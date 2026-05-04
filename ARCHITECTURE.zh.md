@@ -57,6 +57,8 @@ Manager 是 Workspace 中的特殊成员，角色等同于项目经理：
 - 当任务完成或失败时，委托板通知发起者
 - 事件驱动而非轮询——成员完成工作后主动通知委托板，委托板被唤醒后扫描待办队列
 
+**用户与 Manager 的通信同样通过委托板实现。** 用户消息以 `PRIORITY_USER`（u32::MAX）的绝对最高优先级发布到委托板。用户想切换方向时，Manager 对当前任务调用 `cancel()`——委托板将其标记为 Interrupted 并释放目标成员，Manager 随即 poll 到新的用户任务。这样用户输入和 agent 委托通过统一接口处理，"换方向"不需要新协议，只是一个更高优先级的任务。
+
 ### 2.5 沙箱（Sandbox）
 
 Margatroid 采用 **OS 原生沙箱方案**（参考 Claude Code 的 `sandbox-runtime`），不依赖 Docker 或虚拟机，利用操作系统内核级隔离机制：
@@ -255,17 +257,20 @@ margatroid/
 ### 6.2 数据流
 
 ```
-用户 → Manager (分解任务)
+用户 ──(PRIORITY_USER)──→ 委托板
+                              │
+    Manager ←── poll ─────────┘
          │
-         ▼
-    委托板 (事件驱动队列)
-    ├──→ agent A (执行)
-    │      │
-    │      ├── 发现需要 B → 委托板 → agent B
-    │      └── 完成 → 委托板 → Manager → 用户
-    │
-    └──→ agent C (并行执行)
-           └── 完成 → 委托板 → Manager → 用户
+         ├── 分解任务 ──→ 委托板
+         │                  ├──→ agent A (执行)
+         │                  │      │
+         │                  │      ├── 发现需要 B → 委托板 → agent B
+         │                  │      └── 完成 → 委托板 → Manager → 委托板 → 用户
+         │                  │
+         │                  └──→ agent C (并行执行)
+         │                         └── 完成 → 委托板 → Manager
+         │
+         └── cancel() → 委托板 (用户切换方向时打断当前任务)
 ```
 
 ### 6.3 Provider 架构
