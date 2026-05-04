@@ -1,0 +1,19 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "margatroid"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+assets = { path = "../assets" }
+compose = { path = "../compose" }
+server = { path = "../server" }
