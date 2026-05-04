@@ -57,6 +57,8 @@ The Delegation Board is the core collaboration infrastructure of the Workspace �
 - When a task completes or fails, the Board notifies the initiator
 - Event-driven, not polling — members actively notify the Board upon completion, the Board wakes and scans the pending queue
 
+**User communication also flows through the Board.** User messages to the Manager are posted as tasks with `PRIORITY_USER` (u32::MAX), the highest possible priority. When the user changes direction, the Manager calls `cancel()` on the current task — the Board marks it as Interrupted and releases the target member. The Manager then polls the Board and picks up the new user task. This unifies user input and agent delegation under a single interface: "changing direction" requires no additional protocol, just a higher-priority task.
+
 ### 2.5 Sandbox
 
 Margatroid uses an **OS-native sandbox approach** (inspired by Claude Code's `sandbox-runtime`), without Docker or VMs, leveraging OS kernel-level isolation primitives:
@@ -255,17 +257,20 @@ margatroid/
 ### 6.2 Data Flow
 
 ```
-User → Manager (decompose task)
-         │
-         ▼
-    Delegation Board (event-driven queue)
-    ├──→ Agent A (execute)
-    │      │
-    │      ├── Discovers need for B → Delegation Board → Agent B
-    │      └── Complete → Delegation Board → Manager → User
-    │
-    └──→ Agent C (parallel execution)
-           └── Complete → Delegation Board → Manager → User
+User ──(PRIORITY_USER)──→ Delegation Board
+                              │
+   Manager ←── poll ──────────┘
+        │
+        ├── decompose ──→ Delegation Board
+        │                    ├──→ Agent A (execute)
+        │                    │      │
+        │                    │      ├── Need B → Delegation Board → Agent B
+        │                    │      └── Done → Delegation Board → Manager → Board → User
+        │                    │
+        │                    └──→ Agent C (parallel)
+        │                           └── Done → Delegation Board → Manager
+        │
+        └── cancel() → Delegation Board (interrupt current task when user switches direction)
 ```
 
 ### 6.3 Provider Architecture
