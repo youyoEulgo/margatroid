@@ -48,35 +48,59 @@ impl crate::Sandbox for LinuxSandbox {
 
     fn wrap_command(&self, cmd: &str) -> String {
         let config = self.config.as_ref().expect("sandbox not initialized");
+        let has_network = !config.network.allowed_domains.is_empty();
 
         let mut args: Vec<String> = Vec::new();
 
-        // 基础隔离
-        args.push("--unshare-all".into());
+        // 隔离：网络可控时保留网络访问（流量经代理过滤），否则全隔离
+        if has_network {
+            args.push("--unshare-pid".into());
+            args.push("--unshare-uts".into());
+            args.push("--unshare-ipc".into());
+        } else {
+            args.push("--unshare-all".into());
+        }
         args.push("--die-with-parent".into());
 
-        // 只读挂载宿主文件系统
-        args.push("--ro-bind".into());
-        args.push("/usr".into());
-        args.push("/usr".into());
-        args.push("--ro-bind".into());
-        args.push("/lib".into());
-        args.push("/lib".into());
-        args.push("--ro-bind".into());
-        args.push("/lib64".into());
-        args.push("/lib64".into());
-        args.push("--ro-bind".into());
-        args.push("/bin".into());
-        args.push("/bin".into());
-        args.push("--ro-bind".into());
-        args.push("/etc".into());
-        args.push("/etc".into());
+        // 代理环境变量（有网络时注入）
+        if has_network {
+            let http_port = config.network.http_proxy_port.unwrap_or(8888);
+            args.push("--setenv".into());
+            args.push("HTTP_PROXY".into());
+            args.push(format!("http://127.0.0.1:{}", http_port));
+            args.push("--setenv".into());
+            args.push("HTTPS_PROXY".into());
+            args.push(format!("http://127.0.0.1:{}", http_port));
+            args.push("--setenv".into());
+            args.push("http_proxy".into());
+            args.push(format!("http://127.0.0.1:{}", http_port));
+            args.push("--setenv".into());
+            args.push("https_proxy".into());
+            args.push(format!("http://127.0.0.1:{}", http_port));
+            args.push("--setenv".into());
+            args.push("NO_PROXY".into());
+            args.push("localhost,127.0.0.1".into());
+        }
 
-        // 可写目录（allow_write 配置）
-        for path in &config.filesystem.allow_write {
+        // 只读挂载宿主文件系统
+        for dir in &["/usr", "/lib", "/lib64", "/bin", "/etc"] {
+            args.push("--ro-bind".into());
+            args.push((*dir).into());
+            args.push((*dir).into());
+        }
+
+        // 可写目录
+        if config.filesystem.allow_write.is_empty() {
+            // 默认可写 /tmp
             args.push("--bind".into());
-            args.push(path.clone());
-            args.push(path.clone());
+            args.push("/tmp".into());
+            args.push("/tmp".into());
+        } else {
+            for path in &config.filesystem.allow_write {
+                args.push("--bind".into());
+                args.push(path.clone());
+                args.push(path.clone());
+            }
         }
 
         // 强制禁止写入的路径
@@ -87,30 +111,17 @@ impl crate::Sandbox for LinuxSandbox {
             args.push(expanded);
         }
 
-        // /tmp 可写（如果不在 allow_write 中）
-        args.push("--bind".into());
-        args.push("/tmp".into());
-        args.push("/tmp".into());
-
-        // 创建 /proc
         args.push("--proc".into());
         args.push("/proc".into());
 
-        // 网络隔离：如果没有配置代理，直接用 --unshare-net 阻断
-        if config.network.allowed_domains.is_empty() {
-            // 无网络权限
-        } else {
-            // 通过 Unix Domain Socket 桥接到代理（Phase 3 完成）
-        }
-
         // 执行命令
+        let escaped_cmd = shell_escape(cmd);
         args.push("--".into());
         args.push("sh".into());
         args.push("-c".into());
-        args.push(format!("cd {} && {}", ".", cmd));
+        args.push(escaped_cmd);
 
-        let bwrap_cmd = build_bwrap_command(&args);
-        format!("sh -c '{}'", shell_escape(&bwrap_cmd))
+        build_bwrap_command(&args)
     }
 
     fn reset(&mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
@@ -157,6 +168,7 @@ mod tests {
                 ..Default::default()
             },
             network: NetworkConfig::default(),
+            ..Default::default()
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();

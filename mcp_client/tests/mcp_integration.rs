@@ -126,6 +126,7 @@ async fn test_ai_driven_tool_call() -> Result<()> {
                 "请用 echo tool 把这条消息原样返回：「MCP连通测试成功」".into(),
             ),
             name: None,
+            tool_calls: None,
         })],
         tools: Some(request_tools),
         tool_choice: Some(types::RequestToolChoice::String("required".into())),

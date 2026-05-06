@@ -57,7 +57,9 @@ Manager 是 Workspace 中的特殊成员，角色等同于项目经理：
 - 当任务完成或失败时，委托板通知发起者
 - 事件驱动而非轮询——成员完成工作后主动通知委托板，委托板被唤醒后扫描待办队列
 
-**用户与 Manager 的通信同样通过委托板实现。** 用户消息以 `PRIORITY_USER`（u32::MAX）的绝对最高优先级发布到委托板。用户想切换方向时，Manager 对当前任务调用 `cancel()`——委托板将其标记为 Interrupted 并释放目标成员，Manager 随即 poll 到新的用户任务。这样用户输入和 agent 委托通过统一接口处理，"换方向"不需要新协议，只是一个更高优先级的任务。
+**用户与 Manager 的通信同样通过委托板实现。** 用户消息以 `PRIORITY_USER`（u32::MAX）的绝对最高优先级发布到委托板。用户想切换方向时，Manager 对当前任务调用 `cancel()`——委托板将其标记为 Interrupted 并释放目标成员，Manager 随即 poll 到新的用户任务。
+
+**回忆请求也走委托板，但不写入工作日志。** 成员 A 想查询成员 B 的过往经验时，通过委托板发布一个带 `skip_worklog: true` 的轻量委托。B 搜自己的个人记忆，返回摘要。和普通委托的区别：无工作日志、不可驳回、不占用 B 的 Working 状态超过必要时间。
 
 ### 2.5 沙箱（Sandbox）
 
@@ -203,27 +205,57 @@ Manager 接收用户需求后：
 
 ## 5. 记忆架构
 
-### 5.1 存储模型
+Margatroid 的记忆系统模拟真实人类团队的文档习惯，分为两层：
 
-每个智能体实例管理自己的 SQLite 数据库文件，存储路径为：
+### 5.1 工作日志（Worklog）
+
+**团队共享的交接记录。** 每个成员完成委托后，将本次工作自动总结为一条简短摘要写入共享的工作日志。每条摘要约 30-50 token，只记录：谁做的、做了什么、产出是什么、有什么遗留。
+
+工作日志是每个 agent 请求的**固定前缀**——system prompt + roster + 工作日志最近 N 条 + agent 人格 + 当前委托。不按需检索，始终注入，保证每个成员对团队状态有最低限度的感知。
+
+### 5.2 个人记忆（Personal Memory）
+
+**每个成员的私有笔记本。** 完成委托后，agent 在写入工作日志的同时，将委托的详细上下文（完整对话、代码改动、决策理由、遇到的问题和解决方案）保存到自己的 `memory.db`。这是不限量的附录，但不主动注入 prompt。
+
+### 5.3 回忆机制（Recall）
+
+**通过委托板直接询问其他成员的过往经验。** 回忆被设计为一个 skill，每个 agent 默认拥有。当成员 A 在处理委托时发现需要 B 的过往经验，调用 recall skill：
 
 ```
-{workspace_data_dir}/{agent_id}/memory.db
+A 调用 recall_skill(target="B", query="上次那个 bug 怎么修的") →
+  通过委托板发 skip_worklog 委托给 B →
+    B 搜自己的 memory.db，返回摘要 →
+      摘要注入 A 的 prompt，继续执行
 ```
 
-类比 Docker：compose 文件中的 agent 定义是"镜像"，memory.db 是"volume"。同一个 compose 文件可以在不同 Workspace 中生成不同的记忆实例。
+**回忆不走工作日志。** 就像现实中走过去问同事一个问题，不需要做会议记录。委托板做路由但不产生持久化条目。
 
-### 5.2 当前阶段
+**回忆不替代工作日志。** 工作日志是被动感知——每个成员都知道"团队最近在做什么"。回忆是主动查询——需要特定细节时才触发。两者互补。
 
-现阶段，每个 agent 的 memory.db 独立存储，不进行跨 agent 知识共享。Agent A 在工作中发现的、对 agent B 有价值的信息不会自动传递给 B——必须通过显式的委托来完成信息传递。
+### 5.4 存储模型
 
-### 5.3 未来规划
+```
+{workspace_root}/
+├── worklog.db              # 团队工作日志（共享）
+└── {agent_id}/
+    └── memory.db           # 个人记忆（私有）
+```
 
-以下能力在架构中预留，但实现延后：
+- **worklog.db** — 追加型，每条 entry 包含：时间戳、agent_id、委托 id、摘要文本。所有 agent 可读，无写入冲突（每个 agent 只写自己的完成记录）。
+- **memory.db** — 每个 agent 独立管理。Phase 3 初始为内存实现，Phase 4 引入 SQLite + FTS5 全文检索。
 
-- **上下文压缩机制**：长对话历史的自动摘要和裁剪
-- **跨 agent 记忆同步**：Manager 周期性的"团队周报"式信息聚合
-- **记忆检索优化**：基于向量相似度的相关记忆提取
+### 5.5 KV Cache 优化
+
+每个 request 的 prompt 结构保持固定顺序，最大化缓存命中：
+
+```
+[系统提示词] [Roster] [工作日志 ← 固定前缀，所有 agent 共享]
+[Agent 人格 prompt ← 静态，同一 agent 跨请求复用]
+[当前委托详情 ← 动态区]
+[必要时：回忆结果 ← 按需追加，不破坏前缀结构]
+```
+
+前两段在同一个 workspace 内的所有请求间可共享 KV cache。角色 prompt 在同一 agent 的不同委托间可复用。
 
 ## 6. 系统架构
 
@@ -233,25 +265,30 @@ Manager 接收用户需求后：
 margatroid/
 ├── types/          # 共享类型定义（请求、响应、配置、消息、Tool、MCP、Bridge 协议）
 ├── paths/          # 路径布局管理（root、workspace、config、data）
-├── config/         # 配置读写（margatroid.toml、workspace.toml，原子写入）
+├── assets/         # 统一资源管理器（app config + workspace 生命周期）
 ├── providers/      # AI 服务商适配层（trait + OpenRouter 实现）
 ├── server/         # HTTP 服务（Axum）
 ├── bridge/         # Claude Code Remote Control 协议客户端
 ├── cli/            # 命令行界面（margatroid 命令）
 ├── mcp_client/     # MCP 协议客户端
-├── plugins/        # 插件系统
-├── delegation/     # 委托板实现
-└── sandbox/        # OS 原生沙箱（Linux: bwrap，macOS: sandbox-exec）
-    └── src/
-        ├── lib.rs          # Sandbox trait + 统一入口
-        ├── config.rs       # 沙箱配置结构体（文件系统规则、网络规则）
-        ├── mandatory.rs    # 强制保护路径（硬编码，不可配置绕过）
-        ├── linux.rs        # bwrap 实现（挂载 ns + PID ns + 网络 ns）
-        ├── macos.rs        # sandbox-exec 实现（Seatbelt profile 动态生成）
-        └── proxy/
-            ├── mod.rs
-            ├── http.rs      # HTTP/HTTPS 代理（域名白名单过滤）
-            └── socks5.rs    # SOCKS5 代理（其他 TCP 流量过滤）
+├── compose/        # compose 文件解析器、校验器、roster 生成器
+├── delegation/     # 委托板（任务队列、状态机、纠纷仲裁）
+├── sandbox/        # OS 原生沙箱（Linux: bwrap，macOS: sandbox-exec）
+│   └── src/
+│       ├── lib.rs / config.rs / mandatory.rs
+│       ├── linux.rs / macos.rs
+│       └── proxy/ (http.rs, socks5.rs)
+├── runtime/        # Agent 运行时（控制循环、委托处理、agent 生命周期）
+│   └── src/
+│       ├── lib.rs       # WorkspaceRuntime — 启动/管理所有 agent
+│       ├── agent.rs     # AgentRuntime — 单 agent 控制循环
+│       └── engine.rs    # 引擎 — process() 驱动 LLM + 工具调用
+├── memory/         # 记忆系统（Phase 3）
+│   └── src/
+│       ├── lib.rs       # Worklog + PersonalMemory trait
+│       ├── worklog.rs   # 团队工作日志
+│       └── personal.rs  # 个人记忆存储与检索
+└── plugins/        # 插件系统骨架
 ```
 
 ### 6.2 数据流
@@ -262,13 +299,14 @@ margatroid/
     Manager ←── poll ─────────┘
          │
          ├── 分解任务 ──→ 委托板
-         │                  ├──→ agent A (执行)
+         │                  ├──→ agent A (引擎处理)
          │                  │      │
          │                  │      ├── 发现需要 B → 委托板 → agent B
-         │                  │      └── 完成 → 委托板 → Manager → 委托板 → 用户
+         │                  │      ├── 需要回忆 → recall skill → 委托板(skip_worklog) → B 搜 memory.db → 摘要返回
+         │                  │      └── 完成 → 写工作日志 + 个人记忆 → 委托板 → Manager → 委托板 → 用户
          │                  │
-         │                  └──→ agent C (并行执行)
-         │                         └── 完成 → 委托板 → Manager
+         │                  └──→ agent C (并行)
+         │                         └── 完成 → 写工作日志 + 个人记忆 → 委托板 → Manager
          │
          └── cancel() → 委托板 (用户切换方向时打断当前任务)
 ```
@@ -306,28 +344,31 @@ pub trait AiProvider: Send + Sync {
 
 ## 8. 实现路线图
 
-### Phase 1: Foundation（当前）
-- [x] 基础 crate 结构（types, paths, config, providers, server）
+### Phase 1: Foundation
+- [x] 基础 crate 结构（types, paths, assets, providers, server）
 - [x] OpenRouter provider 适配（流式 + 非流式）
-- [x] HTTP API 框架
+- [x] HTTP API 框架（/v1/chat, /v1/stream, /v1/providers, /admin/reload）
 - [x] Bridge 远程控制协议
+- [x] 项目从 AliceCode 更名为 Margatroid
 
-### Phase 2: Compose & Workspace（下一阶段）
-- [ ] compose 文件解析器
-- [ ] Workspace 生命周期管理（创建、启动、停止、销毁）
-- [ ] 沙箱环境实现
-- [ ] 委托板核心逻辑
+### Phase 2: Compose & Workspace
+- [x] compose 文件解析器（parser + validator + roster 生成器）
+- [x] Workspace 生命周期管理（创建、列表、销毁）
+- [x] OS 原生沙箱（bwrap / sandbox-exec，guard 守卫，HTTP 代理，强制保护路径）
+- [x] 委托板（优先级队列、状态机、纠纷仲裁、cancel、PRIORITY_USER）
+- [x] Agent 运行时（WorkspaceRuntime + AgentRuntime + engine 控制循环）
+- [x] CLI（serve, compose validate/roster/load, workspace create/list）
 
-### Phase 3: Agent Collaboration
-- [ ] 智能体实例管理器
-- [ ] Roster skill 自动生成
-- [ ] 委托流程完整实现（发布、分配、完成、纠纷）
-- [ ] Manager 任务分解能力
-- [ ] 独立 SQLite 记忆存储
+### Phase 3: Memory & Recall（当前阶段）
+- [ ] 工作日志（Worklog）— 团队共享摘要，~30 token/条
+- [ ] 个人记忆（Personal Memory）— 每 agent 独立存储，内存实现先行
+- [ ] 回忆 Skill — 委托板 skip_worklog 路由的跨 agent 记忆查询
+- [ ] engine tool-call loop — 解析 LLM tool calls 并驱动沙箱执行
+- [ ] Agent 上下文构建 — 固定前缀（roster + worklog）+ 角色 prompt + 委托详情
 
 ### Phase 4: Production Readiness
-- [ ] 上下文压缩机制
-- [ ] 跨 agent 记忆同步
+- [ ] SQLite + FTS5 全文检索（替代内存实现）
+- [ ] 上下文压缩 — Memory Flush 机制
 - [ ] 完整测试覆盖（单元、集成、端到端）
 - [ ] CLI 交互体验优化
 - [ ] 文档和示例 compose 文件
@@ -338,11 +379,12 @@ pub trait AiProvider: Send + Sync {
 2. **TOML 而非 YAML** — 与 Rust 生态配置传统一致，且 Margatroid 整体使用 TOML 作为配置格式。
 3. **事件驱动而非轮询** — 避免委托板空转，降低资源消耗。
 4. **两层成员发现** — Roster（轻量）+ Profile（按需），控制上下文窗口膨胀。
-5. **独立记忆存储** — 每个成员管理自己的 db，隔离简单，共享通过显式委托。
-6. **Manager 也是智能体** — 不是硬编码调度器，保持系统灵活性。
-7. **depends_on 仅自文档化** — 不强制启动顺序，协作关系运行时动态建立。
-8. **OS 原生沙箱而非 Docker/MicroVM** — 借鉴 Claude Code 的 `sandbox-runtime` 设计，利用 bubblewrap（Linux）和 sandbox-exec（macOS）做进程级隔离。Agent 直接继承宿主工具链，无需在基础镜像中预装开发工具。沙箱环境临时可丢弃，只有 workdir 和 memory.db 持久化。
-9. **仅支持 Linux 和 macOS** — 沙箱依赖操作系统级隔离机制（Linux 命名空间、macOS Seatbelt/Sandbox），不兼容 Windows。代码中不使用任何 Windows 条件编译或兼容层。
+5. **工作日志 + 个人记忆双层模型** — 工作日志是团队共享的固定前缀（~30 token/条），每个人始终知道其他人在做什么。个人记忆是私有附录，按需检索。回忆通过委托板路由且不写入工作日志。
+6. **回忆作为 skill 而非委托类型** — 每个 agent 默认拥有 recall skill，底层走委托板的 `skip_worklog` 通道。AgentRuntime 不需要区分任务类型。
+7. **Manager 也是智能体** — 不是硬编码调度器，保持系统灵活性。
+8. **depends_on 仅自文档化** — 不强制启动顺序，协作关系运行时动态建立。
+9. **OS 原生沙箱而非 Docker/MicroVM** — 利用 bubblewrap（Linux）和 sandbox-exec（macOS）做进程级隔离。Agent 直接继承宿主工具链。沙箱环境临时可丢弃，只有 workdir 和 memory.db 持久化。
+10. **仅支持 Linux 和 macOS** — 不兼容 Windows。代码中不使用任何 Windows 条件编译或兼容层。
 
 ## 10. 沙箱参考设计与技术栈
 

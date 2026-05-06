@@ -57,7 +57,9 @@ The Delegation Board is the core collaboration infrastructure of the Workspace �
 - When a task completes or fails, the Board notifies the initiator
 - Event-driven, not polling — members actively notify the Board upon completion, the Board wakes and scans the pending queue
 
-**User communication also flows through the Board.** User messages to the Manager are posted as tasks with `PRIORITY_USER` (u32::MAX), the highest possible priority. When the user changes direction, the Manager calls `cancel()` on the current task — the Board marks it as Interrupted and releases the target member. The Manager then polls the Board and picks up the new user task. This unifies user input and agent delegation under a single interface: "changing direction" requires no additional protocol, just a higher-priority task.
+**User communication also flows through the Board.** User messages to the Manager are posted as tasks with `PRIORITY_USER` (u32::MAX), the highest possible priority. When the user changes direction, the Manager calls `cancel()` on the current task — the Board marks it as Interrupted and releases the target member.
+
+**Recall requests also use the Board, but skip the worklog.** When Member A wants to query Member B's past experience, they post a lightweight delegation with `skip_worklog: true`. B searches their personal memory and returns a summary. Unlike normal delegations: no worklog entry, not rejectable, and does not occupy B's Working state longer than necessary.
 
 ### 2.5 Sandbox
 
@@ -203,27 +205,57 @@ Upon receiving a user requirement, the Manager:
 
 ## 5. Memory Architecture
 
-### 5.1 Storage Model
+Margatroid's memory system mirrors how real human teams document their work, split into two layers:
 
-Each agent instance manages its own SQLite database file at:
+### 5.1 Worklog
+
+**Team-shared handoff log.** Each member, upon completing a delegation, auto-summarizes their work into a short entry appended to the shared worklog. Each entry is ~30-50 tokens: who, what they did, what they produced, what's left unresolved.
+
+The worklog is a **fixed prefix** in every agent's request — system prompt + roster + recent worklog entries + agent personality + current delegation. It is always injected (not queried on-demand), ensuring every member has a baseline awareness of what the team is doing.
+
+### 5.2 Personal Memory
+
+**Each member's private notebook.** After completing a delegation, alongside the worklog entry, the agent saves the delegation's full context (complete conversation, code changes, decisions and reasoning, problems encountered and solutions) to their own `memory.db`. This is an unbounded appendix, but is never actively injected into the prompt.
+
+### 5.3 Recall Mechanism
+
+**Query another member's past experience through the Board.** Recall is designed as a skill — every agent has it by default. When Member A, during a delegation, needs Member B's past experience:
 
 ```
-{workspace_data_dir}/{agent_id}/memory.db
+A invokes recall_skill(target="B", query="how was that bug fixed last time") →
+  Posts a skip_worklog delegation via the Board to B →
+    B searches their memory.db, returns a summary →
+      Summary is injected into A's prompt; A continues
 ```
 
-Docker analogy: the agent definition in the compose file is the "image," and memory.db is the "volume." The same compose file can generate different memory instances across different Workspaces.
+**Recall does not write to the worklog.** Just like walking over to a colleague's desk to ask a question — no meeting notes needed. The Board routes the request without producing a persistent entry.
 
-### 5.2 Current Stage
+**Recall complements, not replaces, the worklog.** The worklog is passive awareness — every member knows "what the team is working on." Recall is active lookup — triggered only when specific details are needed.
 
-At this stage, each agent's memory.db is stored independently without cross-agent knowledge sharing. Information that Agent A discovers during work that would be valuable to Agent B is not automatically transferred to B — it must be passed through explicit delegation.
+### 5.4 Storage Layout
 
-### 5.3 Future Plans
+```
+{workspace_root}/
+├── worklog.db              # Team worklog (shared)
+└── {agent_id}/
+    └── memory.db           # Personal memory (private)
+```
 
-The following capabilities are reserved in the architecture but deferred for implementation:
+- **worklog.db** — Append-only. Each entry: timestamp, agent_id, delegation_id, summary text. All agents can read; no write conflicts (each agent only writes their own completion records).
+- **memory.db** — Independently managed per agent. Phase 3 starts with an in-memory implementation; Phase 4 introduces SQLite + FTS5 full-text search.
 
-- **Context compression**: Automatic summarization and pruning of long conversation histories
-- **Cross-agent memory sync**: Manager-initiated periodic "team standup" style information aggregation
-- **Memory retrieval optimization**: Vector similarity-based relevant memory extraction
+### 5.5 KV Cache Optimization
+
+Each request's prompt structure follows a fixed order to maximize cache hit rates:
+
+```
+[System prompt] [Roster] [Worklog ← fixed prefix, shared by all agents]
+[Agent personality prompt ← static, reused across requests for same agent]
+[Current delegation details ← dynamic zone]
+[If needed: recall results ← appended on demand, does not disrupt prefix structure]
+```
+
+The first two segments are shareable across all requests within a workspace. The role prompt is reusable across different delegations for the same agent.
 
 ## 6. System Architecture
 
@@ -233,25 +265,27 @@ The following capabilities are reserved in the architecture but deferred for imp
 margatroid/
 ├── types/          # Shared type definitions (request, response, config, message, Tool, MCP, Bridge protocol)
 ├── paths/          # Path layout management (root, workspace, config, data)
-├── config/         # Configuration read/write (margatroid.toml, workspace.toml, atomic writes)
+├── assets/         # Unified asset manager (app config + workspace lifecycle)
 ├── providers/      # AI provider adaptation layer (trait + OpenRouter implementation)
 ├── server/         # HTTP service (Axum)
 ├── bridge/         # Claude Code Remote Control protocol client
 ├── cli/            # Command-line interface (margatroid command)
 ├── mcp_client/     # MCP protocol client
-├── plugins/        # Plugin system
-├── delegation/     # Delegation Board implementation
-└── sandbox/        # OS-native sandbox (Linux: bwrap, macOS: sandbox-exec)
-    └── src/
-        ├── lib.rs          # Sandbox trait + unified entry point
-        ├── config.rs       # Sandbox configuration structs (filesystem & network rules)
-        ├── mandatory.rs    # Mandatory deny paths (hard-coded, not configurable)
-        ├── linux.rs        # bwrap implementation (mount ns + PID ns + network ns)
-        ├── macos.rs        # sandbox-exec implementation (Seatbelt profile dynamic generation)
-        └── proxy/
-            ├── mod.rs
-            ├── http.rs      # HTTP/HTTPS proxy (domain allowlist filtering)
-            └── socks5.rs    # SOCKS5 proxy (other TCP traffic filtering)
+├── compose/        # Compose file parser, validator, roster generator
+├── delegation/     # Delegation Board (task queue, state machine, dispute arbitration)
+├── sandbox/        # OS-native sandbox (Linux: bwrap, macOS: sandbox-exec)
+│   └── src/ lib.rs, config.rs, mandatory.rs, linux.rs, macos.rs, proxy/
+├── runtime/        # Agent runtime (control loop, delegation processing, agent lifecycle)
+│   └── src/
+│       ├── lib.rs       # WorkspaceRuntime — spawn/manage all agents
+│       ├── agent.rs     # AgentRuntime — single-agent control loop
+│       └── engine.rs    # Engine — process() drives LLM + tool calls
+├── memory/         # Memory system (Phase 3)
+│   └── src/
+│       ├── lib.rs       # Worklog + PersonalMemory trait
+│       ├── worklog.rs   # Team worklog
+│       └── personal.rs  # Personal memory storage and retrieval
+└── plugins/        # Plugin system skeleton
 ```
 
 ### 6.2 Data Flow
@@ -262,13 +296,14 @@ User ──(PRIORITY_USER)──→ Delegation Board
    Manager ←── poll ──────────┘
         │
         ├── decompose ──→ Delegation Board
-        │                    ├──→ Agent A (execute)
+        │                    ├──→ Agent A (engine process)
         │                    │      │
         │                    │      ├── Need B → Delegation Board → Agent B
-        │                    │      └── Done → Delegation Board → Manager → Board → User
+        │                    │      ├── Need recall → recall skill → Board(skip_worklog) → B searches memory.db → summary
+        │                    │      └── Done → write worklog + personal memory → Board → Manager → Board → User
         │                    │
         │                    └──→ Agent C (parallel)
-        │                           └── Done → Delegation Board → Manager
+        │                           └── Done → write worklog + personal memory → Board → Manager
         │
         └── cancel() → Delegation Board (interrupt current task when user switches direction)
 ```
@@ -306,28 +341,31 @@ Planned:
 
 ## 8. Implementation Roadmap
 
-### Phase 1: Foundation (current)
-- [x] Basic crate structure (types, paths, config, providers, server)
+### Phase 1: Foundation
+- [x] Basic crate structure (types, paths, assets, providers, server)
 - [x] OpenRouter provider adaptation (streaming + non-streaming)
-- [x] HTTP API framework
+- [x] HTTP API framework (/v1/chat, /v1/stream, /v1/providers, /admin/reload)
 - [x] Bridge remote control protocol
+- [x] Project renamed from AliceCode to Margatroid
 
-### Phase 2: Compose & Workspace (next)
-- [ ] Compose file parser
-- [ ] Workspace lifecycle management (create, start, stop, destroy)
-- [ ] Sandbox environment implementation
-- [ ] Delegation Board core logic
+### Phase 2: Compose & Workspace
+- [x] Compose file parser (parser + validator + roster generator)
+- [x] Workspace lifecycle management (create, list, destroy)
+- [x] OS-native sandbox (bwrap / sandbox-exec, guard, HTTP proxy, mandatory deny paths)
+- [x] Delegation Board (priority queue, state machine, dispute arbitration, cancel, PRIORITY_USER)
+- [x] Agent runtime (WorkspaceRuntime + AgentRuntime + engine control loop)
+- [x] CLI (serve, compose validate/roster/load, workspace create/list)
 
-### Phase 3: Agent Collaboration
-- [ ] Agent instance manager
-- [ ] Automatic roster skill generation
-- [ ] Full delegation flow implementation (publish, assign, complete, dispute)
-- [ ] Manager task decomposition capability
-- [ ] Independent SQLite memory storage
+### Phase 3: Memory & Recall (current)
+- [ ] Worklog — team-shared summary entries, ~30 tokens each
+- [ ] Personal Memory — per-agent independent storage, in-memory first
+- [ ] Recall Skill — cross-agent memory queries via Board skip_worklog routing
+- [ ] Engine tool-call loop — parse LLM tool calls and drive sandbox execution
+- [ ] Agent context builder — fixed prefix (roster + worklog) + role prompt + delegation detail
 
 ### Phase 4: Production Readiness
-- [ ] Context compression mechanism
-- [ ] Cross-agent memory sync
+- [ ] SQLite + FTS5 full-text search (replace in-memory implementation)
+- [ ] Context compression — Memory Flush mechanism
 - [ ] Full test coverage (unit, integration, end-to-end)
 - [ ] CLI interaction polish
 - [ ] Documentation and example compose files
@@ -338,11 +376,12 @@ Planned:
 2. **TOML over YAML** — Consistent with Rust ecosystem configuration conventions, and Margatroid uses TOML throughout for configuration.
 3. **Event-driven over polling** — Avoids Delegation Board idle spinning, reducing resource consumption.
 4. **Two-layer member discovery** — Roster (lightweight) + Profile (on-demand), controlling context window bloat.
-5. **Independent memory storage** — Each member manages its own db; isolation is simple, sharing goes through explicit delegation.
-6. **Manager is also an agent** — Not a hard-coded scheduler; maintains system flexibility.
-7. **depends_on is self-documenting only** — Does not enforce startup ordering; collaboration relationships are dynamically established at runtime.
-8. **OS-native sandbox over Docker/MicroVM** — Inspired by Claude Code's `sandbox-runtime`, uses bubblewrap (Linux) and sandbox-exec (macOS) for process-level isolation. Agents inherit the host toolchain directly without pre-installing dev tools in a base image. Sandbox environments are ephemeral and disposable; only workdir and memory.db persist.
-9. **Linux and macOS only** — Sandboxing relies on OS-level isolation mechanisms (Linux namespaces, macOS Seatbelt/Sandbox). Windows is not supported. No Windows conditional compilation or compatibility layers in the codebase.
+5. **Worklog + Personal Memory dual-layer model** — The worklog is a team-shared fixed prefix (~30 tokens per entry); everyone is always aware of what others are doing. Personal memory is a private appendix, queried on demand. Recall is routed through the Delegation Board without writing to the worklog.
+6. **Recall as a skill, not a task type** — Every agent has the recall skill by default, backed by the Board's `skip_worklog` channel. AgentRuntime does not need to distinguish task types.
+7. **Manager is also an agent** — Not a hard-coded scheduler; maintains system flexibility.
+8. **depends_on is self-documenting only** — Does not enforce startup ordering; collaboration relationships are dynamically established at runtime.
+9. **OS-native sandbox over Docker/MicroVM** — Uses bubblewrap (Linux) and sandbox-exec (macOS) for process-level isolation. Agents inherit the host toolchain directly. Sandbox environments are ephemeral and disposable; only workdir and memory.db persist.
+10. **Linux and macOS only** — Windows is not supported. No conditional compilation or compatibility layers.
 
 ## 10. Sandbox Reference Design & Tech Stack
 

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::tool::ResponseToolCall;
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -52,6 +54,8 @@ pub struct ChatMessage {
     pub content: MessageContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ResponseToolCall>>,
 }
 
 /// role 是 tool 的消息（tool call 结果）
