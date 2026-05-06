@@ -53,9 +53,7 @@ impl Manager {
     ///
     /// 等价于 `Manager::new(paths).init()`，但自动确定 `~/.margatroid/` 路径。
     pub fn bootstrap() -> Result<Self> {
-        let root = paths::margatroid_root()
-            .unwrap_or_else(|| PathBuf::from(".margatroid"))
-            .join(".margatroid");
+        let root = paths::margatroid_root().unwrap_or_else(|| PathBuf::from(".margatroid"));
         Manager::new(Arc::new(MargatroidPaths::new(root))).init()
     }
 
@@ -141,7 +139,11 @@ impl Manager {
         self.write_workspace_config(name, &config)?;
         self.workspace_configs.insert(name.into(), config);
 
-        // 2. agent data 子目录
+        // 2. 写入默认沙箱配置
+        let sandbox_path = self.paths.workspace_dir(name)?.join("sandbox.toml");
+        fs::write(&sandbox_path, DEFAULT_SANDBOX_CONFIG)?;
+
+        // 3. agent data 子目录
         for agent in &compose.agents {
             let data_dir = self.paths.workspace_data_dir(name)?.join(&agent.id);
             fs::create_dir_all(&data_dir)
@@ -246,6 +248,26 @@ impl Manager {
         Ok(names)
     }
 }
+
+/// 默认沙箱配置模板（workspace 创建时生成）
+const DEFAULT_SANDBOX_CONFIG: &str = r#"# Margatroid Sandbox Configuration
+
+enabled = true
+auto_allow_bash_if_sandboxed = false
+allow_unsandboxed_commands = false
+excluded_commands = ["git push", "gh pr create"]
+
+[filesystem]
+deny_read = []
+allow_write = []
+deny_write = []
+
+[network]
+allowed_domains = ["github.com", "*.github.com", "api.github.com", "registry.npmjs.org"]
+denied_domains = []
+allow_unix_sockets = []
+allow_local_binding = false
+"#;
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -352,6 +374,13 @@ mod tests {
 
         assert!(mgr.paths.workspace_dir("test-ws").unwrap().is_dir());
         assert!(mgr.paths.workspace_config("test-ws").unwrap().is_file());
+        assert!(
+            mgr.paths
+                .workspace_dir("test-ws")
+                .unwrap()
+                .join("sandbox.toml")
+                .is_file()
+        );
         assert!(
             mgr.paths
                 .workspace_data_dir("test-ws")

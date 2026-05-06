@@ -10,7 +10,7 @@ members = [
     "mcp_client",
     "assets",
     "paths",
-    "delegation",
+    "runtime",
     "sandbox",
 ]
 

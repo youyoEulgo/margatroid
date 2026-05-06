@@ -106,11 +106,16 @@ fn generate_seatbelt_profile(config: &SandboxConfig) -> String {
 
     // 网络权限：如果配置了允许的域名，放行到代理端口的 TCP 连接
     if !config.network.allowed_domains.is_empty() {
-        // Phase 3: 配置具体代理端口
-        rules.push("(allow network* (local ip \"localhost:8888\"))".to_string());
-        rules.push("(allow network* (local ip \"localhost:1080\"))".to_string());
-    } else {
-        // 无网络权限
+        let http_port = config.network.http_proxy_port.unwrap_or(8888);
+        let socks_port = config.network.socks_proxy_port.unwrap_or(1080);
+        rules.push(format!(
+            "(allow network* (local ip \"localhost:{}\"))",
+            http_port
+        ));
+        rules.push(format!(
+            "(allow network* (local ip \"localhost:{}\"))",
+            socks_port
+        ));
     }
 
     rules.join("\n")
@@ -118,8 +123,7 @@ fn generate_seatbelt_profile(config: &SandboxConfig) -> String {
 
 /// 转义 SBPL 路径中的特殊字符
 fn escape_sbpl_path(path: &str) -> String {
-    path.replace('\\', "\\\\")
-        .replace('"', "\\\"")
+    path.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]
@@ -136,6 +140,7 @@ mod tests {
                 ..Default::default()
             },
             network: NetworkConfig::default(),
+            ..Default::default()
         };
 
         let profile = generate_seatbelt_profile(&config);
@@ -160,6 +165,7 @@ mod tests {
                 ..Default::default()
             },
             network: NetworkConfig::default(),
+            ..Default::default()
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();

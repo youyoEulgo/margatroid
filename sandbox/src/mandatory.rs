@@ -1,7 +1,6 @@
 //! 强制保护路径
 //!
 //! 这些路径在代码中硬编码为禁止写入，不受任何配置影响。
-//! 设计参照 Claude Code sandbox-runtime 的 mandatory deny paths。
 
 /// 无论如何都禁止写入的路径列表
 ///
@@ -23,11 +22,7 @@ pub fn mandatory_deny_write() -> &'static [&'static str] {
 
 /// 无论如何都禁止读取的路径列表
 pub fn mandatory_deny_read() -> &'static [&'static str] {
-    &[
-        "~/.ssh/id_rsa",
-        "~/.ssh/id_ed25519",
-        "~/.ssh/id_ecdsa",
-    ]
+    &["~/.ssh/id_rsa", "~/.ssh/id_ed25519", "~/.ssh/id_ecdsa"]
 }
 
 /// 展开路径中的 `~` 为用户主目录
