@@ -293,10 +293,6 @@ impl DelegationBoard {
         self.db.schedule_archive(id)
     }
 
-    pub fn schedule_archive_by_target(&self, target: &str) {
-        self.db.schedule_archive_by_target(target)
-    }
-
     pub fn schedule_revert(&self, id: i64) {
         self.db.schedule_revert(id)
     }

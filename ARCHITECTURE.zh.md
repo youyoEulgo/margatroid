@@ -83,7 +83,7 @@ Manager 专用的阶段任务规划工具，存于 board 的 SQLite。一条阶�
 | `schedule_remove` | 删除指定条目 |
 | `schedule_reorder` | 调整优先级 |
 
-**Manager 的 push_from_schedule**：Manager 空闲时遍历 schedule，检查目标成员是否有 offered 条目（阶段任务正在执行中）。若没有则 pop → offer 到 board。阶段任务的归档在 Manager accept 对应委托时触发，不在 offer 时。
+**Manager 的 push_from_schedule**：Manager 空闲时遍历 schedule，检查目标成员是否有 offered 条目。若无则 pop → offer，将 `schedule_id` 写入委托的 parameters。Manager accept 时通过 parameters 中的 `schedule_id` 精确归档，不依赖 heuristics。
 
 阶段任务与委托的区别：
 - **阶段任务**：schedule 中的顶层规划，每成员一次一个
