@@ -258,6 +258,27 @@ impl SqliteMemory {
         );
     }
 
+    /// 将指定成员当前 offered 的阶段任务归档
+    pub fn schedule_archive_by_target(&self, target: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE schedule SET status = 'archived' WHERE target = ? AND status = 'offered'",
+            rusqlite::params![target],
+        );
+    }
+
+    /// 查询指定成员是否有 offered 状态的阶段任务
+    pub fn has_offered_schedule(&self, target: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM schedule WHERE target = ? AND status = 'offered'",
+            rusqlite::params![target],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false)
+    }
+
     /// 将已 pop 的条目回退为 planned
     pub fn schedule_revert(&self, id: i64) {
         let conn = self.conn.lock().unwrap();

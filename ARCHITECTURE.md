@@ -71,9 +71,9 @@ offer ──→ [Publish] ──claim──→ [Exec] ──return──→ [Ret
 
 **Memory**: Written automatically on `return_task` — worklog (team) and personal_memory (per-agent). No separate archive step needed.
 
-### 2.5 Schedule (Manager-only)
+### 2.5 Schedule (Stage Tasks, Manager-only)
 
-A private planning tool for the Manager, stored in the board's SQLite:
+A private planning tool for the Manager. Stage tasks are top-level work items assigned to members — one per member at a time. The Manager offers a stage task as a delegation to the board; when the delegation completes and is accepted, the stage task is archived.
 
 | Operation | Effect |
 |---|---|
@@ -83,7 +83,11 @@ A private planning tool for the Manager, stored in the board's SQLite:
 | `schedule_remove` | Remove an entry |
 | `schedule_reorder` | Change priority |
 
-**push_from_schedule**: When the Manager is idle, iterates schedule entries, checks `has_pending` for each target (a member may have at most one task in the board at a time). Pops and offers only when the previous task is fully archived. Runs automatically in the Manager's control loop.
+**push_from_schedule**: When idle, the Manager iterates schedule entries, checks `has_offered_schedule` (is a stage task already in progress for this member?). If not, `pop → offer`. Archiving happens when the Manager accepts the delegation back, not at offer time.
+
+Stage tasks vs. delegations:
+- **Stage task**: Top-level plan in the schedule, one per member at a time
+- **Delegation**: Concrete work item on the board, from either Manager (stage task) or peer (member-to-member)
 
 ### 2.6 Sandbox
 

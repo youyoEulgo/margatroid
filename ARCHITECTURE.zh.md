@@ -73,17 +73,21 @@ offer ──→ [发布区] ──claim──→ [执行区] ──return──�
 
 ### 2.5 计划表（Schedule）
 
-Manager 专用的私有任务规划工具，存于 board 的 SQLite：
+Manager 专用的阶段任务规划工具，存于 board 的 SQLite。一条阶段任务 = 一个成员被分配的顶层工作项，每个成员同时最多只有一个阶段任务在执行。阶段任务作为委托发布到 board 上，完成后 Manager accept 时归档。
 
 | 操作 | 效果 |
 |---|---|
 | `schedule_add` | 添加 planned 条目（target, description, priority） |
 | `schedule_list` | 列出所有 planned 条目 |
-| `schedule_pop` | 取出某成员当前最高优先级的 planned 条目，标记 offered |
+| `schedule_pop` | 弹出某成员最高优先级条目，标记 offered |
 | `schedule_remove` | 删除指定条目 |
 | `schedule_reorder` | 调整优先级 |
 
-**Manager 的 push_from_schedule**：Manager 空闲时遍历 schedule，检查目标成员在 board 中是否还有未归档的任务（`has_pending`）。一个成员在 board 中最多只能有一条任务，完全归档后 Manager 才 `pop → offer → archive` 推下一条。
+**Manager 的 push_from_schedule**：Manager 空闲时遍历 schedule，检查目标成员是否有 offered 条目（阶段任务正在执行中）。若没有则 pop → offer 到 board。阶段任务的归档在 Manager accept 对应委托时触发，不在 offer 时。
+
+阶段任务与委托的区别：
+- **阶段任务**：schedule 中的顶层规划，每成员一次一个
+- **委托**：board 上的具体工作项，可以来自 Manager（阶段任务）或 peer 委托（成员间互相委托）
 
 ### 2.6 沙箱（Sandbox）
 

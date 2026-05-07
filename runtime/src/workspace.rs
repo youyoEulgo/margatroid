@@ -307,7 +307,20 @@ async fn manager_loop(
     tracing::info!("Manager '{}' 启动控制循环", member.id);
 
     loop {
-        check_and_accept_returned(&member.id, &board).await;
+        // 0. 检查返回区，接受的委托对应阶段任务归档
+        let returned = board.check_return(&member.id).await;
+        for task in &returned {
+            match board.accept(&member.id, &task.id).await {
+                Ok(t) => {
+                    tracing::info!("Manager 接受 '{}': {}", t.id, t.result.as_deref().unwrap_or(""));
+                    // 阶段任务完成 → 归档
+                    board.schedule_archive_by_target(&t.to);
+                }
+                Err(e) => {
+                    tracing::error!("Manager accept 失败 '{}': {}", task.id, e);
+                }
+            }
+        }
 
         let task = match board.claim(&member.id).await {
             Ok(Some(t)) => t,
@@ -355,12 +368,12 @@ async fn manager_loop(
     }
 }
 
-/// 从计划表为每个空闲成员推一条任务到发布区
+/// 从计划表为每个空闲成员推阶段任务到发布区（不归档）
 async fn push_from_schedule(board: &DelegationBoard) {
     let entries = board.schedule_list();
     for entry in entries {
-        if board.has_pending(&entry.target).await {
-            continue; // 成员还有未归档任务，跳过
+        if board.has_offered_schedule(&entry.target) {
+            continue; // 该成员的阶段任务还在执行中
         }
         if let Some(s) = board.schedule_pop(&entry.target) {
             match board
@@ -373,9 +386,7 @@ async fn push_from_schedule(board: &DelegationBoard) {
                 )
                 .await
             {
-                Ok(_) => {
-                    board.schedule_archive(s.id);
-                }
+                Ok(_) => {} // 阶段任务已发布为委托，归档在 Manager accept 时
                 Err(e) => {
                     tracing::error!("Manager offer 失败: {}, 回退条目 {}", e, s.id);
                     board.schedule_revert(s.id);
