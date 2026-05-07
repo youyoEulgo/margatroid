@@ -307,14 +307,16 @@ async fn manager_loop(
     tracing::info!("Manager '{}' 启动控制循环", member.id);
 
     loop {
-        // 0. 检查返回区，接受的委托对应阶段任务归档
+        // 0. 检查返回区，阶段任务委托完成后归档
         let returned = board.check_return(&member.id).await;
         for task in &returned {
             match board.accept(&member.id, &task.id).await {
                 Ok(t) => {
                     tracing::info!("Manager 接受 '{}': {}", t.id, t.result.as_deref().unwrap_or(""));
-                    // 阶段任务完成 → 归档
-                    board.schedule_archive_by_target(&t.to);
+                    if let Some(schedule_id) = t.parameters.get("schedule_id").and_then(|v| v.as_i64())
+                    {
+                        board.schedule_archive(schedule_id);
+                    }
                 }
                 Err(e) => {
                     tracing::error!("Manager accept 失败 '{}': {}", task.id, e);
@@ -376,20 +378,21 @@ async fn push_from_schedule(board: &DelegationBoard) {
             continue; // 该成员的阶段任务还在执行中
         }
         if let Some(s) = board.schedule_pop(&entry.target) {
+            let schedule_id = s.id;
             match board
                 .offer(
                     "manager",
                     &entry.target,
                     &entry.description,
-                    serde_json::json!({}),
+                    serde_json::json!({"schedule_id": schedule_id}),
                     entry.priority as u32,
                 )
                 .await
             {
                 Ok(_) => {} // 阶段任务已发布为委托，归档在 Manager accept 时
                 Err(e) => {
-                    tracing::error!("Manager offer 失败: {}, 回退条目 {}", e, s.id);
-                    board.schedule_revert(s.id);
+                    tracing::error!("Manager offer 失败: {}, 回退条目 {}", e, schedule_id);
+                    board.schedule_revert(schedule_id);
                 }
             }
         }
