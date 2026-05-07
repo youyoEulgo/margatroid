@@ -48,20 +48,44 @@ The Manager is a special member of the Workspace, equivalent to a project lead:
 
 ### 2.4 Delegation Board
 
-The Delegation Board is the core collaboration infrastructure of the Workspace — an **event-driven task queue**. Its operation is analogous to the Tokio runtime:
+The Delegation Board uses a **four-zone model**:
 
-- Any member (including the Manager and regular agents) can post delegation tasks to the Board
-- A delegation task contains: target member ID, task description, structured parameters, priority, deadline
-- The Board maintains a status flag for each member (idle / working)
-- When the target member is idle, the Board immediately assigns the task
-- When a task completes or fails, the Board notifies the initiator
-- Event-driven, not polling — members actively notify the Board upon completion, the Board wakes and scans the pending queue
+```
+offer ──→ [Publish] ──claim──→ [Exec] ──return──→ [Returned]
+              ↑                                   │       │
+              └────────── reject ──────────────────┘       │
+                                                           │
+                                    accept → [Archive: SQLite]
+```
 
-**User communication also flows through the Board.** User messages to the Manager are posted as tasks with `PRIORITY_USER` (u32::MAX), the highest possible priority. When the user changes direction, the Manager calls `cancel()` on the current task — the Board marks it as Interrupted and releases the target member.
+- **Publish**: Manager or members `offer` tasks, queued by priority
+- **Exec**: Target member `claim` picks up the task
+- **Returned**: Member `return_task` submits result + summary; board writes worklog + personal_memory to SQLite archive
+- **Archive**: SQLite, written automatically on `return_task`
 
-**Recall requests also use the Board, but skip the worklog.** When Member A wants to query Member B's past experience, they post a lightweight delegation with `skip_worklog: true`. B searches their personal memory and returns a summary. Unlike normal delegations: no worklog entry, not rejectable, and does not occupy B's Working state longer than necessary.
+**All delegations are async** — `offer` returns a task_id immediately. Results flow through the returned zone and are accepted by the publisher on their next loop iteration.
 
-### 2.5 Sandbox
+**Disputes**: Publisher `reject` sends the task back to publish with `reject_count++`. Above `DISPUTE_THRESHOLD` (default 3), `to` is changed to `manager` for escalation.
+
+**User messages**: `offer("user", "manager", ...)` with `PRIORITY_USER` (u32::MAX).
+
+**Memory**: Written automatically on `return_task` — worklog (team) and personal_memory (per-agent). No separate archive step needed.
+
+### 2.5 Schedule (Manager-only)
+
+A private planning tool for the Manager, stored in the board's SQLite:
+
+| Operation | Effect |
+|---|---|
+| `schedule_add` | Add a planned entry (target, description, priority) |
+| `schedule_list` | List all planned entries |
+| `schedule_pop` | Pop next planned entry for a target, mark offered |
+| `schedule_remove` | Remove an entry |
+| `schedule_reorder` | Change priority |
+
+**push_from_schedule**: When the Manager is idle, iterates schedule entries, checks `is_working` for each target, and `pop → offer → archive` for idle members. Runs automatically in the Manager's control loop.
+
+### 2.6 Sandbox
 
 Margatroid uses an **OS-native sandbox approach** (inspired by Claude Code's `sandbox-runtime`), without Docker or VMs, leveraging OS kernel-level isolation primitives:
 
@@ -272,40 +296,37 @@ margatroid/
 ├── cli/            # Command-line interface (margatroid command)
 ├── mcp_client/     # MCP protocol client
 ├── compose/        # Compose file parser, validator, roster generator
-├── delegation/     # Delegation Board (task queue, state machine, dispute arbitration)
 ├── sandbox/        # OS-native sandbox (Linux: bwrap, macOS: sandbox-exec)
 │   └── src/ lib.rs, config.rs, mandatory.rs, linux.rs, macos.rs, proxy/
-├── runtime/        # Agent runtime (control loop, delegation processing, agent lifecycle)
+├── runtime/        # Runtime core (board, member, memory, workspace)
 │   └── src/
-│       ├── lib.rs       # WorkspaceRuntime — spawn/manage all agents
-│       ├── agent.rs     # AgentRuntime — single-agent control loop
-│       └── engine.rs    # Engine — process() drives LLM + tool calls
-├── memory/         # Memory system (Phase 3)
-│   └── src/
-│       ├── lib.rs       # Worklog + PersonalMemory trait
-│       ├── worklog.rs   # Team worklog
-│       └── personal.rs  # Personal memory storage and retrieval
+│       ├── lib.rs          # re-exports
+│       ├── board.rs        # DelegationBoard — four-zone model (publish/exec/returned/archive)
+│       ├── member.rs       # Member — single member encapsulating chat() + tool-call loop
+│       ├── memory.rs       # SQLite-backed memory (worklog + personal_memory + schedule)
+│       └── workspace.rs    # Workspace — member lifecycle, context injection, Manager scheduling
 └── plugins/        # Plugin system skeleton
 ```
 
 ### 6.2 Data Flow
 
 ```
-User ──(PRIORITY_USER)──→ Delegation Board
+User ──(PRIORITY_USER)──→ Manager (via board.offer())
                               │
-   Manager ←── poll ──────────┘
-        │
-        ├── decompose ──→ Delegation Board
-        │                    ├──→ Agent A (engine process)
-        │                    │      │
-        │                    │      ├── Need B → Delegation Board → Agent B
-        │                    │      ├── Need recall → recall skill → Board(skip_worklog) → B searches memory.db → summary
-        │                    │      └── Done → write worklog + personal memory → Board → Manager → Board → User
-        │                    │
-        │                    └──→ Agent C (parallel)
-        │                           └── Done → write worklog + personal memory → Board → Manager
-        │
-        └── cancel() → Delegation Board (interrupt current task when user switches direction)
+              Manager ──claim──→ analyze/plan ──return──→ returned zone
+                              │                                   │
+              Manager accept ←────────────────────────────────────┘
+                              │
+              Manager push_from_schedule ──→ offer ──→ [Publish Zone]
+                                                          │
+              Member claim ───────────────────────────────┘
+                              │
+              Member chat() ──→ bash / delegate / schedule_*
+                              │
+              Member return_task ──→ [Returned Zone] + write archive(SQLite)
+                              │
+              Publisher check_return ──→ accept ──→ remove
+                                    or reject ──→ back to publish
 ```
 
 ### 6.3 Provider Architecture

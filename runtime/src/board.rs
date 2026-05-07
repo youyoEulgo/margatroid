@@ -1,36 +1,30 @@
 //! 委托板（Delegation Board）
 //!
-//! 纯任务队列——不感知成员是否存在、忙闲。成员自己决定何时 poll。
-//!
-//! # 状态机
+//! 四区模型：发布区 → 执行区 → 返回区 → 档案区（SQLite）。
 //!
 //! ```text
-//! published ──→ assigned ──→ completed
-//!              │   │
-//!              │   └──→ interrupted (cancel)
-//!              └──→ rejected ──→ disputed
+//! offer ──→ [发布区] ──claim──→ [执行区] ──return──→ [返回区]
+//!               ↑                                    │       │
+//!               └────────── reject ──────────────────┘       │
+//!                                                            │
+//!                                    accept → [档案区: SQLite]
 //! ```
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
+
+use crate::memory::{MemoryEntry, PersonalMemory, SqliteMemory, Worklog, WorklogEntry};
 
 /// 用户消息的优先级——高于一切 agent 任务
 pub const PRIORITY_USER: u32 = u32::MAX;
 
-// ── Types ────────────────────────────────────────────────────
+/// 纠纷升级阈值
+const DISPUTE_THRESHOLD: u32 = 3;
 
-/// 任务状态
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
-    Published,
-    Assigned,
-    Completed,
-    Rejected,
-    Disputed,
-    Interrupted,
-}
+// ── Types ────────────────────────────────────────────────────
 
 /// 委托任务
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,47 +35,71 @@ pub struct DelegationTask {
     pub description: String,
     pub parameters: serde_json::Value,
     pub priority: u32,
-    pub status: TaskStatus,
-    pub reject_reason: Option<String>,
-    pub reject_count: u32,
     pub result: Option<String>,
+    pub reject_count: u32,
 }
 
-/// 委托板——纯任务队列
-///
-/// 两个队列：pending（待分配）和 archive（已分配/已完成/已驳回的归档）。
-/// 不维护成员状态，成员自己决定何时 poll。
+impl DelegationTask {
+    fn new(
+        from: &str,
+        to: &str,
+        description: &str,
+        parameters: serde_json::Value,
+        priority: u32,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+            description: description.to_string(),
+            parameters,
+            priority,
+            result: None,
+            reject_count: 0,
+        }
+    }
+
+    /// 克隆并重置为可重新发布的状态
+    fn clone_for_reoffer(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            from: self.from.clone(),
+            to: self.to.clone(),
+            description: self.description.clone(),
+            parameters: self.parameters.clone(),
+            priority: self.priority,
+            result: None,
+            reject_count: self.reject_count,
+        }
+    }
+}
+
+/// 委托板——三区任务队列
 pub struct DelegationBoard {
-    pending: RwLock<Vec<DelegationTask>>,
-    archive: RwLock<Vec<DelegationTask>>,
-    dispute_threshold: u32,
+    publish: RwLock<Vec<DelegationTask>>,
+    exec: RwLock<Vec<DelegationTask>>,
+    returned: RwLock<Vec<DelegationTask>>,
+    db: Arc<SqliteMemory>,
 }
 
 // ── Lifecycle ────────────────────────────────────────────────
 
 impl DelegationBoard {
-    pub fn new() -> Self {
+    pub fn new(db: Arc<SqliteMemory>) -> Self {
         Self {
-            pending: RwLock::new(Vec::new()),
-            archive: RwLock::new(Vec::new()),
-            dispute_threshold: 1,
+            publish: RwLock::new(Vec::new()),
+            exec: RwLock::new(Vec::new()),
+            returned: RwLock::new(Vec::new()),
+            db,
         }
-    }
-
-    pub fn with_dispute_threshold(mut self, threshold: u32) -> Self {
-        self.dispute_threshold = threshold;
-        self
     }
 }
 
 // ── Operations ───────────────────────────────────────────────
 
 impl DelegationBoard {
-    /// 发布委托任务
-    ///
-    /// 任务进入 pending 队列，等待目标成员 poll。
-    /// 不再校验目标是否存在——成员管理是 Workspace 的职责。
-    pub async fn post(
+    /// 发布委托到发布区（非阻塞，始终异步）
+    pub async fn offer(
         &self,
         from: &str,
         to: &str,
@@ -89,39 +107,23 @@ impl DelegationBoard {
         parameters: serde_json::Value,
         priority: u32,
     ) -> Result<String> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let task = DelegationTask {
-            id: id.clone(),
-            from: from.to_string(),
-            to: to.to_string(),
-            description: description.to_string(),
-            parameters,
-            priority,
-            status: TaskStatus::Published,
-            reject_reason: None,
-            reject_count: 0,
-            result: None,
-        };
+        let task = DelegationTask::new(from, to, description, parameters, priority);
+        let id = task.id.clone();
 
-        let mut pending = self.pending.write().await;
-        pending.push(task);
-        pending.sort_by(|a, b| b.priority.cmp(&a.priority));
+        let mut publish = self.publish.write().await;
+        publish.push(task);
+        publish.sort_by(|a, b| b.priority.cmp(&a.priority));
         Ok(id)
     }
 
-    /// 轮询分配给自己的任务
-    ///
-    /// 返回优先级最高、目标为自己的 Published 任务，并标记为 Assigned。
-    /// 没有匹配任务时返回 `None`。
-    pub async fn poll(&self, member_id: &str) -> Result<Option<DelegationTask>> {
-        let mut pending = self.pending.write().await;
-        if let Some(pos) = pending.iter().position(|t| t.to == member_id) {
-            let mut task = pending.remove(pos);
-            task.status = TaskStatus::Assigned;
+    /// 成员领取任务：从发布区移到执行区
+    pub async fn claim(&self, member_id: &str) -> Result<Option<DelegationTask>> {
+        let mut publish = self.publish.write().await;
+        if let Some(pos) = publish.iter().position(|t| t.to == member_id) {
+            let task = publish.remove(pos);
 
-            let task_for_archive = task.clone();
-            let mut archive = self.archive.write().await;
-            archive.push(task_for_archive);
+            let mut exec = self.exec.write().await;
+            exec.push(task.clone());
 
             Ok(Some(task))
         } else {
@@ -129,129 +131,182 @@ impl DelegationBoard {
         }
     }
 
-    /// 取消任务
-    ///
-    /// Published: 从 pending 直接移除。
-    /// Assigned / Rejected / Disputed: 标记 Interrupted。
-    /// Completed / Interrupted: 终态，不可取消。
-    pub async fn cancel(&self, task_id: &str) -> Result<()> {
-        // 先在 archive 中查找
-        {
-            let mut archive = self.archive.write().await;
-            if let Some(task) = archive.iter_mut().find(|t| t.id == task_id) {
-                match task.status {
-                    TaskStatus::Completed | TaskStatus::Interrupted => {
-                        bail!("任务 '{}' 已处于终态 {:?}，不能取消", task_id, task.status);
-                    }
-                    TaskStatus::Assigned | TaskStatus::Rejected | TaskStatus::Disputed => {
-                        task.status = TaskStatus::Interrupted;
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // 不在 archive，检查 pending
-        let mut pending = self.pending.write().await;
-        if let Some(pos) = pending.iter().position(|t| t.id == task_id) {
-            pending.remove(pos);
-            return Ok(());
-        }
-
-        bail!("任务 '{}' 不存在", task_id)
-    }
-
-    /// 完成任务
-    pub async fn complete(&self, member_id: &str, task_id: &str, result: &str) -> Result<()> {
-        self.transition(member_id, task_id, TaskStatus::Completed, |task| {
-            task.result = Some(result.to_string());
-        })
-        .await
-    }
-
-    /// 驳回任务结果
-    ///
-    /// 驳回次数超过阈值后自动变为 Disputed。
-    pub async fn reject(&self, member_id: &str, task_id: &str, reason: &str) -> Result<()> {
-        let threshold = self.dispute_threshold;
-        self.transition(member_id, task_id, TaskStatus::Rejected, move |task| {
-            task.reject_reason = Some(reason.to_string());
-            task.reject_count += 1;
-            if task.reject_count > threshold {
-                task.status = TaskStatus::Disputed;
-            }
-        })
-        .await
-    }
-
-    /// 状态转换
-    async fn transition<F>(
+    /// 成员提交结果：从执行区移到返回区，写入档案
+    pub async fn return_task(
         &self,
         member_id: &str,
         task_id: &str,
-        _expected_status: TaskStatus,
-        mut apply: F,
-    ) -> Result<()>
-    where
-        F: FnMut(&mut DelegationTask) + Send,
-    {
-        let mut archive = self.archive.write().await;
-        let task = archive
-            .iter_mut()
-            .find(|t| t.id == task_id)
-            .ok_or_else(|| anyhow::anyhow!("任务 '{}' 不存在", task_id))?;
+        result: &str,
+        summary: &str,
+    ) -> Result<()> {
+        let mut exec = self.exec.write().await;
+        let pos = exec
+            .iter()
+            .position(|t| t.id == task_id && t.to == member_id)
+            .ok_or_else(|| anyhow::anyhow!("执行区中未找到任务 '{}'", task_id))?;
 
-        if task.to != member_id {
-            bail!("任务 '{}' 不属于成员 '{}'", task_id, member_id);
-        }
-        if task.status != TaskStatus::Assigned {
-            bail!(
-                "任务 '{}' 当前状态为 {:?}，不能执行此操作",
-                task_id,
-                task.status
-            );
-        }
+        let mut task = exec.remove(pos);
+        task.result = Some(result.to_string());
 
-        apply(task);
+        let returned_task = task.clone();
+        let mut returned = self.returned.write().await;
+        returned.push(task);
 
-        // Disputed 自动重新发布给 manager
-        if task.status == TaskStatus::Disputed {
-            let mut pending = self.pending.write().await;
-            let mut reopened = task.clone();
-            reopened.to = "manager".to_string();
-            reopened.status = TaskStatus::Published;
-            pending.push(reopened);
-        }
-
+        // 写入档案（SQLite）
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let _ = self.db.append(WorklogEntry {
+            timestamp: now,
+            agent_id: member_id.to_string(),
+            delegation_id: returned_task.id.clone(),
+            summary: format!("{} — {}", returned_task.description, summary),
+            artifacts: vec![],
+        });
+        let _ = self.db.remember(MemoryEntry {
+            timestamp: now,
+            delegation_id: returned_task.id.clone(),
+            description: returned_task.description.clone(),
+            summary: summary.to_string(),
+            artifacts: vec![],
+            tags: vec![],
+        });
         Ok(())
     }
 
-    /// 获取指派给指定成员的当前任务
-    pub async fn current_task(&self, member_id: &str) -> Option<DelegationTask> {
-        let archive = self.archive.read().await;
-        archive
+    /// 发布者接受结果：从返回区删除
+    ///
+    /// 档案写入在 return_task 时已完成，accept 仅移除出返回区。
+    pub async fn accept(&self, member_id: &str, task_id: &str) -> Result<DelegationTask> {
+        let mut returned = self.returned.write().await;
+        let pos = returned
             .iter()
-            .find(|t| t.to == member_id && t.status == TaskStatus::Assigned)
-            .cloned()
+            .position(|t| t.id == task_id && t.from == member_id)
+            .ok_or_else(|| anyhow::anyhow!("返回区中未找到任务 '{}'", task_id))?;
+
+        Ok(returned.remove(pos))
     }
 
-    /// 查询委托板快照
-    pub async fn status(&self) -> BoardStatus {
-        let pending = self.pending.read().await;
-        let archive = self.archive.read().await;
-        BoardStatus {
-            pending_count: pending.len(),
-            archive_count: archive.len(),
+    /// 发布者驳回结果：从返回区回到发布区（reject_count++）
+    ///
+    /// 若 reject_count 超过阈值，to 改为 manager。
+    pub async fn reject(&self, member_id: &str, task_id: &str) -> Result<()> {
+        let mut returned = self.returned.write().await;
+        let pos = returned
+            .iter()
+            .position(|t| t.id == task_id && t.from == member_id)
+            .ok_or_else(|| anyhow::anyhow!("返回区中未找到任务 '{}'", task_id))?;
+
+        let task = &mut returned[pos];
+        task.reject_count += 1;
+        task.result = None;
+
+        if task.reject_count >= DISPUTE_THRESHOLD {
+            task.to = "manager".to_string();
         }
+
+        let reoffer = task.clone_for_reoffer();
+        returned.remove(pos);
+        drop(returned);
+
+        let mut publish = self.publish.write().await;
+        publish.push(reoffer);
+        publish.sort_by(|a, b| b.priority.cmp(&a.priority));
+        Ok(())
+    }
+
+    /// 取消任务：从任意区删除
+    pub async fn cancel(&self, task_id: &str) -> Result<DelegationTask> {
+        // 执行区
+        {
+            let mut exec = self.exec.write().await;
+            if let Some(pos) = exec.iter().position(|t| t.id == task_id) {
+                return Ok(exec.remove(pos));
+            }
+        }
+        // 发布区
+        {
+            let mut publish = self.publish.write().await;
+            if let Some(pos) = publish.iter().position(|t| t.id == task_id) {
+                return Ok(publish.remove(pos));
+            }
+        }
+        // 返回区
+        {
+            let mut returned = self.returned.write().await;
+            if let Some(pos) = returned.iter().position(|t| t.id == task_id) {
+                return Ok(returned.remove(pos));
+            }
+        }
+        bail!("任务 '{}' 不存在", task_id)
+    }
+
+    /// 查询返回区中自己发布的委托（等待 accept/reject）
+    pub async fn check_return(&self, member_id: &str) -> Vec<DelegationTask> {
+        let returned = self.returned.read().await;
+        returned
+            .iter()
+            .filter(|t| t.from == member_id)
+            .cloned()
+            .collect()
+    }
+
+    /// 查询自己的任务在执行区中是否存在
+    pub async fn is_working(&self, member_id: &str) -> bool {
+        let exec = self.exec.read().await;
+        exec.iter().any(|t| t.to == member_id)
+    }
+
+    /// 查询快照
+    pub async fn status(&self) -> BoardStatus {
+        let publish = self.publish.read().await;
+        let exec = self.exec.read().await;
+        let returned = self.returned.read().await;
+        BoardStatus {
+            publish_count: publish.len(),
+            exec_count: exec.len(),
+            returned_count: returned.len(),
+        }
+    }
+
+    // ── Schedule 委派 ──────────────────────────────────────────
+
+    pub fn schedule_add(&self, target: &str, description: &str, priority: i32) -> Result<i64> {
+        self.db.schedule_add(target, description, priority)
+    }
+
+    pub fn schedule_list(&self) -> Vec<crate::memory::ScheduleEntry> {
+        self.db.schedule_list()
+    }
+
+    pub fn schedule_pop(&self, target: &str) -> Option<crate::memory::ScheduleEntry> {
+        self.db.schedule_pop(target)
+    }
+
+    pub fn schedule_archive(&self, id: i64) {
+        self.db.schedule_archive(id)
+    }
+
+    pub fn schedule_revert(&self, id: i64) {
+        self.db.schedule_revert(id)
+    }
+
+    pub fn schedule_remove(&self, id: i64) -> Result<()> {
+        self.db.schedule_remove(id)
+    }
+
+    pub fn schedule_reorder(&self, id: i64, new_priority: i32) -> Result<()> {
+        self.db.schedule_reorder(id, new_priority)
     }
 }
 
 /// 委托板快照
 #[derive(Debug, Clone, Serialize)]
 pub struct BoardStatus {
-    pub pending_count: usize,
-    pub archive_count: usize,
+    pub publish_count: usize,
+    pub exec_count: usize,
+    pub returned_count: usize,
 }
 
 // ── Tests ────────────────────────────────────────────────────
@@ -260,105 +315,205 @@ pub struct BoardStatus {
 mod tests {
     use super::*;
 
+    fn test_db() -> Arc<SqliteMemory> {
+        Arc::new(SqliteMemory::open(":memory:").unwrap())
+    }
+
     #[tokio::test]
-    async fn post_and_poll_flow() {
-        let board = DelegationBoard::new();
+    async fn offer_claim_return_accept_flow() {
+        let board = DelegationBoard::new(test_db());
+
         let task_id = board
-            .post("architect", "coder", "write hello world", serde_json::json!({"lang": "rust"}), 1)
+            .offer("architect", "coder", "write code", serde_json::json!({}), 1)
             .await
             .unwrap();
         assert!(!task_id.is_empty());
+        assert_eq!(board.status().await.publish_count, 1);
 
-        let task = board.poll("coder").await.unwrap().unwrap();
+        // claim
+        let task = board.claim("coder").await.unwrap().unwrap();
         assert_eq!(task.id, task_id);
-        assert_eq!(task.status, TaskStatus::Assigned);
-        assert_eq!(task.from, "architect");
+        assert_eq!(board.status().await.publish_count, 0);
+        assert_eq!(board.status().await.exec_count, 1);
+
+        // return
+        board
+            .return_task("coder", &task_id, "fn main() {}", "coder's summary")
+            .await
+            .unwrap();
+        assert_eq!(board.status().await.exec_count, 0);
+        assert_eq!(board.status().await.returned_count, 1);
+
+        // accept
+        let done = board.accept("architect", &task_id).await.unwrap();
+        assert_eq!(done.result.unwrap(), "fn main() {}");
+        assert_eq!(board.status().await.returned_count, 0);
     }
 
     #[tokio::test]
-    async fn complete_task() {
-        let board = DelegationBoard::new();
+    async fn reject_goes_back_to_publish() {
+        let board = DelegationBoard::new(test_db());
+
         let task_id = board
-            .post("architect", "coder", "write code", serde_json::json!({}), 1)
+            .offer("architect", "coder", "write code", serde_json::json!({}), 1)
             .await
             .unwrap();
 
-        board.poll("coder").await.unwrap();
-        board.complete("coder", &task_id, "fn main() {}").await.unwrap();
+        board.claim("coder").await.unwrap();
+        board
+            .return_task("coder", &task_id, "bad code", "bad")
+            .await
+            .unwrap();
+        assert_eq!(board.status().await.returned_count, 1);
 
-        let status = board.status().await;
-        assert_eq!(status.pending_count, 0);
+        board.reject("architect", &task_id).await.unwrap();
+        assert_eq!(board.status().await.returned_count, 0);
+        assert_eq!(board.status().await.publish_count, 1);
+
+        // 任务回到发布区，coder 可以重新 claim
+        let retry = board.claim("coder").await.unwrap().unwrap();
+        assert_eq!(retry.id, task_id);
+        assert_eq!(retry.reject_count, 1);
     }
 
     #[tokio::test]
-    async fn reject_and_dispute() {
-        let board = DelegationBoard::new().with_dispute_threshold(1);
+    async fn reject_over_threshold_escalates_to_manager() {
+        let board = DelegationBoard::new(test_db());
+
         let task_id = board
-            .post("architect", "coder", "write code", serde_json::json!({}), 1)
+            .offer("architect", "coder", "write code", serde_json::json!({}), 1)
             .await
             .unwrap();
 
-        board.poll("coder").await.unwrap();
-        board.reject("coder", &task_id, "not good enough").await.unwrap();
+        for _ in 0..DISPUTE_THRESHOLD {
+            board.claim("coder").await.unwrap();
+            board
+                .return_task("coder", &task_id, "nope", "no")
+                .await
+                .unwrap();
+            board.reject("architect", &task_id).await.unwrap();
+        }
 
-        // 超过阈值，重新发布给 manager
-        let pending = board.status().await.pending_count;
-        assert_eq!(pending, 1);
+        // 超过阈值，to 改为 manager
+        let task = board.claim("manager").await.unwrap().unwrap();
+        assert_eq!(task.id, task_id);
+        assert_eq!(task.to, "manager");
+        assert_eq!(task.reject_count, DISPUTE_THRESHOLD);
     }
 
     #[tokio::test]
     async fn priority_ordering() {
-        let board = DelegationBoard::new();
-        board.post("architect", "coder", "low", serde_json::json!({}), 1).await.unwrap();
-        board.post("architect", "coder", "high", serde_json::json!({}), 10).await.unwrap();
+        let board = DelegationBoard::new(test_db());
+        board
+            .offer("architect", "coder", "low", serde_json::json!({}), 1)
+            .await
+            .unwrap();
+        board
+            .offer("architect", "coder", "high", serde_json::json!({}), 10)
+            .await
+            .unwrap();
 
-        let task = board.poll("coder").await.unwrap().unwrap();
+        let task = board.claim("coder").await.unwrap().unwrap();
         assert_eq!(task.description, "high");
     }
 
     #[tokio::test]
-    async fn cancel_assigned_task() {
-        let board = DelegationBoard::new();
+    async fn check_return_lists_pending_review() {
+        let board = DelegationBoard::new(test_db());
         let task_id = board
-            .post("architect", "coder", "task", serde_json::json!({}), 1)
+            .offer("architect", "coder", "write code", serde_json::json!({}), 1)
             .await
             .unwrap();
 
-        board.poll("coder").await.unwrap();
-        board.cancel(&task_id).await.unwrap();
-
-        let status = board.status().await;
-        assert_eq!(status.pending_count, 0);
-    }
-
-    #[tokio::test]
-    async fn cancel_published_task() {
-        let board = DelegationBoard::new();
-        let task_id = board
-            .post("architect", "coder", "no longer needed", serde_json::json!({}), 1)
+        board.claim("coder").await.unwrap();
+        board
+            .return_task("coder", &task_id, "done", "ok")
             .await
             .unwrap();
 
-        assert_eq!(board.status().await.pending_count, 1);
+        let pending = board.check_return("architect").await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, task_id);
+
+        // coder 看不到（是发给 architect 的）
+        let empty = board.check_return("coder").await;
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_from_exec() {
+        let board = DelegationBoard::new(test_db());
+        let task_id = board
+            .offer("architect", "coder", "write code", serde_json::json!({}), 1)
+            .await
+            .unwrap();
+
+        board.claim("coder").await.unwrap();
         board.cancel(&task_id).await.unwrap();
-        assert_eq!(board.status().await.pending_count, 0);
+        assert_eq!(board.status().await.exec_count, 0);
     }
 
     #[tokio::test]
-    async fn user_priority_overrides_all() {
-        let board = DelegationBoard::new();
-        board.post("architect", "coder", "normal", serde_json::json!({}), 5).await.unwrap();
-        board.post("user", "coder", "urgent!", serde_json::json!({}), PRIORITY_USER).await.unwrap();
+    async fn cancel_from_publish() {
+        let board = DelegationBoard::new(test_db());
+        let task_id = board
+            .offer(
+                "architect",
+                "coder",
+                "no longer needed",
+                serde_json::json!({}),
+                1,
+            )
+            .await
+            .unwrap();
 
-        let task = board.poll("coder").await.unwrap().unwrap();
-        assert_eq!(task.description, "urgent!");
-        assert_eq!(task.from, "user");
+        assert_eq!(board.status().await.publish_count, 1);
+        board.cancel(&task_id).await.unwrap();
+        assert_eq!(board.status().await.publish_count, 0);
     }
 
     #[tokio::test]
-    async fn cancel_nonexistent_task_fails() {
-        let board = DelegationBoard::new();
+    async fn cancel_nonexistent_fails() {
+        let board = DelegationBoard::new(test_db());
         let err = board.cancel("nonexistent").await.unwrap_err();
         assert!(err.to_string().contains("不存在"));
+    }
+
+    #[tokio::test]
+    async fn user_priority() {
+        let board = DelegationBoard::new(test_db());
+        board
+            .offer("architect", "coder", "normal", serde_json::json!({}), 5)
+            .await
+            .unwrap();
+        board
+            .offer(
+                "user",
+                "coder",
+                "urgent!",
+                serde_json::json!({}),
+                PRIORITY_USER,
+            )
+            .await
+            .unwrap();
+
+        let task = board.claim("coder").await.unwrap().unwrap();
+        assert_eq!(task.description, "urgent!");
+    }
+
+    #[tokio::test]
+    async fn is_working_tracks_exec_zone() {
+        let board = DelegationBoard::new(test_db());
+        assert!(!board.is_working("coder").await);
+
+        board
+            .offer("architect", "coder", "write code", serde_json::json!({}), 1)
+            .await
+            .unwrap();
+        board.claim("coder").await.unwrap();
+        assert!(board.is_working("coder").await);
+
+        // 另一个成员不受影响
+        assert!(!board.is_working("designer").await);
     }
 }

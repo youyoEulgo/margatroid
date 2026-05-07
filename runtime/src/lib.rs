@@ -8,7 +8,7 @@ pub mod member;
 pub mod memory;
 pub mod workspace;
 
-pub use board::{DelegationBoard, PRIORITY_USER, BoardStatus, DelegationTask, TaskStatus};
-pub use member::{DynProviderLike, Member};
+pub use board::{DelegationBoard, PRIORITY_USER, BoardStatus, DelegationTask};
+pub use member::Member;
 pub use memory::SqliteMemory;
 pub use workspace::Workspace;
