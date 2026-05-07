@@ -83,7 +83,7 @@ Manager 专用的私有任务规划工具，存于 board 的 SQLite：
 | `schedule_remove` | 删除指定条目 |
 | `schedule_reorder` | 调整优先级 |
 
-**Manager 的 push_from_schedule**：Manager 空闲时遍历 schedule，检查目标成员是否在工作（`is_working`），空闲则 `pop → offer → archive`。此过程在 Manager 的控制循环中自动执行。
+**Manager 的 push_from_schedule**：Manager 空闲时遍历 schedule，检查目标成员在 board 中是否还有未归档的任务（`has_pending`）。一个成员在 board 中最多只能有一条任务，完全归档后 Manager 才 `pop → offer → archive` 推下一条。
 
 ### 2.6 沙箱（Sandbox）
 

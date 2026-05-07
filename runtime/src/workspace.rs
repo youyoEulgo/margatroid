@@ -359,8 +359,8 @@ async fn manager_loop(
 async fn push_from_schedule(board: &DelegationBoard) {
     let entries = board.schedule_list();
     for entry in entries {
-        if board.is_working(&entry.target).await {
-            continue; // 成员正在忙，跳过
+        if board.has_pending(&entry.target).await {
+            continue; // 成员还有未归档任务，跳过
         }
         if let Some(s) = board.schedule_pop(&entry.target) {
             match board
