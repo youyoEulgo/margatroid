@@ -48,20 +48,44 @@ Manager 是 Workspace 中的特殊成员，角色等同于项目经理：
 
 ### 2.4 委托板（Delegation Board）
 
-委托板是 Workspace 的核心协作基础设施，是一个**事件驱动的任务队列**。其工作原理类比 Tokio 运行时：
+委托板是 Workspace 的核心协作基础设施，采用**四区模型**：
 
-- 任何成员（包括 Manager 和普通智能体）可以向委托板发布委托任务
-- 委托任务包含：目标成员 ID、任务描述、结构化参数、优先级、截止条件
-- 委托板维护每个成员的状态标记（idle / working）
-- 当目标成员空闲时，委托板立即分配任务
-- 当任务完成或失败时，委托板通知发起者
-- 事件驱动而非轮询——成员完成工作后主动通知委托板，委托板被唤醒后扫描待办队列
+```
+offer ──→ [发布区] ──claim──→ [执行区] ──return──→ [返回区]
+              ↑                                    │       │
+              └────────── reject ──────────────────┘       │
+                                                           │
+                                    accept → [档案区: SQLite]
+```
 
-**用户与 Manager 的通信同样通过委托板实现。** 用户消息以 `PRIORITY_USER`（u32::MAX）的绝对最高优先级发布到委托板。用户想切换方向时，Manager 对当前任务调用 `cancel()`——委托板将其标记为 Interrupted 并释放目标成员，Manager 随即 poll 到新的用户任务。
+- **发布区**：Manager 或成员 `offer` 委托任务进入，按优先级排队
+- **执行区**：目标成员 `claim` 领取后进入
+- **返回区**：成员 `return_task` 提交结果后进入，同时写入档案（worklog + personal_memory）
+- **档案区**：SQLite，`return_task` 时自动写入，无需额外操作
 
-**回忆请求也走委托板，但不写入工作日志。** 成员 A 想查询成员 B 的过往经验时，通过委托板发布一个带 `skip_worklog: true` 的轻量委托。B 搜自己的个人记忆，返回摘要。和普通委托的区别：无工作日志、不可驳回、不占用 B 的 Working 状态超过必要时间。
+**纯异步委托**：所有委托都是非阻塞的——发出后立即返回 task_id，结果通过返回区自然流转。成员不等待被委托方完成。
 
-### 2.5 沙箱（Sandbox）
+**纠纷**：发布者 `reject` 驳回结果，任务回到发布区并 `reject_count++`。超过 `DISPUTE_THRESHOLD`（默认 3 次）时 `to` 改为 `manager`，自动上报仲裁。
+
+**用户消息**：通过 `offer("user", "manager", ...)` 以 `PRIORITY_USER`（u32::MAX）发布到发布区。
+
+**记忆写入**：`return_task` 时自动写 worklog（团队）和 personal_memory（个人），然后进入返回区由发布者 accept。board 直接持有 SQLite。
+
+### 2.5 计划表（Schedule）
+
+Manager 专用的私有任务规划工具，存于 board 的 SQLite：
+
+| 操作 | 效果 |
+|---|---|
+| `schedule_add` | 添加 planned 条目（target, description, priority） |
+| `schedule_list` | 列出所有 planned 条目 |
+| `schedule_pop` | 取出某成员当前最高优先级的 planned 条目，标记 offered |
+| `schedule_remove` | 删除指定条目 |
+| `schedule_reorder` | 调整优先级 |
+
+**Manager 的 push_from_schedule**：Manager 空闲时遍历 schedule，检查目标成员是否在工作（`is_working`），空闲则 `pop → offer → archive`。此过程在 Manager 的控制循环中自动执行。
+
+### 2.6 沙箱（Sandbox）
 
 Margatroid 采用 **OS 原生沙箱方案**（参考 Claude Code 的 `sandbox-runtime`），不依赖 Docker 或虚拟机，利用操作系统内核级隔离机制：
 
@@ -272,43 +296,40 @@ margatroid/
 ├── cli/            # 命令行界面（margatroid 命令）
 ├── mcp_client/     # MCP 协议客户端
 ├── compose/        # compose 文件解析器、校验器、roster 生成器
-├── delegation/     # 委托板（任务队列、状态机、纠纷仲裁）
 ├── sandbox/        # OS 原生沙箱（Linux: bwrap，macOS: sandbox-exec）
 │   └── src/
 │       ├── lib.rs / config.rs / mandatory.rs
 │       ├── linux.rs / macos.rs
 │       └── proxy/ (http.rs, socks5.rs)
-├── runtime/        # Agent 运行时（控制循环、委托处理、agent 生命周期）
+├── runtime/        # 运行时核心（委托板、成员、记忆、Workspace）
 │   └── src/
-│       ├── lib.rs       # WorkspaceRuntime — 启动/管理所有 agent
-│       ├── agent.rs     # AgentRuntime — 单 agent 控制循环
-│       └── engine.rs    # 引擎 — process() 驱动 LLM + 工具调用
-├── memory/         # 记忆系统（Phase 3）
-│   └── src/
-│       ├── lib.rs       # Worklog + PersonalMemory trait
-│       ├── worklog.rs   # 团队工作日志
-│       └── personal.rs  # 个人记忆存储与检索
+│       ├── lib.rs          # re-exports
+│       ├── board.rs        # DelegationBoard — 四区模型（发布/执行/返回/档案）
+│       ├── member.rs       # Member — 单成员封装（chat() + tool-call loop）
+│       ├── memory.rs       # SQLite 记忆（worklog + personal_memory + schedule）
+│       └── workspace.rs    # Workspace — 成员生命周期、上下文注入、Manager 调度
 └── plugins/        # 插件系统骨架
 ```
 
 ### 6.2 数据流
 
 ```
-用户 ──(PRIORITY_USER)──→ 委托板
+用户 ──(PRIORITY_USER)──→ Manager（通过委托板 offer）
                               │
-    Manager ←── poll ─────────┘
-         │
-         ├── 分解任务 ──→ 委托板
-         │                  ├──→ agent A (引擎处理)
-         │                  │      │
-         │                  │      ├── 发现需要 B → 委托板 → agent B
-         │                  │      ├── 需要回忆 → recall skill → 委托板(skip_worklog) → B 搜 memory.db → 摘要返回
-         │                  │      └── 完成 → 写工作日志 + 个人记忆 → 委托板 → Manager → 委托板 → 用户
-         │                  │
-         │                  └──→ agent C (并行)
-         │                         └── 完成 → 写工作日志 + 个人记忆 → 委托板 → Manager
-         │
-         └── cancel() → 委托板 (用户切换方向时打断当前任务)
+              Manager ──claim──→ 分析/规划 ──return──→ 返回区
+                              │                               │
+              Manager accept ←────────────────────────────────┘
+                              │
+              Manager push_from_schedule ──→ offer ──→ [发布区]
+                                                          │
+              成员 claim ──────────────────────────────────┘
+                              │
+              成员 chat() ──→ bash / delegate / schedule_*
+                              │
+              成员 return_task ──→ [返回区] + 写入档案(SQLite)
+                              │
+              发布者 check_return ──→ accept ──→ 删除
+                                 或 reject ──→ 回到发布区
 ```
 
 ### 6.3 Provider 架构

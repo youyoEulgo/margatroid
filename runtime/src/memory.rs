@@ -58,6 +58,16 @@ pub struct SqliteMemory {
     conn: Mutex<Connection>,
 }
 
+/// 计划表条目（Manager 专用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleEntry {
+    pub id: i64,
+    pub target: String,
+    pub description: String,
+    pub priority: i32,
+    pub status: String, // planned | offered | archived
+}
+
 impl SqliteMemory {
     /// 打开或创建数据库，初始化表
     pub fn open(path: &str) -> Result<Self> {
@@ -88,6 +98,15 @@ impl SqliteMemory {
             );
             CREATE INDEX IF NOT EXISTS idx_personal_agent ON personal_memory(agent_id);
             CREATE INDEX IF NOT EXISTS idx_personal_delegation ON personal_memory(delegation_id);
+
+            CREATE TABLE IF NOT EXISTS schedule (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target TEXT NOT NULL,
+                description TEXT NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'planned'
+            );
+            CREATE INDEX IF NOT EXISTS idx_schedule_status ON schedule(status);
             ",
         )?;
 
@@ -166,6 +185,103 @@ impl SqliteMemory {
         conn.query_row("SELECT COUNT(*) FROM worklog", [], |r| r.get::<_, i64>(0))
             .map(|c| c as usize)
             .unwrap_or(0)
+    }
+
+    // ── 计划表操作 ──
+
+    /// 添加计划条目
+    pub fn schedule_add(&self, target: &str, description: &str, priority: i32) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO schedule (target, description, priority) VALUES (?, ?, ?)",
+            rusqlite::params![target, description, priority],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 列出所有 planned 状态的条目（按优先级排序）
+    pub fn schedule_list(&self) -> Vec<ScheduleEntry> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, target, description, priority, status FROM schedule WHERE status = 'planned' ORDER BY priority DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map([], |r| {
+            Ok(ScheduleEntry {
+                id: r.get(0)?,
+                target: r.get(1)?,
+                description: r.get(2)?,
+                priority: r.get(3)?,
+                status: r.get(4)?,
+            })
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// 取出指定成员的下一个任务（最高优先级），标记为 offered
+    pub fn schedule_pop(&self, target: &str) -> Option<ScheduleEntry> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, target, description, priority, status FROM schedule
+                 WHERE status = 'planned' AND target = ?
+                 ORDER BY priority DESC LIMIT 1",
+            )
+            .ok()?;
+        let entry = stmt
+            .query_row(rusqlite::params![target], |r| {
+                Ok(ScheduleEntry {
+                    id: r.get(0)?,
+                    target: r.get(1)?,
+                    description: r.get(2)?,
+                    priority: r.get(3)?,
+                    status: r.get(4)?,
+                })
+            })
+            .ok()?;
+        let _ = conn.execute(
+            "UPDATE schedule SET status = 'offered' WHERE id = ?",
+            rusqlite::params![entry.id],
+        );
+        Some(entry)
+    }
+
+    /// 将条目标记为 archived
+    pub fn schedule_archive(&self, id: i64) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE schedule SET status = 'archived' WHERE id = ?",
+            rusqlite::params![id],
+        );
+    }
+
+    /// 将已 pop 的条目回退为 planned
+    pub fn schedule_revert(&self, id: i64) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE schedule SET status = 'planned' WHERE id = ?",
+            rusqlite::params![id],
+        );
+    }
+
+    /// 删除计划条目
+    pub fn schedule_remove(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM schedule WHERE id = ?", rusqlite::params![id])?;
+        Ok(())
+    }
+
+    /// 调整优先级
+    pub fn schedule_reorder(&self, id: i64, new_priority: i32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE schedule SET priority = ? WHERE id = ?",
+            rusqlite::params![new_priority, id],
+        )?;
+        Ok(())
     }
 }
 

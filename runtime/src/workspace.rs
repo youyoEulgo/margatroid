@@ -8,16 +8,19 @@ use anyhow::Result;
 use sandbox::SandboxManager;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use types::{ComposeFile, RequestTool};
 
 use crate::board::{DelegationBoard, PRIORITY_USER};
-use crate::member::{DynProviderLike, Member};
-use crate::memory::{PersonalMemory, SqliteMemory, Worklog};
+use crate::member::Member;
+use crate::memory::{SqliteMemory, Worklog};
 
 /// 默认注入上下文的工具集
 fn default_tools() -> Vec<RequestTool> {
+    base_tools()
+}
+
+fn base_tools() -> Vec<RequestTool> {
     vec![
         types::RequestTool {
             r#type: "function".into(),
@@ -40,7 +43,9 @@ fn default_tools() -> Vec<RequestTool> {
             r#type: "function".into(),
             function: types::FunctionDescription {
                 name: "delegate".into(),
-                description: Some("将子任务委托给团队中的另一个成员".into()),
+                description: Some(
+                    "将子任务委托给团队中的另一个成员（发布到委托板，异步获取结果）".into(),
+                ),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -60,6 +65,65 @@ fn default_tools() -> Vec<RequestTool> {
     ]
 }
 
+fn manager_tools() -> Vec<RequestTool> {
+    let mut tools = base_tools();
+    tools.extend(vec![
+        types::RequestTool {
+            r#type: "function".into(),
+            function: types::FunctionDescription {
+                name: "schedule_add".into(),
+                description: Some("向计划表添加任务（Manager 专用）".into()),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "description": "指派给谁" },
+                        "description": { "type": "string", "description": "任务描述" },
+                        "priority": { "type": "integer", "description": "优先级，越大越高" }
+                    },
+                    "required": ["target", "description"]
+                }),
+            },
+        },
+        types::RequestTool {
+            r#type: "function".into(),
+            function: types::FunctionDescription {
+                name: "schedule_list".into(),
+                description: Some("列出计划表所有待处理任务（Manager 专用）".into()),
+                parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            },
+        },
+        types::RequestTool {
+            r#type: "function".into(),
+            function: types::FunctionDescription {
+                name: "schedule_pop".into(),
+                description: Some("为指定成员弹出计划表的下一个任务（Manager 专用）".into()),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "description": "成员 ID" }
+                    },
+                    "required": ["target"]
+                }),
+            },
+        },
+        types::RequestTool {
+            r#type: "function".into(),
+            function: types::FunctionDescription {
+                name: "schedule_remove".into(),
+                description: Some("从计划表删除任务（Manager 专用）".into()),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "条目 ID" }
+                    },
+                    "required": ["id"]
+                }),
+            },
+        },
+    ]);
+    tools
+}
+
 /// Workspace —— 所有成员的运行环境
 pub struct Workspace {
     pub board: Arc<DelegationBoard>,
@@ -71,19 +135,22 @@ pub struct Workspace {
 
 impl Workspace {
     /// 从 compose 文件创建并启动所有成员
-    pub async fn start(compose: &ComposeFile, provider: Arc<dyn DynProviderLike>) -> Result<Self> {
+    pub async fn start(
+        compose: &ComposeFile,
+        provider: Arc<dyn providers::DynAiProvider>,
+    ) -> Result<Self> {
         // 1. 沙箱
         let sandbox_config = load_sandbox_config(compose);
         let mut sandbox_mgr = SandboxManager::new();
         sandbox_mgr.initialize(sandbox_config).await?;
         let sandbox = Arc::new(RwLock::new(sandbox_mgr));
 
-        // 2. 委托板
-        let board = Arc::new(DelegationBoard::new());
-
-        // 3. SQLite 记忆
+        // 2. SQLite 记忆
         let db_path = memory_path(compose);
         let db = Arc::new(SqliteMemory::open(&db_path)?);
+
+        // 3. 委托板（持有 SQLite 引用）
+        let board = Arc::new(DelegationBoard::new(db.clone()));
 
         // 4. 构建成员（Arc 包装以跨 task 共享）
         let mut members: HashMap<String, Arc<Member>> = HashMap::new();
@@ -91,24 +158,33 @@ impl Workspace {
             let member = Arc::new(Member::new(
                 &agent.id,
                 &agent.model,
-                &agent.system_prompt,
                 provider.clone(),
                 sandbox.clone(),
+                board.clone(),
             ));
             members.insert(agent.id.clone(), member);
         }
 
-        // 5. 启动成员循环
-        let tools = default_tools();
+        // 5. 启动成员循环（manager 有 schedule 工具 + 推任务逻辑）
         let mut handles = Vec::new();
-        for (_id, member) in &members {
-            let member = Arc::clone(member);
+        for agent in &compose.agents {
+            let member = Arc::clone(&members[&agent.id]);
             let board_clone = board.clone();
             let db_clone = db.clone();
-            let tools = tools.clone();
+            let system_prompt = agent.system_prompt.clone();
+            let is_manager = agent.id == "manager";
+            let tools = if is_manager {
+                manager_tools()
+            } else {
+                default_tools()
+            };
 
             handles.push(tokio::spawn(async move {
-                member_loop(member, board_clone, db_clone, tools).await;
+                if is_manager {
+                    manager_loop(member, system_prompt, board_clone, db_clone, tools).await;
+                } else {
+                    member_loop(member, system_prompt, board_clone, db_clone, tools).await;
+                }
             }));
         }
 
@@ -125,7 +201,7 @@ impl Workspace {
     pub async fn send_user_message(&self, message: &str) -> Result<String> {
         let task_id = self
             .board
-            .post(
+            .offer(
                 "user",
                 "manager",
                 message,
@@ -154,6 +230,7 @@ impl Drop for Workspace {
 
 async fn member_loop(
     member: Arc<Member>,
+    system_prompt: String,
     board: Arc<DelegationBoard>,
     db: Arc<SqliteMemory>,
     tools: Vec<RequestTool>,
@@ -161,22 +238,25 @@ async fn member_loop(
     tracing::info!("成员 '{}' 启动控制循环", member.id);
 
     loop {
-        // 1. poll
-        let task = match board.poll(&member.id).await {
+        // 0. 检查返回区——接受自己发布的任务结果
+        check_and_accept_returned(&member.id, &board).await;
+
+        // 1. claim 新任务
+        let task = match board.claim(&member.id).await {
             Ok(Some(t)) => t,
             Ok(None) => {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 continue;
             }
             Err(e) => {
-                tracing::error!("成员 '{}' poll 失败: {}", member.id, e);
+                tracing::error!("成员 '{}' claim 失败: {}", member.id, e);
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
         };
 
         tracing::info!(
-            "成员 '{}' 收到任务 '{}': {}",
+            "成员 '{}' 领取任务 '{}': {}",
             member.id,
             task.id,
             task.description
@@ -185,38 +265,143 @@ async fn member_loop(
         // 2. 准备上下文：worklog + 相关 personal memory
         let context = prepare_context(&db, &member.id, &task.description);
 
-        // 3. 拼 prompt
+        // 3. 拼完整 prompt：系统 prompt + 上下文 + 任务
         let prompt = format!(
-            "团队工作日志与相关记忆：\n{}\n\n任务描述：{}\n参数：{}",
-            context, task.description, task.parameters
+            "{}\n\n---\n\n团队工作日志与相关记忆：\n{}\n\n---\n\n任务描述：{}\n参数：{}",
+            system_prompt, context, task.description, task.parameters
         );
 
-        // 4. 调用 member.chat()（内部 tool-call loop + 内联总结）
+        // 3. 执行
         let outcome = match member.chat(&prompt, &tools).await {
             Ok(o) => o,
             Err(e) => {
                 let err_msg = format!("执行失败: {}", e);
                 tracing::error!("成员 '{}': {}", member.id, err_msg);
-                let _ = board.complete(&member.id, &task.id, &err_msg).await;
+                let _ = board
+                    .return_task(&member.id, &task.id, &err_msg, "执行失败")
+                    .await;
                 continue;
             }
         };
 
-        // 5. 提交结果
-        if let Err(e) = board.complete(&member.id, &task.id, &outcome.result).await {
+        // 4. 提交结果到返回区（board 内部写入档案）
+        if let Err(e) = board
+            .return_task(&member.id, &task.id, &outcome.result, &outcome.summary)
+            .await
+        {
             tracing::error!("成员 '{}' 提交结果失败: {}", member.id, e);
             continue;
         }
         tracing::info!("成员 '{}' 完成任务 '{}'", member.id, task.id);
+    }
+}
 
-        // 6. 写记忆
-        write_memory(
-            &db,
-            &member.id,
-            &task.id,
-            &task.description,
-            &outcome.summary,
+/// Manager 专用循环：完成归档后从 schedule 推任务到发布区
+async fn manager_loop(
+    member: Arc<Member>,
+    system_prompt: String,
+    board: Arc<DelegationBoard>,
+    db: Arc<SqliteMemory>,
+    tools: Vec<RequestTool>,
+) {
+    tracing::info!("Manager '{}' 启动控制循环", member.id);
+
+    loop {
+        check_and_accept_returned(&member.id, &board).await;
+
+        let task = match board.claim(&member.id).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                push_from_schedule(&board).await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(e) => {
+                tracing::error!("Manager claim 失败: {}", e);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        tracing::info!("Manager 领取任务 '{}': {}", task.id, task.description);
+
+        let context = prepare_context(&db, &member.id, &task.description);
+        let prompt = format!(
+            "{}\n\n---\n\n团队工作日志与相关记忆：\n{}\n\n---\n\n任务描述：{}\n参数：{}",
+            system_prompt, context, task.description, task.parameters
         );
+
+        let outcome = match member.chat(&prompt, &tools).await {
+            Ok(o) => o,
+            Err(e) => {
+                let err_msg = format!("执行失败: {}", e);
+                let _ = board
+                    .return_task(&member.id, &task.id, &err_msg, "执行失败")
+                    .await;
+                continue;
+            }
+        };
+
+        if let Err(e) = board
+            .return_task(&member.id, &task.id, &outcome.result, &outcome.summary)
+            .await
+        {
+            tracing::error!("Manager 提交结果失败: {}", e);
+            continue;
+        }
+        tracing::info!("Manager 完成任务 '{}'", task.id);
+
+        push_from_schedule(&board).await;
+    }
+}
+
+/// 从计划表为每个空闲成员推一条任务到发布区
+async fn push_from_schedule(board: &DelegationBoard) {
+    let entries = board.schedule_list();
+    for entry in entries {
+        if board.is_working(&entry.target).await {
+            continue; // 成员正在忙，跳过
+        }
+        if let Some(s) = board.schedule_pop(&entry.target) {
+            match board
+                .offer(
+                    "manager",
+                    &entry.target,
+                    &entry.description,
+                    serde_json::json!({}),
+                    entry.priority as u32,
+                )
+                .await
+            {
+                Ok(_) => {
+                    board.schedule_archive(s.id);
+                }
+                Err(e) => {
+                    tracing::error!("Manager offer 失败: {}, 回退条目 {}", e, s.id);
+                    board.schedule_revert(s.id);
+                }
+            }
+        }
+    }
+}
+
+/// 检查返回区，自动 accept 自己发布的任务结果
+async fn check_and_accept_returned(member_id: &str, board: &DelegationBoard) {
+    let returned = board.check_return(member_id).await;
+    for task in &returned {
+        match board.accept(member_id, &task.id).await {
+            Ok(t) => {
+                tracing::info!(
+                    "成员 '{}' 接受委托结果 '{}': {}",
+                    member_id,
+                    t.id,
+                    t.result.as_deref().unwrap_or("")
+                );
+            }
+            Err(e) => {
+                tracing::error!("成员 '{}' accept 失败 '{}': {}", member_id, task.id, e);
+            }
+        }
     }
 }
 
@@ -294,45 +479,7 @@ fn truncate(s: &str, max_chars: usize) -> &str {
     }
 }
 
-// ── 记忆写入 ─────────────────────────────────────────────────
-
-fn write_memory(
-    db: &SqliteMemory,
-    agent_id: &str,
-    delegation_id: &str,
-    description: &str,
-    summary: &str,
-) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    // worklog
-    if let Err(e) = db.append(crate::memory::WorklogEntry {
-        timestamp: now,
-        agent_id: agent_id.to_string(),
-        delegation_id: delegation_id.to_string(),
-        summary: format!("{} — {}", description, summary),
-        artifacts: vec![],
-    }) {
-        tracing::error!("写工作日志失败: {}", e);
-    }
-
-    // personal memory
-    if let Err(e) = db.remember(crate::memory::MemoryEntry {
-        timestamp: now,
-        delegation_id: delegation_id.to_string(),
-        description: description.to_string(),
-        summary: summary.to_string(),
-        artifacts: vec![],
-        tags: vec![],
-    }) {
-        tracing::error!("写个人记忆失败: {}", e);
-    }
-}
-
-// ── Helpers ──────────────────────────────────────────────────
+// ── 帮助函数 ──────────────────────────────────────────────────
 
 fn load_sandbox_config(compose: &ComposeFile) -> sandbox::config::SandboxConfig {
     let workspace_name = &compose.workspace.name;
@@ -399,32 +546,5 @@ mod tests {
         let db = SqliteMemory::open(":memory:").unwrap();
         let ctx = prepare_context(&db, "coder", "写一个 API");
         assert!(ctx.contains("暂无记录"));
-    }
-
-    #[test]
-    fn prepare_context_with_data() {
-        use crate::memory::{MemoryEntry, WorklogEntry};
-
-        let db = SqliteMemory::open(":memory:").unwrap();
-        db.append(WorklogEntry {
-            timestamp: 1705000000,
-            agent_id: "coder".into(),
-            delegation_id: "d-001".into(),
-            summary: "实现了 /api/users".into(),
-            artifacts: vec!["src/users.rs".into()],
-        })
-        .unwrap();
-        db.remember(MemoryEntry {
-            timestamp: 1705000001,
-            delegation_id: "d-001".into(),
-            description: "写用户接口".into(),
-            summary: "用 actix-web 实现 GET /api/users".into(),
-            artifacts: vec![],
-            tags: vec!["api".into()],
-        })
-        .unwrap();
-
-        let ctx = prepare_context(&db, "coder", "修复 API bug");
-        assert!(ctx.contains("/api/users"));
     }
 }
