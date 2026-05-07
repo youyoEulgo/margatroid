@@ -258,19 +258,9 @@ impl DelegationBoard {
         exec.iter().any(|t| t.to == member_id)
     }
 
-    /// 查询成员在 board 中是否还有任何未归档的任务
-    pub async fn has_pending(&self, member_id: &str) -> bool {
-        let publish = self.publish.read().await;
-        if publish.iter().any(|t| t.to == member_id) {
-            return true;
-        }
-        let exec = self.exec.read().await;
-        if exec.iter().any(|t| t.to == member_id) {
-            return true;
-        }
-        let returned = self.returned.read().await;
-        returned.iter().any(|t| t.to == member_id && t.from != member_id)
-        // from != member_id: 排除自己发布的委托（在返回区等别人 accept）
+    /// 查询该成员是否有未完成的阶段任务（status='offered'）
+    pub fn has_offered_schedule(&self, member_id: &str) -> bool {
+        self.db.has_offered_schedule(member_id)
     }
 
     /// 查询快照
@@ -301,6 +291,10 @@ impl DelegationBoard {
 
     pub fn schedule_archive(&self, id: i64) {
         self.db.schedule_archive(id)
+    }
+
+    pub fn schedule_archive_by_target(&self, target: &str) {
+        self.db.schedule_archive_by_target(target)
     }
 
     pub fn schedule_revert(&self, id: i64) {
