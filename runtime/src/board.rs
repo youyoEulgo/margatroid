@@ -258,6 +258,21 @@ impl DelegationBoard {
         exec.iter().any(|t| t.to == member_id)
     }
 
+    /// 查询成员在 board 中是否还有任何未归档的任务
+    pub async fn has_pending(&self, member_id: &str) -> bool {
+        let publish = self.publish.read().await;
+        if publish.iter().any(|t| t.to == member_id) {
+            return true;
+        }
+        let exec = self.exec.read().await;
+        if exec.iter().any(|t| t.to == member_id) {
+            return true;
+        }
+        let returned = self.returned.read().await;
+        returned.iter().any(|t| t.to == member_id && t.from != member_id)
+        // from != member_id: 排除自己发布的委托（在返回区等别人 accept）
+    }
+
     /// 查询快照
     pub async fn status(&self) -> BoardStatus {
         let publish = self.publish.read().await;

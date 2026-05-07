@@ -83,7 +83,7 @@ A private planning tool for the Manager, stored in the board's SQLite:
 | `schedule_remove` | Remove an entry |
 | `schedule_reorder` | Change priority |
 
-**push_from_schedule**: When the Manager is idle, iterates schedule entries, checks `is_working` for each target, and `pop → offer → archive` for idle members. Runs automatically in the Manager's control loop.
+**push_from_schedule**: When the Manager is idle, iterates schedule entries, checks `has_pending` for each target (a member may have at most one task in the board at a time). Pops and offers only when the previous task is fully archived. Runs automatically in the Manager's control loop.
 
 ### 2.6 Sandbox
 
