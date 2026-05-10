@@ -89,7 +89,7 @@ fn cmd_compose_validate(path: &str) -> Result<()> {
 }
 
 fn cmd_compose_roster(path: &str) -> Result<()> {
-    let compose = compose::load(path)?;
+    let _compose = compose::load(path)?;
     let lib = assets::MemberLibrary::load()?;
     let defs: Vec<_> = lib.all().collect();
     let roster = compose::roster::generate(&defs);
@@ -134,20 +134,8 @@ async fn cmd_compose_up(path: &str) -> Result<()> {
     let mgr = assets::Manager::bootstrap()?;
     let lib = assets::MemberLibrary::load()?;
 
-    let api_key = mgr
-        .app_config()
-        .ai
-        .providers
-        .iter()
-        .find(|p| p.name == "OpenRouter" && p.enabled)
-        .map(|p| p.api_key.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no enabled OpenRouter provider, check ~/.margatroid/margatroid.toml"
-            )
-        })?;
+    let app_config = mgr.app_config();
 
-    let provider = Arc::new(providers::OpenRouterProvider::new(api_key));
     let sandbox = Arc::new(tokio::sync::RwLock::new(sandbox::SandboxManager::new()));
     let temp_board = Arc::new(runtime::DelegationBoard::new(Arc::new(
         runtime::SqliteMemory::open(":memory:").unwrap(),
@@ -163,12 +151,14 @@ async fn cmd_compose_up(path: &str) -> Result<()> {
             continue;
         }
 
+        let provider = providers::resolve(&def.provider, &app_config.ai)?;
+
         let is_manager = def.identity == types::Identity::Manager;
         let member = Arc::new(runtime::Member::new(
             &def.id,
             def.identity.clone(),
             &def.model,
-            provider.clone(),
+            provider,
             sandbox.clone(),
             temp_board.clone(),
         ));
@@ -184,7 +174,7 @@ async fn cmd_compose_up(path: &str) -> Result<()> {
         });
     }
 
-    let workspace = Arc::new(runtime::Workspace::start(&compose, entries, provider).await?);
+    let workspace = Arc::new(runtime::Workspace::start(&compose, entries).await?);
 
     tracing::info!(
         "Workspace '{}' started, {} members",

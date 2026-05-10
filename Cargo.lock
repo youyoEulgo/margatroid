@@ -1652,7 +1652,6 @@ dependencies = [
  "compose",
  "futures",
  "paths",
- "providers",
  "rusqlite",
  "sandbox",
  "serde",
@@ -2474,6 +2473,7 @@ name = "types"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",

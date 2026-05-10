@@ -18,6 +18,5 @@ futures = "0.3"
 assets = { path = "../assets" }
 compose = { path = "../compose" }
 paths = { path = "../paths" }
-providers = { path = "../providers" }
 sandbox = { path = "../sandbox" }
 types = { path = "../types" }
