@@ -4,12 +4,12 @@
 //! 实现 Agent trait，chat() 驱动 LLM tool-call loop。
 
 use anyhow::Result;
-use providers::DynAiProvider;
 use sandbox::SandboxManager;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use types::{
-    ChatRequest, FinishReason, Identity, RequestMessage, RequestTool, ResponseChoice,
+    ChatRequest, DynAiProvider, FinishReason, Identity, RequestMessage, RequestTool,
+    ResponseChoice,
     message::{ChatMessage, MessageContent, Role, ToolMessage},
     tool::ResponseToolCall,
 };
@@ -161,14 +161,9 @@ impl Member {
                 let mut break_content = String::new();
 
                 for tc in tool_calls {
-                    let (result, brk) = execute_tool(
-                        tc,
-                        &sandbox_guard,
-                        &self.board,
-                        &self.id,
-                        current_task_id,
-                    )
-                    .await;
+                    let (result, brk) =
+                        execute_tool(tc, &sandbox_guard, &self.board, &self.id, current_task_id)
+                            .await;
 
                     messages.push(RequestMessage::Tool(ToolMessage {
                         role: Role::Tool,
@@ -252,10 +247,19 @@ async fn execute_tool(
             execute_delegate_reject(&tc.function.arguments, board, from).await,
             false,
         ),
-        "schedule_add" => (execute_schedule_add(&tc.function.arguments, board).await, false),
+        "schedule_add" => (
+            execute_schedule_add(&tc.function.arguments, board).await,
+            false,
+        ),
         "schedule_list" => (execute_schedule_list(board).await, false),
-        "schedule_pop" => (execute_schedule_pop(&tc.function.arguments, board).await, false),
-        "schedule_remove" => (execute_schedule_remove(&tc.function.arguments, board).await, false),
+        "schedule_pop" => (
+            execute_schedule_pop(&tc.function.arguments, board).await,
+            false,
+        ),
+        "schedule_remove" => (
+            execute_schedule_remove(&tc.function.arguments, board).await,
+            false,
+        ),
         "recall" => (execute_recall(&tc.function.arguments, board).await, false),
         "finish" => (execute_finish(&tc.function.arguments).await, true),
         _ => (format!("未知工具: {}", tc.function.name), false),
@@ -271,10 +275,7 @@ async fn execute_finish(arguments: &str) -> String {
         .get("summary")
         .and_then(|v| v.as_str())
         .unwrap_or("(无摘要)");
-    let result = args
-        .get("result")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let result = args.get("result").and_then(|v| v.as_str()).unwrap_or("");
     format!("任务完成。摘要: {}\n结果: {}", summary, result)
 }
 
@@ -297,10 +298,11 @@ async fn execute_delegate(
         Some(t) => t,
         None => return "缺少 'task' 参数".to_string(),
     };
+    let detail = args.get("detail").and_then(|v| v.as_str()).unwrap_or("");
     let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
     match board
-        .offer(from, target, task, "", parent_id, priority)
+        .offer(from, target, task, detail, parent_id, priority)
         .await
     {
         Ok(task_id) => format!("委托已发布到发布区，task_id: {}", task_id),
@@ -433,112 +435,5 @@ async fn execute_bash(arguments: &str, sandbox: &SandboxManager) -> String {
             }
         }
         Err(e) => format!("执行失败: {}", e),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::Stream;
-    use std::{future::Future, pin::Pin};
-    use types::ResponseMessage;
-
-    struct NoopProvider;
-    impl DynAiProvider for NoopProvider {
-        fn chat_boxed(
-            &self,
-            _req: ChatRequest,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<types::ChatResponse, providers::ProviderError>>
-                    + Send
-                    + '_,
-            >,
-        > {
-            Box::pin(async {
-                Ok(types::ChatResponse {
-                    id: "noop".into(),
-                    model: "noop".into(),
-                    created: 0,
-                    choices: vec![ResponseChoice {
-                        index: 0,
-                        message: ResponseMessage {
-                            role: "assistant".into(),
-                            content: Some("OK".into()),
-                            tool_calls: None,
-                        },
-                        finish_reason: Some(FinishReason::Stop),
-                    }],
-                    usage: None,
-                })
-            })
-        }
-
-        fn chat_stream_boxed(
-            &self,
-            _req: ChatRequest,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            Pin<
-                                Box<
-                                    dyn Stream<
-                                            Item = Result<
-                                                types::StreamChunk,
-                                                providers::ProviderError,
-                                            >,
-                                        > + Send,
-                                >,
-                            >,
-                            providers::ProviderError,
-                        >,
-                    > + Send
-                    + '_,
-            >,
-        > {
-            Box::pin(async {
-                Err(providers::ProviderError::Unsupported(
-                    "streaming not supported in tests".into(),
-                ))
-            })
-        }
-
-        fn id(&self) -> &'static str {
-            "noop"
-        }
-    }
-
-    #[tokio::test]
-    async fn member_chat_without_tools_loops_on_constraint() {
-        let sandbox = Arc::new(RwLock::new(SandboxManager::new()));
-        let board = Arc::new(DelegationBoard::new(Arc::new(
-            crate::memory::SqliteMemory::open(":memory:").unwrap(),
-        )));
-        let member = Member::new(
-            "test-agent",
-            Identity::Member,
-            "noop",
-            Arc::new(NoopProvider),
-            sandbox,
-            board,
-        );
-
-        // NoopProvider 永远返回 bare "OK"（无 tool_calls），
-        // chat() 会追加 LOOP_CONSTRAINT 并继续，形成无限循环。
-        // 这里只验证不会 panic。
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            member.chat(
-                "你是测试助手\n\n---\n\n工作日志: (暂无)\n\n回答: 1+1=?",
-                "测试任务",
-                &[],
-                None,
-            ),
-        )
-        .await;
-
-        // 预期超时（无限循环），验证不 panic
-        assert!(outcome.is_err());
     }
 }

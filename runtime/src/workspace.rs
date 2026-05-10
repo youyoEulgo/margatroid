@@ -40,7 +40,8 @@ pub fn base_tools() -> Vec<RequestTool> {
                     "type": "object",
                     "properties": {
                         "target": { "type": "string", "description": "目标成员 ID" },
-                        "task": { "type": "string", "description": "任务描述" },
+                        "task": { "type": "string", "description": "任务简述" },
+                        "detail": { "type": "string", "description": "详细描述" },
                         "priority": { "type": "integer", "description": "优先级，数字越大越优先，默认 0" }
                     },
                     "required": ["target", "task"]
@@ -168,11 +169,7 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub async fn start(
-        compose: &ComposeFile,
-        entries: Vec<AgentEntry>,
-        provider: Arc<dyn providers::DynAiProvider>,
-    ) -> Result<Self> {
+    pub async fn start(compose: &ComposeFile, entries: Vec<AgentEntry>) -> Result<Self> {
         let sandbox_config = load_sandbox_config(compose);
         let mut sandbox_mgr = SandboxManager::new();
         sandbox_mgr.initialize(sandbox_config).await?;
@@ -235,7 +232,7 @@ impl Drop for Workspace {
     }
 }
 
-/// 审核自己发出去的委托 — 向下插入
+/// 审核返回的委托 — 向下插入
 async fn review_delegations(
     agent: &dyn Agent,
     board: &DelegationBoard,
@@ -247,14 +244,6 @@ async fn review_delegations(
         return;
     }
 
-    // 将每条返回的委托格式化后向下插入上级委托的 result
-    for t in &returned {
-        let child_formatted = format!("\n---\n{}", t.format());
-        if let Some(ref parent_id) = t.parent_id {
-            let _ = board.append_result(parent_id, &child_formatted);
-        }
-    }
-
     // 构建审核提示词
     let items: Vec<String> = returned.iter().map(|t| t.format()).collect();
     let review_prompt = format!(
@@ -264,7 +253,12 @@ async fn review_delegations(
     );
     let _ = agent.process(&review_prompt, "审核委托", tools).await;
 
+    // 只对 accept 的委托向下插入上级 result
     for t in &board.check_return(agent.id()).await {
+        let child_formatted = format!("\n---\n{}", t.format());
+        if let Some(ref parent_id) = t.parent_id {
+            let _ = board.append_result(parent_id, &child_formatted);
+        }
         let _ = board.accept(agent.id(), &t.id).await;
     }
 }

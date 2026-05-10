@@ -1,5 +1,0 @@
-id = "coder"
-identity = "Member"
-model = "openai/gpt-4o-mini"
-provider = "OpenRouter"
-skills = ["coding", "bash"]
