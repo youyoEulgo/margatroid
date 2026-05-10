@@ -17,6 +17,11 @@ pub struct WorklogEntry {
     pub timestamp: u64,
     pub agent_id: String,
     pub delegation_id: String,
+    /// 委托目标
+    pub to_agent: String,
+    /// 委托描述
+    pub description: String,
+    /// 工作摘要（~30-50 token）
     pub summary: String,
     #[serde(default)]
     pub artifacts: Vec<String>,
@@ -27,6 +32,8 @@ pub struct WorklogEntry {
 pub struct MemoryEntry {
     pub timestamp: u64,
     pub delegation_id: String,
+    /// 委托来源
+    pub from_agent: String,
     pub description: String,
     pub summary: String,
     #[serde(default)]
@@ -68,6 +75,39 @@ pub struct ScheduleEntry {
     pub status: String, // planned | offered | archived
 }
 
+/// 委托持久化记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegationRecord {
+    pub id: String,
+    pub from_agent: String,
+    pub to_agent: String,
+    pub brief: String,
+    pub detail: String,
+    pub parent_id: Option<String>,
+    pub result: String,
+}
+
+impl DelegationRecord {
+    /// 格式化输出完整委托信息（与 DelegationTask::format() 一致）
+    pub fn format(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("[委托 {}]\n", self.id));
+        out.push_str(&format!("简述: {}\n", self.brief));
+        if !self.detail.is_empty() {
+            out.push_str(&format!("详情: {}\n", self.detail));
+        }
+        out.push_str(&format!("委托人: {}\n", self.from_agent));
+        out.push_str(&format!("承接人: {}\n", self.to_agent));
+        if let Some(ref pid) = self.parent_id {
+            out.push_str(&format!("上级委托: {}\n", pid));
+        }
+        if !self.result.is_empty() {
+            out.push_str(&format!("结果:\n{}\n", self.result));
+        }
+        out
+    }
+}
+
 impl SqliteMemory {
     /// 打开或创建数据库，初始化表
     pub fn open(path: &str) -> Result<Self> {
@@ -80,6 +120,8 @@ impl SqliteMemory {
                 timestamp INTEGER NOT NULL,
                 agent_id TEXT NOT NULL,
                 delegation_id TEXT NOT NULL UNIQUE,
+                to_agent TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
                 summary TEXT NOT NULL,
                 artifacts TEXT NOT NULL DEFAULT '[]'
             );
@@ -90,6 +132,7 @@ impl SqliteMemory {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER NOT NULL,
                 agent_id TEXT NOT NULL,
+                from_agent TEXT NOT NULL DEFAULT '',
                 delegation_id TEXT NOT NULL UNIQUE,
                 description TEXT NOT NULL DEFAULT '',
                 summary TEXT NOT NULL DEFAULT '',
@@ -107,6 +150,17 @@ impl SqliteMemory {
                 status TEXT NOT NULL DEFAULT 'planned'
             );
             CREATE INDEX IF NOT EXISTS idx_schedule_status ON schedule(status);
+
+            CREATE TABLE IF NOT EXISTS delegations (
+                id TEXT PRIMARY KEY,
+                from_agent TEXT NOT NULL,
+                to_agent TEXT NOT NULL,
+                brief TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                parent_id TEXT,
+                result TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_delegations_parent ON delegations(parent_id);
             ",
         )?;
 
@@ -121,7 +175,7 @@ impl SqliteMemory {
     pub fn worklog_by_agent(&self, agent_id: &str, limit: usize) -> Result<Vec<WorklogEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT timestamp, agent_id, delegation_id, summary, artifacts
+            "SELECT timestamp, agent_id, delegation_id, to_agent, description, summary, artifacts
              FROM worklog
              WHERE agent_id = ?
              ORDER BY timestamp DESC
@@ -138,7 +192,7 @@ impl SqliteMemory {
     pub fn personal_by_delegation(&self, delegation_id: &str) -> Option<MemoryEntry> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT timestamp, agent_id, delegation_id, description, summary, artifacts, tags
+            "SELECT timestamp, agent_id, from_agent, delegation_id, description, summary, artifacts, tags
              FROM personal_memory
              WHERE delegation_id = ?",
             rusqlite::params![delegation_id],
@@ -159,7 +213,7 @@ impl SqliteMemory {
             .map(|(i, _)| format!("?{}", i + 1))
             .collect();
         let sql = format!(
-            "SELECT timestamp, agent_id, delegation_id, description, summary, artifacts, tags
+            "SELECT timestamp, agent_id, from_agent, delegation_id, description, summary, artifacts, tags
              FROM personal_memory
              WHERE delegation_id IN ({})",
             placeholders.join(", ")
@@ -295,6 +349,69 @@ impl SqliteMemory {
         )?;
         Ok(())
     }
+
+    // ── 委托持久化 ──
+
+    /// 创建委托时写入 delegations 表
+    pub fn delegation_insert(
+        &self,
+        id: &str,
+        from: &str,
+        to: &str,
+        brief: &str,
+        detail: &str,
+        parent_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO delegations (id, from_agent, to_agent, brief, detail, parent_id, result)
+             VALUES (?, ?, ?, ?, ?, ?, '')",
+            rusqlite::params![id, from, to, brief, detail, parent_id],
+        )?;
+        Ok(())
+    }
+
+    /// 按 ID 查询单条委托
+    pub fn delegation_get(&self, id: &str) -> Option<DelegationRecord> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, from_agent, to_agent, brief, detail, parent_id, result
+             FROM delegations WHERE id = ?",
+            rusqlite::params![id],
+            |r| {
+                Ok(DelegationRecord {
+                    id: r.get(0)?,
+                    from_agent: r.get(1)?,
+                    to_agent: r.get(2)?,
+                    brief: r.get(3)?,
+                    detail: r.get(4)?,
+                    parent_id: r.get(5)?,
+                    result: r.get(6)?,
+                })
+            },
+        )
+        .ok()
+    }
+
+    /// 向委托的 result 字段追加文本
+    pub fn delegation_append_result(&self, id: &str, text: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE delegations SET result = result || ? WHERE id = ?",
+            rusqlite::params![text, id],
+        )?;
+        Ok(())
+    }
+
+    /// 更新委托的 result 字段（覆盖）
+    pub fn delegation_set_result(&self, id: &str, result: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE delegations SET result = ? WHERE id = ?",
+            rusqlite::params![result, id],
+        )?;
+        Ok(())
+    }
 }
 
 // ── Worklog trait ────────────────────────────────────────────
@@ -304,12 +421,14 @@ impl Worklog for SqliteMemory {
         let conn = self.conn.lock().unwrap();
         let artifacts = serde_json::to_string(&entry.artifacts).unwrap_or_default();
         conn.execute(
-            "INSERT OR REPLACE INTO worklog (timestamp, agent_id, delegation_id, summary, artifacts)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO worklog (timestamp, agent_id, delegation_id, to_agent, description, summary, artifacts)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params![
                 entry.timestamp as i64,
                 entry.agent_id,
                 entry.delegation_id,
+                entry.to_agent,
+                entry.description,
                 entry.summary,
                 artifacts,
             ],
@@ -320,7 +439,7 @@ impl Worklog for SqliteMemory {
     fn recent(&self, limit: usize) -> Vec<WorklogEntry> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT timestamp, agent_id, delegation_id, summary, artifacts
+            "SELECT timestamp, agent_id, delegation_id, to_agent, description, summary, artifacts
              FROM worklog
              ORDER BY timestamp DESC
              LIMIT ?",
@@ -337,7 +456,7 @@ impl Worklog for SqliteMemory {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", keyword);
         let mut stmt = match conn.prepare(
-            "SELECT timestamp, agent_id, delegation_id, summary, artifacts
+            "SELECT timestamp, agent_id, delegation_id, to_agent, description, summary, artifacts
              FROM worklog
              WHERE summary LIKE ? OR agent_id LIKE ?
              ORDER BY timestamp DESC
@@ -361,11 +480,12 @@ impl PersonalMemory for SqliteMemory {
         let tags = serde_json::to_string(&entry.tags).unwrap_or_default();
         conn.execute(
             "INSERT OR REPLACE INTO personal_memory
-             (timestamp, agent_id, delegation_id, description, summary, artifacts, tags)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (timestamp, agent_id, from_agent, delegation_id, description, summary, artifacts, tags)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params![
                 entry.timestamp as i64,
                 "", // agent_id 由上层通过 delegation_id 关联 worklog 确定
+                entry.from_agent,
                 entry.delegation_id,
                 entry.description,
                 entry.summary,
@@ -380,7 +500,7 @@ impl PersonalMemory for SqliteMemory {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", keyword);
         let mut stmt = match conn.prepare(
-            "SELECT timestamp, agent_id, delegation_id, description, summary, artifacts, tags
+            "SELECT timestamp, agent_id, from_agent, delegation_id, description, summary, artifacts, tags
              FROM personal_memory
              WHERE description LIKE ? OR summary LIKE ? OR tags LIKE ?
              ORDER BY timestamp DESC
@@ -398,7 +518,7 @@ impl PersonalMemory for SqliteMemory {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", tag);
         let mut stmt = match conn.prepare(
-            "SELECT timestamp, agent_id, delegation_id, description, summary, artifacts, tags
+            "SELECT timestamp, agent_id, from_agent, delegation_id, description, summary, artifacts, tags
              FROM personal_memory
              WHERE tags LIKE ?
              ORDER BY timestamp DESC
@@ -416,24 +536,30 @@ impl PersonalMemory for SqliteMemory {
 // ── Row mappers ──────────────────────────────────────────────
 
 fn row_to_worklog(row: &rusqlite::Row) -> rusqlite::Result<WorklogEntry> {
-    let artifacts_str: String = row.get(4).unwrap_or_default();
+    let artifacts_str: String = row.get(6).unwrap_or_default();
+    let to_agent: String = row.get(3).unwrap_or_default();
+    let description: String = row.get(4).unwrap_or_default();
     Ok(WorklogEntry {
         timestamp: row.get::<_, i64>(0)? as u64,
         agent_id: row.get(1)?,
         delegation_id: row.get(2)?,
-        summary: row.get(3)?,
+        to_agent,
+        description,
+        summary: row.get(5)?,
         artifacts: serde_json::from_str(&artifacts_str).unwrap_or_default(),
     })
 }
 
 fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<MemoryEntry> {
-    let artifacts_str: String = row.get(5).unwrap_or_default();
-    let tags_str: String = row.get(6).unwrap_or_default();
+    let artifacts_str: String = row.get(6).unwrap_or_default();
+    let tags_str: String = row.get(7).unwrap_or_default();
+    let from_agent: String = row.get(2).unwrap_or_default();
     Ok(MemoryEntry {
         timestamp: row.get::<_, i64>(0)? as u64,
-        delegation_id: row.get(2)?,
-        description: row.get(3).unwrap_or_default(),
-        summary: row.get(4).unwrap_or_default(),
+        delegation_id: row.get(3)?,
+        from_agent,
+        description: row.get(4).unwrap_or_default(),
+        summary: row.get(5).unwrap_or_default(),
         artifacts: serde_json::from_str(&artifacts_str).unwrap_or_default(),
         tags: serde_json::from_str(&tags_str).unwrap_or_default(),
     })
@@ -452,6 +578,8 @@ mod tests {
             timestamp: 1705000000,
             agent_id: "coder".into(),
             delegation_id: "d-001".into(),
+            to_agent: "reviewer".into(),
+            description: "写用户接口".into(),
             summary: "实现了 /api/users".into(),
             artifacts: vec!["src/users.rs".into()],
         })
@@ -478,6 +606,7 @@ mod tests {
         db.remember(MemoryEntry {
             timestamp: 1705000001,
             delegation_id: "d-001".into(),
+            from_agent: "manager".into(),
             description: "写用户接口".into(),
             summary: "用 actix-web 实现了 GET /api/users，返回 JSON 列表".into(),
             artifacts: vec!["src/users.rs".into()],
@@ -505,6 +634,7 @@ mod tests {
         db.remember(MemoryEntry {
             timestamp: 1,
             delegation_id: "a".into(),
+            from_agent: "manager".into(),
             description: "".into(),
             summary: "A".into(),
             artifacts: vec![],
@@ -514,6 +644,7 @@ mod tests {
         db.remember(MemoryEntry {
             timestamp: 2,
             delegation_id: "b".into(),
+            from_agent: "coder".into(),
             description: "".into(),
             summary: "B".into(),
             artifacts: vec![],
@@ -523,5 +654,24 @@ mod tests {
 
         let results = db.personal_by_delegations(&["a".into(), "b".into()]);
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn delegation_record_format() {
+        let record = DelegationRecord {
+            id: "d-001".into(),
+            from_agent: "manager".into(),
+            to_agent: "coder".into(),
+            brief: "实现JWT".into(),
+            detail: "签发和验证令牌".into(),
+            parent_id: None,
+            result: String::new(),
+        };
+        let formatted = record.format();
+        assert!(formatted.contains("[委托 d-001]"));
+        assert!(formatted.contains("简述: 实现JWT"));
+        assert!(formatted.contains("详情: 签发和验证令牌"));
+        assert!(formatted.contains("委托人: manager"));
+        assert!(formatted.contains("承接人: coder"));
     }
 }

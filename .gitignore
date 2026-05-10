@@ -1,2 +1,4 @@
 /target
+.margatroid
+compose.toml
 .DS_Store
