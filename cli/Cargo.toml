@@ -10,10 +10,16 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = "0.8"
 
 assets = { path = "../assets" }
 compose = { path = "../compose" }
+providers = { path = "../providers" }
+runtime = { path = "../runtime" }
 server = { path = "../server" }
+types = { path = "../types" }
+sandbox = { path = "../sandbox" }

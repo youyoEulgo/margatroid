@@ -279,12 +279,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assets",
+ "axum",
  "compose",
+ "providers",
+ "runtime",
+ "sandbox",
+ "serde",
  "serde_json",
  "server",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "types",
 ]
 
 [[package]]

@@ -1,0 +1,5 @@
+id = "manager"
+identity = "Manager"
+model = "openai/gpt-4o-mini"
+provider = "OpenRouter"
+skills = ["manage", "planning", "delegation"]

@@ -1,8 +1,7 @@
 //! Member — 单个团队成员
 //!
 //! 封装模型、供应商、沙箱、委托板。
-//! chat() 对外暴露干净的接口：prompt + 工具 → 结果 + 总结。
-//! 委托（delegate/delegate_async）通过 self.board 发布，LLM 自行决策阻塞/非阻塞。
+//! 实现 Agent trait，chat() 驱动 LLM tool-call loop。
 
 use anyhow::Result;
 use providers::DynAiProvider;
@@ -10,11 +9,12 @@ use sandbox::SandboxManager;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use types::{
-    ChatRequest, FinishReason, RequestMessage, RequestTool, ResponseChoice,
+    ChatRequest, FinishReason, Identity, RequestMessage, RequestTool, ResponseChoice,
     message::{ChatMessage, MessageContent, Role, ToolMessage},
     tool::ResponseToolCall,
 };
 
+use crate::agent::Agent;
 use crate::board::DelegationBoard;
 
 // ── Member ───────────────────────────────────────────────────
@@ -22,6 +22,7 @@ use crate::board::DelegationBoard;
 /// 单个团队成员
 pub struct Member {
     pub id: String,
+    identity: Identity,
     model: String,
     provider: Arc<dyn DynAiProvider>,
     sandbox: Arc<RwLock<SandboxManager>>,
@@ -30,15 +31,17 @@ pub struct Member {
 
 /// chat() 返回值
 pub struct ChatOutcome {
-    /// 最终回复文本（给委托方的结果）
     pub result: String,
-    /// 内联总结（同一 KV cache 上下文生成，用于记忆）
     pub summary: String,
 }
+
+/// execute_tool 返回值 —— (tool 结果文本, 是否应该退出循环)
+type ToolResult = (String, bool);
 
 impl Member {
     pub fn new(
         id: &str,
+        identity: Identity,
         model: &str,
         provider: Arc<dyn DynAiProvider>,
         sandbox: Arc<RwLock<SandboxManager>>,
@@ -46,6 +49,7 @@ impl Member {
     ) -> Self {
         Self {
             id: id.to_string(),
+            identity,
             model: model.to_string(),
             provider,
             sandbox,
@@ -53,13 +57,46 @@ impl Member {
         }
     }
 
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+#[async_trait::async_trait]
+impl Agent for Member {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    async fn process(
+        &self,
+        prompt: &str,
+        task_description: &str,
+        tools: &[RequestTool],
+    ) -> Result<ChatOutcome> {
+        self.chat(prompt, task_description, tools, None).await
+    }
+}
+
+const LOOP_CONSTRAINT: &str = "你必须返回当前委托或发布新委托才能结束";
+
+impl Member {
     /// 执行一次对话
     ///
-    /// `prompt` 应由 Workspace 准备好，包含系统提示词、工作日志、相关记忆、当前任务。
+    /// `prompt` 完整提示词。`task_description` 当前任务简述。
+    /// `current_task_id` 当前委托 ID，子委托时会作为 parent_id。
     /// `tools` 由调用方决定注入哪些工具。
-    ///
-    /// 内部：tool-call loop → 结束后在同一上下文追加 summarization → 返回结果 + 总结。
-    pub async fn chat(&self, prompt: &str, tools: &[RequestTool]) -> Result<ChatOutcome> {
+    pub async fn chat(
+        &self,
+        prompt: &str,
+        _task_description: &str,
+        tools: &[RequestTool],
+        current_task_id: Option<&str>,
+    ) -> Result<ChatOutcome> {
         let mut messages: Vec<RequestMessage> = vec![RequestMessage::Chat(ChatMessage {
             role: Role::User,
             content: MessageContent::Text(prompt.to_string()),
@@ -68,7 +105,7 @@ impl Member {
         })];
 
         // ── 主 tool-call loop ──
-        let final_content = loop {
+        let (final_content, final_summary) = loop {
             let req = ChatRequest {
                 model: self.model.clone(),
                 messages: messages.clone(),
@@ -88,7 +125,7 @@ impl Member {
             let resp = self.provider.chat_boxed(req).await?;
             let choice = resp.choices.first().expect("no response choice");
 
-            // 没有 tool calls → 主任务完成
+            // 没有 tool calls → 追加约束消息，继续循环
             if choice.finish_reason == Some(FinishReason::Stop)
                 && choice
                     .message
@@ -96,7 +133,22 @@ impl Member {
                     .as_ref()
                     .map_or(true, |v| v.is_empty())
             {
-                break choice.message.content.clone().unwrap_or_default();
+                let bare_text = choice.message.content.clone().unwrap_or_default();
+                // 保存 assistant 消息
+                messages.push(RequestMessage::Chat(ChatMessage {
+                    role: Role::Assistant,
+                    content: MessageContent::Text(bare_text),
+                    name: None,
+                    tool_calls: None,
+                }));
+                // 追加约束
+                messages.push(RequestMessage::Chat(ChatMessage {
+                    role: Role::User,
+                    content: MessageContent::Text(LOOP_CONSTRAINT.to_string()),
+                    name: None,
+                    tool_calls: None,
+                }));
+                continue;
             }
 
             // 保存 assistant 消息（含 tool_calls）
@@ -105,16 +157,36 @@ impl Member {
             // 执行 tool calls
             if let Some(tool_calls) = &choice.message.tool_calls {
                 let sandbox_guard = self.sandbox.read().await;
+                let mut should_break = false;
+                let mut break_content = String::new();
+
                 for tc in tool_calls {
-                    let tool_result = execute_tool(tc, &sandbox_guard, &self.board, &self.id).await;
+                    let (result, brk) = execute_tool(
+                        tc,
+                        &sandbox_guard,
+                        &self.board,
+                        &self.id,
+                        current_task_id,
+                    )
+                    .await;
+
                     messages.push(RequestMessage::Tool(ToolMessage {
                         role: Role::Tool,
-                        content: tool_result,
+                        content: result.clone(),
                         tool_call_id: tc.id.clone(),
                         name: None,
                     }));
+
+                    if brk {
+                        should_break = true;
+                        break_content = result;
+                    }
                 }
                 drop(sandbox_guard);
+
+                if should_break {
+                    break (break_content.clone(), break_content);
+                }
             }
         };
 
@@ -141,17 +213,13 @@ impl Member {
             .choices
             .first()
             .and_then(|c| c.message.content.as_deref())
-            .unwrap_or("(summary unavailable)")
+            .unwrap_or(&final_summary)
             .to_string();
 
         Ok(ChatOutcome {
             result: final_content,
             summary,
         })
-    }
-
-    pub fn model(&self) -> &str {
-        &self.model
     }
 }
 
@@ -171,19 +239,51 @@ async fn execute_tool(
     sandbox: &SandboxManager,
     board: &DelegationBoard,
     from: &str,
-) -> String {
+    current_task_id: Option<&str>,
+) -> ToolResult {
     match tc.function.name.as_str() {
-        "bash" => execute_bash(&tc.function.arguments, sandbox).await,
-        "delegate" => execute_delegate(&tc.function.arguments, board, from).await,
-        "schedule_add" => execute_schedule_add(&tc.function.arguments, board).await,
-        "schedule_list" => execute_schedule_list(board).await,
-        "schedule_pop" => execute_schedule_pop(&tc.function.arguments, board).await,
-        "schedule_remove" => execute_schedule_remove(&tc.function.arguments, board).await,
-        _ => format!("未知工具: {}", tc.function.name),
+        "bash" => (execute_bash(&tc.function.arguments, sandbox).await, false),
+        "delegate" => {
+            let result =
+                execute_delegate(&tc.function.arguments, board, from, current_task_id).await;
+            (result, true)
+        }
+        "delegate_reject" => (
+            execute_delegate_reject(&tc.function.arguments, board, from).await,
+            false,
+        ),
+        "schedule_add" => (execute_schedule_add(&tc.function.arguments, board).await, false),
+        "schedule_list" => (execute_schedule_list(board).await, false),
+        "schedule_pop" => (execute_schedule_pop(&tc.function.arguments, board).await, false),
+        "schedule_remove" => (execute_schedule_remove(&tc.function.arguments, board).await, false),
+        "recall" => (execute_recall(&tc.function.arguments, board).await, false),
+        "finish" => (execute_finish(&tc.function.arguments).await, true),
+        _ => (format!("未知工具: {}", tc.function.name), false),
     }
 }
 
-async fn execute_delegate(arguments: &str, board: &DelegationBoard, from: &str) -> String {
+async fn execute_finish(arguments: &str) -> String {
+    let args: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(e) => return format!("参数解析失败: {}", e),
+    };
+    let summary = args
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(无摘要)");
+    let result = args
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    format!("任务完成。摘要: {}\n结果: {}", summary, result)
+}
+
+async fn execute_delegate(
+    arguments: &str,
+    board: &DelegationBoard,
+    from: &str,
+    parent_id: Option<&str>,
+) -> String {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
         Err(e) => return format!("参数解析失败: {}", e),
@@ -197,9 +297,10 @@ async fn execute_delegate(arguments: &str, board: &DelegationBoard, from: &str) 
         Some(t) => t,
         None => return "缺少 'task' 参数".to_string(),
     };
+    let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
     match board
-        .offer(from, target, task, serde_json::json!({}), 1)
+        .offer(from, target, task, "", parent_id, priority)
         .await
     {
         Ok(task_id) => format!("委托已发布到发布区，task_id: {}", task_id),
@@ -269,6 +370,33 @@ async fn execute_schedule_remove(arguments: &str, board: &DelegationBoard) -> St
         Ok(()) => format!("已从计划表删除条目 {}", id),
         Err(e) => format!("删除失败: {}", e),
     }
+}
+
+async fn execute_delegate_reject(arguments: &str, board: &DelegationBoard, from: &str) -> String {
+    let args: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(e) => return format!("参数解析失败: {}", e),
+    };
+    let task_id = match args.get("task_id").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return "缺少 'task_id' 参数".to_string(),
+    };
+    match board.reject(from, task_id).await {
+        Ok(()) => format!("已驳回委托 {}, 任务回到发布区", task_id),
+        Err(e) => format!("驳回失败: {}", e),
+    }
+}
+
+async fn execute_recall(arguments: &str, board: &DelegationBoard) -> String {
+    let args: serde_json::Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(e) => return format!("参数解析失败: {}", e),
+    };
+    let keyword = match args.get("keyword").and_then(|v| v.as_str()) {
+        Some(k) => k,
+        None => return "缺少 'keyword' 参数".to_string(),
+    };
+    board.recall(keyword)
 }
 
 async fn execute_bash(arguments: &str, sandbox: &SandboxManager) -> String {
@@ -382,22 +510,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn member_chat_without_tools() {
+    async fn member_chat_without_tools_loops_on_constraint() {
         let sandbox = Arc::new(RwLock::new(SandboxManager::new()));
         let board = Arc::new(DelegationBoard::new(Arc::new(
             crate::memory::SqliteMemory::open(":memory:").unwrap(),
         )));
-        let member = Member::new("test-agent", "noop", Arc::new(NoopProvider), sandbox, board);
+        let member = Member::new(
+            "test-agent",
+            Identity::Member,
+            "noop",
+            Arc::new(NoopProvider),
+            sandbox,
+            board,
+        );
 
-        let outcome = member
-            .chat(
+        // NoopProvider 永远返回 bare "OK"（无 tool_calls），
+        // chat() 会追加 LOOP_CONSTRAINT 并继续，形成无限循环。
+        // 这里只验证不会 panic。
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            member.chat(
                 "你是测试助手\n\n---\n\n工作日志: (暂无)\n\n回答: 1+1=?",
+                "测试任务",
                 &[],
-            )
-            .await
-            .unwrap();
+                None,
+            ),
+        )
+        .await;
 
-        assert!(!outcome.result.is_empty());
-        assert!(!outcome.summary.is_empty());
+        // 预期超时（无限循环），验证不 panic
+        assert!(outcome.is_err());
     }
 }
