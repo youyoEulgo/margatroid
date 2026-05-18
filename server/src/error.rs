@@ -52,17 +52,9 @@ impl IntoResponse for ApiError {
     }
 }
 
-impl From<providers::ProviderError> for ApiError {
-    fn from(e: providers::ProviderError) -> Self {
-        match &e {
-            providers::ProviderError::InvalidRequest(msg) => Self::bad_request(msg.clone()),
-            providers::ProviderError::Unsupported(msg) => Self::bad_request(msg.clone()),
-            providers::ProviderError::Api { code, message, .. } => Self {
-                status: StatusCode::from_u16(*code as u16).unwrap_or(StatusCode::BAD_GATEWAY),
-                message: message.clone(),
-            },
-            _ => Self::internal(e.to_string()),
-        }
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::internal(e.to_string())
     }
 }
 

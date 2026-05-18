@@ -1,64 +1,70 @@
-//! Member — 单个团队成员
+//! Member — 单个团队成员 + Agent trait
 //!
-//! 封装模型、供应商、沙箱、委托板。
-//! 实现 Agent trait，chat() 驱动 LLM tool-call loop。
+//! 封装客户端、沙箱。
+//! Agent trait 定义统一调用接口，Member 是唯一实现。
+//! chat() 驱动 LLM tool-call loop，通过 Board.assemble_prompt() 获取上下文。
 
 use anyhow::Result;
 use sandbox::SandboxManager;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use types::{
-    ChatRequest, DynAiProvider, FinishReason, Identity, RequestMessage, RequestTool,
+    FinishReason, Identity, RequestMessage, RequestTool,
     ResponseChoice,
     message::{ChatMessage, MessageContent, Role, ToolMessage},
     tool::ResponseToolCall,
 };
 
-use crate::agent::Agent;
 use crate::board::DelegationBoard;
+use crate::client::Client;
 
-// ── Member ───────────────────────────────────────────────────
+/// 所有成员（LLM 或 Human）都实现这个 trait
+#[async_trait::async_trait]
+pub trait Agent: Send + Sync {
+    fn id(&self) -> &str;
+    fn identity(&self) -> &Identity;
 
-/// 单个团队成员
-pub struct Member {
-    pub id: String,
-    identity: Identity,
-    model: String,
-    provider: Arc<dyn DynAiProvider>,
-    sandbox: Arc<RwLock<SandboxManager>>,
-    board: Arc<DelegationBoard>,
+    /// 处理一个任务：board 组装上下文 → LLM tool-call loop → 结果 + 总结
+    async fn process(
+        &self,
+        board: &DelegationBoard,
+        tools: &[RequestTool],
+    ) -> Result<ChatOutcome>;
 }
 
 /// chat() 返回值
 pub struct ChatOutcome {
     pub result: String,
-    pub summary: String,
 }
 
 /// execute_tool 返回值 —— (tool 结果文本, 是否应该退出循环)
 type ToolResult = (String, bool);
 
+// ── Member ───────────────────────────────────────────────────
+
+pub struct Member {
+    pub id: String,
+    soul: String,
+    identity: Identity,
+    client: Client,
+    sandbox: Arc<RwLock<SandboxManager>>,
+}
+
 impl Member {
     pub fn new(
         id: &str,
+        soul: String,
         identity: Identity,
-        model: &str,
-        provider: Arc<dyn DynAiProvider>,
+        client: Client,
         sandbox: Arc<RwLock<SandboxManager>>,
-        board: Arc<DelegationBoard>,
     ) -> Self {
         Self {
             id: id.to_string(),
+            soul,
             identity,
-            model: model.to_string(),
-            provider,
+            client,
             sandbox,
-            board,
         }
-    }
-
-    pub fn model(&self) -> &str {
-        &self.model
     }
 }
 
@@ -72,60 +78,30 @@ impl Agent for Member {
         &self.identity
     }
 
-    async fn process(
-        &self,
-        prompt: &str,
-        task_description: &str,
-        tools: &[RequestTool],
-    ) -> Result<ChatOutcome> {
-        self.chat(prompt, task_description, tools, None).await
+    async fn process(&self, board: &DelegationBoard, tools: &[RequestTool]) -> Result<ChatOutcome> {
+        self.chat(board, tools).await
     }
 }
 
-const LOOP_CONSTRAINT: &str = "你必须返回当前委托或发布新委托才能结束";
+const LOOP_CONSTRAINT: &str = "你必须完成当前委托或发布新委托才能结束";
 
 impl Member {
-    /// 执行一次对话
-    ///
-    /// `prompt` 完整提示词。`task_description` 当前任务简述。
-    /// `current_task_id` 当前委托 ID，子委托时会作为 parent_id。
-    /// `tools` 由调用方决定注入哪些工具。
-    pub async fn chat(
-        &self,
-        prompt: &str,
-        _task_description: &str,
-        tools: &[RequestTool],
-        current_task_id: Option<&str>,
-    ) -> Result<ChatOutcome> {
-        let mut messages: Vec<RequestMessage> = vec![RequestMessage::Chat(ChatMessage {
-            role: Role::User,
-            content: MessageContent::Text(prompt.to_string()),
-            name: None,
-            tool_calls: None,
-        })];
+    async fn chat(&self, board: &DelegationBoard, tools: &[RequestTool]) -> Result<ChatOutcome> {
+        let memories = format_memories(board.db(), &self.id);
+        let chat_messages = board.assemble_prompt(&self.soul, &memories).await;
+        let mut messages: Vec<RequestMessage> = chat_messages
+            .into_iter()
+            .map(RequestMessage::Chat)
+            .collect();
 
-        // ── 主 tool-call loop ──
-        let (final_content, final_summary) = loop {
-            let req = ChatRequest {
-                model: self.model.clone(),
-                messages: messages.clone(),
-                tools: if tools.is_empty() {
-                    None
-                } else {
-                    Some(tools.to_vec())
-                },
-                tool_choice: if tools.is_empty() {
-                    None
-                } else {
-                    Some(types::RequestToolChoice::String("auto".into()))
-                },
-                ..Default::default()
-            };
+        // 主 tool-call loop
+        let final_content = loop {
+            let resp = self.client.chat(messages.clone(), tools).await?;
+            let choice = resp
+                .choices
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("provider returned empty choices"))?;
 
-            let resp = self.provider.chat_boxed(req).await?;
-            let choice = resp.choices.first().expect("no response choice");
-
-            // 没有 tool calls → 追加约束消息，继续循环
             if choice.finish_reason == Some(FinishReason::Stop)
                 && choice
                     .message
@@ -134,14 +110,12 @@ impl Member {
                     .map_or(true, |v| v.is_empty())
             {
                 let bare_text = choice.message.content.clone().unwrap_or_default();
-                // 保存 assistant 消息
                 messages.push(RequestMessage::Chat(ChatMessage {
                     role: Role::Assistant,
                     content: MessageContent::Text(bare_text),
                     name: None,
                     tool_calls: None,
                 }));
-                // 追加约束
                 messages.push(RequestMessage::Chat(ChatMessage {
                     role: Role::User,
                     content: MessageContent::Text(LOOP_CONSTRAINT.to_string()),
@@ -151,10 +125,8 @@ impl Member {
                 continue;
             }
 
-            // 保存 assistant 消息（含 tool_calls）
             messages.push(request_message_from_choice(choice));
 
-            // 执行 tool calls
             if let Some(tool_calls) = &choice.message.tool_calls {
                 let sandbox_guard = self.sandbox.read().await;
                 let mut should_break = false;
@@ -162,8 +134,7 @@ impl Member {
 
                 for tc in tool_calls {
                     let (result, brk) =
-                        execute_tool(tc, &sandbox_guard, &self.board, &self.id, current_task_id)
-                            .await;
+                        execute_tool(tc, &sandbox_guard, board, &self.id).await;
 
                     messages.push(RequestMessage::Tool(ToolMessage {
                         role: Role::Tool,
@@ -180,44 +151,16 @@ impl Member {
                 drop(sandbox_guard);
 
                 if should_break {
-                    break (break_content.clone(), break_content);
+                    break break_content;
                 }
             }
         };
 
-        // ── 内联总结（同一上下文，KV cache 不中断）──
-        let summary_prompt = format!(
-            "请用一两句话总结你刚才完成的工作：做了什么、产出了什么、有什么遗留。\n\n工作结果供你参考：\n{}",
-            final_content
-        );
-        messages.push(RequestMessage::Chat(ChatMessage {
-            role: Role::User,
-            content: MessageContent::Text(summary_prompt),
-            name: None,
-            tool_calls: None,
-        }));
-
-        let summary_req = ChatRequest {
-            model: self.model.clone(),
-            messages,
-            ..Default::default()
-        };
-
-        let summary_resp = self.provider.chat_boxed(summary_req).await?;
-        let summary = summary_resp
-            .choices
-            .first()
-            .and_then(|c| c.message.content.as_deref())
-            .unwrap_or(&final_summary)
-            .to_string();
-
         Ok(ChatOutcome {
             result: final_content,
-            summary,
         })
     }
 }
-
 // ── Helpers ──────────────────────────────────────────────────
 
 fn request_message_from_choice(choice: &ResponseChoice) -> RequestMessage {
@@ -234,19 +177,13 @@ async fn execute_tool(
     sandbox: &SandboxManager,
     board: &DelegationBoard,
     from: &str,
-    current_task_id: Option<&str>,
 ) -> ToolResult {
     match tc.function.name.as_str() {
         "bash" => (execute_bash(&tc.function.arguments, sandbox).await, false),
         "delegate" => {
-            let result =
-                execute_delegate(&tc.function.arguments, board, from, current_task_id).await;
+            let result = execute_delegate(&tc.function.arguments, board, from).await;
             (result, true)
         }
-        "delegate_reject" => (
-            execute_delegate_reject(&tc.function.arguments, board, from).await,
-            false,
-        ),
         "schedule_add" => (
             execute_schedule_add(&tc.function.arguments, board).await,
             false,
@@ -261,12 +198,15 @@ async fn execute_tool(
             false,
         ),
         "recall" => (execute_recall(&tc.function.arguments, board).await, false),
-        "finish" => (execute_finish(&tc.function.arguments).await, true),
+        "finish" => (
+            execute_finish(&tc.function.arguments, board, from).await,
+            true,
+        ),
         _ => (format!("未知工具: {}", tc.function.name), false),
     }
 }
 
-async fn execute_finish(arguments: &str) -> String {
+async fn execute_finish(arguments: &str, board: &DelegationBoard, from: &str) -> String {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
         Err(e) => return format!("参数解析失败: {}", e),
@@ -275,37 +215,91 @@ async fn execute_finish(arguments: &str) -> String {
         .get("summary")
         .and_then(|v| v.as_str())
         .unwrap_or("(无摘要)");
-    let result = args.get("result").and_then(|v| v.as_str()).unwrap_or("");
-    format!("任务完成。摘要: {}\n结果: {}", summary, result)
+    let detail = args.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+
+    let delegation_id = board
+        .chain_snapshot()
+        .await
+        .current_task()
+        .map(|t| t.id.clone())
+        .unwrap_or_default();
+
+    match board
+        .result(
+            from,
+            crate::board::TaskResult {
+                delegation_id,
+                detail: detail.to_string(),
+                summary: summary.to_string(),
+                done: true,
+            },
+        )
+        .await
+    {
+        Ok(()) => format!("完成。摘要: {}", summary),
+        Err(e) => format!("产出写入失败: {}", e),
+    }
 }
 
-async fn execute_delegate(
-    arguments: &str,
-    board: &DelegationBoard,
-    from: &str,
-    parent_id: Option<&str>,
-) -> String {
+async fn execute_delegate(arguments: &str, board: &DelegationBoard, from: &str) -> String {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
         Err(e) => return format!("参数解析失败: {}", e),
     };
-
     let target = match args.get("target").and_then(|v| v.as_str()) {
         Some(t) => t,
         None => return "缺少 'target' 参数".to_string(),
     };
-    let task = match args.get("task").and_then(|v| v.as_str()) {
+    let task_summary = match args.get("task_summary").and_then(|v| v.as_str()) {
         Some(t) => t,
-        None => return "缺少 'task' 参数".to_string(),
+        None => return "缺少 'task_summary' 参数".to_string(),
     };
-    let detail = args.get("detail").and_then(|v| v.as_str()).unwrap_or("");
-    let priority = args.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let task_detail = match args.get("task_detail").and_then(|v| v.as_str()) {
+        Some(d) => d,
+        None => return "缺少 'task_detail' 参数".to_string(),
+    };
+    let work_summary = match args.get("work_summary").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return "缺少 'work_summary' 参数".to_string(),
+    };
+    let work_detail = match args.get("work_detail").and_then(|v| v.as_str()) {
+        Some(d) => d,
+        None => return "缺少 'work_detail' 参数".to_string(),
+    };
+    let parent_id = board
+        .chain_snapshot()
+        .await
+        .current_task()
+        .map(|t| t.id.clone());
+
+    // 记录发委托前的产出
+    let delegation_id = parent_id.clone().unwrap_or_default();
+    let _ = board
+        .result(
+            from,
+            crate::board::TaskResult {
+                delegation_id,
+                detail: work_detail.to_string(),
+                summary: work_summary.to_string(),
+                done: false,
+            },
+        )
+        .await;
 
     match board
-        .offer(from, target, task, detail, parent_id, priority)
+        .offer(
+            from,
+            target,
+            task_summary,
+            task_detail,
+            parent_id.as_deref(),
+        )
         .await
     {
-        Ok(task_id) => format!("委托已发布到发布区，task_id: {}", task_id),
+        Ok(task_id) => format!(
+            "委托已发布到发布区，task_id: {}\n发委托前总结: {}\n发委托前思路: {}",
+            task_id, work_summary, work_detail
+        ),
         Err(e) => format!("委托发布失败: {}", e),
     }
 }
@@ -374,21 +368,6 @@ async fn execute_schedule_remove(arguments: &str, board: &DelegationBoard) -> St
     }
 }
 
-async fn execute_delegate_reject(arguments: &str, board: &DelegationBoard, from: &str) -> String {
-    let args: serde_json::Value = match serde_json::from_str(arguments) {
-        Ok(v) => v,
-        Err(e) => return format!("参数解析失败: {}", e),
-    };
-    let task_id = match args.get("task_id").and_then(|v| v.as_str()) {
-        Some(t) => t,
-        None => return "缺少 'task_id' 参数".to_string(),
-    };
-    match board.reject(from, task_id).await {
-        Ok(()) => format!("已驳回委托 {}, 任务回到发布区", task_id),
-        Err(e) => format!("驳回失败: {}", e),
-    }
-}
-
 async fn execute_recall(arguments: &str, board: &DelegationBoard) -> String {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
@@ -406,23 +385,19 @@ async fn execute_bash(arguments: &str, sandbox: &SandboxManager) -> String {
         Ok(v) => v,
         Err(e) => return format!("参数解析失败: {}", e),
     };
-
     let command = match args.get("command").and_then(|v| v.as_str()) {
         Some(cmd) => cmd.to_string(),
         None => return "缺少 'command' 参数".to_string(),
     };
-
     let wrapped = sandbox.wrap_command(&command);
     if let Err(e) = sandbox.guard(&wrapped) {
         return format!("命令被守卫拒绝: {}", e);
     }
-
     let output = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(&wrapped)
         .output()
         .await;
-
     match output {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -436,4 +411,35 @@ async fn execute_bash(arguments: &str, sandbox: &SandboxManager) -> String {
         }
         Err(e) => format!("执行失败: {}", e),
     }
+}
+
+fn format_memories(db: &crate::memory::SqliteMemory, member_id: &str) -> String {
+    let my_log = match db.worklog_by_agent(member_id, 10) {
+        Ok(log) => log,
+        Err(e) => {
+            tracing::warn!(
+                "无法查询成员 '{}' 的工作日志: {}",
+                member_id,
+                e
+            );
+            return "(暂无记录)".to_string();
+        }
+    };
+    let delegation_ids: Vec<String> = my_log.iter().map(|e| e.delegation_id.clone()).collect();
+    let memories = db.personal_by_delegations(&delegation_ids);
+    if memories.is_empty() {
+        return "(暂无记录)".to_string();
+    }
+    memories
+        .iter()
+        .map(|m| {
+            format!(
+                "[{}] {} — tags: {}",
+                m.delegation_id,
+                m.summary,
+                m.tags.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

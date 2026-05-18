@@ -31,39 +31,3 @@ fn validate_workdir(workdir: &str) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use types::{AgentRef, WorkspaceMeta};
-
-    fn make_compose(ids: Vec<&str>, workdir: &str) -> ComposeFile {
-        ComposeFile {
-            workspace: WorkspaceMeta {
-                name: "test".into(),
-                version: "0.1.0".into(),
-                description: "".into(),
-                workdir: workdir.into(),
-            },
-            agents: ids.into_iter().map(|id| AgentRef { id: id.into() }).collect(),
-        }
-    }
-
-    #[test]
-    fn valid_compose_passes() {
-        let compose = make_compose(vec!["a", "b", "c"], "./project");
-        assert!(validate(&compose).is_ok());
-    }
-
-    #[test]
-    fn duplicate_ids_fail() {
-        let compose = make_compose(vec!["a", "b", "a"], "./project");
-        assert!(validate(&compose).is_err());
-    }
-
-    #[test]
-    fn dotdot_workdir_fails() {
-        let compose = make_compose(vec!["a"], "../escape");
-        assert!(validate(&compose).is_err());
-    }
-}

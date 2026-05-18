@@ -29,4 +29,6 @@ pub struct WorkspaceMeta {
     #[serde(default)]
     pub description: String,
     pub workdir: String,
+    #[serde(default)]
+    pub system_prompt: String,
 }

@@ -1,34 +1,23 @@
-//! 委托板（Delegation Board）
+//! 委托板（Delegation Board）+ 任务链（TaskChain）
 //!
-//! 四区模型：发布区 → 执行区 → 返回区 → 档案区（SQLite）。
+//! 简化后的双区模型：发布区 + 档案区（SQLite）。
+//! 任务链以图灵机方式管理委托过程：链右移（delegate），链左移（finish，done=true）。
 //!
 //! ```text
-//! offer ──→ [发布区] ──claim──→ [执行区] ──return──→ [返回区]
-//!               ↑                                    │       │
-//!               └────────── reject ──────────────────┘       │
-//!                                                            │
-//!                                    accept → [档案区: SQLite]
+//! offer ──→ [发布区] ──take──→ [成员处理] ──finish/delegate──→ [档案区: SQLite]
 //! ```
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
+use types::message::{ChatMessage, MessageContent, Role};
 
-use crate::memory::{
-    DelegationRecord, MemoryEntry, PersonalMemory, SqliteMemory, Worklog, WorklogEntry,
-};
+use crate::memory::{PersonalMemory, SqliteMemory, Worklog};
 
-/// 用户消息的优先级——高于一切 agent 任务
-pub const PRIORITY_USER: u32 = u32::MAX;
+// ── 任务链类型 ────────────────────────────────────────────────
 
-/// 纠纷升级阈值
-const DISPUTE_THRESHOLD: u32 = 3;
-
-// ── Types ────────────────────────────────────────────────────
-
-/// 委托任务
+/// 委托任务（纯数据）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegationTask {
     pub id: String,
@@ -37,20 +26,102 @@ pub struct DelegationTask {
     pub brief: String,
     pub detail: String,
     pub parent_id: Option<String>,
-    pub priority: u32,
-    pub result: Option<String>,
-    pub reject_count: u32,
+}
+
+/// 委托产出（与数据库字段对应）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskResult {
+    pub delegation_id: String,
+    pub detail: String,
+    pub summary: String,
+    pub done: bool,
+}
+
+/// 链条目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ChainEntry {
+    /// 一次委托
+    Delegate {
+        task: DelegationTask,
+        parent_idx: usize,
+    },
+    /// 一次产出（一个委托可以有多个 Outcome）
+    Outcome {
+        result: TaskResult,
+        delegate_idx: usize,
+    },
+}
+
+/// 任务链
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskChain {
+    pub(crate) entries: Vec<ChainEntry>,
+    pub(crate) head: usize,
+}
+
+impl TaskChain {
+    // TODO: 虚拟根条目会污染 assemble_prompt 的链上下文输出，后续考虑用 Option<TaskChain> 消除
+    fn new(root: DelegationTask) -> Self {
+        Self {
+            entries: vec![ChainEntry::Delegate {
+                task: root,
+                parent_idx: 0,
+            }],
+            head: 0,
+        }
+    }
+
+    fn add_task(&mut self, task: DelegationTask, db: &SqliteMemory) {
+        let parent_idx = self.head;
+        self.entries.push(ChainEntry::Delegate { task, parent_idx });
+        self.head = self.entries.len() - 1;
+        if let Some(ChainEntry::Delegate { task, .. }) = self.entries.last() {
+            let _ = self.worklog_record(self.entries.last().unwrap(), db);
+            let _ = db.memory_add_task(&task.id, &task.to, &task.from, &task.brief);
+        }
+    }
+
+    fn add_result(&mut self, result: TaskResult, db: &SqliteMemory) {
+        let delegate_idx = self.head;
+        let done = result.done;
+        self.entries.push(ChainEntry::Outcome {
+            delegate_idx,
+            result,
+        });
+        if let Some(ChainEntry::Outcome { result, .. }) = self.entries.last() {
+            let _ = self.worklog_record(self.entries.last().unwrap(), db);
+            let _ = db.memory_add_detail(&result.delegation_id, &result.detail);
+        }
+        if done {
+            if let Some(ChainEntry::Delegate { parent_idx, .. }) = self.entries.get(self.head) {
+                self.head = *parent_idx;
+            }
+        }
+    }
+
+    pub fn current_task(&self) -> Option<&DelegationTask> {
+        match self.entries.get(self.head) {
+            Some(ChainEntry::Delegate { task, .. }) => Some(task),
+            _ => None,
+        }
+    }
+
+    /// 根据 ChainEntry 类型自动写入 worklog：
+    /// Delegate → insert 新行，Outcome → update summary
+    fn worklog_record(&self, entry: &ChainEntry, db: &SqliteMemory) -> Result<()> {
+        match entry {
+            ChainEntry::Delegate { task, .. } => {
+                db.worklog_add_task(&task.id, &task.from, &task.to, &task.brief)
+            }
+            ChainEntry::Outcome { result, .. } => {
+                db.worklog_add_result(&result.delegation_id, &result.summary)
+            }
+        }
+    }
 }
 
 impl DelegationTask {
-    fn new(
-        from: &str,
-        to: &str,
-        brief: &str,
-        detail: &str,
-        parent_id: Option<&str>,
-        priority: u32,
-    ) -> Self {
+    fn new(from: &str, to: &str, brief: &str, detail: &str, parent_id: Option<&str>) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             from: from.to_string(),
@@ -58,74 +129,180 @@ impl DelegationTask {
             brief: brief.to_string(),
             detail: detail.to_string(),
             parent_id: parent_id.map(|s| s.to_string()),
-            priority,
-            result: None,
-            reject_count: 0,
-        }
-    }
-
-    /// 格式化输出完整委托信息
-    pub fn format(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!("[委托 {}]\n", self.id));
-        out.push_str(&format!("简述: {}\n", self.brief));
-        if !self.detail.is_empty() {
-            out.push_str(&format!("详情: {}\n", self.detail));
-        }
-        out.push_str(&format!("委托人: {}\n", self.from));
-        out.push_str(&format!("承接人: {}\n", self.to));
-        if let Some(ref pid) = self.parent_id {
-            out.push_str(&format!("上级委托: {}\n", pid));
-        }
-        if let Some(ref result) = self.result {
-            if !result.is_empty() {
-                out.push_str(&format!("结果:\n{}\n", result));
-            }
-        }
-        out
-    }
-
-    /// 克隆并重置为可重新发布的状态
-    fn clone_for_reoffer(&self) -> Self {
-        Self {
-            id: self.id.clone(),
-            from: self.from.clone(),
-            to: self.to.clone(),
-            brief: self.brief.clone(),
-            detail: self.detail.clone(),
-            parent_id: self.parent_id.clone(),
-            priority: self.priority,
-            result: None,
-            reject_count: self.reject_count,
         }
     }
 }
 
-/// 委托板——四区任务队列
+// ── Board ───────────────────────────────────────────────
+
+/// 委托板——发布区 + 档案区（SQLite）+ 任务链
 pub struct DelegationBoard {
     publish: RwLock<Vec<DelegationTask>>,
-    exec: RwLock<Vec<DelegationTask>>,
-    returned: RwLock<Vec<DelegationTask>>,
+    // exec: RwLock<Vec<DelegationTask>>,
+    // returned: RwLock<Vec<DelegationTask>>,
+    // archive → SQLite
     db: Arc<SqliteMemory>,
+    chain: RwLock<TaskChain>,
+    system_prompt: String,
 }
 
 // ── Lifecycle ────────────────────────────────────────────────
 
 impl DelegationBoard {
-    pub fn new(db: Arc<SqliteMemory>) -> Self {
+    pub fn new(db: Arc<SqliteMemory>, system_prompt: String) -> Self {
         Self {
             publish: RwLock::new(Vec::new()),
-            exec: RwLock::new(Vec::new()),
-            returned: RwLock::new(Vec::new()),
+            // exec: RwLock::new(Vec::new()),
+            // returned: RwLock::new(Vec::new()),
+            chain: RwLock::new(TaskChain::new(DelegationTask {
+                id: String::new(),
+                from: String::new(),
+                to: String::new(),
+                brief: String::new(),
+                detail: String::new(),
+                parent_id: None,
+            })),
             db,
+            system_prompt,
         }
+    }
+
+    pub fn db(&self) -> &SqliteMemory {
+        &self.db
+    }
+
+    /// 获取任务链快照（只读克隆，供 Prompt 使用）
+    pub async fn chain_snapshot(&self) -> TaskChain {
+        self.chain.read().await.clone()
+    }
+
+    /// 组装 LLM 上下文消息（替代原 Prompt::format）
+    pub async fn assemble_prompt(&self, soul: &str, memories: &str) -> Vec<ChatMessage> {
+        let mut messages = Vec::new();
+
+        // 1. 人格提示词（system 消息）
+        messages.push(ChatMessage {
+            role: Role::System,
+            content: MessageContent::Text(soul.to_string()),
+            name: None,
+            tool_calls: None,
+        });
+
+        // 2. 系统提示词
+        if !self.system_prompt.is_empty() {
+            messages.push(ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text(self.system_prompt.clone()),
+                name: None,
+                tool_calls: None,
+            });
+        }
+
+        // 3. 委托链上下文
+        let chain = self.chain.read().await;
+        let chain_text = Self::format_chain(&chain);
+        messages.push(ChatMessage {
+            role: Role::User,
+            content: MessageContent::Text(format!("--- 委托链上下文 ---\n{}", chain_text)),
+            name: None,
+            tool_calls: None,
+        });
+
+        // 4. 团队工作日志
+        let worklog = Self::format_worklog(&self.db);
+        if !worklog.is_empty() {
+            messages.push(ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text(format!("--- 团队工作日志 ---\n{}", worklog)),
+                name: None,
+                tool_calls: None,
+            });
+        }
+
+        // 5. 个人记忆
+        if !memories.is_empty() {
+            messages.push(ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text(format!("--- 你的相关记忆 ---\n{}", memories)),
+                name: None,
+                tool_calls: None,
+            });
+        }
+
+        // 6. 当前任务
+        if let Some(task) = chain.current_task() {
+            let mut task_desc = format!("当前任务: {}", task.brief);
+            if !task.detail.is_empty() {
+                task_desc.push_str(&format!("\n详情: {}", task.detail));
+            }
+            messages.push(ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text(task_desc),
+                name: None,
+                tool_calls: None,
+            });
+        }
+
+        messages
+    }
+
+    fn format_chain(chain: &TaskChain) -> String {
+        let mut lines = Vec::new();
+        for (i, entry) in chain.entries.iter().enumerate() {
+            let marker = if i == chain.head { "→ " } else { "  " };
+            match entry {
+                ChainEntry::Delegate { task, .. } => {
+                    lines.push(format!(
+                        "{}[委托 {}] {} 委托 {}: {}",
+                        marker,
+                        &task.id[..8],
+                        task.from,
+                        task.to,
+                        task.brief
+                    ));
+                    if !task.detail.is_empty() {
+                        lines.push(format!("  详情: {}", task.detail));
+                    }
+                    if let Some(ref pid) = task.parent_id {
+                        lines.push(format!("  上级: {}", &pid[..8]));
+                    }
+                }
+                ChainEntry::Outcome {
+                    delegate_idx,
+                    result,
+                } => {
+                    let status = if result.done {
+                        "完成"
+                    } else {
+                        "阶段性产出"
+                    };
+                    lines.push(format!(
+                        "{}[产出 idx={}] {} — {}",
+                        marker, delegate_idx, result.summary, status
+                    ));
+                }
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn format_worklog(db: &SqliteMemory) -> String {
+        let entries = db.recent(20);
+        if entries.is_empty() {
+            return String::new();
+        }
+        entries
+            .iter()
+            .map(|e| format!("[{}] {} — {}", e.agent_id, e.delegation_id, e.summary))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
 // ── Operations ───────────────────────────────────────────────
 
 impl DelegationBoard {
-    /// 发布委托到发布区（非阻塞，始终异步）
+    /// 发布委托到发布区，同时链右移
     pub async fn offer(
         &self,
         from: &str,
@@ -133,205 +310,98 @@ impl DelegationBoard {
         brief: &str,
         detail: &str,
         parent_id: Option<&str>,
-        priority: u32,
     ) -> Result<String> {
-        let task = DelegationTask::new(from, to, brief, detail, parent_id, priority);
+        let task = DelegationTask::new(from, to, brief, detail, parent_id);
         let id = task.id.clone();
 
-        // 持久化到 SQLite
-        let _ = self
-            .db
-            .delegation_insert(&id, from, to, brief, detail, parent_id);
+        self.db
+            .delegation_insert(&id, from, to, brief, detail, parent_id)?;
 
-        let mut publish = self.publish.write().await;
-        publish.push(task);
-        publish.sort_by(|a, b| b.priority.cmp(&a.priority));
+        // 先入链（worklog/memory 由 add_task 内部写入）
+        let cloned = {
+            let mut chain = self.chain.write().await;
+            chain.add_task(task, &self.db);
+            chain.entries.last().and_then(|e| match e {
+                ChainEntry::Delegate { task, .. } => Some(task.clone()),
+                _ => None,
+            })
+        };
+
+        // 放掉链锁后再入发布区
+        if let Some(t) = cloned {
+            let mut publish = self.publish.write().await;
+            publish.push(t);
+        }
+
         Ok(id)
     }
 
+    /*
     /// 成员领取任务：从发布区移到执行区
     pub async fn claim(&self, member_id: &str) -> Result<Option<DelegationTask>> {
         let mut publish = self.publish.write().await;
         if let Some(pos) = publish.iter().position(|t| t.to == member_id) {
             let task = publish.remove(pos);
-
             let mut exec = self.exec.write().await;
             exec.push(task.clone());
-
             Ok(Some(task))
         } else {
             Ok(None)
         }
     }
+    */
 
-    /// 成员提交结果：从执行区移到返回区，写入个人记忆
-    pub async fn return_task(
-        &self,
-        member_id: &str,
-        task_id: &str,
-        result: &str,
-        summary: &str,
-    ) -> Result<()> {
-        let mut exec = self.exec.write().await;
-        let pos = exec
+    /// 成员从发布区领取任务
+    pub async fn take(&self, member_id: &str) -> Option<DelegationTask> {
+        let mut publish = self.publish.write().await;
+        publish
+            .iter()
+            .position(|t| t.to == member_id)
+            .map(|pos| publish.remove(pos))
+    }
+
+    /// 产出结果：链追加 Outcome；done 时从发布区移除
+    pub async fn result(&self, member_id: &str, result: TaskResult) -> Result<()> {
+        let task_id = result.delegation_id.clone();
+        let done = result.done;
+
+        // 链操作（含 worklog/memory 写入）
+        {
+            let mut chain = self.chain.write().await;
+            chain.add_result(result, &self.db);
+        }
+
+        if !done {
+            return Ok(());
+        }
+
+        // 板操作：从任务区删除
+        let mut tasks = self.publish.write().await;
+        let pos = tasks
             .iter()
             .position(|t| t.id == task_id && t.to == member_id)
-            .ok_or_else(|| anyhow::anyhow!("执行区中未找到任务 '{}'", task_id))?;
+            .ok_or_else(|| anyhow::anyhow!("任务区中未找到任务 '{}'", task_id))?;
+        tasks.remove(pos);
 
-        let mut task = exec.remove(pos);
-        task.result = Some(result.to_string());
-
-        // 同步 result 到 SQLite
-        let _ = self.db.delegation_set_result(task_id, result);
-
-        let returned_task = task.clone();
-        let mut returned = self.returned.write().await;
-        returned.push(task);
-
-        // 写入个人记忆（谁完成谁记录）
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let _ = self.db.remember(MemoryEntry {
-            timestamp: now,
-            delegation_id: returned_task.id.clone(),
-            from_agent: returned_task.from.clone(),
-            description: returned_task.brief.clone(),
-            summary: summary.to_string(),
-            artifacts: vec![],
-            tags: vec![],
-        });
         Ok(())
     }
 
-    /// 发布者接受结果：从返回区删除，写入工作日志
-    ///
-    /// 谁发布谁负责记工作日志。个人记忆在 return_task 时已写。
-    pub async fn accept(&self, member_id: &str, task_id: &str) -> Result<DelegationTask> {
-        let mut returned = self.returned.write().await;
-        let pos = returned
-            .iter()
-            .position(|t| t.id == task_id && t.from == member_id)
-            .ok_or_else(|| anyhow::anyhow!("返回区中未找到任务 '{}'", task_id))?;
-
-        let task = returned.remove(pos);
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let _ = self.db.append(WorklogEntry {
-            timestamp: now,
-            agent_id: task.to.clone(),
-            delegation_id: task.id.clone(),
-            to_agent: task.to.clone(),
-            description: task.brief.clone(),
-            summary: task.result.clone().unwrap_or_default(),
-            artifacts: vec![],
-        });
-
-        Ok(task)
-    }
-
-    /// 发布者驳回结果：从返回区回到发布区（reject_count++）
-    ///
-    /// 若 reject_count 超过阈值，to 改为 manager。
-    pub async fn reject(&self, member_id: &str, task_id: &str) -> Result<()> {
-        let mut returned = self.returned.write().await;
-        let pos = returned
-            .iter()
-            .position(|t| t.id == task_id && t.from == member_id)
-            .ok_or_else(|| anyhow::anyhow!("返回区中未找到任务 '{}'", task_id))?;
-
-        let task = &mut returned[pos];
-        task.reject_count += 1;
-        task.result = None;
-
-        if task.reject_count >= DISPUTE_THRESHOLD {
-            task.to = "manager".to_string();
-        }
-
-        let reoffer = task.clone_for_reoffer();
-        returned.remove(pos);
-        drop(returned);
-
-        let mut publish = self.publish.write().await;
-        publish.push(reoffer);
-        publish.sort_by(|a, b| b.priority.cmp(&a.priority));
-        Ok(())
-    }
-
-    /// 取消任务：从任意区删除
+    /// 取消任务
     pub async fn cancel(&self, task_id: &str) -> Result<DelegationTask> {
-        // 执行区
-        {
-            let mut exec = self.exec.write().await;
-            if let Some(pos) = exec.iter().position(|t| t.id == task_id) {
-                return Ok(exec.remove(pos));
-            }
-        }
-        // 发布区
-        {
-            let mut publish = self.publish.write().await;
-            if let Some(pos) = publish.iter().position(|t| t.id == task_id) {
-                return Ok(publish.remove(pos));
-            }
-        }
-        // 返回区
-        {
-            let mut returned = self.returned.write().await;
-            if let Some(pos) = returned.iter().position(|t| t.id == task_id) {
-                return Ok(returned.remove(pos));
-            }
+        let mut tasks = self.publish.write().await;
+        if let Some(pos) = tasks.iter().position(|t| t.id == task_id) {
+            return Ok(tasks.remove(pos));
         }
         bail!("任务 '{}' 不存在", task_id)
     }
 
-    /// 查询返回区中自己发布的委托（等待 accept/reject）
-    pub async fn check_return(&self, member_id: &str) -> Vec<DelegationTask> {
-        let returned = self.returned.read().await;
-        returned
-            .iter()
-            .filter(|t| t.from == member_id)
-            .cloned()
-            .collect()
-    }
-
-    /// 查询自己的任务在执行区中是否存在
-    pub async fn is_working(&self, member_id: &str) -> bool {
-        let exec = self.exec.read().await;
-        exec.iter().any(|t| t.to == member_id)
-    }
-
-    /// 查询该成员是否有未完成的阶段任务（status='offered'）
-    pub fn has_offered_schedule(&self, member_id: &str) -> bool {
-        self.db.has_offered_schedule(member_id)
-    }
-
     /// 查询快照
     pub async fn status(&self) -> BoardStatus {
-        let publish = self.publish.read().await;
-        let exec = self.exec.read().await;
-        let returned = self.returned.read().await;
+        let tasks = self.publish.read().await;
         BoardStatus {
-            publish_count: publish.len(),
-            exec_count: exec.len(),
-            returned_count: returned.len(),
-            publish_details: publish.iter().map(TaskInfo::from).collect(),
-            exec_details: exec.iter().map(TaskInfo::from).collect(),
-            returned_details: returned.iter().map(TaskInfo::from).collect(),
+            publish_count: tasks.len(),
+            publish_details: tasks.iter().map(TaskInfo::from).collect(),
         }
-    }
-
-    /// 按 ID 查询委托记录（用于链向上查找）
-    pub fn get_task(&self, id: &str) -> Option<DelegationRecord> {
-        self.db.delegation_get(id)
-    }
-
-    /// 向委托 result 字段追加子委托的完整输出
-    pub fn append_result(&self, task_id: &str, text: &str) -> Result<()> {
-        self.db.delegation_append_result(task_id, text)
     }
 
     // ── Schedule 委派 ──────────────────────────────────────────
@@ -405,11 +475,7 @@ impl DelegationBoard {
 #[derive(Debug, Clone, Serialize)]
 pub struct BoardStatus {
     pub publish_count: usize,
-    pub exec_count: usize,
-    pub returned_count: usize,
     pub publish_details: Vec<TaskInfo>,
-    pub exec_details: Vec<TaskInfo>,
-    pub returned_details: Vec<TaskInfo>,
 }
 
 /// 任务简要信息
@@ -429,275 +495,5 @@ impl From<&DelegationTask> for TaskInfo {
             to: t.to.clone(),
             brief: t.brief.clone(),
         }
-    }
-}
-
-// ── Tests ────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_db() -> Arc<SqliteMemory> {
-        Arc::new(SqliteMemory::open(":memory:").unwrap())
-    }
-
-    #[tokio::test]
-    async fn offer_claim_return_accept_flow() {
-        let board = DelegationBoard::new(test_db());
-
-        let task_id = board
-            .offer("architect", "coder", "写代码", "实现用户认证模块", None, 0)
-            .await
-            .unwrap();
-        assert!(!task_id.is_empty());
-        assert_eq!(board.status().await.publish_count, 1);
-
-        // claim
-        let task = board.claim("coder").await.unwrap().unwrap();
-        assert_eq!(task.id, task_id);
-        assert_eq!(task.brief, "写代码");
-        assert_eq!(board.status().await.publish_count, 0);
-        assert_eq!(board.status().await.exec_count, 1);
-
-        // return
-        board
-            .return_task("coder", &task_id, "fn main() {}", "实现了入口")
-            .await
-            .unwrap();
-        assert_eq!(board.status().await.exec_count, 0);
-        assert_eq!(board.status().await.returned_count, 1);
-
-        // accept
-        let done = board.accept("architect", &task_id).await.unwrap();
-        assert_eq!(done.result.unwrap(), "fn main() {}");
-        assert_eq!(board.status().await.returned_count, 0);
-    }
-
-    #[tokio::test]
-    async fn reject_goes_back_to_publish() {
-        let board = DelegationBoard::new(test_db());
-
-        let task_id = board
-            .offer("architect", "coder", "写代码", "实现认证", None, 0)
-            .await
-            .unwrap();
-
-        board.claim("coder").await.unwrap();
-        board
-            .return_task("coder", &task_id, "bad code", "bad")
-            .await
-            .unwrap();
-        assert_eq!(board.status().await.returned_count, 1);
-
-        board.reject("architect", &task_id).await.unwrap();
-        assert_eq!(board.status().await.returned_count, 0);
-        assert_eq!(board.status().await.publish_count, 1);
-
-        let retry = board.claim("coder").await.unwrap().unwrap();
-        assert_eq!(retry.id, task_id);
-        assert_eq!(retry.reject_count, 1);
-    }
-
-    #[tokio::test]
-    async fn reject_over_threshold_escalates_to_manager() {
-        let board = DelegationBoard::new(test_db());
-
-        let task_id = board
-            .offer("architect", "coder", "写代码", "实现认证", None, 0)
-            .await
-            .unwrap();
-
-        for _ in 0..DISPUTE_THRESHOLD {
-            board.claim("coder").await.unwrap();
-            board
-                .return_task("coder", &task_id, "nope", "no")
-                .await
-                .unwrap();
-            board.reject("architect", &task_id).await.unwrap();
-        }
-
-        let task = board.claim("manager").await.unwrap().unwrap();
-        assert_eq!(task.id, task_id);
-        assert_eq!(task.to, "manager");
-        assert_eq!(task.reject_count, DISPUTE_THRESHOLD);
-    }
-
-    #[tokio::test]
-    async fn user_message_priority() {
-        let board = DelegationBoard::new(test_db());
-        board
-            .offer("architect", "coder", "普通任务", "", None, 0)
-            .await
-            .unwrap();
-        board
-            .offer("user", "coder", "紧急消息", "", None, PRIORITY_USER)
-            .await
-            .unwrap();
-
-        let task = board.claim("coder").await.unwrap().unwrap();
-        assert_eq!(task.brief, "紧急消息");
-    }
-
-    #[tokio::test]
-    async fn check_return_lists_pending_review() {
-        let board = DelegationBoard::new(test_db());
-        let task_id = board
-            .offer("architect", "coder", "写代码", "", None, 0)
-            .await
-            .unwrap();
-
-        board.claim("coder").await.unwrap();
-        board
-            .return_task("coder", &task_id, "done", "ok")
-            .await
-            .unwrap();
-
-        let pending = board.check_return("architect").await;
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, task_id);
-
-        let empty = board.check_return("coder").await;
-        assert!(empty.is_empty());
-    }
-
-    #[tokio::test]
-    async fn cancel_from_exec() {
-        let board = DelegationBoard::new(test_db());
-        let task_id = board
-            .offer("architect", "coder", "写代码", "", None, 0)
-            .await
-            .unwrap();
-
-        board.claim("coder").await.unwrap();
-        board.cancel(&task_id).await.unwrap();
-        assert_eq!(board.status().await.exec_count, 0);
-    }
-
-    #[tokio::test]
-    async fn cancel_from_publish() {
-        let board = DelegationBoard::new(test_db());
-        let task_id = board
-            .offer("architect", "coder", "不需要了", "", None, 0)
-            .await
-            .unwrap();
-
-        assert_eq!(board.status().await.publish_count, 1);
-        board.cancel(&task_id).await.unwrap();
-        assert_eq!(board.status().await.publish_count, 0);
-    }
-
-    #[tokio::test]
-    async fn cancel_nonexistent_fails() {
-        let board = DelegationBoard::new(test_db());
-        let err = board.cancel("nonexistent").await.unwrap_err();
-        assert!(err.to_string().contains("不存在"));
-    }
-
-    #[tokio::test]
-    async fn is_working_tracks_exec_zone() {
-        let board = DelegationBoard::new(test_db());
-        assert!(!board.is_working("coder").await);
-
-        board
-            .offer("architect", "coder", "写代码", "", None, 0)
-            .await
-            .unwrap();
-        board.claim("coder").await.unwrap();
-        assert!(board.is_working("coder").await);
-
-        assert!(!board.is_working("designer").await);
-    }
-
-    #[tokio::test]
-    async fn delegation_persisted_to_sqlite() {
-        let board = DelegationBoard::new(test_db());
-        let task_id = board
-            .offer("architect", "coder", "写API", "实现 GET /users", None, 0)
-            .await
-            .unwrap();
-
-        let record = board.get_task(&task_id).unwrap();
-        assert_eq!(record.brief, "写API");
-        assert_eq!(record.detail, "实现 GET /users");
-        assert_eq!(record.from_agent, "architect");
-        assert_eq!(record.to_agent, "coder");
-    }
-
-    #[tokio::test]
-    async fn delegation_format_output() {
-        let board = DelegationBoard::new(test_db());
-        let _task_id = board
-            .offer("manager", "coder", "实现JWT", "签发和验证令牌", None, 0)
-            .await
-            .unwrap();
-
-        let task = board.claim("coder").await.unwrap().unwrap();
-        let formatted = task.format();
-        assert!(formatted.contains("[委托"));
-        assert!(formatted.contains("简述: 实现JWT"));
-        assert!(formatted.contains("详情: 签发和验证令牌"));
-        assert!(formatted.contains("委托人: manager"));
-        assert!(formatted.contains("承接人: coder"));
-    }
-
-    #[tokio::test]
-    async fn append_result_downward() {
-        let board = DelegationBoard::new(test_db());
-        let parent_id = board
-            .offer("manager", "coder", "父任务", "", None, 0)
-            .await
-            .unwrap();
-
-        // 模拟子委托完成，追加到父的 result
-        board
-            .append_result(
-                &parent_id,
-                "\n---\n[委托 child-1]\n简述: 子任务\n结果: 完成\n",
-            )
-            .unwrap();
-
-        let record = board.get_task(&parent_id).unwrap();
-        assert!(record.result.contains("子任务"));
-        assert!(record.result.contains("完成"));
-    }
-
-    #[tokio::test]
-    async fn parent_id_chain_lookup() {
-        let board = DelegationBoard::new(test_db());
-        let root_id = board
-            .offer("user", "manager", "构建系统", "", None, PRIORITY_USER)
-            .await
-            .unwrap();
-
-        let child_id = board
-            .offer("manager", "coder", "实现JWT", "", Some(&root_id), 0)
-            .await
-            .unwrap();
-
-        // 通过 parent_id 向上查
-        let child = board.get_task(&child_id).unwrap();
-        assert_eq!(child.parent_id.as_deref(), Some(root_id.as_str()));
-
-        let root = board.get_task(&root_id).unwrap();
-        assert_eq!(root.brief, "构建系统");
-    }
-
-    #[tokio::test]
-    async fn return_task_updates_sqlite_result() {
-        let board = DelegationBoard::new(test_db());
-        let task_id = board
-            .offer("architect", "coder", "写代码", "", None, 0)
-            .await
-            .unwrap();
-
-        board.claim("coder").await.unwrap();
-        board
-            .return_task("coder", &task_id, "完成: src/main.rs", "ok")
-            .await
-            .unwrap();
-
-        let record = board.get_task(&task_id).unwrap();
-        assert_eq!(record.result, "完成: src/main.rs");
     }
 }
