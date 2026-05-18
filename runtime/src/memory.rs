@@ -46,14 +46,12 @@ pub struct MemoryEntry {
 
 /// 工作日志（团队共享）
 pub trait Worklog: Send + Sync {
-    fn append(&self, entry: WorklogEntry) -> Result<()>;
     fn recent(&self, limit: usize) -> Vec<WorklogEntry>;
     fn search(&self, keyword: &str) -> Vec<WorklogEntry>;
 }
 
 /// 个人记忆（每 agent 私有）
 pub trait PersonalMemory: Send + Sync {
-    fn remember(&self, entry: MemoryEntry) -> Result<()>;
     fn recall(&self, keyword: &str) -> Vec<MemoryEntry>;
     fn recall_by_tag(&self, tag: &str) -> Vec<MemoryEntry>;
 }
@@ -412,30 +410,77 @@ impl SqliteMemory {
         )?;
         Ok(())
     }
+
+    // ── 工作日志写入 ──
+
+    /// 任务创建时插入 worklog 行（summary 留空，待产出时补全）
+    pub fn worklog_add_task(
+        &self,
+        delegation_id: &str,
+        from_agent: &str,
+        to_agent: &str,
+        description: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        conn.execute(
+            "INSERT INTO worklog (timestamp, agent_id, delegation_id, to_agent, description, summary, artifacts)
+             VALUES (?, ?, ?, ?, ?, '', '[]')",
+            rusqlite::params![now as i64, from_agent, delegation_id, to_agent, description],
+        )?;
+        Ok(())
+    }
+
+    /// 任务产出时补全 worklog 的 summary
+    pub fn worklog_add_result(&self, delegation_id: &str, summary: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE worklog SET summary = ? WHERE delegation_id = ?",
+            rusqlite::params![summary, delegation_id],
+        )?;
+        Ok(())
+    }
+
+    // ── 个人记忆写入 ──
+
+    /// 任务创建时插入 personal_memory 行（summary 留空，待产出时补全）
+    pub fn memory_add_task(
+        &self,
+        delegation_id: &str,
+        agent_id: &str,
+        from_agent: &str,
+        description: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        conn.execute(
+            "INSERT INTO personal_memory (timestamp, agent_id, from_agent, delegation_id, description, summary, artifacts, tags)
+             VALUES (?, ?, ?, ?, ?, '', '[]', '[]')",
+            rusqlite::params![now as i64, agent_id, from_agent, delegation_id, description],
+        )?;
+        Ok(())
+    }
+
+    /// 任务产出时补全 personal_memory 的 detail
+    pub fn memory_add_detail(&self, delegation_id: &str, detail: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE personal_memory SET summary = ? WHERE delegation_id = ?",
+            rusqlite::params![detail, delegation_id],
+        )?;
+        Ok(())
+    }
 }
 
 // ── Worklog trait ────────────────────────────────────────────
 
 impl Worklog for SqliteMemory {
-    fn append(&self, entry: WorklogEntry) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let artifacts = serde_json::to_string(&entry.artifacts).unwrap_or_default();
-        conn.execute(
-            "INSERT OR REPLACE INTO worklog (timestamp, agent_id, delegation_id, to_agent, description, summary, artifacts)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-            rusqlite::params![
-                entry.timestamp as i64,
-                entry.agent_id,
-                entry.delegation_id,
-                entry.to_agent,
-                entry.description,
-                entry.summary,
-                artifacts,
-            ],
-        )?;
-        Ok(())
-    }
-
     fn recent(&self, limit: usize) -> Vec<WorklogEntry> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
@@ -474,28 +519,6 @@ impl Worklog for SqliteMemory {
 // ── PersonalMemory trait ─────────────────────────────────────
 
 impl PersonalMemory for SqliteMemory {
-    fn remember(&self, entry: MemoryEntry) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let artifacts = serde_json::to_string(&entry.artifacts).unwrap_or_default();
-        let tags = serde_json::to_string(&entry.tags).unwrap_or_default();
-        conn.execute(
-            "INSERT OR REPLACE INTO personal_memory
-             (timestamp, agent_id, from_agent, delegation_id, description, summary, artifacts, tags)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            rusqlite::params![
-                entry.timestamp as i64,
-                "", // agent_id 由上层通过 delegation_id 关联 worklog 确定
-                entry.from_agent,
-                entry.delegation_id,
-                entry.description,
-                entry.summary,
-                artifacts,
-                tags,
-            ],
-        )?;
-        Ok(())
-    }
-
     fn recall(&self, keyword: &str) -> Vec<MemoryEntry> {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", keyword);
@@ -573,17 +596,11 @@ mod tests {
     fn sqlite_memory_worklog_flow() {
         let db = SqliteMemory::open(":memory:").unwrap();
 
-        // 写入
-        db.append(WorklogEntry {
-            timestamp: 1705000000,
-            agent_id: "coder".into(),
-            delegation_id: "d-001".into(),
-            to_agent: "reviewer".into(),
-            description: "写用户接口".into(),
-            summary: "实现了 /api/users".into(),
-            artifacts: vec!["src/users.rs".into()],
-        })
-        .unwrap();
+        // 写入：任务创建
+        db.worklog_add_task("d-001", "coder", "reviewer", "写用户接口")
+            .unwrap();
+        // 补全：产出结果
+        db.worklog_add_result("d-001", "实现了 /api/users").unwrap();
 
         // 读取
         let recent = db.recent(5);
@@ -603,25 +620,17 @@ mod tests {
     fn sqlite_memory_personal_flow() {
         let db = SqliteMemory::open(":memory:").unwrap();
 
-        db.remember(MemoryEntry {
-            timestamp: 1705000001,
-            delegation_id: "d-001".into(),
-            from_agent: "manager".into(),
-            description: "写用户接口".into(),
-            summary: "用 actix-web 实现了 GET /api/users，返回 JSON 列表".into(),
-            artifacts: vec!["src/users.rs".into()],
-            tags: vec!["api".into(), "backend".into()],
-        })
+        db.memory_add_task("d-001", "coder", "manager", "写用户接口")
+            .unwrap();
+        db.memory_add_detail(
+            "d-001",
+            "用 actix-web 实现了 GET /api/users，返回 JSON 列表",
+        )
         .unwrap();
 
         // delegation_id 直查
         let found = db.personal_by_delegation("d-001");
         assert!(found.is_some());
-        assert_eq!(found.unwrap().tags, vec!["api", "backend"]);
-
-        // 按标签召回
-        let by_tag = db.recall_by_tag("api");
-        assert_eq!(by_tag.len(), 1);
 
         // 关键词召回
         let by_keyword = db.recall("actix");
@@ -631,26 +640,12 @@ mod tests {
     #[test]
     fn batch_delegation_lookup() {
         let db = SqliteMemory::open(":memory:").unwrap();
-        db.remember(MemoryEntry {
-            timestamp: 1,
-            delegation_id: "a".into(),
-            from_agent: "manager".into(),
-            description: "".into(),
-            summary: "A".into(),
-            artifacts: vec![],
-            tags: vec![],
-        })
-        .unwrap();
-        db.remember(MemoryEntry {
-            timestamp: 2,
-            delegation_id: "b".into(),
-            from_agent: "coder".into(),
-            description: "".into(),
-            summary: "B".into(),
-            artifacts: vec![],
-            tags: vec![],
-        })
-        .unwrap();
+        db.memory_add_task("a", "agent_a", "from_a", "task A")
+            .unwrap();
+        db.memory_add_detail("a", "detail A").unwrap();
+        db.memory_add_task("b", "agent_b", "from_b", "task B")
+            .unwrap();
+        db.memory_add_detail("b", "detail B").unwrap();
 
         let results = db.personal_by_delegations(&["a".into(), "b".into()]);
         assert_eq!(results.len(), 2);

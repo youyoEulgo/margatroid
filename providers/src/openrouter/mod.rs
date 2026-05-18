@@ -5,8 +5,9 @@ mod types;
 pub use error::OpenRouterError;
 
 use self::types::{ApiErrorBody, WireResponse};
-use crate::{error::ProviderError, traits::AiProvider};
+use crate::traits::AiProvider;
 use ::types::{ChatRequest, ChatResponse, StreamChunk};
+use anyhow::{Context, Result, bail};
 use futures::{Stream, StreamExt};
 use std::pin::Pin;
 
@@ -36,28 +37,23 @@ impl OpenRouterProvider {
         format!("{}/chat/completions", self.base_url)
     }
 
-    // 返回 ProviderError，? 在 impl AiProvider 里可以直接用
-    async fn parse_response(&self, resp: reqwest::Response) -> Result<WireResponse, ProviderError> {
+    // 返回 anyhow::Result，? 在 impl AiProvider 里可以直接用
+    async fn parse_response(&self, resp: reqwest::Response) -> Result<WireResponse> {
         let status = resp.status();
         let body = resp
             .text()
             .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+            .context("failed to read response body")?;
 
         if !status.is_success() {
             return match serde_json::from_str::<ApiErrorBody>(&body) {
-                Ok(e) => Err(ProviderError::from(OpenRouterError::Api(e.error))),
-                Err(_) => Err(ProviderError::ApiRaw {
-                    status: status.as_u16(),
-                    body,
-                }),
+                Ok(e) => Err(OpenRouterError::Api(e.error).into()),
+                Err(_) => bail!("API error (HTTP {}): {}", status.as_u16(), body),
             };
         }
 
-        serde_json::from_str::<WireResponse>(&body).map_err(|e| ProviderError::Deserialize {
-            message: e.to_string(),
-            raw: body,
-        })
+        serde_json::from_str::<WireResponse>(&body)
+            .with_context(|| format!("failed to deserialize response: {}", &body[..body.len().min(500)]))
     }
 
     fn parse_stream_line(line: &str) -> Option<Result<WireResponse, OpenRouterError>> {
@@ -82,7 +78,7 @@ impl AiProvider for OpenRouterProvider {
         "openrouter"
     }
 
-    async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ProviderError> {
+    async fn chat(&self, req: ChatRequest) -> Result<ChatResponse> {
         let wire_req = convert::to_wire(&req);
 
         let resp = self
@@ -92,8 +88,7 @@ impl AiProvider for OpenRouterProvider {
             .json(&wire_req)
             .send()
             .await
-            // reqwest::Error → OpenRouterError::Http → ProviderError
-            .map_err(|e| ProviderError::from(OpenRouterError::Http(e)))?;
+            .context("HTTP request failed")?;
 
         let wire_resp = self.parse_response(resp).await?;
         Ok(convert::from_wire(wire_resp))
@@ -102,8 +97,7 @@ impl AiProvider for OpenRouterProvider {
     async fn chat_stream(
         &self,
         req: ChatRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, ProviderError>> + Send>>, ProviderError>
-    {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
         let mut wire_req = convert::to_wire(&req);
         wire_req.stream = Some(true);
 
@@ -114,7 +108,7 @@ impl AiProvider for OpenRouterProvider {
             .json(&wire_req)
             .send()
             .await
-            .map_err(|e| ProviderError::from(OpenRouterError::Http(e)))?;
+            .context("HTTP request failed")?;
 
         // 非 2xx 在进入流之前就返回错误
         if !resp.status().is_success() {
@@ -122,10 +116,10 @@ impl AiProvider for OpenRouterProvider {
             let body = resp
                 .text()
                 .await
-                .map_err(|e| ProviderError::Network(e.to_string()))?;
+                .context("failed to read response body")?;
             return match serde_json::from_str::<ApiErrorBody>(&body) {
-                Ok(e) => Err(ProviderError::from(OpenRouterError::Api(e.error))),
-                Err(_) => Err(ProviderError::ApiRaw { status, body }),
+                Ok(e) => Err(OpenRouterError::Api(e.error).into()),
+                Err(_) => bail!("API error (HTTP {}): {}", status, body),
             };
         }
 
@@ -139,7 +133,7 @@ impl AiProvider for OpenRouterProvider {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
-                        yield Err(ProviderError::Network(e.to_string()));
+                        yield Err(anyhow::anyhow!("network error: {}", e));
                         return;
                     }
                 };
@@ -147,10 +141,7 @@ impl AiProvider for OpenRouterProvider {
                 let text = match std::str::from_utf8(&chunk) {
                     Ok(t) => t,
                     Err(_) => {
-                        yield Err(ProviderError::Deserialize {
-                            message: "Invalid UTF-8 in stream".into(),
-                            raw: String::new(),
-                        });
+                        yield Err(anyhow::anyhow!("invalid UTF-8 in stream"));
                         return;
                     }
                 };
@@ -170,14 +161,15 @@ impl AiProvider for OpenRouterProvider {
                             Ok(wire) => yield Ok(convert::from_wire_stream(wire)),
                             Err(OpenRouterError::StreamChunk { source, raw }) => {
                                 // chunk 解析失败，yield 错误但继续流
-                                yield Err(ProviderError::StreamChunk {
-                                    message: source.to_string(),
-                                    raw,
-                                });
+                                yield Err(anyhow::anyhow!(
+                                    "stream chunk parse error: {}; chunk: {}",
+                                    source,
+                                    raw
+                                ));
                             }
                             Err(e) => {
                                 // 其他错误中断流
-                                yield Err(ProviderError::from(e));
+                                yield Err(e.into());
                                 return;
                             }
                         }

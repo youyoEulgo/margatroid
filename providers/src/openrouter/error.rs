@@ -1,5 +1,4 @@
 use super::types::ApiError;
-use crate::error::ProviderError;
 
 #[derive(Debug)]
 pub enum OpenRouterError {
@@ -48,27 +47,5 @@ impl std::error::Error for OpenRouterError {
 impl From<reqwest::Error> for OpenRouterError {
     fn from(e: reqwest::Error) -> Self {
         Self::Http(e)
-    }
-}
-
-impl From<OpenRouterError> for ProviderError {
-    fn from(e: OpenRouterError) -> Self {
-        match e {
-            OpenRouterError::Http(e) => Self::Network(e.to_string()),
-            OpenRouterError::Api(e) => Self::Api {
-                code: e.code,
-                message: e.message,
-                metadata: e.metadata,
-            },
-            OpenRouterError::ApiRaw { status, body } => Self::ApiRaw { status, body },
-            OpenRouterError::Deserialize { source, raw } => Self::Deserialize {
-                message: source.to_string(),
-                raw,
-            },
-            OpenRouterError::StreamChunk { source, raw } => Self::StreamChunk {
-                message: source.to_string(),
-                raw,
-            },
-        }
     }
 }

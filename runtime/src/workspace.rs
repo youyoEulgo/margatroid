@@ -1,19 +1,20 @@
 //! Workspace — 团队协作容器
 //!
-//! 持有成员、委托板、沙箱、SQLite 记忆。
+//! 持有成员、委托板、任务链、SQLite 记忆。
 //! 成员由调用方构造传入，Workspace 不负责创建。
-//! 负责上下文注入和成员控制循环。
+//! 负责任务链管理和成员控制循环。
 
 use anyhow::Result;
 use sandbox::SandboxManager;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use types::{ComposeFile, RequestTool};
 
-use crate::agent::Agent;
-use crate::board::{DelegationBoard, PRIORITY_USER};
-use crate::memory::{SqliteMemory, Worklog};
+use crate::board::DelegationBoard;
+use crate::member::Agent;
+use crate::memory::SqliteMemory;
 
 pub fn base_tools() -> Vec<RequestTool> {
     vec![
@@ -40,25 +41,12 @@ pub fn base_tools() -> Vec<RequestTool> {
                     "type": "object",
                     "properties": {
                         "target": { "type": "string", "description": "目标成员 ID" },
-                        "task": { "type": "string", "description": "任务简述" },
-                        "detail": { "type": "string", "description": "详细描述" },
-                        "priority": { "type": "integer", "description": "优先级，数字越大越优先，默认 0" }
+                        "task_summary": { "type": "string", "description": "委托出去的任务简述" },
+                        "task_detail": { "type": "string", "description": "委托出去的任务详细描述" },
+                        "work_summary": { "type": "string", "description": "一句话简述发委托前做了什么、产出什么、有什么缺漏" },
+                        "work_detail": { "type": "string", "description": "发委托前干的事情的具体的思路、做法" }
                     },
-                    "required": ["target", "task"]
-                }),
-            },
-        },
-        types::RequestTool {
-            r#type: "function".into(),
-            function: types::FunctionDescription {
-                name: "delegate_reject".into(),
-                description: Some("驳回收到的委托结果".into()),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "task_id": { "type": "string", "description": "要驳回的委托 ID" }
-                    },
-                    "required": ["task_id"]
+                    "required": ["target", "task_summary", "task_detail", "work_summary", "work_detail"]
                 }),
             },
         },
@@ -80,14 +68,14 @@ pub fn base_tools() -> Vec<RequestTool> {
             r#type: "function".into(),
             function: types::FunctionDescription {
                 name: "finish".into(),
-                description: Some("完成当前委托并返回结果".into()),
+                description: Some("完成当前委托，产出最终结果".into()),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "summary": { "type": "string", "description": "完成摘要" },
-                        "result": { "type": "string", "description": "详细结果" }
+                        "summary": { "type": "string", "description": "一句话简述完成委托做了什么、产出什么" },
+                        "detail": { "type": "string", "description": "完成委托的具体思路、做法" }
                     },
-                    "required": ["summary"]
+                    "required": ["summary", "detail"]
                 }),
             },
         },
@@ -156,7 +144,7 @@ pub fn manager_tools() -> Vec<RequestTool> {
 /// 传给 Workspace 的成员配置
 pub struct AgentEntry {
     pub agent: Arc<dyn Agent>,
-    pub system_prompt: String,
+    pub soul: String,
     pub tools: Vec<RequestTool>,
 }
 
@@ -166,6 +154,7 @@ pub struct Workspace {
     pub db: Arc<SqliteMemory>,
     members: HashMap<String, Arc<dyn Agent>>,
     handles: Vec<tokio::task::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Workspace {
@@ -178,23 +167,26 @@ impl Workspace {
         let db_path = memory_path(compose);
         let db = Arc::new(SqliteMemory::open(&db_path)?);
 
-        let board = Arc::new(DelegationBoard::new(db.clone()));
+        let board = Arc::new(DelegationBoard::new(
+            db.clone(),
+            compose.workspace.system_prompt.clone(),
+        ));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         let mut members: HashMap<String, Arc<dyn Agent>> = HashMap::new();
         let mut handles = Vec::new();
 
         for entry in entries {
             let member_id = entry.agent.id().to_string();
-            members.insert(member_id.clone(), entry.agent.clone());
+            let agent = entry.agent.clone();
+            members.insert(member_id, agent.clone());
 
-            let entry_agent = entry.agent;
             let board_clone = board.clone();
-            let db_clone = db.clone();
-            let system_prompt = entry.system_prompt;
             let tools = entry.tools;
+            let shutdown_clone = shutdown.clone();
 
             handles.push(tokio::spawn(async move {
-                member_loop(entry_agent, system_prompt, board_clone, db_clone, tools).await;
+                member_loop(agent, board_clone, tools, shutdown_clone).await;
             }));
         }
 
@@ -204,9 +196,11 @@ impl Workspace {
             db,
             members,
             handles,
+            shutdown,
         })
     }
 
+    /// 发送用户消息：创建根委托并排入发布区
     pub async fn send_user_message(
         &self,
         from: &str,
@@ -214,66 +208,37 @@ impl Workspace {
         brief: &str,
         detail: &str,
     ) -> Result<String> {
-        self.board
-            .offer(from, to, brief, detail, None, PRIORITY_USER)
-            .await
+        self.board.offer(from, to, brief, detail, None).await
     }
 
     pub fn member(&self, id: &str) -> Option<&Arc<dyn Agent>> {
         self.members.get(id)
     }
+
+    /// 优雅关闭：通知所有成员退出并等待完成
+    pub async fn shutdown(mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let handles = std::mem::take(&mut self.handles);
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
 }
 
 impl Drop for Workspace {
     fn drop(&mut self) {
-        for handle in self.handles.drain(..) {
-            handle.abort();
-        }
+        self.shutdown.store(true, Ordering::SeqCst);
     }
 }
 
-/// 审核返回的委托 — 向下插入
-async fn review_delegations(
-    agent: &dyn Agent,
-    board: &DelegationBoard,
-    system_prompt: &str,
-    tools: &[RequestTool],
-) {
-    let returned = board.check_return(agent.id()).await;
-    if returned.is_empty() {
-        return;
-    }
+/// 处理任务：take → process → handle outcome
+async fn execute_task(agent: &dyn Agent, board: &DelegationBoard, tools: &[RequestTool]) {
+    const MAX_RETRIES: u32 = 3;
 
-    // 构建审核提示词
-    let items: Vec<String> = returned.iter().map(|t| t.format()).collect();
-    let review_prompt = format!(
-        "{}\n\n---\n\n审核你发出去的委托结果：\n{}\n\n满意的默认通过。不满意的调 delegate_reject(task_id) 驳回。",
-        system_prompt,
-        items.join("\n\n")
-    );
-    let _ = agent.process(&review_prompt, "审核委托", tools).await;
-
-    // 只对 accept 的委托向下插入上级 result
-    for t in &board.check_return(agent.id()).await {
-        let child_formatted = format!("\n---\n{}", t.format());
-        if let Some(ref parent_id) = t.parent_id {
-            let _ = board.append_result(parent_id, &child_formatted);
-        }
-        let _ = board.accept(agent.id(), &t.id).await;
-    }
-}
-
-/// 处理别人发来的委托 — 向上查
-async fn execute_task(
-    agent: &dyn Agent,
-    board: &DelegationBoard,
-    db: &SqliteMemory,
-    system_prompt: &str,
-    tools: &[RequestTool],
-) {
-    let task = match board.claim(agent.id()).await {
-        Ok(Some(t)) => t,
-        _ => return,
+    // 从发布区领取任务
+    let task = match board.take(agent.id()).await {
+        Some(t) => t,
+        None => return,
     };
 
     tracing::info!(
@@ -283,123 +248,86 @@ async fn execute_task(
         task.brief
     );
 
-    // 构建委托链上下文：沿 parent_id 向上追溯
-    let chain_context = build_chain(board, &task);
-
-    let memory_context = prepare_context(db, agent.id(), &task.brief);
-    let prompt = format!(
-        "{}\n\n---\n\n团队工作日志与相关记忆：\n{}\n\n---\n\n委托链上下文：\n{}\n\n---\n\n当前任务：{}",
-        system_prompt, memory_context, chain_context, task.brief
-    );
-
-    let outcome = match agent.process(&prompt, &task.brief, tools).await {
-        Ok(o) => o,
+    match agent.process(board, tools).await {
+        Ok(outcome) => {
+            tracing::debug!(
+                "成员 '{}' 完成委托 '{}': {}",
+                agent.id(),
+                task.id,
+                outcome.result
+            );
+        }
         Err(e) => {
-            let _ = board
-                .return_task(agent.id(), &task.id, &e.to_string(), "执行失败")
-                .await;
-            return;
+            if let Err(e) = board
+                .result(
+                    agent.id(),
+                    crate::board::TaskResult {
+                        delegation_id: task.id.clone(),
+                        detail: e.to_string(),
+                        summary: "执行失败".into(),
+                        done: false,
+                    },
+                )
+                .await
+            {
+                tracing::error!("记录失败结果出错: {}", e);
+            }
+
+            // 提取 / 递增重试计数
+            let (retries, inner_detail) = parse_retry(&task.detail);
+            if retries >= MAX_RETRIES {
+                tracing::warn!(
+                    "任务 '{}' 已达最大重试次数 {}，放弃",
+                    task.id,
+                    MAX_RETRIES
+                );
+                return;
+            }
+            let detail = format!("[RETRY:{}] {}", retries + 1, inner_detail);
+
+            if let Err(e) = board
+                .offer(
+                    &task.from,
+                    &task.to,
+                    &task.brief,
+                    &detail,
+                    task.parent_id.as_deref(),
+                )
+                .await
+            {
+                tracing::error!("重新发布失败: {}", e);
+            }
         }
     };
-    let _ = board
-        .return_task(agent.id(), &task.id, &outcome.result, &outcome.summary)
-        .await;
 }
 
-fn build_chain(board: &DelegationBoard, task: &crate::board::DelegationTask) -> String {
-    // 沿 parent_id 向上收集所有祖先
-    let mut ancestors: Vec<String> = Vec::new();
-    let mut current_pid = task.parent_id.clone();
-    while let Some(pid) = current_pid {
-        match board.get_task(&pid) {
-            Some(record) => {
-                current_pid = record.parent_id.clone();
-                ancestors.push(record.format());
+fn parse_retry(detail: &str) -> (u32, &str) {
+    if let Some(rest) = detail.strip_prefix("[RETRY:") {
+        if let Some(idx) = rest.find(']') {
+            if let Ok(n) = rest[..idx].parse::<u32>() {
+                return (n, rest[idx + 1..].trim());
             }
-            None => break,
         }
     }
-    // 反转：祖先 → 子孙
-    ancestors.reverse();
-    // 追加当前任务
-    ancestors.push(task.format());
-    ancestors.join("\n")
+    (0, detail)
 }
 
 async fn member_loop(
     agent: Arc<dyn Agent>,
-    system_prompt: String,
     board: Arc<DelegationBoard>,
-    db: Arc<SqliteMemory>,
     tools: Vec<RequestTool>,
+    shutdown: Arc<AtomicBool>,
 ) {
     tracing::info!("成员 '{}' 启动控制循环", agent.id());
 
     loop {
-        review_delegations(&*agent, &board, &system_prompt, &tools).await;
-        execute_task(&*agent, &board, &db, &system_prompt, &tools).await;
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        execute_task(&*agent, &board, &tools).await;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-}
-
-fn prepare_context(db: &SqliteMemory, member_id: &str, task_description: &str) -> String {
-    let mut parts = Vec::new();
-
-    let team_log = db.recent(20);
-    if !team_log.is_empty() {
-        let log_text = team_log
-            .iter()
-            .map(|e| {
-                format!(
-                    "[{}] {} — {}",
-                    chrono_lite::timestamp_to_date(e.timestamp),
-                    e.agent_id,
-                    e.summary
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        parts.push(format!("团队近期工作日志：\n{}", log_text));
-    }
-
-    let my_log = db.worklog_by_agent(member_id, 10).unwrap_or_default();
-    let delegation_ids: Vec<String> = my_log.iter().map(|e| e.delegation_id.clone()).collect();
-    let relevant_memories = db.personal_by_delegations(&delegation_ids);
-
-    if !relevant_memories.is_empty() {
-        let memory_text = relevant_memories
-            .iter()
-            .map(|m| {
-                format!(
-                    "[{}] {} — tags: {}",
-                    m.delegation_id,
-                    &m.summary,
-                    m.tags.join(", ")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        parts.push(format!("你的相关记忆：\n{}", memory_text));
-    }
-
-    if !task_description.is_empty() {
-        let keyword_hits = db.search(task_description);
-        if !keyword_hits.is_empty() {
-            let related = keyword_hits
-                .iter()
-                .take(5)
-                .map(|e| format!("[{}] {}", e.delegation_id, &e.summary))
-                .collect::<Vec<_>>()
-                .join("\n");
-            parts.push(format!("关键词相关的工作记录：\n{}", related));
-        }
-    }
-
-    if parts.is_empty() {
-        "(暂无记录)".to_string()
-    } else {
-        parts.join("\n\n")
-    }
+    tracing::info!("成员 '{}' 控制循环退出", agent.id());
 }
 
 fn load_sandbox_config(compose: &ComposeFile) -> sandbox::config::SandboxConfig {
@@ -430,41 +358,4 @@ fn memory_path(compose: &ComposeFile) -> String {
         .join("memory.db");
     let _ = std::fs::create_dir_all(local.parent().unwrap());
     local.to_string_lossy().to_string()
-}
-
-mod chrono_lite {
-    pub fn timestamp_to_date(ts: u64) -> String {
-        let secs_per_day: u64 = 86400;
-        let base_ts: u64 = 1704067200;
-        if ts < base_ts {
-            return "---".to_string();
-        }
-        let days = ((ts - base_ts) / secs_per_day) as i32;
-        let year = 2024 + days / 365;
-        let day_of_year = days % 365;
-        let months = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        let mut month = 1;
-        let mut remaining = day_of_year;
-        for days_in_month in &months {
-            if remaining < *days_in_month {
-                break;
-            }
-            remaining -= days_in_month;
-            month += 1;
-        }
-        let day = remaining + 1;
-        format!("{:04}-{:02}-{:02}", year, month, day)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prepare_context_with_empty_db() {
-        let db = SqliteMemory::open(":memory:").unwrap();
-        let ctx = prepare_context(&db, "coder", "写一个 API");
-        assert!(ctx.contains("暂无记录"));
-    }
 }

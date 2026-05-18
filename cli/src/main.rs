@@ -137,9 +137,6 @@ async fn cmd_compose_up(path: &str) -> Result<()> {
     let app_config = mgr.app_config();
 
     let sandbox = Arc::new(tokio::sync::RwLock::new(sandbox::SandboxManager::new()));
-    let temp_board = Arc::new(runtime::DelegationBoard::new(Arc::new(
-        runtime::SqliteMemory::open(":memory:").unwrap(),
-    )));
 
     let mut entries = Vec::new();
     for agent_ref in &compose.agents {
@@ -152,20 +149,20 @@ async fn cmd_compose_up(path: &str) -> Result<()> {
         }
 
         let provider = providers::resolve(&def.provider, &app_config.ai)?;
+        let client = runtime::Client::new(def.model.clone(), provider);
 
         let is_manager = def.identity == types::Identity::Manager;
         let member = Arc::new(runtime::Member::new(
             &def.id,
+            def.soul.clone(),
             def.identity.clone(),
-            &def.model,
-            provider,
+            client,
             sandbox.clone(),
-            temp_board.clone(),
         ));
 
         entries.push(runtime::AgentEntry {
             agent: member,
-            system_prompt: def.soul.clone(),
+            soul: def.soul.clone(),
             tools: if is_manager {
                 runtime::manager_tools()
             } else {
@@ -214,8 +211,6 @@ async fn cmd_compose_up(path: &str) -> Result<()> {
             let s = ws.board.status().await;
             Json(serde_json::json!({
                 "publish": s.publish_count,
-                "exec": s.exec_count,
-                "returned": s.returned_count,
             }))
         }
 
@@ -246,10 +241,8 @@ async fn cmd_compose_up(path: &str) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         let status = workspace.board.status().await;
         tracing::info!(
-            "board: publish={} exec={} returned={}",
+            "board: publish={}",
             status.publish_count,
-            status.exec_count,
-            status.returned_count
         );
     }
 }
