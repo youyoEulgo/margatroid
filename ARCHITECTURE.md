@@ -8,14 +8,17 @@ Margatroid 是一个用 Rust 实现的多 Agent 协作运行时，模拟人类�
 
 ## Provider 隔离
 
-runtime crate 完全不接触 provider 实现。`DynAiProvider` trait 和 `ProviderError` 定义在 `types` crate 中，`providers` crate 负责实现和解析：
+runtime crate 完全不接触 provider 实现。`DynAiProvider` trait 定义在 `types` crate 中，`providers` crate 负责实现和解析：
 
 ```
-types::DynAiProvider   ← runtime 持有，通过它做 LLM 调用
+types::DynAiProvider   ← runtime 通过 Client 持有，通过它做 LLM 调用
 types::AiProvider      ← providers 实现，blanket impl → DynAiProvider
-providers::resolve()   ← 按成员 ID 从配置自动查找并构建 provider
+providers::resolve()   ← 按 provider 名称从配置自动查找并构建
 providers::build()     ← 按 provider_type 分发构造
+runtime::Client        ← 封装 model + provider，统一聊天接口
 ```
+
+所有 provider 层错误统一使用 `anyhow::Error`，`ProviderError` 枚举已移除。
 
 ## 任务链（TaskChain）
 
@@ -24,18 +27,12 @@ providers::build()     ← 按 provider_type 分发构造
 ```rust
 enum ChainEntry {
     Delegate {
-        id: String,          // 委托 ID
-        from: String,        // 委托人
-        to: String,          // 承接人
-        brief: String,       // 简述
-        detail: String,      // 详细描述
-        parent_idx: usize,   // 父委托位置
+        task: DelegationTask,
+        parent_idx: usize,
     },
     Outcome {
-        delegation_id: String, // 对应委托 ID
-        content: String,       // 产出内容
-        summary: String,       // 产出摘要
-        done: bool,            // 委托是否完成
+        result: TaskResult,
+        delegate_idx: usize,
     },
 }
 
@@ -43,13 +40,29 @@ struct TaskChain {
     entries: Vec<ChainEntry>,  // 链（只追加）
     head: usize,               // 读写头：当前活跃委托位置
 }
+
+struct DelegationTask {
+    id: String,
+    from: String,
+    to: String,
+    brief: String,
+    detail: String,
+    parent_id: Option<String>,
+}
+
+struct TaskResult {
+    delegation_id: String,
+    detail: String,
+    summary: String,
+    done: bool,               // true: 完成，左移；false: 阶段性产出
+}
 ```
 
 ### 操作
 
 - **delegate（右移）**：`entries.push(Delegate { parent_idx: head, ... })` → `head = entries.len() - 1`
-- **finish（左移）**：`entries.push(Outcome { delegation_id, done })` → 如果完成则 `head = entries[head].parent_idx`
-- **上下文**：`entries[0..]` 就是从根到当前的全部记录，直接转为 LLM 上下文
+- **finish（左移）**：`entries.push(Outcome { delegation_id, done })` → 如果 `done=true` 则 `head = entries[head].parent_idx`
+- **上下文**：`entries[0..]` 就是从根到当前的全部记录，由 `assemble_prompt()` 转为 LLM 上下文
 
 ### 多点 Outcome
 
@@ -66,37 +79,58 @@ Outcome(d3, "性能测试通过", true)  head=0  ← 回到 A
 Outcome(d1, "最终版", done:true)  head=0  ← 完成，可返回上级
 ```
 
-查询委托是否完成：找到该委托的最后一个 Outcome，看 `done` 字段。
-
 ### 与委托板的关系
 
-`DelegationBoard` 作为持久化存储层保留。`Delegate` 条目通过 `id` 从 board 借用数据，不持有拷贝。`Outcome` 是链独有的运行时产物，不存 board。
+`DelegationBoard` 持有 TaskChain 和持久化存储。`Delegate` 条目通过 `offer()` 写入链和数据库。`Outcome` 由 `result()` 写入。TaskChain 是链的权威源，数据库是持久化镜像。
 
-未来多线程调度和可视化都需要委托板提供的全局视图。
+## 委托板（Delegation Board）
+
+双区模型：发布区 + 档案区（SQLite）。
+
+```
+offer ──→ [发布区] ──take──→ [成员处理] ──finish/delegate──→ [档案区: SQLite]
+```
+
+- **发布区**：`offer` 发布，`take` 领取后移除
+- **档案区**：SQLite 中的 worklog + personal_memory + delegations 表
+- **重试**：execute_task 错误路径自动 re-offer（`[RETRY:N]` 前缀），超过 3 次放弃
 
 ## 成员（Member）
 
-每个成员封装了 LLM 模型、系统提示词（SOUL.md）、沙箱访问和工具集。成员不区分身份——User、Manager、Member 三种 Identity 仅在成员库中标记。
-
-成员通过 `Agent` trait 暴露统一接口。对应的 Provider 通过 `providers::resolve()` 按成员 ID 自动注入。
-
-## Prompt 结构
+每个成员封装了 Client、SOUL 提示词、沙箱访问。不区分身份——User、Manager、Member 三种 Identity 仅在成员库中标记。
 
 ```rust
-struct Prompt {
-    messages: Vec<ChatMessage>,
+pub struct Member {
+    pub id: String,
+    soul: String,
+    identity: Identity,
+    client: Client,                         // 封装 model + provider
+    sandbox: Arc<RwLock<SandboxManager>>,
 }
 ```
 
-`Prompt::build(soul, task_chain, worklog, memories)` 组装上下文消息列表——不拼接模板，不关心格式，对外只暴露消息数组。Member 直接馈入 tool-call 循环。
+成员通过 `Agent` trait 暴露统一接口。Board 在 `process()` 调用时注入，Member 不持有 Board 引用。
+
+## 上下文组装
+
+由 `Board.assemble_prompt(soul, memories)` 组装六段上下文：
+
+```
+[人格提示词（System）]
+[系统提示词（User）]
+[委托链上下文]
+[团队工作日志（最近 20 条）]
+[个人记忆]
+[当前任务]
+```
 
 ## Tool-Call 循环约束
 
 `chat()` 中 LLM 必须通过工具调用才能退出循环：
 
 - LLM 返回 bare text → 追加"你必须返回当前委托或发布新委托才能结束"，继续循环
-- 调用 `finish` → 返回当前委托结果（可能未完成），退出循环
-- 调用 `delegate` → 发布新委托，退出循环
+- 调用 `finish` → 产出结果（done=true），退出循环
+- 调用 `delegate` → 记录阶段性产出（done=false），发布新委托，退出循环
 - 其他工具（bash、recall、schedule_*）→ 执行后继续循环
 
 ## 基本工具集
@@ -104,39 +138,56 @@ struct Prompt {
 | 工具 | 说明 |
 |------|------|
 | `bash` | 在沙箱中执行 shell 命令 |
-| `delegate` | 委托子任务给其他成员（target、task、detail、priority） |
+| `delegate` | 委托子任务给其他成员（target、task_summary、task_detail、work_summary、work_detail） |
 | `recall` | 搜索工作日志和个人记忆 |
-| `finish` | 完成或阶段性产出当前委托结果 |
+| `finish` | 完成当前委托（summary、detail） |
 
 Manager 额外拥有 `schedule_add`、`schedule_list`、`schedule_pop`、`schedule_remove`。
 
 ## 记忆系统（SQLite）
 
+单文件 `memory.db`，含四张表：
+
 ### worklog（团队工作日志）
-- 委托最终完成时写入
-- 记录谁（agent_id）、委托给谁（to_agent）、做了什么（summary）
+- 委托创建时插入行（summary 留空），产出时补全
+- 记录 agent_id、to_agent、delegation_id、summary
 
 ### personal_memory（个人记忆）
-- 委托产出时写入
-- 记录谁委托的（from_agent）、做了什么（summary）、标签（tags）
+- 委托创建时插入行（summary 留空），产出时补全 detail
+- 记录 agent_id、from_agent、delegation_id、detail、tags
+
+### schedule（计划表）
+- Manager 专用，planned / offered / archived 状态流转
 
 ### delegations（委托持久化）
-- 委托创建时写入
-- 支持链上查找
+- 委托创建时写入完整信息
 
 ## 项目结构
 
 ```
 margatroid/
-├── types/         # 共享类型定义（DynAiProvider, ProviderError, Identity, ChatRequest 等）
+├── types/         # 共享类型定义（DynAiProvider, AiProvider, Identity, ChatRequest 等）
 │   └── provider.rs  # DynAiProvider + AiProvider trait + blanket impl
-├── runtime/       # 核心运行时（Workspace, DelegationBoard, Member, TaskChain, memory）
+├── runtime/       # 核心运行时（Workspace, DelegationBoard, Member, TaskChain, Client, memory）
+│   ├── board.rs   # DelegationBoard + TaskChain + assemble_prompt
+│   ├── client.rs  # Client — 封装 model + provider
+│   ├── member.rs  # Member — Agent trait + chat() tool-call loop
+│   ├── memory.rs  # SQLite（worklog + personal_memory + schedule + delegations）
+│   └── workspace.rs  # Workspace + 工具定义 + 控制循环
 ├── providers/     # LLM 供应商（OpenRouter）+ resolve() / build()
 ├── compose/       # Compose 文件解析
 ├── assets/        # 成员库（member.toml + SOUL.md）
 ├── sandbox/       # 沙箱执行环境
 ├── cli/           # 命令行入口
-└── server/        # HTTP API（factory 委托 providers::build()）
+└── server/        # HTTP API
+```
+
+## Workspace 生命周期
+
+```rust
+Workspace::start(compose, entries) → 创建 Board、沙箱、SQLite，spawn 成员控制循环
+send_user_message(from, to, brief, detail) → 发布根委托到发布区
+shutdown() → 通知所有成员退出，await 所有 handle
 ```
 
 ## Compose 文件
@@ -145,6 +196,7 @@ margatroid/
 [workspace]
 name = "demo"
 version = "0.1"
+system_prompt = "全局系统提示词（可选）"
 
 [[agents]]
 id = "manager"

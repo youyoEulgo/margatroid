@@ -48,28 +48,22 @@ Manager 是 Workspace 中的特殊成员，角色等同于项目经理：
 
 ### 2.4 委托板（Delegation Board）
 
-委托板是 Workspace 的核心协作基础设施，采用**四区模型**：
+委托板是 Workspace 的核心协作基础设施，采用**双区模型**：
 
 ```
-offer ──→ [发布区] ──claim──→ [执行区] ──return──→ [返回区]
-              ↑                                    │       │
-              └────────── reject ──────────────────┘       │
-                                                           │
-                                    accept → [档案区: SQLite]
+offer ──→ [发布区] ──take──→ [成员处理] ──finish/delegate──→ [档案区: SQLite]
 ```
 
-- **发布区**：Manager 或成员 `offer` 委托任务进入，按优先级排队
-- **执行区**：目标成员 `claim` 领取后进入
-- **返回区**：成员 `return_task` 提交结果后进入，同时写入档案（worklog + personal_memory）
-- **档案区**：SQLite，`return_task` 时自动写入，无需额外操作
+- **发布区**：Manager 或成员 `offer` 委托任务进入，目标成员 `take` 领取后移除
+- **档案区**：SQLite，`result` 写入时自动更新 worklog + personal_memory
 
-**纯异步委托**：所有委托都是非阻塞的——发出后立即返回 task_id，结果通过返回区自然流转。成员不等待被委托方完成。
+**纯异步委托**：所有委托都是非阻塞的——发布后立即返回 task_id，结果通过档案区自然流转。成员不等待被委托方完成。
 
-**纠纷**：发布者 `reject` 驳回结果，任务回到发布区并 `reject_count++`。超过 `DISPUTE_THRESHOLD`（默认 3 次）时 `to` 改为 `manager`，自动上报仲裁。
+**用户消息**：通过 `send_user_message("user", "manager", ...)` 以根委托发布到发布区。
 
-**用户消息**：通过 `offer("user", "manager", ...)` 以 `PRIORITY_USER`（u32::MAX）发布到发布区。
+**记忆写入**：`add_task` 时自动插入 worklog + personal_memory 行，`add_result` 时补全 summary / detail。board 直接持有 SQLite。
 
-**记忆写入**：`return_task` 时自动写 worklog（团队）和 personal_memory（个人），然后进入返回区由发布者 accept。board 直接持有 SQLite。
+**重试**：成员执行失败时任务自动重新发布（detail 前缀 `[RETRY:N]`），超过 3 次放弃。
 
 ### 2.5 计划表（Schedule）
 
@@ -205,21 +199,20 @@ depends_on = []
 ```
 1. 成员 A 在执行任务时发现需要 B 的能力
 2. A 通过 roster skill 识别 B 可能是合适人选
-3. A 向委托板查询 B 的可用性和详细 Profile
-4. A 确认委托，向委托板提交结构化任务
-5. 委托板检查 B 状态（idle → 分配 / working → 排队）
-6. B 接收任务，执行，完成后通知委托板
-7. 委托板将结果返回给 A
-8. A 验证结果（满意 → 继续 / 不满意 → 重新委托或上报 Manager）
+3. A 调用 delegate 工具，指定 target、task_summary、task_detail，附带自己当前产出的 work_summary/work_detail
+4. board 记录 A 的阶段性产出（done=false），发布新委托到发布区
+5. B 领取任务，执行，完成后调用 finish 工具
+6. 结果写入档案（SQLite）
 ```
 
-### 4.3 纠纷处理
+### 4.3 工具驱动的委托循环
 
-当成员 A 对成员 B 的执行结果不满意时：
+成员通过 `chat()` 中的 tool-call 循环与委托板交互：
 
-- A 可以驳回结果，附带驳回理由，请求 B 重新执行
-- 若驳回超过阈值（默认 1 次），委托板自动将纠纷上报给 Manager
-- Manager 介入进行仲裁：选择替换执行者、重新分解任务、或自行处理
+- `finish` —— 完成当前委托，产出最终结果（done=true）
+- `delegate` —— 记录阶段性产出（done=false），发布子委托，退出循环
+- `bash` / `recall` / `schedule_*` —— 执行后继续循环
+- 裸文本回复 —— 追加循环约束，强制 LLM 调用 finish 或 delegate
 
 ### 4.4 Manager 任务分解
 
@@ -237,53 +230,41 @@ Margatroid 的记忆系统模拟真实人类团队的文档习惯，分为两层
 
 ### 5.1 工作日志（Worklog）
 
-**团队共享的交接记录。** 每个成员完成委托后，将本次工作自动总结为一条简短摘要写入共享的工作日志。每条摘要约 30-50 token，只记录：谁做的、做了什么、产出是什么、有什么遗留。
+**团队共享的交接记录。** 每个委托创建时写入一行（summary 留空），产出时补全 summary。每条约 30-50 token，只记录：谁做的、委托给谁、做了什么。
 
-工作日志是每个 agent 请求的**固定前缀**——system prompt + roster + 工作日志最近 N 条 + agent 人格 + 当前委托。不按需检索，始终注入，保证每个成员对团队状态有最低限度的感知。
+工作日志是每个 agent 请求的**固定前缀**——通过 `Board.assemble_prompt()` 自动注入最近 20 条。不按需检索，始终注入，保证每个成员对团队状态有最低限度的感知。
 
 ### 5.2 个人记忆（Personal Memory）
 
-**每个成员的私有笔记本。** 完成委托后，agent 在写入工作日志的同时，将委托的详细上下文（完整对话、代码改动、决策理由、遇到的问题和解决方案）保存到自己的 `memory.db`。这是不限量的附录，但不主动注入 prompt。
+**每个成员的私有笔记本。** 委托创建时插入一行（summary 留空），产出时补全 detail。存储委托的详细上下文（决策理由、遇到的问题和解决方案）。不限量，按需检索。
 
 ### 5.3 回忆机制（Recall）
 
-**通过委托板直接询问其他成员的过往经验。** 回忆被设计为一个 skill，每个 agent 默认拥有。当成员 A 在处理委托时发现需要 B 的过往经验，调用 recall skill：
-
-```
-A 调用 recall_skill(target="B", query="上次那个 bug 怎么修的") →
-  通过委托板发 skip_worklog 委托给 B →
-    B 搜自己的 memory.db，返回摘要 →
-      摘要注入 A 的 prompt，继续执行
-```
-
-**回忆不走工作日志。** 就像现实中走过去问同事一个问题，不需要做会议记录。委托板做路由但不产生持久化条目。
-
-**回忆不替代工作日志。** 工作日志是被动感知——每个成员都知道"团队最近在做什么"。回忆是主动查询——需要特定细节时才触发。两者互补。
+**通过委托板直接搜索历史记忆。** 回忆被设计为一个工具（recall），每个 agent 默认拥有。调用 recall 工具时按关键词搜索 worklog + personal_memory，返回匹配条目。
 
 ### 5.4 存储模型
 
 ```
 {workspace_root}/
-├── worklog.db              # 团队工作日志（共享）
-└── {agent_id}/
-    └── memory.db           # 个人记忆（私有）
+├── .margatroid/
+│   └── workspace/
+│       └── {name}/
+│           ├── memory.db       # 单文件，含 worklog + personal_memory + schedule + delegations
+│           └── sandbox.toml    # 沙箱配置
 ```
 
-- **worklog.db** — 追加型，每条 entry 包含：时间戳、agent_id、委托 id、摘要文本。所有 agent 可读，无写入冲突（每个 agent 只写自己的完成记录）。
-- **memory.db** — 每个 agent 独立管理。Phase 3 初始为内存实现，Phase 4 引入 SQLite + FTS5 全文检索。
+### 5.5 上下文组装
 
-### 5.5 KV Cache 优化
-
-每个 request 的 prompt 结构保持固定顺序，最大化缓存命中：
+每个 request 的上下文由 `Board.assemble_prompt(soul, memories)` 组装，固定顺序：
 
 ```
-[系统提示词] [Roster] [工作日志 ← 固定前缀，所有 agent 共享]
-[Agent 人格 prompt ← 静态，同一 agent 跨请求复用]
-[当前委托详情 ← 动态区]
-[必要时：回忆结果 ← 按需追加，不破坏前缀结构]
+[人格提示词（System 消息）]
+[系统提示词（User 消息）]
+[委托链上下文]
+[团队工作日志]
+[个人记忆]
+[当前任务]
 ```
-
-前两段在同一个 workspace 内的所有请求间可共享 KV cache。角色 prompt 在同一 agent 的不同委托间可复用。
 
 ## 6. 系统架构
 
@@ -305,46 +286,48 @@ margatroid/
 │       ├── lib.rs / config.rs / mandatory.rs
 │       ├── linux.rs / macos.rs
 │       └── proxy/ (http.rs, socks5.rs)
-├── runtime/        # 运行时核心（委托板、成员、记忆、Workspace）
+├── runtime/        # 运行时核心（委托板、成员、记忆、Workspace、Client）
 │   └── src/
 │       ├── lib.rs          # re-exports
-│       ├── board.rs        # DelegationBoard — 四区模型（发布/执行/返回/档案）
-│       ├── member.rs       # Member — 单成员封装（chat() + tool-call loop）
-│       ├── memory.rs       # SQLite 记忆（worklog + personal_memory + schedule）
-│       └── workspace.rs    # Workspace — 成员生命周期、上下文注入、Manager 调度
+│       ├── board.rs        # DelegationBoard — 双区模型（发布 + 档案/SQLite）+ TaskChain + assemble_prompt
+│       ├── client.rs       # Client — 封装 model + provider，统一聊天接口
+│       ├── member.rs       # Member — 单成员封装（Agent trait，chat() tool-call loop）
+│       ├── memory.rs       # SQLite 记忆（worklog + personal_memory + schedule + delegations）
+│       └── workspace.rs    # Workspace — 成员生命周期、工具定义、控制循环
 └── plugins/        # 插件系统骨架
 ```
 
 ### 6.2 数据流
 
 ```
-用户 ──(PRIORITY_USER)──→ Manager（通过委托板 offer）
+用户 ──send_user_message──→ Workspace ──offer──→ [发布区]
+                                                    │
+              成员 take ─────────────────────────────┘
                               │
-              Manager ──claim──→ 分析/规划 ──return──→ 返回区
-                              │                               │
-              Manager accept ←────────────────────────────────┘
+              成员 chat() ──→ bash / delegate / recall / schedule_*
                               │
-              Manager push_from_schedule ──→ offer ──→ [发布区]
-                                                          │
-              成员 claim ──────────────────────────────────┘
-                              │
-              成员 chat() ──→ bash / delegate / schedule_*
-                              │
-              成员 return_task ──→ [返回区] + 写入档案(SQLite)
-                              │
-              发布者 check_return ──→ accept ──→ 删除
-                                 或 reject ──→ 回到发布区
+              成员 finish ──→ result(done=true) ──→ 从发布区删除，写入档案(SQLite)
+                         或 delegate ──→ result(done=false) + offer ──→ 新任务入发布区
 ```
 
 ### 6.3 Provider 架构
 
-上层代码只依赖 `AiProvider` trait，不依赖具体实现。添加新服务商（Anthropic、Groq、本地模型）只需实现 trait，不影响现有代码。
+上层代码只依赖 `DynAiProvider` trait，不依赖具体实现。添加新服务商只需实现 `AiProvider` trait。错误统一使用 `anyhow::Result`。
 
 ```rust
 pub trait AiProvider: Send + Sync {
     fn id(&self) -> &'static str;
-    fn chat(&self, req: ChatRequest) -> impl Future<Output = Result<ChatResponse, ProviderError>>;
-    fn chat_stream(&self, req: ChatRequest) -> impl Future<...>;
+    fn chat(&self, req: ChatRequest) -> impl Future<Output = Result<ChatResponse>>;
+    fn chat_stream(&self, req: ChatRequest) -> impl Future<Output = Result<...>>;
+}
+```
+
+runtime 通过 `Client` 封装 model + provider：
+
+```rust
+pub struct Client {
+    model: String,
+    provider: Arc<dyn DynAiProvider>,
 }
 ```
 
@@ -385,17 +368,19 @@ pub trait AiProvider: Send + Sync {
 - [x] CLI（serve, compose validate/roster/load, workspace create/list）
 
 ### Phase 3: Memory & Recall（当前阶段）
-- [ ] 工作日志（Worklog）— 团队共享摘要，~30 token/条
-- [ ] 个人记忆（Personal Memory）— 每 agent 独立存储，内存实现先行
-- [ ] 回忆 Skill — 委托板 skip_worklog 路由的跨 agent 记忆查询
-- [ ] engine tool-call loop — 解析 LLM tool calls 并驱动沙箱执行
-- [ ] Agent 上下文构建 — 固定前缀（roster + worklog）+ 角色 prompt + 委托详情
+- [x] 工作日志（Worklog）— 团队共享摘要，~30 token/条
+- [x] 个人记忆（Personal Memory）— SQLite 实现
+- [x] 回忆 Skill — 委托板关键词搜索 worklog + personal_memory
+- [x] 委托板双区模型 — 发布区 + 档案区（SQLite）
+- [x] TaskChain 图灵机模型 — delegate 右移，finish 左移
+- [x] Agent 上下文构建 — Board.assemble_prompt() 六段拼接
+- [x] tool-call loop — bash / delegate / finish / recall / schedule_*
 
 ### Phase 4: Production Readiness
-- [ ] SQLite + FTS5 全文检索（替代内存实现）
-- [ ] 上下文压缩 — Memory Flush 机制
 - [ ] 完整测试覆盖（单元、集成、端到端）
 - [ ] CLI 交互体验优化
+- [ ] Human provider（人类伪装为 AI 模型供应商）
+- [ ] streaming 支持
 - [ ] 文档和示例 compose 文件
 
 ## 9. 设计决策日志
