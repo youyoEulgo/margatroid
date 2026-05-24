@@ -4,5 +4,5 @@ use std::sync::Arc;
 use types::config::AiProvider;
 
 pub fn build(config: &AiProvider) -> Result<Arc<dyn DynAiProvider>> {
-    Ok(providers::build(config)?)
+    providers::build(config)
 }

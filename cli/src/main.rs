@@ -10,6 +10,9 @@
 //!   margatroid workspace list                列出所有 Workspace
 
 use anyhow::Result;
+use std::sync::Arc;
+
+use server::state::AppState;
 
 fn usage() -> ! {
     eprintln!("用法:");
@@ -71,7 +74,9 @@ async fn main() -> Result<()> {
 }
 
 async fn cmd_serve() -> Result<()> {
-    server::serve().await
+    let config_mgr = assets::Manager::bootstrap()?;
+    let state = AppState::new(config_mgr).await?;
+    server::serve(state).await
 }
 
 fn cmd_compose_validate(path: &str) -> Result<()> {
@@ -128,8 +133,6 @@ fn cmd_workspace_list() -> Result<()> {
 // ── compose up ────────────────────────────────────────────────
 
 async fn cmd_compose_up(path: &str) -> Result<()> {
-    use std::sync::Arc;
-
     let compose = compose::load(path)?;
     let mgr = assets::Manager::bootstrap()?;
     let lib = assets::MemberLibrary::load()?;
@@ -171,78 +174,16 @@ async fn cmd_compose_up(path: &str) -> Result<()> {
         });
     }
 
-    let workspace = Arc::new(runtime::Workspace::start(&compose, entries).await?);
+    let ws_name = compose.workspace.name.clone();
+
+    let state = AppState::new(mgr).await?;
+    state.start_workspace(&compose, entries).await?;
 
     tracing::info!(
         "Workspace '{}' started, {} members",
-        compose.workspace.name,
+        ws_name,
         compose.agents.len()
     );
 
-    // HTTP endpoint
-    let ws = workspace.clone();
-    tokio::spawn(async move {
-        use axum::{Json, Router, extract::State, routing::post};
-
-        #[derive(serde::Deserialize)]
-        struct ChatMsg {
-            brief: String,
-            #[serde(default)]
-            detail: String,
-        }
-
-        async fn chat(
-            State(ws): State<Arc<runtime::Workspace>>,
-            Json(payload): Json<ChatMsg>,
-        ) -> Json<serde_json::Value> {
-            let mgr_id = "manager";
-            match ws
-                .send_user_message("user", mgr_id, &payload.brief, &payload.detail)
-                .await
-            {
-                Ok(task_id) => Json(serde_json::json!({"ok": true, "task_id": task_id})),
-                Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
-            }
-        }
-
-        async fn status(
-            State(ws): State<Arc<runtime::Workspace>>,
-        ) -> Json<serde_json::Value> {
-            let s = ws.board.status().await;
-            Json(serde_json::json!({
-                "publish": s.publish_count,
-            }))
-        }
-
-        async fn tasks(
-            State(ws): State<Arc<runtime::Workspace>>,
-        ) -> Json<serde_json::Value> {
-            Json(serde_json::json!(ws.board.status().await))
-        }
-
-        let app = Router::new()
-            .route("/chat", post(chat))
-            .route("/status", axum::routing::get(status))
-            .route("/tasks", axum::routing::get(tasks))
-            .with_state(ws);
-
-        let _ = axum::serve(
-            tokio::net::TcpListener::bind("127.0.0.1:3456")
-                .await
-                .unwrap(),
-            app,
-        )
-        .await;
-    });
-
-    tracing::info!("HTTP endpoint: http://127.0.0.1:3456");
-
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let status = workspace.board.status().await;
-        tracing::info!(
-            "board: publish={}",
-            status.publish_count,
-        );
-    }
+    server::serve(state).await
 }

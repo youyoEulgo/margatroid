@@ -23,6 +23,9 @@ uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 providers = { path = "../providers" }
 types = { path = "../types" }
+runtime = { path = "../runtime" }
+compose = { path = "../compose" }
+sandbox = { path = "../sandbox" }
 bridge = { path = "../bridge" }
 mcp_client = { path = "../mcp_client" }
 assets = { path = "../assets" }
