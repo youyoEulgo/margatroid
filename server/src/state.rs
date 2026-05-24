@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use providers::DynAiProvider;
+use runtime;
 use serde::Serialize;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
@@ -24,6 +25,7 @@ pub type DynProvider = Arc<dyn DynAiProvider>;
 pub struct AppState {
     providers: Arc<RwLock<HashMap<String, DynProvider>>>,
     pub config_mgr: Arc<Mutex<assets::Manager>>,
+    workspaces: Arc<RwLock<HashMap<String, Arc<runtime::Workspace>>>>,
 }
 
 impl AppState {
@@ -47,6 +49,7 @@ impl AppState {
         Ok(Self {
             providers: Arc::new(RwLock::new(providers)),
             config_mgr: Arc::new(Mutex::new(config_mgr)),
+            workspaces: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -96,6 +99,48 @@ impl AppState {
         let mut guard = self.providers.write().await;
         *guard = new_providers;
         tracing::info!("runtime reload done");
+        Ok(())
+    }
+
+    // ── Workspace ──────────────────────────────────────────────
+
+    /// 获取 workspace 引用
+    pub async fn workspace(&self, name: &str) -> Option<Arc<runtime::Workspace>> {
+        self.workspaces.read().await.get(name).cloned()
+    }
+
+    /// 启动 workspace 并注册到服务器
+    pub async fn start_workspace(
+        &self,
+        compose: &types::ComposeFile,
+        entries: Vec<runtime::AgentEntry>,
+    ) -> Result<()> {
+        let name = compose.workspace.name.clone();
+        {
+            let guard = self.workspaces.read().await;
+            if guard.contains_key(&name) {
+                bail!("workspace '{}' is already running", name);
+            }
+        }
+
+        let ws = Arc::new(runtime::Workspace::start(compose, entries).await?);
+
+        // 后台轮询日志
+        let ws_clone = ws.clone();
+        let ws_name = name.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let status = ws_clone.board.status().await;
+                tracing::info!(
+                    "workspace '{}' board: publish={}",
+                    ws_name,
+                    status.publish_count,
+                );
+            }
+        });
+
+        self.workspaces.write().await.insert(name, ws);
         Ok(())
     }
 }

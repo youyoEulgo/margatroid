@@ -1,6 +1,7 @@
 pub mod error;
 pub mod factory;
 pub mod handlers;
+pub mod human;
 pub mod state;
 
 use anyhow::{Context, Result};
@@ -12,14 +13,27 @@ use state::AppState;
 
 /// 启动 HTTP 服务
 ///
-/// 初始化配置、provider、路由，绑定地址并开始监听。
-/// 这是 server crate 的公共入口，同时被 `server/src/main.rs`
-/// 和 `cli/src/main.rs` 的 `margatroid serve` 命令使用。
-pub async fn serve() -> Result<()> {
-    let config_mgr = assets::Manager::bootstrap()?;
+/// 绑定到 AppState 中配置的地址并开始监听。
+/// 调用方负责创建 AppState（可预先注册 workspace）。
+pub async fn serve(state: AppState) -> Result<()> {
+    let server_cfg = {
+        let mgr = state.config_mgr.lock().await;
+        mgr.app_config().server.clone()
+    };
 
-    let server_cfg = config_mgr.app_config().server.clone();
-    let app_state = AppState::new(config_mgr).await?;
+    let pending = human::new_pending_map();
+    let human_routes = Router::new()
+        .route("/api/human/request", post(human::create_request))
+        .route("/api/human/request/{id}", get(human::wait_reply))
+        .route("/api/human/requests", get(human::list_requests))
+        .route("/api/human/request/{id}/reply", post(human::submit_reply))
+        .with_state(pending);
+
+    let ws_routes = Router::new()
+        .route("/ws/{name}/chat", post(handlers::workspace::chat))
+        .route("/ws/{name}/status", get(handlers::workspace::status))
+        .route("/ws/{name}/tasks", get(handlers::workspace::tasks))
+        .with_state(state.clone());
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -27,7 +41,9 @@ pub async fn serve() -> Result<()> {
         .route("/v1/stream", post(handlers::stream::stream))
         .route("/v1/providers", get(handlers::providers::list))
         .route("/admin/reload", post(handlers::admin::reload))
-        .with_state(app_state);
+        .merge(ws_routes)
+        .merge(human_routes)
+        .with_state(state);
 
     let addr = format!("{}:{}", server_cfg.host, server_cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr)
