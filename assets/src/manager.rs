@@ -182,6 +182,22 @@ impl Manager {
         Ok(())
     }
 
+    /// 确保 workspace 有系统提示词文件，若无则创建默认文件
+    /// 返回提示词内容
+    pub fn ensure_system_prompt(&self, name: &str) -> Result<String> {
+        let path = self.paths.workspace_dir(name)?.join("system_prompt.md");
+        if path.exists() {
+            return fs::read_to_string(&path)
+                .with_context(|| format!("读取系统提示词失败: {}", path.display()));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("创建目录失败: {}", parent.display()))?;
+        }
+        fs::write(&path, DEFAULT_SYSTEM_PROMPT)?;
+        Ok(DEFAULT_SYSTEM_PROMPT.to_string())
+    }
+
     /// 持久化指定 workspace 的配置
     pub fn save_workspace_config(&self, name: &str) -> Result<()> {
         match self.workspace_configs.get(name) {
@@ -249,7 +265,23 @@ impl Manager {
     }
 }
 
-/// 默认沙箱配置模板（workspace 创建时生成）
+const DEFAULT_SYSTEM_PROMPT: &str = r#"# 系统提示词
+
+这是一个 Margatroid 多智能体工作区。你是团队中的一员，与其他成员协作完成任务。
+
+## 工作方式
+- 收到任务后，分析需求，制定执行计划
+- 通过委托（delegate）将子任务分派给合适的团队成员
+- 审查返回结果，确保质量
+- 任务完成后调用 finish 产出最终结果
+
+## 注意事项
+- 简单任务直接 finish，不要过度委托
+- 委托前确保目标成员拥有相应技能
+- 遇到错误或不确定的情况，在产出中说明
+- !!!非常重要!!! 你必须通过 delegate 或 finish 工具来结束对话 !!!非常重要!!!
+"#;
+
 const DEFAULT_SANDBOX_CONFIG: &str = r#"# Margatroid Sandbox Configuration
 
 enabled = true

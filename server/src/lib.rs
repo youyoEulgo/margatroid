@@ -10,6 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use state::AppState;
+use tower_http::cors::CorsLayer;
 
 /// 启动 HTTP 服务
 ///
@@ -33,6 +34,9 @@ pub async fn serve(state: AppState) -> Result<()> {
         .route("/ws/{name}/chat", post(handlers::workspace::chat))
         .route("/ws/{name}/status", get(handlers::workspace::status))
         .route("/ws/{name}/tasks", get(handlers::workspace::tasks))
+        .route("/ws/{name}/recent", get(handlers::workspace::recent))
+        .route("/ws/{name}/conversation", get(handlers::workspace::conversation))
+        .route("/ws/{name}/events/{task_id}", get(handlers::workspace::events))
         .with_state(state.clone());
 
     let app = Router::new()
@@ -43,6 +47,7 @@ pub async fn serve(state: AppState) -> Result<()> {
         .route("/admin/reload", post(handlers::admin::reload))
         .merge(ws_routes)
         .merge(human_routes)
+        .layer(CorsLayer::permissive())
         .with_state(state);
 
     let addr = format!("{}:{}", server_cfg.host, server_cfg.port);

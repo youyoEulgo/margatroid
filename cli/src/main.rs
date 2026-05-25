@@ -28,15 +28,28 @@ fn usage() -> ! {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-
     let args: Vec<String> = std::env::args().collect();
+    let verbose = args.iter().any(|a| a == "--verbose");
+    let args: Vec<_> = args.into_iter().filter(|a| a != "--verbose").collect();
+
+    if verbose {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::builder()
+                    .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+                    .from_env_lossy(),
+            )
+            .init();
+    } else {
+        tracing_subscriber::fmt().init();
+    }
+
     if args.len() < 2 {
         usage();
     }
 
     match args[1].as_str() {
-        "serve" => cmd_serve().await,
+        "serve" => cmd_serve(verbose).await,
         "compose" => {
             if args.len() < 4 {
                 usage();
@@ -49,7 +62,7 @@ async fn main() -> Result<()> {
                     if args.len() < 4 {
                         usage();
                     }
-                    cmd_compose_up(&args[3]).await
+                    cmd_compose_up(&args[3], verbose).await
                 }
                 _ => usage(),
             }
@@ -73,7 +86,8 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn cmd_serve() -> Result<()> {
+async fn cmd_serve(verbose: bool) -> Result<()> {
+    let _ = verbose;
     let config_mgr = assets::Manager::bootstrap()?;
     let state = AppState::new(config_mgr).await?;
     server::serve(state).await
@@ -132,10 +146,16 @@ fn cmd_workspace_list() -> Result<()> {
 
 // ── compose up ────────────────────────────────────────────────
 
-async fn cmd_compose_up(path: &str) -> Result<()> {
-    let compose = compose::load(path)?;
+async fn cmd_compose_up(path: &str, verbose: bool) -> Result<()> {
+    let mut compose = compose::load(path)?;
     let mgr = assets::Manager::bootstrap()?;
     let lib = assets::MemberLibrary::load()?;
+
+    // 确保 workspace 有系统提示词
+    if compose.workspace.system_prompt.is_empty() {
+        let prompt = mgr.ensure_system_prompt(&compose.workspace.name)?;
+        compose.workspace.system_prompt = prompt;
+    }
 
     let app_config = mgr.app_config();
 
@@ -152,7 +172,7 @@ async fn cmd_compose_up(path: &str) -> Result<()> {
         }
 
         let provider = providers::resolve(&def.provider, &app_config.ai)?;
-        let client = runtime::Client::new(def.model.clone(), provider);
+        let client = runtime::Client::new(def.model.clone(), provider, verbose);
 
         let is_manager = def.identity == types::Identity::Manager;
         let member = Arc::new(runtime::Member::new(

@@ -7,11 +7,16 @@ use types::{ChatRequest, ChatResponse, DynAiProvider, RequestMessage, RequestToo
 pub struct Client {
     model: String,
     provider: Arc<dyn DynAiProvider>,
+    verbose: bool,
 }
 
 impl Client {
-    pub fn new(model: String, provider: Arc<dyn DynAiProvider>) -> Self {
-        Self { model, provider }
+    pub fn new(model: String, provider: Arc<dyn DynAiProvider>, verbose: bool) -> Self {
+        Self {
+            model,
+            provider,
+            verbose,
+        }
     }
 
     pub async fn chat(
@@ -34,6 +39,26 @@ impl Client {
             },
             ..Default::default()
         };
-        self.provider.chat_boxed(req).await
+
+        if self.verbose {
+            tracing::info!(
+                "[DEBUG] → LLM request | model={} | messages={} | tools={}",
+                self.model,
+                serde_json::to_string_pretty(&req.messages).unwrap_or_default(),
+                serde_json::to_string_pretty(&req.tools).unwrap_or_default(),
+            );
+        }
+
+        let resp = self.provider.chat_boxed(req).await?;
+
+        if self.verbose {
+            tracing::info!(
+                "[DEBUG] ← LLM response | model={} | {}",
+                self.model,
+                serde_json::to_string_pretty(&resp).unwrap_or_default(),
+            );
+        }
+
+        Ok(resp)
     }
 }

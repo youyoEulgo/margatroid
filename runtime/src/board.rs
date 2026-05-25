@@ -9,8 +9,9 @@
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use types::message::{ChatMessage, MessageContent, Role};
 
 use crate::memory::{PersonalMemory, SqliteMemory, Worklog};
@@ -35,6 +36,18 @@ pub struct TaskResult {
     pub detail: String,
     pub summary: String,
     pub done: bool,
+    /// LLM 返回的对话文本（可与工具调用同时出现）
+    #[serde(default)]
+    pub reply: String,
+}
+
+/// SSE 推送事件
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatEvent {
+    #[serde(rename = "type")]
+    pub event_type: String, // "message" | "done"
+    pub content: String,
+    pub delegation_id: String,
 }
 
 /// 链条目
@@ -114,7 +127,7 @@ impl TaskChain {
                 db.worklog_add_task(&task.id, &task.from, &task.to, &task.brief)
             }
             ChainEntry::Outcome { result, .. } => {
-                db.worklog_add_result(&result.delegation_id, &result.summary)
+                db.worklog_add_result(&result.delegation_id, &result.summary, &result.reply)
             }
         }
     }
@@ -138,12 +151,10 @@ impl DelegationTask {
 /// 委托板——发布区 + 档案区（SQLite）+ 任务链
 pub struct DelegationBoard {
     publish: RwLock<Vec<DelegationTask>>,
-    // exec: RwLock<Vec<DelegationTask>>,
-    // returned: RwLock<Vec<DelegationTask>>,
-    // archive → SQLite
     db: Arc<SqliteMemory>,
     chain: RwLock<TaskChain>,
     system_prompt: String,
+    events: RwLock<HashMap<String, broadcast::Sender<ChatEvent>>>,
 }
 
 // ── Lifecycle ────────────────────────────────────────────────
@@ -152,8 +163,6 @@ impl DelegationBoard {
     pub fn new(db: Arc<SqliteMemory>, system_prompt: String) -> Self {
         Self {
             publish: RwLock::new(Vec::new()),
-            // exec: RwLock::new(Vec::new()),
-            // returned: RwLock::new(Vec::new()),
             chain: RwLock::new(TaskChain::new(DelegationTask {
                 id: String::new(),
                 from: String::new(),
@@ -164,11 +173,38 @@ impl DelegationBoard {
             })),
             db,
             system_prompt,
+            events: RwLock::new(HashMap::new()),
         }
     }
 
     pub fn db(&self) -> &SqliteMemory {
         &self.db
+    }
+
+    /// 为 delegation 注册一个 SSE 事件监听器
+    pub async fn register_listener(
+        &self,
+        delegation_id: &str,
+    ) -> Option<broadcast::Receiver<ChatEvent>> {
+        self.events
+            .read()
+            .await
+            .get(delegation_id)
+            .map(|tx| tx.subscribe())
+    }
+
+    /// 推送一个事件到指定 delegation 的监听器
+    pub async fn publish_event(&self, event: ChatEvent) {
+        let map = self.events.read().await;
+        if let Some(tx) = map.get(&event.delegation_id) {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// 清理 delegation 的事件通道
+    pub async fn cleanup_events(&self, delegation_id: &str) {
+        let mut map = self.events.write().await;
+        map.remove(delegation_id);
     }
 
     /// 获取任务链快照（只读克隆，供 Prompt 使用）
@@ -252,19 +288,21 @@ impl DelegationBoard {
             let marker = if i == chain.head { "→ " } else { "  " };
             match entry {
                 ChainEntry::Delegate { task, .. } => {
+                    let short_id = if task.id.is_empty() {
+                        "(root)"
+                    } else {
+                        &task.id[..task.id.len().min(8)]
+                    };
                     lines.push(format!(
                         "{}[委托 {}] {} 委托 {}: {}",
-                        marker,
-                        &task.id[..8],
-                        task.from,
-                        task.to,
-                        task.brief
+                        marker, short_id, task.from, task.to, task.brief
                     ));
                     if !task.detail.is_empty() {
                         lines.push(format!("  详情: {}", task.detail));
                     }
                     if let Some(ref pid) = task.parent_id {
-                        lines.push(format!("  上级: {}", &pid[..8]));
+                        let short_pid = &pid[..pid.len().min(8)];
+                        lines.push(format!("  上级: {}", short_pid));
                     }
                 }
                 ChainEntry::Outcome {
@@ -313,6 +351,15 @@ impl DelegationBoard {
     ) -> Result<String> {
         let task = DelegationTask::new(from, to, brief, detail, parent_id);
         let id = task.id.clone();
+
+        // 预建 SSE 事件通道
+        {
+            let mut map = self.events.write().await;
+            map.entry(id.clone()).or_insert_with(|| {
+                let (tx, _) = broadcast::channel(32);
+                tx
+            });
+        }
 
         self.db
             .delegation_insert(&id, from, to, brief, detail, parent_id)?;
@@ -375,13 +422,14 @@ impl DelegationBoard {
             return Ok(());
         }
 
-        // 板操作：从任务区删除
+        // 从发布区移除（可能已被 take() 取走，忽略）
         let mut tasks = self.publish.write().await;
-        let pos = tasks
+        if let Some(pos) = tasks
             .iter()
             .position(|t| t.id == task_id && t.to == member_id)
-            .ok_or_else(|| anyhow::anyhow!("任务区中未找到任务 '{}'", task_id))?;
-        tasks.remove(pos);
+        {
+            tasks.remove(pos);
+        }
 
         Ok(())
     }
