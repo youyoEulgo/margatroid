@@ -9,8 +9,7 @@ use sandbox::SandboxManager;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use types::{
-    FinishReason, Identity, RequestMessage, RequestTool,
-    ResponseChoice,
+    FinishReason, Identity, RequestMessage, RequestTool, ResponseChoice,
     message::{ChatMessage, MessageContent, Role, ToolMessage},
     tool::ResponseToolCall,
 };
@@ -25,11 +24,7 @@ pub trait Agent: Send + Sync {
     fn identity(&self) -> &Identity;
 
     /// 处理一个任务：board 组装上下文 → LLM tool-call loop → 结果 + 总结
-    async fn process(
-        &self,
-        board: &DelegationBoard,
-        tools: &[RequestTool],
-    ) -> Result<ChatOutcome>;
+    async fn process(&self, board: &DelegationBoard, tools: &[RequestTool]) -> Result<ChatOutcome>;
 }
 
 /// chat() 返回值
@@ -110,6 +105,10 @@ impl Member {
                     .map_or(true, |v| v.is_empty())
             {
                 let bare_text = choice.message.content.clone().unwrap_or_default();
+                if !bare_text.is_empty() {
+                    save_conversation(board, &self.id, &bare_text).await;
+                    publish_msg(board, &bare_text).await;
+                }
                 messages.push(RequestMessage::Chat(ChatMessage {
                     role: Role::Assistant,
                     content: MessageContent::Text(bare_text),
@@ -127,14 +126,32 @@ impl Member {
 
             messages.push(request_message_from_choice(choice));
 
+            let text_content = choice.message.content.clone().unwrap_or_default();
+            let has_breaking_tool = choice
+                .message
+                .tool_calls
+                .as_ref()
+                .map_or(false, |tc| {
+                    tc.iter()
+                        .any(|t| matches!(t.function.name.as_str(), "finish" | "delegate"))
+                });
+
+            if !text_content.is_empty() {
+                save_conversation(board, &self.id, &text_content).await;
+                if !has_breaking_tool {
+                    publish_msg(board, &text_content).await;
+                }
+            }
+
             if let Some(tool_calls) = &choice.message.tool_calls {
                 let sandbox_guard = self.sandbox.read().await;
                 let mut should_break = false;
                 let mut break_content = String::new();
+                let reply = choice.message.content.clone().unwrap_or_default();
 
                 for tc in tool_calls {
                     let (result, brk) =
-                        execute_tool(tc, &sandbox_guard, board, &self.id).await;
+                        execute_tool(tc, &sandbox_guard, board, &self.id, &reply).await;
 
                     messages.push(RequestMessage::Tool(ToolMessage {
                         role: Role::Tool,
@@ -177,11 +194,12 @@ async fn execute_tool(
     sandbox: &SandboxManager,
     board: &DelegationBoard,
     from: &str,
+    reply: &str,
 ) -> ToolResult {
     match tc.function.name.as_str() {
         "bash" => (execute_bash(&tc.function.arguments, sandbox).await, false),
         "delegate" => {
-            let result = execute_delegate(&tc.function.arguments, board, from).await;
+            let result = execute_delegate(&tc.function.arguments, board, from, reply).await;
             (result, true)
         }
         "schedule_add" => (
@@ -199,14 +217,19 @@ async fn execute_tool(
         ),
         "recall" => (execute_recall(&tc.function.arguments, board).await, false),
         "finish" => (
-            execute_finish(&tc.function.arguments, board, from).await,
+            execute_finish(&tc.function.arguments, board, from, reply).await,
             true,
         ),
         _ => (format!("未知工具: {}", tc.function.name), false),
     }
 }
 
-async fn execute_finish(arguments: &str, board: &DelegationBoard, from: &str) -> String {
+async fn execute_finish(
+    arguments: &str,
+    board: &DelegationBoard,
+    from: &str,
+    reply: &str,
+) -> String {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
         Err(e) => return format!("参数解析失败: {}", e),
@@ -224,6 +247,7 @@ async fn execute_finish(arguments: &str, board: &DelegationBoard, from: &str) ->
         .map(|t| t.id.clone())
         .unwrap_or_default();
 
+    let did = delegation_id.clone();
     match board
         .result(
             from,
@@ -232,16 +256,36 @@ async fn execute_finish(arguments: &str, board: &DelegationBoard, from: &str) ->
                 detail: detail.to_string(),
                 summary: summary.to_string(),
                 done: true,
+                reply: reply.to_string(),
             },
         )
         .await
     {
-        Ok(()) => format!("完成。摘要: {}", summary),
+        Ok(()) => {
+            let content = if reply.is_empty() {
+                summary.to_string()
+            } else {
+                reply.to_string()
+            };
+            board
+                .publish_event(crate::board::ChatEvent {
+                    event_type: "done".into(),
+                    content,
+                    delegation_id: did,
+                })
+                .await;
+            format!("完成。摘要: {}", summary)
+        }
         Err(e) => format!("产出写入失败: {}", e),
     }
 }
 
-async fn execute_delegate(arguments: &str, board: &DelegationBoard, from: &str) -> String {
+async fn execute_delegate(
+    arguments: &str,
+    board: &DelegationBoard,
+    from: &str,
+    reply: &str,
+) -> String {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
         Err(e) => return format!("参数解析失败: {}", e),
@@ -282,6 +326,7 @@ async fn execute_delegate(arguments: &str, board: &DelegationBoard, from: &str) 
                 detail: work_detail.to_string(),
                 summary: work_summary.to_string(),
                 done: false,
+                reply: reply.to_string(),
             },
         )
         .await;
@@ -417,11 +462,7 @@ fn format_memories(db: &crate::memory::SqliteMemory, member_id: &str) -> String 
     let my_log = match db.worklog_by_agent(member_id, 10) {
         Ok(log) => log,
         Err(e) => {
-            tracing::warn!(
-                "无法查询成员 '{}' 的工作日志: {}",
-                member_id,
-                e
-            );
+            tracing::warn!("无法查询成员 '{}' 的工作日志: {}", member_id, e);
             return "(暂无记录)".to_string();
         }
     };
@@ -442,4 +483,38 @@ fn format_memories(db: &crate::memory::SqliteMemory, member_id: &str) -> String 
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+async fn save_conversation(board: &DelegationBoard, agent_id: &str, content: &str) {
+    let delegation_id = board
+        .chain_snapshot()
+        .await
+        .current_task()
+        .map(|t| t.id.clone())
+        .unwrap_or_default();
+    if delegation_id.is_empty() {
+        return;
+    }
+    let _ = board
+        .db()
+        .conversation_add(&delegation_id, agent_id, content);
+}
+
+async fn publish_msg(board: &DelegationBoard, content: &str) {
+    let delegation_id = board
+        .chain_snapshot()
+        .await
+        .current_task()
+        .map(|t| t.id.clone())
+        .unwrap_or_default();
+    if delegation_id.is_empty() {
+        return;
+    }
+    let _ = board
+        .publish_event(crate::board::ChatEvent {
+            event_type: "message".into(),
+            content: content.to_string(),
+            delegation_id,
+        })
+        .await;
 }

@@ -23,6 +23,9 @@ pub struct WorklogEntry {
     pub description: String,
     /// 工作摘要（~30-50 token）
     pub summary: String,
+    /// LLM 对话回复
+    #[serde(default)]
+    pub reply: String,
     #[serde(default)]
     pub artifacts: Vec<String>,
 }
@@ -40,6 +43,15 @@ pub struct MemoryEntry {
     pub artifacts: Vec<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+}
+
+/// 对话消息（LLM 回复的文本内容，每个回复一条）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationMessage {
+    pub delegation_id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: u64,
 }
 
 // ── Traits ────────────────────────────────────────────────────
@@ -120,7 +132,8 @@ impl SqliteMemory {
                 delegation_id TEXT NOT NULL UNIQUE,
                 to_agent TEXT NOT NULL DEFAULT '',
                 description TEXT NOT NULL DEFAULT '',
-                summary TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                reply TEXT NOT NULL DEFAULT '',
                 artifacts TEXT NOT NULL DEFAULT '[]'
             );
             CREATE INDEX IF NOT EXISTS idx_worklog_agent ON worklog(agent_id);
@@ -159,8 +172,20 @@ impl SqliteMemory {
                 result TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_delegations_parent ON delegations(parent_id);
+
+            CREATE TABLE IF NOT EXISTS conversation_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                delegation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_conv_delegation ON conversation_messages(delegation_id);
             ",
         )?;
+
+        // migration: add reply column for existing databases
+        let _ = conn.execute_batch("ALTER TABLE worklog ADD COLUMN reply TEXT NOT NULL DEFAULT '';");
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -173,7 +198,7 @@ impl SqliteMemory {
     pub fn worklog_by_agent(&self, agent_id: &str, limit: usize) -> Result<Vec<WorklogEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT timestamp, agent_id, delegation_id, to_agent, description, summary, artifacts
+            "SELECT timestamp, agent_id, delegation_id, to_agent, description, summary, reply, artifacts
              FROM worklog
              WHERE agent_id = ?
              ORDER BY timestamp DESC
@@ -435,13 +460,78 @@ impl SqliteMemory {
     }
 
     /// 任务产出时补全 worklog 的 summary
-    pub fn worklog_add_result(&self, delegation_id: &str, summary: &str) -> Result<()> {
+    pub fn worklog_add_result(&self, delegation_id: &str, summary: &str, reply: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE worklog SET summary = ? WHERE delegation_id = ?",
-            rusqlite::params![summary, delegation_id],
+            "UPDATE worklog SET summary = ?, reply = ? WHERE delegation_id = ?",
+            rusqlite::params![summary, reply, delegation_id],
         )?;
         Ok(())
+    }
+
+    // ── 对话消息 ──
+
+    /// 保存一条 assistant 对话消息
+    pub fn conversation_add(&self, delegation_id: &str, role: &str, content: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        conn.execute(
+            "INSERT INTO conversation_messages (delegation_id, role, content, created_at)
+             VALUES (?, ?, ?, ?)",
+            rusqlite::params![delegation_id, role, content, now as i64],
+        )?;
+        Ok(())
+    }
+
+    /// 查询某个委托下的所有对话消息
+    pub fn conversation_messages(&self, delegation_id: &str) -> Vec<ConversationMessage> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT delegation_id, role, content, created_at
+             FROM conversation_messages
+             WHERE delegation_id = ?
+             ORDER BY created_at ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(rusqlite::params![delegation_id], |row| {
+            Ok(ConversationMessage {
+                delegation_id: row.get(0)?,
+                role: row.get(1)?,
+                content: row.get(2)?,
+                created_at: row.get::<_, i64>(3)? as u64,
+            })
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// 返回所有活跃委托的最新对话消息（限制条数）
+    pub fn recent_conversations(&self, limit: usize) -> Vec<ConversationMessage> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT delegation_id, role, content, created_at
+             FROM conversation_messages
+             ORDER BY created_at DESC
+             LIMIT ?",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok(ConversationMessage {
+                delegation_id: row.get(0)?,
+                role: row.get(1)?,
+                content: row.get(2)?,
+                created_at: row.get::<_, i64>(3)? as u64,
+            })
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     }
 
     // ── 个人记忆写入 ──
@@ -484,7 +574,7 @@ impl Worklog for SqliteMemory {
     fn recent(&self, limit: usize) -> Vec<WorklogEntry> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT timestamp, agent_id, delegation_id, to_agent, description, summary, artifacts
+            "SELECT timestamp, agent_id, delegation_id, to_agent, description, summary, reply, artifacts
              FROM worklog
              ORDER BY timestamp DESC
              LIMIT ?",
@@ -501,7 +591,7 @@ impl Worklog for SqliteMemory {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", keyword);
         let mut stmt = match conn.prepare(
-            "SELECT timestamp, agent_id, delegation_id, to_agent, description, summary, artifacts
+            "SELECT timestamp, agent_id, delegation_id, to_agent, description, summary, reply, artifacts
              FROM worklog
              WHERE summary LIKE ? OR agent_id LIKE ?
              ORDER BY timestamp DESC
@@ -559,9 +649,10 @@ impl PersonalMemory for SqliteMemory {
 // ── Row mappers ──────────────────────────────────────────────
 
 fn row_to_worklog(row: &rusqlite::Row) -> rusqlite::Result<WorklogEntry> {
-    let artifacts_str: String = row.get(6).unwrap_or_default();
+    let artifacts_str: String = row.get(7).unwrap_or_default();
     let to_agent: String = row.get(3).unwrap_or_default();
     let description: String = row.get(4).unwrap_or_default();
+    let reply: String = row.get(6).unwrap_or_default();
     Ok(WorklogEntry {
         timestamp: row.get::<_, i64>(0)? as u64,
         agent_id: row.get(1)?,
@@ -569,6 +660,7 @@ fn row_to_worklog(row: &rusqlite::Row) -> rusqlite::Result<WorklogEntry> {
         to_agent,
         description,
         summary: row.get(5)?,
+        reply,
         artifacts: serde_json::from_str(&artifacts_str).unwrap_or_default(),
     })
 }
@@ -600,7 +692,7 @@ mod tests {
         db.worklog_add_task("d-001", "coder", "reviewer", "写用户接口")
             .unwrap();
         // 补全：产出结果
-        db.worklog_add_result("d-001", "实现了 /api/users").unwrap();
+        db.worklog_add_result("d-001", "实现了 /api/users", "").unwrap();
 
         // 读取
         let recent = db.recent(5);

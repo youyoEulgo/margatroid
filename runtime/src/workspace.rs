@@ -266,6 +266,7 @@ async fn execute_task(agent: &dyn Agent, board: &DelegationBoard, tools: &[Reque
                         detail: e.to_string(),
                         summary: "执行失败".into(),
                         done: false,
+                        reply: String::new(),
                     },
                 )
                 .await
