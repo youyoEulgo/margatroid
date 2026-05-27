@@ -113,7 +113,7 @@ pub async fn events(
         }
     };
 
-    // 检查是否已经完成（竞态：Manager 可能在 SSE 连接前就已 finish）
+    // 检查竞态：Manager 可能已经 finish
     let already_done = ws
         .board
         .db()
@@ -122,17 +122,16 @@ pub async fn events(
         .any(|e| e.delegation_id == task_id && !e.summary.is_empty());
 
     let broadcast = BroadcastStream::new(rx).map(|item| {
-        let event = match item {
-            Ok(e) => e,
-            Err(_) => return Ok(Event::default().data(r#"{"type":"error","content":"stream lagged"}"#)),
+        let data = match item {
+            Ok(s) => s,
+            Err(_) => r#"{"type":"error","content":"stream lagged"}"#.into(),
         };
-        let json = serde_json::to_string(&event).unwrap_or_default();
-        Ok(Event::default().data(json))
+        Ok(Event::default().data(data))
     });
 
     let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if already_done {
         let done = futures::stream::once(async {
-            Ok(Event::default().data(r#"{"type":"done","content":"","delegation_id":""}"#))
+            Ok(Event::default().data(r#"{"type":"done"}"#))
         });
         Box::pin(done.chain(broadcast))
     } else {
