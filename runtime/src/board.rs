@@ -41,15 +41,6 @@ pub struct TaskResult {
     pub reply: String,
 }
 
-/// SSE 推送事件
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatEvent {
-    #[serde(rename = "type")]
-    pub event_type: String, // "message" | "done"
-    pub content: String,
-    pub delegation_id: String,
-}
-
 /// 链条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChainEntry {
@@ -154,7 +145,7 @@ pub struct DelegationBoard {
     db: Arc<SqliteMemory>,
     chain: RwLock<TaskChain>,
     system_prompt: String,
-    events: RwLock<HashMap<String, broadcast::Sender<ChatEvent>>>,
+    events: RwLock<HashMap<String, broadcast::Sender<String>>>,
 }
 
 // ── Lifecycle ────────────────────────────────────────────────
@@ -185,7 +176,7 @@ impl DelegationBoard {
     pub async fn register_listener(
         &self,
         delegation_id: &str,
-    ) -> Option<broadcast::Receiver<ChatEvent>> {
+    ) -> Option<broadcast::Receiver<String>> {
         self.events
             .read()
             .await
@@ -193,11 +184,11 @@ impl DelegationBoard {
             .map(|tx| tx.subscribe())
     }
 
-    /// 推送一个事件到指定 delegation 的监听器
-    pub async fn publish_event(&self, event: ChatEvent) {
+    /// 推送一条原始数据到指定 delegation
+    pub async fn publish_raw(&self, delegation_id: &str, data: &str) {
         let map = self.events.read().await;
-        if let Some(tx) = map.get(&event.delegation_id) {
-            let _ = tx.send(event);
+        if let Some(tx) = map.get(delegation_id) {
+            let _ = tx.send(data.to_string());
         }
     }
 

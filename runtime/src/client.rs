@@ -1,8 +1,13 @@
 //! AI 客户端 — 封装模型名称与供应商，统一聊天接口
 
 use anyhow::Result;
+use futures::StreamExt;
+use std::pin::Pin;
 use std::sync::Arc;
-use types::{ChatRequest, ChatResponse, DynAiProvider, RequestMessage, RequestTool};
+use types::{
+    ChatRequest, ChatResponse, DynAiProvider, RequestMessage, RequestTool,
+    message::MessageContent,
+};
 
 pub struct Client {
     model: String,
@@ -17,6 +22,10 @@ impl Client {
             provider,
             verbose,
         }
+    }
+
+    pub fn is_verbose(&self) -> bool {
+        self.verbose
     }
 
     pub async fn chat(
@@ -41,24 +50,195 @@ impl Client {
         };
 
         if self.verbose {
-            tracing::info!(
-                "[DEBUG] → LLM request | model={} | messages={} | tools={}",
-                self.model,
-                serde_json::to_string_pretty(&req.messages).unwrap_or_default(),
-                serde_json::to_string_pretty(&req.tools).unwrap_or_default(),
-            );
+            log_request(&self.model, &req.messages, tools);
         }
+        tracing::debug!(
+            "raw request: {}",
+            serde_json::to_string_pretty(&req).unwrap_or_default(),
+        );
 
         let resp = self.provider.chat_boxed(req).await?;
 
         if self.verbose {
-            tracing::info!(
-                "[DEBUG] ← LLM response | model={} | {}",
-                self.model,
-                serde_json::to_string_pretty(&resp).unwrap_or_default(),
-            );
+            log_response(&self.model, &resp);
         }
+        tracing::debug!(
+            "raw response: {}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default(),
+        );
 
         Ok(resp)
     }
+
+    /// 流式请求（降级：不支持流式时回退到非流式，包装为单条 chunk）
+    pub async fn chat_stream(
+        &self,
+        messages: Vec<RequestMessage>,
+        tools: &[RequestTool],
+    ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>> {
+        let tools_vec = if tools.is_empty() {
+            None
+        } else {
+            Some(tools.to_vec())
+        };
+
+        let req = ChatRequest {
+            model: self.model.clone(),
+            messages: messages.clone(),
+            stream: Some(true),
+            tools: tools_vec.clone(),
+            tool_choice: if tools.is_empty() {
+                None
+            } else {
+                Some(types::RequestToolChoice::String("auto".into()))
+            },
+            ..Default::default()
+        };
+
+        if self.verbose {
+            log_request(&self.model, &req.messages, tools);
+        }
+        tracing::debug!(
+            "raw request: {}",
+            serde_json::to_string_pretty(&req).unwrap_or_default(),
+        );
+
+        match self.provider.chat_stream_boxed(req).await {
+            Ok(stream) => {
+                let s = stream.map(|chunk| Ok(serde_json::to_string(&chunk?)?));
+                Ok(Box::pin(s))
+            }
+            Err(e) => {
+                tracing::debug!("raw error, falling back: {}", e);
+                tracing::warn!("stream failed, falling back: {}", e);
+                let req2 = ChatRequest {
+                    model: self.model.clone(),
+                    messages,
+                    stream: Some(false),
+                    tools: tools_vec,
+                    tool_choice: if tools.is_empty() {
+                        None
+                    } else {
+                        Some(types::RequestToolChoice::String("auto".into()))
+                    },
+                    ..Default::default()
+                };
+                let resp = self.provider.chat_boxed(req2).await?;
+                let json = serde_json::to_string(&resp)?;
+                tracing::debug!("raw fallback response: {}", json);
+
+                if self.verbose {
+                    log_response(&self.model, &resp);
+                }
+
+                Ok(Box::pin(futures::stream::once(async { Ok(json) })))
+            }
+        }
+    }
+}
+
+// ── Verbose helpers ──
+
+fn log_request(model: &str, messages: &[RequestMessage], tools: &[RequestTool]) {
+    let mut out = String::new();
+    for m in messages {
+        match m {
+            RequestMessage::Chat(c) => {
+                let content = match &c.content {
+                    MessageContent::Text(t) => truncate(t, 140),
+                    _ => "(multipart)".into(),
+                };
+                out.push_str(&format!(
+                    "  [{:>9}] {}\n",
+                    format!("{:?}", c.role).to_lowercase(),
+                    content,
+                ));
+            }
+            RequestMessage::Tool(t) => {
+                out.push_str(&format!(
+                    "  [    tool] {} ← {}\n",
+                    truncate(&t.content, 80),
+                    &t.tool_call_id[..t.tool_call_id.len().min(8)],
+                ));
+            }
+        }
+    }
+    out.push_str("  --- tools ---\n");
+    for t in tools {
+        out.push_str(&format!("  {}\n", t.function.name));
+    }
+    tracing::info!(
+        "[DEBUG] → LLM | model={} | {} msgs:\n{}",
+        model,
+        messages.len(),
+        out,
+    );
+}
+
+fn log_response(model: &str, resp: &ChatResponse) {
+    if let Some(c) = resp.choices.first() {
+        let text = c.message.content.as_deref().unwrap_or("(none)");
+        let tokens = resp.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
+        let mut out = format!(
+            "[DEBUG] ← LLM | model={} | tokens={} | finish={:?}\n",
+            model, tokens, c.finish_reason,
+        );
+        out.push_str(&format!("  text: {}\n", truncate(text, 200)));
+        if let Some(tcs) = &c.message.tool_calls {
+            out.push_str("  tool_calls:\n");
+            for tc in tcs {
+                out.push_str(&format!("    {}({})\n", tc.function.name, format_args(&tc.function.arguments)));
+            }
+        }
+        tracing::info!("{}", out);
+    }
+}
+
+fn format_args(json: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return truncate(json, 80),
+    };
+    match v {
+        serde_json::Value::Object(map) => map
+            .into_iter()
+            .map(|(k, v)| {
+                let val = match v {
+                    serde_json::Value::String(s) => format!("\"{}\"", truncate(&s, 60)),
+                    other => other.to_string(),
+                };
+                format!("{}: {}", k, val)
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => truncate(json, 80),
+    }
+}
+
+pub fn log_stream_end(text: &str, tool_calls_json: &str) {
+    if text.is_empty() && tool_calls_json.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "[DEBUG] ← LLM stream end | text: {}\ntool_calls: {}",
+        truncate(text, 300),
+        if tool_calls_json.is_empty() {
+            "(none)"
+        } else {
+            tool_calls_json
+        },
+    );
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let s = s.replace('\n', "\\n");
+    if s.len() <= max {
+        return s;
+    }
+    let cut = s
+        .char_indices()
+        .take_while(|(i, _)| *i < max)
+        .map(|(_, c)| c)
+        .collect::<String>();
+    format!("{}...", cut)
 }

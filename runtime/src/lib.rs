@@ -9,7 +9,7 @@ pub mod member;
 pub mod memory;
 pub mod workspace;
 
-pub use board::{ChatEvent, DelegationBoard, DelegationTask, TaskChain, TaskResult};
+pub use board::{DelegationBoard, DelegationTask, TaskChain, TaskResult};
 pub use client::Client;
 pub use member::{Agent, Member};
 pub use memory::{ConversationMessage, SqliteMemory};

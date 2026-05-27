@@ -5,13 +5,14 @@
 //! chat() 驱动 LLM tool-call loop，通过 Board.assemble_prompt() 获取上下文。
 
 use anyhow::Result;
+use futures::StreamExt;
 use sandbox::SandboxManager;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use types::{
     FinishReason, Identity, RequestMessage, RequestTool, ResponseChoice,
     message::{ChatMessage, MessageContent, Role, ToolMessage},
-    tool::ResponseToolCall,
+    tool::{ResponseFunctionCall, ResponseToolCall, ToolCallDelta},
 };
 
 use crate::board::DelegationBoard;
@@ -89,29 +90,125 @@ impl Member {
             .map(RequestMessage::Chat)
             .collect();
 
+        let did = current_delegation_id(board).await;
+
         // 主 tool-call loop
         let final_content = loop {
-            let resp = self.client.chat(messages.clone(), tools).await?;
-            let choice = resp
-                .choices
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("provider returned empty choices"))?;
+            let mut stream = self.client.chat_stream(messages.clone(), tools).await?;
 
-            if choice.finish_reason == Some(FinishReason::Stop)
-                && choice
-                    .message
-                    .tool_calls
-                    .as_ref()
-                    .map_or(true, |v| v.is_empty())
-            {
-                let bare_text = choice.message.content.clone().unwrap_or_default();
-                if !bare_text.is_empty() {
-                    save_conversation(board, &self.id, &bare_text).await;
-                    publish_msg(board, &bare_text).await;
+            let mut full_content = String::new();
+            let mut full_tool_calls: Vec<ResponseToolCall> = Vec::new();
+            let mut finish_reason: Option<FinishReason> = None;
+
+            while let Some(chunk_result) = stream.next().await {
+                let chunk_json = match chunk_result {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("stream chunk error, skipping: {}", e);
+                        continue;
+                    }
+                };
+                tracing::debug!("raw chunk: {}", chunk_json);
+                board.publish_raw(&did, &chunk_json).await;
+
+                let chunk: types::StreamChunk =
+                    serde_json::from_str(&chunk_json).unwrap_or_else(|_| {
+                        // 可能是一整个 ChatResponse（降级路径）
+                        types::StreamChunk {
+                            id: String::new(),
+                            model: String::new(),
+                            choices: vec![],
+                            usage: None,
+                        }
+                    });
+
+                if chunk.choices.is_empty() {
+                    // ChatResponse 降级：解析为完整响应
+                    if let Ok(resp) = serde_json::from_str::<types::ChatResponse>(&chunk_json) {
+                        if let Some(choice) = resp.choices.first() {
+                            full_content = choice.message.content.clone().unwrap_or_default();
+                            full_tool_calls = choice.message.tool_calls.clone().unwrap_or_default();
+                            finish_reason = choice.finish_reason.clone();
+                        }
+                    }
+                    continue;
                 }
+
+                if let Some(choice) = chunk.choices.first() {
+                    if let Some(content) = &choice.delta.content {
+                        full_content.push_str(content);
+                    }
+                    if let Some(tcs) = &choice.delta.tool_calls {
+                        merge_deltas(&mut full_tool_calls, tcs);
+                    }
+                    if finish_reason.is_none() {
+                        finish_reason.clone_from(&choice.finish_reason);
+                    }
+                }
+            }
+
+            tracing::info!(
+                "[DEBUG] stream ended | fr={:?} | text_len={} | tool_count={}",
+                finish_reason,
+                full_content.len(),
+                full_tool_calls.len(),
+            );
+
+            // 保存完整文本到 DB
+            if !full_content.is_empty() {
+                save_conversation(board, &self.id, &full_content).await;
+            }
+
+            if self.client.is_verbose() {
+                let mut out = format!("[DEBUG] stream done | text_len={}", full_content.len(),);
+                if !full_content.is_empty() {
+                    let s = full_content.replace('\n', "\\n");
+                    let preview = if s.len() > 200 {
+                        let cut: String = s
+                            .char_indices()
+                            .take_while(|(i, _)| *i < 200)
+                            .map(|(_, c)| c)
+                            .collect();
+                        format!("{}...", cut)
+                    } else {
+                        s
+                    };
+                    out.push_str(&format!("\n  text: {}", preview));
+                }
+                if !full_tool_calls.is_empty() {
+                    out.push_str("\n  tool_calls:");
+                    for tc in &full_tool_calls {
+                        let args = format_args_json(&tc.function.arguments);
+                        out.push_str(&format!("\n    {}({})", tc.function.name, args));
+                    }
+                }
+                tracing::info!("{}", out);
+            }
+
+            // 构造伪 ResponseChoice 沿用后续逻辑
+            let fr = finish_reason.clone();
+            let choice = ResponseChoice {
+                index: 0,
+                message: types::ResponseMessage {
+                    role: "assistant".into(),
+                    content: if full_content.is_empty() {
+                        None
+                    } else {
+                        Some(full_content.clone())
+                    },
+                    tool_calls: if full_tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(full_tool_calls.clone())
+                    },
+                },
+                finish_reason,
+            };
+
+            if fr == Some(FinishReason::Stop) && full_tool_calls.is_empty() {
                 messages.push(RequestMessage::Chat(ChatMessage {
                     role: Role::Assistant,
-                    content: MessageContent::Text(bare_text),
+                    content: MessageContent::Text(full_content),
                     name: None,
                     tool_calls: None,
                 }));
@@ -124,34 +221,17 @@ impl Member {
                 continue;
             }
 
-            messages.push(request_message_from_choice(choice));
+            messages.push(request_message_from_choice(&choice));
 
-            let text_content = choice.message.content.clone().unwrap_or_default();
-            let has_breaking_tool = choice
-                .message
-                .tool_calls
-                .as_ref()
-                .map_or(false, |tc| {
-                    tc.iter()
-                        .any(|t| matches!(t.function.name.as_str(), "finish" | "delegate"))
-                });
-
-            if !text_content.is_empty() {
-                save_conversation(board, &self.id, &text_content).await;
-                if !has_breaking_tool {
-                    publish_msg(board, &text_content).await;
-                }
-            }
-
-            if let Some(tool_calls) = &choice.message.tool_calls {
+            if !full_tool_calls.is_empty() {
                 let sandbox_guard = self.sandbox.read().await;
                 let mut should_break = false;
                 let mut break_content = String::new();
-                let reply = choice.message.content.clone().unwrap_or_default();
+                let reply = &full_content;
 
-                for tc in tool_calls {
+                for tc in &full_tool_calls {
                     let (result, brk) =
-                        execute_tool(tc, &sandbox_guard, board, &self.id, &reply).await;
+                        execute_tool(tc, &sandbox_guard, board, &self.id, reply).await;
 
                     messages.push(RequestMessage::Tool(ToolMessage {
                         role: Role::Tool,
@@ -230,9 +310,13 @@ async fn execute_finish(
     from: &str,
     reply: &str,
 ) -> String {
-    let args: serde_json::Value = match serde_json::from_str(arguments) {
-        Ok(v) => v,
-        Err(e) => return format!("参数解析失败: {}", e),
+    let args: serde_json::Value = if arguments.is_empty() {
+        serde_json::Value::Null
+    } else {
+        match serde_json::from_str(arguments) {
+            Ok(v) => v,
+            Err(_) => serde_json::Value::Null,
+        }
     };
     let summary = args
         .get("summary")
@@ -262,18 +346,11 @@ async fn execute_finish(
         .await
     {
         Ok(()) => {
-            let content = if reply.is_empty() {
-                summary.to_string()
-            } else {
-                reply.to_string()
-            };
-            board
-                .publish_event(crate::board::ChatEvent {
-                    event_type: "done".into(),
-                    content,
-                    delegation_id: did,
-                })
-                .await;
+            tracing::info!(
+                "[DEBUG] publish done event | did={}",
+                &did[..did.len().min(8)]
+            );
+            board.publish_raw(&did, r#"{"type":"done"}"#).await;
             format!("完成。摘要: {}", summary)
         }
         Err(e) => format!("产出写入失败: {}", e),
@@ -500,21 +577,103 @@ async fn save_conversation(board: &DelegationBoard, agent_id: &str, content: &st
         .conversation_add(&delegation_id, agent_id, content);
 }
 
-async fn publish_msg(board: &DelegationBoard, content: &str) {
-    let delegation_id = board
+async fn current_delegation_id(board: &DelegationBoard) -> String {
+    board
         .chain_snapshot()
         .await
         .current_task()
         .map(|t| t.id.clone())
-        .unwrap_or_default();
-    if delegation_id.is_empty() {
-        return;
+        .unwrap_or_default()
+}
+
+fn merge_deltas(accum: &mut Vec<ResponseToolCall>, deltas: &[ToolCallDelta]) {
+    for td in deltas {
+        let idx = td.index as usize;
+        while accum.len() <= idx {
+            accum.push(ResponseToolCall {
+                id: String::new(),
+                r#type: "function".into(),
+                function: ResponseFunctionCall {
+                    name: String::new(),
+                    arguments: String::new(),
+                },
+            });
+        }
+        let existing = &mut accum[idx];
+        if let Some(id) = &td.id {
+            if !id.is_empty() {
+                existing.id.clone_from(id);
+            }
+        }
+        if let Some(t) = &td.r#type {
+            existing.r#type.clone_from(t);
+        }
+        if let Some(f) = &td.function {
+            if let Some(name) = &f.name {
+                if !name.is_empty() {
+                    existing.function.name.clone_from(name);
+                }
+            }
+            if let Some(args) = &f.arguments {
+                existing.function.arguments.push_str(args);
+            }
+        }
     }
-    let _ = board
-        .publish_event(crate::board::ChatEvent {
-            event_type: "message".into(),
-            content: content.to_string(),
-            delegation_id,
-        })
-        .await;
+}
+
+fn format_args_json(json: &str) -> String {
+    if json.is_empty() {
+        return "(empty)".into();
+    }
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => {
+            let cut: String = json
+                .char_indices()
+                .take_while(|(i, _)| *i < 80)
+                .map(|(_, c)| c)
+                .collect();
+            return if json.len() > 80 {
+                format!("{}...", cut)
+            } else {
+                cut
+            };
+        }
+    };
+    match v {
+        serde_json::Value::Object(map) => map
+            .into_iter()
+            .map(|(k, v)| {
+                let val = match v {
+                    serde_json::Value::String(s) => {
+                        let cut: String = s
+                            .char_indices()
+                            .take_while(|(i, _)| *i < 60)
+                            .map(|(_, c)| c)
+                            .collect();
+                        if s.len() > 60 {
+                            format!("\"{}...\"", cut)
+                        } else {
+                            format!("\"{}\"", cut)
+                        }
+                    }
+                    other => other.to_string(),
+                };
+                format!("{}: {}", k, val)
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => {
+            let cut: String = json
+                .char_indices()
+                .take_while(|(i, _)| *i < 80)
+                .map(|(_, c)| c)
+                .collect();
+            if json.len() > 80 {
+                format!("{}...", cut)
+            } else {
+                cut
+            }
+        }
+    }
 }

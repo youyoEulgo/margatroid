@@ -1,6 +1,7 @@
 pub mod error;
 pub mod traits;
 
+pub mod deepseek;
 pub mod human;
 pub mod openrouter;
 
@@ -9,6 +10,7 @@ pub use traits::AiProvider;
 pub use types::DynAiProvider;
 
 // 方便外部直接构造 provider
+pub use deepseek::DeepSeekProvider;
 pub use openrouter::OpenRouterProvider;
 
 use anyhow::{Result, bail};
@@ -32,6 +34,13 @@ pub fn build(config: &types::config::AiProvider) -> Result<Arc<dyn DynAiProvider
     match config.provider_type.as_str() {
         "openrouter" => {
             let mut client = OpenRouterProvider::new(&config.api_key);
+            if !config.base_url.is_empty() {
+                client = client.with_base_url(&config.base_url);
+            }
+            Ok(Arc::new(client))
+        }
+        "deepseek" => {
+            let mut client = DeepSeekProvider::new(&config.api_key);
             if !config.base_url.is_empty() {
                 client = client.with_base_url(&config.base_url);
             }
