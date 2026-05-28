@@ -127,6 +127,7 @@ async fn test_ai_driven_tool_call() -> Result<()> {
             ),
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         })],
         tools: Some(request_tools),
         tool_choice: Some(types::RequestToolChoice::String("required".into())),
