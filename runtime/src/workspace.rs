@@ -249,14 +249,14 @@ impl Drop for Workspace {
     }
 }
 
-/// 处理任务：take → process → handle outcome
+/// 处理任务：读链 → 匹配成员 → process → handle outcome
 async fn execute_task(agent: &dyn Agent, board: &DelegationBoard, tools: &[RequestTool]) {
     const MAX_RETRIES: u32 = 3;
 
-    // 从发布区领取任务
-    let task = match board.take(agent.id()).await {
-        Some(t) => t,
-        None => return,
+    // 从任务链读取当前委托
+    let task = match board.chain_snapshot().await.current_task().cloned() {
+        Some(t) if t.to == agent.id() && !t.id.is_empty() => t,
+        _ => return,
     };
 
     tracing::info!(
