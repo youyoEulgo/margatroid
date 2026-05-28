@@ -344,7 +344,13 @@ async fn member_loop(
             break;
         }
         execute_task(&*agent, &board, &tools).await;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::select! {
+            _ = board.wait(agent.id()) => {},
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+        }
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
     }
     tracing::info!("成员 '{}' 控制循环退出", agent.id());
 }
