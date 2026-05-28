@@ -11,8 +11,36 @@
 
 use anyhow::Result;
 use std::sync::Arc;
+use tracing::level_filters::LevelFilter;
 
 use server::state::AppState;
+
+fn config_log_level() -> LevelFilter {
+    let path = paths::margatroid_root()
+        .unwrap_or_else(|| std::path::PathBuf::from(".margatroid"))
+        .join("margatroid.toml");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return LevelFilter::INFO,
+    };
+    let config: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return LevelFilter::INFO,
+    };
+    match config
+        .get("logging")
+        .and_then(|l| l.get("level"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_lowercase())
+        .as_deref()
+    {
+        Some("error") => LevelFilter::ERROR,
+        Some("warn") => LevelFilter::WARN,
+        Some("debug") => LevelFilter::DEBUG,
+        Some("trace") => LevelFilter::TRACE,
+        _ => LevelFilter::INFO,
+    }
+}
 
 fn usage() -> ! {
     eprintln!("用法:");
@@ -32,17 +60,13 @@ async fn main() -> Result<()> {
     let verbose = args.iter().any(|a| a == "--verbose");
     let args: Vec<_> = args.into_iter().filter(|a| a != "--verbose").collect();
 
-    if verbose {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::builder()
-                    .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
-                    .from_env_lossy(),
-            )
-            .init();
-    } else {
-        tracing_subscriber::fmt().init();
-    }
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(config_log_level().into())
+                .from_env_lossy(),
+        )
+        .init();
 
     if args.len() < 2 {
         usage();
@@ -191,6 +215,7 @@ async fn cmd_compose_up(path: &str, verbose: bool) -> Result<()> {
             } else {
                 runtime::base_tools()
             },
+            skills: def.skills.clone(),
         });
     }
 

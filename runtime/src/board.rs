@@ -145,13 +145,14 @@ pub struct DelegationBoard {
     db: Arc<SqliteMemory>,
     chain: RwLock<TaskChain>,
     system_prompt: String,
+    member_roster: String,
     events: RwLock<HashMap<String, broadcast::Sender<String>>>,
 }
 
 // ── Lifecycle ────────────────────────────────────────────────
 
 impl DelegationBoard {
-    pub fn new(db: Arc<SqliteMemory>, system_prompt: String) -> Self {
+    pub fn new(db: Arc<SqliteMemory>, system_prompt: String, member_roster: String) -> Self {
         Self {
             publish: RwLock::new(Vec::new()),
             chain: RwLock::new(TaskChain::new(DelegationTask {
@@ -164,6 +165,7 @@ impl DelegationBoard {
             })),
             db,
             system_prompt,
+            member_roster,
             events: RwLock::new(HashMap::new()),
         }
     }
@@ -213,6 +215,7 @@ impl DelegationBoard {
             content: MessageContent::Text(soul.to_string()),
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         });
 
         // 2. 系统提示词
@@ -222,6 +225,21 @@ impl DelegationBoard {
                 content: MessageContent::Text(self.system_prompt.clone()),
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
+            });
+        }
+
+        // 2.5. 团队成员名录
+        if !self.member_roster.is_empty() {
+            messages.push(ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text(format!(
+                    "--- 团队成员 ---\n{}",
+                    self.member_roster,
+                )),
+                name: None,
+                tool_calls: None,
+                reasoning_content: None,
             });
         }
 
@@ -233,6 +251,7 @@ impl DelegationBoard {
             content: MessageContent::Text(format!("--- 委托链上下文 ---\n{}", chain_text)),
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         });
 
         // 4. 团队工作日志
@@ -243,6 +262,7 @@ impl DelegationBoard {
                 content: MessageContent::Text(format!("--- 团队工作日志 ---\n{}", worklog)),
                 name: None,
                 tool_calls: None,
+            reasoning_content: None,
             });
         }
 
@@ -253,6 +273,7 @@ impl DelegationBoard {
                 content: MessageContent::Text(format!("--- 你的相关记忆 ---\n{}", memories)),
                 name: None,
                 tool_calls: None,
+            reasoning_content: None,
             });
         }
 
@@ -267,6 +288,7 @@ impl DelegationBoard {
                 content: MessageContent::Text(task_desc),
                 name: None,
                 tool_calls: None,
+            reasoning_content: None,
             });
         }
 

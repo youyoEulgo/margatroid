@@ -94,9 +94,11 @@ impl Member {
 
         // 主 tool-call loop
         let final_content = loop {
+            tracing::info!("→ LLM | {}", self.id);
             let mut stream = self.client.chat_stream(messages.clone(), tools).await?;
 
             let mut full_content = String::new();
+            let mut full_reasoning = String::new();
             let mut full_tool_calls: Vec<ResponseToolCall> = Vec::new();
             let mut finish_reason: Option<FinishReason> = None;
 
@@ -127,6 +129,7 @@ impl Member {
                     if let Ok(resp) = serde_json::from_str::<types::ChatResponse>(&chunk_json) {
                         if let Some(choice) = resp.choices.first() {
                             full_content = choice.message.content.clone().unwrap_or_default();
+                            full_reasoning = choice.message.reasoning_content.clone().unwrap_or_default();
                             full_tool_calls = choice.message.tool_calls.clone().unwrap_or_default();
                             finish_reason = choice.finish_reason.clone();
                         }
@@ -138,6 +141,9 @@ impl Member {
                     if let Some(content) = &choice.delta.content {
                         full_content.push_str(content);
                     }
+                    if let Some(r) = &choice.delta.reasoning_content {
+                        full_reasoning.push_str(r);
+                    }
                     if let Some(tcs) = &choice.delta.tool_calls {
                         merge_deltas(&mut full_tool_calls, tcs);
                     }
@@ -147,8 +153,8 @@ impl Member {
                 }
             }
 
-            tracing::info!(
-                "[DEBUG] stream ended | fr={:?} | text_len={} | tool_count={}",
+            tracing::debug!(
+                "stream ended | fr={:?} | text_len={} | tool_count={}",
                 finish_reason,
                 full_content.len(),
                 full_tool_calls.len(),
@@ -159,30 +165,25 @@ impl Member {
                 save_conversation(board, &self.id, &full_content).await;
             }
 
+            // info: 接收流量的工具摘要
+            let used: Vec<&str> = full_tool_calls
+                .iter()
+                .map(|tc| tc.function.name.as_str())
+                .collect();
+            tracing::info!(
+                "← LLM | {} | used=[{}]",
+                self.id,
+                used.join(", "),
+            );
+
+            // verbose 日志：流式摘要
             if self.client.is_verbose() {
-                let mut out = format!("[DEBUG] stream done | text_len={}", full_content.len(),);
-                if !full_content.is_empty() {
-                    let s = full_content.replace('\n', "\\n");
-                    let preview = if s.len() > 200 {
-                        let cut: String = s
-                            .char_indices()
-                            .take_while(|(i, _)| *i < 200)
-                            .map(|(_, c)| c)
-                            .collect();
-                        format!("{}...", cut)
-                    } else {
-                        s
-                    };
-                    out.push_str(&format!("\n  text: {}", preview));
-                }
-                if !full_tool_calls.is_empty() {
-                    out.push_str("\n  tool_calls:");
-                    for tc in &full_tool_calls {
-                        let args = format_args_json(&tc.function.arguments);
-                        out.push_str(&format!("\n    {}({})", tc.function.name, args));
-                    }
-                }
-                tracing::info!("{}", out);
+                let tc_str = full_tool_calls
+                    .iter()
+                    .map(|tc| format!("{}({})", tc.function.name, format_args_json(&tc.function.arguments)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                crate::client::verbose_stream_done(&full_content, &tc_str);
             }
 
             // 构造伪 ResponseChoice 沿用后续逻辑
@@ -201,6 +202,11 @@ impl Member {
                     } else {
                         Some(full_tool_calls.clone())
                     },
+                    reasoning_content: if full_reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(full_reasoning.clone())
+                    },
                 },
                 finish_reason,
             };
@@ -211,12 +217,18 @@ impl Member {
                     content: MessageContent::Text(full_content),
                     name: None,
                     tool_calls: None,
+                    reasoning_content: if full_reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(full_reasoning.clone())
+                    },
                 }));
                 messages.push(RequestMessage::Chat(ChatMessage {
                     role: Role::User,
                     content: MessageContent::Text(LOOP_CONSTRAINT.to_string()),
                     name: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 }));
                 continue;
             }
@@ -266,6 +278,7 @@ fn request_message_from_choice(choice: &ResponseChoice) -> RequestMessage {
         content: MessageContent::Text(choice.message.content.clone().unwrap_or_default()),
         name: None,
         tool_calls: choice.message.tool_calls.clone(),
+        reasoning_content: choice.message.reasoning_content.clone(),
     })
 }
 
@@ -347,7 +360,7 @@ async fn execute_finish(
     {
         Ok(()) => {
             tracing::info!(
-                "[DEBUG] publish done event | did={}",
+                "publish done | did={}",
                 &did[..did.len().min(8)]
             );
             board.publish_raw(&did, r#"{"type":"done"}"#).await;

@@ -102,10 +102,9 @@ impl AiProvider for DeepSeekProvider {
             bail!("API error (HTTP {}): {}", status, msg);
         }
 
-        let byte_stream = resp.bytes_stream();
+        let mut byte_stream = resp.bytes_stream();
         let stream = async_stream::stream! {
             let mut buf = String::new();
-            let mut byte_stream = byte_stream;
 
             while let Some(chunk) = byte_stream.next().await {
                 let chunk = match chunk {
