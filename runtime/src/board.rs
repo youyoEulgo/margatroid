@@ -11,7 +11,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Notify, RwLock, broadcast};
 use types::message::{ChatMessage, MessageContent, Role};
 
 use crate::memory::{PersonalMemory, SqliteMemory, Worklog};
@@ -147,6 +147,7 @@ pub struct DelegationBoard {
     system_prompt: String,
     member_roster: String,
     events: RwLock<HashMap<String, broadcast::Sender<String>>>,
+    notifies: RwLock<HashMap<String, Arc<Notify>>>,
 }
 
 // ── Lifecycle ────────────────────────────────────────────────
@@ -167,6 +168,7 @@ impl DelegationBoard {
             system_prompt,
             member_roster,
             events: RwLock::new(HashMap::new()),
+            notifies: RwLock::new(HashMap::new()),
         }
     }
 
@@ -191,6 +193,23 @@ impl DelegationBoard {
         let map = self.events.read().await;
         if let Some(tx) = map.get(delegation_id) {
             let _ = tx.send(data.to_string());
+        }
+    }
+
+    /// 成员阻塞等待直到链头指向自己
+    pub async fn wait(&self, member_id: &str) {
+        let notify = {
+            let mut map = self.notifies.write().await;
+            map.entry(member_id.to_string())
+                .or_insert_with(|| Arc::new(Notify::new()))
+                .clone()
+        };
+        notify.notified().await;
+    }
+
+    async fn notify_member(&self, member_id: &str) {
+        if let Some(notify) = self.notifies.read().await.get(member_id) {
+            notify.notify_one();
         }
     }
 
@@ -386,8 +405,11 @@ impl DelegationBoard {
 
         // 放掉链锁后再入发布区
         if let Some(t) = cloned {
+            let target = t.to.clone();
             let mut publish = self.publish.write().await;
             publish.push(t);
+            drop(publish);
+            self.notify_member(&target).await;
         }
 
         Ok(id)
@@ -436,6 +458,13 @@ impl DelegationBoard {
             .position(|t| t.id == task_id && t.to == member_id)
         {
             tasks.remove(pos);
+        }
+
+        // 唤醒上级（链头已左移，新链头指向父委托的承接者）
+        if let Some(task) = self.chain.read().await.current_task() {
+            if !task.id.is_empty() {
+                self.notify_member(&task.to);
+            }
         }
 
         Ok(())
