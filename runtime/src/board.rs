@@ -589,3 +589,105 @@ impl From<&DelegationTask> for TaskInfo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::SqliteMemory;
+
+    fn test_board() -> DelegationBoard {
+        let db = Arc::new(SqliteMemory::open(":memory:").unwrap());
+        DelegationBoard::new(db, String::new(), String::new())
+    }
+
+    #[tokio::test]
+    async fn test_chain_offer_and_finish() {
+        let board = test_board();
+
+        let id = board
+            .offer("user", "manager", "test", "", None)
+            .await
+            .unwrap();
+        assert_eq!(board.chain.read().await.head, 1);
+
+        board
+            .result(
+                "manager",
+                TaskResult {
+                    delegation_id: id,
+                    detail: "done".into(),
+                    summary: "done".into(),
+                    done: true,
+                    reply: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let chain = board.chain.read().await;
+        assert_eq!(chain.head, 0);
+        assert!(chain.current_task().unwrap().id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chain_delegate_then_finish() {
+        let board = test_board();
+
+        let id1 = board
+            .offer("user", "manager", "分发", "", None)
+            .await
+            .unwrap();
+
+        board
+            .result(
+                "manager",
+                TaskResult {
+                    delegation_id: id1.clone(),
+                    detail: "分发中".into(),
+                    summary: "分发".into(),
+                    done: false,
+                    reply: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let id2 = board
+            .offer("manager", "coder", "子任务", "直接finish", Some(&id1))
+            .await
+            .unwrap();
+
+        board
+            .result(
+                "coder",
+                TaskResult {
+                    delegation_id: id2,
+                    detail: "coder done".into(),
+                    summary: "coder done".into(),
+                    done: true,
+                    reply: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // 链头回到 manager 的委托
+        assert_eq!(board.chain.read().await.head, 1);
+
+        // manager finish 回到根
+        board
+            .result(
+                "manager",
+                TaskResult {
+                    delegation_id: id1,
+                    detail: "manager done".into(),
+                    summary: "manager done".into(),
+                    done: true,
+                    reply: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(board.chain.read().await.head, 0);
+    }
+}
