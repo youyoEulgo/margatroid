@@ -144,6 +144,7 @@ pub struct DelegationBoard {
     publish: RwLock<Vec<DelegationTask>>,
     db: Arc<SqliteMemory>,
     chain: RwLock<TaskChain>,
+    cached_worklog: RwLock<String>,
     system_prompt: String,
     member_roster: String,
     events: RwLock<HashMap<String, broadcast::Sender<String>>>,
@@ -154,6 +155,7 @@ pub struct DelegationBoard {
 
 impl DelegationBoard {
     pub fn new(db: Arc<SqliteMemory>, system_prompt: String, member_roster: String) -> Self {
+        let init_worklog = Self::format_worklog(&db);
         Self {
             publish: RwLock::new(Vec::new()),
             chain: RwLock::new(TaskChain::new(DelegationTask {
@@ -167,6 +169,7 @@ impl DelegationBoard {
             db,
             system_prompt,
             member_roster,
+            cached_worklog: RwLock::new(init_worklog),
             events: RwLock::new(HashMap::new()),
             notifies: RwLock::new(HashMap::new()),
         }
@@ -228,16 +231,7 @@ impl DelegationBoard {
     pub async fn assemble_prompt(&self, soul: &str, memories: &str) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
 
-        // 1. 人格提示词（system 消息）
-        messages.push(ChatMessage {
-            role: Role::System,
-            content: MessageContent::Text(soul.to_string()),
-            name: None,
-            tool_calls: None,
-            reasoning_content: None,
-        });
-
-        // 2. 系统提示词
+        // 1. 系统提示词（最前面）
         if !self.system_prompt.is_empty() {
             messages.push(ChatMessage {
                 role: Role::User,
@@ -248,7 +242,7 @@ impl DelegationBoard {
             });
         }
 
-        // 2.5. 团队成员名录
+        // 2. 团队成员名录
         if !self.member_roster.is_empty() {
             messages.push(ChatMessage {
                 role: Role::User,
@@ -259,7 +253,21 @@ impl DelegationBoard {
             });
         }
 
-        // 3. 委托链上下文
+        // 3. 团队工作日志（内存缓存，根委托完成时刷新）
+        {
+            let worklog = self.cached_worklog.read().await;
+            if !worklog.is_empty() {
+                messages.push(ChatMessage {
+                    role: Role::User,
+                    content: MessageContent::Text(format!("--- 团队工作日志 ---\n{}", *worklog)),
+                    name: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                });
+            }
+        }
+
+        // 4. 委托链上下文
         let chain = self.chain.read().await;
         let chain_text = Self::format_chain(&chain);
         messages.push(ChatMessage {
@@ -270,19 +278,16 @@ impl DelegationBoard {
             reasoning_content: None,
         });
 
-        // 4. 团队工作日志
-        let worklog = Self::format_worklog(&self.db);
-        if !worklog.is_empty() {
-            messages.push(ChatMessage {
-                role: Role::User,
-                content: MessageContent::Text(format!("--- 团队工作日志 ---\n{}", worklog)),
-                name: None,
-                tool_calls: None,
-                reasoning_content: None,
-            });
-        }
+        // 5. 人格提示词（system 消息，工作日志后面、个人记忆前面）
+        messages.push(ChatMessage {
+            role: Role::System,
+            content: MessageContent::Text(soul.to_string()),
+            name: None,
+            tool_calls: None,
+            reasoning_content: None,
+        });
 
-        // 5. 个人记忆
+        // 6. 个人记忆
         if !memories.is_empty() {
             messages.push(ChatMessage {
                 role: Role::User,
@@ -293,7 +298,7 @@ impl DelegationBoard {
             });
         }
 
-        // 6. 当前任务
+        // 7. 当前任务（永远最后）
         if let Some(task) = chain.current_task() {
             let mut task_desc = format!("当前任务: {}", task.brief);
             if !task.detail.is_empty() {
@@ -463,7 +468,10 @@ impl DelegationBoard {
         // 唤醒上级（链头已左移，新链头指向父委托的承接者）
         if let Some(task) = self.chain.read().await.current_task() {
             if !task.id.is_empty() {
-                self.notify_member(&task.to);
+                self.notify_member(&task.to).await;
+            } else {
+                // 根委托完成，刷新工作日志缓存
+                *self.cached_worklog.write().await = Self::format_worklog(&self.db);
             }
         }
 

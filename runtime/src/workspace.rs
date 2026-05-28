@@ -7,8 +7,8 @@
 use anyhow::Result;
 use sandbox::SandboxManager;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use types::{ComposeFile, RequestTool};
 
@@ -295,11 +295,7 @@ async fn execute_task(agent: &dyn Agent, board: &DelegationBoard, tools: &[Reque
             // 提取 / 递增重试计数
             let (retries, inner_detail) = parse_retry(&task.detail);
             if retries >= MAX_RETRIES {
-                tracing::warn!(
-                    "任务 '{}' 已达最大重试次数 {}，放弃",
-                    task.id,
-                    MAX_RETRIES
-                );
+                tracing::warn!("任务 '{}' 已达最大重试次数 {}，放弃", task.id, MAX_RETRIES);
                 return;
             }
             let detail = format!("[RETRY:{}] {}", retries + 1, inner_detail);
