@@ -233,10 +233,7 @@ impl DelegationBoard {
         if !self.member_roster.is_empty() {
             messages.push(ChatMessage {
                 role: Role::User,
-                content: MessageContent::Text(format!(
-                    "--- 团队成员 ---\n{}",
-                    self.member_roster,
-                )),
+                content: MessageContent::Text(format!("--- 团队成员 ---\n{}", self.member_roster,)),
                 name: None,
                 tool_calls: None,
                 reasoning_content: None,
@@ -262,7 +259,7 @@ impl DelegationBoard {
                 content: MessageContent::Text(format!("--- 团队工作日志 ---\n{}", worklog)),
                 name: None,
                 tool_calls: None,
-            reasoning_content: None,
+                reasoning_content: None,
             });
         }
 
@@ -273,7 +270,7 @@ impl DelegationBoard {
                 content: MessageContent::Text(format!("--- 你的相关记忆 ---\n{}", memories)),
                 name: None,
                 tool_calls: None,
-            reasoning_content: None,
+                reasoning_content: None,
             });
         }
 
@@ -288,7 +285,7 @@ impl DelegationBoard {
                 content: MessageContent::Text(task_desc),
                 name: None,
                 tool_calls: None,
-            reasoning_content: None,
+                reasoning_content: None,
             });
         }
 
@@ -411,13 +408,10 @@ impl DelegationBoard {
     }
     */
 
-    /// 成员从发布区领取任务
+    /// 查询发布区中匹配成员的委托（不修改发布区）
     pub async fn take(&self, member_id: &str) -> Option<DelegationTask> {
-        let mut publish = self.publish.write().await;
-        publish
-            .iter()
-            .position(|t| t.to == member_id)
-            .map(|pos| publish.remove(pos))
+        let publish = self.publish.read().await;
+        publish.iter().find(|t| t.to == member_id).cloned()
     }
 
     /// 产出结果：链追加 Outcome；done 时从发布区移除
