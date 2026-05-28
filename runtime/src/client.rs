@@ -5,8 +5,7 @@ use futures::StreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
 use types::{
-    ChatRequest, ChatResponse, DynAiProvider, RequestMessage, RequestTool,
-    message::MessageContent,
+    ChatRequest, ChatResponse, DynAiProvider, RequestMessage, RequestTool, message::MessageContent,
 };
 
 pub struct Client {
@@ -50,7 +49,7 @@ impl Client {
         };
 
         if self.verbose {
-            log_request(&self.model, &req.messages, tools);
+            verbose_request(&self.model, &req.messages, tools);
         }
         tracing::debug!(
             "raw request: {}",
@@ -60,7 +59,7 @@ impl Client {
         let resp = self.provider.chat_boxed(req).await?;
 
         if self.verbose {
-            log_response(&self.model, &resp);
+            verbose_response(&self.model, &resp);
         }
         tracing::debug!(
             "raw response: {}",
@@ -96,7 +95,7 @@ impl Client {
         };
 
         if self.verbose {
-            log_request(&self.model, &req.messages, tools);
+            verbose_request(&self.model, &req.messages, tools);
         }
         tracing::debug!(
             "raw request: {}",
@@ -109,7 +108,6 @@ impl Client {
                 Ok(Box::pin(s))
             }
             Err(e) => {
-                tracing::debug!("raw error, falling back: {}", e);
                 tracing::warn!("stream failed, falling back: {}", e);
                 let req2 = ChatRequest {
                     model: self.model.clone(),
@@ -125,11 +123,11 @@ impl Client {
                 };
                 let resp = self.provider.chat_boxed(req2).await?;
                 let json = serde_json::to_string(&resp)?;
-                tracing::debug!("raw fallback response: {}", json);
 
                 if self.verbose {
-                    log_response(&self.model, &resp);
+                    verbose_response(&self.model, &resp);
                 }
+                tracing::debug!("raw fallback response: {}", json);
 
                 Ok(Box::pin(futures::stream::once(async { Ok(json) })))
             }
@@ -137,9 +135,9 @@ impl Client {
     }
 }
 
-// ── Verbose helpers ──
+// ── verbose 输出（tracing::info!，需 --verbose 开启） ──
 
-fn log_request(model: &str, messages: &[RequestMessage], tools: &[RequestTool]) {
+fn verbose_request(model: &str, messages: &[RequestMessage], tools: &[RequestTool]) {
     let mut out = String::new();
     for m in messages {
         match m {
@@ -168,33 +166,37 @@ fn log_request(model: &str, messages: &[RequestMessage], tools: &[RequestTool]) 
         out.push_str(&format!("  {}\n", t.function.name));
     }
     tracing::info!(
-        "[DEBUG] → LLM | model={} | {} msgs:\n{}",
+        "→ LLM | model={} | {} msgs:\n{}",
         model,
         messages.len(),
         out,
     );
 }
 
-fn log_response(model: &str, resp: &ChatResponse) {
+fn verbose_response(model: &str, resp: &ChatResponse) {
     if let Some(c) = resp.choices.first() {
         let text = c.message.content.as_deref().unwrap_or("(none)");
         let tokens = resp.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
         let mut out = format!(
-            "[DEBUG] ← LLM | model={} | tokens={} | finish={:?}\n",
+            "← LLM | model={} | tokens={} | finish={:?}\n",
             model, tokens, c.finish_reason,
         );
         out.push_str(&format!("  text: {}\n", truncate(text, 200)));
         if let Some(tcs) = &c.message.tool_calls {
             out.push_str("  tool_calls:\n");
             for tc in tcs {
-                out.push_str(&format!("    {}({})\n", tc.function.name, format_args(&tc.function.arguments)));
+                out.push_str(&format!(
+                    "    {}({})\n",
+                    tc.function.name,
+                    verbose_args(&tc.function.arguments)
+                ));
             }
         }
         tracing::info!("{}", out);
     }
 }
 
-fn format_args(json: &str) -> String {
+fn verbose_args(json: &str) -> String {
     let v: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(_) => return truncate(json, 80),
@@ -215,19 +217,26 @@ fn format_args(json: &str) -> String {
     }
 }
 
-pub fn log_stream_end(text: &str, tool_calls_json: &str) {
-    if text.is_empty() && tool_calls_json.is_empty() {
-        return;
-    }
-    tracing::info!(
-        "[DEBUG] ← LLM stream end | text: {}\ntool_calls: {}",
-        truncate(text, 300),
-        if tool_calls_json.is_empty() {
-            "(none)"
+pub fn verbose_stream_done(text: &str, tool_calls: &str) {
+    let mut out = format!("stream done | text_len={}", text.len());
+    if !text.is_empty() {
+        let s = text.replace('\n', "\\n");
+        let preview = if s.len() > 200 {
+            let cut: String = s
+                .char_indices()
+                .take_while(|(i, _)| *i < 200)
+                .map(|(_, c)| c)
+                .collect();
+            format!("{}...", cut)
         } else {
-            tool_calls_json
-        },
-    );
+            s
+        };
+        out.push_str(&format!("\n  text: {}", preview));
+    }
+    if !tool_calls.is_empty() {
+        out.push_str(&format!("\n  tool_calls: {}", tool_calls));
+    }
+    tracing::info!("{}", out);
 }
 
 fn truncate(s: &str, max: usize) -> String {

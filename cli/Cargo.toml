@@ -18,8 +18,10 @@ axum = "0.8"
 
 assets = { path = "../assets" }
 compose = { path = "../compose" }
+paths = { path = "../paths" }
 providers = { path = "../providers" }
 runtime = { path = "../runtime" }
 server = { path = "../server" }
 types = { path = "../types" }
 sandbox = { path = "../sandbox" }
+toml = "0.8"

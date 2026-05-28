@@ -146,6 +146,7 @@ pub struct AgentEntry {
     pub agent: Arc<dyn Agent>,
     pub soul: String,
     pub tools: Vec<RequestTool>,
+    pub skills: Vec<String>,
 }
 
 pub struct Workspace {
@@ -167,9 +168,26 @@ impl Workspace {
         let db_path = memory_path(compose);
         let db = Arc::new(SqliteMemory::open(&db_path)?);
 
+        let mut roster = String::new();
+        for entry in &entries {
+            let id = entry.agent.id();
+            let identity = entry.agent.identity();
+            let id_str = match identity {
+                types::Identity::Manager => format!("- {} (经理)", id),
+                types::Identity::Member => format!("- {} (成员)", id),
+                types::Identity::User => continue,
+            };
+            roster.push_str(&id_str);
+            if !entry.skills.is_empty() {
+                roster.push_str(&format!(" — 技能: {}", entry.skills.join(", ")));
+            }
+            roster.push('\n');
+        }
+
         let board = Arc::new(DelegationBoard::new(
             db.clone(),
             compose.workspace.system_prompt.clone(),
+            roster,
         ));
         let shutdown = Arc::new(AtomicBool::new(false));
 
