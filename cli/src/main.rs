@@ -191,10 +191,6 @@ async fn cmd_compose_up(path: &str, verbose: bool) -> Result<()> {
             .get(&agent_ref.id)
             .ok_or_else(|| anyhow::anyhow!("member '{}' not found in library", agent_ref.id))?;
 
-        if def.identity == types::Identity::User {
-            continue;
-        }
-
         let provider = providers::resolve(&def.provider, &app_config.ai)?;
         let client = runtime::Client::new(def.model.clone(), provider, verbose);
 

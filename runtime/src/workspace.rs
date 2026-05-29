@@ -254,17 +254,27 @@ async fn execute_task(agent: &dyn Agent, board: &DelegationBoard, tools: &[Reque
     const MAX_RETRIES: u32 = 3;
 
     // 从任务链读取当前委托
-    let task = match board.chain_snapshot().await.current_task().cloned() {
+    let task_chain = board.chain_snapshot().await;
+    let task = match task_chain.current_task().cloned() {
         Some(t) if t.to == agent.id() && !t.id.is_empty() => t,
         _ => return,
     };
 
-    tracing::info!(
-        "成员 '{}' 领取任务 '{}': {}",
-        agent.id(),
-        task.id,
-        task.brief
-    );
+    if task_chain.has_outcome() {
+        tracing::info!(
+            "processing | {} → {} | {}",
+            task.from,
+            task.to,
+            task.brief,
+        );
+    } else {
+        tracing::info!(
+            "delegation | {} → {} | {}",
+            task.from,
+            task.to,
+            task.brief,
+        );
+    }
 
     match agent.process(board, tools).await {
         Ok(outcome) => {
