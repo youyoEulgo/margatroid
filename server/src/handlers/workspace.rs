@@ -14,6 +14,16 @@ use crate::state::{AnyhowError, AppState};
 
 // ── 请求体 ──
 
+/// GET /ws — 列出所有运行中的 workspace
+pub async fn list(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AnyhowError> {
+    let names = state.list_workspace_names().await;
+    Ok(Json(serde_json::json!({ "workspaces": names })))
+}
+
+// ── 请求体 ──
+
 #[derive(Debug, Deserialize)]
 pub struct ChatBody {
     pub brief: String,
