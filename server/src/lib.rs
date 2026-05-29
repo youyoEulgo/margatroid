@@ -31,6 +31,7 @@ pub async fn serve(state: AppState) -> Result<()> {
         .with_state(pending);
 
     let ws_routes = Router::new()
+        .route("/ws", get(handlers::workspace::list))
         .route("/ws/{name}/chat", post(handlers::workspace::chat))
         .route("/ws/{name}/status", get(handlers::workspace::status))
         .route("/ws/{name}/tasks", get(handlers::workspace::tasks))

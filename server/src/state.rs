@@ -109,6 +109,19 @@ impl AppState {
         self.workspaces.read().await.get(name).cloned()
     }
 
+    /// 列出所有运行中的 workspace 名称
+    pub async fn list_workspace_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .workspaces
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
     /// 启动 workspace 并注册到服务器
     pub async fn start_workspace(
         &self,
