@@ -138,22 +138,6 @@ impl AppState {
 
         let ws = Arc::new(runtime::Workspace::start(compose, entries).await?);
 
-        // 后台轮询日志（仅在变动时输出）
-        let ws_clone = ws.clone();
-        let ws_name = name.clone();
-        tokio::spawn(async move {
-            let mut last = 0usize;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let status = ws_clone.board.status().await;
-                let cur = status.publish_count;
-                if cur != last {
-                    tracing::info!("workspace '{}' board: publish={}", ws_name, cur);
-                    last = cur;
-                }
-            }
-        });
-
         self.workspaces.write().await.insert(name, ws);
         Ok(())
     }

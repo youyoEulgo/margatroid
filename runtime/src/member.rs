@@ -94,7 +94,6 @@ impl Member {
 
         // 主 tool-call loop
         let final_content = loop {
-            tracing::info!("→ LLM | {}", self.id);
             let mut stream = self.client.chat_stream(messages.clone(), tools).await?;
 
             let mut full_content = String::new();
@@ -337,6 +336,12 @@ async fn execute_finish(
         .unwrap_or("(无摘要)");
     let detail = args.get("detail").and_then(|v| v.as_str()).unwrap_or("");
 
+    let task_from = board
+        .chain_snapshot()
+        .await
+        .current_task()
+        .map(|t| t.from.clone())
+        .unwrap_or_default();
     let delegation_id = board
         .chain_snapshot()
         .await
@@ -359,9 +364,12 @@ async fn execute_finish(
         .await
     {
         Ok(()) => {
+            let short_did = &did[..did.len().min(8)];
             tracing::info!(
-                "publish done | did={}",
-                &did[..did.len().min(8)]
+                "finish | {} ← {} | did={}",
+                task_from,
+                from,
+                short_did,
             );
             board.publish_raw(&did, r#"{"type":"done"}"#).await;
             format!("完成。摘要: {}", summary)

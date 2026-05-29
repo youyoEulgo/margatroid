@@ -110,6 +110,13 @@ impl TaskChain {
         }
     }
 
+    /// 当前链头上的委托是否已有产出（用在 execute_task 里区分初执/续执）
+    pub fn has_outcome(&self) -> bool {
+        self.entries.iter().any(|e| {
+            matches!(e, ChainEntry::Outcome { delegate_idx, .. } if *delegate_idx == self.head)
+        })
+    }
+
     /// 根据 ChainEntry 类型自动写入 worklog：
     /// Delegate → insert 新行，Outcome → update summary
     fn worklog_record(&self, entry: &ChainEntry, db: &SqliteMemory) -> Result<()> {
@@ -411,9 +418,12 @@ impl DelegationBoard {
         // 放掉链锁后再入发布区
         if let Some(t) = cloned {
             let target = t.to.clone();
+            let from = t.from.clone();
             let mut publish = self.publish.write().await;
             publish.push(t);
+            let cur = publish.len();
             drop(publish);
+            tracing::info!("board: publish={} | from={} → to={}", cur, from, target);
             self.notify_member(&target).await;
         }
 
@@ -463,6 +473,7 @@ impl DelegationBoard {
             .position(|t| t.id == task_id && t.to == member_id)
         {
             tasks.remove(pos);
+            tracing::info!("board: publish={} | archived by {}", tasks.len(), member_id);
         }
 
         // 唤醒上级（链头已左移，新链头指向父委托的承接者）
@@ -689,5 +700,148 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(board.chain.read().await.head, 0);
+    }
+
+    #[tokio::test]
+    async fn test_chain_multi_level_delegate() {
+        let board = test_board();
+
+        // user → manager
+        let id1 = board
+            .offer("user", "manager", "顶层任务", "", None)
+            .await
+            .unwrap();
+
+        // manager → coder
+        board
+            .result(
+                "manager",
+                TaskResult {
+                    delegation_id: id1.clone(),
+                    detail: "分派中".into(),
+                    summary: "分派".into(),
+                    done: false,
+                    reply: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let id2 = board
+            .offer("manager", "coder", "子任务", "", Some(&id1))
+            .await
+            .unwrap();
+
+        // coder → reviewer
+        board
+            .result(
+                "coder",
+                TaskResult {
+                    delegation_id: id2.clone(),
+                    detail: "再次分派".into(),
+                    summary: "再次分派".into(),
+                    done: false,
+                    reply: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let id3 = board
+            .offer("coder", "reviewer", "孙任务", "", Some(&id2))
+            .await
+            .unwrap();
+
+        // reviewer finish → 回到 coder
+        board
+            .result(
+                "reviewer",
+                TaskResult {
+                    delegation_id: id3,
+                    detail: "审查完成".into(),
+                    summary: "审查完成".into(),
+                    done: true,
+                    reply: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(board.chain.read().await.head, 3); // 回到 coder 的委托
+
+        // coder finish → 回到 manager
+        board
+            .result(
+                "coder",
+                TaskResult {
+                    delegation_id: id2,
+                    detail: "编码完成".into(),
+                    summary: "编码完成".into(),
+                    done: true,
+                    reply: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(board.chain.read().await.head, 1); // 回到 manager 的委托
+
+        // manager finish → 回到根
+        board
+            .result(
+                "manager",
+                TaskResult {
+                    delegation_id: id1,
+                    detail: "全部完成".into(),
+                    summary: "全部完成".into(),
+                    done: true,
+                    reply: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(board.chain.read().await.head, 0); // 回到根
+        assert!(board.chain.read().await.current_task().unwrap().id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_worklog_cache_refresh_on_root_done() {
+        let board = test_board();
+
+        // 初始缓存为空
+        assert!(board.cached_worklog.read().await.is_empty());
+
+        let id = board
+            .offer("user", "manager", "测试任务", "", None)
+            .await
+            .unwrap();
+
+        // 中间委托不刷新缓存
+        board
+            .result(
+                "manager",
+                TaskResult {
+                    delegation_id: id.clone(),
+                    detail: "中间产出".into(),
+                    summary: "中间".into(),
+                    done: false,
+                    reply: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(board.cached_worklog.read().await.is_empty());
+
+        // 根完成 → 缓存刷新
+        board
+            .result(
+                "manager",
+                TaskResult {
+                    delegation_id: id,
+                    detail: "完成".into(),
+                    summary: "完成".into(),
+                    done: true,
+                    reply: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!board.cached_worklog.read().await.is_empty());
     }
 }
