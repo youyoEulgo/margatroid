@@ -165,7 +165,7 @@ pub async fn stream(
         }
     };
 
-    let rx = match ws.board.register_listener("workspace_stream").await {
+    let rx = match ws.board.register_listener(types::event_index::CH_WORKSPACE_STREAM).await {
         Some(rx) => rx,
         None => {
             return Sse::new(Box::pin(futures::stream::once(async {

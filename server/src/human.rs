@@ -14,7 +14,7 @@ use tokio::sync::Notify;
 use tracing::info;
 use types::{ChatResponse, RequestMessage, RequestTool};
 
-use crate::state::{AppState, AnyhowError, PendingMap, PendingTask};
+use crate::state::{AppState, PendingTask};
 
 // ── 请求/响应体 ──
 
@@ -62,11 +62,11 @@ pub async fn create_request(
     // 推送 human_request 事件到前端
     if !body.workspace.is_empty() {
         if let Some(ws) = state.workspace(&body.workspace).await {
-            let event = format!(
-                r#"{{"type":"human_request","session_id":"{}"}}"#,
-                session_id,
-            );
-            ws.board.publish_raw("workspace_stream", &event).await;
+            let event = types::events::HumanRequestEvent::new(session_id.clone());
+            let json = serde_json::to_string(&event).unwrap_or_default();
+            ws.board
+                .publish_raw(types::event_index::CH_WORKSPACE_STREAM, &json)
+                .await;
         }
     }
 

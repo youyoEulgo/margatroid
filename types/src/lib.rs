@@ -1,6 +1,8 @@
 pub mod bridge;
 pub mod compose;
 pub mod config;
+pub mod event_index;
+pub mod events;
 pub mod mcp;
 pub mod member;
 pub mod message;
