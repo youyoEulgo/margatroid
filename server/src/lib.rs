@@ -36,8 +36,15 @@ pub async fn serve(state: AppState) -> Result<()> {
         .route("/ws/{name}/status", get(handlers::workspace::status))
         .route("/ws/{name}/tasks", get(handlers::workspace::tasks))
         .route("/ws/{name}/recent", get(handlers::workspace::recent))
-        .route("/ws/{name}/conversation", get(handlers::workspace::conversation))
-        .route("/ws/{name}/events/{task_id}", get(handlers::workspace::events))
+        .route(
+            "/ws/{name}/conversation",
+            get(handlers::workspace::conversation),
+        )
+        .route(
+            "/ws/{name}/events/{task_id}",
+            get(handlers::workspace::events),
+        )
+        .route("/ws/{name}/stream", get(handlers::workspace::stream))
         .with_state(state.clone());
 
     let app = Router::new()

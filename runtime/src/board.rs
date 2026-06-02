@@ -112,9 +112,9 @@ impl TaskChain {
 
     /// 当前链头上的委托是否已有产出（用在 execute_task 里区分初执/续执）
     pub fn has_outcome(&self) -> bool {
-        self.entries.iter().any(|e| {
-            matches!(e, ChainEntry::Outcome { delegate_idx, .. } if *delegate_idx == self.head)
-        })
+        self.entries.iter().any(
+            |e| matches!(e, ChainEntry::Outcome { delegate_idx, .. } if *delegate_idx == self.head),
+        )
     }
 
     /// 根据 ChainEntry 类型自动写入 worklog：
@@ -177,7 +177,12 @@ impl DelegationBoard {
             system_prompt,
             member_roster,
             cached_worklog: RwLock::new(init_worklog),
-            events: RwLock::new(HashMap::new()),
+            events: {
+                let mut map = HashMap::new();
+                let (tx, _) = broadcast::channel(32);
+                map.insert("ws_stream".into(), tx);
+                RwLock::new(map)
+            },
             notifies: RwLock::new(HashMap::new()),
         }
     }
@@ -232,6 +237,15 @@ impl DelegationBoard {
     /// 获取任务链快照（只读克隆，供 Prompt 使用）
     pub async fn chain_snapshot(&self) -> TaskChain {
         self.chain.read().await.clone()
+    }
+
+    /// 推送 workspace 状态事件到前端统一通道
+    async fn push_ws_status(&self, publish_count: usize) {
+        let event = format!(
+            r#"{{"type":"board_update","publish_count":{}}}"#,
+            publish_count
+        );
+        self.publish_raw("ws_stream", &event).await;
     }
 
     /// 组装 LLM 上下文消息（替代原 Prompt::format）
@@ -424,6 +438,7 @@ impl DelegationBoard {
             let cur = publish.len();
             drop(publish);
             tracing::info!("board: publish={} | from={} → to={}", cur, from, target);
+            self.push_ws_status(cur).await;
             self.notify_member(&target).await;
         }
 
@@ -473,7 +488,10 @@ impl DelegationBoard {
             .position(|t| t.id == task_id && t.to == member_id)
         {
             tasks.remove(pos);
-            tracing::info!("board: publish={} | archived by {}", tasks.len(), member_id);
+            let cur = tasks.len();
+            tracing::info!("board: publish={} | archived by {}", cur, member_id);
+            drop(tasks);
+            self.push_ws_status(cur).await;
         }
 
         // 唤醒上级（链头已左移，新链头指向父委托的承接者）
@@ -797,7 +815,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(board.chain.read().await.head, 0); // 回到根
-        assert!(board.chain.read().await.current_task().unwrap().id.is_empty());
+        assert!(
+            board
+                .chain
+                .read()
+                .await
+                .current_task()
+                .unwrap()
+                .id
+                .is_empty()
+        );
     }
 
     #[tokio::test]
