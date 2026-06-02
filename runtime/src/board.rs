@@ -180,7 +180,9 @@ impl DelegationBoard {
             events: {
                 let mut map = HashMap::new();
                 let (tx, _) = broadcast::channel(32);
-                map.insert("workspace_stream".into(), tx);
+                map.insert(types::event_index::CH_RAW_EVENTS.into(), tx);
+                let (tx, _) = broadcast::channel(32);
+                map.insert(types::event_index::CH_WORKSPACE_STREAM.into(), tx);
                 RwLock::new(map)
             },
             notifies: RwLock::new(HashMap::new()),
@@ -201,14 +203,6 @@ impl DelegationBoard {
             .await
             .get(delegation_id)
             .map(|tx| tx.subscribe())
-    }
-
-    /// 推送一条原始数据到指定 delegation
-    pub async fn publish_raw(&self, delegation_id: &str, data: &str) {
-        let map = self.events.read().await;
-        if let Some(tx) = map.get(delegation_id) {
-            let _ = tx.send(data.to_string());
-        }
     }
 
     /// 成员阻塞等待直到链头指向自己
@@ -239,13 +233,23 @@ impl DelegationBoard {
         self.chain.read().await.clone()
     }
 
-    /// 推送事件到前端统一通道（高频 chat 仍走 per-task channel）
-    async fn push_workspace_status(&self, publish_count: usize) {
-        let event = format!(
-            r#"{{"type":"board_update","publish_count":{}}}"#,
-            publish_count
-        );
-        self.publish_raw("workspace_stream", &event).await;
+    /// 通知 server 层有事件发生（server 负责从 state 构造完整消息并推送）
+    /// payload 格式: "event_name\noptional_data"
+    async fn trigger_event(&self, event_name: &str, data: &str) {
+        let payload = if data.is_empty() {
+            event_name.to_string()
+        } else {
+            format!("{}\n{}", event_name, data)
+        };
+        self.publish_raw(types::event_index::CH_RAW_EVENTS, &payload).await;
+    }
+
+    /// 推送一条原始数据到指定 delegation
+    pub async fn publish_raw(&self, delegation_id: &str, data: &str) {
+        let map = self.events.read().await;
+        if let Some(tx) = map.get(delegation_id) {
+            let _ = tx.send(data.to_string());
+        }
     }
 
     /// 组装 LLM 上下文消息（替代原 Prompt::format）
@@ -438,7 +442,7 @@ impl DelegationBoard {
             let cur = publish.len();
             drop(publish);
             tracing::info!("board: publish={} | from={} → to={}", cur, from, target);
-            self.push_workspace_status(cur).await;
+            self.trigger_event(types::event_index::EVT_BOARD_UPDATE, &cur.to_string()).await;
             self.notify_member(&target).await;
         }
 
@@ -491,7 +495,7 @@ impl DelegationBoard {
             let cur = tasks.len();
             tracing::info!("board: publish={} | archived by {}", cur, member_id);
             drop(tasks);
-            self.push_workspace_status(cur).await;
+            self.trigger_event(types::event_index::EVT_BOARD_UPDATE, &cur.to_string()).await;
         }
 
         // 唤醒上级（链头已左移，新链头指向父委托的承接者）
