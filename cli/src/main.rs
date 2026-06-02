@@ -191,28 +191,70 @@ async fn cmd_compose_up(path: &str, verbose: bool) -> Result<()> {
             .get(&agent_ref.id)
             .ok_or_else(|| anyhow::anyhow!("member '{}' not found in library", agent_ref.id))?;
 
-        let provider = providers::resolve(&def.provider, &app_config.ai)?;
-        let client = runtime::Client::new(def.model.clone(), provider, verbose);
-
-        let is_manager = def.identity == types::Identity::Manager;
-        let member = Arc::new(runtime::Member::new(
-            &def.id,
-            def.soul.clone(),
-            def.identity.clone(),
-            client,
-            sandbox.clone(),
-        ));
-
-        entries.push(runtime::AgentEntry {
-            agent: member,
-            soul: def.soul.clone(),
-            tools: if is_manager {
-                runtime::manager_tools()
-            } else {
-                runtime::base_tools()
-            },
-            skills: def.skills.clone(),
-        });
+        match def.identity {
+            types::Identity::Manager => {
+                let provider = providers::resolve(&def.provider, &app_config.ai)?;
+                let client = runtime::Client::new(def.model.clone(), provider, verbose);
+                let member = Arc::new(runtime::Member::new(
+                    &def.id,
+                    def.soul.clone(),
+                    def.identity.clone(),
+                    client,
+                    sandbox.clone(),
+                ));
+                entries.push(runtime::AgentEntry {
+                    agent: member,
+                    soul: def.soul.clone(),
+                    tools: runtime::manager_tools(),
+                    skills: def.skills.clone(),
+                });
+            }
+            types::Identity::Member => {
+                let provider = providers::resolve(&def.provider, &app_config.ai)?;
+                let client = runtime::Client::new(def.model.clone(), provider, verbose);
+                let member = Arc::new(runtime::Member::new(
+                    &def.id,
+                    def.soul.clone(),
+                    def.identity.clone(),
+                    client,
+                    sandbox.clone(),
+                ));
+                entries.push(runtime::AgentEntry {
+                    agent: member,
+                    soul: def.soul.clone(),
+                    tools: runtime::base_tools(),
+                    skills: def.skills.clone(),
+                });
+            }
+            types::Identity::User => {
+                let provider_config = app_config
+                    .ai
+                    .providers
+                    .iter()
+                    .find(|p| p.name == "human" && p.enabled)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("human provider not found for user member")
+                    })?;
+                let provider = Arc::new(providers::human::HumanProvider::new(
+                    provider_config.base_url.clone(),
+                    compose.workspace.name.clone(),
+                )) as Arc<dyn providers::DynAiProvider>;
+                let client = runtime::Client::new(def.model.clone(), provider, verbose);
+                let member = Arc::new(runtime::Member::new(
+                    &def.id,
+                    def.soul.clone(),
+                    def.identity.clone(),
+                    client,
+                    sandbox.clone(),
+                ));
+                entries.push(runtime::AgentEntry {
+                    agent: member,
+                    soul: def.soul.clone(),
+                    tools: runtime::base_tools(),
+                    skills: def.skills.clone(),
+                });
+            }
+        }
     }
 
     let ws_name = compose.workspace.name.clone();
