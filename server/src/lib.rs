@@ -30,21 +30,21 @@ pub async fn serve(state: AppState) -> Result<()> {
         .route("/api/human/request/{id}/reply", post(human::submit_reply))
         .with_state(pending);
 
-    let ws_routes = Router::new()
-        .route("/ws", get(handlers::workspace::list))
-        .route("/ws/{name}/chat", post(handlers::workspace::chat))
-        .route("/ws/{name}/status", get(handlers::workspace::status))
-        .route("/ws/{name}/tasks", get(handlers::workspace::tasks))
-        .route("/ws/{name}/recent", get(handlers::workspace::recent))
+    let workspace_routes = Router::new()
+        .route("/workspace", get(handlers::workspace::list))
+        .route("/workspace/{name}/chat", post(handlers::workspace::chat))
+        .route("/workspace/{name}/status", get(handlers::workspace::status))
+        .route("/workspace/{name}/tasks", get(handlers::workspace::tasks))
+        .route("/workspace/{name}/recent", get(handlers::workspace::recent))
         .route(
-            "/ws/{name}/conversation",
+            "/workspace/{name}/conversation",
             get(handlers::workspace::conversation),
         )
         .route(
-            "/ws/{name}/events/{task_id}",
+            "/workspace/{name}/events/{task_id}",
             get(handlers::workspace::events),
         )
-        .route("/ws/{name}/stream", get(handlers::workspace::stream))
+        .route("/workspace/{name}/stream", get(handlers::workspace::stream))
         .with_state(state.clone());
 
     let app = Router::new()
@@ -53,7 +53,7 @@ pub async fn serve(state: AppState) -> Result<()> {
         .route("/v1/stream", post(handlers::stream::stream))
         .route("/v1/providers", get(handlers::providers::list))
         .route("/admin/reload", post(handlers::admin::reload))
-        .merge(ws_routes)
+        .merge(workspace_routes)
         .merge(human_routes)
         .layer(CorsLayer::permissive())
         .with_state(state);
