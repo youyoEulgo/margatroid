@@ -180,7 +180,7 @@ impl DelegationBoard {
             events: {
                 let mut map = HashMap::new();
                 let (tx, _) = broadcast::channel(32);
-                map.insert("ws_stream".into(), tx);
+                map.insert("workspace_stream".into(), tx);
                 RwLock::new(map)
             },
             notifies: RwLock::new(HashMap::new()),
@@ -239,13 +239,13 @@ impl DelegationBoard {
         self.chain.read().await.clone()
     }
 
-    /// 推送 workspace 状态事件到前端统一通道
-    async fn push_ws_status(&self, publish_count: usize) {
+    /// 推送事件到前端统一通道（高频 chat 仍走 per-task channel）
+    async fn push_workspace_status(&self, publish_count: usize) {
         let event = format!(
             r#"{{"type":"board_update","publish_count":{}}}"#,
             publish_count
         );
-        self.publish_raw("ws_stream", &event).await;
+        self.publish_raw("workspace_stream", &event).await;
     }
 
     /// 组装 LLM 上下文消息（替代原 Prompt::format）
@@ -438,7 +438,7 @@ impl DelegationBoard {
             let cur = publish.len();
             drop(publish);
             tracing::info!("board: publish={} | from={} → to={}", cur, from, target);
-            self.push_ws_status(cur).await;
+            self.push_workspace_status(cur).await;
             self.notify_member(&target).await;
         }
 
@@ -491,7 +491,7 @@ impl DelegationBoard {
             let cur = tasks.len();
             tracing::info!("board: publish={} | archived by {}", cur, member_id);
             drop(tasks);
-            self.push_ws_status(cur).await;
+            self.push_workspace_status(cur).await;
         }
 
         // 唤醒上级（链头已左移，新链头指向父委托的承接者）

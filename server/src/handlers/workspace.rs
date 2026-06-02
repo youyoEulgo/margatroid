@@ -33,7 +33,7 @@ pub struct ChatBody {
 
 // ── handlers ──
 
-/// POST /ws/{name}/chat — 以 user 身份向 manager 发消息
+/// POST /workspace/{name}/chat — 以 user 身份向 manager 发消息
 pub async fn chat(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -49,7 +49,7 @@ pub async fn chat(
     Ok(Json(serde_json::json!({ "ok": true, "task_id": task_id })))
 }
 
-/// GET /ws/{name}/status
+/// GET /workspace/{name}/status
 pub async fn status(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -62,7 +62,7 @@ pub async fn status(
     Ok(Json(serde_json::json!({ "publish_count": s.publish_count })))
 }
 
-/// GET /ws/{name}/tasks
+/// GET /workspace/{name}/tasks
 pub async fn tasks(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -74,7 +74,7 @@ pub async fn tasks(
     Ok(Json(serde_json::json!(ws.board.status().await)))
 }
 
-/// GET /ws/{name}/recent — 最近的工作日志（用于前端轮询）
+/// GET /workspace/{name}/recent — 最近的工作日志（用于前端轮询）
 pub async fn recent(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -87,7 +87,7 @@ pub async fn recent(
     Ok(Json(serde_json::json!(entries)))
 }
 
-/// GET /ws/{name}/conversation — 最近的对话消息（用于前端展示 LLM 回复）
+/// GET /workspace/{name}/conversation — 最近的对话消息（用于前端展示 LLM 回复）
 pub async fn conversation(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -100,7 +100,7 @@ pub async fn conversation(
     Ok(Json(serde_json::json!(msgs)))
 }
 
-/// GET /ws/{name}/events/{task_id} — SSE 流，推送 LLM 对话消息和完成事件
+/// GET /workspace/{name}/events/{task_id} — SSE 流，推送 LLM 对话消息和完成事件
 pub async fn events(
     State(state): State<AppState>,
     Path((name, task_id)): Path<(String, String)>,
@@ -151,7 +151,7 @@ pub async fn events(
     Sse::new(stream)
 }
 
-/// GET /ws/{name}/stream — workspace 统一事件流（低频状态，长期保持）
+/// GET /workspace/{name}/stream — workspace 统一事件流（低频状态，长期保持）
 pub async fn stream(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -165,7 +165,7 @@ pub async fn stream(
         }
     };
 
-    let rx = match ws.board.register_listener("ws_stream").await {
+    let rx = match ws.board.register_listener("workspace_stream").await {
         Some(rx) => rx,
         None => {
             return Sse::new(Box::pin(futures::stream::once(async {
