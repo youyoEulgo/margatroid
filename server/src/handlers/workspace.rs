@@ -150,3 +150,37 @@ pub async fn events(
 
     Sse::new(stream)
 }
+
+/// GET /ws/{name}/stream — workspace 统一事件流（低频状态，长期保持）
+pub async fn stream(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Sse<Pin<Box<dyn Stream<Item = Result<Event, std::convert::Infallible>> + Send>>> {
+    let ws = match state.workspace(&name).await {
+        Some(w) => w,
+        None => {
+            return Sse::new(Box::pin(futures::stream::once(async {
+                Ok(Event::default().data(r#"{"type":"error","content":"workspace not found"}"#))
+            })));
+        }
+    };
+
+    let rx = match ws.board.register_listener("ws_stream").await {
+        Some(rx) => rx,
+        None => {
+            return Sse::new(Box::pin(futures::stream::once(async {
+                Ok(Event::default().data(r#"{"type":"error","content":"no stream"}"#))
+            })));
+        }
+    };
+
+    let stream = BroadcastStream::new(rx).map(|item| {
+        let data = match item {
+            Ok(s) => s,
+            Err(_) => r#"{"type":"error","content":"stream lagged"}"#.into(),
+        };
+        Ok(Event::default().data(data))
+    });
+
+    Sse::new(Box::pin(stream))
+}
