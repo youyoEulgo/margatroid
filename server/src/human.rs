@@ -9,28 +9,12 @@ use axum::{
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::Notify;
 use tracing::info;
 use types::{ChatResponse, RequestMessage, RequestTool};
 
-pub struct PendingTask {
-    pub session_id: String,
-    pub messages: Vec<RequestMessage>,
-    pub tools: Vec<RequestTool>,
-    status: String,
-    response: Option<ChatResponse>,
-    notify: Arc<Notify>,
-    created_at: Instant,
-}
-
-pub type PendingMap = Arc<tokio::sync::RwLock<HashMap<String, PendingTask>>>;
-
-pub fn new_pending_map() -> PendingMap {
-    Arc::new(tokio::sync::RwLock::new(HashMap::new()))
-}
+use crate::state::{AppState, AnyhowError, PendingMap, PendingTask};
 
 // ── 请求/响应体 ──
 
@@ -38,6 +22,8 @@ pub fn new_pending_map() -> PendingMap {
 pub struct CreateRequest {
     pub messages: Vec<RequestMessage>,
     pub tools: Vec<RequestTool>,
+    #[serde(default)]
+    pub workspace: String,
 }
 
 #[derive(Serialize)]
@@ -56,7 +42,7 @@ pub struct ReplyBody {
 // ── handlers ──
 
 pub async fn create_request(
-    State(pending): State<PendingMap>,
+    State(state): State<AppState>,
     Json(body): Json<CreateRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -67,11 +53,23 @@ pub async fn create_request(
         status: "pending".to_string(),
         response: None,
         notify: Arc::new(Notify::new()),
-        created_at: Instant::now(),
+        created_at: std::time::Instant::now(),
     };
-    pending.write().await.insert(session_id.clone(), task);
+    state.pending.write().await.insert(session_id.clone(), task);
 
     info!("human request created: {}", &session_id[..8]);
+
+    // 推送 human_request 事件到前端
+    if !body.workspace.is_empty() {
+        if let Some(ws) = state.workspace(&body.workspace).await {
+            let event = format!(
+                r#"{{"type":"human_request","session_id":"{}"}}"#,
+                session_id,
+            );
+            ws.board.publish_raw("workspace_stream", &event).await;
+        }
+    }
+
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -81,11 +79,11 @@ pub async fn create_request(
 }
 
 pub async fn wait_reply(
-    State(pending): State<PendingMap>,
+    State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let notify = {
-        let map = pending.read().await;
+        let map = state.pending.read().await;
         match map.get(&session_id) {
             Some(t) => t.notify.clone(),
             None => {
@@ -100,7 +98,7 @@ pub async fn wait_reply(
     };
     notify.notified().await;
 
-    let map = pending.read().await;
+    let map = state.pending.read().await;
     let task = match map.get(&session_id) {
         Some(t) => t,
         None => {
@@ -128,8 +126,8 @@ pub async fn wait_reply(
     }
 }
 
-pub async fn list_requests(State(pending): State<PendingMap>) -> Json<Vec<PendingItem>> {
-    let map = pending.read().await;
+pub async fn list_requests(State(state): State<AppState>) -> Json<Vec<PendingItem>> {
+    let map = state.pending.read().await;
     let items: Vec<PendingItem> = map
         .iter()
         .filter(|(_, t)| t.status == "pending")
@@ -144,11 +142,11 @@ pub async fn list_requests(State(pending): State<PendingMap>) -> Json<Vec<Pendin
 }
 
 pub async fn submit_reply(
-    State(pending): State<PendingMap>,
+    State(state): State<AppState>,
     Path(session_id): Path<String>,
     Json(body): Json<ReplyBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let mut map = pending.write().await;
+    let mut map = state.pending.write().await;
     let task = match map.get_mut(&session_id) {
         Some(t) => t,
         None => {

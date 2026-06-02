@@ -1,11 +1,26 @@
 use anyhow::{Result, bail};
 use providers::DynAiProvider;
 use runtime;
-use serde::Serialize;
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::{Mutex, Notify, RwLock};
+use types::{ChatResponse, RequestMessage, RequestTool};
 
 use crate::factory;
+
+pub struct PendingTask {
+    pub session_id: String,
+    pub messages: Vec<RequestMessage>,
+    pub tools: Vec<RequestTool>,
+    pub status: String,
+    pub response: Option<ChatResponse>,
+    pub notify: Arc<Notify>,
+    pub created_at: Instant,
+}
+
+pub type PendingMap = Arc<tokio::sync::RwLock<HashMap<String, PendingTask>>>;
 
 /// 对外暴露的 provider 信息（不包含 api_key 等敏感字段）
 #[derive(Debug, Clone, Serialize)]
@@ -26,6 +41,11 @@ pub struct AppState {
     providers: Arc<RwLock<HashMap<String, DynProvider>>>,
     pub config_mgr: Arc<Mutex<assets::Manager>>,
     workspaces: Arc<RwLock<HashMap<String, Arc<runtime::Workspace>>>>,
+    pub pending: PendingMap,
+}
+
+pub fn new_pending_map() -> PendingMap {
+    Arc::new(tokio::sync::RwLock::new(HashMap::new()))
 }
 
 impl AppState {
@@ -50,6 +70,7 @@ impl AppState {
             providers: Arc::new(RwLock::new(providers)),
             config_mgr: Arc::new(Mutex::new(config_mgr)),
             workspaces: Arc::new(RwLock::new(HashMap::new())),
+            pending: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         })
     }
 

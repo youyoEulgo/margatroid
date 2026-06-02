@@ -13,13 +13,15 @@ use types::{ChatRequest, ChatResponse};
 pub struct HumanProvider {
     client: reqwest::Client,
     base_url: String,
+    workspace_name: String,
 }
 
 impl HumanProvider {
-    pub fn new(base_url: String) -> Self {
+    pub fn new(base_url: String, workspace_name: String) -> Self {
         Self {
             client: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
+            workspace_name,
         }
     }
 }
@@ -39,6 +41,7 @@ impl AiProvider for HumanProvider {
             .json(&serde_json::json!({
                 "messages": req.messages,
                 "tools": tools,
+                "workspace": self.workspace_name,
             }))
             .send()
             .await?;

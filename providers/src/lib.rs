@@ -46,7 +46,7 @@ pub fn build(config: &types::config::AiProvider) -> Result<Arc<dyn DynAiProvider
             }
             Ok(Arc::new(client))
         }
-        "human" => Ok(Arc::new(human::HumanProvider::new(config.base_url.clone()))),
+        "human" => Ok(Arc::new(human::HumanProvider::new(config.base_url.clone(), String::new()))),
         other => bail!("unsupported provider type: {}", other),
     }
 }

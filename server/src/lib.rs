@@ -22,13 +22,12 @@ pub async fn serve(state: AppState) -> Result<()> {
         mgr.app_config().server.clone()
     };
 
-    let pending = human::new_pending_map();
     let human_routes = Router::new()
         .route("/api/human/request", post(human::create_request))
         .route("/api/human/request/{id}", get(human::wait_reply))
         .route("/api/human/requests", get(human::list_requests))
         .route("/api/human/request/{id}/reply", post(human::submit_reply))
-        .with_state(pending);
+        .with_state(state.clone());
 
     let workspace_routes = Router::new()
         .route("/workspace", get(handlers::workspace::list))
