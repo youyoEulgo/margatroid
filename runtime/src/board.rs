@@ -9,7 +9,7 @@
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Notify, RwLock, broadcast};
 use types::message::{ChatMessage, MessageContent, Role};
@@ -158,7 +158,9 @@ pub struct DelegationBoard {
     chain: RwLock<TaskChain>,
     cached_worklog: RwLock<String>,
     system_prompt: String,
-    member_roster: String,
+    member_ids: RwLock<HashSet<String>>,
+    /// (id, label, skills) — assemble_prompt 据此渲染团队名录
+    member_profiles: RwLock<Vec<(String, String, Vec<String>)>>,
     events: RwLock<HashMap<String, broadcast::Sender<String>>>,
     notifies: RwLock<HashMap<String, Arc<Notify>>>,
 }
@@ -166,8 +168,13 @@ pub struct DelegationBoard {
 // ── Lifecycle ────────────────────────────────────────────────
 
 impl DelegationBoard {
-    pub fn new(db: Arc<SqliteMemory>, system_prompt: String, member_roster: String) -> Self {
+    pub fn new(
+        db: Arc<SqliteMemory>,
+        system_prompt: String,
+        member_profiles: Vec<(String, String, Vec<String>)>,
+    ) -> Self {
         let init_worklog = Self::format_worklog(&db);
+        let member_ids: HashSet<String> = member_profiles.iter().map(|(id, _, _)| id.clone()).collect();
         Self {
             publish: RwLock::new(Vec::new()),
             chain: RwLock::new(TaskChain::new(DelegationTask {
@@ -180,7 +187,8 @@ impl DelegationBoard {
             })),
             db,
             system_prompt,
-            member_roster,
+            member_ids: RwLock::new(member_ids),
+            member_profiles: RwLock::new(member_profiles),
             cached_worklog: RwLock::new(init_worklog),
             events: {
                 let mut map = HashMap::new();
@@ -273,14 +281,25 @@ impl DelegationBoard {
         }
 
         // 2. 团队成员名录
-        if !self.member_roster.is_empty() {
-            messages.push(ChatMessage {
-                role: Role::User,
-                content: MessageContent::Text(format!("--- 团队成员 ---\n{}", self.member_roster,)),
-                name: None,
-                tool_calls: None,
-                reasoning_content: None,
-            });
+        {
+            let profiles = self.member_profiles.read().await;
+            if !profiles.is_empty() {
+                let mut roster = String::new();
+                for (id, label, skills) in profiles.iter() {
+                    roster.push_str(&format!("- {} ({})", id, label));
+                    if !skills.is_empty() {
+                        roster.push_str(&format!(" — 技能: {}", skills.join(", ")));
+                    }
+                    roster.push('\n');
+                }
+                messages.push(ChatMessage {
+                    role: Role::User,
+                    content: MessageContent::Text(format!("--- 团队成员 ---\n{}", roster)),
+                    name: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                });
+            }
         }
 
         // 3. 团队工作日志（内存缓存，根委托完成时刷新）
@@ -413,6 +432,10 @@ impl DelegationBoard {
         detail: &str,
         parent_id: Option<&str>,
     ) -> Result<String> {
+        if !self.member_ids.read().await.contains(to) {
+            bail!("member '{}' does not exist in this workspace", to);
+        }
+
         let task = DelegationTask::new(from, to, brief, detail, parent_id);
         let id = task.id.clone();
 
@@ -637,7 +660,12 @@ mod tests {
 
     fn test_board() -> DelegationBoard {
         let db = Arc::new(SqliteMemory::open(":memory:").unwrap());
-        DelegationBoard::new(db, String::new(), String::new())
+        let profiles = vec![
+            ("manager".into(), "经理".into(), vec![]),
+            ("coder".into(), "成员".into(), vec![]),
+            ("reviewer".into(), "成员".into(), vec![]),
+        ];
+        DelegationBoard::new(db, String::new(), profiles)
     }
 
     #[tokio::test]
