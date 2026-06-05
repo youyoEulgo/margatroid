@@ -429,6 +429,8 @@ async fn execute_delegate(
         )
         .await;
 
+    board.publish_raw(&parent_id.clone().unwrap_or_default(), r#"{"type":"done"}"#).await;
+
     match board
         .offer(
             from,
