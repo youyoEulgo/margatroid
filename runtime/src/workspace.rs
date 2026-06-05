@@ -168,26 +168,23 @@ impl Workspace {
         let db_path = memory_path(compose);
         let db = Arc::new(SqliteMemory::open(&db_path)?);
 
-        let mut roster = String::new();
+        let mut member_profiles = Vec::new();
         for entry in &entries {
-            let id = entry.agent.id();
+            let id = entry.agent.id().to_string();
             let identity = entry.agent.identity();
-            let id_str = match identity {
-                types::Identity::Manager => format!("- {} (经理)", id),
-                types::Identity::Member => format!("- {} (成员)", id),
-                types::Identity::User => format!("- {} (用户)", id),
-            };
-            roster.push_str(&id_str);
-            if !entry.skills.is_empty() {
-                roster.push_str(&format!(" — 技能: {}", entry.skills.join(", ")));
+            let label = match identity {
+                types::Identity::Manager => "经理",
+                types::Identity::Member => "成员",
+                types::Identity::User => "用户",
             }
-            roster.push('\n');
+            .to_string();
+            member_profiles.push((id, label, entry.skills.clone()));
         }
 
         let board = Arc::new(DelegationBoard::new(
             db.clone(),
             compose.workspace.system_prompt.clone(),
-            roster,
+            member_profiles,
         ));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -261,19 +258,9 @@ async fn execute_task(agent: &dyn Agent, board: &DelegationBoard, tools: &[Reque
     };
 
     if task_chain.has_outcome() {
-        tracing::info!(
-            "processing | {} → {} | {}",
-            task.from,
-            task.to,
-            task.brief,
-        );
+        tracing::info!("processing | {} → {} | {}", task.from, task.to, task.brief,);
     } else {
-        tracing::info!(
-            "delegation | {} → {} | {}",
-            task.from,
-            task.to,
-            task.brief,
-        );
+        tracing::info!("delegation | {} → {} | {}", task.from, task.to, task.brief,);
     }
 
     board
