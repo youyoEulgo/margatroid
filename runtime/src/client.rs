@@ -124,9 +124,6 @@ impl Client {
                 let resp = self.provider.chat_boxed(req2).await?;
                 let json = serde_json::to_string(&resp)?;
 
-                if self.verbose {
-                    verbose_response(&self.model, &resp);
-                }
                 tracing::debug!("raw fallback response: {}", json);
 
                 Ok(Box::pin(futures::stream::once(async { Ok(json) })))
