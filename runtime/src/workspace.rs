@@ -276,6 +276,13 @@ async fn execute_task(agent: &dyn Agent, board: &DelegationBoard, tools: &[Reque
         );
     }
 
+    board
+        .trigger_event(
+            types::event_index::EVENT_MEMBER_STATUS,
+            &format!("{}\nworking", agent.id()),
+        )
+        .await;
+
     match agent.process(board, tools).await {
         Ok(outcome) => {
             tracing::debug!(
@@ -324,6 +331,12 @@ async fn execute_task(agent: &dyn Agent, board: &DelegationBoard, tools: &[Reque
             }
         }
     };
+    board
+        .trigger_event(
+            types::event_index::EVENT_MEMBER_STATUS,
+            &format!("{}\nidle", agent.id()),
+        )
+        .await;
 }
 
 fn parse_retry(detail: &str) -> (u32, &str) {
