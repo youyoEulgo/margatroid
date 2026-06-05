@@ -2,7 +2,7 @@
 
 按优先级排列。
 
-- [ ] memory.rs: std::sync::Mutex 在 async 上下文中阻塞 tokio 线程，改 actor 模式或 spawn_blocking
+- [x] memory.rs: std::sync::Mutex——经评估，短锁无 await 跨越无竞争，不需要改
 - [ ] member.rs: 工具执行函数用 String 编码成功/失败，改为 Result<String, ToolError>
 - [ ] member.rs: execute_finish 中重复 chain_snapshot()，合并为一次
 - [ ] workspace: Arc<AtomicBool> 关停信号改为 CancellationToken，与 bridge 一致
