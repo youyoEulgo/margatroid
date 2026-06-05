@@ -59,12 +59,12 @@ Outcome(d1, "最终版", done:true)   head=0  ← 完成
 任务链驱动调度，发布区降级为前端可视化缓存。
 
 ```
-offer → [发布区(缓存)] + 链新增 Delegate
-链. current_task() → 成员循环读取 → 匹配则执行
+offer → 链新增 Delegate + 发布区(缓存)
+链 current_task() → 成员循环读取 → 匹配则执行
 result(done=true) → 链新增 Outcome + 发布区移除 → 唤醒上级
 ```
 
-- **发布区**：`offer` 写入，`result(done=true)` 移除归档。只读不删（`take()` 为只读查询）。前端轮询 /ws/{name}/status 读取 publish_count
+- **发布区**：`offer` 写入，`result(done=true)` 移除归档。`take()` 为只读查询
 - **调度机制**：`member_loop` 直接读 `chain.current_task()`，当 `task.to == agent.id()` 时领取执行。不再依赖发布区
 - **事件驱动唤醒**：每成员持 `tokio::sync::Notify`。`offer()` 和 `result(done=true)` 在链头移动后唤醒目标成员。不再轮询
 - **重试**：`execute_task` 错误路径自动 re-offer（`[RETRY:N]` 前缀），超过 3 次放弃
@@ -83,13 +83,13 @@ pub struct Member {
 }
 ```
 
-三种 Identity：`User`（不 spawn 循环）、`Manager`（额外 schedule_* 工具）、`Member`（base 工具）。
+三种 Identity：`User`（与 HumanProvider 绑定，可被委托）、`Manager`（额外 schedule_* 工具）、`Member`（base 工具）。CLI `cmd_compose_up` 用 `match def.identity` 为三种身份走独立创建逻辑。
 
 ### Tool-Call 循环（流式）
 
 `chat()` 通过 `Client::chat_stream()` 获取流，每收一个 chunk：
 1. 原样 `publish_raw` 推 SSE 给前端（透传不做加工）
-2. 累积 `full_content` / `full_tool_calls` / `finish_reason`
+2. 累积 `full_content` / `full_tool_calls` / `finish_reason` / `full_reasoning`
 3. 流结束后保存完整文本到 `conversation_messages` 表
 4. 非破坏工具（bash/recall/schedule_*）→ 执行后继续循环
 5. `finish` → 产出结果（done=true），推 `{"type":"done"}` SSE 事件
@@ -100,11 +100,24 @@ pub struct Member {
 
 流式 tool call 的 arguments 分片发送，`merge_deltas` 按 `ToolCallDelta.index` 位置合并增量
 
+### Human 成员
+
+User 身份成员配 HumanProvider。Manager 可 delegate 给用户成员。HumanProvider 通过 `/api/human/request` 创建请求、`GET /api/human/request/{id}` 阻塞等待回复。前端 SSE `workspace_stream` 收 `human_request` 事件后输入框自动切换为回复模式。用户回复后链继续走。
+
 ## SSE 实时推送
 
-`GET /ws/{name}/events/{task_id}` 建立 SSE 连接，后端把 LLM 返回的每个 `StreamChunk` JSON 原样透传给前端。`execute_finish` 结束时推送 `{"type":"done"}` 关闭连接。
+`GET /workspace/{name}/events/{task_id}` — 后端把 LLM 返回的每个 `StreamChunk` JSON 原样透传给前端。`execute_finish` 结束时推送 `{"type":"done"}` 关闭连接。
 
-底层通过 `DelegationBoard` 的 `broadcast::Sender<String>` 实现——`offer()` 时预建 channel，`publish_raw()` 写入，`BroadcastStream` 读出。连接时先检查 worklog 防竞态。
+`GET /workspace/{name}/stream` — 前端进 workspace 时的长期订阅。四种事件：
+
+| 事件 | 触发 | 携带数据 |
+|------|------|----------|
+| board_update | offer / result(done=true) | publish_count: usize |
+| chain_update | delegate 右移 / finish 左移 | from, to, brief, head_pos |
+| member_status | 成员开始/结束处理 | member_id, state(working/idle) |
+| human_request | HumanProvider 创建请求 | session_id, from, to, brief, detail |
+
+**事件桥接**：runtime `trigger_event()` → `raw_events` 通道 → `server/event_bridge.rs` 订阅 → 从 AppState 构造类型化事件 → `publish_raw("workspace_stream")` → 前端 SSE。
 
 ## 上下文组装
 
@@ -124,13 +137,34 @@ pub struct Member {
 
 SQLite 实时写保证持久化。`DelegationBoard` 持 `cached_worklog: RwLock<String>`，只在启动时和根委托完成时刷新。子任务执行期间缓存不变，保持 LLM 上下文稳定，最大化 prompt cache 命中。
 
+## 事件系统
+
+### 事件类型库
+
+`types/src/events.rs` — 四种事件 struct（Serialize + Deserialize），`fn new()` 构造器。
+
+`types/src/event_index.rs` — 通道和事件名常量（`CH_RAW_EVENTS`, `CH_WORKSPACE_STREAM`, `EVENT_*`），三斜杠文档。
+
+### 事件桥接
+
+`server/src/event_bridge.rs` — 每 workspace 起 tokio 任务，订阅 `raw_events`，按 `event_name` 分派，从 AppState 获取上下文构造类型化 JSON，推送 `workspace_stream`。
+
+### 推送点
+
+| 事件 | 触发位置 | 层 |
+|------|----------|-----|
+| board_update + chain_update | `board.offer()` | runtime |
+| board_update + chain_update | `board.result(done=true)` | runtime |
+| chain_update | `board.result(done=false)` | runtime |
+| member_status | `execute_task` 开始/结束 | runtime |
+| human_request | `human::create_request` handler | server |
+
 ## 记忆系统（SQLite）
 
 单文件 `memory.db`，含五张表：
-
 - **worklog**：团队工作日志，委托创建时插入，产出时补全 summary/reply
 - **personal_memory**：个人记忆，委托创建时插入，产出时补全 detail
-- **conversation_messages**：对话消息，每次 LLM 文本回复实时存入。`GET /ws/{name}/conversation` 可查询
+- **conversation_messages**：对话消息，每次 LLM 文本回复实时存入
 - **schedule**：Manager 专用，planned/offered/archived 状态流转
 - **delegations**：委托持久化，创建时写入完整信息
 
@@ -142,7 +176,7 @@ SQLite 实时写保证持久化。`DelegationBoard` 持 `cached_worklog: RwLock<
 |---|---|---|---|
 | error | 是 | — | 不可恢复错误 |
 | warn | 是 | — | chunk 跳过、流降级、任务重试 |
-| info | 是 | — | 成员启动、任务领取、publish done、board 变动 |
+| info | 是 | — | 成员启动、任务领取、delegation/finish、board 变动 |
 | debug | 否 | `--verbose` 或 `level = "debug"` | 格式化摘要 + 原始 JSON 全文 |
 
 `--verbose` 独立的 info 层守卫（成员名+工具名摘要），debug 级别打原始流量不做任何加工。日志级别从 `margatroid.toml` 的 `[logging] level` 读取，大小写不敏感。
@@ -163,9 +197,11 @@ SQLite 实时写保证持久化。`DelegationBoard` 持 `cached_worklog: RwLock<
 ```
 margatroid/
 ├── types/         # 共享类型定义（DynAiProvider, AiProvider, Identity, ChatRequest 等）
-│   └── provider.rs  # DynAiProvider + AiProvider trait + blanket impl
+│   ├── provider.rs  # DynAiProvider + AiProvider trait + blanket impl
+│   ├── events.rs    # 事件 struct（BoardUpdate, ChainUpdate 等）
+│   └── event_index.rs # 通道/事件名常量
 ├── runtime/       # 核心运行时（Workspace, DelegationBoard, Member, TaskChain, Client, memory）
-│   ├── board.rs   # DelegationBoard + TaskChain + assemble_prompt + Notify
+│   ├── board.rs   # DelegationBoard + TaskChain + assemble_prompt + Notify + SSE 广播
 │   ├── client.rs  # Client — 封装 model + provider + 流式/降级 + verbose 日志
 │   ├── member.rs  # Member — Agent trait + chat() 流式 tool-call loop
 │   ├── memory.rs  # SQLite（worklog + personal_memory + schedule + delegations + conversation_messages）
@@ -174,14 +210,43 @@ margatroid/
 ├── compose/       # Compose 文件解析
 ├── assets/        # 成员库（member.toml + SOUL.md）+ 系统提示词管理
 ├── sandbox/       # 沙箱执行环境
-├── cli/           # 命令行入口 + --verbose + 配置日志等级
-└── server/        # HTTP API（axum）+ SSE + CORS + ws 路由
+├── cli/           # 命令行入口 + --verbose + 配置日志等级 + 身份路由
+└── server/        # HTTP API（axum）+ SSE + CORS + workspace 路由
+    ├── event_bridge.rs # runtime raw_events → frontend workspace_stream
+    └── human.rs        # Human 交互端点
 ```
 
-## Workspace 生命周期
+## API 端点
 
-```rust
-Workspace::start(compose, entries) → 创建 Board、沙箱、SQLite，spawn 成员控制循环
-send_user_message(from, to, brief, detail) → 发布根委托到发布区 + 链
-shutdown() → 通知所有成员退出，await 所有 handle
-```
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | /health | 健康检查 |
+| POST | /v1/chat | 非流式 Chat |
+| POST | /v1/stream | SSE 流式 Chat |
+| GET | /v1/providers | AI 服务商列表 |
+| POST | /admin/reload | 热重载 provider |
+| GET | /workspace | 列出运行中的 workspace |
+| POST | /workspace/{name}/chat | 向 Workspace 发消息 |
+| GET | /workspace/{name}/status | 委托板发布区计数 |
+| GET | /workspace/{name}/tasks | 委托板完整状态 |
+| GET | /workspace/{name}/events/{task_id} | Per-task SSE 事件流 |
+| GET | /workspace/{name}/stream | Workspace 统一事件流（长期） |
+| GET | /workspace/{name}/recent | 最近工作日志 |
+| GET | /workspace/{name}/conversation | 对话消息 |
+| POST | /api/human/request | 人类交互请求 |
+| GET | /api/human/request/{id} | 阻塞等待人类回复 |
+| GET | /api/human/requests | 待处理请求列表 |
+| POST | /api/human/request/{id}/reply | 提交人类回复 |
+
+## 设计决策日志
+
+1. **任务链只追加不删改** — delegate 和 Outcome 写入后永不修改
+2. **事件驱动** — Notify + 链头检测替代轮询
+3. **流式透传** — SSE 不过加工，前端自解析
+4. **工作日志缓存** — 启动+根完成刷新，中间不变保 prompt cache
+5. **Manager 也是智能体** — 不是硬编码调度器
+6. **发布区降级** — 前端缓存，不影响调度逻辑
+7. **两层成员发现** — 团队成员名录（轻量注入上下文）+ recall 按需检索
+8. **三层日志体系** — error/warn/info/debug
+9. **事件桥接** — runtime 触发事件名，server 构造类型化消息，不改 runtime 依赖
+10. **身份路由** — CLI 中 match identity 三路独立，清晰可维护
