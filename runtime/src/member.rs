@@ -33,8 +33,12 @@ pub struct ChatOutcome {
     pub result: String,
 }
 
-/// execute_tool 返回值 —— (tool 结果文本, 是否应该退出循环)
-type ToolResult = (String, bool);
+/// tool 执行结果
+struct ToolResult {
+    content: String,
+    should_break: bool,
+    is_error: bool,
+}
 
 // ── Member ───────────────────────────────────────────────────
 
@@ -241,19 +245,19 @@ impl Member {
                 let reply = &full_content;
 
                 for tc in &full_tool_calls {
-                    let (result, brk) =
+                    let tr =
                         execute_tool(tc, &sandbox_guard, board, &self.id, reply).await;
 
                     messages.push(RequestMessage::Tool(ToolMessage {
                         role: Role::Tool,
-                        content: result.clone(),
+                        content: tr.content.clone(),
                         tool_call_id: tc.id.clone(),
                         name: None,
                     }));
 
-                    if brk {
+                    if tr.should_break && !tr.is_error {
                         should_break = true;
-                        break_content = result;
+                        break_content = tr.content;
                     }
                 }
                 drop(sandbox_guard);
@@ -289,30 +293,48 @@ async fn execute_tool(
     reply: &str,
 ) -> ToolResult {
     match tc.function.name.as_str() {
-        "bash" => (execute_bash(&tc.function.arguments, sandbox).await, false),
+        "bash" => ToolResult {
+            content: execute_bash(&tc.function.arguments, sandbox).await,
+            should_break: false,
+            is_error: false,
+        },
         "delegate" => {
-            let result = execute_delegate(&tc.function.arguments, board, from, reply).await;
-            (result, true)
+            let mut tr =
+                execute_delegate(&tc.function.arguments, board, from, reply).await;
+            tr.should_break = true;
+            tr
         }
-        "schedule_add" => (
-            execute_schedule_add(&tc.function.arguments, board).await,
-            false,
-        ),
-        "schedule_list" => (execute_schedule_list(board).await, false),
-        "schedule_pop" => (
-            execute_schedule_pop(&tc.function.arguments, board).await,
-            false,
-        ),
-        "schedule_remove" => (
-            execute_schedule_remove(&tc.function.arguments, board).await,
-            false,
-        ),
-        "recall" => (execute_recall(&tc.function.arguments, board).await, false),
-        "finish" => (
-            execute_finish(&tc.function.arguments, board, from, reply).await,
-            true,
-        ),
-        _ => (format!("未知工具: {}", tc.function.name), false),
+        "schedule_add" => ToolResult {
+            content: execute_schedule_add(&tc.function.arguments, board).await,
+            should_break: false,
+            is_error: false,
+        },
+        "schedule_list" => ToolResult {
+            content: execute_schedule_list(board).await,
+            should_break: false,
+            is_error: false,
+        },
+        "schedule_pop" => ToolResult {
+            content: execute_schedule_pop(&tc.function.arguments, board).await,
+            should_break: false,
+            is_error: false,
+        },
+        "schedule_remove" => ToolResult {
+            content: execute_schedule_remove(&tc.function.arguments, board).await,
+            should_break: false,
+            is_error: false,
+        },
+        "recall" => ToolResult {
+            content: execute_recall(&tc.function.arguments, board).await,
+            should_break: false,
+            is_error: false,
+        },
+        "finish" => execute_finish(&tc.function.arguments, board, from, reply).await,
+        _ => ToolResult {
+            content: format!("未知工具: {}", tc.function.name),
+            should_break: false,
+            is_error: false,
+        },
     }
 }
 
@@ -321,7 +343,7 @@ async fn execute_finish(
     board: &DelegationBoard,
     from: &str,
     reply: &str,
-) -> String {
+) -> ToolResult {
     let args: serde_json::Value = if arguments.is_empty() {
         serde_json::Value::Null
     } else {
@@ -372,9 +394,17 @@ async fn execute_finish(
                 short_did,
             );
             board.publish_raw(&did, r#"{"type":"done"}"#).await;
-            format!("完成。摘要: {}", summary)
+            ToolResult {
+                content: format!("完成。摘要: {}", summary),
+                should_break: true,
+                is_error: false,
+            }
         }
-        Err(e) => format!("产出写入失败: {}", e),
+        Err(e) => ToolResult {
+            content: format!("产出写入失败: {}", e),
+            should_break: false,
+            is_error: true,
+        },
     }
 }
 
@@ -383,30 +413,54 @@ async fn execute_delegate(
     board: &DelegationBoard,
     from: &str,
     reply: &str,
-) -> String {
+) -> ToolResult {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
-        Err(e) => return format!("参数解析失败: {}", e),
+        Err(e) => return ToolResult {
+            content: format!("参数解析失败: {}", e),
+            should_break: false,
+            is_error: true,
+        },
     };
     let target = match args.get("target").and_then(|v| v.as_str()) {
         Some(t) => t,
-        None => return "缺少 'target' 参数".to_string(),
+        None => return ToolResult {
+            content: "缺少 'target' 参数".to_string(),
+            should_break: false,
+            is_error: true,
+        },
     };
     let task_summary = match args.get("task_summary").and_then(|v| v.as_str()) {
         Some(t) => t,
-        None => return "缺少 'task_summary' 参数".to_string(),
+        None => return ToolResult {
+            content: "缺少 'task_summary' 参数".to_string(),
+            should_break: false,
+            is_error: true,
+        },
     };
     let task_detail = match args.get("task_detail").and_then(|v| v.as_str()) {
         Some(d) => d,
-        None => return "缺少 'task_detail' 参数".to_string(),
+        None => return ToolResult {
+            content: "缺少 'task_detail' 参数".to_string(),
+            should_break: false,
+            is_error: true,
+        },
     };
     let work_summary = match args.get("work_summary").and_then(|v| v.as_str()) {
         Some(s) => s,
-        None => return "缺少 'work_summary' 参数".to_string(),
+        None => return ToolResult {
+            content: "缺少 'work_summary' 参数".to_string(),
+            should_break: false,
+            is_error: true,
+        },
     };
     let work_detail = match args.get("work_detail").and_then(|v| v.as_str()) {
         Some(d) => d,
-        None => return "缺少 'work_detail' 参数".to_string(),
+        None => return ToolResult {
+            content: "缺少 'work_detail' 参数".to_string(),
+            should_break: false,
+            is_error: true,
+        },
     };
     let parent_id = board
         .chain_snapshot()
@@ -441,11 +495,19 @@ async fn execute_delegate(
         )
         .await
     {
-        Ok(task_id) => format!(
-            "委托已发布到发布区，task_id: {}\n发委托前总结: {}\n发委托前思路: {}",
-            task_id, work_summary, work_detail
-        ),
-        Err(e) => format!("委托发布失败: {}", e),
+        Ok(task_id) => ToolResult {
+            content: format!(
+                "委托已发布到发布区，task_id: {}\n发委托前总结: {}\n发委托前思路: {}",
+                task_id, work_summary, work_detail
+            ),
+            should_break: false,
+            is_error: false,
+        },
+        Err(e) => ToolResult {
+            content: format!("委托发布失败: {}", e),
+            should_break: false,
+            is_error: true,
+        },
     }
 }
 
