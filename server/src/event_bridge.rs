@@ -26,9 +26,25 @@ pub fn spawn_event_bridge(board: Arc<DelegationBoard>) {
                 .map_or((payload.as_str(), ""), |(n, d)| (n, d));
 
             let json = match event_name {
-                event_index::EVT_BOARD_UPDATE => {
+                event_index::EVENT_BOARD_UPDATE => {
                     let count: usize = data.parse().unwrap_or(0);
                     serde_json::to_string(&events::BoardUpdateEvent::new(count)).unwrap_or_default()
+                }
+                event_index::EVENT_CHAIN_UPDATE => {
+                    let chain = board.chain_snapshot().await;
+                    let task = chain
+                        .current_task()
+                        .map(|t| (t.from.clone(), t.to.clone(), t.brief.clone()));
+                    let head_pos = chain.head_pos();
+                    serde_json::to_string(&events::ChainUpdateEvent::new(task, head_pos))
+                        .unwrap_or_default()
+                }
+                event_index::EVENT_MEMBER_STATUS => {
+                    let parts: Vec<&str> = data.splitn(2, '\n').collect();
+                    let member_id = parts.first().copied().unwrap_or("").to_string();
+                    let state = parts.get(1).copied().unwrap_or("").to_string();
+                    serde_json::to_string(&events::MemberStatusEvent::new(member_id, state))
+                        .unwrap_or_default()
                 }
                 _ => continue,
             };

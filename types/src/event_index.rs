@@ -22,16 +22,16 @@ pub const CH_WORKSPACE_STREAM: &str = "workspace_stream";
 
 /// offer() 入发布区 或 result(done=true) 出发布区时触发
 /// 事件体见 [`super::events::BoardUpdateEvent`]
-pub const EVT_BOARD_UPDATE: &str = "board_update";
+pub const EVENT_BOARD_UPDATE: &str = "board_update";
 
 /// HumanProvider 为人类成员创建待处理请求时触发
 /// 事件体见 [`super::events::HumanRequestEvent`]
-pub const EVT_HUMAN_REQUEST: &str = "human_request";
+pub const EVENT_HUMAN_REQUEST: &str = "human_request";
 
 /// delegate 右移 或 finish(done=true) 左移时触发
 /// 事件体见 [`super::events::ChainUpdateEvent`]
-pub const EVT_CHAIN_UPDATE: &str = "chain_update";
+pub const EVENT_CHAIN_UPDATE: &str = "chain_update";
 
 /// 成员开始或结束处理委托时触发
 /// 事件体见 [`super::events::MemberStatusEvent`]
-pub const EVT_MEMBER_STATUS: &str = "member_status";
+pub const EVENT_MEMBER_STATUS: &str = "member_status";

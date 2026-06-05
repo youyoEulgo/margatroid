@@ -44,13 +44,16 @@ impl HumanRequestEvent {
 pub struct ChainUpdateEvent {
     #[serde(rename = "type")]
     pub event_type: &'static str,
+    pub from: String,
+    pub to: String,
+    pub brief: String,
+    pub head_pos: usize,
 }
 
 impl ChainUpdateEvent {
-    pub fn new() -> Self {
-        Self {
-            event_type: "chain_update",
-        }
+    pub fn new(task: Option<(String, String, String)>, head_pos: usize) -> Self {
+        let (from, to, brief) = task.unwrap_or_default();
+        Self { event_type: "chain_update", from, to, brief, head_pos }
     }
 }
 

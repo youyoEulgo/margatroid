@@ -110,6 +110,11 @@ impl TaskChain {
         }
     }
 
+    /// 获取当前链头位置
+    pub fn head_pos(&self) -> usize {
+        self.head
+    }
+
     /// 当前链头上的委托是否已有产出（用在 execute_task 里区分初执/续执）
     pub fn has_outcome(&self) -> bool {
         self.entries.iter().any(
@@ -234,8 +239,8 @@ impl DelegationBoard {
     }
 
     /// 通知 server 层有事件发生（server 负责从 state 构造完整消息并推送）
-    /// payload 格式: "event_name\noptional_data"
-    async fn trigger_event(&self, event_name: &str, data: &str) {
+    /// payload 格式: "event_name" 或 "event_name\ndata"
+    pub async fn trigger_event(&self, event_name: &str, data: &str) {
         let payload = if data.is_empty() {
             event_name.to_string()
         } else {
@@ -442,7 +447,8 @@ impl DelegationBoard {
             let cur = publish.len();
             drop(publish);
             tracing::info!("board: publish={} | from={} → to={}", cur, from, target);
-            self.trigger_event(types::event_index::EVT_BOARD_UPDATE, &cur.to_string()).await;
+            self.trigger_event(types::event_index::EVENT_BOARD_UPDATE, &cur.to_string()).await;
+            self.trigger_event(types::event_index::EVENT_CHAIN_UPDATE, "").await;
             self.notify_member(&target).await;
         }
 
@@ -480,6 +486,7 @@ impl DelegationBoard {
             let mut chain = self.chain.write().await;
             chain.add_result(result, &self.db);
         }
+        self.trigger_event(types::event_index::EVENT_CHAIN_UPDATE, "").await;
 
         if !done {
             return Ok(());
@@ -495,7 +502,7 @@ impl DelegationBoard {
             let cur = tasks.len();
             tracing::info!("board: publish={} | archived by {}", cur, member_id);
             drop(tasks);
-            self.trigger_event(types::event_index::EVT_BOARD_UPDATE, &cur.to_string()).await;
+            self.trigger_event(types::event_index::EVENT_BOARD_UPDATE, &cur.to_string()).await;
         }
 
         // 唤醒上级（链头已左移，新链头指向父委托的承接者）
