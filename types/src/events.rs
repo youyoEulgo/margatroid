@@ -28,13 +28,27 @@ pub struct HumanRequestEvent {
     #[serde(rename = "type")]
     pub event_type: &'static str,
     pub session_id: String,
+    pub from: String,
+    pub to: String,
+    pub brief: String,
+    pub detail: String,
 }
 
 impl HumanRequestEvent {
-    pub fn new(session_id: String) -> Self {
+    pub fn new(
+        session_id: String,
+        from: String,
+        to: String,
+        brief: String,
+        detail: String,
+    ) -> Self {
         Self {
             event_type: "human_request",
             session_id,
+            from,
+            to,
+            brief,
+            detail,
         }
     }
 }

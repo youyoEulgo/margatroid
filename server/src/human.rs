@@ -62,7 +62,16 @@ pub async fn create_request(
     // 推送 human_request 事件到前端
     if !body.workspace.is_empty() {
         if let Some(ws) = state.workspace(&body.workspace).await {
-            let event = types::events::HumanRequestEvent::new(session_id.clone());
+            let chain = ws.board.chain_snapshot().await;
+            let task = chain.current_task();
+            let from = task.map(|t| t.from.clone()).unwrap_or_default();
+            let to = task.map(|t| t.to.clone()).unwrap_or_default();
+            let brief = task.map(|t| t.brief.clone()).unwrap_or_default();
+            let detail = task.map(|t| t.detail.clone()).unwrap_or_default();
+            let event = types::events::HumanRequestEvent::new(
+                session_id.clone(),
+                from, to, brief, detail,
+            );
             let json = serde_json::to_string(&event).unwrap_or_default();
             ws.board
                 .publish_raw(types::event_index::CH_WORKSPACE_STREAM, &json)

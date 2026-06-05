@@ -175,7 +175,7 @@ impl Workspace {
             let id_str = match identity {
                 types::Identity::Manager => format!("- {} (经理)", id),
                 types::Identity::Member => format!("- {} (成员)", id),
-                types::Identity::User => continue,
+                types::Identity::User => format!("- {} (用户)", id),
             };
             roster.push_str(&id_str);
             if !entry.skills.is_empty() {
