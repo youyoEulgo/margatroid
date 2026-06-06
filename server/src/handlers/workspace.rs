@@ -6,7 +6,6 @@ use axum::{
     response::sse::{Event, Sse},
 };
 use futures::Stream;
-use runtime::memory::Worklog;
 use serde::Deserialize;
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
