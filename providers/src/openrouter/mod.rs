@@ -1,8 +1,5 @@
 mod convert;
-mod error;
 mod types;
-
-pub use error::OpenRouterError;
 
 use self::types::{ApiErrorBody, WireResponse};
 use crate::traits::AiProvider;
@@ -40,23 +37,17 @@ impl OpenRouterProvider {
     // 返回 anyhow::Result，? 在 impl AiProvider 里可以直接用
     async fn parse_response(&self, resp: reqwest::Response) -> Result<WireResponse> {
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .context("failed to read response body")?;
-
+        let body = resp.text().await.context("failed to read response body")?;
         if !status.is_success() {
-            return match serde_json::from_str::<ApiErrorBody>(&body) {
-                Ok(e) => Err(OpenRouterError::Api(e.error).into()),
-                Err(_) => bail!("API error (HTTP {}): {}", status.as_u16(), body),
-            };
+            let msg = serde_json::from_str::<ApiErrorBody>(&body)
+                .map(|e| e.error.message)
+                .unwrap_or(body);
+            bail!("API error (HTTP {}): {}", status.as_u16(), msg);
         }
-
-        serde_json::from_str::<WireResponse>(&body)
-            .with_context(|| format!("failed to deserialize response: {}", &body[..body.len().min(500)]))
+        serde_json::from_str(&body).context("failed to deserialize response")
     }
 
-    fn parse_stream_line(line: &str) -> Option<Result<WireResponse, OpenRouterError>> {
+    fn parse_stream_line(line: &str) -> Option<Result<WireResponse, serde_json::Error>> {
         if line.starts_with(':') {
             return None;
         }
@@ -64,12 +55,7 @@ impl OpenRouterProvider {
         if data.trim() == "[DONE]" {
             return None;
         }
-        Some(
-            serde_json::from_str::<WireResponse>(data).map_err(|e| OpenRouterError::StreamChunk {
-                source: e,
-                raw: data.to_owned(),
-            }),
-        )
+        Some(serde_json::from_str(data))
     }
 }
 
@@ -117,10 +103,10 @@ impl AiProvider for OpenRouterProvider {
                 .text()
                 .await
                 .context("failed to read response body")?;
-            return match serde_json::from_str::<ApiErrorBody>(&body) {
-                Ok(e) => Err(OpenRouterError::Api(e.error).into()),
-                Err(_) => bail!("API error (HTTP {}): {}", status, body),
-            };
+            let msg = serde_json::from_str::<ApiErrorBody>(&body)
+                .map(|e| e.error.message)
+                .unwrap_or(body);
+            bail!("API error (HTTP {}): {}", status, msg);
         }
 
         let byte_stream = resp.bytes_stream();
@@ -159,18 +145,8 @@ impl AiProvider for OpenRouterProvider {
                     if let Some(result) = Self::parse_stream_line(&line) {
                         match result {
                             Ok(wire) => yield Ok(convert::from_wire_stream(wire)),
-                            Err(OpenRouterError::StreamChunk { source, raw }) => {
-                                // chunk 解析失败，yield 错误但继续流
-                                yield Err(anyhow::anyhow!(
-                                    "stream chunk parse error: {}; chunk: {}",
-                                    source,
-                                    raw
-                                ));
-                            }
                             Err(e) => {
-                                // 其他错误中断流
-                                yield Err(e.into());
-                                return;
+                                yield Err(anyhow::anyhow!("chunk parse error: {}", e));
                             }
                         }
                     }

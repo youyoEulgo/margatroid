@@ -132,7 +132,8 @@ impl Member {
                     if let Ok(resp) = serde_json::from_str::<types::ChatResponse>(&chunk_json) {
                         if let Some(choice) = resp.choices.first() {
                             full_content = choice.message.content.clone().unwrap_or_default();
-                            full_reasoning = choice.message.reasoning_content.clone().unwrap_or_default();
+                            full_reasoning =
+                                choice.message.reasoning_content.clone().unwrap_or_default();
                             full_tool_calls = choice.message.tool_calls.clone().unwrap_or_default();
                             finish_reason = choice.finish_reason.clone();
                         }
@@ -173,17 +174,19 @@ impl Member {
                 .iter()
                 .map(|tc| tc.function.name.as_str())
                 .collect();
-            tracing::info!(
-                "← LLM | {} | used=[{}]",
-                self.id,
-                used.join(", "),
-            );
+            tracing::info!("← LLM | {} | used=[{}]", self.id, used.join(", "),);
 
             // verbose 日志：流式摘要
             if self.client.is_verbose() {
                 let tc_str = full_tool_calls
                     .iter()
-                    .map(|tc| format!("{}({})", tc.function.name, format_args_json(&tc.function.arguments)))
+                    .map(|tc| {
+                        format!(
+                            "{}({})",
+                            tc.function.name,
+                            format_args_json(&tc.function.arguments)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 crate::client::verbose_stream_done(&full_content, &tc_str);
@@ -245,8 +248,7 @@ impl Member {
                 let reply = &full_content;
 
                 for tc in &full_tool_calls {
-                    let tr =
-                        execute_tool(tc, &sandbox_guard, board, &self.id, reply).await;
+                    let tr = execute_tool(tc, &sandbox_guard, board, &self.id, reply).await;
 
                     messages.push(RequestMessage::Tool(ToolMessage {
                         role: Role::Tool,
@@ -299,8 +301,7 @@ async fn execute_tool(
             is_error: false,
         },
         "delegate" => {
-            let mut tr =
-                execute_delegate(&tc.function.arguments, board, from, reply).await;
+            let mut tr = execute_delegate(&tc.function.arguments, board, from, reply).await;
             tr.should_break = true;
             tr
         }
@@ -379,12 +380,7 @@ async fn execute_finish(
     {
         Ok(()) => {
             let short_did = &did[..did.len().min(8)];
-            tracing::info!(
-                "finish | {} ← {} | did={}",
-                task_from,
-                from,
-                short_did,
-            );
+            tracing::info!("finish | {} ← {} | did={}", task_from, from, short_did,);
             board.publish_raw(&did, r#"{"type":"done"}"#).await;
             ToolResult {
                 content: format!("完成。摘要: {}", summary),
@@ -408,51 +404,63 @@ async fn execute_delegate(
 ) -> ToolResult {
     let args: serde_json::Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
-        Err(e) => return ToolResult {
-            content: format!("参数解析失败: {}", e),
-            should_break: false,
-            is_error: true,
-        },
+        Err(e) => {
+            return ToolResult {
+                content: format!("参数解析失败: {}", e),
+                should_break: false,
+                is_error: true,
+            };
+        }
     };
     let target = match args.get("target").and_then(|v| v.as_str()) {
         Some(t) => t,
-        None => return ToolResult {
-            content: "缺少 'target' 参数".to_string(),
-            should_break: false,
-            is_error: true,
-        },
+        None => {
+            return ToolResult {
+                content: "缺少 'target' 参数".to_string(),
+                should_break: false,
+                is_error: true,
+            };
+        }
     };
     let task_summary = match args.get("task_summary").and_then(|v| v.as_str()) {
         Some(t) => t,
-        None => return ToolResult {
-            content: "缺少 'task_summary' 参数".to_string(),
-            should_break: false,
-            is_error: true,
-        },
+        None => {
+            return ToolResult {
+                content: "缺少 'task_summary' 参数".to_string(),
+                should_break: false,
+                is_error: true,
+            };
+        }
     };
     let task_detail = match args.get("task_detail").and_then(|v| v.as_str()) {
         Some(d) => d,
-        None => return ToolResult {
-            content: "缺少 'task_detail' 参数".to_string(),
-            should_break: false,
-            is_error: true,
-        },
+        None => {
+            return ToolResult {
+                content: "缺少 'task_detail' 参数".to_string(),
+                should_break: false,
+                is_error: true,
+            };
+        }
     };
     let work_summary = match args.get("work_summary").and_then(|v| v.as_str()) {
         Some(s) => s,
-        None => return ToolResult {
-            content: "缺少 'work_summary' 参数".to_string(),
-            should_break: false,
-            is_error: true,
-        },
+        None => {
+            return ToolResult {
+                content: "缺少 'work_summary' 参数".to_string(),
+                should_break: false,
+                is_error: true,
+            };
+        }
     };
     let work_detail = match args.get("work_detail").and_then(|v| v.as_str()) {
         Some(d) => d,
-        None => return ToolResult {
-            content: "缺少 'work_detail' 参数".to_string(),
-            should_break: false,
-            is_error: true,
-        },
+        None => {
+            return ToolResult {
+                content: "缺少 'work_detail' 参数".to_string(),
+                should_break: false,
+                is_error: true,
+            };
+        }
     };
     let parent_id = board
         .chain_snapshot()
@@ -475,7 +483,9 @@ async fn execute_delegate(
         )
         .await;
 
-    board.publish_raw(&parent_id.clone().unwrap_or_default(), r#"{"type":"done"}"#).await;
+    board
+        .publish_raw(&parent_id.clone().unwrap_or_default(), r#"{"type":"done"}"#)
+        .await;
 
     match board
         .offer(
