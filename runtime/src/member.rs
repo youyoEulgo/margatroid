@@ -358,18 +358,10 @@ async fn execute_finish(
         .unwrap_or("(无摘要)");
     let detail = args.get("detail").and_then(|v| v.as_str()).unwrap_or("");
 
-    let task_from = board
-        .chain_snapshot()
-        .await
-        .current_task()
-        .map(|t| t.from.clone())
-        .unwrap_or_default();
-    let delegation_id = board
-        .chain_snapshot()
-        .await
-        .current_task()
-        .map(|t| t.id.clone())
-        .unwrap_or_default();
+    let snap = board.chain_snapshot().await;
+    let current = snap.current_task();
+    let task_from = current.map(|t| t.from.clone()).unwrap_or_default();
+    let delegation_id = current.map(|t| t.id.clone()).unwrap_or_default();
 
     let did = delegation_id.clone();
     match board
