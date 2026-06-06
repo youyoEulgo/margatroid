@@ -337,6 +337,46 @@ fn parse_retry(detail: &str) -> (u32, &str) {
     (0, detail)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_retry_no_prefix() {
+        let (n, detail) = parse_retry("some task detail");
+        assert_eq!(n, 0);
+        assert_eq!(detail, "some task detail");
+    }
+
+    #[test]
+    fn parse_retry_first() {
+        let (n, detail) = parse_retry("[RETRY:1] failed: timeout");
+        assert_eq!(n, 1);
+        assert_eq!(detail, "failed: timeout");
+    }
+
+    #[test]
+    fn parse_retry_third() {
+        let (n, detail) = parse_retry("[RETRY:3] something broke");
+        assert_eq!(n, 3);
+        assert_eq!(detail, "something broke");
+    }
+
+    #[test]
+    fn parse_retry_malformed_no_bracket() {
+        let (n, detail) = parse_retry("[RETRY:2");
+        assert_eq!(n, 0);
+        assert_eq!(detail, "[RETRY:2");
+    }
+
+    #[test]
+    fn parse_retry_malformed_not_a_number() {
+        let (n, detail) = parse_retry("[RETRY:two] error");
+        assert_eq!(n, 0);
+        assert_eq!(detail, "[RETRY:two] error");
+    }
+}
+
 async fn member_loop(
     agent: Arc<dyn Agent>,
     board: Arc<DelegationBoard>,

@@ -764,3 +764,148 @@ fn format_args_json(json: &str) -> String {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── merge_deltas ───────────────────────────────────────
+
+    #[test]
+    fn merge_deltas_new_tool_call() {
+        let mut accum = vec![];
+        let deltas = vec![ToolCallDelta {
+            id: Some("call_1".into()),
+            r#type: Some("function".into()),
+            index: 0,
+            function: Some(types::tool::FunctionCallDelta {
+                name: Some("bash".into()),
+                arguments: Some(r#"{"command":"#.into()),
+            }),
+        }];
+        merge_deltas(&mut accum, &deltas);
+        assert_eq!(accum.len(), 1);
+        assert_eq!(accum[0].id, "call_1");
+        assert_eq!(accum[0].function.name, "bash");
+        assert_eq!(accum[0].function.arguments, r#"{"command":"#);
+    }
+
+    #[test]
+    fn merge_deltas_argument_accumulation() {
+        let mut accum = vec![ResponseToolCall {
+            id: "call_1".into(),
+            r#type: "function".into(),
+            function: ResponseFunctionCall {
+                name: "bash".into(),
+                arguments: r#"{"command":"#.into(),
+            },
+        }];
+        // 第二个 delta 追加: ls"}  → 完整 arguments: {"command":ls"}
+        let deltas = vec![ToolCallDelta {
+            id: None,
+            r#type: None,
+            index: 0,
+            function: Some(types::tool::FunctionCallDelta {
+                name: None,
+                arguments: Some("ls\"}".into()),
+            }),
+        }];
+        merge_deltas(&mut accum, &deltas);
+        // r#"{"command":"# 末尾的 " 是 raw string 闭合引号，实际内容为 {"command":
+        assert_eq!(accum[0].function.arguments, r#"{"command":ls"}"#);
+    }
+
+    #[test]
+    fn merge_deltas_gaps_filled() {
+        let mut accum = vec![];
+        // index 2 directly — 0 and 1 should be auto-created as empty
+        let deltas = vec![ToolCallDelta {
+            id: Some("call_2".into()),
+            r#type: None,
+            index: 2,
+            function: Some(types::tool::FunctionCallDelta {
+                name: Some("finish".into()),
+                arguments: None,
+            }),
+        }];
+        merge_deltas(&mut accum, &deltas);
+        assert_eq!(accum.len(), 3);
+        assert_eq!(accum[2].id, "call_2");
+        assert_eq!(accum[2].function.name, "finish");
+        // gaps are empty defaults
+        assert!(accum[0].id.is_empty());
+        assert!(accum[1].id.is_empty());
+    }
+
+    #[test]
+    fn merge_deltas_name_only_first_chunk() {
+        let mut accum = vec![];
+        let deltas = vec![ToolCallDelta {
+            id: None,
+            r#type: None,
+            index: 0,
+            function: Some(types::tool::FunctionCallDelta {
+                name: Some("delegate".into()),
+                arguments: None,
+            }),
+        }];
+        merge_deltas(&mut accum, &deltas);
+        assert_eq!(accum[0].function.name, "delegate");
+        assert!(accum[0].function.arguments.is_empty());
+    }
+
+    // ── format_args_json ────────────────────────────────────
+
+    #[test]
+    fn format_args_json_empty() {
+        assert_eq!(format_args_json(""), "(empty)");
+    }
+
+    #[test]
+    fn format_args_json_valid_object() {
+        let result = format_args_json(r#"{"command": "ls -la", "timeout": 30}"#);
+        assert!(result.contains("command: \"ls -la\""));
+        assert!(result.contains("timeout: 30"));
+    }
+
+    #[test]
+    fn format_args_json_invalid_truncated() {
+        let result = format_args_json("just some raw text");
+        assert_eq!(result, "just some raw text");
+    }
+
+    #[test]
+    fn format_args_json_long_string_truncated() {
+        let long = "x".repeat(100);
+        let result = format_args_json(&long);
+        assert!(result.len() <= 83); // 80 chars + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    // ── request_message_from_choice ─────────────────────────
+
+    #[test]
+    fn request_message_from_choice_basic() {
+        let choice = ResponseChoice {
+            index: 0,
+            message: types::ResponseMessage {
+                role: "assistant".into(),
+                content: Some("hello".into()),
+                tool_calls: None,
+                reasoning_content: None,
+            },
+            finish_reason: Some(FinishReason::Stop),
+        };
+        let msg = request_message_from_choice(&choice);
+        match msg {
+            RequestMessage::Chat(m) => {
+                assert_eq!(m.role, Role::Assistant);
+                match m.content {
+                    MessageContent::Text(t) => assert_eq!(t, "hello"),
+                    _ => panic!("expected Text"),
+                }
+            }
+            _ => panic!("expected Chat variant"),
+        }
+    }
+}
