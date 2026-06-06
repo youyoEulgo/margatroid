@@ -8,6 +8,9 @@
 //! ```
 
 use anyhow::{Result, bail};
+
+/// broadcast 通道缓冲区大小——积压超过此数时丢弃最早消息
+const CHANNEL_CAPACITY: usize = 32;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -192,9 +195,9 @@ impl DelegationBoard {
             cached_worklog: RwLock::new(init_worklog),
             events: {
                 let mut map = HashMap::new();
-                let (tx, _) = broadcast::channel(32);
+                let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
                 map.insert(types::event_index::CH_RAW_EVENTS.into(), tx);
-                let (tx, _) = broadcast::channel(32);
+                let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
                 map.insert(types::event_index::CH_WORKSPACE_STREAM.into(), tx);
                 RwLock::new(map)
             },
@@ -443,7 +446,7 @@ impl DelegationBoard {
         {
             let mut map = self.events.write().await;
             map.entry(id.clone()).or_insert_with(|| {
-                let (tx, _) = broadcast::channel(32);
+                let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
                 tx
             });
         }
