@@ -54,20 +54,6 @@ pub struct ConversationMessage {
     pub created_at: u64,
 }
 
-// ── Traits ────────────────────────────────────────────────────
-
-/// 工作日志（团队共享）
-pub trait Worklog: Send + Sync {
-    fn recent(&self, limit: usize) -> Vec<WorklogEntry>;
-    fn search(&self, keyword: &str) -> Vec<WorklogEntry>;
-}
-
-/// 个人记忆（每 agent 私有）
-pub trait PersonalMemory: Send + Sync {
-    fn recall(&self, keyword: &str) -> Vec<MemoryEntry>;
-    fn recall_by_tag(&self, tag: &str) -> Vec<MemoryEntry>;
-}
-
 /// SQLite 记忆存储
 ///
 /// 使用 Mutex 保证线程安全。workspace 内所有成员共享同一个连接。
@@ -566,12 +552,8 @@ impl SqliteMemory {
         )?;
         Ok(())
     }
-}
 
-// ── Worklog trait ────────────────────────────────────────────
-
-impl Worklog for SqliteMemory {
-    fn recent(&self, limit: usize) -> Vec<WorklogEntry> {
+    pub fn recent(&self, limit: usize) -> Vec<WorklogEntry> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
             "SELECT timestamp, agent_id, delegation_id, to_agent, description, summary, reply, artifacts
@@ -587,7 +569,7 @@ impl Worklog for SqliteMemory {
             .unwrap_or_default()
     }
 
-    fn search(&self, keyword: &str) -> Vec<WorklogEntry> {
+    pub fn search(&self, keyword: &str) -> Vec<WorklogEntry> {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", keyword);
         let mut stmt = match conn.prepare(
@@ -604,12 +586,8 @@ impl Worklog for SqliteMemory {
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
     }
-}
 
-// ── PersonalMemory trait ─────────────────────────────────────
-
-impl PersonalMemory for SqliteMemory {
-    fn recall(&self, keyword: &str) -> Vec<MemoryEntry> {
+    pub fn recall(&self, keyword: &str) -> Vec<MemoryEntry> {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", keyword);
         let mut stmt = match conn.prepare(
@@ -627,7 +605,7 @@ impl PersonalMemory for SqliteMemory {
             .unwrap_or_default()
     }
 
-    fn recall_by_tag(&self, tag: &str) -> Vec<MemoryEntry> {
+    pub fn recall_by_tag(&self, tag: &str) -> Vec<MemoryEntry> {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", tag);
         let mut stmt = match conn.prepare(

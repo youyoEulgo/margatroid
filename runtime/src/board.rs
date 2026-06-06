@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::sync::{Notify, RwLock, broadcast};
 use types::message::{ChatMessage, MessageContent, Role};
 
-use crate::memory::{PersonalMemory, SqliteMemory, Worklog};
+use crate::memory::SqliteMemory;
 
 // ── 任务链类型 ────────────────────────────────────────────────
 
