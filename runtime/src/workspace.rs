@@ -8,8 +8,8 @@ use anyhow::Result;
 use sandbox::SandboxManager;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use types::{ComposeFile, RequestTool};
 
 use crate::board::DelegationBoard;
@@ -155,7 +155,7 @@ pub struct Workspace {
     pub db: Arc<SqliteMemory>,
     members: HashMap<String, Arc<dyn Agent>>,
     handles: Vec<tokio::task::JoinHandle<()>>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: CancellationToken,
 }
 
 impl Workspace {
@@ -186,7 +186,7 @@ impl Workspace {
             compose.workspace.system_prompt.clone(),
             member_profiles,
         ));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = CancellationToken::new();
 
         let mut members: HashMap<String, Arc<dyn Agent>> = HashMap::new();
         let mut handles = Vec::new();
@@ -232,7 +232,7 @@ impl Workspace {
 
     /// 优雅关闭：通知所有成员退出并等待完成
     pub async fn shutdown(mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown.cancel();
         let handles = std::mem::take(&mut self.handles);
         for handle in handles {
             let _ = handle.await;
@@ -242,7 +242,7 @@ impl Workspace {
 
 impl Drop for Workspace {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown.cancel();
     }
 }
 
@@ -341,21 +341,18 @@ async fn member_loop(
     agent: Arc<dyn Agent>,
     board: Arc<DelegationBoard>,
     tools: Vec<RequestTool>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: CancellationToken,
 ) {
     tracing::info!("成员 '{}' 启动控制循环", agent.id());
 
     loop {
-        if shutdown.load(Ordering::SeqCst) {
+        if shutdown.is_cancelled() {
             break;
         }
         execute_task(&*agent, &board, &tools).await;
         tokio::select! {
             _ = board.wait(agent.id()) => {},
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
-        }
-        if shutdown.load(Ordering::SeqCst) {
-            break;
+            _ = shutdown.cancelled() => {},
         }
     }
     tracing::info!("成员 '{}' 控制循环退出", agent.id());
