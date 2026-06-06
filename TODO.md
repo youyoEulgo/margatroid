@@ -8,7 +8,7 @@
 - [x] workspace: 关停信号改为 CancellationToken，与 bridge 统一
 - [x] providers: OpenRouterError 与 anyhow 双路径合并
 - [x] board.rs: broadcast::channel(32) 提取为常量 CHANNEL_CAPACITY
-- [ ] memory.rs: Worklog/PersonalMemory trait 只有一个实现，考虑简化
-- [ ] 补充测试: server handlers, runtime member/workspace/client 核心路径
+- [x] memory.rs: Worklog/PersonalMemory trait 只有一个实现，删除 trait
+- [x] 补充测试: merge_deltas, format_args_json, parse_retry, request_message_from_choice (8→22)
 - [ ] 前端: 验证流式修复，完善 member_status 展示
 - [ ] 多 workspace 并发支持
