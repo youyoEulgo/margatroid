@@ -18,6 +18,9 @@ pub const CH_RAW_EVENTS: &str = "raw_events";
 /// 前端通过 GET /workspace/{name}/stream 订阅
 pub const CH_WORKSPACE_STREAM: &str = "workspace_stream";
 
+/// 所有成员 LLM 输出的共享流，每个 chunk 含 member_id
+pub const CH_RAW_STREAMS: &str = "raw_streams";
+
 // ── 事件类型 ──
 
 /// offer() 入发布区 或 result(done=true) 出发布区时触发

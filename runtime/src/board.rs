@@ -199,6 +199,8 @@ impl DelegationBoard {
                 map.insert(types::event_index::CH_RAW_EVENTS.into(), tx);
                 let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
                 map.insert(types::event_index::CH_WORKSPACE_STREAM.into(), tx);
+                let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
+                map.insert(types::event_index::CH_RAW_STREAMS.into(), tx);
                 RwLock::new(map)
             },
             notifies: RwLock::new(HashMap::new()),

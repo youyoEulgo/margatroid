@@ -115,6 +115,12 @@ impl Member {
                 };
                 tracing::debug!("raw chunk: {}", chunk_json);
                 board.publish_raw(&did, &chunk_json).await;
+                // 推一条含 member_id 的副本到共享流，供前端多成员展示
+                let tagged = format!(
+                    r#"{{"type":"stream_chunk","member_id":"{}","chunk":{}}}"#,
+                    self.id, chunk_json
+                );
+                board.publish_raw(types::event_index::CH_RAW_STREAMS, &tagged).await;
 
                 let chunk: types::StreamChunk =
                     serde_json::from_str(&chunk_json).unwrap_or_else(|_| {

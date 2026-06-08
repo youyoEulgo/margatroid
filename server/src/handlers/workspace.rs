@@ -5,10 +5,11 @@ use axum::{
     extract::{Path, State},
     response::sse::{Event, Sse},
 };
-use futures::Stream;
+use futures::{Stream, stream};
 use serde::Deserialize;
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
+use types;
 use crate::state::{AnyhowError, AppState};
 
 // ── 请求体 ──
@@ -150,7 +151,7 @@ pub async fn events(
     Sse::new(stream)
 }
 
-/// GET /workspace/{name}/stream — workspace 统一事件流（低频状态，长期保持）
+/// GET /workspace/{name}/stream — workspace 统一事件流（状态事件 + 所有成员 LLM 输出）
 pub async fn stream(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -164,7 +165,7 @@ pub async fn stream(
         }
     };
 
-    let rx = match ws.board.register_listener(types::event_index::CH_WORKSPACE_STREAM).await {
+    let rx_ws = match ws.board.register_listener(types::event_index::CH_WORKSPACE_STREAM).await {
         Some(rx) => rx,
         None => {
             return Sse::new(Box::pin(futures::stream::once(async {
@@ -173,7 +174,9 @@ pub async fn stream(
         }
     };
 
-    let stream = BroadcastStream::new(rx).map(|item| {
+    let rx_raw = ws.board.register_listener(types::event_index::CH_RAW_STREAMS).await;
+
+    let structured = BroadcastStream::new(rx_ws).map(|item| {
         let data = match item {
             Ok(s) => s,
             Err(_) => r#"{"type":"error","content":"stream lagged"}"#.into(),
@@ -181,5 +184,18 @@ pub async fn stream(
         Ok(Event::default().data(data))
     });
 
-    Sse::new(Box::pin(stream))
+    let merged: Pin<Box<dyn Stream<Item = _> + Send>> = if let Some(rx) = rx_raw {
+        let raw = BroadcastStream::new(rx).map(|item| {
+            let data = match item {
+                Ok(s) => s,
+                Err(_) => r#"{"type":"error","content":"stream lagged"}"#.into(),
+            };
+            Ok(Event::default().data(data))
+        });
+        Box::pin(stream::select(structured, raw))
+    } else {
+        Box::pin(structured)
+    };
+
+    Sse::new(merged)
 }
