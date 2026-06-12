@@ -11,6 +11,7 @@ members = [
     "assets",
     "paths",
     "runtime",
+    "runtime_v2",
     "sandbox",
 ]
 

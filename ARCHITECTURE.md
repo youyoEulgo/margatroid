@@ -106,9 +106,17 @@ User 身份成员配 HumanProvider。Manager 可 delegate 给用户成员。Huma
 
 ## SSE 实时推送
 
-`GET /workspace/{name}/events/{task_id}` — 后端把 LLM 返回的每个 `StreamChunk` JSON 原样透传给前端。`execute_finish` 结束时推送 `{"type":"done"}` 关闭连接。
+Margatroid 有三个 broadcast channel，各司其职：
 
-`GET /workspace/{name}/stream` — 前端进 workspace 时的长期订阅。四种事件：
+### Per-task channel
+
+`GET /workspace/{name}/events/{task_id}` — 单条委托的 LLM 流式输出通道。`chat()` 每收一个 chunk 原样透传。`finish` 和 `delegate` 结束时推送 `{"type":"done"}` 标记 LLM 轮次边界，但不关闭连接——子委托返回后可能继续处理同一 task。
+
+只有发起对话端订阅此通道——用户发消息拿到的 task_id 即 manager 的通道。coder/reviewer 等子委托的 per-task 通道无前端监听，其输出走 raw_streams。
+
+### workspace_stream channel
+
+`GET /workspace/{name}/stream` — 全局结构化事件通道。前端进 workspace 时的长期订阅。Board 构造时预建，workspace 存活期间持续推送。承载四类事件：
 
 | 事件 | 触发 | 携带数据 |
 |------|------|----------|
@@ -117,7 +125,23 @@ User 身份成员配 HumanProvider。Manager 可 delegate 给用户成员。Huma
 | member_status | 成员开始/结束处理 | member_id, state(working/idle) |
 | human_request | HumanProvider 创建请求 | session_id, from, to, brief, detail |
 
-**事件桥接**：runtime `trigger_event()` → `raw_events` 通道 → `server/event_bridge.rs` 订阅 → 从 AppState 构造类型化事件 → `publish_raw("workspace_stream")` → 前端 SSE。
+### raw_streams channel
+
+所有成员 LLM 输出的共享通道。`chat()` 每收一个 chunk，在写 per-task 的同时复制一份到 raw_streams，包装为 `{type:"stream_chunk", member_id, chunk}`。前端同一 SSE 连接收到后按 member_id 累计，member_status idle 时刷出为一条消息（非 user/manager 角色缩小字号、降低对比度）。
+
+不经过 event_bridge——chat() 直接用 `publish_raw` 写入，透传即可。
+
+### 双流合并
+
+`server/src/handlers/workspace.rs` 的 `stream()` handler 同时订阅 workspace_stream 和 raw_streams：
+
+```rust
+let structured = BroadcastStream::new(rx_ws);    // 结构事件
+let raw        = BroadcastStream::new(rx_raw);   // 成员 chunk
+let merged     = stream::select(structured, raw); // 合并为一个 SSE
+```
+
+前端一个 EventSource 连接接收两类消息，按 `event.type` 分派。
 
 ## 上下文组装
 

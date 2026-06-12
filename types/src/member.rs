@@ -24,3 +24,11 @@ pub struct MemberDef {
     #[serde(skip)]
     pub soul: String,
 }
+
+/// Workspace 中的成员简介（用于显示）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberProfile {
+    pub id: String,
+    pub display_name: String,
+    pub tags: Vec<String>,
+}

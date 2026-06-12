@@ -12,6 +12,7 @@ use anyhow::{Result, bail};
 /// broadcast 通道缓冲区大小——积压超过此数时丢弃最早消息
 const CHANNEL_CAPACITY: usize = 32;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Notify, RwLock, broadcast};
@@ -177,7 +178,10 @@ impl DelegationBoard {
         member_profiles: Vec<(String, String, Vec<String>)>,
     ) -> Self {
         let init_worklog = Self::format_worklog(&db);
-        let member_ids: HashSet<String> = member_profiles.iter().map(|(id, _, _)| id.clone()).collect();
+        let member_ids: HashSet<String> = member_profiles
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .collect();
         Self {
             publish: RwLock::new(Vec::new()),
             chain: RwLock::new(TaskChain::new(DelegationTask {
@@ -196,11 +200,7 @@ impl DelegationBoard {
             events: {
                 let mut map = HashMap::new();
                 let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
-                map.insert(types::event_index::CH_RAW_EVENTS.into(), tx);
-                let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
-                map.insert(types::event_index::CH_WORKSPACE_STREAM.into(), tx);
-                let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
-                map.insert(types::event_index::CH_RAW_STREAMS.into(), tx);
+                map.insert(types::event_index::CHANNEL_WORKSPACE_STREAM.into(), tx);
                 RwLock::new(map)
             },
             notifies: RwLock::new(HashMap::new()),
@@ -251,15 +251,51 @@ impl DelegationBoard {
         self.chain.read().await.clone()
     }
 
-    /// 通知 server 层有事件发生（server 负责从 state 构造完整消息并推送）
-    /// payload 格式: "event_name" 或 "event_name\ndata"
-    pub async fn trigger_event(&self, event_name: &str, data: &str) {
-        let payload = if data.is_empty() {
-            event_name.to_string()
-        } else {
-            format!("{}\n{}", event_name, data)
+    /// 构造 WorkspaceEvent 推送 workspace_stream
+    pub async fn trigger_event(
+        &self,
+        event_name: &str,
+        delegation_id: &str,
+        data: &str,
+    ) {
+        let (member_id, content) = match event_name {
+            types::event_index::EVENT_BOARD_UPDATE => {
+                let count: usize = data.parse().unwrap_or(0);
+                (String::new(), types::events::EventContent::BoardUpdate {
+                    publish_count: count,
+                })
+            }
+            types::event_index::EVENT_CHAIN_UPDATE => {
+                let chain = self.chain_snapshot().await;
+                let (from, to, brief) = chain
+                    .current_task()
+                    .map_or((String::new(), String::new(), String::new()), |t| {
+                        (t.from.clone(), t.to.clone(), t.brief.clone())
+                    });
+                let head_pos = chain.head_pos();
+                (String::new(), types::events::EventContent::ChainUpdate {
+                    from,
+                    to,
+                    brief,
+                    head_pos,
+                })
+            }
+            types::event_index::EVENT_MEMBER_STATUS => {
+                let parts: Vec<&str> = data.splitn(2, '\n').collect();
+                let mid = parts.first().copied().unwrap_or("").to_string();
+                let state = parts.get(1).copied().unwrap_or("");
+                let content = types::events::EventContent::MemberStatus {
+                    state: state.to_string(),
+                };
+                (mid, content)
+            }
+            _ => return,
         };
-        self.publish_raw(types::event_index::CH_RAW_EVENTS, &payload).await;
+        let payload = types::events::EventPayload::new(event_name, &member_id, delegation_id);
+        let event = types::events::WorkspaceEvent { payload, content };
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        self.publish_raw(types::event_index::CHANNEL_WORKSPACE_STREAM, &json)
+            .await;
     }
 
     /// 推送一条原始数据到指定 delegation
@@ -475,8 +511,10 @@ impl DelegationBoard {
             let cur = publish.len();
             drop(publish);
             tracing::info!("board: publish={} | from={} → to={}", cur, from, target);
-            self.trigger_event(types::event_index::EVENT_BOARD_UPDATE, &cur.to_string()).await;
-            self.trigger_event(types::event_index::EVENT_CHAIN_UPDATE, "").await;
+            self.trigger_event(types::event_index::EVENT_BOARD_UPDATE, &id, &cur.to_string())
+                .await;
+            self.trigger_event(types::event_index::EVENT_CHAIN_UPDATE, &id, "")
+                .await;
             self.notify_member(&target).await;
         }
 
@@ -514,7 +552,8 @@ impl DelegationBoard {
             let mut chain = self.chain.write().await;
             chain.add_result(result, &self.db);
         }
-        self.trigger_event(types::event_index::EVENT_CHAIN_UPDATE, "").await;
+        self.trigger_event(types::event_index::EVENT_CHAIN_UPDATE, &task_id, "")
+            .await;
 
         if !done {
             return Ok(());
@@ -530,7 +569,8 @@ impl DelegationBoard {
             let cur = tasks.len();
             tracing::info!("board: publish={} | archived by {}", cur, member_id);
             drop(tasks);
-            self.trigger_event(types::event_index::EVENT_BOARD_UPDATE, &cur.to_string()).await;
+            self.trigger_event(types::event_index::EVENT_BOARD_UPDATE, &task_id, &cur.to_string())
+                .await;
         }
 
         // 唤醒上级（链头已左移，新链头指向父委托的承接者）

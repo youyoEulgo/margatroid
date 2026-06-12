@@ -130,28 +130,68 @@ SQLite 实时写，但 `DelegationBoard` 持内存缓存。只在启动和根委
 
 ## 7. 事件系统
 
-### 7.1 事件类型库
+Margatroid 事件系统由三条 broadcast 通道、四类结构事件、一条事件桥接组成。
 
-`types/src/events.rs` — 四种事件 struct（Serialize + Deserialize），`fn new()` 构造器。
+### 7.1 三通道模型
 
-`types/src/event_index.rs` — 通道名（`CH_RAW_EVENTS`, `CH_WORKSPACE_STREAM`）和事件名常量（`EVENT_BOARD_UPDATE` 等），三斜杠文档。
+所有通道都是 `broadcast::Sender<String>`，存于 `DelegationBoard.events: HashMap<String, Sender>`。
 
-### 7.2 事件桥接
+| 通道 | key | 创建时机 | 写入者 | 读取者 | 生命周期 |
+|------|-----|----------|--------|--------|----------|
+| per-task | task_id (UUID) | 每次 offer() 动态创建 | chat() | 前端 taskEs | task 结束即废弃 |
+| workspace_stream | 固定字符串 | board 构造时预建 | event_bridge, human.rs | 前端 wsStream | workspace 存活期间 |
+| raw_streams | 固定字符串 | board 构造时预建 | chat() | 前端 wsStream | workspace 存活期间 |
 
-`server/src/event_bridge.rs` — 每 workspace 起 tokio 任务，订阅 `raw_events`，按 `event_name` 分派，从 AppState 获取上下文构造类型化 JSON，推送 `workspace_stream`。
+#### 7.1.1 per-task channel
 
-### 7.3 统一状态通道
+LLM 流式输出的专属通道。`chat()` 每收一个 chunk，原样 `publish_raw(task_id, chunk_json)`。前端通过 `GET /workspace/{name}/events/{task_id}` 订阅。只有发起对话端监听——用户发消息拿到的 task_id 即 manager 的通道，coder/reviewer 等子委托的 per-task 通道无前端监听。
 
-`GET /workspace/{name}/stream` — 前端进 workspace 时的长期订阅。四种事件：
+推送内容为原始 LLM chunk，不经任何加工。`{"type":"done"}` 由 `chat()` 在 finish/delegate 时插入，标记 LLM 轮次边界。
 
-| 事件 | 触发 | 携带数据 |
-|------|------|----------|
+#### 7.1.2 workspace_stream channel
+
+全局结构化事件通道。前端通过 `GET /workspace/{name}/stream` 长期订阅。承载四类事件：
+
+| 事件 type | 触发 | 携带数据 |
+|-----------|------|----------|
 | board_update | offer / result(done=true) | publish_count: usize |
 | chain_update | delegate 右移 / finish 左移 | from, to, brief, head_pos |
-| member_status | 成员开始/结束处理 | member_id, state(working/idle) |
+| member_status | execute_task 开始/结束 | member_id, state (working/idle) |
 | human_request | HumanProvider 创建请求 | session_id, from, to, brief, detail |
 
-### 7.4 推送点
+#### 7.1.3 raw_streams channel
+
+所有成员 LLM 输出的共享通道。`chat()` 每收一个 chunk，在写 per-task 的同时复制一份到 raw_streams，包装为 `{type:"stream_chunk", member_id, chunk}`。前端同一 SSE 连接收到后按 member_id 累计，member_status idle 时刷出为一条消息。
+
+不经过 event_bridge——chat() 直接用 `publish_raw` 写入，透传即可。
+
+### 7.2 双流合并
+
+`server/src/handlers/workspace.rs` 的 `stream()` handler 同时订阅 workspace_stream 和 raw_streams：
+
+```rust
+let structured = BroadcastStream::new(rx_ws);    // 结构事件
+let raw        = BroadcastStream::new(rx_raw);   // 成员 chunk
+let merged     = stream::select(structured, raw); // 合并为一个 SSE
+```
+
+前端一个 EventSource 连接接收两类消息，按 `event.type` 分派。
+
+### 7.3 事件桥接
+
+`server/src/event_bridge.rs` — 每 workspace 一个 tokio task，订阅 CHANNEL_RAW_EVENTS，按 `event_name` 分派：
+
+| 事件名 | 处理 |
+|--------|------|
+| board_update | BoardUpdateEvent::new(count) → JSON |
+| chain_update | 查链当前 task → ChainUpdateEvent::new() → JSON |
+| member_status | 解析 member_id+state → MemberStatusEvent::new() → JSON |
+
+runtime 层通过 `trigger_event()` 写入原始事件名+数据到 raw_events，不构造 JSON、不依赖 types::events。event_bridge 完成从"事件名"到"类型化 JSON"的转换，推送 workspace_stream。
+
+human_request 不在桥接中——它由 `server/src/human.rs` 直接写 workspace_stream，因为触发点在 server 层。
+
+### 7.4 推送点汇总
 
 | 事件 | 触发位置 | 层 |
 |------|----------|-----|
@@ -160,6 +200,7 @@ SQLite 实时写，但 `DelegationBoard` 持内存缓存。只在启动和根委
 | chain_update | `board.result(done=false)` | runtime |
 | member_status | `execute_task` 开始/结束 | runtime |
 | human_request | `human::create_request` handler | server |
+| stream_chunk | `chat()` while 循环 | runtime |
 
 ## 8. 记忆系统（SQLite）
 

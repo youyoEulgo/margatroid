@@ -263,9 +263,12 @@ async fn execute_task(agent: &dyn Agent, board: &DelegationBoard, tools: &[Reque
         tracing::info!("delegation | {} → {} | {}", task.from, task.to, task.brief,);
     }
 
+    let did = task.id.clone();
+
     board
         .trigger_event(
             types::event_index::EVENT_MEMBER_STATUS,
+            &task.id,
             &format!("{}\nworking", agent.id()),
         )
         .await;
@@ -321,6 +324,7 @@ async fn execute_task(agent: &dyn Agent, board: &DelegationBoard, tools: &[Reque
     board
         .trigger_event(
             types::event_index::EVENT_MEMBER_STATUS,
+            &did,
             &format!("{}\nidle", agent.id()),
         )
         .await;
