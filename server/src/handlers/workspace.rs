@@ -5,19 +5,17 @@ use axum::{
     extract::{Path, State},
     response::sse::{Event, Sse},
 };
-use futures::{Stream, stream};
+use futures::Stream;
 use serde::Deserialize;
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
-use types;
 use crate::state::{AnyhowError, AppState};
+use types;
 
 // ── 请求体 ──
 
 /// GET /ws — 列出所有运行中的 workspace
-pub async fn list(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, AnyhowError> {
+pub async fn list(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AnyhowError> {
     let names = state.list_workspace_names().await;
     Ok(Json(serde_json::json!({ "workspaces": names })))
 }
@@ -59,7 +57,9 @@ pub async fn status(
         .await
         .ok_or_else(|| anyhow::anyhow!("workspace '{}' not running", name))?;
     let s = ws.board.status().await;
-    Ok(Json(serde_json::json!({ "publish_count": s.publish_count })))
+    Ok(Json(
+        serde_json::json!({ "publish_count": s.publish_count }),
+    ))
 }
 
 /// GET /workspace/{name}/tasks
@@ -140,9 +140,7 @@ pub async fn events(
     });
 
     let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if already_done {
-        let done = futures::stream::once(async {
-            Ok(Event::default().data(r#"{"type":"done"}"#))
-        });
+        let done = futures::stream::once(async { Ok(Event::default().data(r#"{"type":"done"}"#)) });
         Box::pin(done.chain(broadcast))
     } else {
         Box::pin(broadcast)
@@ -151,7 +149,7 @@ pub async fn events(
     Sse::new(stream)
 }
 
-/// GET /workspace/{name}/stream — workspace 统一事件流（状态事件 + 所有成员 LLM 输出）
+/// GET /workspace/{name}/stream — workspace 统一事件流
 pub async fn stream(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -165,7 +163,11 @@ pub async fn stream(
         }
     };
 
-    let rx_ws = match ws.board.register_listener(types::event_index::CH_WORKSPACE_STREAM).await {
+    let rx = match ws
+        .board
+        .register_listener(types::event_index::CHANNEL_WORKSPACE_STREAM)
+        .await
+    {
         Some(rx) => rx,
         None => {
             return Sse::new(Box::pin(futures::stream::once(async {
@@ -174,9 +176,7 @@ pub async fn stream(
         }
     };
 
-    let rx_raw = ws.board.register_listener(types::event_index::CH_RAW_STREAMS).await;
-
-    let structured = BroadcastStream::new(rx_ws).map(|item| {
+    let stream = BroadcastStream::new(rx).map(|item| {
         let data = match item {
             Ok(s) => s,
             Err(_) => r#"{"type":"error","content":"stream lagged"}"#.into(),
@@ -184,18 +184,5 @@ pub async fn stream(
         Ok(Event::default().data(data))
     });
 
-    let merged: Pin<Box<dyn Stream<Item = _> + Send>> = if let Some(rx) = rx_raw {
-        let raw = BroadcastStream::new(rx).map(|item| {
-            let data = match item {
-                Ok(s) => s,
-                Err(_) => r#"{"type":"error","content":"stream lagged"}"#.into(),
-            };
-            Ok(Event::default().data(data))
-        });
-        Box::pin(stream::select(structured, raw))
-    } else {
-        Box::pin(structured)
-    };
-
-    Sse::new(merged)
+    Sse::new(Box::pin(stream))
 }

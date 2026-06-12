@@ -68,13 +68,24 @@ pub async fn create_request(
             let to = task.map(|t| t.to.clone()).unwrap_or_default();
             let brief = task.map(|t| t.brief.clone()).unwrap_or_default();
             let detail = task.map(|t| t.detail.clone()).unwrap_or_default();
-            let event = types::events::HumanRequestEvent::new(
-                session_id.clone(),
-                from, to, brief, detail,
-            );
+
+            let event = types::events::WorkspaceEvent {
+                payload: types::events::EventPayload::new(
+                    "human_request",
+                    &to,
+                    &session_id,
+                ),
+                content: types::events::EventContent::HumanRequest {
+                    session_id: session_id.clone(),
+                    from,
+                    to,
+                    brief,
+                    detail,
+                },
+            };
             let json = serde_json::to_string(&event).unwrap_or_default();
             ws.board
-                .publish_raw(types::event_index::CH_WORKSPACE_STREAM, &json)
+                .publish_raw(types::event_index::CHANNEL_WORKSPACE_STREAM, &json)
                 .await;
         }
     }

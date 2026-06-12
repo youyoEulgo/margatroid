@@ -159,9 +159,6 @@ impl AppState {
 
         let ws = Arc::new(runtime::Workspace::start(compose, entries).await?);
 
-        // 启动事件桥接：runtime → 事件名 → server 构造消息 → 前端 SSE
-        crate::event_bridge::spawn_event_bridge(ws.board.clone());
-
         self.workspaces.write().await.insert(name, ws);
         Ok(())
     }

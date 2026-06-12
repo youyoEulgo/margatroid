@@ -115,12 +115,6 @@ impl Member {
                 };
                 tracing::debug!("raw chunk: {}", chunk_json);
                 board.publish_raw(&did, &chunk_json).await;
-                // 推一条含 member_id 的副本到共享流，供前端多成员展示
-                let tagged = format!(
-                    r#"{{"type":"stream_chunk","member_id":"{}","chunk":{}}}"#,
-                    self.id, chunk_json
-                );
-                board.publish_raw(types::event_index::CH_RAW_STREAMS, &tagged).await;
 
                 let chunk: types::StreamChunk =
                     serde_json::from_str(&chunk_json).unwrap_or_else(|_| {
@@ -132,6 +126,23 @@ impl Member {
                             usage: None,
                         }
                     });
+
+                // 新版: 构造 WorkspaceEvent 推 workspace_stream（与旧版 raw_streams 共存）
+                let event = types::events::WorkspaceEvent {
+                    payload: types::events::EventPayload::new(
+                        types::event_index::EVENT_STREAM_CHUNK,
+                        &self.id,
+                        &did,
+                    ),
+                    content: types::events::EventContent::StreamChunk {
+                        chunk: chunk.clone(),
+                    },
+                };
+                if let Ok(json) = serde_json::to_string(&event) {
+                    board
+                        .publish_raw(types::event_index::CHANNEL_WORKSPACE_STREAM, &json)
+                        .await;
+                }
 
                 if chunk.choices.is_empty() {
                     // ChatResponse 降级：解析为完整响应
