@@ -1,5 +1,6 @@
 pub mod error;
 pub mod traits;
+pub mod client;
 
 pub mod deepseek;
 pub mod human;
@@ -12,6 +13,12 @@ pub use types::DynAiProvider;
 // 方便外部直接构造 provider
 pub use deepseek::DeepSeekProvider;
 pub use openrouter::OpenRouterProvider;
+
+// 导出 Client
+pub use client::Client;
+
+// 导出 verbose 日志函数
+pub use client::verbose_stream_done;
 
 use anyhow::{Result, bail};
 use std::sync::Arc;
