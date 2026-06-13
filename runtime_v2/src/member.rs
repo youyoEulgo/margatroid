@@ -9,9 +9,9 @@ use sandbox::SandboxManager;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use types::{
-    FinishReason, Identity, RequestMessage, RequestTool, ResponseChoice,
     message::{ChatMessage, MessageContent, Role, ToolMessage},
     tool::ResponseToolCall,
+    FinishReason, Identity, RequestMessage, RequestTool, ResponseChoice,
 };
 
 use crate::board::DelegationBoard;
@@ -75,7 +75,12 @@ impl Member {
     }
 
     /// 发送事件到 workspace 统一事件流
-    fn send_event(&self, event_name: &str, delegation_id: &str, content: types::events::EventContent) {
+    fn send_event(
+        &self,
+        event_name: &str,
+        delegation_id: &str,
+        content: types::events::EventContent,
+    ) {
         let payload = types::events::EventPayload::new(event_name, &self.id, delegation_id);
         let event = types::events::WorkspaceEvent { payload, content };
         if let Ok(json) = serde_json::to_string(&event) {
@@ -102,7 +107,8 @@ impl Agent for Member {
         system_prompt: &str,
         member_profiles: &[types::MemberProfile],
     ) -> Result<ChatOutcome> {
-        self.chat(board, tools, system_prompt, member_profiles).await
+        self.chat(board, tools, system_prompt, member_profiles)
+            .await
     }
 }
 
@@ -134,7 +140,8 @@ impl Member {
             .map(RequestMessage::Chat)
             .collect();
 
-        let did = chain.current_task()
+        let did = chain
+            .current_task()
             .map(|t| t.id.clone())
             .unwrap_or_default();
 
@@ -158,13 +165,11 @@ impl Member {
 
                 // 解析 chunk
                 let chunk: types::StreamChunk =
-                    serde_json::from_str(&chunk_json).unwrap_or_else(|_| {
-                        types::StreamChunk {
-                            id: String::new(),
-                            model: String::new(),
-                            choices: vec![],
-                            usage: None,
-                        }
+                    serde_json::from_str(&chunk_json).unwrap_or_else(|_| types::StreamChunk {
+                        id: String::new(),
+                        model: String::new(),
+                        choices: vec![],
+                        usage: None,
                     });
 
                 // 发送 stream_chunk 事件
@@ -181,7 +186,8 @@ impl Member {
                     if let Ok(resp) = serde_json::from_str::<types::ChatResponse>(&chunk_json) {
                         if let Some(choice) = resp.choices.first() {
                             full_content = choice.message.content.clone().unwrap_or_default();
-                            full_reasoning = choice.message.reasoning_content.clone().unwrap_or_default();
+                            full_reasoning =
+                                choice.message.reasoning_content.clone().unwrap_or_default();
                             full_tool_calls = choice.message.tool_calls.clone().unwrap_or_default();
                             finish_reason = choice.finish_reason.clone();
                         }
@@ -370,7 +376,9 @@ async fn save_conversation(board: &DelegationBoard, agent_id: &str, content: &st
     if delegation_id.is_empty() {
         return;
     }
-    let _ = board.db().conversation_add(&delegation_id, agent_id, content);
+    let _ = board
+        .db()
+        .conversation_add(&delegation_id, agent_id, content);
 }
 
 fn format_args_json(json: &str) -> String {
@@ -432,31 +440,44 @@ fn format_args_json(json: &str) -> String {
 
 fn merge_deltas(full: &mut Vec<ResponseToolCall>, deltas: &[types::tool::ToolCallDelta]) {
     for delta in deltas {
-        let delta_id = match &delta.id {
-            Some(id) => id,
-            None => continue, // 没有 id 的 delta 跳过
-        };
+        let idx = delta.index as usize;
 
-        if let Some(existing) = full.iter_mut().find(|tc| &tc.id == delta_id) {
-            // 合并 function name 和 arguments
-            if let Some(ref f) = delta.function {
-                if let Some(ref name) = f.name {
-                    existing.function.name = name.clone();
-                }
-                if let Some(ref args) = f.arguments {
-                    existing.function.arguments.push_str(args);
-                }
-            }
-        } else {
-            // 新 tool call
+        // 自动填充空白占位符，确保 full[idx] 存在
+        while full.len() <= idx {
             full.push(ResponseToolCall {
-                id: delta_id.clone(),
-                r#type: delta.r#type.clone().unwrap_or_else(|| "function".to_string()),
+                id: String::new(),
+                r#type: "function".into(),
                 function: types::tool::ResponseFunctionCall {
-                    name: delta.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default(),
-                    arguments: delta.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default(),
+                    name: String::new(),
+                    arguments: String::new(),
                 },
             });
+        }
+
+        let existing = &mut full[idx];
+
+        // 累积 id（如果有）
+        if let Some(id) = &delta.id {
+            if !id.is_empty() {
+                existing.id.clone_from(id);
+            }
+        }
+
+        // 累积 type（如果有）
+        if let Some(t) = &delta.r#type {
+            existing.r#type.clone_from(t);
+        }
+
+        // 累积 function 信息
+        if let Some(ref f) = delta.function {
+            if let Some(ref name) = f.name {
+                if !name.is_empty() {
+                    existing.function.name.clone_from(name);
+                }
+            }
+            if let Some(ref args) = f.arguments {
+                existing.function.arguments.push_str(args);
+            }
         }
     }
 }
