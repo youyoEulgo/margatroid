@@ -218,6 +218,16 @@ impl Member {
                 full_tool_calls.len(),
             );
 
+            // Debug: 打印最终累积的 tool_calls
+            for tc in &full_tool_calls {
+                tracing::debug!(
+                    "final tool_call | id={} | name={} | args_len={}",
+                    tc.id,
+                    tc.function.name,
+                    tc.function.arguments.len()
+                );
+            }
+
             // verbose 日志：流式摘要
             if self.client.is_verbose() {
                 let tc_str = full_tool_calls
@@ -320,6 +330,24 @@ impl Member {
                 drop(sandbox_guard);
 
                 if should_break {
+                    // 发送 chain_update 事件（任务完成，链左移）
+                    let chain = board.chain_snapshot().await;
+                    let (from, to, brief) = chain
+                        .current_task()
+                        .map_or((String::new(), String::new(), String::new()), |t| {
+                            (t.from.clone(), t.to.clone(), t.brief.clone())
+                        });
+                    let head_pos = chain.head;
+                    self.send_event(
+                        types::event_index::EVENT_CHAIN_UPDATE,
+                        &did,
+                        types::events::EventContent::ChainUpdate {
+                            from,
+                            to,
+                            brief,
+                            head_pos,
+                        },
+                    );
                     break break_content;
                 }
             }
