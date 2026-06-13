@@ -194,36 +194,72 @@ async fn cmd_compose_up(path: &str, verbose: bool) -> Result<()> {
         match def.identity {
             types::Identity::Manager => {
                 let provider = providers::resolve(&def.provider, &app_config.ai)?;
-                let client = runtime::Client::new(def.model.clone(), provider, verbose);
-                let member = Arc::new(runtime::Member::new(
-                    &def.id,
-                    def.soul.clone(),
-                    def.identity.clone(),
-                    client,
-                    sandbox.clone(),
-                ));
-                entries.push(runtime::AgentEntry {
-                    agent: member,
+                let client = providers::Client::new(def.model.clone(), provider, verbose);
+
+                // V2 兼容：传入 client 和 sandbox，让 Workspace 内部构造 Member
+                use runtime_v2::Agent;
+                #[derive(Clone)]
+                struct DummyAgent { id: String, identity: types::Identity }
+                #[async_trait::async_trait]
+                impl Agent for DummyAgent {
+                    fn id(&self) -> &str { &self.id }
+                    fn identity(&self) -> &types::Identity { &self.identity }
+                    async fn process(
+                        &self,
+                        _board: &runtime_v2::DelegationBoard,
+                        _tools: &[types::RequestTool],
+                        _system_prompt: &str,
+                        _member_profiles: &[types::MemberProfile],
+                    ) -> anyhow::Result<runtime_v2::ChatOutcome> {
+                        unreachable!("DummyAgent should never be called - Workspace will reconstruct real Member")
+                    }
+                }
+
+                entries.push(runtime_v2::AgentEntry {
+                    agent: Arc::new(DummyAgent {
+                        id: def.id.clone(),
+                        identity: def.identity.clone()
+                    }),
                     soul: def.soul.clone(),
-                    tools: runtime::manager_tools(),
+                    tools: runtime_v2::manager_tools(),
                     skills: def.skills.clone(),
+                    client: Some(client),
+                    sandbox: Some(sandbox.clone()),
                 });
             }
             types::Identity::Member => {
                 let provider = providers::resolve(&def.provider, &app_config.ai)?;
-                let client = runtime::Client::new(def.model.clone(), provider, verbose);
-                let member = Arc::new(runtime::Member::new(
-                    &def.id,
-                    def.soul.clone(),
-                    def.identity.clone(),
-                    client,
-                    sandbox.clone(),
-                ));
-                entries.push(runtime::AgentEntry {
-                    agent: member,
+                let client = providers::Client::new(def.model.clone(), provider, verbose);
+
+                // V2 兼容：传入 client 和 sandbox，让 Workspace 内部构造 Member
+                use runtime_v2::Agent;
+                #[derive(Clone)]
+                struct DummyAgent { id: String, identity: types::Identity }
+                #[async_trait::async_trait]
+                impl Agent for DummyAgent {
+                    fn id(&self) -> &str { &self.id }
+                    fn identity(&self) -> &types::Identity { &self.identity }
+                    async fn process(
+                        &self,
+                        _board: &runtime_v2::DelegationBoard,
+                        _tools: &[types::RequestTool],
+                        _system_prompt: &str,
+                        _member_profiles: &[types::MemberProfile],
+                    ) -> anyhow::Result<runtime_v2::ChatOutcome> {
+                        unreachable!("DummyAgent should never be called - Workspace will reconstruct real Member")
+                    }
+                }
+
+                entries.push(runtime_v2::AgentEntry {
+                    agent: Arc::new(DummyAgent {
+                        id: def.id.clone(),
+                        identity: def.identity.clone()
+                    }),
                     soul: def.soul.clone(),
-                    tools: runtime::base_tools(),
+                    tools: runtime_v2::base_tools(),
                     skills: def.skills.clone(),
+                    client: Some(client),
+                    sandbox: Some(sandbox.clone()),
                 });
             }
             types::Identity::User => {
@@ -239,19 +275,37 @@ async fn cmd_compose_up(path: &str, verbose: bool) -> Result<()> {
                     provider_config.base_url.clone(),
                     compose.workspace.name.clone(),
                 )) as Arc<dyn providers::DynAiProvider>;
-                let client = runtime::Client::new(def.model.clone(), provider, verbose);
-                let member = Arc::new(runtime::Member::new(
-                    &def.id,
-                    def.soul.clone(),
-                    def.identity.clone(),
-                    client,
-                    sandbox.clone(),
-                ));
-                entries.push(runtime::AgentEntry {
-                    agent: member,
+                let client = providers::Client::new(def.model.clone(), provider, verbose);
+
+                // V2 兼容：传入 client 和 sandbox，让 Workspace 内部构造 Member
+                use runtime_v2::Agent;
+                #[derive(Clone)]
+                struct DummyAgent { id: String, identity: types::Identity }
+                #[async_trait::async_trait]
+                impl Agent for DummyAgent {
+                    fn id(&self) -> &str { &self.id }
+                    fn identity(&self) -> &types::Identity { &self.identity }
+                    async fn process(
+                        &self,
+                        _board: &runtime_v2::DelegationBoard,
+                        _tools: &[types::RequestTool],
+                        _system_prompt: &str,
+                        _member_profiles: &[types::MemberProfile],
+                    ) -> anyhow::Result<runtime_v2::ChatOutcome> {
+                        unreachable!("DummyAgent should never be called - Workspace will reconstruct real Member")
+                    }
+                }
+
+                entries.push(runtime_v2::AgentEntry {
+                    agent: Arc::new(DummyAgent {
+                        id: def.id.clone(),
+                        identity: def.identity.clone()
+                    }),
                     soul: def.soul.clone(),
-                    tools: runtime::base_tools(),
+                    tools: runtime_v2::base_tools(),
                     skills: def.skills.clone(),
+                    client: Some(client),
+                    sandbox: Some(sandbox.clone()),
                 });
             }
         }
