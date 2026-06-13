@@ -25,6 +25,9 @@ pub struct AgentEntry {
     pub soul: String,
     pub tools: Vec<RequestTool>,
     pub skills: Vec<String>,
+    // V2 兼容字段：用于在 Workspace 内部重新构造 Member
+    pub client: Option<providers::Client>,
+    pub sandbox: Option<Arc<RwLock<SandboxManager>>>,
 }
 
 /// Workspace 运行时
@@ -35,6 +38,7 @@ pub struct Workspace {
     pub db: Arc<SqliteMemory>,
     pub system_prompt: String,
     pub member_profiles: Vec<MemberProfile>,
+    pub event_bus: Arc<EventBus>,
 
     handles: Vec<tokio::task::JoinHandle<()>>,
     shutdown: CancellationToken,
@@ -94,6 +98,7 @@ impl Workspace {
             db,
             system_prompt,
             member_profiles,
+            event_bus,
             handles,
             shutdown,
         })
@@ -119,6 +124,78 @@ impl Workspace {
             let _ = handle.await;
         }
         tracing::info!("workspace '{}' shutdown", self.name);
+    }
+
+    /// 兼容层：V1 风格的 start() 方法
+    /// 从 ComposeFile 提取参数并调用 new()
+    pub async fn start(
+        compose: &types::ComposeFile,
+        entries: Vec<AgentEntry>,
+    ) -> Result<Self> {
+        // 提取配置
+        let name = compose.workspace.name.clone();
+        let system_prompt = compose.workspace.system_prompt.clone();
+
+        // 创建全局 EventBus（V1 兼容模式，每个 workspace 独立 EventBus）
+        let event_bus = Arc::new(EventBus::new());
+
+        // 构造 member_profiles 并重新构造 Member（注入 event_bus 和 workspace_name）
+        let mut member_profiles = Vec::new();
+        let mut new_entries = Vec::new();
+
+        for entry in entries {
+            let id = entry.agent.id().to_string();
+            let identity = entry.agent.identity();
+            let display_name = match identity {
+                types::Identity::Manager => "经理",
+                types::Identity::Member => "成员",
+                types::Identity::User => "用户",
+            }
+            .to_string();
+            member_profiles.push(types::MemberProfile {
+                id: id.clone(),
+                display_name,
+                tags: entry.skills.clone(),
+            });
+
+            // 重新构造 Member（如果提供了 client 和 sandbox）
+            let new_agent: Arc<dyn Agent> = if let (Some(client), Some(sandbox)) = (entry.client, entry.sandbox) {
+                Arc::new(crate::member::Member::new(
+                    &id,
+                    entry.soul.clone(),
+                    identity.clone(),
+                    client,
+                    sandbox,
+                    event_bus.clone(),
+                    name.clone(),
+                ))
+            } else {
+                // 没有提供构造参数，直接使用原 agent（可能是测试用的 mock）
+                entry.agent
+            };
+
+            new_entries.push(AgentEntry {
+                agent: new_agent,
+                soul: entry.soul,
+                tools: entry.tools,
+                skills: entry.skills,
+                client: None,
+                sandbox: None,
+            });
+        }
+
+        // 构造 db_path（与 v1 保持一致）
+        let db_path = std::path::PathBuf::from(".margatroid")
+            .join("workspace")
+            .join(&name)
+            .join("memory.db");
+
+        // 确保父目录存在
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        Self::new(name, system_prompt, member_profiles, new_entries, event_bus, db_path).await
     }
 }
 

@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
@@ -20,7 +21,7 @@ assets = { path = "../assets" }
 compose = { path = "../compose" }
 paths = { path = "../paths" }
 providers = { path = "../providers" }
-runtime = { path = "../runtime" }
+runtime_v2 = { path = "../runtime_v2" }
 server = { path = "../server" }
 types = { path = "../types" }
 sandbox = { path = "../sandbox" }

@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use providers::DynAiProvider;
-use runtime;
+use runtime_v2 as runtime;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -84,9 +84,8 @@ pub async fn create_request(
                 },
             };
             let json = serde_json::to_string(&event).unwrap_or_default();
-            ws.board
-                .publish_raw(types::event_index::CHANNEL_WORKSPACE_STREAM, &json)
-                .await;
+            let channel_name = format!("{}/stream", body.workspace);
+            let _ = ws.event_bus.send(&channel_name, json);
         }
     }
 

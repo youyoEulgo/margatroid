@@ -23,5 +23,5 @@ pub use board::{DelegationBoard, DelegationTask, TaskResult, TaskChain, BoardSta
 pub use memory::SqliteMemory;
 pub use context::{assemble_prompt, format_chain, format_worklog};
 pub use member::{Agent, ChatOutcome, Member};
-pub use workspace::Workspace;
-pub use tools::{execute_tool, ToolExecResult};
+pub use workspace::{AgentEntry, Workspace};
+pub use tools::{execute_tool, ToolExecResult, base_tools, manager_tools};

@@ -24,7 +24,7 @@ uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 providers = { path = "../providers" }
 types = { path = "../types" }
-runtime = { path = "../runtime" }
+runtime_v2 = { path = "../runtime_v2" }
 compose = { path = "../compose" }
 sandbox = { path = "../sandbox" }
 bridge = { path = "../bridge" }

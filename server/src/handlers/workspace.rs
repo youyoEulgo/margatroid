@@ -114,11 +114,14 @@ pub async fn events(
         }
     };
 
-    let rx = match ws.board.register_listener(&task_id).await {
+    // V2: 订阅 workspace 级别的流
+    // TODO: 暂时不过滤，返回所有事件（前端自行过滤 task_id）
+    let channel_name = format!("{}/stream", name);
+    let rx = match ws.event_bus.subscribe(&channel_name) {
         Some(rx) => rx,
         None => {
             return Sse::new(Box::pin(futures::stream::once(async {
-                Ok(Event::default().data(r#"{"type":"error","content":"task not found"}"#))
+                Ok(Event::default().data(r#"{"type":"error","content":"no stream"}"#))
             })));
         }
     };
@@ -163,11 +166,8 @@ pub async fn stream(
         }
     };
 
-    let rx = match ws
-        .board
-        .register_listener(types::event_index::CHANNEL_WORKSPACE_STREAM)
-        .await
-    {
+    let channel_name = format!("{}/stream", name);
+    let rx = match ws.event_bus.subscribe(&channel_name) {
         Some(rx) => rx,
         None => {
             return Sse::new(Box::pin(futures::stream::once(async {
