@@ -228,14 +228,7 @@ mod tests {
             head: 0,
         };
 
-        let messages = assemble_prompt(
-            "系统提示",
-            &profiles,
-            "",
-            &chain,
-            "你是 Alice",
-            "记忆内容",
-        );
+        let messages = assemble_prompt("系统提示", &profiles, "", &chain, "你是 Alice", "记忆内容");
 
         // 验证消息顺序
         assert!(messages.len() >= 5);
