@@ -252,18 +252,16 @@ impl DelegationBoard {
     }
 
     /// 构造 WorkspaceEvent 推送 workspace_stream
-    pub async fn trigger_event(
-        &self,
-        event_name: &str,
-        delegation_id: &str,
-        data: &str,
-    ) {
+    pub async fn trigger_event(&self, event_name: &str, delegation_id: &str, data: &str) {
         let (member_id, content) = match event_name {
             types::event_index::EVENT_BOARD_UPDATE => {
                 let count: usize = data.parse().unwrap_or(0);
-                (String::new(), types::events::EventContent::BoardUpdate {
-                    publish_count: count,
-                })
+                (
+                    String::new(),
+                    types::events::EventContent::BoardUpdate {
+                        publish_count: count,
+                    },
+                )
             }
             types::event_index::EVENT_CHAIN_UPDATE => {
                 let chain = self.chain_snapshot().await;
@@ -273,12 +271,15 @@ impl DelegationBoard {
                         (t.from.clone(), t.to.clone(), t.brief.clone())
                     });
                 let head_pos = chain.head_pos();
-                (String::new(), types::events::EventContent::ChainUpdate {
-                    from,
-                    to,
-                    brief,
-                    head_pos,
-                })
+                (
+                    String::new(),
+                    types::events::EventContent::ChainUpdate {
+                        from,
+                        to,
+                        brief,
+                        head_pos,
+                    },
+                )
             }
             types::event_index::EVENT_MEMBER_STATUS => {
                 let parts: Vec<&str> = data.splitn(2, '\n').collect();
@@ -291,8 +292,11 @@ impl DelegationBoard {
             }
             _ => return,
         };
-        let payload = types::events::EventPayload::new(event_name, &member_id, delegation_id);
-        let event = types::events::WorkspaceEvent { payload, content };
+        let payload = types::events::EventMetadata::new(event_name, &member_id, delegation_id);
+        let event = types::events::WorkspaceEvent {
+            metadata: payload,
+            content,
+        };
         let json = serde_json::to_string(&event).unwrap_or_default();
         self.publish_raw(types::event_index::CHANNEL_WORKSPACE_STREAM, &json)
             .await;
@@ -511,8 +515,12 @@ impl DelegationBoard {
             let cur = publish.len();
             drop(publish);
             tracing::info!("board: publish={} | from={} → to={}", cur, from, target);
-            self.trigger_event(types::event_index::EVENT_BOARD_UPDATE, &id, &cur.to_string())
-                .await;
+            self.trigger_event(
+                types::event_index::EVENT_BOARD_UPDATE,
+                &id,
+                &cur.to_string(),
+            )
+            .await;
             self.trigger_event(types::event_index::EVENT_CHAIN_UPDATE, &id, "")
                 .await;
             self.notify_member(&target).await;
@@ -569,8 +577,12 @@ impl DelegationBoard {
             let cur = tasks.len();
             tracing::info!("board: publish={} | archived by {}", cur, member_id);
             drop(tasks);
-            self.trigger_event(types::event_index::EVENT_BOARD_UPDATE, &task_id, &cur.to_string())
-                .await;
+            self.trigger_event(
+                types::event_index::EVENT_BOARD_UPDATE,
+                &task_id,
+                &cur.to_string(),
+            )
+            .await;
         }
 
         // 唤醒上级（链头已左移，新链头指向父委托的承接者）

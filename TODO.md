@@ -10,5 +10,7 @@
 - [x] board.rs: broadcast::channel(32) 提取为常量 CHANNEL_CAPACITY
 - [x] memory.rs: Worklog/PersonalMemory trait 只有一个实现，删除 trait
 - [x] 补充测试: merge_deltas, format_args_json, parse_retry, request_message_from_choice (8→22)
-- [ ] 前端: 验证流式修复，完善 member_status 展示
+- [x] 后端事件格式规范化: EventPayload→EventMetadata, flatten 移除, tag→untagged, 单 EventBus 通道
+- [x] 前端事件系统清理: 统一类型定义, 5 handler, 删 streamEvents/DONE/taskEs, 实时 streaming
 - [ ] 多 workspace 并发支持
+- [ ] runtime → runtime_v2 完全迁移，消除双写

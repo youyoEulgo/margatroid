@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use types::events::{EventContent, EventPayload, WorkspaceEvent};
+use types::events::{EventContent, EventMetadata, WorkspaceEvent};
 
 use crate::board::{DelegationBoard, TaskResult};
 use crate::events::EventBus;
@@ -175,9 +175,9 @@ fn send_event(
     delegation_id: &str,
     content: &EventContent,
 ) {
-    let payload = EventPayload::new(event_type, member_id, delegation_id);
+    let payload = EventMetadata::new(event_type, member_id, delegation_id);
     let event = WorkspaceEvent {
-        payload,
+        metadata: payload,
         content: content.clone(),
     };
     if let Ok(json) = serde_json::to_string(&event) {

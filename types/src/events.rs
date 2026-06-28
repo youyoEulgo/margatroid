@@ -1,22 +1,21 @@
 /// Workspace 统一事件流（通过 SSE /workspace/{name}/stream 推送给前端）
 ///
-/// WorkspaceEvent = EventPayload + EventContent
-/// 所有事件走同一根通道，前端按 `type` 字段分派。
-
+/// WorkspaceEvent = EventMetadata + EventContent
+/// 顶层只有 metadata 和 content，前端按 metadata.event 分派，content 可直接反序列化。
 use serde::Serialize;
 
 use crate::StreamChunk;
 
 /// 事件元数据
 #[derive(Debug, Clone, Serialize)]
-pub struct EventPayload {
+pub struct EventMetadata {
     pub event: String,
     pub member_id: String,
     pub delegation_id: String,
     pub timestamp: u64,
 }
 
-impl EventPayload {
+impl EventMetadata {
     pub fn new(event: &str, member_id: &str, delegation_id: &str) -> Self {
         Self {
             event: event.to_string(),
@@ -28,33 +27,31 @@ impl EventPayload {
                 .as_secs(),
         }
     }
+
+    #[cfg(test)]
+    pub fn with_timestamp(mut self, ts: u64) -> Self {
+        self.timestamp = ts;
+        self
+    }
 }
 
 /// workspace 统一事件
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceEvent {
-    pub payload: EventPayload,
-
-    #[serde(flatten)]
+    pub metadata: EventMetadata,
     pub content: EventContent,
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type")]
+#[serde(untagged)]
 pub enum EventContent {
     /// LLM 流式 chunk——直接复用 types 里的 StreamChunk
-    #[serde(rename = "stream_chunk")]
-    StreamChunk {
-        #[serde(flatten)]
-        chunk: StreamChunk,
-    },
+    StreamChunk { chunk: StreamChunk },
 
     /// offer() 入发布区 或 result(done=true) 出发布区
-    #[serde(rename = "board_update")]
     BoardUpdate { publish_count: usize },
 
     /// 任务链变化（delegate 右移 或 finish 左移）
-    #[serde(rename = "chain_update")]
     ChainUpdate {
         from: String,
         to: String,
@@ -63,11 +60,9 @@ pub enum EventContent {
     },
 
     /// 成员执行状态变化（开始处理 / 恢复空闲）
-    #[serde(rename = "member_status")]
     MemberStatus { state: String },
 
     /// 人类成员收到委托（HumanProvider 创建请求时触发）
-    #[serde(rename = "human_request")]
     HumanRequest {
         session_id: String,
         from: String,
@@ -83,16 +78,10 @@ mod tests {
 
     #[test]
     fn workspace_event_json_shape() {
-        let payload = EventPayload {
-            event: "stream_chunk".into(),
-            member_id: "coder".into(),
-            delegation_id: "d-001".into(),
-            timestamp: 1700000000,
-        };
-
         // stream_chunk
         let ev = WorkspaceEvent {
-            payload: payload.clone(),
+            metadata: EventMetadata::new("stream_chunk", "coder", "d-001")
+                .with_timestamp(1700000000),
             content: EventContent::StreamChunk {
                 chunk: StreamChunk {
                     id: "chat-1".into(),
@@ -104,37 +93,25 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "stream_chunk");
-        assert_eq!(v["payload"]["event"], "stream_chunk");
-        assert_eq!(v["payload"]["member_id"], "coder");
-        assert_eq!(v["id"], "chat-1");
+        assert_eq!(v["metadata"]["event"], "stream_chunk");
+        assert_eq!(v["metadata"]["member_id"], "coder");
+        assert_eq!(v["content"]["chunk"]["id"], "chat-1");
+        assert!(v.get("type").is_none());
 
         // board_update
-        let payload = EventPayload {
-            event: "board_update".into(),
-            member_id: String::new(),
-            delegation_id: String::new(),
-            timestamp: 1700000001,
-        };
         let json = serde_json::to_string(&WorkspaceEvent {
-            payload: payload.clone(),
+            metadata: EventMetadata::new("board_update", "", "").with_timestamp(1700000001),
             content: EventContent::BoardUpdate { publish_count: 3 },
         })
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "board_update");
-        assert_eq!(v["payload"]["event"], "board_update");
-        assert_eq!(v["publish_count"], 3);
+        assert_eq!(v["metadata"]["event"], "board_update");
+        assert_eq!(v["content"]["publish_count"], 3);
+        assert!(v.get("type").is_none());
 
         // chain_update
-        let payload = EventPayload {
-            event: "chain_update".into(),
-            member_id: String::new(),
-            delegation_id: String::new(),
-            timestamp: 1700000002,
-        };
         let json = serde_json::to_string(&WorkspaceEvent {
-            payload: payload.clone(),
+            metadata: EventMetadata::new("chain_update", "", "").with_timestamp(1700000002),
             content: EventContent::ChainUpdate {
                 from: "manager".into(),
                 to: "coder".into(),
@@ -144,38 +121,26 @@ mod tests {
         })
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "chain_update");
-        assert_eq!(v["payload"]["event"], "chain_update");
-        assert_eq!(v["from"], "manager");
+        assert_eq!(v["metadata"]["event"], "chain_update");
+        assert_eq!(v["content"]["from"], "manager");
+        assert!(v.get("type").is_none());
 
         // member_status
-        let payload = EventPayload {
-            event: "member_status".into(),
-            member_id: "coder".into(),
-            delegation_id: "d-001".into(),
-            timestamp: 1700000003,
-        };
         let json = serde_json::to_string(&WorkspaceEvent {
-            payload: payload.clone(),
+            metadata: EventMetadata::new("member_status", "coder", "d-001").with_timestamp(1700000003),
             content: EventContent::MemberStatus {
                 state: "working".into(),
             },
         })
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "member_status");
-        assert_eq!(v["payload"]["event"], "member_status");
-        assert_eq!(v["state"], "working");
+        assert_eq!(v["metadata"]["event"], "member_status");
+        assert_eq!(v["content"]["state"], "working");
+        assert!(v.get("type").is_none());
 
         // human_request
-        let payload = EventPayload {
-            event: "human_request".into(),
-            member_id: String::new(),
-            delegation_id: String::new(),
-            timestamp: 1700000004,
-        };
         let json = serde_json::to_string(&WorkspaceEvent {
-            payload,
+            metadata: EventMetadata::new("human_request", "", "").with_timestamp(1700000004),
             content: EventContent::HumanRequest {
                 session_id: "h-001".into(),
                 from: "manager".into(),
@@ -186,9 +151,9 @@ mod tests {
         })
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "human_request");
-        assert_eq!(v["payload"]["event"], "human_request");
-        assert_eq!(v["from"], "manager");
-        assert_eq!(v["to"], "user");
+        assert_eq!(v["metadata"]["event"], "human_request");
+        assert_eq!(v["content"]["from"], "manager");
+        assert_eq!(v["content"]["to"], "user");
+        assert!(v.get("type").is_none());
     }
 }
