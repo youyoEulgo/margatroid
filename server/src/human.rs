@@ -70,7 +70,7 @@ pub async fn create_request(
             let detail = task.map(|t| t.detail.clone()).unwrap_or_default();
 
             let event = types::events::WorkspaceEvent {
-                payload: types::events::EventPayload::new(
+                metadata: types::events::EventMetadata::new(
                     "human_request",
                     &to,
                     &session_id,

@@ -81,8 +81,8 @@ impl Member {
         delegation_id: &str,
         content: types::events::EventContent,
     ) {
-        let payload = types::events::EventPayload::new(event_name, &self.id, delegation_id);
-        let event = types::events::WorkspaceEvent { payload, content };
+        let payload = types::events::EventMetadata::new(event_name, &self.id, delegation_id);
+        let event = types::events::WorkspaceEvent { metadata: payload, content };
         if let Ok(json) = serde_json::to_string(&event) {
             let channel_name = format!("{}/stream", self.workspace_name);
             let _ = self.event_bus.send(&channel_name, json);

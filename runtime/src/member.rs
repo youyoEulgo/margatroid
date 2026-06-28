@@ -129,7 +129,7 @@ impl Member {
 
                 // 新版: 构造 WorkspaceEvent 推 workspace_stream（与旧版 raw_streams 共存）
                 let event = types::events::WorkspaceEvent {
-                    payload: types::events::EventPayload::new(
+                    metadata: types::events::EventMetadata::new(
                         types::event_index::EVENT_STREAM_CHUNK,
                         &self.id,
                         &did,

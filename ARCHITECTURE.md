@@ -1,276 +1,302 @@
-# Margatroid 架构文档
+# Margatroid Architecture
 
-## 概述
+> The project is named after the Touhou character Alice Margatroid, the "Seven-Colored Puppeteer," who manipulates multiple dolls simultaneously. In Margatroid, the user is the AI puppeteer; the compose file defines each agent's capabilities and role; the delegation board is the thread connecting agents and user.
 
-Margatroid 是一个用 Rust 实现的多 Agent 协作运行时，模拟人类团队的工作方式：通过委托（Delegation）机制分发任务，成员在沙箱中执行。
+## 1. Design Philosophy
 
-核心设计理念是将委托过程建模为**任务链（TaskChain）**，类似图灵机的纸带：读写头在链上移动，委托时右移、完成时左移，上下文即整条链。
+Margatroid adopts a **human team collaboration model** as its design foundation. A Workspace is a project group; each AI agent is a team member with specific skills; the Manager is the project manager; the delegation board is the team's collaboration infrastructure (TaskChain + publish area + SQLite archive).
 
-## Provider 隔离
+## 2. Core Concepts
 
-runtime crate 完全不接触 provider 实现。`DynAiProvider` trait 定义在 `types` crate 中，`providers` crate 负责实现和解析。
+### 2.1 Workspace
+
+An independent, sandboxed collaboration environment containing:
+- A set of AI agent instances (defined by the compose file)
+- A delegation board (Delegation Board + TaskChain)
+- A SQLite database (worklog + personal_memory + schedule + delegations + conversation_messages)
+- A shared sandbox environment
+
+### 2.2 AI Agent Instance
+
+Composed of the following elements:
+
+| Element | Description |
+|---|---|
+| Provider + Model | Underlying AI model (OpenRouter / DeepSeek direct / Human) |
+| Skills | The instance's capability set (function/tool definitions) |
+| SOUL.md | Character identity and behavioral boundaries |
+| Memory system | worklog + personal_memory |
+
+### 2.3 AI Manager
+
+Manager is a special member in the Workspace (Identity::Manager), equivalent to a project manager:
+- Directly interfaces with the user, receiving user requirements
+- Decomposes user requirements into structured delegatable tasks
+- Distributes tasks to suitable agents via the delegation board
+- Reviews returned results: finish if acceptable, finish with explanation if not
+- Manager is itself an LLM-driven agent, with additional `schedule_*` tools
+
+### 2.4 Delegation Board + TaskChain
+
+The delegation board is the core collaboration infrastructure of a Workspace, driven by the TaskChain:
 
 ```
-types::DynAiProvider   ← runtime 通过 Client 持有，通过它做 LLM 调用
-types::AiProvider      ← providers 实现，blanket impl → DynAiProvider
-providers::resolve()   ← 按 provider 名称从配置自动查找并构建
-providers::build()     ← 按 provider_type 分发构造
-runtime::Client        ← 封装 model + provider，统一聊天/流式接口
+offer → chain append Delegate + publish area (frontend cache)
+chain current_task() → member loop reads → executes if to matches
+result(done=true) → chain append Outcome + publish removal + wake parent
 ```
 
-支持的 Provider：`OpenRouterProvider`、`DeepSeekProvider`（直连 API，OpenAI 兼容格式）、`HumanProvider`（人类交互回退）。所有 provider 层错误统一使用 `anyhow::Error`。
+**TaskChain** is a Turing-machine model — append-only, never delete or modify. Delegate shifts right, finish(done=true) shifts left. Context is the entire chain.
 
-## 任务链（TaskChain）
+The **publish area** is downgraded to a frontend visualization cache; the member loop no longer depends on it. Scheduling is entirely driven by the chain's `current_task()`.
 
-### 数据结构
+**Event-driven wakeup**: each member holds a `tokio::sync::Notify`. `offer()` and `result(done=true)` wake the target member after the chain head moves. No polling.
+
+**User messages**: published as root delegation via `send_user_message("user", "manager", ...)`.
+
+**Retry**: on failure, the task is automatically re-offered with `[RETRY:N]` prefix in detail; abandoned after 3 retries.
+
+### 2.5 Schedule
+
+Manager-specific phased task planning tool, stored in the board's SQLite.
+
+| Operation | Effect |
+|---|---|
+| `schedule_add` | Add a planned entry |
+| `schedule_list` | List all planned entries |
+| `schedule_pop` | Pop the highest-priority entry for a member |
+| `schedule_remove` | Delete a specified entry |
+
+A phased task = a top-level work item assigned to a member. Phased tasks are published as delegations via the board and archived when the Manager accepts on completion.
+
+### 2.6 Sandbox
+
+OS-native sandboxing using kernel-level isolation mechanisms:
+
+| Platform | Isolation Mechanism |
+|---|---|
+| Linux | Bubblewrap (`bwrap`) — mount namespace + PID namespace + network namespace |
+| macOS | `sandbox-exec` — dynamically generated Seatbelt profile |
+
+Writes are deny-by-default (allow-only); network is deny-by-default. Mandatory protected paths are hardcoded (~/.ssh, ~/.aws, .env, .gitconfig, etc.).
+
+Each Workspace gets an independent sandbox. The sandbox environment is ephemeral and disposable; only workdir and memory.db are persisted.
+
+## 3. Delegation Flow
+
+```
+1. Member A discovers they need B's capability
+2. A identifies B as a likely fit via the team roster
+3. A calls the delegate tool, specifying target, task_summary, task_detail,
+   with work_summary/work_detail
+4. board records A's outcome (done=false), chain appends sub-delegation, wakes B
+5. B claims the task via chain current_task(), executes, calls finish on completion
+6. board records B's outcome (done=true), chain head shifts left back to A, wakes A
+7. A reviews B's result, decides to accept (finish) or flag issues (finish with explanation)
+```
+
+## 4. Human Interaction (User Members)
+
+Users participate in the delegation chain as team members. Identity::User members use HumanProvider; Manager can delegate to users. HumanProvider creates requests via POST /api/human/request and blocks waiting for a reply. The frontend receives human_request events via the SSE stream and automatically switches the input box to reply mode. The chain resumes after the user submits a reply.
+
+## 5. Tool-Call Loop (Streaming / Fallback)
+
+`chat()` streams via `Client::chat_stream()`. For each chunk:
+- Parse as `StreamChunk` (empty shell if parse fails); construct `WorkspaceEvent { content: StreamChunk { chunk } }`
+- Push via `send_event()` to the `{workspace}/stream` EventBus channel
+- Accumulate full_content / full_tool_calls / finish_reason / full_reasoning
+- Non-streaming fallback: if StreamChunk parse fails, parse as `ChatResponse` (`message` instead of `delta`), merge into accumulators
+- Save full text to conversation_messages after stream ends
+- Non-breaking tools (bash/recall/schedule_*) → execute, continue loop
+- finish → emit outcome (done=true), send chain_update event, break
+- delegate → record partial outcome (done=false), publish new delegation, break
+
+Streaming tool call arguments arrive in fragments. `merge_deltas` merges by `ToolCallDelta.index`.
+
+## 6. Context Assembly
+
+`Board.assemble_prompt(soul, memories)` assembles LLM context in fixed order:
+
+```
+1. System prompt (User)
+2. Team roster (User)
+3. Team worklog (User) — from memory cache
+4. Delegation chain context (User)
+5. Soul prompt (System) — SOUL.md
+6. Personal memories (User)
+7. Current task (User) — dynamic, always last
+```
+
+### Worklog Cache
+
+SQLite writes in real time, but `DelegationBoard` holds an in-memory cache. Refreshed only at startup and on root delegation completion. Stable during sub-task execution to keep LLM context consistent.
+
+## 7. Event System
+
+Margatroid uses a global EventBus to manage event channels with naming pattern `<workspace>/stream`.
+
+### 7.1 Unified Event Stream
+
+The frontend subscribes via `GET /workspace/{name}/stream` as a persistent connection. All events flow through a single channel. Event structure is `metadata` + `content`:
+
+```json
+{
+  "metadata": { "event": "stream_chunk", "member_id": "manager", "delegation_id": "...", "timestamp": 123 },
+  "content": { "chunk": { "id": "...", "model": "...", "choices": [...] } }
+}
+```
+
+Five event types:
+
+| `metadata.event` | Trigger | `content` |
+|---|---|---|
+| `stream_chunk` | LLM streaming per chunk | `{ chunk: StreamChunk }` |
+| `board_update` | offer / result(done=true) | `{ publish_count: number }` |
+| `chain_update` | delegate shift right / finish shift left | `{ from, to, brief, head_pos }` |
+| `member_status` | member start/end processing | `{ state: "working" \| "idle" }` |
+| `human_request` | HumanProvider creates request | `{ session_id, from, to, brief, detail }` |
+
+### 7.2 Rust Definitions
+
+`types/src/events.rs`:
 
 ```rust
-enum ChainEntry {
-    Delegate { task: DelegationTask, parent_idx: usize },
-    Outcome { result: TaskResult, delegate_idx: usize },
+pub struct WorkspaceEvent {
+    pub metadata: EventMetadata,  // event, member_id, delegation_id, timestamp
+    pub content: EventContent,    // #[serde(untagged)] — no type tag
 }
-struct TaskChain {
-    entries: Vec<ChainEntry>,  // 链（只追加）
-    head: usize,               // 读写头：当前活跃委托位置
-}
-```
 
-### 操作
-
-- **delegate（右移）**：`entries.push(Delegate { parent_idx: head })` → `head = entries.len() - 1`
-- **finish（左移）**：`entries.push(Outcome { delegation_id, done })` → `done=true` 时 `head = entries[head].parent_idx`
-- **上下文**：`entries[0..]` 就是从根到当前的全部记录，由 `assemble_prompt()` 转为 LLM 上下文
-- **链只追加，不删改**：任何 Delegate 或 Outcome 写入后永不修改，链是调度和上下文的唯一权威源
-
-### 多点 Outcome
-
-一个委托可以产出多个 Outcome，配合子委托形成工作流：
-
-```
-Delegate(d1, user→manager)        head=0
-Outcome(d1, "阶段性产出", done:false) head=0  ← manager 需要帮助
-Delegate(d2, manager→coder)       head=2  ← coder 接手
-Outcome(d2, "完成", done:true)     head=0  ← 回到 manager
-Outcome(d1, "最终版", done:true)   head=0  ← 完成
-```
-
-## 委托板（Delegation Board）
-
-任务链驱动调度，发布区降级为前端可视化缓存。
-
-```
-offer → 链新增 Delegate + 发布区(缓存)
-链 current_task() → 成员循环读取 → 匹配则执行
-result(done=true) → 链新增 Outcome + 发布区移除 → 唤醒上级
-```
-
-- **发布区**：`offer` 写入，`result(done=true)` 移除归档。`take()` 为只读查询
-- **调度机制**：`member_loop` 直接读 `chain.current_task()`，当 `task.to == agent.id()` 时领取执行。不再依赖发布区
-- **事件驱动唤醒**：每成员持 `tokio::sync::Notify`。`offer()` 和 `result(done=true)` 在链头移动后唤醒目标成员。不再轮询
-- **重试**：`execute_task` 错误路径自动 re-offer（`[RETRY:N]` 前缀），超过 3 次放弃
-
-## 成员（Member）
-
-每个成员封装了 Client、SOUL 提示词、沙箱访问。
-
-```rust
-pub struct Member {
-    pub id: String,
-    soul: String,
-    identity: Identity,
-    client: Client,
-    sandbox: Arc<RwLock<SandboxManager>>,
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum EventContent {
+    StreamChunk { chunk: StreamChunk },     // references types::StreamChunk
+    BoardUpdate { publish_count: usize },
+    ChainUpdate { from, to, brief, head_pos },
+    MemberStatus { state: String },
+    HumanRequest { session_id, from, to, brief, detail },
 }
 ```
 
-三种 Identity：`User`（与 HumanProvider 绑定，可被委托）、`Manager`（额外 schedule_* 工具）、`Member`（base 工具）。CLI `cmd_compose_up` 用 `match def.identity` 为三种身份走独立创建逻辑。
+### 7.3 EventBus
 
-### Tool-Call 循环（流式）
+`runtime_v2/src/events.rs` — global `EventBus` (`HashMap<String, broadcast::Sender<String>>`). `Workspace::new()` registers the `"{name}/stream"` channel, and `Member::send_event()` constructs `WorkspaceEvent` and sends. No more three-channel model or event_bridge middle layer — the runtime directly constructs typed events.
 
-`chat()` 通过 `Client::chat_stream()` 获取流，每收一个 chunk：
-1. 原样 `publish_raw` 推 SSE 给前端（透传不做加工）
-2. 累积 `full_content` / `full_tool_calls` / `finish_reason` / `full_reasoning`
-3. 流结束后保存完整文本到 `conversation_messages` 表
-4. 非破坏工具（bash/recall/schedule_*）→ 执行后继续循环
-5. `finish` → 产出结果（done=true），推 `{"type":"done"}` SSE 事件
-6. `delegate` → 记录阶段性产出（done=false），发布新委托，推 done 事件
-7. `ChatMessage` / `ResponseDelta` / `ResponseMessage` 带 `reasoning_content: Option<String>` 字段
+### 7.4 Frontend Dispatch
 
-### Tool-Call 合并
+The frontend switches on `metadata.event`; `content` maps directly to TypeScript types:
 
-流式 tool call 的 arguments 分片发送，`merge_deltas` 按 `ToolCallDelta.index` 位置合并增量
-
-### Human 成员
-
-User 身份成员配 HumanProvider。Manager 可 delegate 给用户成员。HumanProvider 通过 `/api/human/request` 创建请求、`GET /api/human/request/{id}` 阻塞等待回复。前端 SSE `workspace_stream` 收 `human_request` 事件后输入框自动切换为回复模式。用户回复后链继续走。
-
-## SSE 实时推送
-
-Margatroid 有三个 broadcast channel，各司其职：
-
-### Per-task channel
-
-`GET /workspace/{name}/events/{task_id}` — 单条委托的 LLM 流式输出通道。`chat()` 每收一个 chunk 原样透传。`finish` 和 `delegate` 结束时推送 `{"type":"done"}` 标记 LLM 轮次边界，但不关闭连接——子委托返回后可能继续处理同一 task。
-
-只有发起对话端订阅此通道——用户发消息拿到的 task_id 即 manager 的通道。coder/reviewer 等子委托的 per-task 通道无前端监听，其输出走 raw_streams。
-
-### workspace_stream channel
-
-`GET /workspace/{name}/stream` — 全局结构化事件通道。前端进 workspace 时的长期订阅。Board 构造时预建，workspace 存活期间持续推送。承载四类事件：
-
-| 事件 | 触发 | 携带数据 |
-|------|------|----------|
-| board_update | offer / result(done=true) | publish_count: usize |
-| chain_update | delegate 右移 / finish 左移 | from, to, brief, head_pos |
-| member_status | 成员开始/结束处理 | member_id, state(working/idle) |
-| human_request | HumanProvider 创建请求 | session_id, from, to, brief, detail |
-
-### raw_streams channel
-
-所有成员 LLM 输出的共享通道。`chat()` 每收一个 chunk，在写 per-task 的同时复制一份到 raw_streams，包装为 `{type:"stream_chunk", member_id, chunk}`。前端同一 SSE 连接收到后按 member_id 累计，member_status idle 时刷出为一条消息（非 user/manager 角色缩小字号、降低对比度）。
-
-不经过 event_bridge——chat() 直接用 `publish_raw` 写入，透传即可。
-
-### 双流合并
-
-`server/src/handlers/workspace.rs` 的 `stream()` handler 同时订阅 workspace_stream 和 raw_streams：
-
-```rust
-let structured = BroadcastStream::new(rx_ws);    // 结构事件
-let raw        = BroadcastStream::new(rx_raw);   // 成员 chunk
-let merged     = stream::select(structured, raw); // 合并为一个 SSE
+```ts
+switch (metadata?.event) {
+  case 'stream_chunk': handleStreamChunkEvent(content, metadata.member_id); break;
+  case 'board_update': handleBoardUpdateEvent(content); break;
+  case 'chain_update': handleChainUpdateEvent(content); break;
+  case 'member_status': handleMemberStatusEvent(content, metadata.member_id); break;
+  case 'human_request': handleHumanRequestEvent(content); break;
+}
 ```
 
-前端一个 EventSource 连接接收两类消息，按 `event.type` 分派。
+Five handlers, each receiving the corresponding type — zero processing direct pass-through.
 
-## 上下文组装
+### 7.5 Streaming UI
 
-`Board.assemble_prompt(soul, memories)` 按以下顺序组装 LLM 上下文：
+First `stream_chunk` immediately pushes a message; subsequent chunks append text in real time. `member_status: idle` flushes tool results and sets `loading = false`.
 
-```
-1. 系统提示词（User）
-2. 团队成员名录（User）
-3. 团队工作日志（User）— 从内存缓存读取
-4. 委托链上下文（User）
-5. 人格提示词（System）— SOUL.md
-6. 个人记忆（User）
-7. 当前任务（User）— 动态，始终最后
-```
+### 7.6 Emit Points
 
-### 工作日志缓存
+| Event | Trigger Location | Layer |
+|---|---|---|
+| stream_chunk | `member.chat()` while loop | runtime_v2 |
+| board_update + chain_update | `trigger_event()` | runtime |
+| chain_update | `member.chat()` should_break | runtime_v2 |
+| member_status | `engine::member_loop` start/end | runtime_v2 |
+| human_request | `human::handle_request` | server |
 
-SQLite 实时写保证持久化。`DelegationBoard` 持 `cached_worklog: RwLock<String>`，只在启动时和根委托完成时刷新。子任务执行期间缓存不变，保持 LLM 上下文稳定，最大化 prompt cache 命中。
+## 8. Memory System (SQLite)
 
-## 事件系统
+Single `memory.db` file with five tables:
+- **worklog** — team work log; inserted on delegation creation, completed on outcome
+- **personal_memory** — per-member memory; on-demand keyword search
+- **conversation_messages** — dialog messages; real-time write on each LLM text response
+- **schedule** — Manager-specific schedule table
+- **delegations** — delegation persistence
 
-### 事件类型库
-
-`types/src/events.rs` — 四种事件 struct（Serialize + Deserialize），`fn new()` 构造器。
-
-`types/src/event_index.rs` — 通道和事件名常量（`CH_RAW_EVENTS`, `CH_WORKSPACE_STREAM`, `EVENT_*`），三斜杠文档。
-
-### 事件桥接
-
-`server/src/event_bridge.rs` — 每 workspace 起 tokio 任务，订阅 `raw_events`，按 `event_name` 分派，从 AppState 获取上下文构造类型化 JSON，推送 `workspace_stream`。
-
-### 推送点
-
-| 事件 | 触发位置 | 层 |
-|------|----------|-----|
-| board_update + chain_update | `board.offer()` | runtime |
-| board_update + chain_update | `board.result(done=true)` | runtime |
-| chain_update | `board.result(done=false)` | runtime |
-| member_status | `execute_task` 开始/结束 | runtime |
-| human_request | `human::create_request` handler | server |
-
-## 记忆系统（SQLite）
-
-单文件 `memory.db`，含五张表：
-- **worklog**：团队工作日志，委托创建时插入，产出时补全 summary/reply
-- **personal_memory**：个人记忆，委托创建时插入，产出时补全 detail
-- **conversation_messages**：对话消息，每次 LLM 文本回复实时存入
-- **schedule**：Manager 专用，planned/offered/archived 状态流转
-- **delegations**：委托持久化，创建时写入完整信息
-
-## 日志体系
-
-四层日志：
-
-| 级别 | 默认 | 开启方式 | 内容 |
-|---|---|---|---|
-| error | 是 | — | 不可恢复错误 |
-| warn | 是 | — | chunk 跳过、流降级、任务重试 |
-| info | 是 | — | 成员启动、任务领取、delegation/finish、board 变动 |
-| debug | 否 | `--verbose` 或 `level = "debug"` | 格式化摘要 + 原始 JSON 全文 |
-
-`--verbose` 独立的 info 层守卫（成员名+工具名摘要），debug 级别打原始流量不做任何加工。日志级别从 `margatroid.toml` 的 `[logging] level` 读取，大小写不敏感。
-
-## 成员名录注入
-
-`Workspace::start()` 从 `AgentEntry.skills` 拼成员名单，注入 `DelegationBoard.member_roster`，`assemble_prompt()` 在系统提示词后插入。格式：
+## 9. Provider Isolation
 
 ```
---- 团队成员 ---
-- manager (经理) — 技能: manage, planning, delegation
-- coder (成员) — 技能: coding, bash
-- reviewer (成员) — 技能: review, testing
+types::DynAiProvider   ← runtime holds via Client
+types::AiProvider      ← providers implement
+runtime::Client        ← wraps model + provider
 ```
 
-## 项目结构
+Supported providers: `OpenRouterProvider`, `DeepSeekProvider` (direct API, OpenAI-compatible format), `HumanProvider`.
+
+## 10. API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| GET | /health | Health check |
+| POST | /v1/chat | Non-streaming chat |
+| POST | /v1/stream | SSE streaming chat |
+| GET | /v1/providers | AI provider list |
+| POST | /admin/reload | Hot-reload providers |
+| GET | /workspace | List running workspaces |
+| POST | /workspace/{name}/chat | Send message to workspace |
+| GET | /workspace/{name}/status | Board publish count |
+| GET | /workspace/{name}/tasks | Full board status |
+| GET | /workspace/{name}/events/{task_id} | Per-task SSE event stream |
+| GET | /workspace/{name}/stream | Workspace unified event stream (persistent) |
+| GET | /workspace/{name}/recent | Recent worklog |
+| GET | /workspace/{name}/conversation | Conversation messages |
+| POST | /api/human/request | Human interaction request |
+| GET | /api/human/request/{id} | Blocking wait for human reply |
+| GET | /api/human/requests | Pending request list |
+| POST | /api/human/request/{id}/reply | Submit human reply |
+
+## 11. Project Structure
 
 ```
 margatroid/
-├── types/         # 共享类型定义（DynAiProvider, AiProvider, Identity, ChatRequest 等）
+├── types/         # Shared type definitions (DynAiProvider, AiProvider, Identity, ChatRequest, EventMetadata, EventContent)
 │   ├── provider.rs  # DynAiProvider + AiProvider trait + blanket impl
-│   ├── events.rs    # 事件 struct（BoardUpdate, ChainUpdate 等）
-│   └── event_index.rs # 通道/事件名常量
-├── runtime/       # 核心运行时（Workspace, DelegationBoard, Member, TaskChain, Client, memory）
-│   ├── board.rs   # DelegationBoard + TaskChain + assemble_prompt + Notify + SSE 广播
-│   ├── client.rs  # Client — 封装 model + provider + 流式/降级 + verbose 日志
-│   ├── member.rs  # Member — Agent trait + chat() 流式 tool-call loop
-│   ├── memory.rs  # SQLite（worklog + personal_memory + schedule + delegations + conversation_messages）
-│   └── workspace.rs  # Workspace + 工具定义 + member_loop 事件驱动
-├── providers/     # LLM 供应商（OpenRouter + DeepSeek + Human）+ resolve()/build()
-├── compose/       # Compose 文件解析
-├── assets/        # 成员库（member.toml + SOUL.md）+ 系统提示词管理
-├── sandbox/       # 沙箱执行环境
-├── cli/           # 命令行入口 + --verbose + 配置日志等级 + 身份路由
-└── server/        # HTTP API（axum）+ SSE + CORS + workspace 路由
-    ├── event_bridge.rs # runtime raw_events → frontend workspace_stream
-    └── human.rs        # Human 交互端点
+│   ├── events.rs    # WorkspaceEvent = EventMetadata + EventContent (#[serde(untagged)])
+│   └── event_index.rs # Event name constants
+├── runtime/       # V1 core runtime
+│   ├── board.rs   # DelegationBoard + TaskChain + assemble_prompt + trigger_event
+│   ├── client.rs  # Client — wraps model + provider + streaming/fallback
+│   ├── member.rs  # Member — Agent trait + chat() streaming tool-call loop
+│   ├── memory.rs  # SQLite five tables
+│   └── workspace.rs  # Workspace lifecycle + member_loop
+├── runtime_v2/    # V2 runtime (gradually migrating)
+│   ├── engine.rs  # member_loop (event-driven + send_event to EventBus)
+│   ├── board.rs   # DelegationBoard V2 — pure scheduling layer
+│   ├── member.rs  # Member V2 — Agent trait (holds EventBus ref)
+│   ├── events.rs  # EventBus — HashMap<broadcast::Sender> channel registry
+│   ├── workspace.rs # Workspace V2 — receives EventBus, manages member lifecycle
+│   ├── context.rs # Context assembly (assemble_prompt + worklog)
+│   ├── memory.rs  # SQLite
+│   ├── tools.rs   # Tool execution
+│   └── kernel.rs  # Kernel — multi-workspace process host
+├── providers/     # LLM providers (OpenRouter + DeepSeek + Human)
+├── compose/       # Compose file parsing
+├── assets/        # Member library (member.toml + SOUL.md)
+├── sandbox/       # Sandbox execution environment
+├── cli/           # CLI entry point
+└── server/        # HTTP API (axum) + SSE + workspace routing
+    ├── human.rs        # Human interaction endpoints
+    └── handlers/       # stream, chat, workspace, providers, admin
 ```
 
-## API 端点
+## 12. Design Decisions
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | /health | 健康检查 |
-| POST | /v1/chat | 非流式 Chat |
-| POST | /v1/stream | SSE 流式 Chat |
-| GET | /v1/providers | AI 服务商列表 |
-| POST | /admin/reload | 热重载 provider |
-| GET | /workspace | 列出运行中的 workspace |
-| POST | /workspace/{name}/chat | 向 Workspace 发消息 |
-| GET | /workspace/{name}/status | 委托板发布区计数 |
-| GET | /workspace/{name}/tasks | 委托板完整状态 |
-| GET | /workspace/{name}/events/{task_id} | Per-task SSE 事件流 |
-| GET | /workspace/{name}/stream | Workspace 统一事件流（长期） |
-| GET | /workspace/{name}/recent | 最近工作日志 |
-| GET | /workspace/{name}/conversation | 对话消息 |
-| POST | /api/human/request | 人类交互请求 |
-| GET | /api/human/request/{id} | 阻塞等待人类回复 |
-| GET | /api/human/requests | 待处理请求列表 |
-| POST | /api/human/request/{id}/reply | 提交人类回复 |
-
-## 设计决策日志
-
-1. **任务链只追加不删改** — delegate 和 Outcome 写入后永不修改
-2. **事件驱动** — Notify + 链头检测替代轮询
-3. **流式透传** — SSE 不过加工，前端自解析
-4. **工作日志缓存** — 启动+根完成刷新，中间不变保 prompt cache
-5. **Manager 也是智能体** — 不是硬编码调度器
-6. **发布区降级** — 前端缓存，不影响调度逻辑
-7. **两层成员发现** — 团队成员名录（轻量注入上下文）+ recall 按需检索
-8. **三层日志体系** — error/warn/info/debug
-9. **事件桥接** — runtime 触发事件名，server 构造类型化消息，不改 runtime 依赖
-10. **身份路由** — CLI 中 match identity 三路独立，清晰可维护
+1. **Append-only TaskChain** — Delegate and Outcome entries are never modified after write; the chain is the single source of truth for scheduling and context
+2. **Event-driven** — Notify + chain-head detection replaces polling, zero CPU busy-wait
+3. **metadata.event dispatch + content untagged** — frontend switches on metadata.event; content is bare data mapping directly to TypeScript types, zero processing
+4. **Single-channel EventBus** — deprecated three-channel model + event_bridge; one `{name}/stream` channel per workspace; runtime directly constructs typed JSON
+5. **Worklog cache** — refresh at startup and root completion only; stable during sub-task execution for prompt cache
+6. **Manager is an agent** — not a hardcoded scheduler
+7. **Publish area downgraded** — frontend cache, decoupled from scheduling logic
+8. **Two-tier member discovery** — team roster (lightweight context injection) + recall on-demand retrieval
+9. **Four-level logging** — error/warn default on; info for business events; debug for raw traffic
+10. **Identity routing** — CLI dispatches by `match identity` in three independent branches
+11. **Human member** — User paired with HumanProvider; the user is both chain initiator and delegatable target
+12. **Streaming UI** — first chunk pushes message immediately; subsequent chunks append in real time; idle flushes tools and sets loading

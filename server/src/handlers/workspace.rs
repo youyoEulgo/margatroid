@@ -109,7 +109,7 @@ pub async fn events(
         Some(w) => w,
         None => {
             return Sse::new(Box::pin(futures::stream::once(async {
-                Ok(Event::default().data(r#"{"type":"error","content":"workspace not found"}"#))
+                Ok(Event::default().data(r#"{"metadata":{"event":"error"},"content":{"error":"workspace not found"}}"#))
             })));
         }
     };
@@ -121,7 +121,7 @@ pub async fn events(
         Some(rx) => rx,
         None => {
             return Sse::new(Box::pin(futures::stream::once(async {
-                Ok(Event::default().data(r#"{"type":"error","content":"no stream"}"#))
+                Ok(Event::default().data(r#"{"metadata":{"event":"error"},"content":{"error":"no stream"}}"#))
             })));
         }
     };
@@ -137,13 +137,13 @@ pub async fn events(
     let broadcast = BroadcastStream::new(rx).map(|item| {
         let data = match item {
             Ok(s) => s,
-            Err(_) => r#"{"type":"error","content":"stream lagged"}"#.into(),
+            Err(_) => r#"{"metadata":{"event":"error"},"content":{"error":"stream lagged"}}"#.into(),
         };
         Ok(Event::default().data(data))
     });
 
     let stream: Pin<Box<dyn Stream<Item = _> + Send>> = if already_done {
-        let done = futures::stream::once(async { Ok(Event::default().data(r#"{"type":"done"}"#)) });
+        let done = futures::stream::once(async { Ok(Event::default().data(r#"{"metadata":{"event":"done"},"content":{}}"#)) });
         Box::pin(done.chain(broadcast))
     } else {
         Box::pin(broadcast)
@@ -161,7 +161,7 @@ pub async fn stream(
         Some(w) => w,
         None => {
             return Sse::new(Box::pin(futures::stream::once(async {
-                Ok(Event::default().data(r#"{"type":"error","content":"workspace not found"}"#))
+                Ok(Event::default().data(r#"{"metadata":{"event":"error"},"content":{"error":"workspace not found"}}"#))
             })));
         }
     };
@@ -171,7 +171,7 @@ pub async fn stream(
         Some(rx) => rx,
         None => {
             return Sse::new(Box::pin(futures::stream::once(async {
-                Ok(Event::default().data(r#"{"type":"error","content":"no stream"}"#))
+                Ok(Event::default().data(r#"{"metadata":{"event":"error"},"content":{"error":"no stream"}}"#))
             })));
         }
     };
@@ -179,7 +179,7 @@ pub async fn stream(
     let stream = BroadcastStream::new(rx).map(|item| {
         let data = match item {
             Ok(s) => s,
-            Err(_) => r#"{"type":"error","content":"stream lagged"}"#.into(),
+            Err(_) => r#"{"metadata":{"event":"error"},"content":{"error":"stream lagged"}}"#.into(),
         };
         Ok(Event::default().data(data))
     });
