@@ -13,6 +13,7 @@ members = [
     "runtime",
     "runtime_v2",
     "sandbox",
+    "crates/core_plugin",
 ]
 
 resolver = "3"

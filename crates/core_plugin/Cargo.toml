@@ -1,0 +1,12 @@
+[package]
+name = "core_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+providers = { path = "../../providers" }
+types = { path = "../../types" }
