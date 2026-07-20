@@ -1,0 +1,10 @@
+[package]
+name = "event_bus_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core_plugin = { path = "../core_plugin" }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+types = { path = "../../types" }
