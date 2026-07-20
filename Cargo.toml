@@ -14,6 +14,12 @@ members = [
     "runtime_v2",
     "sandbox",
     "crates/core_plugin",
+    "crates/config_plugin",
+    "crates/event_bus_plugin",
+    "crates/llm_plugin",
+    "crates/sandbox_plugin",
+    "crates/server_plugin",
+    "crates/skill_plugin",
 ]
 
 resolver = "3"
