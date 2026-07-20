@@ -327,6 +327,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "config_plugin"
+version = "0.1.0"
+dependencies = [
+ "core_plugin",
+ "serde",
+ "tempfile",
+ "toml 0.8.23",
+ "types",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -498,6 +509,16 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "event_bus_plugin"
+version = "0.1.0"
+dependencies = [
+ "core_plugin",
+ "serde_json",
+ "tokio",
+ "types",
 ]
 
 [[package]]
@@ -1143,6 +1164,18 @@ name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
+
+[[package]]
+name = "llm_plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core_plugin",
+ "futures",
+ "providers",
+ "tokio",
+ "types",
+]
 
 [[package]]
 name = "lock_api"
@@ -1855,6 +1888,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandbox_plugin"
+version = "0.1.0"
+dependencies = [
+ "core_plugin",
+ "sandbox",
+ "tokio",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2049,6 +2091,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "server_plugin"
+version = "0.1.0"
+dependencies = [
+ "core_plugin",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2099,6 +2148,16 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "skill_plugin"
+version = "0.1.0"
+dependencies = [
+ "core_plugin",
+ "serde",
+ "tempfile",
+ "toml 0.8.23",
+]
 
 [[package]]
 name = "slab"
