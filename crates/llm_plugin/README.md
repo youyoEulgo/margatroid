@@ -6,7 +6,7 @@
 
 - Register an `LlmProviderRegistry` resource.
 - Consume `LlmRequest` events.
-- Call registered `types::DynAiProvider` implementations on the core async worker.
+- Call registered `types::DynAiProvider` implementations through `AsyncRuntimePlugin`.
 - Emit `LlmResponse`, `LlmStreamChunk`, or `LlmFailed`.
 
 ## Public Events
@@ -22,15 +22,17 @@
 
 ## Stage Registration
 
-Async results are converted into public LLM events in `Stage::Finalize`.
+Async completions return in `Stage::First`; LLM batch results are converted into public events in `Stage::Update`.
 
 ## Minimal Example
 
 ```rust
+use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::App;
 use llm_plugin::{LlmPlugin, LlmProviderRegistry};
 
 let mut app = App::new();
+app.add_plugins(AsyncRuntimePlugin::default());
 app.add_plugins(LlmPlugin::new());
 
 let registry = app.world().resource::<LlmProviderRegistry>().unwrap();

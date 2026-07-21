@@ -1,4 +1,5 @@
-use core_plugin::{AppControl, EventReader, World};
+use app_runtime_plugin::AppControl;
+use core_plugin::{EventReader, World};
 
 use crate::events::{ServerFailed, ServerStartRequested, ServerStarted, ShutdownRequested};
 use crate::resource::{ServerConfig, ServerHandle};
@@ -44,6 +45,7 @@ pub(crate) fn handle_shutdown_requests(
 
 #[cfg(test)]
 mod tests {
+    use app_runtime_plugin::AppRuntimePlugin;
     use core_plugin::App;
 
     use crate::{ServerConfig, ServerFailed, ServerPlugin, ServerStartRequested, ServerStarted};
@@ -51,6 +53,7 @@ mod tests {
     #[test]
     fn plugin_reports_server_start_result() {
         let mut app = App::new();
+        app.add_plugins(AppRuntimePlugin);
         app.add_plugins(ServerPlugin::new().with_config(ServerConfig {
             host: "127.0.0.1".into(),
             port: 0,

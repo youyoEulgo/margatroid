@@ -99,6 +99,7 @@ mod tests {
     use std::sync::Arc;
 
     use anyhow::Result;
+    use async_runtime_plugin::AsyncRuntimePlugin;
     use core_plugin::{App, Stage, World};
     use futures::{stream, Stream};
     use types::{
@@ -158,6 +159,7 @@ mod tests {
     #[test]
     fn plugin_routes_chat_request_to_provider() {
         let mut app = App::new();
+        app.add_plugins(AsyncRuntimePlugin::default());
         app.add_plugins(LlmPlugin::new());
         app.world()
             .resource::<LlmProviderRegistry>()
@@ -169,7 +171,7 @@ mod tests {
         let system_responses = responses.clone();
         let mut reader = app.event_reader::<LlmResponse>();
         app.add_systems(
-            Stage::Event,
+            Stage::Update,
             [move |world: &mut World| {
                 system_responses
                     .lock()
@@ -192,13 +194,14 @@ mod tests {
     #[test]
     fn plugin_reports_missing_provider() {
         let mut app = App::new();
+        app.add_plugins(AsyncRuntimePlugin::default());
         app.add_plugins(LlmPlugin::new());
 
         let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
         let system_failures = failures.clone();
         let mut reader = app.event_reader::<LlmFailed>();
         app.add_systems(
-            Stage::Event,
+            Stage::Update,
             [move |world: &mut World| {
                 system_failures
                     .lock()

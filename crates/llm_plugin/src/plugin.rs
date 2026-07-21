@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use core_plugin::{App, AsyncSystemOptions, Plugin};
+use async_runtime_plugin::{AsyncAppExt, AsyncSystemOptions};
+use core_plugin::{App, Plugin, Stage};
 
 use crate::events::{LlmFailed, LlmRequest, LlmResponse, LlmStreamChunk};
 use crate::resource::LlmProviderRegistry;
@@ -68,7 +69,7 @@ impl Plugin for LlmPlugin {
 
         let mut reader = app.event_reader::<LlmAsyncBatch>();
         app.add_systems(
-            core_plugin::Stage::Finalize,
+            Stage::Update,
             [move |world: &mut core_plugin::World| {
                 for batch in world.read_events(&mut reader) {
                     for output in batch.outputs {

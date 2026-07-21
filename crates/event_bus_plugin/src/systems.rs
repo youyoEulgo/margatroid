@@ -104,7 +104,7 @@ mod tests {
         let system_failures = failures.clone();
         let mut reader = app.event_reader::<EventBusPublishFailed>();
         app.add_systems(
-            Stage::Event,
+            Stage::Update,
             [move |world: &mut World| {
                 system_failures
                     .lock()

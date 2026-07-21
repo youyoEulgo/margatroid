@@ -181,7 +181,7 @@ preload = true
         let system_scanned = scanned.clone();
         let mut scan_reader = app.event_reader::<SkillScanned>();
         app.add_systems(
-            Stage::Event,
+            Stage::Update,
             [move |world: &mut World| {
                 system_scanned
                     .lock()
@@ -199,7 +199,7 @@ preload = true
         let system_loaded = loaded.clone();
         let mut load_reader = app.event_reader::<SkillLoaded>();
         app.add_systems(
-            Stage::Event,
+            Stage::Update,
             [move |world: &mut World| {
                 system_loaded
                     .lock()
