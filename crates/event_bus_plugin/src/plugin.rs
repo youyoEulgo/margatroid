@@ -40,7 +40,7 @@ impl Plugin for EventBusPlugin {
 
         let mut reader = app.event_reader::<WorkspaceEventEmitted>();
         app.add_systems(
-            Stage::Event,
+            Stage::Update,
             [move |world: &mut World| {
                 publish_workspace_events(world, &mut reader);
             }],

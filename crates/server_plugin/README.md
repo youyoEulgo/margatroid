@@ -24,16 +24,18 @@
 
 ## Stage Registration
 
-- Start and shutdown requests are consumed in `Stage::Input`.
+- Start and shutdown requests are consumed in `Stage::Update`.
 - Optional auto-start runs in `Stage::Startup`.
 
 ## Minimal Example
 
 ```rust
+use app_runtime_plugin::AppRuntimePlugin;
 use core_plugin::App;
 use server_plugin::{ServerPlugin, ServerStartRequested};
 
 let mut app = App::new();
+app.add_plugins(AppRuntimePlugin);
 app.add_plugins(ServerPlugin::new());
 app.world().send_event(ServerStartRequested);
 app.tick();

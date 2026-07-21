@@ -77,7 +77,7 @@ mod tests {
         let system_loaded = loaded.clone();
         let mut reader = app.event_reader::<ConfigLoaded>();
         app.add_systems(
-            Stage::Event,
+            Stage::Update,
             [move |world: &mut World| {
                 system_loaded
                     .lock()
@@ -111,7 +111,7 @@ mod tests {
         let system_failures = failures.clone();
         let mut reader = app.event_reader::<ConfigLoadFailed>();
         app.add_systems(
-            Stage::Event,
+            Stage::Update,
             [move |world: &mut World| {
                 system_failures
                     .lock()

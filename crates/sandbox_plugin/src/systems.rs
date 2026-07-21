@@ -69,6 +69,7 @@ pub(crate) async fn execute_sandbox_command(
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use async_runtime_plugin::AsyncRuntimePlugin;
     use core_plugin::{App, Stage, World};
 
     use crate::{SandboxCommandCompleted, SandboxCommandRequested, SandboxPlugin};
@@ -76,13 +77,14 @@ mod tests {
     #[test]
     fn plugin_executes_command_without_sandbox() {
         let mut app = App::new();
+        app.add_plugins(AsyncRuntimePlugin::default());
         app.add_plugins(SandboxPlugin::new());
 
         let completed = Arc::new(Mutex::new(Vec::new()));
         let system_completed = completed.clone();
         let mut reader = app.event_reader::<SandboxCommandCompleted>();
         app.add_systems(
-            Stage::Event,
+            Stage::Update,
             [move |world: &mut World| {
                 system_completed
                     .lock()

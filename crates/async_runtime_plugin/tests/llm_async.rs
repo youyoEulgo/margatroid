@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use core_plugin::{App, AsyncSystemOptions, Stage, World};
+use async_runtime_plugin::{AsyncAppExt, AsyncRuntimePlugin, AsyncSystemOptions};
+use core_plugin::{App, Stage, World};
 use providers::{AiProvider, OpenRouterProvider};
 use types::message::{ChatMessage, MessageContent, RequestMessage, Role};
 use types::ChatRequest;
@@ -26,6 +27,7 @@ fn real_llm_runs_through_async_system_and_returns_an_event() {
 
     let provider = Arc::new(OpenRouterProvider::new(api_key).with_base_url(base_url));
     let mut app = App::new();
+    app.add_plugins(AsyncRuntimePlugin::default());
     app.add_async_system_with_options(
         move |request: LlmRequest| {
             let provider = provider.clone();
@@ -70,10 +72,10 @@ fn real_llm_runs_through_async_system_and_returns_an_event() {
     );
 
     let mut request = Some(LlmRequest {
-        prompt: "Reply with exactly: CORE_PLUGIN_LLM_OK".into(),
+        prompt: "Reply with exactly: ASYNC_RUNTIME_PLUGIN_LLM_OK".into(),
     });
     app.add_systems(
-        Stage::Execute,
+        Stage::Update,
         [move |world: &mut World| {
             if let Some(request) = request.take() {
                 world.send_event(request);
@@ -85,7 +87,7 @@ fn real_llm_runs_through_async_system_and_returns_an_event() {
     let system_outcomes = outcomes.clone();
     let mut reader = app.event_reader::<LlmOutcome>();
     app.add_systems(
-        Stage::Event,
+        Stage::Update,
         [move |world: &mut World| {
             system_outcomes
                 .lock()
@@ -103,7 +105,7 @@ fn real_llm_runs_through_async_system_and_returns_an_event() {
     let outcome = outcomes.lock().unwrap().first().cloned();
     match outcome {
         Some(LlmOutcome::Completed(content)) => assert!(
-            content.contains("CORE_PLUGIN_LLM_OK"),
+            content.contains("ASYNC_RUNTIME_PLUGIN_LLM_OK"),
             "unexpected model response: {content:?}"
         ),
         Some(LlmOutcome::Failed(error)) => panic!("LLM request failed: {error}"),

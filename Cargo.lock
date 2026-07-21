@@ -39,6 +39,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "app_runtime_plugin"
+version = "0.1.0"
+dependencies = [
+ "core_plugin",
+]
+
+[[package]]
 name = "assets"
 version = "0.1.0"
 dependencies = [
@@ -82,6 +89,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "async_runtime_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "core_plugin",
+ "providers",
+ "tokio",
+ "types",
 ]
 
 [[package]]
@@ -367,10 +385,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 name = "core_plugin"
 version = "0.1.0"
 dependencies = [
- "providers",
- "tokio",
  "tracing",
- "types",
 ]
 
 [[package]]
@@ -1170,6 +1185,7 @@ name = "llm_plugin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async_runtime_plugin",
  "core_plugin",
  "futures",
  "providers",
@@ -1891,6 +1907,7 @@ dependencies = [
 name = "sandbox_plugin"
 version = "0.1.0"
 dependencies = [
+ "async_runtime_plugin",
  "core_plugin",
  "sandbox",
  "tokio",
@@ -2094,6 +2111,7 @@ dependencies = [
 name = "server_plugin"
 version = "0.1.0"
 dependencies = [
+ "app_runtime_plugin",
  "core_plugin",
 ]
 

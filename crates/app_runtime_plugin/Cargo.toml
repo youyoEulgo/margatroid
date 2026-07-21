@@ -1,8 +1,7 @@
 [package]
-name = "server_plugin"
+name = "app_runtime_plugin"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-app_runtime_plugin = { path = "../app_runtime_plugin" }
 core_plugin = { path = "../core_plugin" }

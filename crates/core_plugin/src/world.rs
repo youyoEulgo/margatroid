@@ -5,7 +5,6 @@ use crate::component::{Bundle, Component};
 use crate::entity::Entity;
 use crate::events::{Event, EventReader, Events};
 use crate::resource::Resource;
-use crate::{async_runtime::AsyncTaskControl, AsyncTaskId};
 
 /// 稀疏集合列：entity index → 稠密槽位 → 组件数据。
 struct Column {
@@ -242,12 +241,6 @@ impl World {
         self.resource::<Events<E>>()
             .unwrap_or_else(|| panic!("event `{}` is not registered", std::any::type_name::<E>()))
             .read(reader)
-    }
-
-    /// 请求取消已提交的异步任务。
-    pub fn cancel_async_task(&self, id: AsyncTaskId) -> bool {
-        self.resource::<AsyncTaskControl>()
-            .is_some_and(|control| control.cancel(id))
     }
 }
 
