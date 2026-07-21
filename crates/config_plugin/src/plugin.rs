@@ -47,7 +47,7 @@ impl Plugin for ConfigPlugin {
 
         let mut reader = app.event_reader::<ConfigLoadRequested>();
         app.add_systems(
-            Stage::Input,
+            Stage::Update,
             [move |world: &mut World| {
                 load_requested_configs(world, &mut reader);
             }],

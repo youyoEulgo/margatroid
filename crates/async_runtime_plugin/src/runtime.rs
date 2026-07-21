@@ -2,71 +2,22 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
+use app_runtime_plugin::AppControl;
+use core_plugin::{Event, World};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::task::{AbortHandle, Id as TokioTaskId, JoinSet};
 
-use crate::events::Event;
-use crate::system::System;
-use crate::world::World;
-use crate::AppControl;
-
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+use crate::{
+    AsyncRuntimeOptions, AsyncSystemOptions, AsyncTaskControl, AsyncTaskFailed,
+    AsyncTaskFailureKind, AsyncTaskId,
+};
 
 type WorldCommand = Box<dyn FnOnce(&mut World) + Send + 'static>;
 type TaskResult = Result<WorldCommand, AsyncTaskFailed>;
 type AsyncTaskFuture = Pin<Box<dyn Future<Output = TaskResult> + Send + 'static>>;
-
-/// core_plugin 分配的异步任务标识。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct AsyncTaskId(u64);
-
-impl AsyncTaskId {
-    pub fn get(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AsyncTaskFailureKind {
-    QueueFull,
-    WorkerStopped,
-    Timeout,
-    Cancelled,
-    Panic,
-}
-
-/// 任务成功提交到异步线程后产生。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AsyncTaskStarted {
-    pub task_id: AsyncTaskId,
-    pub request_type: &'static str,
-}
-
-/// 框架无法产生正常 Output 时产生。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AsyncTaskFailed {
-    pub task_id: AsyncTaskId,
-    pub request_type: &'static str,
-    pub kind: AsyncTaskFailureKind,
-    pub message: String,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct AsyncSystemOptions {
-    pub timeout: Option<Duration>,
-}
-
-impl Default for AsyncSystemOptions {
-    fn default() -> Self {
-        Self {
-            timeout: Some(DEFAULT_TIMEOUT),
-        }
-    }
-}
 
 struct AsyncTask {
     id: AsyncTaskId,
@@ -79,7 +30,7 @@ enum ControlMessage {
     Shutdown,
 }
 
-enum Completion {
+pub(crate) enum Completion {
     Apply(WorldCommand),
     Failed(AsyncTaskFailed),
 }
@@ -120,82 +71,114 @@ impl AsyncSpawner {
             }),
             None => Box::pin(async move { Ok(execute.await) }),
         };
-        let task = AsyncTask {
-            id,
-            request_type,
-            future: task_future,
-        };
-
-        self.task_sender.try_send(task).map_err(|error| {
-            let (kind, message) = match error {
-                tokio_mpsc::error::TrySendError::Full(_) => (
-                    AsyncTaskFailureKind::QueueFull,
-                    "async task queue is full".to_string(),
-                ),
-                tokio_mpsc::error::TrySendError::Closed(_) => (
-                    AsyncTaskFailureKind::WorkerStopped,
-                    "async worker has stopped".to_string(),
-                ),
-            };
-            AsyncTaskFailed {
-                task_id: id,
+        self.task_sender
+            .try_send(AsyncTask {
+                id,
                 request_type,
-                kind,
-                message,
-            }
-        })?;
+                future: task_future,
+            })
+            .map_err(|error| {
+                let (kind, message) = match error {
+                    tokio_mpsc::error::TrySendError::Full(_) => (
+                        AsyncTaskFailureKind::QueueFull,
+                        "async task queue is full".to_string(),
+                    ),
+                    tokio_mpsc::error::TrySendError::Closed(_) => (
+                        AsyncTaskFailureKind::WorkerStopped,
+                        "async worker has stopped".to_string(),
+                    ),
+                };
+                AsyncTaskFailed {
+                    task_id: id,
+                    request_type,
+                    kind,
+                    message,
+                }
+            })?;
         Ok(id)
     }
 
-    fn cancel(&self, id: AsyncTaskId) -> bool {
+    pub(crate) fn cancel(&self, id: AsyncTaskId) -> bool {
         self.control_sender.send(ControlMessage::Cancel(id)).is_ok()
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct AsyncTaskControl {
-    spawner: AsyncSpawner,
+pub(crate) struct AsyncRuntimeState {
+    options: AsyncRuntimeOptions,
+    worker: Mutex<Option<AsyncWorker>>,
+    completion_receiver: Mutex<Option<mpsc::Receiver<Completion>>>,
 }
 
-impl AsyncTaskControl {
-    pub(crate) fn cancel(&self, id: AsyncTaskId) -> bool {
-        self.spawner.cancel(id)
-    }
-}
-
-pub(crate) struct AsyncCompletionSystem {
-    receiver: mpsc::Receiver<Completion>,
-}
-
-impl System for AsyncCompletionSystem {
-    fn run(&mut self, world: &mut World) {
-        for completion in self.receiver.try_iter() {
-            match completion {
-                Completion::Apply(command) => command(world),
-                Completion::Failed(failure) => world.send_event(failure),
-            }
+impl AsyncRuntimeState {
+    pub(crate) fn new(options: AsyncRuntimeOptions) -> Self {
+        Self {
+            options,
+            worker: Mutex::new(None),
+            completion_receiver: Mutex::new(None),
         }
     }
+
+    pub(crate) fn start(&self, control: Option<AppControl>) -> Option<AsyncTaskControl> {
+        let mut worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if worker.is_some() {
+            return None;
+        }
+        let (new_worker, receiver) = AsyncWorker::start(control, self.options);
+        let task_control = AsyncTaskControl {
+            spawner: new_worker.spawner(),
+        };
+        *self
+            .completion_receiver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(receiver);
+        *worker = Some(new_worker);
+        Some(task_control)
+    }
+
+    pub(crate) fn spawner(&self) -> Option<AsyncSpawner> {
+        self.worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(AsyncWorker::spawner)
+    }
+
+    pub(crate) fn drain_completions(&self) -> Vec<Completion> {
+        self.completion_receiver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|receiver| receiver.try_iter().collect())
+            .unwrap_or_default()
+    }
 }
 
-pub(crate) struct AsyncWorker {
+struct AsyncWorker {
     spawner: AsyncSpawner,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl AsyncWorker {
-    pub(crate) fn start(
-        control: AppControl,
-        queue_capacity: usize,
-        max_in_flight: usize,
-    ) -> (Self, AsyncCompletionSystem) {
-        assert!(queue_capacity > 0, "async queue capacity must be positive");
-        assert!(max_in_flight > 0, "max in-flight tasks must be positive");
+    fn start(
+        control: Option<AppControl>,
+        options: AsyncRuntimeOptions,
+    ) -> (Self, mpsc::Receiver<Completion>) {
+        assert!(
+            options.queue_capacity > 0,
+            "async queue capacity must be positive"
+        );
+        assert!(
+            options.max_in_flight > 0,
+            "max in-flight tasks must be positive"
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("failed to build async worker runtime");
-        let (task_sender, task_receiver) = tokio_mpsc::channel(queue_capacity);
+        let (task_sender, task_receiver) = tokio_mpsc::channel(options.queue_capacity);
         let (control_sender, control_receiver) = tokio_mpsc::unbounded_channel();
         let (completion_sender, completion_receiver) = mpsc::channel();
         let spawner = AsyncSpawner {
@@ -204,37 +187,28 @@ impl AsyncWorker {
             next_id: Arc::new(AtomicU64::new(1)),
         };
         let thread = thread::Builder::new()
-            .name("core-plugin-async".into())
+            .name("margatroid-async-runtime".into())
             .spawn(move || {
                 runtime.block_on(worker_loop(
                     task_receiver,
                     control_receiver,
                     completion_sender,
                     control,
-                    max_in_flight,
+                    options.max_in_flight,
                 ));
             })
             .expect("failed to start async worker thread");
-
         (
             Self {
                 spawner,
                 thread: Some(thread),
             },
-            AsyncCompletionSystem {
-                receiver: completion_receiver,
-            },
+            completion_receiver,
         )
     }
 
-    pub(crate) fn spawner(&self) -> AsyncSpawner {
+    fn spawner(&self) -> AsyncSpawner {
         self.spawner.clone()
-    }
-
-    pub(crate) fn task_control(&self) -> AsyncTaskControl {
-        AsyncTaskControl {
-            spawner: self.spawner(),
-        }
     }
 }
 
@@ -257,7 +231,7 @@ async fn worker_loop(
     mut task_receiver: tokio_mpsc::Receiver<AsyncTask>,
     mut control_receiver: tokio_mpsc::UnboundedReceiver<ControlMessage>,
     completion_sender: mpsc::Sender<Completion>,
-    control: AppControl,
+    control: Option<AppControl>,
     max_in_flight: usize,
 ) {
     let mut tasks = JoinSet::new();
@@ -278,7 +252,7 @@ async fn worker_loop(
                     send_completion(
                         &completion_sender,
                         Completion::Failed(cancelled_failure(task.id, task.request_type)),
-                        &control,
+                        control.as_ref(),
                     );
                     continue;
                 }
@@ -287,11 +261,7 @@ async fn worker_loop(
                 let abort = tasks.spawn(async move { (task_id, task.future.await) });
                 let tokio_id = abort.id();
                 active_by_id.insert(task_id, tokio_id);
-                active_by_tokio.insert(tokio_id, ActiveTask {
-                    id: task_id,
-                    request_type,
-                    abort,
-                });
+                active_by_tokio.insert(tokio_id, ActiveTask { id: task_id, request_type, abort });
             }
             message = control_receiver.recv() => {
                 match message {
@@ -302,7 +272,7 @@ async fn worker_loop(
                                 send_completion(
                                     &completion_sender,
                                     Completion::Failed(cancelled_failure(id, task.request_type)),
-                                    &control,
+                                    control.as_ref(),
                                 );
                             }
                         } else if id.get() > highest_seen_id {
@@ -324,7 +294,7 @@ async fn worker_loop(
                             Ok(command) => Completion::Apply(command),
                             Err(failure) => Completion::Failed(failure),
                         };
-                        if !send_completion(&completion_sender, completion, &control) {
+                        if !send_completion(&completion_sender, completion, control.as_ref()) {
                             abort_all(&mut tasks).await;
                             break;
                         }
@@ -333,16 +303,15 @@ async fn worker_loop(
                         let tokio_id = error.id();
                         if let Some(task) = active_by_tokio.remove(&tokio_id) {
                             active_by_id.remove(&task.id);
-                            let failure = AsyncTaskFailed {
-                                task_id: task.id,
-                                request_type: task.request_type,
-                                kind: AsyncTaskFailureKind::Panic,
-                                message: error.to_string(),
-                            };
                             send_completion(
                                 &completion_sender,
-                                Completion::Failed(failure),
-                                &control,
+                                Completion::Failed(AsyncTaskFailed {
+                                    task_id: task.id,
+                                    request_type: task.request_type,
+                                    kind: AsyncTaskFailureKind::Panic,
+                                    message: error.to_string(),
+                                }),
+                                control.as_ref(),
                             );
                         }
                     }
@@ -365,12 +334,14 @@ fn cancelled_failure(id: AsyncTaskId, request_type: &'static str) -> AsyncTaskFa
 fn send_completion(
     sender: &mpsc::Sender<Completion>,
     completion: Completion,
-    control: &AppControl,
+    control: Option<&AppControl>,
 ) -> bool {
     if sender.send(completion).is_err() {
         return false;
     }
-    control.wake();
+    if let Some(control) = control {
+        control.wake();
+    }
     true
 }
 

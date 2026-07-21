@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = { workspace = true }
+async_runtime_plugin = { path = "../async_runtime_plugin" }
 core_plugin = { path = "../core_plugin" }
 futures = "0.3"
 providers = { path = "../../providers" }

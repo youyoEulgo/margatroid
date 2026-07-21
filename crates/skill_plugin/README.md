@@ -27,8 +27,7 @@
 
 ## Stage Registration
 
-- Scan requests are consumed in `Stage::Input`.
-- Load and unload requests are consumed in `Stage::Prepare`.
+- Scan, load, and unload requests are consumed in `Stage::Update`.
 
 ## Minimal Example
 

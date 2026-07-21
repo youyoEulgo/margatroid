@@ -1,4 +1,5 @@
-use core_plugin::{App, AsyncSystemOptions, Plugin, Stage, World};
+use async_runtime_plugin::{AsyncAppExt, AsyncSystemOptions};
+use core_plugin::{App, Plugin, Stage, World};
 
 use crate::events::{
     SandboxCommandCompleted, SandboxCommandFailed, SandboxCommandRequested, SandboxCommandStarted,
@@ -49,7 +50,7 @@ impl Plugin for SandboxPlugin {
 
         let mut started_reader = app.event_reader::<SandboxCommandRequested>();
         app.add_systems(
-            Stage::Execute,
+            Stage::Update,
             [move |world: &mut World| {
                 for request in world.read_events(&mut started_reader) {
                     world.send_event(SandboxCommandStarted {
@@ -69,7 +70,7 @@ impl Plugin for SandboxPlugin {
 
         let mut reader = app.event_reader::<SandboxAsyncOutput>();
         app.add_systems(
-            Stage::Finalize,
+            Stage::Update,
             [move |world: &mut World| {
                 for output in world.read_events(&mut reader) {
                     match output {

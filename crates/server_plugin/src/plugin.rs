@@ -1,3 +1,4 @@
+use app_runtime_plugin::AppControl;
 use core_plugin::{App, Plugin, Stage, World};
 
 use crate::events::{
@@ -40,6 +41,10 @@ impl Default for ServerPlugin {
 
 impl Plugin for ServerPlugin {
     fn build(&self, app: &mut App) {
+        assert!(
+            app.world().resource::<AppControl>().is_some(),
+            "AppRuntimePlugin must be installed before ServerPlugin"
+        );
         app.add_event::<ServerStartRequested>();
         app.add_event::<ServerStarted>();
         app.add_event::<ServerFailed>();
@@ -69,16 +74,16 @@ impl Plugin for ServerPlugin {
 
         let mut start_reader = app.event_reader::<ServerStartRequested>();
         app.add_systems(
-            Stage::Input,
+            Stage::Update,
             [move |world: &mut World| {
                 handle_server_start_requests(world, &mut start_reader);
             }],
         );
 
-        let control = app.control();
+        let control = app.world().resource::<AppControl>().unwrap().clone();
         let mut shutdown_reader = app.event_reader::<ShutdownRequested>();
         app.add_systems(
-            Stage::Input,
+            Stage::Update,
             [move |world: &mut World| {
                 handle_shutdown_requests(world, &mut shutdown_reader, &control);
             }],

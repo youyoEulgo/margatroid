@@ -22,7 +22,7 @@
 ## Stage Registration
 
 - Optional autoload runs in `Stage::Startup`.
-- Explicit load requests are consumed in `Stage::Input`.
+- Explicit load requests are consumed in `Stage::Update`.
 
 ## Minimal Example
 

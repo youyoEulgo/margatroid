@@ -20,7 +20,7 @@
 
 ## Stage Registration
 
-`EventBusPlugin` registers its publishing system in `Stage::Event`.
+`EventBusPlugin` registers its publishing system in `Stage::Update`.
 
 ## Minimal Example
 

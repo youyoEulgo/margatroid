@@ -36,7 +36,7 @@ impl Plugin for SkillPlugin {
 
         let mut scan_reader = app.event_reader::<SkillScanRequested>();
         app.add_systems(
-            Stage::Input,
+            Stage::Update,
             [move |world: &mut World| {
                 scan_requested_skills(world, &mut scan_reader);
             }],
@@ -44,7 +44,7 @@ impl Plugin for SkillPlugin {
 
         let mut load_reader = app.event_reader::<SkillLoadRequested>();
         app.add_systems(
-            Stage::Prepare,
+            Stage::Update,
             [move |world: &mut World| {
                 load_requested_skills(world, &mut load_reader);
             }],
@@ -52,7 +52,7 @@ impl Plugin for SkillPlugin {
 
         let mut unload_reader = app.event_reader::<SkillUnloadRequested>();
         app.add_systems(
-            Stage::Prepare,
+            Stage::Update,
             [move |world: &mut World| {
                 unload_requested_skills(world, &mut unload_reader);
             }],
