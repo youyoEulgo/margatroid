@@ -14,6 +14,11 @@ LLM 回归它擅长的（理解、生成、判断），程序做它擅长的（�
 
 ## 已明确的架构方向
 
+API 规范已拆分为：
+
+- [V3-INFRASTRUCTURE-API.md](V3-INFRASTRUCTURE-API.md)：可复用 ECS 与基础设施公开 API。
+- [V3-BUSINESS-PLUGIN-API.md](V3-BUSINESS-PLUGIN-API.md)：Margatroid 业务 Plugin 契约。
+
 ### 1. 守护进程（Daemon）
 
 - 一个 bin：`margatroidd`（守护进程），两个前端：`margatroid` CLI + Web
@@ -22,15 +27,34 @@ LLM 回归它擅长的（理解、生成、判断），程序做它擅长的（�
 - 类 Docker 体验：`margatroid up -f compose.toml` / `margatroid ps` / `margatroid stop`
 - **已通过 demo 验证**：`daemon_test/` 目录，三方通信模型可行
 
+运维日志同样复用 daemon 的 HTTP 服务，不另开第二个日志端口：
+
+```text
+daemon tracing
+→ LogPlugin bounded Stream Layer
+→ ServerPlugin 鉴权日志路由
+→ HttpServerPlugin SSE/WebSocket
+→ margatroid logs --follow
+```
+
+日志流只用于诊断。任务进度、LLM 结果和可执行错误仍通过业务 ECS Event
+与产品 API 传输，不将日志当成 CLI 业务协议。
+
 ### 2. ECS + Plugin 架构（定制轻量版，借鉴 Bevy）
 
 Bevy 值得借鉴的核心是通过 Plugin 组合功能，而不是机械地让 ECS 内核也伪装成 Plugin。
 V3 中 `core_plugin` crate 是编译期内核，`App::new()` 直接创建 ECS；所有可选能力才是运行时 Plugin。
 
+这套可独立使用和发布的 ECS 与基础设施体系暂定名为 **mecs**。
+设计目标不只是可插拔，还包括开发者友好、配置简单和默认开箱即用：
+
+- 常见场景只需 `add_plugins(...)`。
+- 进阶需求使用 builder，不迫使普通用户理解内部 worker、channel 和全局状态。
+- 保持 tracing、Axum 等 Rust 生态的原生使用习惯，不为形式一致重造 API。
+
 ```
 App::new()
-    .add_plugins(DefaultPlugins)
-    .add_plugins(ServerPlugin)          // HTTP API
+    .add_plugins(MargatroidDaemonPlugins::default())
     .add_plugins(workspace_compose("compose.toml"))  // compose 编译为 plugin
     .run();
 ```
@@ -65,17 +89,22 @@ core 明确不负责：
 阻塞运行循环由 `AppRuntimePlugin` 提供，异步执行由 `AsyncRuntimePlugin` 提供。
 core 只保留 `Startup / First / Update / Last` 四个通用阶段，不知道业务阶段或基础设施用途。
 
-#### 2.2 DefaultPlugins
+#### 2.2 默认 Plugin 组合
 
 ```
+基础设施（mecs）
+├── LogPlugin           ← tracing console / file / bounded stream
 ├── AppRuntimePlugin    ← run / wake / shutdown
 ├── AsyncRuntimePlugin  ← 可选异步任务执行基础设施
+└── HttpServerPlugin    ← Axum / HTTP / SSE / WebSocket 生命周期
+
+Margatroid 业务
 ├── LLMPlugin           ← Provider + Chat streaming
 ├── SandboxPlugin       ← 沙箱执行
 ├── SkillPlugin         ← Skill 加载/卸载/分发
 ├── WorkflowPlugin       ← Workflow DAG 执行器
 ├── EventBusPlugin      ← SSE 事件流
-├── ServerPlugin        ← HTTP API（daemon）
+├── ServerPlugin        ← Margatroid HTTP API 与日志流路由
 └── ConfigPlugin        ← 配置文件的解析与资源管理
 ```
 
