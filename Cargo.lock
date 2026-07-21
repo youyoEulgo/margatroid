@@ -1261,6 +1261,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "margatroid_defaults"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "config_plugin",
+ "core_plugin",
+ "event_bus_plugin",
+ "http_server_plugin",
+ "llm_plugin",
+ "log_plugin",
+ "sandbox_plugin",
+ "server_plugin",
+ "skill_plugin",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1430,23 +1447,6 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
-
-[[package]]
-name = "plugins"
-version = "0.1.0"
-dependencies = [
- "app_runtime_plugin",
- "async_runtime_plugin",
- "config_plugin",
- "core_plugin",
- "event_bus_plugin",
- "http_server_plugin",
- "llm_plugin",
- "log_plugin",
- "sandbox_plugin",
- "server_plugin",
- "skill_plugin",
-]
 
 [[package]]
 name = "potential_utf"

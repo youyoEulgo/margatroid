@@ -96,7 +96,8 @@ core 只保留 `Startup / First / Update / Last` 四个通用阶段，不知道�
 ├── LogPlugin           ← tracing console / file / bounded stream
 ├── AppRuntimePlugin    ← run / wake / shutdown
 ├── AsyncRuntimePlugin  ← 可选异步任务执行基础设施
-└── HttpServerPlugin    ← Axum / HTTP / SSE / WebSocket 生命周期
+├── HttpServerPlugin    ← Axum / HTTP / SSE / WebSocket 生命周期
+└── ExternalEventPlugin ← 外部线程安全注入 ECS Event（API 已设计）
 
 Margatroid 业务
 ├── LLMPlugin           ← Provider + Chat streaming
@@ -108,7 +109,31 @@ Margatroid 业务
 └── ConfigPlugin        ← 配置文件的解析与资源管理
 ```
 
-#### 2.3 每个 Plugin 是一个功能边界
+`MargatroidDaemonPlugins` 由 `margatroid_defaults` crate 提供。该 crate 只负责默认
+Plugin 组合，不负责创建 App、解析进程参数或启动 daemon。
+
+#### 2.3 外部输入进入 ECS
+
+HTTP handler 运行在 HTTP worker，不能直接修改 World。下一个基础设施阶段
+按以下数据流打通：
+
+```text
+CLI / Web
+→ HttpServerPlugin / Axum handler
+→ ExternalEventSender<E>::try_send
+→ bounded channel + AppControl::wake
+→ Stage::First
+→ ECS Event / business System
+→ result Event with request_id
+→ EventBus / SSE
+→ CLI / Web
+```
+
+HTTP 提交类请求不在 handler 中等待 ECS 完成，而是返回 `202 + request_id`。
+这避免在 ECS Event 中携带 oneshot sender，也不把 HTTP 连接寿命与业务 System
+的完成时间强绑定。
+
+#### 2.4 每个 Plugin 是一个功能边界
 
 - 换 LLM provider → 换 LLMPlugin，其余不动
 - 不用沙箱 → 去掉 SandboxPlugin，换 ProcessPlugin
@@ -116,14 +141,14 @@ Margatroid 业务
 - 纯同步 Plugin 测试时只需要 `App::new()`
 - 异步 Plugin 测试时显式组合 `AsyncRuntimePlugin`
 
-#### 2.4 compose.toml 编译为 Plugin
+#### 2.5 compose.toml 编译为 Plugin
 
 用户 compose 文件中声明的 member 和 workflow，在运行时编译为一组 Plugin：
 - 每个 member → 挂载对应 Component（Soul、SkillSet、ProviderConfig）
 - 每个 workflow → 注册到 WorkflowRegistry Resource
 - manager 字段 → 设置 DispatcherSystem 的路由目标
 
-#### 2.5 ECS 核心概念映射
+#### 2.6 ECS 核心概念映射
 
 - Entity = Agent 实例（只是 ID）
 - Component = 纯数据（SoulPrompt, SkillSet, TaskContext, ProviderConfig, Memory 等）

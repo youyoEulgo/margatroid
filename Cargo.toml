@@ -6,7 +6,7 @@ members = [
     "server",
     "types",
     "providers",
-    "plugins",
+    "margatroid_defaults",
     "mcp_client",
     "assets",
     "paths",

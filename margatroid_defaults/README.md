@@ -1,10 +1,10 @@
-# plugins
+# margatroid_defaults
 
 该 crate 提供 Margatroid V3 的默认 Plugin 组合。
 
 ```rust
 use core_plugin::App;
-use plugins::MargatroidDaemonPlugins;
+use margatroid_defaults::MargatroidDaemonPlugins;
 
 let mut app = App::new();
 app.add_plugins(MargatroidDaemonPlugins::default());

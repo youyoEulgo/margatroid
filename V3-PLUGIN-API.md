@@ -20,6 +20,7 @@ app_runtime_plugin
 async_runtime_plugin
 log_plugin（第一版已实现）
 http_server_plugin（第一版已实现）
+external_event_plugin（仅 API 设计，尚未实现）
 ```
 
 这部分按未来可独立发布到 crates.io 的公开 API 标准维护，不允许引用 Margatroid 的
