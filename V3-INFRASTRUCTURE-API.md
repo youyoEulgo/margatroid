@@ -64,6 +64,12 @@ http_server_plugin（第一版已实现）
 ├── HTTP / SSE / WebSocket primitives
 ├── listener lifecycle
 └── graceful shutdown
+
+external_event_plugin（API 设计阶段）
+├── typed external Event registration
+├── cloneable bounded sender
+├── AppControl wake integration
+└── Stage::First drain into World
 ```
 
 依赖方向固定为：
@@ -73,6 +79,7 @@ app_runtime_plugin   → core_plugin
 async_runtime_plugin → core_plugin + app_runtime_plugin API
 log_plugin           → core_plugin + tracing ecosystem
 http_server_plugin   → core_plugin + app_runtime_plugin + Axum/Tokio
+external_event_plugin → core_plugin + optional app_runtime_plugin API
 ```
 
 core 不得反向依赖任何运行时 Plugin。
@@ -701,9 +708,162 @@ HTTP 端口、路由、鉴权、限流和日志可见性属于上层适配 Plugi
 - App shutdown 时停止接受新连接，等待在途请求到明确 deadline。
 - 测试覆盖路由合并、端口冲突、启动失败、SSE 断开和 graceful shutdown。
 
-## 9. 发布级维护规则
+## 9. external_event_plugin API 设计（尚未实现）
 
-### 9.1 稳定性
+### 9.1 定位
+
+`external_event_plugin` 负责将 HTTP handler、文件 watcher、系统信号或其他外部线程
+产生的类型化数据，安全地注入只能由主线程修改的 ECS World。
+
+它不将 channel 放入 core，不让外部线程持有 `World` 引用，也不定义 HTTP、CLI
+或 Margatroid 业务协议。安装 `AppRuntimePlugin` 时，成功入队后通过
+`AppControl::wake()` 唤醒可能正在等待的 App；未安装时仍可手动 `tick()`，
+便于测试和嵌入式宿主使用。
+
+### 9.2 Public API
+
+```text
+ExternalEventPlugin
+ExternalEventAppExt
+ExternalEventOptions
+ExternalEventSender<E>
+ExternalEventSendError<E>
+```
+
+最小使用方式：
+
+```rust
+let mut app = App::new();
+app.add_plugins(AppRuntimePlugin);
+app.add_plugins(ExternalEventPlugin::default());
+app.add_external_event::<UserPromptSubmitted>();
+
+let sender = app.external_event_sender::<UserPromptSubmitted>();
+```
+
+需要自动唤醒时，`AppRuntimePlugin` 必须在 `ExternalEventPlugin` 之前安装。
+未安装 App runtime 是受支持的 manual-tick 模式，不是错误。调用 extension API
+时若缺失 `ExternalEventPlugin`，则在 build 阶段立即给出明确错误。
+
+### 9.3 注册 API
+
+```rust
+pub trait ExternalEventAppExt {
+    fn add_external_event<E: Event>(&mut self) -> &mut Self;
+
+    fn add_external_event_with_options<E: Event>(
+        &mut self,
+        options: ExternalEventOptions,
+    ) -> &mut Self;
+
+    fn external_event_sender<E: Event>(&self) -> ExternalEventSender<E>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalEventOptions {
+    // private fields
+}
+
+impl ExternalEventOptions {
+    pub fn new() -> Self;
+    pub fn with_capacity(self, capacity: usize) -> Self;
+    pub fn with_max_events_per_frame(self, limit: usize) -> Self;
+}
+```
+
+默认 `capacity = 1024`，`max_events_per_frame = 256`。两者都必须大于 0。
+
+注册 `E` 时同时调用 core 的 `add_event::<E>()`，并在 `Stage::First` 注册该类型的
+内部 drain System。同一 `E` 以相同 Options 重复注册为等幂操作，不替换 channel；
+使用不同 Options 重复注册时立即给出配置错误。需要不同配置时应使用
+不同的 Event newtype。
+
+### 9.4 Sender 与背压
+
+```rust
+#[derive(Clone)]
+pub struct ExternalEventSender<E: Event>;
+
+impl<E: Event> ExternalEventSender<E> {
+    pub fn try_send(&self, event: E) -> Result<(), ExternalEventSendError<E>>;
+    pub fn max_capacity(&self) -> usize;
+    pub fn is_closed(&self) -> bool;
+}
+
+pub enum ExternalEventSendError<E> {
+    Full(E),
+    Closed(E),
+}
+```
+
+`try_send()` 永不阻塞，且失败时归还原 Event：
+
+- 入队成功：如果可用，调用一次 `AppControl::wake()`。
+- 队列已满：返回 `Full(event)`，不唤醒 App。
+- App/receiver 已销毁：返回 `Closed(event)`。
+
+第一版不提供阻塞 `send()` 或 async `send().await`，避免外部生产者因 ECS
+消费速度失去控制。
+
+### 9.5 帧语义与顺序
+
+```text
+external thread
+→ ExternalEventSender<E>::try_send
+→ bounded FIFO channel
+→ AppControl::wake
+→ next App tick / Stage::First
+→ drain at most max_events_per_frame
+→ World::send_event(E)
+→ normal EventReader<E>
+```
+
+- 同一 Event 类型内按 channel FIFO 顺序注入 World。
+- 不同 Event 类型之间不承诺全局顺序。
+- 在该类型 drain System 开始前入队的 Event 可在当前帧进入 World；
+  drain 开始后到达的 Event 最迟在下一次 tick 处理。
+- 每帧上限防止高频外部输入长时间占用主线程。队列未清空时，
+  如果 `AppControl` 可用，drain System 必须再次 `wake()` 以便继续处理。
+
+Event 进入 World 后完全遵循 core Event 的 reader、retention 和过期语义。
+
+### 9.6 HTTP 映射建议
+
+`external_event_plugin` 不定义 HTTP status，但 `ServerPlugin` 应统一映射：
+
+```text
+try_send Ok          → 202 Accepted + request_id
+Full(event)          → 429 Too Many Requests
+Closed(event)        → 503 Service Unavailable
+invalid request      → 400 Bad Request
+authentication fail  → 401/403
+```
+
+HTTP handler 生成稳定 `request_id` 并放入业务 Event。结果不通过 channel sender
+塞进 ECS Event，而是以携带同一 `request_id` 的业务结果 Event 进入 EventBus，
+再由 SSE/WebSocket 或查询 API 交付。
+
+### 9.7 第一版不做
+
+- 外部线程直接访问 World
+- 跨 Event 类型全局顺序
+- 阻塞或 async sender
+- request/response oneshot registry
+- 持久化队列和重启恢复
+- 自动 retry 或丢弃最旧输入
+
+### 9.8 测试要求
+
+- 有 App runtime 时入队后唤醒 App，并在 `Stage::First` 转为正常 ECS Event。
+- 无 App runtime 时手动 tick 仍可正常 drain。
+- 验证 FIFO、queue full、closed 和每帧上限。
+- 验证队列未清空时会继续 wake。
+- 验证相同 Options 重复注册不清空 channel，不同 Options 被拒绝。
+- 验证 App Drop 后所有留存 sender 返回 `Closed`。
+
+## 10. 发布级维护规则
+
+### 10.1 稳定性
 
 ```text
 Stable
@@ -718,7 +878,7 @@ Internal
 
 破坏 Stable API 必须提升 SemVer major（1.0 前提升 minor），并在 changelog 中提供迁移说明。
 
-### 9.2 发布前要求
+### 10.2 发布前要求
 
 - crate 名称和仓库命名脱离 Margatroid 领域语义
 - README、crate-level docs、examples 使用同一套 API
@@ -731,7 +891,7 @@ Internal
 - 检查 package 内容，不上传 secret、测试凭据和本地路径
 - 使用 `cargo deny` 或同等工具检查 license、advisory 和依赖来源
 
-### 9.3 文档语言
+### 10.3 文档语言
 
 内部验证阶段只维护中文规范。准备发布时：
 

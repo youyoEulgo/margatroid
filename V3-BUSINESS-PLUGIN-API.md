@@ -174,7 +174,7 @@ event_bus_plugin → core_plugin + types
 llm_plugin       → core_plugin + async_runtime_plugin + providers + types
 sandbox_plugin   → core_plugin + async_runtime_plugin + sandbox
 skill_plugin     → core_plugin
-server_plugin    → core_plugin + http_server_plugin
+server_plugin    → core_plugin + http_server_plugin + external_event_plugin（规划）
 ```
 
 ## 10. 当前业务 Plugin 契约
@@ -303,9 +303,21 @@ LoadedSkills
 职责：
 
 - 向 `HttpServerPlugin` 注册 Margatroid HTTP API
-- 将 HTTP/CLI/Web 输入转换为 App Event
 - 将 EventBus 订阅转换为 SSE/WebSocket 输出
 - 启用日志端点时，将 `LogStream` 转换为经过鉴权的 SSE/WebSocket 输出
+
+当前第一版已实现：
+
+- `/health`
+- 带 bearer token 鉴权的可选 `/v1/logs/stream`
+- `ShutdownRequested` 消费与 HTTP/App 停止
+
+下一阶段在 `external_event_plugin` 实现后完成：
+
+- 将 HTTP/CLI/Web 输入通过 `ExternalEventSender<E>` 转换为 App Event
+- 提交类路由返回 `202 Accepted + request_id`
+- 将 queue full 映射为 429，App closed 映射为 503
+- 将带 request_id 的业务结果 Event 通过 EventBus/SSE 交付给 CLI
 
 公开 Event：
 
@@ -331,7 +343,7 @@ LogEndpointOptions
 ## 11. 默认产品组合
 
 Margatroid 开发者不需要为常规 daemon 逐个了解和配置基础设施 Plugin。
-产品层提供预置 PluginGroup：
+产品层由 `margatroid_defaults` crate 提供预置 PluginGroup：
 
 ```rust
 app.add_plugins(MargatroidDaemonPlugins::default());
@@ -344,6 +356,7 @@ LogPlugin
 → AppRuntimePlugin
 → AsyncRuntimePlugin
 → HttpServerPlugin
+→ ExternalEventPlugin（实现后加入）
 → EventBusPlugin
 → ServerPlugin
 → 其他 Margatroid 业务 Plugin
