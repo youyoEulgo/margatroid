@@ -16,6 +16,8 @@ members = [
     "crates/core_plugin",
     "crates/app_runtime_plugin",
     "crates/async_runtime_plugin",
+    "crates/log_plugin",
+    "crates/http_server_plugin",
     "crates/config_plugin",
     "crates/event_bus_plugin",
     "crates/llm_plugin",
@@ -31,3 +33,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }

@@ -1,92 +1,213 @@
+use std::convert::Infallible;
+
 use app_runtime_plugin::AppControl;
+use axum::extract::State;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use axum::routing::get;
+use axum::Router;
 use core_plugin::{App, Plugin, Stage, World};
+use futures_util::stream;
+use http_server_plugin::{HttpAppExt, HttpServerHandle};
+use log_plugin::{LogStream, LogStreamError};
 
-use crate::events::{
-    HttpRequestReceived, ServerFailed, ServerStartRequested, ServerStarted, ShutdownRequested,
-    UserPromptSubmitted,
-};
-use crate::resource::{ServerConfig, ServerHandle};
-use crate::systems::{handle_server_start_requests, handle_shutdown_requests, start_server};
+use crate::events::{HttpRequestReceived, ShutdownRequested, UserPromptSubmitted};
+use crate::resource::{LogEndpointOptions, ServerPluginOptions};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ServerPlugin {
-    config: ServerConfig,
-    auto_start: bool,
+    options: ServerPluginOptions,
 }
 
 impl ServerPlugin {
     pub fn new() -> Self {
-        Self {
-            config: ServerConfig::default(),
-            auto_start: false,
-        }
+        Self::default()
     }
 
-    pub fn with_config(mut self, config: ServerConfig) -> Self {
-        self.config = config;
+    pub fn with_options(options: ServerPluginOptions) -> Self {
+        Self { options }
+    }
+
+    pub fn with_log_stream_endpoint(mut self, options: LogEndpointOptions) -> Self {
+        self.options.log_endpoint = Some(options);
         self
-    }
-
-    pub fn auto_start(mut self) -> Self {
-        self.auto_start = true;
-        self
-    }
-}
-
-impl Default for ServerPlugin {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
 impl Plugin for ServerPlugin {
     fn build(&self, app: &mut App) {
         assert!(
+            app.world().resource::<HttpServerHandle>().is_some(),
+            "HttpServerPlugin must be installed before ServerPlugin"
+        );
+        assert!(
             app.world().resource::<AppControl>().is_some(),
             "AppRuntimePlugin must be installed before ServerPlugin"
         );
-        app.add_event::<ServerStartRequested>();
-        app.add_event::<ServerStarted>();
-        app.add_event::<ServerFailed>();
         app.add_event::<ShutdownRequested>();
         app.add_event::<HttpRequestReceived>();
         app.add_event::<UserPromptSubmitted>();
+        app.add_http_routes(Router::new().route("/health", get(health)));
 
-        if app.world().resource::<ServerConfig>().is_none() {
-            app.world_mut().add_resource(self.config.clone());
+        if let Some(options) = &self.options.log_endpoint {
+            let stream = app
+                .world()
+                .resource::<LogStream>()
+                .unwrap_or_else(|| {
+                    panic!("LogPlugin stream layer must be enabled before the log endpoint")
+                })
+                .clone();
+            app.add_http_routes(log_routes(stream, options.clone()));
         }
-        if app.world().resource::<ServerHandle>().is_none() {
-            app.world_mut().add_resource(ServerHandle::new());
-        }
-
-        if self.auto_start {
-            let mut started = false;
-            app.add_systems(
-                Stage::Startup,
-                [move |world: &mut World| {
-                    if !started {
-                        started = true;
-                        start_server(world);
-                    }
-                }],
-            );
-        }
-
-        let mut start_reader = app.event_reader::<ServerStartRequested>();
-        app.add_systems(
-            Stage::Update,
-            [move |world: &mut World| {
-                handle_server_start_requests(world, &mut start_reader);
-            }],
-        );
 
         let control = app.world().resource::<AppControl>().unwrap().clone();
+        let server = app.world().resource::<HttpServerHandle>().unwrap().clone();
         let mut shutdown_reader = app.event_reader::<ShutdownRequested>();
         app.add_systems(
             Stage::Update,
             [move |world: &mut World| {
-                handle_shutdown_requests(world, &mut shutdown_reader, &control);
+                if world.read_events(&mut shutdown_reader).is_empty() {
+                    return;
+                }
+                server.shutdown();
+                control.shutdown();
             }],
         );
+    }
+}
+
+async fn health() -> &'static str {
+    "ok"
+}
+
+#[derive(Clone)]
+struct LogRouteState {
+    stream: LogStream,
+    authorization: String,
+}
+
+fn log_routes(stream: LogStream, options: LogEndpointOptions) -> Router {
+    Router::new()
+        .route("/v1/logs/stream", get(stream_logs))
+        .with_state(LogRouteState {
+            stream,
+            authorization: options.authorization_header(),
+        })
+}
+
+async fn stream_logs(
+    State(state): State<LogRouteState>,
+    headers: HeaderMap,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>>, StatusCode> {
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if authorization != Some(state.authorization.as_str()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let subscription = state.stream.subscribe();
+    let stream = stream::unfold(subscription, |mut subscription| async move {
+        match subscription.recv().await {
+            Ok(record) => {
+                let data = serde_json::to_string(&record).unwrap_or_else(|_| "{}".into());
+                Some((
+                    Ok(SseEvent::default().event("log").data(data)),
+                    subscription,
+                ))
+            }
+            Err(LogStreamError::Lagged(count)) => Some((
+                Ok(SseEvent::default().event("lagged").data(count.to_string())),
+                subscription,
+            )),
+            Err(LogStreamError::Closed) => None,
+        }
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use app_runtime_plugin::AppRuntimePlugin;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_server_plugin::HttpServerPlugin;
+    use log_plugin::{LogPlugin, LogStreamOptions};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[test]
+    fn registers_business_routes_on_http_server() {
+        let mut app = App::new();
+        app.add_plugins(AppRuntimePlugin);
+        app.add_plugins(HttpServerPlugin::bind("127.0.0.1:0"));
+        app.add_plugins(ServerPlugin::default());
+        app.tick();
+
+        assert!(app
+            .world()
+            .resource::<HttpServerHandle>()
+            .unwrap()
+            .address()
+            .is_some());
+    }
+
+    #[test]
+    fn log_endpoint_requires_stream_layer() {
+        let result = std::panic::catch_unwind(|| {
+            let mut app = App::new();
+            app.add_plugins(AppRuntimePlugin);
+            app.add_plugins(HttpServerPlugin::bind("127.0.0.1:0"));
+            app.add_plugins(
+                ServerPlugin::default()
+                    .with_log_stream_endpoint(LogEndpointOptions::bearer_token("test-token")),
+            );
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn log_endpoint_builds_with_stream_layer() {
+        let mut app = App::new();
+        app.add_plugins(LogPlugin::default().with_stream(LogStreamOptions::default()));
+        app.add_plugins(AppRuntimePlugin);
+        app.add_plugins(HttpServerPlugin::bind("127.0.0.1:0"));
+        app.add_plugins(
+            ServerPlugin::default()
+                .with_log_stream_endpoint(LogEndpointOptions::bearer_token("test-token")),
+        );
+    }
+
+    #[tokio::test]
+    async fn log_endpoint_requires_matching_bearer_token() {
+        let mut app = App::new();
+        app.add_plugins(LogPlugin::default().with_stream(LogStreamOptions::default()));
+        let stream = app.world().resource::<LogStream>().unwrap().clone();
+        let router = log_routes(stream, LogEndpointOptions::bearer_token("expected-token"));
+
+        let unauthorized = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/logs/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/logs/stream")
+                    .header(header::AUTHORIZATION, "Bearer expected-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
     }
 }
