@@ -9,5 +9,5 @@ core_plugin = { path = "../core_plugin" }
 tokio = { workspace = true }
 
 [dev-dependencies]
-providers = { path = "../../providers" }
-types = { path = "../../types" }
+providers = { path = "../../margatroid/providers" }
+types = { path = "../../margatroid/types" }

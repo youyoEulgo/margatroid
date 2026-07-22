@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 
-const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:3000";
+const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:3939";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -60,8 +60,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_daemon_url_is_http() {
-        assert!(DEFAULT_DAEMON_URL.starts_with("http://"));
-        assert!(!DEFAULT_DAEMON_URL.ends_with('/'));
+    fn default_daemon_url_uses_product_port() {
+        assert_eq!(DEFAULT_DAEMON_URL, "http://127.0.0.1:3939");
     }
 }
