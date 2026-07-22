@@ -53,7 +53,7 @@ impl MargatroidDaemonPlugins {
 impl Default for MargatroidDaemonPlugins {
     fn default() -> Self {
         Self {
-            bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3000),
+            bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3939),
             log_endpoint_token: None,
         }
     }
@@ -87,6 +87,14 @@ mod tests {
     use http_server_plugin::{HttpServerFailed, HttpServerHandle};
 
     use super::*;
+
+    #[test]
+    fn default_group_uses_product_port() {
+        assert_eq!(
+            MargatroidDaemonPlugins::default().bind_address,
+            "127.0.0.1:3939".parse().unwrap()
+        );
+    }
 
     #[test]
     fn default_group_builds_and_starts() {

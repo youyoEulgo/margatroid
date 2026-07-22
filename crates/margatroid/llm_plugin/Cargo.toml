@@ -1,0 +1,13 @@
+[package]
+name = "llm_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
+core_plugin = { path = "../../mecs/core_plugin" }
+futures = "0.3"
+providers = { path = "../providers" }
+tokio = { workspace = true }
+types = { path = "../types" }

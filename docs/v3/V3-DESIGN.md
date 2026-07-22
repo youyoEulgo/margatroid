@@ -18,6 +18,7 @@ API 规范已拆分为：
 
 - [V3-INFRASTRUCTURE-API.md](V3-INFRASTRUCTURE-API.md)：可复用 ECS 与基础设施公开 API。
 - [V3-BUSINESS-PLUGIN-API.md](V3-BUSINESS-PLUGIN-API.md)：Margatroid 业务 Plugin 契约。
+- [V3-ROADMAP.md](V3-ROADMAP.md)：从当前状态到 v0.1 独立发布的执行阶段与验收门槛。
 
 ### 1. 守护进程（Daemon）
 
@@ -28,7 +29,7 @@ API 规范已拆分为：
 
 当前 `margatroidd` 已直接创建 V3 `App` 并安装 `MargatroidDaemonPlugins`；
 `margatroid` 已改为纯 HTTP 客户端，不再链接旧 server 或 runtime。旧实现目录已从
-workspace 编译图排除，仅作为迁移参考，见 [legacy/README.md](legacy/README.md)。
+workspace 编译图排除，仅作为迁移参考，见 [legacy/README.md](../../legacy/README.md)。
 
 运维日志同样复用 daemon 的 HTTP 服务，不另开第二个日志端口：
 
