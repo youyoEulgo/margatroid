@@ -5,6 +5,7 @@ use async_runtime_plugin::AsyncRuntimePlugin;
 use config_plugin::ConfigPlugin;
 use core_plugin::{App, Plugin};
 use event_bus_plugin::EventBusPlugin;
+use external_event_plugin::ExternalEventPlugin;
 use http_server_plugin::HttpServerPlugin;
 use llm_plugin::LlmPlugin;
 use log_plugin::{LogPlugin, LogStreamOptions};
@@ -67,9 +68,9 @@ impl Plugin for MargatroidDaemonPlugins {
             server_plugin = server_plugin
                 .with_log_stream_endpoint(LogEndpointOptions::bearer_token(token.clone()));
         }
-
         app.add_plugins(log_plugin)
             .add_plugins(AppRuntimePlugin)
+            .add_plugins(ExternalEventPlugin)
             .add_plugins(AsyncRuntimePlugin::default())
             .add_plugins(HttpServerPlugin::bind(self.bind_address))
             .add_plugins(ConfigPlugin::default())
@@ -83,7 +84,7 @@ impl Plugin for MargatroidDaemonPlugins {
 
 #[cfg(test)]
 mod tests {
-    use http_server_plugin::HttpServerHandle;
+    use http_server_plugin::{HttpServerFailed, HttpServerHandle};
 
     use super::*;
 
@@ -93,14 +94,14 @@ mod tests {
         app.add_plugins(
             MargatroidDaemonPlugins::default().with_bind_address("127.0.0.1:0".parse().unwrap()),
         );
+        let mut failure_reader = app.event_reader::<HttpServerFailed>();
         app.tick();
 
+        let server = app.world().resource::<HttpServerHandle>().unwrap();
+        let failures = app.world().read_events(&mut failure_reader);
         assert!(
-            app.world()
-                .resource::<HttpServerHandle>()
-                .unwrap()
-                .address()
-                .is_some()
+            server.address().is_some(),
+            "HTTP server failed to start: {failures:?}"
         );
     }
 

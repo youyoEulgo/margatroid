@@ -9,6 +9,7 @@ async_runtime_plugin = { path = "../crates/async_runtime_plugin" }
 config_plugin = { path = "../crates/config_plugin" }
 core_plugin = { path = "../crates/core_plugin" }
 event_bus_plugin = { path = "../crates/event_bus_plugin" }
+external_event_plugin = { path = "../crates/external_event_plugin" }
 http_server_plugin = { path = "../crates/http_server_plugin" }
 llm_plugin = { path = "../crates/llm_plugin" }
 log_plugin = { path = "../crates/log_plugin" }
