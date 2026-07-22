@@ -739,9 +739,9 @@ ExternalEventSendError<E>
 let mut app = App::new();
 app.add_plugins(AppRuntimePlugin);
 app.add_plugins(ExternalEventPlugin::default());
-app.add_external_event::<UserPromptSubmitted>();
+app.add_external_event::<ExternalInput>();
 
-let sender = app.external_event_sender::<UserPromptSubmitted>();
+let sender = app.external_event_sender::<ExternalInput>();
 ```
 
 需要自动唤醒时，`AppRuntimePlugin` 必须在调用 `add_external_event::<E>()` 之前安装；

@@ -64,9 +64,7 @@ impl AiProvider for HumanProvider {
 
         let body: serde_json::Value = resp.json().await?;
         match body["status"].as_str() {
-            Some("completed") => {
-                Ok(serde_json::from_value(body["response"].clone())?)
-            }
+            Some("completed") => Ok(serde_json::from_value(body["response"].clone())?),
             Some("timeout") => {
                 bail!("human request timed out")
             }
@@ -82,9 +80,8 @@ impl AiProvider for HumanProvider {
     async fn chat_stream(
         &self,
         _req: ChatRequest,
-    ) -> Result<
-        std::pin::Pin<Box<dyn futures::Stream<Item = Result<types::StreamChunk>> + Send>>,
-    > {
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<types::StreamChunk>> + Send>>>
+    {
         bail!("human provider does not support streaming")
     }
 }

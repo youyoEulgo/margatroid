@@ -21,7 +21,7 @@ cargo run -p cli -- status
 
 ```text
 apps/                  # 可执行程序入口
-├── cli/               # margatroid HTTP 客户端
+├── cli/               # margatroid 本地工具链与 daemon 客户端
 └── daemon/            # margatroidd ECS 守护进程
 crates/
 ├── mecs/              # 领域无关、计划独立发布的 ECS 与基础设施

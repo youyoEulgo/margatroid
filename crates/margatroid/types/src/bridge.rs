@@ -205,10 +205,12 @@ impl BridgeError {
 
     /// 是否是过期类型的错误
     pub fn is_expired(&self) -> bool {
-        if let BridgeError::Fatal { error_type, .. } = self {
-            if let Some(et) = error_type {
-                return et.contains("expired") || et.contains("lifetime");
-            }
+        if let BridgeError::Fatal {
+            error_type: Some(error_type),
+            ..
+        } = self
+        {
+            return error_type.contains("expired") || error_type.contains("lifetime");
         }
         false
     }
@@ -218,11 +220,10 @@ impl BridgeError {
         if let BridgeError::Fatal {
             status, message, ..
         } = self
+            && *status == 403
         {
-            if *status == 403 {
-                return message.contains("external_poll_sessions")
-                    || message.contains("environments:manage");
-            }
+            return message.contains("external_poll_sessions")
+                || message.contains("environments:manage");
         }
         false
     }

@@ -13,10 +13,11 @@ pub fn to_wire(req: &ChatRequest) -> WireRequest {
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
-        tools: req
-            .tools
-            .as_ref()
-            .map(|t| t.iter().filter_map(|v| serde_json::to_value(v).ok()).collect()),
+        tools: req.tools.as_ref().map(|t| {
+            t.iter()
+                .filter_map(|v| serde_json::to_value(v).ok())
+                .collect()
+        }),
         tool_choice: req
             .tool_choice
             .as_ref()

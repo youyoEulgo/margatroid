@@ -177,14 +177,81 @@ skill_plugin     → core_plugin
 server_plugin    → core_plugin + http_server_plugin
 ```
 
-## 10. 当前业务 Plugin 契约
+## 10. Compose、WorkspaceBundle 与资源管理边界
 
-### 10.1 ConfigPlugin
+### 10.1 CLI 与 daemon 的职责
+
+CLI 是本地项目工具链和 daemon 客户端，可以读取文件、解析 compose、收集资源、执行
+预检并发起资源管理命令；daemon 是资源库与运行状态的权威所有者。
+
+```text
+CLI owns
+  本地 compose / Soul / Skill / Workflow 文件的读取
+  相对路径解析和本地 schema 预检
+  WorkspaceBundle 构建和上传
+  命令交互、结果展示和退出码
+
+daemon owns
+  已安装 Agent / Skill / Provider 等资源目录
+  Workspace / Request / Task 运行状态
+  权威语义校验、安全策略和持久化
+  ECS 生命周期与业务状态转换
+```
+
+`margatroid agent ls` 等命令通过 API 查询 daemon 资源库，不在 CLI 内维护第二份权威
+数据库。CLI 可以保留可删除的下载缓存，但缓存不得成为 workspace 可恢复性的前提。
+
+### 10.2 共享协议对象
+
+CLI 与 daemon 通过独立 protocol/project crate 共享以下纯数据对象：
+
+```text
+WorkspaceSpec       规范化 workspace、Agent、Workflow 和引用关系
+WorkspaceBundle     WorkspaceSpec + ResourceManifest + 资源内容
+ResourceManifest    每个资源的 kind、逻辑名称、版本和内容哈希
+ResourceId          daemon 中已安装资源的稳定 ID
+ProjectName         compose 项目名
+```
+
+这些类型不得依赖 ECS、Axum、CLI 或 daemon 实现。资源内容必须有大小上限和内容哈希；
+daemon 必须独立验证 schema version、hash、引用、路径和安全策略。
+
+Provider secret 不进入 `WorkspaceBundle`、日志或规范化 compose 输出。compose 只允许通过
+稳定 Provider ID 引用 daemon 侧凭据。
+
+### 10.3 Compose 编译流程
+
+```text
+compose.toml
+→ parse + resolve local references
+→ local preflight
+→ normalized WorkspaceSpec
+→ collect local resources into WorkspaceBundle
+→ upload
+→ daemon authoritative validation
+→ persist accepted bundle
+→ WorkspacePlugin lifecycle Event
+```
+
+CLI 不得把未打包的本地绝对路径交给 daemon 读取。daemon 接受 workspace 前必须确保资源包
+可独立恢复；不能依赖 CLI 当前工作目录或本地缓存仍然存在。
+
+### 10.4 资源命令与运行时命令
+
+- `agent/skill/provider ls|inspect|add|remove` 管理 daemon 中的共享资源库。
+- `compose up|stop|start|restart|down|ps|logs|config` 管理一个 compose 项目。
+- 顶层 `ps/inspect/logs` 管理或观察 daemon 全局运行状态。
+- 删除仍被 workspace 引用的资源必须拒绝，除非未来提供语义明确的强制迁移机制。
+- `compose down` 不隐式删除共享 Agent、Skill、Provider 或历史数据。
+
+## 11. 当前业务 Plugin 契约
+
+### 11.1 ConfigPlugin
 
 职责：
 
 - 管理配置路径和 ConfigStore
-- 加载 daemon/workspace/provider 配置
+- 加载 daemon 和 provider 运行配置
 - 发出加载、重载和失败 Event
 
 公开 Event：
@@ -200,7 +267,7 @@ ConfigLoadFailed
 
 不负责创建 workspace、provider 或 server。
 
-### 10.2 EventBusPlugin
+### 11.2 EventBusPlugin
 
 职责：
 
@@ -219,7 +286,7 @@ EventBusPublishFailed
 
 不定义 runtime 任务状态，不持久化 memory。
 
-### 10.3 LlmPlugin
+### 11.3 LlmPlugin
 
 职责：
 
@@ -241,7 +308,7 @@ LlmFailed
 
 不决定 agent 路由、不执行 workflow、不写 memory、不发送 SSE。
 
-### 10.4 SandboxPlugin
+### 11.4 SandboxPlugin
 
 职责：
 
@@ -267,7 +334,7 @@ SandboxExecutor
 
 不解释工具语义，不直接读取 LLM 输出。
 
-### 10.5 SkillPlugin
+### 11.5 SkillPlugin
 
 职责：
 
@@ -298,7 +365,7 @@ LoadedSkills
 
 不执行 workflow DAG、不调用 LLM、不执行 sandbox command。
 
-### 10.6 ServerPlugin
+### 11.6 ServerPlugin
 
 职责：
 
@@ -313,8 +380,8 @@ LoadedSkills
 - `ShutdownRequested` 消费与 HTTP/App 停止
 
 `POST /v1/workspaces/{workspace}/prompts` 暂不开放。必须等未来 workflow/workspace
-Plugin 注册 `UserPromptSubmitted` ingress、安装实际消费 System 并提供明确 capability 后，
-HTTP 适配层才能注册该路由并返回 `202 Accepted`。缺少消费者时不得接受请求。
+Plugin 定义稳定 protocol ingress、安装实际消费 System 并提供明确 capability 后，HTTP
+适配层才能注册该路由并返回 `202 Accepted`。缺少消费者时不得接受请求。
 
 携带 request_id 的共享 DTO 和错误码届时放入独立 protocol crate，供 CLI 与 daemon
 共同依赖；不放入 `server_plugin` 实现 crate。
@@ -323,8 +390,6 @@ HTTP 适配层才能注册该路由并返回 `202 Accepted`。缺少消费者时
 
 ```text
 ShutdownRequested
-HttpRequestReceived
-UserPromptSubmitted
 ```
 
 公开配置：
@@ -340,7 +405,7 @@ LogEndpointOptions
 
 不负责 HTTP 服务生命周期、业务调度、LLM 调用、workflow 和 memory。
 
-## 11. 默认产品组合
+## 12. 默认产品组合
 
 Margatroid 开发者不需要为常规 daemon 逐个了解和配置基础设施 Plugin。
 产品层由 `margatroid_defaults` crate 提供预置 PluginGroup：
@@ -364,7 +429,7 @@ LogPlugin
 
 高级用户仍可以拆开 PluginGroup，替换默认配置或移除可选能力。
 
-## 12. 延后设计的业务 Plugin
+## 13. 延后设计的业务 Plugin
 
 ```text
 workspace_plugin
@@ -381,7 +446,7 @@ memory_plugin
 - 不让 LLM 控制程序流程
 - 不把领域 Stage 硬编码进 core
 
-## 13. 测试要求
+## 14. 测试要求
 
 每个业务 Plugin 至少包含：
 
@@ -399,7 +464,7 @@ memory_plugin
 
 外部服务测试默认 ignored，通过环境变量读取凭据，禁止在源码中写真实 key。
 
-## 14. README 要求
+## 15. README 要求
 
 每个 crate README 至少包含：
 
@@ -410,7 +475,7 @@ memory_plugin
 - 最小组合示例
 - 失败和 secret 处理方式
 
-## 15. 最小业务 Plugin 示例
+## 16. 最小业务 Plugin 示例
 
 ```rust
 use core_plugin::{App, Plugin, Stage, World};

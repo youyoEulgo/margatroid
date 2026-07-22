@@ -38,6 +38,9 @@ impl crate::Sandbox for MacOSSandbox {
         &mut self,
         config: SandboxConfig,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        if !Self::is_available() {
+            tracing::warn!("sandbox-exec not found; sandbox is disabled");
+        }
         self.config = Some(config);
         Box::pin(async { Ok(()) })
     }
