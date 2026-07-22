@@ -1,4 +1,3 @@
-pub mod bridge;
 pub mod compose;
 pub mod config;
 pub mod event_index;

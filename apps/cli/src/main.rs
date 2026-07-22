@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 
 const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:3939";
+const API_VERSION: &str = margatroid_protocol::API_VERSION;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -53,6 +54,8 @@ fn print_usage() {
     println!();
     println!("Environment:");
     println!("  MARGATROID_URL  daemon base URL (default: {DEFAULT_DAEMON_URL})");
+    println!();
+    println!("Protocol: {API_VERSION}");
 }
 
 #[cfg(test)]
@@ -62,5 +65,6 @@ mod tests {
     #[test]
     fn default_daemon_url_uses_product_port() {
         assert_eq!(DEFAULT_DAEMON_URL, "http://127.0.0.1:3939");
+        assert_eq!(API_VERSION, "v1");
     }
 }

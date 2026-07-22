@@ -6,6 +6,7 @@
 
 - [V3-INFRASTRUCTURE-API.md](V3-INFRASTRUCTURE-API.md)：通用 ECS 与基础设施公开 API。
 - [V3-BUSINESS-PLUGIN-API.md](V3-BUSINESS-PLUGIN-API.md)：Margatroid 业务 Plugin 契约。
+- [V3-PROTOCOL-API.md](V3-PROTOCOL-API.md)：Margatroid CLI 与 daemon 共享协议。
 
 通用 ECS 与基础设施体系暂定名为 **mecs**，以开发者友好、配置简单和
 默认开箱即用为公开 API 的主要设计目标。
@@ -51,7 +52,8 @@ server_plugin
 
 1. 基础设施 public API 以 `V3-INFRASTRUCTURE-API.md` 为准。
 2. 业务事件和 Resource 以 `V3-BUSINESS-PLUGIN-API.md` 为准。
-3. 产品整体方向以 `V3-DESIGN.md` 为准。
+3. CLI/daemon DTO 和 JSON shape 以 `V3-PROTOCOL-API.md` 为准。
+4. 产品整体方向以 `V3-DESIGN.md` 为准。
 
 任何 Stable API 的破坏性修改必须同步更新对应文档，并在 commit message 中标明
 `Breaking changes`。

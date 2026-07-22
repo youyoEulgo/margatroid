@@ -6,12 +6,12 @@
 legacy/
 ├── runtime_v2/  # 最后一版旧协作 runtime
 ├── server/      # 旧 Axum server 与业务路由
-├── bridge/      # 旧远程 bridge
 ├── mcp_client/  # 旧 MCP client
 └── docs/        # V1/V2 架构、迁移计划和 TaskChain 说明
 ```
 
-更早且已被 `runtime_v2` 完全替代的 `runtime/` 源码不再保留；需要时从 Git 历史查看。
+更早且已被 `runtime_v2` 完全替代的 `runtime/`，以及产品已明确不再支持的远程
+`bridge/` 源码不再保留；需要时从 Git 历史查看。
 
 它们用于查询旧行为、数据结构和迁移背景，不再作为产品代码维护：
 

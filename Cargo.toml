@@ -15,6 +15,7 @@ members = [
     "crates/margatroid/server_plugin",
     "crates/margatroid/skill_plugin",
     "crates/margatroid/defaults",
+    "crates/margatroid/protocol",
     "crates/margatroid/types",
     "crates/margatroid/providers",
     "crates/margatroid/compose",

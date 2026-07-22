@@ -1,6 +1,6 @@
 # Margatroid V3 产品路线图
 
-状态：阶段 0 已完成；下一阶段为阶段 1“稳定产品协议”
+状态：阶段 1 已完成；下一阶段为阶段 2“进程生命周期”
 
 ## 1. 暂定发布目标
 
@@ -30,7 +30,8 @@ v0.1 不包含：
 - 动态库形式的运行时 Plugin 加载
 - 企业级认证和多租户
 - V1/V2 兼容层
-- MCP 和 bridge 产品集成
+- MCP 产品集成
+- V1/V2 远程 bridge 兼容（已明确不再支持）
 - Windows 正式支持
 
 这些能力进入 v0.2 或更晚版本，不阻塞 v0.1。
@@ -46,10 +47,10 @@ v0.1 不包含：
 - legacy 代码隔离。
 - Docker 风格 CLI、Compose 工具链和 daemon 资源库职责设计。
 - legacy 依赖边界检查和全 workspace 严格质量基线。
+- `margatroid_protocol` v1 ID、bundle、DTO、状态机和错误契约。
 
 尚未完成：
 
-- CLI/daemon 共享产品协议。
 - workspace、member、workflow、memory 四个核心业务 Plugin。
 - 持久化任务状态与重启恢复。
 - 完整业务 HTTP API 与 CLI。
@@ -99,7 +100,9 @@ resource catalog ──→ workspace ──→ memory
 - `cargo test --workspace --locked` 通过。
 - `scripts/check-no-legacy-deps.sh` 通过。
 
-## 5. 阶段 1：稳定产品协议
+## 5. 阶段 1：稳定产品协议（已完成）
+
+完成时间：2026-07-22。
 
 新增 `margatroid_protocol` crate，负责：
 
@@ -116,6 +119,13 @@ resource catalog ──→ workspace ──→ memory
 - 协议类型具有双向 serde 和 JSON shape 测试。
 - protocol 不依赖 ECS、Axum、CLI 或 daemon。
 - 关联关系只依赖稳定 ID，不依赖事件队列顺序。
+
+验证记录：
+
+- CLI 与 daemon 均依赖并使用 `margatroid_protocol`。
+- ID、WorkspaceBundle、workspace/request/task DTO 具有 JSON shape 与双向 serde 测试。
+- ExecutionStatus 迁移和 ErrorCode HTTP status 映射具有测试。
+- `scripts/check-protocol-boundary.sh` 验证 protocol 只依赖 serde/serde_json。
 
 ## 6. 阶段 2：进程生命周期
 
@@ -348,7 +358,7 @@ mecs crates：
 - 支持 Linux x86_64 和 macOS arm64。
 - 完整测试、Clippy、依赖审计和真实 LLM smoke test 通过。
 - 二进制、checksum、许可证、升级和卸载说明齐全。
-- Web UI、MCP、bridge、分布式和动态 Plugin 明确留到 v0.2+。
+- Web UI、MCP、分布式和动态 Plugin 明确留到 v0.2+；远程 bridge 不再规划。
 
 ## 17. 执行规则
 
