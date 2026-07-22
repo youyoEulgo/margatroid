@@ -203,7 +203,8 @@ daemon owns
 
 ### 10.2 共享协议对象
 
-CLI 与 daemon 通过独立 protocol/project crate 共享以下纯数据对象：
+CLI 与 daemon 通过 `margatroid_protocol` 共享以下纯数据对象；阶段 3 的 project crate
+负责把 compose 编译成这些对象：
 
 ```text
 WorkspaceSpec       规范化 workspace、Agent、Workflow 和引用关系
@@ -383,7 +384,7 @@ LoadedSkills
 Plugin 定义稳定 protocol ingress、安装实际消费 System 并提供明确 capability 后，HTTP
 适配层才能注册该路由并返回 `202 Accepted`。缺少消费者时不得接受请求。
 
-携带 request_id 的共享 DTO 和错误码届时放入独立 protocol crate，供 CLI 与 daemon
+携带 request_id 的共享 DTO 和错误码由 `margatroid_protocol` 提供，供 CLI 与 daemon
 共同依赖；不放入 `server_plugin` 实现 crate。
 
 公开 Event：

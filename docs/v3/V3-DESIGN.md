@@ -18,6 +18,7 @@ API 规范已拆分为：
 
 - [V3-INFRASTRUCTURE-API.md](V3-INFRASTRUCTURE-API.md)：可复用 ECS 与基础设施公开 API。
 - [V3-BUSINESS-PLUGIN-API.md](V3-BUSINESS-PLUGIN-API.md)：Margatroid 业务 Plugin 契约。
+- [V3-PROTOCOL-API.md](V3-PROTOCOL-API.md)：CLI 与 daemon 共享的产品协议。
 - [V3-ROADMAP.md](V3-ROADMAP.md)：从当前状态到 v0.1 独立发布的执行阶段与验收门槛。
 
 ### 1. 守护进程（Daemon）

@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use app_runtime_plugin::AppRunExt;
 use core_plugin::App;
 use margatroid_defaults::MargatroidDaemonPlugins;
+use margatroid_protocol::API_VERSION;
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:3939";
 
@@ -15,7 +16,7 @@ fn main() {
 
     let mut app = App::new();
     app.add_plugins(plugins);
-    tracing::info!(%bind_address, "margatroidd starting");
+    tracing::info!(%bind_address, api_version = API_VERSION, "margatroidd starting");
     app.run();
 }
 
