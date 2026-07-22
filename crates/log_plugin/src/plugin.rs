@@ -18,6 +18,8 @@ type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
 
 static WORKER_GUARDS: OnceLock<Mutex<Vec<WorkerGuard>>> = OnceLock::new();
 static MANAGED_STREAM: OnceLock<LogStream> = OnceLock::new();
+static MANAGED_OPTIONS: OnceLock<LogOptions> = OnceLock::new();
+static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Default)]
 pub struct LogPlugin {
@@ -71,6 +73,9 @@ impl LogPlugin {
 
 impl Plugin for LogPlugin {
     fn build(&self, app: &mut App) {
+        let _install_guard = INSTALL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut layers = Vec::<BoxedLayer>::new();
         if let Some(console) = &self.options.console {
             layers.push(console_layer(console, self.options.format, &self.options));
@@ -105,13 +110,24 @@ impl Plugin for LogPlugin {
         }
 
         if let Err(error) = tracing_subscriber::registry().with(layers).try_init() {
-            if let Some(stream) = MANAGED_STREAM.get() {
-                app.add_resource(stream.clone());
+            if let Some(installed) = MANAGED_OPTIONS.get() {
+                if installed != &self.options {
+                    eprintln!(
+                        "log_plugin: requested options differ from the process-level options; \
+                         the first installation remains active"
+                    );
+                }
+                if self.options.stream.is_some() {
+                    if let Some(stream) = MANAGED_STREAM.get() {
+                        app.add_resource(stream.clone());
+                    }
+                }
             }
             eprintln!("log_plugin: global tracing subscriber already exists: {error}");
             return;
         }
 
+        let _ = MANAGED_OPTIONS.set(self.options.clone());
         if let Some(guard) = worker_guard {
             WORKER_GUARDS
                 .get_or_init(|| Mutex::new(Vec::new()))

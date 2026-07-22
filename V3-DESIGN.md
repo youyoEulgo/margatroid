@@ -1,6 +1,6 @@
 # Margatroid V3 重构设计
 
-2026-07-10 开始，2026-07-21 更新 Core API 边界，状态：基础设施重构中。
+2026-07-10 开始，2026-07-22 正式入口切换到 ECS，状态：基础设施重构中。
 
 ## 核心问题诊断
 
@@ -25,7 +25,10 @@ API 规范已拆分为：
 - 守护进程常驻，管理多个 workspace 生命周期
 - CLI/Web 通过 HTTP API 与守护进程通信
 - 类 Docker 体验：`margatroid up -f compose.toml` / `margatroid ps` / `margatroid stop`
-- **已通过 demo 验证**：`daemon_test/` 目录，三方通信模型可行
+
+当前 `margatroidd` 已直接创建 V3 `App` 并安装 `MargatroidDaemonPlugins`；
+`margatroid` 已改为纯 HTTP 客户端，不再链接旧 server 或 runtime。旧实现目录已从
+workspace 编译图排除，仅作为迁移参考，见 [legacy/README.md](legacy/README.md)。
 
 运维日志同样复用 daemon 的 HTTP 服务，不另开第二个日志端口：
 
@@ -97,7 +100,7 @@ core 只保留 `Startup / First / Update / Last` 四个通用阶段，不知道�
 ├── AppRuntimePlugin    ← run / wake / shutdown
 ├── AsyncRuntimePlugin  ← 可选异步任务执行基础设施
 ├── HttpServerPlugin    ← Axum / HTTP / SSE / WebSocket 生命周期
-└── ExternalEventPlugin ← 外部线程安全注入 ECS Event（API 已设计）
+└── ExternalEventPlugin ← 外部线程安全注入 ECS Event
 
 Margatroid 业务
 ├── LLMPlugin           ← Provider + Chat streaming
@@ -114,24 +117,21 @@ Plugin 组合，不负责创建 App、解析进程参数或启动 daemon。
 
 #### 2.3 外部输入进入 ECS
 
-HTTP handler 运行在 HTTP worker，不能直接修改 World。下一个基础设施阶段
-按以下数据流打通：
+HTTP handler 运行在 HTTP worker，不能直接修改 World。当前
+`ExternalEventPlugin` 已打通通用基础设施部分：
 
 ```text
-CLI / Web
-→ HttpServerPlugin / Axum handler
+external thread / handler
 → ExternalEventSender<E>::try_send
 → bounded channel + AppControl::wake
 → Stage::First
-→ ECS Event / business System
-→ result Event with request_id
-→ EventBus / SSE
-→ CLI / Web
+→ ECS Event
 ```
 
-HTTP 提交类请求不在 handler 中等待 ECS 完成，而是返回 `202 + request_id`。
-这避免在 ECS Event 中携带 oneshot sender，也不把 HTTP 连接寿命与业务 System
-的完成时间强绑定。
+具体 prompt HTTP 路由将在 workflow/workspace Plugin 提供实际消费者后实现。提交类请求
+届时不在 handler 中等待 ECS 完成，而是返回 `202 + request_id`；在没有消费者时不得
+注册路由或返回 `202`。这避免在 ECS Event 中携带 oneshot sender，也不把 HTTP
+连接寿命与业务 System 的完成时间强绑定。
 
 #### 2.4 每个 Plugin 是一个功能边界
 

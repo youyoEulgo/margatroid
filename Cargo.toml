@@ -1,23 +1,20 @@
 [workspace]
 members = [
     "cli",
-    "bridge",
+    "daemon",
     "compose",
-    "server",
     "types",
     "providers",
     "margatroid_defaults",
-    "mcp_client",
     "assets",
     "paths",
-    "runtime",
-    "runtime_v2",
     "sandbox",
     "crates/core_plugin",
     "crates/app_runtime_plugin",
     "crates/async_runtime_plugin",
     "crates/log_plugin",
     "crates/http_server_plugin",
+    "crates/external_event_plugin",
     "crates/config_plugin",
     "crates/event_bus_plugin",
     "crates/llm_plugin",
@@ -25,6 +22,8 @@ members = [
     "crates/server_plugin",
     "crates/skill_plugin",
 ]
+
+exclude = ["legacy/*"]
 
 resolver = "3"
 [workspace.dependencies]
