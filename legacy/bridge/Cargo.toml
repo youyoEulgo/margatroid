@@ -13,5 +13,5 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
-types = { path = "../../types" }
+types = { path = "../../crates/margatroid/types" }
 uuid = { version = "1", features = ["v4"] }

@@ -4,7 +4,7 @@ use app_runtime_plugin::AppRunExt;
 use core_plugin::App;
 use margatroid_defaults::MargatroidDaemonPlugins;
 
-const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:3000";
+const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:3939";
 
 fn main() {
     let bind_address = bind_address();
@@ -38,7 +38,7 @@ mod tests {
     fn default_bind_address_is_valid() {
         assert_eq!(
             DEFAULT_BIND_ADDRESS.parse::<SocketAddr>().unwrap(),
-            "127.0.0.1:3000".parse().unwrap()
+            "127.0.0.1:3939".parse().unwrap()
         );
     }
 }

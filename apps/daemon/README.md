@@ -9,5 +9,5 @@ cargo run -p margatroidd
 
 环境变量：
 
-- `MARGATROID_BIND`：监听地址，默认 `127.0.0.1:3000`。
+- `MARGATROID_BIND`：监听地址，默认 `127.0.0.1:3939`。
 - `MARGATROID_LOG_TOKEN`：设置后启用带 bearer token 的日志 SSE 端点。

@@ -24,14 +24,15 @@ legacy/
 当前正式入口：
 
 ```text
-daemon/src/main.rs
+apps/daemon/src/main.rs
 → core_plugin::App
 → margatroid_defaults::MargatroidDaemonPlugins
 
-cli/src/main.rs
+apps/cli/src/main.rs
 → HTTP
 → margatroidd
 ```
 
-仍留在 workspace 的 `types`、`providers`、`compose`、`assets`、`paths` 和 `sandbox`
-不是入口层旧实现；现有 V3 Plugin 仍依赖其中的能力，后续按 Plugin 边界逐步整理。
+`crates/margatroid/` 中的 `types`、`providers`、`compose`、`assets`、`paths` 和
+`sandbox` 不是入口层旧实现；现有 V3 Plugin 仍依赖其中的能力，后续按 Plugin
+边界逐步整理。
