@@ -11,4 +11,5 @@ path = "src/main.rs"
 app_runtime_plugin = { path = "../../crates/mecs/app_runtime_plugin" }
 core_plugin = { path = "../../crates/mecs/core_plugin" }
 margatroid_defaults = { path = "../../crates/margatroid/defaults" }
+margatroid_protocol = { path = "../../crates/margatroid/protocol" }
 tracing = { workspace = true }
