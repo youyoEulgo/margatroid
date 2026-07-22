@@ -14,8 +14,8 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<ComposeFile> {
 
 /// 从字符串解析 compose 文件
 pub fn parse_str(content: &str) -> Result<ComposeFile> {
-    let file: ComposeFile = toml::from_str(content)
-        .context("TOML 解析失败，请检查 compose 文件格式")?;
+    let file: ComposeFile =
+        toml::from_str(content).context("TOML 解析失败，请检查 compose 文件格式")?;
 
     validate_workspace(&file.workspace)?;
 

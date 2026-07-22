@@ -9,10 +9,11 @@
 //! `guard()` 拒绝任何未经 wrap_command() 包装的裸命令。
 
 pub mod config;
+#[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
 mod macos;
 mod mandatory;
-mod proxy;
 
 use anyhow::{Result, bail};
 use config::SandboxConfig;
@@ -208,7 +209,7 @@ mod tests {
         mgr.initialize(config).await.unwrap();
 
         let wrapped = mgr.wrap_command("cargo build");
-        assert_eq!(mgr.guard(&wrapped).unwrap(), true);
+        assert!(mgr.guard(&wrapped).unwrap());
     }
 
     #[tokio::test]
@@ -217,7 +218,7 @@ mod tests {
         mgr.initialize(SandboxConfig::strict()).await.unwrap();
 
         let wrapped = mgr.wrap_command("cargo build");
-        assert_eq!(mgr.guard(&wrapped).unwrap(), false);
+        assert!(!mgr.guard(&wrapped).unwrap());
     }
 
     #[tokio::test]

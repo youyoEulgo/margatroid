@@ -99,10 +99,7 @@ impl AiProvider for OpenRouterProvider {
         // 非 2xx 在进入流之前就返回错误
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let body = resp
-                .text()
-                .await
-                .context("failed to read response body")?;
+            let body = resp.text().await.context("failed to read response body")?;
             let msg = serde_json::from_str::<ApiErrorBody>(&body)
                 .map(|e| e.error.message)
                 .unwrap_or(body);

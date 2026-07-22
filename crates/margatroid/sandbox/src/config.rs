@@ -78,7 +78,7 @@ impl SandboxConfig {
 }
 
 /// 文件系统隔离规则
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FilesystemConfig {
     #[serde(default)]
     pub deny_read: Vec<String>,
@@ -90,16 +90,6 @@ pub struct FilesystemConfig {
     pub deny_write: Vec<String>,
 }
 
-impl Default for FilesystemConfig {
-    fn default() -> Self {
-        Self {
-            deny_read: vec![],
-            allow_write: vec![],
-            deny_write: vec![],
-        }
-    }
-}
-
 impl FilesystemConfig {
     fn merge(&mut self, other: &FilesystemConfig) {
         self.deny_read.extend(other.deny_read.clone());
@@ -109,7 +99,7 @@ impl FilesystemConfig {
 }
 
 /// 网络隔离规则
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetworkConfig {
     #[serde(default)]
     pub allowed_domains: Vec<String>,
@@ -130,19 +120,6 @@ pub struct NetworkConfig {
     /// SOCKS5 代理端口（None = 自动分配）
     #[serde(default)]
     pub socks_proxy_port: Option<u16>,
-}
-
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self {
-            allowed_domains: vec![],
-            denied_domains: vec![],
-            allow_unix_sockets: vec![],
-            allow_local_binding: false,
-            http_proxy_port: None,
-            socks_proxy_port: None,
-        }
-    }
 }
 
 impl NetworkConfig {

@@ -247,18 +247,17 @@ impl Manager {
                     continue;
                 }
             };
-            if !entry.file_type().map_or(false, |t| t.is_dir()) {
+            if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
                 continue;
             }
-            if let Some(name) = entry.file_name().to_str() {
-                if self
+            if let Some(name) = entry.file_name().to_str()
+                && self
                     .paths
                     .workspace_config(name)
                     .ok()
                     .is_some_and(|p| p.is_file())
-                {
-                    names.push(name.to_string());
-                }
+            {
+                names.push(name.to_string());
             }
         }
         Ok(names)
