@@ -22,13 +22,12 @@ serde_json = "1"
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
-providers = { path = "../providers" }
-types = { path = "../types" }
+providers = { path = "../../providers" }
+types = { path = "../../types" }
 runtime_v2 = { path = "../runtime_v2" }
-compose = { path = "../compose" }
-sandbox = { path = "../sandbox" }
+compose = { path = "../../compose" }
+sandbox = { path = "../../sandbox" }
 bridge = { path = "../bridge" }
 mcp_client = { path = "../mcp_client" }
-assets = { path = "../assets" }
-paths = { path = "../paths" }
-
+assets = { path = "../../assets" }
+paths = { path = "../../paths" }

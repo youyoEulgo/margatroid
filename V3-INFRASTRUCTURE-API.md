@@ -65,7 +65,7 @@ http_server_plugin（第一版已实现）
 ├── listener lifecycle
 └── graceful shutdown
 
-external_event_plugin（API 设计阶段）
+external_event_plugin（第一版已实现）
 ├── typed external Event registration
 ├── cloneable bounded sender
 ├── AppControl wake integration
@@ -559,8 +559,11 @@ App::new()
 ### 7.7 已存在的 subscriber
 
 `LogPlugin` 默认调用 `try_init`：如果进程已有 subscriber，则保留它且不 panic。
-本次 console、file 和 stream 配置不生效，Plugin 使用最小 fallback 直接写 stderr
-说明原因。不提供 subscriber 替换或卸载 API。
+由 `LogPlugin` 完成的首次安装会记录进程级 Options；后续相同配置可以在明确请求
+stream 时复用同一个 `LogStream`，未请求 stream 的 App 不会得到该 Resource。
+后续配置与首次配置不同时，首次配置继续生效，并通过最小 fallback 写 stderr 明确
+报告冲突。若 subscriber 由外部代码安装，本次 console、file 和 stream 配置均不生效。
+不提供 subscriber 替换或卸载 API。
 
 需要完全自定义 subscriber 或 Layer 的高级用户，应使用 tracing 原生 API 完成安装，
 并不安装 `LogPlugin`。`LogPlugin` 不为支持任意 Layer 而向公开 API 泄漏复杂泛型。
@@ -616,12 +619,12 @@ tracing Event 用于诊断，ECS Event 用于驱动程序行为。两者同名�
 由于 global subscriber 每进程只能安装一次，测试必须隔离：
 
 - 纯 options/filter 单元测试不安装 global subscriber。
-- subscriber 安装测试使用独立 integration-test binary/process。
+- subscriber 安装和并发重复安装测试使用独立 integration-test binary/process。
 - 测试已有 subscriber 时不覆盖且不 panic。
 - 测试 console off、JSON、文件创建和轮转。
 - 测试 stream 队列满、慢订阅者和 dropped count。
 - 测试重复安装不会 panic。
-- 不并行运行共享 global subscriber 的测试。
+- 除专门验证安装锁的单个隔离测试外，不并行运行共享 global subscriber 的测试。
 
 ### 7.12 第一版明确不做
 
@@ -708,7 +711,7 @@ HTTP 端口、路由、鉴权、限流和日志可见性属于上层适配 Plugi
 - App shutdown 时停止接受新连接，等待在途请求到明确 deadline。
 - 测试覆盖路由合并、端口冲突、启动失败、SSE 断开和 graceful shutdown。
 
-## 9. external_event_plugin API 设计（尚未实现）
+## 9. external_event_plugin API
 
 ### 9.1 定位
 
@@ -741,7 +744,8 @@ app.add_external_event::<UserPromptSubmitted>();
 let sender = app.external_event_sender::<UserPromptSubmitted>();
 ```
 
-需要自动唤醒时，`AppRuntimePlugin` 必须在 `ExternalEventPlugin` 之前安装。
+需要自动唤醒时，`AppRuntimePlugin` 必须在调用 `add_external_event::<E>()` 之前安装；
+`ExternalEventPlugin` 本身与 `AppRuntimePlugin` 的安装先后不影响该能力。
 未安装 App runtime 是受支持的 manual-tick 模式，不是错误。调用 extension API
 时若缺失 `ExternalEventPlugin`，则在 build 阶段立即给出明确错误。
 
@@ -829,7 +833,8 @@ Event 进入 World 后完全遵循 core Event 的 reader、retention 和过期�
 
 ### 9.6 HTTP 映射建议
 
-`external_event_plugin` 不定义 HTTP status，但 `ServerPlugin` 应统一映射：
+`external_event_plugin` 不定义 HTTP status。未来具有实际业务消费者的 HTTP 适配
+Plugin 应统一映射：
 
 ```text
 try_send Ok          → 202 Accepted + request_id

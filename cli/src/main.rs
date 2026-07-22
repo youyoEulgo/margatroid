@@ -1,326 +1,67 @@
-//! Margatroid CLI
-//!
-//! 用法:
-//!   margatroid serve                         启动 HTTP 服务
-//!   margatroid compose validate <file>       校验 compose 文件
-//!   margatroid compose roster <file>         打印团队成员目录
-//!   margatroid compose load <file>           解析并以 JSON 输出
-//!   margatroid compose up <file>             启动 Workspace
-//!   margatroid workspace create <file>       从 compose 文件创建 Workspace
-//!   margatroid workspace list                列出所有 Workspace
+use anyhow::{Context, Result, bail};
 
-use anyhow::Result;
-use std::sync::Arc;
-use tracing::level_filters::LevelFilter;
+const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:3000";
 
-use server::state::AppState;
-
-fn config_log_level() -> LevelFilter {
-    let path = paths::margatroid_root()
-        .unwrap_or_else(|| std::path::PathBuf::from(".margatroid"))
-        .join("margatroid.toml");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return LevelFilter::INFO,
-    };
-    let config: toml::Value = match toml::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return LevelFilter::INFO,
-    };
-    match config
-        .get("logging")
-        .and_then(|l| l.get("level"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_lowercase())
-        .as_deref()
-    {
-        Some("error") => LevelFilter::ERROR,
-        Some("warn") => LevelFilter::WARN,
-        Some("debug") => LevelFilter::DEBUG,
-        Some("trace") => LevelFilter::TRACE,
-        _ => LevelFilter::INFO,
-    }
-}
-
-fn usage() -> ! {
-    eprintln!("用法:");
-    eprintln!("  margatroid serve");
-    eprintln!("  margatroid compose validate <file>");
-    eprintln!("  margatroid compose roster <file>");
-    eprintln!("  margatroid compose load <file>");
-    eprintln!("  margatroid compose up <file>");
-    eprintln!("  margatroid workspace create <file>");
-    eprintln!("  margatroid workspace list");
-    std::process::exit(1);
-}
-
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let verbose = args.iter().any(|a| a == "--verbose");
-    let args: Vec<_> = args.into_iter().filter(|a| a != "--verbose").collect();
+    let mut args = std::env::args().skip(1);
+    let Some(command) = args.next() else {
+        print_usage();
+        return Ok(());
+    };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .with_default_directive(config_log_level().into())
-                .from_env_lossy(),
-        )
-        .init();
-
-    if args.len() < 2 {
-        usage();
-    }
-
-    match args[1].as_str() {
-        "serve" => cmd_serve(verbose).await,
-        "compose" => {
-            if args.len() < 4 {
-                usage();
-            }
-            match args[2].as_str() {
-                "validate" => cmd_compose_validate(&args[3]),
-                "roster" => cmd_compose_roster(&args[3]),
-                "load" => cmd_compose_load(&args[3]),
-                "up" => {
-                    if args.len() < 4 {
-                        usage();
-                    }
-                    cmd_compose_up(&args[3], verbose).await
-                }
-                _ => usage(),
-            }
+    match command.as_str() {
+        "status" => status(&daemon_url()).await,
+        "help" | "--help" | "-h" => {
+            print_usage();
+            Ok(())
         }
-        "workspace" => {
-            if args.len() < 3 {
-                usage();
-            }
-            match args[2].as_str() {
-                "create" => {
-                    if args.len() < 4 {
-                        usage();
-                    }
-                    cmd_workspace_create(&args[3])
-                }
-                "list" => cmd_workspace_list(),
-                _ => usage(),
-            }
-        }
-        _ => usage(),
+        unknown => bail!("unknown command `{unknown}`; run `margatroid help`"),
     }
 }
 
-async fn cmd_serve(verbose: bool) -> Result<()> {
-    let _ = verbose;
-    let config_mgr = assets::Manager::bootstrap()?;
-    let state = AppState::new(config_mgr).await?;
-    server::serve(state).await
-}
-
-fn cmd_compose_validate(path: &str) -> Result<()> {
-    let compose = compose::load(path)?;
-    println!("  valid compose file");
-    println!(
-        "  workspace: {} (v{})",
-        compose.workspace.name, compose.workspace.version
-    );
-    println!("  agents: {}", compose.agents.len());
-    for agent in &compose.agents {
-        println!("    - {}", agent.id);
+async fn status(base_url: &str) -> Result<()> {
+    let endpoint = format!("{}/health", base_url.trim_end_matches('/'));
+    let response = reqwest::get(&endpoint)
+        .await
+        .with_context(|| format!("cannot reach margatroidd at {base_url}"))?
+        .error_for_status()
+        .with_context(|| format!("margatroidd health check failed at {endpoint}"))?;
+    let body = response
+        .text()
+        .await
+        .context("cannot read health response")?;
+    if body.trim() != "ok" {
+        bail!("unexpected health response from margatroidd: {body:?}");
     }
+    println!("margatroidd is running at {base_url}");
     Ok(())
 }
 
-fn cmd_compose_roster(path: &str) -> Result<()> {
-    let _compose = compose::load(path)?;
-    let lib = assets::MemberLibrary::load()?;
-    let defs: Vec<_> = lib.all().collect();
-    let roster = compose::roster::generate(&defs);
-    print!("{}", roster);
-    Ok(())
+fn daemon_url() -> String {
+    std::env::var("MARGATROID_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_DAEMON_URL.into())
+        .trim_end_matches('/')
+        .to_string()
 }
 
-fn cmd_compose_load(path: &str) -> Result<()> {
-    let compose = compose::load(path)?;
-    let json = serde_json::to_string_pretty(&compose)?;
-    println!("{}", json);
-    Ok(())
+fn print_usage() {
+    println!("Usage:");
+    println!("  margatroid status");
+    println!();
+    println!("Environment:");
+    println!("  MARGATROID_URL  daemon base URL (default: {DEFAULT_DAEMON_URL})");
 }
 
-fn cmd_workspace_create(path: &str) -> Result<()> {
-    let compose = compose::load(path)?;
-    let mut mgr = assets::Manager::bootstrap()?;
-    mgr.create_workspace(&compose)?;
-    println!("  workspace '{}' created", compose.workspace.name);
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn cmd_workspace_list() -> Result<()> {
-    let mgr = assets::Manager::bootstrap()?;
-    let list = mgr.list_workspaces();
-    if list.is_empty() {
-        println!("(no workspaces)");
-    } else {
-        for name in list {
-            println!("  {}", name);
-        }
+    #[test]
+    fn default_daemon_url_is_http() {
+        assert!(DEFAULT_DAEMON_URL.starts_with("http://"));
+        assert!(!DEFAULT_DAEMON_URL.ends_with('/'));
     }
-    Ok(())
-}
-
-// ── compose up ────────────────────────────────────────────────
-
-async fn cmd_compose_up(path: &str, verbose: bool) -> Result<()> {
-    let mut compose = compose::load(path)?;
-    let mgr = assets::Manager::bootstrap()?;
-    let lib = assets::MemberLibrary::load()?;
-
-    // 确保 workspace 有系统提示词
-    if compose.workspace.system_prompt.is_empty() {
-        let prompt = mgr.ensure_system_prompt(&compose.workspace.name)?;
-        compose.workspace.system_prompt = prompt;
-    }
-
-    let app_config = mgr.app_config();
-
-    let sandbox = Arc::new(tokio::sync::RwLock::new(sandbox::SandboxManager::new()));
-
-    let mut entries = Vec::new();
-    for agent_ref in &compose.agents {
-        let def = lib
-            .get(&agent_ref.id)
-            .ok_or_else(|| anyhow::anyhow!("member '{}' not found in library", agent_ref.id))?;
-
-        match def.identity {
-            types::Identity::Manager => {
-                let provider = providers::resolve(&def.provider, &app_config.ai)?;
-                let client = providers::Client::new(def.model.clone(), provider, verbose);
-
-                // V2 兼容：传入 client 和 sandbox，让 Workspace 内部构造 Member
-                use runtime_v2::Agent;
-                #[derive(Clone)]
-                struct DummyAgent { id: String, identity: types::Identity }
-                #[async_trait::async_trait]
-                impl Agent for DummyAgent {
-                    fn id(&self) -> &str { &self.id }
-                    fn identity(&self) -> &types::Identity { &self.identity }
-                    async fn process(
-                        &self,
-                        _board: &runtime_v2::DelegationBoard,
-                        _tools: &[types::RequestTool],
-                        _system_prompt: &str,
-                        _member_profiles: &[types::MemberProfile],
-                    ) -> anyhow::Result<runtime_v2::ChatOutcome> {
-                        unreachable!("DummyAgent should never be called - Workspace will reconstruct real Member")
-                    }
-                }
-
-                entries.push(runtime_v2::AgentEntry {
-                    agent: Arc::new(DummyAgent {
-                        id: def.id.clone(),
-                        identity: def.identity.clone()
-                    }),
-                    soul: def.soul.clone(),
-                    tools: runtime_v2::manager_tools(),
-                    skills: def.skills.clone(),
-                    client: Some(client),
-                    sandbox: Some(sandbox.clone()),
-                });
-            }
-            types::Identity::Member => {
-                let provider = providers::resolve(&def.provider, &app_config.ai)?;
-                let client = providers::Client::new(def.model.clone(), provider, verbose);
-
-                // V2 兼容：传入 client 和 sandbox，让 Workspace 内部构造 Member
-                use runtime_v2::Agent;
-                #[derive(Clone)]
-                struct DummyAgent { id: String, identity: types::Identity }
-                #[async_trait::async_trait]
-                impl Agent for DummyAgent {
-                    fn id(&self) -> &str { &self.id }
-                    fn identity(&self) -> &types::Identity { &self.identity }
-                    async fn process(
-                        &self,
-                        _board: &runtime_v2::DelegationBoard,
-                        _tools: &[types::RequestTool],
-                        _system_prompt: &str,
-                        _member_profiles: &[types::MemberProfile],
-                    ) -> anyhow::Result<runtime_v2::ChatOutcome> {
-                        unreachable!("DummyAgent should never be called - Workspace will reconstruct real Member")
-                    }
-                }
-
-                entries.push(runtime_v2::AgentEntry {
-                    agent: Arc::new(DummyAgent {
-                        id: def.id.clone(),
-                        identity: def.identity.clone()
-                    }),
-                    soul: def.soul.clone(),
-                    tools: runtime_v2::base_tools(),
-                    skills: def.skills.clone(),
-                    client: Some(client),
-                    sandbox: Some(sandbox.clone()),
-                });
-            }
-            types::Identity::User => {
-                let provider_config = app_config
-                    .ai
-                    .providers
-                    .iter()
-                    .find(|p| p.name == "human" && p.enabled)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("human provider not found for user member")
-                    })?;
-                let provider = Arc::new(providers::human::HumanProvider::new(
-                    provider_config.base_url.clone(),
-                    compose.workspace.name.clone(),
-                )) as Arc<dyn providers::DynAiProvider>;
-                let client = providers::Client::new(def.model.clone(), provider, verbose);
-
-                // V2 兼容：传入 client 和 sandbox，让 Workspace 内部构造 Member
-                use runtime_v2::Agent;
-                #[derive(Clone)]
-                struct DummyAgent { id: String, identity: types::Identity }
-                #[async_trait::async_trait]
-                impl Agent for DummyAgent {
-                    fn id(&self) -> &str { &self.id }
-                    fn identity(&self) -> &types::Identity { &self.identity }
-                    async fn process(
-                        &self,
-                        _board: &runtime_v2::DelegationBoard,
-                        _tools: &[types::RequestTool],
-                        _system_prompt: &str,
-                        _member_profiles: &[types::MemberProfile],
-                    ) -> anyhow::Result<runtime_v2::ChatOutcome> {
-                        unreachable!("DummyAgent should never be called - Workspace will reconstruct real Member")
-                    }
-                }
-
-                entries.push(runtime_v2::AgentEntry {
-                    agent: Arc::new(DummyAgent {
-                        id: def.id.clone(),
-                        identity: def.identity.clone()
-                    }),
-                    soul: def.soul.clone(),
-                    tools: runtime_v2::base_tools(),
-                    skills: def.skills.clone(),
-                    client: Some(client),
-                    sandbox: Some(sandbox.clone()),
-                });
-            }
-        }
-    }
-
-    let ws_name = compose.workspace.name.clone();
-
-    let state = AppState::new(mgr).await?;
-    state.start_workspace(&compose, entries).await?;
-
-    tracing::info!(
-        "Workspace '{}' started, {} members",
-        ws_name,
-        compose.agents.len()
-    );
-
-    server::serve(state).await
 }

@@ -8,21 +8,6 @@ name = "margatroid"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
 anyhow = "1"
-async-trait = "0.1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-axum = "0.8"
-
-assets = { path = "../assets" }
-compose = { path = "../compose" }
-paths = { path = "../paths" }
-providers = { path = "../providers" }
-runtime_v2 = { path = "../runtime_v2" }
-server = { path = "../server" }
-types = { path = "../types" }
-sandbox = { path = "../sandbox" }
-toml = "0.8"
+reqwest = "0.13"
+tokio = { version = "1", features = ["macros", "rt"] }

@@ -174,7 +174,7 @@ event_bus_plugin → core_plugin + types
 llm_plugin       → core_plugin + async_runtime_plugin + providers + types
 sandbox_plugin   → core_plugin + async_runtime_plugin + sandbox
 skill_plugin     → core_plugin
-server_plugin    → core_plugin + http_server_plugin + external_event_plugin（规划）
+server_plugin    → core_plugin + http_server_plugin
 ```
 
 ## 10. 当前业务 Plugin 契约
@@ -312,12 +312,12 @@ LoadedSkills
 - 带 bearer token 鉴权的可选 `/v1/logs/stream`
 - `ShutdownRequested` 消费与 HTTP/App 停止
 
-下一阶段在 `external_event_plugin` 实现后完成：
+`POST /v1/workspaces/{workspace}/prompts` 暂不开放。必须等未来 workflow/workspace
+Plugin 注册 `UserPromptSubmitted` ingress、安装实际消费 System 并提供明确 capability 后，
+HTTP 适配层才能注册该路由并返回 `202 Accepted`。缺少消费者时不得接受请求。
 
-- 将 HTTP/CLI/Web 输入通过 `ExternalEventSender<E>` 转换为 App Event
-- 提交类路由返回 `202 Accepted + request_id`
-- 将 queue full 映射为 429，App closed 映射为 503
-- 将带 request_id 的业务结果 Event 通过 EventBus/SSE 交付给 CLI
+携带 request_id 的共享 DTO 和错误码届时放入独立 protocol crate，供 CLI 与 daemon
+共同依赖；不放入 `server_plugin` 实现 crate。
 
 公开 Event：
 
@@ -354,9 +354,9 @@ app.add_plugins(MargatroidDaemonPlugins::default());
 ```text
 LogPlugin
 → AppRuntimePlugin
+→ ExternalEventPlugin
 → AsyncRuntimePlugin
 → HttpServerPlugin
-→ ExternalEventPlugin（实现后加入）
 → EventBusPlugin
 → ServerPlugin
 → 其他 Margatroid 业务 Plugin
