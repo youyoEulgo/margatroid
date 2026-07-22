@@ -20,17 +20,12 @@ pub fn mandatory_deny_write() -> &'static [&'static str] {
     ]
 }
 
-/// 无论如何都禁止读取的路径列表
-pub fn mandatory_deny_read() -> &'static [&'static str] {
-    &["~/.ssh/id_rsa", "~/.ssh/id_ed25519", "~/.ssh/id_ecdsa"]
-}
-
 /// 展开路径中的 `~` 为用户主目录
 pub fn expand_home(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).to_string_lossy().into_owned();
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest).to_string_lossy().into_owned();
     }
     path.to_string()
 }
@@ -42,7 +37,6 @@ mod tests {
     #[test]
     fn mandatory_lists_are_non_empty() {
         assert!(!mandatory_deny_write().is_empty());
-        assert!(!mandatory_deny_read().is_empty());
     }
 
     #[test]

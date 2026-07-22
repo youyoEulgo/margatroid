@@ -11,7 +11,7 @@ use futures_util::stream;
 use http_server_plugin::{HttpAppExt, HttpServerHandle};
 use log_plugin::{LogStream, LogStreamError};
 
-use crate::events::{HttpRequestReceived, ShutdownRequested, UserPromptSubmitted};
+use crate::events::ShutdownRequested;
 use crate::resource::{LogEndpointOptions, ServerPluginOptions};
 
 #[derive(Clone, Debug, Default)]
@@ -45,8 +45,6 @@ impl Plugin for ServerPlugin {
             "AppRuntimePlugin must be installed before ServerPlugin"
         );
         app.add_event::<ShutdownRequested>();
-        app.add_event::<HttpRequestReceived>();
-        app.add_event::<UserPromptSubmitted>();
         app.add_http_routes(Router::new().route("/health", get(health)));
 
         if let Some(options) = &self.options.log_endpoint {

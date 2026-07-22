@@ -25,11 +25,68 @@ API 规范已拆分为：
 - 一个 bin：`margatroidd`（守护进程），两个前端：`margatroid` CLI + Web
 - 守护进程常驻，管理多个 workspace 生命周期
 - CLI/Web 通过 HTTP API 与守护进程通信
-- 类 Docker 体验：`margatroid up -f compose.toml` / `margatroid ps` / `margatroid stop`
+- CLI 交互参考 Docker 与 Docker Compose：`margatroid compose up -d`、`margatroid ps`
+- daemon 持有权威资源库、运行状态和持久化数据，CLI 不直接修改 daemon 状态
 
 当前 `margatroidd` 已直接创建 V3 `App` 并安装 `MargatroidDaemonPlugins`；
 `margatroid` 已改为纯 HTTP 客户端，不再链接旧 server 或 runtime。旧实现目录已从
 workspace 编译图排除，仅作为迁移参考，见 [legacy/README.md](../../legacy/README.md)。
+
+#### 1.1 CLI 是本地工具链，不只是 HTTP 转发器
+
+`margatroid` CLI 的职责包括：
+
+- 解析命令和展示结果
+- 读取并解析用户指定的 `compose.toml`
+- 解析相对路径，收集 Soul、Skill、Workflow 等本地资源
+- 执行本地语法与 schema 预检，生成稳定 `WorkspaceBundle`
+- 将资源包上传给 daemon，并通过 HTTP 管理 workspace 和资源库
+- 为 Agent、Skill、Provider 等资源提供 list、inspect、add、remove 命令
+
+CLI 不负责业务状态机、运行时调度、权限裁决或持久化真相。daemon 必须对任何客户端
+提交的 `WorkspaceBundle` 再做一次权威校验，不能信任 CLI 已经检查过的数据。
+
+```text
+compose.toml + local resources
+→ margatroid CLI: parse / resolve / preflight / bundle
+→ WorkspaceBundle + ResourceManifest
+→ margatroidd: authoritative validation / persistence
+→ WorkspacePlugin: create ECS runtime state
+```
+
+这种边界允许 CLI 与 daemon 将来运行在不同机器上。compose 中不得依赖 daemon
+直接读取 CLI 机器上的任意绝对路径；本地文件必须进入上传资源包，或者引用 daemon
+中已经安装且具有稳定 ID 的资源。Provider secret 不进入资源包，只引用 daemon 侧配置。
+
+#### 1.2 Docker 风格命令语义
+
+```text
+margatroid compose up [-d] [-f compose.toml] [-p project]
+margatroid compose stop | start | restart | down
+margatroid compose ps
+margatroid compose logs [-f]
+margatroid compose config
+
+margatroid ps
+margatroid inspect <workspace>
+margatroid logs [-f]
+margatroid prompt <workspace> <text>
+margatroid request inspect | watch | cancel <request-id>
+
+margatroid agent ls | inspect | add | remove
+margatroid skill ls | inspect | add | remove
+margatroid provider ls | inspect | add | remove
+```
+
+- `compose up` 默认 attach，持续显示业务事件、Agent 输出和 workflow 结果。
+- `compose up -d/--detach` 完成启动后返回；detach 不是静默，仍输出 workspace 名称和 ID。
+- `compose logs -f` 查看并跟随 workspace 业务输出，不以 tracing 日志代替业务协议。
+- 顶层 `logs -f` 查看 daemon 运维诊断日志。
+- `stop` 保留 workspace 状态；`start` 恢复；`down` 删除运行实例，但不删除共享资源库。
+- `compose ps` 查看当前 compose 项目，顶层 `ps` 查看 daemon 中的全部 workspace。
+- `compose config` 输出 CLI 解析后的规范化配置，不创建 workspace。
+- `-p/--project-name` 显式指定项目名；未指定时依次使用 compose 名称和目录名。
+- `prompt` 提交工作，`request` 命令组查询、跟随或取消一次请求；它们不属于 compose 生命周期。
 
 运维日志同样复用 daemon 的 HTTP 服务，不另开第二个日志端口：
 
@@ -38,7 +95,7 @@ daemon tracing
 → LogPlugin bounded Stream Layer
 → ServerPlugin 鉴权日志路由
 → HttpServerPlugin SSE/WebSocket
-→ margatroid logs --follow
+→ margatroid logs -f
 ```
 
 日志流只用于诊断。任务进度、LLM 结果和可执行错误仍通过业务 ECS Event
@@ -56,10 +113,9 @@ V3 中 `core_plugin` crate 是编译期内核，`App::new()` 直接创建 ECS；
 - 进阶需求使用 builder，不迫使普通用户理解内部 worker、channel 和全局状态。
 - 保持 tracing、Axum 等 Rust 生态的原生使用习惯，不为形式一致重造 API。
 
-```
+```rust
 App::new()
     .add_plugins(MargatroidDaemonPlugins::default())
-    .add_plugins(workspace_compose("compose.toml"))  // compose 编译为 plugin
     .run();
 ```
 
@@ -110,7 +166,7 @@ Margatroid 业务
 ├── WorkflowPlugin       ← Workflow DAG 执行器
 ├── EventBusPlugin      ← SSE 事件流
 ├── ServerPlugin        ← Margatroid HTTP API 与日志流路由
-└── ConfigPlugin        ← 配置文件的解析与资源管理
+└── ConfigPlugin        ← daemon 运行配置加载与重载
 ```
 
 `MargatroidDaemonPlugins` 由 `margatroid_defaults` crate 提供。该 crate 只负责默认
@@ -142,12 +198,19 @@ external thread / handler
 - 纯同步 Plugin 测试时只需要 `App::new()`
 - 异步 Plugin 测试时显式组合 `AsyncRuntimePlugin`
 
-#### 2.5 compose.toml 编译为 Plugin
+#### 2.5 compose.toml 编译为 WorkspaceBundle
 
-用户 compose 文件中声明的 member 和 workflow，在运行时编译为一组 Plugin：
-- 每个 member → 挂载对应 Component（Soul、SkillSet、ProviderConfig）
-- 每个 workflow → 注册到 WorkflowRegistry Resource
-- manager 字段 → 设置 DispatcherSystem 的路由目标
+compose 是面向用户的声明式项目文件，不是 ECS Plugin 源码。CLI 使用独立的纯数据解析库
+将其编译为稳定 `WorkspaceBundle`；daemon 校验并持久化后，由 `WorkspacePlugin` 应用到 ECS：
+
+- 每个 Agent 定义 → 创建 Entity 并挂载 Soul、SkillSet、ProviderConfig 等 Component
+- 每个 Workflow 定义 → 注册到 `WorkflowRegistry` Resource
+- manager 引用 → 解析为 workspace 内的普通 Agent ID
+- 本地 Soul、Skill、Workflow 文件 → 进入带内容哈希的 `ResourceManifest`
+- 已安装资源 → 通过稳定资源 ID 引用 daemon 的资源库
+
+compose 解析器和 bundle 类型不依赖 ECS、HTTP、CLI 或 daemon 实现。CLI 可做快速预检，
+但 daemon 的校验结果始终是最终结果。
 
 #### 2.6 ECS 核心概念映射
 

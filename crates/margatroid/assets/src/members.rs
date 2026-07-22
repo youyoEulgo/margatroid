@@ -19,7 +19,9 @@ impl MemberLibrary {
             .unwrap_or_else(|| std::path::PathBuf::from(".margatroid"))
             .join("members");
         if !base.is_dir() {
-            return Ok(Self { members: HashMap::new() });
+            return Ok(Self {
+                members: HashMap::new(),
+            });
         }
 
         let mut members = HashMap::new();

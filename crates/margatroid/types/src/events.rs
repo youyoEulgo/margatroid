@@ -127,7 +127,8 @@ mod tests {
 
         // member_status
         let json = serde_json::to_string(&WorkspaceEvent {
-            metadata: EventMetadata::new("member_status", "coder", "d-001").with_timestamp(1700000003),
+            metadata: EventMetadata::new("member_status", "coder", "d-001")
+                .with_timestamp(1700000003),
             content: EventContent::MemberStatus {
                 state: "working".into(),
             },
