@@ -59,7 +59,6 @@ impl Plugin for ServerPlugin {
         }
 
         let control = app.world().resource::<AppControl>().unwrap().clone();
-        let server = app.world().resource::<HttpServerHandle>().unwrap().clone();
         let mut shutdown_reader = app.event_reader::<ShutdownRequested>();
         app.add_systems(
             Stage::Update,
@@ -67,7 +66,6 @@ impl Plugin for ServerPlugin {
                 if world.read_events(&mut shutdown_reader).is_empty() {
                     return;
                 }
-                server.shutdown();
                 control.shutdown();
             }],
         );

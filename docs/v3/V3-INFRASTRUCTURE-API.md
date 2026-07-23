@@ -24,6 +24,10 @@
 - 开发者友好：保持 Rust 生态已有的开发习惯，不为 Plugin 重新发明一套包装 API。
 - 默认可用：常见场景只需 `add_plugins(...)`，合理默认值即可启动。
 - 渐进配置：零配置、builder 配置和生态原生高级 API 分层提供，简单场景不暴露内部复杂度。
+- 独立产品标准：官方 Plugin 的取舍以通用 ECS 工具包是否完整为准，不以 Margatroid
+  当前是否使用为准；未使用的能力保持可选，而不是从 mecs 设计中删除。
+- 机制与策略分离：基础设施只把外部输入转换为 Event，不自行决定关闭进程、重载配置
+  或执行其他产品动作。
 
 判断能力是否应进入 core：
 
@@ -46,7 +50,23 @@ core_plugin
 app_runtime_plugin
 ├── AppRunExt::run()
 ├── AppControl
-└── wait / wake / shutdown
+├── wait / wake / shutdown
+└── ordered shutdown handlers
+
+signal_plugin
+├── configurable process signal listener
+├── signal → typed Event
+└── managed listener thread
+
+terminal_input_plugin（第一版已实现）
+├── key / paste / mouse / focus / resize Event
+├── raw mode and terminal session guard
+└── managed input thread
+
+pty_plugin（目标 API，尚未实现）
+├── pseudo-terminal process lifecycle
+├── bidirectional byte stream
+└── resize / exit / failure Event
 
 async_runtime_plugin
 ├── AsyncAppExt
@@ -76,6 +96,9 @@ external_event_plugin（第一版已实现）
 
 ```text
 app_runtime_plugin   → core_plugin
+signal_plugin        → core_plugin + external_event_plugin + optional app_runtime_plugin API
+terminal_input_plugin → core_plugin + external_event_plugin + optional app_runtime_plugin API
+pty_plugin           → core_plugin + external_event_plugin + optional app_runtime_plugin API
 async_runtime_plugin → core_plugin + app_runtime_plugin API
 log_plugin           → core_plugin + tracing ecosystem
 http_server_plugin   → core_plugin + app_runtime_plugin + Axum/Tokio
@@ -271,6 +294,7 @@ pub trait Plugin {
 - 无 wake 时阻塞当前线程
 - 提供线程安全的 wake / shutdown handle
 - 每次 wake 后执行下一次 `App::tick()`
+- 按固定阶段执行 Plugin 注册的关闭动作
 
 ### 5.2 Public API
 
@@ -279,6 +303,22 @@ pub struct AppRuntimePlugin;
 
 pub trait AppRunExt {
     fn run(&mut self);
+}
+
+pub trait AppShutdownExt {
+    fn add_shutdown_system(
+        &mut self,
+        phase: ShutdownPhase,
+        system: impl FnMut(&mut World) + Send + 'static,
+    ) -> &mut Self;
+}
+
+pub enum ShutdownPhase {
+    Begin,
+    StopIngress,
+    StopWorkers,
+    FlushState,
+    Finish,
 }
 
 #[derive(Clone)]
@@ -298,8 +338,269 @@ impl AppControl {
 - `run()` 先执行一帧，然后进入阻塞等待。
 - wake 具有 pending 语义，先发生的 wake 不会因稍后进入 wait 而丢失。
 - shutdown 必须同时唤醒等待线程。
+- `run()` 退出帧循环后依次执行 `Begin / StopIngress / StopWorkers / FlushState / Finish`。
+- 同一阶段保持注册顺序；单个关闭 System panic 不得阻止后续清理。
+- HTTP listener 使用 `StopIngress`，异步 worker 使用 `StopWorkers`，持久化层使用
+  `FlushState`；产品生命周期只使用 `Begin` 和 `Finish`。
 
 `AppRuntimePlugin` 不定义业务 Stage，也不创建异步任务。
+
+## 5A. signal_plugin API
+
+### 5A.1 职责
+
+`SignalPlugin` 是通用的进程信号事件源。它监听宿主操作系统信号，并将其转换为只能由
+主线程读取的 `ProcessSignalReceived` Event。它不知道 daemon、终端 UI 或产品生命周期，
+也不调用 `AppControl::shutdown()`。
+
+默认监听 `Interrupt` 与 `Terminate`，但默认行为只是发送 Event。应用可以配置
+`Hangup`、`Quit`、`WindowChanged`、`User1`、`User2`；Unix 高级用户可以显式监听
+经过校验的 raw signal number。平台不支持或无法捕获的信号在 `Startup` 阶段产生明确的
+`SignalListenerFailed` Event。
+
+### 5A.2 Public API
+
+```text
+SignalPlugin
+SignalOptions
+ProcessSignal
+ProcessSignalReceived
+SignalHandle
+SignalListenerFailed
+```
+
+目标 API 形状：
+
+```rust
+pub enum ProcessSignal {
+    Interrupt,
+    Terminate,
+    Hangup,
+    Quit,
+    WindowChanged,
+    User1,
+    User2,
+    Raw(i32),
+}
+
+pub struct ProcessSignalReceived {
+    pub signal: ProcessSignal,
+}
+
+impl SignalPlugin {
+    pub fn new() -> Self;
+    pub fn with_options(options: SignalOptions) -> Self;
+}
+
+impl SignalOptions {
+    pub fn new() -> Self;
+    pub fn with_signals(
+        mut self,
+        signals: impl IntoIterator<Item = ProcessSignal>,
+    ) -> Self;
+    pub fn with_capacity(mut self, capacity: usize) -> Self;
+}
+
+impl SignalHandle {
+    pub fn is_running(&self) -> bool;
+    pub fn dropped_count(&self) -> u64;
+    pub fn shutdown(&self);
+}
+```
+
+`SignalPlugin::new()` 默认监听 `Interrupt` 和 `Terminate`。`Raw(i32)` 只在 Unix 提供，
+并拒绝无法捕获、保留或超出平台范围的 signal number。`ProcessSignalReceived` 不携带
+闭包、channel sender 或产品命令。
+
+- 必须先安装 `ExternalEventPlugin`；若同时安装 `AppRuntimePlugin`，入队后会唤醒主循环。
+- `SignalOptions::with_signals(...)` 替换默认监听集合，重复信号必须去重。
+- listener 在 `Startup` 启动，线程由 `SignalHandle` 持有。
+- 安装 app runtime 时 listener 在 `Finish` 关闭并 join；手动 tick 场景在 Resource Drop
+  时完成同样清理。
+- Signal handler 不访问 `World`，不在信号上下文中执行锁、分配或业务逻辑。
+- 有界 Event channel 满时记录丢弃计数，不允许阻塞操作系统 signal handler。
+- 同一个 App 只能安装一个 `SignalPlugin`；不同 App 是否监听同一进程信号由应用的
+  composition root 决定。
+
+上层策略示例：
+
+```text
+ProcessSignalReceived(Interrupt | Terminate)
+→ daemon lifecycle system
+→ AppControl::shutdown()
+
+ProcessSignalReceived(Hangup)
+→ config policy system
+→ ConfigReloadRequested
+```
+
+这两条映射都不属于 `signal_plugin`。
+
+## 5B. terminal_input_plugin API
+
+### 5B.1 职责与边界
+
+`TerminalInputPlugin` 为交互式 ECS 程序提供本地终端输入。它读取当前进程的 stdin，
+将终端协议解析为类型化 Event，并通过 RAII 管理 raw mode、alternate screen、mouse capture
+和 bracketed paste。它适合 TUI、游戏、REPL 和交互式 CLI，不默认安装到 daemon。
+
+它不负责：
+
+- 进程信号；这些由 `SignalPlugin` 处理。
+- UI 布局、渲染、文本编辑器状态或快捷键语义。
+- 全局键盘 hook、GUI 窗口输入或硬件 scan code。
+- 远端会话协议和 PTY 子进程。
+
+### 5B.2 Public API
+
+```text
+TerminalInputPlugin
+TerminalInputOptions
+TerminalSessionHandle
+TerminalEvent
+KeyEvent / KeyCode / KeyModifiers / KeyState
+MouseEvent / MouseButton / MouseEventKind
+TerminalSize
+TerminalInputFailed
+TerminalInputFailureKind
+TerminalError
+```
+
+目标 API 形状：
+
+```rust
+impl TerminalInputPlugin {
+    pub fn with_options(options: TerminalInputOptions) -> Self;
+}
+
+impl TerminalInputOptions {
+    pub fn raw() -> Self;
+    pub fn cooked() -> Self;
+    pub fn with_alternate_screen(self, enabled: bool) -> Self;
+    pub fn with_mouse_capture(self, enabled: bool) -> Self;
+    pub fn with_bracketed_paste(self, enabled: bool) -> Self;
+    pub fn with_capacity(self, capacity: usize) -> Self;
+}
+
+impl TerminalSessionHandle {
+    pub fn is_running(&self) -> bool;
+    pub fn size(&self) -> Result<TerminalSize, TerminalError>;
+    pub fn dropped_count(&self) -> u64;
+    pub fn shutdown(&self);
+}
+```
+
+`TerminalInputPlugin` 不实现 `Default`，因为安装时是否进入 raw mode、alternate screen
+以及是否接管 mouse 都是进程级副作用，必须由 composition root 明确选择。`cooked()`
+只承诺完整行、EOF 和 resize，不伪造逐键 Event；`raw()` 才承诺立即产生 key Event。
+
+`TerminalEvent` 至少覆盖：
+
+```text
+Key(KeyEvent)
+Paste(String)
+Mouse(MouseEvent)
+Resize(TerminalSize)
+FocusGained
+FocusLost
+Line(String)
+EndOfInput
+```
+
+约束：
+
+- 安装前必须存在 `ExternalEventPlugin`。
+- 一个进程同一时刻只能有一个 active `TerminalSessionHandle` 拥有 stdin/terminal mode。
+- ownership 冲突产生 kind 为 `TerminalInputFailureKind::AlreadyInUse` 的
+  `TerminalInputFailed`，不得启动第二条输入线程。
+- stdin 不是 TTY 时默认产生 kind 为 `TerminalInputFailureKind::NotATerminal` 的
+  `TerminalInputFailed`，不得后台忙轮询。
+- raw mode 必须显式配置；进入成功后，无论正常退出、读取失败、线程 panic、shutdown
+  还是 Drop 都必须恢复终端。
+- 输入线程只产生 Event，不直接执行退出、提交消息或 UI 命令。
+- raw mode 下 `Ctrl-C` 通常表现为 `KeyEvent`，是否关闭由应用策略决定；不得同时假设
+  一定会收到 `SIGINT`。
+- Event channel 有界；队列满时丢弃当前新事件，并通过 `dropped_count()` 累计丢弃数，
+  不阻塞输入线程。
+
+### 5B.3 典型组合
+
+```text
+TerminalInputPlugin
+→ TerminalEvent::Key / Paste / Resize
+→ application input systems
+→ UI state / network request / AppControl
+```
+
+Margatroid 的 TUI 可以使用该 Plugin，但 `workspace`、对话和 CLI 命令不得进入其 API。
+
+## 5C. pty_plugin API（目标设计）
+
+### 5C.1 职责与边界
+
+`PtyPlugin` 管理挂在伪终端上的子进程，供 shell、REPL、调试器等双向交互会话使用。
+它与 `TerminalInputPlugin` 分开：前者管理子进程一侧的 PTY，后者管理用户本地终端。
+
+目标 Public API：
+
+```text
+PtyPlugin
+PtyOptions
+PtySessionId
+PtyCommand
+PtySize
+PtySpawnRequested / PtySpawned / PtySpawnFailed
+PtyInputRequested / PtyResizeRequested / PtyCloseRequested
+PtyOutput / PtyExited / PtyFailed
+PtySessionHandle
+```
+
+目标 API 形状：
+
+```rust
+pub struct PtyCommand {
+    // private fields
+}
+
+impl PtyCommand {
+    pub fn new(program: impl Into<OsString>) -> Self;
+    pub fn arg(self, arg: impl Into<OsString>) -> Self;
+    pub fn current_dir(self, path: impl Into<PathBuf>) -> Self;
+    pub fn env(self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self;
+    pub fn size(self, size: PtySize) -> Self;
+}
+
+impl PtySessionHandle {
+    pub fn id(&self) -> PtySessionId;
+    pub fn try_write(&self, bytes: Arc<[u8]>) -> Result<(), PtyWriteError>;
+    pub fn resize(&self, size: PtySize) -> Result<(), PtyControlError>;
+    pub fn close_input(&self) -> Result<(), PtyControlError>;
+    pub fn terminate(&self) -> Result<(), PtyControlError>;
+}
+```
+
+生命周期命令使用 ECS Event，数据面使用有界 chunk：`PtyOutput` 的 payload 为
+`Arc<[u8]>`，Reader 克隆不复制整块数据。禁止按单个 byte 发送 Event。单个 chunk 上限、
+队列容量和 overflow 行为由 `PtyOptions` 明确配置。
+
+约束：
+
+- stdin/stdout 字节流保持二进制安全，不假设 UTF-8。
+- 每个 session 有界缓冲、唯一 ID、明确的 EOF、exit status 和 backpressure 语义。
+- `PtyResizeRequested` 与本地 `TerminalEvent::Resize` 是两个独立 Event，由应用连接。
+- App shutdown 时停止接受新 session，终止或按 deadline 等待子进程，并 join reader/writer。
+- `PtyPlugin` 只提供进程和 PTY 机制，不决定命令授权、workspace 权限或 sandbox 策略。
+- Margatroid 的远程 shell 必须先经过产品层鉴权和 `SandboxPlugin` 策略，不能因为使用
+  `PtyPlugin` 绕过安全边界。
+
+典型远程交互链路：
+
+```text
+local TerminalInputPlugin
+→ bidirectional transport
+→ remote PtyPlugin
+→ child shell / REPL
+```
 
 ## 6. async_runtime_plugin API
 
