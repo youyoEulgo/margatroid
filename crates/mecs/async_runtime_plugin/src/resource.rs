@@ -7,9 +7,9 @@ use crate::AsyncTaskId;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Copy, Debug)]
-pub struct AsyncRuntimeOptions {
-    pub queue_capacity: usize,
-    pub max_in_flight: usize,
+pub(crate) struct AsyncRuntimeOptions {
+    pub(crate) queue_capacity: usize,
+    pub(crate) max_in_flight: usize,
 }
 
 impl Default for AsyncRuntimeOptions {
@@ -23,7 +23,7 @@ impl Default for AsyncRuntimeOptions {
 
 #[derive(Clone, Copy, Debug)]
 pub struct AsyncSystemOptions {
-    pub timeout: Option<Duration>,
+    pub(crate) timeout: Option<Duration>,
 }
 
 impl Default for AsyncSystemOptions {
@@ -34,27 +34,39 @@ impl Default for AsyncSystemOptions {
     }
 }
 
+impl AsyncSystemOptions {
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            timeout: Some(timeout),
+        }
+    }
+
+    pub fn without_timeout() -> Self {
+        Self { timeout: None }
+    }
+}
+
 #[derive(Clone)]
-pub struct AsyncTaskControl {
+pub struct AsyncTasks {
     pub(crate) spawner: AsyncSpawner,
 }
 
 #[derive(Clone)]
-pub struct AsyncRuntimeHandle {
+pub struct AsyncRuntimeStatus {
     pub(crate) state: std::sync::Arc<AsyncRuntimeState>,
 }
 
-impl AsyncRuntimeHandle {
+impl AsyncRuntimeStatus {
     pub fn is_running(&self) -> bool {
         self.state.is_running()
     }
 
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         self.state.shutdown();
     }
 }
 
-impl AsyncTaskControl {
+impl AsyncTasks {
     pub fn cancel(&self, id: AsyncTaskId) -> bool {
         self.spawner.cancel(id)
     }

@@ -2,7 +2,6 @@ use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 
 use crate::events::{Event, EventReader, Events};
-use crate::plugin::PluginGroup;
 use crate::resource::Resource;
 use crate::schedule::{Schedule, ScheduleReport};
 use crate::system::{System, SystemFailed};
@@ -43,8 +42,8 @@ impl App {
         }
     }
 
-    pub fn add_plugins(&mut self, plugins: impl Into<PluginGroup>) -> &mut Self {
-        plugins.into().build_all(self);
+    pub fn add_plugins(&mut self, plugins: impl crate::Plugin) -> &mut Self {
+        plugins.build(self);
         self
     }
 
@@ -109,12 +108,6 @@ impl App {
 
     pub fn world_mut(&mut self) -> &mut World {
         &mut self.world
-    }
-
-    pub fn schedule_mut(&mut self, stage: Stage) -> &mut Schedule {
-        self.schedules
-            .get_mut(&stage)
-            .expect("stage not registered")
     }
 
     /// 执行一个同步 ECS 帧。第一次调用时先运行一次 Startup。

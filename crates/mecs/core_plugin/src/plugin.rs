@@ -22,8 +22,8 @@ impl PluginGroup {
         self
     }
 
-    pub fn build_all(self, app: &mut App) {
-        for plugin in self.plugins {
+    fn build_all(&self, app: &mut App) {
+        for plugin in &self.plugins {
             plugin.build(app);
         }
     }
@@ -35,9 +35,8 @@ impl Default for PluginGroup {
     }
 }
 
-// 允许单个 Plugin 直接传入 add_plugins
-impl<P: Plugin + 'static> From<P> for PluginGroup {
-    fn from(plugin: P) -> Self {
-        PluginGroup::new().add_plugin(plugin)
+impl Plugin for PluginGroup {
+    fn build(&self, app: &mut App) {
+        self.build_all(app);
     }
 }
