@@ -132,4 +132,4 @@ define_identifier!(RequestId, "request ID");
 define_identifier!(TaskId, "task ID");
 define_identifier!(AgentId, "agent ID");
 define_identifier!(ResourceId, "resource ID");
-define_identifier!(ProjectName, "project name");
+define_identifier!(WorkspaceName, "workspace name");

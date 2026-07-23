@@ -10,4 +10,3 @@ anyhow = "1"
 tempfile = "3.27.0"
 types = { path = "../types" }
 paths = { path = "../paths" }
-compose = { path = "../compose" }

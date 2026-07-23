@@ -64,7 +64,8 @@ WorkspaceAgentSpec
 ├── id: AgentId
 ├── image: AgentImageReference
 ├── skills: ResourceReference[]
-└── workflows: ResourceReference[]
+├── workflows: ResourceReference[]
+└── memory_volume?: string
 ```
 
 `ResourceReference` 使用显式 tagged union：
@@ -85,6 +86,22 @@ WorkspaceAgentSpec
 `ContentDigest` 当前只接受规范化的 `sha256:` 加 64 位小写十六进制。`BundledResource`
 使用 `content_base64`，避免二进制在 JSON 中展开为整数数组。
 
+Skill 和 Workflow 目录包使用 protocol 公开的 `ResourcePackage` wire format：
+
+```text
+ResourcePackage
+├── format_version: 1
+└── files: ResourcePackageFile[]
+    ├── path: package-relative UTF-8 path
+    └── content_base64: RFC 4648 standard base64 with padding
+```
+
+`files` 必须按 `path` 升序排列，换行规范化后使用 compact JSON 编码；资源 digest 和
+`size_bytes` 覆盖这段准确的 JSON bytes。当前格式版本是
+`RESOURCE_PACKAGE_FORMAT_VERSION = 1`，媒体类型分别为
+`application/vnd.margatroid.skill+json` 和 `application/vnd.margatroid.workflow+json`。
+CLI 和 daemon 必须共享 protocol 类型与常量，不能各自维护私有包结构。
+
 协议类型只固定传输形状，不负责以下权威校验：
 
 - manifest entry 与 resources 是否一一对应。
@@ -94,13 +111,10 @@ WorkspaceAgentSpec
 
 这些校验由阶段 3 的项目编译器预检，并由阶段 4 的 daemon 再次执行。
 
-阶段 3 实现前需要按 [V3-COMPOSE-API.md](V3-COMPOSE-API.md) 补充
+阶段 3 已按 [V3-COMPOSE-API.md](V3-COMPOSE-API.md) 固化
 `ResourceManifestEntry.format_version`、`AgentImageReference`、版本化 `WorkspaceAgentSpec` 和
 `ResourceReference`。这些类型属于 CLI 与 daemon 共享的规范化传输形状，不属于 Compose
 authoring schema。
-
-本轮 Workspace 语义设计将 `ProjectName/project` 更名为 `WorkspaceName/name`；当前协议
-实现仍需在阶段 3 前完成这一 breaking migration，并同步更新 JSON shape 测试。
 
 ## 5. Workspace DTO
 
