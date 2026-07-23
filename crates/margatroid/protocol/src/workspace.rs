@@ -1,18 +1,24 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentId, ProjectName, ResourceReference, WorkspaceBundle, WorkspaceId};
+use crate::{
+    AgentId, AgentImageReference, ResourceReference, WorkspaceBundle, WorkspaceId, WorkspaceName,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceAgentSpec {
     pub id: AgentId,
-    pub definition: ResourceReference,
+    pub image: AgentImageReference,
+    #[serde(default)]
+    pub skills: Vec<ResourceReference>,
     #[serde(default)]
     pub workflows: Vec<ResourceReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_volume: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceSpec {
-    pub project: ProjectName,
+    pub name: WorkspaceName,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub manager: AgentId,
@@ -35,7 +41,7 @@ pub enum WorkspaceStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceSummary {
     pub id: WorkspaceId,
-    pub project: ProjectName,
+    pub name: WorkspaceName,
     pub status: WorkspaceStatus,
     pub agent_count: u32,
     pub created_at_ms: u64,

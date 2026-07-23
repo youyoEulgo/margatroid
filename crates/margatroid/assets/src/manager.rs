@@ -4,20 +4,19 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use types::{AppConfig, ComposeFile, WorkspaceConfig};
+use types::{AppConfig, WorkspaceConfig};
 
 /// Margatroid 资源管理器
 ///
 /// 统一管理全局配置与 Workspace 生命周期：
 /// - app config（margatroid.toml）的读写与内存缓存
-/// - workspace 的创建（从 compose 文件）、列表、销毁
+/// - workspace 的列表、销毁和旧配置读取
 /// - workspace.toml 的读写与内存缓存
 ///
 /// # 用法
 ///
 /// ```ignore
 /// let mut mgr = assets::Manager::new(paths).init()?;
-/// mgr.create_workspace(&compose)?;
 /// for name in mgr.list_workspaces() {
 ///     println!("{}", name);
 /// }
@@ -120,45 +119,6 @@ impl Manager {
 // ── Workspace ────────────────────────────────────────────────
 
 impl Manager {
-    /// 从 compose 文件创建 Workspace
-    ///
-    /// 创建目录结构，写入默认 workspace.toml，为每个 agent 创建 data/ 子目录，
-    /// 并将新 workspace 加载到内存缓存中。
-    pub fn create_workspace(&mut self, compose: &ComposeFile) -> Result<()> {
-        let name = &compose.workspace.name;
-        paths::validate_segment(name)?;
-
-        // 1. 目录 + workspace.toml
-        let ws_dir = self.paths.workspace_dir(name)?;
-        if !ws_dir.is_dir() {
-            fs::create_dir_all(&ws_dir)
-                .with_context(|| format!("创建 workspace 目录失败: {}", ws_dir.display()))?;
-        }
-
-        let config = WorkspaceConfig::default();
-        self.write_workspace_config(name, &config)?;
-        self.workspace_configs.insert(name.into(), config);
-
-        // 2. 写入默认沙箱配置
-        let sandbox_path = self.paths.workspace_dir(name)?.join("sandbox.toml");
-        fs::write(&sandbox_path, DEFAULT_SANDBOX_CONFIG)?;
-
-        // 3. agent data 子目录
-        for agent in &compose.agents {
-            let data_dir = self.paths.workspace_data_dir(name)?.join(&agent.id);
-            fs::create_dir_all(&data_dir)
-                .with_context(|| format!("创建 agent {} 的数据目录失败", agent.id))?;
-        }
-
-        Ok(())
-    }
-
-    /// 从 compose 文件路径创建 Workspace
-    pub fn create_workspace_from_file(&mut self, compose_path: impl AsRef<Path>) -> Result<()> {
-        let compose = compose::load(compose_path)?;
-        self.create_workspace(&compose)
-    }
-
     /// 列出所有 Workspace（从内存缓存，非文件系统扫描）
     pub fn list_workspaces(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.workspace_configs.keys().map(|s| s.as_str()).collect();
@@ -326,25 +286,6 @@ const DEFAULT_SYSTEM_PROMPT: &str = r#"# 系统提示词
 - 引用代码用 file_path:line_number 格式
 - 委托前确认目标成员拥有相应技能
 - 遇到错误或不确定的情况在产出中说明
-"#;
-
-const DEFAULT_SANDBOX_CONFIG: &str = r#"# Margatroid Sandbox Configuration
-
-enabled = true
-auto_allow_bash_if_sandboxed = false
-allow_unsandboxed_commands = false
-excluded_commands = ["git push", "gh pr create"]
-
-[filesystem]
-deny_read = []
-allow_write = []
-deny_write = []
-
-[network]
-allowed_domains = ["github.com", "*.github.com", "api.github.com", "registry.npmjs.org"]
-denied_domains = []
-allow_unix_sockets = []
-allow_local_binding = false
 "#;
 
 // ── Helpers ──────────────────────────────────────────────────

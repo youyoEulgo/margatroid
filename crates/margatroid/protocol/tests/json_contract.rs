@@ -1,9 +1,10 @@
 use margatroid_protocol::{
-    AgentId, ApiError, BundledResource, ContentDigest, CreateWorkspaceResponse, ErrorCode,
-    ErrorResponse, ExecutionStatus, GetRequestResponse, ProjectName, RequestId, ResourceId,
-    ResourceKind, ResourceManifest, ResourceManifestEntry, ResourceReference, SchemaVersion,
+    AgentId, AgentImageReference, ApiError, BundledResource, ContentDigest,
+    CreateWorkspaceResponse, ErrorCode, ErrorResponse, ExecutionStatus, GetRequestResponse,
+    RESOURCE_PACKAGE_FORMAT_VERSION, RequestId, ResourceId, ResourceKind, ResourceManifest,
+    ResourceManifestEntry, ResourcePackage, ResourcePackageFile, SchemaVersion,
     SubmitPromptResponse, TaskId, TaskResult, TaskSummary, WorkspaceAgentSpec, WorkspaceBundle,
-    WorkspaceId, WorkspaceSpec, WorkspaceStatus, WorkspaceSummary,
+    WorkspaceId, WorkspaceName, WorkspaceSpec, WorkspaceStatus, WorkspaceSummary,
 };
 use serde_json::json;
 
@@ -12,26 +13,47 @@ fn digest(character: char) -> ContentDigest {
 }
 
 #[test]
+fn resource_package_json_shape_is_stable() {
+    let package = ResourcePackage {
+        format_version: RESOURCE_PACKAGE_FORMAT_VERSION,
+        files: vec![ResourcePackageFile {
+            path: "SKILL.md".into(),
+            content_base64: "dGVzdAo=".into(),
+        }],
+    };
+    let bytes = serde_json::to_vec(&package).unwrap();
+    assert_eq!(
+        bytes,
+        br#"{"format_version":1,"files":[{"path":"SKILL.md","content_base64":"dGVzdAo="}]}"#
+    );
+    assert_eq!(
+        serde_json::from_slice::<ResourcePackage>(&bytes).unwrap(),
+        package
+    );
+}
+
+#[test]
 fn workspace_bundle_json_shape_is_stable_and_round_trips() {
     let soul_digest = digest('a');
     let bundle = WorkspaceBundle {
         schema_version: SchemaVersion::current(),
         spec: WorkspaceSpec {
-            project: ProjectName::new("demo").unwrap(),
+            name: WorkspaceName::new("demo").unwrap(),
             description: Some("demo workspace".into()),
             manager: AgentId::new("manager").unwrap(),
             agents: vec![WorkspaceAgentSpec {
                 id: AgentId::new("manager").unwrap(),
-                definition: ResourceReference::Bundled {
-                    digest: soul_digest.clone(),
-                },
+                image: AgentImageReference::new("eulgo/manager:v1").unwrap(),
+                skills: vec![],
                 workflows: vec![],
+                memory_volume: None,
             }],
         },
         manifest: ResourceManifest {
             entries: vec![ResourceManifestEntry {
                 kind: ResourceKind::Agent,
                 logical_name: "manager".into(),
+                format_version: 1,
                 digest: soul_digest.clone(),
                 size_bytes: 6,
                 media_type: "text/markdown".into(),
@@ -49,15 +71,13 @@ fn workspace_bundle_json_shape_is_stable_and_round_trips() {
         json!({
             "schema_version": 1,
             "spec": {
-                "project": "demo",
+                "name": "demo",
                 "description": "demo workspace",
                 "manager": "manager",
                 "agents": [{
                     "id": "manager",
-                    "definition": {
-                        "source": "bundled",
-                        "digest": format!("sha256:{}", "a".repeat(64))
-                    },
+                    "image": "eulgo/manager:v1",
+                    "skills": [],
                     "workflows": []
                 }]
             },
@@ -65,6 +85,7 @@ fn workspace_bundle_json_shape_is_stable_and_round_trips() {
                 "entries": [{
                     "kind": "agent",
                     "logical_name": "manager",
+                    "format_version": 1,
                     "digest": format!("sha256:{}", "a".repeat(64)),
                     "size_bytes": 6,
                     "media_type": "text/markdown"
@@ -136,7 +157,7 @@ fn execution_status_transitions_are_explicit() {
 fn workspace_and_task_dtos_round_trip() {
     let workspace = WorkspaceSummary {
         id: WorkspaceId::new("workspace-1").unwrap(),
-        project: ProjectName::new("demo").unwrap(),
+        name: WorkspaceName::new("demo").unwrap(),
         status: WorkspaceStatus::Running,
         agent_count: 2,
         created_at_ms: 100,

@@ -1,6 +1,6 @@
 # Margatroid V3 Workspace 文件编译器 API
 
-状态：阶段 3 API 设计，尚未实现
+状态：阶段 3 第一版已实现
 
 目标 crate：`crates/margatroid/compose`（package 由宽泛的 `compose` 改为
 `margatroid_compose`）
@@ -247,8 +247,8 @@ Workspace 编译器 v1 仅打包 UTF-8 Skill / Workflow 资源；AgentImage 不�
 
 | Kind | 输入 | Manifest media type | v1 预检 |
 |---|---|---|---|
-| Skill | Skill 资源包目录 | `application/vnd.margatroid.skill` | 包清单、版本和通用 envelope |
-| Workflow | Workflow Skill 资源包目录 | `application/vnd.margatroid.workflow` | 包清单、节点 schema 版本和基础引用 |
+| Skill | Skill 资源包目录 | `application/vnd.margatroid.skill+json` | 包清单、版本和通用 envelope |
+| Workflow | Workflow Skill 资源包目录 | `application/vnd.margatroid.workflow+json` | 包清单、节点 schema 版本和基础引用 |
 | AgentImage | Agent 库引用 | 不进入 Workspace manifest | image 引用形状 |
 | MemoryVolume | daemon 侧命名卷引用 | 不进入 manifest | volume 名称和绑定策略 |
 
@@ -258,7 +258,7 @@ Workspace 编译器 v1 仅打包 UTF-8 Skill / Workflow 资源；AgentImage 不�
 AgentImage 的独立格式、构建、版本和发布 API 不属于本 Workspace 编译器，后续由 Agent 库
 API 单独设计。Workspace 编译器只输出 image 引用，不复制或修改 AgentImage 内容。
 
-在实现阶段 3 前，`margatroid_protocol` 需要补齐两项共享形状：
+阶段 3 已在 `margatroid_protocol` 补齐以下共享形状：
 
 - `ResourceManifestEntry.format_version`，表示单个资源内容格式版本。
 - 版本化 AgentImage 引用、WorkspaceAgentSpec 和 ResourceReference，供 CLI 编译和 daemon 权威
@@ -271,6 +271,8 @@ pub struct WorkspaceAgentSpec {
     pub id: AgentId,
     pub image: AgentImageReference,
     pub skills: Vec<ResourceReference>,
+    pub workflows: Vec<ResourceReference>,
+    pub memory_volume: Option<String>,
 }
 ```
 
@@ -320,9 +322,11 @@ impl CompileOptions {
 
 impl ProjectLimits {
     pub fn default() -> Self;
+    pub fn with_max_compose_bytes(self, bytes: u64) -> Self;
     pub fn with_max_resource_bytes(self, bytes: u64) -> Self;
     pub fn with_max_bundle_bytes(self, bytes: u64) -> Self;
     pub fn with_max_resources(self, count: usize) -> Self;
+    pub fn with_max_files_per_resource(self, count: usize) -> Self;
     pub fn with_max_yaml_aliases(self, count: usize) -> Self;
     pub fn with_max_yaml_depth(self, depth: usize) -> Self;
     pub fn with_max_yaml_nodes(self, count: usize) -> Self;
@@ -355,15 +359,18 @@ impl ComposeCompileError {
 默认限制暂定：
 
 ```text
+Compose source              ≤ 1 MiB
 single normalized resource  ≤ 1 MiB
 decoded bundled contents    ≤ 16 MiB
 manifest entries            ≤ 1024
+filesystem entries/resource ≤ 4096
 YAML aliases                ≤ 128
 YAML expanded depth         ≤ 64
 YAML expanded nodes         ≤ 100,000
 ```
 
-资源大小限制在读取与分配前检查，YAML 结构限制在展开过程中检查；`size_bytes` 和 bundle
+Compose 和资源文件均使用有界读取，资源大小与目录 entry 数量在完整打包前检查，YAML
+结构限制在展开后、反序列化前检查；`size_bytes` 和 bundle
 上限按 base64 解码前的实际资源 bytes 计算。CLI 后续可以提供更严格的限制，但不能超过
 daemon 的权威上限。
 
@@ -384,6 +391,9 @@ NormalizedProject
 - 资源正文和 base64。
 - CLI cache path。
 - API key、token 或环境变量值。
+
+实现中 `NormalizedProject` 独立持有 `schema_version/spec/manifest`，不通过隐藏字段持有完整
+`WorkspaceBundle`；因此序列化和 `Debug` 都不会泄露资源正文。
 
 `margatroid workspace config` 必须完成与 `workspace up` 相同的完整编译和预检，然后默认输出
 canonical YAML；`--format json` 输出相同对象的 canonical JSON。不能维护一条只解析、不读取
@@ -466,14 +476,19 @@ InvalidPath
 PathEscapesProject
 InvalidResource
 DigestMismatch
+ComposeTooLarge
 ResourceTooLarge
 BundleTooLarge
 TooManyResources
+TooManyFiles
 SecretFieldForbidden
 ```
 
 `message` 面向人类，调用者只根据 `code` 判断退出类别。路径以 project-relative 形式展示，
 错误中不包含资源正文、环境变量值或 secret。
+
+YAML parser 错误尽可能填写行列；语义校验错误填写稳定字段路径。CLI 必须逐条展示收集到的
+诊断，不能只输出第一条后隐藏其余错误。
 
 ## 11. CLI 接入
 
@@ -560,11 +575,11 @@ Workspace 对用户隐藏，但仍使用相同的生命周期和记忆模型。�
 
 阶段 3 实现按以下顺序进行：
 
-1. 先补 protocol 的 manifest format version、AgentImageReference 与 WorkspaceAgentSpec，共享 JSON shape 测试。
-2. 将 package `compose` 改名为 `margatroid_compose`，删除对 `types` 和 `paths` 的依赖。
-3. 实现私有 authoring schema、诊断、路径边界和资源规范化。
-4. 实现共用单一内部流水线的 `compile/compile_with_options` 与确定性 bundle 构建。
-5. 删除 compose crate 中的 roster；迁移仍依赖旧 `ComposeFile` 的正式代码。
-6. 接入 `margatroid workspace config`，通过离线黑盒测试后再实现 `workspace up` 上传。
+1. 已补 protocol 的 manifest format version、AgentImageReference 与 WorkspaceAgentSpec，共享 JSON shape 测试。
+2. 已将 package `compose` 改名为 `margatroid_compose`，删除对 `types` 和 `paths` 的依赖。
+3. 已实现私有 authoring schema、诊断、路径边界和资源规范化。
+4. 已实现共用单一内部流水线的 `compile/compile_with_options` 与确定性 bundle 构建。
+5. 已删除 compose crate 中的 roster，并移除正式代码对旧 `ComposeFile` 的依赖。
+6. 已接入 `margatroid workspace config`；`workspace up` 上传留到 WorkspacePlugin 阶段。
 
 本阶段不实现 WorkspacePlugin。daemon 在阶段 4 才接受、权威校验并持久化 bundle。

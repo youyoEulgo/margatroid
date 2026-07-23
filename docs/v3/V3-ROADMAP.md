@@ -1,7 +1,7 @@
 # Margatroid V3 产品路线图
 
-状态：阶段 2A“通用信号与终端输入”已完成；阶段 3“Compose 项目与资源包工具链”API
-草案已完成，下一步审查协议前置项并开始实现。
+状态：阶段 2A“通用信号与终端输入”已完成；阶段 3“Compose 项目与资源包工具链”已完成
+第一版本地编译链，下一步审查并收口阶段 3。
 
 ## 1. 暂定发布目标
 
@@ -49,6 +49,7 @@ v0.1 不包含：
 - Docker 风格 CLI、Compose 工具链和 daemon 资源库职责设计。
 - legacy 依赖边界检查和全 workspace 严格质量基线。
 - `margatroid_protocol` v1 ID、bundle、DTO、状态机和错误契约。
+- `margatroid_compose` 第一版 YAML 编译器、Skill/Workflow 资源包收集和 `workspace config`。
 
 尚未完成：
 
