@@ -2,18 +2,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use app_runtime_plugin::AppRuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
-use config_plugin::ConfigPlugin;
 use core_plugin::{App, Plugin};
 use daemon_lifecycle_plugin::DaemonLifecyclePlugin;
-use event_bus_plugin::EventBusPlugin;
 use external_event_plugin::ExternalEventPlugin;
 use http_server_plugin::HttpServerPlugin;
-use llm_plugin::LlmPlugin;
 use log_plugin::{LogPlugin, LogStreamOptions};
-use sandbox_plugin::SandboxPlugin;
 use server_plugin::{LogEndpointOptions, ServerPlugin};
 use signal_plugin::SignalPlugin;
-use skill_plugin::SkillPlugin;
 
 #[derive(Clone)]
 pub struct MargatroidDaemonPlugins {
@@ -76,11 +71,6 @@ impl Plugin for MargatroidDaemonPlugins {
             .add_plugins(SignalPlugin::new())
             .add_plugins(AsyncRuntimePlugin::default())
             .add_plugins(HttpServerPlugin::bind(self.bind_address))
-            .add_plugins(ConfigPlugin::default())
-            .add_plugins(EventBusPlugin::default())
-            .add_plugins(LlmPlugin::default())
-            .add_plugins(SandboxPlugin::default())
-            .add_plugins(SkillPlugin)
             .add_plugins(server_plugin)
             .add_plugins(DaemonLifecyclePlugin);
     }

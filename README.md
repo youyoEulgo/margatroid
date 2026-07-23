@@ -27,7 +27,7 @@ crates/
 ├── mecs/              # 领域无关、计划独立发布的 ECS 与基础设施
 └── margatroid/        # Margatroid 业务 Plugin 与领域 crate
 docs/v3/               # V3 设计、API 契约与产品路线图
-legacy/                # 已退出正式依赖图的 V1/V2 参考实现
+legacy/                # 已退出正式依赖图的旧实现与早期业务原型
 ```
 
 - [V3 架构设计](docs/v3/V3-DESIGN.md)
