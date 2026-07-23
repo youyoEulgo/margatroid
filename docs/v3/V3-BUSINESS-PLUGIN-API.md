@@ -406,6 +406,21 @@ LogEndpointOptions
 
 不负责 HTTP 服务生命周期、业务调度、LLM 调用、workflow 和 memory。
 
+### 11.7 DaemonLifecyclePlugin
+
+职责：
+
+- 维护 `Starting / Ready / Draining / Stopped` 四态 daemon 生命周期。
+- 在所有 `Startup` System 完成后的首个 `First` 阶段检查 HTTP listener 与异步 worker，
+  二者均启动后进入 `Ready`；不依赖不同 Plugin 的 Startup 注册顺序。
+- 注册 `/ready`；仅 `Ready` 返回 `200`，其余状态返回 `503`。
+- 在 app runtime 的 `Begin` 阶段进入 `Draining`，在 `Finish` 阶段进入 `Stopped`。
+
+该 Plugin 不监听操作系统信号，不持有 listener 或异步 runtime，也不解析进程配置。
+通用 `SignalPlugin` 只发布 `ProcessSignalReceived`；该 Plugin 消费其中的
+`Interrupt/Terminate` 并调用 `AppControl::shutdown()`。HTTP 和异步 Plugin 分别在
+`StopIngress` 与 `StopWorkers` 阶段清理。未来持久化 Plugin 在 `FlushState` 注册刷盘动作。
+
 ## 12. 默认产品组合
 
 Margatroid 开发者不需要为常规 daemon 逐个了解和配置基础设施 Plugin。

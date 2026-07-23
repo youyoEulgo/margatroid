@@ -1,7 +1,7 @@
 use std::net::ToSocketAddrs;
 use std::time::Duration;
 
-use app_runtime_plugin::AppControl;
+use app_runtime_plugin::{AppControl, AppShutdownExt, ShutdownPhase};
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::Router;
@@ -68,6 +68,14 @@ impl Plugin for HttpServerPlugin {
         app.add_resource(HttpRoutes::new());
         app.add_resource(self.options.clone());
         app.add_resource(HttpServerHandle::new());
+        let server = app
+            .world()
+            .resource::<HttpServerHandle>()
+            .expect("HttpServerHandle should be registered")
+            .clone();
+        app.add_shutdown_system(ShutdownPhase::StopIngress, move |_world| {
+            server.shutdown();
+        });
 
         app.add_systems(Stage::Startup, [start_http_server]);
     }

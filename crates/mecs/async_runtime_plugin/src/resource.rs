@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::runtime::AsyncRuntimeState;
 use crate::runtime::AsyncSpawner;
 use crate::AsyncTaskId;
 
@@ -36,6 +37,21 @@ impl Default for AsyncSystemOptions {
 #[derive(Clone)]
 pub struct AsyncTaskControl {
     pub(crate) spawner: AsyncSpawner,
+}
+
+#[derive(Clone)]
+pub struct AsyncRuntimeHandle {
+    pub(crate) state: std::sync::Arc<AsyncRuntimeState>,
+}
+
+impl AsyncRuntimeHandle {
+    pub fn is_running(&self) -> bool {
+        self.state.is_running()
+    }
+
+    pub fn shutdown(&self) {
+        self.state.shutdown();
+    }
 }
 
 impl AsyncTaskControl {

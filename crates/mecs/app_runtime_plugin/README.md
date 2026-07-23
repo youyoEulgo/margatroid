@@ -7,12 +7,15 @@
 - `AppRuntimePlugin`
 - `AppRunExt`
 - `AppControl`
+- `AppShutdownExt`
+- `ShutdownPhase`
 
 ## Responsibilities
 
 - Repeatedly call `App::tick()`.
 - Block while no wake request is pending.
 - Expose thread-safe wake and shutdown control.
+- Run shutdown systems in `Begin`, `StopIngress`, `StopWorkers`, `FlushState`, and `Finish` order.
 
 It does not define business stages, own ECS data, or execute async tasks.
 

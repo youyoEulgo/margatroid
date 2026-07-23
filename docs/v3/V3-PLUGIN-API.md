@@ -18,11 +18,18 @@
 ```text
 core_plugin
 app_runtime_plugin
+signal_plugin
+terminal_input_plugin（第一版已实现）
+pty_plugin（目标 API，尚未实现）
 async_runtime_plugin
 log_plugin（第一版已实现）
 http_server_plugin（第一版已实现）
 external_event_plugin（第一版已实现）
 ```
+
+官方 Plugin 目录以通用 ECS 工具包的完整性为标准，而不是以 Margatroid 当前使用范围
+为标准。Plugin 可以不进入 Margatroid 默认组合，但不能因此把通用能力与产品策略混合，
+或从 mecs 的公开设计中删除。
 
 这部分按未来可独立发布到 crates.io 的公开 API 标准维护，不允许引用 Margatroid 的
 LLM、agent、workflow、workspace 等领域类型。
@@ -36,6 +43,8 @@ llm_plugin
 sandbox_plugin
 skill_plugin
 server_plugin
+daemon_lifecycle_plugin
+defaults（产品默认 PluginGroup）
 未来的 workspace / workflow / member / memory plugin
 ```
 

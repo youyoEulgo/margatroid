@@ -154,6 +154,21 @@ impl AsyncRuntimeState {
             .map(|receiver| receiver.try_iter().collect())
             .unwrap_or_default()
     }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(AsyncWorker::is_running)
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
 }
 
 struct AsyncWorker {
@@ -209,6 +224,12 @@ impl AsyncWorker {
 
     fn spawner(&self) -> AsyncSpawner {
         self.spawner.clone()
+    }
+
+    fn is_running(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
     }
 }
 

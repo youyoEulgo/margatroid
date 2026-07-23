@@ -73,6 +73,16 @@ impl HttpServerHandle {
     }
 
     pub fn address(&self) -> Option<SocketAddr> {
+        let thread_running = self
+            .inner
+            .thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished());
+        if !thread_running {
+            return None;
+        }
         match self.state() {
             HttpServerState::Stopped => None,
             HttpServerState::Running(address) => Some(address),

@@ -1,6 +1,7 @@
 # Margatroid V3 产品路线图
 
-状态：阶段 1 已完成；下一阶段为阶段 2“进程生命周期”
+状态：阶段 2A“通用信号与终端输入”已完成；下一步进入阶段 3“Compose 项目与资源包
+工具链”。
 
 ## 1. 暂定发布目标
 
@@ -54,7 +55,6 @@ v0.1 不包含：
 - workspace、member、workflow、memory 四个核心业务 Plugin。
 - 持久化任务状态与重启恢复。
 - 完整业务 HTTP API 与 CLI。
-- 进程信号和优雅关闭。
 - 发布元数据、许可证和安装产物。
 
 ## 3. 关键依赖顺序
@@ -127,11 +127,26 @@ resource catalog ──→ workspace ──→ memory
 - ExecutionStatus 迁移和 ErrorCode HTTP status 映射具有测试。
 - `scripts/check-protocol-boundary.sh` 验证 protocol 只依赖 serde/serde_json。
 
-## 6. 阶段 2：进程生命周期
+## 6. 阶段 2：进程生命周期（已完成）
+
+完成时间：2026-07-22。
+
+设计约定：
+
+- `SignalPlugin` 属于 mecs，只把可配置的进程信号转换为 `ProcessSignalReceived`，不直接
+  调用 `AppControl::shutdown()`。
+- `DaemonLifecyclePlugin` 消费 `Interrupt/Terminate` 并执行 Margatroid 的关闭策略。
+- `AppRuntimePlugin` 按 `Begin → StopIngress → StopWorkers → FlushState → Finish`
+  执行关闭动作，避免依赖 Resource 的析构顺序。
+- `DaemonLifecyclePlugin` 属于 Margatroid 产品层，只维护
+  `Starting / Ready / Draining / Stopped` 与 `/ready`。
+- daemon 配置优先级固定为 `CLI 参数 > 环境变量 > 配置文件 > 默认值`。
+- 默认配置文件是数据目录下的 `margatroid.toml`；显式指定但不存在时启动失败。
+- 数据目录在 Unix 上使用 `0700`，lock 文件使用 `0600`，并通过 OS 文件锁保证单实例。
 
 工作内容：
 
-- 实现 `SignalPlugin`，将 SIGINT/SIGTERM 转换为 `AppControl::shutdown()`。
+- 实现通用 `SignalPlugin`，将进程信号转换为类型化 Event。
 - 明确 Starting、Ready、Draining、Stopped 状态。
 - 定义环境变量、配置文件和 CLI 参数的优先级。
 - 定义 daemon 单实例、数据目录和文件权限规则。
@@ -142,6 +157,66 @@ resource catalog ──→ workspace ──→ memory
 - Ctrl-C 和 SIGTERM 均能确定退出。
 - 没有遗留线程或未 join worker。
 - `/ready` 只在必要依赖初始化完成后成功。
+
+阶段 2 原实现内容：
+
+- 新增第一版 `SignalPlugin`，监听 SIGINT/SIGTERM，且 listener 线程可关闭、可 join；
+  其直接触发 shutdown 的临时语义已在阶段 2A 移除。
+- `AppRuntimePlugin` 新增五阶段关闭注册表；HTTP listener 和异步 worker 分别在
+  `StopIngress`、`StopWorkers` 清理，`FlushState` 为阶段 5 的持久化层保留稳定接入点。
+- 新增产品侧 `DaemonLifecyclePlugin` 与 `/ready`，实现
+  `Starting / Ready / Draining / Stopped`。
+- daemon 支持 CLI、环境变量、TOML 和默认值四层配置，优先级固定且具有测试。
+- 数据目录使用 Unix `0700`，lock 文件使用 `0600`，标准库 OS 文件锁保证单实例。
+- HTTP 或 signal listener 启动失败会有序清理并返回非零进程退出码。
+
+验证记录：
+
+- 真实子进程 SIGINT、SIGTERM 和端口冲突测试通过。
+- readiness、HTTP listener 停止、异步 worker 停止和线程 join 测试通过。
+- 全 workspace test、严格 Clippy、格式和依赖边界检查通过。
+
+### 6.1 阶段 2A：通用信号与终端输入（已完成）
+
+完成时间：2026-07-23。
+
+该阶段是进入 Compose 业务开发前的基础设施边界修订，不把产品策略继续固化进 mecs。
+
+工作内容：
+
+- 将 `SignalPlugin` 改为 `ProcessSignalReceived` Event 源，支持语义化常用信号和 Unix
+  raw signal number，不直接关闭 App。
+- 让 `DaemonLifecyclePlugin` 显式消费 `Interrupt/Terminate` 并请求 shutdown。
+- 实现 `TerminalInputPlugin`，覆盖 key、paste、mouse、focus、resize、raw mode 恢复、
+  非 TTY 失败和有界输入队列。
+- 固化 `PtyPlugin` API 边界；实现安排在阶段 9 的交互式 CLI 之前完成。
+- 保持三者均为 mecs 可选 Plugin，不进入 core；daemon 默认不安装终端和 PTY Plugin。
+
+验收门槛：
+
+- SignalPlugin 单独使用时不会隐式关闭 App，不安装 AppRuntimePlugin 也可手动 tick 读取。
+- Margatroid 真实子进程仍能通过 SIGINT/SIGTERM 有序退出。
+- TerminalInputPlugin 使用伪终端覆盖普通键、组合键、resize、EOF 和终端状态恢复。
+- stdin 非 TTY 和 input thread 失败具有可观察 Event；队列满通过 dropped count 可观察，
+  不死锁、不忙轮询。
+- 文档、crate README、实现和默认 Plugin 组合不存在旧的“signal 直接 shutdown”语义。
+
+完成内容：
+
+- `SignalPlugin` 只发布类型化 `ProcessSignalReceived`，常用信号具有跨平台语义名称，
+  Unix 额外支持经过校验的 raw signal number。
+- `DaemonLifecyclePlugin` 消费 `Interrupt/Terminate` 并执行 Margatroid 的 shutdown 策略；
+  signal listener 启动失败也由产品层决定退出。
+- `TerminalInputPlugin` 提供显式 raw/cooked 模式、类型化终端 Event、有界队列、丢弃计数、
+  非 TTY 与线程失败 Event，以及成对恢复终端状态的 RAII 生命周期。
+- `PtyPlugin` 的职责、命令、数据面、背压与安全边界已固化；实现安排在交互式 CLI 前。
+
+验证记录：
+
+- SignalPlugin 在不安装 AppRuntimePlugin 时可通过手动 tick 接收 Event，且不隐式 shutdown。
+- 真实 daemon 子进程的 SIGINT、SIGTERM 和端口冲突测试通过。
+- TerminalInputPlugin 的 PTY 测试覆盖普通键、Ctrl-C、resize、cooked line、真实 EOF、
+  非 TTY failure 和 raw mode 恢复。
 
 ## 7. 阶段 3：Compose 项目与资源包工具链
 
@@ -294,6 +369,9 @@ margatroid ps
 margatroid inspect <workspace>
 margatroid logs [-f]
 margatroid prompt <workspace> <text>
+margatroid chat <workspace>
+margatroid attach <workspace>
+margatroid exec [-it] <workspace> <command...>
 margatroid request inspect | watch | cancel <request-id>
 margatroid agent ls | inspect | add | remove
 margatroid skill ls | inspect | add | remove
@@ -304,6 +382,14 @@ CLI 负责本地项目解析、资源收集与预检、HTTP、展示和退出码
 `compose up` 默认 attach 业务事件与 Agent 输出；`-d/--detach` 启动后返回，不代表静默。
 `compose logs` 展示 workspace 业务输出，顶层 `logs` 展示 daemon tracing 诊断日志。
 `compose down` 删除运行实例但不隐式删除共享资源库。
+
+交互命令边界：
+
+- `chat/attach` 使用本地 `TerminalInputPlugin` 和业务双向会话协议，不让 daemon 读取
+  CLI 的 stdin。
+- `exec -it` 使用本地终端、双向 transport、daemon 侧 `PtyPlugin` 和 Sandbox 策略。
+- `exec` 没有 `-t` 时不得伪造 TTY；stdin、stdout、stderr 和 exit code 语义必须明确。
+- `PtyPlugin` 必须在实现 `exec -it` 前完成，不允许在 ServerPlugin 内临时手写 PTY。
 
 验收门槛：
 
@@ -346,6 +432,8 @@ mecs crates：
 - 补齐 description、repository、license、readme、rust-version 和 categories。
 - 去除不可发布的 path-only 依赖，收敛 feature 和公开 API。
 - 按依赖顺序执行 package dry-run、publish 和 docs.rs 验证。
+- 发布前实现并验证已列入官方目录的 Signal、TerminalInput 和 PTY Plugin；未达到稳定性
+  要求的能力可以标记 experimental feature，但不能以 Margatroid 未使用为由删除设计。
 
 基础设施公开 API 在被完整产品链路实际使用前不冻结；先 dogfood，再发布 mecs 0.1。
 
