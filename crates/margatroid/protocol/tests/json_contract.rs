@@ -25,8 +25,8 @@ fn workspace_bundle_json_shape_is_stable_and_round_trips() {
                 definition: ResourceReference::Bundled {
                     digest: soul_digest.clone(),
                 },
+                workflows: vec![],
             }],
-            workflows: vec![],
         },
         manifest: ResourceManifest {
             entries: vec![ResourceManifestEntry {
@@ -57,9 +57,9 @@ fn workspace_bundle_json_shape_is_stable_and_round_trips() {
                     "definition": {
                         "source": "bundled",
                         "digest": format!("sha256:{}", "a".repeat(64))
-                    }
-                }],
-                "workflows": []
+                    },
+                    "workflows": []
+                }]
             },
             "manifest": {
                 "entries": [{

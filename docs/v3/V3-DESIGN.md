@@ -26,7 +26,8 @@ API 规范已拆分为：
 - 一个 bin：`margatroidd`（守护进程），两个前端：`margatroid` CLI + Web
 - 守护进程常驻，管理多个 workspace 生命周期
 - CLI/Web 通过 HTTP API 与守护进程通信
-- CLI 交互参考 Docker 与 Docker Compose：`margatroid compose up -d`、`margatroid ps`
+- CLI 参考 Docker 的易用性，但使用 Margatroid 自己的 Workspace 语义：
+  `margatroid workspace up -d`、`margatroid ps`
 - daemon 持有权威资源库、运行状态和持久化数据，CLI 不直接修改 daemon 状态
 
 当前 `margatroidd` 已直接创建 V3 `App` 并安装 `MargatroidDaemonPlugins`；
@@ -38,8 +39,9 @@ workspace 编译图排除，仅作为迁移参考，见 [legacy/README.md](../..
 `margatroid` CLI 的职责包括：
 
 - 解析命令和展示结果
-- 读取并解析用户指定的 `compose.toml`
-- 解析相对路径，收集 Soul、Skill、Workflow 等本地资源
+- 读取并解析用户指定的 `margatroid-workspace.yaml`
+- 在项目根创建或复用 `.margatroid/`，作为项目级 skill / workflow / memory 的默认目录
+- 解析相对路径，收集 Workspace Skill / Workflow 等本地资源；AgentImage 由 daemon Agent 库管理
 - 执行本地语法与 schema 预检，生成稳定 `WorkspaceBundle`
 - 将资源包上传给 daemon，并通过 HTTP 管理 workspace 和资源库
 - 为 Agent、Skill、Provider 等资源提供 list、inspect、add、remove 命令
@@ -48,26 +50,30 @@ CLI 不负责业务状态机、运行时调度、权限裁决或持久化真相�
 提交的 `WorkspaceBundle` 再做一次权威校验，不能信任 CLI 已经检查过的数据。
 
 ```text
-compose.toml + local resources
+margatroid-workspace.yaml + local resources
 → margatroid CLI: parse / resolve / preflight / bundle
 → WorkspaceBundle + ResourceManifest
 → margatroidd: authoritative validation / persistence
 → WorkspacePlugin: create ECS runtime state
 ```
 
-这种边界允许 CLI 与 daemon 将来运行在不同机器上。compose 中不得依赖 daemon
+这种边界允许 CLI 与 daemon 将来运行在不同机器上。Workspace 文件中不得依赖 daemon
 直接读取 CLI 机器上的任意绝对路径；本地文件必须进入上传资源包，或者引用 daemon
 中已经安装且具有稳定 ID 的资源。Provider secret 不进入资源包，只引用 daemon 侧配置。
 
-#### 1.2 Docker 风格命令语义
+#### 1.2 Workspace 命令语义
 
 ```text
-margatroid compose up [-d] [-f compose.toml] [-p project]
-margatroid compose stop | start | restart | down
-margatroid compose ps
-margatroid compose logs [-f]
-margatroid compose config
+margatroid workspace up [-d] [-f margatroid-workspace.yaml] [-n name]
+margatroid workspace down [-n name]
+margatroid workspace stop [-n name]
+margatroid workspace start [-n name]
+margatroid workspace restart [-n name]
+margatroid workspace ps
+margatroid workspace logs [-f] [-n name]
+margatroid workspace config
 
+margatroid run <scope>/<agent>[:tag]
 margatroid ps
 margatroid inspect <workspace>
 margatroid logs [-f]
@@ -82,14 +88,17 @@ margatroid skill ls | inspect | add | remove
 margatroid provider ls | inspect | add | remove
 ```
 
-- `compose up` 默认 attach，持续显示业务事件、Agent 输出和 workflow 结果。
-- `compose up -d/--detach` 完成启动后返回；detach 不是静默，仍输出 workspace 名称和 ID。
-- `compose logs -f` 查看并跟随 workspace 业务输出，不以 tracing 日志代替业务协议。
+- `workspace up` 默认 attach，持续显示业务事件、Agent 输出和 workflow 结果。
+- `workspace up -d/--detach` 完成启动后返回；detach 不是静默，仍输出 workspace 名称和 ID。
+- `workspace logs -f` 查看并跟随 workspace 业务输出，不以 tracing 日志代替业务协议。
 - 顶层 `logs -f` 查看 daemon 运维诊断日志。
-- `stop` 保留 workspace 状态；`start` 恢复；`down` 删除运行实例，但不删除共享资源库。
-- `compose ps` 查看当前 compose 项目，顶层 `ps` 查看 daemon 中的全部 workspace。
-- `compose config` 输出 CLI 解析后的规范化配置，不创建 workspace。
-- `-p/--project-name` 显式指定项目名；未指定时依次使用 compose 名称和目录名。
+- `stop` 停止并保留当前实例快照；`start` 恢复原快照；`restart` 读取最新 AgentImage
+  并重建实例；`down` 删除 workspace 实例但不删除共享资源库和记忆卷。
+- `workspace ps` 查看当前目录或指定名称的 workspace，顶层 `ps` 查看 daemon 中的全部 workspace。
+- `workspace config` 输出 CLI 解析后的规范化配置，不创建 workspace。
+- 默认文件是 `margatroid-workspace.yaml`，兼容 `.yml`；`-n/--name` 在 `up` 中设置名称，
+  在生命周期命令中选择已有 workspace。
+- `run` 启动单个 AgentImage，并在内部创建一个隐藏的单 Agent workspace。
 - `prompt` 提交工作，`request` 命令组查询、跟随或取消一次请求；它们不属于 compose 生命周期。
 - `chat/attach` 建立 workspace 的交互式会话；`exec` 请求在 workspace 策略允许范围内
   执行命令，`-i` 转发 stdin，`-t` 分配 PTY。这些命令依赖终端、双向 transport、鉴权
@@ -245,19 +254,23 @@ local TerminalInputPlugin → bidirectional transport → remote PtyPlugin → s
 - 纯同步 Plugin 测试时只需要 `App::new()`
 - 异步 Plugin 测试时显式组合 `AsyncRuntimePlugin`
 
-#### 2.5 compose.toml 编译为 WorkspaceBundle
+#### 2.5 Workspace 文件编译为 WorkspaceBundle
 
-compose 是面向用户的声明式项目文件，不是 ECS Plugin 源码。CLI 使用独立的纯数据解析库
+`margatroid-workspace.yaml` 是面向用户的声明式 Workspace 文件，不是 ECS Plugin 源码。CLI 使用独立的纯数据解析库
 将其编译为稳定 `WorkspaceBundle`；daemon 校验并持久化后，由 `WorkspacePlugin` 应用到 ECS：
 
-- 每个 Agent 定义 → 创建 Entity 并挂载 Soul、SkillSet、ProviderConfig 等 Component
-- 每个 Workflow 定义 → 注册到 `WorkflowRegistry` Resource
+- 每个 AgentImage 实例 → 创建 AgentInstance Entity 并挂载 Soul、SkillSet、ProviderConfig 等 Component
+- 每个 Skill / Workflow 定义 → 注册到对应 Resource
 - manager 引用 → 解析为 workspace 内的普通 Agent ID
-- 本地 Soul、Skill、Workflow 文件 → 进入带内容哈希的 `ResourceManifest`
+- 本地 Skill / Workflow 文件 → 进入带内容哈希的 `ResourceManifest`；AgentImage 由 daemon Agent 库管理
 - 已安装资源 → 通过稳定资源 ID 引用 daemon 的资源库
 
 compose 解析器和 bundle 类型不依赖 ECS、HTTP、CLI 或 daemon 实现。CLI 可做快速预检，
 但 daemon 的校验结果始终是最终结果。
+
+具体 API 以 [V3-COMPOSE-API.md](V3-COMPOSE-API.md) 为准。普通 `workspace config/up` 是有限的
+同步工具链流程，不启动 ECS；只有未来需要同时处理终端、网络和渲染状态的交互式 CLI 命令
+才按需启动临时 mecs App。
 
 #### 2.6 ECS 核心概念映射
 
@@ -277,8 +290,8 @@ compose 解析器和 bundle 类型不依赖 ECS、HTTP、CLI 或 daemon 实现�
 
 - 用户不在委托链上作为节点
 - 用户是工作流的触发者和中断仲裁者，通过 CLI/Web 发指令
-- compose.toml 声明 `manager` 字段，指定哪个 agent 接收用户消息
-- manager 是普通 agent，无特殊身份，不硬编码特权工具
+- `margatroid-workspace.yaml` 声明 `manager` 字段，指定哪个 agent 接收用户消息
+- manager 是普通 agent，无特殊身份，不硬编码特权工具；它也就是用户语境里的 coordinator
 - 缺 `manager` 字段 → 启动时直接报错退出，不做 fallback
 
 ### 5. Agent 功能统一 + 人格隔离
@@ -290,27 +303,31 @@ compose 解析器和 bundle 类型不依赖 ECS、HTTP、CLI 或 daemon 实现�
 - 同一个 Entity archetype，挂不同 Component 值即可区分
 - 需要一个 coordinator agent（普通 agent，人格/技能偏向路由），不是特殊身份，用户也可绕过它直接指定目标
 
-### 6. 统一的 Skill 格式
+### 6. 统一的 Skill 资源包
 
-两类 skill 使用相同的外表格式（TOML frontmatter + Markdown 正文），LLM 看到的列表完全统一。区分靠程序解析正文结构。
+Skill 不是单个文件，而是一个完整的、可寻址的资源包目录。普通 Skill 和 Workflow
+Skill 使用相同的资源包模型；Workflow 只是其中具有流程入口和执行图的高级类型。
 
-**共同特征：**
-- 后缀 `.md`
-- frontmatter 包含 `name`, `description`, `allowed_tools` 等标准字段
-- LLM 视角：所有 skill 都是"可以加载的能力"，选哪个都一样
-- `load_skill("xxx")` 被调用后，程序先判定类型，再分派处理
+资源包可以包含描述文件、提示词模板、脚本、静态资源和依赖声明。具体目录结构和字段
+在实现 SkillPlugin 时单独固化，本文只规定资源边界和加载语义。
 
-**分类判定逻辑：**
+每个 Skill 必须具有带作用域的唯一名称，例如：
 
-```rust
-fn classify(skill_body: &str) -> SkillKind {
-    if skill_body.contains("[[steps]]") {
-        SkillKind::Workflow
-    } else {
-        SkillKind::Member
-    }
-}
+```text
+eulgo/code-review
+official/web-search
 ```
+
+Skill 的来源优先级按作用域从窄到宽排列：
+
+```text
+AgentImage 内建 Skill
+    > 项目级 .margatroid/skills/
+    > 主目录 ~/.margatroid/skills/
+```
+
+Compose 中声明的 Skill / Workflow 是该 Agent 除 AgentImage 内建能力之外常态可见的外部
+能力。相同名称按上述优先级解析；最终来源、版本和内容 hash 必须进入规范化结果。
 
 #### 6.1 Member Skill
 
@@ -366,9 +383,14 @@ preload = true
 生成代码后附带简短说明，如需要进一步委托请明确说明需要谁配合。
 ```
 
-#### 6.2 Workflow Skill
+#### 6.2 Workflow
 
-Frontmatter 之后是纯 TOML 的 `[[steps]]` 块——对 LLM 来说只是看起来像数据的 Markdown 代码块，对程序来说是确定性执行图。
+Workflow 是本项目继 Agent 编排之后的第二个核心特点。它当前使用 frontmatter 加
+`[[steps]]` 的文档格式，但格式只是第一版载体，不是长期能力边界。未来可以增加节点类型、
+节点扩展协议，甚至演进为独立的 Workflow DSL 或语言。
+
+Workflow 由 WorkflowPlugin 解析为可执行 DAG。WorkflowPlugin 必须通过稳定的节点注册接口
+识别内置节点和扩展节点；解析器不能把节点类型硬编码成不可扩展的枚举。
 
 **Frontmatter 字段（与 member skill 相同基础字段）：**
 
@@ -381,12 +403,21 @@ Frontmatter 之后是纯 TOML 的 `[[steps]]` 块——对 LLM 来说只是看�
 
 **Steps 定义：**
 
-| Step 类型 | 字段 | 说明 |
+| 内置节点类型 | 字段 | 说明 |
 |---|---|---|
 | `delegate` | `target`, `prompt_template`, `depends_on` | 委托给某个 member，等待结果 |
 | `condition` | `condition`, `then`, `else` | 基于前置结果的分支判断 |
 | `parallel` | `steps`, `depends_on` | 并行执行一组子步骤 |
 | `return` | `value` | 将结果返回给上游（coordinator） |
+
+节点扩展约束：
+
+- 节点类型至少由稳定的 `type` 标识、版本和参数对象组成。
+- 未注册的节点类型在预检阶段失败，不能静默当作普通节点执行。
+- Plugin 可以注册新的节点类型及其参数校验、依赖声明、执行器和结果类型。
+- 节点执行器不得绕过 WorkflowPlugin 的状态、取消、超时和事件边界。
+- DAG 是当前执行模型；未来 DSL 可以编译为同一套规范化执行图，不改变 Agent 和
+  WorkflowPlugin 的外部生命周期 API。
 
 **Steps 通用字段：**
 - `id` — 可选，步骤标识符，用于 condition 引用和 prompt_template 中的变量名
@@ -398,11 +429,22 @@ Frontmatter 之后是纯 TOML 的 `[[steps]]` 块——对 LLM 来说只是看�
 - `{requirement}` 等用户输入变量由 coordinator 传入
 
 **加载后效果：**
-1. LLM 视角：看到 skill 列表中有此工作流
-2. LLM 调用 `load_skill("code_review")` 加载
-3. 程序检测到 `[[steps]]` → 判定为 workflow
-4. 程序直接接管，按 steps DAG 确定性执行
-5. 每个 delegate step 内部仍然调用该 member 的 LLM，但流程本身不受 LLM 控制
+1. Workflow 被分配给具体 Agent，并通过该 Agent 的可用 Workflow 列表暴露
+2. Agent 或外部入口触发 Workflow
+3. 程序校验 Workflow 的 Skill 依赖和节点依赖
+4. 程序解析节点为执行 DAG 并接管流程
+5. 每个 delegate step 内部仍然调用目标 Agent 的 LLM，但流程本身不受 LLM 控制
+
+Workflow 的 Skill 依赖：
+
+- Workflow 可以声明需要注入提示词、强制调用或作为执行前置条件的 Skill。
+- Workflow 启动前必须完成依赖检查；缺失依赖时整个 Workflow 不得启动。
+- 检查范围包括 daemon 的主 Skill 目录和当前项目的
+  `{project_root}/.margatroid/skills/`。
+- 主目录与项目级目录出现同名 Skill 时，编译器必须按明确的冲突规则处理，并把最终来源、
+  版本和 hash 记录在规范化结果中，不能由运行时隐式决定。
+- 依赖检查只确认 Skill 存在、格式有效且满足版本/hash 约束；Skill 的实际注入或强制调用
+  仍由 Workflow 节点和 Agent 执行边界负责。
 
 **示例：**
 
@@ -481,10 +523,10 @@ SkillRegistry.lookup("coder")
   │     2. 注册工具 delegate_to_coder(tool_spec)
   │     3. 工具参数结构由 skill frontmatter 定义
   ↓
-  ├── WorkflowSkill:
+  ├── Workflow:
   │     1. 程序解析 [[steps]] 为执行 DAG
   │     2. 开始按步执行，每个 delegate step 调用对应 member
-  │     3. 执行完成后 control 归还给触发 workfow 的 agent
+  │     3. 执行完成后 control 归还给触发 workflow 的 agent
   ↓
 LLM: 调用 unload_skill("coder")
   ↓
@@ -508,28 +550,37 @@ LLM: 调用 unload_skill("coder")
 
 #### 设计原则
 
-- **personal_memory 完全隔离** — 每个 agent 独立 `personal.db`，无法读其他 agent 的回忆
-- **conversation_messages 隔离** — agent 与 LLM 的对话历史是私有的
+- **personal_memory 完全隔离** — 每个 Workspace 中的 agent 独立的
+  `.margatroid/workspaces/<workspace_name>/memory/<agent_id>/memory.sql`，无法读其他 agent
+  或其他 Workspace 的回忆
+- **conversation_messages 隔离** — agent 与 LLM 的对话历史写入自己的 `memory.sql`
 - **worklog + delegations 共享** — 团队需要知道"谁做了什么的产出"，这是协作基础
 - **manager 可读 worklog，不能读 personal** — 与现实团队一致
 
 #### 存储结构
 
 ```
-~/.margatroid/workspaces/{name}/
-├── agents/
-│   ├── coder/
-│   │   ├── personal.db
-│   │   └── conversation.db
-│   └── reviewer/
-│       ├── personal.db
-│       └── conversation.db
-├── team.db           ← worklog + delegations（团队共享）
-└── compose.toml
+{project_root}/.margatroid/
+├── skills/
+├── workflows/
+├── memory/
+└── workspaces/{name}/
+    ├── memory/
+    │   ├── coder/
+    │   │   └── memory.sql
+    │   └── reviewer/
+    │       └── memory.sql
+    └── agents/
+        ├── coder/
+        │   └── runtime.db
+        └── reviewer/
+            └── runtime.db
+    ├── team.db           ← worklog + delegations（团队共享）
+    └── workspace.yaml
 ```
 
 #### ECS 映射
 
-- 每个 agent Entity 挂 `MemoryComponent`（持有自己的 `personal.db` + `conversation.db` 连接）
+- 每个 agent Entity 挂 `MemoryComponent`（持有自己的 `memory.sql` 连接）
 - `TeamMemory` 作为 World Resource（持有 `team.db` 连接）
 - `MemorySystem` 读写 `MemoryComponent`，`WorklogSystem` 读写 `TeamMemory`

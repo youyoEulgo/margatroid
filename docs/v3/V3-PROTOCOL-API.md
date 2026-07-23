@@ -35,7 +35,7 @@ RequestId
 TaskId
 AgentId
 ResourceId
-ProjectName
+WorkspaceName
 ```
 
 这些类型在 JSON 中均为 string，不绑定 UUID、ULID 或数据库实现。构造和反序列化统一校验：
@@ -55,10 +55,15 @@ WorkspaceBundle
 └── resources: BundledResource[]
 
 WorkspaceSpec
-├── project: ProjectName
+├── name: WorkspaceName
 ├── description?: string
 ├── manager: AgentId
-├── agents: WorkspaceAgentSpec[]
+└── agents: WorkspaceAgentSpec[]
+
+WorkspaceAgentSpec
+├── id: AgentId
+├── image: AgentImageReference
+├── skills: ResourceReference[]
 └── workflows: ResourceReference[]
 ```
 
@@ -88,6 +93,14 @@ WorkspaceSpec
 - bundle 大小、media type、资源删除和安全策略。
 
 这些校验由阶段 3 的项目编译器预检，并由阶段 4 的 daemon 再次执行。
+
+阶段 3 实现前需要按 [V3-COMPOSE-API.md](V3-COMPOSE-API.md) 补充
+`ResourceManifestEntry.format_version`、`AgentImageReference`、版本化 `WorkspaceAgentSpec` 和
+`ResourceReference`。这些类型属于 CLI 与 daemon 共享的规范化传输形状，不属于 Compose
+authoring schema。
+
+本轮 Workspace 语义设计将 `ProjectName/project` 更名为 `WorkspaceName/name`；当前协议
+实现仍需在阶段 3 前完成这一 breaking migration，并同步更新 JSON shape 测试。
 
 ## 5. Workspace DTO
 

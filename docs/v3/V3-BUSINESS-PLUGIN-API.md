@@ -186,13 +186,14 @@ CLI 是本地项目工具链和 daemon 客户端，可以读取文件、解析 c
 
 ```text
 CLI owns
-  本地 compose / Soul / Skill / Workflow 文件的读取
+  本地 Workspace / Skill / Workflow 文件的读取；AgentImage 由 daemon Agent 库管理
+  项目根 `.margatroid/` 的创建、复用和本地缓存组织
   相对路径解析和本地 schema 预检
   WorkspaceBundle 构建和上传
   命令交互、结果展示和退出码
 
 daemon owns
-  已安装 Agent / Skill / Provider 等资源目录
+  已安装 AgentImage / Skill / Workflow / Provider 等资源目录
   Workspace / Request / Task 运行状态
   权威语义校验、安全策略和持久化
   ECS 生命周期与业务状态转换
@@ -207,23 +208,27 @@ CLI 与 daemon 通过 `margatroid_protocol` 共享以下纯数据对象；阶段
 负责把 compose 编译成这些对象：
 
 ```text
-WorkspaceSpec       规范化 workspace、Agent、Workflow 和引用关系
+WorkspaceSpec       规范化 Workspace、Agent、Skill、Workflow 和引用关系
 WorkspaceBundle     WorkspaceSpec + ResourceManifest + 资源内容
 ResourceManifest    每个资源的 kind、逻辑名称、版本和内容哈希
 ResourceId          daemon 中已安装资源的稳定 ID
-ProjectName         compose 项目名
+WorkspaceName       Workspace 名称
 ```
 
 这些类型不得依赖 ECS、Axum、CLI 或 daemon 实现。资源内容必须有大小上限和内容哈希；
 daemon 必须独立验证 schema version、hash、引用、路径和安全策略。
 
-Provider secret 不进入 `WorkspaceBundle`、日志或规范化 compose 输出。compose 只允许通过
-稳定 Provider ID 引用 daemon 侧凭据。
+compose schema 不提供 Provider secret 字段，也不读取 daemon 凭据；Provider 只允许通过
+稳定 Resource ID 引用。用户维护的 Skill / Workflow 正文会按原意打包上传，编译器不能证明
+其中没有手写凭据，因此项目作者不得把 secret 写入资源正文。
 
 ### 10.3 Compose 编译流程
 
+具体 authoring schema、Rust API、确定性规则和诊断契约以
+[V3-COMPOSE-API.md](V3-COMPOSE-API.md) 为准。
+
 ```text
-compose.toml
+margatroid-workspace.yaml
 → parse + resolve local references
 → local preflight
 → normalized WorkspaceSpec
@@ -240,10 +245,10 @@ CLI 不得把未打包的本地绝对路径交给 daemon 读取。daemon 接受 
 ### 10.4 资源命令与运行时命令
 
 - `agent/skill/provider ls|inspect|add|remove` 管理 daemon 中的共享资源库。
-- `compose up|stop|start|restart|down|ps|logs|config` 管理一个 compose 项目。
+- `workspace up|stop|start|restart|down|ps|logs|config` 管理一个 Workspace。
 - 顶层 `ps/inspect/logs` 管理或观察 daemon 全局运行状态。
 - 删除仍被 workspace 引用的资源必须拒绝，除非未来提供语义明确的强制迁移机制。
-- `compose down` 不隐式删除共享 Agent、Skill、Provider 或历史数据。
+- `workspace down` 不隐式删除共享 Agent、Skill、Provider 或 MemoryVolume。
 
 ## 11. 当前业务 Plugin 契约
 
@@ -461,6 +466,10 @@ memory_plugin
 - 跨 Plugin 使用 Event 或稳定 Resource
 - 不让 LLM 控制程序流程
 - 不把领域 Stage 硬编码进 core
+- Workflow 由具体 Agent 持有和触发，不在 Workspace 顶层声明
+- Workflow 节点通过可扩展注册接口提供；新增节点不能要求修改既有 Workflow 生命周期 API
+- Workflow 启动前完成 Skill 依赖检查，至少覆盖 daemon 主 Skill 目录与项目级
+  `.margatroid/skills/`
 
 ## 14. 测试要求
 

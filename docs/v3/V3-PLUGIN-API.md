@@ -7,6 +7,7 @@
 - [V3-INFRASTRUCTURE-API.md](V3-INFRASTRUCTURE-API.md)：通用 ECS 与基础设施公开 API。
 - [V3-BUSINESS-PLUGIN-API.md](V3-BUSINESS-PLUGIN-API.md)：Margatroid 业务 Plugin 契约。
 - [V3-PROTOCOL-API.md](V3-PROTOCOL-API.md)：Margatroid CLI 与 daemon 共享协议。
+- [V3-COMPOSE-API.md](V3-COMPOSE-API.md)：本地 Workspace 文件编译器与资源打包契约。
 
 通用 ECS 与基础设施体系暂定名为 **mecs**，以开发者友好、配置简单和
 默认开箱即用为公开 API 的主要设计目标。
@@ -47,6 +48,9 @@ daemon_lifecycle_plugin
 defaults（产品默认 PluginGroup）
 未来的 workspace / workflow / member / memory plugin
 ```
+
+`margatroid_compose` 是业务工具链 crate，但不是 Plugin；其公开 API 单独维护在 Compose
+规范中，不得因为 CLI 是调用者而把解析和打包逻辑写入 command handler。
 
 这些 Plugin 可以依赖 Margatroid 领域模型，并通过事件和 Resource 组成完整产品。
 
