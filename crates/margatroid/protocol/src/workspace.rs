@@ -6,6 +6,8 @@ use crate::{AgentId, ProjectName, ResourceReference, WorkspaceBundle, WorkspaceI
 pub struct WorkspaceAgentSpec {
     pub id: AgentId,
     pub definition: ResourceReference,
+    #[serde(default)]
+    pub workflows: Vec<ResourceReference>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,8 +18,6 @@ pub struct WorkspaceSpec {
     pub manager: AgentId,
     #[serde(default)]
     pub agents: Vec<WorkspaceAgentSpec>,
-    #[serde(default)]
-    pub workflows: Vec<ResourceReference>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
