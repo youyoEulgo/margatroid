@@ -6,7 +6,7 @@ mod document;
 mod package;
 
 pub use compiler::{
-    CompileOptions, CompileOutput, NormalizedProject, ProjectCompiler, ProjectLimits, RenderError,
+    CompileOptions, CompileOutput, Compiler, NormalizedProject, ProjectLimits, RenderError, compile,
 };
 pub use diagnostic::{ComposeCompileError, ComposeDiagnostic, DiagnosticCode, SourceLocation};
 

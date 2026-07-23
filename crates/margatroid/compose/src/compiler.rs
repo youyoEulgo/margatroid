@@ -15,14 +15,14 @@ use crate::package::PackageCollector;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectLimits {
-    pub max_resource_bytes: u64,
-    pub max_bundle_bytes: u64,
-    pub max_compose_bytes: u64,
-    pub max_resources: usize,
-    pub max_files_per_resource: usize,
-    pub max_yaml_aliases: usize,
-    pub max_yaml_depth: usize,
-    pub max_yaml_nodes: usize,
+    pub(crate) max_resource_bytes: u64,
+    pub(crate) max_bundle_bytes: u64,
+    pub(crate) max_compose_bytes: u64,
+    pub(crate) max_resources: usize,
+    pub(crate) max_files_per_resource: usize,
+    pub(crate) max_yaml_aliases: usize,
+    pub(crate) max_yaml_depth: usize,
+    pub(crate) max_yaml_nodes: usize,
 }
 
 impl Default for ProjectLimits {
@@ -90,10 +90,6 @@ pub struct CompileOptions {
 }
 
 impl CompileOptions {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn with_workspace_name(mut self, name: impl Into<String>) -> Self {
         self.workspace_name = Some(name.into());
         self
@@ -190,26 +186,20 @@ impl std::fmt::Display for RenderError {
 
 impl std::error::Error for RenderError {}
 
-#[derive(Default)]
-pub struct ProjectCompiler;
+pub struct Compiler {
+    options: CompileOptions,
+}
 
-impl ProjectCompiler {
-    pub fn new() -> Self {
-        Self
+impl Compiler {
+    pub fn new(options: CompileOptions) -> Self {
+        Self { options }
     }
 
     pub fn compile(
         &self,
         compose_path: impl AsRef<Path>,
     ) -> Result<CompileOutput, ComposeCompileError> {
-        self.compile_with_options(compose_path, &CompileOptions::default())
-    }
-
-    pub fn compile_with_options(
-        &self,
-        compose_path: impl AsRef<Path>,
-        options: &CompileOptions,
-    ) -> Result<CompileOutput, ComposeCompileError> {
+        let options = &self.options;
         let compose_path = compose_path.as_ref();
         let source_file = compose_path
             .file_name()
@@ -375,6 +365,16 @@ impl ProjectCompiler {
         })();
         result.map_err(|error| error.with_source_file(source_file))
     }
+}
+
+impl Default for Compiler {
+    fn default() -> Self {
+        Self::new(CompileOptions::default())
+    }
+}
+
+pub fn compile(compose_path: impl AsRef<Path>) -> Result<CompileOutput, ComposeCompileError> {
+    Compiler::default().compile(compose_path)
 }
 
 fn read_compose(path: &Path, max_bytes: u64) -> Result<String, ComposeCompileError> {

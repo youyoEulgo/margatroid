@@ -57,14 +57,17 @@ impl Plugin for LlmPlugin {
             .resource::<LlmProviderRegistry>()
             .expect("LlmProviderRegistry should be registered by LlmPlugin")
             .clone();
+        let async_options = self
+            .options
+            .timeout
+            .map(AsyncSystemOptions::with_timeout)
+            .unwrap_or_else(AsyncSystemOptions::without_timeout);
         app.add_async_system_with_options(
             move |request: LlmRequest| {
                 let registry = registry.clone();
                 async move { handle_llm_request(registry, request).await }
             },
-            AsyncSystemOptions {
-                timeout: self.options.timeout,
-            },
+            async_options,
         );
 
         let mut reader = app.event_reader::<LlmAsyncBatch>();

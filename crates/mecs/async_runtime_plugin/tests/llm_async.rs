@@ -66,9 +66,7 @@ fn real_llm_runs_through_async_system_and_returns_an_event() {
                 LlmOutcome::Failed(last_error)
             }
         },
-        AsyncSystemOptions {
-            timeout: Some(Duration::from_secs(60)),
-        },
+        AsyncSystemOptions::with_timeout(Duration::from_secs(60)),
     );
 
     let mut request = Some(LlmRequest {

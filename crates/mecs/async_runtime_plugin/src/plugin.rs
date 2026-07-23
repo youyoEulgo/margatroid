@@ -2,13 +2,13 @@ use std::any::TypeId;
 use std::future::Future;
 use std::sync::Arc;
 
-use app_runtime_plugin::{AppControl, AppShutdownExt, ShutdownPhase};
+use app_runtime_plugin::{AppControl, AppShutdownExt};
 use core_plugin::{named_system, App, Event, Plugin, Stage, World};
 
+use crate::resource::AsyncRuntimeOptions;
 use crate::runtime::{AsyncRuntimeState, Completion};
 use crate::{
-    AsyncRuntimeHandle, AsyncRuntimeOptions, AsyncSystemOptions, AsyncTaskControl, AsyncTaskFailed,
-    AsyncTaskId, AsyncTaskStarted,
+    AsyncRuntimeStatus, AsyncSystemOptions, AsyncTaskFailed, AsyncTaskId, AsyncTaskStarted,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -43,10 +43,10 @@ impl Plugin for AsyncRuntimePlugin {
         app.add_event::<AsyncTaskFailed>();
         let state = Arc::new(AsyncRuntimeState::new(self.options));
         app.add_resource(state.clone());
-        let handle = AsyncRuntimeHandle { state };
+        let handle = AsyncRuntimeStatus { state };
         app.add_resource(handle.clone());
         if app.world().resource::<AppControl>().is_some() {
-            app.add_shutdown_system(ShutdownPhase::StopWorkers, move |_world| {
+            app.on_shutdown(move |_world| {
                 handle.shutdown();
             });
         }
@@ -174,17 +174,6 @@ impl AsyncAppExt for App {
     }
 }
 
-pub trait AsyncWorldExt {
-    fn cancel_async_task(&self, id: AsyncTaskId) -> bool;
-}
-
-impl AsyncWorldExt for World {
-    fn cancel_async_task(&self, id: AsyncTaskId) -> bool {
-        self.resource::<AsyncTaskControl>()
-            .is_some_and(|control| control.cancel(id))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -229,9 +218,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(30)).await;
                 DoubleOutput(0)
             },
-            AsyncSystemOptions {
-                timeout: Some(Duration::from_millis(1)),
-            },
+            AsyncSystemOptions::with_timeout(Duration::from_millis(1)),
         );
         let mut failure_reader = app.event_reader::<AsyncTaskFailed>();
 
@@ -272,14 +259,16 @@ mod tests {
         app.add_plugins(AsyncRuntimePlugin::default());
         app.add_async_system_with_options(
             |_request: PendingRequest| std::future::pending::<PendingOutput>(),
-            AsyncSystemOptions { timeout: None },
+            AsyncSystemOptions::without_timeout(),
         );
         let mut started_reader = app.event_reader::<AsyncTaskStarted>();
         app.add_systems(
             Stage::Update,
             [move |world: &mut World| {
                 for started in world.read_events(&mut started_reader) {
-                    assert!(world.cancel_async_task(started.task_id));
+                    assert!(world
+                        .resource::<crate::AsyncTasks>()
+                        .is_some_and(|tasks| tasks.cancel(started.task_id)));
                 }
             }],
         );
@@ -306,7 +295,7 @@ mod tests {
         );
         app.add_async_system_with_options(
             |_request: PendingRequest| std::future::pending::<PendingOutput>(),
-            AsyncSystemOptions { timeout: None },
+            AsyncSystemOptions::without_timeout(),
         );
         let mut failure_reader = app.event_reader::<AsyncTaskFailed>();
         for _ in 0..100 {
@@ -329,7 +318,7 @@ mod tests {
             app.add_plugins(AsyncRuntimePlugin::default());
             app.add_async_system_with_options(
                 |_request: PendingRequest| std::future::pending::<PendingOutput>(),
-                AsyncSystemOptions { timeout: None },
+                AsyncSystemOptions::without_timeout(),
             );
             app.world().send_event(PendingRequest);
             app.tick();

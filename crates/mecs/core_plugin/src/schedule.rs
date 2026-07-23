@@ -16,12 +16,6 @@ pub struct ScheduleReport {
     pub ordering_error: Option<String>,
 }
 
-impl ScheduleReport {
-    pub fn is_ok(&self) -> bool {
-        self.failures.is_empty() && self.ordering_error.is_none()
-    }
-}
-
 /// 有序的 system 集合。无约束的 system 保持注册顺序。
 pub struct Schedule {
     systems: Vec<Box<dyn System>>,
@@ -69,10 +63,6 @@ impl Schedule {
             failures,
             ordering_error: None,
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.systems.is_empty()
     }
 
     fn ensure_ordered(&mut self) -> Result<(), String> {
@@ -177,7 +167,8 @@ mod tests {
 
         let report = schedule.run(&mut World::new());
 
-        assert!(report.is_ok());
+        assert!(report.failures.is_empty());
+        assert!(report.ordering_error.is_none());
         assert_eq!(*calls.lock().unwrap(), [1, 2]);
     }
 

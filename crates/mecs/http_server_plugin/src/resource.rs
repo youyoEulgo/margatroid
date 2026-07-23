@@ -36,7 +36,7 @@ impl HttpRoutes {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum HttpServerState {
+enum HttpServerState {
     #[default]
     Stopped,
     Running(SocketAddr),
@@ -64,12 +64,16 @@ impl HttpServerHandle {
         }
     }
 
-    pub fn state(&self) -> HttpServerState {
+    fn state(&self) -> HttpServerState {
         *self
             .inner
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.address().is_some()
     }
 
     pub fn address(&self) -> Option<SocketAddr> {

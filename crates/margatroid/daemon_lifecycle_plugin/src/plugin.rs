@@ -1,5 +1,5 @@
-use app_runtime_plugin::{AppControl, AppShutdownExt, ShutdownPhase};
-use async_runtime_plugin::AsyncRuntimeHandle;
+use app_runtime_plugin::{AppControl, AppShutdownExt};
+use async_runtime_plugin::AsyncRuntimeStatus;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -20,7 +20,7 @@ impl Plugin for DaemonLifecyclePlugin {
             "AppRuntimePlugin must be installed before DaemonLifecyclePlugin"
         );
         assert!(
-            app.world().resource::<AsyncRuntimeHandle>().is_some(),
+            app.world().resource::<AsyncRuntimeStatus>().is_some(),
             "AsyncRuntimePlugin must be installed before DaemonLifecyclePlugin"
         );
         assert!(
@@ -86,8 +86,8 @@ impl Plugin for DaemonLifecyclePlugin {
                     .resource::<HttpServerHandle>()
                     .is_some_and(|server| server.address().is_some());
                 let async_ready = world
-                    .resource::<AsyncRuntimeHandle>()
-                    .is_some_and(AsyncRuntimeHandle::is_running);
+                    .resource::<AsyncRuntimeStatus>()
+                    .is_some_and(AsyncRuntimeStatus::is_running);
                 let signal_ready = world
                     .read_events(&mut readiness_signal_failure_reader)
                     .is_empty();
@@ -106,14 +106,14 @@ impl Plugin for DaemonLifecyclePlugin {
             }],
         );
 
-        let draining_lifecycle = lifecycle.clone();
-        app.add_shutdown_system(ShutdownPhase::Begin, move |_world| {
-            draining_lifecycle.set(DaemonState::Draining);
-            tracing::info!("margatroidd draining");
-        });
-        app.add_shutdown_system(ShutdownPhase::Finish, move |_world| {
-            lifecycle.set(DaemonState::Stopped);
+        let stopped_lifecycle = lifecycle.clone();
+        app.after_shutdown(move |_world| {
+            stopped_lifecycle.set(DaemonState::Stopped);
             tracing::info!("margatroidd stopped");
+        });
+        app.on_shutdown(move |_world| {
+            lifecycle.set(DaemonState::Draining);
+            tracing::info!("margatroidd draining");
         });
     }
 }
@@ -136,7 +136,7 @@ mod tests {
 
     use app_runtime_plugin::{AppRunExt, AppRuntimePlugin};
     use async_runtime_plugin::AsyncRuntimePlugin;
-    use http_server_plugin::{HttpServerPlugin, HttpServerState};
+    use http_server_plugin::HttpServerPlugin;
 
     use super::*;
 
@@ -154,7 +154,7 @@ mod tests {
         let server = app.world().resource::<HttpServerHandle>().unwrap().clone();
         let runtime = app
             .world()
-            .resource::<AsyncRuntimeHandle>()
+            .resource::<AsyncRuntimeStatus>()
             .unwrap()
             .clone();
         let thread = std::thread::spawn(move || app.run());
@@ -165,7 +165,7 @@ mod tests {
                 Instant::now() < deadline,
                 "daemon readiness timed out: lifecycle={:?}, server={:?}, async_running={}",
                 lifecycle.state(),
-                server.state(),
+                server.address(),
                 runtime.is_running()
             );
             std::thread::yield_now();
@@ -183,7 +183,7 @@ mod tests {
         thread.join().unwrap();
 
         assert_eq!(lifecycle.state(), DaemonState::Stopped);
-        assert_eq!(server.state(), HttpServerState::Stopped);
+        assert!(!server.is_running());
         assert!(!runtime.is_running());
     }
 

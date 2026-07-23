@@ -65,7 +65,7 @@ impl Plugin for SandboxPlugin {
                 let policy = policy.clone();
                 async move { execute_sandbox_command(policy, request).await }
             },
-            AsyncSystemOptions { timeout: None },
+            AsyncSystemOptions::without_timeout(),
         );
 
         let mut reader = app.event_reader::<SandboxAsyncOutput>();

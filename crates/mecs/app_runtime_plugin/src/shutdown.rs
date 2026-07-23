@@ -3,52 +3,34 @@ use std::sync::{Arc, Mutex};
 
 use core_plugin::World;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ShutdownPhase {
-    Begin,
-    StopIngress,
-    StopWorkers,
-    FlushState,
-    Finish,
-}
-
-impl ShutdownPhase {
-    const ALL: [Self; 5] = [
-        Self::Begin,
-        Self::StopIngress,
-        Self::StopWorkers,
-        Self::FlushState,
-        Self::Finish,
-    ];
-
-    const fn index(self) -> usize {
-        self as usize
-    }
-}
-
 type ShutdownSystem = Box<dyn FnMut(&mut World) + Send + 'static>;
 
 #[derive(Clone)]
 pub(crate) struct ShutdownSystems {
-    systems: Arc<Mutex<[Vec<ShutdownSystem>; 5]>>,
+    systems: Arc<Mutex<Vec<ShutdownSystem>>>,
+    finalizers: Arc<Mutex<Vec<ShutdownSystem>>>,
 }
 
 impl ShutdownSystems {
     pub(crate) fn new() -> Self {
         Self {
-            systems: Arc::new(Mutex::new(std::array::from_fn(|_| Vec::new()))),
+            systems: Arc::new(Mutex::new(Vec::new())),
+            finalizers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub(crate) fn add(
-        &self,
-        phase: ShutdownPhase,
-        system: impl FnMut(&mut World) + Send + 'static,
-    ) {
+    pub(crate) fn add(&self, system: impl FnMut(&mut World) + Send + 'static) {
         self.systems
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)[phase.index()]
-        .push(Box::new(system));
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Box::new(system));
+    }
+
+    pub(crate) fn add_finalizer(&self, system: impl FnMut(&mut World) + Send + 'static) {
+        self.finalizers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Box::new(system));
     }
 
     pub(crate) fn run(&self, world: &mut World) {
@@ -56,11 +38,18 @@ impl ShutdownSystems {
             .systems
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for phase in ShutdownPhase::ALL {
-            for system in &mut systems[phase.index()] {
-                if catch_unwind(AssertUnwindSafe(|| system(world))).is_err() {
-                    tracing::error!(?phase, "shutdown system panicked");
-                }
+        for system in systems.iter_mut().rev() {
+            if catch_unwind(AssertUnwindSafe(|| system(world))).is_err() {
+                tracing::error!("shutdown system panicked");
+            }
+        }
+        let mut finalizers = self
+            .finalizers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for finalizer in finalizers.iter_mut() {
+            if catch_unwind(AssertUnwindSafe(|| finalizer(world))).is_err() {
+                tracing::error!("shutdown finalizer panicked");
             }
         }
     }

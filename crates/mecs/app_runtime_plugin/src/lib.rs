@@ -4,4 +4,3 @@ mod shutdown;
 
 pub use plugin::{AppRunExt, AppRuntimePlugin, AppShutdownExt};
 pub use resource::AppControl;
-pub use shutdown::ShutdownPhase;

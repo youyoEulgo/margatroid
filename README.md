@@ -30,6 +30,8 @@ docs/v3/               # V3 设计、API 契约与产品路线图
 legacy/                # 已退出正式依赖图的 V1/V2 参考实现
 ```
 
-- [V3 设计](docs/v3/V3-DESIGN.md)
+- [V3 架构设计](docs/v3/V3-DESIGN.md)
+- [mecs 公开 API](docs/v3/MECS-API.md)
+- [Margatroid 公开 API](docs/v3/MARGATROID-API.md)
 - [V3 产品路线图](docs/v3/V3-ROADMAP.md)
 - [旧实现与历史文档](legacy/README.md)

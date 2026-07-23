@@ -1,4 +1,4 @@
-use app_runtime_plugin::{AppControl, AppShutdownExt, ShutdownPhase};
+use app_runtime_plugin::{AppControl, AppShutdownExt};
 use core_plugin::{App, Plugin, Stage, World};
 use external_event_plugin::{ExternalEventAppExt, ExternalEventOptions};
 
@@ -46,7 +46,7 @@ impl Plugin for TerminalInputPlugin {
         );
 
         if app.world().resource::<AppControl>().is_some() {
-            app.add_shutdown_system(ShutdownPhase::Finish, move |_world| {
+            app.on_shutdown(move |_world| {
                 handle.shutdown();
             });
         }

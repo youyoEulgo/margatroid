@@ -113,58 +113,6 @@ impl<'w, T: Component> QueryMut<'w, T> {
     }
 }
 
-/// 不可变资源引用。
-pub struct Res<'w, R> {
-    pub(crate) inner: &'w R,
-}
-
-impl<'w, R> Res<'w, R> {
-    pub fn new(world: &'w World) -> Self
-    where
-        R: crate::resource::Resource,
-    {
-        Res {
-            inner: world.resource::<R>().expect("resource not registered"),
-        }
-    }
-}
-
-impl<'w, R> std::ops::Deref for Res<'w, R> {
-    type Target = R;
-    fn deref(&self) -> &R {
-        self.inner
-    }
-}
-
-/// 可变资源引用。
-pub struct ResMut<'w, R> {
-    pub(crate) inner: &'w mut R,
-}
-
-impl<'w, R> ResMut<'w, R> {
-    pub fn new(world: &'w mut World) -> Self
-    where
-        R: crate::resource::Resource,
-    {
-        ResMut {
-            inner: world.resource_mut::<R>().expect("resource not registered"),
-        }
-    }
-}
-
-impl<'w, R> std::ops::Deref for ResMut<'w, R> {
-    type Target = R;
-    fn deref(&self) -> &R {
-        self.inner
-    }
-}
-
-impl<'w, R> std::ops::DerefMut for ResMut<'w, R> {
-    fn deref_mut(&mut self) -> &mut R {
-        self.inner
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

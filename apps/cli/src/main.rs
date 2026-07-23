@@ -1,9 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use margatroid_compose::{
-    ALTERNATE_COMPOSE_FILE, CompileOptions, DEFAULT_COMPOSE_FILE, ProjectCompiler,
-};
+use margatroid_compose::{ALTERNATE_COMPOSE_FILE, CompileOptions, Compiler, DEFAULT_COMPOSE_FILE};
 
 const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:3939";
 const API_VERSION: &str = margatroid_protocol::API_VERSION;
@@ -76,12 +74,12 @@ fn workspace_config(args: &[String]) -> Result<()> {
         Some(path) => path,
         None => discover_compose(Path::new("."))?,
     };
-    let mut options = CompileOptions::new();
+    let mut options = CompileOptions::default();
     if let Some(name) = workspace_name {
         options = options.with_workspace_name(name);
     }
-    let output = ProjectCompiler::new()
-        .compile_with_options(&compose_path, &options)
+    let output = Compiler::new(options)
+        .compile(&compose_path)
         .with_context(|| {
             let file = compose_path
                 .file_name()

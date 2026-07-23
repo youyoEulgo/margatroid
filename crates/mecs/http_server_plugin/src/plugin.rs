@@ -1,14 +1,14 @@
 use std::net::ToSocketAddrs;
 use std::time::Duration;
 
-use app_runtime_plugin::{AppControl, AppShutdownExt, ShutdownPhase};
+use app_runtime_plugin::{AppControl, AppShutdownExt};
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::Router;
 use core_plugin::{App, Plugin, Stage, World};
 use tower_http::timeout::TimeoutLayer;
 
-use crate::events::{HttpServerFailed, HttpServerStarted};
+use crate::events::HttpServerFailed;
 use crate::options::HttpServerOptions;
 use crate::resource::{HttpRoutes, HttpServerHandle};
 
@@ -63,7 +63,6 @@ impl Plugin for HttpServerPlugin {
             app.world().resource::<HttpRoutes>().is_none(),
             "HttpServerPlugin can only be installed once"
         );
-        app.add_event::<HttpServerStarted>();
         app.add_event::<HttpServerFailed>();
         app.add_resource(HttpRoutes::new());
         app.add_resource(self.options.clone());
@@ -73,7 +72,7 @@ impl Plugin for HttpServerPlugin {
             .resource::<HttpServerHandle>()
             .expect("HttpServerHandle should be registered")
             .clone();
-        app.add_shutdown_system(ShutdownPhase::StopIngress, move |_world| {
+        app.on_shutdown(move |_world| {
             server.shutdown();
         });
 
@@ -115,11 +114,10 @@ fn start_http_server(world: &mut World) {
         .resource::<HttpServerHandle>()
         .expect("HttpServerHandle should be registered")
         .start(options, router);
-    match result {
-        Ok(address) => world.send_event(HttpServerStarted { address }),
-        Err(error) => world.send_event(HttpServerFailed {
+    if let Err(error) = result {
+        world.send_event(HttpServerFailed {
             message: error.to_string(),
-        }),
+        });
     }
 }
 

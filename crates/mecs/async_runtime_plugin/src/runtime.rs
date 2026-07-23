@@ -10,10 +10,8 @@ use core_plugin::{Event, World};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::task::{AbortHandle, Id as TokioTaskId, JoinSet};
 
-use crate::{
-    AsyncRuntimeOptions, AsyncSystemOptions, AsyncTaskControl, AsyncTaskFailed,
-    AsyncTaskFailureKind, AsyncTaskId,
-};
+use crate::resource::AsyncRuntimeOptions;
+use crate::{AsyncSystemOptions, AsyncTaskFailed, AsyncTaskFailureKind, AsyncTaskId, AsyncTasks};
 
 type WorldCommand = Box<dyn FnOnce(&mut World) + Send + 'static>;
 type TaskResult = Result<WorldCommand, AsyncTaskFailed>;
@@ -118,7 +116,7 @@ impl AsyncRuntimeState {
         }
     }
 
-    pub(crate) fn start(&self, control: Option<AppControl>) -> Option<AsyncTaskControl> {
+    pub(crate) fn start(&self, control: Option<AppControl>) -> Option<AsyncTasks> {
         let mut worker = self
             .worker
             .lock()
@@ -127,7 +125,7 @@ impl AsyncRuntimeState {
             return None;
         }
         let (new_worker, receiver) = AsyncWorker::start(control, self.options);
-        let task_control = AsyncTaskControl {
+        let task_control = AsyncTasks {
             spawner: new_worker.spawner(),
         };
         *self
