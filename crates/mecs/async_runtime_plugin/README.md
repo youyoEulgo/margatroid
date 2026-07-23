@@ -10,6 +10,7 @@
 - `AsyncWorldExt`
 - `AsyncSystemOptions`
 - `AsyncTaskId`, `AsyncTaskControl`
+- `AsyncRuntimeHandle`
 - `AsyncTaskStarted`, `AsyncTaskFailed`, `AsyncTaskFailureKind`
 
 ## Stage Registration
@@ -19,6 +20,7 @@
 - `Stage::Last`: dispatch request events registered through `AsyncAppExt`.
 
 Each request is spawned independently. Futures never borrow `World`; successful outputs return as typed events on a later frame.
+The managed worker aborts remaining tasks and joins in the app runtime's `StopWorkers` shutdown phase.
 
 ```rust
 use async_runtime_plugin::{AsyncAppExt, AsyncRuntimePlugin};

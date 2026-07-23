@@ -1,13 +1,14 @@
 use std::any::TypeId;
 use std::future::Future;
+use std::sync::Arc;
 
-use app_runtime_plugin::AppControl;
+use app_runtime_plugin::{AppControl, AppShutdownExt, ShutdownPhase};
 use core_plugin::{named_system, App, Event, Plugin, Stage, World};
 
 use crate::runtime::{AsyncRuntimeState, Completion};
 use crate::{
-    AsyncRuntimeOptions, AsyncSystemOptions, AsyncTaskControl, AsyncTaskFailed, AsyncTaskId,
-    AsyncTaskStarted,
+    AsyncRuntimeHandle, AsyncRuntimeOptions, AsyncSystemOptions, AsyncTaskControl, AsyncTaskFailed,
+    AsyncTaskId, AsyncTaskStarted,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -35,12 +36,20 @@ impl AsyncRuntimePlugin {
 
 impl Plugin for AsyncRuntimePlugin {
     fn build(&self, app: &mut App) {
-        if app.world().resource::<AsyncRuntimeState>().is_some() {
+        if app.world().resource::<Arc<AsyncRuntimeState>>().is_some() {
             return;
         }
         app.add_event::<AsyncTaskStarted>();
         app.add_event::<AsyncTaskFailed>();
-        app.add_resource(AsyncRuntimeState::new(self.options));
+        let state = Arc::new(AsyncRuntimeState::new(self.options));
+        app.add_resource(state.clone());
+        let handle = AsyncRuntimeHandle { state };
+        app.add_resource(handle.clone());
+        if app.world().resource::<AppControl>().is_some() {
+            app.add_shutdown_system(ShutdownPhase::StopWorkers, move |_world| {
+                handle.shutdown();
+            });
+        }
         app.add_systems(
             Stage::Startup,
             [named_system("async_runtime.start", start_runtime)],
@@ -55,7 +64,7 @@ impl Plugin for AsyncRuntimePlugin {
 fn start_runtime(world: &mut World) {
     let control = world.resource::<AppControl>().cloned();
     let task_control = world
-        .resource::<AsyncRuntimeState>()
+        .resource::<Arc<AsyncRuntimeState>>()
         .expect("AsyncRuntimeState should be registered")
         .start(control);
     if let Some(task_control) = task_control {
@@ -65,7 +74,7 @@ fn start_runtime(world: &mut World) {
 
 fn collect_completions(world: &mut World) {
     let completions = world
-        .resource::<AsyncRuntimeState>()
+        .resource::<Arc<AsyncRuntimeState>>()
         .expect("AsyncRuntimeState should be registered")
         .drain_completions();
     for completion in completions {
@@ -119,7 +128,7 @@ impl AsyncAppExt for App {
         Fut: Future<Output = Output> + Send + 'static,
     {
         assert!(
-            self.world().resource::<AsyncRuntimeState>().is_some(),
+            self.world().resource::<Arc<AsyncRuntimeState>>().is_some(),
             "AsyncRuntimePlugin must be installed before registering async systems"
         );
         assert_ne!(
@@ -140,8 +149,8 @@ impl AsyncAppExt for App {
                 let requests = world.read_events(&mut reader);
                 for request in requests {
                     let spawner = world
-                        .resource::<AsyncRuntimeState>()
-                        .and_then(AsyncRuntimeState::spawner);
+                        .resource::<Arc<AsyncRuntimeState>>()
+                        .and_then(|state| state.spawner());
                     let Some(spawner) = spawner else {
                         world.send_event(AsyncTaskFailed {
                             task_id: AsyncTaskId(0),

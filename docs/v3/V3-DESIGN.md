@@ -72,6 +72,9 @@ margatroid ps
 margatroid inspect <workspace>
 margatroid logs [-f]
 margatroid prompt <workspace> <text>
+margatroid chat <workspace>
+margatroid attach <workspace>
+margatroid exec [-it] <workspace> <command...>
 margatroid request inspect | watch | cancel <request-id>
 
 margatroid agent ls | inspect | add | remove
@@ -88,6 +91,9 @@ margatroid provider ls | inspect | add | remove
 - `compose config` 输出 CLI 解析后的规范化配置，不创建 workspace。
 - `-p/--project-name` 显式指定项目名；未指定时依次使用 compose 名称和目录名。
 - `prompt` 提交工作，`request` 命令组查询、跟随或取消一次请求；它们不属于 compose 生命周期。
+- `chat/attach` 建立 workspace 的交互式会话；`exec` 请求在 workspace 策略允许范围内
+  执行命令，`-i` 转发 stdin，`-t` 分配 PTY。这些命令依赖终端、双向 transport、鉴权
+  和 sandbox，不得退化为 CLI 直接访问 daemon 本地进程。
 
 运维日志同样复用 daemon 的 HTTP 服务，不另开第二个日志端口：
 
@@ -150,12 +156,15 @@ core 明确不负责：
 阻塞运行循环由 `AppRuntimePlugin` 提供，异步执行由 `AsyncRuntimePlugin` 提供。
 core 只保留 `Startup / First / Update / Last` 四个通用阶段，不知道业务阶段或基础设施用途。
 
-#### 2.2 默认 Plugin 组合
+#### 2.2 mecs 官方 Plugin 与 Margatroid 默认组合
 
 ```
 基础设施（mecs）
 ├── LogPlugin           ← tracing console / file / bounded stream
 ├── AppRuntimePlugin    ← run / wake / shutdown
+├── SignalPlugin        ← 任意进程信号 → typed Event
+├── TerminalInputPlugin ← 本地按键 / paste / resize → typed Event
+├── PtyPlugin           ← 交互式子进程与双向 PTY 字节流（规划）
 ├── AsyncRuntimePlugin  ← 可选异步任务执行基础设施
 ├── HttpServerPlugin    ← Axum / HTTP / SSE / WebSocket 生命周期
 └── ExternalEventPlugin ← 外部线程安全注入 ECS Event
@@ -167,11 +176,16 @@ Margatroid 业务
 ├── WorkflowPlugin       ← Workflow DAG 执行器
 ├── EventBusPlugin      ← SSE 事件流
 ├── ServerPlugin        ← Margatroid HTTP API 与日志流路由
+├── DaemonLifecyclePlugin ← readiness 与 Starting/Ready/Draining/Stopped
 └── ConfigPlugin        ← daemon 运行配置加载与重载
 ```
 
 `MargatroidDaemonPlugins` 由 `margatroid_defaults` crate 提供。该 crate 只负责默认
 Plugin 组合，不负责创建 App、解析进程参数或启动 daemon。
+
+mecs 的官方 Plugin 目录按“通用 ECS 工具包是否应提供该能力”设计，不按 Margatroid
+当前是否使用设计。`TerminalInputPlugin` 和 `PtyPlugin` 不进入 daemon 默认组合，仍然是
+mecs 的正式规划能力。可选表示使用者可以不安装，不表示 mecs 不提供。
 
 #### 2.3 外部输入进入 ECS
 
@@ -190,6 +204,38 @@ external thread / handler
 届时不在 handler 中等待 ECS 完成，而是返回 `202 + request_id`；在没有消费者时不得
 注册路由或返回 `202`。这避免在 ECS Event 中携带 oneshot sender，也不把 HTTP
 连接寿命与业务 System 的完成时间强绑定。
+
+#### 2.3.1 进程信号、终端输入与 PTY
+
+三者是不同的基础设施边界：
+
+```text
+SignalPlugin
+  OS process signal → ProcessSignalReceived
+
+TerminalInputPlugin
+  local terminal/stdin → Key / Paste / Mouse / Resize Event
+
+PtyPlugin
+  child pseudo-terminal ↔ binary input/output Event
+```
+
+`SignalPlugin` 不直接关闭 App。Margatroid 的 `DaemonLifecyclePlugin` 消费
+`Interrupt/Terminate` 后调用 `AppControl::shutdown()`；其他 mecs 应用可以把相同信号
+映射为暂停、保存或忽略。
+
+未来交互式产品链路分为两种：
+
+```text
+margatroid chat / attach
+local TerminalInputPlugin → HTTP/WebSocket → workspace conversation
+
+margatroid exec -it
+local TerminalInputPlugin → bidirectional transport → remote PtyPlugin → sandboxed process
+```
+
+终端 Plugin 只处理本地终端协议，PTY Plugin 只处理子进程伪终端。workspace 对话、远程
+鉴权、命令权限与 sandbox 策略仍属于 Margatroid 产品层。
 
 #### 2.4 每个 Plugin 是一个功能边界
 
