@@ -8,14 +8,14 @@
 - `AppRunExt`
 - `AppControl`
 - `AppShutdownExt`
-- `ShutdownPhase`
+- `AppShutdownExt::on_shutdown` / `after_shutdown`
 
 ## Responsibilities
 
 - Repeatedly call `App::tick()`.
 - Block while no wake request is pending.
 - Expose thread-safe wake and shutdown control.
-- Run shutdown systems in `Begin`, `StopIngress`, `StopWorkers`, `FlushState`, and `Finish` order.
+- Run dependency teardown in reverse registration order, then run finalizers.
 
 It does not define business stages, own ECS data, or execute async tasks.
 

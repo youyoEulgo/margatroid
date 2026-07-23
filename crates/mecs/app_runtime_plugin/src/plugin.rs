@@ -1,7 +1,7 @@
 use core_plugin::{App, Plugin, World};
 
 use crate::shutdown::ShutdownSystems;
-use crate::{AppControl, ShutdownPhase};
+use crate::AppControl;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AppRuntimePlugin;
@@ -43,23 +43,24 @@ impl AppRunExt for App {
 }
 
 pub trait AppShutdownExt {
-    fn add_shutdown_system(
-        &mut self,
-        phase: ShutdownPhase,
-        system: impl FnMut(&mut World) + Send + 'static,
-    ) -> &mut Self;
+    fn on_shutdown(&mut self, system: impl FnMut(&mut World) + Send + 'static) -> &mut Self;
+    fn after_shutdown(&mut self, system: impl FnMut(&mut World) + Send + 'static) -> &mut Self;
 }
 
 impl AppShutdownExt for App {
-    fn add_shutdown_system(
-        &mut self,
-        phase: ShutdownPhase,
-        system: impl FnMut(&mut World) + Send + 'static,
-    ) -> &mut Self {
+    fn on_shutdown(&mut self, system: impl FnMut(&mut World) + Send + 'static) -> &mut Self {
         self.world_mut()
             .resource::<ShutdownSystems>()
             .unwrap_or_else(|| panic!("AppRuntimePlugin must be installed before shutdown systems"))
-            .add(phase, system);
+            .add(system);
+        self
+    }
+
+    fn after_shutdown(&mut self, system: impl FnMut(&mut World) + Send + 'static) -> &mut Self {
+        self.world_mut()
+            .resource::<ShutdownSystems>()
+            .unwrap_or_else(|| panic!("AppRuntimePlugin must be installed before shutdown systems"))
+            .add_finalizer(system);
         self
     }
 }
@@ -99,28 +100,22 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_systems_run_in_phase_order_and_isolate_panics() {
+    fn shutdown_systems_run_in_reverse_registration_order_and_isolate_panics() {
         let mut app = App::new();
         app.add_plugins(AppRuntimePlugin);
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        for (phase, value) in [
-            (ShutdownPhase::Finish, 5),
-            (ShutdownPhase::StopWorkers, 3),
-            (ShutdownPhase::Begin, 1),
-            (ShutdownPhase::StopIngress, 2),
-            (ShutdownPhase::FlushState, 4),
-        ] {
+        for value in 1..=5 {
             let calls = calls.clone();
-            app.add_shutdown_system(phase, move |_world| calls.lock().unwrap().push(value));
+            app.on_shutdown(move |_world| calls.lock().unwrap().push(value));
         }
-        app.add_shutdown_system(ShutdownPhase::StopIngress, |_world| {
-            panic!("shutdown failure")
-        });
+        app.on_shutdown(|_world| panic!("shutdown failure"));
+        let final_calls = calls.clone();
+        app.after_shutdown(move |_world| final_calls.lock().unwrap().push(6));
         app.world().resource::<AppControl>().unwrap().shutdown();
 
         app.run();
 
-        assert_eq!(*calls.lock().unwrap(), [1, 2, 3, 4, 5]);
+        assert_eq!(*calls.lock().unwrap(), [5, 4, 3, 2, 1, 6]);
     }
 
     fn wait_until(mut condition: impl FnMut() -> bool) {

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use base64::Engine;
-use margatroid_compose::{CompileOptions, DiagnosticCode, ProjectCompiler, ProjectLimits};
+use margatroid_compose::{CompileOptions, Compiler, DiagnosticCode, ProjectLimits, compile};
 use margatroid_protocol::ResourcePackage;
 use tempfile::TempDir;
 
@@ -52,8 +52,8 @@ agents:
 fn compiles_scoped_packages_into_a_deterministic_bundle() {
     let project = project();
     let path = project.path().join("margatroid-workspace.yaml");
-    let first = ProjectCompiler::new().compile(&path).unwrap();
-    let second = ProjectCompiler::new()
+    let first = compile(&path).unwrap();
+    let second = Compiler::default()
         .compile(project.path().join("./margatroid-workspace.yaml"))
         .unwrap();
 
@@ -77,11 +77,8 @@ fn project_package_overrides_same_named_main_package() {
         "main reviewer\n",
     );
 
-    let output = ProjectCompiler::new()
-        .compile_with_options(
-            project.path().join("margatroid-workspace.yaml"),
-            &CompileOptions::new().with_main_directory(main.path()),
-        )
+    let output = Compiler::new(CompileOptions::default().with_main_directory(main.path()))
+        .compile(project.path().join("margatroid-workspace.yaml"))
         .unwrap();
     let skill_digest = &output.bundle().manifest.entries[0].digest;
     let bundled = output
@@ -114,7 +111,7 @@ agents:
     image: acme/coder:v1
 "#,
     );
-    let error = ProjectCompiler::new()
+    let error = Compiler::default()
         .compile(project.path().join("margatroid-workspace.yaml"))
         .unwrap_err();
     let codes: Vec<_> = error
@@ -142,7 +139,7 @@ agents:
         path: ../outside
 "#,
     );
-    let error = ProjectCompiler::new()
+    let error = Compiler::default()
         .compile(project.path().join("margatroid-workspace.yaml"))
         .unwrap_err();
     assert_eq!(error.diagnostics()[0].code, DiagnosticCode::InvalidPath);
@@ -165,7 +162,7 @@ agents:
             "0".repeat(64)
         ),
     );
-    let error = ProjectCompiler::new()
+    let error = Compiler::default()
         .compile(project.path().join("margatroid-workspace.yaml"))
         .unwrap_err();
     assert_eq!(error.diagnostics()[0].code, DiagnosticCode::DigestMismatch);
@@ -187,7 +184,7 @@ agents:
     x-note: local
 "#,
     );
-    let output = ProjectCompiler::new()
+    let output = Compiler::default()
         .compile(project.path().join("margatroid-workspace.yaml"))
         .unwrap();
     assert_eq!(
@@ -210,20 +207,18 @@ agents:
   coder: *agent
 "#,
     );
-    let error = ProjectCompiler::new()
-        .compile_with_options(
-            project.path().join("margatroid-workspace.yaml"),
-            &CompileOptions::new().with_limits(ProjectLimits::default().with_max_yaml_aliases(0)),
-        )
-        .unwrap_err();
+    let error = Compiler::new(
+        CompileOptions::default().with_limits(ProjectLimits::default().with_max_yaml_aliases(0)),
+    )
+    .compile(project.path().join("margatroid-workspace.yaml"))
+    .unwrap_err();
     assert_eq!(error.diagnostics()[0].code, DiagnosticCode::InvalidYaml);
 
-    let error = ProjectCompiler::new()
-        .compile_with_options(
-            project.path().join("margatroid-workspace.yaml"),
-            &CompileOptions::new().with_limits(ProjectLimits::default().with_max_yaml_nodes(1)),
-        )
-        .unwrap_err();
+    let error = Compiler::new(
+        CompileOptions::default().with_limits(ProjectLimits::default().with_max_yaml_nodes(1)),
+    )
+    .compile(project.path().join("margatroid-workspace.yaml"))
+    .unwrap_err();
     assert_eq!(error.diagnostics()[0].code, DiagnosticCode::InvalidYaml);
 }
 
@@ -236,7 +231,7 @@ fn rejects_multiple_documents_and_explicit_yaml_tags() {
         let project = tempfile::tempdir().unwrap();
         let path = project.path().join("margatroid-workspace.yaml");
         write(&path, content);
-        let error = ProjectCompiler::new().compile(path).unwrap_err();
+        let error = Compiler::default().compile(path).unwrap_err();
         assert_eq!(error.diagnostics()[0].code, DiagnosticCode::InvalidYaml);
         assert!(error.diagnostics()[0].location.is_some());
     }
@@ -252,7 +247,7 @@ fn normalizes_line_endings_and_uses_the_protocol_package_format() {
                 .join(".margatroid/skills/acme/reviewer/SKILL.md"),
             content,
         );
-        let output = ProjectCompiler::new()
+        let output = Compiler::default()
             .compile(project.path().join("margatroid-workspace.yaml"))
             .unwrap();
         let entry = output
@@ -288,12 +283,11 @@ fn normalizes_line_endings_and_uses_the_protocol_package_format() {
 fn enforces_compose_resource_and_package_entry_limits_before_completion() {
     let project = project();
     let compose = project.path().join("margatroid-workspace.yaml");
-    let error = ProjectCompiler::new()
-        .compile_with_options(
-            &compose,
-            &CompileOptions::new().with_limits(ProjectLimits::default().with_max_compose_bytes(8)),
-        )
-        .unwrap_err();
+    let error = Compiler::new(
+        CompileOptions::default().with_limits(ProjectLimits::default().with_max_compose_bytes(8)),
+    )
+    .compile(&compose)
+    .unwrap_err();
     assert_eq!(error.diagnostics()[0].code, DiagnosticCode::ComposeTooLarge);
 
     write(
@@ -302,21 +296,19 @@ fn enforces_compose_resource_and_package_entry_limits_before_completion() {
             .join(".margatroid/skills/acme/reviewer/extra.txt"),
         "extra",
     );
-    let error = ProjectCompiler::new()
-        .compile_with_options(
-            &compose,
-            &CompileOptions::new()
-                .with_limits(ProjectLimits::default().with_max_files_per_resource(1)),
-        )
-        .unwrap_err();
+    let error = Compiler::new(
+        CompileOptions::default()
+            .with_limits(ProjectLimits::default().with_max_files_per_resource(1)),
+    )
+    .compile(&compose)
+    .unwrap_err();
     assert_eq!(error.diagnostics()[0].code, DiagnosticCode::TooManyFiles);
 
-    let error = ProjectCompiler::new()
-        .compile_with_options(
-            compose,
-            &CompileOptions::new().with_limits(ProjectLimits::default().with_max_resource_bytes(4)),
-        )
-        .unwrap_err();
+    let error = Compiler::new(
+        CompileOptions::default().with_limits(ProjectLimits::default().with_max_resource_bytes(4)),
+    )
+    .compile(compose)
+    .unwrap_err();
     assert_eq!(
         error.diagnostics()[0].code,
         DiagnosticCode::ResourceTooLarge
@@ -337,7 +329,7 @@ agents:
     image: acme/coder:v1
 "#,
     );
-    let error = ProjectCompiler::new().compile(&path).unwrap_err();
+    let error = Compiler::default().compile(&path).unwrap_err();
     let rendered = error.to_string();
     assert!(!rendered.contains(project.path().to_str().unwrap()));
     assert!(rendered.contains("margatroid-workspace.yaml"));
@@ -349,7 +341,7 @@ agents:
 #[test]
 fn normalized_debug_output_does_not_contain_resource_bodies() {
     let project = project();
-    let output = ProjectCompiler::new()
+    let output = Compiler::default()
         .compile(project.path().join("margatroid-workspace.yaml"))
         .unwrap();
     let debug = format!("{:?}", output.normalized());
@@ -361,7 +353,7 @@ fn normalized_debug_output_does_not_contain_resource_bodies() {
 fn accepts_expected_digest_and_installed_resource_ids() {
     let project = project();
     let compose = project.path().join("margatroid-workspace.yaml");
-    let first = ProjectCompiler::new().compile(&compose).unwrap();
+    let first = Compiler::default().compile(&compose).unwrap();
     let digest = first
         .bundle()
         .manifest
@@ -390,7 +382,7 @@ agents:
 "#,
         ),
     );
-    let output = ProjectCompiler::new().compile(compose).unwrap();
+    let output = Compiler::default().compile(compose).unwrap();
     assert_eq!(output.bundle().manifest.entries.len(), 1);
     assert!(matches!(
         &output.bundle().spec.agents[0].workflows[0],
@@ -419,7 +411,7 @@ agents:
         path: skills/second
 "#,
     );
-    let error = ProjectCompiler::new().compile(compose).unwrap_err();
+    let error = Compiler::default().compile(compose).unwrap_err();
     assert_eq!(error.diagnostics()[0].code, DiagnosticCode::DuplicateName);
 }
 
@@ -427,31 +419,28 @@ agents:
 fn enforces_bundle_resource_count_and_yaml_depth_limits() {
     let project = project();
     let compose = project.path().join("margatroid-workspace.yaml");
-    let error = ProjectCompiler::new()
-        .compile_with_options(
-            &compose,
-            &CompileOptions::new().with_limits(ProjectLimits::default().with_max_bundle_bytes(1)),
-        )
-        .unwrap_err();
+    let error = Compiler::new(
+        CompileOptions::default().with_limits(ProjectLimits::default().with_max_bundle_bytes(1)),
+    )
+    .compile(&compose)
+    .unwrap_err();
     assert_eq!(error.diagnostics()[0].code, DiagnosticCode::BundleTooLarge);
 
-    let error = ProjectCompiler::new()
-        .compile_with_options(
-            &compose,
-            &CompileOptions::new().with_limits(ProjectLimits::default().with_max_resources(1)),
-        )
-        .unwrap_err();
+    let error = Compiler::new(
+        CompileOptions::default().with_limits(ProjectLimits::default().with_max_resources(1)),
+    )
+    .compile(&compose)
+    .unwrap_err();
     assert_eq!(
         error.diagnostics()[0].code,
         DiagnosticCode::TooManyResources
     );
 
-    let error = ProjectCompiler::new()
-        .compile_with_options(
-            compose,
-            &CompileOptions::new().with_limits(ProjectLimits::default().with_max_yaml_depth(1)),
-        )
-        .unwrap_err();
+    let error = Compiler::new(
+        CompileOptions::default().with_limits(ProjectLimits::default().with_max_yaml_depth(1)),
+    )
+    .compile(compose)
+    .unwrap_err();
     assert_eq!(error.diagnostics()[0].code, DiagnosticCode::InvalidYaml);
 }
 
@@ -475,7 +464,7 @@ agents:
             project.path().display()
         ),
     );
-    let error = ProjectCompiler::new().compile(compose).unwrap_err();
+    let error = Compiler::default().compile(compose).unwrap_err();
     assert_eq!(error.diagnostics()[0].code, DiagnosticCode::InvalidPath);
 }
 
@@ -503,7 +492,7 @@ agents:
         path: skills/acme/outside
 "#,
     );
-    let error = ProjectCompiler::new().compile(compose).unwrap_err();
+    let error = Compiler::default().compile(compose).unwrap_err();
     assert_eq!(
         error.diagnostics()[0].code,
         DiagnosticCode::PathEscapesProject
@@ -520,7 +509,7 @@ fn rejects_non_utf8_resource_files() {
         [0xff, 0xfe],
     )
     .unwrap();
-    let error = ProjectCompiler::new()
+    let error = Compiler::default()
         .compile(project.path().join("margatroid-workspace.yaml"))
         .unwrap_err();
     assert_eq!(error.diagnostics()[0].code, DiagnosticCode::InvalidResource);
