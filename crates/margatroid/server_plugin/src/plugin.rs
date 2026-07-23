@@ -1,17 +1,15 @@
 use std::convert::Infallible;
 
-use app_runtime_plugin::AppControl;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::get;
 use axum::Router;
-use core_plugin::{App, Plugin, Stage, World};
+use core_plugin::{App, Plugin};
 use futures_util::stream;
 use http_server_plugin::{HttpAppExt, HttpServerHandle};
 use log_plugin::{LogStream, LogStreamError};
 
-use crate::events::ShutdownRequested;
 use crate::resource::{LogEndpointOptions, ServerPluginOptions};
 
 #[derive(Clone, Debug, Default)]
@@ -40,11 +38,6 @@ impl Plugin for ServerPlugin {
             app.world().resource::<HttpServerHandle>().is_some(),
             "HttpServerPlugin must be installed before ServerPlugin"
         );
-        assert!(
-            app.world().resource::<AppControl>().is_some(),
-            "AppRuntimePlugin must be installed before ServerPlugin"
-        );
-        app.add_event::<ShutdownRequested>();
         app.add_http_routes(Router::new().route("/health", get(health)));
 
         if let Some(options) = &self.options.log_endpoint {
@@ -57,18 +50,6 @@ impl Plugin for ServerPlugin {
                 .clone();
             app.add_http_routes(log_routes(stream, options.clone()));
         }
-
-        let control = app.world().resource::<AppControl>().unwrap().clone();
-        let mut shutdown_reader = app.event_reader::<ShutdownRequested>();
-        app.add_systems(
-            Stage::Update,
-            [move |world: &mut World| {
-                if world.read_events(&mut shutdown_reader).is_empty() {
-                    return;
-                }
-                control.shutdown();
-            }],
-        );
     }
 }
 

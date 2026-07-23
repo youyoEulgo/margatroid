@@ -318,18 +318,18 @@ margatroid workflow ls
 - HTTP DTO 的破坏性变化升级 API major；WorkspaceBundle 破坏性变化升级 schema version。
 - Plugin 内部 Event 和 storage 格式不是协议兼容承诺。
 
-## 10. 旧 crate 迁移边界
+## 10. 旧 crate 边界
 
-当前 workspace 中的 `types`、`providers`、`assets`、`paths` 和 `sandbox` 来自旧产品层或被
-早期 Plugin 继续依赖。它们不是 V3 facade，不单独承诺稳定 API：
+早期 Config、EventBus、LLM、Sandbox、Skill Plugin 以及 `types`、`providers`、`assets`、
+`sandbox` 已移入 `legacy/prototypes`，退出正式 workspace。它们不是 V3 facade，也不构成
+兼容承诺：
 
 ```text
-types       仅保留尚被 Provider/LLM 使用的数据，逐步迁入明确领域 crate
-providers   收口为 LlmPlugin 的 Provider 扩展边界，不公开 wire 内部模块
-assets      由资源库 Plugin 取代
-paths       保留内部路径计算，不决定 Workspace 业务语义
-sandbox     作为 SandboxPlugin 的平台实现，不作为并列产品入口
+types       旧 LLM wire、配置、Member、Compose 与消息类型
+providers   旧 Provider client、wire module 与构造逻辑
+assets      旧 Member/Workspace 文件资源管理
+sandbox     旧平台命令包装与策略实现
 ```
 
-在替代调用者完成前不机械删除这些 crate；但不得继续向其中添加 V3 Workspace、Agent、Skill
-或 Workflow API，也不得从新的统一入口重导出它们。
+正式 workspace 中的 `paths` 只负责当前 daemon 主目录、配置文件和 lock 文件路径，不决定
+Workspace、资源库或记忆的业务布局。新能力可以参考 legacy 行为，但不得重新依赖其中的 crate。

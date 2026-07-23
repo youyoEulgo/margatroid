@@ -13,4 +13,4 @@
 协议对象禁止携带 API key、token 或 Provider secret。资源内容使用内容摘要关联，daemon
 必须在接受 bundle 前重新校验 schema、摘要、大小和引用关系。
 
-当前 `crates/margatroid/types` 是旧内部类型库，不属于此公开协议，也不会整体迁入。
+`legacy/prototypes/types` 是旧内部类型库，不属于此公开协议，也不会整体迁回正式代码。

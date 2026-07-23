@@ -1,12 +1,14 @@
 # 旧实现边界
 
-`legacy/` 统一保存 V1/V2 参考实现，已经从 Cargo workspace 和正式运行入口中排除：
+`legacy/` 统一保存 V1/V2 参考实现和已淘汰的早期 V3 原型，已经从 Cargo workspace 与
+正式运行入口中排除：
 
 ```text
 legacy/
 ├── runtime_v2/  # 最后一版旧协作 runtime
 ├── server/      # 旧 Axum server 与业务路由
 ├── mcp_client/  # 旧 MCP client
+├── prototypes/  # 退出活动依赖图的早期 V3 业务与实现原型
 └── docs/        # V1/V2 架构、迁移计划和 TaskChain 说明
 ```
 
@@ -33,6 +35,6 @@ apps/cli/src/main.rs
 → margatroidd
 ```
 
-`crates/margatroid/` 中的 `types`、`providers`、`compose`、`assets`、`paths` 和
-`sandbox` 不是入口层旧实现；现有 V3 Plugin 仍依赖其中的能力，后续按 Plugin
-边界逐步整理。
+`prototypes/` 中的 Config、EventBus、LLM、Sandbox、Skill Plugin 及其
+types/providers/assets/sandbox 实现已经退出正式 workspace。它们保留用于查询早期实验，
+不构成 V3 API；后续能力必须按当前设计重新建立边界，不能重新依赖这些 crate。

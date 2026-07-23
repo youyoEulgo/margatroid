@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 axum = { workspace = true }
 core_plugin = { path = "../../mecs/core_plugin" }
 futures-util = { workspace = true }
@@ -13,5 +12,6 @@ log_plugin = { path = "../../mecs/log_plugin" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 tokio = { workspace = true }
 tower = "0.5"

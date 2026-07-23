@@ -10,21 +10,12 @@ members = [
     "crates/mecs/log_plugin",
     "crates/mecs/http_server_plugin",
     "crates/mecs/external_event_plugin",
-    "crates/margatroid/config_plugin",
-    "crates/margatroid/event_bus_plugin",
-    "crates/margatroid/llm_plugin",
-    "crates/margatroid/sandbox_plugin",
     "crates/margatroid/server_plugin",
-    "crates/margatroid/skill_plugin",
     "crates/margatroid/defaults",
     "crates/margatroid/daemon_lifecycle_plugin",
     "crates/margatroid/protocol",
-    "crates/margatroid/types",
-    "crates/margatroid/providers",
     "crates/margatroid/compose",
-    "crates/margatroid/assets",
     "crates/margatroid/paths",
-    "crates/margatroid/sandbox",
 ]
 
 exclude = ["legacy/*"]

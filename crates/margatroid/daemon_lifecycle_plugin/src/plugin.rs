@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
 use core_plugin::{App, Plugin, Stage, World};
-use http_server_plugin::{HttpAppExt, HttpServerHandle};
+use http_server_plugin::{HttpAppExt, HttpServerFailed, HttpServerHandle};
 use signal_plugin::{ProcessSignal, ProcessSignalReceived, SignalListenerFailed};
 
 use crate::{DaemonLifecycle, DaemonState};
@@ -42,9 +42,11 @@ impl Plugin for DaemonLifecyclePlugin {
 
         app.add_event::<ProcessSignalReceived>();
         app.add_event::<SignalListenerFailed>();
+        app.add_event::<HttpServerFailed>();
         let mut signal_reader = app.event_reader::<ProcessSignalReceived>();
         let mut signal_failure_reader = app.event_reader::<SignalListenerFailed>();
         let mut readiness_signal_failure_reader = app.event_reader::<SignalListenerFailed>();
+        let mut readiness_http_failure_reader = app.event_reader::<HttpServerFailed>();
         let signal_control = app.world().resource::<AppControl>().unwrap().clone();
         app.add_systems(
             Stage::Update,
@@ -82,26 +84,30 @@ impl Plugin for DaemonLifecyclePlugin {
                 if control.is_shutdown() {
                     return;
                 }
+                let signal_failed = !world
+                    .read_events(&mut readiness_signal_failure_reader)
+                    .is_empty();
+                let http_failed = !world
+                    .read_events(&mut readiness_http_failure_reader)
+                    .is_empty();
+                if signal_failed || http_failed {
+                    tracing::error!(
+                        signal_failed,
+                        http_failed,
+                        "daemon dependency failed to start"
+                    );
+                    control.shutdown();
+                    return;
+                }
                 let http_ready = world
                     .resource::<HttpServerHandle>()
                     .is_some_and(|server| server.address().is_some());
                 let async_ready = world
                     .resource::<AsyncRuntimeStatus>()
                     .is_some_and(AsyncRuntimeStatus::is_running);
-                let signal_ready = world
-                    .read_events(&mut readiness_signal_failure_reader)
-                    .is_empty();
-                if http_ready && async_ready && signal_ready {
+                if http_ready && async_ready {
                     startup_lifecycle.set(DaemonState::Ready);
                     tracing::info!("margatroidd ready");
-                } else {
-                    tracing::error!(
-                        http_ready,
-                        async_ready,
-                        signal_ready,
-                        "daemon dependencies failed to start"
-                    );
-                    control.shutdown();
                 }
             }],
         );
@@ -157,16 +163,38 @@ mod tests {
             .resource::<AsyncRuntimeStatus>()
             .unwrap()
             .clone();
+        let startup_failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_failures = startup_failures.clone();
+        let mut http_failure_reader = app.event_reader::<HttpServerFailed>();
+        let mut signal_failure_reader = app.event_reader::<SignalListenerFailed>();
+        app.add_systems(
+            Stage::Last,
+            [move |world: &mut World| {
+                observed_failures.lock().unwrap().extend(
+                    world
+                        .read_events(&mut http_failure_reader)
+                        .into_iter()
+                        .map(|failure| format!("HTTP: {}", failure.message)),
+                );
+                observed_failures.lock().unwrap().extend(
+                    world
+                        .read_events(&mut signal_failure_reader)
+                        .into_iter()
+                        .map(|failure| format!("signal: {}", failure.message)),
+                );
+            }],
+        );
         let thread = std::thread::spawn(move || app.run());
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while lifecycle.state() != DaemonState::Ready {
             assert!(
                 Instant::now() < deadline,
-                "daemon readiness timed out: lifecycle={:?}, server={:?}, async_running={}",
+                "daemon readiness timed out: lifecycle={:?}, server={:?}, async_running={}, failures={:?}",
                 lifecycle.state(),
                 server.address(),
-                runtime.is_running()
+                runtime.is_running(),
+                *startup_failures.lock().unwrap()
             );
             std::thread::yield_now();
         }
