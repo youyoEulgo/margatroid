@@ -1,7 +1,7 @@
 # Margatroid V3 产品路线图
 
-状态：阶段 2A“通用信号与终端输入”已完成；下一步进入阶段 3“Compose 项目与资源包
-工具链”。
+状态：阶段 2A“通用信号与终端输入”已完成；阶段 3“Compose 项目与资源包工具链”API
+草案已完成，下一步审查协议前置项并开始实现。
 
 ## 1. 暂定发布目标
 
@@ -14,14 +14,14 @@ v0.1 的完整用户路径：
 安装 margatroidd + margatroid
 → 配置 LLM provider
 → 启动 daemon
-→ 编辑自己的 compose.toml，或使用别人提供的 compose 项目
-→ margatroid compose up -f compose.toml
+→ 编辑自己的 margatroid-workspace.yaml，或使用别人提供的 Workspace 文件
+→ margatroid workspace up -f margatroid-workspace.yaml
 → 提交 prompt
 → 程序按确定性 workflow DAG 调度 Agent
 → 实时查看进度和结果
 → 使用 margatroid ps 和资源库命令查看 workspace、Agent、Skill、Provider
 → 重启 daemon 后仍能查询任务和历史
-→ 使用 compose stop/start/down 管理 workspace 生命周期
+→ 使用 workspace stop/start/restart/down 管理 workspace 生命周期
 ```
 
 v0.1 不包含：
@@ -107,7 +107,7 @@ resource catalog ──→ workspace ──→ memory
 新增 `margatroid_protocol` crate，负责：
 
 - 定义 `WorkspaceId`、`RequestId`、`TaskId`、`AgentId`。
-- 定义 `ResourceId`、`ProjectName`、workspace、prompt、task 和 result DTO。
+- 定义 `ResourceId`、`WorkspaceName`、workspace、prompt、task 和 result DTO。
 - 定义 `WorkspaceSpec`、`WorkspaceBundle` 和 `ResourceManifest` 的传输契约。
 - 定义稳定错误码和 API version。
 - 定义任务状态机：Queued、Running、Waiting、Completed、Failed、Cancelled。
@@ -220,24 +220,34 @@ resource catalog ──→ workspace ──→ memory
 
 ## 7. 阶段 3：Compose 项目与资源包工具链
 
+API 设计以 [V3-COMPOSE-API.md](V3-COMPOSE-API.md) 为准。目标 package 名为
+`margatroid_compose`；它是纯本地编译器，不是 ECS Plugin。
+
 新增独立的纯数据 project/compose crate，负责：
 
-- 解析用户编写或第三方提供的 `compose.toml`。
-- 解析相对路径并收集 Soul、Skill、Workflow 等本地资源。
+- 解析用户编写或第三方提供的 `margatroid-workspace.yaml`（兼容默认文件名
+  `margatroid-workspace.yml`）。
+- 在项目根创建或复用 `.margatroid/`，其中保存 project-level Skill / Workflow 资源和
+  Workspace 记忆；默认记忆路径为
+  `.margatroid/workspaces/<workspace_name>/memory/<agent_id>/memory.sql`。
+- 解析相对路径并收集 Workspace Skill / Workflow 等本地资源；AgentImage 由 daemon Agent 库管理。
 - 执行本地 schema 预检，生成规范化 `WorkspaceSpec`。
 - 生成带类型、逻辑名称、版本、大小和内容哈希的 `ResourceManifest`。
 - 构建可独立上传和恢复的 `WorkspaceBundle`。
-- 为 `margatroid compose config` 提供稳定规范化输出。
+- 为 `margatroid workspace config` 提供稳定规范化输出。
+- 删除旧 compose crate 中与项目编译无关的 roster，并停止依赖 legacy 风格
+  `types::ComposeFile`。
 
-该 crate 不依赖 ECS、HTTP、CLI 或 daemon。CLI 下载缓存不是权威资源库，Provider secret
-不得进入 bundle 或规范化配置输出。
+该 crate 不依赖 ECS、HTTP、CLI 或 daemon。CLI 下载缓存不是权威资源库；compose schema
+不提供 Provider secret 字段，用户资源正文则按待上传内容处理。
 
 验收门槛：
 
 - 同一个项目在不同当前工作目录下生成相同的规范化 spec 和资源哈希。
 - 缺失文件、越界路径、重复资源、hash 不匹配和 schema 不兼容有明确错误位置。
-- bundle 不包含 API key、daemon 本地路径或对 CLI 缓存的隐式依赖。
-- 不启动 daemon 即可完成 `compose config` 和完整本地预检。
+- 结构化 compose 与规范化输出不包含 API key；bundle 不包含 daemon 本地路径或对 CLI
+  缓存的隐式依赖，用户资源正文不得手写 secret。
+- 不启动 daemon 即可完成 `workspace config` 和完整本地预检。
 
 ## 8. 阶段 4：WorkspacePlugin 与资源目录
 
@@ -245,7 +255,7 @@ resource catalog ──→ workspace ──→ memory
 
 - 使用 `WorkspaceRegistry` 管理多个 workspace。
 - 接受 `WorkspaceBundle`，并在 daemon 中执行独立的权威校验。
-- 为 Agent、Skill、Provider 提供稳定 ID、查询和管理能力；不创建宽泛的万能 ResourcePlugin。
+- 为 AgentImage、Skill、Workflow、Provider 提供稳定 ID、查询和管理能力；不创建宽泛的万能 ResourcePlugin。
 - 校验 manager、Agent、Provider、Skill 和 Workflow 引用及资源删除约束。
 - 实现 create、start、stop、delete、list 生命周期 Event。
 - 使用 Entity 表示 Agent 实例，差异通过 Component 表达。
@@ -280,7 +290,10 @@ resource catalog ──→ workspace ──→ memory
 工作内容：
 
 - 解析并验证确定性 DAG。
-- 支持 delegate、parallel、condition、return。
+- 支持 delegate、parallel、condition、return 等第一批内置节点。
+- 设计可扩展节点注册接口，允许 Plugin 增加节点类型；为未来 Workflow DSL 保留编译入口。
+- 在 Workflow 启动前检查 daemon 主 Skill 目录与项目 `.margatroid/skills/` 的依赖。
+- Workflow 由具体 Agent 持有和触发，不在 Workspace 顶层单独声明。
 - 实现依赖调度、并发上限、timeout、retry 和 cancel。
 - 每次状态转换产生结构化 Event 并持久化。
 - 流程由程序控制，LLM 只执行 workflow 节点。
@@ -360,11 +373,15 @@ GET    /v1/logs/stream
 
 ```text
 margatroid status
-margatroid compose up [-d] [-f compose.toml] [-p project]
-margatroid compose stop | start | restart | down
-margatroid compose ps
-margatroid compose logs [-f]
-margatroid compose config
+margatroid workspace up [-d] [-f margatroid-workspace.yaml] [-n name]
+margatroid workspace down [-n name]
+margatroid workspace stop [-n name]
+margatroid workspace start [-n name]
+margatroid workspace restart [-n name]
+margatroid workspace ps
+margatroid workspace logs [-f] [-n name]
+margatroid workspace config
+margatroid run <scope>/<agent>[:tag]
 margatroid ps
 margatroid inspect <workspace>
 margatroid logs [-f]
@@ -379,9 +396,13 @@ margatroid provider ls | inspect | add | remove
 ```
 
 CLI 负责本地项目解析、资源收集与预检、HTTP、展示和退出码，不包含业务状态机。
-`compose up` 默认 attach 业务事件与 Agent 输出；`-d/--detach` 启动后返回，不代表静默。
-`compose logs` 展示 workspace 业务输出，顶层 `logs` 展示 daemon tracing 诊断日志。
-`compose down` 删除运行实例但不隐式删除共享资源库。
+`workspace up` 默认 attach 业务事件与 Agent 输出；`-d/--detach` 启动后返回，不代表静默。
+`workspace logs` 展示 workspace 业务输出，顶层 `logs` 展示 daemon tracing 诊断日志。
+`workspace down` 删除运行实例但不隐式删除共享资源库和记忆卷。
+
+`run` 启动一个 AgentImage，并创建隐藏的单 Agent Workspace。镜像引用支持
+`scope/agent[:tag]` 和 `scope/agent@sha256:<digest>`；实例参数、终端参数和 MemoryVolume
+挂载以 [V3-COMPOSE-API.md](V3-COMPOSE-API.md) 的 API 约定为准。
 
 交互命令边界：
 
