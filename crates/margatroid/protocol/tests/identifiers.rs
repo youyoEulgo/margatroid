@@ -1,4 +1,4 @@
-use margatroid_protocol::{ContentDigest, ProjectName, WorkspaceId};
+use margatroid_protocol::{AgentImageReference, ContentDigest, WorkspaceId, WorkspaceName};
 
 #[test]
 fn identifiers_are_validated_on_construction_and_deserialization() {
@@ -10,7 +10,28 @@ fn identifiers_are_validated_on_construction_and_deserialization() {
         assert!(WorkspaceId::new(invalid).is_err(), "accepted {invalid:?}");
     }
 
-    assert!(serde_json::from_str::<ProjectName>(r#""bad/name""#).is_err());
+    assert!(serde_json::from_str::<WorkspaceName>(r#""bad/name""#).is_err());
+}
+
+#[test]
+fn agent_image_references_require_scope_and_valid_version() {
+    assert!(AgentImageReference::new("eulgo/coder:v1").is_ok());
+    assert!(AgentImageReference::new(format!("eulgo/coder@sha256:{}", "a".repeat(64))).is_ok());
+    assert!(AgentImageReference::new("coder:v1").is_err());
+    assert!(AgentImageReference::new("eulgo/coder@sha256:bad").is_err());
+    for invalid in [
+        "eulgo/coder?debug",
+        "eulgo/coder#latest",
+        "eulgo/coder:v1?debug",
+        "eulgo/-coder:v1",
+        "eulgo/coder:\0",
+    ] {
+        assert!(
+            AgentImageReference::new(invalid).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+    assert!(AgentImageReference::new(format!("eulgo/{}", "a".repeat(256))).is_err());
 }
 
 #[test]
