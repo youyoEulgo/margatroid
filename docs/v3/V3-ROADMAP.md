@@ -1,6 +1,6 @@
 # Margatroid V3 路线图
 
-状态：API 收口与阶段 3.5 已完成，下一步设计阶段 4 资源库 API
+状态：API 收口与阶段 3.5 已完成，正在设计阶段 4 资源库 API
 
 路线图只记录工作顺序与验收条件，不重复 API 和产品设计。架构见
 [V3-DESIGN.md](V3-DESIGN.md)。
@@ -43,9 +43,11 @@ v0.1 是可以独立安装和使用的本地多 Agent 编排产品：
 ### 阶段 3：Compose 工具链
 
 - YAML authoring schema。
-- 项目路径与资源包解析。
-- WorkspaceBundle 确定性构建。
-- 大小、路径、digest 和诊断测试。
+- 项目路径、WorkspaceSpec 和资源引用解析。
+- YAML 上限、路径和诊断测试。
+
+阶段 3 实现中已有的 WorkspaceBundle 和资源打包代码不再是目标 API；它们在阶段 4/5
+随 daemon 本地资源边界一起简化，不为旧实现保留兼容层。
 
 ## API 收口（已完成）
 
@@ -84,24 +86,26 @@ v0.1 是可以独立安装和使用的本地多 Agent 编排产品：
 
 - 公开写入口统一为 ResourceCommand / ResourceResult。
 - ResourceCatalog 只提供 AgentImage、Skill、Workflow 查询。
-- 支持带作用域逻辑名称、安装、查询和删除。
-- 校验目录包结构、digest、路径和包大小。
-- 记录资源引用，阻止仍被使用的资源误删。
+- 支持从 daemon 可见的本地目录安装带作用域逻辑名称的资源。
+- daemon 校验源目录、文件类型、symlink、路径和大小，并自行计算 digest。
+- 为可编辑资源保留稳定 ResourceId，Agent 启动时生成不可变运行快照。
 - 主目录资源采用原子持久化，并能识别损坏数据。
 
 不在本阶段处理 Workspace 生命周期、AgentInstance 或记忆目录。
 Provider 配置及 secret 由 LlmPlugin 独立拥有，不进入目录包资源库。
 
-完成条件：三类资源可以独立安装、查询和安全删除；重启后结果一致；公开 API 不暴露
-存储 Record、数据库连接或可写注册表。
+完成条件：三类资源可以从本地目录独立安装、查询和安全删除；CLI 不读取或
+打包资源正文；重启后结果一致；公开 API 不暴露存储 Record、数据库连接或可写注册表。
 
 ## 阶段 5：WorkspacePlugin
 
 在资源库边界稳定后实现 Workspace 状态机：
 
-- WorkspaceBundle daemon 权威校验。
+- `workspace up` 路径在 daemon 内编译为 WorkspaceSpec 与规范化项目根目录。
 - 公开写入口统一为 WorkspaceCommand / WorkspaceResult。
 - Workspaces Resource 只提供运行状态查询。
+- daemon 解析项目级 Skill / Workflow 并生成不可变运行快照。
+- 登记和释放 Workspace 使用的资源条目与快照 digest，阻止仍被使用的资源误删。
 - AgentInstance Entity 映射。
 - 项目级默认 Memory 路径。
 - 原子持久化和进程重启恢复。
@@ -146,13 +150,14 @@ Workspace 删除不会隐式删除共享资源或记忆。
 - 认证、请求上限、错误 DTO 和 graceful shutdown。
 - ServerPlugin 只做 HTTP DTO 与业务 Command/Result 适配。
 
-完成条件：CLI 不需要直接访问 daemon 文件，断线重连不会破坏运行状态。
+完成条件：CLI 只发送本地路径和控制命令，不读写 daemon 权威数据；CLI 退出或重连不会
+破坏运行状态。
 
 ## 阶段 10：Docker-like CLI
 
 - workspace up/down/start/stop/restart/ps。
 - run 单 AgentImage。
-- agent/skill/workflow 资源管理。
+- agent/skill/workflow 本地路径命令与资源库查询。
 - 默认附着日志、`-d` 后台运行。
 - 项目发现、退出码、结构化输出和 TUI/对话入口。
 

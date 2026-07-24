@@ -1,6 +1,6 @@
 # Margatroid V3 架构设计
 
-状态：阶段 3 已完成，下一阶段为公开 API 收口
+状态：API 收口与活动边界清理已完成，正在设计阶段 4 资源库 API
 
 本文只描述产品结构和稳定概念。具体公开类型以 [MECS-API.md](MECS-API.md) 和
 [MARGATROID-API.md](MARGATROID-API.md) 为准，执行顺序以 [V3-ROADMAP.md](V3-ROADMAP.md)
@@ -16,13 +16,15 @@ Margatroid 是 Docker-like 的多 Agent 编排与运行工具：
 - Memory 类似持久化卷，但默认按项目和 Agent 自动分配。
 - Workflow 是可组合、可扩展的高级 Skill，未来可以演化为独立语言。
 
-CLI 面向用户，daemon 拥有运行状态和资源库。用户不直接操作 margatroidd。
+CLI 面向用户，daemon 拥有运行状态、资源库和 Memory。用户不直接操作 margatroidd。
+V3 第一版是本地产品：CLI 与 daemon 在同一台机器上共享文件系统，不为远程资源上传、
+项目目录同步或 Memory 回传预留 API。
 
 ## 2. 分层
 
 ```text
 apps/
-├── cli                 本地项目工具链和 daemon 客户端
+├── cli                 短生命周期本地控制端
 └── daemon              产品组合根
 
 crates/mecs/
@@ -72,12 +74,15 @@ Plugin。所有外部线程通过有界通道把数据送回主线程，不能�
 
 ```text
 margatroid CLI
-  -> compile margatroid-workspace.yaml
-  -> WorkspaceBundle
+  -> locate margatroid-workspace.yaml
+  -> compose path
   -> daemon HTTP API
   -> ServerPlugin
   -> WorkspaceCommand Event
   -> WorkspacePlugin
+  -> compile WorkspaceSpec + project root
+  -> resolve main/project resources
+  -> immutable runtime snapshot
   -> Workspace state + Agent Entity
   -> Agent/Workflow/Memory plugins
   -> LlmCommand / SandboxCommand
@@ -147,21 +152,26 @@ Workflow 依赖由包内依赖清单声明。启动前检查其 Skill 依赖，�
 
 ## 8. CLI
 
-CLI 不只是 HTTP 转发器，它负责：
+CLI 是短生命周期本地控制端，它负责：
 
-- 查找和解析 Workspace 文件。
-- 解析项目相对路径。
-- 收集项目级 Skill / Workflow。
-- 构建确定性 WorkspaceBundle。
+- 查找 Workspace 文件，将用户输入解析为绝对路径并发送给 daemon。
+- 发送 Workspace 与资源管理命令。
 - 展示日志、状态和诊断。
-- 管理可删除的本地缓存。
+- 为 `workspace config` 等纯预览命令调用共享 Compose 编译器。
 
 daemon 负责：
 
-- 已安装资源的权威目录。
+- 编译 Workspace 文件并解析项目相对路径。
+- 读取项目级 Skill / Workflow 和主目录已安装资源。
+- 安装、更新、删除和查询主目录资源。
 - Workspace、AgentInstance、Request 和 Task 状态。
+- 持续读写项目级 Memory。
 - 权威校验、持久化和安全策略。
 - ECS 运行与恢复。
+
+CLI 不打包资源正文，不维护资源副本，也不接收 Memory 增量回传。CLI 退出不影响
+Workspace；daemon 负责完整运行生命周期。项目级静态资源在启动时读取为不可变快照，
+Memory 则由 daemon 在 Workspace 运行期间持续读写。
 
 CLI 命令语义参考 Docker，但不复制容易混淆的名词。`workspace up` 创建或启动运行组，`run`
 从单个 AgentImage 创建临时 Workspace，`ps` 查询 daemon 权威状态。
@@ -385,7 +395,7 @@ Owner 与生命周期：
 
 V3 第一版不承诺：
 
-- 远程 Workspace 项目目录。
+- 远程 daemon、远程 Workspace 项目目录、资源上传或 Memory 同步。
 - Agent 热更新。
 - 分布式 ECS 或多进程 World。
 - 任意代码的绝对安全隔离。
