@@ -1,105 +1,17 @@
-use std::any::TypeId;
-use std::collections::{HashMap, HashSet};
+use crate::schedule::SchedulePlan;
+use crate::{Event, Plugin, System, World};
 
-use crate::events::{Event, EventReader, Events};
-use crate::resource::Resource;
-use crate::schedule::{Schedule, ScheduleReport};
-use crate::system::{System, SystemFailed};
-use crate::world::World;
-
-/// Core 只定义通用帧阶段，不携带业务语义。
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Stage {
-    Startup,
-    First,
-    Update,
-    Last,
-}
-
-/// 同步 ECS 组合根。持有 World 和按阶段分组的 Schedule。
 pub struct App {
     world: World,
-    schedules: HashMap<Stage, Schedule>,
-    event_maintenance: Schedule,
-    event_types: HashSet<TypeId>,
-    started: bool,
-    event_retention_frames: u64,
+    schedules: SchedulePlan,
 }
 
 impl App {
     pub fn new() -> Self {
-        let schedules = [Stage::Startup, Stage::First, Stage::Update, Stage::Last]
-            .into_iter()
-            .map(|stage| (stage, Schedule::new()))
-            .collect();
         Self {
             world: World::new(),
-            schedules,
-            event_maintenance: Schedule::new(),
-            event_types: HashSet::new(),
-            started: false,
-            event_retention_frames: 2,
+            schedules: SchedulePlan::new(),
         }
-    }
-
-    pub fn add_plugins(&mut self, plugins: impl crate::Plugin) -> &mut Self {
-        plugins.build(self);
-        self
-    }
-
-    pub fn add_systems(
-        &mut self,
-        stage: Stage,
-        systems: impl IntoIterator<Item = impl System>,
-    ) -> &mut Self {
-        let schedule = self
-            .schedules
-            .get_mut(&stage)
-            .expect("stage not registered");
-        for system in systems {
-            schedule.add_system(system);
-        }
-        self
-    }
-
-    pub fn add_resource<R: Resource>(&mut self, resource: R) -> &mut Self {
-        self.world.add_resource(resource);
-        self
-    }
-
-    /// 注册一种事件类型。重复注册不会重置已有队列。
-    pub fn add_event<E: Event>(&mut self) -> &mut Self {
-        if self.world.resource::<Events<E>>().is_none() {
-            self.world
-                .add_resource(Events::<E>::new(self.event_retention_frames));
-        }
-        if self.event_types.insert(TypeId::of::<E>()) {
-            self.event_maintenance.add_system(|world: &mut World| {
-                if let Some(events) = world.resource::<Events<E>>() {
-                    events.finish_frame();
-                }
-            });
-        }
-        self
-    }
-
-    /// 为已注册的事件类型创建独立 reader。
-    pub fn event_reader<E: Event>(&self) -> EventReader<E> {
-        self.world
-            .resource::<Events<E>>()
-            .unwrap_or_else(|| panic!("event `{}` is not registered", std::any::type_name::<E>()))
-            .reader()
-    }
-
-    /// 设置事件保留帧数。必须在注册首个事件类型前调用。
-    pub fn set_event_retention_frames(&mut self, frames: u64) -> &mut Self {
-        assert!(frames > 0, "event retention must be positive");
-        assert!(
-            self.event_types.is_empty(),
-            "event retention cannot change after events are registered"
-        );
-        self.event_retention_frames = frames;
-        self
     }
 
     pub fn world(&self) -> &World {
@@ -110,62 +22,45 @@ impl App {
         &mut self.world
     }
 
-    /// 执行一个同步 ECS 帧。第一次调用时先运行一次 Startup。
+    pub fn add_plugin<P: Plugin>(&mut self, plugin: P) -> &mut Self {
+        assert!(!self.schedules.is_started(), "app has already started");
+        plugin.build(self);
+        self
+    }
+
+    pub fn add_schedule(&mut self, name: String) -> &mut Self {
+        assert!(
+            self.schedules.add_schedule(name),
+            "schedule name is duplicated or app has already started"
+        );
+        self
+    }
+
+    pub fn add_once_schedule(&mut self, name: String) -> &mut Self {
+        assert!(
+            self.schedules.add_once_schedule(name),
+            "schedule name is duplicated or app has already started"
+        );
+        self
+    }
+
+    pub fn add_system<S: System>(&mut self, schedule: &str, system: S) -> &mut Self {
+        self.schedules
+            .schedule_mut(schedule)
+            .unwrap_or_else(|| panic!("schedule `{schedule}` does not exist or app has started"))
+            .add_system(system);
+        self
+    }
+
+    pub fn register_event<E: Event>(&mut self) -> &mut Self {
+        assert!(!self.schedules.is_started(), "app has already started");
+        self.world.event_registry_mut().register::<E>();
+        self
+    }
+
     pub fn tick(&mut self) {
-        self.add_event::<SystemFailed>();
-        if !self.started {
-            self.run_stage(Stage::Startup);
-            self.started = true;
-        }
-        for stage in [Stage::First, Stage::Update, Stage::Last] {
-            self.run_stage(stage);
-        }
-        let report = self.event_maintenance.run(&mut self.world);
-        self.handle_schedule_report("EventMaintenance", report);
-    }
-
-    fn run_stage(&mut self, stage: Stage) {
-        let report = self
-            .schedules
-            .get_mut(&stage)
-            .expect("stage not registered")
-            .run(&mut self.world);
-        self.handle_schedule_report(stage.name(), report);
-    }
-
-    fn handle_schedule_report(&mut self, schedule: &'static str, report: ScheduleReport) {
-        if let Some(message) = report.ordering_error {
-            tracing::error!(schedule, %message, "schedule configuration failed");
-            self.world.send_event(SystemFailed {
-                schedule,
-                system: None,
-                message,
-            });
-        }
-        for failure in report.failures {
-            tracing::error!(
-                schedule,
-                system = failure.system.unwrap_or("<anonymous>"),
-                message = %failure.message,
-                "system execution failed"
-            );
-            self.world.send_event(SystemFailed {
-                schedule,
-                system: failure.system,
-                message: failure.message,
-            });
-        }
-    }
-}
-
-impl Stage {
-    fn name(self) -> &'static str {
-        match self {
-            Stage::Startup => "Startup",
-            Stage::First => "First",
-            Stage::Update => "Update",
-            Stage::Last => "Last",
-        }
+        self.world.tick();
+        self.schedules.run(&mut self.world);
     }
 }
 
@@ -177,60 +72,97 @@ impl Default for App {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
-    use crate::named_system;
 
-    #[derive(Debug, PartialEq)]
-    struct Counter(i32);
+    struct Notice(u32);
+    impl Event for Notice {}
 
     #[test]
-    fn stages_run_in_core_order() {
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    fn events_sent_by_a_system_are_visible_on_the_next_tick() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let reader_seen = Arc::clone(&seen);
         let mut app = App::new();
-        for (stage, value) in [
-            (Stage::Startup, 0),
-            (Stage::First, 1),
-            (Stage::Update, 2),
-            (Stage::Last, 3),
-        ] {
-            let calls = calls.clone();
-            app.add_systems(
-                stage,
-                [move |_world: &mut World| {
-                    calls.lock().unwrap().push(value);
-                }],
-            );
-        }
+        app.register_event::<Notice>()
+            .add_schedule("update".into())
+            .add_system("update", move |world: &mut World| {
+                let values = world
+                    .event_reader::<Notice>()
+                    .into_iter()
+                    .map(|notice| notice.0)
+                    .collect::<Vec<_>>();
+                reader_seen.lock().unwrap().extend(values);
+                world.event_write().send_event(Notice(7));
+            });
 
         app.tick();
+        assert!(seen.lock().unwrap().is_empty());
         app.tick();
-
-        assert_eq!(*calls.lock().unwrap(), [0, 1, 2, 3, 1, 2, 3]);
+        assert_eq!(*seen.lock().unwrap(), [7]);
     }
 
     #[test]
-    fn resources_can_be_added_through_app() {
+    #[should_panic(expected = "app has already started")]
+    fn plugins_cannot_be_added_after_startup() {
         let mut app = App::new();
-        app.add_resource(Counter(7));
-        assert_eq!(app.world().resource::<Counter>(), Some(&Counter(7)));
+        app.tick();
+        app.add_plugin(|_app: &mut App| {});
     }
 
     #[test]
-    fn ordering_failures_become_events() {
+    fn delayed_events_arrive_after_their_countdown_and_then_clear() {
         let mut app = App::new();
-        let mut reader = {
-            app.add_event::<SystemFailed>();
-            app.event_reader::<SystemFailed>()
-        };
-        app.add_systems(
-            Stage::Update,
-            [named_system("first", |_world| {}).after("missing")],
+        app.register_event::<Notice>();
+        app.world().event_write().send_event_after(Notice(3), 2);
+
+        app.tick();
+        assert!(app.world().event_reader::<Notice>().is_empty());
+        app.tick();
+        assert!(app.world().event_reader::<Notice>().is_empty());
+        app.tick();
+        assert_eq!(
+            app.world()
+                .event_reader::<Notice>()
+                .into_iter()
+                .map(|notice| notice.0)
+                .collect::<Vec<_>>(),
+            [3]
         );
+        app.tick();
+        assert!(app.world().event_reader::<Notice>().is_empty());
+    }
+
+    #[test]
+    fn maximum_delay_counts_down_without_overflowing() {
+        let mut app = App::new();
+        app.register_event::<Notice>();
+        app.world()
+            .event_write()
+            .send_event_after(Notice(1), u64::MAX);
 
         app.tick();
 
-        let failures = app.world().read_events(&mut reader);
-        assert_eq!(failures.len(), 1);
-        assert!(failures[0].message.contains("unknown system label"));
+        assert!(app.world().event_reader::<Notice>().is_empty());
+    }
+
+    #[test]
+    fn registering_an_event_twice_preserves_queued_events() {
+        let mut app = App::new();
+        app.register_event::<Notice>();
+        app.world().event_write().send_event(Notice(5));
+        app.register_event::<Notice>();
+
+        app.tick();
+
+        assert_eq!(app.world().event_reader::<Notice>().len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicated")]
+    fn schedule_names_must_be_unique_across_once_and_recurring_schedules() {
+        let mut app = App::new();
+        app.add_schedule("update".into());
+        app.add_once_schedule("update".into());
     }
 }
