@@ -1,188 +1,174 @@
-use std::collections::VecDeque;
-use std::marker::PhantomData;
-use std::sync::Mutex;
+use std::any::{Any, TypeId};
+use std::collections::{HashMap, VecDeque};
 
-/// 可由 App 分发的事件。
-pub trait Event: Clone + Send + Sync + 'static {}
-impl<T: Clone + Send + Sync + 'static> Event for T {}
+pub trait Event: Send + Sync + 'static {}
 
-struct StoredEvent<E> {
-    id: u64,
-    frame: u64,
-    value: E,
+struct QueuedEvent {
+    body: Box<dyn Any + Send + Sync>,
+    remaining_delay_frames: u64,
 }
 
-struct EventsInner<E> {
-    events: VecDeque<StoredEvent<E>>,
-    next_id: u64,
-    frame: u64,
+trait ErasedEventReadStorage: Any + Send + Sync + 'static {
+    fn clear(&mut self);
+    fn push_boxed(&mut self, body: Box<dyn Any + Send + Sync>);
+    fn as_any(&self) -> &dyn Any;
+    #[allow(dead_code)]
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
-/// 事件读取器。内部游标对调用方透明，可以作为 system 状态跨帧保存。
-pub struct EventReader<E: Event> {
-    next_id: u64,
-    missed: u64,
-    _marker: PhantomData<E>,
+struct EventReadStorage<E: Event> {
+    events: Vec<E>,
 }
 
-/// 每种事件类型在 World 中对应一个内部队列。
-///
-/// 该类型不对 crate 外公开，调用方只通过 App 和 World 的事件 API 使用它。
-pub(crate) struct Events<E: Event> {
-    inner: Mutex<EventsInner<E>>,
-    retention_frames: u64,
+impl<E: Event> EventReadStorage<E> {
+    fn new() -> Self {
+        Self { events: Vec::new() }
+    }
+
+    fn push(&mut self, event: E) {
+        self.events.push(event);
+    }
 }
 
-impl<E: Event> Events<E> {
-    pub(crate) fn new(retention_frames: u64) -> Self {
-        assert!(retention_frames > 0, "event retention must be positive");
+impl<E: Event> ErasedEventReadStorage for EventReadStorage<E> {
+    fn clear(&mut self) {
+        self.events.clear();
+    }
+
+    fn push_boxed(&mut self, body: Box<dyn Any + Send + Sync>) {
+        let event = body
+            .downcast::<E>()
+            .expect("event body type must match its TypeId");
+        self.push(*event);
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+pub(crate) struct EventReadStorageRegistry {
+    storages: HashMap<TypeId, Box<dyn ErasedEventReadStorage>>,
+}
+
+impl EventReadStorageRegistry {
+    pub(crate) fn new() -> Self {
         Self {
-            inner: Mutex::new(EventsInner {
-                events: VecDeque::new(),
-                next_id: 0,
-                frame: 0,
-            }),
-            retention_frames,
+            storages: HashMap::new(),
         }
     }
 
-    pub(crate) fn reader(&self) -> EventReader<E> {
-        let inner = self.lock();
-        EventReader {
-            next_id: inner.next_id,
-            missed: 0,
-            _marker: PhantomData,
+    pub(crate) fn register<E: Event>(&mut self) {
+        self.storages
+            .entry(TypeId::of::<E>())
+            .or_insert_with(|| Box::new(EventReadStorage::<E>::new()));
+    }
+
+    pub(crate) fn reader<E: Event>(&self) -> EventReader<'_, E> {
+        let storage = self
+            .storages
+            .get(&TypeId::of::<E>())
+            .unwrap_or_else(|| panic!("event `{}` is not registered", std::any::type_name::<E>()))
+            .as_any()
+            .downcast_ref::<EventReadStorage<E>>()
+            .expect("event storage type must match its TypeId");
+        EventReader { storage }
+    }
+
+    fn push_event(&mut self, event: QueuedEvent) {
+        let event_type = event.body.as_ref().type_id();
+        let storage = self
+            .storages
+            .get_mut(&event_type)
+            .unwrap_or_else(|| panic!("received an event whose type is not registered"));
+        storage.push_boxed(event.body);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        for storage in self.storages.values_mut() {
+            storage.clear();
+        }
+    }
+}
+
+pub struct EventQueue {
+    pending: VecDeque<QueuedEvent>,
+}
+
+impl EventQueue {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
         }
     }
 
-    pub(crate) fn send(&self, event: E) {
-        let mut inner = self.lock();
-        let stored = StoredEvent {
-            id: inner.next_id,
-            frame: inner.frame,
-            value: event,
-        };
-        inner.next_id = inner.next_id.wrapping_add(1);
-        inner.events.push_back(stored);
-    }
-
-    pub(crate) fn read(&self, reader: &mut EventReader<E>) -> Vec<E> {
-        let inner = self.lock();
-        if let Some(oldest) = inner.events.front() {
-            if reader.next_id < oldest.id {
-                reader.missed = reader
-                    .missed
-                    .wrapping_add(oldest.id.wrapping_sub(reader.next_id));
-                reader.next_id = oldest.id;
+    pub(crate) fn pull_events(&mut self, registry: &mut EventReadStorageRegistry) {
+        let count = self.pending.len();
+        for _ in 0..count {
+            if let Some(event) = self.pop_event() {
+                registry.push_event(event);
             }
         }
-        let events = inner
-            .events
-            .iter()
-            .filter(|event| event.id >= reader.next_id)
-            .map(|event| event.value.clone())
-            .collect();
-        reader.next_id = inner.next_id;
-        events
     }
 
-    /// 推进帧号并清理超过保留期限的事件。
-    pub(crate) fn finish_frame(&self) {
-        let mut inner = self.lock();
-        inner.frame = inner.frame.wrapping_add(1);
-        let frame = inner.frame;
-        while inner
-            .events
-            .front()
-            .is_some_and(|event| event.frame.wrapping_add(self.retention_frames) <= frame)
-        {
-            inner.events.pop_front();
+    fn pop_event(&mut self) -> Option<QueuedEvent> {
+        let mut event = self.pending.pop_front()?;
+        if event.remaining_delay_frames == 0 {
+            return Some(event);
         }
+        event.remaining_delay_frames -= 1;
+        self.pending.push_back(event);
+        None
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, EventsInner<E>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn push_event(&mut self, body: Box<dyn Any + Send + Sync>, delay_frames: u64) {
+        self.pending.push_back(QueuedEvent {
+            body,
+            remaining_delay_frames: delay_frames,
+        });
+    }
+
+    pub fn send_event<E: Event>(&mut self, event: E) {
+        self.push_event(Box::new(event), 0);
+    }
+
+    pub fn send_event_after<E: Event>(&mut self, event: E, extra_delay_frames: u64) {
+        self.push_event(Box::new(event), extra_delay_frames);
     }
 }
 
-impl<E: Event> EventReader<E> {
-    /// 返回该 reader 因事件过期而累计漏掉的事件数。
-    pub fn missed_events(&self) -> u64 {
-        self.missed
+pub struct EventReader<'a, E: Event> {
+    storage: &'a EventReadStorage<E>,
+}
+
+impl<E: Event> EventReader<'_, E> {
+    pub fn len(&self) -> usize {
+        self.storage.events.len()
     }
 
-    /// 取出并清零累计漏读数。
-    pub fn take_missed_events(&mut self) -> u64 {
-        std::mem::take(&mut self.missed)
+    pub fn is_empty(&self) -> bool {
+        self.storage.events.is_empty()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+impl<'a, E: Event> IntoIterator for EventReader<'a, E> {
+    type Item = &'a E;
+    type IntoIter = std::slice::Iter<'a, E>;
 
-    #[test]
-    fn reader_skips_events_that_existed_when_it_was_created() {
-        let events = Events::<i32>::new(2);
-        events.send(1);
-
-        let mut reader = events.reader();
-
-        assert!(events.read(&mut reader).is_empty());
+    fn into_iter(self) -> Self::IntoIter {
+        self.storage.events.iter()
     }
+}
 
-    #[test]
-    fn readers_consume_events_independently() {
-        let events = Events::<String>::new(2);
-        let mut first = events.reader();
-        let mut second = events.reader();
-        events.send("a".into());
-        events.send("b".into());
+impl<'reader, 'storage, E: Event> IntoIterator for &'reader EventReader<'storage, E> {
+    type Item = &'reader E;
+    type IntoIter = std::slice::Iter<'reader, E>;
 
-        assert_eq!(events.read(&mut first), ["a", "b"]);
-        assert_eq!(events.read(&mut second), ["a", "b"]);
-        assert!(events.read(&mut first).is_empty());
-    }
-
-    #[test]
-    fn reader_can_read_an_event_during_the_next_frame() {
-        let events = Events::<i32>::new(2);
-        let mut reader = events.reader();
-        events.send(1);
-        events.finish_frame();
-
-        assert_eq!(events.read(&mut reader), [1]);
-        assert_eq!(reader.missed_events(), 0);
-    }
-
-    #[test]
-    fn reader_reports_events_that_expired() {
-        let events = Events::<i32>::new(2);
-        let mut reader = events.reader();
-        events.send(1);
-        events.finish_frame();
-        events.finish_frame();
-        events.send(2);
-
-        assert_eq!(events.read(&mut reader), [2]);
-        assert_eq!(reader.take_missed_events(), 1);
-        assert_eq!(reader.missed_events(), 0);
-    }
-
-    #[test]
-    fn expired_events_are_pruned_during_long_runs() {
-        let events = Events::<u64>::new(2);
-        let mut reader = events.reader();
-
-        for value in 0..10_000 {
-            events.send(value);
-            assert_eq!(events.read(&mut reader), [value]);
-            events.finish_frame();
-        }
-
-        assert!(events.lock().events.len() <= 2);
-        assert_eq!(reader.missed_events(), 0);
+    fn into_iter(self) -> Self::IntoIter {
+        self.storage.events.iter()
     }
 }
