@@ -1,128 +1,125 @@
-use core_plugin::{App, Plugin, World};
+use std::sync::mpsc::sync_channel;
 
-use crate::shutdown::ShutdownSystems;
-use crate::AppControl;
+use core_plugin::{App, Event, Plugin, World};
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AppRuntimePlugin;
+use crate::resource::RuntimeControl;
+use crate::{RuntimeHandle, RuntimeMode};
 
-impl Plugin for AppRuntimePlugin {
-    fn build(&self, app: &mut App) {
-        if app.world().resource::<AppControl>().is_none() {
-            app.add_resource(AppControl::new());
-        }
-        if app.world().resource::<ShutdownSystems>().is_none() {
-            app.add_resource(ShutdownSystems::new());
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimePlugin {
+    mode: RuntimeMode,
+    frame_rate: Option<u64>,
+}
+
+impl RuntimePlugin {
+    pub fn fixed(frame_rate: u64) -> Self {
+        assert!(
+            frame_rate > 0,
+            "runtime frame rate must be greater than zero"
+        );
+        Self {
+            mode: RuntimeMode::FixedFrame,
+            frame_rate: Some(frame_rate),
         }
     }
 }
 
+impl Default for RuntimePlugin {
+    fn default() -> Self {
+        Self {
+            mode: RuntimeMode::EventDriven,
+            frame_rate: None,
+        }
+    }
+}
+
+impl Plugin for RuntimePlugin {
+    fn build(self, app: &mut App) {
+        let (wake_sender, wake_receiver) = sync_channel(1);
+        let handle = RuntimeHandle::new(wake_sender);
+        let control = RuntimeControl::new(
+            self.mode,
+            self.frame_rate,
+            handle.clone(),
+            wake_receiver,
+            app.world().event_snapshot(),
+        );
+        app.world_mut().insert_resource(handle);
+        app.world_mut().insert_resource(control);
+    }
+}
+
 pub trait AppRunExt {
-    /// 持续执行同步帧；没有 wake 或 shutdown 请求时阻塞当前线程。
     fn run(&mut self);
 }
 
 impl AppRunExt for App {
     fn run(&mut self) {
-        let control = self
-            .world()
-            .resource::<AppControl>()
-            .unwrap_or_else(|| panic!("AppRuntimePlugin must be installed before App::run()"))
-            .clone();
-        while !control.is_shutdown() {
-            self.tick();
-            control.wait();
-        }
-        let systems = self
-            .world()
-            .resource::<ShutdownSystems>()
-            .expect("AppRuntimePlugin shutdown registry should be installed")
-            .clone();
-        systems.run(self.world_mut());
+        let mut runtime = self
+            .world_mut()
+            .remove_resource::<RuntimeControl>()
+            .unwrap_or_else(|| {
+                panic!("RuntimePlugin must be installed and App::run may only be called once")
+            });
+        runtime.run(self);
     }
 }
 
-pub trait AppShutdownExt {
-    fn on_shutdown(&mut self, system: impl FnMut(&mut World) + Send + 'static) -> &mut Self;
-    fn after_shutdown(&mut self, system: impl FnMut(&mut World) + Send + 'static) -> &mut Self;
+pub trait WorldEventExt {
+    fn emit_event<E: Event>(&self, event: E);
+    fn emit_event_after<E: Event>(&self, event: E, delay: u64);
 }
 
-impl AppShutdownExt for App {
-    fn on_shutdown(&mut self, system: impl FnMut(&mut World) + Send + 'static) -> &mut Self {
-        self.world_mut()
-            .resource::<ShutdownSystems>()
-            .unwrap_or_else(|| panic!("AppRuntimePlugin must be installed before shutdown systems"))
-            .add(system);
-        self
+impl WorldEventExt for World {
+    fn emit_event<E: Event>(&self, event: E) {
+        let handle = self
+            .get_resource::<RuntimeHandle>()
+            .unwrap_or_else(|| panic!("RuntimePlugin must be installed before emitting events"))
+            .clone();
+        self.event_write().send_event(event);
+        handle.wake();
     }
 
-    fn after_shutdown(&mut self, system: impl FnMut(&mut World) + Send + 'static) -> &mut Self {
-        self.world_mut()
-            .resource::<ShutdownSystems>()
-            .unwrap_or_else(|| panic!("AppRuntimePlugin must be installed before shutdown systems"))
-            .add_finalizer(system);
-        self
+    fn emit_event_after<E: Event>(&self, event: E, delay: u64) {
+        let handle = self
+            .get_resource::<RuntimeHandle>()
+            .unwrap_or_else(|| panic!("RuntimePlugin must be installed before emitting events"))
+            .clone();
+        self.event_write().send_event_after(event, delay);
+        handle.wake();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
-    use core_plugin::{Stage, World};
+    use core_plugin::Event;
 
     use super::*;
 
+    struct Notice;
+    impl Event for Notice {}
+
     #[test]
-    fn run_waits_for_wake_and_stops_on_shutdown() {
-        let mut app = App::new();
-        app.add_plugins(AppRuntimePlugin);
-        let ticks = Arc::new(AtomicUsize::new(0));
-        let system_ticks = ticks.clone();
-        app.add_systems(
-            Stage::Update,
-            [move |_world: &mut World| {
-                system_ticks.fetch_add(1, Ordering::SeqCst);
-            }],
-        );
-        let control = app.world().resource::<AppControl>().unwrap().clone();
-        let thread = std::thread::spawn(move || app.run());
-
-        wait_until(|| ticks.load(Ordering::SeqCst) == 1);
-        control.wake();
-        wait_until(|| ticks.load(Ordering::SeqCst) == 2);
-        control.shutdown();
-        thread.join().unwrap();
-
-        assert_eq!(ticks.load(Ordering::SeqCst), 2);
+    fn default_runtime_is_event_driven() {
+        let plugin = RuntimePlugin::default();
+        assert_eq!(plugin.mode, RuntimeMode::EventDriven);
+        assert_eq!(plugin.frame_rate, None);
     }
 
     #[test]
-    fn shutdown_systems_run_in_reverse_registration_order_and_isolate_panics() {
+    fn event_extensions_send_through_the_core_queue() {
         let mut app = App::new();
-        app.add_plugins(AppRuntimePlugin);
-        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        for value in 1..=5 {
-            let calls = calls.clone();
-            app.on_shutdown(move |_world| calls.lock().unwrap().push(value));
-        }
-        app.on_shutdown(|_world| panic!("shutdown failure"));
-        let final_calls = calls.clone();
-        app.after_shutdown(move |_world| final_calls.lock().unwrap().push(6));
-        app.world().resource::<AppControl>().unwrap().shutdown();
+        app.register_event::<Notice>()
+            .add_plugin(RuntimePlugin::default());
 
-        app.run();
+        app.world().emit_event(Notice);
 
-        assert_eq!(*calls.lock().unwrap(), [5, 4, 3, 2, 1, 6]);
+        assert_eq!(app.world().event_snapshot().normal_event_count, 1);
     }
 
-    fn wait_until(mut condition: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !condition() {
-            assert!(Instant::now() < deadline, "condition timed out");
-            std::thread::yield_now();
-        }
+    #[test]
+    #[should_panic(expected = "RuntimePlugin must be installed")]
+    fn event_extensions_require_the_runtime_plugin() {
+        World::new().emit_event(Notice);
     }
 }

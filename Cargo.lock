@@ -22,7 +22,6 @@ name = "app_runtime_plugin"
 version = "0.1.0"
 dependencies = [
  "core_plugin",
- "tracing",
 ]
 
 [[package]]

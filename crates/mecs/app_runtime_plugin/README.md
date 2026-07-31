@@ -1,29 +1,30 @@
-# AppRuntimePlugin
+# RuntimePlugin
 
-`AppRuntimePlugin` adds the blocking application loop without expanding the ECS core.
+`RuntimePlugin` provides the blocking application loop without expanding the ECS core.
 
 ## Public API
 
-- `AppRuntimePlugin`
-- `AppRunExt`
-- `AppControl`
-- `AppShutdownExt`
-- `AppShutdownExt::on_shutdown` / `after_shutdown`
+- `RuntimePlugin::default()` for event-driven execution
+- `RuntimePlugin::fixed(frame_rate)` for fixed-frame execution
+- `AppRunExt::run`
+- `RuntimeHandle::wake` / `open_gate` / `close_gate`
+- `WorldEventExt::emit_event` / `emit_event_after`
+- `RuntimeMode` and `RuntimeState`
 
 ## Responsibilities
 
-- Repeatedly call `App::tick()`.
-- Block while no wake request is pending.
-- Expose thread-safe wake and shutdown control.
-- Run dependency teardown in reverse registration order, then run finalizers.
+- Drive `App::tick()` in fixed-frame mode.
+- Fast-forward delayed events and drive `App::fast_forward_tick()` in event-driven mode.
+- Wait while only pending events remain or the blocker count is nonzero.
+- Expose a cloneable cross-thread wake and blocker handle.
+- Wake the runtime when events are emitted through the runtime extension API.
 
-It does not define business stages, own ECS data, or execute async tasks.
+It does not execute asynchronous tasks or complete pending events.
 
 ```rust
-use app_runtime_plugin::{AppRunExt, AppRuntimePlugin};
+use app_runtime_plugin::{AppRunExt, RuntimePlugin};
 use core_plugin::App;
 
 let mut app = App::new();
-app.add_plugins(AppRuntimePlugin);
-app.run();
+app.add_plugin(RuntimePlugin::default()).run();
 ```
