@@ -62,6 +62,11 @@ impl App {
         self.world.tick();
         self.schedules.run(&mut self.world);
     }
+
+    pub fn fast_forward_tick(&mut self) {
+        self.world.fast_forward_events();
+        self.tick();
+    }
 }
 
 impl Default for App {
@@ -156,6 +161,60 @@ mod tests {
         app.tick();
 
         assert_eq!(app.world().event_reader::<Notice>().len(), 1);
+    }
+
+    #[test]
+    fn pending_events_remain_queued_until_completed() {
+        let mut app = App::new();
+        app.register_event::<Result<u32, String>>();
+        let _handle = app.world().event_write().send_pending::<u32, String>();
+
+        app.tick();
+
+        let snapshot = app.world().event_snapshot();
+        assert_eq!(snapshot.normal_event_count, 0);
+        assert_eq!(snapshot.pending_event_count, 1);
+        assert_eq!(snapshot.nearest_normal_event_delay, None);
+        assert!(app.world().event_reader::<Result<u32, String>>().is_empty());
+    }
+
+    #[test]
+    fn pending_events_can_be_completed_from_another_thread() {
+        let mut app = App::new();
+        app.register_event::<Result<u32, String>>();
+        let handle = app.world().event_write().send_pending::<u32, String>();
+
+        std::thread::spawn(move || handle.complete(Ok(7)))
+            .join()
+            .unwrap();
+
+        let snapshot = app.world().event_snapshot();
+        assert_eq!(snapshot.normal_event_count, 1);
+        assert_eq!(snapshot.pending_event_count, 0);
+        assert_eq!(snapshot.nearest_normal_event_delay, Some(0));
+
+        app.tick();
+
+        let reader = app.world().event_reader::<Result<u32, String>>();
+        assert!(matches!(reader.into_iter().next(), Some(Ok(7))));
+        let snapshot = app.world().event_snapshot();
+        assert_eq!(snapshot.normal_event_count, 0);
+        assert_eq!(snapshot.pending_event_count, 0);
+        assert_eq!(snapshot.nearest_normal_event_delay, None);
+    }
+
+    #[test]
+    fn fast_forward_tick_delivers_a_delayed_completed_event() {
+        let mut app = App::new();
+        app.register_event::<Result<u32, String>>();
+        let handle = app.world().event_write().send_pending::<u32, String>();
+        handle.complete_after(Ok(11), 5);
+
+        app.fast_forward_tick();
+
+        let reader = app.world().event_reader::<Result<u32, String>>();
+        assert!(matches!(reader.into_iter().next(), Some(Ok(11))));
+        assert_eq!(app.world().event_snapshot().normal_event_count, 0);
     }
 
     #[test]

@@ -5,7 +5,9 @@ use crate::entity::EntityAllocator;
 use crate::events::EventReadStorageRegistry;
 use crate::query::Query;
 use crate::resource::ResourceRegistry;
-use crate::{Component, Entity, Event, EventQueue, EventReader, QueryResult, Resource};
+use crate::{
+    Component, Entity, Event, EventQueue, EventReader, EventSnapshot, QueryResult, Resource,
+};
 
 pub struct World {
     entities: EntityAllocator,
@@ -127,6 +129,20 @@ impl World {
 
     pub fn event_reader<E: Event>(&self) -> EventReader<'_, E> {
         self.event_registry.reader()
+    }
+
+    pub fn event_snapshot(&self) -> EventSnapshot {
+        self.event_queue
+            .read()
+            .expect("event queue lock poisoned")
+            .snapshot()
+    }
+
+    pub fn fast_forward_events(&self) {
+        self.event_queue
+            .write()
+            .expect("event queue lock poisoned")
+            .fast_forward();
     }
 
     pub(crate) fn tick(&mut self) {

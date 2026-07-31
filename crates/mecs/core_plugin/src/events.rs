@@ -1,12 +1,26 @@
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, VecDeque};
+use std::marker::PhantomData;
+use std::sync::{Arc, Mutex};
 
 pub trait Event: Send + Sync + 'static {}
 
-struct QueuedEvent {
-    body: Box<dyn Any + Send + Sync>,
-    remaining_delay_frames: u64,
+impl<T, E> Event for Result<T, E>
+where
+    T: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
 }
+
+enum EventState {
+    Pending,
+    Normal {
+        body: Box<dyn Any + Send + Sync>,
+        remaining_delay_frames: u64,
+    },
+}
+
+type EventNode = Arc<Mutex<EventState>>;
 
 trait ErasedEventReadStorage: Any + Send + Sync + 'static {
     fn clear(&mut self);
@@ -79,13 +93,13 @@ impl EventReadStorageRegistry {
         EventReader { storage }
     }
 
-    fn push_event(&mut self, event: QueuedEvent) {
-        let event_type = event.body.as_ref().type_id();
+    fn push_event(&mut self, body: Box<dyn Any + Send + Sync>) {
+        let event_type = body.as_ref().type_id();
         let storage = self
             .storages
             .get_mut(&event_type)
             .unwrap_or_else(|| panic!("received an event whose type is not registered"));
-        storage.push_boxed(event.body);
+        storage.push_boxed(body);
     }
 
     pub(crate) fn clear(&mut self) {
@@ -95,49 +109,183 @@ impl EventReadStorageRegistry {
     }
 }
 
+#[derive(Clone)]
+pub struct EventSnapshot {
+    pub normal_event_count: usize,
+    pub pending_event_count: usize,
+    pub nearest_normal_event_delay: Option<u64>,
+}
+
+#[must_use = "pending event handles must be completed with `complete` or `complete_after`"]
+pub struct EventHandle<E: Event> {
+    node: EventNode,
+    snapshot: Arc<Mutex<EventSnapshot>>,
+    marker: PhantomData<E>,
+}
+
+impl<T, E> EventHandle<Result<T, E>>
+where
+    T: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
+    pub fn complete(self, result: Result<T, E>) {
+        self.complete_after(result, 0);
+    }
+
+    pub fn complete_after(self, result: Result<T, E>, extra_delay_frames: u64) {
+        let mut snapshot = self.snapshot.lock().expect("event snapshot lock poisoned");
+        let mut state = self.node.lock().expect("event node lock poisoned");
+        assert!(
+            matches!(*state, EventState::Pending),
+            "only pending events can be completed"
+        );
+        *state = EventState::Normal {
+            body: Box::new(result),
+            remaining_delay_frames: extra_delay_frames,
+        };
+        snapshot.pending_event_count -= 1;
+        snapshot.normal_event_count += 1;
+        if snapshot
+            .nearest_normal_event_delay
+            .is_none_or(|nearest| extra_delay_frames < nearest)
+        {
+            snapshot.nearest_normal_event_delay = Some(extra_delay_frames);
+        }
+    }
+}
+
 pub struct EventQueue {
-    pending: VecDeque<QueuedEvent>,
+    pending: VecDeque<EventNode>,
+    snapshot: Arc<Mutex<EventSnapshot>>,
 }
 
 impl EventQueue {
     pub(crate) fn new() -> Self {
         Self {
             pending: VecDeque::new(),
+            snapshot: Arc::new(Mutex::new(EventSnapshot {
+                normal_event_count: 0,
+                pending_event_count: 0,
+                nearest_normal_event_delay: None,
+            })),
         }
     }
 
+    pub fn snapshot(&self) -> EventSnapshot {
+        self.snapshot
+            .lock()
+            .expect("event snapshot lock poisoned")
+            .clone()
+    }
+
     pub(crate) fn pull_events(&mut self, registry: &mut EventReadStorageRegistry) {
+        let mut snapshot = self.snapshot.lock().expect("event snapshot lock poisoned");
+        snapshot.nearest_normal_event_delay = None;
         let count = self.pending.len();
         for _ in 0..count {
-            if let Some(event) = self.pop_event() {
-                registry.push_event(event);
+            let node = self
+                .pending
+                .pop_front()
+                .expect("event queue length must match its bounded iteration");
+            let mut state = node.lock().expect("event node lock poisoned");
+            match &mut *state {
+                EventState::Pending => {
+                    drop(state);
+                    self.pending.push_back(node);
+                }
+                EventState::Normal {
+                    remaining_delay_frames: 0,
+                    ..
+                } => {
+                    let EventState::Normal { body, .. } =
+                        std::mem::replace(&mut *state, EventState::Pending)
+                    else {
+                        unreachable!("matched event state must remain normal");
+                    };
+                    drop(state);
+                    registry.push_event(body);
+                    snapshot.normal_event_count -= 1;
+                }
+                EventState::Normal {
+                    remaining_delay_frames,
+                    ..
+                } => {
+                    *remaining_delay_frames -= 1;
+                    if snapshot
+                        .nearest_normal_event_delay
+                        .is_none_or(|nearest| *remaining_delay_frames < nearest)
+                    {
+                        snapshot.nearest_normal_event_delay = Some(*remaining_delay_frames);
+                    }
+                    drop(state);
+                    self.pending.push_back(node);
+                }
             }
         }
     }
 
-    fn pop_event(&mut self) -> Option<QueuedEvent> {
-        let mut event = self.pending.pop_front()?;
-        if event.remaining_delay_frames == 0 {
-            return Some(event);
-        }
-        event.remaining_delay_frames -= 1;
-        self.pending.push_back(event);
-        None
-    }
-
-    fn push_event(&mut self, body: Box<dyn Any + Send + Sync>, delay_frames: u64) {
-        self.pending.push_back(QueuedEvent {
-            body,
-            remaining_delay_frames: delay_frames,
-        });
-    }
-
     pub fn send_event<E: Event>(&mut self, event: E) {
-        self.push_event(Box::new(event), 0);
+        let mut snapshot = self.snapshot.lock().expect("event snapshot lock poisoned");
+        self.pending
+            .push_back(Arc::new(Mutex::new(EventState::Normal {
+                body: Box::new(event),
+                remaining_delay_frames: 0,
+            })));
+        snapshot.normal_event_count += 1;
+        snapshot.nearest_normal_event_delay = Some(0);
     }
 
     pub fn send_event_after<E: Event>(&mut self, event: E, extra_delay_frames: u64) {
-        self.push_event(Box::new(event), extra_delay_frames);
+        let mut snapshot = self.snapshot.lock().expect("event snapshot lock poisoned");
+        self.pending
+            .push_back(Arc::new(Mutex::new(EventState::Normal {
+                body: Box::new(event),
+                remaining_delay_frames: extra_delay_frames,
+            })));
+        snapshot.normal_event_count += 1;
+        if snapshot
+            .nearest_normal_event_delay
+            .is_none_or(|nearest| extra_delay_frames < nearest)
+        {
+            snapshot.nearest_normal_event_delay = Some(extra_delay_frames);
+        }
+    }
+
+    pub fn send_pending<T, E>(&mut self) -> EventHandle<Result<T, E>>
+    where
+        T: Send + Sync + 'static,
+        E: Send + Sync + 'static,
+    {
+        let mut snapshot = self.snapshot.lock().expect("event snapshot lock poisoned");
+        let node = Arc::new(Mutex::new(EventState::Pending));
+        self.pending.push_back(Arc::clone(&node));
+        snapshot.pending_event_count += 1;
+        EventHandle {
+            node,
+            snapshot: Arc::clone(&self.snapshot),
+            marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn fast_forward(&mut self) {
+        let mut snapshot = self.snapshot.lock().expect("event snapshot lock poisoned");
+        let Some(nearest_delay) = snapshot.nearest_normal_event_delay else {
+            return;
+        };
+        if nearest_delay == 0 {
+            return;
+        }
+        for node in &self.pending {
+            let mut state = node.lock().expect("event node lock poisoned");
+            if let EventState::Normal {
+                remaining_delay_frames,
+                ..
+            } = &mut *state
+            {
+                *remaining_delay_frames -= nearest_delay;
+            }
+        }
+        snapshot.nearest_normal_event_delay = Some(0);
     }
 }
 
