@@ -14,6 +14,12 @@
     休眠
     关闭--暂时占位，触发条件以后再定义
 
+默认Schedule名称：常量
+    STARTUP: 字符串引用 = "startup"--启动时执行一次
+    PRE_UPDATE: 字符串引用 = "pre_update"--每帧第一个执行
+    UPDATE: 字符串引用 = "update"--每帧第二个执行
+    POST_UPDATE: 字符串引用 = "post_update"--每帧最后执行
+
 RuntimePlugin：结构体
     运行模式：运行模式--私有
     帧率：可选无符号整数--私有，仅固定帧模式使用
@@ -28,6 +34,7 @@ RuntimePlugin：结构体
     Plugin：公开trait实现
         签名：build(self, app: &mut App)
         行为：
+            依次注册单次Schedule STARTUP和每帧Schedule PRE_UPDATE、UPDATE、POST_UPDATE
             创建容量为1的线程通知通道--多次唤醒合并为一个待处理通知
             使用通知发送端与初始为0的阻塞计数创建RuntimeHandle
             从World获取初始事件快照
@@ -149,7 +156,8 @@ App
 ```text
 启动App：
     -> 链式调用add_plugin完成所有Plugin配置
-    -> 挂载RuntimePlugin时，World暂存RuntimeControl并保留RuntimeHandle
+    -> 挂载RuntimePlugin时，依次注册STARTUP、PRE_UPDATE、UPDATE、POST_UPDATE
+    -> World暂存RuntimeControl并保留RuntimeHandle
     -> 调用App运行拓展的run
     -> 从World移出RuntimeControl，避免同时借用World内部资源与整个App
     -> RuntimeControl独占驱动App并进入运行循环
