@@ -52,6 +52,10 @@ impl App {
         self
     }
 
+    pub fn contains_schedule(&self, name: &str) -> bool {
+        self.schedules.contains(name)
+    }
+
     pub fn add_system<S: System>(&mut self, schedule: &str, system: S) -> &mut Self {
         if self.schedules.is_started() {
             CoreError::AppAlreadyStarted.panic();
@@ -179,6 +183,17 @@ mod tests {
         app.tick();
 
         assert_eq!(app.world().event_reader::<Notice>().len(), 1);
+    }
+
+    #[test]
+    fn schedule_presence_can_be_queried_without_mutating_the_plan() {
+        let mut app = App::new();
+        app.add_once_schedule("startup".into())
+            .add_schedule("update".into());
+
+        assert!(app.contains_schedule("startup"));
+        assert!(app.contains_schedule("update"));
+        assert!(!app.contains_schedule("missing"));
     }
 
     #[test]
