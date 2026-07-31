@@ -12,7 +12,7 @@ mod world;
 pub use app::App;
 pub use component::Component;
 pub use entity::Entity;
-pub use events::{Event, EventQueue, EventReader};
+pub use events::{Event, EventHandle, EventQueue, EventReader, EventSnapshot};
 pub use plugin::Plugin;
 pub use query::QueryResult;
 pub use resource::Resource;
