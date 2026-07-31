@@ -2,6 +2,11 @@
 
 `RuntimePlugin` provides the blocking application loop without expanding the ECS core.
 
+Installing it also registers four schedules in execution order:
+
+- `STARTUP` runs once on the first tick.
+- `PRE_UPDATE`, `UPDATE`, and `POST_UPDATE` run on every tick.
+
 ## Public API
 
 - `RuntimePlugin::default()` for event-driven execution

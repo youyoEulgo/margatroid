@@ -5,6 +5,11 @@ use core_plugin::{App, Event, Plugin, World};
 use crate::resource::RuntimeControl;
 use crate::{RuntimeHandle, RuntimeMode};
 
+pub const STARTUP: &str = "startup";
+pub const PRE_UPDATE: &str = "pre_update";
+pub const UPDATE: &str = "update";
+pub const POST_UPDATE: &str = "post_update";
+
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimePlugin {
     mode: RuntimeMode,
@@ -35,6 +40,11 @@ impl Default for RuntimePlugin {
 
 impl Plugin for RuntimePlugin {
     fn build(self, app: &mut App) {
+        app.add_once_schedule(STARTUP.into())
+            .add_schedule(PRE_UPDATE.into())
+            .add_schedule(UPDATE.into())
+            .add_schedule(POST_UPDATE.into());
+
         let (wake_sender, wake_receiver) = sync_channel(1);
         let handle = RuntimeHandle::new(wake_sender);
         let control = RuntimeControl::new(
@@ -92,6 +102,8 @@ impl WorldEventExt for World {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use core_plugin::Event;
 
     use super::*;
@@ -115,6 +127,38 @@ mod tests {
         app.world().emit_event(Notice);
 
         assert_eq!(app.world().event_snapshot().normal_event_count, 1);
+    }
+
+    #[test]
+    fn runtime_installs_default_schedules_in_execution_order() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default());
+
+        for (schedule, label) in [
+            (STARTUP, "startup"),
+            (PRE_UPDATE, "pre_update"),
+            (UPDATE, "update"),
+            (POST_UPDATE, "post_update"),
+        ] {
+            let calls = Arc::clone(&calls);
+            app.add_system(schedule, move |_world: &mut World| {
+                calls.lock().unwrap().push(label);
+            });
+        }
+
+        app.tick();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["startup", "pre_update", "update", "post_update"]
+        );
+
+        calls.lock().unwrap().clear();
+        app.tick();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["pre_update", "update", "post_update"]
+        );
     }
 
     #[test]
