@@ -26,11 +26,13 @@ external_event_plugin   外部线程向 ECS 发送有界 Event
 async_runtime_plugin    Future 执行与结果回流
 signal_plugin           进程信号转 Event
 terminal_input_plugin   终端输入转 Event
-log_plugin              tracing 配置与可选日志流
+log_plugin              tracing 配置、SystemLog 与 EventLog 投影
 http_server_plugin      Axum 路由组合与服务生命周期
 ```
 
-依赖方向只能从具体 Plugin 指向 core；core 不依赖其他 Plugin，也不依赖 Tokio。
+core 不依赖任何其他 Plugin，也不依赖 Tokio。基础设施 Plugin 可以依赖已稳定的下层
+Plugin，例如 async_runtime_plugin 和 log_plugin 依赖 app_runtime_plugin 的默认
+Schedule。
 
 ## 3. core_plugin
 
@@ -185,11 +187,17 @@ Plugin 负责终端会话的 RAII 恢复。输入通过 `TerminalEvent` 统一�
 
 ## 9. log_plugin
 
-开发者继续直接使用 `tracing` 宏。LogPlugin 只安装常用 subscriber/layer 组合：console、
-rolling file 和可选 bounded stream。
+直接调用 `tracing` 宏的进程诊断称为 SystemLog。`LogPlugin` 安装 console、rolling
+file 和可选 bounded stream Layer，默认只启用 stderr Console Layer。
 
-公开面保留 `LogPlugin`、`LogOptions`、各输出 Options、`LogRecord`、`LogStream` 和
-`LogSubscription`。不使用 ECS Event 传递普通日志，不公开 tracing subscriber 的组合类型。
+`EventLog` 通过 ECS 事件队列传播，由 `LogPlugin` 注册在 `POST_UPDATE` 的 System
+投影为 `target = "mecs::event_log"` 的 tracing Event。其他 Plugin 可以独立读取同一帧
+`EventLog`，不会与日志 System 互相消费。
+
+稳定公开面为 `LogPlugin`、`LogError`、`LogLevel`、`LogFormat`、
+`ConsoleTarget`、`LogRotation`、`FileLogOptions`、`EventLog`、
+`WorldEventLogExt`、`TracingRecord`、`TracingField`、`TracingStream`、
+`TracingSubscription` 和 `TracingStreamError`。tracing Subscriber 的组合类型不公开。
 
 ## 10. http_server_plugin
 

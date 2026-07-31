@@ -2,6 +2,7 @@ use std::fmt;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use core_plugin::Resource;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::field::{Field, Visit};
@@ -11,34 +12,40 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogField {
+pub struct TracingField {
     pub name: String,
     pub value: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogRecord {
+pub struct TracingRecord {
     pub timestamp_millis: u64,
     pub level: String,
     pub target: String,
     pub message: String,
-    pub fields: Vec<LogField>,
+    pub fields: Vec<TracingField>,
     pub spans: Vec<String>,
 }
 
 #[derive(Clone)]
-pub struct LogStream {
-    sender: broadcast::Sender<LogRecord>,
+pub struct TracingStream {
+    sender: broadcast::Sender<TracingRecord>,
 }
 
-impl LogStream {
+impl TracingStream {
     pub(crate) fn new(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
         Self { sender }
     }
 
-    pub fn subscribe(&self) -> LogSubscription {
-        LogSubscription {
+    pub(crate) fn layer(&self) -> TracingStreamLayer {
+        TracingStreamLayer {
+            sender: self.sender.clone(),
+        }
+    }
+
+    pub fn subscribe(&self) -> TracingSubscription {
+        TracingSubscription {
             receiver: self.sender.subscribe(),
             dropped: 0,
         }
@@ -47,27 +54,23 @@ impl LogStream {
     pub fn receiver_count(&self) -> usize {
         self.sender.receiver_count()
     }
-
-    pub(crate) fn layer(&self) -> LogStreamLayer {
-        LogStreamLayer {
-            sender: self.sender.clone(),
-        }
-    }
 }
 
-pub struct LogSubscription {
-    receiver: broadcast::Receiver<LogRecord>,
+impl Resource for TracingStream {}
+
+pub struct TracingSubscription {
+    receiver: broadcast::Receiver<TracingRecord>,
     dropped: u64,
 }
 
-impl LogSubscription {
-    pub async fn recv(&mut self) -> Result<LogRecord, LogStreamError> {
+impl TracingSubscription {
+    pub async fn recv(&mut self) -> Result<TracingRecord, TracingStreamError> {
         match self.receiver.recv().await {
             Ok(record) => Ok(record),
-            Err(broadcast::error::RecvError::Closed) => Err(LogStreamError::Closed),
+            Err(broadcast::error::RecvError::Closed) => Err(TracingStreamError::Closed),
             Err(broadcast::error::RecvError::Lagged(count)) => {
                 self.dropped = self.dropped.saturating_add(count);
-                Err(LogStreamError::Lagged(count))
+                Err(TracingStreamError::Lagged(count))
             }
         }
     }
@@ -77,28 +80,29 @@ impl LogSubscription {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LogStreamError {
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum TracingStreamError {
     Closed,
     Lagged(u64),
 }
 
-impl fmt::Display for LogStreamError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl fmt::Display for TracingStreamError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Closed => write!(f, "log stream closed"),
-            Self::Lagged(count) => write!(f, "log stream dropped {count} records"),
+            Self::Closed => formatter.write_str("tracing stream closed"),
+            Self::Lagged(count) => write!(formatter, "tracing stream dropped {count} records"),
         }
     }
 }
 
-impl std::error::Error for LogStreamError {}
+impl std::error::Error for TracingStreamError {}
 
-pub(crate) struct LogStreamLayer {
-    sender: broadcast::Sender<LogRecord>,
+pub(crate) struct TracingStreamLayer {
+    sender: broadcast::Sender<TracingRecord>,
 }
 
-impl<S> Layer<S> for LogStreamLayer
+impl<S> Layer<S> for TracingStreamLayer
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
@@ -108,20 +112,20 @@ where
     }
 }
 
-pub(crate) struct JsonLayer<W> {
-    writer: W,
+pub(crate) struct JsonLayer<Writer> {
+    writer: Writer,
 }
 
-impl<W> JsonLayer<W> {
-    pub(crate) fn new(writer: W) -> Self {
+impl<Writer> JsonLayer<Writer> {
+    pub(crate) fn new(writer: Writer) -> Self {
         Self { writer }
     }
 }
 
-impl<S, W> Layer<S> for JsonLayer<W>
+impl<S, Writer> Layer<S> for JsonLayer<Writer>
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+    Writer: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
 {
     fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
         let record = record_from_event(event, context);
@@ -134,7 +138,7 @@ where
     }
 }
 
-fn record_from_event<S>(event: &Event<'_>, context: Context<'_, S>) -> LogRecord
+fn record_from_event<S>(event: &Event<'_>, context: Context<'_, S>) -> TracingRecord
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
@@ -156,7 +160,7 @@ where
                 .collect()
         })
         .unwrap_or_default();
-    LogRecord {
+    TracingRecord {
         timestamp_millis: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -173,12 +177,12 @@ where
 
 #[derive(Default)]
 struct FieldVisitor {
-    fields: Vec<LogField>,
+    fields: Vec<TracingField>,
 }
 
 impl Visit for FieldVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.fields.push(LogField {
+        self.fields.push(TracingField {
             name: field.name().to_string(),
             value: format!("{value:?}"),
         });
@@ -193,7 +197,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_captures_structured_event() {
-        let stream = LogStream::new(8);
+        let stream = TracingStream::new(8);
         let mut subscription = stream.subscribe();
         let subscriber = tracing_subscriber::registry().with(stream.layer());
 
@@ -212,17 +216,19 @@ mod tests {
 
     #[tokio::test]
     async fn subscription_reports_lag() {
-        let stream = LogStream::new(1);
+        let stream = TracingStream::new(1);
         let mut subscription = stream.subscribe();
-        let layer = stream.layer();
-        let subscriber = tracing_subscriber::registry().with(layer);
+        let subscriber = tracing_subscriber::registry().with(stream.layer());
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(sequence = 1, "first");
             tracing::info!(sequence = 2, "second");
         });
 
-        assert_eq!(subscription.recv().await, Err(LogStreamError::Lagged(1)));
+        assert!(matches!(
+            subscription.recv().await,
+            Err(TracingStreamError::Lagged(1))
+        ));
         assert_eq!(subscription.dropped_count(), 1);
         assert_eq!(subscription.recv().await.unwrap().message, "second");
     }

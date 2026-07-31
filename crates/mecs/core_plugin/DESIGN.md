@@ -729,8 +729,8 @@ crate公开：
             将是否单次执行设为真，以首帧执行长度作为Schedule下标，推入首帧计划
             创建Schedule，与阶段名封装成元组，推入首帧执行
             返回真
-    阶段名查重：私有方法
-        签名：check(阶段名：字符串引用) -> 布尔值
+    查询Schedule：crate公开方法
+        签名：contains(阶段名：字符串引用) -> 布尔值
         行为：遍历首帧执行和每帧执行，存在同名阶段时返回真，否则返回假
     检查启动状态：crate公开方法
         签名：is_started() -> 布尔值
@@ -844,6 +844,9 @@ App：结构体--持有World和计划表的ECS组合根
             如果计划表已经启动，终止并报告CoreError::AppAlreadyStarted
             如果阶段重名，终止并报告CoreError::ScheduleAlreadyExists
             返回App可变引用
+    查询Schedule：公开方法
+        签名：contains_schedule(阶段名：字符串引用) -> 布尔值
+        行为：调用计划表::contains并返回结果
     添加System：公开泛型方法
         签名：add_system<System类型:System>(阶段名：字符串引用, system：System类型) -> &mut Self
         行为：

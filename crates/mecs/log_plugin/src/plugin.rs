@@ -1,6 +1,7 @@
 use std::sync::{Mutex, OnceLock};
 
-use core_plugin::{App, Plugin};
+use app_runtime_plugin::POST_UPDATE;
+use core_plugin::{App, CoreError, Plugin, Resource};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::filter::EnvFilter;
@@ -8,182 +9,237 @@ use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::registry::Registry;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::options::{
-    ConsoleOptions, ConsoleTarget, FileLogOptions, LogFormat, LogLevel, LogOptions, LogRotation,
-    LogStreamOptions,
-};
-use crate::stream::{JsonLayer, LogStream};
+use crate::event::event_log_system;
+use crate::stream::{JsonLayer, TracingStream};
+use crate::{ConsoleTarget, EventLog, FileLogOptions, LogError, LogFormat, LogLevel, LogRotation};
 
 type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
 
-static WORKER_GUARDS: OnceLock<Mutex<Vec<WorkerGuard>>> = OnceLock::new();
-static MANAGED_STREAM: OnceLock<LogStream> = OnceLock::new();
-static MANAGED_OPTIONS: OnceLock<LogOptions> = OnceLock::new();
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
+static INSTALLED_TRACING: OnceLock<InstalledTracing> = OnceLock::new();
 
-#[derive(Clone, Debug, Default)]
+struct InstalledTracing {
+    configuration: TracingConfiguration,
+    stream: Option<TracingStream>,
+    _worker_guards: Vec<WorkerGuard>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TracingConfiguration {
+    level: LogLevel,
+    filter: Option<String>,
+    format: LogFormat,
+    console: Option<ConsoleTarget>,
+    file: Option<FileLogOptions>,
+    stream_capacity: Option<usize>,
+}
+
+struct LogPluginInstalled;
+impl Resource for LogPluginInstalled {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogPlugin {
-    options: LogOptions,
+    level: LogLevel,
+    filter: Option<String>,
+    format: LogFormat,
+    console: Option<ConsoleTarget>,
+    file: Option<FileLogOptions>,
+    stream_capacity: Option<usize>,
+    schedule: String,
 }
 
 impl LogPlugin {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_options(options: LogOptions) -> Self {
-        Self { options }
-    }
-
     pub fn with_level(mut self, level: LogLevel) -> Self {
-        self.options.level = level;
+        self.level = level;
         self
     }
 
-    pub fn with_filter(mut self, filter: impl Into<String>) -> Self {
-        self.options.filter = Some(filter.into());
+    pub fn with_filter<Filter>(mut self, filter: Filter) -> Self
+    where
+        Filter: Into<String>,
+    {
+        self.filter = Some(filter.into());
         self
     }
 
     pub fn with_format(mut self, format: LogFormat) -> Self {
-        self.options.format = format;
+        self.format = format;
         self
     }
 
-    pub fn with_console(mut self, options: ConsoleOptions) -> Self {
-        self.options.console = Some(options);
+    pub fn with_console(mut self, target: ConsoleTarget) -> Self {
+        self.console = Some(target);
         self
     }
 
     pub fn without_console(mut self) -> Self {
-        self.options.console = None;
+        self.console = None;
         self
     }
 
     pub fn with_file(mut self, options: FileLogOptions) -> Self {
-        self.options.file = Some(options);
+        self.file = Some(options);
         self
     }
 
-    pub fn with_stream(mut self, options: LogStreamOptions) -> Self {
-        self.options.stream = Some(options);
+    pub fn with_stream(mut self, capacity: usize) -> Self {
+        if capacity == 0 {
+            LogError::InvalidStreamCapacity { capacity }.panic();
+        }
+        self.stream_capacity = Some(capacity);
         self
+    }
+
+    pub fn in_schedule<ScheduleName>(mut self, schedule: ScheduleName) -> Self
+    where
+        ScheduleName: Into<String>,
+    {
+        self.schedule = schedule.into();
+        self
+    }
+}
+
+impl Default for LogPlugin {
+    fn default() -> Self {
+        Self {
+            level: LogLevel::Info,
+            filter: None,
+            format: LogFormat::Compact,
+            console: Some(ConsoleTarget::Stderr),
+            file: None,
+            stream_capacity: None,
+            schedule: POST_UPDATE.into(),
+        }
     }
 }
 
 impl Plugin for LogPlugin {
-    fn build(&self, app: &mut App) {
-        let _install_guard = INSTALL_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut layers = Vec::<BoxedLayer>::new();
-        if let Some(console) = &self.options.console {
-            layers.push(console_layer(console, self.options.format, &self.options));
+    fn build(self, app: &mut App) {
+        if app.world().contains_resource::<LogPluginInstalled>() {
+            LogError::LogPluginAlreadyInstalled.panic();
         }
-
-        let mut worker_guard = None;
-        if let Some(file) = &self.options.file {
-            match file_layer(file, self.options.format, &self.options) {
-                Ok((layer, guard)) => {
-                    layers.push(layer);
-                    worker_guard = guard;
-                }
-                Err(error) => {
-                    eprintln!("log_plugin: failed to configure file output: {error}");
-                    return;
-                }
+        assert!(
+            app.contains_schedule(&self.schedule),
+            "{}",
+            CoreError::ScheduleNotFound {
+                name: self.schedule.clone()
             }
-        }
+        );
+        let _ = build_filter(&self);
 
-        let stream = self
-            .options
-            .stream
-            .as_ref()
-            .map(|options| LogStream::new(options.capacity()));
-        if let Some(stream) = &stream {
-            layers.push(
-                stream
-                    .layer()
-                    .with_filter(build_filter(&self.options))
-                    .boxed(),
-            );
-        }
-
-        if let Err(error) = tracing_subscriber::registry().with(layers).try_init() {
-            if let Some(installed) = MANAGED_OPTIONS.get() {
-                if installed != &self.options {
-                    eprintln!(
-                        "log_plugin: requested options differ from the process-level options; \
-                         the first installation remains active"
-                    );
-                }
-                if self.options.stream.is_some() {
-                    if let Some(stream) = MANAGED_STREAM.get() {
-                        app.add_resource(stream.clone());
-                    }
-                }
-            }
-            eprintln!("log_plugin: global tracing subscriber already exists: {error}");
-            return;
-        }
-
-        let _ = MANAGED_OPTIONS.set(self.options.clone());
-        if let Some(guard) = worker_guard {
-            WORKER_GUARDS
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(guard);
-        }
-        if let Some(stream) = stream {
-            let _ = MANAGED_STREAM.set(stream.clone());
-            app.add_resource(stream);
-        }
+        install_tracing(&self, app);
+        app.register_event::<EventLog>()
+            .add_system(&self.schedule, event_log_system);
+        app.world_mut().insert_resource(LogPluginInstalled);
     }
 }
 
-fn build_filter(options: &LogOptions) -> EnvFilter {
-    let value = options
+fn install_tracing(plugin: &LogPlugin, app: &mut App) {
+    let configuration = TracingConfiguration {
+        level: plugin.level,
+        filter: plugin.filter.clone(),
+        format: plugin.format,
+        console: plugin.console,
+        file: plugin.file.clone(),
+        stream_capacity: plugin.stream_capacity,
+    };
+    let _install_guard = INSTALL_LOCK
+        .lock()
+        .expect("tracing installation lock poisoned");
+
+    if let Some(installed) = INSTALLED_TRACING.get() {
+        if installed.configuration != configuration {
+            LogError::ConflictingConfiguration.panic();
+        }
+        if let Some(stream) = &installed.stream {
+            app.world_mut().insert_resource(stream.clone());
+        }
+        return;
+    }
+
+    let mut layers = Vec::<BoxedLayer>::new();
+    if let Some(target) = plugin.console {
+        layers.push(console_layer(target, plugin.format, plugin));
+    }
+
+    let mut worker_guards = Vec::new();
+    if let Some(options) = &plugin.file {
+        let (layer, worker_guard) = file_layer(options, plugin.format, plugin);
+        layers.push(layer);
+        if let Some(worker_guard) = worker_guard {
+            worker_guards.push(worker_guard);
+        }
+    }
+
+    let stream = plugin.stream_capacity.map(TracingStream::new);
+    if let Some(stream) = &stream {
+        layers.push(stream.layer().with_filter(build_filter(plugin)).boxed());
+    }
+
+    if tracing_subscriber::registry()
+        .with(layers)
+        .try_init()
+        .is_err()
+    {
+        LogError::SubscriberAlreadyInstalled.panic();
+    }
+
+    if let Some(stream) = &stream {
+        app.world_mut().insert_resource(stream.clone());
+    }
+    if INSTALLED_TRACING
+        .set(InstalledTracing {
+            configuration,
+            stream,
+            _worker_guards: worker_guards,
+        })
+        .is_err()
+    {
+        panic!("installed tracing state must be empty while holding the installation lock");
+    }
+}
+
+fn build_filter(plugin: &LogPlugin) -> EnvFilter {
+    let filter = plugin
         .filter
         .as_deref()
-        .unwrap_or_else(|| options.level.directive());
-    EnvFilter::try_new(value).unwrap_or_else(|error| {
-        eprintln!("log_plugin: invalid filter `{value}`: {error}; using info");
-        EnvFilter::new("info")
+        .unwrap_or_else(|| plugin.level.directive());
+    EnvFilter::try_new(filter).unwrap_or_else(|source| {
+        LogError::InvalidFilter {
+            filter: filter.into(),
+            source: Box::new(source),
+        }
+        .panic()
     })
 }
 
-fn console_layer(
-    options: &ConsoleOptions,
-    format: LogFormat,
-    log_options: &LogOptions,
-) -> BoxedLayer {
-    match (format, options.target()) {
+fn console_layer(target: ConsoleTarget, format: LogFormat, plugin: &LogPlugin) -> BoxedLayer {
+    match (format, target) {
         (LogFormat::Compact, ConsoleTarget::Stdout) => tracing_subscriber::fmt::layer()
             .compact()
             .with_writer(std::io::stdout)
-            .with_filter(build_filter(log_options))
+            .with_filter(build_filter(plugin))
             .boxed(),
         (LogFormat::Compact, ConsoleTarget::Stderr) => tracing_subscriber::fmt::layer()
             .compact()
             .with_writer(std::io::stderr)
-            .with_filter(build_filter(log_options))
+            .with_filter(build_filter(plugin))
             .boxed(),
         (LogFormat::Pretty, ConsoleTarget::Stdout) => tracing_subscriber::fmt::layer()
             .pretty()
             .with_writer(std::io::stdout)
-            .with_filter(build_filter(log_options))
+            .with_filter(build_filter(plugin))
             .boxed(),
         (LogFormat::Pretty, ConsoleTarget::Stderr) => tracing_subscriber::fmt::layer()
             .pretty()
             .with_writer(std::io::stderr)
-            .with_filter(build_filter(log_options))
+            .with_filter(build_filter(plugin))
             .boxed(),
         (LogFormat::Json, ConsoleTarget::Stdout) => JsonLayer::new(std::io::stdout)
-            .with_filter(build_filter(log_options))
+            .with_filter(build_filter(plugin))
             .boxed(),
         (LogFormat::Json, ConsoleTarget::Stderr) => JsonLayer::new(std::io::stderr)
-            .with_filter(build_filter(log_options))
+            .with_filter(build_filter(plugin))
             .boxed(),
     }
 }
@@ -191,9 +247,9 @@ fn console_layer(
 fn file_layer(
     options: &FileLogOptions,
     format: LogFormat,
-    log_options: &LogOptions,
-) -> Result<(BoxedLayer, Option<WorkerGuard>), tracing_appender::rolling::InitError> {
-    let rotation = match options.rotation() {
+    plugin: &LogPlugin,
+) -> (BoxedLayer, Option<WorkerGuard>) {
+    let rotation = match options.rotation {
         LogRotation::Minutely => Rotation::MINUTELY,
         LogRotation::Hourly => Rotation::HOURLY,
         LogRotation::Daily => Rotation::DAILY,
@@ -201,39 +257,45 @@ fn file_layer(
     };
     let mut builder = RollingFileAppender::builder()
         .rotation(rotation)
-        .filename_prefix(options.file_name_prefix());
-    if let Some(max_files) = options.max_files() {
+        .filename_prefix(&options.file_name_prefix);
+    if let Some(max_files) = options.max_files {
         builder = builder.max_log_files(max_files);
     }
-    let appender = builder.build(options.directory())?;
+    let appender = builder.build(&options.directory).unwrap_or_else(|source| {
+        LogError::FileOutputInitFailed {
+            directory: options.directory.clone(),
+            source: Box::new(source),
+        }
+        .panic()
+    });
 
-    if options.is_non_blocking() {
+    if options.non_blocking {
         let (writer, guard) = tracing_appender::non_blocking(appender);
-        Ok((format_file_layer(format, writer, log_options), Some(guard)))
+        (format_file_layer(format, writer, plugin), Some(guard))
     } else {
-        Ok((format_file_layer(format, appender, log_options), None))
+        (format_file_layer(format, appender, plugin), None)
     }
 }
 
-fn format_file_layer<W>(format: LogFormat, writer: W, options: &LogOptions) -> BoxedLayer
+fn format_file_layer<Writer>(format: LogFormat, writer: Writer, plugin: &LogPlugin) -> BoxedLayer
 where
-    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+    Writer: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
 {
     match format {
         LogFormat::Compact => tracing_subscriber::fmt::layer()
             .compact()
-            .with_writer(writer)
             .with_ansi(false)
-            .with_filter(build_filter(options))
+            .with_writer(writer)
+            .with_filter(build_filter(plugin))
             .boxed(),
         LogFormat::Pretty => tracing_subscriber::fmt::layer()
             .pretty()
-            .with_writer(writer)
             .with_ansi(false)
-            .with_filter(build_filter(options))
+            .with_writer(writer)
+            .with_filter(build_filter(plugin))
             .boxed(),
         LogFormat::Json => JsonLayer::new(writer)
-            .with_filter(build_filter(options))
+            .with_filter(build_filter(plugin))
             .boxed(),
     }
 }
@@ -247,17 +309,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_console_info_compact() {
+    fn default_configuration_matches_the_documented_surface() {
         let plugin = LogPlugin::default();
-        assert_eq!(plugin.options.level, LogLevel::Info);
-        assert_eq!(plugin.options.format, LogFormat::Compact);
-        assert!(plugin.options.console.is_some());
-        assert!(plugin.options.file.is_none());
-        assert!(plugin.options.stream.is_none());
+
+        assert_eq!(plugin.level, LogLevel::Info);
+        assert_eq!(plugin.format, LogFormat::Compact);
+        assert_eq!(plugin.console, Some(ConsoleTarget::Stderr));
+        assert_eq!(plugin.file, None);
+        assert_eq!(plugin.stream_capacity, None);
+        assert_eq!(plugin.schedule, POST_UPDATE);
     }
 
     #[test]
-    fn writes_structured_json_to_rolling_file() {
+    #[should_panic(expected = "tracing stream capacity must be greater than zero")]
+    fn zero_stream_capacity_is_rejected() {
+        let _ = LogPlugin::default().with_stream(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid tracing filter")]
+    fn invalid_filter_is_rejected() {
+        let _ = build_filter(&LogPlugin::default().with_filter("["));
+    }
+
+    #[test]
+    fn structured_json_is_written_to_a_rolling_file() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -266,11 +342,11 @@ mod tests {
         let file = FileLogOptions::daily(&directory, "test")
             .with_rotation(LogRotation::Never)
             .blocking();
-        let options = LogOptions::default()
+        let plugin = LogPlugin::default()
             .without_console()
             .with_format(LogFormat::Json)
             .with_file(file.clone());
-        let (layer, guard) = file_layer(&file, LogFormat::Json, &options).unwrap();
+        let (layer, guard) = file_layer(&file, LogFormat::Json, &plugin);
         let subscriber = tracing_subscriber::registry().with(vec![layer]);
 
         tracing::subscriber::with_default(subscriber, || {
