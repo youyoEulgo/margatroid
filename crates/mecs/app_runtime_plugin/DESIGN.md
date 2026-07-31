@@ -14,6 +14,25 @@
     休眠
     关闭--暂时占位，触发条件以后再定义
 
+RuntimeError：枚举--描述Runtime公开API能够识别的配置错误与运行错误
+    NonExhaustive：公开属性--允许后续版本增加错误变体
+    InvalidFrameRate { frame_rate: 无符号整数 }
+    RuntimePluginMissing
+    RuntimePluginAlreadyInstalled
+    RuntimeAlreadyRunning
+    WakeChannelDisconnected
+    GateOperationUnbalanced
+    终止：crate公开方法
+        签名：panic(self) -> Never
+        行为：使用自身Display描述触发panic
+    Debug：公开trait实现
+        签名：Debug for RuntimeError
+    Display：公开trait实现
+        签名：Display for RuntimeError
+        行为：输出包含错误类型与上下文的稳定错误描述
+    Error：公开trait实现
+        签名：Error for RuntimeError
+
 默认Schedule名称：常量
     STARTUP: 字符串引用 = "startup"--启动时执行一次
     PRE_UPDATE: 字符串引用 = "pre_update"--每帧第一个执行
@@ -29,11 +48,12 @@ RuntimePlugin：结构体
     固定帧：公开方法
         签名：fixed(frame_rate: 无符号整数) -> Self
         行为：
-            如果frame_rate为0，终止并报告帧率必须大于0
+            如果frame_rate为0，终止并报告RuntimeError::InvalidFrameRate
             使用用户指定的帧率构造固定帧模式的RuntimePlugin
     Plugin：公开trait实现
         签名：build(self, app: &mut App)
         行为：
+            如果RuntimeHandle或RuntimeControl已经存在，终止并报告RuntimeError::RuntimePluginAlreadyInstalled
             依次注册单次Schedule STARTUP和每帧Schedule PRE_UPDATE、UPDATE、POST_UPDATE
             创建容量为1的线程通知通道--多次唤醒合并为一个待处理通知
             使用通知发送端与初始为0的阻塞计数创建RuntimeHandle
@@ -51,12 +71,12 @@ RuntimeHandle：结构体--可以克隆并交给其他Plugin、System或异步�
         行为：
             尝试向通知通道非阻塞发送一次唤醒通知
             如果通道已有通知，直接返回
-            如果通知通道断开，终止并报告错误
+            如果通知通道断开，终止并报告RuntimeError::WakeChannelDisconnected
     开阀：公开方法
         签名：open_gate(&self)
         行为：
             原子地检查阻塞计数并在非0时减1
-            如果检查时阻塞计数为0，终止并报告开关阀调用不匹配
+            如果检查时阻塞计数为0，终止并报告RuntimeError::GateOperationUnbalanced
             如果阻塞计数变为0，调用wake
     关阀：公开方法
         签名：close_gate(&self)
@@ -67,7 +87,8 @@ App运行拓展：trait--由RuntimePlugin为App提供
         签名：run(&mut self)
         行为：
             从World移出RuntimeControl并取得所有权
-            如果RuntimeControl不存在，终止并报告RuntimePlugin未挂载或App已经开始运行
+            如果RuntimeControl不存在且RuntimeHandle不存在，终止并报告RuntimeError::RuntimePluginMissing
+            如果RuntimeControl不存在且RuntimeHandle存在，终止并报告RuntimeError::RuntimeAlreadyRunning
             调用RuntimeControl::run并传入App可变引用
 
 World事件拓展：trait--由RuntimePlugin为World提供，不替换core原有事件方法
@@ -75,16 +96,23 @@ World事件拓展：trait--由RuntimePlugin为World提供，不替换core原有�
         签名：emit_event<事件类型:Event>(&self, event: 事件类型)
         行为：
             获取RuntimeHandle
-            如果RuntimeHandle不存在，终止并报告RuntimePlugin未挂载
+            如果RuntimeHandle不存在，终止并报告RuntimeError::RuntimePluginMissing
             调用core事件队列的send_event
             调用RuntimeHandle::wake
     延迟发送事件：公开泛型方法
         签名：emit_event_after<事件类型:Event>(&self, event: 事件类型, delay: 无符号整数)
         行为：
             获取RuntimeHandle
-            如果RuntimeHandle不存在，终止并报告RuntimePlugin未挂载
+            如果RuntimeHandle不存在，终止并报告RuntimeError::RuntimePluginMissing
             调用core事件队列的send_event_after
             调用RuntimeHandle::wake
+```
+
+错误边界：
+```text
+Runtime的配置错误与可识别运行错误使用RuntimeError统一描述
+保持链式调用和运行控制方法遇到RuntimeError时终止并报告对应错误
+锁中毒、原子计数溢出和Runtime内部状态不一致属于不变量破坏，直接panic且不进入RuntimeError
 ```
 
 私有：

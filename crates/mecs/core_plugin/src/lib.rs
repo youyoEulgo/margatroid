@@ -1,6 +1,7 @@
 mod app;
 mod component;
 mod entity;
+mod error;
 mod events;
 mod plugin;
 mod query;
@@ -12,6 +13,7 @@ mod world;
 pub use app::App;
 pub use component::Component;
 pub use entity::Entity;
+pub use error::CoreError;
 pub use events::{Event, EventHandle, EventQueue, EventReader, EventSnapshot};
 pub use plugin::Plugin;
 pub use query::QueryResult;

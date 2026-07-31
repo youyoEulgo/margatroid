@@ -1,3 +1,5 @@
+use crate::CoreError;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Entity(u64);
 
@@ -40,7 +42,8 @@ impl EntityAllocator {
             self.slots[index as usize].alive = true;
             index
         } else {
-            let index = u32::try_from(self.slots.len()).expect("entity capacity exhausted");
+            let index = u32::try_from(self.slots.len())
+                .unwrap_or_else(|_| CoreError::EntityCapacityExhausted.panic());
             self.slots.push(EntitySlot {
                 generation: 0,
                 alive: true,

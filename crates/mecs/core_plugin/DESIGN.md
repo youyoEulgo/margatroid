@@ -22,6 +22,38 @@
 边界：对外使用泛型和具体类型，内部使用类型擦除
 ```
 
+# Error
+## 类型
+公开：
+```text
+CoreError：枚举--描述core公开API能够识别的配置错误与状态错误
+    NonExhaustive：公开属性--允许后续版本增加错误变体
+    AppAlreadyStarted
+    ScheduleAlreadyExists { name: 字符串 }
+    ScheduleNotFound { name: 字符串 }
+    EventNotRegistered { type_name: 静态字符串引用 }
+    EntityCapacityExhausted
+    PendingEventAlreadyCompleted
+    终止：crate公开方法
+        签名：panic(self) -> Never
+        行为：使用自身Display描述触发panic
+    Debug：公开trait实现
+        签名：Debug for CoreError
+    Display：公开trait实现
+        签名：Display for CoreError
+        行为：输出包含错误类型与上下文的稳定错误描述
+    Error：公开trait实现
+        签名：Error for CoreError
+```
+
+## 逻辑
+```text
+错误边界：
+    可由调用者输入或当前公开状态判断的错误，使用CoreError统一描述
+    保持链式调用的配置方法遇到CoreError时终止并报告对应错误
+    锁中毒、类型擦除不一致和内部计数不一致属于core不变量破坏，直接panic且不进入CoreError
+```
+
 # Component
 ## 类型
 私有：
@@ -178,7 +210,7 @@ crate公开：
         行为：
             如果空闲索引非空，弹出索引并将对应槽位标记为存活
             否则，使用槽位数量作为新索引
-                如果新索引无法表示为32位无符号整数，终止并报告Entity容量耗尽
+                如果新索引无法表示为32位无符号整数，终止并报告CoreError::EntityCapacityExhausted
                 追加代数为0且存活的槽位
             存活数量加1
             返回使用该索引和槽位当前代数构造的Entity
@@ -244,6 +276,7 @@ crate公开：
     pending
     正常：
         事件体：类型擦除<事件类型:事件特征>
+        事件类型名：静态字符串引用--类型擦除后仍保留错误诊断所需的具体类型名
         剩余延迟帧：64位无符号整数--事件在执行前还需等待多少次tick
 
 事件节点：类型别名<共享引用<互斥锁<事件状态>>>--事件队列与异步任务可以安全持有并修改同一事件
@@ -288,12 +321,14 @@ crate公开
         签名：reader<事件类型:事件特征>() -> 事件读取器<'_, 事件类型>
         行为：
             获取对应类型的事件读取存储
+            如果类型未注册，终止并报告CoreError::EventNotRegistered
             返回持有该存储只读引用的事件读取器
     装填事件：私有方法
-        签名：push_event(事件体：类型擦除<事件类型:事件特征>)
+        签名：push_event(事件体：类型擦除<事件类型:事件特征>, 事件类型名：静态字符串引用)
         行为：
             获取事件体的具体类型
             获取对应类型的事件读取存储
+            如果类型未注册，终止并报告CoreError::EventNotRegistered
             调用擦除事件读取存储::push_boxed转移事件体所有权
     清空：crate公开方法
         签名：clear()
@@ -332,6 +367,7 @@ Result<T, E>：Event trait实现
         行为：
             锁定事件快照，锁中毒时终止并报告错误
             锁定事件节点，锁中毒时终止并报告错误
+            如果事件状态不是pending，终止并报告CoreError::PendingEventAlreadyCompleted
             将事件状态从pending替换为正常
                 事件体：使用result填充
                 剩余延迟帧：额外延迟帧
@@ -788,7 +824,7 @@ App：结构体--持有World和计划表的ECS组合根
     添加Plugin：公开泛型方法
         签名：add_plugin<Plugin类型:Plugin>(plugin：Plugin类型) -> &mut Self
         行为：
-            如果计划表::is_started返回真，终止并报告App已经启动
+            如果计划表::is_started返回真，终止并报告CoreError::AppAlreadyStarted
             调用Plugin::build转移Plugin所有权并传入App可变引用
             Plugin配置完成后返回App可变引用
 
@@ -798,26 +834,29 @@ App：结构体--持有World和计划表的ECS组合根
         签名：add_schedule(阶段名：字符串) -> &mut Self
         行为：
             调用计划表::add_schedule
-            如果返回假，终止并报告阶段重名或App已经启动
+            如果计划表已经启动，终止并报告CoreError::AppAlreadyStarted
+            如果阶段重名，终止并报告CoreError::ScheduleAlreadyExists
             返回App可变引用
     添加单次阶段：公开方法
         签名：add_once_schedule(阶段名：字符串) -> &mut Self
         行为：
             调用计划表::add_once_schedule
-            如果返回假，终止并报告阶段重名或App已经启动
+            如果计划表已经启动，终止并报告CoreError::AppAlreadyStarted
+            如果阶段重名，终止并报告CoreError::ScheduleAlreadyExists
             返回App可变引用
     添加System：公开泛型方法
         签名：add_system<System类型:System>(阶段名：字符串引用, system：System类型) -> &mut Self
         行为：
             调用计划表::schedule_mut查找阶段
-            如果返回空，终止并报告阶段不存在或App已经启动
+            如果计划表已经启动，终止并报告CoreError::AppAlreadyStarted
+            如果阶段不存在，终止并报告CoreError::ScheduleNotFound
             调用Schedule::add_system转移System所有权
             返回App可变引用
 
     注册事件：公开方法--挂载plugin时执行
         签名：register_event<事件类型:event::事件特征>() -> &mut Self
         行为：
-            如果计划表::is_started返回真，终止并报告App已经启动
+            如果计划表::is_started返回真，终止并报告CoreError::AppAlreadyStarted
             通过World可变引用调用World::event_registry_mut，并注册事件读取存储
             返回App可变引用
     执行一次更新：公开方法
@@ -868,7 +907,7 @@ Plugin：trait--在App启动前完成一组功能配置的一次性对象
 ```text
 挂载Plugin：
     App::add_plugin取得Plugin所有权
-    如果App已经启动，终止并报告错误
+    如果App已经启动，终止并报告CoreError::AppAlreadyStarted
     调用Plugin::build并传入App可变引用
     Plugin通过App公开API注册Schedule、System、Event以及World数据
     build返回后销毁Plugin，App不保存Plugin

@@ -1,73 +1,70 @@
-use std::time::Duration;
+use std::any::TypeId;
+use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+use std::thread::JoinHandle;
 
-use crate::runtime::AsyncRuntimeState;
-use crate::runtime::AsyncSpawner;
-use crate::AsyncTaskId;
+use core_plugin::Resource;
+use tokio::sync::mpsc::UnboundedSender;
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+use crate::{AsyncRequest, AsyncRuntimeError};
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct AsyncRuntimeOptions {
-    pub(crate) queue_capacity: usize,
-    pub(crate) max_in_flight: usize,
+pub(crate) type ErasedExecutionTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+pub(crate) struct AsyncExecutorHandle {
+    sender: Option<UnboundedSender<ErasedExecutionTask>>,
+    thread: Option<JoinHandle<()>>,
 }
 
-impl Default for AsyncRuntimeOptions {
-    fn default() -> Self {
+impl AsyncExecutorHandle {
+    pub(crate) fn new(
+        sender: UnboundedSender<ErasedExecutionTask>,
+        thread: JoinHandle<()>,
+    ) -> Self {
         Self {
-            queue_capacity: 1024,
-            max_in_flight: 256,
+            sender: Some(sender),
+            thread: Some(thread),
+        }
+    }
+
+    pub(crate) fn spawn(&self, task: ErasedExecutionTask) {
+        self.sender
+            .as_ref()
+            .expect("async executor sender must exist before drop")
+            .send(task)
+            .unwrap_or_else(|_| AsyncRuntimeError::ExecutorDisconnected.panic());
+    }
+}
+
+impl Drop for AsyncExecutorHandle {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("async executor thread panicked");
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct AsyncSystemOptions {
-    pub(crate) timeout: Option<Duration>,
+impl Resource for AsyncExecutorHandle {}
+
+pub(crate) struct AsyncRequestRegistry {
+    registered: HashSet<TypeId>,
 }
 
-impl Default for AsyncSystemOptions {
-    fn default() -> Self {
+impl AsyncRequestRegistry {
+    pub(crate) fn new() -> Self {
         Self {
-            timeout: Some(DEFAULT_TIMEOUT),
-        }
-    }
-}
-
-impl AsyncSystemOptions {
-    pub fn with_timeout(timeout: Duration) -> Self {
-        Self {
-            timeout: Some(timeout),
+            registered: HashSet::new(),
         }
     }
 
-    pub fn without_timeout() -> Self {
-        Self { timeout: None }
+    pub(crate) fn register<T, E>(&mut self) -> bool
+    where
+        T: Send + Sync + 'static,
+        E: From<crate::AsyncTaskError> + Send + Sync + 'static,
+    {
+        self.registered.insert(TypeId::of::<AsyncRequest<T, E>>())
     }
 }
 
-#[derive(Clone)]
-pub struct AsyncTasks {
-    pub(crate) spawner: AsyncSpawner,
-}
-
-#[derive(Clone)]
-pub struct AsyncRuntimeStatus {
-    pub(crate) state: std::sync::Arc<AsyncRuntimeState>,
-}
-
-impl AsyncRuntimeStatus {
-    pub fn is_running(&self) -> bool {
-        self.state.is_running()
-    }
-
-    pub(crate) fn shutdown(&self) {
-        self.state.shutdown();
-    }
-}
-
-impl AsyncTasks {
-    pub fn cancel(&self, id: AsyncTaskId) -> bool {
-        self.spawner.cancel(id)
-    }
-}
+impl Resource for AsyncRequestRegistry {}
