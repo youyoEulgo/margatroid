@@ -51,3 +51,14 @@ fn schedule_is_independently_usable() {
 
     assert_eq!(world.get_resource::<Settings>().unwrap().0, 7);
 }
+
+#[test]
+fn app_exposes_read_only_schedule_queries() {
+    let mut app = App::new();
+    app.add_once_schedule("startup".into())
+        .add_schedule("update".into());
+
+    assert!(app.contains_schedule("startup"));
+    assert!(app.contains_schedule("update"));
+    assert!(!app.contains_schedule("missing"));
+}

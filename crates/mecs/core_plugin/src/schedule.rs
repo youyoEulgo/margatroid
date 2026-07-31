@@ -68,7 +68,7 @@ impl SchedulePlan {
         true
     }
 
-    fn contains(&self, name: &str) -> bool {
+    pub(crate) fn contains(&self, name: &str) -> bool {
         self.once.iter().any(|(current, _)| current == name)
             || self.recurring.iter().any(|(current, _)| current == name)
     }
