@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use core_plugin::{App, EventSnapshot, Resource};
 
+use crate::RuntimeError;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeMode {
     FixedFrame,
@@ -36,7 +38,7 @@ impl RuntimeHandle {
     pub fn wake(&self) {
         match self.wake_sender.try_send(()) {
             Ok(()) | Err(TrySendError::Full(())) => {}
-            Err(TrySendError::Disconnected(())) => panic!("runtime wake channel disconnected"),
+            Err(TrySendError::Disconnected(())) => RuntimeError::WakeChannelDisconnected.panic(),
         }
     }
 
@@ -46,14 +48,18 @@ impl RuntimeHandle {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             })
-            .unwrap_or_else(|_| panic!("runtime gate open and close calls must be paired"));
+            .unwrap_or_else(|_| RuntimeError::GateOperationUnbalanced.panic());
         if previous == 1 {
             self.wake();
         }
     }
 
     pub fn close_gate(&self) {
-        self.blocker_count.fetch_add(1, Ordering::AcqRel);
+        self.blocker_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .expect("runtime blocker count overflow");
     }
 
     pub(crate) fn is_gate_open(&self) -> bool {
@@ -113,7 +119,7 @@ impl RuntimeControl {
             .lock()
             .expect("runtime wake receiver lock poisoned")
             .recv()
-            .expect("runtime wake channel disconnected");
+            .unwrap_or_else(|_| RuntimeError::WakeChannelDisconnected.panic());
     }
 
     pub(crate) fn run(&mut self, app: &mut App) {
@@ -201,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "must be paired")]
+    #[should_panic(expected = "unbalanced")]
     fn opening_an_open_gate_panics() {
         let (_control, handle) = control(RuntimeMode::EventDriven);
         handle.open_gate();

@@ -1,346 +1,257 @@
-use std::any::TypeId;
-use std::future::Future;
-use std::sync::Arc;
+use std::any::type_name;
 
-use app_runtime_plugin::{AppControl, AppShutdownExt};
-use core_plugin::{named_system, App, Event, Plugin, Stage, World};
+use app_runtime_plugin::{RuntimeHandle, PRE_UPDATE};
+use core_plugin::{App, Plugin, World};
 
-use crate::resource::AsyncRuntimeOptions;
-use crate::runtime::{AsyncRuntimeState, Completion};
-use crate::{
-    AsyncRuntimeStatus, AsyncSystemOptions, AsyncTaskFailed, AsyncTaskId, AsyncTaskStarted,
-};
+use crate::request::ErasedAsyncTask;
+use crate::resource::{AsyncExecutorHandle, AsyncRequestRegistry};
+use crate::runtime::start_executor;
+use crate::{AsyncRequest, AsyncRequestMode, AsyncRuntimeError, AsyncTaskError};
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AsyncRuntimePlugin {
-    options: AsyncRuntimeOptions,
-}
-
-impl AsyncRuntimePlugin {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_queue_capacity(mut self, capacity: usize) -> Self {
-        assert!(capacity > 0, "async queue capacity must be positive");
-        self.options.queue_capacity = capacity;
-        self
-    }
-
-    pub fn with_max_in_flight(mut self, limit: usize) -> Self {
-        assert!(limit > 0, "max in-flight tasks must be positive");
-        self.options.max_in_flight = limit;
-        self
-    }
-}
+pub struct AsyncRuntimePlugin;
 
 impl Plugin for AsyncRuntimePlugin {
-    fn build(&self, app: &mut App) {
-        if app.world().resource::<Arc<AsyncRuntimeState>>().is_some() {
-            return;
+    fn build(self, app: &mut App) {
+        if !app.world().contains_resource::<RuntimeHandle>() {
+            AsyncRuntimeError::RuntimePluginMissing.panic();
         }
-        app.add_event::<AsyncTaskStarted>();
-        app.add_event::<AsyncTaskFailed>();
-        let state = Arc::new(AsyncRuntimeState::new(self.options));
-        app.add_resource(state.clone());
-        let handle = AsyncRuntimeStatus { state };
-        app.add_resource(handle.clone());
-        if app.world().resource::<AppControl>().is_some() {
-            app.on_shutdown(move |_world| {
-                handle.shutdown();
-            });
+        if app.world().contains_resource::<AsyncExecutorHandle>()
+            || app.world().contains_resource::<AsyncRequestRegistry>()
+        {
+            AsyncRuntimeError::AsyncRuntimePluginAlreadyInstalled.panic();
         }
-        app.add_systems(
-            Stage::Startup,
-            [named_system("async_runtime.start", start_runtime)],
-        );
-        app.add_systems(
-            Stage::First,
-            [named_system("async_runtime.collect", collect_completions)],
-        );
+
+        let executor = start_executor();
+        app.world_mut().insert_resource(executor);
+        app.world_mut().insert_resource(AsyncRequestRegistry::new());
     }
 }
 
-fn start_runtime(world: &mut World) {
-    let control = world.resource::<AppControl>().cloned();
-    let task_control = world
-        .resource::<Arc<AsyncRuntimeState>>()
-        .expect("AsyncRuntimeState should be registered")
-        .start(control);
-    if let Some(task_control) = task_control {
-        world.add_resource(task_control);
-    }
+pub trait AppAsyncExt {
+    fn register_async_request<T, E>(&mut self) -> &mut Self
+    where
+        T: Send + Sync + 'static,
+        E: From<AsyncTaskError> + Send + Sync + 'static;
+
+    fn register_async_request_in<T, E>(&mut self, schedule: &str) -> &mut Self
+    where
+        T: Send + Sync + 'static,
+        E: From<AsyncTaskError> + Send + Sync + 'static;
 }
 
-fn collect_completions(world: &mut World) {
-    let completions = world
-        .resource::<Arc<AsyncRuntimeState>>()
-        .expect("AsyncRuntimeState should be registered")
-        .drain_completions();
-    for completion in completions {
-        match completion {
-            Completion::Apply(command) => command(world),
-            Completion::Failed(failure) => world.send_event(failure),
-        }
-    }
-}
-
-pub trait AsyncAppExt {
-    fn add_async_system<Request, Output, Handler, Fut>(&mut self, handler: Handler) -> &mut Self
+impl AppAsyncExt for App {
+    fn register_async_request<T, E>(&mut self) -> &mut Self
     where
-        Request: Event,
-        Output: Event,
-        Handler: FnMut(Request) -> Fut + Send + 'static,
-        Fut: Future<Output = Output> + Send + 'static;
-
-    fn add_async_system_with_options<Request, Output, Handler, Fut>(
-        &mut self,
-        handler: Handler,
-        options: AsyncSystemOptions,
-    ) -> &mut Self
-    where
-        Request: Event,
-        Output: Event,
-        Handler: FnMut(Request) -> Fut + Send + 'static,
-        Fut: Future<Output = Output> + Send + 'static;
-}
-
-impl AsyncAppExt for App {
-    fn add_async_system<Request, Output, Handler, Fut>(&mut self, handler: Handler) -> &mut Self
-    where
-        Request: Event,
-        Output: Event,
-        Handler: FnMut(Request) -> Fut + Send + 'static,
-        Fut: Future<Output = Output> + Send + 'static,
+        T: Send + Sync + 'static,
+        E: From<AsyncTaskError> + Send + Sync + 'static,
     {
-        self.add_async_system_with_options(handler, AsyncSystemOptions::default())
+        self.register_async_request_in::<T, E>(PRE_UPDATE)
     }
 
-    fn add_async_system_with_options<Request, Output, Handler, Fut>(
-        &mut self,
-        mut handler: Handler,
-        options: AsyncSystemOptions,
-    ) -> &mut Self
+    fn register_async_request_in<T, E>(&mut self, schedule: &str) -> &mut Self
     where
-        Request: Event,
-        Output: Event,
-        Handler: FnMut(Request) -> Fut + Send + 'static,
-        Fut: Future<Output = Output> + Send + 'static,
+        T: Send + Sync + 'static,
+        E: From<AsyncTaskError> + Send + Sync + 'static,
     {
-        assert!(
-            self.world().resource::<Arc<AsyncRuntimeState>>().is_some(),
-            "AsyncRuntimePlugin must be installed before registering async systems"
-        );
-        assert_ne!(
-            TypeId::of::<Request>(),
-            TypeId::of::<Output>(),
-            "async request and output event types must be different"
-        );
-        self.add_event::<Request>();
-        self.add_event::<Output>();
-        self.add_event::<AsyncTaskStarted>();
-        self.add_event::<AsyncTaskFailed>();
+        let Some(registry) = self.world_mut().get_resource_mut::<AsyncRequestRegistry>() else {
+            AsyncRuntimeError::AsyncRuntimePluginMissing.panic();
+        };
+        if !registry.register::<T, E>() {
+            AsyncRuntimeError::RequestAlreadyRegistered {
+                request_type: type_name::<AsyncRequest<T, E>>(),
+            }
+            .panic();
+        }
 
-        let mut reader = self.event_reader::<Request>();
-        let request_type = std::any::type_name::<Request>();
-        self.add_systems(
-            Stage::Last,
-            [move |world: &mut World| {
-                let requests = world.read_events(&mut reader);
-                for request in requests {
-                    let spawner = world
-                        .resource::<Arc<AsyncRuntimeState>>()
-                        .and_then(|state| state.spawner());
-                    let Some(spawner) = spawner else {
-                        world.send_event(AsyncTaskFailed {
-                            task_id: AsyncTaskId(0),
-                            request_type,
-                            kind: crate::AsyncTaskFailureKind::WorkerStopped,
-                            message: "async worker has not started".into(),
-                        });
-                        continue;
-                    };
-                    match spawner.spawn(handler(request), request_type, options) {
-                        Ok(task_id) => world.send_event(AsyncTaskStarted {
-                            task_id,
-                            request_type,
-                        }),
-                        Err(failure) => world.send_event(failure),
-                    }
-                }
-            }],
-        );
-        self
+        self.register_event::<AsyncRequest<T, E>>()
+            .register_event::<Result<T, E>>()
+            .add_system(schedule, dispatch_async_requests::<T, E>)
+    }
+}
+
+fn dispatch_async_requests<T, E>(world: &mut World)
+where
+    T: Send + Sync + 'static,
+    E: From<AsyncTaskError> + Send + Sync + 'static,
+{
+    let runtime = world
+        .get_resource::<RuntimeHandle>()
+        .unwrap_or_else(|| AsyncRuntimeError::RuntimePluginMissing.panic())
+        .clone();
+    let requests = world
+        .event_reader::<AsyncRequest<T, E>>()
+        .into_iter()
+        .map(|request| (request.take_task(), request.mode()))
+        .collect::<Vec<(ErasedAsyncTask<T, E>, AsyncRequestMode)>>();
+
+    for (task, mode) in requests {
+        let event_handle = world.event_write().send_pending::<T, E>();
+        if mode == AsyncRequestMode::BlockNextFrame {
+            runtime.close_gate();
+        }
+        let task_runtime = runtime.clone();
+        let supervised = async move {
+            let result = match tokio::spawn(async move { task().await }).await {
+                Ok(result) => result,
+                Err(error) => Err(E::from(AsyncTaskError::from_join_error(error))),
+            };
+            event_handle.complete(result);
+            match mode {
+                AsyncRequestMode::Normal => task_runtime.wake(),
+                AsyncRequestMode::BlockNextFrame => task_runtime.open_gate(),
+            }
+        };
+        world
+            .get_resource::<AsyncExecutorHandle>()
+            .unwrap_or_else(|| AsyncRuntimeError::AsyncRuntimePluginMissing.panic())
+            .spawn(Box::pin(supervised));
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
     use std::time::{Duration, Instant};
 
+    use app_runtime_plugin::RuntimePlugin;
+
     use super::*;
-    use crate::AsyncTaskFailureKind;
 
-    #[derive(Clone)]
-    struct DoubleRequest(i32);
-    #[derive(Clone, Debug, PartialEq)]
-    struct DoubleOutput(i32);
-
-    #[derive(Clone)]
-    struct PendingRequest;
-    #[derive(Clone)]
-    struct PendingOutput;
-
-    #[test]
-    fn request_runs_on_worker_and_returns_as_event() {
-        let mut app = App::new();
-        app.add_plugins(AsyncRuntimePlugin::default());
-        app.add_async_system(|request: DoubleRequest| async move { DoubleOutput(request.0 * 2) });
-        let mut output_reader = app.event_reader::<DoubleOutput>();
-
-        app.world().send_event(DoubleRequest(21));
-        app.tick();
-        let outputs = tick_until(
-            &mut app,
-            || false,
-            |app| app.world().read_events(&mut output_reader),
-        );
-
-        assert_eq!(outputs, [DoubleOutput(42)]);
+    #[derive(Debug)]
+    enum TestError {
+        Business,
+        Async(AsyncTaskError),
     }
 
-    #[test]
-    fn timeout_is_reported() {
-        let mut app = App::new();
-        app.add_plugins(AsyncRuntimePlugin::default());
-        app.add_async_system_with_options(
-            |_request: DoubleRequest| async move {
-                tokio::time::sleep(Duration::from_millis(30)).await;
-                DoubleOutput(0)
-            },
-            AsyncSystemOptions::with_timeout(Duration::from_millis(1)),
-        );
-        let mut failure_reader = app.event_reader::<AsyncTaskFailed>();
-
-        app.world().send_event(DoubleRequest(1));
-        app.tick();
-        let failures = tick_until(
-            &mut app,
-            || false,
-            |app| app.world().read_events(&mut failure_reader),
-        );
-
-        assert_eq!(failures[0].kind, AsyncTaskFailureKind::Timeout);
-    }
-
-    #[test]
-    fn panic_is_reported() {
-        let mut app = App::new();
-        app.add_plugins(AsyncRuntimePlugin::default());
-        app.add_async_system::<PendingRequest, PendingOutput, _, _>(|_request| async {
-            panic!("async boom")
-        });
-        let mut failure_reader = app.event_reader::<AsyncTaskFailed>();
-
-        app.world().send_event(PendingRequest);
-        app.tick();
-        let failures = tick_until(
-            &mut app,
-            || false,
-            |app| app.world().read_events(&mut failure_reader),
-        );
-
-        assert_eq!(failures[0].kind, AsyncTaskFailureKind::Panic);
-    }
-
-    #[test]
-    fn task_can_be_cancelled_from_main_thread() {
-        let mut app = App::new();
-        app.add_plugins(AsyncRuntimePlugin::default());
-        app.add_async_system_with_options(
-            |_request: PendingRequest| std::future::pending::<PendingOutput>(),
-            AsyncSystemOptions::without_timeout(),
-        );
-        let mut started_reader = app.event_reader::<AsyncTaskStarted>();
-        app.add_systems(
-            Stage::Update,
-            [move |world: &mut World| {
-                for started in world.read_events(&mut started_reader) {
-                    assert!(world
-                        .resource::<crate::AsyncTasks>()
-                        .is_some_and(|tasks| tasks.cancel(started.task_id)));
-                }
-            }],
-        );
-        let mut failure_reader = app.event_reader::<AsyncTaskFailed>();
-
-        app.world().send_event(PendingRequest);
-        app.tick();
-        let failures = tick_until(
-            &mut app,
-            || false,
-            |app| app.world().read_events(&mut failure_reader),
-        );
-
-        assert_eq!(failures[0].kind, AsyncTaskFailureKind::Cancelled);
-    }
-
-    #[test]
-    fn bounded_queue_reports_backpressure() {
-        let mut app = App::new();
-        app.add_plugins(
-            AsyncRuntimePlugin::new()
-                .with_queue_capacity(1)
-                .with_max_in_flight(1),
-        );
-        app.add_async_system_with_options(
-            |_request: PendingRequest| std::future::pending::<PendingOutput>(),
-            AsyncSystemOptions::without_timeout(),
-        );
-        let mut failure_reader = app.event_reader::<AsyncTaskFailed>();
-        for _ in 0..100 {
-            app.world().send_event(PendingRequest);
+    impl From<AsyncTaskError> for TestError {
+        fn from(error: AsyncTaskError) -> Self {
+            Self::Async(error)
         }
+    }
 
-        app.tick();
-        let failures = app.world().read_events(&mut failure_reader);
+    impl fmt::Display for TestError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Business => formatter.write_str("business error"),
+                Self::Async(error) => error.fmt(formatter),
+            }
+        }
+    }
 
-        assert!(failures
-            .iter()
-            .any(|failure| failure.kind == AsyncTaskFailureKind::QueueFull));
+    impl std::error::Error for TestError {}
+
+    fn app() -> App {
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default())
+            .add_plugin(AsyncRuntimePlugin)
+            .register_async_request::<u32, TestError>();
+        app
+    }
+
+    fn wait_for_response(app: &mut App) -> Result<u32, TestError> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            app.tick();
+            if let Some(result) = app
+                .world()
+                .event_reader::<Result<u32, TestError>>()
+                .into_iter()
+                .next()
+            {
+                return match result {
+                    Ok(value) => Ok(*value),
+                    Err(TestError::Business) => Err(TestError::Business),
+                    Err(TestError::Async(AsyncTaskError::Panicked { message })) => {
+                        Err(TestError::Async(AsyncTaskError::Panicked {
+                            message: message.clone(),
+                        }))
+                    }
+                    Err(TestError::Async(AsyncTaskError::Cancelled)) => {
+                        Err(TestError::Async(AsyncTaskError::Cancelled))
+                    }
+                };
+            }
+            assert!(Instant::now() < deadline, "async response timed out");
+            std::thread::yield_now();
+        }
     }
 
     #[test]
-    fn dropping_app_cancels_pending_tasks() {
+    fn successful_task_completes_the_pending_response() {
+        let mut app = app();
+        app.world()
+            .event_write()
+            .send_event(AsyncRequest::<u32, TestError>::new(|| async { Ok(42) }));
+
+        assert!(matches!(wait_for_response(&mut app), Ok(42)));
+    }
+
+    #[test]
+    fn business_error_remains_the_developer_error() {
+        let mut app = app();
+        app.world()
+            .event_write()
+            .send_event(AsyncRequest::<u32, TestError>::new(|| async {
+                Err(TestError::Business)
+            }));
+
+        assert!(matches!(
+            wait_for_response(&mut app),
+            Err(TestError::Business)
+        ));
+    }
+
+    #[test]
+    fn panicked_task_completes_with_an_async_task_error() {
+        let mut app = app();
+        app.world()
+            .event_write()
+            .send_event(AsyncRequest::<u32, TestError>::new(|| async {
+                panic!("async boom")
+            }));
+
+        assert!(matches!(
+            wait_for_response(&mut app),
+            Err(TestError::Async(AsyncTaskError::Panicked { message }))
+                if message == "async boom"
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "already registered")]
+    fn duplicate_request_registration_is_rejected() {
+        app().register_async_request::<u32, TestError>();
+    }
+
+    #[test]
+    #[should_panic(expected = "RuntimePlugin is not installed")]
+    fn runtime_plugin_must_be_installed_first() {
+        App::new().add_plugin(AsyncRuntimePlugin);
+    }
+
+    #[test]
+    #[should_panic(expected = "AsyncRuntimePlugin is already installed")]
+    fn async_runtime_plugin_cannot_be_installed_twice() {
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default())
+            .add_plugin(AsyncRuntimePlugin)
+            .add_plugin(AsyncRuntimePlugin);
+    }
+
+    #[test]
+    fn dropping_app_cancels_pending_tasks_and_joins_the_executor() {
         let start = Instant::now();
         {
-            let mut app = App::new();
-            app.add_plugins(AsyncRuntimePlugin::default());
-            app.add_async_system_with_options(
-                |_request: PendingRequest| std::future::pending::<PendingOutput>(),
-                AsyncSystemOptions::without_timeout(),
-            );
-            app.world().send_event(PendingRequest);
+            let mut app = app();
+            app.world()
+                .event_write()
+                .send_event(AsyncRequest::<u32, TestError>::new(|| {
+                    std::future::pending()
+                }));
             app.tick();
         }
 
         assert!(start.elapsed() < Duration::from_secs(1));
-    }
-
-    fn tick_until<T>(
-        app: &mut App,
-        mut stop: impl FnMut() -> bool,
-        mut read: impl FnMut(&App) -> Vec<T>,
-    ) -> Vec<T> {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            app.tick();
-            let values = read(app);
-            if !values.is_empty() || stop() {
-                return values;
-            }
-            assert!(Instant::now() < deadline, "async result timed out");
-            std::thread::yield_now();
-        }
     }
 }
