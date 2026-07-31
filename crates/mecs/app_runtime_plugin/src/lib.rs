@@ -1,6 +1,5 @@
 mod plugin;
 mod resource;
-mod shutdown;
 
-pub use plugin::{AppRunExt, AppRuntimePlugin, AppShutdownExt};
-pub use resource::AppControl;
+pub use plugin::{AppRunExt, RuntimePlugin, WorldEventExt};
+pub use resource::{RuntimeHandle, RuntimeMode, RuntimeState};
