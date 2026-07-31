@@ -3,6 +3,8 @@ use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
+use crate::CoreError;
+
 pub trait Event: Send + Sync + 'static {}
 
 impl<T, E> Event for Result<T, E>
@@ -16,6 +18,7 @@ enum EventState {
     Pending,
     Normal {
         body: Box<dyn Any + Send + Sync>,
+        type_name: &'static str,
         remaining_delay_frames: u64,
     },
 }
@@ -86,19 +89,24 @@ impl EventReadStorageRegistry {
         let storage = self
             .storages
             .get(&TypeId::of::<E>())
-            .unwrap_or_else(|| panic!("event `{}` is not registered", std::any::type_name::<E>()))
+            .unwrap_or_else(|| {
+                CoreError::EventNotRegistered {
+                    type_name: std::any::type_name::<E>(),
+                }
+                .panic()
+            })
             .as_any()
             .downcast_ref::<EventReadStorage<E>>()
             .expect("event storage type must match its TypeId");
         EventReader { storage }
     }
 
-    fn push_event(&mut self, body: Box<dyn Any + Send + Sync>) {
+    fn push_event(&mut self, body: Box<dyn Any + Send + Sync>, type_name: &'static str) {
         let event_type = body.as_ref().type_id();
         let storage = self
             .storages
             .get_mut(&event_type)
-            .unwrap_or_else(|| panic!("received an event whose type is not registered"));
+            .unwrap_or_else(|| CoreError::EventNotRegistered { type_name }.panic());
         storage.push_boxed(body);
     }
 
@@ -135,12 +143,12 @@ where
     pub fn complete_after(self, result: Result<T, E>, extra_delay_frames: u64) {
         let mut snapshot = self.snapshot.lock().expect("event snapshot lock poisoned");
         let mut state = self.node.lock().expect("event node lock poisoned");
-        assert!(
-            matches!(*state, EventState::Pending),
-            "only pending events can be completed"
-        );
+        if !matches!(*state, EventState::Pending) {
+            CoreError::PendingEventAlreadyCompleted.panic();
+        }
         *state = EventState::Normal {
             body: Box::new(result),
+            type_name: std::any::type_name::<Result<T, E>>(),
             remaining_delay_frames: extra_delay_frames,
         };
         snapshot.pending_event_count -= 1;
@@ -197,13 +205,14 @@ impl EventQueue {
                     remaining_delay_frames: 0,
                     ..
                 } => {
-                    let EventState::Normal { body, .. } =
-                        std::mem::replace(&mut *state, EventState::Pending)
+                    let EventState::Normal {
+                        body, type_name, ..
+                    } = std::mem::replace(&mut *state, EventState::Pending)
                     else {
                         unreachable!("matched event state must remain normal");
                     };
                     drop(state);
-                    registry.push_event(body);
+                    registry.push_event(body, type_name);
                     snapshot.normal_event_count -= 1;
                 }
                 EventState::Normal {
@@ -229,6 +238,7 @@ impl EventQueue {
         self.pending
             .push_back(Arc::new(Mutex::new(EventState::Normal {
                 body: Box::new(event),
+                type_name: std::any::type_name::<E>(),
                 remaining_delay_frames: 0,
             })));
         snapshot.normal_event_count += 1;
@@ -240,6 +250,7 @@ impl EventQueue {
         self.pending
             .push_back(Arc::new(Mutex::new(EventState::Normal {
                 body: Box::new(event),
+                type_name: std::any::type_name::<E>(),
                 remaining_delay_frames: extra_delay_frames,
             })));
         snapshot.normal_event_count += 1;

@@ -3,7 +3,7 @@ use std::sync::mpsc::sync_channel;
 use core_plugin::{App, Event, Plugin, World};
 
 use crate::resource::RuntimeControl;
-use crate::{RuntimeHandle, RuntimeMode};
+use crate::{RuntimeError, RuntimeHandle, RuntimeMode};
 
 pub const STARTUP: &str = "startup";
 pub const PRE_UPDATE: &str = "pre_update";
@@ -18,10 +18,9 @@ pub struct RuntimePlugin {
 
 impl RuntimePlugin {
     pub fn fixed(frame_rate: u64) -> Self {
-        assert!(
-            frame_rate > 0,
-            "runtime frame rate must be greater than zero"
-        );
+        if frame_rate == 0 {
+            RuntimeError::InvalidFrameRate { frame_rate }.panic();
+        }
         Self {
             mode: RuntimeMode::FixedFrame,
             frame_rate: Some(frame_rate),
@@ -40,6 +39,11 @@ impl Default for RuntimePlugin {
 
 impl Plugin for RuntimePlugin {
     fn build(self, app: &mut App) {
+        if app.world().contains_resource::<RuntimeHandle>()
+            || app.world().contains_resource::<RuntimeControl>()
+        {
+            RuntimeError::RuntimePluginAlreadyInstalled.panic();
+        }
         app.add_once_schedule(STARTUP.into())
             .add_schedule(PRE_UPDATE.into())
             .add_schedule(UPDATE.into())
@@ -65,12 +69,12 @@ pub trait AppRunExt {
 
 impl AppRunExt for App {
     fn run(&mut self) {
-        let mut runtime = self
-            .world_mut()
-            .remove_resource::<RuntimeControl>()
-            .unwrap_or_else(|| {
-                panic!("RuntimePlugin must be installed and App::run may only be called once")
-            });
+        let Some(mut runtime) = self.world_mut().remove_resource::<RuntimeControl>() else {
+            if self.world().contains_resource::<RuntimeHandle>() {
+                RuntimeError::RuntimeAlreadyRunning.panic();
+            }
+            RuntimeError::RuntimePluginMissing.panic();
+        };
         runtime.run(self);
     }
 }
@@ -84,7 +88,7 @@ impl WorldEventExt for World {
     fn emit_event<E: Event>(&self, event: E) {
         let handle = self
             .get_resource::<RuntimeHandle>()
-            .unwrap_or_else(|| panic!("RuntimePlugin must be installed before emitting events"))
+            .unwrap_or_else(|| RuntimeError::RuntimePluginMissing.panic())
             .clone();
         self.event_write().send_event(event);
         handle.wake();
@@ -93,7 +97,7 @@ impl WorldEventExt for World {
     fn emit_event_after<E: Event>(&self, event: E, delay: u64) {
         let handle = self
             .get_resource::<RuntimeHandle>()
-            .unwrap_or_else(|| panic!("RuntimePlugin must be installed before emitting events"))
+            .unwrap_or_else(|| RuntimeError::RuntimePluginMissing.panic())
             .clone();
         self.event_write().send_event_after(event, delay);
         handle.wake();
@@ -162,7 +166,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "RuntimePlugin must be installed")]
+    #[should_panic(expected = "RuntimePlugin is already installed")]
+    fn runtime_plugin_cannot_be_installed_twice() {
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default())
+            .add_plugin(RuntimePlugin::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "RuntimePlugin is not installed")]
     fn event_extensions_require_the_runtime_plugin() {
         World::new().emit_event(Notice);
     }

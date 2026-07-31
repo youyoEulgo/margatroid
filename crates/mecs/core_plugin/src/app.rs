@@ -1,5 +1,5 @@
 use crate::schedule::SchedulePlan;
-use crate::{Event, Plugin, System, World};
+use crate::{CoreError, Event, Plugin, System, World};
 
 pub struct App {
     world: World,
@@ -23,37 +23,55 @@ impl App {
     }
 
     pub fn add_plugin<P: Plugin>(&mut self, plugin: P) -> &mut Self {
-        assert!(!self.schedules.is_started(), "app has already started");
+        if self.schedules.is_started() {
+            CoreError::AppAlreadyStarted.panic();
+        }
         plugin.build(self);
         self
     }
 
     pub fn add_schedule(&mut self, name: String) -> &mut Self {
-        assert!(
-            self.schedules.add_schedule(name),
-            "schedule name is duplicated or app has already started"
-        );
+        if self.schedules.is_started() {
+            CoreError::AppAlreadyStarted.panic();
+        }
+        let error_name = name.clone();
+        if !self.schedules.add_schedule(name) {
+            CoreError::ScheduleAlreadyExists { name: error_name }.panic();
+        }
         self
     }
 
     pub fn add_once_schedule(&mut self, name: String) -> &mut Self {
-        assert!(
-            self.schedules.add_once_schedule(name),
-            "schedule name is duplicated or app has already started"
-        );
+        if self.schedules.is_started() {
+            CoreError::AppAlreadyStarted.panic();
+        }
+        let error_name = name.clone();
+        if !self.schedules.add_once_schedule(name) {
+            CoreError::ScheduleAlreadyExists { name: error_name }.panic();
+        }
         self
     }
 
     pub fn add_system<S: System>(&mut self, schedule: &str, system: S) -> &mut Self {
+        if self.schedules.is_started() {
+            CoreError::AppAlreadyStarted.panic();
+        }
         self.schedules
             .schedule_mut(schedule)
-            .unwrap_or_else(|| panic!("schedule `{schedule}` does not exist or app has started"))
+            .unwrap_or_else(|| {
+                CoreError::ScheduleNotFound {
+                    name: schedule.into(),
+                }
+                .panic()
+            })
             .add_system(system);
         self
     }
 
     pub fn register_event<E: Event>(&mut self) -> &mut Self {
-        assert!(!self.schedules.is_started(), "app has already started");
+        if self.schedules.is_started() {
+            CoreError::AppAlreadyStarted.panic();
+        }
         self.world.event_registry_mut().register::<E>();
         self
     }
@@ -218,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "duplicated")]
+    #[should_panic(expected = "schedule `update` already exists")]
     fn schedule_names_must_be_unique_across_once_and_recurring_schedules() {
         let mut app = App::new();
         app.add_schedule("update".into());
