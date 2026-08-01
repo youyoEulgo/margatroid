@@ -120,7 +120,7 @@ mod tests {
                     .map(|notice| notice.0)
                     .collect::<Vec<_>>();
                 reader_seen.lock().unwrap().extend(values);
-                world.event_write().send_event(Notice(7));
+                world.emit_event(Notice(7));
             });
 
         app.tick();
@@ -141,7 +141,7 @@ mod tests {
     fn delayed_events_arrive_after_their_countdown_and_then_clear() {
         let mut app = App::new();
         app.register_event::<Notice>();
-        app.world().event_write().send_event_after(Notice(3), 2);
+        app.world().emit_event_after(Notice(3), 2);
 
         app.tick();
         assert!(app.world().event_reader::<Notice>().is_empty());
@@ -164,9 +164,7 @@ mod tests {
     fn maximum_delay_counts_down_without_overflowing() {
         let mut app = App::new();
         app.register_event::<Notice>();
-        app.world()
-            .event_write()
-            .send_event_after(Notice(1), u64::MAX);
+        app.world().emit_event_after(Notice(1), u64::MAX);
 
         app.tick();
 
@@ -177,7 +175,7 @@ mod tests {
     fn registering_an_event_twice_preserves_queued_events() {
         let mut app = App::new();
         app.register_event::<Notice>();
-        app.world().event_write().send_event(Notice(5));
+        app.world().emit_event(Notice(5));
         app.register_event::<Notice>();
 
         app.tick();
@@ -200,7 +198,7 @@ mod tests {
     fn pending_events_remain_queued_until_completed() {
         let mut app = App::new();
         app.register_event::<Result<u32, String>>();
-        let _handle = app.world().event_write().send_pending::<u32, String>();
+        let _handle = app.world().emit_pending::<u32, String>();
 
         app.tick();
 
@@ -215,7 +213,7 @@ mod tests {
     fn pending_events_can_be_completed_from_another_thread() {
         let mut app = App::new();
         app.register_event::<Result<u32, String>>();
-        let handle = app.world().event_write().send_pending::<u32, String>();
+        let handle = app.world().emit_pending::<u32, String>();
 
         std::thread::spawn(move || handle.complete(Ok(7)))
             .join()
@@ -240,7 +238,7 @@ mod tests {
     fn fast_forward_tick_delivers_a_delayed_completed_event() {
         let mut app = App::new();
         app.register_event::<Result<u32, String>>();
-        let handle = app.world().event_write().send_pending::<u32, String>();
+        let handle = app.world().emit_pending::<u32, String>();
         handle.complete_after(Ok(11), 5);
 
         app.fast_forward_tick();

@@ -8,7 +8,7 @@
 - API 与配置 schema version
 - `WorkspaceSpec`、`WorkspaceBundle` 和资源清单
 - workspace、prompt、request、task 和 result DTO
-- 稳定错误码与 JSON error envelope
+- 稳定错误码与 JSON 错误封装
 
 协议对象禁止携带 API key、token 或 Provider secret。资源内容使用内容摘要关联，daemon
 必须在接受 bundle 前重新校验 schema、摘要、大小和引用关系。

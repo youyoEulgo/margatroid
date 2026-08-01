@@ -1,7 +1,7 @@
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::CoreError;
 
@@ -165,6 +165,31 @@ where
 pub struct EventQueue {
     pending: VecDeque<EventNode>,
     snapshot: Arc<Mutex<EventSnapshot>>,
+}
+
+#[derive(Clone)]
+pub struct EventEmitter {
+    queue: Arc<RwLock<EventQueue>>,
+}
+
+impl EventEmitter {
+    pub(crate) fn new(queue: Arc<RwLock<EventQueue>>) -> Self {
+        Self { queue }
+    }
+
+    pub fn emit_event<E: Event>(&self, event: E) {
+        self.queue
+            .write()
+            .expect("event queue lock poisoned")
+            .send_event(event);
+    }
+
+    pub fn emit_event_after<E: Event>(&self, event: E, delay: u64) {
+        self.queue
+            .write()
+            .expect("event queue lock poisoned")
+            .send_event_after(event, delay);
+    }
 }
 
 impl EventQueue {

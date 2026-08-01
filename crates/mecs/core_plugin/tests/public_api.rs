@@ -28,7 +28,7 @@ fn documented_public_api_composes_from_an_external_crate() {
     app.add_system("update", move |world: &mut World| {
         world.get_component_mut::<Position>(entity).unwrap().0 += 1;
         world.get_resource_mut::<Settings>().unwrap().0 += 1;
-        world.event_write().send_event(Updated);
+        world.emit_event(Updated);
     });
 
     app.tick();

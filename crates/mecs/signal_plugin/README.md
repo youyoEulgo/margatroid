@@ -1,7 +1,7 @@
 # SignalPlugin
 
-`SignalPlugin` converts configured operating-system process signals into typed ECS events. It does
-not decide whether an application should shut down, reload, pause, or ignore a signal.
+`SignalPlugin` 将配置的操作系统进程信号转换为类型化 ECS 事件。它不决定应用收到信号后
+应该关闭、重载、暂停还是忽略。
 
 ```rust
 use core_plugin::App;
@@ -15,7 +15,6 @@ app.add_plugins(SignalPlugin::with_options(
 ));
 ```
 
-The listener publishes `ProcessSignalReceived`. Applications may consume that event and call
-`AppControl::shutdown()` as an explicit policy. The listener thread is closed and joined through
-the app runtime shutdown phases when available, or when its resource is dropped in manual-tick
-applications.
+监听器发布 `ProcessSignalReceived`。应用可以消费该事件，并根据自身策略调用
+`AppControl::shutdown()`。存在 App Runtime 关闭阶段时，监听线程会在该阶段停止并回收；
+对于手动 tick 的应用，则在对应 Resource 被丢弃时停止并回收。

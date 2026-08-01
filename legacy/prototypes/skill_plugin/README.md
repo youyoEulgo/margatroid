@@ -1,15 +1,15 @@
 # skill_plugin
 
-`skill_plugin` provides the V3 skill registry boundary.
+`skill_plugin` 提供 V3 Skill 注册表边界。
 
-## Responsibilities
+## 职责
 
-- Scan skill Markdown files.
-- Parse TOML frontmatter.
-- Classify member skills and workflow skills.
-- Manage skill registry and loaded skill state.
+- 扫描 Skill Markdown 文件。
+- 解析 TOML frontmatter。
+- 区分成员 Skill 与 Workflow Skill。
+- 管理 Skill 注册表和已加载 Skill 状态。
 
-## Public Events
+## 公开事件
 
 - `SkillScanRequested`
 - `SkillScanned`
@@ -20,16 +20,16 @@
 - `SkillUnloadRequested`
 - `SkillUnloaded`
 
-## Public Resources
+## 公开 Resource
 
 - `SkillRegistry`
 - `LoadedSkills`
 
-## Stage Registration
+## Stage 注册
 
-- Scan, load, and unload requests are consumed in `Stage::Update`.
+- 扫描、加载和卸载请求在 `Stage::Update` 消费。
 
-## Minimal Example
+## 最小示例
 
 ```rust
 use core_plugin::App;
@@ -40,6 +40,6 @@ app.add_plugins(SkillPlugin::new());
 app.world().send_event(SkillScanRequested::new("./skills"));
 ```
 
-## Boundaries
+## 边界
 
-This plugin does not execute workflow DAGs, call LLM providers, or execute sandbox commands.
+该 Plugin 不执行 Workflow DAG、不调用 LLM Provider，也不执行 Sandbox 命令。

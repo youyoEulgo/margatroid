@@ -1,31 +1,31 @@
 # sandbox_plugin
 
-`sandbox_plugin` provides the V3 command execution boundary.
+`sandbox_plugin` 提供 V3 命令执行边界。
 
-## Responsibilities
+## 职责
 
-- Register sandbox policy and executor resources.
-- Consume `SandboxCommandRequested`.
-- Execute commands through `AsyncRuntimePlugin`.
-- Emit command completion or failure events.
+- 注册 Sandbox 策略和执行器 Resource。
+- 消费 `SandboxCommandRequested`。
+- 通过 `AsyncRuntimePlugin` 执行命令。
+- 发出命令完成或失败事件。
 
-## Public Events
+## 公开事件
 
 - `SandboxCommandRequested`
 - `SandboxCommandStarted`
 - `SandboxCommandCompleted`
 - `SandboxCommandFailed`
 
-## Public Resources
+## 公开 Resource
 
 - `SandboxPolicy`
 - `SandboxExecutor`
 
-## Stage Registration
+## Stage 注册
 
-Async completions return in `Stage::First`; command results are converted into public events in `Stage::Update`.
+异步结果在 `Stage::First` 返回；命令结果在 `Stage::Update` 转换为公开事件。
 
-## Minimal Example
+## 最小示例
 
 ```rust
 use async_runtime_plugin::AsyncRuntimePlugin;
@@ -38,6 +38,6 @@ app.add_plugins(SandboxPlugin::new());
 app.world().send_event(SandboxCommandRequested::new("cmd-1", "echo ok"));
 ```
 
-## Boundaries
+## 边界
 
-This plugin does not interpret tool semantics, decide whether an agent should run a command, or read LLM output directly.
+该 Plugin 不解释工具语义、不决定 Agent 是否应该运行命令，也不直接读取 LLM 输出。

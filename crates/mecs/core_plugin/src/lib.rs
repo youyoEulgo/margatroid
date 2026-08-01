@@ -14,7 +14,7 @@ pub use app::App;
 pub use component::Component;
 pub use entity::Entity;
 pub use error::CoreError;
-pub use events::{Event, EventHandle, EventQueue, EventReader, EventSnapshot};
+pub use events::{Event, EventEmitter, EventHandle, EventQueue, EventReader, EventSnapshot};
 pub use plugin::Plugin;
 pub use query::QueryResult;
 pub use resource::Resource;
