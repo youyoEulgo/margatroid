@@ -1,12 +1,12 @@
 use std::any::type_name;
 
-use app_runtime_plugin::{RuntimeHandle, PRE_UPDATE};
+use app_runtime_plugin::{RuntimeHandle, WorldEventExt};
 use core_plugin::{App, Plugin, World};
 
 use crate::request::ErasedAsyncTask;
 use crate::resource::{AsyncExecutorHandle, AsyncRequestRegistry};
 use crate::runtime::start_executor;
-use crate::{AsyncRequest, AsyncRequestMode, AsyncRuntimeError, AsyncTaskError};
+use crate::{AsyncContext, AsyncRequest, AsyncRequestMode, AsyncRuntimeError, AsyncTaskError};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AsyncRuntimePlugin;
@@ -29,27 +29,14 @@ impl Plugin for AsyncRuntimePlugin {
 }
 
 pub trait AppAsyncExt {
-    fn register_async_request<T, E>(&mut self) -> &mut Self
-    where
-        T: Send + Sync + 'static,
-        E: From<AsyncTaskError> + Send + Sync + 'static;
-
-    fn register_async_request_in<T, E>(&mut self, schedule: &str) -> &mut Self
+    fn add_async_system<T, E>(&mut self, schedule: &str) -> &mut Self
     where
         T: Send + Sync + 'static,
         E: From<AsyncTaskError> + Send + Sync + 'static;
 }
 
 impl AppAsyncExt for App {
-    fn register_async_request<T, E>(&mut self) -> &mut Self
-    where
-        T: Send + Sync + 'static,
-        E: From<AsyncTaskError> + Send + Sync + 'static,
-    {
-        self.register_async_request_in::<T, E>(PRE_UPDATE)
-    }
-
-    fn register_async_request_in<T, E>(&mut self, schedule: &str) -> &mut Self
+    fn add_async_system<T, E>(&mut self, schedule: &str) -> &mut Self
     where
         T: Send + Sync + 'static,
         E: From<AsyncTaskError> + Send + Sync + 'static,
@@ -79,6 +66,7 @@ where
         .get_resource::<RuntimeHandle>()
         .unwrap_or_else(|| AsyncRuntimeError::RuntimePluginMissing.panic())
         .clone();
+    let event_sender = world.event_sender();
     let requests = world
         .event_reader::<AsyncRequest<T, E>>()
         .into_iter()
@@ -86,13 +74,14 @@ where
         .collect::<Vec<(ErasedAsyncTask<T, E>, AsyncRequestMode)>>();
 
     for (task, mode) in requests {
-        let event_handle = world.event_write().send_pending::<T, E>();
+        let event_handle = world.emit_pending::<T, E>();
         if mode == AsyncRequestMode::BlockNextFrame {
             runtime.close_gate();
         }
         let task_runtime = runtime.clone();
+        let context = AsyncContext::new(event_sender.clone());
         let supervised = async move {
-            let result = match tokio::spawn(async move { task().await }).await {
+            let result = match tokio::spawn(async move { task(context).await }).await {
                 Ok(result) => result,
                 Err(error) => Err(E::from(AsyncTaskError::from_join_error(error))),
             };
@@ -117,6 +106,7 @@ mod tests {
     use app_runtime_plugin::RuntimePlugin;
 
     use super::*;
+    use crate::WorldAsyncExt;
 
     #[derive(Debug)]
     enum TestError {
@@ -141,11 +131,20 @@ mod tests {
 
     impl std::error::Error for TestError {}
 
+    struct Progress(u32);
+    impl core_plugin::Event for Progress {}
+
+    async fn report_progress(context: AsyncContext) -> Result<u32, TestError> {
+        context.send_event(Progress(25));
+        context.send_event(Progress(75));
+        Ok(100)
+    }
+
     fn app() -> App {
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
             .add_plugin(AsyncRuntimePlugin)
-            .register_async_request::<u32, TestError>();
+            .add_async_system::<u32, TestError>(app_runtime_plugin::RuntimePlugin::PRE_UPDATE);
         app
     }
 
@@ -181,20 +180,46 @@ mod tests {
     fn successful_task_completes_the_pending_response() {
         let mut app = app();
         app.world()
-            .event_write()
-            .send_event(AsyncRequest::<u32, TestError>::new(|| async { Ok(42) }));
+            .send_async_event(|| async { Ok::<u32, TestError>(42) }, false);
 
         assert!(matches!(wait_for_response(&mut app), Ok(42)));
+    }
+
+    #[test]
+    fn async_context_sends_events_before_completing_the_response() {
+        let mut app = app();
+        app.register_event::<Progress>();
+        app.world().send_async_event(report_progress, false);
+        app.tick();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.world().event_snapshot().normal_event_count < 3 {
+            assert!(Instant::now() < deadline, "async events timed out");
+            std::thread::yield_now();
+        }
+        app.tick();
+
+        let progress = app
+            .world()
+            .event_reader::<Progress>()
+            .into_iter()
+            .map(|event| event.0)
+            .collect::<Vec<_>>();
+        assert_eq!(progress, [25, 75]);
+        assert!(matches!(
+            app.world()
+                .event_reader::<Result<u32, TestError>>()
+                .into_iter()
+                .next(),
+            Some(Ok(100))
+        ));
     }
 
     #[test]
     fn business_error_remains_the_developer_error() {
         let mut app = app();
         app.world()
-            .event_write()
-            .send_event(AsyncRequest::<u32, TestError>::new(|| async {
-                Err(TestError::Business)
-            }));
+            .send_async_event(|| async { Err::<u32, _>(TestError::Business) }, false);
 
         assert!(matches!(
             wait_for_response(&mut app),
@@ -206,10 +231,7 @@ mod tests {
     fn panicked_task_completes_with_an_async_task_error() {
         let mut app = app();
         app.world()
-            .event_write()
-            .send_event(AsyncRequest::<u32, TestError>::new(|| async {
-                panic!("async boom")
-            }));
+            .send_async_event::<u32, TestError, _, _>(|| async { panic!("async boom") }, false);
 
         assert!(matches!(
             wait_for_response(&mut app),
@@ -220,8 +242,21 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "already registered")]
-    fn duplicate_request_registration_is_rejected() {
-        app().register_async_request::<u32, TestError>();
+    fn duplicate_async_system_is_rejected() {
+        app().add_async_system::<u32, TestError>(app_runtime_plugin::RuntimePlugin::PRE_UPDATE);
+    }
+
+    #[test]
+    fn async_system_can_be_added_to_a_selected_schedule() {
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default())
+            .add_plugin(AsyncRuntimePlugin)
+            .add_schedule("async_dispatch".into())
+            .add_async_system::<u32, TestError>("async_dispatch");
+        app.world()
+            .send_async_event(|| async { Ok::<u32, TestError>(7) }, false);
+
+        assert!(matches!(wait_for_response(&mut app), Ok(7)));
     }
 
     #[test]
@@ -245,10 +280,7 @@ mod tests {
         {
             let mut app = app();
             app.world()
-                .event_write()
-                .send_event(AsyncRequest::<u32, TestError>::new(|| {
-                    std::future::pending()
-                }));
+                .send_async_event(std::future::pending::<Result<u32, TestError>>, false);
             app.tick();
         }
 

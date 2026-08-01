@@ -1,7 +1,7 @@
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
-use app_runtime_plugin::{RuntimePlugin, POST_UPDATE};
+use app_runtime_plugin::RuntimePlugin;
 use core_plugin::App;
 use log_plugin::{
     EventLog, LogLevel, LogPlugin, TracingStream, WorldEventLogExt, EVENT_LOG_TARGET,
@@ -69,14 +69,17 @@ async fn event_log_is_projected_to_tracing_without_exclusive_consumption() {
     let reader_seen = Arc::clone(&seen);
     let mut app = App::new();
     install_runtime_and_log(&mut app);
-    app.add_system(POST_UPDATE, move |world: &mut core_plugin::World| {
-        reader_seen.lock().unwrap().extend(
-            world
-                .event_reader::<EventLog>()
-                .into_iter()
-                .map(|event| event.message.clone()),
-        );
-    });
+    app.add_system(
+        RuntimePlugin::POST_UPDATE,
+        move |world: &mut core_plugin::World| {
+            reader_seen.lock().unwrap().extend(
+                world
+                    .event_reader::<EventLog>()
+                    .into_iter()
+                    .map(|event| event.message.clone()),
+            );
+        },
+    );
 
     let stream = app.world().get_resource::<TracingStream>().unwrap().clone();
     let mut subscription = stream.subscribe();

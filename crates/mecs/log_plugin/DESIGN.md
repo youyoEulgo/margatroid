@@ -375,7 +375,7 @@ WorldEventLogExt：trait--由LogPlugin为World提供EventLog发送方法
     发送EventLog：公开泛型方法
         签名：event_log<Message>(&self, level: LogLevel, message: Message)
         约束：Message可转换为字符串
-        行为：构造EventLog并调用core事件队列的send_event
+        行为：构造EventLog并调用WorldEventExt::send_event写入事件并唤醒Runtime
 ```
 
 ## System

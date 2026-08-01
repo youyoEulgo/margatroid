@@ -40,7 +40,7 @@ impl Plugin for SignalPlugin {
             Stage::Startup,
             [move |world: &mut World| {
                 if let Err(error) = startup_handle.start(options.signals(), sender.clone()) {
-                    world.send_event(SignalListenerFailed {
+                    world.emit_event(SignalListenerFailed {
                         message: error.to_string(),
                     });
                 }

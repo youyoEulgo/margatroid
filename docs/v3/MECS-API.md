@@ -86,7 +86,7 @@ Startup（一次） -> First -> Update -> Last -> Event maintenance
 Entity:   spawn / despawn / is_alive / entity_count
 Component: insert / remove / get / get_mut / has / iter / iter_mut
 Resource: add_resource / remove_resource / resource / resource_mut
-Event:    send_event / read_events
+Event:    emit_event / event_reader
 ```
 
 ### 3.4 System 与顺序
@@ -151,14 +151,17 @@ pub use sender::{ExternalEventSendError, ExternalEventSender};
 ## 6. async_runtime_plugin
 
 ```rust
-pub use events::{AsyncTaskFailed, AsyncTaskFailureKind, AsyncTaskId, AsyncTaskStarted};
-pub use plugin::{AsyncAppExt, AsyncRuntimePlugin};
-pub use resource::{AsyncRuntimeStatus, AsyncSystemOptions, AsyncTasks};
+pub use error::{AsyncRuntimeError, AsyncTaskError};
+pub use plugin::{AppAsyncExt, AsyncRuntimePlugin};
+pub use request::{AsyncRequest, AsyncRequestMode, AsyncTask, WorldAsyncExt};
+pub use context::AsyncContext;
 ```
 
-`AsyncAppExt::add_async_system` 注册 `Request Event -> Future -> Output Event`。`AsyncTasks`
-只负责按 TaskId 取消任务。runtime 线程、spawner 和 shutdown handle 不公开；领域失败由领域
-Result Event 表达，`AsyncTaskFailed` 只报告框架级失败。
+`AppAsyncExt::add_async_system::<T, E>(schedule)` 注册 `AsyncRequest<T, E>` 与
+`Result<T, E>` 事件，并将通用异步分发 System 挂到开发者指定的
+Schedule。`WorldAsyncExt::send_async_event` 将异步闭包封装为请求事件。业务
+Plugin 自行挂载最终的 `Result<T, E>` 响应处理 System。异步函数可以声明
+`AsyncContext` 参数，由 AsyncRuntime 自动注入并用于在任务完成前发送普通事件。
 
 ## 7. signal_plugin
 
@@ -190,7 +193,7 @@ Plugin 负责终端会话的 RAII 恢复。输入通过 `TerminalEvent` 统一�
 直接调用 `tracing` 宏的进程诊断称为 SystemLog。`LogPlugin` 安装 console、rolling
 file 和可选 bounded stream Layer，默认只启用 stderr Console Layer。
 
-`EventLog` 通过 ECS 事件队列传播，由 `LogPlugin` 注册在 `POST_UPDATE` 的 System
+`EventLog` 通过 ECS 事件队列传播，由 `LogPlugin` 注册在 `RuntimePlugin::POST_UPDATE` 的 System
 投影为 `target = "mecs::event_log"` 的 tracing Event。其他 Plugin 可以独立读取同一帧
 `EventLog`，不会与日志 System 互相消费。
 

@@ -115,7 +115,7 @@ fn start_http_server(world: &mut World) {
         .expect("HttpServerHandle should be registered")
         .start(options, router);
     if let Err(error) = result {
-        world.send_event(HttpServerFailed {
+        world.emit_event(HttpServerFailed {
             message: error.to_string(),
         });
     }
