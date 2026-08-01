@@ -1,28 +1,28 @@
 # event_bus_plugin
 
-`event_bus_plugin` provides the V3 named event broadcast boundary.
+`event_bus_plugin` 提供 V3 具名事件广播边界。
 
-## Responsibilities
+## 职责
 
-- Register an `EventBus` resource.
-- Publish `WorkspaceEventEmitted` events to named broadcast channels.
-- Report publish failures through `EventBusPublishFailed`.
-- Provide subscription handles for server, CLI, or test code.
+- 注册 `EventBus` Resource。
+- 将 `WorkspaceEventEmitted` 事件发布到具名广播 channel。
+- 通过 `EventBusPublishFailed` 报告发布失败。
+- 为 Server、CLI 或测试代码提供订阅句柄。
 
-## Public Events
+## 公开事件
 
 - `WorkspaceEventEmitted`
 - `EventBusPublishFailed`
 
-## Public Resources
+## 公开 Resource
 
 - `EventBus`
 
-## Stage Registration
+## Stage 注册
 
-`EventBusPlugin` registers its publishing system in `Stage::Update`.
+`EventBusPlugin` 在 `Stage::Update` 注册发布 System。
 
-## Minimal Example
+## 最小示例
 
 ```rust
 use core_plugin::App;
@@ -38,6 +38,7 @@ let receiver = app
     .register("demo/stream");
 ```
 
-## Boundaries
+## 边界
 
-This plugin does not define runtime task state, generate LLM chunks, persist memory, or own HTTP/SSE routes. It only provides the internal broadcast resource and the event-to-channel bridge.
+该 Plugin 不定义运行时任务状态、不生成 LLM chunk、不持久化记忆，也不持有 HTTP/SSE
+路由。它只提供内部广播 Resource 和事件到 channel 的桥接。

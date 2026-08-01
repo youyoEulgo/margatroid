@@ -1,3 +1,4 @@
+use app_runtime_plugin::WorldEventExt;
 use core_plugin::{Event, World};
 
 use crate::LogLevel;
@@ -35,7 +36,7 @@ impl WorldEventLogExt for World {
     where
         Message: Into<String>,
     {
-        self.event_write().send_event(EventLog::new(level, message));
+        self.send_event(EventLog::new(level, message));
     }
 }
 

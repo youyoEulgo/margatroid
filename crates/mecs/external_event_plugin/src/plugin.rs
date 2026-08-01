@@ -80,7 +80,7 @@ impl ExternalEventAppExt for App {
             [move |world: &mut World| {
                 for _ in 0..max_events_per_frame {
                     match receiver.try_recv() {
-                        Ok(event) => world.send_event(event),
+                        Ok(event) => world.emit_event(event),
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => return,
                     }

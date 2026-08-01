@@ -40,7 +40,7 @@ impl Plugin for TerminalInputPlugin {
                     event_sender.clone(),
                     failure_sender.clone(),
                 ) {
-                    world.send_event(failure);
+                    world.emit_event(failure);
                 }
             }],
         );

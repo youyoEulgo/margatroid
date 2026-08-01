@@ -3,7 +3,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use core_plugin::{App, EventSnapshot, Resource};
+use core_plugin::{App, Event, EventEmitter, EventSnapshot, Resource};
 
 use crate::RuntimeError;
 
@@ -69,11 +69,33 @@ impl RuntimeHandle {
 
 impl Resource for RuntimeHandle {}
 
+#[derive(Clone)]
+pub struct RuntimeEventSender {
+    emitter: EventEmitter,
+    runtime: RuntimeHandle,
+}
+
+impl RuntimeEventSender {
+    pub(crate) fn new(emitter: EventEmitter, runtime: RuntimeHandle) -> Self {
+        Self { emitter, runtime }
+    }
+
+    pub fn send_event<E: Event>(&self, event: E) {
+        self.emitter.emit_event(event);
+        self.runtime.wake();
+    }
+
+    pub fn send_event_after<E: Event>(&self, event: E, delay: u64) {
+        self.emitter.emit_event_after(event, delay);
+        self.runtime.wake();
+    }
+}
+
 pub(crate) struct RuntimeControl {
     mode: RuntimeMode,
     frame_rate: Option<u64>,
     handle: RuntimeHandle,
-    wake_receiver: Mutex<Receiver<()>>,
+    wake_receiver: Mutex<Option<Receiver<()>>>,
     event_snapshot: EventSnapshot,
 }
 
@@ -89,7 +111,7 @@ impl RuntimeControl {
             mode,
             frame_rate,
             handle,
-            wake_receiver: Mutex::new(wake_receiver),
+            wake_receiver: Mutex::new(Some(wake_receiver)),
             event_snapshot,
         }
     }
@@ -114,22 +136,26 @@ impl RuntimeControl {
         }
     }
 
-    fn wait(&self) {
-        self.wake_receiver
-            .lock()
-            .expect("runtime wake receiver lock poisoned")
+    fn wait(wake_receiver: &Receiver<()>) {
+        wake_receiver
             .recv()
             .unwrap_or_else(|_| RuntimeError::WakeChannelDisconnected.panic());
     }
 
     pub(crate) fn run(&mut self, app: &mut App) {
+        let wake_receiver = self
+            .wake_receiver
+            .lock()
+            .expect("runtime wake receiver lock poisoned")
+            .take()
+            .expect("runtime wake receiver must only be taken once");
         match self.mode {
-            RuntimeMode::FixedFrame => self.run_fixed_frame(app),
-            RuntimeMode::EventDriven => self.run_event_driven(app),
+            RuntimeMode::FixedFrame => self.run_fixed_frame(app, &wake_receiver),
+            RuntimeMode::EventDriven => self.run_event_driven(app, &wake_receiver),
         }
     }
 
-    fn run_fixed_frame(&mut self, app: &mut App) {
+    fn run_fixed_frame(&mut self, app: &mut App, wake_receiver: &Receiver<()>) {
         let frame_rate = self
             .frame_rate
             .expect("fixed-frame runtime must have a frame rate");
@@ -141,18 +167,18 @@ impl RuntimeControl {
                     app.tick();
                     std::thread::sleep(frame_duration);
                 }
-                RuntimeState::Waiting | RuntimeState::Sleeping => self.wait(),
+                RuntimeState::Waiting | RuntimeState::Sleeping => Self::wait(wake_receiver),
                 RuntimeState::Closed => return,
             }
         }
     }
 
-    fn run_event_driven(&mut self, app: &mut App) {
+    fn run_event_driven(&mut self, app: &mut App, wake_receiver: &Receiver<()>) {
         loop {
             self.sync_event_snapshot(app);
             match self.status() {
                 RuntimeState::Working => app.fast_forward_tick(),
-                RuntimeState::Waiting | RuntimeState::Sleeping => self.wait(),
+                RuntimeState::Waiting | RuntimeState::Sleeping => Self::wait(wake_receiver),
                 RuntimeState::Closed => return,
             }
         }

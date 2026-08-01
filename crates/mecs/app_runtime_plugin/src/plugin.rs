@@ -3,12 +3,7 @@ use std::sync::mpsc::sync_channel;
 use core_plugin::{App, Event, Plugin, World};
 
 use crate::resource::RuntimeControl;
-use crate::{RuntimeError, RuntimeHandle, RuntimeMode};
-
-pub const STARTUP: &str = "startup";
-pub const PRE_UPDATE: &str = "pre_update";
-pub const UPDATE: &str = "update";
-pub const POST_UPDATE: &str = "post_update";
+use crate::{RuntimeError, RuntimeEventSender, RuntimeHandle, RuntimeMode};
 
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimePlugin {
@@ -17,6 +12,11 @@ pub struct RuntimePlugin {
 }
 
 impl RuntimePlugin {
+    pub const STARTUP: &'static str = "startup";
+    pub const PRE_UPDATE: &'static str = "pre_update";
+    pub const UPDATE: &'static str = "update";
+    pub const POST_UPDATE: &'static str = "post_update";
+
     pub fn fixed(frame_rate: u64) -> Self {
         if frame_rate == 0 {
             RuntimeError::InvalidFrameRate { frame_rate }.panic();
@@ -44,10 +44,10 @@ impl Plugin for RuntimePlugin {
         {
             RuntimeError::RuntimePluginAlreadyInstalled.panic();
         }
-        app.add_once_schedule(STARTUP.into())
-            .add_schedule(PRE_UPDATE.into())
-            .add_schedule(UPDATE.into())
-            .add_schedule(POST_UPDATE.into());
+        app.add_once_schedule(Self::STARTUP.into())
+            .add_schedule(Self::PRE_UPDATE.into())
+            .add_schedule(Self::UPDATE.into())
+            .add_schedule(Self::POST_UPDATE.into());
 
         let (wake_sender, wake_receiver) = sync_channel(1);
         let handle = RuntimeHandle::new(wake_sender);
@@ -80,27 +80,26 @@ impl AppRunExt for App {
 }
 
 pub trait WorldEventExt {
-    fn emit_event<E: Event>(&self, event: E);
-    fn emit_event_after<E: Event>(&self, event: E, delay: u64);
+    fn event_sender(&self) -> RuntimeEventSender;
+    fn send_event<E: Event>(&self, event: E);
+    fn send_event_after<E: Event>(&self, event: E, delay: u64);
 }
 
 impl WorldEventExt for World {
-    fn emit_event<E: Event>(&self, event: E) {
+    fn event_sender(&self) -> RuntimeEventSender {
         let handle = self
             .get_resource::<RuntimeHandle>()
             .unwrap_or_else(|| RuntimeError::RuntimePluginMissing.panic())
             .clone();
-        self.event_write().send_event(event);
-        handle.wake();
+        RuntimeEventSender::new(self.event_emitter(), handle)
     }
 
-    fn emit_event_after<E: Event>(&self, event: E, delay: u64) {
-        let handle = self
-            .get_resource::<RuntimeHandle>()
-            .unwrap_or_else(|| RuntimeError::RuntimePluginMissing.panic())
-            .clone();
-        self.event_write().send_event_after(event, delay);
-        handle.wake();
+    fn send_event<E: Event>(&self, event: E) {
+        self.event_sender().send_event(event);
+    }
+
+    fn send_event_after<E: Event>(&self, event: E, delay: u64) {
+        self.event_sender().send_event_after(event, delay);
     }
 }
 
@@ -128,7 +127,7 @@ mod tests {
         app.register_event::<Notice>()
             .add_plugin(RuntimePlugin::default());
 
-        app.world().emit_event(Notice);
+        app.world().send_event(Notice);
 
         assert_eq!(app.world().event_snapshot().normal_event_count, 1);
     }
@@ -140,10 +139,10 @@ mod tests {
         app.add_plugin(RuntimePlugin::default());
 
         for (schedule, label) in [
-            (STARTUP, "startup"),
-            (PRE_UPDATE, "pre_update"),
-            (UPDATE, "update"),
-            (POST_UPDATE, "post_update"),
+            (RuntimePlugin::STARTUP, "startup"),
+            (RuntimePlugin::PRE_UPDATE, "pre_update"),
+            (RuntimePlugin::UPDATE, "update"),
+            (RuntimePlugin::POST_UPDATE, "post_update"),
         ] {
             let calls = Arc::clone(&calls);
             app.add_system(schedule, move |_world: &mut World| {
@@ -176,6 +175,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "RuntimePlugin is not installed")]
     fn event_extensions_require_the_runtime_plugin() {
-        World::new().emit_event(Notice);
+        World::new().send_event(Notice);
     }
 }

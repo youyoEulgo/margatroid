@@ -441,6 +441,16 @@ Result<T, E>：Event trait实现
 
 事件特征：trait: Send + Sync + 'static
 
+事件发射器：结构体--可克隆并跨线程发出事件，只写入Core事件队列，不唤醒Runtime
+    事件队列：共享引用<写锁<事件队列>>--私有
+    Clone：公开trait实现
+    发出事件：公开泛型方法
+        签名：emit_event<事件类型:事件特征>(&self, 事件体：事件类型)
+        行为：获取事件队列写锁，调用事件队列::send_event后释放锁
+    延迟发出事件：公开泛型方法
+        签名：emit_event_after<事件类型:事件特征>(&self, 事件体：事件类型, 延迟帧：64位无符号整数)
+        行为：获取事件队列写锁，调用事件队列::send_event_after后释放锁
+
 事件读取器<'a, 事件类型:事件特征>：结构体--System临时持有
     存储：只读引用<'a, 事件读取存储<事件类型>>--私有，直接引用本次更新事件，不持有锁守卫
     数量：公开方法
@@ -460,14 +470,12 @@ Result<T, E>：Event trait实现
 ## 逻辑
 ```text
 发送事件：
-    事件队列 = World::获取事件写锁--只锁定待执行事件
-    事件队列.send_event(事件体)               -> 下一次tick
-    事件队列.send_event_after(事件体, 0)      -> 下一次tick
-    事件队列.send_event_after(事件体, frames) -> 下一次tick之后再等待frames次tick
+    World.emit_event(事件体)               -> 下一次tick
+    World.emit_event_after(事件体, 0)      -> 下一次tick
+    World.emit_event_after(事件体, frames) -> 下一次tick之后再等待frames次tick
 
 发送pending事件：
-    事件队列 = World::获取事件写锁
-    事件句柄 = 事件队列.send_pending<Result成功类型, Result错误类型>()
+    事件句柄 = World.emit_pending<Result成功类型, Result错误类型>()
     事件句柄.complete(result)               -> 下一次tick
     事件句柄.complete_after(result, frames) -> 下一次tick之后再等待frames次tick
 
@@ -582,11 +590,21 @@ World：结构体--统一持有并协调ECS数据
         行为：返回资源注册表::contains的结果
 
     --事件
-    事件队列：写锁<事件队列>--私有
+    事件队列：共享引用<写锁<事件队列>>--私有，与克隆出的事件发射器共享
     事件读取存储注册表：事件读取存储注册表--私有，配置期和tick开始时独占修改，System执行期共享读取
-    获取事件写锁：公开方法
-        签名：event_write() -> 写锁借用<事件队列>
-        行为：获取待执行事件队列的独占写借用，锁中毒时终止并报告错误
+    发出事件：公开泛型方法
+        签名：emit_event<事件类型:事件特征>(事件体：事件类型)
+        行为：获取事件队列写锁，调用事件队列::send_event后释放锁
+    延迟发出事件：公开泛型方法
+        签名：emit_event_after<事件类型:事件特征>(事件体：事件类型, 延迟帧：64位无符号整数)
+        行为：获取事件队列写锁，调用事件队列::send_event_after后释放锁
+    发出pending事件：公开泛型方法
+        签名：emit_pending<T, E>() -> 事件句柄<Result<T, E>>
+        约束：T与E满足Send + Sync + 'static
+        行为：获取事件队列写锁，调用事件队列::send_pending取得事件句柄后释放锁并返回事件句柄
+    获取事件发射器：公开方法
+        签名：event_emitter() -> 事件发射器
+        行为：克隆事件队列共享引用并构造事件发射器
     获取事件读取存储注册表可变引用：crate公开方法
         签名：event_registry_mut() -> 可变引用<事件读取存储注册表>
         行为：通过World可变引用返回事件读取存储注册表的可变引用

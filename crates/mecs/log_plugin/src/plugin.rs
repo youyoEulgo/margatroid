@@ -1,6 +1,6 @@
 use std::sync::{Mutex, OnceLock};
 
-use app_runtime_plugin::POST_UPDATE;
+use app_runtime_plugin::RuntimePlugin;
 use core_plugin::{App, CoreError, Plugin, Resource};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -108,7 +108,7 @@ impl Default for LogPlugin {
             console: Some(ConsoleTarget::Stderr),
             file: None,
             stream_capacity: None,
-            schedule: POST_UPDATE.into(),
+            schedule: RuntimePlugin::POST_UPDATE.into(),
         }
     }
 }
@@ -317,7 +317,7 @@ mod tests {
         assert_eq!(plugin.console, Some(ConsoleTarget::Stderr));
         assert_eq!(plugin.file, None);
         assert_eq!(plugin.stream_capacity, None);
-        assert_eq!(plugin.schedule, POST_UPDATE);
+        assert_eq!(plugin.schedule, RuntimePlugin::POST_UPDATE);
     }
 
     #[test]

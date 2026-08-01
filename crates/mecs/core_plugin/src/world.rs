@@ -1,4 +1,4 @@
-use std::sync::{RwLock, RwLockWriteGuard};
+use std::sync::{Arc, RwLock};
 
 use crate::component::ComponentRegistry;
 use crate::entity::EntityAllocator;
@@ -6,7 +6,8 @@ use crate::events::EventReadStorageRegistry;
 use crate::query::Query;
 use crate::resource::ResourceRegistry;
 use crate::{
-    Component, Entity, Event, EventQueue, EventReader, EventSnapshot, QueryResult, Resource,
+    Component, Entity, Event, EventEmitter, EventHandle, EventQueue, EventReader, EventSnapshot,
+    QueryResult, Resource,
 };
 
 pub struct World {
@@ -14,7 +15,7 @@ pub struct World {
     components: ComponentRegistry,
     resources: ResourceRegistry,
     query: Query,
-    event_queue: RwLock<EventQueue>,
+    event_queue: Arc<RwLock<EventQueue>>,
     event_registry: EventReadStorageRegistry,
 }
 
@@ -25,7 +26,7 @@ impl World {
             components: ComponentRegistry::new(),
             resources: ResourceRegistry::new(),
             query: Query::new(),
-            event_queue: RwLock::new(EventQueue::new()),
+            event_queue: Arc::new(RwLock::new(EventQueue::new())),
             event_registry: EventReadStorageRegistry::new(),
         }
     }
@@ -119,8 +120,33 @@ impl World {
         self.resources.contains::<R>()
     }
 
-    pub fn event_write(&self) -> RwLockWriteGuard<'_, EventQueue> {
-        self.event_queue.write().expect("event queue lock poisoned")
+    pub fn emit_event<E: Event>(&self, event: E) {
+        self.event_queue
+            .write()
+            .expect("event queue lock poisoned")
+            .send_event(event);
+    }
+
+    pub fn event_emitter(&self) -> EventEmitter {
+        EventEmitter::new(Arc::clone(&self.event_queue))
+    }
+
+    pub fn emit_event_after<E: Event>(&self, event: E, delay: u64) {
+        self.event_queue
+            .write()
+            .expect("event queue lock poisoned")
+            .send_event_after(event, delay);
+    }
+
+    pub fn emit_pending<T, E>(&self) -> EventHandle<Result<T, E>>
+    where
+        T: Send + Sync + 'static,
+        E: Send + Sync + 'static,
+    {
+        self.event_queue
+            .write()
+            .expect("event queue lock poisoned")
+            .send_pending()
     }
 
     pub(crate) fn event_registry_mut(&mut self) -> &mut EventReadStorageRegistry {

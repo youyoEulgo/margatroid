@@ -224,7 +224,7 @@ mod tests {
             HttpServerPlugin::bind("127.0.0.1:0").with_shutdown_timeout(Duration::from_millis(100)),
         );
         app.add_plugins(DaemonLifecyclePlugin);
-        app.world().send_event(SignalListenerFailed {
+        app.world().emit_event(SignalListenerFailed {
             message: "test failure".into(),
         });
 
