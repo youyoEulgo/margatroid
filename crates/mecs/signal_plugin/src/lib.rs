@@ -1,16 +1,15 @@
-//! Converts configured operating-system signals into typed ECS events.
+//! 将配置的操作系统信号转换为类型化 ECS 事件。
 //!
-//! The plugin provides mechanism only: applications decide whether a received signal should stop,
-//! reload, pause, or otherwise affect the app.
+//! Plugin 只提供信号输入机制；应用自行决定收到信号后关闭、重载、暂停或忽略。
 //!
 //! ```no_run
 //! use core_plugin::App;
-//! use external_event_plugin::ExternalEventPlugin;
+//! use app_runtime_plugin::RuntimePlugin;
 //! use signal_plugin::SignalPlugin;
 //!
 //! let mut app = App::new();
-//! app.add_plugins(ExternalEventPlugin);
-//! app.add_plugins(SignalPlugin::new());
+//! app.add_plugin(RuntimePlugin::default());
+//! app.add_plugin(SignalPlugin::new());
 //! app.tick();
 //! ```
 

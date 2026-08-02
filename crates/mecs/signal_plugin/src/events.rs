@@ -1,3 +1,5 @@
+use core_plugin::Event;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProcessSignal {
     Interrupt,
@@ -20,3 +22,6 @@ pub struct ProcessSignalReceived {
 pub struct SignalListenerFailed {
     pub message: String,
 }
+
+impl Event for ProcessSignalReceived {}
+impl Event for SignalListenerFailed {}
