@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use external_event_plugin::{ExternalEventSendError, ExternalEventSender};
+use app_runtime_plugin::RuntimeEventSender;
+use core_plugin::Resource;
 use signal_hook::iterator::{Handle, Signals};
 
 use crate::{ProcessSignal, ProcessSignalReceived};
@@ -12,7 +12,6 @@ use crate::{ProcessSignal, ProcessSignalReceived};
 struct SignalInner {
     iterator: Mutex<Option<Handle>>,
     thread: Mutex<Option<JoinHandle<()>>>,
-    dropped: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -26,7 +25,6 @@ impl SignalHandle {
             inner: Arc::new(SignalInner {
                 iterator: Mutex::new(None),
                 thread: Mutex::new(None),
-                dropped: AtomicU64::new(0),
             }),
         }
     }
@@ -40,10 +38,6 @@ impl SignalHandle {
             .is_some_and(|thread| !thread.is_finished())
     }
 
-    pub fn dropped_count(&self) -> u64 {
-        self.inner.dropped.load(Ordering::Acquire)
-    }
-
     pub fn shutdown(&self) {
         self.inner.shutdown();
     }
@@ -51,7 +45,7 @@ impl SignalHandle {
     pub(crate) fn start(
         &self,
         configured: &[ProcessSignal],
-        sender: ExternalEventSender<ProcessSignalReceived>,
+        sender: RuntimeEventSender,
     ) -> io::Result<()> {
         let mut thread_slot = self
             .inner
@@ -65,7 +59,6 @@ impl SignalHandle {
         let signal_map = resolve_signals(configured)?;
         let mut signals = Signals::new(signal_map.keys().copied())?;
         let iterator = signals.handle();
-        let inner = Arc::downgrade(&self.inner);
         let thread = std::thread::Builder::new()
             .name("mecs-signal-listener".into())
             .spawn(move || {
@@ -73,15 +66,7 @@ impl SignalHandle {
                     let Some(signal) = signal_map.get(&raw_signal).copied() else {
                         continue;
                     };
-                    match sender.try_send(ProcessSignalReceived { signal }) {
-                        Ok(()) => {}
-                        Err(ExternalEventSendError::Full(_)) => {
-                            if let Some(inner) = inner.upgrade() {
-                                inner.dropped.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        Err(ExternalEventSendError::Closed(_)) => break,
-                    }
+                    sender.send_event(ProcessSignalReceived { signal });
                 }
             })?;
         *self
@@ -93,6 +78,8 @@ impl SignalHandle {
         Ok(())
     }
 }
+
+impl Resource for SignalHandle {}
 
 impl SignalInner {
     fn shutdown(&self) {

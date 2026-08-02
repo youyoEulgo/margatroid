@@ -22,10 +22,8 @@ Plugin 集合，不包含 Agent、Workspace、LLM 等 Margatroid 业务概念。
 ```text
 core_plugin             同步 ECS 与单帧执行
 app_runtime_plugin      阻塞运行循环、唤醒和关闭
-external_event_plugin   外部线程向 ECS 发送有界 Event
 async_runtime_plugin    Future 执行与结果回流
 signal_plugin           进程信号转 Event
-terminal_input_plugin   终端输入转 Event
 log_plugin              tracing 配置、SystemLog 与 EventLog 投影
 server_plugin           HTTP、WebSocket、流式通道与服务生命周期
 ```
@@ -137,18 +135,7 @@ pub trait AppShutdownExt {
 安装，依赖者后安装，因此依赖者先关闭。`after_shutdown` 只用于所有依赖关闭后的最终状态；
 不公开固定的 Begin/Workers/Finish 阶段。
 
-## 5. external_event_plugin
-
-```rust
-pub use options::ExternalEventOptions;
-pub use plugin::{ExternalEventAppExt, ExternalEventPlugin};
-pub use sender::{ExternalEventSendError, ExternalEventSender};
-```
-
-`App::external_event_sender::<E>()` 是外部线程发送 E 的唯一入口。sender 有界、非阻塞，
-发送成功时唤醒 App；First 阶段把外部事件写入 World。
-
-## 6. async_runtime_plugin
+## 5. async_runtime_plugin
 
 ```rust
 pub use error::{AsyncRuntimeError, AsyncTaskError};
@@ -166,7 +153,7 @@ Plugin 自行挂载最终的 `Result<T, E>` 响应处理 System。异步函数�
 `WorldAsyncExt::spawn_async_service` 用于 Server 等长期基础设施 Future，不创建 pending
 事件、不操作 Runtime gate，也不自动产生完成事件。
 
-## 7. signal_plugin
+## 6. signal_plugin
 
 ```rust
 pub use events::{ProcessSignal, ProcessSignalReceived, SignalListenerFailed};
@@ -175,23 +162,11 @@ pub use plugin::SignalPlugin;
 pub use resource::SignalHandle;
 ```
 
-SignalPlugin 只把信号转换为 Event，不决定关闭、重载或暂停。Handle 仅用于查询和提前停止
-监听器。
+SignalPlugin 依赖 RuntimePlugin，通过 `RuntimeEventSender` 将信号直接转换为 Event 并唤醒
+Runtime，不决定关闭、重载或暂停。Handle 仅用于查询和提前停止监听器；App 销毁时通过
+RAII 回收信号线程。
 
-## 8. terminal_input_plugin
-
-```rust
-pub use events::{TerminalEvent, TerminalInputFailed, TerminalInputFailureKind, TerminalSize};
-pub use options::TerminalInputOptions;
-pub use plugin::TerminalInputPlugin;
-pub use resource::{TerminalError, TerminalSessionHandle};
-```
-
-Plugin 负责终端会话的 RAII 恢复。输入通过 `TerminalEvent` 统一输出；无需独立消费的内部
-失败分类不形成额外 Event。Key 和 Mouse 数据直接使用并重导出 crossterm 的公开类型，避免
-再维护一套字段相同的包装结构。
-
-## 9. log_plugin
+## 7. log_plugin
 
 直接调用 `tracing` 宏的进程诊断称为 SystemLog。`LogPlugin` 安装 console、rolling
 file 和可选 bounded stream Layer，默认只启用 stderr Console Layer。
@@ -205,7 +180,7 @@ file 和可选 bounded stream Layer，默认只启用 stderr Console Layer。
 `WorldEventLogExt`、`TracingRecord`、`TracingField`、`TracingStream`、
 `TracingSubscription` 和 `TracingStreamError`。tracing Subscriber 的组合类型不公开。
 
-## 10. server_plugin
+## 8. server_plugin
 
 ```rust
 pub use events::{HttpRequestReceived, ServerFailed, ServerStarted, ServerStopped};
@@ -231,7 +206,7 @@ pub use websocket::{
 断开通知。发送器可以按连接 ID、唯一非空名称或不具名集合查询。业务 endpoint 和消息
 语义属于业务 Plugin。
 
-## 11. 稳定性
+## 9. 稳定性
 
 - `lib.rs` 未导出的类型都不是兼容承诺。
 - Options 新增字段必须有默认值。
