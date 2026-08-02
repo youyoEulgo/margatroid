@@ -97,16 +97,7 @@ impl Plugin for ServerPlugin {
         app.world_mut().insert_resource(WebSocketConnections::new());
         app.world_mut().insert_resource(self.options);
         app.world_mut().insert_resource(ServerHandle::new());
-        app.register_event::<HttpRequestReceived>()
-            .register_event::<ServerStarted>()
-            .register_event::<ServerFailed>()
-            .register_event::<ServerStopped>()
-            .register_event::<WebSocketConnected>()
-            .register_event::<WebSocketMessageReceived>()
-            .register_event::<WebSocketStreamOpened>()
-            .register_event::<WebSocketDisconnected>()
-            .register_event::<WebSocketProtocolFailed>()
-            .add_system(RuntimePlugin::STARTUP, start_server);
+        app.add_system(RuntimePlugin::STARTUP, start_server);
     }
 }
 

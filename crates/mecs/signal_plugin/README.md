@@ -1,9 +1,12 @@
 # SignalPlugin
 
-`SignalPlugin` 将配置的操作系统进程信号转换为类型化 ECS 事件。它不决定应用收到信号后
-应该关闭、重载、暂停还是忽略。
+## 介绍
 
-## 快速开始
+`SignalPlugin` 监听配置的操作系统进程信号，将其转换为类型化 ECS 事件并唤醒 Runtime。
+它是输入桥接，不是关闭管理器；关闭、重载、暂停或忽略由读取事件的 System 决定。句柄可以
+显式停止监听，未显式停止时由 RAII 完成回收。
+
+## 使用说明
 
 ```rust
 use app_runtime_plugin::RuntimePlugin;
@@ -88,7 +91,7 @@ assert!(!handle.is_running());
 
 ## 公开 API
 
-- `SignalPlugin`：注册事件、Handle 和 STARTUP System。
+- `SignalPlugin`：插入 Handle 并添加 STARTUP System。
 - `SignalOptions`：选择需要监听的进程信号。
 - `ProcessSignal`：跨平台稳定信号枚举。
 - `ProcessSignalReceived`：成功捕获信号时产生的事件。

@@ -47,8 +47,7 @@ fn async_context_is_injected_into_a_named_function() {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
-        .add_async_system::<u32, anyhow::Error>(RuntimePlugin::PRE_UPDATE)
-        .register_event::<Progress>();
+        .add_async_system::<u32, anyhow::Error>(RuntimePlugin::PRE_UPDATE);
     app.world().send_async_event(report_progress, false);
     app.tick();
 

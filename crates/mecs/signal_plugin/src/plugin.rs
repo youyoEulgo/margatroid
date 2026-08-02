@@ -1,7 +1,7 @@
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Plugin, World};
 
-use crate::{ProcessSignalReceived, SignalHandle, SignalListenerFailed, SignalOptions};
+use crate::{SignalHandle, SignalListenerFailed, SignalOptions};
 
 #[derive(Clone, Debug, Default)]
 pub struct SignalPlugin {
@@ -33,15 +33,13 @@ impl Plugin for SignalPlugin {
         let startup_handle = handle.clone();
         let signals = self.options.signals;
         app.world_mut().insert_resource(handle);
-        app.register_event::<ProcessSignalReceived>()
-            .register_event::<SignalListenerFailed>()
-            .add_system(RuntimePlugin::STARTUP, move |world: &mut World| {
-                if let Err(error) = startup_handle.start(&signals, world.event_sender()) {
-                    world.send_event(SignalListenerFailed {
-                        message: error.to_string(),
-                    });
-                }
-            });
+        app.add_system(RuntimePlugin::STARTUP, move |world: &mut World| {
+            if let Err(error) = startup_handle.start(&signals, world.event_sender()) {
+                world.send_event(SignalListenerFailed {
+                    message: error.to_string(),
+                });
+            }
+        });
     }
 }
 
@@ -50,7 +48,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::ProcessSignal;
+    use crate::{ProcessSignal, ProcessSignalReceived};
 
     #[test]
     fn signal_becomes_event_without_implicit_shutdown() {

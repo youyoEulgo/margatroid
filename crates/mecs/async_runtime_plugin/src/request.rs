@@ -163,8 +163,7 @@ mod tests {
     #[test]
     fn world_builds_normal_and_blocking_async_events() {
         let mut app = App::new();
-        app.register_event::<AsyncRequest<u32, TestError>>()
-            .add_plugin(app_runtime_plugin::RuntimePlugin::default());
+        app.add_plugin(app_runtime_plugin::RuntimePlugin::default());
 
         let value = 1;
         app.world()
@@ -197,8 +196,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "RuntimePlugin is not installed")]
     fn sending_an_async_event_requires_the_runtime_plugin() {
-        let mut app = App::new();
-        app.register_event::<AsyncRequest<u32, TestError>>();
+        let app = App::new();
         app.world()
             .send_async_event(|| async { Ok::<u32, TestError>(1) }, false);
     }

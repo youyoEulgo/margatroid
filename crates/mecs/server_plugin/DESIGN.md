@@ -488,8 +488,6 @@ ServerPlugin：结构体
             创建空WebSocket连接注册表并作为Resource插入World
             将服务器配置作为Resource插入World
             创建服务器句柄并作为Resource插入World
-            注册收到HTTP请求、服务器已启动、服务器失败和服务器已停止事件
-            注册WebSocket已连接、收到WebSocket消息、WebSocket支流已打开、WebSocket已断开和WebSocket协议失败事件
             将启动服务器System挂到RuntimePlugin::STARTUP
 
 App Server拓展：trait

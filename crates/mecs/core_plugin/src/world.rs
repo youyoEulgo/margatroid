@@ -149,10 +149,6 @@ impl World {
             .send_pending()
     }
 
-    pub(crate) fn event_registry_mut(&mut self) -> &mut EventReadStorageRegistry {
-        &mut self.event_registry
-    }
-
     pub fn event_reader<E: Event>(&self) -> EventReader<'_, E> {
         self.event_registry.reader()
     }

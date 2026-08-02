@@ -17,19 +17,26 @@ where
 enum EventState {
     Pending,
     Normal {
-        body: Box<dyn Any + Send + Sync>,
-        type_name: &'static str,
+        body: Box<dyn ErasedEvent>,
         remaining_delay_frames: u64,
     },
 }
 
 type EventNode = Arc<Mutex<EventState>>;
 
+trait ErasedEvent: Send + Sync + 'static {
+    fn push_into(self: Box<Self>, registry: &mut EventReadStorageRegistry);
+}
+
+impl<E: Event> ErasedEvent for E {
+    fn push_into(self: Box<Self>, registry: &mut EventReadStorageRegistry) {
+        registry.push(*self);
+    }
+}
+
 trait ErasedEventReadStorage: Any + Send + Sync + 'static {
     fn clear(&mut self);
-    fn push_boxed(&mut self, body: Box<dyn Any + Send + Sync>);
     fn as_any(&self) -> &dyn Any;
-    #[allow(dead_code)]
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
@@ -52,13 +59,6 @@ impl<E: Event> ErasedEventReadStorage for EventReadStorage<E> {
         self.events.clear();
     }
 
-    fn push_boxed(&mut self, body: Box<dyn Any + Send + Sync>) {
-        let event = body
-            .downcast::<E>()
-            .expect("event body type must match its TypeId");
-        self.push(*event);
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -79,35 +79,31 @@ impl EventReadStorageRegistry {
         }
     }
 
-    pub(crate) fn register<E: Event>(&mut self) {
-        self.storages
-            .entry(TypeId::of::<E>())
-            .or_insert_with(|| Box::new(EventReadStorage::<E>::new()));
-    }
-
     pub(crate) fn reader<E: Event>(&self) -> EventReader<'_, E> {
-        let storage = self
+        let events = self
             .storages
             .get(&TypeId::of::<E>())
-            .unwrap_or_else(|| {
-                CoreError::EventNotRegistered {
-                    type_name: std::any::type_name::<E>(),
-                }
-                .panic()
+            .map(|storage| {
+                &storage
+                    .as_any()
+                    .downcast_ref::<EventReadStorage<E>>()
+                    .expect("event storage type must match its TypeId")
+                    .events[..]
             })
-            .as_any()
-            .downcast_ref::<EventReadStorage<E>>()
-            .expect("event storage type must match its TypeId");
-        EventReader { storage }
+            .unwrap_or(&[]);
+        EventReader { events }
     }
 
-    fn push_event(&mut self, body: Box<dyn Any + Send + Sync>, type_name: &'static str) {
-        let event_type = body.as_ref().type_id();
+    fn push<E: Event>(&mut self, event: E) {
         let storage = self
             .storages
-            .get_mut(&event_type)
-            .unwrap_or_else(|| CoreError::EventNotRegistered { type_name }.panic());
-        storage.push_boxed(body);
+            .entry(TypeId::of::<E>())
+            .or_insert_with(|| Box::new(EventReadStorage::<E>::new()));
+        storage
+            .as_any_mut()
+            .downcast_mut::<EventReadStorage<E>>()
+            .expect("event storage type must match its TypeId")
+            .push(event);
     }
 
     pub(crate) fn clear(&mut self) {
@@ -148,7 +144,6 @@ where
         }
         *state = EventState::Normal {
             body: Box::new(result),
-            type_name: std::any::type_name::<Result<T, E>>(),
             remaining_delay_frames: extra_delay_frames,
         };
         snapshot.pending_event_count -= 1;
@@ -230,14 +225,13 @@ impl EventQueue {
                     remaining_delay_frames: 0,
                     ..
                 } => {
-                    let EventState::Normal {
-                        body, type_name, ..
-                    } = std::mem::replace(&mut *state, EventState::Pending)
+                    let EventState::Normal { body, .. } =
+                        std::mem::replace(&mut *state, EventState::Pending)
                     else {
                         unreachable!("matched event state must remain normal");
                     };
                     drop(state);
-                    registry.push_event(body, type_name);
+                    body.push_into(registry);
                     snapshot.normal_event_count -= 1;
                 }
                 EventState::Normal {
@@ -263,7 +257,6 @@ impl EventQueue {
         self.pending
             .push_back(Arc::new(Mutex::new(EventState::Normal {
                 body: Box::new(event),
-                type_name: std::any::type_name::<E>(),
                 remaining_delay_frames: 0,
             })));
         snapshot.normal_event_count += 1;
@@ -275,7 +268,6 @@ impl EventQueue {
         self.pending
             .push_back(Arc::new(Mutex::new(EventState::Normal {
                 body: Box::new(event),
-                type_name: std::any::type_name::<E>(),
                 remaining_delay_frames: extra_delay_frames,
             })));
         snapshot.normal_event_count += 1;
@@ -326,16 +318,16 @@ impl EventQueue {
 }
 
 pub struct EventReader<'a, E: Event> {
-    storage: &'a EventReadStorage<E>,
+    events: &'a [E],
 }
 
 impl<E: Event> EventReader<'_, E> {
     pub fn len(&self) -> usize {
-        self.storage.events.len()
+        self.events.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.storage.events.is_empty()
+        self.events.is_empty()
     }
 }
 
@@ -344,7 +336,7 @@ impl<'a, E: Event> IntoIterator for EventReader<'a, E> {
     type IntoIter = std::slice::Iter<'a, E>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.storage.events.iter()
+        self.events.iter()
     }
 }
 
@@ -353,6 +345,6 @@ impl<'reader, 'storage, E: Event> IntoIterator for &'reader EventReader<'storage
     type IntoIter = std::slice::Iter<'reader, E>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.storage.events.iter()
+        self.events.iter()
     }
 }

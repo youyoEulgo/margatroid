@@ -1,9 +1,18 @@
 # server_plugin
 
+## 介绍
+
 `server_plugin` 将 Axum HTTP 与 WebSocket 服务接入 mecs。它负责连接、路由、流式通道、
 背压和生命周期；业务协议仍由其他 Plugin 的 System 处理。
 
-## 快速开始
+Axum 持有协议状态、连接和网络通道，ECS 持有同步状态并做业务编排。完整消息交给同步 System；
+需要等待的数据留在异步线程累积或转发。流分片不逐条进入事件队列，避免网络速率改变 ECS 帧语义。
+
+这里采用同步处理、异步累积：事件传递连接和流的状态，通道传递持续到达的数据。发送器可以
+复制给多个持有者，接收器只能转交；流 ID 确定支流，连接 ID 确定客户端。Axum 管理网络，
+ECS 编排业务。
+
+## 使用说明
 
 ```rust
 use app_runtime_plugin::RuntimePlugin;
