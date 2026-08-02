@@ -13,11 +13,11 @@ use log_plugin::{LogStream, LogStreamError};
 use crate::resource::{LogEndpointOptions, ServerPluginOptions};
 
 #[derive(Clone, Debug, Default)]
-pub struct ServerPlugin {
+pub struct DaemonApiPlugin {
     options: ServerPluginOptions,
 }
 
-impl ServerPlugin {
+impl DaemonApiPlugin {
     pub fn new() -> Self {
         Self::default()
     }
@@ -32,11 +32,11 @@ impl ServerPlugin {
     }
 }
 
-impl Plugin for ServerPlugin {
+impl Plugin for DaemonApiPlugin {
     fn build(&self, app: &mut App) {
         assert!(
             app.world().resource::<HttpServerHandle>().is_some(),
-            "HttpServerPlugin must be installed before ServerPlugin"
+            "HttpServerPlugin must be installed before DaemonApiPlugin"
         );
         app.add_http_routes(Router::new().route("/health", get(health)));
 
@@ -119,7 +119,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(AppRuntimePlugin);
         app.add_plugins(HttpServerPlugin::bind("127.0.0.1:0"));
-        app.add_plugins(ServerPlugin::default());
+        app.add_plugins(DaemonApiPlugin::default());
         app.tick();
 
         assert!(app
@@ -137,7 +137,7 @@ mod tests {
             app.add_plugins(AppRuntimePlugin);
             app.add_plugins(HttpServerPlugin::bind("127.0.0.1:0"));
             app.add_plugins(
-                ServerPlugin::default()
+                DaemonApiPlugin::default()
                     .with_log_stream_endpoint(LogEndpointOptions::bearer_token("test-token")),
             );
         });
@@ -151,7 +151,7 @@ mod tests {
         app.add_plugins(AppRuntimePlugin);
         app.add_plugins(HttpServerPlugin::bind("127.0.0.1:0"));
         app.add_plugins(
-            ServerPlugin::default()
+            DaemonApiPlugin::default()
                 .with_log_stream_endpoint(LogEndpointOptions::bearer_token("test-token")),
         );
     }

@@ -107,6 +107,10 @@ pub trait WorldAsyncExt {
         T: Send + Sync + 'static,
         E: From<AsyncTaskError> + Send + Sync + 'static,
         Task: AsyncTask<T, E, Args>;
+
+    fn spawn_async_service<Service>(&self, service: Service)
+    where
+        Service: Future<Output = ()> + Send + 'static;
 }
 
 impl WorldAsyncExt for World {
@@ -123,10 +127,23 @@ impl WorldAsyncExt for World {
         };
         self.send_event(request);
     }
+
+    fn spawn_async_service<Service>(&self, service: Service)
+    where
+        Service: Future<Output = ()> + Send + 'static,
+    {
+        self.get_resource::<crate::AsyncRuntimeHandle>()
+            .unwrap_or_else(|| crate::AsyncRuntimeError::AsyncRuntimePluginMissing.panic())
+            .spawn(Box::pin(service));
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
     use core_plugin::App;
 
     use super::*;
@@ -184,5 +201,27 @@ mod tests {
         app.register_event::<AsyncRequest<u32, TestError>>();
         app.world()
             .send_async_event(|| async { Ok::<u32, TestError>(1) }, false);
+    }
+
+    #[test]
+    fn world_spawns_a_service_without_creating_an_event() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let service_completed = Arc::clone(&completed);
+        let mut app = App::new();
+        app.add_plugin(app_runtime_plugin::RuntimePlugin::default())
+            .add_plugin(crate::AsyncRuntimePlugin);
+
+        app.world().spawn_async_service(async move {
+            service_completed.store(true, Ordering::Release);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !completed.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "async service timed out");
+            std::thread::yield_now();
+        }
+        let snapshot = app.world().event_snapshot();
+        assert_eq!(snapshot.normal_event_count, 0);
+        assert_eq!(snapshot.pending_event_count, 0);
     }
 }

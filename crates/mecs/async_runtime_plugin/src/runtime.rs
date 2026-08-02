@@ -3,10 +3,10 @@ use std::thread;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
-use crate::resource::{AsyncExecutorHandle, ErasedExecutionTask};
+use crate::resource::{AsyncRuntimeHandle, ErasedExecutionTask};
 use crate::AsyncRuntimeError;
 
-pub(crate) fn start_executor() -> AsyncExecutorHandle {
+pub(crate) fn start_executor() -> AsyncRuntimeHandle {
     let (task_sender, task_receiver) = unbounded_channel();
     let (startup_sender, startup_receiver) = sync_channel(1);
     let thread = thread::Builder::new()
@@ -18,7 +18,7 @@ pub(crate) fn start_executor() -> AsyncExecutorHandle {
         .recv()
         .expect("async executor startup confirmation channel disconnected")
     {
-        Ok(()) => AsyncExecutorHandle::new(task_sender, thread),
+        Ok(()) => AsyncRuntimeHandle::new(task_sender, thread),
         Err(source) => {
             thread
                 .join()
