@@ -1,188 +1,282 @@
+# 伪代码格式
+```text
+模块：使用一级标题，只写当前设计涉及的部分
+
+类型：使用二级标题，按私有、crate公开和公开分组
+TypeName：中文类型名，可见性类型--类型说明
+    field_name: RustType--中文字段名，字段说明
+    method_name<Generic>(self, parameter: ParameterType) -> ReturnType
+        中文方法名：可见性方法，解释参数和用途
+        约束：使用标准Rust where约束；单个约束写在同一行
+        行为：展开完整逻辑
+    impl TraitName for TypeName
+        TraitName：可见性trait实现
+        trait_method_name(&self, parameter: ParameterType) -> ReturnType
+            中文方法名：解释参数和用途
+            行为：标准库trait的简单行为用一句话说明
+
+函数：使用二级标题，按私有、crate公开和公开分组，只放置不属于某个类型的操作
+function_name<Generic>(parameter: ParameterType) -> ReturnType
+    中文函数名：可见性函数，解释参数和用途
+    约束：使用标准Rust where约束；单个约束写在同一行
+    行为：展开完整逻辑
+
+逻辑：使用二级标题，按执行顺序描述对象之间的调用关系
+注释：字段注释使用--，类型、方法和函数的说明直接写在标题中
+属性：不写Rust Attribute，实现时自行判断
+边界：对外使用泛型和具体类型，内部使用类型擦除
+```
+
 # AsyncRuntimePlugin
 
 ## 类型
 
 公开：
 ```text
-异步请求模式：枚举
-    普通--任务完成后唤醒Runtime
-    阻塞下一帧--任务开始前关闭一层阀，完成后打开一层阀并唤醒Runtime
-
-AsyncTaskError：枚举--可以通过From转换进入开发者选择的响应错误类型E
-    NonExhaustive：公开属性--允许后续版本增加错误变体
-    Panicked { message: 字符串 }
+AsyncTaskError：异步任务错误，公开枚举--可通过From转换进入开发者选择的响应错误类型E
+    Panicked {
+        message: String--panic信息
+    }
     Cancelled
-    从JoinError构造：crate公开方法
-        签名：from_join_error(error: JoinError) -> Self
-        行为：JoinError表示panic时提取panic信息构造Panicked，否则构造Cancelled
-    Debug：公开trait实现
-        签名：Debug for AsyncTaskError
-    Display：公开trait实现
-        签名：Display for AsyncTaskError
-        行为：输出任务panic信息或任务已取消
-    Error：公开trait实现
-        签名：Error for AsyncTaskError
+    from_join_error(error: JoinError) -> Self
+        从JoinError构造：crate公开关联函数，error是受监督任务的结束状态
+        行为：panic时提取信息构造Panicked，否则构造Cancelled
+    impl fmt::Display for AsyncTaskError
+        Display：公开trait实现
+        fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
+            格式化任务错误：formatter接收稳定错误描述
+            行为：输出任务panic信息或任务已取消
+    impl std::error::Error for AsyncTaskError
+        Error：公开trait实现
 
-AsyncRuntimeError：枚举--描述异步执行基础设施的配置错误与运行错误
-    NonExhaustive：公开属性--允许后续版本增加错误变体
+AsyncRuntimeError：异步Runtime错误，公开枚举--描述异步基础设施的配置错误与运行错误
     RuntimePluginMissing
     AsyncRuntimePluginMissing
     AsyncRuntimePluginAlreadyInstalled
-    RequestAlreadyRegistered { request_type: 静态字符串引用 }
-    ExecutorThreadStartFailed { source: IO错误 }
-    ExecutorRuntimeBuildFailed { source: IO错误 }
+    RequestAlreadyRegistered {
+        request_type: &'static str--请求类型名
+    }
+    ExecutorThreadStartFailed {
+        source: io::Error--底层IO错误
+    }
+    ExecutorRuntimeBuildFailed {
+        source: io::Error--底层IO错误
+    }
     ExecutorDisconnected
-    终止：crate公开方法
-        签名：panic(self) -> Never
+    panic(self) -> !
+        终止：crate公开方法，消费当前AsyncRuntimeError并使用Display文本终止执行
         行为：使用自身Display描述触发panic
-    Debug：公开trait实现
-        签名：Debug for AsyncRuntimeError
-    Display：公开trait实现
-        签名：Display for AsyncRuntimeError
-        行为：输出包含错误类型与上下文的稳定错误描述
-    Error：公开trait实现
-        签名：Error for AsyncRuntimeError
-        行为：ExecutorThreadStartFailed与ExecutorRuntimeBuildFailed返回内部IO错误作为source，其他变体不返回source
+    impl fmt::Display for AsyncRuntimeError
+        Display：公开trait实现
+        fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
+            格式化Runtime错误：formatter接收稳定错误描述
+            行为：输出包含错误类型与上下文的描述
+    impl std::error::Error for AsyncRuntimeError
+        Error：公开trait实现
+        source(&self) -> Option<&(dyn std::error::Error + 'static)>
+            获取错误来源：返回执行线程启动或Runtime构建的底层IO错误
+            行为：其他变体返回None
 
-AsyncRuntimeHandle：结构体--由World持有，只通过受控拓展接口提交异步任务
-    任务发送端：可选<异步任务发送端>--私有
-    异步线程：可选<线程句柄>--私有
-    Resource：公开trait实现
-    构造：crate公开方法
-        签名：new(任务发送端, 异步线程) -> Self
-        行为：将任务发送端和异步线程分别包装为可选并构造AsyncRuntimeHandle
-    提交任务：crate公开方法
-        签名：spawn(&self, task: 类型擦除执行任务)
-        行为：将task发送到异步线程，通道断开时终止并报告AsyncRuntimeError::ExecutorDisconnected
-    Drop：私有trait实现
-        签名：Drop for AsyncRuntimeHandle
-        行为：先丢弃任务发送端关闭通道，再join专用异步线程并取消仍在运行的长期服务
+AsyncRuntimeHandle：异步Runtime句柄，公开结构体--由World持有，只通过受控扩展接口提交异步任务
+    sender: Option<UnboundedSender<ErasedExecutionTask>>--任务发送端，私有
+    thread: Option<JoinHandle<()>>--异步线程，私有
+    new(sender: UnboundedSender<ErasedExecutionTask>, thread: JoinHandle<()>) -> Self
+        构造句柄：crate公开关联函数，sender和thread组成执行器所有权
+        行为：将两个参数包装为Some
+    spawn(&self, task: ErasedExecutionTask)
+        提交任务：crate公开方法，task是类型擦除后的执行任务
+        行为：发送到异步线程；通道断开时报告AsyncRuntimeError::ExecutorDisconnected
+    impl Drop for AsyncRuntimeHandle
+        Drop：公开trait实现
+        drop(&mut self)
+            回收执行器：关闭任务通道并等待专用线程退出
+            行为：先take sender，再take并join thread
+    impl Resource for AsyncRuntimeHandle
+        Resource：公开trait实现
 
-异步上下文：结构体--由AsyncRuntime自动注入异步任务
-    Runtime事件发送器：Runtime事件发送器--私有
-    Clone：公开trait实现
-    发送事件：公开泛型方法
-        签名：send_event<事件类型:Event>(&self, event: 事件类型)
-        行为：调用Runtime事件发送器::send_event，事件入队后唤醒Runtime
-    延迟发送事件：公开泛型方法
-        签名：send_event_after<事件类型:Event>(&self, event: 事件类型, delay: 无符号整数)
-        行为：调用Runtime事件发送器::send_event_after，事件入队后唤醒Runtime
+AsyncContext：异步上下文，公开结构体--由AsyncRuntime自动注入需要上下文的任务
+    events: RuntimeEventSender--Runtime事件发送器，私有
+    new(events: RuntimeEventSender) -> Self
+        构造上下文：crate公开关联函数，events提供跨线程事件发送能力
+        行为：持有events
+    send_event<E>(&self, event: E)
+        发送事件：公开泛型方法，event是立即发送的中间事件
+        约束：E: Event
+        行为：调用RuntimeEventSender::send_event并唤醒Runtime
+    send_event_after<E>(&self, event: E, delay: u64)
+        延迟发送事件：公开泛型方法，delay指定额外延迟帧数
+        约束：E: Event
+        行为：调用RuntimeEventSender::send_event_after并唤醒Runtime
 
-异步任务<T, E, Args>：trait--公开泛型适配层，进入异步请求后擦除具体任务类型
-    Future：关联类型，满足Future<Output = Result<T, E>> + Send + 'static
-    运行：公开方法
-        签名：run(self, context: 异步上下文) -> Future
-    无上下文函数：公开trait实现
-        约束：Task满足FnOnce() -> Future + Send + 'static
-        行为：忽略AsyncRuntime注入的异步上下文并调用Task
-    上下文函数：公开trait实现
-        约束：Task满足FnOnce(异步上下文) -> Future + Send + 'static
-        行为：将AsyncRuntime注入的异步上下文传给Task
-
-异步请求<T, E>：结构体--本身是正常事件，持有只能取出一次的异步任务
-    异步任务：互斥锁<可选<类型擦除异步任务<T, E>>>--私有
-    请求模式：异步请求模式--私有
-    构造普通请求：公开泛型方法
-        签名：new<Task, Args>(task: Task) -> Self
+AsyncTask<T, E, Args>：异步任务适配层，公开trait--进入AsyncRequest后擦除具体任务类型
+    Future: Future<Output = Result<T, E>> + Send + 'static--关联类型
+    run(self, context: AsyncContext) -> Self::Future
+        运行任务：公开方法，context由AsyncRuntime注入
+    impl<T, E, Task, TaskFuture> AsyncTask<T, E, ()> for Task
+        无上下文函数：公开泛型trait实现
         约束：
-            Task: 异步任务<T, E, Args>
-            T满足Send + Sync + 'static
-            E满足From<AsyncTaskError> + Send + Sync + 'static
-        行为：擦除task类型并构造普通异步请求
-    构造阻塞请求：公开泛型方法
-        签名：blocking<Task, Future>(task: Task) -> Self
-        约束：与new相同
-        行为：擦除task类型并构造阻塞下一帧的异步请求
-    Event：公开trait实现
-        约束：T与E满足Send + Sync + 'static
-
-AsyncRuntimePlugin：结构体
-    默认：公开trait实现
-        签名：Default for AsyncRuntimePlugin
-        行为：构造AsyncRuntimePlugin
-    Plugin：公开trait实现
-        签名：build(self, app: &mut App)
-        行为：
-            从World获取RuntimeHandle
-            如果RuntimeHandle不存在，终止并报告AsyncRuntimeError::RuntimePluginMissing
-            如果AsyncRuntimeHandle或异步请求注册表已经存在，终止并报告AsyncRuntimeError::AsyncRuntimePluginAlreadyInstalled
-            创建异步任务通道
-            创建异步线程启动确认通道
-            启动一条专用异步线程并移入任务接收端与启动确认发送端
-            如果线程创建失败，终止并报告AsyncRuntimeError::ExecutorThreadStartFailed
-            等待异步线程报告Tokio Runtime创建结果
-            如果Tokio Runtime创建失败，终止并报告AsyncRuntimeError::ExecutorRuntimeBuildFailed
-            使用任务发送端构造AsyncRuntimeHandle并作为Resource插入World
-            创建异步请求注册表并作为Resource插入World
-
-App异步拓展：trait
-    添加异步System：公开泛型方法
-        签名：add_async_system<T, E>(&mut self, schedule: &str) -> &mut Self
+            Task: FnOnce() -> TaskFuture + Send + 'static
+            TaskFuture: Future<Output = Result<T, E>> + Send + 'static
+        run(self, _context: AsyncContext) -> Self::Future
+            运行任务：忽略注入的上下文
+            行为：调用self()
+    impl<T, E, Task, TaskFuture> AsyncTask<T, E, (AsyncContext,)> for Task
+        上下文函数：公开泛型trait实现
         约束：
-            T满足Send + Sync + 'static
-            E满足From<AsyncTaskError> + Send + Sync + 'static
-        行为：
-            如果异步请求注册表不存在，终止并报告AsyncRuntimeError::AsyncRuntimePluginMissing
-            如果异步请求<T, E>已经注册，终止并报告AsyncRuntimeError::RequestAlreadyRegistered
-            向指定Schedule添加异步分发System<T, E>
-            AsyncRequest<T, E>与Result<T, E>由Core在事件首次到期时自动建立读取存储
-            返回App可变引用
+            Task: FnOnce(AsyncContext) -> TaskFuture + Send + 'static
+            TaskFuture: Future<Output = Result<T, E>> + Send + 'static
+        run(self, context: AsyncContext) -> Self::Future
+            运行任务：把context传入业务函数
+            行为：调用self(context)
 
-World异步拓展：trait
-    发送异步事件：公开泛型方法
-        签名：send_async_event<T, E, Task, Args>(&self, task: Task, blocking: 布尔值)
+AsyncRequestMode：异步请求模式，公开枚举
+    Normal--普通，任务完成后唤醒Runtime
+    BlockNextFrame--阻塞下一帧，任务开始前关阀，完成后开阀
+
+AsyncRequest<T, E>：异步请求，公开结构体--本身是正常事件，持有只能取出一次的异步任务
+    task: Mutex<Option<ErasedAsyncTask<T, E>>>--类型擦除任务，私有
+    mode: AsyncRequestMode--请求模式，私有
+    new<Task, Args>(task: Task) -> Self
+        构造普通请求：公开泛型关联函数，task是需要执行的业务异步任务
+        约束：Task: AsyncTask<T, E, Args>
+        行为：调用from_task并使用Normal
+    blocking<Task, Args>(task: Task) -> Self
+        构造阻塞请求：公开泛型关联函数，task是需要执行的业务异步任务
+        约束：Task: AsyncTask<T, E, Args>
+        行为：调用from_task并使用BlockNextFrame
+    from_task<Task, Args>(task: Task, mode: AsyncRequestMode) -> Self
+        按模式构造：私有泛型关联函数，mode指定请求模式
+        约束：Task: AsyncTask<T, E, Args>
+        行为：将task包装为接收AsyncContext的ErasedAsyncTask并保存
+    take_task(&self) -> ErasedAsyncTask<T, E>
+        取出任务：crate公开方法
+        行为：锁定task并取出所有权；已取出时终止并报告只能执行一次
+    mode(&self) -> AsyncRequestMode
+        获取请求模式：crate公开方法
+        行为：返回mode
+    impl<T, E> Event for AsyncRequest<T, E>
+        Event：公开泛型trait实现
         约束：
-            T满足Send + Sync + 'static
-            E满足From<AsyncTaskError> + Send + Sync + 'static
-            Task满足异步任务<T, E, Args>
-        行为：
-            blocking为假时使用AsyncRequest::new构造普通请求
-            blocking为真时使用AsyncRequest::blocking构造阻塞下一帧的请求
-            调用WorldEventExt::send_event发送构造后的AsyncRequest<T, E>并唤醒Runtime
-    启动长期异步服务：公开泛型方法
-        签名：spawn_async_service<Service>(&self, service: Service)
-        约束：Service满足Future<Output = ()> + Send + 'static
-        行为：
-            AsyncRuntimeHandle不存在时终止并报告AsyncRuntimeError::AsyncRuntimePluginMissing
-            擦除service Future类型并提交到异步线程
-            不创建AsyncRequest和pending事件
-            不操作Runtime阀
-            不自动生成完成响应事件
-            服务错误、停止与优雅关闭由所属Plugin通过自己的Event、Resource与Handle管理
+            T: Send + Sync + 'static
+            E: From<AsyncTaskError> + Send + Sync + 'static
+
+AsyncRuntimePlugin：异步Runtime插件，公开单元结构体
+    impl Plugin for AsyncRuntimePlugin
+        Plugin：公开trait实现
+        build(self, app: &mut App)
+            构建插件：安装专用异步执行器与请求注册表
+            行为：
+                RuntimeHandle不存在时报告RuntimePluginMissing
+                AsyncRuntimeHandle或AsyncRequestRegistry已存在时报告AsyncRuntimePluginAlreadyInstalled
+                调用start_executor并插入AsyncRuntimeHandle
+                创建并插入AsyncRequestRegistry
+
+AppAsyncExt：App异步扩展，公开trait--挂载类型化异步请求分发System
+    add_async_system<T, E>(&mut self, schedule: &str) -> &mut Self
+        添加异步System：公开泛型方法，schedule指定分发阶段
+        约束：
+            T: Send + Sync + 'static
+            E: From<AsyncTaskError> + Send + Sync + 'static
+        行为：注册AsyncRequest<T, E>；重复时报告RequestAlreadyRegistered；向schedule添加dispatch_async_requests<T, E>
+    impl AppAsyncExt for App
+        AppAsyncExt for App：公开trait实现
+        add_async_system<T, E>(&mut self, schedule: &str) -> &mut Self
+            添加异步System：按trait定义执行
+            约束：
+                T: Send + Sync + 'static
+                E: From<AsyncTaskError> + Send + Sync + 'static
+            行为：Core在事件首次到期时自动建立AsyncRequest<T, E>与Result<T, E>读取存储
+
+WorldAsyncExt：World异步扩展，公开trait--发送异步请求或启动长期异步服务
+    send_async_event<T, E, Task, Args>(&self, task: Task, blocking: bool)
+        发送异步事件：公开泛型方法，task是业务任务，blocking决定是否阻塞下一帧
+        约束：
+            T: Send + Sync + 'static
+            E: From<AsyncTaskError> + Send + Sync + 'static
+            Task: AsyncTask<T, E, Args>
+        行为：按blocking构造AsyncRequest::new或blocking，并调用WorldEventExt::send_event
+    spawn_async_service<Service>(&self, service: Service)
+        启动长期异步服务：公开泛型方法，service由所属Plugin自行管理生命周期
+        约束：Service: Future<Output = ()> + Send + 'static
+        行为：从World取得AsyncRuntimeHandle并提交擦除后的Future；不创建请求、pending事件或响应
+    impl WorldAsyncExt for World
+        WorldAsyncExt for World：公开trait实现
+        send_async_event<T, E, Task, Args>(&self, task: Task, blocking: bool)
+            发送异步事件：按trait定义执行
+            约束：
+                T: Send + Sync + 'static
+                E: From<AsyncTaskError> + Send + Sync + 'static
+                Task: AsyncTask<T, E, Args>
+            行为：构造请求并发送到Runtime
+        spawn_async_service<Service>(&self, service: Service)
+            启动长期异步服务：按trait定义执行
+            约束：Service: Future<Output = ()> + Send + 'static
+            行为：擦除并提交service
+```
+
+crate公开：
+```text
+ErasedFuture<T, E>：类型擦除Future，crate公开类型别名--等于Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'static>>
+
+ErasedAsyncTask<T, E>：类型擦除异步任务，crate公开类型别名--等于Box<dyn FnOnce(AsyncContext) -> ErasedFuture<T, E> + Send + 'static>
+
+ErasedExecutionTask：类型擦除执行任务，crate公开类型别名--等于Pin<Box<dyn Future<Output = ()> + Send + 'static>>
+
+AsyncRequestRegistry：异步请求注册表，crate公开结构体--防止同一种请求挂载多个分发System
+    registered: HashSet<TypeId>--已注册请求，私有
+    new() -> Self
+        构造注册表：crate公开关联函数
+        行为：构造空HashSet
+    register<T, E>(&mut self) -> bool
+        注册请求：crate公开泛型方法
+        约束：
+            T: Send + Sync + 'static
+            E: From<AsyncTaskError> + Send + Sync + 'static
+        行为：插入AsyncRequest<T, E>的TypeId，首次返回true，已存在返回false
+    impl Resource for AsyncRequestRegistry
+        Resource：crate公开trait实现
+```
+
+## System
+
+私有：
+```text
+dispatch_async_requests<T, E>(world: &mut World)
+    分发异步请求：私有泛型System，world提供请求读取器、pending事件和执行器
+    约束：
+        T: Send + Sync + 'static
+        E: From<AsyncTaskError> + Send + Sync + 'static
+    行为：
+        读取本次更新的全部AsyncRequest<T, E>并取出task与mode
+        取得RuntimeHandle、RuntimeEventSender和AsyncRuntimeHandle
+        逐个请求创建EventHandle<Result<T, E>>
+        BlockNextFrame时调用close_gate
+        使用RuntimeEventSender构造AsyncContext
+        构造监督Future，在内层tokio::spawn运行task并await JoinHandle
+        正常结束保留业务Result；panic或取消转换为AsyncTaskError再转换为E
+        调用EventHandle::complete升变响应事件
+        Normal调用wake，BlockNextFrame调用open_gate
+        向AsyncRuntimeHandle提交监督Future
+```
+
+## 函数
+
+crate公开：
+```text
+start_executor() -> AsyncRuntimeHandle
+    启动异步执行器：crate公开函数
+    行为：创建任务和启动确认通道，启动专用线程，确认Tokio Runtime创建成功后返回AsyncRuntimeHandle
 ```
 
 私有：
 ```text
-类型擦除Future<T, E>：类型别名<Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'static>>>
+run_executor(mut task_receiver: UnboundedReceiver<ErasedExecutionTask>, startup_sender: SyncSender<Result<(), io::Error>>)
+    运行异步线程：私有函数，task_receiver接收监督Future，startup_sender报告初始化结果
+    行为：创建Tokio current-thread Runtime；报告结果；持续接收任务并逐个tokio::spawn
 
-类型擦除异步任务<T, E>：类型别名<Box<dyn FnOnce(异步上下文) -> 类型擦除Future<T, E> + Send + 'static>>
-
-类型擦除执行任务：类型别名<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>
-
-异步请求注册表：结构体--防止同一种异步请求注册多个分发System
-    已注册请求：集合<TypeId>
-    Resource：crate公开trait实现
-    构造：crate公开方法
-        签名：new() -> Self
-        行为：构造不包含任何TypeId的异步请求注册表
-    注册：私有泛型方法
-        签名：register<T, E>() -> 布尔值
-        行为：插入异步请求<T, E>的TypeId，首次插入返回真，已经存在返回假
-
-异步请求<T, E>：实现
-    按模式构造：私有泛型方法
-        签名：from_task<Task, Future>(task: Task, mode: 异步请求模式) -> Self
-        约束：与new相同
-        行为：擦除task类型并使用指定请求模式构造异步请求
-    取出任务：crate公开方法
-        签名：take_task(&self) -> 类型擦除异步任务<T, E>
-        行为：
-            锁定异步任务
-            取出任务所有权
-            如果任务已经被取出，终止并报告异步请求只能执行一次
-    获取请求模式：crate公开方法
-        签名：mode(&self) -> 异步请求模式
-        行为：返回请求模式
+panic_message(payload: Box<dyn Any + Send + 'static>) -> String
+    提取panic信息：私有函数，payload是类型擦除panic载荷
+    行为：依次尝试String和&'static str，均不匹配时返回固定描述
 ```
 
 ## 持有关系
@@ -191,163 +285,98 @@ World异步拓展：trait
 配置完成：
 App
 └── World
-    ├── RuntimeHandle资源
-    ├── 异步请求注册表资源
-    └── AsyncRuntimeHandle资源
-        └── 异步任务发送端
+    ├── RuntimeHandle Resource
+    ├── AsyncRequestRegistry Resource
+    └── AsyncRuntimeHandle Resource
+        ├── Option<UnboundedSender<ErasedExecutionTask>>
+        └── Option<JoinHandle<()>>
 
 专用异步线程
-└── Tokio单线程Runtime
-    └── 异步任务接收端
+└── Tokio current-thread Runtime
+    └── UnboundedReceiver<ErasedExecutionTask>
 
-已提交的异步任务
-├── 类型擦除异步任务<T, E>
-├── 异步上下文
-│   └── Runtime事件发送器
-├── 事件句柄<Result<T, E>>
+已提交的受监督任务
+├── ErasedAsyncTask<T, E>
+├── AsyncContext
+│   └── RuntimeEventSender
+├── EventHandle<Result<T, E>>
 └── RuntimeHandle克隆
-```
-
-## System
-
-私有：
-```text
-异步分发System<T, E>：泛型System
-    签名：dispatch_async_requests<T, E>(world: &mut World)
-    约束：
-        T满足Send + Sync + 'static
-        E满足From<AsyncTaskError> + Send + Sync + 'static
-    行为：
-        读取本次更新的全部异步请求<T, E>事件
-        从World借用AsyncRuntimeHandle
-        从World取得RuntimeHandle克隆
-        从World取得Runtime事件发送器
-        循环：逐个处理异步请求
-            从异步请求取出任务所有权
-            调用World::emit_pending创建pending响应事件并取得事件句柄<Result<T, E>>
-            如果请求模式为阻塞下一帧，调用RuntimeHandle::close_gate
-            使用Runtime事件发送器克隆构造异步上下文
-            构造持有事件句柄的任务监督Future并擦除类型
-                将异步上下文传给类型擦除异步任务
-                将异步任务放入内层Tokio任务并spawn，任务监督Future保留事件句柄
-                await内层任务的JoinHandle
-                分流：JoinHandle结果
-                    正常完成：取得异步任务返回的Result<T, E>
-                    任务panic：提取panic信息，构造AsyncTaskError::Panicked并转换为E
-                    任务取消：构造AsyncTaskError::Cancelled并转换为E
-                调用事件句柄::complete将最终Result<T, E>升变为正常响应事件
-                分流：请求模式
-                    普通：调用RuntimeHandle::wake
-                    阻塞下一帧：调用RuntimeHandle::open_gate
-            调用AsyncRuntimeHandle::spawn提交类型擦除执行任务
-```
-
-## 函数
-
-私有：
-```text
-启动异步执行器：私有函数
-    签名：start_executor() -> AsyncRuntimeHandle
-    行为：创建任务通道和启动确认通道，启动专用线程，确认Tokio Runtime创建成功后返回AsyncRuntimeHandle
-
-运行异步线程：私有函数
-    签名：run_executor(任务接收端, 启动确认发送端)
-    行为：创建Tokio current-thread Runtime，报告启动结果，并持续接收任务监督Future后逐个tokio::spawn
-
-提取panic信息：私有函数
-    签名：panic_message(payload: 类型擦除panic载荷) -> 字符串
-    行为：依次尝试读取String和静态字符串引用，均不匹配时返回固定的非字符串panic描述
 ```
 
 ## 逻辑
 
 ```text
 启动异步线程：
-    -> 专用线程创建Tokio current-thread Runtime
-    -> 通过启动确认通道向Plugin报告创建成功或AsyncRuntimeError::ExecutorRuntimeBuildFailed
-    -> 在Runtime中持续await异步任务接收端
-    -> 每收到一个任务监督Future，单独调用tokio::spawn
-    -> 所有任务在同一条异步线程并发执行
+    -> start_executor创建专用线程
+    -> run_executor创建Tokio current-thread Runtime
+    -> 通过启动确认通道报告成功或ExecutorRuntimeBuildFailed
+    -> 持续await task_receiver
+    -> 每收到一个ErasedExecutionTask，单独tokio::spawn
 
 添加异步System：
     app.add_async_system<T, E>(schedule)
-        -> 在异步请求注册表中注册异步请求<T, E>
-        -> 已经注册时终止并报告AsyncRuntimeError::RequestAlreadyRegistered
-        -> 向指定Schedule添加异步分发System<T, E>
-        --AsyncRequest<T, E>与Result<T, E>均由Core在事件首次到期时自动建立读取存储
-
-发送异步事件：
-    world.send_async_event(task, blocking)
-        -> 根据blocking构造普通或阻塞AsyncRequest<T, E>
-        -> 调用WorldEventExt::send_event发送请求并唤醒Runtime
+        -> AsyncRequestRegistry::register<T, E>
+        -> 重复时报告RequestAlreadyRegistered
+        -> 向schedule添加dispatch_async_requests<T, E>
 
 发送普通异步请求：
-    -> System发送异步请求::new(task)
-    -> 异步分发System读取请求
-    -> 创建pending响应事件
-    -> 将任务提交到异步线程
-    -> Runtime发现只有pending事件时进入等待
-    -> 异步任务完成
-    -> pending事件升变为延迟0的正常Result<T, E>事件
-    -> 唤醒Runtime
-    -> 下一次tick读取响应事件
-
-异步任务发送中间事件：
-    -> AsyncRuntime自动向异步任务注入异步上下文
-    -> 异步任务调用异步上下文::send_event一次或多次
-    -> 每个事件直接写入Core事件队列并唤醒Runtime
-    -> 普通请求的中间事件可以在任务完成前被System处理
-    -> 阻塞请求的中间事件先入队，等待任务完成并开阀后处理
-    -> 异步任务最终返回Result<T, E>并完成自身pending响应事件
-
-异步任务panic：
-    -> 内层Tokio任务panic并返回JoinError
-    -> 任务监督Future仍然持有事件句柄
-    -> 从JoinError提取panic信息并构造AsyncTaskError::Panicked
-    -> 调用E::from转换为开发者选择的响应错误类型
-    -> 使用Err(E)完成pending响应事件
-    -> 普通请求唤醒Runtime，阻塞请求打开阀
-    -> 下一次tick由响应System读取错误响应
+    world.send_async_event(task, false)
+        -> 构造AsyncRequest::new(task)
+        -> 发送事件并唤醒Runtime
+        -> dispatch_async_requests创建pending Result<T, E>
+        -> 异步线程执行任务
+        -> 任务完成后EventHandle::complete
+        -> RuntimeHandle::wake
+        -> 下一帧读取Result<T, E>
 
 发送阻塞下一帧的异步请求：
-    -> System发送异步请求::blocking(task)
-    -> 异步分发System创建pending响应事件
-    -> RuntimeHandle::close_gate使阻塞计数加1
-    -> 当前帧继续执行完成
-    -> Runtime在下一帧前进入等待
-    -> 异步任务完成并升变pending响应事件
-    -> RuntimeHandle::open_gate使阻塞计数减1
-    -> 所有阻塞任务完成、计数归零时唤醒Runtime
-    -> 下一帧读取响应事件
+    world.send_async_event(task, true)
+        -> 构造AsyncRequest::blocking(task)
+        -> 分发时RuntimeHandle::close_gate
+        -> 当前帧完成，下一帧前等待
+        -> 任务完成并升变响应事件
+        -> RuntimeHandle::open_gate
+        -> 所有阻塞计数归零时唤醒Runtime
 
-响应事件区分：
-    add_async_system只挂载读取AsyncRequest<T, E>的通用异步分发System
-    读取Result<T, E>的业务响应System由业务Plugin自行挂载并选择Schedule
-    AsyncRuntimePlugin不生成请求ID、不识别Agent，也不负责响应路由
-    多个同类型并发请求由开发者自行在T、E或业务类型中携带请求ID、Agent ID或其他上下文
-    响应System按照开发者定义的上下文自行完成路由
+异步任务发送中间事件：
+    -> AsyncRuntime注入AsyncContext
+    -> 任务调用send_event或send_event_after任意次数
+    -> 每个事件进入Core队列并唤醒Runtime
+    -> Normal请求的中间事件可在任务结束前处理
+    -> BlockNextFrame请求的事件等待开阀后处理
+
+异步任务panic或取消：
+    -> 内层JoinHandle返回错误
+    -> 监督Future仍持有EventHandle
+    -> 转换为AsyncTaskError，再通过E::from转换
+    -> 使用Err(E)完成pending响应
+    -> 按mode唤醒或开阀
+
+响应路由：
+    add_async_system只挂载读取AsyncRequest<T, E>的通用分发System
+    Result<T, E>业务响应System由业务Plugin自行挂载并选择Schedule
+    AsyncRuntimePlugin不生成请求ID、不识别Agent、不负责同类型并发请求路由
+    开发者自行在T、E或业务类型中携带上下文
 
 错误边界：
-    业务错误由开发者定义E，或选择anyhow::Error等通用错误类型
-    AsyncTaskError通过E::from进入Result<T, E>响应事件，AsyncRuntimePlugin不依赖anyhow
-    AsyncRuntimeError描述Plugin配置与执行器基础设施错误，遇到时终止并报告对应错误
-    锁中毒、类型擦除不一致和内部状态不一致属于不变量破坏，直接panic且不进入公开错误类型
+    业务错误由开发者定义E，也可选择anyhow::Error
+    AsyncTaskError通过E::from进入Result响应，AsyncRuntimePlugin不依赖anyhow
+    AsyncRuntimeError描述Plugin配置与执行器基础设施错误
+    锁中毒、类型擦除不一致和内部状态不一致属于不变量破坏，直接panic
 ```
 
 ## 职责
 
 ```text
 AsyncRuntimePlugin：
-    持有异步执行器的任务发送端
     启动并管理专用异步线程
-    提供异步请求事件与泛型分发System
+    提供AsyncRequest与泛型分发System
     创建pending响应事件
-    监督异步任务的正常完成、业务错误、panic与取消
-    无论任务如何结束都将pending事件升变为Result<T, E>响应事件
-    根据请求模式唤醒Runtime或控制阻塞计数
+    监督正常完成、业务错误、panic与取消
+    根据请求模式唤醒Runtime或控制阀
 
 RuntimePlugin：
     不执行异步任务
     不创建或填充pending事件
-    只提供运行循环、阻塞计数、RuntimeHandle与事件发送拓展
+    只提供运行循环、RuntimeHandle、阀与事件发送扩展
 ```
