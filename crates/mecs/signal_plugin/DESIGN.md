@@ -134,7 +134,6 @@ crate名称：signal_plugin。
             RuntimeHandle不存在时终止并报告RuntimePlugin must be installed before SignalPlugin
             信号句柄已经存在时终止并报告SignalPlugin can only be installed once
             创建信号句柄并将其作为Resource插入World
-            注册收到进程信号与信号监听失败事件
             将启动信号监听System挂到RuntimePlugin::STARTUP
             STARTUP System调用信号句柄::start
             start失败时通过World::send_event发送信号监听失败事件并唤醒Runtime
@@ -219,7 +218,7 @@ App
     app.add_plugin(RuntimePlugin)
         -> app.add_plugin(SignalPlugin)
         -> SignalPlugin检查依赖与重复安装
-        -> 注册事件、SignalHandle资源与STARTUP System
+        -> 插入SignalHandle资源并添加STARTUP System
 
 启动：
     第一次tick

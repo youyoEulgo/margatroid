@@ -124,9 +124,8 @@ App异步拓展：trait
         行为：
             如果异步请求注册表不存在，终止并报告AsyncRuntimeError::AsyncRuntimePluginMissing
             如果异步请求<T, E>已经注册，终止并报告AsyncRuntimeError::RequestAlreadyRegistered
-            注册异步请求<T, E>事件
-            注册Result<T, E>响应事件
             向指定Schedule添加异步分发System<T, E>
+            AsyncRequest<T, E>与Result<T, E>由Core在事件首次到期时自动建立读取存储
             返回App可变引用
 
 World异步拓展：trait
@@ -274,9 +273,8 @@ App
     app.add_async_system<T, E>(schedule)
         -> 在异步请求注册表中注册异步请求<T, E>
         -> 已经注册时终止并报告AsyncRuntimeError::RequestAlreadyRegistered
-        -> 注册异步请求<T, E>
-        -> 注册Result<T, E>
         -> 向指定Schedule添加异步分发System<T, E>
+        --AsyncRequest<T, E>与Result<T, E>均由Core在事件首次到期时自动建立读取存储
 
 发送异步事件：
     world.send_async_event(task, blocking)

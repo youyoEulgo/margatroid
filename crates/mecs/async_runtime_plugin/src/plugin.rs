@@ -51,9 +51,7 @@ impl AppAsyncExt for App {
             .panic();
         }
 
-        self.register_event::<AsyncRequest<T, E>>()
-            .register_event::<Result<T, E>>()
-            .add_system(schedule, dispatch_async_requests::<T, E>)
+        self.add_system(schedule, dispatch_async_requests::<T, E>)
     }
 }
 
@@ -188,7 +186,6 @@ mod tests {
     #[test]
     fn async_context_sends_events_before_completing_the_response() {
         let mut app = app();
-        app.register_event::<Progress>();
         app.world().send_async_event(report_progress, false);
         app.tick();
 

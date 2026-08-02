@@ -1,8 +1,17 @@
 # AsyncRuntimePlugin
 
+## 介绍
+
 `AsyncRuntimePlugin` 为 mecs 提供专用异步线程，不把 Tokio 引入 `core_plugin`。
 
-## 快速开始
+同步 System 始终留在主线程，异步线程只执行不能在一帧内完成的任务。请求以闭包描述行为，
+响应以 `Result<T, E>` 回到类型化事件流；任务不借用 World，也不把 Tokio 类型泄露给 Core。
+
+同步路径是事件传类型、System 传闭包，异步路径则是事件传闭包、System 传响应类型。异步请求
+先创建 pending 响应占位，任务完成后再升变为普通响应事件。任务 panic 或取消时，监督器会
+把它转换为错误响应，仍然交回主线程处理。
+
+## 使用说明
 
 ```rust
 use app_runtime_plugin::RuntimePlugin;
@@ -87,13 +96,13 @@ async fn load_with_progress(context: AsyncContext) -> Result<String, LoadError> 
     Ok("done".to_string())
 }
 
-app.register_event::<LoadProgress>();
 app.world()
     .send_async_event(load_with_progress, false);
 ```
 
 `AsyncContext::send_event` 每次都会写入事件队列并唤醒 Runtime。普通异步请求的中间事件
-可以在任务完成前处理；阻塞异步请求需要等任务完成并开阀后处理。
+可以在任务完成前处理；阻塞异步请求需要等任务完成并开阀后处理。事件类型由 Core 在首次
+到期时自动建立读取存储，不需要预先注册。
 
 ### 使用 anyhow
 
@@ -123,7 +132,7 @@ app.world().send_async_event(load_config, false);
 - `AsyncRequest<T, E>`：封装一次只能执行一次的异步闭包。
 - `AsyncRequest::new`：普通请求，完成后唤醒 Runtime。
 - `AsyncRequest::blocking`：阻止下一帧开始，完成后开阀。
-- `AppAsyncExt::add_async_system`：注册请求与响应事件，并将异步分发 System 挂到开发者指定的 Schedule。
+- `AppAsyncExt::add_async_system`：将对应请求类型的异步分发 System 挂到开发者指定的 Schedule。
 - `WorldAsyncExt::send_async_event`：从异步闭包构造并发送 `AsyncRequest`，唤醒 Runtime，
   布尔参数决定是否阻塞下一帧。
 - `AsyncTaskError`：将任务 panic 或取消转换进开发者选择的错误类型 `E`。
