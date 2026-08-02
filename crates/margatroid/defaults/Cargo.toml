@@ -9,7 +9,7 @@ async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
 daemon_lifecycle_plugin = { path = "../daemon_lifecycle_plugin" }
 external_event_plugin = { path = "../../mecs/external_event_plugin" }
-http_server_plugin = { path = "../../mecs/http_server_plugin" }
+http_server_plugin = { package = "server_plugin", path = "../../mecs/server_plugin" }
 log_plugin = { path = "../../mecs/log_plugin" }
-server_plugin = { path = "../server_plugin" }
+daemon_api_plugin = { path = "../daemon_api_plugin" }
 signal_plugin = { path = "../../mecs/signal_plugin" }

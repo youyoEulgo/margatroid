@@ -1,5 +1,5 @@
 mod plugin;
 mod resource;
 
-pub use plugin::ServerPlugin;
+pub use plugin::DaemonApiPlugin;
 pub use resource::{LogEndpointOptions, ServerPluginOptions};

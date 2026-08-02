@@ -27,7 +27,7 @@ async_runtime_plugin    Future 执行与结果回流
 signal_plugin           进程信号转 Event
 terminal_input_plugin   终端输入转 Event
 log_plugin              tracing 配置、SystemLog 与 EventLog 投影
-http_server_plugin      Axum 路由组合与服务生命周期
+server_plugin           HTTP、WebSocket、流式通道与服务生命周期
 ```
 
 core 不依赖任何其他 Plugin，也不依赖 Tokio。基础设施 Plugin 可以依赖已稳定的下层
@@ -155,6 +155,7 @@ pub use error::{AsyncRuntimeError, AsyncTaskError};
 pub use plugin::{AppAsyncExt, AsyncRuntimePlugin};
 pub use request::{AsyncRequest, AsyncRequestMode, AsyncTask, WorldAsyncExt};
 pub use context::AsyncContext;
+pub use resource::AsyncRuntimeHandle;
 ```
 
 `AppAsyncExt::add_async_system::<T, E>(schedule)` 注册 `AsyncRequest<T, E>` 与
@@ -162,6 +163,8 @@ pub use context::AsyncContext;
 Schedule。`WorldAsyncExt::send_async_event` 将异步闭包封装为请求事件。业务
 Plugin 自行挂载最终的 `Result<T, E>` 响应处理 System。异步函数可以声明
 `AsyncContext` 参数，由 AsyncRuntime 自动注入并用于在任务完成前发送普通事件。
+`WorldAsyncExt::spawn_async_service` 用于 Server 等长期基础设施 Future，不创建 pending
+事件、不操作 Runtime gate，也不自动产生完成事件。
 
 ## 7. signal_plugin
 
@@ -202,17 +205,31 @@ file 和可选 bounded stream Layer，默认只启用 stderr Console Layer。
 `WorldEventLogExt`、`TracingRecord`、`TracingField`、`TracingStream`、
 `TracingSubscription` 和 `TracingStreamError`。tracing Subscriber 的组合类型不公开。
 
-## 10. http_server_plugin
+## 10. server_plugin
 
 ```rust
-pub use events::HttpServerFailed;
-pub use options::HttpServerOptions;
-pub use plugin::{HttpAppExt, HttpServerPlugin};
-pub use resource::HttpServerHandle;
+pub use events::{HttpRequestReceived, ServerFailed, ServerStarted, ServerStopped};
+pub use options::ServerOptions;
+pub use plugin::{AppServerExt, ServerPlugin};
+pub use resource::ServerHandle;
+pub use response::{HttpResponse, HttpResponseHead, HttpResponseSession};
+pub use websocket::{
+    JsonWebSocketMessageClassifier, WebSocketConnected, WebSocketConnectionId,
+    WebSocketConnections, WebSocketDisconnected, WebSocketMessageClassifier,
+    WebSocketMessageReceived, WebSocketNameError, WebSocketSender,
+    WebSocketStreamOpened, WebSocketStreamReceiver,
+};
 ```
 
-`HttpAppExt::add_http_routes` 是注册路由的唯一入口。Handle 提供 `is_running`、`address` 和
-`shutdown`；不再同时公开 State 和 Started Event。业务 endpoint 属于业务 Plugin。
+`AppServerExt` 支持原生 Axum Router、HTTP 事件委托和 WebSocket 事件路由。HTTP 流式响应
+通过可转交的 `HttpResponseSession` 发送；WebSocket 普通消息进入 ECS，带
+`Start/Chunk/End/Abort` 信封的连续分片进入有界支流通道。Handle 提供
+`is_running`、`local_address` 和 `shutdown`。
+
+`WebSocketConnections` 由 ServerPlugin 自动维护并与 Axum 共享。连接建立时先注册不具名
+发送器，再发送只携带连接 ID 的连接通知；连接断开时先删除注册表条目及名称索引，再发送
+断开通知。发送器可以按连接 ID、唯一非空名称或不具名集合查询。业务 endpoint 和消息
+语义属于业务 Plugin。
 
 ## 11. 稳定性
 

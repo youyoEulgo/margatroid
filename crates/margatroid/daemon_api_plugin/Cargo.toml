@@ -1,5 +1,5 @@
 [package]
-name = "server_plugin"
+name = "daemon_api_plugin"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 axum = { workspace = true }
 core_plugin = { path = "../../mecs/core_plugin" }
 futures-util = { workspace = true }
-http_server_plugin = { path = "../../mecs/http_server_plugin" }
+http_server_plugin = { package = "server_plugin", path = "../../mecs/server_plugin" }
 log_plugin = { path = "../../mecs/log_plugin" }
 serde_json = { workspace = true }
 

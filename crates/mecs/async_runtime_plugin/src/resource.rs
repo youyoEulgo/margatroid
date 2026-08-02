@@ -11,12 +11,12 @@ use crate::{AsyncRequest, AsyncRuntimeError};
 
 pub(crate) type ErasedExecutionTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-pub(crate) struct AsyncExecutorHandle {
+pub struct AsyncRuntimeHandle {
     sender: Option<UnboundedSender<ErasedExecutionTask>>,
     thread: Option<JoinHandle<()>>,
 }
 
-impl AsyncExecutorHandle {
+impl AsyncRuntimeHandle {
     pub(crate) fn new(
         sender: UnboundedSender<ErasedExecutionTask>,
         thread: JoinHandle<()>,
@@ -36,7 +36,7 @@ impl AsyncExecutorHandle {
     }
 }
 
-impl Drop for AsyncExecutorHandle {
+impl Drop for AsyncRuntimeHandle {
     fn drop(&mut self) {
         self.sender.take();
         if let Some(thread) = self.thread.take() {
@@ -45,7 +45,7 @@ impl Drop for AsyncExecutorHandle {
     }
 }
 
-impl Resource for AsyncExecutorHandle {}
+impl Resource for AsyncRuntimeHandle {}
 
 pub(crate) struct AsyncRequestRegistry {
     registered: HashSet<TypeId>,

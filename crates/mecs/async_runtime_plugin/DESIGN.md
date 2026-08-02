@@ -44,6 +44,20 @@ AsyncRuntimeError：枚举--描述异步执行基础设施的配置错误与运�
         签名：Error for AsyncRuntimeError
         行为：ExecutorThreadStartFailed与ExecutorRuntimeBuildFailed返回内部IO错误作为source，其他变体不返回source
 
+AsyncRuntimeHandle：结构体--由World持有，只通过受控拓展接口提交异步任务
+    任务发送端：可选<异步任务发送端>--私有
+    异步线程：可选<线程句柄>--私有
+    Resource：公开trait实现
+    构造：crate公开方法
+        签名：new(任务发送端, 异步线程) -> Self
+        行为：将任务发送端和异步线程分别包装为可选并构造AsyncRuntimeHandle
+    提交任务：crate公开方法
+        签名：spawn(&self, task: 类型擦除执行任务)
+        行为：将task发送到异步线程，通道断开时终止并报告AsyncRuntimeError::ExecutorDisconnected
+    Drop：私有trait实现
+        签名：Drop for AsyncRuntimeHandle
+        行为：先丢弃任务发送端关闭通道，再join专用异步线程并取消仍在运行的长期服务
+
 异步上下文：结构体--由AsyncRuntime自动注入异步任务
     Runtime事件发送器：Runtime事件发送器--私有
     Clone：公开trait实现
@@ -91,14 +105,14 @@ AsyncRuntimePlugin：结构体
         行为：
             从World获取RuntimeHandle
             如果RuntimeHandle不存在，终止并报告AsyncRuntimeError::RuntimePluginMissing
-            如果异步执行器句柄或异步请求注册表已经存在，终止并报告AsyncRuntimeError::AsyncRuntimePluginAlreadyInstalled
+            如果AsyncRuntimeHandle或异步请求注册表已经存在，终止并报告AsyncRuntimeError::AsyncRuntimePluginAlreadyInstalled
             创建异步任务通道
             创建异步线程启动确认通道
             启动一条专用异步线程并移入任务接收端与启动确认发送端
             如果线程创建失败，终止并报告AsyncRuntimeError::ExecutorThreadStartFailed
             等待异步线程报告Tokio Runtime创建结果
             如果Tokio Runtime创建失败，终止并报告AsyncRuntimeError::ExecutorRuntimeBuildFailed
-            使用任务发送端构造异步执行器句柄并作为Resource插入World
+            使用任务发送端构造AsyncRuntimeHandle并作为Resource插入World
             创建异步请求注册表并作为Resource插入World
 
 App异步拓展：trait
@@ -126,6 +140,16 @@ World异步拓展：trait
             blocking为假时使用AsyncRequest::new构造普通请求
             blocking为真时使用AsyncRequest::blocking构造阻塞下一帧的请求
             调用WorldEventExt::send_event发送构造后的AsyncRequest<T, E>并唤醒Runtime
+    启动长期异步服务：公开泛型方法
+        签名：spawn_async_service<Service>(&self, service: Service)
+        约束：Service满足Future<Output = ()> + Send + 'static
+        行为：
+            AsyncRuntimeHandle不存在时终止并报告AsyncRuntimeError::AsyncRuntimePluginMissing
+            擦除service Future类型并提交到异步线程
+            不创建AsyncRequest和pending事件
+            不操作Runtime阀
+            不自动生成完成响应事件
+            服务错误、停止与优雅关闭由所属Plugin通过自己的Event、Resource与Handle管理
 ```
 
 私有：
@@ -135,20 +159,6 @@ World异步拓展：trait
 类型擦除异步任务<T, E>：类型别名<Box<dyn FnOnce(异步上下文) -> 类型擦除Future<T, E> + Send + 'static>>
 
 类型擦除执行任务：类型别名<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>
-
-异步执行器句柄：结构体--由World持有，System使用它向异步线程提交任务
-    任务发送端：可选<异步任务发送端>
-    异步线程：可选<线程句柄>
-    Resource：crate公开trait实现
-    构造：crate公开方法
-        签名：new(任务发送端, 异步线程) -> Self
-        行为：将任务发送端和异步线程分别包装为可选并构造异步执行器句柄
-    提交任务：私有方法
-        签名：spawn(&self, task: 类型擦除执行任务)
-        行为：将task发送到异步线程，通道断开时终止并报告AsyncRuntimeError::ExecutorDisconnected
-    Drop：私有trait实现
-        签名：Drop for 异步执行器句柄
-        行为：先丢弃任务发送端关闭通道，再join专用异步线程
 
 异步请求注册表：结构体--防止同一种异步请求注册多个分发System
     已注册请求：集合<TypeId>
@@ -184,7 +194,7 @@ App
 └── World
     ├── RuntimeHandle资源
     ├── 异步请求注册表资源
-    └── 异步执行器句柄资源
+    └── AsyncRuntimeHandle资源
         └── 异步任务发送端
 
 专用异步线程
@@ -210,7 +220,7 @@ App
         E满足From<AsyncTaskError> + Send + Sync + 'static
     行为：
         读取本次更新的全部异步请求<T, E>事件
-        从World借用异步执行器句柄
+        从World借用AsyncRuntimeHandle
         从World取得RuntimeHandle克隆
         从World取得Runtime事件发送器
         循环：逐个处理异步请求
@@ -230,7 +240,7 @@ App
                 分流：请求模式
                     普通：调用RuntimeHandle::wake
                     阻塞下一帧：调用RuntimeHandle::open_gate
-            调用异步执行器句柄::spawn提交类型擦除执行任务
+            调用AsyncRuntimeHandle::spawn提交类型擦除执行任务
 ```
 
 ## 函数
@@ -238,8 +248,8 @@ App
 私有：
 ```text
 启动异步执行器：私有函数
-    签名：start_executor() -> 异步执行器句柄
-    行为：创建任务通道和启动确认通道，启动专用线程，确认Tokio Runtime创建成功后返回异步执行器句柄
+    签名：start_executor() -> AsyncRuntimeHandle
+    行为：创建任务通道和启动确认通道，启动专用线程，确认Tokio Runtime创建成功后返回AsyncRuntimeHandle
 
 运行异步线程：私有函数
     签名：run_executor(任务接收端, 启动确认发送端)
