@@ -5,7 +5,6 @@ use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::{App, Plugin};
 use daemon_api_plugin::{DaemonApiPlugin, LogEndpointOptions};
 use daemon_lifecycle_plugin::DaemonLifecyclePlugin;
-use external_event_plugin::ExternalEventPlugin;
 use http_server_plugin::HttpServerPlugin;
 use log_plugin::{LogPlugin, LogStreamOptions};
 use signal_plugin::SignalPlugin;
@@ -67,7 +66,6 @@ impl Plugin for MargatroidDaemonPlugins {
         }
         app.add_plugins(log_plugin)
             .add_plugins(AppRuntimePlugin)
-            .add_plugins(ExternalEventPlugin)
             .add_plugins(SignalPlugin::new())
             .add_plugins(AsyncRuntimePlugin::default())
             .add_plugins(HttpServerPlugin::bind(self.bind_address))
