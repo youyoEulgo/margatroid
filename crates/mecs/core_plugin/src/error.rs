@@ -6,7 +6,6 @@ pub enum CoreError {
     AppAlreadyStarted,
     ScheduleAlreadyExists { name: String },
     ScheduleNotFound { name: String },
-    EventNotRegistered { type_name: &'static str },
     EntityCapacityExhausted,
     PendingEventAlreadyCompleted,
 }
@@ -26,9 +25,6 @@ impl fmt::Display for CoreError {
             }
             Self::ScheduleNotFound { name } => {
                 write!(formatter, "schedule `{name}` does not exist")
-            }
-            Self::EventNotRegistered { type_name } => {
-                write!(formatter, "event `{type_name}` is not registered")
             }
             Self::EntityCapacityExhausted => formatter.write_str("entity capacity exhausted"),
             Self::PendingEventAlreadyCompleted => {

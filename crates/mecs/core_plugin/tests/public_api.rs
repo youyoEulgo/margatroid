@@ -14,7 +14,6 @@ struct TestPlugin;
 impl Plugin for TestPlugin {
     fn build(self, app: &mut App) {
         app.world_mut().insert_resource(Settings(1));
-        app.register_event::<Updated>();
         app.add_schedule("update".into());
     }
 }

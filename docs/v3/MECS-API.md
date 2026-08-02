@@ -63,7 +63,6 @@ impl App {
         systems: impl IntoIterator<Item = impl System>,
     ) -> &mut Self;
     pub fn add_resource<R: Resource>(&mut self, resource: R) -> &mut Self;
-    pub fn add_event<E: Event>(&mut self) -> &mut Self;
     pub fn event_reader<E: Event>(&self) -> EventReader<E>;
     pub fn world(&self) -> &World;
     pub fn world_mut(&mut self) -> &mut World;
@@ -95,8 +94,8 @@ Event:    emit_event / event_reader
 
 ### 3.5 Event
 
-每种 Event 有独立队列，每个 `EventReader<E>` 有独立游标。Reader 默认只读取创建后发送的
-事件。Event 按帧保留，读取返回值，不暴露存储锁。
+Event 先进入共享队列，到期时由 Core 自动建立对应类型的本帧读取存储，不需要显式注册。
+`EventReader<E>` 只读取本帧事件；该类型从未出现时返回空读取器，不暴露存储锁。
 
 ### 3.6 Plugin
 
@@ -171,7 +170,7 @@ RAII 回收信号线程。
 直接调用 `tracing` 宏的进程诊断称为 SystemLog。`LogPlugin` 安装 console、rolling
 file 和可选 bounded stream Layer，默认只启用 stderr Console Layer。
 
-`EventLog` 通过 ECS 事件队列传播，由 `LogPlugin` 注册在 `RuntimePlugin::POST_UPDATE` 的 System
+`EventLog` 通过 ECS 事件队列传播，由 `LogPlugin` 挂在 `RuntimePlugin::POST_UPDATE` 的 System
 投影为 `target = "mecs::event_log"` 的 tracing Event。其他 Plugin 可以独立读取同一帧
 `EventLog`，不会与日志 System 互相消费。
 

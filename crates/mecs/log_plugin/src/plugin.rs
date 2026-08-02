@@ -11,7 +11,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::event::event_log_system;
 use crate::stream::{JsonLayer, TracingStream};
-use crate::{ConsoleTarget, EventLog, FileLogOptions, LogError, LogFormat, LogLevel, LogRotation};
+use crate::{ConsoleTarget, FileLogOptions, LogError, LogFormat, LogLevel, LogRotation};
 
 type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
 
@@ -128,8 +128,7 @@ impl Plugin for LogPlugin {
         let _ = build_filter(&self);
 
         install_tracing(&self, app);
-        app.register_event::<EventLog>()
-            .add_system(&self.schedule, event_log_system);
+        app.add_system(&self.schedule, event_log_system);
         app.world_mut().insert_resource(LogPluginInstalled);
     }
 }

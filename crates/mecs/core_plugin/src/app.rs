@@ -1,5 +1,5 @@
 use crate::schedule::SchedulePlan;
-use crate::{CoreError, Event, Plugin, System, World};
+use crate::{CoreError, Plugin, System, World};
 
 pub struct App {
     world: World,
@@ -72,14 +72,6 @@ impl App {
         self
     }
 
-    pub fn register_event<E: Event>(&mut self) -> &mut Self {
-        if self.schedules.is_started() {
-            CoreError::AppAlreadyStarted.panic();
-        }
-        self.world.event_registry_mut().register::<E>();
-        self
-    }
-
     pub fn tick(&mut self) {
         self.world.tick();
         self.schedules.run(&mut self.world);
@@ -101,6 +93,8 @@ impl Default for App {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use crate::Event;
+
     use super::*;
 
     struct Notice(u32);
@@ -111,8 +105,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let reader_seen = Arc::clone(&seen);
         let mut app = App::new();
-        app.register_event::<Notice>()
-            .add_schedule("update".into())
+        app.add_schedule("update".into())
             .add_system("update", move |world: &mut World| {
                 let values = world
                     .event_reader::<Notice>()
@@ -130,6 +123,13 @@ mod tests {
     }
 
     #[test]
+    fn reading_an_event_type_before_its_first_event_is_empty() {
+        let app = App::new();
+
+        assert!(app.world().event_reader::<Notice>().is_empty());
+    }
+
+    #[test]
     #[should_panic(expected = "app has already started")]
     fn plugins_cannot_be_added_after_startup() {
         let mut app = App::new();
@@ -140,7 +140,6 @@ mod tests {
     #[test]
     fn delayed_events_arrive_after_their_countdown_and_then_clear() {
         let mut app = App::new();
-        app.register_event::<Notice>();
         app.world().emit_event_after(Notice(3), 2);
 
         app.tick();
@@ -163,7 +162,6 @@ mod tests {
     #[test]
     fn maximum_delay_counts_down_without_overflowing() {
         let mut app = App::new();
-        app.register_event::<Notice>();
         app.world().emit_event_after(Notice(1), u64::MAX);
 
         app.tick();
@@ -172,11 +170,9 @@ mod tests {
     }
 
     #[test]
-    fn registering_an_event_twice_preserves_queued_events() {
+    fn first_event_automatically_creates_its_read_storage() {
         let mut app = App::new();
-        app.register_event::<Notice>();
         app.world().emit_event(Notice(5));
-        app.register_event::<Notice>();
 
         app.tick();
 
@@ -197,7 +193,6 @@ mod tests {
     #[test]
     fn pending_events_remain_queued_until_completed() {
         let mut app = App::new();
-        app.register_event::<Result<u32, String>>();
         let _handle = app.world().emit_pending::<u32, String>();
 
         app.tick();
@@ -212,7 +207,6 @@ mod tests {
     #[test]
     fn pending_events_can_be_completed_from_another_thread() {
         let mut app = App::new();
-        app.register_event::<Result<u32, String>>();
         let handle = app.world().emit_pending::<u32, String>();
 
         std::thread::spawn(move || handle.complete(Ok(7)))
@@ -237,7 +231,6 @@ mod tests {
     #[test]
     fn fast_forward_tick_delivers_a_delayed_completed_event() {
         let mut app = App::new();
-        app.register_event::<Result<u32, String>>();
         let handle = app.world().emit_pending::<u32, String>();
         handle.complete_after(Ok(11), 5);
 

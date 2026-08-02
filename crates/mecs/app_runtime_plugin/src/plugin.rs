@@ -124,8 +124,7 @@ mod tests {
     #[test]
     fn event_extensions_send_through_the_core_queue() {
         let mut app = App::new();
-        app.register_event::<Notice>()
-            .add_plugin(RuntimePlugin::default());
+        app.add_plugin(RuntimePlugin::default());
 
         app.world().send_event(Notice);
 
