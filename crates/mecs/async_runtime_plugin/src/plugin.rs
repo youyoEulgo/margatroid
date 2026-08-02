@@ -4,7 +4,7 @@ use app_runtime_plugin::{RuntimeHandle, WorldEventExt};
 use core_plugin::{App, Plugin, World};
 
 use crate::request::ErasedAsyncTask;
-use crate::resource::{AsyncExecutorHandle, AsyncRequestRegistry};
+use crate::resource::{AsyncRequestRegistry, AsyncRuntimeHandle};
 use crate::runtime::start_executor;
 use crate::{AsyncContext, AsyncRequest, AsyncRequestMode, AsyncRuntimeError, AsyncTaskError};
 
@@ -16,7 +16,7 @@ impl Plugin for AsyncRuntimePlugin {
         if !app.world().contains_resource::<RuntimeHandle>() {
             AsyncRuntimeError::RuntimePluginMissing.panic();
         }
-        if app.world().contains_resource::<AsyncExecutorHandle>()
+        if app.world().contains_resource::<AsyncRuntimeHandle>()
             || app.world().contains_resource::<AsyncRequestRegistry>()
         {
             AsyncRuntimeError::AsyncRuntimePluginAlreadyInstalled.panic();
@@ -92,7 +92,7 @@ where
             }
         };
         world
-            .get_resource::<AsyncExecutorHandle>()
+            .get_resource::<AsyncRuntimeHandle>()
             .unwrap_or_else(|| AsyncRuntimeError::AsyncRuntimePluginMissing.panic())
             .spawn(Box::pin(supervised));
     }

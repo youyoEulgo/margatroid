@@ -3,11 +3,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use app_runtime_plugin::AppRuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::{App, Plugin};
+use daemon_api_plugin::{DaemonApiPlugin, LogEndpointOptions};
 use daemon_lifecycle_plugin::DaemonLifecyclePlugin;
 use external_event_plugin::ExternalEventPlugin;
 use http_server_plugin::HttpServerPlugin;
 use log_plugin::{LogPlugin, LogStreamOptions};
-use server_plugin::{LogEndpointOptions, ServerPlugin};
 use signal_plugin::SignalPlugin;
 
 #[derive(Clone)]
@@ -59,7 +59,7 @@ impl Default for MargatroidDaemonPlugins {
 impl Plugin for MargatroidDaemonPlugins {
     fn build(&self, app: &mut App) {
         let mut log_plugin = LogPlugin::default();
-        let mut server_plugin = ServerPlugin::default();
+        let mut server_plugin = DaemonApiPlugin::default();
         if let Some(token) = &self.log_endpoint_token {
             log_plugin = log_plugin.with_stream(LogStreamOptions::default());
             server_plugin = server_plugin
