@@ -1,7 +1,5 @@
 [workspace]
 members = [
-    "apps/cli",
-    "apps/daemon",
     "crates/mecs/core_plugin",
     "crates/mecs/app_runtime_plugin",
     "crates/mecs/closure_plugin",
@@ -9,12 +7,6 @@ members = [
     "crates/mecs/async_runtime_plugin",
     "crates/mecs/log_plugin",
     "crates/mecs/server_plugin",
-    "crates/margatroid/daemon_api_plugin",
-    "crates/margatroid/defaults",
-    "crates/margatroid/daemon_lifecycle_plugin",
-    "crates/margatroid/protocol",
-    "crates/margatroid/compose",
-    "crates/margatroid/paths",
 ]
 
 exclude = ["legacy/*"]
