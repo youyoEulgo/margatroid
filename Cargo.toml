@@ -4,6 +4,7 @@ members = [
     "apps/daemon",
     "crates/mecs/core_plugin",
     "crates/mecs/app_runtime_plugin",
+    "crates/mecs/closure_plugin",
     "crates/mecs/signal_plugin",
     "crates/mecs/async_runtime_plugin",
     "crates/mecs/log_plugin",

@@ -22,6 +22,7 @@ Plugin 集合，不包含 Agent、Workspace、LLM 等 Margatroid 业务概念。
 ```text
 core_plugin             同步 ECS 与单帧执行
 app_runtime_plugin      阻塞运行循环、唤醒和关闭
+closure_plugin          一次性同步闭包的Schedule路由
 async_runtime_plugin    Future 执行与结果回流
 signal_plugin           进程信号转 Event
 log_plugin              tracing 配置、SystemLog 与 EventLog 投影
@@ -134,25 +135,38 @@ pub trait AppShutdownExt {
 安装，依赖者后安装，因此依赖者先关闭。`after_shutdown` 只用于所有依赖关闭后的最终状态；
 不公开固定的 Begin/Workers/Finish 阶段。
 
-## 5. async_runtime_plugin
+## 5. closure_plugin
+
+```rust
+pub use error::ClosureError;
+pub use plugin::{AppClosureExt, ClosurePlugin, WorldClosureExt};
+```
+
+`AppClosureExt::add_closure_system(schedule)` 显式决定哪些 Schedule 可以执行一次性闭包。
+`WorldClosureExt::send_closure(schedule, closure)` 把闭包包装成事件，并复用
+`app_runtime_plugin::WorldEventExt::send_event` 完成入队与唤醒。ClosurePlugin 不直接操作
+EventEmitter，也不认识 Future、pending 事件或 Runtime 阀。
+
+## 6. async_runtime_plugin
 
 ```rust
 pub use error::{AsyncRuntimeError, AsyncTaskError};
 pub use plugin::{AppAsyncExt, AsyncRuntimePlugin};
-pub use request::{AsyncRequest, AsyncRequestMode, AsyncTask, WorldAsyncExt};
+pub use request::{AsyncEventHandler, AsyncTask, WorldAsyncExt};
 pub use context::AsyncContext;
 pub use resource::AsyncRuntimeHandle;
 ```
 
-`AppAsyncExt::add_async_system::<T, E>(schedule)` 注册 `AsyncRequest<T, E>` 与
-`Result<T, E>` 事件，并将通用异步分发 System 挂到开发者指定的
-Schedule。`WorldAsyncExt::send_async_event` 将异步闭包封装为请求事件。业务
-Plugin 自行挂载最终的 `Result<T, E>` 响应处理 System。异步函数可以声明
-`AsyncContext` 参数，由 AsyncRuntime 自动注入并用于在任务完成前发送普通事件。
+`AppAsyncExt::add_async_system(schedule, handler)` 将请求事件类型与固定异步 handler 绑定，
+`send_async_event` 和 `send_await_event` 只发送请求数据。闭包模式通过
+`send_async_closure` 和 `send_await_closure` 把异步任务包装成同步分发闭包，复用
+ClosurePlugin 的 ClosureSystem。两种模式都以 `Result<T, E>` 事件返回结果。
+
+异步函数可以声明 `AsyncContext` 参数，由 AsyncRuntime 自动注入并用于在任务完成前发送普通事件。
 `WorldAsyncExt::spawn_async_service` 用于 Server 等长期基础设施 Future，不创建 pending
 事件、不操作 Runtime gate，也不自动产生完成事件。
 
-## 6. signal_plugin
+## 7. signal_plugin
 
 ```rust
 pub use events::{ProcessSignal, ProcessSignalReceived, SignalListenerFailed};
@@ -165,7 +179,7 @@ SignalPlugin 依赖 RuntimePlugin，通过 `RuntimeEventSender` 将信号直接�
 Runtime，不决定关闭、重载或暂停。Handle 仅用于查询和提前停止监听器；App 销毁时通过
 RAII 回收信号线程。
 
-## 7. log_plugin
+## 8. log_plugin
 
 直接调用 `tracing` 宏的进程诊断称为 SystemLog。`LogPlugin` 安装 console、rolling
 file 和可选 bounded stream Layer，默认只启用 stderr Console Layer。
@@ -179,7 +193,7 @@ file 和可选 bounded stream Layer，默认只启用 stderr Console Layer。
 `WorldEventLogExt`、`TracingRecord`、`TracingField`、`TracingStream`、
 `TracingSubscription` 和 `TracingStreamError`。tracing Subscriber 的组合类型不公开。
 
-## 8. server_plugin
+## 9. server_plugin
 
 ```rust
 pub use events::{HttpRequestReceived, ServerFailed, ServerStarted, ServerStopped};
@@ -205,7 +219,7 @@ pub use websocket::{
 断开通知。发送器可以按连接 ID、唯一非空名称或不具名集合查询。业务 endpoint 和消息
 语义属于业务 Plugin。
 
-## 9. 稳定性
+## 10. 稳定性
 
 - `lib.rs` 未导出的类型都不是兼容承诺。
 - Options 新增字段必须有默认值。

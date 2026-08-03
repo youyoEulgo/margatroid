@@ -1,5 +1,5 @@
 use std::any::TypeId;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::thread::JoinHandle;
@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 use core_plugin::Resource;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{AsyncRequest, AsyncRuntimeError};
+use crate::AsyncRuntimeError;
 
 pub(crate) type ErasedExecutionTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -47,24 +47,26 @@ impl Drop for AsyncRuntimeHandle {
 
 impl Resource for AsyncRuntimeHandle {}
 
-pub(crate) struct AsyncRequestRegistry {
-    registered: HashSet<TypeId>,
+pub(crate) struct AsyncRegistry {
+    event_systems: HashMap<TypeId, &'static str>,
 }
 
-impl AsyncRequestRegistry {
+impl AsyncRegistry {
     pub(crate) fn new() -> Self {
         Self {
-            registered: HashSet::new(),
+            event_systems: HashMap::new(),
         }
     }
 
-    pub(crate) fn register<T, E>(&mut self) -> bool
-    where
-        T: Send + Sync + 'static,
-        E: From<crate::AsyncTaskError> + Send + Sync + 'static,
-    {
-        self.registered.insert(TypeId::of::<AsyncRequest<T, E>>())
+    pub(crate) fn register<Request: core_plugin::Event>(&mut self) -> bool {
+        self.event_systems
+            .insert(TypeId::of::<Request>(), std::any::type_name::<Request>())
+            .is_none()
+    }
+
+    pub(crate) fn contains<Request: core_plugin::Event>(&self) -> bool {
+        self.event_systems.contains_key(&TypeId::of::<Request>())
     }
 }
 
-impl Resource for AsyncRequestRegistry {}
+impl Resource for AsyncRegistry {}

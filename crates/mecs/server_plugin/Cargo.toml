@@ -16,5 +16,6 @@ tokio-stream = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+closure_plugin = { path = "../closure_plugin" }
 tokio-tungstenite = "0.29"
 tower = "0.5"

@@ -61,7 +61,7 @@ request.start_stream(head)
 
 会话可以在 System、事件和异步任务之间反复转交，适合 LLM 流式响应与 tool call 循环。
 
-### 使用异步事件发送HTTP流
+### 使用异步闭包发送HTTP流
 
 同步 System 只负责读取请求事件、开始响应并发出异步请求。等待上游数据和发送分片都在
 AsyncRuntime 中执行：
@@ -69,13 +69,15 @@ AsyncRuntime 中执行：
 ```rust
 use anyhow::Error;
 use app_runtime_plugin::RuntimePlugin;
-use async_runtime_plugin::{AppAsyncExt, WorldAsyncExt};
+use async_runtime_plugin::WorldAsyncExt;
 use axum::body::Bytes;
 use axum::http::Method;
+use closure_plugin::{AppClosureExt, ClosurePlugin};
 use core_plugin::World;
 use server_plugin::{AppServerExt, HttpRequestReceived, HttpResponseHead};
 
-app.add_async_system::<(), Error>(RuntimePlugin::PRE_UPDATE)
+app.add_plugin(ClosurePlugin)
+    .add_closure_system(RuntimePlugin::PRE_UPDATE)
     .add_http_event_route(Method::POST, "/stream")
     .add_system(RuntimePlugin::UPDATE, start_http_streams);
 
@@ -91,7 +93,8 @@ fn start_http_streams(world: &mut World) {
         .collect::<Vec<_>>();
 
     for response in responses {
-        world.send_async_event(
+        world.send_async_closure(
+            RuntimePlugin::PRE_UPDATE,
             move || async move {
                 for chunk in ["hello ", "world"] {
                     response.send_chunk(Bytes::from(chunk)).await?;
@@ -99,14 +102,13 @@ fn start_http_streams(world: &mut World) {
                 response.finish()?;
                 Ok::<(), Error>(())
             },
-            false,
         );
     }
 }
 ```
 
-这里必须注册 `add_async_system::<(), Error>`，因为它负责把异步请求交给专用线程，并在
-完成后产生 `Result<(), Error>` 响应事件。若一次 LLM 调用结束后需要同步判断 tool call，
+这里显式挂载的 `ClosureSystem` 负责在 `PRE_UPDATE` 取得同步包装闭包；包装闭包随后把真正的
+异步任务交给专用线程，并在完成后产生 `Result<(), Error>` 响应事件。若一次 LLM 调用结束后需要同步判断 tool call，
 可以让异步任务返回累积后的响应类型，再由另一个同步 System 读取对应的 `Result` 事件。
 
 ## WebSocket
@@ -147,7 +149,8 @@ System 通过事件句柄取出唯一的 `WebSocketStreamReceiver`，再把它�
 ```rust
 use anyhow::Error;
 use app_runtime_plugin::RuntimePlugin;
-use async_runtime_plugin::{AppAsyncExt, WorldAsyncExt};
+use async_runtime_plugin::WorldAsyncExt;
+use closure_plugin::{AppClosureExt, ClosurePlugin};
 use core_plugin::World;
 use server_plugin::{
     WebSocketConnectionId, WebSocketMessage, WebSocketStreamId, WebSocketStreamOpened,
@@ -159,7 +162,8 @@ struct ReceivedStream {
     messages: Vec<WebSocketMessage>,
 }
 
-app.add_async_system::<ReceivedStream, Error>(RuntimePlugin::PRE_UPDATE)
+app.add_plugin(ClosurePlugin)
+    .add_closure_system(RuntimePlugin::PRE_UPDATE)
     .add_system(RuntimePlugin::UPDATE, accumulate_websocket_streams);
 
 fn accumulate_websocket_streams(world: &mut World) {
@@ -176,7 +180,8 @@ fn accumulate_websocket_streams(world: &mut World) {
         .collect::<Vec<_>>();
 
     for (connection_id, stream_id, mut receiver) in streams {
-        world.send_async_event(
+        world.send_async_closure(
+            RuntimePlugin::PRE_UPDATE,
             move || async move {
                 let mut messages = Vec::new();
                 while let Some(message) = receiver.recv().await {
@@ -189,7 +194,6 @@ fn accumulate_websocket_streams(world: &mut World) {
                     messages,
                 })
             },
-            false,
         );
     }
 }
@@ -264,6 +268,7 @@ fn send_once(
 
 ```rust
 use anyhow::Error;
+use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::WorldAsyncExt;
 use axum::extract::ws::Message;
 use core_plugin::World;
@@ -277,7 +282,8 @@ fn stream_to_client(world: &World, connection_id: WebSocketConnectionId) {
         return;
     };
 
-    world.send_async_event(
+    world.send_async_closure(
+        RuntimePlugin::PRE_UPDATE,
         move || async move {
             for message in [
                 r#"{"mecs_stream":{"id":"reply-1","phase":"start"}}"#,
@@ -288,7 +294,6 @@ fn stream_to_client(world: &World, connection_id: WebSocketConnectionId) {
             }
             Ok::<(), Error>(())
         },
-        false,
     );
 }
 ```

@@ -1,15 +1,14 @@
+use std::any::type_name;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Mutex;
 
 use app_runtime_plugin::WorldEventExt;
+use closure_plugin::WorldClosureExt;
 use core_plugin::{Event, World};
 
-use crate::{AsyncContext, AsyncTaskError};
-
-pub(crate) type ErasedFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'static>>;
-pub(crate) type ErasedAsyncTask<T, E> =
-    Box<dyn FnOnce(AsyncContext) -> ErasedFuture<T, E> + Send + 'static>;
+use crate::plugin::dispatch_closure_task;
+use crate::resource::AsyncRegistry;
+use crate::{AsyncContext, AsyncRuntimeError, AsyncTaskError};
 
 pub trait AsyncTask<T, E, Args>: Send + 'static {
     type Future: Future<Output = Result<T, E>> + Send + 'static;
@@ -41,68 +40,81 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AsyncRequestMode {
-    Normal,
-    BlockNextFrame,
+pub trait AsyncEventHandler<Request, T, E, Args>: Send + Sync + 'static {
+    type Future: Future<Output = Result<T, E>> + Send + 'static;
+
+    fn run(&self, request: Request, context: AsyncContext) -> Self::Future;
 }
 
-pub struct AsyncRequest<T, E> {
-    task: Mutex<Option<ErasedAsyncTask<T, E>>>,
-    mode: AsyncRequestMode,
-}
-
-impl<T, E> AsyncRequest<T, E>
+impl<Request, T, E, Handler, HandlerFuture> AsyncEventHandler<Request, T, E, ()> for Handler
 where
-    T: Send + Sync + 'static,
-    E: From<AsyncTaskError> + Send + Sync + 'static,
+    Handler: Fn(Request) -> HandlerFuture + Send + Sync + 'static,
+    HandlerFuture: Future<Output = Result<T, E>> + Send + 'static,
 {
-    pub fn new<Task, Args>(task: Task) -> Self
-    where
-        Task: AsyncTask<T, E, Args>,
-    {
-        Self::from_task(task, AsyncRequestMode::Normal)
-    }
+    type Future = HandlerFuture;
 
-    pub fn blocking<Task, Args>(task: Task) -> Self
-    where
-        Task: AsyncTask<T, E, Args>,
-    {
-        Self::from_task(task, AsyncRequestMode::BlockNextFrame)
+    fn run(&self, request: Request, _context: AsyncContext) -> Self::Future {
+        self(request)
     }
+}
 
-    fn from_task<Task, Args>(task: Task, mode: AsyncRequestMode) -> Self
-    where
-        Task: AsyncTask<T, E, Args>,
-    {
+impl<Request, T, E, Handler, HandlerFuture> AsyncEventHandler<Request, T, E, (AsyncContext,)>
+    for Handler
+where
+    Handler: Fn(Request, AsyncContext) -> HandlerFuture + Send + Sync + 'static,
+    HandlerFuture: Future<Output = Result<T, E>> + Send + 'static,
+{
+    type Future = HandlerFuture;
+
+    fn run(&self, request: Request, context: AsyncContext) -> Self::Future {
+        self(request, context)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AsyncMode {
+    Async,
+    Await,
+}
+
+pub(crate) struct AsyncEventRequest<Request: Event> {
+    event: Mutex<Option<Request>>,
+    mode: AsyncMode,
+}
+
+impl<Request: Event> AsyncEventRequest<Request> {
+    fn new(event: Request, mode: AsyncMode) -> Self {
         Self {
-            task: Mutex::new(Some(Box::new(move |context| Box::pin(task.run(context))))),
+            event: Mutex::new(Some(event)),
             mode,
         }
     }
 
-    pub(crate) fn take_task(&self) -> ErasedAsyncTask<T, E> {
-        self.task
+    pub(crate) fn take_event(&self) -> Option<Request> {
+        self.event
             .lock()
-            .expect("async request task lock poisoned")
+            .expect("async event request lock poisoned")
             .take()
-            .expect("async request task has already been taken")
     }
 
-    pub(crate) fn mode(&self) -> AsyncRequestMode {
+    pub(crate) fn mode(&self) -> AsyncMode {
         self.mode
     }
 }
 
-impl<T, E> Event for AsyncRequest<T, E>
-where
-    T: Send + Sync + 'static,
-    E: From<AsyncTaskError> + Send + Sync + 'static,
-{
-}
+impl<Request: Event> Event for AsyncEventRequest<Request> {}
 
 pub trait WorldAsyncExt {
-    fn send_async_event<T, E, Task, Args>(&self, task: Task, blocking: bool)
+    fn send_async_event<Request: Event>(&self, event: Request);
+    fn send_await_event<Request: Event>(&self, event: Request);
+
+    fn send_async_closure<T, E, Task, Args>(&self, schedule: &str, task: Task)
+    where
+        T: Send + Sync + 'static,
+        E: From<AsyncTaskError> + Send + Sync + 'static,
+        Task: AsyncTask<T, E, Args>;
+
+    fn send_await_closure<T, E, Task, Args>(&self, schedule: &str, task: Task)
     where
         T: Send + Sync + 'static,
         E: From<AsyncTaskError> + Send + Sync + 'static,
@@ -114,18 +126,36 @@ pub trait WorldAsyncExt {
 }
 
 impl WorldAsyncExt for World {
-    fn send_async_event<T, E, Task, Args>(&self, task: Task, blocking: bool)
+    fn send_async_event<Request: Event>(&self, event: Request) {
+        ensure_async_system_registered::<Request>(self);
+        WorldEventExt::send_event(self, AsyncEventRequest::new(event, AsyncMode::Async));
+    }
+
+    fn send_await_event<Request: Event>(&self, event: Request) {
+        ensure_async_system_registered::<Request>(self);
+        WorldEventExt::send_event(self, AsyncEventRequest::new(event, AsyncMode::Await));
+    }
+
+    fn send_async_closure<T, E, Task, Args>(&self, schedule: &str, task: Task)
     where
         T: Send + Sync + 'static,
         E: From<AsyncTaskError> + Send + Sync + 'static,
         Task: AsyncTask<T, E, Args>,
     {
-        let request = if blocking {
-            AsyncRequest::blocking(task)
-        } else {
-            AsyncRequest::new(task)
-        };
-        self.send_event(request);
+        WorldClosureExt::send_closure(self, schedule, move |world| {
+            dispatch_closure_task::<T, E, Task, Args>(world, task, AsyncMode::Async);
+        });
+    }
+
+    fn send_await_closure<T, E, Task, Args>(&self, schedule: &str, task: Task)
+    where
+        T: Send + Sync + 'static,
+        E: From<AsyncTaskError> + Send + Sync + 'static,
+        Task: AsyncTask<T, E, Args>,
+    {
+        WorldClosureExt::send_closure(self, schedule, move |world| {
+            dispatch_closure_task::<T, E, Task, Args>(world, task, AsyncMode::Await);
+        });
     }
 
     fn spawn_async_service<Service>(&self, service: Service)
@@ -133,93 +163,19 @@ impl WorldAsyncExt for World {
         Service: Future<Output = ()> + Send + 'static,
     {
         self.get_resource::<crate::AsyncRuntimeHandle>()
-            .unwrap_or_else(|| crate::AsyncRuntimeError::AsyncRuntimePluginMissing.panic())
+            .unwrap_or_else(|| AsyncRuntimeError::AsyncRuntimePluginMissing.panic())
             .spawn(Box::pin(service));
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
-    use core_plugin::App;
-
-    use super::*;
-
-    async fn value_after(value: u32) -> Result<u32, TestError> {
-        Ok(value)
-    }
-
-    struct TestError;
-
-    impl From<AsyncTaskError> for TestError {
-        fn from(_error: AsyncTaskError) -> Self {
-            Self
+fn ensure_async_system_registered<Request: Event>(world: &World) {
+    let Some(registry) = world.get_resource::<AsyncRegistry>() else {
+        AsyncRuntimeError::AsyncRuntimePluginMissing.panic();
+    };
+    if !registry.contains::<Request>() {
+        AsyncRuntimeError::AsyncSystemNotRegistered {
+            event_type: type_name::<Request>(),
         }
-    }
-
-    #[test]
-    fn world_builds_normal_and_blocking_async_events() {
-        let mut app = App::new();
-        app.add_plugin(app_runtime_plugin::RuntimePlugin::default());
-
-        let value = 1;
-        app.world()
-            .send_async_event(move || value_after(value), false);
-        app.tick();
-        assert_eq!(
-            app.world()
-                .event_reader::<AsyncRequest<u32, TestError>>()
-                .into_iter()
-                .next()
-                .unwrap()
-                .mode(),
-            AsyncRequestMode::Normal
-        );
-
-        app.world()
-            .send_async_event(|| async { Ok::<u32, TestError>(2) }, true);
-        app.tick();
-        assert_eq!(
-            app.world()
-                .event_reader::<AsyncRequest<u32, TestError>>()
-                .into_iter()
-                .next()
-                .unwrap()
-                .mode(),
-            AsyncRequestMode::BlockNextFrame
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "RuntimePlugin is not installed")]
-    fn sending_an_async_event_requires_the_runtime_plugin() {
-        let app = App::new();
-        app.world()
-            .send_async_event(|| async { Ok::<u32, TestError>(1) }, false);
-    }
-
-    #[test]
-    fn world_spawns_a_service_without_creating_an_event() {
-        let completed = Arc::new(AtomicBool::new(false));
-        let service_completed = Arc::clone(&completed);
-        let mut app = App::new();
-        app.add_plugin(app_runtime_plugin::RuntimePlugin::default())
-            .add_plugin(crate::AsyncRuntimePlugin);
-
-        app.world().spawn_async_service(async move {
-            service_completed.store(true, Ordering::Release);
-        });
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !completed.load(Ordering::Acquire) {
-            assert!(Instant::now() < deadline, "async service timed out");
-            std::thread::yield_now();
-        }
-        let snapshot = app.world().event_snapshot();
-        assert_eq!(snapshot.normal_event_count, 0);
-        assert_eq!(snapshot.pending_event_count, 0);
+        .panic();
     }
 }

@@ -4,10 +4,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use app_runtime_plugin::RuntimePlugin;
-use async_runtime_plugin::{AppAsyncExt, AsyncRuntimePlugin, AsyncTaskError, WorldAsyncExt};
+use async_runtime_plugin::{AsyncRuntimePlugin, AsyncTaskError, WorldAsyncExt};
 use axum::body::Bytes;
 use axum::extract::ws::Message as AxumMessage;
 use axum::http::{Method, Response};
+use closure_plugin::{AppClosureExt, ClosurePlugin};
 use core_plugin::{App, World};
 use futures_util::{SinkExt, StreamExt};
 use server_plugin::{
@@ -87,9 +88,10 @@ fn delegated_http_request_is_processed_by_a_system() {
 }
 
 #[test]
-fn delegated_http_response_can_stream_from_an_async_event() {
+fn delegated_http_response_can_stream_from_an_async_closure() {
     let mut app = app();
-    app.add_async_system::<(), TestAsyncError>(RuntimePlugin::PRE_UPDATE)
+    app.add_plugin(ClosurePlugin)
+        .add_closure_system(RuntimePlugin::PRE_UPDATE)
         .add_http_event_route(Method::POST, "/stream")
         .add_system(RuntimePlugin::UPDATE, |world: &mut World| {
             let responses = world
@@ -101,21 +103,18 @@ fn delegated_http_response_can_stream_from_an_async_event() {
                 })
                 .collect::<Vec<_>>();
             for response in responses {
-                world.send_async_event(
-                    move || async move {
-                        response
-                            .send_chunk(Bytes::from_static(b"hello "))
-                            .await
-                            .map_err(|_| TestAsyncError)?;
-                        response
-                            .send_chunk(Bytes::from_static(b"world"))
-                            .await
-                            .map_err(|_| TestAsyncError)?;
-                        response.finish().map_err(|_| TestAsyncError)?;
-                        Ok::<(), TestAsyncError>(())
-                    },
-                    false,
-                );
+                world.send_async_closure(RuntimePlugin::PRE_UPDATE, move || async move {
+                    response
+                        .send_chunk(Bytes::from_static(b"hello "))
+                        .await
+                        .map_err(|_| TestAsyncError)?;
+                    response
+                        .send_chunk(Bytes::from_static(b"world"))
+                        .await
+                        .map_err(|_| TestAsyncError)?;
+                    response.finish().map_err(|_| TestAsyncError)?;
+                    Ok::<(), TestAsyncError>(())
+                });
             }
         });
     let address = start(&mut app);
@@ -234,26 +233,24 @@ fn websocket_message_is_delegated_and_can_be_answered() {
 #[test]
 fn websocket_stream_is_accumulated_asynchronously_and_returns_to_ecs() {
     let mut app = app();
-    app.add_async_system::<Vec<String>, TestAsyncError>(RuntimePlugin::PRE_UPDATE)
+    app.add_plugin(ClosurePlugin)
+        .add_closure_system(RuntimePlugin::PRE_UPDATE)
         .add_websocket_event_route("/ws")
         .add_system(RuntimePlugin::UPDATE, |world: &mut World| {
             for event in world.event_reader::<WebSocketStreamOpened>() {
                 let Some(mut receiver) = event.receiver.take() else {
                     continue;
                 };
-                world.send_async_event(
-                    move || async move {
-                        let mut messages = Vec::new();
-                        while let Some(message) = receiver.recv().await {
-                            let message = message.map_err(|_| TestAsyncError)?;
-                            if let AxumMessage::Text(text) = message {
-                                messages.push(text.to_string());
-                            }
+                world.send_async_closure(RuntimePlugin::PRE_UPDATE, move || async move {
+                    let mut messages = Vec::new();
+                    while let Some(message) = receiver.recv().await {
+                        let message = message.map_err(|_| TestAsyncError)?;
+                        if let AxumMessage::Text(text) = message {
+                            messages.push(text.to_string());
                         }
-                        Ok::<_, TestAsyncError>(messages)
-                    },
-                    false,
-                );
+                    }
+                    Ok::<_, TestAsyncError>(messages)
+                });
             }
         });
     let address = start(&mut app);
