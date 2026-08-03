@@ -2,27 +2,34 @@
 
 ## 介绍
 
-`AsyncRuntimePlugin` 为 mecs 提供专用异步线程，不把 Tokio 引入 `core_plugin`。
+`AsyncRuntimePlugin` 为 mecs 提供专用异步线程，不把 Tokio 引入 `core_plugin`。同步 System
+始终在主线程运行；异步线程只执行不能在一帧内完成的任务，结果以 `Result<T, E>` 事件返回。
 
-同步 System 始终留在主线程，异步线程只执行不能在一帧内完成的任务。请求以闭包描述行为，
-响应以 `Result<T, E>` 回到类型化事件流；任务不借用 World，也不把 Tokio 类型泄露给 Core。
+异步有两种入口：
 
-同步路径是事件传类型、System 传闭包，异步路径则是事件传闭包、System 传响应类型。异步请求
-先创建 pending 响应占位，任务完成后再升变为普通响应事件。任务 panic 或取消时，监督器会
-把它转换为错误响应，仍然交回主线程处理。
+- 事件模式：事件传数据，预先挂载的异步 System 持有固定处理闭包。
+- 闭包模式：请求传一次性异步闭包，通过 `ClosurePlugin` 的同步闭包 System 提交任务。
 
-## 使用说明
+两种模式都会先创建 pending 响应。任务完成后 pending 升变为普通事件；panic 或取消会转换为
+`AsyncTaskError`，再进入开发者选择的错误类型 `E`。
+
+## 事件模式
+
+适合一种请求需要长期复用同一种处理逻辑的场景：
 
 ```rust
 use app_runtime_plugin::RuntimePlugin;
-use async_runtime_plugin::{
-    AppAsyncExt, AsyncRuntimePlugin, AsyncTaskError, WorldAsyncExt,
-};
-use core_plugin::{App, Plugin, World};
+use async_runtime_plugin::{AppAsyncExt, AsyncRuntimePlugin, AsyncTaskError, WorldAsyncExt};
+use core_plugin::{App, Event, Plugin};
+
+struct LoadAgent {
+    name: String,
+}
+impl Event for LoadAgent {}
 
 #[derive(Debug)]
 enum LoadError {
-    Io(std::io::Error),
+    NotFound,
     AsyncTask(AsyncTaskError),
 }
 
@@ -32,56 +39,60 @@ impl From<AsyncTaskError> for LoadError {
     }
 }
 
-struct LoadPlugin;
-
-impl Plugin for LoadPlugin {
-    fn build(self, app: &mut App) {
-        app.add_async_system::<String, LoadError>(RuntimePlugin::UPDATE)
-            .add_system(RuntimePlugin::UPDATE, handle_load_results);
-    }
-}
-
-async fn load() -> Result<String, LoadError> {
-    Ok("done".to_string())
-}
-
-fn handle_load_results(world: &mut World) {
-    for _result in world.event_reader::<Result<String, LoadError>>() {
-        // 处理异步结果
-    }
+async fn load_agent(request: LoadAgent) -> Result<String, LoadError> {
+    Ok(format!("loaded {}", request.name))
 }
 
 let mut app = App::new();
 app.add_plugin(RuntimePlugin::default())
     .add_plugin(AsyncRuntimePlugin)
-    .add_plugin(LoadPlugin);
+    .add_async_system(RuntimePlugin::UPDATE, load_agent);
 
-app.world().send_async_event(
-    load,
-    false,
+app.world().send_async_event(LoadAgent {
+    name: "reviewer".into(),
+});
+```
+
+`send_async_event` 只发送数据。`add_async_system` 决定事件类型、固定异步处理闭包和处理阶段。
+同一请求事件类型最多绑定一个异步 System。
+
+需要阻止下一帧开始时使用 `send_await_event(request)`。请求被异步 System 真正取得后才关阀，
+当前帧仍会完成；任务结束后开阀。
+
+## 闭包模式
+
+一次性文件操作、网络请求或临时组合任务可以直接发送闭包。闭包模式依赖 `ClosurePlugin`，并且
+开发者必须显式选择允许执行闭包的 Schedule：
+
+```rust
+use app_runtime_plugin::RuntimePlugin;
+use async_runtime_plugin::{AsyncRuntimePlugin, WorldAsyncExt};
+use closure_plugin::{AppClosureExt, ClosurePlugin};
+use core_plugin::App;
+
+let mut app = App::new();
+app.add_plugin(RuntimePlugin::default())
+    .add_plugin(ClosurePlugin)
+    .add_closure_system(RuntimePlugin::PRE_UPDATE)
+    .add_plugin(AsyncRuntimePlugin);
+
+let path = "margatroid-workspace.yaml".to_string();
+app.world().send_async_closure(
+    RuntimePlugin::PRE_UPDATE,
+    move || async move {
+        tokio::fs::read_to_string(path)
+            .await
+            .map_err(anyhow::Error::from)
+    },
 );
 ```
 
-### 传递参数
+`send_async_closure` 不阻塞下一帧；`send_await_closure` 在闭包被 `ClosureSystem` 取得并开始提交
+异步任务时关阀。异步插件不会另外挂载 Dispatcher，也不会复制 ClosurePlugin 的路由逻辑。
 
-`send_async_event` 不会自动填充业务参数。有业务参数的异步函数通过闭包捕获参数：
+## 异步上下文
 
-```rust
-async fn load_agent(name: String) -> Result<String, LoadError> {
-    Ok(format!("loaded {name}"))
-}
-
-let name = "reviewer".to_string();
-app.world()
-    .send_async_event(move || load_agent(name), false);
-```
-
-闭包和它捕获的值都必须满足 `Send + 'static`，异步任务不能借用 `World`。
-
-### 在任务中发送事件
-
-异步函数声明 `AsyncContext` 参数后，AsyncRuntime 会自动传入上下文，不需要调用方手动
-创建或捕获事件发送器：
+事件 handler 和一次性闭包都可以声明 `AsyncContext` 参数，由插件自动注入：
 
 ```rust
 use async_runtime_plugin::AsyncContext;
@@ -90,57 +101,58 @@ use core_plugin::Event;
 struct LoadProgress(u8);
 impl Event for LoadProgress {}
 
-async fn load_with_progress(context: AsyncContext) -> Result<String, LoadError> {
+struct LoadWithProgress {
+    name: String,
+}
+impl Event for LoadWithProgress {}
+
+async fn load_with_progress(
+    request: LoadWithProgress,
+    context: AsyncContext,
+) -> Result<String, LoadError> {
     context.send_event(LoadProgress(25));
     context.send_event(LoadProgress(75));
-    Ok("done".to_string())
+    Ok(request.name)
 }
 
-app.world()
-    .send_async_event(load_with_progress, false);
+app.add_async_system(RuntimePlugin::UPDATE, load_with_progress);
 ```
 
-`AsyncContext::send_event` 每次都会写入事件队列并唤醒 Runtime。普通异步请求的中间事件
-可以在任务完成前处理；阻塞异步请求需要等任务完成并开阀后处理。事件类型由 Core 在首次
-到期时自动建立读取存储，不需要预先注册。
+`AsyncContext` 不持有 `World`，只提供跨线程安全的能力。它发送的每个事件都会经过 Runtime
+事件发送器并唤醒 Runtime。
 
-### 使用 anyhow
+## 使用 anyhow
 
-不需要业务错误枚举时，可以直接将 `anyhow::Error` 注册为错误类型：
+不需要自定义业务错误枚举时，可以直接使用 `anyhow::Error`。它可以接收业务错误以及框架产生的
+`AsyncTaskError`：
 
 ```rust
 use anyhow::{Context, Result};
 
-async fn load_config() -> Result<String> {
+async fn load_config(_request: LoadAgent) -> Result<String> {
     tokio::fs::read_to_string("margatroid-workspace.yaml")
         .await
-        .context("加载 Workspace 配置失败")
+        .context("加载Workspace配置失败")
 }
 
-app.add_async_system::<String, anyhow::Error>(RuntimePlugin::UPDATE);
-app.world().send_async_event(load_config, false);
+app.add_async_system(RuntimePlugin::UPDATE, load_config);
 ```
 
-业务错误和异步任务 panic、取消产生的 `AsyncTaskError` 都会作为
-`Result<String, anyhow::Error>` 响应事件返回。
+## 长期服务
+
+`spawn_async_service` 直接提交长期 Future，供 Server 等基础设施 Plugin 管理服务生命周期。
+它不创建请求事件、pending 响应或完成事件，也不操作 Runtime 阀。
 
 ## 公开 API
 
 - `AsyncRuntimePlugin`：启动并管理专用异步线程。
-- `AsyncContext`：由 AsyncRuntime 自动注入，允许异步任务发送一个或多个普通事件。
-- `AsyncTask`：同时适配无上下文函数和接收 `AsyncContext` 的函数。
-- `AsyncRequest<T, E>`：封装一次只能执行一次的异步闭包。
-- `AsyncRequest::new`：普通请求，完成后唤醒 Runtime。
-- `AsyncRequest::blocking`：阻止下一帧开始，完成后开阀。
-- `AppAsyncExt::add_async_system`：将对应请求类型的异步分发 System 挂到开发者指定的 Schedule。
-- `WorldAsyncExt::send_async_event`：从异步闭包构造并发送 `AsyncRequest`，唤醒 Runtime，
-  布尔参数决定是否阻塞下一帧。
-- `AsyncTaskError`：将任务 panic 或取消转换进开发者选择的错误类型 `E`。
-- `AsyncRuntimeError`：报告异步基础设施的配置与运行错误。
+- `AppAsyncExt::add_async_system`：绑定请求事件类型、固定异步 handler 与 Schedule。
+- `WorldAsyncExt::send_async_event`、`send_await_event`：发送事件模式请求。
+- `WorldAsyncExt::send_async_closure`、`send_await_closure`：发送闭包模式请求。
+- `WorldAsyncExt::spawn_async_service`：提交由所属 Plugin 自行管理的长期 Future。
+- `AsyncEventHandler`：适配有或没有 `AsyncContext` 的固定 handler。
+- `AsyncTask`：适配有或没有 `AsyncContext` 的一次性异步闭包。
+- `AsyncContext`：在异步任务中发送普通事件。
+- `AsyncTaskError`：描述任务 panic 或取消。
 
-每个请求独立 `tokio::spawn`。异步任务不借用 `World`；完成结果通过
-`Result<T, E>` 事件返回主线程。请求 ID、Agent ID 和响应路由由开发者定义。
-
-`add_async_system::<T, E>(schedule)` 挂载的是读取 `AsyncRequest<T, E>` 的通用异步分发
-System，不是最终的业务响应 System。业务 Plugin 仍需自行添加读取
-`Result<T, E>` 的 System，并决定它所属的 Schedule。
+请求 ID、Agent ID 和同类型并发响应路由属于业务数据，由开发者自行携带。

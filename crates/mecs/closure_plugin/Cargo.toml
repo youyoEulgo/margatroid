@@ -1,13 +1,8 @@
 [package]
-name = "async_runtime_plugin"
+name = "closure_plugin"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 app_runtime_plugin = { path = "../app_runtime_plugin" }
-closure_plugin = { path = "../closure_plugin" }
 core_plugin = { path = "../core_plugin" }
-tokio = { workspace = true }
-
-[dev-dependencies]
-anyhow = { workspace = true }
