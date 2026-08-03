@@ -40,7 +40,8 @@ pub enum AsyncRuntimeError {
     RuntimePluginMissing,
     AsyncRuntimePluginMissing,
     AsyncRuntimePluginAlreadyInstalled,
-    RequestAlreadyRegistered { request_type: &'static str },
+    AsyncSystemAlreadyRegistered { event_type: &'static str },
+    AsyncSystemNotRegistered { event_type: &'static str },
     ExecutorThreadStartFailed { source: io::Error },
     ExecutorRuntimeBuildFailed { source: io::Error },
     ExecutorDisconnected,
@@ -62,12 +63,16 @@ impl fmt::Display for AsyncRuntimeError {
             Self::AsyncRuntimePluginAlreadyInstalled => {
                 formatter.write_str("AsyncRuntimePlugin is already installed")
             }
-            Self::RequestAlreadyRegistered { request_type } => {
+            Self::AsyncSystemAlreadyRegistered { event_type } => {
                 write!(
                     formatter,
-                    "async request `{request_type}` is already registered"
+                    "an async system is already registered for event `{event_type}`"
                 )
             }
+            Self::AsyncSystemNotRegistered { event_type } => write!(
+                formatter,
+                "no async system is registered for event `{event_type}`"
+            ),
             Self::ExecutorThreadStartFailed { source } => {
                 write!(formatter, "failed to start async executor thread: {source}")
             }
