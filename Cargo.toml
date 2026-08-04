@@ -7,6 +7,8 @@ members = [
     "crates/mecs/async_runtime_plugin",
     "crates/mecs/log_plugin",
     "crates/mecs/server_plugin",
+    "crates/margatroid/types",
+    "crates/margatroid/skill_loader_plugin",
 ]
 
 exclude = ["legacy/*"]
@@ -16,6 +18,7 @@ resolver = "3"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

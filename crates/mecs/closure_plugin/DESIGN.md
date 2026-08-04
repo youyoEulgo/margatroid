@@ -137,23 +137,6 @@ ClosureSystem：闭包System，私有结构体--只取得并执行目标为当�
                 依次调用closures中的闭包并为每个闭包临时传入&mut World
 ```
 
-## 持有关系
-
-```text
-App
-├── Schedule
-│   └── ClosureSystem--开发者按Schedule显式挂载
-│       └── schedule: String
-└── World
-    ├── RuntimeHandle Resource
-    └── ClosureRegistry Resource
-        └── schedules
-
-ClosureRequest
-├── target_schedule
-└── Mutex<Option<ErasedClosure>>
-```
-
 ## 逻辑
 
 ```text
@@ -208,4 +191,21 @@ ClosureSystem：
 RuntimePlugin：
     只负责事件入队后的Runtime唤醒
     不解释ClosureRequest，也不执行闭包
+```
+
+## 持有关系
+
+```text
+App
+├── Schedule
+│   └── ClosureSystem--开发者按Schedule显式挂载
+│       └── schedule: String
+└── World
+    ├── RuntimeHandle Resource
+    └── ClosureRegistry Resource
+        └── schedules
+
+ClosureRequest
+├── target_schedule
+└── Mutex<Option<ErasedClosure>>
 ```

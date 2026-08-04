@@ -154,29 +154,6 @@ raw_signal(signal: ProcessSignal) -> io::Result<i32>
     行为：Interrupt返回SIGINT，Terminate返回SIGTERM，其他变体返回Unsupported
 ```
 
-## 持有关系
-
-```text
-App
-├── World
-│   ├── RuntimeHandle Resource
-│   └── SignalHandle Resource
-│       └── Arc<SignalInner>
-│           ├── Mutex<Option<Handle>>
-│           └── Mutex<Option<JoinHandle<()>>>
-└── RuntimePlugin::STARTUP
-    └── 启动信号监听闭包
-        ├── SignalHandle克隆
-        └── Vec<ProcessSignal>
-
-信号监听线程
-├── Signals迭代器
-├── HashMap<i32, ProcessSignal>
-└── RuntimeEventSender
-    ├── EventEmitter
-    └── RuntimeHandle
-```
-
 ## 逻辑
 
 ```text
@@ -225,4 +202,27 @@ App
     SignalPlugin不缓冲、不限流信号事件；每次捕获都直接进入Core事件队列并唤醒Runtime
     SIGKILL与SIGSTOP无法被进程捕获，因此始终拒绝注册
     非Unix平台当前只保证Interrupt与Terminate
+```
+
+## 持有关系
+
+```text
+App
+├── World
+│   ├── RuntimeHandle Resource
+│   └── SignalHandle Resource
+│       └── Arc<SignalInner>
+│           ├── Mutex<Option<Handle>>
+│           └── Mutex<Option<JoinHandle<()>>>
+└── RuntimePlugin::STARTUP
+    └── 启动信号监听闭包
+        ├── SignalHandle克隆
+        └── Vec<ProcessSignal>
+
+信号监听线程
+├── Signals迭代器
+├── HashMap<i32, ProcessSignal>
+└── RuntimeEventSender
+    ├── EventEmitter
+    └── RuntimeHandle
 ```

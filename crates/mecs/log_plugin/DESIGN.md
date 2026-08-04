@@ -303,27 +303,6 @@ record_from_event<S>(event: &tracing::Event<'_>, context: Context<'_, S>) -> Tra
     行为：读取时间、级别、target、message、字段和Span栈并构造TracingRecord
 ```
 
-## 持有关系
-
-```text
-进程全局：
-InstalledTracing--已安装Tracing
-├── TracingConfiguration--Tracing配置
-├── Option<TracingStream>--可选诊断流
-│   └── broadcast::Sender<TracingRecord>--广播发送端
-└── Vec<WorkerGuard>--WorkerGuard数组
-
-tracing全局Dispatcher
-└── Registry
-    ├── Option<Console Layer>--可选Console Layer
-    ├── Option<File Layer>--可选File Layer
-    └── Option<TracingStreamLayer>--可选诊断流Layer
-
-App
-└── World
-    └── Option<TracingStream> Resource--可选诊断流资源；与进程全局TracingStream共享广播发送端
-```
-
 ## 逻辑
 
 ```text
@@ -444,4 +423,25 @@ HttpPlugin处理EventLog：
     LogPlugin中的event_log_system只负责事件到tracing Event的转换，不保存其他业务状态
     EventLog可以被多个System独立读取，一个System的处理不会消费或屏蔽其他System的读取
     请求ID、Agent ID和其他上下文暂不由LogPlugin定义，需要时扩展EventLog而不是解析message
+```
+
+## 持有关系
+
+```text
+进程全局：
+InstalledTracing--已安装Tracing
+├── TracingConfiguration--Tracing配置
+├── Option<TracingStream>--可选诊断流
+│   └── broadcast::Sender<TracingRecord>--广播发送端
+└── Vec<WorkerGuard>--WorkerGuard数组
+
+tracing全局Dispatcher
+└── Registry
+    ├── Option<Console Layer>--可选Console Layer
+    ├── Option<File Layer>--可选File Layer
+    └── Option<TracingStreamLayer>--可选诊断流Layer
+
+App
+└── World
+    └── Option<TracingStream> Resource--可选诊断流资源；与进程全局TracingStream共享广播发送端
 ```
