@@ -42,7 +42,7 @@ max_output_tokens = 8192
 `model` 是模型路由 ID 文本；Provider、base URL 和 API key 属于 `models.toml`，不能写入镜像。
 
 `skills/` 和 `workflows/` 下的 `<scope>/<name>` 自动进入镜像默认可见性，不需要在
-`agent.toml` 重复登记。Loader 只发现名称和保存查找根，不读取资源正文。
+`agent.toml` 重复登记。Loader 只发现名称，不读取资源正文，也不把查找路径塞进默认可见性。
 
 ## 安装
 
@@ -55,16 +55,17 @@ use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::App;
 
 let data_root = PathBuf::from("/home/user/.margatroid");
-let loader = AgentImageLoaderPlugin::open(data_root.join("agent-images"))?;
+let agent_image_loader = AgentImageLoaderPlugin::open(data_root.join("agent-images"))?;
 
 let mut app = App::new();
 app.add_plugin(RuntimePlugin::default())
     .add_plugin(AsyncRuntimePlugin)
-    .add_plugin(loader);
+    .add_plugin(agent_image_loader);
 ```
 
 官方 daemon 组合负责确定主目录并传入绝对路径。Loader 不根据当前工作目录猜测位置，也不要求
-InferencePlugin、WorkspacePlugin、SkillLoaderPlugin 或 WorkflowLoaderPlugin 已经安装。
+InferencePlugin、WorkspacePlugin、SkillLoaderPlugin 或 WorkflowLoaderPlugin 已经安装。这里的
+`agent_image_loader` 是已经配置好、等待安装到 App 的 `AgentImageLoaderPlugin` 实例。
 
 ## 加载镜像
 

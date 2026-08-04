@@ -106,6 +106,11 @@ AgentImageLoadErrorKind：AgentImage加载错误分类，公开枚举
 AgentImageLoadError：AgentImage加载错误，公开结构体--提供稳定分类和不暴露绝对路径的安全描述
     kind: AgentImageLoadErrorKind--错误分类
     message: String--有界安全描述
+    new(kind: AgentImageLoadErrorKind, message: impl Into<String>) -> Self
+        构造错误：私有关联函数，保存kind和安全描述
+        行为：message超过512 UTF-8字节时在字符边界截断并追加省略号，最终长度不超过512字节
+    invalid_root(message: impl Into<String>) -> Self
+        构造根错误：私有关联函数，以InvalidRoot分类调用new
     kind(&self) -> AgentImageLoadErrorKind
         取得分类：公开方法，返回kind
     message(&self) -> &str
@@ -150,7 +155,7 @@ AgentImageLoaderLimits：AgentImage加载限制，私有结构体--限制单个�
     max_stop_sequences: usize--停止序列数量上限，仅保护资源读取
     max_stop_sequence_bytes: usize--单个停止序列最大UTF-8字节数，仅保护资源读取
     impl Default for AgentImageLoaderLimits
-        Default：私有trait实现，使用有界清单、Soul、资源名称、模型ID和停止序列限制
+        Default：私有trait实现，使用64KiB清单、1MiB Soul、4096个资源名称、1KiB模型ID、128个停止序列和4KiB单序列限制
 
 AgentImageReadTask：AgentImage异步读取任务，私有事件--不持有World引用
     reference: AgentImageReference--目标镜像引用
@@ -165,14 +170,36 @@ PreparedAgentImage：已准备AgentImage，私有结构体--镜像静态数据�
     model: AgentImageModelConfig--中立模型配置
     default_visibility: AgentImageDefaultVisibility--默认只读资源可见性
 
-AgentImageReadOutput：AgentImage读取输出，私有结构体--无论成功失败都保留镜像引用
+AgentImageReadPayload：AgentImage读取载荷，私有结构体--无论成功失败都保留镜像引用
     reference: AgentImageReference--原镜像引用
     result: Result<PreparedAgentImage, AgentImageLoadError>--读取结果
+
+AgentImageReadOutput：AgentImage读取输出，私有结构体--允许提交System从共享事件引用中取得一次载荷所有权
+    payload: Mutex<Option<AgentImageReadPayload>>--尚未提交的读取载荷
+    new(payload: AgentImageReadPayload) -> Self
+        构造输出：私有关联函数，将payload保存为尚未取得的载荷
+    take(&self) -> Option<AgentImageReadPayload>
+        取得载荷：私有方法，从共享事件中取出一次载荷所有权；已取出时返回空
 
 AgentImageTaskError：AgentImage异步监督错误，私有结构体--表示AsyncRuntime整体取消处理器
     source: AsyncTaskError--异步运行时错误
     impl From<AsyncTaskError> for AgentImageTaskError
         From<AsyncTaskError>：私有trait实现，满足add_async_system错误约束
+
+DirectoryEntryKind：目录入口类型，私有枚举--目录快照只区分Loader允许的普通文件和目录
+    File
+    Directory
+
+DirectoryEntrySignature：目录入口签名，私有结构体--用于发现加载期间的目录结构变化
+    name: OsString--入口名称
+    kind: DirectoryEntryKind--入口类型
+
+DirectorySignature：目录签名，私有结构体--按名称排序的直接子项快照
+    entries: Vec<DirectoryEntrySignature>--直接子项
+
+FileSignature：文件签名，私有结构体--用于识别静态文件读取期间的可见变化
+    length: u64--文件长度
+    modified: Option<SystemTime>--文件系统可用时的修改时间
 ```
 
 ## 函数
@@ -191,7 +218,7 @@ prepare_agent_image_load_system(world: &mut World)
 read_agent_image(task: AgentImageReadTask) -> Result<AgentImageReadOutput, AgentImageTaskError>
     读取镜像：私有异步函数，在AsyncRuntime中读取并准备完整AgentImage
     行为：
-        在panic捕获边界内调用resolve_image_root
+        在panic捕获边界内调用read_agent_image_inner
         调用validate_image_layout检查顶层目录结构
         有界读取并解析agent.toml
         schema_version不是1时返回UnsupportedSchema
@@ -201,31 +228,47 @@ read_agent_image(task: AgentImageReadTask) -> Result<AgentImageReadOutput, Agent
         调用discover_resource_names分别发现skills与workflows下的scope/name目录
         构造字段私有的AgentImageDefaultVisibility
         不读取SKILL.md、Workflow正文、脚本、模板或资产
-        成功或普通失败均包装为保留reference的AgentImageReadOutput
-        panic转换为带reference的TaskPanicked输出
+        成功或普通失败均包装为保留reference的AgentImageReadPayload和AgentImageReadOutput
+        panic转换为带reference和固定安全描述的TaskPanicked输出
         Runtime整体取消时返回AgentImageTaskError
+
+read_agent_image_inner(task: AgentImageReadTask) -> Result<PreparedAgentImage, AgentImageLoadError>
+    执行镜像读取：私有异步函数，完成目录验证、静态文件读取、清单解析和资源名称发现
+    行为：读取前后比较顶层目录与静态文件签名，成功时构造PreparedAgentImage
+
+validate_model_document(
+    document: &AgentImageModelDocument,
+    limits: &AgentImageLoaderLimits,
+) -> Result<(), AgentImageLoadError>
+    验证模型文档：私有函数，只检查模型ID、停止序列数量和单序列读取上限
+    行为：不判断temperature、top_p、max_output_tokens或停止序列的业务语义
 
 apply_agent_image_load_system(world: &mut World)
     提交镜像：私有System，读取异步结果并创建或刷新AgentImage Entity
     行为：对每个异步响应依次执行
         AgentImageTaskError只在Runtime取消等无法继续路径写system log
-        取得AgentImageReadOutput后从pending移除reference并取得全部等待id
+        对每个AgentImageReadOutput调用take取得一次AgentImageReadPayload
+        从pending移除payload.reference并取得全部等待id
         output失败时为每个等待id发送克隆的AgentImageLoadError
         output成功且已登记Entity仍存活时替换Identity、Soul、ModelConfig和DefaultVisibility组件
         没有存活Entity时spawn并插入全部组件，再登记reference到Entity
         只有全部PreparedAgentImage已完成结构验证后才修改World
         为每个等待id发送同一reference和Entity的LoadAgentImageResult::Ok
 
-resolve_image_root(root: &Path, reference: &AgentImageReference) -> Result<PathBuf, AgentImageLoadError>
-    解析镜像目录：私有函数，将规范化引用映射到root/scope/name/tag
-    行为：规范化结果必须位于root内；不存在返回NotFound；symlink或非目录返回InvalidLayout
+apply_agent_image_payload(world: &mut World, payload: AgentImageReadPayload)
+    提交镜像载荷：私有函数，取得等待请求并原子选择成功或失败路径
+    行为：成功时复用存活Entity或创建新Entity并全量替换四个组件；失败时只发送克隆错误
 
-validate_image_layout(root: &Path) -> Result<(), AgentImageLoadError>
-    验证镜像布局：私有函数，检查AgentImage顶层只包含规定文件与目录
+resolve_image_root(root: &Path, reference: &AgentImageReference) -> Result<PathBuf, AgentImageLoadError>
+    解析镜像目录：私有异步函数，将规范化引用映射到root/scope/name/tag
+    行为：规范化结果必须位于root内；不存在返回NotFound；symlink返回SymlinkNotAllowed，非目录返回InvalidLayout
+
+validate_image_layout(root: &Path) -> Result<DirectorySignature, AgentImageLoadError>
+    验证镜像布局：私有异步函数，检查AgentImage顶层只包含规定文件与目录并返回快照
     行为：
         agent.toml和SOUL.md必须是普通文件
         skills与workflows缺失时视为空，存在时必须是普通目录
-        顶层symlink、设备文件和未知入口返回InvalidLayout
+        顶层symlink返回SymlinkNotAllowed，设备文件和未知入口返回InvalidLayout
         不递归验证Skill与Workflow内容，它们由对应Loader Plugin在每次使用时重新验证
 
 discover_resource_names(root: &Path, limits: &AgentImageLoaderLimits) -> Result<BTreeSet<ResourceName>, AgentImageLoadError>
@@ -237,6 +280,35 @@ discover_resource_names(root: &Path, limits: &AgentImageLoaderLimits) -> Result<
         不进入name目录读取任何资源内容
         名称数量超过max_embedded_resources时返回LimitExceeded
         目录在发现过程中变化时返回SourceChanged
+
+normalize_root(root: PathBuf) -> Result<PathBuf, AgentImageLoadError>
+    规范化根：私有函数，要求绝对路径、拒绝父级跳转并移除当前目录段
+
+ensure_root(root: &Path) -> Result<(), AgentImageLoadError>
+    确保根存在：私有函数，创建缺失目录后重新检查最终节点
+    行为：最终节点是symlink或不是目录时返回InvalidRoot
+
+check_directory(path: &Path, root: bool) -> Result<Option<PathBuf>, AgentImageLoadError>
+    检查目录：私有异步函数，区分不存在、合法目录与无效镜像来源
+    行为：拒绝symlink和非目录；root决定非目录被分类为InvalidRoot或InvalidLayout
+
+directory_signature(path: &Path, maximum_entries: usize) -> Result<DirectorySignature, AgentImageLoadError>
+    获取目录签名：私有异步函数，读取并排序直接子项
+    行为：拒绝symlink、特殊文件和超限入口，只在签名中保留入口名称与普通文件或目录类型
+
+read_bounded(
+    path: &Path,
+    maximum: u64,
+    read_error: AgentImageLoadErrorKind,
+) -> Result<(Vec<u8>, FileSignature), AgentImageLoadError>
+    有界读取：私有异步函数，在读取前后比较文件签名和实际字节数
+    行为：最多读取maximum加一字节，拒绝超限和读取中变化，成功时返回原始字节与读取前签名
+
+file_signature(path: &Path, read_error: AgentImageLoadErrorKind) -> Result<FileSignature, AgentImageLoadError>
+    获取文件签名：私有异步函数，拒绝symlink和非普通文件并读取长度与修改时间
+
+has_parent(path: &Path) -> bool
+    检查父级跳转：私有函数，返回路径是否包含ParentDir组件
 ```
 
 ## 逻辑
@@ -319,11 +391,12 @@ AgentImageReadTask
 ├── root: Arc<PathBuf>
 └── limits: AgentImageLoaderLimits
     -> AgentImageReadOutput
-       ├── reference: AgentImageReference
-       └── result: Result<PreparedAgentImage, AgentImageLoadError>
-           └── PreparedAgentImage
-               ├── reference: AgentImageReference
-               ├── soul: AgentImageSoul
-               ├── model: AgentImageModelConfig
-               └── default_visibility: AgentImageDefaultVisibility
+       └── payload: Mutex<Option<AgentImageReadPayload>>
+           ├── reference: AgentImageReference
+           └── result: Result<PreparedAgentImage, AgentImageLoadError>
+               └── PreparedAgentImage
+                   ├── reference: AgentImageReference
+                   ├── soul: AgentImageSoul
+                   ├── model: AgentImageModelConfig
+                   └── default_visibility: AgentImageDefaultVisibility
 ```
