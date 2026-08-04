@@ -599,48 +599,6 @@ route_websocket_message(event_sender: &RuntimeEventSender, classifier: &dyn WebS
     分流WebSocket消息：私有异步函数，普通消息发事件，Start创建支流并发一次打开事件，Chunk、End和Abort只进入支流通道
 ```
 
-## 持有关系
-
-```text
-App
-└── World
-    ├── RuntimeHandle
-    ├── AsyncRuntimeHandle
-    ├── ServerOptions
-    ├── RouteRegistry
-    │   └── Mutex<RouteRegistryState>
-    │       ├── Router
-    │       ├── Vec<EventRoute>
-    │       └── Vec<WebSocketRoute>
-    ├── WebSocketConnections
-    │   └── Arc<RwLock<WebSocketConnectionsState>>
-    └── ServerHandle
-        └── Arc<ServerHandleState>
-
-AsyncRuntime专用线程
-└── Axum长期服务Future
-    ├── Router
-    ├── ServerBridgeState
-    └── 优雅停止接收端
-
-每个HTTP委托请求
-├── Axum Handler
-│   └── 响应开始接收端
-└── HttpRequestReceived
-    └── HttpResponseSession
-        └── Arc<Mutex<HttpResponseState>>
-
-每条WebSocket连接
-├── Axum连接任务
-│   ├── 根接收器
-│   ├── 根写入器
-│   └── HashMap<WebSocketStreamId, WebSocketStream>
-├── WebSocketConnections条目
-│   └── WebSocketSender
-└── 每条活动支流
-    └── WebSocketStreamReceiver--唯一消费者，可转交不可克隆
-```
-
 ## 逻辑
 
 ```text
@@ -719,4 +677,46 @@ ServerPlugin边界：
     流分片不进入ECS事件队列，事件只传递连接、普通消息和支流打开等状态
     流式HTTP上传、原生Axum提取器和中间件使用原生路由
     文件存储与落盘、prompt、token、tool call和业务协议不属于ServerPlugin
+```
+
+## 持有关系
+
+```text
+App
+└── World
+    ├── RuntimeHandle
+    ├── AsyncRuntimeHandle
+    ├── ServerOptions
+    ├── RouteRegistry
+    │   └── Mutex<RouteRegistryState>
+    │       ├── Router
+    │       ├── Vec<EventRoute>
+    │       └── Vec<WebSocketRoute>
+    ├── WebSocketConnections
+    │   └── Arc<RwLock<WebSocketConnectionsState>>
+    └── ServerHandle
+        └── Arc<ServerHandleState>
+
+AsyncRuntime专用线程
+└── Axum长期服务Future
+    ├── Router
+    ├── ServerBridgeState
+    └── 优雅停止接收端
+
+每个HTTP委托请求
+├── Axum Handler
+│   └── 响应开始接收端
+└── HttpRequestReceived
+    └── HttpResponseSession
+        └── Arc<Mutex<HttpResponseState>>
+
+每条WebSocket连接
+├── Axum连接任务
+│   ├── 根接收器
+│   ├── 根写入器
+│   └── HashMap<WebSocketStreamId, WebSocketStream>
+├── WebSocketConnections条目
+│   └── WebSocketSender
+└── 每条活动支流
+    └── WebSocketStreamReceiver--唯一消费者，可转交不可克隆
 ```

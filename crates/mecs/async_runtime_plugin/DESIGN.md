@@ -338,47 +338,6 @@ panic_message(payload: Box<dyn Any + Send + 'static>) -> String
     行为：依次尝试String和&'static str，均不匹配时返回固定描述
 ```
 
-## 持有关系
-
-```text
-App
-├── Schedule
-│   ├── AsyncEventSystem<Request, T, E, Handler, Args>--事件模式，每个Request类型最多一个
-│   │   └── Arc<Handler>
-│   └── ClosureSystem--由ClosurePlugin持有，统一执行同步闭包与异步分发包装闭包
-└── World
-    ├── RuntimeHandle Resource
-    ├── AsyncRegistry Resource
-    │   └── event_systems
-    └── AsyncRuntimeHandle Resource
-        ├── Option<UnboundedSender<ErasedExecutionTask>>
-        └── Option<JoinHandle<()>>
-
-事件模式请求
-└── AsyncEventRequest<Request>
-    ├── Mutex<Option<Request>>
-    └── AsyncMode
-
-闭包模式请求--由ClosurePlugin持有
-└── ClosureRequest
-    ├── target_schedule
-    └── 同步分发闭包
-        ├── Task
-        └── AsyncMode
-
-专用异步线程
-└── Tokio current-thread Runtime
-    └── UnboundedReceiver<ErasedExecutionTask>
-
-已提交的受监督任务
-├── 业务Future
-├── AsyncContext
-│   └── RuntimeEventSender
-├── EventHandle<Result<T, E>>
-├── AsyncMode
-└── RuntimeHandle
-```
-
 ## 逻辑
 
 ```text
@@ -543,4 +502,45 @@ RuntimePlugin：
     不执行异步任务
     不创建或填充pending事件
     只提供运行循环、RuntimeHandle、阀与事件发送扩展
+```
+
+## 持有关系
+
+```text
+App
+├── Schedule
+│   ├── AsyncEventSystem<Request, T, E, Handler, Args>--事件模式，每个Request类型最多一个
+│   │   └── Arc<Handler>
+│   └── ClosureSystem--由ClosurePlugin持有，统一执行同步闭包与异步分发包装闭包
+└── World
+    ├── RuntimeHandle Resource
+    ├── AsyncRegistry Resource
+    │   └── event_systems
+    └── AsyncRuntimeHandle Resource
+        ├── Option<UnboundedSender<ErasedExecutionTask>>
+        └── Option<JoinHandle<()>>
+
+事件模式请求
+└── AsyncEventRequest<Request>
+    ├── Mutex<Option<Request>>
+    └── AsyncMode
+
+闭包模式请求--由ClosurePlugin持有
+└── ClosureRequest
+    ├── target_schedule
+    └── 同步分发闭包
+        ├── Task
+        └── AsyncMode
+
+专用异步线程
+└── Tokio current-thread Runtime
+    └── UnboundedReceiver<ErasedExecutionTask>
+
+已提交的受监督任务
+├── 业务Future
+├── AsyncContext
+│   └── RuntimeEventSender
+├── EventHandle<Result<T, E>>
+├── AsyncMode
+└── RuntimeHandle
 ```

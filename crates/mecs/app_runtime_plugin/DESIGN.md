@@ -210,26 +210,6 @@ Runtime的配置错误与可识别运行错误使用RuntimeError统一描述
 锁中毒、原子计数溢出和Runtime内部状态不一致属于不变量破坏，直接panic且不进入RuntimeError
 ```
 
-## 持有关系
-
-```text
-配置阶段：
-App
-└── World
-    ├── RuntimeControl Resource
-    │   └── RuntimeHandle
-    └── RuntimeHandle Resource
-
-调用AppRunExt::run之后：
-当前线程栈
-└── RuntimeControl--从World移出所有权，独占驱动App
-    └── RuntimeHandle
-
-App
-└── World
-    └── RuntimeHandle Resource
-```
-
 ## 逻辑
 
 ```text
@@ -263,4 +243,24 @@ App
                 调用RuntimeControl::wait等待通知
             Closed：
                 返回
+```
+
+## 持有关系
+
+```text
+配置阶段：
+App
+└── World
+    ├── RuntimeControl Resource
+    │   └── RuntimeHandle
+    └── RuntimeHandle Resource
+
+调用AppRunExt::run之后：
+当前线程栈
+└── RuntimeControl--从World移出所有权，独占驱动App
+    └── RuntimeHandle
+
+App
+└── World
+    └── RuntimeHandle Resource
 ```
