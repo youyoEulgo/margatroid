@@ -408,6 +408,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "inference_plugin"
+version = "0.1.0"
+dependencies = [
+ "core_plugin",
+ "serde_json",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1039,6 +1047,22 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "tool_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "core_plugin",
+ "futures-util",
+ "inference_plugin",
+ "margatroid_types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "tower"
