@@ -231,6 +231,21 @@ pub struct AgentMessage {
 
 impl Event for AgentMessage {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentFailureKind {
+    Inference,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentFailure {
+    pub id: String,
+    pub agent: Entity,
+    pub kind: AgentFailureKind,
+    pub message: String,
+}
+
+impl Event for AgentFailure {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentContextMessagesUpdated {
     pub agent: Entity,
