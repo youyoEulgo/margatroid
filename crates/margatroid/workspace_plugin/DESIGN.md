@@ -1,160 +1,123 @@
+# 伪代码格式
+```text
+模块：使用一级标题，只写当前设计涉及的部分
+
+类型：使用二级标题，按私有、crate公开和公开分组
+TypeName：中文类型名，可见性类型--类型说明
+    field_name: RustType--中文字段名，字段说明
+    method_name<Generic>(self, parameter: ParameterType) -> ReturnType
+        中文方法名：可见性方法，解释参数和用途
+        约束：使用标准Rust where约束；单个约束写在同一行
+        行为：展开完整逻辑
+    impl TraitName for TypeName
+        TraitName：可见性trait实现
+        trait_method_name(&self, parameter: ParameterType) -> ReturnType
+            中文方法名：解释参数和用途
+            行为：标准库trait的简单行为用一句话说明
+
+函数：使用二级标题，按私有和公开分组，只放置不属于某个类型的操作
+function_name<Generic>(parameter: ParameterType) -> ReturnType
+    中文函数名：可见性函数，解释参数和用途
+    约束：使用标准Rust where约束；单个约束写在同一行
+    行为：展开完整逻辑
+
+逻辑：使用二级标题，按执行顺序描述对象之间的调用关系
+注释：字段注释使用--，类型、方法和函数的说明直接写在标题中
+属性：不写Rust Attribute，实现时自行判断
+边界：对外使用泛型和具体类型，内部使用类型擦除
+```
+
 # WorkspacePlugin
-
-## 定位
-
-WorkspacePlugin是Workspace运行时的编排者。它接收Compose已经编译完成的`WorkspaceDefinition`，
-从各业务Plugin收集创建AgentInstance所需的信息，最后发送Agent创建事件。
-
-WorkspacePlugin负责两类事情：
-
-- 启动、重载和关闭Workspace中的整组AgentInstance。
-- 在Workspace和Agent Entity上保存稳定、只读、可查询的运行时关系。
-
-WorkspacePlugin不解析YAML，不读取Skill/Workflow正文，不执行推理、工具或Agent消息循环，也不把
-其他Plugin的运行状态复制到一个通用字典。信息仍由拥有它的Plugin用typed Component保存；
-WorkspacePlugin只建立Workspace归属、逻辑名称与Entity之间的关系。
-
-## 输入与收集范围
-
-`WorkspaceDefinition`和`WorkspaceAgentDefinition`定义在`margatroid_types`，由Compose构造：
-
-```text
-WorkspaceDefinition
-├── name
-├── project_root
-├── manager
-└── agents
-    ├── name
-    ├── image
-    ├── resources / disable_resources
-    └── memory_path
-```
-
-WorkspacePlugin为每个Agent收集：
-
-```text
-AgentImageLoaderPlugin
-    AgentImage Entity、Soul、中立模型配置、默认ResourceRef可见性
-
-InferencePlugin
-    Workspace项目级模型路由、AgentInferenceSnapshot
-
-ToolPlugin
-    AgentToolEnvironment；工具定义在每次LLM请求前由动态可见性解析
-
-MemoryPlugin
-    AgentMemory、realtime_messages恢复出的Vec<Message>
-
-WorkspacePlugin自身
-    Workspace归属；Agent默认可见性由AgentPlugin持有
-```
-
-Skill和Workflow正文不在启动阶段加载。Workspace只计算最终可见名称并把项目根、镜像根交给
-ToolPlugin的执行环境；实际使用时由SkillPlugin或WorkflowPlugin动态读取当前内容。
 
 ## 类型
 
 公开：
 ```text
-WorkspacePlugin：Workspace运行编排插件，公开结构体--配置AgentImage根与处理Schedule
+WorkspacePlugin：Workspace运行编排插件，公开结构体--协调Workspace及其AgentInstance的创建、重载和关闭
     agent_images_root: PathBuf--与AgentImageLoaderPlugin相同的镜像库根，私有
-    schedule: String--命令与依赖结果收集所属Schedule，私有
+    schedule: String--Workspace命令System所属Schedule，私有
     open(agent_images_root: impl Into<PathBuf>) -> Result<Self, WorkspaceError>
         打开插件：公开关联函数，规范化AgentImage根但不扫描或读取镜像
-        限制：daemon组合根必须向WorkspacePlugin和AgentImageLoaderPlugin传入同一个镜像库根
+        限制：daemon必须向WorkspacePlugin和AgentImageLoaderPlugin传入同一个镜像库根
     with_schedule(mut self, schedule: impl Into<String>) -> Self
         指定阶段：公开方法，替换默认RuntimePlugin::UPDATE并返回自身
     impl Plugin for WorkspacePlugin
         Plugin：公开trait实现
         build(self, app: &mut App)
-            构建插件：安装WorkspaceRegistry并挂载Workspace生命周期System
+            构建插件：安装WorkspaceRegistry并挂载Workspace命令System
             行为：
-                确认RuntimePlugin、AgentImageLoaderPlugin、InferencePlugin、ToolPlugin、AgentPlugin与MemoryPlugin已安装
+                确认RuntimePlugin、AgentImageLoaderPlugin、InferencePlugin、ToolPlugin、AgentPlugin和MemoryPlugin已安装
                 确认schedule存在且WorkspacePlugin尚未安装
                 插入WorkspaceRegistry
                 挂载begin_workspace_command_system
                 挂载collect_agent_image_system
                 挂载collect_agent_created_system
 
-StartWorkspace：启动Workspace事件，公开事件--从编译后的静态定义创建一组AgentInstance
+StartWorkspace：Workspace启动事件，公开事件--从Compose编译后的定义创建一组AgentInstance
     id: String--调用方生成的请求ID
     definition: WorkspaceDefinition--Compose产生的完整静态定义
     impl Event for StartWorkspace
         Event：公开trait实现
 
-StartWorkspaceResult：启动Workspace结果，公开事件--返回Ready Workspace Entity或稳定错误
+StartWorkspaceResult：Workspace启动结果，公开事件--返回已就绪Workspace Entity或稳定错误
     id: String--原请求ID
-    result: Result<Entity, WorkspaceError>--成功时为可以接收请求的Workspace Entity
+    result: Result<Entity, WorkspaceError>--成功时为可接收请求的Workspace Entity
     impl Event for StartWorkspaceResult
         Event：公开trait实现
 
-ReloadWorkspace：重载Workspace事件，公开事件--关闭当前实例组并按新定义重新创建
+ReloadWorkspace：Workspace重载事件，公开事件--关闭当前实例组并按新定义重新创建
     id: String--调用方生成的请求ID
-    workspace: Entity--当前Ready Workspace Entity
+    workspace: Entity--当前已就绪Workspace Entity
     definition: WorkspaceDefinition--Compose重新编译的最新定义
     impl Event for ReloadWorkspace
         Event：公开trait实现
 
-ReloadWorkspaceResult：重载Workspace结果，公开事件--成功时返回新的Workspace Entity
+ReloadWorkspaceResult：Workspace重载结果，公开事件--返回新建Workspace或稳定错误
     id: String--原请求ID
     previous: Entity--被关闭的原Workspace Entity
-    result: Result<Entity, WorkspaceError>--成功时为重建后的Ready Workspace Entity
+    result: Result<Entity, WorkspaceError>--成功时为重建后的已就绪Workspace Entity
     impl Event for ReloadWorkspaceResult
         Event：公开trait实现
 
-StopWorkspace：关闭Workspace事件，公开事件--释放Workspace拥有的全部AgentInstance
+StopWorkspace：Workspace关闭事件，公开事件--释放Workspace拥有的全部AgentInstance
     id: String--调用方生成的请求ID
-    workspace: Entity--需要关闭的Ready Workspace Entity
+    workspace: Entity--需要关闭的已就绪Workspace Entity
     impl Event for StopWorkspace
         Event：公开trait实现
 
-StopWorkspaceResult：关闭Workspace结果，公开事件
+StopWorkspaceResult：Workspace关闭结果，公开事件--报告Workspace和Agent释放结果
     id: String--原请求ID
     workspace: Entity--原Workspace Entity
     result: Result<(), WorkspaceError>--成功表示Workspace和其AgentInstance已经释放
     impl Event for StopWorkspaceResult
         Event：公开trait实现
 
-WorkspaceIdentity：Workspace身份，公开组件--保存稳定逻辑名称与项目根
+WorkspaceIdentity：Workspace身份，公开组件--保存稳定逻辑名称与规范化项目根
     name: Arc<str>--项目内Workspace逻辑名称，私有
     project_root: Arc<PathBuf>--规范化绝对项目根，私有
     name(&self) -> &str
-        取得名称：公开方法
+        取得名称：公开方法，返回Workspace逻辑名称
     project_root(&self) -> &Path
-        取得项目根：公开方法
+        取得项目根：公开方法，返回规范化项目根
     impl Component for WorkspaceIdentity
         Component：公开trait实现
 
 WorkspaceConfiguration：Workspace配置快照，公开组件--保存本次启动使用的编译后定义
     definition: Arc<WorkspaceDefinition>--不包含运行时Entity的静态定义，私有
     definition(&self) -> &WorkspaceDefinition
-        取得定义：公开方法，返回只读引用
+        取得定义：公开方法，返回只读配置引用
     impl Component for WorkspaceConfiguration
-        Component：公开trait实现
-
-WorkspaceStatus：Workspace公开状态，公开枚举
-    Starting--正在收集镜像和实例材料，不可接收Agent请求
-    Ready--全部Agent已经创建、补齐组件并绑定Memory
-    Stopping--正在释放实例，不再接受新请求
-    impl Clone + Copy + PartialEq + Eq for WorkspaceStatus
-        值语义：公开trait实现
-
-WorkspaceLifecycle：Workspace状态组件，公开组件
-    status: WorkspaceStatus--当前状态，私有
-    status(&self) -> WorkspaceStatus
-        取得状态：公开方法
-    impl Component for WorkspaceLifecycle
         Component：公开trait实现
 
 WorkspaceAgents：Workspace Agent索引，公开组件--只在全部Agent准备成功后挂载
     manager: Entity--默认入口AgentInstance，私有
     agents: BTreeMap<String, Entity>--Agent逻辑名称到Entity的稳定映射，私有
     manager(&self) -> Entity
-        取得默认入口：公开方法
+        取得默认入口：公开方法，返回manager Agent Entity
     agent(&self, name: &str) -> Option<Entity>
-        取得Agent：公开方法，按逻辑名称查询
+        取得Agent：公开方法，按逻辑名称查询Agent Entity
     iter(&self) -> impl Iterator<Item = (&str, Entity)> + '_
-        遍历Agent：公开方法，按逻辑名称顺序返回
+        遍历Agent：公开方法，按逻辑名称顺序返回全部Agent
     impl Component for WorkspaceAgents
         Component：公开trait实现
 
@@ -172,30 +135,37 @@ WorkspaceErrorKind：Workspace错误分类，公开枚举
     InferenceSetupFailed
     MemorySetupFailed
     ResourceSetupFailed
+    impl Clone + Copy + PartialEq + Eq for WorkspaceErrorKind
+        值语义：公开trait实现
 
-WorkspaceError：Workspace启动和生命周期错误，公开结构体--提供不暴露绝对路径或资源正文的稳定描述
+WorkspaceError：Workspace命令错误，公开结构体--提供不暴露绝对路径或资源正文的稳定描述
     kind: WorkspaceErrorKind--错误分类，私有
     message: String--不包含Soul、Memory消息、Skill正文或工具参数的有界描述，私有
     kind(&self) -> WorkspaceErrorKind
-        取得分类：公开方法
+        取得分类：公开方法，返回错误分类
     message(&self) -> &str
-        取得描述：公开方法
+        取得描述：公开方法，返回有界错误描述
     impl Clone for WorkspaceError
         Clone：公开trait实现
     impl fmt::Display for WorkspaceError
-        Display：公开trait实现
+        Display：公开trait实现，只输出稳定分类和描述
     impl std::error::Error for WorkspaceError
         Error：公开trait实现
 
-WorldWorkspaceExt：World Workspace扩展，公开trait--发送生命周期命令并查询运行时关系
+WorldWorkspaceExt：World Workspace扩展，公开trait--发送Workspace命令并查询运行时关系
     start_workspace(&self, id: impl Into<String>, definition: WorkspaceDefinition)
         启动Workspace：公开方法，发送StartWorkspace并唤醒Runtime
-    reload_workspace(&self, id: impl Into<String>, workspace: Entity, definition: WorkspaceDefinition)
+    reload_workspace(
+        &self,
+        id: impl Into<String>,
+        workspace: Entity,
+        definition: WorkspaceDefinition,
+    )
         重载Workspace：公开方法，发送ReloadWorkspace并唤醒Runtime
     stop_workspace(&self, id: impl Into<String>, workspace: Entity)
         关闭Workspace：公开方法，发送StopWorkspace并唤醒Runtime
     workspace(&self, project_root: &Path, name: &str) -> Option<Entity>
-        查询Workspace：公开方法，只返回Ready且仍存活的Workspace Entity
+        查询Workspace：公开方法，只返回已登记且仍存活的Workspace Entity
     workspace_agent(&self, workspace: Entity, name: &str) -> Option<Entity>
         查询Agent：公开方法，从WorkspaceAgents按逻辑名称返回存活Agent
     workspace_manager(&self, workspace: Entity) -> Option<Entity>
@@ -203,15 +173,15 @@ WorldWorkspaceExt：World Workspace扩展，公开trait--发送生命周期命�
     workspace_of(&self, agent: Entity) -> Option<Entity>
         反查Workspace：公开方法，从AgentWorkspaceId返回存活Workspace
     impl WorldWorkspaceExt for World
-        WorldWorkspaceExt for World：公开trait实现
+        WorldWorkspaceExt for World：公开trait实现，命令通过Runtime事件队列发送
 ```
 
 crate公开：
 ```text
-WorkspaceRegistry：Workspace注册与启动状态，crate公开Resource--保存Ready索引和未完成操作
+WorkspaceRegistry：Workspace注册与操作状态，crate公开Resource--保存已就绪索引和未完成操作
     agent_images_root: Arc<PathBuf>--AgentImage版本目录推导根
-    ready: HashMap<WorkspaceKey, Entity>--规范化项目根与Workspace名称到Ready Entity
-    pending: HashMap<String, PendingWorkspace>--Workspace请求ID到未完成启动
+    ready: HashMap<WorkspaceKey, Entity>--规范化项目根与Workspace名称到已就绪Workspace Entity
+    pending: HashMap<String, PendingWorkspace>--Workspace请求ID到未完成操作
     image_requests: HashMap<String, (String, String)>--镜像子请求ID到Workspace请求ID和Agent名称
     agent_requests: HashMap<String, (String, String)>--Agent创建子请求ID到Workspace请求ID和Agent名称
     impl Resource for WorkspaceRegistry
@@ -221,28 +191,26 @@ WorkspaceRegistry：Workspace注册与启动状态，crate公开Resource--保存
 私有：
 ```text
 WorkspaceKey：Workspace注册键，私有结构体--由规范化project_root和name组成
-    project_root: PathBuf
-    name: String
+    project_root: PathBuf--规范化项目根
+    name: String--Workspace逻辑名称
 
 PendingWorkspaceKind：未完成操作类型，私有枚举
-    Start
-    Reload { previous: Entity }
+    Start--启动操作
+    Reload { previous: Entity }--重载操作及已关闭的旧Workspace
 
-PendingWorkspace：未完成Workspace启动，私有结构体
+PendingWorkspace：未完成Workspace操作，私有结构体--暂存跨多个事件阶段的启动材料
     kind: PendingWorkspaceKind--决定最终发布Start或Reload结果
-    workspace: Entity--本次新建的Starting Workspace Entity
+    workspace: Entity--本次操作暂存的Workspace Entity
     definition: WorkspaceDefinition--已复核定义
     images: BTreeMap<String, Result<Entity, WorkspaceError>>--每个Agent的镜像收集结果
     prepared: BTreeMap<String, PreparedWorkspaceAgent>--全部镜像成功后构造的实例材料
     agents: BTreeMap<String, Entity>--已经收到回执并完成其他Plugin组件绑定的Agent
 
-PreparedWorkspaceAgent：已经收集完成的单Agent实例材料，私有结构体
+PreparedWorkspaceAgent：单Agent实例材料，私有结构体--创建Agent Entity前收集完整依赖
     name: String--Agent逻辑名称
-    image: Entity--来源AgentImage Entity
-    image_reference: AgentImageReference--来源镜像引用
     system_prompt: String--从AgentImage Soul取得的系统提示词
     messages: Vec<Message>--MemoryPlugin恢复的实时上下文
-    default_visibility: AgentDefaultVisibility--镜像默认值与Workspace参数的合并结果
+    default_visibility: BTreeSet<ResourceRef>--镜像默认值与Workspace参数合并后的资源集合，交给AgentPlugin构造只读组件
     inference_snapshot: AgentInferenceSnapshot--InferencePlugin构造的实例推理快照
     tool_environment: AgentToolEnvironment--项目根与镜像版本根
     memory: AgentMemory--已经打开但尚未绑定Entity的SQLite连接
@@ -255,10 +223,12 @@ PreparedWorkspaceAgent：已经收集完成的单Agent实例材料，私有结�
 begin_workspace_command_system(world: &mut World)
     开始命令：私有System，读取StartWorkspace、ReloadWorkspace和StopWorkspace
     行为：
+        收集本次全部Workspace命令并结束EventReader借用
         StartWorkspace调用begin_workspace_start
-        ReloadWorkspace先验证旧Workspace为Ready、新definition合法且WorkspaceKey与旧身份一致
-        验证成功后调用stop_workspace_inner关闭旧实例，再以Reload类型调用begin_workspace_start
+        ReloadWorkspace验证旧Workspace已登记、最新定义合法且WorkspaceKey与旧身份一致
+        ReloadWorkspace验证成功后调用stop_workspace_inner关闭旧实例，再以Reload类型调用begin_workspace_start
         StopWorkspace调用stop_workspace_inner并立即发送StopWorkspaceResult
+        每个命令失败时发布对应的稳定错误结果
 
 begin_workspace_start(
     world: &mut World,
@@ -269,12 +239,11 @@ begin_workspace_start(
     开始启动：私有函数，复核定义、创建Workspace Entity并请求全部AgentImage
     行为：
         验证id、Workspace名称、绝对project_root、非空agents和唯一Agent名称
-        id不能与其他pending Workspace操作重复
         验证manager对应一个Agent定义
         Agent名称必须能够安全用于默认Memory目录段
         memory_path存在时必须是Compose解析后的绝对路径
-        相同WorkspaceKey已经Ready或正在启动时返回DuplicateWorkspace
-        创建Workspace Entity并插入WorkspaceIdentity、WorkspaceConfiguration与Starting状态
+        相同WorkspaceKey已经登记或正在启动时返回DuplicateWorkspace
+        创建暂存Workspace Entity并插入WorkspaceIdentity和WorkspaceConfiguration
         调用WorldInferenceExt::load_workspace_model_routes(workspace, project_root)
         项目级模型路由加载失败时despawn Workspace Entity并直接发布当前操作失败结果
         为每个Agent生成独立子请求ID并发送LoadAgentImage
@@ -293,48 +262,45 @@ collect_agent_image_system(world: &mut World)
 
 prepare_workspace_agents(world: &mut World, request_id: &str) -> Result<(), WorkspaceError>
     准备实例：私有函数，在发送任何CreateAgent前完整构造所有Agent材料
-    行为：对每个WorkspaceAgentDefinition按配置顺序执行
+    行为：
+        按WorkspaceAgentDefinition配置顺序处理每个Agent
         读取AgentImageIdentity、AgentImageSoul、AgentImageModelConfig和AgentImageDefaultVisibility
         调用WorldInferenceExt::build_agent_inference_snapshot构造AgentInferenceSnapshot
-        构造AgentDefaultVisibility.resources：镜像默认resources + definition.resources - definition.disable_resources
+        构造default_visibility：镜像默认resources + definition.resources - definition.disable_resources
         根据agent_images_root和AgentImageReference构造镜像版本根
         使用definition.project_root和镜像版本根构造AgentToolEnvironment
-        AgentPlugin创建Entity时将AgentDefaultVisibility复制为AgentDynamicVisibility
         memory_path为空时生成<project>/.margatroid/workspaces/<workspace>/memory/<agent>/memory.sql
         调用AgentMemory::open取得AgentMemory与恢复messages
-        收集Soul、AgentDefaultVisibility和恢复上下文
+        收集Soul、default_visibility和恢复上下文
         构造PreparedWorkspaceAgent并保存到pending.prepared
         任一步失败时释放已打开AgentMemory并返回错误，不发送部分Agent创建事件
-    全部Agent准备成功后：
-        为每个PreparedWorkspaceAgent生成独立创建子请求ID
+        全部Agent准备成功后为每个Agent生成独立创建子请求ID
         保存agent_requests[子请求ID] = (Workspace请求ID, Agent名称)
         发送AgentCreateRequest { id, workspace_id, system_prompt, messages, default_visibility }
         AgentCreateRequest只交付AgentPlugin自有字段，不携带Memory、Inference或Tool组件
 
 collect_agent_created_system(world: &mut World)
-    收集Agent创建回执：消费AgentCreated并补齐其他Plugin拥有的组件
+    收集创建回执：私有System，消费AgentCreated并补齐其他Plugin拥有的组件
     行为：
         根据AgentCreated.id从agent_requests定位Workspace请求与Agent名称
         从pending.prepared取出对应PreparedWorkspaceAgent
-        验证AgentCreated.agent存活且AgentWorkspaceId指向本次Starting Workspace
+        验证AgentCreated.agent存活且AgentWorkspaceId指向本次暂存Workspace
         调用WorldMemoryExt::bind_agent_memory绑定AgentMemory和恢复messages
         插入PreparedWorkspaceAgent.inference_snapshot
         插入PreparedWorkspaceAgent.tool_environment
         成功时保存pending.agents[Agent名称] = Agent Entity
         任一步失败时despawn当前Agent并调用fail_pending_workspace
-        全部Agent完成时：
-            使用pending.agents构造WorkspaceAgents并确定manager Entity
-            把WorkspaceLifecycle切换为Ready
-            写入WorkspaceRegistry.ready
-            清理pending、image_requests和agent_requests
-            发布StartWorkspaceResult或ReloadWorkspaceResult成功结果
+        全部Agent完成时使用pending.agents构造WorkspaceAgents并确定manager
+        挂载WorkspaceAgents并写入WorkspaceRegistry.ready；WorkspaceAgents存在即表示Workspace可接收请求
+        清理pending、image_requests和agent_requests
+        发布StartWorkspaceResult或ReloadWorkspaceResult成功结果
 
 fail_pending_workspace(world: &mut World, request_id: &str, error: WorkspaceError)
     终止启动：私有函数，释放本次未完成Workspace拥有的运行时对象
     行为：
         丢弃PreparedWorkspaceAgent中尚未绑定的AgentMemory
         despawn pending.agents中已经创建并完成部分绑定的全部Agent
-        despawn本次Starting Workspace Entity
+        despawn本次暂存Workspace Entity
         清理image_requests、agent_requests和pending
         Start发送StartWorkspaceResult::Err
         Reload发送ReloadWorkspaceResult::Err；旧Workspace已经关闭，不做回滚
@@ -343,18 +309,19 @@ fail_pending_workspace(world: &mut World, request_id: &str, error: WorkspaceErro
 stop_workspace_inner(world: &mut World, workspace: Entity) -> Result<(), WorkspaceError>
     关闭Workspace：私有函数，停止查询并释放Workspace拥有的AgentInstance
     行为：
-        验证workspace存活、状态为Ready且包含WorkspaceIdentity与WorkspaceAgents
+        验证workspace存活、包含WorkspaceIdentity和WorkspaceAgents且已登记在WorkspaceRegistry.ready
         从WorkspaceRegistry.ready移除对应WorkspaceKey
-        将状态替换为Stopping
         依次despawn全部Agent Entity，使AgentMemory连接随组件释放
         despawn Workspace Entity
         不删除memory.sql、项目文件或AgentImage Entity
 
 normalize_project_root(path: PathBuf) -> Result<PathBuf, WorkspaceError>
     规范化项目根：私有函数，要求绝对路径且不包含父级跳转
+    行为：拒绝相对路径、Root/Prefix之外的Parent组件和无法规范化的路径
 
 validate_logical_name(value: &str) -> Result<(), WorkspaceError>
-    验证Workspace或Agent逻辑名称：私有函数，要求非空、长度有界且可安全作为单个目录段
+    验证逻辑名称：私有函数，要求非空、长度有界且可安全作为单个目录段
+    行为：拒绝控制字符、路径分隔符、.、..和其他不能作为单目录段的值
 ```
 
 ## 逻辑
@@ -368,53 +335,91 @@ validate_logical_name(value: &str) -> Result<(), WorkspaceError>
         -> AgentPlugin
         -> WorkspacePlugin::open(agent_images_root)
     WorkspacePlugin只协调已有Plugin，不替它们重新实现加载、验证或执行
+    WorkspacePlugin不解析YAML，不读取Skill/Workflow正文，不执行推理、工具或Agent消息循环
+
+输入与收集边界：
+    Compose
+        -> 构造WorkspaceDefinition和WorkspaceAgentDefinition
+        -> 不创建Entity，不加载AgentImage，不打开Memory
+    AgentImageLoaderPlugin
+        -> AgentImage Entity、Soul、中立模型配置和镜像默认资源名称
+    InferencePlugin
+        -> Workspace项目级模型路由和AgentInferenceSnapshot
+    ToolPlugin
+        -> AgentToolEnvironment
+        -> 工具定义在每次InferenceCommand发送前由AgentPlugin按动态可见性解析
+    MemoryPlugin
+        -> AgentMemory
+        -> 打开数据库时恢复的realtime_messages Vec<Message>
+    WorkspacePlugin自身
+        -> Workspace归属、逻辑名称和Agent Entity索引
+        -> 合并后把default_visibility交给AgentCreateRequest，由AgentPlugin构造两个可见性组件
+    Skill和Workflow正文不在启动阶段加载
+        -> Workspace只传递项目根与镜像根
+        -> 实际调用时由对应ToolDefinitionProvider读取当前内容
 
 workspace up：
-    Compose读取margatroid-workspace.yaml
-        -> 生成WorkspaceDefinition
+    Compose生成WorkspaceDefinition
         -> world.start_workspace(id, definition)
-    WorkspacePlugin创建Starting Workspace Entity
-        -> 加载项目级模型路由
-        -> 为全部Agent发送LoadAgentImage
-    全部AgentImage成功
-        -> 读取Soul、模型配置和默认可见性
-        -> 合并AgentDefaultVisibility
-        -> 构造Inference、统一默认可见性、ToolEnvironment与Memory实例材料
-        -> 全部材料成功后才发送CreateAgent * N
-    发送Agent创建事件后的Entity收集、其他Plugin组件挂载和Ready切换协议暂不定义
+        -> begin_workspace_command_system校验并创建暂存Workspace Entity
+        -> WorldInferenceExt::load_workspace_model_routes(workspace, project_root)
+        -> 发送LoadAgentImage * N
+        -> collect_agent_image_system收集LoadAgentImageResult * N
+        -> 全部镜像成功后读取Soul、模型配置和默认可见性
+        -> 合并Workspace资源配置，构造Inference、Tool、Memory实例材料
+        -> 全部材料成功后发送AgentCreateRequest * N
+        -> AgentPlugin创建Agent Entity并发送AgentCreated * N
+        -> Workspace绑定AgentMemory、AgentInferenceSnapshot和AgentToolEnvironment
+        -> 全部Agent完成后挂载WorkspaceAgents并写入WorkspaceRegistry.ready
+        -> 发布StartWorkspaceResult::Ok
+
+项目级模型路由：
+    WorkspacePlugin传入已经规范化的project_root
+        -> InferencePlugin读取<project_root>/.margatroid/models.toml
+        -> 存在时编译并挂载WorkspaceModelRoutes
+        -> 不存在时移除旧WorkspaceModelRoutes并返回0
+    每次InferenceCommand：
+        -> WorkspaceModelRoutes[AgentInferenceSnapshot.model]
+        -> 未命中时GlobalModelRoutes[model]
+        -> 都未命中时InferencePlugin发送AgentFailure
 
 运行时查询：
     ServerPlugin取得Workspace Entity
-        -> workspace_manager(workspace)找到默认Agent
+        -> WorldWorkspaceExt::workspace_manager(workspace)
+        -> 取得默认入口Agent
     Agent或其他Plugin持有Agent Entity
+        -> WorldWorkspaceExt::workspace_of(agent)
         -> 读取AgentWorkspaceId反查Workspace
         -> 读取WorkspaceIdentity取得项目根
         -> 读取各业务Plugin挂载的typed Component取得实际配置
     WorkspacePlugin不提供String到Any的通用属性表
 
 workspace reload：
-    Compose重新读取当前Workspace文件并生成新WorkspaceDefinition
+    Compose重新读取Workspace文件并生成新WorkspaceDefinition
         -> world.reload_workspace(id, old_workspace, definition)
-    WorkspacePlugin先停止旧Workspace及全部Agent
-        -> 关闭旧AgentMemory连接
-        -> 再按workspace up流程创建新Workspace Entity与Agent Entity
-    新启动失败时返回错误，旧Workspace不恢复
-    当前阶段不同时运行新旧实例，不实现无停机热切换
+        -> 验证旧Workspace已登记且WorkspaceKey不变
+        -> stop_workspace_inner关闭旧Workspace和全部Agent
+        -> 按workspace up流程创建新Workspace和Agent
+        -> 新启动失败时发布ReloadWorkspaceResult::Err，旧Workspace不恢复
+        -> 当前阶段不同时运行新旧实例，不实现无停机热切换
 
 workspace down：
     world.stop_workspace(id, workspace)
-        -> 从Ready查询索引移除
+        -> 验证Workspace已登记且包含WorkspaceAgents
+        -> 从WorkspaceRegistry.ready移除索引
         -> despawn全部AgentInstance
         -> despawn Workspace Entity
-        -> 保留Memory与全部资源文件
+        -> 保留memory.sql、项目文件和AgentImage Entity
 
-所有权：
-    WorkspacePlugin拥有Workspace Entity和由它启动的AgentInstance生命周期
+所有权与边界：
+    WorkspacePlugin拥有Workspace Entity和由它启动的AgentInstance
     AgentImageLoaderPlugin拥有AgentImage Entity
     MemoryPlugin拥有SQLite格式与AgentMemory组件行为
-    各业务Plugin拥有自己挂在Workspace或Agent上的Component语义
-    WorkspacePlugin只拥有Workspace编排决策，创建时把AgentDefaultVisibility交给AgentPlugin
+    InferencePlugin拥有WorkspaceModelRoutes和AgentInferenceSnapshot
     ToolPlugin拥有AgentToolEnvironment类型，WorkspacePlugin只负责构造实例值
+    AgentPlugin拥有AgentWorkspaceId、AgentContext、AgentStatus和两层可见性
+    各业务Plugin拥有自己挂在Workspace或Agent上的typed Component语义
+    WorkspacePlugin只拥有编排决策，不复制其他Plugin的运行时状态
 ```
 
 ## 持有关系
@@ -423,29 +428,34 @@ workspace down：
 App
 └── World
     ├── WorkspaceRegistry Resource
+    │   ├── agent_images_root
     │   ├── ready: HashMap<WorkspaceKey, Entity>
     │   └── pending: HashMap<String, PendingWorkspace>
-    └── Workspace Entity
-        ├── WorkspaceIdentity
-        ├── WorkspaceConfiguration
-        ├── WorkspaceLifecycle::Ready
-        ├── WorkspaceAgents
-        ├── WorkspaceModelRoutes--InferencePlugin拥有
-        └── AgentInstance Entity * N
-            ├── AgentWorkspaceId--AgentPlugin拥有
-            ├── AgentContext / AgentStatus--AgentPlugin拥有
-            ├── AgentInferenceSnapshot--InferencePlugin拥有
-            ├── AgentToolEnvironment--ToolPlugin拥有类型
-            ├── AgentDefaultVisibility / AgentDynamicVisibility--AgentPlugin拥有
-            └── AgentMemory--MemoryPlugin拥有
+    ├── Workspace Entity
+    │   ├── WorkspaceIdentity
+    │   ├── WorkspaceConfiguration
+    │   ├── WorkspaceAgents
+    │   ├── WorkspaceModelRoutes--InferencePlugin拥有
+    │   └── AgentInstance Entity * N
+    │       ├── AgentWorkspaceId--AgentPlugin拥有
+    │       ├── AgentContext / AgentStatus--AgentPlugin拥有
+    │       ├── AgentInferenceSnapshot--InferencePlugin拥有
+    │       ├── AgentToolEnvironment--ToolPlugin拥有类型
+    │       ├── AgentDefaultVisibility / AgentDynamicVisibility--AgentPlugin拥有
+    │       └── AgentMemory--MemoryPlugin拥有
+    └── AgentImage Entity * N
+        ├── AgentImageIdentity--AgentImageLoaderPlugin拥有
+        ├── AgentImageSoul--AgentImageLoaderPlugin拥有
+        ├── AgentImageModelConfig--AgentImageLoaderPlugin拥有
+        └── AgentImageDefaultVisibility--AgentImageLoaderPlugin拥有
 
 启动事件链：
 StartWorkspace
     -> LoadAgentImage * N
        -> LoadAgentImageResult * N
           -> PreparedWorkspaceAgent * N
-             -> Agent创建事件 * N
+             -> AgentCreateRequest * N
                 -> AgentCreated * N
-                   -> Workspace绑定AgentMemory、AgentInferenceSnapshot和AgentToolEnvironment
-                   -> 全部完成后Workspace Ready
+                   -> Workspace绑定Memory、InferenceSnapshot和ToolEnvironment
+                   -> 全部完成后Workspace可接收请求
 ```

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 
 use core_plugin::{Entity, Event};
 use serde::{Deserialize, Serialize};
@@ -178,6 +179,23 @@ impl fmt::Display for AgentImageReference {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}:{}", self.resource, self.tag)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceAgentDefinition {
+    pub name: String,
+    pub image: AgentImageReference,
+    pub resources: Vec<ResourceRef>,
+    pub disable_resources: Vec<ResourceRef>,
+    pub memory_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceDefinition {
+    pub name: String,
+    pub project_root: PathBuf,
+    pub manager: String,
+    pub agents: Vec<WorkspaceAgentDefinition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

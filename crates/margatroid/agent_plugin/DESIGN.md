@@ -244,10 +244,10 @@ validate_message_intent(event: &AgentMessage)
 
 边界：
     AgentPlugin只持有WorkspaceId、Context、两层Visibility和Status
-    AgentPlugin不持有AgentToolCatalog或工具快照
+    AgentPlugin不持有工具快照
     InferenceCommand.tools的唯一集合来源是AgentDynamicVisibility
     ToolPlugin收到的是单个已经解析的ResourceRef，不接收可见性集合，也不检查可见性权限
-    AgentPlugin不决定上下文压缩、资源正文解析、模型路由或Workspace生命周期
+    AgentPlugin不决定上下文压缩、资源正文解析、模型路由或Workspace创建、重载和关闭
 ```
 
 ## 持有关系
