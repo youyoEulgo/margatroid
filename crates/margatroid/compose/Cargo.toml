@@ -1,0 +1,12 @@
+[package]
+name = "compose"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+margatroid_types = { path = "../types" }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
