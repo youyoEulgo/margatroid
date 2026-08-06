@@ -1,36 +1,23 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
-use async_runtime_plugin::{
-    AppAsyncExt, AsyncContext, AsyncRuntimeHandle, AsyncTaskError, WorldAsyncExt,
-};
-use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
-use futures_util::FutureExt;
-use inference_plugin::{AgentToolDefinitions, ToolCall, ToolDefinition};
-use margatroid_types::ResourceName;
+use async_runtime_plugin::AsyncContext;
+use core_plugin::{App, Entity, Event, Plugin, Resource, World};
+use margatroid_types::{ResourceName, ToolDefinition};
 use serde::de::DeserializeOwned;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolErrorKind {
     InvalidDefinition,
-    DuplicateTool,
-    DuplicateExposedName,
     ToolPluginMissing,
     ToolAlreadyRegistered,
-    ToolNotRegistered,
-    InvalidRequest,
-    AgentNotAlive,
-    ToolCatalogMissing,
-    ToolNotVisible,
     InvalidArguments,
     ExecutionFailed,
     OutputLimitExceeded,
-    TaskPanicked,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +68,7 @@ impl std::error::Error for ToolError {}
 pub struct Tool {
     name: ResourceName,
     definition: ToolDefinition,
+    #[allow(dead_code)]
     handler: Arc<dyn ErasedToolHandler>,
 }
 
@@ -146,78 +134,11 @@ impl ToolContext {
     }
 }
 
-pub struct AgentToolCatalog {
-    tools: BTreeMap<String, Tool>,
-}
-
-impl AgentToolCatalog {
-    pub fn new(tools: impl IntoIterator<Item = Tool>) -> Result<Self, ToolError> {
-        let mut logical_names = BTreeSet::new();
-        let mut catalog = BTreeMap::new();
-        for tool in tools {
-            if !logical_names.insert(tool.name.clone()) {
-                return Err(ToolError::new(
-                    ToolErrorKind::DuplicateTool,
-                    format!("tool `{}` appears more than once", tool.name),
-                ));
-            }
-            let exposed_name = tool.definition.name.clone();
-            if catalog.insert(exposed_name.clone(), tool).is_some() {
-                return Err(ToolError::new(
-                    ToolErrorKind::DuplicateExposedName,
-                    format!("exposed tool name `{exposed_name}` appears more than once"),
-                ));
-            }
-        }
-        Ok(Self { tools: catalog })
-    }
-
-    pub fn definitions(&self) -> impl Iterator<Item = &ToolDefinition> + '_ {
-        self.tools.values().map(Tool::definition)
-    }
-
-    pub fn contains(&self, name: &ResourceName) -> bool {
-        self.tools.values().any(|tool| tool.name() == name)
-    }
-
-    pub(crate) fn get(&self, exposed_name: &str) -> Option<&Tool> {
-        self.tools.get(exposed_name)
-    }
-}
-
-impl Component for AgentToolCatalog {}
-
-pub struct ToolCallCommand {
-    pub id: String,
-    pub agent: Entity,
-    pub call: ToolCall,
-}
-
-impl Event for ToolCallCommand {}
-
-pub struct ToolCallResult {
-    pub id: String,
-    pub agent: Entity,
-    pub tool_call_id: String,
-    pub result: Result<String, ToolError>,
-}
-
-impl Event for ToolCallResult {}
-
-pub struct ToolPlugin {
-    schedule: String,
-}
+pub struct ToolPlugin;
 
 impl ToolPlugin {
     pub fn new() -> Self {
-        Self {
-            schedule: RuntimePlugin::UPDATE.to_owned(),
-        }
-    }
-
-    pub fn with_schedule(mut self, schedule: impl Into<String>) -> Self {
-        self.schedule = schedule.into();
-        self
+        Self
     }
 }
 
@@ -229,20 +150,6 @@ impl Default for ToolPlugin {
 
 impl Plugin for ToolPlugin {
     fn build(self, app: &mut App) {
-        if !app.world().contains_resource::<RuntimeHandle>() {
-            ToolError::new(
-                ToolErrorKind::ToolPluginMissing,
-                "RuntimePlugin is not installed",
-            )
-            .panic();
-        }
-        if !app.world().contains_resource::<AsyncRuntimeHandle>() {
-            ToolError::new(
-                ToolErrorKind::ToolPluginMissing,
-                "AsyncRuntimePlugin is not installed",
-            )
-            .panic();
-        }
         if app.world().contains_resource::<ToolRegistry>() {
             ToolError::new(
                 ToolErrorKind::ToolAlreadyRegistered,
@@ -250,22 +157,7 @@ impl Plugin for ToolPlugin {
             )
             .panic();
         }
-        if !app.contains_schedule(&self.schedule) {
-            ToolError::new(
-                ToolErrorKind::InvalidRequest,
-                "ToolPlugin schedule does not exist",
-            )
-            .panic();
-        }
-
-        let schedule = self.schedule;
         app.world_mut().insert_resource(ToolRegistry::new());
-        app.world_mut().insert_resource(ToolState {
-            limits: ToolLimits::default(),
-        });
-        app.add_system(&schedule, prepare_tool_call_system)
-            .add_async_system(&schedule, execute_tool)
-            .add_system(&schedule, publish_tool_call_system);
     }
 }
 
@@ -292,91 +184,11 @@ impl AppToolExt for App {
 
 pub trait WorldToolExt {
     fn registered_tool(&self, name: &ResourceName) -> Option<Tool>;
-
-    fn registered_tools(
-        &self,
-        names: impl IntoIterator<Item = ResourceName>,
-    ) -> Result<Vec<Tool>, ToolError>;
-
-    fn set_agent_tools(
-        &mut self,
-        agent: Entity,
-        tools: impl IntoIterator<Item = Tool>,
-    ) -> Result<(), ToolError>;
-
-    fn set_registered_agent_tools(
-        &mut self,
-        agent: Entity,
-        names: impl IntoIterator<Item = ResourceName>,
-    ) -> Result<(), ToolError>;
-
-    fn send_tool_call(&self, id: impl Into<String>, agent: Entity, call: ToolCall);
 }
 
 impl WorldToolExt for World {
     fn registered_tool(&self, name: &ResourceName) -> Option<Tool> {
         self.get_resource::<ToolRegistry>()?.get(name)
-    }
-
-    fn registered_tools(
-        &self,
-        names: impl IntoIterator<Item = ResourceName>,
-    ) -> Result<Vec<Tool>, ToolError> {
-        let registry = self.get_resource::<ToolRegistry>().ok_or_else(|| {
-            ToolError::new(
-                ToolErrorKind::ToolPluginMissing,
-                "ToolPlugin is not installed",
-            )
-        })?;
-        names
-            .into_iter()
-            .map(|name| {
-                registry.get(&name).ok_or_else(|| {
-                    ToolError::new(
-                        ToolErrorKind::ToolNotRegistered,
-                        format!("tool `{name}` is not registered"),
-                    )
-                })
-            })
-            .collect()
-    }
-
-    fn set_agent_tools(
-        &mut self,
-        agent: Entity,
-        tools: impl IntoIterator<Item = Tool>,
-    ) -> Result<(), ToolError> {
-        if !self.is_alive(agent) {
-            return Err(ToolError::new(
-                ToolErrorKind::AgentNotAlive,
-                "agent entity is not alive",
-            ));
-        }
-        let catalog = AgentToolCatalog::new(tools)?;
-        let definitions = AgentToolDefinitions::new(catalog.definitions().cloned().collect());
-        assert!(self.insert_component(agent, catalog));
-        assert!(self.insert_component(agent, definitions));
-        Ok(())
-    }
-
-    fn set_registered_agent_tools(
-        &mut self,
-        agent: Entity,
-        names: impl IntoIterator<Item = ResourceName>,
-    ) -> Result<(), ToolError> {
-        let tools = self.registered_tools(names)?;
-        self.set_agent_tools(agent, tools)
-    }
-
-    fn send_tool_call(&self, id: impl Into<String>, agent: Entity, call: ToolCall) {
-        WorldEventExt::send_event(
-            self,
-            ToolCallCommand {
-                id: id.into(),
-                agent,
-                call,
-            },
-        );
     }
 }
 
@@ -409,6 +221,7 @@ impl ToolRegistry {
 
 impl Resource for ToolRegistry {}
 
+#[allow(dead_code)]
 trait ErasedToolHandler: Send + Sync + 'static {
     fn call(
         &self,
@@ -419,6 +232,7 @@ trait ErasedToolHandler: Send + Sync + 'static {
 }
 
 struct TypedToolHandler<Arguments, Handler> {
+    #[allow(dead_code)]
     handler: Handler,
     marker: PhantomData<fn() -> Arguments>,
 }
@@ -464,224 +278,6 @@ where
     }
 }
 
-struct ToolExecutionTask {
-    id: String,
-    agent: Entity,
-    tool_call_id: String,
-    arguments: String,
-    handler: Arc<dyn ErasedToolHandler>,
-    maximum_output_bytes: usize,
-}
-
-impl Event for ToolExecutionTask {}
-
-struct ToolExecutionPayload {
-    id: String,
-    agent: Entity,
-    tool_call_id: String,
-    result: Result<String, ToolError>,
-}
-
-struct ToolExecutionOutput {
-    payload: Mutex<Option<ToolExecutionPayload>>,
-}
-
-impl ToolExecutionOutput {
-    fn new(payload: ToolExecutionPayload) -> Self {
-        Self {
-            payload: Mutex::new(Some(payload)),
-        }
-    }
-
-    fn take(&self) -> Option<ToolExecutionPayload> {
-        self.payload
-            .lock()
-            .expect("tool execution output lock poisoned")
-            .take()
-    }
-}
-
-struct ToolTaskError {
-    source: AsyncTaskError,
-}
-
-impl From<AsyncTaskError> for ToolTaskError {
-    fn from(source: AsyncTaskError) -> Self {
-        Self { source }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ToolLimits {
-    maximum_arguments_bytes: usize,
-    maximum_output_bytes: usize,
-}
-
-impl Default for ToolLimits {
-    fn default() -> Self {
-        Self {
-            maximum_arguments_bytes: 1024 * 1024,
-            maximum_output_bytes: 4 * 1024 * 1024,
-        }
-    }
-}
-
-struct ToolState {
-    limits: ToolLimits,
-}
-
-impl Resource for ToolState {}
-
-fn prepare_tool_call_system(world: &mut World) {
-    let commands = world
-        .event_reader::<ToolCallCommand>()
-        .into_iter()
-        .map(|command| (command.id.clone(), command.agent, command.call.clone()))
-        .collect::<Vec<_>>();
-    let limits = world
-        .get_resource::<ToolState>()
-        .expect("ToolPlugin is not installed")
-        .limits;
-
-    for (id, agent, call) in commands {
-        let invalid = if id.is_empty() || call.id.is_empty() || call.name.is_empty() {
-            Some(ToolError::new(
-                ToolErrorKind::InvalidRequest,
-                "request id, tool call id, and tool name must be non-empty",
-            ))
-        } else if !world.is_alive(agent) {
-            Some(ToolError::new(
-                ToolErrorKind::AgentNotAlive,
-                "agent entity is not alive",
-            ))
-        } else if call.arguments.len() > limits.maximum_arguments_bytes {
-            Some(ToolError::new(
-                ToolErrorKind::InvalidArguments,
-                "tool arguments exceed the configured byte limit",
-            ))
-        } else {
-            None
-        };
-        if let Some(error) = invalid {
-            send_tool_result(world, id, agent, call.id, Err(error));
-            continue;
-        }
-
-        let Some(catalog) = world.get_component::<AgentToolCatalog>(agent) else {
-            send_tool_result(
-                world,
-                id,
-                agent,
-                call.id,
-                Err(ToolError::new(
-                    ToolErrorKind::ToolCatalogMissing,
-                    "agent does not have a tool catalog",
-                )),
-            );
-            continue;
-        };
-        let Some(tool) = catalog.get(&call.name) else {
-            send_tool_result(
-                world,
-                id,
-                agent,
-                call.id,
-                Err(ToolError::new(
-                    ToolErrorKind::ToolNotVisible,
-                    "tool is not visible to the agent",
-                )),
-            );
-            continue;
-        };
-        let task = ToolExecutionTask {
-            id,
-            agent,
-            tool_call_id: call.id,
-            arguments: call.arguments,
-            handler: Arc::clone(&tool.handler),
-            maximum_output_bytes: limits.maximum_output_bytes,
-        };
-        world.send_async_event(task);
-    }
-}
-
-async fn execute_tool(
-    task: ToolExecutionTask,
-    context: AsyncContext,
-) -> Result<ToolExecutionOutput, ToolTaskError> {
-    let ToolExecutionTask {
-        id,
-        agent,
-        tool_call_id,
-        arguments,
-        handler,
-        maximum_output_bytes,
-    } = task;
-    let tool_context = ToolContext {
-        request_id: Arc::from(id.as_str()),
-        agent,
-        tool_call_id: Arc::from(tool_call_id.as_str()),
-        events: context,
-    };
-    let execution = std::panic::AssertUnwindSafe(async move {
-        handler
-            .call(tool_context, arguments, maximum_output_bytes)
-            .await
-    })
-    .catch_unwind()
-    .await;
-    let result = match execution {
-        Ok(result) => result,
-        Err(_) => Err(ToolError::new(
-            ToolErrorKind::TaskPanicked,
-            "tool handler panicked",
-        )),
-    };
-    Ok(ToolExecutionOutput::new(ToolExecutionPayload {
-        id,
-        agent,
-        tool_call_id,
-        result,
-    }))
-}
-
-fn publish_tool_call_system(world: &mut World) {
-    let mut payloads = Vec::new();
-    for output in world.event_reader::<Result<ToolExecutionOutput, ToolTaskError>>() {
-        match output {
-            Ok(output) => payloads.extend(output.take()),
-            Err(error) => tracing::error!(error = %error.source, "tool async task stopped"),
-        }
-    }
-    for payload in payloads {
-        send_tool_result(
-            world,
-            payload.id,
-            payload.agent,
-            payload.tool_call_id,
-            payload.result,
-        );
-    }
-}
-
-fn send_tool_result(
-    world: &World,
-    id: String,
-    agent: Entity,
-    tool_call_id: String,
-    result: Result<String, ToolError>,
-) {
-    WorldEventExt::send_event(
-        world,
-        ToolCallResult {
-            id,
-            agent,
-            tool_call_id,
-            result,
-        },
-    );
-}
-
 fn validate_tool(name: &ResourceName, definition: &ToolDefinition) -> Result<(), ToolError> {
     let valid_name = !definition.name.is_empty()
         && definition.name.len() <= 64
@@ -713,10 +309,7 @@ fn validate_tool(name: &ResourceName, definition: &ToolDefinition) -> Result<(),
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
-    use std::future::Ready;
-    use std::time::{Duration, Instant};
 
-    use async_runtime_plugin::AsyncRuntimePlugin;
     use serde::Deserialize;
     use serde_json::json;
 
@@ -743,8 +336,7 @@ mod tests {
                     "required": ["left", "right"]
                 }),
             },
-            |context: ToolContext, arguments: AddArguments| async move {
-                assert!(!context.request_id().is_empty());
+            |_context: ToolContext, arguments: AddArguments| async move {
                 Ok::<_, Infallible>((arguments.left + arguments.right).to_string())
             },
         )
@@ -753,191 +345,37 @@ mod tests {
 
     fn test_app() -> App {
         let mut app = App::new();
-        app.add_plugin(RuntimePlugin::default())
-            .add_plugin(AsyncRuntimePlugin)
-            .add_plugin(ToolPlugin::default());
+        app.add_plugin(ToolPlugin::new());
         app
     }
 
-    fn wait_for_result(app: &mut App, id: &str) -> (String, Result<String, ToolError>) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            app.tick();
-            if let Some(result) = app
-                .world()
-                .event_reader::<ToolCallResult>()
-                .into_iter()
-                .find(|result| result.id == id)
-            {
-                return (result.tool_call_id.clone(), result.result.clone());
-            }
-            assert!(Instant::now() < deadline, "tool execution timed out");
-            std::thread::yield_now();
-        }
-    }
-
     #[test]
-    fn registered_tool_executes_for_an_agent_and_preserves_route() {
+    fn registered_tool_exposes_its_definition() {
         let mut app = test_app();
         app.register_tool(add_tool("builtin/add", "add"));
-        let agent = app.world_mut().spawn();
-        app.world_mut()
-            .set_registered_agent_tools(agent, [ResourceName::new("builtin/add").unwrap()])
-            .unwrap();
-
-        app.world().send_tool_call(
-            "request-1",
-            agent,
-            ToolCall {
-                id: "call-1".into(),
-                name: "add".into(),
-                arguments: r#"{"left": 2, "right": 5}"#.into(),
-            },
-        );
-
-        let (tool_call_id, result) = wait_for_result(&mut app, "request-1");
-        assert_eq!(tool_call_id, "call-1");
-        assert_eq!(result.unwrap(), "7");
-    }
-
-    #[test]
-    fn agent_definitions_are_projected_in_exposed_name_order() {
-        let mut app = test_app();
-        let agent = app.world_mut().spawn();
-        app.world_mut()
-            .set_agent_tools(
-                agent,
-                [
-                    add_tool("builtin/zeta", "zeta"),
-                    add_tool("builtin/alpha", "alpha"),
-                ],
-            )
-            .unwrap();
-
-        let definitions = app
+        let tool = app
             .world()
-            .get_component::<AgentToolDefinitions>(agent)
+            .registered_tool(&ResourceName::new("builtin/add").unwrap())
             .unwrap();
-        assert_eq!(
-            definitions
-                .tools()
-                .iter()
-                .map(|definition| definition.name.as_str())
-                .collect::<Vec<_>>(),
-            ["alpha", "zeta"]
-        );
+        assert_eq!(tool.definition().name, "add");
     }
 
     #[test]
-    fn invisible_and_invalid_arguments_return_stable_errors() {
-        let mut app = test_app();
-        let agent = app.world_mut().spawn();
-        app.world_mut()
-            .set_agent_tools(agent, std::iter::empty())
-            .unwrap();
-        app.world().send_tool_call(
-            "hidden",
-            agent,
-            ToolCall {
-                id: "hidden-call".into(),
-                name: "add".into(),
-                arguments: "{}".into(),
-            },
-        );
-        assert_eq!(
-            wait_for_result(&mut app, "hidden").1.unwrap_err().kind(),
-            ToolErrorKind::ToolNotVisible
-        );
-
-        app.register_tool(add_tool("builtin/add", "add"));
-        app.world_mut()
-            .set_registered_agent_tools(agent, [ResourceName::new("builtin/add").unwrap()])
-            .unwrap();
-        app.world().send_tool_call(
-            "invalid",
-            agent,
-            ToolCall {
-                id: "invalid-call".into(),
-                name: "add".into(),
-                arguments: "{}".into(),
-            },
-        );
-        assert_eq!(
-            wait_for_result(&mut app, "invalid").1.unwrap_err().kind(),
-            ToolErrorKind::InvalidArguments
-        );
-    }
-
-    #[test]
-    fn duplicate_catalog_entries_are_rejected_without_replacing_the_old_catalog() {
-        let mut app = test_app();
-        let agent = app.world_mut().spawn();
-        app.world_mut()
-            .set_agent_tools(agent, [add_tool("builtin/add", "add")])
-            .unwrap();
-
-        let error = app
-            .world_mut()
-            .set_agent_tools(
-                agent,
-                [
-                    add_tool("builtin/first", "same"),
-                    add_tool("builtin/second", "same"),
-                ],
-            )
-            .unwrap_err();
-        assert_eq!(error.kind(), ToolErrorKind::DuplicateExposedName);
-        assert!(app
-            .world()
-            .get_component::<AgentToolCatalog>(agent)
-            .unwrap()
-            .contains(&ResourceName::new("builtin/add").unwrap()));
-    }
-
-    #[test]
-    fn duplicate_logical_names_are_rejected() {
-        let error = match AgentToolCatalog::new([
-            add_tool("builtin/add", "add_first"),
-            add_tool("builtin/add", "add_second"),
-        ]) {
-            Ok(_) => panic!("duplicate logical names must be rejected"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ToolErrorKind::DuplicateTool);
-    }
-
-    #[test]
-    fn handler_panic_becomes_a_routed_tool_error() {
-        let mut app = test_app();
-        let panic_tool = Tool::new(
-            ResourceName::new("builtin/panic").unwrap(),
+    fn invalid_definitions_are_rejected() {
+        let error = match Tool::new(
+            ResourceName::new("builtin/invalid").unwrap(),
             ToolDefinition {
-                name: "panic_tool".into(),
-                description: "Panic while starting".into(),
+                name: "invalid name".into(),
+                description: "Invalid exposed name".into(),
                 input_schema: json!({ "type": "object" }),
             },
-            |_context: ToolContext,
-             _arguments: serde_json::Value|
-             -> Ready<Result<String, Infallible>> { panic!("handler panic") },
-        )
-        .unwrap();
-        app.register_tool(panic_tool);
-        let agent = app.world_mut().spawn();
-        app.world_mut()
-            .set_registered_agent_tools(agent, [ResourceName::new("builtin/panic").unwrap()])
-            .unwrap();
-        app.world().send_tool_call(
-            "panic-request",
-            agent,
-            ToolCall {
-                id: "panic-call".into(),
-                name: "panic_tool".into(),
-                arguments: "{}".into(),
+            |_context: ToolContext, _arguments: serde_json::Value| async {
+                Ok::<_, Infallible>(String::new())
             },
-        );
-
-        let (tool_call_id, result) = wait_for_result(&mut app, "panic-request");
-        assert_eq!(tool_call_id, "panic-call");
-        assert_eq!(result.unwrap_err().kind(), ToolErrorKind::TaskPanicked);
+        ) {
+            Ok(_) => panic!("invalid definition must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ToolErrorKind::InvalidDefinition);
     }
 }

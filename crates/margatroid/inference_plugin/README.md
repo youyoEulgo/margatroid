@@ -144,7 +144,8 @@ Agent 核心发送当前完整 `messages` 快照。下面的 `agent` 由 Workspa
 
 ```rust
 use app_runtime_plugin::WorldEventExt;
-use inference_plugin::{InferenceCommand, Message};
+use inference_plugin::InferenceCommand;
+use margatroid_types::{Message, ToolDefinition};
 
 app.world().send_event(InferenceCommand {
     id: "request-1".into(),
@@ -157,6 +158,7 @@ app.world().send_event(InferenceCommand {
             content: "Review this patch.".into(),
         },
     ],
+    tools: Vec::<ToolDefinition>::new(),
     stream: None,
 });
 ```
@@ -164,7 +166,8 @@ app.world().send_event(InferenceCommand {
 `id` 由调用方生成，用于区分同一 Agent 的并发请求；`agent` 是发起推理的 AgentInstance
 Entity。最终响应使用 `(agent, id)` 定位原 Agent 和原请求。
 
-InferencePlugin 在主线程读取 Agent 快照和工具定义，根据 `ModelId` 组装请求，然后
+`tools`由AgentPlugin遍历当前`AgentDynamicVisibility.resources`，逐个调用ToolPlugin构造`Tool`后
+收集definitions。InferencePlugin在主线程读取Agent推理快照，并直接使用事件中的工具定义根据`ModelId`组装请求，然后
 把网络请求交给 AsyncRuntime。不会把 `World` 或 Component 引用带入异步线程。
 
 ## 流式输出与最终结果
@@ -182,6 +185,7 @@ app.world().send_event(InferenceCommand {
     id: "request-2".into(),
     agent,
     messages,
+    tools,
     stream: Some(stream),
 });
 ```
@@ -190,48 +194,40 @@ app.world().send_event(InferenceCommand {
 不进入 ECS 事件队列；工具调用 ID、名称和参数片段也不转发，只在后端累积器中组装。
 前端已断开时，InferencePlugin 停止转发后续文本，但不中断后端推理和最终响应累积。
 
-流结束后才发布一个 `InferenceResult`：
+流结束后，成功响应由 InferencePlugin 直接转换成共享 `AgentMessage`。来源根据完整
+Assistant 消息是否包含工具调用，分别赋予 `CompleteTurn` 或 `DispatchToolCalls`：
 
 ```rust
 use core_plugin::World;
-use inference_plugin::{InferenceResult, Message};
+use margatroid_types::{AgentMessage, Message, MessageIntent};
 
-fn handle_inference_results(world: &mut World) {
-    for event in world.event_reader::<InferenceResult>() {
-        let agent = event.agent;
+fn handle_inference_messages(world: &mut World) {
+    for event in world.event_reader::<AgentMessage>() {
+        if !matches!(
+            event.intent,
+            MessageIntent::CompleteTurn | MessageIntent::DispatchToolCalls
+        ) {
+            continue;
+        }
 
-        match &event.result {
-            Ok(response) => match &response.message {
-                Message::Assistant {
-                    content,
-                    tool_calls,
-                } => {
-                    tracing::info!(
-                        ?agent,
-                        request_id = %event.id,
-                        ?content,
-                        tool_call_count = tool_calls.len(),
-                        "agent inference completed"
-                    );
-                }
-                _ => unreachable!("InferenceResponse must contain an Assistant message"),
-            },
-            Err(error) => tracing::error!(
-                ?agent,
+        if let Message::Assistant { content, tool_calls } = &event.message {
+            tracing::info!(
+                agent = ?event.agent,
                 request_id = %event.id,
-                %error,
-                "agent inference failed"
-            ),
+                ?content,
+                tool_call_count = tool_calls.len(),
+                "agent inference completed"
+            );
         }
     }
 }
 
-app.add_system(RuntimePlugin::UPDATE, handle_inference_results);
+app.add_system(RuntimePlugin::UPDATE, handle_inference_messages);
 ```
 
-`InferenceResult::agent` 明确指出结果属于哪个 AgentInstance。Agent 核心根据该 Entity 找到
-对应实例，再决定何时将 `Message::Assistant` 追加到它的 `messages`：没有 tool call 时结束
-本轮，有 tool call 时交给后续 tool-call loop。
+无法表示成对话消息的推理失败通过 `AgentFailure { id, agent, kind, message }` 发布。AgentPlugin
+直接消费这两种共享事件：它校验来源已经赋予的意图，将合法 Assistant 消息写入对应实例上下文，
+或用可配对的失败结束当前推理状态；它不再按 InferencePlugin 的结果类型做二次路由。
 
 ## 重载模型路由
 
@@ -288,8 +284,8 @@ Adapter 只解释 Provider 协议，不读取 `World`、Agent Component 或会�
 ## 数据流
 
 ```text
-Agent messages
-→ InferenceCommand { id, agent, messages, stream? }
+Agent messages + AgentPlugin收集的ToolDefinition
+→ InferenceCommand { id, agent, messages, tools, stream? }
 → AgentInferenceSnapshot { workspace, model }
 → WorkspaceModelRoutes[ModelId]
 → 未命中时查询GlobalModelRoutes[ModelId]
@@ -299,8 +295,9 @@ Agent messages
 ├→ 可展示文本 -> InferenceStreamSender -> 前端
 └→ 后端内部累积完整响应
 → ProviderResponseAccumulator::finish
-→ InferenceResult { id, agent, result }
-→ Agent核心追加Assistant Message或处理错误
+├→ 成功：AgentMessage { id, agent, Message::Assistant, intent }
+└→ 失败：AgentFailure { id, agent, kind: Inference, message }
+→ 成功消息由AgentPlugin记入上下文并执行意图；失败契约暂不定义
 ```
 
 ## 职责边界
@@ -312,7 +309,9 @@ InferencePlugin 负责：
 - 把 AgentImageLoaderPlugin 的中立模型配置转换为经过验证的 AgentInferenceSnapshot。
 - 将统一 messages、工具定义和推理参数组装为 Provider Request。
 - 发送流式 HTTP 请求并解析增量与最终响应。
-- 将文本片段写入可选前端通道，并按请求 ID 和 Agent Entity 发布最终结果。
+- 将文本片段写入可选前端通道，并按请求 ID 和 Agent Entity 发布 `AgentMessage` 或
+  `AgentFailure`。
+- 根据完整 Assistant 消息是否包含工具调用，直接赋予消息意图。
 
 InferencePlugin 不负责：
 

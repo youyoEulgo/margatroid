@@ -11,32 +11,6 @@ ModelId：模型路由ID，公开元组结构体--AgentImage引用的稳定名�
     as_str(&self) -> &str
         获取名称：公开方法，返回内部字符串引用
 
-ToolCall：统一工具调用，公开结构体--保存Provider返回且后续请求必须原样关联的工具调用
-    id: String--Provider工具调用ID
-    name: String--工具名称
-    arguments: String--完整参数JSON文本，在流式响应完成前不尝试反序列化
-
-ToolDefinition：统一工具定义，公开结构体--描述本次请求允许模型调用的一个工具
-    name: String--工具名称
-    description: String--工具说明
-    input_schema: serde_json::Value--JSON Schema参数定义
-
-Message：统一消息，公开枚举--Agent核心唯一持久化的会话数据格式
-    System {
-        content: String--系统提示词
-    }
-    User {
-        content: String--用户内容
-    }
-    Assistant {
-        content: Option<String>--Assistant文本，只有工具调用时允许为空
-        tool_calls: Vec<ToolCall>--工具调用，可以为空
-    }
-    Tool {
-        tool_call_id: String--对应Assistant ToolCall::id
-        content: String--工具执行结果文本
-    }
-
 InferenceParameters：统一推理参数，公开结构体--只保存跨Provider有稳定语义的参数
     temperature: Option<f32>--采样温度
     max_output_tokens: Option<u32>--最大输出token数
@@ -52,6 +26,8 @@ AgentInferenceSnapshot：Agent实例推理快照，公开组件--启动时从中
     parameters: InferenceParameters--实际使用的参数
     workspace: Entity--所属Workspace Entity，用于查询项目级模型路由
     source_image: Entity--来源AgentImage Entity，仅用于追踪，不在推理时重新读取
+    impl Clone for AgentInferenceSnapshot
+        Clone：公开trait实现，允许Workspace为Agent实例准备独立推理配置
     impl Component for AgentInferenceSnapshot
         Component：公开trait实现
 
@@ -62,15 +38,11 @@ WorkspaceModelRoutes：Workspace模型路由，公开组件--挂在Workspace Ent
     impl Component for WorkspaceModelRoutes
         Component：公开trait实现
 
-AgentToolDefinitions：Agent工具定义，公开组件--本次运行实例允许发送给模型的工具Schema
-    tools: Vec<ToolDefinition>--工具定义，为空时请求不携带tools字段
-    impl Component for AgentToolDefinitions
-        Component：公开trait实现
-
-InferenceCommand：推理命令，公开事件--携带路由、已处理的统一messages与可选前端文本流
+InferenceCommand：推理命令，公开事件--携带已处理的messages、AgentPlugin收集的工具定义与可选前端文本流
     id: String--调用方生成的请求ID，与agent共同构成并发响应路由
     agent: Entity--发起本次推理的AgentInstance Entity
     messages: Vec<Message>--本次请求的完整消息快照
+    tools: Vec<ToolDefinition>--AgentPlugin遍历动态可见资源并逐个构造后收集的工具定义
     stream: Option<InferenceStreamSender>--可选有界文本通道发送器，用于直接转发给前端
     impl Event for InferenceCommand
         Event：公开trait实现
@@ -89,17 +61,10 @@ TokenUsage：Token用量，公开结构体--Provider没有返回时整个字段�
     output_tokens: u64--输出token数
     total_tokens: u64--总token数
 
-InferenceResponse：统一推理响应，公开结构体--Agent核心需要的最终结果
+InferenceResponse：统一推理响应，公开结构体--Provider响应累积器完成后交给发布System的协议无关产物
     message: Message--必须是Assistant消息
     stop_reason: StopReason--停止原因
     usage: Option<TokenUsage>--可选用量
-
-InferenceResult：推理结果，公开事件--所有同步校验错误和异步Provider结果统一从此返回
-    id: String--原请求ID，与agent共同定位原请求
-    agent: Entity--发起原请求的AgentInstance Entity，响应System据此找到正确实例
-    result: Result<InferenceResponse, InferenceError>--统一结果
-    impl Event for InferenceResult
-        Event：公开trait实现
 
 ReloadModelRoutes：重载模型路由，公开事件--请求InferencePlugin重新加载主目录全局models.toml
     id: String--调用方生成的请求ID
@@ -338,12 +303,12 @@ prepare_inference_system(world: &mut World)
     行为：对每个Command依次执行
         验证id非空、agent存活且messages结构合法
         从agent读取AgentInferenceSnapshot
-        从agent读取AgentToolDefinitions，不存在时使用空工具数组
+        直接使用command.tools；InferencePlugin不从Agent读取或推导另一份工具列表
         从snapshot.workspace读取WorkspaceModelRoutes并按snapshot.model查询
         项目级未找到时从GlobalModelRoutes查询全局默认路由
         构造ProviderInput借用route.model、snapshot.parameters、messages和tools
         调用Adapter::build_request
-        任一检查或组装失败时立即发送带原id和agent的InferenceResult::Err
+        任一检查或组装失败时立即发送AgentFailure { id, agent, kind: Inference, message }
         成功时调用WorldAsyncExt::send_async_event发送PreparedInference
 
 execute_prepared_inference(prepared: PreparedInference) -> Result<InferenceTaskOutput, InferenceTaskError>
@@ -359,14 +324,19 @@ execute_prepared_inference(prepared: PreparedInference) -> Result<InferenceTaskO
         流结束后调用累积器::finish
         将成功响应或任意InferenceError包装为InferenceTaskOutput
         Provider Future或Adapter panic时使用已保留的route返回TaskPanicked
-        AsyncRuntime取消整个处理器时返回InferenceTaskError，此路径不伪造无法配对的InferenceResult
+        AsyncRuntime取消整个处理器时返回InferenceTaskError，此路径无法继续发布业务事件
 
-publish_inference_result_system(world: &mut World)
-    发布结果：私有System，读取异步任务响应并统一发出InferenceResult
+publish_inference_output_system(world: &mut World)
+    发布结果：私有System，将异步推理输出直接发布为共享AgentMessage或AgentFailure
     行为：
-        成功取得InferenceTaskOutput时发送其route和result
+        成功取得InferenceTaskOutput时保留route.id和route.agent
+        result为Ok时确认response.message是Message::Assistant
+            tool_calls为空时赋予MessageIntent::CompleteTurn
+            tool_calls非空时赋予MessageIntent::DispatchToolCalls
+            发送AgentMessage { id, agent, message, intent }
+        result为Err时提取安全有界描述并发送AgentFailure { id, agent, kind: Inference, message }
         取得InferenceTaskError时写入system log；该错误只会在Runtime取消任务等无法继续运行的路径出现
-        不修改Agent的messages，不执行工具，不决定是否继续推理
+        不修改Agent的messages、不执行工具；只由当前消息来源赋予意图
 
 validate_messages(messages: &[Message]) -> Result<(), InferenceError>
     验证消息：私有函数，检查消息数量、总字节上限及ToolCall配对所需字段
@@ -402,7 +372,7 @@ send_provider_request(client: &reqwest::Client, request: ProviderHttpRequest) ->
         -> 在指定Schedule挂载reload_model_routes_system
         -> 在指定Schedule挂载prepare_inference_system
         -> 在指定Schedule通过add_async_system挂载PreparedInference处理器
-        -> 在指定Schedule挂载publish_inference_result_system
+        -> 在指定Schedule挂载publish_inference_output_system
 
 AgentImage启动：
     Workspace启动逻辑调用load_workspace_model_routes(workspace, project_root)
@@ -429,10 +399,12 @@ AgentImage启动：
 
 发起推理：
     Agent核心克隆当前完整messages
-        -> 无前端实时输出时send_event(InferenceCommand { id, agent, messages, stream: None })
+        -> 遍历AgentDynamicVisibility.resources
+        -> 逐个调用ToolPlugin.resolve_tool并收集ToolDefinition
+        -> 无前端实时输出时send_event(InferenceCommand { id, agent, messages, tools, stream: None })
         -> 需要前端实时输出时创建有界文本通道并传入stream: Some(sender)
     prepare_inference_system
-        -> 读取AgentInferenceSnapshot和AgentToolDefinitions
+        -> 读取AgentInferenceSnapshot并使用command.tools
         -> 根据snapshot.workspace查询WorkspaceModelRoutes
         -> 项目级未找到snapshot.model时查询全局GlobalModelRoutes
         -> Adapter把统一Message、工具和实际模型配置组装为ProviderHttpRequest
@@ -444,8 +416,9 @@ AgentImage启动：
         -> 有stream时将可展示文本片段写入有界通道
         -> 工具调用片段只在累积器内部组装
         -> 响应结束后返回InferenceTaskOutput
-    publish_inference_result_system
-        -> 发送InferenceResult { id, agent, result }
+    publish_inference_output_system
+        -> 成功时发送AgentMessage { id, agent, Message::Assistant, intent }
+        -> 失败时发送AgentFailure { id, agent, kind: Inference, message }
 
 流式响应：
     文本片段只用于前端实时展示，通过InferenceStreamSender发送
@@ -458,12 +431,12 @@ AgentImage启动：
     最终生成Message::Assistant { content, tool_calls }
 
 Agent收到结果：
-    InferenceResult::Ok
-        -> Agent核心将response.message追加到自身messages末尾
-        -> 没有tool_calls时本轮结束
-        -> 有tool_calls时交给后续ToolCallLoop处理
-    InferenceResult::Err
-        -> Agent核心按id和agent结束或重试本次请求
+    AgentMessage
+        -> Assistant没有tool_calls时intent为CompleteTurn
+        -> Assistant有tool_calls时intent为DispatchToolCalls
+        -> AgentPlugin记入消息，然后执行来源已经赋予的intent
+    AgentFailure
+        -> 失败如何影响AgentStatus由后续Agent消息契约确定
     InferencePlugin不直接修改messages
 
 Provider边界：
@@ -479,7 +452,7 @@ Provider边界：
     项目级models.toml只从Workspace的规范化project_root/.margatroid目录读取
     Provider API key和Authorization header只存在于路由配置加载期、Adapter与ProviderHttpRequest私有字段
     TOML解析错误只返回行列位置和类别，不回显可能包含api_key的原文行
-    Event、InferenceError、日志和Tracing字段不得包含secret、完整请求正文或完整响应正文
+    AgentMessage、AgentFailure、InferenceError、日志和Tracing字段不得包含secret、完整请求正文或完整响应正文
     非2xx响应最多读取有界错误正文，由Adapter转换成ResponseStatus
     messages、工具Schema、单分片、累计响应和错误文本均设置大小上限
     ModelId路由不存在、失效Agent或缺少启动快照在主线程立即失败，不启动异步任务
@@ -504,19 +477,18 @@ App
     ├── AgentImage Entity
     │   └── AgentImageModelConfig--由AgentImageLoaderPlugin创建
     └── AgentInstance Entity
-        ├── AgentInferenceSnapshot
+        └── AgentInferenceSnapshot
         │   ├── model: ModelId
         │   ├── parameters: InferenceParameters
         │   ├── workspace: Entity
-        │   └── source_image: Entity
-        └── AgentToolDefinitions
-            └── tools: Vec<ToolDefinition>
+            └── source_image: Entity
 
 一次推理期间：
 InferenceCommand
 ├── id: String
 ├── agent: Entity
 ├── messages: Vec<Message>
+├── tools: Vec<ToolDefinition>--由AgentPlugin遍历动态可见资源并逐个构造
 └── stream: Option<InferenceStreamSender>
     -> PreparedInference
        ├── route: InferenceRoute
@@ -527,8 +499,14 @@ InferenceCommand
            -> InferenceTaskOutput
               ├── route: InferenceRoute
               └── result: Result<InferenceResponse, InferenceError>
-                  -> InferenceResult
-                     ├── id: String
-                     ├── agent: Entity
-                     └── result: Result<InferenceResponse, InferenceError>
+                  ├── Ok -> AgentMessage
+                  │   ├── id: String
+                  │   ├── agent: Entity
+                  │   ├── message: Message::Assistant
+                  │   └── intent: CompleteTurn / DispatchToolCalls
+                  └── Err -> AgentFailure
+                      ├── id: String
+                      ├── agent: Entity
+                      ├── kind: Inference
+                      └── message: String
 ```

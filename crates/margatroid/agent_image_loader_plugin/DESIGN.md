@@ -77,12 +77,9 @@ AgentImageModelConfig：AgentImage模型配置，公开组件--中立保存模�
         Component：公开trait实现
 
 AgentImageDefaultVisibility：AgentImage默认资源可见性，公开组件--只读保存镜像默认资源名称
-    skills: BTreeSet<ResourceName>--镜像默认可见Skill名称，私有
-    workflows: BTreeSet<ResourceName>--镜像默认可见Workflow名称，私有
-    skills(&self) -> impl Iterator<Item = &ResourceName> + '_
-        遍历Skill名称：公开方法，按逻辑名称顺序返回镜像默认可见Skill
-    workflows(&self) -> impl Iterator<Item = &ResourceName> + '_
-        遍历Workflow名称：公开方法，按逻辑名称顺序返回镜像默认可见Workflow
+    resources: BTreeSet<ResourceRef>--镜像默认可见的普通Tool、Skill、Workflow统一引用，私有
+    resources(&self) -> impl Iterator<Item = &ResourceRef> + '_
+        遍历资源：公开方法，按provider和逻辑名称稳定返回
     impl Component for AgentImageDefaultVisibility
         Component：公开trait实现
 
@@ -323,7 +320,7 @@ has_parent(path: &Path) -> bool
         -> 不扫描具体镜像，不创建AgentImage Entity
 
 Workspace启动：
-    WorkspacePlugin解析WorkspaceSpec
+    WorkspacePlugin接收Compose产生的WorkspaceDefinition
         -> 为每个Agent发送LoadAgentImage { id, reference }
         -> Loader按reference合并并发读取
         -> AsyncRuntime读取和结构验证磁盘镜像
@@ -342,10 +339,14 @@ Workspace重载：
         -> 新AgentInstance取得新的静态配置与资源可见性
         -> 旧AgentInstance的Soul、推理快照和资源可见性保持不变
 
-Skill动态加载：
-    AgentInstance的SkillVisibility只保存最终可见Skill逻辑名称
-        -> WorkspacePlugin根据项目目录和AgentImageIdentity单独构造SkillSourceRoots
-        -> 每次准备模型请求或调用Skill时由SkillLoaderPlugin重新读取当前内容
+资源动态使用：
+    AgentPlugin在AgentInstance上保存AgentDefaultVisibility和AgentDynamicVisibility
+        -> AgentDefaultVisibility保存Workspace创建时合并出的统一ResourceRef集合
+        -> AgentDynamicVisibility初始复制默认值，后续可由Agent/Workflow逻辑调整
+        -> WorkspacePlugin根据项目目录和AgentImageIdentity构造AgentToolEnvironment
+        -> 每次LLM请求由AgentPlugin遍历动态可见资源并逐个交给ToolPlugin生成Tool
+        -> 普通Tool、Skill和Workflow均通过ToolDefinitionProvider进入同一tools列表
+        -> 资源handler从ToolContext取得项目根和镜像根
         -> 查找顺序固定为项目级、镜像内置、主目录
         -> 新增全新逻辑名称需要workspace reload
         -> 已可见名称的内容修改和同名来源变化在下一次使用时生效
@@ -382,8 +383,7 @@ App
         │   ├── model: Arc<str>
         │   └── parameters: AgentImageModelParameters
         └── AgentImageDefaultVisibility
-            ├── skills: BTreeSet<ResourceName>
-            └── workflows: BTreeSet<ResourceName>
+            └── resources: BTreeSet<ResourceRef>
 
 异步读取期间：
 AgentImageReadTask

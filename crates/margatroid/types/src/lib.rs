@@ -1,5 +1,8 @@
 use std::fmt;
 
+use core_plugin::{Entity, Event};
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResourceNameError {
     Empty,
@@ -23,7 +26,7 @@ impl fmt::Display for ResourceNameError {
 
 impl std::error::Error for ResourceNameError {}
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ResourceName {
     scope: String,
     name: String,
@@ -66,6 +69,52 @@ impl ResourceName {
 impl fmt::Display for ResourceName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}/{}", self.scope, self.name)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResourceRefError {
+    EmptyProvider,
+    InvalidProvider,
+}
+
+impl fmt::Display for ResourceRefError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyProvider => formatter.write_str("resource provider cannot be empty"),
+            Self::InvalidProvider => formatter.write_str("resource provider is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for ResourceRefError {}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ResourceRef {
+    provider: String,
+    name: ResourceName,
+}
+
+impl ResourceRef {
+    pub fn new(provider: impl Into<String>, name: ResourceName) -> Result<Self, ResourceRefError> {
+        let provider = provider.into();
+        if provider.is_empty() {
+            return Err(ResourceRefError::EmptyProvider);
+        }
+        if !provider.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        }) {
+            return Err(ResourceRefError::InvalidProvider);
+        }
+        Ok(Self { provider, name })
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn name(&self) -> &ResourceName {
+        &self.name
     }
 }
 
@@ -131,6 +180,76 @@ impl fmt::Display for AgentImageReference {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Message {
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    Assistant {
+        content: Option<String>,
+        tool_calls: Vec<ToolCall>,
+    },
+    Tool {
+        tool_call_id: String,
+        content: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MessageIntent {
+    UserWithToolCalls { tool_calls: Vec<ToolCall> },
+    UserWithoutToolCalls,
+    DispatchToolCalls,
+    ResolveToolCall,
+    CompleteTurn,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMessage {
+    pub id: String,
+    pub agent: Entity,
+    pub message: Message,
+    pub intent: MessageIntent,
+}
+
+impl Event for AgentMessage {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentContextMessagesUpdated {
+    pub agent: Entity,
+    pub messages: Vec<Message>,
+}
+
+impl Event for AgentContextMessagesUpdated {}
+
+pub type MessageResource = ResourceRef;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentResourcesUsed {
+    pub id: String,
+    pub agent: Entity,
+    pub resources: Vec<MessageResource>,
+}
+
+impl Event for AgentResourcesUsed {}
+
 fn validate_part(part: &str) -> Result<(), ResourceNameError> {
     if part.is_empty() || part == "." || part == ".." {
         return Err(ResourceNameError::InvalidName);
@@ -194,6 +313,23 @@ mod tests {
     }
 
     #[test]
+    fn resource_references_validate_provider_ids() {
+        let name = ResourceName::new("local/review").unwrap();
+        let resource = ResourceRef::new("workflow", name.clone()).unwrap();
+
+        assert_eq!(resource.provider(), "workflow");
+        assert_eq!(resource.name(), &name);
+        assert_eq!(
+            ResourceRef::new("", name.clone()),
+            Err(ResourceRefError::EmptyProvider)
+        );
+        assert_eq!(
+            ResourceRef::new("Invalid Provider", name),
+            Err(ResourceRefError::InvalidProvider)
+        );
+    }
+
+    #[test]
     fn agent_image_references_default_to_latest() {
         let reference = AgentImageReference::new("local/coder").unwrap();
 
@@ -228,5 +364,55 @@ mod tests {
             AgentImageReference::new("local/coder:tag:extra"),
             Err(AgentImageReferenceError::InvalidTag)
         );
+    }
+
+    #[test]
+    fn user_message_intents_distinguish_preselected_tool_calls() {
+        let tool_call = ToolCall {
+            id: "call-1".into(),
+            name: "skill__local__review".into(),
+            arguments: "{}".into(),
+        };
+
+        assert_eq!(
+            MessageIntent::UserWithToolCalls {
+                tool_calls: vec![tool_call.clone()],
+            },
+            MessageIntent::UserWithToolCalls {
+                tool_calls: vec![tool_call],
+            }
+        );
+        assert_ne!(
+            MessageIntent::UserWithToolCalls {
+                tool_calls: Vec::new(),
+            },
+            MessageIntent::UserWithoutToolCalls
+        );
+    }
+
+    #[test]
+    fn messages_round_trip_through_json() {
+        let message = Message::Assistant {
+            content: Some("Using the selected workflow.".into()),
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                name: "workflow__local__review".into(),
+                arguments: r#"{"path":"src/lib.rs"}"#.into(),
+            }],
+        };
+
+        let encoded = serde_json::to_string(&message).unwrap();
+        let decoded = serde_json::from_str::<Message>(&encoded).unwrap();
+
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn shared_agent_message_types_are_events() {
+        fn assert_event<EventType: Event>() {}
+
+        assert_event::<AgentMessage>();
+        assert_event::<AgentContextMessagesUpdated>();
+        assert_event::<AgentResourcesUsed>();
     }
 }
