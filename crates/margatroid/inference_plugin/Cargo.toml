@@ -4,6 +4,18 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+agent_image_loader_plugin = { path = "../agent_image_loader_plugin" }
+app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
+async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
+futures-util = { workspace = true }
 margatroid_types = { path = "../types" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
