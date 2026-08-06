@@ -13,10 +13,15 @@ Agent可见性组件。
 
 公开：
 ```text
-ToolPlugin：统一工具插件，公开结构体--安装工具定义Provider注册表
+ToolPlugin：统一工具插件，公开结构体--安装Provider注册表和工具执行System
+    schedule: String--工具准备、异步执行和结果发布所属Schedule，私有
+    new() -> Self
+        构造插件：公开关联函数，默认使用RuntimePlugin::UPDATE
+    with_schedule(mut self, schedule: impl Into<String>) -> Self
+        指定阶段：公开方法，替换默认Schedule并返回自身
     impl Plugin for ToolPlugin
         Plugin：公开trait实现
-        行为：安装ToolProviderRegistry
+        行为：要求RuntimePlugin和AsyncRuntimePlugin，安装ToolProviderRegistry与ToolState并挂载三个System
 
 ToolDefinitionProvider：工具定义提供方，公开trait--把一个ResourceRef解析为完整Tool
     id(&self) -> &str
@@ -42,6 +47,7 @@ Tool：一个可发送给模型并可执行的完整工具，公开结构体
 ToolCallRequest：工具调用请求，公开事件--AgentPlugin交给ToolPlugin执行一个模型或前端指定的工具调用
     id: String--完整用户交互轮次ID
     agent: Entity--发起调用的AgentInstance Entity
+    resource: ResourceRef--AgentPlugin按当次工具名称映射得到的唯一资源身份
     call: margatroid_types::ToolCall--需要原样执行的工具调用
     impl Event for ToolCallRequest
         Event：公开trait实现
@@ -51,6 +57,8 @@ ToolCallRequest：工具调用请求，公开事件--AgentPlugin交给ToolPlugin
 AgentToolEnvironment：Agent工具环境，公开组件--保存工具定义和执行需要的实例位置
     project_root: Arc<PathBuf>--Workspace规范化绝对项目根，私有
     image_root: Arc<PathBuf>--AgentImage版本根，私有
+    new(project_root: impl Into<PathBuf>, image_root: impl Into<PathBuf>) -> Self
+        构造环境：公开关联函数，由WorkspacePlugin传入已经确定的实例位置
     project_root(&self) -> &Path
         取得项目根：公开方法
     image_root(&self) -> &Path
@@ -65,8 +73,17 @@ ToolErrorKind：工具错误分类，公开枚举
     ResourceResolutionFailed
     AgentNotAlive
     ToolEnvironmentMissing
+    ToolPluginMissing
+    ToolAlreadyRegistered
+    InvalidRequest
+    InvalidArguments
+    ExecutionFailed
+    OutputLimitExceeded
+    TaskPanicked
 
 ToolError：工具错误，公开结构体--保存稳定分类和不泄露参数、输出或路径的有界描述
+    new(kind: ToolErrorKind, message: impl Into<String>) -> Self
+        构造错误：公开关联函数，截断超过512字节的描述
 
 AppToolExt：App工具定义扩展，公开trait
     register_tool_provider(&mut self, provider: impl ToolDefinitionProvider) -> &mut Self
@@ -90,6 +107,14 @@ ToolProviderRegistry：工具定义Provider注册表，私有Resource
     static_tools: BTreeMap<ResourceName, Tool>--内置tool Provider的精确普通工具定义
 
 ErasedToolHandler：擦除工具执行器，私有trait
+
+ToolState：工具执行限制，私有Resource
+    maximum_arguments_bytes: usize--工具参数最大字节数
+    maximum_output_bytes: usize--工具输出最大字节数
+
+ToolExecutionTask：工具异步执行请求，私有事件
+
+ToolExecutionOutput：工具异步执行结果，私有结构体
 ```
 
 ## 函数
@@ -102,6 +127,26 @@ resolve_tool(world: &World, agent: Entity, resource: &ResourceRef)
         调用provider.provide(environment, resource.name)构造Tool
         验证Tool.resource等于输入resource
         返回Tool
+
+prepare_tool_call_system(world: &mut World)
+    准备调用：消费ToolCallRequest
+        验证请求字段和参数长度
+        只调用resolve_tool(agent, &request.resource)，不读取可见性组件
+        验证Tool.definition.name等于ToolCall.name
+        发送AgentResourcesUsed { id, agent, resources: [request.resource] }
+        把handler和参数包装为ToolExecutionTask交给AsyncRuntime
+        准备失败时直接发送错误内容的Tool AgentMessage
+
+execute_tool(task: ToolExecutionTask, context: AsyncContext) -> Result<ToolExecutionOutput, ToolTaskError>
+    执行工具：反序列化参数、调用异步handler并限制输出大小
+        handler panic转换为TaskPanicked
+        成功和业务失败都保留id、agent与tool_call_id
+
+publish_tool_call_system(world: &mut World)
+    发布结果：把ToolExecutionOutput转换为AgentMessage
+        成功时Message::Tool.content使用完整工具输出
+        失败时content使用有界ToolError文本
+        intent固定为ResolveToolCall
 ```
 
 ## 逻辑
@@ -121,8 +166,10 @@ resolve_tool(world: &World, agent: Entity, resource: &ResourceRef)
         -> 写入InferenceCommand.tools
 
 处理工具调用：
-    AgentPlugin发送ToolCallRequest
-        -> ToolPlugin接收单个调用并进入工具调用处理
+    AgentPlugin发送ToolCallRequest { id, agent, resource, call }
+        -> ToolPlugin只解析request.resource并执行对应Tool
+        -> ToolPlugin不重新从ToolCall.name猜测ResourceRef
+        -> 实际解析成功后发送AgentResourcesUsed
         -> 成功或失败都构造Message::Tool
         -> 发送margatroid_types::AgentMessage { id, agent, message, intent: ResolveToolCall }
 
@@ -131,5 +178,5 @@ resolve_tool(world: &World, agent: Entity, resource: &ResourceRef)
     ToolPlugin一次只知道当前ResourceRef，不接收资源集合
     ToolProviderRegistry只说明一个资源如何变成Tool，不决定请求中有哪些工具
     ToolPlugin只执行AgentPlugin派发的ToolCallRequest，不读取Agent可见性组件，也不做可见性检查
-    ToolCallRequest之后的工具定位与执行步骤后续定义
+    ToolCall.name只用于确认模型可见名称与已解析Tool一致，不用于可见性判断
 ```

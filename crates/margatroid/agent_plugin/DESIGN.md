@@ -33,222 +33,221 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 公开：
 ```text
-AgentCreateRequest：Agent创建请求，公开结构体--WorkspacePlugin提供创建Agent实例所需的全部信息
-    workspace_id: Entity--Agent所属Workspace Entity，公开
-    system_prompt: String--Agent系统提示词，公开
-    messages: Vec<margatroid_types::Message>--Agent初始动态消息，不包含System Message，公开
-    default_visibility: BTreeSet<margatroid_types::ResourceRef>--Agent默认可见资源，公开
+AgentPlugin：Agent实例与消息循环插件，公开结构体--安装创建和消息处理System
+    schedule: String--两个System所属Schedule，私有
+    new() -> Self
+        构造插件：公开关联函数，默认使用RuntimePlugin::UPDATE
+    with_schedule(mut self, schedule: impl Into<String>) -> Self
+        指定阶段：公开方法，替换默认Schedule并返回自身
+    impl Default for AgentPlugin
+        Default：公开trait实现，与new等价
+    impl Plugin for AgentPlugin
+        Plugin：公开trait实现
+        build(self, app: &mut App)
+            构建插件：要求RuntimePlugin和目标Schedule存在
+            行为：依次挂载agent_create_system和agent_message_system
+
+AgentCreateRequest：Agent创建请求，公开事件--WorkspacePlugin交付创建实例所需的Agent自有字段
+    id: String--Workspace生成的创建子请求ID
+    workspace_id: Entity--Agent所属Workspace Entity
+    system_prompt: String--当前系统提示词
+    messages: Vec<margatroid_types::Message>--恢复出的动态上下文，不包含System Message
+    default_visibility: BTreeSet<margatroid_types::ResourceRef>--创建时默认可见资源
     impl Event for AgentCreateRequest
         Event：公开trait实现
     impl Clone for AgentCreateRequest
         Clone：公开trait实现
 
-AgentWorkspaceId：Agent所属Workspace标识，公开结构体--WorkspacePlugin在创建Agent时提供
+AgentCreated：Agent创建完成回执，公开事件--把创建子请求与新Entity关联
+    id: String--原创建子请求ID
+    agent: Entity--新Agent Entity
+    impl Event for AgentCreated
+        Event：公开trait实现
+    impl Clone for AgentCreated
+        Clone：公开trait实现
+
+AgentWorkspaceId：Agent所属Workspace标识，公开组件
     workspace_id: Entity--Workspace Entity，私有
+    workspace_id(&self) -> Entity
+        取得Workspace：公开方法
     impl Component for AgentWorkspaceId
         Component：公开trait实现
 
-AgentContext：Agent上下文，公开结构体--分开保存当前系统提示词与动态消息
+AgentContext：Agent上下文，公开组件--分开保存系统提示词与动态消息
     system_prompt: String--当前系统提示词，私有
-    messages: Vec<margatroid_types::Message>--动态消息，不包含System Message，私有
-    append_message(
-        &mut self,
-        agent: Entity,
-        message: margatroid_types::Message,
-        events: &app_runtime_plugin::RuntimeEventSender,
-    )
-        追加消息：公开方法，将message追加到messages末尾
-        行为：追加完成后发送margatroid_types::AgentContextMessagesUpdated { agent, messages: self.messages.clone() }
-    rewrite_messages(
-        &mut self,
-        agent: Entity,
-        messages: Vec<margatroid_types::Message>,
-        events: &app_runtime_plugin::RuntimeEventSender,
-    )
-        重写消息：公开方法，使用传入的messages整体替换当前messages
-        行为：替换完成后发送margatroid_types::AgentContextMessagesUpdated { agent, messages: self.messages.clone() }
-    限制：创建完成后不公开messages的可变引用；append_message和rewrite_messages是仅有的修改入口
+    messages: Vec<margatroid_types::Message>--User、Assistant和Tool动态消息，私有
+    system_prompt(&self) -> &str
+        取得系统提示词：公开只读方法
+    messages(&self) -> &[margatroid_types::Message]
+        取得动态上下文：公开只读方法
+    append_message(&mut self, agent: Entity, message: Message, events: &RuntimeEventSender)
+        追加消息：公开方法，拒绝System Message并追加一条动态消息
+        行为：修改后发送AgentContextMessagesUpdated完整快照
+    rewrite_messages(&mut self, agent: Entity, messages: Vec<Message>, events: &RuntimeEventSender)
+        重写消息：公开方法，拒绝System Message并整体替换动态上下文
+        行为：修改后发送AgentContextMessagesUpdated完整快照
+    限制：append_message和rewrite_messages是创建完成后仅有的可变入口
     impl Component for AgentContext
         Component：公开trait实现
 
-AgentDefaultVisibility：Agent默认可见性，公开结构体--Workspace创建Agent时确定的只读集合
-    resources: BTreeSet<margatroid_types::ResourceRef>--默认可见资源，私有
+AgentDefaultVisibility：Agent默认可见性，公开组件--创建时确定后只读
+    resources: BTreeSet<ResourceRef>--默认可见资源，私有
+    resources(&self) -> &BTreeSet<ResourceRef>
+        取得默认可见性：公开只读方法
     impl Component for AgentDefaultVisibility
         Component：公开trait实现
 
-AgentDynamicVisibility：Agent动态可见性，公开结构体--Agent运行中实际可见的资源集合
-    resources: BTreeSet<margatroid_types::ResourceRef>--当前可见资源，私有
+AgentDynamicVisibility：Agent动态可见性，公开组件--当前实际可见资源
+    resources: BTreeSet<ResourceRef>--动态可见资源，私有
+    resources(&self) -> &BTreeSet<ResourceRef>
+        取得动态可见性：公开只读方法
     impl Component for AgentDynamicVisibility
         Component：公开trait实现
 
-AgentStatus：Agent状态，公开单元结构体--当前只保留状态组件，具体状态后续定义
+AgentStatus：Agent轮次状态，公开组件--当前只跟踪一个工具调用批次
+    pending_tools: Option<PendingToolCalls>--等待响应的当前批次，私有
+    is_waiting_for_tools(&self) -> bool
+        是否等待工具：公开只读方法
+    pending_turn_id(&self) -> Option<&str>
+        等待轮次：公开只读方法
+    pending_tool_call_ids(&self) -> impl Iterator<Item = &str> + '_
+        等待调用：公开只读方法
     impl Component for AgentStatus
         Component：公开trait实现
+```
+
+私有：
+```text
+PendingToolCalls：待完成工具批次，私有结构体
+    id: String--完整交互轮次ID
+    tool_call_ids: BTreeSet<String>--尚未返回的唯一ToolCall ID
+
+AvailableTools：一次请求的临时工具集合，私有结构体--不是Agent组件
+    definitions: Vec<ToolDefinition>--发给InferencePlugin的工具定义
+    resources_by_name: BTreeMap<String, ResourceRef>--模型可见名称到资源引用的临时映射
+
+AgentStepError：当前事件处理错误，私有枚举--除Memory错误外的公开传递方式后续定义
 ```
 
 ## 函数
 
 私有：
 ```text
-record_message(
-    world: &mut World,
-    event: &margatroid_types::AgentMessage,
-    events: &app_runtime_plugin::RuntimeEventSender,
-) -> Result<(), memory_plugin::MemoryError>
-    记录消息：私有函数，按Message类型决定是否写入历史表，并始终追加到AgentContext
-    行为：
-        event.message是Message::User或Message::Assistant时：
-            调用memory_plugin::WorldMemoryExt::append_history_message(world, event)
-            历史写入失败时不修改AgentContext并返回MemoryError
-        event.message是Message::Tool时不调用append_history_message
-        读取event.agent的AgentContext
-        调用AgentContext.append_message(event.agent, event.message.clone(), events)
-        append_message发送margatroid_types::AgentContextMessagesUpdated
-
-build_tool_definitions(
-    world: &World,
-    agent: Entity,
-    resources: &BTreeSet<margatroid_types::ResourceRef>,
-) -> Result<Vec<margatroid_types::ToolDefinition>, tool_plugin::ToolError>
-    构造工具定义：私有函数，将动态可见资源逐个转换为模型工具定义
-    行为：
-        创建空tools列表
-        依次遍历resources中的每个resource
-        调用tool_plugin::WorldToolExt::resolve_tool(world, agent, resource)
-        成功时克隆tool.definition()并追加到tools
-        任一资源构造失败时返回ToolError，不返回部分tools
-        全部成功时返回tools
-
-dispatch_tool_calls(
-    events: &app_runtime_plugin::RuntimeEventSender,
-    id: &str,
-    agent: Entity,
-    tool_calls: &[margatroid_types::ToolCall],
-)
-    派发工具调用：私有函数，将一组工具调用逐个包装为ToolPlugin请求
-    行为：
-        依次遍历tool_calls
-        为每个调用发送tool_plugin::ToolCallRequest {
-            id: id.to_owned(),
-            agent,
-            call: tool_call.clone(),
-        }
-
 agent_create_system(world: &mut World)
-    创建Agent：私有System，读取AgentCreateRequest并创建Agent Entity
+    创建Agent：读取AgentCreateRequest并创建Agent Entity
     行为：
-        收集本次全部AgentCreateRequest，结束对EventReader的借用
-        按事件顺序处理每个AgentCreateRequest
-        调用World::spawn创建Agent Entity
-        使用request.workspace_id构造AgentWorkspaceId并插入Entity
-        使用request.system_prompt和request.messages构造AgentContext并插入Entity
-        克隆request.default_visibility作为dynamic_visibility
-        使用request.default_visibility构造AgentDefaultVisibility并插入Entity
-        使用dynamic_visibility构造AgentDynamicVisibility并插入Entity
-        构造AgentStatus并插入Entity
-        不读取AgentImage、Workspace Entity组件或磁盘内容
+        收集当前全部请求
+        要求id非空、workspace_id存活且messages不包含System
+        创建Entity并插入AgentWorkspaceId、AgentContext、两层Visibility和AgentStatus
+        AgentDynamicVisibility初始完整复制AgentDefaultVisibility
+        发送AgentCreated { id, agent }
+        不读取Workspace、AgentImage或磁盘，不挂载其他Plugin拥有的组件
 
 agent_message_system(world: &mut World)
-    处理Agent消息：私有System，记录全部AgentMessage并按intent进入对应分支
+    处理Agent消息：读取统一AgentMessage并调用handle_message
     行为：
-        收集本次全部margatroid_types::AgentMessage，结束对EventReader的借用
-        调用WorldEventExt::event_sender取得RuntimeEventSender
-        按事件顺序处理每个margatroid_types::AgentMessage
-        调用record_message(world, &event, &events)
-            失败时发送memory_plugin::AgentMemoryWriteFailed并结束当前事件
-        根据event.intent进入分支：
-            margatroid_types::MessageIntent::CompleteTurn
-                直接结束当前事件，不发送工具调用或新的InferenceCommand
-            margatroid_types::MessageIntent::UserWithToolCalls { tool_calls }
-                调用dispatch_tool_calls(&events, &event.id, event.agent, &tool_calls)
-                结束当前事件，不发送InferenceCommand
-            margatroid_types::MessageIntent::DispatchToolCalls
-                event.message必须是Message::Assistant
-                从event.message读取Assistant.tool_calls
-                调用dispatch_tool_calls(&events, &event.id, event.agent, &tool_calls)
-                结束当前事件，不发送InferenceCommand
-            margatroid_types::MessageIntent::UserWithoutToolCalls
-                继续构造InferenceCommand
-            margatroid_types::MessageIntent::ResolveToolCall
-                Tool响应已经由record_message追加到AgentContext，但未写入历史表
-                继续构造InferenceCommand
-        读取event.agent的AgentDynamicVisibility
-        调用build_tool_definitions(world, event.agent, &AgentDynamicVisibility.resources)
-            失败时结束当前事件，错误传递方式后续定义
-            成功时取得tools
-        结束对AgentDynamicVisibility的只读借用
-        读取event.agent的AgentContext
-        构造messages：
-            第一条是使用AgentContext.system_prompt构造的margatroid_types::Message::System
-            后续依次克隆AgentContext.messages
-        结束对AgentContext的只读借用
-        发送inference_plugin::InferenceCommand {
-            id: event.id,
-            agent: event.agent,
-            messages,
-            tools,
-            stream: None
-        }
-        失败处理暂不定义
+        Memory错误发送AgentMemoryWriteFailed
+        其他错误的公开传递方式后续定义
+
+handle_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender)
+    处理单条消息：先验证MessageIntent与Message类型组合，再记录消息并进入分支
+    行为：
+        UserWithToolCalls只接受User，记录后派发指定工具批次
+        UserWithoutToolCalls只接受User，记录后发送InferenceCommand
+        DispatchToolCalls只接受Assistant，记录后派发Assistant.tool_calls
+        ResolveToolCall只接受Tool，确认属于当前批次后记录；最后一个响应才发送InferenceCommand
+        CompleteTurn只接受Assistant，记录后结束
+        不根据消息正文推断Intent
+
+record_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender)
+    记录消息：同步历史表并更新AgentContext
+    行为：
+        User和Assistant先调用WorldMemoryExt::append_history_message
+        历史提交失败时不修改AgentContext
+        Tool跳过历史写入
+        成功后调用AgentContext.append_message
+
+build_available_tools(world: &World, agent: Entity) -> Result<AvailableTools, AgentStepError>
+    构造可用工具：每次直接从AgentDynamicVisibility构造请求工具与名称映射
+    行为：
+        按BTreeSet顺序遍历每个ResourceRef
+        逐个调用WorldToolExt::resolve_tool
+        收集ToolDefinition
+        建立definition.name到ResourceRef的临时映射
+        definition.name重复时整体失败，不产生歧义映射
+        不把AvailableTools保存为Component
+
+dispatch_tool_calls(
+    world: &mut World,
+    id: &str,
+    agent: Entity,
+    tool_calls: &[ToolCall],
+    events: &RuntimeEventSender,
+)
+    派发工具：把模型名称解析成ResourceRef并启动一个待完成批次
+    行为：
+        调用build_available_tools
+        每个ToolCall.name必须出现在临时映射
+        ToolCall ID必须非空且批次内唯一
+        AgentStatus不能已经等待另一个批次
+        全部请求构造成功后一次性写入AgentStatus
+        逐个发送ToolCallRequest { id, agent, resource, call }
+
+send_inference_command(world: &World, id: &str, agent: Entity, events: &RuntimeEventSender)
+    发送推理：使用当前系统提示词、动态消息和动态可见性构造请求
+    行为：
+        调用build_available_tools
+        第一条Message由AgentContext.system_prompt构造为System
+        后续完整复制AgentContext.messages
+        发送InferenceCommand { id, agent, messages, tools, stream: None }
+
+validate_message_intent(event: &AgentMessage)
+    验证消息契约：只检查来源赋予的Intent与静态Message类型是否匹配，不重新决定Intent
 ```
 
 ## 逻辑
 
 ```text
-创建Agent：
-    WorkspacePlugin收集完整创建信息
-        -> 发送AgentCreateRequest
-        -> agent_create_system创建Entity
-        -> 插入AgentWorkspaceId、AgentContext、AgentDefaultVisibility、AgentDynamicVisibility和AgentStatus
+创建：
+    WorkspacePlugin发送AgentCreateRequest { id, workspace_id, system_prompt, messages, default_visibility }
+        -> agent_create_system创建Agent自有组件
+        -> 发送AgentCreated { id, agent }
+        -> WorkspacePlugin按id取回PreparedWorkspaceAgent
+        -> WorkspacePlugin绑定AgentMemory、AgentInferenceSnapshot和AgentToolEnvironment
 
-处理消息：
-    任意消息来源发送AgentMessage
-        -> agent_message_system调用record_message
-        -> User或Assistant消息由record_message调用MemoryPlugin追加到history_messages
-        -> Tool消息跳过history_messages
-        -> record_message调用AgentContext.append_message追加event.message
-        -> AgentContext发送margatroid_types::AgentContextMessagesUpdated
-        -> MemoryPlugin重写realtime_messages
-        -> agent_message_system根据event.intent进入分支
-
-处理没有前端指定工具调用的用户消息分支：
-    MessageIntent::UserWithoutToolCalls
-        -> 使用AgentContext构造InferenceCommand.messages
-        -> 调用build_tool_definitions按AgentDynamicVisibility构造InferenceCommand.tools
+普通用户消息：
+    AgentMessage { User, UserWithoutToolCalls }
+        -> history_messages追加User
+        -> AgentContext追加User并通知MemoryPlugin重写realtime_messages
+        -> 当前AgentDynamicVisibility逐项构造ToolDefinition
         -> 发送InferenceCommand
 
-处理带有前端指定工具调用的用户消息分支：
-    MessageIntent::UserWithToolCalls { tool_calls }
-        -> 调用dispatch_tool_calls逐个发送tool_plugin::ToolCallRequest
-        -> 当前事件不发送InferenceCommand
-        -> ToolPlugin完成调用后发送AgentMessage { Message::Tool, intent: ResolveToolCall }
+工具批次：
+    UserWithToolCalls或DispatchToolCalls
+        -> 记录User或Assistant消息
+        -> 构造临时exposed name到ResourceRef映射
+        -> AgentStatus记录全部待完成ToolCall ID
+        -> 逐个发送ToolCallRequest
 
-处理模型返回工具调用分支：
-    InferencePlugin发送AgentMessage { Message::Assistant, intent: DispatchToolCalls }
-        -> AgentPlugin记录Assistant消息
-        -> 从Assistant.tool_calls取得调用列表
-        -> 调用dispatch_tool_calls逐个发送tool_plugin::ToolCallRequest
-        -> 当前事件不发送InferenceCommand
-        -> ToolPlugin完成调用后发送AgentMessage { Message::Tool, intent: ResolveToolCall }
+    每个Tool响应发送AgentMessage { Tool, ResolveToolCall }
+        -> 验证turn id与tool_call_id属于当前批次
+        -> Tool只进入AgentContext和realtime_messages，不进入history_messages
+        -> 从AgentStatus移除tool_call_id
+        -> 尚有待完成调用时结束当前事件
+        -> 最后一个响应到达时清空批次并只发送一次InferenceCommand
 
-处理工具响应分支：
-    MessageIntent::ResolveToolCall
-        -> Tool消息只写入AgentContext和realtime_messages，不写入history_messages
-        -> 使用更新后的AgentContext构造InferenceCommand.messages
-        -> 调用build_tool_definitions按AgentDynamicVisibility构造InferenceCommand.tools
-        -> 发送InferenceCommand
+最终响应：
+    AgentMessage { Assistant, CompleteTurn }
+        -> history_messages追加Assistant
+        -> AgentContext追加Assistant
+        -> 结束轮次
 
-处理无工具调用响应分支：
-    InferencePlugin发送AgentMessage { intent: CompleteTurn }
-        -> 历史消息和AgentContext更新完成
-        -> 不检查message.tool_calls
-        -> 不发送任何后续事件，直接结束当前轮次
-
-InferenceCommand中的tools：
-    每次发送InferenceCommand
-        -> 都由build_tool_definitions读取当前AgentDynamicVisibility构造
-        -> 与用户消息是否携带前端指定的tool_calls无关
-        -> 动态可见性为空时tools才自然为空
+边界：
+    AgentPlugin只持有WorkspaceId、Context、两层Visibility和Status
+    AgentPlugin不持有AgentToolCatalog或工具快照
+    InferenceCommand.tools的唯一集合来源是AgentDynamicVisibility
+    ToolPlugin收到的是单个已经解析的ResourceRef，不接收可见性集合，也不检查可见性权限
+    AgentPlugin不决定上下文压缩、资源正文解析、模型路由或Workspace生命周期
 ```
 
 ## 持有关系
@@ -256,9 +255,13 @@ InferenceCommand中的tools：
 ```text
 World
 ├── AgentCreateRequest Event
+│   └── agent_create_system
+│       └── AgentCreated Event
 ├── margatroid_types::AgentMessage Event
-├── tool_plugin::ToolCallRequest Event
-├── inference_plugin::InferenceCommand Event
+│   └── agent_message_system
+│       ├── memory_plugin::WorldMemoryExt
+│       ├── tool_plugin::ToolCallRequest Event
+│       └── inference_plugin::InferenceCommand Event
 └── Agent Entity
     ├── AgentWorkspaceId
     ├── AgentContext

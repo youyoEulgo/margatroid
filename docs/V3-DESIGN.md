@@ -163,9 +163,10 @@ Workspace 是运行对象，不是 YAML 文件。YAML 是创建或更新 Workspa
 
 Compose把YAML编译为不包含运行时Entity的`WorkspaceDefinition`。WorkspacePlugin不解析YAML；它负责
 加载全部AgentImage，从Inference、Tool和Memory等Plugin收集实例材料，全部准备成功后发送
-`CreateAgent`。Workspace Entity保存身份、配置快照和Agent名称索引，Agent Entity通过
-`AgentWorkspaceId`反向关联所属Workspace。其他Plugin查询各自的typed Component，不通过Workspace
-维护通用属性字典。
+`AgentCreateRequest`。AgentPlugin只创建自身组件并发布带请求ID的`AgentCreated`回执，WorkspacePlugin
+再按回执绑定AgentMemory、AgentInferenceSnapshot和AgentToolEnvironment。Workspace Entity保存身份、
+配置快照和Agent名称索引，Agent Entity通过`AgentWorkspaceId`反向关联所属Workspace。其他Plugin查询
+各自的typed Component，不通过Workspace维护通用属性字典。
 
 `workspace reload`先验证新定义与原Workspace身份一致，再关闭旧AgentInstance并按新定义创建新的
 Workspace和Agent Entity。当前阶段不同时运行新旧实例，也不提供失败后的旧实例回滚。
@@ -186,9 +187,13 @@ ToolPlugin构造`Tool`，再收集definitions写入请求`tools`字段。ToolPlu
 Agent可见性组件。
 
 前端可以随用户消息直接指定Skill、Workflow或其他工具调用。此时AgentPlugin先记录用户消息并执行
-指定调用，不立即发送LLM请求；Tool响应作为统一Message写入上下文后，再使用完整上下文发起推理。
+指定调用，不立即发送LLM请求；Tool响应作为统一Message写入上下文，全部指定调用完成后再使用完整上下文发起推理。
 前端没有指定调用时，记录用户消息后直接推理。两条路径的LLM请求都从动态可见性构造`tools`，
 用户消息意图不负责启用或禁用模型工具。
+
+模型一次返回多个ToolCall时，AgentPlugin在`AgentStatus`中保存该批次的全部调用ID。每个Tool响应
+只追加上下文并移除自己的ID，最后一个响应到达时才发送下一次`InferenceCommand`，避免同一批工具
+响应触发多次推理。
 
 SkillPlugin为每个可见Skill生成一个独立Tool，并在执行时按作用域动态解析内容：
 
