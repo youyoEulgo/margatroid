@@ -12,6 +12,7 @@ members = [
     "crates/margatroid/inference_plugin",
     "crates/margatroid/tool_plugin",
     "crates/margatroid/memory_plugin",
+    "crates/margatroid/agent_plugin",
 ]
 
 exclude = ["legacy/*"]
