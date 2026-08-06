@@ -89,7 +89,7 @@ fn documented_public_api_composes_from_an_external_crate() {
         app.world()
             .get_component::<AgentImageDefaultVisibility>(image)
             .unwrap()
-            .skills()
+            .resources()
             .count(),
         0
     );

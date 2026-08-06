@@ -9,7 +9,7 @@ use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::{AppAsyncExt, AsyncTaskError, WorldAsyncExt};
 use core_plugin::{App, Component as MecsComponent, Entity, Event, Plugin, Resource, World};
 use futures_util::FutureExt;
-use margatroid_types::{AgentImageReference, ResourceName};
+use margatroid_types::{AgentImageReference, ResourceName, ResourceRef};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
@@ -157,17 +157,12 @@ impl AgentImageModelConfig {
 impl MecsComponent for AgentImageModelConfig {}
 
 pub struct AgentImageDefaultVisibility {
-    skills: BTreeSet<ResourceName>,
-    workflows: BTreeSet<ResourceName>,
+    resources: BTreeSet<ResourceRef>,
 }
 
 impl AgentImageDefaultVisibility {
-    pub fn skills(&self) -> impl Iterator<Item = &ResourceName> + '_ {
-        self.skills.iter()
-    }
-
-    pub fn workflows(&self) -> impl Iterator<Item = &ResourceName> + '_ {
-        self.workflows.iter()
+    pub fn resources(&self) -> impl Iterator<Item = &ResourceRef> + '_ {
+        self.resources.iter()
     }
 }
 
@@ -483,6 +478,21 @@ async fn read_agent_image_inner(
         ));
     }
 
+    let resources = skills
+        .into_iter()
+        .map(|name| ResourceRef::new("skill", name))
+        .chain(
+            workflows
+                .into_iter()
+                .map(|name| ResourceRef::new("workflow", name)),
+        )
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|_| {
+            AgentImageLoadError::new(
+                AgentImageLoadErrorKind::InvalidResourceName,
+                "embedded resource provider is invalid",
+            )
+        })?;
     let inference = manifest.inference;
     Ok(PreparedAgentImage {
         reference: task.reference,
@@ -498,7 +508,7 @@ async fn read_agent_image_inner(
                 stop: Arc::from(inference.stop),
             },
         },
-        default_visibility: AgentImageDefaultVisibility { skills, workflows },
+        default_visibility: AgentImageDefaultVisibility { resources },
     })
 }
 
@@ -1062,17 +1072,10 @@ stop = ["DONE"]
         assert_eq!(model.parameters().stop(), ["DONE"]);
         assert_eq!(
             visibility
-                .skills()
-                .map(ToString::to_string)
+                .resources()
+                .map(|resource| format!("{}:{}", resource.provider(), resource.name()))
                 .collect::<Vec<_>>(),
-            ["local/code-review"]
-        );
-        assert_eq!(
-            visibility
-                .workflows()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            ["local/review"]
+            ["skill:local/code-review", "workflow:local/review"]
         );
         let _ = fs::remove_dir_all(library);
     }

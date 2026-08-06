@@ -1,0 +1,10 @@
+# WorkspacePlugin
+
+`WorkspacePlugin`接收Compose生成的`WorkspaceDefinition`，从AgentImage、Inference、Memory和Tool
+插件收集创建材料，再通过`AgentCreateRequest`创建Workspace中的全部Agent实例。
+
+Workspace只有在全部Agent完成创建和组件绑定后才会加入查询索引并挂载`WorkspaceAgents`。
+启动中的临时状态只保存在插件内部；关闭时同步移除索引并释放Workspace拥有的Agent Entity。
+
+工具定义不会在Workspace启动时加载。Workspace只合并默认资源集合并保存项目根、镜像根；
+AgentPlugin在每次推理前根据动态可见性调用ToolPlugin构造当前工具定义。
