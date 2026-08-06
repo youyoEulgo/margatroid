@@ -93,9 +93,9 @@ Plugin。所有外部线程通过有界通道把数据送回主线程，不能�
 margatroid CLI
   -> locate margatroid-workspace.yaml
   -> compose path
-  -> daemon HTTP API
+  -> Compose编译WorkspaceDefinition
+  -> daemon HTTP API / protocol
   -> ServerPlugin
-  -> Compose编译WorkspaceDefinition + project root
   -> StartWorkspace / ReloadWorkspace / StopWorkspace Event
   -> WorkspacePlugin
   -> 收集AgentImage / Inference / Tool / Memory信息
@@ -272,14 +272,14 @@ AgentPlugin的消息处理System收到合法`AgentMessage`后，User和Assistant
 
 CLI 是短生命周期本地控制端，它负责：
 
-- 查找 Workspace 文件，将用户输入解析为绝对路径并发送给 daemon。
+- 查找 Workspace 文件，调用共享 Compose 编译器，并将 `WorkspaceDefinition` 发送给 daemon。
 - 发送 Workspace 与资源管理命令。
 - 展示日志、状态和诊断。
 - 为 `workspace config` 等纯预览命令调用共享 Compose 编译器。
 
 daemon 负责：
 
-- 编译 Workspace 文件并解析项目相对路径。
+- 接收 Compose 编译后的 `WorkspaceDefinition`，做运行时复核和权威安全校验。
 - 读取项目级 Skill / Workflow 和主目录已安装资源。
 - 安装、更新、删除和查询主目录资源。
 - Workspace、AgentInstance、Request 和 Task 状态。
