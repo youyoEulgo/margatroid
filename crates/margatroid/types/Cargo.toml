@@ -2,3 +2,8 @@
 name = "margatroid_types"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+core_plugin = { path = "../../mecs/core_plugin" }
+serde = { workspace = true }
+serde_json = { workspace = true }

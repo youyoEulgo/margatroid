@@ -47,22 +47,25 @@ apps -> margatroid plugins -> mecs plugins -> core_plugin
 apps -> compose -> protocol
 margatroid plugins -> protocol
 margatroid plugins -> types
+types -> core_plugin
 ```
 
-types和protocol不依赖ECS，compose不依赖daemon，core不依赖任何具体Plugin。types只保存
-ResourceName等共享领域值，不承载CLI/daemon协议；protocol只保存跨进程DTO。
+protocol不依赖ECS，compose不依赖daemon，core不依赖任何具体Plugin。types可以依赖core的
+Entity与Event，保存ResourceName、Message和AgentMessage等业务Plugin共享静态契约，但不依赖
+任何Margatroid业务Plugin，也不承载CLI/daemon协议；protocol只保存跨进程DTO。
 
-Margatroid Plugin再分为资源加载层与业务层：
+Margatroid Plugin按资源所有权和运行职责组合：
 
 ```text
 mecs基础设施
--> AgentImageLoaderPlugin / SkillLoaderPlugin / WorkflowLoaderPlugin / ModelRouteLoaderPlugin
--> WorkspacePlugin / SkillPlugin / WorkflowPlugin / InferencePlugin / AgentPlugin
+-> AgentImageLoaderPlugin / ModelRouteLoaderPlugin
+-> ToolPlugin / tool_definition_plugins/{SkillPlugin, WorkflowPlugin} / InferencePlugin / AgentPlugin / MemoryPlugin
+-> WorkspacePlugin
 ```
 
-每种资源由独立Loader Plugin负责作用域查找、路径安全、文件读取和格式解析。Loader Plugin不
-依赖业务Plugin；业务Plugin依赖加载结果并决定何时使用、如何执行和怎样改变业务状态。共享的
-资源名称与协议值对象可以来自无业务行为的纯类型crate，不设置理解所有格式的中央Loader。
+AgentImage和模型路由拥有独立生命周期，因此由Loader读取并形成运行时对象。Skill和Workflow只在
+工具调用中使用，不建立额外Loader事件层：各自Plugin定义Tool并拥有格式解析和执行语义，ToolPlugin
+注入实例位置并调用它们。共享资源名称仍来自无业务行为的纯类型crate。
 
 ## 3. mecs
 
@@ -92,12 +95,13 @@ margatroid CLI
   -> compose path
   -> daemon HTTP API
   -> ServerPlugin
-  -> WorkspaceCommand Event
+  -> Compose编译WorkspaceDefinition + project root
+  -> StartWorkspace / ReloadWorkspace / StopWorkspace Event
   -> WorkspacePlugin
-  -> compile WorkspaceSpec + project root
-  -> resolve main/project resources
-  -> Agent静态配置与资源可见性快照
-  -> Workspace state + Agent Entity
+  -> 收集AgentImage / Inference / Tool / Memory信息
+  -> Agent静态配置与默认/动态可见性
+  -> CreateAgent Event
+  -> Workspace Entity + Agent Entity
   -> Agent/Workflow/Memory plugins
   -> InferenceCommand / SandboxCommand
   -> async runtime
@@ -134,13 +138,13 @@ WorkspacePlugin取得该Entity后，把镜像默认值与Workspace增删项合�
 `ModelId`、推理参数与实例快照，并负责业务规则和路由验证。Loader不依赖任何业务Plugin。
 
 AgentImage Entity刷新不会修改已有AgentInstance的Soul、推理快照或最终资源可见性；新配置只在
-`workspace up/reload`创建的新实例上生效。Skill和Workflow正文仍由各自Loader Plugin按需读取，
-不设置理解所有资源格式的中央Loader Plugin。
+`workspace up/reload`创建的新实例上生效。Skill和Workflow正文由各自工具Plugin按调用读取，
+ToolPlugin不理解它们的资源格式。
 
 ### AgentInstance
 
-AgentInstance 属于一个 Workspace。Workspace 启动时解析 AgentImage 与额外资源，并将得到的
-静态配置和资源可见性快照挂到 ECS Entity。实例之间不共享可变记忆。
+AgentInstance 属于一个 Workspace。Workspace 启动时收集 AgentImage 与额外资源信息，并将得到的
+静态配置、`AgentDefaultVisibility`和`AgentDynamicVisibility`挂到 ECS Entity。实例之间不共享可变记忆。
 
 ### 模型路由
 
@@ -157,6 +161,15 @@ ECS Event。后端内部累积完整 Assistant Message，只在响应完成时�
 Workspace 是运行对象，不是 YAML 文件。YAML 是创建或更新 Workspace 所需的项目配置。
 一个 Workspace 可以包含多个 AgentInstance，其中 manager 是用户和运行组的默认入口。
 
+Compose把YAML编译为不包含运行时Entity的`WorkspaceDefinition`。WorkspacePlugin不解析YAML；它负责
+加载全部AgentImage，从Inference、Tool和Memory等Plugin收集实例材料，全部准备成功后发送
+`CreateAgent`。Workspace Entity保存身份、配置快照和Agent名称索引，Agent Entity通过
+`AgentWorkspaceId`反向关联所属Workspace。其他Plugin查询各自的typed Component，不通过Workspace
+维护通用属性字典。
+
+`workspace reload`先验证新定义与原Workspace身份一致，再关闭旧AgentInstance并按新定义创建新的
+Workspace和Agent Entity。当前阶段不同时运行新旧实例，也不提供失败后的旧实例回滚。
+
 ## 6. Skill 与 Workflow
 
 Skill 是带作用域的目录包，不是单 Markdown 文件。目录可以包含说明、脚本、模板和其他资源。
@@ -164,19 +177,28 @@ Skill 是带作用域的目录包，不是单 Markdown 文件。目录可以包�
 Workflow 属于 Skill 范畴，但负责显式控制多步骤执行。节点类型必须可扩展；未来可以增加条件、
 循环、并行、人工确认、提示词注入和强制 Skill 调用，不能把第一版节点 enum 当作永久封闭集合。
 
-AgentInstance持有资源可见性快照。未配置时默认可见AgentImage内的全部Skill；Workspace文件
-可以为单个Agent增加`skills`，也可以通过`disable_skills`移除逻辑名称。可见性只在
-`workspace up/reload`时重新生成，Skill内容不进入快照。
+AgentInstance持有两层统一资源可见性：`AgentDefaultVisibility`是Workspace创建时根据AgentImage
+默认值和Workspace参数合并出的只读`ResourceRef`集合；`AgentDynamicVisibility`初始复制基线，
+表示普通Tool、Skill、Workflow和未来资源的当前实际可用集合，后续可由Agent或Workflow逻辑调整。
 
-SkillLoaderPlugin在每次准备模型请求或调用时按作用域动态解析Skill内容：
+每次LLM请求前，AgentPlugin遍历动态可见性的`ResourceRef`集合，将每个`ResourceRef`分别交给
+ToolPlugin构造`Tool`，再收集definitions写入请求`tools`字段。ToolPlugin不接收资源集合，也不读取
+Agent可见性组件。
+
+前端可以随用户消息直接指定Skill、Workflow或其他工具调用。此时AgentPlugin先记录用户消息并执行
+指定调用，不立即发送LLM请求；Tool响应作为统一Message写入上下文后，再使用完整上下文发起推理。
+前端没有指定调用时，记录用户消息后直接推理。两条路径的LLM请求都从动态可见性构造`tools`，
+用户消息意图不负责启用或禁用模型工具。
+
+SkillPlugin为每个可见Skill生成一个独立Tool，并在执行时按作用域动态解析内容：
 
 ```text
 项目级 .margatroid > AgentImage内置 > 主目录 ~/.margatroid
 ```
 
 作用域越窄优先级越高。最高优先级同名资源存在但内容非法时返回错误，不静默降级。修改已有
-可见Skill的说明、`SKILL.md`、脚本、模板或资产会在下一次使用时生效；新增逻辑名称、修改额外
-列表或禁用列表需要重载Workspace。
+可见Skill的`SKILL.md`、脚本、模板或资产会在下一次使用时生效；默认ResourceRef的变化需要重载
+Workspace，动态可见性变化从下一次LLM请求起生效。
 
 Workspace中的Agent配置形式：
 
@@ -184,15 +206,18 @@ Workspace中的Agent配置形式：
 agents:
   coder:
     image: local/coder:latest
-    skills:
-      - local/project-context
-    disable_skills:
-      - local/dangerous-command
+    resources:
+      - provider: skill
+        name: local/project-context
+      - provider: tool
+        name: builtin/read-file
+    disable_resources:
+      - provider: skill
+        name: local/dangerous-command
 ```
 
-Workflow 依赖由包内依赖清单声明。WorkflowPlugin在每次执行时检查项目级和主目录 Skill 依赖，
-缺失时拒绝本次执行，不进行静默降级；当前不把AgentImage内置Skill作为Workflow外部依赖来源。
-Workflow可见名称的变化仍需重载Workspace。
+WorkflowPlugin同样把每个可见Workflow生成为独立Tool。Workflow依赖Skill时将对应Skill
+`ResourceRef`加入动态可见性，通过同一Provider与Tool构造链路调用，不建立旁路加载协议。
 
 ## 7. Memory
 
@@ -206,6 +231,37 @@ Workflow可见名称的变化仍需重载Workspace。
 
 默认情况下无需配置 memory path。相同 AgentImage 在不同项目 Workspace 中自然使用不同项目级
 目录。显式 volume 只用于用户确实需要覆盖默认位置的场景。
+
+每个逻辑Agent使用一个独立SQLite文件，包含两张业务表：
+
+```text
+history_messages
+    只追加所有已经提交的User和Assistant消息，不保存Tool响应
+    每行保存一个完整Message、交互轮次ID、时间和独立资源引用列
+    上下文压缩不会删除或覆盖历史行
+
+realtime_messages
+    按位置保存当前AgentContext.messages的完整快照
+    每次动态消息变化后整体同步
+    未来上下文压缩可以替换该表，但不影响history_messages
+```
+
+Skill、Workflow等资源正文只在当次模型请求中临时解析，不混入历史消息JSON。实际使用的资源以
+类型和`ResourceName`写入历史行的`resources`列，从而可以展示资源使用情况而不复制正文。
+
+WorkspacePlugin负责确定数据库路径。`workspace up/reload`创建Agent前先由MemoryPlugin打开数据库
+并读取`realtime_messages`，再把恢复出的`Vec<Message>`直接放入Agent创建事件的上下文字段。
+无法读取已有数据库时启动失败，不能静默退化为空上下文。
+
+`AgentContext.messages`创建完成后只能通过`append_message`和`rewrite_messages`修改。两个方法修改完成后
+都发送携带完整消息快照的`margatroid_types::AgentContextMessagesUpdated`；MemoryPlugin逐个消费事件，并各自使用一次
+SQLite事务整体重写`realtime_messages`。MemoryPlugin仍不决定压缩时机、摘要内容、记忆检索或
+上下文裁剪策略。
+
+AgentPlugin的消息处理System收到合法`AgentMessage`后，User和Assistant消息先调用MemoryPlugin向
+`history_messages`追加一行，提交成功后再调用`append_message`追加动态上下文；Tool消息跳过历史表，
+直接追加动态上下文。该判断只依据`Message`类型，不依据`MessageIntent`；`rewrite_messages`只影响
+实时表，不向历史表补写压缩结果。
 
 ## 8. CLI
 
@@ -227,7 +283,7 @@ daemon 负责：
 - ECS 运行与恢复。
 
 CLI 不打包资源正文，不维护资源副本，也不接收 Memory 增量回传。CLI 退出不影响
-Workspace；daemon 负责完整运行生命周期。Agent静态配置和资源可见性在启动时确定；Skill等
+Workspace；daemon 负责完整运行生命周期。Agent默认可见性在启动时确定，动态可见性可在运行时改变；Skill等
 动态资源在使用时读取，Memory由daemon在Workspace运行期间持续读写。
 
 CLI 只参考 Docker 的管理方式，不复制容器的完整生命周期。`workspace up` 创建

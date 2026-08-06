@@ -10,7 +10,7 @@ Loader 只描述镜像中“有什么”，不决定这些内容“怎么运行�
 
 - Loader 加载 AgentImage，WorkspacePlugin 创建 AgentInstance。
 - Loader 保存模型 ID 文本和参数原值，InferencePlugin 解释参数并验证路由。
-- Loader 发现默认可见资源名称，SkillLoaderPlugin 和 WorkflowLoaderPlugin 按需加载内容。
+- Loader 发现默认可见ResourceRef，WorkspacePlugin计算Agent默认可见性，ToolPlugin按动态可见性生成请求工具。
 - 默认可见性属于 AgentImage，最终可见性属于 AgentInstance。
 - 磁盘目录是权威内容，Entity 保存最近一次成功加载的镜像数据。
 - 文件读取走 AsyncRuntime，Entity 只能在 ECS 主线程创建或刷新。
@@ -41,8 +41,8 @@ max_output_tokens = 8192
 镜像引用使用 `scope/name:tag`，例如 `local/coder:latest`。省略 tag 时规范化为 `latest`。
 `model` 是模型路由 ID 文本；Provider、base URL 和 API key 属于 `models.toml`，不能写入镜像。
 
-`skills/` 和 `workflows/` 下的 `<scope>/<name>` 自动进入镜像默认可见性，不需要在
-`agent.toml` 重复登记。Loader 只发现名称，不读取资源正文，也不把查找路径塞进默认可见性。
+`skills/`和`workflows/`下的`<scope>/<name>`分别转换为provider为`skill`和`workflow`的
+`ResourceRef`并进入镜像默认可见性；普通Tool资源由镜像清单声明。Loader不读取资源正文。
 
 ## 安装
 
@@ -64,7 +64,7 @@ app.add_plugin(RuntimePlugin::default())
 ```
 
 官方 daemon 组合负责确定主目录并传入绝对路径。Loader 不根据当前工作目录猜测位置，也不要求
-InferencePlugin、WorkspacePlugin、SkillLoaderPlugin 或 WorkflowLoaderPlugin 已经安装。这里的
+InferencePlugin、WorkspacePlugin、SkillPlugin 或 WorkflowPlugin 已经安装。这里的
 `agent_image_loader` 是已经配置好、等待安装到 App 的 `AgentImageLoaderPlugin` 实例。
 
 ## 加载镜像
@@ -127,8 +127,7 @@ fn inspect_loaded_images(world: &mut World) {
             reference = %identity.reference(),
             soul_bytes = soul.as_str().len(),
             model = model.model(),
-            skill_count = visibility.skills().count(),
-            workflow_count = visibility.workflows().count(),
+            resource_count = visibility.resources().count(),
             "agent image loaded"
         );
     }
@@ -140,7 +139,7 @@ fn inspect_loaded_images(world: &mut World) {
 
 ## 默认可见性
 
-`AgentImageDefaultVisibility` 的字段私有，只提供 `skills()` 和 `workflows()`。它不保存磁盘路径，
+`AgentImageDefaultVisibility`的字段私有，只提供`resources()`。它不保存磁盘路径，
 调用方也不能原地修改镜像默认值。
 
 WorkspacePlugin 创建 AgentInstance 时读取默认值，再叠加 Workspace 对单个 Agent 的配置：
@@ -151,10 +150,13 @@ visible += workspace additions
 visible -= workspace disabled
 ```
 
-禁用始终优先。合并后的 `SkillVisibility` 或 `WorkflowVisibility` 挂在 AgentInstance 上。
+禁用始终优先。合并后的`AgentDefaultVisibility`交给AgentPlugin；AgentPlugin创建实例时复制出
+初始`AgentDynamicVisibility`。前者只读，后者代表运行中的实际可见资源。
 AgentImage 后续刷新不会改变运行中实例；执行 `workspace reload` 后创建的新实例才使用新默认值。
 
-Skill 内容不进入可见性快照。已可见 Skill 在每次使用时按以下顺序重新查找：
+资源内容不进入可见性数据。WorkspacePlugin同时挂载`AgentToolEnvironment`；每次请求由
+AgentPlugin遍历动态可见资源并逐个交给ToolPlugin生成工具，SkillPlugin等Provider执行时从
+`ToolContext`取得项目根和镜像根。
 
 ```text
 项目级 .margatroid/skills/<scope>/<name>

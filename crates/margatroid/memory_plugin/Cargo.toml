@@ -1,11 +1,14 @@
 [package]
-name = "tool_plugin"
+name = "memory_plugin"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
+app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
 margatroid_types = { path = "../types" }
-serde = { workspace = true }
+rusqlite = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

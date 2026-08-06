@@ -1,0 +1,39 @@
+use app_runtime_plugin::RuntimePlugin;
+use core_plugin::App;
+use margatroid_types::{AgentMessage, Message, MessageIntent};
+use memory_plugin::{AgentMemory, MemoryPlugin, WorldMemoryExt};
+use tempfile::tempdir;
+
+#[test]
+fn documented_public_api_composes_from_an_external_crate() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("memory.sql");
+    let (memory, restored) = AgentMemory::open(&path).unwrap();
+    assert!(restored.is_empty());
+
+    let mut app = App::new();
+    app.add_plugin(RuntimePlugin::default())
+        .add_plugin(MemoryPlugin::default());
+    let agent = app.world_mut().spawn();
+    app.world_mut()
+        .bind_agent_memory(agent, memory, &restored)
+        .unwrap();
+    app.world_mut()
+        .append_history_message(&AgentMessage {
+            id: "turn-1".into(),
+            agent,
+            message: Message::User {
+                content: "hello".into(),
+            },
+            intent: MessageIntent::UserWithoutToolCalls,
+        })
+        .unwrap();
+
+    assert_eq!(
+        app.world()
+            .get_component::<AgentMemory>(agent)
+            .unwrap()
+            .path(),
+        path
+    );
+}
