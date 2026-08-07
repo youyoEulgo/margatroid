@@ -2,7 +2,8 @@ use std::fmt;
 use std::path::PathBuf;
 
 use margatroid_types::{
-    AgentImageReference, ResourceName, ResourceRef, WorkspaceAgentDefinition, WorkspaceDefinition,
+    AgentImageReference, Message, ResourceName, ResourceRef, WorkspaceAgentDefinition,
+    WorkspaceDefinition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,13 @@ pub enum ClientRequest {
         id: String,
         definition: WorkspaceDefinitionDto,
     },
+    #[serde(rename = "agent.message")]
+    AgentMessage {
+        id: String,
+        workspace: WorkspaceRefDto,
+        agent: Option<String>,
+        content: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +31,15 @@ pub enum ClientRequest {
 pub enum ServerEvent {
     #[serde(rename = "log")]
     Log { record: LogRecordDto },
+    #[serde(rename = "workspace.started")]
+    WorkspaceStarted {
+        id: String,
+        workspace: WorkspaceInfoDto,
+    },
+    #[serde(rename = "agent.message")]
+    AgentMessage { message: AgentMessageDto },
+    #[serde(rename = "agent.failure")]
+    AgentFailure { failure: AgentFailureDto },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +67,86 @@ impl ClientRequest {
             definition: WorkspaceDefinitionDto::from_definition(definition),
         }
     }
+
+    pub fn agent_message(
+        id: impl Into<String>,
+        workspace: &WorkspaceRefDto,
+        agent: Option<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self::AgentMessage {
+            id: id.into(),
+            workspace: workspace.clone(),
+            agent,
+            content: content.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRefDto {
+    pub name: String,
+    pub project_root: String,
+}
+
+impl WorkspaceRefDto {
+    pub fn new(name: impl Into<String>, project_root: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            project_root: project_root.into(),
+        }
+    }
+
+    pub fn from_definition(definition: &WorkspaceDefinition) -> Self {
+        Self::new(
+            definition.name.clone(),
+            definition.project_root.to_string_lossy().into_owned(),
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceInfoDto {
+    pub name: String,
+    pub project_root: String,
+    pub manager: String,
+    pub agents: Vec<String>,
+}
+
+impl WorkspaceInfoDto {
+    pub fn from_definition(definition: &WorkspaceDefinition) -> Self {
+        Self {
+            name: definition.name.clone(),
+            project_root: definition.project_root.to_string_lossy().into_owned(),
+            manager: definition.manager.clone(),
+            agents: definition
+                .agents
+                .iter()
+                .map(|agent| agent.name.clone())
+                .collect(),
+        }
+    }
+
+    pub fn reference(&self) -> WorkspaceRefDto {
+        WorkspaceRefDto::new(self.name.clone(), self.project_root.clone())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMessageDto {
+    pub id: String,
+    pub workspace: WorkspaceRefDto,
+    pub agent: String,
+    pub message: Message,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentFailureDto {
+    pub id: String,
+    pub workspace: WorkspaceRefDto,
+    pub agent: String,
+    pub kind: String,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +365,71 @@ mod tests {
     }
 
     #[test]
+    fn agent_message_uses_workspace_identity_and_optional_agent_name() {
+        let workspace = WorkspaceRefDto::new("demo", "/tmp/demo");
+        let value = serde_json::to_value(ClientRequest::agent_message(
+            "message-1",
+            &workspace,
+            Some("reviewer".into()),
+            "Review this change.",
+        ))
+        .unwrap();
+
+        assert_eq!(value["type"], "agent.message");
+        assert_eq!(value["workspace"]["name"], "demo");
+        assert_eq!(value["workspace"]["project_root"], "/tmp/demo");
+        assert_eq!(value["agent"], "reviewer");
+        assert_eq!(value["content"], "Review this change.");
+    }
+
+    #[test]
+    fn omitted_agent_is_encoded_for_manager_fallback() {
+        let workspace = WorkspaceRefDto::new("demo", "/tmp/demo");
+        let value = serde_json::to_value(ClientRequest::agent_message(
+            "message-1",
+            &workspace,
+            None,
+            "Hello.",
+        ))
+        .unwrap();
+
+        assert!(value["agent"].is_null());
+    }
+
+    #[test]
+    fn workspace_started_exposes_manager_and_selectable_agents() {
+        let event = ServerEvent::WorkspaceStarted {
+            id: "request-1".into(),
+            workspace: WorkspaceInfoDto::from_definition(&definition()),
+        };
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["type"], "workspace.started");
+        assert_eq!(value["workspace"]["manager"], "coder");
+        assert_eq!(value["workspace"]["agents"][0], "coder");
+    }
+
+    #[test]
+    fn agent_message_event_exposes_resolved_route_and_message() {
+        let event = ServerEvent::AgentMessage {
+            message: AgentMessageDto {
+                id: "message-1".into(),
+                workspace: WorkspaceRefDto::new("demo", "/tmp/demo"),
+                agent: "coder".into(),
+                message: Message::Assistant {
+                    content: Some("Done.".into()),
+                    tool_calls: Vec::new(),
+                },
+            },
+        };
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["type"], "agent.message");
+        assert_eq!(value["message"]["agent"], "coder");
+        assert_eq!(value["message"]["message"]["Assistant"]["content"], "Done.");
+    }
+
+    #[test]
     fn server_log_event_decodes_without_llm_fields() {
         let event: ServerEvent = serde_json::from_str(
             r#"{
@@ -281,8 +443,12 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let ServerEvent::Log { record } = event;
-        assert_eq!(record.message, "started");
-        assert!(record.fields.is_empty());
+        match event {
+            ServerEvent::Log { record } => {
+                assert_eq!(record.message, "started");
+                assert!(record.fields.is_empty());
+            }
+            _ => panic!("expected a log event"),
+        }
     }
 }

@@ -11,7 +11,11 @@ use async_runtime_plugin::{AsyncRuntimePlugin, WorldAsyncExt};
 use core_plugin::{App, Event, World};
 use inference_plugin::InferencePlugin;
 use log_plugin::{LogPlugin, TracingRecord, TracingStream, TracingStreamError};
-use margatroid_protocol::{ClientRequest, LogFieldDto, LogRecordDto, ServerEvent};
+use margatroid_protocol::{
+    AgentFailureDto, AgentMessageDto, ClientRequest, LogFieldDto, LogRecordDto, ServerEvent,
+    WorkspaceInfoDto,
+};
+use margatroid_types::{AgentFailure, AgentMessage as DomainAgentMessage, Message, MessageIntent};
 use memory_plugin::MemoryPlugin;
 use server_plugin::{
     AppServerExt, ServerFailed, ServerOptions, ServerPlugin, ServerStarted, ServerStopped,
@@ -19,7 +23,10 @@ use server_plugin::{
 };
 use tool_plugin::ToolPlugin;
 use tracing::info;
-use workspace_plugin::{StartWorkspace, StartWorkspaceResult, WorkspacePlugin};
+use workspace_plugin::{
+    StartWorkspace, StartWorkspaceResult, WorkspaceAgents, WorkspaceConfiguration, WorkspacePlugin,
+    WorldWorkspaceExt,
+};
 
 const DEFAULT_BIND: &str = "127.0.0.1:3939";
 const DEFAULT_DATA_ROOT: &str = ".margatroid";
@@ -187,11 +194,28 @@ fn handle_websocket_messages(world: &mut World) {
                     ),
                 }
             }
+            ClientRequest::AgentMessage {
+                id,
+                workspace,
+                agent,
+                content,
+            } => {
+                if let Err(error) = route_agent_message(world, id, workspace, agent, content) {
+                    tracing::warn!(
+                        connection = received.connection_id.get(),
+                        error = %error,
+                        "agent message was rejected"
+                    );
+                }
+            }
         }
     }
 }
 
 fn report_runtime_events(world: &mut World) {
+    let Some(connections) = world.get_resource::<WebSocketConnections>().cloned() else {
+        return;
+    };
     for event in world.event_reader::<ServerStarted>() {
         tracing::info!(address = %event.address, "daemon WebSocket server started");
     }
@@ -203,11 +227,128 @@ fn report_runtime_events(world: &mut World) {
     }
     for result in world.event_reader::<StartWorkspaceResult>() {
         match &result.result {
-            Ok(_) => tracing::info!(request_id = %result.id, "workspace started"),
+            Ok(workspace) => {
+                tracing::info!(request_id = %result.id, "workspace started");
+                if let Some(info) = workspace_info(world, *workspace) {
+                    broadcast_server_event(
+                        &connections,
+                        &ServerEvent::WorkspaceStarted {
+                            id: result.id.clone(),
+                            workspace: info,
+                        },
+                    );
+                }
+            }
             Err(error) => {
                 tracing::error!(request_id = %result.id, error = %error, "workspace start failed")
             }
         }
+    }
+    let messages = world
+        .event_reader::<DomainAgentMessage>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for message in messages {
+        let Some((workspace, agent)) = agent_route(world, message.agent) else {
+            continue;
+        };
+        broadcast_server_event(
+            &connections,
+            &ServerEvent::AgentMessage {
+                message: AgentMessageDto {
+                    id: message.id,
+                    workspace,
+                    agent,
+                    message: message.message,
+                },
+            },
+        );
+    }
+    let failures = world
+        .event_reader::<AgentFailure>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for failure in failures {
+        let Some((workspace, agent)) = agent_route(world, failure.agent) else {
+            continue;
+        };
+        broadcast_server_event(
+            &connections,
+            &ServerEvent::AgentFailure {
+                failure: AgentFailureDto {
+                    id: failure.id,
+                    workspace,
+                    agent,
+                    kind: format!("{:?}", failure.kind),
+                    message: failure.message,
+                },
+            },
+        );
+    }
+}
+
+fn route_agent_message(
+    world: &World,
+    id: String,
+    workspace: margatroid_protocol::WorkspaceRefDto,
+    agent: Option<String>,
+    content: String,
+) -> Result<(), String> {
+    if id.trim().is_empty() {
+        return Err("message id cannot be empty".into());
+    }
+    if content.trim().is_empty() {
+        return Err("message content cannot be empty".into());
+    }
+    let project_root = PathBuf::from(&workspace.project_root);
+    let workspace_entity = world
+        .workspace(&project_root, &workspace.name)
+        .ok_or_else(|| "workspace was not found or is not ready".to_owned())?;
+    let agent_entity = match agent {
+        Some(name) if name.trim().is_empty() => return Err("agent name cannot be empty".into()),
+        Some(name) => world
+            .workspace_agent(workspace_entity, &name)
+            .ok_or_else(|| format!("agent `{name}` was not found in the workspace"))?,
+        None => world
+            .workspace_manager(workspace_entity)
+            .ok_or_else(|| "workspace manager is not ready".to_owned())?,
+    };
+    world.send_event(DomainAgentMessage {
+        id,
+        agent: agent_entity,
+        message: Message::User { content },
+        intent: MessageIntent::UserWithoutToolCalls,
+    });
+    Ok(())
+}
+
+fn workspace_info(world: &World, workspace: core_plugin::Entity) -> Option<WorkspaceInfoDto> {
+    world
+        .get_component::<WorkspaceConfiguration>(workspace)
+        .map(|configuration| WorkspaceInfoDto::from_definition(configuration.definition()))
+}
+
+fn agent_route(
+    world: &World,
+    agent: core_plugin::Entity,
+) -> Option<(margatroid_protocol::WorkspaceRefDto, String)> {
+    let workspace = world.workspace_of(agent)?;
+    let name = world
+        .get_component::<WorkspaceAgents>(workspace)?
+        .iter()
+        .find_map(|(name, entity)| (entity == agent).then_some(name.to_owned()))?;
+    let workspace = workspace_info(world, workspace)?.reference();
+    Some((workspace, name))
+}
+
+fn broadcast_server_event(connections: &WebSocketConnections, event: &ServerEvent) {
+    let Ok(encoded) = serde_json::to_string(event) else {
+        return;
+    };
+    for sender in connections.unnamed() {
+        let _ = sender.try_send(WebSocketMessage::Text(encoded.clone().into()));
     }
 }
 

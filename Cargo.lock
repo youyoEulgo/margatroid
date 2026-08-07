@@ -806,6 +806,7 @@ dependencies = [
  "inference_plugin",
  "log_plugin",
  "margatroid_protocol",
+ "margatroid_types",
  "memory_plugin",
  "serde_json",
  "server_plugin",
