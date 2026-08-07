@@ -15,7 +15,7 @@ Margatroid 是 Docker-like 的多 Agent 编排与运行工具：
 - Memory 类似持久化卷，但默认按项目和 Agent 自动分配。
 - Workflow 是可组合、可扩展的高级 Skill，未来可以演化为独立语言。
 
-CLI 面向用户，daemon 拥有运行状态、资源库和 Memory。用户不直接操作 margatroidd。
+CLI 面向用户，daemon 拥有运行状态、资源库和 Memory。用户不直接操作 daemon 进程。
 V3 第一版是本地产品：CLI 与 daemon 在同一台机器上共享文件系统，不为远程资源上传、
 项目目录同步或 Memory 回传预留 API。
 
@@ -112,6 +112,11 @@ margatroid CLI
 
 HTTP 只是适配层，不能承载业务状态。业务 Plugin 不直接访问 Axum handler，ServerPlugin 也不
 直接修改业务 Resource。
+
+daemon 是当前产品组合根，默认安装 Runtime、AsyncRuntime、Log、Server、AgentImageLoader、
+Inference、Tool、Memory、Agent 和 Workspace Plugin。它通过 `/ws` 接收 protocol 定义的
+`workspace.start` 请求，并把结构化日志转发给连接中的 CLI；daemon 不解析 Workspace YAML，
+也不处理 CLI 的 LLM 消息输入输出。
 
 ## 5. Agent 模型
 
@@ -276,6 +281,10 @@ CLI 是短生命周期本地控制端，它负责：
 - 发送 Workspace 与资源管理命令。
 - 展示日志、状态和诊断。
 - 为 `workspace config` 等纯预览命令调用共享 Compose 编译器。
+
+当前 CLI 第一阶段只实现 `workspace up`：编译 Workspace 文件、通过 WebSocket 发送
+`workspace.start`，并打印 `type = "log"` 的后端日志事件。CLI 暂不读取用户输入，也不处理
+LLM 消息输入输出。
 
 daemon 负责：
 

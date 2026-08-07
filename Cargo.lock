@@ -783,6 +783,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "margatroid_cli"
+version = "0.1.0"
+dependencies = [
+ "compose",
+ "futures-util",
+ "margatroid_protocol",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
+name = "margatroid_daemon"
+version = "0.1.0"
+dependencies = [
+ "agent_image_loader_plugin",
+ "agent_plugin",
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "core_plugin",
+ "inference_plugin",
+ "log_plugin",
+ "margatroid_protocol",
+ "memory_plugin",
+ "serde_json",
+ "server_plugin",
+ "tool_plugin",
+ "tracing",
+ "workspace_plugin",
+]
+
+[[package]]
+name = "margatroid_protocol"
+version = "0.1.0"
+dependencies = [
+ "margatroid_types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "margatroid_types"
 version = "0.1.0"
 dependencies = [
