@@ -1,9 +1,9 @@
 # Margatroid Protocol
 
-`margatroid_protocol` 保存 CLI 与 daemon 之间共享的跨进程 DTO。它不依赖 ECS、WorkspacePlugin 或
-网络实现；WebSocket、HTTP 等传输层只负责传递其 JSON 表示。
+`margatroid_protocol` 保存客户端与 daemon 之间共享的跨进程 DTO。它不依赖 ECS、WorkspacePlugin
+或网络实现；WebSocket、HTTP 等传输层只负责传递其 JSON 表示。
 
-当前只定义 Workspace 启动请求：
+启动 Workspace：
 
 ```rust
 use margatroid_protocol::ClientRequest;
@@ -12,8 +12,65 @@ let request = ClientRequest::start_workspace("request-1", &definition);
 let json = serde_json::to_string(&request)?;
 ```
 
-后端日志使用 `ServerEvent::Log` 发送，CLI 只处理这种事件。其他后端事件可以继续扩展，但不属于
-CLI 的 LLM 消息输入输出通道。
+启动完成后，daemon 发送 `workspace.started`，返回 Workspace 逻辑身份、manager 和所有可选 Agent：
+
+```json
+{
+  "type": "workspace.started",
+  "id": "request-1",
+  "workspace": {
+    "name": "demo",
+    "project_root": "/project/demo",
+    "manager": "coder",
+    "agents": ["coder", "reviewer"]
+  }
+}
+```
+
+客户端向指定成员发送用户消息：
+
+```json
+{
+  "type": "agent.message",
+  "id": "message-1",
+  "workspace": {
+    "name": "demo",
+    "project_root": "/project/demo"
+  },
+  "agent": "reviewer",
+  "content": "Review this change."
+}
+```
+
+`agent` 可以为 `null`；daemon 此时查询 Workspace 的 manager 并把它作为目标。显式名称不存在、
+Workspace 尚未就绪、ID 为空或正文为空时，请求不会创建内部消息，错误暂时通过日志报告。
+
+Agent 的对话事件使用同一个 `agent.message` 类型返回，并带上已经解析出的 Agent 名称。当前
+`margatroid_types::Message` 使用 serde 的枚举形状，例如用户消息为：
+
+```json
+{
+  "type": "agent.message",
+  "message": {
+    "id": "message-1",
+    "workspace": {
+      "name": "demo",
+      "project_root": "/project/demo"
+    },
+    "agent": "reviewer",
+    "message": {
+      "User": {
+        "content": "Review this change."
+      }
+    }
+  }
+}
+```
+
+无法表示成消息的 Agent 轮次失败使用 `agent.failure` 返回。`kind` 当前对应领域失败类型，例如
+`Inference`。
+
+后端日志继续使用 `ServerEvent::Log` 发送；现有 CLI 只处理这种事件，不承担 Agent 消息输入输出。
 
 ```json
 {
@@ -56,4 +113,5 @@ JSON 形状：
 
 `WorkspaceDefinitionDto` 将镜像、资源和路径转换为跨进程稳定的字符串形式；后端收到 DTO 后可以
 调用 `into_definition` 恢复 `margatroid_types` 中的领域值，随后仍由 WorkspacePlugin 做运行时
-复核。协议 crate 不发送或解析 LLM 消息。
+复核。协议只携带逻辑 Workspace/Agent 身份，不暴露 ECS `Entity`，也不决定 manager、消息意图或
+模型请求。
