@@ -1,0 +1,16 @@
+[package]
+name = "margatroid_cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "margatroid"
+path = "src/main.rs"
+
+[dependencies]
+compose = { path = "../../crates/margatroid/compose" }
+futures-util = { workspace = true }
+margatroid_protocol = { path = "../../crates/margatroid/protocol" }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
