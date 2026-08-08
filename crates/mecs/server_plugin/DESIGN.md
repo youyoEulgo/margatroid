@@ -325,12 +325,20 @@ WebSocketConnections：WebSocket连接注册表，公开结构体--ServerPlugin�
         查询名称：公开方法，连接未具名时返回None
     set_name(&self, connection_id: WebSocketConnectionId, name: impl Into<String>) -> Result<(), WebSocketNameError>
         设置名称：公开方法，名称全局唯一，空名称将连接改为不具名
-    unnamed(&self) -> Vec<WebSocketSender>
+    connection_type(&self, connection_id: WebSocketConnectionId) -> Option<String>
+        查询连接类型：公开方法，连接不存在或尚未设置类型时返回None
+    set_connection_type(&self, connection_id: WebSocketConnectionId, connection_type: impl Into<String>) -> bool
+        设置连接类型：公开方法，原子更新连接条目和类型索引，连接不存在时返回false，空类型清除类型
+    get_all(&self) -> Vec<WebSocketSender>
+        查询全部发送器：公开方法，返回全部存活连接的发送器克隆，顺序不作保证
+    get_by_type(&self, connection_type: &str) -> Vec<WebSocketSender>
+        按类型查询发送器：公开方法，返回类型相同的全部存活连接发送器克隆，空类型返回空数组
+    get_unnamed(&self) -> Vec<WebSocketSender>
         查询不具名发送器：公开方法，返回顺序不作保证的克隆数组
     insert(&self, sender: WebSocketSender)
-        注册连接：crate公开方法，以空名称写入sender，ID重复时panic
+        注册连接：crate公开方法，以空名称和空连接类型写入sender，ID重复时panic
     remove(&self, connection_id: WebSocketConnectionId)
-        移除连接：crate公开方法，原子删除ID条目和非空名称索引
+        移除连接：crate公开方法，原子删除ID条目、非空名称索引和非空连接类型索引
     impl Resource for WebSocketConnections
         Resource：公开trait实现
 
@@ -543,11 +551,13 @@ ServerHandleState：服务器句柄状态，私有结构体
 
 WebSocketConnectionEntry：WebSocket连接条目，私有结构体
     name: String--名称，空字符串表示不具名
+    connection_type: String--连接类型，空字符串表示尚未注册类型
     sender: WebSocketSender--发送器
 
 WebSocketConnectionsState：WebSocket连接索引，私有结构体
     by_id: HashMap<WebSocketConnectionId, WebSocketConnectionEntry>--ID索引
     by_name: HashMap<String, WebSocketConnectionId>--非空唯一名称索引
+    by_type: HashMap<String, HashSet<WebSocketConnectionId>>--非空连接类型到连接ID集合的索引
 
 ServerBridgeState：服务器桥接状态，私有结构体--HTTP和WebSocket Handler共享
     event_sender: RuntimeEventSender--Runtime事件发送器
@@ -637,16 +647,22 @@ HTTP流式响应：
 
 WebSocket普通消息：
     连接建立
-        -> ServerPlugin先将不具名WebSocketSender写入WebSocketConnections
+        -> ServerPlugin先将名称和连接类型均为空的WebSocketSender写入WebSocketConnections
         -> 发送WebSocketConnected通知
-        -> System可按ID命名或直接取得发送器
+        -> System可按ID设置连接类型、生成唯一名称或直接取得发送器
     普通消息
         -> 根接收循环发送WebSocketMessageReceived
         -> 同步System处理
         -> try_send一次立即回复，或将发送器克隆交给异步任务多次send
     连接断开
-        -> 先从WebSocketConnections删除
+        -> 先从WebSocketConnections的ID、名称和类型索引删除
         -> 再发送WebSocketDisconnected通知
+
+WebSocket连接筛选：
+    get_all返回全部当前连接
+    get_by_type按connection_type返回一组连接
+    get_by_name按唯一名称返回单个连接
+    get_unnamed只表示名称为空，不表示全部连接，不作为广播接口
 
 WebSocket默认支流信封：
     {"mecs_stream":{"id":"request-1","phase":"start|chunk|end|abort"},"payload":...}

@@ -126,7 +126,9 @@ AvailableTools：一次请求的临时工具集合，私有结构体--不是Agen
     definitions: Vec<ToolDefinition>--发给InferencePlugin的工具定义
     resources_by_name: BTreeMap<String, ResourceRef>--模型可见名称到资源引用的临时映射
 
-AgentStepError：当前事件处理错误，私有枚举--除Memory错误外的公开传递方式后续定义
+AgentStepError：当前事件处理错误，私有枚举--Memory错误单独上报，其余错误转换为AgentFailure
+    failure_message(&self) -> String
+        构造失败描述：返回不包含消息正文、工具参数或资源正文的稳定有界文本
 ```
 
 ## 函数
@@ -147,7 +149,8 @@ agent_message_system(world: &mut World)
     处理Agent消息：读取统一AgentMessage并调用handle_message
     行为：
         Memory错误发送AgentMemoryWriteFailed
-        其他错误的公开传递方式后续定义
+        其他错误发送AgentFailure { kind: Agent, id, agent, message }
+        失败不伪造Assistant或Tool消息，不继续当前事件后续步骤
 
 handle_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender)
     处理单条消息：先验证MessageIntent与Message类型组合，再记录消息并进入分支

@@ -1,0 +1,189 @@
+use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
+use core_plugin::{App, Event, Plugin, Resource, World};
+use margatroid_protocol::{ClientRequest, ServerEvent, WorkspaceDefinitionDto, WorkspaceRefDto};
+use server_plugin::{
+    AppServerExt, WebSocketConnectionId, WebSocketConnections, WebSocketMessage,
+    WebSocketMessageReceived,
+};
+
+#[derive(Clone, Debug)]
+pub struct ApiPlugin {
+    websocket_path: String,
+    schedule: String,
+}
+
+impl ApiPlugin {
+    pub fn new() -> Self {
+        Self {
+            websocket_path: "/ws".into(),
+            schedule: RuntimePlugin::UPDATE.into(),
+        }
+    }
+
+    pub fn with_websocket_path(mut self, path: impl Into<String>) -> Self {
+        self.websocket_path = path.into();
+        self
+    }
+
+    pub fn with_schedule(mut self, schedule: impl Into<String>) -> Self {
+        self.schedule = schedule.into();
+        self
+    }
+}
+
+impl Default for ApiPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionRegisterRequested {
+    pub connection_id: WebSocketConnectionId,
+    pub client_type: String,
+}
+
+impl Event for ConnectionRegisterRequested {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceStartRequested {
+    pub connection_id: WebSocketConnectionId,
+    pub id: String,
+    pub definition: WorkspaceDefinitionDto,
+}
+
+impl Event for WorkspaceStartRequested {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMessageRequested {
+    pub connection_id: WebSocketConnectionId,
+    pub id: String,
+    pub workspace: WorkspaceRefDto,
+    pub agent: Option<String>,
+    pub content: String,
+}
+
+impl Event for AgentMessageRequested {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WebSocketMessageTarget {
+    Broadcast,
+    Type(String),
+    Name(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebSocketMessageSend {
+    pub target: WebSocketMessageTarget,
+    pub message: ServerEvent,
+}
+
+impl Event for WebSocketMessageSend {}
+
+struct ApiPluginInstalled;
+
+impl Resource for ApiPluginInstalled {}
+
+impl Plugin for ApiPlugin {
+    fn build(self, app: &mut App) {
+        if app.world().contains_resource::<ApiPluginInstalled>() {
+            panic!("ApiPlugin is already installed");
+        }
+        if !app.contains_schedule(&self.schedule) {
+            panic!("ApiPlugin schedule does not exist: {}", self.schedule);
+        }
+        if !app.world().contains_resource::<WebSocketConnections>() {
+            panic!("ServerPlugin must be installed before ApiPlugin");
+        }
+        app.world_mut().insert_resource(ApiPluginInstalled);
+        app.add_websocket_event_route(&self.websocket_path)
+            .add_system(&self.schedule, api_route_system);
+    }
+}
+
+fn api_route_system(world: &mut World) {
+    let received = world
+        .event_reader::<WebSocketMessageReceived>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    for received in received {
+        let WebSocketMessage::Text(text) = &received.message else {
+            tracing::warn!(
+                connection = received.connection_id.get(),
+                "ignoring non-text API message"
+            );
+            continue;
+        };
+        let request = match serde_json::from_str::<ClientRequest>(text.as_str()) {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(connection = received.connection_id.get(), error = %error, "ignoring invalid API request");
+                continue;
+            }
+        };
+        match request {
+            ClientRequest::ConnectionRegister { client_type } => {
+                world.send_event(ConnectionRegisterRequested {
+                    connection_id: received.connection_id,
+                    client_type,
+                });
+            }
+            ClientRequest::WorkspaceStart { id, definition } => {
+                world.send_event(WorkspaceStartRequested {
+                    connection_id: received.connection_id,
+                    id,
+                    definition,
+                });
+            }
+            ClientRequest::AgentMessage {
+                id,
+                workspace,
+                agent,
+                content,
+            } => {
+                world.send_event(AgentMessageRequested {
+                    connection_id: received.connection_id,
+                    id,
+                    workspace,
+                    agent,
+                    content,
+                });
+            }
+        }
+    }
+
+    let outgoing = world
+        .event_reader::<WebSocketMessageSend>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let Some(connections) = world.get_resource::<WebSocketConnections>().cloned() else {
+        return;
+    };
+    for outgoing in outgoing {
+        let encoded = match serde_json::to_string(&outgoing.message) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                tracing::warn!(error = %error, "API response serialization failed");
+                continue;
+            }
+        };
+        let senders = match &outgoing.target {
+            WebSocketMessageTarget::Broadcast => connections.get_all(),
+            WebSocketMessageTarget::Type(connection_type) => {
+                connections.get_by_type(connection_type)
+            }
+            WebSocketMessageTarget::Name(name) => match connections.get_by_name(name) {
+                Some(sender) => vec![sender],
+                None => {
+                    tracing::warn!(name = %name, "named WebSocket connection was not found");
+                    Vec::new()
+                }
+            },
+        };
+        for sender in senders {
+            if let Err(error) = sender.try_send(WebSocketMessage::Text(encoded.clone().into())) {
+                tracing::warn!(connection = sender.connection_id().get(), error = %error, "WebSocket API message could not be queued");
+            }
+        }
+    }
+}

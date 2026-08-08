@@ -56,6 +56,7 @@ async fn run_workspace_up(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let definition = compile(&workspace_file)?;
     let request_id = request_id();
+    let registration = serde_json::to_string(&ClientRequest::register_connection("cli"))?;
     let request = ClientRequest::start_workspace(&request_id, &definition);
     let encoded = serde_json::to_string(&request)?;
 
@@ -66,6 +67,7 @@ async fn run_workspace_up(
     );
     eprintln!("connecting to {backend_url}");
     let (mut socket, _) = connect_async(&backend_url).await?;
+    socket.send(Message::Text(registration.into())).await?;
     socket.send(Message::Text(encoded.into())).await?;
     eprintln!("workspace.start sent (request '{request_id}'); waiting for backend logs");
 

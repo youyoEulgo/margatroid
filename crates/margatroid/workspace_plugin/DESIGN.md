@@ -164,6 +164,8 @@ WorldWorkspaceExt：World Workspace扩展，公开trait--发送Workspace命令�
         重载Workspace：公开方法，发送ReloadWorkspace并唤醒Runtime
     stop_workspace(&self, id: impl Into<String>, workspace: Entity)
         关闭Workspace：公开方法，发送StopWorkspace并唤醒Runtime
+    workspaces(&self) -> Vec<Entity>
+        列出Workspace：公开方法，返回当前已登记且仍存活的全部Workspace Entity
     workspace(&self, project_root: &Path, name: &str) -> Option<Entity>
         查询Workspace：公开方法，只返回已登记且仍存活的Workspace Entity
     workspace_agent(&self, workspace: Entity, name: &str) -> Option<Entity>

@@ -171,6 +171,7 @@ AgentContextMessagesUpdated：Agent上下文更新事件，公开结构体--Agen
         Clone：公开trait实现
 
 AgentFailureKind：Agent执行失败来源，公开枚举--标识无法表示成Message的轮次级失败
+    Agent--AgentPlugin在消息分支、上下文或工具定义准备失败时产生
     Inference--InferencePlugin在准备或执行推理失败时产生
     impl Clone + Copy + PartialEq + Eq for AgentFailureKind
         值语义：公开trait实现

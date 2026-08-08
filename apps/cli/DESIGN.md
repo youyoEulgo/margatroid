@@ -26,7 +26,7 @@ run(command: Command) -> Result<(), Box<dyn Error + Send + Sync>>
     执行命令：私有异步函数，分派WorkspaceUp
 
 run_workspace_up(workspace_file: PathBuf, backend_url: String) -> Result<(), Box<dyn Error + Send + Sync>>
-    启动Workspace：私有异步函数，编译文件、连接WebSocket、发送启动请求并打印日志事件
+    启动Workspace：私有异步函数，编译文件、连接WebSocket、注册cli连接、发送启动请求并打印日志事件
     行为：不读取stdin，不构造或发送LLM消息；只有ServerEvent::Log写入stdout
 
 print_backend_message(text: &str)
@@ -54,10 +54,11 @@ main
 run_workspace_up
     -> compose::compile(workspace_file)
     -> request_id()
+    -> ClientRequest::register_connection("cli")
     -> ClientRequest::start_workspace(id, &definition)
-    -> serde_json序列化ClientRequest
+    -> 分别序列化两个ClientRequest
     -> tokio_tungstenite连接backend_url
-    -> 发送Message::Text
+    -> 依次发送connection.register和workspace.start的Message::Text
     -> 循环接收WebSocket消息
        -> Text：解析ServerEvent::Log并打印
        -> UTF-8 Binary：按文本解析ServerEvent::Log

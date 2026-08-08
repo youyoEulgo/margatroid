@@ -36,4 +36,18 @@ fn documented_public_api_composes_from_an_external_crate() {
             .path(),
         path
     );
+    let history = app
+        .world()
+        .get_component::<AgentMemory>(agent)
+        .unwrap()
+        .history_messages()
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].turn_id, "turn-1");
+    assert_eq!(
+        history[0].message,
+        Message::User {
+            content: "hello".into()
+        }
+    );
 }

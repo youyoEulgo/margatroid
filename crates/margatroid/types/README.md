@@ -37,3 +37,6 @@ Plugin，普通工具、Skill和Workflow不再建立不同通道。每次请求�
 
 资源来源可以用 `MessageResource` 与 `AgentResourcesUsed` 报告一次Agent轮次实际使用的资源。
 事件只携带统一`ResourceRef`，不携带Skill、Workflow或其他资源正文。
+
+无法表示成消息的轮次失败使用 `AgentFailure`。`kind=Agent` 表示 AgentPlugin 在处理消息或准备可见工具
+时失败，`kind=Inference` 表示 InferencePlugin 在准备或执行模型请求时失败。

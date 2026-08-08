@@ -63,8 +63,23 @@ AgentMemory：Agent数据库绑定，公开组件--一个运行中AgentInstance�
             任一步失败时不返回部分上下文
     path(&self) -> &Path
         取得路径：公开方法，返回数据库路径
+    history_messages(&self) -> Result<Vec<HistoryMessage>, MemoryError>
+        读取展示历史：公开方法，按sequence升序返回完整history_messages
+        行为：
+            每行message必须是与role一致的Message::User或Message::Assistant
+            resources只恢复MessageResource引用，不读取任何资源正文
+            任一行读取或解码失败时整体失败，不返回残缺历史
     impl Component for AgentMemory
         Component：公开trait实现
+
+HistoryMessage：可展示历史条目，公开结构体--对应history_messages中的一行
+    sequence: i64--单Agent永久递增序号
+    turn_id: String--原AgentMessage.id
+    message: margatroid_types::Message--只可能是User或Assistant
+    resources: Vec<margatroid_types::MessageResource>--实际使用的资源引用，不含资源正文
+    created_at_ms: i64--历史写入时Unix毫秒时间
+    impl Clone + PartialEq + Eq for HistoryMessage
+        值语义：公开trait实现
 
 AgentMemoryWriteFailed：消息持久化失败事件，公开结构体--报告历史或实时消息写入失败
     agent: Entity--写入失败的AgentInstance Entity
@@ -152,6 +167,16 @@ initialize_schema(connection: &rusqlite::Connection) -> Result<(), MemoryError>
             position INTEGER PRIMARY KEY--从0开始的连续上下文位置
             message TEXT NOT NULL--完整Message结构化JSON
         任一建表操作失败时返回SchemaFailed
+
+load_history_messages(
+    connection: &rusqlite::Connection,
+) -> Result<Vec<HistoryMessage>, MemoryError>
+    读取展示历史：私有函数，按sequence升序读取全部history_messages
+    行为：
+        读取sequence、turn_id、role、message、resources和created_at_ms
+        message只接受与role一致的Message::User或Message::Assistant
+        resources只反序列化MessageResource引用数组
+        任一读取、角色校验或JSON解码失败时整体失败，不返回部分历史
 
 load_realtime_messages(
     connection: &rusqlite::Connection,
@@ -295,6 +320,14 @@ Workspace重新启动：
     history_messages保留User和Assistant历史，不自动装入当前模型上下文
     realtime_messages可以包含User、Assistant和Tool，不包含System
 
+前端展示：
+    daemon调用AgentMemory::history_messages读取每个Agent的完整history_messages
+        -> 通过state.sync发送历史快照
+        -> 客户端整体替换已有展示历史
+    history_messages是客户端可展示对话的唯一来源
+    realtime_messages只用于模型上下文恢复，不通过状态快照提供给客户端
+    agent.message实时事件不作为客户端自行追加或持久化展示历史的依据
+
 关闭：
     workspace down释放Agent Entity
         -> AgentMemory随组件释放
@@ -307,6 +340,7 @@ Workspace重新启动：
     资源Plugin只发送AgentResourcesUsed，不直接写SQLite
     MemoryPlugin不读取AgentImage、Workspace文件或资源正文
     MemoryPlugin不决定上下文压缩时机，不生成摘要，不实现记忆检索或向量索引
+    history_messages面向客户端展示，realtime_messages面向模型上下文恢复，两者不可互相替代
 ```
 
 ## 持有关系

@@ -12,3 +12,6 @@ tool_definition_plugins/
 ```
 
 目录本身不是一个总控Plugin，也不拥有统一资源注册表。新增工具定义提供方时增加同级目录即可。
+
+当前 SkillPlugin 已实现 `SKILL.md` 的三层查找与 Tool 响应；WorkflowPlugin 只注册可解析的占位 Tool，
+不读取或执行 Workflow 正文。
