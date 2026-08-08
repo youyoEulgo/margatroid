@@ -240,9 +240,15 @@ pub enum MessageIntent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentReference {
+    Entity(Entity),
+    Id(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentMessage {
     pub id: String,
-    pub agent: Entity,
+    pub agent: AgentReference,
     pub message: Message,
     pub intent: MessageIntent,
 }

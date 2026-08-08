@@ -210,6 +210,7 @@ PendingWorkspace：未完成Workspace操作，私有结构体--暂存跨多个�
 
 PreparedWorkspaceAgent：单Agent实例材料，私有结构体--创建Agent Entity前收集完整依赖
     name: String--Agent逻辑名称
+    agent_id: String--Workspace生成的稳定Agent ID，例如<workspace>.<name><index>
     system_prompt: String--从AgentImage Soul取得的系统提示词
     messages: Vec<Message>--MemoryPlugin恢复的实时上下文
     default_visibility: BTreeSet<ResourceRef>--镜像默认值与Workspace参数合并后的资源集合，交给AgentPlugin构造只读组件
@@ -276,9 +277,9 @@ prepare_workspace_agents(world: &mut World, request_id: &str) -> Result<(), Work
         收集Soul、default_visibility和恢复上下文
         构造PreparedWorkspaceAgent并保存到pending.prepared
         任一步失败时释放已打开AgentMemory并返回错误，不发送部分Agent创建事件
-        全部Agent准备成功后为每个Agent生成独立创建子请求ID
+        全部Agent准备成功后为每个Agent生成稳定Agent ID和独立创建子请求ID
         保存agent_requests[子请求ID] = (Workspace请求ID, Agent名称)
-        发送AgentCreateRequest { id, workspace_id, system_prompt, messages, default_visibility }
+        发送AgentCreateRequest { id, agent_id, workspace_id, system_prompt, messages, default_visibility }
         AgentCreateRequest只交付AgentPlugin自有字段，不携带Memory、Inference或Tool组件
 
 collect_agent_created_system(world: &mut World)

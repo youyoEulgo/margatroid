@@ -15,6 +15,7 @@ fn documented_public_api_creates_an_agent() {
     let workspace = app.world_mut().spawn();
     app.world().send_event(AgentCreateRequest {
         id: "agent-1".into(),
+        agent_id: "test.agent0".into(),
         workspace_id: workspace,
         system_prompt: "You are concise.".into(),
         messages: Vec::new(),

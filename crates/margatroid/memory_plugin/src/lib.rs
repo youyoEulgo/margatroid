@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use app_runtime_plugin::RuntimePlugin;
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use margatroid_types::{
-    AgentContextMessagesUpdated, AgentMessage, AgentResourcesUsed, Message, MessageResource,
-    ResourceRef,
+    AgentContextMessagesUpdated, AgentMessage, AgentReference, AgentResourcesUsed, Message,
+    MessageResource, ResourceRef,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
@@ -249,20 +249,24 @@ impl WorldMemoryExt for World {
             ));
         }
         require_plugin(self)?;
-        if !self.is_alive(event.agent) {
+        let AgentReference::Entity(agent) = event.agent else {
+            return Err(MemoryError::new(
+                MemoryErrorKind::AgentNotAlive,
+                "agent reference must be resolved before memory access",
+            ));
+        };
+        if !self.is_alive(agent) {
             return Err(MemoryError::new(
                 MemoryErrorKind::AgentNotAlive,
                 "agent entity is not alive",
             ));
         }
-        let memory = self
-            .get_component::<AgentMemory>(event.agent)
-            .ok_or_else(|| {
-                MemoryError::new(
-                    MemoryErrorKind::AgentMemoryMissing,
-                    "agent does not have memory",
-                )
-            })?;
+        let memory = self.get_component::<AgentMemory>(agent).ok_or_else(|| {
+            MemoryError::new(
+                MemoryErrorKind::AgentMemoryMissing,
+                "agent does not have memory",
+            )
+        })?;
         let mut connection = lock_connection(memory)?;
         let transaction = connection.transaction().map_err(write_error)?;
         insert_history_message(&transaction, event, current_unix_milliseconds()?)?;
@@ -636,7 +640,7 @@ mod tests {
     fn user_event(agent: Entity, id: &str) -> AgentMessage {
         AgentMessage {
             id: id.into(),
-            agent,
+            agent: AgentReference::Entity(agent),
             message: Message::User {
                 content: "hello".into(),
             },
@@ -678,7 +682,7 @@ mod tests {
         app.world_mut()
             .append_history_message(&AgentMessage {
                 id: "turn-1".into(),
-                agent,
+                agent: AgentReference::Entity(agent),
                 message: Message::Tool {
                     tool_call_id: "call-1".into(),
                     content: "tool output".into(),

@@ -8,6 +8,7 @@ name = "margatroid-daemon"
 path = "src/main.rs"
 
 [dependencies]
+api_integration_plugin = { path = "../../crates/margatroid/api_integration_plugin" }
 api_plugin = { path = "../../crates/margatroid/api_plugin" }
 agent_image_loader_plugin = { path = "../../crates/margatroid/agent_image_loader_plugin" }
 agent_plugin = { path = "../../crates/margatroid/agent_plugin" }
@@ -17,8 +18,6 @@ core_plugin = { path = "../../crates/mecs/core_plugin" }
 connection_plugin = { path = "../../crates/margatroid/connection_plugin" }
 inference_plugin = { path = "../../crates/margatroid/inference_plugin" }
 log_plugin = { path = "../../crates/mecs/log_plugin" }
-margatroid_protocol = { path = "../../crates/margatroid/protocol" }
-margatroid_types = { path = "../../crates/margatroid/types" }
 memory_plugin = { path = "../../crates/margatroid/memory_plugin" }
 server_plugin = { path = "../../crates/mecs/server_plugin" }
 skill_plugin = { path = "../../crates/margatroid/tool_definition_plugins/skill_plugin" }

@@ -1,7 +1,8 @@
 # Margatroid Daemon
 
-daemon 是 Margatroid 的产品组合根，负责安装运行时和业务 Plugin。ApiPlugin 处理 WebSocket API
-收发，ConnectionPlugin 管理客户端连接类型和名称。
+daemon 是 Margatroid 的产品组合根，只负责读取启动配置、安装 Plugin 并运行 App。ApiPlugin 处理
+WebSocket API 收发，ConnectionPlugin 管理客户端连接类型和名称，ApiIntegrationPlugin 负责 API
+事件与领域事件/状态之间的适配。
 
 启动：
 
@@ -40,8 +41,8 @@ agent.message--向已启动Workspace中的一个Agent发送用户消息
 ```
 
 `agent.message` 使用 Workspace 名称和项目根目录定位实例。请求带 Agent 名称时投递给该成员；
-省略 Agent 时查询 Workspace 的 manager。daemon 只把请求转换成内部 `AgentMessage`，消息上下文、
-工具调用和推理由对应 Plugin 继续处理。
+省略 Agent 时查询 Workspace 的 manager。ApiIntegrationPlugin 把请求转换成内部 `AgentMessage`，
+消息上下文、工具调用和推理由对应 Plugin 继续处理。
 
 AgentPlugin 在消息处理或可见工具准备失败时发送 `agent.failure(kind=Agent)`；InferencePlugin 的请求
 失败使用 `kind=Inference`。两者都会进入前端 Activity，不会伪造成对话历史。

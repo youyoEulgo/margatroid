@@ -2,9 +2,11 @@
 
 `AgentPlugin`只拥有Agent实例的Workspace关联、上下文、默认/动态可见性和轮次状态。它消费
 `AgentCreateRequest`创建Agent自身组件，再发布`AgentCreated`，由WorkspacePlugin按请求ID绑定
+其他组件。每个实例同时挂载`AgentIdentity`，保存Workspace生成的稳定Agent ID，例如`demo.coder0`。
 Memory、Inference和Tool组件。
 
-User和Assistant消息进入`AgentContext`前先通过MemoryPlugin追加历史；Tool响应只进入上下文和实时
+`AgentMessage.agent`可以是稳定`AgentReference::Id`或已解析的`AgentReference::Entity`。AgentPlugin
+在消息处理入口将ID解析为Entity；User和Assistant消息进入`AgentContext`前先通过MemoryPlugin追加历史；Tool响应只进入上下文和实时
 表，不进入历史。一个工具批次的全部调用ID保存在`AgentStatus`，只有最后一个响应到达后才发送
 下一次推理请求。
 

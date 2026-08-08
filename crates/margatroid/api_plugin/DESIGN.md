@@ -158,7 +158,7 @@ ApiPlugin不负责：
     请求字段的语义校验
     Workspace和Agent逻辑身份到Entity的解析
     manager路由
-    生成ServerEvent承载的业务数据
+    生成ServerEvent承载的业务数据，由ApiIntegrationPlugin负责
     Workspace、Agent、Memory、Inference、Tool、Skill和Workflow业务
     读取Workspace文件、SQLite或任何资源正文
     流式WebSocket消息
