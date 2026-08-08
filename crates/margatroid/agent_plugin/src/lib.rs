@@ -4,8 +4,8 @@ use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, World
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::InferenceCommand;
 use margatroid_types::{
-    AgentContextMessagesUpdated, AgentFailure, AgentFailureKind, AgentMessage, Message,
-    MessageIntent, ResourceRef, ToolCall, ToolDefinition,
+    AgentContextMessagesUpdated, AgentFailure, AgentFailureKind, AgentMessage, AgentReference,
+    Message, MessageIntent, ResourceRef, ToolCall, ToolDefinition,
 };
 use memory_plugin::{AgentMemoryWriteFailed, MemoryError, WorldMemoryExt};
 use tool_plugin::{ToolCallRequest, ToolError, ToolErrorKind, WorldToolExt};
@@ -58,6 +58,7 @@ impl Plugin for AgentPlugin {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentCreateRequest {
     pub id: String,
+    pub agent_id: String,
     pub workspace_id: Entity,
     pub system_prompt: String,
     pub messages: Vec<Message>,
@@ -73,6 +74,18 @@ pub struct AgentCreated {
 }
 
 impl Event for AgentCreated {}
+
+pub struct AgentIdentity {
+    id: String,
+}
+
+impl AgentIdentity {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Component for AgentIdentity {}
 
 pub struct AgentWorkspaceId {
     workspace_id: Entity,
@@ -265,6 +278,7 @@ fn agent_create_system(world: &mut World) {
 
     for request in requests {
         if request.id.is_empty()
+            || request.agent_id.is_empty()
             || !world.is_alive(request.workspace_id)
             || request
                 .messages
@@ -275,6 +289,12 @@ fn agent_create_system(world: &mut World) {
         }
         let dynamic_visibility = request.default_visibility.clone();
         let agent = world.spawn();
+        assert!(world.insert_component(
+            agent,
+            AgentIdentity {
+                id: request.agent_id,
+            },
+        ));
         assert!(world.insert_component(
             agent,
             AgentWorkspaceId {
@@ -317,18 +337,21 @@ fn agent_message_system(world: &mut World) {
     let events = world.event_sender();
 
     for message in messages {
-        match handle_message(world, &message, &events) {
+        let Some(agent) = resolve_agent(world, &message.agent) else {
+            tracing::warn!(id = %message.id, "AgentMessage agent reference could not be resolved");
+            continue;
+        };
+        let mut resolved = message;
+        resolved.agent = AgentReference::Entity(agent);
+        match handle_message(world, agent, &resolved, &events) {
             Ok(()) => {}
             Err(AgentStepError::Memory(error)) => {
-                events.send_event(AgentMemoryWriteFailed {
-                    agent: message.agent,
-                    error,
-                });
+                events.send_event(AgentMemoryWriteFailed { agent, error });
             }
             Err(error) => {
                 events.send_event(AgentFailure {
-                    id: message.id.clone(),
-                    agent: message.agent,
+                    id: resolved.id.clone(),
+                    agent,
                     kind: AgentFailureKind::Agent,
                     message: error.failure_message(),
                 });
@@ -337,8 +360,25 @@ fn agent_message_system(world: &mut World) {
     }
 }
 
+fn resolve_agent(world: &World, reference: &AgentReference) -> Option<Entity> {
+    match reference {
+        AgentReference::Entity(entity) if world.is_alive(*entity) => Some(*entity),
+        AgentReference::Entity(_) => None,
+        AgentReference::Id(id) => world
+            .query_with::<AgentIdentity>()
+            .result()
+            .into_iter()
+            .find(|entity| {
+                world
+                    .get_component::<AgentIdentity>(*entity)
+                    .is_some_and(|identity| identity.id() == id)
+            }),
+    }
+}
+
 fn handle_message(
     world: &mut World,
+    agent: Entity,
     event: &AgentMessage,
     events: &RuntimeEventSender,
 ) -> Result<(), AgentStepError> {
@@ -346,35 +386,35 @@ fn handle_message(
     match (&event.intent, &event.message) {
         (MessageIntent::ResolveToolCall, Message::Tool { tool_call_id, .. }) => {
             let accepts_response = world
-                .get_component::<AgentStatus>(event.agent)
+                .get_component::<AgentStatus>(agent)
                 .ok_or(AgentStepError::StatusMissing)?
                 .accepts_tool_response(&event.id, tool_call_id);
             if !accepts_response {
                 return Err(AgentStepError::InvalidToolBatch);
             }
-            record_message(world, event, events)?;
+            record_message(world, agent, event, events)?;
             let is_last_response = world
-                .get_component_mut::<AgentStatus>(event.agent)
+                .get_component_mut::<AgentStatus>(agent)
                 .ok_or(AgentStepError::StatusMissing)?
                 .complete_tool_response(&event.id, tool_call_id);
             if is_last_response {
-                send_inference_command(world, &event.id, event.agent, events)?;
+                send_inference_command(world, &event.id, agent, events)?;
             }
         }
         (MessageIntent::CompleteTurn, Message::Assistant { .. }) => {
-            record_message(world, event, events)?;
+            record_message(world, agent, event, events)?;
         }
         (MessageIntent::UserWithToolCalls { tool_calls }, Message::User { .. }) => {
-            record_message(world, event, events)?;
-            dispatch_tool_calls(world, &event.id, event.agent, tool_calls, events)?;
+            record_message(world, agent, event, events)?;
+            dispatch_tool_calls(world, &event.id, agent, tool_calls, events)?;
         }
         (MessageIntent::DispatchToolCalls, Message::Assistant { tool_calls, .. }) => {
-            record_message(world, event, events)?;
-            dispatch_tool_calls(world, &event.id, event.agent, tool_calls, events)?;
+            record_message(world, agent, event, events)?;
+            dispatch_tool_calls(world, &event.id, agent, tool_calls, events)?;
         }
         (MessageIntent::UserWithoutToolCalls, Message::User { .. }) => {
-            record_message(world, event, events)?;
-            send_inference_command(world, &event.id, event.agent, events)?;
+            record_message(world, agent, event, events)?;
+            send_inference_command(world, &event.id, agent, events)?;
         }
         _ => return Err(AgentStepError::InvalidMessage),
     }
@@ -383,26 +423,30 @@ fn handle_message(
 
 fn record_message(
     world: &mut World,
+    agent: Entity,
     event: &AgentMessage,
     events: &RuntimeEventSender,
 ) -> Result<(), AgentStepError> {
-    if !world.is_alive(event.agent) {
+    if !world.is_alive(agent) {
         return Err(AgentStepError::AgentMissing);
     }
-    if world.get_component::<AgentContext>(event.agent).is_none() {
+    if world.get_component::<AgentContext>(agent).is_none() {
         return Err(AgentStepError::ContextMissing);
     }
     match event.message {
         Message::User { .. } | Message::Assistant { .. } => world
-            .append_history_message(event)
+            .append_history_message(&AgentMessage {
+                agent: AgentReference::Entity(agent),
+                ..event.clone()
+            })
             .map_err(AgentStepError::Memory)?,
         Message::Tool { .. } => {}
         Message::System { .. } => return Err(AgentStepError::InvalidMessage),
     }
     world
-        .get_component_mut::<AgentContext>(event.agent)
+        .get_component_mut::<AgentContext>(agent)
         .expect("AgentContext existence was checked")
-        .append_message(event.agent, event.message.clone(), events);
+        .append_message(agent, event.message.clone(), events);
     Ok(())
 }
 
@@ -573,6 +617,7 @@ mod tests {
         let workspace = app.world_mut().spawn();
         app.world().send_event(AgentCreateRequest {
             id: "agent-1".into(),
+            agent_id: "test.agent0".into(),
             workspace_id: workspace,
             system_prompt: "system".into(),
             messages: Vec::new(),
@@ -650,7 +695,7 @@ mod tests {
         let agent = create_agent(&mut app, [missing].into_iter().collect());
         app.world().send_event(AgentMessage {
             id: "turn-1".into(),
-            agent,
+            agent: AgentReference::Id("test.agent0".into()),
             message: Message::User {
                 content: "hello".into(),
             },
@@ -680,7 +725,7 @@ mod tests {
         let agent = create_agent(&mut app, BTreeSet::new());
         app.world().send_event(AgentMessage {
             id: "turn-1".into(),
-            agent,
+            agent: AgentReference::Id("test.agent0".into()),
             message: Message::User {
                 content: "hello".into(),
             },
@@ -722,7 +767,7 @@ mod tests {
         );
         app.world().send_event(AgentMessage {
             id: "turn-1".into(),
-            agent,
+            agent: AgentReference::Entity(agent),
             message: Message::User {
                 content: "use both".into(),
             },

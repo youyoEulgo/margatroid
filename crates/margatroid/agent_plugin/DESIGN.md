@@ -49,6 +49,7 @@ AgentPlugin：Agent实例与消息循环插件，公开结构体--安装创建�
 
 AgentCreateRequest：Agent创建请求，公开事件--WorkspacePlugin交付创建实例所需的Agent自有字段
     id: String--Workspace生成的创建子请求ID
+    agent_id: String--Workspace生成的稳定Agent逻辑ID，例如demo.coder0
     workspace_id: Entity--Agent所属Workspace Entity
     system_prompt: String--当前系统提示词
     messages: Vec<margatroid_types::Message>--恢复出的动态上下文，不包含System Message
@@ -65,6 +66,13 @@ AgentCreated：Agent创建完成回执，公开事件--把创建子请求与新E
         Event：公开trait实现
     impl Clone for AgentCreated
         Clone：公开trait实现
+
+AgentIdentity：Agent稳定身份，公开组件--保存跨Plugin和跨进程使用的逻辑Agent ID
+    id: String--唯一Agent ID，例如demo.coder0，私有
+    id(&self) -> &str
+        取得Agent ID：公开方法，返回稳定逻辑ID
+    impl Component for AgentIdentity
+        Component：公开trait实现
 
 AgentWorkspaceId：Agent所属Workspace标识，公开组件
     workspace_id: Entity--Workspace Entity，私有
@@ -139,21 +147,27 @@ agent_create_system(world: &mut World)
     创建Agent：读取AgentCreateRequest并创建Agent Entity
     行为：
         收集当前全部请求
-        要求id非空、workspace_id存活且messages不包含System
-        创建Entity并插入AgentWorkspaceId、AgentContext、两层Visibility和AgentStatus
+        要求id、agent_id非空、workspace_id存活且messages不包含System
+        创建Entity并插入AgentIdentity、AgentWorkspaceId、AgentContext、两层Visibility和AgentStatus
         AgentDynamicVisibility初始完整复制AgentDefaultVisibility
         发送AgentCreated { id, agent }
         不读取Workspace、AgentImage或磁盘，不挂载其他Plugin拥有的组件
 
 agent_message_system(world: &mut World)
-    处理Agent消息：读取统一AgentMessage并调用handle_message
+    处理Agent消息：读取统一AgentMessage，解析AgentReference后调用handle_message
     行为：
+        AgentReference::Entity直接使用Entity
+        AgentReference::Id调用find_agent_by_id查找AgentIdentity
+        引用无法解析时发送AgentFailure并结束当前事件
         Memory错误发送AgentMemoryWriteFailed
         其他错误发送AgentFailure { kind: Agent, id, agent, message }
         失败不伪造Assistant或Tool消息，不继续当前事件后续步骤
 
-handle_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender)
-    处理单条消息：先验证MessageIntent与Message类型组合，再记录消息并进入分支
+find_agent_by_id(world: &World, id: &str) -> Option<Entity>
+    按ID查找Agent：私有函数，遍历存活Entity并匹配AgentIdentity.id
+
+handle_message(world: &mut World, agent: Entity, event: &AgentMessage, events: &RuntimeEventSender)
+    处理单条消息：使用已解析Entity，先验证MessageIntent与Message类型组合，再记录消息并进入分支
     行为：
         UserWithToolCalls只接受User，记录后派发指定工具批次
         UserWithoutToolCalls只接受User，记录后发送InferenceCommand
@@ -212,14 +226,17 @@ validate_message_intent(event: &AgentMessage)
 
 ```text
 创建：
-    WorkspacePlugin发送AgentCreateRequest { id, workspace_id, system_prompt, messages, default_visibility }
+    WorkspacePlugin发送AgentCreateRequest { id, agent_id, workspace_id, system_prompt, messages, default_visibility }
         -> agent_create_system创建Agent自有组件
+        -> 插入AgentIdentity { id: agent_id }
         -> 发送AgentCreated { id, agent }
         -> WorkspacePlugin按id取回PreparedWorkspaceAgent
         -> WorkspacePlugin绑定AgentMemory、AgentInferenceSnapshot和AgentToolEnvironment
 
 普通用户消息：
-    AgentMessage { User, UserWithoutToolCalls }
+    AgentMessage { agent: Id("demo.coder0"), User, UserWithoutToolCalls }
+        -> AgentPlugin按AgentIdentity解析为Entity
+        -> 使用解析后的Entity处理消息
         -> history_messages追加User
         -> AgentContext追加User并通知MemoryPlugin重写realtime_messages
         -> 当前AgentDynamicVisibility逐项构造ToolDefinition
@@ -232,7 +249,7 @@ validate_message_intent(event: &AgentMessage)
         -> AgentStatus记录全部待完成ToolCall ID
         -> 逐个发送ToolCallRequest
 
-    每个Tool响应发送AgentMessage { Tool, ResolveToolCall }
+    每个Tool响应发送AgentMessage { agent: Entity(agent), Tool, ResolveToolCall }
         -> 验证turn id与tool_call_id属于当前批次
         -> Tool只进入AgentContext和realtime_messages，不进入history_messages
         -> 从AgentStatus移除tool_call_id

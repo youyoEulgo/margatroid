@@ -1,0 +1,33 @@
+use api_integration_plugin::ApiIntegrationPlugin;
+use api_plugin::{WebSocketMessageSend, WebSocketMessageTarget};
+use app_runtime_plugin::RuntimePlugin;
+use async_runtime_plugin::AsyncRuntimePlugin;
+use core_plugin::App;
+use log_plugin::LogPlugin;
+use margatroid_protocol::ServerEvent;
+
+#[test]
+fn documented_public_api_publishes_state_for_the_configured_frontend_type() {
+    let mut app = App::new();
+    app.add_plugin(RuntimePlugin::default())
+        .add_plugin(AsyncRuntimePlugin)
+        .add_plugin(LogPlugin::default().without_console().with_stream(8))
+        .add_plugin(ApiIntegrationPlugin::default().with_frontend_type("browser"));
+
+    app.tick();
+    app.tick();
+
+    let messages = app
+        .world()
+        .event_reader::<WebSocketMessageSend>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert!(messages.iter().any(|message| {
+        message.target == WebSocketMessageTarget::Type("browser".into())
+            && matches!(
+                &message.message,
+                ServerEvent::StateSync { state }
+                    if state.workspaces.is_empty() && state.histories.is_empty()
+            )
+    }));
+}

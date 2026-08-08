@@ -1,7 +1,8 @@
 # WorkspacePlugin
 
 `WorkspacePlugin`接收Compose生成的`WorkspaceDefinition`，从AgentImage、Inference、Memory和Tool
-插件收集创建材料，再通过`AgentCreateRequest`创建Workspace中的全部Agent实例。
+插件收集创建材料，再通过`AgentCreateRequest`创建Workspace中的全部Agent实例。每个实例同时获得
+Workspace范围内唯一的稳定ID，例如`demo.coder0`；该ID用于跨Plugin和API引用，ECS Entity只在后端内部使用。
 
 Workspace只有在全部Agent完成创建和组件绑定后才会加入查询索引并挂载`WorkspaceAgents`。
 启动中的临时状态只保存在插件内部；关闭时同步移除索引并释放Workspace拥有的Agent Entity。

@@ -344,6 +344,7 @@ struct PendingWorkspace {
 
 struct PreparedWorkspaceAgent {
     name: String,
+    agent_id: String,
     system_prompt: String,
     messages: Vec<Message>,
     default_visibility: BTreeSet<ResourceRef>,
@@ -635,7 +636,7 @@ fn prepare_workspace_agents(world: &mut World, request_id: &str) -> Result<(), W
     };
 
     let mut prepared = BTreeMap::new();
-    for agent_definition in &definition.agents {
+    for (index, agent_definition) in definition.agents.iter().enumerate() {
         let image = images.get(&agent_definition.name).copied().ok_or_else(|| {
             WorkspaceError::new(
                 WorkspaceErrorKind::AgentImageComponentsMissing,
@@ -700,6 +701,7 @@ fn prepare_workspace_agents(world: &mut World, request_id: &str) -> Result<(), W
             agent_definition.name.clone(),
             PreparedWorkspaceAgent {
                 name: agent_definition.name.clone(),
+                agent_id: format!("{}.{}{}", definition.name, agent_definition.name, index),
                 system_prompt,
                 messages,
                 default_visibility,
@@ -723,6 +725,7 @@ fn prepare_workspace_agents(world: &mut World, request_id: &str) -> Result<(), W
                 prepared.name.clone(),
                 AgentCreateRequest {
                     id: format!("{request_id}/agent/{index}"),
+                    agent_id: prepared.agent_id.clone(),
                     workspace_id: workspace,
                     system_prompt: prepared.system_prompt.clone(),
                     messages: prepared.messages.clone(),

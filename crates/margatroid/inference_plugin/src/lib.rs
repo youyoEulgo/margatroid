@@ -12,7 +12,8 @@ use async_runtime_plugin::{
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use futures_util::{FutureExt, StreamExt};
 use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentMessage, Message, MessageIntent, ToolCall, ToolDefinition,
+    AgentFailure, AgentFailureKind, AgentMessage, AgentReference, Message, MessageIntent, ToolCall,
+    ToolDefinition,
 };
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Method, StatusCode, Url};
@@ -1193,7 +1194,7 @@ fn publish_inference_output_system(world: &mut World) {
                     };
                     events.send_event(AgentMessage {
                         id: output.route.id.clone(),
-                        agent: output.route.agent,
+                        agent: AgentReference::Entity(output.route.agent),
                         message: response.message.clone(),
                         intent,
                     });
