@@ -10,3 +10,6 @@ User和Assistant消息进入`AgentContext`前先通过MemoryPlugin追加历史�
 
 每次推理请求都根据`AgentDynamicVisibility`重新构造工具定义。工具名称到`ResourceRef`的映射只在
 当前请求处理期间存在，不保存为Agent组件，也不承担权限检查。
+
+Memory写入失败继续使用`AgentMemoryWriteFailed`；其他消息处理或工具定义准备错误统一发送
+`AgentFailure { kind: Agent }`，不再静默丢弃，也不伪造成Assistant或Tool消息。

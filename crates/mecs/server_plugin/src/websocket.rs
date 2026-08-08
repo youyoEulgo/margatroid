@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -308,6 +308,7 @@ impl WebSocketSender {
 
 struct WebSocketConnectionEntry {
     name: String,
+    connection_type: String,
     sender: WebSocketSender,
 }
 
@@ -315,6 +316,7 @@ struct WebSocketConnectionEntry {
 struct WebSocketConnectionsState {
     by_id: HashMap<WebSocketConnectionId, WebSocketConnectionEntry>,
     by_name: HashMap<String, WebSocketConnectionId>,
+    by_type: HashMap<String, HashSet<WebSocketConnectionId>>,
 }
 
 #[derive(Clone)]
@@ -362,6 +364,52 @@ impl WebSocketConnections {
             .and_then(|entry| (!entry.name.is_empty()).then(|| entry.name.clone()))
     }
 
+    pub fn connection_type(&self, connection_id: WebSocketConnectionId) -> Option<String> {
+        self.state
+            .read()
+            .expect("WebSocket connection registry lock poisoned")
+            .by_id
+            .get(&connection_id)
+            .and_then(|entry| {
+                (!entry.connection_type.is_empty()).then(|| entry.connection_type.clone())
+            })
+    }
+
+    pub fn set_connection_type(
+        &self,
+        connection_id: WebSocketConnectionId,
+        connection_type: impl Into<String>,
+    ) -> bool {
+        let connection_type = connection_type.into();
+        let mut state = self
+            .state
+            .write()
+            .expect("WebSocket connection registry lock poisoned");
+        let old_type = match state.by_id.get(&connection_id) {
+            Some(entry) => entry.connection_type.clone(),
+            None => return false,
+        };
+        if old_type == connection_type {
+            return true;
+        }
+        if !old_type.is_empty() {
+            remove_type_index(&mut state, &old_type, connection_id);
+        }
+        state
+            .by_id
+            .get_mut(&connection_id)
+            .expect("WebSocket connection disappeared while registry was write locked")
+            .connection_type = connection_type.clone();
+        if !connection_type.is_empty() {
+            state
+                .by_type
+                .entry(connection_type)
+                .or_default()
+                .insert(connection_id);
+        }
+        true
+    }
+
     pub fn set_name(
         &self,
         connection_id: WebSocketConnectionId,
@@ -402,7 +450,34 @@ impl WebSocketConnections {
         Ok(())
     }
 
-    pub fn unnamed(&self) -> Vec<WebSocketSender> {
+    pub fn get_all(&self) -> Vec<WebSocketSender> {
+        self.state
+            .read()
+            .expect("WebSocket connection registry lock poisoned")
+            .by_id
+            .values()
+            .map(|entry| entry.sender.clone())
+            .collect()
+    }
+
+    pub fn get_by_type(&self, connection_type: &str) -> Vec<WebSocketSender> {
+        if connection_type.is_empty() {
+            return Vec::new();
+        }
+        let state = self
+            .state
+            .read()
+            .expect("WebSocket connection registry lock poisoned");
+        state
+            .by_type
+            .get(connection_type)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+            .filter_map(|id| state.by_id.get(id).map(|entry| entry.sender.clone()))
+            .collect()
+    }
+
+    pub fn get_unnamed(&self) -> Vec<WebSocketSender> {
         self.state
             .read()
             .expect("WebSocket connection registry lock poisoned")
@@ -428,6 +503,7 @@ impl WebSocketConnections {
             connection_id,
             WebSocketConnectionEntry {
                 name: String::new(),
+                connection_type: String::new(),
                 sender,
             },
         );
@@ -444,6 +520,27 @@ impl WebSocketConnections {
         if !entry.name.is_empty() {
             state.by_name.remove(&entry.name);
         }
+        if !entry.connection_type.is_empty() {
+            remove_type_index(&mut state, &entry.connection_type, connection_id);
+        }
+    }
+}
+
+fn remove_type_index(
+    state: &mut WebSocketConnectionsState,
+    connection_type: &str,
+    connection_id: WebSocketConnectionId,
+) {
+    let remove_type = state
+        .by_type
+        .get_mut(connection_type)
+        .map(|ids| {
+            ids.remove(&connection_id);
+            ids.is_empty()
+        })
+        .unwrap_or(false);
+    if remove_type {
+        state.by_type.remove(connection_type);
     }
 }
 
@@ -662,7 +759,7 @@ mod tests {
         connections.insert(first.clone());
         connections.insert(second.clone());
 
-        assert_eq!(connections.unnamed().len(), 2);
+        assert_eq!(connections.get_unnamed().len(), 2);
         connections
             .set_name(first.connection_id(), "frontend")
             .unwrap();
@@ -674,7 +771,7 @@ mod tests {
             connections.get_by_name("frontend").unwrap().connection_id(),
             first.connection_id()
         );
-        let unnamed = connections.unnamed();
+        let unnamed = connections.get_unnamed();
         assert_eq!(unnamed.len(), 1);
         assert_eq!(unnamed[0].connection_id(), second.connection_id());
         assert!(matches!(
@@ -684,10 +781,10 @@ mod tests {
 
         connections.set_name(first.connection_id(), "").unwrap();
         assert!(connections.get_by_name("frontend").is_none());
-        assert_eq!(connections.unnamed().len(), 2);
+        assert_eq!(connections.get_unnamed().len(), 2);
         connections.remove(first.connection_id());
         assert!(connections.get(first.connection_id()).is_none());
-        let unnamed = connections.unnamed();
+        let unnamed = connections.get_unnamed();
         assert_eq!(unnamed.len(), 1);
         assert_eq!(unnamed[0].connection_id(), second.connection_id());
     }
@@ -703,6 +800,37 @@ mod tests {
                 connection_id: missing_id
             }) if missing_id == connection_id
         ));
+    }
+
+    #[test]
+    fn connection_registry_indexes_senders_by_type() {
+        let connections = WebSocketConnections::new();
+        let first = sender(1);
+        let second = sender(2);
+        connections.insert(first.clone());
+        connections.insert(second.clone());
+
+        assert_eq!(connections.get_all().len(), 2);
+        assert!(connections.set_connection_type(first.connection_id(), "webui"));
+        assert!(connections.set_connection_type(second.connection_id(), "cli"));
+        assert_eq!(
+            connections
+                .connection_type(first.connection_id())
+                .as_deref(),
+            Some("webui")
+        );
+        let webui = connections.get_by_type("webui");
+        assert_eq!(webui.len(), 1);
+        assert_eq!(webui[0].connection_id(), first.connection_id());
+
+        assert!(connections.set_connection_type(first.connection_id(), "cli"));
+        assert!(connections.get_by_type("webui").is_empty());
+        assert_eq!(connections.get_by_type("cli").len(), 2);
+
+        connections.remove(first.connection_id());
+        let cli = connections.get_by_type("cli");
+        assert_eq!(cli.len(), 1);
+        assert_eq!(cli[0].connection_id(), second.connection_id());
     }
 
     #[tokio::test]

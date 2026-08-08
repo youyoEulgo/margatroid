@@ -135,6 +135,7 @@ fn documented_public_api_starts_queries_reloads_and_stops_workspace() {
         app.world().workspace(project.path(), "demo"),
         Some(workspace)
     );
+    assert_eq!(app.world().workspaces(), vec![workspace]);
     let manager = app.world().workspace_manager(workspace).unwrap();
     assert_eq!(
         app.world().workspace_agent(workspace, "manager"),
@@ -191,6 +192,7 @@ fn documented_public_api_starts_queries_reloads_and_stops_workspace() {
     wait_stop(&mut app, "stop-1", reloaded).unwrap();
     assert!(!app.world().is_alive(reloaded));
     assert!(app.world().workspace(project.path(), "demo").is_none());
+    assert!(app.world().workspaces().is_empty());
 
     let _ = fs::remove_dir_all(library);
 }

@@ -18,6 +18,7 @@ ws://127.0.0.1:3939/ws
 读取 Workspace 文件
 -> Compose::compile
 -> margatroid_protocol::ClientRequest::WorkspaceStart
+-> WebSocket 发送 connection.register(client_type=cli)
 -> WebSocket 发送 workspace.start
 -> 持续接收并打印后端消息
 ~~~

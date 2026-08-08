@@ -251,6 +251,7 @@ impl Event for AgentMessage {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentFailureKind {
+    Agent,
     Inference,
 }
 

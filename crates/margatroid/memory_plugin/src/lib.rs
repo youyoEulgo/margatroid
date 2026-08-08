@@ -129,6 +129,15 @@ pub struct AgentMemory {
     connection: Mutex<Connection>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryMessage {
+    pub sequence: i64,
+    pub turn_id: String,
+    pub message: Message,
+    pub resources: Vec<MessageResource>,
+    pub created_at_ms: i64,
+}
+
 impl AgentMemory {
     pub fn open(path: impl Into<PathBuf>) -> Result<(Self, Vec<Message>), MemoryError> {
         let path = path.into();
@@ -164,6 +173,11 @@ impl AgentMemory {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn history_messages(&self) -> Result<Vec<HistoryMessage>, MemoryError> {
+        let connection = lock_connection(self)?;
+        load_history_messages(&connection)
     }
 }
 
@@ -295,6 +309,62 @@ fn initialize_schema(connection: &Connection) -> Result<(), MemoryError> {
             "memory database schema could not be initialized",
         )
     })
+}
+
+fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>, MemoryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, turn_id, role, message, resources, created_at_ms
+             FROM history_messages ORDER BY sequence ASC",
+        )
+        .map_err(read_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(read_error)?;
+    let mut messages = Vec::new();
+    for row in rows {
+        let (sequence, turn_id, role, encoded_message, encoded_resources, created_at_ms) =
+            row.map_err(read_error)?;
+        let message = serde_json::from_str::<Message>(&encoded_message).map_err(|_| {
+            MemoryError::new(
+                MemoryErrorKind::DecodeFailed,
+                "history message JSON could not be decoded",
+            )
+        })?;
+        if !matches!(
+            (role.as_str(), &message),
+            ("user", Message::User { .. }) | ("assistant", Message::Assistant { .. })
+        ) {
+            return Err(MemoryError::new(
+                MemoryErrorKind::DecodeFailed,
+                "history message role does not match its message type",
+            ));
+        }
+        let resources =
+            serde_json::from_str::<Vec<MessageResource>>(&encoded_resources).map_err(|_| {
+                MemoryError::new(
+                    MemoryErrorKind::DecodeFailed,
+                    "history resource JSON could not be decoded",
+                )
+            })?;
+        messages.push(HistoryMessage {
+            sequence,
+            turn_id,
+            message,
+            resources,
+            created_at_ms,
+        });
+    }
+    Ok(messages)
 }
 
 fn load_realtime_messages(connection: &Connection) -> Result<Vec<Message>, MemoryError> {
@@ -667,7 +737,7 @@ mod tests {
         app.world().emit_event(AgentResourcesUsed {
             id: "turn-1".into(),
             agent,
-            resources: vec![resource.clone(), resource],
+            resources: vec![resource.clone(), resource.clone()],
         });
         app.tick();
 
@@ -679,6 +749,15 @@ mod tests {
             .unwrap();
         let resources: Vec<ResourceRef> = serde_json::from_str(&encoded).unwrap();
         assert_eq!(resources.len(), 1);
+
+        let memory = app.world().get_component::<AgentMemory>(agent).unwrap();
+        let history = memory.history_messages().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].sequence, 1);
+        assert_eq!(history[0].turn_id, "turn-1");
+        assert_eq!(history[0].resources, vec![resource]);
+        assert!(matches!(history[0].message, Message::User { .. }));
+        assert!(history[0].created_at_ms > 0);
     }
 
     #[test]

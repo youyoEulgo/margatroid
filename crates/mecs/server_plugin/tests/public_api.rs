@@ -219,7 +219,8 @@ fn websocket_message_is_delegated_and_can_be_answered() {
     loop {
         app.tick();
         let connections = app.world().get_resource::<WebSocketConnections>().unwrap();
-        if connections.get_by_name("echo-client").is_none() && connections.unnamed().is_empty() {
+        if connections.get_by_name("echo-client").is_none() && connections.get_unnamed().is_empty()
+        {
             break;
         }
         assert!(

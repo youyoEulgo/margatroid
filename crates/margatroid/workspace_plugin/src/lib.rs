@@ -233,6 +233,7 @@ pub trait WorldWorkspaceExt {
         definition: WorkspaceDefinition,
     );
     fn stop_workspace(&self, id: impl Into<String>, workspace: Entity);
+    fn workspaces(&self) -> Vec<Entity>;
     fn workspace(&self, project_root: &Path, name: &str) -> Option<Entity>;
     fn workspace_agent(&self, workspace: Entity, name: &str) -> Option<Entity>;
     fn workspace_manager(&self, workspace: Entity) -> Option<Entity>;
@@ -265,6 +266,19 @@ impl WorldWorkspaceExt for World {
             id: id.into(),
             workspace,
         });
+    }
+
+    fn workspaces(&self) -> Vec<Entity> {
+        self.get_resource::<WorkspaceRegistry>()
+            .map(|registry| {
+                registry
+                    .ready
+                    .values()
+                    .copied()
+                    .filter(|workspace| is_registered_workspace(self, *workspace))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn workspace(&self, project_root: &Path, name: &str) -> Option<Entity> {

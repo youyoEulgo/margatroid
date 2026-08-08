@@ -4,11 +4,11 @@ use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, World
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::InferenceCommand;
 use margatroid_types::{
-    AgentContextMessagesUpdated, AgentMessage, Message, MessageIntent, ResourceRef, ToolCall,
-    ToolDefinition,
+    AgentContextMessagesUpdated, AgentFailure, AgentFailureKind, AgentMessage, Message,
+    MessageIntent, ResourceRef, ToolCall, ToolDefinition,
 };
 use memory_plugin::{AgentMemoryWriteFailed, MemoryError, WorldMemoryExt};
-use tool_plugin::{ToolCallRequest, ToolError, WorldToolExt};
+use tool_plugin::{ToolCallRequest, ToolError, ToolErrorKind, WorldToolExt};
 
 pub struct AgentPlugin {
     schedule: String,
@@ -234,8 +234,25 @@ enum AgentStepError {
     StatusMissing,
     InvalidMessage,
     InvalidToolBatch,
-    Tool,
+    Tool(ToolError),
     DuplicateToolName,
+}
+
+impl AgentStepError {
+    fn failure_message(&self) -> String {
+        match self {
+            Self::Memory(error) => error.to_string(),
+            Self::AgentMissing => "AgentMissing: agent entity is not alive".into(),
+            Self::ContextMissing => "ContextMissing: agent context is missing".into(),
+            Self::StatusMissing => "StatusMissing: agent status is missing".into(),
+            Self::InvalidMessage => "InvalidMessage: message and intent do not match".into(),
+            Self::InvalidToolBatch => "InvalidToolBatch: tool call batch is invalid".into(),
+            Self::Tool(error) => error.to_string(),
+            Self::DuplicateToolName => {
+                "DuplicateToolName: visible resources expose the same tool name".into()
+            }
+        }
+    }
 }
 
 fn agent_create_system(world: &mut World) {
@@ -300,11 +317,22 @@ fn agent_message_system(world: &mut World) {
     let events = world.event_sender();
 
     for message in messages {
-        if let Err(AgentStepError::Memory(error)) = handle_message(world, &message, &events) {
-            events.send_event(AgentMemoryWriteFailed {
-                agent: message.agent,
-                error,
-            });
+        match handle_message(world, &message, &events) {
+            Ok(()) => {}
+            Err(AgentStepError::Memory(error)) => {
+                events.send_event(AgentMemoryWriteFailed {
+                    agent: message.agent,
+                    error,
+                });
+            }
+            Err(error) => {
+                events.send_event(AgentFailure {
+                    id: message.id.clone(),
+                    agent: message.agent,
+                    kind: AgentFailureKind::Agent,
+                    message: error.failure_message(),
+                });
+            }
         }
     }
 }
@@ -392,7 +420,12 @@ fn dispatch_tool_calls(
             let resource = available_tools
                 .resources_by_name
                 .get(&call.name)
-                .ok_or(AgentStepError::Tool)?;
+                .ok_or_else(|| {
+                    AgentStepError::Tool(ToolError::new(
+                        ToolErrorKind::InvalidRequest,
+                        "tool call name was not present in current tool definitions",
+                    ))
+                })?;
             Ok(ToolCallRequest {
                 id: id.to_owned(),
                 agent,
@@ -449,7 +482,7 @@ fn build_available_tools(world: &World, agent: Entity) -> Result<AvailableTools,
     for resource in resources {
         let tool = world
             .resolve_tool(agent, &resource)
-            .map_err(|_error: ToolError| AgentStepError::Tool)?;
+            .map_err(AgentStepError::Tool)?;
         if resources_by_name
             .insert(tool.definition().name.clone(), resource)
             .is_some()
@@ -607,6 +640,38 @@ mod tests {
             build_available_tools(app.world(), agent),
             Err(AgentStepError::DuplicateToolName)
         ));
+    }
+
+    #[test]
+    fn unavailable_visible_resource_emits_agent_failure() {
+        let mut app = test_app();
+        let missing =
+            ResourceRef::new("skill", ResourceName::new("local/missing").unwrap()).unwrap();
+        let agent = create_agent(&mut app, [missing].into_iter().collect());
+        app.world().send_event(AgentMessage {
+            id: "turn-1".into(),
+            agent,
+            message: Message::User {
+                content: "hello".into(),
+            },
+            intent: MessageIntent::UserWithoutToolCalls,
+        });
+        app.tick();
+        app.tick();
+
+        let failure = app
+            .world()
+            .event_reader::<AgentFailure>()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(failure.id, "turn-1");
+        assert_eq!(failure.agent, agent);
+        assert_eq!(failure.kind, AgentFailureKind::Agent);
+        assert_eq!(
+            failure.message,
+            "ProviderMissing: resource provider was not registered"
+        );
     }
 
     #[test]

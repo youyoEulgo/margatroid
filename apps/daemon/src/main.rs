@@ -6,23 +6,27 @@ use std::process;
 
 use agent_image_loader_plugin::AgentImageLoaderPlugin;
 use agent_plugin::AgentPlugin;
-use app_runtime_plugin::{AppRunExt, RuntimePlugin, WorldEventExt};
+use api_plugin::{
+    AgentMessageRequested, ApiPlugin, WebSocketMessageSend, WebSocketMessageTarget,
+    WorkspaceStartRequested,
+};
+use app_runtime_plugin::{AppRunExt, RuntimeEventSender, RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::{AsyncRuntimePlugin, WorldAsyncExt};
-use core_plugin::{App, Event, World};
+use connection_plugin::ConnectionPlugin;
+use core_plugin::{App, World};
 use inference_plugin::InferencePlugin;
 use log_plugin::{LogPlugin, TracingRecord, TracingStream, TracingStreamError};
 use margatroid_protocol::{
-    AgentFailureDto, AgentMessageDto, ClientRequest, LogFieldDto, LogRecordDto, ServerEvent,
-    WorkspaceInfoDto,
+    AgentFailureDto, AgentHistoryDto, AgentMessageDto, BackendStateDto, HistoryMessageDto,
+    LogFieldDto, LogRecordDto, ResourceRefDto, ServerEvent, WorkspaceInfoDto,
 };
 use margatroid_types::{AgentFailure, AgentMessage as DomainAgentMessage, Message, MessageIntent};
-use memory_plugin::MemoryPlugin;
-use server_plugin::{
-    AppServerExt, ServerFailed, ServerOptions, ServerPlugin, ServerStarted, ServerStopped,
-    WebSocketConnections, WebSocketMessage, WebSocketMessageReceived,
-};
+use memory_plugin::{AgentMemory, MemoryPlugin};
+use server_plugin::{ServerFailed, ServerOptions, ServerPlugin, ServerStarted, ServerStopped};
+use skill_plugin::SkillPlugin;
 use tool_plugin::ToolPlugin;
 use tracing::info;
+use workflow_plugin::WorkflowPlugin;
 use workspace_plugin::{
     StartWorkspace, StartWorkspaceResult, WorkspaceAgents, WorkspaceConfiguration, WorkspacePlugin,
     WorldWorkspaceExt,
@@ -31,10 +35,6 @@ use workspace_plugin::{
 const DEFAULT_BIND: &str = "127.0.0.1:3939";
 const DEFAULT_DATA_ROOT: &str = ".margatroid";
 const LOG_STREAM_CAPACITY: usize = 256;
-
-struct DaemonStart;
-
-impl Event for DaemonStart {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DaemonConfig {
@@ -76,6 +76,10 @@ fn run(config: DaemonConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
         .map_err(|error| format!("cannot open agent image root: {error}"))?;
     let workspace = WorkspacePlugin::open(&agent_images_root)
         .map_err(|error| format!("cannot open workspace agent image root: {error}"))?;
+    let skills = SkillPlugin::open(data_root.join("skills"))
+        .map_err(|error| format!("cannot open skill root: {error}"))?;
+    let workflows = WorkflowPlugin::open(data_root.join("workflows"))
+        .map_err(|error| format!("cannot open workflow root: {error}"))?;
 
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
@@ -85,15 +89,19 @@ fn run(config: DaemonConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(agent_images)
         .add_plugin(InferencePlugin::default().with_config_path(models_path.clone()))
         .add_plugin(ToolPlugin::default())
+        .add_plugin(skills)
+        .add_plugin(workflows)
         .add_plugin(MemoryPlugin::default())
         .add_plugin(AgentPlugin::default())
         .add_plugin(workspace)
-        .add_websocket_event_route("/ws")
-        .add_system(RuntimePlugin::UPDATE, handle_websocket_messages)
-        .add_system(RuntimePlugin::UPDATE, report_runtime_events);
+        .add_plugin(ApiPlugin::default())
+        .add_plugin(ConnectionPlugin::default())
+        .add_system(RuntimePlugin::UPDATE, handle_workspace_start_requests)
+        .add_system(RuntimePlugin::UPDATE, handle_agent_message_requests)
+        .add_system(RuntimePlugin::UPDATE, report_runtime_events)
+        .add_system(RuntimePlugin::UPDATE, sync_frontend_state_system);
 
     install_log_forwarder(&app)?;
-    app.world().send_event(DaemonStart);
     info!(address = %config.bind, data_root = %data_root.display(), models = %models_path.display(), "margatroid daemon starting");
     app.run();
     Ok(())
@@ -105,17 +113,13 @@ fn install_log_forwarder(app: &App) -> Result<(), Box<dyn Error + Send + Sync>> 
         .get_resource::<TracingStream>()
         .cloned()
         .ok_or("LogPlugin stream is not available")?;
-    let connections = app
-        .world()
-        .get_resource::<WebSocketConnections>()
-        .cloned()
-        .ok_or("ServerPlugin WebSocket registry is not available")?;
+    let events = app.world().event_sender();
     app.world()
-        .spawn_async_service(forward_logs(stream, connections));
+        .spawn_async_service(forward_logs(stream, events));
     Ok(())
 }
 
-async fn forward_logs(stream: TracingStream, connections: WebSocketConnections) {
+async fn forward_logs(stream: TracingStream, events: RuntimeEventSender) {
     let mut subscription = stream.subscribe();
     loop {
         let record = match subscription.recv().await {
@@ -124,20 +128,14 @@ async fn forward_logs(stream: TracingStream, connections: WebSocketConnections) 
                 tracing::warn!(dropped = count, "daemon log stream lagged");
                 continue;
             }
-            Err(TracingStreamError::Closed) => break,
-            Err(_) => break,
+            Err(TracingStreamError::Closed) | Err(_) => break,
         };
-        let event = ServerEvent::Log {
-            record: log_record(record),
-        };
-        let Ok(encoded) = serde_json::to_string(&event) else {
-            continue;
-        };
-        for sender in connections.unnamed() {
-            let _ = sender
-                .send(WebSocketMessage::Text(encoded.clone().into()))
-                .await;
-        }
+        events.send_event(WebSocketMessageSend {
+            target: WebSocketMessageTarget::Broadcast,
+            message: ServerEvent::Log {
+                record: log_record(record),
+            },
+        });
     }
 }
 
@@ -159,63 +157,51 @@ fn log_record(record: TracingRecord) -> LogRecordDto {
     }
 }
 
-fn handle_websocket_messages(world: &mut World) {
-    let messages = world
-        .event_reader::<WebSocketMessageReceived>()
+fn handle_workspace_start_requests(world: &mut World) {
+    let requests = world
+        .event_reader::<WorkspaceStartRequested>()
         .into_iter()
+        .cloned()
         .collect::<Vec<_>>();
-    for received in messages {
-        let WebSocketMessage::Text(text) = &received.message else {
+    for request in requests {
+        match request.definition.into_definition() {
+            Ok(definition) => world.send_event(StartWorkspace {
+                id: request.id,
+                definition,
+            }),
+            Err(error) => tracing::warn!(
+                connection = request.connection_id.get(),
+                error = %error,
+                "workspace request contains an invalid definition"
+            ),
+        }
+    }
+}
+
+fn handle_agent_message_requests(world: &mut World) {
+    let requests = world
+        .event_reader::<AgentMessageRequested>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for request in requests {
+        if let Err(error) = route_agent_message(
+            world,
+            request.id,
+            request.workspace,
+            request.agent,
+            request.content,
+        ) {
             tracing::warn!(
-                connection = received.connection_id.get(),
-                "ignoring non-text WebSocket message"
+                connection = request.connection_id.get(),
+                error = %error,
+                "agent message was rejected"
             );
-            continue;
-        };
-        let request = match serde_json::from_str::<ClientRequest>(text.as_str()) {
-            Ok(request) => request,
-            Err(error) => {
-                tracing::warn!(
-                    connection = received.connection_id.get(),
-                    error = %error,
-                    "ignoring invalid daemon request"
-                );
-                continue;
-            }
-        };
-        match request {
-            ClientRequest::WorkspaceStart { id, definition } => {
-                match definition.into_definition() {
-                    Ok(definition) => world.send_event(StartWorkspace { id, definition }),
-                    Err(error) => tracing::warn!(
-                        connection = received.connection_id.get(),
-                        error = %error,
-                        "workspace request contains an invalid definition"
-                    ),
-                }
-            }
-            ClientRequest::AgentMessage {
-                id,
-                workspace,
-                agent,
-                content,
-            } => {
-                if let Err(error) = route_agent_message(world, id, workspace, agent, content) {
-                    tracing::warn!(
-                        connection = received.connection_id.get(),
-                        error = %error,
-                        "agent message was rejected"
-                    );
-                }
-            }
         }
     }
 }
 
 fn report_runtime_events(world: &mut World) {
-    let Some(connections) = world.get_resource::<WebSocketConnections>().cloned() else {
-        return;
-    };
     for event in world.event_reader::<ServerStarted>() {
         tracing::info!(address = %event.address, "daemon WebSocket server started");
     }
@@ -230,13 +216,13 @@ fn report_runtime_events(world: &mut World) {
             Ok(workspace) => {
                 tracing::info!(request_id = %result.id, "workspace started");
                 if let Some(info) = workspace_info(world, *workspace) {
-                    broadcast_server_event(
-                        &connections,
-                        &ServerEvent::WorkspaceStarted {
+                    world.send_event(WebSocketMessageSend {
+                        target: WebSocketMessageTarget::Broadcast,
+                        message: ServerEvent::WorkspaceStarted {
                             id: result.id.clone(),
                             workspace: info,
                         },
-                    );
+                    });
                 }
             }
             Err(error) => {
@@ -253,9 +239,9 @@ fn report_runtime_events(world: &mut World) {
         let Some((workspace, agent)) = agent_route(world, message.agent) else {
             continue;
         };
-        broadcast_server_event(
-            &connections,
-            &ServerEvent::AgentMessage {
+        world.send_event(WebSocketMessageSend {
+            target: WebSocketMessageTarget::Broadcast,
+            message: ServerEvent::AgentMessage {
                 message: AgentMessageDto {
                     id: message.id,
                     workspace,
@@ -263,7 +249,7 @@ fn report_runtime_events(world: &mut World) {
                     message: message.message,
                 },
             },
-        );
+        });
     }
     let failures = world
         .event_reader::<AgentFailure>()
@@ -274,19 +260,104 @@ fn report_runtime_events(world: &mut World) {
         let Some((workspace, agent)) = agent_route(world, failure.agent) else {
             continue;
         };
-        broadcast_server_event(
-            &connections,
-            &ServerEvent::AgentFailure {
+        let kind = format!("{:?}", failure.kind);
+        tracing::warn!(
+            request_id = %failure.id,
+            agent = %agent,
+            kind = %kind,
+            error = %failure.message,
+            "agent turn failed"
+        );
+        world.send_event(WebSocketMessageSend {
+            target: WebSocketMessageTarget::Broadcast,
+            message: ServerEvent::AgentFailure {
                 failure: AgentFailureDto {
                     id: failure.id,
                     workspace,
                     agent,
-                    kind: format!("{:?}", failure.kind),
+                    kind,
                     message: failure.message,
                 },
             },
-        );
+        });
     }
+}
+
+fn sync_frontend_state_system(world: &mut World) {
+    let state = match backend_state(world) {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(error = %error, "frontend state sync failed");
+            return;
+        }
+    };
+    world.send_event(WebSocketMessageSend {
+        target: WebSocketMessageTarget::Type("webui".into()),
+        message: ServerEvent::StateSync { state },
+    });
+}
+
+fn backend_state(world: &World) -> Result<BackendStateDto, String> {
+    let mut workspaces = world
+        .workspaces()
+        .into_iter()
+        .filter_map(|workspace| workspace_info(world, workspace).map(|info| (workspace, info)))
+        .collect::<Vec<_>>();
+    workspaces.sort_by(|left, right| {
+        left.1
+            .project_root
+            .cmp(&right.1.project_root)
+            .then_with(|| left.1.name.cmp(&right.1.name))
+    });
+    let mut workspace_infos = Vec::with_capacity(workspaces.len());
+    let mut histories = Vec::new();
+    for (workspace, info) in workspaces {
+        let agents = world
+            .get_component::<WorkspaceAgents>(workspace)
+            .ok_or_else(|| format!("workspace `{}` does not have an Agent index", info.name))?;
+        for (name, agent) in agents.iter() {
+            let memory = world.get_component::<AgentMemory>(agent).ok_or_else(|| {
+                format!(
+                    "Agent `{name}` in workspace `{}` does not have memory",
+                    info.name
+                )
+            })?;
+            let messages = memory
+                .history_messages()
+                .map_err(|error| {
+                    format!(
+                        "Agent `{name}` history in workspace `{}` could not be read: {error}",
+                        info.name
+                    )
+                })?
+                .into_iter()
+                .map(|message| HistoryMessageDto {
+                    sequence: message.sequence,
+                    turn_id: message.turn_id,
+                    message: message.message,
+                    resources: message
+                        .resources
+                        .into_iter()
+                        .map(|resource| ResourceRefDto {
+                            provider: resource.provider().to_owned(),
+                            name: resource.name().to_string(),
+                        })
+                        .collect(),
+                    created_at_ms: message.created_at_ms,
+                })
+                .collect();
+            histories.push(AgentHistoryDto {
+                workspace: info.reference(),
+                agent: name.to_owned(),
+                messages,
+            });
+        }
+        workspace_infos.push(info);
+    }
+    Ok(BackendStateDto {
+        workspaces: workspace_infos,
+        histories,
+    })
 }
 
 fn route_agent_message(
@@ -341,15 +412,6 @@ fn agent_route(
         .find_map(|(name, entity)| (entity == agent).then_some(name.to_owned()))?;
     let workspace = workspace_info(world, workspace)?.reference();
     Some((workspace, name))
-}
-
-fn broadcast_server_event(connections: &WebSocketConnections, event: &ServerEvent) {
-    let Ok(encoded) = serde_json::to_string(event) else {
-        return;
-    };
-    for sender in connections.unnamed() {
-        let _ = sender.try_send(WebSocketMessage::Text(encoded.clone().into()));
-    }
 }
 
 fn parse_args<I>(arguments: I) -> Result<DaemonConfig, String>

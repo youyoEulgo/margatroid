@@ -12,6 +12,8 @@ const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientRequest {
+    #[serde(rename = "connection.register")]
+    ConnectionRegister { client_type: String },
     #[serde(rename = "workspace.start")]
     WorkspaceStart {
         id: String,
@@ -31,6 +33,8 @@ pub enum ClientRequest {
 pub enum ServerEvent {
     #[serde(rename = "log")]
     Log { record: LogRecordDto },
+    #[serde(rename = "state.sync")]
+    StateSync { state: BackendStateDto },
     #[serde(rename = "workspace.started")]
     WorkspaceStarted {
         id: String,
@@ -61,6 +65,12 @@ pub struct LogFieldDto {
 }
 
 impl ClientRequest {
+    pub fn register_connection(client_type: impl Into<String>) -> Self {
+        Self::ConnectionRegister {
+            client_type: client_type.into(),
+        }
+    }
+
     pub fn start_workspace(id: impl Into<String>, definition: &WorkspaceDefinition) -> Self {
         Self::WorkspaceStart {
             id: id.into(),
@@ -130,6 +140,30 @@ impl WorkspaceInfoDto {
     pub fn reference(&self) -> WorkspaceRefDto {
         WorkspaceRefDto::new(self.name.clone(), self.project_root.clone())
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendStateDto {
+    pub workspaces: Vec<WorkspaceInfoDto>,
+    #[serde(default)]
+    pub histories: Vec<AgentHistoryDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHistoryDto {
+    pub workspace: WorkspaceRefDto,
+    pub agent: String,
+    pub messages: Vec<HistoryMessageDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryMessageDto {
+    pub sequence: i64,
+    pub turn_id: String,
+    pub message: Message,
+    #[serde(default)]
+    pub resources: Vec<ResourceRefDto>,
+    pub created_at_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,6 +392,14 @@ mod tests {
     }
 
     #[test]
+    fn connection_registration_uses_stable_shape() {
+        let value = serde_json::to_value(ClientRequest::register_connection("webui")).unwrap();
+
+        assert_eq!(value["type"], "connection.register");
+        assert_eq!(value["client_type"], "webui");
+    }
+
+    #[test]
     fn dto_round_trips_to_domain_definition() {
         let original = definition();
         let dto = WorkspaceDefinitionDto::from_definition(&original);
@@ -407,6 +449,45 @@ mod tests {
         assert_eq!(value["type"], "workspace.started");
         assert_eq!(value["workspace"]["manager"], "coder");
         assert_eq!(value["workspace"]["agents"][0], "coder");
+    }
+
+    #[test]
+    fn state_sync_contains_the_complete_workspace_snapshot() {
+        let event = ServerEvent::StateSync {
+            state: BackendStateDto {
+                workspaces: vec![WorkspaceInfoDto::from_definition(&definition())],
+                histories: vec![AgentHistoryDto {
+                    workspace: WorkspaceRefDto::new("demo", "/tmp/demo"),
+                    agent: "coder".into(),
+                    messages: vec![HistoryMessageDto {
+                        sequence: 1,
+                        turn_id: "turn-1".into(),
+                        message: Message::User {
+                            content: "hello".into(),
+                        },
+                        resources: vec![ResourceRefDto {
+                            provider: "skill".into(),
+                            name: "local/context".into(),
+                        }],
+                        created_at_ms: 42,
+                    }],
+                }],
+            },
+        };
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["type"], "state.sync");
+        assert_eq!(value["state"]["workspaces"][0]["name"], "demo");
+        assert_eq!(value["state"]["workspaces"][0]["manager"], "coder");
+        assert_eq!(value["state"]["histories"][0]["agent"], "coder");
+        assert_eq!(
+            value["state"]["histories"][0]["messages"][0]["turn_id"],
+            "turn-1"
+        );
+        assert_eq!(
+            value["state"]["histories"][0]["messages"][0]["resources"][0]["provider"],
+            "skill"
+        );
     }
 
     #[test]
