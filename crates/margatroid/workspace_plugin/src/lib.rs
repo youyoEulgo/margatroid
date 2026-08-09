@@ -107,6 +107,14 @@ pub struct StopWorkspace {
 impl Event for StopWorkspace {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StopWorkspaceByReference {
+    pub id: String,
+    pub workspace: margatroid_types::WorkspaceReference,
+}
+
+impl Event for StopWorkspaceByReference {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StopWorkspaceResult {
     pub id: String,
     pub workspace: Entity,
@@ -114,6 +122,15 @@ pub struct StopWorkspaceResult {
 }
 
 impl Event for StopWorkspaceResult {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StopWorkspaceByReferenceResult {
+    pub id: String,
+    pub workspace: margatroid_types::WorkspaceReference,
+    pub result: Result<(), WorkspaceError>,
+}
+
+impl Event for StopWorkspaceByReferenceResult {}
 
 fn route_agent_message_system(world: &mut World) {
     let requests = world
@@ -414,6 +431,11 @@ fn begin_workspace_command_system(world: &mut World) {
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
+    let referenced_stops = world
+        .event_reader::<StopWorkspaceByReference>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
 
     for event in starts {
         let id = event.id;
@@ -451,6 +473,34 @@ fn begin_workspace_command_system(world: &mut World) {
         world.send_event(StopWorkspaceResult {
             id: event.id,
             workspace: event.workspace,
+            result,
+        });
+    }
+
+    for event in referenced_stops {
+        let workspace = event.workspace;
+        let result = if event.id.is_empty() {
+            Err(WorkspaceError::new(
+                WorkspaceErrorKind::InvalidRequest,
+                "workspace request id cannot be empty",
+            ))
+        } else {
+            let Some(entity) = world.workspace(&workspace.project_root, &workspace.name) else {
+                world.send_event(StopWorkspaceByReferenceResult {
+                    id: event.id,
+                    workspace,
+                    result: Err(WorkspaceError::new(
+                        WorkspaceErrorKind::WorkspaceNotAlive,
+                        "workspace is not started",
+                    )),
+                });
+                continue;
+            };
+            stop_workspace_inner(world, entity)
+        };
+        world.send_event(StopWorkspaceByReferenceResult {
+            id: event.id,
+            workspace,
             result,
         });
     }

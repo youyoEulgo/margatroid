@@ -4,19 +4,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_image_loader_plugin::AgentImageLoaderPlugin;
 use agent_plugin::{AgentContext, AgentIdentity, AgentPlugin, AgentWorkspaceId};
-use app_runtime_plugin::RuntimePlugin;
+use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::App;
 use inference_plugin::{AgentInferenceSnapshot, InferencePlugin, WorkspaceModelRoutes};
 use margatroid_types::{
     AgentImageReference, ResourceName, ResourceRef, WorkspaceAgentDefinition, WorkspaceDefinition,
+    WorkspaceReference,
 };
 use memory_plugin::{AgentMemory, MemoryPlugin};
 use tempfile::tempdir;
 use tool_plugin::{AgentToolEnvironment, ToolPlugin};
 use workspace_plugin::{
-    ReloadWorkspaceResult, StartWorkspaceResult, StopWorkspaceResult, WorkspaceAgents,
-    WorkspaceIdentity, WorkspacePlugin, WorldWorkspaceExt,
+    ReloadWorkspaceResult, StartWorkspaceResult, StopWorkspaceByReference,
+    StopWorkspaceByReferenceResult, WorkspaceAgents, WorkspaceIdentity, WorkspacePlugin,
+    WorldWorkspaceExt,
 };
 
 fn unique_directory(prefix: &str) -> PathBuf {
@@ -195,8 +197,15 @@ fn documented_public_api_starts_queries_reloads_and_stops_workspace() {
         Some(app.world().workspace_agent(reloaded, "manager").unwrap())
     );
 
-    app.world().stop_workspace("stop-1", reloaded);
-    wait_stop(&mut app, "stop-1", reloaded).unwrap();
+    let reference = WorkspaceReference {
+        name: "demo".into(),
+        project_root: project.path().into(),
+    };
+    app.world().send_event(StopWorkspaceByReference {
+        id: "stop-1".into(),
+        workspace: reference.clone(),
+    });
+    wait_stop_by_reference(&mut app, "stop-1", &reference).unwrap();
     assert!(!app.world().is_alive(reloaded));
     assert!(app.world().workspace(project.path(), "demo").is_none());
     assert!(app.world().workspaces().is_empty());
@@ -225,19 +234,19 @@ fn wait_reload(
     }
 }
 
-fn wait_stop(
+fn wait_stop_by_reference(
     app: &mut App,
     id: &str,
-    workspace: core_plugin::Entity,
+    workspace: &WorkspaceReference,
 ) -> Result<(), workspace_plugin::WorkspaceError> {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         app.tick();
         if let Some(result) = app
             .world()
-            .event_reader::<StopWorkspaceResult>()
+            .event_reader::<StopWorkspaceByReferenceResult>()
             .into_iter()
-            .find(|result| result.id == id && result.workspace == workspace)
+            .find(|result| result.id == id && &result.workspace == workspace)
         {
             return result.result.clone();
         }

@@ -462,6 +462,16 @@ fn dispatch_tool_calls(
         .get_component_mut::<AgentStatus>(agent)
         .ok_or(AgentStepError::StatusMissing)?
         .begin_tool_calls(id, tool_calls)?;
+    let agent_id = world
+        .get_component::<AgentIdentity>(agent)
+        .map(AgentIdentity::id)
+        .unwrap_or("unknown");
+    tracing::info!(
+        request_id = id,
+        agent = agent_id,
+        tool_calls = requests.len(),
+        "tool calls dispatched"
+    );
     for request in requests {
         events.send_event(request);
     }
@@ -483,6 +493,17 @@ fn send_inference_command(
         content: context.system_prompt.clone(),
     });
     messages.extend(context.messages.iter().cloned());
+    let agent_id = world
+        .get_component::<AgentIdentity>(agent)
+        .map(AgentIdentity::id)
+        .unwrap_or("unknown");
+    tracing::info!(
+        request_id = id,
+        agent = agent_id,
+        messages = messages.len(),
+        tools = available_tools.definitions.len(),
+        "inference requested"
+    );
     events.send_event(InferenceCommand {
         id: id.to_owned(),
         agent,

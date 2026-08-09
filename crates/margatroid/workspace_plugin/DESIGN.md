@@ -85,11 +85,24 @@ StopWorkspace：Workspace关闭事件，公开事件--释放Workspace拥有的�
     impl Event for StopWorkspace
         Event：公开trait实现
 
+StopWorkspaceByReference：按逻辑引用关闭Workspace事件，公开事件--供跨进程DTO在没有Entity时请求关闭
+    id: String--请求ID
+    workspace: WorkspaceReference--Workspace名称和项目根
+    impl Event for StopWorkspaceByReference
+        Event：公开trait实现
+
 StopWorkspaceResult：Workspace关闭结果，公开事件--报告Workspace和Agent释放结果
     id: String--原请求ID
     workspace: Entity--原Workspace Entity
     result: Result<(), WorkspaceError>--成功表示Workspace和其AgentInstance已经释放
     impl Event for StopWorkspaceResult
+        Event：公开trait实现
+
+StopWorkspaceByReferenceResult：逻辑引用关闭结果，公开事件--供DTO层生成停止回执
+    id: String--请求ID
+    workspace: WorkspaceReference--已请求关闭的Workspace逻辑引用
+    result: Result<(), WorkspaceError>--关闭结果
+    impl Event for StopWorkspaceByReferenceResult
         Event：公开trait实现
 
 WorkspaceIdentity：Workspace身份，公开组件--保存稳定逻辑名称与规范化项目根
@@ -224,13 +237,14 @@ PreparedWorkspaceAgent：单Agent实例材料，私有结构体--创建Agent Ent
 私有：
 ```text
 begin_workspace_command_system(world: &mut World)
-    开始命令：私有System，读取StartWorkspace、ReloadWorkspace和StopWorkspace
+    开始命令：私有System，读取StartWorkspace、ReloadWorkspace、StopWorkspace和StopWorkspaceByReference
     行为：
         收集本次全部Workspace命令并结束EventReader借用
         StartWorkspace调用begin_workspace_start
         ReloadWorkspace验证旧Workspace已登记、最新定义合法且WorkspaceKey与旧身份一致
         ReloadWorkspace验证成功后调用stop_workspace_inner关闭旧实例，再以Reload类型调用begin_workspace_start
         StopWorkspace调用stop_workspace_inner并立即发送StopWorkspaceResult
+        StopWorkspaceByReference先查询Entity，再调用stop_workspace_inner并发送StopWorkspaceByReferenceResult
         每个命令失败时发布对应的稳定错误结果
 
 begin_workspace_start(

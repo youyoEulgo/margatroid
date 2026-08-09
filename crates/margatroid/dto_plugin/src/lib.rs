@@ -118,6 +118,7 @@ fn dto_route_system(world: &mut World) {
         };
         match request {
             ClientMessage::ConnectionRegister { id, message } => {
+                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "connection.register", "API request received");
                 match message.into_domain((id, received.connection_id)) {
                     Ok(event) => world.send_event(event),
                     Err(error) => tracing::warn!(
@@ -127,22 +128,39 @@ fn dto_route_system(world: &mut World) {
                     ),
                 }
             }
-            ClientMessage::WorkspaceStart { id, message } => match message.into_domain(id) {
-                Ok(event) => world.send_event(event),
-                Err(error) => tracing::warn!(
-                    connection = received.connection_id.get(),
-                    error = %error,
-                    "invalid workspace.start payload"
-                ),
-            },
-            ClientMessage::AgentMessage { id, message } => match message.into_domain(id) {
-                Ok(event) => world.send_event(event),
-                Err(error) => tracing::warn!(
-                    connection = received.connection_id.get(),
-                    error = %error,
-                    "invalid agent.message payload"
-                ),
-            },
+            ClientMessage::WorkspaceStart { id, message } => {
+                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "workspace.start", "API request received");
+                match message.into_domain(id) {
+                    Ok(event) => world.send_event(event),
+                    Err(error) => tracing::warn!(
+                        connection = received.connection_id.get(),
+                        error = %error,
+                        "invalid workspace.start payload"
+                    ),
+                }
+            }
+            ClientMessage::WorkspaceStop { id, message } => {
+                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "workspace.stop", "API request received");
+                match message.into_domain(id) {
+                    Ok(event) => world.send_event(event),
+                    Err(error) => tracing::warn!(
+                        connection = received.connection_id.get(),
+                        error = %error,
+                        "invalid workspace.stop payload"
+                    ),
+                }
+            }
+            ClientMessage::AgentMessage { id, message } => {
+                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.message", "API request received");
+                match message.into_domain(id) {
+                    Ok(event) => world.send_event(event),
+                    Err(error) => tracing::warn!(
+                        connection = received.connection_id.get(),
+                        error = %error,
+                        "invalid agent.message payload"
+                    ),
+                }
+            }
         }
     }
 

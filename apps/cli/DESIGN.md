@@ -26,11 +26,29 @@ run(command: Command) -> Result<(), Box<dyn Error + Send + Sync>>
     执行命令：私有异步函数，分派WorkspaceUp
 
 run_workspace_up(workspace_file: PathBuf, backend_url: String) -> Result<(), Box<dyn Error + Send + Sync>>
-    启动Workspace：私有异步函数，编译文件、连接WebSocket、注册cli连接、发送启动请求并打印日志事件
+    启动Workspace：私有异步函数，编译文件、连接WebSocket、注册cli连接、发送启动请求、处理关闭信号并打印日志事件
     行为：不读取stdin，不构造或发送LLM消息；只有ServerMessage::Log写入stdout
 
 print_backend_message(text: &str)
-    打印日志：私有函数，反序列化ServerMessage并格式化LogRecordDto；未知事件直接忽略
+    打印日志：私有函数，反序列化ServerMessage并使用RFC 3339时间、等级、target、事件和结构化字段格式化LogRecordDto；未知事件直接忽略
+    行为：stdout连接终端时启用ANSI等级色，并弱化时间和target；重定向时输出纯文本
+
+print_cli_event(level: &str, message: &str)
+    打印CLI事件：私有函数，使用当前RFC 3339时间、等级和margatroid_cli target写入stderr
+    行为：stderr连接终端时使用与后端日志相同的ANSI样式
+
+format_log_line(timestamp_millis: u64, level: &str, target: &str, message: &str, fields: &str, ansi: bool) -> String
+    格式化日志行：私有函数，按等级选择ANSI颜色并将时间和target设为灰色弱化；ansi为false时不产生控制符
+
+format_timestamp(timestamp_millis: u64) -> String
+    格式化时间：私有函数，将Unix毫秒时间转换为RFC 3339 UTC文本
+
+wait_for_stop_ack(socket, request_id: &str) -> Result<(), Box<dyn Error + Send + Sync>>
+    等待停止回执：私有异步函数，等待同一请求ID的workspace.stopped
+    行为：处理日志、心跳和停止失败；超时、断线或再次收到关闭信号时返回错误
+
+wait_for_shutdown_signal() -> Result<(), std::io::Error>
+    等待关闭信号：私有异步函数，Unix监听Ctrl+C和SIGTERM，其他平台监听Ctrl+C
 
 parse_args<I>(arguments: I) -> Result<Command, String>
     解析参数：私有函数，接受workspace up、可选文件路径和--backend URL
@@ -59,7 +77,11 @@ run_workspace_up
     -> 分别序列化两个ClientMessage
     -> tokio_tungstenite连接backend_url
     -> 依次发送connection.register和workspace.start的Message::Text
-    -> 循环接收WebSocket消息
+    -> 循环接收WebSocket消息和关闭信号
+       -> 首次关闭信号：发送workspace.stop
+       -> 等待同一请求ID的workspace.stopped
+       -> 收到回执后关闭WebSocket并正常退出
+       -> 再次信号、超时、停止失败或后端提前断开：关闭并报错退出
        -> Text：解析ServerMessage::Log并打印
        -> UTF-8 Binary：按文本解析ServerMessage::Log
        -> 非UTF-8 Binary：打印长度提示stderr
@@ -72,6 +94,7 @@ run_workspace_up
     CLI不启动daemon、不创建ECS、不读取AgentImage或资源正文
     CLI不读取stdin，不处理UserMessage、AssistantMessage、ToolCall或LLM流
     WebSocket传输只承载margatroid_protocol定义的请求和后端事件
+    CLI进程退出前必须先完成workspace.stop业务回执；WebSocket关闭不是停止Workspace的替代品
 ~~~
 
 ## 持有关系

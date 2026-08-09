@@ -12,7 +12,9 @@ use margatroid_types::{
 use memory_plugin::{AgentMemory, HistoryMessage};
 use serde::{Deserialize, Serialize};
 use server_plugin::{RegisterConnection, WebSocketConnectionId};
-use workspace_plugin::{WorkspaceAgents, WorkspaceConfiguration, WorldWorkspaceExt};
+use workspace_plugin::{
+    StopWorkspaceByReference, WorkspaceAgents, WorkspaceConfiguration, WorldWorkspaceExt,
+};
 
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 
@@ -63,6 +65,11 @@ pub enum ClientMessage {
         id: String,
         message: StartWorkspaceDto,
     },
+    #[serde(rename = "workspace.stop")]
+    WorkspaceStop {
+        id: String,
+        message: StopWorkspaceDto,
+    },
     #[serde(rename = "agent.message")]
     AgentMessage {
         id: String,
@@ -82,6 +89,13 @@ pub enum ServerMessage {
         id: String,
         workspace: WorkspaceInfoDto,
     },
+    #[serde(rename = "workspace.stopped")]
+    WorkspaceStopped {
+        id: String,
+        workspace: WorkspaceReferenceDto,
+    },
+    #[serde(rename = "workspace.stop_failed")]
+    WorkspaceStopFailed { id: String, error: String },
     #[serde(rename = "agent.message")]
     AgentMessage { message: AgentMessageDto },
     #[serde(rename = "agent.failure")]
@@ -230,6 +244,20 @@ impl IntoDomain<StartWorkspace, String> for StartWorkspaceDto {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopWorkspaceDto {
+    pub workspace: WorkspaceReferenceDto,
+}
+
+impl IntoDomain<StopWorkspaceByReference, String> for StopWorkspaceDto {
+    fn into_domain(self, id: String) -> Result<StopWorkspaceByReference, ProtocolError> {
+        Ok(StopWorkspaceByReference {
+            id,
+            workspace: self.workspace.into_domain(())?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteAgentMessageDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: Option<String>,
@@ -264,6 +292,15 @@ impl ClientMessage {
                 definition: definition
                     .into_dto(())
                     .expect("WorkspaceDefinition conversion cannot fail"),
+            },
+        }
+    }
+
+    pub fn stop_workspace(id: impl Into<String>, workspace: &WorkspaceReferenceDto) -> Self {
+        Self::WorkspaceStop {
+            id: id.into(),
+            message: StopWorkspaceDto {
+                workspace: workspace.clone(),
             },
         }
     }
@@ -307,6 +344,15 @@ impl FromDomain<&WorkspaceDefinition> for WorkspaceReferenceDto {
         Ok(Self::new(
             definition.name.clone(),
             definition.project_root.to_string_lossy().into_owned(),
+        ))
+    }
+}
+
+impl FromDomain<WorkspaceReference> for WorkspaceReferenceDto {
+    fn from_domain(reference: WorkspaceReference, (): ()) -> Result<Self, ProtocolError> {
+        Ok(Self::new(
+            reference.name,
+            reference.project_root.to_string_lossy().into_owned(),
         ))
     }
 }
@@ -762,6 +808,38 @@ mod tests {
         assert_eq!(value["type"], "connection.register");
         assert_eq!(value["id"], "register-1");
         assert_eq!(value["message"]["client_type"], "webui");
+    }
+
+    #[test]
+    fn workspace_stop_uses_workspace_reference_and_request_id() {
+        let workspace = WorkspaceReferenceDto::new("demo", "/tmp/demo");
+        let value =
+            serde_json::to_value(ClientMessage::stop_workspace("stop-1", &workspace)).unwrap();
+
+        assert_eq!(value["type"], "workspace.stop");
+        assert_eq!(value["id"], "stop-1");
+        assert_eq!(value["message"]["workspace"]["name"], "demo");
+        assert_eq!(value["message"]["workspace"]["project_root"], "/tmp/demo");
+    }
+
+    #[test]
+    fn workspace_stop_result_uses_stable_server_shapes() {
+        let workspace = WorkspaceReferenceDto::new("demo", "/tmp/demo");
+        let stopped = serde_json::to_value(ServerMessage::WorkspaceStopped {
+            id: "stop-1".into(),
+            workspace: workspace.clone(),
+        })
+        .unwrap();
+        assert_eq!(stopped["type"], "workspace.stopped");
+        assert_eq!(stopped["id"], "stop-1");
+
+        let failed = serde_json::to_value(ServerMessage::WorkspaceStopFailed {
+            id: "stop-1".into(),
+            error: "workspace is not started".into(),
+        })
+        .unwrap();
+        assert_eq!(failed["type"], "workspace.stop_failed");
+        assert_eq!(failed["error"], "workspace is not started");
     }
 
     #[test]

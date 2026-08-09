@@ -54,6 +54,8 @@ ClientMessage：客户端WebSocket请求，公开枚举--统一使用type、id�
         connection.register：声明当前连接的客户端类型
     WorkspaceStart { id: String, message: StartWorkspaceDto }
         workspace.start：提交编译后的Workspace定义
+    WorkspaceStop { id: String, message: StopWorkspaceDto }
+        workspace.stop：按Workspace名称和项目根请求停止已启动Workspace
     AgentMessage { id: String, message: RouteAgentMessageDto }
         agent.message：向逻辑Agent投递一条用户消息
     impl Serialize + Deserialize for ClientMessage
@@ -100,10 +102,19 @@ WorkspaceReferenceDto：Workspace逻辑引用DTO，公开结构体--保存跨进
     impl IntoDomain<WorkspaceReference> for WorkspaceReferenceDto
         转换逻辑引用：将project_root转换为PathBuf
 
+StopWorkspaceDto：Workspace停止DTO，公开结构体--保存待停止Workspace的逻辑引用
+    workspace: WorkspaceReferenceDto--Workspace名称和项目根
+    impl IntoDomain<StopWorkspaceByReference, String> for StopWorkspaceDto
+        转换停止命令：附加请求ID并转换WorkspaceReferenceDto
+
 ServerMessage：daemon发给客户端的协议事件，公开枚举--统一使用type和业务字段
     Log { record: LogRecordDto }
     StateSync { state: BackendStateDto }
     WorkspaceStarted { id: String, workspace: WorkspaceInfoDto }
+    WorkspaceStopped { id: String, workspace: WorkspaceReferenceDto }
+        workspace.stopped：Workspace已停止，可作为客户端关闭连接的业务回执
+    WorkspaceStopFailed { id: String, error: String }
+        workspace.stop_failed：Workspace停止失败
     AgentMessage { message: AgentMessageDto }
     AgentFailure { failure: AgentFailureDto }
     impl Serialize + Deserialize for ServerMessage
@@ -179,6 +190,7 @@ HistoryMessageDto：历史消息DTO，公开结构体--保存序号、turn ID、
 
 领域事件：
     workspace.start -> StartWorkspace
+    workspace.stop -> StopWorkspaceByReference
     agent.message -> RouteAgentMessage
     connection.register -> RegisterConnection
 

@@ -36,6 +36,24 @@ Workspace 启动请求：
 }
 ```
 
+Workspace 停止请求和业务回执：
+
+```json
+{
+  "type": "workspace.stop",
+  "id": "stop-1",
+  "message": {
+    "workspace": {
+      "name": "demo",
+      "project_root": "/project/demo"
+    }
+  }
+}
+```
+
+后端完成停止后发送 `workspace.stopped`（复用请求 ID）。停止失败发送
+`workspace.stop_failed`。客户端应等待成功回执后再关闭 WebSocket。
+
 Agent 消息请求：
 
 ```json

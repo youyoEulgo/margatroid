@@ -67,7 +67,7 @@ dto_route_system(world: &mut World)
         收集WebSocketMessageReceived并要求消息为Text
         反序列化统一{type,id,message}信封为ClientMessage
         按type取得对应DTO并调用DTO::into_domain
-        转换成功后直接发送StartWorkspace、RouteAgentMessage或RegisterConnection领域事件
+        转换成功后直接发送StartWorkspace、StopWorkspaceByReference、RouteAgentMessage或RegisterConnection领域事件
         转换失败时记录warning并丢弃当前请求
         收集WebSocketMessageSend
         将ServerMessage序列化为Text
@@ -76,10 +76,11 @@ dto_route_system(world: &mut World)
 collect_external_events_system(world: &mut World, frontend_type: &str)
     收集外部事件：私有System，将允许发送给外部的领域事件转换为ServerMessage并包装成WebSocketMessageSend
     行为：
-        将ServerStarted、ServerFailed和ServerStopped写入结构化日志
-        收集StartWorkspaceResult、AgentMessage和AgentFailure
+        将Server生命周期、WebSocket连接、断开和协议失败写入结构化日志
+        收集StartWorkspaceResult、StopWorkspaceByReferenceResult、AgentMessage和AgentFailure
         调用Protocol的FromDomain实现解析Workspace和Agent逻辑身份
-        构造对应WorkspaceStarted、AgentMessage或AgentFailure协议事件
+        构造对应WorkspaceStarted、WorkspaceStopped、WorkspaceStopFailed、AgentMessage或AgentFailure协议事件
+        记录Workspace启停、用户消息路由、Assistant响应和Agent失败等业务日志
         选择Broadcast目标并发送WebSocketMessageSend
         调用()::into_dto(&World)构造BackendStateDto
         将StateSync发送给frontend_type指定的连接类型
