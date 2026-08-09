@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -511,10 +512,13 @@ impl InferenceHttpClient {
         reqwest::Client::builder()
             .build()
             .map(|client| Self { client })
-            .map_err(|_| {
+            .map_err(|error| {
                 InferenceError::new(
                     InferenceErrorKind::RequestBuildFailed,
-                    "inference HTTP client could not be created",
+                    format!(
+                        "inference HTTP client could not be created: {}",
+                        summarize_reqwest_error(&error)
+                    ),
                 )
             })
     }
@@ -1089,33 +1093,43 @@ async fn execute_prepared_inference(
 }
 
 async fn run_provider(prepared: PreparedInference) -> Result<InferenceResponse, InferenceError> {
+    let endpoint = safe_endpoint(&prepared.request.url);
     let request = reqwest::Request::new(prepared.request.method, prepared.request.url);
     let mut request = request;
     *request.headers_mut() = prepared.request.headers;
     *request.body_mut() = Some(reqwest::Body::from(prepared.request.body));
-    let response = prepared.client.execute(request).await.map_err(|_| {
+    let response = prepared.client.execute(request).await.map_err(|error| {
         InferenceError::new(
             InferenceErrorKind::RequestFailed,
-            "inference provider request failed",
+            format!(
+                "inference provider request failed at {endpoint}: {}",
+                summarize_reqwest_error(&error)
+            ),
         )
     })?;
     let status = response.status();
     if !status.is_success() {
-        let _ = read_bounded_body(response, MAX_ERROR_BODY_BYTES).await;
+        let body = read_bounded_body(response, MAX_ERROR_BODY_BYTES).await;
+        let detail = provider_error_detail(&body)
+            .map(|detail| format!("inference provider rejected the request: {detail}"))
+            .unwrap_or_else(|| "inference provider returned an empty error response".into());
         return Err(InferenceError::with_status(
             InferenceErrorKind::ResponseStatus,
             Some(status.as_u16()),
-            "inference provider returned a non-success status",
+            detail,
         ));
     }
     let headers = response.headers().clone();
     let mut accumulator = prepared.adapter.begin_response(status, &headers)?;
     let mut body = response.bytes_stream();
     while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|_| {
+        let chunk = chunk.map_err(|error| {
             InferenceError::new(
                 InferenceErrorKind::RequestFailed,
-                "inference response stream failed",
+                format!(
+                    "inference response stream failed at {endpoint}: {}",
+                    summarize_reqwest_error(&error)
+                ),
             )
         })?;
         let text = accumulator.push(&chunk)?;
@@ -1128,6 +1142,70 @@ async fn run_provider(prepared: PreparedInference) -> Result<InferenceResponse, 
         }
     }
     accumulator.finish()
+}
+
+fn safe_endpoint(url: &Url) -> String {
+    url.origin().ascii_serialization()
+}
+
+fn summarize_reqwest_error(error: &reqwest::Error) -> String {
+    let category = if error.is_timeout() {
+        "request timed out"
+    } else if error.is_connect() {
+        "connection failed"
+    } else if error.is_body() {
+        "response body failed"
+    } else if error.is_decode() {
+        "response decoding failed"
+    } else if error.is_request() {
+        "request construction failed"
+    } else {
+        "HTTP transport failed"
+    };
+    let mut source = StdError::source(error);
+    let mut deepest = None;
+    while let Some(current) = source {
+        deepest = Some(current.to_string());
+        source = current.source();
+    }
+    match deepest.filter(|detail| !detail.trim().is_empty()) {
+        Some(detail) => format!("{category}: {}", single_line(&detail)),
+        None => category.into(),
+    }
+}
+
+fn provider_error_detail(body: &[u8]) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        for pointer in ["/error/message", "/error", "/message", "/detail"] {
+            if let Some(message) = value.pointer(pointer).and_then(|value| value.as_str()) {
+                let message = single_line(message);
+                if !message.is_empty() {
+                    return Some(message);
+                }
+            }
+        }
+    }
+    let message = single_line(&String::from_utf8_lossy(body));
+    (!message.is_empty()).then_some(message)
+}
+
+fn single_line(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Vec<u8> {
@@ -1586,6 +1664,27 @@ mod tests {
     use async_runtime_plugin::AsyncRuntimePlugin;
     use std::collections::HashMap;
     use tempfile::tempdir;
+
+    #[test]
+    fn provider_error_detail_extracts_json_and_sanitizes_text() {
+        assert_eq!(
+            provider_error_detail(br#"{"error":{"message":"quota\nexceeded"}}"#).as_deref(),
+            Some("quota exceeded")
+        );
+        assert_eq!(
+            provider_error_detail(b"upstream\n\x1b[31m unavailable").as_deref(),
+            Some("upstream [31m unavailable")
+        );
+        assert_eq!(provider_error_detail(b""), None);
+    }
+
+    #[test]
+    fn safe_endpoint_excludes_credentials_and_query_parameters() {
+        let url =
+            Url::parse("https://user:password@example.test:8443/v1/chat/completions?token=secret")
+                .unwrap();
+        assert_eq!(safe_endpoint(&url), "https://example.test:8443");
+    }
 
     #[test]
     fn model_routes_compile_and_openai_accumulator_handles_split_sse() {

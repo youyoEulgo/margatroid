@@ -352,7 +352,18 @@ validate_tools(tools: &[ToolDefinition]) -> Result<(), InferenceError>
 
 send_provider_request(client: &reqwest::Client, request: ProviderHttpRequest) -> Result<reqwest::Response, InferenceError>
     发送请求：私有异步函数，将ProviderHttpRequest转换为reqwest Request并发送
-    行为：设置method、url、headers和body；网络错误转换为RequestFailed；不记录header和body
+    行为：设置method、url、headers和body；网络错误转换为RequestFailed并保留错误类别与最深层系统原因
+    安全：错误只包含去除凭据和查询参数的endpoint，不记录header、API key和请求body
+
+safe_endpoint(url: &Url) -> String
+    安全端点：私有函数，只保留origin，移除用户凭据、path、查询参数与fragment
+
+summarize_reqwest_error(error: &reqwest::Error) -> String
+    汇总传输错误：私有函数，映射连接、超时、body、decode和request类别并保留最深层source
+
+provider_error_detail(body: &[u8]) -> Option<String>
+    提取Provider错误：私有函数，优先读取error.message、error、message或detail字符串，否则使用有界正文
+    安全：移除控制字符、折叠空白，最终仍受InferenceError的512字节限制
 ```
 
 ## 逻辑
@@ -453,7 +464,7 @@ Provider边界：
     Provider API key和Authorization header只存在于路由配置加载期、Adapter与ProviderHttpRequest私有字段
     TOML解析错误只返回行列位置和类别，不回显可能包含api_key的原文行
     AgentMessage、AgentFailure、InferenceError、日志和Tracing字段不得包含secret、完整请求正文或完整响应正文
-    非2xx响应最多读取有界错误正文，由Adapter转换成ResponseStatus
+    非2xx响应最多读取有界错误正文，提取常见错误字段并转换成ResponseStatus
     messages、工具Schema、单分片、累计响应和错误文本均设置大小上限
     ModelId路由不存在、失效Agent或缺少启动快照在主线程立即失败，不启动异步任务
     Provider执行与Adapter解析panic在推理任务内转换为可路由的TaskPanicked
