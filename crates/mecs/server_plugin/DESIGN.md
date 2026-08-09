@@ -681,7 +681,7 @@ WebSocket默认支流信封：
 
 连接注册：
     客户端发送connection.register协议请求
-        -> ApiPlugin转换为RegisterConnection事件
+        -> DtoPlugin转换为RegisterConnection事件
         -> ConnectionPlugin消费事件并写入WebSocketConnections的类型和名称索引
     ServerPlugin只负责保存和查询连接，不解析客户端业务协议
 

@@ -23,10 +23,10 @@ assert_eq!(image.to_string(), "local/coder:latest");
 Compose使用 `WorkspaceDefinition` 和 `WorkspaceAgentDefinition` 把配置文件编译成进程内静态业务
 输入。它们不包含运行时Entity，也不负责加载镜像、打开Memory或创建AgentInstance。
 
-消息层定义 `ToolCall`、`ToolDefinition`、`Message`、`AgentReference`、`AgentMessage`、`AgentContextMessagesUpdated` 和 `AgentFailure`。产生消息的
+消息层定义 `ToolCall`、`ToolDefinition`、`Message`、`AgentMessage`、`AgentContextMessagesUpdated` 和 `AgentFailure`。产生消息的
 Plugin直接赋予 `MessageIntent`，AgentPlugin记入消息并执行意图，不再把各Plugin结果事件二次转换为
 消息。`AgentMessage` 和 `AgentContextMessagesUpdated` 是进程内部ECS事件，不是CLI/daemon协议。
-`AgentMessage.agent` 使用 `AgentReference`：API入口使用稳定ID，AgentPlugin解析后使用Entity；稳定ID不暴露ECS内部句柄。
+`AgentMessage.agent` 始终使用后端内部 `Entity`。WorkspacePlugin 在产生用户消息事件前完成逻辑名称解析，协议 DTO 使用稳定 Agent ID，不暴露 ECS 内部句柄。
 
 用户消息的两种意图只区分前端是否指定了实际工具调用。指定Skill、Workflow或其他工具时，
 AgentPlugin先进入ToolCall流程，等Tool响应写入上下文后再推理；没有指定时直接推理。两种路径最终

@@ -33,71 +33,107 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 公开：
 ```text
-ClientRequest：客户端WebSocket请求，公开枚举--统一使用type、id和message三个顶层字段
+FromDomain<Domain, Context = ()>：领域值到DTO转换trait，公开trait--由DTO类型实现
+    from_domain(domain: Domain, context: Context) -> Result<Self, ProtocolError>
+        从领域值构造DTO：context提供转换需要的运行时信息，需要查询ECS时使用&World
+
+IntoDomain<Domain, Context = ()>：DTO到领域值转换trait，公开trait--由DTO类型实现
+    into_domain(self, context: Context) -> Result<Domain, ProtocolError>
+        将DTO转换为领域值：context提供请求ID、连接ID或&World等转换上下文
+
+IntoDto<Dto, Context = ()>：领域值转DTO便捷trait，公开trait--根据Dto: FromDomain<Self, Context>自动实现
+    into_dto(self, context: Context) -> Result<Dto, ProtocolError>
+        转换为DTO：调用Dto::from_domain(self, context)
+
+FromDto<Dto, Context = ()>：DTO转领域值便捷trait，公开trait--根据Dto: IntoDomain<Self, Context>自动实现
+    from_dto(dto: Dto, context: Context) -> Result<Self, ProtocolError>
+        从DTO构造：调用dto.into_domain(context)
+
+ClientMessage：客户端WebSocket请求，公开枚举--统一使用type、id和message三个顶层字段
     ConnectionRegister { id: String, message: RegisterConnectionDto }
         connection.register：声明当前连接的客户端类型
     WorkspaceStart { id: String, message: StartWorkspaceDto }
         workspace.start：提交编译后的Workspace定义
     AgentMessage { id: String, message: RouteAgentMessageDto }
         agent.message：向逻辑Agent投递一条用户消息
-    impl Serialize + Deserialize for ClientRequest
+    impl Serialize + Deserialize for ClientMessage
         Serialize + Deserialize：将type作为判别字段，将业务payload放入message字段
     register_connection(id: impl Into<String>, client_type: impl Into<String>) -> Self
         构造连接请求：构造统一信封，不校验连接类型
     start_workspace(id: impl Into<String>, definition: &WorkspaceDefinition) -> Self
         构造Workspace请求：使用StartWorkspaceDto保存可序列化定义
-    agent_message(id: impl Into<String>, message: RouteAgentMessageDto) -> Self
-        构造Agent请求：使用RouteAgentMessageDto作为message字段
+    agent_message(id: impl Into<String>, workspace: &WorkspaceReferenceDto, agent: Option<String>, content: impl Into<String>) -> Self
+        构造Agent请求：构造只包含UserMessageDto的RouteAgentMessageDto
 
 RegisterConnectionDto：连接注册DTO，公开结构体--保存客户端声明的连接类型
     client_type: String--客户端类型，例如webui或cli
-    into_domain(self, id: String, connection_id: WebSocketConnectionId) -> RegisterConnection
-        转换连接命令：把协议字段和当前连接上下文转换为ConnectionPlugin领域事件
+    impl IntoDomain<RegisterConnection, (String, WebSocketConnectionId)> for RegisterConnectionDto
+        转换连接命令：把协议字段、请求ID和当前连接转换为ConnectionPlugin领域事件
 
 StartWorkspaceDto：Workspace启动DTO，公开结构体--保存StartWorkspace可序列化输入
     definition: WorkspaceDefinitionDto--Workspace静态定义
-    into_domain(self, id: String) -> Result<StartWorkspace, ProtocolError>
-        转换Workspace命令：调用WorkspaceDefinitionDto::into_domain并构造StartWorkspace
+    impl IntoDomain<StartWorkspace, String> for StartWorkspaceDto
+        转换Workspace命令：使用请求ID并调用WorkspaceDefinitionDto的IntoDomain实现
 
 RouteAgentMessageDto：逻辑Agent消息DTO，公开结构体--保存尚未解析Entity的消息路由信息
     workspace: WorkspaceReferenceDto--目标Workspace逻辑引用
     agent: Option<String>--Agent逻辑名称，None表示manager
-    message: margatroid_types::Message--消息内容，当前入口只接受User变体
-    into_domain(self, id: String) -> RouteAgentMessage
-        转换消息命令：将WorkspaceReferenceDto转换为WorkspaceReference并保留Message
+    message: UserMessageDto--用户消息内容，协议结构无法表达System、Assistant或Tool输入
+    impl IntoDomain<RouteAgentMessage, String> for RouteAgentMessageDto
+        转换消息命令：使用请求ID，将WorkspaceReferenceDto转换为WorkspaceReference并保留Message
 
 WorkspaceDefinitionDto：Workspace定义DTO，公开结构体--保存不含Entity的可序列化定义
     name: String--Workspace名称
     project_root: String--项目根路径文本
     manager: String--默认Agent名称
     agents: Vec<WorkspaceAgentDefinitionDto>--Agent静态定义
-    from_domain(definition: &WorkspaceDefinition) -> Self
+    impl FromDomain<&WorkspaceDefinition> for WorkspaceDefinitionDto
         转换领域定义：将路径、镜像和资源转换为字符串
-    into_domain(self) -> Result<WorkspaceDefinition, ProtocolError>
+    impl IntoDomain<WorkspaceDefinition> for WorkspaceDefinitionDto
         转换领域值：解析镜像、资源和路径
 
 WorkspaceReferenceDto：Workspace逻辑引用DTO，公开结构体--保存跨进程定位信息
     name: String--Workspace名称
     project_root: String--项目根路径文本
-    into_domain(self) -> Result<WorkspaceReference, ProtocolError>
+    impl FromDomain<&WorkspaceDefinition> for WorkspaceReferenceDto
+        转换逻辑引用：从Workspace定义提取名称和项目根
+    impl IntoDomain<WorkspaceReference> for WorkspaceReferenceDto
         转换逻辑引用：将project_root转换为PathBuf
 
-ServerEvent：daemon发给客户端的协议事件，公开枚举--统一使用type和业务字段
+ServerMessage：daemon发给客户端的协议事件，公开枚举--统一使用type和业务字段
     Log { record: LogRecordDto }
     StateSync { state: BackendStateDto }
     WorkspaceStarted { id: String, workspace: WorkspaceInfoDto }
     AgentMessage { message: AgentMessageDto }
     AgentFailure { failure: AgentFailureDto }
-    impl Serialize + Deserialize for ServerEvent
+    impl Serialize + Deserialize for ServerMessage
         Serialize + Deserialize：使用type区分事件类型
 
-AgentMessageDto：Agent消息展示DTO，公开结构体--把领域AgentReference::Entity投影为逻辑身份
+UserMessageDto：用户输入DTO，公开结构体--只允许客户端提交用户文本
+    content: String--用户消息正文
+    impl IntoDomain<Message> for UserMessageDto
+        转换用户消息：构造Message::User，不允许客户端选择其他领域Message变体
+
+ToolCallDto：工具调用展示DTO，公开结构体--隔离领域ToolCall的协议表示
+    id: String--工具调用ID
+    name: String--外部工具名称
+    arguments: String--JSON参数文本
+    impl FromDomain<&ToolCall> for ToolCallDto
+        转换工具调用：复制稳定外部字段
+
+MessageDto：可展示消息DTO，公开枚举--只包含历史表和前端允许展示的消息类型
+    User { content: String }
+    Assistant { content: Option<String>, tool_calls: Vec<ToolCallDto> }
+    impl FromDomain<&Message> for MessageDto
+        转换可展示消息：User和Assistant成功；System和Tool返回UnsupportedMessage
+
+AgentMessageDto：Agent消息展示DTO，公开结构体--把领域Agent Entity投影为稳定逻辑ID
     id: String--消息或turn ID
     workspace: WorkspaceReferenceDto--所属Workspace
-    agent: String--稳定Agent逻辑ID或展示名称
-    message: margatroid_types::Message--可展示消息正文
-    from_domain(...) -> Self
-        转换展示消息：由API应用层补充Workspace和Agent逻辑身份
+    agent: String--AgentIdentity保存的稳定Agent逻辑ID
+    message: MessageDto--隔离后的可展示消息正文
+    impl FromDomain<&AgentMessage, &World> for AgentMessageDto
+        转换展示消息：通过World将Agent Entity解析成稳定Agent ID
 
 AgentFailureDto：Agent失败展示DTO，公开结构体--把领域失败投影为可展示文本
     id: String--轮次或请求ID
@@ -105,6 +141,8 @@ AgentFailureDto：Agent失败展示DTO，公开结构体--把领域失败投影�
     agent: String--Agent稳定逻辑ID
     kind: String--失败来源
     message: String--有界错误描述
+    impl FromDomain<&AgentFailure, &World> for AgentFailureDto
+        转换失败：解析稳定Agent ID与Workspace，并显式映射稳定kind字符串
 
 LogRecordDto：结构化日志DTO，公开结构体--保存客户端展示所需的日志字段
     timestamp_millis: u64--日志时间
@@ -117,15 +155,16 @@ LogRecordDto：结构化日志DTO，公开结构体--保存客户端展示所需
 BackendStateDto：后端状态快照DTO，公开结构体--保存前端权威状态
     workspaces: Vec<WorkspaceInfoDto>--当前已就绪Workspace
     histories: Vec<AgentHistoryDto>--可展示历史
-```
+    impl FromDomain<(), &World> for BackendStateDto
+        转换完整状态：查询全部Workspace、Agent和Memory历史并构造快照
 
-私有：
-```text
-WorkspaceAgentDefinitionDto：单Agent定义DTO，私有结构体--保存镜像、资源和Memory路径文本
-ResourceRefDto：资源引用DTO，私有结构体--保存provider和scope/name文本
-LogFieldDto：日志字段DTO，私有结构体--保存字段名和值
-AgentHistoryDto：Agent历史DTO，私有结构体--保存Workspace引用、Agent ID和HistoryMessageDto列表
-HistoryMessageDto：历史消息DTO，私有结构体--保存序号、turn ID、Message、资源标记和时间
+WorkspaceAgentDefinitionDto：单Agent定义DTO，公开结构体--保存镜像、资源和Memory路径文本
+ResourceRefDto：资源引用DTO，公开结构体--保存provider和scope/name文本
+LogFieldDto：日志字段DTO，公开结构体--保存字段名和值
+AgentHistoryDto：Agent历史DTO，公开结构体--保存Workspace引用、Agent逻辑名称和HistoryMessageDto列表
+HistoryMessageDto：历史消息DTO，公开结构体--保存序号、turn ID、MessageDto、资源标记和时间
+    impl FromDomain<HistoryMessage> for HistoryMessageDto
+        转换历史条目：转换可展示Message和ResourceRef列表
 ```
 
 ## 逻辑
@@ -134,9 +173,9 @@ HistoryMessageDto：历史消息DTO，私有结构体--保存序号、turn ID、
 统一入站信封：
     前端发送 { type, id, message }
         -> ServerPlugin::WebSocketMessageReceived
-        -> ApiPlugin反序列化ClientRequest
+        -> DtoPlugin反序列化ClientMessage
         -> message DTO调用into_domain
-        -> ApiPlugin直接发送领域事件
+        -> DtoPlugin直接发送领域事件
 
 领域事件：
     workspace.start -> StartWorkspace
@@ -146,14 +185,15 @@ HistoryMessageDto：历史消息DTO，私有结构体--保存序号、turn ID、
 Agent消息路由：
     RouteAgentMessage携带WorkspaceReference和Agent逻辑名称
         -> WorkspacePlugin查询Workspace
-        -> 生成稳定Agent ID或使用已有ID
-        -> 发送AgentMessage { agent: AgentReference::Id }
-        -> AgentPlugin解析AgentIdentity并使用Entity处理
+        -> WorkspaceAgents按逻辑名称取得Agent Entity
+        -> 发送AgentMessage { agent: Entity }
+        -> AgentPlugin直接使用Entity处理
 
 出站：
     领域事件或状态
-        -> API应用层构造ServerEvent
-        -> ApiPlugin序列化并发送WebSocket文本
+        -> 对应DTO调用FromDomain，必要时只读查询World
+        -> DtoPlugin构造ServerMessage
+        -> DtoPlugin序列化并发送WebSocket文本
 ```
 
 ## 边界
@@ -162,24 +202,24 @@ Agent消息路由：
 Protocol负责：
     定义跨进程JSON形状
     定义所有XxxDto
-    实现DTO到共享领域值或领域命令的数据转换
+    集中定义FromDomain、IntoDomain、IntoDto和FromDto
+    由DTO类型实现与领域类型之间的信息隔离转换
     保证协议不暴露ECS Entity
 
 Protocol不负责：
-    查询Workspace或Agent
+    修改Workspace、Agent或Memory状态
     生成Agent Entity
     决定manager
     执行消息意图、工具或推理
 
-ApiPlugin负责：
+DtoPlugin负责：
     接收WebSocketMessageReceived
     解包统一信封
     调用DTO转换方法
     直接发送领域事件
-    序列化ServerEvent并发送
+    序列化ServerMessage并发送
 
-ApiPlugin不再负责：
-    发送StartWorkspace、RouteAgentMessage或RegisterConnection领域事件
-    查找Workspace或Agent Entity
+DtoPlugin不再负责：
+    发送只复制字段的API中间事件
     执行领域业务
 ```

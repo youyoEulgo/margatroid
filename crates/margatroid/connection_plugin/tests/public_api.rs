@@ -2,13 +2,13 @@ use std::net::SocketAddr;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use api_plugin::{ApiPlugin, WebSocketMessageSend, WebSocketMessageTarget};
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
 use connection_plugin::ConnectionPlugin;
 use core_plugin::{App, World};
+use dto_plugin::{DtoPlugin, WebSocketMessageSend, WebSocketMessageTarget};
 use futures_util::{SinkExt, StreamExt};
-use margatroid_protocol::{ClientRequest, LogRecordDto, ServerEvent, WorkspaceReferenceDto};
+use margatroid_protocol::{ClientMessage, LogRecordDto, ServerMessage, WorkspaceReferenceDto};
 use margatroid_types::{Message, RouteAgentMessage};
 use server_plugin::{ServerHandle, ServerPlugin};
 
@@ -34,7 +34,7 @@ fn registered_client_receives_messages_targeted_by_type() {
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(ServerPlugin::bind("127.0.0.1:0"))
-        .add_plugin(ApiPlugin::default())
+        .add_plugin(DtoPlugin::default())
         .add_plugin(ConnectionPlugin::default())
         .add_system(RuntimePlugin::UPDATE, |world: &mut World| {
             let requests = world
@@ -48,7 +48,7 @@ fn registered_client_receives_messages_targeted_by_type() {
             for content in requests {
                 world.send_event(WebSocketMessageSend {
                     target: WebSocketMessageTarget::Type("webui".into()),
-                    message: ServerEvent::Log {
+                    message: ServerMessage::Log {
                         record: LogRecordDto {
                             timestamp_millis: 1,
                             level: "INFO".into(),
@@ -72,15 +72,13 @@ fn registered_client_receives_messages_targeted_by_type() {
                 .await
                 .unwrap();
             let registration =
-                serde_json::to_string(&ClientRequest::register_connection("register-1", "webui"))
+                serde_json::to_string(&ClientMessage::register_connection("register-1", "webui"))
                     .unwrap();
-            let message = serde_json::to_string(&ClientRequest::agent_message(
+            let message = serde_json::to_string(&ClientMessage::agent_message(
                 "message-1",
                 &WorkspaceReferenceDto::new("demo", "/tmp/demo"),
                 None,
-                Message::User {
-                    content: "routed".into(),
-                },
+                "routed",
             ))
             .unwrap();
             socket
@@ -111,9 +109,9 @@ fn registered_client_receives_messages_targeted_by_type() {
     let tokio_tungstenite::tungstenite::Message::Text(response) = response else {
         panic!("expected a text response");
     };
-    let response: ServerEvent = serde_json::from_str(&response).unwrap();
+    let response: ServerMessage = serde_json::from_str(&response).unwrap();
     assert!(matches!(
         response,
-        ServerEvent::Log { record } if record.message == "routed"
+        ServerMessage::Log { record } if record.message == "routed"
     ));
 }

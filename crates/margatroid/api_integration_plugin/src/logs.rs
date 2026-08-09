@@ -1,7 +1,21 @@
-use api_plugin::{WebSocketMessageSend, WebSocketMessageTarget};
 use app_runtime_plugin::RuntimeEventSender;
-use log_plugin::{TracingRecord, TracingStream, TracingStreamError};
-use margatroid_protocol::{LogFieldDto, LogRecordDto, ServerEvent};
+use core_plugin::World;
+use dto_plugin::{WebSocketMessageSend, WebSocketMessageTarget};
+use log_plugin::{TracingStream, TracingStreamError};
+use margatroid_protocol::{IntoDto, LogRecordDto, ServerMessage};
+use server_plugin::{ServerFailed, ServerStarted, ServerStopped};
+
+pub(crate) fn report_server_events(world: &mut World) {
+    for event in world.event_reader::<ServerStarted>() {
+        tracing::info!(address = %event.address, "daemon WebSocket server started");
+    }
+    for event in world.event_reader::<ServerFailed>() {
+        tracing::error!(error = %event.message, "daemon WebSocket server failed");
+    }
+    if !world.event_reader::<ServerStopped>().is_empty() {
+        tracing::info!("daemon WebSocket server stopped");
+    }
+}
 
 pub(crate) async fn forward_logs(stream: TracingStream, events: RuntimeEventSender) {
     let mut subscription = stream.subscribe();
@@ -14,29 +28,12 @@ pub(crate) async fn forward_logs(stream: TracingStream, events: RuntimeEventSend
             }
             Err(TracingStreamError::Closed) | Err(_) => break,
         };
+        let Ok(record): Result<LogRecordDto, _> = record.into_dto(()) else {
+            continue;
+        };
         events.send_event(WebSocketMessageSend {
             target: WebSocketMessageTarget::Broadcast,
-            message: ServerEvent::Log {
-                record: log_record(record),
-            },
+            message: ServerMessage::Log { record },
         });
-    }
-}
-
-fn log_record(record: TracingRecord) -> LogRecordDto {
-    LogRecordDto {
-        timestamp_millis: record.timestamp_millis,
-        level: record.level,
-        target: record.target,
-        message: record.message,
-        fields: record
-            .fields
-            .into_iter()
-            .map(|field| LogFieldDto {
-                name: field.name,
-                value: field.value,
-            })
-            .collect(),
-        spans: record.spans,
     }
 }

@@ -56,7 +56,7 @@ connection_registration_system(world: &mut World)
 ```text
 客户端连接注册：
     connection.register
-        -> ApiPlugin::api_route_system
+        -> DtoPlugin::dto_route_system
         -> RegisterConnection
         -> ConnectionPlugin::connection_registration_system
         -> WebSocketConnections::set_connection_type
@@ -82,8 +82,8 @@ ConnectionPlugin负责：
     将类型和名称写入WebSocketConnections
 
 ConnectionPlugin不负责：
-    解析WebSocket frame或ClientRequest JSON
-    构造Workspace、Agent或ServerEvent
+    解析WebSocket frame或ClientMessage JSON
+    构造Workspace、Agent或ServerMessage
     发送WebSocket消息
     认证客户端或提供权限控制
     处理连接断开；连接生命周期和索引清理由ServerPlugin负责

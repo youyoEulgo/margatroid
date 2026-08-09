@@ -1,5 +1,5 @@
 [package]
-name = "api_plugin"
+name = "dto_plugin"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,6 +11,7 @@ margatroid_types = { path = "../types" }
 serde_json = { workspace = true }
 server_plugin = { path = "../../mecs/server_plugin" }
 tracing = { workspace = true }
+workspace_plugin = { path = "../workspace_plugin" }
 
 [dev-dependencies]
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }

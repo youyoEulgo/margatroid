@@ -23,7 +23,7 @@ run(config: DaemonConfig) -> Result<(), Error>
         检查models.toml存在
         打开AgentImage、Workspace、Skill和Workflow Plugin所需目录
         安装运行时、日志、Server和全部领域Plugin
-        安装ApiPlugin、ConnectionPlugin和ApiIntegrationPlugin
+        安装DtoPlugin、ConnectionPlugin和ApiIntegrationPlugin
         记录启动信息并调用AppRunExt::run
 
 parse_args(arguments: impl IntoIterator<Item = String>) -> Result<DaemonConfig, String>
@@ -56,5 +56,5 @@ main
     daemon负责进程参数、路径准备、Plugin配置与装配、进程退出
     daemon不定义或注册业务System
     daemon不解析API消息，不路由Workspace或Agent，不构造前端状态，不转发日志
-    API DTO与领域命令转换由ApiPlugin负责，领域状态到客户端事件的投影由ApiIntegrationPlugin负责
+    API DTO与领域命令转换由DtoPlugin负责，领域状态到客户端事件的投影由ApiIntegrationPlugin负责
 ```

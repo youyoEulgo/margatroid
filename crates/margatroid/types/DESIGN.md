@@ -151,22 +151,16 @@ MessageIntent：统一消息意图，公开枚举--由产生消息的可信来�
     impl Clone + PartialEq + Eq for MessageIntent
         值语义：公开trait实现
 
-AgentReference：Agent实例引用，公开枚举--允许跨边界使用稳定Agent ID，也允许运行时Plugin使用Entity
-    Entity(Entity)--已经解析的Agent ECS Entity，仅供后端内部事件使用
-    Id(String)--Agent稳定逻辑ID，例如demo.coder0，供API入口和跨Plugin消息使用
-    impl Clone + PartialEq + Eq for AgentReference
-        值语义：公开trait实现
-
 AgentMessage：统一Agent消息事件，公开结构体--Margatroid内部所有成功消息来源交给AgentPlugin的唯一格式
     id: String--完整用户交互轮次ID
-    agent: AgentReference--消息所属Agent，可为外部稳定ID或已解析Entity
+    agent: Entity--消息所属Agent，进入事件队列前必须完成逻辑身份解析
     message: Message--需要写入Agent动态上下文的统一消息
     intent: MessageIntent--消息来源已经决定的后续处理意图
     impl Event for AgentMessage
         Event：公开trait实现
     impl Clone for AgentMessage
         Clone：公开trait实现
-    限制：message只能是User、Assistant或Tool，不能是System；Id只允许作为进入AgentPlugin前的引用；结构体不提供业务方法；来源Plugin负责构造，AgentPlugin负责解析引用、记入消息和执行intent
+    限制：message只能是User、Assistant或Tool，不能是System；结构体不提供业务方法；来源Plugin负责提供Entity和意图，AgentPlugin负责记入消息并执行intent
 
 AgentContextMessagesUpdated：Agent上下文更新事件，公开结构体--AgentContext修改完成后通知MemoryPlugin同步实时消息表
     agent: Entity--消息所属AgentInstance Entity
