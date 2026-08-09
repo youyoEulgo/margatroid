@@ -33,7 +33,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 公开：
 ```text
-ApiIntegrationPlugin：API应用层投影插件，公开结构体--连接Margatroid领域状态与ApiPlugin的出站事件
+ApiIntegrationPlugin：前端状态与日志集成插件，公开结构体--生成后端完整状态并转发结构化日志
     schedule: String--全部同步System所属Schedule，默认RuntimePlugin::UPDATE
     frontend_type: String--接收完整状态快照的连接类型，默认webui
     new() -> Self
@@ -49,7 +49,7 @@ ApiIntegrationPlugin：API应用层投影插件，公开结构体--连接Margatr
     impl Plugin for ApiIntegrationPlugin
         Plugin：公开trait实现
         build(self, app: &mut App)
-            安装投影：检查安装条件，启动日志转发服务并注册报告和快照System
+            安装集成：检查安装条件，启动日志转发服务并注册Server日志和状态快照System
 ```
 
 私有：
@@ -62,47 +62,24 @@ ApiIntegrationPluginInstalled：插件安装标记，私有资源--阻止重复�
 私有：
 ```text
 forward_logs(stream: TracingStream, events: RuntimeEventSender)
-    转发结构化日志：私有异步函数，持续将TracingRecord转换为广播WebSocketMessageSend
+    转发结构化日志：私有异步函数，调用TracingRecord::into_dto并发送广播WebSocketMessageSend
 
-log_record(record: TracingRecord) -> LogRecordDto
-    转换日志：私有函数，逐字段构造协议日志DTO
-
-report_runtime_events(world: &mut World)
-    投影运行事件：私有System，依次调用各类运行事件报告函数
-
-report_server_events(world: &World)
+report_server_events(world: &mut World)
     报告Server事件：私有函数，将Server生命周期事件写入结构化日志
 
-report_workspace_events(world: &World)
-    报告Workspace事件：私有函数，将启动结果转换为日志和WebSocketMessageSend
-
-report_agent_messages(world: &World)
-    报告Agent消息：私有函数，反查Agent逻辑身份并转换为WebSocketMessageSend
-
-report_agent_failures(world: &World)
-    报告Agent失败：私有函数，反查Agent逻辑身份并转换为日志和WebSocketMessageSend
-
 sync_frontend_state_system(world: &mut World, frontend_type: &str)
-    同步完整状态：私有System，构造BackendStateDto并发送给指定连接类型
+    同步完整状态：私有System，调用()::into_dto(&World)构造BackendStateDto并发送给指定连接类型
 
-backend_state(world: &World) -> Result<BackendStateDto, String>
-    构造后端状态：私有函数，按Workspace读取Agent历史表并生成完整有序快照
-
-workspace_info(world: &World, workspace: Entity) -> Option<WorkspaceInfoDto>
-    转换Workspace：私有函数，从WorkspaceConfiguration构造协议DTO
-
-agent_route(world: &World, agent: &AgentReference) -> Option<(WorkspaceReferenceDto, String)>
-    反查Agent身份：私有函数，Entity直接反查Workspace，Id先查AgentIdentity再反查Workspace
 ```
 
 ## 逻辑
 
 ```text
-出站业务状态：
-    Workspace、Agent、Memory和Server产生领域事件或状态
-        -> ApiIntegrationPlugin构造ServerEvent
-        -> 发送WebSocketMessageSend
-        -> ApiPlugin序列化并选择连接
+完整状态：
+    Workspace、Agent和Memory当前状态
+        -> Protocol的BackendStateDto::from_domain读取完整状态
+        -> sync_frontend_state_system包装ServerMessage
+        -> WebSocketMessageSend::Type(frontend_type)
 
 日志：
     LogPlugin::TracingStream
@@ -111,7 +88,7 @@ agent_route(world: &World, agent: &AgentReference) -> Option<(WorkspaceReference
 
 边界：
     ApiIntegrationPlugin不解析或序列化WebSocket JSON，不持有发送器，不执行领域业务
-    ApiPlugin负责DTO转换和入站领域事件发送，不查询Workspace、Agent或Memory
+    DtoPlugin负责DTO转换、入站领域事件发送和即时出站事件投影
     Workspace、Agent和Memory Plugin不依赖API协议或客户端连接
     daemon不注册业务System，只配置并安装Plugin
 ```

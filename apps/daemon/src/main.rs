@@ -7,11 +7,11 @@ use std::process;
 use agent_image_loader_plugin::AgentImageLoaderPlugin;
 use agent_plugin::AgentPlugin;
 use api_integration_plugin::ApiIntegrationPlugin;
-use api_plugin::ApiPlugin;
 use app_runtime_plugin::{AppRunExt, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimePlugin;
 use connection_plugin::ConnectionPlugin;
 use core_plugin::App;
+use dto_plugin::DtoPlugin;
 use inference_plugin::InferencePlugin;
 use log_plugin::LogPlugin;
 use memory_plugin::MemoryPlugin;
@@ -84,7 +84,7 @@ fn run(config: DaemonConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(MemoryPlugin::default())
         .add_plugin(AgentPlugin::default())
         .add_plugin(workspace)
-        .add_plugin(ApiPlugin::default())
+        .add_plugin(DtoPlugin::default())
         .add_plugin(ConnectionPlugin::default())
         .add_plugin(ApiIntegrationPlugin::default());
 

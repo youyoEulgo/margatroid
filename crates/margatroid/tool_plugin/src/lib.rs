@@ -13,8 +13,8 @@ use async_runtime_plugin::{
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use futures_util::FutureExt;
 use margatroid_types::{
-    AgentMessage, AgentReference, AgentResourcesUsed, Message, MessageIntent, ResourceName,
-    ResourceRef, ToolCall, ToolDefinition,
+    AgentMessage, AgentResourcesUsed, Message, MessageIntent, ResourceName, ResourceRef, ToolCall,
+    ToolDefinition,
 };
 use serde::de::DeserializeOwned;
 
@@ -666,7 +666,7 @@ fn send_tool_message(
 ) {
     world.send_event(AgentMessage {
         id,
-        agent: AgentReference::Entity(agent),
+        agent,
         message: Message::Tool {
             tool_call_id,
             content,
@@ -814,7 +814,7 @@ mod tests {
                 .next()
             {
                 assert_eq!(message.id, "request");
-                assert_eq!(message.agent, AgentReference::Entity(agent));
+                assert_eq!(message.agent, agent);
                 assert_eq!(message.intent, MessageIntent::ResolveToolCall);
                 assert_eq!(
                     message.message,

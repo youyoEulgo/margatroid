@@ -10,8 +10,8 @@ server_plugin = { path = "../../mecs/server_plugin" }
 tracing = { workspace = true }
 
 [dev-dependencies]
-api_plugin = { path = "../api_plugin" }
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
+dto_plugin = { path = "../dto_plugin" }
 futures-util = { workspace = true }
 margatroid_protocol = { path = "../protocol" }
 margatroid_types = { path = "../types" }

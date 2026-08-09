@@ -1,17 +1,17 @@
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Event, Plugin, Resource, World};
-use margatroid_protocol::{ClientRequest, ServerEvent};
+use margatroid_protocol::{ClientMessage, IntoDomain, ServerMessage};
 use server_plugin::{
     AppServerExt, WebSocketConnections, WebSocketMessage, WebSocketMessageReceived,
 };
 
 #[derive(Clone, Debug)]
-pub struct ApiPlugin {
+pub struct DtoPlugin {
     websocket_path: String,
     schedule: String,
 }
 
-impl ApiPlugin {
+impl DtoPlugin {
     pub fn new() -> Self {
         Self {
             websocket_path: "/ws".into(),
@@ -30,7 +30,7 @@ impl ApiPlugin {
     }
 }
 
-impl Default for ApiPlugin {
+impl Default for DtoPlugin {
     fn default() -> Self {
         Self::new()
     }
@@ -46,33 +46,34 @@ pub enum WebSocketMessageTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebSocketMessageSend {
     pub target: WebSocketMessageTarget,
-    pub message: ServerEvent,
+    pub message: ServerMessage,
 }
 
 impl Event for WebSocketMessageSend {}
 
-struct ApiPluginInstalled;
+struct DtoPluginInstalled;
 
-impl Resource for ApiPluginInstalled {}
+impl Resource for DtoPluginInstalled {}
 
-impl Plugin for ApiPlugin {
+impl Plugin for DtoPlugin {
     fn build(self, app: &mut App) {
-        if app.world().contains_resource::<ApiPluginInstalled>() {
-            panic!("ApiPlugin is already installed");
+        if app.world().contains_resource::<DtoPluginInstalled>() {
+            panic!("DtoPlugin is already installed");
         }
         if !app.contains_schedule(&self.schedule) {
-            panic!("ApiPlugin schedule does not exist: {}", self.schedule);
+            panic!("DtoPlugin schedule does not exist: {}", self.schedule);
         }
         if !app.world().contains_resource::<WebSocketConnections>() {
-            panic!("ServerPlugin must be installed before ApiPlugin");
+            panic!("ServerPlugin must be installed before DtoPlugin");
         }
-        app.world_mut().insert_resource(ApiPluginInstalled);
+        app.world_mut().insert_resource(DtoPluginInstalled);
         app.add_websocket_event_route(&self.websocket_path)
-            .add_system(&self.schedule, api_route_system);
+            .add_system(&self.schedule, outbound::collect_external_events_system)
+            .add_system(&self.schedule, dto_route_system);
     }
 }
 
-fn api_route_system(world: &mut World) {
+fn dto_route_system(world: &mut World) {
     let received = world
         .event_reader::<WebSocketMessageReceived>()
         .into_iter()
@@ -85,7 +86,7 @@ fn api_route_system(world: &mut World) {
             );
             continue;
         };
-        let request = match serde_json::from_str::<ClientRequest>(text.as_str()) {
+        let request = match serde_json::from_str::<ClientMessage>(text.as_str()) {
             Ok(request) => request,
             Err(error) => {
                 tracing::warn!(connection = received.connection_id.get(), error = %error, "ignoring invalid API request");
@@ -93,10 +94,17 @@ fn api_route_system(world: &mut World) {
             }
         };
         match request {
-            ClientRequest::ConnectionRegister { id, message } => {
-                world.send_event(message.into_domain(id, received.connection_id));
+            ClientMessage::ConnectionRegister { id, message } => {
+                match message.into_domain((id, received.connection_id)) {
+                    Ok(event) => world.send_event(event),
+                    Err(error) => tracing::warn!(
+                        connection = received.connection_id.get(),
+                        error = %error,
+                        "invalid connection.register payload"
+                    ),
+                }
             }
-            ClientRequest::WorkspaceStart { id, message } => match message.into_domain(id) {
+            ClientMessage::WorkspaceStart { id, message } => match message.into_domain(id) {
                 Ok(event) => world.send_event(event),
                 Err(error) => tracing::warn!(
                     connection = received.connection_id.get(),
@@ -104,9 +112,14 @@ fn api_route_system(world: &mut World) {
                     "invalid workspace.start payload"
                 ),
             },
-            ClientRequest::AgentMessage { id, message } => {
-                world.send_event(message.into_domain(id));
-            }
+            ClientMessage::AgentMessage { id, message } => match message.into_domain(id) {
+                Ok(event) => world.send_event(event),
+                Err(error) => tracing::warn!(
+                    connection = received.connection_id.get(),
+                    error = %error,
+                    "invalid agent.message payload"
+                ),
+            },
         }
     }
 
@@ -145,3 +158,4 @@ fn api_route_system(world: &mut World) {
         }
     }
 }
+mod outbound;

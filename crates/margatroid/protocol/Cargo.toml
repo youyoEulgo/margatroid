@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+agent_plugin = { path = "../agent_plugin" }
+core_plugin = { path = "../../mecs/core_plugin" }
+log_plugin = { path = "../../mecs/log_plugin" }
 margatroid_types = { path = "../types" }
+memory_plugin = { path = "../memory_plugin" }
 server_plugin = { path = "../../mecs/server_plugin" }
 serde = { workspace = true }
+workspace_plugin = { path = "../workspace_plugin" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -1,12 +1,13 @@
 # ApiIntegrationPlugin
 
-`ApiIntegrationPlugin` 是领域运行时到 `ApiPlugin` 的应用层投影插件。它把 Workspace、Agent、Memory、
-Server 和日志状态投影为 `WebSocketMessageSend`。
+`ApiIntegrationPlugin` 负责触发完整前端状态和日志集成。具体 DTO 转换由 Protocol 的 `FromDomain`
+实现完成，它只把转换结果包装为 `WebSocketMessageSend`。
 
 边界如下：
 
-- `ApiPlugin` 处理 WebSocket 文本、协议 JSON、DTO 转换和领域命令发送；
-- `ApiIntegrationPlugin` 只负责领域事件到客户端 DTO 的投影；
+- `DtoPlugin` 处理 WebSocket 文本、协议 JSON、DTO 转换和领域命令发送；
+- `DtoPlugin` 收集允许发送给外部的即时领域事件并构造客户端 DTO；
+- `ApiIntegrationPlugin` 只负责完整状态快照和日志转发；
 - 领域 Plugin 不依赖 WebSocket 或客户端连接；
 - daemon 只负责配置、Plugin 装配和启动。
 

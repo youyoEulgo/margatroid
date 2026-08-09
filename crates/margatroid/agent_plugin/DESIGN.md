@@ -154,17 +154,12 @@ agent_create_system(world: &mut World)
         不读取Workspace、AgentImage或磁盘，不挂载其他Plugin拥有的组件
 
 agent_message_system(world: &mut World)
-    处理Agent消息：读取统一AgentMessage，解析AgentReference后调用handle_message
+    处理Agent消息：读取统一AgentMessage并使用其中的Entity调用handle_message
     行为：
-        AgentReference::Entity直接使用Entity
-        AgentReference::Id调用find_agent_by_id查找AgentIdentity
-        引用无法解析时发送AgentFailure并结束当前事件
+        Agent Entity不存在时记录warning并结束当前事件
         Memory错误发送AgentMemoryWriteFailed
         其他错误发送AgentFailure { kind: Agent, id, agent, message }
         失败不伪造Assistant或Tool消息，不继续当前事件后续步骤
-
-find_agent_by_id(world: &World, id: &str) -> Option<Entity>
-    按ID查找Agent：私有函数，遍历存活Entity并匹配AgentIdentity.id
 
 handle_message(world: &mut World, agent: Entity, event: &AgentMessage, events: &RuntimeEventSender)
     处理单条消息：使用已解析Entity，先验证MessageIntent与Message类型组合，再记录消息并进入分支

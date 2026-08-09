@@ -4,15 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-api_plugin = { path = "../api_plugin" }
-agent_plugin = { path = "../agent_plugin" }
+dto_plugin = { path = "../dto_plugin" }
 app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
 log_plugin = { path = "../../mecs/log_plugin" }
 margatroid_protocol = { path = "../protocol" }
-margatroid_types = { path = "../types" }
-memory_plugin = { path = "../memory_plugin" }
 server_plugin = { path = "../../mecs/server_plugin" }
 tracing = { workspace = true }
-workspace_plugin = { path = "../workspace_plugin" }

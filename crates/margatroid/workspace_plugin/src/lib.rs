@@ -12,8 +12,8 @@ use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::{AgentInferenceSnapshot, GlobalModelRoutes, WorldInferenceExt};
 use margatroid_types::{
-    AgentMessage, AgentReference, Message, MessageIntent, ResourceRef, RouteAgentMessage,
-    WorkspaceAgentDefinition, WorkspaceDefinition,
+    AgentMessage, Message, MessageIntent, ResourceRef, RouteAgentMessage, WorkspaceAgentDefinition,
+    WorkspaceDefinition,
 };
 use memory_plugin::{AgentMemory, WorldMemoryExt};
 use tool_plugin::AgentToolEnvironment;
@@ -135,12 +135,7 @@ fn route_agent_message_system(world: &mut World) {
         let agent_name = request
             .agent
             .unwrap_or_else(|| configuration.definition().manager.clone());
-        let Some(index) = configuration
-            .definition()
-            .agents
-            .iter()
-            .position(|agent| agent.name == agent_name)
-        else {
+        let Some(agent) = world.workspace_agent(workspace, &agent_name) else {
             tracing::warn!(id = %request.id, agent = %agent_name, "agent message agent was not found");
             continue;
         };
@@ -150,10 +145,7 @@ fn route_agent_message_system(world: &mut World) {
         }
         world.send_event(AgentMessage {
             id: request.id,
-            agent: AgentReference::Id(format!(
-                "{}.{}{}",
-                request.workspace.name, agent_name, index
-            )),
+            agent,
             message: request.message,
             intent: MessageIntent::UserWithoutToolCalls,
         });

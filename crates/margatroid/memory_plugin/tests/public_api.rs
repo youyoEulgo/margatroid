@@ -1,6 +1,6 @@
 use app_runtime_plugin::RuntimePlugin;
 use core_plugin::App;
-use margatroid_types::{AgentMessage, AgentReference, Message, MessageIntent};
+use margatroid_types::{AgentMessage, Message, MessageIntent};
 use memory_plugin::{AgentMemory, MemoryPlugin, WorldMemoryExt};
 use tempfile::tempdir;
 
@@ -21,7 +21,7 @@ fn documented_public_api_composes_from_an_external_crate() {
     app.world_mut()
         .append_history_message(&AgentMessage {
             id: "turn-1".into(),
-            agent: AgentReference::Entity(agent),
+            agent,
             message: Message::User {
                 content: "hello".into(),
             },

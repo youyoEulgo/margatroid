@@ -1,6 +1,4 @@
-mod identity;
 mod logs;
-mod outbound;
 mod state;
 
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
@@ -68,7 +66,7 @@ impl Plugin for ApiIntegrationPlugin {
             .insert_resource(ApiIntegrationPluginInstalled);
 
         let frontend_type = self.frontend_type;
-        app.add_system(&self.schedule, outbound::report_runtime_events)
+        app.add_system(&self.schedule, logs::report_server_events)
             .add_system(&self.schedule, move |world: &mut World| {
                 state::sync_frontend_state_system(world, &frontend_type);
             });

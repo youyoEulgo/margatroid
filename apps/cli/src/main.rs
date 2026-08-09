@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use compose::compile;
 use futures_util::{SinkExt, StreamExt};
-use margatroid_protocol::{ClientRequest, ServerEvent};
+use margatroid_protocol::{ClientMessage, ServerMessage};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -56,11 +56,11 @@ async fn run_workspace_up(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let definition = compile(&workspace_file)?;
     let request_id = request_id();
-    let registration = serde_json::to_string(&ClientRequest::register_connection(
+    let registration = serde_json::to_string(&ClientMessage::register_connection(
         format!("{request_id}-register"),
         "cli",
     ))?;
-    let request = ClientRequest::start_workspace(&request_id, &definition);
+    let request = ClientMessage::start_workspace(&request_id, &definition);
     let encoded = serde_json::to_string(&request)?;
 
     eprintln!(
@@ -103,7 +103,7 @@ async fn run_workspace_up(
 }
 
 fn print_backend_message(text: &str) {
-    let Ok(ServerEvent::Log { record }) = serde_json::from_str(text) else {
+    let Ok(ServerMessage::Log { record }) = serde_json::from_str(text) else {
         return;
     };
     let fields = record

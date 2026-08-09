@@ -4,8 +4,8 @@ use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, World
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::InferenceCommand;
 use margatroid_types::{
-    AgentContextMessagesUpdated, AgentFailure, AgentFailureKind, AgentMessage, AgentReference,
-    Message, MessageIntent, ResourceRef, ToolCall, ToolDefinition,
+    AgentContextMessagesUpdated, AgentFailure, AgentFailureKind, AgentMessage, Message,
+    MessageIntent, ResourceRef, ToolCall, ToolDefinition,
 };
 use memory_plugin::{AgentMemoryWriteFailed, MemoryError, WorldMemoryExt};
 use tool_plugin::{ToolCallRequest, ToolError, ToolErrorKind, WorldToolExt};
@@ -337,42 +337,25 @@ fn agent_message_system(world: &mut World) {
     let events = world.event_sender();
 
     for message in messages {
-        let Some(agent) = resolve_agent(world, &message.agent) else {
-            tracing::warn!(id = %message.id, "AgentMessage agent reference could not be resolved");
+        let agent = message.agent;
+        if !world.is_alive(agent) {
+            tracing::warn!(id = %message.id, "AgentMessage agent does not exist");
             continue;
-        };
-        let mut resolved = message;
-        resolved.agent = AgentReference::Entity(agent);
-        match handle_message(world, agent, &resolved, &events) {
+        }
+        match handle_message(world, agent, &message, &events) {
             Ok(()) => {}
             Err(AgentStepError::Memory(error)) => {
                 events.send_event(AgentMemoryWriteFailed { agent, error });
             }
             Err(error) => {
                 events.send_event(AgentFailure {
-                    id: resolved.id.clone(),
+                    id: message.id.clone(),
                     agent,
                     kind: AgentFailureKind::Agent,
                     message: error.failure_message(),
                 });
             }
         }
-    }
-}
-
-fn resolve_agent(world: &World, reference: &AgentReference) -> Option<Entity> {
-    match reference {
-        AgentReference::Entity(entity) if world.is_alive(*entity) => Some(*entity),
-        AgentReference::Entity(_) => None,
-        AgentReference::Id(id) => world
-            .query_with::<AgentIdentity>()
-            .result()
-            .into_iter()
-            .find(|entity| {
-                world
-                    .get_component::<AgentIdentity>(*entity)
-                    .is_some_and(|identity| identity.id() == id)
-            }),
     }
 }
 
@@ -435,10 +418,7 @@ fn record_message(
     }
     match event.message {
         Message::User { .. } | Message::Assistant { .. } => world
-            .append_history_message(&AgentMessage {
-                agent: AgentReference::Entity(agent),
-                ..event.clone()
-            })
+            .append_history_message(event)
             .map_err(AgentStepError::Memory)?,
         Message::Tool { .. } => {}
         Message::System { .. } => return Err(AgentStepError::InvalidMessage),
@@ -695,7 +675,7 @@ mod tests {
         let agent = create_agent(&mut app, [missing].into_iter().collect());
         app.world().send_event(AgentMessage {
             id: "turn-1".into(),
-            agent: AgentReference::Id("test.agent0".into()),
+            agent,
             message: Message::User {
                 content: "hello".into(),
             },
@@ -725,7 +705,7 @@ mod tests {
         let agent = create_agent(&mut app, BTreeSet::new());
         app.world().send_event(AgentMessage {
             id: "turn-1".into(),
-            agent: AgentReference::Id("test.agent0".into()),
+            agent,
             message: Message::User {
                 content: "hello".into(),
             },
@@ -767,7 +747,7 @@ mod tests {
         );
         app.world().send_event(AgentMessage {
             id: "turn-1".into(),
-            agent: AgentReference::Entity(agent),
+            agent,
             message: Message::User {
                 content: "use both".into(),
             },
