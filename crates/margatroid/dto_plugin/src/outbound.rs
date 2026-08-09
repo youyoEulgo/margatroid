@@ -6,12 +6,12 @@ use margatroid_protocol::{
 };
 use margatroid_types::{AgentFailure, AgentMessage};
 use server_plugin::{
-    ServerFailed, ServerStarted, ServerStopped, WebSocketConnected, WebSocketDisconnected,
-    WebSocketProtocolFailed,
+    ServerFailed, ServerStarted, ServerStopped, WebSocketConnected, WebSocketConnections,
+    WebSocketDisconnected, WebSocketProtocolFailed,
 };
 use workspace_plugin::{StartWorkspaceResult, StopWorkspaceByReferenceResult};
 
-use crate::{WebSocketMessageSend, WebSocketMessageTarget};
+use crate::{BackendStateReportCache, WebSocketMessageSend, WebSocketMessageTarget};
 
 pub(crate) fn collect_external_events_system(world: &mut World, frontend_type: &str) {
     report_server_events(world);
@@ -19,7 +19,7 @@ pub(crate) fn collect_external_events_system(world: &mut World, frontend_type: &
     report_workspace_stop_events(world);
     report_agent_messages(world);
     report_agent_failures(world);
-    sync_frontend_state(world, frontend_type);
+    report_backend_state(world, frontend_type);
 }
 
 fn report_workspace_stop_events(world: &World) {
@@ -87,14 +87,55 @@ fn report_server_events(world: &World) {
     }
 }
 
-fn sync_frontend_state(world: &World, frontend_type: &str) {
-    let state: BackendStateDto = match ().into_dto(world) {
+fn report_backend_state(world: &mut World, frontend_type: &str) {
+    let state: BackendStateDto = match ().into_dto(&*world) {
         Ok(state) => state,
         Err(error) => {
-            tracing::warn!(error = %error, "frontend state sync failed");
+            let error = error.to_string();
+            let should_log = {
+                let cache = world
+                    .get_resource_mut::<BackendStateReportCache>()
+                    .expect("DtoPlugin backend state report cache is missing");
+                if cache.last_error.as_deref() == Some(&error) {
+                    false
+                } else {
+                    cache.last_error = Some(error.clone());
+                    true
+                }
+            };
+            if should_log {
+                tracing::warn!(error, "backend state report failed");
+            }
             return;
         }
     };
+    let mut recipients = world
+        .get_resource::<WebSocketConnections>()
+        .map(|connections| {
+            connections
+                .get_by_type(frontend_type)
+                .into_iter()
+                .map(|sender| sender.connection_id().get())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    recipients.sort_unstable();
+    let should_sync = {
+        let cache = world
+            .get_resource_mut::<BackendStateReportCache>()
+            .expect("DtoPlugin backend state report cache is missing");
+        cache.last_error = None;
+        if cache.state.as_ref() == Some(&state) && cache.recipients == recipients {
+            false
+        } else {
+            cache.state = Some(state.clone());
+            cache.recipients = recipients;
+            true
+        }
+    };
+    if !should_sync {
+        return;
+    }
     world.send_event(WebSocketMessageSend {
         target: WebSocketMessageTarget::Type(frontend_type.into()),
         message: ServerMessage::StateSync { state },

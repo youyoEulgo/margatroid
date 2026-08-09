@@ -13,13 +13,15 @@ agent.message        -> RouteAgentMessage
 ```
 
 它还收集允许发送给外部的 `StartWorkspaceResult`、`StopWorkspaceByReferenceResult`、`AgentMessage` 和 `AgentFailure`，调用 Protocol
-定义的 DTO 转换，构造 `ServerMessage` 并包装为 `WebSocketMessageSend`。每个 Runtime tick 会从
-Workspace、Agent 和 Memory 构造完整 `state.sync`，默认只发送给类型为 `webui` 的连接。
+定义的 DTO 转换，构造 `ServerMessage` 并包装为 `WebSocketMessageSend`。DtoPlugin 会从 Workspace、
+Agent 和 Memory 构造完整 `state.sync`，但仅在状态内容或目标前端连接集合变化时发送，默认只发给类型为
+`webui` 的连接。缓存避免出站事件持续唤醒 event-driven Runtime。
 
 DtoPlugin 订阅 LogPlugin 提供的 `TracingStream`，将结构化日志转换为 `log` 消息并广播。因此安装前
 必须先安装 AsyncRuntimePlugin、带 stream 的 LogPlugin 以及 ServerPlugin。Server 生命周期事件也由
 DtoPlugin 的出站 system 写入结构化日志。它还记录 WebSocket 连接状态、Workspace 启停结果、可展示
 Agent 消息方向和 Agent 失败；每帧状态同步和单个出站包不记日志，避免高频噪声和日志转发递归。
+日志消息自身发送失败时不会再产生可转发警告，日志订阅滞后也不会向自身写回 tracing 事件。
 
 它不创建 ECS Entity，不决定 manager，不执行消息意图，也不检查资源权限。WorkspacePlugin 负责逻辑
 Workspace/Agent 路由，AgentPlugin 只处理已经携带 Entity 的消息。

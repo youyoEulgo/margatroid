@@ -55,6 +55,11 @@ WebSocketMessageSend：发送事件，公开结构体--承载ServerMessage和连
     message: ServerMessage--待序列化协议事件
     impl Event for WebSocketMessageSend
         Event：公开trait实现
+
+BackendStateReportCache：后端状态报告缓存，私有Resource--阻止未变化快照在事件驱动Runtime中形成自唤醒循环
+    state: Option<BackendStateDto>--上次同步的完整状态
+    recipients: Vec<u64>--上次报告时匹配frontend_type的连接ID
+    last_error: Option<String>--最近一次转换错误，用于相同错误只记录一次
 ```
 
 ## 函数
@@ -83,10 +88,18 @@ collect_external_events_system(world: &mut World, frontend_type: &str)
         记录Workspace启停、用户消息路由、Assistant响应和Agent失败等业务日志
         选择Broadcast目标并发送WebSocketMessageSend
         调用()::into_dto(&World)构造BackendStateDto
+        状态内容或frontend_type连接集合变化时才发送StateSync
+        相同状态转换错误只记录一次，成功后清除错误缓存
         将StateSync发送给frontend_type指定的连接类型
+
+report_backend_state(world: &mut World, frontend_type: &str)
+    报告后端状态：私有函数，从World构造权威状态快照并在快照或接收连接变化时发送StateSync
+    调用：collect_external_events_system每次运行时调用
+    输出：仅在首次运行、BackendStateDto变化或frontend_type连接集合变化时发送WebSocketMessageSend
 
 forward_logs(stream: TracingStream, events: RuntimeEventSender)
     转发结构化日志：私有异步函数，订阅TracingStream，将TracingRecord转换为LogRecordDto并广播WebSocketMessageSend
+    行为：订阅滞后时直接累计TracingSubscription内部丢弃计数，不向正在消费的TracingStream写回日志
 
 ```
 
@@ -104,7 +117,8 @@ forward_logs(stream: TracingStream, events: RuntimeEventSender)
         -> collect_external_events_system构造ServerMessage
         -> 包装WebSocketMessageSend
     Workspace、Agent和Memory当前状态
-        -> collect_external_events_system每帧构造BackendStateDto
+        -> collect_external_events_system构造BackendStateDto并与缓存比较
+        -> 内容或接收连接集合未变化时结束
         -> StateSync发送给frontend_type
     LogPlugin::TracingStream
         -> forward_logs异步订阅

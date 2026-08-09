@@ -9,10 +9,7 @@ pub(crate) async fn forward_logs(stream: TracingStream, events: RuntimeEventSend
     loop {
         let record = match subscription.recv().await {
             Ok(record) => record,
-            Err(TracingStreamError::Lagged(count)) => {
-                tracing::warn!(dropped = count, "DTO log stream lagged");
-                continue;
-            }
+            Err(TracingStreamError::Lagged(_)) => continue,
             Err(TracingStreamError::Closed) | Err(_) => break,
         };
         let Ok(record): Result<LogRecordDto, _> = record.into_dto(()) else {
