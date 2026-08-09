@@ -87,6 +87,7 @@ dependencies = [
  "async_runtime_plugin",
  "core_plugin",
  "margatroid_protocol",
+ "margatroid_types",
  "serde_json",
  "server_plugin",
  "tracing",
@@ -254,6 +255,7 @@ dependencies = [
  "core_plugin",
  "futures-util",
  "margatroid_protocol",
+ "margatroid_types",
  "serde_json",
  "server_plugin",
  "tokio",
@@ -873,6 +875,7 @@ dependencies = [
  "margatroid_types",
  "serde",
  "serde_json",
+ "server_plugin",
 ]
 
 [[package]]
@@ -2297,6 +2300,7 @@ dependencies = [
  "memory_plugin",
  "tempfile",
  "tool_plugin",
+ "tracing",
 ]
 
 [[package]]

@@ -36,9 +36,9 @@ ConnectionPluginInstalled：连接插件安装标记，私有资源--防止同�
 私有：
 ```text
 connection_registration_system(world: &mut World)
-    注册连接元数据：私有system，消费ConnectionRegisterRequested并更新ServerPlugin连接注册表
+    注册连接元数据：私有system，消费RegisterConnection并更新ServerPlugin连接注册表
     行为：
-        收集当前事件队列中的全部ConnectionRegisterRequested
+        收集当前事件队列中的全部RegisterConnection
         逐条处理，不因单条请求失败而终止本帧其他请求
         去除client_type首尾空白
         检查client_type非空且只包含小写ASCII字母、数字、下划线和短横线
@@ -57,7 +57,7 @@ connection_registration_system(world: &mut World)
 客户端连接注册：
     connection.register
         -> ApiPlugin::api_route_system
-        -> ConnectionRegisterRequested
+        -> RegisterConnection
         -> ConnectionPlugin::connection_registration_system
         -> WebSocketConnections::set_connection_type
         -> WebSocketConnections::set_name
@@ -88,4 +88,3 @@ ConnectionPlugin不负责：
     认证客户端或提供权限控制
     处理连接断开；连接生命周期和索引清理由ServerPlugin负责
 ```
-

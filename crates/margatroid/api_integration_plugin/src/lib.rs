@@ -1,5 +1,4 @@
 mod identity;
-mod inbound;
 mod logs;
 mod outbound;
 mod state;
@@ -69,9 +68,7 @@ impl Plugin for ApiIntegrationPlugin {
             .insert_resource(ApiIntegrationPluginInstalled);
 
         let frontend_type = self.frontend_type;
-        app.add_system(&self.schedule, inbound::handle_workspace_start_requests)
-            .add_system(&self.schedule, inbound::handle_agent_message_requests)
-            .add_system(&self.schedule, outbound::report_runtime_events)
+        app.add_system(&self.schedule, outbound::report_runtime_events)
             .add_system(&self.schedule, move |world: &mut World| {
                 state::sync_frontend_state_system(world, &frontend_type);
             });

@@ -1,19 +1,19 @@
 use agent_plugin::AgentIdentity;
 use core_plugin::{Entity, World};
-use margatroid_protocol::{WorkspaceInfoDto, WorkspaceRefDto};
+use margatroid_protocol::{WorkspaceInfoDto, WorkspaceReferenceDto};
 use margatroid_types::AgentReference;
 use workspace_plugin::{WorkspaceAgents, WorkspaceConfiguration, WorldWorkspaceExt};
 
 pub(crate) fn workspace_info(world: &World, workspace: Entity) -> Option<WorkspaceInfoDto> {
     world
         .get_component::<WorkspaceConfiguration>(workspace)
-        .map(|configuration| WorkspaceInfoDto::from_definition(configuration.definition()))
+        .map(|configuration| WorkspaceInfoDto::from_domain(configuration.definition()))
 }
 
 pub(crate) fn agent_route(
     world: &World,
     reference: &AgentReference,
-) -> Option<(WorkspaceRefDto, String)> {
+) -> Option<(WorkspaceReferenceDto, String)> {
     let agent = match reference {
         AgentReference::Entity(agent) => *agent,
         AgentReference::Id(id) => world

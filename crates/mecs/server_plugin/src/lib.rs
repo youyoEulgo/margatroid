@@ -16,7 +16,7 @@ pub use plugin::{AppServerExt, ServerPlugin};
 pub use resource::ServerHandle;
 pub use response::{HttpResponse, HttpResponseHead, HttpResponseSession};
 pub use websocket::{
-    JsonWebSocketMessageClassifier, WebSocketCloseReason, WebSocketConnected,
+    JsonWebSocketMessageClassifier, RegisterConnection, WebSocketCloseReason, WebSocketConnected,
     WebSocketConnectionId, WebSocketConnections, WebSocketDisconnected, WebSocketMessage,
     WebSocketMessageClassification, WebSocketMessageClassifier, WebSocketMessageReceived,
     WebSocketProtocolError, WebSocketProtocolFailed, WebSocketSender, WebSocketStreamId,

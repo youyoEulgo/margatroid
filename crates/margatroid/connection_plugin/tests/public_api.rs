@@ -2,13 +2,14 @@ use std::net::SocketAddr;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use api_plugin::{AgentMessageRequested, ApiPlugin, WebSocketMessageSend, WebSocketMessageTarget};
+use api_plugin::{ApiPlugin, WebSocketMessageSend, WebSocketMessageTarget};
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
 use connection_plugin::ConnectionPlugin;
 use core_plugin::{App, World};
 use futures_util::{SinkExt, StreamExt};
-use margatroid_protocol::{ClientRequest, LogRecordDto, ServerEvent, WorkspaceRefDto};
+use margatroid_protocol::{ClientRequest, LogRecordDto, ServerEvent, WorkspaceReferenceDto};
+use margatroid_types::{Message, RouteAgentMessage};
 use server_plugin::{ServerHandle, ServerPlugin};
 
 fn start(app: &mut App) -> SocketAddr {
@@ -37,9 +38,12 @@ fn registered_client_receives_messages_targeted_by_type() {
         .add_plugin(ConnectionPlugin::default())
         .add_system(RuntimePlugin::UPDATE, |world: &mut World| {
             let requests = world
-                .event_reader::<AgentMessageRequested>()
+                .event_reader::<RouteAgentMessage>()
                 .into_iter()
-                .map(|request| request.content.clone())
+                .filter_map(|request| match &request.message {
+                    Message::User { content } => Some(content.clone()),
+                    _ => None,
+                })
                 .collect::<Vec<_>>();
             for content in requests {
                 world.send_event(WebSocketMessageSend {
@@ -68,12 +72,15 @@ fn registered_client_receives_messages_targeted_by_type() {
                 .await
                 .unwrap();
             let registration =
-                serde_json::to_string(&ClientRequest::register_connection("webui")).unwrap();
+                serde_json::to_string(&ClientRequest::register_connection("register-1", "webui"))
+                    .unwrap();
             let message = serde_json::to_string(&ClientRequest::agent_message(
                 "message-1",
-                &WorkspaceRefDto::new("demo", "/tmp/demo"),
+                &WorkspaceReferenceDto::new("demo", "/tmp/demo"),
                 None,
-                "routed",
+                Message::User {
+                    content: "routed".into(),
+                },
             ))
             .unwrap();
             socket

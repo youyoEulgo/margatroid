@@ -33,7 +33,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 公开：
 ```text
-ApiIntegrationPlugin：API应用层适配插件，公开结构体--连接ApiPlugin的传输事件与Margatroid领域事件和状态
+ApiIntegrationPlugin：API应用层投影插件，公开结构体--连接Margatroid领域状态与ApiPlugin的出站事件
     schedule: String--全部同步System所属Schedule，默认RuntimePlugin::UPDATE
     frontend_type: String--接收完整状态快照的连接类型，默认webui
     new() -> Self
@@ -49,7 +49,7 @@ ApiIntegrationPlugin：API应用层适配插件，公开结构体--连接ApiPlug
     impl Plugin for ApiIntegrationPlugin
         Plugin：公开trait实现
         build(self, app: &mut App)
-            安装适配器：检查安装条件，启动日志转发服务并注册请求、报告和快照System
+            安装投影：检查安装条件，启动日志转发服务并注册报告和快照System
 ```
 
 私有：
@@ -66,12 +66,6 @@ forward_logs(stream: TracingStream, events: RuntimeEventSender)
 
 log_record(record: TracingRecord) -> LogRecordDto
     转换日志：私有函数，逐字段构造协议日志DTO
-
-handle_workspace_start_requests(world: &mut World)
-    处理Workspace请求：私有System，将WorkspaceDefinitionDto恢复为领域定义并发送StartWorkspace
-
-handle_agent_message_requests(world: &mut World)
-    处理Agent消息请求：私有System，解析逻辑Workspace和Agent后发送用户AgentMessage
 
 report_runtime_events(world: &mut World)
     投影运行事件：私有System，依次调用各类运行事件报告函数
@@ -94,24 +88,16 @@ sync_frontend_state_system(world: &mut World, frontend_type: &str)
 backend_state(world: &World) -> Result<BackendStateDto, String>
     构造后端状态：私有函数，按Workspace读取Agent历史表并生成完整有序快照
 
-route_agent_message(world: &World, id: String, workspace: WorkspaceRefDto, agent: Option<String>, content: String) -> Result<(), String>
-    路由用户消息：私有函数，校验输入，按逻辑身份查找显式Agent或manager并发送AgentMessage
-
 workspace_info(world: &World, workspace: Entity) -> Option<WorkspaceInfoDto>
     转换Workspace：私有函数，从WorkspaceConfiguration构造协议DTO
 
-agent_route(world: &World, agent: Entity) -> Option<(WorkspaceRefDto, String)>
-    反查Agent身份：私有函数，从Workspace索引取得Agent逻辑名称和Workspace引用
+agent_route(world: &World, agent: &AgentReference) -> Option<(WorkspaceReferenceDto, String)>
+    反查Agent身份：私有函数，Entity直接反查Workspace，Id先查AgentIdentity再反查Workspace
 ```
 
 ## 逻辑
 
 ```text
-入站业务请求：
-    ApiPlugin发送WorkspaceStartRequested或AgentMessageRequested
-        -> ApiIntegrationPlugin解析协议DTO和逻辑身份
-        -> 发送StartWorkspace或AgentMessage领域事件
-
 出站业务状态：
     Workspace、Agent、Memory和Server产生领域事件或状态
         -> ApiIntegrationPlugin构造ServerEvent
@@ -125,7 +111,7 @@ agent_route(world: &World, agent: Entity) -> Option<(WorkspaceRefDto, String)>
 
 边界：
     ApiIntegrationPlugin不解析或序列化WebSocket JSON，不持有发送器，不执行领域业务
-    ApiPlugin不查询Workspace、Agent或Memory，不构造业务DTO
+    ApiPlugin负责DTO转换和入站领域事件发送，不查询Workspace、Agent或Memory
     Workspace、Agent和Memory Plugin不依赖API协议或客户端连接
     daemon不注册业务System，只配置并安装Plugin
 ```

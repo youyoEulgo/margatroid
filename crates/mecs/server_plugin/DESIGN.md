@@ -221,6 +221,13 @@ WebSocketConnectionId：WebSocket连接ID，公开元组结构体
     get(self) -> u64
         获取ID：公开方法，返回内部u64
 
+RegisterConnection：连接注册事件，公开结构体--声明连接的客户端类型，供连接元数据插件消费
+    id: String--客户端生成的注册请求ID
+    connection_id: WebSocketConnectionId--收到注册请求的连接
+    client_type: String--客户端声明的类型，例如webui或cli
+    impl Event for RegisterConnection
+        Event：公开trait实现
+
 WebSocketStreamId：WebSocket支流ID，公开元组结构体
     0: String--支流ID，私有
     new(value: impl Into<String>) -> Self
@@ -671,6 +678,12 @@ WebSocket默认支流信封：
     Chunk -> 直接写入支流通道，不进入ECS事件队列
     End -> 写入最后消息并标记Finished
     Abort -> 写入最后消息并标记Aborted
+
+连接注册：
+    客户端发送connection.register协议请求
+        -> ApiPlugin转换为RegisterConnection事件
+        -> ConnectionPlugin消费事件并写入WebSocketConnections的类型和名称索引
+    ServerPlugin只负责保存和查询连接，不解析客户端业务协议
 
 WebSocket流式接收：
     同步System读取WebSocketStreamOpened

@@ -56,7 +56,10 @@ async fn run_workspace_up(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let definition = compile(&workspace_file)?;
     let request_id = request_id();
-    let registration = serde_json::to_string(&ClientRequest::register_connection("cli"))?;
+    let registration = serde_json::to_string(&ClientRequest::register_connection(
+        format!("{request_id}-register"),
+        "cli",
+    ))?;
     let request = ClientRequest::start_workspace(&request_id, &definition);
     let encoded = serde_json::to_string(&request)?;
 

@@ -1,7 +1,6 @@
-use api_plugin::ConnectionRegisterRequested;
 use app_runtime_plugin::RuntimePlugin;
 use core_plugin::{App, Plugin, Resource, World};
-use server_plugin::WebSocketConnections;
+use server_plugin::{RegisterConnection, WebSocketConnections};
 
 #[derive(Clone, Debug)]
 pub struct ConnectionPlugin {
@@ -52,7 +51,7 @@ impl Plugin for ConnectionPlugin {
 
 fn connection_registration_system(world: &mut World) {
     let requests = world
-        .event_reader::<ConnectionRegisterRequested>()
+        .event_reader::<RegisterConnection>()
         .into_iter()
         .collect::<Vec<_>>();
     let Some(connections) = world.get_resource::<WebSocketConnections>().cloned() else {
