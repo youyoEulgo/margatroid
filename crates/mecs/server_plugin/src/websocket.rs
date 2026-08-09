@@ -26,6 +26,15 @@ impl WebSocketConnectionId {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisterConnection {
+    pub id: String,
+    pub connection_id: WebSocketConnectionId,
+    pub client_type: String,
+}
+
+impl Event for RegisterConnection {}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WebSocketStreamId(String);
 

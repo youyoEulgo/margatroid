@@ -1,24 +1,18 @@
 # ApiPlugin
 
-`ApiPlugin` 是 Margatroid 的 WebSocket API 路由层。它把 ServerPlugin 产生的
-`WebSocketMessageReceived` 解析为 `ClientRequest`，再按请求类型发送内部事件；后端输出统一通过
-`WebSocketMessageSend` 进入插件，由插件序列化 `ServerEvent` 并发送。
+`ApiPlugin` 是 WebSocket 传输层。它消费 ServerPlugin 的 `WebSocketMessageReceived`，解析统一的
+`{ type, id, message }` 信封，调用对应 DTO 的 `into_domain` 方法，并直接发送领域事件。
 
-当前输入事件：
-
-```text
-connection.register -> ConnectionRegisterRequested
-workspace.start      -> WorkspaceStartRequested
-agent.message        -> AgentMessageRequested
-```
-
-发送目标支持全部连接、指定连接类型和指定连接名称：
+入站路由：
 
 ```text
-WebSocketMessageTarget::Broadcast
-WebSocketMessageTarget::Type("webui")
-WebSocketMessageTarget::Name("webui-12")
+connection.register -> RegisterConnection
+workspace.start      -> StartWorkspace
+agent.message        -> RouteAgentMessage
 ```
 
-ApiPlugin 不校验业务字段、不查询 Workspace 或 Agent，也不生成连接名称。连接元数据由
-ConnectionPlugin 管理。
+它不查询 Workspace 或 Agent，不创建 ECS Entity，不决定 manager，不执行消息意图，也不检查资源权限。
+WorkspacePlugin 负责逻辑 Workspace/Agent 路由，AgentPlugin 负责将 `AgentReference::Id` 解析为 Entity。
+
+后端通过 `WebSocketMessageSend` 请求发送 `ServerEvent`。ApiPlugin 负责序列化和根据
+`Broadcast`、`Type`、`Name` 筛选连接；业务 DTO 构造由 API 应用层负责。

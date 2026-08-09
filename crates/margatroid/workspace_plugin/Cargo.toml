@@ -12,6 +12,7 @@ inference_plugin = { path = "../inference_plugin" }
 margatroid_types = { path = "../types" }
 memory_plugin = { path = "../memory_plugin" }
 tool_plugin = { path = "../tool_plugin" }
+tracing = { workspace = true }
 
 [dev-dependencies]
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }

@@ -11,9 +11,14 @@ use agent_plugin::{AgentCreateRequest, AgentCreated, AgentWorkspaceId};
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::{AgentInferenceSnapshot, GlobalModelRoutes, WorldInferenceExt};
-use margatroid_types::{Message, ResourceRef, WorkspaceAgentDefinition, WorkspaceDefinition};
+use margatroid_types::{
+    AgentMessage, AgentReference, Message, MessageIntent, ResourceRef, RouteAgentMessage,
+    WorkspaceAgentDefinition, WorkspaceDefinition,
+};
 use memory_plugin::{AgentMemory, WorldMemoryExt};
 use tool_plugin::AgentToolEnvironment;
+
+pub use margatroid_types::StartWorkspace;
 
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 const MAX_LOGICAL_NAME_BYTES: usize = 128;
@@ -61,18 +66,11 @@ impl Plugin for WorkspacePlugin {
             agent_requests: HashMap::new(),
         });
         app.add_system(&schedule, begin_workspace_command_system)
+            .add_system(&schedule, route_agent_message_system)
             .add_system(&schedule, collect_agent_image_system)
             .add_system(&schedule, collect_agent_created_system);
     }
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StartWorkspace {
-    pub id: String,
-    pub definition: WorkspaceDefinition,
-}
-
-impl Event for StartWorkspace {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartWorkspaceResult {
@@ -116,6 +114,51 @@ pub struct StopWorkspaceResult {
 }
 
 impl Event for StopWorkspaceResult {}
+
+fn route_agent_message_system(world: &mut World) {
+    let requests = world
+        .event_reader::<RouteAgentMessage>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for request in requests {
+        let Some(workspace) =
+            world.workspace(&request.workspace.project_root, &request.workspace.name)
+        else {
+            tracing::warn!(id = %request.id, "agent message workspace was not found");
+            continue;
+        };
+        let Some(configuration) = world.get_component::<WorkspaceConfiguration>(workspace) else {
+            tracing::warn!(id = %request.id, "agent message workspace configuration is missing");
+            continue;
+        };
+        let agent_name = request
+            .agent
+            .unwrap_or_else(|| configuration.definition().manager.clone());
+        let Some(index) = configuration
+            .definition()
+            .agents
+            .iter()
+            .position(|agent| agent.name == agent_name)
+        else {
+            tracing::warn!(id = %request.id, agent = %agent_name, "agent message agent was not found");
+            continue;
+        };
+        if !matches!(request.message, Message::User { .. }) {
+            tracing::warn!(id = %request.id, "route agent message only accepts User messages");
+            continue;
+        }
+        world.send_event(AgentMessage {
+            id: request.id,
+            agent: AgentReference::Id(format!(
+                "{}.{}{}",
+                request.workspace.name, agent_name, index
+            )),
+            message: request.message,
+            intent: MessageIntent::UserWithoutToolCalls,
+        });
+    }
+}
 
 pub struct WorkspaceIdentity {
     name: Arc<str>,

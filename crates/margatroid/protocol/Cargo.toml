@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 margatroid_types = { path = "../types" }
+server_plugin = { path = "../../mecs/server_plugin" }
 serde = { workspace = true }
 
 [dev-dependencies]

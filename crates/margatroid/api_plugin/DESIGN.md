@@ -1,73 +1,57 @@
+# 伪代码格式
+```text
+模块：使用一级标题，只写当前设计涉及的部分
+
+类型：使用二级标题，按私有、crate公开和公开分组
+TypeName：中文类型名，可见性类型--类型说明
+    field_name: RustType--中文字段名，字段说明
+    method_name<Generic>(self, parameter: ParameterType) -> ReturnType
+        中文方法名：可见性方法，解释参数和用途
+        约束：使用标准Rust where约束；单个约束写在同一行
+        行为：展开完整逻辑
+
+函数：使用二级标题，按私有和公开分组，只放置不属于某个类型的操作
+function_name<Generic>(parameter: ParameterType) -> ReturnType
+    中文函数名：可见性函数，解释参数和用途
+    约束：使用标准Rust where约束；单个约束写在同一行
+    行为：展开完整逻辑
+
+逻辑：使用二级标题，按执行顺序描述对象之间的调用关系
+注释：字段注释使用--，类型、方法和函数的说明直接写在标题中
+属性：不写Rust Attribute，实现时自行判断
+边界：对外使用泛型和具体类型，内部使用类型擦除
+```
+
 # ApiPlugin
 
 ## 类型
 
 公开：
 ```text
-ApiPlugin：API路由插件，公开结构体--注册WebSocket API路由并双向转换API消息与内部事件
+ApiPlugin：WebSocket API传输插件，公开结构体--注册WebSocket路由并在协议DTO与领域事件之间转换
     websocket_path: String--WebSocket路由路径，默认/ws
-    schedule: String--api_route_system所在的Runtime schedule，默认RuntimePlugin::UPDATE
+    schedule: String--api_route_system所属Runtime schedule，默认RuntimePlugin::UPDATE
     new() -> Self
-        构造API插件：公开方法
-        行为：使用/ws和RuntimePlugin::UPDATE构造插件
-    with_websocket_path(path: impl Into<String>) -> Self
-        设置WebSocket路径：公开方法
-        行为：保存调用者提供的路径并返回自身
-    with_schedule(schedule: impl Into<String>) -> Self
-        设置执行schedule：公开方法
-        行为：保存调用者提供的schedule名称并返回自身
-    impl Default for ApiPlugin
-        Default：公开trait实现
-        default() -> Self
-            构造默认API插件：使用new返回默认配置
+        构造插件：使用默认路径和Schedule
+    with_websocket_path(self, path: impl Into<String>) -> Self
+        设置路径：保存调用者路径并返回自身
+    with_schedule(self, schedule: impl Into<String>) -> Self
+        设置Schedule：保存调用者Schedule并返回自身
     impl Plugin for ApiPlugin
         Plugin：公开trait实现
         build(self, app: &mut App)
-            安装API插件：注册路由、事件和唯一的API路由system
-            行为：
-                检查ApiPlugin没有重复安装
-                检查schedule存在
-                使用websocket_path注册ServerPlugin的WebSocket事件路由
-                注册ConnectionRegisterRequested、WorkspaceStartRequested、AgentMessageRequested和WebSocketMessageSend事件
-                将api_route_system加入schedule
+            安装插件：注册WebSocket路由和唯一api_route_system
 
-ConnectionRegisterRequested：连接注册API请求，公开事件--保存客户端声明的连接类型和来源连接ID
-    connection_id: WebSocketConnectionId--来源WebSocket连接
-    client_type: String--客户端声明的类型，例如webui或cli
-    impl Event for ConnectionRegisterRequested
-        Event：公开trait实现
+WebSocketMessageTarget：发送目标，公开枚举--描述连接筛选方式
+    Broadcast--全部连接
+    Type(String)--指定connection_type的连接
+    Name(String)--指定唯一连接名称
 
-WorkspaceStartRequested：Workspace启动API请求，公开事件--原样保存客户端workspace.start请求供其他system处理
-    connection_id: WebSocketConnectionId--来源WebSocket连接
-    id: String--客户端生成的请求ID
-    definition: WorkspaceDefinitionDto--客户端提交的Workspace定义DTO
-    impl Event for WorkspaceStartRequested
-        Event：公开trait实现
-
-AgentMessageRequested：Agent消息API请求，公开事件--原样保存客户端agent.message请求供其他system处理
-    connection_id: WebSocketConnectionId--来源WebSocket连接
-    id: String--客户端生成的消息ID
-    workspace: WorkspaceRefDto--目标Workspace逻辑引用
-    agent: Option<String>--可选目标Agent名称，None的含义由后续system决定
-    content: String--客户端提交的消息正文
-    impl Event for AgentMessageRequested
-        Event：公开trait实现
-
-WebSocketMessageTarget：WebSocket消息目标，公开枚举--描述api_route_system应选择哪些连接
-    Broadcast--全部当前连接
-    Type(String)--connection_type与给定值相同的全部连接
-    Name(String)--具有给定唯一名称的单个连接
-
-WebSocketMessageSend：WebSocket消息发送请求，公开事件--统一承载后端发给客户端的协议事件
-    target: WebSocketMessageTarget--连接筛选方式
-    message: ServerEvent--待序列化的后端协议事件
+WebSocketMessageSend：发送事件，公开结构体--承载ServerEvent和连接筛选目标
+    target: WebSocketMessageTarget--发送范围
+    message: ServerEvent--待序列化协议事件
     impl Event for WebSocketMessageSend
         Event：公开trait实现
-```
-
-私有：
-```text
-ApiPluginInstalled：API插件安装标记，私有资源--防止同一个App重复安装ApiPlugin
 ```
 
 ## 函数
@@ -75,91 +59,40 @@ ApiPluginInstalled：API插件安装标记，私有资源--防止同一个App重
 私有：
 ```text
 api_route_system(world: &mut World)
-    路由API消息：私有system，在WebSocket消息与内部API事件之间双向转换
+    路由WebSocket API：私有System，执行入站解包和出站序列化
     行为：
-        收集当前事件队列中的全部WebSocketMessageReceived
-        逐条处理收到的消息
-            检查WebSocket消息是否为Text
-                不是Text时写warning日志并结束当前消息
-            将Text反序列化为margatroid_protocol::ClientRequest
-                反序列化失败时写warning日志并结束当前消息
-            根据ClientRequest的type分支
-                ConnectionRegister：
-                    使用received.connection_id和client_type构造ConnectionRegisterRequested
-                    发送ConnectionRegisterRequested
-                WorkspaceStart：
-                    使用received.connection_id、id和definition构造WorkspaceStartRequested
-                    发送WorkspaceStartRequested
-                AgentMessage：
-                    使用received.connection_id、id、workspace、agent和content构造AgentMessageRequested
-                    发送AgentMessageRequested
-        收集当前事件队列中的全部WebSocketMessageSend
-        逐条处理待发送消息
-            将message序列化为JSON文本
-                序列化失败时写warning日志并结束当前消息
-            将JSON文本包装为WebSocketMessage::Text
-            根据target从WebSocketConnections筛选发送器
-                Broadcast调用get_all
-                Type调用get_by_type
-                Name调用get_by_name
-            对筛选出的每个发送器调用try_send
-            单个连接发送失败时写warning日志，不影响其他连接
+        收集WebSocketMessageReceived并要求消息为Text
+        反序列化统一{type,id,message}信封为ClientRequest
+        按type取得对应DTO并调用DTO::into_domain
+        转换成功后直接发送StartWorkspace、RouteAgentMessage或RegisterConnection领域事件
+        转换失败时记录warning并丢弃当前请求
+        收集WebSocketMessageSend
+        将ServerEvent序列化为Text
+        根据Broadcast、Type或Name取得发送器并调用try_send
 ```
 
 ## 逻辑
 
 ```text
-前端到后端：
-    WebSocket Text frame
-        -> ServerPlugin::WebSocketMessageReceived
-        -> ApiPlugin::api_route_system
-        -> margatroid_protocol::ClientRequest
-        -> 按type发送一种内部API事件
-            connection.register -> ConnectionRegisterRequested
-            workspace.start -> WorkspaceStartRequested
-            agent.message -> AgentMessageRequested
-```
+入站：
+    WebSocketMessageReceived
+        -> ClientRequest { type, id, message }
+        -> message DTO::into_domain
+        -> 直接发送领域事件
 
-```text
-后端到前端：
-    其他system构造margatroid_protocol::ServerEvent
-        -> WebSocketMessageSend
-        -> ApiPlugin::api_route_system
-        -> serde_json序列化
-        -> WebSocketMessage::Text
-        -> WebSocketConnections按Broadcast、Type或Name筛选
-        -> WebSocketSender::try_send
-```
-
-```text
-错误处理：
-    非Text消息、无法反序列化的ClientRequest和无法序列化的ServerEvent
-        -> 写warning日志
-        -> 丢弃当前消息
-    找不到Name目标时不发送消息并写warning日志
-    Type目标没有匹配连接时不发送消息
-    请求字段语义是否合法由消费对应请求事件的system判断
+出站：
+    其他Plugin发送WebSocketMessageSend
+        -> ApiPlugin序列化ServerEvent
+        -> WebSocketConnections按target筛选
+        -> WebSocketSender发送Text
 ```
 
 ## 边界
 
 ```text
-ApiPlugin负责：
-    WebSocket API路由注册
-    WebSocketMessageReceived到ClientRequest的反序列化
-    按ClientRequest类型包装并发送对应内部API事件
-    WebSocketMessageSend中ServerEvent的序列化
-    按连接目标筛选WebSocketSender并发送Text消息
-
-ApiPlugin不负责：
-    校验client_type或为连接生成名称
-    修改WebSocketConnections中的连接类型和名称
-    WorkspaceDefinitionDto到WorkspaceDefinition的转换
-    请求字段的语义校验
-    Workspace和Agent逻辑身份到Entity的解析
-    manager路由
-    生成ServerEvent承载的业务数据，由ApiIntegrationPlugin负责
-    Workspace、Agent、Memory、Inference、Tool、Skill和Workflow业务
-    读取Workspace文件、SQLite或任何资源正文
-    流式WebSocket消息
+ApiPlugin负责：WebSocket帧、JSON信封、DTO转换调用、领域事件发送、ServerEvent序列化和连接筛选
+ApiPlugin不负责：Workspace/Agent查询、manager路由、Agent Entity创建、Memory、Tool、Inference和资源权限
+Protocol负责：XxxDto及其into_domain/from_domain转换
+WorkspacePlugin负责：消费Workspace领域命令、解析Workspace和Agent逻辑身份
+AgentPlugin负责：将AgentReference解析为Entity并处理AgentMessage
 ```

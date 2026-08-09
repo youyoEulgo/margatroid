@@ -56,5 +56,5 @@ main
     daemon负责进程参数、路径准备、Plugin配置与装配、进程退出
     daemon不定义或注册业务System
     daemon不解析API消息，不路由Workspace或Agent，不构造前端状态，不转发日志
-    API与领域层适配统一由ApiIntegrationPlugin负责
+    API DTO与领域命令转换由ApiPlugin负责，领域状态到客户端事件的投影由ApiIntegrationPlugin负责
 ```

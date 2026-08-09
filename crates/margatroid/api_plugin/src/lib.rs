@@ -1,9 +1,8 @@
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Event, Plugin, Resource, World};
-use margatroid_protocol::{ClientRequest, ServerEvent, WorkspaceDefinitionDto, WorkspaceRefDto};
+use margatroid_protocol::{ClientRequest, ServerEvent};
 use server_plugin::{
-    AppServerExt, WebSocketConnectionId, WebSocketConnections, WebSocketMessage,
-    WebSocketMessageReceived,
+    AppServerExt, WebSocketConnections, WebSocketMessage, WebSocketMessageReceived,
 };
 
 #[derive(Clone, Debug)]
@@ -36,34 +35,6 @@ impl Default for ApiPlugin {
         Self::new()
     }
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConnectionRegisterRequested {
-    pub connection_id: WebSocketConnectionId,
-    pub client_type: String,
-}
-
-impl Event for ConnectionRegisterRequested {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkspaceStartRequested {
-    pub connection_id: WebSocketConnectionId,
-    pub id: String,
-    pub definition: WorkspaceDefinitionDto,
-}
-
-impl Event for WorkspaceStartRequested {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentMessageRequested {
-    pub connection_id: WebSocketConnectionId,
-    pub id: String,
-    pub workspace: WorkspaceRefDto,
-    pub agent: Option<String>,
-    pub content: String,
-}
-
-impl Event for AgentMessageRequested {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WebSocketMessageTarget {
@@ -122,32 +93,19 @@ fn api_route_system(world: &mut World) {
             }
         };
         match request {
-            ClientRequest::ConnectionRegister { client_type } => {
-                world.send_event(ConnectionRegisterRequested {
-                    connection_id: received.connection_id,
-                    client_type,
-                });
+            ClientRequest::ConnectionRegister { id, message } => {
+                world.send_event(message.into_domain(id, received.connection_id));
             }
-            ClientRequest::WorkspaceStart { id, definition } => {
-                world.send_event(WorkspaceStartRequested {
-                    connection_id: received.connection_id,
-                    id,
-                    definition,
-                });
-            }
-            ClientRequest::AgentMessage {
-                id,
-                workspace,
-                agent,
-                content,
-            } => {
-                world.send_event(AgentMessageRequested {
-                    connection_id: received.connection_id,
-                    id,
-                    workspace,
-                    agent,
-                    content,
-                });
+            ClientRequest::WorkspaceStart { id, message } => match message.into_domain(id) {
+                Ok(event) => world.send_event(event),
+                Err(error) => tracing::warn!(
+                    connection = received.connection_id.get(),
+                    error = %error,
+                    "invalid workspace.start payload"
+                ),
+            },
+            ClientRequest::AgentMessage { id, message } => {
+                world.send_event(message.into_domain(id));
             }
         }
     }

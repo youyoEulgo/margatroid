@@ -2,10 +2,11 @@ use std::fmt;
 use std::path::PathBuf;
 
 use margatroid_types::{
-    AgentImageReference, Message, ResourceName, ResourceRef, WorkspaceAgentDefinition,
-    WorkspaceDefinition,
+    AgentImageReference, Message, ResourceName, ResourceRef, RouteAgentMessage, StartWorkspace,
+    WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
 };
 use serde::{Deserialize, Serialize};
+use server_plugin::{RegisterConnection, WebSocketConnectionId};
 
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 
@@ -13,18 +14,19 @@ const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 #[serde(tag = "type")]
 pub enum ClientRequest {
     #[serde(rename = "connection.register")]
-    ConnectionRegister { client_type: String },
+    ConnectionRegister {
+        id: String,
+        message: RegisterConnectionDto,
+    },
     #[serde(rename = "workspace.start")]
     WorkspaceStart {
         id: String,
-        definition: WorkspaceDefinitionDto,
+        message: StartWorkspaceDto,
     },
     #[serde(rename = "agent.message")]
     AgentMessage {
         id: String,
-        workspace: WorkspaceRefDto,
-        agent: Option<String>,
-        content: String,
+        message: RouteAgentMessageDto,
     },
 }
 
@@ -64,42 +66,100 @@ pub struct LogFieldDto {
     pub value: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterConnectionDto {
+    pub client_type: String,
+}
+
+impl RegisterConnectionDto {
+    pub fn into_domain(
+        self,
+        id: String,
+        connection_id: WebSocketConnectionId,
+    ) -> RegisterConnection {
+        RegisterConnection {
+            id,
+            connection_id,
+            client_type: self.client_type,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartWorkspaceDto {
+    pub definition: WorkspaceDefinitionDto,
+}
+
+impl StartWorkspaceDto {
+    pub fn into_domain(self, id: String) -> Result<StartWorkspace, ProtocolError> {
+        Ok(StartWorkspace {
+            id,
+            definition: self.definition.into_domain()?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteAgentMessageDto {
+    pub workspace: WorkspaceReferenceDto,
+    pub agent: Option<String>,
+    pub message: Message,
+}
+
+impl RouteAgentMessageDto {
+    pub fn into_domain(self, id: String) -> RouteAgentMessage {
+        RouteAgentMessage {
+            id,
+            workspace: self.workspace.into_domain(),
+            agent: self.agent,
+            message: self.message,
+        }
+    }
+}
+
 impl ClientRequest {
-    pub fn register_connection(client_type: impl Into<String>) -> Self {
+    pub fn register_connection(id: impl Into<String>, client_type: impl Into<String>) -> Self {
         Self::ConnectionRegister {
-            client_type: client_type.into(),
+            id: id.into(),
+            message: RegisterConnectionDto {
+                client_type: client_type.into(),
+            },
         }
     }
 
     pub fn start_workspace(id: impl Into<String>, definition: &WorkspaceDefinition) -> Self {
         Self::WorkspaceStart {
             id: id.into(),
-            definition: WorkspaceDefinitionDto::from_definition(definition),
+            message: StartWorkspaceDto {
+                definition: WorkspaceDefinitionDto::from_domain(definition),
+            },
         }
     }
 
     pub fn agent_message(
         id: impl Into<String>,
-        workspace: &WorkspaceRefDto,
+        workspace: &WorkspaceReferenceDto,
         agent: Option<String>,
-        content: impl Into<String>,
+        message: Message,
     ) -> Self {
         Self::AgentMessage {
             id: id.into(),
-            workspace: workspace.clone(),
-            agent,
-            content: content.into(),
+            message: RouteAgentMessageDto {
+                workspace: workspace.clone(),
+                agent,
+                message,
+            },
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceRefDto {
+pub struct WorkspaceReferenceDto {
     pub name: String,
     pub project_root: String,
 }
 
-impl WorkspaceRefDto {
+impl WorkspaceReferenceDto {
     pub fn new(name: impl Into<String>, project_root: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -107,11 +167,18 @@ impl WorkspaceRefDto {
         }
     }
 
-    pub fn from_definition(definition: &WorkspaceDefinition) -> Self {
+    pub fn from_domain(definition: &WorkspaceDefinition) -> Self {
         Self::new(
             definition.name.clone(),
             definition.project_root.to_string_lossy().into_owned(),
         )
+    }
+
+    pub fn into_domain(self) -> WorkspaceReference {
+        WorkspaceReference {
+            name: self.name,
+            project_root: PathBuf::from(self.project_root),
+        }
     }
 }
 
@@ -124,7 +191,7 @@ pub struct WorkspaceInfoDto {
 }
 
 impl WorkspaceInfoDto {
-    pub fn from_definition(definition: &WorkspaceDefinition) -> Self {
+    pub fn from_domain(definition: &WorkspaceDefinition) -> Self {
         Self {
             name: definition.name.clone(),
             project_root: definition.project_root.to_string_lossy().into_owned(),
@@ -137,8 +204,8 @@ impl WorkspaceInfoDto {
         }
     }
 
-    pub fn reference(&self) -> WorkspaceRefDto {
-        WorkspaceRefDto::new(self.name.clone(), self.project_root.clone())
+    pub fn reference(&self) -> WorkspaceReferenceDto {
+        WorkspaceReferenceDto::new(self.name.clone(), self.project_root.clone())
     }
 }
 
@@ -151,7 +218,7 @@ pub struct BackendStateDto {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentHistoryDto {
-    pub workspace: WorkspaceRefDto,
+    pub workspace: WorkspaceReferenceDto,
     pub agent: String,
     pub messages: Vec<HistoryMessageDto>,
 }
@@ -169,7 +236,7 @@ pub struct HistoryMessageDto {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentMessageDto {
     pub id: String,
-    pub workspace: WorkspaceRefDto,
+    pub workspace: WorkspaceReferenceDto,
     pub agent: String,
     pub message: Message,
 }
@@ -177,7 +244,7 @@ pub struct AgentMessageDto {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentFailureDto {
     pub id: String,
-    pub workspace: WorkspaceRefDto,
+    pub workspace: WorkspaceReferenceDto,
     pub agent: String,
     pub kind: String,
     pub message: String,
@@ -192,7 +259,7 @@ pub struct WorkspaceDefinitionDto {
 }
 
 impl WorkspaceDefinitionDto {
-    pub fn from_definition(definition: &WorkspaceDefinition) -> Self {
+    pub fn from_domain(definition: &WorkspaceDefinition) -> Self {
         Self {
             name: definition.name.clone(),
             project_root: definition.project_root.to_string_lossy().into_owned(),
@@ -200,16 +267,16 @@ impl WorkspaceDefinitionDto {
             agents: definition
                 .agents
                 .iter()
-                .map(WorkspaceAgentDefinitionDto::from_definition)
+                .map(WorkspaceAgentDefinitionDto::from_domain)
                 .collect(),
         }
     }
 
-    pub fn into_definition(self) -> Result<WorkspaceDefinition, ProtocolError> {
+    pub fn into_domain(self) -> Result<WorkspaceDefinition, ProtocolError> {
         let agents = self
             .agents
             .into_iter()
-            .map(WorkspaceAgentDefinitionDto::into_definition)
+            .map(WorkspaceAgentDefinitionDto::into_domain)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(WorkspaceDefinition {
             name: self.name,
@@ -230,19 +297,19 @@ pub struct WorkspaceAgentDefinitionDto {
 }
 
 impl WorkspaceAgentDefinitionDto {
-    fn from_definition(definition: &WorkspaceAgentDefinition) -> Self {
+    fn from_domain(definition: &WorkspaceAgentDefinition) -> Self {
         Self {
             name: definition.name.clone(),
             image: definition.image.to_string(),
             resources: definition
                 .resources
                 .iter()
-                .map(ResourceRefDto::from_resource)
+                .map(ResourceRefDto::from_domain)
                 .collect(),
             disable_resources: definition
                 .disable_resources
                 .iter()
-                .map(ResourceRefDto::from_resource)
+                .map(ResourceRefDto::from_domain)
                 .collect(),
             memory_path: definition
                 .memory_path
@@ -251,7 +318,7 @@ impl WorkspaceAgentDefinitionDto {
         }
     }
 
-    fn into_definition(self) -> Result<WorkspaceAgentDefinition, ProtocolError> {
+    fn into_domain(self) -> Result<WorkspaceAgentDefinition, ProtocolError> {
         let image = AgentImageReference::new(self.image).map_err(|error| {
             ProtocolError::new(
                 ProtocolErrorKind::InvalidImageReference,
@@ -261,12 +328,12 @@ impl WorkspaceAgentDefinitionDto {
         let resources = self
             .resources
             .into_iter()
-            .map(ResourceRefDto::into_resource)
+            .map(ResourceRefDto::into_domain)
             .collect::<Result<Vec<_>, _>>()?;
         let disable_resources = self
             .disable_resources
             .into_iter()
-            .map(ResourceRefDto::into_resource)
+            .map(ResourceRefDto::into_domain)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(WorkspaceAgentDefinition {
             name: self.name,
@@ -285,14 +352,14 @@ pub struct ResourceRefDto {
 }
 
 impl ResourceRefDto {
-    fn from_resource(resource: &ResourceRef) -> Self {
+    fn from_domain(resource: &ResourceRef) -> Self {
         Self {
             provider: resource.provider().to_owned(),
             name: resource.name().to_string(),
         }
     }
 
-    fn into_resource(self) -> Result<ResourceRef, ProtocolError> {
+    fn into_domain(self) -> Result<ResourceRef, ProtocolError> {
         let name = ResourceName::new(self.name).map_err(|error| {
             ProtocolError::new(
                 ProtocolErrorKind::InvalidResourceReference,
@@ -384,65 +451,77 @@ mod tests {
                 .unwrap();
         assert_eq!(value["type"], "workspace.start");
         assert_eq!(value["id"], "request-1");
-        assert_eq!(value["definition"]["agents"][0]["image"], "local/coder:v1");
         assert_eq!(
-            value["definition"]["agents"][0]["resources"][0]["name"],
+            value["message"]["definition"]["agents"][0]["image"],
+            "local/coder:v1"
+        );
+        assert_eq!(
+            value["message"]["definition"]["agents"][0]["resources"][0]["name"],
             "local/context"
         );
     }
 
     #[test]
     fn connection_registration_uses_stable_shape() {
-        let value = serde_json::to_value(ClientRequest::register_connection("webui")).unwrap();
+        let value = serde_json::to_value(ClientRequest::register_connection("register-1", "webui"))
+            .unwrap();
 
         assert_eq!(value["type"], "connection.register");
-        assert_eq!(value["client_type"], "webui");
+        assert_eq!(value["id"], "register-1");
+        assert_eq!(value["message"]["client_type"], "webui");
     }
 
     #[test]
     fn dto_round_trips_to_domain_definition() {
         let original = definition();
-        let dto = WorkspaceDefinitionDto::from_definition(&original);
-        assert_eq!(dto.into_definition().unwrap(), original);
+        let dto = WorkspaceDefinitionDto::from_domain(&original);
+        assert_eq!(dto.into_domain().unwrap(), original);
     }
 
     #[test]
     fn agent_message_uses_workspace_identity_and_optional_agent_name() {
-        let workspace = WorkspaceRefDto::new("demo", "/tmp/demo");
+        let workspace = WorkspaceReferenceDto::new("demo", "/tmp/demo");
         let value = serde_json::to_value(ClientRequest::agent_message(
             "message-1",
             &workspace,
             Some("reviewer".into()),
-            "Review this change.",
+            Message::User {
+                content: "Review this change.".into(),
+            },
         ))
         .unwrap();
 
         assert_eq!(value["type"], "agent.message");
-        assert_eq!(value["workspace"]["name"], "demo");
-        assert_eq!(value["workspace"]["project_root"], "/tmp/demo");
-        assert_eq!(value["agent"], "reviewer");
-        assert_eq!(value["content"], "Review this change.");
+        assert_eq!(value["message"]["workspace"]["name"], "demo");
+        assert_eq!(value["message"]["workspace"]["project_root"], "/tmp/demo");
+        assert_eq!(value["message"]["agent"], "reviewer");
+        assert_eq!(
+            value["message"]["message"]["User"]["content"],
+            "Review this change."
+        );
     }
 
     #[test]
     fn omitted_agent_is_encoded_for_manager_fallback() {
-        let workspace = WorkspaceRefDto::new("demo", "/tmp/demo");
+        let workspace = WorkspaceReferenceDto::new("demo", "/tmp/demo");
         let value = serde_json::to_value(ClientRequest::agent_message(
             "message-1",
             &workspace,
             None,
-            "Hello.",
+            Message::User {
+                content: "Hello.".into(),
+            },
         ))
         .unwrap();
 
-        assert!(value["agent"].is_null());
+        assert!(value["message"]["agent"].is_null());
     }
 
     #[test]
     fn workspace_started_exposes_manager_and_selectable_agents() {
         let event = ServerEvent::WorkspaceStarted {
             id: "request-1".into(),
-            workspace: WorkspaceInfoDto::from_definition(&definition()),
+            workspace: WorkspaceInfoDto::from_domain(&definition()),
         };
         let value = serde_json::to_value(event).unwrap();
 
@@ -455,9 +534,9 @@ mod tests {
     fn state_sync_contains_the_complete_workspace_snapshot() {
         let event = ServerEvent::StateSync {
             state: BackendStateDto {
-                workspaces: vec![WorkspaceInfoDto::from_definition(&definition())],
+                workspaces: vec![WorkspaceInfoDto::from_domain(&definition())],
                 histories: vec![AgentHistoryDto {
-                    workspace: WorkspaceRefDto::new("demo", "/tmp/demo"),
+                    workspace: WorkspaceReferenceDto::new("demo", "/tmp/demo"),
                     agent: "coder".into(),
                     messages: vec![HistoryMessageDto {
                         sequence: 1,
@@ -495,7 +574,7 @@ mod tests {
         let event = ServerEvent::AgentMessage {
             message: AgentMessageDto {
                 id: "message-1".into(),
-                workspace: WorkspaceRefDto::new("demo", "/tmp/demo"),
+                workspace: WorkspaceReferenceDto::new("demo", "/tmp/demo"),
                 agent: "coder".into(),
                 message: Message::Assistant {
                     content: Some("Done.".into()),

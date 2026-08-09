@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_image_loader_plugin::AgentImageLoaderPlugin;
-use agent_plugin::{AgentContext, AgentPlugin, AgentWorkspaceId};
+use agent_plugin::{AgentContext, AgentIdentity, AgentPlugin, AgentWorkspaceId};
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::App;
@@ -137,6 +137,13 @@ fn documented_public_api_starts_queries_reloads_and_stops_workspace() {
     );
     assert_eq!(app.world().workspaces(), vec![workspace]);
     let manager = app.world().workspace_manager(workspace).unwrap();
+    assert_eq!(
+        app.world()
+            .get_component::<AgentIdentity>(manager)
+            .unwrap()
+            .id(),
+        "demo.manager0"
+    );
     assert_eq!(
         app.world().workspace_agent(workspace, "manager"),
         Some(manager)

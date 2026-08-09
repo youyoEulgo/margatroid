@@ -198,6 +198,30 @@ pub struct WorkspaceDefinition {
     pub agents: Vec<WorkspaceAgentDefinition>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceReference {
+    pub name: String,
+    pub project_root: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartWorkspace {
+    pub id: String,
+    pub definition: WorkspaceDefinition,
+}
+
+impl Event for StartWorkspace {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteAgentMessage {
+    pub id: String,
+    pub workspace: WorkspaceReference,
+    pub agent: Option<String>,
+    pub message: Message,
+}
+
+impl Event for RouteAgentMessage {}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
