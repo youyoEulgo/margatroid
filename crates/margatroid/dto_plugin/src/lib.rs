@@ -5,7 +5,7 @@ use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::WorldAsyncExt;
 use core_plugin::{App, Event, Plugin, Resource, World};
 use log_plugin::TracingStream;
-use margatroid_protocol::{ClientMessage, IntoDomain, ServerMessage};
+use margatroid_protocol::{BackendStateDto, ClientMessage, IntoDomain, ServerMessage};
 use server_plugin::{
     AppServerExt, WebSocketConnections, WebSocketMessage, WebSocketMessageReceived,
 };
@@ -67,6 +67,15 @@ struct DtoPluginInstalled;
 
 impl Resource for DtoPluginInstalled {}
 
+#[derive(Default)]
+struct BackendStateReportCache {
+    state: Option<BackendStateDto>,
+    recipients: Vec<u64>,
+    last_error: Option<String>,
+}
+
+impl Resource for BackendStateReportCache {}
+
 impl Plugin for DtoPlugin {
     fn build(self, app: &mut App) {
         if app.world().contains_resource::<DtoPluginInstalled>() {
@@ -87,6 +96,8 @@ impl Plugin for DtoPlugin {
         app.world()
             .spawn_async_service(logs::forward_logs(stream, events));
         app.world_mut().insert_resource(DtoPluginInstalled);
+        app.world_mut()
+            .insert_resource(BackendStateReportCache::default());
         let frontend_type = self.frontend_type;
         app.add_websocket_event_route(&self.websocket_path)
             .add_system(&self.schedule, move |world: &mut World| {
@@ -172,6 +183,7 @@ fn dto_route_system(world: &mut World) {
         return;
     };
     for outgoing in outgoing {
+        let is_log = matches!(&outgoing.message, ServerMessage::Log { .. });
         let encoded = match serde_json::to_string(&outgoing.message) {
             Ok(encoded) => encoded,
             Err(error) => {
@@ -194,7 +206,9 @@ fn dto_route_system(world: &mut World) {
         };
         for sender in senders {
             if let Err(error) = sender.try_send(WebSocketMessage::Text(encoded.clone().into())) {
-                tracing::warn!(connection = sender.connection_id().get(), error = %error, "WebSocket API message could not be queued");
+                if !is_log {
+                    tracing::warn!(connection = sender.connection_id().get(), error = %error, "WebSocket API message could not be queued");
+                }
             }
         }
     }

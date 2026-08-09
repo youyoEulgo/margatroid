@@ -31,4 +31,12 @@ fn documented_public_api_publishes_state_for_the_configured_frontend_type() {
                     if state.workspaces.is_empty() && state.histories.is_empty()
             )
     }));
+
+    app.tick();
+    app.tick();
+    assert!(app
+        .world()
+        .event_reader::<WebSocketMessageSend>()
+        .into_iter()
+        .all(|message| !matches!(message.message, ServerMessage::StateSync { .. })));
 }
