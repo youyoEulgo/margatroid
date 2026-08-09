@@ -1,17 +1,46 @@
 use app_runtime_plugin::WorldEventExt;
 use core_plugin::World;
 use margatroid_protocol::{
-    AgentFailureDto, AgentMessageDto, IntoDto, ProtocolErrorKind, ServerMessage,
+    AgentFailureDto, AgentMessageDto, BackendStateDto, IntoDto, ProtocolErrorKind, ServerMessage,
 };
 use margatroid_types::{AgentFailure, AgentMessage};
+use server_plugin::{ServerFailed, ServerStarted, ServerStopped};
 use workspace_plugin::StartWorkspaceResult;
 
 use crate::{WebSocketMessageSend, WebSocketMessageTarget};
 
-pub(crate) fn collect_external_events_system(world: &mut World) {
+pub(crate) fn collect_external_events_system(world: &mut World, frontend_type: &str) {
+    report_server_events(world);
     report_workspace_events(world);
     report_agent_messages(world);
     report_agent_failures(world);
+    sync_frontend_state(world, frontend_type);
+}
+
+fn report_server_events(world: &World) {
+    for event in world.event_reader::<ServerStarted>() {
+        tracing::info!(address = %event.address, "daemon WebSocket server started");
+    }
+    for event in world.event_reader::<ServerFailed>() {
+        tracing::error!(error = %event.message, "daemon WebSocket server failed");
+    }
+    if !world.event_reader::<ServerStopped>().is_empty() {
+        tracing::info!("daemon WebSocket server stopped");
+    }
+}
+
+fn sync_frontend_state(world: &World, frontend_type: &str) {
+    let state: BackendStateDto = match ().into_dto(world) {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(error = %error, "frontend state sync failed");
+            return;
+        }
+    };
+    world.send_event(WebSocketMessageSend {
+        target: WebSocketMessageTarget::Type(frontend_type.into()),
+        message: ServerMessage::StateSync { state },
+    });
 }
 
 fn report_workspace_events(world: &World) {

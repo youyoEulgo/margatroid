@@ -8,6 +8,7 @@ use connection_plugin::ConnectionPlugin;
 use core_plugin::{App, World};
 use dto_plugin::{DtoPlugin, WebSocketMessageSend, WebSocketMessageTarget};
 use futures_util::{SinkExt, StreamExt};
+use log_plugin::LogPlugin;
 use margatroid_protocol::{ClientMessage, LogRecordDto, ServerMessage, WorkspaceReferenceDto};
 use margatroid_types::{Message, RouteAgentMessage};
 use server_plugin::{ServerHandle, ServerPlugin};
@@ -33,6 +34,7 @@ fn registered_client_receives_messages_targeted_by_type() {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
+        .add_plugin(LogPlugin::default().without_console().with_stream(8))
         .add_plugin(ServerPlugin::bind("127.0.0.1:0"))
         .add_plugin(DtoPlugin::default())
         .add_plugin(ConnectionPlugin::default())
@@ -93,7 +95,18 @@ fn registered_client_receives_messages_targeted_by_type() {
                 ))
                 .await
                 .unwrap();
-            let response = socket.next().await.unwrap().unwrap();
+            let response = loop {
+                let response = socket.next().await.unwrap().unwrap();
+                let tokio_tungstenite::tungstenite::Message::Text(text) = &response else {
+                    continue;
+                };
+                let Ok(ServerMessage::Log { record }) = serde_json::from_str(text) else {
+                    continue;
+                };
+                if record.message == "routed" {
+                    break response;
+                }
+            };
             let _ = socket.close(None).await;
             response
         })

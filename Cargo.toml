@@ -13,7 +13,6 @@ members = [
     "crates/margatroid/compose",
     "crates/margatroid/protocol",
     "crates/margatroid/dto_plugin",
-    "crates/margatroid/api_integration_plugin",
     "crates/margatroid/connection_plugin",
     "crates/margatroid/agent_image_loader_plugin",
     "crates/margatroid/inference_plugin",

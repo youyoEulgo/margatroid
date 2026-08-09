@@ -1,5 +1,10 @@
+mod logs;
+mod outbound;
+
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
+use async_runtime_plugin::WorldAsyncExt;
 use core_plugin::{App, Event, Plugin, Resource, World};
+use log_plugin::TracingStream;
 use margatroid_protocol::{ClientMessage, IntoDomain, ServerMessage};
 use server_plugin::{
     AppServerExt, WebSocketConnections, WebSocketMessage, WebSocketMessageReceived,
@@ -9,6 +14,7 @@ use server_plugin::{
 pub struct DtoPlugin {
     websocket_path: String,
     schedule: String,
+    frontend_type: String,
 }
 
 impl DtoPlugin {
@@ -16,6 +22,7 @@ impl DtoPlugin {
         Self {
             websocket_path: "/ws".into(),
             schedule: RuntimePlugin::UPDATE.into(),
+            frontend_type: "webui".into(),
         }
     }
 
@@ -26,6 +33,11 @@ impl DtoPlugin {
 
     pub fn with_schedule(mut self, schedule: impl Into<String>) -> Self {
         self.schedule = schedule.into();
+        self
+    }
+
+    pub fn with_frontend_type(mut self, frontend_type: impl Into<String>) -> Self {
+        self.frontend_type = frontend_type.into();
         self
     }
 }
@@ -66,9 +78,20 @@ impl Plugin for DtoPlugin {
         if !app.world().contains_resource::<WebSocketConnections>() {
             panic!("ServerPlugin must be installed before DtoPlugin");
         }
+        let stream = app
+            .world()
+            .get_resource::<TracingStream>()
+            .cloned()
+            .expect("LogPlugin with a TracingStream must be installed before DtoPlugin");
+        let events = app.world().event_sender();
+        app.world()
+            .spawn_async_service(logs::forward_logs(stream, events));
         app.world_mut().insert_resource(DtoPluginInstalled);
+        let frontend_type = self.frontend_type;
         app.add_websocket_event_route(&self.websocket_path)
-            .add_system(&self.schedule, outbound::collect_external_events_system)
+            .add_system(&self.schedule, move |world: &mut World| {
+                outbound::collect_external_events_system(world, &frontend_type);
+            })
             .add_system(&self.schedule, dto_route_system);
     }
 }
@@ -158,4 +181,3 @@ fn dto_route_system(world: &mut World) {
         }
     }
 }
-mod outbound;

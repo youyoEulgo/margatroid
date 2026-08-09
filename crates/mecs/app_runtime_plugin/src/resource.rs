@@ -174,6 +174,7 @@ impl RuntimeControl {
     }
 
     fn run_event_driven(&mut self, app: &mut App, wake_receiver: &Receiver<()>) {
+        self.run_initial_frame(app);
         loop {
             self.sync_event_snapshot(app);
             match self.status() {
@@ -183,6 +184,11 @@ impl RuntimeControl {
             }
         }
     }
+
+    fn run_initial_frame(&mut self, app: &mut App) {
+        app.tick();
+        self.sync_event_snapshot(app);
+    }
 }
 
 impl Resource for RuntimeControl {}
@@ -190,6 +196,8 @@ impl Resource for RuntimeControl {}
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc::sync_channel;
+
+    use core_plugin::World;
 
     use super::*;
 
@@ -237,5 +245,22 @@ mod tests {
     fn opening_an_open_gate_panics() {
         let (_control, handle) = control(RuntimeMode::EventDriven);
         handle.open_gate();
+    }
+
+    #[test]
+    fn event_driven_initial_frame_runs_without_queued_events() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let startup_calls = Arc::clone(&calls);
+        let mut app = App::new();
+        app.add_once_schedule("startup".into())
+            .add_system("startup", move |_world: &mut World| {
+                startup_calls.fetch_add(1, Ordering::Relaxed);
+            });
+        let (mut control, _handle) = control(RuntimeMode::EventDriven);
+
+        control.run_initial_frame(&mut app);
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(control.status(), RuntimeState::Sleeping);
     }
 }

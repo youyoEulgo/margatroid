@@ -1,10 +1,10 @@
-use api_integration_plugin::ApiIntegrationPlugin;
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::App;
-use dto_plugin::{WebSocketMessageSend, WebSocketMessageTarget};
+use dto_plugin::{DtoPlugin, WebSocketMessageSend, WebSocketMessageTarget};
 use log_plugin::LogPlugin;
 use margatroid_protocol::ServerMessage;
+use server_plugin::ServerPlugin;
 
 #[test]
 fn documented_public_api_publishes_state_for_the_configured_frontend_type() {
@@ -12,7 +12,8 @@ fn documented_public_api_publishes_state_for_the_configured_frontend_type() {
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(LogPlugin::default().without_console().with_stream(8))
-        .add_plugin(ApiIntegrationPlugin::default().with_frontend_type("browser"));
+        .add_plugin(ServerPlugin::bind("127.0.0.1:0"))
+        .add_plugin(DtoPlugin::default().with_frontend_type("browser"));
 
     app.tick();
     app.tick();

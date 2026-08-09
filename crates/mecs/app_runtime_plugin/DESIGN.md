@@ -198,7 +198,10 @@ RuntimeControl：Runtime控制器，crate公开结构体--配置阶段由World�
         行为：执行固定帧运行循环
     run_event_driven(&mut self, app: &mut App, wake_receiver: &Receiver<()>)
         事件驱动运行：私有方法，按事件快照驱动app
-        行为：执行事件驱动运行循环
+        行为：无条件执行初始帧后进入事件驱动运行循环
+    run_initial_frame(&mut self, app: &mut App)
+        执行初始帧：私有方法，在事件驱动循环开始前调用app.tick并同步EventSnapshot
+        行为：保证空事件队列下也会执行STARTUP和第一帧循环Schedule
     impl Resource for RuntimeControl
         Resource：crate公开trait实现
 ```
@@ -234,6 +237,7 @@ Runtime的配置错误与可识别运行错误使用RuntimeError统一描述
                 返回
 
 事件驱动运行循环：
+    调用run_initial_frame无条件执行一次app.tick
     循环：
         同步EventSnapshot
         分流：RuntimeState

@@ -6,7 +6,6 @@ use std::process;
 
 use agent_image_loader_plugin::AgentImageLoaderPlugin;
 use agent_plugin::AgentPlugin;
-use api_integration_plugin::ApiIntegrationPlugin;
 use app_runtime_plugin::{AppRunExt, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimePlugin;
 use connection_plugin::ConnectionPlugin;
@@ -85,8 +84,7 @@ fn run(config: DaemonConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(AgentPlugin::default())
         .add_plugin(workspace)
         .add_plugin(DtoPlugin::default())
-        .add_plugin(ConnectionPlugin::default())
-        .add_plugin(ApiIntegrationPlugin::default());
+        .add_plugin(ConnectionPlugin::default());
 
     info!(address = %config.bind, data_root = %data_root.display(), models = %models_path.display(), "margatroid daemon starting");
     app.run();

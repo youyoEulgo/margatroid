@@ -31,16 +31,19 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 DtoPlugin：WebSocket DTO转换插件，公开结构体--注册WebSocket路由并在协议DTO与领域事件之间转换
     websocket_path: String--WebSocket路由路径，默认/ws
     schedule: String--dto_route_system所属Runtime schedule，默认RuntimePlugin::UPDATE
+    frontend_type: String--接收完整状态快照的连接类型，默认webui
     new() -> Self
         构造插件：使用默认路径和Schedule
     with_websocket_path(self, path: impl Into<String>) -> Self
         设置路径：保存调用者路径并返回自身
     with_schedule(self, schedule: impl Into<String>) -> Self
         设置Schedule：保存调用者Schedule并返回自身
+    with_frontend_type(self, frontend_type: impl Into<String>) -> Self
+        设置前端类型：替换完整状态快照的目标连接类型并返回自身
     impl Plugin for DtoPlugin
         Plugin：公开trait实现
         build(self, app: &mut App)
-            安装插件：注册WebSocket路由、collect_external_events_system和dto_route_system
+            安装插件：检查Server与TracingStream依赖，启动日志转发服务并注册WebSocket路由、collect_external_events_system和dto_route_system
 
 WebSocketMessageTarget：发送目标，公开枚举--描述连接筛选方式
     Broadcast--全部连接
@@ -70,13 +73,19 @@ dto_route_system(world: &mut World)
         将ServerMessage序列化为Text
         根据Broadcast、Type或Name取得发送器并调用try_send
 
-collect_external_events_system(world: &mut World)
+collect_external_events_system(world: &mut World, frontend_type: &str)
     收集外部事件：私有System，将允许发送给外部的领域事件转换为ServerMessage并包装成WebSocketMessageSend
     行为：
+        将ServerStarted、ServerFailed和ServerStopped写入结构化日志
         收集StartWorkspaceResult、AgentMessage和AgentFailure
         调用Protocol的FromDomain实现解析Workspace和Agent逻辑身份
         构造对应WorkspaceStarted、AgentMessage或AgentFailure协议事件
         选择Broadcast目标并发送WebSocketMessageSend
+        调用()::into_dto(&World)构造BackendStateDto
+        将StateSync发送给frontend_type指定的连接类型
+
+forward_logs(stream: TracingStream, events: RuntimeEventSender)
+    转发结构化日志：私有异步函数，订阅TracingStream，将TracingRecord转换为LogRecordDto并广播WebSocketMessageSend
 
 ```
 
@@ -93,6 +102,13 @@ collect_external_events_system(world: &mut World)
     外部可见领域事件
         -> collect_external_events_system构造ServerMessage
         -> 包装WebSocketMessageSend
+    Workspace、Agent和Memory当前状态
+        -> collect_external_events_system每帧构造BackendStateDto
+        -> StateSync发送给frontend_type
+    LogPlugin::TracingStream
+        -> forward_logs异步订阅
+        -> LogRecordDto转换
+        -> 广播WebSocketMessageSend
     其他Plugin也可直接发送WebSocketMessageSend
         -> DtoPlugin序列化ServerMessage
         -> WebSocketConnections按target筛选
@@ -102,9 +118,10 @@ collect_external_events_system(world: &mut World)
 ## 边界
 
 ```text
-DtoPlugin负责：WebSocket帧、JSON信封、DTO转换调用、入站领域事件发送、外部可见领域事件投影、ServerMessage序列化和连接筛选
+DtoPlugin负责：WebSocket帧、JSON信封、DTO转换调用、入站领域事件发送、外部可见领域事件投影、完整状态快照、结构化日志转发、ServerMessage序列化和连接筛选
 DtoPlugin不负责：manager路由、Agent Entity创建、Memory、Tool、Inference和资源权限
 Protocol负责：XxxDto及其IntoDomain/FromDomain转换，包括使用World进行只读身份投影
+LogPlugin负责：生成TracingStream，不感知DTO、WebSocket或连接目标
 WorkspacePlugin负责：消费Workspace领域命令、解析Workspace和Agent逻辑身份
 AgentPlugin负责：处理已经携带Entity的AgentMessage
 ```

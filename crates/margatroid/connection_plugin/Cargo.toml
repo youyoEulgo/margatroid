@@ -13,6 +13,7 @@ tracing = { workspace = true }
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
 dto_plugin = { path = "../dto_plugin" }
 futures-util = { workspace = true }
+log_plugin = { path = "../../mecs/log_plugin" }
 margatroid_protocol = { path = "../protocol" }
 margatroid_types = { path = "../types" }
 serde_json = { workspace = true }
