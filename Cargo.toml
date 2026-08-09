@@ -42,3 +42,4 @@ axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 rusqlite = "0.31"
+time = { version = "0.3", features = ["formatting"] }

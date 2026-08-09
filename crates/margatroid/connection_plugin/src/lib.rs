@@ -71,9 +71,17 @@ fn connection_registration_system(world: &mut World) {
             );
             continue;
         }
-        if let Err(error) = connections.set_name(request.connection_id, name) {
+        if let Err(error) = connections.set_name(request.connection_id, name.clone()) {
             tracing::warn!(connection = request.connection_id.get(), error = %error, "WebSocket connection could not be named");
+            continue;
         }
+        tracing::info!(
+            request_id = %request.id,
+            connection = request.connection_id.get(),
+            client_type,
+            name,
+            "WebSocket connection registered"
+        );
     }
 }
 
