@@ -12,6 +12,10 @@ Plugin 根据 AgentInstance 绑定的逻辑 `ModelId` 按项目级、全局顺�
 组装为 Provider Request，发送流式 HTTP 请求，将文本片段直接写入可选前端通道，最后
 返回完整统一响应。
 
+Provider 请求失败时，错误会保留安全 endpoint、传输错误类别和最深层系统原因。非成功 HTTP 响应会
+优先提取常见 JSON 错误字段，并回退到有界、单行化的响应正文。错误不会包含 Authorization header、
+API key、请求正文、URL 凭据或查询参数，最终文本限制为 512 字节。
+
 AgentImageLoaderPlugin 只提供中立模型配置；InferencePlugin 负责把它转换为实例推理快照，
 并验证推理参数和模型路由。资源加载层不依赖推理业务层。
 
