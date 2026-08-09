@@ -26,6 +26,9 @@ app.add_plugin(RuntimePlugin::default()).run();
 - `RuntimePlugin::PRE_UPDATE`、`RuntimePlugin::UPDATE` 和
   `RuntimePlugin::POST_UPDATE` 在每次 tick 时执行。
 
+事件驱动模式进入等待循环前会无条件执行第一个 tick，因此即使初始事件队列为空，`STARTUP` 和
+第一帧循环 Schedule 也一定会运行。后续帧才由事件快照和阀状态驱动。
+
 ## 公开 API
 
 - `RuntimePlugin::default()`：事件驱动模式
