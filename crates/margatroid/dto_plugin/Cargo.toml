@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
+config_plugin = { path = "../config_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
 log_plugin = { path = "../../mecs/log_plugin" }
 margatroid_protocol = { path = "../protocol" }

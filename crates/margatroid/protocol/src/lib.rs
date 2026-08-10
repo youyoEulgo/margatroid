@@ -98,6 +98,12 @@ pub enum ServerMessage {
     WorkspaceStopFailed { id: String, error: String },
     #[serde(rename = "agent.message")]
     AgentMessage { message: AgentMessageDto },
+    #[serde(rename = "agent.message.delta")]
+    AgentMessageDelta {
+        id: String,
+        agent: String,
+        content: String,
+    },
     #[serde(rename = "agent.failure")]
     AgentFailure { failure: AgentFailureDto },
 }
@@ -973,6 +979,21 @@ mod tests {
         assert_eq!(value["type"], "agent.message");
         assert_eq!(value["message"]["agent"], "coder");
         assert_eq!(value["message"]["message"]["Assistant"]["content"], "Done.");
+    }
+
+    #[test]
+    fn agent_message_delta_serializes_as_a_flat_stream_frame() {
+        let event = ServerMessage::AgentMessageDelta {
+            id: "turn-1".into(),
+            agent: "demo.coder0".into(),
+            content: "hello".into(),
+        };
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["type"], "agent.message.delta");
+        assert_eq!(value["id"], "turn-1");
+        assert_eq!(value["agent"], "demo.coder0");
+        assert_eq!(value["content"], "hello");
     }
 
     #[test]

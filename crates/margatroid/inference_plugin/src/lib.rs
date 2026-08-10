@@ -10,6 +10,7 @@ use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::{
     AppAsyncExt, AsyncContext, AsyncRuntimeHandle, AsyncTaskError, WorldAsyncExt,
 };
+use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use futures_util::{FutureExt, StreamExt};
 use margatroid_types::{
@@ -18,6 +19,9 @@ use margatroid_types::{
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Method, StatusCode, Url};
 use serde::{Deserialize, Serialize};
+use server_plugin::{
+    WebSocketConnections, WebSocketMessage, WebSocketMessageSender, WebSocketSender,
+};
 
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_MESSAGES_BYTES: usize = 16 * 1024 * 1024;
@@ -49,6 +53,7 @@ pub enum InferenceErrorKind {
     RequestFailed,
     ResponseStatus,
     ResponseDecodeFailed,
+    ResponseEncodeFailed,
     ResponseIncomplete,
     TaskPanicked,
 }
@@ -377,7 +382,7 @@ pub trait ProviderAdapterFactory: Send + Sync + 'static {
 pub trait ProviderResponseAccumulator: Send + 'static {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, InferenceError>;
 
-    fn finish(self: Box<Self>) -> Result<InferenceResponse, InferenceError>;
+    fn finish(self: Box<Self>) -> Result<(InferenceResponse, Vec<String>), InferenceError>;
 }
 
 pub type ErasedProviderAdapter = Arc<dyn ProviderAdapter>;
@@ -430,14 +435,12 @@ impl Event for ReloadModelRoutesResult {}
 pub struct InferenceCommand {
     pub id: String,
     pub agent: Entity,
+    pub agent_id: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
-    pub stream: Option<InferenceStreamSender>,
 }
 
 impl Event for InferenceCommand {}
-
-pub type InferenceStreamSender = tokio::sync::mpsc::Sender<String>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InferenceRoute {
@@ -447,10 +450,11 @@ struct InferenceRoute {
 
 struct PreparedInference {
     route: InferenceRoute,
+    agent_id: String,
     client: reqwest::Client,
     request: ProviderHttpRequest,
     adapter: ErasedProviderAdapter,
-    stream: Option<InferenceStreamSender>,
+    senders: Vec<WebSocketSender>,
 }
 
 impl Event for PreparedInference {}
@@ -896,12 +900,15 @@ fn prepare_inference(
         id: command.id.clone(),
         agent: command.agent,
     };
-    if command.id.is_empty() {
+    if command.id.is_empty()
+        || command.agent_id.is_empty()
+        || command.agent_id.chars().any(char::is_control)
+    {
         return Err((
             route,
             InferenceError::new(
                 InferenceErrorKind::InvalidCommand,
-                "inference request ID cannot be empty",
+                "inference request and Agent IDs must be valid",
             ),
         ));
     }
@@ -966,13 +973,58 @@ fn prepare_inference(
         })?
         .client
         .clone();
+    let targets = world
+        .get_resource::<MargatroidConfig>()
+        .ok_or_else(|| {
+            (
+                route.clone(),
+                InferenceError::new(
+                    InferenceErrorKind::InvalidCommand,
+                    "global configuration is missing",
+                ),
+            )
+        })?
+        .streaming_member_messages();
+    let connections = world
+        .get_resource::<WebSocketConnections>()
+        .ok_or_else(|| {
+            (
+                route.clone(),
+                InferenceError::new(
+                    InferenceErrorKind::InvalidCommand,
+                    "WebSocket connection registry is missing",
+                ),
+            )
+        })?;
+    let senders = resolve_websocket_targets(connections, targets);
     Ok(PreparedInference {
         route,
+        agent_id: command.agent_id,
         client,
         request,
         adapter: model_route.adapter,
-        stream: command.stream,
+        senders,
     })
+}
+
+fn resolve_websocket_targets(
+    connections: &WebSocketConnections,
+    targets: &[WebSocketMessageTarget],
+) -> Vec<WebSocketSender> {
+    let mut seen = HashSet::new();
+    targets
+        .iter()
+        .flat_map(|target| match target {
+            WebSocketMessageTarget::Broadcast => connections.get_all(),
+            WebSocketMessageTarget::Type(connection_type) => {
+                connections.get_by_type(connection_type)
+            }
+            WebSocketMessageTarget::Name(name) => {
+                connections.get_by_name(name).into_iter().collect()
+            }
+        })
+        .filter(|sender| seen.insert(sender.connection_id()))
+        .collect()
 }
 
 fn validate_messages(messages: &[Message]) -> Result<(), InferenceError> {
@@ -1132,16 +1184,65 @@ async fn run_provider(prepared: PreparedInference) -> Result<InferenceResponse, 
                 ),
             )
         })?;
-        let text = accumulator.push(&chunk)?;
-        if let Some(sender) = &prepared.stream {
-            for text in text {
-                if sender.send(text).await.is_err() {
-                    break;
-                }
-            }
+        for content in accumulator.push(&chunk)? {
+            send_stream_delta(
+                &prepared.senders,
+                &prepared.route.id,
+                &prepared.agent_id,
+                content,
+            )
+            .await?;
         }
     }
-    accumulator.finish()
+    let (response, content) = accumulator.finish()?;
+    for content in content {
+        send_stream_delta(
+            &prepared.senders,
+            &prepared.route.id,
+            &prepared.agent_id,
+            content,
+        )
+        .await?;
+    }
+    Ok(response)
+}
+
+#[derive(Serialize)]
+struct AgentMessageDeltaFrame<'a> {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    id: &'a str,
+    agent: &'a str,
+    content: String,
+}
+
+async fn send_stream_delta(
+    senders: &[WebSocketSender],
+    id: &str,
+    agent: &str,
+    content: String,
+) -> Result<(), InferenceError> {
+    let encoded = serde_json::to_string(&AgentMessageDeltaFrame {
+        message_type: "agent.message.delta",
+        id,
+        agent,
+        content,
+    })
+    .map_err(|_| {
+        InferenceError::new(
+            InferenceErrorKind::ResponseEncodeFailed,
+            "inference stream message could not be encoded",
+        )
+    })?;
+    let active = senders
+        .iter()
+        .filter(|sender| !sender.is_closed())
+        .cloned()
+        .collect::<Vec<_>>();
+    WebSocketMessageSender::new(active, WebSocketMessage::Text(encoded.into()))
+        .send()
+        .await;
+    Ok(())
 }
 
 fn safe_endpoint(url: &Url) -> String {
@@ -1515,10 +1616,11 @@ impl ProviderResponseAccumulator for OpenAiAccumulator {
         Ok(text)
     }
 
-    fn finish(mut self: Box<Self>) -> Result<InferenceResponse, InferenceError> {
+    fn finish(mut self: Box<Self>) -> Result<(InferenceResponse, Vec<String>), InferenceError> {
+        let mut text = Vec::new();
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
-            self.consume_line(&line)?;
+            text.extend(self.consume_line(&line)?);
         }
         if !self.saw_choice || !self.done && self.stop_reason.is_none() {
             return Err(InferenceError::new(
@@ -1551,14 +1653,17 @@ impl ProviderResponseAccumulator for OpenAiAccumulator {
         } else {
             StopReason::ToolCalls
         };
-        Ok(InferenceResponse {
-            message: Message::Assistant {
-                content: (!self.content.is_empty()).then_some(self.content),
-                tool_calls: calls,
+        Ok((
+            InferenceResponse {
+                message: Message::Assistant {
+                    content: (!self.content.is_empty()).then_some(self.content),
+                    tool_calls: calls,
+                },
+                stop_reason: reason,
+                usage: self.usage,
             },
-            stop_reason: reason,
-            usage: self.usage,
-        })
+            text,
+        ))
     }
 }
 
@@ -1719,7 +1824,8 @@ data: [DONE]
         let mut visible = accumulator.push(&first[..13]).unwrap();
         visible.extend(accumulator.push(&first[13..]).unwrap());
         visible.extend(accumulator.push(second).unwrap());
-        let response = Box::new(accumulator).finish().unwrap();
+        let (response, trailing) = Box::new(accumulator).finish().unwrap();
+        assert!(trailing.is_empty());
         assert_eq!(visible, ["he", "llo"]);
         assert_eq!(
             response.message,
@@ -1733,14 +1839,14 @@ data: [DONE]
     #[test]
     fn openai_accumulator_reassembles_tool_call_fragments() {
         let mut accumulator = OpenAiAccumulator::default();
-        accumulator
+        let first_visible = accumulator
             .push(
                 br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"echo","arguments":"{\"te"}}]},"finish_reason":null}]}
 
 "#,
             )
             .unwrap();
-        accumulator
+        let second_visible = accumulator
             .push(
                 br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"xt\":\"hi\"}"}}]},"finish_reason":"tool_calls"}]}
 
@@ -1749,7 +1855,10 @@ data: [DONE]
 "#,
             )
             .unwrap();
-        let response = Box::new(accumulator).finish().unwrap();
+        assert!(first_visible.is_empty());
+        assert!(second_visible.is_empty());
+        let (response, trailing) = Box::new(accumulator).finish().unwrap();
+        assert!(trailing.is_empty());
         assert_eq!(
             response.message,
             Message::Assistant {
@@ -1762,6 +1871,25 @@ data: [DONE]
             }
         );
         assert_eq!(response.stop_reason, StopReason::ToolCalls);
+    }
+
+    #[test]
+    fn openai_accumulator_returns_text_from_the_trailing_line() {
+        let mut accumulator = OpenAiAccumulator::default();
+        let visible = accumulator
+            .push(br#"data: {"choices":[{"delta":{"content":"tail"},"finish_reason":"stop"}]}"#)
+            .unwrap();
+        assert!(visible.is_empty());
+
+        let (response, trailing) = Box::new(accumulator).finish().unwrap();
+        assert_eq!(trailing, ["tail"]);
+        assert_eq!(
+            response.message,
+            Message::Assistant {
+                content: Some("tail".into()),
+                tool_calls: Vec::new(),
+            }
+        );
     }
 
     #[test]
@@ -1787,11 +1915,11 @@ api_type = "openai"
         app.world().send_event(InferenceCommand {
             id: "request".into(),
             agent,
+            agent_id: "test.agent0".into(),
             messages: vec![Message::User {
                 content: "hello".into(),
             }],
             tools: Vec::new(),
-            stream: None,
         });
         app.tick();
         app.tick();

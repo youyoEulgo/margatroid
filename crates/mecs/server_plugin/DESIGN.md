@@ -312,6 +312,16 @@ WebSocketSender：WebSocket发送器，公开结构体--可在事件、System和
     impl Hash for WebSocketSender
         Hash：公开trait实现，仅哈希connection_id
 
+WebSocketMessageSender：WebSocket消息发送终端，公开结构体--持有已解析的连接发送器和可直接入队的WebSocket消息，不是Event
+    senders: Vec<WebSocketSender>--本次消息的固定接收连接集合，私有
+    message: WebSocketMessage--已序列化或已构造的WebSocket帧，私有
+    new(senders: Vec<WebSocketSender>, message: WebSocketMessage) -> Self
+        构造发送终端：公开关联函数，保存固定发送器集合和消息
+    send(self) -> Future<Output = Vec<(WebSocketConnectionId, Result<(), WebSocketSendError>)>>
+        异步发送：公开方法，按senders顺序逐个await WebSocketSender::send并汇总结果
+    try_send(self) -> Vec<(WebSocketConnectionId, Result<(), WebSocketSendError>)>
+        尝试发送：公开方法，按senders顺序逐个调用WebSocketSender::try_send并汇总结果
+
 WebSocketNameError：WebSocket命名错误，公开枚举
     ConnectionNotFound { connection_id: WebSocketConnectionId }
     NameAlreadyExists { name: String }

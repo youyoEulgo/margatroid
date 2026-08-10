@@ -3,18 +3,20 @@ mod outbound;
 
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::WorldAsyncExt;
+use config_plugin::MargatroidConfig;
+pub use config_plugin::WebSocketMessageTarget;
 use core_plugin::{App, Event, Plugin, Resource, World};
 use log_plugin::TracingStream;
 use margatroid_protocol::{BackendStateDto, ClientMessage, IntoDomain, ServerMessage};
 use server_plugin::{
     AppServerExt, WebSocketConnections, WebSocketMessage, WebSocketMessageReceived,
+    WebSocketMessageSender,
 };
 
 #[derive(Clone, Debug)]
 pub struct DtoPlugin {
     websocket_path: String,
     schedule: String,
-    frontend_type: String,
 }
 
 impl DtoPlugin {
@@ -22,7 +24,6 @@ impl DtoPlugin {
         Self {
             websocket_path: "/ws".into(),
             schedule: RuntimePlugin::UPDATE.into(),
-            frontend_type: "webui".into(),
         }
     }
 
@@ -35,24 +36,12 @@ impl DtoPlugin {
         self.schedule = schedule.into();
         self
     }
-
-    pub fn with_frontend_type(mut self, frontend_type: impl Into<String>) -> Self {
-        self.frontend_type = frontend_type.into();
-        self
-    }
 }
 
 impl Default for DtoPlugin {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WebSocketMessageTarget {
-    Broadcast,
-    Type(String),
-    Name(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,22 +76,27 @@ impl Plugin for DtoPlugin {
         if !app.world().contains_resource::<WebSocketConnections>() {
             panic!("ServerPlugin must be installed before DtoPlugin");
         }
+        let targets = app
+            .world()
+            .get_resource::<MargatroidConfig>()
+            .cloned()
+            .expect("ConfigPlugin must be installed before DtoPlugin");
         let stream = app
             .world()
             .get_resource::<TracingStream>()
             .cloned()
             .expect("LogPlugin with a TracingStream must be installed before DtoPlugin");
         let events = app.world().event_sender();
-        app.world()
-            .spawn_async_service(logs::forward_logs(stream, events));
+        app.world().spawn_async_service(logs::forward_logs(
+            stream,
+            events,
+            targets.logs().to_vec(),
+        ));
         app.world_mut().insert_resource(DtoPluginInstalled);
         app.world_mut()
             .insert_resource(BackendStateReportCache::default());
-        let frontend_type = self.frontend_type;
         app.add_websocket_event_route(&self.websocket_path)
-            .add_system(&self.schedule, move |world: &mut World| {
-                outbound::collect_external_events_system(world, &frontend_type);
-            })
+            .add_system(&self.schedule, outbound::collect_external_events_system)
             .add_system(&self.schedule, dto_route_system);
     }
 }
@@ -204,10 +198,12 @@ fn dto_route_system(world: &mut World) {
                 }
             },
         };
-        for sender in senders {
-            if let Err(error) = sender.try_send(WebSocketMessage::Text(encoded.clone().into())) {
+        for (connection_id, result) in
+            WebSocketMessageSender::new(senders, WebSocketMessage::Text(encoded.into())).try_send()
+        {
+            if let Err(error) = result {
                 if !is_log {
-                    tracing::warn!(connection = sender.connection_id().get(), error = %error, "WebSocket API message could not be queued");
+                    tracing::warn!(connection = connection_id.get(), error = %error, "WebSocket API message could not be queued");
                 }
             }
         }

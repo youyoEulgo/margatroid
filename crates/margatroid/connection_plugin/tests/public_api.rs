@@ -4,9 +4,10 @@ use std::time::{Duration, Instant};
 
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
+use config_plugin::{ConfigPlugin, MargatroidConfig, WebSocketMessageTarget};
 use connection_plugin::ConnectionPlugin;
 use core_plugin::{App, World};
-use dto_plugin::{DtoPlugin, WebSocketMessageSend, WebSocketMessageTarget};
+use dto_plugin::{DtoPlugin, WebSocketMessageSend};
 use futures_util::{SinkExt, StreamExt};
 use log_plugin::LogPlugin;
 use margatroid_protocol::{ClientMessage, LogRecordDto, ServerMessage, WorkspaceReferenceDto};
@@ -36,6 +37,15 @@ fn registered_client_receives_messages_targeted_by_type() {
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(LogPlugin::default().without_console().with_stream(8))
         .add_plugin(ServerPlugin::bind("127.0.0.1:0"))
+        .add_plugin(ConfigPlugin::new(
+            MargatroidConfig::new(
+                vec![WebSocketMessageTarget::Broadcast],
+                vec![WebSocketMessageTarget::Broadcast],
+                vec![WebSocketMessageTarget::Broadcast],
+                vec![WebSocketMessageTarget::Broadcast],
+            )
+            .unwrap(),
+        ))
         .add_plugin(DtoPlugin::default())
         .add_plugin(ConnectionPlugin::default())
         .add_system(RuntimePlugin::UPDATE, |world: &mut World| {

@@ -14,6 +14,7 @@ app_runtime_plugin = { path = "../../crates/mecs/app_runtime_plugin" }
 async_runtime_plugin = { path = "../../crates/mecs/async_runtime_plugin" }
 core_plugin = { path = "../../crates/mecs/core_plugin" }
 connection_plugin = { path = "../../crates/margatroid/connection_plugin" }
+config_plugin = { path = "../../crates/margatroid/config_plugin" }
 dto_plugin = { path = "../../crates/margatroid/dto_plugin" }
 inference_plugin = { path = "../../crates/margatroid/inference_plugin" }
 log_plugin = { path = "../../crates/mecs/log_plugin" }

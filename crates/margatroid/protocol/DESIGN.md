@@ -116,9 +116,19 @@ ServerMessage：daemon发给客户端的协议事件，公开枚举--统一使�
     WorkspaceStopFailed { id: String, error: String }
         workspace.stop_failed：Workspace停止失败
     AgentMessage { message: AgentMessageDto }
+        agent.message：发送推理完成后的完整Agent消息，用于最终校正，不产生第二条前端消息
+    AgentMessageDelta { id: String, agent: String, content: String }
+        agent.message.delta：发送当前推理轮次的文本分片，只用于实时渲染
     AgentFailure { failure: AgentFailureDto }
     impl Serialize + Deserialize for ServerMessage
         Serialize + Deserialize：使用type区分事件类型
+
+流式消息约束：AgentMessageDelta与最终AgentMessage必须使用相同的id；前端按agent和id维护当前
+消息累积器，分片直接追加，完整消息相同时丢弃、不同时替换。完整AgentMessage是该轮流式响应的
+完成标记，后端必须保证同一target下的分片先于完整消息进入WebSocket发送顺序。发送器句柄可以
+复制，不要求两类消息使用同一个句柄，只要求target相同。前端只屏蔽已完成轮次的尾部分片，不影响
+后续新轮次。state.sync确认该id已进入历史后，前端才清空累积器并重新使用完整历史渲染。按连接
+类型筛选的动态target应固定本轮连接集合，或规定中途加入的连接从下一轮开始接收。
 
 UserMessageDto：用户输入DTO，公开结构体--只允许客户端提交用户文本
     content: String--用户消息正文

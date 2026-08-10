@@ -38,16 +38,14 @@ WorkspaceModelRoutes：Workspace模型路由，公开组件--挂在Workspace Ent
     impl Component for WorkspaceModelRoutes
         Component：公开trait实现
 
-InferenceCommand：推理命令，公开事件--携带已处理的messages、AgentPlugin收集的工具定义与可选前端文本流
+InferenceCommand：推理命令，公开事件--携带已处理的messages、AgentPlugin收集的工具定义和稳定Agent ID
     id: String--调用方生成的请求ID，与agent共同构成并发响应路由
     agent: Entity--发起本次推理的AgentInstance Entity
+    agent_id: String--AgentPlugin提供的稳定逻辑ID，用于构造外部流式消息
     messages: Vec<Message>--本次请求的完整消息快照
     tools: Vec<ToolDefinition>--AgentPlugin遍历动态可见资源并逐个构造后收集的工具定义
-    stream: Option<InferenceStreamSender>--可选有界文本通道发送器，用于直接转发给前端
     impl Event for InferenceCommand
         Event：公开trait实现
-
-InferenceStreamSender：推理文本流发送器，公开类型别名--等于tokio::sync::mpsc::Sender<String>
 
 StopReason：停止原因，公开枚举--描述Provider结束本次响应的原因
     Completed--正常完成
@@ -100,6 +98,7 @@ InferenceErrorKind：推理错误分类，公开枚举
     RequestFailed
     ResponseStatus
     ResponseDecodeFailed
+    ResponseEncodeFailed
     ResponseIncomplete
     TaskPanicked
 
@@ -154,8 +153,8 @@ ProviderResponseAccumulator：Provider响应累积器，公开trait--每个请�
     push(&mut self, chunk: &[u8]) -> Result<Vec<String>, InferenceError>
         推入分片：公开方法，允许任意网络分片边界，返回本次新解析出的可展示文本片段
         行为：工具调用ID、名称和参数片段只在累积器内部保存，不返回给流式通道
-    finish(self: Box<Self>) -> Result<InferenceResponse, InferenceError>
-        完成响应：公开方法，验证协议结束、工具调用完整性并返回统一响应
+    finish(self: Box<Self>) -> Result<(InferenceResponse, Vec<String>), InferenceError>
+        完成响应：公开方法，解析缓冲区中的尾行，验证协议结束与工具调用完整性，并返回统一响应和尾行中新解析出的可展示文本片段
 
 InferencePlugin：推理插件，公开结构体
     schedule: String--命令准备、异步提交与结果发布所属Schedule，私有
@@ -253,7 +252,8 @@ PreparedInference：已准备推理任务，私有结构体--主线程已完成�
     client: reqwest::Client--从InferenceHttpClient克隆的共享HTTP客户端
     request: ProviderHttpRequest--完整HTTP请求
     adapter: ErasedProviderAdapter--对应协议适配器
-    stream: Option<InferenceStreamSender>--可选前端文本流发送器
+    agent_id: String--稳定Agent逻辑ID
+    senders: Vec<WebSocketSender>--prepare_inference_system按全局streaming_member_messages目标解析并固定的本轮连接发送器
     impl Event for PreparedInference
         Event：私有trait实现
 
@@ -312,15 +312,16 @@ prepare_inference_system(world: &mut World)
         成功时调用WorldAsyncExt::send_async_event发送PreparedInference
 
 execute_prepared_inference(prepared: PreparedInference) -> Result<InferenceTaskOutput, InferenceTaskError>
-    执行推理：私有异步函数，发送HTTP请求、向前端通道转发文本并累积完整响应
+    执行推理：私有异步函数，发送HTTP请求、直接向固定WebSocket发送器转发文本并累积完整响应
     行为：
         始终保留prepared.route
         在panic捕获边界内使用prepared.client发送prepared.request
         调用Adapter::begin_response创建独占累积器
         异步读取response.bytes_stream
         每取得一段bytes就调用累积器::push
-        prepared.stream存在时将push返回的文本片段通过有界通道发送
-        前端接收端已关闭时丢弃后续文本转发，不中止后端推理与累积
+        将push返回的文本片段与route.id、agent_id包装为ServerMessage::AgentMessageDelta并序列化为WebSocketMessage
+        为每个分片使用prepared.senders构造WebSocketMessageSender并await send
+        发送器为空或连接已关闭时停止对应外部转发，不中止后端推理与累积
         流结束后调用累积器::finish
         将成功响应或任意InferenceError包装为InferenceTaskOutput
         Provider Future或Adapter panic时使用已保留的route返回TaskPanicked
@@ -412,19 +413,20 @@ AgentImage启动：
     Agent核心克隆当前完整messages
         -> 遍历AgentDynamicVisibility.resources
         -> 逐个调用ToolPlugin.resolve_tool并收集ToolDefinition
-        -> 无前端实时输出时send_event(InferenceCommand { id, agent, messages, tools, stream: None })
-        -> 需要前端实时输出时创建有界文本通道并传入stream: Some(sender)
+        -> 读取AgentIdentity并send_event(InferenceCommand { id, agent, agent_id, messages, tools })
     prepare_inference_system
         -> 读取AgentInferenceSnapshot并使用command.tools
         -> 根据snapshot.workspace查询WorkspaceModelRoutes
         -> 项目级未找到snapshot.model时查询全局GlobalModelRoutes
+        -> 读取全局配置的streaming_member_messages目标并通过WebSocketConnections解析为固定Vec<WebSocketSender>
         -> Adapter把统一Message、工具和实际模型配置组装为ProviderHttpRequest
         -> 克隆InferenceHttpClient内的reqwest::Client
-        -> send_async_event(PreparedInference)
+        -> 将command.agent_id和固定senders写入PreparedInference并send_async_event
     异步System取得PreparedInference
         -> 发送HTTP请求
         -> 按网络分片持续喂给ProviderResponseAccumulator
-        -> 有stream时将可展示文本片段写入有界通道
+        -> 将可展示文本片段包装并通过WebSocketMessageSender直接发送
+        -> finish时先发送缓冲区尾行产生的可展示文本，再返回完整响应
         -> 工具调用片段只在累积器内部组装
         -> 响应结束后返回InferenceTaskOutput
     publish_inference_output_system
@@ -432,8 +434,9 @@ AgentImage启动：
         -> 失败时发送AgentFailure { id, agent, kind: Inference, message }
 
 流式响应：
-    文本片段只用于前端实时展示，通过InferenceStreamSender发送
+    文本片段只用于前端实时展示，通过WebSocketMessageSender直接发送
     文本片段不进入ECS事件队列，不直接写入Agent messages
+    全局streaming_member_messages目标在prepare_inference_system中解析并固定，本轮中途新增连接从下一轮开始接收
     Provider可能按index分多次发送工具调用ID、名称和arguments片段
     ProviderResponseAccumulator按index维护独立临时槽位
     Text增量按到达顺序累积为Assistant content
@@ -461,6 +464,7 @@ Provider边界：
 错误与安全边界：
     全局models.toml只从daemon主目录或用户显式指定路径读取
     项目级models.toml只从Workspace的规范化project_root/.margatroid目录读取
+    models.toml只描述Provider路由，不保存WebSocket发送目标
     Provider API key和Authorization header只存在于路由配置加载期、Adapter与ProviderHttpRequest私有字段
     TOML解析错误只返回行列位置和类别，不回显可能包含api_key的原文行
     AgentMessage、AgentFailure、InferenceError、日志和Tracing字段不得包含secret、完整请求正文或完整响应正文
@@ -498,15 +502,16 @@ App
 InferenceCommand
 ├── id: String
 ├── agent: Entity
+├── agent_id: String
 ├── messages: Vec<Message>
-├── tools: Vec<ToolDefinition>--由AgentPlugin遍历动态可见资源并逐个构造
-└── stream: Option<InferenceStreamSender>
+└── tools: Vec<ToolDefinition>--由AgentPlugin遍历动态可见资源并逐个构造
     -> PreparedInference
        ├── route: InferenceRoute
        ├── client: reqwest::Client
        ├── request: ProviderHttpRequest
        ├── adapter: ErasedProviderAdapter
-       └── stream: Option<InferenceStreamSender>
+       ├── agent_id: String
+       └── senders: Vec<WebSocketSender>
            -> InferenceTaskOutput
               ├── route: InferenceRoute
               └── result: Result<InferenceResponse, InferenceError>

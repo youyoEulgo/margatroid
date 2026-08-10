@@ -8,6 +8,7 @@ use agent_image_loader_plugin::AgentImageLoaderPlugin;
 use agent_plugin::AgentPlugin;
 use app_runtime_plugin::{AppRunExt, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimePlugin;
+use config_plugin::ConfigPlugin;
 use connection_plugin::ConnectionPlugin;
 use core_plugin::App;
 use dto_plugin::DtoPlugin;
@@ -53,6 +54,7 @@ fn run(config: DaemonConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
     fs::create_dir_all(&config.data_root)?;
     let data_root = absolute_path(&config.data_root)?;
     let agent_images_root = data_root.join("agent-images");
+    let config_path = data_root.join("config.toml");
     let models_path = data_root.join("models.toml");
     if !models_path.is_file() {
         return Err(format!(
@@ -69,12 +71,15 @@ fn run(config: DaemonConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
         .map_err(|error| format!("cannot open skill root: {error}"))?;
     let workflows = WorkflowPlugin::open(data_root.join("workflows"))
         .map_err(|error| format!("cannot open workflow root: {error}"))?;
+    let global_config = ConfigPlugin::open(&config_path)
+        .map_err(|error| format!("cannot open global configuration: {error}"))?;
 
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(LogPlugin::default().with_stream(LOG_STREAM_CAPACITY))
         .add_plugin(ServerPlugin::with_options(ServerOptions::bind(config.bind)))
+        .add_plugin(global_config)
         .add_plugin(agent_images)
         .add_plugin(InferencePlugin::default().with_config_path(models_path.clone()))
         .add_plugin(ToolPlugin::default())
@@ -86,7 +91,7 @@ fn run(config: DaemonConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(DtoPlugin::default())
         .add_plugin(ConnectionPlugin::default());
 
-    info!(address = %config.bind, data_root = %data_root.display(), models = %models_path.display(), "margatroid daemon starting");
+    info!(address = %config.bind, data_root = %data_root.display(), config = %config_path.display(), models = %models_path.display(), "margatroid daemon starting");
     app.run();
     Ok(())
 }

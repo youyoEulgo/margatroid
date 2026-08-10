@@ -1,0 +1,5 @@
+[outbound]
+logs = ["type:cli", "type:webui"]
+backend_state = ["type:webui"]
+member_messages = ["type:webui"]
+streaming_member_messages = ["type:webui"]

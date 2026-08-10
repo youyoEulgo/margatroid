@@ -315,6 +315,36 @@ impl WebSocketSender {
     }
 }
 
+pub struct WebSocketMessageSender {
+    senders: Vec<WebSocketSender>,
+    message: WebSocketMessage,
+}
+
+impl WebSocketMessageSender {
+    pub fn new(senders: Vec<WebSocketSender>, message: WebSocketMessage) -> Self {
+        Self { senders, message }
+    }
+
+    pub async fn send(self) -> Vec<(WebSocketConnectionId, Result<(), WebSocketSendError>)> {
+        let mut results = Vec::with_capacity(self.senders.len());
+        for sender in self.senders {
+            let connection_id = sender.connection_id();
+            results.push((connection_id, sender.send(self.message.clone()).await));
+        }
+        results
+    }
+
+    pub fn try_send(self) -> Vec<(WebSocketConnectionId, Result<(), WebSocketSendError>)> {
+        self.senders
+            .into_iter()
+            .map(|sender| {
+                let connection_id = sender.connection_id();
+                (connection_id, sender.try_send(self.message.clone()))
+            })
+            .collect()
+    }
+}
+
 struct WebSocketConnectionEntry {
     name: String,
     connection_type: String,
@@ -855,5 +885,38 @@ mod tests {
             Some(Err(WebSocketStreamReceiveError::Aborted))
         );
         assert_eq!(receiver.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn message_sender_delivers_one_direct_message_to_each_target() {
+        let (first_tx, mut first_rx) = mpsc::channel(2);
+        let (second_tx, mut second_rx) = mpsc::channel(2);
+        let first = WebSocketSender::new(
+            WebSocketConnectionId::new(1),
+            first_tx,
+            Arc::new(SharedConnectionState::open()),
+        );
+        let second = WebSocketSender::new(
+            WebSocketConnectionId::new(2),
+            second_tx,
+            Arc::new(SharedConnectionState::open()),
+        );
+
+        let results = WebSocketMessageSender::new(
+            vec![first, second],
+            WebSocketMessage::Text("delta".into()),
+        )
+        .send()
+        .await;
+
+        assert!(results.iter().all(|(_, result)| result.is_ok()));
+        assert_eq!(
+            first_rx.recv().await,
+            Some(WebSocketMessage::Text("delta".into()))
+        );
+        assert_eq!(
+            second_rx.recv().await,
+            Some(WebSocketMessage::Text("delta".into()))
+        );
     }
 }

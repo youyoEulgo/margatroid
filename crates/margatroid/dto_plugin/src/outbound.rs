@@ -1,4 +1,5 @@
 use app_runtime_plugin::WorldEventExt;
+use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::World;
 use margatroid_protocol::{
     AgentFailureDto, AgentMessageDto, BackendStateDto, IntoDto, MessageDto, ProtocolErrorKind,
@@ -11,18 +12,22 @@ use server_plugin::{
 };
 use workspace_plugin::{StartWorkspaceResult, StopWorkspaceByReferenceResult};
 
-use crate::{BackendStateReportCache, WebSocketMessageSend, WebSocketMessageTarget};
+use crate::{BackendStateReportCache, WebSocketMessageSend};
 
-pub(crate) fn collect_external_events_system(world: &mut World, frontend_type: &str) {
+pub(crate) fn collect_external_events_system(world: &mut World) {
+    let targets = world
+        .get_resource::<MargatroidConfig>()
+        .cloned()
+        .expect("ConfigPlugin must be installed before DtoPlugin");
     report_server_events(world);
-    report_workspace_events(world);
-    report_workspace_stop_events(world);
-    report_agent_messages(world);
-    report_agent_failures(world);
-    report_backend_state(world, frontend_type);
+    report_workspace_events(world, targets.logs());
+    report_workspace_stop_events(world, targets.logs());
+    report_agent_messages(world, targets.member_messages());
+    report_agent_failures(world, targets.logs());
+    report_backend_state(world, targets.backend_state());
 }
 
-fn report_workspace_stop_events(world: &World) {
+fn report_workspace_stop_events(world: &World, targets: &[WebSocketMessageTarget]) {
     for result in world.event_reader::<StopWorkspaceByReferenceResult>() {
         let message = match &result.result {
             Ok(()) => {
@@ -44,10 +49,7 @@ fn report_workspace_stop_events(world: &World) {
                 }
             }
         };
-        world.send_event(WebSocketMessageSend {
-            target: WebSocketMessageTarget::Broadcast,
-            message,
-        });
+        send_to_targets(world, targets, message);
     }
 }
 
@@ -87,7 +89,7 @@ fn report_server_events(world: &World) {
     }
 }
 
-fn report_backend_state(world: &mut World, frontend_type: &str) {
+fn report_backend_state(world: &mut World, targets: &[WebSocketMessageTarget]) {
     let state: BackendStateDto = match ().into_dto(&*world) {
         Ok(state) => state,
         Err(error) => {
@@ -111,15 +113,10 @@ fn report_backend_state(world: &mut World, frontend_type: &str) {
     };
     let mut recipients = world
         .get_resource::<WebSocketConnections>()
-        .map(|connections| {
-            connections
-                .get_by_type(frontend_type)
-                .into_iter()
-                .map(|sender| sender.connection_id().get())
-                .collect::<Vec<_>>()
-        })
+        .map(|connections| target_recipients(connections, targets))
         .unwrap_or_default();
     recipients.sort_unstable();
+    recipients.dedup();
     let should_sync = {
         let cache = world
             .get_resource_mut::<BackendStateReportCache>()
@@ -136,25 +133,23 @@ fn report_backend_state(world: &mut World, frontend_type: &str) {
     if !should_sync {
         return;
     }
-    world.send_event(WebSocketMessageSend {
-        target: WebSocketMessageTarget::Type(frontend_type.into()),
-        message: ServerMessage::StateSync { state },
-    });
+    send_to_targets(world, targets, ServerMessage::StateSync { state });
 }
 
-fn report_workspace_events(world: &World) {
+fn report_workspace_events(world: &World, targets: &[WebSocketMessageTarget]) {
     for result in world.event_reader::<StartWorkspaceResult>() {
         match &result.result {
             Ok(workspace) => match IntoDto::<WorkspaceInfoDto, _>::into_dto(*workspace, world) {
                 Ok(info) => {
                     tracing::info!(request_id = %result.id, workspace = %info.name, project_root = %info.project_root, manager = %info.manager, agents = info.agents.len(), "workspace started");
-                    world.send_event(WebSocketMessageSend {
-                        target: WebSocketMessageTarget::Broadcast,
-                        message: ServerMessage::WorkspaceStarted {
+                    send_to_targets(
+                        world,
+                        targets,
+                        ServerMessage::WorkspaceStarted {
                             id: result.id.clone(),
                             workspace: info,
                         },
-                    });
+                    );
                 }
                 Err(error) => tracing::warn!(
                     request_id = %result.id,
@@ -169,7 +164,7 @@ fn report_workspace_events(world: &World) {
     }
 }
 
-fn report_agent_messages(world: &World) {
+fn report_agent_messages(world: &World, targets: &[WebSocketMessageTarget]) {
     let messages = world
         .event_reader::<AgentMessage>()
         .into_iter()
@@ -199,14 +194,11 @@ fn report_agent_messages(world: &World) {
                 "assistant message produced"
             ),
         }
-        world.send_event(WebSocketMessageSend {
-            target: WebSocketMessageTarget::Broadcast,
-            message: ServerMessage::AgentMessage { message },
-        });
+        send_to_targets(world, targets, ServerMessage::AgentMessage { message });
     }
 }
 
-fn report_agent_failures(world: &World) {
+fn report_agent_failures(world: &World, targets: &[WebSocketMessageTarget]) {
     let failures = world
         .event_reader::<AgentFailure>()
         .into_iter()
@@ -227,9 +219,34 @@ fn report_agent_failures(world: &World) {
             error = %failure.message,
             "agent turn failed"
         );
+        send_to_targets(world, targets, ServerMessage::AgentFailure { failure: dto });
+    }
+}
+
+fn send_to_targets(world: &World, targets: &[WebSocketMessageTarget], message: ServerMessage) {
+    for target in targets {
         world.send_event(WebSocketMessageSend {
-            target: WebSocketMessageTarget::Broadcast,
-            message: ServerMessage::AgentFailure { failure: dto },
+            target: target.clone(),
+            message: message.clone(),
         });
     }
+}
+
+fn target_recipients(
+    connections: &WebSocketConnections,
+    targets: &[WebSocketMessageTarget],
+) -> Vec<u64> {
+    targets
+        .iter()
+        .flat_map(|target| match target {
+            WebSocketMessageTarget::Broadcast => connections.get_all(),
+            WebSocketMessageTarget::Type(connection_type) => {
+                connections.get_by_type(connection_type)
+            }
+            WebSocketMessageTarget::Name(name) => {
+                connections.get_by_name(name).into_iter().collect()
+            }
+        })
+        .map(|sender| sender.connection_id().get())
+        .collect()
 }
