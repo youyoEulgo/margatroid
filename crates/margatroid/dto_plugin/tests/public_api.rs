@@ -1,7 +1,8 @@
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
+use config_plugin::{ConfigPlugin, MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::App;
-use dto_plugin::{DtoPlugin, WebSocketMessageSend, WebSocketMessageTarget};
+use dto_plugin::{DtoPlugin, WebSocketMessageSend};
 use log_plugin::LogPlugin;
 use margatroid_protocol::ServerMessage;
 use server_plugin::ServerPlugin;
@@ -13,7 +14,16 @@ fn documented_public_api_publishes_state_for_the_configured_frontend_type() {
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(LogPlugin::default().without_console().with_stream(8))
         .add_plugin(ServerPlugin::bind("127.0.0.1:0"))
-        .add_plugin(DtoPlugin::default().with_frontend_type("browser"));
+        .add_plugin(ConfigPlugin::new(
+            MargatroidConfig::new(
+                vec![WebSocketMessageTarget::Broadcast],
+                vec![WebSocketMessageTarget::Type("browser".into())],
+                vec![WebSocketMessageTarget::Broadcast],
+                vec![WebSocketMessageTarget::Broadcast],
+            )
+            .unwrap(),
+        ))
+        .add_plugin(DtoPlugin::default());
 
     app.tick();
     app.tick();

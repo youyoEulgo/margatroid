@@ -24,10 +24,24 @@ cargo run -p margatroid_daemon -- --data-root ~/.margatroid
 ├── agent-images/
 ├── skills/
 ├── workflows/
+├── config.toml
 └── models.toml
 ```
 
 `models.toml` 必须存在且符合 InferencePlugin 的模型路由格式；daemon 启动时会加载并校验它。
+`config.toml` 保存全局 WebSocket 出站目标，暂定格式：
+
+```toml
+[outbound]
+logs = ["type:cli", "type:webui"]
+backend_state = ["type:webui"]
+member_messages = ["type:webui"]
+streaming_member_messages = ["type:webui"]
+```
+
+目标支持 `broadcast`、`type:<连接类型>` 和 `name:<连接名称>`。Workspace 启动、停止、失败或异常结果，以及成员
+失败或异常，都归入 `logs`；完整成员消息和流式成员消息分别使用后两个字段。模型路由文件不再保存
+WebSocket target。
 AgentImage 由 `agent-images/` 提供，Workspace 文件仍由 CLI 编译，daemon 不读取 YAML。
 daemon 把 `skills/` 和 `workflows/` 分别交给 SkillPlugin 与 WorkflowPlugin。SkillPlugin 当前只读取
 `SKILL.md`；WorkflowPlugin 当前只提供不执行正文的占位工具。
@@ -47,8 +61,7 @@ agent.message--向已启动Workspace中的一个Agent发送用户消息
 AgentPlugin 在消息处理或可见工具准备失败时发送 `agent.failure(kind=Agent)`；InferencePlugin 的请求
 失败使用 `kind=Inference`。两者都会进入前端 Activity，不会伪造成对话历史。
 
-结构化日志、`workspace.started`、`agent.message` 和 `agent.failure` 当前广播给全部连接。
-`state.sync` 只发送给类型为 `webui` 的连接；它是后端当前已就绪 Workspace 和各 Agent 可展示历史的
+所有出站消息的 target 都来自 `config.toml`。`state.sync` 是后端当前已就绪 Workspace 和各 Agent 可展示历史的
 完整快照，每次 Runtime tick 都会生成。历史直接来自各 Agent SQLite 的 `history_messages`；
 `realtime_messages` 只用于恢复模型上下文，不发送给客户端。Web UI 必须以 `state.sync` 为业务状态的
 唯一权威来源，不自行持久化、乐观追加或从实时事件拼接对话。

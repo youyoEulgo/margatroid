@@ -9,7 +9,7 @@
 Assistant 响应。它不是 Agent 的完整思考过程，不包含工具执行或 tool-call loop。
 
 Plugin 根据 AgentInstance 绑定的逻辑 `ModelId` 按项目级、全局顺序查询模型路由，将统一消息
-组装为 Provider Request，发送流式 HTTP 请求，将文本片段直接写入可选前端通道，最后
+组装为 Provider Request，发送流式 HTTP 请求，将文本片段直接写入模型路由指定的 WebSocket，最后
 返回完整统一响应。
 
 Provider 请求失败时，错误会保留安全 endpoint、传输错误类别和最深层系统原因。非成功 HTTP 响应会
@@ -25,7 +25,7 @@ AgentImageLoaderPlugin 只提供中立模型配置；InferencePlugin 负责把�
 - `ModelId` 是逻辑路由键，不代表实际模型或供应商。
 - `provider` 是可选元数据，`api_type` 才决定请求和响应协议。
 - ProviderAdapter 组装请求，ProviderResponseAccumulator 累积并解析响应。
-- 流式文本通过有界通道转发，不为每个分片创建 ECS Event。
+- 流式文本通过固定的 WebSocket 发送器集合直接转发，不为每个分片创建 ECS Event。
 - InferencePlugin 不修改 Agent 的 `messages`，不执行工具，不实现 tool-call loop。
 
 ## 模型路由表
@@ -44,7 +44,8 @@ api_type = "openai"
 
 AgentImage 只引用 `id = "deepseek-v4-flash"`。ID 通常直接写具体模型名，方便开发者辨认；
 `model` 则是构建 Provider Request 时直接使用的模型值。`base_url`、`api_key` 和 `api_type`
-也只属于路由表，`provider` 可以省略且不参与路由查找。
+也只属于路由表，`provider` 可以省略且不参与路由查找。WebSocket 发送目标不属于模型路由，统一
+来自主目录 `config.toml`。
 
 项目可以在 `<project>/.margatroid/models.toml` 使用相同格式定义项目级路由。查找顺序是：
 
@@ -154,6 +155,7 @@ use margatroid_types::{Message, ToolDefinition};
 app.world().send_event(InferenceCommand {
     id: "request-1".into(),
     agent,
+    agent_id: "demo.coder0".into(),
     messages: vec![
         Message::System {
             content: "You are a coding agent.".into(),
@@ -163,7 +165,6 @@ app.world().send_event(InferenceCommand {
         },
     ],
     tools: Vec::<ToolDefinition>::new(),
-    stream: None,
 });
 ```
 
@@ -179,24 +180,14 @@ Entity。最终响应使用 `(agent, id)` 定位原 Agent 和原请求。
 后端对一次模型调用的有效处理都依赖完整响应：工具参数需要拼完才能解析，tool-call loop
 需要完整 Assistant Message，结束原因和 token usage 也只有流结束后才能确定。
 
-流式文本的用途只是让前端实时显示。调用方有这个需求时，为 `InferenceCommand` 提供一个有界
-`InferenceStreamSender`：
+流式文本的用途只是让前端实时显示。`InferenceCommand` 不携带发送器；`prepare_inference_system`
+读取全局配置的 `streaming_member_messages` 目标，通过 `WebSocketConnections` 解析并固定本轮的发送器集合，然后写入
+`PreparedInference`。异步推理每解析出一个文本分片，就使用请求 ID、稳定 Agent ID 和文本构造
+`agent.message.delta`，序列化后通过 `WebSocketMessageSender::send` 直接发送。
 
-```rust
-let (stream, frontend_stream) = tokio::sync::mpsc::channel::<String>(64);
-
-app.world().send_event(InferenceCommand {
-    id: "request-2".into(),
-    agent,
-    messages,
-    tools,
-    stream: Some(stream),
-});
-```
-
-`frontend_stream` 由 ServerPlugin 的异步任务持有，将文本片段转发到 HTTP 流或 WebSocket。文本片段
-不进入 ECS 事件队列；工具调用 ID、名称和参数片段也不转发，只在后端累积器中组装。
-前端已断开时，InferencePlugin 停止转发后续文本，但不中断后端推理和最终响应累积。
+文本片段不进入 ECS 事件队列；工具调用 ID、名称和参数片段也不转发，只在后端累积器中组装。
+前端已断开时，InferencePlugin 停止向对应连接转发，但不中断后端推理和最终响应累积。本轮开始后
+新增且符合相同 target 的连接从下一轮开始接收，以保持增量与最终消息的接收集合一致。
 
 流结束后，成功响应由 InferencePlugin 直接转换成共享 `AgentMessage`。来源根据完整
 Assistant 消息是否包含工具调用，分别赋予 `CompleteTurn` 或 `DispatchToolCalls`：
@@ -281,7 +272,7 @@ let inference = InferencePlugin::default()
 - `ProviderAdapterFactory`：读取 `provider`、`base_url` 和 `api_key`，创建已配置 Adapter。
 - `ProviderAdapter`：将统一 `ProviderInput` 组装为 HTTP Request，并为每个响应创建累积器。
 - `ProviderResponseAccumulator`：接受任意网络分片边界，返回可展示文本片段，在内部累积
-  工具调用并最终构造 `InferenceResponse`。
+  工具调用并最终构造 `InferenceResponse`；`finish` 也会返回缓冲区尾行最后解析出的文本片段。
 
 Adapter 只解释 Provider 协议，不读取 `World`、Agent Component 或会话状态。
 
@@ -289,16 +280,17 @@ Adapter 只解释 Provider 协议，不读取 `World`、Agent Component 或会�
 
 ```text
 Agent messages + AgentPlugin收集的ToolDefinition
-→ InferenceCommand { id, agent, messages, tools, stream? }
+→ InferenceCommand { id, agent, agent_id, messages, tools }
 → AgentInferenceSnapshot { workspace, model }
 → WorkspaceModelRoutes[ModelId]
 → 未命中时查询GlobalModelRoutes[ModelId]
 → ProviderAdapter::build_request
 → AsyncRuntime发送流式HTTP
 → ProviderResponseAccumulator::push
-├→ 可展示文本 -> InferenceStreamSender -> 前端
+├→ 可展示文本 -> WebSocketMessageSender -> 前端
 └→ 后端内部累积完整响应
 → ProviderResponseAccumulator::finish
+├→ 尾行文本 -> WebSocketMessageSender -> 前端
 ├→ 成功：AgentMessage { id, agent, Message::Assistant, intent }
 └→ 失败：AgentFailure { id, agent, kind: Inference, message }
 → 成功消息由AgentPlugin记入上下文并执行意图；失败契约暂不定义
@@ -313,7 +305,7 @@ InferencePlugin 负责：
 - 把 AgentImageLoaderPlugin 的中立模型配置转换为经过验证的 AgentInferenceSnapshot。
 - 将统一 messages、工具定义和推理参数组装为 Provider Request。
 - 发送流式 HTTP 请求并解析增量与最终响应。
-- 将文本片段写入可选前端通道，并按请求 ID 和 Agent Entity 发布 `AgentMessage` 或
+- 将文本片段写入固定 WebSocket 发送器集合，并按请求 ID 和 Agent Entity 发布 `AgentMessage` 或
   `AgentFailure`。
 - 根据完整 Assistant 消息是否包含工具调用，直接赋予消息意图。
 

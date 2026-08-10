@@ -12,6 +12,10 @@ Axum 持有协议状态、连接和网络通道，ECS 持有同步状态并做�
 复制给多个持有者，接收器只能转交；流 ID 确定支流，连接 ID 确定客户端。Axum 管理网络，
 ECS 编排业务。
 
+`WebSocketMessageSender` 是不经过事件队列的直接发送终端。调用方先从 `WebSocketConnections`
+解析并固定一组 `WebSocketSender`，再与已经构造好的 `WebSocketMessage` 组成发送终端。同步 System
+使用 `try_send`，异步流式任务使用可等待的 `send`；该类型不解析业务 target，也不序列化业务协议。
+
 ## 使用说明
 
 ```rust

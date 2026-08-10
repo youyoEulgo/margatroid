@@ -20,7 +20,9 @@ run(config: DaemonConfig) -> Result<(), Error>
     组合并启动应用：私有函数，打开主目录中的插件资源，按依赖顺序安装Plugin并运行App
     行为：
         创建并规范化data_root
-        检查models.toml存在
+        检查models.toml和config.toml存在
+        加载并验证config.toml中的logs、backend_state、member_messages和streaming_member_messages
+        将全局只读WebSocket目标配置交给DtoPlugin和InferencePlugin
         打开AgentImage、Workspace、Skill和Workflow Plugin所需目录
         安装运行时、日志、Server和全部领域Plugin
         安装DtoPlugin和ConnectionPlugin

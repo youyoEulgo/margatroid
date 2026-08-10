@@ -11,6 +11,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
+config_plugin = { path = "../config_plugin" }
 dto_plugin = { path = "../dto_plugin" }
 futures-util = { workspace = true }
 log_plugin = { path = "../../mecs/log_plugin" }

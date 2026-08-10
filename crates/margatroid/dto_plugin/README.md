@@ -15,7 +15,7 @@ agent.message        -> RouteAgentMessage
 它还收集允许发送给外部的 `StartWorkspaceResult`、`StopWorkspaceByReferenceResult`、`AgentMessage` 和 `AgentFailure`，调用 Protocol
 定义的 DTO 转换，构造 `ServerMessage` 并包装为 `WebSocketMessageSend`。DtoPlugin 会从 Workspace、
 Agent 和 Memory 构造完整 `state.sync`，但仅在状态内容或目标前端连接集合变化时发送，默认只发给类型为
-`webui` 的连接。缓存避免出站事件持续唤醒 event-driven Runtime。
+`webui` 的连接。目标将改为统一读取主目录 `config.toml` 的 `backend_state` 字段。缓存避免出站事件持续唤醒 event-driven Runtime。
 
 DtoPlugin 订阅 LogPlugin 提供的 `TracingStream`，将结构化日志转换为 `log` 消息并广播。因此安装前
 必须先安装 AsyncRuntimePlugin、带 stream 的 LogPlugin 以及 ServerPlugin。Server 生命周期事件也由
@@ -27,4 +27,7 @@ Agent 消息方向和 Agent 失败；每帧状态同步和单个出站包不记�
 Workspace/Agent 路由，AgentPlugin 只处理已经携带 Entity 的消息。
 
 后端通过 `WebSocketMessageSend` 请求发送 `ServerMessage`。DtoPlugin 负责序列化和根据
-`Broadcast`、`Type`、`Name` 筛选连接。`with_frontend_type` 可修改完整状态快照的目标连接类型。
+`Broadcast`、`Type`、`Name` 筛选连接，再构造 ServerPlugin 的 `WebSocketMessageSender` 并调用
+`try_send`。日志、后端状态、完整成员消息和流式成员消息分别使用全局配置中的 `logs`、
+`backend_state`、`member_messages` 和 `streaming_member_messages`；Workspace 启停结果及 Agent
+失败或异常归入 `logs`。

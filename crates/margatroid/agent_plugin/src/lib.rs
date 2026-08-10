@@ -507,9 +507,9 @@ fn send_inference_command(
     events.send_event(InferenceCommand {
         id: id.to_owned(),
         agent,
+        agent_id: agent_id.to_owned(),
         messages,
         tools: available_tools.definitions,
-        stream: None,
     });
     Ok(())
 }

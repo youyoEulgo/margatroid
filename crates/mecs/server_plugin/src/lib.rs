@@ -19,7 +19,7 @@ pub use websocket::{
     JsonWebSocketMessageClassifier, RegisterConnection, WebSocketCloseReason, WebSocketConnected,
     WebSocketConnectionId, WebSocketConnections, WebSocketDisconnected, WebSocketMessage,
     WebSocketMessageClassification, WebSocketMessageClassifier, WebSocketMessageReceived,
-    WebSocketProtocolError, WebSocketProtocolFailed, WebSocketSender, WebSocketStreamId,
-    WebSocketStreamOpened, WebSocketStreamPhase, WebSocketStreamReceiver,
+    WebSocketMessageSender, WebSocketProtocolError, WebSocketProtocolFailed, WebSocketSender,
+    WebSocketStreamId, WebSocketStreamOpened, WebSocketStreamPhase, WebSocketStreamReceiver,
     WebSocketStreamReceiverHandle,
 };

@@ -211,7 +211,8 @@ send_inference_command(world: &World, id: &str, agent: Entity, events: &RuntimeE
         调用build_available_tools
         第一条Message由AgentContext.system_prompt构造为System
         后续完整复制AgentContext.messages
-        发送InferenceCommand { id, agent, messages, tools, stream: None }
+        读取AgentIdentity.id
+        发送InferenceCommand { id, agent, agent_id, messages, tools }
 
 validate_message_intent(event: &AgentMessage)
     验证消息契约：只检查来源赋予的Intent与静态Message类型是否匹配，不重新决定Intent
