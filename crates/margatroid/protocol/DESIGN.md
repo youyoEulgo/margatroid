@@ -64,8 +64,12 @@ ClientMessage：客户端WebSocket请求，公开枚举--统一使用type、id�
         构造连接请求：构造统一信封，不校验连接类型
     start_workspace(id: impl Into<String>, definition: &WorkspaceDefinition) -> Self
         构造Workspace请求：使用StartWorkspaceDto保存可序列化定义
+    stop_workspace(id: impl Into<String>, workspace: &WorkspaceReferenceDto) -> Self
+        构造Workspace停止请求：克隆逻辑引用并构造StopWorkspaceDto
     agent_message(id: impl Into<String>, workspace: &WorkspaceReferenceDto, agent: Option<String>, content: impl Into<String>) -> Self
-        构造Agent请求：构造只包含UserMessageDto的RouteAgentMessageDto
+        构造Agent请求：构造包含空tool_calls的RouteAgentMessageDto
+    agent_message_with_tool_calls(id: impl Into<String>, workspace: &WorkspaceReferenceDto, agent: Option<String>, content: impl Into<String>, tool_calls: Vec<ToolCallDto>) -> Self
+        构造带工具Agent请求：保留前端指定的工具调用，由WorkspacePlugin赋予UserWithToolCalls意图
 
 RegisterConnectionDto：连接注册DTO，公开结构体--保存客户端声明的连接类型
     client_type: String--客户端类型，例如webui或cli
@@ -81,8 +85,9 @@ RouteAgentMessageDto：逻辑Agent消息DTO，公开结构体--保存尚未解�
     workspace: WorkspaceReferenceDto--目标Workspace逻辑引用
     agent: Option<String>--Agent逻辑名称，None表示manager
     message: UserMessageDto--用户消息内容，协议结构无法表达System、Assistant或Tool输入
+    tool_calls: Vec<ToolCallDto>--可选预选工具调用，JSON缺省时为空
     impl IntoDomain<RouteAgentMessage, String> for RouteAgentMessageDto
-        转换消息命令：使用请求ID，将WorkspaceReferenceDto转换为WorkspaceReference并保留Message
+        转换消息命令：使用请求ID，将WorkspaceReferenceDto和ToolCallDto转换为领域值并保留Message
 
 WorkspaceDefinitionDto：Workspace定义DTO，公开结构体--保存不含Entity的可序列化定义
     name: String--Workspace名称
@@ -97,8 +102,12 @@ WorkspaceDefinitionDto：Workspace定义DTO，公开结构体--保存不含Entit
 WorkspaceReferenceDto：Workspace逻辑引用DTO，公开结构体--保存跨进程定位信息
     name: String--Workspace名称
     project_root: String--项目根路径文本
+    new(name: impl Into<String>, project_root: impl Into<String>) -> Self
+        构造逻辑引用：公开关联函数，直接保存名称和路径文本
     impl FromDomain<&WorkspaceDefinition> for WorkspaceReferenceDto
         转换逻辑引用：从Workspace定义提取名称和项目根
+    impl FromDomain<WorkspaceReference> for WorkspaceReferenceDto
+        转换领域引用：转移Workspace名称并把PathBuf转换为路径文本
     impl IntoDomain<WorkspaceReference> for WorkspaceReferenceDto
         转换逻辑引用：将project_root转换为PathBuf
 
@@ -141,6 +150,8 @@ ToolCallDto：工具调用展示DTO，公开结构体--隔离领域ToolCall的�
     arguments: String--JSON参数文本
     impl FromDomain<&ToolCall> for ToolCallDto
         转换工具调用：复制稳定外部字段
+    impl IntoDomain<ToolCall> for ToolCallDto
+        转换领域调用：转移ID、名称和参数文本，具体合法性由AgentPlugin与ToolPlugin在业务边界验证
 
 MessageDto：可展示消息DTO，公开枚举--只包含历史表和前端允许展示的消息类型
     User { content: String }
@@ -172,6 +183,8 @@ LogRecordDto：结构化日志DTO，公开结构体--保存客户端展示所需
     message: String--日志正文
     fields: Vec<LogFieldDto>--结构化字段
     spans: Vec<String>--Tracing span名称
+    impl FromDomain<TracingRecord> for LogRecordDto
+        转换日志：转移基础字段并逐个转换TracingField
 
 BackendStateDto：后端状态快照DTO，公开结构体--保存前端权威状态
     workspaces: Vec<WorkspaceInfoDto>--当前已就绪Workspace
@@ -179,13 +192,87 @@ BackendStateDto：后端状态快照DTO，公开结构体--保存前端权威状
     impl FromDomain<(), &World> for BackendStateDto
         转换完整状态：查询全部Workspace、Agent和Memory历史并构造快照
 
+WorkspaceInfoDto：已启动Workspace信息DTO，公开结构体--提供逻辑引用、manager和成员列表
+    name: String--Workspace名称
+    project_root: String--项目根路径文本
+    manager: String--manager逻辑名称
+    agents: Vec<String>--成员逻辑名称
+    reference(&self) -> WorkspaceReferenceDto
+        提取逻辑引用：公开方法，克隆name和project_root
+    impl FromDomain<&WorkspaceDefinition> for WorkspaceInfoDto
+        转换静态定义：复制Workspace身份、manager和Agent名称
+    impl FromDomain<Entity, &World> for WorkspaceInfoDto
+        转换运行实例：读取WorkspaceConfiguration并转换其中定义
+
 WorkspaceAgentDefinitionDto：单Agent定义DTO，公开结构体--保存镜像、资源和Memory路径文本
+    name: String--Agent逻辑名称
+    image: String--AgentImage引用文本
+    resources: Vec<ResourceRefDto>--Workspace追加的默认资源
+    disable_resources: Vec<ResourceRefDto>--Workspace禁用的默认资源
+    memory_path: Option<String>--可选Memory数据库路径文本
+    impl FromDomain<&WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto
+        转换静态Agent定义：转换镜像、资源和路径为协议值
+    impl IntoDomain<WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto
+        转换领域Agent定义：解析镜像、资源和路径
+
 ResourceRefDto：资源引用DTO，公开结构体--保存provider和scope/name文本
+    provider: String--资源Provider ID
+    name: String--ResourceName文本
+    impl FromDomain<&ResourceRef> for ResourceRefDto
+        转换资源引用：复制Provider和ResourceName文本
+    impl IntoDomain<ResourceRef> for ResourceRefDto
+        转换领域资源：验证ResourceName和Provider组合
+
 LogFieldDto：日志字段DTO，公开结构体--保存字段名和值
+    name: String--字段名
+    value: String--格式化后的字段值
+    impl FromDomain<TracingField> for LogFieldDto
+        转换日志字段：转移字段名和值
+
 AgentHistoryDto：Agent历史DTO，公开结构体--保存Workspace引用、Agent逻辑名称和HistoryMessageDto列表
+    workspace: WorkspaceReferenceDto--所属Workspace
+    agent: String--稳定Agent ID
+    messages: Vec<HistoryMessageDto>--按sequence排序的展示历史
+
 HistoryMessageDto：历史消息DTO，公开结构体--保存序号、turn ID、MessageDto、资源标记和时间
+    sequence: i64--永久递增序号
+    turn_id: String--消息所属轮次ID
+    message: MessageDto--可展示User或Assistant消息
+    resources: Vec<ResourceRefDto>--该User轮次实际使用的资源引用
+    created_at_ms: i64--Unix毫秒创建时间
     impl FromDomain<HistoryMessage> for HistoryMessageDto
         转换历史条目：转换可展示Message和ResourceRef列表
+
+ProtocolErrorKind：协议转换错误分类，公开枚举
+    AgentNotFound
+    InvalidImageReference
+    InvalidResourceReference
+    MemoryNotFound
+    MemoryReadFailed
+    UnsupportedMessage
+    WorkspaceNotFound
+
+ProtocolError：协议转换错误，公开结构体--保存稳定分类和不超过512字节的安全描述
+    kind: ProtocolErrorKind--错误分类，私有
+    message: String--有界错误描述，私有
+    new(kind: ProtocolErrorKind, message: impl Into<String>) -> Self
+        构造错误：私有关联函数，保存分类并按UTF-8边界截断描述
+    kind(&self) -> ProtocolErrorKind
+        取得分类：公开方法
+    message(&self) -> &str
+        取得描述：公开方法
+    impl fmt::Display for ProtocolError
+        Display：公开trait实现，输出分类与描述
+    impl std::error::Error for ProtocolError
+        Error：公开trait实现
+```
+
+## 函数
+
+私有：
+```text
+agent_route(world: &World, agent: Entity) -> Result<(WorkspaceReferenceDto, String), ProtocolError>
+    解析Agent路由：私有函数，从AgentIdentity和所属Workspace配置得到外部Workspace引用与稳定Agent ID
 ```
 
 ## 逻辑

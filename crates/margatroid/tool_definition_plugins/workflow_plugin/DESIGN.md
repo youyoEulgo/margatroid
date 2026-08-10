@@ -16,7 +16,8 @@ WorkflowPlugin：Workflow工具定义与执行Plugin，公开结构体--配置�
     open(home_root: impl Into<PathBuf>) -> Result<Self, WorkflowError>
         打开Plugin：规范化并保存绝对主目录根，不扫描资源库
     impl Plugin for WorkflowPlugin
-        行为：确认ToolPlugin已安装，以provider ID workflow注册WorkflowToolProvider
+        build(self, app: &mut App)
+            构建插件：公开trait方法，通过ToolPlugin注册provider ID workflow的WorkflowToolProvider
 
 WorkflowErrorKind：Workflow Plugin配置错误分类，公开枚举
     InvalidRoot--主目录Workflow根不是无父级跳转的绝对路径
@@ -24,6 +25,8 @@ WorkflowErrorKind：Workflow Plugin配置错误分类，公开枚举
 WorkflowError：Workflow Plugin配置错误，公开结构体
     kind: WorkflowErrorKind--稳定错误分类，私有
     message: String--错误描述，私有
+    new(kind: WorkflowErrorKind, message: impl Into<String>) -> Self
+        构造错误：私有关联函数，保存配置错误描述
     kind(&self) -> WorkflowErrorKind
         取得分类：公开方法
     message(&self) -> &str

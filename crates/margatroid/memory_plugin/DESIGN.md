@@ -41,11 +41,16 @@ MemoryPlugin：Agent消息持久化插件，公开结构体--安装SQLite绑定�
         指定阶段：公开方法，替换默认Schedule并返回自身
     impl Default for MemoryPlugin
         Default：公开trait实现，与new等价
+        default() -> Self
+            构造默认插件：调用new
     impl Plugin for MemoryPlugin
         Plugin：公开trait实现
         build(self, app: &mut App)
             构建插件：安装SQLite持久化能力
             行为：
+                拒绝重复安装
+                要求目标schedule存在
+                插入MemoryPluginInstalled
                 在schedule中挂载sync_realtime_messages_system
                 在schedule中挂载sync_history_resources_system
 
@@ -107,6 +112,8 @@ MemoryErrorKind：记忆错误分类，公开枚举
 MemoryError：记忆错误，公开结构体--保存稳定分类和有界描述
     kind: MemoryErrorKind--错误分类，私有
     message: String--不包含消息正文、资源正文或完整SQL语句的描述，私有
+    new(kind: MemoryErrorKind, message: impl Into<String>) -> Self
+        构造错误：私有关联函数，保存分类并按UTF-8边界截断描述
     kind(&self) -> MemoryErrorKind
         取得分类：公开方法
     message(&self) -> &str
@@ -147,12 +154,30 @@ WorldMemoryExt：World记忆扩展，公开trait--绑定Agent数据库并提供�
             调用insert_history_message(transaction, event, current_unix_milliseconds)
             成功时提交事务
             插入或提交失败时恢复旧表并返回MemoryError
+    impl WorldMemoryExt for World
+        World记忆扩展：公开trait实现，按上述契约绑定数据库和追加历史
+```
+
+私有：
+```text
+MemoryPluginInstalled：MemoryPlugin安装标记，公开单元Resource--阻止重复安装并供WorldMemoryExt、WorkspacePlugin确认依赖
+    impl Resource for MemoryPluginInstalled
+        Resource：公开trait实现
 ```
 
 ## 函数
 
 私有：
 ```text
+validate_path(path: &Path) -> Result<(), MemoryError>
+    验证数据库路径：私有函数，要求路径非空且包含文件名
+
+require_plugin(world: &World) -> Result<(), MemoryError>
+    确认插件：私有函数，MemoryPluginInstalled不存在时返回PluginMissing
+
+lock_connection(memory: &AgentMemory) -> Result<MutexGuard<Connection>, MemoryError>
+    锁定连接：私有函数，锁中毒时返回WriteFailed且不暴露数据库内容
+
 initialize_schema(connection: &rusqlite::Connection) -> Result<(), MemoryError>
     初始化数据库：私有函数，创建不存在的两张业务表
     行为：
@@ -232,6 +257,15 @@ merge_history_resources(
         不写入Skill、Workflow或其他资源正文
         读取、序列化或更新失败时返回WriteFailed
 
+current_unix_milliseconds() -> Result<i64, MemoryError>
+    取得写入时间：私有函数，返回Unix毫秒并检查SQLite整数范围
+
+read_error(error: rusqlite::Error) -> MemoryError
+    转换读取错误：私有函数，丢弃底层SQL详情并返回ReadFailed
+
+write_error(error: rusqlite::Error) -> MemoryError
+    转换写入错误：私有函数，丢弃底层SQL详情并返回WriteFailed
+
 sync_realtime_messages_system(world: &mut World)
     同步实时上下文：私有System，消费AgentContextMessagesUpdated并重写实时消息表
     行为：
@@ -245,6 +279,9 @@ sync_realtime_messages_system(world: &mut World)
         重写或提交失败时恢复旧表并发送AgentMemoryWriteFailed
         不重新读取AgentContext，不修改history_messages
 
+sync_realtime_message(world: &World, event: &AgentContextMessagesUpdated) -> Result<(), MemoryError>
+    同步单次实时上下文：私有函数，验证Agent与AgentMemory后在独立事务中重写并提交realtime_messages
+
 sync_history_resources_system(world: &mut World)
     同步历史资源：私有System，消费AgentResourcesUsed并更新User历史行资源列
     行为：
@@ -256,6 +293,9 @@ sync_history_resources_system(world: &mut World)
         调用merge_history_resources(transaction, &event.id, &event.resources)
         成功时提交事务
         合并或提交失败时恢复旧表并发送AgentMemoryWriteFailed
+
+sync_history_resources(world: &World, event: &AgentResourcesUsed) -> Result<(), MemoryError>
+    同步单次资源使用：私有函数，验证Agent与AgentMemory后在独立事务中合并资源并提交
 ```
 
 ## 逻辑

@@ -23,12 +23,16 @@ ConnectionPlugin：连接元数据插件，公开结构体--根据客户端注�
             行为：
                 检查ConnectionPlugin没有重复安装
                 检查schedule存在
+                检查ServerPlugin已经安装WebSocketConnections
+                插入ConnectionPluginInstalled
                 将connection_registration_system加入schedule
 ```
 
 私有：
 ```text
 ConnectionPluginInstalled：连接插件安装标记，私有资源--防止同一个App重复安装ConnectionPlugin
+    impl Resource for ConnectionPluginInstalled
+        Resource：私有trait实现
 ```
 
 ## 函数
@@ -49,6 +53,9 @@ connection_registration_system(world: &mut World)
         连接不存在时写warning日志并结束当前请求
         调用WebSocketConnections::set_name写入生成的唯一名称
         命名失败时写warning日志
+
+valid_client_type(value: &str) -> bool
+    验证客户端类型：私有函数，要求非空且只包含小写ASCII字母、数字、下划线和短横线
 ```
 
 ## 逻辑

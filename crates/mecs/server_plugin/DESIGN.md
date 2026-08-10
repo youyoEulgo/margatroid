@@ -553,6 +553,8 @@ HttpResponseBodyStream：HTTP Body流，私有结构体--将分片通道适配�
     terminal_reported: bool--是否已输出终止错误
     impl Stream for HttpResponseBodyStream
         Stream：私有trait实现，输出分片；通道意外关闭时输出HttpStreamError::abandoned
+        Item = Result<Bytes, HttpStreamError>
+            分片类型：成功为Body字节，失败为终止流的HttpStreamError
 
 RouteRegistryState：路由注册表状态，私有结构体
     native_router: Option<Router>--原生Router，冻结时取出
@@ -589,6 +591,10 @@ ServerBridgeState：服务器桥接状态，私有结构体--HTTP和WebSocket Ha
 WebSocketRouteState：WebSocket路由状态，私有结构体
     bridge: ServerBridgeState--服务器桥接状态
     classifier: ErasedWebSocketClassifier--当前路由的消息分类器
+
+CompletedLoop：WebSocket根循环完成方，run_websocket_connection内私有局部枚举
+    Read(Option<WebSocketCloseReason>)--读取循环先结束
+    Write(Option<WebSocketCloseReason>)--写入循环先结束
 ```
 
 ## 函数
@@ -624,6 +630,9 @@ read_websocket_messages(event_sender: &RuntimeEventSender, classifier: ErasedWeb
 
 route_websocket_message(event_sender: &RuntimeEventSender, classifier: &dyn WebSocketMessageClassifier, connection_id: WebSocketConnectionId, stream_buffer_capacity: usize, streams: &mut HashMap<WebSocketStreamId, WebSocketStream>, message: Message)
     分流WebSocket消息：私有异步函数，普通消息发事件，Start创建支流并发一次打开事件，Chunk、End和Abort只进入支流通道
+
+remove_type_index(state: &mut WebSocketConnectionsState, connection_type: &str, connection_id: WebSocketConnectionId)
+    移除连接类型索引：私有函数，从指定类型集合删除连接ID，并在集合为空时删除类型键
 ```
 
 ## 逻辑

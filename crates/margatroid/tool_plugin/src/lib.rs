@@ -216,6 +216,10 @@ impl Default for ToolPlugin {
     }
 }
 
+pub struct ToolPluginInstalled;
+
+impl Resource for ToolPluginInstalled {}
+
 impl Plugin for ToolPlugin {
     fn build(self, app: &mut App) {
         if !app.world().contains_resource::<RuntimeHandle>()
@@ -227,7 +231,7 @@ impl Plugin for ToolPlugin {
             )
             .panic();
         }
-        if app.world().contains_resource::<ToolProviderRegistry>() {
+        if app.world().contains_resource::<ToolPluginInstalled>() {
             ToolError::new(
                 ToolErrorKind::ToolAlreadyRegistered,
                 "ToolPlugin is already installed",
@@ -243,6 +247,7 @@ impl Plugin for ToolPlugin {
         }
 
         let schedule = self.schedule;
+        app.world_mut().insert_resource(ToolPluginInstalled);
         app.world_mut().insert_resource(ToolProviderRegistry::new());
         app.world_mut().insert_resource(ToolState::default());
         app.add_system(&schedule, prepare_tool_call_system)

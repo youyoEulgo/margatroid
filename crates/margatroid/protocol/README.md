@@ -68,7 +68,8 @@ Agent 消息请求：
     "agent": "coder",
     "message": {
       "content": "Review this change."
-    }
+    },
+    "tool_calls": []
   }
 }
 ```

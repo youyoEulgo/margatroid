@@ -17,7 +17,8 @@ SkillPlugin：Skill工具定义Plugin，公开结构体--配置主目录Skill根
     open(home_root: impl Into<PathBuf>) -> Result<Self, SkillError>
         打开Plugin：规范化并保存绝对主目录根，不扫描资源库
     impl Plugin for SkillPlugin
-        行为：确认ToolPlugin已安装，以provider ID skill注册SkillToolProvider
+        build(self, app: &mut App)
+            构建插件：公开trait方法，通过ToolPlugin注册provider ID skill的SkillToolProvider
 
 SkillErrorKind：Skill Plugin配置错误分类，公开枚举
     InvalidRoot--主目录Skill根不是无父级跳转的绝对路径
@@ -25,6 +26,8 @@ SkillErrorKind：Skill Plugin配置错误分类，公开枚举
 SkillError：Skill Plugin配置错误，公开结构体
     kind: SkillErrorKind--稳定错误分类，私有
     message: String--不泄露Skill正文的描述，私有
+    new(kind: SkillErrorKind, message: impl Into<String>) -> Self
+        构造错误：私有关联函数，保存配置错误描述
     kind(&self) -> SkillErrorKind
         取得分类：公开方法
     message(&self) -> &str

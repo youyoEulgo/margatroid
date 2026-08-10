@@ -218,6 +218,7 @@ pub struct RouteAgentMessage {
     pub workspace: WorkspaceReference,
     pub agent: Option<String>,
     pub message: Message,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 impl Event for RouteAgentMessage {}

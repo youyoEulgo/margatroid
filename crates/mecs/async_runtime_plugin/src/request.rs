@@ -172,7 +172,7 @@ fn ensure_async_system_registered<Request: Event>(world: &World) {
     let Some(registry) = world.get_resource::<AsyncRegistry>() else {
         AsyncRuntimeError::AsyncRuntimePluginMissing.panic();
     };
-    if !registry.contains::<Request>() {
+    if !registry.contains_event_system::<Request>() {
         AsyncRuntimeError::AsyncSystemNotRegistered {
             event_type: type_name::<Request>(),
         }

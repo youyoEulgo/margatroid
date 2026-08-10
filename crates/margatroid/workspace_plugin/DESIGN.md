@@ -46,10 +46,11 @@ WorkspacePlugin：Workspace运行编排插件，公开结构体--协调Workspace
         build(self, app: &mut App)
             构建插件：安装WorkspaceRegistry并挂载Workspace命令System
             行为：
-                确认RuntimePlugin、AgentImageLoaderPlugin、InferencePlugin、ToolPlugin、AgentPlugin和MemoryPlugin已安装
+                确认RuntimePlugin、AgentImageLoaderPlugin、InferencePlugin、ToolPlugin、AgentPlugin和MemoryPlugin已安装；缺失任一依赖时终止配置
                 确认schedule存在且WorkspacePlugin尚未安装
                 插入WorkspaceRegistry
                 挂载begin_workspace_command_system
+                挂载route_agent_message_system
                 挂载collect_agent_image_system
                 挂载collect_agent_created_system
 
@@ -158,6 +159,8 @@ WorkspaceError：Workspace命令错误，公开结构体--提供不暴露绝对�
         取得分类：公开方法，返回错误分类
     message(&self) -> &str
         取得描述：公开方法，返回有界错误描述
+    new(kind: WorkspaceErrorKind, message: impl Into<String>) -> Self
+        构造错误：私有关联函数，保存分类和有界描述
     impl Clone for WorkspaceError
         Clone：公开trait实现
     impl fmt::Display for WorkspaceError
@@ -208,6 +211,8 @@ WorkspaceRegistry：Workspace注册与操作状态，crate公开Resource--保存
 WorkspaceKey：Workspace注册键，私有结构体--由规范化project_root和name组成
     project_root: PathBuf--规范化项目根
     name: String--Workspace逻辑名称
+    from_definition(definition: &WorkspaceDefinition) -> Self
+        从定义构造：私有关联函数，克隆规范化项目根和Workspace名称
 
 PendingWorkspaceKind：未完成操作类型，私有枚举
     Start--启动操作
@@ -236,6 +241,16 @@ PreparedWorkspaceAgent：单Agent实例材料，私有结构体--创建Agent Ent
 
 私有：
 ```text
+route_agent_message_system(world: &mut World)
+    路由成员消息：私有System，读取RouteAgentMessage并把逻辑Workspace和Agent名称解析为Entity
+    行为：
+        按WorkspaceReference查询已就绪Workspace
+        agent为空时使用WorkspaceDefinition.manager
+        只接受Message::User
+        tool_calls为空时发送MessageIntent::UserWithoutToolCalls
+        tool_calls非空时发送MessageIntent::UserWithToolCalls { tool_calls }
+        路由失败时记录警告且不构造AgentMessage
+
 begin_workspace_command_system(world: &mut World)
     开始命令：私有System，读取StartWorkspace、ReloadWorkspace、StopWorkspace和StopWorkspaceByReference
     行为：
@@ -246,6 +261,9 @@ begin_workspace_command_system(world: &mut World)
         StopWorkspace调用stop_workspace_inner并立即发送StopWorkspaceResult
         StopWorkspaceByReference先查询Entity，再调用stop_workspace_inner并发送StopWorkspaceByReferenceResult
         每个命令失败时发布对应的稳定错误结果
+
+begin_workspace_reload(world: &mut World, id: &str, previous: Entity, definition: WorkspaceDefinition) -> Result<(), WorkspaceError>
+    开始重载：私有函数，验证请求、旧Workspace和新定义身份一致，关闭旧实例后开始已验证启动
 
 begin_workspace_start(
     world: &mut World,
@@ -266,6 +284,9 @@ begin_workspace_start(
         为每个Agent生成独立子请求ID并发送LoadAgentImage
         保存PendingWorkspace和所有image_requests路由
         不读取AgentImage组件，不提前创建部分AgentInstance
+
+begin_workspace_start_validated(world: &mut World, id: &str, definition: WorkspaceDefinition, kind: PendingWorkspaceKind) -> Result<(), WorkspaceError>
+    开始已验证启动：私有函数，拒绝重复Workspace，创建暂存Entity、加载项目模型路由并发送镜像请求
 
 collect_agent_image_system(world: &mut World)
     收集镜像：私有System，读取LoadAgentImageResult并推进对应PendingWorkspace
@@ -312,6 +333,12 @@ collect_agent_created_system(world: &mut World)
         清理pending、image_requests和agent_requests
         发布StartWorkspaceResult或ReloadWorkspaceResult成功结果
 
+attach_prepared_agent(world: &mut World, request_id: &str, name: &str, agent: Entity) -> Result<(), WorkspaceError>
+    绑定实例材料：私有函数，验证Agent归属并绑定Memory、Inference和Tool组件
+
+complete_pending_workspace(world: &mut World, request_id: &str) -> Result<(), WorkspaceError>
+    完成启动：私有函数，挂载WorkspaceAgents、登记ready索引、清理子请求并发布成功结果
+
 fail_pending_workspace(world: &mut World, request_id: &str, error: WorkspaceError)
     终止启动：私有函数，释放本次未完成Workspace拥有的运行时对象
     行为：
@@ -332,13 +359,52 @@ stop_workspace_inner(world: &mut World, workspace: Entity) -> Result<(), Workspa
         despawn Workspace Entity
         不删除memory.sql、项目文件或AgentImage Entity
 
+validate_request_id(world: &World, id: &str) -> Result<(), WorkspaceError>
+    验证请求ID：私有函数，拒绝空ID和已处于pending的ID
+
+validate_definition(definition: WorkspaceDefinition) -> Result<WorkspaceDefinition, WorkspaceError>
+    验证定义：私有函数，规范化项目根和Memory路径，验证Agent唯一性与manager引用
+
+validate_agent_definition(agent: &WorkspaceAgentDefinition) -> Result<(), WorkspaceError>
+    验证Agent定义：私有函数，验证Agent逻辑名称
+
 normalize_project_root(path: PathBuf) -> Result<PathBuf, WorkspaceError>
     规范化项目根：私有函数，要求绝对路径且不包含父级跳转
     行为：拒绝相对路径、Root/Prefix之外的Parent组件和无法规范化的路径
 
+normalize_agent_images_root(path: PathBuf) -> Result<PathBuf, WorkspaceError>
+    规范化镜像根：私有函数，要求绝对路径且不包含父级跳转
+
+normalize_memory_path(path: PathBuf) -> Result<PathBuf, WorkspaceError>
+    规范化Memory路径：私有函数，要求绝对路径且不包含父级跳转
+
+normalize_absolute_path(path: PathBuf) -> Option<PathBuf>
+    规范化绝对路径：私有函数，移除CurDir并拒绝相对路径和ParentDir
+
 validate_logical_name(value: &str) -> Result<(), WorkspaceError>
     验证逻辑名称：私有函数，要求非空、长度有界且可安全作为单个目录段
     行为：拒绝控制字符、路径分隔符、.、..和其他不能作为单目录段的值
+
+image_root(root: &Path, reference: &AgentImageReference) -> PathBuf
+    构造镜像版本根：私有函数，依次拼接scope、name和tag
+
+default_memory_path(project_root: &Path, workspace: &str, agent: &str) -> PathBuf
+    构造默认Memory路径：私有函数，返回项目内对应Agent的memory.sql路径
+
+agent_image_components_missing() -> WorkspaceError
+    构造镜像组件错误：私有函数，返回稳定AgentImageComponentsMissing错误
+
+ready_workspace_key(world: &World, workspace: Entity) -> Result<WorkspaceKey, WorkspaceError>
+    取得就绪键：私有函数，验证Entity、Identity、Agents和ready索引一致
+
+is_registered_workspace(world: &World, workspace: Entity) -> bool
+    检查已登记Workspace：私有函数，复用ready_workspace_key
+
+pending_contains_key(world: &World, key: &WorkspaceKey) -> bool
+    检查待处理Workspace：私有函数，查询是否存在相同WorkspaceKey的pending操作
+
+cleanup_orphan_agent(world: &mut World, agent: Entity)
+    清理孤立Agent：私有函数，仅在Agent的Workspace已经失活时释放Agent
 ```
 
 ## 逻辑

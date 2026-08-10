@@ -58,13 +58,13 @@ impl AsyncRegistry {
         }
     }
 
-    pub(crate) fn register<Request: core_plugin::Event>(&mut self) -> bool {
+    pub(crate) fn register_event_system<Request: core_plugin::Event>(&mut self) -> bool {
         self.event_systems
             .insert(TypeId::of::<Request>(), std::any::type_name::<Request>())
             .is_none()
     }
 
-    pub(crate) fn contains<Request: core_plugin::Event>(&self) -> bool {
+    pub(crate) fn contains_event_system<Request: core_plugin::Event>(&self) -> bool {
         self.event_systems.contains_key(&TypeId::of::<Request>())
     }
 }

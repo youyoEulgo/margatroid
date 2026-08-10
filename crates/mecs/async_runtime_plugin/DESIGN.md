@@ -329,6 +329,18 @@ submit_supervised<T, E, TaskFuture>(executor: &AsyncRuntimeHandle, runtime: Runt
             mode为Await时调用RuntimeHandle::open_gate
         擦除监督Future并提交AsyncRuntimeHandle
 
+runtime_handle(world: &World) -> RuntimeHandle
+    获取Runtime句柄：私有函数，克隆World中的RuntimeHandle
+    行为：Resource不存在时报告RuntimePluginMissing
+
+async_runtime_handle(world: &World) -> &AsyncRuntimeHandle
+    获取异步Runtime句柄：私有函数，借用World中的AsyncRuntimeHandle
+    行为：Resource不存在时报告AsyncRuntimePluginMissing
+
+ensure_async_system_registered<Request: Event>(world: &World)
+    确认事件模式System：私有泛型函数，查询AsyncRegistry中的Request注册记录
+    行为：AsyncRegistry不存在时报告AsyncRuntimePluginMissing；Request未注册时报告AsyncSystemNotRegistered
+
 run_executor(mut task_receiver: UnboundedReceiver<ErasedExecutionTask>, startup_sender: SyncSender<Result<(), io::Error>>)
     运行异步线程：私有函数，task_receiver接收监督Future，startup_sender报告初始化结果
     行为：创建Tokio current-thread Runtime；报告结果；持续接收任务并逐个tokio::spawn
