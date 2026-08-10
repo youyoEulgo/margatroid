@@ -24,6 +24,8 @@ ComposeError：Workspace文件编译错误，公开结构体--保存稳定分类
         取得分类：公开方法，返回错误分类
     message(&self) -> &str
         取得描述：公开方法，返回有界错误描述
+    new(kind: ComposeErrorKind, message: impl Into<String>) -> Self
+        构造错误：私有关联函数，保存分类和有界描述
     impl Clone + PartialEq + Eq for ComposeError
         值语义：公开trait实现
     impl fmt::Display for ComposeError
@@ -44,6 +46,18 @@ AgentDocuments：Agent文档集合，私有结构体--保留配置出现顺序
     0: Vec<RawAgent>--原始Agent配置
     impl Deserialize for AgentDocuments
         Deserialize：公开trait实现，接受名称映射或带name字段的列表
+        deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            反序列化：使用AgentDocumentsVisitor接受映射或序列
+
+AgentDocumentsVisitor：Agent集合访问器，deserialize内私有局部单元结构体
+    impl Visitor for AgentDocumentsVisitor
+        Value = AgentDocuments--反序列化结果
+        expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
+            描述输入：要求Agent定义映射或序列
+        visit_map<A>(self, map: A) -> Result<AgentDocuments, A::Error>
+            读取映射：把键写入RawAgent.name；内部name存在且与键不一致时失败
+        visit_seq<A>(self, sequence: A) -> Result<AgentDocuments, A::Error>
+            读取序列：按原顺序收集RawAgent，name必填校验留给build_definition
 
 RawAgent：Agent原始文档，私有结构体--等待编译为WorkspaceAgentDefinition
     name: Option<String>--列表中的Agent名称；映射形式由键赋值

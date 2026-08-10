@@ -105,7 +105,7 @@ impl Default for MemoryPlugin {
     }
 }
 
-struct MemoryPluginInstalled;
+pub struct MemoryPluginInstalled;
 
 impl Resource for MemoryPluginInstalled {}
 

@@ -202,13 +202,18 @@ impl Plugin for AgentImageLoaderPlugin {
         {
             panic!("AsyncRuntimePlugin is not installed");
         }
-        if app.world().contains_resource::<AgentImageLoaderState>() {
+        if app
+            .world()
+            .contains_resource::<AgentImageLoaderPluginInstalled>()
+        {
             panic!("AgentImageLoaderPlugin is already installed");
         }
         if !app.contains_schedule(&self.schedule) {
             panic!("AgentImageLoaderPlugin schedule does not exist");
         }
         let schedule = self.schedule;
+        app.world_mut()
+            .insert_resource(AgentImageLoaderPluginInstalled);
         app.world_mut().insert_resource(AgentImageLoaderState {
             root: Arc::new(self.root),
             limits: self.limits,
@@ -220,6 +225,10 @@ impl Plugin for AgentImageLoaderPlugin {
             .add_system(&schedule, apply_agent_image_load_system);
     }
 }
+
+pub struct AgentImageLoaderPluginInstalled;
+
+impl Resource for AgentImageLoaderPluginInstalled {}
 
 pub(crate) struct AgentImageLoaderState {
     root: Arc<PathBuf>,

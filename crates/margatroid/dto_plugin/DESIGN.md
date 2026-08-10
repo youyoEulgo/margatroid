@@ -37,6 +37,10 @@ DtoPlugin：WebSocket DTO转换插件，公开结构体--注册WebSocket路由�
         设置路径：保存调用者路径并返回自身
     with_schedule(self, schedule: impl Into<String>) -> Self
         设置Schedule：保存调用者Schedule并返回自身
+    impl Default for DtoPlugin
+        Default：公开trait实现，与new等价
+        default() -> Self
+            构造默认插件：调用new
     impl Plugin for DtoPlugin
         Plugin：公开trait实现
         build(self, app: &mut App)
@@ -53,11 +57,20 @@ WebSocketMessageSend：发送事件，公开结构体--承载ServerMessage和连
     impl Event for WebSocketMessageSend
         Event：公开trait实现
 
+```
+
+私有：
+```text
+DtoPluginInstalled：DtoPlugin安装标记，私有单元Resource--阻止同一App重复安装
+    impl Resource for DtoPluginInstalled
+        Resource：私有trait实现
+
 BackendStateReportCache：后端状态报告缓存，私有Resource--阻止未变化快照在事件驱动Runtime中形成自唤醒循环
     state: Option<BackendStateDto>--上次同步的完整状态
     recipients: Vec<u64>--上次报告时匹配backend_state目标的连接ID
     last_error: Option<String>--最近一次转换错误，用于相同错误只记录一次
-
+    impl Resource for BackendStateReportCache
+        Resource：私有trait实现
 ```
 
 ## 函数
@@ -77,7 +90,7 @@ dto_route_system(world: &mut World)
         WebSocketMessageSend:
         收集WebSocketMessageSend
         将ServerMessage序列化为Text
-        根据消息分类从ConfigPlugin::MargatroidConfig取得target，再按Broadcast、Type或Name取得Vec<WebSocketSender>
+        直接使用事件携带的target，按Broadcast、Type或Name取得Vec<WebSocketSender>
         使用发送器集合和Text消息构造WebSocketMessageSender并调用try_send
 
 collect_external_events_system(world: &mut World)
@@ -95,12 +108,33 @@ collect_external_events_system(world: &mut World)
         相同状态转换错误只记录一次，成功后清除错误缓存
         将StateSync发送给backend_state指定目标
 
-report_backend_state(world: &mut World)
+report_server_events(world: &World)
+    报告Server事件：私有函数，将Server启停、WebSocket连接、断开和协议失败投影为结构化日志
+
+report_workspace_events(world: &World, targets: &[WebSocketMessageTarget])
+    报告Workspace启动：私有函数，成功时转换并发送WorkspaceStarted，失败时写错误日志
+
+report_workspace_stop_events(world: &World, targets: &[WebSocketMessageTarget])
+    报告Workspace停止：私有函数，发送WorkspaceStopped或WorkspaceStopFailed并记录日志
+
+report_agent_messages(world: &World, targets: &[WebSocketMessageTarget])
+    报告Agent消息：私有函数，将外部可见User和Assistant转换为AgentMessage协议事件；跳过System和Tool
+
+report_agent_failures(world: &World, targets: &[WebSocketMessageTarget])
+    报告Agent失败：私有函数，将AgentFailure转换为协议事件并记录warning
+
+report_backend_state(world: &mut World, targets: &[WebSocketMessageTarget])
     报告后端状态：私有函数，从World构造权威状态快照并在快照或接收连接变化时发送StateSync
     调用：collect_external_events_system每次运行时调用
     输出：仅在首次运行、BackendStateDto变化或backend_state接收连接集合变化时发送WebSocketMessageSend
 
-forward_logs(stream: TracingStream, events: RuntimeEventSender)
+send_to_targets(world: &World, targets: &[WebSocketMessageTarget], message: ServerMessage)
+    按目标发事件：私有函数，为每个目标克隆ServerMessage并发送一个WebSocketMessageSend
+
+target_recipients(connections: &WebSocketConnections, targets: &[WebSocketMessageTarget]) -> Vec<u64>
+    解析接收连接：私有函数，按目标查询发送器并返回连接ID；排序和去重由调用方完成
+
+forward_logs(stream: TracingStream, events: RuntimeEventSender, targets: Vec<WebSocketMessageTarget>)
     转发结构化日志：私有异步函数，订阅TracingStream，将TracingRecord转换为LogRecordDto并按logs目标发送WebSocketMessageSend
     行为：订阅滞后时直接累计TracingSubscription内部丢弃计数，不向正在消费的TracingStream写回日志
 

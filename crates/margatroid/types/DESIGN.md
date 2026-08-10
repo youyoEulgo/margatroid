@@ -102,6 +102,27 @@ WorkspaceDefinition：编译后的Workspace静态定义，公开结构体--不�
         Clone：公开trait实现
     限制：结构体不提供业务方法；它是进程内业务输入，不是CLI/daemon网络DTO
 
+WorkspaceReference：Workspace逻辑引用，公开结构体--使用名称和项目根跨Plugin定位已启动Workspace
+    name: String--Workspace名称
+    project_root: PathBuf--规范化项目根
+    impl Clone + PartialEq + Eq for WorkspaceReference
+        值语义：公开trait实现
+
+StartWorkspace：Workspace启动命令，公开事件--把请求ID和静态定义交给WorkspacePlugin
+    id: String--客户端请求ID
+    definition: WorkspaceDefinition--待启动静态定义
+    impl Event for StartWorkspace
+        Event：公开trait实现
+
+RouteAgentMessage：逻辑Agent消息路由命令，公开事件--由DTO层产生并交给WorkspacePlugin解析Entity
+    id: String--完整交互轮次ID
+    workspace: WorkspaceReference--目标Workspace逻辑引用
+    agent: Option<String>--目标成员名，None表示manager
+    message: Message--当前只接受User消息
+    tool_calls: Vec<ToolCall>--前端预选工具调用；为空表示直接推理
+    impl Event for RouteAgentMessage
+        Event：公开trait实现
+
 ToolCall：统一工具调用，公开结构体--保存前端指定或Provider返回且后续工具执行必须原样关联的调用
     id: String--调用来源生成的工具调用ID
     name: String--模型可见工具名称

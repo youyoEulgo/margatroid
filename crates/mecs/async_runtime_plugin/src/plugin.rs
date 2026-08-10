@@ -59,7 +59,7 @@ impl AppAsyncExt for App {
         let Some(registry) = self.world_mut().get_resource_mut::<AsyncRegistry>() else {
             AsyncRuntimeError::AsyncRuntimePluginMissing.panic();
         };
-        if !registry.register::<Request>() {
+        if !registry.register_event_system::<Request>() {
             AsyncRuntimeError::AsyncSystemAlreadyRegistered {
                 event_type: type_name::<Request>(),
             }

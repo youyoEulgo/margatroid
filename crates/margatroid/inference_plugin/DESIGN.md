@@ -16,6 +16,16 @@ InferenceParameters：统一推理参数，公开结构体--只保存跨Provider
     max_output_tokens: Option<u32>--最大输出token数
     top_p: Option<f32>--核采样参数
     stop: Vec<String>--停止序列
+    new(temperature: Option<f32>, max_output_tokens: Option<u32>, top_p: Option<f32>, stop: Vec<String>) -> Self
+        构造参数：公开关联函数，原样保存参数；业务范围由validate统一检查
+    temperature(&self) -> Option<f32>
+        取得温度：公开方法
+    max_output_tokens(&self) -> Option<u32>
+        取得最大输出量：公开方法
+    top_p(&self) -> Option<f32>
+        取得核采样参数：公开方法
+    stop(&self) -> &[String]
+        取得停止序列：公开方法
     validate(&self) -> Result<(), InferenceError>
         验证参数：crate公开方法，检查数值范围、停止序列数量与长度
     impl Default for InferenceParameters
@@ -26,6 +36,14 @@ AgentInferenceSnapshot：Agent实例推理快照，公开组件--启动时从中
     parameters: InferenceParameters--实际使用的参数
     workspace: Entity--所属Workspace Entity，用于查询项目级模型路由
     source_image: Entity--来源AgentImage Entity，仅用于追踪，不在推理时重新读取
+    model(&self) -> &ModelId
+        取得逻辑模型：公开方法
+    parameters(&self) -> &InferenceParameters
+        取得推理参数：公开方法
+    workspace(&self) -> Entity
+        取得Workspace：公开方法
+    source_image(&self) -> Entity
+        取得来源镜像：公开方法
     impl Clone for AgentInferenceSnapshot
         Clone：公开trait实现，允许Workspace为Agent实例准备独立推理配置
     impl Component for AgentInferenceSnapshot
@@ -35,6 +53,10 @@ WorkspaceModelRoutes：Workspace模型路由，公开组件--挂在Workspace Ent
     routes: HashMap<ModelId, ConfiguredModelRoute>--从<project>/.margatroid/models.toml编译的项目级路由，私有
     get(&self, id: &ModelId) -> Option<ConfiguredModelRoute>
         取得项目路由：crate公开方法，克隆实际模型名称和Adapter共享引用
+    len(&self) -> usize
+        取得路由数量：公开方法
+    is_empty(&self) -> bool
+        检查空路由：公开方法
     impl Component for WorkspaceModelRoutes
         Component：公开trait实现
 
@@ -106,6 +128,12 @@ InferenceError：推理错误，公开结构体--不保存API key、Authorizatio
     kind: InferenceErrorKind--错误分类
     message: String--有界诊断文本
     status: Option<u16>--Provider HTTP状态码
+    new(kind: InferenceErrorKind, message: impl Into<String>) -> Self
+        构造错误：公开关联函数，保存分类和有界描述，不设置HTTP状态码
+    with_status(kind: InferenceErrorKind, status: Option<u16>, message: impl Into<String>) -> Self
+        构造带状态错误：公开关联函数，将描述按UTF-8边界截断到512字节
+    panic(self) -> !
+        终止配置：crate私有方法，以Display文本触发panic
     kind(&self) -> InferenceErrorKind
         获取分类：公开方法，返回kind
     message(&self) -> &str
@@ -122,11 +150,27 @@ ProviderInput<'a>：Provider输入视图，公开结构体--ProviderAdapter组�
     parameters: &'a InferenceParameters--推理参数
     messages: &'a [Message]--完整统一消息
     tools: &'a [ToolDefinition]--允许的工具定义
+    new(model: &'a str, parameters: &'a InferenceParameters, messages: &'a [Message], tools: &'a [ToolDefinition]) -> Self
+        构造输入：私有关联函数，由InferencePlugin准备阶段创建
+    model(&self) -> &str
+        取得实际模型：公开方法
+    parameters(&self) -> &InferenceParameters
+        取得参数：公开方法
+    messages(&self) -> &[Message]
+        取得消息：公开方法
+    tools(&self) -> &[ToolDefinition]
+        取得工具定义：公开方法
 
 ProviderRouteInput<'a>：Provider路由视图，公开结构体--ProviderAdapterFactory创建已配置Adapter时只读借用
     provider: Option<&'a str>--可选供应商名称，不参与路由查找
     base_url: &'a reqwest::Url--完整API基础地址
     api_key: &'a str--鉴权密钥，不得保存到日志、Event或Error
+    provider(&self) -> Option<&str>
+        取得供应商元数据：公开方法
+    base_url(&self) -> &reqwest::Url
+        取得API基础地址：公开方法
+    api_key(&self) -> &str
+        取得鉴权密钥：公开方法，只允许Adapter构造请求时使用
 
 ProviderHttpRequest：Provider HTTP请求，公开结构体--允许Adapter构造但不允许业务读取鉴权内容
     method: reqwest::Method--HTTP方法，私有
@@ -160,6 +204,8 @@ InferencePlugin：推理插件，公开结构体
     schedule: String--命令准备、异步提交与结果发布所属Schedule，私有
     config_path: PathBuf--主目录全局模型路由表路径，私有
     adapter_factories: HashMap<String, ErasedProviderAdapterFactory>--api_type到协议工厂的映射，私有
+    new() -> Self
+        构造插件：公开关联函数，使用默认Schedule、默认配置路径和openai协议工厂
     with_schedule(mut self, schedule: impl Into<String>) -> Self
         指定阶段：公开方法，使用schedule替换默认Schedule并返回自身
     with_config_path(mut self, path: impl Into<PathBuf>) -> Self
@@ -170,6 +216,8 @@ InferencePlugin：推理插件，公开结构体
         行为：api_type非空且未重复时插入工厂并返回自身，否则终止配置
     impl Default for InferencePlugin
         Default：公开trait实现，使用RuntimePlugin::PRE_UPDATE、~/.margatroid/models.toml和内置openai协议工厂
+        default() -> Self
+            构造默认插件：调用new
     impl Plugin for InferencePlugin
         Plugin：公开trait实现，加载模型路由表并安装路由重载、推理处理所需的Resource和System
 
@@ -195,6 +243,16 @@ WorldInferenceExt：World推理扩展，公开trait--提供全局路由重载与
             不向World插入组件，不创建AgentInstance
     impl WorldInferenceExt for World
         WorldInferenceExt for World：公开trait实现
+
+OpenAiAdapterFactory：OpenAI兼容协议工厂，公开单元结构体
+    new() -> Self
+        构造工厂：公开关联函数
+    impl Default for OpenAiAdapterFactory
+        Default：公开trait实现，返回无状态工厂
+        default() -> Self
+            构造默认工厂：返回单元结构体
+    impl ProviderAdapterFactory for OpenAiAdapterFactory
+        ProviderAdapterFactory：公开trait实现，验证API key并创建绑定路由的OpenAiAdapter
 ```
 
 crate公开：
@@ -265,12 +323,88 @@ InferenceTaskError：异步监督错误，私有结构体--表示AsyncRuntime在
     source: AsyncTaskError--异步运行时错误
     impl From<AsyncTaskError> for InferenceTaskError
         From<AsyncTaskError>：私有trait实现，满足AppAsyncExt::add_async_system的错误约束
+        from(source: AsyncTaskError) -> Self
+            转换监督错误：保存source
+
+AgentMessageDeltaFrame<'a>：成员流式消息帧，私有结构体--直接序列化给WebSocket发送终端，不进入事件队列
+    message_type: &'static str--固定为agent.message.delta
+    id: &'a str--推理请求ID
+    agent: &'a str--稳定Agent ID
+    content: String--本次新增文本
+
+OpenAiAdapter：OpenAI兼容协议适配器，私有结构体--保存单条路由的端点和密钥
+    base_url: reqwest::Url--API基础地址
+    api_key: String--鉴权密钥
+    impl ProviderAdapter for OpenAiAdapter
+        ProviderAdapter：私有trait实现，构造流式chat/completions请求并创建OpenAiAccumulator
+
+OpenAiRequest：OpenAI兼容请求正文，私有结构体
+    model: String--实际模型名
+    messages: Vec<serde_json::Value>--协议消息数组
+    tools: Vec<serde_json::Value>--函数工具定义
+    stream: bool--固定启用流式响应
+    temperature: Option<f32>--采样温度
+    max_tokens: Option<u32>--最大输出量
+    top_p: Option<f32>--核采样参数
+    stop: Vec<String>--停止序列
+    from_input(input: ProviderInput<'_>) -> Self
+        转换输入：私有关联函数，将统一消息、参数和工具转换为OpenAI兼容请求
+
+OpenAiAccumulator：OpenAI兼容响应累积器，私有结构体--按SSE行解析并累积Assistant响应
+    buffer: Vec<u8>--未形成完整行的网络字节
+    content: String--完整文本内容
+    tool_calls: Vec<OpenAiToolCallBuilder>--按index累积的工具调用
+    stop_reason: Option<StopReason>--Provider停止原因
+    usage: Option<TokenUsage>--Token用量
+    saw_choice: bool--是否收到过choice
+    done: bool--是否收到[DONE]
+    consume_line(&mut self, line: &[u8]) -> Result<Vec<String>, InferenceError>
+        消费响应行：私有方法，忽略空行和注释，解析data载荷或DONE标记
+    consume_chunk(&mut self, chunk: OpenAiChunk) -> Result<Vec<String>, InferenceError>
+        消费协议分片：私有方法，累积文本、工具调用、停止原因和用量
+    impl ProviderResponseAccumulator for OpenAiAccumulator
+        ProviderResponseAccumulator：私有trait实现，处理任意网络分片边界并完成统一响应
+
+OpenAiToolCallBuilder：OpenAI工具调用临时槽，私有结构体
+    id: String--分片拼接的调用ID
+    name: String--分片拼接的工具名
+    arguments: String--分片拼接的原始参数
+
+OpenAiChunk：OpenAI响应分片，私有反序列化结构体
+    choices: Vec<OpenAiChoice>--响应候选
+    usage: Option<OpenAiUsage>--可选用量
+
+OpenAiChoice：OpenAI响应候选，私有反序列化结构体
+    delta: Option<OpenAiDelta>--流式增量
+    message: Option<OpenAiDelta>--兼容端点可能返回的完整消息
+    finish_reason: Option<String>--停止原因
+
+OpenAiDelta：OpenAI消息增量，私有反序列化结构体
+    content: Option<String>--文本增量
+    tool_calls: Option<Vec<OpenAiToolCallDelta>>--工具调用增量
+
+OpenAiToolCallDelta：OpenAI工具调用增量，私有反序列化结构体
+    index: Option<usize>--工具调用槽位
+    id: Option<String>--调用ID片段
+    function: Option<OpenAiFunctionDelta>--函数片段
+
+OpenAiFunctionDelta：OpenAI函数增量，私有反序列化结构体
+    name: Option<String>--函数名片段
+    arguments: Option<String>--参数片段
+
+OpenAiUsage：OpenAI用量，私有反序列化结构体
+    input_tokens: u64--输入Token，兼容prompt_tokens别名
+    output_tokens: u64--输出Token，兼容completion_tokens别名
+    total_tokens: u64--总Token
 ```
 
 ## 函数
 
 私有：
 ```text
+default_config_path() -> PathBuf
+    默认配置路径：私有函数，返回~/.margatroid/models.toml；主目录不可取得时回退相对路径
+
 load_model_routes(path: &Path, factories: &HashMap<String, ErasedProviderAdapterFactory>) -> Result<HashMap<ModelId, ConfiguredModelRoute>, InferenceError>
     加载模型路由：私有函数，Plugin构建期从path同步读取并编译完整模型路由表
     行为：有界读取UTF-8 TOML并调用compile_model_routes；此时Runtime尚未进入循环
@@ -288,6 +422,12 @@ compile_model_routes(source: &str, factories: &HashMap<String, ErasedProviderAda
         构造ProviderRouteInput并调用Factory::build
         将id、实际model与Adapter组装为ConfiguredModelRoute插入路由映射
         返回完整路由映射
+
+require_workspace(world: &World, workspace: Entity) -> Result<(), InferenceError>
+    检查Workspace：私有函数，确认Entity存活且具有WorkspaceIdentity
+
+model_is_routable(world: &World, workspace: Entity, model: &ModelId) -> bool
+    检查路由：私有函数，按Workspace项目级、全局顺序确认模型存在
 
 reload_model_routes_system(world: &mut World)
     重载模型路由：私有System，读取ReloadModelRoutes并同步重载全局默认路由表
@@ -310,6 +450,12 @@ prepare_inference_system(world: &mut World)
         调用Adapter::build_request
         任一检查或组装失败时立即发送AgentFailure { id, agent, kind: Inference, message }
         成功时调用WorldAsyncExt::send_async_event发送PreparedInference
+
+prepare_inference(world: &World, command: InferenceCommand) -> Result<PreparedInference, InferenceError>
+    准备单次推理：私有函数，完成Command验证、路由解析、请求构造、客户端克隆和流式发送器解析
+
+resolve_websocket_targets(world: &World, target: &WebSocketMessageTarget) -> Vec<WebSocketSender>
+    解析流式目标：私有函数，从WebSocketConnections取得目标当前匹配的发送器快照
 
 execute_prepared_inference(prepared: PreparedInference) -> Result<InferenceTaskOutput, InferenceTaskError>
     执行推理：私有异步函数，发送HTTP请求、直接向固定WebSocket发送器转发文本并累积完整响应
@@ -365,6 +511,24 @@ summarize_reqwest_error(error: &reqwest::Error) -> String
 provider_error_detail(body: &[u8]) -> Option<String>
     提取Provider错误：私有函数，优先读取error.message、error、message或detail字符串，否则使用有界正文
     安全：移除控制字符、折叠空白，最终仍受InferenceError的512字节限制
+
+single_line(value: &str) -> String
+    单行化：私有函数，将控制字符替换为空格并折叠空白
+
+read_bounded_body(response: reqwest::Response, limit: usize) -> Vec<u8>
+    有界读取响应：私有异步函数，最多读取limit字节错误正文
+
+run_provider(prepared: PreparedInference) -> Result<InferenceResponse, InferenceError>
+    驱动Provider：私有异步函数，发送请求、检查状态、驱动累积器并直接转发文本分片
+
+send_stream_delta(senders: &[WebSocketSender], id: &str, agent: &str, content: String) -> Result<(), InferenceError>
+    发送流式文本：私有异步函数，序列化AgentMessageDeltaFrame并通过WebSocketMessageSender直接发送
+
+openai_message(message: &Message) -> serde_json::Value
+    转换OpenAI消息：私有函数，将统一Message映射为兼容协议JSON
+
+parse_stop_reason(value: &str) -> StopReason
+    解析停止原因：私有函数，映射已知OpenAI原因并保留未知文本
 ```
 
 ## 逻辑

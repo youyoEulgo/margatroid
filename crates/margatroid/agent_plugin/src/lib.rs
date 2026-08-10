@@ -33,7 +33,7 @@ impl Default for AgentPlugin {
     }
 }
 
-struct AgentPluginInstalled;
+pub struct AgentPluginInstalled;
 
 impl Resource for AgentPluginInstalled {}
 

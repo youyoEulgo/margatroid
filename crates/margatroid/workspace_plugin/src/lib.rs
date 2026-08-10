@@ -4,10 +4,10 @@ use std::path::{Component as PathComponent, Path, PathBuf};
 use std::sync::Arc;
 
 use agent_image_loader_plugin::{
-    AgentImageDefaultVisibility, AgentImageIdentity, AgentImageModelConfig, AgentImageSoul,
-    LoadAgentImage, LoadAgentImageResult,
+    AgentImageDefaultVisibility, AgentImageIdentity, AgentImageLoaderPluginInstalled,
+    AgentImageModelConfig, AgentImageSoul, LoadAgentImage, LoadAgentImageResult,
 };
-use agent_plugin::{AgentCreateRequest, AgentCreated, AgentWorkspaceId};
+use agent_plugin::{AgentCreateRequest, AgentCreated, AgentPluginInstalled, AgentWorkspaceId};
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::{AgentInferenceSnapshot, GlobalModelRoutes, WorldInferenceExt};
@@ -15,8 +15,8 @@ use margatroid_types::{
     AgentMessage, Message, MessageIntent, ResourceRef, RouteAgentMessage, WorkspaceAgentDefinition,
     WorkspaceDefinition,
 };
-use memory_plugin::{AgentMemory, WorldMemoryExt};
-use tool_plugin::AgentToolEnvironment;
+use memory_plugin::{AgentMemory, MemoryPluginInstalled, WorldMemoryExt};
+use tool_plugin::{AgentToolEnvironment, ToolPluginInstalled};
 
 pub use margatroid_types::StartWorkspace;
 
@@ -49,6 +49,21 @@ impl Plugin for WorkspacePlugin {
         }
         if !app.world().contains_resource::<GlobalModelRoutes>() {
             panic!("WorkspacePlugin requires InferencePlugin");
+        }
+        if !app
+            .world()
+            .contains_resource::<AgentImageLoaderPluginInstalled>()
+        {
+            panic!("WorkspacePlugin requires AgentImageLoaderPlugin");
+        }
+        if !app.world().contains_resource::<ToolPluginInstalled>() {
+            panic!("WorkspacePlugin requires ToolPlugin");
+        }
+        if !app.world().contains_resource::<AgentPluginInstalled>() {
+            panic!("WorkspacePlugin requires AgentPlugin");
+        }
+        if !app.world().contains_resource::<MemoryPluginInstalled>() {
+            panic!("WorkspacePlugin requires MemoryPlugin");
         }
         if app.world().contains_resource::<WorkspaceRegistry>() {
             panic!("WorkspacePlugin is already installed");
@@ -160,11 +175,18 @@ fn route_agent_message_system(world: &mut World) {
             tracing::warn!(id = %request.id, "route agent message only accepts User messages");
             continue;
         }
+        let intent = if request.tool_calls.is_empty() {
+            MessageIntent::UserWithoutToolCalls
+        } else {
+            MessageIntent::UserWithToolCalls {
+                tool_calls: request.tool_calls,
+            }
+        };
         world.send_event(AgentMessage {
             id: request.id,
             agent,
             message: request.message,
-            intent: MessageIntent::UserWithoutToolCalls,
+            intent,
         });
     }
 }

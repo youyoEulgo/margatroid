@@ -182,6 +182,16 @@ impl FromDomain<&ToolCall> for ToolCallDto {
     }
 }
 
+impl IntoDomain<ToolCall> for ToolCallDto {
+    fn into_domain(self, (): ()) -> Result<ToolCall, ProtocolError> {
+        Ok(ToolCall {
+            id: self.id,
+            name: self.name,
+            arguments: self.arguments,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageDto {
     User {
@@ -268,6 +278,8 @@ pub struct RouteAgentMessageDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: Option<String>,
     pub message: UserMessageDto,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallDto>,
 }
 
 impl IntoDomain<RouteAgentMessage, String> for RouteAgentMessageDto {
@@ -277,6 +289,11 @@ impl IntoDomain<RouteAgentMessage, String> for RouteAgentMessageDto {
             workspace: self.workspace.into_domain(())?,
             agent: self.agent,
             message: self.message.into_domain(())?,
+            tool_calls: self
+                .tool_calls
+                .into_iter()
+                .map(|call| call.into_domain(()))
+                .collect::<Result<_, _>>()?,
         })
     }
 }
@@ -325,6 +342,27 @@ impl ClientMessage {
                 message: UserMessageDto {
                     content: content.into(),
                 },
+                tool_calls: Vec::new(),
+            },
+        }
+    }
+
+    pub fn agent_message_with_tool_calls(
+        id: impl Into<String>,
+        workspace: &WorkspaceReferenceDto,
+        agent: Option<String>,
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCallDto>,
+    ) -> Self {
+        Self::AgentMessage {
+            id: id.into(),
+            message: RouteAgentMessageDto {
+                workspace: workspace.clone(),
+                agent,
+                message: UserMessageDto {
+                    content: content.into(),
+                },
+                tool_calls,
             },
         }
     }
@@ -874,6 +912,30 @@ mod tests {
             value["message"]["message"]["content"],
             "Review this change."
         );
+    }
+
+    #[test]
+    fn agent_message_preserves_preselected_tool_calls() {
+        let workspace = WorkspaceReferenceDto::new("demo", "/tmp/demo");
+        let request = ClientMessage::agent_message_with_tool_calls(
+            "message-1",
+            &workspace,
+            None,
+            "Load context.",
+            vec![ToolCallDto {
+                id: "call-1".into(),
+                name: "skill_local_context".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        let ClientMessage::AgentMessage { id, message } = request else {
+            panic!("agent message constructor returned a different request type");
+        };
+        let routed = message.into_domain(id).unwrap();
+
+        assert_eq!(routed.tool_calls.len(), 1);
+        assert_eq!(routed.tool_calls[0].id, "call-1");
+        assert_eq!(routed.tool_calls[0].name, "skill_local_context");
     }
 
     #[test]

@@ -19,11 +19,15 @@ AgentImageLoaderPlugin：AgentImage加载插件，公开结构体--配置镜像�
             构建插件：安装AgentImage加载状态、异步读取System和主线程提交System
             行为：
                 确认RuntimePlugin和AsyncRuntimePlugin已安装
-                确认schedule存在且AgentImageLoaderState尚未安装
-                插入AgentImageLoaderState
+                确认schedule存在且AgentImageLoaderPluginInstalled尚未安装
+                插入AgentImageLoaderPluginInstalled和AgentImageLoaderState
                 挂载prepare_agent_image_load_system
                 通过add_async_system挂载AgentImageReadTask处理器
                 挂载apply_agent_image_load_system
+
+AgentImageLoaderPluginInstalled：镜像加载插件安装标记，公开单元Resource--供WorkspacePlugin确认依赖并阻止重复安装
+    impl Resource for AgentImageLoaderPluginInstalled
+        Resource：公开trait实现
 
 LoadAgentImage：加载AgentImage，公开事件--请求读取当前磁盘中的逻辑镜像
     id: String--调用方生成的请求ID，用于配对结果
@@ -153,6 +157,8 @@ AgentImageLoaderLimits：AgentImage加载限制，私有结构体--限制单个�
     max_stop_sequence_bytes: usize--单个停止序列最大UTF-8字节数，仅保护资源读取
     impl Default for AgentImageLoaderLimits
         Default：私有trait实现，使用64KiB清单、1MiB Soul、4096个资源名称、1KiB模型ID、128个停止序列和4KiB单序列限制
+        default() -> Self
+            构造默认限制：返回上述固定限制
 
 AgentImageReadTask：AgentImage异步读取任务，私有事件--不持有World引用
     reference: AgentImageReference--目标镜像引用
@@ -182,6 +188,8 @@ AgentImageTaskError：AgentImage异步监督错误，私有结构体--表示Asyn
     source: AsyncTaskError--异步运行时错误
     impl From<AsyncTaskError> for AgentImageTaskError
         From<AsyncTaskError>：私有trait实现，满足add_async_system错误约束
+        from(source: AsyncTaskError) -> Self
+            转换监督错误：保存source
 
 DirectoryEntryKind：目录入口类型，私有枚举--目录快照只区分Loader允许的普通文件和目录
     File

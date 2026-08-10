@@ -41,6 +41,8 @@ AgentPlugin：Agent实例与消息循环插件，公开结构体--安装创建�
         指定阶段：公开方法，替换默认Schedule并返回自身
     impl Default for AgentPlugin
         Default：公开trait实现，与new等价
+        default() -> Self
+            构造默认插件：调用new
     impl Plugin for AgentPlugin
         Plugin：公开trait实现
         build(self, app: &mut App)
@@ -120,12 +122,23 @@ AgentStatus：Agent轮次状态，公开组件--当前只跟踪一个工具调�
         等待轮次：公开只读方法
     pending_tool_call_ids(&self) -> impl Iterator<Item = &str> + '_
         等待调用：公开只读方法
+    begin_tool_calls(&mut self, id: &str, tool_calls: &[ToolCall]) -> Result<(), AgentStepError>
+        开始工具批次：私有方法，要求当前没有批次、轮次ID非空、调用非空且ToolCall ID非空不重复
+        行为：一次性保存轮次ID和全部待完成ToolCall ID
+    accepts_tool_response(&self, id: &str, tool_call_id: &str) -> bool
+        验证工具响应：私有只读方法，仅当轮次和ToolCall ID属于当前待完成批次时返回true
+    complete_tool_response(&mut self, id: &str, tool_call_id: &str) -> bool
+        完成工具响应：私有方法，删除匹配的待完成ID；集合清空时清除整个批次并返回true
     impl Component for AgentStatus
         Component：公开trait实现
 ```
 
 私有：
 ```text
+AgentPluginInstalled：AgentPlugin安装标记，公开单元Resource--阻止同一App重复安装并供WorkspacePlugin确认依赖
+    impl Resource for AgentPluginInstalled
+        Resource：公开trait实现
+
 PendingToolCalls：待完成工具批次，私有结构体
     id: String--完整交互轮次ID
     tool_call_ids: BTreeSet<String>--尚未返回的唯一ToolCall ID
@@ -135,6 +148,14 @@ AvailableTools：一次请求的临时工具集合，私有结构体--不是Agen
     resources_by_name: BTreeMap<String, ResourceRef>--模型可见名称到资源引用的临时映射
 
 AgentStepError：当前事件处理错误，私有枚举--Memory错误单独上报，其余错误转换为AgentFailure
+    Memory(MemoryError)--历史写入失败
+    AgentMissing--Agent Entity不存在
+    ContextMissing--AgentContext或动态可见性不存在
+    StatusMissing--AgentStatus不存在
+    InvalidMessage--Message与Intent组合非法
+    InvalidToolBatch--工具批次为空、冲突、重复或响应不属于当前批次
+    Tool(ToolError)--工具定义解析、请求或执行准备错误
+    DuplicateToolName--两个可见资源暴露同一个模型工具名
     failure_message(&self) -> String
         构造失败描述：返回不包含消息正文、工具参数或资源正文的稳定有界文本
 ```
@@ -171,7 +192,7 @@ handle_message(world: &mut World, agent: Entity, event: &AgentMessage, events: &
         CompleteTurn只接受Assistant，记录后结束
         不根据消息正文推断Intent
 
-record_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender)
+record_message(world: &mut World, agent: Entity, event: &AgentMessage, events: &RuntimeEventSender)
     记录消息：同步历史表并更新AgentContext
     行为：
         User和Assistant先调用WorldMemoryExt::append_history_message
@@ -216,6 +237,12 @@ send_inference_command(world: &World, id: &str, agent: Entity, events: &RuntimeE
 
 validate_message_intent(event: &AgentMessage)
     验证消息契约：只检查来源赋予的Intent与静态Message类型是否匹配，不重新决定Intent
+
+assert_dynamic_message(message: &Message)
+    断言动态消息：私有函数，message为System时panic
+
+assert_dynamic_messages(messages: &[Message])
+    断言动态消息集合：私有函数，逐条调用assert_dynamic_message
 ```
 
 ## 逻辑
@@ -230,9 +257,9 @@ validate_message_intent(event: &AgentMessage)
         -> WorkspacePlugin绑定AgentMemory、AgentInferenceSnapshot和AgentToolEnvironment
 
 普通用户消息：
-    AgentMessage { agent: Id("demo.coder0"), User, UserWithoutToolCalls }
-        -> AgentPlugin按AgentIdentity解析为Entity
-        -> 使用解析后的Entity处理消息
+    AgentMessage { agent: Entity, User, UserWithoutToolCalls }
+        -> AgentPlugin直接使用事件携带的Agent Entity
+        -> AgentIdentity只用于构造InferenceCommand和日志中的稳定ID
         -> history_messages追加User
         -> AgentContext追加User并通知MemoryPlugin重写realtime_messages
         -> 当前AgentDynamicVisibility逐项构造ToolDefinition

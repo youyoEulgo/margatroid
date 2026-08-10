@@ -1146,19 +1146,7 @@ async fn execute_prepared_inference(
 
 async fn run_provider(prepared: PreparedInference) -> Result<InferenceResponse, InferenceError> {
     let endpoint = safe_endpoint(&prepared.request.url);
-    let request = reqwest::Request::new(prepared.request.method, prepared.request.url);
-    let mut request = request;
-    *request.headers_mut() = prepared.request.headers;
-    *request.body_mut() = Some(reqwest::Body::from(prepared.request.body));
-    let response = prepared.client.execute(request).await.map_err(|error| {
-        InferenceError::new(
-            InferenceErrorKind::RequestFailed,
-            format!(
-                "inference provider request failed at {endpoint}: {}",
-                summarize_reqwest_error(&error)
-            ),
-        )
-    })?;
+    let response = send_provider_request(&prepared.client, prepared.request).await?;
     let status = response.status();
     if !status.is_success() {
         let body = read_bounded_body(response, MAX_ERROR_BODY_BYTES).await;
@@ -1205,6 +1193,25 @@ async fn run_provider(prepared: PreparedInference) -> Result<InferenceResponse, 
         .await?;
     }
     Ok(response)
+}
+
+async fn send_provider_request(
+    client: &reqwest::Client,
+    request: ProviderHttpRequest,
+) -> Result<reqwest::Response, InferenceError> {
+    let endpoint = safe_endpoint(&request.url);
+    let mut outbound = reqwest::Request::new(request.method, request.url);
+    *outbound.headers_mut() = request.headers;
+    *outbound.body_mut() = Some(reqwest::Body::from(request.body));
+    client.execute(outbound).await.map_err(|error| {
+        InferenceError::new(
+            InferenceErrorKind::RequestFailed,
+            format!(
+                "inference provider request failed at {endpoint}: {}",
+                summarize_reqwest_error(&error)
+            ),
+        )
+    })
 }
 
 #[derive(Serialize)]
