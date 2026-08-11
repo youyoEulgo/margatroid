@@ -19,6 +19,7 @@ fn documented_public_api_creates_an_agent() {
         workspace_id: workspace,
         system_prompt: "You are concise.".into(),
         messages: Vec::new(),
+        tool_context: Vec::new(),
         default_visibility: BTreeSet::new(),
     });
     app.tick();

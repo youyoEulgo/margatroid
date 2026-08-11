@@ -246,32 +246,31 @@ WorkflowPlugin同样把每个可见Workflow生成为独立Tool。Workflow依赖S
 
 ```text
 history_messages
-    只追加所有已经提交的User和Assistant消息，不保存Tool响应
-    每行保存一个完整Message、交互轮次ID、时间和独立资源引用列
+    追加已经提交的User、Assistant和Tool消息
+    每行分列保存role、content、tool_calls、tool_call_id、交互轮次ID和时间
     上下文压缩不会删除或覆盖历史行
 
 realtime_messages
-    按位置保存当前AgentContext.messages的完整快照
-    每次动态消息变化后整体同步
+    使用conversation和tool两个context分区保存AgentContext.messages和tool_context
+    每次任一上下文变化后整体同步两个快照
     未来上下文压缩可以替换该表，但不影响history_messages
 ```
 
-Skill、Workflow等资源正文只在当次模型请求中临时解析，不混入历史消息JSON。实际使用的资源以
-类型和`ResourceName`写入历史行的`resources`列，从而可以展示资源使用情况而不复制正文。
+Skill正文只进入当前轮`tool_context`，不写入历史。Skill Tool的历史内容替换为
+`skill: <scope/name> loaded`；普通Tool响应原样写入历史。历史表不再设置独立的资源列。
 
 WorkspacePlugin负责确定数据库路径。`workspace up/reload`创建Agent前先由MemoryPlugin打开数据库
-并读取`realtime_messages`，再把恢复出的`Vec<Message>`直接放入Agent创建事件的上下文字段。
+并读取`realtime_messages`，再把恢复出的`messages`和`tool_context`直接放入Agent创建事件。
 无法读取已有数据库时启动失败，不能静默退化为空上下文。
 
-`AgentContext.messages`创建完成后只能通过`append_message`和`rewrite_messages`修改。两个方法修改完成后
-都发送携带完整消息快照的`margatroid_types::AgentContextMessagesUpdated`；MemoryPlugin逐个消费事件，并各自使用一次
+`AgentContext.messages`通过`append_message`和`rewrite_messages`修改，`tool_context`通过追加和清空入口修改。修改完成后
+都发送携带两个完整快照的`margatroid_types::AgentContextMessagesUpdated`；MemoryPlugin逐个消费事件，并各自使用一次
 SQLite事务整体重写`realtime_messages`。MemoryPlugin仍不决定压缩时机、摘要内容、记忆检索或
 上下文裁剪策略。
 
-AgentPlugin的消息处理System收到合法`AgentMessage`后，User和Assistant消息先调用MemoryPlugin向
-`history_messages`追加一行，提交成功后再调用`append_message`追加动态上下文；Tool消息跳过历史表，
-直接追加动态上下文。该判断只依据`Message`类型，不依据`MessageIntent`；`rewrite_messages`只影响
-实时表，不向历史表补写压缩结果。
+AgentPlugin的`AgentToolCallSystem`收到合法`AgentMessage`后，一律发送历史写入事件，不直接调用SQLite。
+User和Assistant追加到长期`messages`，Tool追加到当前轮`tool_context`。`tool_context`只在收到下一条
+User或Assistant时清空；`rewrite_messages`只影响实时表，不向历史表补写压缩结果。
 
 ## 8. CLI
 

@@ -99,11 +99,11 @@ collect_external_events_system(world: &mut World)
         将Server生命周期、WebSocket连接、断开和协议失败写入结构化日志
         收集StartWorkspaceResult、StopWorkspaceByReferenceResult、AgentMessage和AgentFailure
         调用Protocol的FromDomain实现解析Workspace和Agent逻辑身份
-        构造对应WorkspaceStarted、WorkspaceStopped、WorkspaceStopFailed、AgentMessage或AgentFailure协议事件
+        构造对应WorkspaceStarted、WorkspaceStartFailed、WorkspaceStopped、WorkspaceStopFailed、AgentMessage或AgentFailure协议事件
         记录Workspace启停、用户消息路由、Assistant响应和Agent失败等业务日志
         Workspace启停结果及AgentFailure选择logs目标，AgentMessage选择member_messages目标
         发送WebSocketMessageSend
-        调用()::into_dto(&World)构造BackendStateDto
+        调用()::into_dto(&World)构造包含Workspace、Agent动态可见性和历史的BackendStateDto
         状态内容或backend_state接收连接集合变化时才发送StateSync
         相同状态转换错误只记录一次，成功后清除错误缓存
         将StateSync发送给backend_state指定目标
@@ -112,7 +112,7 @@ report_server_events(world: &World)
     报告Server事件：私有函数，将Server启停、WebSocket连接、断开和协议失败投影为结构化日志
 
 report_workspace_events(world: &World, targets: &[WebSocketMessageTarget])
-    报告Workspace启动：私有函数，成功时转换并发送WorkspaceStarted，失败时写错误日志
+    报告Workspace启动：私有函数，成功时转换并发送WorkspaceStarted，失败时写错误日志并发送WorkspaceStartFailed
 
 report_workspace_stop_events(world: &World, targets: &[WebSocketMessageTarget])
     报告Workspace停止：私有函数，发送WorkspaceStopped或WorkspaceStopFailed并记录日志

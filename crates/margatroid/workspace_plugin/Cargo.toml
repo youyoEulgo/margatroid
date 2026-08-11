@@ -16,4 +16,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
+skill_plugin = { path = "../tool_definition_plugins/skill_plugin" }
 tempfile = "3"

@@ -13,8 +13,7 @@ use async_runtime_plugin::{
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use futures_util::FutureExt;
 use margatroid_types::{
-    AgentMessage, AgentResourcesUsed, Message, MessageIntent, ResourceName, ResourceRef, ToolCall,
-    ToolDefinition,
+    AgentMessage, Message, ResourceName, ResourceRef, ToolCall, ToolDefinition,
 };
 use serde::de::DeserializeOwned;
 
@@ -618,11 +617,6 @@ fn prepare_tool_call_system(world: &mut World) {
             continue;
         }
 
-        world.send_event(AgentResourcesUsed {
-            id: request.id.clone(),
-            agent: request.agent,
-            resources: vec![request.resource.clone()],
-        });
         world.send_async_event(ToolExecutionTask {
             id: request.id,
             agent: request.agent,
@@ -676,7 +670,6 @@ fn send_tool_message(
             tool_call_id,
             content,
         },
-        intent: MessageIntent::ResolveToolCall,
     });
 }
 
@@ -820,7 +813,6 @@ mod tests {
             {
                 assert_eq!(message.id, "request");
                 assert_eq!(message.agent, agent);
-                assert_eq!(message.intent, MessageIntent::ResolveToolCall);
                 assert_eq!(
                     message.message,
                     Message::Tool {

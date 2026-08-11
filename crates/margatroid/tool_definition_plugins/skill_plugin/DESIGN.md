@@ -81,9 +81,12 @@ AgentDynamicVisibility包含：
     ToolPlugin执行Skill Tool handler
         -> 忽略当前JSON object参数
         -> 返回SKILL.md正文作为Message::Tool
-        -> AgentPlugin把Tool消息加入实时上下文并继续推理
+        -> AgentPlugin把Tool消息加入实时tool_context并继续推理
+        -> AgentPlugin另外在历史事件中写入"skill: <scope/name> loaded"，不写入正文
 ```
 
 最高优先级同名目录存在但内容非法时直接失败，不向低优先级降级。SkillPlugin不读取Agent可见性；
 它只为ToolPlugin传入的单个ResourceRef提供定义和执行器。当前不解析frontmatter、不执行脚本、不读取
 Skill目录中的其他资源。
+
+Skill动态加载：AgentStatus只保存工具调用模板，每轮由AgentPlugin重新生成调用ID并调用ToolPlugin；SkillPlugin每次执行都按优先级重新读取SKILL.md，不缓存正文。

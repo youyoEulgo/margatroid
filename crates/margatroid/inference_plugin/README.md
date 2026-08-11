@@ -189,22 +189,16 @@ Entity。最终响应使用 `(agent, id)` 定位原 Agent 和原请求。
 前端已断开时，InferencePlugin 停止向对应连接转发，但不中断后端推理和最终响应累积。本轮开始后
 新增且符合相同 target 的连接从下一轮开始接收，以保持增量与最终消息的接收集合一致。
 
-流结束后，成功响应由 InferencePlugin 直接转换成共享 `AgentMessage`。来源根据完整
-Assistant 消息是否包含工具调用，分别赋予 `CompleteTurn` 或 `DispatchToolCalls`：
+流结束后，成功响应由 InferencePlugin 直接转换成共享 `AgentMessage::Assistant`。InferencePlugin
+不为响应附加意图，也不判断本轮是否结束；AgentPlugin 收到消息后根据 `tool_calls` 是否为空决定
+结束当前轮次或派发下一批工具调用：
 
 ```rust
 use core_plugin::World;
-use margatroid_types::{AgentMessage, Message, MessageIntent};
+use margatroid_types::{AgentMessage, Message};
 
 fn handle_inference_messages(world: &mut World) {
     for event in world.event_reader::<AgentMessage>() {
-        if !matches!(
-            event.intent,
-            MessageIntent::CompleteTurn | MessageIntent::DispatchToolCalls
-        ) {
-            continue;
-        }
-
         if let Message::Assistant { content, tool_calls } = &event.message {
             tracing::info!(
                 agent = ?event.agent,
@@ -221,8 +215,8 @@ app.add_system(RuntimePlugin::UPDATE, handle_inference_messages);
 ```
 
 无法表示成对话消息的推理失败通过 `AgentFailure { id, agent, kind, message }` 发布。AgentPlugin
-直接消费这两种共享事件：它校验来源已经赋予的意图，将合法 Assistant 消息写入对应实例上下文，
-或用可配对的失败结束当前推理状态；它不再按 InferencePlugin 的结果类型做二次路由。
+直接消费这两种共享事件：它将合法 Assistant 消息写入对应实例上下文，并根据消息结构继续工具
+调用或结束当前轮次；可配对的失败用于结束当前推理状态。InferencePlugin 不参与这些分支判断。
 
 ## 重载模型路由
 
@@ -291,9 +285,9 @@ Agent messages + AgentPlugin收集的ToolDefinition
 └→ 后端内部累积完整响应
 → ProviderResponseAccumulator::finish
 ├→ 尾行文本 -> WebSocketMessageSender -> 前端
-├→ 成功：AgentMessage { id, agent, Message::Assistant, intent }
+├→ 成功：AgentMessage { id, agent, Message::Assistant }
 └→ 失败：AgentFailure { id, agent, kind: Inference, message }
-→ 成功消息由AgentPlugin记入上下文并执行意图；失败契约暂不定义
+→ 成功消息由AgentPlugin记入上下文并根据tool_calls继续工具调用或结束；失败契约暂不定义
 ```
 
 ## 职责边界

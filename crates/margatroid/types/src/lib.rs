@@ -218,7 +218,6 @@ pub struct RouteAgentMessage {
     pub workspace: WorkspaceReference,
     pub agent: Option<String>,
     pub message: Message,
-    pub tool_calls: Vec<ToolCall>,
 }
 
 impl Event for RouteAgentMessage {}
@@ -244,6 +243,8 @@ pub enum Message {
     },
     User {
         content: String,
+        #[serde(default)]
+        tool_calls: Vec<ToolCall>,
     },
     Assistant {
         content: Option<String>,
@@ -256,20 +257,10 @@ pub enum Message {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MessageIntent {
-    UserWithToolCalls { tool_calls: Vec<ToolCall> },
-    UserWithoutToolCalls,
-    DispatchToolCalls,
-    ResolveToolCall,
-    CompleteTurn,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentMessage {
     pub id: String,
     pub agent: Entity,
     pub message: Message,
-    pub intent: MessageIntent,
 }
 
 impl Event for AgentMessage {}
@@ -294,20 +285,19 @@ impl Event for AgentFailure {}
 pub struct AgentContextMessagesUpdated {
     pub agent: Entity,
     pub messages: Vec<Message>,
+    pub tool_context: Vec<Message>,
 }
 
 impl Event for AgentContextMessagesUpdated {}
 
-pub type MessageResource = ResourceRef;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentResourcesUsed {
+pub struct AgentHistoryMessageWriteRequested {
     pub id: String,
     pub agent: Entity,
-    pub resources: Vec<MessageResource>,
+    pub message: Message,
 }
 
-impl Event for AgentResourcesUsed {}
+impl Event for AgentHistoryMessageWriteRequested {}
 
 fn validate_part(part: &str) -> Result<(), ResourceNameError> {
     if part.is_empty() || part == "." || part == ".." {
@@ -426,30 +416,6 @@ mod tests {
     }
 
     #[test]
-    fn user_message_intents_distinguish_preselected_tool_calls() {
-        let tool_call = ToolCall {
-            id: "call-1".into(),
-            name: "skill__local__review".into(),
-            arguments: "{}".into(),
-        };
-
-        assert_eq!(
-            MessageIntent::UserWithToolCalls {
-                tool_calls: vec![tool_call.clone()],
-            },
-            MessageIntent::UserWithToolCalls {
-                tool_calls: vec![tool_call],
-            }
-        );
-        assert_ne!(
-            MessageIntent::UserWithToolCalls {
-                tool_calls: Vec::new(),
-            },
-            MessageIntent::UserWithoutToolCalls
-        );
-    }
-
-    #[test]
     fn messages_round_trip_through_json() {
         let message = Message::Assistant {
             content: Some("Using the selected workflow.".into()),
@@ -472,6 +438,6 @@ mod tests {
 
         assert_event::<AgentMessage>();
         assert_event::<AgentContextMessagesUpdated>();
-        assert_event::<AgentResourcesUsed>();
+        assert_event::<AgentHistoryMessageWriteRequested>();
     }
 }

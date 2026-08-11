@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use agent_plugin::AgentIdentity;
+use agent_plugin::{AgentDynamicVisibility, AgentIdentity};
 use core_plugin::{Entity, World};
 use log_plugin::{TracingField, TracingRecord};
 use margatroid_types::{
@@ -89,6 +89,8 @@ pub enum ServerMessage {
         id: String,
         workspace: WorkspaceInfoDto,
     },
+    #[serde(rename = "workspace.start_failed")]
+    WorkspaceStartFailed { id: String, error: String },
     #[serde(rename = "workspace.stopped")]
     WorkspaceStopped {
         id: String,
@@ -161,6 +163,7 @@ impl IntoDomain<Message> for UserMessageDto {
     fn into_domain(self, (): ()) -> Result<Message, ProtocolError> {
         Ok(Message::User {
             content: self.content,
+            tool_calls: Vec::new(),
         })
     }
 }
@@ -196,18 +199,30 @@ impl IntoDomain<ToolCall> for ToolCallDto {
 pub enum MessageDto {
     User {
         content: String,
+        tool_calls: Vec<ToolCallDto>,
     },
     Assistant {
         content: Option<String>,
         tool_calls: Vec<ToolCallDto>,
+    },
+    Tool {
+        tool_call_id: String,
+        content: String,
     },
 }
 
 impl FromDomain<&Message> for MessageDto {
     fn from_domain(message: &Message, (): ()) -> Result<Self, ProtocolError> {
         match message {
-            Message::User { content } => Ok(Self::User {
+            Message::User {
+                content,
+                tool_calls,
+            } => Ok(Self::User {
                 content: content.clone(),
+                tool_calls: tool_calls
+                    .iter()
+                    .map(|call| call.into_dto(()))
+                    .collect::<Result<Vec<_>, _>>()?,
             }),
             Message::Assistant {
                 content,
@@ -219,9 +234,16 @@ impl FromDomain<&Message> for MessageDto {
                     .map(|call| call.into_dto(()))
                     .collect::<Result<Vec<_>, _>>()?,
             }),
-            Message::System { .. } | Message::Tool { .. } => Err(ProtocolError::new(
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => Ok(Self::Tool {
+                tool_call_id: tool_call_id.clone(),
+                content: content.clone(),
+            }),
+            Message::System { .. } => Err(ProtocolError::new(
                 ProtocolErrorKind::UnsupportedMessage,
-                "system and tool messages are not externally visible",
+                "system messages are not externally visible",
             )),
         }
     }
@@ -284,16 +306,19 @@ pub struct RouteAgentMessageDto {
 
 impl IntoDomain<RouteAgentMessage, String> for RouteAgentMessageDto {
     fn into_domain(self, id: String) -> Result<RouteAgentMessage, ProtocolError> {
+        let tool_calls = self
+            .tool_calls
+            .into_iter()
+            .map(|call| call.into_domain(()))
+            .collect::<Result<_, _>>()?;
         Ok(RouteAgentMessage {
             id,
             workspace: self.workspace.into_domain(())?,
             agent: self.agent,
-            message: self.message.into_domain(())?,
-            tool_calls: self
-                .tool_calls
-                .into_iter()
-                .map(|call| call.into_domain(()))
-                .collect::<Result<_, _>>()?,
+            message: Message::User {
+                content: self.message.content,
+                tool_calls,
+            },
         })
     }
 }
@@ -443,7 +468,16 @@ impl WorkspaceInfoDto {
 pub struct BackendStateDto {
     pub workspaces: Vec<WorkspaceInfoDto>,
     #[serde(default)]
+    pub agents: Vec<AgentStateDto>,
+    #[serde(default)]
     pub histories: Vec<AgentHistoryDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStateDto {
+    pub workspace: WorkspaceReferenceDto,
+    pub agent: String,
+    pub visible_resources: Vec<ResourceRefDto>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,8 +492,6 @@ pub struct HistoryMessageDto {
     pub sequence: i64,
     pub turn_id: String,
     pub message: MessageDto,
-    #[serde(default)]
-    pub resources: Vec<ResourceRefDto>,
     pub created_at_ms: i64,
 }
 
@@ -486,11 +518,6 @@ impl FromDomain<HistoryMessage> for HistoryMessageDto {
             sequence: message.sequence,
             turn_id: message.turn_id,
             message: (&message.message).into_dto(())?,
-            resources: message
-                .resources
-                .iter()
-                .map(|resource| resource.into_dto(()))
-                .collect::<Result<Vec<_>, _>>()?,
             created_at_ms: message.created_at_ms,
         })
     }
@@ -539,6 +566,32 @@ impl FromDomain<Entity, &World> for WorkspaceInfoDto {
     }
 }
 
+impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
+    fn from_domain(
+        (agent, name, workspace): (Entity, &str, &WorkspaceInfoDto),
+        world: &World,
+    ) -> Result<Self, ProtocolError> {
+        let visibility = world
+            .get_component::<AgentDynamicVisibility>(agent)
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorKind::AgentNotFound,
+                    "Agent dynamic visibility is missing",
+                )
+            })?;
+        let visible_resources = visibility
+            .resources()
+            .iter()
+            .map(|resource| resource.into_dto(()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            workspace: workspace.reference(),
+            agent: name.to_owned(),
+            visible_resources,
+        })
+    }
+}
+
 impl FromDomain<(), &World> for BackendStateDto {
     fn from_domain((): (), world: &World) -> Result<Self, ProtocolError> {
         let mut workspaces = world
@@ -554,6 +607,7 @@ impl FromDomain<(), &World> for BackendStateDto {
         });
 
         let mut workspace_infos = Vec::with_capacity(workspaces.len());
+        let mut agent_states = Vec::new();
         let mut histories = Vec::new();
         for (workspace, info) in workspaces {
             let agents = world
@@ -565,6 +619,7 @@ impl FromDomain<(), &World> for BackendStateDto {
                     )
                 })?;
             for (name, agent) in agents.iter() {
+                agent_states.push(AgentStateDto::from_domain((agent, name, &info), world)?);
                 let memory = world.get_component::<AgentMemory>(agent).ok_or_else(|| {
                     ProtocolError::new(ProtocolErrorKind::MemoryNotFound, "Agent memory is missing")
                 })?;
@@ -589,6 +644,7 @@ impl FromDomain<(), &World> for BackendStateDto {
         }
         Ok(Self {
             workspaces: workspace_infos,
+            agents: agent_states,
             histories,
         })
     }
@@ -804,7 +860,12 @@ impl std::error::Error for ProtocolError {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::Path;
+
+    use agent_plugin::{AgentCreateRequest, AgentCreated, AgentPlugin};
+    use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
+    use core_plugin::App;
 
     use super::*;
 
@@ -933,9 +994,12 @@ mod tests {
         };
         let routed = message.into_domain(id).unwrap();
 
-        assert_eq!(routed.tool_calls.len(), 1);
-        assert_eq!(routed.tool_calls[0].id, "call-1");
-        assert_eq!(routed.tool_calls[0].name, "skill_local_context");
+        let Message::User { tool_calls, .. } = routed.message else {
+            panic!("route did not contain a user message");
+        };
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call-1");
+        assert_eq!(tool_calls[0].name, "skill_local_context");
     }
 
     #[test]
@@ -954,21 +1018,20 @@ mod tests {
 
     #[test]
     fn internal_messages_are_not_externally_visible() {
-        for message in [
-            Message::System {
-                content: "system".into(),
-            },
-            Message::Tool {
-                tool_call_id: "call-1".into(),
-                content: "result".into(),
-            },
-        ] {
-            let result: Result<MessageDto, _> = (&message).into_dto(());
-            assert_eq!(
-                result.unwrap_err().kind(),
-                ProtocolErrorKind::UnsupportedMessage
-            );
-        }
+        let result: Result<MessageDto, _> = (&Message::System {
+            content: "system".into(),
+        })
+            .into_dto(());
+        assert_eq!(
+            result.unwrap_err().kind(),
+            ProtocolErrorKind::UnsupportedMessage
+        );
+
+        let tool = Message::Tool {
+            tool_call_id: "call-1".into(),
+            content: "result".into(),
+        };
+        assert!(matches!((&tool).into_dto(()), Ok(MessageDto::Tool { .. })));
     }
 
     #[test]
@@ -985,10 +1048,34 @@ mod tests {
     }
 
     #[test]
+    fn workspace_start_failure_uses_a_terminal_server_shape() {
+        let event = ServerMessage::WorkspaceStartFailed {
+            id: "request-1".into(),
+            error: "ResourceSetupFailed: skill file was not found".into(),
+        };
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["type"], "workspace.start_failed");
+        assert_eq!(value["id"], "request-1");
+        assert_eq!(
+            value["error"],
+            "ResourceSetupFailed: skill file was not found"
+        );
+    }
+
+    #[test]
     fn state_sync_contains_the_complete_workspace_snapshot() {
         let event = ServerMessage::StateSync {
             state: BackendStateDto {
                 workspaces: vec![(&definition()).into_dto(()).unwrap()],
+                agents: vec![AgentStateDto {
+                    workspace: WorkspaceReferenceDto::new("demo", "/tmp/demo"),
+                    agent: "coder".into(),
+                    visible_resources: vec![ResourceRefDto {
+                        provider: "skill".into(),
+                        name: "local/review".into(),
+                    }],
+                }],
                 histories: vec![AgentHistoryDto {
                     workspace: WorkspaceReferenceDto::new("demo", "/tmp/demo"),
                     agent: "coder".into(),
@@ -997,11 +1084,8 @@ mod tests {
                         turn_id: "turn-1".into(),
                         message: MessageDto::User {
                             content: "hello".into(),
+                            tool_calls: Vec::new(),
                         },
-                        resources: vec![ResourceRefDto {
-                            provider: "skill".into(),
-                            name: "local/context".into(),
-                        }],
                         created_at_ms: 42,
                     }],
                 }],
@@ -1012,15 +1096,52 @@ mod tests {
         assert_eq!(value["type"], "state.sync");
         assert_eq!(value["state"]["workspaces"][0]["name"], "demo");
         assert_eq!(value["state"]["workspaces"][0]["manager"], "coder");
+        assert_eq!(value["state"]["agents"][0]["agent"], "coder");
+        assert_eq!(
+            value["state"]["agents"][0]["visible_resources"][0]["provider"],
+            "skill"
+        );
         assert_eq!(value["state"]["histories"][0]["agent"], "coder");
         assert_eq!(
             value["state"]["histories"][0]["messages"][0]["turn_id"],
             "turn-1"
         );
-        assert_eq!(
-            value["state"]["histories"][0]["messages"][0]["resources"][0]["provider"],
-            "skill"
-        );
+    }
+
+    #[test]
+    fn agent_state_projects_dynamic_visibility() {
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default())
+            .add_plugin(AgentPlugin::default());
+        let workspace = app.world_mut().spawn();
+        let skill = ResourceRef::new("skill", ResourceName::new("local/review").unwrap()).unwrap();
+        app.world().send_event(AgentCreateRequest {
+            id: "create-1".into(),
+            agent_id: "demo.coder0".into(),
+            workspace_id: workspace,
+            system_prompt: "system".into(),
+            messages: Vec::new(),
+            tool_context: Vec::new(),
+            default_visibility: BTreeSet::from([skill]),
+        });
+        app.tick();
+        app.tick();
+        let agent = app
+            .world()
+            .event_reader::<AgentCreated>()
+            .into_iter()
+            .find(|event| event.id == "create-1")
+            .unwrap()
+            .agent;
+        let workspace = (&definition()).into_dto(()).unwrap();
+
+        let state = AgentStateDto::from_domain((agent, "coder", &workspace), app.world()).unwrap();
+
+        assert_eq!(state.workspace.name, "demo");
+        assert_eq!(state.agent, "coder");
+        assert_eq!(state.visible_resources.len(), 1);
+        assert_eq!(state.visible_resources[0].provider, "skill");
+        assert_eq!(state.visible_resources[0].name, "local/review");
     }
 
     #[test]

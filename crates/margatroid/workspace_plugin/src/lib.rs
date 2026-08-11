@@ -7,16 +7,19 @@ use agent_image_loader_plugin::{
     AgentImageDefaultVisibility, AgentImageIdentity, AgentImageLoaderPluginInstalled,
     AgentImageModelConfig, AgentImageSoul, LoadAgentImage, LoadAgentImageResult,
 };
-use agent_plugin::{AgentCreateRequest, AgentCreated, AgentPluginInstalled, AgentWorkspaceId};
+use agent_plugin::{
+    AgentCreateRequest, AgentCreated, AgentDynamicVisibility, AgentPluginInstalled,
+    AgentWorkspaceId,
+};
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::{AgentInferenceSnapshot, GlobalModelRoutes, WorldInferenceExt};
 use margatroid_types::{
-    AgentMessage, Message, MessageIntent, ResourceRef, RouteAgentMessage, WorkspaceAgentDefinition,
+    AgentMessage, Message, ResourceRef, RouteAgentMessage, WorkspaceAgentDefinition,
     WorkspaceDefinition,
 };
-use memory_plugin::{AgentMemory, MemoryPluginInstalled, WorldMemoryExt};
-use tool_plugin::{AgentToolEnvironment, ToolPluginInstalled};
+use memory_plugin::{AgentMemory, MemoryPluginInstalled, RealtimeContext, WorldMemoryExt};
+use tool_plugin::{AgentToolEnvironment, ToolPluginInstalled, WorldToolExt};
 
 pub use margatroid_types::StartWorkspace;
 
@@ -175,18 +178,10 @@ fn route_agent_message_system(world: &mut World) {
             tracing::warn!(id = %request.id, "route agent message only accepts User messages");
             continue;
         }
-        let intent = if request.tool_calls.is_empty() {
-            MessageIntent::UserWithoutToolCalls
-        } else {
-            MessageIntent::UserWithToolCalls {
-                tool_calls: request.tool_calls,
-            }
-        };
         world.send_event(AgentMessage {
             id: request.id,
             agent,
             message: request.message,
-            intent,
         });
     }
 }
@@ -421,6 +416,7 @@ struct PreparedWorkspaceAgent {
     agent_id: String,
     system_prompt: String,
     messages: Vec<Message>,
+    tool_context: Vec<Message>,
     default_visibility: BTreeSet<ResourceRef>,
     inference_snapshot: AgentInferenceSnapshot,
     tool_environment: AgentToolEnvironment,
@@ -798,7 +794,7 @@ fn prepare_workspace_agents(world: &mut World, request_id: &str) -> Result<(), W
                 &agent_definition.name,
             )
         });
-        let (memory, messages) = AgentMemory::open(memory_path).map_err(|error| {
+        let (memory, context) = AgentMemory::open(memory_path).map_err(|error| {
             WorkspaceError::new(
                 WorkspaceErrorKind::MemorySetupFailed,
                 format!("agent memory could not be opened: {:?}", error.kind()),
@@ -810,7 +806,8 @@ fn prepare_workspace_agents(world: &mut World, request_id: &str) -> Result<(), W
                 name: agent_definition.name.clone(),
                 agent_id: format!("{}.{}{}", definition.name, agent_definition.name, index),
                 system_prompt,
-                messages,
+                messages: context.messages,
+                tool_context: context.tool_context,
                 default_visibility,
                 inference_snapshot,
                 tool_environment,
@@ -836,6 +833,7 @@ fn prepare_workspace_agents(world: &mut World, request_id: &str) -> Result<(), W
                     workspace_id: workspace,
                     system_prompt: prepared.system_prompt.clone(),
                     messages: prepared.messages.clone(),
+                    tool_context: prepared.tool_context.clone(),
                     default_visibility: prepared.default_visibility.clone(),
                 },
             )
@@ -944,7 +942,14 @@ fn attach_prepared_agent(
         ));
     }
     world
-        .bind_agent_memory(agent, prepared.memory, &prepared.messages)
+        .bind_agent_memory(
+            agent,
+            prepared.memory,
+            &RealtimeContext {
+                messages: prepared.messages,
+                tool_context: prepared.tool_context,
+            },
+        )
         .map_err(|error| {
             WorkspaceError::new(
                 WorkspaceErrorKind::MemorySetupFailed,
@@ -959,6 +964,7 @@ fn attach_prepared_agent(
             "created Agent could not receive its runtime components",
         ));
     }
+    validate_agent_visibility(world, agent)?;
     world
         .get_resource_mut::<WorkspaceRegistry>()
         .expect("WorkspacePlugin is not installed")
@@ -967,6 +973,41 @@ fn attach_prepared_agent(
         .expect("pending workspace operation disappeared")
         .agents
         .insert(name.to_owned(), agent);
+    Ok(())
+}
+
+fn validate_agent_visibility(world: &World, agent: Entity) -> Result<(), WorkspaceError> {
+    let visibility = world
+        .get_component::<AgentDynamicVisibility>(agent)
+        .ok_or_else(|| {
+            WorkspaceError::new(
+                WorkspaceErrorKind::ResourceSetupFailed,
+                "created Agent dynamic visibility is missing",
+            )
+        })?;
+    let mut exposed_names = BTreeSet::new();
+    for resource in visibility.resources() {
+        let tool = world.resolve_tool(agent, resource).map_err(|error| {
+            WorkspaceError::new(
+                WorkspaceErrorKind::ResourceSetupFailed,
+                format!(
+                    "visible resource {}:{} could not be resolved: {}",
+                    resource.provider(),
+                    resource.name(),
+                    error
+                ),
+            )
+        })?;
+        if !exposed_names.insert(tool.definition().name.clone()) {
+            return Err(WorkspaceError::new(
+                WorkspaceErrorKind::ResourceSetupFailed,
+                format!(
+                    "visible resources expose duplicate tool name {}",
+                    tool.definition().name
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 

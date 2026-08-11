@@ -13,7 +13,8 @@ agent.message        -> RouteAgentMessage
 ```
 
 它还收集允许发送给外部的 `StartWorkspaceResult`、`StopWorkspaceByReferenceResult`、`AgentMessage` 和 `AgentFailure`，调用 Protocol
-定义的 DTO 转换，构造 `ServerMessage` 并包装为 `WebSocketMessageSend`。DtoPlugin 会从 Workspace、
+定义的 DTO 转换，构造 `ServerMessage` 并包装为 `WebSocketMessageSend`。Workspace启动失败会同时
+写错误日志并发送可按请求ID配对的`workspace.start_failed`终止回执。DtoPlugin 会从 Workspace、
 Agent 和 Memory 构造完整 `state.sync`，但仅在状态内容或目标前端连接集合变化时发送，默认只发给类型为
 `webui` 的连接。目标将改为统一读取主目录 `config.toml` 的 `backend_state` 字段。缓存避免出站事件持续唤醒 event-driven Runtime。
 

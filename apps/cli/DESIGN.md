@@ -27,7 +27,10 @@ run(command: Command) -> Result<(), Box<dyn Error + Send + Sync>>
 
 run_workspace_up(workspace_file: PathBuf, backend_url: String) -> Result<(), Box<dyn Error + Send + Sync>>
     启动Workspace：私有异步函数，编译文件、连接WebSocket、注册cli连接、发送启动请求、处理关闭信号并打印日志事件
-    行为：不读取stdin，不构造或发送LLM消息；只有ServerMessage::Log写入stdout
+    行为：不读取stdin，不构造或发送LLM消息；ServerMessage::Log写入stdout；匹配启动请求ID的WorkspaceStartFailed立即返回错误
+
+workspace_start_error(text: &str, request_id: &str) -> Option<String>
+    解析启动失败：私有函数，只把匹配当前workspace.start请求ID的WorkspaceStartFailed转换为错误文本
 
 print_backend_message(text: &str)
     打印日志：私有函数，反序列化ServerMessage并使用RFC 3339时间、等级、target、事件和结构化字段格式化LogRecordDto；未知事件直接忽略
@@ -83,6 +86,7 @@ run_workspace_up
        -> 收到回执后关闭WebSocket并正常退出
        -> 再次信号、超时、停止失败或后端提前断开：关闭并报错退出
        -> Text：解析ServerMessage::Log并打印
+       -> Text或UTF-8 Binary中的同ID workspace.start_failed：立即报错并以非零状态退出
        -> UTF-8 Binary：按文本解析ServerMessage::Log
        -> 非UTF-8 Binary：打印长度提示stderr
        -> Ping：发送Pong
@@ -94,7 +98,7 @@ run_workspace_up
     CLI不启动daemon、不创建ECS、不读取AgentImage或资源正文
     CLI不读取stdin，不处理UserMessage、AssistantMessage、ToolCall或LLM流
     WebSocket传输只承载margatroid_protocol定义的请求和后端事件
-    CLI进程退出前必须先完成workspace.stop业务回执；WebSocket关闭不是停止Workspace的替代品
+    正常运行期间收到关闭信号时，CLI退出前必须先完成workspace.stop业务回执；启动失败已由后端清理Workspace，直接报错退出，不发送workspace.stop
 ~~~
 
 ## 持有关系
