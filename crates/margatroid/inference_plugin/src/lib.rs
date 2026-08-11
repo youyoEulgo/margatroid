@@ -14,7 +14,7 @@ use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use futures_util::{FutureExt, StreamExt};
 use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentMessage, Message, MessageIntent, ToolCall, ToolDefinition,
+    AgentFailure, AgentFailureKind, AgentMessage, Message, ToolCall, ToolDefinition,
 };
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Method, StatusCode, Url};
@@ -1037,7 +1037,7 @@ fn validate_messages(messages: &[Message]) -> Result<(), InferenceError> {
     let mut total_bytes = 0usize;
     for message in messages {
         let size = match message {
-            Message::System { content } | Message::User { content } => content.len(),
+            Message::System { content } | Message::User { content, .. } => content.len(),
             Message::Assistant {
                 content,
                 tool_calls,
@@ -1340,10 +1340,8 @@ fn publish_inference_output_system(world: &mut World) {
         match output {
             Ok(output) => match &output.result {
                 Ok(response) => {
-                    let intent = match &response.message {
-                        Message::Assistant { tool_calls, .. } if tool_calls.is_empty() => {
-                            MessageIntent::CompleteTurn
-                        }
+                    match &response.message {
+                        Message::Assistant { tool_calls, .. } if tool_calls.is_empty() => (),
                         Message::Assistant { tool_calls, .. } => {
                             if tool_calls
                                 .iter()
@@ -1361,7 +1359,7 @@ fn publish_inference_output_system(world: &mut World) {
                                 });
                                 continue;
                             }
-                            MessageIntent::DispatchToolCalls
+                            ()
                         }
                         _ => {
                             events.send_event(AgentFailure {
@@ -1376,12 +1374,11 @@ fn publish_inference_output_system(world: &mut World) {
                             });
                             continue;
                         }
-                    };
+                    }
                     events.send_event(AgentMessage {
                         id: output.route.id.clone(),
                         agent: output.route.agent,
                         message: response.message.clone(),
-                        intent,
                     });
                 }
                 Err(error) => events.send_event(AgentFailure {
@@ -1530,7 +1527,7 @@ impl OpenAiRequest {
 fn openai_message(message: &Message) -> serde_json::Value {
     match message {
         Message::System { content } => serde_json::json!({"role":"system", "content":content}),
-        Message::User { content } => serde_json::json!({"role":"user", "content":content}),
+        Message::User { content, .. } => serde_json::json!({"role":"user", "content":content}),
         Message::Assistant {
             content,
             tool_calls,
@@ -1925,6 +1922,7 @@ api_type = "openai"
             agent_id: "test.agent0".into(),
             messages: vec![Message::User {
                 content: "hello".into(),
+                tool_calls: Vec::new(),
             }],
             tools: Vec::new(),
         });

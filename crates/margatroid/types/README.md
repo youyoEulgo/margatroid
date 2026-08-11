@@ -23,21 +23,20 @@ assert_eq!(image.to_string(), "local/coder:latest");
 Compose使用 `WorkspaceDefinition` 和 `WorkspaceAgentDefinition` 把配置文件编译成进程内静态业务
 输入。它们不包含运行时Entity，也不负责加载镜像、打开Memory或创建AgentInstance。
 
-消息层定义 `ToolCall`、`ToolDefinition`、`Message`、`AgentMessage`、`AgentContextMessagesUpdated` 和 `AgentFailure`。产生消息的
-Plugin直接赋予 `MessageIntent`，AgentPlugin记入消息并执行意图，不再把各Plugin结果事件二次转换为
-消息。`AgentMessage` 和 `AgentContextMessagesUpdated` 是进程内部ECS事件，不是CLI/daemon协议。
+消息层定义 `ToolCall`、`ToolDefinition`、`Message`、`AgentMessage`、`AgentContextMessagesUpdated`、
+`AgentHistoryMessageWriteRequested` 和 `AgentFailure`。AgentPlugin直接根据`Message`变体与
+`tool_calls`列表决定后续分支。这些是进程内部ECS事件，不是CLI/daemon协议。
 `AgentMessage.agent` 始终使用后端内部 `Entity`。WorkspacePlugin 在产生用户消息事件前完成逻辑名称解析，协议 DTO 使用稳定 Agent ID，不暴露 ECS 内部句柄。
 
-用户消息的两种意图只区分前端是否指定了实际工具调用。指定Skill、Workflow或其他工具时，
-AgentPlugin先进入ToolCall流程，等Tool响应写入上下文后再推理；没有指定时直接推理。两种路径最终
-发送的推理请求都按当前动态可见性构造工具定义，意图不用于开关模型可用工具。
+`Message::User.tool_calls`直接保存前端预选调用。列表非空时AgentPlugin先执行工具，
+所有Tool响应进入当前轮上下文后再推理；列表为空时直接推理。
 
 AgentPlugin使用`BTreeSet<ResourceRef>`保存Agent可见性。`ResourceRef.provider`只负责路由工具定义
 Plugin，普通工具、Skill和Workflow不再建立不同通道。每次请求由AgentPlugin遍历该集合，并把单个
 `ResourceRef`交给ToolPlugin构造工具。
 
-资源来源可以用 `MessageResource` 与 `AgentResourcesUsed` 报告一次Agent轮次实际使用的资源。
-事件只携带统一`ResourceRef`，不携带Skill、Workflow或其他资源正文。
+历史写入统一使用`AgentHistoryMessageWriteRequested`。Skill正文不进入历史事件，只写入
+`skill: <scope/name> loaded`标记。
 
 无法表示成消息的轮次失败使用 `AgentFailure`。`kind=Agent` 表示 AgentPlugin 在处理消息或准备可见工具
 时失败，`kind=Inference` 表示 InferencePlugin 在准备或执行模型请求时失败。

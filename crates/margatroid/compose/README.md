@@ -126,6 +126,10 @@ Provider 包括 `tool`、`skill` 和 `workflow`，但编译器允许后续注册
 镜像默认资源 + resources - disable_resources
 ```
 
+编译器只验证资源引用语法，不访问AgentImage、项目目录或主目录。daemon在启动Workspace时使用最终
+可见资源和Agent的实际项目根、镜像根逐项解析；Provider未注册、Skill或Workflow文件不存在、定义
+非法或多个资源暴露同名工具时，`workspace up`失败，Workspace不会进入已就绪状态。
+
 ### Memory 路径
 
 `memory_path` 是该 Agent 的 SQLite 文件覆盖路径。相对路径以 `project_root` 为基准，绝对路径

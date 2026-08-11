@@ -53,7 +53,7 @@ fn registered_client_receives_messages_targeted_by_type() {
                 .event_reader::<RouteAgentMessage>()
                 .into_iter()
                 .filter_map(|request| match &request.message {
-                    Message::User { content } => Some(content.clone()),
+                    Message::User { content, .. } => Some(content.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>();

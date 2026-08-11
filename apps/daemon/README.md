@@ -61,8 +61,8 @@ agent.message--向已启动Workspace中的一个Agent发送用户消息
 AgentPlugin 在消息处理或可见工具准备失败时发送 `agent.failure(kind=Agent)`；InferencePlugin 的请求
 失败使用 `kind=Inference`。两者都会进入前端 Activity，不会伪造成对话历史。
 
-所有出站消息的 target 都来自 `config.toml`。`state.sync` 是后端当前已就绪 Workspace 和各 Agent 可展示历史的
-完整快照，每次 Runtime tick 都会生成。历史直接来自各 Agent SQLite 的 `history_messages`；
+所有出站消息的 target 都来自 `config.toml`。`state.sync` 是后端当前已就绪 Workspace、各 Agent
+动态可见资源和可展示历史的完整快照，每次 Runtime tick 都会生成。历史直接来自各 Agent SQLite 的 `history_messages`；
 `realtime_messages` 只用于恢复模型上下文，不发送给客户端。Web UI 必须以 `state.sync` 为业务状态的
 唯一权威来源，不自行持久化、乐观追加或从实时事件拼接对话。
 当前 CLI 仍只提交 Workspace 并打印日志，不负责 Agent 消息输入输出。

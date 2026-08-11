@@ -208,7 +208,6 @@ prepare_tool_call_system(world: &mut World)
         验证请求字段和参数长度
         只调用resolve_tool(agent, &request.resource)，不读取可见性组件
         验证Tool.definition.name等于ToolCall.name
-        发送AgentResourcesUsed { id, agent, resources: [request.resource] }
         把handler和参数包装为ToolExecutionTask交给AsyncRuntime
         准备失败时直接发送错误内容的Tool AgentMessage
 
@@ -221,10 +220,9 @@ publish_tool_call_system(world: &mut World)
     发布结果：把ToolExecutionOutput转换为AgentMessage
         成功时Message::Tool.content使用完整工具输出
         失败时content使用有界ToolError文本
-        intent固定为ResolveToolCall
 
 send_tool_message(world: &World, id: String, agent: Entity, tool_call_id: String, content: String)
-    发送工具消息：私有函数，构造Message::Tool与ResolveToolCall意图的AgentMessage
+    发送工具消息：私有函数，构造Message::Tool的AgentMessage
 
 validate_tool(resource: &ResourceRef, definition: &ToolDefinition) -> Result<(), ToolError>
     验证工具：私有函数，校验模型名称、描述、JSON object Schema和资源身份
@@ -253,9 +251,8 @@ is_valid_provider_id(id: &str) -> bool
     AgentPlugin发送ToolCallRequest { id, agent, resource, call }
         -> ToolPlugin只解析request.resource并执行对应Tool
         -> ToolPlugin不重新从ToolCall.name猜测ResourceRef
-        -> 实际解析成功后发送AgentResourcesUsed
         -> 成功或失败都构造Message::Tool
-        -> 发送margatroid_types::AgentMessage { id, agent, message, intent: ResolveToolCall }
+        -> 发送margatroid_types::AgentMessage { id, agent, message }
 
 边界：
     AgentPlugin拥有并遍历AgentDynamicVisibility.resources

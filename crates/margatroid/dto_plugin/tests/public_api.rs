@@ -38,7 +38,9 @@ fn documented_public_api_publishes_state_for_the_configured_frontend_type() {
             && matches!(
                 &message.message,
                 ServerMessage::StateSync { state }
-                    if state.workspaces.is_empty() && state.histories.is_empty()
+                    if state.workspaces.is_empty()
+                        && state.agents.is_empty()
+                        && state.histories.is_empty()
             )
     }));
 

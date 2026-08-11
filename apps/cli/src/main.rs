@@ -111,9 +111,19 @@ async fn run_workspace_up(
             message = socket.next() => {
                 let Some(message) = message else { return Ok(()); };
                 match message? {
-                    Message::Text(text) => print_backend_message(&text),
+                    Message::Text(text) => {
+                        print_backend_message(&text);
+                        if let Some(error) = workspace_start_error(&text, &start_request_id) {
+                            return Err(error.into());
+                        }
+                    },
                     Message::Binary(bytes) => match String::from_utf8(bytes.to_vec()) {
-                        Ok(text) => print_backend_message(&text),
+                        Ok(text) => {
+                            print_backend_message(&text);
+                            if let Some(error) = workspace_start_error(&text, &start_request_id) {
+                                return Err(error.into());
+                            }
+                        },
                         Err(_) => print_cli_event("WARN", &format!("non-UTF-8 backend message ignored (bytes={})", bytes.len())),
                     },
                     Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
@@ -130,6 +140,15 @@ async fn run_workspace_up(
                 }
             }
         }
+    }
+}
+
+fn workspace_start_error(text: &str, request_id: &str) -> Option<String> {
+    match serde_json::from_str::<ServerMessage>(text) {
+        Ok(ServerMessage::WorkspaceStartFailed { id, error }) if id == request_id => {
+            Some(format!("workspace start failed: {error}"))
+        }
+        _ => None,
     }
 }
 
@@ -404,5 +423,20 @@ mod tests {
     fn redirected_log_line_has_no_ansi_codes() {
         let line = format_log_line(0, "INFO", "margatroid_cli", "started", "", false);
         assert_eq!(line, "1970-01-01T00:00:00Z INFO  margatroid_cli: started");
+    }
+
+    #[test]
+    fn matching_workspace_start_failure_is_terminal() {
+        let message = serde_json::to_string(&ServerMessage::WorkspaceStartFailed {
+            id: "start-1".into(),
+            error: "ResourceSetupFailed: skill file was not found".into(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            workspace_start_error(&message, "start-1").as_deref(),
+            Some("workspace start failed: ResourceSetupFailed: skill file was not found")
+        );
+        assert_eq!(workspace_start_error(&message, "other-start"), None);
     }
 }

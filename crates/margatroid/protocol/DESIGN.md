@@ -69,7 +69,7 @@ ClientMessage：客户端WebSocket请求，公开枚举--统一使用type、id�
     agent_message(id: impl Into<String>, workspace: &WorkspaceReferenceDto, agent: Option<String>, content: impl Into<String>) -> Self
         构造Agent请求：构造包含空tool_calls的RouteAgentMessageDto
     agent_message_with_tool_calls(id: impl Into<String>, workspace: &WorkspaceReferenceDto, agent: Option<String>, content: impl Into<String>, tool_calls: Vec<ToolCallDto>) -> Self
-        构造带工具Agent请求：保留前端指定的工具调用，由WorkspacePlugin赋予UserWithToolCalls意图
+        构造带工具Agent请求：保留前端指定的工具调用，转换时写入Message::User.tool_calls
 
 RegisterConnectionDto：连接注册DTO，公开结构体--保存客户端声明的连接类型
     client_type: String--客户端类型，例如webui或cli
@@ -85,9 +85,9 @@ RouteAgentMessageDto：逻辑Agent消息DTO，公开结构体--保存尚未解�
     workspace: WorkspaceReferenceDto--目标Workspace逻辑引用
     agent: Option<String>--Agent逻辑名称，None表示manager
     message: UserMessageDto--用户消息内容，协议结构无法表达System、Assistant或Tool输入
-    tool_calls: Vec<ToolCallDto>--可选预选工具调用，JSON缺省时为空
+    tool_calls: Vec<ToolCallDto>--可选预选工具调用，转换后成为Message::User.tool_calls
     impl IntoDomain<RouteAgentMessage, String> for RouteAgentMessageDto
-        转换消息命令：使用请求ID，将WorkspaceReferenceDto和ToolCallDto转换为领域值并保留Message
+        转换消息命令：使用请求ID，将WorkspaceReferenceDto和ToolCallDto转换为领域值，构造Message::User { content, tool_calls }
 
 WorkspaceDefinitionDto：Workspace定义DTO，公开结构体--保存不含Entity的可序列化定义
     name: String--Workspace名称
@@ -120,6 +120,8 @@ ServerMessage：daemon发给客户端的协议事件，公开枚举--统一使�
     Log { record: LogRecordDto }
     StateSync { state: BackendStateDto }
     WorkspaceStarted { id: String, workspace: WorkspaceInfoDto }
+    WorkspaceStartFailed { id: String, error: String }
+        workspace.start_failed：Workspace启动失败，作为workspace.start的终止回执
     WorkspaceStopped { id: String, workspace: WorkspaceReferenceDto }
         workspace.stopped：Workspace已停止，可作为客户端关闭连接的业务回执
     WorkspaceStopFailed { id: String, error: String }
@@ -142,7 +144,7 @@ ServerMessage：daemon发给客户端的协议事件，公开枚举--统一使�
 UserMessageDto：用户输入DTO，公开结构体--只允许客户端提交用户文本
     content: String--用户消息正文
     impl IntoDomain<Message> for UserMessageDto
-        转换用户消息：构造Message::User，不允许客户端选择其他领域Message变体
+        转换用户消息：构造tool_calls为空的Message::User，不允许客户端选择其他领域Message变体
 
 ToolCallDto：工具调用展示DTO，公开结构体--隔离领域ToolCall的协议表示
     id: String--工具调用ID
@@ -154,10 +156,11 @@ ToolCallDto：工具调用展示DTO，公开结构体--隔离领域ToolCall的�
         转换领域调用：转移ID、名称和参数文本，具体合法性由AgentPlugin与ToolPlugin在业务边界验证
 
 MessageDto：可展示消息DTO，公开枚举--只包含历史表和前端允许展示的消息类型
-    User { content: String }
+    User { content: String, tool_calls: Vec<ToolCallDto> }
     Assistant { content: Option<String>, tool_calls: Vec<ToolCallDto> }
+    Tool { tool_call_id: String, content: String }
     impl FromDomain<&Message> for MessageDto
-        转换可展示消息：User和Assistant成功；System和Tool返回UnsupportedMessage
+        转换可展示消息：User、Assistant和Tool成功；System返回UnsupportedMessage
 
 AgentMessageDto：Agent消息展示DTO，公开结构体--把领域Agent Entity投影为稳定逻辑ID
     id: String--消息或turn ID
@@ -188,9 +191,17 @@ LogRecordDto：结构化日志DTO，公开结构体--保存客户端展示所需
 
 BackendStateDto：后端状态快照DTO，公开结构体--保存前端权威状态
     workspaces: Vec<WorkspaceInfoDto>--当前已就绪Workspace
+    agents: Vec<AgentStateDto>--当前Agent运行状态与动态可见资源
     histories: Vec<AgentHistoryDto>--可展示历史
     impl FromDomain<(), &World> for BackendStateDto
-        转换完整状态：查询全部Workspace、Agent和Memory历史并构造快照
+        转换完整状态：查询全部Workspace、Agent动态可见性和Memory历史并构造快照
+
+AgentStateDto：Agent运行状态DTO，公开结构体--投影一个运行中Agent的当前动态可见资源
+    workspace: WorkspaceReferenceDto--所属Workspace
+    agent: String--Workspace内Agent逻辑名称
+    visible_resources: Vec<ResourceRefDto>--AgentDynamicVisibility当前资源，按ResourceRef顺序排列
+    impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto
+        转换Agent状态：从World读取AgentDynamicVisibility并转换全部ResourceRef
 
 WorkspaceInfoDto：已启动Workspace信息DTO，公开结构体--提供逻辑引用、manager和成员列表
     name: String--Workspace名称
@@ -234,14 +245,13 @@ AgentHistoryDto：Agent历史DTO，公开结构体--保存Workspace引用、Agen
     agent: String--稳定Agent ID
     messages: Vec<HistoryMessageDto>--按sequence排序的展示历史
 
-HistoryMessageDto：历史消息DTO，公开结构体--保存序号、turn ID、MessageDto、资源标记和时间
+HistoryMessageDto：历史消息DTO，公开结构体--保存序号、turn ID、MessageDto和时间
     sequence: i64--永久递增序号
     turn_id: String--消息所属轮次ID
-    message: MessageDto--可展示User或Assistant消息
-    resources: Vec<ResourceRefDto>--该User轮次实际使用的资源引用
+    message: MessageDto--可展示User、Assistant或Tool消息
     created_at_ms: i64--Unix毫秒创建时间
     impl FromDomain<HistoryMessage> for HistoryMessageDto
-        转换历史条目：转换可展示Message和ResourceRef列表
+        转换历史条目：转换可展示Message和基础元数据
 
 ProtocolErrorKind：协议转换错误分类，公开枚举
     AgentNotFound

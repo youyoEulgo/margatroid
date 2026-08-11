@@ -158,7 +158,15 @@ fn report_workspace_events(world: &World, targets: &[WebSocketMessageTarget]) {
                 ),
             },
             Err(error) => {
-                tracing::error!(request_id = %result.id, error = %error, "workspace start failed")
+                tracing::error!(request_id = %result.id, error = %error, "workspace start failed");
+                send_to_targets(
+                    world,
+                    targets,
+                    ServerMessage::WorkspaceStartFailed {
+                        id: result.id.clone(),
+                        error: error.to_string(),
+                    },
+                );
             }
         }
     }
@@ -193,6 +201,7 @@ fn report_agent_messages(world: &World, targets: &[WebSocketMessageTarget]) {
                 tool_calls = tool_calls.len(),
                 "assistant message produced"
             ),
+            MessageDto::Tool { .. } => continue,
         }
         send_to_targets(world, targets, ServerMessage::AgentMessage { message });
     }

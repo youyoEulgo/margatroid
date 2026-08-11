@@ -36,6 +36,10 @@ Workspace 启动请求：
 }
 ```
 
+启动成功时后端发送复用请求ID的`workspace.started`；启动失败时发送
+`workspace.start_failed { id, error }`。两者都是`workspace.start`的终止回执，客户端不应通过
+日志正文推断启动结果。
+
 Workspace 停止请求和业务回执：
 
 ```json
@@ -79,10 +83,12 @@ API 中间事件。Agent 逻辑名称由 WorkspacePlugin 在发送 `AgentMessage
 DTO 再通过 `World` 将 Entity 投影为稳定 Agent ID，协议不会暴露 Entity。
 
 客户端用户输入使用 `UserMessageDto`，不能构造 System、Assistant 或 Tool 消息。后端可展示消息使用
-`MessageDto`，只包含 User 和 Assistant；领域 `Message` 与 `ToolCall` 不直接进入协议字段。
+`MessageDto`，包含 User、Assistant 和历史Tool；领域 `Message` 与 `ToolCall` 不直接进入协议字段。
 
 后端状态通过 `state.sync` 发送完整快照。前端以该快照替换业务状态，不自行持久化或从增量消息拼接
-历史。`histories` 只包含可展示的 User/Assistant 消息和资源引用，不包含 Tool、System 或资源正文。
+历史。`histories` 包含可展示的 User、Assistant 和 Tool消息，不包含 System 或Skill正文。`agents`
+包含每个运行中Agent的`visible_resources`，该字段直接来自当前`AgentDynamicVisibility`而不是镜像
+默认可见性；客户端可以按`provider`筛选资源，例如只展示可手动调用的Skill。
 
 ## 流式 Agent 响应
 

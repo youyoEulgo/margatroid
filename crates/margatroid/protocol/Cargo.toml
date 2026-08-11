@@ -14,4 +14,5 @@ serde = { workspace = true }
 workspace_plugin = { path = "../workspace_plugin" }
 
 [dev-dependencies]
+app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 serde_json = { workspace = true }

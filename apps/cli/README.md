@@ -21,13 +21,14 @@ ws://127.0.0.1:3939/ws
 -> WebSocket 发送 connection.register(client_type=cli)
 -> WebSocket 发送 workspace.start
 -> 持续接收并打印后端消息
+-> 收到匹配请求ID的 workspace.start_failed：立即报错并以非零状态退出
 -> 首次 Ctrl+C/SIGTERM：WebSocket 发送 workspace.stop
 -> 等待匹配 request id 的 workspace.stopped
 -> 收到回执后关闭 WebSocket 并退出
 ~~~
 
-CLI 不读取 stdin，不发送用户消息、AgentMessage 或 LLM 请求；只处理 type 为 log 的消息并打印结构化
-日志，其他后端事件忽略。非 UTF-8 二进制消息只打印长度提示。关闭信号不会直接终止进程，而是先请求后端停止
+CLI 不读取 stdin，不发送用户消息、AgentMessage 或 LLM 请求；打印`log`消息，并把匹配当前启动请求的
+`workspace.start_failed`作为终止错误。其他后端事件忽略。非 UTF-8 二进制消息只打印长度提示。关闭信号不会直接终止进程，而是先请求后端停止
 workspace；停止失败、超时、重复信号或后端提前断开时命令报错退出。
 
 CLI 生命周期事件与后端日志统一显示 RFC 3339 UTC 时间、等级和事件目标，例如：

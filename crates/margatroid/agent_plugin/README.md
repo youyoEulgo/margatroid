@@ -5,8 +5,8 @@
 其他组件。每个实例同时挂载`AgentIdentity`，保存Workspace生成的稳定Agent ID，例如`demo.coder0`。
 Memory、Inference和Tool组件。
 
-`AgentMessage.agent`始终是已解析的Entity；User和Assistant消息进入`AgentContext`前先通过MemoryPlugin追加历史；Tool响应只进入上下文和实时
-表，不进入历史。一个工具批次的全部调用ID保存在`AgentStatus`，只有最后一个响应到达后才发送
+`AgentMessage.agent`始终是已解析的Entity。User和Assistant进入长期`messages`，Tool进入当前轮
+`tool_context`；三种消息都通过事件请求MemoryPlugin写历史。一个工具批次的全部调用ID保存在`AgentStatus`，只有最后一个响应到达后才发送
 下一次推理请求。
 
 每次推理请求都根据`AgentDynamicVisibility`重新构造工具定义。工具名称到`ResourceRef`的映射只在

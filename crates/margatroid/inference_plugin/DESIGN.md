@@ -478,12 +478,10 @@ publish_inference_output_system(world: &mut World)
     行为：
         成功取得InferenceTaskOutput时保留route.id和route.agent
         result为Ok时确认response.message是Message::Assistant
-            tool_calls为空时赋予MessageIntent::CompleteTurn
-            tool_calls非空时赋予MessageIntent::DispatchToolCalls
-            发送AgentMessage { id, agent, message, intent }
+            发送AgentMessage { id, agent, message }
         result为Err时提取安全有界描述并发送AgentFailure { id, agent, kind: Inference, message }
         取得InferenceTaskError时写入system log；该错误只会在Runtime取消任务等无法继续运行的路径出现
-        不修改Agent的messages、不执行工具；只由当前消息来源赋予意图
+        不修改Agent的messages、不执行工具、不决定Assistant后续分支
 
 validate_messages(messages: &[Message]) -> Result<(), InferenceError>
     验证消息：私有函数，检查消息数量、总字节上限及ToolCall配对所需字段
@@ -594,7 +592,7 @@ AgentImage启动：
         -> 工具调用片段只在累积器内部组装
         -> 响应结束后返回InferenceTaskOutput
     publish_inference_output_system
-        -> 成功时发送AgentMessage { id, agent, Message::Assistant, intent }
+        -> 成功时发送AgentMessage { id, agent, Message::Assistant }
         -> 失败时发送AgentFailure { id, agent, kind: Inference, message }
 
 流式响应：
@@ -610,9 +608,9 @@ AgentImage启动：
 
 Agent收到结果：
     AgentMessage
-        -> Assistant没有tool_calls时intent为CompleteTurn
-        -> Assistant有tool_calls时intent为DispatchToolCalls
-        -> AgentPlugin记入消息，然后执行来源已经赋予的intent
+        -> AgentPlugin记入Assistant消息
+        -> tool_calls为空时结束本轮
+        -> tool_calls非空时合并loading_skills并派发工具
     AgentFailure
         -> 失败如何影响AgentStatus由后续Agent消息契约确定
     InferencePlugin不直接修改messages
@@ -682,8 +680,7 @@ InferenceCommand
                   ├── Ok -> AgentMessage
                   │   ├── id: String
                   │   ├── agent: Entity
-                  │   ├── message: Message::Assistant
-                  │   └── intent: CompleteTurn / DispatchToolCalls
+                  │   └── message: Message::Assistant
                   └── Err -> AgentFailure
                       ├── id: String
                       ├── agent: Entity

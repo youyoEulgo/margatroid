@@ -118,8 +118,7 @@ RouteAgentMessage：逻辑Agent消息路由命令，公开事件--由DTO层产�
     id: String--完整交互轮次ID
     workspace: WorkspaceReference--目标Workspace逻辑引用
     agent: Option<String>--目标成员名，None表示manager
-    message: Message--当前只接受User消息
-    tool_calls: Vec<ToolCall>--前端预选工具调用；为空表示直接推理
+    message: Message--当前只接受User消息，前端预选调用保存在Message::User.tool_calls
     impl Event for RouteAgentMessage
         Event：公开trait实现
 
@@ -147,6 +146,7 @@ Message：统一消息，公开枚举--所有Margatroid消息Plugin共享的静�
     }
     User {
         content: String--用户内容
+        tool_calls: Vec<ToolCall>--用户预先指定的工具调用，可以为空
     }
     Assistant {
         content: Option<String>--Assistant文本，只有工具调用时允许为空
@@ -163,29 +163,20 @@ Message：统一消息，公开枚举--所有Margatroid消息Plugin共享的静�
     impl Serialize + Deserialize for Message
         序列化：公开trait实现，MemoryPlugin使用结构化JSON持久化动态消息
 
-MessageIntent：统一消息意图，公开枚举--由产生消息的可信来源直接指定AgentPlugin后续动作
-    UserWithToolCalls { tool_calls: Vec<ToolCall> }--用户入口赋予，先执行前端随本次用户消息指定的实际工具调用，不立即发起推理
-    UserWithoutToolCalls--用户入口赋予，提交用户消息后直接发起推理
-    DispatchToolCalls--InferencePlugin赋予，提交Assistant消息后发送工具调用
-    ResolveToolCall--ToolPlugin赋予，提交Tool消息后使用更新完成的上下文继续推理
-    CompleteTurn--InferencePlugin赋予，提交最终Assistant消息后结束本轮
-    impl Clone + PartialEq + Eq for MessageIntent
-        值语义：公开trait实现
-
 AgentMessage：统一Agent消息事件，公开结构体--Margatroid内部所有成功消息来源交给AgentPlugin的唯一格式
     id: String--完整用户交互轮次ID
     agent: Entity--消息所属Agent，进入事件队列前必须完成逻辑身份解析
     message: Message--需要写入Agent动态上下文的统一消息
-    intent: MessageIntent--消息来源已经决定的后续处理意图
     impl Event for AgentMessage
         Event：公开trait实现
     impl Clone for AgentMessage
         Clone：公开trait实现
-    限制：message只能是User、Assistant或Tool，不能是System；结构体不提供业务方法；来源Plugin负责提供Entity和意图，AgentPlugin负责记入消息并执行intent
+    限制：message只能是User、Assistant或Tool，不能是System；结构体不提供业务方法；AgentPlugin根据Message结构决定后续动作
 
 AgentContextMessagesUpdated：Agent上下文更新事件，公开结构体--AgentContext修改完成后通知MemoryPlugin同步实时消息表
     agent: Entity--消息所属AgentInstance Entity
     messages: Vec<Message>--修改完成后的完整动态消息快照，不包含System消息
+    tool_context: Vec<Message>--当前轮临时工具上下文，包含普通Tool输出和Skill正文
     impl Event for AgentContextMessagesUpdated
         Event：公开trait实现
     impl Clone for AgentContextMessagesUpdated
@@ -207,15 +198,13 @@ AgentFailure：统一Agent失败事件，公开结构体--让来源Plugin终止�
     impl Clone for AgentFailure
         Clone：公开trait实现
 
-MessageResource：消息使用的资源引用，公开类型别名--等于ResourceRef，只记录统一身份，不携带资源正文
-
-AgentResourcesUsed：Agent轮次资源使用事件，公开结构体--由实际解析资源的来源报告给MemoryPlugin
-    id: String--使用资源的完整交互轮次ID
-    agent: Entity--使用资源的AgentInstance Entity
-    resources: Vec<MessageResource>--本次新增使用的资源引用，不包含正文
-    impl Event for AgentResourcesUsed
+AgentHistoryMessageWriteRequested：Agent历史消息写入请求，公开结构体--AgentPlugin通过事件通道交给MemoryPlugin
+    id: String--完整交互轮次ID
+    agent: Entity--消息所属AgentInstance Entity
+    message: Message--需要写入历史的消息，Skill响应已由AgentPlugin替换为加载标记
+    impl Event for AgentHistoryMessageWriteRequested
         Event：公开trait实现
-    impl Clone for AgentResourcesUsed
+    impl Clone for AgentHistoryMessageWriteRequested
         Clone：公开trait实现
 ```
 
@@ -268,29 +257,20 @@ Workspace定义：
 
 统一消息：
     用户入口
-        -> 构造Message::User
-        -> 前端没有指定工具调用时赋予UserWithoutToolCalls
-        -> 前端指定Skill、Workflow或其他工具调用时赋予UserWithToolCalls { tool_calls }
+        -> 构造Message::User { content, tool_calls }
         -> 发送AgentMessage
-    AgentPlugin收到UserWithoutToolCalls
-        -> 直接使用当前完整上下文发起推理
-    AgentPlugin收到UserWithToolCalls
-        -> 先发送前端指定的tool_calls
-        -> 不立即发起推理
+    AgentPlugin收到User
+        -> tool_calls为空时直接发起推理
+        -> tool_calls非空时先派发指定工具
     InferencePlugin完成推理
         -> 构造Message::Assistant
-        -> 根据tool_calls赋予DispatchToolCalls或CompleteTurn
         -> 发送AgentMessage
     ToolPlugin完成工具调用
         -> 构造Message::Tool
-        -> 赋予ResolveToolCall
         -> 发送AgentMessage
-    AgentPlugin收到ResolveToolCall
-        -> 将Tool消息追加到上下文后发起推理
     AgentPlugin
         -> 只消费统一AgentMessage
-        -> 记入message并根据intent更新AgentStatus
-        -> 不重新判断消息来源或生成意图
+        -> 根据Message变体及ToolCall列表维护AgentStatus并调度后续动作
         -> 每次发起推理都按AgentDynamicVisibility构造tools；用户意图不控制工具定义是否进入请求
 
 失败通道：
@@ -298,12 +278,13 @@ Workspace定义：
         -> InferencePlugin发送AgentFailure
         -> 后续处理契约暂不定义
 
-资源使用元数据：
-    SkillPlugin、WorkflowPlugin或其他资源来源解析实际内容
-        -> 内容只用于临时模型请求
-        -> 直接报告本次Tool对应的ResourceRef
-        -> 发送AgentResourcesUsed { id, agent, resources }
-    MemoryPlugin只保存引用，不把资源正文混入Message
+记忆事件：
+    AgentPlugin处理User、Assistant或Tool
+        -> 发送AgentHistoryMessageWriteRequested
+        -> Skill Tool的正文替换为"skill: <scope/name> loaded"
+    AgentContext修改
+        -> 发送同时包含messages和tool_context的AgentContextMessagesUpdated
+    MemoryPlugin只消费事件，不读取AgentStatus或资源正文
 ```
 
 ## 持有关系
@@ -329,7 +310,9 @@ WorkspaceDefinition
     └── memory_path
 
 Message
-├── System / User
+├── System
+├── User
+│   └── Vec<ToolCall>
 ├── Assistant
 │   └── Vec<ToolCall>
 └── Tool
@@ -337,8 +320,7 @@ Message
 AgentMessage
 ├── id
 ├── agent: Entity
-├── message: Message
-└── intent: MessageIntent
+└── message: Message
 
 AgentFailure
 ├── id
@@ -346,10 +328,8 @@ AgentFailure
 ├── kind: AgentFailureKind
 └── message
 
-AgentResourcesUsed
+AgentHistoryMessageWriteRequested
 ├── id
 ├── agent: Entity
-└── resources: Vec<MessageResource = ResourceRef>
-    ├── provider
-    └── name: ResourceName
+└── message: Message
 ```

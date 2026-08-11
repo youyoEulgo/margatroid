@@ -18,5 +18,6 @@ Agent的默认或动态可见性组件。AgentPlugin使用当次临时名称映�
 `ResourceRef`，再通过`ToolCallRequest { id, agent, resource, call }`逐个派发。
 
 ToolPlugin只解析请求中的单个`resource`，验证构造出的模型名称与`call.name`一致后异步执行handler。
-成功或失败都返回`Message::Tool`形式的`AgentMessage`，意图固定为`ResolveToolCall`。这条执行链路不做
+成功或失败都返回`Message::Tool`形式的`AgentMessage`，AgentPlugin根据`tool_call_id`关联
+对应pending调用。这条执行链路不做
 可见性权限检查；可见工具集合只在AgentPlugin构造请求时产生。

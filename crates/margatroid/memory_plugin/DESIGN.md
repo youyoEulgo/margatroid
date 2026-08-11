@@ -33,66 +33,47 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 公开：
 ```text
-MemoryPlugin：Agent消息持久化插件，公开结构体--安装SQLite绑定与消息同步System
+MemoryPlugin：Agent消息持久化插件，公开结构体--通过事件同步历史消息和实时上下文
     schedule: String--持久化System所属Schedule，私有
     new() -> Self
         构造插件：公开关联函数，默认使用RuntimePlugin::UPDATE
     with_schedule(mut self, schedule: impl Into<String>) -> Self
-        指定阶段：公开方法，替换默认Schedule并返回自身
-    impl Default for MemoryPlugin
-        Default：公开trait实现，与new等价
-        default() -> Self
-            构造默认插件：调用new
+        指定阶段：公开方法
     impl Plugin for MemoryPlugin
         Plugin：公开trait实现
         build(self, app: &mut App)
-            构建插件：安装SQLite持久化能力
-            行为：
-                拒绝重复安装
-                要求目标schedule存在
-                插入MemoryPluginInstalled
-                在schedule中挂载sync_realtime_messages_system
-                在schedule中挂载sync_history_resources_system
+            构建插件：拒绝重复安装，挂载sync_history_messages_system和sync_realtime_messages_system
 
-AgentMemory：Agent数据库绑定，公开组件--一个运行中AgentInstance独占一个SQLite连接
+AgentMemory：Agent数据库绑定，公开组件--一个运行中Agent独占一个SQLite连接
     path: PathBuf--WorkspacePlugin提供的规范化数据库路径，私有
-    connection: Mutex<rusqlite::Connection>--只由MemoryPlugin持久化入口和System使用，私有
-    open(path: impl Into<PathBuf>) -> Result<(Self, Vec<margatroid_types::Message>), MemoryError>
-        打开记忆：公开关联函数，打开数据库并恢复实时上下文
-        行为：
-            创建数据库父目录
-            打开SQLite文件
-            调用initialize_schema创建不存在的业务表
-            调用load_realtime_messages恢复当前动态消息
-            返回尚未绑定Entity的AgentMemory和完整Vec<Message>
-            任一步失败时不返回部分上下文
+    connection: Mutex<rusqlite::Connection>--只由MemoryPlugin使用，私有
+    open(path: impl Into<PathBuf>) -> Result<(Self, RealtimeContext), MemoryError>
+        打开记忆：公开关联函数，创建表并恢复实时上下文
+        行为：返回未绑定Entity的AgentMemory及messages与tool_context，任一步失败时不返回部分结果
     path(&self) -> &Path
-        取得路径：公开方法，返回数据库路径
+        取得路径：公开方法
     history_messages(&self) -> Result<Vec<HistoryMessage>, MemoryError>
-        读取展示历史：公开方法，按sequence升序返回完整history_messages
-        行为：
-            每行message必须是与role一致的Message::User或Message::Assistant
-            resources只恢复MessageResource引用，不读取任何资源正文
-            任一行读取或解码失败时整体失败，不返回残缺历史
+        读取展示历史：公开方法，按sequence升序恢复User、Assistant和Tool条目
     impl Component for AgentMemory
         Component：公开trait实现
+
+RealtimeContext：实时上下文快照，公开结构体--Agent启动时恢复的两类消息
+    messages: Vec<Message>--长期User和Assistant对话
+    tool_context: Vec<Message>--未完成当前轮的Tool上下文
 
 HistoryMessage：可展示历史条目，公开结构体--对应history_messages中的一行
     sequence: i64--单Agent永久递增序号
     turn_id: String--原AgentMessage.id
-    message: margatroid_types::Message--只可能是User或Assistant
-    resources: Vec<margatroid_types::MessageResource>--实际使用的资源引用，不含资源正文
-    created_at_ms: i64--历史写入时Unix毫秒时间
+    message: Message--User、Assistant或Tool
+    created_at_ms: i64--写入时Unix毫秒时间
     impl Clone + PartialEq + Eq for HistoryMessage
         值语义：公开trait实现
 
-AgentMemoryWriteFailed：消息持久化失败事件，公开结构体--报告历史或实时消息写入失败
-    agent: Entity--写入失败的AgentInstance Entity
-    error: MemoryError--不包含消息正文、资源正文或完整SQL语句的稳定错误
+AgentMemoryWriteFailed：记忆写入失败事件，公开结构体
+    agent: Entity--写入失败的Agent Entity
+    error: MemoryError--稳定错误，不包含消息正文或完整SQL
     impl Event for AgentMemoryWriteFailed
         Event：公开trait实现
-    impl Clone for AgentMemoryWriteFailed
-        Clone：公开trait实现
 
 MemoryErrorKind：记忆错误分类，公开枚举
     InvalidPath
@@ -106,63 +87,26 @@ MemoryErrorKind：记忆错误分类，公开枚举
     AlreadyBound
     PluginMissing
     WriteFailed
-    impl Clone + Copy + PartialEq + Eq for MemoryErrorKind
-        值语义：公开trait实现
 
 MemoryError：记忆错误，公开结构体--保存稳定分类和有界描述
     kind: MemoryErrorKind--错误分类，私有
-    message: String--不包含消息正文、资源正文或完整SQL语句的描述，私有
-    new(kind: MemoryErrorKind, message: impl Into<String>) -> Self
-        构造错误：私有关联函数，保存分类并按UTF-8边界截断描述
+    message: String--不包含数据库内容的描述，私有
     kind(&self) -> MemoryErrorKind
         取得分类：公开方法
     message(&self) -> &str
         取得描述：公开方法
-    impl Clone for MemoryError
-        Clone：公开trait实现
     impl fmt::Display for MemoryError
-        Display：公开trait实现，输出稳定错误描述
+        Display：公开trait实现
     impl std::error::Error for MemoryError
         Error：公开trait实现
 
-WorldMemoryExt：World记忆扩展，公开trait--绑定Agent数据库并提供历史消息同步写入入口
-    bind_agent_memory(
-        &mut self,
-        agent: Entity,
-        memory: AgentMemory,
-        messages: &[margatroid_types::Message],
-    ) -> Result<(), MemoryError>
-        绑定记忆：公开方法，将已打开的数据库绑定到Agent
-        行为：
-            MemoryPlugin必须已经安装
-            agent必须存活
-            agent不能已经持有AgentMemory
-            为memory.connection开启事务
-            调用rewrite_realtime_messages(transaction, messages)
-            成功时提交事务并把memory插入agent
-            重写或提交失败时恢复旧表且不插入部分绑定
-    append_history_message(
-        &mut self,
-        event: &margatroid_types::AgentMessage,
-    ) -> Result<(), MemoryError>
-        追加历史消息：公开方法，由AgentPlugin同步调用
-        行为：
-            event.message是Message::Tool时直接返回成功，不访问数据库
-            event.message只接受Message::User或Message::Assistant
-            event.agent必须存活且持有AgentMemory
-            为AgentMemory.connection开启事务
-            调用insert_history_message(transaction, event, current_unix_milliseconds)
-            成功时提交事务
-            插入或提交失败时恢复旧表并返回MemoryError
+WorldMemoryExt：World记忆扩展，公开trait--只保留Workspace启动期的Agent数据库绑定入口
+    bind_agent_memory(&mut self, agent: Entity, memory: AgentMemory, context: &RealtimeContext) -> Result<(), MemoryError>
+        绑定记忆：公开方法，验证Plugin、Agent和未绑定状态，使实时表与context一致后挂载AgentMemory
     impl WorldMemoryExt for World
-        World记忆扩展：公开trait实现，按上述契约绑定数据库和追加历史
-```
+        World记忆扩展：公开trait实现
 
-私有：
-```text
-MemoryPluginInstalled：MemoryPlugin安装标记，公开单元Resource--阻止重复安装并供WorldMemoryExt、WorkspacePlugin确认依赖
-    impl Resource for MemoryPluginInstalled
-        Resource：公开trait实现
+MemoryPluginInstalled：MemoryPlugin安装标记，公开单元Resource--阻止重复安装并供WorkspacePlugin确认依赖
 ```
 
 ## 函数
@@ -176,240 +120,155 @@ require_plugin(world: &World) -> Result<(), MemoryError>
     确认插件：私有函数，MemoryPluginInstalled不存在时返回PluginMissing
 
 lock_connection(memory: &AgentMemory) -> Result<MutexGuard<Connection>, MemoryError>
-    锁定连接：私有函数，锁中毒时返回WriteFailed且不暴露数据库内容
+    锁定连接：私有函数，锁中毒时返回WriteFailed
 
-initialize_schema(connection: &rusqlite::Connection) -> Result<(), MemoryError>
-    初始化数据库：私有函数，创建不存在的两张业务表
+initialize_schema(connection: &mut Connection) -> Result<(), MemoryError>
+    初始化数据库：私有函数，事务内迁移旧表并创建不存在的两张业务表
     行为：
-        创建history_messages表：
-            sequence INTEGER PRIMARY KEY AUTOINCREMENT--单Agent永久递增序号
-            turn_id TEXT NOT NULL--AgentMessage.id
-            role TEXT NOT NULL--只保存user或assistant
-            message TEXT NOT NULL--完整Message结构化JSON
-            resources TEXT NOT NULL DEFAULT '[]'--MessageResource数组JSON，不保存资源正文
-            created_at_ms INTEGER NOT NULL--写入时Unix毫秒时间
-        创建realtime_messages表：
-            position INTEGER PRIMARY KEY--从0开始的连续上下文位置
-            message TEXT NOT NULL--完整Message结构化JSON
-        任一建表操作失败时返回SchemaFailed
+        旧history_messages包含message列时改名为history_messages_legacy
+        旧realtime_messages没有context列时改名为realtime_messages_legacy
+        history_messages:
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT
+            turn_id TEXT NOT NULL
+            role TEXT NOT NULL--user、assistant或tool
+            content TEXT--User和Tool为正文，Assistant可以为空
+            tool_calls TEXT NOT NULL--User和Assistant的ToolCall数组JSON，Tool固定为[]
+            tool_call_id TEXT--Tool对应调用ID，User和Assistant为空
+            created_at_ms INTEGER NOT NULL
+        realtime_messages:
+            context TEXT NOT NULL--conversation或tool
+            position INTEGER NOT NULL--同一context内从0连续递增
+            message TEXT NOT NULL--Message JSON
+            PRIMARY KEY(context, position)
+        调用migrate_history和migrate_realtime保留可解码内容，成功后删除legacy表并提交
+        任一步失败时回滚整个迁移
 
-load_history_messages(
-    connection: &rusqlite::Connection,
-) -> Result<Vec<HistoryMessage>, MemoryError>
-    读取展示历史：私有函数，按sequence升序读取全部history_messages
-    行为：
-        读取sequence、turn_id、role、message、resources和created_at_ms
-        message只接受与role一致的Message::User或Message::Assistant
-        resources只反序列化MessageResource引用数组
-        任一读取、角色校验或JSON解码失败时整体失败，不返回部分历史
+table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool, MemoryError>
+    检查旧表字段：私有函数，通过PRAGMA table_info判断是否需要迁移
 
-load_realtime_messages(
-    connection: &rusqlite::Connection,
-) -> Result<Vec<margatroid_types::Message>, MemoryError>
-    恢复实时上下文：私有函数，读取当前Agent动态消息
-    行为：
-        按position升序读取全部realtime_messages
-        position必须从0连续递增
-        使用serde_json反序列化每行message
-        不允许Message::System进入动态上下文
-        任一位置缺口或非法JSON导致整体失败，不返回部分消息
+migrate_history(transaction: &Transaction) -> Result<(), MemoryError>
+    迁移历史：私有函数，解码旧Message JSON并按新分列schema写入
 
-rewrite_realtime_messages(
-    transaction: &rusqlite::Transaction,
-    messages: &[margatroid_types::Message],
-) -> Result<(), MemoryError>
-    重写实时上下文：私有函数，使realtime_messages与输入消息逐项完全一致
-    行为：
-        拒绝输入中的Message::System
-        删除原realtime_messages全部行
-        按messages顺序取得从0开始的position
-        使用serde_json结构化序列化并逐行插入Message
-        任一序列化或插入失败时返回WriteFailed，由外层事务恢复旧表
+migrate_realtime(transaction: &Transaction) -> Result<(), MemoryError>
+    迁移实时上下文：私有函数，把User和Assistant放入conversation，把Tool放入tool
 
-insert_history_message(
-    transaction: &rusqlite::Transaction,
-    event: &margatroid_types::AgentMessage,
-    created_at_ms: i64,
-) -> Result<(), MemoryError>
-    插入历史消息：私有函数，向history_messages追加一条User或Assistant消息
-    行为：
-        event.message是Message::User时role使用user
-        event.message是Message::Assistant时role使用assistant
-        event.message是Message::Tool或Message::System时返回WriteFailed
-        使用serde_json结构化序列化event.message
-        使用event.id写入turn_id
-        resources写入空数组
-        使用created_at_ms写入创建时间
-        插入失败时返回WriteFailed
+schema_error(error: rusqlite::Error) -> MemoryError
+    转换schema错误：私有函数，不暴露SQL详情
 
-merge_history_resources(
-    transaction: &rusqlite::Transaction,
-    turn_id: &str,
-    resources: &[margatroid_types::MessageResource],
-) -> Result<(), MemoryError>
-    合并历史资源：私有函数，把本次实际使用的资源引用写入对应User历史行
+load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>, MemoryError>
+    读取历史：私有函数，按role与分列字段重建Message
+    行为：User和Assistant恢复tool_calls，Tool要求tool_calls为[]并恢复tool_call_id；任一行非法时整体失败
+
+load_realtime_messages(connection: &Connection) -> Result<RealtimeContext, MemoryError>
+    恢复实时上下文：私有函数，分别按conversation和tool的position升序读取
+    行为：conversation只允许User和Assistant，tool只允许Tool；各自position必须从0连续
+
+rewrite_realtime_messages(transaction: &Transaction, messages: &[Message], tool_context: &[Message]) -> Result<(), MemoryError>
+    重写实时上下文：私有函数，使两个context分区与输入快照完全一致
+    行为：在同一事务中删除旧行，验证变体并按分区从0写入，失败时由外层回滚
+
+insert_history_message(transaction: &Transaction, event: &AgentHistoryMessageWriteRequested, created_at_ms: i64) -> Result<(), MemoryError>
+    插入历史消息：私有函数，每个Message写入一行
     行为：
-        按turn_id读取对应User历史行的resources
-        使用serde_json反序列化现有MessageResource数组
-        合并resources并去除重复ResourceRef
-        使用serde_json序列化合并结果
-        只更新该User历史行的resources列
-        不写入Skill、Workflow或其他资源正文
-        读取、序列化或更新失败时返回WriteFailed
+        User写role=user、content和tool_calls，tool_call_id为空
+        Assistant写role=assistant、可空content和tool_calls，tool_call_id为空
+        Tool写role=tool、content和tool_call_id，tool_calls固定为[]
+        System返回WriteFailed
+        MemoryPlugin不判断Skill；Skill标记由AgentPlugin在事件中预先替换
+
+insert_history_message_values(transaction: &Transaction, turn_id: &str, message: &Message, created_at_ms: i64) -> Result<(), MemoryError>
+    写入历史分列：私有函数，供历史事件与旧schema迁移共用
+
+sync_history_messages_system(world: &mut World)
+    同步历史消息：私有System，消费AgentHistoryMessageWriteRequested
+    行为：按事件顺序分别开启事务、调用insert_history_message并提交；Agent或Memory不存在及写入失败时发送AgentMemoryWriteFailed
+
+sync_history_message(world: &World, event: &AgentHistoryMessageWriteRequested) -> Result<(), MemoryError>
+    同步单条历史：私有函数，验证AgentMemory后在独立事务中写入并提交
+
+sync_realtime_messages_system(world: &mut World)
+    同步实时上下文：私有System，消费AgentContextMessagesUpdated
+    行为：按事件顺序调用rewrite_realtime_messages(event.messages, event.tool_context)，不重新读取AgentContext，不修改history_messages
+
+sync_realtime_message(world: &World, event: &AgentContextMessagesUpdated) -> Result<(), MemoryError>
+    同步单次实时快照：私有函数，验证AgentMemory后在独立事务中重写并提交
 
 current_unix_milliseconds() -> Result<i64, MemoryError>
     取得写入时间：私有函数，返回Unix毫秒并检查SQLite整数范围
 
 read_error(error: rusqlite::Error) -> MemoryError
-    转换读取错误：私有函数，丢弃底层SQL详情并返回ReadFailed
+    转换读取错误：私有函数，不暴露SQL详情
 
 write_error(error: rusqlite::Error) -> MemoryError
-    转换写入错误：私有函数，丢弃底层SQL详情并返回WriteFailed
-
-sync_realtime_messages_system(world: &mut World)
-    同步实时上下文：私有System，消费AgentContextMessagesUpdated并重写实时消息表
-    行为：
-        收集本次全部margatroid_types::AgentContextMessagesUpdated，结束对EventReader的借用
-        按事件顺序处理每个事件，不合并同一Agent的连续事件
-        agent不存在时发送AgentMemoryWriteFailed { kind: AgentNotAlive }
-        agent没有AgentMemory时发送AgentMemoryWriteFailed { kind: AgentMemoryMissing }
-        为AgentMemory.connection开启事务
-        调用rewrite_realtime_messages(transaction, event.messages)
-        成功时提交事务
-        重写或提交失败时恢复旧表并发送AgentMemoryWriteFailed
-        不重新读取AgentContext，不修改history_messages
-
-sync_realtime_message(world: &World, event: &AgentContextMessagesUpdated) -> Result<(), MemoryError>
-    同步单次实时上下文：私有函数，验证Agent与AgentMemory后在独立事务中重写并提交realtime_messages
-
-sync_history_resources_system(world: &mut World)
-    同步历史资源：私有System，消费AgentResourcesUsed并更新User历史行资源列
-    行为：
-        收集本次全部margatroid_types::AgentResourcesUsed，结束对EventReader的借用
-        按事件顺序处理每个事件
-        agent不存在时发送AgentMemoryWriteFailed { kind: AgentNotAlive }
-        agent没有AgentMemory时发送AgentMemoryWriteFailed { kind: AgentMemoryMissing }
-        为AgentMemory.connection开启事务
-        调用merge_history_resources(transaction, &event.id, &event.resources)
-        成功时提交事务
-        合并或提交失败时恢复旧表并发送AgentMemoryWriteFailed
-
-sync_history_resources(world: &World, event: &AgentResourcesUsed) -> Result<(), MemoryError>
-    同步单次资源使用：私有函数，验证Agent与AgentMemory后在独立事务中合并资源并提交
+    转换写入错误：私有函数，不暴露SQL详情
 ```
 
 ## 逻辑
 
 ```text
 安装：
-    app.add_plugin(MemoryPlugin)
-        -> 保存持久化Schedule
-        -> 挂载sync_realtime_messages_system
-        -> 挂载sync_history_resources_system
+    MemoryPlugin
+        -> sync_history_messages_system
+        -> sync_realtime_messages_system
 
-Workspace启动Agent：
-    WorkspacePlugin确定项目根、Workspace名称和Agent名称
-        -> 默认数据库路径为<project>/.margatroid/workspaces/<workspace>/memory/<agent>/memory.sql
-        -> 显式memory_path由WorkspacePlugin覆盖默认路径
-        -> 调用AgentMemory::open(path)
-        -> initialize_schema创建history_messages和realtime_messages
-        -> load_realtime_messages恢复Vec<Message>
-        -> 把Vec<Message>放入AgentCreateRequest.messages
-        -> Agent创建后调用WorldMemoryExt::bind_agent_memory
-    打开、建表或恢复失败
-        -> Workspace启动该Agent失败
-        -> 不使用空上下文替代不可读取的已有数据库
+Workspace启动：
+    AgentMemory::open
+        -> initialize_schema
+        -> load_realtime_messages
+        -> 返回RealtimeContext { messages, tool_context }
+    WorkspacePlugin
+        -> 把两部分上下文放入AgentCreateRequest
+        -> Agent创建后调用bind_agent_memory
 
-记录User或Assistant消息：
-    AgentPlugin收到AgentMessage
-        -> record_message识别Message::User或Message::Assistant
-        -> 调用WorldMemoryExt::append_history_message
-        -> insert_history_message向history_messages追加一行
-        -> 历史事务提交成功
-        -> AgentContext.append_message追加动态上下文
-        -> 发送AgentContextMessagesUpdated完整快照
-        -> sync_realtime_messages_system整体重写realtime_messages
-    历史写入失败
-        -> 不修改AgentContext
+历史写入：
+    AgentToolCallSystem
+        -> AgentHistoryMessageWriteRequested
+        -> sync_history_messages_system
+        -> history_messages追加一行
+    User、Assistant和普通Tool保存原始分列内容
+    Skill Tool事件的content已是"skill: <scope/name> loaded"，不保存Skill正文
 
-记录Tool响应：
-    AgentPlugin收到Message::Tool
-        -> 不调用WorldMemoryExt::append_history_message
-        -> AgentContext.append_message追加动态上下文
-        -> 发送AgentContextMessagesUpdated完整快照
-        -> sync_realtime_messages_system整体重写realtime_messages
-    Tool响应只进入AgentContext和realtime_messages，不进入history_messages
+实时写入：
+    AgentContext的messages或tool_context变更
+        -> AgentContextMessagesUpdated完整快照
+        -> sync_realtime_messages_system
+        -> realtime_messages的conversation和tool分区整体替换
+    上下文压缩只替换实时表，不删除或覆盖历史表
 
-重写动态上下文：
-    AgentContext.rewrite_messages替换完整消息数组
-        -> 发送AgentContextMessagesUpdated完整快照
-        -> sync_realtime_messages_system为每个事件开启独立事务
-        -> rewrite_realtime_messages整体替换realtime_messages
-    history_messages不删除、不覆盖，也不补写压缩结果
-
-记录资源使用：
-    SkillPlugin、WorkflowPlugin或其他资源Plugin发送AgentResourcesUsed
-        -> 事件只携带ResourceRef，不携带资源正文
-        -> sync_history_resources_system调用merge_history_resources
-        -> 把资源引用合并到相同turn_id的User历史行
-    Assistant历史行的resources保持空数组
-    Tool响应没有历史行
-
-Workspace重新启动：
-    AgentMemory::open只从realtime_messages恢复AgentContext.messages
-    history_messages保留User和Assistant历史，不自动装入当前模型上下文
-    realtime_messages可以包含User、Assistant和Tool，不包含System
+Agent重启：
+    只从realtime_messages恢复messages和tool_context
+    不从history_messages恢复模型上下文
+    loading_skills不从历史推断
 
 前端展示：
-    daemon调用AgentMemory::history_messages读取每个Agent的完整history_messages
-        -> 通过state.sync发送历史快照
-        -> 客户端整体替换已有展示历史
     history_messages是客户端可展示对话的唯一来源
-    realtime_messages只用于模型上下文恢复，不通过状态快照提供给客户端
-    agent.message实时事件不作为客户端自行追加或持久化展示历史的依据
+    realtime_messages只用于Agent上下文恢复
+```
 
-关闭：
-    workspace down释放Agent Entity
-        -> AgentMemory随组件释放
-        -> SQLite连接关闭
-        -> 数据库文件保留供下次workspace up或reload恢复
+## 边界
 
-边界：
-    WorkspacePlugin负责数据库路径、显式覆盖和Agent启动顺序
-    AgentPlugin负责调用历史写入入口和修改AgentContext.messages
-    资源Plugin只发送AgentResourcesUsed，不直接写SQLite
-    MemoryPlugin不读取AgentImage、Workspace文件或资源正文
-    MemoryPlugin不决定上下文压缩时机，不生成摘要，不实现记忆检索或向量索引
-    history_messages面向客户端展示，realtime_messages面向模型上下文恢复，两者不可互相替代
+```text
+MemoryPlugin负责：SQLite schema、历史事件写入、实时快照同步和恢复
+MemoryPlugin不读取AgentStatus，不判断Tool来源，不读取Skill正文，不决定上下文压缩时机
+AgentPlugin负责根据工具来源构造应写入的历史Message并发送事件
+WorkspacePlugin负责数据库路径、打开顺序和Agent绑定
 ```
 
 ## 持有关系
 
 ```text
-Workspace logical Agent
-└── memory.sql
-    ├── history_messages
-    │   └── User / Assistant Message
-    └── realtime_messages
-        └── User / Assistant / Tool Message
+memory.sql
+├── history_messages
+│   └── User / Assistant / Tool
+└── realtime_messages
+    ├── conversation: User / Assistant
+    └── tool: Tool
 
 World
-├── margatroid_types::AgentMessage Event
-│   └── AgentPlugin.record_message
-│       ├── User / Assistant -> WorldMemoryExt::append_history_message
-│       │   └── history_messages追加一行
-│       ├── Tool -> 跳过history_messages
-│       └── AgentContext.append_message
-├── margatroid_types::AgentContextMessagesUpdated Event
+├── AgentHistoryMessageWriteRequested Event
+│   └── sync_history_messages_system
+├── AgentContextMessagesUpdated Event
 │   └── sync_realtime_messages_system
-│       └── realtime_messages整体重写
-├── margatroid_types::AgentResourcesUsed Event
-│   └── sync_history_resources_system
-│       └── history_messages.resources合并资源引用
-└── AgentInstance Entity
-    ├── AgentContext
-    │   └── messages: Vec<Message>
+└── Agent Entity
     └── AgentMemory
-        ├── path: PathBuf
-        └── connection: Mutex<rusqlite::Connection>
 ```

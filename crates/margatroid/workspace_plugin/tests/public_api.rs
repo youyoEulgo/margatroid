@@ -13,6 +13,7 @@ use margatroid_types::{
     WorkspaceReference,
 };
 use memory_plugin::{AgentMemory, MemoryPlugin};
+use skill_plugin::SkillPlugin;
 use tempfile::tempdir;
 use tool_plugin::{AgentToolEnvironment, ToolPlugin};
 use workspace_plugin::{
@@ -34,13 +35,17 @@ fn unique_directory(prefix: &str) -> PathBuf {
 fn write_image(library: &Path, model: &str) {
     let image = library.join("local/coder/latest");
     fs::create_dir_all(image.join("skills/local/review")).unwrap();
-    fs::create_dir_all(image.join("workflows/local/check")).unwrap();
     fs::write(
         image.join("agent.toml"),
         format!("schema_version = 1\n[inference]\nmodel = \"{model}\"\n"),
     )
     .unwrap();
     fs::write(image.join("SOUL.md"), "You are a test agent.\n").unwrap();
+    fs::write(
+        image.join("skills/local/review/SKILL.md"),
+        "Review the current project.",
+    )
+    .unwrap();
 }
 
 fn write_routes(path: &Path) {
@@ -65,11 +70,9 @@ fn definition(project_root: &Path) -> WorkspaceDefinition {
         agents: vec![WorkspaceAgentDefinition {
             name: "manager".into(),
             image: AgentImageReference::new("local/coder").unwrap(),
-            resources: vec![ResourceRef::new(
-                "workflow",
-                ResourceName::new("local/extra").unwrap(),
-            )
-            .unwrap()],
+            resources: vec![
+                ResourceRef::new("skill", ResourceName::new("local/review").unwrap()).unwrap(),
+            ],
             disable_resources: Vec::new(),
             memory_path: None,
         }],
@@ -83,6 +86,7 @@ fn app(library: &Path, routes: &Path) -> App {
         .add_plugin(AgentImageLoaderPlugin::open(library).unwrap())
         .add_plugin(InferencePlugin::default().with_config_path(routes))
         .add_plugin(ToolPlugin::default())
+        .add_plugin(SkillPlugin::open(library.join("home-skills")).unwrap())
         .add_plugin(MemoryPlugin::default())
         .add_plugin(AgentPlugin::default())
         .add_plugin(WorkspacePlugin::open(library).unwrap());
@@ -273,6 +277,33 @@ fn invalid_model_route_fails_before_agent_creation() {
         error.kind(),
         workspace_plugin::WorkspaceErrorKind::InferenceSetupFailed
     );
+    assert_eq!(app.world().entity_count(), 1);
+    let _ = fs::remove_dir_all(library);
+}
+
+#[test]
+fn missing_visible_skill_fails_workspace_start() {
+    let library = unique_directory("missing-skill-library");
+    let project = tempdir().unwrap();
+    let routes = project.path().join("models.toml");
+    fs::create_dir_all(&library).unwrap();
+    write_image(&library, "test-model");
+    write_routes(&routes);
+
+    let mut definition = definition(project.path());
+    definition.agents[0].resources =
+        vec![ResourceRef::new("skill", ResourceName::new("local/missing").unwrap()).unwrap()];
+    let mut app = app(&library, &routes);
+    app.world()
+        .start_workspace("start-missing-skill", definition);
+    let error = wait_start(&mut app, "start-missing-skill").unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        workspace_plugin::WorkspaceErrorKind::ResourceSetupFailed
+    );
+    assert!(error.message().contains("skill file was not found"));
+    assert!(app.world().workspaces().is_empty());
     assert_eq!(app.world().entity_count(), 1);
     let _ = fs::remove_dir_all(library);
 }

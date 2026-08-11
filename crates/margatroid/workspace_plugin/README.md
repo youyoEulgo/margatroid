@@ -7,5 +7,6 @@ Workspace范围内唯一的稳定ID，例如`demo.coder0`；该ID用于跨Plugin
 Workspace只有在全部Agent完成创建和组件绑定后才会加入查询索引并挂载`WorkspaceAgents`。
 启动中的临时状态只保存在插件内部；关闭时同步移除索引并释放Workspace拥有的Agent Entity。
 
-工具定义不会在Workspace启动时加载。Workspace只合并默认资源集合并保存项目根、镜像根；
-AgentPlugin在每次推理前根据动态可见性调用ToolPlugin构造当前工具定义。
+Workspace在全部运行时组件绑定后，通过ToolPlugin真实解析一次每个Agent的动态可见资源，确认Provider、
+资源文件和工具定义有效且暴露名称唯一。验证结果不会缓存；AgentPlugin在每次推理前仍根据动态可见性
+重新调用ToolPlugin构造当前工具定义，因此启动后的文件变化会在下一轮生效。

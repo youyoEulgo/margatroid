@@ -230,7 +230,8 @@ PreparedWorkspaceAgent：单Agent实例材料，私有结构体--创建Agent Ent
     name: String--Agent逻辑名称
     agent_id: String--Workspace生成的稳定Agent ID，例如<workspace>.<name><index>
     system_prompt: String--从AgentImage Soul取得的系统提示词
-    messages: Vec<Message>--MemoryPlugin恢复的实时上下文
+    messages: Vec<Message>--MemoryPlugin恢复的长期对话上下文
+    tool_context: Vec<Message>--MemoryPlugin恢复的当前轮工具上下文
     default_visibility: BTreeSet<ResourceRef>--镜像默认值与Workspace参数合并后的资源集合，交给AgentPlugin构造只读组件
     inference_snapshot: AgentInferenceSnapshot--InferencePlugin构造的实例推理快照
     tool_environment: AgentToolEnvironment--项目根与镜像版本根
@@ -247,8 +248,7 @@ route_agent_message_system(world: &mut World)
         按WorkspaceReference查询已就绪Workspace
         agent为空时使用WorkspaceDefinition.manager
         只接受Message::User
-        tool_calls为空时发送MessageIntent::UserWithoutToolCalls
-        tool_calls非空时发送MessageIntent::UserWithToolCalls { tool_calls }
+        直接保留Message::User中的content和tool_calls并发送AgentMessage { id, agent, message }
         路由失败时记录警告且不构造AgentMessage
 
 begin_workspace_command_system(world: &mut World)
@@ -308,13 +308,13 @@ prepare_workspace_agents(world: &mut World, request_id: &str) -> Result<(), Work
         根据agent_images_root和AgentImageReference构造镜像版本根
         使用definition.project_root和镜像版本根构造AgentToolEnvironment
         memory_path为空时生成<project>/.margatroid/workspaces/<workspace>/memory/<agent>/memory.sql
-        调用AgentMemory::open取得AgentMemory与恢复messages
+        调用AgentMemory::open取得AgentMemory与恢复的RealtimeContext
         收集Soul、default_visibility和恢复上下文
         构造PreparedWorkspaceAgent并保存到pending.prepared
         任一步失败时释放已打开AgentMemory并返回错误，不发送部分Agent创建事件
         全部Agent准备成功后为每个Agent生成稳定Agent ID和独立创建子请求ID
         保存agent_requests[子请求ID] = (Workspace请求ID, Agent名称)
-        发送AgentCreateRequest { id, agent_id, workspace_id, system_prompt, messages, default_visibility }
+        发送AgentCreateRequest { id, agent_id, workspace_id, system_prompt, messages, tool_context, default_visibility }
         AgentCreateRequest只交付AgentPlugin自有字段，不携带Memory、Inference或Tool组件
 
 collect_agent_created_system(world: &mut World)
@@ -323,9 +323,10 @@ collect_agent_created_system(world: &mut World)
         根据AgentCreated.id从agent_requests定位Workspace请求与Agent名称
         从pending.prepared取出对应PreparedWorkspaceAgent
         验证AgentCreated.agent存活且AgentWorkspaceId指向本次暂存Workspace
-        调用WorldMemoryExt::bind_agent_memory绑定AgentMemory和恢复messages
+        调用WorldMemoryExt::bind_agent_memory绑定AgentMemory和恢复的messages、tool_context
         插入PreparedWorkspaceAgent.inference_snapshot
         插入PreparedWorkspaceAgent.tool_environment
+        调用validate_agent_visibility解析全部AgentDynamicVisibility资源并检查暴露名称唯一
         成功时保存pending.agents[Agent名称] = Agent Entity
         任一步失败时despawn当前Agent并调用fail_pending_workspace
         全部Agent完成时使用pending.agents构造WorkspaceAgents并确定manager
@@ -334,7 +335,16 @@ collect_agent_created_system(world: &mut World)
         发布StartWorkspaceResult或ReloadWorkspaceResult成功结果
 
 attach_prepared_agent(world: &mut World, request_id: &str, name: &str, agent: Entity) -> Result<(), WorkspaceError>
-    绑定实例材料：私有函数，验证Agent归属并绑定Memory、Inference和Tool组件
+    绑定实例材料：私有函数，验证Agent归属，绑定Memory、Inference和Tool组件，并验证动态可见资源
+
+validate_agent_visibility(world: &World, agent: Entity) -> Result<(), WorkspaceError>
+    验证Agent可见性：私有函数，确保启动成功时全部动态可见资源可解析为名称唯一的工具
+    行为：
+        读取AgentDynamicVisibility；缺失时返回ResourceSetupFailed
+        按ResourceRef顺序逐个调用WorldToolExt::resolve_tool
+        Provider未注册、Skill或Workflow文件不存在、定义非法时返回ResourceSetupFailed
+        两个资源暴露相同ToolDefinition.name时返回ResourceSetupFailed
+        只验证并丢弃Tool，不缓存工具定义或资源正文
 
 complete_pending_workspace(world: &mut World, request_id: &str) -> Result<(), WorkspaceError>
     完成启动：私有函数，挂载WorkspaceAgents、登记ready索引、清理子请求并发布成功结果
@@ -433,13 +443,14 @@ cleanup_orphan_agent(world: &mut World, agent: Entity)
         -> 工具定义在每次InferenceCommand发送前由AgentPlugin按动态可见性解析
     MemoryPlugin
         -> AgentMemory
-        -> 打开数据库时恢复的realtime_messages Vec<Message>
+        -> 打开数据库时恢复的RealtimeContext { messages, tool_context }
     WorkspacePlugin自身
         -> Workspace归属、逻辑名称和Agent Entity索引
         -> 合并后把default_visibility交给AgentCreateRequest，由AgentPlugin构造两个可见性组件
-    Skill和Workflow正文不在启动阶段加载
-        -> Workspace只传递项目根与镜像根
-        -> 实际调用时由对应ToolDefinitionProvider读取当前内容
+    Skill和Workflow在启动完成前解析一次以验证动态可见性
+        -> Workspace传递项目根与镜像根并调用ToolPlugin真实解析路径
+        -> 验证结果和正文不缓存
+        -> 每次构造InferenceCommand时仍由对应ToolDefinitionProvider读取当前内容
 
 workspace up：
     Compose生成WorkspaceDefinition
@@ -453,6 +464,7 @@ workspace up：
         -> 全部材料成功后发送AgentCreateRequest * N
         -> AgentPlugin创建Agent Entity并发送AgentCreated * N
         -> Workspace绑定AgentMemory、AgentInferenceSnapshot和AgentToolEnvironment
+        -> 逐Agent验证全部动态可见资源存在、定义有效且暴露名称唯一
         -> 全部Agent完成后挂载WorkspaceAgents并写入WorkspaceRegistry.ready
         -> 发布StartWorkspaceResult::Ok
 
