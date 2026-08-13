@@ -67,7 +67,8 @@ async fn run_workspace_up(
     ))?;
     let request = ClientMessage::start_workspace(&start_request_id, &definition);
     let encoded = serde_json::to_string(&request)?;
-    let workspace = margatroid_protocol::WorkspaceReferenceDto::new(
+    let workspace = margatroid_protocol::WorkspaceReferenceDto::with_id(
+        margatroid_protocol::ResourceIdDto(definition.id.to_string()),
         definition.name.clone(),
         definition.project_root.to_string_lossy(),
     );

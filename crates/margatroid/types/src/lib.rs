@@ -1,8 +1,144 @@
 use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use core_plugin::{Entity, Event};
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResourceIdError {
+    Empty,
+    InvalidType,
+    InvalidScope,
+    InvalidName,
+    InvalidTag,
+    InvalidFormat,
+}
+
+impl fmt::Display for ResourceIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "resource id cannot be empty",
+            Self::InvalidType => "resource type is invalid",
+            Self::InvalidScope => "resource scope is invalid",
+            Self::InvalidName => "resource name is invalid",
+            Self::InvalidTag => "resource tag is invalid",
+            Self::InvalidFormat => "resource id format is invalid",
+        })
+    }
+}
+
+impl std::error::Error for ResourceIdError {}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ResourceId {
+    resource_type: String,
+    scope: String,
+    name: String,
+    tag: String,
+}
+
+impl ResourceId {
+    pub fn parse(value: impl AsRef<str>) -> Result<Self, ResourceIdError> {
+        value.as_ref().parse()
+    }
+
+    pub fn new(
+        resource_type: impl Into<String>,
+        scope: impl Into<String>,
+        name: impl Into<String>,
+        tag: Option<impl Into<String>>,
+    ) -> Result<Self, ResourceIdError> {
+        let resource_type = resource_type.into();
+        let scope = scope.into();
+        let name = name.into();
+        let tag = tag.map(Into::into).unwrap_or_else(|| "latest".into());
+        validate_resource_type(&resource_type)?;
+        validate_resource_part(&scope, ResourceIdError::InvalidScope)?;
+        validate_resource_part(&name, ResourceIdError::InvalidName)?;
+        validate_resource_tag(&tag)?;
+        Ok(Self {
+            resource_type,
+            scope,
+            name,
+            tag,
+        })
+    }
+
+    pub fn resource_type(&self) -> &str {
+        &self.resource_type
+    }
+
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
+impl FromStr for ResourceId {
+    type Err = ResourceIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty() {
+            return Err(ResourceIdError::Empty);
+        }
+        let (resource_type, remainder) = value
+            .split_once(':')
+            .ok_or(ResourceIdError::InvalidFormat)?;
+        let (scope, name_and_tag) = remainder
+            .split_once('/')
+            .ok_or(ResourceIdError::InvalidFormat)?;
+        if name_and_tag.contains('/') {
+            return Err(ResourceIdError::InvalidFormat);
+        }
+        let (name, tag) = match name_and_tag.split_once(':') {
+            Some((name, tag)) => {
+                if tag.contains(':') {
+                    return Err(ResourceIdError::InvalidFormat);
+                }
+                (name, Some(tag.to_owned()))
+            }
+            None => (name_and_tag, None),
+        };
+        Self::new(resource_type, scope, name, tag)
+    }
+}
+
+impl fmt::Display for ResourceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}:{}/{}:{}",
+            self.resource_type, self.scope, self.name, self.tag
+        )
+    }
+}
+
+impl Serialize for ResourceId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ResourceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResourceNameError {
@@ -184,14 +320,16 @@ impl fmt::Display for AgentImageReference {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceAgentDefinition {
     pub name: String,
-    pub image: AgentImageReference,
-    pub resources: Vec<ResourceRef>,
-    pub disable_resources: Vec<ResourceRef>,
+    pub id: ResourceId,
+    pub image: ResourceId,
+    pub resources: Vec<ResourceId>,
+    pub disable_resources: Vec<ResourceId>,
     pub memory_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceDefinition {
+    pub id: ResourceId,
     pub name: String,
     pub project_root: PathBuf,
     pub manager: String,
@@ -200,6 +338,7 @@ pub struct WorkspaceDefinition {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceReference {
+    pub id: ResourceId,
     pub name: String,
     pub project_root: PathBuf,
 }
@@ -216,7 +355,7 @@ impl Event for StartWorkspace {}
 pub struct RouteAgentMessage {
     pub id: String,
     pub workspace: WorkspaceReference,
-    pub agent: Option<String>,
+    pub agent: Option<ResourceId>,
     pub message: Message,
 }
 
@@ -225,7 +364,7 @@ impl Event for RouteAgentMessage {}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
-    pub name: String,
+    pub resource: ResourceId,
     pub arguments: String,
 }
 
@@ -333,9 +472,76 @@ fn is_tag_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-')
 }
 
+fn validate_resource_type(resource_type: &str) -> Result<(), ResourceIdError> {
+    if resource_type.is_empty()
+        || !resource_type.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+    {
+        return Err(ResourceIdError::InvalidType);
+    }
+    Ok(())
+}
+
+fn validate_resource_part(part: &str, error: ResourceIdError) -> Result<(), ResourceIdError> {
+    if part.is_empty()
+        || part == "."
+        || part == ".."
+        || part
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':'))
+    {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn validate_resource_tag(tag: &str) -> Result<(), ResourceIdError> {
+    if tag.is_empty() || tag.len() > 128 {
+        return Err(ResourceIdError::InvalidTag);
+    }
+    let mut characters = tag.chars();
+    let first = characters.next().ok_or(ResourceIdError::InvalidTag)?;
+    if first == '.' || first == '-' || !is_tag_character(first) {
+        return Err(ResourceIdError::InvalidTag);
+    }
+    if !characters.all(is_tag_character) {
+        return Err(ResourceIdError::InvalidTag);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_ids_default_to_latest_and_serialize_as_strings() {
+        let id = ResourceId::parse("agent:demo/coder").unwrap();
+
+        assert_eq!(id.resource_type(), "agent");
+        assert_eq!(id.scope(), "demo");
+        assert_eq!(id.name(), "coder");
+        assert_eq!(id.tag(), "latest");
+        assert_eq!(id.to_string(), "agent:demo/coder:latest");
+        assert_eq!(
+            serde_json::to_string(&id).unwrap(),
+            r#""agent:demo/coder:latest""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ResourceId>(r#""skill:local/review""#).unwrap(),
+            ResourceId::parse("skill:local/review:latest").unwrap()
+        );
+    }
+
+    #[test]
+    fn resource_ids_reject_ambiguous_or_invalid_parts() {
+        assert!(ResourceId::parse("agent:demo/coder:clone0").is_ok());
+        assert!(ResourceId::parse("Agent:demo/coder").is_err());
+        assert!(ResourceId::parse("agent:demo/coder:tag:extra").is_err());
+        assert!(ResourceId::parse("agent:../coder").is_err());
+        assert!(ResourceId::parse("agent:demo/coder/extra").is_err());
+    }
 
     #[test]
     fn resource_names_are_split_into_scope_and_name() {
@@ -421,7 +627,7 @@ mod tests {
             content: Some("Using the selected workflow.".into()),
             tool_calls: vec![ToolCall {
                 id: "call-1".into(),
-                name: "workflow__local__review".into(),
+                resource: ResourceId::parse("workflow:local/review:latest").unwrap(),
                 arguments: r#"{"path":"src/lib.rs"}"#.into(),
             }],
         };

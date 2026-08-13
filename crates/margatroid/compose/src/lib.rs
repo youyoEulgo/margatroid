@@ -2,9 +2,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use margatroid_types::{
-    AgentImageReference, ResourceName, ResourceRef, WorkspaceAgentDefinition, WorkspaceDefinition,
-};
+use margatroid_types::{ResourceId, WorkspaceAgentDefinition, WorkspaceDefinition};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 
@@ -186,7 +184,8 @@ enum RawResource {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawStructuredResource {
-    provider: String,
+    #[serde(rename = "type", alias = "provider")]
+    resource_type: String,
     name: String,
 }
 
@@ -207,12 +206,23 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
             )
         })?;
         validate_logical_name(&name, "agent")?;
-        let image = AgentImageReference::new(raw_agent.image).map_err(|error| {
+        let image_value = if raw_agent.image.starts_with("image:") {
+            raw_agent.image
+        } else {
+            format!("image:{}", raw_agent.image)
+        };
+        let image = ResourceId::parse(image_value).map_err(|error| {
             ComposeError::new(
                 ComposeErrorKind::InvalidImageReference,
                 format!("invalid image reference: {error}"),
             )
         })?;
+        if image.resource_type() != "image" {
+            return Err(ComposeError::new(
+                ComposeErrorKind::InvalidImageReference,
+                "image reference must use type image",
+            ));
+        }
         let resources = raw_agent
             .resources
             .into_iter()
@@ -228,6 +238,12 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
             .map(|path| resolve_path(&project_root, path))
             .transpose()?;
         agents.push(WorkspaceAgentDefinition {
+            id: ResourceId::new("agent", &raw.name, &name, None::<String>).map_err(|error| {
+                ComposeError::new(
+                    ComposeErrorKind::InvalidDefinition,
+                    format!("invalid Agent resource ID: {error}"),
+                )
+            })?,
             name,
             image,
             resources,
@@ -261,6 +277,9 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
     }
 
     Ok(WorkspaceDefinition {
+        id: ResourceId::new("workspace", "local", &raw.name, None::<String>).map_err(|error| {
+            ComposeError::new(ComposeErrorKind::InvalidDefinition, error.to_string())
+        })?,
         name: raw.name,
         project_root,
         manager,
@@ -268,26 +287,14 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
     })
 }
 
-fn parse_resource(raw: RawResource) -> Result<ResourceRef, ComposeError> {
-    let (provider, name) = match raw {
-        RawResource::Structured(resource) => (resource.provider, resource.name),
-        RawResource::Shorthand(value) => value.split_once(':').map_or_else(
-            || {
-                Err(ComposeError::new(
-                    ComposeErrorKind::InvalidResourceReference,
-                    "resource shorthand must use provider:scope/name",
-                ))
-            },
-            |(provider, name)| Ok((provider.to_owned(), name.to_owned())),
-        )?,
+fn parse_resource(raw: RawResource) -> Result<ResourceId, ComposeError> {
+    let value = match raw {
+        RawResource::Structured(resource) => {
+            format!("{}:{}", resource.resource_type, resource.name)
+        }
+        RawResource::Shorthand(value) => value,
     };
-    let name = ResourceName::new(name).map_err(|error| {
-        ComposeError::new(
-            ComposeErrorKind::InvalidResourceReference,
-            format!("invalid resource reference: {error}"),
-        )
-    })?;
-    ResourceRef::new(provider, name).map_err(|error| {
+    ResourceId::parse(value).map_err(|error| {
         ComposeError::new(
             ComposeErrorKind::InvalidResourceReference,
             format!("invalid resource reference: {error}"),
@@ -390,7 +397,14 @@ agents:
             PathBuf::from("/tmp/workspace/project")
         );
         assert_eq!(definition.manager, "coder");
-        assert_eq!(definition.agents[0].image.to_string(), "local/coder:latest");
+        assert_eq!(
+            definition.agents[0].id.to_string(),
+            "agent:demo/coder:latest"
+        );
+        assert_eq!(
+            definition.agents[0].image.to_string(),
+            "image:local/coder:latest"
+        );
         assert_eq!(definition.agents[1].name, "reviewer");
         assert_eq!(
             definition.agents[0].memory_path,
@@ -409,7 +423,7 @@ agents:
 "#;
         let definition = compile_str(source, "/tmp/workspace.yaml").unwrap();
         assert_eq!(definition.manager, "manager");
-        assert_eq!(definition.agents[0].resources[0].provider(), "skill");
+        assert_eq!(definition.agents[0].resources[0].resource_type(), "skill");
     }
 
     #[test]

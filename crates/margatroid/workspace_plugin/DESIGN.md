@@ -29,6 +29,16 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # WorkspacePlugin
 
+## 统一资源身份约定
+
+```text
+Workspace和Workspace中的Agent都是可寻址资源
+Workspace使用workspace:local/<workspace-name>:latest的ResourceId，省略tag时为latest
+静态Agent使用agent:<workspace-name>/<agent-name>:latest的ResourceId
+静态Workspace Agent固定使用latest；WorkspacePlugin不得根据Agent tag创建独立Memory目录，动态Subagent留待后续设计
+Workspace查找先按完整ResourceId定位，再得到当前World中的Entity句柄
+```
+
 ## 类型
 
 公开：
@@ -106,11 +116,11 @@ StopWorkspaceByReferenceResult：逻辑引用关闭结果，公开事件--供DTO
     impl Event for StopWorkspaceByReferenceResult
         Event：公开trait实现
 
-WorkspaceIdentity：Workspace身份，公开组件--保存稳定逻辑名称与规范化项目根
-    name: Arc<str>--项目内Workspace逻辑名称，私有
+WorkspaceIdentity：Workspace身份，公开组件--保存稳定资源ID与规范化项目根
+    id: ResourceId--type=workspace的唯一资源ID，私有
     project_root: Arc<PathBuf>--规范化绝对项目根，私有
-    name(&self) -> &str
-        取得名称：公开方法，返回Workspace逻辑名称
+    id(&self) -> &ResourceId
+        取得身份：公开方法，返回完整Workspace资源ID
     project_root(&self) -> &Path
         取得项目根：公开方法，返回规范化项目根
     impl Component for WorkspaceIdentity
@@ -182,8 +192,10 @@ WorldWorkspaceExt：World Workspace扩展，公开trait--发送Workspace命令�
         关闭Workspace：公开方法，发送StopWorkspace并唤醒Runtime
     workspaces(&self) -> Vec<Entity>
         列出Workspace：公开方法，返回当前已登记且仍存活的全部Workspace Entity
+    workspace_by_id(&self, id: &ResourceId) -> Option<Entity>
+        按资源ID查询Workspace：公开方法，按完整ResourceId返回已登记且仍存活的Workspace Entity
     workspace(&self, project_root: &Path, name: &str) -> Option<Entity>
-        查询Workspace：公开方法，只返回已登记且仍存活的Workspace Entity
+        兼容查询Workspace：公开方法，把名称规范化为workspace:local/<name>:latest，并同时校验项目根
     workspace_agent(&self, workspace: Entity, name: &str) -> Option<Entity>
         查询Agent：公开方法，从WorkspaceAgents按逻辑名称返回存活Agent
     workspace_manager(&self, workspace: Entity) -> Option<Entity>
@@ -228,11 +240,11 @@ PendingWorkspace：未完成Workspace操作，私有结构体--暂存跨多个�
 
 PreparedWorkspaceAgent：单Agent实例材料，私有结构体--创建Agent Entity前收集完整依赖
     name: String--Agent逻辑名称
-    agent_id: String--Workspace生成的稳定Agent ID，例如<workspace>.<name><index>
+    agent_id: ResourceId--Workspace生成的稳定Agent ID，例如agent:<workspace>/<name>:latest
     system_prompt: String--从AgentImage Soul取得的系统提示词
     messages: Vec<Message>--MemoryPlugin恢复的长期对话上下文
     tool_context: Vec<Message>--MemoryPlugin恢复的当前轮工具上下文
-    default_visibility: BTreeSet<ResourceRef>--镜像默认值与Workspace参数合并后的资源集合，交给AgentPlugin构造只读组件
+    default_visibility: BTreeSet<ResourceId>--镜像默认值与Workspace参数合并后的资源集合，交给AgentPlugin构造只读组件
     inference_snapshot: AgentInferenceSnapshot--InferencePlugin构造的实例推理快照
     tool_environment: AgentToolEnvironment--项目根与镜像版本根
     memory: AgentMemory--已经打开但尚未绑定Entity的SQLite连接
@@ -305,14 +317,14 @@ prepare_workspace_agents(world: &mut World, request_id: &str) -> Result<(), Work
         读取AgentImageIdentity、AgentImageSoul、AgentImageModelConfig和AgentImageDefaultVisibility
         调用WorldInferenceExt::build_agent_inference_snapshot构造AgentInferenceSnapshot
         构造default_visibility：镜像默认resources + definition.resources - definition.disable_resources
-        根据agent_images_root和AgentImageReference构造镜像版本根
+        根据agent_images_root和type=image的ResourceId构造镜像版本根
         使用definition.project_root和镜像版本根构造AgentToolEnvironment
         memory_path为空时生成<project>/.margatroid/workspaces/<workspace>/memory/<agent>/memory.sql
         调用AgentMemory::open取得AgentMemory与恢复的RealtimeContext
         收集Soul、default_visibility和恢复上下文
         构造PreparedWorkspaceAgent并保存到pending.prepared
         任一步失败时释放已打开AgentMemory并返回错误，不发送部分Agent创建事件
-        全部Agent准备成功后为每个Agent生成稳定Agent ID和独立创建子请求ID
+        全部Agent准备成功后使用WorkspaceAgentDefinition.id并为每个Agent生成独立创建子请求ID
         保存agent_requests[子请求ID] = (Workspace请求ID, Agent名称)
         发送AgentCreateRequest { id, agent_id, workspace_id, system_prompt, messages, tool_context, default_visibility }
         AgentCreateRequest只交付AgentPlugin自有字段，不携带Memory、Inference或Tool组件
@@ -341,7 +353,7 @@ validate_agent_visibility(world: &World, agent: Entity) -> Result<(), WorkspaceE
     验证Agent可见性：私有函数，确保启动成功时全部动态可见资源可解析为名称唯一的工具
     行为：
         读取AgentDynamicVisibility；缺失时返回ResourceSetupFailed
-        按ResourceRef顺序逐个调用WorldToolExt::resolve_tool
+        按ResourceId顺序逐个调用WorldToolExt::resolve_tool
         Provider未注册、Skill或Workflow文件不存在、定义非法时返回ResourceSetupFailed
         两个资源暴露相同ToolDefinition.name时返回ResourceSetupFailed
         只验证并丢弃Tool，不缓存工具定义或资源正文
@@ -375,8 +387,8 @@ validate_request_id(world: &World, id: &str) -> Result<(), WorkspaceError>
 validate_definition(definition: WorkspaceDefinition) -> Result<WorkspaceDefinition, WorkspaceError>
     验证定义：私有函数，规范化项目根和Memory路径，验证Agent唯一性与manager引用
 
-validate_agent_definition(agent: &WorkspaceAgentDefinition) -> Result<(), WorkspaceError>
-    验证Agent定义：私有函数，验证Agent逻辑名称
+validate_agent_definition(agent: &WorkspaceAgentDefinition, workspace_name: &str) -> Result<(), WorkspaceError>
+    验证Agent定义：私有函数，检查逻辑名称、Agent资源ID的type/scope/name一致性和AgentImage资源类型；保留完整实例tag
 
 normalize_project_root(path: PathBuf) -> Result<PathBuf, WorkspaceError>
     规范化项目根：私有函数，要求绝对路径且不包含父级跳转
@@ -395,17 +407,20 @@ validate_logical_name(value: &str) -> Result<(), WorkspaceError>
     验证逻辑名称：私有函数，要求非空、长度有界且可安全作为单个目录段
     行为：拒绝控制字符、路径分隔符、.、..和其他不能作为单目录段的值
 
-image_root(root: &Path, reference: &AgentImageReference) -> PathBuf
-    构造镜像版本根：私有函数，依次拼接scope、name和tag
+image_root(root: &Path, reference: &ResourceId) -> PathBuf
+    构造镜像版本根：私有函数，要求type=image，依次拼接scope、name和tag
 
-default_memory_path(project_root: &Path, workspace: &str, agent: &str) -> PathBuf
-    构造默认Memory路径：私有函数，返回项目内对应Agent的memory.sql路径
+default_memory_path(project_root: &Path, agent: &ResourceId) -> PathBuf
+    构造默认Memory路径：私有函数，静态Agent统一使用项目内Agent memory.sql路径；不按tag创建目录，Subagent路径策略留待后续设计
 
 agent_image_components_missing() -> WorkspaceError
     构造镜像组件错误：私有函数，返回稳定AgentImageComponentsMissing错误
 
 ready_workspace_key(world: &World, workspace: Entity) -> Result<WorkspaceKey, WorkspaceError>
     取得就绪键：私有函数，验证Entity、Identity、Agents和ready索引一致
+
+workspace_by_reference(world: &World, reference: &WorkspaceReference) -> Option<Entity>
+    按引用查询Workspace：私有函数，按完整ResourceId查询，并复核规范化项目根与Workspace名称
 
 is_registered_workspace(world: &World, workspace: Entity) -> bool
     检查已登记Workspace：私有函数，复用ready_workspace_key
@@ -440,7 +455,7 @@ cleanup_orphan_agent(world: &mut World, agent: Entity)
         -> Workspace项目级模型路由和AgentInferenceSnapshot
     ToolPlugin
         -> AgentToolEnvironment
-        -> 工具定义在每次InferenceCommand发送前由AgentPlugin按动态可见性解析
+        -> 工具定义在每次InferenceRequest发送前由AgentPlugin按动态可见性解析
     MemoryPlugin
         -> AgentMemory
         -> 打开数据库时恢复的RealtimeContext { messages, tool_context }
@@ -450,7 +465,7 @@ cleanup_orphan_agent(world: &mut World, agent: Entity)
     Skill和Workflow在启动完成前解析一次以验证动态可见性
         -> Workspace传递项目根与镜像根并调用ToolPlugin真实解析路径
         -> 验证结果和正文不缓存
-        -> 每次构造InferenceCommand时仍由对应ToolDefinitionProvider读取当前内容
+        -> 每次调用时仍由对应工具定义Plugin重新读取当前内容
 
 workspace up：
     Compose生成WorkspaceDefinition
@@ -473,7 +488,7 @@ workspace up：
         -> InferencePlugin读取<project_root>/.margatroid/models.toml
         -> 存在时编译并挂载WorkspaceModelRoutes
         -> 不存在时移除旧WorkspaceModelRoutes并返回0
-    每次InferenceCommand：
+    每次InferenceRequest：
         -> WorkspaceModelRoutes[AgentInferenceSnapshot.model]
         -> 未命中时GlobalModelRoutes[model]
         -> 都未命中时InferencePlugin发送AgentFailure

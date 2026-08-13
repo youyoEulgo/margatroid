@@ -10,7 +10,7 @@ Loader 只描述镜像中“有什么”，不决定这些内容“怎么运行�
 
 - Loader 加载 AgentImage，WorkspacePlugin 创建 AgentInstance。
 - Loader 保存模型 ID 文本和参数原值，InferencePlugin 解释参数并验证路由。
-- Loader 发现默认可见ResourceRef，WorkspacePlugin计算Agent默认可见性，ToolPlugin按动态可见性生成请求工具。
+- Loader 发现默认可见ResourceId，WorkspacePlugin计算Agent默认可见性，ToolPlugin按动态可见性生成请求工具。
 - 默认可见性属于 AgentImage，最终可见性属于 AgentInstance。
 - 磁盘目录是权威内容，Entity 保存最近一次成功加载的镜像数据。
 - 文件读取走 AsyncRuntime，Entity 只能在 ECS 主线程创建或刷新。
@@ -38,11 +38,11 @@ temperature = 0.7
 max_output_tokens = 8192
 ```
 
-镜像引用使用 `scope/name:tag`，例如 `local/coder:latest`。省略 tag 时规范化为 `latest`。
+镜像资源ID使用 `image:scope/name:tag`，例如 `image:local/coder:latest`。省略 tag 时规范化为 `latest`。
 `model` 是模型路由 ID 文本；Provider、base URL 和 API key 属于 `models.toml`，不能写入镜像。
 
-`skills/`和`workflows/`下的`<scope>/<name>`分别转换为provider为`skill`和`workflow`的
-`ResourceRef`并进入镜像默认可见性；普通Tool资源由镜像清单声明。Loader不读取资源正文。
+`skills/`和`workflows/`下的`<scope>/<name>`分别转换为`skill:scope/name:latest`和
+`workflow:scope/name:latest`的`ResourceId`并进入镜像默认可见性；Loader不读取资源正文。
 
 ## 安装
 
@@ -74,11 +74,11 @@ WorkspacePlugin 为 Workspace 文件中的每个 Agent 发送加载请求：
 ```rust
 use agent_image_loader_plugin::LoadAgentImage;
 use app_runtime_plugin::WorldEventExt;
-use margatroid_types::AgentImageReference;
+use margatroid_types::ResourceId;
 
 world.send_event(LoadAgentImage {
     id: "workspace/demo/coder".into(),
-    reference: AgentImageReference::new("local/coder:latest")?,
+    reference: ResourceId::parse("image:local/coder:latest")?,
 });
 ```
 
@@ -156,7 +156,7 @@ AgentImage 后续刷新不会改变运行中实例；执行 `workspace reload` �
 
 资源内容不进入可见性数据。WorkspacePlugin同时挂载`AgentToolEnvironment`；每次请求由
 AgentPlugin遍历动态可见资源并逐个交给ToolPlugin生成工具，SkillPlugin等Provider执行时从
-`ToolContext`取得项目根和镜像根。
+具体资源Plugin从`AgentToolEnvironment`取得项目根和镜像根。
 
 ```text
 项目级 .margatroid/skills/<scope>/<name>

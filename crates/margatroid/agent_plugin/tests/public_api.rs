@@ -2,10 +2,11 @@ use std::collections::BTreeSet;
 
 use agent_plugin::{
     AgentContext, AgentCreateRequest, AgentCreated, AgentDefaultVisibility, AgentDynamicVisibility,
-    AgentPlugin, AgentWorkspaceId,
+    AgentPlugin, AgentWorkspaceId, WorldAgentExt,
 };
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::App;
+use margatroid_types::ResourceId;
 
 #[test]
 fn documented_public_api_creates_an_agent() {
@@ -15,7 +16,7 @@ fn documented_public_api_creates_an_agent() {
     let workspace = app.world_mut().spawn();
     app.world().send_event(AgentCreateRequest {
         id: "agent-1".into(),
-        agent_id: "test.agent0".into(),
+        agent_id: ResourceId::parse("agent:test/agent0").unwrap(),
         workspace_id: workspace,
         system_prompt: "You are concise.".into(),
         messages: Vec::new(),
@@ -59,4 +60,35 @@ fn documented_public_api_creates_an_agent() {
         .unwrap()
         .resources()
         .is_empty());
+}
+
+#[test]
+fn duplicate_agent_resource_ids_are_rejected() {
+    let mut app = App::new();
+    app.add_plugin(RuntimePlugin::default())
+        .add_plugin(AgentPlugin::default());
+    let workspace = app.world_mut().spawn();
+    let agent_id = ResourceId::parse("agent:test/agent0").unwrap();
+
+    for request_id in ["agent-1", "agent-2"] {
+        app.world().send_event(AgentCreateRequest {
+            id: request_id.into(),
+            agent_id: agent_id.clone(),
+            workspace_id: workspace,
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tool_context: Vec::new(),
+            default_visibility: BTreeSet::new(),
+        });
+    }
+    app.tick();
+    app.tick();
+
+    let created = app
+        .world()
+        .event_reader::<AgentCreated>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert_eq!(created.len(), 1);
+    assert_eq!(app.world().agent(&agent_id), Some(created[0].agent));
 }

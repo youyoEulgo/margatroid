@@ -1,115 +1,61 @@
-use std::convert::Infallible;
-
-use app_runtime_plugin::RuntimePlugin;
-use async_runtime_plugin::AsyncRuntimePlugin;
+use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::App;
-use margatroid_types::{ResourceName, ResourceRef, ToolDefinition};
-use serde::Deserialize;
+use margatroid_types::{ResourceId, ToolCall, ToolDefinition};
 use serde_json::json;
 use tool_plugin::{
-    AgentToolEnvironment, AppToolExt, Tool, ToolCallRequest, ToolContext, ToolPlugin, WorldToolExt,
+    AppToolExt, ToolCallEvent, ToolCallRequest, ToolPlugin, ToolTemplate, WorldToolExt,
 };
-use tool_plugin::{ToolDefinitionProvider, ToolError};
-
-#[derive(Deserialize)]
-struct EchoArguments {
-    text: String,
-}
-
-struct SkillProvider;
-
-impl ToolDefinitionProvider for SkillProvider {
-    fn id(&self) -> &str {
-        "skill"
-    }
-
-    fn provide(
-        &self,
-        _environment: &AgentToolEnvironment,
-        name: &ResourceName,
-    ) -> Result<Tool, ToolError> {
-        Tool::new(
-            ResourceRef::new("skill", name.clone()).unwrap(),
-            ToolDefinition {
-                name: "skill_review".into(),
-                description: "Run the selected skill".into(),
-                input_schema: json!({ "type": "object" }),
-            },
-            |_context: ToolContext, _arguments: serde_json::Value| async move {
-                Ok::<_, Infallible>("done".into())
-            },
-        )
-    }
-}
 
 #[test]
-fn documented_public_api_composes_from_an_external_crate() {
+fn templates_route_domain_tool_calls() {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
-        .add_plugin(AsyncRuntimePlugin)
-        .add_plugin(ToolPlugin::new());
-    app.register_tool(
-        Tool::new(
-            ResourceRef::new("tool", ResourceName::new("builtin/echo").unwrap()).unwrap(),
+        .add_plugin(ToolPlugin::default());
+    let loader = ResourceId::parse("tool:builtin/skill-loader:latest").unwrap();
+    app.register_tool_template(
+        ToolTemplate::new(
+            loader.clone(),
             ToolDefinition {
-                name: "echo".into(),
-                description: "Return the supplied text".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": { "text": { "type": "string" } },
-                    "required": ["text"]
-                }),
-            },
-            |context: ToolContext, arguments: EchoArguments| async move {
-                Ok::<_, Infallible>(format!(
-                    "{}:{}:{}",
-                    context.request_id(),
-                    context.tool_call_id(),
-                    arguments.text
-                ))
+                name: "skill_loader".into(),
+                description: "Load a skill resource.".into(),
+                input_schema: json!({"type":"object"}),
             },
         )
         .unwrap(),
     );
+    assert_eq!(
+        app.world()
+            .tool_template(&loader)
+            .unwrap()
+            .definition()
+            .name,
+        "skill_loader"
+    );
 
     let agent = app.world_mut().spawn();
-    app.world_mut()
-        .insert_component(agent, AgentToolEnvironment::new("/project", "/image"));
-    let tool = app
-        .world()
-        .resolve_tool(
-            agent,
-            &ResourceRef::new("tool", ResourceName::new("builtin/echo").unwrap()).unwrap(),
-        )
-        .unwrap();
-    assert_eq!(tool.definition().name, "echo");
-
-    app.world().emit_event(ToolCallRequest {
-        id: "request".into(),
+    let resource = ResourceId::parse("skill:local/review:latest").unwrap();
+    app.world().send_event(ToolCallRequest {
+        id: "turn-1".into(),
         agent,
-        resource: ResourceRef::new("tool", ResourceName::new("builtin/echo").unwrap()).unwrap(),
-        call: margatroid_types::ToolCall {
-            id: "call".into(),
-            name: "echo".into(),
-            arguments: r#"{"text":"hello"}"#.into(),
+        call: ToolCall {
+            id: "call-1".into(),
+            resource: resource.clone(),
+            arguments: "{}".into(),
         },
     });
-}
-
-#[test]
-fn external_definition_providers_resolve_resources() {
-    let mut app = App::new();
-    app.add_plugin(RuntimePlugin::default())
-        .add_plugin(AsyncRuntimePlugin)
-        .add_plugin(ToolPlugin::new())
-        .register_tool_provider(SkillProvider);
-    let agent = app.world_mut().spawn();
-    app.world_mut()
-        .insert_component(agent, AgentToolEnvironment::new("/project", "/image"));
-
-    let resource = ResourceRef::new("skill", ResourceName::new("local/review").unwrap()).unwrap();
-    let tool = app.world().resolve_tool(agent, &resource).unwrap();
-
-    assert_eq!(tool.resource(), &resource);
-    assert_eq!(tool.definition().name, "skill_review");
+    app.tick();
+    app.tick();
+    let routed = app
+        .world()
+        .event_reader::<ToolCallEvent>()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(routed.loader, loader);
+    assert_eq!(routed.resource, resource);
+    assert_eq!(routed.call.resource, routed.resource);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&routed.call.arguments).unwrap(),
+        json!({"resource":"skill:local/review:latest"})
+    );
 }

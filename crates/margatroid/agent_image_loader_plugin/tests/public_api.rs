@@ -9,7 +9,7 @@ use agent_image_loader_plugin::{
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::App;
-use margatroid_types::AgentImageReference;
+use margatroid_types::ResourceId;
 
 fn unique_directory() -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -40,7 +40,7 @@ fn documented_public_api_composes_from_an_external_crate() {
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(AgentImageLoaderPlugin::open(&library).unwrap());
-    let reference = AgentImageReference::new("local/coder").unwrap();
+    let reference = ResourceId::parse("image:local/coder").unwrap();
     app.world().send_event(LoadAgentImage {
         id: "public-api".into(),
         reference: reference.clone(),

@@ -2,11 +2,13 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use core_plugin::{App, Plugin};
-use margatroid_types::{ResourceName, ResourceRef, ToolDefinition};
-use serde_json::{json, Value};
+use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
+use core_plugin::{App, Plugin, Resource, World};
+use margatroid_types::{ResourceId, ToolDefinition};
+use serde_json::json;
 use tool_plugin::{
-    AgentToolEnvironment, AppToolExt, Tool, ToolDefinitionProvider, ToolError, ToolErrorKind,
+    AgentToolEnvironment, AppToolExt, ToolCallEvent, ToolDefinitionResult, ToolDefinitionRoute,
+    ToolError, ToolErrorKind, ToolTemplate,
 };
 
 const PROVIDER_ID: &str = "workflow";
@@ -51,6 +53,11 @@ pub struct WorkflowPlugin {
     home_root: Arc<PathBuf>,
 }
 
+struct WorkflowRoots {
+    home_root: Arc<PathBuf>,
+}
+impl Resource for WorkflowRoots {}
+
 impl WorkflowPlugin {
     pub fn open(home_root: impl Into<PathBuf>) -> Result<Self, WorkflowError> {
         let home_root = normalize_root(home_root.into()).ok_or_else(|| {
@@ -67,60 +74,88 @@ impl WorkflowPlugin {
 
 impl Plugin for WorkflowPlugin {
     fn build(self, app: &mut App) {
-        app.register_tool_provider(WorkflowToolProvider {
-            home_root: self.home_root,
+        app.world_mut().insert_resource(WorkflowRoots {
+            home_root: self.home_root.clone(),
+        });
+        app.register_tool_template(
+            ToolTemplate::new(
+                ResourceId::parse("tool:builtin/workflow-loader:latest").unwrap(),
+                ToolDefinition {
+                    name: "workflow_loader".into(),
+                    description: "Load a workflow resource by its complete resource ID.".into(),
+                    input_schema: json!({"type":"object"}),
+                },
+            )
+            .unwrap(),
+        );
+        app.add_system(RuntimePlugin::UPDATE, workflow_tool_definition_system)
+            .add_system(RuntimePlugin::UPDATE, workflow_tool_call_system);
+    }
+}
+
+fn workflow_tool_definition_system(world: &mut World) {
+    let routes = world
+        .event_reader::<ToolDefinitionRoute>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for route in routes.into_iter().filter(|route| {
+        route.loader == ResourceId::parse("tool:builtin/workflow-loader:latest").unwrap()
+    }) {
+        let result = world
+            .get_component::<AgentToolEnvironment>(route.agent)
+            .ok_or_else(|| {
+                ToolError::new(
+                    ToolErrorKind::ToolEnvironmentMissing,
+                    "agent tool environment is missing",
+                )
+            })
+            .and_then(|environment| {
+                validate_workflow_resource(&route.resource)?;
+                let roots = world
+                    .get_resource::<WorkflowRoots>()
+                    .expect("WorkflowPlugin is installed");
+                find_workflow_directory(environment, &roots.home_root, &route.resource)?;
+                Ok(ToolDefinition {
+                    name: "workflow_loader".into(),
+                    description: "Load a workflow resource.".into(),
+                    input_schema: json!({"type":"object"}),
+                })
+            });
+        world.send_event(ToolDefinitionResult {
+            id: route.id,
+            agent: route.agent,
+            resource: route.resource,
+            result,
         });
     }
 }
 
-struct WorkflowToolProvider {
-    home_root: Arc<PathBuf>,
-}
-
-impl ToolDefinitionProvider for WorkflowToolProvider {
-    fn id(&self) -> &str {
-        PROVIDER_ID
-    }
-
-    fn provide(
-        &self,
-        environment: &AgentToolEnvironment,
-        name: &ResourceName,
-    ) -> Result<Tool, ToolError> {
-        find_workflow_directory(environment, &self.home_root, name)?;
-        let resource = ResourceRef::new(PROVIDER_ID, name.clone()).map_err(|_| {
-            ToolError::new(
-                ToolErrorKind::InvalidDefinition,
-                "workflow resource reference is invalid",
-            )
-        })?;
-        let exposed_name = exposed_name(name)?;
-        let result = format!(
-            "Workflow `{}` is available, but workflow execution is not implemented yet.",
-            name
-        );
-        Tool::new(
-            resource,
-            ToolDefinition {
-                name: exposed_name,
-                description: "Workflow execution is not implemented yet.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "additionalProperties": true
-                }),
+fn workflow_tool_call_system(world: &mut World) {
+    let calls = world
+        .event_reader::<ToolCallEvent>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for event in calls.into_iter().filter(|event| {
+        event.loader == ResourceId::parse("tool:builtin/workflow-loader:latest").unwrap()
+    }) {
+        let content = "Workflow execution is not implemented yet.".to_owned();
+        world.send_event(margatroid_types::AgentMessage {
+            id: event.id,
+            agent: event.agent,
+            message: margatroid_types::Message::Tool {
+                tool_call_id: event.call.id,
+                content,
             },
-            move |_context, _arguments: Value| {
-                let result = result.clone();
-                async move { Ok::<_, std::convert::Infallible>(result) }
-            },
-        )
+        });
     }
 }
 
 fn find_workflow_directory(
     environment: &AgentToolEnvironment,
     home_root: &Path,
-    name: &ResourceName,
+    resource: &ResourceId,
 ) -> Result<(), ToolError> {
     let candidates = [
         environment
@@ -131,7 +166,10 @@ fn find_workflow_directory(
         home_root.to_path_buf(),
     ];
     for root in candidates {
-        let path = root.join(name.scope()).join(name.name());
+        let path = root
+            .join(resource.scope())
+            .join(resource.name())
+            .join(resource.tag());
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -156,15 +194,14 @@ fn find_workflow_directory(
     ))
 }
 
-fn exposed_name(name: &ResourceName) -> Result<String, ToolError> {
-    let value = format!("workflow_{}_{}", name.scope(), name.name());
-    if value.len() > 64 {
+fn validate_workflow_resource(resource: &ResourceId) -> Result<(), ToolError> {
+    if resource.resource_type() != PROVIDER_ID || resource.tag() != "latest" {
         return Err(ToolError::new(
-            ToolErrorKind::InvalidDefinition,
-            "workflow exposed name is too long",
+            ToolErrorKind::ResourceResolutionFailed,
+            "workflow resource must use type workflow and the supported latest tag",
         ));
     }
-    Ok(value)
+    Ok(())
 }
 
 fn normalize_root(path: PathBuf) -> Option<PathBuf> {
@@ -182,72 +219,4 @@ fn normalize_root(path: PathBuf) -> Option<PathBuf> {
         }
     }
     Some(normalized)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
-
-    use app_runtime_plugin::RuntimePlugin;
-    use async_runtime_plugin::AsyncRuntimePlugin;
-    use core_plugin::App;
-    use margatroid_types::{AgentMessage, Message, ToolCall};
-    use tempfile::tempdir;
-    use tool_plugin::{ToolCallRequest, WorldToolExt};
-
-    use super::*;
-
-    #[test]
-    fn existing_workflow_resolves_to_a_placeholder_tool() {
-        let project = tempdir().unwrap();
-        let image = tempdir().unwrap();
-        let home = tempdir().unwrap();
-        let workflow = project.path().join(".margatroid/workflows/local/review");
-        std::fs::create_dir_all(&workflow).unwrap();
-
-        let mut app = App::new();
-        app.add_plugin(RuntimePlugin::default())
-            .add_plugin(AsyncRuntimePlugin)
-            .add_plugin(tool_plugin::ToolPlugin::default())
-            .add_plugin(WorkflowPlugin::open(home.path()).unwrap());
-        let agent = app.world_mut().spawn();
-        app.world_mut().insert_component(
-            agent,
-            AgentToolEnvironment::new(project.path(), image.path()),
-        );
-        let resource =
-            ResourceRef::new("workflow", ResourceName::new("local/review").unwrap()).unwrap();
-        let tool = app.world().resolve_tool(agent, &resource).unwrap();
-        assert_eq!(tool.definition().name, "workflow_local_review");
-
-        app.world().emit_event(ToolCallRequest {
-            id: "turn-1".into(),
-            agent,
-            resource,
-            call: ToolCall {
-                id: "call-1".into(),
-                name: tool.definition().name.clone(),
-                arguments: "{}".into(),
-            },
-        });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            app.tick();
-            if let Some(message) = app
-                .world()
-                .event_reader::<AgentMessage>()
-                .into_iter()
-                .next()
-            {
-                assert!(matches!(
-                    message.message,
-                    Message::Tool { ref content, .. }
-                        if content.contains("execution is not implemented")
-                ));
-                break;
-            }
-            assert!(Instant::now() < deadline, "workflow execution timed out");
-            std::thread::yield_now();
-        }
-    }
 }

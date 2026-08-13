@@ -1,92 +1,47 @@
 # SkillPlugin
 
-## 定位
-
-SkillPlugin是`provider="skill"`的`ToolDefinitionProvider`。每个Skill资源都被解析成一个独立
-`Tool`，与普通Tool走完全相同的构造链路。
-
-不存在全局`use_skill(name)`工具，也不在工具参数中进行第二次资源路由。Skill的`ResourceRef`就是
-可见性单元，模型可见工具名直接对应这一个Skill。
-
 ## 类型
 
 公开：
 ```text
-SkillPlugin：Skill工具定义Plugin，公开结构体--配置主目录Skill根并注册SkillToolProvider
-    home_root: Arc<PathBuf>--主目录Skill根，例如~/.margatroid/skills
+SkillPlugin：Skill工具定义Plugin，公开结构体--注册skill Loader并处理Skill路由事件
+    home_root: Arc<PathBuf>--主目录Skill根
     open(home_root: impl Into<PathBuf>) -> Result<Self, SkillError>
-        打开Plugin：规范化并保存绝对主目录根，不扫描资源库
     impl Plugin for SkillPlugin
-        build(self, app: &mut App)
-            构建插件：公开trait方法，通过ToolPlugin注册provider ID skill的SkillToolProvider
 
-SkillErrorKind：Skill Plugin配置错误分类，公开枚举
-    InvalidRoot--主目录Skill根不是无父级跳转的绝对路径
-
-SkillError：Skill Plugin配置错误，公开结构体
-    kind: SkillErrorKind--稳定错误分类，私有
-    message: String--不泄露Skill正文的描述，私有
-    new(kind: SkillErrorKind, message: impl Into<String>) -> Self
-        构造错误：私有关联函数，保存配置错误描述
-    kind(&self) -> SkillErrorKind
-        取得分类：公开方法
-    message(&self) -> &str
-        取得描述：公开方法
-    impl Display + Error for SkillError
+SkillError：Skill配置错误，公开结构体
+SkillErrorKind：Skill配置错误分类，公开枚举
 ```
 
 私有：
 ```text
-SkillToolProvider：Skill工具定义提供方，私有结构体
-    home_root: Arc<PathBuf>
-    impl ToolDefinitionProvider for SkillToolProvider
-        id() -> "skill"
-        provide(environment, name) -> Result<Tool, ToolError>
-            按项目、AgentImage、主目录顺序查找并读取SKILL.md
-            ToolDefinition.description使用完整SKILL.md正文
-            handler忽略参数并返回完整SKILL.md正文
+SkillLoaderTemplate：Skill Loader模板，私有常量定义
+    id: tool:builtin/skill-loader:latest
+    definition.name: skill_loader--仅注册表内部模板名，不进入InferenceRequest
+    definition.input_schema: {"type":"object"}--模型不负责传Skill ResourceId
+
+Skill路径查找函数：按project/.margatroid/skills、image/skills、home顺序查找
 ```
 
 ## 函数
 
-私有：
 ```text
-find_skill_file(environment, home_root, name) -> Result<PathBuf, ToolError>
-    查找Skill文件：按项目目录、AgentImage目录、主目录顺序返回第一个存在的SKILL.md
+skill_tool_definition_system(world: &mut World)
+    定义检查：读取ToolDefinitionRoute
+    行为：只处理skill-loader；验证skill:scope/name:tag，精确查找SKILL.md；成功返回name=完整Skill ResourceId且无参数的ToolDefinitionResult，失败发送错误结果
 
-exposed_name(name: &ResourceName) -> Result<String, ToolError>
-    构造模型名称：生成skill_<scope>_<name>并限制为ToolPlugin允许的64字节
+skill_tool_call_system(world: &mut World)
+    Skill调用：读取ToolCallEvent
+    行为：只处理skill-loader；按event.resource中的完整ResourceId重新查找并读取SKILL.md；成功或失败都直接发送AgentMessage::Tool，保留原轮次ID和tool_call_id
 
-normalize_root(path: PathBuf) -> Option<PathBuf>
-    规范化主目录根：要求绝对路径、拒绝父级跳转并去除当前目录段
+find_skill_file(environment: &AgentToolEnvironment, home_root: &Path, resource: &ResourceId) -> Result<PathBuf, ToolError>
+    查找Skill：project、image、home顺序；找到目录但缺少SKILL.md时立即失败，不回退
 ```
 
 ## 逻辑
 
 ```text
-AgentDynamicVisibility包含：
-    ResourceRef { provider: "skill", name: local/code-review }
-
-准备LLM请求：
-    ToolPlugin按provider="skill"找到SkillToolProvider
-        -> 依次查找项目、AgentImage和主目录中的local/code-review/SKILL.md
-        -> 读取最高优先级SKILL.md正文
-        -> provider为local/code-review构造一个Tool
-        -> Tool.resource保持同一个ResourceRef
-        -> ToolDefinition.name使用skill_local_code-review
-        -> ToolDefinition.description使用SKILL.md正文
-        -> AgentPlugin将definition加入InferenceCommand.tools
-
-模型调用Skill：
-    ToolPlugin执行Skill Tool handler
-        -> 忽略当前JSON object参数
-        -> 返回SKILL.md正文作为Message::Tool
-        -> AgentPlugin把Tool消息加入实时tool_context并继续推理
-        -> AgentPlugin另外在历史事件中写入"skill: <scope/name> loaded"，不写入正文
+SkillPlugin不读取可见性，不保存每个Skill注册项，不把Skill正文放入ToolRegistry。
+Skill正文按每次定义检查和每次调用重新读取；当前只读取SKILL.md，Workflow和脚本执行留待后续设计。
+Skill工具响应仍是AgentMessage::Tool；历史记录由AgentPlugin按skill资源写入标记文本，不写正文。
 ```
-
-最高优先级同名目录存在但内容非法时直接失败，不向低优先级降级。SkillPlugin不读取Agent可见性；
-它只为ToolPlugin传入的单个ResourceRef提供定义和执行器。当前不解析frontmatter、不执行脚本、不读取
-Skill目录中的其他资源。
-
-Skill动态加载：AgentStatus只保存工具调用模板，每轮由AgentPlugin重新生成调用ID并调用ToolPlugin；SkillPlugin每次执行都按优先级重新读取SKILL.md，不缓存正文。

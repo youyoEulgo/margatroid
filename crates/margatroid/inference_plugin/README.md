@@ -149,13 +149,13 @@ Agent 核心发送当前完整 `messages` 快照。下面的 `agent` 由 Workspa
 
 ```rust
 use app_runtime_plugin::WorldEventExt;
-use inference_plugin::InferenceCommand;
+use inference_plugin::InferenceRequest;
 use margatroid_types::{Message, ToolDefinition};
 
-app.world().send_event(InferenceCommand {
+app.world().send_event(InferenceRequest {
     id: "request-1".into(),
     agent,
-    agent_id: "demo.coder0".into(),
+    agent_id: ResourceId::parse("agent:demo/coder:latest")?,
     messages: vec![
         Message::System {
             content: "You are a coding agent.".into(),
@@ -171,8 +171,8 @@ app.world().send_event(InferenceCommand {
 `id` 由调用方生成，用于区分同一 Agent 的并发请求；`agent` 是发起推理的 AgentInstance
 Entity。最终响应使用 `(agent, id)` 定位原 Agent 和原请求。
 
-`tools`由AgentPlugin遍历当前`AgentDynamicVisibility.resources`，逐个调用ToolPlugin构造`Tool`后
-收集definitions。InferencePlugin在主线程读取Agent推理快照，并直接使用事件中的工具定义根据`ModelId`组装请求，然后
+`tools`由AgentPlugin遍历当前`AgentDynamicVisibility.resources`，逐个调用ToolPlugin按资源类型返回定义；
+每个定义名都是完整`ResourceId`。InferencePlugin在主线程读取Agent推理快照，并在请求边界将资源ID转换为模型API工具名，根据`ModelId`组装请求，然后
 把网络请求交给 AsyncRuntime。不会把 `World` 或 Component 引用带入异步线程。
 
 ## 流式输出与最终结果
@@ -180,7 +180,7 @@ Entity。最终响应使用 `(agent, id)` 定位原 Agent 和原请求。
 后端对一次模型调用的有效处理都依赖完整响应：工具参数需要拼完才能解析，tool-call loop
 需要完整 Assistant Message，结束原因和 token usage 也只有流结束后才能确定。
 
-流式文本的用途只是让前端实时显示。`InferenceCommand` 不携带发送器；`prepare_inference_system`
+流式文本的用途只是让前端实时显示。`InferenceRequest` 不携带发送器；`prepare_inference_system`
 读取全局配置的 `streaming_member_messages` 目标，通过 `WebSocketConnections` 解析并固定本轮的发送器集合，然后写入
 `PreparedInference`。异步推理每解析出一个文本分片，就使用请求 ID、稳定 Agent ID 和文本构造
 `agent.message.delta`，序列化后通过 `WebSocketMessageSender::send` 直接发送。
@@ -274,7 +274,7 @@ Adapter 只解释 Provider 协议，不读取 `World`、Agent Component 或会�
 
 ```text
 Agent messages + AgentPlugin收集的ToolDefinition
-→ InferenceCommand { id, agent, agent_id, messages, tools }
+→ InferenceRequest { id, agent, agent_id, messages, tools }
 → AgentInferenceSnapshot { workspace, model }
 → WorkspaceModelRoutes[ModelId]
 → 未命中时查询GlobalModelRoutes[ModelId]

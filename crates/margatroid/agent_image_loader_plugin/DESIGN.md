@@ -1,5 +1,13 @@
 # AgentImageLoaderPlugin
 
+## 统一资源身份约定
+
+```text
+AgentImage的身份统一为ResourceId：image:<scope>/<name>:<tag>
+镜像默认可见资源保存ResourceId集合，不保存ResourceRef或裸scope/name
+镜像目录解析必须使用完整scope、name和tag；省略tag的输入先规范化为latest
+```
+
 ## 类型
 
 公开：
@@ -31,20 +39,20 @@ AgentImageLoaderPluginInstalled：镜像加载插件安装标记，公开单元R
 
 LoadAgentImage：加载AgentImage，公开事件--请求读取当前磁盘中的逻辑镜像
     id: String--调用方生成的请求ID，用于配对结果
-    reference: AgentImageReference--scope/name:tag镜像引用，省略tag时已规范化为latest
+    reference: ResourceId--type=image的完整镜像资源ID，省略tag时已规范化为latest
     impl Event for LoadAgentImage
         Event：公开trait实现
 
 LoadAgentImageResult：加载AgentImage结果，公开事件--每个已读取请求对应一个结果
     id: String--原请求ID
-    reference: AgentImageReference--原镜像引用
+    reference: ResourceId--原镜像资源ID
     result: Result<Entity, AgentImageLoadError>--成功时返回当前AgentImage Entity
     impl Event for LoadAgentImageResult
         Event：公开trait实现
 
 AgentImageIdentity：AgentImage身份，公开组件--标记Entity代表哪个逻辑镜像
-    reference: AgentImageReference--规范化scope/name:tag引用，私有
-    reference(&self) -> &AgentImageReference
+    reference: ResourceId--规范化type=image资源ID，私有
+    reference(&self) -> &ResourceId
         取得引用：公开方法，返回镜像引用
     impl Component for AgentImageIdentity
         Component：公开trait实现
@@ -81,8 +89,8 @@ AgentImageModelConfig：AgentImage模型配置，公开组件--中立保存模�
         Component：公开trait实现
 
 AgentImageDefaultVisibility：AgentImage默认资源可见性，公开组件--只读保存镜像默认资源名称
-    resources: BTreeSet<ResourceRef>--镜像默认可见的普通Tool、Skill、Workflow统一引用，私有
-    resources(&self) -> impl Iterator<Item = &ResourceRef> + '_
+    resources: BTreeSet<ResourceId>--镜像默认可见的普通Tool、Skill、Workflow统一引用，私有
+    resources(&self) -> impl Iterator<Item = &ResourceId> + '_
         遍历资源：公开方法，按provider和逻辑名称稳定返回
     impl Component for AgentImageDefaultVisibility
         Component：公开trait实现
@@ -129,8 +137,8 @@ crate公开：
 AgentImageLoaderState：AgentImage加载状态，crate公开Resource--保存根目录、当前Entity和正在合并的请求
     root: Arc<PathBuf>--agent-images根目录
     limits: AgentImageLoaderLimits--加载限制
-    entities: HashMap<AgentImageReference, Entity>--每个逻辑镜像当前的Entity
-    pending: HashMap<AgentImageReference, Vec<String>>--同一镜像正在进行的请求ID
+    entities: HashMap<ResourceId, Entity>--每个逻辑镜像当前的Entity
+    pending: HashMap<ResourceId, Vec<String>>--同一镜像正在进行的请求ID
     impl Resource for AgentImageLoaderState
         Resource：crate公开trait实现
 ```
@@ -161,20 +169,20 @@ AgentImageLoaderLimits：AgentImage加载限制，私有结构体--限制单个�
             构造默认限制：返回上述固定限制
 
 AgentImageReadTask：AgentImage异步读取任务，私有事件--不持有World引用
-    reference: AgentImageReference--目标镜像引用
+    reference: ResourceId--type=image的目标镜像资源ID
     root: Arc<PathBuf>--镜像库根目录
     limits: AgentImageLoaderLimits--当前限制快照
     impl Event for AgentImageReadTask
         Event：私有trait实现
 
 PreparedAgentImage：已准备AgentImage，私有结构体--镜像静态数据读取与名称发现均已完成
-    reference: AgentImageReference--镜像引用
+    reference: ResourceId--type=image的镜像资源ID
     soul: AgentImageSoul--已验证Soul
     model: AgentImageModelConfig--中立模型配置
     default_visibility: AgentImageDefaultVisibility--默认只读资源可见性
 
 AgentImageReadPayload：AgentImage读取载荷，私有结构体--无论成功失败都保留镜像引用
-    reference: AgentImageReference--原镜像引用
+    reference: ResourceId--type=image的原镜像资源ID
     result: Result<PreparedAgentImage, AgentImageLoadError>--读取结果
 
 AgentImageReadOutput：AgentImage读取输出，私有结构体--允许提交System从共享事件引用中取得一次载荷所有权
@@ -264,7 +272,7 @@ apply_agent_image_payload(world: &mut World, payload: AgentImageReadPayload)
     提交镜像载荷：私有函数，取得等待请求并原子选择成功或失败路径
     行为：成功时复用存活Entity或创建新Entity并全量替换四个组件；失败时只发送克隆错误
 
-resolve_image_root(root: &Path, reference: &AgentImageReference) -> Result<PathBuf, AgentImageLoadError>
+resolve_image_root(root: &Path, reference: &ResourceId) -> Result<PathBuf, AgentImageLoadError>
     解析镜像目录：私有异步函数，将规范化引用映射到root/scope/name/tag
     行为：规范化结果必须位于root内；不存在返回NotFound；symlink返回SymlinkNotAllowed，非目录返回InvalidLayout
 
@@ -349,12 +357,12 @@ Workspace重载：
 
 资源动态使用：
     AgentPlugin在AgentInstance上保存AgentDefaultVisibility和AgentDynamicVisibility
-        -> AgentDefaultVisibility保存Workspace创建时合并出的统一ResourceRef集合
+        -> AgentDefaultVisibility保存Workspace创建时合并出的统一ResourceId集合
         -> AgentDynamicVisibility初始复制默认值，后续可由Agent/Workflow逻辑调整
         -> WorkspacePlugin根据项目目录和AgentImageIdentity构造AgentToolEnvironment
         -> 每次LLM请求由AgentPlugin遍历动态可见资源并逐个交给ToolPlugin生成Tool
-        -> 普通Tool、Skill和Workflow均通过ToolDefinitionProvider进入同一tools列表
-        -> 资源handler从ToolContext取得项目根和镜像根
+        -> 普通Tool、Skill和Workflow均通过ToolTemplate进入同一tools列表
+        -> 资源Plugin从AgentToolEnvironment取得项目根和镜像根
         -> 查找顺序固定为项目级、镜像内置、主目录
         -> 新增全新逻辑名称需要workspace reload
         -> 已可见名称的内容修改和同名来源变化在下一次使用时生效
@@ -380,30 +388,30 @@ App
     ├── AgentImageLoaderState Resource
     │   ├── root: Arc<PathBuf>
     │   ├── limits: AgentImageLoaderLimits
-    │   ├── entities: HashMap<AgentImageReference, Entity>
-    │   └── pending: HashMap<AgentImageReference, Vec<String>>
+    │   ├── entities: HashMap<ResourceId, Entity>
+    │   └── pending: HashMap<ResourceId, Vec<String>>
     └── AgentImage Entity
         ├── AgentImageIdentity
-        │   └── reference: AgentImageReference
+        │   └── reference: ResourceId
         ├── AgentImageSoul
         │   └── content: Arc<str>
         ├── AgentImageModelConfig
         │   ├── model: Arc<str>
         │   └── parameters: AgentImageModelParameters
         └── AgentImageDefaultVisibility
-            └── resources: BTreeSet<ResourceRef>
+            └── resources: BTreeSet<ResourceId>
 
 异步读取期间：
 AgentImageReadTask
-├── reference: AgentImageReference
+├── reference: ResourceId
 ├── root: Arc<PathBuf>
 └── limits: AgentImageLoaderLimits
     -> AgentImageReadOutput
        └── payload: Mutex<Option<AgentImageReadPayload>>
-           ├── reference: AgentImageReference
+           ├── reference: ResourceId
            └── result: Result<PreparedAgentImage, AgentImageLoadError>
                └── PreparedAgentImage
-                   ├── reference: AgentImageReference
+                   ├── reference: ResourceId
                    ├── soul: AgentImageSoul
                    ├── model: AgentImageModelConfig
                    └── default_visibility: AgentImageDefaultVisibility

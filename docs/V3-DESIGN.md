@@ -103,7 +103,7 @@ margatroid CLI
   -> CreateAgent Event
   -> Workspace Entity + Agent Entity
   -> Agent/Workflow/Memory plugins
-  -> InferenceCommand / SandboxCommand
+  -> InferenceRequest / SandboxCommand
   -> async runtime
   -> Result Event
   -> product event stream
@@ -197,7 +197,7 @@ Agent可见性组件。
 用户消息意图不负责启用或禁用模型工具。
 
 模型一次返回多个ToolCall时，AgentPlugin在`AgentStatus`中保存该批次的全部调用ID。每个Tool响应
-只追加上下文并移除自己的ID，最后一个响应到达时才发送下一次`InferenceCommand`，避免同一批工具
+只追加上下文并移除自己的ID，最后一个响应到达时才发送下一次`InferenceRequest`，避免同一批工具
 响应触发多次推理。
 
 SkillPlugin为每个可见Skill生成一个独立Tool，并在执行时按作用域动态解析内容：

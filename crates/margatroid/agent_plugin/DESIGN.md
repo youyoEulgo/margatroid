@@ -29,6 +29,15 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # AgentPlugin
 
+## 统一资源身份约定
+
+```text
+Agent的稳定身份使用ResourceId：agent:<workspace>/<name>:latest；动态Subagent不属于本阶段
+AgentIdentity保存ResourceId，不保存workspace.name0等旧格式字符串
+AgentDefaultVisibility、AgentDynamicVisibility和PendingToolCall中的资源字段使用ResourceId
+core_plugin::Entity仅用于当前World内的组件和事件关联
+```
+
 ## 类型
 
 公开：
@@ -48,12 +57,12 @@ AgentPlugin：Agent实例与工具消息循环插件，公开结构体--安装�
 
 AgentCreateRequest：Agent创建请求，公开事件--WorkspacePlugin交付创建实例所需的Agent自有字段
     id: String--Workspace生成的创建子请求ID
-    agent_id: String--稳定Agent逻辑ID，例如demo.coder0
+    agent_id: ResourceId--type=agent的稳定Agent资源ID，例如agent:demo/coder:latest
     workspace_id: Entity--Agent所属Workspace Entity
     system_prompt: String--当前系统提示词
     messages: Vec<Message>--恢复的长期对话上下文
     tool_context: Vec<Message>--恢复的当前轮工具上下文
-    default_visibility: BTreeSet<ResourceRef>--创建时默认可见资源
+    default_visibility: BTreeSet<ResourceId>--创建时默认可见资源
     impl Event for AgentCreateRequest
         Event：公开trait实现
 
@@ -64,8 +73,8 @@ AgentCreated：Agent创建完成回执，公开事件--把创建子请求与新E
         Event：公开trait实现
 
 AgentIdentity：Agent稳定身份，公开组件--保存跨Plugin和跨进程使用的逻辑Agent ID
-    id: String--唯一Agent ID，私有
-    id(&self) -> &str
+    id: ResourceId--type=agent的唯一资源ID，私有
+    id(&self) -> &ResourceId
         取得Agent ID：公开方法
     impl Component for AgentIdentity
         Component：公开trait实现
@@ -99,20 +108,26 @@ AgentContext：Agent上下文，公开组件--保存系统提示词、长期对�
         Component：公开trait实现
 
 AgentDefaultVisibility：Agent默认可见性，公开组件--创建时确定后只读
-    resources: BTreeSet<ResourceRef>--默认可见资源，私有
-    resources(&self) -> &BTreeSet<ResourceRef>
+    resources: BTreeSet<ResourceId>--默认可见资源，私有
+    resources(&self) -> &BTreeSet<ResourceId>
         取得默认可见性：公开只读方法
     impl Component for AgentDefaultVisibility
         Component：公开trait实现
 
 AgentDynamicVisibility：Agent动态可见性，公开组件--当前实际可见资源
-    resources: BTreeSet<ResourceRef>--动态可见资源，私有
-    resources(&self) -> &BTreeSet<ResourceRef>
+    resources: BTreeSet<ResourceId>--动态可见资源，私有
+    resources(&self) -> &BTreeSet<ResourceId>
         取得动态可见性：公开只读方法
     impl Component for AgentDynamicVisibility
         Component：公开trait实现
 
 AgentPluginInstalled：AgentPlugin安装标记，公开单元Resource--阻止重复安装并供WorkspacePlugin确认依赖
+
+WorldAgentExt：World Agent扩展，公开trait--按稳定资源ID查询当前World中的Agent Entity
+    agent(&self, id: &ResourceId) -> Option<Entity>
+        查询Agent：公开方法，只返回身份完整匹配且仍存在的Agent Entity
+    impl WorldAgentExt for World
+        WorldAgentExt for World：公开trait实现，遍历AgentIdentity并按完整ResourceId匹配
 ```
 
 crate公开：
@@ -135,7 +150,7 @@ AgentStatus：Agent工具调用状态，crate公开组件--同时保存当前工
 
 PendingToolCall：工具调用状态，crate公开结构体--pending_tools和loading_skills共用的内部值类型
     call: ToolCall--工具调用信息，持久模板展开时重新生成ID
-    resource: ResourceRef--工具资源引用
+    resource: ResourceId--工具资源ID
     kind: ToolCallKind--普通工具或Skill
 
 ToolCallKind：工具调用来源，crate公开枚举
@@ -151,13 +166,13 @@ ToolCallCompletion：工具完成结果，crate公开枚举
 私有：
 ```text
 AvailableTools：一次请求的临时工具集合，私有结构体--不是Agent组件
-    definitions: Vec<ToolDefinition>--发给InferencePlugin的工具定义
-    resources_by_name: BTreeMap<String, ResourceRef>--模型工具名到资源引用的临时映射
+    definitions: Vec<ToolDefinition>--发给InferencePlugin的工具定义，name为完整ResourceId
+    resources: BTreeSet<ResourceId>--当次定义对应的完整资源集合
 
 ConversationTurnResult：当前AgentMessage处理结果，私有枚举--只在一次System执行中使用
     WaitForTools--仍有pending_tools
     FinishTurn--Assistant没有工具调用，本轮结束
-    RequestInference--上下文完整，可发送InferenceCommand
+    RequestInference--上下文完整，可发送InferenceRequest
 
 AgentStepError：当前事件处理错误，私有枚举--转换为AgentFailure
     AgentMissing
@@ -166,7 +181,6 @@ AgentStepError：当前事件处理错误，私有枚举--转换为AgentFailure
     InvalidMessage
     InvalidToolBatch
     Tool(ToolError)
-    DuplicateToolName
     failure_message(&self) -> String
         构造失败描述：私有方法，返回不包含消息正文、工具参数或资源正文的稳定有界文本
 ```
@@ -223,7 +237,7 @@ clear_tool_context(world: &mut World, agent: Entity, events: &RuntimeEventSender
 
 build_available_tools(world: &World, agent: Entity) -> Result<AvailableTools, AgentStepError>
     构造可用工具：私有函数，每次从AgentDynamicVisibility构造工具定义和名称映射
-    行为：按资源顺序调用WorldToolExt::resolve_tool，工具名重复时整体失败，不把结果保存为Component
+    行为：按资源顺序调用WorldToolExt::tool_definition_for；每个定义的name保持完整ResourceId，不合并同类型资源，不把结果保存为Component
 
 dispatch_tool_calls(world: &mut World, id: &str, agent: Entity, tool_calls: &[ToolCall], include_loading_skills: bool, events: &RuntimeEventSender) -> Result<ConversationTurnResult, AgentStepError>
     组建工具批次：私有函数，拒绝重叠批次，解析显式调用，按参数合并loading_skills，验证ID唯一后写入pending_tools并派发
@@ -233,23 +247,23 @@ expand_loading_skills(status: &AgentStatus) -> Vec<PendingToolCall>
     展开持久Skill：私有函数，复制loading_skills模板并为本轮重新生成调用ID
 
 queue_tool_calls(available_tools: &AvailableTools, calls: &[ToolCall]) -> Result<Vec<PendingToolCall>, AgentStepError>
-    解析工具调用：私有函数，使用当次AvailableTools将ToolCall.name映射为ResourceRef并根据provider构造Tool或Skill类型的PendingToolCall
+    解析工具调用：私有函数，确认ToolCall.resource属于当次AvailableTools并根据resource_type构造Tool或Skill类型的PendingToolCall
 
 dispatch_pending_tools(world: &World, id: &str, agent: Entity, events: &RuntimeEventSender) -> Result<(), AgentStepError>
-    派发待完成工具：私有函数，逐个发送携带轮次ID、Agent Entity、ResourceRef和ToolCall的ToolCallRequest
+    派发待完成工具：私有函数，逐个发送携带轮次ID、Agent Entity、ResourceId和ToolCall的ToolCallRequest
 
-tool_call_kind(resource: &ResourceRef) -> ToolCallKind
-    判断工具来源：私有函数，provider为skill时返回Skill，其他provider返回Tool
+tool_call_kind(resource: &ResourceId) -> ToolCallKind
+    判断工具来源：私有函数，resource_type为skill时返回Skill，其他类型返回Tool
 
-skill_key(resource: &ResourceRef) -> String
-    构造Skill模板键：私有函数，使用provider和scope/name生成loading_skills稳定键
+skill_key(resource: &ResourceId) -> String
+    构造Skill模板键：私有函数，使用完整ResourceId生成loading_skills稳定键
 
 build_inference_context(world: &World, agent: Entity) -> Result<Vec<Message>, AgentStepError>
     组装推理上下文：私有函数，固定按System、messages、tool_context返回
     行为：Skill正文只来自当前tool_context，不在组装时重复读取
 
 send_inference_command(world: &World, id: &str, agent: Entity, events: &RuntimeEventSender) -> Result<(), AgentStepError>
-    发起推理：私有函数，构造可见工具定义和完整上下文后发送InferenceCommand
+    发起推理：私有函数，构造ResourceId形式的可见工具定义和完整上下文后发送InferenceRequest
     行为：只克隆当前上下文，不修改AgentContext；只有后续User或Assistant进入System时才清空tool_context
 
 assert_conversation_message(message: &Message)
@@ -267,7 +281,7 @@ assert_conversation_messages(messages: &[Message])
         -> 清空上一轮tool_context
         -> 发送AgentHistoryMessageWriteRequested并追加messages
         -> 展开loading_skills并合并User.tool_calls
-        -> pending_tools为空时发送InferenceCommand
+        -> pending_tools为空时发送InferenceRequest
         -> pending_tools非空时发送ToolCallRequest并等待
 
 Assistant消息：
@@ -284,7 +298,7 @@ Tool消息：
         -> Skill发送"skill: <scope/name> loaded"历史事件
         -> 原始Tool响应追加tool_context
         -> complete_tool_call
-        -> 仍有pending_tools时等待，全部完成时发送InferenceCommand
+        -> 仍有pending_tools时等待，全部完成时发送InferenceRequest
 
 Skill动态加载：
     Skill工具成功调用
@@ -301,11 +315,11 @@ Skill动态加载：
 ## 边界
 
 ```text
-AgentPlugin负责：Agent创建、Message结构分支、pending_tools与loading_skills、工具来源识别、历史事件、工具派发和InferenceCommand
+AgentPlugin负责：Agent创建、Message结构分支、pending_tools与loading_skills、工具来源识别、历史事件、工具派发和InferenceRequest
 AgentPlugin不直接写SQLite，不解析Skill正文，不决定模型路由或Workspace生命周期
 MemoryPlugin只消费历史和实时上下文事件，不读取AgentStatus或判断工具来源
 ToolPlugin执行ToolCallRequest并返回AgentMessage::Tool
-InferencePlugin执行InferenceCommand并返回AgentMessage::Assistant
+InferencePlugin执行InferenceRequest，发布InferenceResponse，再由自身转换System发布AgentMessage::Assistant
 ```
 
 ## 持有关系
@@ -318,7 +332,7 @@ World
 │   └── agent_tool_call_system
 │       ├── AgentHistoryMessageWriteRequested Event
 │       ├── ToolCallRequest Event
-│       └── InferenceCommand Event
+│       └── InferenceRequest Event
 └── Agent Entity
     ├── AgentIdentity
     ├── AgentWorkspaceId

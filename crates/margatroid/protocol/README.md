@@ -27,6 +27,7 @@ Workspace 启动请求：
   "id": "request-1",
   "message": {
     "definition": {
+      "id": "workspace:local/demo:latest",
       "name": "demo",
       "project_root": "/project/demo",
       "manager": "coder",
@@ -48,6 +49,7 @@ Workspace 停止请求和业务回执：
   "id": "stop-1",
   "message": {
     "workspace": {
+      "id": "workspace:local/demo:latest",
       "name": "demo",
       "project_root": "/project/demo"
     }
@@ -66,10 +68,11 @@ Agent 消息请求：
   "id": "message-1",
   "message": {
     "workspace": {
+      "id": "workspace:local/demo:latest",
       "name": "demo",
       "project_root": "/project/demo"
     },
-    "agent": "coder",
+    "agent": "agent:demo/coder:latest",
     "message": {
       "content": "Review this change."
     },
@@ -79,8 +82,8 @@ Agent 消息请求：
 ```
 
 DtoPlugin 反序列化 DTO 后直接调用 `into_domain` 发送领域事件，不再发送只复制字段的
-API 中间事件。Agent 逻辑名称由 WorkspacePlugin 在发送 `AgentMessage` 前解析为 ECS Entity；出站
-DTO 再通过 `World` 将 Entity 投影为稳定 Agent ID，协议不会暴露 Entity。
+API 中间事件。WorkspacePlugin直接按完整`ResourceId`查找Agent并解析为ECS Entity；出站DTO再通过
+`World`将Entity投影为相同的稳定资源ID，协议不会暴露Entity。
 
 客户端用户输入使用 `UserMessageDto`，不能构造 System、Assistant 或 Tool 消息。后端可展示消息使用
 `MessageDto`，包含 User、Assistant 和历史Tool；领域 `Message` 与 `ToolCall` 不直接进入协议字段。
@@ -88,7 +91,8 @@ DTO 再通过 `World` 将 Entity 投影为稳定 Agent ID，协议不会暴露 E
 后端状态通过 `state.sync` 发送完整快照。前端以该快照替换业务状态，不自行持久化或从增量消息拼接
 历史。`histories` 包含可展示的 User、Assistant 和 Tool消息，不包含 System 或Skill正文。`agents`
 包含每个运行中Agent的`visible_resources`，该字段直接来自当前`AgentDynamicVisibility`而不是镜像
-默认可见性；客户端可以按`provider`筛选资源，例如只展示可手动调用的Skill。
+默认可见性。`visible_resources`中的每项都是规范化`type:scope/name:tag`字符串；客户端解析type后
+筛选资源，例如只展示可手动调用的Skill。
 
 ## 流式 Agent 响应
 
