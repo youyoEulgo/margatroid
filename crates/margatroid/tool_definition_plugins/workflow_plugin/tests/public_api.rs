@@ -1,8 +1,8 @@
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::App;
-use margatroid_types::{AgentMessage, Message, ResourceId, ToolCall};
+use margatroid_types::ResourceId;
 use tempfile::tempdir;
-use tool_plugin::{AgentToolEnvironment, ToolCallRequest, ToolPlugin};
+use tool_plugin::{AgentToolEnvironment, ToolCallRequest, ToolCallResponse, ToolPlugin};
 use workflow_plugin::WorkflowPlugin;
 
 #[test]
@@ -22,29 +22,22 @@ fn workflow_loader_returns_placeholder_tool_message() {
     );
     let resource = ResourceId::parse("workflow:local/review:latest").unwrap();
     app.world().send_event(ToolCallRequest {
-        id: "turn-1".into(),
+        turn_id: "turn-1".into(),
         agent,
-        call: ToolCall {
-            id: "call-1".into(),
-            resource,
-            arguments: "{}".into(),
-        },
+        tool_id: ResourceId::parse("tool:builtin/workflow-loader:latest").unwrap(),
+        resource_id: resource,
+        tool_call_id: "call-1".into(),
+        arguments: "{}".into(),
     });
     for _ in 0..4 {
         app.tick();
-        if let Some(message) = app
+        if let Some(response) = app
             .world()
-            .event_reader::<AgentMessage>()
+            .event_reader::<ToolCallResponse>()
             .into_iter()
             .next()
         {
-            assert_eq!(
-                message.message,
-                Message::Tool {
-                    tool_call_id: "call-1".into(),
-                    content: "Workflow execution is not implemented yet.".into()
-                }
-            );
+            assert!(response.result.is_err());
             return;
         }
     }

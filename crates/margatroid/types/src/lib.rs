@@ -359,12 +359,30 @@ pub struct RouteAgentMessage {
     pub message: Message,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentSkillRouteAction {
+    Load,
+    Unload,
+    UnloadAll,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteAgentSkill {
+    pub id: String,
+    pub workspace: WorkspaceReference,
+    pub agent: Option<ResourceId>,
+    pub resource_id: Option<ResourceId>,
+    pub action: AgentSkillRouteAction,
+}
+
+impl Event for RouteAgentSkill {}
+
 impl Event for RouteAgentMessage {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
-    pub resource: ResourceId,
+    pub tool_name: String,
     pub arguments: String,
 }
 
@@ -390,6 +408,7 @@ pub enum Message {
         tool_calls: Vec<ToolCall>,
     },
     Tool {
+        resource_id: ResourceId,
         tool_call_id: String,
         content: String,
     },
@@ -627,7 +646,7 @@ mod tests {
             content: Some("Using the selected workflow.".into()),
             tool_calls: vec![ToolCall {
                 id: "call-1".into(),
-                resource: ResourceId::parse("workflow:local/review:latest").unwrap(),
+                tool_name: "workflow0_review".into(),
                 arguments: r#"{"path":"src/lib.rs"}"#.into(),
             }],
         };

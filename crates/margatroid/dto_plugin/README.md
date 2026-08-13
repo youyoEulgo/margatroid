@@ -10,6 +10,9 @@ connection.register -> RegisterConnection
 workspace.start      -> StartWorkspace
 workspace.stop       -> StopWorkspaceByReference
 agent.message        -> RouteAgentMessage
+agent.skill.load     -> RouteAgentSkill { Load }
+agent.skill.unload   -> RouteAgentSkill { Unload }
+agent.skill.unload_all -> RouteAgentSkill { UnloadAll }
 ```
 
 它还收集允许发送给外部的 `StartWorkspaceResult`、`StopWorkspaceByReferenceResult`、`AgentMessage` 和 `AgentFailure`，调用 Protocol

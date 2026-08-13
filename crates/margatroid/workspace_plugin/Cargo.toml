@@ -11,10 +11,11 @@ core_plugin = { path = "../../mecs/core_plugin" }
 inference_plugin = { path = "../inference_plugin" }
 margatroid_types = { path = "../types" }
 memory_plugin = { path = "../memory_plugin" }
+skill_plugin = { path = "../tool_definition_plugins/skill_plugin" }
 tool_plugin = { path = "../tool_plugin" }
+workflow_plugin = { path = "../tool_definition_plugins/workflow_plugin" }
 tracing = { workspace = true }
 
 [dev-dependencies]
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
-skill_plugin = { path = "../tool_definition_plugins/skill_plugin" }
 tempfile = "3"

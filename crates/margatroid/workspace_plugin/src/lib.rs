@@ -15,13 +15,13 @@ use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::{AgentInferenceSnapshot, GlobalModelRoutes, WorldInferenceExt};
 use margatroid_types::{
-    AgentMessage, Message, ResourceId, RouteAgentMessage, WorkspaceAgentDefinition,
-    WorkspaceDefinition, WorkspaceReference,
+    AgentMessage, AgentSkillRouteAction, Message, ResourceId, RouteAgentMessage, RouteAgentSkill,
+    WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
 };
 use memory_plugin::{AgentMemory, MemoryPluginInstalled, RealtimeContext, WorldMemoryExt};
-use tool_plugin::{
-    AgentToolEnvironment, ToolDefinitionRequest, ToolDefinitionResult, ToolPluginInstalled,
-};
+use skill_plugin::{SkillRegisterRequest, SkillRegisterResponse};
+use tool_plugin::{attach_agent_tool_map, AgentToolEnvironment, ToolPluginInstalled};
+use workflow_plugin::{WorkflowRegisterRequest, WorkflowRegisterResponse};
 
 pub use margatroid_types::StartWorkspace;
 
@@ -84,13 +84,14 @@ impl Plugin for WorkspacePlugin {
             pending: HashMap::new(),
             image_requests: HashMap::new(),
             agent_requests: HashMap::new(),
-            definition_requests: HashMap::new(),
+            tool_registration_requests: HashMap::new(),
         });
         app.add_system(&schedule, begin_workspace_command_system)
             .add_system(&schedule, route_agent_message_system)
+            .add_system(&schedule, route_agent_skill_system)
             .add_system(&schedule, collect_agent_image_system)
             .add_system(&schedule, collect_agent_created_system)
-            .add_system(&schedule, collect_tool_definition_system);
+            .add_system(&schedule, collect_tool_registration_system);
     }
 }
 
@@ -186,6 +187,60 @@ fn route_agent_message_system(world: &mut World) {
             agent,
             message: request.message,
         });
+    }
+}
+
+fn route_agent_skill_system(world: &mut World) {
+    let requests = world
+        .event_reader::<RouteAgentSkill>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for request in requests {
+        let Some(workspace) = workspace_by_reference(world, &request.workspace) else {
+            tracing::warn!(id = %request.id, "agent skill workspace was not found");
+            continue;
+        };
+        let agent = match request.agent {
+            Some(agent_id) => world.agent(&agent_id).filter(|entity| {
+                world
+                    .get_component::<AgentWorkspaceId>(*entity)
+                    .is_some_and(|owner| owner.workspace_id() == workspace)
+            }),
+            None => world.workspace_manager(workspace),
+        };
+        let Some(agent) = agent else {
+            tracing::warn!(id = %request.id, "agent skill agent was not found");
+            continue;
+        };
+        match request.action {
+            AgentSkillRouteAction::Load => {
+                let Some(resource_id) = request.resource_id else {
+                    continue;
+                };
+                world.send_event(agent_plugin::LoadAgentSkill {
+                    id: request.id,
+                    agent,
+                    resource_id,
+                });
+            }
+            AgentSkillRouteAction::Unload => {
+                let Some(resource_id) = request.resource_id else {
+                    continue;
+                };
+                world.send_event(agent_plugin::UnloadAgentSkill {
+                    id: request.id,
+                    agent,
+                    resource_id,
+                });
+            }
+            AgentSkillRouteAction::UnloadAll => {
+                world.send_event(agent_plugin::UnloadAllAgentSkills {
+                    id: request.id,
+                    agent,
+                });
+            }
+        }
     }
 }
 
@@ -416,7 +471,7 @@ struct PendingWorkspace {
     images: BTreeMap<String, Result<Entity, WorkspaceError>>,
     prepared: BTreeMap<String, PreparedWorkspaceAgent>,
     agents: BTreeMap<String, Entity>,
-    pending_definitions: usize,
+    pending_tool_registrations: usize,
 }
 
 struct PreparedWorkspaceAgent {
@@ -437,7 +492,7 @@ struct WorkspaceRegistry {
     pending: HashMap<String, PendingWorkspace>,
     image_requests: HashMap<String, (String, String)>,
     agent_requests: HashMap<String, (String, String)>,
-    definition_requests: HashMap<String, (String, Entity, ResourceId)>,
+    tool_registration_requests: HashMap<String, (String, Entity, ResourceId)>,
 }
 
 impl Resource for WorkspaceRegistry {}
@@ -647,7 +702,7 @@ fn begin_workspace_start_validated(
             images: BTreeMap::new(),
             prepared: BTreeMap::new(),
             agents: BTreeMap::new(),
-            pending_definitions: 0,
+            pending_tool_registrations: 0,
         },
     );
     for (request_id, name, _) in &image_requests {
@@ -906,7 +961,7 @@ fn collect_agent_created_system(world: &mut World) {
             .and_then(|registry| registry.pending.get(&request_id))
             .is_some_and(|pending| {
                 pending.agents.len() == pending.definition.agents.len()
-                    && pending.pending_definitions == 0
+                    && pending.pending_tool_registrations == 0
             });
         if complete {
             if let Err(error) = complete_pending_workspace(world, &request_id) {
@@ -916,23 +971,48 @@ fn collect_agent_created_system(world: &mut World) {
     }
 }
 
-fn collect_tool_definition_system(world: &mut World) {
-    let results = world
-        .event_reader::<ToolDefinitionResult>()
+fn collect_tool_registration_system(world: &mut World) {
+    let skill_results = world
+        .event_reader::<SkillRegisterResponse>()
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
+    let workflow_results = world
+        .event_reader::<WorkflowRegisterResponse>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let results = skill_results
+        .into_iter()
+        .map(|result| (result.id, result.agent, result.resource_id, result.result))
+        .chain(
+            workflow_results
+                .into_iter()
+                .map(|result| (result.id, result.agent, result.resource_id, result.result)),
+        )
+        .collect::<Vec<_>>();
     let mut complete = Vec::new();
-    for result in results {
+    for (id, agent, resource_id, result) in results {
         let route = world
             .get_resource_mut::<WorkspaceRegistry>()
             .expect("WorkspacePlugin is not installed")
-            .definition_requests
-            .remove(&result.id);
-        let Some((request_id, _agent, _resource)) = route else {
+            .tool_registration_requests
+            .remove(&id);
+        let Some((request_id, expected_agent, expected_resource)) = route else {
             continue;
         };
-        if let Err(error) = result.result {
+        if agent != expected_agent || resource_id != expected_resource {
+            fail_pending_workspace(
+                world,
+                &request_id,
+                WorkspaceError::new(
+                    WorkspaceErrorKind::ResourceSetupFailed,
+                    "tool registration response does not match its request",
+                ),
+            );
+            continue;
+        }
+        if let Err(error) = result {
             fail_pending_workspace(
                 world,
                 &request_id,
@@ -944,8 +1024,9 @@ fn collect_tool_definition_system(world: &mut World) {
             .get_resource_mut::<WorkspaceRegistry>()
             .and_then(|registry| registry.pending.get_mut(&request_id))
         {
-            pending.pending_definitions = pending.pending_definitions.saturating_sub(1);
-            if pending.pending_definitions == 0
+            pending.pending_tool_registrations =
+                pending.pending_tool_registrations.saturating_sub(1);
+            if pending.pending_tool_registrations == 0
                 && pending.agents.len() == pending.definition.agents.len()
             {
                 complete.push(request_id);
@@ -1017,6 +1098,9 @@ fn attach_prepared_agent(
             "created Agent could not receive its runtime components",
         ));
     }
+    attach_agent_tool_map(world, agent).map_err(|error| {
+        WorkspaceError::new(WorkspaceErrorKind::ResourceSetupFailed, error.to_string())
+    })?;
     let resources = world
         .get_component::<AgentDynamicVisibility>(agent)
         .ok_or_else(|| {
@@ -1029,15 +1113,28 @@ fn attach_prepared_agent(
         .iter()
         .cloned()
         .collect::<Vec<_>>();
-    let mut definition_ids = Vec::new();
+    let mut registration_ids = Vec::new();
     for (index, resource) in resources.into_iter().enumerate() {
-        let definition_id = format!("{request_id}/definition/{name}/{index}");
-        definition_ids.push((definition_id.clone(), resource.clone()));
-        world.send_event(ToolDefinitionRequest {
-            id: definition_id.clone(),
-            agent,
-            resource: resource.clone(),
-        });
+        let registration_id = format!("{request_id}/tool/{name}/{index}");
+        match resource.resource_type() {
+            "skill" => world.send_event(SkillRegisterRequest {
+                id: registration_id.clone(),
+                agent,
+                resource_id: resource.clone(),
+            }),
+            "workflow" => world.send_event(WorkflowRegisterRequest {
+                id: registration_id.clone(),
+                agent,
+                resource_id: resource.clone(),
+            }),
+            _ => {
+                return Err(WorkspaceError::new(
+                    WorkspaceErrorKind::ResourceSetupFailed,
+                    "visible resource type has no registration plugin",
+                ))
+            }
+        }
+        registration_ids.push((registration_id, resource));
     }
     world
         .get_resource_mut::<WorkspaceRegistry>()
@@ -1054,11 +1151,11 @@ fn attach_prepared_agent(
         .pending
         .get_mut(request_id)
         .expect("pending workspace operation disappeared");
-    pending.pending_definitions += definition_ids.len();
-    for (definition_id, resource) in definition_ids {
+    pending.pending_tool_registrations += registration_ids.len();
+    for (registration_id, resource) in registration_ids {
         registry
-            .definition_requests
-            .insert(definition_id, (request_id.to_owned(), agent, resource));
+            .tool_registration_requests
+            .insert(registration_id, (request_id.to_owned(), agent, resource));
     }
     Ok(())
 }
@@ -1113,7 +1210,7 @@ fn complete_pending_workspace(world: &mut World, request_id: &str) -> Result<(),
             .agent_requests
             .retain(|_, (parent, _)| parent != request_id);
         registry
-            .definition_requests
+            .tool_registration_requests
             .retain(|_, (parent, _, _)| parent != request_id);
         pending
     };
@@ -1144,7 +1241,7 @@ fn fail_pending_workspace(world: &mut World, request_id: &str, error: WorkspaceE
             .agent_requests
             .retain(|_, (parent, _)| parent != request_id);
         registry
-            .definition_requests
+            .tool_registration_requests
             .retain(|_, (parent, _, _)| parent != request_id);
         pending
     };

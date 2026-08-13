@@ -133,6 +133,7 @@ initialize_schema(connection: &mut Connection) -> Result<(), MemoryError>
             role TEXT NOT NULL--user、assistant或tool
             content TEXT--User和Tool为正文，Assistant可以为空
             tool_calls TEXT NOT NULL--User和Assistant的ToolCall数组JSON，Tool固定为[]
+            resource_id TEXT--Tool具体资源ResourceId，User和Assistant为空
             tool_call_id TEXT--Tool对应调用ID，User和Assistant为空
             created_at_ms INTEGER NOT NULL
         realtime_messages:
@@ -157,7 +158,7 @@ schema_error(error: rusqlite::Error) -> MemoryError
 
 load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>, MemoryError>
     读取历史：私有函数，按role与分列字段重建Message
-    行为：User和Assistant恢复tool_calls，Tool要求tool_calls为[]并恢复tool_call_id；任一行非法时整体失败
+    行为：User和Assistant恢复tool_calls，Tool要求tool_calls为[]并恢复resource_id与tool_call_id；任一行非法时整体失败
 
 load_realtime_messages(connection: &Connection) -> Result<RealtimeContext, MemoryError>
     恢复实时上下文：私有函数，分别按conversation和tool的position升序读取
@@ -170,11 +171,11 @@ rewrite_realtime_messages(transaction: &Transaction, messages: &[Message], tool_
 insert_history_message(transaction: &Transaction, event: &AgentHistoryMessageWriteRequested, created_at_ms: i64) -> Result<(), MemoryError>
     插入历史消息：私有函数，每个Message写入一行
     行为：
-        User写role=user、content和tool_calls，tool_call_id为空
-        Assistant写role=assistant、可空content和tool_calls，tool_call_id为空
-        Tool写role=tool、content和tool_call_id，tool_calls固定为[]
+        User写role=user、content和tool_calls，resource_id与tool_call_id为空
+        Assistant写role=assistant、可空content和tool_calls，resource_id与tool_call_id为空
+        Tool写role=tool、content、resource_id和tool_call_id，tool_calls固定为[]
         System返回WriteFailed
-        MemoryPlugin不判断Skill；Skill标记由AgentPlugin在事件中预先替换
+        MemoryPlugin不判断工具类型；Tool历史content已由AgentPlugin替换为完整resource_id字符串
 
 insert_history_message_values(transaction: &Transaction, turn_id: &str, message: &Message, created_at_ms: i64) -> Result<(), MemoryError>
     写入历史分列：私有函数，供历史事件与旧schema迁移共用
@@ -226,7 +227,7 @@ Workspace启动：
         -> sync_history_messages_system
         -> history_messages追加一行
     User、Assistant和普通Tool保存原始分列内容
-    Skill Tool事件的content已是"skill: <scope/name> loaded"，不保存Skill正文
+    Tool历史事件的content已是完整resource_id字符串，不保存工具正文
 
 实时写入：
     AgentContext的messages或tool_context变更

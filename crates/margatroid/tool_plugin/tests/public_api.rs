@@ -1,61 +1,55 @@
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::App;
-use margatroid_types::{ResourceId, ToolCall, ToolDefinition};
+use margatroid_types::{ResourceId, ToolCall};
 use serde_json::json;
 use tool_plugin::{
-    AppToolExt, ToolCallEvent, ToolCallRequest, ToolPlugin, ToolTemplate, WorldToolExt,
+    attach_agent_tool_map, register_agent_tool, AgentToolMap, ToolCallEvent, ToolCallRequest,
+    ToolPlugin, ToolTemplate,
 };
 
 #[test]
-fn templates_route_domain_tool_calls() {
+fn agent_tool_maps_route_local_tool_names() {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(ToolPlugin::default());
-    let loader = ResourceId::parse("tool:builtin/skill-loader:latest").unwrap();
-    app.register_tool_template(
+    let agent = app.world_mut().spawn();
+    attach_agent_tool_map(app.world_mut(), agent).unwrap();
+    let tool_id = ResourceId::parse("tool:builtin/skill-loader:latest").unwrap();
+    let resource_id = ResourceId::parse("skill:local/review:latest").unwrap();
+    let map = register_agent_tool(
+        app.world_mut(),
+        agent,
+        tool_id.clone(),
+        resource_id.clone(),
         ToolTemplate::new(
-            loader.clone(),
-            ToolDefinition {
-                name: "skill_loader".into(),
-                description: "Load a skill resource.".into(),
-                input_schema: json!({"type":"object"}),
-            },
+            "ignored",
+            "Load a skill resource.",
+            json!({"type":"object"}),
         )
         .unwrap(),
-    );
-    assert_eq!(
-        app.world()
-            .tool_template(&loader)
-            .unwrap()
-            .definition()
-            .name,
-        "skill_loader"
-    );
+    )
+    .unwrap();
+    assert_eq!(map.tool_name, "skill0_review");
 
-    let agent = app.world_mut().spawn();
-    let resource = ResourceId::parse("skill:local/review:latest").unwrap();
-    app.world().send_event(ToolCallRequest {
-        id: "turn-1".into(),
+    app.world().send_event(ToolCallEvent {
+        turn_id: "turn-1".into(),
         agent,
         call: ToolCall {
             id: "call-1".into(),
-            resource: resource.clone(),
+            tool_name: map.tool_name,
             arguments: "{}".into(),
         },
     });
     app.tick();
     app.tick();
-    let routed = app
+    let request = app
         .world()
-        .event_reader::<ToolCallEvent>()
+        .event_reader::<ToolCallRequest>()
         .into_iter()
         .next()
         .unwrap();
-    assert_eq!(routed.loader, loader);
-    assert_eq!(routed.resource, resource);
-    assert_eq!(routed.call.resource, routed.resource);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&routed.call.arguments).unwrap(),
-        json!({"resource":"skill:local/review:latest"})
-    );
+    assert_eq!(request.tool_id, tool_id);
+    assert_eq!(request.resource_id, resource_id);
+    assert_eq!(request.tool_call_id, "call-1");
+    assert!(app.world().get_component::<AgentToolMap>(agent).is_some());
 }

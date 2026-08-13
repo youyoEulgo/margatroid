@@ -8,6 +8,7 @@ pub use config_plugin::WebSocketMessageTarget;
 use core_plugin::{App, Event, Plugin, Resource, World};
 use log_plugin::TracingStream;
 use margatroid_protocol::{BackendStateDto, ClientMessage, IntoDomain, ServerMessage};
+use margatroid_types::AgentSkillRouteAction;
 use server_plugin::{
     AppServerExt, WebSocketConnections, WebSocketMessage, WebSocketMessageReceived,
     WebSocketMessageSender,
@@ -164,6 +165,33 @@ fn dto_route_system(world: &mut World) {
                         error = %error,
                         "invalid agent.message payload"
                     ),
+                }
+            }
+            ClientMessage::AgentSkillLoad { id, message } => {
+                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.skill.load", "API request received");
+                match message.into_domain((id, AgentSkillRouteAction::Load)) {
+                    Ok(event) => world.send_event(event),
+                    Err(error) => {
+                        tracing::warn!(connection = received.connection_id.get(), error = %error, "invalid agent.skill.load payload")
+                    }
+                }
+            }
+            ClientMessage::AgentSkillUnload { id, message } => {
+                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.skill.unload", "API request received");
+                match message.into_domain((id, AgentSkillRouteAction::Unload)) {
+                    Ok(event) => world.send_event(event),
+                    Err(error) => {
+                        tracing::warn!(connection = received.connection_id.get(), error = %error, "invalid agent.skill.unload payload")
+                    }
+                }
+            }
+            ClientMessage::AgentSkillUnloadAll { id, message } => {
+                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.skill.unload_all", "API request received");
+                match message.into_domain((id, AgentSkillRouteAction::UnloadAll)) {
+                    Ok(event) => world.send_event(event),
+                    Err(error) => {
+                        tracing::warn!(connection = received.connection_id.get(), error = %error, "invalid agent.skill.unload_all payload")
+                    }
                 }
             }
         }

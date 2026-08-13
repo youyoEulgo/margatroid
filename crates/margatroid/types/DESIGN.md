@@ -127,10 +127,23 @@ RouteAgentMessage：逻辑Agent消息路由命令，公开事件--由DTO层产�
     impl Event for RouteAgentMessage
         Event：公开trait实现
 
+AgentSkillRouteAction：Agent持久Skill操作，公开枚举
+    Load
+    Unload
+    UnloadAll
+
+RouteAgentSkill：逻辑Agent持久Skill路由命令，公开事件--由DTO层产生并交给WorkspacePlugin解析Entity
+    id: String--请求ID
+    workspace: WorkspaceReference--目标Workspace逻辑引用
+    agent: Option<ResourceId>--目标Agent完整资源ID，None表示manager
+    resource_id: Option<ResourceId>--Load与Unload必填，UnloadAll为空
+    action: AgentSkillRouteAction
+    impl Event for RouteAgentSkill
+
 ToolCall：统一工具调用，公开结构体--保存前端指定或Provider返回且后续工具执行必须原样关联的调用
     id: String--调用来源生成的工具调用ID
-    resource: ResourceId--完整领域资源ID；模型可见别名只在InferencePlugin内部使用
-    arguments: String--完整参数JSON文本
+    tool_name: String--所属AgentToolMap内唯一的模型工具名
+    arguments: String--完整参数JSON对象文本，无参数时为"{}"
     impl Clone + PartialEq + Eq for ToolCall
         值语义：公开trait实现
     impl Serialize + Deserialize for ToolCall
@@ -158,6 +171,7 @@ Message：统一消息，公开枚举--所有Margatroid消息Plugin共享的静�
         tool_calls: Vec<ToolCall>--完整工具调用列表，可以为空
     }
     Tool {
+        resource_id: ResourceId--本次调用对应的具体资源ID
         tool_call_id: String--对应Assistant ToolCall::id
         content: String--工具成功输出或稳定错误文本
     }
@@ -273,15 +287,16 @@ Workspace定义：
         -> tool_calls为空时直接发起推理
         -> tool_calls非空时先派发指定工具
     InferencePlugin完成推理
-        -> 构造Message::Assistant
+        -> Provider Adapter保留tool_name并构造Message::Assistant
         -> 发送AgentMessage
     ToolPlugin完成工具调用
-        -> 构造Message::Tool
+        -> 从PendingToolCalls恢复resource_id并构造Message::Tool
         -> 发送AgentMessage
     AgentPlugin
         -> 只消费统一AgentMessage
-        -> 根据Message变体及ToolCall列表维护AgentStatus并调度后续动作
-        -> 每次发起推理都按AgentDynamicVisibility构造tools；用户意图不控制工具定义是否进入请求
+        -> 根据Message变体及ToolCall列表维护上下文、当前turn和loading skills
+        -> 把工具调用发送为ToolCallEvent；pending与批次完成由ToolPlugin管理
+        -> 每次发起推理都按AgentDynamicVisibility从AgentToolMap构造ToolSpec；用户意图不控制工具定义是否进入请求
 
 失败通道：
     推理失败不能伪装成Message
@@ -291,7 +306,8 @@ Workspace定义：
 记忆事件：
     AgentPlugin处理User、Assistant或Tool
         -> 发送AgentHistoryMessageWriteRequested
-        -> Skill Tool的正文替换为"skill: <scope/name> loaded"
+        -> 历史事件的content直接替换为Message::Tool.resource_id字符串
+        -> 实时tool_context仍保存完整Tool正文
     AgentContext修改
         -> 发送同时包含messages和tool_context的AgentContextMessagesUpdated
     MemoryPlugin只消费事件，不读取AgentStatus或资源正文
@@ -329,6 +345,8 @@ Message
 ├── Assistant
 │   └── Vec<ToolCall>
 └── Tool
+    ├── resource_id: ResourceId
+    └── tool_call_id
 
 AgentMessage
 ├── id
