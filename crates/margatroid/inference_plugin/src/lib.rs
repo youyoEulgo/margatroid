@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
@@ -14,7 +14,7 @@ use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use futures_util::{FutureExt, StreamExt};
 use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentMessage, Message, ToolCall, ToolDefinition,
+    AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, ToolCall, ToolDefinition,
 };
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Method, StatusCode, Url};
@@ -382,7 +382,7 @@ pub trait ProviderAdapterFactory: Send + Sync + 'static {
 pub trait ProviderResponseAccumulator: Send + 'static {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, InferenceError>;
 
-    fn finish(self: Box<Self>) -> Result<(InferenceResponse, Vec<String>), InferenceError>;
+    fn finish(self: Box<Self>) -> Result<(ProviderInferenceResponse, Vec<String>), InferenceError>;
 }
 
 pub type ErasedProviderAdapter = Arc<dyn ProviderAdapter>;
@@ -405,11 +405,28 @@ pub struct TokenUsage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InferenceResponse {
-    pub message: Message,
+pub struct ProviderInferenceResponse {
+    pub content: Option<String>,
+    tool_calls: Vec<InferenceToolCall>,
     pub stop_reason: StopReason,
     pub usage: Option<TokenUsage>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InferenceToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InferenceResponse {
+    pub id: String,
+    pub agent: Entity,
+    pub response: ProviderInferenceResponse,
+    pub tool_resources: BTreeMap<String, ResourceId>,
+}
+impl Event for InferenceResponse {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReloadModelRoutes {
@@ -432,15 +449,15 @@ pub struct ReloadModelRoutesResult {
 impl Event for ReloadModelRoutesResult {}
 
 #[derive(Clone, Debug)]
-pub struct InferenceCommand {
+pub struct InferenceRequest {
     pub id: String,
     pub agent: Entity,
-    pub agent_id: String,
+    pub agent_id: ResourceId,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
 }
 
-impl Event for InferenceCommand {}
+impl Event for InferenceRequest {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InferenceRoute {
@@ -450,7 +467,8 @@ struct InferenceRoute {
 
 struct PreparedInference {
     route: InferenceRoute,
-    agent_id: String,
+    agent_id: ResourceId,
+    tool_resources: BTreeMap<String, ResourceId>,
     client: reqwest::Client,
     request: ProviderHttpRequest,
     adapter: ErasedProviderAdapter,
@@ -461,7 +479,8 @@ impl Event for PreparedInference {}
 
 struct InferenceTaskOutput {
     route: InferenceRoute,
-    result: Result<InferenceResponse, InferenceError>,
+    tool_resources: BTreeMap<String, ResourceId>,
+    result: Result<ProviderInferenceResponse, InferenceError>,
 }
 
 struct InferenceTaskError {
@@ -617,7 +636,8 @@ impl Plugin for InferencePlugin {
         app.add_system(&schedule, reload_model_routes_system)
             .add_system(&schedule, prepare_inference_system)
             .add_async_system(&schedule, execute_prepared_inference)
-            .add_system(&schedule, publish_inference_output_system);
+            .add_system(&schedule, publish_inference_output_system)
+            .add_system(&schedule, convert_inference_response_system);
     }
 }
 
@@ -874,7 +894,7 @@ fn reload_model_routes_system(world: &mut World) {
 
 fn prepare_inference_system(world: &mut World) {
     let commands = world
-        .event_reader::<InferenceCommand>()
+        .event_reader::<InferenceRequest>()
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
@@ -894,16 +914,13 @@ fn prepare_inference_system(world: &mut World) {
 
 fn prepare_inference(
     world: &World,
-    command: InferenceCommand,
+    command: InferenceRequest,
 ) -> Result<PreparedInference, (InferenceRoute, InferenceError)> {
     let route = InferenceRoute {
         id: command.id.clone(),
         agent: command.agent,
     };
-    if command.id.is_empty()
-        || command.agent_id.is_empty()
-        || command.agent_id.chars().any(char::is_control)
-    {
+    if command.id.is_empty() || command.agent_id.resource_type() != "agent" {
         return Err((
             route,
             InferenceError::new(
@@ -922,7 +939,12 @@ fn prepare_inference(
         ));
     }
     validate_messages(&command.messages).map_err(|error| (route.clone(), error))?;
-    validate_tools(&command.tools).map_err(|error| (route.clone(), error))?;
+    let (tools, tool_resources) = convert_resource_tools(&command.tools)
+        .and_then(|converted| {
+            validate_tools(&converted.0)?;
+            Ok(converted)
+        })
+        .map_err(|error| (route.clone(), error))?;
     let snapshot = world
         .get_component::<AgentInferenceSnapshot>(command.agent)
         .ok_or_else(|| {
@@ -957,7 +979,7 @@ fn prepare_inference(
             &model_route.model,
             &snapshot.parameters,
             &command.messages,
-            &command.tools,
+            &tools,
         ))
         .map_err(|error| (route.clone(), error))?;
     let client = world
@@ -1000,6 +1022,7 @@ fn prepare_inference(
     Ok(PreparedInference {
         route,
         agent_id: command.agent_id,
+        tool_resources,
         client,
         request,
         adapter: model_route.adapter,
@@ -1045,7 +1068,9 @@ fn validate_messages(messages: &[Message]) -> Result<(), InferenceError> {
                 content.as_deref().unwrap_or("").len()
                     + tool_calls
                         .iter()
-                        .map(|call| call.id.len() + call.name.len() + call.arguments.len())
+                        .map(|call| {
+                            call.id.len() + call.resource.to_string().len() + call.arguments.len()
+                        })
                         .sum::<usize>()
             }
             Message::Tool {
@@ -1086,7 +1111,7 @@ fn validate_messages(messages: &[Message]) -> Result<(), InferenceError> {
                 ));
             }
             for call in tool_calls {
-                if call.id.is_empty() || call.name.is_empty() {
+                if call.id.is_empty() {
                     return Err(InferenceError::new(
                         InferenceErrorKind::InvalidMessages,
                         "assistant tool call ID and name cannot be empty",
@@ -1127,11 +1152,52 @@ fn validate_tools(tools: &[ToolDefinition]) -> Result<(), InferenceError> {
     Ok(())
 }
 
+fn api_tool_name(resource: &ResourceId) -> String {
+    resource
+        .to_string()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn convert_resource_tools(
+    tools: &[ToolDefinition],
+) -> Result<(Vec<ToolDefinition>, BTreeMap<String, ResourceId>), InferenceError> {
+    let mut converted = Vec::with_capacity(tools.len());
+    let mut resources = BTreeMap::new();
+    for tool in tools {
+        let resource = ResourceId::parse(&tool.name).map_err(|_| {
+            InferenceError::new(
+                InferenceErrorKind::InvalidToolDefinitions,
+                "tool definition name must be a ResourceId",
+            )
+        })?;
+        let name = api_tool_name(&resource);
+        if resources.insert(name.clone(), resource).is_some() {
+            return Err(InferenceError::new(
+                InferenceErrorKind::InvalidToolDefinitions,
+                "resource IDs produce duplicate API tool names",
+            ));
+        }
+        let mut definition = tool.clone();
+        definition.name = name;
+        converted.push(definition);
+    }
+    Ok((converted, resources))
+}
+
 async fn execute_prepared_inference(
     prepared: PreparedInference,
     _context: AsyncContext,
 ) -> Result<InferenceTaskOutput, InferenceTaskError> {
     let route = prepared.route.clone();
+    let tool_resources = prepared.tool_resources.clone();
     let result = std::panic::AssertUnwindSafe(run_provider(prepared))
         .catch_unwind()
         .await
@@ -1141,10 +1207,16 @@ async fn execute_prepared_inference(
                 "inference provider task panicked",
             ))
         });
-    Ok(InferenceTaskOutput { route, result })
+    Ok(InferenceTaskOutput {
+        route,
+        tool_resources,
+        result,
+    })
 }
 
-async fn run_provider(prepared: PreparedInference) -> Result<InferenceResponse, InferenceError> {
+async fn run_provider(
+    prepared: PreparedInference,
+) -> Result<ProviderInferenceResponse, InferenceError> {
     let endpoint = safe_endpoint(&prepared.request.url);
     let response = send_provider_request(&prepared.client, prepared.request).await?;
     let status = response.status();
@@ -1219,14 +1291,14 @@ struct AgentMessageDeltaFrame<'a> {
     #[serde(rename = "type")]
     message_type: &'static str,
     id: &'a str,
-    agent: &'a str,
+    agent: &'a ResourceId,
     content: String,
 }
 
 async fn send_stream_delta(
     senders: &[WebSocketSender],
     id: &str,
-    agent: &str,
+    agent: &ResourceId,
     content: String,
 ) -> Result<(), InferenceError> {
     let encoded = serde_json::to_string(&AgentMessageDeltaFrame {
@@ -1340,45 +1412,24 @@ fn publish_inference_output_system(world: &mut World) {
         match output {
             Ok(output) => match &output.result {
                 Ok(response) => {
-                    match &response.message {
-                        Message::Assistant { tool_calls, .. } if tool_calls.is_empty() => (),
-                        Message::Assistant { tool_calls, .. } => {
-                            if tool_calls
-                                .iter()
-                                .any(|call| call.id.is_empty() || call.name.is_empty())
-                            {
-                                events.send_event(AgentFailure {
-                                    id: output.route.id.clone(),
-                                    agent: output.route.agent,
-                                    kind: AgentFailureKind::Inference,
-                                    message: InferenceError::new(
-                                        InferenceErrorKind::ResponseIncomplete,
-                                        "inference response contains an invalid tool call",
-                                    )
-                                    .to_string(),
-                                });
-                                continue;
-                            }
-                            ()
-                        }
-                        _ => {
-                            events.send_event(AgentFailure {
-                                id: output.route.id.clone(),
-                                agent: output.route.agent,
-                                kind: AgentFailureKind::Inference,
-                                message: InferenceError::new(
-                                    InferenceErrorKind::UnsupportedInput,
-                                    "inference provider returned a non-assistant message",
-                                )
-                                .to_string(),
-                            });
-                            continue;
-                        }
+                    if response.content.is_none() && response.tool_calls.is_empty() {
+                        events.send_event(AgentFailure {
+                            id: output.route.id.clone(),
+                            agent: output.route.agent,
+                            kind: AgentFailureKind::Inference,
+                            message: InferenceError::new(
+                                InferenceErrorKind::ResponseIncomplete,
+                                "inference response contains an invalid tool call",
+                            )
+                            .to_string(),
+                        });
+                        continue;
                     }
-                    events.send_event(AgentMessage {
+                    events.send_event(InferenceResponse {
                         id: output.route.id.clone(),
                         agent: output.route.agent,
-                        message: response.message.clone(),
+                        response: response.clone(),
+                        tool_resources: output.tool_resources.clone(),
                     });
                 }
                 Err(error) => events.send_event(AgentFailure {
@@ -1391,6 +1442,60 @@ fn publish_inference_output_system(world: &mut World) {
             Err(error) => tracing::warn!(error = %error.source, "inference task was cancelled"),
         }
     }
+}
+
+fn convert_inference_response_system(world: &mut World) {
+    let responses = world
+        .event_reader::<InferenceResponse>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for response in responses {
+        let mut tool_calls = Vec::with_capacity(response.response.tool_calls.len());
+        let mut invalid = None;
+        for call in response.response.tool_calls {
+            match convert_inference_tool_call(call, &response.tool_resources) {
+                Ok(call) => tool_calls.push(call),
+                Err(error) => {
+                    invalid = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(message_text) = invalid {
+            world.send_event(AgentFailure {
+                id: response.id,
+                agent: response.agent,
+                kind: AgentFailureKind::Inference,
+                message: message_text,
+            });
+            continue;
+        }
+        let message = Message::Assistant {
+            content: response.response.content,
+            tool_calls,
+        };
+        world.send_event(AgentMessage {
+            id: response.id,
+            agent: response.agent,
+            message,
+        });
+    }
+}
+
+fn convert_inference_tool_call(
+    call: InferenceToolCall,
+    tool_resources: &BTreeMap<String, ResourceId>,
+) -> Result<ToolCall, String> {
+    let resource = tool_resources
+        .get(&call.name)
+        .cloned()
+        .ok_or_else(|| format!("model returned unknown tool `{}`", call.name))?;
+    Ok(ToolCall {
+        id: call.id,
+        resource,
+        arguments: call.arguments,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1537,7 +1642,7 @@ fn openai_message(message: &Message) -> serde_json::Value {
             "tool_calls": tool_calls.iter().map(|call| serde_json::json!({
                 "id": call.id,
                 "type": "function",
-                "function": {"name": call.name, "arguments": call.arguments}
+                "function": {"name": api_tool_name(&call.resource), "arguments": call.arguments}
             })).collect::<Vec<_>>(),
         }),
         Message::Tool {
@@ -1620,7 +1725,9 @@ impl ProviderResponseAccumulator for OpenAiAccumulator {
         Ok(text)
     }
 
-    fn finish(mut self: Box<Self>) -> Result<(InferenceResponse, Vec<String>), InferenceError> {
+    fn finish(
+        mut self: Box<Self>,
+    ) -> Result<(ProviderInferenceResponse, Vec<String>), InferenceError> {
         let mut text = Vec::new();
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
@@ -1640,7 +1747,7 @@ impl ProviderResponseAccumulator for OpenAiAccumulator {
                     "inference tool call is missing an ID or name",
                 ));
             }
-            calls.push(ToolCall {
+            calls.push(InferenceToolCall {
                 id: call.id,
                 name: call.name,
                 arguments: call.arguments,
@@ -1658,11 +1765,9 @@ impl ProviderResponseAccumulator for OpenAiAccumulator {
             StopReason::ToolCalls
         };
         Ok((
-            InferenceResponse {
-                message: Message::Assistant {
-                    content: (!self.content.is_empty()).then_some(self.content),
-                    tool_calls: calls,
-                },
+            ProviderInferenceResponse {
+                content: (!self.content.is_empty()).then_some(self.content),
+                tool_calls: calls,
                 stop_reason: reason,
                 usage: self.usage,
             },
@@ -1831,13 +1936,8 @@ data: [DONE]
         let (response, trailing) = Box::new(accumulator).finish().unwrap();
         assert!(trailing.is_empty());
         assert_eq!(visible, ["he", "llo"]);
-        assert_eq!(
-            response.message,
-            Message::Assistant {
-                content: Some("hello".into()),
-                tool_calls: Vec::new(),
-            }
-        );
+        assert_eq!(response.content, Some("hello".into()));
+        assert!(response.tool_calls.is_empty());
     }
 
     #[test]
@@ -1863,16 +1963,14 @@ data: [DONE]
         assert!(second_visible.is_empty());
         let (response, trailing) = Box::new(accumulator).finish().unwrap();
         assert!(trailing.is_empty());
+        assert_eq!(response.content, None);
         assert_eq!(
-            response.message,
-            Message::Assistant {
-                content: None,
-                tool_calls: vec![ToolCall {
-                    id: "call-1".into(),
-                    name: "echo".into(),
-                    arguments: r#"{"text":"hi"}"#.into(),
-                }],
-            }
+            response.tool_calls,
+            vec![InferenceToolCall {
+                id: "call-1".into(),
+                name: "echo".into(),
+                arguments: r#"{"text":"hi"}"#.into(),
+            }]
         );
         assert_eq!(response.stop_reason, StopReason::ToolCalls);
     }
@@ -1887,12 +1985,50 @@ data: [DONE]
 
         let (response, trailing) = Box::new(accumulator).finish().unwrap();
         assert_eq!(trailing, ["tail"]);
+        assert_eq!(response.content, Some("tail".into()));
+        assert!(response.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn resource_tools_convert_to_distinct_api_names() {
+        let tools = vec![
+            ToolDefinition {
+                name: "skill:local/review:latest".into(),
+                description: "Review code.".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+            ToolDefinition {
+                name: "skill:local/commit:latest".into(),
+                description: "Commit code.".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+        ];
+        let (converted, resources) = convert_resource_tools(&tools).unwrap();
+        assert_eq!(converted[0].name, "skill_local_review_latest");
+        assert_eq!(converted[1].name, "skill_local_commit_latest");
         assert_eq!(
-            response.message,
-            Message::Assistant {
-                content: Some("tail".into()),
-                tool_calls: Vec::new(),
-            }
+            resources["skill_local_review_latest"],
+            ResourceId::parse("skill:local/review:latest").unwrap()
+        );
+    }
+
+    #[test]
+    fn inference_response_uses_internal_name_mapping() {
+        let tool_call = convert_inference_tool_call(
+            InferenceToolCall {
+                id: "call-1".into(),
+                name: "skill_local_review_latest".into(),
+                arguments: r#"{"resource":"skill:local/other:latest"}"#.into(),
+            },
+            &BTreeMap::from([(
+                "skill_local_review_latest".into(),
+                ResourceId::parse("skill:local/review:latest").unwrap(),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(
+            tool_call.resource,
+            ResourceId::parse("skill:local/review:latest").unwrap()
         );
     }
 
@@ -1916,10 +2052,10 @@ api_type = "openai"
             .add_plugin(AsyncRuntimePlugin)
             .add_plugin(InferencePlugin::default().with_config_path(path));
         let agent = app.world_mut().spawn();
-        app.world().send_event(InferenceCommand {
+        app.world().send_event(InferenceRequest {
             id: "request".into(),
             agent,
-            agent_id: "test.agent0".into(),
+            agent_id: ResourceId::parse("agent:test/agent0").unwrap(),
             messages: vec![Message::User {
                 content: "hello".into(),
                 tool_calls: Vec::new(),

@@ -9,17 +9,19 @@ use agent_image_loader_plugin::{
 };
 use agent_plugin::{
     AgentCreateRequest, AgentCreated, AgentDynamicVisibility, AgentPluginInstalled,
-    AgentWorkspaceId,
+    AgentWorkspaceId, WorldAgentExt,
 };
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::{AgentInferenceSnapshot, GlobalModelRoutes, WorldInferenceExt};
 use margatroid_types::{
-    AgentMessage, Message, ResourceRef, RouteAgentMessage, WorkspaceAgentDefinition,
-    WorkspaceDefinition,
+    AgentMessage, Message, ResourceId, RouteAgentMessage, WorkspaceAgentDefinition,
+    WorkspaceDefinition, WorkspaceReference,
 };
 use memory_plugin::{AgentMemory, MemoryPluginInstalled, RealtimeContext, WorldMemoryExt};
-use tool_plugin::{AgentToolEnvironment, ToolPluginInstalled, WorldToolExt};
+use tool_plugin::{
+    AgentToolEnvironment, ToolDefinitionRequest, ToolDefinitionResult, ToolPluginInstalled,
+};
 
 pub use margatroid_types::StartWorkspace;
 
@@ -82,11 +84,13 @@ impl Plugin for WorkspacePlugin {
             pending: HashMap::new(),
             image_requests: HashMap::new(),
             agent_requests: HashMap::new(),
+            definition_requests: HashMap::new(),
         });
         app.add_system(&schedule, begin_workspace_command_system)
             .add_system(&schedule, route_agent_message_system)
             .add_system(&schedule, collect_agent_image_system)
-            .add_system(&schedule, collect_agent_created_system);
+            .add_system(&schedule, collect_agent_created_system)
+            .add_system(&schedule, collect_tool_definition_system);
     }
 }
 
@@ -157,21 +161,20 @@ fn route_agent_message_system(world: &mut World) {
         .cloned()
         .collect::<Vec<_>>();
     for request in requests {
-        let Some(workspace) =
-            world.workspace(&request.workspace.project_root, &request.workspace.name)
-        else {
+        let Some(workspace) = workspace_by_reference(world, &request.workspace) else {
             tracing::warn!(id = %request.id, "agent message workspace was not found");
             continue;
         };
-        let Some(configuration) = world.get_component::<WorkspaceConfiguration>(workspace) else {
-            tracing::warn!(id = %request.id, "agent message workspace configuration is missing");
-            continue;
+        let agent = match request.agent {
+            Some(agent_id) => world.agent(&agent_id).filter(|entity| {
+                world
+                    .get_component::<AgentWorkspaceId>(*entity)
+                    .is_some_and(|owner| owner.workspace_id() == workspace)
+            }),
+            None => world.workspace_manager(workspace),
         };
-        let agent_name = request
-            .agent
-            .unwrap_or_else(|| configuration.definition().manager.clone());
-        let Some(agent) = world.workspace_agent(workspace, &agent_name) else {
-            tracing::warn!(id = %request.id, agent = %agent_name, "agent message agent was not found");
+        let Some(agent) = agent else {
+            tracing::warn!(id = %request.id, "agent message agent was not found");
             continue;
         };
         if !matches!(request.message, Message::User { .. }) {
@@ -187,13 +190,13 @@ fn route_agent_message_system(world: &mut World) {
 }
 
 pub struct WorkspaceIdentity {
-    name: Arc<str>,
+    id: ResourceId,
     project_root: Arc<PathBuf>,
 }
 
 impl WorkspaceIdentity {
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn id(&self) -> &ResourceId {
+        &self.id
     }
 
     pub fn project_root(&self) -> &Path {
@@ -303,6 +306,7 @@ pub trait WorldWorkspaceExt {
     );
     fn stop_workspace(&self, id: impl Into<String>, workspace: Entity);
     fn workspaces(&self) -> Vec<Entity>;
+    fn workspace_by_id(&self, id: &ResourceId) -> Option<Entity>;
     fn workspace(&self, project_root: &Path, name: &str) -> Option<Entity>;
     fn workspace_agent(&self, workspace: Entity, name: &str) -> Option<Entity>;
     fn workspace_manager(&self, workspace: Entity) -> Option<Entity>;
@@ -352,14 +356,18 @@ impl WorldWorkspaceExt for World {
 
     fn workspace(&self, project_root: &Path, name: &str) -> Option<Entity> {
         let project_root = normalize_project_root(project_root.to_path_buf()).ok()?;
-        let key = WorkspaceKey {
-            project_root,
-            name: name.to_owned(),
-        };
+        let id = ResourceId::new("workspace", "local", name, None::<String>).ok()?;
+        let workspace = self.workspace_by_id(&id)?;
+        self.get_component::<WorkspaceIdentity>(workspace)
+            .is_some_and(|identity| identity.project_root() == project_root)
+            .then_some(workspace)
+    }
+
+    fn workspace_by_id(&self, id: &ResourceId) -> Option<Entity> {
         let workspace = self
             .get_resource::<WorkspaceRegistry>()?
             .ready
-            .get(&key)
+            .get(&WorkspaceKey { id: id.clone() })
             .copied()?;
         is_registered_workspace(self, workspace).then_some(workspace)
     }
@@ -392,8 +400,7 @@ impl WorldWorkspaceExt for World {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct WorkspaceKey {
-    project_root: PathBuf,
-    name: String,
+    id: ResourceId,
 }
 
 #[derive(Clone, Copy)]
@@ -409,15 +416,16 @@ struct PendingWorkspace {
     images: BTreeMap<String, Result<Entity, WorkspaceError>>,
     prepared: BTreeMap<String, PreparedWorkspaceAgent>,
     agents: BTreeMap<String, Entity>,
+    pending_definitions: usize,
 }
 
 struct PreparedWorkspaceAgent {
     name: String,
-    agent_id: String,
+    agent_id: ResourceId,
     system_prompt: String,
     messages: Vec<Message>,
     tool_context: Vec<Message>,
-    default_visibility: BTreeSet<ResourceRef>,
+    default_visibility: BTreeSet<ResourceId>,
     inference_snapshot: AgentInferenceSnapshot,
     tool_environment: AgentToolEnvironment,
     memory: AgentMemory,
@@ -429,6 +437,7 @@ struct WorkspaceRegistry {
     pending: HashMap<String, PendingWorkspace>,
     image_requests: HashMap<String, (String, String)>,
     agent_requests: HashMap<String, (String, String)>,
+    definition_requests: HashMap<String, (String, Entity, ResourceId)>,
 }
 
 impl Resource for WorkspaceRegistry {}
@@ -503,7 +512,7 @@ fn begin_workspace_command_system(world: &mut World) {
                 "workspace request id cannot be empty",
             ))
         } else {
-            let Some(entity) = world.workspace(&workspace.project_root, &workspace.name) else {
+            let Some(entity) = workspace_by_reference(world, &workspace) else {
                 world.send_event(StopWorkspaceByReferenceResult {
                     id: event.id,
                     workspace,
@@ -593,7 +602,7 @@ fn begin_workspace_start_validated(
     assert!(world.insert_component(
         workspace,
         WorkspaceIdentity {
-            name: Arc::from(definition.name.as_str()),
+            id: definition.id.clone(),
             project_root: Arc::new(definition.project_root.clone()),
         },
     ));
@@ -638,6 +647,7 @@ fn begin_workspace_start_validated(
             images: BTreeMap::new(),
             prepared: BTreeMap::new(),
             agents: BTreeMap::new(),
+            pending_definitions: 0,
         },
     );
     for (request_id, name, _) in &image_requests {
@@ -739,7 +749,7 @@ fn prepare_workspace_agents(world: &mut World, request_id: &str) -> Result<(), W
     };
 
     let mut prepared = BTreeMap::new();
-    for (index, agent_definition) in definition.agents.iter().enumerate() {
+    for agent_definition in &definition.agents {
         let image = images.get(&agent_definition.name).copied().ok_or_else(|| {
             WorkspaceError::new(
                 WorkspaceErrorKind::AgentImageComponentsMissing,
@@ -787,13 +797,10 @@ fn prepare_workspace_agents(world: &mut World, request_id: &str) -> Result<(), W
         let image_root = image_root(&agent_images_root, &agent_definition.image);
         let tool_environment =
             AgentToolEnvironment::new(definition.project_root.clone(), image_root);
-        let memory_path = agent_definition.memory_path.clone().unwrap_or_else(|| {
-            default_memory_path(
-                &definition.project_root,
-                &definition.name,
-                &agent_definition.name,
-            )
-        });
+        let memory_path = agent_definition
+            .memory_path
+            .clone()
+            .unwrap_or_else(|| default_memory_path(&definition.project_root, &agent_definition.id));
         let (memory, context) = AgentMemory::open(memory_path).map_err(|error| {
             WorkspaceError::new(
                 WorkspaceErrorKind::MemorySetupFailed,
@@ -804,7 +811,7 @@ fn prepare_workspace_agents(world: &mut World, request_id: &str) -> Result<(), W
             agent_definition.name.clone(),
             PreparedWorkspaceAgent {
                 name: agent_definition.name.clone(),
-                agent_id: format!("{}.{}{}", definition.name, agent_definition.name, index),
+                agent_id: agent_definition.id.clone(),
                 system_prompt,
                 messages: context.messages,
                 tool_context: context.tool_context,
@@ -897,11 +904,57 @@ fn collect_agent_created_system(world: &mut World) {
         let complete = world
             .get_resource::<WorkspaceRegistry>()
             .and_then(|registry| registry.pending.get(&request_id))
-            .is_some_and(|pending| pending.agents.len() == pending.definition.agents.len());
+            .is_some_and(|pending| {
+                pending.agents.len() == pending.definition.agents.len()
+                    && pending.pending_definitions == 0
+            });
         if complete {
             if let Err(error) = complete_pending_workspace(world, &request_id) {
                 fail_pending_workspace(world, &request_id, error);
             }
+        }
+    }
+}
+
+fn collect_tool_definition_system(world: &mut World) {
+    let results = world
+        .event_reader::<ToolDefinitionResult>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut complete = Vec::new();
+    for result in results {
+        let route = world
+            .get_resource_mut::<WorkspaceRegistry>()
+            .expect("WorkspacePlugin is not installed")
+            .definition_requests
+            .remove(&result.id);
+        let Some((request_id, _agent, _resource)) = route else {
+            continue;
+        };
+        if let Err(error) = result.result {
+            fail_pending_workspace(
+                world,
+                &request_id,
+                WorkspaceError::new(WorkspaceErrorKind::ResourceSetupFailed, error.to_string()),
+            );
+            continue;
+        }
+        if let Some(pending) = world
+            .get_resource_mut::<WorkspaceRegistry>()
+            .and_then(|registry| registry.pending.get_mut(&request_id))
+        {
+            pending.pending_definitions = pending.pending_definitions.saturating_sub(1);
+            if pending.pending_definitions == 0
+                && pending.agents.len() == pending.definition.agents.len()
+            {
+                complete.push(request_id);
+            }
+        }
+    }
+    for request_id in complete {
+        if let Err(error) = complete_pending_workspace(world, &request_id) {
+            fail_pending_workspace(world, &request_id, error);
         }
     }
 }
@@ -964,7 +1017,28 @@ fn attach_prepared_agent(
             "created Agent could not receive its runtime components",
         ));
     }
-    validate_agent_visibility(world, agent)?;
+    let resources = world
+        .get_component::<AgentDynamicVisibility>(agent)
+        .ok_or_else(|| {
+            WorkspaceError::new(
+                WorkspaceErrorKind::ResourceSetupFailed,
+                "created Agent dynamic visibility is missing",
+            )
+        })?
+        .resources()
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut definition_ids = Vec::new();
+    for (index, resource) in resources.into_iter().enumerate() {
+        let definition_id = format!("{request_id}/definition/{name}/{index}");
+        definition_ids.push((definition_id.clone(), resource.clone()));
+        world.send_event(ToolDefinitionRequest {
+            id: definition_id.clone(),
+            agent,
+            resource: resource.clone(),
+        });
+    }
     world
         .get_resource_mut::<WorkspaceRegistry>()
         .expect("WorkspacePlugin is not installed")
@@ -973,40 +1047,18 @@ fn attach_prepared_agent(
         .expect("pending workspace operation disappeared")
         .agents
         .insert(name.to_owned(), agent);
-    Ok(())
-}
-
-fn validate_agent_visibility(world: &World, agent: Entity) -> Result<(), WorkspaceError> {
-    let visibility = world
-        .get_component::<AgentDynamicVisibility>(agent)
-        .ok_or_else(|| {
-            WorkspaceError::new(
-                WorkspaceErrorKind::ResourceSetupFailed,
-                "created Agent dynamic visibility is missing",
-            )
-        })?;
-    let mut exposed_names = BTreeSet::new();
-    for resource in visibility.resources() {
-        let tool = world.resolve_tool(agent, resource).map_err(|error| {
-            WorkspaceError::new(
-                WorkspaceErrorKind::ResourceSetupFailed,
-                format!(
-                    "visible resource {}:{} could not be resolved: {}",
-                    resource.provider(),
-                    resource.name(),
-                    error
-                ),
-            )
-        })?;
-        if !exposed_names.insert(tool.definition().name.clone()) {
-            return Err(WorkspaceError::new(
-                WorkspaceErrorKind::ResourceSetupFailed,
-                format!(
-                    "visible resources expose duplicate tool name {}",
-                    tool.definition().name
-                ),
-            ));
-        }
+    let registry = world
+        .get_resource_mut::<WorkspaceRegistry>()
+        .expect("WorkspacePlugin is not installed");
+    let pending = registry
+        .pending
+        .get_mut(request_id)
+        .expect("pending workspace operation disappeared");
+    pending.pending_definitions += definition_ids.len();
+    for (definition_id, resource) in definition_ids {
+        registry
+            .definition_requests
+            .insert(definition_id, (request_id.to_owned(), agent, resource));
     }
     Ok(())
 }
@@ -1060,6 +1112,9 @@ fn complete_pending_workspace(world: &mut World, request_id: &str) -> Result<(),
         registry
             .agent_requests
             .retain(|_, (parent, _)| parent != request_id);
+        registry
+            .definition_requests
+            .retain(|_, (parent, _, _)| parent != request_id);
         pending
     };
     match pending.kind {
@@ -1088,6 +1143,9 @@ fn fail_pending_workspace(world: &mut World, request_id: &str, error: WorkspaceE
         registry
             .agent_requests
             .retain(|_, (parent, _)| parent != request_id);
+        registry
+            .definition_requests
+            .retain(|_, (parent, _, _)| parent != request_id);
         pending
     };
     let Some(pending) = pending else {
@@ -1158,6 +1216,19 @@ fn validate_definition(
     mut definition: WorkspaceDefinition,
 ) -> Result<WorkspaceDefinition, WorkspaceError> {
     validate_logical_name(&definition.name)?;
+    let expected_id = ResourceId::new("workspace", "local", &definition.name, None::<String>)
+        .map_err(|_| {
+            WorkspaceError::new(
+                WorkspaceErrorKind::InvalidDefinition,
+                "workspace resource ID is invalid",
+            )
+        })?;
+    if definition.id != expected_id {
+        return Err(WorkspaceError::new(
+            WorkspaceErrorKind::InvalidDefinition,
+            "workspace resource ID does not match its name",
+        ));
+    }
     definition.project_root = normalize_project_root(definition.project_root)?;
     if definition.agents.is_empty() {
         return Err(WorkspaceError::new(
@@ -1167,7 +1238,7 @@ fn validate_definition(
     }
     let mut names = HashSet::new();
     for agent in &mut definition.agents {
-        validate_agent_definition(agent)?;
+        validate_agent_definition(agent, &definition.name)?;
         if !names.insert(agent.name.clone()) {
             return Err(WorkspaceError::new(
                 WorkspaceErrorKind::InvalidDefinition,
@@ -1187,8 +1258,28 @@ fn validate_definition(
     Ok(definition)
 }
 
-fn validate_agent_definition(agent: &WorkspaceAgentDefinition) -> Result<(), WorkspaceError> {
-    validate_logical_name(&agent.name)
+fn validate_agent_definition(
+    agent: &WorkspaceAgentDefinition,
+    workspace_name: &str,
+) -> Result<(), WorkspaceError> {
+    validate_logical_name(&agent.name)?;
+    if agent.id.resource_type() != "agent"
+        || agent.id.scope() != workspace_name
+        || agent.id.name() != agent.name
+        || agent.id.tag() != "latest"
+    {
+        return Err(WorkspaceError::new(
+            WorkspaceErrorKind::InvalidDefinition,
+            "Agent resource ID does not match its definition name",
+        ));
+    }
+    if agent.image.resource_type() != "image" {
+        return Err(WorkspaceError::new(
+            WorkspaceErrorKind::InvalidDefinition,
+            "Agent image resource must use type image",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_logical_name(value: &str) -> Result<(), WorkspaceError> {
@@ -1253,20 +1344,20 @@ fn normalize_absolute_path(path: PathBuf) -> Option<PathBuf> {
     Some(normalized)
 }
 
-fn image_root(root: &Path, reference: &margatroid_types::AgentImageReference) -> PathBuf {
+fn image_root(root: &Path, reference: &ResourceId) -> PathBuf {
     root.join(reference.scope())
         .join(reference.name())
         .join(reference.tag())
 }
 
-fn default_memory_path(project_root: &Path, workspace: &str, agent: &str) -> PathBuf {
-    project_root
+fn default_memory_path(project_root: &Path, agent: &ResourceId) -> PathBuf {
+    let base = project_root
         .join(".margatroid")
         .join("workspaces")
-        .join(workspace)
+        .join(agent.scope())
         .join("memory")
-        .join(agent)
-        .join("memory.sql")
+        .join(agent.name());
+    base.join("memory.sql")
 }
 
 fn agent_image_components_missing() -> WorkspaceError {
@@ -1298,8 +1389,7 @@ fn ready_workspace_key(world: &World, workspace: Entity) -> Result<WorkspaceKey,
         ));
     }
     let key = WorkspaceKey {
-        project_root: identity.project_root().to_path_buf(),
-        name: identity.name().to_owned(),
+        id: identity.id().clone(),
     };
     match world
         .get_resource::<WorkspaceRegistry>()
@@ -1315,6 +1405,15 @@ fn ready_workspace_key(world: &World, workspace: Entity) -> Result<WorkspaceKey,
             "workspace is not registered for requests",
         )),
     }
+}
+
+fn workspace_by_reference(world: &World, reference: &WorkspaceReference) -> Option<Entity> {
+    let workspace = world.workspace_by_id(&reference.id)?;
+    let identity = world.get_component::<WorkspaceIdentity>(workspace)?;
+    let configuration = world.get_component::<WorkspaceConfiguration>(workspace)?;
+    (identity.project_root() == reference.project_root
+        && configuration.definition().name == reference.name)
+        .then_some(workspace)
 }
 
 fn is_registered_workspace(world: &World, workspace: Entity) -> bool {
@@ -1344,8 +1443,7 @@ fn cleanup_orphan_agent(world: &mut World, agent: Entity) {
 impl WorkspaceKey {
     fn from_definition(definition: &WorkspaceDefinition) -> Self {
         Self {
-            project_root: definition.project_root.clone(),
-            name: definition.name.clone(),
+            id: definition.id.clone(),
         }
     }
 }

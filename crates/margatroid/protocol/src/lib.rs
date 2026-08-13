@@ -5,9 +5,8 @@ use agent_plugin::{AgentDynamicVisibility, AgentIdentity};
 use core_plugin::{Entity, World};
 use log_plugin::{TracingField, TracingRecord};
 use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentImageReference, AgentMessage, Message, ResourceName,
-    ResourceRef, RouteAgentMessage, StartWorkspace, ToolCall, WorkspaceAgentDefinition,
-    WorkspaceDefinition, WorkspaceReference,
+    AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, RouteAgentMessage,
+    StartWorkspace, ToolCall, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
 };
 use memory_plugin::{AgentMemory, HistoryMessage};
 use serde::{Deserialize, Serialize};
@@ -103,7 +102,7 @@ pub enum ServerMessage {
     #[serde(rename = "agent.message.delta")]
     AgentMessageDelta {
         id: String,
-        agent: String,
+        agent: ResourceIdDto,
         content: String,
     },
     #[serde(rename = "agent.failure")]
@@ -171,7 +170,7 @@ impl IntoDomain<Message> for UserMessageDto {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallDto {
     pub id: String,
-    pub name: String,
+    pub resource: ResourceIdDto,
     pub arguments: String,
 }
 
@@ -179,7 +178,7 @@ impl FromDomain<&ToolCall> for ToolCallDto {
     fn from_domain(call: &ToolCall, (): ()) -> Result<Self, ProtocolError> {
         Ok(Self {
             id: call.id.clone(),
-            name: call.name.clone(),
+            resource: ResourceIdDto::from_domain(&call.resource, ())?,
             arguments: call.arguments.clone(),
         })
     }
@@ -189,7 +188,7 @@ impl IntoDomain<ToolCall> for ToolCallDto {
     fn into_domain(self, (): ()) -> Result<ToolCall, ProtocolError> {
         Ok(ToolCall {
             id: self.id,
-            name: self.name,
+            resource: self.resource.into_domain(())?,
             arguments: self.arguments,
         })
     }
@@ -298,7 +297,7 @@ impl IntoDomain<StopWorkspaceByReference, String> for StopWorkspaceDto {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteAgentMessageDto {
     pub workspace: WorkspaceReferenceDto,
-    pub agent: Option<String>,
+    pub agent: Option<ResourceIdDto>,
     pub message: UserMessageDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallDto>,
@@ -314,7 +313,7 @@ impl IntoDomain<RouteAgentMessage, String> for RouteAgentMessageDto {
         Ok(RouteAgentMessage {
             id,
             workspace: self.workspace.into_domain(())?,
-            agent: self.agent,
+            agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
             message: Message::User {
                 content: self.message.content,
                 tool_calls,
@@ -356,7 +355,7 @@ impl ClientMessage {
     pub fn agent_message(
         id: impl Into<String>,
         workspace: &WorkspaceReferenceDto,
-        agent: Option<String>,
+        agent: Option<ResourceIdDto>,
         content: impl Into<String>,
     ) -> Self {
         Self::AgentMessage {
@@ -375,7 +374,7 @@ impl ClientMessage {
     pub fn agent_message_with_tool_calls(
         id: impl Into<String>,
         workspace: &WorkspaceReferenceDto,
-        agent: Option<String>,
+        agent: Option<ResourceIdDto>,
         content: impl Into<String>,
         tool_calls: Vec<ToolCallDto>,
     ) -> Self {
@@ -395,13 +394,26 @@ impl ClientMessage {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceReferenceDto {
+    pub id: ResourceIdDto,
     pub name: String,
     pub project_root: String,
 }
 
 impl WorkspaceReferenceDto {
     pub fn new(name: impl Into<String>, project_root: impl Into<String>) -> Self {
+        let name = name.into();
+        let id = ResourceId::new("workspace", "local", &name, None::<String>)
+            .expect("workspace reference name must be valid");
+        Self::with_id(ResourceIdDto(id.to_string()), name, project_root)
+    }
+
+    pub fn with_id(
+        id: ResourceIdDto,
+        name: impl Into<String>,
+        project_root: impl Into<String>,
+    ) -> Self {
         Self {
+            id,
             name: name.into(),
             project_root: project_root.into(),
         }
@@ -410,7 +422,8 @@ impl WorkspaceReferenceDto {
 
 impl FromDomain<&WorkspaceDefinition> for WorkspaceReferenceDto {
     fn from_domain(definition: &WorkspaceDefinition, (): ()) -> Result<Self, ProtocolError> {
-        Ok(Self::new(
+        Ok(Self::with_id(
+            (&definition.id).into_dto(())?,
             definition.name.clone(),
             definition.project_root.to_string_lossy().into_owned(),
         ))
@@ -419,7 +432,8 @@ impl FromDomain<&WorkspaceDefinition> for WorkspaceReferenceDto {
 
 impl FromDomain<WorkspaceReference> for WorkspaceReferenceDto {
     fn from_domain(reference: WorkspaceReference, (): ()) -> Result<Self, ProtocolError> {
-        Ok(Self::new(
+        Ok(Self::with_id(
+            (&reference.id).into_dto(())?,
             reference.name,
             reference.project_root.to_string_lossy().into_owned(),
         ))
@@ -429,6 +443,7 @@ impl FromDomain<WorkspaceReference> for WorkspaceReferenceDto {
 impl IntoDomain<WorkspaceReference> for WorkspaceReferenceDto {
     fn into_domain(self, (): ()) -> Result<WorkspaceReference, ProtocolError> {
         Ok(WorkspaceReference {
+            id: self.id.into_domain(())?,
             name: self.name,
             project_root: PathBuf::from(self.project_root),
         })
@@ -437,30 +452,36 @@ impl IntoDomain<WorkspaceReference> for WorkspaceReferenceDto {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceInfoDto {
+    pub id: ResourceIdDto,
     pub name: String,
     pub project_root: String,
-    pub manager: String,
-    pub agents: Vec<String>,
+    pub manager: ResourceIdDto,
+    pub agents: Vec<ResourceIdDto>,
 }
 
 impl FromDomain<&WorkspaceDefinition> for WorkspaceInfoDto {
     fn from_domain(definition: &WorkspaceDefinition, (): ()) -> Result<Self, ProtocolError> {
         Ok(Self {
+            id: (&definition.id).into_dto(())?,
             name: definition.name.clone(),
             project_root: definition.project_root.to_string_lossy().into_owned(),
-            manager: definition.manager.clone(),
+            manager: agent_resource_id(&definition.name, &definition.manager)?.into_dto(())?,
             agents: definition
                 .agents
                 .iter()
-                .map(|agent| agent.name.clone())
-                .collect(),
+                .map(|agent| agent_resource_id(&definition.name, &agent.name)?.into_dto(()))
+                .collect::<Result<_, ProtocolError>>()?,
         })
     }
 }
 
 impl WorkspaceInfoDto {
     pub fn reference(&self) -> WorkspaceReferenceDto {
-        WorkspaceReferenceDto::new(self.name.clone(), self.project_root.clone())
+        WorkspaceReferenceDto::with_id(
+            self.id.clone(),
+            self.name.clone(),
+            self.project_root.clone(),
+        )
     }
 }
 
@@ -476,14 +497,14 @@ pub struct BackendStateDto {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStateDto {
     pub workspace: WorkspaceReferenceDto,
-    pub agent: String,
-    pub visible_resources: Vec<ResourceRefDto>,
+    pub agent: ResourceIdDto,
+    pub visible_resources: Vec<ResourceIdDto>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentHistoryDto {
     pub workspace: WorkspaceReferenceDto,
-    pub agent: String,
+    pub agent: ResourceIdDto,
     pub messages: Vec<HistoryMessageDto>,
 }
 
@@ -499,7 +520,7 @@ pub struct HistoryMessageDto {
 pub struct AgentMessageDto {
     pub id: String,
     pub workspace: WorkspaceReferenceDto,
-    pub agent: String,
+    pub agent: ResourceIdDto,
     pub message: MessageDto,
 }
 
@@ -507,7 +528,7 @@ pub struct AgentMessageDto {
 pub struct AgentFailureDto {
     pub id: String,
     pub workspace: WorkspaceReferenceDto,
-    pub agent: String,
+    pub agent: ResourceIdDto,
     pub kind: String,
     pub message: String,
 }
@@ -568,7 +589,7 @@ impl FromDomain<Entity, &World> for WorkspaceInfoDto {
 
 impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
     fn from_domain(
-        (agent, name, workspace): (Entity, &str, &WorkspaceInfoDto),
+        (agent, _name, workspace): (Entity, &str, &WorkspaceInfoDto),
         world: &World,
     ) -> Result<Self, ProtocolError> {
         let visibility = world
@@ -584,9 +605,15 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
             .iter()
             .map(|resource| resource.into_dto(()))
             .collect::<Result<Vec<_>, _>>()?;
+        let identity = world.get_component::<AgentIdentity>(agent).ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorKind::AgentNotFound,
+                "Agent identity is missing",
+            )
+        })?;
         Ok(Self {
             workspace: workspace.reference(),
-            agent: name.to_owned(),
+            agent: identity.id().into_dto(())?,
             visible_resources,
         })
     }
@@ -636,7 +663,16 @@ impl FromDomain<(), &World> for BackendStateDto {
                     .collect::<Result<Vec<_>, _>>()?;
                 histories.push(AgentHistoryDto {
                     workspace: info.reference(),
-                    agent: name.to_owned(),
+                    agent: world
+                        .get_component::<AgentIdentity>(agent)
+                        .ok_or_else(|| {
+                            ProtocolError::new(
+                                ProtocolErrorKind::AgentNotFound,
+                                "Agent identity is missing",
+                            )
+                        })?
+                        .id()
+                        .into_dto(())?,
                     messages,
                 });
             }
@@ -652,6 +688,7 @@ impl FromDomain<(), &World> for BackendStateDto {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceDefinitionDto {
+    pub id: ResourceIdDto,
     pub name: String,
     pub project_root: String,
     pub manager: String,
@@ -661,6 +698,7 @@ pub struct WorkspaceDefinitionDto {
 impl FromDomain<&WorkspaceDefinition> for WorkspaceDefinitionDto {
     fn from_domain(definition: &WorkspaceDefinition, (): ()) -> Result<Self, ProtocolError> {
         Ok(Self {
+            id: (&definition.id).into_dto(())?,
             name: definition.name.clone(),
             project_root: definition.project_root.to_string_lossy().into_owned(),
             manager: definition.manager.clone(),
@@ -681,6 +719,7 @@ impl IntoDomain<WorkspaceDefinition> for WorkspaceDefinitionDto {
             .map(|agent| agent.into_domain(()))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(WorkspaceDefinition {
+            id: self.id.into_domain(())?,
             name: self.name,
             project_root: PathBuf::from(self.project_root),
             manager: self.manager,
@@ -692,9 +731,10 @@ impl IntoDomain<WorkspaceDefinition> for WorkspaceDefinitionDto {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceAgentDefinitionDto {
     pub name: String,
-    pub image: String,
-    pub resources: Vec<ResourceRefDto>,
-    pub disable_resources: Vec<ResourceRefDto>,
+    pub id: ResourceIdDto,
+    pub image: ResourceIdDto,
+    pub resources: Vec<ResourceIdDto>,
+    pub disable_resources: Vec<ResourceIdDto>,
     pub memory_path: Option<String>,
 }
 
@@ -702,7 +742,8 @@ impl FromDomain<&WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto {
     fn from_domain(definition: &WorkspaceAgentDefinition, (): ()) -> Result<Self, ProtocolError> {
         Ok(Self {
             name: definition.name.clone(),
-            image: definition.image.to_string(),
+            id: (&definition.id).into_dto(())?,
+            image: (&definition.image).into_dto(())?,
             resources: definition
                 .resources
                 .iter()
@@ -723,12 +764,13 @@ impl FromDomain<&WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto {
 
 impl IntoDomain<WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto {
     fn into_domain(self, (): ()) -> Result<WorkspaceAgentDefinition, ProtocolError> {
-        let image = AgentImageReference::new(self.image).map_err(|error| {
-            ProtocolError::new(
+        let image = self.image.into_domain(())?;
+        if image.resource_type() != "image" {
+            return Err(ProtocolError::new(
                 ProtocolErrorKind::InvalidImageReference,
-                format!("invalid AgentImage reference: {error}"),
-            )
-        })?;
+                "AgentImage resource must use type image",
+            ));
+        }
         let resources = self
             .resources
             .into_iter()
@@ -741,6 +783,7 @@ impl IntoDomain<WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(WorkspaceAgentDefinition {
             name: self.name,
+            id: self.id.into_domain(())?,
             image,
             resources,
             disable_resources,
@@ -750,32 +793,33 @@ impl IntoDomain<WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceRefDto {
-    pub provider: String,
-    pub name: String,
-}
+#[serde(transparent)]
+pub struct ResourceIdDto(pub String);
 
-impl FromDomain<&ResourceRef> for ResourceRefDto {
-    fn from_domain(resource: &ResourceRef, (): ()) -> Result<Self, ProtocolError> {
-        Ok(Self {
-            provider: resource.provider().to_owned(),
-            name: resource.name().to_string(),
-        })
+impl fmt::Display for ResourceIdDto {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
     }
 }
 
-impl IntoDomain<ResourceRef> for ResourceRefDto {
-    fn into_domain(self, (): ()) -> Result<ResourceRef, ProtocolError> {
-        let name = ResourceName::new(self.name).map_err(|error| {
+impl FromDomain<&ResourceId> for ResourceIdDto {
+    fn from_domain(resource: &ResourceId, (): ()) -> Result<Self, ProtocolError> {
+        Ok(Self(resource.to_string()))
+    }
+}
+
+impl FromDomain<ResourceId> for ResourceIdDto {
+    fn from_domain(resource: ResourceId, (): ()) -> Result<Self, ProtocolError> {
+        Ok(Self(resource.to_string()))
+    }
+}
+
+impl IntoDomain<ResourceId> for ResourceIdDto {
+    fn into_domain(self, (): ()) -> Result<ResourceId, ProtocolError> {
+        ResourceId::parse(self.0).map_err(|error| {
             ProtocolError::new(
                 ProtocolErrorKind::InvalidResourceReference,
-                format!("invalid resource name: {error}"),
-            )
-        })?;
-        ResourceRef::new(self.provider, name).map_err(|error| {
-            ProtocolError::new(
-                ProtocolErrorKind::InvalidResourceReference,
-                format!("invalid resource reference: {error}"),
+                format!("invalid resource ID: {error}"),
             )
         })
     }
@@ -784,7 +828,7 @@ impl IntoDomain<ResourceRef> for ResourceRefDto {
 fn agent_route(
     world: &World,
     agent: Entity,
-) -> Result<(WorkspaceReferenceDto, String), ProtocolError> {
+) -> Result<(WorkspaceReferenceDto, ResourceIdDto), ProtocolError> {
     let identity = world.get_component::<AgentIdentity>(agent).ok_or_else(|| {
         ProtocolError::new(
             ProtocolErrorKind::AgentNotFound,
@@ -806,7 +850,16 @@ fn agent_route(
             )
         })?;
     let workspace = configuration.definition().into_dto(())?;
-    Ok((workspace, identity.id().to_owned()))
+    Ok((workspace, identity.id().into_dto(())?))
+}
+
+fn agent_resource_id(workspace: &str, agent: &str) -> Result<ResourceId, ProtocolError> {
+    ResourceId::new("agent", workspace, agent, None::<String>).map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorKind::InvalidResourceReference,
+            format!("invalid Agent resource ID: {error}"),
+        )
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -871,21 +924,27 @@ mod tests {
 
     fn definition() -> WorkspaceDefinition {
         WorkspaceDefinition {
+            id: ResourceId::parse("workspace:local/demo").unwrap(),
             name: "demo".into(),
             project_root: Path::new("/tmp/demo").into(),
             manager: "coder".into(),
             agents: vec![WorkspaceAgentDefinition {
                 name: "coder".into(),
-                image: AgentImageReference::new("local/coder:v1").unwrap(),
-                resources: vec![ResourceRef::new(
-                    "skill",
-                    ResourceName::new("local/context").unwrap(),
-                )
-                .unwrap()],
+                id: ResourceId::parse("agent:demo/coder:clone0").unwrap(),
+                image: ResourceId::parse("image:local/coder:v1").unwrap(),
+                resources: vec![ResourceId::parse("skill:local/context").unwrap()],
                 disable_resources: Vec::new(),
                 memory_path: None,
             }],
         }
+    }
+
+    fn workspace_reference() -> WorkspaceReferenceDto {
+        WorkspaceReferenceDto::with_id(
+            ResourceIdDto("workspace:local/demo:latest".into()),
+            "demo",
+            "/tmp/demo",
+        )
     }
 
     #[test]
@@ -896,12 +955,16 @@ mod tests {
         assert_eq!(value["type"], "workspace.start");
         assert_eq!(value["id"], "request-1");
         assert_eq!(
-            value["message"]["definition"]["agents"][0]["image"],
-            "local/coder:v1"
+            value["message"]["definition"]["agents"][0]["id"],
+            "agent:demo/coder:clone0"
         );
         assert_eq!(
-            value["message"]["definition"]["agents"][0]["resources"][0]["name"],
-            "local/context"
+            value["message"]["definition"]["agents"][0]["image"],
+            "image:local/coder:v1"
+        );
+        assert_eq!(
+            value["message"]["definition"]["agents"][0]["resources"][0],
+            "skill:local/context:latest"
         );
     }
 
@@ -917,7 +980,7 @@ mod tests {
 
     #[test]
     fn workspace_stop_uses_workspace_reference_and_request_id() {
-        let workspace = WorkspaceReferenceDto::new("demo", "/tmp/demo");
+        let workspace = workspace_reference();
         let value =
             serde_json::to_value(ClientMessage::stop_workspace("stop-1", &workspace)).unwrap();
 
@@ -929,7 +992,7 @@ mod tests {
 
     #[test]
     fn workspace_stop_result_uses_stable_server_shapes() {
-        let workspace = WorkspaceReferenceDto::new("demo", "/tmp/demo");
+        let workspace = workspace_reference();
         let stopped = serde_json::to_value(ServerMessage::WorkspaceStopped {
             id: "stop-1".into(),
             workspace: workspace.clone(),
@@ -955,12 +1018,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_message_uses_workspace_identity_and_optional_agent_name() {
-        let workspace = WorkspaceReferenceDto::new("demo", "/tmp/demo");
+    fn agent_message_uses_workspace_identity_and_optional_agent_id() {
+        let workspace = workspace_reference();
         let value = serde_json::to_value(ClientMessage::agent_message(
             "message-1",
             &workspace,
-            Some("reviewer".into()),
+            Some(ResourceIdDto("agent:demo/reviewer:latest".into())),
             "Review this change.",
         ))
         .unwrap();
@@ -968,7 +1031,7 @@ mod tests {
         assert_eq!(value["type"], "agent.message");
         assert_eq!(value["message"]["workspace"]["name"], "demo");
         assert_eq!(value["message"]["workspace"]["project_root"], "/tmp/demo");
-        assert_eq!(value["message"]["agent"], "reviewer");
+        assert_eq!(value["message"]["agent"], "agent:demo/reviewer:latest");
         assert_eq!(
             value["message"]["message"]["content"],
             "Review this change."
@@ -977,7 +1040,7 @@ mod tests {
 
     #[test]
     fn agent_message_preserves_preselected_tool_calls() {
-        let workspace = WorkspaceReferenceDto::new("demo", "/tmp/demo");
+        let workspace = workspace_reference();
         let request = ClientMessage::agent_message_with_tool_calls(
             "message-1",
             &workspace,
@@ -985,7 +1048,7 @@ mod tests {
             "Load context.",
             vec![ToolCallDto {
                 id: "call-1".into(),
-                name: "skill_local_context".into(),
+                resource: ResourceIdDto("skill:local/context:latest".into()),
                 arguments: "{}".into(),
             }],
         );
@@ -999,12 +1062,15 @@ mod tests {
         };
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call-1");
-        assert_eq!(tool_calls[0].name, "skill_local_context");
+        assert_eq!(
+            tool_calls[0].resource.to_string(),
+            "skill:local/context:latest"
+        );
     }
 
     #[test]
     fn omitted_agent_is_encoded_for_manager_fallback() {
-        let workspace = WorkspaceReferenceDto::new("demo", "/tmp/demo");
+        let workspace = workspace_reference();
         let value = serde_json::to_value(ClientMessage::agent_message(
             "message-1",
             &workspace,
@@ -1043,8 +1109,8 @@ mod tests {
         let value = serde_json::to_value(event).unwrap();
 
         assert_eq!(value["type"], "workspace.started");
-        assert_eq!(value["workspace"]["manager"], "coder");
-        assert_eq!(value["workspace"]["agents"][0], "coder");
+        assert_eq!(value["workspace"]["manager"], "agent:demo/coder:latest");
+        assert_eq!(value["workspace"]["agents"][0], "agent:demo/coder:latest");
     }
 
     #[test]
@@ -1069,16 +1135,13 @@ mod tests {
             state: BackendStateDto {
                 workspaces: vec![(&definition()).into_dto(()).unwrap()],
                 agents: vec![AgentStateDto {
-                    workspace: WorkspaceReferenceDto::new("demo", "/tmp/demo"),
-                    agent: "coder".into(),
-                    visible_resources: vec![ResourceRefDto {
-                        provider: "skill".into(),
-                        name: "local/review".into(),
-                    }],
+                    workspace: workspace_reference(),
+                    agent: ResourceIdDto("agent:demo/coder:latest".into()),
+                    visible_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
                 }],
                 histories: vec![AgentHistoryDto {
-                    workspace: WorkspaceReferenceDto::new("demo", "/tmp/demo"),
-                    agent: "coder".into(),
+                    workspace: workspace_reference(),
+                    agent: ResourceIdDto("agent:demo/coder:latest".into()),
                     messages: vec![HistoryMessageDto {
                         sequence: 1,
                         turn_id: "turn-1".into(),
@@ -1095,13 +1158,22 @@ mod tests {
 
         assert_eq!(value["type"], "state.sync");
         assert_eq!(value["state"]["workspaces"][0]["name"], "demo");
-        assert_eq!(value["state"]["workspaces"][0]["manager"], "coder");
-        assert_eq!(value["state"]["agents"][0]["agent"], "coder");
         assert_eq!(
-            value["state"]["agents"][0]["visible_resources"][0]["provider"],
-            "skill"
+            value["state"]["workspaces"][0]["manager"],
+            "agent:demo/coder:latest"
         );
-        assert_eq!(value["state"]["histories"][0]["agent"], "coder");
+        assert_eq!(
+            value["state"]["agents"][0]["agent"],
+            "agent:demo/coder:latest"
+        );
+        assert_eq!(
+            value["state"]["agents"][0]["visible_resources"][0],
+            "skill:local/review:latest"
+        );
+        assert_eq!(
+            value["state"]["histories"][0]["agent"],
+            "agent:demo/coder:latest"
+        );
         assert_eq!(
             value["state"]["histories"][0]["messages"][0]["turn_id"],
             "turn-1"
@@ -1114,10 +1186,10 @@ mod tests {
         app.add_plugin(RuntimePlugin::default())
             .add_plugin(AgentPlugin::default());
         let workspace = app.world_mut().spawn();
-        let skill = ResourceRef::new("skill", ResourceName::new("local/review").unwrap()).unwrap();
+        let skill = ResourceId::parse("skill:local/review").unwrap();
         app.world().send_event(AgentCreateRequest {
             id: "create-1".into(),
-            agent_id: "demo.coder0".into(),
+            agent_id: ResourceId::parse("agent:demo/coder").unwrap(),
             workspace_id: workspace,
             system_prompt: "system".into(),
             messages: Vec::new(),
@@ -1138,10 +1210,12 @@ mod tests {
         let state = AgentStateDto::from_domain((agent, "coder", &workspace), app.world()).unwrap();
 
         assert_eq!(state.workspace.name, "demo");
-        assert_eq!(state.agent, "coder");
+        assert_eq!(state.agent, ResourceIdDto("agent:demo/coder:latest".into()));
         assert_eq!(state.visible_resources.len(), 1);
-        assert_eq!(state.visible_resources[0].provider, "skill");
-        assert_eq!(state.visible_resources[0].name, "local/review");
+        assert_eq!(
+            state.visible_resources[0],
+            ResourceIdDto("skill:local/review:latest".into())
+        );
     }
 
     #[test]
@@ -1149,8 +1223,8 @@ mod tests {
         let event = ServerMessage::AgentMessage {
             message: AgentMessageDto {
                 id: "message-1".into(),
-                workspace: WorkspaceReferenceDto::new("demo", "/tmp/demo"),
-                agent: "coder".into(),
+                workspace: workspace_reference(),
+                agent: ResourceIdDto("agent:demo/coder:latest".into()),
                 message: MessageDto::Assistant {
                     content: Some("Done.".into()),
                     tool_calls: Vec::new(),
@@ -1160,7 +1234,7 @@ mod tests {
         let value = serde_json::to_value(event).unwrap();
 
         assert_eq!(value["type"], "agent.message");
-        assert_eq!(value["message"]["agent"], "coder");
+        assert_eq!(value["message"]["agent"], "agent:demo/coder:latest");
         assert_eq!(value["message"]["message"]["Assistant"]["content"], "Done.");
     }
 
@@ -1168,14 +1242,14 @@ mod tests {
     fn agent_message_delta_serializes_as_a_flat_stream_frame() {
         let event = ServerMessage::AgentMessageDelta {
             id: "turn-1".into(),
-            agent: "demo.coder0".into(),
+            agent: ResourceIdDto("agent:demo/coder:latest".into()),
             content: "hello".into(),
         };
         let value = serde_json::to_value(event).unwrap();
 
         assert_eq!(value["type"], "agent.message.delta");
         assert_eq!(value["id"], "turn-1");
-        assert_eq!(value["agent"], "demo.coder0");
+        assert_eq!(value["agent"], "agent:demo/coder:latest");
         assert_eq!(value["content"], "hello");
     }
 

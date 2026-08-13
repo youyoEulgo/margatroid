@@ -19,10 +19,9 @@ manager: coder
 project_root: .
 agents:
   coder:
-    image: local/coder:latest
+    image: image:local/coder:latest
     resources:
-      - provider: skill
-        name: local/project-context
+      - "skill:local/project-context:latest"
 ```
 
 ## 文件语法
@@ -35,13 +34,12 @@ project_root: .                    # 可选，默认为 workspace 文件所在�
 manager: coder                     # 可选，默认为第一个 Agent
 agents:                            # 必填，至少一个 Agent
   coder:
-    image: local/coder:latest      # 必填，scope/name[:tag]
+    tag: latest                     # 可选，Agent实例标签，默认为latest
+    image: image:local/coder:latest # 必填，image:scope/name[:tag]
     resources:                     # 可选，额外启用的资源
-      - provider: skill
-        name: local/project-context
+      - "skill:local/project-context:latest"
     disable_resources:             # 可选，禁用的资源
-      - provider: skill
-        name: local/dangerous-command
+      - "skill:local/dangerous-command:latest"
     memory_path: memory/coder.sql  # 可选，SQLite 路径
 ```
 
@@ -57,6 +55,9 @@ agents:                            # 必填，至少一个 Agent
 Agent。
 
 `agents` 不能为空。Agent 名称在同一个 Workspace 内必须唯一，并遵守和 `name` 相同的名称规则。
+每个Agent可用`tag`指定实例标签；Compose将其编译为
+`agent:<workspace>/<agent-name>:<tag>`，省略时使用`latest`。例如`tag: clone0`会生成
+`agent:demo/coder:clone0`。
 
 ### Agent 定义
 
@@ -65,9 +66,9 @@ Agent。
 ```yaml
 agents:
   coder:
-    image: local/coder:latest
+    image: image:local/coder:latest
   reviewer:
-    image: local/reviewer:v2
+    image: image:local/reviewer:v2
 ```
 
 也可以使用列表，此时每项必须显式提供 `name`：
@@ -75,36 +76,34 @@ agents:
 ```yaml
 agents:
   - name: coder
-    image: local/coder
+    image: image:local/coder
   - name: reviewer
-    image: local/reviewer:v2
+    image: image:local/reviewer:v2
 ```
 
 列表和映射都会按照文件中的出现顺序编译。映射形式下如果同时写了 Agent 内部的 `name` 字段，
 它必须和映射键相同。
 
-`image` 是 AgentImage 引用，格式为 `scope/name[:tag]`。省略 tag 时使用 `latest`：
+`image` 是 AgentImage资源ID，格式为 `image:scope/name[:tag]`。省略 tag 时使用 `latest`。
+旧的`scope/name[:tag]`输入仍可读取，但编译后统一成为完整`ResourceId`：
 
 ```yaml
-image: local/coder
-# 等价于 local/coder:latest
+image: image:local/coder
+# 等价于 image:local/coder:latest
 ```
 
 ### Resource 语法
 
-`resources` 和 `disable_resources` 都是资源引用列表。资源引用由 `provider` 和 `name` 组成：
+`resources` 和 `disable_resources` 都是完整资源ID列表：
 
 ```yaml
 resources:
-  - provider: skill
-    name: local/project-context
-  - provider: workflow
-    name: local/review
-  - provider: tool
-    name: builtin/read-file
+  - "skill:local/project-context:latest"
+  - "workflow:local/review:latest"
+  - "tool:builtin/read-file:latest"
 ```
 
-也支持 `provider:scope/name` 简写，建议加引号：
+tag可以省略，编译后统一补为`latest`：
 
 ```yaml
 resources:
@@ -112,8 +111,8 @@ resources:
   - "workflow:local/review"
 ```
 
-`provider` 是工具定义 Plugin 的稳定 ID，只允许小写 ASCII 字母、数字、`_` 和 `-`。当前常见
-Provider 包括 `tool`、`skill` 和 `workflow`，但编译器允许后续注册其他 Provider。
+`type`只允许小写 ASCII 字母、数字、`_` 和 `-`。当前常见类型包括 `tool`、`skill` 和
+`workflow`，但编译器允许后续注册其他类型。
 
 `name` 必须严格是 `scope/name`，两个部分都不能为空，不能使用 `.`、`..`，也不能包含反斜杠或
 控制字符。例如 `local/project-context` 合法，`project-context`、`local/a/b` 和

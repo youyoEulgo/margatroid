@@ -9,8 +9,7 @@ use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::App;
 use inference_plugin::{AgentInferenceSnapshot, InferencePlugin, WorkspaceModelRoutes};
 use margatroid_types::{
-    AgentImageReference, ResourceName, ResourceRef, WorkspaceAgentDefinition, WorkspaceDefinition,
-    WorkspaceReference,
+    ResourceId, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
 };
 use memory_plugin::{AgentMemory, MemoryPlugin};
 use skill_plugin::SkillPlugin;
@@ -64,15 +63,15 @@ api_type = "openai"
 
 fn definition(project_root: &Path) -> WorkspaceDefinition {
     WorkspaceDefinition {
+        id: ResourceId::parse("workspace:local/demo").unwrap(),
         name: "demo".into(),
         project_root: project_root.to_path_buf(),
         manager: "manager".into(),
         agents: vec![WorkspaceAgentDefinition {
             name: "manager".into(),
-            image: AgentImageReference::new("local/coder").unwrap(),
-            resources: vec![
-                ResourceRef::new("skill", ResourceName::new("local/review").unwrap()).unwrap(),
-            ],
+            id: ResourceId::parse("agent:demo/manager:latest").unwrap(),
+            image: ResourceId::parse("image:local/coder").unwrap(),
+            resources: vec![ResourceId::parse("skill:local/review").unwrap()],
             disable_resources: Vec::new(),
             memory_path: None,
         }],
@@ -134,11 +133,16 @@ fn documented_public_api_starts_queries_reloads_and_stops_workspace() {
         app.world()
             .get_component::<WorkspaceIdentity>(workspace)
             .unwrap()
-            .name(),
-        "demo"
+            .id(),
+        &ResourceId::parse("workspace:local/demo").unwrap()
     );
     assert_eq!(
         app.world().workspace(project.path(), "demo"),
+        Some(workspace)
+    );
+    assert_eq!(
+        app.world()
+            .workspace_by_id(&ResourceId::parse("workspace:local/demo").unwrap()),
         Some(workspace)
     );
     assert_eq!(app.world().workspaces(), vec![workspace]);
@@ -148,7 +152,7 @@ fn documented_public_api_starts_queries_reloads_and_stops_workspace() {
             .get_component::<AgentIdentity>(manager)
             .unwrap()
             .id(),
-        "demo.manager0"
+        &ResourceId::parse("agent:demo/manager:latest").unwrap()
     );
     assert_eq!(
         app.world().workspace_agent(workspace, "manager"),
@@ -202,6 +206,7 @@ fn documented_public_api_starts_queries_reloads_and_stops_workspace() {
     );
 
     let reference = WorkspaceReference {
+        id: ResourceId::parse("workspace:local/demo").unwrap(),
         name: "demo".into(),
         project_root: project.path().into(),
     };
@@ -291,8 +296,7 @@ fn missing_visible_skill_fails_workspace_start() {
     write_routes(&routes);
 
     let mut definition = definition(project.path());
-    definition.agents[0].resources =
-        vec![ResourceRef::new("skill", ResourceName::new("local/missing").unwrap()).unwrap()];
+    definition.agents[0].resources = vec![ResourceId::parse("skill:local/missing").unwrap()];
     let mut app = app(&library, &routes);
     app.world()
         .start_workspace("start-missing-skill", definition);

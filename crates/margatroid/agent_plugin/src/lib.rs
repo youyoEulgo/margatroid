@@ -3,10 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
-use inference_plugin::InferenceCommand;
+use inference_plugin::InferenceRequest;
 use margatroid_types::{
     AgentContextMessagesUpdated, AgentFailure, AgentFailureKind, AgentHistoryMessageWriteRequested,
-    AgentMessage, Message, ResourceRef, ToolCall, ToolDefinition,
+    AgentMessage, Message, ResourceId, ToolCall, ToolDefinition,
 };
 use tool_plugin::{ToolCallRequest, ToolError, ToolErrorKind, WorldToolExt};
 
@@ -58,12 +58,12 @@ impl Plugin for AgentPlugin {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentCreateRequest {
     pub id: String,
-    pub agent_id: String,
+    pub agent_id: ResourceId,
     pub workspace_id: Entity,
     pub system_prompt: String,
     pub messages: Vec<Message>,
     pub tool_context: Vec<Message>,
-    pub default_visibility: BTreeSet<ResourceRef>,
+    pub default_visibility: BTreeSet<ResourceId>,
 }
 
 impl Event for AgentCreateRequest {}
@@ -77,16 +77,32 @@ pub struct AgentCreated {
 impl Event for AgentCreated {}
 
 pub struct AgentIdentity {
-    id: String,
+    id: ResourceId,
 }
 
 impl AgentIdentity {
-    pub fn id(&self) -> &str {
+    pub fn id(&self) -> &ResourceId {
         &self.id
     }
 }
 
 impl Component for AgentIdentity {}
+
+pub trait WorldAgentExt {
+    fn agent(&self, id: &ResourceId) -> Option<Entity>;
+}
+
+impl WorldAgentExt for World {
+    fn agent(&self, id: &ResourceId) -> Option<Entity> {
+        self.query_with::<AgentIdentity>()
+            .result()
+            .into_iter()
+            .find(|entity| {
+                self.get_component::<AgentIdentity>(*entity)
+                    .is_some_and(|identity| identity.id() == id)
+            })
+    }
+}
 
 pub struct AgentWorkspaceId {
     workspace_id: Entity,
@@ -167,11 +183,11 @@ impl AgentContext {
 impl Component for AgentContext {}
 
 pub struct AgentDefaultVisibility {
-    resources: BTreeSet<ResourceRef>,
+    resources: BTreeSet<ResourceId>,
 }
 
 impl AgentDefaultVisibility {
-    pub fn resources(&self) -> &BTreeSet<ResourceRef> {
+    pub fn resources(&self) -> &BTreeSet<ResourceId> {
         &self.resources
     }
 }
@@ -179,11 +195,11 @@ impl AgentDefaultVisibility {
 impl Component for AgentDefaultVisibility {}
 
 pub struct AgentDynamicVisibility {
-    resources: BTreeSet<ResourceRef>,
+    resources: BTreeSet<ResourceId>,
 }
 
 impl AgentDynamicVisibility {
-    pub fn resources(&self) -> &BTreeSet<ResourceRef> {
+    pub fn resources(&self) -> &BTreeSet<ResourceId> {
         &self.resources
     }
 }
@@ -240,7 +256,7 @@ impl Component for AgentStatus {}
 #[derive(Clone)]
 pub(crate) struct PendingToolCall {
     pub(crate) call: ToolCall,
-    pub(crate) resource: ResourceRef,
+    pub(crate) resource: ResourceId,
     pub(crate) kind: ToolCallKind,
 }
 
@@ -259,7 +275,7 @@ pub(crate) enum ToolCallCompletion {
 
 struct AvailableTools {
     definitions: Vec<ToolDefinition>,
-    resources_by_name: BTreeMap<String, ResourceRef>,
+    resources: BTreeSet<ResourceId>,
 }
 
 enum ConversationTurnResult {
@@ -270,26 +286,24 @@ enum ConversationTurnResult {
 
 enum AgentStepError {
     AgentMissing,
+    IdentityMissing,
     ContextMissing,
     StatusMissing,
     InvalidMessage,
     InvalidToolBatch,
     Tool(ToolError),
-    DuplicateToolName,
 }
 
 impl AgentStepError {
     fn failure_message(&self) -> String {
         match self {
             Self::AgentMissing => "AgentMissing: agent entity is not alive".into(),
+            Self::IdentityMissing => "IdentityMissing: agent identity is missing".into(),
             Self::ContextMissing => "ContextMissing: agent context is missing".into(),
             Self::StatusMissing => "StatusMissing: agent status is missing".into(),
             Self::InvalidMessage => "InvalidMessage: message type is invalid".into(),
             Self::InvalidToolBatch => "InvalidToolBatch: tool call batch is invalid".into(),
             Self::Tool(error) => error.to_string(),
-            Self::DuplicateToolName => {
-                "DuplicateToolName: visible resources expose the same tool name".into()
-            }
         }
     }
 }
@@ -304,7 +318,8 @@ fn agent_create_system(world: &mut World) {
 
     for request in requests {
         if request.id.is_empty()
-            || request.agent_id.is_empty()
+            || request.agent_id.resource_type() != "agent"
+            || world.agent(&request.agent_id).is_some()
             || !world.is_alive(request.workspace_id)
             || request
                 .messages
@@ -564,18 +579,22 @@ fn queue_tool_calls(
     tool_calls
         .iter()
         .map(|call| {
-            let resource = available_tools
-                .resources_by_name
-                .get(&call.name)
-                .ok_or_else(|| {
-                    AgentStepError::Tool(ToolError::new(
-                        ToolErrorKind::InvalidRequest,
-                        "tool call name was not present in current tool definitions",
-                    ))
-                })?;
+            let resource = call.resource.clone();
+            if !available_tools.resources.contains(&resource) {
+                return Err(AgentStepError::Tool(ToolError::new(
+                    ToolErrorKind::InvalidRequest,
+                    "tool call resource was not present in current tool definitions",
+                )));
+            }
+            if resource.resource_type().is_empty() {
+                return Err(AgentStepError::Tool(ToolError::new(
+                    ToolErrorKind::InvalidRequest,
+                    "tool call resource is invalid",
+                )));
+            }
             Ok(PendingToolCall {
                 call: call.clone(),
-                kind: tool_call_kind(resource),
+                kind: tool_call_kind(&resource),
                 resource: resource.clone(),
             })
         })
@@ -597,17 +616,17 @@ fn dispatch_pending_tools(
         .map(|pending| ToolCallRequest {
             id: id.to_owned(),
             agent,
-            resource: pending.resource,
             call: pending.call,
         })
         .collect::<Vec<_>>();
     let agent_id = world
         .get_component::<AgentIdentity>(agent)
         .map(AgentIdentity::id)
-        .unwrap_or("unknown");
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "unknown".into());
     tracing::info!(
         request_id = id,
-        agent = agent_id,
+        agent = %agent_id,
         tool_calls = requests.len(),
         "tool calls dispatched"
     );
@@ -634,16 +653,16 @@ fn expand_loading_skills(status: &AgentStatus) -> Vec<PendingToolCall> {
         .collect()
 }
 
-fn tool_call_kind(resource: &ResourceRef) -> ToolCallKind {
-    if resource.provider() == "skill" {
+fn tool_call_kind(resource: &ResourceId) -> ToolCallKind {
+    if resource.resource_type() == "skill" {
         ToolCallKind::Skill
     } else {
         ToolCallKind::Tool
     }
 }
 
-fn skill_key(resource: &ResourceRef) -> String {
-    format!("{}:{}", resource.provider(), resource.name())
+fn skill_key(resource: &ResourceId) -> String {
+    resource.to_string()
 }
 
 fn send_inference_command(
@@ -657,18 +676,18 @@ fn send_inference_command(
     let agent_id = world
         .get_component::<AgentIdentity>(agent)
         .map(AgentIdentity::id)
-        .unwrap_or("unknown");
+        .ok_or(AgentStepError::IdentityMissing)?;
     tracing::info!(
         request_id = id,
-        agent = agent_id,
+        agent = %agent_id,
         messages = messages.len(),
         tools = available_tools.definitions.len(),
         "inference requested"
     );
-    events.send_event(InferenceCommand {
+    events.send_event(InferenceRequest {
         id: id.to_owned(),
         agent,
-        agent_id: agent_id.to_owned(),
+        agent_id: agent_id.clone(),
         messages,
         tools: available_tools.definitions,
     });
@@ -697,22 +716,18 @@ fn build_available_tools(world: &World, agent: Entity) -> Result<AvailableTools,
         .cloned()
         .collect::<Vec<_>>();
     let mut definitions = Vec::with_capacity(resources.len());
-    let mut resources_by_name = BTreeMap::new();
-    for resource in resources {
-        let tool = world
-            .resolve_tool(agent, &resource)
-            .map_err(AgentStepError::Tool)?;
-        if resources_by_name
-            .insert(tool.definition().name.clone(), resource)
-            .is_some()
-        {
-            return Err(AgentStepError::DuplicateToolName);
-        }
-        definitions.push(tool.definition().clone());
+    for resource in &resources {
+        let definition = world.tool_definition_for(&resource).ok_or_else(|| {
+            AgentStepError::Tool(ToolError::new(
+                ToolErrorKind::ProviderMissing,
+                "resource provider was not registered",
+            ))
+        })?;
+        definitions.push(definition);
     }
     Ok(AvailableTools {
         definitions,
-        resources_by_name,
+        resources: resources.into_iter().collect(),
     })
 }
 
@@ -731,37 +746,29 @@ fn assert_conversation_messages(messages: &[Message]) {
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
     use std::path::Path;
     use std::time::{Duration, Instant};
 
     use async_runtime_plugin::AsyncRuntimePlugin;
-    use margatroid_types::{ResourceName, ToolDefinition};
+    use margatroid_types::ToolDefinition;
     use memory_plugin::{AgentMemory, MemoryPlugin, WorldMemoryExt};
-    use serde::Deserialize;
     use serde_json::json;
     use tempfile::tempdir;
-    use tool_plugin::{AgentToolEnvironment, AppToolExt, Tool, ToolContext, ToolPlugin};
+    use tool_plugin::{AgentToolEnvironment, AppToolExt, ToolPlugin, ToolTemplate};
 
     use super::*;
 
-    #[derive(Deserialize)]
-    struct EmptyArguments {}
-
-    fn resource(name: &str) -> ResourceRef {
-        ResourceRef::new("tool", ResourceName::new(name).unwrap()).unwrap()
+    fn resource(name: &str) -> ResourceId {
+        ResourceId::parse(format!("tool:{name}")).unwrap()
     }
 
-    fn tool(resource: ResourceRef, exposed_name: &str) -> Tool {
-        Tool::new(
+    fn tool(resource: ResourceId, exposed_name: &str) -> ToolTemplate {
+        ToolTemplate::new(
             resource,
             ToolDefinition {
                 name: exposed_name.into(),
                 description: "Test tool".into(),
                 input_schema: json!({"type":"object"}),
-            },
-            |_context: ToolContext, _arguments: EmptyArguments| async move {
-                Ok::<_, Infallible>("ok".into())
             },
         )
         .unwrap()
@@ -777,11 +784,11 @@ mod tests {
         app
     }
 
-    fn create_agent(app: &mut App, visibility: BTreeSet<ResourceRef>) -> Entity {
+    fn create_agent(app: &mut App, visibility: BTreeSet<ResourceId>) -> Entity {
         let workspace = app.world_mut().spawn();
         app.world().send_event(AgentCreateRequest {
             id: "agent-1".into(),
-            agent_id: "test.agent0".into(),
+            agent_id: ResourceId::parse("agent:test/agent0").unwrap(),
             workspace_id: workspace,
             system_prompt: "system".into(),
             messages: Vec::new(),
@@ -835,28 +842,32 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_exposed_names_are_rejected_from_a_request() {
+    fn resource_ids_are_used_as_tool_definition_names() {
         let mut app = test_app();
         let first = resource("builtin/first");
         let second = resource("builtin/second");
-        app.register_tool(tool(first.clone(), "same"));
-        app.register_tool(tool(second.clone(), "same"));
+        app.register_tool_template(tool(first.clone(), "same"));
+        app.register_tool_template(tool(second.clone(), "same"));
         let agent = create_agent(
             &mut app,
-            [first, second].into_iter().collect::<BTreeSet<_>>(),
+            [first.clone(), second.clone()]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
         );
 
-        assert!(matches!(
-            build_available_tools(app.world(), agent),
-            Err(AgentStepError::DuplicateToolName)
-        ));
+        let available = match build_available_tools(app.world(), agent) {
+            Ok(available) => available,
+            Err(_) => panic!("available tool templates should be valid"),
+        };
+        assert_eq!(available.definitions.len(), 2);
+        assert_eq!(available.definitions[0].name, first.to_string());
+        assert_eq!(available.definitions[1].name, second.to_string());
     }
 
     #[test]
     fn unavailable_visible_resource_emits_agent_failure() {
         let mut app = test_app();
-        let missing =
-            ResourceRef::new("skill", ResourceName::new("local/missing").unwrap()).unwrap();
+        let missing = ResourceId::parse("skill:local/missing").unwrap();
         let agent = create_agent(&mut app, [missing].into_iter().collect());
         app.world().send_event(AgentMessage {
             id: "turn-1".into(),
@@ -901,7 +912,7 @@ mod tests {
 
         let command = app
             .world()
-            .event_reader::<InferenceCommand>()
+            .event_reader::<InferenceRequest>()
             .into_iter()
             .next()
             .unwrap();
@@ -925,8 +936,8 @@ mod tests {
         let mut app = test_app();
         let first = resource("builtin/first");
         let second = resource("builtin/second");
-        app.register_tool(tool(first.clone(), "first"));
-        app.register_tool(tool(second.clone(), "second"));
+        app.register_tool_template(tool(first.clone(), "first"));
+        app.register_tool_template(tool(second.clone(), "second"));
         let agent = create_agent(
             &mut app,
             [first, second].into_iter().collect::<BTreeSet<_>>(),
@@ -939,15 +950,33 @@ mod tests {
                 tool_calls: vec![
                     ToolCall {
                         id: "first-call".into(),
-                        name: "first".into(),
+                        resource: ResourceId::parse("tool:builtin/first").unwrap(),
                         arguments: "{}".into(),
                     },
                     ToolCall {
                         id: "second-call".into(),
-                        name: "second".into(),
+                        resource: ResourceId::parse("tool:builtin/second").unwrap(),
                         arguments: "{}".into(),
                     },
                 ],
+            },
+        });
+
+        app.tick();
+        app.world().send_event(AgentMessage {
+            id: "turn-1".into(),
+            agent,
+            message: Message::Tool {
+                tool_call_id: "first-call".into(),
+                content: "first".into(),
+            },
+        });
+        app.world().send_event(AgentMessage {
+            id: "turn-1".into(),
+            agent,
+            message: Message::Tool {
+                tool_call_id: "second-call".into(),
+                content: "second".into(),
             },
         });
 
@@ -958,7 +987,7 @@ mod tests {
             app.tick();
             commands += app
                 .world()
-                .event_reader::<InferenceCommand>()
+                .event_reader::<InferenceRequest>()
                 .into_iter()
                 .filter(|command| command.id == "turn-1")
                 .count();
@@ -982,14 +1011,13 @@ mod tests {
 
     #[test]
     fn loading_skills_are_templates_with_fresh_call_ids() {
-        let resource =
-            ResourceRef::new("skill", ResourceName::new("local/review").unwrap()).unwrap();
+        let resource = ResourceId::parse("skill:local/review").unwrap();
         let mut status = AgentStatus::default();
         assert!(status
             .load_skill(PendingToolCall {
                 call: ToolCall {
                     id: "initial-call".into(),
-                    name: "skill_local_review".into(),
+                    resource: ResourceId::parse("skill:local/review").unwrap(),
                     arguments: "{}".into(),
                 },
                 resource,
@@ -1004,7 +1032,7 @@ mod tests {
         assert_ne!(first[0].call.id, "initial-call");
         assert_ne!(first[0].call.id, second[0].call.id);
         assert_eq!(first[0].resource, second[0].resource);
-        assert!(status.unload_skill("skill:local/review"));
+        assert!(status.unload_skill("skill:local/review:latest"));
         status.unload_all_skills();
     }
 }

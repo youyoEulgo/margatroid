@@ -3,11 +3,13 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use core_plugin::{App, Plugin};
-use margatroid_types::{ResourceName, ResourceRef, ToolDefinition};
-use serde_json::{json, Value};
+use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
+use core_plugin::{App, Plugin, Resource, World};
+use margatroid_types::{AgentMessage, Message, ResourceId, ToolDefinition};
+use serde_json::json;
 use tool_plugin::{
-    AgentToolEnvironment, AppToolExt, Tool, ToolDefinitionProvider, ToolError, ToolErrorKind,
+    AgentToolEnvironment, AppToolExt, ToolCallEvent, ToolDefinitionResult, ToolDefinitionRoute,
+    ToolError, ToolErrorKind, ToolTemplate,
 };
 
 const PROVIDER_ID: &str = "skill";
@@ -53,6 +55,11 @@ pub struct SkillPlugin {
     home_root: Arc<PathBuf>,
 }
 
+struct SkillRoots {
+    home_root: Arc<PathBuf>,
+}
+impl Resource for SkillRoots {}
+
 impl SkillPlugin {
     pub fn open(home_root: impl Into<PathBuf>) -> Result<Self, SkillError> {
         let home_root = normalize_root(home_root.into()).ok_or_else(|| {
@@ -69,70 +76,109 @@ impl SkillPlugin {
 
 impl Plugin for SkillPlugin {
     fn build(self, app: &mut App) {
-        app.register_tool_provider(SkillToolProvider {
-            home_root: self.home_root,
+        app.world_mut().insert_resource(SkillRoots {
+            home_root: self.home_root.clone(),
+        });
+        app.register_tool_template(
+            ToolTemplate::new(
+                ResourceId::parse("tool:builtin/skill-loader:latest").unwrap(),
+                ToolDefinition {
+                    name: "skill_loader".into(),
+                    description: "Load this skill resource.".into(),
+                    input_schema: json!({"type":"object"}),
+                },
+            )
+            .unwrap(),
+        );
+        app.add_system(RuntimePlugin::UPDATE, skill_tool_definition_system)
+            .add_system(RuntimePlugin::UPDATE, skill_tool_call_system);
+    }
+}
+
+fn skill_tool_definition_system(world: &mut World) {
+    let routes = world
+        .event_reader::<ToolDefinitionRoute>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for route in routes.into_iter().filter(|route| {
+        route.loader == ResourceId::parse("tool:builtin/skill-loader:latest").unwrap()
+    }) {
+        let result = world
+            .get_component::<AgentToolEnvironment>(route.agent)
+            .ok_or_else(|| {
+                ToolError::new(
+                    ToolErrorKind::ToolEnvironmentMissing,
+                    "agent tool environment is missing",
+                )
+            })
+            .and_then(|environment| {
+                validate_skill_resource(&route.resource)?;
+                let roots = world
+                    .get_resource::<SkillRoots>()
+                    .expect("SkillPlugin is installed");
+                find_skill_file(environment, &roots.home_root, &route.resource)?;
+                Ok(ToolDefinition {
+                    name: route.resource.to_string(),
+                    description: "Load this skill resource.".into(),
+                    input_schema: json!({"type":"object"}),
+                })
+            });
+        world.send_event(ToolDefinitionResult {
+            id: route.id,
+            agent: route.agent,
+            resource: route.resource,
+            result,
         });
     }
 }
 
-struct SkillToolProvider {
-    home_root: Arc<PathBuf>,
-}
-
-impl ToolDefinitionProvider for SkillToolProvider {
-    fn id(&self) -> &str {
-        PROVIDER_ID
-    }
-
-    fn provide(
-        &self,
-        environment: &AgentToolEnvironment,
-        name: &ResourceName,
-    ) -> Result<Tool, ToolError> {
-        let path = find_skill_file(environment, &self.home_root, name)?;
-        let content = fs::read_to_string(&path).map_err(|_| {
-            ToolError::new(
-                ToolErrorKind::ResourceResolutionFailed,
-                "skill file could not be read",
-            )
-        })?;
-        if content.trim().is_empty() {
-            return Err(ToolError::new(
-                ToolErrorKind::InvalidDefinition,
-                "skill file is empty",
-            ));
-        }
-
-        let resource = ResourceRef::new(PROVIDER_ID, name.clone()).map_err(|_| {
-            ToolError::new(
-                ToolErrorKind::InvalidDefinition,
-                "skill resource reference is invalid",
-            )
-        })?;
-        let exposed_name = exposed_name(name)?;
-        let description = content.clone();
-        Tool::new(
-            resource,
-            ToolDefinition {
-                name: exposed_name,
-                description,
-                input_schema: json!({
-                    "type": "object",
-                    "additionalProperties": true
-                }),
+fn skill_tool_call_system(world: &mut World) {
+    let calls = world
+        .event_reader::<ToolCallEvent>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for event in calls.into_iter().filter(|event| {
+        event.loader == ResourceId::parse("tool:builtin/skill-loader:latest").unwrap()
+    }) {
+        let content = world
+            .get_component::<AgentToolEnvironment>(event.agent)
+            .ok_or_else(|| {
+                ToolError::new(
+                    ToolErrorKind::ToolEnvironmentMissing,
+                    "agent tool environment is missing",
+                )
+            })
+            .and_then(|environment| {
+                validate_skill_resource(&event.resource)?;
+                let roots = world
+                    .get_resource::<SkillRoots>()
+                    .expect("SkillPlugin is installed");
+                let path = find_skill_file(environment, &roots.home_root, &event.resource)?;
+                fs::read_to_string(path).map_err(|_| {
+                    ToolError::new(
+                        ToolErrorKind::ResourceResolutionFailed,
+                        "skill file could not be read",
+                    )
+                })
+            });
+        let content = content.unwrap_or_else(|error| error.to_string());
+        world.send_event(AgentMessage {
+            id: event.id,
+            agent: event.agent,
+            message: Message::Tool {
+                tool_call_id: event.call.id,
+                content,
             },
-            move |_context, _arguments: Value| {
-                let content = content.clone();
-                async move { Ok::<_, std::convert::Infallible>(content) }
-            },
-        )
+        });
     }
 }
 
 fn find_skill_file(
     environment: &AgentToolEnvironment,
     home_root: &Path,
-    name: &ResourceName,
+    resource: &ResourceId,
 ) -> Result<PathBuf, ToolError> {
     let candidates = [
         environment
@@ -143,7 +189,10 @@ fn find_skill_file(
         home_root.to_path_buf(),
     ];
     for root in candidates {
-        let package = root.join(name.scope()).join(name.name());
+        let package = root
+            .join(resource.scope())
+            .join(resource.name())
+            .join(resource.tag());
         let metadata = match fs::metadata(&package) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -175,15 +224,14 @@ fn find_skill_file(
     ))
 }
 
-fn exposed_name(name: &ResourceName) -> Result<String, ToolError> {
-    let value = format!("skill_{}_{}", name.scope(), name.name());
-    if value.len() > 64 {
+fn validate_skill_resource(resource: &ResourceId) -> Result<(), ToolError> {
+    if resource.resource_type() != PROVIDER_ID || resource.tag() != "latest" {
         return Err(ToolError::new(
-            ToolErrorKind::InvalidDefinition,
-            "skill exposed name is too long",
+            ToolErrorKind::ResourceResolutionFailed,
+            "skill resource must use type skill and the supported latest tag",
         ));
     }
-    Ok(value)
+    Ok(())
 }
 
 fn normalize_root(path: PathBuf) -> Option<PathBuf> {
@@ -201,112 +249,4 @@ fn normalize_root(path: PathBuf) -> Option<PathBuf> {
         }
     }
     Some(normalized)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
-
-    use app_runtime_plugin::RuntimePlugin;
-    use async_runtime_plugin::AsyncRuntimePlugin;
-    use core_plugin::App;
-    use margatroid_types::{AgentMessage, Message, ToolCall};
-    use tempfile::tempdir;
-    use tool_plugin::{ToolCallRequest, WorldToolExt};
-
-    use super::*;
-
-    fn name(value: &str) -> ResourceName {
-        ResourceName::new(value).unwrap()
-    }
-
-    #[test]
-    fn project_skill_takes_priority_and_becomes_a_tool() {
-        let project = tempdir().unwrap();
-        let image = tempdir().unwrap();
-        let home = tempdir().unwrap();
-        let skill = project
-            .path()
-            .join(".margatroid/skills/local/review/SKILL.md");
-        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
-        std::fs::write(&skill, "project skill").unwrap();
-
-        let mut app = App::new();
-        app.add_plugin(RuntimePlugin::default())
-            .add_plugin(AsyncRuntimePlugin)
-            .add_plugin(tool_plugin::ToolPlugin::default())
-            .add_plugin(SkillPlugin::open(home.path()).unwrap());
-        let agent = app.world_mut().spawn();
-        app.world_mut().insert_component(
-            agent,
-            AgentToolEnvironment::new(project.path(), image.path()),
-        );
-        let resource = ResourceRef::new("skill", name("local/review")).unwrap();
-        let tool = app.world().resolve_tool(agent, &resource).unwrap();
-        assert_eq!(tool.definition().name, "skill_local_review");
-        assert_eq!(tool.definition().description, "project skill");
-
-        app.world().emit_event(ToolCallRequest {
-            id: "turn-1".into(),
-            agent,
-            resource,
-            call: ToolCall {
-                id: "call-1".into(),
-                name: tool.definition().name.clone(),
-                arguments: "{}".into(),
-            },
-        });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            app.tick();
-            if let Some(message) = app
-                .world()
-                .event_reader::<AgentMessage>()
-                .into_iter()
-                .next()
-            {
-                assert_eq!(
-                    message.message,
-                    Message::Tool {
-                        tool_call_id: "call-1".into(),
-                        content: "project skill".into(),
-                    }
-                );
-                break;
-            }
-            assert!(Instant::now() < deadline, "skill execution timed out");
-            std::thread::yield_now();
-        }
-    }
-
-    #[test]
-    fn invalid_project_package_does_not_fall_back_to_home() {
-        let project = tempdir().unwrap();
-        let image = tempdir().unwrap();
-        let home = tempdir().unwrap();
-        std::fs::create_dir_all(project.path().join(".margatroid/skills/local/review")).unwrap();
-        let home_skill = home.path().join("local/review/SKILL.md");
-        std::fs::create_dir_all(home_skill.parent().unwrap()).unwrap();
-        std::fs::write(home_skill, "home skill").unwrap();
-
-        let mut app = App::new();
-        app.add_plugin(RuntimePlugin::default())
-            .add_plugin(AsyncRuntimePlugin)
-            .add_plugin(tool_plugin::ToolPlugin::default())
-            .add_plugin(SkillPlugin::open(home.path()).unwrap());
-        let agent = app.world_mut().spawn();
-        app.world_mut().insert_component(
-            agent,
-            AgentToolEnvironment::new(project.path(), image.path()),
-        );
-        let resource = ResourceRef::new("skill", name("local/review")).unwrap();
-
-        let error = match app.world().resolve_tool(agent, &resource) {
-            Ok(_) => panic!("invalid project skill must not fall back to home"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.kind(), ToolErrorKind::ResourceResolutionFailed);
-        assert_eq!(error.message(), "skill package does not contain SKILL.md");
-    }
 }

@@ -2,7 +2,57 @@
 
 ## 类型
 
-公开：
+### 统一资源身份
+
+```text
+ResourceId：统一资源ID，公开结构体--所有可寻址资源共享的稳定身份
+    resource_type: String--资源类型，私有
+    scope: String--资源命名空间，私有
+    name: String--命名空间内名称，私有
+    tag: String--版本或实例标签，私有；省略时规范化为latest
+    parse(value: impl AsRef<str>) -> Result<Self, ResourceIdError>
+        解析ID：公开关联函数，解析type:scope/name[:tag]并补齐latest
+    new(resource_type: impl Into<String>, scope: impl Into<String>, name: impl Into<String>, tag: Option<impl Into<String>>) -> Result<Self, ResourceIdError>
+        构造ID：公开关联函数，验证字段并在tag为空时补齐latest
+    resource_type(&self) -> &str
+        取得资源类型：公开方法，用于选择资源路由
+    scope(&self) -> &str
+        取得作用域：公开方法
+    name(&self) -> &str
+        取得名称：公开方法
+    tag(&self) -> &str
+        取得标签：公开方法
+    impl fmt::Display for ResourceId
+        Display：公开trait实现，始终输出type:scope/name:tag
+    impl FromStr for ResourceId
+        FromStr：公开trait实现，行为与parse一致
+    impl Clone + Ord + Eq + Hash for ResourceId
+        值语义：公开trait实现，四个字段共同参与比较和哈希
+    impl Serialize + Deserialize for ResourceId
+        序列化：公开trait实现，使用规范化完整ID字符串
+
+ResourceIdError：统一资源ID错误，公开枚举--描述ResourceId解析和验证错误
+    Empty
+    InvalidType
+    InvalidScope
+    InvalidName
+    InvalidTag
+    InvalidFormat
+    impl fmt::Display for ResourceIdError
+        Display：公开trait实现，输出不包含原始输入的稳定错误描述
+    impl std::error::Error for ResourceIdError
+        Error：公开trait实现
+```
+
+```text
+ResourceId是跨Plugin查找资源的统一地址，不等同于ECS Entity句柄
+资源可以是Agent、Workspace、AgentImage、Skill、Workflow、Tool等领域对象
+ResourceId的规范格式为type:scope/name:tag，省略tag时使用latest
+所有跨Plugin、DTO、配置、日志、Memory和前端身份都使用规范化ResourceId
+ResourceName、ResourceRef和AgentImageReference只在迁移兼容层存在，不能作为新的领域身份
+```
+
+迁移兼容公开类型：
 ```text
 ResourceNameError：资源名称错误，公开枚举--描述scope/name逻辑名称的格式错误
     Empty
@@ -14,7 +64,7 @@ ResourceNameError：资源名称错误，公开枚举--描述scope/name逻辑名
     impl std::error::Error for ResourceNameError
         Error：公开trait实现
 
-ResourceName：资源逻辑名称，公开结构体--跨资源Loader共享scope/name标识
+ResourceName：旧资源逻辑名称，迁移兼容结构体--只用于读取旧scope/name输入
     scope: String--资源作用域，私有
     name: String--作用域内名称，私有
     new(value: impl Into<String>) -> Result<Self, ResourceNameError>
@@ -32,68 +82,22 @@ ResourceName：资源逻辑名称，公开结构体--跨资源Loader共享scope/
     impl fmt::Display for ResourceName
         Display：公开trait实现，输出scope/name
 
-ResourceRefError：统一资源引用错误，公开枚举--描述Provider ID格式错误
-    EmptyProvider
-    InvalidProvider
-    impl fmt::Display for ResourceRefError
-        Display：公开trait实现，输出不包含原始输入的稳定错误描述
-    impl std::error::Error for ResourceRefError
-        Error：公开trait实现
-
-ResourceRef：统一可调用资源引用，公开结构体--用同一种身份表示普通Tool、Skill、Workflow和未来工具资源
-    provider: String--提供资源的工具定义Plugin稳定ID，例如tool、skill或workflow
-    name: ResourceName--Provider内部的逻辑资源名称
-    new(provider: impl Into<String>, name: ResourceName) -> Result<Self, ResourceRefError>
-        构造引用：公开关联函数，验证provider非空，且只包含ASCII小写字母、数字、下划线和连字符
-    provider(&self) -> &str
-        取得Provider：公开方法，仅用于路由工具定义提供方
-    name(&self) -> &ResourceName
-        取得名称：公开方法
-    impl Clone + Ord + Eq for ResourceRef
-        值语义：公开trait实现，可直接作为可见性集合键
-
-AgentImageReferenceError：AgentImage引用错误，公开枚举--描述scope/name:tag格式错误
-    InvalidName
-    InvalidTag
-    impl fmt::Display for AgentImageReferenceError
-        Display：公开trait实现，输出不包含原始输入的稳定错误描述
-    impl std::error::Error for AgentImageReferenceError
-        Error：公开trait实现
-
-AgentImageReference：AgentImage引用，公开结构体--跨Loader和Workspace共享的规范化scope/name:tag标识
-    resource: ResourceName--镜像scope/name，私有
-    tag: String--镜像版本标签，私有
-    new(value: impl Into<String>) -> Result<Self, AgentImageReferenceError>
-        构造引用：公开关联函数，解析并验证scope/name:tag文本
-        行为：
-            tag省略时使用latest
-            scope/name必须满足ResourceName规则
-            tag长度为1到128 UTF-8字节
-            tag只允许ASCII字母、数字、下划线、点和连字符
-            tag首字符不能是点或连字符
-            成功时保存ResourceName和规范化tag
-    resource(&self) -> &ResourceName
-        取得资源名：公开方法，返回scope/name
-    scope(&self) -> &str
-        取得作用域：公开方法，返回resource.scope
-    name(&self) -> &str
-        取得名称：公开方法，返回resource.name
-    tag(&self) -> &str
-        取得标签：公开方法，返回tag
-    impl fmt::Display for AgentImageReference
-        Display：公开trait实现，始终输出scope/name:tag
+旧ResourceRef、ResourceName和AgentImageReference：迁移兼容类型--仅用于读取旧配置和旧协议
+    约束：进入领域层后必须转换为ResourceId，不得继续作为Entity身份或可见性键
 
 WorkspaceAgentDefinition：Workspace中的Agent静态定义，公开结构体--Compose交给WorkspacePlugin的单实例收集输入
     name: String--Workspace内唯一的Agent逻辑名称
-    image: AgentImageReference--启动来源镜像
-    resources: Vec<ResourceRef>--在镜像默认值上额外启用的可调用资源，统一表示Tool、Skill或Workflow
-    disable_resources: Vec<ResourceRef>--最终禁用的资源，优先于镜像默认和额外项
+    id: ResourceId--完整Agent实例ID，格式agent:<workspace>/<name>:<tag>
+    image: ResourceId--type必须为image的启动来源镜像
+    resources: Vec<ResourceId>--在镜像默认值上额外启用的资源
+    disable_resources: Vec<ResourceId>--最终禁用的资源
     memory_path: Option<PathBuf>--可选Memory SQLite覆盖路径；空时由WorkspacePlugin生成默认路径
     impl Clone for WorkspaceAgentDefinition
         Clone：公开trait实现
     限制：结构体不提供业务方法；Compose负责构造，WorkspacePlugin负责运行时复核与执行
 
 WorkspaceDefinition：编译后的Workspace静态定义，公开结构体--不包含YAML语法和运行时Entity
+    id: ResourceId--完整Workspace资源ID，默认格式workspace:local/<name>:latest
     name: String--项目内Workspace逻辑名称
     project_root: PathBuf--Compose根据配置文件位置确定的绝对项目根
     manager: String--默认入口Agent逻辑名称
@@ -103,6 +107,7 @@ WorkspaceDefinition：编译后的Workspace静态定义，公开结构体--不�
     限制：结构体不提供业务方法；它是进程内业务输入，不是CLI/daemon网络DTO
 
 WorkspaceReference：Workspace逻辑引用，公开结构体--使用名称和项目根跨Plugin定位已启动Workspace
+    id: ResourceId--type必须为workspace的完整Workspace资源ID
     name: String--Workspace名称
     project_root: PathBuf--规范化项目根
     impl Clone + PartialEq + Eq for WorkspaceReference
@@ -117,14 +122,14 @@ StartWorkspace：Workspace启动命令，公开事件--把请求ID和静态定�
 RouteAgentMessage：逻辑Agent消息路由命令，公开事件--由DTO层产生并交给WorkspacePlugin解析Entity
     id: String--完整交互轮次ID
     workspace: WorkspaceReference--目标Workspace逻辑引用
-    agent: Option<String>--目标成员名，None表示manager
+    agent: Option<ResourceId>--目标Agent完整资源ID，None表示manager
     message: Message--当前只接受User消息，前端预选调用保存在Message::User.tool_calls
     impl Event for RouteAgentMessage
         Event：公开trait实现
 
 ToolCall：统一工具调用，公开结构体--保存前端指定或Provider返回且后续工具执行必须原样关联的调用
     id: String--调用来源生成的工具调用ID
-    name: String--模型可见工具名称
+    resource: ResourceId--完整领域资源ID；模型可见别名只在InferencePlugin内部使用
     arguments: String--完整参数JSON文本
     impl Clone + PartialEq + Eq for ToolCall
         值语义：公开trait实现
@@ -215,8 +220,14 @@ AgentHistoryMessageWriteRequested：Agent历史消息写入请求，公开结构
 validate_part(part: &str) -> Result<(), ResourceNameError>
     验证名称段：私有函数，拒绝空值、.、..、控制字符和反斜杠
 
-validate_tag(tag: &str) -> Result<(), AgentImageReferenceError>
-    验证标签：私有函数，执行AgentImageReference的长度、字符和首字符规则
+validate_resource_type(resource_type: &str) -> Result<(), ResourceIdError>
+    验证资源类型：私有函数，只接受非空的小写ASCII字母、数字、下划线和连字符
+
+validate_resource_part(part: &str, error: ResourceIdError) -> Result<(), ResourceIdError>
+    验证scope或name：私有函数，拒绝空值、.、..、控制字符、分隔符和冒号
+
+validate_resource_tag(tag: &str) -> Result<(), ResourceIdError>
+    验证资源tag：私有函数，检查长度、首字符和允许字符
 
 is_tag_character(character: char) -> bool
     检查标签字符：私有函数，只接受ASCII字母、数字、下划线、点和连字符
@@ -238,13 +249,12 @@ is_tag_character(character: char) -> bool
         -> WorkspacePlugin、SkillPlugin和WorkflowPlugin共享同一值类型
         -> WorkspacePlugin用它保存可见名称，资源Plugin用它拼接受控资源根
 
-构造AgentImage引用：
-    AgentImageReference::new(value)
-        -> 按第一个冒号拆分scope/name与可选tag
+构造统一资源ID：
+    ResourceId::parse(value)
+        -> 拆分type与scope/name[:tag]
         -> 没有tag时使用latest
-        -> ResourceName::new(scope/name)
-        -> validate_tag(tag)
-        -> 保存resource与tag
+        -> 验证type、scope、name和tag
+        -> 保存四个字段
 
 Workspace定义：
     Compose读取margatroid-workspace.yaml
@@ -294,8 +304,10 @@ ResourceName
 ├── scope: String
 └── name: String
 
-AgentImageReference
-├── resource: ResourceName
+ResourceId
+├── resource_type: String
+├── scope: String
+├── name: String
 └── tag: String
 
 WorkspaceDefinition
@@ -304,9 +316,10 @@ WorkspaceDefinition
 ├── manager
 └── agents: Vec<WorkspaceAgentDefinition>
     ├── name
-    ├── image: AgentImageReference
-    ├── resources: Vec<ResourceRef>
-    ├── disable_resources: Vec<ResourceRef>
+    ├── id: ResourceId
+    ├── image: ResourceId
+    ├── resources: Vec<ResourceId>
+    ├── disable_resources: Vec<ResourceId>
     └── memory_path
 
 Message

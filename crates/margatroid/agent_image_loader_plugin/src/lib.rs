@@ -9,7 +9,7 @@ use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::{AppAsyncExt, AsyncTaskError, WorldAsyncExt};
 use core_plugin::{App, Component as MecsComponent, Entity, Event, Plugin, Resource, World};
 use futures_util::FutureExt;
-use margatroid_types::{AgentImageReference, ResourceName, ResourceRef};
+use margatroid_types::ResourceId;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
@@ -77,25 +77,25 @@ impl std::error::Error for AgentImageLoadError {}
 
 pub struct LoadAgentImage {
     pub id: String,
-    pub reference: AgentImageReference,
+    pub reference: ResourceId,
 }
 
 impl Event for LoadAgentImage {}
 
 pub struct LoadAgentImageResult {
     pub id: String,
-    pub reference: AgentImageReference,
+    pub reference: ResourceId,
     pub result: Result<Entity, AgentImageLoadError>,
 }
 
 impl Event for LoadAgentImageResult {}
 
 pub struct AgentImageIdentity {
-    reference: AgentImageReference,
+    reference: ResourceId,
 }
 
 impl AgentImageIdentity {
-    pub fn reference(&self) -> &AgentImageReference {
+    pub fn reference(&self) -> &ResourceId {
         &self.reference
     }
 }
@@ -157,11 +157,11 @@ impl AgentImageModelConfig {
 impl MecsComponent for AgentImageModelConfig {}
 
 pub struct AgentImageDefaultVisibility {
-    resources: BTreeSet<ResourceRef>,
+    resources: BTreeSet<ResourceId>,
 }
 
 impl AgentImageDefaultVisibility {
-    pub fn resources(&self) -> impl Iterator<Item = &ResourceRef> + '_ {
+    pub fn resources(&self) -> impl Iterator<Item = &ResourceId> + '_ {
         self.resources.iter()
     }
 }
@@ -233,8 +233,8 @@ impl Resource for AgentImageLoaderPluginInstalled {}
 pub(crate) struct AgentImageLoaderState {
     root: Arc<PathBuf>,
     limits: AgentImageLoaderLimits,
-    entities: HashMap<AgentImageReference, Entity>,
-    pending: HashMap<AgentImageReference, Vec<String>>,
+    entities: HashMap<ResourceId, Entity>,
+    pending: HashMap<ResourceId, Vec<String>>,
 }
 
 impl Resource for AgentImageLoaderState {}
@@ -279,7 +279,7 @@ impl Default for AgentImageLoaderLimits {
 }
 
 struct AgentImageReadTask {
-    reference: AgentImageReference,
+    reference: ResourceId,
     root: Arc<PathBuf>,
     limits: AgentImageLoaderLimits,
 }
@@ -287,14 +287,14 @@ struct AgentImageReadTask {
 impl Event for AgentImageReadTask {}
 
 struct PreparedAgentImage {
-    reference: AgentImageReference,
+    reference: ResourceId,
     soul: AgentImageSoul,
     model: AgentImageModelConfig,
     default_visibility: AgentImageDefaultVisibility,
 }
 
 struct AgentImageReadPayload {
-    reference: AgentImageReference,
+    reference: ResourceId,
     result: Result<PreparedAgentImage, AgentImageLoadError>,
 }
 
@@ -465,8 +465,9 @@ async fn read_agent_image_inner(
         ));
     }
 
-    let skills = discover_resource_names(&image_root.join("skills"), &task.limits).await?;
-    let workflows = discover_resource_names(&image_root.join("workflows"), &task.limits).await?;
+    let skills = discover_resource_names("skill", &image_root.join("skills"), &task.limits).await?;
+    let workflows =
+        discover_resource_names("workflow", &image_root.join("workflows"), &task.limits).await?;
     if skills.len() + workflows.len() > task.limits.max_embedded_resources {
         return Err(AgentImageLoadError::new(
             AgentImageLoadErrorKind::LimitExceeded,
@@ -487,21 +488,7 @@ async fn read_agent_image_inner(
         ));
     }
 
-    let resources = skills
-        .into_iter()
-        .map(|name| ResourceRef::new("skill", name))
-        .chain(
-            workflows
-                .into_iter()
-                .map(|name| ResourceRef::new("workflow", name)),
-        )
-        .collect::<Result<BTreeSet<_>, _>>()
-        .map_err(|_| {
-            AgentImageLoadError::new(
-                AgentImageLoadErrorKind::InvalidResourceName,
-                "embedded resource provider is invalid",
-            )
-        })?;
+    let resources = skills.into_iter().chain(workflows).collect();
     let inference = manifest.inference;
     Ok(PreparedAgentImage {
         reference: task.reference,
@@ -621,8 +608,14 @@ fn apply_agent_image_payload(world: &mut World, payload: AgentImageReadPayload) 
 
 async fn resolve_image_root(
     root: &Path,
-    reference: &AgentImageReference,
+    reference: &ResourceId,
 ) -> Result<PathBuf, AgentImageLoadError> {
+    if reference.resource_type() != "image" {
+        return Err(AgentImageLoadError::new(
+            AgentImageLoadErrorKind::InvalidResourceName,
+            "agent image resource type must be image",
+        ));
+    }
     let Some(root) = check_directory(root, true).await? else {
         return Err(AgentImageLoadError::invalid_root(
             "agent image library root does not exist",
@@ -669,9 +662,10 @@ async fn validate_image_layout(root: &Path) -> Result<DirectorySignature, AgentI
 }
 
 async fn discover_resource_names(
+    resource_type: &str,
     root: &Path,
     limits: &AgentImageLoaderLimits,
-) -> Result<BTreeSet<ResourceName>, AgentImageLoadError> {
+) -> Result<BTreeSet<ResourceId>, AgentImageLoadError> {
     let metadata = match tokio::fs::symlink_metadata(root).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
@@ -725,12 +719,13 @@ async fn discover_resource_names(
                     "embedded resource name is not valid UTF-8",
                 )
             })?;
-            let resource = ResourceName::new(format!("{scope_name}/{name}")).map_err(|_| {
-                AgentImageLoadError::new(
-                    AgentImageLoadErrorKind::InvalidResourceName,
-                    "embedded resource name is invalid",
-                )
-            })?;
+            let resource = ResourceId::new(resource_type, scope_name, name, None::<String>)
+                .map_err(|_| {
+                    AgentImageLoadError::new(
+                        AgentImageLoadErrorKind::InvalidResourceName,
+                        "embedded resource name is invalid",
+                    )
+                })?;
             names.insert(resource);
             if names.len() > limits.max_embedded_resources {
                 return Err(AgentImageLoadError::new(
@@ -1027,7 +1022,7 @@ stop = ["DONE"]
     fn load(
         app: &mut App,
         id: &str,
-        reference: &AgentImageReference,
+        reference: &ResourceId,
     ) -> Result<Entity, AgentImageLoadError> {
         app.world().send_event(LoadAgentImage {
             id: id.to_owned(),
@@ -1054,7 +1049,7 @@ stop = ["DONE"]
         let library = unique_directory("components");
         write_image(&library, "You are a careful coder.\n");
         let mut app = app(&library);
-        let reference = AgentImageReference::new("local/coder").unwrap();
+        let reference = ResourceId::parse("image:local/coder").unwrap();
 
         let entity = load(&mut app, "load-components", &reference).unwrap();
 
@@ -1082,9 +1077,12 @@ stop = ["DONE"]
         assert_eq!(
             visibility
                 .resources()
-                .map(|resource| format!("{}:{}", resource.provider(), resource.name()))
+                .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            ["skill:local/code-review", "workflow:local/review"]
+            [
+                "skill:local/code-review:latest",
+                "workflow:local/review:latest"
+            ]
         );
         let _ = fs::remove_dir_all(library);
     }
@@ -1094,7 +1092,7 @@ stop = ["DONE"]
         let library = unique_directory("concurrent");
         write_image(&library, "Concurrent image.\n");
         let mut app = app(&library);
-        let reference = AgentImageReference::new("local/coder:latest").unwrap();
+        let reference = ResourceId::parse("image:local/coder:latest").unwrap();
         for id in ["first", "second"] {
             app.world().send_event(LoadAgentImage {
                 id: id.to_owned(),
@@ -1132,7 +1130,7 @@ stop = ["DONE"]
         let library = unique_directory("reload-success");
         write_image(&library, "Old soul.\n");
         let mut app = app(&library);
-        let reference = AgentImageReference::new("local/coder").unwrap();
+        let reference = ResourceId::parse("image:local/coder").unwrap();
         let entity = load(&mut app, "initial", &reference).unwrap();
         fs::write(image_root(&library).join("SOUL.md"), "New soul.\n").unwrap();
 
@@ -1155,7 +1153,7 @@ stop = ["DONE"]
         let library = unique_directory("reload-failure");
         write_image(&library, "Stable soul.\n");
         let mut app = app(&library);
-        let reference = AgentImageReference::new("local/coder").unwrap();
+        let reference = ResourceId::parse("image:local/coder").unwrap();
         let entity = load(&mut app, "initial", &reference).unwrap();
         fs::write(image_root(&library).join("unknown.txt"), "invalid").unwrap();
 
@@ -1178,7 +1176,7 @@ stop = ["DONE"]
         let library = unique_directory("missing");
         fs::create_dir_all(&library).unwrap();
         let mut app = app(&library);
-        let reference = AgentImageReference::new("local/missing").unwrap();
+        let reference = ResourceId::parse("image:local/missing").unwrap();
 
         let error = load(&mut app, "missing", &reference).unwrap_err();
 
@@ -1200,7 +1198,7 @@ stop = ["DONE"]
         )
         .unwrap();
         let mut app = app(&library);
-        let reference = AgentImageReference::new("local/coder").unwrap();
+        let reference = ResourceId::parse("image:local/coder").unwrap();
 
         let error = load(&mut app, "symlink", &reference).unwrap_err();
 
