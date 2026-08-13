@@ -184,30 +184,30 @@ Workflow 属于 Skill 范畴，但负责显式控制多步骤执行。节点类�
 循环、并行、人工确认、提示词注入和强制 Skill 调用，不能把第一版节点 enum 当作永久封闭集合。
 
 AgentInstance持有两层统一资源可见性：`AgentDefaultVisibility`是Workspace创建时根据AgentImage
-默认值和Workspace参数合并出的只读`ResourceRef`集合；`AgentDynamicVisibility`初始复制基线，
+默认值和Workspace参数合并出的只读`ResourceId`集合；`AgentDynamicVisibility`初始复制基线，
 表示普通Tool、Skill、Workflow和未来资源的当前实际可用集合，后续可由Agent或Workflow逻辑调整。
 
-每次LLM请求前，AgentPlugin遍历动态可见性的`ResourceRef`集合，将每个`ResourceRef`分别交给
-ToolPlugin构造`Tool`，再收集definitions写入请求`tools`字段。ToolPlugin不接收资源集合，也不读取
-Agent可见性组件。
+Workspace启动时，具体工具Plugin验证每个可见ResourceId并注册到Agent Entity上的`AgentToolMap`；
+每个Agent独立分配`tool0_query`、`skill1_review`等模型工具名。每次LLM请求前，AgentPlugin遍历
+动态可见性，从当前AgentToolMap取得内部ToolSpec。ToolPlugin不读取Agent可见性组件。
 
 前端可以随用户消息直接指定Skill、Workflow或其他工具调用。此时AgentPlugin先记录用户消息并执行
 指定调用，不立即发送LLM请求；Tool响应作为统一Message写入上下文，全部指定调用完成后再使用完整上下文发起推理。
 前端没有指定调用时，记录用户消息后直接推理。两条路径的LLM请求都从动态可见性构造`tools`，
 用户消息意图不负责启用或禁用模型工具。
 
-模型一次返回多个ToolCall时，AgentPlugin在`AgentStatus`中保存该批次的全部调用ID。每个Tool响应
-只追加上下文并移除自己的ID，最后一个响应到达时才发送下一次`InferenceRequest`，避免同一批工具
-响应触发多次推理。
+模型一次返回多个ToolCall时，ToolPlugin把解析后的`ToolCallRequest`保存在`PendingToolCalls`。
+每个Tool响应由ToolPlugin移除对应请求并整理为AgentMessage；同轮Pending为空时才发送
+`ToolTurnCompleted`，AgentPlugin随后发出下一次`InferenceRequestEvent`。
 
-SkillPlugin为每个可见Skill生成一个独立Tool，并在执行时按作用域动态解析内容：
+SkillPlugin为每个Agent的可见Skill注册一个独立ToolMap，并在执行时按作用域动态解析内容：
 
 ```text
 项目级 .margatroid > AgentImage内置 > 主目录 ~/.margatroid
 ```
 
 作用域越窄优先级越高。最高优先级同名资源存在但内容非法时返回错误，不静默降级。修改已有
-可见Skill的`SKILL.md`、脚本、模板或资产会在下一次使用时生效；默认ResourceRef的变化需要重载
+可见Skill的`SKILL.md`、脚本、模板或资产会在下一次使用时生效；默认ResourceId的变化需要重载
 Workspace，动态可见性变化从下一次LLM请求起生效。
 
 Workspace中的Agent配置形式：
@@ -226,8 +226,8 @@ agents:
         name: local/dangerous-command
 ```
 
-WorkflowPlugin同样把每个可见Workflow生成为独立Tool。Workflow依赖Skill时将对应Skill
-`ResourceRef`加入动态可见性，通过同一Provider与Tool构造链路调用，不建立旁路加载协议。
+WorkflowPlugin同样为每个Agent注册可见Workflow。Workflow依赖Skill时将对应Skill
+`ResourceId`加入动态可见性，通过同一AgentToolMap和ToolCall链路调用，不建立旁路加载协议。
 
 ## 7. Memory
 
@@ -247,7 +247,7 @@ WorkflowPlugin同样把每个可见Workflow生成为独立Tool。Workflow依赖S
 ```text
 history_messages
     追加已经提交的User、Assistant和Tool消息
-    每行分列保存role、content、tool_calls、tool_call_id、交互轮次ID和时间
+    每行分列保存role、content、tool_calls、resource_id、tool_call_id、交互轮次ID和时间
     上下文压缩不会删除或覆盖历史行
 
 realtime_messages
@@ -256,8 +256,8 @@ realtime_messages
     未来上下文压缩可以替换该表，但不影响history_messages
 ```
 
-Skill正文只进入当前轮`tool_context`，不写入历史。Skill Tool的历史内容替换为
-`skill: <scope/name> loaded`；普通Tool响应原样写入历史。历史表不再设置独立的资源列。
+工具正文只进入当前轮`tool_context`，不写入历史。Tool历史内容直接替换为完整`resource_id`字符串，
+并在`resource_id`列保存结构化身份。
 
 WorkspacePlugin负责确定数据库路径。`workspace up/reload`创建Agent前先由MemoryPlugin打开数据库
 并读取`realtime_messages`，再把恢复出的`messages`和`tool_context`直接放入Agent创建事件。

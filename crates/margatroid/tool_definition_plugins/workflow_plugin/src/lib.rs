@@ -3,15 +3,33 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
-use core_plugin::{App, Plugin, Resource, World};
-use margatroid_types::{ResourceId, ToolDefinition};
+use core_plugin::{App, Entity, Event, Plugin, Resource, World};
+use margatroid_types::ResourceId;
 use serde_json::json;
 use tool_plugin::{
-    AgentToolEnvironment, AppToolExt, ToolCallEvent, ToolDefinitionResult, ToolDefinitionRoute,
-    ToolError, ToolErrorKind, ToolTemplate,
+    register_agent_tool, AgentToolEnvironment, ToolCallRequest, ToolCallResponse, ToolError,
+    ToolErrorKind, ToolTemplate,
 };
 
 const PROVIDER_ID: &str = "workflow";
+const WORKFLOW_LOADER_ID: &str = "tool:builtin/workflow-loader:latest";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowRegisterRequest {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceId,
+}
+impl Event for WorkflowRegisterRequest {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowRegisterResponse {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceId,
+    pub result: Result<(), ToolError>,
+}
+impl Event for WorkflowRegisterResponse {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkflowErrorKind {
@@ -77,33 +95,20 @@ impl Plugin for WorkflowPlugin {
         app.world_mut().insert_resource(WorkflowRoots {
             home_root: self.home_root.clone(),
         });
-        app.register_tool_template(
-            ToolTemplate::new(
-                ResourceId::parse("tool:builtin/workflow-loader:latest").unwrap(),
-                ToolDefinition {
-                    name: "workflow_loader".into(),
-                    description: "Load a workflow resource by its complete resource ID.".into(),
-                    input_schema: json!({"type":"object"}),
-                },
-            )
-            .unwrap(),
-        );
-        app.add_system(RuntimePlugin::UPDATE, workflow_tool_definition_system)
+        app.add_system(RuntimePlugin::UPDATE, workflow_register_system)
             .add_system(RuntimePlugin::UPDATE, workflow_tool_call_system);
     }
 }
 
-fn workflow_tool_definition_system(world: &mut World) {
-    let routes = world
-        .event_reader::<ToolDefinitionRoute>()
+fn workflow_register_system(world: &mut World) {
+    let requests = world
+        .event_reader::<WorkflowRegisterRequest>()
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
-    for route in routes.into_iter().filter(|route| {
-        route.loader == ResourceId::parse("tool:builtin/workflow-loader:latest").unwrap()
-    }) {
+    for request in requests {
         let result = world
-            .get_component::<AgentToolEnvironment>(route.agent)
+            .get_component::<AgentToolEnvironment>(request.agent)
             .ok_or_else(|| {
                 ToolError::new(
                     ToolErrorKind::ToolEnvironmentMissing,
@@ -111,21 +116,32 @@ fn workflow_tool_definition_system(world: &mut World) {
                 )
             })
             .and_then(|environment| {
-                validate_workflow_resource(&route.resource)?;
+                validate_workflow_resource(&request.resource_id)?;
                 let roots = world
                     .get_resource::<WorkflowRoots>()
                     .expect("WorkflowPlugin is installed");
-                find_workflow_directory(environment, &roots.home_root, &route.resource)?;
-                Ok(ToolDefinition {
-                    name: "workflow_loader".into(),
-                    description: "Load a workflow resource.".into(),
-                    input_schema: json!({"type":"object"}),
-                })
+                find_workflow_directory(environment, &roots.home_root, &request.resource_id)?;
+                ToolTemplate::new(
+                    request.resource_id.to_string(),
+                    "Load this workflow resource.",
+                    json!({"type":"object"}),
+                )
             });
-        world.send_event(ToolDefinitionResult {
-            id: route.id,
-            agent: route.agent,
-            resource: route.resource,
+        let result = result.and_then(|template| {
+            register_agent_tool(
+                world,
+                request.agent,
+                ResourceId::parse(WORKFLOW_LOADER_ID)
+                    .expect("built-in Workflow loader ID is valid"),
+                request.resource_id.clone(),
+                template,
+            )
+            .map(|_| ())
+        });
+        world.send_event(WorkflowRegisterResponse {
+            id: request.id,
+            agent: request.agent,
+            resource_id: request.resource_id,
             result,
         });
     }
@@ -133,21 +149,22 @@ fn workflow_tool_definition_system(world: &mut World) {
 
 fn workflow_tool_call_system(world: &mut World) {
     let calls = world
-        .event_reader::<ToolCallEvent>()
+        .event_reader::<ToolCallRequest>()
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
-    for event in calls.into_iter().filter(|event| {
-        event.loader == ResourceId::parse("tool:builtin/workflow-loader:latest").unwrap()
-    }) {
-        let content = "Workflow execution is not implemented yet.".to_owned();
-        world.send_event(margatroid_types::AgentMessage {
-            id: event.id,
+    for event in calls
+        .into_iter()
+        .filter(|event| event.tool_id == ResourceId::parse(WORKFLOW_LOADER_ID).unwrap())
+    {
+        world.send_event(ToolCallResponse {
+            turn_id: event.turn_id,
             agent: event.agent,
-            message: margatroid_types::Message::Tool {
-                tool_call_id: event.call.id,
-                content,
-            },
+            tool_call_id: event.tool_call_id,
+            result: Err(ToolError::new(
+                ToolErrorKind::ExecutionFailed,
+                "workflow execution is not implemented",
+            )),
         });
     }
 }

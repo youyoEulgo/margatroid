@@ -4,10 +4,24 @@
 
 公开：
 ```text
-SkillPlugin：Skill工具定义Plugin，公开结构体--注册skill Loader并处理Skill路由事件
+SkillPlugin：Skill注册与执行Plugin，公开结构体
     home_root: Arc<PathBuf>--主目录Skill根
     open(home_root: impl Into<PathBuf>) -> Result<Self, SkillError>
     impl Plugin for SkillPlugin
+        构建：安装SkillRegisterRequest和ToolCallRequest处理System；不在安装时注册具体Skill或全局Loader模板
+
+SkillRegisterRequest：Agent Skill注册请求，公开事件
+    id: String--Workspace注册子请求ID
+    agent: Entity--目标Agent Entity，必须已挂载AgentToolMap和AgentToolEnvironment
+    resource_id: ResourceId--待注册完整Skill ID
+    impl Event for SkillRegisterRequest
+
+SkillRegisterResponse：Agent Skill注册结果，公开事件
+    id: String--原注册子请求ID
+    agent: Entity
+    resource_id: ResourceId
+    result: Result<(), ToolError>
+    impl Event for SkillRegisterResponse
 
 SkillError：Skill配置错误，公开结构体
 SkillErrorKind：Skill配置错误分类，公开枚举
@@ -15,33 +29,61 @@ SkillErrorKind：Skill配置错误分类，公开枚举
 
 私有：
 ```text
-SkillLoaderTemplate：Skill Loader模板，私有常量定义
-    id: tool:builtin/skill-loader:latest
-    definition.name: skill_loader--仅注册表内部模板名，不进入InferenceRequest
-    definition.input_schema: {"type":"object"}--模型不负责传Skill ResourceId
+SkillRoots：Skill根配置，私有Resource
+    home_root: Arc<PathBuf>
 
-Skill路径查找函数：按project/.margatroid/skills、image/skills、home顺序查找
+SkillArguments：Skill调用参数，私有结构体--当前无字段；只接受JSON对象
 ```
 
 ## 函数
 
 ```text
-skill_tool_definition_system(world: &mut World)
-    定义检查：读取ToolDefinitionRoute
-    行为：只处理skill-loader；验证skill:scope/name:tag，精确查找SKILL.md；成功返回name=完整Skill ResourceId且无参数的ToolDefinitionResult，失败发送错误结果
+skill_register_system(world: &mut World)
+    注册Skill：私有System，读取SkillRegisterRequest
+    行为：
+        验证resource_id使用type=skill及受支持tag
+        从Agent Entity读取AgentToolEnvironment
+        按项目、镜像、主目录顺序精确查找SKILL.md
+        读取Skill元信息并构造Provider无关ToolTemplate；不把Skill正文放入模板
+        调用ToolPlugin注册接口写入当前Agent的AgentToolMap
+        tool_id固定为tool:builtin/skill-loader:latest，resource_id保持具体Skill ID
+        成功或失败都发送SkillRegisterResponse
 
 skill_tool_call_system(world: &mut World)
-    Skill调用：读取ToolCallEvent
-    行为：只处理skill-loader；按event.resource中的完整ResourceId重新查找并读取SKILL.md；成功或失败都直接发送AgentMessage::Tool，保留原轮次ID和tool_call_id
+    执行Skill：私有System，读取ToolCallRequest
+    行为：
+        只处理tool_id=tool:builtin/skill-loader:latest
+        使用request.resource_id重新按项目、镜像、主目录查找并读取SKILL.md
+        解析request.arguments；当前只接受JSON对象，无参数为"{}"
+        成功时发送ToolCallResponse { turn_id, agent, tool_call_id, result: Ok(SKILL.md正文) }
+        失败时发送同定位信息和稳定ToolError
+        不自行发送AgentMessage
 
-find_skill_file(environment: &AgentToolEnvironment, home_root: &Path, resource: &ResourceId) -> Result<PathBuf, ToolError>
-    查找Skill：project、image、home顺序；找到目录但缺少SKILL.md时立即失败，不回退
+find_skill_file(environment: &AgentToolEnvironment, home_root: &Path, resource_id: &ResourceId) -> Result<PathBuf, ToolError>
+    查找Skill：项目、镜像、主目录顺序；找到目录但缺少SKILL.md时立即失败，不回退
 ```
 
 ## 逻辑
 
 ```text
-SkillPlugin不读取可见性，不保存每个Skill注册项，不把Skill正文放入ToolRegistry。
-Skill正文按每次定义检查和每次调用重新读取；当前只读取SKILL.md，Workflow和脚本执行留待后续设计。
-Skill工具响应仍是AgentMessage::Tool；历史记录由AgentPlugin按skill资源写入标记文本，不写正文。
+Workspace启动：
+    WorkspacePlugin -> SkillRegisterRequest
+    SkillPlugin -> 验证并读取元信息
+                -> register_agent_tool(agent, skill-loader, resource_id, template)
+                -> SkillRegisterResponse
+
+每次调用：
+    ToolPlugin -> ToolCallRequest { tool_id=skill-loader, resource_id=具体Skill }
+    SkillPlugin -> 重新读取当前SKILL.md
+                -> ToolCallResponse
+    ToolPlugin -> 根据ToolCallResponse整理为AgentMessage::Tool
+```
+
+## 边界
+
+```text
+SkillPlugin不读取Agent可见性，不保存每个Skill的全局注册项，不维护pending调用，不自行构造AgentMessage。
+Skill正文每次调用重新读取，保证loading skill每轮得到当前内容；正文不进入AgentToolMap的ToolTemplate。
+注册过程不伪造ToolCall，不保存test_arguments，不执行有副作用的测试操作。
+SkillPlugin只负责Skill资源验证、模板构造、SKILL.md读取和ToolCallResponse。
 ```

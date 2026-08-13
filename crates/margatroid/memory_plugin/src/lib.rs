@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS history_messages (
     role TEXT NOT NULL,
     content TEXT,
     tool_calls TEXT NOT NULL,
+    resource_id TEXT,
     tool_call_id TEXT,
     created_at_ms INTEGER NOT NULL
 );
@@ -276,6 +277,8 @@ fn lock_connection<'a>(
 
 fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
     let legacy_history = table_has_column(connection, "history_messages", "message")?;
+    let history_exists = table_exists(connection, "history_messages")?;
+    let history_has_resource_id = table_has_column(connection, "history_messages", "resource_id")?;
     let legacy_realtime = table_has_column(connection, "realtime_messages", "position")?
         && !table_has_column(connection, "realtime_messages", "context")?;
     let transaction = connection.transaction().map_err(|_| {
@@ -303,6 +306,14 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
     transaction
         .execute_batch(HISTORY_SCHEMA)
         .map_err(schema_error)?;
+    if history_exists && !legacy_history && !history_has_resource_id {
+        transaction
+            .execute(
+                "ALTER TABLE history_messages ADD COLUMN resource_id TEXT",
+                [],
+            )
+            .map_err(schema_error)?;
+    }
     if legacy_history {
         migrate_history(&transaction)?;
         transaction
@@ -316,6 +327,16 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
             .map_err(schema_error)?;
     }
     transaction.commit().map_err(schema_error)
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, MemoryError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(schema_error)
 }
 
 fn table_has_column(
@@ -403,7 +424,7 @@ fn schema_error(_: rusqlite::Error) -> MemoryError {
 
 fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>, MemoryError> {
     let mut statement = connection
-        .prepare("SELECT sequence, turn_id, role, content, tool_calls, tool_call_id, created_at_ms FROM history_messages ORDER BY sequence ASC")
+        .prepare("SELECT sequence, turn_id, role, content, tool_calls, resource_id, tool_call_id, created_at_ms FROM history_messages ORDER BY sequence ASC")
         .map_err(read_error)?;
     let rows = statement
         .query_map([], |row| {
@@ -414,12 +435,13 @@ fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
-                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })
         .map_err(read_error)?;
     rows.map(|row| {
-        let (sequence, turn_id, role, content, calls, call_id, created_at_ms) =
+        let (sequence, turn_id, role, content, calls, resource_id, call_id, created_at_ms) =
             row.map_err(read_error)?;
         let tool_calls = serde_json::from_str(&calls).map_err(|_| {
             MemoryError::new(
@@ -437,6 +459,20 @@ fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>,
                 tool_calls,
             },
             "tool" if tool_calls.is_empty() => Message::Tool {
+                resource_id: resource_id
+                    .ok_or_else(|| {
+                        MemoryError::new(
+                            MemoryErrorKind::DecodeFailed,
+                            "tool history resource ID is missing",
+                        )
+                    })?
+                    .parse()
+                    .map_err(|_| {
+                        MemoryError::new(
+                            MemoryErrorKind::DecodeFailed,
+                            "tool history resource ID is invalid",
+                        )
+                    })?,
                 tool_call_id: call_id.ok_or_else(|| {
                     MemoryError::new(
                         MemoryErrorKind::DecodeFailed,
@@ -567,22 +603,30 @@ fn insert_history_message_values(
     message: &Message,
     created_at_ms: i64,
 ) -> Result<(), MemoryError> {
-    let (role, content, tool_calls, tool_call_id) = match message {
+    let (role, content, tool_calls, resource_id, tool_call_id) = match message {
         Message::User {
             content,
             tool_calls,
-        } => ("user", Some(content.clone()), tool_calls.clone(), None),
+        } => (
+            "user",
+            Some(content.clone()),
+            tool_calls.clone(),
+            None,
+            None,
+        ),
         Message::Assistant {
             content,
             tool_calls,
-        } => ("assistant", content.clone(), tool_calls.clone(), None),
+        } => ("assistant", content.clone(), tool_calls.clone(), None, None),
         Message::Tool {
+            resource_id,
             tool_call_id,
             content,
         } => (
             "tool",
             Some(content.clone()),
             Vec::new(),
+            Some(resource_id.to_string()),
             Some(tool_call_id.clone()),
         ),
         Message::System { .. } => {
@@ -598,7 +642,7 @@ fn insert_history_message_values(
             "history tool calls could not be encoded",
         )
     })?;
-    transaction.execute("INSERT INTO history_messages (turn_id, role, content, tool_calls, tool_call_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![turn_id, role, content, encoded_calls, tool_call_id, created_at_ms]).map_err(write_error)?;
+    transaction.execute("INSERT INTO history_messages (turn_id, role, content, tool_calls, resource_id, tool_call_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![turn_id, role, content, encoded_calls, resource_id, tool_call_id, created_at_ms]).map_err(write_error)?;
     Ok(())
 }
 
@@ -711,6 +755,7 @@ fn sync_history_message(
 mod tests {
     use super::*;
     use core_plugin::App;
+    use margatroid_types::ResourceId;
     use tempfile::tempdir;
 
     fn test_app() -> App {
@@ -733,6 +778,7 @@ mod tests {
                 tool_calls: Vec::new(),
             }],
             tool_context: vec![Message::Tool {
+                resource_id: ResourceId::parse("tool:local/test:latest").unwrap(),
                 tool_call_id: "call-1".into(),
                 content: "tool output".into(),
             }],
@@ -765,6 +811,7 @@ mod tests {
                 tool_calls: Vec::new(),
             },
             Message::Tool {
+                resource_id: ResourceId::parse("tool:local/test:latest").unwrap(),
                 tool_call_id: "call-1".into(),
                 content: "tool output".into(),
             },

@@ -33,7 +33,7 @@ fn unique_directory(prefix: &str) -> PathBuf {
 
 fn write_image(library: &Path, model: &str) {
     let image = library.join("local/coder/latest");
-    fs::create_dir_all(image.join("skills/local/review")).unwrap();
+    fs::create_dir_all(image.join("skills/local/review/latest")).unwrap();
     fs::write(
         image.join("agent.toml"),
         format!("schema_version = 1\n[inference]\nmodel = \"{model}\"\n"),
@@ -41,7 +41,7 @@ fn write_image(library: &Path, model: &str) {
     .unwrap();
     fs::write(image.join("SOUL.md"), "You are a test agent.\n").unwrap();
     fs::write(
-        image.join("skills/local/review/SKILL.md"),
+        image.join("skills/local/review/latest/SKILL.md"),
         "Review the current project.",
     )
     .unwrap();

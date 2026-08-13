@@ -2365,6 +2365,7 @@ dependencies = [
  "tempfile",
  "tool_plugin",
  "tracing",
+ "workflow_plugin",
 ]
 
 [[package]]

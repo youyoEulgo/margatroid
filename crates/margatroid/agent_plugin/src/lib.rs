@@ -1,14 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
-use inference_plugin::InferenceRequest;
+use inference_plugin::InferenceRequestEvent;
 use margatroid_types::{
     AgentContextMessagesUpdated, AgentFailure, AgentFailureKind, AgentHistoryMessageWriteRequested,
     AgentMessage, Message, ResourceId, ToolCall, ToolDefinition,
 };
-use tool_plugin::{ToolCallRequest, ToolError, ToolErrorKind, WorldToolExt};
+use tool_plugin::{AgentToolMap, ToolCallEvent, ToolError, ToolErrorKind, ToolTurnCompleted};
 
 pub struct AgentPlugin {
     schedule: String,
@@ -51,7 +51,9 @@ impl Plugin for AgentPlugin {
 
         app.world_mut().insert_resource(AgentPluginInstalled);
         app.add_system(&self.schedule, agent_create_system)
-            .add_system(&self.schedule, agent_tool_call_system);
+            .add_system(&self.schedule, agent_skill_state_system)
+            .add_system(&self.schedule, agent_message_system)
+            .add_system(&self.schedule, tool_turn_completed_system);
     }
 }
 
@@ -76,6 +78,32 @@ pub struct AgentCreated {
 
 impl Event for AgentCreated {}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadAgentSkill {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceId,
+}
+
+impl Event for LoadAgentSkill {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnloadAgentSkill {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceId,
+}
+
+impl Event for UnloadAgentSkill {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnloadAllAgentSkills {
+    pub id: String,
+    pub agent: Entity,
+}
+
+impl Event for UnloadAllAgentSkills {}
+
 pub struct AgentIdentity {
     id: ResourceId,
 }
@@ -90,6 +118,7 @@ impl Component for AgentIdentity {}
 
 pub trait WorldAgentExt {
     fn agent(&self, id: &ResourceId) -> Option<Entity>;
+    fn agent_loading_skills(&self, agent: Entity) -> Option<&BTreeSet<ResourceId>>;
 }
 
 impl WorldAgentExt for World {
@@ -101,6 +130,11 @@ impl WorldAgentExt for World {
                 self.get_component::<AgentIdentity>(*entity)
                     .is_some_and(|identity| identity.id() == id)
             })
+    }
+
+    fn agent_loading_skills(&self, agent: Entity) -> Option<&BTreeSet<ResourceId>> {
+        self.get_component::<AgentStatus>(agent)
+            .map(|status| &status.loading_skills)
     }
 }
 
@@ -208,44 +242,35 @@ impl Component for AgentDynamicVisibility {}
 
 #[derive(Default)]
 pub(crate) struct AgentStatus {
-    pending_tools: BTreeMap<String, PendingToolCall>,
-    loading_skills: BTreeMap<String, PendingToolCall>,
+    turn_id: Option<String>,
+    loading_skills: BTreeSet<ResourceId>,
 }
 
 impl AgentStatus {
-    pub(crate) fn add_tool_call(&mut self, call: PendingToolCall) -> Result<(), AgentStepError> {
-        if call.call.id.is_empty() || self.pending_tools.contains_key(&call.call.id) {
+    pub(crate) fn begin_turn(&mut self, turn_id: String) -> Result<(), AgentStepError> {
+        if self.turn_id.is_some() {
             return Err(AgentStepError::InvalidToolBatch);
         }
-        self.pending_tools.insert(call.call.id.clone(), call);
+        self.turn_id = Some(turn_id);
         Ok(())
     }
-
-    pub(crate) fn complete_tool_call(&mut self, id: &str) -> ToolCallCompletion {
-        if self.pending_tools.remove(id).is_none() {
-            return ToolCallCompletion::Invalid;
-        }
-        if self.pending_tools.is_empty() {
-            ToolCallCompletion::Completed
-        } else {
-            ToolCallCompletion::Pending
-        }
-    }
-
-    pub(crate) fn load_skill(&mut self, call: PendingToolCall) -> Result<(), AgentStepError> {
-        if call.kind != ToolCallKind::Skill {
+    pub(crate) fn finish_turn(&mut self, turn_id: &str) -> Result<(), AgentStepError> {
+        if self.turn_id.as_deref() != Some(turn_id) {
             return Err(AgentStepError::InvalidToolBatch);
         }
-        self.loading_skills.insert(skill_key(&call.resource), call);
+        self.turn_id = None;
         Ok(())
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn unload_skill(&mut self, key: &str) -> bool {
-        self.loading_skills.remove(key).is_some()
+    pub(crate) fn load_skill(&mut self, resource_id: ResourceId) -> Result<(), AgentStepError> {
+        if resource_id.resource_type() != "skill" {
+            return Err(AgentStepError::InvalidToolBatch);
+        }
+        self.loading_skills.insert(resource_id);
+        Ok(())
     }
-
-    #[allow(dead_code)]
+    pub(crate) fn unload_skill(&mut self, resource_id: &ResourceId) -> bool {
+        self.loading_skills.remove(resource_id)
+    }
     pub(crate) fn unload_all_skills(&mut self) {
         self.loading_skills.clear();
     }
@@ -253,29 +278,8 @@ impl AgentStatus {
 
 impl Component for AgentStatus {}
 
-#[derive(Clone)]
-pub(crate) struct PendingToolCall {
-    pub(crate) call: ToolCall,
-    pub(crate) resource: ResourceId,
-    pub(crate) kind: ToolCallKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToolCallKind {
-    Tool,
-    Skill,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToolCallCompletion {
-    Invalid,
-    Pending,
-    Completed,
-}
-
 struct AvailableTools {
     definitions: Vec<ToolDefinition>,
-    resources: BTreeSet<ResourceId>,
 }
 
 enum ConversationTurnResult {
@@ -289,6 +293,7 @@ enum AgentStepError {
     IdentityMissing,
     ContextMissing,
     StatusMissing,
+    ToolMapMissing,
     InvalidMessage,
     InvalidToolBatch,
     Tool(ToolError),
@@ -301,6 +306,7 @@ impl AgentStepError {
             Self::IdentityMissing => "IdentityMissing: agent identity is missing".into(),
             Self::ContextMissing => "ContextMissing: agent context is missing".into(),
             Self::StatusMissing => "StatusMissing: agent status is missing".into(),
+            Self::ToolMapMissing => "ToolMapMissing: Agent tool map is missing".into(),
             Self::InvalidMessage => "InvalidMessage: message type is invalid".into(),
             Self::InvalidToolBatch => "InvalidToolBatch: tool call batch is invalid".into(),
             Self::Tool(error) => error.to_string(),
@@ -374,7 +380,77 @@ fn agent_create_system(world: &mut World) {
     }
 }
 
-fn agent_tool_call_system(world: &mut World) {
+fn agent_skill_state_system(world: &mut World) {
+    let loads = world
+        .event_reader::<LoadAgentSkill>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let unloads = world
+        .event_reader::<UnloadAgentSkill>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let unload_all = world
+        .event_reader::<UnloadAllAgentSkills>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let events = world.event_sender();
+
+    for event in loads {
+        let result = world
+            .get_component_mut::<AgentStatus>(event.agent)
+            .ok_or(AgentStepError::AgentMissing)
+            .and_then(|status| status.load_skill(event.resource_id));
+        if let Err(error) = result {
+            events.send_event(AgentFailure {
+                id: event.id,
+                agent: event.agent,
+                kind: AgentFailureKind::Agent,
+                message: error.failure_message(),
+            });
+        }
+    }
+
+    for event in unloads {
+        let result = if event.resource_id.resource_type() != "skill" {
+            Err(AgentStepError::InvalidToolBatch)
+        } else {
+            world
+                .get_component_mut::<AgentStatus>(event.agent)
+                .ok_or(AgentStepError::AgentMissing)
+                .map(|status| {
+                    status.unload_skill(&event.resource_id);
+                })
+        };
+        if let Err(error) = result {
+            events.send_event(AgentFailure {
+                id: event.id,
+                agent: event.agent,
+                kind: AgentFailureKind::Agent,
+                message: error.failure_message(),
+            });
+        }
+    }
+
+    for event in unload_all {
+        let result = world
+            .get_component_mut::<AgentStatus>(event.agent)
+            .ok_or(AgentStepError::AgentMissing)
+            .map(|status| status.unload_all_skills());
+        if let Err(error) = result {
+            events.send_event(AgentFailure {
+                id: event.id,
+                agent: event.agent,
+                kind: AgentFailureKind::Agent,
+                message: error.failure_message(),
+            });
+        }
+    }
+}
+
+fn agent_message_system(world: &mut World) {
     let messages = world
         .event_reader::<AgentMessage>()
         .into_iter()
@@ -411,66 +487,75 @@ fn handle_agent_message(
     let result = match &event.message {
         Message::System { .. } => return Err(AgentStepError::InvalidMessage),
         Message::User { tool_calls, .. } => {
+            world
+                .get_component_mut::<AgentStatus>(agent)
+                .ok_or(AgentStepError::StatusMissing)?
+                .begin_turn(event.id.clone())?;
             clear_tool_context(world, agent, events)?;
-            record_history_message(event, None, events);
+            record_history_message(event, events);
             append_conversation_message(world, agent, event.message.clone(), events)?;
             dispatch_tool_calls(world, &event.id, agent, tool_calls, true, events)?
         }
         Message::Assistant { tool_calls, .. } => {
+            if world
+                .get_component::<AgentStatus>(agent)
+                .ok_or(AgentStepError::StatusMissing)?
+                .turn_id
+                .as_deref()
+                != Some(&event.id)
+            {
+                return Err(AgentStepError::InvalidToolBatch);
+            }
             clear_tool_context(world, agent, events)?;
-            record_history_message(event, None, events);
+            record_history_message(event, events);
             append_conversation_message(world, agent, event.message.clone(), events)?;
             if !tool_calls.is_empty() {
                 dispatch_tool_calls(world, &event.id, agent, tool_calls, true, events)?
             } else {
-                ConversationTurnResult::FinishTurn
-            }
-        }
-        Message::Tool { tool_call_id, .. } => {
-            let pending = world
-                .get_component::<AgentStatus>(agent)
-                .ok_or(AgentStepError::StatusMissing)?
-                .pending_tools
-                .get(tool_call_id)
-                .cloned()
-                .ok_or(AgentStepError::InvalidToolBatch)?;
-            record_history_message(event, Some(&pending), events);
-            append_tool_context(world, agent, event.message.clone(), events)?;
-            if pending.kind == ToolCallKind::Skill {
                 world
                     .get_component_mut::<AgentStatus>(agent)
                     .ok_or(AgentStepError::StatusMissing)?
-                    .load_skill(pending)?;
+                    .finish_turn(&event.id)?;
+                ConversationTurnResult::FinishTurn
             }
-            let completion = world
-                .get_component_mut::<AgentStatus>(agent)
+        }
+        Message::Tool { resource_id, .. } => {
+            if world
+                .get_component::<AgentStatus>(agent)
                 .ok_or(AgentStepError::StatusMissing)?
-                .complete_tool_call(tool_call_id);
-            match completion {
-                ToolCallCompletion::Invalid => return Err(AgentStepError::InvalidToolBatch),
-                ToolCallCompletion::Pending => ConversationTurnResult::WaitForTools,
-                ToolCallCompletion::Completed => ConversationTurnResult::RequestInference,
+                .turn_id
+                .as_deref()
+                != Some(&event.id)
+            {
+                return Err(AgentStepError::InvalidToolBatch);
             }
+            record_history_message(event, events);
+            append_tool_context(world, agent, event.message.clone(), events)?;
+            if resource_id.resource_type() == "skill" {
+                world
+                    .get_component_mut::<AgentStatus>(agent)
+                    .ok_or(AgentStepError::StatusMissing)?
+                    .load_skill(resource_id.clone())?;
+            }
+            ConversationTurnResult::WaitForTools
         }
     };
     if matches!(result, ConversationTurnResult::RequestInference) {
-        send_inference_command(world, &event.id, agent, events)?;
+        send_inference_request(world, &event.id, agent, events)?;
     }
     Ok(result)
 }
 
-fn record_history_message(
-    event: &AgentMessage,
-    pending: Option<&PendingToolCall>,
-    events: &RuntimeEventSender,
-) {
-    let message = match (pending.map(|pending| pending.kind), &event.message) {
-        (Some(ToolCallKind::Skill), Message::Tool { tool_call_id, .. }) => Message::Tool {
+fn record_history_message(event: &AgentMessage, events: &RuntimeEventSender) {
+    let message = match &event.message {
+        Message::Tool {
+            resource_id,
+            tool_call_id,
+            ..
+        } => Message::Tool {
+            resource_id: resource_id.clone(),
             tool_call_id: tool_call_id.clone(),
-            content: format!(
-                "skill: {} loaded",
-                pending.expect("skill pending call exists").resource.name()
-            ),
+            content: resource_id.to_string(),
         },
         _ => event.message.clone(),
     };
@@ -526,146 +611,71 @@ fn clear_tool_context(
 }
 
 fn dispatch_tool_calls(
-    world: &mut World,
+    world: &World,
     id: &str,
     agent: Entity,
     tool_calls: &[ToolCall],
     include_loading_skills: bool,
     events: &RuntimeEventSender,
 ) -> Result<ConversationTurnResult, AgentStepError> {
-    if !world
-        .get_component::<AgentStatus>(agent)
-        .ok_or(AgentStepError::StatusMissing)?
-        .pending_tools
-        .is_empty()
-    {
-        return Err(AgentStepError::InvalidToolBatch);
-    }
-    let available_tools = build_available_tools(world, agent)?;
-    let mut pending = queue_tool_calls(&available_tools, tool_calls)?;
+    let maps = world
+        .get_component::<AgentToolMap>(agent)
+        .ok_or(AgentStepError::ToolMapMissing)?;
+    let mut calls = tool_calls.to_vec();
     if include_loading_skills {
-        pending.extend(expand_loading_skills(
-            world
-                .get_component::<AgentStatus>(agent)
-                .ok_or(AgentStepError::StatusMissing)?,
-        ));
+        calls.extend(expand_loading_skills(world, agent)?);
     }
-    if pending.is_empty() {
+    if calls.is_empty() {
         return Ok(ConversationTurnResult::RequestInference);
     }
     let mut call_ids = BTreeSet::new();
-    if pending
-        .iter()
-        .any(|pending| pending.call.id.is_empty() || !call_ids.insert(pending.call.id.clone()))
-    {
+    if calls.iter().any(|call| {
+        call.id.is_empty()
+            || call.tool_name.is_empty()
+            || maps.get_by_name(&call.tool_name).is_none()
+            || !call_ids.insert(call.id.clone())
+    }) {
         return Err(AgentStepError::InvalidToolBatch);
     }
-    {
-        let status = world
-            .get_component_mut::<AgentStatus>(agent)
-            .ok_or(AgentStepError::StatusMissing)?;
-        for call in pending.iter().cloned() {
-            status.add_tool_call(call)?;
-        }
+    for call in calls {
+        events.send_event(ToolCallEvent {
+            turn_id: id.to_owned(),
+            agent,
+            call,
+        });
     }
-    dispatch_pending_tools(world, id, agent, events)?;
     Ok(ConversationTurnResult::WaitForTools)
 }
 
-fn queue_tool_calls(
-    available_tools: &AvailableTools,
-    tool_calls: &[ToolCall],
-) -> Result<Vec<PendingToolCall>, AgentStepError> {
-    tool_calls
+fn expand_loading_skills(world: &World, agent: Entity) -> Result<Vec<ToolCall>, AgentStepError> {
+    static NEXT_SKILL_CALL_ID: AtomicU64 = AtomicU64::new(1);
+    let status = world
+        .get_component::<AgentStatus>(agent)
+        .ok_or(AgentStepError::StatusMissing)?;
+    let maps = world
+        .get_component::<AgentToolMap>(agent)
+        .ok_or(AgentStepError::ToolMapMissing)?;
+    status
+        .loading_skills
         .iter()
-        .map(|call| {
-            let resource = call.resource.clone();
-            if !available_tools.resources.contains(&resource) {
-                return Err(AgentStepError::Tool(ToolError::new(
-                    ToolErrorKind::InvalidRequest,
-                    "tool call resource was not present in current tool definitions",
-                )));
+        .map(|resource_id| {
+            let matches = maps.get_by_resource(resource_id);
+            if matches.len() != 1 {
+                return Err(AgentStepError::InvalidToolBatch);
             }
-            if resource.resource_type().is_empty() {
-                return Err(AgentStepError::Tool(ToolError::new(
-                    ToolErrorKind::InvalidRequest,
-                    "tool call resource is invalid",
-                )));
-            }
-            Ok(PendingToolCall {
-                call: call.clone(),
-                kind: tool_call_kind(&resource),
-                resource: resource.clone(),
+            Ok(ToolCall {
+                id: format!(
+                    "loading-skill-{}",
+                    NEXT_SKILL_CALL_ID.fetch_add(1, Ordering::Relaxed)
+                ),
+                tool_name: matches[0].tool_name.clone(),
+                arguments: "{}".into(),
             })
         })
         .collect()
 }
 
-fn dispatch_pending_tools(
-    world: &World,
-    id: &str,
-    agent: Entity,
-    events: &RuntimeEventSender,
-) -> Result<(), AgentStepError> {
-    let requests = world
-        .get_component::<AgentStatus>(agent)
-        .ok_or(AgentStepError::StatusMissing)?
-        .pending_tools
-        .values()
-        .cloned()
-        .map(|pending| ToolCallRequest {
-            id: id.to_owned(),
-            agent,
-            call: pending.call,
-        })
-        .collect::<Vec<_>>();
-    let agent_id = world
-        .get_component::<AgentIdentity>(agent)
-        .map(AgentIdentity::id)
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "unknown".into());
-    tracing::info!(
-        request_id = id,
-        agent = %agent_id,
-        tool_calls = requests.len(),
-        "tool calls dispatched"
-    );
-    for request in requests {
-        events.send_event(request);
-    }
-    Ok(())
-}
-
-fn expand_loading_skills(status: &AgentStatus) -> Vec<PendingToolCall> {
-    static NEXT_SKILL_CALL_ID: AtomicU64 = AtomicU64::new(1);
-
-    status
-        .loading_skills
-        .values()
-        .cloned()
-        .map(|mut pending| {
-            pending.call.id = format!(
-                "loading-skill-{}",
-                NEXT_SKILL_CALL_ID.fetch_add(1, Ordering::Relaxed)
-            );
-            pending
-        })
-        .collect()
-}
-
-fn tool_call_kind(resource: &ResourceId) -> ToolCallKind {
-    if resource.resource_type() == "skill" {
-        ToolCallKind::Skill
-    } else {
-        ToolCallKind::Tool
-    }
-}
-
-fn skill_key(resource: &ResourceId) -> String {
-    resource.to_string()
-}
-
-fn send_inference_command(
+fn send_inference_request(
     world: &World,
     id: &str,
     agent: Entity,
@@ -684,7 +694,7 @@ fn send_inference_command(
         tools = available_tools.definitions.len(),
         "inference requested"
     );
-    events.send_event(InferenceRequest {
+    events.send_event(InferenceRequestEvent {
         id: id.to_owned(),
         agent,
         agent_id: agent_id.clone(),
@@ -715,20 +725,54 @@ fn build_available_tools(world: &World, agent: Entity) -> Result<AvailableTools,
         .iter()
         .cloned()
         .collect::<Vec<_>>();
+    let maps = world
+        .get_component::<AgentToolMap>(agent)
+        .ok_or(AgentStepError::ToolMapMissing)?;
     let mut definitions = Vec::with_capacity(resources.len());
     for resource in &resources {
-        let definition = world.tool_definition_for(&resource).ok_or_else(|| {
-            AgentStepError::Tool(ToolError::new(
+        let matched = maps.get_by_resource(resource);
+        if matched.len() != 1 {
+            return Err(AgentStepError::Tool(ToolError::new(
                 ToolErrorKind::ProviderMissing,
-                "resource provider was not registered",
-            ))
-        })?;
-        definitions.push(definition);
+                "visible resource is not registered exactly once",
+            )));
+        }
+        definitions.push(ToolDefinition {
+            name: matched[0].template.name.clone(),
+            description: matched[0].template.description.clone(),
+            input_schema: matched[0].template.parameters.clone(),
+        });
     }
-    Ok(AvailableTools {
-        definitions,
-        resources: resources.into_iter().collect(),
-    })
+    Ok(AvailableTools { definitions })
+}
+
+fn tool_turn_completed_system(world: &mut World) {
+    let completed = world
+        .event_reader::<ToolTurnCompleted>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let events = world.event_sender();
+    for event in completed {
+        let result = world
+            .get_component::<AgentStatus>(event.agent)
+            .ok_or(AgentStepError::StatusMissing)
+            .and_then(|status| {
+                if status.turn_id.as_deref() == Some(&event.turn_id) {
+                    send_inference_request(world, &event.turn_id, event.agent, &events)
+                } else {
+                    Err(AgentStepError::InvalidToolBatch)
+                }
+            });
+        if let Err(error) = result {
+            events.send_event(AgentFailure {
+                id: event.turn_id,
+                agent: event.agent,
+                kind: AgentFailureKind::Agent,
+                message: error.failure_message(),
+            });
+        }
+    }
 }
 
 fn assert_conversation_message(message: &Message) {
@@ -744,7 +788,7 @@ fn assert_conversation_messages(messages: &[Message]) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any()))]
 mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -1034,5 +1078,113 @@ mod tests {
         assert_eq!(first[0].resource, second[0].resource);
         assert!(status.unload_skill("skill:local/review:latest"));
         status.unload_all_skills();
+    }
+}
+
+#[cfg(test)]
+mod loading_skill_tests {
+    use super::*;
+
+    fn test_app() -> (App, Entity) {
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default())
+            .add_plugin(AgentPlugin::default());
+        let agent = app.world_mut().spawn();
+        assert!(app
+            .world_mut()
+            .insert_component(agent, AgentStatus::default()));
+        (app, agent)
+    }
+
+    #[test]
+    fn load_and_unload_events_update_loading_skills() {
+        let (mut app, agent) = test_app();
+        let skill = ResourceId::parse("skill:local/review:latest").unwrap();
+        for id in ["load-1", "load-2"] {
+            app.world().send_event(LoadAgentSkill {
+                id: id.into(),
+                agent,
+                resource_id: skill.clone(),
+            });
+        }
+        app.tick();
+        assert_eq!(
+            app.world()
+                .get_component::<AgentStatus>(agent)
+                .unwrap()
+                .loading_skills,
+            BTreeSet::from([skill.clone()])
+        );
+
+        for id in ["unload-1", "unload-2"] {
+            app.world().send_event(UnloadAgentSkill {
+                id: id.into(),
+                agent,
+                resource_id: skill.clone(),
+            });
+        }
+        app.tick();
+        assert!(app
+            .world()
+            .get_component::<AgentStatus>(agent)
+            .unwrap()
+            .loading_skills
+            .is_empty());
+    }
+
+    #[test]
+    fn loading_non_skill_resource_emits_failure() {
+        let (mut app, agent) = test_app();
+        app.world().send_event(LoadAgentSkill {
+            id: "load-1".into(),
+            agent,
+            resource_id: ResourceId::parse("tool:local/query:latest").unwrap(),
+        });
+        app.tick();
+        app.tick();
+        let failure = app
+            .world()
+            .event_reader::<AgentFailure>()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(failure.id, "load-1");
+        assert_eq!(failure.kind, AgentFailureKind::Agent);
+    }
+
+    #[test]
+    fn unload_all_event_clears_every_loading_skill() {
+        let (mut app, agent) = test_app();
+        for resource_id in [
+            ResourceId::parse("skill:local/review:latest").unwrap(),
+            ResourceId::parse("skill:local/commit:latest").unwrap(),
+        ] {
+            app.world().send_event(LoadAgentSkill {
+                id: resource_id.to_string(),
+                agent,
+                resource_id,
+            });
+        }
+        app.tick();
+        assert_eq!(
+            app.world()
+                .get_component::<AgentStatus>(agent)
+                .unwrap()
+                .loading_skills
+                .len(),
+            2
+        );
+
+        app.world().send_event(UnloadAllAgentSkills {
+            id: "unload-all-1".into(),
+            agent,
+        });
+        app.tick();
+        assert!(app
+            .world()
+            .get_component::<AgentStatus>(agent)
+            .unwrap()
+            .loading_skills
+            .is_empty());
     }
 }

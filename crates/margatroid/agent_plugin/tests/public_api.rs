@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 
 use agent_plugin::{
     AgentContext, AgentCreateRequest, AgentCreated, AgentDefaultVisibility, AgentDynamicVisibility,
-    AgentPlugin, AgentWorkspaceId, WorldAgentExt,
+    AgentPlugin, AgentWorkspaceId, LoadAgentSkill, UnloadAgentSkill, UnloadAllAgentSkills,
+    WorldAgentExt,
 };
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::App;
@@ -91,4 +92,32 @@ fn duplicate_agent_resource_ids_are_rejected() {
         .collect::<Vec<_>>();
     assert_eq!(created.len(), 1);
     assert_eq!(app.world().agent(&agent_id), Some(created[0].agent));
+}
+
+#[test]
+fn loading_skill_events_are_public() {
+    fn assert_event<EventType: core_plugin::Event>() {}
+    assert_event::<LoadAgentSkill>();
+    assert_event::<UnloadAgentSkill>();
+    assert_event::<UnloadAllAgentSkills>();
+
+    let mut app = App::new();
+    let agent = app.world_mut().spawn();
+    let resource_id = ResourceId::parse("skill:local/review:latest").unwrap();
+    let load = LoadAgentSkill {
+        id: "load-1".into(),
+        agent,
+        resource_id: resource_id.clone(),
+    };
+    let unload = UnloadAgentSkill {
+        id: "unload-1".into(),
+        agent,
+        resource_id,
+    };
+    let unload_all = UnloadAllAgentSkills {
+        id: "unload-all-1".into(),
+        agent,
+    };
+    assert_eq!(load.agent, unload.agent);
+    assert_eq!(load.agent, unload_all.agent);
 }

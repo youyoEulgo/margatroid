@@ -1,12 +1,13 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use agent_plugin::{AgentDynamicVisibility, AgentIdentity};
+use agent_plugin::{AgentDynamicVisibility, AgentIdentity, WorldAgentExt};
 use core_plugin::{Entity, World};
 use log_plugin::{TracingField, TracingRecord};
 use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, RouteAgentMessage,
-    StartWorkspace, ToolCall, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
+    AgentFailure, AgentFailureKind, AgentMessage, AgentSkillRouteAction, Message, ResourceId,
+    RouteAgentMessage, RouteAgentSkill, StartWorkspace, ToolCall, WorkspaceAgentDefinition,
+    WorkspaceDefinition, WorkspaceReference,
 };
 use memory_plugin::{AgentMemory, HistoryMessage};
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,21 @@ pub enum ClientMessage {
     AgentMessage {
         id: String,
         message: RouteAgentMessageDto,
+    },
+    #[serde(rename = "agent.skill.load")]
+    AgentSkillLoad {
+        id: String,
+        message: RouteAgentSkillDto,
+    },
+    #[serde(rename = "agent.skill.unload")]
+    AgentSkillUnload {
+        id: String,
+        message: RouteAgentSkillDto,
+    },
+    #[serde(rename = "agent.skill.unload_all")]
+    AgentSkillUnloadAll {
+        id: String,
+        message: RouteAgentSkillDto,
     },
 }
 
@@ -170,7 +186,7 @@ impl IntoDomain<Message> for UserMessageDto {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallDto {
     pub id: String,
-    pub resource: ResourceIdDto,
+    pub tool_name: String,
     pub arguments: String,
 }
 
@@ -178,7 +194,7 @@ impl FromDomain<&ToolCall> for ToolCallDto {
     fn from_domain(call: &ToolCall, (): ()) -> Result<Self, ProtocolError> {
         Ok(Self {
             id: call.id.clone(),
-            resource: ResourceIdDto::from_domain(&call.resource, ())?,
+            tool_name: call.tool_name.clone(),
             arguments: call.arguments.clone(),
         })
     }
@@ -188,7 +204,7 @@ impl IntoDomain<ToolCall> for ToolCallDto {
     fn into_domain(self, (): ()) -> Result<ToolCall, ProtocolError> {
         Ok(ToolCall {
             id: self.id,
-            resource: self.resource.into_domain(())?,
+            tool_name: self.tool_name,
             arguments: self.arguments,
         })
     }
@@ -205,6 +221,7 @@ pub enum MessageDto {
         tool_calls: Vec<ToolCallDto>,
     },
     Tool {
+        resource_id: ResourceIdDto,
         tool_call_id: String,
         content: String,
     },
@@ -234,9 +251,11 @@ impl FromDomain<&Message> for MessageDto {
                     .collect::<Result<Vec<_>, _>>()?,
             }),
             Message::Tool {
+                resource_id,
                 tool_call_id,
                 content,
             } => Ok(Self::Tool {
+                resource_id: ResourceIdDto::from_domain(resource_id, ())?,
                 tool_call_id: tool_call_id.clone(),
                 content: content.clone(),
             }),
@@ -301,6 +320,49 @@ pub struct RouteAgentMessageDto {
     pub message: UserMessageDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteAgentSkillDto {
+    pub workspace: WorkspaceReferenceDto,
+    pub agent: Option<ResourceIdDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<ResourceIdDto>,
+}
+
+impl RouteAgentSkillDto {
+    fn into_domain(
+        self,
+        id: String,
+        action: AgentSkillRouteAction,
+    ) -> Result<RouteAgentSkill, ProtocolError> {
+        let resource_id = self
+            .resource_id
+            .map(|resource| resource.into_domain(()))
+            .transpose()?;
+        if !matches!(action, AgentSkillRouteAction::UnloadAll) && resource_id.is_none() {
+            return Err(ProtocolError::new(
+                ProtocolErrorKind::InvalidRequest,
+                "skill resource_id is required",
+            ));
+        }
+        Ok(RouteAgentSkill {
+            id,
+            workspace: self.workspace.into_domain(())?,
+            agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
+            resource_id,
+            action,
+        })
+    }
+}
+
+impl IntoDomain<RouteAgentSkill, (String, AgentSkillRouteAction)> for RouteAgentSkillDto {
+    fn into_domain(
+        self,
+        (id, action): (String, AgentSkillRouteAction),
+    ) -> Result<RouteAgentSkill, ProtocolError> {
+        RouteAgentSkillDto::into_domain(self, id, action)
+    }
 }
 
 impl IntoDomain<RouteAgentMessage, String> for RouteAgentMessageDto {
@@ -387,6 +449,22 @@ impl ClientMessage {
                     content: content.into(),
                 },
                 tool_calls,
+            },
+        }
+    }
+
+    pub fn agent_skill_load(
+        id: impl Into<String>,
+        workspace: &WorkspaceReferenceDto,
+        agent: Option<ResourceIdDto>,
+        resource_id: ResourceIdDto,
+    ) -> Self {
+        Self::AgentSkillLoad {
+            id: id.into(),
+            message: RouteAgentSkillDto {
+                workspace: workspace.clone(),
+                agent,
+                resource_id: Some(resource_id),
             },
         }
     }
@@ -499,6 +577,8 @@ pub struct AgentStateDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: ResourceIdDto,
     pub visible_resources: Vec<ResourceIdDto>,
+    #[serde(default)]
+    pub loading_skills: Vec<ResourceIdDto>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,10 +691,22 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
                 "Agent identity is missing",
             )
         })?;
+        let loading_skills = world
+            .agent_loading_skills(agent)
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorKind::AgentNotFound,
+                    "Agent loading skills are missing",
+                )
+            })?
+            .iter()
+            .map(|resource| resource.into_dto(()))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             workspace: workspace.reference(),
             agent: identity.id().into_dto(())?,
             visible_resources,
+            loading_skills,
         })
     }
 }
@@ -865,6 +957,7 @@ fn agent_resource_id(workspace: &str, agent: &str) -> Result<ResourceId, Protoco
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolErrorKind {
     AgentNotFound,
+    InvalidRequest,
     InvalidImageReference,
     InvalidResourceReference,
     MemoryNotFound,
@@ -1048,7 +1141,7 @@ mod tests {
             "Load context.",
             vec![ToolCallDto {
                 id: "call-1".into(),
-                resource: ResourceIdDto("skill:local/context:latest".into()),
+                tool_name: "skill0_context".into(),
                 arguments: "{}".into(),
             }],
         );
@@ -1062,10 +1155,7 @@ mod tests {
         };
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call-1");
-        assert_eq!(
-            tool_calls[0].resource.to_string(),
-            "skill:local/context:latest"
-        );
+        assert_eq!(tool_calls[0].tool_name, "skill0_context");
     }
 
     #[test]
@@ -1094,6 +1184,7 @@ mod tests {
         );
 
         let tool = Message::Tool {
+            resource_id: ResourceId::parse("skill:local/context:latest").unwrap(),
             tool_call_id: "call-1".into(),
             content: "result".into(),
         };
@@ -1138,6 +1229,7 @@ mod tests {
                     workspace: workspace_reference(),
                     agent: ResourceIdDto("agent:demo/coder:latest".into()),
                     visible_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
+                    loading_skills: vec![ResourceIdDto("skill:local/review:latest".into())],
                 }],
                 histories: vec![AgentHistoryDto {
                     workspace: workspace_reference(),
@@ -1168,6 +1260,10 @@ mod tests {
         );
         assert_eq!(
             value["state"]["agents"][0]["visible_resources"][0],
+            "skill:local/review:latest"
+        );
+        assert_eq!(
+            value["state"]["agents"][0]["loading_skills"][0],
             "skill:local/review:latest"
         );
         assert_eq!(
@@ -1212,6 +1308,7 @@ mod tests {
         assert_eq!(state.workspace.name, "demo");
         assert_eq!(state.agent, ResourceIdDto("agent:demo/coder:latest".into()));
         assert_eq!(state.visible_resources.len(), 1);
+        assert!(state.loading_skills.is_empty());
         assert_eq!(
             state.visible_resources[0],
             ResourceIdDto("skill:local/review:latest".into())

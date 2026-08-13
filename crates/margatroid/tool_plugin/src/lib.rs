@@ -1,11 +1,12 @@
-use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
-use margatroid_types::{AgentMessage, Message, ResourceId, ToolCall, ToolDefinition};
+use margatroid_types::{
+    AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, ToolCall,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolErrorKind {
@@ -82,71 +83,130 @@ impl Component for AgentToolEnvironment {}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolTemplate {
-    id: ResourceId,
-    definition: ToolDefinition,
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
 }
+
 impl ToolTemplate {
-    pub fn new(id: ResourceId, definition: ToolDefinition) -> Result<Self, ToolError> {
-        if id.resource_type() != "tool" {
-            return Err(ToolError::new(
-                ToolErrorKind::InvalidDefinition,
-                "tool template ID must use type tool",
-            ));
-        }
-        validate_definition(&definition)?;
-        Ok(Self { id, definition })
-    }
-    pub fn id(&self) -> &ResourceId {
-        &self.id
-    }
-    pub fn definition(&self) -> &ToolDefinition {
-        &self.definition
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Result<Self, ToolError> {
+        let template = Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        };
+        validate_template(&template)?;
+        Ok(template)
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolCallRequest {
-    pub id: String,
-    pub agent: Entity,
-    pub call: ToolCall,
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolMap {
+    pub tool_name: String,
+    pub tool_id: ResourceId,
+    pub resource_id: ResourceId,
+    pub template: ToolTemplate,
 }
-impl Event for ToolCallRequest {}
+
+#[derive(Default)]
+pub struct AgentToolMap {
+    next_index: u64,
+    tools: Vec<ToolMap>,
+}
+
+impl AgentToolMap {
+    pub fn get_by_name(&self, tool_name: &str) -> Option<&ToolMap> {
+        self.tools.iter().find(|map| map.tool_name == tool_name)
+    }
+
+    pub fn get_by_tool(&self, tool_id: &ResourceId) -> Vec<&ToolMap> {
+        self.tools
+            .iter()
+            .filter(|map| &map.tool_id == tool_id)
+            .collect()
+    }
+
+    pub fn get_by_resource(&self, resource_id: &ResourceId) -> Vec<&ToolMap> {
+        self.tools
+            .iter()
+            .filter(|map| &map.resource_id == resource_id)
+            .collect()
+    }
+
+    pub fn register(
+        &mut self,
+        tool_id: ResourceId,
+        resource_id: ResourceId,
+        mut template: ToolTemplate,
+    ) -> Result<&ToolMap, ToolError> {
+        if !self.get_by_resource(&resource_id).is_empty() {
+            return Err(ToolError::new(
+                ToolErrorKind::ToolAlreadyRegistered,
+                "resource is already registered for this Agent",
+            ));
+        }
+        let tool_name = generated_tool_name(
+            resource_id.resource_type(),
+            self.next_index,
+            resource_id.name(),
+        );
+        self.next_index = self.next_index.checked_add(1).ok_or_else(|| {
+            ToolError::new(
+                ToolErrorKind::InvalidDefinition,
+                "Agent tool index is exhausted",
+            )
+        })?;
+        template.name = tool_name.clone();
+        validate_template(&template)?;
+        self.tools.push(ToolMap {
+            tool_name,
+            tool_id,
+            resource_id,
+            template,
+        });
+        Ok(self.tools.last().expect("ToolMap was just inserted"))
+    }
+}
+impl Component for AgentToolMap {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallEvent {
-    pub id: String,
+    pub turn_id: String,
     pub agent: Entity,
-    pub loader: ResourceId,
-    pub resource: ResourceId,
     pub call: ToolCall,
 }
 impl Event for ToolCallEvent {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolDefinitionRequest {
-    pub id: String,
+pub struct ToolCallRequest {
+    pub turn_id: String,
     pub agent: Entity,
-    pub resource: ResourceId,
+    pub tool_id: ResourceId,
+    pub resource_id: ResourceId,
+    pub tool_call_id: String,
+    pub arguments: String,
 }
-impl Event for ToolDefinitionRequest {}
+impl Event for ToolCallRequest {}
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ToolDefinitionRoute {
-    pub id: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCallResponse {
+    pub turn_id: String,
     pub agent: Entity,
-    pub loader: ResourceId,
-    pub resource: ResourceId,
+    pub tool_call_id: String,
+    pub result: Result<String, ToolError>,
 }
-impl Event for ToolDefinitionRoute {}
+impl Event for ToolCallResponse {}
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ToolDefinitionResult {
-    pub id: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolTurnCompleted {
+    pub turn_id: String,
     pub agent: Entity,
-    pub resource: ResourceId,
-    pub result: Result<ToolDefinition, ToolError>,
 }
-impl Event for ToolDefinitionResult {}
+impl Event for ToolTurnCompleted {}
 
 pub struct ToolPlugin {
     schedule: String,
@@ -167,6 +227,7 @@ impl Default for ToolPlugin {
         Self::new()
     }
 }
+
 pub struct ToolPluginInstalled;
 impl Resource for ToolPluginInstalled {}
 
@@ -194,181 +255,224 @@ impl Plugin for ToolPlugin {
             .panic();
         }
         app.world_mut().insert_resource(ToolPluginInstalled);
-        app.world_mut().insert_resource(ToolRegistry::default());
-        app.add_system(&self.schedule, tool_definition_route_system)
-            .add_system(&self.schedule, tool_call_route_system);
+        app.world_mut().insert_resource(PendingToolCalls::default());
+        app.add_system(&self.schedule, tool_call_route_system)
+            .add_system(&self.schedule, tool_call_response_system);
     }
 }
 
-pub trait AppToolExt {
-    fn register_tool_template(&mut self, template: ToolTemplate) -> &mut Self;
-}
-impl AppToolExt for App {
-    fn register_tool_template(&mut self, template: ToolTemplate) -> &mut Self {
-        let registry = self
-            .world_mut()
-            .get_resource_mut::<ToolRegistry>()
-            .unwrap_or_else(|| {
-                ToolError::new(
-                    ToolErrorKind::ToolPluginMissing,
-                    "ToolPlugin is not installed",
-                )
-                .panic()
-            });
-        registry
-            .insert(template)
-            .unwrap_or_else(|error| error.panic());
-        self
+pub fn attach_agent_tool_map(world: &mut World, agent: Entity) -> Result<(), ToolError> {
+    if !world.is_alive(agent) {
+        return Err(ToolError::new(
+            ToolErrorKind::AgentNotAlive,
+            "Agent entity is not alive",
+        ));
     }
+    if world.get_component::<AgentToolMap>(agent).is_some()
+        || !world.insert_component(agent, AgentToolMap::default())
+    {
+        return Err(ToolError::new(
+            ToolErrorKind::ToolAlreadyRegistered,
+            "AgentToolMap is already attached",
+        ));
+    }
+    Ok(())
 }
 
-pub trait WorldToolExt {
-    fn tool_template(&self, id: &ResourceId) -> Option<ToolTemplate>;
-    fn tool_definition_for(&self, resource: &ResourceId) -> Option<ToolDefinition>;
-}
-impl WorldToolExt for World {
-    fn tool_template(&self, id: &ResourceId) -> Option<ToolTemplate> {
-        self.get_resource::<ToolRegistry>()?
-            .templates
-            .get(id)
-            .cloned()
-    }
-    fn tool_definition_for(&self, resource: &ResourceId) -> Option<ToolDefinition> {
-        let id = match resource.resource_type() {
-            "tool" => resource.clone(),
-            "skill" => loader_id("skill")?,
-            _ => return None,
-        };
-        let mut definition = self.tool_template(&id)?.definition().clone();
-        definition.name = resource.to_string();
-        if resource.resource_type() != "tool" {
-            definition.input_schema = serde_json::json!({"type":"object"});
-        }
-        Some(definition)
-    }
+pub fn register_agent_tool(
+    world: &mut World,
+    agent: Entity,
+    tool_id: ResourceId,
+    resource_id: ResourceId,
+    template: ToolTemplate,
+) -> Result<ToolMap, ToolError> {
+    let map = world
+        .get_component_mut::<AgentToolMap>(agent)
+        .ok_or_else(|| {
+            ToolError::new(
+                ToolErrorKind::ToolPluginMissing,
+                "AgentToolMap is not attached",
+            )
+        })?
+        .register(tool_id, resource_id, template)?
+        .clone();
+    Ok(map)
 }
 
 #[derive(Default)]
-struct ToolRegistry {
-    templates: BTreeMap<ResourceId, ToolTemplate>,
+struct PendingToolCalls {
+    calls: Vec<ToolCallRequest>,
 }
-impl ToolRegistry {
-    fn insert(&mut self, template: ToolTemplate) -> Result<(), ToolError> {
-        if self.templates.contains_key(template.id()) {
+
+impl PendingToolCalls {
+    fn get(&self, agent: Entity, turn_id: &str, tool_call_id: &str) -> Option<&ToolCallRequest> {
+        self.calls.iter().find(|request| {
+            request.agent == agent
+                && request.turn_id == turn_id
+                && request.tool_call_id == tool_call_id
+        })
+    }
+
+    fn get_by_agent(&self, agent: Entity) -> Vec<&ToolCallRequest> {
+        self.calls
+            .iter()
+            .filter(|request| request.agent == agent)
+            .collect()
+    }
+
+    fn get_by_turn(&self, agent: Entity, turn_id: &str) -> Vec<&ToolCallRequest> {
+        self.calls
+            .iter()
+            .filter(|request| request.agent == agent && request.turn_id == turn_id)
+            .collect()
+    }
+
+    fn add_pending(&mut self, request: ToolCallRequest) -> Result<(), ToolError> {
+        if self
+            .get(request.agent, &request.turn_id, &request.tool_call_id)
+            .is_some()
+        {
             return Err(ToolError::new(
-                ToolErrorKind::InvalidDefinition,
-                "tool template is already registered",
+                ToolErrorKind::InvalidRequest,
+                "tool call is already pending",
             ));
         }
-        self.templates.insert(template.id().clone(), template);
+        self.calls.push(request);
         Ok(())
     }
-}
-impl Resource for ToolRegistry {}
 
-fn loader_id(resource_type: &str) -> Option<ResourceId> {
-    ResourceId::parse(format!("tool:builtin/{resource_type}-loader:latest")).ok()
-}
-
-fn tool_definition_route_system(world: &mut World) {
-    let requests = world
-        .event_reader::<ToolDefinitionRequest>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    for request in requests {
-        let loader = loader_id(request.resource.resource_type());
-        if let Some(loader) = loader.filter(|id| world.tool_template(id).is_some()) {
-            world.send_event(ToolDefinitionRoute {
-                id: request.id,
-                agent: request.agent,
-                loader,
-                resource: request.resource,
-            });
-        } else {
-            world.send_event(ToolDefinitionResult {
-                id: request.id,
-                agent: request.agent,
-                resource: request.resource,
-                result: Err(ToolError::new(
-                    ToolErrorKind::ProviderMissing,
-                    "resource loader is not registered",
-                )),
-            });
-        }
+    fn remove(
+        &mut self,
+        agent: Entity,
+        turn_id: &str,
+        tool_call_id: &str,
+    ) -> Option<ToolCallRequest> {
+        let index = self.calls.iter().position(|request| {
+            request.agent == agent
+                && request.turn_id == turn_id
+                && request.tool_call_id == tool_call_id
+        })?;
+        Some(self.calls.remove(index))
     }
 }
+impl Resource for PendingToolCalls {}
 
 fn tool_call_route_system(world: &mut World) {
-    let requests = world
-        .event_reader::<ToolCallRequest>()
+    let calls = world
+        .event_reader::<ToolCallEvent>()
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
-    for request in requests {
-        let resource = request.call.resource.clone();
-        let loader = match resource.resource_type() {
-            "tool" => resource.clone(),
-            "skill" => match loader_id("skill") {
-                Some(loader) => loader,
-                None => {
-                    send_error(world, request, "resource loader ID is invalid");
-                    continue;
-                }
-            },
-            _ => {
-                send_error(world, request, "resource type is not callable");
-                continue;
+    for event in calls {
+        let result = (|| {
+            if event.turn_id.is_empty() || event.call.id.is_empty() || !world.is_alive(event.agent)
+            {
+                return Err(ToolError::new(
+                    ToolErrorKind::InvalidRequest,
+                    "tool call event is invalid",
+                ));
             }
-        };
-        if world.tool_template(&loader).is_none() {
-            send_error(world, request, "resource loader is not registered");
-            continue;
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                &event.call.arguments,
+            )
+            .map_err(|_| {
+                ToolError::new(
+                    ToolErrorKind::InvalidArguments,
+                    "tool arguments must be a JSON object",
+                )
+            })?;
+            let map = world
+                .get_component::<AgentToolMap>(event.agent)
+                .and_then(|maps| maps.get_by_name(&event.call.tool_name))
+                .cloned()
+                .ok_or_else(|| {
+                    ToolError::new(
+                        ToolErrorKind::InvalidRequest,
+                        "tool name is not registered for this Agent",
+                    )
+                })?;
+            let request = ToolCallRequest {
+                turn_id: event.turn_id.clone(),
+                agent: event.agent,
+                tool_id: map.tool_id,
+                resource_id: map.resource_id,
+                tool_call_id: event.call.id.clone(),
+                arguments: event.call.arguments.clone(),
+            };
+            world
+                .get_resource_mut::<PendingToolCalls>()
+                .expect("ToolPlugin is installed")
+                .add_pending(request.clone())?;
+            world.send_event(request);
+            Ok::<(), ToolError>(())
+        })();
+        if let Err(error) = result {
+            world.send_event(AgentFailure {
+                id: event.turn_id,
+                agent: event.agent,
+                kind: AgentFailureKind::Agent,
+                message: error.to_string(),
+            });
         }
-        let call = if resource.resource_type() == "skill" {
-            ToolCall {
-                id: request.call.id.clone(),
-                resource: resource.clone(),
-                arguments: serde_json::json!({"resource": resource.to_string()}).to_string(),
-            }
-        } else {
-            request.call
-        };
-        world.send_event(ToolCallEvent {
-            id: request.id,
-            agent: request.agent,
-            loader,
-            resource,
-            call,
-        });
     }
 }
 
-fn send_error(world: &World, request: ToolCallRequest, content: &str) {
-    world.send_event(AgentMessage {
-        id: request.id,
-        agent: request.agent,
-        message: Message::Tool {
-            tool_call_id: request.call.id,
-            content: content.to_owned(),
-        },
-    });
+fn tool_call_response_system(world: &mut World) {
+    let responses = world
+        .event_reader::<ToolCallResponse>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for response in responses {
+        let request = world
+            .get_resource_mut::<PendingToolCalls>()
+            .expect("ToolPlugin is installed")
+            .remove(response.agent, &response.turn_id, &response.tool_call_id);
+        let Some(request) = request else {
+            continue;
+        };
+        let content = response.result.unwrap_or_else(|error| error.to_string());
+        world.send_event(AgentMessage {
+            id: response.turn_id.clone(),
+            agent: response.agent,
+            message: Message::Tool {
+                resource_id: request.resource_id,
+                tool_call_id: response.tool_call_id,
+                content,
+            },
+        });
+        let completed = world
+            .get_resource::<PendingToolCalls>()
+            .expect("ToolPlugin is installed")
+            .get_by_turn(response.agent, &response.turn_id)
+            .is_empty();
+        if completed {
+            world.send_event(ToolTurnCompleted {
+                turn_id: response.turn_id,
+                agent: response.agent,
+            });
+        }
+    }
 }
 
-fn validate_definition(definition: &ToolDefinition) -> Result<(), ToolError> {
-    let valid_name = !definition.name.is_empty()
-        && definition.name.len() <= 64
-        && definition
-            .name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
-    if !valid_name
-        || definition.description.trim().is_empty()
-        || !definition.input_schema.is_object()
-    {
+fn generated_tool_name(resource_type: &str, index: u64, resource_name: &str) -> String {
+    let mut name = format!("{resource_type}{index}_");
+    name.extend(resource_name.chars().map(|character| {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+            character
+        } else {
+            '_'
+        }
+    }));
+    name.truncate(64);
+    name
+}
+
+fn validate_template(template: &ToolTemplate) -> Result<(), ToolError> {
+    if template.description.trim().is_empty() || !template.parameters.is_object() {
         return Err(ToolError::new(
             ToolErrorKind::InvalidDefinition,
-            "tool template definition is invalid",
+            "tool template is invalid",
         ));
     }
     Ok(())
