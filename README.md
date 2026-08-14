@@ -11,7 +11,8 @@ Workspace 文件、通过 WebSocket 发送 Workspace 启动请求并打印后端
 启动后端：
 
 ```text
-cargo run -p margatroid_daemon -- --data-root ~/.margatroid
+cargo run -p margatroid_daemon
 ```
 
-daemon 默认监听 `127.0.0.1:3939`，并要求 `~/.margatroid/models.toml` 是有效的模型路由配置。
+daemon不接受启动参数，固定读取 `~/.margatroid/config.toml` 和 `~/.margatroid/models.toml`。
+监听地址由 `config.toml` 的 `server.bind` 配置。

@@ -7,15 +7,11 @@ WebSocket API 收发、DTO 与领域命令转换、完整状态及日志的出�
 启动：
 
 ```text
-cargo run -p margatroid_daemon -- --data-root ~/.margatroid
+cargo run -p margatroid_daemon
 ```
 
-默认监听 `127.0.0.1:3939`，CLI 连接 `ws://127.0.0.1:3939/ws`。可用参数：
-
-```text
---bind HOST:PORT          监听地址，默认 127.0.0.1:3939
---data-root DIRECTORY     数据目录，默认 ~/.margatroid
-```
+daemon不接受启动参数，固定使用 `~/.margatroid` 主目录。监听地址和其他运行配置全部来自
+`~/.margatroid/config.toml`。
 
 数据目录至少包含：
 
@@ -32,6 +28,9 @@ cargo run -p margatroid_daemon -- --data-root ~/.margatroid
 `config.toml` 保存全局 WebSocket 出站目标，暂定格式：
 
 ```toml
+[server]
+bind = "127.0.0.1:3939"
+
 [outbound]
 logs = ["type:cli", "type:webui"]
 backend_state = ["type:webui"]
@@ -39,7 +38,8 @@ member_messages = ["type:webui"]
 streaming_member_messages = ["type:webui"]
 ```
 
-目标支持 `broadcast`、`type:<连接类型>` 和 `name:<连接名称>`。Workspace 启动、停止、失败或异常结果，以及成员
+`server.bind` 是ServerPlugin的监听地址。目标支持 `broadcast`、`type:<连接类型>` 和
+`name:<连接名称>`。Workspace 启动、停止、失败或异常结果，以及成员
 失败或异常，都归入 `logs`；完整成员消息和流式成员消息分别使用后两个字段。模型路由文件不再保存
 WebSocket target。
 AgentImage 由 `agent-images/` 提供，Workspace 文件仍由 CLI 编译，daemon 不读取 YAML。

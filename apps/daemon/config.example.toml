@@ -1,3 +1,6 @@
+[server]
+bind = "127.0.0.1:3939"
+
 [outbound]
 logs = ["type:cli", "type:webui"]
 backend_state = ["type:webui"]
