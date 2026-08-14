@@ -1,61 +1,42 @@
 # MargatroidDaemon
 
-## 类型
-
-私有：
-```text
-DaemonConfig：daemon启动配置，私有结构体
-    bind: SocketAddr--ServerPlugin监听地址
-    data_root: PathBuf--Margatroid主目录
-```
-
 ## 函数
 
 私有：
 ```text
 main()
-    daemon入口：解析启动配置，调用run并将错误转换为进程退出码
+    daemon入口：调用run并将错误转换为进程退出码；不解析任何启动参数
 
-run(config: DaemonConfig) -> Result<(), Error>
+run() -> Result<(), Error>
     组合并启动应用：私有函数，打开主目录中的插件资源，按依赖顺序安装Plugin并运行App
     行为：
-        创建并规范化data_root
+        从HOME固定得到~/.margatroid并创建主目录
         检查models.toml和config.toml存在
-        加载并验证config.toml中的logs、backend_state、member_messages和streaming_member_messages
+        加载并验证config.toml中的server.bind和全部出站配置
+        使用server.bind构造ServerPlugin
         将全局只读WebSocket目标配置交给DtoPlugin和InferencePlugin
         打开AgentImage、Workspace、Skill和Workflow Plugin所需目录
         安装运行时、日志、Server和全部领域Plugin
         安装DtoPlugin和ConnectionPlugin
         记录启动信息并调用AppRunExt::run
 
-parse_args(arguments: impl IntoIterator<Item = String>) -> Result<DaemonConfig, String>
-    解析启动参数：私有函数，读取bind与data-root配置
-
-parse_bind(value: String) -> Result<SocketAddr, String>
-    解析监听地址：私有函数，将字符串转换为SocketAddr
-
-default_data_root() -> PathBuf
-    构造默认主目录：私有函数，返回HOME下的.margatroid，HOME缺失时使用当前目录
-
-absolute_path(path: &Path) -> Result<PathBuf, Error>
-    构造绝对路径：私有函数，绝对路径原样返回，相对路径拼接当前目录
-
-usage() -> &'static str
-    返回帮助文本：私有函数，描述当前启动参数
+data_root() -> Result<PathBuf, Error>
+    构造固定主目录：私有函数，返回HOME下的.margatroid；HOME缺失时启动失败
 ```
 
 ## 逻辑
 
 ```text
 main
-    -> parse_args
     -> run
-        -> 打开主目录资源
+        -> 打开~/.margatroid/config.toml
+        -> 使用server.bind安装ServerPlugin
         -> 按依赖顺序安装Plugin
         -> AppRunExt::run
 
 边界：
-    daemon负责进程参数、路径准备、Plugin配置与装配、进程退出
+    daemon负责固定主目录定位、Plugin配置与装配、进程退出
+    daemon不接受启动参数；运行配置以~/.margatroid/config.toml为准
     daemon不定义或注册业务System
     daemon不解析API消息，不路由Workspace或Agent，不构造前端状态，不转发日志
     API DTO与领域命令转换、领域状态和日志的客户端投影均由DtoPlugin负责

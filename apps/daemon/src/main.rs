@@ -1,7 +1,6 @@
 use std::error::Error;
 use std::fs;
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process;
 
 use agent_image_loader_plugin::AgentImageLoaderPlugin;
@@ -22,37 +21,19 @@ use tracing::info;
 use workflow_plugin::WorkflowPlugin;
 use workspace_plugin::WorkspacePlugin;
 
-const DEFAULT_BIND: &str = "127.0.0.1:3939";
-const DEFAULT_DATA_ROOT: &str = ".margatroid";
+const DATA_ROOT_NAME: &str = ".margatroid";
 const LOG_STREAM_CAPACITY: usize = 256;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DaemonConfig {
-    bind: SocketAddr,
-    data_root: PathBuf,
-}
-
 fn main() {
-    match parse_args(std::env::args().skip(1)) {
-        Ok(config) => {
-            if let Err(error) = run(config) {
-                eprintln!("margatroid-daemon: {error}");
-                process::exit(1);
-            }
-        }
-        Err(error) if error == usage() => println!("{}", usage()),
-        Err(error) => {
-            eprintln!("margatroid-daemon: {error}");
-            eprintln!();
-            eprintln!("{}", usage());
-            process::exit(2);
-        }
+    if let Err(error) = run() {
+        eprintln!("margatroid-daemon: {error}");
+        process::exit(1);
     }
 }
 
-fn run(config: DaemonConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
-    fs::create_dir_all(&config.data_root)?;
-    let data_root = absolute_path(&config.data_root)?;
+fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let data_root = data_root()?;
+    fs::create_dir_all(&data_root)?;
     let agent_images_root = data_root.join("agent-images");
     let config_path = data_root.join("config.toml");
     let models_path = data_root.join("models.toml");
@@ -73,12 +54,13 @@ fn run(config: DaemonConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
         .map_err(|error| format!("cannot open workflow root: {error}"))?;
     let global_config = ConfigPlugin::open(&config_path)
         .map_err(|error| format!("cannot open global configuration: {error}"))?;
+    let bind = global_config.config().server_bind();
 
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(LogPlugin::default().with_stream(LOG_STREAM_CAPACITY))
-        .add_plugin(ServerPlugin::with_options(ServerOptions::bind(config.bind)))
+        .add_plugin(ServerPlugin::with_options(ServerOptions::bind(bind)))
         .add_plugin(global_config)
         .add_plugin(agent_images)
         .add_plugin(InferencePlugin::default().with_config_path(models_path.clone()))
@@ -91,90 +73,12 @@ fn run(config: DaemonConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(DtoPlugin::default())
         .add_plugin(ConnectionPlugin::default());
 
-    info!(address = %config.bind, data_root = %data_root.display(), config = %config_path.display(), models = %models_path.display(), "margatroid daemon starting");
+    info!(address = %bind, data_root = %data_root.display(), config = %config_path.display(), models = %models_path.display(), "margatroid daemon starting");
     app.run();
     Ok(())
 }
 
-fn parse_args<I>(arguments: I) -> Result<DaemonConfig, String>
-where
-    I: IntoIterator<Item = String>,
-{
-    let mut arguments = arguments.into_iter();
-    let mut bind = DEFAULT_BIND.parse().expect("default bind address is valid");
-    let mut data_root = default_data_root();
-    while let Some(argument) = arguments.next() {
-        if argument == "--help" || argument == "-h" {
-            return Err(usage().to_owned());
-        }
-        if argument == "--bind" {
-            bind = parse_bind(arguments.next().ok_or("--bind requires an address")?)?;
-            continue;
-        }
-        if let Some(value) = argument.strip_prefix("--bind=") {
-            bind = parse_bind(value.to_owned())?;
-            continue;
-        }
-        if argument == "--data-root" {
-            data_root = PathBuf::from(arguments.next().ok_or("--data-root requires a directory")?);
-            continue;
-        }
-        if let Some(value) = argument.strip_prefix("--data-root=") {
-            if value.is_empty() {
-                return Err("--data-root requires a directory".into());
-            }
-            data_root = PathBuf::from(value);
-            continue;
-        }
-        return Err(format!("unknown option '{argument}'"));
-    }
-    Ok(DaemonConfig { bind, data_root })
-}
-
-fn parse_bind(value: String) -> Result<SocketAddr, String> {
-    value
-        .parse()
-        .map_err(|error| format!("invalid bind address '{value}': {error}"))
-}
-
-fn default_data_root() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(DEFAULT_DATA_ROOT)
-}
-
-fn absolute_path(path: &Path) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    Ok(std::env::current_dir()?.join(path))
-}
-
-fn usage() -> &'static str {
-    "Usage: margatroid-daemon [--bind HOST:PORT] [--data-root DIRECTORY]\n\nStart the Margatroid backend WebSocket server."
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn defaults_are_local_server_and_home_data_root() {
-        let config = parse_args(std::iter::empty()).unwrap();
-        assert_eq!(config.bind, DEFAULT_BIND.parse().unwrap());
-        assert!(config.data_root.ends_with(DEFAULT_DATA_ROOT));
-    }
-
-    #[test]
-    fn accepts_bind_and_data_root_options() {
-        let config = parse_args([
-            "--bind".into(),
-            "0.0.0.0:4000".into(),
-            "--data-root=/tmp/margatroid-test".into(),
-        ])
-        .unwrap();
-        assert_eq!(config.bind, "0.0.0.0:4000".parse().unwrap());
-        assert_eq!(config.data_root, PathBuf::from("/tmp/margatroid-test"));
-    }
+fn data_root() -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    Ok(PathBuf::from(home).join(DATA_ROOT_NAME))
 }

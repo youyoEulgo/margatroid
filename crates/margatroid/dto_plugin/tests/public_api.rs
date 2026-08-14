@@ -16,6 +16,7 @@ fn documented_public_api_publishes_state_for_the_configured_frontend_type() {
         .add_plugin(ServerPlugin::bind("127.0.0.1:0"))
         .add_plugin(ConfigPlugin::new(
             MargatroidConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
                 vec![WebSocketMessageTarget::Broadcast],
                 vec![WebSocketMessageTarget::Type("browser".into())],
                 vec![WebSocketMessageTarget::Broadcast],

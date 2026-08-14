@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use core_plugin::{App, Plugin, Resource};
@@ -17,6 +18,7 @@ pub enum WebSocketMessageTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MargatroidConfig {
+    server_bind: SocketAddr,
     logs: Vec<WebSocketMessageTarget>,
     backend_state: Vec<WebSocketMessageTarget>,
     member_messages: Vec<WebSocketMessageTarget>,
@@ -25,6 +27,7 @@ pub struct MargatroidConfig {
 
 impl MargatroidConfig {
     pub fn new(
+        server_bind: SocketAddr,
         logs: Vec<WebSocketMessageTarget>,
         backend_state: Vec<WebSocketMessageTarget>,
         member_messages: Vec<WebSocketMessageTarget>,
@@ -35,11 +38,16 @@ impl MargatroidConfig {
         validate_targets("member_messages", &member_messages)?;
         validate_targets("streaming_member_messages", &streaming_member_messages)?;
         Ok(Self {
+            server_bind,
             logs,
             backend_state,
             member_messages,
             streaming_member_messages,
         })
+    }
+
+    pub fn server_bind(&self) -> SocketAddr {
+        self.server_bind
     }
 
     pub fn logs(&self) -> &[WebSocketMessageTarget] {
@@ -83,6 +91,10 @@ impl ConfigPlugin {
     pub fn new(config: MargatroidConfig) -> Self {
         Self { config }
     }
+
+    pub fn config(&self) -> &MargatroidConfig {
+        &self.config
+    }
 }
 
 impl Plugin for ConfigPlugin {
@@ -99,6 +111,7 @@ pub enum ConfigError {
     ReadFailed(PathBuf),
     TooLarge,
     DecodeFailed,
+    InvalidServerBind,
     EmptyTargets(&'static str),
     InvalidTarget(&'static str),
     DuplicateTarget(&'static str),
@@ -116,6 +129,9 @@ impl fmt::Display for ConfigError {
             }
             Self::TooLarge => formatter.write_str("configuration exceeds the size limit"),
             Self::DecodeFailed => formatter.write_str("configuration could not be decoded"),
+            Self::InvalidServerBind => {
+                formatter.write_str("configuration field `server.bind` is not a socket address")
+            }
             Self::EmptyTargets(field) => {
                 write!(formatter, "configuration field `{field}` has no targets")
             }
@@ -140,15 +156,28 @@ impl std::error::Error for ConfigError {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigDocument {
+    server: ServerDocument,
     outbound: OutboundDocument,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerDocument {
+    bind: String,
 }
 
 impl TryFrom<ConfigDocument> for MargatroidConfig {
     type Error = ConfigError;
 
     fn try_from(document: ConfigDocument) -> Result<Self, Self::Error> {
+        let server_bind = document
+            .server
+            .bind
+            .parse()
+            .map_err(|_| ConfigError::InvalidServerBind)?;
         let outbound = document.outbound;
         Self::new(
+            server_bind,
             decode_targets("logs", outbound.logs)?,
             decode_targets("backend_state", outbound.backend_state)?,
             decode_targets("member_messages", outbound.member_messages)?,
@@ -235,6 +264,10 @@ mod tests {
 
         let plugin = ConfigPlugin::open(path).unwrap();
         assert_eq!(
+            plugin.config.server_bind(),
+            "127.0.0.1:3939".parse().unwrap()
+        );
+        assert_eq!(
             plugin.config.logs(),
             &[
                 WebSocketMessageTarget::Type("cli".into()),
@@ -256,8 +289,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_server_bind() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let source = include_str!("../../../../apps/daemon/config.example.toml")
+            .replace("127.0.0.1:3939", "not-an-address");
+        fs::write(&path, source).unwrap();
+
+        assert_eq!(
+            ConfigPlugin::open(path).unwrap_err(),
+            ConfigError::InvalidServerBind
+        );
+    }
+
+    #[test]
     fn rejects_empty_target_groups() {
         let error = MargatroidConfig::new(
+            "127.0.0.1:3939".parse().unwrap(),
             Vec::new(),
             vec![WebSocketMessageTarget::Broadcast],
             vec![WebSocketMessageTarget::Broadcast],
@@ -270,6 +318,7 @@ mod tests {
     #[test]
     fn config_is_installed_as_a_resource() {
         let config = MargatroidConfig::new(
+            "127.0.0.1:3939".parse().unwrap(),
             vec![WebSocketMessageTarget::Broadcast],
             vec![WebSocketMessageTarget::Broadcast],
             vec![WebSocketMessageTarget::Broadcast],
