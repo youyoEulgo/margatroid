@@ -7,7 +7,9 @@ edition = "2021"
 app_runtime_plugin = { path = "../../../mecs/app_runtime_plugin" }
 core_plugin = { path = "../../../mecs/core_plugin" }
 margatroid_types = { path = "../../types" }
+serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 tool_plugin = { path = "../../tool_plugin" }
 
 [dev-dependencies]
