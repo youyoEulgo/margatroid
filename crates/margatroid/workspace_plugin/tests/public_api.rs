@@ -42,7 +42,7 @@ fn write_image(library: &Path, model: &str) {
     fs::write(image.join("SOUL.md"), "You are a test agent.\n").unwrap();
     fs::write(
         image.join("skills/local/review/latest/SKILL.md"),
-        "Review the current project.",
+        "+++\nname = \"review\"\ndescription = \"Review the current project.\"\n+++\n\nReview the current project.\n",
     )
     .unwrap();
 }

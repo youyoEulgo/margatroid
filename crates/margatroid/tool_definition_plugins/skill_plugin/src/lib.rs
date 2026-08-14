@@ -6,6 +6,7 @@ use std::sync::Arc;
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Entity, Event, Plugin, Resource, World};
 use margatroid_types::ResourceId;
+use serde::Deserialize;
 use serde_json::json;
 use tool_plugin::{
     register_agent_tool, AgentToolEnvironment, ToolCallRequest, ToolCallResponse, ToolError,
@@ -15,6 +16,18 @@ use tool_plugin::{
 const PROVIDER_ID: &str = "skill";
 const SKILL_FILE: &str = "SKILL.md";
 const SKILL_LOADER_ID: &str = "tool:builtin/skill-loader:latest";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillMetadata {
+    name: String,
+    description: String,
+}
+
+struct SkillDocument {
+    metadata: SkillMetadata,
+    body: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillRegisterRequest {
@@ -122,10 +135,11 @@ fn skill_register_system(world: &mut World) {
                 let roots = world
                     .get_resource::<SkillRoots>()
                     .expect("SkillPlugin is installed");
-                find_skill_file(environment, &roots.home_root, &request.resource_id)?;
+                let path = find_skill_file(environment, &roots.home_root, &request.resource_id)?;
+                let document = read_skill_document(&path)?;
                 ToolTemplate::new(
                     request.resource_id.to_string(),
-                    "Load this skill resource.",
+                    document.metadata.description,
                     json!({"type":"object"}),
                 )
             });
@@ -181,12 +195,7 @@ fn skill_tool_call_system(world: &mut World) {
                         "skill arguments must be a JSON object",
                     )
                 })?;
-                fs::read_to_string(path).map_err(|_| {
-                    ToolError::new(
-                        ToolErrorKind::ResourceResolutionFailed,
-                        "skill file could not be read",
-                    )
-                })
+                read_skill_document(&path).map(|document| document.body)
             });
         world.send_event(ToolCallResponse {
             turn_id: event.turn_id,
@@ -195,6 +204,47 @@ fn skill_tool_call_system(world: &mut World) {
             result,
         });
     }
+}
+
+fn read_skill_document(path: &Path) -> Result<SkillDocument, ToolError> {
+    let source = fs::read_to_string(path).map_err(|_| {
+        ToolError::new(
+            ToolErrorKind::ResourceResolutionFailed,
+            "skill file could not be read",
+        )
+    })?;
+    let remainder = source.strip_prefix("+++\n").ok_or_else(|| {
+        ToolError::new(
+            ToolErrorKind::InvalidDefinition,
+            "skill file must begin with TOML frontmatter",
+        )
+    })?;
+    let (metadata_source, body) = remainder.split_once("\n+++\n").ok_or_else(|| {
+        ToolError::new(
+            ToolErrorKind::InvalidDefinition,
+            "skill TOML frontmatter is not terminated",
+        )
+    })?;
+    let metadata = toml::from_str::<SkillMetadata>(metadata_source).map_err(|_| {
+        ToolError::new(
+            ToolErrorKind::InvalidDefinition,
+            "skill TOML frontmatter is invalid",
+        )
+    })?;
+    if metadata.name.trim().is_empty() || metadata.description.trim().is_empty() {
+        return Err(ToolError::new(
+            ToolErrorKind::InvalidDefinition,
+            "skill name and description must not be empty",
+        ));
+    }
+    let body = body.trim().to_owned();
+    if body.is_empty() {
+        return Err(ToolError::new(
+            ToolErrorKind::InvalidDefinition,
+            "skill body must not be empty",
+        ));
+    }
+    Ok(SkillDocument { metadata, body })
 }
 
 fn find_skill_file(

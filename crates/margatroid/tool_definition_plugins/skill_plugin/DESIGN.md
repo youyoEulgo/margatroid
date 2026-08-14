@@ -33,6 +33,14 @@ SkillRoots：Skill根配置，私有Resource
     home_root: Arc<PathBuf>
 
 SkillArguments：Skill调用参数，私有结构体--当前无字段；只接受JSON对象
+
+SkillMetadata：Skill TOML元信息，私有结构体
+    name: String--非空Skill名称
+    description: String--非空ToolSpec描述
+
+SkillDocument：已解析Skill文档，私有结构体
+    metadata: SkillMetadata
+    body: String--不含frontmatter的非空Markdown正文
 ```
 
 ## 函数
@@ -44,7 +52,7 @@ skill_register_system(world: &mut World)
         验证resource_id使用type=skill及受支持tag
         从Agent Entity读取AgentToolEnvironment
         按项目、镜像、主目录顺序精确查找SKILL.md
-        读取Skill元信息并构造Provider无关ToolTemplate；不把Skill正文放入模板
+        解析顶部+++包围的TOML元信息并构造Provider无关ToolTemplate；description来自frontmatter，不把Skill正文放入模板
         调用ToolPlugin注册接口写入当前Agent的AgentToolMap
         tool_id固定为tool:builtin/skill-loader:latest，resource_id保持具体Skill ID
         成功或失败都发送SkillRegisterResponse
@@ -53,14 +61,18 @@ skill_tool_call_system(world: &mut World)
     执行Skill：私有System，读取ToolCallRequest
     行为：
         只处理tool_id=tool:builtin/skill-loader:latest
-        使用request.resource_id重新按项目、镜像、主目录查找并读取SKILL.md
+        使用request.resource_id重新按项目、镜像、主目录查找并解析SKILL.md
         解析request.arguments；当前只接受JSON对象，无参数为"{}"
-        成功时发送ToolCallResponse { turn_id, agent, tool_call_id, result: Ok(SKILL.md正文) }
+        成功时发送ToolCallResponse { turn_id, agent, tool_call_id, result: Ok(不含frontmatter的Markdown正文) }
         失败时发送同定位信息和稳定ToolError
         不自行发送AgentMessage
 
 find_skill_file(environment: &AgentToolEnvironment, home_root: &Path, resource_id: &ResourceId) -> Result<PathBuf, ToolError>
     查找Skill：项目、镜像、主目录顺序；找到目录但缺少SKILL.md时立即失败，不回退
+
+read_skill_document(path: &Path) -> Result<SkillDocument, ToolError>
+    解析Skill：严格要求文件以+++开头并以第二个+++结束TOML区域
+    行为：使用TOML解析name与description，拒绝未知字段、空字段和空正文
 ```
 
 ## 逻辑

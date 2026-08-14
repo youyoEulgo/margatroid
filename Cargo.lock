@@ -1541,8 +1541,10 @@ dependencies = [
  "async_runtime_plugin",
  "core_plugin",
  "margatroid_types",
+ "serde",
  "serde_json",
  "tempfile",
+ "toml",
  "tool_plugin",
 ]
 
