@@ -4,12 +4,20 @@
 
 私有：
 ~~~text
-Command：CLI命令，私有枚举--保存当前支持的命令参数
-    Help--打印用法并正常退出
-    WorkspaceUp {
-        workspace_file: PathBuf--要编译的Workspace文件
-        backend_url: String--后端WebSocket URL
+Cli：CLI参数根，私有结构体--使用clap::Parser派生解析顶层命令
+    command: Command
+
+Command：顶层命令，私有枚举--使用clap::Subcommand派生
+    Workspace {
+        command: WorkspaceCommand
     }
+
+WorkspaceCommand：Workspace子命令，私有枚举--使用clap::Subcommand派生
+    Up(WorkspaceUpArgs)
+
+WorkspaceUpArgs：Workspace启动参数，私有结构体--使用clap::Args派生
+    workspace_file: PathBuf--可选位置参数，默认margatroid-workspace.yaml
+    backend_url: String--后端WebSocket URL，使用--backend指定，默认ws://127.0.0.1:3939/ws
 ~~~
 
 ## 函数
@@ -17,13 +25,13 @@ Command：CLI命令，私有枚举--保存当前支持的命令参数
 公开：
 ~~~text
 main()
-    CLI入口：公开二进制入口，解析命令并将错误写入stderr后以非零状态退出
+    CLI入口：公开二进制入口，调用Cli::parse并执行命令；clap负责帮助、版本、参数错误和退出码
 ~~~
 
 私有：
 ~~~text
 run(command: Command) -> Result<(), Box<dyn Error + Send + Sync>>
-    执行命令：私有异步函数，分派WorkspaceUp
+    执行命令：私有异步函数，分派WorkspaceCommand::Up
 
 run_workspace_up(workspace_file: PathBuf, backend_url: String) -> Result<(), Box<dyn Error + Send + Sync>>
     启动Workspace：私有异步函数，编译文件、连接WebSocket、注册cli连接、发送启动请求、处理关闭信号并打印日志事件
@@ -53,22 +61,15 @@ wait_for_stop_ack(socket, request_id: &str) -> Result<(), Box<dyn Error + Send +
 wait_for_shutdown_signal() -> Result<(), std::io::Error>
     等待关闭信号：私有异步函数，Unix监听Ctrl+C和SIGTERM，其他平台监听Ctrl+C
 
-parse_args<I>(arguments: I) -> Result<Command, String>
-    解析参数：私有函数，接受workspace up、可选文件路径和--backend URL
-    行为：文件省略时使用margatroid-workspace.yaml，backend省略时使用ws://127.0.0.1:3939/ws
-
 request_id() -> String
     请求ID：私有函数，由进程ID和当前时间生成本次workspace.start的非空ID
-
-usage() -> &'static str
-    使用说明：私有函数，返回命令行用法文本
 ~~~
 
 ## 逻辑
 
 ~~~text
 main
-    -> parse_args(std::env::args().skip(1))
+    -> Cli::parse()
     -> run(command)
     -> 错误写stderr并返回非零状态
 
@@ -95,6 +96,7 @@ run_workspace_up
 
 边界：
     CLI只负责Compose编译、Workspace启动请求和日志显示
+    clap只负责命令行语法、帮助、版本、默认值和参数错误，不进入业务调用链
     CLI不启动daemon、不创建ECS、不读取AgentImage或资源正文
     CLI不读取stdin，不处理UserMessage、AssistantMessage、ToolCall或LLM流
     WebSocket传输只承载margatroid_protocol定义的请求和后端事件

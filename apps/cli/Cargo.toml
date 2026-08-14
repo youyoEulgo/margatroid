@@ -8,6 +8,7 @@ name = "margatroid"
 path = "src/main.rs"
 
 [dependencies]
+clap = { workspace = true }
 compose = { path = "../../crates/margatroid/compose" }
 futures-util = { workspace = true }
 margatroid_protocol = { path = "../../crates/margatroid/protocol" }
