@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use clap::{Args, Parser, Subcommand};
 use compose::compile;
 use futures_util::{SinkExt, StreamExt};
 use margatroid_protocol::{ClientMessage, ServerMessage};
@@ -17,41 +18,56 @@ const DEFAULT_BACKEND_URL: &str = "ws://127.0.0.1:3939/ws";
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_DIM: &str = "\x1b[2m";
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Parser, PartialEq, Eq)]
+#[command(
+    name = "margatroid",
+    version,
+    about = "Compile Margatroid workspaces and connect them to the backend"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
 enum Command {
-    Help,
-    WorkspaceUp {
-        workspace_file: PathBuf,
-        backend_url: String,
+    /// Compile, start, and manage a Workspace.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+enum WorkspaceCommand {
+    /// Compile a Workspace file and start it on the backend.
+    Up(WorkspaceUpArgs),
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+struct WorkspaceUpArgs {
+    /// Workspace definition to compile.
+    #[arg(value_name = "WORKSPACE_FILE", default_value = DEFAULT_WORKSPACE_FILE)]
+    workspace_file: PathBuf,
+    /// Backend WebSocket endpoint.
+    #[arg(long = "backend", value_name = "WS_URL", default_value = DEFAULT_BACKEND_URL)]
+    backend_url: String,
 }
 
 #[tokio::main]
 async fn main() {
-    match parse_args(std::env::args().skip(1)) {
-        Ok(Command::Help) => println!("{}", usage()),
-        Ok(command) => {
-            if let Err(error) = run(command).await {
-                print_cli_event("ERROR", &format!("command failed ({error})"));
-                process::exit(1);
-            }
-        }
-        Err(error) => {
-            print_cli_event("ERROR", &format!("argument parsing failed ({error})"));
-            eprintln!();
-            eprintln!("{}", usage());
-            process::exit(2);
-        }
+    let cli = Cli::parse();
+    if let Err(error) = run(cli.command).await {
+        print_cli_event("ERROR", &format!("command failed ({error})"));
+        process::exit(1);
     }
 }
 
 async fn run(command: Command) -> Result<(), Box<dyn Error + Send + Sync>> {
     match command {
-        Command::Help => Ok(()),
-        Command::WorkspaceUp {
-            workspace_file,
-            backend_url,
-        } => run_workspace_up(workspace_file, backend_url).await,
+        Command::Workspace {
+            command: WorkspaceCommand::Up(arguments),
+        } => run_workspace_up(arguments.workspace_file, arguments.backend_url).await,
     }
 }
 
@@ -298,75 +314,12 @@ fn format_timestamp(timestamp_millis: u64) -> String {
         .unwrap_or_else(|| timestamp_millis.to_string())
 }
 
-fn parse_args<I>(arguments: I) -> Result<Command, String>
-where
-    I: IntoIterator<Item = String>,
-{
-    let mut arguments = arguments.into_iter();
-    let Some(command) = arguments.next() else {
-        return Err("a command is required".into());
-    };
-    if command == "--help" || command == "-h" {
-        return Ok(Command::Help);
-    }
-    if command != "workspace" {
-        return Err(format!("unknown command '{command}'"));
-    }
-
-    let Some(action) = arguments.next() else {
-        return Err("workspace action is required".into());
-    };
-    if action == "--help" || action == "-h" {
-        return Ok(Command::Help);
-    }
-    if action != "up" {
-        return Err(format!("unknown workspace action '{action}'"));
-    }
-
-    let mut workspace_file = None;
-    let mut backend_url = DEFAULT_BACKEND_URL.to_owned();
-    while let Some(argument) = arguments.next() {
-        if argument == "--help" || argument == "-h" {
-            return Ok(Command::Help);
-        }
-        if argument == "--backend" {
-            backend_url = arguments
-                .next()
-                .ok_or_else(|| "--backend requires a WebSocket URL".to_owned())?;
-            continue;
-        }
-        if let Some(value) = argument.strip_prefix("--backend=") {
-            if value.is_empty() {
-                return Err("--backend requires a WebSocket URL".into());
-            }
-            backend_url = value.to_owned();
-            continue;
-        }
-        if argument.starts_with('-') {
-            return Err(format!("unknown option '{argument}'"));
-        }
-        if workspace_file.is_some() {
-            return Err("workspace file was provided more than once".into());
-        }
-        workspace_file = Some(PathBuf::from(argument));
-    }
-
-    Ok(Command::WorkspaceUp {
-        workspace_file: workspace_file.unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_FILE)),
-        backend_url,
-    })
-}
-
 fn request_id() -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     format!("cli-{}-{timestamp}", process::id())
-}
-
-fn usage() -> &'static str {
-    "Usage: margatroid workspace up [WORKSPACE_FILE] [--backend WS_URL]\n\nCompile a workspace file, send it to the backend, and print backend WebSocket messages."
 }
 
 #[cfg(test)]
@@ -376,10 +329,14 @@ mod tests {
     #[test]
     fn defaults_to_workspace_file_and_local_backend() {
         assert_eq!(
-            parse_args(["workspace".into(), "up".into()]).unwrap(),
-            Command::WorkspaceUp {
-                workspace_file: PathBuf::from(DEFAULT_WORKSPACE_FILE),
-                backend_url: DEFAULT_BACKEND_URL.into(),
+            Cli::try_parse_from(["margatroid", "workspace", "up"])
+                .unwrap()
+                .command,
+            Command::Workspace {
+                command: WorkspaceCommand::Up(WorkspaceUpArgs {
+                    workspace_file: PathBuf::from(DEFAULT_WORKSPACE_FILE),
+                    backend_url: DEFAULT_BACKEND_URL.into(),
+                }),
             }
         );
     }
@@ -387,17 +344,21 @@ mod tests {
     #[test]
     fn accepts_file_and_backend_options() {
         assert_eq!(
-            parse_args([
-                "workspace".into(),
-                "up".into(),
-                "project/workspace.yaml".into(),
-                "--backend".into(),
-                "ws://localhost:4000/events".into(),
+            Cli::try_parse_from([
+                "margatroid",
+                "workspace",
+                "up",
+                "project/workspace.yaml",
+                "--backend",
+                "ws://localhost:4000/events",
             ])
-            .unwrap(),
-            Command::WorkspaceUp {
-                workspace_file: PathBuf::from("project/workspace.yaml"),
-                backend_url: "ws://localhost:4000/events".into(),
+            .unwrap()
+            .command,
+            Command::Workspace {
+                command: WorkspaceCommand::Up(WorkspaceUpArgs {
+                    workspace_file: PathBuf::from("project/workspace.yaml"),
+                    backend_url: "ws://localhost:4000/events".into(),
+                }),
             }
         );
     }

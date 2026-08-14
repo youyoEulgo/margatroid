@@ -1,6 +1,7 @@
 # Margatroid CLI
 
 当前 CLI 只实现 Workspace 启动请求和后端日志显示，不实现 LLM 消息输入或输出。
+命令行参数由 `clap` 解析，可在任意命令层级使用 `--help` 查看对应说明。
 
 ~~~text
 margatroid workspace up [WORKSPACE_FILE] [--backend WS_URL]
