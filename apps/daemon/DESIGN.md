@@ -15,7 +15,7 @@ run() -> Result<(), Error>
         加载并验证config.toml中的server.bind和全部出站配置
         使用server.bind构造ServerPlugin
         将全局只读WebSocket目标配置交给DtoPlugin和InferencePlugin
-        打开AgentImage、Workspace、Skill、Workflow和Lua Plugin所需目录
+        打开AgentImage、Workspace和BuiltinToolPlugin所需目录
         安装运行时、日志、Server和全部领域Plugin
         安装DtoPlugin和ConnectionPlugin
         记录启动信息并调用AppRunExt::run
@@ -31,7 +31,7 @@ main
     -> run
         -> 打开~/.margatroid/config.toml
         -> 使用server.bind安装ServerPlugin
-        -> 按依赖顺序安装ToolPlugin和LuaPlugin等全部Plugin
+        -> 按依赖顺序安装ToolPlugin和BuiltinToolPlugin等全部Plugin
         -> AppRunExt::run
 
 边界：

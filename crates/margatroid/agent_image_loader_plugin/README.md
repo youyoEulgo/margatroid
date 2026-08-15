@@ -64,7 +64,7 @@ app.add_plugin(RuntimePlugin::default())
 ```
 
 官方 daemon 组合负责确定主目录并传入绝对路径。Loader 不根据当前工作目录猜测位置，也不要求
-InferencePlugin、WorkspacePlugin、SkillPlugin 或 WorkflowPlugin 已经安装。这里的
+InferencePlugin、WorkspacePlugin或BuiltinToolPlugin已经安装。这里的
 `agent_image_loader` 是已经配置好、等待安装到 App 的 `AgentImageLoaderPlugin` 实例。
 
 ## 加载镜像
@@ -155,8 +155,8 @@ visible -= workspace disabled
 AgentImage 后续刷新不会改变运行中实例；执行 `workspace reload` 后创建的新实例才使用新默认值。
 
 资源内容不进入可见性数据。WorkspacePlugin同时挂载`AgentToolEnvironment`；每次请求由
-AgentPlugin遍历动态可见资源并逐个交给ToolPlugin生成工具，SkillPlugin等Provider执行时从
-具体资源Plugin从`AgentToolEnvironment`取得项目根和镜像根。
+WorkspacePlugin遍历动态可见资源并逐个交给BuiltinToolPlugin注册工具；具体隐藏执行器从
+`AgentToolEnvironment`取得项目根和镜像根。
 
 ```text
 项目级 .margatroid/skills/<scope>/<name>

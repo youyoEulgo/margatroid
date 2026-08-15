@@ -251,6 +251,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "builtin_tool_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "core_plugin",
+ "lua_plugin",
+ "margatroid_types",
+ "shell_plugin",
+ "skill_plugin",
+ "tempfile",
+ "tool_plugin",
+ "workflow_plugin",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1150,19 +1166,17 @@ dependencies = [
  "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "builtin_tool_plugin",
  "config_plugin",
  "connection_plugin",
  "core_plugin",
  "dto_plugin",
  "inference_plugin",
  "log_plugin",
- "lua_plugin",
  "memory_plugin",
  "server_plugin",
- "skill_plugin",
  "tool_plugin",
  "tracing",
- "workflow_plugin",
  "workspace_plugin",
 ]
 
@@ -1967,6 +1981,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "shell_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "core_plugin",
+ "jsonschema",
+ "margatroid_types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tool_plugin",
+ "tracing",
 ]
 
 [[package]]
@@ -2896,16 +2928,14 @@ dependencies = [
  "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "builtin_tool_plugin",
  "core_plugin",
  "inference_plugin",
- "lua_plugin",
  "margatroid_types",
  "memory_plugin",
- "skill_plugin",
  "tempfile",
  "tool_plugin",
  "tracing",
- "workflow_plugin",
 ]
 
 [[package]]

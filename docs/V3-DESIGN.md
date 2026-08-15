@@ -57,13 +57,13 @@ Margatroid Plugin按资源所有权和运行职责组合：
 ```text
 mecs基础设施
 -> AgentImageLoaderPlugin / ModelRouteLoaderPlugin
--> ToolPlugin / tool_definition_plugins/{SkillPlugin, WorkflowPlugin} / InferencePlugin / AgentPlugin / MemoryPlugin
+-> ToolPlugin / BuiltinToolPlugin / InferencePlugin / AgentPlugin / MemoryPlugin
 -> WorkspacePlugin
 ```
 
-AgentImage和模型路由拥有独立生命周期，因此由Loader读取并形成运行时对象。Skill和Workflow只在
-工具调用中使用，不建立额外Loader事件层：各自Plugin定义Tool并拥有格式解析和执行语义，ToolPlugin
-注入实例位置并调用它们。共享资源名称仍来自无业务行为的纯类型crate。
+AgentImage和模型路由拥有独立生命周期，因此由Loader读取并形成运行时对象。BuiltinToolPlugin
+组合Skill、Workflow、Lua和Shell内建执行器，将Workspace提交的可见资源注册到ToolMap。
+ToolPlugin注入实例位置并路由调用；共享资源名称仍来自无业务行为的纯类型crate。
 
 ## 3. mecs
 
@@ -185,7 +185,8 @@ AgentInstance持有两层统一资源可见性：`AgentDefaultVisibility`是Work
 默认值和Workspace参数合并出的只读`ResourceId`集合；`AgentDynamicVisibility`初始复制基线，
 表示普通Tool、Skill、Workflow和未来资源的当前实际可用集合，后续可由Agent或Workflow逻辑调整。
 
-Workspace启动时，具体工具Plugin验证每个可见ResourceId并注册到Agent Entity上的`AgentToolMap`；
+Workspace启动时把每个可见ResourceId统一交给BuiltinToolPlugin验证并注册到Agent Entity上的
+`AgentToolMap`；
 每个Agent独立分配`tool0_query`、`skill1_review`等模型工具名。每次LLM请求前，AgentPlugin遍历
 动态可见性，从当前AgentToolMap取得内部ToolSpec。ToolPlugin不读取Agent可见性组件。
 
@@ -198,7 +199,17 @@ Workspace启动时，具体工具Plugin验证每个可见ResourceId并注册到A
 每个Tool响应由ToolPlugin移除对应请求并整理为AgentMessage；同轮Pending为空时才发送
 `ToolTurnCompleted`，AgentPlugin随后发出下一次`InferenceRequestEvent`。
 
-SkillPlugin为每个Agent的可见Skill注册一个独立ToolMap，并在执行时按作用域动态解析内容：
+BuiltinToolPlugin按资源类型选择隐藏执行器：
+
+```text
+skill:*    -> tool:builtin/skill-loader:latest
+workflow:* -> tool:builtin/workflow-loader:latest
+tool:*     -> tool:builtin/lua-runtime:latest
+shell:*    -> tool:builtin/shell:latest
+```
+
+LLM只看到左侧资源生成的ToolSpec；`tool:builtin/*`不进入可见性，也不能注册成模型工具。
+Skill执行器为每个Agent的可见Skill注册一个独立ToolMap，并在执行时按作用域动态解析内容：
 
 ```text
 项目级 .margatroid > AgentImage内置 > 主目录 ~/.margatroid
@@ -224,7 +235,7 @@ agents:
         name: local/dangerous-command
 ```
 
-WorkflowPlugin同样为每个Agent注册可见Workflow。Workflow依赖Skill时将对应Skill
+Workflow执行器同样为每个Agent注册可见Workflow。Workflow依赖Skill时将对应Skill
 `ResourceId`加入动态可见性，通过同一AgentToolMap和ToolCall链路调用，不建立旁路加载协议。
 
 ## 7. Memory

@@ -6,14 +6,13 @@ use agent_image_loader_plugin::AgentImageLoaderPlugin;
 use agent_plugin::{AgentContext, AgentIdentity, AgentPlugin, AgentWorkspaceId};
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
+use builtin_tool_plugin::BuiltinToolPlugin;
 use core_plugin::App;
 use inference_plugin::{AgentInferenceSnapshot, InferencePlugin, WorkspaceModelRoutes};
-use lua_plugin::LuaPlugin;
 use margatroid_types::{
     ResourceId, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
 };
 use memory_plugin::{AgentMemory, MemoryPlugin};
-use skill_plugin::SkillPlugin;
 use tempfile::tempdir;
 use tool_plugin::{AgentToolEnvironment, ToolPlugin};
 use workspace_plugin::{
@@ -106,8 +105,7 @@ fn app(library: &Path, routes: &Path) -> App {
         .add_plugin(AgentImageLoaderPlugin::open(library).unwrap())
         .add_plugin(InferencePlugin::default().with_config_path(routes))
         .add_plugin(ToolPlugin::default())
-        .add_plugin(LuaPlugin::open(library.join("home-tools")).unwrap())
-        .add_plugin(SkillPlugin::open(library.join("home-skills")).unwrap())
+        .add_plugin(BuiltinToolPlugin::open(library).unwrap())
         .add_plugin(MemoryPlugin::default())
         .add_plugin(AgentPlugin::default())
         .add_plugin(WorkspacePlugin::open(library).unwrap());

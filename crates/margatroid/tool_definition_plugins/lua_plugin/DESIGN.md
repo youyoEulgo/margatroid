@@ -257,9 +257,9 @@ install_lua_environment(lua: &Lua, handle: &LuaExecutionHandle) -> Result<(), To
         -> LuaPlugin::open(<data_root>/tools)
 
 Workspace启动：
-    WorkspacePlugin
-        -> 遍历AgentDynamicVisibility
-        -> type=tool发送LuaToolRegisterRequest
+    BuiltinToolPlugin
+        -> 接收Workspace提交的tool资源
+        -> 发送LuaToolRegisterRequest
     LuaPlugin
         -> 读取静态定义
         -> register_agent_tool(
@@ -294,7 +294,7 @@ Workspace启动：
 
 ```text
 LuaPlugin依赖AgentPlugin的AgentIdentity、ToolPlugin和AsyncRuntimePlugin；不依赖WorkspacePlugin，避免与注册协调形成循环依赖。
-LuaPlugin不读取Agent可见性；WorkspacePlugin只把已经确定的具体resource_id交给它注册。
+LuaPlugin不读取Agent可见性；BuiltinToolPlugin只把已经确定的具体resource_id交给它注册。
 LuaPlugin不持有AgentToolMap、PendingToolCalls或AgentStatus，不构造AgentMessage，不判断一轮工具是否完成。
 LuaExecutionHandle及全部子句柄不持有World、Entity查询器、Component引用或Resource引用。
 Agent Entity只用于内部ToolCallResponse定位；Lua可见上下文使用AgentIdentity中的ResourceId。
