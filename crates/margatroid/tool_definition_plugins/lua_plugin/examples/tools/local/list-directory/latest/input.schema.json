@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "description": "Arguments accepted by the list-directory tool.",
+  "properties": {
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "default": ".",
+      "description": "Absolute path or project-root-relative path of the directory to list. Omit this field to list the project root."
+    }
+  },
+  "additionalProperties": false
+}

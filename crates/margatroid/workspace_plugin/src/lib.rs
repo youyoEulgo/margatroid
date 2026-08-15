@@ -14,6 +14,7 @@ use agent_plugin::{
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::{AgentInferenceSnapshot, GlobalModelRoutes, WorldInferenceExt};
+use lua_plugin::{LuaToolRegisterRequest, LuaToolRegisterResponse};
 use margatroid_types::{
     AgentMessage, AgentSkillRouteAction, Message, ResourceId, RouteAgentMessage, RouteAgentSkill,
     WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
@@ -982,11 +983,21 @@ fn collect_tool_registration_system(world: &mut World) {
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
+    let lua_results = world
+        .event_reader::<LuaToolRegisterResponse>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
     let results = skill_results
         .into_iter()
         .map(|result| (result.id, result.agent, result.resource_id, result.result))
         .chain(
             workflow_results
+                .into_iter()
+                .map(|result| (result.id, result.agent, result.resource_id, result.result)),
+        )
+        .chain(
+            lua_results
                 .into_iter()
                 .map(|result| (result.id, result.agent, result.resource_id, result.result)),
         )
@@ -1123,6 +1134,11 @@ fn attach_prepared_agent(
                 resource_id: resource.clone(),
             }),
             "workflow" => world.send_event(WorkflowRegisterRequest {
+                id: registration_id.clone(),
+                agent,
+                resource_id: resource.clone(),
+            }),
+            "tool" => world.send_event(LuaToolRegisterRequest {
                 id: registration_id.clone(),
                 agent,
                 resource_id: resource.clone(),

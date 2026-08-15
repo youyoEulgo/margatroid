@@ -18,6 +18,7 @@ config_plugin = { path = "../../crates/margatroid/config_plugin" }
 dto_plugin = { path = "../../crates/margatroid/dto_plugin" }
 inference_plugin = { path = "../../crates/margatroid/inference_plugin" }
 log_plugin = { path = "../../crates/mecs/log_plugin" }
+lua_plugin = { path = "../../crates/margatroid/tool_definition_plugins/lua_plugin" }
 memory_plugin = { path = "../../crates/margatroid/memory_plugin" }
 server_plugin = { path = "../../crates/mecs/server_plugin" }
 skill_plugin = { path = "../../crates/margatroid/tool_definition_plugins/skill_plugin" }

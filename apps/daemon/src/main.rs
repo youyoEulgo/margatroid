@@ -13,6 +13,7 @@ use core_plugin::App;
 use dto_plugin::DtoPlugin;
 use inference_plugin::InferencePlugin;
 use log_plugin::LogPlugin;
+use lua_plugin::LuaPlugin;
 use memory_plugin::MemoryPlugin;
 use server_plugin::{ServerOptions, ServerPlugin};
 use skill_plugin::SkillPlugin;
@@ -52,6 +53,8 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .map_err(|error| format!("cannot open skill root: {error}"))?;
     let workflows = WorkflowPlugin::open(data_root.join("workflows"))
         .map_err(|error| format!("cannot open workflow root: {error}"))?;
+    let lua_tools = LuaPlugin::open(data_root.join("tools"))
+        .map_err(|error| format!("cannot open Lua tool root: {error}"))?;
     let global_config = ConfigPlugin::open(&config_path)
         .map_err(|error| format!("cannot open global configuration: {error}"))?;
     let bind = global_config.config().server_bind();
@@ -65,6 +68,7 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(agent_images)
         .add_plugin(InferencePlugin::default().with_config_path(models_path.clone()))
         .add_plugin(ToolPlugin::default())
+        .add_plugin(lua_tools)
         .add_plugin(skills)
         .add_plugin(workflows)
         .add_plugin(MemoryPlugin::default())

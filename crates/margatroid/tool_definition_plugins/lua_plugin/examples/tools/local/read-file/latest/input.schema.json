@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "description": "Arguments accepted by the read-file tool.",
+  "properties": {
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Absolute path or project-root-relative path of the UTF-8 text file to read."
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "additionalProperties": false
+}

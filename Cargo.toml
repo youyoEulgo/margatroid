@@ -19,13 +19,12 @@ members = [
     "crates/margatroid/inference_plugin",
     "crates/margatroid/tool_plugin",
     "crates/margatroid/tool_definition_plugins/skill_plugin",
+    "crates/margatroid/tool_definition_plugins/lua_plugin",
     "crates/margatroid/tool_definition_plugins/workflow_plugin",
     "crates/margatroid/memory_plugin",
     "crates/margatroid/agent_plugin",
     "crates/margatroid/workspace_plugin",
 ]
-
-exclude = ["legacy/*"]
 
 resolver = "3"
 [workspace.dependencies]
@@ -42,6 +41,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
+jsonschema = "0.33"
+mlua = { version = "0.11", features = ["lua54", "vendored", "async", "serialize", "send"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 rusqlite = "0.31"
 time = { version = "0.3", features = ["formatting"] }

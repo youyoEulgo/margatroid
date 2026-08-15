@@ -10,6 +10,7 @@ app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
 inference_plugin = { path = "../inference_plugin" }
 margatroid_types = { path = "../types" }
+lua_plugin = { path = "../tool_definition_plugins/lua_plugin" }
 memory_plugin = { path = "../memory_plugin" }
 skill_plugin = { path = "../tool_definition_plugins/skill_plugin" }
 tool_plugin = { path = "../tool_plugin" }
