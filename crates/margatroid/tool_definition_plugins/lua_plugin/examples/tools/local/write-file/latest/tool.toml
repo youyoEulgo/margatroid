@@ -1,0 +1,10 @@
+# Lua Tool metadata schema version. Margatroid currently accepts version 1.
+schema_version = 1
+
+# This name must exactly match the name segment in
+# tool:local/write-file:latest.
+name = "write-file"
+
+# The tool intentionally describes replacement behavior explicitly because a
+# successful call overwrites an existing file.
+description = "Write UTF-8 text to an absolute path or a path relative to the current project root, replacing the file if it exists. Optionally create missing parent directories. Use this when a complete file replacement is appropriate."

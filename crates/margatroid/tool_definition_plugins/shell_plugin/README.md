@@ -13,4 +13,4 @@ shells/<scope>/<name>/<tag>/
 ```
 
 资源脚本接收模型提供的`command`作为第一个参数，工作目录为Agent项目根目录。完整接口见
-`DESIGN.md`。
+`DESIGN.md`。`examples/shells/local/sh/latest/`提供基础的POSIX Shell资源示例。
