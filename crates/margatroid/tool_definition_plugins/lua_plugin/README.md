@@ -18,10 +18,12 @@ tools/<scope>/<name>/<tag>/
 ```text
 examples/tools/local/
 ├── list-directory/latest/
-└── read-file/latest/
+├── read-file/latest/
+└── write-file/latest/
 ```
 
-两个示例都把相对路径解析到`context.project_root`，同时保留绝对路径和父目录访问能力；它们既是
+三个示例都把相对路径解析到`context.project_root`，同时保留绝对路径和父目录访问能力；它们既是
 基础文件工具，也是编写Tool元信息、JSON Schema、跨平台路径处理和异步宿主调用的参考实现。
+`write-file`会完整覆盖目标文件，可按参数要求创建父目录。
 
 完整职责、接口和边界见`DESIGN.md`。

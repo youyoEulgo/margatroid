@@ -148,3 +148,96 @@ end
         std::thread::yield_now();
     }
 }
+
+#[test]
+fn tracked_write_file_example_creates_parent_directories_and_writes_content() {
+    let project = tempdir().unwrap();
+    let image = tempdir().unwrap();
+    let examples = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/tools");
+
+    let mut app = App::new();
+    app.add_plugin(RuntimePlugin::default())
+        .add_plugin(AsyncRuntimePlugin)
+        .add_plugin(ToolPlugin::default())
+        .add_plugin(AgentPlugin::default())
+        .add_plugin(LuaPlugin::open(examples).unwrap());
+    let workspace = app.world_mut().spawn();
+    app.world().send_event(AgentCreateRequest {
+        id: "create-write-agent".into(),
+        agent_id: ResourceId::parse("agent:demo/writer:latest").unwrap(),
+        workspace_id: workspace,
+        system_prompt: "test".into(),
+        messages: Vec::new(),
+        tool_context: Vec::new(),
+        default_visibility: BTreeSet::new(),
+    });
+    app.tick();
+    app.tick();
+    let agent = app
+        .world()
+        .event_reader::<AgentCreated>()
+        .into_iter()
+        .find(|event| event.id == "create-write-agent")
+        .unwrap()
+        .agent;
+    app.world_mut().insert_component(
+        agent,
+        AgentToolEnvironment::new(project.path(), image.path()),
+    );
+    attach_agent_tool_map(app.world_mut(), agent).unwrap();
+
+    let resource_id = ResourceId::parse("tool:local/write-file:latest").unwrap();
+    app.world().send_event(LuaToolRegisterRequest {
+        id: "register-write-file".into(),
+        agent,
+        resource_id: resource_id.clone(),
+    });
+    app.tick();
+    app.tick();
+    let registration = app
+        .world()
+        .event_reader::<LuaToolRegisterResponse>()
+        .into_iter()
+        .find(|event| event.id == "register-write-file")
+        .unwrap();
+    assert!(registration.result.is_ok());
+
+    app.world().send_event(ToolCallRequest {
+        turn_id: "write-turn".into(),
+        agent,
+        tool_id: ResourceId::parse("tool:builtin/lua-runtime:latest").unwrap(),
+        resource_id,
+        tool_call_id: "write-call".into(),
+        arguments: serde_json::json!({
+            "path": "nested/result.txt",
+            "content": "complete contents",
+            "create_parent_directories": true
+        })
+        .to_string(),
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.tick();
+        if let Some(response) = app
+            .world()
+            .event_reader::<ToolCallResponse>()
+            .into_iter()
+            .find(|response| response.tool_call_id == "write-call")
+        {
+            let result = serde_json::from_str::<serde_json::Value>(
+                response.result.as_ref().expect("write-file must succeed"),
+            )
+            .unwrap();
+            assert_eq!(result["bytes"], 17);
+            assert_eq!(result["replaced"], true);
+            assert_eq!(
+                fs::read_to_string(project.path().join("nested/result.txt")).unwrap(),
+                "complete contents"
+            );
+            return;
+        }
+        assert!(Instant::now() < deadline, "write-file response timed out");
+        std::thread::yield_now();
+    }
+}
