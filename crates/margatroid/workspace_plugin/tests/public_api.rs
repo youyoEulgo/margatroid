@@ -8,6 +8,7 @@ use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::App;
 use inference_plugin::{AgentInferenceSnapshot, InferencePlugin, WorkspaceModelRoutes};
+use lua_plugin::LuaPlugin;
 use margatroid_types::{
     ResourceId, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
 };
@@ -61,6 +62,26 @@ api_type = "openai"
     .unwrap();
 }
 
+fn write_lua_tool(project: &Path) {
+    let package = project.join(".margatroid/tools/local/echo/latest");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(
+        package.join("tool.toml"),
+        "schema_version = 1\nname = \"echo\"\ndescription = \"Echo input.\"\n",
+    )
+    .unwrap();
+    fs::write(
+        package.join("input.schema.json"),
+        r#"{"type":"object","additionalProperties":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        package.join("main.lua"),
+        "function execute(arguments, context) return arguments.value end\n",
+    )
+    .unwrap();
+}
+
 fn definition(project_root: &Path) -> WorkspaceDefinition {
     WorkspaceDefinition {
         id: ResourceId::parse("workspace:local/demo").unwrap(),
@@ -85,6 +106,7 @@ fn app(library: &Path, routes: &Path) -> App {
         .add_plugin(AgentImageLoaderPlugin::open(library).unwrap())
         .add_plugin(InferencePlugin::default().with_config_path(routes))
         .add_plugin(ToolPlugin::default())
+        .add_plugin(LuaPlugin::open(library.join("home-tools")).unwrap())
         .add_plugin(SkillPlugin::open(library.join("home-skills")).unwrap())
         .add_plugin(MemoryPlugin::default())
         .add_plugin(AgentPlugin::default())
@@ -309,5 +331,25 @@ fn missing_visible_skill_fails_workspace_start() {
     assert!(error.message().contains("skill file was not found"));
     assert!(app.world().workspaces().is_empty());
     assert_eq!(app.world().entity_count(), 1);
+    let _ = fs::remove_dir_all(library);
+}
+
+#[test]
+fn visible_lua_tool_is_registered_before_workspace_is_ready() {
+    let library = unique_directory("lua-tool-library");
+    let project = tempdir().unwrap();
+    let routes = project.path().join("models.toml");
+    fs::create_dir_all(&library).unwrap();
+    write_image(&library, "test-model");
+    write_routes(&routes);
+    write_lua_tool(project.path());
+
+    let mut definition = definition(project.path());
+    definition.agents[0].resources = vec![ResourceId::parse("tool:local/echo:latest").unwrap()];
+    let mut app = app(&library, &routes);
+    app.world().start_workspace("start-lua-tool", definition);
+    let workspace = wait_start(&mut app, "start-lua-tool").unwrap();
+
+    assert!(app.world().workspace_manager(workspace).is_some());
     let _ = fs::remove_dir_all(library);
 }

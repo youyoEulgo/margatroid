@@ -362,13 +362,14 @@ register_agent_visibility(world: &mut World, request_id: &str, agent: Entity) ->
     行为：
         读取AgentDynamicVisibility；缺失时返回ResourceSetupFailed
         按ResourceId顺序为每项生成注册子请求ID
-        type=skill发送SkillRegisterRequest；type=workflow发送WorkflowRegisterRequest；type=tool发送对应静态工具注册请求
+        type=skill发送SkillRegisterRequest；type=workflow发送WorkflowRegisterRequest；type=tool发送LuaToolRegisterRequest
         未知资源类型立即返回ResourceSetupFailed
         把子请求写入tool_registration_requests并增加pending_tool_registrations
 
 collect_tool_registration_system(world: &mut World)
     收集工具注册：私有System，读取各具体工具Plugin的注册响应
     行为：
+        读取SkillRegisterResponse、WorkflowRegisterResponse和LuaToolRegisterResponse
         使用响应ID从tool_registration_requests定位Workspace请求、Agent和资源
         失败时转换为ResourceSetupFailed并调用fail_pending_workspace
         成功时递减pending_tool_registrations
@@ -455,6 +456,9 @@ cleanup_orphan_agent(world: &mut World, agent: Entity)
     AgentImageLoaderPlugin
         -> InferencePlugin
         -> ToolPlugin
+        -> SkillPlugin
+        -> WorkflowPlugin
+        -> LuaPlugin
         -> MemoryPlugin
         -> AgentPlugin
         -> WorkspacePlugin::open(agent_images_root)
@@ -478,7 +482,7 @@ cleanup_orphan_agent(world: &mut World, agent: Entity)
     WorkspacePlugin自身
         -> Workspace归属、逻辑名称和Agent Entity索引
         -> 合并后把default_visibility交给AgentCreateRequest，由AgentPlugin构造两个可见性组件
-    Skill和Workflow在启动完成前按Agent注册一次
+    Skill、Workflow和Lua Tool在启动完成前按Agent注册一次
         -> 具体Plugin验证资源并构造Agent专属ToolTemplate
         -> ToolPlugin写入AgentToolMap并分配tool_name
         -> 工具正文和运行时内容不缓存；每次调用时由对应Plugin重新读取

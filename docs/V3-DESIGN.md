@@ -36,8 +36,6 @@ crates/margatroid/
 ├── compose             Workspace 文件编译器
 ├── *_plugin            业务能力
 └── defaults            官方默认 Plugin 组合
-
-legacy/                 只读历史参考，不参与 workspace
 ```
 
 依赖方向：
