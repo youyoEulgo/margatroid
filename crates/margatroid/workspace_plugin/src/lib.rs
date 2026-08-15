@@ -12,17 +12,15 @@ use agent_plugin::{
     AgentWorkspaceId, WorldAgentExt,
 };
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
+use builtin_tool_plugin::{BuiltinResourceRegisterRequest, BuiltinResourceRegisterResponse};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::{AgentInferenceSnapshot, GlobalModelRoutes, WorldInferenceExt};
-use lua_plugin::{LuaToolRegisterRequest, LuaToolRegisterResponse};
 use margatroid_types::{
     AgentMessage, AgentSkillRouteAction, Message, ResourceId, RouteAgentMessage, RouteAgentSkill,
     WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
 };
 use memory_plugin::{AgentMemory, MemoryPluginInstalled, RealtimeContext, WorldMemoryExt};
-use skill_plugin::{SkillRegisterRequest, SkillRegisterResponse};
 use tool_plugin::{attach_agent_tool_map, AgentToolEnvironment, ToolPluginInstalled};
-use workflow_plugin::{WorkflowRegisterRequest, WorkflowRegisterResponse};
 
 pub use margatroid_types::StartWorkspace;
 
@@ -973,37 +971,19 @@ fn collect_agent_created_system(world: &mut World) {
 }
 
 fn collect_tool_registration_system(world: &mut World) {
-    let skill_results = world
-        .event_reader::<SkillRegisterResponse>()
+    let results = world
+        .event_reader::<BuiltinResourceRegisterResponse>()
         .into_iter()
         .cloned()
-        .collect::<Vec<_>>();
-    let workflow_results = world
-        .event_reader::<WorkflowRegisterResponse>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    let lua_results = world
-        .event_reader::<LuaToolRegisterResponse>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    let results = skill_results
-        .into_iter()
-        .map(|result| (result.id, result.agent, result.resource_id, result.result))
-        .chain(
-            workflow_results
-                .into_iter()
-                .map(|result| (result.id, result.agent, result.resource_id, result.result)),
-        )
-        .chain(
-            lua_results
-                .into_iter()
-                .map(|result| (result.id, result.agent, result.resource_id, result.result)),
-        )
         .collect::<Vec<_>>();
     let mut complete = Vec::new();
-    for (id, agent, resource_id, result) in results {
+    for response in results {
+        let BuiltinResourceRegisterResponse {
+            id,
+            agent,
+            resource_id,
+            result,
+        } = response;
         let route = world
             .get_resource_mut::<WorkspaceRegistry>()
             .expect("WorkspacePlugin is not installed")
@@ -1127,29 +1107,11 @@ fn attach_prepared_agent(
     let mut registration_ids = Vec::new();
     for (index, resource) in resources.into_iter().enumerate() {
         let registration_id = format!("{request_id}/tool/{name}/{index}");
-        match resource.resource_type() {
-            "skill" => world.send_event(SkillRegisterRequest {
-                id: registration_id.clone(),
-                agent,
-                resource_id: resource.clone(),
-            }),
-            "workflow" => world.send_event(WorkflowRegisterRequest {
-                id: registration_id.clone(),
-                agent,
-                resource_id: resource.clone(),
-            }),
-            "tool" => world.send_event(LuaToolRegisterRequest {
-                id: registration_id.clone(),
-                agent,
-                resource_id: resource.clone(),
-            }),
-            _ => {
-                return Err(WorkspaceError::new(
-                    WorkspaceErrorKind::ResourceSetupFailed,
-                    "visible resource type has no registration plugin",
-                ))
-            }
-        }
+        world.send_event(BuiltinResourceRegisterRequest {
+            id: registration_id.clone(),
+            agent,
+            resource_id: resource.clone(),
+        });
         registration_ids.push((registration_id, resource));
     }
     world

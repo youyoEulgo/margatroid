@@ -79,7 +79,7 @@ read_skill_document(path: &Path) -> Result<SkillDocument, ToolError>
 
 ```text
 Workspace启动：
-    WorkspacePlugin -> SkillRegisterRequest
+    BuiltinToolPlugin -> SkillRegisterRequest
     SkillPlugin -> 验证并读取元信息
                 -> register_agent_tool(agent, skill-loader, resource_id, template)
                 -> SkillRegisterResponse

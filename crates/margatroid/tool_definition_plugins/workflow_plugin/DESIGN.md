@@ -42,7 +42,7 @@ workflow_tool_call_system(world: &mut World)
 ## 边界
 
 ```text
-WorkflowPlugin只负责Workflow资源验证、Agent专属模板注册和ToolCallResponse。
+WorkflowPlugin只负责Workflow资源验证、Agent专属模板注册和ToolCallResponse；注册请求由BuiltinToolPlugin路由。
 ToolPlugin拥有AgentToolMap、PendingToolCalls、响应整理及批次完成判断。
 WorkflowPlugin不读取Agent可见性，不保存全局具体Workflow映射，不为静态Agent tag创建目录。
 ```

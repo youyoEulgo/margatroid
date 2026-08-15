@@ -346,7 +346,7 @@ collect_agent_created_system(world: &mut World)
         插入PreparedWorkspaceAgent.inference_snapshot
         插入PreparedWorkspaceAgent.tool_environment
         调用ToolPlugin接口为Agent挂载空AgentToolMap
-        调用register_agent_visibility为全部AgentDynamicVisibility资源发送对应注册请求
+        为全部AgentDynamicVisibility资源发送BuiltinResourceRegisterRequest
         成功时保存pending.agents[Agent名称] = Agent Entity
         任一步失败时despawn当前Agent并调用fail_pending_workspace
         全部Agent完成且全部工具注册响应成功时使用pending.agents构造WorkspaceAgents并确定manager
@@ -356,20 +356,15 @@ collect_agent_created_system(world: &mut World)
 
 attach_prepared_agent(world: &mut World, request_id: &str, name: &str, agent: Entity) -> Result<(), WorkspaceError>
     绑定实例材料：私有函数，验证Agent归属，绑定Memory、Inference、AgentToolEnvironment和空AgentToolMap，并开始注册动态可见资源
-
-register_agent_visibility(world: &mut World, request_id: &str, agent: Entity) -> Result<(), WorkspaceError>
-    注册Agent可见资源：私有函数，按资源类型发送对应工具注册事件
     行为：
         读取AgentDynamicVisibility；缺失时返回ResourceSetupFailed
         按ResourceId顺序为每项生成注册子请求ID
-        type=skill发送SkillRegisterRequest；type=workflow发送WorkflowRegisterRequest；type=tool发送LuaToolRegisterRequest
-        未知资源类型立即返回ResourceSetupFailed
+        不判断资源类型，统一发送BuiltinResourceRegisterRequest { id, agent, resource_id }
         把子请求写入tool_registration_requests并增加pending_tool_registrations
 
 collect_tool_registration_system(world: &mut World)
-    收集工具注册：私有System，读取各具体工具Plugin的注册响应
+    收集工具注册：私有System，只读取BuiltinResourceRegisterResponse
     行为：
-        读取SkillRegisterResponse、WorkflowRegisterResponse和LuaToolRegisterResponse
         使用响应ID从tool_registration_requests定位Workspace请求、Agent和资源
         失败时转换为ResourceSetupFailed并调用fail_pending_workspace
         成功时递减pending_tool_registrations
@@ -456,14 +451,12 @@ cleanup_orphan_agent(world: &mut World, agent: Entity)
     AgentImageLoaderPlugin
         -> InferencePlugin
         -> ToolPlugin
-        -> SkillPlugin
-        -> WorkflowPlugin
-        -> LuaPlugin
+        -> BuiltinToolPlugin
         -> MemoryPlugin
         -> AgentPlugin
         -> WorkspacePlugin::open(agent_images_root)
     WorkspacePlugin只协调已有Plugin，不替它们重新实现加载、验证或执行
-    WorkspacePlugin不解析YAML，不读取Skill/Workflow正文，不执行推理、工具或Agent消息循环
+    WorkspacePlugin不解析YAML，不识别资源Provider，不读取资源正文，不执行推理、工具或Agent消息循环
 
 输入与收集边界：
     Compose
@@ -475,15 +468,15 @@ cleanup_orphan_agent(world: &mut World, agent: Entity)
         -> Workspace项目级模型路由和AgentInferenceSnapshot
     ToolPlugin
         -> AgentToolEnvironment和AgentToolMap
-        -> Workspace启动时按动态可见性向具体工具Plugin发送注册请求
+        -> Workspace启动时由BuiltinToolPlugin按动态可见性注册资源
     MemoryPlugin
         -> AgentMemory
         -> 打开数据库时恢复的RealtimeContext { messages, tool_context }
     WorkspacePlugin自身
         -> Workspace归属、逻辑名称和Agent Entity索引
         -> 合并后把default_visibility交给AgentCreateRequest，由AgentPlugin构造两个可见性组件
-    Skill、Workflow和Lua Tool在启动完成前按Agent注册一次
-        -> 具体Plugin验证资源并构造Agent专属ToolTemplate
+    Skill、Workflow、Lua和Shell资源在启动完成前按Agent注册一次
+        -> BuiltinToolPlugin选择具体执行器并验证资源、构造Agent专属ToolTemplate
         -> ToolPlugin写入AgentToolMap并分配tool_name
         -> 工具正文和运行时内容不缓存；每次调用时由对应Plugin重新读取
 
