@@ -14,6 +14,9 @@ use tool_plugin::{
     ToolCallEvent, ToolError, ToolErrorKind, ToolPluginInstalled, ToolTurnCompleted,
 };
 
+const TOOL_PERMISSION_DENIED: &str =
+    "PermissionDenied: this resource is not available in the current tool schema; check the current tool schema before calling tools";
+
 pub struct AgentPlugin {
     schedule: String,
 }
@@ -1258,7 +1261,7 @@ fn handle_agent_message(
                 .ok_or(AgentStepError::StatusMissing)?
                 .begin_turn(event.id.clone())?;
             clear_tool_context(world, agent, events)?;
-            record_history_message(world, event, events);
+            record_history_message(world, event, events, Vec::new());
             append_conversation_message(world, agent, event.message.clone(), events)?;
             dispatch_tool_calls(world, &event.id, agent, tool_calls, true, events)?
         }
@@ -1272,11 +1275,19 @@ fn handle_agent_message(
             {
                 return Err(AgentStepError::InvalidToolBatch);
             }
+            let tool_schema = take_pending_tool_schema(world, agent, &event.id);
             clear_tool_context(world, agent, events)?;
-            record_history_message(world, event, events);
+            record_history_message(world, event, events, tool_schema.clone());
             append_conversation_message(world, agent, event.message.clone(), events)?;
             if !tool_calls.is_empty() {
-                dispatch_tool_calls(world, &event.id, agent, tool_calls, true, events)?
+                dispatch_assistant_tool_calls(
+                    world,
+                    &event.id,
+                    agent,
+                    tool_calls,
+                    &tool_schema,
+                    events,
+                )?
             } else {
                 world
                     .get_component_mut::<AgentStatus>(agent)
@@ -1285,7 +1296,7 @@ fn handle_agent_message(
                 ConversationTurnResult::FinishTurn
             }
         }
-        Message::Tool { resource_id, .. } => {
+        Message::Tool { resource_id: _, .. } => {
             if world
                 .get_component::<AgentStatus>(agent)
                 .ok_or(AgentStepError::StatusMissing)?
@@ -1295,14 +1306,8 @@ fn handle_agent_message(
             {
                 return Err(AgentStepError::InvalidToolBatch);
             }
-            record_history_message(world, event, events);
+            record_history_message(world, event, events, Vec::new());
             append_tool_context(world, agent, event.message.clone(), events)?;
-            if resource_id.resource_type() == "skill" {
-                world
-                    .get_component_mut::<AgentStatus>(agent)
-                    .ok_or(AgentStepError::StatusMissing)?
-                    .load_skill(resource_id.clone())?;
-            }
             ConversationTurnResult::WaitForTools
         }
     };
@@ -1312,17 +1317,25 @@ fn handle_agent_message(
     Ok(result)
 }
 
-fn record_history_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender) {
-    let tool_schema = if matches!(event.message, Message::Assistant { .. }) {
-        world
-            .get_resource_mut::<PendingInferenceToolSchemas>()
-            .expect("AgentPlugin is not installed")
-            .schemas
-            .remove(&(event.agent, event.id.clone()))
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+fn take_pending_tool_schema(
+    world: &mut World,
+    agent: Entity,
+    turn_id: &str,
+) -> Vec<ToolDefinition> {
+    world
+        .get_resource_mut::<PendingInferenceToolSchemas>()
+        .expect("AgentPlugin is not installed")
+        .schemas
+        .remove(&(agent, turn_id.to_owned()))
+        .unwrap_or_default()
+}
+
+fn record_history_message(
+    _world: &mut World,
+    event: &AgentMessage,
+    events: &RuntimeEventSender,
+    tool_schema: Vec<ToolDefinition>,
+) {
     let message = match &event.message {
         Message::Tool {
             resource_id,
@@ -1421,6 +1434,81 @@ fn dispatch_tool_calls(
             call,
         });
     }
+    Ok(ConversationTurnResult::WaitForTools)
+}
+
+fn dispatch_assistant_tool_calls(
+    world: &mut World,
+    id: &str,
+    agent: Entity,
+    tool_calls: &[ToolCall],
+    tool_schema: &[ToolDefinition],
+    events: &RuntimeEventSender,
+) -> Result<ConversationTurnResult, AgentStepError> {
+    let maps = world
+        .get_component::<AgentToolMap>(agent)
+        .ok_or(AgentStepError::ToolMapMissing)?;
+    let visibility = world
+        .get_component::<AgentDynamicVisibility>(agent)
+        .ok_or(AgentStepError::ContextMissing)?;
+    let schema_names = tool_schema
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut call_ids = BTreeSet::new();
+    let mut authorized = Vec::new();
+    let mut authorized_skills = Vec::new();
+    let mut denied = Vec::new();
+    for call in tool_calls {
+        if call.id.is_empty() || call.tool_name.is_empty() || !call_ids.insert(call.id.clone()) {
+            return Err(AgentStepError::InvalidToolBatch);
+        }
+        let map = maps
+            .get_by_name(&call.tool_name)
+            .ok_or(AgentStepError::InvalidToolBatch)?;
+        if !schema_names.contains(call.tool_name.as_str())
+            || !visibility.resources().contains(&map.resource_id)
+        {
+            denied.push((call.id.clone(), map.resource_id.clone()));
+        } else if map.resource_id.resource_type() == "skill" {
+            authorized_skills.push(map.resource_id.clone());
+        } else {
+            authorized.push(call.clone());
+        }
+    }
+    if !authorized_skills.is_empty() {
+        let status = world
+            .get_component_mut::<AgentStatus>(agent)
+            .ok_or(AgentStepError::StatusMissing)?;
+        for resource_id in authorized_skills {
+            status.load_skill(resource_id)?;
+        }
+    }
+    let denied_only = !denied.is_empty() && authorized.is_empty();
+    for (tool_call_id, resource_id) in denied {
+        events.send_event(AgentMessage {
+            id: id.to_owned(),
+            agent,
+            message: Message::Tool {
+                resource_id,
+                tool_call_id,
+                content: TOOL_PERMISSION_DENIED.into(),
+            },
+        });
+    }
+    let has_loading_skills = !world
+        .get_component::<AgentStatus>(agent)
+        .ok_or(AgentStepError::StatusMissing)?
+        .loading_skills
+        .is_empty();
+    let result = dispatch_tool_calls(world, id, agent, &authorized, true, events)?;
+    if !denied_only || has_loading_skills {
+        return Ok(result);
+    }
+    events.send_event(ToolTurnCompleted {
+        turn_id: id.to_owned(),
+        agent,
+    });
     Ok(ConversationTurnResult::WaitForTools)
 }
 
@@ -1903,11 +1991,6 @@ mod loading_skill_tests {
             description: "Read a file.".into(),
             input_schema: json!({"type": "object"}),
         }];
-        app.world_mut()
-            .get_resource_mut::<PendingInferenceToolSchemas>()
-            .unwrap()
-            .schemas
-            .insert((agent, "turn-1".into()), schema.clone());
         let message = AgentMessage {
             id: "turn-1".into(),
             agent,
@@ -1919,7 +2002,7 @@ mod loading_skill_tests {
         };
         let events = app.world().event_sender();
 
-        record_history_message(app.world_mut(), &message, &events);
+        record_history_message(app.world_mut(), &message, &events, schema.clone());
         app.tick();
 
         let write = app
@@ -1934,6 +2017,97 @@ mod loading_skill_tests {
             .get_resource::<PendingInferenceToolSchemas>()
             .unwrap()
             .schemas
+            .is_empty());
+    }
+
+    #[test]
+    fn hidden_assistant_tool_call_becomes_a_denied_tool_message() {
+        let (mut app, agent) = test_app();
+        let resource_id = ResourceId::parse("shell:local/sh:latest").unwrap();
+        attach_agent_tool_map(app.world_mut(), agent).unwrap();
+        let map = register_agent_tool(
+            app.world_mut(),
+            agent,
+            ResourceId::parse("tool:builtin/shell:latest").unwrap(),
+            resource_id.clone(),
+            ToolTemplate::new("ignored", "Run a shell command.", json!({"type": "object"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(app.world_mut().insert_component(
+            agent,
+            AgentDynamicVisibility {
+                resources: BTreeSet::new(),
+            },
+        ));
+        assert!(app.world_mut().insert_component(
+            agent,
+            AgentContext {
+                system_prompt: "system".into(),
+                messages: Vec::new(),
+                tool_context: Vec::new(),
+            },
+        ));
+        assert!(app
+            .world_mut()
+            .get_component_mut::<AgentStatus>(agent)
+            .unwrap()
+            .begin_turn("turn-1".into())
+            .is_ok());
+        let schema = vec![ToolDefinition {
+            name: map.tool_name.clone(),
+            description: "Run a shell command.".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        app.world_mut()
+            .get_resource_mut::<PendingInferenceToolSchemas>()
+            .unwrap()
+            .schemas
+            .insert((agent, "turn-1".into()), schema);
+
+        app.world().send_event(AgentMessage {
+            id: "turn-1".into(),
+            agent,
+            message: Message::Assistant {
+                reasoning: None,
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    tool_name: map.tool_name,
+                    arguments: "{}".into(),
+                }],
+            },
+        });
+        app.tick();
+        app.tick();
+
+        assert!(app
+            .world()
+            .event_reader::<ToolCallEvent>()
+            .into_iter()
+            .next()
+            .is_none());
+        assert!(app
+            .world()
+            .get_component::<AgentContext>(agent)
+            .unwrap()
+            .tool_context()
+            .iter()
+            .any(|message| matches!(
+                message,
+                Message::Tool {
+                    resource_id: actual,
+                    tool_call_id,
+                    content,
+                } if actual == &resource_id
+                    && tool_call_id == "call-1"
+                    && content == TOOL_PERMISSION_DENIED
+            )));
+        assert!(app
+            .world()
+            .get_component::<AgentStatus>(agent)
+            .unwrap()
+            .loading_skills
             .is_empty());
     }
 
