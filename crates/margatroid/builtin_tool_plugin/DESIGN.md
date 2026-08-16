@@ -14,19 +14,6 @@ BuiltinToolPlugin：Margatroid内建工具组合与资源注册路由Plugin，�
     impl Plugin for BuiltinToolPlugin
         构建：依次安装四个执行器，再挂载统一注册路由和响应收集System
 
-BuiltinResourceRegisterRequest：可见资源注册请求，公开事件
-    id: String
-    agent: Entity
-    resource_id: ResourceId--LLM可见资源身份，不允许tool:builtin执行器身份
-    impl Event for BuiltinResourceRegisterRequest
-
-BuiltinResourceRegisterResponse：可见资源注册响应，公开事件
-    id: String
-    agent: Entity
-    resource_id: ResourceId
-    result: Result<(), ToolError>
-    impl Event for BuiltinResourceRegisterResponse
-
 BuiltinToolError：组合构造错误，公开结构体
 BuiltinToolErrorKind：InvalidRoot、ChildPluginInvalid
 ```
@@ -40,33 +27,33 @@ BuiltinToolPluginInstalled：重复安装标记，私有Resource
 
 ```text
 builtin_resource_register_system(world: &mut World)
-    路由资源注册：读取BuiltinResourceRegisterRequest
+    路由资源注册：读取ToolPlugin定义的AgentToolRegisterRequest
     行为：
-        id为空或resource_id为tool:builtin/*时直接发送失败BuiltinResourceRegisterResponse
+        id为空或resource_id为tool:builtin/*时直接发送失败AgentToolRegisterResponse
         type=skill转发SkillRegisterRequest
         type=workflow转发WorkflowRegisterRequest
         type=tool转发LuaToolRegisterRequest
         type=shell转发ShellRegisterRequest
-        其他type直接发送ProviderMissing失败响应
+        其他type直接发送AgentToolRegisterResponse::ProviderMissing失败响应
 
 collect_builtin_registration_system(world: &mut World)
     收集注册结果：读取四个执行器的注册响应
-    行为：保持id、agent、resource_id和result不变，统一发送BuiltinResourceRegisterResponse
+    行为：保持id、agent、resource_id和result不变，统一发送AgentToolRegisterResponse
 ```
 
 ## 逻辑
 
 ```text
 AgentDynamicVisibility
-    -> WorkspacePlugin
-    -> BuiltinResourceRegisterRequest { resource_id }
+    -> AgentPlugin可见性注册协调器
+    -> AgentToolRegisterRequest { resource_id }
     -> BuiltinToolPlugin按resource_id.type路由
        ├── skill:*    -> tool:builtin/skill-loader:latest
        ├── workflow:* -> tool:builtin/workflow-loader:latest
        ├── tool:*     -> tool:builtin/lua-runtime:latest
        └── shell:*    -> tool:builtin/shell:latest
     -> register_agent_tool(resource_id, hidden tool_id, resource ToolTemplate)
-    -> BuiltinResourceRegisterResponse
+    -> AgentToolRegisterResponse
 ```
 
 ## 边界
@@ -75,7 +62,8 @@ AgentDynamicVisibility
 内建工具是资源解析和执行后端，对LLM、前端和Agent可见性隐藏。
 LLM只能看到AgentToolMap中由skill:*、workflow:*、tool:*和shell:*资源衍生出的ToolSpec。
 ToolMap.resource_id表示LLM调用语义；ToolMap.tool_id只供ToolPlugin内部路由。
-BuiltinToolPlugin不读取Agent可见性；WorkspacePlugin决定注册哪些资源。
+BuiltinToolPlugin不读取或修改Agent可见性；AgentPlugin根据初始化和热插拔操作决定注册哪些资源。
+BuiltinToolPlugin的成功响应只表示AgentToolMap注册完成，不表示资源已经可见；AgentPlugin收到并校验回执后才逐项注入AgentDynamicVisibility。
 BuiltinToolPlugin只组合内建执行器，不拥有PendingToolCalls、不构造AgentMessage、不执行Inference。
 tool:builtin/*不能作为可见资源注册，防止模型绕过资源定义直接调用执行器。
 ```

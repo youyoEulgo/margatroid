@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::time::{Duration, Instant};
 
-use agent_plugin::{AgentCreateRequest, AgentCreated, AgentPlugin};
+use agent_plugin::{AgentCreateRequest, AgentCreateResult, AgentPlugin};
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::App;
@@ -10,8 +10,7 @@ use lua_plugin::{LuaPlugin, LuaToolRegisterRequest, LuaToolRegisterResponse};
 use margatroid_types::ResourceId;
 use tempfile::tempdir;
 use tool_plugin::{
-    attach_agent_tool_map, AgentToolEnvironment, AgentToolMap, ToolCallRequest, ToolCallResponse,
-    ToolPlugin,
+    AgentToolEnvironment, AgentToolMap, ToolCallRequest, ToolCallResponse, ToolPlugin,
 };
 
 #[test]
@@ -61,16 +60,18 @@ fn registers_and_executes_trusted_lua_tools_asynchronously() {
     app.tick();
     let agent = app
         .world()
-        .event_reader::<AgentCreated>()
+        .event_reader::<AgentCreateResult>()
         .into_iter()
         .find(|event| event.id == "create-1")
         .unwrap()
-        .agent;
+        .result
+        .as_ref()
+        .copied()
+        .unwrap();
     app.world_mut().insert_component(
         agent,
         AgentToolEnvironment::new(project.path(), image.path()),
     );
-    attach_agent_tool_map(app.world_mut(), agent).unwrap();
 
     let resource_id = ResourceId::parse("tool:local/echo:latest").unwrap();
     app.world().send_event(LuaToolRegisterRequest {
@@ -175,16 +176,18 @@ fn tracked_write_file_example_creates_parent_directories_and_writes_content() {
     app.tick();
     let agent = app
         .world()
-        .event_reader::<AgentCreated>()
+        .event_reader::<AgentCreateResult>()
         .into_iter()
         .find(|event| event.id == "create-write-agent")
         .unwrap()
-        .agent;
+        .result
+        .as_ref()
+        .copied()
+        .unwrap();
     app.world_mut().insert_component(
         agent,
         AgentToolEnvironment::new(project.path(), image.path()),
     );
-    attach_agent_tool_map(app.world_mut(), agent).unwrap();
 
     let resource_id = ResourceId::parse("tool:local/write-file:latest").unwrap();
     app.world().send_event(LuaToolRegisterRequest {

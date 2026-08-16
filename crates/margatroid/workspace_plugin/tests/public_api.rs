@@ -17,8 +17,8 @@ use tempfile::tempdir;
 use tool_plugin::{AgentToolEnvironment, ToolPlugin};
 use workspace_plugin::{
     ReloadWorkspaceResult, StartWorkspaceResult, StopWorkspaceByReference,
-    StopWorkspaceByReferenceResult, WorkspaceAgents, WorkspaceIdentity, WorkspacePlugin,
-    WorldWorkspaceExt,
+    StopWorkspaceByReferenceResult, WorkspaceAgentState, WorkspaceAgents, WorkspaceIdentity,
+    WorkspacePlugin, WorldWorkspaceExt,
 };
 
 fn unique_directory(prefix: &str) -> PathBuf {
@@ -48,6 +48,7 @@ fn write_image(library: &Path, model: &str) {
 }
 
 fn write_routes(path: &Path) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(
         path,
         r#"[[models]]
@@ -136,7 +137,7 @@ fn wait_start(
 fn documented_public_api_starts_queries_reloads_and_stops_workspace() {
     let library = unique_directory("success-library");
     let project = tempdir().unwrap();
-    let routes = project.path().join("models.toml");
+    let routes = project.path().join(".margatroid/models.toml");
     fs::create_dir_all(&library).unwrap();
     write_image(&library, "test-model");
     write_routes(&routes);
@@ -166,7 +167,7 @@ fn documented_public_api_starts_queries_reloads_and_stops_workspace() {
         Some(workspace)
     );
     assert_eq!(app.world().workspaces(), vec![workspace]);
-    let manager = app.world().workspace_manager(workspace).unwrap();
+    let manager = wait_manager(&mut app, workspace);
     assert_eq!(
         app.world()
             .get_component::<AgentIdentity>(manager)
@@ -220,9 +221,10 @@ fn documented_public_api_starts_queries_reloads_and_stops_workspace() {
     let reloaded = wait_reload(&mut app, "reload-1", workspace).unwrap();
     assert_ne!(workspace, reloaded);
     assert!(!app.world().is_alive(workspace));
+    let reloaded_manager = wait_manager(&mut app, reloaded);
     assert_eq!(
         app.world().workspace_manager(reloaded),
-        Some(app.world().workspace_agent(reloaded, "manager").unwrap())
+        Some(reloaded_manager)
     );
 
     let reference = WorkspaceReference {
@@ -285,10 +287,10 @@ fn wait_stop_by_reference(
 }
 
 #[test]
-fn invalid_model_route_fails_before_agent_creation() {
+fn agent_inference_setup_failure_does_not_fail_workspace_start() {
     let library = unique_directory("failure-library");
     let project = tempdir().unwrap();
-    let routes = project.path().join("models.toml");
+    let routes = project.path().join(".margatroid/models.toml");
     fs::create_dir_all(&library).unwrap();
     write_image(&library, "missing-model");
     write_routes(&routes);
@@ -296,21 +298,35 @@ fn invalid_model_route_fails_before_agent_creation() {
     let mut app = app(&library, &routes);
     app.world()
         .start_workspace("start-failure", definition(project.path()));
-    let error = wait_start(&mut app, "start-failure").unwrap_err();
-
-    assert_eq!(
-        error.kind(),
-        workspace_plugin::WorkspaceErrorKind::InferenceSetupFailed
-    );
-    assert_eq!(app.world().entity_count(), 1);
+    let workspace = wait_start(&mut app, "start-failure").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        app.tick();
+        let state = app
+            .world()
+            .get_component::<WorkspaceAgents>(workspace)
+            .unwrap()
+            .state("manager");
+        if let Some(WorkspaceAgentState::Failed { error }) = state {
+            assert_eq!(
+                error.kind(),
+                workspace_plugin::WorkspaceErrorKind::InferenceSetupFailed
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "agent failure timed out");
+        std::thread::yield_now();
+    }
+    assert!(app.world().is_alive(workspace));
+    assert!(app.world().workspace_manager(workspace).is_none());
     let _ = fs::remove_dir_all(library);
 }
 
 #[test]
-fn missing_visible_skill_fails_workspace_start() {
+fn missing_visible_skill_does_not_fail_workspace_start() {
     let library = unique_directory("missing-skill-library");
     let project = tempdir().unwrap();
-    let routes = project.path().join("models.toml");
+    let routes = project.path().join(".margatroid/models.toml");
     fs::create_dir_all(&library).unwrap();
     write_image(&library, "test-model");
     write_routes(&routes);
@@ -320,15 +336,15 @@ fn missing_visible_skill_fails_workspace_start() {
     let mut app = app(&library, &routes);
     app.world()
         .start_workspace("start-missing-skill", definition);
-    let error = wait_start(&mut app, "start-missing-skill").unwrap_err();
-
-    assert_eq!(
-        error.kind(),
-        workspace_plugin::WorkspaceErrorKind::ResourceSetupFailed
-    );
-    assert!(error.message().contains("skill file was not found"));
-    assert!(app.world().workspaces().is_empty());
-    assert_eq!(app.world().entity_count(), 1);
+    let workspace = wait_start(&mut app, "start-missing-skill").unwrap();
+    let manager = wait_manager(&mut app, workspace);
+    assert!(app.world().workspaces().contains(&workspace));
+    assert!(app
+        .world()
+        .get_component::<agent_plugin::AgentDynamicVisibility>(manager)
+        .unwrap()
+        .resources()
+        .is_empty());
     let _ = fs::remove_dir_all(library);
 }
 
@@ -336,7 +352,7 @@ fn missing_visible_skill_fails_workspace_start() {
 fn visible_lua_tool_is_registered_before_workspace_is_ready() {
     let library = unique_directory("lua-tool-library");
     let project = tempdir().unwrap();
-    let routes = project.path().join("models.toml");
+    let routes = project.path().join(".margatroid/models.toml");
     fs::create_dir_all(&library).unwrap();
     write_image(&library, "test-model");
     write_routes(&routes);
@@ -348,6 +364,18 @@ fn visible_lua_tool_is_registered_before_workspace_is_ready() {
     app.world().start_workspace("start-lua-tool", definition);
     let workspace = wait_start(&mut app, "start-lua-tool").unwrap();
 
-    assert!(app.world().workspace_manager(workspace).is_some());
+    let _manager = wait_manager(&mut app, workspace);
     let _ = fs::remove_dir_all(library);
+}
+
+fn wait_manager(app: &mut App, workspace: core_plugin::Entity) -> core_plugin::Entity {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        app.tick();
+        if let Some(manager) = app.world().workspace_manager(workspace) {
+            return manager;
+        }
+        assert!(Instant::now() < deadline, "workspace manager timed out");
+        std::thread::yield_now();
+    }
 }

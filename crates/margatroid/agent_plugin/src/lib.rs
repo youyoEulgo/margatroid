@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, WorldEventExt};
@@ -8,7 +9,10 @@ use margatroid_types::{
     AgentContextMessagesUpdated, AgentFailure, AgentFailureKind, AgentHistoryMessageWriteRequested,
     AgentMessage, Message, ResourceId, ToolCall, ToolDefinition,
 };
-use tool_plugin::{AgentToolMap, ToolCallEvent, ToolError, ToolErrorKind, ToolTurnCompleted};
+use tool_plugin::{
+    attach_agent_tool_map, AgentToolMap, AgentToolRegisterRequest, AgentToolRegisterResponse,
+    ToolCallEvent, ToolError, ToolErrorKind, ToolPluginInstalled, ToolTurnCompleted,
+};
 
 pub struct AgentPlugin {
     schedule: String,
@@ -42,6 +46,9 @@ impl Plugin for AgentPlugin {
         if !app.world().contains_resource::<RuntimeHandle>() {
             panic!("AgentPlugin requires RuntimePlugin");
         }
+        if !app.world().contains_resource::<ToolPluginInstalled>() {
+            panic!("AgentPlugin requires ToolPlugin");
+        }
         if app.world().contains_resource::<AgentPluginInstalled>() {
             panic!("AgentPlugin is already installed");
         }
@@ -50,7 +57,14 @@ impl Plugin for AgentPlugin {
         }
 
         app.world_mut().insert_resource(AgentPluginInstalled);
+        app.world_mut()
+            .insert_resource(InFlightVisibilityRegistrations::default());
+        app.world_mut()
+            .insert_resource(PendingInferenceToolSchemas::default());
         app.add_system(&self.schedule, agent_create_system)
+            .add_system(&self.schedule, agent_visibility_change_system)
+            .add_system(&self.schedule, collect_agent_tool_registration_system)
+            .add_system(&self.schedule, cleanup_dead_agent_registrations_system)
             .add_system(&self.schedule, agent_skill_state_system)
             .add_system(&self.schedule, agent_message_system)
             .add_system(&self.schedule, tool_turn_completed_system);
@@ -71,12 +85,160 @@ pub struct AgentCreateRequest {
 impl Event for AgentCreateRequest {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentCreateResult {
+    pub id: String,
+    pub agent_id: ResourceId,
+    pub result: Result<Entity, AgentCreateError>,
+}
+
+impl Event for AgentCreateResult {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentCreated {
     pub id: String,
+    pub agent_id: ResourceId,
     pub agent: Entity,
 }
 
 impl Event for AgentCreated {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InjectAgentVisibleResource {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceId,
+}
+impl Event for InjectAgentVisibleResource {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoveAgentVisibleResource {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceId,
+}
+impl Event for RemoveAgentVisibleResource {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetAgentDefaultResourceVisibility {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceId,
+    pub visible: bool,
+}
+impl Event for SetAgentDefaultResourceVisibility {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreAgentDefaultVisibility {
+    pub id: String,
+    pub agent: Entity,
+}
+impl Event for RestoreAgentDefaultVisibility {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoveAllAgentVisibleResources {
+    pub id: String,
+    pub agent: Entity,
+}
+impl Event for RemoveAllAgentVisibleResources {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentVisibleResourceInjected {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceId,
+}
+impl Event for AgentVisibleResourceInjected {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentVisibleResourceRemoved {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceId,
+}
+impl Event for AgentVisibleResourceRemoved {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentVisibleResourceInjectionFailed {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceId,
+    pub error: AgentVisibilityError,
+}
+impl Event for AgentVisibleResourceInjectionFailed {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentCreateErrorKind {
+    InvalidRequest,
+    DuplicateAgent,
+    WorkspaceMissing,
+    ContextInvalid,
+    ToolMapSetupFailed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentCreateError {
+    kind: AgentCreateErrorKind,
+    message: String,
+}
+
+impl AgentCreateError {
+    fn new(kind: AgentCreateErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: bounded_message(message.into()),
+        }
+    }
+    pub fn kind(&self) -> AgentCreateErrorKind {
+        self.kind
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for AgentCreateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}: {}", self.kind, self.message)
+    }
+}
+impl std::error::Error for AgentCreateError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentVisibilityErrorKind {
+    AgentMissing,
+    VisibilityMissing,
+    ToolMapMissing,
+    RegistrationFailed,
+    RegistrationResponseMismatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentVisibilityError {
+    kind: AgentVisibilityErrorKind,
+    message: String,
+}
+
+impl AgentVisibilityError {
+    fn new(kind: AgentVisibilityErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: bounded_message(message.into()),
+        }
+    }
+    pub fn kind(&self) -> AgentVisibilityErrorKind {
+        self.kind
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for AgentVisibilityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?}: {}", self.kind, self.message)
+    }
+}
+impl std::error::Error for AgentVisibilityError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadAgentSkill {
@@ -119,6 +281,20 @@ impl Component for AgentIdentity {}
 pub trait WorldAgentExt {
     fn agent(&self, id: &ResourceId) -> Option<Entity>;
     fn agent_loading_skills(&self, agent: Entity) -> Option<&BTreeSet<ResourceId>>;
+    fn inject_agent_visible_resource(
+        &self,
+        id: impl Into<String>,
+        agent: Entity,
+        resource_id: ResourceId,
+    );
+    fn remove_agent_visible_resource(
+        &self,
+        id: impl Into<String>,
+        agent: Entity,
+        resource_id: ResourceId,
+    );
+    fn restore_agent_default_visibility(&self, id: impl Into<String>, agent: Entity);
+    fn remove_all_agent_visible_resources(&self, id: impl Into<String>, agent: Entity);
 }
 
 impl WorldAgentExt for World {
@@ -135,6 +311,46 @@ impl WorldAgentExt for World {
     fn agent_loading_skills(&self, agent: Entity) -> Option<&BTreeSet<ResourceId>> {
         self.get_component::<AgentStatus>(agent)
             .map(|status| &status.loading_skills)
+    }
+
+    fn inject_agent_visible_resource(
+        &self,
+        id: impl Into<String>,
+        agent: Entity,
+        resource_id: ResourceId,
+    ) {
+        self.send_event(InjectAgentVisibleResource {
+            id: id.into(),
+            agent,
+            resource_id,
+        });
+    }
+
+    fn remove_agent_visible_resource(
+        &self,
+        id: impl Into<String>,
+        agent: Entity,
+        resource_id: ResourceId,
+    ) {
+        self.send_event(RemoveAgentVisibleResource {
+            id: id.into(),
+            agent,
+            resource_id,
+        });
+    }
+
+    fn restore_agent_default_visibility(&self, id: impl Into<String>, agent: Entity) {
+        self.send_event(RestoreAgentDefaultVisibility {
+            id: id.into(),
+            agent,
+        });
+    }
+
+    fn remove_all_agent_visible_resources(&self, id: impl Into<String>, agent: Entity) {
+        self.send_event(RemoveAllAgentVisibleResources {
+            id: id.into(),
+            agent,
+        });
     }
 }
 
@@ -241,6 +457,27 @@ impl AgentDynamicVisibility {
 impl Component for AgentDynamicVisibility {}
 
 #[derive(Default)]
+struct InFlightVisibilityRegistrations {
+    registrations: HashMap<(Entity, ResourceId), InFlightVisibilityRegistration>,
+}
+impl Resource for InFlightVisibilityRegistrations {}
+
+struct InFlightVisibilityRegistration {
+    registration_id: String,
+    agent: Entity,
+    resource_id: ResourceId,
+    notification_ids: BTreeSet<String>,
+    desired_visible: bool,
+}
+
+#[derive(Default)]
+struct PendingInferenceToolSchemas {
+    schemas: HashMap<(Entity, String), Vec<ToolDefinition>>,
+}
+
+impl Resource for PendingInferenceToolSchemas {}
+
+#[derive(Default)]
 pub(crate) struct AgentStatus {
     turn_id: Option<String>,
     loading_skills: BTreeSet<ResourceId>,
@@ -323,61 +560,590 @@ fn agent_create_system(world: &mut World) {
     let events = world.event_sender();
 
     for request in requests {
-        if request.id.is_empty()
-            || request.agent_id.resource_type() != "agent"
-            || world.agent(&request.agent_id).is_some()
-            || !world.is_alive(request.workspace_id)
-            || request
-                .messages
-                .iter()
-                .any(|message| !matches!(message, Message::User { .. } | Message::Assistant { .. }))
-            || request
-                .tool_context
-                .iter()
-                .any(|message| !matches!(message, Message::Tool { .. }))
-        {
-            continue;
+        let result = create_agent(world, &request);
+        if let Ok(agent) = result {
+            events.send_event(AgentCreated {
+                id: request.id.clone(),
+                agent_id: request.agent_id.clone(),
+                agent,
+            });
+            world.restore_agent_default_visibility(
+                format!("agent-{}/restore-default", agent.index()),
+                agent,
+            );
         }
-        let dynamic_visibility = request.default_visibility.clone();
-        let agent = world.spawn();
-        assert!(world.insert_component(
-            agent,
-            AgentIdentity {
-                id: request.agent_id,
-            },
-        ));
-        assert!(world.insert_component(
-            agent,
-            AgentWorkspaceId {
-                workspace_id: request.workspace_id,
-            },
-        ));
-        assert!(world.insert_component(
-            agent,
-            AgentContext {
-                system_prompt: request.system_prompt,
-                messages: request.messages,
-                tool_context: request.tool_context,
-            },
-        ));
-        assert!(world.insert_component(
-            agent,
-            AgentDefaultVisibility {
-                resources: request.default_visibility,
-            },
-        ));
-        assert!(world.insert_component(
-            agent,
-            AgentDynamicVisibility {
-                resources: dynamic_visibility,
-            },
-        ));
-        assert!(world.insert_component(agent, AgentStatus::default()));
-        events.send_event(AgentCreated {
+        events.send_event(AgentCreateResult {
             id: request.id,
-            agent,
+            agent_id: request.agent_id,
+            result,
         });
     }
+}
+
+fn create_agent(
+    world: &mut World,
+    request: &AgentCreateRequest,
+) -> Result<Entity, AgentCreateError> {
+    if request.id.is_empty() || request.agent_id.resource_type() != "agent" {
+        return Err(AgentCreateError::new(
+            AgentCreateErrorKind::InvalidRequest,
+            "Agent create request is invalid",
+        ));
+    }
+    if world.agent(&request.agent_id).is_some() {
+        return Err(AgentCreateError::new(
+            AgentCreateErrorKind::DuplicateAgent,
+            "Agent resource ID is already alive",
+        ));
+    }
+    if !world.is_alive(request.workspace_id) {
+        return Err(AgentCreateError::new(
+            AgentCreateErrorKind::WorkspaceMissing,
+            "Workspace entity is not alive",
+        ));
+    }
+    if request
+        .messages
+        .iter()
+        .any(|message| !matches!(message, Message::User { .. } | Message::Assistant { .. }))
+        || request
+            .tool_context
+            .iter()
+            .any(|message| !matches!(message, Message::Tool { .. }))
+    {
+        return Err(AgentCreateError::new(
+            AgentCreateErrorKind::ContextInvalid,
+            "Recovered Agent context contains an invalid message type",
+        ));
+    }
+
+    let agent = world.spawn();
+    let inserted = world.insert_component(
+        agent,
+        AgentIdentity {
+            id: request.agent_id.clone(),
+        },
+    ) && world.insert_component(
+        agent,
+        AgentWorkspaceId {
+            workspace_id: request.workspace_id,
+        },
+    ) && world.insert_component(
+        agent,
+        AgentContext {
+            system_prompt: request.system_prompt.clone(),
+            messages: request.messages.clone(),
+            tool_context: request.tool_context.clone(),
+        },
+    ) && world.insert_component(
+        agent,
+        AgentDefaultVisibility {
+            resources: request.default_visibility.clone(),
+        },
+    ) && world.insert_component(
+        agent,
+        AgentDynamicVisibility {
+            resources: BTreeSet::new(),
+        },
+    ) && world.insert_component(agent, AgentStatus::default());
+    if !inserted {
+        world.despawn(agent);
+        return Err(AgentCreateError::new(
+            AgentCreateErrorKind::InvalidRequest,
+            "Agent components could not be attached",
+        ));
+    }
+    if let Err(error) = attach_agent_tool_map(world, agent) {
+        world.despawn(agent);
+        return Err(AgentCreateError::new(
+            AgentCreateErrorKind::ToolMapSetupFailed,
+            error.to_string(),
+        ));
+    }
+    Ok(agent)
+}
+
+fn agent_visibility_change_system(world: &mut World) {
+    let injects = world
+        .event_reader::<InjectAgentVisibleResource>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let removes = world
+        .event_reader::<RemoveAgentVisibleResource>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let restores = world
+        .event_reader::<RestoreAgentDefaultVisibility>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let default_changes = world
+        .event_reader::<SetAgentDefaultResourceVisibility>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let remove_all = world
+        .event_reader::<RemoveAllAgentVisibleResources>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let events = world.event_sender();
+
+    for event in injects {
+        inject_visible_resource(world, &event.id, event.agent, &event.resource_id, &events);
+    }
+    for event in removes {
+        if let Err(error) =
+            remove_visible_resource(world, &event.id, event.agent, &event.resource_id, &events)
+        {
+            report_visibility_operation_failure(&event.id, event.agent, error, &events);
+        }
+    }
+    for event in default_changes {
+        let is_default = world
+            .get_component::<AgentDefaultVisibility>(event.agent)
+            .is_some_and(|visibility| visibility.resources.contains(&event.resource_id));
+        if !is_default {
+            events.send_event(AgentFailure {
+                id: event.id,
+                agent: event.agent,
+                kind: AgentFailureKind::Agent,
+                message: "InvalidRequest: resource is not part of Agent default visibility".into(),
+            });
+            continue;
+        }
+        if event.visible {
+            inject_visible_resource(world, &event.id, event.agent, &event.resource_id, &events);
+        } else if let Err(error) =
+            remove_visible_resource(world, &event.id, event.agent, &event.resource_id, &events)
+        {
+            report_visibility_operation_failure(&event.id, event.agent, error, &events);
+        }
+    }
+    for event in restores {
+        let resources = world
+            .get_component::<AgentDefaultVisibility>(event.agent)
+            .map(|visibility| visibility.resources.iter().cloned().collect::<Vec<_>>());
+        let Some(resources) = resources else {
+            report_visibility_operation_failure(
+                &event.id,
+                event.agent,
+                AgentVisibilityError::new(
+                    AgentVisibilityErrorKind::VisibilityMissing,
+                    "Agent default visibility is missing",
+                ),
+                &events,
+            );
+            continue;
+        };
+        if let Err(error) =
+            remove_all_visible_resources(world, &event.id, event.agent, false, &events)
+        {
+            report_visibility_operation_failure(&event.id, event.agent, error, &events);
+            continue;
+        }
+        for resource_id in resources {
+            inject_visible_resource(world, &event.id, event.agent, &resource_id, &events);
+        }
+    }
+    for event in remove_all {
+        if let Err(error) =
+            remove_all_visible_resources(world, &event.id, event.agent, true, &events)
+        {
+            report_visibility_operation_failure(&event.id, event.agent, error, &events);
+        }
+    }
+}
+
+fn inject_visible_resource(
+    world: &mut World,
+    id: &str,
+    agent: Entity,
+    resource_id: &ResourceId,
+    events: &RuntimeEventSender,
+) {
+    if !world.is_alive(agent) {
+        send_visibility_injection_failed(
+            id,
+            agent,
+            resource_id,
+            AgentVisibilityError::new(
+                AgentVisibilityErrorKind::AgentMissing,
+                "Agent entity is not alive",
+            ),
+            events,
+        );
+        return;
+    }
+    let Some(visibility) = world.get_component::<AgentDynamicVisibility>(agent) else {
+        send_visibility_injection_failed(
+            id,
+            agent,
+            resource_id,
+            AgentVisibilityError::new(
+                AgentVisibilityErrorKind::VisibilityMissing,
+                "Agent dynamic visibility is missing",
+            ),
+            events,
+        );
+        return;
+    };
+    if visibility.resources.contains(resource_id) {
+        events.send_event(AgentVisibleResourceInjected {
+            id: id.to_owned(),
+            agent,
+            resource_id: resource_id.clone(),
+        });
+        return;
+    }
+    let Some(tool_map) = world.get_component::<AgentToolMap>(agent) else {
+        send_visibility_injection_failed(
+            id,
+            agent,
+            resource_id,
+            AgentVisibilityError::new(
+                AgentVisibilityErrorKind::ToolMapMissing,
+                "Agent tool map is missing",
+            ),
+            events,
+        );
+        return;
+    };
+    let mapping_count = tool_map.get_by_resource(resource_id).len();
+    if mapping_count > 1 {
+        send_visibility_injection_failed(
+            id,
+            agent,
+            resource_id,
+            AgentVisibilityError::new(
+                AgentVisibilityErrorKind::RegistrationResponseMismatch,
+                "Agent tool map contains duplicate resource mappings",
+            ),
+            events,
+        );
+        return;
+    }
+    if mapping_count == 1 {
+        world
+            .get_component_mut::<AgentDynamicVisibility>(agent)
+            .expect("AgentDynamicVisibility existence was checked")
+            .resources
+            .insert(resource_id.clone());
+        events.send_event(AgentVisibleResourceInjected {
+            id: id.to_owned(),
+            agent,
+            resource_id: resource_id.clone(),
+        });
+        return;
+    }
+
+    let key = (agent, resource_id.clone());
+    let registrations = world
+        .get_resource_mut::<InFlightVisibilityRegistrations>()
+        .expect("AgentPlugin is not installed");
+    if let Some(registration) = registrations.registrations.get_mut(&key) {
+        registration.notification_ids.insert(id.to_owned());
+        registration.desired_visible = true;
+        return;
+    }
+    static NEXT_REGISTRATION_ID: AtomicU64 = AtomicU64::new(1);
+    let registration_id = format!(
+        "agent-tool-registration-{}",
+        NEXT_REGISTRATION_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut notification_ids = BTreeSet::new();
+    notification_ids.insert(id.to_owned());
+    registrations.registrations.insert(
+        key,
+        InFlightVisibilityRegistration {
+            registration_id: registration_id.clone(),
+            agent,
+            resource_id: resource_id.clone(),
+            notification_ids,
+            desired_visible: true,
+        },
+    );
+    events.send_event(AgentToolRegisterRequest {
+        id: registration_id,
+        agent,
+        resource_id: resource_id.clone(),
+    });
+}
+
+fn remove_visible_resource(
+    world: &mut World,
+    id: &str,
+    agent: Entity,
+    resource_id: &ResourceId,
+    events: &RuntimeEventSender,
+) -> Result<(), AgentVisibilityError> {
+    if !world.is_alive(agent) {
+        return Err(AgentVisibilityError::new(
+            AgentVisibilityErrorKind::AgentMissing,
+            "Agent entity is not alive",
+        ));
+    }
+    world
+        .get_component_mut::<AgentDynamicVisibility>(agent)
+        .ok_or_else(|| {
+            AgentVisibilityError::new(
+                AgentVisibilityErrorKind::VisibilityMissing,
+                "Agent dynamic visibility is missing",
+            )
+        })?
+        .resources
+        .remove(resource_id);
+    if resource_id.resource_type() == "skill" {
+        world
+            .get_component_mut::<AgentStatus>(agent)
+            .ok_or_else(|| {
+                AgentVisibilityError::new(
+                    AgentVisibilityErrorKind::VisibilityMissing,
+                    "Agent status is missing",
+                )
+            })?
+            .unload_skill(resource_id);
+    }
+    if let Some(registration) = world
+        .get_resource_mut::<InFlightVisibilityRegistrations>()
+        .expect("AgentPlugin is not installed")
+        .registrations
+        .get_mut(&(agent, resource_id.clone()))
+    {
+        registration.desired_visible = false;
+    }
+    events.send_event(AgentVisibleResourceRemoved {
+        id: id.to_owned(),
+        agent,
+        resource_id: resource_id.clone(),
+    });
+    Ok(())
+}
+
+fn remove_all_visible_resources(
+    world: &mut World,
+    id: &str,
+    agent: Entity,
+    clear_loading_skills: bool,
+    events: &RuntimeEventSender,
+) -> Result<(), AgentVisibilityError> {
+    if !world.is_alive(agent) {
+        return Err(AgentVisibilityError::new(
+            AgentVisibilityErrorKind::AgentMissing,
+            "Agent entity is not alive",
+        ));
+    }
+    let removed = {
+        let visibility = world
+            .get_component_mut::<AgentDynamicVisibility>(agent)
+            .ok_or_else(|| {
+                AgentVisibilityError::new(
+                    AgentVisibilityErrorKind::VisibilityMissing,
+                    "Agent dynamic visibility is missing",
+                )
+            })?;
+        std::mem::take(&mut visibility.resources)
+    };
+    for registration in world
+        .get_resource_mut::<InFlightVisibilityRegistrations>()
+        .expect("AgentPlugin is not installed")
+        .registrations
+        .values_mut()
+        .filter(|registration| registration.agent == agent)
+    {
+        registration.desired_visible = false;
+    }
+    if clear_loading_skills {
+        world
+            .get_component_mut::<AgentStatus>(agent)
+            .ok_or_else(|| {
+                AgentVisibilityError::new(
+                    AgentVisibilityErrorKind::VisibilityMissing,
+                    "Agent status is missing",
+                )
+            })?
+            .unload_all_skills();
+    }
+    for resource_id in removed {
+        events.send_event(AgentVisibleResourceRemoved {
+            id: id.to_owned(),
+            agent,
+            resource_id,
+        });
+    }
+    Ok(())
+}
+
+fn collect_agent_tool_registration_system(world: &mut World) {
+    let responses = world
+        .event_reader::<AgentToolRegisterResponse>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let events = world.event_sender();
+    for response in responses {
+        let key = world
+            .get_resource::<InFlightVisibilityRegistrations>()
+            .expect("AgentPlugin is not installed")
+            .registrations
+            .iter()
+            .find_map(|(key, registration)| {
+                (registration.registration_id == response.id).then(|| key.clone())
+            });
+        let Some(key) = key else {
+            tracing::warn!(registration_id = %response.id, "unmatched Agent tool registration response");
+            continue;
+        };
+        let registration = world
+            .get_resource_mut::<InFlightVisibilityRegistrations>()
+            .expect("AgentPlugin is not installed")
+            .registrations
+            .remove(&key)
+            .expect("registration key was just found");
+        if registration.agent != response.agent || registration.resource_id != response.resource_id
+        {
+            notify_registration_failure(
+                &registration,
+                AgentVisibilityError::new(
+                    AgentVisibilityErrorKind::RegistrationResponseMismatch,
+                    "Agent tool registration response does not match its request",
+                ),
+                &events,
+            );
+            continue;
+        }
+        if let Err(error) = response.result {
+            notify_registration_failure(
+                &registration,
+                AgentVisibilityError::new(
+                    AgentVisibilityErrorKind::RegistrationFailed,
+                    error.to_string(),
+                ),
+                &events,
+            );
+            continue;
+        }
+        let valid_mapping = world.is_alive(registration.agent)
+            && world
+                .get_component::<AgentToolMap>(registration.agent)
+                .is_some_and(|map| map.get_by_resource(&registration.resource_id).len() == 1);
+        if !valid_mapping {
+            notify_registration_failure(
+                &registration,
+                AgentVisibilityError::new(
+                    AgentVisibilityErrorKind::RegistrationResponseMismatch,
+                    "Agent tool registration succeeded without one matching tool map",
+                ),
+                &events,
+            );
+            continue;
+        }
+        if !registration.desired_visible {
+            continue;
+        }
+        let Some(visibility) =
+            world.get_component_mut::<AgentDynamicVisibility>(registration.agent)
+        else {
+            notify_registration_failure(
+                &registration,
+                AgentVisibilityError::new(
+                    AgentVisibilityErrorKind::VisibilityMissing,
+                    "Agent dynamic visibility disappeared before registration completed",
+                ),
+                &events,
+            );
+            continue;
+        };
+        visibility
+            .resources
+            .insert(registration.resource_id.clone());
+        for id in &registration.notification_ids {
+            events.send_event(AgentVisibleResourceInjected {
+                id: id.clone(),
+                agent: registration.agent,
+                resource_id: registration.resource_id.clone(),
+            });
+        }
+    }
+}
+
+fn cleanup_dead_agent_registrations_system(world: &mut World) {
+    let dead = world
+        .get_resource::<InFlightVisibilityRegistrations>()
+        .expect("AgentPlugin is not installed")
+        .registrations
+        .keys()
+        .filter(|(agent, _)| !world.is_alive(*agent))
+        .cloned()
+        .collect::<Vec<_>>();
+    let registrations = world
+        .get_resource_mut::<InFlightVisibilityRegistrations>()
+        .expect("AgentPlugin is not installed");
+    for key in dead {
+        registrations.registrations.remove(&key);
+    }
+    let dead_schemas = world
+        .get_resource::<PendingInferenceToolSchemas>()
+        .expect("AgentPlugin is not installed")
+        .schemas
+        .keys()
+        .filter(|(agent, _)| !world.is_alive(*agent))
+        .cloned()
+        .collect::<Vec<_>>();
+    let schemas = world
+        .get_resource_mut::<PendingInferenceToolSchemas>()
+        .expect("AgentPlugin is not installed");
+    for key in dead_schemas {
+        schemas.schemas.remove(&key);
+    }
+}
+
+fn notify_registration_failure(
+    registration: &InFlightVisibilityRegistration,
+    error: AgentVisibilityError,
+    events: &RuntimeEventSender,
+) {
+    for id in &registration.notification_ids {
+        send_visibility_injection_failed(
+            id,
+            registration.agent,
+            &registration.resource_id,
+            error.clone(),
+            events,
+        );
+    }
+}
+
+fn send_visibility_injection_failed(
+    id: &str,
+    agent: Entity,
+    resource_id: &ResourceId,
+    error: AgentVisibilityError,
+    events: &RuntimeEventSender,
+) {
+    tracing::warn!(request_id = id, ?agent, resource = %resource_id, error = %error, "Agent visible resource injection failed");
+    events.send_event(AgentVisibleResourceInjectionFailed {
+        id: id.to_owned(),
+        agent,
+        resource_id: resource_id.clone(),
+        error,
+    });
+}
+
+fn report_visibility_operation_failure(
+    id: &str,
+    agent: Entity,
+    error: AgentVisibilityError,
+    events: &RuntimeEventSender,
+) {
+    events.send_event(AgentFailure {
+        id: id.to_owned(),
+        agent,
+        kind: AgentFailureKind::Agent,
+        message: error.to_string(),
+    });
 }
 
 fn agent_skill_state_system(world: &mut World) {
@@ -492,7 +1258,7 @@ fn handle_agent_message(
                 .ok_or(AgentStepError::StatusMissing)?
                 .begin_turn(event.id.clone())?;
             clear_tool_context(world, agent, events)?;
-            record_history_message(event, events);
+            record_history_message(world, event, events);
             append_conversation_message(world, agent, event.message.clone(), events)?;
             dispatch_tool_calls(world, &event.id, agent, tool_calls, true, events)?
         }
@@ -507,7 +1273,7 @@ fn handle_agent_message(
                 return Err(AgentStepError::InvalidToolBatch);
             }
             clear_tool_context(world, agent, events)?;
-            record_history_message(event, events);
+            record_history_message(world, event, events);
             append_conversation_message(world, agent, event.message.clone(), events)?;
             if !tool_calls.is_empty() {
                 dispatch_tool_calls(world, &event.id, agent, tool_calls, true, events)?
@@ -529,7 +1295,7 @@ fn handle_agent_message(
             {
                 return Err(AgentStepError::InvalidToolBatch);
             }
-            record_history_message(event, events);
+            record_history_message(world, event, events);
             append_tool_context(world, agent, event.message.clone(), events)?;
             if resource_id.resource_type() == "skill" {
                 world
@@ -546,7 +1312,17 @@ fn handle_agent_message(
     Ok(result)
 }
 
-fn record_history_message(event: &AgentMessage, events: &RuntimeEventSender) {
+fn record_history_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender) {
+    let tool_schema = if matches!(event.message, Message::Assistant { .. }) {
+        world
+            .get_resource_mut::<PendingInferenceToolSchemas>()
+            .expect("AgentPlugin is not installed")
+            .schemas
+            .remove(&(event.agent, event.id.clone()))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let message = match &event.message {
         Message::Tool {
             resource_id,
@@ -563,6 +1339,7 @@ fn record_history_message(event: &AgentMessage, events: &RuntimeEventSender) {
         id: event.id.clone(),
         agent: event.agent,
         message,
+        tool_schema,
     });
 }
 
@@ -676,7 +1453,7 @@ fn expand_loading_skills(world: &World, agent: Entity) -> Result<Vec<ToolCall>, 
 }
 
 fn send_inference_request(
-    world: &World,
+    world: &mut World,
     id: &str,
     agent: Entity,
     events: &RuntimeEventSender,
@@ -685,7 +1462,7 @@ fn send_inference_request(
     let messages = build_inference_context(world, agent)?;
     let agent_id = world
         .get_component::<AgentIdentity>(agent)
-        .map(AgentIdentity::id)
+        .map(|identity| identity.id().clone())
         .ok_or(AgentStepError::IdentityMissing)?;
     tracing::info!(
         request_id = id,
@@ -694,10 +1471,15 @@ fn send_inference_request(
         tools = available_tools.definitions.len(),
         "inference requested"
     );
+    world
+        .get_resource_mut::<PendingInferenceToolSchemas>()
+        .expect("AgentPlugin is not installed")
+        .schemas
+        .insert((agent, id.to_owned()), available_tools.definitions.clone());
     events.send_event(InferenceRequestEvent {
         id: id.to_owned(),
         agent,
-        agent_id: agent_id.clone(),
+        agent_id,
         messages,
         tools: available_tools.definitions,
     });
@@ -754,16 +1536,15 @@ fn tool_turn_completed_system(world: &mut World) {
         .collect::<Vec<_>>();
     let events = world.event_sender();
     for event in completed {
-        let result = world
+        let current_turn = world
             .get_component::<AgentStatus>(event.agent)
             .ok_or(AgentStepError::StatusMissing)
-            .and_then(|status| {
-                if status.turn_id.as_deref() == Some(&event.turn_id) {
-                    send_inference_request(world, &event.turn_id, event.agent, &events)
-                } else {
-                    Err(AgentStepError::InvalidToolBatch)
-                }
-            });
+            .map(|status| status.turn_id.as_deref() == Some(&event.turn_id));
+        let result = match current_turn {
+            Ok(true) => send_inference_request(world, &event.turn_id, event.agent, &events),
+            Ok(false) => Err(AgentStepError::InvalidToolBatch),
+            Err(error) => Err(error),
+        };
         if let Err(error) = result {
             events.send_event(AgentFailure {
                 id: event.turn_id,
@@ -786,6 +1567,20 @@ fn assert_conversation_messages(messages: &[Message]) {
     for message in messages {
         assert_conversation_message(message);
     }
+}
+
+fn bounded_message(mut message: String) -> String {
+    const LIMIT: usize = 512;
+    if message.len() <= LIMIT {
+        return message;
+    }
+    let mut boundary = LIMIT - 3;
+    while !message.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    message.truncate(boundary);
+    message.push_str("...");
+    message
 }
 
 #[cfg(all(test, any()))]
@@ -1083,17 +1878,63 @@ mod tests {
 
 #[cfg(test)]
 mod loading_skill_tests {
+    use serde_json::json;
+    use tool_plugin::{register_agent_tool, ToolPlugin, ToolTemplate};
+
     use super::*;
 
     fn test_app() -> (App, Entity) {
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
+            .add_plugin(ToolPlugin::default())
             .add_plugin(AgentPlugin::default());
         let agent = app.world_mut().spawn();
         assert!(app
             .world_mut()
             .insert_component(agent, AgentStatus::default()));
         (app, agent)
+    }
+
+    #[test]
+    fn assistant_history_uses_the_matching_inference_tool_schema() {
+        let (mut app, agent) = test_app();
+        let schema = vec![ToolDefinition {
+            name: "tool0_read".into(),
+            description: "Read a file.".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        app.world_mut()
+            .get_resource_mut::<PendingInferenceToolSchemas>()
+            .unwrap()
+            .schemas
+            .insert((agent, "turn-1".into()), schema.clone());
+        let message = AgentMessage {
+            id: "turn-1".into(),
+            agent,
+            message: Message::Assistant {
+                reasoning: None,
+                content: Some("done".into()),
+                tool_calls: Vec::new(),
+            },
+        };
+        let events = app.world().event_sender();
+
+        record_history_message(app.world_mut(), &message, &events);
+        app.tick();
+
+        let write = app
+            .world()
+            .event_reader::<AgentHistoryMessageWriteRequested>()
+            .into_iter()
+            .find(|event| event.id == "turn-1")
+            .unwrap();
+        assert_eq!(write.tool_schema, schema);
+        assert!(app
+            .world()
+            .get_resource::<PendingInferenceToolSchemas>()
+            .unwrap()
+            .schemas
+            .is_empty());
     }
 
     #[test]
@@ -1185,6 +2026,167 @@ mod loading_skill_tests {
             .get_component::<AgentStatus>(agent)
             .unwrap()
             .loading_skills
+            .is_empty());
+    }
+
+    #[test]
+    fn removing_a_resource_while_registration_is_in_flight_prevents_late_injection() {
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default())
+            .add_plugin(ToolPlugin::default())
+            .add_plugin(AgentPlugin::default());
+        let workspace = app.world_mut().spawn();
+        let resource_id = ResourceId::parse("skill:local/review:latest").unwrap();
+        app.world().send_event(AgentCreateRequest {
+            id: "agent-create".into(),
+            agent_id: ResourceId::parse("agent:demo/reviewer:latest").unwrap(),
+            workspace_id: workspace,
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tool_context: Vec::new(),
+            default_visibility: BTreeSet::from([resource_id.clone()]),
+        });
+        app.tick();
+        app.tick();
+        let agent = app
+            .world()
+            .event_reader::<AgentCreated>()
+            .into_iter()
+            .next()
+            .unwrap()
+            .agent;
+        let registration = (0..8)
+            .find_map(|_| {
+                app.tick();
+                app.world()
+                    .event_reader::<AgentToolRegisterRequest>()
+                    .into_iter()
+                    .next()
+                    .cloned()
+            })
+            .expect("default visibility should request tool registration");
+
+        app.world().remove_agent_visible_resource(
+            "remove-during-registration",
+            agent,
+            resource_id.clone(),
+        );
+        app.tick();
+        register_agent_tool(
+            app.world_mut(),
+            agent,
+            ResourceId::parse("tool:builtin/skill-loader:latest").unwrap(),
+            resource_id.clone(),
+            ToolTemplate::new("ignored", "test", json!({"type": "object"})).unwrap(),
+        )
+        .unwrap();
+        app.world().send_event(AgentToolRegisterResponse {
+            id: registration.id,
+            agent,
+            resource_id: resource_id.clone(),
+            result: Ok(()),
+        });
+        app.tick();
+
+        assert!(!app
+            .world()
+            .get_component::<AgentDynamicVisibility>(agent)
+            .unwrap()
+            .resources()
+            .contains(&resource_id));
+        assert!(app
+            .world()
+            .event_reader::<AgentVisibleResourceRemoved>()
+            .into_iter()
+            .any(|event| event.id == "remove-during-registration"));
+        assert!(!app
+            .world()
+            .event_reader::<AgentVisibleResourceInjected>()
+            .into_iter()
+            .any(|event| event.resource_id == resource_id));
+    }
+
+    #[test]
+    fn removing_skill_visibility_also_unloads_the_skill() {
+        let (mut app, agent) = test_app();
+        let skill = ResourceId::parse("skill:local/review:latest").unwrap();
+        assert!(app.world_mut().insert_component(
+            agent,
+            AgentDefaultVisibility {
+                resources: BTreeSet::from([skill.clone()]),
+            },
+        ));
+        assert!(app.world_mut().insert_component(
+            agent,
+            AgentDynamicVisibility {
+                resources: BTreeSet::from([skill.clone()]),
+            },
+        ));
+        assert!(app
+            .world_mut()
+            .get_component_mut::<AgentStatus>(agent)
+            .unwrap()
+            .load_skill(skill.clone())
+            .is_ok());
+
+        app.world().send_event(SetAgentDefaultResourceVisibility {
+            id: "remove-default-skill".into(),
+            agent,
+            resource_id: skill.clone(),
+            visible: false,
+        });
+        app.tick();
+
+        assert!(!app
+            .world()
+            .get_component::<AgentDynamicVisibility>(agent)
+            .unwrap()
+            .resources()
+            .contains(&skill));
+        assert!(!app
+            .world()
+            .get_component::<AgentStatus>(agent)
+            .unwrap()
+            .loading_skills
+            .contains(&skill));
+    }
+
+    #[test]
+    fn external_visibility_switch_rejects_non_default_resources() {
+        let (mut app, agent) = test_app();
+        assert!(app.world_mut().insert_component(
+            agent,
+            AgentDefaultVisibility {
+                resources: BTreeSet::new(),
+            },
+        ));
+        assert!(app.world_mut().insert_component(
+            agent,
+            AgentDynamicVisibility {
+                resources: BTreeSet::new(),
+            },
+        ));
+        app.world().send_event(SetAgentDefaultResourceVisibility {
+            id: "inject-runtime-resource".into(),
+            agent,
+            resource_id: ResourceId::parse("tool:runtime/injected:latest").unwrap(),
+            visible: true,
+        });
+        app.tick();
+        app.tick();
+
+        let failure = app
+            .world()
+            .event_reader::<AgentFailure>()
+            .into_iter()
+            .find(|event| event.id == "inject-runtime-resource")
+            .unwrap();
+        assert_eq!(failure.kind, AgentFailureKind::Agent);
+        assert!(app
+            .world()
+            .get_component::<AgentDynamicVisibility>(agent)
+            .unwrap()
+            .resources()
             .is_empty());
     }
 }

@@ -2,13 +2,14 @@ use std::fs;
 
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
-use builtin_tool_plugin::{
-    BuiltinResourceRegisterRequest, BuiltinResourceRegisterResponse, BuiltinToolPlugin,
-};
+use builtin_tool_plugin::BuiltinToolPlugin;
 use core_plugin::App;
 use margatroid_types::ResourceId;
 use tempfile::tempdir;
-use tool_plugin::{attach_agent_tool_map, AgentToolEnvironment, AgentToolMap, ToolPlugin};
+use tool_plugin::{
+    attach_agent_tool_map, AgentToolEnvironment, AgentToolMap, AgentToolRegisterRequest,
+    AgentToolRegisterResponse, ToolPlugin,
+};
 
 #[test]
 fn routes_visible_shell_resources_to_the_hidden_shell_executor() {
@@ -47,7 +48,7 @@ fn routes_visible_shell_resources_to_the_hidden_shell_executor() {
     attach_agent_tool_map(app.world_mut(), agent).unwrap();
 
     let resource_id = ResourceId::parse("shell:local/sh:latest").unwrap();
-    app.world().send_event(BuiltinResourceRegisterRequest {
+    app.world().send_event(AgentToolRegisterRequest {
         id: "register-shell".into(),
         agent,
         resource_id: resource_id.clone(),
@@ -58,7 +59,7 @@ fn routes_visible_shell_resources_to_the_hidden_shell_executor() {
 
     let response = app
         .world()
-        .event_reader::<BuiltinResourceRegisterResponse>()
+        .event_reader::<AgentToolRegisterResponse>()
         .into_iter()
         .find(|response| response.id == "register-shell")
         .unwrap();
@@ -85,7 +86,7 @@ fn rejects_builtin_executors_as_visible_resources() {
         .add_plugin(BuiltinToolPlugin::open(data_root.path()).unwrap());
     let agent = app.world_mut().spawn();
     let resource_id = ResourceId::parse("tool:builtin/shell:latest").unwrap();
-    app.world().send_event(BuiltinResourceRegisterRequest {
+    app.world().send_event(AgentToolRegisterRequest {
         id: "register-builtin".into(),
         agent,
         resource_id,
@@ -95,7 +96,7 @@ fn rejects_builtin_executors_as_visible_resources() {
 
     let response = app
         .world()
-        .event_reader::<BuiltinResourceRegisterResponse>()
+        .event_reader::<AgentToolRegisterResponse>()
         .into_iter()
         .find(|response| response.id == "register-builtin")
         .unwrap();

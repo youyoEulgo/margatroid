@@ -5,15 +5,17 @@ use agent_plugin::{AgentDynamicVisibility, AgentIdentity, WorldAgentExt};
 use core_plugin::{Entity, World};
 use log_plugin::{TracingField, TracingRecord};
 use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentMessage, AgentSkillRouteAction, Message, ResourceId,
-    RouteAgentMessage, RouteAgentSkill, StartWorkspace, ToolCall, WorkspaceAgentDefinition,
-    WorkspaceDefinition, WorkspaceReference,
+    AgentFailure, AgentFailureKind, AgentMessage, AgentSkillRouteAction,
+    AgentVisibilityRouteAction, Message, ResourceId, RouteAgentMessage, RouteAgentSkill,
+    RouteAgentVisibility, StartWorkspace, ToolCall, WorkspaceAgentDefinition, WorkspaceDefinition,
+    WorkspaceReference,
 };
 use memory_plugin::{AgentMemory, HistoryMessage};
 use serde::{Deserialize, Serialize};
 use server_plugin::{RegisterConnection, WebSocketConnectionId};
 use workspace_plugin::{
-    StopWorkspaceByReference, WorkspaceAgents, WorkspaceConfiguration, WorldWorkspaceExt,
+    StopWorkspaceByReference, WorkspaceAgentState, WorkspaceAgents, WorkspaceConfiguration,
+    WorldWorkspaceExt,
 };
 
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
@@ -89,6 +91,16 @@ pub enum ClientMessage {
     AgentSkillUnloadAll {
         id: String,
         message: RouteAgentSkillDto,
+    },
+    #[serde(rename = "agent.visibility.inject")]
+    AgentVisibilityInject {
+        id: String,
+        message: RouteAgentVisibilityDto,
+    },
+    #[serde(rename = "agent.visibility.remove")]
+    AgentVisibilityRemove {
+        id: String,
+        message: RouteAgentVisibilityDto,
     },
 }
 
@@ -340,6 +352,30 @@ pub struct RouteAgentSkillDto {
     pub resource_id: Option<ResourceIdDto>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteAgentVisibilityDto {
+    pub workspace: WorkspaceReferenceDto,
+    pub agent: Option<ResourceIdDto>,
+    pub resource_id: ResourceIdDto,
+}
+
+impl IntoDomain<RouteAgentVisibility, (String, AgentVisibilityRouteAction)>
+    for RouteAgentVisibilityDto
+{
+    fn into_domain(
+        self,
+        (id, action): (String, AgentVisibilityRouteAction),
+    ) -> Result<RouteAgentVisibility, ProtocolError> {
+        Ok(RouteAgentVisibility {
+            id,
+            workspace: self.workspace.into_domain(())?,
+            agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
+            resource_id: self.resource_id.into_domain(())?,
+            action,
+        })
+    }
+}
+
 impl RouteAgentSkillDto {
     fn into_domain(
         self,
@@ -586,9 +622,22 @@ pub struct BackendStateDto {
 pub struct AgentStateDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: ResourceIdDto,
+    pub status: WorkspaceAgentStatusDto,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub default_resources: Vec<ResourceIdDto>,
     pub visible_resources: Vec<ResourceIdDto>,
     #[serde(default)]
     pub loading_skills: Vec<ResourceIdDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceAgentStatusDto {
+    Creating,
+    Ready,
+    Failed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,6 +739,18 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
                     "Agent dynamic visibility is missing",
                 )
             })?;
+        let default_resources = world
+            .get_component::<agent_plugin::AgentDefaultVisibility>(agent)
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorKind::AgentNotFound,
+                    "Agent default visibility is missing",
+                )
+            })?
+            .resources()
+            .iter()
+            .map(|resource| resource.into_dto(()))
+            .collect::<Result<Vec<_>, _>>()?;
         let visible_resources = visibility
             .resources()
             .iter()
@@ -715,6 +776,9 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
         Ok(Self {
             workspace: workspace.reference(),
             agent: identity.id().into_dto(())?,
+            status: WorkspaceAgentStatusDto::Ready,
+            error: None,
+            default_resources,
             visible_resources,
             loading_skills,
         })
@@ -747,8 +811,51 @@ impl FromDomain<(), &World> for BackendStateDto {
                         "workspace Agent index is missing",
                     )
                 })?;
-            for (name, agent) in agents.iter() {
-                agent_states.push(AgentStateDto::from_domain((agent, name, &info), world)?);
+            let configuration = world
+                .get_component::<WorkspaceConfiguration>(workspace)
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorKind::WorkspaceNotFound,
+                        "workspace configuration is missing",
+                    )
+                })?;
+            for (name, state) in agents.states() {
+                let definition = configuration
+                    .definition()
+                    .agents
+                    .iter()
+                    .find(|agent| agent.name == name)
+                    .ok_or_else(|| {
+                        ProtocolError::new(
+                            ProtocolErrorKind::AgentNotFound,
+                            "workspace Agent state is not present in its definition",
+                        )
+                    })?;
+                match state {
+                    WorkspaceAgentState::Ready { agent } => {
+                        agent_states.push(AgentStateDto::from_domain((*agent, name, &info), world)?)
+                    }
+                    WorkspaceAgentState::Creating => agent_states.push(AgentStateDto {
+                        workspace: info.reference(),
+                        agent: (&definition.id).into_dto(())?,
+                        status: WorkspaceAgentStatusDto::Creating,
+                        error: None,
+                        default_resources: Vec::new(),
+                        visible_resources: Vec::new(),
+                        loading_skills: Vec::new(),
+                    }),
+                    WorkspaceAgentState::Failed { error } => agent_states.push(AgentStateDto {
+                        workspace: info.reference(),
+                        agent: (&definition.id).into_dto(())?,
+                        status: WorkspaceAgentStatusDto::Failed,
+                        error: Some(error.to_string()),
+                        default_resources: Vec::new(),
+                        visible_resources: Vec::new(),
+                        loading_skills: Vec::new(),
+                    }),
+                }
+            }
+            for (_name, agent) in agents.iter() {
                 let memory = world.get_component::<AgentMemory>(agent).ok_or_else(|| {
                     ProtocolError::new(ProtocolErrorKind::MemoryNotFound, "Agent memory is missing")
                 })?;
@@ -1019,9 +1126,11 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    use agent_plugin::{AgentCreateRequest, AgentCreated, AgentPlugin};
+    use agent_plugin::{AgentCreateRequest, AgentCreateResult, AgentPlugin, WorldAgentExt};
     use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
     use core_plugin::App;
+    use serde_json::json;
+    use tool_plugin::{register_agent_tool, ToolPlugin, ToolTemplate};
 
     use super::*;
 
@@ -1091,6 +1200,32 @@ mod tests {
         assert_eq!(value["id"], "stop-1");
         assert_eq!(value["message"]["workspace"]["name"], "demo");
         assert_eq!(value["message"]["workspace"]["project_root"], "/tmp/demo");
+    }
+
+    #[test]
+    fn agent_visibility_inject_uses_stable_shape_and_domain_route() {
+        let value = json!({
+            "type": "agent.visibility.inject",
+            "id": "visibility-1",
+            "message": {
+                "workspace": workspace_reference(),
+                "agent": "agent:demo/coder:latest",
+                "resource_id": "skill:local/review:latest"
+            }
+        });
+        let request: ClientMessage = serde_json::from_value(value).unwrap();
+        let ClientMessage::AgentVisibilityInject { id, message } = request else {
+            panic!("expected agent visibility injection");
+        };
+        let route = message
+            .into_domain((id, AgentVisibilityRouteAction::Inject))
+            .unwrap();
+
+        assert_eq!(route.id, "visibility-1");
+        assert_eq!(route.workspace.name, "demo");
+        assert_eq!(route.agent.unwrap().to_string(), "agent:demo/coder:latest");
+        assert_eq!(route.resource_id.to_string(), "skill:local/review:latest");
+        assert_eq!(route.action, AgentVisibilityRouteAction::Inject);
     }
 
     #[test]
@@ -1238,6 +1373,9 @@ mod tests {
                 agents: vec![AgentStateDto {
                     workspace: workspace_reference(),
                     agent: ResourceIdDto("agent:demo/coder:latest".into()),
+                    status: WorkspaceAgentStatusDto::Ready,
+                    error: None,
+                    default_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
                     visible_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
                     loading_skills: vec![ResourceIdDto("skill:local/review:latest".into())],
                 }],
@@ -1290,6 +1428,7 @@ mod tests {
     fn agent_state_projects_dynamic_visibility() {
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
+            .add_plugin(ToolPlugin::default())
             .add_plugin(AgentPlugin::default());
         let workspace = app.world_mut().spawn();
         let skill = ResourceId::parse("skill:local/review").unwrap();
@@ -1300,17 +1439,32 @@ mod tests {
             system_prompt: "system".into(),
             messages: Vec::new(),
             tool_context: Vec::new(),
-            default_visibility: BTreeSet::from([skill]),
+            default_visibility: BTreeSet::from([skill.clone()]),
         });
         app.tick();
         app.tick();
         let agent = app
             .world()
-            .event_reader::<AgentCreated>()
+            .event_reader::<AgentCreateResult>()
             .into_iter()
             .find(|event| event.id == "create-1")
             .unwrap()
-            .agent;
+            .result
+            .as_ref()
+            .copied()
+            .unwrap();
+        register_agent_tool(
+            app.world_mut(),
+            agent,
+            ResourceId::parse("tool:builtin/skill-loader:latest").unwrap(),
+            skill.clone(),
+            ToolTemplate::new("placeholder", "Load a skill.", json!({"type":"object"})).unwrap(),
+        )
+        .unwrap();
+        app.world()
+            .inject_agent_visible_resource("inject-1", agent, skill);
+        app.tick();
+        app.tick();
         let workspace = (&definition()).into_dto(()).unwrap();
 
         let state = AgentStateDto::from_domain((agent, "coder", &workspace), app.world()).unwrap();
@@ -1318,6 +1472,7 @@ mod tests {
         assert_eq!(state.workspace.name, "demo");
         assert_eq!(state.agent, ResourceIdDto("agent:demo/coder:latest".into()));
         assert_eq!(state.visible_resources.len(), 1);
+        assert_eq!(state.default_resources.len(), 1);
         assert!(state.loading_skills.is_empty());
         assert_eq!(
             state.visible_resources[0],

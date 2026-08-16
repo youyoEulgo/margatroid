@@ -13,6 +13,8 @@ agent.message        -> RouteAgentMessage
 agent.skill.load     -> RouteAgentSkill { Load }
 agent.skill.unload   -> RouteAgentSkill { Unload }
 agent.skill.unload_all -> RouteAgentSkill { UnloadAll }
+agent.visibility.inject -> RouteAgentVisibility { Inject }
+agent.visibility.remove -> RouteAgentVisibility { Remove }
 ```
 
 它还收集允许发送给外部的 `StartWorkspaceResult`、`StopWorkspaceByReferenceResult`、`AgentMessage` 和 `AgentFailure`，调用 Protocol

@@ -84,7 +84,7 @@ dto_route_system(world: &mut World)
         收集WebSocketMessageReceived并要求消息为Text
         反序列化统一{type,id,message}信封为ClientMessage
         按type取得对应DTO并调用DTO::into_domain
-        转换成功后直接发送StartWorkspace、StopWorkspaceByReference、RouteAgentMessage、RouteAgentSkill或RegisterConnection领域事件
+        转换成功后直接发送StartWorkspace、StopWorkspaceByReference、RouteAgentMessage、RouteAgentSkill、RouteAgentVisibility或RegisterConnection领域事件
         转换失败时记录warning并丢弃当前请求
 
         WebSocketMessageSend:
@@ -98,12 +98,13 @@ collect_external_events_system(world: &mut World)
     行为：
         将Server生命周期、WebSocket连接、断开和协议失败写入结构化日志
         收集StartWorkspaceResult、StopWorkspaceByReferenceResult、AgentMessage和AgentFailure
+        AgentCreateResult、AgentVisibleResourceInjected、AgentVisibleResourceRemoved和AgentVisibleResourceInjectionFailed不单独生成API消息；它们通过BackendStateDto和结构化日志体现
         调用Protocol的FromDomain实现解析Workspace和Agent逻辑身份
         构造对应WorkspaceStarted、WorkspaceStartFailed、WorkspaceStopped、WorkspaceStopFailed、AgentMessage或AgentFailure协议事件
         记录Workspace启停、用户消息路由、Assistant响应和Agent失败等业务日志
         Workspace启停结果及AgentFailure选择logs目标，AgentMessage选择member_messages目标
         发送WebSocketMessageSend
-        调用()::into_dto(&World)构造包含Workspace、Agent动态可见性和历史的BackendStateDto
+        调用()::into_dto(&World)构造包含Workspace定义、每个Agent的Creating/Ready/Failed状态、Ready Agent动态可见性和历史的BackendStateDto
         状态内容或backend_state接收连接集合变化时才发送StateSync
         相同状态转换错误只记录一次，成功后清除错误缓存
         将StateSync发送给backend_state指定目标

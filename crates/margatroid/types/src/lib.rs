@@ -377,6 +377,23 @@ pub struct RouteAgentSkill {
 
 impl Event for RouteAgentSkill {}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentVisibilityRouteAction {
+    Inject,
+    Remove,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteAgentVisibility {
+    pub id: String,
+    pub workspace: WorkspaceReference,
+    pub agent: Option<ResourceId>,
+    pub resource_id: ResourceId,
+    pub action: AgentVisibilityRouteAction,
+}
+
+impl Event for RouteAgentVisibility {}
+
 impl Event for RouteAgentMessage {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,11 +467,12 @@ pub struct AgentContextMessagesUpdated {
 
 impl Event for AgentContextMessagesUpdated {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentHistoryMessageWriteRequested {
     pub id: String,
     pub agent: Entity,
     pub message: Message,
+    pub tool_schema: Vec<ToolDefinition>,
 }
 
 impl Event for AgentHistoryMessageWriteRequested {}

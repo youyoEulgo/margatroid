@@ -174,6 +174,23 @@ impl AgentToolMap {
 impl Component for AgentToolMap {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentToolRegisterRequest {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceId,
+}
+impl Event for AgentToolRegisterRequest {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentToolRegisterResponse {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceId,
+    pub result: Result<(), ToolError>,
+}
+impl Event for AgentToolRegisterResponse {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallEvent {
     pub turn_id: String,
     pub agent: Entity,
@@ -311,13 +328,6 @@ impl PendingToolCalls {
                 && request.turn_id == turn_id
                 && request.tool_call_id == tool_call_id
         })
-    }
-
-    fn get_by_agent(&self, agent: Entity) -> Vec<&ToolCallRequest> {
-        self.calls
-            .iter()
-            .filter(|request| request.agent == agent)
-            .collect()
     }
 
     fn get_by_turn(&self, agent: Entity, turn_id: &str) -> Vec<&ToolCallRequest> {

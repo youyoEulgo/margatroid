@@ -1,18 +1,20 @@
 use std::collections::BTreeSet;
 
 use agent_plugin::{
-    AgentContext, AgentCreateRequest, AgentCreated, AgentDefaultVisibility, AgentDynamicVisibility,
-    AgentPlugin, AgentWorkspaceId, LoadAgentSkill, UnloadAgentSkill, UnloadAllAgentSkills,
-    WorldAgentExt,
+    AgentContext, AgentCreateRequest, AgentCreateResult, AgentCreated, AgentDefaultVisibility,
+    AgentDynamicVisibility, AgentPlugin, AgentWorkspaceId, LoadAgentSkill, UnloadAgentSkill,
+    UnloadAllAgentSkills, WorldAgentExt,
 };
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::App;
 use margatroid_types::ResourceId;
+use tool_plugin::ToolPlugin;
 
 #[test]
 fn documented_public_api_creates_an_agent() {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
+        .add_plugin(ToolPlugin::default())
         .add_plugin(AgentPlugin::default());
     let workspace = app.world_mut().spawn();
     app.world().send_event(AgentCreateRequest {
@@ -29,12 +31,17 @@ fn documented_public_api_creates_an_agent() {
 
     let created = app
         .world()
-        .event_reader::<AgentCreated>()
+        .event_reader::<AgentCreateResult>()
         .into_iter()
         .next()
         .unwrap();
     assert_eq!(created.id, "agent-1");
-    let agent = created.agent;
+    let agent = created.result.as_ref().copied().unwrap();
+    assert!(app
+        .world()
+        .event_reader::<AgentCreated>()
+        .into_iter()
+        .any(|event| event.id == "agent-1" && event.agent == agent));
     assert_eq!(
         app.world()
             .get_component::<AgentWorkspaceId>(agent)
@@ -67,6 +74,7 @@ fn documented_public_api_creates_an_agent() {
 fn duplicate_agent_resource_ids_are_rejected() {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
+        .add_plugin(ToolPlugin::default())
         .add_plugin(AgentPlugin::default());
     let workspace = app.world_mut().spawn();
     let agent_id = ResourceId::parse("agent:test/agent0").unwrap();
@@ -87,11 +95,16 @@ fn duplicate_agent_resource_ids_are_rejected() {
 
     let created = app
         .world()
-        .event_reader::<AgentCreated>()
+        .event_reader::<AgentCreateResult>()
         .into_iter()
         .collect::<Vec<_>>();
-    assert_eq!(created.len(), 1);
-    assert_eq!(app.world().agent(&agent_id), Some(created[0].agent));
+    assert_eq!(created.len(), 2);
+    let successful = created
+        .iter()
+        .filter_map(|result| result.result.as_ref().ok().copied())
+        .collect::<Vec<_>>();
+    assert_eq!(successful.len(), 1);
+    assert_eq!(app.world().agent(&agent_id), Some(successful[0]));
 }
 
 #[test]
