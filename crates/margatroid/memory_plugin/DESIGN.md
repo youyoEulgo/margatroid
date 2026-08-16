@@ -65,8 +65,9 @@ HistoryMessage：可展示历史条目，公开结构体--对应history_messages
     sequence: i64--单Agent永久递增序号
     turn_id: String--原AgentMessage.id
     message: Message--User、Assistant或Tool
+    tool_schema: Vec<ToolDefinition>--该Assistant产生时实际发送的内部ToolSpec；User和Tool为空
     created_at_ms: i64--写入时Unix毫秒时间
-    impl Clone + PartialEq + Eq for HistoryMessage
+    impl Clone + PartialEq for HistoryMessage
         值语义：公开trait实现
 
 AgentMemoryWriteFailed：记忆写入失败事件，公开结构体
@@ -126,6 +127,7 @@ initialize_schema(connection: &mut Connection) -> Result<(), MemoryError>
     初始化数据库：私有函数，事务内迁移旧表并创建不存在的两张业务表
     行为：
         旧history_messages包含message列时改名为history_messages_legacy
+        已分列但缺少tool_schema的history_messages改名为history_messages_layout_legacy
         旧realtime_messages没有context列时改名为realtime_messages_legacy
         history_messages:
             sequence INTEGER PRIMARY KEY AUTOINCREMENT
@@ -134,6 +136,7 @@ initialize_schema(connection: &mut Connection) -> Result<(), MemoryError>
             reasoning TEXT--Assistant完整思考内容，User和Tool为空
             content TEXT--User和Tool为正文，Assistant可以为空
             tool_calls TEXT NOT NULL--User和Assistant的ToolCall数组JSON，Tool固定为[]
+            tool_schema TEXT NOT NULL--Assistant该次推理实际ToolSpec数组JSON，User和Tool固定为[]
             resource_id TEXT--Tool具体资源ResourceId，User和Assistant为空
             tool_call_id TEXT--Tool对应调用ID，User和Assistant为空
             created_at_ms INTEGER NOT NULL
@@ -142,7 +145,7 @@ initialize_schema(connection: &mut Connection) -> Result<(), MemoryError>
             position INTEGER NOT NULL--同一context内从0连续递增
             message TEXT NOT NULL--Message JSON
             PRIMARY KEY(context, position)
-        调用migrate_history和migrate_realtime保留可解码内容，成功后删除legacy表并提交
+        调用migrate_history、migrate_history_layout和migrate_realtime保留可解码内容；旧记录tool_schema固定迁移为[]；成功后删除legacy表并提交
         任一步失败时回滚整个迁移
 
 table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool, MemoryError>
@@ -150,6 +153,9 @@ table_has_column(connection: &Connection, table: &str, column: &str) -> Result<b
 
 migrate_history(transaction: &Transaction) -> Result<(), MemoryError>
     迁移历史：私有函数，解码旧Message JSON并按新分列schema写入
+
+migrate_history_layout(transaction: &Transaction) -> Result<(), MemoryError>
+    重排分列历史：私有函数，保留sequence与全部已有字段，把reasoning移到content前并补tool_schema=[]
 
 migrate_realtime(transaction: &Transaction) -> Result<(), MemoryError>
     迁移实时上下文：私有函数，把User和Assistant放入conversation，把Tool放入tool
@@ -159,7 +165,7 @@ schema_error(error: rusqlite::Error) -> MemoryError
 
 load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>, MemoryError>
     读取历史：私有函数，按role与分列字段重建Message
-    行为：Assistant恢复reasoning，User和Assistant恢复tool_calls，Tool要求tool_calls为[]并恢复resource_id与tool_call_id；任一行非法时整体失败
+    行为：Assistant恢复reasoning、tool_calls和tool_schema；User和Tool要求tool_schema为[]；Tool还要求tool_calls为[]并恢复resource_id与tool_call_id；任一行非法时整体失败
 
 load_realtime_messages(connection: &Connection) -> Result<RealtimeContext, MemoryError>
     恢复实时上下文：私有函数，分别按conversation和tool的position升序读取
@@ -172,13 +178,13 @@ rewrite_realtime_messages(transaction: &Transaction, messages: &[Message], tool_
 insert_history_message(transaction: &Transaction, event: &AgentHistoryMessageWriteRequested, created_at_ms: i64) -> Result<(), MemoryError>
     插入历史消息：私有函数，每个Message写入一行
     行为：
-        User写role=user、content和tool_calls，reasoning、resource_id与tool_call_id为空
-        Assistant写role=assistant、可空reasoning、可空content和tool_calls，resource_id与tool_call_id为空
-        Tool写role=tool、content、resource_id和tool_call_id，reasoning为空且tool_calls固定为[]
+        User写role=user、content和tool_calls，tool_schema固定为[]，reasoning、resource_id与tool_call_id为空
+        Assistant写role=assistant、可空reasoning、可空content、tool_calls和事件携带的tool_schema，resource_id与tool_call_id为空
+        Tool写role=tool、content、resource_id和tool_call_id，reasoning为空且tool_calls与tool_schema固定为[]
         System返回WriteFailed
         MemoryPlugin不判断工具类型；Tool历史content已由AgentPlugin替换为完整resource_id字符串
 
-insert_history_message_values(transaction: &Transaction, turn_id: &str, message: &Message, created_at_ms: i64) -> Result<(), MemoryError>
+insert_history_message_values(transaction: &Transaction, turn_id: &str, message: &Message, tool_schema: &[ToolDefinition], created_at_ms: i64) -> Result<(), MemoryError>
     写入历史分列：私有函数，供历史事件与旧schema迁移共用
 
 sync_history_messages_system(world: &mut World)

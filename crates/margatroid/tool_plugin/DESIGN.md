@@ -33,6 +33,19 @@ AgentToolMap：Agent专属工具表，公开Component--由ToolPlugin挂载到Age
         行为：同一Agent内拒绝重复resource_id映射；不执行工具、不保存测试参数
     impl Component for AgentToolMap
 
+AgentToolRegisterRequest：Agent资源工具注册请求，公开事件--注册协议类型由ToolPlugin提供，具体Provider负责消费
+    id: String--AgentPlugin生成的内部唯一注册请求ID
+    agent: Entity--目标Agent Entity
+    resource_id: ResourceId--待建立ToolMap的模型可见资源ID，不允许tool:builtin/*
+    impl Event for AgentToolRegisterRequest
+
+AgentToolRegisterResponse：Agent资源工具注册响应，公开事件--具体Provider无论成功失败都恰好响应一次
+    id: String--原注册请求ID
+    agent: Entity--原目标Agent Entity
+    resource_id: ResourceId--原资源ID
+    result: Result<(), ToolError>--成功只表示AgentToolMap已经建立，不表示资源已进入动态可见性
+    impl Event for AgentToolRegisterResponse
+
 ToolCallEvent：模型或后端发起的工具调用事件，公开事件--交给ToolPlugin解析Agent专属映射
     turn_id: String--完整交互轮次ID
     agent: Entity--调用所属Agent Entity
@@ -87,7 +100,7 @@ PendingToolCalls：待执行工具调用池，私有Resource--由ToolPlugin独�
 
 ```text
 attach_agent_tool_map(world: &mut World, agent: Entity) -> Result<(), ToolError>
-    挂载工具表：公开函数，由WorkspacePlugin在Agent创建完成后调用；拒绝死亡Entity和重复挂载
+    挂载工具表：公开函数，由AgentPlugin创建Agent时调用；拒绝死亡Entity和重复挂载
 
 register_agent_tool(world: &mut World, agent: Entity, tool_id: ResourceId, resource_id: ResourceId, template: ToolTemplate) -> Result<ToolMap, ToolError>
     注册Agent工具：公开函数，取得AgentToolMap并调用register；不检查Agent可见性、不读取资源、不执行工具
@@ -115,11 +128,16 @@ tool_call_response_system(world: &mut World)
 
 ```text
 注册：
-    WorkspacePlugin创建Agent
-        -> ToolPlugin挂载空AgentToolMap
+    AgentPlugin创建Agent
+        -> 调用ToolPlugin挂载空AgentToolMap
+    WorkspacePlugin挂载Agent运行组件并通知AgentPlugin恢复默认可见性
+        -> AgentPlugin发送AgentToolRegisterRequest
+        -> BuiltinToolPlugin按资源类型路由到具体Provider
         -> 具体工具Plugin验证可见资源
         -> register_agent_tool
         -> AgentToolMap为当前Agent分配tool_name
+        -> AgentToolRegisterResponse
+        -> AgentPlugin决定是否注入AgentDynamicVisibility
 
 调用：
     AgentPlugin -> ToolCallEvent { turn_id, agent, call }
@@ -137,7 +155,11 @@ tool_call_response_system(world: &mut World)
 ```text
 AgentToolMap是Agent Entity上的Component，tool_name只在该Component内唯一；不建立全局tool_name索引。
 ToolPlugin拥有AgentToolMap和PendingToolCalls，负责映射、路由、调用关联、响应整理和批次完成判断。
+ToolPlugin定义AgentToolRegisterRequest和AgentToolRegisterResponse作为中立注册协议，但不消费注册请求、不选择资源Provider。
+Margatroid应用组合必须安装一个注册路由消费者；当前由BuiltinToolPlugin消费全部请求并保证每个请求恰好一个响应。
 ToolPlugin不读取Skill或Workflow文件，不解析具体参数，不执行工具，不检查Agent可见性。
+AgentToolMap注册成功后长期保留；动态移除可见性不删除映射，也不回收next_index或tool_name。
+同一资源重新可见时复用既有ToolMap；ToolPlugin仍不决定该资源何时可见。
 具体工具Plugin负责资源验证、ToolTemplate构造和执行，只返回ToolCallResponse，不自行构造AgentMessage。
 AgentStatus不保存pending tool；get_by_turn只属于PendingToolCalls。
 ```

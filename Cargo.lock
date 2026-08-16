@@ -1193,6 +1193,7 @@ dependencies = [
  "serde",
  "serde_json",
  "server_plugin",
+ "tool_plugin",
  "workspace_plugin",
 ]
 

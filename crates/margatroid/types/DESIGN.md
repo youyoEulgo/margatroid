@@ -140,6 +140,18 @@ RouteAgentSkill：逻辑Agent持久Skill路由命令，公开事件--由DTO层�
     action: AgentSkillRouteAction
     impl Event for RouteAgentSkill
 
+AgentVisibilityRouteAction：Agent默认资源可见性操作，公开枚举
+    Inject
+    Remove
+
+RouteAgentVisibility：逻辑Agent默认资源可见性路由命令，公开事件--由DTO层产生并交给WorkspacePlugin解析Entity
+    id: String--请求ID
+    workspace: WorkspaceReference--目标Workspace逻辑引用
+    agent: Option<ResourceId>--目标Agent完整资源ID，None表示manager
+    resource_id: ResourceId--待开关的完整资源ID
+    action: AgentVisibilityRouteAction
+    impl Event for RouteAgentVisibility
+
 ToolCall：统一工具调用，公开结构体--保存前端指定或Provider返回且后续工具执行必须原样关联的调用
     id: String--调用来源生成的工具调用ID
     tool_name: String--所属AgentToolMap内唯一的模型工具名
@@ -222,6 +234,7 @@ AgentHistoryMessageWriteRequested：Agent历史消息写入请求，公开结构
     id: String--完整交互轮次ID
     agent: Entity--消息所属AgentInstance Entity
     message: Message--需要写入历史的消息，Skill响应已由AgentPlugin替换为加载标记
+    tool_schema: Vec<ToolDefinition>--产生Assistant的该次推理实际ToolSpec；User和Tool固定为空
     impl Event for AgentHistoryMessageWriteRequested
         Event：公开trait实现
     impl Clone for AgentHistoryMessageWriteRequested
@@ -363,5 +376,6 @@ AgentFailure
 AgentHistoryMessageWriteRequested
 ├── id
 ├── agent: Entity
-└── message: Message
+├── message: Message
+└── tool_schema: Vec<ToolDefinition>
 ```

@@ -2,12 +2,11 @@ use std::fmt;
 use std::path::{Component, PathBuf};
 
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
-use core_plugin::{App, Entity, Event, Plugin, Resource, World};
+use core_plugin::{App, Plugin, Resource, World};
 use lua_plugin::{LuaPlugin, LuaToolRegisterRequest, LuaToolRegisterResponse};
-use margatroid_types::ResourceId;
 use shell_plugin::{ShellPlugin, ShellRegisterRequest, ShellRegisterResponse};
 use skill_plugin::{SkillPlugin, SkillRegisterRequest, SkillRegisterResponse};
-use tool_plugin::{ToolError, ToolErrorKind};
+use tool_plugin::{AgentToolRegisterRequest, AgentToolRegisterResponse, ToolError, ToolErrorKind};
 use workflow_plugin::{WorkflowPlugin, WorkflowRegisterRequest, WorkflowRegisterResponse};
 
 pub struct BuiltinToolPlugin {
@@ -60,23 +59,6 @@ impl Plugin for BuiltinToolPlugin {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BuiltinResourceRegisterRequest {
-    pub id: String,
-    pub agent: Entity,
-    pub resource_id: ResourceId,
-}
-impl Event for BuiltinResourceRegisterRequest {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BuiltinResourceRegisterResponse {
-    pub id: String,
-    pub agent: Entity,
-    pub resource_id: ResourceId,
-    pub result: Result<(), ToolError>,
-}
-impl Event for BuiltinResourceRegisterResponse {}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuiltinToolErrorKind {
     InvalidRoot,
@@ -115,7 +97,7 @@ impl Resource for BuiltinToolPluginInstalled {}
 
 fn builtin_resource_register_system(world: &mut World) {
     let requests = world
-        .event_reader::<BuiltinResourceRegisterRequest>()
+        .event_reader::<AgentToolRegisterRequest>()
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
@@ -124,7 +106,7 @@ fn builtin_resource_register_system(world: &mut World) {
             || request.resource_id.resource_type() == "tool"
                 && request.resource_id.scope() == "builtin"
         {
-            world.send_event(BuiltinResourceRegisterResponse {
+            world.send_event(AgentToolRegisterResponse {
                 id: request.id,
                 agent: request.agent,
                 resource_id: request.resource_id,
@@ -156,7 +138,7 @@ fn builtin_resource_register_system(world: &mut World) {
                 agent: request.agent,
                 resource_id: request.resource_id,
             }),
-            _ => world.send_event(BuiltinResourceRegisterResponse {
+            _ => world.send_event(AgentToolRegisterResponse {
                 id: request.id,
                 agent: request.agent,
                 resource_id: request.resource_id,
@@ -225,7 +207,7 @@ fn collect_builtin_registration_system(world: &mut World) {
     for (id, agent, resource_id, result) in
         skill.into_iter().chain(workflow).chain(lua).chain(shell)
     {
-        world.send_event(BuiltinResourceRegisterResponse {
+        world.send_event(AgentToolRegisterResponse {
             id,
             agent,
             resource_id,

@@ -6,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use app_runtime_plugin::RuntimePlugin;
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
-use margatroid_types::{AgentContextMessagesUpdated, AgentHistoryMessageWriteRequested, Message};
+use margatroid_types::{
+    AgentContextMessagesUpdated, AgentHistoryMessageWriteRequested, Message, ToolDefinition,
+};
 use rusqlite::{params, Connection, Transaction};
 
 const HISTORY_SCHEMA: &str = r#"
@@ -17,6 +19,7 @@ CREATE TABLE IF NOT EXISTS history_messages (
     reasoning TEXT,
     content TEXT,
     tool_calls TEXT NOT NULL,
+    tool_schema TEXT NOT NULL,
     resource_id TEXT,
     tool_call_id TEXT,
     created_at_ms INTEGER NOT NULL
@@ -131,11 +134,12 @@ pub struct AgentMemory {
     connection: Mutex<Connection>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HistoryMessage {
     pub sequence: i64,
     pub turn_id: String,
     pub message: Message,
+    pub tool_schema: Vec<ToolDefinition>,
     pub created_at_ms: i64,
 }
 
@@ -280,7 +284,11 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
     let legacy_history = table_has_column(connection, "history_messages", "message")?;
     let history_exists = table_exists(connection, "history_messages")?;
     let history_has_resource_id = table_has_column(connection, "history_messages", "resource_id")?;
+    let history_has_tool_call_id =
+        table_has_column(connection, "history_messages", "tool_call_id")?;
     let history_has_reasoning = table_has_column(connection, "history_messages", "reasoning")?;
+    let history_has_tool_schema = table_has_column(connection, "history_messages", "tool_schema")?;
+    let legacy_history_layout = history_exists && !legacy_history && !history_has_tool_schema;
     let legacy_realtime = table_has_column(connection, "realtime_messages", "position")?
         && !table_has_column(connection, "realtime_messages", "context")?;
     let transaction = connection.transaction().map_err(|_| {
@@ -297,6 +305,14 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
             )
             .map_err(schema_error)?;
     }
+    if legacy_history_layout {
+        transaction
+            .execute(
+                "ALTER TABLE history_messages RENAME TO history_messages_layout_legacy",
+                [],
+            )
+            .map_err(schema_error)?;
+    }
     if legacy_realtime {
         transaction
             .execute(
@@ -308,23 +324,21 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
     transaction
         .execute_batch(HISTORY_SCHEMA)
         .map_err(schema_error)?;
-    if history_exists && !legacy_history && !history_has_resource_id {
-        transaction
-            .execute(
-                "ALTER TABLE history_messages ADD COLUMN resource_id TEXT",
-                [],
-            )
-            .map_err(schema_error)?;
-    }
-    if history_exists && !legacy_history && !history_has_reasoning {
-        transaction
-            .execute("ALTER TABLE history_messages ADD COLUMN reasoning TEXT", [])
-            .map_err(schema_error)?;
-    }
     if legacy_history {
         migrate_history(&transaction)?;
         transaction
             .execute("DROP TABLE history_messages_legacy", [])
+            .map_err(schema_error)?;
+    }
+    if legacy_history_layout {
+        migrate_history_layout(
+            &transaction,
+            history_has_reasoning,
+            history_has_resource_id,
+            history_has_tool_call_id,
+        )?;
+        transaction
+            .execute("DROP TABLE history_messages_layout_legacy", [])
             .map_err(schema_error)?;
     }
     if legacy_realtime {
@@ -387,8 +401,34 @@ fn migrate_history(transaction: &Transaction<'_>) -> Result<(), MemoryError> {
                 "legacy history could not be decoded",
             )
         })?;
-        insert_history_message_values(transaction, &turn_id, &message, created_at_ms)?;
+        insert_history_message_values(transaction, &turn_id, &message, &[], created_at_ms)?;
     }
+    Ok(())
+}
+
+fn migrate_history_layout(
+    transaction: &Transaction<'_>,
+    has_reasoning: bool,
+    has_resource_id: bool,
+    has_tool_call_id: bool,
+) -> Result<(), MemoryError> {
+    let reasoning = if has_reasoning { "reasoning" } else { "NULL" };
+    let resource_id = if has_resource_id {
+        "resource_id"
+    } else {
+        "NULL"
+    };
+    let tool_call_id = if has_tool_call_id {
+        "tool_call_id"
+    } else {
+        "NULL"
+    };
+    let statement = format!(
+        "INSERT INTO history_messages (sequence, turn_id, role, reasoning, content, tool_calls, tool_schema, resource_id, tool_call_id, created_at_ms) \
+         SELECT sequence, turn_id, role, {reasoning}, content, tool_calls, '[]', {resource_id}, {tool_call_id}, created_at_ms \
+         FROM history_messages_layout_legacy ORDER BY sequence"
+    );
+    transaction.execute(&statement, []).map_err(schema_error)?;
     Ok(())
 }
 
@@ -431,7 +471,7 @@ fn schema_error(_: rusqlite::Error) -> MemoryError {
 
 fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>, MemoryError> {
     let mut statement = connection
-        .prepare("SELECT sequence, turn_id, role, reasoning, content, tool_calls, resource_id, tool_call_id, created_at_ms FROM history_messages ORDER BY sequence ASC")
+        .prepare("SELECT sequence, turn_id, role, reasoning, content, tool_calls, tool_schema, resource_id, tool_call_id, created_at_ms FROM history_messages ORDER BY sequence ASC")
         .map_err(read_error)?;
     let rows = statement
         .query_map([], |row| {
@@ -442,9 +482,10 @@ fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(6)?,
                 row.get::<_, Option<String>>(7)?,
-                row.get::<_, i64>(8)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)?,
             ))
         })
         .map_err(read_error)?;
@@ -456,6 +497,7 @@ fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>,
             reasoning,
             content,
             calls,
+            schema,
             resource_id,
             call_id,
             created_at_ms,
@@ -466,8 +508,14 @@ fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>,
                 "history tool calls could not be decoded",
             )
         })?;
+        let tool_schema = serde_json::from_str::<Vec<ToolDefinition>>(&schema).map_err(|_| {
+            MemoryError::new(
+                MemoryErrorKind::DecodeFailed,
+                "history tool schema could not be decoded",
+            )
+        })?;
         let message = match role.as_str() {
-            "user" => Message::User {
+            "user" if tool_schema.is_empty() => Message::User {
                 content: content.unwrap_or_default(),
                 tool_calls,
             },
@@ -476,7 +524,7 @@ fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>,
                 content,
                 tool_calls,
             },
-            "tool" if tool_calls.is_empty() => Message::Tool {
+            "tool" if tool_calls.is_empty() && tool_schema.is_empty() => Message::Tool {
                 resource_id: resource_id
                     .ok_or_else(|| {
                         MemoryError::new(
@@ -510,6 +558,7 @@ fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>,
             sequence,
             turn_id,
             message,
+            tool_schema,
             created_at_ms,
         })
     })
@@ -612,13 +661,20 @@ fn insert_history_message(
     event: &AgentHistoryMessageWriteRequested,
     created_at_ms: i64,
 ) -> Result<(), MemoryError> {
-    insert_history_message_values(transaction, &event.id, &event.message, created_at_ms)
+    insert_history_message_values(
+        transaction,
+        &event.id,
+        &event.message,
+        &event.tool_schema,
+        created_at_ms,
+    )
 }
 
 fn insert_history_message_values(
     transaction: &Transaction<'_>,
     turn_id: &str,
     message: &Message,
+    tool_schema: &[ToolDefinition],
     created_at_ms: i64,
 ) -> Result<(), MemoryError> {
     let (role, reasoning, content, tool_calls, resource_id, tool_call_id) = match message {
@@ -670,7 +726,19 @@ fn insert_history_message_values(
             "history tool calls could not be encoded",
         )
     })?;
-    transaction.execute("INSERT INTO history_messages (turn_id, role, reasoning, content, tool_calls, resource_id, tool_call_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![turn_id, role, reasoning, content, encoded_calls, resource_id, tool_call_id, created_at_ms]).map_err(write_error)?;
+    if !matches!(message, Message::Assistant { .. }) && !tool_schema.is_empty() {
+        return Err(MemoryError::new(
+            MemoryErrorKind::WriteFailed,
+            "only assistant history can contain a tool schema",
+        ));
+    }
+    let encoded_schema = serde_json::to_string(tool_schema).map_err(|_| {
+        MemoryError::new(
+            MemoryErrorKind::WriteFailed,
+            "history tool schema could not be encoded",
+        )
+    })?;
+    transaction.execute("INSERT INTO history_messages (turn_id, role, reasoning, content, tool_calls, tool_schema, resource_id, tool_call_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", params![turn_id, role, reasoning, content, encoded_calls, encoded_schema, resource_id, tool_call_id, created_at_ms]).map_err(write_error)?;
     Ok(())
 }
 
@@ -829,7 +897,7 @@ mod tests {
         app.world_mut()
             .bind_agent_memory(agent, memory, &RealtimeContext::default())
             .unwrap();
-        for message in [
+        for (index, message) in [
             Message::User {
                 content: "hello".into(),
                 tool_calls: Vec::new(),
@@ -844,11 +912,24 @@ mod tests {
                 tool_call_id: "call-1".into(),
                 content: "tool output".into(),
             },
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tool_schema = (index == 1)
+                .then(|| {
+                    vec![ToolDefinition {
+                        name: "tool0_read".into(),
+                        description: "Read a file.".into(),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    }]
+                })
+                .unwrap_or_default();
             app.world().emit_event(AgentHistoryMessageWriteRequested {
                 id: "turn-1".into(),
                 agent,
                 message,
+                tool_schema,
             });
         }
         app.tick();
@@ -865,6 +946,9 @@ mod tests {
             } if reasoning == "checking"
         ));
         assert!(matches!(history[2].message, Message::Tool { .. }));
+        assert!(history[0].tool_schema.is_empty());
+        assert_eq!(history[1].tool_schema[0].name, "tool0_read");
+        assert!(history[2].tool_schema.is_empty());
     }
 
     #[test]
@@ -941,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn open_adds_reasoning_to_the_current_history_schema() {
+    fn open_rebuilds_the_split_history_schema_in_canonical_order() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("memory.sql");
         let connection = Connection::open(&path).unwrap();
@@ -955,7 +1039,8 @@ mod tests {
                     tool_calls TEXT NOT NULL,
                     resource_id TEXT,
                     tool_call_id TEXT,
-                    created_at_ms INTEGER NOT NULL
+                    created_at_ms INTEGER NOT NULL,
+                    reasoning TEXT
                 );
                 CREATE TABLE realtime_messages (
                     context TEXT NOT NULL,
@@ -964,8 +1049,8 @@ mod tests {
                     PRIMARY KEY (context, position)
                 );
                 INSERT INTO history_messages
-                    (turn_id, role, content, tool_calls, created_at_ms)
-                    VALUES ('turn-1', 'assistant', 'legacy answer', '[]', 1);",
+                    (turn_id, role, content, tool_calls, created_at_ms, reasoning)
+                    VALUES ('turn-1', 'assistant', 'legacy answer', '[]', 1, 'legacy thought');",
             )
             .unwrap();
         drop(connection);
@@ -976,11 +1061,37 @@ mod tests {
         assert!(matches!(
             &history[0].message,
             Message::Assistant {
-                reasoning: None,
+                reasoning: Some(reasoning),
                 content: Some(content),
                 ..
-            } if content == "legacy answer"
+            } if reasoning == "legacy thought" && content == "legacy answer"
         ));
+        assert!(history[0].tool_schema.is_empty());
+
+        let connection = Connection::open(&path).unwrap();
+        let mut statement = connection
+            .prepare("PRAGMA table_info(history_messages)")
+            .unwrap();
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "sequence",
+                "turn_id",
+                "role",
+                "reasoning",
+                "content",
+                "tool_calls",
+                "tool_schema",
+                "resource_id",
+                "tool_call_id",
+                "created_at_ms",
+            ]
+        );
     }
 
     #[test]

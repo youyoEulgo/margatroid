@@ -8,7 +8,7 @@ pub use config_plugin::WebSocketMessageTarget;
 use core_plugin::{App, Event, Plugin, Resource, World};
 use log_plugin::TracingStream;
 use margatroid_protocol::{BackendStateDto, ClientMessage, IntoDomain, ServerMessage};
-use margatroid_types::AgentSkillRouteAction;
+use margatroid_types::{AgentSkillRouteAction, AgentVisibilityRouteAction};
 use server_plugin::{
     AppServerExt, WebSocketConnections, WebSocketMessage, WebSocketMessageReceived,
     WebSocketMessageSender,
@@ -191,6 +191,24 @@ fn dto_route_system(world: &mut World) {
                     Ok(event) => world.send_event(event),
                     Err(error) => {
                         tracing::warn!(connection = received.connection_id.get(), error = %error, "invalid agent.skill.unload_all payload")
+                    }
+                }
+            }
+            ClientMessage::AgentVisibilityInject { id, message } => {
+                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.visibility.inject", "API request received");
+                match message.into_domain((id, AgentVisibilityRouteAction::Inject)) {
+                    Ok(event) => world.send_event(event),
+                    Err(error) => {
+                        tracing::warn!(connection = received.connection_id.get(), error = %error, "invalid agent.visibility.inject payload")
+                    }
+                }
+            }
+            ClientMessage::AgentVisibilityRemove { id, message } => {
+                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.visibility.remove", "API request received");
+                match message.into_domain((id, AgentVisibilityRouteAction::Remove)) {
+                    Ok(event) => world.send_event(event),
+                    Err(error) => {
+                        tracing::warn!(connection = received.connection_id.get(), error = %error, "invalid agent.visibility.remove payload")
                     }
                 }
             }

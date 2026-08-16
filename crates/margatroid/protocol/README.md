@@ -90,9 +90,10 @@ API 中间事件。WorkspacePlugin直接按完整`ResourceId`查找Agent并解�
 
 后端状态通过 `state.sync` 发送完整快照。前端以该快照替换业务状态，不自行持久化或从增量消息拼接
 历史。`histories` 包含可展示的 User、Assistant 和 Tool消息，不包含 System 或Skill正文。`agents`
-包含每个运行中Agent的`visible_resources`，该字段直接来自当前`AgentDynamicVisibility`而不是镜像
-默认可见性。`visible_resources`中的每项都是规范化`type:scope/name:tag`字符串；客户端解析type后
-筛选资源，例如只展示可手动调用的Skill。
+包含每个运行中Agent的`default_resources`、`visible_resources`和`loading_skills`。
+`default_resources`来自只读`AgentDefaultVisibility`，是用户可手动开关的集合；`visible_resources`
+直接来自当前`AgentDynamicVisibility`。不在`default_resources`中的运行时可见资源只展示，不允许
+客户端开关。各字段中的资源均为规范化`type:scope/name:tag`字符串。
 
 ## 流式 Agent 响应
 
