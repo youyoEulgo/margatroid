@@ -332,10 +332,13 @@ tool_turn_completed_system(world: &mut World)
     处理工具批次完成：私有System，读取ToolTurnCompleted
     行为：验证事件turn_id等于AgentStatus当前turn；随后使用现有上下文发送InferenceRequestEvent
 
-record_history_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender)
+take_pending_tool_schema(world: &mut World, agent: Entity, turn_id: &str) -> Vec<ToolDefinition>
+    取得推理工具规格：私有函数，从PendingInferenceToolSchemas移除并返回当前Agent与turn对应的ToolSpec；不存在时返回空数组
+
+record_history_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender, tool_schema: Vec<ToolDefinition>)
     请求历史写入：私有函数
-    行为：User原样发送且tool_schema为空；Assistant原样发送并从PendingInferenceToolSchemas取出该次推理ToolSpec；Tool保留resource_id和tool_call_id，把content替换为resource_id.to_string()且tool_schema为空
-    限制：工具正文只进入实时tool_context，不进入历史事件
+    行为：User原样发送且tool_schema为空；Assistant原样发送并携带传入的ToolSpec；Skill类型Tool保留resource_id和tool_call_id并把content替换为resource_id.to_string()；非Skill类型Tool原样发送；Tool的tool_schema为空
+    限制：Skill正文只进入实时tool_context，不进入历史事件；非Skill工具响应正文完整写入历史事件
 
 append_conversation_message(world: &mut World, agent: Entity, message: Message, events: &RuntimeEventSender) -> Result<(), AgentStepError>
 append_tool_context(world: &mut World, agent: Entity, message: Message, events: &RuntimeEventSender) -> Result<(), AgentStepError>
