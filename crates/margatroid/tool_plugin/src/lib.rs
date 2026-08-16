@@ -225,6 +225,13 @@ pub struct ToolTurnCompleted {
 }
 impl Event for ToolTurnCompleted {}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancelToolTurn {
+    pub turn_id: String,
+    pub agent: Entity,
+}
+impl Event for CancelToolTurn {}
+
 pub struct ToolPlugin {
     schedule: String,
 }
@@ -274,6 +281,7 @@ impl Plugin for ToolPlugin {
         app.world_mut().insert_resource(ToolPluginInstalled);
         app.world_mut().insert_resource(PendingToolCalls::default());
         app.add_system(&self.schedule, tool_call_route_system)
+            .add_system(&self.schedule, cancel_tool_turn_system)
             .add_system(&self.schedule, tool_call_response_system);
     }
 }
@@ -364,8 +372,27 @@ impl PendingToolCalls {
         })?;
         Some(self.calls.remove(index))
     }
+
+    fn remove_turn(&mut self, agent: Entity, turn_id: &str) {
+        self.calls
+            .retain(|request| request.agent != agent || request.turn_id != turn_id);
+    }
 }
 impl Resource for PendingToolCalls {}
+
+fn cancel_tool_turn_system(world: &mut World) {
+    let cancellations = world
+        .event_reader::<CancelToolTurn>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let pending = world
+        .get_resource_mut::<PendingToolCalls>()
+        .expect("ToolPlugin is installed");
+    for cancellation in cancellations {
+        pending.remove_turn(cancellation.agent, &cancellation.turn_id);
+    }
+}
 
 fn tool_call_route_system(world: &mut World) {
     let calls = world
@@ -486,4 +513,39 @@ fn validate_template(template: &ToolTemplate) -> Result<(), ToolError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelling_a_turn_removes_only_its_pending_calls() {
+        let mut pending = PendingToolCalls::default();
+        let mut app = App::new();
+        let agent = app.world_mut().spawn();
+        let other_agent = app.world_mut().spawn();
+        for (turn_id, owner, tool_call_id) in [
+            ("turn-1", agent, "call-1"),
+            ("turn-2", agent, "call-2"),
+            ("turn-1", other_agent, "call-3"),
+        ] {
+            assert!(pending
+                .add_pending(ToolCallRequest {
+                    turn_id: turn_id.into(),
+                    agent: owner,
+                    tool_id: ResourceId::parse("tool:builtin/shell:latest").unwrap(),
+                    resource_id: ResourceId::parse("shell:local/sh:latest").unwrap(),
+                    tool_call_id: tool_call_id.into(),
+                    arguments: "{}".into(),
+                })
+                .is_ok());
+        }
+
+        pending.remove_turn(agent, "turn-1");
+
+        assert!(pending.get(agent, "turn-1", "call-1").is_none());
+        assert!(pending.get(agent, "turn-2", "call-2").is_some());
+        assert!(pending.get(other_agent, "turn-1", "call-3").is_some());
+    }
 }

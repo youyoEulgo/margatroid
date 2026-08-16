@@ -167,6 +167,17 @@ fn dto_route_system(world: &mut World) {
                     ),
                 }
             }
+            ClientMessage::AgentTurnAbort { id, message } => {
+                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.turn.abort", "API request received");
+                match message.into_domain(id) {
+                    Ok(event) => world.send_event(event),
+                    Err(error) => tracing::warn!(
+                        connection = received.connection_id.get(),
+                        error = %error,
+                        "invalid agent.turn.abort payload"
+                    ),
+                }
+            }
             ClientMessage::AgentSkillLoad { id, message } => {
                 tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.skill.load", "API request received");
                 match message.into_domain((id, AgentSkillRouteAction::Load)) {

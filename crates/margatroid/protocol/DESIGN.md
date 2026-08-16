@@ -35,8 +35,12 @@ ClientMessage::AgentSkillLoad / AgentSkillUnload / AgentSkillUnloadAll：前端�
 ClientMessage::AgentVisibilityInject / AgentVisibilityRemove：前端默认资源可见性命令
     行为：使用WorkspaceReference和可选Agent资源ID路由，携带完整resource_id；AgentPlugin最终校验资源属于默认可见性
 
+ClientMessage::AgentTurnAbort：前端中止当前Agent轮次命令
+    行为：使用WorkspaceReference和可选Agent资源ID路由为RouteAgentTurnAbort；不由前端提供turn_id
+
 AgentStateDto：后端Agent状态快照
     status: WorkspaceAgentStatusDto--creating、ready或failed
+    working: bool--是否存在未结束的交互轮次；覆盖推理和工具调用阶段
     error: Option<String>--只有failed包含稳定错误，不包含路径、上下文或资源正文
     default_resources: Vec<ResourceIdDto>--用户可手动开关的Agent默认资源集合
     visible_resources: Vec<ResourceIdDto>
@@ -56,6 +60,6 @@ ToolPlugin从AgentToolMap和PendingToolCalls恢复具体resource_id并写入Mess
 ResourceId统一格式为type:scope/name:tag，省略tag时解析为latest。
 静态Workspace Agent固定使用agent:<workspace>/<name>:latest；clone tag不创建目录，动态Subagent留待后续设计。
 agent.message.reasoning_delta与agent.message.delta分别累积思考和正文；完整agent.message同时结束两种分片。
-BackendStateDto为Workspace定义中的每个Agent都生成AgentStateDto；Creating和Failed成员的default_resources、visible_resources与loading_skills为空，只有Ready成员读取Agent Entity组件。
+BackendStateDto为Workspace定义中的每个Agent都生成AgentStateDto；Creating和Failed成员的working为false，default_resources、visible_resources与loading_skills为空；只有Ready成员读取Agent Entity组件。
 AgentHistoryDto只为Ready且已经绑定AgentMemory的成员生成；成员创建状态变化和资源逐项注入或删除由下一次state.sync反映。
 ```

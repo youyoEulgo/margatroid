@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use server_plugin::{
     WebSocketConnections, WebSocketMessage, WebSocketMessageSender, WebSocketSender,
 };
+use tokio::sync::watch;
 
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_MESSAGES_BYTES: usize = 16 * 1024 * 1024;
@@ -463,6 +464,14 @@ pub struct InferenceRequestEvent {
 impl Event for InferenceRequestEvent {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancelInferenceRequest {
+    pub id: String,
+    pub agent: Entity,
+}
+
+impl Event for CancelInferenceRequest {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct InferenceRoute {
     id: String,
     agent: Entity,
@@ -475,14 +484,29 @@ struct PreparedInference {
     request: ProviderHttpRequest,
     adapter: ErasedProviderAdapter,
     senders: Vec<WebSocketSender>,
+    cancellation: watch::Receiver<bool>,
 }
 
 impl Event for PreparedInference {}
 
+#[derive(Clone)]
 struct InferenceTaskOutput {
     route: InferenceRoute,
-    result: Result<ProviderInferenceResponse, InferenceError>,
+    result: InferenceTaskResult,
 }
+
+#[derive(Clone)]
+enum InferenceTaskResult {
+    Completed(Result<ProviderInferenceResponse, InferenceError>),
+    Cancelled,
+}
+
+#[derive(Default)]
+struct InFlightInferences {
+    requests: HashMap<(Entity, String), watch::Sender<bool>>,
+}
+
+impl Resource for InFlightInferences {}
 
 struct InferenceTaskError {
     source: AsyncTaskError,
@@ -635,7 +659,10 @@ impl Plugin for InferencePlugin {
         let schedule = self.schedule;
         app.world_mut().insert_resource(routes);
         app.world_mut().insert_resource(client);
+        app.world_mut()
+            .insert_resource(InFlightInferences::default());
         app.add_system(&schedule, reload_model_routes_system)
+            .add_system(&schedule, cancel_inference_system)
             .add_system(&schedule, prepare_inference_system)
             .add_async_system(&schedule, execute_prepared_inference)
             .add_system(&schedule, publish_inference_output_system);
@@ -918,7 +945,7 @@ fn prepare_inference_system(world: &mut World) {
 }
 
 fn prepare_inference(
-    world: &World,
+    world: &mut World,
     command: InferenceRequestEvent,
 ) -> Result<PreparedInference, (InferenceRoute, InferenceError)> {
     let route = InferenceRoute {
@@ -1019,6 +1046,12 @@ fn prepare_inference(
             )
         })?;
     let senders = resolve_websocket_targets(connections, targets);
+    let (cancellation_sender, cancellation) = watch::channel(false);
+    world
+        .get_resource_mut::<InFlightInferences>()
+        .expect("InferencePlugin is installed")
+        .requests
+        .insert((route.agent, route.id.clone()), cancellation_sender);
     Ok(PreparedInference {
         route,
         agent_id: command.agent_id,
@@ -1026,7 +1059,27 @@ fn prepare_inference(
         request,
         adapter: model_route.adapter,
         senders,
+        cancellation,
     })
+}
+
+fn cancel_inference_system(world: &mut World) {
+    let cancellations = world
+        .event_reader::<CancelInferenceRequest>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let in_flight = world
+        .get_resource_mut::<InFlightInferences>()
+        .expect("InferencePlugin is installed");
+    for cancellation in cancellations {
+        if let Some(sender) = in_flight
+            .requests
+            .get(&(cancellation.agent, cancellation.id))
+        {
+            sender.send_replace(true);
+        }
+    }
 }
 
 fn resolve_websocket_targets(
@@ -1158,15 +1211,18 @@ async fn execute_prepared_inference(
     _context: AsyncContext,
 ) -> Result<InferenceTaskOutput, InferenceTaskError> {
     let route = prepared.route.clone();
-    let result = std::panic::AssertUnwindSafe(run_provider(prepared))
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|_| {
+    let mut cancellation = prepared.cancellation.clone();
+    let provider = std::panic::AssertUnwindSafe(run_provider(prepared)).catch_unwind();
+    let result = tokio::select! {
+        biased;
+        _ = cancellation.changed() => InferenceTaskResult::Cancelled,
+        result = provider => InferenceTaskResult::Completed(result.unwrap_or_else(|_| {
             Err(InferenceError::new(
                 InferenceErrorKind::TaskPanicked,
                 "inference provider task panicked",
             ))
-        });
+        })),
+    };
     Ok(InferenceTaskOutput { route, result })
 }
 
@@ -1365,46 +1421,58 @@ async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Vec<u8>
 }
 
 fn publish_inference_output_system(world: &mut World) {
-    let outputs = world
-        .event_reader::<Result<InferenceTaskOutput, InferenceTaskError>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let mut outputs = Vec::new();
+    for output in world.event_reader::<Result<InferenceTaskOutput, InferenceTaskError>>() {
+        match output {
+            Ok(output) => outputs.push(output.clone()),
+            Err(error) => tracing::warn!(error = %error.source, "inference task was cancelled"),
+        }
+    }
     let events = world.event_sender();
     for output in outputs {
-        match output {
-            Ok(output) => match &output.result {
-                Ok(response) => {
-                    if response.content.is_none() && response.tool_calls.is_empty() {
-                        events.send_event(AgentFailure {
-                            id: output.route.id.clone(),
-                            agent: output.route.agent,
-                            kind: AgentFailureKind::Inference,
-                            message: InferenceError::new(
-                                InferenceErrorKind::ResponseIncomplete,
-                                "inference response contains an invalid tool call",
-                            )
-                            .to_string(),
-                        });
-                        continue;
-                    }
-                    events.send_event(AgentMessage {
+        let cancelled = world
+            .get_resource_mut::<InFlightInferences>()
+            .expect("InferencePlugin is installed")
+            .requests
+            .remove(&(output.route.agent, output.route.id.clone()))
+            .is_some_and(|sender| *sender.borrow());
+        if cancelled || matches!(output.result, InferenceTaskResult::Cancelled) {
+            continue;
+        }
+        let InferenceTaskResult::Completed(result) = &output.result else {
+            unreachable!();
+        };
+        match result {
+            Ok(response) => {
+                if response.content.is_none() && response.tool_calls.is_empty() {
+                    events.send_event(AgentFailure {
                         id: output.route.id.clone(),
                         agent: output.route.agent,
-                        message: Message::Assistant {
-                            reasoning: response.reasoning.clone(),
-                            content: response.content.clone(),
-                            tool_calls: response.tool_calls.clone(),
-                        },
+                        kind: AgentFailureKind::Inference,
+                        message: InferenceError::new(
+                            InferenceErrorKind::ResponseIncomplete,
+                            "inference response contains an invalid tool call",
+                        )
+                        .to_string(),
                     });
+                    continue;
                 }
-                Err(error) => events.send_event(AgentFailure {
+                events.send_event(AgentMessage {
                     id: output.route.id.clone(),
                     agent: output.route.agent,
-                    kind: AgentFailureKind::Inference,
-                    message: error.to_string(),
-                }),
-            },
-            Err(error) => tracing::warn!(error = %error.source, "inference task was cancelled"),
+                    message: Message::Assistant {
+                        reasoning: response.reasoning.clone(),
+                        content: response.content.clone(),
+                        tool_calls: response.tool_calls.clone(),
+                    },
+                });
+            }
+            Err(error) => events.send_event(AgentFailure {
+                id: output.route.id.clone(),
+                agent: output.route.agent,
+                kind: AgentFailureKind::Inference,
+                message: error.to_string(),
+            }),
         }
     }
 }
@@ -2045,6 +2113,30 @@ mod tests {
             Url::parse("https://user:password@example.test:8443/v1/chat/completions?token=secret")
                 .unwrap();
         assert_eq!(safe_endpoint(&url), "https://example.test:8443");
+    }
+
+    #[test]
+    fn cancellation_marks_the_matching_inference() {
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default());
+        app.world_mut()
+            .insert_resource(InFlightInferences::default());
+        app.add_system(RuntimePlugin::UPDATE, cancel_inference_system);
+        let agent = app.world_mut().spawn();
+        let (sender, receiver) = watch::channel(false);
+        app.world_mut()
+            .get_resource_mut::<InFlightInferences>()
+            .unwrap()
+            .requests
+            .insert((agent, "turn-1".into()), sender);
+
+        app.world().send_event(CancelInferenceRequest {
+            id: "turn-1".into(),
+            agent,
+        });
+        app.tick();
+
+        assert!(*receiver.borrow());
     }
 
     #[test]

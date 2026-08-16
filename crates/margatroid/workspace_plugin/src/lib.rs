@@ -8,16 +8,16 @@ use agent_image_loader_plugin::{
     AgentImageModelConfig, AgentImageSoul, LoadAgentImage, LoadAgentImageResult,
 };
 use agent_plugin::{
-    AgentCreateRequest, AgentCreateResult, AgentDynamicVisibility, AgentPluginInstalled,
-    AgentWorkspaceId, SetAgentDefaultResourceVisibility, WorldAgentExt,
+    AbortAgentTurn, AgentCreateRequest, AgentCreateResult, AgentDynamicVisibility,
+    AgentPluginInstalled, AgentWorkspaceId, SetAgentDefaultResourceVisibility, WorldAgentExt,
 };
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::{AgentInferenceSnapshot, GlobalModelRoutes, WorldInferenceExt};
 use margatroid_types::{
     AgentMessage, AgentSkillRouteAction, AgentVisibilityRouteAction, Message, ResourceId,
-    RouteAgentMessage, RouteAgentSkill, RouteAgentVisibility, WorkspaceAgentDefinition,
-    WorkspaceDefinition, WorkspaceReference,
+    RouteAgentMessage, RouteAgentSkill, RouteAgentTurnAbort, RouteAgentVisibility,
+    WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
 };
 use memory_plugin::{AgentMemory, MemoryPluginInstalled, RealtimeContext, WorldMemoryExt};
 use tool_plugin::{AgentToolEnvironment, AgentToolMap, ToolPluginInstalled};
@@ -86,6 +86,7 @@ impl Plugin for WorkspacePlugin {
         });
         app.add_system(&schedule, begin_workspace_command_system)
             .add_system(&schedule, route_agent_message_system)
+            .add_system(&schedule, route_agent_turn_abort_system)
             .add_system(&schedule, route_agent_skill_system)
             .add_system(&schedule, route_agent_visibility_system)
             .add_system(&schedule, collect_agent_image_system)
@@ -184,6 +185,36 @@ fn route_agent_message_system(world: &mut World) {
             id: request.id,
             agent,
             message: request.message,
+        });
+    }
+}
+
+fn route_agent_turn_abort_system(world: &mut World) {
+    let requests = world
+        .event_reader::<RouteAgentTurnAbort>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for request in requests {
+        let Some(workspace) = workspace_by_reference(world, &request.workspace) else {
+            tracing::warn!(id = %request.id, "agent turn abort workspace was not found");
+            continue;
+        };
+        let agent = match request.agent {
+            Some(agent_id) => world.agent(&agent_id).filter(|entity| {
+                world
+                    .get_component::<AgentWorkspaceId>(*entity)
+                    .is_some_and(|owner| owner.workspace_id() == workspace)
+            }),
+            None => world.workspace_manager(workspace),
+        };
+        let Some(agent) = agent else {
+            tracing::warn!(id = %request.id, "agent turn abort target was not found");
+            continue;
+        };
+        world.send_event(AbortAgentTurn {
+            id: request.id,
+            agent,
         });
     }
 }

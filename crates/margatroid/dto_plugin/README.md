@@ -10,6 +10,7 @@ connection.register -> RegisterConnection
 workspace.start      -> StartWorkspace
 workspace.stop       -> StopWorkspaceByReference
 agent.message        -> RouteAgentMessage
+agent.turn.abort     -> RouteAgentTurnAbort
 agent.skill.load     -> RouteAgentSkill { Load }
 agent.skill.unload   -> RouteAgentSkill { Unload }
 agent.skill.unload_all -> RouteAgentSkill { UnloadAll }

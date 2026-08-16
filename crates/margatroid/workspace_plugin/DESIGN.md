@@ -61,6 +61,7 @@ WorkspacePlugin：Workspace运行编排插件，公开结构体--协调Workspace
                 插入WorkspaceRegistry
                 挂载begin_workspace_command_system
                 挂载route_agent_message_system
+                挂载route_agent_turn_abort_system
                 挂载route_agent_skill_system
                 挂载route_agent_visibility_system
                 挂载collect_agent_image_system
@@ -266,6 +267,10 @@ route_agent_message_system(world: &mut World)
         只接受Message::User
         直接保留Message::User中的content和tool_calls并发送AgentMessage { id, agent, message }
         路由失败时记录警告且不构造AgentMessage
+
+route_agent_turn_abort_system(world: &mut World)
+    路由成员轮次中止：私有System，读取RouteAgentTurnAbort并把逻辑Workspace和Agent名称解析为Entity
+    行为：agent为空时使用WorkspaceDefinition.manager；成功时发送AbortAgentTurn { id, agent }
 
 route_agent_skill_system(world: &mut World)
     路由Skill状态命令：私有System，读取RouteAgentSkill并解析Workspace和Agent Entity

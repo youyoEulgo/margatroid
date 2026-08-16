@@ -166,11 +166,18 @@ AgentDynamicVisibility：Agent动态可见性，公开Component--当前实际可
 
 AgentPluginInstalled：安装标记，公开Resource
 
+AbortAgentTurn：中止Agent当前轮次，公开事件
+    id: String--API请求ID
+    agent: Entity--目标Agent
+    impl Event for AbortAgentTurn
+
 WorldAgentExt：World Agent扩展，公开trait
     agent(&self, id: &ResourceId) -> Option<Entity>
         按身份查询：公开方法，返回稳定资源ID匹配且仍存活的Agent Entity
     agent_loading_skills(&self, agent: Entity) -> Option<&BTreeSet<ResourceId>>
         查询持久Skill：公开只读方法，不暴露AgentStatus其他字段
+    agent_is_working(&self, agent: Entity) -> Option<bool>
+        查询工作状态：公开只读方法，AgentStatus存在时返回当前是否有未结束turn
     inject_agent_visible_resource(&self, id: impl Into<String>, agent: Entity, resource_id: ResourceId)
         注入可见资源：公开方法，发送InjectAgentVisibleResource并唤醒Runtime
     remove_agent_visible_resource(&self, id: impl Into<String>, agent: Entity, resource_id: ResourceId)
@@ -191,6 +198,10 @@ AgentStatus：Agent轮次与持久Skill状态，crate公开Component--不保存p
         开始轮次：拒绝与当前未完成轮次重叠
     finish_turn(&mut self, turn_id: &str) -> Result<(), AgentStepError>
         完成轮次：只允许完成当前turn
+    abort_turn(&mut self) -> Option<String>
+        中止轮次：清空并返回当前turn_id；空闲时返回None
+    is_working(&self) -> bool
+        查询工作状态：当前turn_id非空时返回true
     load_skill(&mut self, resource_id: ResourceId) -> Result<(), AgentStepError>
         加载Skill：只接受type=skill并按完整ResourceId去重
     unload_skill(&mut self, resource_id: &ResourceId) -> bool
@@ -314,6 +325,10 @@ agent_skill_state_system(world: &mut World)
 agent_message_system(world: &mut World)
     处理Agent消息：私有System，读取AgentMessage并逐条调用handle_agent_message
     行为：失败时发送AgentFailure { kind: Agent }，不伪造Assistant或Tool消息
+
+abort_agent_turn_system(world: &mut World)
+    中止当前轮次：私有System，读取AbortAgentTurn
+    行为：取得并清空AgentStatus当前turn；清空tool_context和对应PendingInferenceToolSchemas；发送CancelInferenceRequest与CancelToolTurn；空闲Agent只记录警告
 
 handle_agent_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender) -> Result<ConversationTurnResult, AgentStepError>
     处理消息：私有函数

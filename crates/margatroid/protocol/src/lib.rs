@@ -7,8 +7,8 @@ use log_plugin::{TracingField, TracingRecord};
 use margatroid_types::{
     AgentFailure, AgentFailureKind, AgentMessage, AgentSkillRouteAction,
     AgentVisibilityRouteAction, Message, ResourceId, RouteAgentMessage, RouteAgentSkill,
-    RouteAgentVisibility, StartWorkspace, ToolCall, WorkspaceAgentDefinition, WorkspaceDefinition,
-    WorkspaceReference,
+    RouteAgentTurnAbort, RouteAgentVisibility, StartWorkspace, ToolCall, WorkspaceAgentDefinition,
+    WorkspaceDefinition, WorkspaceReference,
 };
 use memory_plugin::{AgentMemory, HistoryMessage};
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,11 @@ pub enum ClientMessage {
     AgentMessage {
         id: String,
         message: RouteAgentMessageDto,
+    },
+    #[serde(rename = "agent.turn.abort")]
+    AgentTurnAbort {
+        id: String,
+        message: RouteAgentTargetDto,
     },
     #[serde(rename = "agent.skill.load")]
     AgentSkillLoad {
@@ -345,6 +350,12 @@ pub struct RouteAgentMessageDto {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteAgentTargetDto {
+    pub workspace: WorkspaceReferenceDto,
+    pub agent: Option<ResourceIdDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteAgentSkillDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: Option<ResourceIdDto>,
@@ -426,6 +437,16 @@ impl IntoDomain<RouteAgentMessage, String> for RouteAgentMessageDto {
                 content: self.message.content,
                 tool_calls,
             },
+        })
+    }
+}
+
+impl IntoDomain<RouteAgentTurnAbort, String> for RouteAgentTargetDto {
+    fn into_domain(self, id: String) -> Result<RouteAgentTurnAbort, ProtocolError> {
+        Ok(RouteAgentTurnAbort {
+            id,
+            workspace: self.workspace.into_domain(())?,
+            agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
         })
     }
 }
@@ -624,6 +645,8 @@ pub struct AgentStateDto {
     pub agent: ResourceIdDto,
     pub status: WorkspaceAgentStatusDto,
     #[serde(default)]
+    pub working: bool,
+    #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
     pub default_resources: Vec<ResourceIdDto>,
@@ -773,10 +796,17 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
             .iter()
             .map(|resource| resource.into_dto(()))
             .collect::<Result<Vec<_>, _>>()?;
+        let working = world.agent_is_working(agent).ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorKind::AgentNotFound,
+                "Agent work status is missing",
+            )
+        })?;
         Ok(Self {
             workspace: workspace.reference(),
             agent: identity.id().into_dto(())?,
             status: WorkspaceAgentStatusDto::Ready,
+            working,
             error: None,
             default_resources,
             visible_resources,
@@ -839,6 +869,7 @@ impl FromDomain<(), &World> for BackendStateDto {
                         workspace: info.reference(),
                         agent: (&definition.id).into_dto(())?,
                         status: WorkspaceAgentStatusDto::Creating,
+                        working: false,
                         error: None,
                         default_resources: Vec::new(),
                         visible_resources: Vec::new(),
@@ -848,6 +879,7 @@ impl FromDomain<(), &World> for BackendStateDto {
                         workspace: info.reference(),
                         agent: (&definition.id).into_dto(())?,
                         status: WorkspaceAgentStatusDto::Failed,
+                        working: false,
                         error: Some(error.to_string()),
                         default_resources: Vec::new(),
                         visible_resources: Vec::new(),
@@ -1229,6 +1261,27 @@ mod tests {
     }
 
     #[test]
+    fn agent_turn_abort_uses_workspace_and_optional_agent_route() {
+        let request: ClientMessage = serde_json::from_value(json!({
+            "type": "agent.turn.abort",
+            "id": "abort-1",
+            "message": {
+                "workspace": workspace_reference(),
+                "agent": "agent:demo/coder:latest"
+            }
+        }))
+        .unwrap();
+        let ClientMessage::AgentTurnAbort { id, message } = request else {
+            panic!("expected agent.turn.abort");
+        };
+        let route: RouteAgentTurnAbort = message.into_domain(id).unwrap();
+
+        assert_eq!(route.id, "abort-1");
+        assert_eq!(route.workspace.name, "demo");
+        assert_eq!(route.agent.unwrap().to_string(), "agent:demo/coder:latest");
+    }
+
+    #[test]
     fn workspace_stop_result_uses_stable_server_shapes() {
         let workspace = workspace_reference();
         let stopped = serde_json::to_value(ServerMessage::WorkspaceStopped {
@@ -1374,6 +1427,7 @@ mod tests {
                     workspace: workspace_reference(),
                     agent: ResourceIdDto("agent:demo/coder:latest".into()),
                     status: WorkspaceAgentStatusDto::Ready,
+                    working: false,
                     error: None,
                     default_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
                     visible_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
@@ -1406,6 +1460,7 @@ mod tests {
             value["state"]["agents"][0]["agent"],
             "agent:demo/coder:latest"
         );
+        assert_eq!(value["state"]["agents"][0]["working"], false);
         assert_eq!(
             value["state"]["agents"][0]["visible_resources"][0],
             "skill:local/review:latest"
@@ -1471,6 +1526,7 @@ mod tests {
 
         assert_eq!(state.workspace.name, "demo");
         assert_eq!(state.agent, ResourceIdDto("agent:demo/coder:latest".into()));
+        assert!(!state.working);
         assert_eq!(state.visible_resources.len(), 1);
         assert_eq!(state.default_resources.len(), 1);
         assert!(state.loading_skills.is_empty());
