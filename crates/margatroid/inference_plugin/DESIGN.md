@@ -13,10 +13,15 @@ InferenceRequestEvent：推理请求事件，公开事件--AgentPlugin交付完�
     impl Event for InferenceRequestEvent
 
 ProviderInferenceResponse：Provider响应，公开结构体--InferencePlugin内部的协议无关累积结果
+    reasoning: Option<String>--Provider公开的完整思考内容
     content: Option<String>--Assistant文本
     tool_calls: Vec<ToolCall>--保留Provider返回的调用ID、tool_name和参数
     stop_reason: StopReason
     usage: Option<TokenUsage>
+
+ProviderStreamDelta：Provider流式增量，公开枚举--Accumulator区分思考与正文的有序输出
+    Reasoning(String)--新增思考文本
+    Content(String)--新增正文文本
 
 InferenceError：推理错误，公开结构体
 ```
@@ -30,6 +35,11 @@ PreparedInference：已准备推理，私有事件--主线程完成路由、Prov
     request: ProviderHttpRequest
     adapter: ErasedProviderAdapter
     senders: Vec<WebSocketSender>
+
+ModelRouteConfig：模型路由配置，私有结构体--由models.toml读取Provider协议及地址
+    api_type: String--选择Provider Adapter；deepseek表示DeepSeek协议语义
+    thinking: Option<String>--DeepSeek思考开关；enabled启用，省略或disabled关闭
+    reasoning_effort: Option<String>--DeepSeek思考强度；启用思考时使用high或max
 
 InferenceTaskOutput：异步推理结果，私有事件
     route: InferenceRoute
@@ -55,13 +65,13 @@ prepare_inference_system(world: &mut World)
 
 execute_prepared_inference(prepared: PreparedInference, context: AsyncContext)
     执行推理：私有异步函数
-    行为：发送HTTP请求，按Provider协议累积文本和工具调用；文本分片直接按顺序发给前端，不进入事件队列
+    行为：发送HTTP请求，按Provider协议累积思考、文本和工具调用；思考与文本分片分别直接按顺序发给前端，不进入事件队列
 
 publish_inference_output_system(world: &mut World)
     发布结果：私有System，读取InferenceTaskOutput
     行为：
         失败时发送AgentFailure { kind: Inference }
-        成功时使用ProviderInferenceResponse构造Message::Assistant { content, tool_calls }
+        成功时使用ProviderInferenceResponse构造Message::Assistant { reasoning, content, tool_calls }
         发送AgentMessage { id: route.id, agent: route.agent, message }
         不再发布InferenceResponse，也不经过工具身份转换System
 
@@ -72,6 +82,14 @@ ProviderAdapter::build_request(input: ProviderInput) -> Result<ProviderHttpReque
 ProviderAccumulator::finish(self) -> Result<ProviderInferenceResponse, InferenceError>
     完成响应：把Provider工具调用统一为ToolCall { id, tool_name, arguments }
     行为：OpenAI arguments字符串原样保留；对象型Provider参数序列化成JSON对象文本；无参数统一为"{}"
+
+DeepSeekAdapter::build_request(input: ProviderInput) -> Result<ProviderHttpRequest, InferenceError>
+    构造DeepSeek请求：使用/chat/completions并发送thinking与reasoning_effort
+    行为：Assistant有tool_calls且reasoning非空时写reasoning_content；普通Assistant历史不回传reasoning
+
+DeepSeekAccumulator::push(chunk: &[u8]) -> Result<Vec<ProviderStreamDelta>, InferenceError>
+    累积DeepSeek流：分别解析reasoning_content和content
+    行为：原生reasoning_content或OpenRouter兼容reasoning产生Reasoning分片，content产生Content分片，二者都按Provider顺序返回
 ```
 
 ## 逻辑
@@ -83,10 +101,11 @@ InferencePlugin主线程
     -> Provider Adapter把内部ToolSpec转换为Provider ToolSpec
     -> PreparedInference
 异步HTTP
-    -> 直接发送有序文本分片
+    -> reasoning_content直接发送agent.message.reasoning_delta
+    -> content直接发送agent.message.delta
     -> 累积ProviderInferenceResponse
 主线程发布
-    -> AgentMessage::Assistant { content, tool_calls }
+    -> AgentMessage::Assistant { reasoning, content, tool_calls }
 AgentPlugin
     -> tool_calls为空时结束轮次
     -> tool_calls非空时发送ToolCallEvent
@@ -100,4 +119,6 @@ InferencePlugin不负责ResourceId与tool_name转换；tool_name由AgentToolMap�
 InferencePlugin不查询Agent可见性或工具注册状态，InferenceRequestEvent中的tools是本次请求唯一工具输入。
 不存在公开InferenceResponse事件；异步结果发布System只负责把成功结果包装成AgentMessage。
 模型参数不得用于选择Skill、Tool或其他资源。
+OpenAI Adapter不回传或解析Message::Assistant.reasoning；DeepSeek Adapter独占DeepSeek协议差异。
+api_type决定协议语义，base_url只决定请求目的地；经过OpenAI兼容反代调用DeepSeek时仍使用api_type=deepseek。
 ```

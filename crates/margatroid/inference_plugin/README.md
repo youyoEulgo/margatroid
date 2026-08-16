@@ -25,7 +25,7 @@ AgentImageLoaderPlugin 只提供中立模型配置；InferencePlugin 负责把�
 - `ModelId` 是逻辑路由键，不代表实际模型或供应商。
 - `provider` 是可选元数据，`api_type` 才决定请求和响应协议。
 - ProviderAdapter 组装请求，ProviderResponseAccumulator 累积并解析响应。
-- 流式文本通过固定的 WebSocket 发送器集合直接转发，不为每个分片创建 ECS Event。
+- 流式思考与正文通过固定的 WebSocket 发送器集合分别直接转发，不为每个分片创建 ECS Event。
 - InferencePlugin 不修改 Agent 的 `messages`，不执行工具，不实现 tool-call loop。
 
 ## 模型路由表
@@ -39,8 +39,17 @@ model = "deepseek/deepseek-v4-flash-latest"
 provider = "openrouter"
 base_url = "https://openrouter.ai/api/v1"
 api_key = "sk-123"
-api_type = "openai"
+api_type = "deepseek"
+thinking = "enabled"
+reasoning_effort = "high"
 ```
+
+`api_type = "deepseek"` 启用DeepSeek协议Adapter。`thinking = "enabled"`时请求携带
+`thinking = { type = "enabled" }`，`reasoning_effort`可为`high`或`max`；省略thinking或设为
+`disabled`时不发送思考参数。即使`base_url`指向OpenAI兼容反代，只要需要DeepSeek的
+`reasoning_content`语义，仍应选择`deepseek`。
+响应解析同时接受DeepSeek原生`reasoning_content`和OpenRouter兼容`reasoning`字段；请求历史回传
+始终使用DeepSeek语义的`reasoning_content`。
 
 AgentImage 只引用 `id = "deepseek-v4-flash"`。ID 通常直接写具体模型名，方便开发者辨认；
 `model` 则是构建 Provider Request 时直接使用的模型值。`base_url`、`api_key` 和 `api_type`
@@ -180,12 +189,12 @@ Entity。最终响应使用 `(agent, id)` 定位原 Agent 和原请求。
 后端对一次模型调用的有效处理都依赖完整响应：工具参数需要拼完才能解析，tool-call loop
 需要完整 Assistant Message，结束原因和 token usage 也只有流结束后才能确定。
 
-流式文本的用途只是让前端实时显示。`InferenceRequest` 不携带发送器；`prepare_inference_system`
+流式思考和正文的用途只是让前端实时显示。`InferenceRequest` 不携带发送器；`prepare_inference_system`
 读取全局配置的 `streaming_member_messages` 目标，通过 `WebSocketConnections` 解析并固定本轮的发送器集合，然后写入
-`PreparedInference`。异步推理每解析出一个文本分片，就使用请求 ID、稳定 Agent ID 和文本构造
-`agent.message.delta`，序列化后通过 `WebSocketMessageSender::send` 直接发送。
+`PreparedInference`。异步推理解析出的正文构造`agent.message.delta`，DeepSeek思考内容构造
+`agent.message.reasoning_delta`，两者都通过`WebSocketMessageSender::send`直接发送。
 
-文本片段不进入 ECS 事件队列；工具调用 ID、名称和参数片段也不转发，只在后端累积器中组装。
+思考和正文片段都不进入 ECS 事件队列；工具调用 ID、名称和参数片段也不转发，只在后端累积器中组装。
 前端已断开时，InferencePlugin 停止向对应连接转发，但不中断后端推理和最终响应累积。本轮开始后
 新增且符合相同 target 的连接从下一轮开始接收，以保持增量与最终消息的接收集合一致。
 
@@ -199,10 +208,11 @@ use margatroid_types::{AgentMessage, Message};
 
 fn handle_inference_messages(world: &mut World) {
     for event in world.event_reader::<AgentMessage>() {
-        if let Message::Assistant { content, tool_calls } = &event.message {
+        if let Message::Assistant { reasoning, content, tool_calls } = &event.message {
             tracing::info!(
                 agent = ?event.agent,
                 request_id = %event.id,
+                ?reasoning,
                 ?content,
                 tool_call_count = tool_calls.len(),
                 "agent inference completed"
@@ -254,7 +264,7 @@ app.add_system(RuntimePlugin::UPDATE, handle_model_route_reload);
 
 ## 扩展 API 协议
 
-默认提供 `openai` 协议工厂。新协议通过 `InferencePlugin::with_api_type` 注册：
+默认提供`openai`和`deepseek`协议工厂。新协议通过`InferencePlugin::with_api_type`注册：
 
 ```rust
 let inference = InferencePlugin::default()
@@ -265,8 +275,8 @@ let inference = InferencePlugin::default()
 
 - `ProviderAdapterFactory`：读取 `provider`、`base_url` 和 `api_key`，创建已配置 Adapter。
 - `ProviderAdapter`：将统一 `ProviderInput` 组装为 HTTP Request，并为每个响应创建累积器。
-- `ProviderResponseAccumulator`：接受任意网络分片边界，返回可展示文本片段，在内部累积
-  工具调用并最终构造 `InferenceResponse`；`finish` 也会返回缓冲区尾行最后解析出的文本片段。
+- `ProviderResponseAccumulator`：接受任意网络分片边界，返回有序的`ProviderStreamDelta`，在内部累积
+  思考、正文和工具调用并最终构造`ProviderInferenceResponse`；`finish`也会返回缓冲区尾行解析出的分片。
 
 Adapter 只解释 Provider 协议，不读取 `World`、Agent Component 或会话状态。
 
@@ -281,10 +291,10 @@ Agent messages + AgentPlugin收集的ToolDefinition
 → ProviderAdapter::build_request
 → AsyncRuntime发送流式HTTP
 → ProviderResponseAccumulator::push
-├→ 可展示文本 -> WebSocketMessageSender -> 前端
+├→ Reasoning/Content分片 -> WebSocketMessageSender -> 前端
 └→ 后端内部累积完整响应
 → ProviderResponseAccumulator::finish
-├→ 尾行文本 -> WebSocketMessageSender -> 前端
+├→ 尾行分片 -> WebSocketMessageSender -> 前端
 ├→ 成功：AgentMessage { id, agent, Message::Assistant }
 └→ 失败：AgentFailure { id, agent, kind: Inference, message }
 → 成功消息由AgentPlugin记入上下文并根据tool_calls继续工具调用或结束；失败契约暂不定义
@@ -299,7 +309,7 @@ InferencePlugin 负责：
 - 把 AgentImageLoaderPlugin 的中立模型配置转换为经过验证的 AgentInferenceSnapshot。
 - 将统一 messages、工具定义和推理参数组装为 Provider Request。
 - 发送流式 HTTP 请求并解析增量与最终响应。
-- 将文本片段写入固定 WebSocket 发送器集合，并按请求 ID 和 Agent Entity 发布 `AgentMessage` 或
+- 将思考和正文片段写入固定 WebSocket 发送器集合，并按请求 ID 和 Agent Entity 发布 `AgentMessage` 或
   `AgentFailure`。
 - 根据完整 Assistant 消息是否包含工具调用，直接赋予消息意图。
 

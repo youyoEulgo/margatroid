@@ -121,6 +121,12 @@ pub enum ServerMessage {
         agent: ResourceIdDto,
         content: String,
     },
+    #[serde(rename = "agent.message.reasoning_delta")]
+    AgentMessageReasoningDelta {
+        id: String,
+        agent: ResourceIdDto,
+        content: String,
+    },
     #[serde(rename = "agent.failure")]
     AgentFailure { failure: AgentFailureDto },
 }
@@ -217,6 +223,8 @@ pub enum MessageDto {
         tool_calls: Vec<ToolCallDto>,
     },
     Assistant {
+        #[serde(default)]
+        reasoning: Option<String>,
         content: Option<String>,
         tool_calls: Vec<ToolCallDto>,
     },
@@ -241,9 +249,11 @@ impl FromDomain<&Message> for MessageDto {
                     .collect::<Result<Vec<_>, _>>()?,
             }),
             Message::Assistant {
+                reasoning,
                 content,
                 tool_calls,
             } => Ok(Self::Assistant {
+                reasoning: reasoning.clone(),
                 content: content.clone(),
                 tool_calls: tool_calls
                     .iter()
@@ -1323,6 +1333,7 @@ mod tests {
                 workspace: workspace_reference(),
                 agent: ResourceIdDto("agent:demo/coder:latest".into()),
                 message: MessageDto::Assistant {
+                    reasoning: Some("checking".into()),
                     content: Some("Done.".into()),
                     tool_calls: Vec::new(),
                 },
@@ -1332,6 +1343,10 @@ mod tests {
 
         assert_eq!(value["type"], "agent.message");
         assert_eq!(value["message"]["agent"], "agent:demo/coder:latest");
+        assert_eq!(
+            value["message"]["message"]["Assistant"]["reasoning"],
+            "checking"
+        );
         assert_eq!(value["message"]["message"]["Assistant"]["content"], "Done.");
     }
 
@@ -1348,6 +1363,21 @@ mod tests {
         assert_eq!(value["id"], "turn-1");
         assert_eq!(value["agent"], "agent:demo/coder:latest");
         assert_eq!(value["content"], "hello");
+    }
+
+    #[test]
+    fn agent_reasoning_delta_serializes_as_a_flat_stream_frame() {
+        let event = ServerMessage::AgentMessageReasoningDelta {
+            id: "turn-1".into(),
+            agent: ResourceIdDto("agent:demo/coder:latest".into()),
+            content: "checking".into(),
+        };
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["type"], "agent.message.reasoning_delta");
+        assert_eq!(value["id"], "turn-1");
+        assert_eq!(value["agent"], "agent:demo/coder:latest");
+        assert_eq!(value["content"], "checking");
     }
 
     #[test]

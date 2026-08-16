@@ -167,6 +167,7 @@ Message：统一消息，公开枚举--所有Margatroid消息Plugin共享的静�
         tool_calls: Vec<ToolCall>--用户预先指定的工具调用，可以为空
     }
     Assistant {
+        reasoning: Option<String>--Provider公开的完整思考内容，可以为空；与正文分别保存
         content: Option<String>--Assistant文本，只有工具调用时允许为空
         tool_calls: Vec<ToolCall>--完整工具调用列表，可以为空
     }
@@ -287,7 +288,7 @@ Workspace定义：
         -> tool_calls为空时直接发起推理
         -> tool_calls非空时先派发指定工具
     InferencePlugin完成推理
-        -> Provider Adapter保留tool_name并构造Message::Assistant
+        -> Provider Adapter保留reasoning与tool_name并构造Message::Assistant
         -> 发送AgentMessage
     ToolPlugin完成工具调用
         -> 从PendingToolCalls恢复resource_id并构造Message::Tool

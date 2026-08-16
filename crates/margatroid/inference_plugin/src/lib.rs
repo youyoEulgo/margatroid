@@ -327,6 +327,8 @@ pub struct ProviderRouteInput<'a> {
     provider: Option<&'a str>,
     base_url: &'a Url,
     api_key: &'a str,
+    thinking: Option<&'a str>,
+    reasoning_effort: Option<&'a str>,
 }
 
 impl<'a> ProviderRouteInput<'a> {
@@ -340,6 +342,14 @@ impl<'a> ProviderRouteInput<'a> {
 
     pub fn api_key(&self) -> &str {
         self.api_key
+    }
+
+    pub fn thinking(&self) -> Option<&str> {
+        self.thinking
+    }
+
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort
     }
 }
 
@@ -380,9 +390,11 @@ pub trait ProviderAdapterFactory: Send + Sync + 'static {
 }
 
 pub trait ProviderResponseAccumulator: Send + 'static {
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, InferenceError>;
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<ProviderStreamDelta>, InferenceError>;
 
-    fn finish(self: Box<Self>) -> Result<(ProviderInferenceResponse, Vec<String>), InferenceError>;
+    fn finish(
+        self: Box<Self>,
+    ) -> Result<(ProviderInferenceResponse, Vec<ProviderStreamDelta>), InferenceError>;
 }
 
 pub type ErasedProviderAdapter = Arc<dyn ProviderAdapter>;
@@ -406,10 +418,17 @@ pub struct TokenUsage {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderInferenceResponse {
+    pub reasoning: Option<String>,
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub stop_reason: StopReason,
     pub usage: Option<TokenUsage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderStreamDelta {
+    Reasoning(String),
+    Content(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -541,6 +560,7 @@ impl InferencePlugin {
     pub fn new() -> Self {
         let mut adapter_factories: HashMap<String, ErasedProviderAdapterFactory> = HashMap::new();
         adapter_factories.insert("openai".into(), Arc::new(OpenAiAdapterFactory));
+        adapter_factories.insert("deepseek".into(), Arc::new(DeepSeekAdapterFactory));
         Self {
             schedule: RuntimePlugin::PRE_UPDATE.to_owned(),
             config_path: default_config_path(),
@@ -721,6 +741,8 @@ struct ModelRouteConfig {
     base_url: String,
     api_key: String,
     api_type: String,
+    thinking: Option<String>,
+    reasoning_effort: Option<String>,
 }
 
 fn default_config_path() -> PathBuf {
@@ -807,6 +829,8 @@ fn compile_model_routes(
             provider: config.provider.as_deref(),
             base_url: &base_url,
             api_key: &config.api_key,
+            thinking: config.thinking.as_deref(),
+            reasoning_effort: config.reasoning_effort.as_deref(),
         })?;
         routes.insert(
             id,
@@ -1037,10 +1061,12 @@ fn validate_messages(messages: &[Message]) -> Result<(), InferenceError> {
         let size = match message {
             Message::System { content } | Message::User { content, .. } => content.len(),
             Message::Assistant {
+                reasoning,
                 content,
                 tool_calls,
             } => {
-                content.as_deref().unwrap_or("").len()
+                reasoning.as_deref().unwrap_or("").len()
+                    + content.as_deref().unwrap_or("").len()
                     + tool_calls
                         .iter()
                         .map(|call| call.id.len() + call.tool_name.len() + call.arguments.len())
@@ -1076,6 +1102,7 @@ fn validate_messages(messages: &[Message]) -> Result<(), InferenceError> {
         if let Message::Assistant {
             content,
             tool_calls,
+            ..
         } = message
         {
             if content.is_none() && tool_calls.is_empty() {
@@ -1173,23 +1200,23 @@ async fn run_provider(
                 ),
             )
         })?;
-        for content in accumulator.push(&chunk)? {
+        for delta in accumulator.push(&chunk)? {
             send_stream_delta(
                 &prepared.senders,
                 &prepared.route.id,
                 &prepared.agent_id,
-                content,
+                delta,
             )
             .await?;
         }
     }
-    let (response, content) = accumulator.finish()?;
-    for content in content {
+    let (response, deltas) = accumulator.finish()?;
+    for delta in deltas {
         send_stream_delta(
             &prepared.senders,
             &prepared.route.id,
             &prepared.agent_id,
-            content,
+            delta,
         )
         .await?;
     }
@@ -1221,17 +1248,23 @@ struct AgentMessageDeltaFrame<'a> {
     message_type: &'static str,
     id: &'a str,
     agent: &'a ResourceId,
-    content: String,
+    content: &'a str,
 }
 
 async fn send_stream_delta(
     senders: &[WebSocketSender],
     id: &str,
     agent: &ResourceId,
-    content: String,
+    delta: ProviderStreamDelta,
 ) -> Result<(), InferenceError> {
+    let (message_type, content) = match &delta {
+        ProviderStreamDelta::Reasoning(content) => {
+            ("agent.message.reasoning_delta", content.as_str())
+        }
+        ProviderStreamDelta::Content(content) => ("agent.message.delta", content.as_str()),
+    };
     let encoded = serde_json::to_string(&AgentMessageDeltaFrame {
-        message_type: "agent.message.delta",
+        message_type,
         id,
         agent,
         content,
@@ -1358,6 +1391,7 @@ fn publish_inference_output_system(world: &mut World) {
                         id: output.route.id.clone(),
                         agent: output.route.agent,
                         message: Message::Assistant {
+                            reasoning: response.reasoning.clone(),
                             content: response.content.clone(),
                             tool_calls: response.tool_calls.clone(),
                         },
@@ -1389,6 +1423,12 @@ impl ProviderAdapterFactory for OpenAiAdapterFactory {
         &self,
         route: ProviderRouteInput<'_>,
     ) -> Result<ErasedProviderAdapter, InferenceError> {
+        if route.thinking().is_some() || route.reasoning_effort().is_some() {
+            return Err(InferenceError::new(
+                InferenceErrorKind::InvalidModelRoute,
+                "OpenAI model route cannot contain DeepSeek reasoning options",
+            ));
+        }
         if route.api_key().bytes().any(|byte| byte.is_ascii_control()) {
             return Err(InferenceError::new(
                 InferenceErrorKind::InvalidModelRoute,
@@ -1399,6 +1439,120 @@ impl ProviderAdapterFactory for OpenAiAdapterFactory {
             base_url: route.base_url().clone(),
             api_key: route.api_key().to_owned(),
         }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeepSeekAdapterFactory;
+
+impl DeepSeekAdapterFactory {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ProviderAdapterFactory for DeepSeekAdapterFactory {
+    fn build(
+        &self,
+        route: ProviderRouteInput<'_>,
+    ) -> Result<ErasedProviderAdapter, InferenceError> {
+        if route.api_key().bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(InferenceError::new(
+                InferenceErrorKind::InvalidModelRoute,
+                "provider API key contains an invalid control character",
+            ));
+        }
+        let thinking = match route.thinking() {
+            None | Some("disabled") => false,
+            Some("enabled") => true,
+            Some(_) => {
+                return Err(InferenceError::new(
+                    InferenceErrorKind::InvalidModelRoute,
+                    "DeepSeek thinking must be enabled or disabled",
+                ))
+            }
+        };
+        let reasoning_effort =
+            match (thinking, route.reasoning_effort()) {
+                (true, Some(value @ ("high" | "max"))) => Some(value.to_owned()),
+                (true, None) => {
+                    return Err(InferenceError::new(
+                        InferenceErrorKind::InvalidModelRoute,
+                        "enabled DeepSeek thinking requires reasoning_effort",
+                    ))
+                }
+                (false, None) => None,
+                _ => return Err(InferenceError::new(
+                    InferenceErrorKind::InvalidModelRoute,
+                    "DeepSeek reasoning_effort must be high or max and requires enabled thinking",
+                )),
+            };
+        Ok(Arc::new(DeepSeekAdapter {
+            base_url: route.base_url().clone(),
+            api_key: route.api_key().to_owned(),
+            thinking,
+            reasoning_effort,
+        }))
+    }
+}
+
+struct DeepSeekAdapter {
+    base_url: Url,
+    api_key: String,
+    thinking: bool,
+    reasoning_effort: Option<String>,
+}
+
+impl ProviderAdapter for DeepSeekAdapter {
+    fn build_request(
+        &self,
+        input: ProviderInput<'_>,
+    ) -> Result<ProviderHttpRequest, InferenceError> {
+        let endpoint = format!(
+            "{}/chat/completions",
+            self.base_url.as_str().trim_end_matches('/')
+        );
+        let url = Url::parse(&endpoint).map_err(|_| {
+            InferenceError::new(
+                InferenceErrorKind::RequestBuildFailed,
+                "DeepSeek chat endpoint is invalid",
+            )
+        })?;
+        let body =
+            OpenAiRequest::from_deepseek_input(input, self.thinking, self.reasoning_effort.clone());
+        let body = serde_json::to_vec(&body).map_err(|_| {
+            InferenceError::new(
+                InferenceErrorKind::RequestBuildFailed,
+                "DeepSeek request could not be encoded",
+            )
+        })?;
+        let authorization =
+            HeaderValue::from_str(&format!("Bearer {}", self.api_key)).map_err(|_| {
+                InferenceError::new(
+                    InferenceErrorKind::RequestBuildFailed,
+                    "provider authorization header is invalid",
+                )
+            })?;
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, authorization);
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        Ok(ProviderHttpRequest::new(Method::POST, url, headers, body))
+    }
+
+    fn begin_response(
+        &self,
+        status: StatusCode,
+        _headers: &HeaderMap,
+    ) -> Result<Box<dyn ProviderResponseAccumulator>, InferenceError> {
+        if !status.is_success() {
+            return Err(InferenceError::with_status(
+                InferenceErrorKind::ResponseStatus,
+                Some(status.as_u16()),
+                "DeepSeek returned a non-success status",
+            ));
+        }
+        Ok(Box::new(DeepSeekAccumulator::default()))
     }
 }
 
@@ -1474,6 +1628,10 @@ struct OpenAiRequest {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stop: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<DeepSeekThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAiRequest {
@@ -1502,8 +1660,52 @@ impl OpenAiRequest {
             max_tokens: input.parameters().max_output_tokens(),
             top_p: input.parameters().top_p(),
             stop: input.parameters().stop().to_vec(),
+            thinking: None,
+            reasoning_effort: None,
         }
     }
+
+    fn from_deepseek_input(
+        input: ProviderInput<'_>,
+        thinking: bool,
+        reasoning_effort: Option<String>,
+    ) -> Self {
+        let messages = input.messages().iter().map(deepseek_message).collect();
+        let tools = input
+            .tools()
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    }
+                })
+            })
+            .collect();
+        Self {
+            model: input.model().to_owned(),
+            messages,
+            tools,
+            stream: true,
+            temperature: input.parameters().temperature(),
+            max_tokens: input.parameters().max_output_tokens(),
+            top_p: input.parameters().top_p(),
+            stop: input.parameters().stop().to_vec(),
+            thinking: thinking.then_some(DeepSeekThinking {
+                thinking_type: "enabled",
+            }),
+            reasoning_effort,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct DeepSeekThinking {
+    #[serde(rename = "type")]
+    thinking_type: &'static str,
 }
 
 fn openai_message(message: &Message) -> serde_json::Value {
@@ -1513,6 +1715,7 @@ fn openai_message(message: &Message) -> serde_json::Value {
         Message::Assistant {
             content,
             tool_calls,
+            ..
         } => serde_json::json!({
             "role": "assistant",
             "content": content,
@@ -1534,15 +1737,44 @@ fn openai_message(message: &Message) -> serde_json::Value {
     }
 }
 
+fn deepseek_message(message: &Message) -> serde_json::Value {
+    match message {
+        Message::Assistant {
+            reasoning,
+            content,
+            tool_calls,
+        } => {
+            let mut message = serde_json::json!({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": tool_calls.iter().map(|call| serde_json::json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {"name": call.tool_name, "arguments": call.arguments}
+                })).collect::<Vec<_>>(),
+            });
+            if !tool_calls.is_empty() {
+                if let Some(reasoning) = reasoning.as_ref().filter(|value| !value.is_empty()) {
+                    message["reasoning_content"] = serde_json::Value::String(reasoning.clone());
+                }
+            }
+            message
+        }
+        _ => openai_message(message),
+    }
+}
+
 #[derive(Default)]
 struct OpenAiAccumulator {
     buffer: Vec<u8>,
+    reasoning: String,
     content: String,
     tool_calls: Vec<OpenAiToolCallBuilder>,
     stop_reason: Option<StopReason>,
     usage: Option<TokenUsage>,
     saw_choice: bool,
     done: bool,
+    capture_reasoning: bool,
 }
 
 struct OpenAiToolCallBuilder {
@@ -1566,6 +1798,8 @@ struct OpenAiChoice {
 
 #[derive(Deserialize, Default)]
 struct OpenAiDelta {
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
     content: Option<String>,
     tool_calls: Option<Vec<OpenAiToolCallDelta>>,
 }
@@ -1593,7 +1827,7 @@ struct OpenAiUsage {
 }
 
 impl ProviderResponseAccumulator for OpenAiAccumulator {
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, InferenceError> {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<ProviderStreamDelta>, InferenceError> {
         self.buffer.extend_from_slice(chunk);
         let mut text = Vec::new();
         while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
@@ -1605,7 +1839,7 @@ impl ProviderResponseAccumulator for OpenAiAccumulator {
 
     fn finish(
         mut self: Box<Self>,
-    ) -> Result<(ProviderInferenceResponse, Vec<String>), InferenceError> {
+    ) -> Result<(ProviderInferenceResponse, Vec<ProviderStreamDelta>), InferenceError> {
         let mut text = Vec::new();
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
@@ -1644,6 +1878,7 @@ impl ProviderResponseAccumulator for OpenAiAccumulator {
         };
         Ok((
             ProviderInferenceResponse {
+                reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
                 content: (!self.content.is_empty()).then_some(self.content),
                 tool_calls: calls,
                 stop_reason: reason,
@@ -1655,7 +1890,7 @@ impl ProviderResponseAccumulator for OpenAiAccumulator {
 }
 
 impl OpenAiAccumulator {
-    fn consume_line(&mut self, line: &[u8]) -> Result<Vec<String>, InferenceError> {
+    fn consume_line(&mut self, line: &[u8]) -> Result<Vec<ProviderStreamDelta>, InferenceError> {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() || line.starts_with(b":") {
             return Ok(Vec::new());
@@ -1677,7 +1912,10 @@ impl OpenAiAccumulator {
         self.consume_chunk(chunk)
     }
 
-    fn consume_chunk(&mut self, chunk: OpenAiChunk) -> Result<Vec<String>, InferenceError> {
+    fn consume_chunk(
+        &mut self,
+        chunk: OpenAiChunk,
+    ) -> Result<Vec<ProviderStreamDelta>, InferenceError> {
         if let Some(usage) = chunk.usage {
             self.usage = Some(TokenUsage {
                 input_tokens: usage.input_tokens,
@@ -1689,6 +1927,18 @@ impl OpenAiAccumulator {
         for choice in chunk.choices {
             self.saw_choice = true;
             let delta = choice.delta.or(choice.message).unwrap_or_default();
+            if self.capture_reasoning {
+                if let Some(reasoning) = delta.reasoning_content.or(delta.reasoning) {
+                    if self.reasoning.len().saturating_add(reasoning.len()) > MAX_MESSAGE_BYTES {
+                        return Err(InferenceError::new(
+                            InferenceErrorKind::ResponseDecodeFailed,
+                            "inference response reasoning exceeds the size limit",
+                        ));
+                    }
+                    self.reasoning.push_str(&reasoning);
+                    output.push(ProviderStreamDelta::Reasoning(reasoning));
+                }
+            }
             if let Some(content) = delta.content {
                 if self.content.len().saturating_add(content.len()) > MAX_MESSAGE_BYTES {
                     return Err(InferenceError::new(
@@ -1697,7 +1947,7 @@ impl OpenAiAccumulator {
                     ));
                 }
                 self.content.push_str(&content);
-                output.push(content);
+                output.push(ProviderStreamDelta::Content(content));
             }
             if let Some(tool_calls) = delta.tool_calls {
                 for call in tool_calls {
@@ -1736,6 +1986,25 @@ impl OpenAiAccumulator {
             }
         }
         Ok(output)
+    }
+}
+
+#[derive(Default)]
+struct DeepSeekAccumulator {
+    inner: OpenAiAccumulator,
+}
+
+impl ProviderResponseAccumulator for DeepSeekAccumulator {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<ProviderStreamDelta>, InferenceError> {
+        self.inner.capture_reasoning = true;
+        self.inner.push(chunk)
+    }
+
+    fn finish(
+        mut self: Box<Self>,
+    ) -> Result<(ProviderInferenceResponse, Vec<ProviderStreamDelta>), InferenceError> {
+        self.inner.capture_reasoning = true;
+        Box::new(self.inner).finish()
     }
 }
 
@@ -1813,7 +2082,14 @@ data: [DONE]
         visible.extend(accumulator.push(second).unwrap());
         let (response, trailing) = Box::new(accumulator).finish().unwrap();
         assert!(trailing.is_empty());
-        assert_eq!(visible, ["he", "llo"]);
+        assert_eq!(
+            visible,
+            [
+                ProviderStreamDelta::Content("he".into()),
+                ProviderStreamDelta::Content("llo".into()),
+            ]
+        );
+        assert_eq!(response.reasoning, None);
         assert_eq!(response.content, Some("hello".into()));
         assert!(response.tool_calls.is_empty());
     }
@@ -1862,7 +2138,7 @@ data: [DONE]
         assert!(visible.is_empty());
 
         let (response, trailing) = Box::new(accumulator).finish().unwrap();
-        assert_eq!(trailing, ["tail"]);
+        assert_eq!(trailing, [ProviderStreamDelta::Content("tail".into())]);
         assert_eq!(response.content, Some("tail".into()));
         assert!(response.tool_calls.is_empty());
     }
@@ -1893,6 +2169,66 @@ data: [DONE]
         ));
         assert_eq!(request.tools[0]["function"]["name"], "skill0_review");
         assert_eq!(request.tools[1]["function"]["name"], "skill1_commit");
+    }
+
+    #[test]
+    fn deepseek_request_only_returns_tool_call_reasoning_to_the_provider() {
+        let messages = vec![
+            Message::Assistant {
+                reasoning: Some("ordinary reasoning".into()),
+                content: Some("ordinary answer".into()),
+                tool_calls: Vec::new(),
+            },
+            Message::Assistant {
+                reasoning: Some("tool reasoning".into()),
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    tool_name: "tool0".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+        ];
+        let request = OpenAiRequest::from_deepseek_input(
+            ProviderInput::new("model", &InferenceParameters::default(), &messages, &[]),
+            true,
+            Some("high".into()),
+        );
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["thinking"]["type"], "enabled");
+        assert_eq!(value["reasoning_effort"], "high");
+        assert!(value["messages"][0].get("reasoning_content").is_none());
+        assert_eq!(value["messages"][1]["reasoning_content"], "tool reasoning");
+    }
+
+    #[test]
+    fn deepseek_accumulator_separates_reasoning_and_content() {
+        let mut accumulator = DeepSeekAccumulator::default();
+        let visible = accumulator
+            .push(
+                br#"data: {"choices":[{"delta":{"reasoning_content":"think","content":null},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"reasoning":" more","content":"answer"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+            )
+            .unwrap();
+        let (response, trailing) = Box::new(accumulator).finish().unwrap();
+
+        assert!(trailing.is_empty());
+        assert_eq!(
+            visible,
+            [
+                ProviderStreamDelta::Reasoning("think".into()),
+                ProviderStreamDelta::Reasoning(" more".into()),
+                ProviderStreamDelta::Content("answer".into()),
+            ]
+        );
+        assert_eq!(response.reasoning, Some("think more".into()));
+        assert_eq!(response.content, Some("answer".into()));
     }
 
     #[test]

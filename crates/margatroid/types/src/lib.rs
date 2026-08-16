@@ -404,6 +404,8 @@ pub enum Message {
         tool_calls: Vec<ToolCall>,
     },
     Assistant {
+        #[serde(default)]
+        reasoning: Option<String>,
         content: Option<String>,
         tool_calls: Vec<ToolCall>,
     },
@@ -643,6 +645,7 @@ mod tests {
     #[test]
     fn messages_round_trip_through_json() {
         let message = Message::Assistant {
+            reasoning: None,
             content: Some("Using the selected workflow.".into()),
             tool_calls: vec![ToolCall {
                 id: "call-1".into(),
