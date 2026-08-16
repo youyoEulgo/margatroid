@@ -321,9 +321,12 @@ handle_agent_message(world: &mut World, event: &AgentMessage, events: &RuntimeEv
         System返回InvalidMessage
         User开始或确认当前turn，清空上一轮tool_context，写历史并追加长期messages
         User.tool_calls与当前loading_skills实例合并；有调用时发送ToolCallEvent，无调用时发送InferenceRequestEvent
-        Assistant写历史并追加长期messages；tool_calls为空时结束当前turn
-        Assistant.tool_calls非空时与loading_skills实例合并并发送ToolCallEvent
-        Tool写历史并追加tool_context；resource_id.type=skill时将resource_id加入loading_skills；不判断pending数量，不直接发起下一次推理
+        Assistant先取得该turn对应的PendingInferenceToolSchemas；写历史并追加长期messages
+        Assistant.tool_calls为空时结束当前turn
+        Assistant.tool_calls非空时逐项检查tool_name存在于本次ToolSpec且映射资源仍在AgentDynamicVisibility；不满足时直接发送Message::Tool拒绝响应，提示模型检查当前ToolSpec，不发送ToolCallEvent
+        Assistant所有调用均被拒绝时发送ToolTurnCompleted，等待拒绝响应进入tool_context后重新推理
+        Assistant鉴权通过的Skill资源立即加入loading_skills，再与普通tool_calls合并后统一派发
+        Tool写历史并追加tool_context；不修改loading_skills；不判断pending数量，不直接发起下一次推理
 
 tool_turn_completed_system(world: &mut World)
     处理工具批次完成：私有System，读取ToolTurnCompleted
@@ -363,6 +366,10 @@ dispatch_tool_calls(world: &World, turn_id: &str, agent: Entity, explicit: &[Too
         验证同批ToolCall.id唯一
         为每个调用发送ToolCallEvent { turn_id, agent, call }
         没有调用时返回RequestInference，否则返回WaitForTools
+
+dispatch_assistant_tool_calls(world: &mut World, turn_id: &str, agent: Entity, explicit: &[ToolCall], tool_schema: &[ToolDefinition], events: &RuntimeEventSender) -> Result<ConversationTurnResult, AgentStepError>
+    校验并派发模型调用：私有函数
+    行为：ToolMap无法解析或调用ID重复时返回InvalidToolBatch；ToolSpec中没有tool_name或映射资源不在动态可见性时发送Message::Tool { content: TOOL_PERMISSION_DENIED }；Skill资源通过鉴权后加入loading_skills；其余通过校验的调用交给dispatch_tool_calls
 
 build_inference_context(world: &World, agent: Entity) -> Result<Vec<Message>, AgentStepError>
     组装上下文：固定按System、messages、tool_context返回
@@ -406,7 +413,7 @@ Assistant：
 Tool：
     AgentMessage::Tool { resource_id, tool_call_id, content }
         -> 记录历史并追加tool_context
-        -> resource_id.type=skill时加入loading_skills
+        -> 不修改loading_skills
         -> 不查询pending，不判断批次完成
 
 批次完成：
@@ -427,7 +434,7 @@ loading skill：
 AgentPlugin负责Agent创建、上下文、动态可见性、当前turn、loading skills、内部ToolSpec构造和推理调度。
 AgentPlugin逐资源修改动态可见性，不保存完整可见性操作快照，不因单项资源注册失败结束Agent或Workspace。
 WorkspacePlugin只在收到AgentCreateResult后挂载外部运行组件，不介入资源注册或可见性修改。
-AgentPlugin不保存pending tool，不把tool_name转换为ResourceId，不解析Skill正文，不执行工具。
+AgentPlugin不保存pending tool，不解析Skill正文，不执行工具；只在Assistant消息分支按本次ToolSpec和动态可见性授权模型工具调用。
 ToolPlugin拥有AgentToolMap和PendingToolCalls，并通过ToolTurnCompleted通知批次结束。
 InferencePlugin执行InferenceRequestEvent，Provider Adapter保留tool_name并发布AgentMessage::Assistant。
 MemoryPlugin只消费历史和实时上下文事件，不读取AgentStatus或ToolPlugin的Pending状态。
