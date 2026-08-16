@@ -182,7 +182,7 @@ insert_history_message(transaction: &Transaction, event: &AgentHistoryMessageWri
         Assistant写role=assistant、可空reasoning、可空content、tool_calls和事件携带的tool_schema，resource_id与tool_call_id为空
         Tool写role=tool、content、resource_id和tool_call_id，reasoning为空且tool_calls与tool_schema固定为[]
         System返回WriteFailed
-        MemoryPlugin不判断工具类型；Tool历史content已由AgentPlugin替换为完整resource_id字符串
+        MemoryPlugin不判断工具类型；Skill类型Tool历史content已由AgentPlugin替换为完整resource_id字符串，非Skill类型Tool保留完整响应正文
 
 insert_history_message_values(transaction: &Transaction, turn_id: &str, message: &Message, tool_schema: &[ToolDefinition], created_at_ms: i64) -> Result<(), MemoryError>
     写入历史分列：私有函数，供历史事件与旧schema迁移共用
@@ -233,8 +233,8 @@ Workspace启动：
         -> AgentHistoryMessageWriteRequested
         -> sync_history_messages_system
         -> history_messages追加一行
-    User、Assistant和普通Tool保存原始分列内容
-    Tool历史事件的content已是完整resource_id字符串，不保存工具正文
+    User、Assistant和非Skill类型Tool保存原始分列内容
+    Skill类型Tool历史事件的content已是完整resource_id字符串，不保存Skill正文
 
 实时写入：
     AgentContext的messages或tool_context变更

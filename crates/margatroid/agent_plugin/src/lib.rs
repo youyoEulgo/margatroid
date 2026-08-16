@@ -1341,7 +1341,7 @@ fn record_history_message(
             resource_id,
             tool_call_id,
             ..
-        } => Message::Tool {
+        } if resource_id.resource_type() == "skill" => Message::Tool {
             resource_id: resource_id.clone(),
             tool_call_id: tool_call_id.clone(),
             content: resource_id.to_string(),
@@ -2018,6 +2018,53 @@ mod loading_skill_tests {
             .unwrap()
             .schemas
             .is_empty());
+    }
+
+    #[test]
+    fn tool_history_redacts_only_skill_response_content() {
+        let (mut app, agent) = test_app();
+        let events = app.world().event_sender();
+        let messages = [
+            AgentMessage {
+                id: "skill-turn".into(),
+                agent,
+                message: Message::Tool {
+                    resource_id: ResourceId::parse("skill:local/review:latest").unwrap(),
+                    tool_call_id: "skill-call".into(),
+                    content: "private skill instructions".into(),
+                },
+            },
+            AgentMessage {
+                id: "tool-turn".into(),
+                agent,
+                message: Message::Tool {
+                    resource_id: ResourceId::parse("shell:local/sh:latest").unwrap(),
+                    tool_call_id: "tool-call".into(),
+                    content: "complete command output".into(),
+                },
+            },
+        ];
+
+        for message in &messages {
+            record_history_message(app.world_mut(), message, &events, Vec::new());
+        }
+        app.tick();
+
+        let writes = app
+            .world()
+            .event_reader::<AgentHistoryMessageWriteRequested>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert!(writes.iter().any(|write| matches!(
+            &write.message,
+            Message::Tool { content, .. } if write.id == "skill-turn"
+                && content == "skill:local/review:latest"
+        )));
+        assert!(writes.iter().any(|write| matches!(
+            &write.message,
+            Message::Tool { content, .. } if write.id == "tool-turn"
+                && content == "complete command output"
+        )));
     }
 
     #[test]
