@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS history_messages (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     turn_id TEXT NOT NULL,
     role TEXT NOT NULL,
+    reasoning TEXT,
     content TEXT,
     tool_calls TEXT NOT NULL,
     resource_id TEXT,
@@ -279,6 +280,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
     let legacy_history = table_has_column(connection, "history_messages", "message")?;
     let history_exists = table_exists(connection, "history_messages")?;
     let history_has_resource_id = table_has_column(connection, "history_messages", "resource_id")?;
+    let history_has_reasoning = table_has_column(connection, "history_messages", "reasoning")?;
     let legacy_realtime = table_has_column(connection, "realtime_messages", "position")?
         && !table_has_column(connection, "realtime_messages", "context")?;
     let transaction = connection.transaction().map_err(|_| {
@@ -312,6 +314,11 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
                 "ALTER TABLE history_messages ADD COLUMN resource_id TEXT",
                 [],
             )
+            .map_err(schema_error)?;
+    }
+    if history_exists && !legacy_history && !history_has_reasoning {
+        transaction
+            .execute("ALTER TABLE history_messages ADD COLUMN reasoning TEXT", [])
             .map_err(schema_error)?;
     }
     if legacy_history {
@@ -424,7 +431,7 @@ fn schema_error(_: rusqlite::Error) -> MemoryError {
 
 fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>, MemoryError> {
     let mut statement = connection
-        .prepare("SELECT sequence, turn_id, role, content, tool_calls, resource_id, tool_call_id, created_at_ms FROM history_messages ORDER BY sequence ASC")
+        .prepare("SELECT sequence, turn_id, role, reasoning, content, tool_calls, resource_id, tool_call_id, created_at_ms FROM history_messages ORDER BY sequence ASC")
         .map_err(read_error)?;
     let rows = statement
         .query_map([], |row| {
@@ -433,16 +440,26 @@ fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
-                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         })
         .map_err(read_error)?;
     rows.map(|row| {
-        let (sequence, turn_id, role, content, calls, resource_id, call_id, created_at_ms) =
-            row.map_err(read_error)?;
+        let (
+            sequence,
+            turn_id,
+            role,
+            reasoning,
+            content,
+            calls,
+            resource_id,
+            call_id,
+            created_at_ms,
+        ) = row.map_err(read_error)?;
         let tool_calls = serde_json::from_str(&calls).map_err(|_| {
             MemoryError::new(
                 MemoryErrorKind::DecodeFailed,
@@ -455,6 +472,7 @@ fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>,
                 tool_calls,
             },
             "assistant" => Message::Assistant {
+                reasoning,
                 content,
                 tool_calls,
             },
@@ -603,27 +621,37 @@ fn insert_history_message_values(
     message: &Message,
     created_at_ms: i64,
 ) -> Result<(), MemoryError> {
-    let (role, content, tool_calls, resource_id, tool_call_id) = match message {
+    let (role, reasoning, content, tool_calls, resource_id, tool_call_id) = match message {
         Message::User {
             content,
             tool_calls,
         } => (
             "user",
+            None,
             Some(content.clone()),
             tool_calls.clone(),
             None,
             None,
         ),
         Message::Assistant {
+            reasoning,
             content,
             tool_calls,
-        } => ("assistant", content.clone(), tool_calls.clone(), None, None),
+        } => (
+            "assistant",
+            reasoning.clone(),
+            content.clone(),
+            tool_calls.clone(),
+            None,
+            None,
+        ),
         Message::Tool {
             resource_id,
             tool_call_id,
             content,
         } => (
             "tool",
+            None,
             Some(content.clone()),
             Vec::new(),
             Some(resource_id.to_string()),
@@ -642,7 +670,7 @@ fn insert_history_message_values(
             "history tool calls could not be encoded",
         )
     })?;
-    transaction.execute("INSERT INTO history_messages (turn_id, role, content, tool_calls, resource_id, tool_call_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![turn_id, role, content, encoded_calls, resource_id, tool_call_id, created_at_ms]).map_err(write_error)?;
+    transaction.execute("INSERT INTO history_messages (turn_id, role, reasoning, content, tool_calls, resource_id, tool_call_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![turn_id, role, reasoning, content, encoded_calls, resource_id, tool_call_id, created_at_ms]).map_err(write_error)?;
     Ok(())
 }
 
@@ -807,6 +835,7 @@ mod tests {
                 tool_calls: Vec::new(),
             },
             Message::Assistant {
+                reasoning: Some("checking".into()),
                 content: None,
                 tool_calls: Vec::new(),
             },
@@ -828,7 +857,13 @@ mod tests {
         let history = memory.history_messages().unwrap();
         assert_eq!(history.len(), 3);
         assert!(matches!(history[0].message, Message::User { .. }));
-        assert!(matches!(history[1].message, Message::Assistant { .. }));
+        assert!(matches!(
+            &history[1].message,
+            Message::Assistant {
+                reasoning: Some(reasoning),
+                ..
+            } if reasoning == "checking"
+        ));
         assert!(matches!(history[2].message, Message::Tool { .. }));
     }
 
@@ -903,6 +938,49 @@ mod tests {
         assert_eq!(context.messages.len(), 1);
         assert!(context.tool_context.is_empty());
         assert_eq!(memory.history_messages().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_adds_reasoning_to_the_current_history_schema() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("memory.sql");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE history_messages (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    turn_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT,
+                    tool_calls TEXT NOT NULL,
+                    resource_id TEXT,
+                    tool_call_id TEXT,
+                    created_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE realtime_messages (
+                    context TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    message TEXT NOT NULL,
+                    PRIMARY KEY (context, position)
+                );
+                INSERT INTO history_messages
+                    (turn_id, role, content, tool_calls, created_at_ms)
+                    VALUES ('turn-1', 'assistant', 'legacy answer', '[]', 1);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let (memory, _) = AgentMemory::open(&path).unwrap();
+        let history = memory.history_messages().unwrap();
+
+        assert!(matches!(
+            &history[0].message,
+            Message::Assistant {
+                reasoning: None,
+                content: Some(content),
+                ..
+            } if content == "legacy answer"
+        ));
     }
 
     #[test]

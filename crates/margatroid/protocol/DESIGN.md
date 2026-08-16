@@ -18,6 +18,17 @@ Message::Tool：工具结果消息，公开消息变体
     tool_call_id: String--对应ToolCall.id
     content: String--工具结果或稳定错误
 
+MessageDto::Assistant：Assistant展示消息DTO
+    reasoning: Option<String>--Provider公开的完整思考内容
+    content: Option<String>--Assistant正文
+    tool_calls: Vec<ToolCallDto>
+
+ServerMessage::AgentMessageReasoningDelta：思考流式分片
+    type: agent.message.reasoning_delta
+    id: String--轮次ID
+    agent: ResourceIdDto--稳定Agent ID
+    content: String--仅包含本次新增的思考文本
+
 ClientMessage::AgentSkillLoad / AgentSkillUnload / AgentSkillUnloadAll：前端持久Skill命令
     行为：使用WorkspaceReference和可选Agent资源ID路由；Load与Unload携带完整Skill resource_id
 
@@ -33,4 +44,5 @@ tool_name只在单个Agent内唯一，不作为ResourceId，也不需要跨Agent
 ToolPlugin从AgentToolMap和PendingToolCalls恢复具体resource_id并写入Message::Tool。
 ResourceId统一格式为type:scope/name:tag，省略tag时解析为latest。
 静态Workspace Agent固定使用agent:<workspace>/<name>:latest；clone tag不创建目录，动态Subagent留待后续设计。
+agent.message.reasoning_delta与agent.message.delta分别累积思考和正文；完整agent.message同时结束两种分片。
 ```
