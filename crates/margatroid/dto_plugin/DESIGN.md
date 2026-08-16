@@ -84,7 +84,7 @@ dto_route_system(world: &mut World)
         收集WebSocketMessageReceived并要求消息为Text
         反序列化统一{type,id,message}信封为ClientMessage
         按type取得对应DTO并调用DTO::into_domain
-        转换成功后直接发送StartWorkspace、StopWorkspaceByReference、RouteAgentMessage、RouteAgentSkill、RouteAgentVisibility或RegisterConnection领域事件
+        转换成功后直接发送StartWorkspace、StopWorkspaceByReference、RouteAgentMessage、RouteAgentTurnAbort、RouteAgentSkill、RouteAgentVisibility或RegisterConnection领域事件
         转换失败时记录warning并丢弃当前请求
 
         WebSocketMessageSend:

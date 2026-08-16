@@ -360,6 +360,15 @@ pub struct RouteAgentMessage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteAgentTurnAbort {
+    pub id: String,
+    pub workspace: WorkspaceReference,
+    pub agent: Option<ResourceId>,
+}
+
+impl Event for RouteAgentTurnAbort {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentSkillRouteAction {
     Load,
     Unload,

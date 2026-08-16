@@ -125,6 +125,12 @@ RouteAgentMessage：逻辑Agent消息路由命令，公开事件--由DTO层产�
     agent: Option<ResourceId>--目标Agent完整资源ID，None表示manager
     message: Message--当前只接受User消息，前端预选调用保存在Message::User.tool_calls
     impl Event for RouteAgentMessage
+
+RouteAgentTurnAbort：逻辑Agent轮次中止命令，公开事件--由DTO层产生并交给WorkspacePlugin解析Entity
+    id: String--API请求ID
+    workspace: WorkspaceReference
+    agent: Option<ResourceId>--空时路由到Workspace manager
+    impl Event for RouteAgentTurnAbort
         Event：公开trait实现
 
 AgentSkillRouteAction：Agent持久Skill操作，公开枚举

@@ -73,6 +73,11 @@ ToolTurnCompleted：工具批次完成事件，公开事件--通知AgentPlugin�
     agent: Entity
     impl Event for ToolTurnCompleted
 
+CancelToolTurn：取消工具批次，公开事件--AgentPlugin中止轮次时发送
+    turn_id: String
+    agent: Entity
+    impl Event for CancelToolTurn
+
 ToolError：工具错误，公开结构体--不包含资源正文、完整参数或绝对路径
     kind: ToolErrorKind
     message: String
@@ -93,6 +98,8 @@ PendingToolCalls：待执行工具调用池，私有Resource--由ToolPlugin独�
         登记请求：私有方法，拒绝重复完整定位键
     remove(&mut self, agent: Entity, turn_id: &str, tool_call_id: &str) -> Option<ToolCallRequest>
         移除请求：私有方法，返回原请求供响应整理
+    remove_turn(&mut self, agent: Entity, turn_id: &str)
+        移除轮次：私有方法，删除指定Agent与turn_id的全部请求
     impl Resource for PendingToolCalls
 ```
 
@@ -118,6 +125,9 @@ tool_call_response_system(world: &mut World)
     整理响应：私有System，读取ToolCallResponse
     行为：
         使用Agent、turn_id和tool_call_id从PendingToolCalls移除原请求
+
+cancel_tool_turn_system(world: &mut World)
+    取消工具批次：私有System，移除指定Agent与turn_id的全部PendingToolCalls；迟到响应因无法匹配而丢弃
         未找到原请求时记录稳定错误，不发布AgentMessage
         使用原请求.resource_id、响应tool_call_id及结果正文构造Message::Tool
         发送AgentMessage { id: turn_id, agent, message }

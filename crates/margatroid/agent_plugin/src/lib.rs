@@ -4,14 +4,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
-use inference_plugin::InferenceRequestEvent;
+use inference_plugin::{CancelInferenceRequest, InferenceRequestEvent};
 use margatroid_types::{
     AgentContextMessagesUpdated, AgentFailure, AgentFailureKind, AgentHistoryMessageWriteRequested,
     AgentMessage, Message, ResourceId, ToolCall, ToolDefinition,
 };
 use tool_plugin::{
     attach_agent_tool_map, AgentToolMap, AgentToolRegisterRequest, AgentToolRegisterResponse,
-    ToolCallEvent, ToolError, ToolErrorKind, ToolPluginInstalled, ToolTurnCompleted,
+    CancelToolTurn, ToolCallEvent, ToolError, ToolErrorKind, ToolPluginInstalled,
+    ToolTurnCompleted,
 };
 
 const TOOL_PERMISSION_DENIED: &str =
@@ -44,6 +45,14 @@ pub struct AgentPluginInstalled;
 
 impl Resource for AgentPluginInstalled {}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbortAgentTurn {
+    pub id: String,
+    pub agent: Entity,
+}
+
+impl Event for AbortAgentTurn {}
+
 impl Plugin for AgentPlugin {
     fn build(self, app: &mut App) {
         if !app.world().contains_resource::<RuntimeHandle>() {
@@ -69,6 +78,7 @@ impl Plugin for AgentPlugin {
             .add_system(&self.schedule, collect_agent_tool_registration_system)
             .add_system(&self.schedule, cleanup_dead_agent_registrations_system)
             .add_system(&self.schedule, agent_skill_state_system)
+            .add_system(&self.schedule, abort_agent_turn_system)
             .add_system(&self.schedule, agent_message_system)
             .add_system(&self.schedule, tool_turn_completed_system);
     }
@@ -284,6 +294,7 @@ impl Component for AgentIdentity {}
 pub trait WorldAgentExt {
     fn agent(&self, id: &ResourceId) -> Option<Entity>;
     fn agent_loading_skills(&self, agent: Entity) -> Option<&BTreeSet<ResourceId>>;
+    fn agent_is_working(&self, agent: Entity) -> Option<bool>;
     fn inject_agent_visible_resource(
         &self,
         id: impl Into<String>,
@@ -314,6 +325,11 @@ impl WorldAgentExt for World {
     fn agent_loading_skills(&self, agent: Entity) -> Option<&BTreeSet<ResourceId>> {
         self.get_component::<AgentStatus>(agent)
             .map(|status| &status.loading_skills)
+    }
+
+    fn agent_is_working(&self, agent: Entity) -> Option<bool> {
+        self.get_component::<AgentStatus>(agent)
+            .map(AgentStatus::is_working)
     }
 
     fn inject_agent_visible_resource(
@@ -500,6 +516,12 @@ impl AgentStatus {
         }
         self.turn_id = None;
         Ok(())
+    }
+    pub(crate) fn abort_turn(&mut self) -> Option<String> {
+        self.turn_id.take()
+    }
+    pub(crate) fn is_working(&self) -> bool {
+        self.turn_id.is_some()
     }
     pub(crate) fn load_skill(&mut self, resource_id: ResourceId) -> Result<(), AgentStepError> {
         if resource_id.resource_type() != "skill" {
@@ -1247,6 +1269,41 @@ fn agent_message_system(world: &mut World) {
     }
 }
 
+fn abort_agent_turn_system(world: &mut World) {
+    let requests = world
+        .event_reader::<AbortAgentTurn>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let events = world.event_sender();
+    for request in requests {
+        let turn_id = world
+            .get_component_mut::<AgentStatus>(request.agent)
+            .and_then(AgentStatus::abort_turn);
+        let Some(turn_id) = turn_id else {
+            tracing::warn!(request_id = %request.id, ?request.agent, "Agent turn abort ignored because Agent is idle");
+            continue;
+        };
+        if let Err(error) = clear_tool_context(world, request.agent, &events) {
+            tracing::warn!(request_id = %request.id, ?request.agent, error = %error.failure_message(), "Agent tool context could not be cleared after abort");
+        }
+        world
+            .get_resource_mut::<PendingInferenceToolSchemas>()
+            .expect("AgentPlugin is installed")
+            .schemas
+            .remove(&(request.agent, turn_id.clone()));
+        events.send_event(CancelInferenceRequest {
+            id: turn_id.clone(),
+            agent: request.agent,
+        });
+        events.send_event(CancelToolTurn {
+            turn_id: turn_id.clone(),
+            agent: request.agent,
+        });
+        tracing::info!(request_id = %request.id, turn_id, ?request.agent, "Agent turn aborted");
+    }
+}
+
 fn handle_agent_message(
     world: &mut World,
     event: &AgentMessage,
@@ -1981,6 +2038,87 @@ mod loading_skill_tests {
             .world_mut()
             .insert_component(agent, AgentStatus::default()));
         (app, agent)
+    }
+
+    #[test]
+    fn work_status_tracks_the_active_turn() {
+        let (mut app, agent) = test_app();
+        assert_eq!(app.world().agent_is_working(agent), Some(false));
+
+        assert!(app
+            .world_mut()
+            .get_component_mut::<AgentStatus>(agent)
+            .unwrap()
+            .begin_turn("turn-1".into())
+            .is_ok());
+        assert_eq!(app.world().agent_is_working(agent), Some(true));
+
+        assert!(app
+            .world_mut()
+            .get_component_mut::<AgentStatus>(agent)
+            .unwrap()
+            .finish_turn("turn-1")
+            .is_ok());
+        assert_eq!(app.world().agent_is_working(agent), Some(false));
+    }
+
+    #[test]
+    fn aborting_a_turn_clears_state_and_requests_execution_cancellation() {
+        let (mut app, agent) = test_app();
+        assert!(app.world_mut().insert_component(
+            agent,
+            AgentContext {
+                system_prompt: "system".into(),
+                messages: Vec::new(),
+                tool_context: vec![Message::Tool {
+                    resource_id: ResourceId::parse("shell:local/sh:latest").unwrap(),
+                    tool_call_id: "call-1".into(),
+                    content: "partial".into(),
+                }],
+            },
+        ));
+        assert!(app
+            .world_mut()
+            .get_component_mut::<AgentStatus>(agent)
+            .unwrap()
+            .begin_turn("turn-1".into())
+            .is_ok());
+        app.world_mut()
+            .get_resource_mut::<PendingInferenceToolSchemas>()
+            .unwrap()
+            .schemas
+            .insert((agent, "turn-1".into()), Vec::new());
+
+        app.world().send_event(AbortAgentTurn {
+            id: "abort-1".into(),
+            agent,
+        });
+        app.tick();
+        app.tick();
+
+        assert_eq!(app.world().agent_is_working(agent), Some(false));
+        assert!(app
+            .world()
+            .get_component::<AgentContext>(agent)
+            .unwrap()
+            .tool_context()
+            .is_empty());
+        assert!(app
+            .world()
+            .get_resource::<PendingInferenceToolSchemas>()
+            .unwrap()
+            .schemas
+            .is_empty());
+        assert!(app
+            .world()
+            .event_reader::<CancelInferenceRequest>()
+            .into_iter()
+            .any(|event| event.id == "turn-1" && event.agent == agent));
+        assert!(app
+            .world()
+            .event_reader::<CancelToolTurn>()
+            .into_iter()
+            .any(|event| event.turn_id == "turn-1" && event.agent == agent));
     }
 
     #[test]

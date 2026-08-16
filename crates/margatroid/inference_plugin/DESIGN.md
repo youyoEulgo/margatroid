@@ -12,6 +12,11 @@ InferenceRequestEvent：推理请求事件，公开事件--AgentPlugin交付完�
     tools: Vec<ToolDefinition>--内部ToolSpec；name已经是所属AgentToolMap分配的tool_name
     impl Event for InferenceRequestEvent
 
+CancelInferenceRequest：取消推理请求，公开事件--AgentPlugin中止轮次时发送
+    id: String--要取消的交互轮次ID
+    agent: Entity--请求所属Agent
+    impl Event for CancelInferenceRequest
+
 ProviderInferenceResponse：Provider响应，公开结构体--InferencePlugin内部的协议无关累积结果
     reasoning: Option<String>--Provider公开的完整思考内容
     content: Option<String>--Assistant文本
@@ -35,6 +40,10 @@ PreparedInference：已准备推理，私有事件--主线程完成路由、Prov
     request: ProviderHttpRequest
     adapter: ErasedProviderAdapter
     senders: Vec<WebSocketSender>
+    cancellation: watch::Receiver<bool>--当前请求取消信号
+
+InFlightInferences：飞行中推理表，私有Resource
+    requests: HashMap<(Entity, String), watch::Sender<bool>>--按Agent和turn_id定位取消信号
 
 ModelRouteConfig：模型路由配置，私有结构体--由models.toml读取Provider协议及地址
     api_type: String--选择Provider Adapter；deepseek表示DeepSeek协议语义
@@ -43,7 +52,11 @@ ModelRouteConfig：模型路由配置，私有结构体--由models.toml读取Pro
 
 InferenceTaskOutput：异步推理结果，私有事件
     route: InferenceRoute
-    result: Result<ProviderInferenceResponse, InferenceError>
+    result: InferenceTaskResult
+
+InferenceTaskResult：异步推理结局，私有枚举
+    Completed(Result<ProviderInferenceResponse, InferenceError>)
+    Cancelled
 
 InferenceToolCall：Provider Adapter内部调用累积结构，私有结构体
     id: String
@@ -61,16 +74,20 @@ prepare_inference_system(world: &mut World)
         读取AgentInferenceSnapshot及Workspace或全局模型路由
         把内部ToolSpec交给选定Provider Adapter构造Provider请求
         不查询ToolPlugin，不读取AgentToolMap，不转换ResourceId
-        根据全局配置解析流式发送器并发送PreparedInference
+        根据全局配置解析流式发送器，登记InFlightInferences并发送PreparedInference
+
+cancel_inference_system(world: &mut World)
+    取消推理：私有System，读取CancelInferenceRequest并向匹配飞行中请求发送取消信号
 
 execute_prepared_inference(prepared: PreparedInference, context: AsyncContext)
     执行推理：私有异步函数
-    行为：发送HTTP请求，按Provider协议累积思考、文本和工具调用；思考与文本分片分别直接按顺序发给前端，不进入事件队列
+    行为：发送HTTP请求，按Provider协议累积思考、文本和工具调用；思考与文本分片分别直接按顺序发给前端，不进入事件队列；取消信号到达时丢弃HTTP Future并返回Cancelled
 
 publish_inference_output_system(world: &mut World)
     发布结果：私有System，读取InferenceTaskOutput
     行为：
-        失败时发送AgentFailure { kind: Inference }
+        从InFlightInferences移除当前请求；已取消结果不发送AgentMessage或AgentFailure
+        其他失败时发送AgentFailure { kind: Inference }
         成功时使用ProviderInferenceResponse构造Message::Assistant { reasoning, content, tool_calls }
         发送AgentMessage { id: route.id, agent: route.agent, message }
         不再发布InferenceResponse，也不经过工具身份转换System
