@@ -477,6 +477,7 @@ fn tool_call_response_system(world: &mut World) {
                 tool_call_id: response.tool_call_id,
                 content,
             },
+            usage: None,
         });
         let completed = world
             .get_resource::<PendingToolCalls>()

@@ -48,8 +48,8 @@ AgentMemory：Agent数据库绑定，公开组件--一个运行中Agent独占一
     path: PathBuf--WorkspacePlugin提供的规范化数据库路径，私有
     connection: Mutex<rusqlite::Connection>--只由MemoryPlugin使用，私有
     open(path: impl Into<PathBuf>) -> Result<(Self, RealtimeContext), MemoryError>
-        打开记忆：公开关联函数，创建表并恢复实时上下文
-        行为：返回未绑定Entity的AgentMemory及messages与tool_context，任一步失败时不返回部分结果
+        打开记忆：公开关联函数，创建表、恢复实时上下文并从历史Assistant行聚合Token
+        行为：返回未绑定Entity的AgentMemory及messages、tool_context与token_usage，任一步失败时不返回部分结果
     path(&self) -> &Path
         取得路径：公开方法
     history_messages(&self) -> Result<Vec<HistoryMessage>, MemoryError>
@@ -60,12 +60,14 @@ AgentMemory：Agent数据库绑定，公开组件--一个运行中Agent独占一
 RealtimeContext：实时上下文快照，公开结构体--Agent启动时恢复的两类消息
     messages: Vec<Message>--长期User和Assistant对话
     tool_context: Vec<Message>--未完成当前轮的Tool上下文
+    token_usage: TokenUsage--从全部历史Assistant行聚合出的输入、输出与缓存命中Token总数
 
 HistoryMessage：可展示历史条目，公开结构体--对应history_messages中的一行
     sequence: i64--单Agent永久递增序号
     turn_id: String--原AgentMessage.id
     message: Message--User、Assistant或Tool
     tool_schema: Vec<ToolDefinition>--该Assistant产生时实际发送的内部ToolSpec；User和Tool为空
+    usage: Option<TokenUsage>--Assistant行的输入、输出和缓存命中Token；User和Tool为空
     created_at_ms: i64--写入时Unix毫秒时间
     impl Clone + PartialEq for HistoryMessage
         值语义：公开trait实现
@@ -114,6 +116,15 @@ MemoryPluginInstalled：MemoryPlugin安装标记，公开单元Resource--阻止�
 
 私有：
 ```text
+HistoryLayout：旧分列历史表字段能力，私有结构体--迁移时决定保留已有列或补默认值
+    has_reasoning: bool
+    has_resource_id: bool
+    has_tool_call_id: bool
+    has_tool_schema: bool
+    has_input_tokens: bool
+    has_output_tokens: bool
+    has_cache_hit_tokens: bool
+
 validate_path(path: &Path) -> Result<(), MemoryError>
     验证数据库路径：私有函数，要求路径非空且包含文件名
 
@@ -127,7 +138,7 @@ initialize_schema(connection: &mut Connection) -> Result<(), MemoryError>
     初始化数据库：私有函数，事务内迁移旧表并创建不存在的两张业务表
     行为：
         旧history_messages包含message列时改名为history_messages_legacy
-        已分列但缺少tool_schema的history_messages改名为history_messages_layout_legacy
+        已分列但缺少tool_schema或任一Token列的history_messages改名为history_messages_layout_legacy
         旧realtime_messages没有context列时改名为realtime_messages_legacy
         history_messages:
             sequence INTEGER PRIMARY KEY AUTOINCREMENT
@@ -139,13 +150,16 @@ initialize_schema(connection: &mut Connection) -> Result<(), MemoryError>
             tool_schema TEXT NOT NULL--Assistant该次推理实际ToolSpec数组JSON，User和Tool固定为[]
             resource_id TEXT--Tool具体资源ResourceId，User和Assistant为空
             tool_call_id TEXT--Tool对应调用ID，User和Assistant为空
+            input_tokens INTEGER NOT NULL DEFAULT 0
+            output_tokens INTEGER NOT NULL DEFAULT 0
+            cache_hit_tokens INTEGER NOT NULL DEFAULT 0
             created_at_ms INTEGER NOT NULL
         realtime_messages:
             context TEXT NOT NULL--conversation或tool
             position INTEGER NOT NULL--同一context内从0连续递增
             message TEXT NOT NULL--Message JSON
             PRIMARY KEY(context, position)
-        调用migrate_history、migrate_history_layout和migrate_realtime保留可解码内容；旧记录tool_schema固定迁移为[]；成功后删除legacy表并提交
+        调用migrate_history、migrate_history_layout和migrate_realtime保留可解码内容；旧记录缺失的tool_schema固定迁移为[]，缺失的Token列固定迁移为0；成功后删除legacy表并提交
         任一步失败时回滚整个迁移
 
 table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool, MemoryError>
@@ -154,8 +168,8 @@ table_has_column(connection: &Connection, table: &str, column: &str) -> Result<b
 migrate_history(transaction: &Transaction) -> Result<(), MemoryError>
     迁移历史：私有函数，解码旧Message JSON并按新分列schema写入
 
-migrate_history_layout(transaction: &Transaction) -> Result<(), MemoryError>
-    重排分列历史：私有函数，保留sequence与全部已有字段，把reasoning移到content前并补tool_schema=[]
+migrate_history_layout(transaction: &Transaction, layout: HistoryLayout) -> Result<(), MemoryError>
+    重排分列历史：私有函数，保留sequence与全部已有字段，把reasoning移到content前并补缺失的tool_schema=[]与Token列=0
 
 migrate_realtime(transaction: &Transaction) -> Result<(), MemoryError>
     迁移实时上下文：私有函数，把User和Assistant放入conversation，把Tool放入tool
@@ -165,7 +179,10 @@ schema_error(error: rusqlite::Error) -> MemoryError
 
 load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>, MemoryError>
     读取历史：私有函数，按role与分列字段重建Message
-    行为：Assistant恢复reasoning、tool_calls和tool_schema；User和Tool要求tool_schema为[]；Tool还要求tool_calls为[]并恢复resource_id与tool_call_id；任一行非法时整体失败
+    行为：Assistant恢复reasoning、tool_calls、tool_schema和Token用量；User和Tool要求tool_schema为[]且Token用量对外为空；Tool还要求tool_calls为[]并恢复resource_id与tool_call_id；任一行非法时整体失败
+
+load_token_usage(connection: &Connection) -> Result<TokenUsage, MemoryError>
+    恢复累计Token：私有函数，对role=assistant的三列分别求和，空表返回全0
 
 load_realtime_messages(connection: &Connection) -> Result<RealtimeContext, MemoryError>
     恢复实时上下文：私有函数，分别按conversation和tool的position升序读取
@@ -223,7 +240,8 @@ Workspace启动：
     AgentMemory::open
         -> initialize_schema
         -> load_realtime_messages
-        -> 返回RealtimeContext { messages, tool_context }
+        -> load_token_usage
+        -> 返回RealtimeContext { messages, tool_context, token_usage }
     WorkspacePlugin
         -> 把两部分上下文放入AgentCreateRequest
         -> Agent创建后调用bind_agent_memory
@@ -232,7 +250,7 @@ Workspace启动：
     AgentToolCallSystem
         -> AgentHistoryMessageWriteRequested
         -> sync_history_messages_system
-        -> history_messages追加一行
+        -> history_messages追加一行；Assistant写入usage，User和Tool写0
     User、Assistant和非Skill类型Tool保存原始分列内容
     Skill类型Tool历史事件的content已是完整resource_id字符串，不保存Skill正文
 
@@ -246,6 +264,7 @@ Workspace启动：
 Agent重启：
     只从realtime_messages恢复messages和tool_context
     不从history_messages恢复模型上下文
+    从history_messages的Assistant行恢复累计Token
     loading_skills不从历史推断
 
 前端展示：

@@ -45,6 +45,10 @@ AgentStateDto：后端Agent状态快照
     default_resources: Vec<ResourceIdDto>--用户可手动开关的Agent默认资源集合
     visible_resources: Vec<ResourceIdDto>
     loading_skills: Vec<ResourceIdDto>--当前每轮自动调用的Skill集合
+    total_input_tokens: u64--历史Assistant响应累计输入Token
+    total_output_tokens: u64--历史Assistant响应累计输出Token
+    total_cache_hit_tokens: u64--历史Assistant响应累计缓存命中Token
+    cache_hit_rate: f64--累计缓存命中率，等于total_cache_hit_tokens / total_input_tokens；总输入为0时为0
 
 WorkspaceAgentStatusDto：Workspace成员状态DTO
     Creating
@@ -60,6 +64,6 @@ ToolPlugin从AgentToolMap和PendingToolCalls恢复具体resource_id并写入Mess
 ResourceId统一格式为type:scope/name:tag，省略tag时解析为latest。
 静态Workspace Agent固定使用agent:<workspace>/<name>:latest；clone tag不创建目录，动态Subagent留待后续设计。
 agent.message.reasoning_delta与agent.message.delta分别累积思考和正文；完整agent.message同时结束两种分片。
-BackendStateDto为Workspace定义中的每个Agent都生成AgentStateDto；Creating和Failed成员的working为false，default_resources、visible_resources与loading_skills为空；只有Ready成员读取Agent Entity组件。
+BackendStateDto为Workspace定义中的每个Agent都生成AgentStateDto；Creating和Failed成员的working为false，default_resources、visible_resources与loading_skills为空且四项Token统计为0；只有Ready成员读取Agent Entity组件与AgentTokenUsage。
 AgentHistoryDto只为Ready且已经绑定AgentMemory的成员生成；成员创建状态变化和资源逐项注入或删除由下一次state.sync反映。
 ```

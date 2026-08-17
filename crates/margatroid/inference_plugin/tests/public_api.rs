@@ -3,7 +3,10 @@ use std::fs;
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::App;
-use inference_plugin::{InferencePlugin, ReloadModelRoutesResult, WorldInferenceExt};
+use inference_plugin::{
+    ContextCompactionInferenceRequest, ContextCompactionInferenceResponse, InferencePlugin,
+    ReloadModelRoutesResult, WorldInferenceExt,
+};
 use tempfile::tempdir;
 
 #[test]
@@ -38,4 +41,11 @@ api_type = "openai"
         .unwrap();
     assert_eq!(result.id, "reload-1");
     assert_eq!(result.result.as_ref().unwrap().route_count, 1);
+}
+
+#[test]
+fn context_compaction_inference_events_are_public() {
+    fn assert_event<EventType: core_plugin::Event>() {}
+    assert_event::<ContextCompactionInferenceRequest>();
+    assert_event::<ContextCompactionInferenceResponse>();
 }

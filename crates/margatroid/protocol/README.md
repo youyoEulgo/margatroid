@@ -90,7 +90,8 @@ API 中间事件。WorkspacePlugin直接按完整`ResourceId`查找Agent并解�
 
 后端状态通过 `state.sync` 发送完整快照。前端以该快照替换业务状态，不自行持久化或从增量消息拼接
 历史。`histories` 包含可展示的 User、Assistant 和 Tool消息，不包含 System 或Skill正文。`agents`
-包含每个运行中Agent的`working`、`default_resources`、`visible_resources`和`loading_skills`。
+包含每个运行中Agent的`working`、`default_resources`、`visible_resources`、`loading_skills`以及累计输入、
+输出、缓存命中Token和缓存命中率。
 `working`表示Agent存在未结束的交互轮次，推理和工具调用期间均为`true`；客户端在该值恢复为
 `false`前不得发送下一条用户消息。
 客户端可发送`agent.turn.abort`中止当前轮次；Workspace和Agent仍按与`agent.message`相同的逻辑路由，

@@ -54,6 +54,7 @@ fn registers_and_executes_trusted_lua_tools_asynchronously() {
         system_prompt: "test".into(),
         messages: Vec::new(),
         tool_context: Vec::new(),
+        token_usage: margatroid_types::TokenUsage::default(),
         default_visibility: BTreeSet::new(),
     });
     app.tick();
@@ -170,6 +171,7 @@ fn tracked_write_file_example_creates_parent_directories_and_writes_content() {
         system_prompt: "test".into(),
         messages: Vec::new(),
         tool_context: Vec::new(),
+        token_usage: margatroid_types::TokenUsage::default(),
         default_visibility: BTreeSet::new(),
     });
     app.tick();

@@ -4,10 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
-use inference_plugin::{CancelInferenceRequest, InferenceRequestEvent};
+use inference_plugin::{
+    CancelInferenceRequest, ContextCompactionInferenceRequest, ContextCompactionInferenceResponse,
+    InferenceError, InferenceRequestEvent,
+};
 use margatroid_types::{
     AgentContextMessagesUpdated, AgentFailure, AgentFailureKind, AgentHistoryMessageWriteRequested,
-    AgentMessage, Message, ResourceId, ToolCall, ToolDefinition,
+    AgentMessage, Message, ResourceId, TokenUsage, ToolCall, ToolDefinition,
 };
 use tool_plugin::{
     attach_agent_tool_map, AgentToolMap, AgentToolRegisterRequest, AgentToolRegisterResponse,
@@ -17,6 +20,8 @@ use tool_plugin::{
 
 const TOOL_PERMISSION_DENIED: &str =
     "PermissionDenied: this resource is not available in the current tool schema; check the current tool schema before calling tools";
+const CONTEXT_COMPACTION_PROMPT: &str = "You are acting as a context compaction engine. Summarize the conversation above into a concise checkpoint that allows another model to continue the work without losing essential context. Preserve current goals, decisions, constraints, exact identifiers, file paths, commands, errors, completed work, pending work, and the next required action. Do not mention this request, do not call tools, and output only the checkpoint text.";
+const COMPACTED_SUMMARY_PREAMBLE: &str = "This checkpoint condenses an earlier span of the conversation. Treat it as established context and continue directly from the messages that follow.";
 
 pub struct AgentPlugin {
     schedule: String,
@@ -53,6 +58,15 @@ pub struct AbortAgentTurn {
 
 impl Event for AbortAgentTurn {}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentContextCompactRequest {
+    pub id: String,
+    pub agent: Entity,
+    pub retain_messages: usize,
+}
+
+impl Event for AgentContextCompactRequest {}
+
 impl Plugin for AgentPlugin {
     fn build(self, app: &mut App) {
         if !app.world().contains_resource::<RuntimeHandle>() {
@@ -73,12 +87,15 @@ impl Plugin for AgentPlugin {
             .insert_resource(InFlightVisibilityRegistrations::default());
         app.world_mut()
             .insert_resource(PendingInferenceToolSchemas::default());
+        app.world_mut()
+            .insert_resource(PendingContextCompactions::default());
         app.add_system(&self.schedule, agent_create_system)
             .add_system(&self.schedule, agent_visibility_change_system)
             .add_system(&self.schedule, collect_agent_tool_registration_system)
             .add_system(&self.schedule, cleanup_dead_agent_registrations_system)
             .add_system(&self.schedule, agent_skill_state_system)
             .add_system(&self.schedule, abort_agent_turn_system)
+            .add_system(&self.schedule, context_compaction_system)
             .add_system(&self.schedule, agent_message_system)
             .add_system(&self.schedule, tool_turn_completed_system);
     }
@@ -92,6 +109,7 @@ pub struct AgentCreateRequest {
     pub system_prompt: String,
     pub messages: Vec<Message>,
     pub tool_context: Vec<Message>,
+    pub token_usage: TokenUsage,
     pub default_visibility: BTreeSet<ResourceId>,
 }
 
@@ -475,6 +493,62 @@ impl AgentDynamicVisibility {
 
 impl Component for AgentDynamicVisibility {}
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentTokenUsage {
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    total_cache_hit_tokens: u64,
+    cache_hit_rate: f64,
+}
+
+impl AgentTokenUsage {
+    fn from_totals(usage: &TokenUsage) -> Self {
+        let mut totals = Self {
+            total_input_tokens: usage.input_tokens,
+            total_output_tokens: usage.output_tokens,
+            total_cache_hit_tokens: usage.cache_hit_tokens,
+            cache_hit_rate: 0.0,
+        };
+        totals.recalculate_cache_hit_rate();
+        totals
+    }
+
+    pub fn total_input_tokens(&self) -> u64 {
+        self.total_input_tokens
+    }
+
+    pub fn total_output_tokens(&self) -> u64 {
+        self.total_output_tokens
+    }
+
+    pub fn total_cache_hit_tokens(&self) -> u64 {
+        self.total_cache_hit_tokens
+    }
+
+    pub fn cache_hit_rate(&self) -> f64 {
+        self.cache_hit_rate
+    }
+
+    pub(crate) fn add(&mut self, usage: &TokenUsage) {
+        self.total_input_tokens = self.total_input_tokens.saturating_add(usage.input_tokens);
+        self.total_output_tokens = self.total_output_tokens.saturating_add(usage.output_tokens);
+        self.total_cache_hit_tokens = self
+            .total_cache_hit_tokens
+            .saturating_add(usage.cache_hit_tokens);
+        self.recalculate_cache_hit_rate();
+    }
+
+    fn recalculate_cache_hit_rate(&mut self) {
+        self.cache_hit_rate = if self.total_input_tokens == 0 {
+            0.0
+        } else {
+            self.total_cache_hit_tokens as f64 / self.total_input_tokens as f64
+        };
+    }
+}
+
+impl Component for AgentTokenUsage {}
+
 #[derive(Default)]
 struct InFlightVisibilityRegistrations {
     registrations: HashMap<(Entity, ResourceId), InFlightVisibilityRegistration>,
@@ -495,6 +569,18 @@ struct PendingInferenceToolSchemas {
 }
 
 impl Resource for PendingInferenceToolSchemas {}
+
+#[derive(Default)]
+struct PendingContextCompactions {
+    requests: HashMap<(Entity, String), PendingContextCompaction>,
+}
+
+impl Resource for PendingContextCompactions {}
+
+struct PendingContextCompaction {
+    original_messages: Vec<Message>,
+    retained_messages: Vec<Message>,
+}
 
 #[derive(Default)]
 pub(crate) struct AgentStatus {
@@ -555,9 +641,14 @@ enum AgentStepError {
     IdentityMissing,
     ContextMissing,
     StatusMissing,
+    TokenUsageMissing,
     ToolMapMissing,
     InvalidMessage,
     InvalidToolBatch,
+    ContextNotCompactable,
+    ContextChanged,
+    InvalidCompactionResponse,
+    Inference(InferenceError),
     Tool(ToolError),
 }
 
@@ -568,9 +659,20 @@ impl AgentStepError {
             Self::IdentityMissing => "IdentityMissing: agent identity is missing".into(),
             Self::ContextMissing => "ContextMissing: agent context is missing".into(),
             Self::StatusMissing => "StatusMissing: agent status is missing".into(),
+            Self::TokenUsageMissing => "TokenUsageMissing: agent token usage is missing".into(),
             Self::ToolMapMissing => "ToolMapMissing: Agent tool map is missing".into(),
             Self::InvalidMessage => "InvalidMessage: message type is invalid".into(),
             Self::InvalidToolBatch => "InvalidToolBatch: tool call batch is invalid".into(),
+            Self::ContextNotCompactable => {
+                "ContextNotCompactable: Agent context cannot be compacted".into()
+            }
+            Self::ContextChanged => {
+                "ContextChanged: Agent context changed during compaction".into()
+            }
+            Self::InvalidCompactionResponse => {
+                "InvalidCompactionResponse: context compaction response does not match a pending request".into()
+            }
+            Self::Inference(error) => error.to_string(),
             Self::Tool(error) => error.to_string(),
         }
     }
@@ -670,7 +772,9 @@ fn create_agent(
         AgentDynamicVisibility {
             resources: BTreeSet::new(),
         },
-    ) && world.insert_component(agent, AgentStatus::default());
+    ) && world
+        .insert_component(agent, AgentTokenUsage::from_totals(&request.token_usage))
+        && world.insert_component(agent, AgentStatus::default());
     if !inserted {
         world.despawn(agent);
         return Err(AgentCreateError::new(
@@ -1123,6 +1227,20 @@ fn cleanup_dead_agent_registrations_system(world: &mut World) {
     for key in dead_schemas {
         schemas.schemas.remove(&key);
     }
+    let dead_compactions = world
+        .get_resource::<PendingContextCompactions>()
+        .expect("AgentPlugin is not installed")
+        .requests
+        .keys()
+        .filter(|(agent, _)| !world.is_alive(*agent))
+        .cloned()
+        .collect::<Vec<_>>();
+    let compactions = world
+        .get_resource_mut::<PendingContextCompactions>()
+        .expect("AgentPlugin is not installed");
+    for key in dead_compactions {
+        compactions.requests.remove(&key);
+    }
 }
 
 fn notify_registration_failure(
@@ -1292,6 +1410,11 @@ fn abort_agent_turn_system(world: &mut World) {
             .expect("AgentPlugin is installed")
             .schemas
             .remove(&(request.agent, turn_id.clone()));
+        world
+            .get_resource_mut::<PendingContextCompactions>()
+            .expect("AgentPlugin is installed")
+            .requests
+            .remove(&(request.agent, turn_id.clone()));
         events.send_event(CancelInferenceRequest {
             id: turn_id.clone(),
             agent: request.agent,
@@ -1302,6 +1425,175 @@ fn abort_agent_turn_system(world: &mut World) {
         });
         tracing::info!(request_id = %request.id, turn_id, ?request.agent, "Agent turn aborted");
     }
+}
+
+fn context_compaction_system(world: &mut World) {
+    let requests = world
+        .event_reader::<AgentContextCompactRequest>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let responses = world
+        .event_reader::<ContextCompactionInferenceResponse>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let events = world.event_sender();
+
+    for request in requests {
+        if let Err(error) = begin_context_compaction(world, &request, &events) {
+            events.send_event(AgentFailure {
+                id: request.id,
+                agent: request.agent,
+                kind: AgentFailureKind::Agent,
+                message: error.failure_message(),
+            });
+        }
+    }
+    for response in responses {
+        if let Err(error) = complete_context_compaction(world, &response, &events) {
+            let kind = if matches!(error, AgentStepError::Inference(_)) {
+                AgentFailureKind::Inference
+            } else {
+                AgentFailureKind::Agent
+            };
+            events.send_event(AgentFailure {
+                id: response.id,
+                agent: response.agent,
+                kind,
+                message: error.failure_message(),
+            });
+        }
+    }
+}
+
+fn begin_context_compaction(
+    world: &mut World,
+    request: &AgentContextCompactRequest,
+    events: &RuntimeEventSender,
+) -> Result<(), AgentStepError> {
+    if request.id.is_empty() || !world.is_alive(request.agent) {
+        return Err(AgentStepError::AgentMissing);
+    }
+    let context = world
+        .get_component::<AgentContext>(request.agent)
+        .ok_or(AgentStepError::ContextMissing)?;
+    if !context.tool_context.is_empty() || context.messages.len() <= request.retain_messages {
+        return Err(AgentStepError::ContextNotCompactable);
+    }
+    let original_messages = context.messages.clone();
+    let compacted_count = original_messages.len() - request.retain_messages;
+    let compacting_messages = original_messages[..compacted_count].to_vec();
+    let retained_messages = original_messages[compacted_count..].to_vec();
+    let system_prompt = context.system_prompt.clone();
+    let agent_id = world
+        .get_component::<AgentIdentity>(request.agent)
+        .map(|identity| identity.id().clone())
+        .ok_or(AgentStepError::IdentityMissing)?;
+
+    world
+        .get_component_mut::<AgentStatus>(request.agent)
+        .ok_or(AgentStepError::StatusMissing)?
+        .begin_turn(request.id.clone())?;
+    world
+        .get_resource_mut::<PendingContextCompactions>()
+        .expect("AgentPlugin is installed")
+        .requests
+        .insert(
+            (request.agent, request.id.clone()),
+            PendingContextCompaction {
+                original_messages,
+                retained_messages,
+            },
+        );
+
+    let mut messages = Vec::with_capacity(compacting_messages.len() + 2);
+    messages.push(Message::System {
+        content: system_prompt,
+    });
+    messages.extend(compacting_messages);
+    messages.push(Message::User {
+        content: CONTEXT_COMPACTION_PROMPT.into(),
+        tool_calls: Vec::new(),
+    });
+    events.send_event(ContextCompactionInferenceRequest {
+        id: request.id.clone(),
+        agent: request.agent,
+        agent_id,
+        messages,
+    });
+    Ok(())
+}
+
+fn complete_context_compaction(
+    world: &mut World,
+    response: &ContextCompactionInferenceResponse,
+    events: &RuntimeEventSender,
+) -> Result<(), AgentStepError> {
+    let pending = world
+        .get_resource_mut::<PendingContextCompactions>()
+        .expect("AgentPlugin is installed")
+        .requests
+        .remove(&(response.agent, response.id.clone()))
+        .ok_or(AgentStepError::InvalidCompactionResponse)?;
+    let current_turn_matches = world
+        .get_component::<AgentStatus>(response.agent)
+        .ok_or(AgentStepError::StatusMissing)?
+        .turn_id
+        .as_deref()
+        == Some(&response.id);
+    if !current_turn_matches {
+        return Err(AgentStepError::InvalidCompactionResponse);
+    }
+
+    let summary = match &response.result {
+        Ok(summary) if !summary.trim().is_empty() => summary.trim(),
+        Ok(_) => {
+            world
+                .get_component_mut::<AgentStatus>(response.agent)
+                .expect("AgentStatus existence was checked")
+                .finish_turn(&response.id)?;
+            return Err(AgentStepError::InvalidCompactionResponse);
+        }
+        Err(error) => {
+            world
+                .get_component_mut::<AgentStatus>(response.agent)
+                .expect("AgentStatus existence was checked")
+                .finish_turn(&response.id)?;
+            return Err(AgentStepError::Inference(error.clone()));
+        }
+    };
+    let context_unchanged = world
+        .get_component::<AgentContext>(response.agent)
+        .ok_or(AgentStepError::ContextMissing)
+        .map(|context| {
+            context.messages == pending.original_messages && context.tool_context.is_empty()
+        })?;
+    if !context_unchanged {
+        world
+            .get_component_mut::<AgentStatus>(response.agent)
+            .expect("AgentStatus existence was checked")
+            .finish_turn(&response.id)?;
+        return Err(AgentStepError::ContextChanged);
+    }
+
+    let mut messages = Vec::with_capacity(pending.retained_messages.len() + 1);
+    messages.push(Message::User {
+        content: format!(
+            "{COMPACTED_SUMMARY_PREAMBLE}\n\n<compacted-summary>\n{summary}\n</compacted-summary>"
+        ),
+        tool_calls: Vec::new(),
+    });
+    messages.extend(pending.retained_messages);
+    world
+        .get_component_mut::<AgentContext>(response.agent)
+        .ok_or(AgentStepError::ContextMissing)?
+        .rewrite_messages(response.agent, messages, events);
+    world
+        .get_component_mut::<AgentStatus>(response.agent)
+        .ok_or(AgentStepError::StatusMissing)?
+        .finish_turn(&response.id)?;
+    Ok(())
 }
 
 fn handle_agent_message(
@@ -1334,6 +1626,12 @@ fn handle_agent_message(
             }
             let tool_schema = take_pending_tool_schema(world, agent, &event.id);
             clear_tool_context(world, agent, events)?;
+            if let Some(usage) = &event.usage {
+                world
+                    .get_component_mut::<AgentTokenUsage>(agent)
+                    .ok_or(AgentStepError::TokenUsageMissing)?
+                    .add(usage);
+            }
             record_history_message(world, event, events, tool_schema.clone());
             append_conversation_message(world, agent, event.message.clone(), events)?;
             if !tool_calls.is_empty() {
@@ -1410,6 +1708,11 @@ fn record_history_message(
         agent: event.agent,
         message,
         tool_schema,
+        usage: if matches!(event.message, Message::Assistant { .. }) {
+            event.usage.clone()
+        } else {
+            None
+        },
     });
 }
 
@@ -1551,6 +1854,7 @@ fn dispatch_assistant_tool_calls(
                 tool_call_id,
                 content: TOOL_PERMISSION_DENIED.into(),
             },
+            usage: None,
         });
     }
     let has_loading_skills = !world
@@ -2063,6 +2367,250 @@ mod loading_skill_tests {
     }
 
     #[test]
+    fn token_usage_accumulates_and_recalculates_cache_hit_rate() {
+        let mut totals = AgentTokenUsage::from_totals(&TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_hit_tokens: 25,
+        });
+        totals.add(&TokenUsage {
+            input_tokens: 300,
+            output_tokens: 80,
+            cache_hit_tokens: 175,
+        });
+
+        assert_eq!(totals.total_input_tokens(), 400);
+        assert_eq!(totals.total_output_tokens(), 100);
+        assert_eq!(totals.total_cache_hit_tokens(), 200);
+        assert_eq!(totals.cache_hit_rate(), 0.5);
+    }
+
+    #[test]
+    fn assistant_message_updates_token_totals_and_history_event() {
+        let (mut app, agent) = test_app();
+        assert!(app.world_mut().insert_component(
+            agent,
+            AgentContext {
+                system_prompt: String::new(),
+                messages: Vec::new(),
+                tool_context: Vec::new(),
+            },
+        ));
+        assert!(app
+            .world_mut()
+            .insert_component(agent, AgentTokenUsage::from_totals(&TokenUsage::default()),));
+        assert!(app
+            .world_mut()
+            .get_component_mut::<AgentStatus>(agent)
+            .unwrap()
+            .begin_turn("turn-1".into())
+            .is_ok());
+
+        let usage = TokenUsage {
+            input_tokens: 80,
+            output_tokens: 20,
+            cache_hit_tokens: 40,
+        };
+        app.world().send_event(AgentMessage {
+            id: "turn-1".into(),
+            agent,
+            message: Message::Assistant {
+                reasoning: None,
+                content: Some("done".into()),
+                tool_calls: Vec::new(),
+            },
+            usage: Some(usage.clone()),
+        });
+        app.tick();
+        app.tick();
+
+        let totals = app.world().get_component::<AgentTokenUsage>(agent).unwrap();
+        assert_eq!(totals.total_input_tokens(), 80);
+        assert_eq!(totals.total_output_tokens(), 20);
+        assert_eq!(totals.total_cache_hit_tokens(), 40);
+        assert_eq!(totals.cache_hit_rate(), 0.5);
+        assert!(app
+            .world()
+            .event_reader::<AgentHistoryMessageWriteRequested>()
+            .into_iter()
+            .any(|event| event.id == "turn-1" && event.usage == Some(usage.clone())));
+    }
+
+    #[test]
+    fn context_compaction_summarizes_the_head_and_keeps_the_requested_tail() {
+        let (mut app, agent) = test_app();
+        assert!(app.world_mut().insert_component(
+            agent,
+            AgentIdentity {
+                id: ResourceId::parse("agent:test/agent0:latest").unwrap(),
+            },
+        ));
+        let original = vec![
+            Message::User {
+                content: "old request".into(),
+                tool_calls: Vec::new(),
+            },
+            Message::Assistant {
+                reasoning: None,
+                content: Some("old answer".into()),
+                tool_calls: Vec::new(),
+            },
+            Message::User {
+                content: "recent request".into(),
+                tool_calls: Vec::new(),
+            },
+        ];
+        assert!(app.world_mut().insert_component(
+            agent,
+            AgentContext {
+                system_prompt: "system".into(),
+                messages: original.clone(),
+                tool_context: Vec::new(),
+            },
+        ));
+
+        app.world().send_event(AgentContextCompactRequest {
+            id: "compact-1".into(),
+            agent,
+            retain_messages: 1,
+        });
+        app.tick();
+        app.tick();
+
+        let request = app
+            .world()
+            .event_reader::<ContextCompactionInferenceRequest>()
+            .into_iter()
+            .find(|event| event.id == "compact-1")
+            .unwrap();
+        assert_eq!(request.messages.len(), 4);
+        assert_eq!(
+            request.messages[0],
+            Message::System {
+                content: "system".into()
+            }
+        );
+        assert_eq!(&request.messages[1..3], &original[..2]);
+        assert!(matches!(
+            &request.messages[3],
+            Message::User { content, tool_calls }
+                if content == CONTEXT_COMPACTION_PROMPT && tool_calls.is_empty()
+        ));
+        assert_eq!(
+            app.world()
+                .get_component::<AgentContext>(agent)
+                .unwrap()
+                .messages(),
+            original
+        );
+        assert_eq!(app.world().agent_is_working(agent), Some(true));
+
+        app.world().send_event(ContextCompactionInferenceResponse {
+            id: "compact-1".into(),
+            agent,
+            result: Ok("condensed context".into()),
+        });
+        app.tick();
+        app.tick();
+
+        let rewritten = app
+            .world()
+            .get_component::<AgentContext>(agent)
+            .unwrap()
+            .messages();
+        assert_eq!(rewritten.len(), 2);
+        assert!(matches!(
+            &rewritten[0],
+            Message::User { content, tool_calls }
+                if content.contains("<compacted-summary>\ncondensed context\n</compacted-summary>")
+                    && tool_calls.is_empty()
+        ));
+        assert_eq!(rewritten[1], original[2]);
+        assert_eq!(app.world().agent_is_working(agent), Some(false));
+        let update = app
+            .world()
+            .event_reader::<AgentContextMessagesUpdated>()
+            .into_iter()
+            .last()
+            .unwrap();
+        assert_eq!(update.messages, rewritten);
+        assert!(app
+            .world()
+            .event_reader::<AgentHistoryMessageWriteRequested>()
+            .is_empty());
+    }
+
+    #[test]
+    fn context_compaction_does_not_overwrite_a_changed_context() {
+        let (mut app, agent) = test_app();
+        assert!(app.world_mut().insert_component(
+            agent,
+            AgentIdentity {
+                id: ResourceId::parse("agent:test/agent0:latest").unwrap(),
+            },
+        ));
+        assert!(app.world_mut().insert_component(
+            agent,
+            AgentContext {
+                system_prompt: "system".into(),
+                messages: vec![
+                    Message::User {
+                        content: "old".into(),
+                        tool_calls: Vec::new(),
+                    },
+                    Message::Assistant {
+                        reasoning: None,
+                        content: Some("recent".into()),
+                        tool_calls: Vec::new(),
+                    },
+                ],
+                tool_context: Vec::new(),
+            },
+        ));
+        app.world().send_event(AgentContextCompactRequest {
+            id: "compact-1".into(),
+            agent,
+            retain_messages: 1,
+        });
+        app.tick();
+        app.tick();
+        let events = app.world().event_sender();
+        app.world_mut()
+            .get_component_mut::<AgentContext>(agent)
+            .unwrap()
+            .append_message(
+                agent,
+                Message::User {
+                    content: "concurrent".into(),
+                    tool_calls: Vec::new(),
+                },
+                &events,
+            );
+        app.world().send_event(ContextCompactionInferenceResponse {
+            id: "compact-1".into(),
+            agent,
+            result: Ok("stale summary".into()),
+        });
+        app.tick();
+        app.tick();
+
+        let messages = app
+            .world()
+            .get_component::<AgentContext>(agent)
+            .unwrap()
+            .messages();
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(&messages[2], Message::User { content, .. } if content == "concurrent"));
+        assert_eq!(app.world().agent_is_working(agent), Some(false));
+        assert!(app
+            .world()
+            .event_reader::<AgentFailure>()
+            .into_iter()
+            .any(|failure| failure.id == "compact-1"
+                && failure.message == "ContextChanged: Agent context changed during compaction"));
+    }
+
+    #[test]
     fn aborting_a_turn_clears_state_and_requests_execution_cancellation() {
         let (mut app, agent) = test_app();
         assert!(app.world_mut().insert_component(
@@ -2088,6 +2636,17 @@ mod loading_skill_tests {
             .unwrap()
             .schemas
             .insert((agent, "turn-1".into()), Vec::new());
+        app.world_mut()
+            .get_resource_mut::<PendingContextCompactions>()
+            .unwrap()
+            .requests
+            .insert(
+                (agent, "turn-1".into()),
+                PendingContextCompaction {
+                    original_messages: Vec::new(),
+                    retained_messages: Vec::new(),
+                },
+            );
 
         app.world().send_event(AbortAgentTurn {
             id: "abort-1".into(),
@@ -2108,6 +2667,12 @@ mod loading_skill_tests {
             .get_resource::<PendingInferenceToolSchemas>()
             .unwrap()
             .schemas
+            .is_empty());
+        assert!(app
+            .world()
+            .get_resource::<PendingContextCompactions>()
+            .unwrap()
+            .requests
             .is_empty());
         assert!(app
             .world()
@@ -2137,6 +2702,7 @@ mod loading_skill_tests {
                 content: Some("done".into()),
                 tool_calls: Vec::new(),
             },
+            usage: None,
         };
         let events = app.world().event_sender();
 
@@ -2171,6 +2737,7 @@ mod loading_skill_tests {
                     tool_call_id: "skill-call".into(),
                     content: "private skill instructions".into(),
                 },
+                usage: None,
             },
             AgentMessage {
                 id: "tool-turn".into(),
@@ -2180,6 +2747,7 @@ mod loading_skill_tests {
                     tool_call_id: "tool-call".into(),
                     content: "complete command output".into(),
                 },
+                usage: None,
             },
         ];
 
@@ -2262,6 +2830,7 @@ mod loading_skill_tests {
                     arguments: "{}".into(),
                 }],
             },
+            usage: None,
         });
         app.tick();
         app.tick();
@@ -2403,6 +2972,7 @@ mod loading_skill_tests {
             system_prompt: String::new(),
             messages: Vec::new(),
             tool_context: Vec::new(),
+            token_usage: TokenUsage::default(),
             default_visibility: BTreeSet::from([resource_id.clone()]),
         });
         app.tick();

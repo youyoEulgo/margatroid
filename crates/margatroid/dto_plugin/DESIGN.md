@@ -104,7 +104,7 @@ collect_external_events_system(world: &mut World)
         记录Workspace启停、用户消息路由、Assistant响应和Agent失败等业务日志
         Workspace启停结果及AgentFailure选择logs目标，AgentMessage选择member_messages目标
         发送WebSocketMessageSend
-        调用()::into_dto(&World)构造包含Workspace定义、每个Agent的Creating/Ready/Failed状态、Ready Agent动态可见性和历史的BackendStateDto
+        调用()::into_dto(&World)构造包含Workspace定义、每个Agent的Creating/Ready/Failed状态、Ready Agent动态可见性、累计Token状态和历史的BackendStateDto
         状态内容或backend_state接收连接集合变化时才发送StateSync
         相同状态转换错误只记录一次，成功后清除错误缓存
         将StateSync发送给backend_state指定目标

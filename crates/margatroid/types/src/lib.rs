@@ -442,11 +442,19 @@ pub enum Message {
     },
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_hit_tokens: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentMessage {
     pub id: String,
     pub agent: Entity,
     pub message: Message,
+    pub usage: Option<TokenUsage>,
 }
 
 impl Event for AgentMessage {}
@@ -482,6 +490,7 @@ pub struct AgentHistoryMessageWriteRequested {
     pub agent: Entity,
     pub message: Message,
     pub tool_schema: Vec<ToolDefinition>,
+    pub usage: Option<TokenUsage>,
 }
 
 impl Event for AgentHistoryMessageWriteRequested {}

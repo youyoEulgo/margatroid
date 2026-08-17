@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use agent_plugin::{AgentDynamicVisibility, AgentIdentity, WorldAgentExt};
+use agent_plugin::{AgentDynamicVisibility, AgentIdentity, AgentTokenUsage, WorldAgentExt};
 use core_plugin::{Entity, World};
 use log_plugin::{TracingField, TracingRecord};
 use margatroid_types::{
@@ -109,7 +109,7 @@ pub enum ClientMessage {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
     #[serde(rename = "log")]
@@ -630,7 +630,7 @@ impl WorkspaceInfoDto {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BackendStateDto {
     pub workspaces: Vec<WorkspaceInfoDto>,
     #[serde(default)]
@@ -639,7 +639,7 @@ pub struct BackendStateDto {
     pub histories: Vec<AgentHistoryDto>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentStateDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: ResourceIdDto,
@@ -653,6 +653,14 @@ pub struct AgentStateDto {
     pub visible_resources: Vec<ResourceIdDto>,
     #[serde(default)]
     pub loading_skills: Vec<ResourceIdDto>,
+    #[serde(default)]
+    pub total_input_tokens: u64,
+    #[serde(default)]
+    pub total_output_tokens: u64,
+    #[serde(default)]
+    pub total_cache_hit_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_rate: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -802,6 +810,14 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
                 "Agent work status is missing",
             )
         })?;
+        let token_usage = world
+            .get_component::<AgentTokenUsage>(agent)
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorKind::AgentNotFound,
+                    "Agent token usage is missing",
+                )
+            })?;
         Ok(Self {
             workspace: workspace.reference(),
             agent: identity.id().into_dto(())?,
@@ -811,6 +827,10 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
             default_resources,
             visible_resources,
             loading_skills,
+            total_input_tokens: token_usage.total_input_tokens(),
+            total_output_tokens: token_usage.total_output_tokens(),
+            total_cache_hit_tokens: token_usage.total_cache_hit_tokens(),
+            cache_hit_rate: token_usage.cache_hit_rate(),
         })
     }
 }
@@ -874,6 +894,10 @@ impl FromDomain<(), &World> for BackendStateDto {
                         default_resources: Vec::new(),
                         visible_resources: Vec::new(),
                         loading_skills: Vec::new(),
+                        total_input_tokens: 0,
+                        total_output_tokens: 0,
+                        total_cache_hit_tokens: 0,
+                        cache_hit_rate: 0.0,
                     }),
                     WorkspaceAgentState::Failed { error } => agent_states.push(AgentStateDto {
                         workspace: info.reference(),
@@ -884,6 +908,10 @@ impl FromDomain<(), &World> for BackendStateDto {
                         default_resources: Vec::new(),
                         visible_resources: Vec::new(),
                         loading_skills: Vec::new(),
+                        total_input_tokens: 0,
+                        total_output_tokens: 0,
+                        total_cache_hit_tokens: 0,
+                        cache_hit_rate: 0.0,
                     }),
                 }
             }
@@ -1432,6 +1460,10 @@ mod tests {
                     default_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
                     visible_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
                     loading_skills: vec![ResourceIdDto("skill:local/review:latest".into())],
+                    total_input_tokens: 1_000,
+                    total_output_tokens: 200,
+                    total_cache_hit_tokens: 750,
+                    cache_hit_rate: 0.75,
                 }],
                 histories: vec![AgentHistoryDto {
                     workspace: workspace_reference(),
@@ -1461,6 +1493,10 @@ mod tests {
             "agent:demo/coder:latest"
         );
         assert_eq!(value["state"]["agents"][0]["working"], false);
+        assert_eq!(value["state"]["agents"][0]["total_input_tokens"], 1_000);
+        assert_eq!(value["state"]["agents"][0]["total_output_tokens"], 200);
+        assert_eq!(value["state"]["agents"][0]["total_cache_hit_tokens"], 750);
+        assert_eq!(value["state"]["agents"][0]["cache_hit_rate"], 0.75);
         assert_eq!(
             value["state"]["agents"][0]["visible_resources"][0],
             "skill:local/review:latest"
@@ -1494,6 +1530,11 @@ mod tests {
             system_prompt: "system".into(),
             messages: Vec::new(),
             tool_context: Vec::new(),
+            token_usage: margatroid_types::TokenUsage {
+                input_tokens: 400,
+                output_tokens: 100,
+                cache_hit_tokens: 250,
+            },
             default_visibility: BTreeSet::from([skill.clone()]),
         });
         app.tick();
@@ -1530,6 +1571,10 @@ mod tests {
         assert_eq!(state.visible_resources.len(), 1);
         assert_eq!(state.default_resources.len(), 1);
         assert!(state.loading_skills.is_empty());
+        assert_eq!(state.total_input_tokens, 400);
+        assert_eq!(state.total_output_tokens, 100);
+        assert_eq!(state.total_cache_hit_tokens, 250);
+        assert_eq!(state.cache_hit_rate, 0.625);
         assert_eq!(
             state.visible_resources[0],
             ResourceIdDto("skill:local/review:latest".into())

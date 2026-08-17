@@ -45,7 +45,7 @@ impl Default for DtoPlugin {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WebSocketMessageSend {
     pub target: WebSocketMessageTarget,
     pub message: ServerMessage,
