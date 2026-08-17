@@ -28,6 +28,13 @@ AgentImageLoaderPlugin 只提供中立模型配置；InferencePlugin 负责把�
 - 流式思考与正文通过固定的 WebSocket 发送器集合分别直接转发，不为每个分片创建 ECS Event。
 - InferencePlugin 不修改 Agent 的 `messages`，不执行工具，不实现 tool-call loop。
 
+上下文压缩使用独立的`ContextCompactionInferenceRequest`和`ContextCompactionInferenceResponse`。
+它复用相同模型路由、Provider Adapter、HTTP与取消机制，但不携带工具定义、不解析流式前端目标，也不生成
+普通`AgentMessage`。只有正常结束、没有工具调用且正文非空的响应才作为摘要返回AgentPlugin。
+
+普通推理会通过`stream_options.include_usage`请求Provider在流末尾返回usage，并把输入、输出和缓存命中
+Token随`AgentMessage`交给AgentPlugin；Provider完全不返回usage时保持为空。
+
 ## 模型路由表
 
 默认配置文件为 `~/.margatroid/models.toml`：

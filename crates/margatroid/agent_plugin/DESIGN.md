@@ -20,6 +20,7 @@ AgentCreateRequest：Agent创建请求，公开事件--WorkspacePlugin交付Agen
     system_prompt: String--当前系统提示词
     messages: Vec<Message>--恢复的长期User与Assistant上下文
     tool_context: Vec<Message>--恢复的当前轮Tool上下文
+    token_usage: TokenUsage--从历史Assistant行恢复的累计Token
     default_visibility: BTreeSet<ResourceId>--创建时默认可见资源
     impl Event for AgentCreateRequest
 
@@ -164,6 +165,19 @@ AgentDynamicVisibility：Agent动态可见性，公开Component--当前实际可
     impl Component for AgentDynamicVisibility
     限制：只有AgentPlugin的可见性System可以修改resources；公开接口只读
 
+AgentTokenUsage：Agent累计Token状态，公开只读Component
+    total_input_tokens: u64--历史Assistant响应累计输入Token
+    total_output_tokens: u64--历史Assistant响应累计输出Token
+    total_cache_hit_tokens: u64--历史Assistant响应累计缓存命中Token
+    cache_hit_rate: f64--total_cache_hit_tokens / total_input_tokens；总输入为0时为0
+    total_input_tokens(&self) -> u64
+    total_output_tokens(&self) -> u64
+    total_cache_hit_tokens(&self) -> u64
+    cache_hit_rate(&self) -> f64
+    add(&mut self, usage: &TokenUsage)
+        累加用量：crate公开方法，三项使用饱和加法并在每次修改后重新计算cache_hit_rate
+    impl Component for AgentTokenUsage
+
 AgentPluginInstalled：安装标记，公开Resource
 
 AbortAgentTurn：中止Agent当前轮次，公开事件
@@ -171,13 +185,19 @@ AbortAgentTurn：中止Agent当前轮次，公开事件
     agent: Entity--目标Agent
     impl Event for AbortAgentTurn
 
+AgentContextCompactRequest：Agent实时上下文压缩请求，公开事件--只定义压缩机制，不拥有触发策略
+    id: String--压缩请求ID
+    agent: Entity--目标Agent Entity
+    retain_messages: usize--原样保留的末尾长期消息数量；其余头部消息进入摘要
+    impl Event for AgentContextCompactRequest
+
 WorldAgentExt：World Agent扩展，公开trait
     agent(&self, id: &ResourceId) -> Option<Entity>
         按身份查询：公开方法，返回稳定资源ID匹配且仍存活的Agent Entity
     agent_loading_skills(&self, agent: Entity) -> Option<&BTreeSet<ResourceId>>
         查询持久Skill：公开只读方法，不暴露AgentStatus其他字段
     agent_is_working(&self, agent: Entity) -> Option<bool>
-        查询工作状态：公开只读方法，AgentStatus存在时返回当前是否有未结束turn
+        查询工作状态：公开只读方法，AgentStatus存在时返回当前是否有未结束普通交互或上下文压缩
     inject_agent_visible_resource(&self, id: impl Into<String>, agent: Entity, resource_id: ResourceId)
         注入可见资源：公开方法，发送InjectAgentVisibleResource并唤醒Runtime
     remove_agent_visible_resource(&self, id: impl Into<String>, agent: Entity, resource_id: ResourceId)
@@ -191,11 +211,11 @@ WorldAgentExt：World Agent扩展，公开trait
 
 crate公开：
 ```text
-AgentStatus：Agent轮次与持久Skill状态，crate公开Component--不保存pending tool
-    turn_id: Option<String>--当前仍在处理的交互轮次；空表示Agent空闲
+AgentStatus：Agent工作占用与持久Skill状态，crate公开Component--不保存pending tool或压缩快照
+    turn_id: Option<String>--当前普通交互轮次ID或上下文压缩请求ID；空表示Agent空闲
     loading_skills: BTreeSet<ResourceId>--每轮自动调用的Skill资源ID
     begin_turn(&mut self, turn_id: String) -> Result<(), AgentStepError>
-        开始轮次：拒绝与当前未完成轮次重叠
+        开始工作：拒绝普通轮次与上下文压缩相互重叠
     finish_turn(&mut self, turn_id: &str) -> Result<(), AgentStepError>
         完成轮次：只允许完成当前turn
     abort_turn(&mut self) -> Option<String>
@@ -217,6 +237,13 @@ AvailableTools：一次推理的临时工具规格集合，私有结构体
 PendingInferenceToolSchemas：飞行中推理的ToolSpec快照，私有Resource
     schemas: HashMap<(Entity, String), Vec<ToolDefinition>>--按Agent与turn_id关联下一条Assistant
 
+PendingContextCompactions：飞行中的上下文压缩，私有Resource
+    requests: HashMap<(Entity, String), PendingContextCompaction>--按Agent和压缩请求ID关联原始上下文快照
+
+PendingContextCompaction：单次压缩快照，私有结构体
+    original_messages: Vec<Message>--开始摘要前的完整长期消息，用于完成时校验
+    retained_messages: Vec<Message>--不进入摘要、完成后仍原样位于摘要检查点之后的近期消息
+
 ConversationTurnResult：单条消息处理结果，私有枚举
     WaitForTools--已发送ToolCallEvent，等待ToolPlugin完成批次
     FinishTurn--Assistant无工具调用，本轮结束
@@ -227,10 +254,14 @@ AgentStepError：Agent处理错误，私有枚举
     IdentityMissing
     ContextMissing
     StatusMissing
+    TokenUsageMissing
     ToolMapMissing
     InvalidMessage
-    InvalidTurn
-    InvalidToolCall
+    InvalidToolBatch
+    ContextNotCompactable
+    ContextChanged
+    InvalidCompactionResponse
+    Inference(InferenceError)
     Tool(ToolError)
     failure_message(&self) -> String
         构造稳定有界错误描述，不包含消息正文、工具参数或资源正文
@@ -253,7 +284,7 @@ agent_create_system(world: &mut World)
     创建Agent：私有System，读取AgentCreateRequest
     行为：
         验证请求ID、agent_id、Workspace Entity及恢复消息结构；失败时发送AgentCreateResult::Err
-        创建Entity并挂载AgentIdentity、AgentWorkspaceId、AgentContext、AgentDefaultVisibility、空AgentDynamicVisibility和空AgentStatus
+        创建Entity并挂载AgentIdentity、AgentWorkspaceId、AgentContext、AgentDefaultVisibility、空AgentDynamicVisibility、由请求累计值构造的AgentTokenUsage和空AgentStatus
         调用ToolPlugin公开函数挂载空AgentToolMap；失败时despawn已创建Entity并发送AgentCreateResult::Err
         不直接注册资源；此时WorkspacePlugin尚未挂载AgentToolEnvironment
         成功时发送AgentCreated，并调用自身restore_agent_default_visibility；注册请求在后续System帧处理
@@ -311,7 +342,7 @@ collect_agent_tool_registration_system(world: &mut World)
 
 cleanup_dead_agent_registrations_system(world: &mut World)
     清理死亡Agent注册：私有无输入System
-    行为：删除agent已经死亡的全部InFlightVisibilityRegistration与PendingInferenceToolSchemas快照；迟到响应将作为无匹配响应被丢弃
+    行为：删除agent已经死亡的全部InFlightVisibilityRegistration、PendingInferenceToolSchemas与PendingContextCompactions快照；迟到响应将作为无匹配响应被丢弃
 
 agent_skill_state_system(world: &mut World)
     修改持久Skill：私有System，读取LoadAgentSkill、UnloadAgentSkill和UnloadAllAgentSkills
@@ -328,7 +359,31 @@ agent_message_system(world: &mut World)
 
 abort_agent_turn_system(world: &mut World)
     中止当前轮次：私有System，读取AbortAgentTurn
-    行为：取得并清空AgentStatus当前turn；清空tool_context和对应PendingInferenceToolSchemas；发送CancelInferenceRequest与CancelToolTurn；空闲Agent只记录警告
+    行为：取得并清空AgentStatus当前turn；清空tool_context和对应PendingInferenceToolSchemas与PendingContextCompactions；发送CancelInferenceRequest与CancelToolTurn；空闲Agent只记录警告
+
+context_compaction_system(world: &mut World)
+    处理上下文压缩：私有System，同时读取AgentContextCompactRequest与ContextCompactionInferenceResponse
+    行为：请求逐条调用begin_context_compaction；响应逐条调用complete_context_compaction；失败时发送AgentFailure，不生成AgentMessage
+
+begin_context_compaction(world: &mut World, request: &AgentContextCompactRequest, events: &RuntimeEventSender) -> Result<(), AgentStepError>
+    开始上下文压缩：私有函数
+    行为：
+        要求Agent存活、AgentStatus空闲、tool_context为空且长期messages数量大于retain_messages
+        调用AgentStatus.begin_turn占用工作状态，阻止压缩期间开始普通对话轮次
+        按messages.len() - retain_messages切分待压缩头部和原样保留尾部
+        保存完整original_messages和retained_messages到PendingContextCompactions
+        构造System、待压缩头部消息和末尾压缩提示词，不携带工具规格
+        发送ContextCompactionInferenceRequest；不修改AgentContext，不写历史
+
+complete_context_compaction(world: &mut World, response: &ContextCompactionInferenceResponse, events: &RuntimeEventSender) -> Result<(), AgentStepError>
+    完成上下文压缩：私有函数
+    行为：
+        取得并删除同Agent同请求ID的PendingContextCompaction，要求AgentStatus当前turn等于请求ID
+        推理失败时结束占用并返回Inference错误；成功摘要必须非空
+        要求当前AgentContext.messages仍等于original_messages且tool_context仍为空；不一致时结束占用并返回ContextChanged
+        把摘要包装成带compacted-summary标记的User消息，后接retained_messages
+        调用AgentContext.rewrite_messages整体替换长期上下文，从而发送AgentContextMessagesUpdated更新实时记忆
+        调用AgentStatus.finish_turn释放工作状态；不写历史，不生成普通AgentMessage
 
 handle_agent_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender) -> Result<ConversationTurnResult, AgentStepError>
     处理消息：私有函数
@@ -336,7 +391,7 @@ handle_agent_message(world: &mut World, event: &AgentMessage, events: &RuntimeEv
         System返回InvalidMessage
         User开始或确认当前turn，清空上一轮tool_context，写历史并追加长期messages
         User.tool_calls与当前loading_skills实例合并；有调用时发送ToolCallEvent，无调用时发送InferenceRequestEvent
-        Assistant先取得该turn对应的PendingInferenceToolSchemas；写历史并追加长期messages
+        Assistant先取得该turn对应的PendingInferenceToolSchemas；event.usage存在时先累加AgentTokenUsage；写入带usage的历史并追加长期messages
         Assistant.tool_calls为空时结束当前turn
         Assistant.tool_calls非空时逐项检查tool_name存在于本次ToolSpec且映射资源仍在AgentDynamicVisibility；不满足时直接发送Message::Tool拒绝响应，提示模型检查当前ToolSpec，不发送ToolCallEvent
         Assistant所有调用均被拒绝时发送ToolTurnCompleted，等待拒绝响应进入tool_context后重新推理
@@ -352,7 +407,7 @@ take_pending_tool_schema(world: &mut World, agent: Entity, turn_id: &str) -> Vec
 
 record_history_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender, tool_schema: Vec<ToolDefinition>)
     请求历史写入：私有函数
-    行为：User原样发送且tool_schema为空；Assistant原样发送并携带传入的ToolSpec；Skill类型Tool保留resource_id和tool_call_id并把content替换为resource_id.to_string()；非Skill类型Tool原样发送；Tool的tool_schema为空
+    行为：User原样发送且tool_schema和usage为空；Assistant原样发送并携带传入的ToolSpec与event.usage；Skill类型Tool保留resource_id和tool_call_id并把content替换为resource_id.to_string()；非Skill类型Tool原样发送；Tool的tool_schema和usage为空
     限制：Skill正文只进入实时tool_context，不进入历史事件；非Skill工具响应正文完整写入历史事件
 
 append_conversation_message(world: &mut World, agent: Entity, message: Message, events: &RuntimeEventSender) -> Result<(), AgentStepError>
@@ -450,6 +505,7 @@ loading skill：
 
 ```text
 AgentPlugin负责Agent创建、上下文、动态可见性、当前turn、loading skills、内部ToolSpec构造和推理调度。
+AgentPlugin负责维护AgentTokenUsage；只有进入普通Assistant消息链路的Provider usage会累加，压缩推理不计入。
 AgentPlugin逐资源修改动态可见性，不保存完整可见性操作快照，不因单项资源注册失败结束Agent或Workspace。
 WorkspacePlugin只在收到AgentCreateResult后挂载外部运行组件，不介入资源注册或可见性修改。
 AgentPlugin不保存pending tool，不解析Skill正文，不执行工具；只在Assistant消息分支按本次ToolSpec和动态可见性授权模型工具调用。
@@ -469,6 +525,9 @@ World
 ├── RemoveAllAgentVisibleResources -> AgentVisibleResourceRemoved * N
 ├── InFlightVisibilityRegistrations Resource
 ├── PendingInferenceToolSchemas Resource
+├── PendingContextCompactions Resource
+├── AgentContextCompactRequest -> context_compaction_system
+├── ContextCompactionInferenceResponse -> context_compaction_system
 ├── AgentMessage -> agent_message_system
 ├── ToolTurnCompleted -> tool_turn_completed_system
 └── Agent Entity

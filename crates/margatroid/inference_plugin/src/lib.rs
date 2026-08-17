@@ -14,7 +14,8 @@ use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use futures_util::{FutureExt, StreamExt};
 use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, ToolCall, ToolDefinition,
+    AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, TokenUsage, ToolCall,
+    ToolDefinition,
 };
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Method, StatusCode, Url};
@@ -411,13 +412,6 @@ pub enum StopReason {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TokenUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub total_tokens: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderInferenceResponse {
     pub reasoning: Option<String>,
     pub content: Option<String>,
@@ -463,6 +457,25 @@ pub struct InferenceRequestEvent {
 
 impl Event for InferenceRequestEvent {}
 
+#[derive(Clone, Debug)]
+pub struct ContextCompactionInferenceRequest {
+    pub id: String,
+    pub agent: Entity,
+    pub agent_id: ResourceId,
+    pub messages: Vec<Message>,
+}
+
+impl Event for ContextCompactionInferenceRequest {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextCompactionInferenceResponse {
+    pub id: String,
+    pub agent: Entity,
+    pub result: Result<String, InferenceError>,
+}
+
+impl Event for ContextCompactionInferenceResponse {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CancelInferenceRequest {
     pub id: String,
@@ -475,6 +488,22 @@ impl Event for CancelInferenceRequest {}
 struct InferenceRoute {
     id: String,
     agent: Entity,
+    output: InferenceOutputKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InferenceOutputKind {
+    AgentMessage,
+    ContextCompaction,
+}
+
+struct InferenceCommand {
+    id: String,
+    agent: Entity,
+    agent_id: ResourceId,
+    messages: Vec<Message>,
+    tools: Vec<ToolDefinition>,
+    output: InferenceOutputKind,
 }
 
 struct PreparedInference {
@@ -925,32 +954,50 @@ fn reload_model_routes_system(world: &mut World) {
 }
 
 fn prepare_inference_system(world: &mut World) {
-    let commands = world
+    let mut commands = world
         .event_reader::<InferenceRequestEvent>()
         .into_iter()
         .cloned()
+        .map(|command| InferenceCommand {
+            id: command.id,
+            agent: command.agent,
+            agent_id: command.agent_id,
+            messages: command.messages,
+            tools: command.tools,
+            output: InferenceOutputKind::AgentMessage,
+        })
         .collect::<Vec<_>>();
+    commands.extend(
+        world
+            .event_reader::<ContextCompactionInferenceRequest>()
+            .into_iter()
+            .cloned()
+            .map(|command| InferenceCommand {
+                id: command.id,
+                agent: command.agent,
+                agent_id: command.agent_id,
+                messages: command.messages,
+                tools: Vec::new(),
+                output: InferenceOutputKind::ContextCompaction,
+            }),
+    );
     let events = world.event_sender();
     for command in commands {
         match prepare_inference(world, command) {
             Ok(prepared) => world.send_async_event(prepared),
-            Err((route, error)) => events.send_event(AgentFailure {
-                id: route.id,
-                agent: route.agent,
-                kind: AgentFailureKind::Inference,
-                message: error.to_string(),
-            }),
+            Err((route, error)) => publish_inference_error(&events, route, error),
         }
     }
 }
 
 fn prepare_inference(
     world: &mut World,
-    command: InferenceRequestEvent,
+    command: InferenceCommand,
 ) -> Result<PreparedInference, (InferenceRoute, InferenceError)> {
     let route = InferenceRoute {
         id: command.id.clone(),
         agent: command.agent,
+        output: command.output,
     };
     if command.id.is_empty() || command.agent_id.resource_type() != "agent" {
         return Err((
@@ -1022,30 +1069,35 @@ fn prepare_inference(
         })?
         .client
         .clone();
-    let targets = world
-        .get_resource::<MargatroidConfig>()
-        .ok_or_else(|| {
-            (
-                route.clone(),
-                InferenceError::new(
-                    InferenceErrorKind::InvalidCommand,
-                    "global configuration is missing",
-                ),
-            )
-        })?
-        .streaming_member_messages();
-    let connections = world
-        .get_resource::<WebSocketConnections>()
-        .ok_or_else(|| {
-            (
-                route.clone(),
-                InferenceError::new(
-                    InferenceErrorKind::InvalidCommand,
-                    "WebSocket connection registry is missing",
-                ),
-            )
-        })?;
-    let senders = resolve_websocket_targets(connections, targets);
+    let senders = match route.output {
+        InferenceOutputKind::AgentMessage => {
+            let targets = world
+                .get_resource::<MargatroidConfig>()
+                .ok_or_else(|| {
+                    (
+                        route.clone(),
+                        InferenceError::new(
+                            InferenceErrorKind::InvalidCommand,
+                            "global configuration is missing",
+                        ),
+                    )
+                })?
+                .streaming_member_messages();
+            let connections = world
+                .get_resource::<WebSocketConnections>()
+                .ok_or_else(|| {
+                    (
+                        route.clone(),
+                        InferenceError::new(
+                            InferenceErrorKind::InvalidCommand,
+                            "WebSocket connection registry is missing",
+                        ),
+                    )
+                })?;
+            resolve_websocket_targets(connections, targets)
+        }
+        InferenceOutputKind::ContextCompaction => Vec::new(),
+    };
     let (cancellation_sender, cancellation) = watch::channel(false);
     world
         .get_resource_mut::<InFlightInferences>()
@@ -1443,36 +1495,91 @@ fn publish_inference_output_system(world: &mut World) {
             unreachable!();
         };
         match result {
-            Ok(response) => {
-                if response.content.is_none() && response.tool_calls.is_empty() {
-                    events.send_event(AgentFailure {
+            Ok(response) => match output.route.output {
+                InferenceOutputKind::AgentMessage => {
+                    if response.content.is_none() && response.tool_calls.is_empty() {
+                        publish_inference_error(
+                            &events,
+                            output.route.clone(),
+                            InferenceError::new(
+                                InferenceErrorKind::ResponseIncomplete,
+                                "inference response contains an invalid tool call",
+                            ),
+                        );
+                        continue;
+                    }
+                    events.send_event(AgentMessage {
                         id: output.route.id.clone(),
                         agent: output.route.agent,
-                        kind: AgentFailureKind::Inference,
-                        message: InferenceError::new(
-                            InferenceErrorKind::ResponseIncomplete,
-                            "inference response contains an invalid tool call",
-                        )
-                        .to_string(),
+                        message: Message::Assistant {
+                            reasoning: response.reasoning.clone(),
+                            content: response.content.clone(),
+                            tool_calls: response.tool_calls.clone(),
+                        },
+                        usage: response.usage.clone(),
                     });
-                    continue;
                 }
-                events.send_event(AgentMessage {
-                    id: output.route.id.clone(),
-                    agent: output.route.agent,
-                    message: Message::Assistant {
-                        reasoning: response.reasoning.clone(),
-                        content: response.content.clone(),
-                        tool_calls: response.tool_calls.clone(),
-                    },
-                });
-            }
-            Err(error) => events.send_event(AgentFailure {
-                id: output.route.id.clone(),
-                agent: output.route.agent,
-                kind: AgentFailureKind::Inference,
-                message: error.to_string(),
-            }),
+                InferenceOutputKind::ContextCompaction => {
+                    let result = context_compaction_content(response);
+                    events.send_event(ContextCompactionInferenceResponse {
+                        id: output.route.id.clone(),
+                        agent: output.route.agent,
+                        result,
+                    });
+                }
+            },
+            Err(error) => publish_inference_error(&events, output.route.clone(), error.clone()),
+        }
+    }
+}
+
+fn context_compaction_content(
+    response: &ProviderInferenceResponse,
+) -> Result<String, InferenceError> {
+    if response.stop_reason != StopReason::Completed {
+        return Err(InferenceError::new(
+            InferenceErrorKind::ResponseIncomplete,
+            "context compaction inference did not complete normally",
+        ));
+    }
+    if !response.tool_calls.is_empty() {
+        return Err(InferenceError::new(
+            InferenceErrorKind::ResponseIncomplete,
+            "context compaction inference returned tool calls",
+        ));
+    }
+    let content = response
+        .content
+        .as_deref()
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+        .ok_or_else(|| {
+            InferenceError::new(
+                InferenceErrorKind::ResponseIncomplete,
+                "context compaction inference returned no summary content",
+            )
+        })?;
+    Ok(content.to_owned())
+}
+
+fn publish_inference_error(
+    events: &app_runtime_plugin::RuntimeEventSender,
+    route: InferenceRoute,
+    error: InferenceError,
+) {
+    match route.output {
+        InferenceOutputKind::AgentMessage => events.send_event(AgentFailure {
+            id: route.id,
+            agent: route.agent,
+            kind: AgentFailureKind::Inference,
+            message: error.to_string(),
+        }),
+        InferenceOutputKind::ContextCompaction => {
+            events.send_event(ContextCompactionInferenceResponse {
+                id: route.id,
+                agent: route.agent,
+                result: Err(error),
+            })
         }
     }
 }
@@ -1688,6 +1795,7 @@ struct OpenAiRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<serde_json::Value>,
     stream: bool,
+    stream_options: OpenAiStreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1700,6 +1808,11 @@ struct OpenAiRequest {
     thinking: Option<DeepSeekThinking>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OpenAiStreamOptions {
+    include_usage: bool,
 }
 
 impl OpenAiRequest {
@@ -1724,6 +1837,9 @@ impl OpenAiRequest {
             messages,
             tools,
             stream: true,
+            stream_options: OpenAiStreamOptions {
+                include_usage: true,
+            },
             temperature: input.parameters().temperature(),
             max_tokens: input.parameters().max_output_tokens(),
             top_p: input.parameters().top_p(),
@@ -1758,6 +1874,9 @@ impl OpenAiRequest {
             messages,
             tools,
             stream: true,
+            stream_options: OpenAiStreamOptions {
+                include_usage: true,
+            },
             temperature: input.parameters().temperature(),
             max_tokens: input.parameters().max_output_tokens(),
             top_p: input.parameters().top_p(),
@@ -1891,7 +2010,18 @@ struct OpenAiUsage {
     input_tokens: u64,
     #[serde(alias = "completion_tokens")]
     output_tokens: u64,
-    total_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiTokenDetails>,
+    #[serde(default)]
+    input_tokens_details: Option<OpenAiTokenDetails>,
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiTokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 impl ProviderResponseAccumulator for OpenAiAccumulator {
@@ -1988,7 +2118,13 @@ impl OpenAiAccumulator {
             self.usage = Some(TokenUsage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
-                total_tokens: usage.total_tokens,
+                cache_hit_tokens: usage
+                    .prompt_tokens_details
+                    .or(usage.input_tokens_details)
+                    .map_or_else(
+                        || usage.prompt_cache_hit_tokens.unwrap_or(0),
+                        |details| details.cached_tokens,
+                    ),
             });
         }
         let mut output = Vec::new();
@@ -2113,6 +2249,84 @@ mod tests {
             Url::parse("https://user:password@example.test:8443/v1/chat/completions?token=secret")
                 .unwrap();
         assert_eq!(safe_endpoint(&url), "https://example.test:8443");
+    }
+
+    #[test]
+    fn context_compaction_accepts_only_complete_text_without_tool_calls() {
+        let complete = ProviderInferenceResponse {
+            reasoning: Some("private reasoning".into()),
+            content: Some("  summary  ".into()),
+            tool_calls: Vec::new(),
+            stop_reason: StopReason::Completed,
+            usage: None,
+        };
+        assert_eq!(context_compaction_content(&complete).unwrap(), "summary");
+
+        let truncated = ProviderInferenceResponse {
+            stop_reason: StopReason::Length,
+            ..complete.clone()
+        };
+        assert_eq!(
+            context_compaction_content(&truncated).unwrap_err().kind(),
+            InferenceErrorKind::ResponseIncomplete
+        );
+
+        let tool_call = ProviderInferenceResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                tool_name: "tool0".into(),
+                arguments: "{}".into(),
+            }],
+            stop_reason: StopReason::ToolCalls,
+            ..complete
+        };
+        assert_eq!(
+            context_compaction_content(&tool_call).unwrap_err().kind(),
+            InferenceErrorKind::ResponseIncomplete
+        );
+    }
+
+    #[test]
+    fn openai_usage_reads_cached_prompt_tokens() {
+        let mut accumulator = OpenAiAccumulator::default();
+        accumulator
+            .push(br#"data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_tokens_details":{"cached_tokens":75}}}
+
+data: [DONE]
+
+"#)
+            .unwrap();
+        let (response, _) = Box::new(accumulator).finish().unwrap();
+        assert_eq!(
+            response.usage,
+            Some(TokenUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_hit_tokens: 75,
+            })
+        );
+    }
+
+    #[test]
+    fn deepseek_usage_reads_prompt_cache_hit_tokens() {
+        let mut accumulator = DeepSeekAccumulator::default();
+        accumulator
+            .push(br#"data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":90,"completion_tokens":10,"total_tokens":100,"prompt_cache_hit_tokens":60}}
+
+data: [DONE]
+
+"#)
+            .unwrap();
+        let (response, _) = Box::new(accumulator).finish().unwrap();
+        assert_eq!(
+            response.usage,
+            Some(TokenUsage {
+                input_tokens: 90,
+                output_tokens: 10,
+                cache_hit_tokens: 60,
+            })
+        );
     }
 
     #[test]
@@ -2261,6 +2475,11 @@ data: [DONE]
         ));
         assert_eq!(request.tools[0]["function"]["name"], "skill0_review");
         assert_eq!(request.tools[1]["function"]["name"], "skill1_commit");
+        assert!(
+            serde_json::to_value(request).unwrap()["stream_options"]["include_usage"]
+                .as_bool()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2289,6 +2508,7 @@ data: [DONE]
         let value = serde_json::to_value(request).unwrap();
 
         assert_eq!(value["thinking"]["type"], "enabled");
+        assert_eq!(value["stream_options"]["include_usage"], true);
         assert_eq!(value["reasoning_effort"], "high");
         assert!(value["messages"][0].get("reasoning_content").is_none());
         assert_eq!(value["messages"][1]["reasoning_content"], "tool reasoning");
@@ -2367,5 +2587,32 @@ api_type = "openai"
             failure.message,
             "InferenceSnapshotMissing: agent inference snapshot is missing"
         );
+
+        app.world().send_event(ContextCompactionInferenceRequest {
+            id: "compact".into(),
+            agent,
+            agent_id: ResourceId::parse("agent:test/agent0").unwrap(),
+            messages: vec![Message::User {
+                content: "summarize".into(),
+                tool_calls: Vec::new(),
+            }],
+        });
+        app.tick();
+        app.tick();
+        let response = app
+            .world()
+            .event_reader::<ContextCompactionInferenceResponse>()
+            .into_iter()
+            .find(|event| event.id == "compact")
+            .unwrap();
+        assert_eq!(
+            response.result.as_ref().unwrap_err().kind(),
+            InferenceErrorKind::InferenceSnapshotMissing
+        );
+        assert!(app
+            .world()
+            .event_reader::<AgentMessage>()
+            .into_iter()
+            .all(|message| message.id != "compact"));
     }
 }

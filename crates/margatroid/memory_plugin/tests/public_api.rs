@@ -27,6 +27,7 @@ fn documented_public_api_composes_from_an_external_crate() {
             tool_calls: Vec::new(),
         },
         tool_schema: Vec::new(),
+        usage: None,
     });
     app.tick();
 

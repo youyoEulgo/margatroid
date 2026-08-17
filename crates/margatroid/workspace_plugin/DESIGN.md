@@ -248,6 +248,7 @@ PreparedWorkspaceAgent：单Agent实例材料，私有结构体--创建Agent Ent
     system_prompt: String--从AgentImage Soul取得的系统提示词
     messages: Vec<Message>--MemoryPlugin恢复的长期对话上下文
     tool_context: Vec<Message>--MemoryPlugin恢复的当前轮工具上下文
+    token_usage: TokenUsage--MemoryPlugin从历史Assistant行恢复的累计Token
     default_visibility: BTreeSet<ResourceId>--镜像默认值与Workspace参数合并后的资源集合，交给AgentPlugin构造只读组件
     inference_snapshot: AgentInferenceSnapshot--InferencePlugin构造的实例推理快照
     tool_environment: AgentToolEnvironment--项目根与镜像版本根
@@ -321,7 +322,7 @@ collect_agent_image_system(world: &mut World)
         失败时调用mark_agent_failed，只将该Agent状态改为Failed
         成功时调用prepare_workspace_agent
         prepare_workspace_agent失败时调用mark_agent_failed
-        成功准备该Agent后生成独立创建子请求ID，保存prepared和agent_requests并发送AgentCreateRequest
+        成功准备该Agent后生成独立创建子请求ID，保存prepared和agent_requests并发送携带累计Token的AgentCreateRequest
         不等待其他Agent，不因单个成员失败回滚已经创建的成员
 
 prepare_workspace_agent(world: &mut World, workspace: Entity, name: &str, image: Entity) -> Result<PreparedWorkspaceAgent, WorkspaceError>
@@ -334,8 +335,8 @@ prepare_workspace_agent(world: &mut World, workspace: Entity, name: &str, image:
         根据agent_images_root和type=image的ResourceId构造镜像版本根
         使用definition.project_root和镜像版本根构造AgentToolEnvironment
         memory_path为空时生成<project>/.margatroid/workspaces/<workspace>/memory/<agent>/memory.sql
-        调用AgentMemory::open取得AgentMemory与恢复的RealtimeContext
-        收集Soul、default_visibility和恢复上下文
+        调用AgentMemory::open取得AgentMemory与恢复的RealtimeContext及累计Token
+        收集Soul、default_visibility、恢复上下文和累计Token
         构造并返回PreparedWorkspaceAgent
         任一步失败时释放该Agent已经打开的AgentMemory并返回错误，不影响其他成员
 
@@ -457,7 +458,7 @@ cleanup_orphan_agent(world: &mut World, agent: Entity)
         -> AgentToolMap由AgentPlugin创建Agent时挂载
     MemoryPlugin
         -> AgentMemory
-        -> 打开数据库时恢复的RealtimeContext { messages, tool_context }
+        -> 打开数据库时恢复的RealtimeContext { messages, tool_context, token_usage }
     WorkspacePlugin自身
         -> Workspace归属、逻辑名称和Agent Entity索引
         -> 合并后把default_visibility交给AgentCreateRequest，由AgentPlugin构造两个可见性组件

@@ -1,13 +1,13 @@
 use std::collections::BTreeSet;
 
 use agent_plugin::{
-    AgentContext, AgentCreateRequest, AgentCreateResult, AgentCreated, AgentDefaultVisibility,
-    AgentDynamicVisibility, AgentPlugin, AgentWorkspaceId, LoadAgentSkill, UnloadAgentSkill,
-    UnloadAllAgentSkills, WorldAgentExt,
+    AgentContext, AgentContextCompactRequest, AgentCreateRequest, AgentCreateResult, AgentCreated,
+    AgentDefaultVisibility, AgentDynamicVisibility, AgentPlugin, AgentTokenUsage, AgentWorkspaceId,
+    LoadAgentSkill, UnloadAgentSkill, UnloadAllAgentSkills, WorldAgentExt,
 };
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::App;
-use margatroid_types::ResourceId;
+use margatroid_types::{ResourceId, TokenUsage};
 use tool_plugin::ToolPlugin;
 
 #[test]
@@ -24,6 +24,11 @@ fn documented_public_api_creates_an_agent() {
         system_prompt: "You are concise.".into(),
         messages: Vec::new(),
         tool_context: Vec::new(),
+        token_usage: TokenUsage {
+            input_tokens: 200,
+            output_tokens: 40,
+            cache_hit_tokens: 150,
+        },
         default_visibility: BTreeSet::new(),
     });
     app.tick();
@@ -62,6 +67,11 @@ fn documented_public_api_creates_an_agent() {
         .unwrap()
         .resources()
         .is_empty());
+    let usage = app.world().get_component::<AgentTokenUsage>(agent).unwrap();
+    assert_eq!(usage.total_input_tokens(), 200);
+    assert_eq!(usage.total_output_tokens(), 40);
+    assert_eq!(usage.total_cache_hit_tokens(), 150);
+    assert_eq!(usage.cache_hit_rate(), 0.75);
     assert!(app
         .world()
         .get_component::<AgentDynamicVisibility>(agent)
@@ -87,6 +97,7 @@ fn duplicate_agent_resource_ids_are_rejected() {
             system_prompt: String::new(),
             messages: Vec::new(),
             tool_context: Vec::new(),
+            token_usage: margatroid_types::TokenUsage::default(),
             default_visibility: BTreeSet::new(),
         });
     }
@@ -133,4 +144,20 @@ fn loading_skill_events_are_public() {
     };
     assert_eq!(load.agent, unload.agent);
     assert_eq!(load.agent, unload_all.agent);
+}
+
+#[test]
+fn context_compaction_request_is_public() {
+    fn assert_event<EventType: core_plugin::Event>() {}
+    assert_event::<AgentContextCompactRequest>();
+
+    let mut app = App::new();
+    let agent = app.world_mut().spawn();
+    let request = AgentContextCompactRequest {
+        id: "compact-1".into(),
+        agent,
+        retain_messages: 4,
+    };
+    assert_eq!(request.agent, agent);
+    assert_eq!(request.retain_messages, 4);
 }

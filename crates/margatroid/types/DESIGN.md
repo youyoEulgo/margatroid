@@ -205,6 +205,7 @@ AgentMessage：统一Agent消息事件，公开结构体--Margatroid内部所有
     id: String--完整用户交互轮次ID
     agent: Entity--消息所属Agent，进入事件队列前必须完成逻辑身份解析
     message: Message--需要写入Agent动态上下文的统一消息
+    usage: Option<TokenUsage>--仅InferencePlugin产生的Assistant响应携带本轮Token用量，其他来源固定为空
     impl Event for AgentMessage
         Event：公开trait实现
     impl Clone for AgentMessage
@@ -241,10 +242,16 @@ AgentHistoryMessageWriteRequested：Agent历史消息写入请求，公开结构
     agent: Entity--消息所属AgentInstance Entity
     message: Message--需要写入历史的消息，Skill响应已由AgentPlugin替换为加载标记
     tool_schema: Vec<ToolDefinition>--产生Assistant的该次推理实际ToolSpec；User和Tool固定为空
+    usage: Option<TokenUsage>--Assistant响应的本轮Token用量；User和Tool固定为空
     impl Event for AgentHistoryMessageWriteRequested
         Event：公开trait实现
     impl Clone for AgentHistoryMessageWriteRequested
         Clone：公开trait实现
+
+TokenUsage：单次模型响应Token用量，公开纯数据结构
+    input_tokens: u64--本次请求输入Token数
+    output_tokens: u64--本次响应输出Token数
+    cache_hit_tokens: u64--本次输入中命中Provider缓存的Token数；Provider未提供该字段时为0
 ```
 
 ## 函数

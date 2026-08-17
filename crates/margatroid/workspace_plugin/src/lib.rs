@@ -16,7 +16,7 @@ use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::{AgentInferenceSnapshot, GlobalModelRoutes, WorldInferenceExt};
 use margatroid_types::{
     AgentMessage, AgentSkillRouteAction, AgentVisibilityRouteAction, Message, ResourceId,
-    RouteAgentMessage, RouteAgentSkill, RouteAgentTurnAbort, RouteAgentVisibility,
+    RouteAgentMessage, RouteAgentSkill, RouteAgentTurnAbort, RouteAgentVisibility, TokenUsage,
     WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
 };
 use memory_plugin::{AgentMemory, MemoryPluginInstalled, RealtimeContext, WorldMemoryExt};
@@ -185,6 +185,7 @@ fn route_agent_message_system(world: &mut World) {
             id: request.id,
             agent,
             message: request.message,
+            usage: None,
         });
     }
 }
@@ -550,6 +551,7 @@ struct PreparedWorkspaceAgent {
     system_prompt: String,
     messages: Vec<Message>,
     tool_context: Vec<Message>,
+    token_usage: TokenUsage,
     default_visibility: BTreeSet<ResourceId>,
     inference_snapshot: AgentInferenceSnapshot,
     tool_environment: AgentToolEnvironment,
@@ -815,6 +817,7 @@ fn collect_agent_image_system(world: &mut World) {
             system_prompt: prepared.system_prompt.clone(),
             messages: prepared.messages.clone(),
             tool_context: prepared.tool_context.clone(),
+            token_usage: prepared.token_usage.clone(),
             default_visibility: prepared.default_visibility.clone(),
         };
         let registry = world
@@ -923,6 +926,7 @@ fn prepare_workspace_agent(
         system_prompt,
         messages: context.messages,
         tool_context: context.tool_context,
+        token_usage: context.token_usage,
         default_visibility,
         inference_snapshot,
         tool_environment,
@@ -1057,6 +1061,7 @@ fn attach_prepared_agent(
             &RealtimeContext {
                 messages: prepared.messages,
                 tool_context: prepared.tool_context,
+                token_usage: prepared.token_usage,
             },
         )
         .map_err(|error| {
