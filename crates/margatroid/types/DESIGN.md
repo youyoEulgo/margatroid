@@ -89,8 +89,6 @@ WorkspaceAgentDefinition：Workspace中的Agent静态定义，公开结构体--C
     name: String--Workspace内唯一的Agent逻辑名称
     id: ResourceId--完整Agent实例ID，格式agent:<workspace>/<name>:<tag>
     image: ResourceId--type必须为image的启动来源镜像
-    resources: Vec<ResourceId>--在镜像默认值上额外启用的资源
-    disable_resources: Vec<ResourceId>--最终禁用的资源
     memory_path: Option<PathBuf>--可选Memory SQLite覆盖路径；空时由WorkspacePlugin生成默认路径
     impl Clone for WorkspaceAgentDefinition
         Clone：公开trait实现
@@ -123,7 +121,7 @@ RouteAgentMessage：逻辑Agent消息路由命令，公开事件--由DTO层产�
     id: String--完整交互轮次ID
     workspace: WorkspaceReference--目标Workspace逻辑引用
     agent: Option<ResourceId>--目标Agent完整资源ID，None表示manager
-    message: Message--当前只接受User消息，前端预选调用保存在Message::User.tool_calls
+    message: Message--当前只接受纯User消息；手动工具调用使用独立命令或伪造Assistant工具调用
     impl Event for RouteAgentMessage
 
 RouteAgentTurnAbort：逻辑Agent轮次中止命令，公开事件--由DTO层产生并交给WorkspacePlugin解析Entity
@@ -132,19 +130,6 @@ RouteAgentTurnAbort：逻辑Agent轮次中止命令，公开事件--由DTO层产
     agent: Option<ResourceId>--空时路由到Workspace manager
     impl Event for RouteAgentTurnAbort
         Event：公开trait实现
-
-AgentSkillRouteAction：Agent持久Skill操作，公开枚举
-    Load
-    Unload
-    UnloadAll
-
-RouteAgentSkill：逻辑Agent持久Skill路由命令，公开事件--由DTO层产生并交给WorkspacePlugin解析Entity
-    id: String--请求ID
-    workspace: WorkspaceReference--目标Workspace逻辑引用
-    agent: Option<ResourceId>--目标Agent完整资源ID，None表示manager
-    resource_id: Option<ResourceId>--Load与Unload必填，UnloadAll为空
-    action: AgentSkillRouteAction
-    impl Event for RouteAgentSkill
 
 AgentVisibilityRouteAction：Agent默认资源可见性操作，公开枚举
     Inject
@@ -158,9 +143,23 @@ RouteAgentVisibility：逻辑Agent默认资源可见性路由命令，公开事�
     action: AgentVisibilityRouteAction
     impl Event for RouteAgentVisibility
 
+RouteAgentWorkflowAttach：逻辑Workflow挂载命令，公开事件--由DTO层产生并交给WorkspacePlugin解析Entity与资源根
+    id: String--请求ID，同时作为新Workflow实例ID
+    workspace: WorkspaceReference--目标Workspace逻辑引用
+    agent: Option<ResourceId>--目标Agent完整资源ID，None表示manager
+    resource_id: ResourceId--待挂载的mcl资源ID
+    impl Event for RouteAgentWorkflowAttach
+
+RouteAgentWorkflowDetach：逻辑Workflow卸载命令，公开事件--由DTO层产生并交给WorkspacePlugin解析Entity
+    id: String--请求ID
+    workspace: WorkspaceReference--目标Workspace逻辑引用
+    agent: Option<ResourceId>--目标Agent完整资源ID，None表示manager
+    instance_id: String--挂载时生成的Workflow实例ID
+    impl Event for RouteAgentWorkflowDetach
+
 ToolCall：统一工具调用，公开结构体--保存前端指定或Provider返回且后续工具执行必须原样关联的调用
     id: String--调用来源生成的工具调用ID
-    tool_name: String--所属AgentToolMap内唯一的模型工具名
+    tool_name: String--内部值为AgentResourceMap内唯一的resource_name；Provider名称由InferencePlugin临时转换
     arguments: String--完整参数JSON对象文本，无参数时为"{}"
     impl Clone + PartialEq + Eq for ToolCall
         值语义：公开trait实现
@@ -182,7 +181,6 @@ Message：统一消息，公开枚举--所有Margatroid消息Plugin共享的静�
     }
     User {
         content: String--用户内容
-        tool_calls: Vec<ToolCall>--用户预先指定的工具调用，可以为空
     }
     Assistant {
         reasoning: Option<String>--Provider公开的完整思考内容，可以为空；与正文分别保存
@@ -212,10 +210,9 @@ AgentMessage：统一Agent消息事件，公开结构体--Margatroid内部所有
         Clone：公开trait实现
     限制：message只能是User、Assistant或Tool，不能是System；结构体不提供业务方法；AgentPlugin根据Message结构决定后续动作
 
-AgentContextMessagesUpdated：Agent上下文更新事件，公开结构体--AgentContext修改完成后通知MemoryPlugin同步实时消息表
+AgentContextMessagesUpdated：Agent上下文更新事件，公开结构体--MCL conversation事务提交后通知MemoryPlugin同步实时消息
     agent: Entity--消息所属AgentInstance Entity
-    messages: Vec<Message>--修改完成后的完整动态消息快照，不包含System消息
-    tool_context: Vec<Message>--当前轮临时工具上下文，包含普通Tool输出和Skill正文
+    ordered_messages: Vec<Message>--完整conversation有序快照，包含User、Assistant和Tool，不包含System
     impl Event for AgentContextMessagesUpdated
         Event：公开trait实现
     impl Clone for AgentContextMessagesUpdated
@@ -308,11 +305,10 @@ Workspace定义：
 
 统一消息：
     用户入口
-        -> 构造Message::User { content, tool_calls }
+        -> 构造Message::User { content }
         -> 发送AgentMessage
     AgentPlugin收到User
-        -> tool_calls为空时直接发起推理
-        -> tool_calls非空时先派发指定工具
+        -> 直接发起推理
     InferencePlugin完成推理
         -> Provider Adapter保留reasoning与tool_name并构造Message::Assistant
         -> 发送AgentMessage
@@ -321,9 +317,10 @@ Workspace定义：
         -> 发送AgentMessage
     AgentPlugin
         -> 只消费统一AgentMessage
-        -> 根据Message变体及ToolCall列表维护上下文、当前turn和loading skills
-        -> 把工具调用发送为ToolCallEvent；pending与批次完成由ToolPlugin管理
-        -> 每次发起推理都按AgentDynamicVisibility从AgentToolMap构造ToolSpec；用户意图不控制工具定义是否进入请求
+        -> 根据Message变体及ToolCall列表维护当前turn并把领域事件交给MCL
+        -> 把工具调用发送为ToolCallEvent；MCL pending_tool数组管理语义上的待完成调用
+        -> ToolPlugin PendingToolCalls只关联异步工具请求与响应
+        -> 每次发起推理都按MCL tool.tool_dynamic构造ToolSpec；用户意图不控制工具定义是否进入请求
 
 失败通道：
     推理失败不能伪装成Message
@@ -334,9 +331,9 @@ Workspace定义：
     AgentPlugin处理User、Assistant或Tool
         -> 发送AgentHistoryMessageWriteRequested
         -> 历史事件的content直接替换为Message::Tool.resource_id字符串
-        -> 实时tool_context仍保存完整Tool正文
-    AgentContext修改
-        -> 发送同时包含messages和tool_context的AgentContextMessagesUpdated
+        -> MCL conversation保存完整Tool正文
+    MCL conversation修改
+        -> 发送包含完整ordered_messages的AgentContextMessagesUpdated
     MemoryPlugin只消费事件，不读取AgentStatus或资源正文
 ```
 
@@ -361,8 +358,6 @@ WorkspaceDefinition
     ├── name
     ├── id: ResourceId
     ├── image: ResourceId
-    ├── resources: Vec<ResourceId>
-    ├── disable_resources: Vec<ResourceId>
     └── memory_path
 
 Message

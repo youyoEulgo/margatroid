@@ -369,24 +369,6 @@ pub struct RouteAgentTurnAbort {
 impl Event for RouteAgentTurnAbort {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AgentSkillRouteAction {
-    Load,
-    Unload,
-    UnloadAll,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RouteAgentSkill {
-    pub id: String,
-    pub workspace: WorkspaceReference,
-    pub agent: Option<ResourceId>,
-    pub resource_id: Option<ResourceId>,
-    pub action: AgentSkillRouteAction,
-}
-
-impl Event for RouteAgentSkill {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentVisibilityRouteAction {
     Inject,
     Remove,
@@ -402,6 +384,26 @@ pub struct RouteAgentVisibility {
 }
 
 impl Event for RouteAgentVisibility {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteAgentWorkflowAttach {
+    pub id: String,
+    pub workspace: WorkspaceReference,
+    pub agent: Option<ResourceId>,
+    pub resource_id: ResourceId,
+}
+
+impl Event for RouteAgentWorkflowAttach {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteAgentWorkflowDetach {
+    pub id: String,
+    pub workspace: WorkspaceReference,
+    pub agent: Option<ResourceId>,
+    pub instance_id: String,
+}
+
+impl Event for RouteAgentWorkflowDetach {}
 
 impl Event for RouteAgentMessage {}
 
@@ -426,8 +428,6 @@ pub enum Message {
     },
     User {
         content: String,
-        #[serde(default)]
-        tool_calls: Vec<ToolCall>,
     },
     Assistant {
         #[serde(default)]
@@ -480,6 +480,7 @@ pub struct AgentContextMessagesUpdated {
     pub agent: Entity,
     pub messages: Vec<Message>,
     pub tool_context: Vec<Message>,
+    pub ordered_messages: Vec<Message>,
 }
 
 impl Event for AgentContextMessagesUpdated {}

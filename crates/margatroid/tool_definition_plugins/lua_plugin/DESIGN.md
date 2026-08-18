@@ -40,15 +40,17 @@ LuaExecutionLimits：Lua单次执行限制，公开结构体--所有字段在调
 
 LuaToolRegisterRequest：Agent Lua工具注册请求，公开事件
     id: String--Workspace注册子请求ID
-    agent: Entity--目标Agent Entity，必须已挂载AgentIdentity、AgentToolMap和AgentToolEnvironment
+    agent: Entity--目标Agent Entity，必须已挂载AgentIdentity、AgentResourceMap和AgentToolEnvironment
     resource_id: ResourceId--待注册完整Tool资源ID
+    alias: Option<String>--MCL IMPORT可选别名
     impl Event for LuaToolRegisterRequest
 
 LuaToolRegisterResponse：Agent Lua工具注册结果，公开事件
     id: String--原注册子请求ID
     agent: Entity
     resource_id: ResourceId
-    result: Result<(), ToolError>
+    alias: Option<String>
+    result: Result<ResourceMapEntry, ToolError>
     impl Event for LuaToolRegisterResponse
 
 LuaError：LuaPlugin配置错误，公开结构体--只描述Plugin构造与依赖错误，不回显脚本、参数、绝对路径或响应正文
@@ -181,8 +183,8 @@ lua_tool_register_system(world: &mut World)
         从Agent Entity读取AgentToolEnvironment
         按项目、镜像、主目录顺序精确查找工具包
         有界读取tool.toml和input.schema.json并调用parse_lua_tool_definition
-        构造ToolTemplate { name=resource_id.to_string(), description, parameters }；AgentToolMap注册时再替换为Agent内tool_name
-        调用register_agent_tool，tool_id固定为tool:builtin/lua-runtime:latest，resource_id保持具体Tool ID
+        resource_name使用请求alias或完整resource_id字符串，构造ToolTemplate { name=resource_name, description, parameters }
+        构造候选ResourceMapEntry并通过响应返回，不写AgentResourceMap；tool_id固定为tool:builtin/lua-runtime:latest，resource_id保持具体Tool ID
         成功或失败都发送LuaToolRegisterResponse
         不读取或执行main.lua，不测试工具副作用
 
@@ -262,15 +264,9 @@ Workspace启动：
         -> 发送LuaToolRegisterRequest
     LuaPlugin
         -> 读取静态定义
-        -> register_agent_tool(
-               agent,
-               tool:builtin/lua-runtime:latest,
-               具体tool资源ID,
-               ToolTemplate
-           )
-        -> LuaToolRegisterResponse
-    WorkspacePlugin
-        -> 所有资源注册成功后Workspace才进入ready
+        -> LuaToolRegisterResponse { candidate ResourceMapEntry }
+    MclPlugin
+        -> register_agent_resource并提交IMPORT事务
 
 每次调用：
     ToolPlugin
@@ -287,7 +283,8 @@ Workspace启动：
     ToolPlugin
         -> PendingToolCalls.remove
         -> AgentMessage::Tool
-        -> ToolTurnCompleted
+    AgentPlugin -> MCL删除对应pending_tool
+                -> pending_tool为空时请求下一次推理
 ```
 
 ## 边界
@@ -295,7 +292,7 @@ Workspace启动：
 ```text
 LuaPlugin依赖AgentPlugin的AgentIdentity、ToolPlugin和AsyncRuntimePlugin；不依赖WorkspacePlugin，避免与注册协调形成循环依赖。
 LuaPlugin不读取Agent可见性；BuiltinToolPlugin只把已经确定的具体resource_id交给它注册。
-LuaPlugin不持有AgentToolMap、PendingToolCalls或AgentStatus，不构造AgentMessage，不判断一轮工具是否完成。
+LuaPlugin不持有AgentResourceMap、PendingToolCalls或AgentStatus，不构造AgentMessage，不判断一轮工具是否完成。
 LuaExecutionHandle及全部子句柄不持有World、Entity查询器、Component引用或Resource引用。
 Agent Entity只用于内部ToolCallResponse定位；Lua可见上下文使用AgentIdentity中的ResourceId。
 Lua工具是开发者主动安装的可信代码；LuaPlugin不构成安全沙箱，完整标准库和开放句柄允许任意文件、环境、网络、子进程和动态模块操作。

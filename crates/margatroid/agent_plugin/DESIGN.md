@@ -4,33 +4,32 @@
 
 公开：
 ```text
-AgentPlugin：Agent实例与消息循环插件，公开结构体--安装创建、消息处理和工具批次完成System
+AgentPlugin：Agent实例与消息循环插件，公开结构体--安装创建、消息处理和MCL领域事件适配System
     schedule: String--System所属Schedule，私有
     new() -> Self
     with_schedule(mut self, schedule: impl Into<String>) -> Self
     impl Default for AgentPlugin
     impl Plugin for AgentPlugin
         build(self, app: &mut App)
-            构建插件：要求RuntimePlugin、ToolPlugin和目标Schedule存在，插入InFlightVisibilityRegistrations，挂载Agent创建、可见性修改、资源注册响应、Skill状态、消息处理和工具批次完成System
+            构建插件：要求RuntimePlugin、ToolPlugin、MclPlugin和目标Schedule存在，插入PendingVisibilityCommands，挂载Agent创建、Driver状态、可见性命令回执和消息处理System
 
 AgentCreateRequest：Agent创建请求，公开事件--WorkspacePlugin交付Agent自有字段
     id: String--Workspace创建子请求ID
     agent_id: ResourceId--稳定Agent资源ID，格式agent:<workspace>/<name>:latest
     workspace_id: Entity--所属Workspace Entity
-    system_prompt: String--当前系统提示词
-    messages: Vec<Message>--恢复的长期User与Assistant上下文
-    tool_context: Vec<Message>--恢复的当前轮Tool上下文
+    base_driver: MclDriverSource--AgentImage根目录base.lua验证后的内禀Base Driver，身份继承Agent资源ID
+    tool_environment: AgentToolEnvironment--项目根、镜像根和主目录解析环境，由ToolPlugin定义类型
+    ordered_messages: Vec<Message>--按实际发生顺序恢复的User、Assistant与Tool消息，作为MCL恢复输入
     token_usage: TokenUsage--从历史Assistant行恢复的累计Token
-    default_visibility: BTreeSet<ResourceId>--创建时默认可见资源
     impl Event for AgentCreateRequest
 
 AgentCreateResult：Agent Entity创建结果，公开事件--无论成功失败都恰好发送一次
     id: String--原创建子请求ID
     agent_id: ResourceId--原请求中的稳定Agent资源ID
-    result: Result<Entity, AgentCreateError>--成功时为已经挂载Agent自有组件和空AgentToolMap的Entity
+    result: Result<Entity, AgentCreateError>--成功时为已经挂载Agent自有组件和空AgentResourceMap的Entity
     impl Event for AgentCreateResult
 
-AgentCreated：Agent Entity创建成功通知，公开事件--Agent自有组件和空AgentToolMap已经建立，且已经发出默认可见性恢复请求
+AgentCreated：Agent Entity创建成功通知，公开事件--Agent自有组件、AgentResourceMap与AgentMcl已经建立，Base Driver初始化完成并进入start等待
     id: String--原创建子请求ID
     agent_id: ResourceId--稳定Agent资源ID
     agent: Entity--新建Agent Entity
@@ -55,7 +54,7 @@ SetAgentDefaultResourceVisibility：设置单项默认资源可见性，公开�
     visible: bool--true注入，false删除
     impl Event for SetAgentDefaultResourceVisibility
 
-RestoreAgentDefaultVisibility：恢复默认可见性，公开事件--AgentPlugin在Agent Entity创建成功时自行发送；其他调用方也可显式请求，不等待资源注入
+RestoreAgentDefaultVisibility：显式恢复默认可见性，公开事件--清除manual修改后重新用Base Driver定义的tool_default覆盖tool_dynamic；Agent创建由base.lua初始INJECT完成
     id: String--操作通知ID，也是各默认资源通知的父ID
     agent: Entity--目标Agent Entity
     impl Event for RestoreAgentDefaultVisibility
@@ -89,7 +88,8 @@ AgentCreateErrorKind：Agent创建错误分类，公开枚举
     DuplicateAgent
     WorkspaceMissing
     ContextInvalid
-    ToolMapSetupFailed
+    ResourceMapSetupFailed
+    MclSetupFailed
 
 AgentCreateError：Agent创建错误，公开结构体--不包含上下文正文
     kind: AgentCreateErrorKind
@@ -100,7 +100,7 @@ AgentCreateError：Agent创建错误，公开结构体--不包含上下文正文
 AgentVisibilityErrorKind：可见性错误分类，公开枚举
     AgentMissing
     VisibilityMissing
-    ToolMapMissing
+    ResourceMapMissing
     RegistrationFailed
     RegistrationResponseMismatch
 
@@ -109,23 +109,6 @@ AgentVisibilityError：可见性错误，公开结构体--稳定描述Agent、�
     message: String
     kind(&self) -> AgentVisibilityErrorKind
     message(&self) -> &str
-
-LoadAgentSkill：加载持久Skill事件，公开事件--把Skill加入Agent每轮自动调用集合
-    id: String--请求ID，用于失败定位
-    agent: Entity--目标Agent Entity
-    resource_id: ResourceId--完整Skill资源ID
-    impl Event for LoadAgentSkill
-
-UnloadAgentSkill：卸载持久Skill事件，公开事件--把Skill移出Agent每轮自动调用集合
-    id: String--请求ID，用于失败定位
-    agent: Entity--目标Agent Entity
-    resource_id: ResourceId--完整Skill资源ID
-    impl Event for UnloadAgentSkill
-
-UnloadAllAgentSkills：卸载全部持久Skill事件，公开事件--清空Agent每轮自动调用集合
-    id: String--请求ID，用于失败定位
-    agent: Entity--目标Agent Entity
-    impl Event for UnloadAllAgentSkills
 
 AgentIdentity：Agent稳定身份，公开Component
     id: ResourceId--type=agent的唯一资源ID，私有
@@ -137,33 +120,8 @@ AgentWorkspaceId：Agent所属Workspace，公开Component
     workspace_id(&self) -> Entity
     impl Component for AgentWorkspaceId
 
-AgentContext：Agent上下文，公开Component--保存系统提示词、长期对话和当前轮工具上下文
-    system_prompt: String--当前系统提示词，私有
-    messages: Vec<Message>--长期User与Assistant消息，私有
-    tool_context: Vec<Message>--当前轮Tool响应，私有
-    system_prompt(&self) -> &str
-    messages(&self) -> &[Message]
-    tool_context(&self) -> &[Message]
-    append_message(&mut self, agent: Entity, message: Message, events: &RuntimeEventSender)
-        追加对话：公开方法，只接受User或Assistant，修改后发送AgentContextMessagesUpdated
-    rewrite_messages(&mut self, agent: Entity, messages: Vec<Message>, events: &RuntimeEventSender)
-        重写对话：公开方法，整体替换长期上下文并发送AgentContextMessagesUpdated
-    append_tool_context(&mut self, agent: Entity, message: Message, events: &RuntimeEventSender)
-        追加工具上下文：公开方法，只接受Tool并发送AgentContextMessagesUpdated
-    clear_tool_context(&mut self, agent: Entity, events: &RuntimeEventSender)
-        清空工具上下文：公开方法，修改后发送AgentContextMessagesUpdated
-    impl Component for AgentContext
-
-AgentDefaultVisibility：Agent默认可见性，公开只读Component
-    resources: BTreeSet<ResourceId>--创建时确定的资源集合，私有
-    resources(&self) -> &BTreeSet<ResourceId>
-    impl Component for AgentDefaultVisibility
-
-AgentDynamicVisibility：Agent动态可见性，公开Component--当前实际可见资源
-    resources: BTreeSet<ResourceId>--当前资源集合，私有
-    resources(&self) -> &BTreeSet<ResourceId>
-    impl Component for AgentDynamicVisibility
-    限制：只有AgentPlugin的可见性System可以修改resources；公开接口只读
+Agent上下文不再由AgentPlugin维护第二份AgentContext组件。消息数组、pending_tool和工具可见性
+统一存放在AgentMcl；MemoryPlugin的实时上下文更新由MCL事务提交后的上下文变更事件驱动。
 
 AgentTokenUsage：Agent累计Token状态，公开只读Component
     total_input_tokens: u64--历史Assistant响应累计输入Token
@@ -194,8 +152,6 @@ AgentContextCompactRequest：Agent实时上下文压缩请求，公开事件--�
 WorldAgentExt：World Agent扩展，公开trait
     agent(&self, id: &ResourceId) -> Option<Entity>
         按身份查询：公开方法，返回稳定资源ID匹配且仍存活的Agent Entity
-    agent_loading_skills(&self, agent: Entity) -> Option<&BTreeSet<ResourceId>>
-        查询持久Skill：公开只读方法，不暴露AgentStatus其他字段
     agent_is_working(&self, agent: Entity) -> Option<bool>
         查询工作状态：公开只读方法，AgentStatus存在时返回当前是否有未结束普通交互或上下文压缩
     inject_agent_visible_resource(&self, id: impl Into<String>, agent: Entity, resource_id: ResourceId)
@@ -211,9 +167,8 @@ WorldAgentExt：World Agent扩展，公开trait
 
 crate公开：
 ```text
-AgentStatus：Agent工作占用与持久Skill状态，crate公开Component--不保存pending tool或压缩快照
+AgentStatus：Agent工作占用状态，crate公开Component--不保存pending tool或压缩快照
     turn_id: Option<String>--当前普通交互轮次ID或上下文压缩请求ID；空表示Agent空闲
-    loading_skills: BTreeSet<ResourceId>--每轮自动调用的Skill资源ID
     begin_turn(&mut self, turn_id: String) -> Result<(), AgentStepError>
         开始工作：拒绝普通轮次与上下文压缩相互重叠
     finish_turn(&mut self, turn_id: &str) -> Result<(), AgentStepError>
@@ -222,17 +177,13 @@ AgentStatus：Agent工作占用与持久Skill状态，crate公开Component--不�
         中止轮次：清空并返回当前turn_id；空闲时返回None
     is_working(&self) -> bool
         查询工作状态：当前turn_id非空时返回true
-    load_skill(&mut self, resource_id: ResourceId) -> Result<(), AgentStepError>
-        加载Skill：只接受type=skill并按完整ResourceId去重
-    unload_skill(&mut self, resource_id: &ResourceId) -> bool
-    unload_all_skills(&mut self)
     impl Component for AgentStatus
 ```
 
 私有：
 ```text
 AvailableTools：一次推理的临时工具规格集合，私有结构体
-    definitions: Vec<ToolDefinition>--从当前AgentToolMap取得的内部ToolSpec
+    definitions: Vec<ToolDefinition>--从当前AgentResourceMap取得的内部ToolSpec
 
 PendingInferenceToolSchemas：飞行中推理的ToolSpec快照，私有Resource
     schemas: HashMap<(Entity, String), Vec<ToolDefinition>>--按Agent与turn_id关联下一条Assistant
@@ -252,10 +203,10 @@ ConversationTurnResult：单条消息处理结果，私有枚举
 AgentStepError：Agent处理错误，私有枚举
     AgentMissing
     IdentityMissing
-    ContextMissing
+    MclContextMissing
     StatusMissing
     TokenUsageMissing
-    ToolMapMissing
+    ResourceMapMissing
     InvalidMessage
     InvalidToolBatch
     ContextNotCompactable
@@ -266,15 +217,15 @@ AgentStepError：Agent处理错误，私有枚举
     failure_message(&self) -> String
         构造稳定有界错误描述，不包含消息正文、工具参数或资源正文
 
-InFlightVisibilityRegistrations：飞行中的资源注册，私有Resource--只保存异步请求关联，不是PendingToolCalls，也不保存可见性操作快照
-    registrations: Map<(Entity, ResourceId), InFlightVisibilityRegistration>--同一Agent同一资源最多一个底层注册请求
+PendingVisibilityCommands：等待MCL命令回执的外部可见性操作，私有Resource
+    commands: HashMap<String, PendingVisibilityCommand>--MCL命令ID到原API操作、当前阶段和通知信息
 
-InFlightVisibilityRegistration：单项飞行中注册，私有结构体
-    registration_id: String--发送给ToolPlugin注册协议的内部唯一请求ID
+PendingVisibilityCommand：单次外部可见性操作，私有结构体
+    request_id: String
     agent: Entity
-    resource_id: ResourceId
-    notification_ids: BTreeSet<String>--等待注入成功或失败通知的外部操作ID
-    desired_visible: bool--响应返回时是否仍应注入；删除操作可改为false，后续再次注入可恢复为true
+    resource_id: Option<ResourceId>
+    action: Inject | Remove | SetDefault | Restore | RemoveAll
+    phase: Import | Mutate
 ```
 
 ## 函数
@@ -284,74 +235,35 @@ agent_create_system(world: &mut World)
     创建Agent：私有System，读取AgentCreateRequest
     行为：
         验证请求ID、agent_id、Workspace Entity及恢复消息结构；失败时发送AgentCreateResult::Err
-        创建Entity并挂载AgentIdentity、AgentWorkspaceId、AgentContext、AgentDefaultVisibility、空AgentDynamicVisibility、由请求累计值构造的AgentTokenUsage和空AgentStatus
-        调用ToolPlugin公开函数挂载空AgentToolMap；失败时despawn已创建Entity并发送AgentCreateResult::Err
-        不直接注册资源；此时WorkspacePlugin尚未挂载AgentToolEnvironment
-        成功时发送AgentCreated，并调用自身restore_agent_default_visibility；注册请求在后续System帧处理
-        最后发送AgentCreateResult::Ok(agent)
+        创建Entity并挂载AgentIdentity、AgentWorkspaceId、AgentToolEnvironment、由请求累计值构造的AgentTokenUsage和空AgentStatus
+        调用ToolPlugin公开函数挂载空AgentResourceMap；失败时despawn已创建Entity并发送AgentCreateResult::Err
+        调用MclPlugin为Entity挂载AgentMcl并异步启动base.lua；保存创建请求与临时Entity，暂不发送成功结果
+        Base Driver的IMPORT通过MCL事件异步解析资源；此时不直接注册资源
+
+agent_mcl_driver_state_system(world: &mut World)
+    收集Base Driver初始化结果：私有System，读取MclDriverReady与MclDriverFailed
+    行为：
+        Ready必须匹配等待中的Agent创建；随后发送AgentCreated和AgentCreateResult::Ok(agent)
+        Failed必须匹配等待中的Agent创建；despawn临时Entity并发送AgentCreateResult::Err(MclSetupFailed)
+        每个AgentCreateRequest恰好产生一次最终结果，迟到或重复Driver通知记录稳定错误并忽略
 
 agent_visibility_change_system(world: &mut World)
-    修改动态可见性：私有System，分别读取InjectAgentVisibleResource、RemoveAgentVisibleResource、SetAgentDefaultResourceVisibility、RestoreAgentDefaultVisibility和RemoveAllAgentVisibleResources
+    把外部可见性操作转换为MCL命令：私有System
     行为：
-        Inject逐条调用inject_visible_resource
-        Remove逐条调用remove_visible_resource，目标不存在时仍发送幂等成功删除通知
-        SetDefault先验证resource_id属于AgentDefaultVisibility；否则发送AgentFailure且不修改；成功后按visible调用注入或删除
-        Restore先调用remove_all_visible_resources，再按AgentDefaultVisibility顺序逐项调用inject_visible_resource
-        RemoveAll调用remove_all_visible_resources
-        任一资源失败只发送对应错误通知；不结束Agent、不结束Workspace、不回滚其他资源
+        Inject先查AgentResourceMap；已存在时发送MCL事务追加到tool.tool_dynamic，不存在时先发送IMPORT命令，成功后再追加
+        Remove发送MCL事务按resource_id从tool.tool_dynamic删除；不存在按幂等成功处理
+        SetDefault先查询tool.tool_default，成员不存在则失败；随后按visible追加或删除tool.tool_dynamic
+        Restore发送MCL命令用tool.tool_default COVER tool.tool_dynamic
+        RemoveAll发送MCL命令清空tool.tool_dynamic
+        每个操作生成内部MCL命令ID并写入PendingVisibilityCommands；不直接修改AgentMcl字段
 
-inject_visible_resource(world: &mut World, id: &str, agent: Entity, resource_id: &ResourceId, events: &RuntimeEventSender)
-    注入单项资源：私有函数
-    行为：
-        验证AgentDynamicVisibility和AgentToolMap；失败时发送AgentVisibleResourceInjectionFailed
-        资源已经动态可见时直接发送AgentVisibleResourceInjected，操作幂等成功
-        AgentToolMap中该resource_id恰好存在一个映射时插入AgentDynamicVisibility并发送AgentVisibleResourceInjected
-        AgentToolMap中存在多个同资源映射时发送AgentVisibleResourceInjectionFailed
-        映射不存在且已有同Agent同资源飞行中注册时追加id到notification_ids并把desired_visible设为true
-        映射不存在且没有飞行中注册时生成内部registration_id，写入InFlightVisibilityRegistrations并发送AgentToolRegisterRequest
+collect_visibility_command_response_system(world: &mut World)
+    收集MCL命令回执：私有System，读取MclCommandResponse并匹配PendingVisibilityCommands
+    行为：成功后发送AgentVisibleResourceInjected或AgentVisibleResourceRemoved；失败发送AgentVisibleResourceInjectionFailed
+        任一失败不结束Agent或Workspace；迟到回执只记录稳定错误
 
-remove_visible_resource(world: &mut World, id: &str, agent: Entity, resource_id: &ResourceId, events: &RuntimeEventSender)
-    删除单项资源：私有函数
-    行为：
-        从AgentDynamicVisibility删除resource_id；目标不存在时仍视为幂等成功
-        同Agent同资源存在飞行中注册时把desired_visible设为false
-        resource_id.type=skill时同时从AgentStatus.loading_skills删除
-        不删除AgentToolMap，不回收tool_name或next_index
-        发送AgentVisibleResourceRemoved { id, agent, resource_id }
-
-remove_all_visible_resources(world: &mut World, id: &str, agent: Entity, events: &RuntimeEventSender)
-    删除全部资源：私有函数
-    行为：
-        取得并清空AgentDynamicVisibility，按ResourceId顺序为原来实际可见的每个资源发送AgentVisibleResourceRemoved
-        把该Agent全部飞行中注册的desired_visible设为false
-        动态可见性原本为空时不发送资源删除通知
-        不删除AgentToolMap
-        显式RemoveAll时清空AgentStatus.loading_skills；Restore内部清空不修改loading_skills
-
-collect_agent_tool_registration_system(world: &mut World)
-    收集资源注册响应：私有System，读取AgentToolRegisterResponse
-    行为：
-        按响应id查InFlightVisibilityRegistrations，并校验agent和resource_id完全一致
-        无匹配时记录稳定错误，不修改动态可见性
-        已匹配但agent或resource_id字段不一致时，为该注册的notification_ids发送AgentVisibleResourceInjectionFailed并删除飞行中记录
-        注册失败时为notification_ids中的每个ID发送AgentVisibleResourceInjectionFailed并删除飞行中记录
-        注册成功时再次确认Agent仍存活且AgentToolMap中该resource_id恰好存在一个映射；校验失败按响应不匹配处理
-        desired_visible=true时插入AgentDynamicVisibility，并为notification_ids中的每个ID发送AgentVisibleResourceInjected
-        desired_visible=false时只保留AgentToolMap，不注入资源，也不发送注入成功通知
-        完成后删除飞行中记录
-
-cleanup_dead_agent_registrations_system(world: &mut World)
-    清理死亡Agent注册：私有无输入System
-    行为：删除agent已经死亡的全部InFlightVisibilityRegistration、PendingInferenceToolSchemas与PendingContextCompactions快照；迟到响应将作为无匹配响应被丢弃
-
-agent_skill_state_system(world: &mut World)
-    修改持久Skill：私有System，读取LoadAgentSkill、UnloadAgentSkill和UnloadAllAgentSkills
-    行为：
-        Load要求Agent存活且resource_id.type=skill，调用AgentStatus.load_skill并按完整ResourceId去重
-        Unload要求Agent存活且resource_id.type=skill，调用AgentStatus.unload_skill；目标不存在时仍视为成功
-        UnloadAll要求Agent存活，调用AgentStatus.unload_all_skills
-        不执行Skill，不改变可见性或AgentToolMap
-        Agent不存在或资源类型非法时发送AgentFailure { kind: Agent }
+cleanup_dead_agent_state_system(world: &mut World)
+    清理死亡Agent临时状态：删除PendingVisibilityCommands、PendingInferenceToolSchemas与PendingContextCompactions中对应项
 
 agent_message_system(world: &mut World)
     处理Agent消息：私有System，读取AgentMessage并逐条调用handle_agent_message
@@ -359,7 +271,7 @@ agent_message_system(world: &mut World)
 
 abort_agent_turn_system(world: &mut World)
     中止当前轮次：私有System，读取AbortAgentTurn
-    行为：取得并清空AgentStatus当前turn；清空tool_context和对应PendingInferenceToolSchemas与PendingContextCompactions；发送CancelInferenceRequest与CancelToolTurn；空闲Agent只记录警告
+    行为：取得并清空AgentStatus当前turn；取消对应PendingInferenceToolSchemas与PendingContextCompactions；发送CancelInferenceRequest与CancelToolTurn；MCL中断消息序列的修复策略另行设计，当前不自动清空conversation或pending_tool；空闲Agent只记录警告
 
 context_compaction_system(world: &mut World)
     处理上下文压缩：私有System，同时读取AgentContextCompactRequest与ContextCompactionInferenceResponse
@@ -368,39 +280,35 @@ context_compaction_system(world: &mut World)
 begin_context_compaction(world: &mut World, request: &AgentContextCompactRequest, events: &RuntimeEventSender) -> Result<(), AgentStepError>
     开始上下文压缩：私有函数
     行为：
-        要求Agent存活、AgentStatus空闲、tool_context为空且长期messages数量大于retain_messages
+        要求Agent存活、AgentStatus空闲、msg.pending_tool为空且msg.conversation数量大于retain_messages
         调用AgentStatus.begin_turn占用工作状态，阻止压缩期间开始普通对话轮次
-        按messages.len() - retain_messages切分待压缩头部和原样保留尾部
+        按conversation.len() - retain_messages切分待压缩头部和原样保留尾部
         保存完整original_messages和retained_messages到PendingContextCompactions
         构造System、待压缩头部消息和末尾压缩提示词，不携带工具规格
-        发送ContextCompactionInferenceRequest；不修改AgentContext，不写历史
+        发送ContextCompactionInferenceRequest；不修改AgentMcl，不写历史
 
 complete_context_compaction(world: &mut World, response: &ContextCompactionInferenceResponse, events: &RuntimeEventSender) -> Result<(), AgentStepError>
     完成上下文压缩：私有函数
     行为：
         取得并删除同Agent同请求ID的PendingContextCompaction，要求AgentStatus当前turn等于请求ID
         推理失败时结束占用并返回Inference错误；成功摘要必须非空
-        要求当前AgentContext.messages仍等于original_messages且tool_context仍为空；不一致时结束占用并返回ContextChanged
+        要求当前msg.conversation仍等于original_messages且msg.pending_tool仍为空；不一致时结束占用并返回ContextChanged
         把摘要包装成带compacted-summary标记的User消息，后接retained_messages
-        调用AgentContext.rewrite_messages整体替换长期上下文，从而发送AgentContextMessagesUpdated更新实时记忆
+        通过MCL原子事务用摘要消息和retained_messages覆盖msg.conversation，并发送上下文更新事件
         调用AgentStatus.finish_turn释放工作状态；不写历史，不生成普通AgentMessage
 
 handle_agent_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender) -> Result<ConversationTurnResult, AgentStepError>
     处理消息：私有函数
     行为：
         System返回InvalidMessage
-        User开始或确认当前turn，清空上一轮tool_context，写历史并追加长期messages
-        User.tool_calls与当前loading_skills实例合并；有调用时发送ToolCallEvent，无调用时发送InferenceRequestEvent
-        Assistant先取得该turn对应的PendingInferenceToolSchemas；event.usage存在时先累加AgentTokenUsage；写入带usage的历史并追加长期messages
+        User开始或确认当前turn，写历史并送入Base Driver邮箱
+        User只追加正文并发送InferenceRequestEvent；工具调用只接受Assistant.tool_calls
+        Assistant先取得该turn对应的PendingInferenceToolSchemas；event.usage存在时先累加AgentTokenUsage；写入带usage的历史并送入Base Driver邮箱
         Assistant.tool_calls为空时结束当前turn
-        Assistant.tool_calls非空时逐项检查tool_name存在于本次ToolSpec且映射资源仍在AgentDynamicVisibility；不满足时直接发送Message::Tool拒绝响应，提示模型检查当前ToolSpec，不发送ToolCallEvent
-        Assistant所有调用均被拒绝时发送ToolTurnCompleted，等待拒绝响应进入tool_context后重新推理
-        Assistant鉴权通过的Skill资源立即加入loading_skills，再与普通tool_calls合并后统一派发
-        Tool写历史并追加tool_context；不修改loading_skills；不判断pending数量，不直接发起下一次推理
-
-tool_turn_completed_system(world: &mut World)
-    处理工具批次完成：私有System，读取ToolTurnCompleted
-    行为：验证事件turn_id等于AgentStatus当前turn；随后使用现有上下文发送InferenceRequestEvent
+        Assistant.tool_calls非空时逐项检查tool_name存在于本次ToolSpec且对应ResourceMapEntry仍在tool.tool_dynamic；不满足时直接发送Message::Tool拒绝响应，提示模型检查当前ToolSpec，不发送ToolCallEvent
+        Assistant所有调用均被拒绝时仍将拒绝响应作为Message::Tool交给MCL；MCL按tool_call_id清理pending_tool
+        Assistant鉴权通过的tool_calls统一派发
+        Tool写历史并送入Base Driver邮箱；Driver追加conversation、删除对应pending_tool，并在数组为空时请求下一次推理
 
 take_pending_tool_schema(world: &mut World, agent: Entity, turn_id: &str) -> Vec<ToolDefinition>
     取得推理工具规格：私有函数，从PendingInferenceToolSchemas移除并返回当前Agent与turn对应的ToolSpec；不存在时返回空数组
@@ -408,48 +316,35 @@ take_pending_tool_schema(world: &mut World, agent: Entity, turn_id: &str) -> Vec
 record_history_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender, tool_schema: Vec<ToolDefinition>)
     请求历史写入：私有函数
     行为：User原样发送且tool_schema和usage为空；Assistant原样发送并携带传入的ToolSpec与event.usage；Skill类型Tool保留resource_id和tool_call_id并把content替换为resource_id.to_string()；非Skill类型Tool原样发送；Tool的tool_schema和usage为空
-    限制：Skill正文只进入实时tool_context，不进入历史事件；非Skill工具响应正文完整写入历史事件
+    限制：Skill正文进入MCL conversation但不进入历史事件；非Skill工具响应正文完整写入历史事件
 
 append_conversation_message(world: &mut World, agent: Entity, message: Message, events: &RuntimeEventSender) -> Result<(), AgentStepError>
-append_tool_context(world: &mut World, agent: Entity, message: Message, events: &RuntimeEventSender) -> Result<(), AgentStepError>
-clear_tool_context(world: &mut World, agent: Entity, events: &RuntimeEventSender) -> Result<(), AgentStepError>
-    上下文修改：私有函数，分别调用AgentContext的唯一修改入口
-
 build_available_tools(world: &World, agent: Entity) -> Result<AvailableTools, AgentStepError>
     构造工具规格：私有函数
     行为：
-        读取AgentDynamicVisibility和同一Entity上的AgentToolMap
-        按动态可见性ResourceId顺序调用AgentToolMap.get_by_resource
-        每个可见资源必须恰好对应一个已注册ToolMap，否则失败
-        克隆ToolMap.template形成内部ToolSpec列表；不转换Provider格式
+        按tool.tool_dynamic数组顺序读取ResourceMapEntry
+        每个元素的tool_id和template必须同时为Some，否则失败
+        克隆template并令name等于resource_name形成内部ToolSpec；Provider格式转换由InferencePlugin负责
 
-expand_loading_skills(world: &World, agent: Entity) -> Result<Vec<ToolCall>, AgentStepError>
-    展开持久Skill：私有函数
-    行为：
-        遍历AgentStatus.loading_skills
-        按resource_id从AgentToolMap取得唯一ToolMap
-        为每个Skill生成新的Margatroid工具调用ID
-        构造ToolCall { id, tool_name: map.tool_name, arguments: "{}" }
-
-dispatch_tool_calls(world: &World, turn_id: &str, agent: Entity, explicit: &[ToolCall], include_loading_skills: bool, events: &RuntimeEventSender) -> Result<ConversationTurnResult, AgentStepError>
+dispatch_tool_calls(world: &World, turn_id: &str, agent: Entity, explicit: &[ToolCall], events: &RuntimeEventSender) -> Result<ConversationTurnResult, AgentStepError>
     派发工具：私有函数
     行为：
-        验证显式调用ID和tool_name非空，且tool_name存在于当前AgentToolMap
-        按需合并本轮新实例化的loading skills
+        验证显式调用ID和tool_name非空，且tool_name存在于当前AgentResourceMap
         验证同批ToolCall.id唯一
         为每个调用发送ToolCallEvent { turn_id, agent, call }
         没有调用时返回RequestInference，否则返回WaitForTools
 
 dispatch_assistant_tool_calls(world: &mut World, turn_id: &str, agent: Entity, explicit: &[ToolCall], tool_schema: &[ToolDefinition], events: &RuntimeEventSender) -> Result<ConversationTurnResult, AgentStepError>
     校验并派发模型调用：私有函数
-    行为：ToolMap无法解析或调用ID重复时返回InvalidToolBatch；ToolSpec中没有tool_name或映射资源不在动态可见性时发送Message::Tool { content: TOOL_PERMISSION_DENIED }；Skill资源通过鉴权后加入loading_skills；其余通过校验的调用交给dispatch_tool_calls
+    行为：ResourceMapEntry无法解析或调用ID重复时返回InvalidToolBatch；ToolSpec中没有tool_name或映射资源不在动态可见性时发送Message::Tool { content: TOOL_PERMISSION_DENIED }；通过校验的调用交给dispatch_tool_calls
 
 build_inference_context(world: &World, agent: Entity) -> Result<Vec<Message>, AgentStepError>
-    组装上下文：固定按System、messages、tool_context返回
+    组装上下文：交给AgentMcl按Block中的类型化有序数组生成；只展开请求定义选择的
+    Message数组，pending_tool等执行状态数组不得进入模型请求
 
 send_inference_request(world: &mut World, turn_id: &str, agent: Entity, events: &RuntimeEventSender) -> Result<(), AgentStepError>
     发起推理：构造当前内部ToolSpec与完整上下文；把ToolSpec按(agent, turn_id)写入PendingInferenceToolSchemas后发送InferenceRequestEvent
-    限制：只读取调用时刻的AgentDynamicVisibility；正在注册或注册失败的资源不进入本次请求
+    限制：只读取调用时刻的tool.tool_dynamic；正在IMPORT或解析失败的资源不进入本次请求
 ```
 
 ## 逻辑
@@ -457,59 +352,49 @@ send_inference_request(world: &mut World, turn_id: &str, agent: Entity, events: 
 ```text
 创建与可见性：
     AgentCreateRequest
-        -> 创建Agent自有组件、空动态可见性和空AgentToolMap
+        -> 创建Agent自有组件和空AgentResourceMap
+        -> 挂载AgentMcl并启动base.lua
+        -> IMPORT逐项解析AgentResourceMap；单项失败记录Unavailable但不终止Driver
+        -> CREATE建立标准Block和Request
+        -> 初始INJECT建立tool_default与tool_dynamic
+        -> MclDriverReady（允许AgentResourceMap为空或部分可用）
         -> AgentCreated + AgentCreateResult
-        -> RestoreAgentDefaultVisibility
-        -> 清空动态可见性
-        -> 默认资源逐项注入
-           ├── ToolMap已存在 -> AgentVisibleResourceInjected
-           └── ToolMap不存在 -> AgentToolRegisterRequest
-                                  -> AgentToolRegisterResponse
-                                  ├── 成功且仍期望可见 -> AgentVisibleResourceInjected
-                                  ├── 成功但期间已删除 -> 只保留ToolMap
-                                  └── 失败 -> AgentVisibleResourceInjectionFailed
 
 User：
     AgentMessage::User
         -> begin_turn
-        -> 清空tool_context、记录历史、追加messages
-        -> 合并User.tool_calls与本轮loading skill调用
-        -> 有工具：ToolCallEvent并等待
-        -> 无工具：InferenceRequestEvent
+        -> 记录历史
+        -> 作为MclRuntimeMessage进入Base Driver邮箱
+        -> base.lua的start返回User消息
+        -> Driver将完整User消息追加到conversation并提交InferenceRequestEvent
 
 Assistant：
     AgentMessage::Assistant
-        -> 记录历史、追加messages
-        -> 无tool_calls：finish_turn
-        -> 有tool_calls：合并本轮loading skill调用并发送ToolCallEvent
+        -> 记录历史
+        -> 作为MclRuntimeMessage进入Base Driver邮箱
+        -> base.lua的start返回Assistant消息
+        -> Driver将完整Assistant消息追加到conversation数组
+        -> 无tool_calls：提交finish
+        -> 有tool_calls：逐个追加到pending_tool并提交tool_call Effect
 
 Tool：
     AgentMessage::Tool { resource_id, tool_call_id, content }
-        -> 记录历史并追加tool_context
-        -> 不修改loading_skills
-        -> 不查询pending，不判断批次完成
-
-批次完成：
-    ToolPlugin移除最后一个Pending请求
-        -> ToolTurnCompleted
-        -> AgentPlugin发送InferenceRequestEvent
-
-loading skill：
-    AgentStatus只保存Skill ResourceId
-        -> 每轮从AgentToolMap恢复tool_name
-        -> 每轮生成新的ToolCall.id
-        -> 进入与模型主动调用相同的ToolCallEvent链路
+        -> 记录历史
+        -> Base Driver将完整Tool消息追加到conversation数组
+        -> 按tool_call_id删除pending_tool数组中的对应ToolCall
+        -> pending_tool非空：继续等待其余Tool响应
+        -> pending_tool为空：MCL产生InferenceRequestEvent
 ```
 
 ## 边界
 
 ```text
-AgentPlugin负责Agent创建、上下文、动态可见性、当前turn、loading skills、内部ToolSpec构造和推理调度。
+AgentPlugin负责Agent创建、当前turn、MCL领域事件适配、内部ToolSpec构造和推理调度。
 AgentPlugin负责维护AgentTokenUsage；只有进入普通Assistant消息链路的Provider usage会累加，压缩推理不计入。
-AgentPlugin逐资源修改动态可见性，不保存完整可见性操作快照，不因单项资源注册失败结束Agent或Workspace。
-WorkspacePlugin只在收到AgentCreateResult后挂载外部运行组件，不介入资源注册或可见性修改。
-AgentPlugin不保存pending tool，不解析Skill正文，不执行工具；只在Assistant消息分支按本次ToolSpec和动态可见性授权模型工具调用。
-ToolPlugin拥有AgentToolMap和PendingToolCalls，并通过ToolTurnCompleted通知批次结束。
+AgentPlugin把外部可见性操作转换为MCL命令，不直接修改AgentMcl，不维护第二套可见性Component。
+WorkspacePlugin只在收到AgentCreateResult后挂载其余外部运行组件，不介入资源注册或可见性修改。
+AgentPlugin不额外保存pending tool；pending_tool是AgentMcl中的类型化数组。AgentPlugin不解析Skill正文，不执行工具，只在Assistant消息分支按本次ToolSpec和tool_dynamic授权模型工具调用。
+ToolPlugin的PendingToolCalls只负责异步请求与响应关联，不是MCL工具批次完成的事实来源；完成状态由MCL pending_tool数组决定。
 InferencePlugin执行InferenceRequestEvent，Provider Adapter保留tool_name并发布AgentMessage::Assistant。
 MemoryPlugin只消费历史和实时上下文事件，不读取AgentStatus或ToolPlugin的Pending状态。
 ```
@@ -523,21 +408,17 @@ World
 ├── RemoveAgentVisibleResource -> AgentVisibleResourceRemoved
 ├── RestoreAgentDefaultVisibility -> AgentVisibleResourceInjected * N | AgentVisibleResourceInjectionFailed * N
 ├── RemoveAllAgentVisibleResources -> AgentVisibleResourceRemoved * N
-├── InFlightVisibilityRegistrations Resource
+├── PendingVisibilityCommands Resource
 ├── PendingInferenceToolSchemas Resource
 ├── PendingContextCompactions Resource
 ├── AgentContextCompactRequest -> context_compaction_system
 ├── ContextCompactionInferenceResponse -> context_compaction_system
-├── AgentMessage -> agent_message_system
-├── ToolTurnCompleted -> tool_turn_completed_system
+├── AgentMessage -> agent_message_system -> MclRuntimeMessage -> Base Driver mailbox
 └── Agent Entity
     ├── AgentIdentity
     ├── AgentWorkspaceId
-    ├── AgentContext
-    ├── AgentDefaultVisibility
-    ├── AgentDynamicVisibility
+    ├── AgentMcl--MclPlugin所有
     ├── AgentStatus
     │   ├── turn_id
-    │   └── loading_skills: BTreeSet<ResourceId>
-    └── AgentToolMap--ToolPlugin所有
+    └── AgentResourceMap--ToolPlugin所有
 ```

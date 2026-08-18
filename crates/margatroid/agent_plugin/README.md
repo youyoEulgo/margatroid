@@ -8,9 +8,10 @@ Memory、Inference和Tool组件。
 `AgentTokenUsage`累计普通Assistant响应的输入、输出和缓存命中Token，并维护累计缓存命中率。该状态在
 Agent创建时由MemoryPlugin从历史Assistant行恢复；上下文压缩推理不进入这份对话统计。
 
-`AgentMessage.agent`始终是已解析的Entity。User和Assistant进入长期`messages`，Tool进入当前轮
-`tool_context`；三种消息都通过事件请求MemoryPlugin写历史。工具批次状态由ToolPlugin维护，最后一个响应
-到达后通过`ToolTurnCompleted`通知AgentPlugin发送下一次推理请求。
+`AgentMessage.agent`始终是已解析的Entity。三种消息都通过事件请求MemoryPlugin写历史，并作为
+MCL领域事件进入对应的类型化消息数组。Assistant声明的ToolCall进入`pending_tool`数组；Tool响应
+按`tool_call_id`删除对应元素，数组为空时MCL才发送下一次推理请求。ToolPlugin的PendingToolCalls
+只负责异步工具请求与响应关联。
 
 每次推理请求都根据`AgentDynamicVisibility`重新构造工具定义，定义名保持完整`ResourceId`。
 API合法工具名的双向转换只由InferencePlugin在当前请求内完成，不保存为Agent组件。

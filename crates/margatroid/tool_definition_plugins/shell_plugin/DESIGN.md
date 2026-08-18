@@ -25,13 +25,15 @@ ShellRegisterRequest：Shell资源注册请求，公开事件
     id: String
     agent: Entity
     resource_id: ResourceId--必须使用type=shell
+    alias: Option<String>--MCL IMPORT可选别名
     impl Event for ShellRegisterRequest
 
 ShellRegisterResponse：Shell资源注册结果，公开事件
     id: String
     agent: Entity
     resource_id: ResourceId
-    result: Result<(), ToolError>
+    alias: Option<String>
+    result: Result<ResourceMapEntry, ToolError>
     impl Event for ShellRegisterResponse
 
 ShellError：ShellPlugin构造错误，公开结构体
@@ -55,7 +57,7 @@ description = "Execute a shell command."
 ```
 
 `input.schema.json`必须描述一个包含`command`字符串字段的JSON对象。资源的ToolSpec来自这个
-元信息和Schema；LLM只看到`shell:<scope>/<name>:<tag>`资源衍生出的Agent专属tool_name。
+元信息和Schema；LLM只看到`shell:<scope>/<name>:<tag>`资源衍生出的resource_name，Provider合法名称由InferencePlugin临时转换。
 
 ## 函数
 
@@ -64,7 +66,7 @@ shell_register_system(world: &mut World)
     注册Shell资源：读取ShellRegisterRequest
     行为：验证type=shell；按项目、镜像、主目录查找完整资源包；有界读取元信息、Schema和脚本
         校验name、description、Schema和脚本正文；不执行脚本
-        构造ToolTemplate并调用register_agent_tool
+        resource_name使用alias或完整resource_id字符串，构造候选ToolTemplate和ResourceMapEntry并通过响应返回，不写AgentResourceMap
         tool_id固定为tool:builtin/shell:latest，resource_id保持shell资源ID
         成功或失败都发送ShellRegisterResponse
 
@@ -88,7 +90,8 @@ execute_prepared_shell(call: PreparedShellToolCall) -> Result<(), ShellTaskError
 
 ```text
 Workspace/BuiltinToolPlugin -> ShellRegisterRequest
-ShellPlugin -> register_agent_tool(resource_id=shell:..., tool_id=tool:builtin/shell:...)
+ShellPlugin -> ShellRegisterResponse { candidate ResourceMapEntry }
+MclPlugin -> register_agent_resource并提交IMPORT事务
 
 ToolPlugin -> ToolCallRequest { resource_id=shell:..., tool_id=tool:builtin/shell:... }
 ShellPlugin -> PreparedShellToolCall -> AsyncRuntimePlugin
@@ -101,7 +104,7 @@ ToolPlugin -> AgentMessage::Tool
 
 ```text
 tool:builtin/shell:latest是内建执行器，不注册为LLM可见ToolSpec，也不进入Agent可见性。
-只有shell:*资源会进入AgentToolMap和Inference ToolSpec。
+只有shell:*资源会进入AgentResourceMap和Inference ToolSpec。
 ShellPlugin不检查命令权限；Shell资源是开发者主动安装的可信代码。
 资源脚本接收一个完整command字符串作为第一个参数；脚本自身决定如何解释或限制它。
 相对cwd解析到Agent project_root；绝对资源路径按项目、镜像、主目录顺序查找。

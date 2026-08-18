@@ -4,20 +4,24 @@ use std::path::{Component as PathComponent, Path, PathBuf};
 use std::sync::Arc;
 
 use agent_image_loader_plugin::{
-    AgentImageDefaultVisibility, AgentImageIdentity, AgentImageLoaderPluginInstalled,
-    AgentImageModelConfig, AgentImageSoul, LoadAgentImage, LoadAgentImageResult,
+    AgentImageBaseMcl, AgentImageDefaultVisibility, AgentImageIdentity,
+    AgentImageLoaderPluginInstalled, AgentImageModelConfig, AgentImageSoul, LoadAgentImage,
+    LoadAgentImageResult,
 };
 use agent_plugin::{
-    AbortAgentTurn, AgentCreateRequest, AgentCreateResult, AgentDynamicVisibility,
-    AgentPluginInstalled, AgentWorkspaceId, SetAgentDefaultResourceVisibility, WorldAgentExt,
+    AbortAgentTurn, AgentCreateRequest, AgentCreateResult, AgentPluginInstalled, AgentWorkspaceId,
+    SetAgentDefaultResourceVisibility, WorldAgentExt,
 };
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::{AgentInferenceSnapshot, GlobalModelRoutes, WorldInferenceExt};
 use margatroid_types::{
-    AgentMessage, AgentSkillRouteAction, AgentVisibilityRouteAction, Message, ResourceId,
-    RouteAgentMessage, RouteAgentSkill, RouteAgentTurnAbort, RouteAgentVisibility, TokenUsage,
-    WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
+    AgentMessage, AgentVisibilityRouteAction, Message, ResourceId, RouteAgentMessage,
+    RouteAgentTurnAbort, RouteAgentVisibility, RouteAgentWorkflowAttach, RouteAgentWorkflowDetach,
+    TokenUsage, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
+};
+use mcl_plugin::{
+    AttachWorkflowMcl, DetachWorkflowMcl, MclPluginInstalled, MclProgram, WorkflowInstanceId,
 };
 use memory_plugin::{AgentMemory, MemoryPluginInstalled, RealtimeContext, WorldMemoryExt};
 use tool_plugin::{AgentToolEnvironment, AgentToolMap, ToolPluginInstalled};
@@ -66,6 +70,9 @@ impl Plugin for WorkspacePlugin {
         if !app.world().contains_resource::<AgentPluginInstalled>() {
             panic!("WorkspacePlugin requires AgentPlugin");
         }
+        if !app.world().contains_resource::<MclPluginInstalled>() {
+            panic!("WorkspacePlugin requires MclPlugin");
+        }
         if !app.world().contains_resource::<MemoryPluginInstalled>() {
             panic!("WorkspacePlugin requires MemoryPlugin");
         }
@@ -87,8 +94,8 @@ impl Plugin for WorkspacePlugin {
         app.add_system(&schedule, begin_workspace_command_system)
             .add_system(&schedule, route_agent_message_system)
             .add_system(&schedule, route_agent_turn_abort_system)
-            .add_system(&schedule, route_agent_skill_system)
             .add_system(&schedule, route_agent_visibility_system)
+            .add_system(&schedule, route_agent_workflow_system)
             .add_system(&schedule, collect_agent_image_system)
             .add_system(&schedule, collect_agent_create_result_system);
     }
@@ -220,60 +227,6 @@ fn route_agent_turn_abort_system(world: &mut World) {
     }
 }
 
-fn route_agent_skill_system(world: &mut World) {
-    let requests = world
-        .event_reader::<RouteAgentSkill>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    for request in requests {
-        let Some(workspace) = workspace_by_reference(world, &request.workspace) else {
-            tracing::warn!(id = %request.id, "agent skill workspace was not found");
-            continue;
-        };
-        let agent = match request.agent {
-            Some(agent_id) => world.agent(&agent_id).filter(|entity| {
-                world
-                    .get_component::<AgentWorkspaceId>(*entity)
-                    .is_some_and(|owner| owner.workspace_id() == workspace)
-            }),
-            None => world.workspace_manager(workspace),
-        };
-        let Some(agent) = agent else {
-            tracing::warn!(id = %request.id, "agent skill agent was not found");
-            continue;
-        };
-        match request.action {
-            AgentSkillRouteAction::Load => {
-                let Some(resource_id) = request.resource_id else {
-                    continue;
-                };
-                world.send_event(agent_plugin::LoadAgentSkill {
-                    id: request.id,
-                    agent,
-                    resource_id,
-                });
-            }
-            AgentSkillRouteAction::Unload => {
-                let Some(resource_id) = request.resource_id else {
-                    continue;
-                };
-                world.send_event(agent_plugin::UnloadAgentSkill {
-                    id: request.id,
-                    agent,
-                    resource_id,
-                });
-            }
-            AgentSkillRouteAction::UnloadAll => {
-                world.send_event(agent_plugin::UnloadAllAgentSkills {
-                    id: request.id,
-                    agent,
-                });
-            }
-        }
-    }
-}
-
 fn route_agent_visibility_system(world: &mut World) {
     let requests = world
         .event_reader::<RouteAgentVisibility>()
@@ -303,6 +256,72 @@ fn route_agent_visibility_system(world: &mut World) {
             resource_id: request.resource_id,
             visible: matches!(request.action, AgentVisibilityRouteAction::Inject),
         });
+    }
+}
+
+fn route_agent_workflow_system(world: &mut World) {
+    let attaches = world
+        .event_reader::<RouteAgentWorkflowAttach>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let detaches = world
+        .event_reader::<RouteAgentWorkflowDetach>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for request in attaches {
+        let Some(agent) = route_agent_target(world, &request.workspace, request.agent.as_ref())
+        else {
+            tracing::warn!(id = %request.id, "Agent Workflow attach target was not found");
+            continue;
+        };
+        let Some(environment) = world.get_component::<AgentToolEnvironment>(agent) else {
+            tracing::warn!(id = %request.id, "Agent Workflow attach environment was not found");
+            continue;
+        };
+        world.send_event(AttachWorkflowMcl {
+            id: request.id,
+            agent,
+            resource_id: request.resource_id,
+            project_root: environment.project_root().to_path_buf(),
+            image_root: environment.image_root().to_path_buf(),
+        });
+    }
+    for request in detaches {
+        let Some(agent) = route_agent_target(world, &request.workspace, request.agent.as_ref())
+        else {
+            tracing::warn!(id = %request.id, "Agent Workflow detach target was not found");
+            continue;
+        };
+        let instance_id = match WorkflowInstanceId::new(request.instance_id) {
+            Ok(instance_id) => instance_id,
+            Err(error) => {
+                tracing::warn!(id = %request.id, error = %error, "Agent Workflow instance ID is invalid");
+                continue;
+            }
+        };
+        world.send_event(DetachWorkflowMcl {
+            id: request.id,
+            agent,
+            instance_id,
+        });
+    }
+}
+
+fn route_agent_target(
+    world: &World,
+    reference: &WorkspaceReference,
+    agent_id: Option<&ResourceId>,
+) -> Option<Entity> {
+    let workspace = workspace_by_reference(world, reference)?;
+    match agent_id {
+        Some(agent_id) => world.agent(agent_id).filter(|entity| {
+            world
+                .get_component::<AgentWorkspaceId>(*entity)
+                .is_some_and(|owner| owner.workspace_id() == workspace)
+        }),
+        None => world.workspace_manager(workspace),
     }
 }
 
@@ -549,8 +568,10 @@ struct WorkspaceAgentInitialization {
 struct PreparedWorkspaceAgent {
     agent_id: ResourceId,
     system_prompt: String,
+    base_mcl: Arc<MclProgram>,
     messages: Vec<Message>,
     tool_context: Vec<Message>,
+    ordered_messages: Vec<Message>,
     token_usage: TokenUsage,
     default_visibility: BTreeSet<ResourceId>,
     inference_snapshot: AgentInferenceSnapshot,
@@ -814,9 +835,11 @@ fn collect_agent_image_system(world: &mut World) {
             id: child_id.clone(),
             agent_id: prepared.agent_id.clone(),
             workspace_id: workspace,
+            base_mcl: Arc::clone(&prepared.base_mcl),
             system_prompt: prepared.system_prompt.clone(),
             messages: prepared.messages.clone(),
             tool_context: prepared.tool_context.clone(),
+            ordered_messages: prepared.ordered_messages.clone(),
             token_usage: prepared.token_usage.clone(),
             default_visibility: prepared.default_visibility.clone(),
         };
@@ -884,6 +907,12 @@ fn prepare_workspace_agent(
         .ok_or_else(agent_image_components_missing)?
         .as_str()
         .to_owned();
+    let base_mcl = Arc::clone(
+        world
+            .get_component::<AgentImageBaseMcl>(image)
+            .ok_or_else(agent_image_components_missing)?
+            .program(),
+    );
     let inference_snapshot = {
         let config = world
             .get_component::<AgentImageModelConfig>(image)
@@ -924,8 +953,10 @@ fn prepare_workspace_agent(
     Ok(PreparedWorkspaceAgent {
         agent_id: agent_definition.id,
         system_prompt,
+        base_mcl,
         messages: context.messages,
         tool_context: context.tool_context,
+        ordered_messages: context.ordered_messages,
         token_usage: context.token_usage,
         default_visibility,
         inference_snapshot,
@@ -1045,13 +1076,11 @@ fn attach_prepared_agent(
         ));
     }
     if world.get_component::<AgentToolMap>(agent).is_none()
-        || world
-            .get_component::<AgentDynamicVisibility>(agent)
-            .is_none()
+        || world.get_component::<mcl_plugin::AgentMcl>(agent).is_none()
     {
         return Err(WorkspaceError::new(
             WorkspaceErrorKind::ResourceSetupFailed,
-            "created Agent is missing its tool map or dynamic visibility",
+            "created Agent is missing its tool map or MCL state",
         ));
     }
     world
@@ -1061,6 +1090,7 @@ fn attach_prepared_agent(
             &RealtimeContext {
                 messages: prepared.messages,
                 tool_context: prepared.tool_context,
+                ordered_messages: prepared.ordered_messages,
                 token_usage: prepared.token_usage,
             },
         )

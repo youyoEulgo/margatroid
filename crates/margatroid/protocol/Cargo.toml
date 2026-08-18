@@ -9,6 +9,7 @@ core_plugin = { path = "../../mecs/core_plugin" }
 log_plugin = { path = "../../mecs/log_plugin" }
 margatroid_types = { path = "../types" }
 memory_plugin = { path = "../memory_plugin" }
+mcl_plugin = { path = "../mcl_plugin" }
 server_plugin = { path = "../../mecs/server_plugin" }
 serde = { workspace = true }
 workspace_plugin = { path = "../workspace_plugin" }

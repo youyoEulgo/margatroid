@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_image_loader_plugin::{
-    AgentImageDefaultVisibility, AgentImageIdentity, AgentImageLoaderPlugin, AgentImageModelConfig,
-    AgentImageSoul, LoadAgentImage, LoadAgentImageResult,
+    AgentImageBaseMcl, AgentImageDefaultVisibility, AgentImageIdentity, AgentImageLoaderPlugin,
+    AgentImageModelConfig, AgentImageSoul, LoadAgentImage, LoadAgentImageResult,
 };
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
@@ -26,10 +26,15 @@ fn write_image(library: &Path) {
     fs::create_dir_all(&image).unwrap();
     fs::write(
         image.join("agent.toml"),
-        "schema_version = 1\n[inference]\nmodel = \"test-model\"\n",
+        "schema_version = 1\n[inference]\nmodel = \"test-model\"\n\n[[dependencies]]\nid = \"skill:local/review:latest\"\n",
     )
     .unwrap();
     fs::write(image.join("SOUL.md"), "Public API soul.\n").unwrap();
+    fs::write(
+        image.join("base.lua"),
+        "handle(\"IMPORT skill:local/review:latest AS review\")\nhandle(\"INJECT review TO tool_default FROM tool\")\nhandle(\"INJECT SELECT tool_default FROM tool COVER tool_dynamic FROM tool\")\n",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -66,6 +71,14 @@ fn documented_public_api_composes_from_an_external_crate() {
 
     assert_eq!(
         app.world()
+            .get_component::<AgentImageBaseMcl>(image)
+            .unwrap()
+            .program()
+            .resource_id(),
+        &ResourceId::parse("mcl:local/coder:latest").unwrap()
+    );
+    assert_eq!(
+        app.world()
             .get_component::<AgentImageIdentity>(image)
             .unwrap()
             .reference(),
@@ -91,7 +104,7 @@ fn documented_public_api_composes_from_an_external_crate() {
             .unwrap()
             .resources()
             .count(),
-        0
+        1
     );
     let _ = fs::remove_dir_all(library);
 }

@@ -21,10 +21,7 @@ Loader 只描述镜像中“有什么”，不决定这些内容“怎么运行�
 ~/.margatroid/agent-images/local/coder/latest/
 ├── agent.toml
 ├── SOUL.md
-├── skills/
-│   └── local/code-review/...
-└── workflows/
-    └── local/review/...
+└── base.lua
 ```
 
 `agent.toml`：
@@ -36,13 +33,21 @@ schema_version = 1
 model = "deepseek-v4-flash"
 temperature = 0.7
 max_output_tokens = 8192
+
+[[dependencies]]
+id = "skill:local/code-review:latest"
+source = "/home/user/.margatroid/skills/local/code-review/latest"
+
+[[dependencies]]
+id = "tool:local/list-directory:latest"
+source = "https://example.com/tools/list-directory.tar"
 ```
 
 镜像资源ID使用 `image:scope/name:tag`，例如 `image:local/coder:latest`。省略 tag 时规范化为 `latest`。
 `model` 是模型路由 ID 文本；Provider、base URL 和 API key 属于 `models.toml`，不能写入镜像。
 
-`skills/`和`workflows/`下的`<scope>/<name>`分别转换为`skill:scope/name:latest`和
-`workflow:scope/name:latest`的`ResourceId`并进入镜像默认可见性；Loader不读取资源正文。
+`dependencies`只声明资源ID和可选来源。来源可以是本机路径或URL，当前Loader只校验并保存，
+不负责下载或复制；安装流程会在后续阶段按本机资源查找优先级处理来源。
 
 ## 安装
 
@@ -86,7 +91,7 @@ world.send_event(LoadAgentImage {
 
 ```rust
 use agent_image_loader_plugin::{
-    AgentImageDefaultVisibility,
+    AgentImageBaseDriver,
     AgentImageIdentity,
     AgentImageModelConfig,
     AgentImageSoul,
@@ -118,16 +123,16 @@ fn inspect_loaded_images(world: &mut World) {
         let model = world
             .get_component::<AgentImageModelConfig>(image)
             .expect("successful load must attach model config");
-        let visibility = world
-            .get_component::<AgentImageDefaultVisibility>(image)
-            .expect("successful load must attach default visibility");
+        let base_driver = world
+            .get_component::<AgentImageBaseDriver>(image)
+            .expect("successful load must attach base driver");
 
         tracing::info!(
             ?image,
             reference = %identity.reference(),
             soul_bytes = soul.as_str().len(),
             model = model.model(),
-            resource_count = visibility.resources().count(),
+            base_driver_bytes = base_driver.source().source().len(),
             "agent image loaded"
         );
     }
@@ -137,18 +142,11 @@ fn inspect_loaded_images(world: &mut World) {
 真正的消费者是 WorkspacePlugin。它必须等镜像和其他启动依赖全部成功后再创建 AgentInstance，
 不能在收到第一个成功结果时留下半成品运行对象。
 
-## 默认可见性
+## Base Driver
 
-`AgentImageDefaultVisibility`的字段私有，只提供`resources()`。它不保存磁盘路径，
-调用方也不能原地修改镜像默认值。
-
-WorkspacePlugin 创建 AgentInstance 时读取默认值，再叠加 Workspace 对单个 Agent 的配置：
-
-```text
-visible = image defaults
-visible += workspace additions
-visible -= workspace disabled
-```
+`AgentImageBaseDriver`保存镜像根目录`base.lua`的已验证源码。资源依赖由Driver中的
+`agent.toml`的`dependencies`声明，Driver中的`IMPORT`只负责引用和组织这些依赖；默认和动态
+工具可见性由MCL数组管理。当前实现仍兼容旧镜像目录扫描，迁移完成后移除该兼容路径。
 
 禁用始终优先。合并后的`AgentDefaultVisibility`交给AgentPlugin；AgentPlugin创建实例时复制出
 初始`AgentDynamicVisibility`。前者只读，后者代表运行中的实际可见资源。

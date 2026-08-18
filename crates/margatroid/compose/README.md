@@ -20,8 +20,6 @@ project_root: .
 agents:
   coder:
     image: image:local/coder:latest
-    resources:
-      - "skill:local/project-context:latest"
 ```
 
 ## 文件语法
@@ -36,10 +34,6 @@ agents:                            # 必填，至少一个 Agent
   coder:
     tag: latest                     # 可选，Agent实例标签，默认为latest
     image: image:local/coder:latest # 必填，image:scope/name[:tag]
-    resources:                     # 可选，额外启用的资源
-      - "skill:local/project-context:latest"
-    disable_resources:             # 可选，禁用的资源
-      - "skill:local/dangerous-command:latest"
     memory_path: memory/coder.sql  # 可选，SQLite 路径
 ```
 
@@ -92,42 +86,8 @@ image: image:local/coder
 # 等价于 image:local/coder:latest
 ```
 
-### Resource 语法
-
-`resources` 和 `disable_resources` 都是完整资源ID列表：
-
-```yaml
-resources:
-  - "skill:local/project-context:latest"
-  - "workflow:local/review:latest"
-  - "tool:builtin/read-file:latest"
-```
-
-tag可以省略，编译后统一补为`latest`：
-
-```yaml
-resources:
-  - "skill:local/project-context"
-  - "workflow:local/review"
-```
-
-`type`只允许小写 ASCII 字母、数字、`_` 和 `-`。当前常见类型包括 `tool`、`skill` 和
-`workflow`，但编译器允许后续注册其他类型。
-
-`name` 必须严格是 `scope/name`，两个部分都不能为空，不能使用 `.`、`..`，也不能包含反斜杠或
-控制字符。例如 `local/project-context` 合法，`project-context`、`local/a/b` 和
-`../dangerous` 非法。
-
-`resources` 是在 AgentImage 默认资源上额外启用的资源；`disable_resources` 优先级最高，会从
-最终可见资源中移除同名引用：
-
-```text
-镜像默认资源 + resources - disable_resources
-```
-
-编译器只验证资源引用语法，不访问AgentImage、项目目录或主目录。daemon在启动Workspace时使用最终
-可见资源和Agent的实际项目根、镜像根逐项解析；Provider未注册、Skill或Workflow文件不存在、定义
-非法或多个资源暴露同名工具时，`workspace up`失败，Workspace不会进入已就绪状态。
+资源依赖和工具可见性不属于Workspace文件。AgentImage根目录的`base.lua`通过
+`handle("IMPORT ...")`声明依赖，并通过MCL的`tool_default`和`tool_dynamic`数组管理可见性。
 
 ### Memory 路径
 

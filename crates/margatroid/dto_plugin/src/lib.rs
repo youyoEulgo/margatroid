@@ -8,7 +8,7 @@ pub use config_plugin::WebSocketMessageTarget;
 use core_plugin::{App, Event, Plugin, Resource, World};
 use log_plugin::TracingStream;
 use margatroid_protocol::{BackendStateDto, ClientMessage, IntoDomain, ServerMessage};
-use margatroid_types::{AgentSkillRouteAction, AgentVisibilityRouteAction};
+use margatroid_types::AgentVisibilityRouteAction;
 use server_plugin::{
     AppServerExt, WebSocketConnections, WebSocketMessage, WebSocketMessageReceived,
     WebSocketMessageSender,
@@ -178,33 +178,6 @@ fn dto_route_system(world: &mut World) {
                     ),
                 }
             }
-            ClientMessage::AgentSkillLoad { id, message } => {
-                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.skill.load", "API request received");
-                match message.into_domain((id, AgentSkillRouteAction::Load)) {
-                    Ok(event) => world.send_event(event),
-                    Err(error) => {
-                        tracing::warn!(connection = received.connection_id.get(), error = %error, "invalid agent.skill.load payload")
-                    }
-                }
-            }
-            ClientMessage::AgentSkillUnload { id, message } => {
-                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.skill.unload", "API request received");
-                match message.into_domain((id, AgentSkillRouteAction::Unload)) {
-                    Ok(event) => world.send_event(event),
-                    Err(error) => {
-                        tracing::warn!(connection = received.connection_id.get(), error = %error, "invalid agent.skill.unload payload")
-                    }
-                }
-            }
-            ClientMessage::AgentSkillUnloadAll { id, message } => {
-                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.skill.unload_all", "API request received");
-                match message.into_domain((id, AgentSkillRouteAction::UnloadAll)) {
-                    Ok(event) => world.send_event(event),
-                    Err(error) => {
-                        tracing::warn!(connection = received.connection_id.get(), error = %error, "invalid agent.skill.unload_all payload")
-                    }
-                }
-            }
             ClientMessage::AgentVisibilityInject { id, message } => {
                 tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.visibility.inject", "API request received");
                 match message.into_domain((id, AgentVisibilityRouteAction::Inject)) {
@@ -220,6 +193,24 @@ fn dto_route_system(world: &mut World) {
                     Ok(event) => world.send_event(event),
                     Err(error) => {
                         tracing::warn!(connection = received.connection_id.get(), error = %error, "invalid agent.visibility.remove payload")
+                    }
+                }
+            }
+            ClientMessage::AgentWorkflowAttach { id, message } => {
+                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.workflow.attach", "API request received");
+                match message.into_domain(id) {
+                    Ok(event) => world.send_event(event),
+                    Err(error) => {
+                        tracing::warn!(connection = received.connection_id.get(), error = %error, "invalid agent.workflow.attach payload")
+                    }
+                }
+            }
+            ClientMessage::AgentWorkflowDetach { id, message } => {
+                tracing::info!(connection = received.connection_id.get(), request_id = %id, api_type = "agent.workflow.detach", "API request received");
+                match message.into_domain(id) {
+                    Ok(event) => world.send_event(event),
+                    Err(error) => {
+                        tracing::warn!(connection = received.connection_id.get(), error = %error, "invalid agent.workflow.detach payload")
                     }
                 }
             }

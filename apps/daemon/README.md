@@ -45,7 +45,7 @@ streaming_member_messages = ["type:webui"]
 WebSocket target。
 AgentImage 由 `agent-images/` 提供，Workspace 文件仍由 CLI 编译，daemon 不读取 YAML。
 daemon 把主目录交给BuiltinToolPlugin；组合Plugin再把`skills/`、`workflows/`、`tools/`和`shells/`
-交给隐藏的内建执行器。LLM只看到由这些执行器注册的`skill:*`、`workflow:*`、`tool:*`和
+交给隐藏的内建执行器。LLM只看到由这些执行器注册的`skill:*`、`tool:*`和
 `shell:*`资源，不会看到`tool:builtin/*`。
 
 客户端连接后应先注册连接类型，再发送业务请求：
