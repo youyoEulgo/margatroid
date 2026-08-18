@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::time::{Duration, Instant};
 
@@ -8,10 +8,29 @@ use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::App;
 use lua_plugin::{LuaPlugin, LuaToolRegisterRequest, LuaToolRegisterResponse};
 use margatroid_types::ResourceId;
+use mcl_plugin::{compile_mcl, MclCompileRequest, MclPlugin, MclSource};
 use tempfile::tempdir;
 use tool_plugin::{
     AgentToolEnvironment, AgentToolMap, ToolCallRequest, ToolCallResponse, ToolPlugin,
 };
+
+fn base_mcl() -> std::sync::Arc<mcl_plugin::MclProgram> {
+    compile_mcl(MclCompileRequest {
+        root: MclSource::new(
+            ResourceId::parse("mcl:local/test:latest").unwrap(),
+            r#"base context test {
+block conversation: context persistent;
+view messages: messages { select entry from conversation; }
+view tools: tools { select resource from capabilities.dynamic; }
+request inference { system = agent.system; messages = messages; tools = tools; }
+on agent.created { restore capabilities.dynamic from capabilities.default; }
+}"#,
+            std::path::PathBuf::from("/test/main.mcl"),
+        ),
+        dependencies: BTreeMap::new(),
+    })
+    .unwrap()
+}
 
 #[test]
 fn registers_and_executes_trusted_lua_tools_asynchronously() {
@@ -44,6 +63,7 @@ fn registers_and_executes_trusted_lua_tools_asynchronously() {
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(ToolPlugin::default())
+        .add_plugin(MclPlugin::open(std::env::temp_dir()).unwrap())
         .add_plugin(AgentPlugin::default())
         .add_plugin(LuaPlugin::open(home.path()).unwrap());
     let workspace = app.world_mut().spawn();
@@ -51,9 +71,11 @@ fn registers_and_executes_trusted_lua_tools_asynchronously() {
         id: "create-1".into(),
         agent_id: ResourceId::parse("agent:demo/coder:latest").unwrap(),
         workspace_id: workspace,
+        base_mcl: base_mcl(),
         system_prompt: "test".into(),
         messages: Vec::new(),
         tool_context: Vec::new(),
+        ordered_messages: Vec::new(),
         token_usage: margatroid_types::TokenUsage::default(),
         default_visibility: BTreeSet::new(),
     });
@@ -161,6 +183,7 @@ fn tracked_write_file_example_creates_parent_directories_and_writes_content() {
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(ToolPlugin::default())
+        .add_plugin(MclPlugin::open(std::env::temp_dir()).unwrap())
         .add_plugin(AgentPlugin::default())
         .add_plugin(LuaPlugin::open(examples).unwrap());
     let workspace = app.world_mut().spawn();
@@ -168,9 +191,11 @@ fn tracked_write_file_example_creates_parent_directories_and_writes_content() {
         id: "create-write-agent".into(),
         agent_id: ResourceId::parse("agent:demo/writer:latest").unwrap(),
         workspace_id: workspace,
+        base_mcl: base_mcl(),
         system_prompt: "test".into(),
         messages: Vec::new(),
         tool_context: Vec::new(),
+        ordered_messages: Vec::new(),
         token_usage: margatroid_types::TokenUsage::default(),
         default_visibility: BTreeSet::new(),
     });

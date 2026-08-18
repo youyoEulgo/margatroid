@@ -11,6 +11,7 @@ dependencies = [
  "core_plugin",
  "futures-util",
  "margatroid_types",
+ "mcl_plugin",
  "serde",
  "tokio",
  "toml",
@@ -26,6 +27,7 @@ dependencies = [
  "core_plugin",
  "inference_plugin",
  "margatroid_types",
+ "mcl_plugin",
  "memory_plugin",
  "serde",
  "serde_json",
@@ -1123,6 +1125,7 @@ dependencies = [
  "futures-util",
  "jsonschema",
  "margatroid_types",
+ "mcl_plugin",
  "mlua",
  "reqwest",
  "serde",
@@ -1173,6 +1176,7 @@ dependencies = [
  "dto_plugin",
  "inference_plugin",
  "log_plugin",
+ "mcl_plugin",
  "memory_plugin",
  "server_plugin",
  "tool_plugin",
@@ -1189,6 +1193,7 @@ dependencies = [
  "core_plugin",
  "log_plugin",
  "margatroid_types",
+ "mcl_plugin",
  "memory_plugin",
  "serde",
  "serde_json",
@@ -1220,6 +1225,22 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "mcl_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "core_plugin",
+ "margatroid_types",
+ "mlua",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "memchr"
@@ -1969,6 +1990,17 @@ name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures",
@@ -2933,6 +2965,7 @@ dependencies = [
  "core_plugin",
  "inference_plugin",
  "margatroid_types",
+ "mcl_plugin",
  "memory_plugin",
  "tempfile",
  "tool_plugin",

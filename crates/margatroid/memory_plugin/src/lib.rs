@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS realtime_messages (
     message TEXT NOT NULL,
     PRIMARY KEY (context, position)
 );
+CREATE TABLE IF NOT EXISTS realtime_context (
+    position INTEGER PRIMARY KEY,
+    message TEXT NOT NULL
+);
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +156,7 @@ pub struct HistoryMessage {
 pub struct RealtimeContext {
     pub messages: Vec<Message>,
     pub tool_context: Vec<Message>,
+    pub ordered_messages: Vec<Message>,
     pub token_usage: TokenUsage,
 }
 
@@ -253,7 +258,12 @@ impl WorldMemoryExt for World {
         {
             let mut connection = lock_connection(&memory)?;
             let transaction = connection.transaction().map_err(write_error)?;
-            rewrite_realtime_messages(&transaction, &context.messages, &context.tool_context)?;
+            rewrite_realtime_messages(
+                &transaction,
+                &context.messages,
+                &context.tool_context,
+                &context.ordered_messages,
+            )?;
             transaction.commit().map_err(write_error)?;
         }
         if !self.insert_component(agent, memory) {
@@ -504,8 +514,14 @@ fn migrate_realtime(transaction: &Transaction<'_>) -> Result<(), MemoryError> {
             )
         })?;
         match message {
-            Message::User { .. } | Message::Assistant { .. } => context.messages.push(message),
-            Message::Tool { .. } => context.tool_context.push(message),
+            Message::User { .. } | Message::Assistant { .. } => {
+                context.messages.push(message.clone());
+                context.ordered_messages.push(message);
+            }
+            Message::Tool { .. } => {
+                context.tool_context.push(message.clone());
+                context.ordered_messages.push(message);
+            }
             Message::System { .. } => {
                 return Err(MemoryError::new(
                     MemoryErrorKind::DecodeFailed,
@@ -514,7 +530,12 @@ fn migrate_realtime(transaction: &Transaction<'_>) -> Result<(), MemoryError> {
             }
         }
     }
-    rewrite_realtime_messages(transaction, &context.messages, &context.tool_context)
+    rewrite_realtime_messages(
+        transaction,
+        &context.messages,
+        &context.tool_context,
+        &context.ordered_messages,
+    )
 }
 
 fn schema_error(_: rusqlite::Error) -> MemoryError {
@@ -578,7 +599,6 @@ fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>,
         let message = match role.as_str() {
             "user" if tool_schema.is_empty() => Message::User {
                 content: content.unwrap_or_default(),
-                tool_calls,
             },
             "assistant" => Message::Assistant {
                 reasoning,
@@ -661,6 +681,28 @@ fn decode_token_count(value: i64) -> Result<u64, MemoryError> {
 }
 
 fn load_realtime_messages(connection: &Connection) -> Result<RealtimeContext, MemoryError> {
+    let ordered_messages = load_ordered_realtime_messages(connection)?;
+    if !ordered_messages.is_empty() {
+        let mut context = RealtimeContext {
+            ordered_messages,
+            ..RealtimeContext::default()
+        };
+        for message in &context.ordered_messages {
+            match message {
+                Message::User { .. } | Message::Assistant { .. } => {
+                    context.messages.push(message.clone())
+                }
+                Message::Tool { .. } => context.tool_context.push(message.clone()),
+                Message::System { .. } => {
+                    return Err(MemoryError::new(
+                        MemoryErrorKind::DecodeFailed,
+                        "ordered realtime context contains a system message",
+                    ))
+                }
+            }
+        }
+        return Ok(context);
+    }
     let mut statement = connection.prepare("SELECT context, position, message FROM realtime_messages ORDER BY context ASC, position ASC").map_err(read_error)?;
     let rows = statement
         .query_map([], |row| {
@@ -714,13 +756,48 @@ fn load_realtime_messages(connection: &Connection) -> Result<RealtimeContext, Me
             }
         }
     }
+    context.ordered_messages = context
+        .messages
+        .iter()
+        .chain(context.tool_context.iter())
+        .cloned()
+        .collect();
     Ok(context)
+}
+
+fn load_ordered_realtime_messages(connection: &Connection) -> Result<Vec<Message>, MemoryError> {
+    let mut statement = connection
+        .prepare("SELECT position, message FROM realtime_context ORDER BY position")
+        .map_err(read_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(read_error)?;
+    let mut messages = Vec::new();
+    for row in rows {
+        let (position, encoded) = row.map_err(read_error)?;
+        if position != messages.len() as i64 {
+            return Err(MemoryError::new(
+                MemoryErrorKind::DecodeFailed,
+                "ordered realtime message positions are not continuous",
+            ));
+        }
+        messages.push(serde_json::from_str::<Message>(&encoded).map_err(|_| {
+            MemoryError::new(
+                MemoryErrorKind::DecodeFailed,
+                "ordered realtime message JSON could not be decoded",
+            )
+        })?);
+    }
+    Ok(messages)
 }
 
 fn rewrite_realtime_messages(
     transaction: &Transaction<'_>,
     messages: &[Message],
     tool_context: &[Message],
+    ordered_messages: &[Message],
 ) -> Result<(), MemoryError> {
     if messages
         .iter()
@@ -728,6 +805,9 @@ fn rewrite_realtime_messages(
         || tool_context
             .iter()
             .any(|m| !matches!(m, Message::Tool { .. }))
+        || ordered_messages
+            .iter()
+            .any(|m| matches!(m, Message::System { .. }))
     {
         return Err(MemoryError::new(
             MemoryErrorKind::WriteFailed,
@@ -736,6 +816,9 @@ fn rewrite_realtime_messages(
     }
     transaction
         .execute("DELETE FROM realtime_messages", [])
+        .map_err(write_error)?;
+    transaction
+        .execute("DELETE FROM realtime_context", [])
         .map_err(write_error)?;
     for (context, entries) in [("conversation", messages), ("tool", tool_context)] {
         for (position, message) in entries.iter().enumerate() {
@@ -747,6 +830,28 @@ fn rewrite_realtime_messages(
             })?;
             transaction.execute("INSERT INTO realtime_messages (context, position, message) VALUES (?1, ?2, ?3)", params![context, position as i64, encoded]).map_err(write_error)?;
         }
+    }
+    let ordered = if ordered_messages.is_empty() {
+        messages
+            .iter()
+            .chain(tool_context.iter())
+            .collect::<Vec<_>>()
+    } else {
+        ordered_messages.iter().collect::<Vec<_>>()
+    };
+    for (position, message) in ordered.into_iter().enumerate() {
+        let encoded = serde_json::to_string(message).map_err(|_| {
+            MemoryError::new(
+                MemoryErrorKind::WriteFailed,
+                "ordered realtime message JSON could not be encoded",
+            )
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO realtime_context (position, message) VALUES (?1, ?2)",
+                params![position as i64, encoded],
+            )
+            .map_err(write_error)?;
     }
     Ok(())
 }
@@ -775,17 +880,7 @@ fn insert_history_message_values(
     created_at_ms: i64,
 ) -> Result<(), MemoryError> {
     let (role, reasoning, content, tool_calls, resource_id, tool_call_id) = match message {
-        Message::User {
-            content,
-            tool_calls,
-        } => (
-            "user",
-            None,
-            Some(content.clone()),
-            tool_calls.clone(),
-            None,
-            None,
-        ),
+        Message::User { content } => ("user", None, Some(content.clone()), Vec::new(), None, None),
         Message::Assistant {
             reasoning,
             content,
@@ -924,7 +1019,12 @@ fn sync_realtime_message(
         })?;
     let mut connection = lock_connection(memory)?;
     let transaction = connection.transaction().map_err(write_error)?;
-    rewrite_realtime_messages(&transaction, &event.messages, &event.tool_context)?;
+    rewrite_realtime_messages(
+        &transaction,
+        &event.messages,
+        &event.tool_context,
+        &event.ordered_messages,
+    )?;
     transaction.commit().map_err(write_error)
 }
 
@@ -993,13 +1093,22 @@ mod tests {
         let context = RealtimeContext {
             messages: vec![Message::User {
                 content: "restored".into(),
-                tool_calls: Vec::new(),
             }],
             tool_context: vec![Message::Tool {
                 resource_id: ResourceId::parse("tool:local/test:latest").unwrap(),
                 tool_call_id: "call-1".into(),
                 content: "tool output".into(),
             }],
+            ordered_messages: vec![
+                Message::User {
+                    content: "restored".into(),
+                },
+                Message::Tool {
+                    resource_id: ResourceId::parse("tool:local/test:latest").unwrap(),
+                    tool_call_id: "call-1".into(),
+                    content: "tool output".into(),
+                },
+            ],
             token_usage: TokenUsage::default(),
         };
         app.world_mut()
@@ -1023,7 +1132,6 @@ mod tests {
         for (index, message) in [
             Message::User {
                 content: "hello".into(),
-                tool_calls: Vec::new(),
             },
             Message::Assistant {
                 reasoning: Some("checking".into()),
@@ -1106,9 +1214,11 @@ mod tests {
         let original = RealtimeContext {
             messages: vec![Message::User {
                 content: "keep".into(),
-                tool_calls: Vec::new(),
             }],
             tool_context: Vec::new(),
+            ordered_messages: vec![Message::User {
+                content: "keep".into(),
+            }],
             token_usage: TokenUsage::default(),
         };
         app.world_mut()
@@ -1120,6 +1230,9 @@ mod tests {
                 content: "invalid".into(),
             }],
             tool_context: Vec::new(),
+            ordered_messages: vec![Message::System {
+                content: "invalid".into(),
+            }],
         });
 
         app.tick();

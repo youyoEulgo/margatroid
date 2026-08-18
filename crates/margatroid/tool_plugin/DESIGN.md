@@ -4,55 +4,61 @@
 
 公开：
 ```text
-ToolPlugin：Agent专属工具映射与调用管理插件，公开结构体--安装AgentToolMap注册接口、PendingToolCalls及工具调用System
+ToolPlugin：Agent专属资源映射与调用管理插件，公开结构体--安装AgentResourceMap注册接口、PendingToolCalls及工具调用System
 ToolPluginInstalled：安装标记，公开Resource--供依赖Plugin确认ToolPlugin已安装
 
 ToolTemplate：内部工具规格，公开结构体--Provider无关的模型工具定义
-    name: String--Agent内唯一的模型工具名，由AgentToolMap注册时写入
+    name: String--ResourceMapEntry.resource_name；InferencePlugin再转换为Provider合法名称
     description: String--模型可见说明
     parameters: serde_json::Value--Provider无关的JSON Schema参数
 
-ToolMap：Agent工具映射，公开结构体--关联模型名称、内部执行工具和具体资源
-    tool_name: String--模型看到并返回的名称，只在所属Agent内唯一
-    tool_id: ResourceId--实际处理调用的内部工具ID
-    resource_id: ResourceId--本映射代表的具体资源ID
-    template: ToolTemplate--内部工具规格，name与tool_name一致
+ResourceContent：非工具资源的已解析内容，公开枚举
+    Prompt { role: MessageRole, content: Arc<str> }
 
-AgentToolMap：Agent专属工具表，公开Component--由ToolPlugin挂载到Agent Entity
-    next_index: u64--当前Agent下一代数，私有；删除映射时不回收
-    tools: Vec<ToolMap>--当前Agent的全部工具映射，私有
-    get_by_name(&self, tool_name: &str) -> Option<&ToolMap>
-        按名称查询：公开方法，在当前Agent内按唯一tool_name定位映射
-    get_by_tool(&self, tool_id: &ResourceId) -> Vec<&ToolMap>
+ResourceMapEntry：Agent资源映射，公开结构体--同时表示可执行资源和普通内容资源
+    resource_id: ResourceId--本映射代表的完整资源ID
+    resource_name: String--当前Agent内有效名称；有alias时使用alias，否则使用完整ResourceId字符串
+    alias: Option<String>--IMPORT显式别名
+    tool_id: Option<ResourceId>--Some表示由该隐藏内建工具执行，None表示不可调用资源
+    template: Option<ToolTemplate>--模型工具规格；与tool_id同时为Some或同时为None
+    content: Option<ResourceContent>--Prompt等普通资源内容；可执行资源通常为None
+
+AgentResourceMap：Agent专属资源表，公开Component--由ToolPlugin挂载到Agent Entity
+    resources: Vec<ResourceMapEntry>--当前Agent已经解析的全部资源映射，私有
+    get_by_name(&self, resource_name: &str) -> Option<&ResourceMapEntry>
+        按名称查询：公开方法，resource_name和alias在当前Agent内唯一
+    get_by_tool(&self, tool_id: &ResourceId) -> Vec<&ResourceMapEntry>
         按工具查询：公开方法，返回由同一内部工具处理的全部映射
-    get_by_resource(&self, resource_id: &ResourceId) -> Vec<&ToolMap>
+    get_by_resource(&self, resource_id: &ResourceId) -> Vec<&ResourceMapEntry>
         按资源查询：公开方法，返回对应具体资源的全部映射
-    register(&mut self, tool_id: ResourceId, resource_id: ResourceId, template: ToolTemplate) -> Result<&ToolMap, ToolError>
-        注册映射：公开方法，使用当前next_index生成Agent内唯一tool_name，写入template.name后递增代数
-        命名：格式为<resource type><index>_<resource name>；资源名中非ASCII字母、数字、下划线或短横线的字符替换为下划线，最终超过64字符直接截断
-        行为：同一Agent内拒绝重复resource_id映射；不执行工具、不保存测试参数
-    impl Component for AgentToolMap
+    register(&mut self, entry: ResourceMapEntry) -> Result<&ResourceMapEntry, ToolError>
+        注册映射：公开方法，拒绝重复resource_name和重复alias
+        同一resource_id可以由不同Driver使用不同alias注册为不同映射
+        template存在时强制template.name等于resource_name
+    impl Component for AgentResourceMap
 
-AgentToolRegisterRequest：Agent资源工具注册请求，公开事件--注册协议类型由ToolPlugin提供，具体Provider负责消费
+AgentResourceRegisterRequest：Agent资源注册请求，公开事件--注册协议类型由ToolPlugin提供，具体Provider负责消费
     id: String--AgentPlugin生成的内部唯一注册请求ID
     agent: Entity--目标Agent Entity
-    resource_id: ResourceId--待建立ToolMap的模型可见资源ID，不允许tool:builtin/*
-    impl Event for AgentToolRegisterRequest
+    resource_id: ResourceId--待建立ResourceMapEntry的资源ID，不允许模型直接导入tool:builtin/*
+    alias: Option<String>--MCL IMPORT声明的可选别名
+    impl Event for AgentResourceRegisterRequest
 
-AgentToolRegisterResponse：Agent资源工具注册响应，公开事件--具体Provider无论成功失败都恰好响应一次
+AgentResourceRegisterResponse：Agent资源注册响应，公开事件--具体Provider无论成功失败都恰好响应一次
     id: String--原注册请求ID
     agent: Entity--原目标Agent Entity
     resource_id: ResourceId--原资源ID
-    result: Result<(), ToolError>--成功只表示AgentToolMap已经建立，不表示资源已进入动态可见性
-    impl Event for AgentToolRegisterResponse
+    alias: Option<String>--原请求alias
+    result: Result<ResourceMapEntry, ToolError>--成功返回尚未写入AgentResourceMap的候选映射
+    impl Event for AgentResourceRegisterResponse
 
 ToolCallEvent：模型或后端发起的工具调用事件，公开事件--交给ToolPlugin解析Agent专属映射
     turn_id: String--完整交互轮次ID
     agent: Entity--调用所属Agent Entity
-    call: ToolCall--调用ID、Agent内tool_name和参数
+    call: ToolCall--调用ID、Agent内resource_name和参数
     impl Event for ToolCallEvent
 
-ToolCallRequest：内部工具执行请求，公开事件--ToolPlugin解析ToolMap后交给具体工具Plugin
+ToolCallRequest：内部工具执行请求，公开事件--ToolPlugin解析ResourceMapEntry后交给具体工具Plugin
     turn_id: String
     agent: Entity
     tool_id: ResourceId--实际处理请求的内部工具
@@ -68,11 +74,6 @@ ToolCallResponse：工具执行结果，公开事件--只携带结果和定位�
     result: Result<String, ToolError>--成功正文或稳定工具错误
     impl Event for ToolCallResponse
 
-ToolTurnCompleted：工具批次完成事件，公开事件--通知AgentPlugin同轮全部工具均已响应
-    turn_id: String
-    agent: Entity
-    impl Event for ToolTurnCompleted
-
 CancelToolTurn：取消工具批次，公开事件--AgentPlugin中止轮次时发送
     turn_id: String
     agent: Entity
@@ -87,13 +88,14 @@ ToolError：工具错误，公开结构体--不包含资源正文、完整参数
 私有：
 ```text
 PendingToolCalls：待执行工具调用池，私有Resource--由ToolPlugin独占
+    只负责异步请求与响应关联，不是MCL语义中工具批次完成状态的事实来源
     calls: Vec<ToolCallRequest>
     get(&self, agent: Entity, turn_id: &str, tool_call_id: &str) -> Option<&ToolCallRequest>
         精确查询：私有方法，使用Agent、turn和tool call ID完整定位
     get_by_agent(&self, agent: Entity) -> Vec<&ToolCallRequest>
         按Agent查询：私有方法
     get_by_turn(&self, agent: Entity, turn_id: &str) -> Vec<&ToolCallRequest>
-        按轮次查询：私有方法，供批次完成判断
+        按轮次查询：私有方法，供取消、诊断和清理使用
     add_pending(&mut self, request: ToolCallRequest) -> Result<(), ToolError>
         登记请求：私有方法，拒绝重复完整定位键
     remove(&mut self, agent: Entity, turn_id: &str, tool_call_id: &str) -> Option<ToolCallRequest>
@@ -106,17 +108,18 @@ PendingToolCalls：待执行工具调用池，私有Resource--由ToolPlugin独�
 ## 函数
 
 ```text
-attach_agent_tool_map(world: &mut World, agent: Entity) -> Result<(), ToolError>
-    挂载工具表：公开函数，由AgentPlugin创建Agent时调用；拒绝死亡Entity和重复挂载
+attach_agent_resource_map(world: &mut World, agent: Entity) -> Result<(), ToolError>
+    挂载资源表：公开函数，由AgentPlugin创建Agent时调用；拒绝死亡Entity和重复挂载
 
-register_agent_tool(world: &mut World, agent: Entity, tool_id: ResourceId, resource_id: ResourceId, template: ToolTemplate) -> Result<ToolMap, ToolError>
-    注册Agent工具：公开函数，取得AgentToolMap并调用register；不检查Agent可见性、不读取资源、不执行工具
+register_agent_resource(world: &mut World, agent: Entity, entry: ResourceMapEntry) -> Result<ResourceMapEntry, ToolError>
+    注册Agent资源：公开函数，取得AgentResourceMap并调用register；由MclPlugin在IMPORT提交事务中调用，具体Provider不得提前调用
 
 tool_call_route_system(world: &mut World)
     路由调用：私有System，读取ToolCallEvent
     行为：
         验证turn_id、Agent和ToolCall ID
-        从Agent Entity取得AgentToolMap并按call.tool_name查询唯一映射
+        从Agent Entity取得AgentResourceMap并按call.tool_name查询唯一映射
+        映射的tool_id和template必须为Some，否则拒绝调用
         构造ToolCallRequest { turn_id, agent, tool_id, resource_id, tool_call_id, arguments }
         在发送请求前加入PendingToolCalls
         映射缺失或请求重复时发送AgentFailure，不伪造Tool成功消息
@@ -131,7 +134,6 @@ cancel_tool_turn_system(world: &mut World)
         未找到原请求时记录稳定错误，不发布AgentMessage
         使用原请求.resource_id、响应tool_call_id及结果正文构造Message::Tool
         发送AgentMessage { id: turn_id, agent, message }
-        移除后调用get_by_turn；为空时发送ToolTurnCompleted，否则继续等待
 ```
 
 ## 逻辑
@@ -139,37 +141,36 @@ cancel_tool_turn_system(world: &mut World)
 ```text
 注册：
     AgentPlugin创建Agent
-        -> 调用ToolPlugin挂载空AgentToolMap
-    WorkspacePlugin挂载Agent运行组件并通知AgentPlugin恢复默认可见性
-        -> AgentPlugin发送AgentToolRegisterRequest
+        -> 调用ToolPlugin挂载空AgentResourceMap
+    Base Driver执行IMPORT
+        -> MclPlugin发送AgentResourceRegisterRequest
         -> BuiltinToolPlugin按资源类型路由到具体Provider
-        -> 具体工具Plugin验证可见资源
-        -> register_agent_tool
-        -> AgentToolMap为当前Agent分配tool_name
-        -> AgentToolRegisterResponse
-        -> AgentPlugin决定是否注入AgentDynamicVisibility
+        -> 具体工具Plugin验证资源并返回候选ResourceMapEntry
+        -> AgentResourceRegisterResponse
+        -> MclPlugin在IMPORT事务中调用register_agent_resource并提交导入
 
 调用：
     AgentPlugin -> ToolCallEvent { turn_id, agent, call }
-    ToolPlugin -> AgentToolMap.get_by_name(call.tool_name)
+    ToolPlugin -> AgentResourceMap.get_by_name(call.tool_name)
                -> PendingToolCalls.add_pending
                -> ToolCallRequest
     具体工具Plugin -> ToolCallResponse
     ToolPlugin -> PendingToolCalls.remove
                -> AgentMessage { Message::Tool { resource_id, tool_call_id, content } }
-               -> 本轮Pending为空时发送ToolTurnCompleted
+    AgentPlugin -> MCL追加Tool消息并删除对应pending_tool
+                -> pending_tool为空时发起下一次推理
 ```
 
 ## 边界
 
 ```text
-AgentToolMap是Agent Entity上的Component，tool_name只在该Component内唯一；不建立全局tool_name索引。
-ToolPlugin拥有AgentToolMap和PendingToolCalls，负责映射、路由、调用关联、响应整理和批次完成判断。
-ToolPlugin定义AgentToolRegisterRequest和AgentToolRegisterResponse作为中立注册协议，但不消费注册请求、不选择资源Provider。
+AgentResourceMap是Agent Entity上的Component，resource_name和alias只在该Component内唯一；不建立全局名称索引。
+ToolPlugin拥有AgentResourceMap和PendingToolCalls，负责映射、路由、调用关联和响应整理；不判断MCL语义上的批次完成。
+ToolPlugin定义AgentResourceRegisterRequest和AgentResourceRegisterResponse作为中立注册协议，但不消费注册请求、不选择资源Provider。
 Margatroid应用组合必须安装一个注册路由消费者；当前由BuiltinToolPlugin消费全部请求并保证每个请求恰好一个响应。
 ToolPlugin不读取Skill或Workflow文件，不解析具体参数，不执行工具，不检查Agent可见性。
-AgentToolMap注册成功后长期保留；动态移除可见性不删除映射，也不回收next_index或tool_name。
-同一资源重新可见时复用既有ToolMap；ToolPlugin仍不决定该资源何时可见。
-具体工具Plugin负责资源验证、ToolTemplate构造和执行，只返回ToolCallResponse，不自行构造AgentMessage。
+AgentResourceMap注册成功后长期保留；从TOOL数组移除可见性不删除映射。
+同一resource_id和alias重新导入时复用既有ResourceMapEntry；ToolPlugin仍不决定资源何时进入TOOL数组。
+具体工具Plugin负责资源验证、候选ResourceMapEntry构造和执行，不写AgentResourceMap，不自行构造AgentMessage。
 AgentStatus不保存pending tool；get_by_turn只属于PendingToolCalls。
 ```

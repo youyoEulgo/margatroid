@@ -1164,7 +1164,7 @@ fn validate_messages(messages: &[Message]) -> Result<(), InferenceError> {
     let mut total_bytes = 0usize;
     for message in messages {
         let size = match message {
-            Message::System { content } | Message::User { content, .. } => content.len(),
+            Message::System { content } | Message::User { content } => content.len(),
             Message::Assistant {
                 reasoning,
                 content,
@@ -1898,20 +1898,29 @@ struct DeepSeekThinking {
 fn openai_message(message: &Message) -> serde_json::Value {
     match message {
         Message::System { content } => serde_json::json!({"role":"system", "content":content}),
-        Message::User { content, .. } => serde_json::json!({"role":"user", "content":content}),
+        Message::User { content } => serde_json::json!({"role":"user", "content":content}),
         Message::Assistant {
             content,
             tool_calls,
             ..
-        } => serde_json::json!({
-            "role": "assistant",
-            "content": content,
-            "tool_calls": tool_calls.iter().map(|call| serde_json::json!({
-                "id": call.id,
-                "type": "function",
-                "function": {"name": call.tool_name, "arguments": call.arguments}
-            })).collect::<Vec<_>>(),
-        }),
+        } => {
+            let mut value = serde_json::json!({"role": "assistant", "content": content});
+            if !tool_calls.is_empty() {
+                value["tool_calls"] = serde_json::Value::Array(
+                    tool_calls
+                        .iter()
+                        .map(|call| {
+                            serde_json::json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": {"name": call.tool_name, "arguments": call.arguments}
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            value
+        }
         Message::Tool {
             tool_call_id,
             content,
@@ -1931,15 +1940,21 @@ fn deepseek_message(message: &Message) -> serde_json::Value {
             content,
             tool_calls,
         } => {
-            let mut message = serde_json::json!({
-                "role": "assistant",
-                "content": content,
-                "tool_calls": tool_calls.iter().map(|call| serde_json::json!({
-                    "id": call.id,
-                    "type": "function",
-                    "function": {"name": call.tool_name, "arguments": call.arguments}
-                })).collect::<Vec<_>>(),
-            });
+            let mut message = serde_json::json!({"role": "assistant", "content": content});
+            if !tool_calls.is_empty() {
+                message["tool_calls"] = serde_json::Value::Array(
+                    tool_calls
+                        .iter()
+                        .map(|call| {
+                            serde_json::json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": {"name": call.tool_name, "arguments": call.arguments}
+                            })
+                        })
+                        .collect(),
+                );
+            }
             if !tool_calls.is_empty() {
                 if let Some(reasoning) = reasoning.as_ref().filter(|value| !value.is_empty()) {
                     message["reasoning_content"] = serde_json::Value::String(reasoning.clone());
@@ -2469,7 +2484,6 @@ data: [DONE]
             &InferenceParameters::default(),
             &[Message::User {
                 content: "hello".into(),
-                tool_calls: Vec::new(),
             }],
             &tools,
         ));
@@ -2511,7 +2525,33 @@ data: [DONE]
         assert_eq!(value["stream_options"]["include_usage"], true);
         assert_eq!(value["reasoning_effort"], "high");
         assert!(value["messages"][0].get("reasoning_content").is_none());
+        assert!(value["messages"][0].get("tool_calls").is_none());
         assert_eq!(value["messages"][1]["reasoning_content"], "tool reasoning");
+        assert_eq!(
+            value["messages"][1]["tool_calls"].as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn openai_assistant_omits_empty_tool_calls() {
+        let without_tools = openai_message(&Message::Assistant {
+            reasoning: None,
+            content: Some("answer".into()),
+            tool_calls: Vec::new(),
+        });
+        let with_tools = openai_message(&Message::Assistant {
+            reasoning: None,
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                tool_name: "tool0".into(),
+                arguments: "{}".into(),
+            }],
+        });
+
+        assert!(without_tools.get("tool_calls").is_none());
+        assert_eq!(with_tools["tool_calls"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -2569,7 +2609,6 @@ api_type = "openai"
             agent_id: ResourceId::parse("agent:test/agent0").unwrap(),
             messages: vec![Message::User {
                 content: "hello".into(),
-                tool_calls: Vec::new(),
             }],
             tools: Vec::new(),
         });
@@ -2594,7 +2633,6 @@ api_type = "openai"
             agent_id: ResourceId::parse("agent:test/agent0").unwrap(),
             messages: vec![Message::User {
                 content: "summarize".into(),
-                tool_calls: Vec::new(),
             }],
         });
         app.tick();

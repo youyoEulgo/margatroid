@@ -12,15 +12,17 @@ SkillPlugin：Skill注册与执行Plugin，公开结构体
 
 SkillRegisterRequest：Agent Skill注册请求，公开事件
     id: String--Workspace注册子请求ID
-    agent: Entity--目标Agent Entity，必须已挂载AgentToolMap和AgentToolEnvironment
+    agent: Entity--目标Agent Entity，必须已挂载AgentResourceMap和AgentToolEnvironment
     resource_id: ResourceId--待注册完整Skill ID
+    alias: Option<String>--MCL IMPORT可选别名
     impl Event for SkillRegisterRequest
 
 SkillRegisterResponse：Agent Skill注册结果，公开事件
     id: String--原注册子请求ID
     agent: Entity
     resource_id: ResourceId
-    result: Result<(), ToolError>
+    alias: Option<String>
+    result: Result<ResourceMapEntry, ToolError>
     impl Event for SkillRegisterResponse
 
 SkillError：Skill配置错误，公开结构体
@@ -52,8 +54,8 @@ skill_register_system(world: &mut World)
         验证resource_id使用type=skill及受支持tag
         从Agent Entity读取AgentToolEnvironment
         按项目、镜像、主目录顺序精确查找SKILL.md
-        解析顶部+++包围的TOML元信息并构造Provider无关ToolTemplate；description来自frontmatter，不把Skill正文放入模板
-        调用ToolPlugin注册接口写入当前Agent的AgentToolMap
+        resource_name使用alias或完整resource_id字符串；解析顶部+++包围的TOML元信息并构造Provider无关ToolTemplate；description来自frontmatter，不把Skill正文放入模板
+        构造候选ResourceMapEntry并通过SkillRegisterResponse返回；不写AgentResourceMap
         tool_id固定为tool:builtin/skill-loader:latest，resource_id保持具体Skill ID
         成功或失败都发送SkillRegisterResponse
 
@@ -81,8 +83,8 @@ read_skill_document(path: &Path) -> Result<SkillDocument, ToolError>
 Workspace启动：
     BuiltinToolPlugin -> SkillRegisterRequest
     SkillPlugin -> 验证并读取元信息
-                -> register_agent_tool(agent, skill-loader, resource_id, template)
-                -> SkillRegisterResponse
+                -> SkillRegisterResponse { candidate ResourceMapEntry }
+    MclPlugin -> register_agent_resource并提交IMPORT事务
 
 每次调用：
     ToolPlugin -> ToolCallRequest { tool_id=skill-loader, resource_id=具体Skill }
@@ -95,7 +97,7 @@ Workspace启动：
 
 ```text
 SkillPlugin不读取Agent可见性，不保存每个Skill的全局注册项，不维护pending调用，不自行构造AgentMessage。
-Skill正文每次调用重新读取，保证loading skill每轮得到当前内容；正文不进入AgentToolMap的ToolTemplate。
+Skill正文每次调用重新读取，保证loading skill每轮得到当前内容；正文不进入AgentResourceMap的ToolTemplate。
 注册过程不伪造ToolCall，不保存test_arguments，不执行有副作用的测试操作。
 SkillPlugin只负责Skill资源验证、模板构造、SKILL.md读取和ToolCallResponse。
 ```

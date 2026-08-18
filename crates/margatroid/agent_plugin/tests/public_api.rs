@@ -1,29 +1,51 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use agent_plugin::{
     AgentContext, AgentContextCompactRequest, AgentCreateRequest, AgentCreateResult, AgentCreated,
-    AgentDefaultVisibility, AgentDynamicVisibility, AgentPlugin, AgentTokenUsage, AgentWorkspaceId,
-    LoadAgentSkill, UnloadAgentSkill, UnloadAllAgentSkills, WorldAgentExt,
+    AgentPlugin, AgentTokenUsage, AgentWorkspaceId, WorldAgentExt,
 };
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::App;
 use margatroid_types::{ResourceId, TokenUsage};
+use mcl_plugin::{compile_mcl, AgentMcl, MclCompileRequest, MclPlugin, MclSource};
 use tool_plugin::ToolPlugin;
+
+fn base_mcl() -> std::sync::Arc<mcl_plugin::MclProgram> {
+    compile_mcl(MclCompileRequest {
+        root: MclSource::new(
+            ResourceId::parse("mcl:local/test:latest").unwrap(),
+            r#"base context test {
+block conversation: context persistent;
+view messages: messages { select entry from conversation; }
+view tools: tools { select resource from capabilities.dynamic; }
+request inference { system = agent.system; messages = messages; tools = tools; }
+on agent.created { restore capabilities.dynamic from capabilities.default; }
+}"#,
+            PathBuf::from("/test/main.mcl"),
+        ),
+        dependencies: BTreeMap::new(),
+    })
+    .unwrap()
+}
 
 #[test]
 fn documented_public_api_creates_an_agent() {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(ToolPlugin::default())
+        .add_plugin(MclPlugin::open(std::env::temp_dir()).unwrap())
         .add_plugin(AgentPlugin::default());
     let workspace = app.world_mut().spawn();
     app.world().send_event(AgentCreateRequest {
         id: "agent-1".into(),
         agent_id: ResourceId::parse("agent:test/agent0").unwrap(),
         workspace_id: workspace,
+        base_mcl: base_mcl(),
         system_prompt: "You are concise.".into(),
         messages: Vec::new(),
         tool_context: Vec::new(),
+        ordered_messages: Vec::new(),
         token_usage: TokenUsage {
             input_tokens: 200,
             output_tokens: 40,
@@ -63,9 +85,10 @@ fn documented_public_api_creates_an_agent() {
     );
     assert!(app
         .world()
-        .get_component::<AgentDefaultVisibility>(agent)
+        .get_component::<AgentMcl>(agent)
         .unwrap()
-        .resources()
+        .capabilities()
+        .default_resources()
         .is_empty());
     let usage = app.world().get_component::<AgentTokenUsage>(agent).unwrap();
     assert_eq!(usage.total_input_tokens(), 200);
@@ -74,10 +97,12 @@ fn documented_public_api_creates_an_agent() {
     assert_eq!(usage.cache_hit_rate(), 0.75);
     assert!(app
         .world()
-        .get_component::<AgentDynamicVisibility>(agent)
+        .get_component::<AgentMcl>(agent)
         .unwrap()
-        .resources()
-        .is_empty());
+        .capabilities()
+        .visible_resources()
+        .next()
+        .is_none());
 }
 
 #[test]
@@ -85,6 +110,7 @@ fn duplicate_agent_resource_ids_are_rejected() {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(ToolPlugin::default())
+        .add_plugin(MclPlugin::open(std::env::temp_dir()).unwrap())
         .add_plugin(AgentPlugin::default());
     let workspace = app.world_mut().spawn();
     let agent_id = ResourceId::parse("agent:test/agent0").unwrap();
@@ -94,9 +120,11 @@ fn duplicate_agent_resource_ids_are_rejected() {
             id: request_id.into(),
             agent_id: agent_id.clone(),
             workspace_id: workspace,
+            base_mcl: base_mcl(),
             system_prompt: String::new(),
             messages: Vec::new(),
             tool_context: Vec::new(),
+            ordered_messages: Vec::new(),
             token_usage: margatroid_types::TokenUsage::default(),
             default_visibility: BTreeSet::new(),
         });
@@ -116,34 +144,6 @@ fn duplicate_agent_resource_ids_are_rejected() {
         .collect::<Vec<_>>();
     assert_eq!(successful.len(), 1);
     assert_eq!(app.world().agent(&agent_id), Some(successful[0]));
-}
-
-#[test]
-fn loading_skill_events_are_public() {
-    fn assert_event<EventType: core_plugin::Event>() {}
-    assert_event::<LoadAgentSkill>();
-    assert_event::<UnloadAgentSkill>();
-    assert_event::<UnloadAllAgentSkills>();
-
-    let mut app = App::new();
-    let agent = app.world_mut().spawn();
-    let resource_id = ResourceId::parse("skill:local/review:latest").unwrap();
-    let load = LoadAgentSkill {
-        id: "load-1".into(),
-        agent,
-        resource_id: resource_id.clone(),
-    };
-    let unload = UnloadAgentSkill {
-        id: "unload-1".into(),
-        agent,
-        resource_id,
-    };
-    let unload_all = UnloadAllAgentSkills {
-        id: "unload-all-1".into(),
-        agent,
-    };
-    assert_eq!(load.agent, unload.agent);
-    assert_eq!(load.agent, unload_all.agent);
 }
 
 #[test]

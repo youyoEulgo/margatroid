@@ -1,15 +1,16 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use agent_plugin::{AgentDynamicVisibility, AgentIdentity, AgentTokenUsage, WorldAgentExt};
+use agent_plugin::{AgentIdentity, AgentTokenUsage, WorldAgentExt};
 use core_plugin::{Entity, World};
 use log_plugin::{TracingField, TracingRecord};
 use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentMessage, AgentSkillRouteAction,
-    AgentVisibilityRouteAction, Message, ResourceId, RouteAgentMessage, RouteAgentSkill,
-    RouteAgentTurnAbort, RouteAgentVisibility, StartWorkspace, ToolCall, WorkspaceAgentDefinition,
+    AgentFailure, AgentFailureKind, AgentMessage, AgentVisibilityRouteAction, Message, ResourceId,
+    RouteAgentMessage, RouteAgentTurnAbort, RouteAgentVisibility, RouteAgentWorkflowAttach,
+    RouteAgentWorkflowDetach, StartWorkspace, ToolCall, WorkspaceAgentDefinition,
     WorkspaceDefinition, WorkspaceReference,
 };
+use mcl_plugin::AgentMcl;
 use memory_plugin::{AgentMemory, HistoryMessage};
 use serde::{Deserialize, Serialize};
 use server_plugin::{RegisterConnection, WebSocketConnectionId};
@@ -82,21 +83,6 @@ pub enum ClientMessage {
         id: String,
         message: RouteAgentTargetDto,
     },
-    #[serde(rename = "agent.skill.load")]
-    AgentSkillLoad {
-        id: String,
-        message: RouteAgentSkillDto,
-    },
-    #[serde(rename = "agent.skill.unload")]
-    AgentSkillUnload {
-        id: String,
-        message: RouteAgentSkillDto,
-    },
-    #[serde(rename = "agent.skill.unload_all")]
-    AgentSkillUnloadAll {
-        id: String,
-        message: RouteAgentSkillDto,
-    },
     #[serde(rename = "agent.visibility.inject")]
     AgentVisibilityInject {
         id: String,
@@ -106,6 +92,16 @@ pub enum ClientMessage {
     AgentVisibilityRemove {
         id: String,
         message: RouteAgentVisibilityDto,
+    },
+    #[serde(rename = "agent.workflow.attach")]
+    AgentWorkflowAttach {
+        id: String,
+        message: RouteAgentWorkflowAttachDto,
+    },
+    #[serde(rename = "agent.workflow.detach")]
+    AgentWorkflowDetach {
+        id: String,
+        message: RouteAgentWorkflowDetachDto,
     },
 }
 
@@ -193,6 +189,7 @@ impl FromDomain<TracingRecord> for LogRecordDto {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserMessageDto {
     pub content: String,
 }
@@ -201,7 +198,6 @@ impl IntoDomain<Message> for UserMessageDto {
     fn into_domain(self, (): ()) -> Result<Message, ProtocolError> {
         Ok(Message::User {
             content: self.content,
-            tool_calls: Vec::new(),
         })
     }
 }
@@ -237,7 +233,6 @@ impl IntoDomain<ToolCall> for ToolCallDto {
 pub enum MessageDto {
     User {
         content: String,
-        tool_calls: Vec<ToolCallDto>,
     },
     Assistant {
         #[serde(default)]
@@ -255,15 +250,8 @@ pub enum MessageDto {
 impl FromDomain<&Message> for MessageDto {
     fn from_domain(message: &Message, (): ()) -> Result<Self, ProtocolError> {
         match message {
-            Message::User {
-                content,
-                tool_calls,
-            } => Ok(Self::User {
+            Message::User { content } => Ok(Self::User {
                 content: content.clone(),
-                tool_calls: tool_calls
-                    .iter()
-                    .map(|call| call.into_dto(()))
-                    .collect::<Result<Vec<_>, _>>()?,
             }),
             Message::Assistant {
                 reasoning,
@@ -345,8 +333,6 @@ pub struct RouteAgentMessageDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: Option<ResourceIdDto>,
     pub message: UserMessageDto,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<ToolCallDto>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,18 +342,24 @@ pub struct RouteAgentTargetDto {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RouteAgentSkillDto {
-    pub workspace: WorkspaceReferenceDto,
-    pub agent: Option<ResourceIdDto>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource_id: Option<ResourceIdDto>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteAgentVisibilityDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: Option<ResourceIdDto>,
     pub resource_id: ResourceIdDto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteAgentWorkflowAttachDto {
+    pub workspace: WorkspaceReferenceDto,
+    pub agent: Option<ResourceIdDto>,
+    pub resource_id: ResourceIdDto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteAgentWorkflowDetachDto {
+    pub workspace: WorkspaceReferenceDto,
+    pub agent: Option<ResourceIdDto>,
+    pub instance_id: String,
 }
 
 impl IntoDomain<RouteAgentVisibility, (String, AgentVisibilityRouteAction)>
@@ -387,55 +379,42 @@ impl IntoDomain<RouteAgentVisibility, (String, AgentVisibilityRouteAction)>
     }
 }
 
-impl RouteAgentSkillDto {
-    fn into_domain(
-        self,
-        id: String,
-        action: AgentSkillRouteAction,
-    ) -> Result<RouteAgentSkill, ProtocolError> {
-        let resource_id = self
-            .resource_id
-            .map(|resource| resource.into_domain(()))
-            .transpose()?;
-        if !matches!(action, AgentSkillRouteAction::UnloadAll) && resource_id.is_none() {
-            return Err(ProtocolError::new(
-                ProtocolErrorKind::InvalidRequest,
-                "skill resource_id is required",
-            ));
-        }
-        Ok(RouteAgentSkill {
+impl IntoDomain<RouteAgentWorkflowAttach, String> for RouteAgentWorkflowAttachDto {
+    fn into_domain(self, id: String) -> Result<RouteAgentWorkflowAttach, ProtocolError> {
+        Ok(RouteAgentWorkflowAttach {
             id,
             workspace: self.workspace.into_domain(())?,
             agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
-            resource_id,
-            action,
+            resource_id: self.resource_id.into_domain(())?,
         })
     }
 }
 
-impl IntoDomain<RouteAgentSkill, (String, AgentSkillRouteAction)> for RouteAgentSkillDto {
-    fn into_domain(
-        self,
-        (id, action): (String, AgentSkillRouteAction),
-    ) -> Result<RouteAgentSkill, ProtocolError> {
-        RouteAgentSkillDto::into_domain(self, id, action)
+impl IntoDomain<RouteAgentWorkflowDetach, String> for RouteAgentWorkflowDetachDto {
+    fn into_domain(self, id: String) -> Result<RouteAgentWorkflowDetach, ProtocolError> {
+        if self.instance_id.is_empty() || self.instance_id.chars().any(char::is_control) {
+            return Err(ProtocolError::new(
+                ProtocolErrorKind::InvalidRequest,
+                "Workflow instance ID is invalid",
+            ));
+        }
+        Ok(RouteAgentWorkflowDetach {
+            id,
+            workspace: self.workspace.into_domain(())?,
+            agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
+            instance_id: self.instance_id,
+        })
     }
 }
 
 impl IntoDomain<RouteAgentMessage, String> for RouteAgentMessageDto {
     fn into_domain(self, id: String) -> Result<RouteAgentMessage, ProtocolError> {
-        let tool_calls = self
-            .tool_calls
-            .into_iter()
-            .map(|call| call.into_domain(()))
-            .collect::<Result<_, _>>()?;
         Ok(RouteAgentMessage {
             id,
             workspace: self.workspace.into_domain(())?,
             agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
             message: Message::User {
                 content: self.message.content,
-                tool_calls,
             },
         })
     }
@@ -495,43 +474,6 @@ impl ClientMessage {
                 message: UserMessageDto {
                     content: content.into(),
                 },
-                tool_calls: Vec::new(),
-            },
-        }
-    }
-
-    pub fn agent_message_with_tool_calls(
-        id: impl Into<String>,
-        workspace: &WorkspaceReferenceDto,
-        agent: Option<ResourceIdDto>,
-        content: impl Into<String>,
-        tool_calls: Vec<ToolCallDto>,
-    ) -> Self {
-        Self::AgentMessage {
-            id: id.into(),
-            message: RouteAgentMessageDto {
-                workspace: workspace.clone(),
-                agent,
-                message: UserMessageDto {
-                    content: content.into(),
-                },
-                tool_calls,
-            },
-        }
-    }
-
-    pub fn agent_skill_load(
-        id: impl Into<String>,
-        workspace: &WorkspaceReferenceDto,
-        agent: Option<ResourceIdDto>,
-        resource_id: ResourceIdDto,
-    ) -> Self {
-        Self::AgentSkillLoad {
-            id: id.into(),
-            message: RouteAgentSkillDto {
-                workspace: workspace.clone(),
-                agent,
-                resource_id: Some(resource_id),
             },
         }
     }
@@ -652,7 +594,7 @@ pub struct AgentStateDto {
     pub default_resources: Vec<ResourceIdDto>,
     pub visible_resources: Vec<ResourceIdDto>,
     #[serde(default)]
-    pub loading_skills: Vec<ResourceIdDto>,
+    pub mcl: Option<AgentMclStateDto>,
     #[serde(default)]
     pub total_input_tokens: u64,
     #[serde(default)]
@@ -661,6 +603,22 @@ pub struct AgentStateDto {
     pub total_cache_hit_tokens: u64,
     #[serde(default)]
     pub cache_hit_rate: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMclStateDto {
+    pub base: ResourceIdDto,
+    pub base_program_hash: String,
+    pub plan_hash: String,
+    pub plan_generation: u64,
+    pub workflows: Vec<WorkflowMclStateDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowMclStateDto {
+    pub instance_id: String,
+    pub resource_id: ResourceIdDto,
+    pub program_hash: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -762,48 +720,45 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
         (agent, _name, workspace): (Entity, &str, &WorkspaceInfoDto),
         world: &World,
     ) -> Result<Self, ProtocolError> {
-        let visibility = world
-            .get_component::<AgentDynamicVisibility>(agent)
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorKind::AgentNotFound,
-                    "Agent dynamic visibility is missing",
-                )
-            })?;
-        let default_resources = world
-            .get_component::<agent_plugin::AgentDefaultVisibility>(agent)
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorKind::AgentNotFound,
-                    "Agent default visibility is missing",
-                )
-            })?
-            .resources()
+        let mcl = world.get_component::<AgentMcl>(agent).ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorKind::AgentNotFound,
+                "Agent MCL state is missing",
+            )
+        })?;
+        let default_resources = mcl
+            .capabilities()
+            .default_resources()
             .iter()
             .map(|resource| resource.into_dto(()))
             .collect::<Result<Vec<_>, _>>()?;
-        let visible_resources = visibility
-            .resources()
-            .iter()
+        let visible_resources = mcl
+            .capabilities()
+            .visible_resources()
             .map(|resource| resource.into_dto(()))
             .collect::<Result<Vec<_>, _>>()?;
+        let mcl = AgentMclStateDto {
+            base: mcl.base().resource_id().into_dto(())?,
+            base_program_hash: mcl.base().plan_hash().to_string(),
+            plan_hash: mcl.plan_hash().to_string(),
+            plan_generation: mcl.plan_generation(),
+            workflows: mcl
+                .workflows()
+                .map(|(instance_id, workflow)| {
+                    Ok(WorkflowMclStateDto {
+                        instance_id: instance_id.to_string(),
+                        resource_id: workflow.resource_id().into_dto(())?,
+                        program_hash: workflow.program().plan_hash().to_string(),
+                    })
+                })
+                .collect::<Result<_, ProtocolError>>()?,
+        };
         let identity = world.get_component::<AgentIdentity>(agent).ok_or_else(|| {
             ProtocolError::new(
                 ProtocolErrorKind::AgentNotFound,
                 "Agent identity is missing",
             )
         })?;
-        let loading_skills = world
-            .agent_loading_skills(agent)
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorKind::AgentNotFound,
-                    "Agent loading skills are missing",
-                )
-            })?
-            .iter()
-            .map(|resource| resource.into_dto(()))
-            .collect::<Result<Vec<_>, _>>()?;
         let working = world.agent_is_working(agent).ok_or_else(|| {
             ProtocolError::new(
                 ProtocolErrorKind::AgentNotFound,
@@ -826,7 +781,7 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
             error: None,
             default_resources,
             visible_resources,
-            loading_skills,
+            mcl: Some(mcl),
             total_input_tokens: token_usage.total_input_tokens(),
             total_output_tokens: token_usage.total_output_tokens(),
             total_cache_hit_tokens: token_usage.total_cache_hit_tokens(),
@@ -893,7 +848,7 @@ impl FromDomain<(), &World> for BackendStateDto {
                         error: None,
                         default_resources: Vec::new(),
                         visible_resources: Vec::new(),
-                        loading_skills: Vec::new(),
+                        mcl: None,
                         total_input_tokens: 0,
                         total_output_tokens: 0,
                         total_cache_hit_tokens: 0,
@@ -907,7 +862,7 @@ impl FromDomain<(), &World> for BackendStateDto {
                         error: Some(error.to_string()),
                         default_resources: Vec::new(),
                         visible_resources: Vec::new(),
-                        loading_skills: Vec::new(),
+                        mcl: None,
                         total_input_tokens: 0,
                         total_output_tokens: 0,
                         total_cache_hit_tokens: 0,
@@ -1183,16 +1138,35 @@ impl std::error::Error for ProtocolError {}
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-    use std::path::Path;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
 
     use agent_plugin::{AgentCreateRequest, AgentCreateResult, AgentPlugin, WorldAgentExt};
     use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
     use core_plugin::App;
+    use mcl_plugin::{compile_mcl, MclCompileRequest, MclPlugin, MclSource};
     use serde_json::json;
     use tool_plugin::{register_agent_tool, ToolPlugin, ToolTemplate};
 
     use super::*;
+
+    fn base_mcl() -> std::sync::Arc<mcl_plugin::MclProgram> {
+        compile_mcl(MclCompileRequest {
+            root: MclSource::new(
+                ResourceId::parse("mcl:local/test:latest").unwrap(),
+                r#"base context test {
+block conversation: context persistent;
+view messages: messages { select entry from conversation; }
+view tools: tools { select resource from capabilities.dynamic; }
+request inference { system = agent.system; messages = messages; tools = tools; }
+on agent.created { restore capabilities.dynamic from capabilities.default; }
+}"#,
+                PathBuf::from("/test/main.mcl"),
+            ),
+            dependencies: BTreeMap::new(),
+        })
+        .unwrap()
+    }
 
     fn definition() -> WorkspaceDefinition {
         WorkspaceDefinition {
@@ -1358,33 +1332,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_message_preserves_preselected_tool_calls() {
-        let workspace = workspace_reference();
-        let request = ClientMessage::agent_message_with_tool_calls(
-            "message-1",
-            &workspace,
-            None,
-            "Load context.",
-            vec![ToolCallDto {
-                id: "call-1".into(),
-                tool_name: "skill0_context".into(),
-                arguments: "{}".into(),
-            }],
-        );
-        let ClientMessage::AgentMessage { id, message } = request else {
-            panic!("agent message constructor returned a different request type");
-        };
-        let routed = message.into_domain(id).unwrap();
-
-        let Message::User { tool_calls, .. } = routed.message else {
-            panic!("route did not contain a user message");
-        };
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].id, "call-1");
-        assert_eq!(tool_calls[0].tool_name, "skill0_context");
-    }
-
-    #[test]
     fn omitted_agent_is_encoded_for_manager_fallback() {
         let workspace = workspace_reference();
         let value = serde_json::to_value(ClientMessage::agent_message(
@@ -1459,7 +1406,7 @@ mod tests {
                     error: None,
                     default_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
                     visible_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
-                    loading_skills: vec![ResourceIdDto("skill:local/review:latest".into())],
+                    mcl: None,
                     total_input_tokens: 1_000,
                     total_output_tokens: 200,
                     total_cache_hit_tokens: 750,
@@ -1473,7 +1420,6 @@ mod tests {
                         turn_id: "turn-1".into(),
                         message: MessageDto::User {
                             content: "hello".into(),
-                            tool_calls: Vec::new(),
                         },
                         created_at_ms: 42,
                     }],
@@ -1502,10 +1448,6 @@ mod tests {
             "skill:local/review:latest"
         );
         assert_eq!(
-            value["state"]["agents"][0]["loading_skills"][0],
-            "skill:local/review:latest"
-        );
-        assert_eq!(
             value["state"]["histories"][0]["agent"],
             "agent:demo/coder:latest"
         );
@@ -1520,6 +1462,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
             .add_plugin(ToolPlugin::default())
+            .add_plugin(MclPlugin::open(std::env::temp_dir()).unwrap())
             .add_plugin(AgentPlugin::default());
         let workspace = app.world_mut().spawn();
         let skill = ResourceId::parse("skill:local/review").unwrap();
@@ -1527,9 +1470,11 @@ mod tests {
             id: "create-1".into(),
             agent_id: ResourceId::parse("agent:demo/coder").unwrap(),
             workspace_id: workspace,
+            base_mcl: base_mcl(),
             system_prompt: "system".into(),
             messages: Vec::new(),
             tool_context: Vec::new(),
+            ordered_messages: Vec::new(),
             token_usage: margatroid_types::TokenUsage {
                 input_tokens: 400,
                 output_tokens: 100,
@@ -1570,7 +1515,6 @@ mod tests {
         assert!(!state.working);
         assert_eq!(state.visible_resources.len(), 1);
         assert_eq!(state.default_resources.len(), 1);
-        assert!(state.loading_skills.is_empty());
         assert_eq!(state.total_input_tokens, 400);
         assert_eq!(state.total_output_tokens, 100);
         assert_eq!(state.total_cache_hit_tokens, 250);

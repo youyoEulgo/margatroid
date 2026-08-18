@@ -3,8 +3,8 @@
 ## 统一资源身份约定
 
 ```text
-Compose在输入边界解析统一资源ID
-image、resources和disable_resources进入WorkspaceDefinition前都转换为ResourceId
+Compose在输入边界解析AgentImage资源ID
+image进入WorkspaceDefinition前转换为ResourceId
 省略tag时补latest；编译结果不保留旧的provider + scope/name身份结构
 Compose只验证语法，不解析资源正文；运行时Provider负责按完整ResourceId查找资源
 ```
@@ -72,17 +72,7 @@ RawAgent：Agent原始文档，私有结构体--等待编译为WorkspaceAgentDef
     name: Option<String>--列表中的Agent名称；映射形式由键赋值
     tag: Option<String>--Agent实例标签；省略时为latest
     image: String--AgentImage引用文本
-    resources: Vec<RawResource>--额外可见资源
-    disable_resources: Vec<RawResource>--禁用资源
     memory_path: Option<PathBuf>--Memory SQLite路径
-
-RawResource：资源原始引用，私有枚举--接受完整ResourceId或type:scope/name简写
-    Structured(RawStructuredResource)
-    Shorthand(String)
-
-RawStructuredResource：结构化资源引用，私有结构体--保存资源类型和逻辑ID
-    resource_type: String--资源类型
-    name: String--scope/name[:tag]逻辑名称
 ```
 
 ## 函数
@@ -103,9 +93,6 @@ compile_str(source: &str, workspace_file: impl AsRef<Path>) -> Result<WorkspaceD
 build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefinition, ComposeError>
     构造Workspace定义：私有函数，将原始文档转换为margatroid_types值类型
     行为：解析项目根，按name构造workspace:local/<name>:latest资源ID，按Workspace名称、Agent名称和显式tag构造完整Agent资源ID，按配置顺序构造所有Agent，默认manager为第一个Agent，检查唯一性和manager存在
-
-parse_resource(raw: RawResource) -> Result<ResourceId, ComposeError>
-    解析资源：私有函数，构造ResourceId；结构化引用直接读取，简写按type:scope/name[:tag]拆分，缺少tag时补latest
 
 validate_logical_name(value: &str, kind: &str) -> Result<(), ComposeError>
     校验逻辑名称：私有函数，执行WorkspacePlugin相同的单路径段、长度和控制字符约束
@@ -140,7 +127,6 @@ build_definition
        -> 映射形式把键写入name，列表形式要求name字段
        -> 校验Agent名称
        -> 构造type=image的ResourceId，失败返回InvalidImageReference
-       -> 将resources和disable_resources逐个构造成ResourceId
        -> memory_path省略时保持None，否则相对project_root解析为绝对路径
     -> 空Agent列表失败
     -> 重复Agent名称失败

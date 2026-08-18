@@ -11,6 +11,7 @@ builtin_tool_plugin = { path = "../builtin_tool_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
 inference_plugin = { path = "../inference_plugin" }
 margatroid_types = { path = "../types" }
+mcl_plugin = { path = "../mcl_plugin" }
 memory_plugin = { path = "../memory_plugin" }
 tool_plugin = { path = "../tool_plugin" }
 tracing = { workspace = true }

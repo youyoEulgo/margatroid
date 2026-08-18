@@ -21,4 +21,5 @@ tool_plugin = { path = "../../tool_plugin" }
 tracing = { workspace = true }
 
 [dev-dependencies]
+mcl_plugin = { path = "../../mcl_plugin" }
 tempfile = "3"

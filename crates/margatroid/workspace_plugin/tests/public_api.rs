@@ -12,6 +12,7 @@ use inference_plugin::{AgentInferenceSnapshot, InferencePlugin, WorkspaceModelRo
 use margatroid_types::{
     ResourceId, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
 };
+use mcl_plugin::MclPlugin;
 use memory_plugin::{AgentMemory, MemoryPlugin};
 use tempfile::tempdir;
 use tool_plugin::{AgentToolEnvironment, ToolPlugin};
@@ -33,16 +34,16 @@ fn unique_directory(prefix: &str) -> PathBuf {
 
 fn write_image(library: &Path, model: &str) {
     let image = library.join("local/coder/latest");
-    fs::create_dir_all(image.join("skills/local/review/latest")).unwrap();
+    fs::create_dir_all(&image).unwrap();
     fs::write(
         image.join("agent.toml"),
-        format!("schema_version = 1\n[inference]\nmodel = \"{model}\"\n"),
+        format!("schema_version = 1\n[inference]\nmodel = \"{model}\"\n\n[[dependencies]]\nid = \"skill:local/review:latest\"\n"),
     )
     .unwrap();
     fs::write(image.join("SOUL.md"), "You are a test agent.\n").unwrap();
     fs::write(
-        image.join("skills/local/review/latest/SKILL.md"),
-        "+++\nname = \"review\"\ndescription = \"Review the current project.\"\n+++\n\nReview the current project.\n",
+        image.join("base.lua"),
+        "handle(\"IMPORT skill:local/review:latest AS review\")\nhandle(\"INJECT review TO tool_default FROM tool\")\nhandle(\"INJECT SELECT tool_default FROM tool COVER tool_dynamic FROM tool\")\n",
     )
     .unwrap();
 }
@@ -108,6 +109,7 @@ fn app(library: &Path, routes: &Path) -> App {
         .add_plugin(ToolPlugin::default())
         .add_plugin(BuiltinToolPlugin::open(library).unwrap())
         .add_plugin(MemoryPlugin::default())
+        .add_plugin(MclPlugin::open(library).unwrap())
         .add_plugin(AgentPlugin::default())
         .add_plugin(WorkspacePlugin::open(library).unwrap());
     app
@@ -341,10 +343,12 @@ fn missing_visible_skill_does_not_fail_workspace_start() {
     assert!(app.world().workspaces().contains(&workspace));
     assert!(app
         .world()
-        .get_component::<agent_plugin::AgentDynamicVisibility>(manager)
+        .get_component::<mcl_plugin::AgentMcl>(manager)
         .unwrap()
-        .resources()
-        .is_empty());
+        .capabilities()
+        .visible_resources()
+        .next()
+        .is_none());
     let _ = fs::remove_dir_all(library);
 }
 

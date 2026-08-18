@@ -24,7 +24,6 @@ fn documented_public_api_composes_from_an_external_crate() {
         agent,
         message: Message::User {
             content: "hello".into(),
-            tool_calls: Vec::new(),
         },
         tool_schema: Vec::new(),
         usage: None,
@@ -50,7 +49,6 @@ fn documented_public_api_composes_from_an_external_crate() {
         history[0].message,
         Message::User {
             content: "hello".into(),
-            tool_calls: Vec::new(),
         }
     );
 }

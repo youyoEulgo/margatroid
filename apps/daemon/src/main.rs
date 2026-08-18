@@ -14,6 +14,7 @@ use core_plugin::App;
 use dto_plugin::DtoPlugin;
 use inference_plugin::InferencePlugin;
 use log_plugin::LogPlugin;
+use mcl_plugin::MclPlugin;
 use memory_plugin::MemoryPlugin;
 use server_plugin::{ServerOptions, ServerPlugin};
 use tool_plugin::ToolPlugin;
@@ -52,6 +53,8 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let global_config = ConfigPlugin::open(&config_path)
         .map_err(|error| format!("cannot open global configuration: {error}"))?;
     let bind = global_config.config().server_bind();
+    let mcl = MclPlugin::open(&data_root)
+        .map_err(|error| format!("cannot open MCL resource root: {error}"))?;
 
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
@@ -59,6 +62,7 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(LogPlugin::default().with_stream(LOG_STREAM_CAPACITY))
         .add_plugin(ServerPlugin::with_options(ServerOptions::bind(bind)))
         .add_plugin(global_config)
+        .add_plugin(mcl)
         .add_plugin(agent_images)
         .add_plugin(InferencePlugin::default().with_config_path(models_path.clone()))
         .add_plugin(ToolPlugin::default())

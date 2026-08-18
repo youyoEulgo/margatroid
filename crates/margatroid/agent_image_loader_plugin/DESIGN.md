@@ -4,6 +4,10 @@
 
 ```text
 AgentImage的身份统一为ResourceId：image:<scope>/<name>:<tag>
+每个AgentImage必须在镜像根目录携带base.lua；它是AgentImage本体的一部分，不在agent.toml中声明独立资源ID
+SOUL.md固定作为prompt:system/soul:latest资源提供给该Image的Base Driver；agent.toml的dependencies数组是Agent依赖清单
+每项依赖包含ResourceId和可选source；source只记录来源，本阶段不执行下载或复制
+base.lua通过IMPORT使用依赖清单中的资源；AgentImageLoader不负责执行资源安装
 镜像默认可见资源保存ResourceId集合，不保存ResourceRef或裸scope/name
 镜像目录解析必须使用完整scope、name和tag；省略tag的输入先规范化为latest
 ```
@@ -64,6 +68,21 @@ AgentImageSoul：AgentImage Soul，公开组件--保存已经过UTF-8和大小�
     impl Component for AgentImageSoul
         Component：公开trait实现
 
+AgentImageBaseDriver：AgentImage内禀Base Driver，公开组件--保存已经通过大小、UTF-8和Lua语法验证的base.lua源码
+    source: MclDriverSource--kind=Base且origin为当前镜像根目录base.lua
+    source(&self) -> &MclDriverSource
+        取得Driver源码：公开方法，返回共享不可变源码
+    impl Component for AgentImageBaseDriver
+
+AgentImageDependency：AgentImage依赖项，公开结构体--保存规范化资源ID和可选来源
+    resource_id: ResourceId--依赖资源ID
+    source: Option<String>--可选本机路径或URL，仅记录不解析
+
+AgentImageDependencies：AgentImage依赖清单，公开组件--保存agent.toml中声明的依赖项
+    entries: Arc<[AgentImageDependency]>--保持清单顺序
+    entries(&self) -> &[AgentImageDependency]
+    impl Component for AgentImageDependencies
+
 AgentImageModelParameters：AgentImage模型参数文档，公开结构体--中立保存agent.toml中的可选推理参数
     temperature: Option<f32>--采样温度原始值，私有
     max_output_tokens: Option<u32>--最大输出token数原始值，私有
@@ -88,13 +107,6 @@ AgentImageModelConfig：AgentImage模型配置，公开组件--中立保存模�
     impl Component for AgentImageModelConfig
         Component：公开trait实现
 
-AgentImageDefaultVisibility：AgentImage默认资源可见性，公开组件--只读保存镜像默认资源名称
-    resources: BTreeSet<ResourceId>--镜像默认可见的普通Tool、Skill、Workflow统一引用，私有
-    resources(&self) -> impl Iterator<Item = &ResourceId> + '_
-        遍历资源：公开方法，按provider和逻辑名称稳定返回
-    impl Component for AgentImageDefaultVisibility
-        Component：公开trait实现
-
 AgentImageLoadErrorKind：AgentImage加载错误分类，公开枚举
     InvalidRoot
     InvalidRequest
@@ -110,6 +122,7 @@ AgentImageLoadErrorKind：AgentImage加载错误分类，公开枚举
     SoulReadFailed
     SoulInvalidUtf8
     InvalidResourceName
+    BaseDriverLoadFailed
     TaskPanicked
 
 AgentImageLoadError：AgentImage加载错误，公开结构体--提供稳定分类和不暴露绝对路径的安全描述
@@ -147,7 +160,13 @@ AgentImageLoaderState：AgentImage加载状态，crate公开Resource--保存根�
 ```text
 AgentImageManifest：AgentImage清单，私有结构体--agent.toml反序列化对象
     schema_version: u32--清单版本，第一版只接受1
+    base_driver: 无--Base Driver资源ID由Image引用agent:scope/name:tag自动派生为mcl:scope/name:tag
     inference: AgentImageModelDocument--模型配置文档
+    dependencies: Vec<AgentImageDependencyDocument>--依赖清单，缺省为空
+
+AgentImageDependencyDocument：依赖清单项，私有结构体
+    id: String--资源ID文本
+    source: Option<String>--可选本机路径或URL
 
 AgentImageModelDocument：AgentImage模型配置文档，私有结构体--只表示agent.toml字段
     model: String--稳定模型ID文本
@@ -159,12 +178,11 @@ AgentImageModelDocument：AgentImage模型配置文档，私有结构体--只表
 AgentImageLoaderLimits：AgentImage加载限制，私有结构体--限制单个镜像目录的文件数量和内容大小
     max_manifest_bytes: u64--agent.toml最大字节数
     max_soul_bytes: u64--SOUL.md最大字节数
-    max_embedded_resources: usize--镜像内置Skill和Workflow名称总上限
     max_model_id_bytes: usize--模型ID最大UTF-8字节数
     max_stop_sequences: usize--停止序列数量上限，仅保护资源读取
     max_stop_sequence_bytes: usize--单个停止序列最大UTF-8字节数，仅保护资源读取
     impl Default for AgentImageLoaderLimits
-        Default：私有trait实现，使用64KiB清单、1MiB Soul、4096个资源名称、1KiB模型ID、128个停止序列和4KiB单序列限制
+        Default：私有trait实现，使用64KiB清单、1MiB Soul、1KiB模型ID、128个停止序列和4KiB单序列限制
         default() -> Self
             构造默认限制：返回上述固定限制
 
@@ -178,8 +196,8 @@ AgentImageReadTask：AgentImage异步读取任务，私有事件--不持有World
 PreparedAgentImage：已准备AgentImage，私有结构体--镜像静态数据读取与名称发现均已完成
     reference: ResourceId--type=image的镜像资源ID
     soul: AgentImageSoul--已验证Soul
+    base_driver: AgentImageBaseDriver--已验证的内禀base.lua源码
     model: AgentImageModelConfig--中立模型配置
-    default_visibility: AgentImageDefaultVisibility--默认只读资源可见性
 
 AgentImageReadPayload：AgentImage读取载荷，私有结构体--无论成功失败都保留镜像引用
     reference: ResourceId--type=image的原镜像资源ID
@@ -235,12 +253,14 @@ read_agent_image(task: AgentImageReadTask) -> Result<AgentImageReadOutput, Agent
         调用validate_image_layout检查顶层目录结构
         有界读取并解析agent.toml
         schema_version不是1时返回UnsupportedSchema
+        只从当前镜像根的base.lua加载Base Driver；Driver身份继承AgentImage的scope、name和tag并使用type=mcl
+        检查文件大小、UTF-8和Lua语法；MCL命令在Agent创建启动Driver时按顺序执行，失败返回BaseDriverLoadFailed
         验证model非空、无控制字符且不超过读取上限
         原样构造AgentImageModelParameters，不判断推理参数业务范围
         有界读取SOUL.md并验证UTF-8、非空和max_soul_bytes
-        调用discover_resource_names分别发现skills与workflows下的scope/name目录
-        构造字段私有的AgentImageDefaultVisibility
-        不读取SKILL.md、Workflow正文、脚本、模板或资产
+        读取agent.toml的dependencies，校验资源ID和可选source的基本格式并保存到AgentImageDependencies
+        source只作为安装提示保留，不在Loader阶段下载、复制或解析
+        现阶段仍兼容读取旧skills/和workflows/目录；迁移完成后由依赖清单替代目录扫描
         成功或普通失败均包装为保留reference的AgentImageReadPayload和AgentImageReadOutput
         panic转换为带reference和固定安全描述的TaskPanicked输出
         Runtime整体取消时返回AgentImageTaskError
@@ -263,7 +283,7 @@ apply_agent_image_load_system(world: &mut World)
         对每个AgentImageReadOutput调用take取得一次AgentImageReadPayload
         从pending移除payload.reference并取得全部等待id
         output失败时为每个等待id发送克隆的AgentImageLoadError
-        output成功且已登记Entity仍存活时替换Identity、Soul、ModelConfig和DefaultVisibility组件
+        output成功且已登记Entity仍存活时替换Identity、Soul、BaseDriver和ModelConfig组件
         没有存活Entity时spawn并插入全部组件，再登记reference到Entity
         只有全部PreparedAgentImage已完成结构验证后才修改World
         为每个等待id发送同一reference和Entity的LoadAgentImageResult::Ok
@@ -279,20 +299,10 @@ resolve_image_root(root: &Path, reference: &ResourceId) -> Result<PathBuf, Agent
 validate_image_layout(root: &Path) -> Result<DirectorySignature, AgentImageLoadError>
     验证镜像布局：私有异步函数，检查AgentImage顶层只包含规定文件与目录并返回快照
     行为：
-        agent.toml和SOUL.md必须是普通文件
-        skills与workflows缺失时视为空，存在时必须是普通目录
+        agent.toml、SOUL.md和base.lua必须是普通文件
+        mcl、skills与workflows缺失时视为空，存在时必须是普通目录
         顶层symlink返回SymlinkNotAllowed，设备文件和未知入口返回InvalidLayout
         不递归验证Skill与Workflow内容，它们由对应Loader Plugin在每次使用时重新验证
-
-discover_resource_names(root: &Path, limits: &AgentImageLoaderLimits) -> Result<BTreeSet<ResourceName>, AgentImageLoadError>
-    发现资源名称：私有异步函数，读取root下的scope/name二级目录并返回逻辑名称集合
-    行为：
-        root不存在时返回空集合
-        scope与name必须满足ResourceName规则
-        scope和name入口必须是普通目录且不能是symlink
-        不进入name目录读取任何资源内容
-        名称数量超过max_embedded_resources时返回LimitExceeded
-        目录在发现过程中变化时返回SourceChanged
 
 normalize_root(root: PathBuf) -> Result<PathBuf, AgentImageLoadError>
     规范化根：私有函数，要求绝对路径、拒绝父级跳转并移除当前目录段
@@ -395,11 +405,11 @@ App
         │   └── reference: ResourceId
         ├── AgentImageSoul
         │   └── content: Arc<str>
-        ├── AgentImageModelConfig
+        ├── AgentImageBaseDriver
+        │   └── source: MclDriverSource
+        └── AgentImageModelConfig
         │   ├── model: Arc<str>
         │   └── parameters: AgentImageModelParameters
-        └── AgentImageDefaultVisibility
-            └── resources: BTreeSet<ResourceId>
 
 异步读取期间：
 AgentImageReadTask
@@ -413,6 +423,6 @@ AgentImageReadTask
                └── PreparedAgentImage
                    ├── reference: ResourceId
                    ├── soul: AgentImageSoul
-                   ├── model: AgentImageModelConfig
-                   └── default_visibility: AgentImageDefaultVisibility
+                   ├── base_driver: AgentImageBaseDriver
+                   └── model: AgentImageModelConfig
 ```

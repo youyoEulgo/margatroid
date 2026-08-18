@@ -12,6 +12,10 @@ use margatroid_types::{
     AgentContextMessagesUpdated, AgentFailure, AgentFailureKind, AgentHistoryMessageWriteRequested,
     AgentMessage, Message, ResourceId, TokenUsage, ToolCall, ToolDefinition,
 };
+use mcl_plugin::{
+    AgentMcl, AttachAgentMclRequest, MclCapabilityOwner, MclEffect, MclEffectsProduced,
+    MclPluginInstalled, MclProgram, MclRuntimeMessage, WorkflowMclDetached, WorldMclExt,
+};
 use tool_plugin::{
     attach_agent_tool_map, AgentToolMap, AgentToolRegisterRequest, AgentToolRegisterResponse,
     CancelToolTurn, ToolCallEvent, ToolError, ToolErrorKind, ToolPluginInstalled,
@@ -75,6 +79,9 @@ impl Plugin for AgentPlugin {
         if !app.world().contains_resource::<ToolPluginInstalled>() {
             panic!("AgentPlugin requires ToolPlugin");
         }
+        if !app.world().contains_resource::<MclPluginInstalled>() {
+            panic!("AgentPlugin requires MclPlugin");
+        }
         if app.world().contains_resource::<AgentPluginInstalled>() {
             panic!("AgentPlugin is already installed");
         }
@@ -91,24 +98,26 @@ impl Plugin for AgentPlugin {
             .insert_resource(PendingContextCompactions::default());
         app.add_system(&self.schedule, agent_create_system)
             .add_system(&self.schedule, agent_visibility_change_system)
+            .add_system(&self.schedule, mcl_effect_system)
+            .add_system(&self.schedule, workflow_visibility_cleanup_system)
             .add_system(&self.schedule, collect_agent_tool_registration_system)
             .add_system(&self.schedule, cleanup_dead_agent_registrations_system)
-            .add_system(&self.schedule, agent_skill_state_system)
             .add_system(&self.schedule, abort_agent_turn_system)
             .add_system(&self.schedule, context_compaction_system)
-            .add_system(&self.schedule, agent_message_system)
-            .add_system(&self.schedule, tool_turn_completed_system);
+            .add_system(&self.schedule, agent_message_system);
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct AgentCreateRequest {
     pub id: String,
     pub agent_id: ResourceId,
     pub workspace_id: Entity,
+    pub base_mcl: std::sync::Arc<MclProgram>,
     pub system_prompt: String,
     pub messages: Vec<Message>,
     pub tool_context: Vec<Message>,
+    pub ordered_messages: Vec<Message>,
     pub token_usage: TokenUsage,
     pub default_visibility: BTreeSet<ResourceId>,
 }
@@ -204,6 +213,7 @@ pub enum AgentCreateErrorKind {
     WorkspaceMissing,
     ContextInvalid,
     ToolMapSetupFailed,
+    MclSetupFailed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -271,32 +281,6 @@ impl fmt::Display for AgentVisibilityError {
 }
 impl std::error::Error for AgentVisibilityError {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoadAgentSkill {
-    pub id: String,
-    pub agent: Entity,
-    pub resource_id: ResourceId,
-}
-
-impl Event for LoadAgentSkill {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnloadAgentSkill {
-    pub id: String,
-    pub agent: Entity,
-    pub resource_id: ResourceId,
-}
-
-impl Event for UnloadAgentSkill {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnloadAllAgentSkills {
-    pub id: String,
-    pub agent: Entity,
-}
-
-impl Event for UnloadAllAgentSkills {}
-
 pub struct AgentIdentity {
     id: ResourceId,
 }
@@ -311,7 +295,6 @@ impl Component for AgentIdentity {}
 
 pub trait WorldAgentExt {
     fn agent(&self, id: &ResourceId) -> Option<Entity>;
-    fn agent_loading_skills(&self, agent: Entity) -> Option<&BTreeSet<ResourceId>>;
     fn agent_is_working(&self, agent: Entity) -> Option<bool>;
     fn inject_agent_visible_resource(
         &self,
@@ -338,11 +321,6 @@ impl WorldAgentExt for World {
                 self.get_component::<AgentIdentity>(*entity)
                     .is_some_and(|identity| identity.id() == id)
             })
-    }
-
-    fn agent_loading_skills(&self, agent: Entity) -> Option<&BTreeSet<ResourceId>> {
-        self.get_component::<AgentStatus>(agent)
-            .map(|status| &status.loading_skills)
     }
 
     fn agent_is_working(&self, agent: Entity) -> Option<bool> {
@@ -407,6 +385,7 @@ pub struct AgentContext {
     system_prompt: String,
     messages: Vec<Message>,
     tool_context: Vec<Message>,
+    ordered_messages: Vec<Message>,
 }
 
 impl AgentContext {
@@ -422,9 +401,14 @@ impl AgentContext {
         &self.tool_context
     }
 
+    pub fn ordered_messages(&self) -> &[Message] {
+        &self.ordered_messages
+    }
+
     pub fn append_message(&mut self, agent: Entity, message: Message, events: &RuntimeEventSender) {
         assert_conversation_message(&message);
-        self.messages.push(message);
+        self.messages.push(message.clone());
+        self.ordered_messages.push(message);
         self.notify_updated(agent, events);
     }
 
@@ -436,6 +420,8 @@ impl AgentContext {
     ) {
         assert_conversation_messages(&messages);
         self.messages = messages;
+        self.tool_context.clear();
+        self.ordered_messages = self.messages.clone();
         self.notify_updated(agent, events);
     }
 
@@ -446,7 +432,8 @@ impl AgentContext {
         events: &RuntimeEventSender,
     ) {
         assert!(matches!(message, Message::Tool { .. }));
-        self.tool_context.push(message);
+        self.tool_context.push(message.clone());
+        self.ordered_messages.push(message);
         self.notify_updated(agent, events);
     }
 
@@ -463,35 +450,12 @@ impl AgentContext {
             agent,
             messages: self.messages.clone(),
             tool_context: self.tool_context.clone(),
+            ordered_messages: self.ordered_messages.clone(),
         });
     }
 }
 
 impl Component for AgentContext {}
-
-pub struct AgentDefaultVisibility {
-    resources: BTreeSet<ResourceId>,
-}
-
-impl AgentDefaultVisibility {
-    pub fn resources(&self) -> &BTreeSet<ResourceId> {
-        &self.resources
-    }
-}
-
-impl Component for AgentDefaultVisibility {}
-
-pub struct AgentDynamicVisibility {
-    resources: BTreeSet<ResourceId>,
-}
-
-impl AgentDynamicVisibility {
-    pub fn resources(&self) -> &BTreeSet<ResourceId> {
-        &self.resources
-    }
-}
-
-impl Component for AgentDynamicVisibility {}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentTokenUsage {
@@ -560,7 +524,7 @@ struct InFlightVisibilityRegistration {
     agent: Entity,
     resource_id: ResourceId,
     notification_ids: BTreeSet<String>,
-    desired_visible: bool,
+    owners: BTreeSet<MclCapabilityOwner>,
 }
 
 #[derive(Default)]
@@ -585,7 +549,6 @@ struct PendingContextCompaction {
 #[derive(Default)]
 pub(crate) struct AgentStatus {
     turn_id: Option<String>,
-    loading_skills: BTreeSet<ResourceId>,
 }
 
 impl AgentStatus {
@@ -609,19 +572,6 @@ impl AgentStatus {
     pub(crate) fn is_working(&self) -> bool {
         self.turn_id.is_some()
     }
-    pub(crate) fn load_skill(&mut self, resource_id: ResourceId) -> Result<(), AgentStepError> {
-        if resource_id.resource_type() != "skill" {
-            return Err(AgentStepError::InvalidToolBatch);
-        }
-        self.loading_skills.insert(resource_id);
-        Ok(())
-    }
-    pub(crate) fn unload_skill(&mut self, resource_id: &ResourceId) -> bool {
-        self.loading_skills.remove(resource_id)
-    }
-    pub(crate) fn unload_all_skills(&mut self) {
-        self.loading_skills.clear();
-    }
 }
 
 impl Component for AgentStatus {}
@@ -632,7 +582,6 @@ struct AvailableTools {
 
 enum ConversationTurnResult {
     WaitForTools,
-    FinishTurn,
     RequestInference,
 }
 
@@ -694,10 +643,6 @@ fn agent_create_system(world: &mut World) {
                 agent_id: request.agent_id.clone(),
                 agent,
             });
-            world.restore_agent_default_visibility(
-                format!("agent-{}/restore-default", agent.index()),
-                agent,
-            );
         }
         events.send_event(AgentCreateResult {
             id: request.id,
@@ -761,16 +706,16 @@ fn create_agent(
             system_prompt: request.system_prompt.clone(),
             messages: request.messages.clone(),
             tool_context: request.tool_context.clone(),
-        },
-    ) && world.insert_component(
-        agent,
-        AgentDefaultVisibility {
-            resources: request.default_visibility.clone(),
-        },
-    ) && world.insert_component(
-        agent,
-        AgentDynamicVisibility {
-            resources: BTreeSet::new(),
+            ordered_messages: if request.ordered_messages.is_empty() {
+                request
+                    .messages
+                    .iter()
+                    .chain(request.tool_context.iter())
+                    .cloned()
+                    .collect()
+            } else {
+                request.ordered_messages.clone()
+            },
         },
     ) && world
         .insert_component(agent, AgentTokenUsage::from_totals(&request.token_usage))
@@ -788,6 +733,41 @@ fn create_agent(
             AgentCreateErrorKind::ToolMapSetupFailed,
             error.to_string(),
         ));
+    }
+    let restored_messages = if request.ordered_messages.is_empty() {
+        request
+            .messages
+            .iter()
+            .chain(request.tool_context.iter())
+            .cloned()
+            .collect()
+    } else {
+        request.ordered_messages.clone()
+    };
+    let initial_effects = match world.attach_agent_mcl(
+        agent,
+        AttachAgentMclRequest {
+            base: std::sync::Arc::clone(&request.base_mcl),
+            system_prompt: request.system_prompt.clone(),
+            restored_messages,
+            default_visibility: request.default_visibility.clone(),
+        },
+    ) {
+        Ok(effects) => effects,
+        Err(error) => {
+            world.despawn(agent);
+            return Err(AgentCreateError::new(
+                AgentCreateErrorKind::MclSetupFailed,
+                error.to_string(),
+            ));
+        }
+    };
+    if !initial_effects.is_empty() {
+        world.send_event(MclEffectsProduced {
+            id: request.id.clone(),
+            agent,
+            effects: initial_effects,
+        });
     }
     Ok(agent)
 }
@@ -821,19 +801,57 @@ fn agent_visibility_change_system(world: &mut World) {
     let events = world.event_sender();
 
     for event in injects {
-        inject_visible_resource(world, &event.id, event.agent, &event.resource_id, &events);
+        inject_visible_resource(
+            world,
+            &event.id,
+            event.agent,
+            &event.resource_id,
+            MclCapabilityOwner::External("manual".into()),
+            &events,
+        );
     }
     for event in removes {
         if let Err(error) =
-            remove_visible_resource(world, &event.id, event.agent, &event.resource_id, &events)
+            world.revoke_agent_resource(event.agent, &MclCapabilityOwner::Base, &event.resource_id)
         {
+            report_visibility_operation_failure(
+                &event.id,
+                event.agent,
+                AgentVisibilityError::new(
+                    AgentVisibilityErrorKind::VisibilityMissing,
+                    error.to_string(),
+                ),
+                &events,
+            );
+            continue;
+        }
+        if let Some(registration) = world
+            .get_resource_mut::<InFlightVisibilityRegistrations>()
+            .expect("AgentPlugin is not installed")
+            .registrations
+            .get_mut(&(event.agent, event.resource_id.clone()))
+        {
+            registration.owners.remove(&MclCapabilityOwner::Base);
+        }
+        if let Err(error) = remove_visible_resource(
+            world,
+            &event.id,
+            event.agent,
+            &event.resource_id,
+            &MclCapabilityOwner::External("manual".into()),
+            &events,
+        ) {
             report_visibility_operation_failure(&event.id, event.agent, error, &events);
         }
     }
     for event in default_changes {
         let is_default = world
-            .get_component::<AgentDefaultVisibility>(event.agent)
-            .is_some_and(|visibility| visibility.resources.contains(&event.resource_id));
+            .get_component::<AgentMcl>(event.agent)
+            .is_some_and(|mcl| {
+                mcl.capabilities()
+                    .default_resources()
+                    .contains(&event.resource_id)
+            });
         if !is_default {
             events.send_event(AgentFailure {
                 id: event.id,
@@ -844,17 +862,33 @@ fn agent_visibility_change_system(world: &mut World) {
             continue;
         }
         if event.visible {
-            inject_visible_resource(world, &event.id, event.agent, &event.resource_id, &events);
-        } else if let Err(error) =
-            remove_visible_resource(world, &event.id, event.agent, &event.resource_id, &events)
-        {
+            inject_visible_resource(
+                world,
+                &event.id,
+                event.agent,
+                &event.resource_id,
+                MclCapabilityOwner::Base,
+                &events,
+            );
+        } else if let Err(error) = remove_visible_resource(
+            world,
+            &event.id,
+            event.agent,
+            &event.resource_id,
+            &MclCapabilityOwner::Base,
+            &events,
+        ) {
             report_visibility_operation_failure(&event.id, event.agent, error, &events);
         }
     }
     for event in restores {
-        let resources = world
-            .get_component::<AgentDefaultVisibility>(event.agent)
-            .map(|visibility| visibility.resources.iter().cloned().collect::<Vec<_>>());
+        let resources = world.get_component::<AgentMcl>(event.agent).map(|mcl| {
+            mcl.capabilities()
+                .default_resources()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        });
         let Some(resources) = resources else {
             report_visibility_operation_failure(
                 &event.id,
@@ -867,21 +901,110 @@ fn agent_visibility_change_system(world: &mut World) {
             );
             continue;
         };
-        if let Err(error) =
-            remove_all_visible_resources(world, &event.id, event.agent, false, &events)
-        {
+        if let Err(error) = remove_all_visible_resources(world, &event.id, event.agent, &events) {
             report_visibility_operation_failure(&event.id, event.agent, error, &events);
             continue;
         }
         for resource_id in resources {
-            inject_visible_resource(world, &event.id, event.agent, &resource_id, &events);
+            inject_visible_resource(
+                world,
+                &event.id,
+                event.agent,
+                &resource_id,
+                MclCapabilityOwner::Base,
+                &events,
+            );
         }
     }
     for event in remove_all {
-        if let Err(error) =
-            remove_all_visible_resources(world, &event.id, event.agent, true, &events)
-        {
+        if let Err(error) = remove_all_visible_resources(world, &event.id, event.agent, &events) {
             report_visibility_operation_failure(&event.id, event.agent, error, &events);
+        }
+    }
+}
+
+fn mcl_effect_system(world: &mut World) {
+    let produced = world
+        .event_reader::<MclEffectsProduced>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let events = world.event_sender();
+    for produced in produced {
+        for effect in produced.effects {
+            let result = match effect {
+                MclEffect::ResolveResources { owner, resources } => {
+                    for resource_id in resources {
+                        inject_visible_resource(
+                            world,
+                            &produced.id,
+                            produced.agent,
+                            &resource_id,
+                            owner.clone(),
+                            &events,
+                        );
+                    }
+                    Ok(())
+                }
+                MclEffect::RequestInference { request } => {
+                    send_inference_request(world, &produced.id, produced.agent, &request, &events)
+                }
+                MclEffect::ExecuteTools { calls } => {
+                    let schema = take_pending_tool_schema(world, produced.agent, &produced.id);
+                    dispatch_assistant_tool_calls(
+                        world,
+                        &produced.id,
+                        produced.agent,
+                        &calls,
+                        &schema,
+                        &events,
+                    )
+                    .map(|_| ())
+                }
+                MclEffect::FinishTurn => {
+                    take_pending_tool_schema(world, produced.agent, &produced.id);
+                    world
+                        .get_component_mut::<AgentStatus>(produced.agent)
+                        .ok_or(AgentStepError::StatusMissing)
+                        .and_then(|status| status.finish_turn(&produced.id))
+                }
+            };
+            if let Err(error) = result {
+                events.send_event(AgentFailure {
+                    id: produced.id.clone(),
+                    agent: produced.agent,
+                    kind: AgentFailureKind::Agent,
+                    message: error.failure_message(),
+                });
+            }
+        }
+    }
+}
+
+fn workflow_visibility_cleanup_system(world: &mut World) {
+    let detached = world
+        .event_reader::<WorkflowMclDetached>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let events = world.event_sender();
+    for event in detached {
+        let owner = MclCapabilityOwner::Workflow(event.instance_id);
+        for registration in world
+            .get_resource_mut::<InFlightVisibilityRegistrations>()
+            .expect("AgentPlugin is installed")
+            .registrations
+            .values_mut()
+            .filter(|registration| registration.agent == event.agent)
+        {
+            registration.owners.remove(&owner);
+        }
+        for resource_id in event.removed_resources {
+            events.send_event(AgentVisibleResourceRemoved {
+                id: event.id.clone(),
+                agent: event.agent,
+                resource_id,
+            });
         }
     }
 }
@@ -891,6 +1014,7 @@ fn inject_visible_resource(
     id: &str,
     agent: Entity,
     resource_id: &ResourceId,
+    owner: MclCapabilityOwner,
     events: &RuntimeEventSender,
 ) {
     if !world.is_alive(agent) {
@@ -906,20 +1030,33 @@ fn inject_visible_resource(
         );
         return;
     }
-    let Some(visibility) = world.get_component::<AgentDynamicVisibility>(agent) else {
+    let Some(mcl) = world.get_component::<AgentMcl>(agent) else {
         send_visibility_injection_failed(
             id,
             agent,
             resource_id,
             AgentVisibilityError::new(
                 AgentVisibilityErrorKind::VisibilityMissing,
-                "Agent dynamic visibility is missing",
+                "Agent MCL capability store is missing",
             ),
             events,
         );
         return;
     };
-    if visibility.resources.contains(resource_id) {
+    if mcl.capabilities().is_visible(resource_id) {
+        if let Err(error) = world.grant_agent_resource(agent, owner, resource_id.clone()) {
+            send_visibility_injection_failed(
+                id,
+                agent,
+                resource_id,
+                AgentVisibilityError::new(
+                    AgentVisibilityErrorKind::VisibilityMissing,
+                    error.to_string(),
+                ),
+                events,
+            );
+            return;
+        }
         events.send_event(AgentVisibleResourceInjected {
             id: id.to_owned(),
             agent,
@@ -955,11 +1092,19 @@ fn inject_visible_resource(
         return;
     }
     if mapping_count == 1 {
-        world
-            .get_component_mut::<AgentDynamicVisibility>(agent)
-            .expect("AgentDynamicVisibility existence was checked")
-            .resources
-            .insert(resource_id.clone());
+        if let Err(error) = world.grant_agent_resource(agent, owner, resource_id.clone()) {
+            send_visibility_injection_failed(
+                id,
+                agent,
+                resource_id,
+                AgentVisibilityError::new(
+                    AgentVisibilityErrorKind::VisibilityMissing,
+                    error.to_string(),
+                ),
+                events,
+            );
+            return;
+        }
         events.send_event(AgentVisibleResourceInjected {
             id: id.to_owned(),
             agent,
@@ -974,7 +1119,7 @@ fn inject_visible_resource(
         .expect("AgentPlugin is not installed");
     if let Some(registration) = registrations.registrations.get_mut(&key) {
         registration.notification_ids.insert(id.to_owned());
-        registration.desired_visible = true;
+        registration.owners.insert(owner);
         return;
     }
     static NEXT_REGISTRATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -984,6 +1129,8 @@ fn inject_visible_resource(
     );
     let mut notification_ids = BTreeSet::new();
     notification_ids.insert(id.to_owned());
+    let mut owners = BTreeSet::new();
+    owners.insert(owner);
     registrations.registrations.insert(
         key,
         InFlightVisibilityRegistration {
@@ -991,7 +1138,7 @@ fn inject_visible_resource(
             agent,
             resource_id: resource_id.clone(),
             notification_ids,
-            desired_visible: true,
+            owners,
         },
     );
     events.send_event(AgentToolRegisterRequest {
@@ -1006,6 +1153,7 @@ fn remove_visible_resource(
     id: &str,
     agent: Entity,
     resource_id: &ResourceId,
+    owner: &MclCapabilityOwner,
     events: &RuntimeEventSender,
 ) -> Result<(), AgentVisibilityError> {
     if !world.is_alive(agent) {
@@ -1015,33 +1163,20 @@ fn remove_visible_resource(
         ));
     }
     world
-        .get_component_mut::<AgentDynamicVisibility>(agent)
-        .ok_or_else(|| {
+        .revoke_agent_resource(agent, owner, resource_id)
+        .map_err(|error| {
             AgentVisibilityError::new(
                 AgentVisibilityErrorKind::VisibilityMissing,
-                "Agent dynamic visibility is missing",
+                error.to_string(),
             )
-        })?
-        .resources
-        .remove(resource_id);
-    if resource_id.resource_type() == "skill" {
-        world
-            .get_component_mut::<AgentStatus>(agent)
-            .ok_or_else(|| {
-                AgentVisibilityError::new(
-                    AgentVisibilityErrorKind::VisibilityMissing,
-                    "Agent status is missing",
-                )
-            })?
-            .unload_skill(resource_id);
-    }
+        })?;
     if let Some(registration) = world
         .get_resource_mut::<InFlightVisibilityRegistrations>()
         .expect("AgentPlugin is not installed")
         .registrations
         .get_mut(&(agent, resource_id.clone()))
     {
-        registration.desired_visible = false;
+        registration.owners.remove(owner);
     }
     events.send_event(AgentVisibleResourceRemoved {
         id: id.to_owned(),
@@ -1055,7 +1190,6 @@ fn remove_all_visible_resources(
     world: &mut World,
     id: &str,
     agent: Entity,
-    clear_loading_skills: bool,
     events: &RuntimeEventSender,
 ) -> Result<(), AgentVisibilityError> {
     if !world.is_alive(agent) {
@@ -1064,17 +1198,31 @@ fn remove_all_visible_resources(
             "Agent entity is not alive",
         ));
     }
-    let removed = {
-        let visibility = world
-            .get_component_mut::<AgentDynamicVisibility>(agent)
-            .ok_or_else(|| {
+    let previous = world
+        .get_component::<AgentMcl>(agent)
+        .ok_or_else(|| {
+            AgentVisibilityError::new(
+                AgentVisibilityErrorKind::VisibilityMissing,
+                "Agent MCL capability store is missing",
+            )
+        })?
+        .capabilities()
+        .visible_resources()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for owner in [
+        MclCapabilityOwner::Base,
+        MclCapabilityOwner::External("manual".into()),
+    ] {
+        world
+            .clear_agent_resource_owner(agent, &owner)
+            .map_err(|error| {
                 AgentVisibilityError::new(
                     AgentVisibilityErrorKind::VisibilityMissing,
-                    "Agent dynamic visibility is missing",
+                    error.to_string(),
                 )
             })?;
-        std::mem::take(&mut visibility.resources)
-    };
+    }
     for registration in world
         .get_resource_mut::<InFlightVisibilityRegistrations>()
         .expect("AgentPlugin is not installed")
@@ -1082,20 +1230,24 @@ fn remove_all_visible_resources(
         .values_mut()
         .filter(|registration| registration.agent == agent)
     {
-        registration.desired_visible = false;
+        registration.owners.remove(&MclCapabilityOwner::Base);
+        registration
+            .owners
+            .remove(&MclCapabilityOwner::External("manual".into()));
     }
-    if clear_loading_skills {
-        world
-            .get_component_mut::<AgentStatus>(agent)
-            .ok_or_else(|| {
-                AgentVisibilityError::new(
-                    AgentVisibilityErrorKind::VisibilityMissing,
-                    "Agent status is missing",
-                )
-            })?
-            .unload_all_skills();
-    }
-    for resource_id in removed {
+    let effective = world
+        .get_component::<AgentMcl>(agent)
+        .ok_or_else(|| {
+            AgentVisibilityError::new(
+                AgentVisibilityErrorKind::VisibilityMissing,
+                "Agent MCL capability store is missing",
+            )
+        })?
+        .capabilities()
+        .visible_resources()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for resource_id in previous.difference(&effective).cloned() {
         events.send_event(AgentVisibleResourceRemoved {
             id: id.to_owned(),
             agent,
@@ -1169,25 +1321,37 @@ fn collect_agent_tool_registration_system(world: &mut World) {
             );
             continue;
         }
-        if !registration.desired_visible {
+        let owners = registration
+            .owners
+            .iter()
+            .filter(|owner| capability_owner_is_active(world, registration.agent, owner))
+            .cloned()
+            .collect::<Vec<_>>();
+        if owners.is_empty() {
             continue;
         }
-        let Some(visibility) =
-            world.get_component_mut::<AgentDynamicVisibility>(registration.agent)
-        else {
+        let mut grant_failed = None;
+        for owner in owners {
+            if let Err(error) = world.grant_agent_resource(
+                registration.agent,
+                owner,
+                registration.resource_id.clone(),
+            ) {
+                grant_failed = Some(error);
+                break;
+            }
+        }
+        if let Some(error) = grant_failed {
             notify_registration_failure(
                 &registration,
                 AgentVisibilityError::new(
                     AgentVisibilityErrorKind::VisibilityMissing,
-                    "Agent dynamic visibility disappeared before registration completed",
+                    error.to_string(),
                 ),
                 &events,
             );
             continue;
-        };
-        visibility
-            .resources
-            .insert(registration.resource_id.clone());
+        }
         for id in &registration.notification_ids {
             events.send_event(AgentVisibleResourceInjected {
                 id: id.clone(),
@@ -1195,6 +1359,15 @@ fn collect_agent_tool_registration_system(world: &mut World) {
                 resource_id: registration.resource_id.clone(),
             });
         }
+    }
+}
+
+fn capability_owner_is_active(world: &World, agent: Entity, owner: &MclCapabilityOwner) -> bool {
+    match owner {
+        MclCapabilityOwner::Base | MclCapabilityOwner::External(_) => true,
+        MclCapabilityOwner::Workflow(instance_id) => world
+            .get_component::<AgentMcl>(agent)
+            .is_some_and(|mcl| mcl.workflows().any(|(id, _)| id == instance_id)),
     }
 }
 
@@ -1289,76 +1462,6 @@ fn report_visibility_operation_failure(
     });
 }
 
-fn agent_skill_state_system(world: &mut World) {
-    let loads = world
-        .event_reader::<LoadAgentSkill>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    let unloads = world
-        .event_reader::<UnloadAgentSkill>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    let unload_all = world
-        .event_reader::<UnloadAllAgentSkills>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    let events = world.event_sender();
-
-    for event in loads {
-        let result = world
-            .get_component_mut::<AgentStatus>(event.agent)
-            .ok_or(AgentStepError::AgentMissing)
-            .and_then(|status| status.load_skill(event.resource_id));
-        if let Err(error) = result {
-            events.send_event(AgentFailure {
-                id: event.id,
-                agent: event.agent,
-                kind: AgentFailureKind::Agent,
-                message: error.failure_message(),
-            });
-        }
-    }
-
-    for event in unloads {
-        let result = if event.resource_id.resource_type() != "skill" {
-            Err(AgentStepError::InvalidToolBatch)
-        } else {
-            world
-                .get_component_mut::<AgentStatus>(event.agent)
-                .ok_or(AgentStepError::AgentMissing)
-                .map(|status| {
-                    status.unload_skill(&event.resource_id);
-                })
-        };
-        if let Err(error) = result {
-            events.send_event(AgentFailure {
-                id: event.id,
-                agent: event.agent,
-                kind: AgentFailureKind::Agent,
-                message: error.failure_message(),
-            });
-        }
-    }
-
-    for event in unload_all {
-        let result = world
-            .get_component_mut::<AgentStatus>(event.agent)
-            .ok_or(AgentStepError::AgentMissing)
-            .map(|status| status.unload_all_skills());
-        if let Err(error) = result {
-            events.send_event(AgentFailure {
-                id: event.id,
-                agent: event.agent,
-                kind: AgentFailureKind::Agent,
-                message: error.failure_message(),
-            });
-        }
-    }
-}
-
 fn agent_message_system(world: &mut World) {
     let messages = world
         .event_reader::<AgentMessage>()
@@ -1373,6 +1476,13 @@ fn agent_message_system(world: &mut World) {
             tracing::warn!(id = %message.id, "AgentMessage agent does not exist");
             continue;
         }
+        // The Base Driver is the owner of message routing. Keep this mailbox
+        // ingress separate from history/status bookkeeping below.
+        world.send_event(MclRuntimeMessage {
+            id: message.id.clone(),
+            agent,
+            message: message.message.clone(),
+        });
         match handle_agent_message(world, &message, &events) {
             Ok(_) => {}
             Err(error) => {
@@ -1514,7 +1624,6 @@ fn begin_context_compaction(
     messages.extend(compacting_messages);
     messages.push(Message::User {
         content: CONTEXT_COMPACTION_PROMPT.into(),
-        tool_calls: Vec::new(),
     });
     events.send_event(ContextCompactionInferenceRequest {
         id: request.id.clone(),
@@ -1582,7 +1691,6 @@ fn complete_context_compaction(
         content: format!(
             "{COMPACTED_SUMMARY_PREAMBLE}\n\n<compacted-summary>\n{summary}\n</compacted-summary>"
         ),
-        tool_calls: Vec::new(),
     });
     messages.extend(pending.retained_messages);
     world
@@ -1602,9 +1710,9 @@ fn handle_agent_message(
     events: &RuntimeEventSender,
 ) -> Result<ConversationTurnResult, AgentStepError> {
     let agent = event.agent;
-    let result = match &event.message {
+    match &event.message {
         Message::System { .. } => return Err(AgentStepError::InvalidMessage),
-        Message::User { tool_calls, .. } => {
+        Message::User { .. } => {
             world
                 .get_component_mut::<AgentStatus>(agent)
                 .ok_or(AgentStepError::StatusMissing)?
@@ -1612,9 +1720,8 @@ fn handle_agent_message(
             clear_tool_context(world, agent, events)?;
             record_history_message(world, event, events, Vec::new());
             append_conversation_message(world, agent, event.message.clone(), events)?;
-            dispatch_tool_calls(world, &event.id, agent, tool_calls, true, events)?
         }
-        Message::Assistant { tool_calls, .. } => {
+        Message::Assistant { .. } => {
             if world
                 .get_component::<AgentStatus>(agent)
                 .ok_or(AgentStepError::StatusMissing)?
@@ -1625,7 +1732,11 @@ fn handle_agent_message(
                 return Err(AgentStepError::InvalidToolBatch);
             }
             let tool_schema = take_pending_tool_schema(world, agent, &event.id);
-            clear_tool_context(world, agent, events)?;
+            world
+                .get_resource_mut::<PendingInferenceToolSchemas>()
+                .expect("AgentPlugin is installed")
+                .schemas
+                .insert((agent, event.id.clone()), tool_schema.clone());
             if let Some(usage) = &event.usage {
                 world
                     .get_component_mut::<AgentTokenUsage>(agent)
@@ -1634,24 +1745,8 @@ fn handle_agent_message(
             }
             record_history_message(world, event, events, tool_schema.clone());
             append_conversation_message(world, agent, event.message.clone(), events)?;
-            if !tool_calls.is_empty() {
-                dispatch_assistant_tool_calls(
-                    world,
-                    &event.id,
-                    agent,
-                    tool_calls,
-                    &tool_schema,
-                    events,
-                )?
-            } else {
-                world
-                    .get_component_mut::<AgentStatus>(agent)
-                    .ok_or(AgentStepError::StatusMissing)?
-                    .finish_turn(&event.id)?;
-                ConversationTurnResult::FinishTurn
-            }
         }
-        Message::Tool { resource_id: _, .. } => {
+        Message::Tool { .. } => {
             if world
                 .get_component::<AgentStatus>(agent)
                 .ok_or(AgentStepError::StatusMissing)?
@@ -1663,13 +1758,11 @@ fn handle_agent_message(
             }
             record_history_message(world, event, events, Vec::new());
             append_tool_context(world, agent, event.message.clone(), events)?;
-            ConversationTurnResult::WaitForTools
         }
-    };
-    if matches!(result, ConversationTurnResult::RequestInference) {
-        send_inference_request(world, &event.id, agent, events)?;
     }
-    Ok(result)
+    // Message routing and the next action belong to base.lua. This function
+    // only maintains Agent bookkeeping before the message reaches the Driver.
+    Ok(ConversationTurnResult::WaitForTools)
 }
 
 fn take_pending_tool_schema(
@@ -1765,16 +1858,12 @@ fn dispatch_tool_calls(
     id: &str,
     agent: Entity,
     tool_calls: &[ToolCall],
-    include_loading_skills: bool,
     events: &RuntimeEventSender,
 ) -> Result<ConversationTurnResult, AgentStepError> {
     let maps = world
         .get_component::<AgentToolMap>(agent)
         .ok_or(AgentStepError::ToolMapMissing)?;
-    let mut calls = tool_calls.to_vec();
-    if include_loading_skills {
-        calls.extend(expand_loading_skills(world, agent)?);
-    }
+    let calls = tool_calls.to_vec();
     if calls.is_empty() {
         return Ok(ConversationTurnResult::RequestInference);
     }
@@ -1809,7 +1898,7 @@ fn dispatch_assistant_tool_calls(
         .get_component::<AgentToolMap>(agent)
         .ok_or(AgentStepError::ToolMapMissing)?;
     let visibility = world
-        .get_component::<AgentDynamicVisibility>(agent)
+        .get_component::<AgentMcl>(agent)
         .ok_or(AgentStepError::ContextMissing)?;
     let schema_names = tool_schema
         .iter()
@@ -1817,7 +1906,6 @@ fn dispatch_assistant_tool_calls(
         .collect::<BTreeSet<_>>();
     let mut call_ids = BTreeSet::new();
     let mut authorized = Vec::new();
-    let mut authorized_skills = Vec::new();
     let mut denied = Vec::new();
     for call in tool_calls {
         if call.id.is_empty() || call.tool_name.is_empty() || !call_ids.insert(call.id.clone()) {
@@ -1827,21 +1915,11 @@ fn dispatch_assistant_tool_calls(
             .get_by_name(&call.tool_name)
             .ok_or(AgentStepError::InvalidToolBatch)?;
         if !schema_names.contains(call.tool_name.as_str())
-            || !visibility.resources().contains(&map.resource_id)
+            || !visibility.capabilities().is_visible(&map.resource_id)
         {
             denied.push((call.id.clone(), map.resource_id.clone()));
-        } else if map.resource_id.resource_type() == "skill" {
-            authorized_skills.push(map.resource_id.clone());
         } else {
             authorized.push(call.clone());
-        }
-    }
-    if !authorized_skills.is_empty() {
-        let status = world
-            .get_component_mut::<AgentStatus>(agent)
-            .ok_or(AgentStepError::StatusMissing)?;
-        for resource_id in authorized_skills {
-            status.load_skill(resource_id)?;
         }
     }
     let denied_only = !denied.is_empty() && authorized.is_empty();
@@ -1857,13 +1935,8 @@ fn dispatch_assistant_tool_calls(
             usage: None,
         });
     }
-    let has_loading_skills = !world
-        .get_component::<AgentStatus>(agent)
-        .ok_or(AgentStepError::StatusMissing)?
-        .loading_skills
-        .is_empty();
-    let result = dispatch_tool_calls(world, id, agent, &authorized, true, events)?;
-    if !denied_only || has_loading_skills {
+    let result = dispatch_tool_calls(world, id, agent, &authorized, events)?;
+    if !denied_only {
         return Ok(result);
     }
     events.send_event(ToolTurnCompleted {
@@ -1873,42 +1946,22 @@ fn dispatch_assistant_tool_calls(
     Ok(ConversationTurnResult::WaitForTools)
 }
 
-fn expand_loading_skills(world: &World, agent: Entity) -> Result<Vec<ToolCall>, AgentStepError> {
-    static NEXT_SKILL_CALL_ID: AtomicU64 = AtomicU64::new(1);
-    let status = world
-        .get_component::<AgentStatus>(agent)
-        .ok_or(AgentStepError::StatusMissing)?;
-    let maps = world
-        .get_component::<AgentToolMap>(agent)
-        .ok_or(AgentStepError::ToolMapMissing)?;
-    status
-        .loading_skills
-        .iter()
-        .map(|resource_id| {
-            let matches = maps.get_by_resource(resource_id);
-            if matches.len() != 1 {
-                return Err(AgentStepError::InvalidToolBatch);
-            }
-            Ok(ToolCall {
-                id: format!(
-                    "loading-skill-{}",
-                    NEXT_SKILL_CALL_ID.fetch_add(1, Ordering::Relaxed)
-                ),
-                tool_name: matches[0].tool_name.clone(),
-                arguments: "{}".into(),
-            })
-        })
-        .collect()
-}
-
 fn send_inference_request(
     world: &mut World,
     id: &str,
     agent: Entity,
+    request: &str,
     events: &RuntimeEventSender,
 ) -> Result<(), AgentStepError> {
-    let available_tools = build_available_tools(world, agent)?;
-    let messages = build_inference_context(world, agent)?;
+    let snapshot = world
+        .assemble_model_request(agent, request)
+        .map_err(|_| AgentStepError::ContextMissing)?;
+    let available_tools = build_available_tools(world, agent, &snapshot.visible_resources)?;
+    let mut messages = Vec::with_capacity(snapshot.messages.len() + 1);
+    messages.push(Message::System {
+        content: snapshot.system,
+    });
+    messages.extend(snapshot.messages);
     let agent_id = world
         .get_component::<AgentIdentity>(agent)
         .map(|identity| identity.id().clone())
@@ -1935,32 +1988,16 @@ fn send_inference_request(
     Ok(())
 }
 
-fn build_inference_context(world: &World, agent: Entity) -> Result<Vec<Message>, AgentStepError> {
-    let context = world
-        .get_component::<AgentContext>(agent)
-        .ok_or(AgentStepError::ContextMissing)?;
-    let mut messages = Vec::with_capacity(context.messages.len() + context.tool_context.len() + 1);
-    messages.push(Message::System {
-        content: context.system_prompt.clone(),
-    });
-    messages.extend(context.messages.iter().cloned());
-    messages.extend(context.tool_context.iter().cloned());
-    Ok(messages)
-}
-
-fn build_available_tools(world: &World, agent: Entity) -> Result<AvailableTools, AgentStepError> {
-    let resources = world
-        .get_component::<AgentDynamicVisibility>(agent)
-        .ok_or(AgentStepError::ContextMissing)?
-        .resources()
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+fn build_available_tools(
+    world: &World,
+    agent: Entity,
+    resources: &[ResourceId],
+) -> Result<AvailableTools, AgentStepError> {
     let maps = world
         .get_component::<AgentToolMap>(agent)
         .ok_or(AgentStepError::ToolMapMissing)?;
     let mut definitions = Vec::with_capacity(resources.len());
-    for resource in &resources {
+    for resource in resources {
         let matched = maps.get_by_resource(resource);
         if matched.len() != 1 {
             return Err(AgentStepError::Tool(ToolError::new(
@@ -1975,34 +2012,6 @@ fn build_available_tools(world: &World, agent: Entity) -> Result<AvailableTools,
         });
     }
     Ok(AvailableTools { definitions })
-}
-
-fn tool_turn_completed_system(world: &mut World) {
-    let completed = world
-        .event_reader::<ToolTurnCompleted>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    let events = world.event_sender();
-    for event in completed {
-        let current_turn = world
-            .get_component::<AgentStatus>(event.agent)
-            .ok_or(AgentStepError::StatusMissing)
-            .map(|status| status.turn_id.as_deref() == Some(&event.turn_id));
-        let result = match current_turn {
-            Ok(true) => send_inference_request(world, &event.turn_id, event.agent, &events),
-            Ok(false) => Err(AgentStepError::InvalidToolBatch),
-            Err(error) => Err(error),
-        };
-        if let Err(error) = result {
-            events.send_event(AgentFailure {
-                id: event.turn_id,
-                agent: event.agent,
-                kind: AgentFailureKind::Agent,
-                message: error.failure_message(),
-            });
-        }
-    }
 }
 
 fn assert_conversation_message(message: &Message) {
@@ -2162,7 +2171,6 @@ mod tests {
             agent,
             message: Message::User {
                 content: "hello".into(),
-                tool_calls: Vec::new(),
             },
         });
         app.tick();
@@ -2192,7 +2200,6 @@ mod tests {
             agent,
             message: Message::User {
                 content: "hello".into(),
-                tool_calls: Vec::new(),
             },
         });
         app.tick();
@@ -2214,7 +2221,6 @@ mod tests {
                 .messages(),
             [Message::User {
                 content: "hello".into(),
-                tool_calls: Vec::new(),
             }]
         );
     }
@@ -2296,37 +2302,10 @@ mod tests {
         }
         assert_eq!(commands, 1);
     }
-
-    #[test]
-    fn loading_skills_are_templates_with_fresh_call_ids() {
-        let resource = ResourceId::parse("skill:local/review").unwrap();
-        let mut status = AgentStatus::default();
-        assert!(status
-            .load_skill(PendingToolCall {
-                call: ToolCall {
-                    id: "initial-call".into(),
-                    resource: ResourceId::parse("skill:local/review").unwrap(),
-                    arguments: "{}".into(),
-                },
-                resource,
-                kind: ToolCallKind::Skill,
-            })
-            .is_ok());
-
-        let first = expand_loading_skills(&status);
-        let second = expand_loading_skills(&status);
-        assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 1);
-        assert_ne!(first[0].call.id, "initial-call");
-        assert_ne!(first[0].call.id, second[0].call.id);
-        assert_eq!(first[0].resource, second[0].resource);
-        assert!(status.unload_skill("skill:local/review:latest"));
-        status.unload_all_skills();
-    }
 }
 
 #[cfg(test)]
-mod loading_skill_tests {
+mod tests {
     use serde_json::json;
     use tool_plugin::{register_agent_tool, ToolPlugin, ToolTemplate};
 
@@ -2336,12 +2315,36 @@ mod loading_skill_tests {
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
             .add_plugin(ToolPlugin::default())
+            .add_plugin(mcl_plugin::MclPlugin::open(std::env::temp_dir()).unwrap())
             .add_plugin(AgentPlugin::default());
         let agent = app.world_mut().spawn();
         assert!(app
             .world_mut()
             .insert_component(agent, AgentStatus::default()));
         (app, agent)
+    }
+
+    fn base_mcl() -> std::sync::Arc<mcl_plugin::MclProgram> {
+        mcl_plugin::compile_mcl(mcl_plugin::MclCompileRequest {
+            root: mcl_plugin::MclSource::new(
+                ResourceId::parse("mcl:local/test:latest").unwrap(),
+                r#"base context test {
+block conversation: context persistent;
+view messages: messages { select entry from conversation; }
+view tools: tools { select resource from capabilities.dynamic; }
+request inference { system = agent.system; messages = messages; tools = tools; }
+on agent.created { restore capabilities.dynamic from capabilities.default; }
+on message.user { append event.entry into conversation; emit inference using inference; }
+on message.assistant where event.tool_calls is not empty { append event.exchange into conversation; emit tools event.tool_calls; }
+on message.tool { append event.entry into event.exchange; }
+on tool.batch.completed { emit inference using inference; }
+on message.assistant where event.tool_calls is empty { append event.entry into conversation; finish turn; }
+}"#,
+                std::path::PathBuf::from("/test/main.mcl"),
+            ),
+            dependencies: std::collections::BTreeMap::new(),
+        })
+        .unwrap()
     }
 
     #[test]
@@ -2394,8 +2397,20 @@ mod loading_skill_tests {
                 system_prompt: String::new(),
                 messages: Vec::new(),
                 tool_context: Vec::new(),
+                ordered_messages: Vec::new(),
             },
         ));
+        app.world_mut()
+            .attach_agent_mcl(
+                agent,
+                AttachAgentMclRequest {
+                    base: base_mcl(),
+                    system_prompt: "system".into(),
+                    restored_messages: Vec::new(),
+                    default_visibility: BTreeSet::new(),
+                },
+            )
+            .unwrap();
         assert!(app
             .world_mut()
             .insert_component(agent, AgentTokenUsage::from_totals(&TokenUsage::default()),));
@@ -2448,7 +2463,6 @@ mod loading_skill_tests {
         let original = vec![
             Message::User {
                 content: "old request".into(),
-                tool_calls: Vec::new(),
             },
             Message::Assistant {
                 reasoning: None,
@@ -2457,7 +2471,6 @@ mod loading_skill_tests {
             },
             Message::User {
                 content: "recent request".into(),
-                tool_calls: Vec::new(),
             },
         ];
         assert!(app.world_mut().insert_component(
@@ -2466,6 +2479,7 @@ mod loading_skill_tests {
                 system_prompt: "system".into(),
                 messages: original.clone(),
                 tool_context: Vec::new(),
+                ordered_messages: original.clone(),
             },
         ));
 
@@ -2493,8 +2507,8 @@ mod loading_skill_tests {
         assert_eq!(&request.messages[1..3], &original[..2]);
         assert!(matches!(
             &request.messages[3],
-            Message::User { content, tool_calls }
-                if content == CONTEXT_COMPACTION_PROMPT && tool_calls.is_empty()
+            Message::User { content }
+                if content == CONTEXT_COMPACTION_PROMPT
         ));
         assert_eq!(
             app.world()
@@ -2521,9 +2535,8 @@ mod loading_skill_tests {
         assert_eq!(rewritten.len(), 2);
         assert!(matches!(
             &rewritten[0],
-            Message::User { content, tool_calls }
+            Message::User { content }
                 if content.contains("<compacted-summary>\ncondensed context\n</compacted-summary>")
-                    && tool_calls.is_empty()
         ));
         assert_eq!(rewritten[1], original[2]);
         assert_eq!(app.world().agent_is_working(agent), Some(false));
@@ -2556,7 +2569,6 @@ mod loading_skill_tests {
                 messages: vec![
                     Message::User {
                         content: "old".into(),
-                        tool_calls: Vec::new(),
                     },
                     Message::Assistant {
                         reasoning: None,
@@ -2565,6 +2577,7 @@ mod loading_skill_tests {
                     },
                 ],
                 tool_context: Vec::new(),
+                ordered_messages: Vec::new(),
             },
         ));
         app.world().send_event(AgentContextCompactRequest {
@@ -2582,7 +2595,6 @@ mod loading_skill_tests {
                 agent,
                 Message::User {
                     content: "concurrent".into(),
-                    tool_calls: Vec::new(),
                 },
                 &events,
             );
@@ -2619,6 +2631,11 @@ mod loading_skill_tests {
                 system_prompt: "system".into(),
                 messages: Vec::new(),
                 tool_context: vec![Message::Tool {
+                    resource_id: ResourceId::parse("shell:local/sh:latest").unwrap(),
+                    tool_call_id: "call-1".into(),
+                    content: "partial".into(),
+                }],
+                ordered_messages: vec![Message::Tool {
                     resource_id: ResourceId::parse("shell:local/sh:latest").unwrap(),
                     tool_call_id: "call-1".into(),
                     content: "partial".into(),
@@ -2789,18 +2806,24 @@ mod loading_skill_tests {
         .unwrap();
         assert!(app.world_mut().insert_component(
             agent,
-            AgentDynamicVisibility {
-                resources: BTreeSet::new(),
-            },
-        ));
-        assert!(app.world_mut().insert_component(
-            agent,
             AgentContext {
                 system_prompt: "system".into(),
                 messages: Vec::new(),
                 tool_context: Vec::new(),
+                ordered_messages: Vec::new(),
             },
         ));
+        app.world_mut()
+            .attach_agent_mcl(
+                agent,
+                AttachAgentMclRequest {
+                    base: base_mcl(),
+                    system_prompt: "system".into(),
+                    restored_messages: Vec::new(),
+                    default_visibility: BTreeSet::new(),
+                },
+            )
+            .unwrap();
         assert!(app
             .world_mut()
             .get_component_mut::<AgentStatus>(agent)
@@ -2818,19 +2841,26 @@ mod loading_skill_tests {
             .schemas
             .insert((agent, "turn-1".into()), schema);
 
+        let call = ToolCall {
+            id: "call-1".into(),
+            tool_name: map.tool_name,
+            arguments: "{}".into(),
+        };
         app.world().send_event(AgentMessage {
             id: "turn-1".into(),
             agent,
             message: Message::Assistant {
                 reasoning: None,
                 content: None,
-                tool_calls: vec![ToolCall {
-                    id: "call-1".into(),
-                    tool_name: map.tool_name,
-                    arguments: "{}".into(),
-                }],
+                tool_calls: vec![call.clone()],
             },
             usage: None,
+        });
+        app.tick();
+        app.world().send_event(MclEffectsProduced {
+            id: "turn-1".into(),
+            agent,
+            effects: vec![MclEffect::ExecuteTools { calls: vec![call] }],
         });
         app.tick();
         app.tick();
@@ -2857,104 +2887,6 @@ mod loading_skill_tests {
                     && tool_call_id == "call-1"
                     && content == TOOL_PERMISSION_DENIED
             )));
-        assert!(app
-            .world()
-            .get_component::<AgentStatus>(agent)
-            .unwrap()
-            .loading_skills
-            .is_empty());
-    }
-
-    #[test]
-    fn load_and_unload_events_update_loading_skills() {
-        let (mut app, agent) = test_app();
-        let skill = ResourceId::parse("skill:local/review:latest").unwrap();
-        for id in ["load-1", "load-2"] {
-            app.world().send_event(LoadAgentSkill {
-                id: id.into(),
-                agent,
-                resource_id: skill.clone(),
-            });
-        }
-        app.tick();
-        assert_eq!(
-            app.world()
-                .get_component::<AgentStatus>(agent)
-                .unwrap()
-                .loading_skills,
-            BTreeSet::from([skill.clone()])
-        );
-
-        for id in ["unload-1", "unload-2"] {
-            app.world().send_event(UnloadAgentSkill {
-                id: id.into(),
-                agent,
-                resource_id: skill.clone(),
-            });
-        }
-        app.tick();
-        assert!(app
-            .world()
-            .get_component::<AgentStatus>(agent)
-            .unwrap()
-            .loading_skills
-            .is_empty());
-    }
-
-    #[test]
-    fn loading_non_skill_resource_emits_failure() {
-        let (mut app, agent) = test_app();
-        app.world().send_event(LoadAgentSkill {
-            id: "load-1".into(),
-            agent,
-            resource_id: ResourceId::parse("tool:local/query:latest").unwrap(),
-        });
-        app.tick();
-        app.tick();
-        let failure = app
-            .world()
-            .event_reader::<AgentFailure>()
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(failure.id, "load-1");
-        assert_eq!(failure.kind, AgentFailureKind::Agent);
-    }
-
-    #[test]
-    fn unload_all_event_clears_every_loading_skill() {
-        let (mut app, agent) = test_app();
-        for resource_id in [
-            ResourceId::parse("skill:local/review:latest").unwrap(),
-            ResourceId::parse("skill:local/commit:latest").unwrap(),
-        ] {
-            app.world().send_event(LoadAgentSkill {
-                id: resource_id.to_string(),
-                agent,
-                resource_id,
-            });
-        }
-        app.tick();
-        assert_eq!(
-            app.world()
-                .get_component::<AgentStatus>(agent)
-                .unwrap()
-                .loading_skills
-                .len(),
-            2
-        );
-
-        app.world().send_event(UnloadAllAgentSkills {
-            id: "unload-all-1".into(),
-            agent,
-        });
-        app.tick();
-        assert!(app
-            .world()
-            .get_component::<AgentStatus>(agent)
-            .unwrap()
-            .loading_skills
-            .is_empty());
     }
 
     #[test]
@@ -2962,6 +2894,7 @@ mod loading_skill_tests {
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
             .add_plugin(ToolPlugin::default())
+            .add_plugin(mcl_plugin::MclPlugin::open(std::env::temp_dir()).unwrap())
             .add_plugin(AgentPlugin::default());
         let workspace = app.world_mut().spawn();
         let resource_id = ResourceId::parse("skill:local/review:latest").unwrap();
@@ -2969,9 +2902,11 @@ mod loading_skill_tests {
             id: "agent-create".into(),
             agent_id: ResourceId::parse("agent:demo/reviewer:latest").unwrap(),
             workspace_id: workspace,
+            base_mcl: base_mcl(),
             system_prompt: String::new(),
             messages: Vec::new(),
             tool_context: Vec::new(),
+            ordered_messages: Vec::new(),
             token_usage: TokenUsage::default(),
             default_visibility: BTreeSet::from([resource_id.clone()]),
         });
@@ -3019,10 +2954,10 @@ mod loading_skill_tests {
 
         assert!(!app
             .world()
-            .get_component::<AgentDynamicVisibility>(agent)
+            .get_component::<AgentMcl>(agent)
             .unwrap()
-            .resources()
-            .contains(&resource_id));
+            .capabilities()
+            .is_visible(&resource_id));
         assert!(app
             .world()
             .event_reader::<AgentVisibleResourceRemoved>()
@@ -3036,65 +2971,19 @@ mod loading_skill_tests {
     }
 
     #[test]
-    fn removing_skill_visibility_also_unloads_the_skill() {
-        let (mut app, agent) = test_app();
-        let skill = ResourceId::parse("skill:local/review:latest").unwrap();
-        assert!(app.world_mut().insert_component(
-            agent,
-            AgentDefaultVisibility {
-                resources: BTreeSet::from([skill.clone()]),
-            },
-        ));
-        assert!(app.world_mut().insert_component(
-            agent,
-            AgentDynamicVisibility {
-                resources: BTreeSet::from([skill.clone()]),
-            },
-        ));
-        assert!(app
-            .world_mut()
-            .get_component_mut::<AgentStatus>(agent)
-            .unwrap()
-            .load_skill(skill.clone())
-            .is_ok());
-
-        app.world().send_event(SetAgentDefaultResourceVisibility {
-            id: "remove-default-skill".into(),
-            agent,
-            resource_id: skill.clone(),
-            visible: false,
-        });
-        app.tick();
-
-        assert!(!app
-            .world()
-            .get_component::<AgentDynamicVisibility>(agent)
-            .unwrap()
-            .resources()
-            .contains(&skill));
-        assert!(!app
-            .world()
-            .get_component::<AgentStatus>(agent)
-            .unwrap()
-            .loading_skills
-            .contains(&skill));
-    }
-
-    #[test]
     fn external_visibility_switch_rejects_non_default_resources() {
         let (mut app, agent) = test_app();
-        assert!(app.world_mut().insert_component(
-            agent,
-            AgentDefaultVisibility {
-                resources: BTreeSet::new(),
-            },
-        ));
-        assert!(app.world_mut().insert_component(
-            agent,
-            AgentDynamicVisibility {
-                resources: BTreeSet::new(),
-            },
-        ));
+        app.world_mut()
+            .attach_agent_mcl(
+                agent,
+                AttachAgentMclRequest {
+                    base: base_mcl(),
+                    system_prompt: String::new(),
+                    restored_messages: Vec::new(),
+                    default_visibility: BTreeSet::new(),
+                },
+            )
+            .unwrap();
         app.world().send_event(SetAgentDefaultResourceVisibility {
             id: "inject-runtime-resource".into(),
             agent,
@@ -3113,9 +3002,11 @@ mod loading_skill_tests {
         assert_eq!(failure.kind, AgentFailureKind::Agent);
         assert!(app
             .world()
-            .get_component::<AgentDynamicVisibility>(agent)
+            .get_component::<AgentMcl>(agent)
             .unwrap()
-            .resources()
-            .is_empty());
+            .capabilities()
+            .visible_resources()
+            .next()
+            .is_none());
     }
 }

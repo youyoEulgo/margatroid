@@ -10,6 +10,7 @@ use async_runtime_plugin::{AppAsyncExt, AsyncTaskError, WorldAsyncExt};
 use core_plugin::{App, Component as MecsComponent, Entity, Event, Plugin, Resource, World};
 use futures_util::FutureExt;
 use margatroid_types::ResourceId;
+use mcl_plugin::{load_mcl_program_from_path, MclProgram, MclProgramKind};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
@@ -29,6 +30,7 @@ pub enum AgentImageLoadErrorKind {
     SoulReadFailed,
     SoulInvalidUtf8,
     InvalidResourceName,
+    BaseMclLoadFailed,
     TaskPanicked,
 }
 
@@ -113,6 +115,48 @@ impl AgentImageSoul {
 }
 
 impl MecsComponent for AgentImageSoul {}
+
+pub struct AgentImageBaseDriver {
+    program: Arc<MclProgram>,
+}
+
+impl AgentImageBaseDriver {
+    pub fn program(&self) -> &Arc<MclProgram> {
+        &self.program
+    }
+}
+
+impl MecsComponent for AgentImageBaseDriver {}
+
+pub type AgentImageBaseMcl = AgentImageBaseDriver;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentImageDependency {
+    resource_id: ResourceId,
+    source: Option<Arc<str>>,
+}
+
+impl AgentImageDependency {
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource_id
+    }
+
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+}
+
+pub struct AgentImageDependencies {
+    entries: Arc<[AgentImageDependency]>,
+}
+
+impl AgentImageDependencies {
+    pub fn entries(&self) -> &[AgentImageDependency] {
+        &self.entries
+    }
+}
+
+impl MecsComponent for AgentImageDependencies {}
 
 pub struct AgentImageModelParameters {
     temperature: Option<f32>,
@@ -243,6 +287,15 @@ impl Resource for AgentImageLoaderState {}
 struct AgentImageManifest {
     schema_version: u32,
     inference: AgentImageModelDocument,
+    #[serde(default)]
+    dependencies: Vec<AgentImageDependencyDocument>,
+}
+
+#[derive(Deserialize)]
+struct AgentImageDependencyDocument {
+    id: String,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -259,7 +312,6 @@ struct AgentImageModelDocument {
 struct AgentImageLoaderLimits {
     max_manifest_bytes: u64,
     max_soul_bytes: u64,
-    max_embedded_resources: usize,
     max_model_id_bytes: usize,
     max_stop_sequences: usize,
     max_stop_sequence_bytes: usize,
@@ -270,7 +322,6 @@ impl Default for AgentImageLoaderLimits {
         Self {
             max_manifest_bytes: 64 * 1024,
             max_soul_bytes: 1024 * 1024,
-            max_embedded_resources: 4096,
             max_model_id_bytes: 1024,
             max_stop_sequences: 128,
             max_stop_sequence_bytes: 4096,
@@ -289,8 +340,61 @@ impl Event for AgentImageReadTask {}
 struct PreparedAgentImage {
     reference: ResourceId,
     soul: AgentImageSoul,
+    base_driver: AgentImageBaseDriver,
+    dependencies: AgentImageDependencies,
     model: AgentImageModelConfig,
     default_visibility: AgentImageDefaultVisibility,
+}
+
+fn parse_default_visibility(
+    source: &str,
+    dependencies: &[AgentImageDependency],
+) -> Result<BTreeSet<ResourceId>, AgentImageLoadError> {
+    let mut aliases = HashMap::new();
+    for line in source.lines() {
+        let Some(rest) = line.trim().strip_prefix("handle(\"IMPORT ") else {
+            continue;
+        };
+        let Some((resource, alias)) = rest.split_once(" AS ") else {
+            continue;
+        };
+        let resource = resource.trim();
+        let alias = alias.trim().trim_end_matches("\")");
+        if ResourceId::parse(resource).is_ok() {
+            aliases.insert(alias.to_owned(), resource.to_owned());
+        }
+    }
+    let Some(inject) = source
+        .lines()
+        .map(str::trim)
+        .find(|line| line.contains("INJECT") && line.contains("TO tool_default"))
+    else {
+        return Ok(BTreeSet::new());
+    };
+    let names = inject
+        .split("INJECT")
+        .nth(1)
+        .and_then(|value| value.split("TO tool_default").next())
+        .unwrap_or_default();
+    let mut result = BTreeSet::new();
+    for alias in names.split(',').map(str::trim) {
+        let Some(resource) = aliases.get(alias) else {
+            continue;
+        };
+        let resource = ResourceId::parse(resource).map_err(|_| {
+            AgentImageLoadError::new(
+                AgentImageLoadErrorKind::InvalidResourceName,
+                "Base Driver visibility references an invalid resource",
+            )
+        })?;
+        if dependencies
+            .iter()
+            .any(|dependency| dependency.resource_id == resource)
+        {
+            result.insert(resource);
+        }
+    }
+    Ok(result)
 }
 
 struct AgentImageReadPayload {
@@ -445,6 +549,54 @@ async fn read_agent_image_inner(
         ));
     }
     validate_model_document(&manifest.inference, &task.limits)?;
+    let dependencies = manifest
+        .dependencies
+        .into_iter()
+        .map(|dependency| {
+            let resource_id = ResourceId::parse(&dependency.id).map_err(|_| {
+                AgentImageLoadError::new(
+                    AgentImageLoadErrorKind::InvalidResourceName,
+                    "agent image dependency ID is invalid",
+                )
+            })?;
+            if dependency.source.as_deref().is_some_and(|source| {
+                source.trim().is_empty() || source.chars().any(char::is_control)
+            }) {
+                return Err(AgentImageLoadError::new(
+                    AgentImageLoadErrorKind::InvalidResourceName,
+                    "agent image dependency source is empty or contains control characters",
+                ));
+            }
+            Ok(AgentImageDependency {
+                resource_id,
+                source: dependency.source.map(Arc::from),
+            })
+        })
+        .collect::<Result<Arc<[_]>, _>>()?;
+    let base_driver_id = ResourceId::new(
+        "mcl",
+        task.reference.scope(),
+        task.reference.name(),
+        Some(task.reference.tag()),
+    )
+    .map_err(|_| {
+        AgentImageLoadError::new(
+            AgentImageLoadErrorKind::BaseMclLoadFailed,
+            "AgentImage reference cannot derive a Base Driver resource ID",
+        )
+    })?;
+    let base_driver = load_mcl_program_from_path(
+        std::slice::from_ref(&image_root),
+        &base_driver_id,
+        &image_root.join("base.lua"),
+        MclProgramKind::Base,
+    )
+    .map_err(|error| {
+        AgentImageLoadError::new(
+            AgentImageLoadErrorKind::BaseMclLoadFailed,
+            format!("Base Driver could not be loaded: {:?}", error.kind()),
+        )
+    })?;
 
     let (soul_bytes, soul_signature) = read_bounded(
         &soul_path,
@@ -465,16 +617,6 @@ async fn read_agent_image_inner(
         ));
     }
 
-    let skills = discover_resource_names("skill", &image_root.join("skills"), &task.limits).await?;
-    let workflows =
-        discover_resource_names("workflow", &image_root.join("workflows"), &task.limits).await?;
-    if skills.len() + workflows.len() > task.limits.max_embedded_resources {
-        return Err(AgentImageLoadError::new(
-            AgentImageLoadErrorKind::LimitExceeded,
-            "embedded resource count exceeds the configured limit",
-        ));
-    }
-
     let layout_after = validate_image_layout(&image_root).await?;
     if layout_before != layout_after
         || manifest_signature
@@ -488,12 +630,28 @@ async fn read_agent_image_inner(
         ));
     }
 
-    let resources = skills.into_iter().chain(workflows).collect();
+    let resources = parse_default_visibility(
+        &tokio::fs::read_to_string(image_root.join("base.lua"))
+            .await
+            .map_err(|_| {
+                AgentImageLoadError::new(
+                    AgentImageLoadErrorKind::BaseMclLoadFailed,
+                    "Base Driver could not be read",
+                )
+            })?,
+        &dependencies,
+    )?;
     let inference = manifest.inference;
     Ok(PreparedAgentImage {
         reference: task.reference,
         soul: AgentImageSoul {
             content: Arc::from(soul),
+        },
+        base_driver: AgentImageBaseDriver {
+            program: base_driver,
+        },
+        dependencies: AgentImageDependencies {
+            entries: dependencies,
         },
         model: AgentImageModelConfig {
             model: Arc::from(inference.model),
@@ -574,11 +732,15 @@ fn apply_agent_image_payload(world: &mut World, payload: AgentImageReadPayload) 
             let PreparedAgentImage {
                 reference,
                 soul,
+                base_driver,
+                dependencies,
                 model,
                 default_visibility,
             } = prepared;
             assert!(world.insert_component(entity, AgentImageIdentity { reference }));
             assert!(world.insert_component(entity, soul));
+            assert!(world.insert_component(entity, base_driver));
+            assert!(world.insert_component(entity, dependencies));
             assert!(world.insert_component(entity, model));
             assert!(world.insert_component(entity, default_visibility));
             world
@@ -636,14 +798,14 @@ async fn resolve_image_root(
 }
 
 async fn validate_image_layout(root: &Path) -> Result<DirectorySignature, AgentImageLoadError> {
-    let signature = directory_signature(root, 5).await?;
+    let signature = directory_signature(root, 6).await?;
     let mut manifest = false;
     let mut soul = false;
     for entry in &signature.entries {
         match (entry.name.to_str(), entry.kind) {
             (Some("agent.toml"), DirectoryEntryKind::File) => manifest = true,
             (Some("SOUL.md"), DirectoryEntryKind::File) => soul = true,
-            (Some("skills" | "workflows"), DirectoryEntryKind::Directory) => {}
+            (Some("base.lua"), DirectoryEntryKind::File) => {}
             _ => {
                 return Err(AgentImageLoadError::new(
                     AgentImageLoadErrorKind::InvalidLayout,
@@ -652,102 +814,16 @@ async fn validate_image_layout(root: &Path) -> Result<DirectorySignature, AgentI
             }
         }
     }
-    if !manifest || !soul {
+    let base_driver = signature.entries.iter().any(|entry| {
+        entry.name.to_str() == Some("base.lua") && entry.kind == DirectoryEntryKind::File
+    });
+    if !manifest || !soul || !base_driver {
         return Err(AgentImageLoadError::new(
             AgentImageLoadErrorKind::InvalidLayout,
-            "agent image requires regular agent.toml and SOUL.md files",
+            "agent image requires agent.toml, SOUL.md, and base.lua",
         ));
     }
     Ok(signature)
-}
-
-async fn discover_resource_names(
-    resource_type: &str,
-    root: &Path,
-    limits: &AgentImageLoaderLimits,
-) -> Result<BTreeSet<ResourceId>, AgentImageLoadError> {
-    let metadata = match tokio::fs::symlink_metadata(root).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(error) => {
-            return Err(AgentImageLoadError::new(
-                AgentImageLoadErrorKind::InvalidLayout,
-                format!("cannot inspect embedded resource root: {error}"),
-            ))
-        }
-    };
-    if metadata.file_type().is_symlink() {
-        return Err(AgentImageLoadError::new(
-            AgentImageLoadErrorKind::SymlinkNotAllowed,
-            "embedded resource root cannot be a symlink",
-        ));
-    }
-    if !metadata.is_dir() {
-        return Err(AgentImageLoadError::new(
-            AgentImageLoadErrorKind::InvalidLayout,
-            "embedded resource root must be a directory",
-        ));
-    }
-
-    let root_before = directory_signature(root, limits.max_embedded_resources).await?;
-    let mut names = BTreeSet::new();
-    for scope in &root_before.entries {
-        if scope.kind != DirectoryEntryKind::Directory {
-            return Err(AgentImageLoadError::new(
-                AgentImageLoadErrorKind::InvalidLayout,
-                "embedded resource scope must be a directory",
-            ));
-        }
-        let scope_name = scope.name.to_str().ok_or_else(|| {
-            AgentImageLoadError::new(
-                AgentImageLoadErrorKind::InvalidResourceName,
-                "embedded resource scope is not valid UTF-8",
-            )
-        })?;
-        let scope_root = root.join(&scope.name);
-        let scope_before = directory_signature(&scope_root, limits.max_embedded_resources).await?;
-        for name in &scope_before.entries {
-            if name.kind != DirectoryEntryKind::Directory {
-                return Err(AgentImageLoadError::new(
-                    AgentImageLoadErrorKind::InvalidLayout,
-                    "embedded resource name must be a directory",
-                ));
-            }
-            let name = name.name.to_str().ok_or_else(|| {
-                AgentImageLoadError::new(
-                    AgentImageLoadErrorKind::InvalidResourceName,
-                    "embedded resource name is not valid UTF-8",
-                )
-            })?;
-            let resource = ResourceId::new(resource_type, scope_name, name, None::<String>)
-                .map_err(|_| {
-                    AgentImageLoadError::new(
-                        AgentImageLoadErrorKind::InvalidResourceName,
-                        "embedded resource name is invalid",
-                    )
-                })?;
-            names.insert(resource);
-            if names.len() > limits.max_embedded_resources {
-                return Err(AgentImageLoadError::new(
-                    AgentImageLoadErrorKind::LimitExceeded,
-                    "embedded resource count exceeds the configured limit",
-                ));
-            }
-        }
-        if scope_before != directory_signature(&scope_root, limits.max_embedded_resources).await? {
-            return Err(AgentImageLoadError::new(
-                AgentImageLoadErrorKind::SourceChanged,
-                "embedded resource directory changed while it was being read",
-            ));
-        }
-    }
-    if root_before != directory_signature(root, limits.max_embedded_resources).await? {
-        return Err(AgentImageLoadError::new(
-            AgentImageLoadErrorKind::SourceChanged,
-            "embedded resource root changed while it was being read",
-        ));
-    }
-    Ok(names)
 }
 
 fn normalize_root(root: PathBuf) -> Result<PathBuf, AgentImageLoadError> {
@@ -993,8 +1069,7 @@ mod tests {
 
     fn write_image(library: &Path, soul: &str) {
         let image = image_root(library);
-        fs::create_dir_all(image.join("skills/local/code-review")).unwrap();
-        fs::create_dir_all(image.join("workflows/local/review")).unwrap();
+        fs::create_dir_all(&image).unwrap();
         fs::write(
             image.join("agent.toml"),
             r#"schema_version = 1
@@ -1005,10 +1080,21 @@ temperature = 0.7
 max_output_tokens = 8192
 top_p = 0.9
 stop = ["DONE"]
+
+[[dependencies]]
+id = "skill:local/code-review:latest"
+
+[[dependencies]]
+id = "workflow:local/review:latest"
 "#,
         )
         .unwrap();
         fs::write(image.join("SOUL.md"), soul).unwrap();
+        fs::write(
+            image.join("base.lua"),
+            "handle(\"IMPORT skill:local/code-review:latest AS review\")\nhandle(\"IMPORT workflow:local/review:latest AS workflow\")\nhandle(\"INJECT review, workflow TO tool_default FROM tool\")\nhandle(\"INJECT SELECT tool_default FROM tool COVER tool_dynamic FROM tool\")\n",
+        )
+        .unwrap();
     }
 
     fn app(library: &Path) -> App {

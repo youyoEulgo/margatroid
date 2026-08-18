@@ -62,7 +62,7 @@ mecs基础设施
 ```
 
 AgentImage和模型路由拥有独立生命周期，因此由Loader读取并形成运行时对象。BuiltinToolPlugin
-组合Skill、Workflow、Lua和Shell内建执行器，将Workspace提交的可见资源注册到ToolMap。
+组合Skill、Lua和Shell内建执行器，将MCL IMPORT提交的可执行资源注册到AgentResourceMap；Workflow由MclPlugin运行。
 ToolPlugin注入实例位置并路由调用；共享资源名称仍来自无业务行为的纯类型crate。
 
 ## 3. mecs
@@ -183,33 +183,33 @@ Workflow 属于 Skill 范畴，但负责显式控制多步骤执行。节点类�
 
 AgentInstance持有两层统一资源可见性：`AgentDefaultVisibility`是Workspace创建时根据AgentImage
 默认值和Workspace参数合并出的只读`ResourceId`集合；`AgentDynamicVisibility`初始复制基线，
-表示普通Tool、Skill、Workflow和未来资源的当前实际可用集合，后续可由Agent或Workflow逻辑调整。
+表示普通Tool、Skill和未来可执行资源的当前实际可用集合，后续可由Base Driver或Workflow Driver调整。
 
 Workspace启动时把每个可见ResourceId统一交给BuiltinToolPlugin验证并注册到Agent Entity上的
-`AgentToolMap`；
+`AgentResourceMap`；
 每个Agent独立分配`tool0_query`、`skill1_review`等模型工具名。每次LLM请求前，AgentPlugin遍历
-动态可见性，从当前AgentToolMap取得内部ToolSpec。ToolPlugin不读取Agent可见性组件。
+动态可见性，从当前AgentResourceMap取得内部ToolSpec。ToolPlugin不读取Agent可见性组件。
 
-前端可以随用户消息直接指定Skill、Workflow或其他工具调用。此时AgentPlugin先记录用户消息并执行
+前端可以随用户消息直接指定Skill或其他可执行资源调用。此时AgentPlugin先记录用户消息并执行
 指定调用，不立即发送LLM请求；Tool响应作为统一Message写入上下文，全部指定调用完成后再使用完整上下文发起推理。
 前端没有指定调用时，记录用户消息后直接推理。两条路径的LLM请求都从动态可见性构造`tools`，
 用户消息意图不负责启用或禁用模型工具。
 
-模型一次返回多个ToolCall时，ToolPlugin把解析后的`ToolCallRequest`保存在`PendingToolCalls`。
-每个Tool响应由ToolPlugin移除对应请求并整理为AgentMessage；同轮Pending为空时才发送
-`ToolTurnCompleted`，AgentPlugin随后发出下一次`InferenceRequestEvent`。
+模型一次返回多个ToolCall时，MCL把每个调用写入Agent的`pending_tool`类型化数组；ToolPlugin
+另将解析后的`ToolCallRequest`保存在`PendingToolCalls`，仅用于关联异步请求与响应。每个Tool
+响应由ToolPlugin移除对应请求并整理为AgentMessage，MCL再按`tool_call_id`删除`pending_tool`
+中的对应元素；数组为空时才发出下一次`InferenceRequestEvent`。
 
 BuiltinToolPlugin按资源类型选择隐藏执行器：
 
 ```text
 skill:*    -> tool:builtin/skill-loader:latest
-workflow:* -> tool:builtin/workflow-loader:latest
 tool:*     -> tool:builtin/lua-runtime:latest
 shell:*    -> tool:builtin/shell:latest
 ```
 
 LLM只看到左侧资源生成的ToolSpec；`tool:builtin/*`不进入可见性，也不能注册成模型工具。
-Skill执行器为每个Agent的可见Skill注册一个独立ToolMap，并在执行时按作用域动态解析内容：
+Skill执行器为每个Agent导入的Skill注册一个ResourceMapEntry，并在执行时按作用域动态解析内容：
 
 ```text
 项目级 .margatroid > AgentImage内置 > 主目录 ~/.margatroid
@@ -225,18 +225,13 @@ Workspace中的Agent配置形式：
 agents:
   coder:
     image: local/coder:latest
-    resources:
-      - provider: skill
-        name: local/project-context
-      - provider: tool
-        name: builtin/read-file
-    disable_resources:
-      - provider: skill
-        name: local/dangerous-command
 ```
 
+Agent资源依赖不写入Workspace文件；AgentImage的`agent.toml`依赖清单声明资源ID和可选来源，
+`base.lua`中的MCL `IMPORT`只负责将已声明资源导入上下文和可见性。
+
 Workflow执行器同样为每个Agent注册可见Workflow。Workflow依赖Skill时将对应Skill
-`ResourceId`加入动态可见性，通过同一AgentToolMap和ToolCall链路调用，不建立旁路加载协议。
+`ResourceId`加入动态可见性，通过同一AgentResourceMap和ToolCall链路调用，不建立旁路加载协议。
 
 ## 7. Memory
 
@@ -259,27 +254,27 @@ history_messages
     每行分列保存role、content、tool_calls、resource_id、tool_call_id、交互轮次ID和时间
     上下文压缩不会删除或覆盖历史行
 
-realtime_messages
-    使用conversation和tool两个context分区保存AgentContext.messages和tool_context
-    每次任一上下文变化后整体同步两个快照
+realtime_context
+    按position保存MCL msg.conversation的完整有序消息流
+    包含User、Assistant和Tool；每次conversation事务提交后整体同步快照
     未来上下文压缩可以替换该表，但不影响history_messages
 ```
 
-工具正文只进入当前轮`tool_context`，不写入历史。Tool历史内容直接替换为完整`resource_id`字符串，
-并在`resource_id`列保存结构化身份。
+Tool完整正文进入MCL `conversation`。历史表是否保存完整正文按资源类型执行既定策略，并始终在
+`resource_id`列保存结构化身份。
 
 WorkspacePlugin负责确定数据库路径。`workspace up/reload`创建Agent前先由MemoryPlugin打开数据库
-并读取`realtime_messages`，再把恢复出的`messages`和`tool_context`直接放入Agent创建事件。
+并读取`realtime_context`，再把恢复出的`ordered_messages`放入Agent创建事件。
 无法读取已有数据库时启动失败，不能静默退化为空上下文。
 
-`AgentContext.messages`通过`append_message`和`rewrite_messages`修改，`tool_context`通过追加和清空入口修改。修改完成后
-都发送携带两个完整快照的`margatroid_types::AgentContextMessagesUpdated`；MemoryPlugin逐个消费事件，并各自使用一次
-SQLite事务整体重写`realtime_messages`。MemoryPlugin仍不决定压缩时机、摘要内容、记忆检索或
+MCL `msg.conversation`事务提交后发送携带完整有序快照的
+`margatroid_types::AgentContextMessagesUpdated`；MemoryPlugin逐个消费事件，并各自使用一次
+SQLite事务整体重写`realtime_context`。MemoryPlugin仍不决定压缩时机、摘要内容、记忆检索或
 上下文裁剪策略。
 
 AgentPlugin的`AgentToolCallSystem`收到合法`AgentMessage`后，一律发送历史写入事件，不直接调用SQLite。
-User和Assistant追加到长期`messages`，Tool追加到当前轮`tool_context`。`tool_context`只在收到下一条
-User或Assistant时清空；`rewrite_messages`只影响实时表，不向历史表补写压缩结果。
+User、Assistant和Tool都由Base Driver追加到`msg.conversation`，不自动卸载Tool消息。上下文
+重写只影响实时表，不向历史表补写压缩结果。
 
 ## 8. CLI
 

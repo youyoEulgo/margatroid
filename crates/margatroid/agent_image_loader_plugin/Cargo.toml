@@ -9,6 +9,7 @@ async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
 futures-util = { workspace = true }
 margatroid_types = { path = "../types" }
+mcl_plugin = { path = "../mcl_plugin" }
 serde = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }

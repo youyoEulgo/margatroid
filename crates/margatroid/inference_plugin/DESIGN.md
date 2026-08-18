@@ -9,7 +9,7 @@ InferenceRequestEvent：推理请求事件，公开事件--AgentPlugin交付完�
     agent: Entity--请求所属Agent Entity
     agent_id: ResourceId--稳定Agent身份，用于流式消息和日志
     messages: Vec<Message>--System、长期对话和当前工具上下文
-    tools: Vec<ToolDefinition>--内部ToolSpec；name已经是所属AgentToolMap分配的tool_name
+    tools: Vec<ToolDefinition>--内部ToolSpec；name是ResourceMapEntry.resource_name
     impl Event for InferenceRequestEvent
 
 ContextCompactionInferenceRequest：上下文压缩推理请求，公开事件--AgentPlugin交付System、待压缩头部消息和压缩提示词
@@ -86,7 +86,7 @@ prepare_inference_system(world: &mut World)
         验证请求、Agent和消息结构
         读取AgentInferenceSnapshot及Workspace或全局模型路由
         把内部ToolSpec交给选定Provider Adapter构造Provider请求
-        不查询ToolPlugin，不读取AgentToolMap，不转换ResourceId
+        不查询ToolPlugin或读取AgentResourceMap；只转换请求中已经给出的resource_name
         普通Agent推理根据全局配置解析流式发送器；上下文压缩使用空ToolSpec和空发送器
         登记InFlightInferences并发送带结果用途的PreparedInference
         准备失败时，普通推理发送AgentFailure，上下文压缩发送ContextCompactionInferenceResponse::Err
@@ -110,10 +110,10 @@ publish_inference_output_system(world: &mut World)
 
 ProviderAdapter::build_request(input: ProviderInput) -> Result<ProviderHttpRequest, InferenceError>
     构造Provider请求：把Provider无关ToolSpec转换成对应API的ToolSpec
-    行为：ToolSpec.name原样使用AgentToolMap分配的tool_name；不编码ResourceId；OpenAI兼容流设置stream_options.include_usage=true以请求末尾Token统计
+    行为：为本次请求构造resource_name与Provider合法tool_name的双向映射；Provider名称使用本次请求内唯一序号前缀，非法字符替换为下划线并按Provider上限截断；OpenAI兼容流设置stream_options.include_usage=true以请求末尾Token统计
 
 ProviderAccumulator::finish(self) -> Result<ProviderInferenceResponse, InferenceError>
-    完成响应：把Provider工具调用统一为ToolCall { id, tool_name, arguments }
+    完成响应：使用本次请求的双向映射把Provider tool_name恢复为resource_name，再构造内部ToolCall { id, tool_name=resource_name, arguments }
     行为：OpenAI arguments字符串原样保留；对象型Provider参数序列化成JSON对象文本；无参数统一为"{}"
 
 DeepSeekAdapter::build_request(input: ProviderInput) -> Result<ProviderHttpRequest, InferenceError>
@@ -161,7 +161,7 @@ AgentPlugin
 
 ```text
 InferencePlugin负责模型路由、Provider协议适配、HTTP请求、流式输出、响应累积和异步结果发布。
-InferencePlugin不负责ResourceId与tool_name转换；tool_name由AgentToolMap在注册时确定并贯穿ToolSpec和ToolCall。
+InferencePlugin负责ResourceMapEntry.resource_name与Provider合法tool_name之间的本次请求双向转换；映射只存活到InferenceResponse转换完成，不写入AgentResourceMap。
 InferencePlugin不查询Agent可见性或工具注册状态，InferenceRequestEvent中的tools是本次请求唯一工具输入。
 上下文压缩请求始终使用空ToolSpec、空流式发送器和独立响应事件；摘要不会成为普通Assistant消息。
 上下文压缩Provider响应即使带usage也不进入AgentMessage或历史Token统计。

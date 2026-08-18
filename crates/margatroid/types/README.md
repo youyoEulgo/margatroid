@@ -30,8 +30,8 @@ Compose使用 `WorkspaceDefinition` 和 `WorkspaceAgentDefinition` 把配置文�
 `AgentMessage.agent` 始终使用后端内部 `Entity`。WorkspacePlugin 在产生用户消息事件前按完整
 Agent资源ID解析，协议 DTO 使用稳定 Agent ID，不暴露 ECS 内部句柄。
 
-`Message::User.tool_calls`直接保存前端预选调用。列表非空时AgentPlugin先执行工具，
-所有Tool响应进入当前轮上下文后再推理；列表为空时直接推理。
+`Message::User`只保存用户正文。手动工具调用不再挂在User消息上；需要手动调用时使用独立
+命令构造一条Assistant工具调用消息，遵守Provider要求的Assistant/Tool消息顺序。
 
 AgentPlugin使用`BTreeSet<ResourceId>`保存Agent可见性。`ResourceId.resource_type`负责选择工具
 定义Plugin，普通工具、Skill和Workflow不再建立不同通道。每次请求由AgentPlugin遍历该集合，并把单个
