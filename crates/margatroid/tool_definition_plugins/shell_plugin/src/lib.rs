@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,8 +12,9 @@ use async_runtime_plugin::{AppAsyncExt, AsyncRuntimeHandle, AsyncTaskError, Worl
 use core_plugin::{App, Entity, Event, Plugin, Resource, World};
 use margatroid_types::ResourceId;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tool_plugin::{
     register_agent_tool, AgentToolEnvironment, ToolCallRequest, ToolCallResponse, ToolError,
     ToolErrorKind, ToolPluginInstalled, ToolTemplate,
@@ -22,6 +25,7 @@ const SHELL_FILE: &str = "shell.toml";
 const SHELL_SCHEMA_FILE: &str = "input.schema.json";
 const SHELL_SCRIPT_FILE: &str = "main.sh";
 const SHELL_EXECUTOR_ID: &str = "tool:builtin/shell:latest";
+static SHELL_MARKER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellExecutionLimits {
@@ -154,6 +158,7 @@ impl Plugin for ShellPlugin {
             home_root: self.home_root,
         });
         app.world_mut().insert_resource(self.limits);
+        app.world_mut().insert_resource(PersistentShells::default());
         app.add_system(RuntimePlugin::UPDATE, shell_register_system)
             .add_system(RuntimePlugin::UPDATE, shell_tool_call_prepare_system)
             .add_async_system(RuntimePlugin::UPDATE, execute_prepared_shell)
@@ -189,6 +194,8 @@ struct ShellMetadata {
     schema_version: u32,
     name: String,
     description: String,
+    #[serde(default)]
+    persistent: bool,
 }
 
 struct ShellDefinition {
@@ -200,7 +207,300 @@ struct ShellPackage {
     definition: ShellDefinition,
 }
 
+#[derive(Clone, Default)]
+struct PersistentShells {
+    sessions: Arc<Mutex<HashMap<Entity, Arc<Mutex<PersistentShell>>>>>,
+}
+impl Resource for PersistentShells {}
+
+struct PersistentShell {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: BufReader<tokio::process::ChildStdout>,
+    stderr: Arc<Mutex<BoundedOutputBuffer>>,
+}
+
+#[derive(Default)]
+struct BoundedOutputBuffer {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl BoundedOutputBuffer {
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.truncated = false;
+    }
+
+    fn append(&mut self, bytes: &[u8], limit: usize) {
+        let remaining = limit.saturating_sub(self.bytes.len());
+        if remaining > 0 {
+            self.bytes
+                .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        }
+        if bytes.len() > remaining {
+            self.truncated = true;
+        }
+    }
+}
+
+impl PersistentShells {
+    async fn execute(
+        &self,
+        agent: Entity,
+        project_root: &Path,
+        command: &str,
+        output_limit: usize,
+        timeout: Duration,
+    ) -> Result<ShellOutput, ToolError> {
+        let session = {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get(&agent) {
+                Arc::clone(session)
+            } else {
+                let session = Arc::new(Mutex::new(
+                    PersistentShell::spawn(project_root, output_limit).await?,
+                ));
+                sessions.insert(agent, Arc::clone(&session));
+                session
+            }
+        };
+        let mut session_guard = session.lock().await;
+        match tokio::time::timeout(timeout, session_guard.execute(command, output_limit)).await {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) => {
+                drop(session_guard);
+                self.reset(agent, &session).await;
+                Err(error)
+            }
+            Err(_) => {
+                drop(session_guard);
+                self.reset(agent, &session).await;
+                Err(ToolError::new(
+                    ToolErrorKind::ExecutionFailed,
+                    "Persistent shell command timed out",
+                ))
+            }
+        }
+    }
+
+    async fn reset(&self, agent: Entity, expected: &Arc<Mutex<PersistentShell>>) {
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            if sessions
+                .get(&agent)
+                .is_some_and(|session| Arc::ptr_eq(session, expected))
+            {
+                sessions.remove(&agent)
+            } else {
+                None
+            }
+        };
+        if let Some(session) = removed {
+            let mut session = session.lock().await;
+            let _ = session.child.kill().await;
+            let _ = session.child.wait().await;
+        }
+    }
+}
+
+impl PersistentShell {
+    async fn spawn(project_root: &Path, output_limit: usize) -> Result<Self, ToolError> {
+        let mut child = Command::new("bash")
+            .args(["--noprofile", "--norc", "-s"])
+            .current_dir(project_root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| {
+                ToolError::new(
+                    ToolErrorKind::ExecutionFailed,
+                    "Persistent shell process could not be started",
+                )
+            })?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            ToolError::new(
+                ToolErrorKind::ExecutionFailed,
+                "Persistent shell stdin pipe could not be opened",
+            )
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ToolError::new(
+                ToolErrorKind::ExecutionFailed,
+                "Persistent shell stdout pipe could not be opened",
+            )
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ToolError::new(
+                ToolErrorKind::ExecutionFailed,
+                "Persistent shell stderr pipe could not be opened",
+            )
+        })?;
+        let stderr_buffer = Arc::new(Mutex::new(BoundedOutputBuffer::default()));
+        let reader_buffer = Arc::clone(&stderr_buffer);
+        tokio::spawn(async move {
+            let mut stderr = stderr;
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match stderr.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => reader_buffer
+                        .lock()
+                        .await
+                        .append(&buffer[..read], output_limit),
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            stderr: stderr_buffer,
+        })
+    }
+
+    async fn execute(
+        &mut self,
+        command: &str,
+        output_limit: usize,
+    ) -> Result<ShellOutput, ToolError> {
+        let nonce = format!("{:016x}", rand_nonce());
+        let start = format!("__MARGATROID_SHELL_START_{nonce}__");
+        let end = format!("__MARGATROID_SHELL_END_{nonce}__:");
+        let wrapped = format!(
+            "printf '%s\\n' {}; eval -- {}; status=$?; printf '%s%s\\n' {} \"$status\"",
+            quote_bash(&start),
+            quote_bash(command),
+            quote_bash(&end),
+        );
+        self.stderr.lock().await.clear();
+        self.stdin
+            .write_all(wrapped.as_bytes())
+            .await
+            .map_err(|_| {
+                ToolError::new(
+                    ToolErrorKind::ExecutionFailed,
+                    "Persistent shell stdin write failed",
+                )
+            })?;
+        self.stdin.write_all(b"\n").await.map_err(|_| {
+            ToolError::new(
+                ToolErrorKind::ExecutionFailed,
+                "Persistent shell stdin write failed",
+            )
+        })?;
+        self.stdin.flush().await.map_err(|_| {
+            ToolError::new(
+                ToolErrorKind::ExecutionFailed,
+                "Persistent shell stdin flush failed",
+            )
+        })?;
+        let captured =
+            read_until_shell_marker(&mut self.stdout, &start, &end, output_limit).await?;
+        let stderr = self.stderr.lock().await;
+        Ok(ShellOutput {
+            exit_code: captured.exit_code,
+            stdout: captured.stdout,
+            stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+            stdout_truncated: captured.stdout_truncated,
+            stderr_truncated: stderr.truncated,
+        })
+    }
+}
+
+struct PersistentCapture {
+    stdout: String,
+    exit_code: Option<i32>,
+    stdout_truncated: bool,
+}
+
+async fn read_until_shell_marker(
+    stdout: &mut BufReader<tokio::process::ChildStdout>,
+    start: &str,
+    end: &str,
+    limit: usize,
+) -> Result<PersistentCapture, ToolError> {
+    let mut pending = Vec::new();
+    let mut captured = BoundedOutputBuffer::default();
+    let end_bytes = end.as_bytes();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = stdout.read(&mut buffer).await.map_err(|_| {
+            ToolError::new(
+                ToolErrorKind::ExecutionFailed,
+                "Persistent shell stdout read failed",
+            )
+        })?;
+        if read == 0 {
+            return Err(ToolError::new(
+                ToolErrorKind::ExecutionFailed,
+                "Persistent shell exited unexpectedly",
+            ));
+        }
+        pending.extend_from_slice(&buffer[..read]);
+        if let Some(position) = find_bytes(&pending, end_bytes) {
+            captured.append(&pending[..position], limit);
+            let status_start = position + end_bytes.len();
+            let newline = pending[status_start..]
+                .iter()
+                .position(|byte| *byte == b'\n');
+            if let Some(newline) = newline {
+                let status = std::str::from_utf8(&pending[status_start..status_start + newline])
+                    .ok()
+                    .and_then(|value| value.trim().parse::<i32>().ok());
+                let mut output = String::from_utf8_lossy(&captured.bytes).into_owned();
+                if let Some(start_position) = output.find(start) {
+                    output = output[start_position + start.len()..]
+                        .trim_start_matches(['\r', '\n'])
+                        .to_string();
+                }
+                return Ok(PersistentCapture {
+                    stdout: output,
+                    exit_code: status,
+                    stdout_truncated: captured.truncated,
+                });
+            }
+        }
+        let retain = end_bytes.len().saturating_sub(1);
+        if pending.len() > retain {
+            let flush = pending.len() - retain;
+            captured.append(&pending[..flush], limit);
+            pending.drain(..flush);
+        }
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn quote_bash(value: &str) -> String {
+    format!(
+        "$'{}'",
+        value
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\r', "\\r")
+            .replace('\n', "\\n")
+    )
+}
+
+fn rand_nonce() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    now.as_nanos() as u64
+        ^ (std::process::id() as u64)
+        ^ SHELL_MARKER_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 struct ShellCallContext {
+    agent: Entity,
     project_root: Arc<PathBuf>,
     resource_id: ResourceId,
 }
@@ -264,6 +564,7 @@ struct PreparedShellToolCall {
     arguments: String,
     context: ShellCallContext,
     limits: ShellExecutionLimits,
+    persistent_shells: Option<PersistentShells>,
     response: ShellResponseGuard,
 }
 impl Event for PreparedShellToolCall {}
@@ -367,13 +668,14 @@ fn shell_tool_call_prepare_system(world: &mut World) {
         .collect::<Vec<_>>();
     for request in requests {
         match prepare_shell_tool_call(world, &request) {
-            Ok((package_root, context, limits)) => {
+            Ok((package_root, context, limits, persistent_shells)) => {
                 let response = ShellResponseGuard::new(&request, world.event_sender());
                 world.send_async_event(PreparedShellToolCall {
                     package_root,
                     arguments: request.arguments,
                     context,
                     limits,
+                    persistent_shells,
                     response,
                 });
             }
@@ -390,7 +692,15 @@ fn shell_tool_call_prepare_system(world: &mut World) {
 fn prepare_shell_tool_call(
     world: &World,
     request: &ToolCallRequest,
-) -> Result<(Arc<PathBuf>, ShellCallContext, ShellExecutionLimits), ToolError> {
+) -> Result<
+    (
+        Arc<PathBuf>,
+        ShellCallContext,
+        ShellExecutionLimits,
+        Option<PersistentShells>,
+    ),
+    ToolError,
+> {
     let limits = world
         .get_resource::<ShellExecutionLimits>()
         .expect("ShellPlugin is installed")
@@ -426,10 +736,12 @@ fn prepare_shell_tool_call(
     Ok((
         Arc::clone(&package_root),
         ShellCallContext {
+            agent: request.agent,
             project_root: Arc::new(environment.project_root().to_path_buf()),
             resource_id: request.resource_id.clone(),
         },
         limits,
+        world.get_resource::<PersistentShells>().cloned(),
     ))
 }
 
@@ -480,6 +792,29 @@ async fn execute_shell(prepared: &PreparedShellToolCall) -> Result<String, ToolE
                 "Shell arguments must contain a command string",
             )
         })?;
+    if package.definition.metadata.persistent {
+        let shells = prepared.persistent_shells.as_ref().ok_or_else(|| {
+            ToolError::new(
+                ToolErrorKind::ExecutionFailed,
+                "Persistent shell manager is unavailable",
+            )
+        })?;
+        let output = shells
+            .execute(
+                prepared.context.agent,
+                &prepared.context.project_root,
+                command,
+                prepared.limits.max_output_bytes,
+                prepared.limits.max_execution_time,
+            )
+            .await?;
+        return serde_json::to_string(&output).map_err(|_| {
+            ToolError::new(
+                ToolErrorKind::ExecutionFailed,
+                "Shell process result could not be encoded",
+            )
+        });
+    }
     let script = prepared.package_root.join(SHELL_SCRIPT_FILE);
     let mut child = Command::new("bash")
         .arg(script)

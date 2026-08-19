@@ -54,7 +54,11 @@ shells/<scope>/<name>/<tag>/
 schema_version = 1
 name = "bash"
 description = "Execute a Bash command."
+persistent = true # 可选；默认false
 ```
+
+`persistent = true`的资源按Agent维护一个独立的长驻Bash会话。同一Agent的调用串行执行，
+会话保留cwd、环境变量和shell变量；未设置时每次调用仍创建新的子进程。
 
 `input.schema.json`必须描述一个包含`command`字符串字段的JSON对象。资源的ToolSpec来自这个
 元信息和Schema；LLM只看到`shell:<scope>/<name>:<tag>`资源衍生出的resource_name，Provider合法名称由InferencePlugin临时转换。
@@ -79,10 +83,12 @@ shell_tool_call_prepare_system(world: &mut World)
 
 execute_prepared_shell(call: PreparedShellToolCall) -> Result<(), ShellTaskError>
     执行Shell脚本：私有异步System
-    行为：使用`bash <package>/main.sh <command>`启动子进程，工作目录为Agent project_root
+    行为：未设置persistent时使用`bash <package>/main.sh <command>`启动子进程，工作目录为Agent project_root；
+        persistent资源按Agent获取长驻`bash --noprofile --norc -s`会话，不执行每次调用的main.sh
+        每次命令使用随机开始/结束标记包装，结束标记携带退出码
         stdout和stderr并行读取，分别有界保存并继续消费；采集退出码和输出
         非零退出码仍返回Ok(JSON结果)，因为它是命令结果而不是执行框架错误
-        无法启动、超时或I/O失败返回ToolError
+        无法启动、超时或I/O失败销毁当前持久会话并返回ToolError
         ShellToolResponseGuard保证恰好一次ToolCallResponse
 ```
 
@@ -95,7 +101,8 @@ MclPlugin -> register_agent_resource并提交IMPORT事务
 
 ToolPlugin -> ToolCallRequest { resource_id=shell:..., tool_id=tool:builtin/shell:... }
 ShellPlugin -> PreparedShellToolCall -> AsyncRuntimePlugin
-            -> bash main.sh <command>
+            -> 一次性资源：bash main.sh <command>
+            -> 持久资源：Agent专属bash会话 + 命令标记
             -> ToolCallResponse { result: JSON { exit_code, stdout, stderr } }
 ToolPlugin -> AgentMessage::Tool
 ```
@@ -109,4 +116,5 @@ ShellPlugin不检查命令权限；Shell资源是开发者主动安装的可信�
 资源脚本接收一个完整command字符串作为第一个参数；脚本自身决定如何解释或限制它。
 相对cwd解析到Agent project_root；绝对资源路径按项目、镜像、主目录顺序查找。
 子进程不持有World；所有结果通过ToolCallResponse回到事件系统。
+持久会话不跨Agent、不跨workspace重启恢复；workspace停止或会话异常时销毁进程。
 ```

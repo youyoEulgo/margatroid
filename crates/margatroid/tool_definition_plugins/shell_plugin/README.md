@@ -1,7 +1,9 @@
 # ShellPlugin
 
-ShellPlugin把`shell:<scope>/<name>:<tag>`资源注册为Agent工具，并通过异步子进程执行资源的
-`main.sh`。资源工具对模型可见，`tool:builtin/shell:latest`执行器对模型隐藏。
+ShellPlugin把`shell:<scope>/<name>:<tag>`资源注册为Agent工具。默认资源通过异步子进程执行
+`main.sh`；`shell.toml`设置`persistent = true`后，资源改用每个Agent独立的长驻Bash会话，
+保留cwd、环境变量和shell变量，并串行执行同一Agent的命令。资源工具对模型可见，
+`tool:builtin/shell:latest`执行器对模型隐藏。
 
 Shell资源包：
 
