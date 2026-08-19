@@ -84,9 +84,9 @@ shell_tool_call_prepare_system(world: &mut World)
 execute_prepared_shell(call: PreparedShellToolCall) -> Result<(), ShellTaskError>
     执行Shell脚本：私有异步System
     行为：未设置persistent时使用`bash <package>/main.sh <command>`启动子进程，工作目录为Agent project_root；
-        persistent资源按Agent获取长驻`bash --noprofile --norc -s`会话，不执行每次调用的main.sh
-        每次命令使用随机开始/结束标记包装，结束标记携带退出码
-        stdout和stderr并行读取，分别有界保存并继续消费；采集退出码和输出
+        persistent资源按Agent获取长驻交互式Bash PTY会话，不执行每次调用的main.sh
+        每次命令使用随机开始/结束标记包装，结束标记携带退出码；PTY回显中的伪标记不算完成
+        PTY将stdout和stderr合并为终端输出并有界保存；一次性资源继续分别读取stdout和stderr
         非零退出码仍返回Ok(JSON结果)，因为它是命令结果而不是执行框架错误
         无法启动、超时或I/O失败销毁当前持久会话并返回ToolError
         ShellToolResponseGuard保证恰好一次ToolCallResponse
@@ -117,4 +117,5 @@ ShellPlugin不检查命令权限；Shell资源是开发者主动安装的可信�
 相对cwd解析到Agent project_root；绝对资源路径按项目、镜像、主目录顺序查找。
 子进程不持有World；所有结果通过ToolCallResponse回到事件系统。
 持久会话不跨Agent、不跨workspace重启恢复；workspace停止或会话异常时销毁进程。
+PTY当前使用Unix `nix::pty`实现；非Unix平台的持久资源会返回执行错误。
 ```

@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc::SyncSender, Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, WorldEventExt};
@@ -12,7 +14,7 @@ use async_runtime_plugin::{AppAsyncExt, AsyncRuntimeHandle, AsyncTaskError, Worl
 use core_plugin::{App, Entity, Event, Plugin, Resource, World};
 use margatroid_types::ResourceId;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tool_plugin::{
@@ -214,10 +216,14 @@ struct PersistentShells {
 impl Resource for PersistentShells {}
 
 struct PersistentShell {
-    child: tokio::process::Child,
-    stdin: tokio::process::ChildStdin,
-    stdout: BufReader<tokio::process::ChildStdout>,
-    stderr: Arc<Mutex<BoundedOutputBuffer>>,
+    commands: SyncSender<PtyCommand>,
+    child: Arc<StdMutex<std::process::Child>>,
+}
+
+struct PtyCommand {
+    command: String,
+    output_limit: usize,
+    response: std::sync::mpsc::SyncSender<Result<ShellOutput, ToolError>>,
 }
 
 #[derive(Default)]
@@ -227,11 +233,6 @@ struct BoundedOutputBuffer {
 }
 
 impl BoundedOutputBuffer {
-    fn clear(&mut self) {
-        self.bytes.clear();
-        self.truncated = false;
-    }
-
     fn append(&mut self, bytes: &[u8], limit: usize) {
         let remaining = limit.saturating_sub(self.bytes.len());
         if remaining > 0 {
@@ -297,68 +298,92 @@ impl PersistentShells {
             }
         };
         if let Some(session) = removed {
-            let mut session = session.lock().await;
-            let _ = session.child.kill().await;
-            let _ = session.child.wait().await;
+            let session = session.lock().await;
+            if let Ok(mut child) = session.child.lock() {
+                let _ = child.kill();
+                let _ = child.wait();
+            };
         }
     }
 }
 
 impl PersistentShell {
-    async fn spawn(project_root: &Path, output_limit: usize) -> Result<Self, ToolError> {
-        let mut child = Command::new("bash")
-            .args(["--noprofile", "--norc", "-s"])
-            .current_dir(project_root)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| {
+    async fn spawn(project_root: &Path, _output_limit: usize) -> Result<Self, ToolError> {
+        #[cfg(not(unix))]
+        {
+            let _ = project_root;
+            return Err(ToolError::new(
+                ToolErrorKind::ExecutionFailed,
+                "Persistent PTY shells are currently supported on Unix only",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use nix::pty::openpty;
+            use std::fs::File;
+            use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+
+            let pair = openpty(None, None).map_err(|_| {
+                ToolError::new(ToolErrorKind::ExecutionFailed, "PTY could not be allocated")
+            })?;
+            let master = unsafe { File::from_raw_fd(pair.master.into_raw_fd()) };
+            let slave = unsafe { File::from_raw_fd(pair.slave.into_raw_fd()) };
+            let slave_fd = slave.as_raw_fd();
+            let stdin = slave.try_clone().map_err(|_| {
                 ToolError::new(
                     ToolErrorKind::ExecutionFailed,
-                    "Persistent shell process could not be started",
+                    "PTY stdin could not be cloned",
                 )
             })?;
-        let stdin = child.stdin.take().ok_or_else(|| {
-            ToolError::new(
-                ToolErrorKind::ExecutionFailed,
-                "Persistent shell stdin pipe could not be opened",
-            )
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            ToolError::new(
-                ToolErrorKind::ExecutionFailed,
-                "Persistent shell stdout pipe could not be opened",
-            )
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            ToolError::new(
-                ToolErrorKind::ExecutionFailed,
-                "Persistent shell stderr pipe could not be opened",
-            )
-        })?;
-        let stderr_buffer = Arc::new(Mutex::new(BoundedOutputBuffer::default()));
-        let reader_buffer = Arc::clone(&stderr_buffer);
-        tokio::spawn(async move {
-            let mut stderr = stderr;
-            let mut buffer = [0_u8; 8192];
-            loop {
-                match stderr.read(&mut buffer).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(read) => reader_buffer
-                        .lock()
-                        .await
-                        .append(&buffer[..read], output_limit),
-                }
+            let stdout = slave.try_clone().map_err(|_| {
+                ToolError::new(
+                    ToolErrorKind::ExecutionFailed,
+                    "PTY stdout could not be cloned",
+                )
+            })?;
+            let stderr = slave.try_clone().map_err(|_| {
+                ToolError::new(
+                    ToolErrorKind::ExecutionFailed,
+                    "PTY stderr could not be cloned",
+                )
+            })?;
+            let mut command = std::process::Command::new("bash");
+            command
+                .args(["--noprofile", "--norc", "-i"])
+                .current_dir(project_root)
+                .env("PS1", "")
+                .stdin(std::process::Stdio::from(stdin))
+                .stdout(std::process::Stdio::from(stdout))
+                .stderr(std::process::Stdio::from(stderr));
+            unsafe {
+                command.pre_exec(move || {
+                    if nix::unistd::setsid().is_err() {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
             }
-        });
-        Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            stderr: stderr_buffer,
-        })
+            let child = command.spawn().map_err(|_| {
+                ToolError::new(
+                    ToolErrorKind::ExecutionFailed,
+                    "Persistent PTY Bash could not start",
+                )
+            })?;
+            drop(slave);
+            let child = Arc::new(StdMutex::new(child));
+            let (commands, receiver) = std::sync::mpsc::sync_channel::<PtyCommand>(1);
+            let worker_child = Arc::clone(&child);
+            std::thread::Builder::new()
+                .name("margatroid-persistent-pty".into())
+                .spawn(move || pty_worker(master, receiver, worker_child))
+                .map_err(|_| {
+                    ToolError::new(ToolErrorKind::ExecutionFailed, "PTY worker could not start")
+                })?;
+            Ok(Self { commands, child })
+        }
     }
 
     async fn execute(
@@ -366,47 +391,20 @@ impl PersistentShell {
         command: &str,
         output_limit: usize,
     ) -> Result<ShellOutput, ToolError> {
-        let nonce = format!("{:016x}", rand_nonce());
-        let start = format!("__MARGATROID_SHELL_START_{nonce}__");
-        let end = format!("__MARGATROID_SHELL_END_{nonce}__:");
-        let wrapped = format!(
-            "printf '%s\\n' {}; eval -- {}; status=$?; printf '%s%s\\n' {} \"$status\"",
-            quote_bash(&start),
-            quote_bash(command),
-            quote_bash(&end),
-        );
-        self.stderr.lock().await.clear();
-        self.stdin
-            .write_all(wrapped.as_bytes())
-            .await
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        self.commands
+            .send(PtyCommand {
+                command: command.into(),
+                output_limit,
+                response,
+            })
             .map_err(|_| {
-                ToolError::new(
-                    ToolErrorKind::ExecutionFailed,
-                    "Persistent shell stdin write failed",
-                )
+                ToolError::new(ToolErrorKind::ExecutionFailed, "PTY worker is unavailable")
             })?;
-        self.stdin.write_all(b"\n").await.map_err(|_| {
-            ToolError::new(
-                ToolErrorKind::ExecutionFailed,
-                "Persistent shell stdin write failed",
-            )
-        })?;
-        self.stdin.flush().await.map_err(|_| {
-            ToolError::new(
-                ToolErrorKind::ExecutionFailed,
-                "Persistent shell stdin flush failed",
-            )
-        })?;
-        let captured =
-            read_until_shell_marker(&mut self.stdout, &start, &end, output_limit).await?;
-        let stderr = self.stderr.lock().await;
-        Ok(ShellOutput {
-            exit_code: captured.exit_code,
-            stdout: captured.stdout,
-            stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
-            stdout_truncated: captured.stdout_truncated,
-            stderr_truncated: stderr.truncated,
-        })
+        tokio::task::spawn_blocking(move || receiver.recv())
+            .await
+            .map_err(|_| ToolError::new(ToolErrorKind::ExecutionFailed, "PTY worker panicked"))?
+            .map_err(|_| ToolError::new(ToolErrorKind::ExecutionFailed, "PTY worker stopped"))?
     }
 }
 
@@ -416,8 +414,46 @@ struct PersistentCapture {
     stdout_truncated: bool,
 }
 
-async fn read_until_shell_marker(
-    stdout: &mut BufReader<tokio::process::ChildStdout>,
+fn pty_worker(
+    mut master: std::fs::File,
+    receiver: std::sync::mpsc::Receiver<PtyCommand>,
+    _child: Arc<StdMutex<std::process::Child>>,
+) {
+    for request in receiver {
+        let nonce = format!("{:016x}", rand_nonce());
+        let start = format!("__MARGATROID_SHELL_START_{nonce}__");
+        let end = format!("__MARGATROID_SHELL_END_{nonce}__:");
+        let wrapped = format!(
+            "stty -echo; printf '%s\\n' {}; eval -- {}; status=$?; printf '%s%s\\n' {} \"$status\"",
+            quote_bash(&start),
+            quote_bash(&request.command),
+            quote_bash(&end),
+        );
+        let result = master
+            .write_all(wrapped.as_bytes())
+            .and_then(|_| master.write_all(b"\n"))
+            .and_then(|_| master.flush())
+            .map_err(|_| ToolError::new(ToolErrorKind::ExecutionFailed, "PTY input write failed"))
+            .and_then(|_| {
+                read_until_shell_marker_sync(&mut master, &start, &end, request.output_limit)
+            })
+            .map(|capture| ShellOutput {
+                exit_code: capture.exit_code,
+                stdout: capture.stdout,
+                stderr: String::new(),
+                stdout_truncated: capture.stdout_truncated,
+                stderr_truncated: false,
+            });
+        let failed = result.is_err();
+        let _ = request.response.send(result);
+        if failed {
+            break;
+        }
+    }
+}
+
+fn read_until_shell_marker_sync(
+    stdout: &mut std::fs::File,
     start: &str,
     end: &str,
     limit: usize,
@@ -427,7 +463,7 @@ async fn read_until_shell_marker(
     let end_bytes = end.as_bytes();
     let mut buffer = [0_u8; 8192];
     loop {
-        let read = stdout.read(&mut buffer).await.map_err(|_| {
+        let read = stdout.read(&mut buffer).map_err(|_| {
             ToolError::new(
                 ToolErrorKind::ExecutionFailed,
                 "Persistent shell stdout read failed",
@@ -440,28 +476,19 @@ async fn read_until_shell_marker(
             ));
         }
         pending.extend_from_slice(&buffer[..read]);
-        if let Some(position) = find_bytes(&pending, end_bytes) {
+        if let Some((position, status)) = find_end_marker(&pending, end_bytes) {
             captured.append(&pending[..position], limit);
-            let status_start = position + end_bytes.len();
-            let newline = pending[status_start..]
-                .iter()
-                .position(|byte| *byte == b'\n');
-            if let Some(newline) = newline {
-                let status = std::str::from_utf8(&pending[status_start..status_start + newline])
-                    .ok()
-                    .and_then(|value| value.trim().parse::<i32>().ok());
-                let mut output = String::from_utf8_lossy(&captured.bytes).into_owned();
-                if let Some(start_position) = output.find(start) {
-                    output = output[start_position + start.len()..]
-                        .trim_start_matches(['\r', '\n'])
-                        .to_string();
-                }
-                return Ok(PersistentCapture {
-                    stdout: output,
-                    exit_code: status,
-                    stdout_truncated: captured.truncated,
-                });
+            let mut output = String::from_utf8_lossy(&captured.bytes).into_owned();
+            if let Some(start_position) = output.find(start) {
+                output = output[start_position + start.len()..]
+                    .trim_start_matches(['\r', '\n'])
+                    .to_string();
             }
+            return Ok(PersistentCapture {
+                stdout: output.replace("\r\n", "\n"),
+                exit_code: Some(status),
+                stdout_truncated: captured.truncated,
+            });
         }
         let retain = end_bytes.len().saturating_sub(1);
         if pending.len() > retain {
@@ -476,6 +503,26 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn find_end_marker(haystack: &[u8], marker: &[u8]) -> Option<(usize, i32)> {
+    let mut offset = 0;
+    while let Some(relative) = find_bytes(&haystack[offset..], marker) {
+        let position = offset + relative;
+        let status_start = position + marker.len();
+        let newline = haystack[status_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')?;
+        let status = std::str::from_utf8(&haystack[status_start..status_start + newline])
+            .ok()?
+            .trim()
+            .parse::<i32>();
+        if let Ok(status) = status {
+            return Some((position, status));
+        }
+        offset = position + marker.len();
+    }
+    None
 }
 
 fn quote_bash(value: &str) -> String {
