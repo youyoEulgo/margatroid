@@ -188,7 +188,10 @@ fn persistent_shell_preserves_directory_and_environment_between_calls() {
                     .expect("persistent call must complete");
                 if call_id == "persistent-2" {
                     let output = serde_json::from_str::<serde_json::Value>(result).unwrap();
-                    assert!(output["stdout"].as_str().unwrap().ends_with(":ok"));
+                    assert!(
+                        output["stdout"].as_str().unwrap().ends_with(":ok"),
+                        "unexpected PTY output: {output:?}"
+                    );
                 }
                 break;
             }
