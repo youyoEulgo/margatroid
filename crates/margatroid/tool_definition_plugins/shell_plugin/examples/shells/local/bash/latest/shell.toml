@@ -1,0 +1,3 @@
+schema_version = 1
+name = "bash"
+description = "Execute a Bash command in the current project directory."

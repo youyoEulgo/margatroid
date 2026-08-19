@@ -16,11 +16,11 @@ fn routes_visible_shell_resources_to_the_hidden_shell_executor() {
     let data_root = tempdir().unwrap();
     let project = tempdir().unwrap();
     let image = tempdir().unwrap();
-    let package = data_root.path().join("shells/local/sh/latest");
+    let package = data_root.path().join("shells/local/bash/latest");
     fs::create_dir_all(&package).unwrap();
     fs::write(
         package.join("shell.toml"),
-        "schema_version = 1\nname = \"sh\"\ndescription = \"Execute a shell command.\"\n",
+        "schema_version = 1\nname = \"bash\"\ndescription = \"Execute a Bash command.\"\n",
     )
     .unwrap();
     fs::write(
@@ -33,7 +33,7 @@ fn routes_visible_shell_resources_to_the_hidden_shell_executor() {
         }"#,
     )
     .unwrap();
-    fs::write(package.join("main.sh"), "exec sh -lc \"$1\"\n").unwrap();
+    fs::write(package.join("main.sh"), "exec bash -lc \"$1\"\n").unwrap();
 
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
@@ -47,7 +47,7 @@ fn routes_visible_shell_resources_to_the_hidden_shell_executor() {
     );
     attach_agent_tool_map(app.world_mut(), agent).unwrap();
 
-    let resource_id = ResourceId::parse("shell:local/sh:latest").unwrap();
+    let resource_id = ResourceId::parse("shell:local/bash:latest").unwrap();
     app.world().send_event(AgentToolRegisterRequest {
         id: "register-shell".into(),
         agent,

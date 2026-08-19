@@ -71,7 +71,7 @@ fn compiles_a_base_program() {
 fn executes_handlers_and_assembles_a_snapshot() {
     let mut world = World::new();
     let agent = world.spawn();
-    let shell = ResourceId::parse("shell:local/sh:latest").unwrap();
+    let shell = ResourceId::parse("shell:local/bash:latest").unwrap();
     let initial_effects = world
         .attach_agent_mcl(
             agent,

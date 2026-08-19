@@ -7,4 +7,4 @@ name = "read-file"
 
 # This description is exposed to the model as part of the ToolSpec. It should
 # explain when the tool is useful and the important behavior of its result.
-description = "Read a UTF-8 text file from an absolute path or a path relative to the current project root and return its complete contents. Use this when the contents of a local text file are needed."
+description = "Read a range of a UTF-8 text file with one-based line numbers. Relative paths resolve from the current project root. Use offset and limit to inspect large files without loading them completely."

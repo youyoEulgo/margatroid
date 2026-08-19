@@ -42,7 +42,7 @@ MemoryPlugin：Agent消息持久化插件，公开结构体--通过事件同步�
     impl Plugin for MemoryPlugin
         Plugin：公开trait实现
         build(self, app: &mut App)
-            构建插件：拒绝重复安装，挂载sync_history_messages_system和sync_realtime_messages_system
+            构建插件：拒绝重复安装，挂载sync_history_messages_system、sync_realtime_context_system和read_realtime_context_system
 
 AgentMemory：Agent数据库绑定，公开组件--一个运行中Agent独占一个SQLite连接
     path: PathBuf--WorkspacePlugin提供的规范化数据库路径，私有
@@ -134,7 +134,7 @@ lock_connection(memory: &AgentMemory) -> Result<MutexGuard<Connection>, MemoryEr
     锁定连接：私有函数，锁中毒时返回WriteFailed
 
 initialize_schema(connection: &mut Connection) -> Result<(), MemoryError>
-    初始化数据库：私有函数，事务内迁移旧表并创建不存在的三张业务表
+    初始化数据库：私有函数，事务内迁移旧表并创建不存在的两张业务表
     行为：
         旧history_messages包含message列时改名为history_messages_legacy
         已分列但缺少tool_schema或任一Token列的history_messages改名为history_messages_layout_legacy
@@ -153,15 +153,13 @@ initialize_schema(connection: &mut Connection) -> Result<(), MemoryError>
             output_tokens INTEGER NOT NULL DEFAULT 0
             cache_hit_tokens INTEGER NOT NULL DEFAULT 0
             created_at_ms INTEGER NOT NULL
-        realtime_messages:
-            context TEXT NOT NULL--conversation或tool
-            position INTEGER NOT NULL--同一context内从0连续递增
-            message TEXT NOT NULL--Message JSON
-            PRIMARY KEY(context, position)
         realtime_context:
             position INTEGER PRIMARY KEY--全部实时消息的连续顺序
             message TEXT NOT NULL--Message JSON
-        调用migrate_history、migrate_history_layout和migrate_realtime保留可解码内容；旧记录缺失的tool_schema固定迁移为[]，缺失的Token列固定迁移为0；成功后删除legacy表并提交
+            input_tokens INTEGER--可空，Assistant MclMessage的用量
+            output_tokens INTEGER--可空，Assistant MclMessage的用量
+            cache_hit_tokens INTEGER--可空，Assistant MclMessage的用量
+        调用migrate_history、migrate_history_layout和migrate_realtime保留可解码内容；旧记录缺失的tool_schema固定迁移为[]，旧实时记录的Token列为NULL；成功后删除legacy表和已废弃的realtime_messages并提交
         任一步失败时回滚整个迁移
 
 table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool, MemoryError>
@@ -174,7 +172,7 @@ migrate_history_layout(transaction: &Transaction, layout: HistoryLayout) -> Resu
     重排分列历史：私有函数，保留sequence与全部已有字段，把reasoning移到content前并补缺失的tool_schema=[]与Token列=0
 
 migrate_realtime(transaction: &Transaction) -> Result<(), MemoryError>
-    迁移实时上下文：私有函数，把旧消息按原顺序写入realtime_context，同时派生conversation和tool分区
+    迁移实时上下文：私有函数，把旧消息按原顺序写入realtime_context，Token列为NULL
 
 schema_error(error: rusqlite::Error) -> MemoryError
     转换schema错误：私有函数，不暴露SQL详情
@@ -186,13 +184,12 @@ load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>, Me
 load_token_usage(connection: &Connection) -> Result<TokenUsage, MemoryError>
     恢复累计Token：私有函数，对role=assistant的三列分别求和，空表返回全0
 
-load_realtime_messages(connection: &Connection) -> Result<RealtimeContext, MemoryError>
-    恢复实时上下文：私有函数，优先按realtime_context的position升序读取
-    行为：没有有序记录时才读取旧conversation和tool分区并迁移；新运行时不再维护分区投影
+load_realtime_context(connection: &Connection) -> Result<RealtimeContext, MemoryError>
+    读取兼容投影：私有函数，按realtime_context的position升序读取，供Token恢复和旧公开接口使用
 
-rewrite_realtime_messages(transaction: &Transaction, ordered_messages: &[Message]) -> Result<(), MemoryError>
-    重写实时上下文：私有函数，使realtime_context与MCL conversation快照完全一致
-    行为：在同一事务中删除旧行，验证消息协议并按position写入；不再写旧conversation和tool分区
+rewrite_realtime_context(transaction: &Transaction, ordered_messages: &[AgentRealtimeMessage]) -> Result<(), MemoryError>
+    重写实时上下文：私有函数，使realtime_context与MCL request Block快照完全一致
+    行为：在同一事务中删除旧行，验证消息协议并按position写入Message与可选TokenUsage
 
 insert_history_message(transaction: &Transaction, event: &AgentHistoryMessageWriteRequested, created_at_ms: i64) -> Result<(), MemoryError>
     插入历史消息：私有函数，每个Message写入一行
@@ -213,12 +210,13 @@ sync_history_messages_system(world: &mut World)
 sync_history_message(world: &World, event: &AgentHistoryMessageWriteRequested) -> Result<(), MemoryError>
     同步单条历史：私有函数，验证AgentMemory后在独立事务中写入并提交
 
-sync_realtime_messages_system(world: &mut World)
-    同步实时上下文：私有System，消费AgentContextMessagesUpdated
-    行为：按事件顺序调用rewrite_realtime_messages(event.ordered_messages)，不重新读取AgentMcl，不修改history_messages
+sync_realtime_context_system(world: &mut World)
+    同步实时上下文：私有System，消费AgentRealtimeContextWriteRequested
+    行为：按事件顺序调用rewrite_realtime_context(event.messages)，不读取AgentContext，不修改history_messages
 
-sync_realtime_message(world: &World, event: &AgentContextMessagesUpdated) -> Result<(), MemoryError>
-    同步单次实时快照：私有函数，验证AgentMemory后在独立事务中重写并提交
+read_realtime_context_system(world: &mut World)
+    读取实时上下文：私有System，消费AgentRealtimeContextReadRequested并发布AgentRealtimeContextReadCompleted
+    行为：从已绑定AgentMemory读取完整MclMessage投影；错误通过回执返回MCL Driver
 
 current_unix_milliseconds() -> Result<i64, MemoryError>
     取得写入时间：私有函数，返回Unix毫秒并检查SQLite整数范围
@@ -236,20 +234,24 @@ write_error(error: rusqlite::Error) -> MemoryError
 安装：
     MemoryPlugin
         -> sync_history_messages_system
-        -> sync_realtime_messages_system
+        -> sync_realtime_context_system
+        -> read_realtime_context_system
 
 Workspace启动：
     AgentMemory::open
         -> initialize_schema
-        -> load_realtime_messages
+        -> load_realtime_context（只恢复兼容投影和Token统计，不注入Agent/MCL）
         -> load_token_usage
         -> 返回RealtimeContext { ordered_messages, token_usage }
     WorkspacePlugin
-        -> 把ordered_messages放入AgentCreateRequest
-        -> Agent创建后调用bind_agent_memory
+        -> 只绑定AgentMemory，不把快照作为AgentCreateRequest的隐式上下文
+    Base Lua
+        -> EMIT EFFECT realtime_load
+        -> 将结果注入recent_conversation并执行自己的拆分策略
+        -> EMIT EFFECT realtime_source (req)
 
 历史写入：
-    AgentToolCallSystem
+    Base Lua的EMIT EFFECT history_append
         -> AgentHistoryMessageWriteRequested
         -> sync_history_messages_system
         -> history_messages追加一行；Assistant写入usage，User和Tool写0
@@ -257,20 +259,21 @@ Workspace启动：
     Skill类型Tool历史事件的content已是完整resource_id字符串，不保存Skill正文
 
 实时写入：
-    MCL msg.conversation事务提交
-        -> AgentContextMessagesUpdated完整快照
-        -> sync_realtime_messages_system
+    Base Lua声明EMIT EFFECT realtime_source (req)后
+        -> req输入字段变化
+        -> AgentRealtimeContextWriteRequested完整MclMessage快照
+        -> sync_realtime_context_system
         -> realtime_context整体替换
     上下文压缩只替换实时表，不删除或覆盖历史表
 
 Agent重启：
-    优先从realtime_context恢复ordered_messages；旧数据库才读取旧分区并迁移
+    Base Lua显式从realtime_context恢复MclMessage快照；旧数据库仅在schema迁移时读取旧分区
     不从history_messages恢复模型上下文
     从history_messages的Assistant行恢复累计Token
 
 前端展示：
     history_messages是客户端可展示对话的唯一来源
-    realtime_messages只用于Agent上下文恢复
+    realtime_context只用于Agent上下文恢复
 ```
 
 ## 边界
@@ -288,17 +291,16 @@ WorkspacePlugin负责数据库路径、打开顺序和Agent绑定
 memory.sql
 ├── history_messages
 │   └── User / Assistant / Tool
-├── realtime_messages
-    ├── conversation: User / Assistant
-    └── tool: Tool
 └── realtime_context
-    └── ordered User / Assistant / Tool
+    └── ordered MclMessage { Message, Option<TokenUsage> }
 
 World
 ├── AgentHistoryMessageWriteRequested Event
 │   └── sync_history_messages_system
-├── AgentContextMessagesUpdated Event
-│   └── sync_realtime_messages_system
+├── AgentRealtimeContextWriteRequested Event
+│   └── sync_realtime_context_system
+└── AgentRealtimeContextReadRequested Event
+    └── read_realtime_context_system
 └── Agent Entity
     └── AgentMemory
 ```

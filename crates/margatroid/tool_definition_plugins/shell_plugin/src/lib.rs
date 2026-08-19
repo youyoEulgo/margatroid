@@ -481,7 +481,7 @@ async fn execute_shell(prepared: &PreparedShellToolCall) -> Result<String, ToolE
             )
         })?;
     let script = prepared.package_root.join(SHELL_SCRIPT_FILE);
-    let mut child = Command::new("sh")
+    let mut child = Command::new("bash")
         .arg(script)
         .arg(command)
         .current_dir(&*prepared.context.project_root)

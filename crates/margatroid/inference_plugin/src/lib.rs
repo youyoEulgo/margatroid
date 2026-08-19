@@ -2012,9 +2012,8 @@ fn deepseek_message(message: &Message) -> serde_json::Value {
                 );
             }
             if !tool_calls.is_empty() {
-                if let Some(reasoning) = reasoning.as_ref().filter(|value| !value.is_empty()) {
-                    message["reasoning_content"] = serde_json::Value::String(reasoning.clone());
-                }
+                message["reasoning_content"] =
+                    serde_json::Value::String(reasoning.clone().unwrap_or_default());
             }
             message
         }
@@ -2582,6 +2581,15 @@ data: [DONE]
                     arguments: "{}".into(),
                 }],
             },
+            Message::Assistant {
+                reasoning: None,
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-2".into(),
+                    tool_name: "tool0".into(),
+                    arguments: "{}".into(),
+                }],
+            },
         ];
         let request = OpenAiRequest::from_deepseek_input(
             ProviderInput::new("model", &InferenceParameters::default(), &messages, &[]),
@@ -2600,6 +2608,7 @@ data: [DONE]
             value["messages"][1]["tool_calls"].as_array().unwrap().len(),
             1
         );
+        assert_eq!(value["messages"][2]["reasoning_content"], "");
     }
 
     #[test]

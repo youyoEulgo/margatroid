@@ -13,6 +13,7 @@ inference_plugin = { path = "../inference_plugin" }
 margatroid_types = { path = "../types" }
 mcl_plugin = { path = "../mcl_plugin" }
 memory_plugin = { path = "../memory_plugin" }
+serde_json = { workspace = true }
 tool_plugin = { path = "../tool_plugin" }
 tracing = { workspace = true }
 

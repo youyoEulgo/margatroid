@@ -14,6 +14,27 @@ use tool_plugin::{
     AgentToolEnvironment, AgentToolMap, ToolCallRequest, ToolCallResponse, ToolPlugin,
 };
 
+fn wait_for_tool_response(app: &mut App, call_id: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.tick();
+        if let Some(response) = app
+            .world()
+            .event_reader::<ToolCallResponse>()
+            .into_iter()
+            .find(|response| response.tool_call_id == call_id)
+        {
+            return response
+                .result
+                .as_ref()
+                .unwrap_or_else(|error| panic!("{call_id} failed: {error}"))
+                .clone();
+        }
+        assert!(Instant::now() < deadline, "{call_id} response timed out");
+        std::thread::yield_now();
+    }
+}
+
 fn base_mcl() -> std::sync::Arc<mcl_plugin::MclProgram> {
     compile_mcl(MclCompileRequest {
         root: MclSource::new(
@@ -126,7 +147,12 @@ function execute(arguments, context)
         value = arguments.value,
         agent = context.agent_id,
         project = context.project_root,
-        has_path = os.getenv("PATH") ~= nil
+        has_path = os.getenv("PATH") ~= nil,
+        process = margatroid.process.run({
+            program = "printf",
+            args = { "%s", "process-ok" },
+            cwd = context.project_root
+        }).stdout
     })
     margatroid.fs.write_text(arguments.output, encoded)
     margatroid.log.info("test Lua tool executed")
@@ -164,6 +190,7 @@ end
             assert_eq!(result["agent"], "agent:demo/coder:latest");
             assert_eq!(result["project"], project.path().to_string_lossy().as_ref());
             assert_eq!(result["has_path"], true);
+            assert_eq!(result["process"], "process-ok");
             assert_eq!(
                 fs::read_to_string(output).unwrap(),
                 response.result.as_ref().unwrap().as_str()
@@ -274,4 +301,124 @@ fn tracked_write_file_example_creates_parent_directories_and_writes_content() {
         assert!(Instant::now() < deadline, "write-file response timed out");
         std::thread::yield_now();
     }
+}
+
+#[test]
+fn tracked_read_edit_and_search_examples_execute() {
+    let project = tempdir().unwrap();
+    let image = tempdir().unwrap();
+    let examples = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/tools");
+    fs::write(
+        project.path().join("sample.txt"),
+        "alpha\nbeta\ngamma\ndelta\n",
+    )
+    .unwrap();
+
+    let mut app = App::new();
+    app.add_plugin(RuntimePlugin::default())
+        .add_plugin(AsyncRuntimePlugin)
+        .add_plugin(ToolPlugin::default())
+        .add_plugin(MclPlugin::open(std::env::temp_dir()).unwrap())
+        .add_plugin(AgentPlugin::default())
+        .add_plugin(LuaPlugin::open(examples).unwrap());
+    let workspace = app.world_mut().spawn();
+    app.world().send_event(AgentCreateRequest {
+        id: "create-resource-agent".into(),
+        agent_id: ResourceId::parse("agent:demo/resources:latest").unwrap(),
+        workspace_id: workspace,
+        base_mcl: base_mcl(),
+        system_prompt: "test".into(),
+        messages: Vec::new(),
+        tool_context: Vec::new(),
+        ordered_messages: Vec::new(),
+        token_usage: margatroid_types::TokenUsage::default(),
+        last_input_tokens: 0,
+        context_window_tokens: 1_000_000,
+        default_visibility: BTreeSet::new(),
+    });
+    app.tick();
+    app.tick();
+    let agent = app
+        .world()
+        .event_reader::<AgentCreateResult>()
+        .into_iter()
+        .find(|event| event.id == "create-resource-agent")
+        .unwrap()
+        .result
+        .as_ref()
+        .copied()
+        .unwrap();
+    app.world_mut().insert_component(
+        agent,
+        AgentToolEnvironment::new(project.path(), image.path()),
+    );
+
+    for name in ["read-file", "edit", "grep", "glob"] {
+        app.world().send_event(LuaToolRegisterRequest {
+            id: format!("register-{name}"),
+            agent,
+            resource_id: ResourceId::parse(&format!("tool:local/{name}:latest")).unwrap(),
+        });
+    }
+    app.tick();
+    app.tick();
+    for name in ["read-file", "edit", "grep", "glob"] {
+        let registration = app
+            .world()
+            .event_reader::<LuaToolRegisterResponse>()
+            .into_iter()
+            .find(|event| event.id == format!("register-{name}"))
+            .unwrap();
+        assert!(registration.result.is_ok(), "{name} did not register");
+    }
+
+    let runtime = ResourceId::parse("tool:builtin/lua-runtime:latest").unwrap();
+    app.world().send_event(ToolCallRequest {
+        turn_id: "resource-turn".into(),
+        agent,
+        tool_id: runtime.clone(),
+        resource_id: ResourceId::parse("tool:local/read-file:latest").unwrap(),
+        tool_call_id: "read-window".into(),
+        arguments: serde_json::json!({"path":"sample.txt", "offset":2, "limit":2}).to_string(),
+    });
+    let read = wait_for_tool_response(&mut app, "read-window");
+    assert!(read.contains("lines 2-3 of 4"));
+    assert!(read.contains("     2\tbeta\n     3\tgamma"));
+
+    app.world().send_event(ToolCallRequest {
+        turn_id: "resource-turn".into(),
+        agent,
+        tool_id: runtime.clone(),
+        resource_id: ResourceId::parse("tool:local/edit:latest").unwrap(),
+        tool_call_id: "edit-one".into(),
+        arguments: serde_json::json!({
+            "path":"sample.txt", "old_string":"beta", "new_string":"BETA"
+        })
+        .to_string(),
+    });
+    assert!(wait_for_tool_response(&mut app, "edit-one").contains("1 replacement"));
+    assert!(fs::read_to_string(project.path().join("sample.txt"))
+        .unwrap()
+        .contains("BETA"));
+
+    app.world().send_event(ToolCallRequest {
+        turn_id: "resource-turn".into(),
+        agent,
+        tool_id: runtime.clone(),
+        resource_id: ResourceId::parse("tool:local/grep:latest").unwrap(),
+        tool_call_id: "grep-one".into(),
+        arguments: serde_json::json!({"pattern":"BETA", "path":"."}).to_string(),
+    });
+    let grep = wait_for_tool_response(&mut app, "grep-one");
+    assert!(grep.contains("sample.txt:2:BETA"));
+
+    app.world().send_event(ToolCallRequest {
+        turn_id: "resource-turn".into(),
+        agent,
+        tool_id: runtime,
+        resource_id: ResourceId::parse("tool:local/glob:latest").unwrap(),
+        tool_call_id: "glob-one".into(),
+        arguments: serde_json::json!({"pattern":"*.txt", "path":"."}).to_string(),
+    });
+    assert!(wait_for_tool_response(&mut app, "glob-one").contains("sample.txt"));
 }

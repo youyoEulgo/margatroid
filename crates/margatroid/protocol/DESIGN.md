@@ -35,6 +35,9 @@ ClientMessage::AgentVisibilityInject / AgentVisibilityRemove：前端默认资�
 ClientMessage::AgentTurnAbort：前端中止当前Agent轮次命令
     行为：使用WorkspaceReference和可选Agent资源ID路由为RouteAgentTurnAbort；不由前端提供turn_id
 
+ClientMessage::AgentAssistant：外部构造Assistant消息
+    行为：仅用于显式手动资源调用；ToolCall携带resource_id而不是Agent内部tool_name，由AgentPlugin校验动态可见性并转换后交给Base Driver
+
 ClientMessage::AgentWorkflowAttach / AgentWorkflowDetach：前端Workflow热插拔命令
     行为：第一阶段保留协议形状但转换后返回Unsupported；待MCL Workflow权限和消息订阅模型确定后实现
 
@@ -43,11 +46,12 @@ ClientMessage::MclCommand：外部MCL命令
     agent: Option<ResourceIdDto>--None表示manager
     command: String--一条完整MCL命令字符串
     binding: Option<serde_json::Value>--可选占位符绑定值
-    行为：DtoPlugin解析目标Agent后发送MclCommandReceived；与Base Driver handle使用同一parser和事务执行器
+    行为：DtoPlugin解析协议，WorkspacePlugin解析目标Agent后发送MclCommandReceived；与Base Driver handle使用同一parser和事务执行器
 
 ServerMessage::MclCommandResult：外部MCL命令回执
     id: String--复用请求ID
     result: Result<serde_json::Value, String>--成功命令值或稳定有界错误
+    行为：只发送给发起请求的WebSocket连接，不广播给其他连接；等待Driver响应时不阻塞ECS主线程
 
 AgentStateDto：后端Agent状态快照
     status: WorkspaceAgentStatusDto--creating、ready或failed

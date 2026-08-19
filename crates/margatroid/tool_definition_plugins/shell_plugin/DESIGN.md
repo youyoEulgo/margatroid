@@ -52,8 +52,8 @@ shells/<scope>/<name>/<tag>/
 `shell.toml`严格包含：
 ```toml
 schema_version = 1
-name = "sh"
-description = "Execute a shell command."
+name = "bash"
+description = "Execute a Bash command."
 ```
 
 `input.schema.json`必须描述一个包含`command`字符串字段的JSON对象。资源的ToolSpec来自这个
@@ -79,7 +79,7 @@ shell_tool_call_prepare_system(world: &mut World)
 
 execute_prepared_shell(call: PreparedShellToolCall) -> Result<(), ShellTaskError>
     执行Shell脚本：私有异步System
-    行为：使用`sh <package>/main.sh <command>`启动子进程，工作目录为Agent project_root
+    行为：使用`bash <package>/main.sh <command>`启动子进程，工作目录为Agent project_root
         stdout和stderr并行读取，分别有界保存并继续消费；采集退出码和输出
         非零退出码仍返回Ok(JSON结果)，因为它是命令结果而不是执行框架错误
         无法启动、超时或I/O失败返回ToolError
@@ -95,7 +95,7 @@ MclPlugin -> register_agent_resource并提交IMPORT事务
 
 ToolPlugin -> ToolCallRequest { resource_id=shell:..., tool_id=tool:builtin/shell:... }
 ShellPlugin -> PreparedShellToolCall -> AsyncRuntimePlugin
-            -> sh main.sh <command>
+            -> bash main.sh <command>
             -> ToolCallResponse { result: JSON { exit_code, stdout, stderr } }
 ToolPlugin -> AgentMessage::Tool
 ```

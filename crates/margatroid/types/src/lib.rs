@@ -369,6 +369,25 @@ pub struct RouteAgentTurnAbort {
 impl Event for RouteAgentTurnAbort {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteAgentAssistant {
+    pub id: String,
+    pub workspace: WorkspaceReference,
+    pub agent: Option<ResourceId>,
+    pub content: Option<String>,
+    pub reasoning: Option<String>,
+    pub tool_calls: Vec<RouteAgentAssistantToolCall>,
+}
+
+impl Event for RouteAgentAssistant {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteAgentAssistantToolCall {
+    pub id: String,
+    pub resource_id: ResourceId,
+    pub arguments: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentVisibilityRouteAction {
     Inject,
     Remove,
@@ -406,6 +425,18 @@ pub struct RouteAgentWorkflowDetach {
 impl Event for RouteAgentWorkflowDetach {}
 
 impl Event for RouteAgentMessage {}
+
+#[derive(Clone, Debug)]
+pub struct RouteMclCommand {
+    pub id: String,
+    pub workspace: WorkspaceReference,
+    pub agent: Option<ResourceId>,
+    pub command: String,
+    pub binding: Option<serde_json::Value>,
+    pub reply: std::sync::mpsc::Sender<Result<serde_json::Value, String>>,
+}
+
+impl Event for RouteMclCommand {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -495,6 +526,42 @@ pub struct AgentHistoryMessageWriteRequested {
 }
 
 impl Event for AgentHistoryMessageWriteRequested {}
+
+/// Requests a complete replacement of the persisted MCL realtime-context
+/// snapshot. The source block is selected explicitly by the Base Driver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentRealtimeContextWriteRequested {
+    pub agent: Entity,
+    pub messages: Vec<AgentRealtimeMessage>,
+}
+
+impl Event for AgentRealtimeContextWriteRequested {}
+
+/// A synchronous MCL effect asks MemoryPlugin to return the persisted
+/// realtime snapshot. The reply stays at the MCL boundary; it is never an
+/// implicit Agent creation input.
+#[derive(Clone, Debug)]
+pub struct AgentRealtimeContextReadRequested {
+    pub id: String,
+    pub agent: Entity,
+}
+
+impl Event for AgentRealtimeContextReadRequested {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentRealtimeContextReadCompleted {
+    pub id: String,
+    pub agent: Entity,
+    pub result: Result<Vec<AgentRealtimeMessage>, String>,
+}
+
+impl Event for AgentRealtimeContextReadCompleted {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentRealtimeMessage {
+    pub message: Message,
+    pub usage: Option<TokenUsage>,
+}
 
 fn validate_part(part: &str) -> Result<(), ResourceNameError> {
     if part.is_empty() || part == "." || part == ".." {

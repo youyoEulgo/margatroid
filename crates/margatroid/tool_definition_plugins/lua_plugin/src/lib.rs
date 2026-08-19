@@ -15,7 +15,8 @@ use futures_util::StreamExt;
 use margatroid_types::ResourceId;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
 use tool_plugin::{
     register_agent_tool, AgentToolEnvironment, ToolCallRequest, ToolCallResponse, ToolError,
     ToolErrorKind, ToolPluginInstalled, ToolTemplate,
@@ -254,6 +255,7 @@ struct LuaDirectCapabilityHandle {
     http: LuaHttpHandle,
     json: LuaJsonHandle,
     log: LuaLogHandle,
+    process: LuaProcessHandle,
 }
 
 struct LuaFileHandle {
@@ -272,6 +274,11 @@ struct LuaLogHandle {
     agent_id: ResourceId,
     turn_id: String,
     resource_id: ResourceId,
+}
+
+#[derive(Clone)]
+struct LuaProcessHandle {
+    limits: LuaExecutionLimits,
 }
 
 struct LuaToolResponseGuard {
@@ -501,6 +508,9 @@ fn prepare_lua_tool_call(
             agent_id: context.agent_id.clone(),
             turn_id: context.turn_id.clone(),
             resource_id: context.resource_id.clone(),
+        },
+        process: LuaProcessHandle {
+            limits: limits.clone(),
         },
     };
     Ok((
@@ -782,6 +792,7 @@ fn install_lua_environment<'lua>(
     handle.capabilities.http.install(lua, &margatroid)?;
     handle.capabilities.json.install(lua, &margatroid)?;
     handle.capabilities.log.install(lua, &margatroid)?;
+    handle.capabilities.process.install(lua, &margatroid)?;
     lua.globals()
         .set("margatroid", margatroid)
         .map_err(lua_tool_error)?;
@@ -935,6 +946,105 @@ struct LuaDirectoryEntry {
     name: String,
     path: String,
     kind: String,
+}
+
+impl LuaProcessHandle {
+    fn install(&self, lua: &Lua, margatroid: &Table) -> Result<(), ToolError> {
+        let api = lua.create_table().map_err(lua_tool_error)?;
+        let handle = self.clone();
+        api.set(
+            "run",
+            lua.create_async_function(move |lua, options: Table| {
+                let handle = handle.clone();
+                async move {
+                    let program = options.get::<String>("program")?;
+                    let args = options
+                        .get::<Option<Vec<String>>>("args")?
+                        .unwrap_or_default();
+                    let cwd = options.get::<Option<String>>("cwd")?;
+                    if program.trim().is_empty()
+                        || program.as_bytes().contains(&0)
+                        || args.iter().any(|arg| arg.as_bytes().contains(&0))
+                        || args.iter().map(String::len).sum::<usize>()
+                            > handle.limits.max_argument_bytes
+                    {
+                        return Err(mlua::Error::runtime("process arguments are invalid"));
+                    }
+                    let mut command = Command::new(program);
+                    command.args(args).kill_on_drop(true);
+                    if let Some(cwd) = cwd {
+                        command.current_dir(cwd);
+                    }
+                    command
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped());
+                    let mut child = command.spawn().map_err(mlua::Error::external)?;
+                    let stdout = child.stdout.take().ok_or_else(|| {
+                        mlua::Error::runtime("process stdout pipe is unavailable")
+                    })?;
+                    let stderr = child.stderr.take().ok_or_else(|| {
+                        mlua::Error::runtime("process stderr pipe is unavailable")
+                    })?;
+                    let limit = handle.limits.max_output_bytes;
+                    let (status, stdout, stderr) =
+                        tokio::time::timeout(handle.limits.max_host_call_time, async {
+                            tokio::try_join!(
+                                child.wait(),
+                                read_process_output(stdout, limit),
+                                read_process_output(stderr, limit),
+                            )
+                        })
+                        .await
+                        .map_err(|_| mlua::Error::runtime("process timed out"))?
+                        .map_err(mlua::Error::external)?;
+                    lua.to_value(&LuaProcessOutput {
+                        exit_code: status.code(),
+                        stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
+                        stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+                        stdout_truncated: stdout.truncated,
+                        stderr_truncated: stderr.truncated,
+                    })
+                }
+            })
+            .map_err(lua_tool_error)?,
+        )
+        .map_err(lua_tool_error)?;
+        margatroid.set("process", api).map_err(lua_tool_error)
+    }
+}
+
+#[derive(Serialize)]
+struct LuaProcessOutput {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+struct ProcessOutputBuffer {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_process_output(
+    mut reader: impl AsyncRead + Unpin,
+    limit: usize,
+) -> std::io::Result<ProcessOutputBuffer> {
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(bytes.len());
+        let retained = remaining.min(count);
+        bytes.extend_from_slice(&chunk[..retained]);
+        truncated |= retained < count;
+    }
+    Ok(ProcessOutputBuffer { bytes, truncated })
 }
 
 impl LuaHttpHandle {
