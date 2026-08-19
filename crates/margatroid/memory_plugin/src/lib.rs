@@ -10,7 +10,7 @@ use margatroid_types::{
     AgentContextMessagesUpdated, AgentHistoryMessageWriteRequested, Message, TokenUsage,
     ToolDefinition,
 };
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 const HISTORY_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS history_messages (
@@ -158,6 +158,7 @@ pub struct RealtimeContext {
     pub tool_context: Vec<Message>,
     pub ordered_messages: Vec<Message>,
     pub token_usage: TokenUsage,
+    pub last_input_tokens: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -196,6 +197,7 @@ impl AgentMemory {
         initialize_schema(&mut connection)?;
         let mut context = load_realtime_messages(&connection)?;
         context.token_usage = load_token_usage(&connection)?;
+        context.last_input_tokens = load_last_input_tokens(&connection)?;
         Ok((
             Self {
                 path,
@@ -671,6 +673,19 @@ fn load_token_usage(connection: &Connection) -> Result<TokenUsage, MemoryError> 
     })
 }
 
+fn load_last_input_tokens(connection: &Connection) -> Result<u64, MemoryError> {
+    let input_tokens = connection
+        .query_row(
+            "SELECT input_tokens FROM history_messages WHERE role = 'assistant' ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(read_error)?
+        .unwrap_or(0);
+    decode_token_count(input_tokens)
+}
+
 fn decode_token_count(value: i64) -> Result<u64, MemoryError> {
     u64::try_from(value).map_err(|_| {
         MemoryError::new(
@@ -1110,6 +1125,7 @@ mod tests {
                 },
             ],
             token_usage: TokenUsage::default(),
+            last_input_tokens: 0,
         };
         app.world_mut()
             .bind_agent_memory(agent, memory, &context)
@@ -1202,6 +1218,7 @@ mod tests {
                 cache_hit_tokens: 80,
             }
         );
+        assert_eq!(restored.last_input_tokens, 120);
     }
 
     #[test]
@@ -1220,6 +1237,7 @@ mod tests {
                 content: "keep".into(),
             }],
             token_usage: TokenUsage::default(),
+            last_input_tokens: 0,
         };
         app.world_mut()
             .bind_agent_memory(agent, memory, &original)

@@ -22,6 +22,18 @@ AgentPlugin 只负责将外部 `AgentMessage` 放入 Driver mailbox、执行 `Mc
 
 ## Base Driver
 
+MCL Block字段只允许三种运行时值类型：
+
+```text
+MESSAGE   -> MclMessage数组，组装Provider请求前脱壳为领域Message
+TOOL_CALL -> ToolCall数组，用于pending工具调用循环
+TOOL      -> ResourceId数组，用于默认或动态工具可见性
+```
+
+`CREATE ... BLOCK`会登记字段名及其类型。之后所有`INJECT`、`SELECT`、`DELETE`和`COVER`
+操作都先查Block字段声明，再按声明类型转换binding；未知字段、类型不匹配或未声明Block
+字段必须返回MCL错误。宿主不得根据字段名称或命令分支顺序猜测类型。
+
 ```lua
 handle("IMPORT prompt:system/soul:latest AS soul")
 handle("IMPORT skill:local/code-review:latest AS review")
@@ -44,6 +56,8 @@ handle([[ CREATE REQUEST_BLOCK req (
 handle("INJECT soul TO system FROM msg")
 handle("INJECT review, list_dir TO tool_default FROM tool")
 handle("INJECT SELECT tool_default FROM tool COVER tool_dynamic FROM tool")
+
+local MAX_CONTEXT_TOKENS = handle("EMIT EFFECT agent_info").model.context_window_tokens
 
 while true do
     local message = handle("EMIT EFFECT start")
@@ -69,6 +83,15 @@ while true do
     end
 end
 ```
+
+Agent初始化信息不是上下文数组，不定义Block。Base Driver通过
+`EMIT EFFECT agent_info`读取一次，并将`agent.model.context_window_tokens`保存在Lua局部常量中；
+缺少Agent Driver状态必须报错，不得使用隐式默认值。上下文区域和压缩比例属于Base Driver策略，
+当前基准实现分别使用0.16与0.80。
+
+所有Lua Driver与宿主的交互统一使用`EMIT EFFECT`。Effect可以立即返回值、阻塞后返回值，或发起
+异步操作后立即返回；不得仅为宿主查询新增`GET`、`SELECT`等平行语法。`SELECT`、`INJECT`和
+`DELETE`只操作MCL内部Block。
 
 Rust runtime必须执行这段程序，不得按文件名将其替换为生成的 handler，也不得从
 `base.lua` 文件名推断消息规则。
@@ -101,12 +124,39 @@ req.tools:         tool.tool_dynamic
 每个 Agent 只有一个有序 mailbox。`EMIT EFFECT start` 消费最早的消息；队列为空时 Lua
 协程等待。User、Assistant 和 Tool 均通过同一个 mailbox，Rust 不做消息类型分流。
 
+Mailbox中的消息类型是`MclMessage`：
+
+```text
+MclMessage {
+    message: Message
+    usage: Option<TokenUsage>
+}
+```
+
+`usage`只在Assistant消息上由推理响应携带。它可由Base Driver读取并参与上下文压缩判断；
+普通模型请求组装前，MCL会将Block中的`MclMessage`脱壳为领域`Message`，usage不会发送给Provider。
+
 ## Effects
 
 ```text
 RequestInference { request_block }
 ExecuteTools     { calls }
 FinishTurn
+```
+
+阻塞推理Effect：
+
+```lua
+local summary = handle("EMIT EFFECT blocking_inference (com)")
+```
+
+该Effect暂停当前Lua Driver，发起专用推理请求；响应完成后通过同一个`handle`回执返回
+字符串，不进入普通Assistant mailbox、历史消息或工具调用循环。
+
+消息Block的覆盖语法统一为：
+
+```text
+INJECT <source> COVER <target> FROM <block>
 ```
 
 Effect system只将它们转换为 inference、tool 和 Agent status 事件；不得修改 MCL Block，

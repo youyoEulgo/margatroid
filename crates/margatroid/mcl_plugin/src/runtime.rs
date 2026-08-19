@@ -13,7 +13,7 @@ use crate::{
     load_mcl_program, AgentMcl, AttachAgentMclRequest, AttachWorkflowMcl, DetachWorkflowMcl,
     MclBlock, MclCapabilityOwner, MclCapabilityStore, MclCommandReceived, MclCommandValue,
     MclContextItem, MclContextStore, MclDriverReady, MclEffect, MclEffectsProduced, MclError,
-    MclErrorKind, MclHash, MclPluginInstalled, MclProgram, MclProgramKind, MclRuntime,
+    MclErrorKind, MclHash, MclMessage, MclPluginInstalled, MclProgram, MclProgramKind, MclRuntime,
     MclRuntimeEvent, MclRuntimeMessage, MclSnapshotProvenance, MclToolExchange,
     MclToolExchangeState, ModelRequestSnapshot, WorkflowInstanceId, WorkflowMclAttachFailed,
     WorkflowMclAttached, WorkflowMclDetachFailed, WorkflowMclDetached, WorkflowMclInstance,
@@ -36,66 +36,184 @@ struct MclDriverContext {
     message_block_created: bool,
     tool_block_created: bool,
     request_block_created: bool,
-    system: Vec<Message>,
-    conversation: Vec<Message>,
+    compact_block_created: bool,
+    system: Vec<MclMessage>,
+    history_conversation: Vec<MclMessage>,
+    recent_conversation: Vec<MclMessage>,
+    compact: Vec<MclMessage>,
+    compact_prompt: Option<String>,
+    context_window_tokens: u64,
     tool_default: Vec<ResourceId>,
     tool_dynamic: Vec<ResourceId>,
+    message_fields: HashMap<String, MclFieldType>,
+    tool_fields: HashMap<String, MclFieldType>,
     imports: HashMap<String, ResourceId>,
 }
 
-fn message_from_lua_json(value: serde_json::Value) -> Result<Message, MclError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MclFieldType {
+    Message,
+    ToolCall,
+    Tool,
+}
+
+fn parse_block_fields(
+    command: &str,
+    prefix: &str,
+) -> Result<HashMap<String, MclFieldType>, MclError> {
+    let body = command
+        .strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix(")"))
+        .ok_or_else(|| {
+            MclError::new(MclErrorKind::ParseFailed, "Block declaration is malformed")
+        })?;
+    let mut fields = HashMap::new();
+    for declaration in body
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let mut parts = declaration.split_whitespace();
+        let name = parts.next().ok_or_else(|| {
+            MclError::new(MclErrorKind::ParseFailed, "Block field name is missing")
+        })?;
+        let kind = match parts.next() {
+            Some("MESSAGE") => MclFieldType::Message,
+            Some("TOOL_CALL") => MclFieldType::ToolCall,
+            Some("TOOL") => MclFieldType::Tool,
+            _ => {
+                return Err(MclError::new(
+                    MclErrorKind::TypeMismatch,
+                    "MCL Block field type must be MESSAGE, TOOL_CALL, or TOOL",
+                ))
+            }
+        };
+        if parts.next().is_some() || fields.insert(name.to_owned(), kind).is_some() {
+            return Err(MclError::new(
+                MclErrorKind::ParseFailed,
+                "MCL Block field declaration is invalid or duplicated",
+            ));
+        }
+    }
+    if fields.is_empty() {
+        return Err(MclError::new(
+            MclErrorKind::ParseFailed,
+            "MCL Block must declare at least one field",
+        ));
+    }
+    Ok(fields)
+}
+
+fn field_type(
+    state: &MclDriverContext,
+    block: &str,
+    field: &str,
+) -> Result<MclFieldType, MclError> {
+    let fields = match block {
+        "msg" => &state.message_fields,
+        "tool" => &state.tool_fields,
+        _ => {
+            return Err(MclError::new(
+                MclErrorKind::TypeMismatch,
+                "Unknown MCL Block",
+            ))
+        }
+    };
+    fields.get(field).copied().ok_or_else(|| {
+        MclError::new(
+            MclErrorKind::TypeMismatch,
+            format!("MCL field {block}.{field} is not declared"),
+        )
+    })
+}
+
+fn require_field_type(
+    state: &MclDriverContext,
+    block: &str,
+    field: &str,
+    expected: MclFieldType,
+) -> Result<(), MclError> {
+    let actual = field_type(state, block, field)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(MclError::new(
+            MclErrorKind::TypeMismatch,
+            format!("MCL field {block}.{field} has type {actual:?}, expected {expected:?}"),
+        ))
+    }
+}
+
+fn message_from_lua_json(value: serde_json::Value) -> Result<MclMessage, MclError> {
     let message_type = value
         .get("type")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| MclError::new(MclErrorKind::TypeMismatch, "MESSAGE binding has no type"))?;
     match message_type {
-        "system" => Ok(Message::System {
-            content: value
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-        }),
-        "user" => Ok(Message::User {
-            content: value
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-        }),
-        "assistant" => Ok(Message::Assistant {
-            reasoning: value
-                .get("reasoning")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            content: value
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            tool_calls: serde_json::from_value(
-                value
-                    .get("tool_calls")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!([])),
-            )
-            .map_err(|_| MclError::new(MclErrorKind::TypeMismatch, "tool_calls is invalid"))?,
-        }),
-        "tool" => Ok(Message::Tool {
-            resource_id: serde_json::from_value(value.get("resource_id").cloned().ok_or_else(
-                || MclError::new(MclErrorKind::TypeMismatch, "resource_id is missing"),
-            )?)
-            .map_err(|_| MclError::new(MclErrorKind::TypeMismatch, "resource_id is invalid"))?,
-            tool_call_id: value
-                .get("tool_call_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            content: value
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-        }),
+        "system" => Ok(MclMessage::new(
+            Message::System {
+                content: value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            },
+            None,
+        )),
+        "user" => Ok(MclMessage::new(
+            Message::User {
+                content: value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            },
+            None,
+        )),
+        "assistant" => Ok(MclMessage::new(
+            Message::Assistant {
+                reasoning: value
+                    .get("reasoning")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                content: value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                tool_calls: serde_json::from_value(
+                    value
+                        .get("tool_calls")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                )
+                .map_err(|_| MclError::new(MclErrorKind::TypeMismatch, "tool_calls is invalid"))?,
+            },
+            value
+                .get("usage")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| MclError::new(MclErrorKind::TypeMismatch, "usage is invalid"))?,
+        )),
+        "tool" => Ok(MclMessage::new(
+            Message::Tool {
+                resource_id: serde_json::from_value(value.get("resource_id").cloned().ok_or_else(
+                    || MclError::new(MclErrorKind::TypeMismatch, "resource_id is missing"),
+                )?)
+                .map_err(|_| MclError::new(MclErrorKind::TypeMismatch, "resource_id is invalid"))?,
+                tool_call_id: value
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                content: value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            },
+            None,
+        )),
         _ => Err(MclError::new(
             MclErrorKind::TypeMismatch,
             "MESSAGE binding type is unsupported",
@@ -103,8 +221,8 @@ fn message_from_lua_json(value: serde_json::Value) -> Result<Message, MclError> 
     }
 }
 
-fn message_to_lua_json(message: &Message) -> serde_json::Value {
-    match message {
+fn message_to_lua_json(message: &MclMessage) -> serde_json::Value {
+    let mut value = match &message.message {
         Message::System { content } => serde_json::json!({"type":"system", "content":content}),
         Message::User { content } => serde_json::json!({"type":"user", "content":content}),
         Message::Assistant {
@@ -123,7 +241,16 @@ fn message_to_lua_json(message: &Message) -> serde_json::Value {
             "type":"tool", "resource_id":resource_id, "tool_call_id":tool_call_id,
             "content":content
         }),
+    };
+    if let Some(usage) = &message.usage {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "usage".into(),
+                serde_json::to_value(usage).expect("TokenUsage is serializable"),
+            );
+        }
     }
+    value
 }
 
 pub(crate) fn mcl_command_system(world: &mut World) {
@@ -167,6 +294,24 @@ pub(crate) fn mcl_command_system(world: &mut World) {
                     .insert(command.agent, reply.take().expect("reply exists"));
                 None
             }
+        } else if command_text == "EMIT EFFECT agent_info" {
+            let context_window_tokens = world
+                .get_resource::<MclDriverMailboxes>()
+                .and_then(|mailboxes| mailboxes.states.get(&command.agent))
+                .map(|state| state.context_window_tokens)
+                .ok_or_else(|| {
+                    MclError::new(
+                        MclErrorKind::AgentMclMissing,
+                        "Agent Driver context is missing",
+                    )
+                });
+            Some(context_window_tokens.map(|context_window_tokens| {
+                MclCommandValue::Json(serde_json::json!({
+                    "model": {
+                        "context_window_tokens": context_window_tokens,
+                    }
+                }))
+            }))
         } else if let Some(import) = normalized.strip_prefix("IMPORT ") {
             let parsed = import
                 .split_once(" AS ")
@@ -196,23 +341,35 @@ pub(crate) fn mcl_command_system(world: &mut World) {
                 Err(error) => Some(Err(error)),
             }
         } else if normalized.starts_with("CREATE MESSAGE_BLOCK msg (") {
-            world
-                .get_resource_mut::<MclDriverMailboxes>()
-                .expect("MclPlugin is installed")
-                .states
-                .entry(command.agent)
-                .or_default()
-                .message_block_created = true;
-            Some(Ok(MclCommandValue::Unit))
+            match parse_block_fields(&normalized, "CREATE MESSAGE_BLOCK msg (") {
+                Ok(fields) => {
+                    let state = world
+                        .get_resource_mut::<MclDriverMailboxes>()
+                        .expect("MclPlugin is installed")
+                        .states
+                        .entry(command.agent)
+                        .or_default();
+                    state.message_fields = fields;
+                    state.message_block_created = true;
+                    Some(Ok(MclCommandValue::Unit))
+                }
+                Err(error) => Some(Err(error)),
+            }
         } else if normalized.starts_with("CREATE TOOL_BLOCK tool (") {
-            world
-                .get_resource_mut::<MclDriverMailboxes>()
-                .expect("MclPlugin is installed")
-                .states
-                .entry(command.agent)
-                .or_default()
-                .tool_block_created = true;
-            Some(Ok(MclCommandValue::Unit))
+            match parse_block_fields(&normalized, "CREATE TOOL_BLOCK tool (") {
+                Ok(fields) => {
+                    let state = world
+                        .get_resource_mut::<MclDriverMailboxes>()
+                        .expect("MclPlugin is installed")
+                        .states
+                        .entry(command.agent)
+                        .or_default();
+                    state.tool_fields = fields;
+                    state.tool_block_created = true;
+                    Some(Ok(MclCommandValue::Unit))
+                }
+                Err(error) => Some(Err(error)),
+            }
         } else if normalized.starts_with("CREATE REQUEST_BLOCK req (") {
             world
                 .get_resource_mut::<MclDriverMailboxes>()
@@ -222,28 +379,170 @@ pub(crate) fn mcl_command_system(world: &mut World) {
                 .or_default()
                 .request_block_created = true;
             Some(Ok(MclCommandValue::Unit))
-        } else if command_text == "INJECT ? TO conversation FROM msg" {
-            match command
-                .binding
-                .clone()
+        } else if normalized.starts_with("CREATE COMPACT_BLOCK com (") {
+            world
+                .get_resource_mut::<MclDriverMailboxes>()
+                .expect("MclPlugin is installed")
+                .states
+                .entry(command.agent)
+                .or_default()
+                .compact_block_created = true;
+            Some(Ok(MclCommandValue::Unit))
+        } else if let Some((target, block)) = command_text
+            .strip_prefix("INJECT ? TO ")
+            .and_then(|value| value.split_once(" FROM "))
+        {
+            let target = target.trim();
+            let block = block.trim();
+            let kind = world
+                .get_resource::<MclDriverMailboxes>()
+                .and_then(|mailboxes| mailboxes.states.get(&command.agent))
                 .ok_or_else(|| {
-                    MclError::new(
-                        MclErrorKind::TypeMismatch,
-                        "conversation binding is missing",
-                    )
+                    MclError::new(MclErrorKind::AgentMclMissing, "Driver context is missing")
                 })
-                .and_then(message_from_lua_json)
-            {
+                .and_then(|state| field_type(state, block, target));
+            match kind {
+                Ok(MclFieldType::Message) => {
+                    let message = command
+                        .binding
+                        .clone()
+                        .ok_or_else(|| {
+                            MclError::new(MclErrorKind::TypeMismatch, "MESSAGE binding is missing")
+                        })
+                        .and_then(message_from_lua_json);
+                    match message {
+                        Ok(message) => {
+                            let state = world
+                                .get_resource_mut::<MclDriverMailboxes>()
+                                .expect("MclPlugin is installed")
+                                .states
+                                .entry(command.agent)
+                                .or_default();
+                            let values = match target {
+                                "system" => Some(&mut state.system),
+                                "history_conversation" => Some(&mut state.history_conversation),
+                                "recent_conversation" | "conversation" => {
+                                    Some(&mut state.recent_conversation)
+                                }
+                                "compact" => Some(&mut state.compact),
+                                _ => None,
+                            };
+                            match values {
+                                Some(values) => {
+                                    values.push(message);
+                                    Some(Ok(MclCommandValue::Unit))
+                                }
+                                None => Some(Err(MclError::new(
+                                    MclErrorKind::TypeMismatch,
+                                    "MESSAGE field has no runtime storage",
+                                ))),
+                            }
+                        }
+                        Err(error) => Some(Err(error)),
+                    }
+                }
+                Ok(MclFieldType::ToolCall) => {
+                    let call = command
+                        .binding
+                        .as_ref()
+                        .and_then(|value| serde_json::from_value::<ToolCall>(value.clone()).ok());
+                    match call {
+                        Some(call) => {
+                            world
+                                .get_resource_mut::<MclDriverMailboxes>()
+                                .expect("MclPlugin is installed")
+                                .pending_tools
+                                .entry(command.agent)
+                                .or_default()
+                                .push(call);
+                            Some(Ok(MclCommandValue::Unit))
+                        }
+                        None => Some(Err(MclError::new(
+                            MclErrorKind::TypeMismatch,
+                            "TOOL_CALL binding is invalid",
+                        ))),
+                    }
+                }
+                Ok(MclFieldType::Tool) => {
+                    let resource = command
+                        .binding
+                        .clone()
+                        .and_then(|value| serde_json::from_value::<ResourceId>(value).ok());
+                    match (target, resource) {
+                        ("tool_default", Some(resource)) => {
+                            world
+                                .get_resource_mut::<MclDriverMailboxes>()
+                                .expect("MclPlugin is installed")
+                                .states
+                                .entry(command.agent)
+                                .or_default()
+                                .tool_default
+                                .push(resource);
+                            Some(Ok(MclCommandValue::Unit))
+                        }
+                        ("tool_dynamic", Some(resource)) => {
+                            world
+                                .get_resource_mut::<MclDriverMailboxes>()
+                                .expect("MclPlugin is installed")
+                                .states
+                                .entry(command.agent)
+                                .or_default()
+                                .tool_dynamic
+                                .push(resource);
+                            Some(Ok(MclCommandValue::Unit))
+                        }
+                        _ => Some(Err(MclError::new(
+                            MclErrorKind::TypeMismatch,
+                            "TOOL binding is invalid or has no runtime storage",
+                        ))),
+                    }
+                }
+                Err(error) => Some(Err(error)),
+            }
+        } else if let Some(target) = command_text
+            .strip_prefix("INJECT ? COVER ")
+            .and_then(|value| value.strip_suffix(" FROM msg"))
+        {
+            let declared = world
+                .get_resource::<MclDriverMailboxes>()
+                .and_then(|mailboxes| mailboxes.states.get(&command.agent))
+                .ok_or_else(|| {
+                    MclError::new(MclErrorKind::AgentMclMissing, "Driver context is missing")
+                })
+                .and_then(|state| {
+                    require_field_type(state, "msg", target.trim(), MclFieldType::Message)
+                });
+            let message = declared.and_then(|()| {
+                command
+                    .binding
+                    .clone()
+                    .ok_or_else(|| {
+                        MclError::new(MclErrorKind::TypeMismatch, "COVER binding is missing")
+                    })
+                    .and_then(message_from_lua_json)
+            });
+            match message {
                 Ok(message) => {
-                    world
+                    let state = world
                         .get_resource_mut::<MclDriverMailboxes>()
                         .expect("MclPlugin is installed")
                         .states
                         .entry(command.agent)
-                        .or_default()
-                        .conversation
-                        .push(message);
-                    Some(Ok(MclCommandValue::Unit))
+                        .or_default();
+                    match target.trim() {
+                        "history_conversation" => {
+                            state.history_conversation = vec![message];
+                            Some(Ok(MclCommandValue::Unit))
+                        }
+                        "recent_conversation" => {
+                            state.recent_conversation = vec![message];
+                            Some(Ok(MclCommandValue::Unit))
+                        }
+                        _ => Some(Err(MclError::new(
+                            MclErrorKind::TypeMismatch,
+                            "COVER target is unsupported",
+                        ))),
+                    }
                 }
                 Err(error) => Some(Err(error)),
             }
@@ -256,8 +555,15 @@ pub(crate) fn mcl_command_system(world: &mut World) {
                 .states
                 .entry(command.agent)
                 .or_default();
-            state.tool_dynamic = state.tool_default.clone();
-            Some(Ok(MclCommandValue::Unit))
+            match require_field_type(state, "tool", "tool_default", MclFieldType::Tool).and_then(
+                |()| require_field_type(state, "tool", "tool_dynamic", MclFieldType::Tool),
+            ) {
+                Ok(()) => {
+                    state.tool_dynamic = state.tool_default.clone();
+                    Some(Ok(MclCommandValue::Unit))
+                }
+                Err(error) => Some(Err(error)),
+            }
         } else if let Some(aliases) = command_text
             .strip_prefix("INJECT ")
             .and_then(|value| value.strip_suffix(" TO tool_default FROM tool"))
@@ -268,25 +574,96 @@ pub(crate) fn mcl_command_system(world: &mut World) {
                 .states
                 .entry(command.agent)
                 .or_default();
-            let mut resources = Vec::new();
-            let mut error = None;
-            for alias in aliases.split(',').map(str::trim) {
-                match state.imports.get(alias) {
-                    Some(resource) => resources.push(resource.clone()),
-                    None => {
-                        error = Some(MclError::new(
-                            MclErrorKind::ImportMissing,
-                            format!("import alias {alias} is missing"),
-                        ));
-                        break;
+            match require_field_type(state, "tool", "tool_default", MclFieldType::Tool) {
+                Err(error) => Some(Err(error)),
+                Ok(()) => {
+                    let mut resources = Vec::new();
+                    let mut error = None;
+                    for alias in aliases.split(',').map(str::trim) {
+                        match state.imports.get(alias) {
+                            Some(resource) => resources.push(resource.clone()),
+                            None => {
+                                error = Some(MclError::new(
+                                    MclErrorKind::ImportMissing,
+                                    format!("import alias {alias} is missing"),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(error) = error {
+                        Some(Err(error))
+                    } else {
+                        state.tool_default.extend(resources);
+                        Some(Ok(MclCommandValue::Unit))
                     }
                 }
             }
-            if let Some(error) = error {
-                Some(Err(error))
-            } else {
-                state.tool_default.extend(resources);
-                Some(Ok(MclCommandValue::Unit))
+        } else if let Some(spec) = command_text
+            .strip_prefix("INJECT ")
+            .and_then(|value| value.strip_suffix(" FROM msg"))
+            .and_then(|value| value.split_once(" COVER "))
+        {
+            let (source, target) = spec;
+            let state = world
+                .get_resource_mut::<MclDriverMailboxes>()
+                .expect("MclPlugin is installed")
+                .states
+                .entry(command.agent)
+                .or_default();
+            let source_field = source
+                .trim()
+                .strip_prefix("SELECT ")
+                .map(str::trim)
+                .unwrap_or_default();
+            let target_field = target.trim();
+            let declaration = field_type(state, "msg", source_field).and_then(|source_type| {
+                let target_type = field_type(state, "msg", target_field)?;
+                if source_type == target_type {
+                    Ok(source_type)
+                } else {
+                    Err(MclError::new(
+                        MclErrorKind::TypeMismatch,
+                        "COVER source and target fields must have the same type",
+                    ))
+                }
+            });
+            let values = match declaration {
+                Err(error) => Err(error),
+                Ok(MclFieldType::Message) => match source.trim() {
+                    "SELECT recent_conversation" => Ok(state.recent_conversation.clone()),
+                    "SELECT history_conversation" => Ok(state.history_conversation.clone()),
+                    "SELECT compact" => Ok(state.compact.clone()),
+                    _ => Err(MclError::new(
+                        MclErrorKind::TypeMismatch,
+                        "COVER source is unsupported",
+                    )),
+                },
+                Ok(_) => Err(MclError::new(
+                    MclErrorKind::TypeMismatch,
+                    "COVER is not implemented for this field type",
+                )),
+            };
+            match values {
+                Err(error) => Some(Err(error)),
+                Ok(values) => match target_field {
+                    "history_conversation" => {
+                        state.history_conversation = values;
+                        Some(Ok(MclCommandValue::Unit))
+                    }
+                    "recent_conversation" => {
+                        state.recent_conversation = values;
+                        Some(Ok(MclCommandValue::Unit))
+                    }
+                    "compact" => {
+                        state.compact = values;
+                        Some(Ok(MclCommandValue::Unit))
+                    }
+                    _ => Some(Err(MclError::new(
+                        MclErrorKind::TypeMismatch,
+                        "COVER target is unsupported",
+                    ))),
+                },
             }
         } else if let Some(alias) = command_text
             .strip_prefix("INJECT ")
@@ -302,10 +679,15 @@ pub(crate) fn mcl_command_system(world: &mut World) {
                 .states
                 .entry(command.agent)
                 .or_default();
-            if state.imports.contains_key(alias.trim()) {
-                state.system.push(Message::System {
-                    content: system_prompt,
-                });
+            if let Err(error) = require_field_type(state, "msg", "system", MclFieldType::Message) {
+                Some(Err(error))
+            } else if state.imports.contains_key(alias.trim()) {
+                state.system.push(MclMessage::new(
+                    Message::System {
+                        content: system_prompt,
+                    },
+                    None,
+                ));
                 Some(Ok(MclCommandValue::Unit))
             } else {
                 Some(Err(MclError::new(
@@ -313,65 +695,164 @@ pub(crate) fn mcl_command_system(world: &mut World) {
                     "system prompt import is missing",
                 )))
             }
-        } else if command_text == "INJECT ? TO pending_tool FROM msg" {
-            let call = command
-                .binding
-                .as_ref()
-                .and_then(|value| serde_json::from_value::<ToolCall>(value.clone()).ok())
-                .ok_or_else(|| {
-                    MclError::new(
-                        MclErrorKind::TypeMismatch,
-                        "pending_tool binding must be a ToolCall",
-                    )
-                });
-            match call {
-                Ok(call) => {
-                    world
-                        .get_resource_mut::<MclDriverMailboxes>()
-                        .expect("MclPlugin is installed")
-                        .pending_tools
-                        .entry(command.agent)
-                        .or_default()
-                        .push(call);
-                    Some(Ok(MclCommandValue::Unit))
-                }
-                Err(error) => Some(Err(error)),
+        } else if let Some(alias) = command_text
+            .strip_prefix("INJECT ")
+            .and_then(|value| value.strip_suffix(" TO compact FROM msg"))
+        {
+            let state = world
+                .get_resource_mut::<MclDriverMailboxes>()
+                .expect("MclPlugin is installed")
+                .states
+                .entry(command.agent)
+                .or_default();
+            if let Err(error) = require_field_type(state, "msg", "compact", MclFieldType::Message) {
+                Some(Err(error))
+            } else if !state.imports.contains_key(alias.trim()) {
+                Some(Err(MclError::new(
+                    MclErrorKind::ImportMissing,
+                    "compact prompt import is missing",
+                )))
+            } else if let Some(content) = state.compact_prompt.clone() {
+                state
+                    .compact
+                    .push(MclMessage::new(Message::User { content }, None));
+                Some(Ok(MclCommandValue::Unit))
+            } else {
+                Some(Err(MclError::new(
+                    MclErrorKind::SourceReadFailed,
+                    "COMPACT.md could not be loaded",
+                )))
             }
         } else if command_text == "DELETE pending_tool FROM msg WHERE id == ?" {
-            let id = command.binding.as_ref().and_then(|value| value.as_str());
-            match id {
-                Some(id) => {
-                    let pending = world
-                        .get_resource_mut::<MclDriverMailboxes>()
-                        .expect("MclPlugin is installed")
-                        .pending_tools
-                        .entry(command.agent)
-                        .or_default();
-                    let before = pending.len();
-                    pending.retain(|call| call.id != id);
-                    if pending.len() + 1 == before {
+            let declared = world
+                .get_resource::<MclDriverMailboxes>()
+                .and_then(|mailboxes| mailboxes.states.get(&command.agent))
+                .ok_or_else(|| {
+                    MclError::new(MclErrorKind::AgentMclMissing, "Driver context is missing")
+                })
+                .and_then(|state| {
+                    require_field_type(state, "msg", "pending_tool", MclFieldType::ToolCall)
+                });
+            match declared {
+                Err(error) => Some(Err(error)),
+                Ok(()) => {
+                    let id = command.binding.as_ref().and_then(|value| value.as_str());
+                    match id {
+                        Some(id) => {
+                            let pending = world
+                                .get_resource_mut::<MclDriverMailboxes>()
+                                .expect("MclPlugin is installed")
+                                .pending_tools
+                                .entry(command.agent)
+                                .or_default();
+                            let before = pending.len();
+                            pending.retain(|call| call.id != id);
+                            if pending.len() + 1 == before {
+                                Some(Ok(MclCommandValue::Unit))
+                            } else {
+                                Some(Err(MclError::new(
+                                    MclErrorKind::InvalidMessageSequence,
+                                    "pending ToolCall was not found exactly once",
+                                )))
+                            }
+                        }
+                        None => Some(Err(MclError::new(
+                            MclErrorKind::TypeMismatch,
+                            "pending_tool delete binding must be a string",
+                        ))),
+                    }
+                }
+            }
+        } else if command_text == "SELECT pending_tool FROM msg" {
+            let declared = world
+                .get_resource::<MclDriverMailboxes>()
+                .and_then(|mailboxes| mailboxes.states.get(&command.agent))
+                .ok_or_else(|| {
+                    MclError::new(MclErrorKind::AgentMclMissing, "Driver context is missing")
+                })
+                .and_then(|state| {
+                    require_field_type(state, "msg", "pending_tool", MclFieldType::ToolCall)
+                });
+            match declared {
+                Err(error) => Some(Err(error)),
+                Ok(()) => {
+                    let values = world
+                        .get_resource::<MclDriverMailboxes>()
+                        .and_then(|mailboxes| mailboxes.pending_tools.get(&command.agent))
+                        .cloned()
+                        .unwrap_or_default();
+                    Some(Ok(MclCommandValue::Json(
+                        serde_json::to_value(values).expect("ToolCall is serializable"),
+                    )))
+                }
+            }
+        } else if let Some(field) = command_text
+            .strip_prefix("SELECT ")
+            .and_then(|value| value.strip_suffix(" FROM msg"))
+        {
+            let values = world
+                .get_resource::<MclDriverMailboxes>()
+                .and_then(|mailboxes| mailboxes.states.get(&command.agent))
+                .ok_or_else(|| {
+                    MclError::new(MclErrorKind::AgentMclMissing, "Driver context is missing")
+                })
+                .and_then(|state| {
+                    require_field_type(state, "msg", field.trim(), MclFieldType::Message)?;
+                    match field.trim() {
+                        "recent_conversation" => Ok(state.recent_conversation.clone()),
+                        "history_conversation" => Ok(state.history_conversation.clone()),
+                        "compact" => Ok(state.compact.clone()),
+                        _ => Err(MclError::new(
+                            MclErrorKind::TypeMismatch,
+                            "MESSAGE field has no runtime storage",
+                        )),
+                    }
+                });
+            Some(values.map(|values| {
+                MclCommandValue::Json(
+                    serde_json::to_value(
+                        values.iter().map(message_to_lua_json).collect::<Vec<_>>(),
+                    )
+                    .expect("MclMessage is serializable"),
+                )
+            }))
+        } else if let Some(field) = command_text
+            .strip_prefix("DELETE ")
+            .and_then(|value| value.strip_suffix(" FIRST FROM msg"))
+        {
+            let state = world
+                .get_resource_mut::<MclDriverMailboxes>()
+                .expect("MclPlugin is installed")
+                .states
+                .entry(command.agent)
+                .or_default();
+            let declared = require_field_type(state, "msg", field.trim(), MclFieldType::Message);
+            match declared {
+                Err(error) => Some(Err(error)),
+                Ok(()) => {
+                    let removed = match field.trim() {
+                        "recent_conversation" => state
+                            .recent_conversation
+                            .first()
+                            .is_some()
+                            .then(|| state.recent_conversation.remove(0)),
+                        "history_conversation" => state
+                            .history_conversation
+                            .first()
+                            .is_some()
+                            .then(|| state.history_conversation.remove(0)),
+                        _ => None,
+                    };
+                    if removed.is_some() {
                         Some(Ok(MclCommandValue::Unit))
                     } else {
                         Some(Err(MclError::new(
                             MclErrorKind::InvalidMessageSequence,
-                            "pending ToolCall was not found exactly once",
+                            "message Block field is empty",
                         )))
                     }
                 }
-                None => Some(Err(MclError::new(
-                    MclErrorKind::TypeMismatch,
-                    "pending_tool delete binding must be a string",
-                ))),
             }
-        } else if command_text == "SELECT pending_tool FROM msg" {
-            let values = world
-                .get_resource::<MclDriverMailboxes>()
-                .and_then(|mailboxes| mailboxes.pending_tools.get(&command.agent))
-                .cloned()
-                .unwrap_or_default();
-            Some(Ok(MclCommandValue::Json(
-                serde_json::to_value(values).expect("ToolCall is serializable"),
-            )))
         } else if let Some(request) = command_text
             .strip_prefix("EMIT EFFECT inference (")
             .and_then(|value| value.strip_suffix(')'))
@@ -389,6 +870,17 @@ pub(crate) fn mcl_command_system(world: &mut World) {
                 }],
             });
             Some(Ok(MclCommandValue::Unit))
+        } else if let Some(request) = command_text
+            .strip_prefix("EMIT EFFECT blocking_inference (")
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            events.send_event(crate::MclBlockingInferenceRequest {
+                id: command.id,
+                agent: command.agent,
+                request: request.trim().to_owned(),
+                reply: reply.take().expect("reply exists"),
+            });
+            None
         } else if command_text == "EMIT EFFECT finish" {
             let turn_id = world
                 .get_resource::<MclDriverMailboxes>()
@@ -584,7 +1076,19 @@ impl WorldMclExt for World {
                     MclError::new(MclErrorKind::AgentMclMissing, "Driver state is missing")
                 })?;
             let state = mailboxes.states.entry(agent).or_default();
-            state.conversation.extend(request.restored_messages.clone());
+            state.context_window_tokens = request.context_window_tokens;
+            state.compact_prompt = driver_source
+                .origin()
+                .parent()
+                .map(|root| root.join("COMPACT.md"))
+                .filter(|path| path.is_file())
+                .and_then(|path| std::fs::read_to_string(path).ok());
+            state.recent_conversation.extend(
+                request
+                    .restored_messages
+                    .into_iter()
+                    .map(|message| MclMessage::new(message, None)),
+            );
         }
         // Lua Base Driver is the authoritative control loop. It starts after
         // AgentMcl exists so command transactions can address this Agent.
@@ -626,10 +1130,11 @@ impl WorldMclExt for World {
             let state = mailboxes.states.get(&agent).ok_or_else(|| {
                 MclError::new(MclErrorKind::AgentMclMissing, "Driver context is missing")
             })?;
-            if request_name != "req"
-                || !state.message_block_created
+            if !state.message_block_created
                 || !state.tool_block_created
-                || !state.request_block_created
+                || (request_name == "req" && !state.request_block_created)
+                || (request_name == "com" && !state.compact_block_created)
+                || !matches!(request_name, "req" | "com")
             {
                 return Err(MclError::new(
                     MclErrorKind::TypeMismatch,
@@ -649,12 +1154,29 @@ impl WorldMclExt for World {
             let system = state
                 .system
                 .iter()
-                .filter_map(|message| match message {
+                .filter_map(|message| match &message.message {
                     Message::System { content } => Some(content.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
+            let message_source = if request_name == "com" {
+                state
+                    .history_conversation
+                    .iter()
+                    .chain(state.compact.iter())
+                    .collect::<Vec<_>>()
+            } else {
+                state
+                    .history_conversation
+                    .iter()
+                    .chain(state.recent_conversation.iter())
+                    .collect::<Vec<_>>()
+            };
+            let messages = message_source
+                .into_iter()
+                .map(|message| message.message.clone())
+                .collect();
             let visible_resources = state
                 .tool_dynamic
                 .iter()
@@ -667,7 +1189,7 @@ impl WorldMclExt for World {
                 base_program_hash: mcl.base.plan_hash().clone(),
                 workflow_program_hashes: BTreeMap::new(),
                 system,
-                messages: state.conversation.clone(),
+                messages,
                 visible_resources,
                 provenance: MclSnapshotProvenance {
                     request: request_name.to_owned(),
@@ -1456,4 +1978,49 @@ fn detach_workflow(
         .collect::<Vec<_>>();
     recompute_plan_hash(mcl);
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use margatroid_types::TokenUsage;
+
+    use super::{message_from_lua_json, message_to_lua_json, parse_block_fields, MclFieldType};
+    use crate::MclMessage;
+
+    #[test]
+    fn assistant_usage_survives_lua_message_round_trip() {
+        let message = MclMessage::new(
+            margatroid_types::Message::Assistant {
+                reasoning: Some("reasoning".into()),
+                content: Some("answer".into()),
+                tool_calls: Vec::new(),
+            },
+            Some(TokenUsage {
+                input_tokens: 800_000,
+                output_tokens: 100,
+                cache_hit_tokens: 700_000,
+            }),
+        );
+
+        let restored = message_from_lua_json(message_to_lua_json(&message)).unwrap();
+
+        assert_eq!(restored, message);
+    }
+
+    #[test]
+    fn block_fields_accept_only_the_three_mcl_value_types() {
+        let fields = parse_block_fields(
+            "CREATE MESSAGE_BLOCK msg ( system MESSAGE, pending_tool TOOL_CALL, visible TOOL )",
+            "CREATE MESSAGE_BLOCK msg (",
+        )
+        .unwrap();
+        assert_eq!(fields.get("system"), Some(&MclFieldType::Message));
+        assert_eq!(fields.get("pending_tool"), Some(&MclFieldType::ToolCall));
+        assert_eq!(fields.get("visible"), Some(&MclFieldType::Tool));
+        assert!(parse_block_fields(
+            "CREATE MESSAGE_BLOCK msg ( invalid STRING )",
+            "CREATE MESSAGE_BLOCK msg (",
+        )
+        .is_err());
+    }
 }

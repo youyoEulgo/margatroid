@@ -10,11 +10,11 @@ inference_plugin = { path = "../inference_plugin" }
 margatroid_types = { path = "../types" }
 mcl_plugin = { path = "../mcl_plugin" }
 memory_plugin = { path = "../memory_plugin" }
+serde_json = { workspace = true }
 tool_plugin = { path = "../tool_plugin" }
 tracing = { workspace = true }
 
 [dev-dependencies]
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
 serde = { workspace = true }
-serde_json = { workspace = true }
 tempfile = "3"

@@ -573,6 +573,7 @@ struct PreparedWorkspaceAgent {
     tool_context: Vec<Message>,
     ordered_messages: Vec<Message>,
     token_usage: TokenUsage,
+    last_input_tokens: u64,
     default_visibility: BTreeSet<ResourceId>,
     inference_snapshot: AgentInferenceSnapshot,
     tool_environment: AgentToolEnvironment,
@@ -841,6 +842,8 @@ fn collect_agent_image_system(world: &mut World) {
             tool_context: prepared.tool_context.clone(),
             ordered_messages: prepared.ordered_messages.clone(),
             token_usage: prepared.token_usage.clone(),
+            last_input_tokens: prepared.last_input_tokens,
+            context_window_tokens: prepared.inference_snapshot.context_window_tokens(),
             default_visibility: prepared.default_visibility.clone(),
         };
         let registry = world
@@ -958,6 +961,7 @@ fn prepare_workspace_agent(
         tool_context: context.tool_context,
         ordered_messages: context.ordered_messages,
         token_usage: context.token_usage,
+        last_input_tokens: context.last_input_tokens,
         default_visibility,
         inference_snapshot,
         tool_environment,
@@ -1092,6 +1096,7 @@ fn attach_prepared_agent(
                 tool_context: prepared.tool_context,
                 ordered_messages: prepared.ordered_messages,
                 token_usage: prepared.token_usage,
+                last_input_tokens: prepared.last_input_tokens,
             },
         )
         .map_err(|error| {

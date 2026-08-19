@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource};
-use margatroid_types::{Message, ResourceId, ToolCall};
+use margatroid_types::{Message, ResourceId, TokenUsage, ToolCall};
 use sha2::{Digest, Sha256};
 
 pub use driver::spawn_base_driver;
@@ -135,10 +135,40 @@ impl Event for MclCommandReceived {}
 pub struct MclRuntimeMessage {
     pub id: String,
     pub agent: Entity,
-    pub message: Message,
+    pub message: MclMessage,
 }
 
 impl Event for MclRuntimeMessage {}
+
+#[derive(Clone, Debug)]
+pub struct MclBlockingInferenceRequest {
+    pub id: String,
+    pub agent: Entity,
+    pub request: String,
+    pub reply: Sender<Result<MclCommandValue, MclError>>,
+}
+
+impl Event for MclBlockingInferenceRequest {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MclMessage {
+    pub message: Message,
+    pub usage: Option<TokenUsage>,
+}
+
+impl MclMessage {
+    pub fn new(message: Message, usage: Option<TokenUsage>) -> Self {
+        Self { message, usage }
+    }
+
+    pub fn message(&self) -> &Message {
+        &self.message
+    }
+
+    pub fn usage(&self) -> Option<&TokenUsage> {
+        self.usage.as_ref()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MclDriverReady {
@@ -537,6 +567,7 @@ pub struct ModelRequestSnapshot {
 pub struct AttachAgentMclRequest {
     pub base: Arc<MclProgram>,
     pub system_prompt: String,
+    pub context_window_tokens: u64,
     pub restored_messages: Vec<Message>,
     pub default_visibility: BTreeSet<ResourceId>,
 }
@@ -630,7 +661,7 @@ pub struct MclError {
 }
 
 impl MclError {
-    pub(crate) fn new(kind: MclErrorKind, message: impl Into<String>) -> Self {
+    pub fn new(kind: MclErrorKind, message: impl Into<String>) -> Self {
         let mut message = message.into();
         if message.len() > MAX_ERROR_BYTES {
             let mut end = MAX_ERROR_BYTES - 3;

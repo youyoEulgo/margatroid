@@ -13,8 +13,9 @@ use margatroid_types::{
     AgentMessage, Message, ResourceId, TokenUsage, ToolCall, ToolDefinition,
 };
 use mcl_plugin::{
-    AgentMcl, AttachAgentMclRequest, MclCapabilityOwner, MclEffect, MclEffectsProduced,
-    MclPluginInstalled, MclProgram, MclRuntimeMessage, WorkflowMclDetached, WorldMclExt,
+    AgentMcl, AttachAgentMclRequest, MclBlockingInferenceRequest, MclCapabilityOwner,
+    MclCommandValue, MclEffect, MclEffectsProduced, MclMessage, MclPluginInstalled, MclProgram,
+    MclRuntimeMessage, WorkflowMclDetached, WorldMclExt,
 };
 use tool_plugin::{
     attach_agent_tool_map, AgentToolMap, AgentToolRegisterRequest, AgentToolRegisterResponse,
@@ -96,6 +97,8 @@ impl Plugin for AgentPlugin {
             .insert_resource(PendingInferenceToolSchemas::default());
         app.world_mut()
             .insert_resource(PendingContextCompactions::default());
+        app.world_mut()
+            .insert_resource(PendingBlockingInferences::default());
         app.add_system(&self.schedule, agent_create_system)
             .add_system(&self.schedule, agent_visibility_change_system)
             .add_system(&self.schedule, mcl_effect_system)
@@ -104,6 +107,7 @@ impl Plugin for AgentPlugin {
             .add_system(&self.schedule, cleanup_dead_agent_registrations_system)
             .add_system(&self.schedule, abort_agent_turn_system)
             .add_system(&self.schedule, context_compaction_system)
+            .add_system(&self.schedule, blocking_inference_system)
             .add_system(&self.schedule, agent_message_system);
     }
 }
@@ -119,6 +123,8 @@ pub struct AgentCreateRequest {
     pub tool_context: Vec<Message>,
     pub ordered_messages: Vec<Message>,
     pub token_usage: TokenUsage,
+    pub last_input_tokens: u64,
+    pub context_window_tokens: u64,
     pub default_visibility: BTreeSet<ResourceId>,
 }
 
@@ -463,15 +469,19 @@ pub struct AgentTokenUsage {
     total_output_tokens: u64,
     total_cache_hit_tokens: u64,
     cache_hit_rate: f64,
+    last_input_tokens: u64,
+    context_window_tokens: u64,
 }
 
 impl AgentTokenUsage {
-    fn from_totals(usage: &TokenUsage) -> Self {
+    fn from_totals(usage: &TokenUsage, last_input_tokens: u64, context_window_tokens: u64) -> Self {
         let mut totals = Self {
             total_input_tokens: usage.input_tokens,
             total_output_tokens: usage.output_tokens,
             total_cache_hit_tokens: usage.cache_hit_tokens,
             cache_hit_rate: 0.0,
+            last_input_tokens,
+            context_window_tokens,
         };
         totals.recalculate_cache_hit_rate();
         totals
@@ -493,7 +503,16 @@ impl AgentTokenUsage {
         self.cache_hit_rate
     }
 
+    pub fn last_input_tokens(&self) -> u64 {
+        self.last_input_tokens
+    }
+
+    pub fn context_window_tokens(&self) -> u64 {
+        self.context_window_tokens
+    }
+
     pub(crate) fn add(&mut self, usage: &TokenUsage) {
+        self.last_input_tokens = usage.input_tokens;
         self.total_input_tokens = self.total_input_tokens.saturating_add(usage.input_tokens);
         self.total_output_tokens = self.total_output_tokens.saturating_add(usage.output_tokens);
         self.total_cache_hit_tokens = self
@@ -540,6 +559,16 @@ struct PendingContextCompactions {
 }
 
 impl Resource for PendingContextCompactions {}
+
+#[derive(Default)]
+struct PendingBlockingInferences {
+    requests: HashMap<
+        (Entity, String),
+        std::sync::mpsc::Sender<Result<MclCommandValue, mcl_plugin::MclError>>,
+    >,
+}
+
+impl Resource for PendingBlockingInferences {}
 
 struct PendingContextCompaction {
     original_messages: Vec<Message>,
@@ -717,9 +746,14 @@ fn create_agent(
                 request.ordered_messages.clone()
             },
         },
-    ) && world
-        .insert_component(agent, AgentTokenUsage::from_totals(&request.token_usage))
-        && world.insert_component(agent, AgentStatus::default());
+    ) && world.insert_component(
+        agent,
+        AgentTokenUsage::from_totals(
+            &request.token_usage,
+            request.last_input_tokens,
+            request.context_window_tokens,
+        ),
+    ) && world.insert_component(agent, AgentStatus::default());
     if !inserted {
         world.despawn(agent);
         return Err(AgentCreateError::new(
@@ -749,6 +783,7 @@ fn create_agent(
         AttachAgentMclRequest {
             base: std::sync::Arc::clone(&request.base_mcl),
             system_prompt: request.system_prompt.clone(),
+            context_window_tokens: request.context_window_tokens,
             restored_messages,
             default_visibility: request.default_visibility.clone(),
         },
@@ -1481,7 +1516,7 @@ fn agent_message_system(world: &mut World) {
         world.send_event(MclRuntimeMessage {
             id: message.id.clone(),
             agent,
-            message: message.message.clone(),
+            message: MclMessage::new(message.message.clone(), message.usage.clone()),
         });
         match handle_agent_message(world, &message, &events) {
             Ok(_) => {}
@@ -1561,6 +1596,14 @@ fn context_compaction_system(world: &mut World) {
         }
     }
     for response in responses {
+        if !world
+            .get_resource::<PendingContextCompactions>()
+            .expect("AgentPlugin is installed")
+            .requests
+            .contains_key(&(response.agent, response.id.clone()))
+        {
+            continue;
+        }
         if let Err(error) = complete_context_compaction(world, &response, &events) {
             let kind = if matches!(error, AgentStepError::Inference(_)) {
                 AgentFailureKind::Inference
@@ -1574,6 +1617,72 @@ fn context_compaction_system(world: &mut World) {
                 message: error.failure_message(),
             });
         }
+    }
+}
+
+fn blocking_inference_system(world: &mut World) {
+    let requests = world
+        .event_reader::<MclBlockingInferenceRequest>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let responses = world
+        .event_reader::<ContextCompactionInferenceResponse>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let events = world.event_sender();
+
+    for request in requests {
+        let snapshot = match world.assemble_model_request(request.agent, &request.request) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = request.reply.send(Err(error));
+                continue;
+            }
+        };
+        let agent_id = match world.get_component::<AgentIdentity>(request.agent) {
+            Some(identity) => identity.id().clone(),
+            None => {
+                let _ = request.reply.send(Err(mcl_plugin::MclError::new(
+                    mcl_plugin::MclErrorKind::AgentMissing,
+                    "Agent identity is missing",
+                )));
+                continue;
+            }
+        };
+        let mut messages = Vec::with_capacity(snapshot.messages.len() + 1);
+        messages.push(Message::System {
+            content: snapshot.system,
+        });
+        messages.extend(snapshot.messages);
+        world
+            .get_resource_mut::<PendingBlockingInferences>()
+            .expect("AgentPlugin is installed")
+            .requests
+            .insert((request.agent, request.id.clone()), request.reply);
+        events.send_event(ContextCompactionInferenceRequest {
+            id: request.id,
+            agent: request.agent,
+            agent_id,
+            messages,
+        });
+    }
+
+    for response in responses {
+        let reply = world
+            .get_resource_mut::<PendingBlockingInferences>()
+            .expect("AgentPlugin is installed")
+            .requests
+            .remove(&(response.agent, response.id.clone()));
+        let Some(reply) = reply else { continue };
+        let result = response
+            .result
+            .map(|summary| MclCommandValue::Json(serde_json::Value::String(summary)))
+            .map_err(|error| {
+                mcl_plugin::MclError::new(mcl_plugin::MclErrorKind::TypeMismatch, error.to_string())
+            });
+        let _ = reply.send(result);
     }
 }
 
@@ -2371,11 +2480,15 @@ on message.assistant where event.tool_calls is empty { append event.entry into c
 
     #[test]
     fn token_usage_accumulates_and_recalculates_cache_hit_rate() {
-        let mut totals = AgentTokenUsage::from_totals(&TokenUsage {
-            input_tokens: 100,
-            output_tokens: 20,
-            cache_hit_tokens: 25,
-        });
+        let mut totals = AgentTokenUsage::from_totals(
+            &TokenUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_hit_tokens: 25,
+            },
+            100,
+            1_000,
+        );
         totals.add(&TokenUsage {
             input_tokens: 300,
             output_tokens: 80,
@@ -2386,6 +2499,8 @@ on message.assistant where event.tool_calls is empty { append event.entry into c
         assert_eq!(totals.total_output_tokens(), 100);
         assert_eq!(totals.total_cache_hit_tokens(), 200);
         assert_eq!(totals.cache_hit_rate(), 0.5);
+        assert_eq!(totals.last_input_tokens(), 300);
+        assert_eq!(totals.context_window_tokens(), 1_000);
     }
 
     #[test]
@@ -2406,14 +2521,16 @@ on message.assistant where event.tool_calls is empty { append event.entry into c
                 AttachAgentMclRequest {
                     base: base_mcl(),
                     system_prompt: "system".into(),
+                    context_window_tokens: 1_000_000,
                     restored_messages: Vec::new(),
                     default_visibility: BTreeSet::new(),
                 },
             )
             .unwrap();
-        assert!(app
-            .world_mut()
-            .insert_component(agent, AgentTokenUsage::from_totals(&TokenUsage::default()),));
+        assert!(app.world_mut().insert_component(
+            agent,
+            AgentTokenUsage::from_totals(&TokenUsage::default(), 0, 1_000_000),
+        ));
         assert!(app
             .world_mut()
             .get_component_mut::<AgentStatus>(agent)
@@ -2444,6 +2561,8 @@ on message.assistant where event.tool_calls is empty { append event.entry into c
         assert_eq!(totals.total_output_tokens(), 20);
         assert_eq!(totals.total_cache_hit_tokens(), 40);
         assert_eq!(totals.cache_hit_rate(), 0.5);
+        assert_eq!(totals.last_input_tokens(), 80);
+        assert_eq!(totals.context_window_tokens(), 1_000_000);
         assert!(app
             .world()
             .event_reader::<AgentHistoryMessageWriteRequested>()
@@ -2819,6 +2938,7 @@ on message.assistant where event.tool_calls is empty { append event.entry into c
                 AttachAgentMclRequest {
                     base: base_mcl(),
                     system_prompt: "system".into(),
+                    context_window_tokens: 1_000_000,
                     restored_messages: Vec::new(),
                     default_visibility: BTreeSet::new(),
                 },
@@ -2908,6 +3028,8 @@ on message.assistant where event.tool_calls is empty { append event.entry into c
             tool_context: Vec::new(),
             ordered_messages: Vec::new(),
             token_usage: TokenUsage::default(),
+            last_input_tokens: 0,
+            context_window_tokens: 1_000_000,
             default_visibility: BTreeSet::from([resource_id.clone()]),
         });
         app.tick();
@@ -2979,6 +3101,7 @@ on message.assistant where event.tool_calls is empty { append event.entry into c
                 AttachAgentMclRequest {
                     base: base_mcl(),
                     system_prompt: String::new(),
+                    context_window_tokens: 1_000_000,
                     restored_messages: Vec::new(),
                     default_visibility: BTreeSet::new(),
                 },

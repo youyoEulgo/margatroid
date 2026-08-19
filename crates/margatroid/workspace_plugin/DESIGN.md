@@ -250,7 +250,7 @@ PreparedWorkspaceAgent：单Agent实例材料，私有结构体--创建Agent Ent
     base_driver: MclDriverSource--从AgentImageBaseDriver取得的内禀base.lua源码
     ordered_messages: Vec<Message>--MemoryPlugin按实际发生顺序恢复的完整消息
     token_usage: TokenUsage--MemoryPlugin从历史Assistant行恢复的累计Token
-    inference_snapshot: AgentInferenceSnapshot--InferencePlugin构造的实例推理快照
+    inference_snapshot: AgentInferenceSnapshot--InferencePlugin构造的实例推理快照，包含标准化后的context_window_tokens
     tool_environment: AgentToolEnvironment--项目根与镜像版本根
     memory: AgentMemory--已经打开但尚未绑定Entity的SQLite连接
 ```

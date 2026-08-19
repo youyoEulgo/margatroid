@@ -49,7 +49,13 @@ api_key = "sk-123"
 api_type = "deepseek"
 thinking = "enabled"
 reasoning_effort = "high"
+context_window = "200k"
 ```
+
+`context_window`表示模型总上下文窗口，使用AI领域常见的英语数量级缩写且不区分大小写：
+`k=thousand`、`m=million`、`b=billion`、`t=trillion`。例如`200k`为200000 Token、
+`1m`为1000000 Token、`1b`为1000000000 Token。省略时默认`1m`。该值与只限制
+生成长度的`max_output_tokens`不同，并会标准化后提供给Agent Base Driver。
 
 `api_type = "deepseek"` 启用DeepSeek协议Adapter。`thinking = "enabled"`时请求携带
 `thinking = { type = "enabled" }`，`reasoning_effort`可为`high`或`max`；省略thinking或设为
