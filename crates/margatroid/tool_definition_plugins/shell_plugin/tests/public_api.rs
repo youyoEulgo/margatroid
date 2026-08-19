@@ -17,11 +17,11 @@ fn shell_resources_use_a_hidden_executor_and_return_process_output() {
     let project = tempdir().unwrap();
     let image = tempdir().unwrap();
     let home = tempdir().unwrap();
-    let package = home.path().join("local/sh/latest");
+    let package = home.path().join("local/bash/latest");
     fs::create_dir_all(&package).unwrap();
     fs::write(
         package.join("shell.toml"),
-        "schema_version = 1\nname = \"sh\"\ndescription = \"Execute a shell command.\"\n",
+        "schema_version = 1\nname = \"bash\"\ndescription = \"Execute a Bash command.\"\n",
     )
     .unwrap();
     fs::write(
@@ -34,7 +34,7 @@ fn shell_resources_use_a_hidden_executor_and_return_process_output() {
         }"#,
     )
     .unwrap();
-    fs::write(package.join("main.sh"), "exec sh -lc \"$1\"\n").unwrap();
+    fs::write(package.join("main.sh"), "exec bash -lc \"$1\"\n").unwrap();
 
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
@@ -48,7 +48,7 @@ fn shell_resources_use_a_hidden_executor_and_return_process_output() {
     );
     attach_agent_tool_map(app.world_mut(), agent).unwrap();
 
-    let resource_id = ResourceId::parse("shell:local/sh:latest").unwrap();
+    let resource_id = ResourceId::parse("shell:local/bash:latest").unwrap();
     app.world().send_event(ShellRegisterRequest {
         id: "register-1".into(),
         agent,
@@ -66,7 +66,7 @@ fn shell_resources_use_a_hidden_executor_and_return_process_output() {
     let maps = app.world().get_component::<AgentToolMap>(agent).unwrap();
     let mapping = maps.get_by_resource(&resource_id);
     assert_eq!(mapping.len(), 1);
-    assert_eq!(mapping[0].tool_name, "shell0_sh");
+    assert_eq!(mapping[0].tool_name, "shell0_bash");
     assert_eq!(
         mapping[0].tool_id,
         ResourceId::parse("tool:builtin/shell:latest").unwrap()

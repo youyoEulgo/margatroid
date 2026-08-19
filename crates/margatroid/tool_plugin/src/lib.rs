@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -107,6 +108,7 @@ impl ToolTemplate {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolMap {
     pub tool_name: String,
+    pub alias: Option<String>,
     pub tool_id: ResourceId,
     pub resource_id: ResourceId,
     pub template: ToolTemplate,
@@ -116,6 +118,7 @@ pub struct ToolMap {
 pub struct AgentToolMap {
     next_index: u64,
     tools: Vec<ToolMap>,
+    aliases: HashMap<ResourceId, String>,
 }
 
 impl AgentToolMap {
@@ -149,11 +152,14 @@ impl AgentToolMap {
                 "resource is already registered for this Agent",
             ));
         }
-        let tool_name = generated_tool_name(
-            resource_id.resource_type(),
-            self.next_index,
-            resource_id.name(),
-        );
+        let alias = self.aliases.get(&resource_id).cloned();
+        let tool_name = alias.clone().unwrap_or_else(|| {
+            generated_tool_name(
+                resource_id.resource_type(),
+                self.next_index,
+                resource_id.name(),
+            )
+        });
         self.next_index = self.next_index.checked_add(1).ok_or_else(|| {
             ToolError::new(
                 ToolErrorKind::InvalidDefinition,
@@ -164,11 +170,42 @@ impl AgentToolMap {
         validate_template(&template)?;
         self.tools.push(ToolMap {
             tool_name,
+            alias,
             tool_id,
             resource_id,
             template,
         });
         Ok(self.tools.last().expect("ToolMap was just inserted"))
+    }
+
+    pub fn set_alias(&mut self, resource_id: ResourceId, alias: String) -> Result<(), ToolError> {
+        if alias.trim().is_empty()
+            || self
+                .tools
+                .iter()
+                .any(|map| map.resource_id != resource_id && map.tool_name == alias)
+            || self
+                .aliases
+                .iter()
+                .any(|(id, existing)| id != &resource_id && existing == &alias)
+        {
+            return Err(ToolError::new(
+                ToolErrorKind::InvalidDefinition,
+                "resource alias is empty or already used by this Agent",
+            ));
+        }
+        self.aliases.insert(resource_id.clone(), alias.clone());
+        if let Some(map) = self
+            .tools
+            .iter_mut()
+            .find(|map| map.resource_id == resource_id)
+        {
+            map.tool_name = alias.clone();
+            map.alias = Some(alias.clone());
+            map.template.name = alias;
+            validate_template(&map.template)?;
+        }
+        Ok(())
     }
 }
 impl Component for AgentToolMap {}
@@ -322,6 +359,23 @@ pub fn register_agent_tool(
         .register(tool_id, resource_id, template)?
         .clone();
     Ok(map)
+}
+
+pub fn set_agent_tool_alias(
+    world: &mut World,
+    agent: Entity,
+    resource_id: ResourceId,
+    alias: String,
+) -> Result<(), ToolError> {
+    world
+        .get_component_mut::<AgentToolMap>(agent)
+        .ok_or_else(|| {
+            ToolError::new(
+                ToolErrorKind::ToolPluginMissing,
+                "AgentToolMap is not attached",
+            )
+        })?
+        .set_alias(resource_id, alias)
 }
 
 #[derive(Default)]
@@ -536,7 +590,7 @@ mod tests {
                     turn_id: turn_id.into(),
                     agent: owner,
                     tool_id: ResourceId::parse("tool:builtin/shell:latest").unwrap(),
-                    resource_id: ResourceId::parse("shell:local/sh:latest").unwrap(),
+                    resource_id: ResourceId::parse("shell:local/bash:latest").unwrap(),
                     tool_call_id: tool_call_id.into(),
                     arguments: "{}".into(),
                 })

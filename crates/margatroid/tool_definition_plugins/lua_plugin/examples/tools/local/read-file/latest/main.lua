@@ -1,7 +1,7 @@
 -- read-file
 --
--- Reads one UTF-8 text file and returns its complete contents as the tool
--- response. Absolute paths are used unchanged. Relative paths are resolved
+-- Reads a numbered window from one UTF-8 text file. Absolute paths are used
+-- unchanged. Relative paths are resolved
 -- against the current Agent's project root, making them independent of the
 -- daemon process working directory.
 --
@@ -45,6 +45,8 @@ end
 
 function execute(arguments, context)
     local path = resolve_path(arguments.path, context.project_root)
+    local offset = arguments.offset or 1
+    local limit = arguments.limit or 2000
 
     -- read_text is an asynchronous Rust host function. mlua suspends the Lua
     -- coroutine while the file is read, so Lua code can use it like a normal
@@ -55,8 +57,31 @@ function execute(arguments, context)
     -- returned by LuaPlugin as failed tool responses.
     local content = margatroid.fs.read_text(path)
 
-    -- A Lua tool must return a UTF-8 string. Returning the file contents
-    -- directly preserves whitespace and avoids adding explanatory text that
-    -- was not present in the source file.
-    return content
+    local lines = {}
+    local start = 1
+    while true do
+        local newline = content:find("\n", start, true)
+        if newline then
+            lines[#lines + 1] = content:sub(start, newline - 1)
+            start = newline + 1
+        else
+            if start <= #content then
+                lines[#lines + 1] = content:sub(start)
+            elseif #content == 0 then
+                lines[1] = ""
+            end
+            break
+        end
+    end
+
+    local output = {}
+    local last = math.min(#lines, offset + limit - 1)
+    for line_number = offset, last do
+        output[#output + 1] = string.format("%6d\t%s", line_number, lines[line_number])
+    end
+    local header = string.format("%s (lines %d-%d of %d)", arguments.path, offset, last, #lines)
+    if offset > #lines then
+        return header .. "\n(end of file)"
+    end
+    return header .. "\n" .. table.concat(output, "\n")
 end

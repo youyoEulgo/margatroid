@@ -10,18 +10,21 @@ use agent_image_loader_plugin::{
 };
 use agent_plugin::{
     AbortAgentTurn, AgentCreateRequest, AgentCreateResult, AgentPluginInstalled, AgentWorkspaceId,
-    SetAgentDefaultResourceVisibility, WorldAgentExt,
+    SetAgentDefaultResourceVisibility, SubmitAgentAssistant, SubmitAgentAssistantToolCall,
+    WorldAgentExt,
 };
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use inference_plugin::{AgentInferenceSnapshot, GlobalModelRoutes, WorldInferenceExt};
 use margatroid_types::{
-    AgentMessage, AgentVisibilityRouteAction, Message, ResourceId, RouteAgentMessage,
-    RouteAgentTurnAbort, RouteAgentVisibility, RouteAgentWorkflowAttach, RouteAgentWorkflowDetach,
-    TokenUsage, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
+    AgentMessage, AgentVisibilityRouteAction, Message, ResourceId, RouteAgentAssistant,
+    RouteAgentMessage, RouteAgentTurnAbort, RouteAgentVisibility, RouteAgentWorkflowAttach,
+    RouteAgentWorkflowDetach, RouteMclCommand, TokenUsage, WorkspaceAgentDefinition,
+    WorkspaceDefinition, WorkspaceReference,
 };
 use mcl_plugin::{
-    AttachWorkflowMcl, DetachWorkflowMcl, MclPluginInstalled, MclProgram, WorkflowInstanceId,
+    AttachWorkflowMcl, DetachWorkflowMcl, MclCommandReceived, MclCommandValue, MclPluginInstalled,
+    MclProgram, StartMclDriver, WorkflowInstanceId,
 };
 use memory_plugin::{AgentMemory, MemoryPluginInstalled, RealtimeContext, WorldMemoryExt};
 use tool_plugin::{AgentToolEnvironment, AgentToolMap, ToolPluginInstalled};
@@ -91,14 +94,149 @@ impl Plugin for WorkspacePlugin {
             image_requests: HashMap::new(),
             agent_requests: HashMap::new(),
         });
+        app.world_mut()
+            .insert_resource(PendingMclCommandRoutes::default());
         app.add_system(&schedule, begin_workspace_command_system)
             .add_system(&schedule, route_agent_message_system)
+            .add_system(&schedule, route_agent_assistant_system)
+            .add_system(&schedule, route_mcl_command_system)
             .add_system(&schedule, route_agent_turn_abort_system)
             .add_system(&schedule, route_agent_visibility_system)
             .add_system(&schedule, route_agent_workflow_system)
             .add_system(&schedule, collect_agent_image_system)
             .add_system(&schedule, collect_agent_create_result_system);
     }
+}
+
+fn route_agent_assistant_system(world: &mut World) {
+    let requests = world
+        .event_reader::<RouteAgentAssistant>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for request in requests {
+        let Some(workspace) = workspace_by_reference(world, &request.workspace) else {
+            tracing::warn!(id = %request.id, "agent assistant workspace was not found");
+            continue;
+        };
+        let agent = match request.agent {
+            Some(agent_id) => world.agent(&agent_id).filter(|entity| {
+                world
+                    .get_component::<AgentWorkspaceId>(*entity)
+                    .is_some_and(|owner| owner.workspace_id() == workspace)
+            }),
+            None => world.workspace_manager(workspace),
+        };
+        let Some(agent) = agent else {
+            tracing::warn!(id = %request.id, "agent assistant target was not found");
+            continue;
+        };
+        world.send_event(SubmitAgentAssistant {
+            id: request.id,
+            agent,
+            content: request.content,
+            reasoning: request.reasoning,
+            tool_calls: request
+                .tool_calls
+                .into_iter()
+                .map(|call| SubmitAgentAssistantToolCall {
+                    id: call.id,
+                    resource_id: call.resource_id,
+                    arguments: call.arguments,
+                })
+                .collect(),
+        });
+    }
+}
+
+#[derive(Default)]
+struct PendingMclCommandRoutes {
+    commands: Vec<PendingMclCommandRoute>,
+}
+
+impl Resource for PendingMclCommandRoutes {}
+
+struct PendingMclCommandRoute {
+    result:
+        std::sync::Mutex<std::sync::mpsc::Receiver<Result<MclCommandValue, mcl_plugin::MclError>>>,
+    reply: std::sync::mpsc::Sender<Result<serde_json::Value, String>>,
+}
+
+fn route_mcl_command_system(world: &mut World) {
+    let requests = world
+        .event_reader::<RouteMclCommand>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for request in requests {
+        let fail = |message: &str| {
+            let _ = request.reply.send(Err(message.to_owned()));
+        };
+        let Some(workspace) = workspace_by_reference(world, &request.workspace) else {
+            fail("WorkspaceNotFound: MCL command workspace was not found");
+            continue;
+        };
+        let agent = match &request.agent {
+            Some(agent_id) => world.agent(agent_id).filter(|entity| {
+                world
+                    .get_component::<AgentWorkspaceId>(*entity)
+                    .is_some_and(|owner| owner.workspace_id() == workspace)
+            }),
+            None => world.workspace_manager(workspace),
+        };
+        let Some(agent) = agent else {
+            fail("AgentNotFound: MCL command agent was not found");
+            continue;
+        };
+        let (reply, result) = std::sync::mpsc::channel();
+        world.send_event(MclCommandReceived {
+            id: request.id.clone(),
+            agent,
+            command: request.command.clone(),
+            binding: request.binding.clone(),
+            reply,
+        });
+        world
+            .get_resource_mut::<PendingMclCommandRoutes>()
+            .expect("WorkspacePlugin MCL command routes are missing")
+            .commands
+            .push(PendingMclCommandRoute {
+                result: std::sync::Mutex::new(result),
+                reply: request.reply.clone(),
+            });
+    }
+
+    world
+        .get_resource_mut::<PendingMclCommandRoutes>()
+        .expect("WorkspacePlugin MCL command routes are missing")
+        .commands
+        .retain(|pending| {
+            match pending
+                .result
+                .lock()
+                .expect("MCL command result lock poisoned")
+                .try_recv()
+            {
+                Ok(result) => {
+                    let response =
+                        result
+                            .map_err(|error| error.to_string())
+                            .map(|value| match value {
+                                MclCommandValue::Unit => serde_json::Value::Null,
+                                MclCommandValue::Json(value) => value,
+                            });
+                    let _ = pending.reply.send(response);
+                    false
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let _ = pending.reply.send(Err(
+                        "MclCommandFailed: MCL Driver closed the command channel".to_owned(),
+                    ));
+                    false
+                }
+            }
+        });
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -838,9 +976,10 @@ fn collect_agent_image_system(world: &mut World) {
             workspace_id: workspace,
             base_mcl: Arc::clone(&prepared.base_mcl),
             system_prompt: prepared.system_prompt.clone(),
-            messages: prepared.messages.clone(),
-            tool_context: prepared.tool_context.clone(),
-            ordered_messages: prepared.ordered_messages.clone(),
+            // Base Lua restores its own snapshot through realtime_load.
+            messages: Vec::new(),
+            tool_context: Vec::new(),
+            ordered_messages: Vec::new(),
             token_usage: prepared.token_usage.clone(),
             last_input_tokens: prepared.last_input_tokens,
             context_window_tokens: prepared.inference_snapshot.context_window_tokens(),
@@ -1113,6 +1252,7 @@ fn attach_prepared_agent(
             "created Agent could not receive its runtime components",
         ));
     }
+    world.send_event(StartMclDriver { agent });
     Ok(())
 }
 

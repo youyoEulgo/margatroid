@@ -150,6 +150,15 @@ pub struct MclBlockingInferenceRequest {
 
 impl Event for MclBlockingInferenceRequest {}
 
+#[derive(Clone, Debug)]
+pub struct MclHistoryAppendRequested {
+    pub id: String,
+    pub agent: Entity,
+    pub message: MclMessage,
+}
+
+impl Event for MclHistoryAppendRequested {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MclMessage {
     pub message: Message,
@@ -176,6 +185,13 @@ pub struct MclDriverReady {
 }
 
 impl Event for MclDriverReady {}
+
+#[derive(Clone, Debug)]
+pub struct StartMclDriver {
+    pub agent: Entity,
+}
+
+impl Event for StartMclDriver {}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MclDriverFailed {
@@ -544,6 +560,15 @@ pub struct MclEffectsProduced {
 }
 
 impl Event for MclEffectsProduced {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MclResourceAliasDeclared {
+    pub agent: Entity,
+    pub resource_id: ResourceId,
+    pub alias: String,
+}
+
+impl Event for MclResourceAliasDeclared {}
 
 #[derive(Clone, Debug)]
 pub struct MclSnapshotProvenance {
@@ -1060,7 +1085,8 @@ impl Plugin for MclPlugin {
         app.world_mut().insert_resource(MclRuntime {
             home_root: Arc::new(self.home_root),
         });
-        app.add_system(&self.schedule, runtime::mcl_command_system)
+        app.add_system(&self.schedule, runtime::start_driver_system)
+            .add_system(&self.schedule, runtime::mcl_command_system)
             .add_system(&self.schedule, runtime::workflow_control_system);
     }
 }

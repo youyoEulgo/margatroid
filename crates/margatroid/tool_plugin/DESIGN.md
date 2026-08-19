@@ -35,6 +35,9 @@ AgentResourceMap：Agent专属资源表，公开Component--由ToolPlugin挂载�
         注册映射：公开方法，拒绝重复resource_name和重复alias
         同一resource_id可以由不同Driver使用不同alias注册为不同映射
         template存在时强制template.name等于resource_name
+    set_alias(resource_id, alias)
+        IMPORT声明别名时立即记录；资源已注册则同步替换resource_name和template.name
+        任何领域消息、历史记录、实时上下文和ToolSpec都优先使用alias；代数名只允许作为无alias资源的回退
     impl Component for AgentResourceMap
 
 AgentResourceRegisterRequest：Agent资源注册请求，公开事件--注册协议类型由ToolPlugin提供，具体Provider负责消费

@@ -4,7 +4,10 @@ use std::sync::mpsc::Sender;
 
 use app_runtime_plugin::WorldEventExt;
 use core_plugin::{Entity, World};
-use margatroid_types::{Message, ResourceId, ToolCall};
+use margatroid_types::{
+    AgentRealtimeContextReadCompleted, AgentRealtimeContextReadRequested,
+    AgentRealtimeContextWriteRequested, AgentRealtimeMessage, Message, ResourceId, ToolCall,
+};
 
 use crate::syntax::{
     MclBlockLifetime, MclPredicate, MclResourceExpression, MclStatement, MclViewKind,
@@ -13,10 +16,11 @@ use crate::{
     load_mcl_program, AgentMcl, AttachAgentMclRequest, AttachWorkflowMcl, DetachWorkflowMcl,
     MclBlock, MclCapabilityOwner, MclCapabilityStore, MclCommandReceived, MclCommandValue,
     MclContextItem, MclContextStore, MclDriverReady, MclEffect, MclEffectsProduced, MclError,
-    MclErrorKind, MclHash, MclMessage, MclPluginInstalled, MclProgram, MclProgramKind, MclRuntime,
-    MclRuntimeEvent, MclRuntimeMessage, MclSnapshotProvenance, MclToolExchange,
-    MclToolExchangeState, ModelRequestSnapshot, WorkflowInstanceId, WorkflowMclAttachFailed,
-    WorkflowMclAttached, WorkflowMclDetachFailed, WorkflowMclDetached, WorkflowMclInstance,
+    MclErrorKind, MclHash, MclMessage, MclPluginInstalled, MclProgram, MclProgramKind,
+    MclResourceAliasDeclared, MclRuntime, MclRuntimeEvent, MclRuntimeMessage,
+    MclSnapshotProvenance, MclToolExchange, MclToolExchangeState, ModelRequestSnapshot,
+    WorkflowInstanceId, WorkflowMclAttachFailed, WorkflowMclAttached, WorkflowMclDetachFailed,
+    WorkflowMclDetached, WorkflowMclInstance,
 };
 
 #[derive(Default)]
@@ -24,6 +28,8 @@ pub(crate) struct MclDriverMailboxes {
     queues: HashMap<Entity, VecDeque<MclRuntimeMessage>>,
     waiting: HashMap<Entity, Sender<Result<MclCommandValue, MclError>>>,
     active_turns: HashMap<Entity, String>,
+    realtime_reads: HashMap<String, Sender<Result<MclCommandValue, MclError>>>,
+    drivers: HashMap<Entity, crate::MclDriverSource>,
     pending_tools: HashMap<Entity, Vec<ToolCall>>,
     states: HashMap<Entity, MclDriverContext>,
     ready: std::collections::HashSet<Entity>,
@@ -48,6 +54,8 @@ struct MclDriverContext {
     message_fields: HashMap<String, MclFieldType>,
     tool_fields: HashMap<String, MclFieldType>,
     imports: HashMap<String, ResourceId>,
+    realtime_source: Option<String>,
+    last_realtime_snapshot: Vec<AgentRealtimeMessage>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +149,41 @@ fn require_field_type(
             MclErrorKind::TypeMismatch,
             format!("MCL field {block}.{field} has type {actual:?}, expected {expected:?}"),
         ))
+    }
+}
+
+fn realtime_snapshot(state: &MclDriverContext) -> Option<Vec<AgentRealtimeMessage>> {
+    (state.realtime_source.as_deref() == Some("req")).then(|| {
+        state
+            .history_conversation
+            .iter()
+            .chain(state.recent_conversation.iter())
+            .map(|entry| AgentRealtimeMessage {
+                message: entry.message.clone(),
+                usage: entry.usage.clone(),
+            })
+            .collect()
+    })
+}
+
+fn publish_realtime_snapshot(
+    world: &mut World,
+    agent: Entity,
+    events: &app_runtime_plugin::RuntimeEventSender,
+) {
+    let snapshot = world
+        .get_resource_mut::<MclDriverMailboxes>()
+        .and_then(|mailboxes| mailboxes.states.get_mut(&agent))
+        .and_then(|state| {
+            let snapshot = realtime_snapshot(state)?;
+            if snapshot == state.last_realtime_snapshot {
+                return None;
+            }
+            state.last_realtime_snapshot = snapshot.clone();
+            Some(snapshot)
+        });
+    if let Some(messages) = snapshot {
+        events.send_event(AgentRealtimeContextWriteRequested { agent, messages });
     }
 }
 
@@ -254,6 +297,41 @@ fn message_to_lua_json(message: &MclMessage) -> serde_json::Value {
 }
 
 pub(crate) fn mcl_command_system(world: &mut World) {
+    let read_completions = world
+        .event_reader::<AgentRealtimeContextReadCompleted>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for completion in read_completions {
+        if let Some(reply) = world
+            .get_resource_mut::<MclDriverMailboxes>()
+            .expect("MclPlugin is installed")
+            .realtime_reads
+            .remove(&completion.id)
+        {
+            let result = completion
+                .result
+                .map(|entries| {
+                    MclCommandValue::Json(serde_json::Value::Array(
+                        entries
+                            .iter()
+                            .map(|entry| {
+                                let mut value = message_to_lua_json(&MclMessage::new(
+                                    entry.message.clone(),
+                                    entry.usage.clone(),
+                                ));
+                                if let Some(usage) = &entry.usage {
+                                    value["usage"] = serde_json::to_value(usage).unwrap();
+                                }
+                                value
+                            })
+                            .collect(),
+                    ))
+                })
+                .map_err(|error| MclError::new(MclErrorKind::SourceReadFailed, error));
+            let _ = reply.send(result);
+        }
+    }
     let commands = world
         .event_reader::<MclCommandReceived>()
         .into_iter()
@@ -328,6 +406,11 @@ pub(crate) fn mcl_command_system(world: &mut World) {
                 });
             match parsed {
                 Ok((resource, alias)) => {
+                    world.send_event(MclResourceAliasDeclared {
+                        agent: command.agent,
+                        resource_id: resource.clone(),
+                        alias: alias.clone(),
+                    });
                     world
                         .get_resource_mut::<MclDriverMailboxes>()
                         .expect("MclPlugin is installed")
@@ -853,6 +936,63 @@ pub(crate) fn mcl_command_system(world: &mut World) {
                     }
                 }
             }
+        } else if command_text == "EMIT EFFECT realtime_load" {
+            world
+                .get_resource_mut::<MclDriverMailboxes>()
+                .expect("MclPlugin is installed")
+                .realtime_reads
+                .insert(command.id.clone(), reply.take().expect("reply exists"));
+            events.send_event(AgentRealtimeContextReadRequested {
+                id: command.id.clone(),
+                agent: command.agent,
+            });
+            None
+        } else if let Some(source) = command_text
+            .strip_prefix("EMIT EFFECT realtime_source (")
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            let state = world
+                .get_resource_mut::<MclDriverMailboxes>()
+                .expect("MclPlugin is installed")
+                .states
+                .entry(command.agent)
+                .or_default();
+            if source.trim() != "req" {
+                Some(Err(MclError::new(
+                    MclErrorKind::TypeMismatch,
+                    "realtime source must be req",
+                )))
+            } else {
+                state.realtime_source = Some("req".into());
+                Some(Ok(MclCommandValue::Unit))
+            }
+        } else if command_text == "EMIT EFFECT history_append" {
+            let message = command
+                .binding
+                .clone()
+                .ok_or_else(|| {
+                    MclError::new(
+                        MclErrorKind::TypeMismatch,
+                        "history_append binding is missing",
+                    )
+                })
+                .and_then(message_from_lua_json);
+            match message {
+                Ok(message) => {
+                    let id = world
+                        .get_resource::<MclDriverMailboxes>()
+                        .and_then(|mailboxes| mailboxes.active_turns.get(&command.agent))
+                        .cloned()
+                        .unwrap_or_else(|| command.id.clone());
+                    events.send_event(crate::MclHistoryAppendRequested {
+                        id,
+                        agent: command.agent,
+                        message,
+                    });
+                    Some(Ok(MclCommandValue::Unit))
+                }
+                Err(error) => Some(Err(error)),
+            }
         } else if let Some(request) = command_text
             .strip_prefix("EMIT EFFECT inference (")
             .and_then(|value| value.strip_suffix(')'))
@@ -923,6 +1063,7 @@ pub(crate) fn mcl_command_system(world: &mut World) {
         } else {
             Some(Ok(MclCommandValue::Unit))
         };
+        publish_realtime_snapshot(world, command.agent, &events);
         if let Some(result) = result {
             let _ = reply.expect("reply exists").send(result);
         }
@@ -953,6 +1094,36 @@ pub(crate) fn mcl_command_system(world: &mut World) {
         }
     }
     let _ = events;
+}
+
+pub(crate) fn start_driver_system(world: &mut World) {
+    let starts = world
+        .event_reader::<crate::StartMclDriver>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for start in starts {
+        let source = world
+            .get_resource_mut::<MclDriverMailboxes>()
+            .expect("MclPlugin is installed")
+            .drivers
+            .remove(&start.agent);
+        match source {
+            Some(source) => {
+                if let Err(error) =
+                    crate::spawn_base_driver(start.agent, source, world.event_sender())
+                {
+                    world.emit_event(crate::MclDriverFailed {
+                        agent: start.agent,
+                        error,
+                    });
+                }
+            }
+            None => {
+                tracing::warn!(agent = ?start.agent, "MCL Driver start was requested without a pending Driver")
+            }
+        }
+    }
 }
 
 pub trait WorldMclExt {
@@ -1083,19 +1254,10 @@ impl WorldMclExt for World {
                 .map(|root| root.join("COMPACT.md"))
                 .filter(|path| path.is_file())
                 .and_then(|path| std::fs::read_to_string(path).ok());
-            state.recent_conversation.extend(
-                request
-                    .restored_messages
-                    .into_iter()
-                    .map(|message| MclMessage::new(message, None)),
-            );
+            mailboxes.drivers.insert(agent, driver_source);
         }
         // Lua Base Driver is the authoritative control loop. It starts after
         // AgentMcl exists so command transactions can address this Agent.
-        if is_lua_driver {
-            crate::spawn_base_driver(agent, driver_source, self.event_sender())
-                .map_err(|error| MclError::new(MclErrorKind::LuaFailed, error))?;
-        }
         Ok(effects)
     }
 

@@ -142,7 +142,21 @@ MclMessage {
 RequestInference { request_block }
 ExecuteTools     { calls }
 FinishTurn
+HistoryAppend    { message }
+RealtimeSource   { request_block }
+RealtimeLoad
 ```
+
+`HistoryAppend` is the only history write request. It is explicit Lua behavior;
+the host does not infer history writes from an incoming `AgentMessage` or from
+an arbitrary `INJECT`. `RealtimeSource (req)` declares the request Block as the
+authoritative realtime snapshot. Every mutation after that declaration causes
+the host to replace the persisted snapshot when the selected Block changes.
+`RealtimeLoad` reads that snapshot synchronously from Lua's point of view and
+returns `MclMessage` entries, including optional Assistant token usage. Base
+Lua places the returned entries into `recent_conversation`, runs its normal
+recent-to-history policy, then declares `RealtimeSource (req)` before entering
+the message loop.
 
 阻塞推理Effect：
 
@@ -164,7 +178,8 @@ Effect system只将它们转换为 inference、tool 和 Agent status 事件；�
 
 ## Resource Imports
 
-`IMPORT` 通过 ResourceMap 解析 alias。资源不可用时记录 Unavailable 并报告，但不终止
+`IMPORT` 通过 ResourceMap 解析 alias，并立即向宿主声明 `resource_id -> alias` 映射；宿主必须
+同步更新已注册资源，后续注册也必须复用该 alias。资源不可用时记录 Unavailable 并报告，但不终止
 Agent 创建。Prompt资源注入 MESSAGE 字段时转换为 Message；可执行资源注入 TOOL 字段。
 
 ## 删除项

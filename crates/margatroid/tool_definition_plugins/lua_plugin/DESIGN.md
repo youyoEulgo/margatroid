@@ -103,6 +103,7 @@ LuaDirectCapabilityHandle：单次调用直接能力集合，私有结构体
     http: LuaHttpHandle
     json: LuaJsonHandle
     log: LuaLogHandle
+    process: LuaProcessHandle
 
 LuaFileHandle：开放文件便利能力，私有结构体--接受任意绝对或相对路径，不持有World
     limits: LuaExecutionLimits
@@ -144,6 +145,12 @@ LuaLogHandle：结构化日志能力，私有结构体--固定本次调用日志
     install(&self, lua: &Lua, margatroid: &Table) -> Result<(), ToolError>
         注入日志API：私有方法，创建margatroid.log
         行为：注入trace(message)、debug(message)、info(message)、warn(message)和error(message)同步函数；message是String并携带固定agent_id、turn_id和resource_id tracing字段
+
+LuaProcessHandle：开放子进程能力，私有结构体--只接受程序名和argv，不经过Shell解析
+    install(&self, lua: &Lua, margatroid: &Table) -> Result<(), ToolError>
+        注入margatroid.process.run { program, args?, cwd? }
+        stdout和stderr持续读取并分别有界保留；超限设置truncated字段而不阻塞子进程
+        子进程受max_host_call_time限制并在Future取消时终止
 
 LuaDomainCommandHandle：领域命令能力，预留私有结构体--首版不构造也不注入Lua
     边界：未来只能持有受限RuntimeEventSender和逐请求响应通道，不得持有World或直接修改ECS状态

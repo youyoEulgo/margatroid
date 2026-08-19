@@ -2967,6 +2967,7 @@ dependencies = [
  "margatroid_types",
  "mcl_plugin",
  "memory_plugin",
+ "serde_json",
  "tempfile",
  "tool_plugin",
  "tracing",

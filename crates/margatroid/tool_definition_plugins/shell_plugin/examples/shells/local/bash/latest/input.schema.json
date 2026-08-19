@@ -4,7 +4,7 @@
     "command": {
       "type": "string",
       "minLength": 1,
-      "description": "Shell command to execute."
+      "description": "Bash command to execute."
     }
   },
   "required": ["command"],

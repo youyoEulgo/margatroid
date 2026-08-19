@@ -307,14 +307,18 @@ handle_agent_message(world: &mut World, event: &AgentMessage, events: &RuntimeEv
     处理消息：私有函数
     行为：
         System返回InvalidMessage
-        User开始或确认当前turn，写历史并送入Base Driver邮箱
+        User开始或确认当前turn并送入Base Driver邮箱；不隐式写历史
         User只追加正文并发送InferenceRequestEvent；工具调用只接受Assistant.tool_calls
-        Assistant先取得该turn对应的PendingInferenceToolSchemas；event.usage存在时先累加AgentTokenUsage；写入带usage的历史并送入Base Driver邮箱
+        Assistant先取得该turn对应的PendingInferenceToolSchemas；event.usage存在时先累加AgentTokenUsage；送入Base Driver邮箱但不隐式写历史
         Assistant.tool_calls为空时结束当前turn
         Assistant.tool_calls非空时逐项检查tool_name存在于本次ToolSpec且对应ResourceMapEntry仍在tool.tool_dynamic；不满足时直接发送Message::Tool拒绝响应，提示模型检查当前ToolSpec，不发送ToolCallEvent
         Assistant所有调用均被拒绝时仍将拒绝响应作为Message::Tool交给MCL；MCL按tool_call_id清理pending_tool
         Assistant鉴权通过的tool_calls统一派发
-        Tool写历史并送入Base Driver邮箱；Driver追加conversation、删除对应pending_tool，并在数组为空时请求下一次推理
+        Tool送入Base Driver邮箱；Driver显式追加历史与实时上下文、删除对应pending_tool，并在数组为空时请求下一次推理
+
+mcl_history_append_system(world: &mut World)
+    处理显式历史Effect：私有System，消费MclHistoryAppendRequested
+    行为：根据turn保留的ToolSpec补齐Assistant tool_schema，调用record_history_message发送唯一数据库历史写入事件
 
 take_pending_tool_schema(world: &mut World, agent: Entity, turn_id: &str) -> Vec<ToolDefinition>
     取得推理工具规格：私有函数，从PendingInferenceToolSchemas移除并返回当前Agent与turn对应的ToolSpec；不存在时返回空数组
@@ -322,7 +326,7 @@ take_pending_tool_schema(world: &mut World, agent: Entity, turn_id: &str) -> Vec
 record_history_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender, tool_schema: Vec<ToolDefinition>)
     请求历史写入：私有函数
     行为：User原样发送且tool_schema和usage为空；Assistant原样发送并携带传入的ToolSpec与event.usage；Skill类型Tool保留resource_id和tool_call_id并把content替换为resource_id.to_string()；非Skill类型Tool原样发送；Tool的tool_schema和usage为空
-    限制：Skill正文进入MCL conversation但不进入历史事件；非Skill工具响应正文完整写入历史事件
+    限制：只由mcl_history_append_system调用；Skill正文进入MCL request上下文但不进入历史事件；非Skill工具响应正文完整写入历史事件
 
 append_conversation_message(world: &mut World, agent: Entity, message: Message, events: &RuntimeEventSender) -> Result<(), AgentStepError>
 build_available_tools(world: &World, agent: Entity) -> Result<AvailableTools, AgentStepError>
@@ -396,6 +400,7 @@ Tool：
 
 ```text
 AgentPlugin负责Agent创建、当前turn、MCL领域事件适配、内部ToolSpec构造和推理调度。
+手动Assistant调用由SubmitAgentAssistant进入AgentPlugin；只接受动态可见的Skill资源，AgentPlugin按AgentToolMap将resource_id转换为内部tool_name，建立turn并作为标准AgentMessage交给Base Driver。
 AgentPlugin消费MclBlockingInferenceRequest，将指定MCL Request Block脱壳为领域消息后发起
 ContextCompactionInferenceRequest；响应摘要通过原MCL命令回执返回，不产生AgentMessage。
 AgentPlugin负责维护AgentTokenUsage；只有进入普通Assistant消息链路的Provider usage会累加，压缩推理不计入。

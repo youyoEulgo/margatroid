@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "pattern": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Regular expression to search for using ripgrep syntax."
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "default": ".",
+      "description": "File or directory to search. Relative paths resolve from the project root."
+    },
+    "include": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional single positive glob restricting searched files, for example *.rs or *.{ts,tsx}."
+    }
+  },
+  "required": ["pattern"],
+  "additionalProperties": false
+}

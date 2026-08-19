@@ -6,9 +6,9 @@ use core_plugin::{Entity, World};
 use log_plugin::{TracingField, TracingRecord};
 use margatroid_types::{
     AgentFailure, AgentFailureKind, AgentMessage, AgentVisibilityRouteAction, Message, ResourceId,
-    RouteAgentMessage, RouteAgentTurnAbort, RouteAgentVisibility, RouteAgentWorkflowAttach,
-    RouteAgentWorkflowDetach, StartWorkspace, ToolCall, WorkspaceAgentDefinition,
-    WorkspaceDefinition, WorkspaceReference,
+    RouteAgentAssistant, RouteAgentAssistantToolCall, RouteAgentMessage, RouteAgentTurnAbort,
+    RouteAgentVisibility, RouteAgentWorkflowAttach, RouteAgentWorkflowDetach, RouteMclCommand,
+    StartWorkspace, ToolCall, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
 };
 use mcl_plugin::AgentMcl;
 use memory_plugin::{AgentMemory, HistoryMessage};
@@ -78,6 +78,13 @@ pub enum ClientMessage {
         id: String,
         message: RouteAgentMessageDto,
     },
+    #[serde(rename = "agent.assistant")]
+    AgentAssistant {
+        id: String,
+        message: RouteAgentAssistantDto,
+    },
+    #[serde(rename = "mcl.command")]
+    MclCommand { id: String, message: MclCommandDto },
     #[serde(rename = "agent.turn.abort")]
     AgentTurnAbort {
         id: String,
@@ -128,6 +135,11 @@ pub enum ServerMessage {
     WorkspaceStopFailed { id: String, error: String },
     #[serde(rename = "agent.message")]
     AgentMessage { message: AgentMessageDto },
+    #[serde(rename = "mcl.command_result")]
+    MclCommandResult {
+        id: String,
+        result: Result<serde_json::Value, String>,
+    },
     #[serde(rename = "agent.message.delta")]
     AgentMessageDelta {
         id: String,
@@ -333,6 +345,88 @@ pub struct RouteAgentMessageDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: Option<ResourceIdDto>,
     pub message: UserMessageDto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteAgentAssistantDto {
+    pub workspace: WorkspaceReferenceDto,
+    pub agent: Option<ResourceIdDto>,
+    pub content: Option<String>,
+    pub reasoning: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<RouteAgentAssistantToolCallDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteAgentAssistantToolCallDto {
+    pub id: String,
+    pub resource_id: ResourceIdDto,
+    pub arguments: String,
+}
+
+impl IntoDomain<RouteAgentAssistant, String> for RouteAgentAssistantDto {
+    fn into_domain(self, id: String) -> Result<RouteAgentAssistant, ProtocolError> {
+        let tool_calls = self
+            .tool_calls
+            .into_iter()
+            .map(|call| {
+                Ok(RouteAgentAssistantToolCall {
+                    id: call.id,
+                    resource_id: call.resource_id.into_domain(())?,
+                    arguments: call.arguments,
+                })
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?;
+        Ok(RouteAgentAssistant {
+            id,
+            workspace: self.workspace.into_domain(())?,
+            agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
+            content: self.content,
+            reasoning: self.reasoning,
+            tool_calls,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MclCommandDto {
+    pub workspace: WorkspaceReferenceDto,
+    pub agent: Option<ResourceIdDto>,
+    pub command: String,
+    pub binding: Option<serde_json::Value>,
+}
+
+impl
+    IntoDomain<
+        RouteMclCommand,
+        (
+            String,
+            std::sync::mpsc::Sender<Result<serde_json::Value, String>>,
+        ),
+    > for MclCommandDto
+{
+    fn into_domain(
+        self,
+        (id, reply): (
+            String,
+            std::sync::mpsc::Sender<Result<serde_json::Value, String>>,
+        ),
+    ) -> Result<RouteMclCommand, ProtocolError> {
+        if self.command.trim().is_empty() {
+            return Err(ProtocolError::new(
+                ProtocolErrorKind::InvalidRequest,
+                "MCL command is empty",
+            ));
+        }
+        Ok(RouteMclCommand {
+            id,
+            workspace: self.workspace.into_domain(())?,
+            agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
+            command: self.command,
+            binding: self.binding,
+            reply,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1291,6 +1385,77 @@ on agent.created { restore capabilities.dynamic from capabilities.default; }
         assert_eq!(route.id, "abort-1");
         assert_eq!(route.workspace.name, "demo");
         assert_eq!(route.agent.unwrap().to_string(), "agent:demo/coder:latest");
+    }
+
+    #[test]
+    fn mcl_command_uses_agent_route_and_stable_result_shape() {
+        let request: ClientMessage = serde_json::from_value(json!({
+            "type": "mcl.command",
+            "id": "mcl-1",
+            "message": {
+                "workspace": workspace_reference(),
+                "agent": "agent:demo/coder:latest",
+                "command": "SELECT recent_conversation FROM msg",
+                "binding": null
+            }
+        }))
+        .unwrap();
+        let ClientMessage::MclCommand { id, message } = request else {
+            panic!("expected mcl.command");
+        };
+        let (reply, _) = std::sync::mpsc::channel();
+        let route: RouteMclCommand = message.into_domain((id, reply)).unwrap();
+        assert_eq!(route.id, "mcl-1");
+        assert_eq!(route.workspace.name, "demo");
+        assert_eq!(route.agent.unwrap().to_string(), "agent:demo/coder:latest");
+        assert_eq!(route.command, "SELECT recent_conversation FROM msg");
+
+        let success = serde_json::to_value(ServerMessage::MclCommandResult {
+            id: "mcl-1".into(),
+            result: Ok(json!([{"type": "user", "content": "hello"}])),
+        })
+        .unwrap();
+        assert_eq!(success["type"], "mcl.command_result");
+        assert!(success["result"]["Ok"].is_array());
+
+        let failure = serde_json::to_value(ServerMessage::MclCommandResult {
+            id: "mcl-1".into(),
+            result: Err("TypeMismatch: unknown field".into()),
+        })
+        .unwrap();
+        assert_eq!(failure["result"]["Err"], "TypeMismatch: unknown field");
+    }
+
+    #[test]
+    fn manual_assistant_routes_resource_tool_calls_without_internal_names() {
+        let request: ClientMessage = serde_json::from_value(json!({
+            "type": "agent.assistant",
+            "id": "manual-1",
+            "message": {
+                "workspace": workspace_reference(),
+                "agent": "agent:demo/coder:latest",
+                "content": null,
+                "reasoning": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "resource_id": "skill:local/review:latest",
+                    "arguments": "{}"
+                }]
+            }
+        }))
+        .unwrap();
+        let ClientMessage::AgentAssistant { id, message } = request else {
+            panic!("expected agent.assistant");
+        };
+        let route: RouteAgentAssistant = message.into_domain(id).unwrap();
+        assert_eq!(route.id, "manual-1");
+        assert_eq!(route.workspace.name, "demo");
+        assert_eq!(route.tool_calls.len(), 1);
+        assert_eq!(
+            route.tool_calls[0].resource_id.to_string(),
+            "skill:local/review:latest"
+        );
+        assert_eq!(route.tool_calls[0].arguments, "{}");
     }
 
     #[test]

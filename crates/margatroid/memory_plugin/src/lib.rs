@@ -7,8 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use app_runtime_plugin::RuntimePlugin;
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use margatroid_types::{
-    AgentContextMessagesUpdated, AgentHistoryMessageWriteRequested, Message, TokenUsage,
-    ToolDefinition,
+    AgentHistoryMessageWriteRequested, AgentRealtimeContextReadCompleted,
+    AgentRealtimeContextReadRequested, AgentRealtimeContextWriteRequested, AgentRealtimeMessage,
+    Message, TokenUsage, ToolDefinition,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
@@ -28,15 +29,12 @@ CREATE TABLE IF NOT EXISTS history_messages (
     cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS realtime_messages (
-    context TEXT NOT NULL,
-    position INTEGER NOT NULL,
-    message TEXT NOT NULL,
-    PRIMARY KEY (context, position)
-);
 CREATE TABLE IF NOT EXISTS realtime_context (
     position INTEGER PRIMARY KEY,
-    message TEXT NOT NULL
+    message TEXT NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_hit_tokens INTEGER
 );
 "#;
 
@@ -133,7 +131,8 @@ impl Plugin for MemoryPlugin {
 
         app.world_mut().insert_resource(MemoryPluginInstalled);
         app.add_system(&self.schedule, sync_history_messages_system)
-            .add_system(&self.schedule, sync_realtime_messages_system);
+            .add_system(&self.schedule, read_realtime_context_system)
+            .add_system(&self.schedule, sync_realtime_context_system);
     }
 }
 
@@ -195,7 +194,7 @@ impl AgentMemory {
             )
         })?;
         initialize_schema(&mut connection)?;
-        let mut context = load_realtime_messages(&connection)?;
+        let mut context = load_realtime_context(&connection)?;
         context.token_usage = load_token_usage(&connection)?;
         context.last_input_tokens = load_last_input_tokens(&connection)?;
         Ok((
@@ -257,17 +256,7 @@ impl WorldMemoryExt for World {
             ));
         }
 
-        {
-            let mut connection = lock_connection(&memory)?;
-            let transaction = connection.transaction().map_err(write_error)?;
-            rewrite_realtime_messages(
-                &transaction,
-                &context.messages,
-                &context.tool_context,
-                &context.ordered_messages,
-            )?;
-            transaction.commit().map_err(write_error)?;
-        }
+        let _ = context;
         if !self.insert_component(agent, memory) {
             return Err(MemoryError::new(
                 MemoryErrorKind::AgentNotAlive,
@@ -341,6 +330,10 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
             || !history_has_cache_hit_tokens);
     let legacy_realtime = table_has_column(connection, "realtime_messages", "position")?
         && !table_has_column(connection, "realtime_messages", "context")?;
+    let realtime_context_exists = table_exists(connection, "realtime_context")?;
+    let realtime_has_input = table_has_column(connection, "realtime_context", "input_tokens")?;
+    let realtime_has_output = table_has_column(connection, "realtime_context", "output_tokens")?;
+    let realtime_has_cache = table_has_column(connection, "realtime_context", "cache_hit_tokens")?;
     let transaction = connection.transaction().map_err(|_| {
         MemoryError::new(
             MemoryErrorKind::SchemaFailed,
@@ -374,6 +367,22 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
     transaction
         .execute_batch(HISTORY_SCHEMA)
         .map_err(schema_error)?;
+    if realtime_context_exists {
+        for (missing, column) in [
+            (!realtime_has_input, "input_tokens"),
+            (!realtime_has_output, "output_tokens"),
+            (!realtime_has_cache, "cache_hit_tokens"),
+        ] {
+            if missing {
+                transaction
+                    .execute(
+                        &format!("ALTER TABLE realtime_context ADD COLUMN {column} INTEGER"),
+                        [],
+                    )
+                    .map_err(schema_error)?;
+            }
+        }
+    }
     if legacy_history {
         migrate_history(&transaction)?;
         transaction
@@ -392,6 +401,9 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
             .execute("DROP TABLE realtime_messages_legacy", [])
             .map_err(schema_error)?;
     }
+    transaction
+        .execute("DROP TABLE IF EXISTS realtime_messages", [])
+        .map_err(schema_error)?;
     transaction.commit().map_err(schema_error)
 }
 
@@ -532,11 +544,16 @@ fn migrate_realtime(transaction: &Transaction<'_>) -> Result<(), MemoryError> {
             }
         }
     }
-    rewrite_realtime_messages(
+    rewrite_realtime_context(
         transaction,
-        &context.messages,
-        &context.tool_context,
-        &context.ordered_messages,
+        &context
+            .ordered_messages
+            .into_iter()
+            .map(|message| AgentRealtimeMessage {
+                message,
+                usage: None,
+            })
+            .collect::<Vec<_>>(),
     )
 }
 
@@ -695,167 +712,103 @@ fn decode_token_count(value: i64) -> Result<u64, MemoryError> {
     })
 }
 
-fn load_realtime_messages(connection: &Connection) -> Result<RealtimeContext, MemoryError> {
-    let ordered_messages = load_ordered_realtime_messages(connection)?;
-    if !ordered_messages.is_empty() {
-        let mut context = RealtimeContext {
-            ordered_messages,
-            ..RealtimeContext::default()
-        };
-        for message in &context.ordered_messages {
-            match message {
-                Message::User { .. } | Message::Assistant { .. } => {
-                    context.messages.push(message.clone())
-                }
-                Message::Tool { .. } => context.tool_context.push(message.clone()),
-                Message::System { .. } => {
-                    return Err(MemoryError::new(
-                        MemoryErrorKind::DecodeFailed,
-                        "ordered realtime context contains a system message",
-                    ))
-                }
-            }
-        }
-        return Ok(context);
-    }
-    let mut statement = connection.prepare("SELECT context, position, message FROM realtime_messages ORDER BY context ASC, position ASC").map_err(read_error)?;
+fn load_realtime_context(connection: &Connection) -> Result<RealtimeContext, MemoryError> {
+    let entries = load_ordered_realtime_messages(connection)?;
+    let ordered_messages = entries
+        .iter()
+        .map(|entry| entry.message.clone())
+        .collect::<Vec<_>>();
+    Ok(RealtimeContext {
+        messages: ordered_messages
+            .iter()
+            .filter(|message| matches!(message, Message::User { .. } | Message::Assistant { .. }))
+            .cloned()
+            .collect(),
+        tool_context: ordered_messages
+            .iter()
+            .filter(|message| matches!(message, Message::Tool { .. }))
+            .cloned()
+            .collect(),
+        ordered_messages,
+        ..RealtimeContext::default()
+    })
+}
+
+fn load_ordered_realtime_messages(
+    connection: &Connection,
+) -> Result<Vec<AgentRealtimeMessage>, MemoryError> {
+    let mut statement = connection
+        .prepare("SELECT position, message, input_tokens, output_tokens, cache_hit_tokens FROM realtime_context ORDER BY position")
+        .map_err(read_error)?;
     let rows = statement
         .query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
-        })
-        .map_err(read_error)?;
-    let mut context = RealtimeContext::default();
-    let mut conversation_position = 0i64;
-    let mut tool_position = 0i64;
-    for row in rows {
-        let (kind, position, encoded) = row.map_err(read_error)?;
-        let message = serde_json::from_str::<Message>(&encoded).map_err(|_| {
-            MemoryError::new(
-                MemoryErrorKind::DecodeFailed,
-                "realtime message JSON could not be decoded",
-            )
-        })?;
-        let expected = if kind == "conversation" {
-            &mut conversation_position
-        } else if kind == "tool" {
-            &mut tool_position
-        } else {
-            return Err(MemoryError::new(
-                MemoryErrorKind::DecodeFailed,
-                "realtime context is invalid",
-            ));
-        };
-        if position != *expected {
-            return Err(MemoryError::new(
-                MemoryErrorKind::DecodeFailed,
-                "realtime message positions are not continuous",
-            ));
-        }
-        *expected += 1;
-        match kind.as_str() {
-            "conversation"
-                if matches!(message, Message::User { .. } | Message::Assistant { .. }) =>
-            {
-                context.messages.push(message)
-            }
-            "tool" if matches!(message, Message::Tool { .. }) => context.tool_context.push(message),
-            _ => {
-                return Err(MemoryError::new(
-                    MemoryErrorKind::DecodeFailed,
-                    "realtime message type does not match context",
-                ))
-            }
-        }
-    }
-    context.ordered_messages = context
-        .messages
-        .iter()
-        .chain(context.tool_context.iter())
-        .cloned()
-        .collect();
-    Ok(context)
-}
-
-fn load_ordered_realtime_messages(connection: &Connection) -> Result<Vec<Message>, MemoryError> {
-    let mut statement = connection
-        .prepare("SELECT position, message FROM realtime_context ORDER BY position")
-        .map_err(read_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(read_error)?;
     let mut messages = Vec::new();
     for row in rows {
-        let (position, encoded) = row.map_err(read_error)?;
+        let (position, encoded, input, output, cache_hit) = row.map_err(read_error)?;
         if position != messages.len() as i64 {
             return Err(MemoryError::new(
                 MemoryErrorKind::DecodeFailed,
                 "ordered realtime message positions are not continuous",
             ));
         }
-        messages.push(serde_json::from_str::<Message>(&encoded).map_err(|_| {
+        let message = serde_json::from_str::<Message>(&encoded).map_err(|_| {
             MemoryError::new(
                 MemoryErrorKind::DecodeFailed,
                 "ordered realtime message JSON could not be decoded",
             )
-        })?);
+        })?;
+        let usage = match (input, output, cache_hit) {
+            (None, None, None) => None,
+            (Some(input), Some(output), Some(cache_hit)) => Some(TokenUsage {
+                input_tokens: u64::try_from(input).map_err(|_| {
+                    MemoryError::new(
+                        MemoryErrorKind::DecodeFailed,
+                        "realtime input token usage is negative",
+                    )
+                })?,
+                output_tokens: u64::try_from(output).map_err(|_| {
+                    MemoryError::new(
+                        MemoryErrorKind::DecodeFailed,
+                        "realtime output token usage is negative",
+                    )
+                })?,
+                cache_hit_tokens: u64::try_from(cache_hit).map_err(|_| {
+                    MemoryError::new(
+                        MemoryErrorKind::DecodeFailed,
+                        "realtime cache token usage is negative",
+                    )
+                })?,
+            }),
+            _ => {
+                return Err(MemoryError::new(
+                    MemoryErrorKind::DecodeFailed,
+                    "realtime token usage is incomplete",
+                ))
+            }
+        };
+        messages.push(AgentRealtimeMessage { message, usage });
     }
     Ok(messages)
 }
 
-fn rewrite_realtime_messages(
+fn rewrite_realtime_context(
     transaction: &Transaction<'_>,
-    messages: &[Message],
-    tool_context: &[Message],
-    ordered_messages: &[Message],
+    ordered_messages: &[AgentRealtimeMessage],
 ) -> Result<(), MemoryError> {
-    if messages
-        .iter()
-        .any(|m| !matches!(m, Message::User { .. } | Message::Assistant { .. }))
-        || tool_context
-            .iter()
-            .any(|m| !matches!(m, Message::Tool { .. }))
-        || ordered_messages
-            .iter()
-            .any(|m| matches!(m, Message::System { .. }))
-    {
-        return Err(MemoryError::new(
-            MemoryErrorKind::WriteFailed,
-            "realtime message type is invalid",
-        ));
-    }
-    transaction
-        .execute("DELETE FROM realtime_messages", [])
-        .map_err(write_error)?;
     transaction
         .execute("DELETE FROM realtime_context", [])
         .map_err(write_error)?;
-    for (context, entries) in [("conversation", messages), ("tool", tool_context)] {
-        for (position, message) in entries.iter().enumerate() {
-            let encoded = serde_json::to_string(message).map_err(|_| {
-                MemoryError::new(
-                    MemoryErrorKind::WriteFailed,
-                    "realtime message JSON could not be encoded",
-                )
-            })?;
-            transaction.execute("INSERT INTO realtime_messages (context, position, message) VALUES (?1, ?2, ?3)", params![context, position as i64, encoded]).map_err(write_error)?;
-        }
-    }
-    let ordered = if ordered_messages.is_empty() {
-        messages
-            .iter()
-            .chain(tool_context.iter())
-            .collect::<Vec<_>>()
-    } else {
-        ordered_messages.iter().collect::<Vec<_>>()
-    };
-    for (position, message) in ordered.into_iter().enumerate() {
-        let encoded = serde_json::to_string(message).map_err(|_| {
+    for (position, entry) in ordered_messages.iter().enumerate() {
+        let encoded = serde_json::to_string(&entry.message).map_err(|_| {
             MemoryError::new(
                 MemoryErrorKind::WriteFailed,
                 "ordered realtime message JSON could not be encoded",
@@ -863,8 +816,14 @@ fn rewrite_realtime_messages(
         })?;
         transaction
             .execute(
-                "INSERT INTO realtime_context (position, message) VALUES (?1, ?2)",
-                params![position as i64, encoded],
+                "INSERT INTO realtime_context (position, message, input_tokens, output_tokens, cache_hit_tokens) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    position as i64,
+                    encoded,
+                    entry.usage.as_ref().map(|usage| usage.input_tokens as i64),
+                    entry.usage.as_ref().map(|usage| usage.output_tokens as i64),
+                    entry.usage.as_ref().map(|usage| usage.cache_hit_tokens as i64),
+                ],
             )
             .map_err(write_error)?;
     }
@@ -997,14 +956,14 @@ fn write_error(_: rusqlite::Error) -> MemoryError {
     MemoryError::new(MemoryErrorKind::WriteFailed, "memory database write failed")
 }
 
-fn sync_realtime_messages_system(world: &mut World) {
+fn sync_realtime_context_system(world: &mut World) {
     let events = world
-        .event_reader::<AgentContextMessagesUpdated>()
+        .event_reader::<AgentRealtimeContextWriteRequested>()
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
     for event in events {
-        let result = sync_realtime_message(world, &event);
+        let result = sync_realtime_context(world, &event);
         if let Err(error) = result {
             world.emit_event(AgentMemoryWriteFailed {
                 agent: event.agent,
@@ -1014,9 +973,9 @@ fn sync_realtime_messages_system(world: &mut World) {
     }
 }
 
-fn sync_realtime_message(
+fn sync_realtime_context(
     world: &World,
-    event: &AgentContextMessagesUpdated,
+    event: &AgentRealtimeContextWriteRequested,
 ) -> Result<(), MemoryError> {
     if !world.is_alive(event.agent) {
         return Err(MemoryError::new(
@@ -1034,13 +993,35 @@ fn sync_realtime_message(
         })?;
     let mut connection = lock_connection(memory)?;
     let transaction = connection.transaction().map_err(write_error)?;
-    rewrite_realtime_messages(
-        &transaction,
-        &event.messages,
-        &event.tool_context,
-        &event.ordered_messages,
-    )?;
+    rewrite_realtime_context(&transaction, &event.messages)?;
     transaction.commit().map_err(write_error)
+}
+
+fn read_realtime_context_system(world: &mut World) {
+    let requests = world
+        .event_reader::<AgentRealtimeContextReadRequested>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for request in requests {
+        let result = (|| {
+            let memory = world
+                .get_component::<AgentMemory>(request.agent)
+                .ok_or_else(|| {
+                    MemoryError::new(
+                        MemoryErrorKind::AgentMemoryMissing,
+                        "agent does not have memory",
+                    )
+                })?;
+            let connection = lock_connection(memory)?;
+            Ok(load_ordered_realtime_messages(&connection)?)
+        })();
+        world.emit_event(AgentRealtimeContextReadCompleted {
+            id: request.id,
+            agent: request.agent,
+            result: result.map_err(|error: MemoryError| error.to_string()),
+        });
+    }
 }
 
 fn sync_history_messages_system(world: &mut World) {
@@ -1130,6 +1111,19 @@ mod tests {
         app.world_mut()
             .bind_agent_memory(agent, memory, &context)
             .unwrap();
+        app.world().emit_event(AgentRealtimeContextWriteRequested {
+            agent,
+            messages: context
+                .ordered_messages
+                .iter()
+                .cloned()
+                .map(|message| AgentRealtimeMessage {
+                    message,
+                    usage: None,
+                })
+                .collect(),
+        });
+        app.tick();
 
         let (_, restored) = AgentMemory::open(&path).unwrap();
         assert_eq!(restored, context);
@@ -1222,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_realtime_rewrite_preserves_the_previous_snapshot() {
+    fn realtime_effect_replaces_the_previous_snapshot() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("memory.sql");
         let (memory, _) = AgentMemory::open(&path).unwrap();
@@ -1242,21 +1236,35 @@ mod tests {
         app.world_mut()
             .bind_agent_memory(agent, memory, &original)
             .unwrap();
-        app.world().emit_event(AgentContextMessagesUpdated {
+        app.world().emit_event(AgentRealtimeContextWriteRequested {
             agent,
-            messages: vec![Message::System {
-                content: "invalid".into(),
+            messages: vec![AgentRealtimeMessage {
+                message: Message::User {
+                    content: "keep".into(),
+                },
+                usage: None,
             }],
-            tool_context: Vec::new(),
-            ordered_messages: vec![Message::System {
-                content: "invalid".into(),
+        });
+        app.tick();
+        app.world().emit_event(AgentRealtimeContextWriteRequested {
+            agent,
+            messages: vec![AgentRealtimeMessage {
+                message: Message::User {
+                    content: "new".into(),
+                },
+                usage: None,
             }],
         });
 
         app.tick();
 
         let (_, restored) = AgentMemory::open(&path).unwrap();
-        assert_eq!(restored, original);
+        assert_eq!(
+            restored.ordered_messages,
+            vec![Message::User {
+                content: "new".into()
+            }]
+        );
     }
 
     #[test]

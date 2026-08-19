@@ -12,9 +12,9 @@ memory_plugin = { path = "../memory_plugin" }
 mcl_plugin = { path = "../mcl_plugin" }
 server_plugin = { path = "../../mecs/server_plugin" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 workspace_plugin = { path = "../workspace_plugin" }
 
 [dev-dependencies]
 app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
-serde_json = { workspace = true }
 tool_plugin = { path = "../tool_plugin" }

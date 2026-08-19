@@ -14,9 +14,11 @@ use margatroid_types::{
 };
 use mcl_plugin::{
     AgentMcl, AttachAgentMclRequest, MclBlockingInferenceRequest, MclCapabilityOwner,
-    MclCommandValue, MclEffect, MclEffectsProduced, MclMessage, MclPluginInstalled, MclProgram,
-    MclRuntimeMessage, WorkflowMclDetached, WorldMclExt,
+    MclCommandValue, MclEffect, MclEffectsProduced, MclHistoryAppendRequested, MclMessage,
+    MclPluginInstalled, MclProgram, MclResourceAliasDeclared, MclRuntimeMessage,
+    WorkflowMclDetached, WorldMclExt,
 };
+use tool_plugin::set_agent_tool_alias;
 use tool_plugin::{
     attach_agent_tool_map, AgentToolMap, AgentToolRegisterRequest, AgentToolRegisterResponse,
     CancelToolTurn, ToolCallEvent, ToolError, ToolErrorKind, ToolPluginInstalled,
@@ -100,7 +102,9 @@ impl Plugin for AgentPlugin {
         app.world_mut()
             .insert_resource(PendingBlockingInferences::default());
         app.add_system(&self.schedule, agent_create_system)
+            .add_system(&self.schedule, mcl_resource_alias_system)
             .add_system(&self.schedule, agent_visibility_change_system)
+            .add_system(&self.schedule, mcl_history_append_system)
             .add_system(&self.schedule, mcl_effect_system)
             .add_system(&self.schedule, workflow_visibility_cleanup_system)
             .add_system(&self.schedule, collect_agent_tool_registration_system)
@@ -108,7 +112,63 @@ impl Plugin for AgentPlugin {
             .add_system(&self.schedule, abort_agent_turn_system)
             .add_system(&self.schedule, context_compaction_system)
             .add_system(&self.schedule, blocking_inference_system)
+            .add_system(&self.schedule, submit_agent_assistant_system)
             .add_system(&self.schedule, agent_message_system);
+    }
+}
+
+fn mcl_resource_alias_system(world: &mut World) {
+    let declarations = world
+        .event_reader::<MclResourceAliasDeclared>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for declaration in declarations {
+        if let Err(error) = set_agent_tool_alias(
+            world,
+            declaration.agent,
+            declaration.resource_id.clone(),
+            declaration.alias.clone(),
+        ) {
+            tracing::warn!(
+                agent = ?declaration.agent,
+                resource = %declaration.resource_id,
+                alias = %declaration.alias,
+                error = %error,
+                "MCL resource alias could not be applied to AgentToolMap"
+            );
+        }
+    }
+}
+
+fn mcl_history_append_system(world: &mut World) {
+    let requests = world
+        .event_reader::<MclHistoryAppendRequested>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let events = world.event_sender();
+    for request in requests {
+        let tool_schema = if matches!(request.message.message, Message::Assistant { .. }) {
+            world
+                .get_resource::<PendingInferenceToolSchemas>()
+                .and_then(|pending| pending.schemas.get(&(request.agent, request.id.clone())))
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        record_history_message(
+            world,
+            &AgentMessage {
+                id: request.id,
+                agent: request.agent,
+                message: request.message.message,
+                usage: request.message.usage,
+            },
+            &events,
+            tool_schema,
+        );
     }
 }
 
@@ -147,6 +207,24 @@ pub struct AgentCreated {
 }
 
 impl Event for AgentCreated {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmitAgentAssistant {
+    pub id: String,
+    pub agent: Entity,
+    pub content: Option<String>,
+    pub reasoning: Option<String>,
+    pub tool_calls: Vec<SubmitAgentAssistantToolCall>,
+}
+
+impl Event for SubmitAgentAssistant {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmitAgentAssistantToolCall {
+    pub id: String,
+    pub resource_id: ResourceId,
+    pub arguments: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InjectAgentVisibleResource {
@@ -1532,6 +1610,88 @@ fn agent_message_system(world: &mut World) {
     }
 }
 
+fn submit_agent_assistant_system(world: &mut World) {
+    let requests = world
+        .event_reader::<SubmitAgentAssistant>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let events = world.event_sender();
+    for request in requests {
+        let result = (|| {
+            if request.tool_calls.is_empty() {
+                return Err(AgentStepError::InvalidToolBatch);
+            }
+            world
+                .get_component_mut::<AgentStatus>(request.agent)
+                .ok_or(AgentStepError::StatusMissing)?
+                .begin_turn(request.id.clone())?;
+            let maps = world
+                .get_component::<AgentToolMap>(request.agent)
+                .ok_or(AgentStepError::ToolMapMissing)?;
+            let visibility = world
+                .get_component::<AgentMcl>(request.agent)
+                .ok_or(AgentStepError::ContextMissing)?;
+            let mut tool_calls = Vec::with_capacity(request.tool_calls.len());
+            let mut tool_schema = Vec::with_capacity(request.tool_calls.len());
+            for call in &request.tool_calls {
+                if call.resource_id.resource_type() != "skill"
+                    || !visibility.capabilities().is_visible(&call.resource_id)
+                {
+                    return Err(AgentStepError::InvalidToolBatch);
+                }
+                let matched = maps.get_by_resource(&call.resource_id);
+                if matched.len() != 1 {
+                    return Err(AgentStepError::InvalidToolBatch);
+                }
+                let map = matched[0];
+                tool_calls.push(ToolCall {
+                    id: call.id.clone(),
+                    tool_name: map.tool_name.clone(),
+                    arguments: call.arguments.clone(),
+                });
+                tool_schema.push(ToolDefinition {
+                    name: map.tool_name.clone(),
+                    description: map.template.description.clone(),
+                    input_schema: map.template.parameters.clone(),
+                });
+            }
+            world
+                .get_resource_mut::<PendingInferenceToolSchemas>()
+                .expect("AgentPlugin is installed")
+                .schemas
+                .insert((request.agent, request.id.clone()), tool_schema);
+            events.send_event(AgentMessage {
+                id: request.id.clone(),
+                agent: request.agent,
+                message: Message::Assistant {
+                    reasoning: request.reasoning.clone(),
+                    content: request.content.clone(),
+                    tool_calls,
+                },
+                usage: None,
+            });
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if world
+                .get_component::<AgentStatus>(request.agent)
+                .is_some_and(|status| status.turn_id.as_deref() == Some(&request.id))
+            {
+                let _ = world
+                    .get_component_mut::<AgentStatus>(request.agent)
+                    .and_then(AgentStatus::abort_turn);
+            }
+            events.send_event(AgentFailure {
+                id: request.id,
+                agent: request.agent,
+                kind: AgentFailureKind::Agent,
+                message: error.failure_message(),
+            });
+        }
+    }
+}
+
 fn abort_agent_turn_system(world: &mut World) {
     let requests = world
         .event_reader::<AbortAgentTurn>()
@@ -1827,7 +1987,6 @@ fn handle_agent_message(
                 .ok_or(AgentStepError::StatusMissing)?
                 .begin_turn(event.id.clone())?;
             clear_tool_context(world, agent, events)?;
-            record_history_message(world, event, events, Vec::new());
             append_conversation_message(world, agent, event.message.clone(), events)?;
         }
         Message::Assistant { .. } => {
@@ -1852,7 +2011,6 @@ fn handle_agent_message(
                     .ok_or(AgentStepError::TokenUsageMissing)?
                     .add(usage);
             }
-            record_history_message(world, event, events, tool_schema.clone());
             append_conversation_message(world, agent, event.message.clone(), events)?;
         }
         Message::Tool { .. } => {
@@ -1865,7 +2023,6 @@ fn handle_agent_message(
             {
                 return Err(AgentStepError::InvalidToolBatch);
             }
-            record_history_message(world, event, events, Vec::new());
             append_tool_context(world, agent, event.message.clone(), events)?;
         }
     }
@@ -2554,6 +2711,19 @@ on message.assistant where event.tool_calls is empty { append event.entry into c
             usage: Some(usage.clone()),
         });
         app.tick();
+        app.world().send_event(MclHistoryAppendRequested {
+            id: "turn-1".into(),
+            agent,
+            message: MclMessage::new(
+                Message::Assistant {
+                    reasoning: None,
+                    content: Some("done".into()),
+                    tool_calls: Vec::new(),
+                },
+                Some(usage.clone()),
+            ),
+        });
+        app.tick();
         app.tick();
 
         let totals = app.world().get_component::<AgentTokenUsage>(agent).unwrap();
@@ -2750,12 +2920,12 @@ on message.assistant where event.tool_calls is empty { append event.entry into c
                 system_prompt: "system".into(),
                 messages: Vec::new(),
                 tool_context: vec![Message::Tool {
-                    resource_id: ResourceId::parse("shell:local/sh:latest").unwrap(),
+                    resource_id: ResourceId::parse("shell:local/bash:latest").unwrap(),
                     tool_call_id: "call-1".into(),
                     content: "partial".into(),
                 }],
                 ordered_messages: vec![Message::Tool {
-                    resource_id: ResourceId::parse("shell:local/sh:latest").unwrap(),
+                    resource_id: ResourceId::parse("shell:local/bash:latest").unwrap(),
                     tool_call_id: "call-1".into(),
                     content: "partial".into(),
                 }],
@@ -2879,7 +3049,7 @@ on message.assistant where event.tool_calls is empty { append event.entry into c
                 id: "tool-turn".into(),
                 agent,
                 message: Message::Tool {
-                    resource_id: ResourceId::parse("shell:local/sh:latest").unwrap(),
+                    resource_id: ResourceId::parse("shell:local/bash:latest").unwrap(),
                     tool_call_id: "tool-call".into(),
                     content: "complete command output".into(),
                 },
@@ -2912,7 +3082,7 @@ on message.assistant where event.tool_calls is empty { append event.entry into c
     #[test]
     fn hidden_assistant_tool_call_becomes_a_denied_tool_message() {
         let (mut app, agent) = test_app();
-        let resource_id = ResourceId::parse("shell:local/sh:latest").unwrap();
+        let resource_id = ResourceId::parse("shell:local/bash:latest").unwrap();
         attach_agent_tool_map(app.world_mut(), agent).unwrap();
         let map = register_agent_tool(
             app.world_mut(),
