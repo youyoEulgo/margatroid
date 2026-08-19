@@ -78,6 +78,7 @@ fn executes_handlers_and_assembles_a_snapshot() {
             AttachAgentMclRequest {
                 base: compile_standard(),
                 system_prompt: "system".into(),
+                context_window_tokens: 1_000_000,
                 restored_messages: Vec::new(),
                 default_visibility: BTreeSet::from([shell.clone()]),
             },
@@ -125,6 +126,7 @@ fn capability_grants_are_isolated_by_owner() {
             AttachAgentMclRequest {
                 base: compile_standard(),
                 system_prompt: String::new(),
+                context_window_tokens: 1_000_000,
                 restored_messages: Vec::new(),
                 default_visibility: BTreeSet::new(),
             },
@@ -262,6 +264,7 @@ on message.tool { append event.entry into event.exchange; }
             AttachAgentMclRequest {
                 base: program,
                 system_prompt: String::new(),
+                context_window_tokens: 1_000_000,
                 restored_messages: Vec::new(),
                 default_visibility: BTreeSet::new(),
             },

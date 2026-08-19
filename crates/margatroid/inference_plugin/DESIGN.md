@@ -62,6 +62,10 @@ ModelRouteConfig：模型路由配置，私有结构体--由models.toml读取Pro
     api_type: String--选择Provider Adapter；deepseek表示DeepSeek协议语义
     thinking: Option<String>--DeepSeek思考开关；enabled启用，省略或disabled关闭
     reasoning_effort: Option<String>--DeepSeek思考强度；启用思考时使用high或max
+    context_window: Option<String>--模型总上下文窗口；使用AI数量级k/m/b/t，分别表示thousand/million/billion/trillion，缺省1m
+
+AgentInferenceSnapshot：Agent固定推理配置Component
+    context_window_tokens: u64--模型路由context_window标准化后的Token数量
 
 InferenceTaskOutput：异步推理结果，私有事件
     route: InferenceRoute

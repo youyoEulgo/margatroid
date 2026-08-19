@@ -224,6 +224,7 @@ impl InferenceParameters {
 #[derive(Clone)]
 pub struct AgentInferenceSnapshot {
     model: ModelId,
+    context_window_tokens: u64,
     parameters: InferenceParameters,
     workspace: Entity,
     source_image: Entity,
@@ -232,6 +233,10 @@ pub struct AgentInferenceSnapshot {
 impl AgentInferenceSnapshot {
     pub fn model(&self) -> &ModelId {
         &self.model
+    }
+
+    pub fn context_window_tokens(&self) -> u64 {
+        self.context_window_tokens
     }
 
     pub fn parameters(&self) -> &InferenceParameters {
@@ -252,12 +257,17 @@ impl Component for AgentInferenceSnapshot {}
 #[derive(Clone)]
 pub struct ConfiguredModelRoute {
     model: String,
+    context_window_tokens: u64,
     adapter: ErasedProviderAdapter,
 }
 
 impl ConfiguredModelRoute {
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub fn context_window_tokens(&self) -> u64 {
+        self.context_window_tokens
     }
 
     pub fn adapter(&self) -> &ErasedProviderAdapter {
@@ -775,8 +785,18 @@ impl WorldInferenceExt for World {
                 format!("model route `{model}` was not found"),
             ));
         }
+        let context_window_tokens = self
+            .get_component::<WorkspaceModelRoutes>(workspace)
+            .and_then(|routes| routes.get(&model))
+            .or_else(|| {
+                self.get_resource::<GlobalModelRoutes>()
+                    .and_then(|routes| routes.get(&model))
+            })
+            .map(|route| route.context_window_tokens())
+            .unwrap_or(1_000_000);
         Ok(AgentInferenceSnapshot {
             model,
+            context_window_tokens,
             parameters,
             workspace,
             source_image,
@@ -799,6 +819,40 @@ struct ModelRouteConfig {
     api_type: String,
     thinking: Option<String>,
     reasoning_effort: Option<String>,
+    context_window: Option<String>,
+}
+
+fn parse_context_window(value: Option<&str>) -> Result<u64, InferenceError> {
+    let value = value.unwrap_or("1m").trim().to_ascii_lowercase();
+    let (number, multiplier) = if let Some(number) = value.strip_suffix('k') {
+        (number, 1_000_u64)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 1_000_000_u64)
+    } else if let Some(number) = value.strip_suffix('b') {
+        (number, 1_000_000_000_u64)
+    } else if let Some(number) = value.strip_suffix('t') {
+        (number, 1_000_000_000_000_u64)
+    } else {
+        return Err(InferenceError::new(
+            InferenceErrorKind::InvalidModelRoute,
+            "context_window must use k, m, b, or t suffix",
+        ));
+    };
+    let count = number.parse::<u64>().map_err(|_| {
+        InferenceError::new(
+            InferenceErrorKind::InvalidModelRoute,
+            "context_window amount is invalid",
+        )
+    })?;
+    count
+        .checked_mul(multiplier)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            InferenceError::new(
+                InferenceErrorKind::InvalidModelRoute,
+                "context_window must be greater than zero",
+            )
+        })
 }
 
 fn default_config_path() -> PathBuf {
@@ -888,10 +942,12 @@ fn compile_model_routes(
             thinking: config.thinking.as_deref(),
             reasoning_effort: config.reasoning_effort.as_deref(),
         })?;
+        let context_window_tokens = parse_context_window(config.context_window.as_deref())?;
         routes.insert(
             id,
             ConfiguredModelRoute {
                 model: config.model,
+                context_window_tokens,
                 adapter,
             },
         );
@@ -2240,6 +2296,19 @@ fn parse_stop_reason(value: &str) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_window_uses_decimal_units_and_defaults_to_one_million() {
+        assert_eq!(parse_context_window(None).unwrap(), 1_000_000);
+        assert_eq!(parse_context_window(Some("200k")).unwrap(), 200_000);
+        assert_eq!(parse_context_window(Some("500K")).unwrap(), 500_000);
+        assert_eq!(parse_context_window(Some("1m")).unwrap(), 1_000_000);
+        assert_eq!(parse_context_window(Some("3b")).unwrap(), 3_000_000_000);
+        assert_eq!(parse_context_window(Some("2t")).unwrap(), 2_000_000_000_000);
+        assert!(parse_context_window(Some("1g")).is_err());
+        assert!(parse_context_window(Some("200000")).is_err());
+        assert!(parse_context_window(Some("1.5m")).is_err());
+    }
     use app_runtime_plugin::RuntimePlugin;
     use async_runtime_plugin::AsyncRuntimePlugin;
     use std::collections::HashMap;

@@ -603,6 +603,10 @@ pub struct AgentStateDto {
     pub total_cache_hit_tokens: u64,
     #[serde(default)]
     pub cache_hit_rate: f64,
+    #[serde(default)]
+    pub last_input_tokens: u64,
+    #[serde(default)]
+    pub context_window_tokens: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -786,6 +790,8 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
             total_output_tokens: token_usage.total_output_tokens(),
             total_cache_hit_tokens: token_usage.total_cache_hit_tokens(),
             cache_hit_rate: token_usage.cache_hit_rate(),
+            last_input_tokens: token_usage.last_input_tokens(),
+            context_window_tokens: token_usage.context_window_tokens(),
         })
     }
 }
@@ -853,6 +859,8 @@ impl FromDomain<(), &World> for BackendStateDto {
                         total_output_tokens: 0,
                         total_cache_hit_tokens: 0,
                         cache_hit_rate: 0.0,
+                        last_input_tokens: 0,
+                        context_window_tokens: 0,
                     }),
                     WorkspaceAgentState::Failed { error } => agent_states.push(AgentStateDto {
                         workspace: info.reference(),
@@ -867,6 +875,8 @@ impl FromDomain<(), &World> for BackendStateDto {
                         total_output_tokens: 0,
                         total_cache_hit_tokens: 0,
                         cache_hit_rate: 0.0,
+                        last_input_tokens: 0,
+                        context_window_tokens: 0,
                     }),
                 }
             }
@@ -1411,6 +1421,8 @@ on agent.created { restore capabilities.dynamic from capabilities.default; }
                     total_output_tokens: 200,
                     total_cache_hit_tokens: 750,
                     cache_hit_rate: 0.75,
+                    last_input_tokens: 800,
+                    context_window_tokens: 200_000,
                 }],
                 histories: vec![AgentHistoryDto {
                     workspace: workspace_reference(),
@@ -1443,6 +1455,11 @@ on agent.created { restore capabilities.dynamic from capabilities.default; }
         assert_eq!(value["state"]["agents"][0]["total_output_tokens"], 200);
         assert_eq!(value["state"]["agents"][0]["total_cache_hit_tokens"], 750);
         assert_eq!(value["state"]["agents"][0]["cache_hit_rate"], 0.75);
+        assert_eq!(value["state"]["agents"][0]["last_input_tokens"], 800);
+        assert_eq!(
+            value["state"]["agents"][0]["context_window_tokens"],
+            200_000
+        );
         assert_eq!(
             value["state"]["agents"][0]["visible_resources"][0],
             "skill:local/review:latest"
@@ -1480,6 +1497,8 @@ on agent.created { restore capabilities.dynamic from capabilities.default; }
                 output_tokens: 100,
                 cache_hit_tokens: 250,
             },
+            last_input_tokens: 400,
+            context_window_tokens: 1_000_000,
             default_visibility: BTreeSet::from([skill.clone()]),
         });
         app.tick();
@@ -1519,6 +1538,8 @@ on agent.created { restore capabilities.dynamic from capabilities.default; }
         assert_eq!(state.total_output_tokens, 100);
         assert_eq!(state.total_cache_hit_tokens, 250);
         assert_eq!(state.cache_hit_rate, 0.625);
+        assert_eq!(state.last_input_tokens, 400);
+        assert_eq!(state.context_window_tokens, 1_000_000);
         assert_eq!(
             state.visible_resources[0],
             ResourceIdDto("skill:local/review:latest".into())

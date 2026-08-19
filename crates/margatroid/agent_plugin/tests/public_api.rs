@@ -51,6 +51,8 @@ fn documented_public_api_creates_an_agent() {
             output_tokens: 40,
             cache_hit_tokens: 150,
         },
+        last_input_tokens: 200,
+        context_window_tokens: 1_000_000,
         default_visibility: BTreeSet::new(),
     });
     app.tick();
@@ -126,6 +128,8 @@ fn duplicate_agent_resource_ids_are_rejected() {
             tool_context: Vec::new(),
             ordered_messages: Vec::new(),
             token_usage: margatroid_types::TokenUsage::default(),
+            last_input_tokens: 0,
+            context_window_tokens: 1_000_000,
             default_visibility: BTreeSet::new(),
         });
     }

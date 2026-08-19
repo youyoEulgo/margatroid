@@ -805,6 +805,7 @@ async fn validate_image_layout(root: &Path) -> Result<DirectorySignature, AgentI
         match (entry.name.to_str(), entry.kind) {
             (Some("agent.toml"), DirectoryEntryKind::File) => manifest = true,
             (Some("SOUL.md"), DirectoryEntryKind::File) => soul = true,
+            (Some("COMPACT.md"), DirectoryEntryKind::File) => {}
             (Some("base.lua"), DirectoryEntryKind::File) => {}
             _ => {
                 return Err(AgentImageLoadError::new(

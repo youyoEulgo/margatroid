@@ -21,6 +21,8 @@ AgentCreateRequest：Agent创建请求，公开事件--WorkspacePlugin交付Agen
     tool_environment: AgentToolEnvironment--项目根、镜像根和主目录解析环境，由ToolPlugin定义类型
     ordered_messages: Vec<Message>--按实际发生顺序恢复的User、Assistant与Tool消息，作为MCL恢复输入
     token_usage: TokenUsage--从历史Assistant行恢复的累计Token
+    last_input_tokens: u64--从历史最后一条Assistant恢复的输入Token
+    context_window_tokens: u64--InferencePlugin标准化后的模型总上下文窗口，交给Base Driver读取
     impl Event for AgentCreateRequest
 
 AgentCreateResult：Agent Entity创建结果，公开事件--无论成功失败都恰好发送一次
@@ -128,12 +130,16 @@ AgentTokenUsage：Agent累计Token状态，公开只读Component
     total_output_tokens: u64--历史Assistant响应累计输出Token
     total_cache_hit_tokens: u64--历史Assistant响应累计缓存命中Token
     cache_hit_rate: f64--total_cache_hit_tokens / total_input_tokens；总输入为0时为0
+    last_input_tokens: u64--最近一条普通Assistant响应的输入Token；启动时从历史最后一条Assistant恢复
+    context_window_tokens: u64--当前Agent模型配置的最大上下文窗口
     total_input_tokens(&self) -> u64
     total_output_tokens(&self) -> u64
     total_cache_hit_tokens(&self) -> u64
     cache_hit_rate(&self) -> f64
+    last_input_tokens(&self) -> u64
+    context_window_tokens(&self) -> u64
     add(&mut self, usage: &TokenUsage)
-        累加用量：crate公开方法，三项使用饱和加法并在每次修改后重新计算cache_hit_rate
+        累加用量：crate公开方法，三项使用饱和加法，覆盖last_input_tokens，并重新计算cache_hit_rate
     impl Component for AgentTokenUsage
 
 AgentPluginInstalled：安装标记，公开Resource
@@ -390,6 +396,8 @@ Tool：
 
 ```text
 AgentPlugin负责Agent创建、当前turn、MCL领域事件适配、内部ToolSpec构造和推理调度。
+AgentPlugin消费MclBlockingInferenceRequest，将指定MCL Request Block脱壳为领域消息后发起
+ContextCompactionInferenceRequest；响应摘要通过原MCL命令回执返回，不产生AgentMessage。
 AgentPlugin负责维护AgentTokenUsage；只有进入普通Assistant消息链路的Provider usage会累加，压缩推理不计入。
 AgentPlugin把外部可见性操作转换为MCL命令，不直接修改AgentMcl，不维护第二套可见性Component。
 WorkspacePlugin只在收到AgentCreateResult后挂载其余外部运行组件，不介入资源注册或可见性修改。

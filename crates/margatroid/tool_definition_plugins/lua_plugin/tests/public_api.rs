@@ -77,6 +77,8 @@ fn registers_and_executes_trusted_lua_tools_asynchronously() {
         tool_context: Vec::new(),
         ordered_messages: Vec::new(),
         token_usage: margatroid_types::TokenUsage::default(),
+        last_input_tokens: 0,
+        context_window_tokens: 1_000_000,
         default_visibility: BTreeSet::new(),
     });
     app.tick();
@@ -197,6 +199,8 @@ fn tracked_write_file_example_creates_parent_directories_and_writes_content() {
         tool_context: Vec::new(),
         ordered_messages: Vec::new(),
         token_usage: margatroid_types::TokenUsage::default(),
+        last_input_tokens: 0,
+        context_window_tokens: 1_000_000,
         default_visibility: BTreeSet::new(),
     });
     app.tick();
