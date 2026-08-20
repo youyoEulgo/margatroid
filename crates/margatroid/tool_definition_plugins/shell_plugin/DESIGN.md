@@ -76,7 +76,7 @@ shell_register_system(world: &mut World)
 
 shell_tool_call_prepare_system(world: &mut World)
     准备Shell调用：只处理tool_id=tool:builtin/shell:latest
-    行为：验证请求、读取AgentToolEnvironment和AgentIdentity、重新查找资源包
+    行为：验证请求、读取ResourceId及Agent.info中的project_root和image_root、重新查找资源包
         解析arguments并按资源Schema验证，取得arguments.command
         创建ShellToolResponseGuard和PreparedShellToolCall后发送异步事件
         准备失败立即发送唯一ToolCallResponse

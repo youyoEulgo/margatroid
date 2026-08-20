@@ -42,24 +42,40 @@ MemoryPlugin：Agent消息持久化插件，公开结构体--通过事件同步�
     impl Plugin for MemoryPlugin
         Plugin：公开trait实现
         build(self, app: &mut App)
-            构建插件：拒绝重复安装，挂载sync_history_messages_system、sync_realtime_context_system和read_realtime_context_system
+            构建插件：拒绝重复安装，注册AgentRealtimeContextWriteRequested、AgentRealtimeContextReadRequested和AgentRealtimeContextReadCompleted，挂载sync_history_messages_system、sync_realtime_context_system和read_realtime_context_system
 
-AgentMemory：Agent数据库绑定，公开组件--一个运行中Agent独占一个SQLite连接
+AgentMemory：Agent数据库打开器，公开结构体--创建Agent前建立一个独占SQLite存储并封装为共享AgentMemoryHandle
     path: PathBuf--WorkspacePlugin提供的规范化数据库路径，私有
     connection: Mutex<rusqlite::Connection>--只由MemoryPlugin使用，私有
-    open(path: impl Into<PathBuf>) -> Result<(Self, RealtimeContext), MemoryError>
-        打开记忆：公开关联函数，创建表、按有序实时上下文恢复并从历史Assistant行聚合Token
+    open(path: impl Into<PathBuf>) -> Result<(AgentMemoryHandle, RealtimeContext), MemoryError>
+        打开记忆：公开关联函数，创建表、按有序实时上下文恢复并从历史Assistant行聚合Token，把连接封装进AgentMemoryHandle
         行为：优先从realtime_context恢复ordered_messages；旧库没有有序表时读取旧conversation和tool分区并迁移为单一有序消息流
     path(&self) -> &Path
         取得路径：公开方法
     history_messages(&self) -> Result<Vec<HistoryMessage>, MemoryError>
         读取展示历史：公开方法，按sequence升序恢复User、Assistant和Tool条目
-    impl Component for AgentMemory
-        Component：公开trait实现
+    impl AgentMemoryStore for AgentMemory
+        Agent存储接口：公开trait实现，通过AgentMemoryHandle向MemoryPlugin的System提供历史追加、实时整体覆盖和实时读取；不暴露SQLite连接
 
 RealtimeContext：实时上下文快照，公开结构体--Agent启动时恢复的消息投影
-    ordered_messages: Vec<Message>--MCL conversation的完整有序消息流，包含User、Assistant和Tool
+    ordered_messages: Vec<MclMessage>--MCL实时来源的完整有序消息流，保留Assistant的可选TokenUsage
     token_usage: TokenUsage--从全部历史Assistant行聚合出的输入、输出与缓存命中Token总数
+
+AgentRealtimeContextWriteRequested：实时上下文整体覆盖请求，公开事件--由MclPlugin声明来源或检测到来源字段变更后产生
+    agent: Entity--目标Agent Entity
+    messages: Vec<MclMessage>--来源RefMerge重新展开后的完整有序快照
+    impl Event + Clone for AgentRealtimeContextWriteRequested
+
+AgentRealtimeContextReadRequested：实时上下文读取请求，公开事件--由realtime_load Effect产生
+    id: String--"mcl-effect:"命名空间下的请求ID
+    agent: Entity--目标Agent Entity
+    impl Event + Clone for AgentRealtimeContextReadRequested
+
+AgentRealtimeContextReadCompleted：实时上下文读取响应，公开事件--无论成功失败都恰好响应一次
+    id: String--原读取请求ID
+    agent: Entity--原目标Agent Entity
+    result: Result<Vec<MclMessage>, MemoryError>--完整有序快照或稳定读取错误
+    impl Event + Clone for AgentRealtimeContextReadCompleted
 
 HistoryMessage：可展示历史条目，公开结构体--对应history_messages中的一行
     sequence: i64--单Agent永久递增序号
@@ -86,7 +102,6 @@ MemoryErrorKind：记忆错误分类，公开枚举
     DecodeFailed
     AgentNotAlive
     AgentMemoryMissing
-    AlreadyBound
     PluginMissing
     WriteFailed
 
@@ -101,12 +116,8 @@ MemoryError：记忆错误，公开结构体--保存稳定分类和有界描述
         Display：公开trait实现
     impl std::error::Error for MemoryError
         Error：公开trait实现
-
-WorldMemoryExt：World记忆扩展，公开trait--只保留Workspace启动期的Agent数据库绑定入口
-    bind_agent_memory(&mut self, agent: Entity, memory: AgentMemory, context: &RealtimeContext) -> Result<(), MemoryError>
-        绑定记忆：公开方法，验证Plugin、Agent和未绑定状态，使实时表与context一致后挂载AgentMemory
-    impl WorldMemoryExt for World
-        World记忆扩展：公开trait实现
+    impl Clone for MemoryError
+        Clone：公开trait实现，供读取完成事件安全复制
 
 MemoryPluginInstalled：MemoryPlugin安装标记，公开单元Resource--阻止重复安装并供WorkspacePlugin确认依赖
 ```
@@ -187,7 +198,7 @@ load_token_usage(connection: &Connection) -> Result<TokenUsage, MemoryError>
 load_realtime_context(connection: &Connection) -> Result<RealtimeContext, MemoryError>
     读取兼容投影：私有函数，按realtime_context的position升序读取，供Token恢复和旧公开接口使用
 
-rewrite_realtime_context(transaction: &Transaction, ordered_messages: &[AgentRealtimeMessage]) -> Result<(), MemoryError>
+rewrite_realtime_context(transaction: &Transaction, ordered_messages: &[MclMessage]) -> Result<(), MemoryError>
     重写实时上下文：私有函数，使realtime_context与MCL request Block快照完全一致
     行为：在同一事务中删除旧行，验证消息协议并按position写入Message与可选TokenUsage
 
@@ -212,11 +223,11 @@ sync_history_message(world: &World, event: &AgentHistoryMessageWriteRequested) -
 
 sync_realtime_context_system(world: &mut World)
     同步实时上下文：私有System，消费AgentRealtimeContextWriteRequested
-    行为：按事件顺序调用rewrite_realtime_context(event.messages)，不读取AgentContext，不修改history_messages
+    行为：按事件顺序从Agent.memory取得AgentMemoryHandle并调用rewrite_realtime_context(event.messages)，不读取其他Agent上下文，不修改history_messages
 
 read_realtime_context_system(world: &mut World)
     读取实时上下文：私有System，消费AgentRealtimeContextReadRequested并发布AgentRealtimeContextReadCompleted
-    行为：从已绑定AgentMemory读取完整MclMessage投影；错误通过回执返回MCL Driver
+    行为：逐项保留原请求id和agent，从Agent.memory的AgentMemoryHandle读取完整MclMessage投影；无论成功失败都发布恰好一个Completed，由MclPlugin完成原MCL回执
 
 current_unix_milliseconds() -> Result<i64, MemoryError>
     取得写入时间：私有函数，返回Unix毫秒并检查SQLite整数范围
@@ -244,7 +255,9 @@ Workspace启动：
         -> load_token_usage
         -> 返回RealtimeContext { ordered_messages, token_usage }
     WorkspacePlugin
-        -> 只绑定AgentMemory，不把快照作为AgentCreateRequest的隐式上下文
+        -> 把AgentMemoryHandle放入AgentCreateRequest，不把快照作为隐式上下文
+    AgentPlugin
+        -> 在启动Base Lua前把句柄写入Agent.memory
     Base Lua
         -> EMIT EFFECT realtime_load
         -> 将结果注入recent_conversation并执行自己的拆分策略
@@ -260,7 +273,8 @@ Workspace启动：
 
 实时写入：
     Base Lua声明EMIT EFFECT realtime_source (req)后
-        -> req输入字段变化
+        -> MclPlugin保存req中唯一Message RefMerge的真实BlockPath依赖
+        -> 任一依赖字段成功变化时重新展开该RefMerge
         -> AgentRealtimeContextWriteRequested完整MclMessage快照
         -> sync_realtime_context_system
         -> realtime_context整体替换
@@ -280,7 +294,7 @@ Agent重启：
 
 ```text
 MemoryPlugin负责：SQLite schema、历史事件写入、实时快照同步和恢复
-MemoryPlugin不读取AgentStatus，不判断Tool来源，不读取Skill正文，不决定上下文压缩时机
+MemoryPlugin从Agent.memory取得存储句柄，但不维护第二份Agent状态；不判断Tool来源，不读取Skill正文，不决定上下文压缩时机
 AgentPlugin负责根据工具来源构造应写入的历史Message并发送事件
 WorkspacePlugin负责数据库路径、打开顺序和Agent绑定
 ```
@@ -302,5 +316,5 @@ World
 └── AgentRealtimeContextReadRequested Event
     └── read_realtime_context_system
 └── Agent Entity
-    └── AgentMemory
+    └── Agent.memory: AgentMemoryHandle
 ```

@@ -4,7 +4,7 @@
 
 公开：
 ```text
-InferenceRequestEvent：推理请求事件，公开事件--AgentPlugin交付完整上下文和Provider无关ToolSpec
+InferenceRequestEvent：普通推理请求事件，公开事件--MclPlugin交付完整上下文和Provider无关ToolSpec，响应进入AgentMessage
     id: String--交互轮次ID
     agent: Entity--请求所属Agent Entity
     agent_id: ResourceId--稳定Agent身份，用于流式消息和日志
@@ -12,20 +12,21 @@ InferenceRequestEvent：推理请求事件，公开事件--AgentPlugin交付完�
     tools: Vec<ToolDefinition>--内部ToolSpec；name是ResourceMapEntry.resource_name
     impl Event for InferenceRequestEvent
 
-ContextCompactionInferenceRequest：上下文压缩推理请求，公开事件--AgentPlugin交付System、待压缩头部消息和压缩提示词
-    id: String--压缩请求ID
+CapturedInferenceRequest：捕获式推理请求，公开事件--MclPlugin为catch_inference交付只返回调用点的消息上下文
+    id: String--"mcl-effect:"命名空间下的请求ID
     agent: Entity--请求所属Agent Entity
     agent_id: ResourceId--稳定Agent身份，只用于路由和日志
-    messages: Vec<Message>--不含保留尾部的压缩输入
-    impl Event for ContextCompactionInferenceRequest
+    messages: Vec<Message>--MCL RefBlock展开后的完整输入
+    impl Event for CapturedInferenceRequest
 
-ContextCompactionInferenceResponse：上下文压缩推理响应，公开事件--不进入普通AgentMessage链路
-    id: String--压缩请求ID
+CapturedInferenceResponse：捕获式推理响应，公开事件--只完成原catch_inference回执，不进入普通AgentMessage链路
+    id: String--原捕获请求ID
     agent: Entity--请求所属Agent Entity
-    result: Result<String, InferenceError>--成功时为非空完整摘要正文，失败时为稳定推理错误
-    impl Event for ContextCompactionInferenceResponse
+    result: Result<String, InferenceError>--成功时为非空完整正文，失败时为稳定推理错误
+    impl Event for CapturedInferenceResponse
+    impl Clone for CapturedInferenceResponse
 
-CancelInferenceRequest：取消推理请求，公开事件--AgentPlugin中止轮次时发送
+CancelInferenceRequest：取消推理请求，公开事件--Agent生命周期控制或MclPlugin清理已结束VM时发送
     id: String--要取消的交互轮次ID
     agent: Entity--请求所属Agent
     impl Event for CancelInferenceRequest
@@ -42,6 +43,7 @@ ProviderStreamDelta：Provider流式增量，公开枚举--Accumulator区分思�
     Content(String)--新增正文文本
 
 InferenceError：推理错误，公开结构体
+    impl Clone for InferenceError
 ```
 
 私有：
@@ -52,7 +54,7 @@ PreparedInference：已准备推理，私有事件--主线程完成路由、Prov
     client: reqwest::Client
     request: ProviderHttpRequest
     adapter: ErasedProviderAdapter
-    senders: Vec<WebSocketSender>--普通Agent推理的流式目标；上下文压缩为空
+    senders: Vec<WebSocketSender>--普通Agent推理的流式目标；捕获式推理为空
     cancellation: watch::Receiver<bool>--当前请求取消信号
 
 InFlightInferences：飞行中推理表，私有Resource
@@ -85,15 +87,15 @@ InferenceToolCall：Provider Adapter内部调用累积结构，私有结构体
 
 ```text
 prepare_inference_system(world: &mut World)
-    准备推理：私有System，分别读取InferenceRequestEvent和ContextCompactionInferenceRequest
+    准备推理：私有System，分别读取InferenceRequestEvent和CapturedInferenceRequest
     行为：
         验证请求、Agent和消息结构
         读取AgentInferenceSnapshot及Workspace或全局模型路由
         把内部ToolSpec交给选定Provider Adapter构造Provider请求
         不查询ToolPlugin或读取AgentResourceMap；只转换请求中已经给出的resource_name
-        普通Agent推理根据全局配置解析流式发送器；上下文压缩使用空ToolSpec和空发送器
+        普通Agent推理根据全局配置解析流式发送器；捕获式推理固定使用空ToolSpec和空发送器
         登记InFlightInferences并发送带结果用途的PreparedInference
-        准备失败时，普通推理发送AgentFailure，上下文压缩发送ContextCompactionInferenceResponse::Err
+        准备失败时，普通推理发送AgentFailure，捕获式推理发送CapturedInferenceResponse::Err
 
 cancel_inference_system(world: &mut World)
     取消推理：私有System，读取CancelInferenceRequest并向匹配飞行中请求发送取消信号
@@ -108,8 +110,8 @@ publish_inference_output_system(world: &mut World)
         从InFlightInferences移除当前请求；已取消结果不发送AgentMessage或AgentFailure
         普通推理失败时发送AgentFailure { kind: Inference }
         普通推理成功时使用ProviderInferenceResponse构造Message::Assistant并发送携带response.usage的AgentMessage
-        上下文压缩失败时发送ContextCompactionInferenceResponse::Err
-        上下文压缩成功时要求stop_reason=Completed、无tool_calls且content为非空正文；只发送ContextCompactionInferenceResponse::Ok(content)
+        捕获式推理失败时发送CapturedInferenceResponse::Err
+        捕获式推理成功时要求stop_reason=Completed、无tool_calls且content为非空正文；只发送CapturedInferenceResponse::Ok(content)
         不再发布InferenceResponse，也不经过工具身份转换System
 
 ProviderAdapter::build_request(input: ProviderInput) -> Result<ProviderHttpRequest, InferenceError>
@@ -136,7 +138,7 @@ decode_token_usage(usage: OpenAiUsage) -> TokenUsage
 ## 逻辑
 
 ```text
-AgentPlugin
+MclPlugin的inference Effect
     -> InferenceRequestEvent { messages, tools }
 InferencePlugin主线程
     -> Provider Adapter把内部ToolSpec转换为Provider ToolSpec
@@ -148,17 +150,22 @@ InferencePlugin主线程
 主线程发布
     -> AgentMessage { Message::Assistant { reasoning, content, tool_calls }, usage }
 AgentPlugin
-    -> tool_calls为空时结束轮次
-    -> tool_calls非空时发送ToolCallEvent
+    -> 把完整AgentMessage投递到长期Lua VM邮箱
+Base Lua
+    -> 下一次start取得Assistant消息并决定tool_call或finish
 
-AgentPlugin
-    -> ContextCompactionInferenceRequest { messages, tools=[] }
+普通推理失败
+    -> AgentFailure { id: turn_id, kind: Inference }
+    -> MclPlugin完成当前或下一次start为Err并中止该turn，不留下永久pending回执
+
+MclPlugin的catch_inference Effect
+    -> CapturedInferenceRequest { messages, tools=[] }
 InferencePlugin异步HTTP
     -> 不发送流式前端消息
 InferencePlugin主线程发布
-    -> ContextCompactionInferenceResponse
-AgentPlugin
-    -> 校验上下文快照并rewrite_messages
+    -> CapturedInferenceResponse
+MclPlugin
+    -> 完成原catch_inference的MclCommandReply
 ```
 
 ## 边界
@@ -167,8 +174,8 @@ AgentPlugin
 InferencePlugin负责模型路由、Provider协议适配、HTTP请求、流式输出、响应累积和异步结果发布。
 InferencePlugin负责ResourceMapEntry.resource_name与Provider合法tool_name之间的本次请求双向转换；映射只存活到InferenceResponse转换完成，不写入AgentResourceMap。
 InferencePlugin不查询Agent可见性或工具注册状态，InferenceRequestEvent中的tools是本次请求唯一工具输入。
-上下文压缩请求始终使用空ToolSpec、空流式发送器和独立响应事件；摘要不会成为普通Assistant消息。
-上下文压缩Provider响应即使带usage也不进入AgentMessage或历史Token统计。
+捕获式推理始终使用空ToolSpec、空流式发送器和独立响应事件；响应不会成为普通Assistant消息。
+捕获式推理的Provider响应即使带usage也不进入AgentMessage或历史Token统计。
 不存在公开InferenceResponse事件；异步结果发布System只负责把成功结果包装成AgentMessage。
 模型参数不得用于选择Skill、Tool或其他资源。
 OpenAI Adapter不回传或解析Message::Assistant.reasoning；DeepSeek Adapter独占DeepSeek协议差异。

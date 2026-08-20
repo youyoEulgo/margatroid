@@ -1,47 +1,21 @@
 # MargatroidTypes
 
+## Agent共享数据归属
+
+```text
+Agent以及其内嵌的AgentInfo、AgentCreationState、AgentLuaState、AgentMcl、MclRealtimeSource、AgentResourceMap、AgentMemoryHandle、AgentMemoryStore、AgentMemoryStoreError、AgentInferenceState、AgentToolState、AgentTurnState和TokenUsageState均定义在types crate。
+AgentPlugin负责创建Entity并分别挂载ResourceId和唯一Agent组件；Agent组件的存在本身表明该Entity是Agent。其他领域Plugin只能通过Agent组件读取或修改自己负责的数据，不再为同一Agent挂载第二份状态Component。
+MCL的Block、BlockAssembly、RefMerge、RefBlock和RefBlockAssembly以及LuaVmId同样定义在types crate，由对应Plugin重新导出。
+ResourceId及其World查询扩展实际定义在ResourceIdPlugin；types crate中的共享结构只引用ResourceId，不拥有其实现。
+types crate只定义数据结构、局部数据方法和AgentMemoryStore这类依赖反转接口，不包含System、事件路由或数据库、推理、工具、Lua VM的具体实现。
+```
+
 ## 类型
 
 ### 统一资源身份
 
 ```text
-ResourceId：统一资源ID，公开结构体--所有可寻址资源共享的稳定身份
-    resource_type: String--资源类型，私有
-    scope: String--资源命名空间，私有
-    name: String--命名空间内名称，私有
-    tag: String--版本或实例标签，私有；省略时规范化为latest
-    parse(value: impl AsRef<str>) -> Result<Self, ResourceIdError>
-        解析ID：公开关联函数，解析type:scope/name[:tag]并补齐latest
-    new(resource_type: impl Into<String>, scope: impl Into<String>, name: impl Into<String>, tag: Option<impl Into<String>>) -> Result<Self, ResourceIdError>
-        构造ID：公开关联函数，验证字段并在tag为空时补齐latest
-    resource_type(&self) -> &str
-        取得资源类型：公开方法，用于选择资源路由
-    scope(&self) -> &str
-        取得作用域：公开方法
-    name(&self) -> &str
-        取得名称：公开方法
-    tag(&self) -> &str
-        取得标签：公开方法
-    impl fmt::Display for ResourceId
-        Display：公开trait实现，始终输出type:scope/name:tag
-    impl FromStr for ResourceId
-        FromStr：公开trait实现，行为与parse一致
-    impl Clone + Ord + Eq + Hash for ResourceId
-        值语义：公开trait实现，四个字段共同参与比较和哈希
-    impl Serialize + Deserialize for ResourceId
-        序列化：公开trait实现，使用规范化完整ID字符串
-
-ResourceIdError：统一资源ID错误，公开枚举--描述ResourceId解析和验证错误
-    Empty
-    InvalidType
-    InvalidScope
-    InvalidName
-    InvalidTag
-    InvalidFormat
-    impl fmt::Display for ResourceIdError
-        Display：公开trait实现，输出不包含原始输入的稳定错误描述
-    impl std::error::Error for ResourceIdError
-        Error：公开trait实现
+ResourceId和ResourceIdError由ResourceIdPlugin公开，其他插件直接依赖ResourceIdPlugin使用
 ```
 
 ```text
@@ -208,23 +182,16 @@ AgentMessage：统一Agent消息事件，公开结构体--Margatroid内部所有
         Event：公开trait实现
     impl Clone for AgentMessage
         Clone：公开trait实现
-    限制：message只能是User、Assistant或Tool，不能是System；结构体不提供业务方法；AgentPlugin根据Message结构决定后续动作
-
-AgentContextMessagesUpdated：Agent上下文更新事件，公开结构体--MCL conversation事务提交后通知MemoryPlugin同步实时消息
-    agent: Entity--消息所属AgentInstance Entity
-    ordered_messages: Vec<Message>--完整conversation有序快照，包含User、Assistant和Tool，不包含System
-    impl Event for AgentContextMessagesUpdated
-        Event：公开trait实现
-    impl Clone for AgentContextMessagesUpdated
-        Clone：公开trait实现
+    限制：message只能是User、Assistant或Tool，不能是System；结构体不提供业务方法；AgentPlugin只投递，Base Lua根据start返回的Message结构决定后续Effect
 
 AgentFailureKind：Agent执行失败来源，公开枚举--标识无法表示成Message的轮次级失败
     Agent--AgentPlugin在消息分支、上下文或工具定义准备失败时产生
     Inference--InferencePlugin在准备或执行推理失败时产生
+    Tool--ToolPlugin在调用无法路由且不能产生合法Tool消息时产生
     impl Clone + Copy + PartialEq + Eq for AgentFailureKind
         值语义：公开trait实现
 
-AgentFailure：统一Agent失败事件，公开结构体--让来源Plugin终止轮次而不伪造Assistant或Tool消息
+AgentFailure：兼容性失败事件，公开结构体--仅供非Agent领域向观察者报告无法转换为AgentControlReply的失败；AgentPlugin自身不发布该事件
     id: String--原完整交互轮次ID
     agent: Entity--失败所属AgentInstance Entity
     kind: AgentFailureKind--失败来源分类
@@ -234,7 +201,7 @@ AgentFailure：统一Agent失败事件，公开结构体--让来源Plugin终止�
     impl Clone for AgentFailure
         Clone：公开trait实现
 
-AgentHistoryMessageWriteRequested：Agent历史消息写入请求，公开结构体--AgentPlugin通过事件通道交给MemoryPlugin
+AgentHistoryMessageWriteRequested：Agent历史消息写入请求，公开结构体--MclPlugin的history_append Effect通过事件通道交给MemoryPlugin
     id: String--完整交互轮次ID
     agent: Entity--消息所属AgentInstance Entity
     message: Message--需要写入历史的消息，Skill响应已由AgentPlugin替换为加载标记
@@ -307,20 +274,19 @@ Workspace定义：
     用户入口
         -> 构造Message::User { content }
         -> 发送AgentMessage
-    AgentPlugin收到User
-        -> 直接发起推理
+    AgentPlugin收到AgentMessage
+        -> 只投递给Agent.lua.vm_id对应的长期Lua VM
     InferencePlugin完成推理
         -> Provider Adapter保留reasoning与tool_name并构造Message::Assistant
         -> 发送AgentMessage
     ToolPlugin完成工具调用
-        -> 从PendingToolCalls恢复resource_id并构造Message::Tool
+        -> 从Agent.tools.pending恢复resource_id并构造Message::Tool
         -> 发送AgentMessage
     AgentPlugin
-        -> 只消费统一AgentMessage
-        -> 根据Message变体及ToolCall列表维护当前turn并把领域事件交给MCL
-        -> 把工具调用发送为ToolCallEvent；MCL pending_tool数组管理语义上的待完成调用
-        -> ToolPlugin PendingToolCalls只关联异步工具请求与响应
-        -> 每次发起推理都按MCL tool.tool_dynamic构造ToolSpec；用户意图不控制工具定义是否进入请求
+        -> 只消费AgentControl和AgentMessage
+        -> AgentControl按控制类型路由到领域请求
+        -> AgentMessage不解析内容，只投递给长期Lua VM
+        -> Base Lua通过MCL、Inference和Tool领域组织完整控制循环
 
 失败通道：
     推理失败不能伪装成Message
@@ -328,13 +294,12 @@ Workspace定义：
         -> 后续处理契约暂不定义
 
 记忆事件：
-    AgentPlugin处理User、Assistant或Tool
+    Base Lua通过MCL HistoryAppend Effect
         -> 发送AgentHistoryMessageWriteRequested
-        -> 历史事件的content直接替换为Message::Tool.resource_id字符串
         -> MCL conversation保存完整Tool正文
-    MCL conversation修改
-        -> 发送包含完整ordered_messages的AgentContextMessagesUpdated
-    MemoryPlugin只消费事件，不读取AgentStatus或资源正文
+    MCL realtime_source声明或其依赖字段修改
+        -> MemoryPlugin定义的AgentRealtimeContextWriteRequested携带完整MclMessage快照
+    MemoryPlugin通过事件执行持久化，并从Agent.memory取得目标存储句柄；不维护第二份Agent内存状态
 ```
 
 ## 持有关系

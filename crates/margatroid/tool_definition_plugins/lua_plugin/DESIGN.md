@@ -40,7 +40,7 @@ LuaExecutionLimits：Lua单次执行限制，公开结构体--所有字段在调
 
 LuaToolRegisterRequest：Agent Lua工具注册请求，公开事件
     id: String--Workspace注册子请求ID
-    agent: Entity--目标Agent Entity，必须已挂载AgentIdentity、AgentResourceMap和AgentToolEnvironment
+    agent: Entity--目标Agent Entity，必须具有Agent和ResourceId
     resource_id: ResourceId--待注册完整Tool资源ID
     alias: Option<String>--MCL IMPORT可选别名
     impl Event for LuaToolRegisterRequest
@@ -86,7 +86,7 @@ LuaToolCallLocator：ToolCallResponse定位信息，私有结构体
     tool_call_id: String
 
 LuaCallContext：注入Lua的只读调用信息，私有结构体
-    agent_id: ResourceId--来自AgentIdentity，不向Lua暴露Entity
+    agent_id: ResourceId--来自Entity的ResourceId组件，不向Lua暴露Entity
     turn_id: String
     resource_id: ResourceId
     project_root: Arc<PathBuf>--公开给可信Lua工具的项目绝对根
@@ -187,7 +187,7 @@ lua_tool_register_system(world: &mut World)
     注册Lua工具：私有System，读取LuaToolRegisterRequest
     行为：
         验证id非空、agent存活且resource_id使用type=tool
-        从Agent Entity读取AgentToolEnvironment
+        从Agent.info读取project_root和image_root，主目录工具根来自LuaRoots.home_root
         按项目、镜像、主目录顺序精确查找工具包
         有界读取tool.toml和input.schema.json并调用parse_lua_tool_definition
         resource_name使用请求alias或完整resource_id字符串，构造ToolTemplate { name=resource_name, description, parameters }
@@ -200,10 +200,10 @@ lua_tool_call_prepare_system(world: &mut World)
     行为：
         只处理tool_id=tool:builtin/lua-runtime:latest
         为每个请求先验证定位字段、agent、type=tool和arguments字节限制
-        从Agent读取AgentIdentity和AgentToolEnvironment；不读取Workspace组件
+        从Agent读取ResourceId及Agent.info中的project_root和image_root；不读取Workspace组件
         按项目、镜像、主目录顺序重新查找工具包
         构造LuaCallContext { agent_id, turn_id, resource_id, project_root, image_root, package_root }
-        使用AgentToolEnvironment、工具包根、共享客户端和LuaExecutionLimits构造LuaExecutionHandle
+        使用Agent.info中的目录、工具包根、共享客户端和LuaExecutionLimits构造LuaExecutionHandle
         在send_async_event前使用world.event_sender构造LuaToolResponseGuard
         成功时发送PreparedLuaToolCall异步事件
         任一步失败时立即发送且只发送一次ToolCallResponse { result: Err(error), 原定位字段 }
@@ -229,7 +229,7 @@ lua_task_result_system(world: &mut World)
     收集异步基础设施结果：私有System，读取Result<(), LuaTaskError>
     行为：Ok不处理；Err只记录不含脚本、参数和绝对路径的稳定警告，不再发送ToolCallResponse
 
-find_lua_tool_package(environment: &AgentToolEnvironment, home_root: &Path, resource_id: &ResourceId) -> Result<PathBuf, ToolError>
+find_lua_tool_package(project_root: &Path, image_root: &Path, home_root: &Path, resource_id: &ResourceId) -> Result<PathBuf, ToolError>
     查找Lua工具包：私有函数
     行为：
         只接受type=tool的完整ResourceId，tag不限定为latest
@@ -277,7 +277,7 @@ Workspace启动：
 
 每次调用：
     ToolPlugin
-        -> PendingToolCalls.add_pending
+        -> Agent.tools.pending登记请求
         -> ToolCallRequest
     LuaPlugin同步准备System
         -> 创建LuaToolResponseGuard
@@ -288,7 +288,7 @@ Workspace启动：
         -> 异步Rust宿主函数通过Lua协程等待
         -> ToolCallResponse
     ToolPlugin
-        -> PendingToolCalls.remove
+        -> Agent.tools.pending移除请求
         -> AgentMessage::Tool
     AgentPlugin -> MCL删除对应pending_tool
                 -> pending_tool为空时请求下一次推理
@@ -297,11 +297,11 @@ Workspace启动：
 ## 边界
 
 ```text
-LuaPlugin依赖AgentPlugin的AgentIdentity、ToolPlugin和AsyncRuntimePlugin；不依赖WorkspacePlugin，避免与注册协调形成循环依赖。
+LuaPlugin依赖共享Agent、ResourceId、ToolPlugin和AsyncRuntimePlugin数据；不依赖WorkspacePlugin，避免与注册协调形成循环依赖。
 LuaPlugin不读取Agent可见性；BuiltinToolPlugin只把已经确定的具体resource_id交给它注册。
-LuaPlugin不持有AgentResourceMap、PendingToolCalls或AgentStatus，不构造AgentMessage，不判断一轮工具是否完成。
+LuaPlugin不拥有或修改Agent.tools.pending，不挂载第二份Agent组件，不构造AgentMessage，不判断一轮工具是否完成。
 LuaExecutionHandle及全部子句柄不持有World、Entity查询器、Component引用或Resource引用。
-Agent Entity只用于内部ToolCallResponse定位；Lua可见上下文使用AgentIdentity中的ResourceId。
+Agent Entity只用于内部ToolCallResponse定位；Lua可见上下文使用Entity的ResourceId组件。
 Lua工具是开发者主动安装的可信代码；LuaPlugin不构成安全沙箱，完整标准库和开放句柄允许任意文件、环境、网络、子进程和动态模块操作。
 LuaExecutionLimits只防止部分意外资源耗尽，不是权限边界；os.execute、原生模块和其他同步系统调用可能绕过异步超时与Lua指令Hook。
 首版LuaDomainCommandHandle不存在；工具互调、Agent、Skill、Workspace和Inference不能由Lua直接操作。
