@@ -12,7 +12,7 @@ SkillPlugin：Skill注册与执行Plugin，公开结构体
 
 SkillRegisterRequest：Agent Skill注册请求，公开事件
     id: String--Workspace注册子请求ID
-    agent: Entity--目标Agent Entity，必须已挂载AgentResourceMap和AgentToolEnvironment
+    agent: Entity--目标Agent Entity，必须具有Agent和ResourceId
     resource_id: ResourceId--待注册完整Skill ID
     alias: Option<String>--MCL IMPORT可选别名
     impl Event for SkillRegisterRequest
@@ -52,7 +52,7 @@ skill_register_system(world: &mut World)
     注册Skill：私有System，读取SkillRegisterRequest
     行为：
         验证resource_id使用type=skill及受支持tag
-        从Agent Entity读取AgentToolEnvironment
+        从Agent.info读取project_root和image_root，主目录Skill根来自SkillRoots.home_root
         按项目、镜像、主目录顺序精确查找SKILL.md
         resource_name使用alias或完整resource_id字符串；解析顶部+++包围的TOML元信息并构造Provider无关ToolTemplate；description来自frontmatter，不把Skill正文放入模板
         构造候选ResourceMapEntry并通过SkillRegisterResponse返回；不写AgentResourceMap
@@ -69,7 +69,7 @@ skill_tool_call_system(world: &mut World)
         失败时发送同定位信息和稳定ToolError
         不自行发送AgentMessage
 
-find_skill_file(environment: &AgentToolEnvironment, home_root: &Path, resource_id: &ResourceId) -> Result<PathBuf, ToolError>
+find_skill_file(project_root: &Path, image_root: &Path, home_root: &Path, resource_id: &ResourceId) -> Result<PathBuf, ToolError>
     查找Skill：项目、镜像、主目录顺序；找到目录但缺少SKILL.md时立即失败，不回退
 
 read_skill_document(path: &Path) -> Result<SkillDocument, ToolError>

@@ -58,7 +58,7 @@ WorkspacePlugin：Workspace运行编排插件，公开结构体--协调Workspace
         build(self, app: &mut App)
             构建插件：安装WorkspaceRegistry并挂载Workspace命令System
             行为：
-                确认RuntimePlugin、AgentImageLoaderPlugin、InferencePlugin、ToolPlugin、MclPlugin、AgentPlugin和MemoryPlugin已安装；缺失任一依赖时终止配置
+                确认RuntimePlugin、ResourceIdPlugin、AgentImageLoaderPlugin、InferencePlugin、ToolPlugin、MclPlugin、AgentPlugin和MemoryPlugin已安装；缺失任一依赖时终止配置
                 确认schedule存在且WorkspacePlugin尚未安装
                 插入WorkspaceRegistry
                 挂载begin_workspace_command_system
@@ -247,12 +247,11 @@ WorkspaceAgentInitialization：Workspace成员创建监控，私有结构体--�
 PreparedWorkspaceAgent：单Agent实例材料，私有结构体--创建Agent Entity前收集完整依赖
     name: String--Agent逻辑名称
     agent_id: ResourceId--Workspace生成的稳定Agent ID，例如agent:<workspace>/<name>:latest
-    base_driver: MclDriverSource--从AgentImageBaseDriver取得的内禀base.lua源码
-    ordered_messages: Vec<Message>--MemoryPlugin按实际发生顺序恢复的完整消息
+    base_lua: LuaProgram--从Agent镜像取得的内禀base.lua程序
+    memory: AgentMemoryHandle--MemoryPlugin已经打开的存储句柄，由AgentCreateRequest在启动Base Lua前写入Agent
     token_usage: TokenUsage--MemoryPlugin从历史Assistant行恢复的累计Token
     inference_snapshot: AgentInferenceSnapshot--InferencePlugin构造的实例推理快照，包含标准化后的context_window_tokens
     tool_environment: AgentToolEnvironment--项目根与镜像版本根
-    memory: AgentMemory--已经打开但尚未绑定Entity的SQLite连接
 ```
 
 ## 函数
@@ -266,16 +265,16 @@ route_agent_message_system(world: &mut World)
         agent为空时使用WorkspaceDefinition.manager
         目标成员仍在Creating或已经Failed时路由失败
         只接受Message::User
-        直接保留Message::User中的content并发送AgentMessage { id, agent, message }
+        直接保留Message::User中的content并发送AgentMessage { id, agent, message, usage: None }
         路由失败时记录警告且不构造AgentMessage
 
 route_agent_turn_abort_system(world: &mut World)
     路由成员轮次中止：私有System，读取RouteAgentTurnAbort并把逻辑Workspace和Agent名称解析为Entity
-    行为：agent为空时使用WorkspaceDefinition.manager；成功时发送AbortAgentTurn { id, agent }
+    行为：agent为空时使用WorkspaceDefinition.manager；成功时创建一次性回执并发送AgentControl { id, agent, control=AbortTurn, reply }
 
 route_agent_visibility_system(world: &mut World)
     路由默认资源可见性命令：私有System，读取RouteAgentVisibility并解析Workspace和Agent Entity
-    行为：agent为空时使用manager；把Inject或Remove转换为SetAgentDefaultResourceVisibility { visible }
+    行为：agent为空时使用manager；创建一次性回执，把Inject或Remove转换为AgentControlKind::InjectVisibility或RemoveVisibility并发送AgentControl
     边界：WorkspacePlugin只解析逻辑身份，不读取或修改Agent可见性
 
 route_agent_workflow_system(world: &mut World)
@@ -284,7 +283,7 @@ route_agent_workflow_system(world: &mut World)
         复用WorkspaceReference和可选Agent资源ID解析Ready成员，agent为空时使用manager
         Attach从AgentToolEnvironment取得project_root与image_root并发送AttachWorkflowMcl
         Detach验证instance_id并发送DetachWorkflowMcl
-        WorkspacePlugin不读取MCL源码、不编译、不修改AgentMcl
+        WorkspacePlugin不读取MCL源码、不编译、不修改Agent.mcl
 
 begin_workspace_command_system(world: &mut World)
     开始命令：私有System，读取StartWorkspace、ReloadWorkspace、StopWorkspace和StopWorkspaceByReference
@@ -338,8 +337,8 @@ prepare_workspace_agent(world: &mut World, workspace: Entity, name: &str, image:
         根据agent_images_root和type=image的ResourceId构造镜像版本根
         使用definition.project_root和镜像版本根构造AgentToolEnvironment
         memory_path为空时生成<project>/.margatroid/workspaces/<workspace>/memory/<agent>/memory.sql
-        调用AgentMemory::open取得AgentMemory与恢复的RealtimeContext及累计Token
-        收集Base Driver、ordered_messages恢复上下文和累计Token
+        调用AgentMemory::open取得AgentMemoryHandle和RealtimeContext；RealtimeContext.ordered_messages不注入Agent或MCL
+        收集Base Driver、memory和RealtimeContext.token_usage；实时消息只允许Base Lua随后通过realtime_load读取
         构造并返回PreparedWorkspaceAgent
         任一步失败时释放该Agent已经打开的AgentMemory并返回错误，不影响其他成员
 
@@ -351,10 +350,10 @@ collect_agent_create_result_system(world: &mut World)
         Err时调用mark_agent_failed，不影响Workspace或其他成员
         Ok时从initializations.prepared取出对应PreparedWorkspaceAgent
         验证Agent Entity存活且AgentWorkspaceId指向当前Workspace
-        调用WorldMemoryExt::bind_agent_memory绑定AgentMemory；ordered_messages已经随AgentCreateRequest交给MCL恢复
+        验证Agent.memory等于AgentCreateRequest交付的PreparedWorkspaceAgent.memory；存储在Base Lua启动前已经可读
         插入PreparedWorkspaceAgent.inference_snapshot
         插入PreparedWorkspaceAgent.tool_environment
-        AgentResourceMap已经由AgentPlugin随Agent Entity创建；这里只验证它存在
+        AgentResourceMap已经在唯一Agent组件的resources字段中初始化；这里只验证它存在
         全部绑定成功后把WorkspaceAgents对应成员改为Ready并写入agents索引
         AgentPlugin已在Agent Entity创建成功时发送恢复默认可见性通知；WorkspacePlugin不介入资源注册或可见性修改
         绑定失败时despawn当前Agent并调用mark_agent_failed
@@ -363,9 +362,9 @@ collect_agent_create_result_system(world: &mut World)
 attach_prepared_agent(world: &mut World, workspace: Entity, name: &str, agent: Entity, prepared: PreparedWorkspaceAgent) -> Result<(), WorkspaceError>
     绑定实例材料：私有函数，验证Agent归属并绑定Memory、Inference和AgentToolEnvironment
     行为：
-        验证AgentResourceMap和AgentMcl已经由AgentPlugin挂载；缺失时返回ResourceSetupFailed
+        验证Entity同时挂载ResourceId和Agent，且Agent包含resources和mcl字段；缺失时返回ResourceSetupFailed
         绑定PreparedWorkspaceAgent中的Memory、InferenceSnapshot和AgentToolEnvironment
-        不修改AgentMcl Block，不发送资源注册请求
+        不修改Agent.mcl Block，不发送资源注册请求
 
 mark_agent_failed(world: &mut World, workspace: Entity, name: &str, error: WorkspaceError)
     标记成员失败：私有函数，不改变Workspace成功状态
@@ -458,18 +457,18 @@ cleanup_orphan_agent(world: &mut World, agent: Entity)
         -> Workspace项目级模型路由和AgentInferenceSnapshot
     ToolPlugin
         -> AgentToolEnvironment类型和AgentResourceMap行为
-        -> AgentResourceMap由AgentPlugin创建Agent时挂载
+        -> AgentResourceMap由AgentPlugin创建Agent时初始化在Agent.resources
     MemoryPlugin
         -> AgentMemory
         -> 打开数据库时恢复的RealtimeContext { ordered_messages, token_usage }
     WorkspacePlugin自身
         -> Workspace归属、逻辑名称和Agent Entity索引
-        -> 把Base Driver、AgentToolEnvironment和ordered_messages交给AgentCreateRequest
+        -> 把Base Driver、AgentToolEnvironment和AgentMemoryHandle交给AgentCreateRequest
         -> Workspace Entity成立后立即发布成功通知，并独立监控每个Agent的Creating、Ready或Failed
     Base Driver初始化时执行IMPORT并用tool_default覆盖tool_dynamic
-        -> AgentPlugin协调BuiltinToolPlugin选择具体执行器并验证资源、构造Agent专属ToolTemplate
+        -> MclPlugin发送AgentResourceRegisterRequest，由BuiltinToolPlugin选择具体Provider验证资源并构造候选ResourceMapEntry
         -> MclPlugin在IMPORT事务中调用ToolPlugin接口写入AgentResourceMap；resource_name使用MCL alias或完整ResourceId
-        -> AgentPlugin逐项发送注入成功或失败通知，不产生汇总结果
+        -> MclPlugin通过原MclCommandReply把IMPORT成功或失败返回Base Lua调用点
         -> 工具正文和运行时内容不缓存；每次调用时由对应Plugin重新读取
 
 workspace up：
@@ -538,7 +537,7 @@ workspace down：
     MemoryPlugin拥有SQLite格式与AgentMemory组件行为
     InferencePlugin拥有WorkspaceModelRoutes和AgentInferenceSnapshot
     ToolPlugin拥有AgentToolEnvironment类型，WorkspacePlugin只负责构造实例值
-    AgentPlugin拥有AgentWorkspaceId与AgentStatus；AgentMcl拥有上下文和工具可见性
+    AgentPlugin分别挂载ResourceId和唯一Agent组件；Agent组件统一包含MCL、资源、推理、工具、存储和Lua运行状态
     AgentPlugin拥有资源注册协调、飞行中注册关联和逐项可见性修改；WorkspacePlugin不保存或等待资源注册状态
     各业务Plugin拥有自己挂在Workspace或Agent上的typed Component语义
     WorkspacePlugin只拥有编排决策，不复制其他Plugin的运行时状态
@@ -559,13 +558,8 @@ App
     │   ├── WorkspaceAgents
     │   ├── WorkspaceModelRoutes--InferencePlugin拥有
     │   └── AgentInstance Entity * N
-    │       ├── AgentWorkspaceId--AgentPlugin拥有
-    │       ├── AgentStatus--AgentPlugin拥有
-    │       ├── AgentInferenceSnapshot--InferencePlugin拥有
-    │       ├── AgentToolEnvironment--ToolPlugin拥有类型
-    │       ├── AgentResourceMap--ToolPlugin拥有
-    │       ├── AgentMcl--MclPlugin拥有，包含默认与动态Capability
-    │       └── AgentMemory--MemoryPlugin拥有
+    │       ├── ResourceId--统一身份组件
+    │       └── Agent--共享数据组件，由AgentPlugin挂载；组件存在本身表示该Entity是Agent
     └── AgentImage Entity * N
         ├── AgentImageIdentity--AgentImageLoaderPlugin拥有
         ├── AgentImageSoul--AgentImageLoaderPlugin拥有

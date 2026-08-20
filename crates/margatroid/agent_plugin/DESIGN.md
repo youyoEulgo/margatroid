@@ -1,437 +1,401 @@
-# AgentPlugin
+# lib
 
 ## 类型
 
 公开：
 ```text
-AgentPlugin：Agent实例与消息循环插件，公开结构体--安装创建、消息处理和MCL领域事件适配System
+AgentPlugin：Agent数据与Lua消息入口插件，公开结构体--创建Agent Entity、路由AgentControl并把AgentMessage投递给长期Lua VM
     schedule: String--System所属Schedule，私有
     new() -> Self
+        构造插件：公开关联函数，使用RuntimePlugin::UPDATE
     with_schedule(mut self, schedule: impl Into<String>) -> Self
+        设置Schedule：公开构建方法
     impl Default for AgentPlugin
+        Default：公开trait实现，调用new
     impl Plugin for AgentPlugin
+        Plugin：公开trait实现
         build(self, app: &mut App)
-            构建插件：要求RuntimePlugin、ToolPlugin、MclPlugin和目标Schedule存在，插入PendingVisibilityCommands，挂载Agent创建、Driver状态、可见性命令回执和消息处理System
+            安装插件：要求RuntimePlugin、ResourceIdPlugin和LuaRuntimePlugin已安装
+            行为：
+                重复安装时panic
+                插入AgentPluginInstalled
+                注册AgentInitializationCompleted内部事件
+                在schedule依次挂载agent_create_system、agent_control_system、agent_message_system和agent_lua_vm_state_system；agent_lua_vm_state_system必须先于MclPlugin的Effect System运行
+                不挂载可见性、推理、工具、历史、压缩或MCL Effect专用System
 
-AgentCreateRequest：Agent创建请求，公开事件--WorkspacePlugin交付Agent自有字段
-    id: String--Workspace创建子请求ID
-    agent_id: ResourceId--稳定Agent资源ID，格式agent:<workspace>/<name>:latest
-    workspace_id: Entity--所属Workspace Entity
-    base_driver: MclDriverSource--AgentImage根目录base.lua验证后的内禀Base Driver，身份继承Agent资源ID
-    tool_environment: AgentToolEnvironment--项目根、镜像根和主目录解析环境，由ToolPlugin定义类型
-    ordered_messages: Vec<Message>--按实际发生顺序恢复的User、Assistant与Tool消息，作为MCL恢复输入
-    token_usage: TokenUsage--从历史Assistant行恢复的累计Token
-    last_input_tokens: u64--从历史最后一条Assistant恢复的输入Token
-    context_window_tokens: u64--InferencePlugin标准化后的模型总上下文窗口，交给Base Driver读取
-    impl Event for AgentCreateRequest
+Agent：Agent Entity的数据图书馆，公开Component--组件存在本身表明Entity是Agent；Agent运行所需的数据统一保存在此，不保存Lua VM本体
+    info: AgentInfo--静态Agent信息
+    creation: AgentCreationState--创建请求和创建回执
+    mcl: AgentMcl--MCL Block程序集、引用程序集和运行时数据
+    resources: AgentResourceMap--资源定义、别名和解析状态
+    memory: AgentMemoryHandle--历史和实时存储句柄
+    inference: AgentInferenceState--模型配置和当前推理关联数据
+    tools: AgentToolState--工具调用关联数据
+    lua: AgentLuaState--Base Lua注册请求和长期VM状态
+    lifecycle: AgentLifecycleState--生命周期状态
+    turn: AgentTurnState--当前轮次和工作状态
+    token_usage: TokenUsageState--累计Token用量
+    last_error: Option<AgentError>--最近一次稳定错误
+    info(&self) -> &AgentInfo
+        读取静态信息：公开方法
+    mcl(&self) -> &AgentMcl
+        读取MCL数据：公开方法
+    mcl_mut(&mut self) -> &mut AgentMcl
+        修改MCL数据：公开方法，只能通过AgentMcl公开的封装方法操作其私有存储
+    impl Component for Agent
 
-AgentCreateResult：Agent Entity创建结果，公开事件--无论成功失败都恰好发送一次
-    id: String--原创建子请求ID
-    agent_id: ResourceId--原请求中的稳定Agent资源ID
-    result: Result<Entity, AgentCreateError>--成功时为已经挂载Agent自有组件和空AgentResourceMap的Entity
-    impl Event for AgentCreateResult
-
-AgentCreated：Agent Entity创建成功通知，公开事件--Agent自有组件、AgentResourceMap与AgentMcl已经建立，Base Driver初始化完成并进入start等待
-    id: String--原创建子请求ID
-    agent_id: ResourceId--稳定Agent资源ID
-    agent: Entity--新建Agent Entity
-    impl Event for AgentCreated
-
-InjectAgentVisibleResource：注入单项动态可见资源，公开事件
-    id: String--操作通知ID
-    agent: Entity--目标Agent Entity
-    resource_id: ResourceId--待注入的完整资源ID
-    impl Event for InjectAgentVisibleResource
-
-RemoveAgentVisibleResource：删除单项动态可见资源，公开事件
-    id: String--操作通知ID
-    agent: Entity--目标Agent Entity
-    resource_id: ResourceId--待删除的完整资源ID
-    impl Event for RemoveAgentVisibleResource
-
-SetAgentDefaultResourceVisibility：设置单项默认资源可见性，公开事件--供外部用户操作，AgentPlugin校验资源必须属于默认可见性
-    id: String--操作通知ID
-    agent: Entity--目标Agent Entity
-    resource_id: ResourceId--待开关的完整资源ID
-    visible: bool--true注入，false删除
-    impl Event for SetAgentDefaultResourceVisibility
-
-RestoreAgentDefaultVisibility：显式恢复默认可见性，公开事件--清除manual修改后重新用Base Driver定义的tool_default覆盖tool_dynamic；Agent创建由base.lua初始INJECT完成
-    id: String--操作通知ID，也是各默认资源通知的父ID
-    agent: Entity--目标Agent Entity
-    impl Event for RestoreAgentDefaultVisibility
-
-RemoveAllAgentVisibleResources：删除全部动态可见资源，公开事件
-    id: String--操作通知ID，也是各删除通知的父ID
-    agent: Entity--目标Agent Entity
-    impl Event for RemoveAllAgentVisibleResources
-
-AgentVisibleResourceInjected：资源注入成功通知，公开事件--只表示该资源当前已经进入动态可见性
-    id: String--触发本次注入的操作通知ID
-    agent: Entity--目标Agent Entity
-    resource_id: ResourceId--已经可见的完整资源ID
-    impl Event for AgentVisibleResourceInjected
-
-AgentVisibleResourceRemoved：资源删除通知，公开事件--单项删除请求幂等成功时也发送；批量删除只为实际可见资源逐项发送
-    id: String--触发本次删除的操作通知ID
-    agent: Entity--目标Agent Entity
-    resource_id: ResourceId--已经不可见的完整资源ID
-    impl Event for AgentVisibleResourceRemoved
-
-AgentVisibleResourceInjectionFailed：资源注入失败通知，公开事件--不退出Agent或Workspace
-    id: String--触发本次注入的操作通知ID
-    agent: Entity--目标Agent Entity
-    resource_id: ResourceId--注入失败的完整资源ID
-    error: AgentVisibilityError--稳定错误
-    impl Event for AgentVisibleResourceInjectionFailed
-
-AgentCreateErrorKind：Agent创建错误分类，公开枚举
-    InvalidRequest
-    DuplicateAgent
-    WorkspaceMissing
-    ContextInvalid
-    ResourceMapSetupFailed
-    MclSetupFailed
-
-AgentCreateError：Agent创建错误，公开结构体--不包含上下文正文
-    kind: AgentCreateErrorKind
-    message: String
-    kind(&self) -> AgentCreateErrorKind
-    message(&self) -> &str
-
-AgentVisibilityErrorKind：可见性错误分类，公开枚举
-    AgentMissing
-    VisibilityMissing
-    ResourceMapMissing
-    RegistrationFailed
-    RegistrationResponseMismatch
-
-AgentVisibilityError：可见性错误，公开结构体--稳定描述Agent、注册和回执错误，不包含资源正文
-    kind: AgentVisibilityErrorKind
-    message: String
-    kind(&self) -> AgentVisibilityErrorKind
-    message(&self) -> &str
-
-AgentIdentity：Agent稳定身份，公开Component
-    id: ResourceId--type=agent的唯一资源ID，私有
-    id(&self) -> &ResourceId
-    impl Component for AgentIdentity
-
-AgentWorkspaceId：Agent所属Workspace，公开Component
-    workspace_id: Entity--Workspace Entity，私有
-    workspace_id(&self) -> Entity
-    impl Component for AgentWorkspaceId
-
-Agent上下文不再由AgentPlugin维护第二份AgentContext组件。消息数组、pending_tool和工具可见性
-统一存放在AgentMcl；MemoryPlugin的实时上下文更新由MCL事务提交后的上下文变更事件驱动。
-
-AgentTokenUsage：Agent累计Token状态，公开只读Component
-    total_input_tokens: u64--历史Assistant响应累计输入Token
-    total_output_tokens: u64--历史Assistant响应累计输出Token
-    total_cache_hit_tokens: u64--历史Assistant响应累计缓存命中Token
-    cache_hit_rate: f64--total_cache_hit_tokens / total_input_tokens；总输入为0时为0
-    last_input_tokens: u64--最近一条普通Assistant响应的输入Token；启动时从历史最后一条Assistant恢复
-    context_window_tokens: u64--当前Agent模型配置的最大上下文窗口
-    total_input_tokens(&self) -> u64
-    total_output_tokens(&self) -> u64
-    total_cache_hit_tokens(&self) -> u64
-    cache_hit_rate(&self) -> f64
-    last_input_tokens(&self) -> u64
-    context_window_tokens(&self) -> u64
-    add(&mut self, usage: &TokenUsage)
-        累加用量：crate公开方法，三项使用饱和加法，覆盖last_input_tokens，并重新计算cache_hit_rate
-    impl Component for AgentTokenUsage
-
-AgentPluginInstalled：安装标记，公开Resource
-
-AbortAgentTurn：中止Agent当前轮次，公开事件
-    id: String--API请求ID
-    agent: Entity--目标Agent
-    impl Event for AbortAgentTurn
-
-AgentContextCompactRequest：Agent实时上下文压缩请求，公开事件--只定义压缩机制，不拥有触发策略
-    id: String--压缩请求ID
-    agent: Entity--目标Agent Entity
-    retain_messages: usize--原样保留的末尾长期消息数量；其余头部消息进入摘要
-    impl Event for AgentContextCompactRequest
-
-WorldAgentExt：World Agent扩展，公开trait
-    agent(&self, id: &ResourceId) -> Option<Entity>
-        按身份查询：公开方法，返回稳定资源ID匹配且仍存活的Agent Entity
-    agent_is_working(&self, agent: Entity) -> Option<bool>
-        查询工作状态：公开只读方法，AgentStatus存在时返回当前是否有未结束普通交互或上下文压缩
-    inject_agent_visible_resource(&self, id: impl Into<String>, agent: Entity, resource_id: ResourceId)
-        注入可见资源：公开方法，发送InjectAgentVisibleResource并唤醒Runtime
-    remove_agent_visible_resource(&self, id: impl Into<String>, agent: Entity, resource_id: ResourceId)
-        删除可见资源：公开方法，发送RemoveAgentVisibleResource并唤醒Runtime
-    restore_agent_default_visibility(&self, id: impl Into<String>, agent: Entity)
-        恢复默认可见性：公开方法，发送RestoreAgentDefaultVisibility并唤醒Runtime
-    remove_all_agent_visible_resources(&self, id: impl Into<String>, agent: Entity)
-        删除全部可见资源：公开方法，发送RemoveAllAgentVisibleResources并唤醒Runtime
-    impl WorldAgentExt for World
-```
-
-crate公开：
-```text
-AgentStatus：Agent工作占用状态，crate公开Component--不保存pending tool或压缩快照
-    turn_id: Option<String>--当前普通交互轮次ID或上下文压缩请求ID；空表示Agent空闲
-    begin_turn(&mut self, turn_id: String) -> Result<(), AgentStepError>
-        开始工作：拒绝普通轮次与上下文压缩相互重叠
-    finish_turn(&mut self, turn_id: &str) -> Result<(), AgentStepError>
-        完成轮次：只允许完成当前turn
-    abort_turn(&mut self) -> Option<String>
-        中止轮次：清空并返回当前turn_id；空闲时返回None
-    is_working(&self) -> bool
-        查询工作状态：当前turn_id非空时返回true
-    impl Component for AgentStatus
-```
-
-私有：
-```text
-AvailableTools：一次推理的临时工具规格集合，私有结构体
-    definitions: Vec<ToolDefinition>--从当前AgentResourceMap取得的内部ToolSpec
-
-PendingInferenceToolSchemas：飞行中推理的ToolSpec快照，私有Resource
-    schemas: HashMap<(Entity, String), Vec<ToolDefinition>>--按Agent与turn_id关联下一条Assistant
-
-PendingContextCompactions：飞行中的上下文压缩，私有Resource
-    requests: HashMap<(Entity, String), PendingContextCompaction>--按Agent和压缩请求ID关联原始上下文快照
-
-PendingContextCompaction：单次压缩快照，私有结构体
-    original_messages: Vec<Message>--开始摘要前的完整长期消息，用于完成时校验
-    retained_messages: Vec<Message>--不进入摘要、完成后仍原样位于摘要检查点之后的近期消息
-
-ConversationTurnResult：单条消息处理结果，私有枚举
-    WaitForTools--已发送ToolCallEvent，等待ToolPlugin完成批次
-    FinishTurn--Assistant无工具调用，本轮结束
-    RequestInference--上下文完整，可发送InferenceRequestEvent
-
-AgentStepError：Agent处理错误，私有枚举
-    AgentMissing
-    IdentityMissing
-    MclContextMissing
-    StatusMissing
-    TokenUsageMissing
-    ResourceMapMissing
-    InvalidMessage
-    InvalidToolBatch
-    ContextNotCompactable
-    ContextChanged
-    InvalidCompactionResponse
-    Inference(InferenceError)
-    Tool(ToolError)
-    failure_message(&self) -> String
-        构造稳定有界错误描述，不包含消息正文、工具参数或资源正文
-
-PendingVisibilityCommands：等待MCL命令回执的外部可见性操作，私有Resource
-    commands: HashMap<String, PendingVisibilityCommand>--MCL命令ID到原API操作、当前阶段和通知信息
-
-PendingVisibilityCommand：单次外部可见性操作，私有结构体
-    request_id: String
-    agent: Entity
-    resource_id: Option<ResourceId>
-    action: Inject | Remove | SetDefault | Restore | RemoveAll
-    phase: Import | Mutate
-```
-
-## 函数
-
-```text
-agent_create_system(world: &mut World)
-    创建Agent：私有System，读取AgentCreateRequest
-    行为：
-        验证请求ID、agent_id、Workspace Entity及恢复消息结构；失败时发送AgentCreateResult::Err
-        创建Entity并挂载AgentIdentity、AgentWorkspaceId、AgentToolEnvironment、由请求累计值构造的AgentTokenUsage和空AgentStatus
-        调用ToolPlugin公开函数挂载空AgentResourceMap；失败时despawn已创建Entity并发送AgentCreateResult::Err
-        调用MclPlugin为Entity挂载AgentMcl并异步启动base.lua；保存创建请求与临时Entity，暂不发送成功结果
-        Base Driver的IMPORT通过MCL事件异步解析资源；此时不直接注册资源
-
-agent_mcl_driver_state_system(world: &mut World)
-    收集Base Driver初始化结果：私有System，读取MclDriverReady与MclDriverFailed
-    行为：
-        Ready必须匹配等待中的Agent创建；随后发送AgentCreated和AgentCreateResult::Ok(agent)
-        Failed必须匹配等待中的Agent创建；despawn临时Entity并发送AgentCreateResult::Err(MclSetupFailed)
-        每个AgentCreateRequest恰好产生一次最终结果，迟到或重复Driver通知记录稳定错误并忽略
-
-agent_visibility_change_system(world: &mut World)
-    把外部可见性操作转换为MCL命令：私有System
-    行为：
-        Inject先查AgentResourceMap；已存在时发送MCL事务追加到tool.tool_dynamic，不存在时先发送IMPORT命令，成功后再追加
-        Remove发送MCL事务按resource_id从tool.tool_dynamic删除；不存在按幂等成功处理
-        SetDefault先查询tool.tool_default，成员不存在则失败；随后按visible追加或删除tool.tool_dynamic
-        Restore发送MCL命令用tool.tool_default COVER tool.tool_dynamic
-        RemoveAll发送MCL命令清空tool.tool_dynamic
-        每个操作生成内部MCL命令ID并写入PendingVisibilityCommands；不直接修改AgentMcl字段
-
-collect_visibility_command_response_system(world: &mut World)
-    收集MCL命令回执：私有System，读取MclCommandResponse并匹配PendingVisibilityCommands
-    行为：成功后发送AgentVisibleResourceInjected或AgentVisibleResourceRemoved；失败发送AgentVisibleResourceInjectionFailed
-        任一失败不结束Agent或Workspace；迟到回执只记录稳定错误
-
-cleanup_dead_agent_state_system(world: &mut World)
-    清理死亡Agent临时状态：删除PendingVisibilityCommands、PendingInferenceToolSchemas与PendingContextCompactions中对应项
-
-agent_message_system(world: &mut World)
-    处理Agent消息：私有System，读取AgentMessage并逐条调用handle_agent_message
-    行为：失败时发送AgentFailure { kind: Agent }，不伪造Assistant或Tool消息
-
-abort_agent_turn_system(world: &mut World)
-    中止当前轮次：私有System，读取AbortAgentTurn
-    行为：取得并清空AgentStatus当前turn；取消对应PendingInferenceToolSchemas与PendingContextCompactions；发送CancelInferenceRequest与CancelToolTurn；MCL中断消息序列的修复策略另行设计，当前不自动清空conversation或pending_tool；空闲Agent只记录警告
-
-context_compaction_system(world: &mut World)
-    处理上下文压缩：私有System，同时读取AgentContextCompactRequest与ContextCompactionInferenceResponse
-    行为：请求逐条调用begin_context_compaction；响应逐条调用complete_context_compaction；失败时发送AgentFailure，不生成AgentMessage
-
-begin_context_compaction(world: &mut World, request: &AgentContextCompactRequest, events: &RuntimeEventSender) -> Result<(), AgentStepError>
-    开始上下文压缩：私有函数
-    行为：
-        要求Agent存活、AgentStatus空闲、msg.pending_tool为空且msg.conversation数量大于retain_messages
-        调用AgentStatus.begin_turn占用工作状态，阻止压缩期间开始普通对话轮次
-        按conversation.len() - retain_messages切分待压缩头部和原样保留尾部
-        保存完整original_messages和retained_messages到PendingContextCompactions
-        构造System、待压缩头部消息和末尾压缩提示词，不携带工具规格
-        发送ContextCompactionInferenceRequest；不修改AgentMcl，不写历史
-
-complete_context_compaction(world: &mut World, response: &ContextCompactionInferenceResponse, events: &RuntimeEventSender) -> Result<(), AgentStepError>
-    完成上下文压缩：私有函数
-    行为：
-        取得并删除同Agent同请求ID的PendingContextCompaction，要求AgentStatus当前turn等于请求ID
-        推理失败时结束占用并返回Inference错误；成功摘要必须非空
-        要求当前msg.conversation仍等于original_messages且msg.pending_tool仍为空；不一致时结束占用并返回ContextChanged
-        把摘要包装成带compacted-summary标记的User消息，后接retained_messages
-        通过MCL原子事务用摘要消息和retained_messages覆盖msg.conversation，并发送上下文更新事件
-        调用AgentStatus.finish_turn释放工作状态；不写历史，不生成普通AgentMessage
-
-handle_agent_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender) -> Result<ConversationTurnResult, AgentStepError>
-    处理消息：私有函数
-    行为：
-        System返回InvalidMessage
-        User开始或确认当前turn并送入Base Driver邮箱；不隐式写历史
-        User只追加正文并发送InferenceRequestEvent；工具调用只接受Assistant.tool_calls
-        Assistant先取得该turn对应的PendingInferenceToolSchemas；event.usage存在时先累加AgentTokenUsage；送入Base Driver邮箱但不隐式写历史
-        Assistant.tool_calls为空时结束当前turn
-        Assistant.tool_calls非空时逐项检查tool_name存在于本次ToolSpec且对应ResourceMapEntry仍在tool.tool_dynamic；不满足时直接发送Message::Tool拒绝响应，提示模型检查当前ToolSpec，不发送ToolCallEvent
-        Assistant所有调用均被拒绝时仍将拒绝响应作为Message::Tool交给MCL；MCL按tool_call_id清理pending_tool
-        Assistant鉴权通过的tool_calls统一派发
-        Tool送入Base Driver邮箱；Driver显式追加历史与实时上下文、删除对应pending_tool，并在数组为空时请求下一次推理
-
-mcl_history_append_system(world: &mut World)
-    处理显式历史Effect：私有System，消费MclHistoryAppendRequested
-    行为：根据turn保留的ToolSpec补齐Assistant tool_schema，调用record_history_message发送唯一数据库历史写入事件
-
-take_pending_tool_schema(world: &mut World, agent: Entity, turn_id: &str) -> Vec<ToolDefinition>
-    取得推理工具规格：私有函数，从PendingInferenceToolSchemas移除并返回当前Agent与turn对应的ToolSpec；不存在时返回空数组
-
-record_history_message(world: &mut World, event: &AgentMessage, events: &RuntimeEventSender, tool_schema: Vec<ToolDefinition>)
-    请求历史写入：私有函数
-    行为：User原样发送且tool_schema和usage为空；Assistant原样发送并携带传入的ToolSpec与event.usage；Skill类型Tool保留resource_id和tool_call_id并把content替换为resource_id.to_string()；非Skill类型Tool原样发送；Tool的tool_schema和usage为空
-    限制：只由mcl_history_append_system调用；Skill正文进入MCL request上下文但不进入历史事件；非Skill工具响应正文完整写入历史事件
-
-append_conversation_message(world: &mut World, agent: Entity, message: Message, events: &RuntimeEventSender) -> Result<(), AgentStepError>
-build_available_tools(world: &World, agent: Entity) -> Result<AvailableTools, AgentStepError>
-    构造工具规格：私有函数
-    行为：
-        按tool.tool_dynamic数组顺序读取ResourceMapEntry
-        每个元素的tool_id和template必须同时为Some，否则失败
-        克隆template并令name等于resource_name形成内部ToolSpec；Provider格式转换由InferencePlugin负责
-
-dispatch_tool_calls(world: &World, turn_id: &str, agent: Entity, explicit: &[ToolCall], events: &RuntimeEventSender) -> Result<ConversationTurnResult, AgentStepError>
-    派发工具：私有函数
-    行为：
-        验证显式调用ID和tool_name非空，且tool_name存在于当前AgentResourceMap
-        验证同批ToolCall.id唯一
-        为每个调用发送ToolCallEvent { turn_id, agent, call }
-        没有调用时返回RequestInference，否则返回WaitForTools
-
-dispatch_assistant_tool_calls(world: &mut World, turn_id: &str, agent: Entity, explicit: &[ToolCall], tool_schema: &[ToolDefinition], events: &RuntimeEventSender) -> Result<ConversationTurnResult, AgentStepError>
-    校验并派发模型调用：私有函数
-    行为：ResourceMapEntry无法解析或调用ID重复时返回InvalidToolBatch；ToolSpec中没有tool_name或映射资源不在动态可见性时发送Message::Tool { content: TOOL_PERMISSION_DENIED }；通过校验的调用交给dispatch_tool_calls
-
-build_inference_context(world: &World, agent: Entity) -> Result<Vec<Message>, AgentStepError>
-    组装上下文：交给AgentMcl按Block中的类型化有序数组生成；只展开请求定义选择的
-    Message数组，pending_tool等执行状态数组不得进入模型请求
-
-send_inference_request(world: &mut World, turn_id: &str, agent: Entity, events: &RuntimeEventSender) -> Result<(), AgentStepError>
-    发起推理：构造当前内部ToolSpec与完整上下文；把ToolSpec按(agent, turn_id)写入PendingInferenceToolSchemas后发送InferenceRequestEvent
-    限制：只读取调用时刻的tool.tool_dynamic；正在IMPORT或解析失败的资源不进入本次请求
+AgentPluginInstalled：AgentPlugin安装标记，公开Resource
+    impl Resource for AgentPluginInstalled
 ```
 
 ## 逻辑
 
 ```text
-创建与可见性：
-    AgentCreateRequest
-        -> 创建Agent自有组件和空AgentResourceMap
-        -> 挂载AgentMcl并启动base.lua
-        -> IMPORT逐项解析AgentResourceMap；单项失败记录Unavailable但不终止Driver
-        -> CREATE建立标准Block和Request
-        -> 初始INJECT建立tool_default与tool_dynamic
-        -> MclDriverReady（允许AgentResourceMap为空或部分可用）
-        -> AgentCreated + AgentCreateResult
+Entity识别：
+    同时挂载Agent和ResourceId的Entity是可寻址Agent
+    Agent组件存在本身表示Entity具有Agent语义
+    ResourceId是独立统一身份组件，不在Agent.info中复制身份
 
-User：
-    AgentMessage::User
-        -> begin_turn
-        -> 记录历史
-        -> 作为MclRuntimeMessage进入Base Driver邮箱
-        -> base.lua的start返回User消息
-        -> Driver将完整User消息追加到conversation并提交InferenceRequestEvent
+数据所有权：
+    Agent是Agent运行数据的唯一存储
+    其他领域Plugin读取或修改Agent中自己负责的字段，不挂载第二份Agent状态组件
+    Agent.mcl中的Block和RefBlock名称、顺序与内容全部由Base Lua通过MCL命令声明和修改
 
-Assistant：
-    AgentMessage::Assistant
-        -> 记录历史
-        -> 作为MclRuntimeMessage进入Base Driver邮箱
-        -> base.lua的start返回Assistant消息
-        -> Driver将完整Assistant消息追加到conversation数组
-        -> 无tool_calls：提交finish
-        -> 有tool_calls：逐个追加到pending_tool并提交tool_call Effect
-
-Tool：
-    AgentMessage::Tool { resource_id, tool_call_id, content }
-        -> 记录历史
-        -> Base Driver将完整Tool消息追加到conversation数组
-        -> 按tool_call_id删除pending_tool数组中的对应ToolCall
-        -> pending_tool非空：继续等待其余Tool响应
-        -> pending_tool为空：MCL产生InferenceRequestEvent
+插件边界：
+    除AgentCreateRequest外，AgentPlugin只消费AgentControl和AgentMessage两种Agent领域事件
+    创建和控制使用事件内的一次性回执；AgentMessage是内部成功消息流，投递失败转为Agent终态错误
+    AgentPlugin不发布AgentCreated或AgentFailure事件
+    AgentPlugin不解析MCL命令、不执行工具、不构造ToolSpec、不写历史或实时数据库
+    AgentPlugin不创建、执行或销毁Lua VM，只通过LuaRuntimeHandle注册、投递消息和停止VM
 ```
 
-## 边界
+# events
 
+## 类型
+
+公开：
 ```text
-AgentPlugin负责Agent创建、当前turn、MCL领域事件适配、内部ToolSpec构造和推理调度。
-手动Assistant调用由SubmitAgentAssistant进入AgentPlugin；只接受动态可见的Skill资源，AgentPlugin按AgentToolMap将resource_id转换为内部tool_name，建立turn并作为标准AgentMessage交给Base Driver。
-AgentPlugin消费MclBlockingInferenceRequest，将指定MCL Request Block脱壳为领域消息后发起
-ContextCompactionInferenceRequest；响应摘要通过原MCL命令回执返回，不产生AgentMessage。
-AgentPlugin负责维护AgentTokenUsage；只有进入普通Assistant消息链路的Provider usage会累加，压缩推理不计入。
-AgentPlugin把外部可见性操作转换为MCL命令，不直接修改AgentMcl，不维护第二套可见性Component。
-WorkspacePlugin只在收到AgentCreateResult后挂载其余外部运行组件，不介入资源注册或可见性修改。
-AgentPlugin不额外保存pending tool；pending_tool是AgentMcl中的类型化数组。AgentPlugin不解析Skill正文，不执行工具，只在Assistant消息分支按本次ToolSpec和tool_dynamic授权模型工具调用。
-ToolPlugin的PendingToolCalls只负责异步请求与响应关联，不是MCL工具批次完成的事实来源；完成状态由MCL pending_tool数组决定。
-InferencePlugin执行InferenceRequestEvent，Provider Adapter保留tool_name并发布AgentMessage::Assistant。
-MemoryPlugin只消费历史和实时上下文事件，不读取AgentStatus或ToolPlugin的Pending状态。
+AgentCreateRequest：Agent创建请求，公开事件--Workspace交付创建Agent所需的静态信息和Base Lua程序
+    id: String--创建请求ID
+    agent_id: ResourceId--稳定Agent资源ID，创建时作为独立Component挂载
+    workspace_id: Entity--所属Workspace Entity
+    base_lua: LuaProgram--Agent镜像提供的Base Lua程序
+    project_root: PathBuf--项目根目录
+    image_root: PathBuf--Agent镜像根目录
+    home_root: PathBuf--主目录根目录
+    model: AgentModelInfo--静态模型信息
+    memory: AgentMemoryHandle--MemoryPlugin在创建前打开的存储句柄，必须在Base Lua启动前写入Agent.memory
+    token_usage: TokenUsage--从历史恢复的累计用量
+    reply: AgentCreateReply--创建完成的一次性回执
+    impl Event for AgentCreateRequest
+
+AgentControl：Agent控制事件，公开事件--唯一的非消息控制入口
+    id: String--控制请求ID
+    agent: Entity--目标Agent Entity
+    control: AgentControlKind--控制类型和参数
+    reply: AgentControlReply--一次性控制回执
+    impl Event for AgentControl
+
+AgentInitializationCompleted：Base Lua初始化完成事件，crate公开事件--MclPlugin第一次成功登记start等待后发布
+    agent: Entity--已经进入消息循环的Agent
+    vm_id: LuaVmId--发起start的长期VM，防止旧VM完成新实例初始化
+    impl Event + Clone for AgentInitializationCompleted
+
+AgentMessage：Agent消息事件，公开事件--共享types定义并交给目标Agent长期Lua VM的输入消息
+    id: String--完整交互轮次ID
+    agent: Entity--目标Agent Entity
+    message: Message--User、Assistant或Tool消息；User不允许携带tool_calls
+    usage: Option<TokenUsage>--只有InferencePlugin产生的Assistant响应可携带本轮用量
+    impl Event for AgentMessage
 ```
 
-## 持有关系
+# types
 
+## 类型
+
+公开：
 ```text
-World
-├── AgentCreateRequest -> AgentCreated + AgentCreateResult
-├── InjectAgentVisibleResource -> AgentVisibleResourceInjected | AgentVisibleResourceInjectionFailed
-├── RemoveAgentVisibleResource -> AgentVisibleResourceRemoved
-├── RestoreAgentDefaultVisibility -> AgentVisibleResourceInjected * N | AgentVisibleResourceInjectionFailed * N
-├── RemoveAllAgentVisibleResources -> AgentVisibleResourceRemoved * N
-├── PendingVisibilityCommands Resource
-├── PendingInferenceToolSchemas Resource
-├── PendingContextCompactions Resource
-├── AgentContextCompactRequest -> context_compaction_system
-├── ContextCompactionInferenceResponse -> context_compaction_system
-├── AgentMessage -> agent_message_system -> MclRuntimeMessage -> Base Driver mailbox
-└── Agent Entity
-    ├── AgentIdentity
-    ├── AgentWorkspaceId
-    ├── AgentMcl--MclPlugin所有
-    ├── AgentStatus
-    │   ├── turn_id
-    └── AgentResourceMap--ToolPlugin所有
+AgentCreateReply：Agent创建回执，公开结构体
+    sender: Arc<Mutex<Option<oneshot::Sender<Result<Entity, AgentError>>>>>--私有一次性发送器槽位
+    new(sender: oneshot::Sender<Result<Entity, AgentError>>) -> Self
+        构造回执：公开关联函数
+    send(&self, result: Result<Entity, AgentError>)
+        发送结果：crate公开方法，最多发送一次
+
+AgentControlKind：Agent生命周期控制类型，公开枚举--由agent_control_system路由到对应Handler，不承载MCL Block操作
+    Stop
+
+AgentControlReply：Agent控制回执，公开结构体
+    sender: Arc<Mutex<Option<oneshot::Sender<Result<(), AgentError>>>>>--私有一次性发送器槽位
+    new(sender: oneshot::Sender<Result<(), AgentError>>) -> Self
+        构造回执：公开关联函数
+    send(&self, result: Result<(), AgentError>)
+        发送结果：crate公开方法，最多发送一次
+
+AgentInfo：Agent静态信息，公开结构体--Base Lua通过agent_info读取的只读数据，不复制Entity的ResourceId组件
+    image_entity: Entity--创建该Agent时使用的AgentImage Entity；用于读取镜像依赖清单
+    workspace_id: Entity--所属Workspace
+    model: AgentModelInfo--模型及上下文窗口信息
+    project_root: PathBuf--项目根目录
+    image_root: PathBuf--镜像根目录
+    home_root: PathBuf--主目录根目录
+
+AgentModelInfo：Agent模型信息，公开结构体
+    provider: String--Provider名称
+    model: String--模型名称
+    context_window_tokens: u64--最大上下文窗口
+
+AgentLifecycleState：Agent生命周期，公开枚举
+    Creating
+    Running
+    Stopping
+    Stopped
+    Failed
+
+AgentLuaState：Agent长期Lua状态，公开结构体
+    request_id: Option<String>--等待LuaVmStarted时的运行时请求ID
+    vm_id: Option<LuaVmId>--已经启动的长期VM标识
+
+AgentCreationState：Agent创建状态，公开结构体
+    request_id: String--AgentCreateRequest.id
+    reply: AgentCreateReply--等待VM启动后的创建回执
+    initialization: AgentInitializationState--Base Lua初始化及IMPORT验证状态
+
+AgentInitializationState：Agent初始化状态，公开结构体
+    failed: Option<AgentError>--首个初始化失败
+    complete: bool--MclPlugin确认Base Lua第一次成功登记start后为true
+
+AgentTurnState：Agent轮次状态，公开结构体--仅记录轮次占用，不保存上下文副本
+    turn_id: Option<String>--当前轮次或压缩请求ID
+    begin(&mut self, id: String) -> Result<(), AgentError>
+        开始轮次：已有轮次时失败
+    finish(&mut self, id: &str) -> Result<(), AgentError>
+        完成轮次：只允许完成当前轮次
+    abort(&mut self) -> Option<String>
+        中止轮次：清空并返回当前轮次
+
+TokenUsageState：Token用量状态，公开结构体
+    total_input_tokens: u64
+    total_output_tokens: u64
+    total_cache_hit_tokens: u64
+    cache_hit_rate: f64
+    last_input_tokens: u64
+    add(&mut self, usage: &TokenUsage)
+        累加用量：饱和累加并重新计算命中率
+
+```
+
+crate公开：
+```text
+AgentMcl：MCL数据，公开结构体--Agent持有的MCL运行时存储，由自身封装Block和RefBlock的机械存取
+    blocks: BlockAssembly--真实Block程序集，私有
+    ref_blocks: RefBlockAssembly--引用Block程序集，私有
+    values: HashMap<String, MclValue>--MCL运行时辅助数据，私有
+    realtime_source: Option<MclRealtimeSource>--MclPlugin声明的实时上下文Message RefMerge来源；未声明时为空
+    blocks(&self) -> &BlockAssembly
+        读取真实Block程序集：公开方法
+    ref_blocks(&self) -> &RefBlockAssembly
+        读取引用Block程序集：公开方法
+    select(&self, target: &BlockPath) -> Result<BlockInner, AgentError>
+        查询路径：公开方法
+        行为：
+            target.block_id命中真实Block时，按target.inner_id读取并克隆BlockInner
+            target.block_id命中RefBlock时，把target.inner_id作为merge_id并调用RefMerge迭代器返回合并后的BlockInner
+            两套程序集都未命中时返回BlockMissing
+            不暴露内部引用，不修改MCL数据
+    merge(&self, sources: &[BlockPath]) -> Result<BlockInner, AgentError>
+        真实数组合并：公开方法；逐个调用select读取源字段，允许源字段来自真实Block或RefBlock，验证类型后按声明顺序克隆拼接元素
+    ref_merge(&self, sources: &[BlockPath]) -> Result<RefMerge, AgentError>
+        引用路径合并：公开方法；所有路径必须命中真实Block字段且类型一致，按字段类型构造RefMerge，不读取元素；不得引用RefBlock字段
+    create_block(&mut self, block_id: String, block: Block) -> Result<(), AgentError>
+        创建真实Block：公开方法，block_id已存在于真实Block或RefBlock程序集时失败
+    create_ref_block(&mut self, block_id: String, block: RefBlock) -> Result<(), AgentError>
+        创建引用Block：公开方法，block_id已存在于真实Block或RefBlock程序集时失败
+    insert(&mut self, target: &BlockPath, values: BlockInner) -> Result<(), AgentError>
+        插入字段值：公开方法，找到目标Block字段，验证BlockInner类型一致后按顺序追加；整个方法原子完成
+    delete(&mut self, target: &BlockPath, selection: MclDeleteSelection) -> Result<(), AgentError>
+        删除字段值：公开方法，找到目标Block字段并按已经解析的删除范围移除元素；保持剩余元素顺序，整个方法原子完成
+    cover(&mut self, target: &BlockPath, values: BlockInner) -> Result<(), AgentError>
+        覆盖字段值：公开方法，找到目标Block字段，验证BlockInner类型一致后整体替换数组；整个方法原子完成
+    realtime_source(&self) -> Option<&MclRealtimeSource>
+        读取实时来源：crate公开方法，只返回当前来源描述
+    set_realtime_source(&mut self, source: MclRealtimeSource)
+        设置实时来源：crate公开方法，用新声明整体替换旧来源；MclPlugin必须在调用前完成RefMerge验证和当前快照展开
+
+AgentResourceMap：Agent资源数据，crate公开结构体--实际字段与行为由ToolPlugin定义，Agent只持有唯一实例
+
+AgentMemoryHandle：Agent存储数据，crate公开结构体--MemoryPlugin创建的可克隆存储句柄
+    inner: Arc<dyn AgentMemoryStore>--历史与实时存储接口
+    append_history(&self, turn_id: &str, message: &Message, tool_schema: &[ToolDefinition], usage: Option<&TokenUsage>) -> Result<(), AgentMemoryStoreError>
+        追加历史：crate公开方法，转发给inner
+    rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError>
+        覆盖实时上下文：crate公开方法，转发完整快照给inner
+    read_realtime(&self) -> Result<Vec<MclMessage>, AgentMemoryStoreError>
+        读取实时上下文：crate公开方法，返回完整有序快照
+    impl Clone for AgentMemoryHandle
+
+AgentMemoryStore：Agent存储接口，crate公开trait--由MemoryPlugin实现，types crate只定义协议
+    继承：Send + Sync + 'static
+    append_history(&self, turn_id: &str, message: &Message, tool_schema: &[ToolDefinition], usage: Option<&TokenUsage>) -> Result<(), AgentMemoryStoreError>
+    rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError>
+    read_realtime(&self) -> Result<Vec<MclMessage>, AgentMemoryStoreError>
+
+AgentMemoryStoreError：Agent存储接口错误，crate公开结构体--不包含数据库内容、SQL或消息正文
+    kind: String--稳定有限分类，由MemoryPlugin转换为MemoryErrorKind
+    message: String--稳定有界描述
+    impl Clone + fmt::Display + std::error::Error for AgentMemoryStoreError
+
+AgentInferenceState：Agent推理数据，crate公开结构体--InferencePlugin读写的模型配置和飞行中请求
+    model: AgentModelInfo--当前模型静态信息
+    pending: HashMap<String, AgentInferencePending>--请求ID到ToolSpec快照和取消信息
+
+AgentToolState：Agent工具数据，crate公开结构体--ToolPlugin读写的飞行中工具调用关联
+    pending: HashMap<String, AgentToolPending>--tool_call_id到执行定位和取消信息
+
+AgentRuntimeContext：Agent运行时环境，crate公开结构体--创建时注入LuaRuntimePlugin的显式环境数据
+    resource_id: ResourceId--Entity独立身份组件的副本
+    agent_info: AgentInfo--Agent中的只读静态信息；环境提供器将resource_id作为id字段与其组合后注入Lua
+    mcl_provider: AgentMclEnvironmentProvider--mcl阻塞调用提供器
+
+AgentMclEnvironmentProvider：Agent MCL环境提供器，crate公开结构体--为Base Lua注入显式指定目标Agent且始终返回结果的阻塞mcl函数
+    events: RuntimeEventSender--向MclPlugin发送MclCommandRequest
+    name(&self) -> &str
+        获取名称：返回mcl
+    provide(&self, context: &LuaEnvironmentContext) -> Result<LuaEnvironment, LuaRuntimeError>
+        提供MCL函数：注入mcl(target_agent_id, command, binding?)；每次调用都显式指定目标Agent，不使用context.owner作为默认目标；函数创建一次性回执并发送MclCommandRequest，随后暂停当前Lua VM并把控制权交还LuaRuntimePlugin，直到回执到达后恢复VM，将Result转换为Lua值或Lua错误并返回
+        MclCommandValue::Message以及Inner(Message[])转换Lua时把MclMessage.message的type、content、reasoning、tool_calls等字段与可选usage放在同一层；Lua直接读取message.type和message.usage，不暴露Rust内部的message嵌套字段
+
+AgentLuaMessageEnvelope：AgentPlugin写入长期VM邮箱的内部信封，crate公开结构体--start Effect消费后只把message返回Lua
+    turn_id: String--原AgentMessage.id，供MclPlugin建立或校验Agent.turn
+    message: MclMessage--由AgentMessage.message和usage无损组合
+    impl Serialize + Deserialize for AgentLuaMessageEnvelope
+```
+
+Lua侧 `mcl` 调用约定：
+```text
+mcl(target_agent_id, command, binding?) -> value | error
+    进入函数：创建oneshot回执，生成完整MclCommandRequest并提交事件
+    等待阶段：暂停当前Lua调用栈；LuaRuntimePlugin继续驱动其他任务，不执行本调用点之后的语句
+    收到回执：恢复同一Lua调用栈；成功时返回MclCommandValue转换出的Lua值，失败时抛出Lua错误
+    返回值处理：Lua可以使用local value = mcl(...)接收，也可以直接调用mcl(...)忽略返回值；两者都必须等待回执
+```
+
+# system
+
+## 函数
+
+crate公开：
+```text
+agent_create_system(world: &mut World)
+    创建System：crate公开System
+    处理事件：AgentCreateRequest
+    行为：克隆本帧全部AgentCreateRequest，逐个调用handle_agent_create
+
+agent_control_system(world: &mut World)
+    控制System：crate公开System
+    处理事件：AgentControl
+    行为：克隆本帧全部AgentControl，逐个调用handle_agent_control
+
+agent_message_system(world: &mut World)
+    消息System：crate公开System
+    处理事件：AgentMessage
+    行为：克隆本帧全部AgentMessage，逐个调用handle_agent_message
+
+agent_lua_vm_state_system(world: &mut World)
+    Lua VM状态System：crate公开System
+    处理事件：LuaVmStarted、AgentInitializationCompleted、LuaRuntimeTaskFinished
+    行为：
+        克隆本帧全部LuaVmStarted并逐个调用handle_lua_vm_started
+        克隆本帧全部AgentInitializationCompleted并逐个调用handle_agent_initialization_completed
+        克隆本帧全部LuaRuntimeTaskFinished并逐个调用handle_lua_vm_finished
+```
+
+# error
+
+## 类型
+
+公开：
+```text
+AgentFailureKind：Agent错误分类，公开枚举
+    InvalidRequest
+    AgentMissing
+    DuplicateAgent
+    LuaRuntime
+    Mcl
+    Import
+    Stopped
+
+AgentError：Agent控制错误，公开结构体--稳定描述Agent数据、生命周期或跨领域控制失败
+    kind: AgentFailureKind--错误分类
+    message: String--稳定有界错误描述
+```
+
+# handler
+
+## 函数
+
+crate公开：
+```text
+handle_agent_create(world: &mut World, request: AgentCreateRequest)
+    处理创建：crate公开函数
+    行为：
+        校验请求、Workspace和agent_id唯一性
+        创建Entity并分别挂载ResourceId(agent_id)和完整Agent
+        把除身份外的静态信息、image_entity、空BlockAssembly、空RefBlockAssembly、memory和TokenUsage写入Agent
+        读取ResourceId并与Agent.info组合出Lua agent_info表
+        确认Agent.memory已经可读后，构造providers显式包含agent_info和mcl、owner_id为agent_id的LongRunning LuaRuntimeRequest
+        提交前把运行时request_id写入Agent.lua.request_id
+        调用LuaRuntimeHandle::register_long_running
+        Agent在Base Lua初始化完成前保持Creating，不得通过AgentCreateReply报告成功
+        同步失败时把Agent.lifecycle改为Failed并通过AgentCreateReply返回错误
+
+handle_agent_control(world: &mut World, event: AgentControl)
+    处理控制：crate公开函数
+    行为：
+        要求目标Entity同时具有Agent和ResourceId
+        按event.control调用唯一对应的生命周期函数
+        立即完成时调用event.reply.send
+        失败时写入Agent.last_error并调用event.reply.send(Err)
+
+handle_agent_message(world: &mut World, event: AgentMessage)
+    处理消息：crate公开函数
+    行为：
+        要求目标Entity同时具有Agent和ResourceId、Agent.lifecycle为Running且Agent.lua.vm_id存在
+        验证User不携带tool_calls
+        将event.id、event.message和event.usage组合成AgentLuaMessageEnvelope，再转换为LuaValue并调用LuaRuntimeHandle::send_message
+        不解析消息角色、不维护pending_tool、不写上下文、不启动下一轮推理
+        投递成功即结束；投递失败时写入Agent.last_error、把生命周期设为Failed并停止长期VM，使正在等待start的邮箱receive以错误完成
+
+handle_lua_vm_started(world: &mut World, event: LuaVmStarted)
+    处理VM启动：crate公开函数
+    行为：按Agent.lua.request_id定位唯一Agent，写入vm_id、清空request_id；保持lifecycle=Creating，不提前完成创建回执
+
+handle_agent_initialization_completed(world: &mut World, event: AgentInitializationCompleted)
+    完成Base Lua初始化：crate公开函数
+    行为：要求目标Agent仍为Creating、Agent.lua.vm_id等于event.vm_id且initialization.failed为空
+        设置initialization.complete=true和lifecycle=Running，通过Agent.creation.reply返回Entity
+        重复事件按幂等忽略；Agent、VM或生命周期不匹配时记录稳定错误且不完成错误实例的回执
+
+handle_lua_vm_finished(world: &mut World, event: LuaRuntimeTaskFinished)
+    处理VM结束：crate公开函数
+    行为：
+        启动前失败时按request_id定位Agent，设置lifecycle=Failed并通过创建回执返回错误
+        运行后结束时按vm_id定位Agent，清空Agent.lua并根据结果设置Stopped或Failed
+        失败时写入Agent.last_error
+
+control_stop(world: &mut World, agent: Entity) -> Result<(), AgentError>
+    停止Agent：crate公开函数，将Agent.lifecycle设为Stopping并调用LuaRuntimeHandle::stop_long_running
+```
+
+AgentPlugin控制边界：
+```text
+AgentPlugin不定义或实现visibility、conversation、history、realtime、compression、inference和tool语义
+AgentPlugin不提供恢复默认可见性、删除全部可见性、中止推理或压缩上下文等专用控制
+Agent只聚合AgentMcl并提供mcl与mcl_mut访问，不实现任何Block操作
+AgentMcl封装BlockAssembly和RefBlockAssembly，并提供insert、delete、cover三个字段级机械修改方法
+MclPlugin负责解析MCL命令、查找Agent Entity、读取Agent组件、解析绑定和删除条件，再调用AgentMcl对应的机械修改方法
+AgentPlugin不得从Block名称、字段名称、内容类型或调用来源推断Block用途
+AgentMcl不公开内部BlockAssembly和RefBlockAssembly的可变引用，防止其他领域绕过insert、delete、cover
+真实Block和RefBlock共享同一个block_id命名空间，AgentMcl禁止两套程序集出现相同ID
+Stop只结束Agent自身的长期Lua VM和生命周期，不读取或修改任何Block
 ```

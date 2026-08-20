@@ -61,6 +61,6 @@ LLM只能看到AgentResourceMap中由skill:*、tool:*和shell:*资源衍生出�
 ResourceMapEntry.resource_id表示LLM调用语义；ResourceMapEntry.tool_id只供ToolPlugin内部路由。
 BuiltinToolPlugin不读取或修改Agent可见性；AgentPlugin根据初始化和热插拔操作决定注册哪些资源。
 BuiltinToolPlugin的成功响应只表示候选ResourceMapEntry构造完成；MCLPlugin收到并校验回执后原子写入AgentResourceMap和IMPORT绑定，后续INJECT命令决定可见性。
-BuiltinToolPlugin只组合内建执行器，不拥有PendingToolCalls、不构造AgentMessage、不执行Inference。
+BuiltinToolPlugin只组合内建执行器，不拥有Agent.tools.pending、不构造AgentMessage、不执行Inference。
 tool:builtin/*不能作为可见资源注册，防止模型绕过资源定义直接调用执行器。
 ```

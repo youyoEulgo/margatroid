@@ -77,7 +77,7 @@ WorkspaceAgentStatusDto：Workspace成员状态DTO
 ```text
 InferencePlugin先把模型返回的Provider tool_name恢复为ResourceMapEntry.resource_name；ToolPlugin再根据消息所属Agent的AgentResourceMap恢复tool_id和resource_id。
 resource_name只在单个Agent内唯一，可以是MCL alias或完整ResourceId字符串，不需要跨Agent全局唯一。
-ToolPlugin从AgentResourceMap和PendingToolCalls恢复具体resource_id并写入Message::Tool。
+ToolPlugin从AgentResourceMap和Agent.tools.pending恢复具体resource_id并写入Message::Tool。
 ResourceId统一格式为type:scope/name:tag，省略tag时解析为latest。
 静态Workspace Agent固定使用agent:<workspace>/<name>:latest；clone tag不创建目录，动态Subagent留待后续设计。
 agent.message.reasoning_delta与agent.message.delta分别累积思考和正文；完整agent.message同时结束两种分片。
