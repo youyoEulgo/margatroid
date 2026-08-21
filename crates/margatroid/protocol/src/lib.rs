@@ -202,6 +202,35 @@ impl IntoDomain<Message> for UserMessageDto {
     }
 }
 
+impl IntoDomain<Message> for MessageDto {
+    fn into_domain(self, (): ()) -> Result<Message, ProtocolError> {
+        match self {
+            Self::User { content } => Ok(Message::User { content }),
+            Self::Assistant {
+                reasoning,
+                content,
+                tool_calls,
+            } => Ok(Message::Assistant {
+                reasoning,
+                content,
+                tool_calls: tool_calls
+                    .into_iter()
+                    .map(|call| call.into_domain(()))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            Self::Tool {
+                resource_id,
+                tool_call_id,
+                content,
+            } => Ok(Message::Tool {
+                resource_id: resource_id.into_domain(())?,
+                tool_call_id,
+                content,
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallDto {
     pub id: String,
@@ -332,7 +361,7 @@ impl IntoDomain<StopWorkspaceByReference, String> for StopWorkspaceDto {
 pub struct RouteAgentMessageDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: Option<ResourceIdDto>,
-    pub message: UserMessageDto,
+    pub message: MessageDto,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,9 +500,7 @@ impl IntoDomain<RouteAgentMessage, String> for RouteAgentMessageDto {
             id,
             workspace: self.workspace.into_domain(())?,
             agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
-            message: Message::User {
-                content: self.message.content,
-            },
+            message: self.message.into_domain(())?,
         })
     }
 }
@@ -529,7 +556,7 @@ impl ClientMessage {
             message: RouteAgentMessageDto {
                 workspace: workspace.clone(),
                 agent,
-                message: UserMessageDto {
+                message: MessageDto::User {
                     content: content.into(),
                 },
             },
@@ -640,6 +667,12 @@ pub struct BackendStateDto {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentResourceDto {
+    pub resource_id: ResourceIdDto,
+    pub resource_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentStateDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: ResourceIdDto,
@@ -655,6 +688,8 @@ pub struct AgentStateDto {
     pub default_visibility_source: Option<BlockPathDto>,
     #[serde(default)]
     pub visibility_source: Option<BlockPathDto>,
+    #[serde(default)]
+    pub resources: Vec<AgentResourceDto>,
     #[serde(default)]
     pub mcl: Option<AgentMclStateDto>,
     #[serde(default)]
@@ -803,6 +838,17 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
             .iter()
             .map(|resource| resource.into_dto(()))
             .collect::<Result<Vec<_>, _>>()?;
+        let resources = runtime_agent
+            .resources
+            .tool_entries
+            .iter()
+            .map(|entry| {
+                Ok(AgentResourceDto {
+                    resource_id: ResourceIdDto::from_domain(&entry.resource_id, ())?,
+                    resource_name: entry.resource_name.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?;
         let identity = world.get_component::<ResourceId>(agent).ok_or_else(|| {
             ProtocolError::new(
                 ProtocolErrorKind::AgentNotFound,
@@ -833,6 +879,7 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
             visible_resources,
             default_visibility_source,
             visibility_source,
+            resources,
             mcl: None,
             total_input_tokens: token_usage.total_input_tokens,
             total_output_tokens: token_usage.total_output_tokens,
@@ -900,6 +947,7 @@ impl FromDomain<(), &World> for BackendStateDto {
                         visible_resources: Vec::new(),
                         default_visibility_source: None,
                         visibility_source: None,
+                        resources: Vec::new(),
                         mcl: None,
                         total_input_tokens: 0,
                         total_output_tokens: 0,
@@ -918,6 +966,7 @@ impl FromDomain<(), &World> for BackendStateDto {
                         visible_resources: Vec::new(),
                         default_visibility_source: None,
                         visibility_source: None,
+                        resources: Vec::new(),
                         mcl: None,
                         total_input_tokens: 0,
                         total_output_tokens: 0,
