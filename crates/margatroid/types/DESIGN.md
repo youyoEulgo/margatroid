@@ -1,13 +1,24 @@
 # MargatroidTypes
 
-## Agent共享数据归属
+## 跨Plugin值类型归属
 
 ```text
-Agent以及其内嵌的AgentInfo、AgentCreationState、AgentLuaState、AgentMcl、MclRealtimeSource、AgentResourceMap、AgentMemoryHandle、AgentMemoryStore、AgentMemoryStoreError、AgentInferenceState、AgentToolState、AgentTurnState和TokenUsageState均定义在types crate。
-AgentPlugin负责创建Entity并分别挂载ResourceId和唯一Agent组件；Agent组件的存在本身表明该Entity是Agent。其他领域Plugin只能通过Agent组件读取或修改自己负责的数据，不再为同一Agent挂载第二份状态Component。
-MCL的Block、BlockAssembly、RefMerge、RefBlock和RefBlockAssembly以及LuaVmId同样定义在types crate，由对应Plugin重新导出。
+Agent以及其内嵌的AgentInfo、AgentCreationState、AgentLuaState、AgentMcl、AgentResourceMap、AgentMemoryHandle、AgentMemoryStore、AgentMemoryStoreError、AgentInferenceState、AgentToolState、AgentTurnState和TokenUsageState均定义在agent_plugin，对应agent_plugin/DESIGN.md的lib和types板块。
+AgentPlugin负责创建Entity并分别挂载ResourceId和唯一Agent组件；Agent组件的存在本身表明该Entity是Agent。其他领域Plugin通过agent_plugin公开的Agent组件读取或修改自己负责的数据，不再为同一Agent挂载第二份状态Component。
+MCL的纯值类型MclMessage、MclRealtimeSource、Block、BlockAssembly、RefMerge、RefBlock和RefBlockAssembly以及LuaVmId定义在types crate，由对应Plugin重新导出；它们不持有Agent生命周期或领域入口。
 ResourceId及其World查询扩展实际定义在ResourceIdPlugin；types crate中的共享结构只引用ResourceId，不拥有其实现。
 types crate只定义数据结构、局部数据方法和AgentMemoryStore这类依赖反转接口，不包含System、事件路由或数据库、推理、工具、Lua VM的具体实现。
+```
+
+### 规范归属与依赖方向
+
+```text
+resource_id_plugin是身份基础crate，只依赖core_plugin；ResourceId、ResourceIdError、ResourceIdLookupError和WorldResourceIdExt只在该crate定义。
+types依赖resource_id_plugin并持有跨领域纯值：Block、RefBlock、MclMessage、MclRealtimeSource、LuaVmId、AgentError、ToolError和StopReason。
+agent_plugin拥有唯一Agent聚合根及其内嵌状态；mcl_plugin、memory_plugin、tool_plugin和inference_plugin依赖agent_plugin访问该聚合根，并分别实现自己的System、Provider和领域事件。
+types不得依赖任何业务Plugin；Agent的业务聚合状态统一由Agent组件持有，其他Plugin不得为同一个Agent重复挂载第二份资源映射、工具状态或生命周期状态Component。
+AgentMcl的机械Block方法统一返回AgentError；各领域Plugin在边界处把AgentError转换为自己的错误类型。
+AgentResourceMap的存储类型属于agent_plugin，ToolPlugin独占其注册、查询和pending调用的业务入口。
 ```
 
 ## 类型
@@ -211,6 +222,51 @@ AgentHistoryMessageWriteRequested：Agent历史消息写入请求，公开结构
         Event：公开trait实现
     impl Clone for AgentHistoryMessageWriteRequested
         Clone：公开trait实现
+
+AgentError：Agent共享错误，公开结构体--跨Plugin传递Agent数据和生命周期失败
+    kind: AgentErrorKind--稳定有限分类
+    message: String--不包含消息正文、参数、密钥或绝对路径的有界描述
+    impl Clone + PartialEq + Eq for AgentError
+    impl fmt::Display + std::error::Error for AgentError
+
+AgentErrorKind：Agent共享错误分类，公开枚举
+    InvalidRequest
+    AgentMissing
+    DuplicateAgent
+    ResourceMissing
+    BlockMissing
+    InnerMissing
+    TypeMismatch
+    LuaRuntime
+    Mcl
+    Import
+    Inference
+    Tool
+    Memory
+    Stopped
+
+AgentInferencePending：推理飞行事务，公开结构体--只保存取消和关联所需的最小定位
+    id: String
+    tool_schema: Vec<ToolDefinition>
+
+AgentToolPending：工具飞行事务，公开结构体--只保存迟到响应匹配所需的定位
+    turn_id: String
+    tool_call_id: String
+    resource_id: ResourceId
+    tool_id: ResourceId
+
+AgentToolEnvironment：工具运行环境，公开结构体--由Workspace构造并由具体工具Provider读取
+    project_root: PathBuf
+    image_root: PathBuf
+    impl Clone
+
+StopReason：Provider无关推理停止原因，公开枚举
+    Completed
+    ToolCalls
+    Length
+    Cancelled
+    Error
+    impl Clone + Copy + PartialEq + Eq
 
 TokenUsage：单次模型响应Token用量，公开纯数据结构
     input_tokens: u64--本次请求输入Token数

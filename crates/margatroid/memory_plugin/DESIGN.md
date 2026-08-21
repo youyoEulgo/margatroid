@@ -77,7 +77,7 @@ AgentRealtimeContextReadCompleted：实时上下文读取响应，公开事件--
     result: Result<Vec<MclMessage>, MemoryError>--完整有序快照或稳定读取错误
     impl Event + Clone for AgentRealtimeContextReadCompleted
 
-HistoryMessage：可展示历史条目，公开结构体--对应history_messages中的一行
+HistoryMessage：可展示历史条目，公开重导出--类型定义在agent_plugin，MemoryPlugin为兼容历史查询继续re-export
     sequence: i64--单Agent永久递增序号
     turn_id: String--原AgentMessage.id
     message: Message--User、Assistant或Tool
@@ -142,7 +142,7 @@ require_plugin(world: &World) -> Result<(), MemoryError>
     确认插件：私有函数，MemoryPluginInstalled不存在时返回PluginMissing
 
 lock_connection(memory: &AgentMemory) -> Result<MutexGuard<Connection>, MemoryError>
-    锁定连接：私有函数，锁中毒时返回WriteFailed
+    锁定连接：私有函数，只在AgentMemory实现AgentMemoryStore的内部使用；AgentMemoryHandle只通过AgentMemoryStore方法访问，不暴露连接
 
 initialize_schema(connection: &mut Connection) -> Result<(), MemoryError>
     初始化数据库：私有函数，事务内迁移旧表并创建不存在的两张业务表

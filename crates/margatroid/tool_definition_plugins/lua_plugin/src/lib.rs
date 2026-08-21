@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_plugin::AgentIdentity;
+use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::{AppAsyncExt, AsyncRuntimeHandle, AsyncTaskError, WorldAsyncExt};
 use core_plugin::{App, Entity, Event, Plugin, Resource, World};
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tool_plugin::{
-    register_agent_tool, AgentToolEnvironment, ToolCallRequest, ToolCallResponse, ToolError,
+    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
     ToolErrorKind, ToolPluginInstalled, ToolTemplate,
 };
 
@@ -190,15 +190,17 @@ pub struct LuaToolRegisterRequest {
     pub id: String,
     pub agent: Entity,
     pub resource_id: ResourceId,
+    pub alias: Option<String>,
 }
 impl Event for LuaToolRegisterRequest {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LuaToolRegisterResponse {
     pub id: String,
     pub agent: Entity,
     pub resource_id: ResourceId,
-    pub result: Result<(), ToolError>,
+    pub alias: Option<String>,
+    pub result: Result<ResourceMapEntry, ToolError>,
 }
 impl Event for LuaToolRegisterResponse {}
 
@@ -358,26 +360,28 @@ fn lua_tool_register_system(world: &mut World) {
             id: request.id,
             agent: request.agent,
             resource_id: request.resource_id,
+            alias: request.alias,
             result,
         });
     }
 }
 
-fn register_lua_tool(world: &mut World, request: &LuaToolRegisterRequest) -> Result<(), ToolError> {
+fn register_lua_tool(
+    world: &mut World,
+    request: &LuaToolRegisterRequest,
+) -> Result<ResourceMapEntry, ToolError> {
     if request.id.is_empty() || !world.is_alive(request.agent) {
         return Err(ToolError::new(
             ToolErrorKind::InvalidRequest,
             "Lua tool registration request is invalid",
         ));
     }
-    let environment = world
-        .get_component::<AgentToolEnvironment>(request.agent)
-        .ok_or_else(|| {
-            ToolError::new(
-                ToolErrorKind::ToolEnvironmentMissing,
-                "agent tool environment is missing",
-            )
-        })?;
+    let agent = world.get_component::<Agent>(request.agent).ok_or_else(|| {
+        ToolError::new(
+            ToolErrorKind::ToolEnvironmentMissing,
+            "agent tool environment is missing",
+        )
+    })?;
     let home_root = &world
         .get_resource::<LuaRoots>()
         .expect("LuaPlugin is installed")
@@ -385,7 +389,12 @@ fn register_lua_tool(world: &mut World, request: &LuaToolRegisterRequest) -> Res
     let limits = world
         .get_resource::<LuaExecutionLimits>()
         .expect("LuaPlugin is installed");
-    let package = find_lua_tool_package(environment, home_root, &request.resource_id)?;
+    let package = find_lua_tool_package(
+        &agent.info.project_root,
+        &agent.info.image_root,
+        home_root,
+        &request.resource_id,
+    )?;
     let metadata = read_bounded_sync(
         &package.join(TOOL_METADATA_FILE),
         limits.max_definition_bytes,
@@ -402,14 +411,12 @@ fn register_lua_tool(world: &mut World, request: &LuaToolRegisterRequest) -> Res
         definition.metadata.description,
         definition.parameters,
     )?;
-    register_agent_tool(
-        world,
-        request.agent,
-        ResourceId::parse(LUA_RUNTIME_ID).expect("built-in Lua runtime ID is valid"),
+    candidate_resource_entry(
         request.resource_id.clone(),
+        request.alias.clone(),
+        ResourceId::parse(LUA_RUNTIME_ID).expect("built-in Lua runtime ID is valid"),
         template,
-    )?;
-    Ok(())
+    )
 }
 
 fn lua_tool_call_prepare_system(world: &mut World) {
@@ -460,17 +467,16 @@ fn prepare_lua_tool_call(
             "Lua tool call request is invalid",
         ));
     }
-    let identity = world
-        .get_component::<AgentIdentity>(request.agent)
-        .ok_or_else(|| {
-            ToolError::new(ToolErrorKind::InvalidRequest, "Agent identity is missing")
-        })?;
-    let environment = world
-        .get_component::<AgentToolEnvironment>(request.agent)
+    let agent = world
+        .get_component::<Agent>(request.agent)
+        .ok_or_else(|| ToolError::new(ToolErrorKind::InvalidRequest, "Agent is missing"))?;
+    let agent_id = world
+        .get_component::<ResourceId>(request.agent)
+        .cloned()
         .ok_or_else(|| {
             ToolError::new(
-                ToolErrorKind::ToolEnvironmentMissing,
-                "agent tool environment is missing",
+                ToolErrorKind::InvalidRequest,
+                "Agent resource id is missing",
             )
         })?;
     let home_root = &world
@@ -478,7 +484,8 @@ fn prepare_lua_tool_call(
         .expect("LuaPlugin is installed")
         .home_root;
     let package_root = Arc::new(find_lua_tool_package(
-        environment,
+        &agent.info.project_root,
+        &agent.info.image_root,
         home_root,
         &request.resource_id,
     )?);
@@ -488,11 +495,11 @@ fn prepare_lua_tool_call(
         .0
         .clone();
     let context = LuaCallContext {
-        agent_id: identity.id().clone(),
+        agent_id,
         turn_id: request.turn_id.clone(),
         resource_id: request.resource_id.clone(),
-        project_root: Arc::new(environment.project_root().to_path_buf()),
-        image_root: Arc::new(environment.image_root().to_path_buf()),
+        project_root: Arc::new(agent.info.project_root.clone()),
+        image_root: Arc::new(agent.info.image_root.clone()),
         package_root: Arc::clone(&package_root),
     };
     let capabilities = LuaDirectCapabilityHandle {
@@ -610,7 +617,8 @@ fn lua_task_result_system(world: &mut World) {
 }
 
 fn find_lua_tool_package(
-    environment: &AgentToolEnvironment,
+    project_root: &Path,
+    image_root: &Path,
     home_root: &Path,
     resource_id: &ResourceId,
 ) -> Result<PathBuf, ToolError> {
@@ -621,8 +629,8 @@ fn find_lua_tool_package(
         ));
     }
     let roots = [
-        environment.project_root().join(".margatroid").join("tools"),
-        environment.image_root().join("tools"),
+        project_root.join(".margatroid").join("tools"),
+        image_root.join("tools"),
         home_root.to_path_buf(),
     ];
     for root in roots {

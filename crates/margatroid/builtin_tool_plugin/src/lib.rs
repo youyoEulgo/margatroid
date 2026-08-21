@@ -6,7 +6,9 @@ use core_plugin::{App, Plugin, Resource, World};
 use lua_plugin::{LuaPlugin, LuaToolRegisterRequest, LuaToolRegisterResponse};
 use shell_plugin::{ShellPlugin, ShellRegisterRequest, ShellRegisterResponse};
 use skill_plugin::{SkillPlugin, SkillRegisterRequest, SkillRegisterResponse};
-use tool_plugin::{AgentToolRegisterRequest, AgentToolRegisterResponse, ToolError, ToolErrorKind};
+use tool_plugin::{
+    AgentResourceRegisterRequest, AgentResourceRegisterResponse, ToolError, ToolErrorKind,
+};
 use workflow_plugin::{WorkflowPlugin, WorkflowRegisterRequest, WorkflowRegisterResponse};
 
 pub struct BuiltinToolPlugin {
@@ -97,7 +99,7 @@ impl Resource for BuiltinToolPluginInstalled {}
 
 fn builtin_resource_register_system(world: &mut World) {
     let requests = world
-        .event_reader::<AgentToolRegisterRequest>()
+        .event_reader::<AgentResourceRegisterRequest>()
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
@@ -106,10 +108,11 @@ fn builtin_resource_register_system(world: &mut World) {
             || request.resource_id.resource_type() == "tool"
                 && request.resource_id.scope() == "builtin"
         {
-            world.send_event(AgentToolRegisterResponse {
+            world.send_event(AgentResourceRegisterResponse {
                 id: request.id,
                 agent: request.agent,
                 resource_id: request.resource_id,
+                alias: request.alias,
                 result: Err(ToolError::new(
                     ToolErrorKind::InvalidRequest,
                     "built-in executors cannot be registered as visible resources",
@@ -122,26 +125,31 @@ fn builtin_resource_register_system(world: &mut World) {
                 id: request.id,
                 agent: request.agent,
                 resource_id: request.resource_id,
+                alias: request.alias,
             }),
             "workflow" => world.send_event(WorkflowRegisterRequest {
                 id: request.id,
                 agent: request.agent,
                 resource_id: request.resource_id,
+                alias: request.alias,
             }),
             "tool" => world.send_event(LuaToolRegisterRequest {
                 id: request.id,
                 agent: request.agent,
                 resource_id: request.resource_id,
+                alias: request.alias,
             }),
             "shell" => world.send_event(ShellRegisterRequest {
                 id: request.id,
                 agent: request.agent,
                 resource_id: request.resource_id,
+                alias: request.alias,
             }),
-            _ => world.send_event(AgentToolRegisterResponse {
+            _ => world.send_event(AgentResourceRegisterResponse {
                 id: request.id,
                 agent: request.agent,
                 resource_id: request.resource_id,
+                alias: request.alias,
                 result: Err(ToolError::new(
                     ToolErrorKind::ProviderMissing,
                     "resource type has no built-in executor",
@@ -162,6 +170,7 @@ fn collect_builtin_registration_system(world: &mut World) {
                 response.agent,
                 response.resource_id,
                 response.result,
+                response.alias,
             )
         })
         .collect::<Vec<_>>();
@@ -175,6 +184,7 @@ fn collect_builtin_registration_system(world: &mut World) {
                 response.agent,
                 response.resource_id,
                 response.result,
+                response.alias,
             )
         })
         .collect::<Vec<_>>();
@@ -188,6 +198,7 @@ fn collect_builtin_registration_system(world: &mut World) {
                 response.agent,
                 response.resource_id,
                 response.result,
+                response.alias,
             )
         })
         .collect::<Vec<_>>();
@@ -201,16 +212,18 @@ fn collect_builtin_registration_system(world: &mut World) {
                 response.agent,
                 response.resource_id,
                 response.result,
+                response.alias,
             )
         })
         .collect::<Vec<_>>();
-    for (id, agent, resource_id, result) in
+    for (id, agent, resource_id, result, alias) in
         skill.into_iter().chain(workflow).chain(lua).chain(shell)
     {
-        world.send_event(AgentToolRegisterResponse {
+        world.send_event(AgentResourceRegisterResponse {
             id,
             agent,
             resource_id,
+            alias,
             result,
         });
     }

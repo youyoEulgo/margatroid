@@ -2,12 +2,13 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Entity, Event, Plugin, Resource, World};
 use margatroid_types::ResourceId;
 use serde_json::json;
 use tool_plugin::{
-    register_agent_tool, AgentToolEnvironment, ToolCallRequest, ToolCallResponse, ToolError,
+    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
     ToolErrorKind, ToolTemplate,
 };
 
@@ -19,15 +20,17 @@ pub struct WorkflowRegisterRequest {
     pub id: String,
     pub agent: Entity,
     pub resource_id: ResourceId,
+    pub alias: Option<String>,
 }
 impl Event for WorkflowRegisterRequest {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WorkflowRegisterResponse {
     pub id: String,
     pub agent: Entity,
     pub resource_id: ResourceId,
-    pub result: Result<(), ToolError>,
+    pub alias: Option<String>,
+    pub result: Result<ResourceMapEntry, ToolError>,
 }
 impl Event for WorkflowRegisterResponse {}
 
@@ -108,19 +111,24 @@ fn workflow_register_system(world: &mut World) {
         .collect::<Vec<_>>();
     for request in requests {
         let result = world
-            .get_component::<AgentToolEnvironment>(request.agent)
+            .get_component::<Agent>(request.agent)
             .ok_or_else(|| {
                 ToolError::new(
                     ToolErrorKind::ToolEnvironmentMissing,
                     "agent tool environment is missing",
                 )
             })
-            .and_then(|environment| {
+            .and_then(|agent| {
                 validate_workflow_resource(&request.resource_id)?;
                 let roots = world
                     .get_resource::<WorkflowRoots>()
                     .expect("WorkflowPlugin is installed");
-                find_workflow_directory(environment, &roots.home_root, &request.resource_id)?;
+                find_workflow_directory(
+                    &agent.info.project_root,
+                    &agent.info.image_root,
+                    &roots.home_root,
+                    &request.resource_id,
+                )?;
                 ToolTemplate::new(
                     request.resource_id.to_string(),
                     "Load this workflow resource.",
@@ -128,20 +136,19 @@ fn workflow_register_system(world: &mut World) {
                 )
             });
         let result = result.and_then(|template| {
-            register_agent_tool(
-                world,
-                request.agent,
+            candidate_resource_entry(
+                request.resource_id.clone(),
+                request.alias.clone(),
                 ResourceId::parse(WORKFLOW_LOADER_ID)
                     .expect("built-in Workflow loader ID is valid"),
-                request.resource_id.clone(),
                 template,
             )
-            .map(|_| ())
         });
         world.send_event(WorkflowRegisterResponse {
             id: request.id,
             agent: request.agent,
             resource_id: request.resource_id,
+            alias: request.alias,
             result,
         });
     }
@@ -170,16 +177,14 @@ fn workflow_tool_call_system(world: &mut World) {
 }
 
 fn find_workflow_directory(
-    environment: &AgentToolEnvironment,
+    project_root: &Path,
+    image_root: &Path,
     home_root: &Path,
     resource: &ResourceId,
 ) -> Result<(), ToolError> {
     let candidates = [
-        environment
-            .project_root()
-            .join(".margatroid")
-            .join("workflows"),
-        environment.image_root().join("workflows"),
+        project_root.join(".margatroid").join("workflows"),
+        image_root.join("workflows"),
         home_root.to_path_buf(),
     ];
     for root in candidates {

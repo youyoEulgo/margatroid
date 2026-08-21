@@ -10,7 +10,7 @@ Agent创建时由MemoryPlugin从历史Assistant行恢复；上下文压缩推理
 
 `AgentMessage.agent`始终是已解析的Entity。三种消息都通过事件请求MemoryPlugin写历史，并作为
 MCL领域事件进入对应的类型化消息数组。Assistant声明的ToolCall进入`pending_tool`数组；Tool响应
-按`tool_call_id`删除对应元素，数组为空时MCL才发送下一次推理请求。ToolPlugin的PendingToolCalls
+按`tool_call_id`删除对应元素，数组为空时MCL才发送下一次推理请求。ToolPlugin的`Agent.tools.pending`
 只负责异步工具请求与响应关联。
 
 每次推理请求都根据`AgentDynamicVisibility`重新构造工具定义，定义名保持完整`ResourceId`。

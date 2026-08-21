@@ -50,6 +50,8 @@ AgentResourceMap：Agent专属资源表，公开结构体--只存放在Agent.res
         IMPORT的alias只随完整ResourceMapEntry一次性注册；Provider验证完成前不单独写入alias
         任何领域消息、历史记录、实时上下文和ToolSpec都优先使用entry.alias；资源无alias时才使用完整ResourceId字符串
 
+AgentToolPending：实际定义在AgentPlugin；ToolPlugin的pending键为(agent Entity, turn_id, tool_call_id)，同一Agent同一轮次内tool_call_id必须唯一，不同Agent或不同轮次允许复用。
+
 AgentResourceRegisterRequest：Agent资源注册请求，公开事件--注册协议类型由ToolPlugin提供，具体Provider负责消费
     id: String--发起注册的Plugin生成的内部唯一请求ID；MCL IMPORT使用"mcl-import:"加MclCommandId字符串值
     agent: Entity--目标Agent Entity
@@ -133,6 +135,7 @@ tool_call_route_system(world: &mut World)
         构造ToolCallRequest { turn_id, agent, tool_id, resource_id, tool_call_id, arguments }
         在发送请求前加入Agent.tools.pending
         映射缺失或请求重复时发送AgentFailure { id: turn_id, kind: Tool }，由MclPlugin关闭当前或下一次start；不伪造Tool成功消息
+        ToolCallRequest没有独立超时；取消只由CancelToolTurn触发，具体Provider必须保证每个已接收请求最终发送一次ToolCallResponse
 
 tool_call_response_system(world: &mut World)
     整理响应：私有System，读取ToolCallResponse
@@ -183,6 +186,6 @@ ToolPlugin不读取Skill或Workflow文件，不解析具体参数，不执行工
 AgentResourceMap注册成功后长期保留；从TOOL数组移除可见性不删除映射。
 同一resource_id和alias重新导入时复用既有ResourceMapEntry；ToolPlugin仍不决定资源何时进入TOOL数组。
 具体工具Plugin负责资源清单允许后的资源验证、真实存在性与可用性测试、候选ResourceMapEntry构造和执行，不写AgentResourceMap，不自行构造AgentMessage。
-工具执行关联统一保存在Agent.tools.pending；get_by_turn由ToolPlugin读取该字段，不再挂载独立PendingToolCalls组件或保存第二份Agent工具状态。
+工具执行关联统一保存在Agent.tools.pending；ToolPlugin按(agent, turn_id, tool_call_id)读取该字段，不建立第二份全局工具状态。
 具体工具Plugin必须对每个ToolCallRequest恰好发送一个ToolCallResponse；执行失败放入response.result，ToolPlugin仍把它转换成可配对的Tool消息，使Base Lua能够删除pending_tool并继续或结束循环。
 ```

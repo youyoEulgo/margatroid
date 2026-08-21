@@ -14,5 +14,7 @@ tool_plugin = { path = "../tool_plugin" }
 workflow_plugin = { path = "../tool_definition_plugins/workflow_plugin" }
 
 [dev-dependencies]
+tokio = { workspace = true }
+agent_plugin = { path = "../agent_plugin" }
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
 tempfile = "3"

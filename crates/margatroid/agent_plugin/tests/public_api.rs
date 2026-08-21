@@ -1,167 +1,94 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use agent_plugin::{AgentCreateReply, AgentMcl, AgentTurnState, TokenUsageState};
+use margatroid_types::{Block, BlockInner, BlockPath, MclDeleteSelection, RefBlock, TokenUsage};
 
-use agent_plugin::{
-    AgentContext, AgentContextCompactRequest, AgentCreateRequest, AgentCreateResult, AgentCreated,
-    AgentPlugin, AgentTokenUsage, AgentWorkspaceId, WorldAgentExt,
-};
-use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
-use core_plugin::App;
-use margatroid_types::{ResourceId, TokenUsage};
-use mcl_plugin::{compile_mcl, AgentMcl, MclCompileRequest, MclPlugin, MclSource};
-use tool_plugin::ToolPlugin;
-
-fn base_mcl() -> std::sync::Arc<mcl_plugin::MclProgram> {
-    compile_mcl(MclCompileRequest {
-        root: MclSource::new(
-            ResourceId::parse("mcl:local/test:latest").unwrap(),
-            r#"base context test {
-block conversation: context persistent;
-view messages: messages { select entry from conversation; }
-view tools: tools { select resource from capabilities.dynamic; }
-request inference { system = agent.system; messages = messages; tools = tools; }
-on agent.created { restore capabilities.dynamic from capabilities.default; }
-}"#,
-            PathBuf::from("/test/main.mcl"),
-        ),
-        dependencies: BTreeMap::new(),
-    })
-    .unwrap()
-}
-
-#[test]
-fn documented_public_api_creates_an_agent() {
-    let mut app = App::new();
-    app.add_plugin(RuntimePlugin::default())
-        .add_plugin(ToolPlugin::default())
-        .add_plugin(MclPlugin::open(std::env::temp_dir()).unwrap())
-        .add_plugin(AgentPlugin::default());
-    let workspace = app.world_mut().spawn();
-    app.world().send_event(AgentCreateRequest {
-        id: "agent-1".into(),
-        agent_id: ResourceId::parse("agent:test/agent0").unwrap(),
-        workspace_id: workspace,
-        base_mcl: base_mcl(),
-        system_prompt: "You are concise.".into(),
-        messages: Vec::new(),
-        tool_context: Vec::new(),
-        ordered_messages: Vec::new(),
-        token_usage: TokenUsage {
-            input_tokens: 200,
-            output_tokens: 40,
-            cache_hit_tokens: 150,
-        },
-        last_input_tokens: 200,
-        context_window_tokens: 1_000_000,
-        default_visibility: BTreeSet::new(),
-    });
-    app.tick();
-    app.tick();
-
-    let created = app
-        .world()
-        .event_reader::<AgentCreateResult>()
-        .into_iter()
-        .next()
-        .unwrap();
-    assert_eq!(created.id, "agent-1");
-    let agent = created.result.as_ref().copied().unwrap();
-    assert!(app
-        .world()
-        .event_reader::<AgentCreated>()
-        .into_iter()
-        .any(|event| event.id == "agent-1" && event.agent == agent));
-    assert_eq!(
-        app.world()
-            .get_component::<AgentWorkspaceId>(agent)
-            .unwrap()
-            .workspace_id(),
-        workspace
-    );
-    assert_eq!(
-        app.world()
-            .get_component::<AgentContext>(agent)
-            .unwrap()
-            .system_prompt(),
-        "You are concise."
-    );
-    assert!(app
-        .world()
-        .get_component::<AgentMcl>(agent)
-        .unwrap()
-        .capabilities()
-        .default_resources()
-        .is_empty());
-    let usage = app.world().get_component::<AgentTokenUsage>(agent).unwrap();
-    assert_eq!(usage.total_input_tokens(), 200);
-    assert_eq!(usage.total_output_tokens(), 40);
-    assert_eq!(usage.total_cache_hit_tokens(), 150);
-    assert_eq!(usage.cache_hit_rate(), 0.75);
-    assert!(app
-        .world()
-        .get_component::<AgentMcl>(agent)
-        .unwrap()
-        .capabilities()
-        .visible_resources()
-        .next()
-        .is_none());
-}
-
-#[test]
-fn duplicate_agent_resource_ids_are_rejected() {
-    let mut app = App::new();
-    app.add_plugin(RuntimePlugin::default())
-        .add_plugin(ToolPlugin::default())
-        .add_plugin(MclPlugin::open(std::env::temp_dir()).unwrap())
-        .add_plugin(AgentPlugin::default());
-    let workspace = app.world_mut().spawn();
-    let agent_id = ResourceId::parse("agent:test/agent0").unwrap();
-
-    for request_id in ["agent-1", "agent-2"] {
-        app.world().send_event(AgentCreateRequest {
-            id: request_id.into(),
-            agent_id: agent_id.clone(),
-            workspace_id: workspace,
-            base_mcl: base_mcl(),
-            system_prompt: String::new(),
-            messages: Vec::new(),
-            tool_context: Vec::new(),
-            ordered_messages: Vec::new(),
-            token_usage: margatroid_types::TokenUsage::default(),
-            last_input_tokens: 0,
-            context_window_tokens: 1_000_000,
-            default_visibility: BTreeSet::new(),
-        });
+fn message_path() -> BlockPath {
+    BlockPath {
+        block_id: "conversation".to_owned(),
+        inner_id: "messages".to_owned(),
     }
-    app.tick();
-    app.tick();
-
-    let created = app
-        .world()
-        .event_reader::<AgentCreateResult>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    assert_eq!(created.len(), 2);
-    let successful = created
-        .iter()
-        .filter_map(|result| result.result.as_ref().ok().copied())
-        .collect::<Vec<_>>();
-    assert_eq!(successful.len(), 1);
-    assert_eq!(app.world().agent(&agent_id), Some(successful[0]));
 }
 
 #[test]
-fn context_compaction_request_is_public() {
-    fn assert_event<EventType: core_plugin::Event>() {}
-    assert_event::<AgentContextCompactRequest>();
+fn agent_mcl_owns_blocks_and_enforces_one_block_namespace() {
+    let mut mcl = AgentMcl::default();
+    let mut block = Block::default();
+    block
+        .inners
+        .insert("messages".to_owned(), BlockInner::Message(Vec::new()));
+    mcl.create_block("conversation".to_owned(), block).unwrap();
 
-    let mut app = App::new();
-    let agent = app.world_mut().spawn();
-    let request = AgentContextCompactRequest {
-        id: "compact-1".into(),
-        agent,
-        retain_messages: 4,
+    assert!(mcl
+        .create_ref_block("conversation".to_owned(), RefBlock::default())
+        .is_err());
+    assert_eq!(mcl.blocks().blocks.len(), 1);
+    assert!(mcl.ref_blocks().blocks.is_empty());
+}
+
+#[test]
+fn agent_mcl_rejects_wrong_types_without_mutating_the_field() {
+    let mut mcl = AgentMcl::default();
+    let mut block = Block::default();
+    block
+        .inners
+        .insert("messages".to_owned(), BlockInner::Message(Vec::new()));
+    mcl.create_block("conversation".to_owned(), block).unwrap();
+
+    assert!(mcl
+        .insert(&message_path(), BlockInner::ResourceId(Vec::new()))
+        .is_err());
+    assert_eq!(mcl.select(&message_path()).unwrap().len(), 0);
+}
+
+#[test]
+fn agent_mcl_delete_is_atomic_when_an_index_is_invalid() {
+    let mut mcl = AgentMcl::default();
+    let mut block = Block::default();
+    block.inners.insert(
+        "tools".to_owned(),
+        BlockInner::ResourceId(vec![
+            "tool:local/one:latest".parse().unwrap(),
+            "tool:local/two:latest".parse().unwrap(),
+        ]),
+    );
+    mcl.create_block("conversation".to_owned(), block).unwrap();
+    let path = BlockPath {
+        block_id: "conversation".to_owned(),
+        inner_id: "tools".to_owned(),
     };
-    assert_eq!(request.agent, agent);
-    assert_eq!(request.retain_messages, 4);
+
+    assert!(mcl
+        .delete(&path, MclDeleteSelection::Indices(vec![0, 4]))
+        .is_err());
+    assert_eq!(mcl.select(&path).unwrap().len(), 2);
+}
+
+#[test]
+fn turn_state_only_finishes_the_active_turn() {
+    let mut turn = AgentTurnState::default();
+    turn.begin("turn-1".to_owned()).unwrap();
+    assert!(turn.begin("turn-2".to_owned()).is_err());
+    assert!(turn.finish("turn-2").is_err());
+    turn.finish("turn-1").unwrap();
+    assert_eq!(turn.turn_id, None);
+}
+
+#[test]
+fn token_usage_saturates_and_updates_the_cache_hit_rate() {
+    let mut state = TokenUsageState::default();
+    state.add(&TokenUsage {
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_hit_tokens: 25,
+    });
+    assert_eq!(state.total_input_tokens, 100);
+    assert_eq!(state.last_input_tokens, 100);
+    assert_eq!(state.cache_hit_rate, 0.25);
+}
+
+#[tokio::test]
+async fn create_reply_closes_when_all_reply_handles_are_dropped() {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let reply = AgentCreateReply::new(sender);
+    drop(reply);
+    assert!(receiver.await.is_err());
 }

@@ -64,10 +64,11 @@ WorkspacePlugin：Workspace运行编排插件，公开结构体--协调Workspace
                 挂载begin_workspace_command_system
                 挂载route_agent_message_system
                 挂载route_agent_turn_abort_system
-                挂载route_agent_skill_system
+                挂载route_agent_workflow_system
                 挂载route_agent_visibility_system
                 挂载collect_agent_image_system
                 挂载collect_agent_create_result_system
+                挂载collect_agent_initialization_system
 
 StartWorkspace：Workspace启动事件，公开事件--从Compose编译后的定义创建一组AgentInstance
     id: String--调用方生成的请求ID
@@ -121,37 +122,32 @@ StopWorkspaceByReferenceResult：逻辑引用关闭结果，公开事件--供DTO
     impl Event for StopWorkspaceByReferenceResult
         Event：公开trait实现
 
-WorkspaceIdentity：Workspace身份，公开组件--保存稳定资源ID与规范化项目根
-    id: ResourceId--type=workspace的唯一资源ID，私有
+Workspace：Workspace聚合组件，公开组件--Workspace Entity唯一的领域数据组件
+    definition: Arc<WorkspaceDefinition>--本次启动使用的编译后定义，私有
     project_root: Arc<PathBuf>--规范化绝对项目根，私有
-    id(&self) -> &ResourceId
-        取得身份：公开方法，返回完整Workspace资源ID
-    project_root(&self) -> &Path
-        取得项目根：公开方法，返回规范化项目根
-    impl Component for WorkspaceIdentity
-        Component：公开trait实现
-
-WorkspaceConfiguration：Workspace配置快照，公开组件--保存本次启动使用的编译后定义
-    definition: Arc<WorkspaceDefinition>--不包含运行时Entity的静态定义，私有
-    definition(&self) -> &WorkspaceDefinition
-        取得定义：公开方法，返回只读配置引用
-    impl Component for WorkspaceConfiguration
-        Component：公开trait实现
-
-WorkspaceAgents：Workspace Agent索引与创建状态，公开组件--创建Workspace Entity时立即挂载，允许全部Agent失败
     manager_name: String--Workspace定义中的默认入口Agent逻辑名称，私有
     agents: BTreeMap<String, Entity>--Agent逻辑名称到Entity的稳定映射，私有
     states: BTreeMap<String, WorkspaceAgentState>--每个定义成员的当前创建状态，私有
+    definition(&self) -> &WorkspaceDefinition
+        取得定义：公开方法，返回只读配置引用
+    project_root(&self) -> &Path
+        取得项目根：公开方法，返回规范化项目根
     manager(&self) -> Option<Entity>
-        取得默认入口：公开方法，manager创建成功时返回Entity，否则为空
+        取得默认入口：公开方法
     agent(&self, name: &str) -> Option<Entity>
-        取得Agent：公开方法，按逻辑名称查询Agent Entity
+        取得Agent：公开方法
     state(&self, name: &str) -> Option<&WorkspaceAgentState>
-        查询成员状态：公开方法，返回Creating、Ready或Failed
+        查询成员状态：公开方法
+    states(&self) -> impl Iterator<Item = (&str, &WorkspaceAgentState)> + '_
+        遍历成员状态：公开方法
     iter(&self) -> impl Iterator<Item = (&str, Entity)> + '_
-        遍历Agent：公开方法，按逻辑名称顺序返回已经创建成功的Agent
-    impl Component for WorkspaceAgents
+        遍历已创建Agent：公开方法
+    impl Component for Workspace
         Component：公开trait实现
+
+Workspace Entity硬约束：Entity必须且只能挂载ResourceId和Workspace两个组件。
+    ResourceId是统一身份组件；Workspace保存身份之外的全部Workspace领域状态。
+    WorkspaceModelRoutes由InferencePlugin保存于自身Resource索引，不挂载到Workspace Entity。
 
 WorkspaceAgentState：Workspace成员创建状态，公开枚举
     Creating--已经发布Workspace成功通知，Agent仍处于镜像加载、材料准备或Entity创建阶段
@@ -224,7 +220,7 @@ crate公开：
 ```text
 WorkspaceRegistry：Workspace注册与Agent创建监控状态，crate公开Resource
     agent_images_root: Arc<PathBuf>--AgentImage版本目录推导根
-    ready: HashMap<WorkspaceKey, Entity>--Workspace Entity创建成功后立即登记，不要求存在可用Agent
+    workspaces: Vec<Entity>--Workspace实体生命周期集合，不复制ResourceId索引
     initializations: HashMap<Entity, WorkspaceAgentInitialization>--Workspace Entity到尚未结束的成员创建材料
     image_requests: HashMap<String, (Entity, String)>--镜像子请求ID到Workspace Entity和Agent名称
     agent_requests: HashMap<String, (Entity, String)>--Agent创建子请求ID到Workspace Entity和Agent名称
@@ -243,6 +239,7 @@ WorkspaceKey：Workspace注册键，私有结构体--由规范化project_root和
 WorkspaceAgentInitialization：Workspace成员创建监控，私有结构体--不决定Workspace是否成立
     remaining: BTreeSet<String>--尚未进入Ready或Failed的Agent逻辑名称
     prepared: BTreeMap<String, PreparedWorkspaceAgent>--已经完成材料准备且等待AgentCreateResult的成员
+    agents_by_entity: BTreeMap<Entity, String>--已经收到AgentCreateResult、等待AgentInitializationCompleted的Entity到成员名称映射
 
 PreparedWorkspaceAgent：单Agent实例材料，私有结构体--创建Agent Entity前收集完整依赖
     name: String--Agent逻辑名称
@@ -308,11 +305,11 @@ create_workspace_entity(
         Agent名称必须能够安全用于默认Memory目录段
         memory_path存在时必须是Compose解析后的绝对路径
         相同WorkspaceKey已经登记时返回DuplicateWorkspace
-        创建Workspace Entity并插入WorkspaceIdentity、WorkspaceConfiguration和WorkspaceAgents
-        WorkspaceAgents为全部定义成员写入Creating，agents为空，manager_name来自definition.manager
+        创建Workspace Entity并插入ResourceId和完整Workspace
+        Workspace为全部定义成员写入Creating，agents为空，manager_name来自definition.manager
         调用WorldInferenceExt::load_workspace_model_routes(workspace, project_root)
         项目级模型路由加载失败时despawn Workspace Entity并返回错误
-        立即写入WorkspaceRegistry.ready；从此Workspace查询、停止和状态同步均可见
+        立即写入WorkspaceRegistry.workspaces；从此Workspace查询、停止和状态同步均可见
         创建WorkspaceAgentInitialization.remaining并为每个Agent发送LoadAgentImage
         保存initializations和所有image_requests路由
         返回Workspace Entity；不等待任何Agent结果
@@ -331,8 +328,8 @@ collect_agent_image_system(world: &mut World)
 prepare_workspace_agent(world: &mut World, workspace: Entity, name: &str, image: Entity) -> Result<PreparedWorkspaceAgent, WorkspaceError>
     准备单个实例：私有函数，为一个Agent构造创建材料
     行为：
-        从WorkspaceConfiguration按name取得WorkspaceAgentDefinition
-        读取AgentImageIdentity、AgentImageBaseDriver和AgentImageModelConfig
+        从Workspace.definition按name取得WorkspaceAgentDefinition
+        读取AgentImage聚合字段和ResourceId组件
         调用WorldInferenceExt::build_agent_inference_snapshot构造AgentInferenceSnapshot
         根据agent_images_root和type=image的ResourceId构造镜像版本根
         使用definition.project_root和镜像版本根构造AgentToolEnvironment
@@ -354,10 +351,10 @@ collect_agent_create_result_system(world: &mut World)
         插入PreparedWorkspaceAgent.inference_snapshot
         插入PreparedWorkspaceAgent.tool_environment
         AgentResourceMap已经在唯一Agent组件的resources字段中初始化；这里只验证它存在
-        全部绑定成功后把WorkspaceAgents对应成员改为Ready并写入agents索引
+        全部绑定成功后把Workspace对应成员保留为Creating并写入agents索引；AgentCreateResult成功只表示Entity已创建，不表示Base Lua初始化完成
         AgentPlugin已在Agent Entity创建成功时发送恢复默认可见性通知；WorkspacePlugin不介入资源注册或可见性修改
         绑定失败时despawn当前Agent并调用mark_agent_failed
-        成员进入Ready或Failed后从remaining删除；remaining为空时只清理initializations，不发送新的Workspace完成结果
+        把Entity到成员名称写入initializations.agents_by_entity；只有收到AgentInitializationCompleted后才进入Ready并从remaining删除；AgentCreate失败直接进入Failed
 
 attach_prepared_agent(world: &mut World, workspace: Entity, name: &str, agent: Entity, prepared: PreparedWorkspaceAgent) -> Result<(), WorkspaceError>
     绑定实例材料：私有函数，验证Agent归属并绑定Memory、Inference和AgentToolEnvironment
@@ -365,6 +362,14 @@ attach_prepared_agent(world: &mut World, workspace: Entity, name: &str, agent: E
         验证Entity同时挂载ResourceId和Agent，且Agent包含resources和mcl字段；缺失时返回ResourceSetupFailed
         绑定PreparedWorkspaceAgent中的Memory、InferenceSnapshot和AgentToolEnvironment
         不修改Agent.mcl Block，不发送资源注册请求
+
+collect_agent_initialization_system(world: &mut World)
+    收集Base Lua初始化：私有System，读取AgentInitializationCompleted和LuaRuntimeTaskFinished
+    行为：
+        AgentInitializationCompleted按Entity查找WorkspaceAgentInitialization.agents_by_entity
+        仅当Agent.lifecycle已经Running且vm_id匹配时把成员改为Ready，并从remaining删除
+        LuaRuntimeTaskFinished在Agent仍处于Creating时把成员改为Failed；运行后的停止只更新既有Agent状态，不重复改变Workspace初始化结果
+        remaining为空时清理initializations；迟到或未知Entity事件幂等忽略
 
 mark_agent_failed(world: &mut World, workspace: Entity, name: &str, error: WorkspaceError)
     标记成员失败：私有函数，不改变Workspace成功状态
@@ -487,16 +492,18 @@ workspace up：
                                  -> AgentCreateResult
                                     ├── 失败 -> WorkspaceAgentState::Failed
                                     └── 成功 -> Workspace绑定外部运行组件
+                                               -> Creating
+                                               -> AgentInitializationCompleted
                                                -> WorkspaceAgentState::Ready
-        AgentPlugin创建成功时已经启动Base Driver并完成base.lua初始化命令
+        AgentPlugin创建成功后启动Base Driver；只有Base Lua第一次成功登记start才发布AgentInitializationCompleted
             -> 资源逐项注入成功或失败通知
         -> 任意Agent失败均不撤销Workspace，不改变已经发布的StartWorkspaceResult::Ok
 
 项目级模型路由：
     WorkspacePlugin传入已经规范化的project_root
         -> InferencePlugin读取<project_root>/.margatroid/models.toml
-        -> 存在时编译并挂载WorkspaceModelRoutes
-        -> 不存在时移除旧WorkspaceModelRoutes并返回0
+        -> 存在时编译并写入InferencePlugin自己的WorkspaceModelRoutesRegistry Resource
+        -> 不存在时从该Resource索引移除旧路由并返回0
     每次InferenceRequestEvent：
         -> WorkspaceModelRoutes[AgentInferenceSnapshot.model]
         -> 未命中时GlobalModelRoutes[model]
@@ -525,8 +532,8 @@ workspace reload：
 
 workspace down：
     world.stop_workspace(id, workspace)
-        -> 验证Workspace已登记且包含WorkspaceAgents
-        -> 从WorkspaceRegistry.ready移除索引
+        -> 验证Workspace已登记且包含Workspace
+        -> 从WorkspaceRegistry.workspaces移除实体
         -> despawn全部AgentInstance
         -> despawn Workspace Entity
         -> 保留memory.sql、项目文件和AgentImage Entity
@@ -535,7 +542,7 @@ workspace down：
     WorkspacePlugin拥有Workspace Entity和由它启动的AgentInstance；Workspace Entity创建成功后立即进入ready，允许manager缺失或全部Agent失败
     AgentImageLoaderPlugin拥有AgentImage Entity
     MemoryPlugin拥有SQLite格式与AgentMemory组件行为
-    InferencePlugin拥有WorkspaceModelRoutes和AgentInferenceSnapshot
+    InferencePlugin拥有WorkspaceModelRoutesRegistry Resource和AgentInferenceSnapshot；不向Workspace Entity挂载组件
     ToolPlugin拥有AgentToolEnvironment类型，WorkspacePlugin只负责构造实例值
     AgentPlugin分别挂载ResourceId和唯一Agent组件；Agent组件统一包含MCL、资源、推理、工具、存储和Lua运行状态
     AgentPlugin拥有资源注册协调、飞行中注册关联和逐项可见性修改；WorkspacePlugin不保存或等待资源注册状态
@@ -550,25 +557,21 @@ App
 └── World
     ├── WorkspaceRegistry Resource
     │   ├── agent_images_root
-    │   ├── ready: HashMap<WorkspaceKey, Entity>
+    │   ├── workspaces: Vec<Entity>
     │   └── initializations: HashMap<Entity, WorkspaceAgentInitialization>
     ├── Workspace Entity
-    │   ├── WorkspaceIdentity
-    │   ├── WorkspaceConfiguration
-    │   ├── WorkspaceAgents
-    │   ├── WorkspaceModelRoutes--InferencePlugin拥有
+    │   ├── ResourceId
+    │   └── Workspace
     │   └── AgentInstance Entity * N
     │       ├── ResourceId--统一身份组件
     │       └── Agent--共享数据组件，由AgentPlugin挂载；组件存在本身表示该Entity是Agent
     └── AgentImage Entity * N
-        ├── AgentImageIdentity--AgentImageLoaderPlugin拥有
-        ├── AgentImageSoul--AgentImageLoaderPlugin拥有
-        ├── AgentImageBaseDriver--AgentImageLoaderPlugin拥有
-        ├── AgentImageModelConfig--AgentImageLoaderPlugin拥有
+        ├── ResourceId
+        └── AgentImage--AgentImageLoaderPlugin拥有
 
 启动事件链：
 StartWorkspace
-    -> Workspace Entity + WorkspaceAgents { Creating * N }
+    -> Workspace Entity + Workspace { states: Creating * N }
     -> StartWorkspaceResult::Ok
     -> LoadAgentImage * N
        -> LoadAgentImageResult * N
@@ -576,7 +579,9 @@ StartWorkspace
              -> AgentCreateRequest
                 -> AgentCreateResult
                    -> Failed或Workspace绑定Memory、InferenceSnapshot和ToolEnvironment
+                      -> Creating
+                      -> AgentInitializationCompleted
                       -> Ready
-        AgentPlugin创建成功时已经启动Base Driver并完成base.lua初始化命令
+        AgentPlugin创建成功后启动Base Driver；初始化失败通过LuaRuntimeTaskFinished进入Failed
             -> AgentVisibleResourceInjected | AgentVisibleResourceInjectionFailed
 ```

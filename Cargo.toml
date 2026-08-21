@@ -10,6 +10,8 @@ members = [
     "crates/mecs/log_plugin",
     "crates/mecs/server_plugin",
     "crates/margatroid/types",
+    "crates/margatroid/resource_id_plugin",
+    "crates/margatroid/lua_runtime_plugin",
     "crates/margatroid/compose",
     "crates/margatroid/protocol",
     "crates/margatroid/config_plugin",

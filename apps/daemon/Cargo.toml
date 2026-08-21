@@ -19,8 +19,10 @@ config_plugin = { path = "../../crates/margatroid/config_plugin" }
 dto_plugin = { path = "../../crates/margatroid/dto_plugin" }
 inference_plugin = { path = "../../crates/margatroid/inference_plugin" }
 log_plugin = { path = "../../crates/mecs/log_plugin" }
+lua_runtime_plugin = { path = "../../crates/margatroid/lua_runtime_plugin" }
 memory_plugin = { path = "../../crates/margatroid/memory_plugin" }
 mcl_plugin = { path = "../../crates/margatroid/mcl_plugin" }
+resource_id_plugin = { path = "../../crates/margatroid/resource_id_plugin" }
 server_plugin = { path = "../../crates/mecs/server_plugin" }
 tool_plugin = { path = "../../crates/margatroid/tool_plugin" }
 tracing = { workspace = true }

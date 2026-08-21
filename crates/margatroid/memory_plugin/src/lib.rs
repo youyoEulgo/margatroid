@@ -4,14 +4,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agent_plugin::{Agent, AgentMemoryStore, AgentMemoryStoreError};
 use app_runtime_plugin::RuntimePlugin;
-use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
+use core_plugin::{App, Entity, Event, Plugin, Resource, World};
 use margatroid_types::{
     AgentHistoryMessageWriteRequested, AgentRealtimeContextReadCompleted,
-    AgentRealtimeContextReadRequested, AgentRealtimeContextWriteRequested, AgentRealtimeMessage,
-    Message, TokenUsage, ToolDefinition,
+    AgentRealtimeContextReadRequested, AgentRealtimeContextWriteRequested, MclMessage, Message,
+    TokenUsage, ToolDefinition,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+
+pub use agent_plugin::HistoryMessage;
 
 const HISTORY_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS history_messages (
@@ -48,8 +51,6 @@ pub enum MemoryErrorKind {
     DecodeFailed,
     AgentNotAlive,
     AgentMemoryMissing,
-    AlreadyBound,
-    PluginMissing,
     WriteFailed,
 }
 
@@ -141,16 +142,6 @@ pub struct AgentMemory {
     connection: Mutex<Connection>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct HistoryMessage {
-    pub sequence: i64,
-    pub turn_id: String,
-    pub message: Message,
-    pub tool_schema: Vec<ToolDefinition>,
-    pub usage: Option<TokenUsage>,
-    pub created_at_ms: i64,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RealtimeContext {
     pub messages: Vec<Message>,
@@ -216,7 +207,100 @@ impl AgentMemory {
     }
 }
 
-impl Component for AgentMemory {}
+impl AgentMemoryStore for AgentMemory {
+    fn append_history(
+        &self,
+        turn_id: &str,
+        message: &Message,
+        tool_schema: &[ToolDefinition],
+        usage: Option<&TokenUsage>,
+    ) -> Result<(), AgentMemoryStoreError> {
+        let mut connection = lock_connection(self).map_err(memory_store_error)?;
+        let transaction = connection.transaction().map_err(|error| {
+            memory_store_error(MemoryError::new(
+                MemoryErrorKind::WriteFailed,
+                error.to_string(),
+            ))
+        })?;
+        insert_history_message_values(
+            &transaction,
+            turn_id,
+            message,
+            tool_schema,
+            usage,
+            current_unix_milliseconds().map_err(memory_store_error)?,
+        )
+        .map_err(memory_store_error)?;
+        transaction.commit().map_err(|error| {
+            memory_store_error(MemoryError::new(
+                MemoryErrorKind::WriteFailed,
+                error.to_string(),
+            ))
+        })
+    }
+
+    fn rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError> {
+        let mut connection = lock_connection(self).map_err(memory_store_error)?;
+        let transaction = connection.transaction().map_err(|error| {
+            memory_store_error(MemoryError::new(
+                MemoryErrorKind::WriteFailed,
+                error.to_string(),
+            ))
+        })?;
+        let entries = messages
+            .iter()
+            .cloned()
+            .map(|entry| MclMessage {
+                message: entry.message,
+                usage: entry.usage,
+            })
+            .collect::<Vec<_>>();
+        rewrite_realtime_context(&transaction, &entries).map_err(memory_store_error)?;
+        transaction.commit().map_err(|error| {
+            memory_store_error(MemoryError::new(
+                MemoryErrorKind::WriteFailed,
+                error.to_string(),
+            ))
+        })
+    }
+
+    fn read_realtime(&self) -> Result<Vec<MclMessage>, AgentMemoryStoreError> {
+        let connection = lock_connection(self).map_err(memory_store_error)?;
+        load_ordered_realtime_messages(&connection)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| MclMessage {
+                        message: entry.message,
+                        usage: entry.usage,
+                    })
+                    .collect()
+            })
+            .map_err(memory_store_error)
+    }
+
+    fn history_messages(&self) -> Result<Vec<HistoryMessage>, AgentMemoryStoreError> {
+        AgentMemory::history_messages(self).map_err(memory_store_error)
+    }
+}
+
+fn memory_store_error(error: MemoryError) -> AgentMemoryStoreError {
+    AgentMemoryStoreError {
+        kind: format!("{:?}", error.kind()),
+        message: error.message().to_owned(),
+    }
+}
+
+fn handle_store_error(error: AgentMemoryStoreError) -> MemoryError {
+    MemoryError::new(
+        match error.kind.as_str() {
+            "WriteFailed" => MemoryErrorKind::WriteFailed,
+            "ReadFailed" => MemoryErrorKind::ReadFailed,
+            _ => MemoryErrorKind::AgentMemoryMissing,
+        },
+        error.message,
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentMemoryWriteFailed {
@@ -226,47 +310,6 @@ pub struct AgentMemoryWriteFailed {
 
 impl Event for AgentMemoryWriteFailed {}
 
-pub trait WorldMemoryExt {
-    fn bind_agent_memory(
-        &mut self,
-        agent: Entity,
-        memory: AgentMemory,
-        context: &RealtimeContext,
-    ) -> Result<(), MemoryError>;
-}
-
-impl WorldMemoryExt for World {
-    fn bind_agent_memory(
-        &mut self,
-        agent: Entity,
-        memory: AgentMemory,
-        context: &RealtimeContext,
-    ) -> Result<(), MemoryError> {
-        require_plugin(self)?;
-        if !self.is_alive(agent) {
-            return Err(MemoryError::new(
-                MemoryErrorKind::AgentNotAlive,
-                "agent entity is not alive",
-            ));
-        }
-        if self.contains_component::<AgentMemory>(agent) {
-            return Err(MemoryError::new(
-                MemoryErrorKind::AlreadyBound,
-                "agent already has memory",
-            ));
-        }
-
-        let _ = context;
-        if !self.insert_component(agent, memory) {
-            return Err(MemoryError::new(
-                MemoryErrorKind::AgentNotAlive,
-                "agent entity is not alive",
-            ));
-        }
-        Ok(())
-    }
-}
-
 fn validate_path(path: &Path) -> Result<(), MemoryError> {
     if path.as_os_str().is_empty() || path.file_name().is_none() {
         return Err(MemoryError::new(
@@ -275,17 +318,6 @@ fn validate_path(path: &Path) -> Result<(), MemoryError> {
         ));
     }
     Ok(())
-}
-
-fn require_plugin(world: &World) -> Result<(), MemoryError> {
-    if world.contains_resource::<MemoryPluginInstalled>() {
-        Ok(())
-    } else {
-        Err(MemoryError::new(
-            MemoryErrorKind::PluginMissing,
-            "MemoryPlugin is not installed",
-        ))
-    }
 }
 
 fn lock_connection<'a>(
@@ -549,7 +581,7 @@ fn migrate_realtime(transaction: &Transaction<'_>) -> Result<(), MemoryError> {
         &context
             .ordered_messages
             .into_iter()
-            .map(|message| AgentRealtimeMessage {
+            .map(|message| MclMessage {
                 message,
                 usage: None,
             })
@@ -734,9 +766,7 @@ fn load_realtime_context(connection: &Connection) -> Result<RealtimeContext, Mem
     })
 }
 
-fn load_ordered_realtime_messages(
-    connection: &Connection,
-) -> Result<Vec<AgentRealtimeMessage>, MemoryError> {
+fn load_ordered_realtime_messages(connection: &Connection) -> Result<Vec<MclMessage>, MemoryError> {
     let mut statement = connection
         .prepare("SELECT position, message, input_tokens, output_tokens, cache_hit_tokens FROM realtime_context ORDER BY position")
         .map_err(read_error)?;
@@ -795,14 +825,14 @@ fn load_ordered_realtime_messages(
                 ))
             }
         };
-        messages.push(AgentRealtimeMessage { message, usage });
+        messages.push(MclMessage { message, usage });
     }
     Ok(messages)
 }
 
 fn rewrite_realtime_context(
     transaction: &Transaction<'_>,
-    ordered_messages: &[AgentRealtimeMessage],
+    ordered_messages: &[MclMessage],
 ) -> Result<(), MemoryError> {
     transaction
         .execute("DELETE FROM realtime_context", [])
@@ -828,21 +858,6 @@ fn rewrite_realtime_context(
             .map_err(write_error)?;
     }
     Ok(())
-}
-
-fn insert_history_message(
-    transaction: &Transaction<'_>,
-    event: &AgentHistoryMessageWriteRequested,
-    created_at_ms: i64,
-) -> Result<(), MemoryError> {
-    insert_history_message_values(
-        transaction,
-        &event.id,
-        &event.message,
-        &event.tool_schema,
-        event.usage.as_ref(),
-        created_at_ms,
-    )
 }
 
 fn insert_history_message_values(
@@ -983,18 +998,16 @@ fn sync_realtime_context(
             "agent entity is not alive",
         ));
     }
-    let memory = world
-        .get_component::<AgentMemory>(event.agent)
-        .ok_or_else(|| {
-            MemoryError::new(
-                MemoryErrorKind::AgentMemoryMissing,
-                "agent does not have memory",
-            )
-        })?;
-    let mut connection = lock_connection(memory)?;
-    let transaction = connection.transaction().map_err(write_error)?;
-    rewrite_realtime_context(&transaction, &event.messages)?;
-    transaction.commit().map_err(write_error)
+    let agent = world.get_component::<Agent>(event.agent).ok_or_else(|| {
+        MemoryError::new(
+            MemoryErrorKind::AgentMemoryMissing,
+            "agent does not have memory",
+        )
+    })?;
+    agent
+        .memory
+        .rewrite_realtime(&event.messages)
+        .map_err(handle_store_error)
 }
 
 fn read_realtime_context_system(world: &mut World) {
@@ -1005,16 +1018,13 @@ fn read_realtime_context_system(world: &mut World) {
         .collect::<Vec<_>>();
     for request in requests {
         let result = (|| {
-            let memory = world
-                .get_component::<AgentMemory>(request.agent)
-                .ok_or_else(|| {
-                    MemoryError::new(
-                        MemoryErrorKind::AgentMemoryMissing,
-                        "agent does not have memory",
-                    )
-                })?;
-            let connection = lock_connection(memory)?;
-            Ok(load_ordered_realtime_messages(&connection)?)
+            let agent = world.get_component::<Agent>(request.agent).ok_or_else(|| {
+                MemoryError::new(
+                    MemoryErrorKind::AgentMemoryMissing,
+                    "agent does not have memory",
+                )
+            })?;
+            agent.memory.read_realtime().map_err(handle_store_error)
         })();
         world.emit_event(AgentRealtimeContextReadCompleted {
             id: request.id,
@@ -1051,18 +1061,21 @@ fn sync_history_message(
             "agent entity is not alive",
         ));
     }
-    let memory = world
-        .get_component::<AgentMemory>(event.agent)
-        .ok_or_else(|| {
-            MemoryError::new(
-                MemoryErrorKind::AgentMemoryMissing,
-                "agent does not have memory",
-            )
-        })?;
-    let mut connection = lock_connection(memory)?;
-    let transaction = connection.transaction().map_err(write_error)?;
-    insert_history_message(&transaction, event, current_unix_milliseconds()?)?;
-    transaction.commit().map_err(write_error)
+    let agent = world.get_component::<Agent>(event.agent).ok_or_else(|| {
+        MemoryError::new(
+            MemoryErrorKind::AgentMemoryMissing,
+            "agent does not have memory",
+        )
+    })?;
+    agent
+        .memory
+        .append_history(
+            &event.id,
+            &event.message,
+            &event.tool_schema,
+            event.usage.as_ref(),
+        )
+        .map_err(handle_store_error)
 }
 
 #[cfg(test)]
@@ -1070,6 +1083,7 @@ mod tests {
     use super::*;
     use core_plugin::App;
     use margatroid_types::ResourceId;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn test_app() -> App {
@@ -1079,13 +1093,58 @@ mod tests {
         app
     }
 
+    fn attach_agent(world: &mut World, memory: AgentMemory) -> Entity {
+        let entity = world.spawn();
+        let workspace = world.spawn();
+        let image = world.spawn();
+        let model = agent_plugin::AgentModelInfo {
+            provider: "test".to_owned(),
+            model: "test".to_owned(),
+            context_window_tokens: 1024,
+        };
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        world.insert_component(
+            entity,
+            agent_plugin::Agent {
+                info: agent_plugin::AgentInfo {
+                    image_entity: image,
+                    workspace_id: workspace,
+                    model: model.clone(),
+                    project_root: Default::default(),
+                    image_root: Default::default(),
+                    home_root: Default::default(),
+                    image_dependencies: Default::default(),
+                    image_sources: Default::default(),
+                },
+                creation: agent_plugin::AgentCreationState {
+                    request_id: "test".to_owned(),
+                    reply: agent_plugin::AgentCreateReply::new(sender),
+                    initialization: Default::default(),
+                },
+                mcl: Default::default(),
+                resources: Default::default(),
+                memory: agent_plugin::AgentMemoryHandle::new(Arc::new(memory)),
+                inference: agent_plugin::AgentInferenceState {
+                    model,
+                    pending: Default::default(),
+                },
+                tools: Default::default(),
+                lua: Default::default(),
+                lifecycle: agent_plugin::AgentLifecycleState::Running,
+                turn: Default::default(),
+                token_usage: Default::default(),
+                last_error: None,
+            },
+        );
+        entity
+    }
+
     #[test]
     fn open_creates_schema_and_restores_realtime_messages() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("memory.sql");
         let (memory, _) = AgentMemory::open(&path).unwrap();
         let mut app = test_app();
-        let agent = app.world_mut().spawn();
         let context = RealtimeContext {
             messages: vec![Message::User {
                 content: "restored".into(),
@@ -1108,16 +1167,14 @@ mod tests {
             token_usage: TokenUsage::default(),
             last_input_tokens: 0,
         };
-        app.world_mut()
-            .bind_agent_memory(agent, memory, &context)
-            .unwrap();
+        let agent = attach_agent(app.world_mut(), memory);
         app.world().emit_event(AgentRealtimeContextWriteRequested {
             agent,
             messages: context
                 .ordered_messages
                 .iter()
                 .cloned()
-                .map(|message| AgentRealtimeMessage {
+                .map(|message| MclMessage {
                     message,
                     usage: None,
                 })
@@ -1135,10 +1192,7 @@ mod tests {
         let path = directory.path().join("memory.sql");
         let (memory, _) = AgentMemory::open(&path).unwrap();
         let mut app = test_app();
-        let agent = app.world_mut().spawn();
-        app.world_mut()
-            .bind_agent_memory(agent, memory, &RealtimeContext::default())
-            .unwrap();
+        let agent = attach_agent(app.world_mut(), memory);
         for (index, message) in [
             Message::User {
                 content: "hello".into(),
@@ -1180,8 +1234,8 @@ mod tests {
         }
         app.tick();
 
-        let memory = app.world().get_component::<AgentMemory>(agent).unwrap();
-        let history = memory.history_messages().unwrap();
+        let memory = app.world().get_component::<Agent>(agent).unwrap();
+        let history = memory.memory.history_messages().unwrap();
         assert_eq!(history.len(), 3);
         assert!(matches!(history[0].message, Message::User { .. }));
         assert_eq!(history[0].usage, None);
@@ -1221,24 +1275,10 @@ mod tests {
         let path = directory.path().join("memory.sql");
         let (memory, _) = AgentMemory::open(&path).unwrap();
         let mut app = test_app();
-        let agent = app.world_mut().spawn();
-        let original = RealtimeContext {
-            messages: vec![Message::User {
-                content: "keep".into(),
-            }],
-            tool_context: Vec::new(),
-            ordered_messages: vec![Message::User {
-                content: "keep".into(),
-            }],
-            token_usage: TokenUsage::default(),
-            last_input_tokens: 0,
-        };
-        app.world_mut()
-            .bind_agent_memory(agent, memory, &original)
-            .unwrap();
+        let agent = attach_agent(app.world_mut(), memory);
         app.world().emit_event(AgentRealtimeContextWriteRequested {
             agent,
-            messages: vec![AgentRealtimeMessage {
+            messages: vec![MclMessage {
                 message: Message::User {
                     content: "keep".into(),
                 },
@@ -1248,7 +1288,7 @@ mod tests {
         app.tick();
         app.world().emit_event(AgentRealtimeContextWriteRequested {
             agent,
-            messages: vec![AgentRealtimeMessage {
+            messages: vec![MclMessage {
                 message: Message::User {
                     content: "new".into(),
                 },

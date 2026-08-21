@@ -1,16 +1,20 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agent_plugin::{Agent, AgentResourceEntry, AgentToolPending};
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
-use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, ToolCall,
-};
+use margatroid_types::{AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolErrorKind {
+    AgentMissing,
+    ResourceMapMissing,
+    InvalidResource,
+    ResourceUnavailable,
+    RegistrationFailed,
+    ToolCallMissing,
     InvalidDefinition,
     ProviderMissing,
     ResourceResolutionFailed,
@@ -18,6 +22,7 @@ pub enum ToolErrorKind {
     ToolEnvironmentMissing,
     ToolPluginMissing,
     ToolAlreadyRegistered,
+    DuplicateResource,
     InvalidRequest,
     InvalidArguments,
     ExecutionFailed,
@@ -89,6 +94,11 @@ pub struct ToolTemplate {
     pub parameters: serde_json::Value,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResourceContent {
+    Prompt { role: String, content: Arc<str> },
+}
+
 impl ToolTemplate {
     pub fn new(
         name: impl Into<String>,
@@ -106,134 +116,35 @@ impl ToolTemplate {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ToolMap {
-    pub tool_name: String,
+pub struct ResourceMapEntry {
+    pub resource_id: ResourceId,
+    pub resource_name: String,
     pub alias: Option<String>,
-    pub tool_id: ResourceId,
-    pub resource_id: ResourceId,
-    pub template: ToolTemplate,
+    pub tool_id: Option<ResourceId>,
+    pub template: Option<ToolTemplate>,
+    pub content: Option<ResourceContent>,
 }
-
-#[derive(Default)]
-pub struct AgentToolMap {
-    next_index: u64,
-    tools: Vec<ToolMap>,
-    aliases: HashMap<ResourceId, String>,
-}
-
-impl AgentToolMap {
-    pub fn get_by_name(&self, tool_name: &str) -> Option<&ToolMap> {
-        self.tools.iter().find(|map| map.tool_name == tool_name)
-    }
-
-    pub fn get_by_tool(&self, tool_id: &ResourceId) -> Vec<&ToolMap> {
-        self.tools
-            .iter()
-            .filter(|map| &map.tool_id == tool_id)
-            .collect()
-    }
-
-    pub fn get_by_resource(&self, resource_id: &ResourceId) -> Vec<&ToolMap> {
-        self.tools
-            .iter()
-            .filter(|map| &map.resource_id == resource_id)
-            .collect()
-    }
-
-    pub fn register(
-        &mut self,
-        tool_id: ResourceId,
-        resource_id: ResourceId,
-        mut template: ToolTemplate,
-    ) -> Result<&ToolMap, ToolError> {
-        if !self.get_by_resource(&resource_id).is_empty() {
-            return Err(ToolError::new(
-                ToolErrorKind::ToolAlreadyRegistered,
-                "resource is already registered for this Agent",
-            ));
-        }
-        let alias = self.aliases.get(&resource_id).cloned();
-        let tool_name = alias.clone().unwrap_or_else(|| {
-            generated_tool_name(
-                resource_id.resource_type(),
-                self.next_index,
-                resource_id.name(),
-            )
-        });
-        self.next_index = self.next_index.checked_add(1).ok_or_else(|| {
-            ToolError::new(
-                ToolErrorKind::InvalidDefinition,
-                "Agent tool index is exhausted",
-            )
-        })?;
-        template.name = tool_name.clone();
-        validate_template(&template)?;
-        self.tools.push(ToolMap {
-            tool_name,
-            alias,
-            tool_id,
-            resource_id,
-            template,
-        });
-        Ok(self.tools.last().expect("ToolMap was just inserted"))
-    }
-
-    pub fn set_alias(&mut self, resource_id: ResourceId, alias: String) -> Result<(), ToolError> {
-        if alias.trim().is_empty()
-            || self
-                .tools
-                .iter()
-                .any(|map| map.resource_id != resource_id && map.tool_name == alias)
-            || self
-                .aliases
-                .iter()
-                .any(|(id, existing)| id != &resource_id && existing == &alias)
-        {
-            return Err(ToolError::new(
-                ToolErrorKind::InvalidDefinition,
-                "resource alias is empty or already used by this Agent",
-            ));
-        }
-        self.aliases.insert(resource_id.clone(), alias.clone());
-        if let Some(map) = self
-            .tools
-            .iter_mut()
-            .find(|map| map.resource_id == resource_id)
-        {
-            map.tool_name = alias.clone();
-            map.alias = Some(alias.clone());
-            map.template.name = alias;
-            validate_template(&map.template)?;
-        }
-        Ok(())
-    }
-}
-impl Component for AgentToolMap {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentToolRegisterRequest {
+pub struct AgentResourceRegisterRequest {
     pub id: String,
     pub agent: Entity,
     pub resource_id: ResourceId,
+    pub alias: Option<String>,
 }
-impl Event for AgentToolRegisterRequest {}
+impl Event for AgentResourceRegisterRequest {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentToolRegisterResponse {
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentResourceRegisterResponse {
     pub id: String,
     pub agent: Entity,
     pub resource_id: ResourceId,
-    pub result: Result<(), ToolError>,
+    pub alias: Option<String>,
+    pub result: Result<ResourceMapEntry, ToolError>,
 }
-impl Event for AgentToolRegisterResponse {}
+impl Event for AgentResourceRegisterResponse {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolCallEvent {
-    pub turn_id: String,
-    pub agent: Entity,
-    pub call: ToolCall,
-}
-impl Event for ToolCallEvent {}
+pub use margatroid_types::ToolCallEvent;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallRequest {
@@ -254,13 +165,6 @@ pub struct ToolCallResponse {
     pub result: Result<String, ToolError>,
 }
 impl Event for ToolCallResponse {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolTurnCompleted {
-    pub turn_id: String,
-    pub agent: Entity,
-}
-impl Event for ToolTurnCompleted {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CancelToolTurn {
@@ -316,123 +220,125 @@ impl Plugin for ToolPlugin {
             .panic();
         }
         app.world_mut().insert_resource(ToolPluginInstalled);
-        app.world_mut().insert_resource(PendingToolCalls::default());
         app.add_system(&self.schedule, tool_call_route_system)
             .add_system(&self.schedule, cancel_tool_turn_system)
             .add_system(&self.schedule, tool_call_response_system);
     }
 }
 
-pub fn attach_agent_tool_map(world: &mut World, agent: Entity) -> Result<(), ToolError> {
-    if !world.is_alive(agent) {
+pub fn register_agent_resource(
+    world: &mut World,
+    agent: Entity,
+    entry: ResourceMapEntry,
+) -> Result<ResourceMapEntry, ToolError> {
+    let tool_id = entry.tool_id.clone().ok_or_else(|| {
+        ToolError::new(
+            ToolErrorKind::InvalidDefinition,
+            "resource mapping is not executable",
+        )
+    })?;
+    let template = entry.template.clone().ok_or_else(|| {
+        ToolError::new(
+            ToolErrorKind::InvalidDefinition,
+            "executable resource has no tool template",
+        )
+    })?;
+    let agent_state = world.get_component_mut::<Agent>(agent).ok_or_else(|| {
+        ToolError::new(ToolErrorKind::AgentNotAlive, "Agent component is missing")
+    })?;
+    agent_state
+        .resources
+        .register_tool(AgentResourceEntry {
+            resource_id: entry.resource_id.clone(),
+            resource_name: entry.resource_name.clone(),
+            tool_id,
+            description: template.description,
+            parameters: template.parameters,
+        })
+        .map_err(|error| ToolError::new(ToolErrorKind::DuplicateResource, error.to_string()))?;
+    Ok(entry)
+}
+
+pub fn candidate_resource_entry(
+    resource_id: ResourceId,
+    alias: Option<String>,
+    tool_id: ResourceId,
+    mut template: ToolTemplate,
+) -> Result<ResourceMapEntry, ToolError> {
+    let resource_name = alias.clone().unwrap_or_else(|| resource_id.to_string());
+    if resource_name.trim().is_empty() {
         return Err(ToolError::new(
-            ToolErrorKind::AgentNotAlive,
-            "Agent entity is not alive",
+            ToolErrorKind::InvalidDefinition,
+            "resource name is empty",
         ));
     }
-    if world.get_component::<AgentToolMap>(agent).is_some()
-        || !world.insert_component(agent, AgentToolMap::default())
-    {
-        return Err(ToolError::new(
-            ToolErrorKind::ToolAlreadyRegistered,
-            "AgentToolMap is already attached",
-        ));
+    template.name = resource_name.clone();
+    validate_template(&template)?;
+    Ok(ResourceMapEntry {
+        resource_id,
+        resource_name,
+        alias,
+        tool_id: Some(tool_id),
+        template: Some(template),
+        content: None,
+    })
+}
+
+/// Resolve the provider-neutral tool snapshot for one inference request.
+/// Visibility is deliberately evaluated at the call site so a later import
+/// or visibility change cannot mutate an already submitted request.
+pub fn resolve_agent_tool_definitions(
+    world: &World,
+    agent: Entity,
+    resources: &[ResourceId],
+) -> Result<Vec<margatroid_types::ToolDefinition>, ToolError> {
+    if resources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let agent_state = world.get_component::<Agent>(agent).ok_or_else(|| {
+        ToolError::new(ToolErrorKind::AgentNotAlive, "Agent component is missing")
+    })?;
+    let mut definitions = Vec::with_capacity(resources.len());
+    for resource_id in resources {
+        let entries = agent_state.resources.tools_by_resource(resource_id);
+        if entries.len() != 1 {
+            return Err(ToolError::new(
+                ToolErrorKind::ResourceResolutionFailed,
+                "visible resource is not registered exactly once",
+            ));
+        }
+        let entry = entries[0];
+        definitions.push(margatroid_types::ToolDefinition {
+            name: entry.resource_name.clone(),
+            description: entry.description.clone(),
+            input_schema: entry.parameters.clone(),
+        });
+    }
+    Ok(definitions)
+}
+
+pub fn validate_agent_tool_calls(
+    world: &World,
+    agent: Entity,
+    calls: &[margatroid_types::ToolCall],
+) -> Result<(), ToolError> {
+    let agent_state = world.get_component::<Agent>(agent).ok_or_else(|| {
+        ToolError::new(ToolErrorKind::AgentNotAlive, "Agent component is missing")
+    })?;
+    for call in calls {
+        if agent_state
+            .resources
+            .tool_by_name(&call.tool_name)
+            .is_none()
+        {
+            return Err(ToolError::new(
+                ToolErrorKind::ResourceResolutionFailed,
+                "tool call is not registered for this Agent",
+            ));
+        }
     }
     Ok(())
 }
-
-pub fn register_agent_tool(
-    world: &mut World,
-    agent: Entity,
-    tool_id: ResourceId,
-    resource_id: ResourceId,
-    template: ToolTemplate,
-) -> Result<ToolMap, ToolError> {
-    let map = world
-        .get_component_mut::<AgentToolMap>(agent)
-        .ok_or_else(|| {
-            ToolError::new(
-                ToolErrorKind::ToolPluginMissing,
-                "AgentToolMap is not attached",
-            )
-        })?
-        .register(tool_id, resource_id, template)?
-        .clone();
-    Ok(map)
-}
-
-pub fn set_agent_tool_alias(
-    world: &mut World,
-    agent: Entity,
-    resource_id: ResourceId,
-    alias: String,
-) -> Result<(), ToolError> {
-    world
-        .get_component_mut::<AgentToolMap>(agent)
-        .ok_or_else(|| {
-            ToolError::new(
-                ToolErrorKind::ToolPluginMissing,
-                "AgentToolMap is not attached",
-            )
-        })?
-        .set_alias(resource_id, alias)
-}
-
-#[derive(Default)]
-struct PendingToolCalls {
-    calls: Vec<ToolCallRequest>,
-}
-
-impl PendingToolCalls {
-    fn get(&self, agent: Entity, turn_id: &str, tool_call_id: &str) -> Option<&ToolCallRequest> {
-        self.calls.iter().find(|request| {
-            request.agent == agent
-                && request.turn_id == turn_id
-                && request.tool_call_id == tool_call_id
-        })
-    }
-
-    fn get_by_turn(&self, agent: Entity, turn_id: &str) -> Vec<&ToolCallRequest> {
-        self.calls
-            .iter()
-            .filter(|request| request.agent == agent && request.turn_id == turn_id)
-            .collect()
-    }
-
-    fn add_pending(&mut self, request: ToolCallRequest) -> Result<(), ToolError> {
-        if self
-            .get(request.agent, &request.turn_id, &request.tool_call_id)
-            .is_some()
-        {
-            return Err(ToolError::new(
-                ToolErrorKind::InvalidRequest,
-                "tool call is already pending",
-            ));
-        }
-        self.calls.push(request);
-        Ok(())
-    }
-
-    fn remove(
-        &mut self,
-        agent: Entity,
-        turn_id: &str,
-        tool_call_id: &str,
-    ) -> Option<ToolCallRequest> {
-        let index = self.calls.iter().position(|request| {
-            request.agent == agent
-                && request.turn_id == turn_id
-                && request.tool_call_id == tool_call_id
-        })?;
-        Some(self.calls.remove(index))
-    }
-
-    fn remove_turn(&mut self, agent: Entity, turn_id: &str) {
-        self.calls
-            .retain(|request| request.agent != agent || request.turn_id != turn_id);
-    }
-}
-impl Resource for PendingToolCalls {}
 
 fn cancel_tool_turn_system(world: &mut World) {
     let cancellations = world
@@ -440,11 +346,12 @@ fn cancel_tool_turn_system(world: &mut World) {
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
-    let pending = world
-        .get_resource_mut::<PendingToolCalls>()
-        .expect("ToolPlugin is installed");
     for cancellation in cancellations {
-        pending.remove_turn(cancellation.agent, &cancellation.turn_id);
+        if let Some(agent) = world.get_component_mut::<Agent>(cancellation.agent) {
+            agent.tools.pending.retain(|(entity, turn_id, _), _| {
+                *entity != cancellation.agent || turn_id != &cancellation.turn_id
+            });
+        }
     }
 }
 
@@ -472,10 +379,9 @@ fn tool_call_route_system(world: &mut World) {
                     "tool arguments must be a JSON object",
                 )
             })?;
-            let map = world
-                .get_component::<AgentToolMap>(event.agent)
-                .and_then(|maps| maps.get_by_name(&event.call.tool_name))
-                .cloned()
+            let entry = world
+                .get_component::<Agent>(event.agent)
+                .and_then(|agent| agent.resources.tool_by_name(&event.call.tool_name))
                 .ok_or_else(|| {
                     ToolError::new(
                         ToolErrorKind::InvalidRequest,
@@ -485,15 +391,36 @@ fn tool_call_route_system(world: &mut World) {
             let request = ToolCallRequest {
                 turn_id: event.turn_id.clone(),
                 agent: event.agent,
-                tool_id: map.tool_id,
-                resource_id: map.resource_id,
+                tool_id: entry.tool_id.clone(),
+                resource_id: entry.resource_id.clone(),
                 tool_call_id: event.call.id.clone(),
                 arguments: event.call.arguments.clone(),
             };
-            world
-                .get_resource_mut::<PendingToolCalls>()
-                .expect("ToolPlugin is installed")
-                .add_pending(request.clone())?;
+            let agent = world
+                .get_component_mut::<Agent>(event.agent)
+                .ok_or_else(|| {
+                    ToolError::new(ToolErrorKind::AgentNotAlive, "Agent component is missing")
+                })?;
+            let key = (
+                event.agent,
+                request.turn_id.clone(),
+                request.tool_call_id.clone(),
+            );
+            if agent.tools.pending.contains_key(&key) {
+                return Err(ToolError::new(
+                    ToolErrorKind::InvalidRequest,
+                    "tool call is already pending",
+                ));
+            }
+            agent.tools.pending.insert(
+                key,
+                AgentToolPending {
+                    turn_id: request.turn_id.clone(),
+                    tool_call_id: request.tool_call_id.clone(),
+                    resource_id: request.resource_id.clone(),
+                    tool_id: request.tool_id.clone(),
+                },
+            );
             world.send_event(request);
             Ok::<(), ToolError>(())
         })();
@@ -516,9 +443,14 @@ fn tool_call_response_system(world: &mut World) {
         .collect::<Vec<_>>();
     for response in responses {
         let request = world
-            .get_resource_mut::<PendingToolCalls>()
-            .expect("ToolPlugin is installed")
-            .remove(response.agent, &response.turn_id, &response.tool_call_id);
+            .get_component_mut::<Agent>(response.agent)
+            .and_then(|agent| {
+                agent.tools.pending.remove(&(
+                    response.agent,
+                    response.turn_id.clone(),
+                    response.tool_call_id.clone(),
+                ))
+            });
         let Some(request) = request else {
             continue;
         };
@@ -533,31 +465,7 @@ fn tool_call_response_system(world: &mut World) {
             },
             usage: None,
         });
-        let completed = world
-            .get_resource::<PendingToolCalls>()
-            .expect("ToolPlugin is installed")
-            .get_by_turn(response.agent, &response.turn_id)
-            .is_empty();
-        if completed {
-            world.send_event(ToolTurnCompleted {
-                turn_id: response.turn_id,
-                agent: response.agent,
-            });
-        }
     }
-}
-
-fn generated_tool_name(resource_type: &str, index: u64, resource_name: &str) -> String {
-    let mut name = format!("{resource_type}{index}_");
-    name.extend(resource_name.chars().map(|character| {
-        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
-            character
-        } else {
-            '_'
-        }
-    }));
-    name.truncate(64);
-    name
 }
 
 fn validate_template(template: &ToolTemplate) -> Result<(), ToolError> {
@@ -568,39 +476,4 @@ fn validate_template(template: &ToolTemplate) -> Result<(), ToolError> {
         ));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cancelling_a_turn_removes_only_its_pending_calls() {
-        let mut pending = PendingToolCalls::default();
-        let mut app = App::new();
-        let agent = app.world_mut().spawn();
-        let other_agent = app.world_mut().spawn();
-        for (turn_id, owner, tool_call_id) in [
-            ("turn-1", agent, "call-1"),
-            ("turn-2", agent, "call-2"),
-            ("turn-1", other_agent, "call-3"),
-        ] {
-            assert!(pending
-                .add_pending(ToolCallRequest {
-                    turn_id: turn_id.into(),
-                    agent: owner,
-                    tool_id: ResourceId::parse("tool:builtin/shell:latest").unwrap(),
-                    resource_id: ResourceId::parse("shell:local/bash:latest").unwrap(),
-                    tool_call_id: tool_call_id.into(),
-                    arguments: "{}".into(),
-                })
-                .is_ok());
-        }
-
-        pending.remove_turn(agent, "turn-1");
-
-        assert!(pending.get(agent, "turn-1", "call-1").is_none());
-        assert!(pending.get(agent, "turn-2", "call-2").is_some());
-        assert!(pending.get(other_agent, "turn-1", "call-3").is_some());
-    }
 }

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc::SyncSender, Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::{AppAsyncExt, AsyncRuntimeHandle, AsyncTaskError, WorldAsyncExt};
 use core_plugin::{App, Entity, Event, Plugin, Resource, World};
@@ -18,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tool_plugin::{
-    register_agent_tool, AgentToolEnvironment, ToolCallRequest, ToolCallResponse, ToolError,
+    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
     ToolErrorKind, ToolPluginInstalled, ToolTemplate,
 };
 
@@ -173,15 +174,17 @@ pub struct ShellRegisterRequest {
     pub id: String,
     pub agent: Entity,
     pub resource_id: ResourceId,
+    pub alias: Option<String>,
 }
 impl Event for ShellRegisterRequest {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ShellRegisterResponse {
     pub id: String,
     pub agent: Entity,
     pub resource_id: ResourceId,
-    pub result: Result<(), ToolError>,
+    pub alias: Option<String>,
+    pub result: Result<ResourceMapEntry, ToolError>,
 }
 impl Event for ShellRegisterResponse {}
 
@@ -637,6 +640,7 @@ fn shell_register_system(world: &mut World) {
             id: request.id,
             agent: request.agent,
             resource_id: request.resource_id,
+            alias: request.alias,
             result,
         });
     }
@@ -645,7 +649,7 @@ fn shell_register_system(world: &mut World) {
 fn register_shell_resource(
     world: &mut World,
     request: &ShellRegisterRequest,
-) -> Result<(), ToolError> {
+) -> Result<ResourceMapEntry, ToolError> {
     if request.id.is_empty() || !world.is_alive(request.agent) {
         return Err(ToolError::new(
             ToolErrorKind::InvalidRequest,
@@ -653,14 +657,12 @@ fn register_shell_resource(
         ));
     }
     validate_shell_resource(&request.resource_id)?;
-    let environment = world
-        .get_component::<AgentToolEnvironment>(request.agent)
-        .ok_or_else(|| {
-            ToolError::new(
-                ToolErrorKind::ToolEnvironmentMissing,
-                "agent tool environment is missing",
-            )
-        })?;
+    let agent = world.get_component::<Agent>(request.agent).ok_or_else(|| {
+        ToolError::new(
+            ToolErrorKind::ToolEnvironmentMissing,
+            "agent tool environment is missing",
+        )
+    })?;
     let roots = &world
         .get_resource::<ShellRoots>()
         .expect("ShellPlugin is installed")
@@ -668,7 +670,12 @@ fn register_shell_resource(
     let limits = world
         .get_resource::<ShellExecutionLimits>()
         .expect("ShellPlugin is installed");
-    let package_root = find_shell_package(environment, roots, &request.resource_id)?;
+    let package_root = find_shell_package(
+        &agent.info.project_root,
+        &agent.info.image_root,
+        roots,
+        &request.resource_id,
+    )?;
     let metadata = read_bounded_sync(
         &package_root.join(SHELL_FILE),
         limits.max_definition_bytes,
@@ -691,18 +698,16 @@ fn register_shell_resource(
         ));
     }
     let definition = parse_shell_definition(&metadata, &schema, &request.resource_id)?;
-    register_agent_tool(
-        world,
-        request.agent,
-        ResourceId::parse(SHELL_EXECUTOR_ID).expect("built-in Shell ID is valid"),
+    candidate_resource_entry(
         request.resource_id.clone(),
+        request.alias.clone(),
+        ResourceId::parse(SHELL_EXECUTOR_ID).expect("built-in Shell ID is valid"),
         ToolTemplate::new(
             request.resource_id.to_string(),
             definition.metadata.description,
             definition.parameters,
         )?,
-    )?;
-    Ok(())
+    )
 }
 
 fn shell_tool_call_prepare_system(world: &mut World) {
@@ -763,20 +768,19 @@ fn prepare_shell_tool_call(
             "Shell tool call request is invalid",
         ));
     }
-    let environment = world
-        .get_component::<AgentToolEnvironment>(request.agent)
-        .ok_or_else(|| {
-            ToolError::new(
-                ToolErrorKind::ToolEnvironmentMissing,
-                "agent tool environment is missing",
-            )
-        })?;
+    let agent = world.get_component::<Agent>(request.agent).ok_or_else(|| {
+        ToolError::new(
+            ToolErrorKind::ToolEnvironmentMissing,
+            "agent tool environment is missing",
+        )
+    })?;
     let roots = &world
         .get_resource::<ShellRoots>()
         .expect("ShellPlugin is installed")
         .home_root;
     let package_root = Arc::new(find_shell_package(
-        environment,
+        &agent.info.project_root,
+        &agent.info.image_root,
         roots,
         &request.resource_id,
     )?);
@@ -784,7 +788,7 @@ fn prepare_shell_tool_call(
         Arc::clone(&package_root),
         ShellCallContext {
             agent: request.agent,
-            project_root: Arc::new(environment.project_root().to_path_buf()),
+            project_root: Arc::new(agent.info.project_root.clone()),
             resource_id: request.resource_id.clone(),
         },
         limits,
@@ -970,17 +974,15 @@ fn shell_task_result_system(world: &mut World) {
 }
 
 fn find_shell_package(
-    environment: &AgentToolEnvironment,
+    project_root: &Path,
+    image_root: &Path,
     home_root: &Path,
     resource_id: &ResourceId,
 ) -> Result<PathBuf, ToolError> {
     validate_shell_resource(resource_id)?;
     let roots = [
-        environment
-            .project_root()
-            .join(".margatroid")
-            .join("shells"),
-        environment.image_root().join("shells"),
+        project_root.join(".margatroid").join("shells"),
+        image_root.join("shells"),
         home_root.to_path_buf(),
     ];
     for root in roots {

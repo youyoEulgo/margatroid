@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+agent_plugin = { path = "../../agent_plugin" }
 app_runtime_plugin = { path = "../../../mecs/app_runtime_plugin" }
 core_plugin = { path = "../../../mecs/core_plugin" }
 margatroid_types = { path = "../../types" }
@@ -13,6 +14,7 @@ toml = { workspace = true }
 tool_plugin = { path = "../../tool_plugin" }
 
 [dev-dependencies]
+tokio = { workspace = true }
 async_runtime_plugin = { path = "../../../mecs/async_runtime_plugin" }
 app_runtime_plugin = { path = "../../../mecs/app_runtime_plugin" }
 tempfile = "3"

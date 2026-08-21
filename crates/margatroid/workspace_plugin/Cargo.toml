@@ -11,11 +11,14 @@ builtin_tool_plugin = { path = "../builtin_tool_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
 inference_plugin = { path = "../inference_plugin" }
 margatroid_types = { path = "../types" }
+lua_runtime_plugin = { path = "../lua_runtime_plugin" }
 mcl_plugin = { path = "../mcl_plugin" }
+resource_id_plugin = { path = "../resource_id_plugin" }
 memory_plugin = { path = "../memory_plugin" }
 serde_json = { workspace = true }
 tool_plugin = { path = "../tool_plugin" }
 tracing = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }

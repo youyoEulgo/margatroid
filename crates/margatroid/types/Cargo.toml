@@ -5,5 +5,6 @@ edition = "2021"
 
 [dependencies]
 core_plugin = { path = "../../mecs/core_plugin" }
+resource_id_plugin = { path = "../resource_id_plugin" }
 serde = { workspace = true }
 serde_json = { workspace = true }
