@@ -79,6 +79,7 @@ AgentCreateRequest：Agent创建请求，公开事件--Workspace交付创建Agen
     id: String--创建请求ID
     agent_id: ResourceId--稳定Agent资源ID，创建时作为独立Component挂载
     workspace_id: Entity--所属Workspace Entity
+    image_entity: Entity--创建该Agent时使用的AgentImage Entity
     base_lua: LuaProgram--Agent镜像提供的Base Lua程序
     project_root: PathBuf--项目根目录
     image_root: PathBuf--Agent镜像根目录
@@ -124,6 +125,11 @@ AgentCreateReply：Agent创建回执，公开结构体
 
 AgentControlKind：Agent生命周期控制类型，公开枚举--由agent_control_system路由到对应Handler，不承载MCL Block操作
     Stop
+    AbortTurn
+    InjectVisibility { resource_id: ResourceId }
+    RemoveVisibility { resource_id: ResourceId }
+    RestoreDefaultVisibility
+    RemoveAllVisibility
 
 AgentControlReply：Agent控制回执，公开结构体
     sender: Arc<Mutex<Option<oneshot::Sender<Result<(), AgentError>>>>>--私有一次性发送器槽位
@@ -190,7 +196,6 @@ crate公开：
 AgentMcl：MCL数据，公开结构体--Agent持有的MCL运行时存储，由自身封装Block和RefBlock的机械存取
     blocks: BlockAssembly--真实Block程序集，私有
     ref_blocks: RefBlockAssembly--引用Block程序集，私有
-    values: HashMap<String, MclValue>--MCL运行时辅助数据，私有
     realtime_source: Option<MclRealtimeSource>--MclPlugin声明的实时上下文Message RefMerge来源；未声明时为空
     blocks(&self) -> &BlockAssembly
         读取真实Block程序集：公开方法
@@ -222,7 +227,28 @@ AgentMcl：MCL数据，公开结构体--Agent持有的MCL运行时存储，由�
     set_realtime_source(&mut self, source: MclRealtimeSource)
         设置实时来源：crate公开方法，用新声明整体替换旧来源；MclPlugin必须在调用前完成RefMerge验证和当前快照展开
 
-AgentResourceMap：Agent资源数据，crate公开结构体--实际字段与行为由ToolPlugin定义，Agent只持有唯一实例
+AgentResourceMap：Agent资源数据，crate公开结构体--ToolPlugin写入的唯一Agent资源聚合；不再挂载独立工具映射Component
+    resources: BTreeMap<ResourceId, bool>--已通过IMPORT验证的资源及可用状态
+    aliases: HashMap<String, ResourceId>--Agent内别名到完整资源ID
+    visible: BTreeSet<ResourceId>--当前可见资源
+    default_visible: BTreeSet<ResourceId>--默认可见资源
+    tool_entries: Vec<AgentResourceEntry>--已注册的可执行资源候选及Provider无关ToolSpec
+
+AgentResourceEntry：Agent可执行资源条目，crate公开结构体--ToolPlugin注册成功后写入Agent.resources
+    resource_id: ResourceId--具体资源完整ID
+    resource_name: String--当前Agent内模型可见名称
+    tool_id: ResourceId--实际执行该资源的隐藏内建工具
+    description: String--模型可见工具说明
+    parameters: serde_json::Value--Provider无关JSON Schema
+
+HistoryMessage：可展示历史条目，crate公开结构体--MemoryPlugin实现AgentMemoryStore时读取的展示历史行
+    sequence: i64--单Agent永久递增序号
+    turn_id: String--原AgentMessage.id
+    message: Message--User、Assistant或Tool
+    tool_schema: Vec<ToolDefinition>--该Assistant产生时实际发送的内部ToolSpec；User和Tool为空
+    usage: Option<TokenUsage>--Assistant行的输入、输出和缓存命中Token；User和Tool为空
+    created_at_ms: i64--写入时Unix毫秒时间
+    impl Clone + PartialEq for HistoryMessage
 
 AgentMemoryHandle：Agent存储数据，crate公开结构体--MemoryPlugin创建的可克隆存储句柄
     inner: Arc<dyn AgentMemoryStore>--历史与实时存储接口
@@ -232,6 +258,8 @@ AgentMemoryHandle：Agent存储数据，crate公开结构体--MemoryPlugin创建
         覆盖实时上下文：crate公开方法，转发完整快照给inner
     read_realtime(&self) -> Result<Vec<MclMessage>, AgentMemoryStoreError>
         读取实时上下文：crate公开方法，返回完整有序快照
+    history_messages(&self) -> Result<Vec<HistoryMessage>, AgentMemoryStoreError>
+        读取展示历史：crate公开方法，转发给inner
     impl Clone for AgentMemoryHandle
 
 AgentMemoryStore：Agent存储接口，crate公开trait--由MemoryPlugin实现，types crate只定义协议
@@ -239,6 +267,7 @@ AgentMemoryStore：Agent存储接口，crate公开trait--由MemoryPlugin实现�
     append_history(&self, turn_id: &str, message: &Message, tool_schema: &[ToolDefinition], usage: Option<&TokenUsage>) -> Result<(), AgentMemoryStoreError>
     rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError>
     read_realtime(&self) -> Result<Vec<MclMessage>, AgentMemoryStoreError>
+    history_messages(&self) -> Result<Vec<HistoryMessage>, AgentMemoryStoreError>
 
 AgentMemoryStoreError：Agent存储接口错误，crate公开结构体--不包含数据库内容、SQL或消息正文
     kind: String--稳定有限分类，由MemoryPlugin转换为MemoryErrorKind
@@ -247,23 +276,10 @@ AgentMemoryStoreError：Agent存储接口错误，crate公开结构体--不包�
 
 AgentInferenceState：Agent推理数据，crate公开结构体--InferencePlugin读写的模型配置和飞行中请求
     model: AgentModelInfo--当前模型静态信息
-    pending: HashMap<String, AgentInferencePending>--请求ID到ToolSpec快照和取消信息
+    pending: HashMap<(Entity, String), AgentInferencePending>--按Agent和请求ID定位ToolSpec快照和取消信息
 
 AgentToolState：Agent工具数据，crate公开结构体--ToolPlugin读写的飞行中工具调用关联
-    pending: HashMap<String, AgentToolPending>--tool_call_id到执行定位和取消信息
-
-AgentRuntimeContext：Agent运行时环境，crate公开结构体--创建时注入LuaRuntimePlugin的显式环境数据
-    resource_id: ResourceId--Entity独立身份组件的副本
-    agent_info: AgentInfo--Agent中的只读静态信息；环境提供器将resource_id作为id字段与其组合后注入Lua
-    mcl_provider: AgentMclEnvironmentProvider--mcl阻塞调用提供器
-
-AgentMclEnvironmentProvider：Agent MCL环境提供器，crate公开结构体--为Base Lua注入显式指定目标Agent且始终返回结果的阻塞mcl函数
-    events: RuntimeEventSender--向MclPlugin发送MclCommandRequest
-    name(&self) -> &str
-        获取名称：返回mcl
-    provide(&self, context: &LuaEnvironmentContext) -> Result<LuaEnvironment, LuaRuntimeError>
-        提供MCL函数：注入mcl(target_agent_id, command, binding?)；每次调用都显式指定目标Agent，不使用context.owner作为默认目标；函数创建一次性回执并发送MclCommandRequest，随后暂停当前Lua VM并把控制权交还LuaRuntimePlugin，直到回执到达后恢复VM，将Result转换为Lua值或Lua错误并返回
-        MclCommandValue::Message以及Inner(Message[])转换Lua时把MclMessage.message的type、content、reasoning、tool_calls等字段与可选usage放在同一层；Lua直接读取message.type和message.usage，不暴露Rust内部的message嵌套字段
+    pending: HashMap<(Entity, String, String), AgentToolPending>--按Agent、turn_id和tool_call_id定位执行关联和取消信息
 
 AgentLuaMessageEnvelope：AgentPlugin写入长期VM邮箱的内部信封，crate公开结构体--start Effect消费后只把message返回Lua
     turn_id: String--原AgentMessage.id，供MclPlugin建立或校验Agent.turn
@@ -273,6 +289,7 @@ AgentLuaMessageEnvelope：AgentPlugin写入长期VM邮箱的内部信封，crate
 
 Lua侧 `mcl` 调用约定：
 ```text
+mcl环境提供器由MclPlugin定义和注册；AgentPlugin创建长期VM时只在providers中声明mcl名称。这样MclPlugin可以依赖agent_plugin访问唯一Agent组件，不形成agent_plugin与mcl_plugin的crate循环依赖。
 mcl(target_agent_id, command, binding?) -> value | error
     进入函数：创建oneshot回执，生成完整MclCommandRequest并提交事件
     等待阶段：暂停当前Lua调用栈；LuaRuntimePlugin继续驱动其他任务，不执行本调用点之后的语句
@@ -325,9 +342,10 @@ AgentFailureKind：Agent错误分类，公开枚举
     Import
     Stopped
 
-AgentError：Agent控制错误，公开结构体--稳定描述Agent数据、生命周期或跨领域控制失败
-    kind: AgentFailureKind--错误分类
-    message: String--稳定有界错误描述
+AgentCreateResult：Agent创建结果，公开事件--Agent Entity已经创建但仍可能等待Base Lua初始化
+    id: String--原AgentCreateRequest.id
+    result: Result<Entity, AgentError>--成功时返回已挂载Agent和ResourceId的Entity
+    impl Event + Clone for AgentCreateResult
 ```
 
 # handler

@@ -3,13 +3,14 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Entity, Event, Plugin, Resource, World};
 use margatroid_types::ResourceId;
 use serde::Deserialize;
 use serde_json::json;
 use tool_plugin::{
-    register_agent_tool, AgentToolEnvironment, ToolCallRequest, ToolCallResponse, ToolError,
+    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
     ToolErrorKind, ToolTemplate,
 };
 
@@ -34,15 +35,17 @@ pub struct SkillRegisterRequest {
     pub id: String,
     pub agent: Entity,
     pub resource_id: ResourceId,
+    pub alias: Option<String>,
 }
 impl Event for SkillRegisterRequest {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SkillRegisterResponse {
     pub id: String,
     pub agent: Entity,
     pub resource_id: ResourceId,
-    pub result: Result<(), ToolError>,
+    pub alias: Option<String>,
+    pub result: Result<ResourceMapEntry, ToolError>,
 }
 impl Event for SkillRegisterResponse {}
 
@@ -123,19 +126,24 @@ fn skill_register_system(world: &mut World) {
         .collect::<Vec<_>>();
     for request in requests {
         let result = world
-            .get_component::<AgentToolEnvironment>(request.agent)
+            .get_component::<Agent>(request.agent)
             .ok_or_else(|| {
                 ToolError::new(
                     ToolErrorKind::ToolEnvironmentMissing,
                     "agent tool environment is missing",
                 )
             })
-            .and_then(|environment| {
+            .and_then(|agent| {
                 validate_skill_resource(&request.resource_id)?;
                 let roots = world
                     .get_resource::<SkillRoots>()
                     .expect("SkillPlugin is installed");
-                let path = find_skill_file(environment, &roots.home_root, &request.resource_id)?;
+                let path = find_skill_file(
+                    &agent.info.project_root,
+                    &agent.info.image_root,
+                    &roots.home_root,
+                    &request.resource_id,
+                )?;
                 let document = read_skill_document(&path)?;
                 ToolTemplate::new(
                     request.resource_id.to_string(),
@@ -144,19 +152,18 @@ fn skill_register_system(world: &mut World) {
                 )
             });
         let result = result.and_then(|template| {
-            register_agent_tool(
-                world,
-                request.agent,
-                ResourceId::parse(SKILL_LOADER_ID).expect("built-in Skill loader ID is valid"),
+            candidate_resource_entry(
                 request.resource_id.clone(),
+                request.alias.clone(),
+                ResourceId::parse(SKILL_LOADER_ID).expect("built-in Skill loader ID is valid"),
                 template,
             )
-            .map(|_| ())
         });
         world.send_event(SkillRegisterResponse {
             id: request.id,
             agent: request.agent,
             resource_id: request.resource_id,
+            alias: request.alias,
             result,
         });
     }
@@ -173,19 +180,24 @@ fn skill_tool_call_system(world: &mut World) {
         .filter(|event| event.tool_id == ResourceId::parse(SKILL_LOADER_ID).unwrap())
     {
         let result = world
-            .get_component::<AgentToolEnvironment>(event.agent)
+            .get_component::<Agent>(event.agent)
             .ok_or_else(|| {
                 ToolError::new(
                     ToolErrorKind::ToolEnvironmentMissing,
                     "agent tool environment is missing",
                 )
             })
-            .and_then(|environment| {
+            .and_then(|agent| {
                 validate_skill_resource(&event.resource_id)?;
                 let roots = world
                     .get_resource::<SkillRoots>()
                     .expect("SkillPlugin is installed");
-                let path = find_skill_file(environment, &roots.home_root, &event.resource_id)?;
+                let path = find_skill_file(
+                    &agent.info.project_root,
+                    &agent.info.image_root,
+                    &roots.home_root,
+                    &event.resource_id,
+                )?;
                 serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
                     &event.arguments,
                 )
@@ -248,16 +260,14 @@ fn read_skill_document(path: &Path) -> Result<SkillDocument, ToolError> {
 }
 
 fn find_skill_file(
-    environment: &AgentToolEnvironment,
+    project_root: &Path,
+    image_root: &Path,
     home_root: &Path,
     resource: &ResourceId,
 ) -> Result<PathBuf, ToolError> {
     let candidates = [
-        environment
-            .project_root()
-            .join(".margatroid")
-            .join("skills"),
-        environment.image_root().join("skills"),
+        project_root.join(".margatroid").join("skills"),
+        image_root.join("skills"),
         home_root.to_path_buf(),
     ];
     for root in candidates {

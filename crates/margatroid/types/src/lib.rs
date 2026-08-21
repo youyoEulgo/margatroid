@@ -1,144 +1,11 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use core_plugin::{Entity, Event};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResourceIdError {
-    Empty,
-    InvalidType,
-    InvalidScope,
-    InvalidName,
-    InvalidTag,
-    InvalidFormat,
-}
-
-impl fmt::Display for ResourceIdError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Empty => "resource id cannot be empty",
-            Self::InvalidType => "resource type is invalid",
-            Self::InvalidScope => "resource scope is invalid",
-            Self::InvalidName => "resource name is invalid",
-            Self::InvalidTag => "resource tag is invalid",
-            Self::InvalidFormat => "resource id format is invalid",
-        })
-    }
-}
-
-impl std::error::Error for ResourceIdError {}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ResourceId {
-    resource_type: String,
-    scope: String,
-    name: String,
-    tag: String,
-}
-
-impl ResourceId {
-    pub fn parse(value: impl AsRef<str>) -> Result<Self, ResourceIdError> {
-        value.as_ref().parse()
-    }
-
-    pub fn new(
-        resource_type: impl Into<String>,
-        scope: impl Into<String>,
-        name: impl Into<String>,
-        tag: Option<impl Into<String>>,
-    ) -> Result<Self, ResourceIdError> {
-        let resource_type = resource_type.into();
-        let scope = scope.into();
-        let name = name.into();
-        let tag = tag.map(Into::into).unwrap_or_else(|| "latest".into());
-        validate_resource_type(&resource_type)?;
-        validate_resource_part(&scope, ResourceIdError::InvalidScope)?;
-        validate_resource_part(&name, ResourceIdError::InvalidName)?;
-        validate_resource_tag(&tag)?;
-        Ok(Self {
-            resource_type,
-            scope,
-            name,
-            tag,
-        })
-    }
-
-    pub fn resource_type(&self) -> &str {
-        &self.resource_type
-    }
-
-    pub fn scope(&self) -> &str {
-        &self.scope
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn tag(&self) -> &str {
-        &self.tag
-    }
-}
-
-impl FromStr for ResourceId {
-    type Err = ResourceIdError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.is_empty() {
-            return Err(ResourceIdError::Empty);
-        }
-        let (resource_type, remainder) = value
-            .split_once(':')
-            .ok_or(ResourceIdError::InvalidFormat)?;
-        let (scope, name_and_tag) = remainder
-            .split_once('/')
-            .ok_or(ResourceIdError::InvalidFormat)?;
-        if name_and_tag.contains('/') {
-            return Err(ResourceIdError::InvalidFormat);
-        }
-        let (name, tag) = match name_and_tag.split_once(':') {
-            Some((name, tag)) => {
-                if tag.contains(':') {
-                    return Err(ResourceIdError::InvalidFormat);
-                }
-                (name, Some(tag.to_owned()))
-            }
-            None => (name_and_tag, None),
-        };
-        Self::new(resource_type, scope, name, tag)
-    }
-}
-
-impl fmt::Display for ResourceId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{}:{}/{}:{}",
-            self.resource_type, self.scope, self.name, self.tag
-        )
-    }
-}
-
-impl Serialize for ResourceId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for ResourceId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        value.parse().map_err(serde::de::Error::custom)
-    }
-}
+pub use resource_id_plugin::{ResourceId, ResourceIdError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResourceNameError {
@@ -388,23 +255,6 @@ pub struct RouteAgentAssistantToolCall {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AgentVisibilityRouteAction {
-    Inject,
-    Remove,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RouteAgentVisibility {
-    pub id: String,
-    pub workspace: WorkspaceReference,
-    pub agent: Option<ResourceId>,
-    pub resource_id: ResourceId,
-    pub action: AgentVisibilityRouteAction,
-}
-
-impl Event for RouteAgentVisibility {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteAgentWorkflowAttach {
     pub id: String,
     pub workspace: WorkspaceReference,
@@ -490,10 +340,48 @@ pub struct AgentMessage {
 
 impl Event for AgentMessage {}
 
+#[derive(Clone, Debug)]
+pub struct InferenceRequestEvent {
+    pub id: String,
+    pub agent: Entity,
+    pub agent_id: ResourceId,
+    pub messages: Vec<Message>,
+    pub tools: Vec<ToolDefinition>,
+}
+impl Event for InferenceRequestEvent {}
+
+#[derive(Clone, Debug)]
+pub struct CapturedInferenceRequest {
+    pub id: String,
+    pub agent: Entity,
+    pub agent_id: ResourceId,
+    pub messages: Vec<Message>,
+}
+
+impl Event for CapturedInferenceRequest {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedInferenceResponse {
+    pub id: String,
+    pub agent: Entity,
+    pub result: Result<String, String>,
+}
+
+impl Event for CapturedInferenceResponse {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCallEvent {
+    pub turn_id: String,
+    pub agent: Entity,
+    pub call: ToolCall,
+}
+impl Event for ToolCallEvent {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentFailureKind {
     Agent,
     Inference,
+    Tool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -532,7 +420,7 @@ impl Event for AgentHistoryMessageWriteRequested {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentRealtimeContextWriteRequested {
     pub agent: Entity,
-    pub messages: Vec<AgentRealtimeMessage>,
+    pub messages: Vec<MclMessage>,
 }
 
 impl Event for AgentRealtimeContextWriteRequested {}
@@ -552,16 +440,218 @@ impl Event for AgentRealtimeContextReadRequested {}
 pub struct AgentRealtimeContextReadCompleted {
     pub id: String,
     pub agent: Entity,
-    pub result: Result<Vec<AgentRealtimeMessage>, String>,
+    pub result: Result<Vec<MclMessage>, String>,
 }
 
 impl Event for AgentRealtimeContextReadCompleted {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentRealtimeMessage {
+// The following data types are deliberately free of plugin-specific behavior.
+// Domain plugins store and mutate them through the narrow methods below.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LuaVmId(pub u64);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MclMessage {
     pub message: Message,
     pub usage: Option<TokenUsage>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLuaMessageEnvelope {
+    pub turn_id: String,
+    pub message: MclMessage,
+}
+
+impl MclMessage {
+    pub fn new(message: Message, usage: Option<TokenUsage>) -> Self {
+        Self { message, usage }
+    }
+    pub fn message(&self) -> &Message {
+        &self.message
+    }
+    pub fn usage(&self) -> Option<&TokenUsage> {
+        self.usage.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockInner {
+    Message(Vec<MclMessage>),
+    ToolCall(Vec<ToolCall>),
+    ResourceId(Vec<ResourceId>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InnerType {
+    Message,
+    ToolCall,
+    ResourceId,
+}
+
+impl BlockInner {
+    pub fn inner_type(&self) -> InnerType {
+        match self {
+            Self::Message(_) => InnerType::Message,
+            Self::ToolCall(_) => InnerType::ToolCall,
+            Self::ResourceId(_) => InnerType::ResourceId,
+        }
+    }
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Message(v) => v.len(),
+            Self::ToolCall(v) => v.len(),
+            Self::ResourceId(v) => v.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BlockPath {
+    pub block_id: String,
+    pub inner_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Block {
+    pub inners: HashMap<String, BlockInner>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct BlockAssembly {
+    pub blocks: HashMap<String, Block>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefMerge {
+    Message(Vec<BlockPath>),
+    ToolCall(Vec<BlockPath>),
+    ResourceId(Vec<BlockPath>),
+}
+
+impl RefMerge {
+    pub fn paths(&self) -> &[BlockPath] {
+        match self {
+            Self::Message(v) | Self::ToolCall(v) | Self::ResourceId(v) => v,
+        }
+    }
+    pub fn inner_type(&self) -> InnerType {
+        match self {
+            Self::Message(_) => InnerType::Message,
+            Self::ToolCall(_) => InnerType::ToolCall,
+            Self::ResourceId(_) => InnerType::ResourceId,
+        }
+    }
+    pub fn iter(&self, blocks: &BlockAssembly) -> Result<BlockInner, AgentError> {
+        let mut out = match self {
+            Self::Message(_) => BlockInner::Message(Vec::new()),
+            Self::ToolCall(_) => BlockInner::ToolCall(Vec::new()),
+            Self::ResourceId(_) => BlockInner::ResourceId(Vec::new()),
+        };
+        for path in self.paths() {
+            let block = blocks
+                .blocks
+                .get(&path.block_id)
+                .ok_or_else(|| AgentError::new(AgentErrorKind::BlockMissing, "block is missing"))?;
+            let value = block
+                .inners
+                .get(&path.inner_id)
+                .ok_or_else(|| AgentError::new(AgentErrorKind::InnerMissing, "inner is missing"))?;
+            if value.inner_type() != self.inner_type() {
+                return Err(AgentError::new(
+                    AgentErrorKind::TypeMismatch,
+                    "inner type mismatch",
+                ));
+            }
+            match (&mut out, value) {
+                (BlockInner::Message(dst), BlockInner::Message(src)) => {
+                    dst.extend(src.iter().cloned())
+                }
+                (BlockInner::ToolCall(dst), BlockInner::ToolCall(src)) => {
+                    dst.extend(src.iter().cloned())
+                }
+                (BlockInner::ResourceId(dst), BlockInner::ResourceId(src)) => {
+                    dst.extend(src.iter().cloned())
+                }
+                _ => {
+                    return Err(AgentError::new(
+                        AgentErrorKind::TypeMismatch,
+                        "inner type mismatch",
+                    ))
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct RefBlock {
+    pub merges: HashMap<String, RefMerge>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct RefBlockAssembly {
+    pub blocks: HashMap<String, RefBlock>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MclDeleteSelection {
+    All,
+    First,
+    Indices(Vec<usize>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MclRealtimeSource {
+    pub ref_block_id: String,
+    pub message_merge_id: String,
+    pub dependencies: Vec<BlockPath>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentErrorKind {
+    InvalidRequest,
+    AgentMissing,
+    DuplicateAgent,
+    ResourceMissing,
+    BlockMissing,
+    InnerMissing,
+    TypeMismatch,
+    LuaRuntime,
+    Mcl,
+    Import,
+    Inference,
+    Tool,
+    Memory,
+    Stopped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentError {
+    pub kind: AgentErrorKind,
+    pub message: String,
+}
+
+impl AgentError {
+    pub fn new(kind: AgentErrorKind, message: impl Into<String>) -> Self {
+        let mut message = message.into();
+        if message.len() > 512 {
+            message.truncate(509);
+            message.push_str("...");
+        }
+        Self { kind, message }
+    }
+}
+impl fmt::Display for AgentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}: {}", self.kind, self.message)
+    }
+}
+impl std::error::Error for AgentError {}
 
 fn validate_part(part: &str) -> Result<(), ResourceNameError> {
     if part.is_empty() || part == "." || part == ".." {
@@ -595,45 +685,6 @@ fn validate_tag(tag: &str) -> Result<(), AgentImageReferenceError> {
 
 fn is_tag_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-')
-}
-
-fn validate_resource_type(resource_type: &str) -> Result<(), ResourceIdError> {
-    if resource_type.is_empty()
-        || !resource_type.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-        })
-    {
-        return Err(ResourceIdError::InvalidType);
-    }
-    Ok(())
-}
-
-fn validate_resource_part(part: &str, error: ResourceIdError) -> Result<(), ResourceIdError> {
-    if part.is_empty()
-        || part == "."
-        || part == ".."
-        || part
-            .chars()
-            .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':'))
-    {
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn validate_resource_tag(tag: &str) -> Result<(), ResourceIdError> {
-    if tag.is_empty() || tag.len() > 128 {
-        return Err(ResourceIdError::InvalidTag);
-    }
-    let mut characters = tag.chars();
-    let first = characters.next().ok_or(ResourceIdError::InvalidTag)?;
-    if first == '.' || first == '-' || !is_tag_character(first) {
-        return Err(ResourceIdError::InvalidTag);
-    }
-    if !characters.all(is_tag_character) {
-        return Err(ResourceIdError::InvalidTag);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

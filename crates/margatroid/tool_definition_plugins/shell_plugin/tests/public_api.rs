@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
@@ -7,10 +8,87 @@ use core_plugin::App;
 use margatroid_types::ResourceId;
 use shell_plugin::{ShellPlugin, ShellRegisterRequest, ShellRegisterResponse};
 use tempfile::tempdir;
-use tool_plugin::{
-    attach_agent_tool_map, AgentToolEnvironment, AgentToolMap, ToolCallRequest, ToolCallResponse,
-    ToolPlugin,
-};
+use tool_plugin::{ToolCallRequest, ToolCallResponse, ToolPlugin};
+
+fn attach_agent(
+    app: &mut App,
+    project: &std::path::Path,
+    image: &std::path::Path,
+) -> core_plugin::Entity {
+    let world = app.world_mut();
+    let entity = world.spawn();
+    let workspace = world.spawn();
+    let image_entity = world.spawn();
+    let model = agent_plugin::AgentModelInfo {
+        provider: "test".to_owned(),
+        model: "test".to_owned(),
+        context_window_tokens: 1024,
+    };
+    let (sender, _receiver) = tokio::sync::oneshot::channel();
+    world.insert_component(
+        entity,
+        agent_plugin::Agent {
+            info: agent_plugin::AgentInfo {
+                image_entity,
+                workspace_id: workspace,
+                model: model.clone(),
+                project_root: project.to_path_buf(),
+                image_root: image.to_path_buf(),
+                home_root: Default::default(),
+                image_dependencies: Default::default(),
+                image_sources: Default::default(),
+            },
+            creation: agent_plugin::AgentCreationState {
+                request_id: "test".to_owned(),
+                reply: agent_plugin::AgentCreateReply::new(sender),
+                initialization: Default::default(),
+            },
+            mcl: Default::default(),
+            resources: Default::default(),
+            memory: agent_plugin::AgentMemoryHandle::new(Arc::new(TestMemory)),
+            inference: agent_plugin::AgentInferenceState {
+                model,
+                pending: Default::default(),
+            },
+            tools: Default::default(),
+            lua: Default::default(),
+            lifecycle: agent_plugin::AgentLifecycleState::Running,
+            turn: Default::default(),
+            token_usage: Default::default(),
+            last_error: None,
+        },
+    );
+    entity
+}
+
+struct TestMemory;
+impl agent_plugin::AgentMemoryStore for TestMemory {
+    fn append_history(
+        &self,
+        _turn_id: &str,
+        _message: &margatroid_types::Message,
+        _tool_schema: &[margatroid_types::ToolDefinition],
+        _usage: Option<&margatroid_types::TokenUsage>,
+    ) -> Result<(), agent_plugin::AgentMemoryStoreError> {
+        Ok(())
+    }
+    fn rewrite_realtime(
+        &self,
+        _messages: &[margatroid_types::MclMessage],
+    ) -> Result<(), agent_plugin::AgentMemoryStoreError> {
+        Ok(())
+    }
+    fn read_realtime(
+        &self,
+    ) -> Result<Vec<margatroid_types::MclMessage>, agent_plugin::AgentMemoryStoreError> {
+        Ok(Vec::new())
+    }
+    fn history_messages(
+        &self,
+    ) -> Result<Vec<agent_plugin::HistoryMessage>, agent_plugin::AgentMemoryStoreError> {
+        Ok(Vec::new())
+    }
+}
 
 #[test]
 fn shell_resources_use_a_hidden_executor_and_return_process_output() {
@@ -41,18 +119,14 @@ fn shell_resources_use_a_hidden_executor_and_return_process_output() {
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(ToolPlugin::default())
         .add_plugin(ShellPlugin::open(home.path()).unwrap());
-    let agent = app.world_mut().spawn();
-    app.world_mut().insert_component(
-        agent,
-        AgentToolEnvironment::new(project.path(), image.path()),
-    );
-    attach_agent_tool_map(app.world_mut(), agent).unwrap();
+    let agent = attach_agent(&mut app, project.path(), image.path());
 
     let resource_id = ResourceId::parse("shell:local/bash:latest").unwrap();
     app.world().send_event(ShellRegisterRequest {
         id: "register-1".into(),
         agent,
         resource_id: resource_id.clone(),
+        alias: None,
     });
     app.tick();
     app.tick();
@@ -63,19 +137,16 @@ fn shell_resources_use_a_hidden_executor_and_return_process_output() {
         .find(|response| response.id == "register-1")
         .unwrap();
     assert!(registration.result.is_ok());
-    let maps = app.world().get_component::<AgentToolMap>(agent).unwrap();
-    let mapping = maps.get_by_resource(&resource_id);
-    assert_eq!(mapping.len(), 1);
-    assert_eq!(mapping[0].tool_name, "shell0_bash");
+    let mapping = registration.result.as_ref().unwrap();
     assert_eq!(
-        mapping[0].tool_id,
+        mapping.tool_id.as_ref().unwrap().clone(),
         ResourceId::parse("tool:builtin/shell:latest").unwrap()
     );
 
     app.world().send_event(ToolCallRequest {
         turn_id: "turn-1".into(),
         agent,
-        tool_id: mapping[0].tool_id.clone(),
+        tool_id: mapping.tool_id.clone().unwrap(),
         resource_id,
         tool_call_id: "call-1".into(),
         arguments: serde_json::json!({
@@ -137,25 +208,25 @@ fn persistent_shell_preserves_directory_and_environment_between_calls() {
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(ToolPlugin::default())
         .add_plugin(ShellPlugin::open(home.path()).unwrap());
-    let agent = app.world_mut().spawn();
-    app.world_mut().insert_component(
-        agent,
-        AgentToolEnvironment::new(project.path(), image.path()),
-    );
-    attach_agent_tool_map(app.world_mut(), agent).unwrap();
+    let agent = attach_agent(&mut app, project.path(), image.path());
     let resource_id = ResourceId::parse("shell:local/bash:latest").unwrap();
     app.world().send_event(ShellRegisterRequest {
         id: "register-persistent".into(),
         agent,
         resource_id: resource_id.clone(),
+        alias: None,
     });
     app.tick();
     app.tick();
     let mapping = app
         .world()
-        .get_component::<AgentToolMap>(agent)
+        .event_reader::<ShellRegisterResponse>()
+        .into_iter()
+        .find(|response| response.id == "register-persistent")
         .unwrap()
-        .get_by_resource(&resource_id)[0]
+        .result
+        .as_ref()
+        .unwrap()
         .clone();
 
     for (call_id, command) in [
@@ -168,7 +239,7 @@ fn persistent_shell_preserves_directory_and_environment_between_calls() {
         app.world().send_event(ToolCallRequest {
             turn_id: "persistent-turn".into(),
             agent,
-            tool_id: mapping.tool_id.clone(),
+            tool_id: mapping.tool_id.clone().unwrap(),
             resource_id: resource_id.clone(),
             tool_call_id: call_id.into(),
             arguments: serde_json::json!({ "command": command }).to_string(),

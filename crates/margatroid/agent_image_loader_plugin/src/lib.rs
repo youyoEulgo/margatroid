@@ -11,6 +11,8 @@ use core_plugin::{App, Component as MecsComponent, Entity, Event, Plugin, Resour
 use futures_util::FutureExt;
 use margatroid_types::ResourceId;
 use mcl_plugin::{load_mcl_program_from_path, MclProgram, MclProgramKind};
+use resource_id_plugin::ResourceIdPluginInstalled;
+use resource_id_plugin::WorldResourceIdExt;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
@@ -92,18 +94,7 @@ pub struct LoadAgentImageResult {
 
 impl Event for LoadAgentImageResult {}
 
-pub struct AgentImageIdentity {
-    reference: ResourceId,
-}
-
-impl AgentImageIdentity {
-    pub fn reference(&self) -> &ResourceId {
-        &self.reference
-    }
-}
-
-impl MecsComponent for AgentImageIdentity {}
-
+#[derive(Clone, Debug)]
 pub struct AgentImageSoul {
     content: Arc<str>,
 }
@@ -114,8 +105,7 @@ impl AgentImageSoul {
     }
 }
 
-impl MecsComponent for AgentImageSoul {}
-
+#[derive(Clone, Debug)]
 pub struct AgentImageBaseDriver {
     program: Arc<MclProgram>,
 }
@@ -125,8 +115,6 @@ impl AgentImageBaseDriver {
         &self.program
     }
 }
-
-impl MecsComponent for AgentImageBaseDriver {}
 
 pub type AgentImageBaseMcl = AgentImageBaseDriver;
 
@@ -146,6 +134,7 @@ impl AgentImageDependency {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct AgentImageDependencies {
     entries: Arc<[AgentImageDependency]>,
 }
@@ -156,8 +145,7 @@ impl AgentImageDependencies {
     }
 }
 
-impl MecsComponent for AgentImageDependencies {}
-
+#[derive(Clone, Debug)]
 pub struct AgentImageModelParameters {
     temperature: Option<f32>,
     max_output_tokens: Option<u32>,
@@ -183,6 +171,7 @@ impl AgentImageModelParameters {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct AgentImageModelConfig {
     model: Arc<str>,
     parameters: AgentImageModelParameters,
@@ -198,8 +187,7 @@ impl AgentImageModelConfig {
     }
 }
 
-impl MecsComponent for AgentImageModelConfig {}
-
+#[derive(Clone, Debug)]
 pub struct AgentImageDefaultVisibility {
     resources: BTreeSet<ResourceId>,
 }
@@ -210,7 +198,33 @@ impl AgentImageDefaultVisibility {
     }
 }
 
-impl MecsComponent for AgentImageDefaultVisibility {}
+#[derive(Clone, Debug)]
+pub struct AgentImage {
+    base_driver: AgentImageBaseDriver,
+    dependencies: AgentImageDependencies,
+    model: AgentImageModelConfig,
+    default_visibility: AgentImageDefaultVisibility,
+}
+
+impl AgentImage {
+    pub fn base_driver(&self) -> &AgentImageBaseDriver {
+        &self.base_driver
+    }
+
+    pub fn dependencies(&self) -> &[AgentImageDependency] {
+        self.dependencies.entries()
+    }
+
+    pub fn model(&self) -> &AgentImageModelConfig {
+        &self.model
+    }
+
+    pub fn default_visibility(&self) -> impl Iterator<Item = &ResourceId> + '_ {
+        self.default_visibility.resources()
+    }
+}
+
+impl MecsComponent for AgentImage {}
 
 pub struct AgentImageLoaderPlugin {
     root: PathBuf,
@@ -246,6 +260,9 @@ impl Plugin for AgentImageLoaderPlugin {
         {
             panic!("AsyncRuntimePlugin is not installed");
         }
+        if !app.world().contains_resource::<ResourceIdPluginInstalled>() {
+            panic!("ResourceIdPlugin is not installed");
+        }
         if app
             .world()
             .contains_resource::<AgentImageLoaderPluginInstalled>()
@@ -261,7 +278,6 @@ impl Plugin for AgentImageLoaderPlugin {
         app.world_mut().insert_resource(AgentImageLoaderState {
             root: Arc::new(self.root),
             limits: self.limits,
-            entities: HashMap::new(),
             pending: HashMap::new(),
         });
         app.add_system(&schedule, prepare_agent_image_load_system)
@@ -277,7 +293,6 @@ impl Resource for AgentImageLoaderPluginInstalled {}
 pub(crate) struct AgentImageLoaderState {
     root: Arc<PathBuf>,
     limits: AgentImageLoaderLimits,
-    entities: HashMap<ResourceId, Entity>,
     pending: HashMap<ResourceId, Vec<String>>,
 }
 
@@ -339,7 +354,6 @@ impl Event for AgentImageReadTask {}
 
 struct PreparedAgentImage {
     reference: ResourceId,
-    soul: AgentImageSoul,
     base_driver: AgentImageBaseDriver,
     dependencies: AgentImageDependencies,
     model: AgentImageModelConfig,
@@ -352,7 +366,7 @@ fn parse_default_visibility(
 ) -> Result<BTreeSet<ResourceId>, AgentImageLoadError> {
     let mut aliases = HashMap::new();
     for line in source.lines() {
-        let Some(rest) = line.trim().strip_prefix("handle(\"IMPORT ") else {
+        let Some(rest) = line.trim().strip_prefix("mcl_command(\"IMPORT ") else {
             continue;
         };
         let Some((resource, alias)) = rest.split_once(" AS ") else {
@@ -594,7 +608,7 @@ async fn read_agent_image_inner(
     .map_err(|error| {
         AgentImageLoadError::new(
             AgentImageLoadErrorKind::BaseMclLoadFailed,
-            format!("Base Driver could not be loaded: {:?}", error.kind()),
+            format!("Base Lua could not be loaded: {error}"),
         )
     })?;
 
@@ -616,7 +630,7 @@ async fn read_agent_image_inner(
             "SOUL.md cannot be empty",
         ));
     }
-
+    let _ = soul;
     let layout_after = validate_image_layout(&image_root).await?;
     if layout_before != layout_after
         || manifest_signature
@@ -644,9 +658,6 @@ async fn read_agent_image_inner(
     let inference = manifest.inference;
     Ok(PreparedAgentImage {
         reference: task.reference,
-        soul: AgentImageSoul {
-            content: Arc::from(soul),
-        },
         base_driver: AgentImageBaseDriver {
             program: base_driver,
         },
@@ -723,31 +734,28 @@ fn apply_agent_image_payload(world: &mut World, payload: AgentImageReadPayload) 
     match payload.result {
         Ok(prepared) => {
             debug_assert_eq!(prepared.reference, payload.reference);
-            let known = world
-                .get_resource::<AgentImageLoaderState>()
-                .and_then(|state| state.entities.get(&payload.reference).copied());
-            let entity = known
+            let entity = world
+                .entity_by_resource_id(&payload.reference)
+                .ok()
                 .filter(|entity| world.is_alive(*entity))
                 .unwrap_or_else(|| world.spawn());
             let PreparedAgentImage {
-                reference,
-                soul,
                 base_driver,
                 dependencies,
                 model,
                 default_visibility,
+                ..
             } = prepared;
-            assert!(world.insert_component(entity, AgentImageIdentity { reference }));
-            assert!(world.insert_component(entity, soul));
-            assert!(world.insert_component(entity, base_driver));
-            assert!(world.insert_component(entity, dependencies));
-            assert!(world.insert_component(entity, model));
-            assert!(world.insert_component(entity, default_visibility));
-            world
-                .get_resource_mut::<AgentImageLoaderState>()
-                .expect("AgentImageLoaderPlugin is not installed")
-                .entities
-                .insert(payload.reference.clone(), entity);
+            assert!(world.insert_component(entity, payload.reference.clone()));
+            assert!(world.insert_component(
+                entity,
+                AgentImage {
+                    base_driver,
+                    dependencies,
+                    model,
+                    default_visibility,
+                },
+            ));
             for id in waiting {
                 world.send_event(LoadAgentImageResult {
                     id,
@@ -1048,6 +1056,7 @@ mod tests {
     use app_runtime_plugin::RuntimePlugin;
     use async_runtime_plugin::AsyncRuntimePlugin;
     use core_plugin::App;
+    use resource_id_plugin::ResourceIdPlugin;
 
     use super::*;
 
@@ -1093,7 +1102,7 @@ id = "workflow:local/review:latest"
         fs::write(image.join("SOUL.md"), soul).unwrap();
         fs::write(
             image.join("base.lua"),
-            "handle(\"IMPORT skill:local/code-review:latest AS review\")\nhandle(\"IMPORT workflow:local/review:latest AS workflow\")\nhandle(\"INJECT review, workflow TO tool_default FROM tool\")\nhandle(\"INJECT SELECT tool_default FROM tool COVER tool_dynamic FROM tool\")\n",
+            "mcl_command(\"IMPORT skill:local/code-review:latest AS review\")\nmcl_command(\"IMPORT workflow:local/review:latest AS workflow\")\nmcl_command(\"INJECT review, workflow TO tool_default FROM tool\")\nmcl_command(\"INJECT SELECT tool_default FROM tool COVER tool_dynamic FROM tool\")\n",
         )
         .unwrap();
     }
@@ -1102,6 +1111,7 @@ id = "workflow:local/review:latest"
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
             .add_plugin(AsyncRuntimePlugin)
+            .add_plugin(ResourceIdPlugin)
             .add_plugin(AgentImageLoaderPlugin::open(library).unwrap());
         app
     }
@@ -1140,30 +1150,18 @@ id = "workflow:local/review:latest"
 
         let entity = load(&mut app, "load-components", &reference).unwrap();
 
-        let identity = app
-            .world()
-            .get_component::<AgentImageIdentity>(entity)
-            .unwrap();
-        let soul = app.world().get_component::<AgentImageSoul>(entity).unwrap();
-        let model = app
-            .world()
-            .get_component::<AgentImageModelConfig>(entity)
-            .unwrap();
-        let visibility = app
-            .world()
-            .get_component::<AgentImageDefaultVisibility>(entity)
-            .unwrap();
+        let identity = app.world().get_component::<ResourceId>(entity).unwrap();
+        let image = app.world().get_component::<AgentImage>(entity).unwrap();
 
-        assert_eq!(identity.reference(), &reference);
-        assert_eq!(soul.as_str(), "You are a careful coder.\n");
-        assert_eq!(model.model(), "deepseek-v4-flash");
-        assert_eq!(model.parameters().temperature(), Some(0.7));
-        assert_eq!(model.parameters().max_output_tokens(), Some(8192));
-        assert_eq!(model.parameters().top_p(), Some(0.9));
-        assert_eq!(model.parameters().stop(), ["DONE"]);
+        assert_eq!(identity, &reference);
+        assert_eq!(image.model().model(), "deepseek-v4-flash");
+        assert_eq!(image.model().parameters().temperature(), Some(0.7));
+        assert_eq!(image.model().parameters().max_output_tokens(), Some(8192));
+        assert_eq!(image.model().parameters().top_p(), Some(0.9));
+        assert_eq!(image.model().parameters().stop(), ["DONE"]);
         assert_eq!(
-            visibility
-                .resources()
+            image
+                .default_visibility()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
             [
@@ -1208,7 +1206,6 @@ id = "workflow:local/review:latest"
         assert_eq!(app.world().entity_count(), 1);
         let state = app.world().get_resource::<AgentImageLoaderState>().unwrap();
         assert!(state.pending.is_empty());
-        assert_eq!(state.entities.get(&reference), Some(&entities[0]));
         let _ = fs::remove_dir_all(library);
     }
 
@@ -1224,13 +1221,6 @@ id = "workflow:local/review:latest"
         let reloaded = load(&mut app, "reload", &reference).unwrap();
 
         assert_eq!(reloaded, entity);
-        assert_eq!(
-            app.world()
-                .get_component::<AgentImageSoul>(entity)
-                .unwrap()
-                .as_str(),
-            "New soul.\n"
-        );
         assert_eq!(app.world().entity_count(), 1);
         let _ = fs::remove_dir_all(library);
     }
@@ -1241,20 +1231,13 @@ id = "workflow:local/review:latest"
         write_image(&library, "Stable soul.\n");
         let mut app = app(&library);
         let reference = ResourceId::parse("image:local/coder").unwrap();
-        let entity = load(&mut app, "initial", &reference).unwrap();
+        let _entity = load(&mut app, "initial", &reference).unwrap();
         fs::write(image_root(&library).join("unknown.txt"), "invalid").unwrap();
 
         let error = load(&mut app, "broken", &reference).unwrap_err();
 
         assert_eq!(error.kind(), AgentImageLoadErrorKind::InvalidLayout);
         assert_eq!(app.world().entity_count(), 1);
-        assert_eq!(
-            app.world()
-                .get_component::<AgentImageSoul>(entity)
-                .unwrap()
-                .as_str(),
-            "Stable soul.\n"
-        );
         let _ = fs::remove_dir_all(library);
     }
 

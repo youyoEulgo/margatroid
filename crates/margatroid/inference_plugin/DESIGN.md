@@ -12,14 +12,14 @@ InferenceRequestEvent：普通推理请求事件，公开事件--MclPlugin交付
     tools: Vec<ToolDefinition>--内部ToolSpec；name是ResourceMapEntry.resource_name
     impl Event for InferenceRequestEvent
 
-CapturedInferenceRequest：捕获式推理请求，公开事件--MclPlugin为catch_inference交付只返回调用点的消息上下文
+CapturedInferenceRequest：捕获式推理请求，公开事件（实际数据类型定义在共享types并由本crate重新导出）--MclPlugin为catch_inference交付只返回调用点的消息上下文
     id: String--"mcl-effect:"命名空间下的请求ID
     agent: Entity--请求所属Agent Entity
     agent_id: ResourceId--稳定Agent身份，只用于路由和日志
     messages: Vec<Message>--MCL RefBlock展开后的完整输入
     impl Event for CapturedInferenceRequest
 
-CapturedInferenceResponse：捕获式推理响应，公开事件--只完成原catch_inference回执，不进入普通AgentMessage链路
+CapturedInferenceResponse：捕获式推理响应，公开事件（实际数据类型定义在共享types并由本crate重新导出）--只完成原catch_inference回执，不进入普通AgentMessage链路
     id: String--原捕获请求ID
     agent: Entity--请求所属Agent Entity
     result: Result<String, InferenceError>--成功时为非空完整正文，失败时为稳定推理错误
@@ -81,6 +81,32 @@ InferenceToolCall：Provider Adapter内部调用累积结构，私有结构体
     id: String
     tool_name: String
     arguments: String
+
+InferenceRoute：推理路由，私有枚举
+    Normal { id: String, agent: Entity }
+    Captured { id: String, agent: Entity }
+
+ProviderInput：Provider无关请求，私有结构体
+    model: String
+    messages: Vec<Message>
+    tools: Vec<ToolDefinition>
+    thinking: Option<String>
+    reasoning_effort: Option<String>
+
+ProviderHttpRequest：已编码Provider请求，私有结构体
+    url: String
+    headers: Vec<(String, String)>
+    body: serde_json::Value
+
+ErasedProviderAdapter：Provider适配器对象，私有trait对象
+    build_request(&self, input: ProviderInput) -> Result<ProviderHttpRequest, InferenceError>
+    push(&mut self, chunk: &[u8]) -> Result<Vec<ProviderStreamDelta>, InferenceError>
+    finish(self: Box<Self>) -> Result<ProviderInferenceResponse, InferenceError>
+
+AsyncContext：直接使用mecs async_runtime_plugin提供的公开异步任务上下文，不在inference_plugin重复定义
+
+WebSocketSender：前端流式发送器，私有类型别名
+    Arc<dyn Fn(serde_json::Value) -> Result<(), InferenceError> + Send + Sync>
 ```
 
 ## 函数

@@ -2,6 +2,16 @@
 
 ## 类型
 
+crate公开：
+```text
+MclEnvironmentProvider：MCL Lua环境提供器，crate公开结构体--由MclPlugin注册到LuaRuntimePlugin
+    events: RuntimeEventSender--向MclPlugin发送MclCommandRequest，私有
+    name(&self) -> &str
+        获取名称：返回mcl
+    provide(&self, context: &LuaEnvironmentContext) -> Result<LuaEnvironment, LuaRuntimeError>
+        提供MCL函数：注入mcl(target_agent_id, command, binding?)；每次调用都显式指定目标Agent，等待MclCommandReply后恢复同一Lua调用栈并返回值或Lua错误
+```
+
 公开：
 ```text
 MclPlugin：Model Context Language领域运行时插件，公开结构体--解析MCL命令、执行领域操作并完成命令回执
@@ -218,6 +228,7 @@ MclOperation：MCL命令解析后的领域操作，crate公开枚举
     RefMerge { sources: Vec<BlockPath> }
     Import { resource_id: ResourceId, alias: String }
     Inject { target: BlockPath, value: MclBinding }
+    InjectMany { target: BlockPath, values: Vec<MclBinding> }
     CoverValue { target: BlockPath, value: MclBinding }
     CoverInner { source: BlockPath, target: BlockPath }
     Select { source: BlockPath }
@@ -323,9 +334,15 @@ IMPORT <resource_id> AS <alias>
     依赖存在时向资源注册协议发送验证请求；验证资源真实存在且Provider测试通过后，
     才将候选ResourceMapEntry写入Agent.resources并登记alias。
     验证失败时IMPORT失败，不写入部分映射；错误通过原MclCommandReply返回调用点。
+    prompt:system/soul和prompt:user/compact都是MCL管理的prompt资源，不由AgentImage承载。
+    MCL在IMPORT时直接读取Agent.info.image_root下的SOUL.md和COMPACT.md，
+    成功时构造ResourceContent::Prompt并完成原回执；不写入AgentImage或AgentInfo的长期语义字段。
 
 INJECT <binding> TO <inner_id> FROM <block_id>
     按目标字段类型解析binding并追加一个元素
+
+INJECT <binding>, <binding>, ... TO <inner_id> FROM <block_id>
+    按目标字段类型逐个解析多个binding并按顺序追加；不允许携带运行时binding参数
 
 INJECT <binding> COVER <inner_id> FROM <block_id>
     按目标字段类型解析binding并用单元素数组覆盖字段
@@ -399,6 +416,29 @@ Effect参数约束：
 每条非Effect命令只允许两种完成路径：
     CREATE、MERGE、REF_MERGE、INJECT、SELECT和DELETE在mcl_command_request_system内直接完成原MclCommandReply；
     IMPORT保存原MclCommandReply并等待AgentResourceRegisterResponse，响应到达后通过MclDomainResponse完成同一回执。
+```
+
+词法与绑定规范：
+```text
+命令按UTF-8文本解析，关键字、Block ID、inner ID、merge ID和alias全部大小写敏感；命令两端及关键字之间允许ASCII空白，换行等同空白，单条命令不接受分号后的第二条命令。
+标识符统一使用[A-Za-z_][A-Za-z0-9_.-]*，拒绝空值、.、..、控制字符、反斜杠、冒号和路径分隔符；ResourceId仍由ResourceId::parse独立解析。
+CREATE BLOCK和CREATE REF_BLOCK的括号内允许逗号分隔声明和一个可选尾逗号；重复inner_id或merge_id在解析阶段失败。
+括号中的RefBlock ID必须是单个标识符；tool_call和history_append必须恰好使用一个binding，其余命令携带binding时返回InvalidCommand。
+binding来自JSON值：MESSAGE必须是带type字段的Message对象；TOOL_CALL必须是非空数组且每项id、tool_name和arguments合法；TOOL必须是规范化ResourceId字符串；DELETE WHERE必须是非空字符串。
+解析器返回的错误必须包含MclError分类和命令中的token位置；解析失败不得访问World或修改AgentMcl。
+```
+
+Lua回值规范：
+```text
+MclCommandValue::Unit -> nil
+MclCommandValue::Inner(BlockInner::Message(values)) -> Message对象数组
+MclCommandValue::Inner(BlockInner::ToolCall(values)) -> ToolCall对象数组
+MclCommandValue::Inner(BlockInner::ResourceId(values)) -> 完整ResourceId字符串数组
+MclCommandValue::Paths(paths) -> [{ block_id = string, inner_id = string }, ...]
+MclCommandValue::Message(message) -> 平铺Message对象，type/content/reasoning/tool_calls/usage同MclMessage转换规则
+MclCommandValue::ResourceImport(receipt) -> { resource_id, alias, available, error }
+MclCommandValue::Text(value) -> Lua字符串
+Rust错误统一转换为Lua错误；Lua端只能得到稳定错误分类和有界描述，不暴露World、SQL、绝对路径或Provider原始正文。
 ```
 
 # system
@@ -602,6 +642,19 @@ handle_realtime_source_effect(world: &mut World, request: MclDomainRequest, sour
         只有来源验证和values完整展开都成功后，才用source整体替换Agent.mcl.realtime_source
         随即发送AgentRealtimeContextWriteRequested { agent, messages: values }，使声明当刻的完整内容覆盖实时上下文表
         事件提交后立即以MclDomainValue::Unit完成原reply；Memory持久化失败通过AgentMemoryWriteFailed报告，不回滚已经成立的MCL来源声明
+
+handle_history_append_effect(world: &mut World, request: MclDomainRequest, message: MclMessage)
+    追加历史消息：crate公开函数
+    行为：
+        找到唯一Agent并取得当前turn_id；没有当前轮次或request.id与当前轮次不匹配时返回TurnMissing或TurnMismatch
+        将MclMessage脱壳为Message，拒绝System并按Message角色构造AgentHistoryMessageWriteRequested
+        User和Tool的tool_schema、usage固定为空；Assistant的tool_schema从Agent.inference.pending中按turn_id取得并在发送事件后清除
+        发送事件成功后立即以MclDomainValue::Unit完成原reply；Memory写入是独立持久化事务，不阻塞Lua调用点
+        MemoryPlugin后续发送AgentMemoryWriteFailed时由mcl_memory_failure_system记录稳定错误并设置Agent.last_error；不重复完成已发送的MCL回执
+
+mcl_memory_failure_system(world: &mut World)
+    处理历史或实时写入失败：私有System，读取AgentMemoryWriteFailed
+    行为：按Agent定位并写入Agent.last_error；若错误对应当前Creating或Running Agent，不伪造AgentMessage、不重试、不回滚已经完成的MCL命令
 
 handle_effect_response(world: &mut World, response_id: &str, response: MclExternalEffectResponse)
     整理等待型Effect响应：crate公开函数

@@ -6,12 +6,11 @@ edition = "2021"
 [dependencies]
 app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
-inference_plugin = { path = "../inference_plugin" }
+lua_runtime_plugin = { path = "../lua_runtime_plugin" }
 margatroid_types = { path = "../types" }
-mcl_plugin = { path = "../mcl_plugin" }
-memory_plugin = { path = "../memory_plugin" }
+resource_id_plugin = { path = "../resource_id_plugin" }
 serde_json = { workspace = true }
-tool_plugin = { path = "../tool_plugin" }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

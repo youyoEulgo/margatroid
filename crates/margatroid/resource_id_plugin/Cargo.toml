@@ -1,10 +1,9 @@
 [package]
-name = "margatroid_types"
+name = "resource_id_plugin"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 core_plugin = { path = "../../mecs/core_plugin" }
-resource_id_plugin = { path = "../resource_id_plugin" }
+app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 serde = { workspace = true }
-serde_json = { workspace = true }

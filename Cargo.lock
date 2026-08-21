@@ -12,6 +12,7 @@ dependencies = [
  "futures-util",
  "margatroid_types",
  "mcl_plugin",
+ "resource_id_plugin",
  "serde",
  "tokio",
  "toml",
@@ -25,14 +26,13 @@ dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
  "core_plugin",
- "inference_plugin",
+ "lua_runtime_plugin",
  "margatroid_types",
- "mcl_plugin",
- "memory_plugin",
+ "resource_id_plugin",
  "serde",
  "serde_json",
  "tempfile",
- "tool_plugin",
+ "tokio",
  "tracing",
 ]
 
@@ -256,6 +256,7 @@ dependencies = [
 name = "builtin_tool_plugin"
 version = "0.1.0"
 dependencies = [
+ "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
  "core_plugin",
@@ -264,6 +265,7 @@ dependencies = [
  "shell_plugin",
  "skill_plugin",
  "tempfile",
+ "tokio",
  "tool_plugin",
  "workflow_plugin",
 ]
@@ -964,6 +966,7 @@ name = "inference_plugin"
 version = "0.1.0"
 dependencies = [
  "agent_image_loader_plugin",
+ "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
  "config_plugin",
@@ -1138,6 +1141,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lua_runtime_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "core_plugin",
+ "margatroid_types",
+ "mlua",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "luajit-src"
 version = "210.6.6+707c12b"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1176,8 +1192,10 @@ dependencies = [
  "dto_plugin",
  "inference_plugin",
  "log_plugin",
+ "lua_runtime_plugin",
  "mcl_plugin",
  "memory_plugin",
+ "resource_id_plugin",
  "server_plugin",
  "tool_plugin",
  "tracing",
@@ -1207,6 +1225,7 @@ name = "margatroid_types"
 version = "0.1.0"
 dependencies = [
  "core_plugin",
+ "resource_id_plugin",
  "serde",
  "serde_json",
 ]
@@ -1230,15 +1249,19 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 name = "mcl_plugin"
 version = "0.1.0"
 dependencies = [
+ "agent_plugin",
  "app_runtime_plugin",
  "core_plugin",
+ "lua_runtime_plugin",
  "margatroid_types",
  "mlua",
+ "resource_id_plugin",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
+ "tool_plugin",
  "tracing",
 ]
 
@@ -1252,12 +1275,14 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 name = "memory_plugin"
 version = "0.1.0"
 dependencies = [
+ "agent_plugin",
  "app_runtime_plugin",
  "core_plugin",
  "margatroid_types",
  "rusqlite",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1737,6 +1762,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "resource_id_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "core_plugin",
+ "serde",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2032,6 +2066,7 @@ dependencies = [
 name = "shell_plugin"
 version = "0.1.0"
 dependencies = [
+ "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
  "core_plugin",
@@ -2087,6 +2122,7 @@ dependencies = [
 name = "skill_plugin"
 version = "0.1.0"
 dependencies = [
+ "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
  "core_plugin",
@@ -2094,6 +2130,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "toml",
  "tool_plugin",
 ]
@@ -2403,6 +2440,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 name = "tool_plugin"
 version = "0.1.0"
 dependencies = [
+ "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
  "core_plugin",
@@ -2957,12 +2995,14 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 name = "workflow_plugin"
 version = "0.1.0"
 dependencies = [
+ "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
  "core_plugin",
  "margatroid_types",
  "serde_json",
  "tempfile",
+ "tokio",
  "tool_plugin",
 ]
 
@@ -2977,11 +3017,14 @@ dependencies = [
  "builtin_tool_plugin",
  "core_plugin",
  "inference_plugin",
+ "lua_runtime_plugin",
  "margatroid_types",
  "mcl_plugin",
  "memory_plugin",
+ "resource_id_plugin",
  "serde_json",
  "tempfile",
+ "tokio",
  "tool_plugin",
  "tracing",
 ]

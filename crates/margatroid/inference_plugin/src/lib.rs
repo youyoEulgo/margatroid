@@ -5,7 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent_image_loader_plugin::AgentImageModelConfig;
+use agent_image_loader_plugin::{AgentImage, AgentImageModelConfig};
+use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::{
     AppAsyncExt, AsyncContext, AsyncRuntimeHandle, AsyncTaskError, WorldAsyncExt,
@@ -294,7 +295,26 @@ impl WorkspaceModelRoutes {
     }
 }
 
-impl Component for WorkspaceModelRoutes {}
+#[derive(Default)]
+pub struct WorkspaceModelRoutesRegistry {
+    routes: HashMap<Entity, WorkspaceModelRoutes>,
+}
+
+impl Resource for WorkspaceModelRoutesRegistry {}
+
+impl WorkspaceModelRoutesRegistry {
+    pub fn get(&self, workspace: Entity) -> Option<&WorkspaceModelRoutes> {
+        self.routes.get(&workspace)
+    }
+
+    pub fn insert(&mut self, workspace: Entity, routes: WorkspaceModelRoutes) {
+        self.routes.insert(workspace, routes);
+    }
+
+    pub fn remove(&mut self, workspace: Entity) {
+        self.routes.remove(&workspace);
+    }
+}
 
 pub struct ProviderInput<'a> {
     model: &'a str,
@@ -456,16 +476,7 @@ pub struct ReloadModelRoutesResult {
 
 impl Event for ReloadModelRoutesResult {}
 
-#[derive(Clone, Debug)]
-pub struct InferenceRequestEvent {
-    pub id: String,
-    pub agent: Entity,
-    pub agent_id: ResourceId,
-    pub messages: Vec<Message>,
-    pub tools: Vec<ToolDefinition>,
-}
-
-impl Event for InferenceRequestEvent {}
+pub use margatroid_types::InferenceRequestEvent;
 
 #[derive(Clone, Debug)]
 pub struct ContextCompactionInferenceRequest {
@@ -486,6 +497,8 @@ pub struct ContextCompactionInferenceResponse {
 
 impl Event for ContextCompactionInferenceResponse {}
 
+pub use margatroid_types::{CapturedInferenceRequest, CapturedInferenceResponse};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CancelInferenceRequest {
     pub id: String,
@@ -505,6 +518,7 @@ struct InferenceRoute {
 enum InferenceOutputKind {
     AgentMessage,
     ContextCompaction,
+    Captured,
 }
 
 struct InferenceCommand {
@@ -699,6 +713,8 @@ impl Plugin for InferencePlugin {
         app.world_mut().insert_resource(routes);
         app.world_mut().insert_resource(client);
         app.world_mut()
+            .insert_resource(WorkspaceModelRoutesRegistry::default());
+        app.world_mut()
             .insert_resource(InFlightInferences::default());
         app.add_system(&schedule, reload_model_routes_system)
             .add_system(&schedule, cancel_inference_system)
@@ -738,7 +754,14 @@ impl WorldInferenceExt for World {
         require_workspace(self, workspace)?;
         let path = project_root.join(".margatroid").join("models.toml");
         if !path.exists() {
-            self.remove_component::<WorkspaceModelRoutes>(workspace);
+            self.get_resource_mut::<WorkspaceModelRoutesRegistry>()
+                .ok_or_else(|| {
+                    InferenceError::new(
+                        InferenceErrorKind::InvalidCommand,
+                        "workspace model route registry is missing",
+                    )
+                })?
+                .remove(workspace);
             return Ok(0);
         }
         let factories = self
@@ -753,7 +776,14 @@ impl WorldInferenceExt for World {
             .clone();
         let routes = load_model_routes(&path, &factories)?;
         let count = routes.len();
-        self.insert_component(workspace, WorkspaceModelRoutes { routes });
+        self.get_resource_mut::<WorkspaceModelRoutesRegistry>()
+            .ok_or_else(|| {
+                InferenceError::new(
+                    InferenceErrorKind::InvalidCommand,
+                    "workspace model route registry is missing",
+                )
+            })?
+            .insert(workspace, WorkspaceModelRoutes { routes });
         Ok(count)
     }
 
@@ -786,7 +816,8 @@ impl WorldInferenceExt for World {
             ));
         }
         let context_window_tokens = self
-            .get_component::<WorkspaceModelRoutes>(workspace)
+            .get_resource::<WorkspaceModelRoutesRegistry>()
+            .and_then(|registry| registry.get(workspace))
             .and_then(|routes| routes.get(&model))
             .or_else(|| {
                 self.get_resource::<GlobalModelRoutes>()
@@ -968,7 +999,8 @@ fn require_workspace(world: &World, workspace: Entity) -> Result<(), InferenceEr
 
 fn model_is_routable(world: &World, workspace: Entity, model: &ModelId) -> bool {
     world
-        .get_component::<WorkspaceModelRoutes>(workspace)
+        .get_resource::<WorkspaceModelRoutesRegistry>()
+        .and_then(|registry| registry.get(workspace))
         .and_then(|routes| routes.get(model))
         .or_else(|| {
             world
@@ -1037,6 +1069,20 @@ fn prepare_inference_system(world: &mut World) {
                 output: InferenceOutputKind::ContextCompaction,
             }),
     );
+    commands.extend(
+        world
+            .event_reader::<CapturedInferenceRequest>()
+            .into_iter()
+            .cloned()
+            .map(|command| InferenceCommand {
+                id: command.id,
+                agent: command.agent,
+                agent_id: command.agent_id,
+                messages: command.messages,
+                tools: Vec::new(),
+                output: InferenceOutputKind::Captured,
+            }),
+    );
     let events = world.event_sender();
     for command in commands {
         match prepare_inference(world, command) {
@@ -1075,31 +1121,54 @@ fn prepare_inference(
     }
     validate_messages(&command.messages).map_err(|error| (route.clone(), error))?;
     validate_tools(&command.tools).map_err(|error| (route.clone(), error))?;
-    let snapshot = world
-        .get_component::<AgentInferenceSnapshot>(command.agent)
+    let agent = world.get_component::<Agent>(command.agent).ok_or_else(|| {
+        (
+            route.clone(),
+            InferenceError::new(
+                InferenceErrorKind::InferenceSnapshotMissing,
+                "agent inference snapshot is missing",
+            ),
+        )
+    })?;
+    let image = world
+        .get_component::<AgentImage>(agent.info.image_entity)
         .ok_or_else(|| {
             (
                 route.clone(),
                 InferenceError::new(
                     InferenceErrorKind::InferenceSnapshotMissing,
-                    "agent inference snapshot is missing",
+                    "agent source image is missing",
                 ),
             )
         })?;
+    let model = ModelId::new(agent.info.model.model.clone()).map_err(|error| {
+        (
+            route.clone(),
+            InferenceError::new(InferenceErrorKind::InvalidModelId, error.to_string()),
+        )
+    })?;
+    let parameters = InferenceParameters::new(
+        image.model().parameters().temperature(),
+        image.model().parameters().max_output_tokens(),
+        image.model().parameters().top_p(),
+        image.model().parameters().stop().to_vec(),
+    );
+    let workspace = agent.info.workspace_id;
     let model_route = world
-        .get_component::<WorkspaceModelRoutes>(snapshot.workspace)
-        .and_then(|routes| routes.get(&snapshot.model))
+        .get_resource::<WorkspaceModelRoutesRegistry>()
+        .and_then(|registry| registry.get(workspace))
+        .and_then(|routes| routes.get(&model))
         .or_else(|| {
             world
                 .get_resource::<GlobalModelRoutes>()
-                .and_then(|routes| routes.get(&snapshot.model))
+                .and_then(|routes| routes.get(&model))
         })
         .ok_or_else(|| {
             (
                 route.clone(),
                 InferenceError::new(
                     InferenceErrorKind::ModelRouteNotFound,
-                    format!("model route `{}` was not found", snapshot.model),
+                    format!("model route `{}` was not found", model),
                 ),
             )
         })?;
@@ -1107,7 +1176,7 @@ fn prepare_inference(
         .adapter
         .build_request(ProviderInput::new(
             &model_route.model,
-            &snapshot.parameters,
+            &parameters,
             &command.messages,
             &command.tools,
         ))
@@ -1152,7 +1221,7 @@ fn prepare_inference(
                 })?;
             resolve_websocket_targets(connections, targets)
         }
-        InferenceOutputKind::ContextCompaction => Vec::new(),
+        InferenceOutputKind::ContextCompaction | InferenceOutputKind::Captured => Vec::new(),
     };
     let (cancellation_sender, cancellation) = watch::channel(false);
     world
@@ -1583,6 +1652,14 @@ fn publish_inference_output_system(world: &mut World) {
                         result,
                     });
                 }
+                InferenceOutputKind::Captured => {
+                    let result = context_compaction_content(response);
+                    events.send_event(margatroid_types::CapturedInferenceResponse {
+                        id: output.route.id.clone(),
+                        agent: output.route.agent,
+                        result: result.map_err(|error| error.to_string()),
+                    });
+                }
             },
             Err(error) => publish_inference_error(&events, output.route.clone(), error.clone()),
         }
@@ -1635,6 +1712,13 @@ fn publish_inference_error(
                 id: route.id,
                 agent: route.agent,
                 result: Err(error),
+            })
+        }
+        InferenceOutputKind::Captured => {
+            events.send_event(margatroid_types::CapturedInferenceResponse {
+                id: route.id,
+                agent: route.agent,
+                result: Err(error.to_string()),
             })
         }
     }

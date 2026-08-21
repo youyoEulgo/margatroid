@@ -14,8 +14,10 @@ use core_plugin::App;
 use dto_plugin::DtoPlugin;
 use inference_plugin::InferencePlugin;
 use log_plugin::LogPlugin;
+use lua_runtime_plugin::LuaRuntimePlugin;
 use mcl_plugin::MclPlugin;
 use memory_plugin::MemoryPlugin;
+use resource_id_plugin::ResourceIdPlugin;
 use server_plugin::{ServerOptions, ServerPlugin};
 use tool_plugin::ToolPlugin;
 use tracing::info;
@@ -59,16 +61,18 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
+        .add_plugin(LuaRuntimePlugin::default())
         .add_plugin(LogPlugin::default().with_stream(LOG_STREAM_CAPACITY))
         .add_plugin(ServerPlugin::with_options(ServerOptions::bind(bind)))
         .add_plugin(global_config)
-        .add_plugin(mcl)
+        .add_plugin(ResourceIdPlugin)
         .add_plugin(agent_images)
         .add_plugin(InferencePlugin::default().with_config_path(models_path.clone()))
         .add_plugin(ToolPlugin::default())
         .add_plugin(builtin_tools)
         .add_plugin(MemoryPlugin::default())
         .add_plugin(AgentPlugin::default())
+        .add_plugin(mcl)
         .add_plugin(workspace)
         .add_plugin(DtoPlugin::default())
         .add_plugin(ConnectionPlugin::default());

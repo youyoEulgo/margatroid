@@ -5,7 +5,7 @@
 ```text
 AgentImage的身份统一为ResourceId：image:<scope>/<name>:<tag>
 每个AgentImage必须在镜像根目录携带base.lua；它是AgentImage本体的一部分，不在agent.toml中声明独立资源ID
-SOUL.md固定作为prompt:system/soul:latest资源提供给该Image的Base Driver；agent.toml的dependencies数组是Agent依赖清单
+SOUL.md与COMPACT.md是MCL按prompt资源读取的镜像文件；AgentImage不承载其内容，agent.toml的dependencies数组是Agent依赖清单
 每项依赖包含ResourceId和可选source；source只记录来源，本阶段不执行下载或复制
 base.lua通过IMPORT使用依赖清单中的资源；AgentImageLoader不负责执行资源安装
 镜像默认可见资源保存ResourceId集合，不保存ResourceRef或裸scope/name
@@ -54,34 +54,25 @@ LoadAgentImageResult：加载AgentImage结果，公开事件--每个已读取请
     impl Event for LoadAgentImageResult
         Event：公开trait实现
 
-AgentImageIdentity：AgentImage身份，公开组件--标记Entity代表哪个逻辑镜像
-    reference: ResourceId--规范化type=image资源ID，私有
-    reference(&self) -> &ResourceId
-        取得引用：公开方法，返回镜像引用
-    impl Component for AgentImageIdentity
+AgentImage：AgentImage聚合组件，公开组件--AgentImage Entity唯一的领域数据组件
+    base_driver: MclDriverSource--已经通过大小、UTF-8和Lua语法验证的base.lua源码
+    dependencies: Arc<[AgentImageDependency]>--agent.toml依赖清单
+    model: AgentImageModelConfig--中立模型配置
+    default_visibility: BTreeSet<ResourceId>--镜像默认可见资源
+    base_driver(&self) -> &MclDriverSource
+        取得Driver源码：公开方法
+    dependencies(&self) -> &[AgentImageDependency]
+        取得依赖：公开方法
+    model(&self) -> &AgentImageModelConfig
+        取得模型：公开方法
+    default_visibility(&self) -> impl Iterator<Item = &ResourceId> + '_
+        取得默认可见资源：公开方法
+    impl Component for AgentImage
         Component：公开trait实现
-
-AgentImageSoul：AgentImage Soul，公开组件--保存已经过UTF-8和大小验证的完整Soul
-    content: Arc<str>--Soul文本，私有
-    as_str(&self) -> &str
-        取得Soul：公开方法，返回Soul文本引用
-    impl Component for AgentImageSoul
-        Component：公开trait实现
-
-AgentImageBaseDriver：AgentImage内禀Base Driver，公开组件--保存已经通过大小、UTF-8和Lua语法验证的base.lua源码
-    source: MclDriverSource--kind=Base且origin为当前镜像根目录base.lua
-    source(&self) -> &MclDriverSource
-        取得Driver源码：公开方法，返回共享不可变源码
-    impl Component for AgentImageBaseDriver
 
 AgentImageDependency：AgentImage依赖项，公开结构体--保存规范化资源ID和可选来源
     resource_id: ResourceId--依赖资源ID
     source: Option<String>--可选本机路径或URL，仅记录不解析
-
-AgentImageDependencies：AgentImage依赖清单，公开组件--保存agent.toml中声明的依赖项
-    entries: Arc<[AgentImageDependency]>--保持清单顺序
-    entries(&self) -> &[AgentImageDependency]
-    impl Component for AgentImageDependencies
 
 AgentImageModelParameters：AgentImage模型参数文档，公开结构体--中立保存agent.toml中的可选推理参数
     temperature: Option<f32>--采样温度原始值，私有
@@ -97,15 +88,13 @@ AgentImageModelParameters：AgentImage模型参数文档，公开结构体--中�
     stop(&self) -> &[String]
         取得停止序列：公开方法，返回agent.toml中的停止序列只读切片
 
-AgentImageModelConfig：AgentImage模型配置，公开组件--中立保存模型ID文本和模型参数文档
+AgentImageModelConfig：AgentImage模型配置，公开值类型--中立保存模型ID文本和模型参数文档
     model: Arc<str>--稳定模型ID文本，私有
     parameters: AgentImageModelParameters--原始模型参数文档，私有
     model(&self) -> &str
         取得模型ID：公开方法，返回模型ID文本，不解释路由语义
     parameters(&self) -> &AgentImageModelParameters
         取得模型参数：公开方法，返回中立参数文档
-    impl Component for AgentImageModelConfig
-        Component：公开trait实现
 
 AgentImageLoadErrorKind：AgentImage加载错误分类，公开枚举
     InvalidRoot
@@ -150,7 +139,6 @@ crate公开：
 AgentImageLoaderState：AgentImage加载状态，crate公开Resource--保存根目录、当前Entity和正在合并的请求
     root: Arc<PathBuf>--agent-images根目录
     limits: AgentImageLoaderLimits--加载限制
-    entities: HashMap<ResourceId, Entity>--每个逻辑镜像当前的Entity
     pending: HashMap<ResourceId, Vec<String>>--同一镜像正在进行的请求ID
     impl Resource for AgentImageLoaderState
         Resource：crate公开trait实现
@@ -195,7 +183,6 @@ AgentImageReadTask：AgentImage异步读取任务，私有事件--不持有World
 
 PreparedAgentImage：已准备AgentImage，私有结构体--镜像静态数据读取与名称发现均已完成
     reference: ResourceId--type=image的镜像资源ID
-    soul: AgentImageSoul--已验证Soul
     base_driver: AgentImageBaseDriver--已验证的内禀base.lua源码
     model: AgentImageModelConfig--中立模型配置
 
@@ -398,18 +385,15 @@ App
     ├── AgentImageLoaderState Resource
     │   ├── root: Arc<PathBuf>
     │   ├── limits: AgentImageLoaderLimits
-    │   ├── entities: HashMap<ResourceId, Entity>
     │   └── pending: HashMap<ResourceId, Vec<String>>
     └── AgentImage Entity
-        ├── AgentImageIdentity
-        │   └── reference: ResourceId
-        ├── AgentImageSoul
-        │   └── content: Arc<str>
-        ├── AgentImageBaseDriver
-        │   └── source: MclDriverSource
-        └── AgentImageModelConfig
-        │   ├── model: Arc<str>
-        │   └── parameters: AgentImageModelParameters
+        ├── ResourceId
+        └── AgentImage
+            ├── soul: Arc<str>
+            ├── base_driver: MclDriverSource
+            ├── dependencies: Arc<[AgentImageDependency]>
+            ├── model: AgentImageModelConfig
+            └── default_visibility: BTreeSet<ResourceId>
 
 异步读取期间：
 AgentImageReadTask
