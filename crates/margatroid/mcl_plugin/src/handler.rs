@@ -930,8 +930,13 @@ fn binding_to_inner(
         }
         InnerType::ResourceId => {
             if let Some(alias) = value.as_str() {
-                let resource = aliases.get(alias).ok_or(MclError::ImportMissing)?;
-                return Ok(BlockInner::ResourceId(vec![resource.clone()]));
+                if let Some(resource) = aliases.get(alias) {
+                    return Ok(BlockInner::ResourceId(vec![resource.clone()]));
+                }
+                let resource = alias
+                    .parse::<ResourceId>()
+                    .map_err(|_| MclError::ImportMissing)?;
+                return Ok(BlockInner::ResourceId(vec![resource]));
             }
             if value.is_array() {
                 serde_json::from_value(value.clone())
