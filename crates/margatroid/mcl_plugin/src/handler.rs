@@ -957,6 +957,7 @@ pub fn history_append(
     world: &mut World,
     agent_id: &ResourceId,
     message: margatroid_types::MclMessage,
+    fallback_turn_id: &str,
 ) -> Result<MclDomainValue, MclError> {
     let entity = world
         .entity_by_resource_id(agent_id)
@@ -964,7 +965,11 @@ pub fn history_append(
     let agent = world
         .get_component_mut::<Agent>(entity)
         .ok_or(MclError::AgentMissing)?;
-    let turn_id = agent.turn.turn_id.clone().ok_or(MclError::TurnMissing)?;
+    let turn_id = agent
+        .turn
+        .turn_id
+        .clone()
+        .unwrap_or_else(|| fallback_turn_id.to_owned());
     let tool_schema = if matches!(message.message, Message::Assistant { .. }) {
         agent
             .inference
