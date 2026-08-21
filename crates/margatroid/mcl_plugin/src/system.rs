@@ -539,7 +539,7 @@ pub fn mcl_domain_system(world: &mut World) {
                     let allowed_tools = world
                         .get_component::<Agent>(agent)
                         .and_then(|agent_state| {
-                            agent_state
+                            let pending_tools = agent_state
                                 .inference
                                 .pending
                                 .get(&(agent, turn_id.clone()))
@@ -549,7 +549,20 @@ pub fn mcl_domain_system(world: &mut World) {
                                         .iter()
                                         .map(|tool| tool.name.clone())
                                         .collect::<HashSet<_>>()
+                                });
+                            let visible_tools = agent_state
+                                .resources
+                                .visible
+                                .iter()
+                                .flat_map(|resource_id| {
+                                    agent_state
+                                        .resources
+                                        .tools_by_resource(resource_id)
+                                        .into_iter()
+                                        .map(|entry| entry.resource_name.clone())
                                 })
+                                .collect::<HashSet<_>>();
+                            pending_tools.or(Some(visible_tools))
                         })
                         .ok_or(MclError::ToolCallInvalid)?;
                     for call in calls {
@@ -874,8 +887,21 @@ pub fn mcl_effect_response_system(world: &mut World) {
                             .turn
                             .begin(envelope.turn_id.clone())
                             .map_err(|_| MclError::TurnMismatch)?,
-                        margatroid_types::Message::Assistant { .. }
-                        | margatroid_types::Message::Tool { .. }
+                        margatroid_types::Message::Assistant { .. } => {
+                            match agent.turn.turn_id.as_deref() {
+                                Some(current) if current != envelope.turn_id.as_str() => {
+                                    return Err(MclError::TurnMismatch)
+                                }
+                                None => {
+                                    agent
+                                        .turn
+                                        .begin(envelope.turn_id.clone())
+                                        .map_err(|_| MclError::TurnMismatch)?;
+                                }
+                                _ => {}
+                            }
+                        }
+                        margatroid_types::Message::Tool { .. }
                             if agent.turn.turn_id.as_deref() != Some(envelope.turn_id.as_str()) =>
                         {
                             return Err(MclError::TurnMismatch)
