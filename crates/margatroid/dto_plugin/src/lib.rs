@@ -236,24 +236,6 @@ fn dto_route_system(world: &mut World) {
                     ),
                 }
             }
-            ClientMessage::AgentWorkflowAttach { id, message } => {
-                tracing::info!(connection = connection_id.get(), request_id = %id, api_type = "agent.workflow.attach", "API request received");
-                match message.into_domain(id) {
-                    Ok(event) => world.send_event(event),
-                    Err(error) => {
-                        tracing::warn!(connection = connection_id.get(), error = %error, "invalid agent.workflow.attach payload")
-                    }
-                }
-            }
-            ClientMessage::AgentWorkflowDetach { id, message } => {
-                tracing::info!(connection = connection_id.get(), request_id = %id, api_type = "agent.workflow.detach", "API request received");
-                match message.into_domain(id) {
-                    Ok(event) => world.send_event(event),
-                    Err(error) => {
-                        tracing::warn!(connection = connection_id.get(), error = %error, "invalid agent.workflow.detach payload")
-                    }
-                }
-            }
         }
     }
 

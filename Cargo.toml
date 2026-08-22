@@ -24,7 +24,7 @@ members = [
     "crates/margatroid/tool_definition_plugins/skill_plugin",
     "crates/margatroid/tool_definition_plugins/lua_plugin",
     "crates/margatroid/tool_definition_plugins/shell_plugin",
-    "crates/margatroid/tool_definition_plugins/workflow_plugin",
+    "crates/margatroid/tool_definition_plugins/hook_plugin",
     "crates/margatroid/memory_plugin",
     "crates/margatroid/mcl_plugin",
     "crates/margatroid/agent_plugin",

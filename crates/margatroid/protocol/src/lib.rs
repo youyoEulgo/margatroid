@@ -6,9 +6,8 @@ use core_plugin::{Entity, World};
 use log_plugin::{TracingField, TracingRecord};
 use margatroid_types::{
     AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, RouteAgentAssistant,
-    RouteAgentAssistantToolCall, RouteAgentMessage, RouteAgentTurnAbort, RouteAgentWorkflowAttach,
-    RouteAgentWorkflowDetach, RouteMclCommand, StartWorkspace, ToolCall, WorkspaceAgentDefinition,
-    WorkspaceDefinition, WorkspaceReference,
+    RouteAgentAssistantToolCall, RouteAgentMessage, RouteAgentTurnAbort, RouteMclCommand,
+    StartWorkspace, ToolCall, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
 };
 
 use serde::{Deserialize, Serialize};
@@ -87,16 +86,6 @@ pub enum ClientMessage {
     AgentTurnAbort {
         id: String,
         message: RouteAgentTargetDto,
-    },
-    #[serde(rename = "agent.workflow.attach")]
-    AgentWorkflowAttach {
-        id: String,
-        message: RouteAgentWorkflowAttachDto,
-    },
-    #[serde(rename = "agent.workflow.detach")]
-    AgentWorkflowDetach {
-        id: String,
-        message: RouteAgentWorkflowDetachDto,
     },
 }
 
@@ -452,48 +441,6 @@ pub struct RouteAgentTargetDto {
     pub agent: Option<ResourceIdDto>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RouteAgentWorkflowAttachDto {
-    pub workspace: WorkspaceReferenceDto,
-    pub agent: Option<ResourceIdDto>,
-    pub resource_id: ResourceIdDto,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RouteAgentWorkflowDetachDto {
-    pub workspace: WorkspaceReferenceDto,
-    pub agent: Option<ResourceIdDto>,
-    pub instance_id: String,
-}
-
-impl IntoDomain<RouteAgentWorkflowAttach, String> for RouteAgentWorkflowAttachDto {
-    fn into_domain(self, id: String) -> Result<RouteAgentWorkflowAttach, ProtocolError> {
-        Ok(RouteAgentWorkflowAttach {
-            id,
-            workspace: self.workspace.into_domain(())?,
-            agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
-            resource_id: self.resource_id.into_domain(())?,
-        })
-    }
-}
-
-impl IntoDomain<RouteAgentWorkflowDetach, String> for RouteAgentWorkflowDetachDto {
-    fn into_domain(self, id: String) -> Result<RouteAgentWorkflowDetach, ProtocolError> {
-        if self.instance_id.is_empty() || self.instance_id.chars().any(char::is_control) {
-            return Err(ProtocolError::new(
-                ProtocolErrorKind::InvalidRequest,
-                "Workflow instance ID is invalid",
-            ));
-        }
-        Ok(RouteAgentWorkflowDetach {
-            id,
-            workspace: self.workspace.into_domain(())?,
-            agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
-            instance_id: self.instance_id,
-        })
-    }
-}
-
 impl IntoDomain<RouteAgentMessage, String> for RouteAgentMessageDto {
     fn into_domain(self, id: String) -> Result<RouteAgentMessage, ProtocolError> {
         Ok(RouteAgentMessage {
@@ -712,14 +659,6 @@ pub struct AgentMclStateDto {
     pub base_program_hash: String,
     pub plan_hash: String,
     pub plan_generation: u64,
-    pub workflows: Vec<WorkflowMclStateDto>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowMclStateDto {
-    pub instance_id: String,
-    pub resource_id: ResourceIdDto,
-    pub program_hash: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
