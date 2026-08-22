@@ -1077,6 +1077,9 @@ fn begin_import(
     let is_compact_prompt = resource_id.resource_type() == "prompt"
         && resource_id.scope() == "user"
         && resource_id.name() == "compact";
+    let is_hook_tool = resource_id.resource_type() == "tool"
+        && resource_id.scope() == "builtin"
+        && resource_id.name() == "hook";
     let soul_path = agent_info.image_root.join("SOUL.md");
     let compact_path = agent_info.image_root.join("COMPACT.md");
     let allowed = agent_info
@@ -1084,7 +1087,8 @@ fn begin_import(
         .iter()
         .any(|dependency| dependency == &resource_id)
         || (is_soul_prompt && soul_path.is_file())
-        || (is_compact_prompt && compact_path.is_file());
+        || (is_compact_prompt && compact_path.is_file())
+        || is_hook_tool;
     if !allowed {
         return Err(MclError::ImportMissing);
     }

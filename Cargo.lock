@@ -260,14 +260,15 @@ dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
  "core_plugin",
+ "hook_plugin",
  "lua_plugin",
  "margatroid_types",
+ "serde_json",
  "shell_plugin",
  "skill_plugin",
  "tempfile",
  "tokio",
  "tool_plugin",
- "workflow_plugin",
 ]
 
 [[package]]
@@ -742,6 +743,23 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hook_plugin"
+version = "0.1.0"
+dependencies = [
+ "agent_plugin",
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "core_plugin",
+ "margatroid_types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tool_plugin",
+]
 
 [[package]]
 name = "http"
@@ -2990,21 +3008,6 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
-
-[[package]]
-name = "workflow_plugin"
-version = "0.1.0"
-dependencies = [
- "agent_plugin",
- "app_runtime_plugin",
- "async_runtime_plugin",
- "core_plugin",
- "margatroid_types",
- "serde_json",
- "tempfile",
- "tokio",
- "tool_plugin",
-]
 
 [[package]]
 name = "workspace_plugin"
