@@ -3,15 +3,15 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use crate::{
+    candidate_resource_entry, ToolCallRequest, ToolCallResponse, ToolError, ToolErrorKind,
+    ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
+};
 use agent_plugin::Agent;
-use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
-use core_plugin::{App, Plugin, Resource, World};
+use app_runtime_plugin::WorldEventExt;
+use core_plugin::{Resource, World};
 use margatroid_types::ResourceId;
 use serde::Deserialize;
-use tool_plugin::{
-    candidate_resource_entry, ToolError, ToolErrorKind, ToolRegisterRequest, ToolRegisterResponse,
-    ToolTemplate,
-};
 
 const PROVIDER_ID: &str = "hook";
 const HOOK_FILE: &str = "hook.toml";
@@ -26,12 +26,12 @@ struct HookMetadata {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HookErrorKind {
+pub(crate) enum HookErrorKind {
     InvalidRoot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HookError {
+pub(crate) struct HookError {
     kind: HookErrorKind,
     message: String,
 }
@@ -61,39 +61,12 @@ impl fmt::Display for HookError {
 
 impl std::error::Error for HookError {}
 
-pub struct HookPlugin {
-    home_root: Arc<PathBuf>,
-}
-
-struct HookRoots {
-    home_root: Arc<PathBuf>,
+pub(crate) struct HookRoots {
+    pub(crate) home_root: Arc<PathBuf>,
 }
 impl Resource for HookRoots {}
 
-impl HookPlugin {
-    pub fn open(home_root: impl Into<PathBuf>) -> Result<Self, HookError> {
-        let home_root = normalize_root(home_root.into()).ok_or_else(|| {
-            HookError::new(
-                HookErrorKind::InvalidRoot,
-                "hook root must be absolute and cannot contain parent traversal",
-            )
-        })?;
-        Ok(Self {
-            home_root: Arc::new(home_root),
-        })
-    }
-}
-
-impl Plugin for HookPlugin {
-    fn build(self, app: &mut App) {
-        app.world_mut().insert_resource(HookRoots {
-            home_root: self.home_root.clone(),
-        });
-        app.add_system(RuntimePlugin::UPDATE, hook_register_system);
-    }
-}
-
-fn hook_register_system(world: &mut World) {
+pub(crate) fn hook_register_system(world: &mut World) {
     let requests = world
         .event_reader::<ToolRegisterRequest>()
         .into_iter()
@@ -146,6 +119,25 @@ fn hook_register_system(world: &mut World) {
             resource_id: request.resource_id,
             alias: request.alias,
             result,
+        });
+    }
+}
+
+pub(crate) fn hook_tool_call_system(world: &mut World) {
+    let hook_tool_id =
+        ResourceId::parse(HOOK_EXECUTOR_ID).expect("built-in Hook tool ID must be valid");
+    let calls = world
+        .event_reader::<ToolCallRequest>()
+        .into_iter()
+        .cloned()
+        .filter(|call| call.tool_id == hook_tool_id)
+        .collect::<Vec<_>>();
+    for call in calls {
+        world.send_event(ToolCallResponse {
+            turn_id: call.turn_id,
+            agent: call.agent,
+            tool_call_id: call.tool_call_id,
+            result: Ok(String::new()),
         });
     }
 }

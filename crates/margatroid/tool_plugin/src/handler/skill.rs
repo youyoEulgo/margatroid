@@ -3,16 +3,16 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use agent_plugin::Agent;
-use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
-use core_plugin::{App, Plugin, Resource, World};
-use margatroid_types::ResourceId;
-use serde::Deserialize;
-use serde_json::json;
-use tool_plugin::{
+use crate::{
     candidate_resource_entry, ToolCallRequest, ToolCallResponse, ToolError, ToolErrorKind,
     ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
 };
+use agent_plugin::Agent;
+use app_runtime_plugin::WorldEventExt;
+use core_plugin::{Resource, World};
+use margatroid_types::ResourceId;
+use serde::Deserialize;
+use serde_json::json;
 
 const PROVIDER_ID: &str = "skill";
 const SKILL_FILE: &str = "SKILL.md";
@@ -31,12 +31,12 @@ struct SkillDocument {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SkillErrorKind {
+pub(crate) enum SkillErrorKind {
     InvalidRoot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SkillError {
+pub(crate) struct SkillError {
     kind: SkillErrorKind,
     message: String,
 }
@@ -66,40 +66,12 @@ impl fmt::Display for SkillError {
 
 impl std::error::Error for SkillError {}
 
-pub struct SkillPlugin {
-    home_root: Arc<PathBuf>,
-}
-
-struct SkillRoots {
-    home_root: Arc<PathBuf>,
+pub(crate) struct SkillRoots {
+    pub(crate) home_root: Arc<PathBuf>,
 }
 impl Resource for SkillRoots {}
 
-impl SkillPlugin {
-    pub fn open(home_root: impl Into<PathBuf>) -> Result<Self, SkillError> {
-        let home_root = normalize_root(home_root.into()).ok_or_else(|| {
-            SkillError::new(
-                SkillErrorKind::InvalidRoot,
-                "skill root must be absolute and cannot contain parent traversal",
-            )
-        })?;
-        Ok(Self {
-            home_root: Arc::new(home_root),
-        })
-    }
-}
-
-impl Plugin for SkillPlugin {
-    fn build(self, app: &mut App) {
-        app.world_mut().insert_resource(SkillRoots {
-            home_root: self.home_root.clone(),
-        });
-        app.add_system(RuntimePlugin::UPDATE, skill_register_system)
-            .add_system(RuntimePlugin::UPDATE, skill_tool_call_system);
-    }
-}
-
-fn skill_register_system(world: &mut World) {
+pub(crate) fn skill_register_system(world: &mut World) {
     let requests = world
         .event_reader::<ToolRegisterRequest>()
         .into_iter()
@@ -151,7 +123,7 @@ fn skill_register_system(world: &mut World) {
     }
 }
 
-fn skill_tool_call_system(world: &mut World) {
+pub(crate) fn skill_tool_call_system(world: &mut World) {
     let calls = world
         .event_reader::<ToolCallRequest>()
         .into_iter()

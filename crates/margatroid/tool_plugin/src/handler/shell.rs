@@ -9,19 +9,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc::SyncSender, Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use crate::{
+    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
+    ToolErrorKind, ToolPluginInstalled, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
+};
 use agent_plugin::Agent;
-use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, WorldEventExt};
-use async_runtime_plugin::{AppAsyncExt, AsyncRuntimeHandle, AsyncTaskError, WorldAsyncExt};
-use core_plugin::{App, Entity, Event, Plugin, Resource, World};
+use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
+use async_runtime_plugin::{AsyncTaskError, WorldAsyncExt};
+use core_plugin::{Entity, Event, Resource, World};
 use margatroid_types::ResourceId;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::Mutex;
-use tool_plugin::{
-    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
-    ToolErrorKind, ToolPluginInstalled, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
-};
 
 const SHELL_TYPE: &str = "shell";
 const SHELL_FILE: &str = "shell.toml";
@@ -31,7 +31,7 @@ const SHELL_EXECUTOR_ID: &str = "tool:builtin/shell:latest";
 static SHELL_MARKER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShellExecutionLimits {
+pub(crate) struct ShellExecutionLimits {
     max_definition_bytes: usize,
     max_script_bytes: usize,
     max_argument_bytes: usize,
@@ -121,57 +121,9 @@ impl fmt::Display for ShellError {
 
 impl std::error::Error for ShellError {}
 
-pub struct ShellPlugin {
-    home_root: Arc<PathBuf>,
-    limits: ShellExecutionLimits,
-}
-
-impl ShellPlugin {
-    pub fn open(home_root: impl Into<PathBuf>) -> Result<Self, ShellError> {
-        let home_root = normalize_root(home_root.into()).ok_or_else(|| {
-            ShellError::new(
-                ShellErrorKind::InvalidRoot,
-                "Shell root must be absolute and cannot contain parent traversal",
-            )
-        })?;
-        Ok(Self {
-            home_root: Arc::new(home_root),
-            limits: ShellExecutionLimits::default(),
-        })
-    }
-
-    pub fn with_limits(mut self, limits: ShellExecutionLimits) -> Result<Self, ShellError> {
-        self.limits = limits;
-        Ok(self)
-    }
-}
-
-impl Plugin for ShellPlugin {
-    fn build(self, app: &mut App) {
-        if !app.world().contains_resource::<RuntimeHandle>()
-            || !app.world().contains_resource::<AsyncRuntimeHandle>()
-            || !app.world().contains_resource::<ToolPluginInstalled>()
-        {
-            panic!("ShellPlugin requires RuntimePlugin, AsyncRuntimePlugin, and ToolPlugin");
-        }
-        if app.world().contains_resource::<ShellRoots>() {
-            panic!("ShellPlugin is already installed");
-        }
-        app.world_mut().insert_resource(ShellRoots {
-            home_root: self.home_root,
-        });
-        app.world_mut().insert_resource(self.limits);
-        app.world_mut().insert_resource(PersistentShells::default());
-        app.add_system(RuntimePlugin::UPDATE, shell_register_system)
-            .add_system(RuntimePlugin::UPDATE, shell_tool_call_prepare_system)
-            .add_async_system(RuntimePlugin::UPDATE, execute_prepared_shell)
-            .add_system(RuntimePlugin::UPDATE, shell_task_result_system);
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ShellRoots {
-    home_root: Arc<PathBuf>,
+pub(crate) struct ShellRoots {
+    pub(crate) home_root: Arc<PathBuf>,
 }
 impl Resource for ShellRoots {}
 
@@ -195,7 +147,7 @@ struct ShellPackage {
 }
 
 #[derive(Clone, Default)]
-struct PersistentShells {
+pub(crate) struct PersistentShells {
     sessions: Arc<Mutex<HashMap<Entity, Arc<Mutex<PersistentShell>>>>>,
 }
 impl Resource for PersistentShells {}
@@ -591,7 +543,7 @@ impl Drop for ShellResponseGuard {
     }
 }
 
-struct PreparedShellToolCall {
+pub(crate) struct PreparedShellToolCall {
     package_root: Arc<PathBuf>,
     arguments: String,
     context: ShellCallContext,
@@ -601,7 +553,7 @@ struct PreparedShellToolCall {
 }
 impl Event for PreparedShellToolCall {}
 
-struct ShellTaskError {
+pub(crate) struct ShellTaskError {
     source: AsyncTaskError,
 }
 impl From<AsyncTaskError> for ShellTaskError {
@@ -610,7 +562,7 @@ impl From<AsyncTaskError> for ShellTaskError {
     }
 }
 
-fn shell_register_system(world: &mut World) {
+pub(crate) fn shell_register_system(world: &mut World) {
     let requests = world
         .event_reader::<ToolRegisterRequest>()
         .into_iter()
@@ -693,7 +645,7 @@ fn register_shell_resource(
     )
 }
 
-fn shell_tool_call_prepare_system(world: &mut World) {
+pub(crate) fn shell_tool_call_prepare_system(world: &mut World) {
     let executor_id = ResourceId::parse(SHELL_EXECUTOR_ID).expect("built-in Shell ID is valid");
     let requests = world
         .event_reader::<ToolCallRequest>()
@@ -779,7 +731,9 @@ fn prepare_shell_tool_call(
     ))
 }
 
-async fn execute_prepared_shell(mut prepared: PreparedShellToolCall) -> Result<(), ShellTaskError> {
+pub(crate) async fn execute_prepared_shell(
+    mut prepared: PreparedShellToolCall,
+) -> Result<(), ShellTaskError> {
     let result = execute_shell(&prepared).await;
     prepared.response.respond(result);
     Ok(())
@@ -945,7 +899,7 @@ struct ShellOutput {
     stderr_truncated: bool,
 }
 
-fn shell_task_result_system(world: &mut World) {
+pub(crate) fn shell_task_result_system(world: &mut World) {
     for result in world
         .event_reader::<Result<(), ShellTaskError>>()
         .into_iter()

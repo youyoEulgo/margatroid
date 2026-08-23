@@ -726,23 +726,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hook_plugin"
-version = "0.1.0"
-dependencies = [
- "agent_plugin",
- "app_runtime_plugin",
- "async_runtime_plugin",
- "core_plugin",
- "margatroid_types",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tool_plugin",
-]
-
-[[package]]
 name = "http"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1117,29 +1100,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lua_plugin"
-version = "0.1.0"
-dependencies = [
- "agent_plugin",
- "app_runtime_plugin",
- "async_runtime_plugin",
- "core_plugin",
- "futures-util",
- "jsonschema",
- "margatroid_types",
- "mcl_plugin",
- "mlua",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tool_plugin",
- "tracing",
-]
-
-[[package]]
 name = "lua_runtime_plugin"
 version = "0.1.0"
 dependencies = [
@@ -1188,17 +1148,13 @@ dependencies = [
  "connection_plugin",
  "core_plugin",
  "dto_plugin",
- "hook_plugin",
  "inference_plugin",
  "log_plugin",
- "lua_plugin",
  "lua_runtime_plugin",
  "mcl_plugin",
  "memory_plugin",
  "resource_id_plugin",
  "server_plugin",
- "shell_plugin",
- "skill_plugin",
  "tool_plugin",
  "tracing",
  "workspace_plugin",
@@ -2065,26 +2021,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shell_plugin"
-version = "0.1.0"
-dependencies = [
- "agent_plugin",
- "app_runtime_plugin",
- "async_runtime_plugin",
- "core_plugin",
- "jsonschema",
- "margatroid_types",
- "nix",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tool_plugin",
- "tracing",
-]
-
-[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2118,23 +2054,6 @@ dependencies = [
  "core_plugin",
  "signal-hook",
  "tracing",
-]
-
-[[package]]
-name = "skill_plugin"
-version = "0.1.0"
-dependencies = [
- "agent_plugin",
- "app_runtime_plugin",
- "async_runtime_plugin",
- "core_plugin",
- "margatroid_types",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tool_plugin",
 ]
 
 [[package]]
@@ -2447,10 +2366,17 @@ dependencies = [
  "async_runtime_plugin",
  "core_plugin",
  "futures-util",
+ "jsonschema",
  "margatroid_types",
+ "mlua",
+ "nix",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

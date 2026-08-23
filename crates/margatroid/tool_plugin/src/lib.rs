@@ -7,6 +7,9 @@ use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use margatroid_types::{AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId};
 
+mod handler;
+use async_runtime_plugin::AppAsyncExt;
+
 const HOOK_TOOL_ID: &str = "tool:builtin/hook:latest";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,13 +180,37 @@ impl Event for CancelToolTurn {}
 
 pub struct ToolPlugin {
     schedule: String,
+    skill_root: Arc<PathBuf>,
+    hook_root: Arc<PathBuf>,
+    lua_root: Arc<PathBuf>,
+    shell_root: Arc<PathBuf>,
+    lua_limits: handler::lua::LuaExecutionLimits,
+    shell_limits: handler::shell::ShellExecutionLimits,
 }
 impl ToolPlugin {
-    pub fn new() -> Self {
-        Self {
-            schedule: RuntimePlugin::UPDATE.to_owned(),
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, ToolError> {
+        let root = root.into();
+        if !root.is_absolute()
+            || root
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err(ToolError::new(
+                ToolErrorKind::InvalidRequest,
+                "tool root must be absolute and cannot contain parent traversal",
+            ));
         }
+        Ok(Self {
+            schedule: RuntimePlugin::UPDATE.to_owned(),
+            skill_root: Arc::new(root.join("skills")),
+            hook_root: Arc::new(root.join("hooks")),
+            lua_root: Arc::new(root.join("tools")),
+            shell_root: Arc::new(root.join("shells")),
+            lua_limits: handler::lua::LuaExecutionLimits::default(),
+            shell_limits: handler::shell::ShellExecutionLimits::default(),
+        })
     }
+
     pub fn with_schedule(mut self, schedule: impl Into<String>) -> Self {
         self.schedule = schedule.into();
         self
@@ -191,7 +218,15 @@ impl ToolPlugin {
 }
 impl Default for ToolPlugin {
     fn default() -> Self {
-        Self::new()
+        Self {
+            schedule: RuntimePlugin::UPDATE.to_owned(),
+            skill_root: Arc::new(PathBuf::new()),
+            hook_root: Arc::new(PathBuf::new()),
+            lua_root: Arc::new(PathBuf::new()),
+            shell_root: Arc::new(PathBuf::new()),
+            lua_limits: handler::lua::LuaExecutionLimits::default(),
+            shell_limits: handler::shell::ShellExecutionLimits::default(),
+        }
     }
 }
 
@@ -222,8 +257,44 @@ impl Plugin for ToolPlugin {
             .panic();
         }
         app.world_mut().insert_resource(ToolPluginInstalled);
+        app.world_mut().insert_resource(handler::skill::SkillRoots {
+            home_root: self.skill_root.clone(),
+        });
+        app.world_mut().insert_resource(handler::hook::HookRoots {
+            home_root: self.hook_root.clone(),
+        });
+        app.world_mut().insert_resource(handler::lua::LuaRoots {
+            home_root: self.lua_root.clone(),
+        });
+        app.world_mut().insert_resource(self.lua_limits);
+        app.world_mut().insert_resource(handler::lua::LuaHttpClient(
+            reqwest::Client::builder()
+                .build()
+                .expect("Lua HTTP client could not be built"),
+        ));
+        app.world_mut().insert_resource(handler::shell::ShellRoots {
+            home_root: self.shell_root.clone(),
+        });
+        app.world_mut().insert_resource(self.shell_limits);
+        app.world_mut()
+            .insert_resource(handler::shell::PersistentShells::default());
         app.add_system(&self.schedule, tool_register_system)
+            .add_system(&self.schedule, handler::skill::skill_register_system)
+            .add_system(&self.schedule, handler::hook::hook_register_system)
+            .add_system(&self.schedule, handler::lua::lua_tool_register_system)
+            .add_system(&self.schedule, handler::shell::shell_register_system)
             .add_system(&self.schedule, tool_call_route_system)
+            .add_system(&self.schedule, handler::skill::skill_tool_call_system)
+            .add_system(&self.schedule, handler::hook::hook_tool_call_system)
+            .add_system(&self.schedule, handler::lua::lua_tool_call_prepare_system)
+            .add_async_system(&self.schedule, handler::lua::execute_prepared_lua_tool)
+            .add_system(&self.schedule, handler::lua::lua_task_result_system)
+            .add_system(
+                &self.schedule,
+                handler::shell::shell_tool_call_prepare_system,
+            )
+            .add_async_system(&self.schedule, handler::shell::execute_prepared_shell)
+            .add_system(&self.schedule, handler::shell::shell_task_result_system)
             .add_system(&self.schedule, cancel_tool_turn_system)
             .add_system(&self.schedule, tool_call_response_system);
     }
