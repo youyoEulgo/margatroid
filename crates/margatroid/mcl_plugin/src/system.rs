@@ -942,12 +942,17 @@ pub fn mcl_effect_response_system(world: &mut World) {
             .and_then(|pending| pending.effects.remove(&response.id));
         let Some(state) = state else { continue };
         let result = match state.kind {
-            crate::MclPendingEffectKind::RealtimeLoad => response
-                .result
-                .map(|messages| {
-                    crate::MclDomainValue::Inner(margatroid_types::BlockInner::Message(messages))
-                })
-                .map_err(|_| MclError::RealtimeReadFailed),
+            crate::MclPendingEffectKind::RealtimeLoad => match response.result {
+                Ok(messages) => Ok(crate::MclDomainValue::Inner(
+                    margatroid_types::BlockInner::Message(messages),
+                )),
+                Err(error) => {
+                    tracing::warn!(agent = %state.agent_id, error = %error, "realtime context read failed; returning empty context");
+                    Ok(crate::MclDomainValue::Inner(
+                        margatroid_types::BlockInner::Message(Vec::new()),
+                    ))
+                }
+            },
             _ => Err(MclError::EffectResponseMismatch),
         };
         world.send_event(MclDomainResponse {
@@ -973,10 +978,13 @@ pub fn mcl_effect_response_system(world: &mut World) {
         {
             Err(MclError::EffectResponseMismatch)
         } else {
-            response
-                .result
-                .map(|content| crate::MclDomainValue::Text(content))
-                .map_err(|_| MclError::InferenceFailed)
+            match response.result {
+                Ok(content) => Ok(crate::MclDomainValue::Text(content)),
+                Err(error) => {
+                    tracing::warn!(agent = %state.agent_id, error = %error, "catch inference failed; returning empty summary");
+                    Ok(crate::MclDomainValue::Text(String::new()))
+                }
+            }
         };
         world.send_event(MclDomainResponse {
             id: state.command_id,
@@ -1015,12 +1023,14 @@ pub fn mcl_effect_response_system(world: &mut World) {
                     AgentFailureKind::Tool => MclError::ToolCallInvalid,
                     AgentFailureKind::Agent => MclError::EffectInvalid,
                 };
-                world.send_event(MclDomainResponse {
-                    id: state.command_id,
-                    agent_id: state.agent_id,
-                    result: Err(error),
-                    reply: state.reply,
-                });
+                tracing::warn!(agent = %state.agent_id, error = %error, "agent failure cleared while start is pending");
+                world
+                    .get_resource_mut::<PendingMclEffects>()
+                    .map(|pending| {
+                        pending
+                            .failures
+                            .insert((failure.agent, failure.id.clone()), error);
+                    });
             }
         } else {
             world
