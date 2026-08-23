@@ -1,4 +1,5 @@
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
+use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::App;
 use margatroid_types::ResourceId;
 use serde_json::json;
@@ -27,6 +28,7 @@ fn resource_registration_builds_an_aliasable_candidate() {
 fn registration_response_is_an_explicit_provider_result() {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
+        .add_plugin(AsyncRuntimePlugin)
         .add_plugin(ToolPlugin::default());
     let agent = app.world_mut().spawn();
     let resource = ResourceId::parse("skill:local/review:latest").unwrap();

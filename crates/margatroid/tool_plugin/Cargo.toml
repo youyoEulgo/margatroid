@@ -9,9 +9,16 @@ app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
 futures-util = { workspace = true }
+jsonschema = { workspace = true }
+mlua = { workspace = true }
+nix = { version = "0.31.2", features = ["process", "term"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
 margatroid_types = { path = "../types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -7,20 +7,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::{
+    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
+    ToolErrorKind, ToolPluginInstalled, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
+};
 use agent_plugin::Agent;
-use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, WorldEventExt};
-use async_runtime_plugin::{AppAsyncExt, AsyncRuntimeHandle, AsyncTaskError, WorldAsyncExt};
-use core_plugin::{App, Entity, Event, Plugin, Resource, World};
+use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
+use async_runtime_plugin::{AsyncTaskError, WorldAsyncExt};
+use core_plugin::{Entity, Event, Resource, World};
 use futures_util::StreamExt;
 use margatroid_types::ResourceId;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tool_plugin::{
-    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
-    ToolErrorKind, ToolPluginInstalled, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
-};
 
 const LUA_RUNTIME_ID: &str = "tool:builtin/lua-runtime:latest";
 const TOOL_METADATA_FILE: &str = "tool.toml";
@@ -28,7 +28,7 @@ const TOOL_SCHEMA_FILE: &str = "input.schema.json";
 const TOOL_SCRIPT_FILE: &str = "main.lua";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LuaExecutionLimits {
+pub(crate) struct LuaExecutionLimits {
     max_definition_bytes: usize,
     max_script_bytes: usize,
     max_argument_bytes: usize,
@@ -134,64 +134,13 @@ impl fmt::Display for LuaError {
 
 impl std::error::Error for LuaError {}
 
-pub struct LuaPlugin {
-    home_root: Arc<PathBuf>,
-    limits: LuaExecutionLimits,
-}
-
-impl LuaPlugin {
-    pub fn open(home_root: impl Into<PathBuf>) -> Result<Self, LuaError> {
-        let home_root = normalize_root(home_root.into()).ok_or_else(|| {
-            LuaError::new(
-                LuaErrorKind::InvalidRoot,
-                "Lua tool root must be absolute and cannot contain parent traversal",
-            )
-        })?;
-        Ok(Self {
-            home_root: Arc::new(home_root),
-            limits: LuaExecutionLimits::default(),
-        })
-    }
-
-    pub fn with_limits(mut self, limits: LuaExecutionLimits) -> Result<Self, LuaError> {
-        self.limits = limits;
-        Ok(self)
-    }
-}
-
-impl Plugin for LuaPlugin {
-    fn build(self, app: &mut App) {
-        if !app.world().contains_resource::<RuntimeHandle>()
-            || !app.world().contains_resource::<AsyncRuntimeHandle>()
-            || !app.world().contains_resource::<ToolPluginInstalled>()
-        {
-            panic!("LuaPlugin requires RuntimePlugin, AsyncRuntimePlugin, and ToolPlugin");
-        }
-        if app.world().contains_resource::<LuaRoots>() {
-            panic!("LuaPlugin is already installed");
-        }
-        let client = reqwest::Client::builder()
-            .build()
-            .unwrap_or_else(|error| panic!("LuaPlugin HTTP client could not be built: {error}"));
-        app.world_mut().insert_resource(LuaRoots {
-            home_root: self.home_root,
-        });
-        app.world_mut().insert_resource(self.limits);
-        app.world_mut().insert_resource(LuaHttpClient(client));
-        app.add_system(RuntimePlugin::UPDATE, lua_tool_register_system)
-            .add_system(RuntimePlugin::UPDATE, lua_tool_call_prepare_system)
-            .add_async_system(RuntimePlugin::UPDATE, execute_prepared_lua_tool)
-            .add_system(RuntimePlugin::UPDATE, lua_task_result_system);
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct LuaRoots {
-    home_root: Arc<PathBuf>,
+pub(crate) struct LuaRoots {
+    pub(crate) home_root: Arc<PathBuf>,
 }
 impl Resource for LuaRoots {}
 
-struct LuaHttpClient(reqwest::Client);
+pub(crate) struct LuaHttpClient(pub(crate) reqwest::Client);
 impl Resource for LuaHttpClient {}
 
 #[derive(Deserialize)]
@@ -313,7 +262,7 @@ impl Drop for LuaToolResponseGuard {
     }
 }
 
-struct PreparedLuaToolCall {
+pub(crate) struct PreparedLuaToolCall {
     package_root: Arc<PathBuf>,
     arguments: String,
     handle: LuaExecutionHandle,
@@ -321,7 +270,7 @@ struct PreparedLuaToolCall {
 }
 impl Event for PreparedLuaToolCall {}
 
-struct LuaTaskError {
+pub(crate) struct LuaTaskError {
     source: AsyncTaskError,
 }
 impl From<AsyncTaskError> for LuaTaskError {
@@ -330,7 +279,7 @@ impl From<AsyncTaskError> for LuaTaskError {
     }
 }
 
-fn lua_tool_register_system(world: &mut World) {
+pub(crate) fn lua_tool_register_system(world: &mut World) {
     let requests = world
         .event_reader::<ToolRegisterRequest>()
         .into_iter()
@@ -402,7 +351,7 @@ fn register_lua_tool(
     )
 }
 
-fn lua_tool_call_prepare_system(world: &mut World) {
+pub(crate) fn lua_tool_call_prepare_system(world: &mut World) {
     let runtime_id = ResourceId::parse(LUA_RUNTIME_ID).expect("built-in Lua runtime ID is valid");
     let requests = world
         .event_reader::<ToolCallRequest>()
@@ -513,7 +462,9 @@ fn prepare_lua_tool_call(
     ))
 }
 
-async fn execute_prepared_lua_tool(mut prepared: PreparedLuaToolCall) -> Result<(), LuaTaskError> {
+pub(crate) async fn execute_prepared_lua_tool(
+    mut prepared: PreparedLuaToolCall,
+) -> Result<(), LuaTaskError> {
     let result = tokio::time::timeout(
         prepared.handle.limits.max_execution_time,
         execute_lua_tool(&prepared),
@@ -591,7 +542,7 @@ async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, Tool
     Ok(result)
 }
 
-fn lua_task_result_system(world: &mut World) {
+pub(crate) fn lua_task_result_system(world: &mut World) {
     for result in world.event_reader::<Result<(), LuaTaskError>>().into_iter() {
         if let Err(error) = result {
             tracing::warn!(error = %error.source, "Lua tool task did not complete");
