@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tool_plugin::{
     candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
-    ToolErrorKind, ToolPluginInstalled, ToolTemplate,
+    ToolErrorKind, ToolPluginInstalled, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
 };
 
 const LUA_RUNTIME_ID: &str = "tool:builtin/lua-runtime:latest";
@@ -186,24 +186,6 @@ impl Plugin for LuaPlugin {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LuaToolRegisterRequest {
-    pub id: String,
-    pub agent: Entity,
-    pub resource_id: ResourceId,
-    pub alias: Option<String>,
-}
-impl Event for LuaToolRegisterRequest {}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct LuaToolRegisterResponse {
-    pub id: String,
-    pub agent: Entity,
-    pub resource_id: ResourceId,
-    pub alias: Option<String>,
-    pub result: Result<ResourceMapEntry, ToolError>,
-}
-impl Event for LuaToolRegisterResponse {}
-
 struct LuaRoots {
     home_root: Arc<PathBuf>,
 }
@@ -350,13 +332,14 @@ impl From<AsyncTaskError> for LuaTaskError {
 
 fn lua_tool_register_system(world: &mut World) {
     let requests = world
-        .event_reader::<LuaToolRegisterRequest>()
+        .event_reader::<ToolRegisterRequest>()
         .into_iter()
         .cloned()
+        .filter(|request| request.resource_id.resource_type() == "tool")
         .collect::<Vec<_>>();
     for request in requests {
         let result = register_lua_tool(world, &request);
-        world.send_event(LuaToolRegisterResponse {
+        world.send_event(ToolRegisterResponse {
             id: request.id,
             agent: request.agent,
             resource_id: request.resource_id,
@@ -368,7 +351,7 @@ fn lua_tool_register_system(world: &mut World) {
 
 fn register_lua_tool(
     world: &mut World,
-    request: &LuaToolRegisterRequest,
+    request: &ToolRegisterRequest,
 ) -> Result<ResourceMapEntry, ToolError> {
     if request.id.is_empty() || !world.is_alive(request.agent) {
         return Err(ToolError::new(

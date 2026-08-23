@@ -7,6 +7,8 @@ use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Event, Plugin, Resource, World};
 use margatroid_types::{AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId};
 
+const HOOK_TOOL_ID: &str = "tool:builtin/hook:latest";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolErrorKind {
     AgentMissing,
@@ -126,23 +128,23 @@ pub struct ResourceMapEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentResourceRegisterRequest {
+pub struct ToolRegisterRequest {
     pub id: String,
     pub agent: Entity,
     pub resource_id: ResourceId,
     pub alias: Option<String>,
 }
-impl Event for AgentResourceRegisterRequest {}
+impl Event for ToolRegisterRequest {}
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AgentResourceRegisterResponse {
+pub struct ToolRegisterResponse {
     pub id: String,
     pub agent: Entity,
     pub resource_id: ResourceId,
     pub alias: Option<String>,
     pub result: Result<ResourceMapEntry, ToolError>,
 }
-impl Event for AgentResourceRegisterResponse {}
+impl Event for ToolRegisterResponse {}
 
 pub use margatroid_types::ToolCallEvent;
 
@@ -220,7 +222,8 @@ impl Plugin for ToolPlugin {
             .panic();
         }
         app.world_mut().insert_resource(ToolPluginInstalled);
-        app.add_system(&self.schedule, tool_call_route_system)
+        app.add_system(&self.schedule, tool_register_system)
+            .add_system(&self.schedule, tool_call_route_system)
             .add_system(&self.schedule, cancel_tool_turn_system)
             .add_system(&self.schedule, tool_call_response_system);
     }
@@ -338,6 +341,62 @@ pub fn validate_agent_tool_calls(
         }
     }
     Ok(())
+}
+
+fn tool_register_system(world: &mut World) {
+    let requests = world
+        .event_reader::<ToolRegisterRequest>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for request in requests {
+        if request.id.is_empty() {
+            world.send_event(ToolRegisterResponse {
+                id: request.id,
+                agent: request.agent,
+                resource_id: request.resource_id,
+                alias: request.alias,
+                result: Err(ToolError::new(
+                    ToolErrorKind::InvalidRequest,
+                    "resource registration request is invalid",
+                )),
+            });
+            continue;
+        }
+        let resource_type = request.resource_id.resource_type();
+        if matches!(resource_type, "skill" | "hook" | "shell") {
+            continue;
+        }
+        if resource_type == "tool" {
+            if request.resource_id.to_string() == HOOK_TOOL_ID {
+                continue;
+            }
+            if request.resource_id.scope() == "builtin" {
+                world.send_event(ToolRegisterResponse {
+                    id: request.id,
+                    agent: request.agent,
+                    resource_id: request.resource_id,
+                    alias: request.alias,
+                    result: Err(ToolError::new(
+                        ToolErrorKind::InvalidRequest,
+                        "built-in executors cannot be registered as visible resources",
+                    )),
+                });
+                continue;
+            }
+            continue;
+        }
+        world.send_event(ToolRegisterResponse {
+            id: request.id,
+            agent: request.agent,
+            resource_id: request.resource_id,
+            alias: request.alias,
+            result: Err(ToolError::new(
+                ToolErrorKind::ProviderMissing,
+                "resource type has no built-in executor",
+            )),
+        });
+    }
 }
 
 fn cancel_tool_turn_system(world: &mut World) {

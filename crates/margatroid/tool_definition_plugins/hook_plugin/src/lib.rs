@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
-use core_plugin::{App, Entity, Event, Plugin, Resource, World};
+use core_plugin::{App, Plugin, Resource, World};
 use margatroid_types::ResourceId;
 use serde::Deserialize;
 use tool_plugin::{
-    candidate_resource_entry, ResourceMapEntry, ToolError, ToolErrorKind, ToolTemplate,
+    candidate_resource_entry, ToolError, ToolErrorKind, ToolRegisterRequest, ToolRegisterResponse,
+    ToolTemplate,
 };
 
 const PROVIDER_ID: &str = "hook";
@@ -23,25 +24,6 @@ struct HookMetadata {
     name: String,
     description: String,
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HookRegisterRequest {
-    pub id: String,
-    pub agent: Entity,
-    pub resource_id: ResourceId,
-    pub alias: Option<String>,
-}
-impl Event for HookRegisterRequest {}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct HookRegisterResponse {
-    pub id: String,
-    pub agent: Entity,
-    pub resource_id: ResourceId,
-    pub alias: Option<String>,
-    pub result: Result<ResourceMapEntry, ToolError>,
-}
-impl Event for HookRegisterResponse {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HookErrorKind {
@@ -113,9 +95,13 @@ impl Plugin for HookPlugin {
 
 fn hook_register_system(world: &mut World) {
     let requests = world
-        .event_reader::<HookRegisterRequest>()
+        .event_reader::<ToolRegisterRequest>()
         .into_iter()
         .cloned()
+        .filter(|request| {
+            request.resource_id.resource_type() == "hook"
+                || request.resource_id.to_string() == HOOK_EXECUTOR_ID
+        })
         .collect::<Vec<_>>();
     for request in requests {
         let result = world
@@ -154,7 +140,7 @@ fn hook_register_system(world: &mut World) {
                 template,
             )
         });
-        world.send_event(HookRegisterResponse {
+        world.send_event(ToolRegisterResponse {
             id: request.id,
             agent: request.agent,
             resource_id: request.resource_id,

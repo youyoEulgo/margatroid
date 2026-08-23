@@ -6,9 +6,10 @@ use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::App;
 use margatroid_types::ResourceId;
-use shell_plugin::{ShellPlugin, ShellRegisterRequest, ShellRegisterResponse};
+use shell_plugin::ShellPlugin;
 use tempfile::tempdir;
 use tool_plugin::{ToolCallRequest, ToolCallResponse, ToolPlugin};
+use tool_plugin::{ToolRegisterRequest, ToolRegisterResponse};
 
 fn attach_agent(
     app: &mut App,
@@ -122,7 +123,7 @@ fn shell_resources_use_a_hidden_executor_and_return_process_output() {
     let agent = attach_agent(&mut app, project.path(), image.path());
 
     let resource_id = ResourceId::parse("shell:local/bash:latest").unwrap();
-    app.world().send_event(ShellRegisterRequest {
+    app.world().send_event(ToolRegisterRequest {
         id: "register-1".into(),
         agent,
         resource_id: resource_id.clone(),
@@ -132,7 +133,7 @@ fn shell_resources_use_a_hidden_executor_and_return_process_output() {
     app.tick();
     let registration = app
         .world()
-        .event_reader::<ShellRegisterResponse>()
+        .event_reader::<ToolRegisterResponse>()
         .into_iter()
         .find(|response| response.id == "register-1")
         .unwrap();
@@ -210,7 +211,7 @@ fn persistent_shell_preserves_directory_and_environment_between_calls() {
         .add_plugin(ShellPlugin::open(home.path()).unwrap());
     let agent = attach_agent(&mut app, project.path(), image.path());
     let resource_id = ResourceId::parse("shell:local/bash:latest").unwrap();
-    app.world().send_event(ShellRegisterRequest {
+    app.world().send_event(ToolRegisterRequest {
         id: "register-persistent".into(),
         agent,
         resource_id: resource_id.clone(),
@@ -220,7 +221,7 @@ fn persistent_shell_preserves_directory_and_environment_between_calls() {
     app.tick();
     let mapping = app
         .world()
-        .event_reader::<ShellRegisterResponse>()
+        .event_reader::<ToolRegisterResponse>()
         .into_iter()
         .find(|response| response.id == "register-persistent")
         .unwrap()

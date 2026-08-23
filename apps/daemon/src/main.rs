@@ -7,18 +7,21 @@ use agent_image_loader_plugin::AgentImageLoaderPlugin;
 use agent_plugin::AgentPlugin;
 use app_runtime_plugin::{AppRunExt, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimePlugin;
-use builtin_tool_plugin::BuiltinToolPlugin;
 use config_plugin::ConfigPlugin;
 use connection_plugin::ConnectionPlugin;
 use core_plugin::App;
 use dto_plugin::DtoPlugin;
+use hook_plugin::HookPlugin;
 use inference_plugin::InferencePlugin;
 use log_plugin::LogPlugin;
+use lua_plugin::LuaPlugin;
 use lua_runtime_plugin::LuaRuntimePlugin;
 use mcl_plugin::MclPlugin;
 use memory_plugin::MemoryPlugin;
 use resource_id_plugin::ResourceIdPlugin;
 use server_plugin::{ServerOptions, ServerPlugin};
+use shell_plugin::ShellPlugin;
+use skill_plugin::SkillPlugin;
 use tool_plugin::ToolPlugin;
 use tracing::info;
 use workspace_plugin::WorkspacePlugin;
@@ -50,8 +53,14 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .map_err(|error| format!("cannot open agent image root: {error}"))?;
     let workspace = WorkspacePlugin::open(&agent_images_root)
         .map_err(|error| format!("cannot open workspace agent image root: {error}"))?;
-    let builtin_tools = BuiltinToolPlugin::open(&data_root)
-        .map_err(|error| format!("cannot open built-in tool roots: {error}"))?;
+    let skill = SkillPlugin::open(data_root.join("skills"))
+        .map_err(|error| format!("cannot open skill root: {error}"))?;
+    let hook = HookPlugin::open(data_root.join("hooks"))
+        .map_err(|error| format!("cannot open hook root: {error}"))?;
+    let lua = LuaPlugin::open(data_root.join("tools"))
+        .map_err(|error| format!("cannot open lua tool root: {error}"))?;
+    let shell = ShellPlugin::open(data_root.join("shells"))
+        .map_err(|error| format!("cannot open shell root: {error}"))?;
     let global_config = ConfigPlugin::open(&config_path)
         .map_err(|error| format!("cannot open global configuration: {error}"))?;
     let bind = global_config.config().server_bind();
@@ -69,7 +78,10 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(agent_images)
         .add_plugin(InferencePlugin::default().with_config_path(models_path.clone()))
         .add_plugin(ToolPlugin::default())
-        .add_plugin(builtin_tools)
+        .add_plugin(skill)
+        .add_plugin(hook)
+        .add_plugin(lua)
+        .add_plugin(shell)
         .add_plugin(MemoryPlugin::default())
         .add_plugin(AgentPlugin::default())
         .add_plugin(mcl)

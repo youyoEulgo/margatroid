@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
-use core_plugin::{App, Entity, Event, Plugin, Resource, World};
+use core_plugin::{App, Plugin, Resource, World};
 use margatroid_types::ResourceId;
 use serde::Deserialize;
 use serde_json::json;
 use tool_plugin::{
-    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
-    ToolErrorKind, ToolTemplate,
+    candidate_resource_entry, ToolCallRequest, ToolCallResponse, ToolError, ToolErrorKind,
+    ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
 };
 
 const PROVIDER_ID: &str = "skill";
@@ -29,25 +29,6 @@ struct SkillDocument {
     metadata: SkillMetadata,
     body: String,
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SkillRegisterRequest {
-    pub id: String,
-    pub agent: Entity,
-    pub resource_id: ResourceId,
-    pub alias: Option<String>,
-}
-impl Event for SkillRegisterRequest {}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SkillRegisterResponse {
-    pub id: String,
-    pub agent: Entity,
-    pub resource_id: ResourceId,
-    pub alias: Option<String>,
-    pub result: Result<ResourceMapEntry, ToolError>,
-}
-impl Event for SkillRegisterResponse {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillErrorKind {
@@ -120,9 +101,10 @@ impl Plugin for SkillPlugin {
 
 fn skill_register_system(world: &mut World) {
     let requests = world
-        .event_reader::<SkillRegisterRequest>()
+        .event_reader::<ToolRegisterRequest>()
         .into_iter()
         .cloned()
+        .filter(|request| request.resource_id.resource_type() == "skill")
         .collect::<Vec<_>>();
     for request in requests {
         let result = world
@@ -159,7 +141,7 @@ fn skill_register_system(world: &mut World) {
                 template,
             )
         });
-        world.send_event(SkillRegisterResponse {
+        world.send_event(ToolRegisterResponse {
             id: request.id,
             agent: request.agent,
             resource_id: request.resource_id,
