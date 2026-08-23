@@ -15,29 +15,51 @@ use crate::{
     AgentTurnState, TokenUsageState,
 };
 
+fn agent_label(world: &World, entity: Entity) -> String {
+    world
+        .get_component::<ResourceId>(entity)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("Entity({entity:?})"))
+}
+
 pub fn handle_agent_create(world: &mut World, request: AgentCreateRequest) {
-    if request.id.is_empty()
-        || request.agent_id.resource_type() != "agent"
-        || !world.is_alive(request.workspace_id)
-        || world
-            .query_with::<ResourceId>()
-            .result()
-            .into_iter()
-            .any(|entity| world.get_component::<ResourceId>(entity) == Some(&request.agent_id))
-        || world
-            .query_with::<Agent>()
-            .result()
-            .into_iter()
-            .any(|entity| {
-                world
-                    .get_component::<Agent>(entity)
-                    .is_some_and(|agent| agent.creation.request_id == request.id)
-            })
+    let invalid_reason = if request.id.is_empty() {
+        Some("request id is empty")
+    } else if request.agent_id.resource_type() != "agent" {
+        Some("agent id is not an agent resource")
+    } else if !world.is_alive(request.workspace_id) {
+        Some("workspace is not alive")
+    } else if world
+        .query_with::<ResourceId>()
+        .result()
+        .into_iter()
+        .any(|entity| world.get_component::<ResourceId>(entity) == Some(&request.agent_id))
     {
-        tracing::error!(request_id = %request.id, "agent creation request is invalid");
+        Some("agent resource id already exists")
+    } else if world
+        .query_with::<Agent>()
+        .result()
+        .into_iter()
+        .any(|entity| {
+            world
+                .get_component::<Agent>(entity)
+                .is_some_and(|agent| agent.creation.request_id == request.id)
+        })
+    {
+        Some("creation request id already exists")
+    } else {
+        None
+    };
+    if let Some(reason) = invalid_reason {
+        tracing::error!(
+            request_id = %request.id,
+            agent_id = %request.agent_id,
+            reason,
+            "agent creation request is invalid"
+        );
         request.reply.send(Err(failure(
             AgentFailureKind::InvalidRequest,
-            "agent creation request is invalid",
+            format!("agent creation request is invalid: {reason}"),
         )));
         return;
     }
@@ -174,7 +196,7 @@ pub fn handle_agent_control(world: &mut World, event: AgentControl) {
 pub fn handle_agent_message(world: &mut World, event: AgentMessage) {
     let result = deliver_agent_message(world, &event);
     if let Err(error) = result {
-        tracing::error!(agent = ?event.agent, error = %error, "agent message delivery failed");
+        tracing::error!(agent = %agent_label(world, event.agent), error = %error, "agent message delivery failed");
         let vm_id = world
             .get_component::<Agent>(event.agent)
             .and_then(|agent| agent.lua.vm_id);
@@ -219,6 +241,7 @@ pub fn handle_agent_initialization_completed(
     world: &mut World,
     event: AgentInitializationCompleted,
 ) {
+    let label = agent_label(world, event.agent);
     let Some(agent) = world.get_component_mut::<Agent>(event.agent) else {
         return;
     };
@@ -229,7 +252,7 @@ pub fn handle_agent_initialization_completed(
         || agent.lua.vm_id != Some(event.vm_id)
         || agent.creation.initialization.failed.is_some()
     {
-        tracing::warn!(agent = ?event.agent, "agent initialization completion does not match the active VM");
+        tracing::warn!(agent = %label, "agent initialization completion does not match the active VM");
         agent.last_error = Some(failure(
             AgentFailureKind::InvalidRequest,
             "agent initialization completion does not match the active VM",
@@ -238,7 +261,7 @@ pub fn handle_agent_initialization_completed(
     }
     agent.creation.initialization.complete = true;
     agent.lifecycle = AgentLifecycleState::Running;
-    tracing::info!(agent = ?event.agent, "agent initialization completed");
+    tracing::info!(agent = %label, "agent initialization completed");
     agent.creation.reply.send(Ok(event.agent));
 }
 
@@ -258,6 +281,7 @@ pub fn handle_lua_vm_finished(world: &mut World, event: LuaRuntimeTaskFinished) 
     let Some(entity) = target else {
         return;
     };
+    let label = agent_label(world, entity);
     let Some(agent) = world.get_component_mut::<Agent>(entity) else {
         return;
     };
@@ -265,7 +289,7 @@ pub fn handle_lua_vm_finished(world: &mut World, event: LuaRuntimeTaskFinished) 
     agent.lua.request_id = None;
     agent.lua.vm_id = None;
     if let Some(runtime_error) = event.error {
-        tracing::error!(agent = ?entity, error = %runtime_error, "agent Lua runtime finished with error");
+        tracing::error!(agent = %label, error = %runtime_error, "agent Lua runtime finished with error");
         let error = failure(AgentFailureKind::LuaRuntime, runtime_error.to_string());
         agent.lifecycle = AgentLifecycleState::Failed;
         agent.last_error = Some(error.clone());
@@ -285,6 +309,9 @@ pub fn handle_lua_vm_finished(world: &mut World, event: LuaRuntimeTaskFinished) 
                 "agent VM stopped before initialization completed",
             )));
         }
+    }
+    if was_creating {
+        world.despawn(entity);
     }
 }
 
@@ -361,7 +388,7 @@ fn deliver_agent_message(
 }
 
 fn fail_creation(world: &mut World, entity: Entity, error: margatroid_types::AgentError) {
-    tracing::error!(agent = ?entity, error = %error, "agent creation failed");
+    tracing::error!(agent = %agent_label(world, entity), error = %error, "agent creation failed");
     if let Some(agent) = world.get_component_mut::<Agent>(entity) {
         agent.lifecycle = AgentLifecycleState::Failed;
         agent.creation.initialization.failed = Some(error.clone());

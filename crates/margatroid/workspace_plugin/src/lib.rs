@@ -619,10 +619,14 @@ fn collect_agent_image_system(world: &mut World) {
         let Some((workspace, name)) = route else {
             continue;
         };
+        let workspace_name = world
+            .get_component::<Workspace>(workspace)
+            .map(|value| value.definition().name.clone())
+            .unwrap_or_default();
         let image = match image_result {
             Ok(image) => image,
             Err(error) => {
-                tracing::error!(agent = %name, error = %error, "agent image load failed");
+                tracing::error!(workspace = %workspace_name, agent = %name, error = %error, "agent image load failed");
                 if let Some(value) = world.get_component_mut::<Workspace>(workspace) {
                     value.states.insert(
                         name,
@@ -653,6 +657,16 @@ fn collect_agent_image_system(world: &mut World) {
             continue;
         };
         let base_lua = image_data.base_driver().program().clone();
+        let image_root = world
+            .get_resource::<WorkspaceRegistry>()
+            .map(|registry| {
+                registry
+                    .agent_images_root
+                    .join(definition.image.scope())
+                    .join(definition.image.name())
+                    .join(definition.image.tag())
+            })
+            .unwrap_or_default();
         let model = AgentModelInfo {
             provider: "openai-compatible".into(),
             model: image_data.model().model().into(),
@@ -670,7 +684,7 @@ fn collect_agent_image_system(world: &mut World) {
                 .join("memory.sql")
         });
         let Ok((memory, context)) = AgentMemory::open(memory_path) else {
-            tracing::error!(agent = %name, "agent memory could not be opened");
+            tracing::error!(workspace = %workspace_name, agent = %name, "agent memory could not be opened");
             if let Some(value) = world.get_component_mut::<Workspace>(workspace) {
                 value.states.insert(
                     name,
@@ -706,16 +720,7 @@ fn collect_agent_image_system(world: &mut World) {
                 libraries: lua_runtime_plugin::LuaStandardLibraries::Safe,
             },
             project_root: configuration.project_root().to_path_buf(),
-            image_root: world
-                .get_resource::<WorkspaceRegistry>()
-                .map(|registry| {
-                    registry
-                        .agent_images_root
-                        .join(definition.image.scope())
-                        .join(definition.image.name())
-                        .join(definition.image.tag())
-                })
-                .unwrap_or_default(),
+            image_root: image_root.clone(),
             home_root: configuration.definition().project_root.clone(),
             model,
             memory: AgentMemoryHandle::new(Arc::new(memory)),
@@ -727,15 +732,33 @@ fn collect_agent_image_system(world: &mut World) {
                     .map(|dependency| dependency.resource_id().clone())
                     .collect::<Vec<_>>(),
             ),
-            image_sources: image_data
-                .dependencies()
-                .iter()
-                .filter_map(|dependency| {
-                    dependency
-                        .source()
-                        .map(|source| (dependency.resource_id().clone(), Arc::<str>::from(source)))
-                })
-                .collect::<HashMap<_, _>>(),
+            image_sources: {
+                let mut sources = image_data
+                    .dependencies()
+                    .iter()
+                    .filter_map(|dependency| {
+                        dependency.source().map(|source| {
+                            (dependency.resource_id().clone(), Arc::<str>::from(source))
+                        })
+                    })
+                    .collect::<HashMap<_, _>>();
+                for dependency in image_data.dependencies() {
+                    if dependency.resource_id().resource_type() != "prompt" {
+                        continue;
+                    }
+                    let file_name =
+                        format!("{}.md", dependency.resource_id().name().to_uppercase());
+                    if let Ok(content) = std::fs::read_to_string(image_root.join(file_name)) {
+                        if !content.trim().is_empty() {
+                            sources.insert(
+                                dependency.resource_id().clone(),
+                                Arc::<str>::from(content),
+                            );
+                        }
+                    }
+                }
+                sources
+            },
             reply: AgentCreateReply::new(sender),
         });
     }
@@ -744,9 +767,13 @@ fn collect_agent_image_system(world: &mut World) {
         .map(|registry| std::mem::take(&mut registry.pending_agents))
         .unwrap_or_default();
     for (id, (workspace, name, mut receiver)) in pending {
+        let workspace_name = world
+            .get_component::<Workspace>(workspace)
+            .map(|value| value.definition().name.clone())
+            .unwrap_or_default();
         match receiver.try_recv() {
             Ok(Ok(agent)) => {
-                tracing::info!(agent = %name, "agent created");
+                tracing::info!(workspace = %workspace_name, agent = %name, "agent created");
                 if let Some(index) = world.get_component_mut::<Workspace>(workspace) {
                     index.agents.insert(name.clone(), agent);
                     index
@@ -755,7 +782,7 @@ fn collect_agent_image_system(world: &mut World) {
                 }
             }
             Ok(Err(error)) => {
-                tracing::error!(agent = %name, error = %error, "agent create failed");
+                tracing::error!(workspace = %workspace_name, agent = %name, error = %error, "agent create failed");
                 if let Some(index) = world.get_component_mut::<Workspace>(workspace) {
                     index.states.insert(
                         name,
@@ -806,7 +833,7 @@ fn collect_agent_initialization_system(world: &mut World) {
             .find(|definition| definition.id == agent_id)
             .map(|definition| definition.name.clone());
         if let Some(agent_name) = agent_name {
-            tracing::info!(agent = %agent_name, "agent initialization completed");
+            tracing::info!(workspace = %value.definition().name, agent = %agent_name, "agent initialization completed");
             value.agents.insert(agent_name.clone(), event.agent);
             value.states.insert(
                 agent_name,
