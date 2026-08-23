@@ -706,10 +706,14 @@ fn begin_start(world: &mut World, request: MclDomainRequest) -> Result<(), MclEr
             .get_resource_mut::<PendingMclEffects>()
             .and_then(|pending| pending.failures.remove(&(agent, turn_id.clone())))
         {
+            tracing::warn!(
+                agent = %request.agent_id,
+                error = %error,
+                "inference failure cleared; agent keeps waiting for the next message"
+            );
             if let Some(agent_state) = world.get_component_mut::<Agent>(agent) {
                 agent_state.turn.abort();
             }
-            return Err(error);
         }
     }
     let vm_id = world
