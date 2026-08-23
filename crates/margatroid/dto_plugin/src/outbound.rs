@@ -192,14 +192,14 @@ fn report_agent_messages(world: &World, targets: &[WebSocketMessageTarget]) {
                 request_id = %message.id,
                 workspace = %message.workspace.name,
                 agent = %message.agent,
-                "user message routed"
+                "user message sent"
             ),
             MessageDto::Assistant { tool_calls, .. } => tracing::info!(
                 request_id = %message.id,
                 workspace = %message.workspace.name,
                 agent = %message.agent,
                 tool_calls = tool_calls.len(),
-                "assistant message produced"
+                "assistant message sent"
             ),
             MessageDto::Tool { .. } => continue,
         }

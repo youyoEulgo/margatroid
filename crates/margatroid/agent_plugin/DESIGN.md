@@ -1,3 +1,77 @@
+# 伪代码格式
+```text
+模块：使用一级标题，只写当前设计涉及的部分
+
+类型：使用二级标题，按私有、crate公开和公开分组
+TypeName：中文类型名，可见性类型--类型说明
+    field_name: RustType--中文字段名，字段说明
+    method_name<Generic>(self, parameter: ParameterType) -> ReturnType
+        中文方法名：可见性方法，解释参数和用途
+        约束：使用标准Rust where约束；单个约束写在同一行
+        行为：展开完整逻辑
+    impl TraitName for TypeName
+        TraitName：可见性trait实现
+        trait_method_name(&self, parameter: ParameterType) -> ReturnType
+            中文方法名：解释参数和用途
+            行为：标准库trait的简单行为用一句话说明
+
+函数：使用二级标题，按私有和公开分组，只放置不属于某个类型的操作
+function_name<Generic>(parameter: ParameterType) -> ReturnType
+    中文函数名：可见性函数，解释参数和用途
+    约束：使用标准Rust where约束；单个约束写在同一行
+    行为：展开完整逻辑
+
+逻辑：使用二级标题，按执行顺序描述对象之间的调用关系
+注释：字段注释使用--，类型、方法和函数的说明直接写在标题中
+属性：不写Rust Attribute，实现时自行判断
+边界：对外使用泛型和具体类型，内部使用类型擦除
+```
+
+# 板块格式
+
+每个 crate 的 DESIGN.md 在伪代码格式之后使用六个一级标题，按 `lib`、`system`、`handler`、`events`、`types`、`error` 顺序组织。每个标题对应 `src/` 下的同名 Rust 文件：
+
+```text
+# lib        src/lib.rs        图书馆组件与 Plugin
+# system     src/system.rs     System 函数
+# handler    src/handler.rs    处理函数
+# events     src/events.rs     事件类型
+# types      src/types.rs      其余类型
+# error      src/error.rs      Error 与公开错误分类
+```
+
+## lib
+
+lib 只放图书馆组件和 Plugin。
+
+图书馆组件是 Entity 必须挂载的领域组件，组件存在本身表明 Entity 的领域身份；例如：
+
+```text
+Agent Entity     必须挂载 Agent 组件 + ResourceId 组件
+Workspace Entity 必须挂载 Workspace 组件 + ResourceId 组件
+```
+
+AgentPlugin 等 Plugin 结构体，以及 AgentPluginInstalled 等 Plugin 安装标记 Resource，也放在 lib。
+
+## system
+
+system 放 System 函数。System 只负责读取本帧领域事件并克隆，然后调用 handler 中的对应处理函数；System 不展开业务逻辑。
+
+## handler
+
+handler 放处理函数。每个 System 读到的领域事件在 handler 中展开为完整业务逻辑。
+
+## events
+
+events 放事件类型。事件类型只包含字段和 `impl Event`，不实现业务逻辑。
+
+## types
+
+types 放除事件和错误外的其余类型：一次性回执、生命周期状态、组件字段依赖的领域类型、trait 等。
+
+## error
+
+error 放 Error 类型和公开错误分类。
 # lib
 
 ## 类型
@@ -69,6 +143,106 @@ Entity识别：
     AgentPlugin不创建、执行或销毁Lua VM，只通过LuaRuntimeHandle注册、投递消息和停止VM
 ```
 
+# system
+
+## 函数
+
+crate公开：
+```text
+agent_create_system(world: &mut World)
+    创建System：crate公开System
+    处理事件：AgentCreateRequest
+    行为：克隆本帧全部AgentCreateRequest，逐个调用handle_agent_create
+
+agent_control_system(world: &mut World)
+    控制System：crate公开System
+    处理事件：AgentControl
+    行为：克隆本帧全部AgentControl，逐个调用handle_agent_control
+
+agent_message_system(world: &mut World)
+    消息System：crate公开System
+    处理事件：AgentMessage
+    行为：克隆本帧全部AgentMessage，逐个调用handle_agent_message
+
+agent_lua_vm_state_system(world: &mut World)
+    Lua VM状态System：crate公开System
+    处理事件：LuaVmStarted、AgentInitializationCompleted、LuaRuntimeTaskFinished
+    行为：
+        克隆本帧全部LuaVmStarted并逐个调用handle_lua_vm_started
+        克隆本帧全部AgentInitializationCompleted并逐个调用handle_agent_initialization_completed
+        克隆本帧全部LuaRuntimeTaskFinished并逐个调用handle_lua_vm_finished
+```
+
+# handler
+
+## 函数
+
+crate公开：
+```text
+handle_agent_create(world: &mut World, request: AgentCreateRequest)
+    处理创建：crate公开函数
+    行为：
+        校验请求、Workspace和agent_id唯一性，失败时在日志和错误消息中携带具体 reason
+        创建Entity并分别挂载ResourceId(agent_id)和完整Agent
+        把除身份外的静态信息、image_entity、空BlockAssembly、空RefBlockAssembly、memory和TokenUsage写入Agent
+        读取ResourceId并与Agent.info组合出Lua agent_info表
+        确认Agent.memory已经可读后，构造providers显式包含agent_info和mcl、owner_id为agent_id的LongRunning LuaRuntimeRequest
+        提交前把运行时request_id写入Agent.lua.request_id
+        调用LuaRuntimeHandle::register_long_running
+        Agent在Base Lua初始化完成前保持Creating，不得通过AgentCreateReply报告成功
+        同步失败时把Agent.lifecycle改为Failed并通过AgentCreateReply返回错误
+
+handle_agent_control(world: &mut World, event: AgentControl)
+    处理控制：crate公开函数
+    行为：
+        要求目标Entity同时具有Agent和ResourceId
+        按event.control调用唯一对应的生命周期函数
+        立即完成时调用event.reply.send
+        失败时写入Agent.last_error并调用event.reply.send(Err)
+
+handle_agent_message(world: &mut World, event: AgentMessage)
+    处理消息：crate公开函数
+    行为：
+        要求目标Entity同时具有Agent和ResourceId、Agent.lifecycle为Running且Agent.lua.vm_id存在
+        验证User不携带tool_calls
+        将event.id、event.message和event.usage组合成AgentLuaMessageEnvelope，再转换为LuaValue并调用LuaRuntimeHandle::send_message
+        不解析消息角色、不维护pending_tool、不写上下文、不启动下一轮推理
+        投递成功即结束；投递失败时写入Agent.last_error、把生命周期设为Failed并停止长期VM，使正在等待start的邮箱receive以错误完成
+
+handle_lua_vm_started(world: &mut World, event: LuaVmStarted)
+    处理VM启动：crate公开函数
+    行为：按Agent.lua.request_id定位唯一Agent，写入vm_id、清空request_id；保持lifecycle=Creating，不提前完成创建回执
+
+handle_agent_initialization_completed(world: &mut World, event: AgentInitializationCompleted)
+    完成Base Lua初始化：crate公开函数
+    行为：要求目标Agent仍为Creating、Agent.lua.vm_id等于event.vm_id且initialization.failed为空
+        设置initialization.complete=true和lifecycle=Running，通过Agent.creation.reply返回Entity
+        重复事件按幂等忽略；Agent、VM或生命周期不匹配时记录稳定错误且不完成错误实例的回执
+
+handle_lua_vm_finished(world: &mut World, event: LuaRuntimeTaskFinished)
+    处理VM结束：crate公开函数
+    行为：
+        启动前失败时按request_id定位Agent，设置lifecycle=Failed并通过创建回执返回错误
+        运行后结束时按vm_id定位Agent，清空Agent.lua并根据结果设置Stopped或Failed
+        失败时写入Agent.last_error
+        Agent仍处于Creating时结束：先发送创建回执，再despawn Agent Entity，释放agent_id供后续创建复用
+
+control_stop(world: &mut World, agent: Entity) -> Result<(), AgentError>
+    停止Agent：crate公开函数，将Agent.lifecycle设为Stopping并调用LuaRuntimeHandle::stop_long_running
+```
+
+AgentPlugin控制边界：
+```text
+AgentPlugin不定义或实现visibility、conversation、history、realtime、compression、inference和tool语义
+AgentPlugin不提供恢复默认可见性、删除全部可见性、中止推理或压缩上下文等专用控制
+Agent只聚合AgentMcl并提供mcl与mcl_mut访问，不实现任何Block操作
+AgentMcl封装BlockAssembly和RefBlockAssembly，并提供insert、delete、cover三个字段级机械修改方法
+MclPlugin负责解析MCL命令、查找Agent Entity、读取Agent组件、解析绑定和删除条件，再调用AgentMcl对应的机械修改方法
+AgentPlugin不得从Block名称、字段名称、内容类型或调用来源推断Block用途
+AgentMcl不公开内部BlockAssembly和RefBlockAssembly的可变引用，防止其他领域绕过insert、delete、cover
+真实Block和RefBlock共享同一个block_id命名空间，AgentMcl禁止两套程序集出现相同ID
+Stop只结束Agent自身的长期Lua VM和生命周期，不读取或修改任何Block
+```
 # events
 
 ## 类型
@@ -297,36 +471,6 @@ mcl(target_agent_id, command, binding?) -> value | error
     返回值处理：Lua可以使用local value = mcl(...)接收，也可以直接调用mcl(...)忽略返回值；两者都必须等待回执
 ```
 
-# system
-
-## 函数
-
-crate公开：
-```text
-agent_create_system(world: &mut World)
-    创建System：crate公开System
-    处理事件：AgentCreateRequest
-    行为：克隆本帧全部AgentCreateRequest，逐个调用handle_agent_create
-
-agent_control_system(world: &mut World)
-    控制System：crate公开System
-    处理事件：AgentControl
-    行为：克隆本帧全部AgentControl，逐个调用handle_agent_control
-
-agent_message_system(world: &mut World)
-    消息System：crate公开System
-    处理事件：AgentMessage
-    行为：克隆本帧全部AgentMessage，逐个调用handle_agent_message
-
-agent_lua_vm_state_system(world: &mut World)
-    Lua VM状态System：crate公开System
-    处理事件：LuaVmStarted、AgentInitializationCompleted、LuaRuntimeTaskFinished
-    行为：
-        克隆本帧全部LuaVmStarted并逐个调用handle_lua_vm_started
-        克隆本帧全部AgentInitializationCompleted并逐个调用handle_agent_initialization_completed
-        克隆本帧全部LuaRuntimeTaskFinished并逐个调用handle_lua_vm_finished
-```
-
 # error
 
 ## 类型
@@ -348,72 +492,3 @@ AgentCreateResult：Agent创建结果，公开事件--Agent Entity已经创建�
     impl Event + Clone for AgentCreateResult
 ```
 
-# handler
-
-## 函数
-
-crate公开：
-```text
-handle_agent_create(world: &mut World, request: AgentCreateRequest)
-    处理创建：crate公开函数
-    行为：
-        校验请求、Workspace和agent_id唯一性
-        创建Entity并分别挂载ResourceId(agent_id)和完整Agent
-        把除身份外的静态信息、image_entity、空BlockAssembly、空RefBlockAssembly、memory和TokenUsage写入Agent
-        读取ResourceId并与Agent.info组合出Lua agent_info表
-        确认Agent.memory已经可读后，构造providers显式包含agent_info和mcl、owner_id为agent_id的LongRunning LuaRuntimeRequest
-        提交前把运行时request_id写入Agent.lua.request_id
-        调用LuaRuntimeHandle::register_long_running
-        Agent在Base Lua初始化完成前保持Creating，不得通过AgentCreateReply报告成功
-        同步失败时把Agent.lifecycle改为Failed并通过AgentCreateReply返回错误
-
-handle_agent_control(world: &mut World, event: AgentControl)
-    处理控制：crate公开函数
-    行为：
-        要求目标Entity同时具有Agent和ResourceId
-        按event.control调用唯一对应的生命周期函数
-        立即完成时调用event.reply.send
-        失败时写入Agent.last_error并调用event.reply.send(Err)
-
-handle_agent_message(world: &mut World, event: AgentMessage)
-    处理消息：crate公开函数
-    行为：
-        要求目标Entity同时具有Agent和ResourceId、Agent.lifecycle为Running且Agent.lua.vm_id存在
-        验证User不携带tool_calls
-        将event.id、event.message和event.usage组合成AgentLuaMessageEnvelope，再转换为LuaValue并调用LuaRuntimeHandle::send_message
-        不解析消息角色、不维护pending_tool、不写上下文、不启动下一轮推理
-        投递成功即结束；投递失败时写入Agent.last_error、把生命周期设为Failed并停止长期VM，使正在等待start的邮箱receive以错误完成
-
-handle_lua_vm_started(world: &mut World, event: LuaVmStarted)
-    处理VM启动：crate公开函数
-    行为：按Agent.lua.request_id定位唯一Agent，写入vm_id、清空request_id；保持lifecycle=Creating，不提前完成创建回执
-
-handle_agent_initialization_completed(world: &mut World, event: AgentInitializationCompleted)
-    完成Base Lua初始化：crate公开函数
-    行为：要求目标Agent仍为Creating、Agent.lua.vm_id等于event.vm_id且initialization.failed为空
-        设置initialization.complete=true和lifecycle=Running，通过Agent.creation.reply返回Entity
-        重复事件按幂等忽略；Agent、VM或生命周期不匹配时记录稳定错误且不完成错误实例的回执
-
-handle_lua_vm_finished(world: &mut World, event: LuaRuntimeTaskFinished)
-    处理VM结束：crate公开函数
-    行为：
-        启动前失败时按request_id定位Agent，设置lifecycle=Failed并通过创建回执返回错误
-        运行后结束时按vm_id定位Agent，清空Agent.lua并根据结果设置Stopped或Failed
-        失败时写入Agent.last_error
-
-control_stop(world: &mut World, agent: Entity) -> Result<(), AgentError>
-    停止Agent：crate公开函数，将Agent.lifecycle设为Stopping并调用LuaRuntimeHandle::stop_long_running
-```
-
-AgentPlugin控制边界：
-```text
-AgentPlugin不定义或实现visibility、conversation、history、realtime、compression、inference和tool语义
-AgentPlugin不提供恢复默认可见性、删除全部可见性、中止推理或压缩上下文等专用控制
-Agent只聚合AgentMcl并提供mcl与mcl_mut访问，不实现任何Block操作
-AgentMcl封装BlockAssembly和RefBlockAssembly，并提供insert、delete、cover三个字段级机械修改方法
-MclPlugin负责解析MCL命令、查找Agent Entity、读取Agent组件、解析绑定和删除条件，再调用AgentMcl对应的机械修改方法
-AgentPlugin不得从Block名称、字段名称、内容类型或调用来源推断Block用途
-AgentMcl不公开内部BlockAssembly和RefBlockAssembly的可变引用，防止其他领域绕过insert、delete、cover
-真实Block和RefBlock共享同一个block_id命名空间，AgentMcl禁止两套程序集出现相同ID
-Stop只结束Agent自身的长期Lua VM和生命周期，不读取或修改任何Block
-```
