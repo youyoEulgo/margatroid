@@ -1,45 +1,82 @@
+# 伪代码格式
+```text
+模块：使用一级标题，只写当前设计涉及的部分
+
+类型：使用二级标题，按私有、crate公开和公开分组
+TypeName：中文类型名，可见性类型--类型说明
+    field_name: RustType--中文字段名，字段说明
+    method_name<Generic>(self, parameter: ParameterType) -> ReturnType
+        中文方法名：可见性方法，解释参数和用途
+        约束：使用标准Rust where约束；单个约束写在同一行
+        行为：展开完整逻辑
+    impl TraitName for TypeName
+        TraitName：可见性trait实现
+        trait_method_name(&self, parameter: ParameterType) -> ReturnType
+            中文方法名：解释参数和用途
+            行为：标准库trait的简单行为用一句话说明
+
+函数：使用二级标题，按私有和公开分组，只放置不属于某个类型的操作
+function_name<Generic>(parameter: ParameterType) -> ReturnType
+    中文函数名：可见性函数，解释参数和用途
+    约束：使用标准Rust where约束；单个约束写在同一行
+    行为：展开完整逻辑
+
+逻辑：使用二级标题，按执行顺序描述对象之间的调用关系
+注释：字段注释使用--，类型、方法和函数的说明直接写在标题中
+属性：不写Rust Attribute，实现时自行判断
+边界：对外使用泛型和具体类型，内部使用类型擦除
+```
+
+# 板块格式
+
+每个 crate 的 DESIGN.md 在伪代码格式之后使用六个一级标题，按 `lib`、`system`、`handler`、`events`、`types`、`error` 顺序组织。每个标题对应 `src/` 下的同名 Rust 文件：
+
+```text
+# lib        src/lib.rs        Plugin 与扩展 trait
+# system     src/system.rs     System 函数（当前无）
+# handler    src/handler.rs    处理函数（当前无）
+# events     src/events.rs     事件类型（当前无）
+# types      src/types.rs      ResourceId 组件与解析
+# error      src/error.rs      Error 类型
+```
+
 # lib
 
 ## 类型
 
 公开：
 ```text
-ResourceIdPlugin：统一资源身份插件，公开单元结构体--提供ResourceId组件和World按ID查询能力
-    impl Default for ResourceIdPlugin
+ResourceIdPlugin：统一资源身份插件，公开单元结构体--提供 ResourceId 组件和 World 按 ID 查询能力
     impl Plugin for ResourceIdPlugin
         build(self, app: &mut App)
-            安装插件：要求CorePlugin已安装
-            行为：
-                重复安装时panic
-                插入ResourceIdPluginInstalled
-                不创建索引Resource，不挂载System
+            安装插件：重复安装时 panic；插入 ResourceIdPluginInstalled；不创建索引 Resource，不挂载 System
 
-ResourceIdPluginInstalled：ResourceIdPlugin安装标记，公开Resource
+ResourceIdPluginInstalled：ResourceIdPlugin 安装标记，公开单元 Resource
     impl Resource for ResourceIdPluginInstalled
 ```
 
-## 逻辑
+## 扩展 trait
 
+公开：
 ```text
-插件职责：
-    定义所有可寻址Entity统一使用的ResourceId组件
-    为World提供按规范化ResourceId查询当前Entity的方法
-    查询直接以World当前组件为准，不维护第二份ResourceId到Entity索引
-
-插件边界：
-    ResourceIdPlugin不创建或销毁Entity
-    ResourceIdPlugin不判断资源的领域类型是否允许挂载到某个Entity
-    ResourceIdPlugin不解析Workspace、Agent、Image、Skill、Tool或MCL语义
-    各领域Plugin负责创建Entity并挂载ResourceId，查询统一调用WorldResourceIdExt
+WorldResourceIdExt：World 资源 ID 查询扩展，公开 trait
+    entity_by_resource_id(&self, id: &ResourceId) -> Result<Entity, ResourceIdLookupError>
+        按资源 ID 查询唯一 Entity：要求插件已安装；缺失返回 Missing，多条返回 Duplicate
+    impl WorldResourceIdExt for World
+        实现：以 World 当前组件为准，不维护第二份索引
 ```
+
+# system
+
+当前无 System。
+
+# handler
+
+当前无处理函数。
 
 # events
 
-## 类型
-
-```text
-ResourceIdPlugin不定义事件
-```
+当前无事件类型。
 
 # types
 
@@ -47,54 +84,41 @@ ResourceIdPlugin不定义事件
 
 公开：
 ```text
-ResourceId：统一资源ID，公开Component--所有可寻址Entity共享的稳定身份
+ResourceId：统一资源 ID 组件，公开类型--所有可寻址 Entity 统一使用的身份组件
     resource_type: String--资源类型，私有
-    scope: String--资源命名空间，私有
-    name: String--命名空间内名称，私有
-    tag: String--版本或实例标签，私有；省略时规范化为latest
+    scope: String--作用域，私有
+    name: String--资源名，私有
+    tag: String--标签，私有
     parse(value: impl AsRef<str>) -> Result<Self, ResourceIdError>
-        解析ID：公开关联函数，解析type:scope/name[:tag]并补齐latest
-    new(resource_type: impl Into<String>, scope: impl Into<String>, name: impl Into<String>, tag: Option<impl Into<String>>) -> Result<Self, ResourceIdError>
-        构造ID：公开关联函数，验证字段并在tag为空时补齐latest
+        解析资源 ID：公开关联函数，调用 FromStr
+    new(resource_type, scope, name, tag: Option) -> Result<Self, ResourceIdError>
+        构造资源 ID：公开关联函数，tag 省略时为 latest
     resource_type(&self) -> &str
+        读取类型：公开方法
     scope(&self) -> &str
+        读取作用域：公开方法
     name(&self) -> &str
+        读取名称：公开方法
     tag(&self) -> &str
-    impl fmt::Display for ResourceId
-        Display：始终输出type:scope/name:tag
+        读取标签：公开方法
     impl FromStr for ResourceId
-        FromStr：行为与parse一致
-    impl Clone + Ord + Eq + Hash for ResourceId
-    impl Serialize + Deserialize for ResourceId
-        序列化：使用规范化完整ID字符串
+        解析：格式为 type:scope/name[:tag]，tag 省略时为 latest
+    impl fmt::Display for ResourceId
+        输出：type:scope/name:tag
+    impl Serialize for ResourceId
+        序列化：写为字符串
+    impl Deserialize for ResourceId
+        反序列化：从字符串解析
     impl Component for ResourceId
 
-WorldResourceIdExt：World统一资源寻址扩展，公开trait
-    entity_by_resource_id(&self, id: &ResourceId) -> Result<Entity, ResourceIdLookupError>
-        按ID查询Entity：要求World已经安装ResourceIdPlugin；返回当前唯一匹配Entity
-    impl WorldResourceIdExt for World
-```
-
-## 逻辑
-
+私有：
 ```text
-格式：
-    ResourceId规范格式为type:scope/name:tag
-    省略tag时使用latest
-    四个字段共同参与比较和哈希
-
-身份：
-    ResourceId是跨Plugin查询资源的稳定地址，不等同于Entity句柄
-    Agent、Workspace、AgentImage及其他可寻址运行时对象都挂载ResourceId组件
-    DTO、配置、日志、Memory和前端统一使用规范化ResourceId
-```
-
-# system
-
-## 函数
-
-```text
-ResourceIdPlugin没有System
+validate_type(value: &str) -> Result<(), ResourceIdError>
+    校验类型：小写字母、数字、_ 或 -
+validate_part(value: &str, error: ResourceIdError) -> Result<(), ResourceIdError>
+    校验作用域或名称：非空、非 . 或 ..、不含控制字符、/、\、:
+validate_tag(value: &str) -> Result<(), ResourceIdError>
+    校验标签：首字符为字母数字，后续允许字母数字、_、-、.
 ```
 
 # error
@@ -103,47 +127,45 @@ ResourceIdPlugin没有System
 
 公开：
 ```text
-ResourceIdError：ResourceId解析和验证错误，公开枚举
+ResourceIdError：ResourceId 错误，公开枚举
     Empty
     InvalidType
     InvalidScope
     InvalidName
     InvalidTag
     InvalidFormat
+    impl Clone + Debug + PartialEq + Eq for ResourceIdError
     impl fmt::Display for ResourceIdError
     impl std::error::Error for ResourceIdError
 
-ResourceIdLookupError：World资源寻址错误，公开枚举
-    PluginMissing--World未安装ResourceIdPlugin
-    Missing { id: ResourceId }--没有Entity挂载目标ID
-    Duplicate { id: ResourceId, entities: Vec<Entity> }--多个Entity挂载同一ID
+ResourceIdLookupError：ResourceId 查询错误，公开枚举
+    PluginMissing
+    Missing { id: ResourceId }
+    Duplicate { id: ResourceId, entities: Vec<Entity> }
+    impl Clone + Debug + PartialEq + Eq for ResourceIdLookupError
     impl fmt::Display for ResourceIdLookupError
-        Display：输出稳定错误类型和规范化ResourceId，不输出组件内容
     impl std::error::Error for ResourceIdLookupError
 ```
 
-# handler
-
-## 函数
-
-公开：
-```text
-entity_by_resource_id(world: &World, id: &ResourceId) -> Result<Entity, ResourceIdLookupError>
-    按ID查询：公开函数
-    行为：
-        检查ResourceIdPluginInstalled存在
-        遍历所有挂载ResourceId组件的存活Entity
-        筛选ResourceId与id完全相等的Entity
-        无匹配返回Missing
-        唯一匹配返回该Entity
-        多个匹配按Entity稳定顺序排列后返回Duplicate
-```
-
-## 不变量
+# 逻辑
 
 ```text
-查询只返回当前仍存活且当前挂载目标ResourceId的Entity
-查询不得依赖Workspace、Agent或其他领域索引
-查询不得在重复ID时静默选择第一个Entity
-Entity创建和销毁不需要同步ResourceIdPlugin缓存，因为不存在第二份索引
+插件职责：
+    定义所有可寻址 Entity 统一使用的 ResourceId 组件
+    为 World 提供按规范化 ResourceId 查询当前 Entity 的方法
+    查询直接以 World 当前组件为准，不维护第二份索引
+
+插件边界：
+    ResourceIdPlugin 不创建或销毁 Entity
+    ResourceIdPlugin 不判断资源的领域类型是否允许挂载到某个 Entity
+    各领域 Plugin 负责创建 Entity 并挂载 ResourceId
 ```
+
+# 持有关系
+
+```text
+App
+└── World
+    ├── ResourceIdPluginInstalled
+    └── 各 Entity
+        └── ResourceId 组件
