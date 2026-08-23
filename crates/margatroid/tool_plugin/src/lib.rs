@@ -11,6 +11,7 @@ mod handler;
 use async_runtime_plugin::AppAsyncExt;
 
 const HOOK_TOOL_ID: &str = "tool:builtin/hook:latest";
+const SKILL_LOADER_ID: &str = "tool:builtin/skill-loader:latest";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolErrorKind {
@@ -284,8 +285,6 @@ impl Plugin for ToolPlugin {
             .add_system(&self.schedule, handler::lua::lua_tool_register_system)
             .add_system(&self.schedule, handler::shell::shell_register_system)
             .add_system(&self.schedule, tool_call_route_system)
-            .add_system(&self.schedule, handler::skill::skill_tool_call_system)
-            .add_system(&self.schedule, handler::hook::hook_tool_call_system)
             .add_system(&self.schedule, handler::lua::lua_tool_call_prepare_system)
             .add_async_system(&self.schedule, handler::lua::execute_prepared_lua_tool)
             .add_system(&self.schedule, handler::lua::lua_task_result_system)
@@ -551,7 +550,25 @@ fn tool_call_route_system(world: &mut World) {
                     tool_id: request.tool_id.clone(),
                 },
             );
-            world.send_event(request);
+            if request.tool_id == ResourceId::parse(SKILL_LOADER_ID).unwrap() {
+                let result = handler::skill::execute_skill_call(world, &request);
+                world.send_event(ToolCallResponse {
+                    turn_id: request.turn_id,
+                    agent: request.agent,
+                    tool_call_id: request.tool_call_id,
+                    result,
+                });
+            } else if request.tool_id == ResourceId::parse(HOOK_TOOL_ID).unwrap() {
+                let result = handler::hook::execute_hook_call(world, &request);
+                world.send_event(ToolCallResponse {
+                    turn_id: request.turn_id,
+                    agent: request.agent,
+                    tool_call_id: request.tool_call_id,
+                    result,
+                });
+            } else {
+                world.send_event(request);
+            }
             Ok::<(), ToolError>(())
         })();
         if let Err(error) = result {

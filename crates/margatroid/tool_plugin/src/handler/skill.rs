@@ -1,11 +1,10 @@
-use std::fmt;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{
-    candidate_resource_entry, ToolCallRequest, ToolCallResponse, ToolError, ToolErrorKind,
-    ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
+    candidate_resource_entry, ToolCallRequest, ToolError, ToolErrorKind, ToolRegisterRequest,
+    ToolRegisterResponse, ToolTemplate,
 };
 use agent_plugin::Agent;
 use app_runtime_plugin::WorldEventExt;
@@ -29,43 +28,6 @@ struct SkillDocument {
     metadata: SkillMetadata,
     body: String,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SkillErrorKind {
-    InvalidRoot,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SkillError {
-    kind: SkillErrorKind,
-    message: String,
-}
-
-impl SkillError {
-    fn new(kind: SkillErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-        }
-    }
-
-    pub fn kind(&self) -> SkillErrorKind {
-        self.kind
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl fmt::Display for SkillError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:?}: {}", self.kind, self.message)
-    }
-}
-
-impl std::error::Error for SkillError {}
-
 pub(crate) struct SkillRoots {
     pub(crate) home_root: Arc<PathBuf>,
 }
@@ -123,53 +85,34 @@ pub(crate) fn skill_register_system(world: &mut World) {
     }
 }
 
-pub(crate) fn skill_tool_call_system(world: &mut World) {
-    let calls = world
-        .event_reader::<ToolCallRequest>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    for event in calls
-        .into_iter()
-        .filter(|event| event.tool_id == ResourceId::parse(SKILL_LOADER_ID).unwrap())
-    {
-        let result = world
-            .get_component::<Agent>(event.agent)
-            .ok_or_else(|| {
-                ToolError::new(
-                    ToolErrorKind::ToolEnvironmentMissing,
-                    "agent tool environment is missing",
-                )
-            })
-            .and_then(|agent| {
-                validate_skill_resource(&event.resource_id)?;
-                let roots = world
-                    .get_resource::<SkillRoots>()
-                    .expect("SkillPlugin is installed");
-                let path = find_skill_file(
-                    &agent.info.project_root,
-                    &agent.info.image_root,
-                    &roots.home_root,
-                    &event.resource_id,
-                )?;
-                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
-                    &event.arguments,
-                )
-                .map_err(|_| {
-                    ToolError::new(
-                        ToolErrorKind::InvalidArguments,
-                        "skill arguments must be a JSON object",
-                    )
-                })?;
-                read_skill_document(&path).map(|document| document.body)
-            });
-        world.send_event(ToolCallResponse {
-            turn_id: event.turn_id,
-            agent: event.agent,
-            tool_call_id: event.tool_call_id,
-            result,
-        });
-    }
+pub(crate) fn execute_skill_call(
+    world: &World,
+    request: &ToolCallRequest,
+) -> Result<String, ToolError> {
+    let agent = world.get_component::<Agent>(request.agent).ok_or_else(|| {
+        ToolError::new(
+            ToolErrorKind::ToolEnvironmentMissing,
+            "agent tool environment is missing",
+        )
+    })?;
+    validate_skill_resource(&request.resource_id)?;
+    let roots = world
+        .get_resource::<SkillRoots>()
+        .expect("SkillPlugin is installed");
+    let path = find_skill_file(
+        &agent.info.project_root,
+        &agent.info.image_root,
+        &roots.home_root,
+        &request.resource_id,
+    )?;
+    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&request.arguments)
+        .map_err(|_| {
+            ToolError::new(
+                ToolErrorKind::InvalidArguments,
+                "skill arguments must be a JSON object",
+            )
+        })?;
+    read_skill_document(&path).map(|document| document.body)
 }
 
 fn read_skill_document(path: &Path) -> Result<SkillDocument, ToolError> {
@@ -268,21 +211,4 @@ fn validate_skill_resource(resource: &ResourceId) -> Result<(), ToolError> {
         ));
     }
     Ok(())
-}
-
-fn normalize_root(path: PathBuf) -> Option<PathBuf> {
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|component| component == Component::ParentDir)
-    {
-        return None;
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        if component != Component::CurDir {
-            normalized.push(component.as_os_str());
-        }
-    }
-    Some(normalized)
 }

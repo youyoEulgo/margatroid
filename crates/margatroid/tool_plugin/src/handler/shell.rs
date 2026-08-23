@@ -4,14 +4,14 @@ use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc::SyncSender, Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use crate::{
     candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
-    ToolErrorKind, ToolPluginInstalled, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
+    ToolErrorKind, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
 };
 use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
@@ -89,9 +89,7 @@ impl Resource for ShellExecutionLimits {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellErrorKind {
-    InvalidRoot,
     InvalidLimits,
-    AlreadyInstalled,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,10 +104,6 @@ impl ShellError {
             kind,
             message: message.into(),
         }
-    }
-
-    pub fn kind(&self) -> ShellErrorKind {
-        self.kind
     }
 }
 
@@ -1109,21 +1103,4 @@ fn validate_shell_resource(resource_id: &ResourceId) -> Result<(), ToolError> {
         ));
     }
     Ok(())
-}
-
-fn normalize_root(path: PathBuf) -> Option<PathBuf> {
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|component| component == Component::ParentDir)
-    {
-        return None;
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        if component != Component::CurDir {
-            normalized.push(component.as_os_str());
-        }
-    }
-    Some(normalized)
 }
