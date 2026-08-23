@@ -1,10 +1,11 @@
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::App;
 use margatroid_types::ResourceId;
-use skill_plugin::{SkillPlugin, SkillRegisterRequest, SkillRegisterResponse};
+use skill_plugin::SkillPlugin;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tool_plugin::{ToolCallRequest, ToolCallResponse, ToolPlugin};
+use tool_plugin::{ToolRegisterRequest, ToolRegisterResponse};
 
 fn attach_agent(
     app: &mut App,
@@ -104,7 +105,7 @@ fn skill_loader_reads_skill_and_returns_tool_message() {
         .add_plugin(SkillPlugin::open(home.path()).unwrap());
     let agent = attach_agent(&mut app, project.path(), image.path());
     let resource = ResourceId::parse("skill:local/review:latest").unwrap();
-    app.world().send_event(SkillRegisterRequest {
+    app.world().send_event(ToolRegisterRequest {
         id: "register-1".into(),
         agent,
         resource_id: resource.clone(),
@@ -114,7 +115,7 @@ fn skill_loader_reads_skill_and_returns_tool_message() {
     app.tick();
     let registration = app
         .world()
-        .event_reader::<SkillRegisterResponse>()
+        .event_reader::<ToolRegisterResponse>()
         .into_iter()
         .next()
         .unwrap();

@@ -20,7 +20,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tool_plugin::{
     candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
-    ToolErrorKind, ToolPluginInstalled, ToolTemplate,
+    ToolErrorKind, ToolPluginInstalled, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
 };
 
 const SHELL_TYPE: &str = "shell";
@@ -170,24 +170,6 @@ impl Plugin for ShellPlugin {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShellRegisterRequest {
-    pub id: String,
-    pub agent: Entity,
-    pub resource_id: ResourceId,
-    pub alias: Option<String>,
-}
-impl Event for ShellRegisterRequest {}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ShellRegisterResponse {
-    pub id: String,
-    pub agent: Entity,
-    pub resource_id: ResourceId,
-    pub alias: Option<String>,
-    pub result: Result<ResourceMapEntry, ToolError>,
-}
-impl Event for ShellRegisterResponse {}
-
 struct ShellRoots {
     home_root: Arc<PathBuf>,
 }
@@ -630,13 +612,14 @@ impl From<AsyncTaskError> for ShellTaskError {
 
 fn shell_register_system(world: &mut World) {
     let requests = world
-        .event_reader::<ShellRegisterRequest>()
+        .event_reader::<ToolRegisterRequest>()
         .into_iter()
         .cloned()
+        .filter(|request| request.resource_id.resource_type() == "shell")
         .collect::<Vec<_>>();
     for request in requests {
         let result = register_shell_resource(world, &request);
-        world.send_event(ShellRegisterResponse {
+        world.send_event(ToolRegisterResponse {
             id: request.id,
             agent: request.agent,
             resource_id: request.resource_id,
@@ -648,7 +631,7 @@ fn shell_register_system(world: &mut World) {
 
 fn register_shell_resource(
     world: &mut World,
-    request: &ShellRegisterRequest,
+    request: &ToolRegisterRequest,
 ) -> Result<ResourceMapEntry, ToolError> {
     if request.id.is_empty() || !world.is_alive(request.agent) {
         return Err(ToolError::new(

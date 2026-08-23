@@ -18,8 +18,8 @@ use resource_id_plugin::WorldResourceIdExt;
 use std::sync::Arc;
 use tool_plugin::ToolPluginInstalled;
 use tool_plugin::{
-    register_agent_resource, resolve_agent_tool_definitions, AgentResourceRegisterRequest,
-    AgentResourceRegisterResponse, ResourceContent, ResourceMapEntry,
+    register_agent_resource, resolve_agent_tool_definitions, ResourceContent, ResourceMapEntry,
+    ToolRegisterRequest, ToolRegisterResponse,
 };
 
 use crate::{
@@ -1129,7 +1129,7 @@ fn begin_import(
         .insert(id.clone(), state);
     if is_prompt {
         let (role, content) = prompt_content.expect("prompt content was validated above");
-        world.send_event(AgentResourceRegisterResponse {
+        world.send_event(ToolRegisterResponse {
             id,
             agent,
             resource_id: resource_id.clone(),
@@ -1148,7 +1148,7 @@ fn begin_import(
         });
         return Ok(());
     }
-    world.send_event(AgentResourceRegisterRequest {
+    world.send_event(ToolRegisterRequest {
         id,
         agent,
         resource_id,
@@ -1159,7 +1159,7 @@ fn begin_import(
 
 pub fn mcl_import_response_system(world: &mut World) {
     let responses = world
-        .event_reader::<AgentResourceRegisterResponse>()
+        .event_reader::<ToolRegisterResponse>()
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();

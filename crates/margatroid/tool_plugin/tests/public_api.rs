@@ -3,7 +3,7 @@ use core_plugin::App;
 use margatroid_types::ResourceId;
 use serde_json::json;
 use tool_plugin::{
-    candidate_resource_entry, AgentResourceRegisterResponse, ToolError, ToolPlugin, ToolTemplate,
+    candidate_resource_entry, ToolError, ToolPlugin, ToolRegisterResponse, ToolTemplate,
 };
 
 #[test]
@@ -30,7 +30,7 @@ fn registration_response_is_an_explicit_provider_result() {
         .add_plugin(ToolPlugin::default());
     let agent = app.world_mut().spawn();
     let resource = ResourceId::parse("skill:local/review:latest").unwrap();
-    app.world().send_event(AgentResourceRegisterResponse {
+    app.world().send_event(ToolRegisterResponse {
         id: "registration".into(),
         agent,
         resource_id: resource.clone(),
@@ -43,7 +43,7 @@ fn registration_response_is_an_explicit_provider_result() {
     app.tick();
     let response = app
         .world()
-        .event_reader::<AgentResourceRegisterResponse>()
+        .event_reader::<ToolRegisterResponse>()
         .into_iter()
         .next()
         .unwrap();
