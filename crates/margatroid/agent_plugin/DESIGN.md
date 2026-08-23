@@ -231,6 +231,32 @@ control_stop(world: &mut World, agent: Entity) -> Result<(), AgentError>
     停止Agent：crate公开函数，将Agent.lifecycle设为Stopping并调用LuaRuntimeHandle::stop_long_running
 ```
 
+私有：
+```text
+agent_label(world: &World, entity: Entity) -> String
+    生成日志标签：私有函数，优先读取Entity上的ResourceId字符串，缺失时回退为Entity(N)
+
+deliver_agent_message(world: &World, event: &AgentMessage) -> Result<(), AgentError>
+    投递Agent消息：私有函数
+    行为：
+        要求Entity同时具有Agent和ResourceId，且生命周期为Running
+        拒绝System消息进入长期VM邮箱
+        要求Agent.lua.vm_id存在且LuaRuntimeHandle可用
+        把AgentMessage序列化为AgentLuaMessageEnvelope并发送到长期VM
+
+fail_creation(world: &mut World, entity: Entity, error: AgentError)
+    失败创建：私有函数，写入Failed生命周期、初始化失败、last_error并通过创建回执返回错误
+
+stop_runtime(world: &World, entity: Entity)
+    停止运行时：私有函数，读取ResourceId并调用LuaRuntimeHandle::stop_long_running
+
+agent_info_value(id: &ResourceId, info: &AgentInfo) -> LuaValue
+    构造agent_info：私有函数，把Agent标识、workspace_id、目录根和模型信息转换为Lua表
+
+json_to_lua(value: serde_json::Value) -> LuaValue
+    JSON转Lua：私有函数，递归转换JSON值为LuaValue
+```
+
 AgentPlugin控制边界：
 ```text
 AgentPlugin不定义或实现visibility、conversation、history、realtime、compression、inference和tool语义
