@@ -14,7 +14,7 @@ pub enum MclError {
     TypeMismatch,
     BindingMissing,
     InvalidCommand,
-    ImportMissing,
+    ImportMissing(String),
     ImportFailed,
     ImportResponseMismatch,
     MessageSourceUnavailable,
