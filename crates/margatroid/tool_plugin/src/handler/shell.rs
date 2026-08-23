@@ -10,8 +10,8 @@ use std::sync::{mpsc::SyncSender, Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use crate::{
-    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
-    ToolErrorKind, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
+    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolError, ToolErrorKind,
+    ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
 };
 use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
@@ -492,6 +492,7 @@ struct ShellCallLocator {
     turn_id: String,
     agent: Entity,
     tool_call_id: String,
+    resource_id: ResourceId,
 }
 
 impl ShellResponseGuard {
@@ -501,6 +502,7 @@ impl ShellResponseGuard {
                 turn_id: request.turn_id.clone(),
                 agent: request.agent,
                 tool_call_id: request.tool_call_id.clone(),
+                resource_id: request.resource_id.clone(),
             }),
             events,
         }
@@ -511,11 +513,16 @@ impl ShellResponseGuard {
             .locator
             .take()
             .expect("Shell tool response was already sent");
-        self.events.send_event(ToolCallResponse {
-            turn_id: locator.turn_id,
+        let content = result.unwrap_or_else(|error| error.to_string());
+        self.events.send_event(margatroid_types::AgentMessage {
+            id: locator.turn_id,
             agent: locator.agent,
-            tool_call_id: locator.tool_call_id,
-            result,
+            message: margatroid_types::Message::Tool {
+                resource_id: locator.resource_id,
+                tool_call_id: locator.tool_call_id,
+                content,
+            },
+            usage: None,
         });
     }
 }
@@ -525,14 +532,19 @@ impl Drop for ShellResponseGuard {
         let Some(locator) = self.locator.take() else {
             return;
         };
-        self.events.send_event(ToolCallResponse {
-            turn_id: locator.turn_id,
+        self.events.send_event(margatroid_types::AgentMessage {
+            id: locator.turn_id,
             agent: locator.agent,
-            tool_call_id: locator.tool_call_id,
-            result: Err(ToolError::new(
-                ToolErrorKind::ExecutionFailed,
-                "Shell tool task did not complete",
-            )),
+            message: margatroid_types::Message::Tool {
+                resource_id: locator.resource_id,
+                tool_call_id: locator.tool_call_id,
+                content: ToolError::new(
+                    ToolErrorKind::ExecutionFailed,
+                    "Shell tool task did not complete",
+                )
+                .to_string(),
+            },
+            usage: None,
         });
     }
 }
@@ -639,35 +651,22 @@ fn register_shell_resource(
     )
 }
 
-pub(crate) fn shell_tool_call_prepare_system(world: &mut World) {
-    let executor_id = ResourceId::parse(SHELL_EXECUTOR_ID).expect("built-in Shell ID is valid");
-    let requests = world
-        .event_reader::<ToolCallRequest>()
-        .into_iter()
-        .filter(|request| request.tool_id == executor_id)
-        .cloned()
-        .collect::<Vec<_>>();
-    for request in requests {
-        match prepare_shell_tool_call(world, &request) {
-            Ok((package_root, context, limits, persistent_shells)) => {
-                let response = ShellResponseGuard::new(&request, world.event_sender());
-                world.send_async_event(PreparedShellToolCall {
-                    package_root,
-                    arguments: request.arguments,
-                    context,
-                    limits,
-                    persistent_shells,
-                    response,
-                });
-            }
-            Err(error) => world.send_event(ToolCallResponse {
-                turn_id: request.turn_id,
-                agent: request.agent,
-                tool_call_id: request.tool_call_id,
-                result: Err(error),
-            }),
-        }
-    }
+pub(crate) fn prepare_shell_call(
+    world: &mut World,
+    request: ToolCallRequest,
+) -> Result<(), ToolError> {
+    let (package_root, context, limits, persistent_shells) =
+        prepare_shell_tool_call(world, &request)?;
+    let response = ShellResponseGuard::new(&request, world.event_sender());
+    world.send_async_event(PreparedShellToolCall {
+        package_root,
+        arguments: request.arguments,
+        context,
+        limits,
+        persistent_shells,
+        response,
+    });
+    Ok(())
 }
 
 fn prepare_shell_tool_call(
