@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{
     candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
-    ToolErrorKind, ToolPluginInstalled, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
+    ToolErrorKind, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
 };
 use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
@@ -101,10 +101,7 @@ impl Resource for LuaExecutionLimits {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LuaErrorKind {
-    InvalidRoot,
     InvalidLimits,
-    DependencyMissing,
-    AlreadyInstalled,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,10 +116,6 @@ impl LuaError {
             kind,
             message: message.into(),
         }
-    }
-
-    pub fn kind(&self) -> LuaErrorKind {
-        self.kind
     }
 }
 
@@ -1228,21 +1221,4 @@ fn lua_tool_error(error: mlua::Error) -> ToolError {
         ToolErrorKind::ExecutionFailed,
         format!("Lua tool execution failed: {error}"),
     )
-}
-
-fn normalize_root(path: PathBuf) -> Option<PathBuf> {
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|component| component == Component::ParentDir)
-    {
-        return None;
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        if component != Component::CurDir {
-            normalized.push(component.as_os_str());
-        }
-    }
-    Some(normalized)
 }

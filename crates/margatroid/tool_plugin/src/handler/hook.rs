@@ -1,11 +1,10 @@
-use std::fmt;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{
-    candidate_resource_entry, ToolCallRequest, ToolCallResponse, ToolError, ToolErrorKind,
-    ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
+    candidate_resource_entry, ToolCallRequest, ToolError, ToolErrorKind, ToolRegisterRequest,
+    ToolRegisterResponse, ToolTemplate,
 };
 use agent_plugin::Agent;
 use app_runtime_plugin::WorldEventExt;
@@ -24,43 +23,6 @@ struct HookMetadata {
     name: String,
     description: String,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HookErrorKind {
-    InvalidRoot,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct HookError {
-    kind: HookErrorKind,
-    message: String,
-}
-
-impl HookError {
-    fn new(kind: HookErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-        }
-    }
-
-    pub fn kind(&self) -> HookErrorKind {
-        self.kind
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl fmt::Display for HookError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:?}: {}", self.kind, self.message)
-    }
-}
-
-impl std::error::Error for HookError {}
-
 pub(crate) struct HookRoots {
     pub(crate) home_root: Arc<PathBuf>,
 }
@@ -123,23 +85,11 @@ pub(crate) fn hook_register_system(world: &mut World) {
     }
 }
 
-pub(crate) fn hook_tool_call_system(world: &mut World) {
-    let hook_tool_id =
-        ResourceId::parse(HOOK_EXECUTOR_ID).expect("built-in Hook tool ID must be valid");
-    let calls = world
-        .event_reader::<ToolCallRequest>()
-        .into_iter()
-        .cloned()
-        .filter(|call| call.tool_id == hook_tool_id)
-        .collect::<Vec<_>>();
-    for call in calls {
-        world.send_event(ToolCallResponse {
-            turn_id: call.turn_id,
-            agent: call.agent,
-            tool_call_id: call.tool_call_id,
-            result: Ok(String::new()),
-        });
-    }
+pub(crate) fn execute_hook_call(
+    _world: &World,
+    _request: &ToolCallRequest,
+) -> Result<String, ToolError> {
+    Ok(String::new())
 }
 
 fn read_hook_metadata(package_root: &Path) -> Result<HookMetadata, ToolError> {
@@ -235,21 +185,4 @@ fn validate_hook_resource(resource: &ResourceId) -> Result<(), ToolError> {
         ));
     }
     Ok(())
-}
-
-fn normalize_root(path: PathBuf) -> Option<PathBuf> {
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|component| component == Component::ParentDir)
-    {
-        return None;
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        if component != Component::CurDir {
-            normalized.push(component.as_os_str());
-        }
-    }
-    Some(normalized)
 }
