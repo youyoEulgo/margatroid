@@ -532,28 +532,10 @@ pub fn execute_direct_operation(
     let entity = world
         .entity_by_resource_id(&request.agent_id)
         .map_err(|_| MclError::AgentMissing)?;
-    let mut dependency_sources = world
+    let dependency_sources = world
         .get_component::<Agent>(entity)
         .map(|agent| agent.info.image_sources.clone())
         .unwrap_or_default();
-    for (prompt_id, file_name) in [
-        ("prompt:system/soul:latest", "SOUL.md"),
-        ("prompt:user/compact:latest", "COMPACT.md"),
-    ] {
-        if let Ok(prompt_id) = prompt_id.parse::<ResourceId>() {
-            if !dependency_sources.contains_key(&prompt_id) {
-                let prompt_path = world
-                    .get_component::<Agent>(entity)
-                    .map(|agent| agent.info.image_root.join(file_name))
-                    .unwrap_or_default();
-                if let Ok(content) = std::fs::read_to_string(&prompt_path) {
-                    if !content.trim().is_empty() {
-                        dependency_sources.insert(prompt_id, std::sync::Arc::<str>::from(content));
-                    }
-                }
-            }
-        }
-    }
     let agent = world
         .get_component_mut::<Agent>(entity)
         .ok_or(MclError::AgentMissing)?;
@@ -885,8 +867,12 @@ fn binding_to_inner(
     match kind {
         InnerType::Message => {
             if let Some(alias) = value.as_str() {
-                let resource = aliases.get(alias).ok_or(MclError::ImportMissing)?;
-                let content = sources.get(resource).ok_or(MclError::ImportMissing)?;
+                let resource = aliases.get(alias).ok_or_else(|| {
+                    MclError::ImportMissing(format!("alias `{alias}` is not imported"))
+                })?;
+                let content = sources.get(resource).ok_or_else(|| {
+                    MclError::ImportMissing(format!("content for `{resource}` is unavailable"))
+                })?;
                 let message = if resource.scope() == "system" {
                     Message::System {
                         content: content.to_string(),
@@ -915,7 +901,9 @@ fn binding_to_inner(
         }
         InnerType::ToolCall => {
             if let Some(alias) = value.as_str() {
-                let resource = aliases.get(alias).ok_or(MclError::ImportMissing)?;
+                let resource = aliases.get(alias).ok_or_else(|| {
+                    MclError::ImportMissing(format!("alias `{alias}` is not imported"))
+                })?;
                 return Ok(BlockInner::ResourceId(vec![resource.clone()]));
             }
             if value.is_array() {
@@ -933,9 +921,9 @@ fn binding_to_inner(
                 if let Some(resource) = aliases.get(alias) {
                     return Ok(BlockInner::ResourceId(vec![resource.clone()]));
                 }
-                let resource = alias
-                    .parse::<ResourceId>()
-                    .map_err(|_| MclError::ImportMissing)?;
+                let resource = alias.parse::<ResourceId>().map_err(|_| {
+                    MclError::ImportMissing(format!("invalid resource id `{alias}`"))
+                })?;
                 return Ok(BlockInner::ResourceId(vec![resource]));
             }
             if value.is_array() {

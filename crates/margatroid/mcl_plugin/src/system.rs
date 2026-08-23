@@ -504,7 +504,12 @@ pub fn mcl_domain_system(world: &mut World) {
                         Vec::new()
                     };
                     let tools = resolve_agent_tool_definitions(world, agent, &visible_resources)
-                        .map_err(|_| MclError::ImportMissing)?;
+                        .map_err(|_| {
+                            MclError::ImportMissing(
+                                "visible resources could not be resolved into tool definitions"
+                                    .into(),
+                            )
+                        })?;
                     if let Some(agent_state) = world.get_component_mut::<Agent>(agent) {
                         agent_state.inference.pending.insert(
                             (agent, turn_id.clone()),
@@ -1071,26 +1076,17 @@ fn begin_import(
         .ok_or(MclError::AgentMissing)?
         .info
         .clone();
-    let is_soul_prompt = resource_id.resource_type() == "prompt"
-        && resource_id.scope() == "system"
-        && resource_id.name() == "soul";
-    let is_compact_prompt = resource_id.resource_type() == "prompt"
-        && resource_id.scope() == "user"
-        && resource_id.name() == "compact";
+    let is_prompt = resource_id.resource_type() == "prompt";
     let is_hook_tool = resource_id.resource_type() == "tool"
         && resource_id.scope() == "builtin"
         && resource_id.name() == "hook";
-    let soul_path = agent_info.image_root.join("SOUL.md");
-    let compact_path = agent_info.image_root.join("COMPACT.md");
     let allowed = agent_info
         .image_dependencies
         .iter()
         .any(|dependency| dependency == &resource_id)
-        || (is_soul_prompt && soul_path.is_file())
-        || (is_compact_prompt && compact_path.is_file())
         || is_hook_tool;
     if !allowed {
-        return Err(MclError::ImportMissing);
+        return Err(MclError::ImportMissing(resource_id.to_string()));
     }
     let state = crate::MclImportState {
         command_id: request.id.clone(),
@@ -1101,19 +1097,28 @@ fn begin_import(
         reply: request.reply.clone(),
     };
     let id = format!("mcl-import:{}", request.id.as_str());
-    let prompt_content = if is_soul_prompt {
-        let content = std::fs::read_to_string(&soul_path).map_err(|_| MclError::ImportMissing)?;
+    let prompt_content = if is_prompt {
+        let role = match resource_id.scope() {
+            "system" | "user" => resource_id.scope(),
+            _ => {
+                return Err(MclError::ImportMissing(format!(
+                    "{resource_id} (prompt scope must be system or user)"
+                )))
+            }
+        };
+        let file_name = format!("{}.md", resource_id.name().to_uppercase());
+        let prompt_path = agent_info.image_root.join(&file_name);
+        let content = std::fs::read_to_string(&prompt_path).map_err(|_| {
+            MclError::ImportMissing(format!(
+                "{resource_id} ({file_name} is missing or unreadable)"
+            ))
+        })?;
         if content.trim().is_empty() {
-            return Err(MclError::ImportMissing);
+            return Err(MclError::ImportMissing(format!(
+                "{resource_id} ({file_name} is empty)"
+            )));
         }
-        Some(Arc::<str>::from(content))
-    } else if is_compact_prompt {
-        let content =
-            std::fs::read_to_string(&compact_path).map_err(|_| MclError::ImportMissing)?;
-        if content.trim().is_empty() {
-            return Err(MclError::ImportMissing);
-        }
-        Some(Arc::<str>::from(content))
+        Some((role, Arc::<str>::from(content)))
     } else {
         None
     };
@@ -1122,12 +1127,8 @@ fn begin_import(
         .ok_or(MclError::ImportFailed)?
         .imports
         .insert(id.clone(), state);
-    if resource_id.resource_type() == "prompt" {
-        let role = if resource_id.scope() == "system" {
-            "system"
-        } else {
-            "user"
-        };
+    if is_prompt {
+        let (role, content) = prompt_content.expect("prompt content was validated above");
         world.send_event(AgentResourceRegisterResponse {
             id,
             agent,
@@ -1141,7 +1142,7 @@ fn begin_import(
                 template: None,
                 content: Some(ResourceContent::Prompt {
                     role: role.into(),
-                    content: prompt_content.expect("prompt content was validated above"),
+                    content,
                 }),
             }),
         });
