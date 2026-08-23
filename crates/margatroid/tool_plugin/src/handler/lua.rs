@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{
-    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolCallResponse, ToolError,
-    ToolErrorKind, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
+    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolError, ToolErrorKind,
+    ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
 };
 use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
@@ -159,6 +159,7 @@ struct LuaToolCallLocator {
     turn_id: String,
     agent: Entity,
     tool_call_id: String,
+    resource_id: ResourceId,
 }
 
 struct LuaCallContext {
@@ -219,6 +220,7 @@ impl LuaToolResponseGuard {
                 turn_id: request.turn_id.clone(),
                 agent: request.agent,
                 tool_call_id: request.tool_call_id.clone(),
+                resource_id: request.resource_id.clone(),
             }),
             events,
         }
@@ -229,11 +231,16 @@ impl LuaToolResponseGuard {
             .locator
             .take()
             .expect("Lua tool response was already sent");
-        self.events.send_event(ToolCallResponse {
-            turn_id: locator.turn_id,
+        let content = result.unwrap_or_else(|error| error.to_string());
+        self.events.send_event(margatroid_types::AgentMessage {
+            id: locator.turn_id,
             agent: locator.agent,
-            tool_call_id: locator.tool_call_id,
-            result,
+            message: margatroid_types::Message::Tool {
+                resource_id: locator.resource_id,
+                tool_call_id: locator.tool_call_id,
+                content,
+            },
+            usage: None,
         });
     }
 }
@@ -243,14 +250,19 @@ impl Drop for LuaToolResponseGuard {
         let Some(locator) = self.locator.take() else {
             return;
         };
-        self.events.send_event(ToolCallResponse {
-            turn_id: locator.turn_id,
+        self.events.send_event(margatroid_types::AgentMessage {
+            id: locator.turn_id,
             agent: locator.agent,
-            tool_call_id: locator.tool_call_id,
-            result: Err(ToolError::new(
-                ToolErrorKind::ExecutionFailed,
-                "Lua tool task did not complete",
-            )),
+            message: margatroid_types::Message::Tool {
+                resource_id: locator.resource_id,
+                tool_call_id: locator.tool_call_id,
+                content: ToolError::new(
+                    ToolErrorKind::ExecutionFailed,
+                    "Lua tool task did not complete",
+                )
+                .to_string(),
+            },
+            usage: None,
         });
     }
 }
@@ -344,33 +356,19 @@ fn register_lua_tool(
     )
 }
 
-pub(crate) fn lua_tool_call_prepare_system(world: &mut World) {
-    let runtime_id = ResourceId::parse(LUA_RUNTIME_ID).expect("built-in Lua runtime ID is valid");
-    let requests = world
-        .event_reader::<ToolCallRequest>()
-        .into_iter()
-        .filter(|request| request.tool_id == runtime_id)
-        .cloned()
-        .collect::<Vec<_>>();
-    for request in requests {
-        match prepare_lua_tool_call(world, &request) {
-            Ok((package_root, handle)) => {
-                let response = LuaToolResponseGuard::new(&request, world.event_sender());
-                world.send_async_event(PreparedLuaToolCall {
-                    package_root,
-                    arguments: request.arguments,
-                    handle,
-                    response,
-                });
-            }
-            Err(error) => world.send_event(ToolCallResponse {
-                turn_id: request.turn_id,
-                agent: request.agent,
-                tool_call_id: request.tool_call_id,
-                result: Err(error),
-            }),
-        }
-    }
+pub(crate) fn prepare_lua_call(
+    world: &mut World,
+    request: ToolCallRequest,
+) -> Result<(), ToolError> {
+    let (package_root, handle) = prepare_lua_tool_call(world, &request)?;
+    let response = LuaToolResponseGuard::new(&request, world.event_sender());
+    world.send_async_event(PreparedLuaToolCall {
+        package_root,
+        arguments: request.arguments,
+        handle,
+        response,
+    });
+    Ok(())
 }
 
 fn prepare_lua_tool_call(

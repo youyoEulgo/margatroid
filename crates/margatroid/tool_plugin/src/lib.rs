@@ -161,16 +161,6 @@ pub struct ToolCallRequest {
     pub tool_call_id: String,
     pub arguments: String,
 }
-impl Event for ToolCallRequest {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolCallResponse {
-    pub turn_id: String,
-    pub agent: Entity,
-    pub tool_call_id: String,
-    pub result: Result<String, ToolError>,
-}
-impl Event for ToolCallResponse {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CancelToolTurn {
@@ -285,17 +275,12 @@ impl Plugin for ToolPlugin {
             .add_system(&self.schedule, handler::lua::lua_tool_register_system)
             .add_system(&self.schedule, handler::shell::shell_register_system)
             .add_system(&self.schedule, tool_call_route_system)
-            .add_system(&self.schedule, handler::lua::lua_tool_call_prepare_system)
             .add_async_system(&self.schedule, handler::lua::execute_prepared_lua_tool)
             .add_system(&self.schedule, handler::lua::lua_task_result_system)
-            .add_system(
-                &self.schedule,
-                handler::shell::shell_tool_call_prepare_system,
-            )
             .add_async_system(&self.schedule, handler::shell::execute_prepared_shell)
             .add_system(&self.schedule, handler::shell::shell_task_result_system)
             .add_system(&self.schedule, cancel_tool_turn_system)
-            .add_system(&self.schedule, tool_call_response_system);
+            .add_system(&self.schedule, tool_message_cleanup_system);
     }
 }
 
@@ -552,22 +537,28 @@ fn tool_call_route_system(world: &mut World) {
             );
             if request.tool_id == ResourceId::parse(SKILL_LOADER_ID).unwrap() {
                 let result = handler::skill::execute_skill_call(world, &request);
-                world.send_event(ToolCallResponse {
-                    turn_id: request.turn_id,
-                    agent: request.agent,
-                    tool_call_id: request.tool_call_id,
-                    result,
-                });
+                finish_tool_call(world, request, result);
             } else if request.tool_id == ResourceId::parse(HOOK_TOOL_ID).unwrap() {
                 let result = handler::hook::execute_hook_call(world, &request);
-                world.send_event(ToolCallResponse {
-                    turn_id: request.turn_id,
-                    agent: request.agent,
-                    tool_call_id: request.tool_call_id,
-                    result,
-                });
+                finish_tool_call(world, request, result);
+            } else if request.tool_id
+                == ResourceId::parse("tool:builtin/lua-runtime:latest").unwrap()
+            {
+                let result = handler::lua::prepare_lua_call(world, request.clone());
+                if let Err(error) = result {
+                    finish_tool_call(world, request, Err(error));
+                }
+            } else if request.tool_id == ResourceId::parse("tool:builtin/shell:latest").unwrap() {
+                let result = handler::shell::prepare_shell_call(world, request.clone());
+                if let Err(error) = result {
+                    finish_tool_call(world, request, Err(error));
+                }
             } else {
-                world.send_event(request);
+                let error = ToolError::new(
+                    ToolErrorKind::ProviderMissing,
+                    "tool executor is not registered for this Agent",
+                );
+                finish_tool_call(world, request, Err(error));
             }
             Ok::<(), ToolError>(())
         })();
@@ -582,36 +573,55 @@ fn tool_call_route_system(world: &mut World) {
     }
 }
 
-fn tool_call_response_system(world: &mut World) {
-    let responses = world
-        .event_reader::<ToolCallResponse>()
+fn finish_tool_call(
+    world: &mut World,
+    request: ToolCallRequest,
+    result: Result<String, ToolError>,
+) {
+    let pending = world
+        .get_component_mut::<Agent>(request.agent)
+        .and_then(|agent| {
+            agent.tools.pending.remove(&(
+                request.agent,
+                request.turn_id.clone(),
+                request.tool_call_id.clone(),
+            ))
+        });
+    if pending.is_none() {
+        return;
+    }
+    let content = result.unwrap_or_else(|error| error.to_string());
+    world.send_event(AgentMessage {
+        id: request.turn_id,
+        agent: request.agent,
+        message: Message::Tool {
+            resource_id: request.resource_id,
+            tool_call_id: request.tool_call_id,
+            content,
+        },
+        usage: None,
+    });
+}
+
+fn tool_message_cleanup_system(world: &mut World) {
+    let messages = world
+        .event_reader::<AgentMessage>()
         .into_iter()
         .cloned()
+        .filter_map(|message| match &message.message {
+            Message::Tool { tool_call_id, .. } => {
+                Some((message.id.clone(), message.agent, tool_call_id.clone()))
+            }
+            _ => None,
+        })
         .collect::<Vec<_>>();
-    for response in responses {
-        let request = world
-            .get_component_mut::<Agent>(response.agent)
-            .and_then(|agent| {
-                agent.tools.pending.remove(&(
-                    response.agent,
-                    response.turn_id.clone(),
-                    response.tool_call_id.clone(),
-                ))
-            });
-        let Some(request) = request else {
-            continue;
-        };
-        let content = response.result.unwrap_or_else(|error| error.to_string());
-        world.send_event(AgentMessage {
-            id: response.turn_id.clone(),
-            agent: response.agent,
-            message: Message::Tool {
-                resource_id: request.resource_id,
-                tool_call_id: response.tool_call_id,
-                content,
-            },
-            usage: None,
-        });
+    for (turn_id, agent, tool_call_id) in messages {
+        if let Some(agent_state) = world.get_component_mut::<Agent>(agent) {
+            agent_state
+                .tools
+                .pending
+                .remove(&(agent, turn_id, tool_call_id));
+        }
     }
 }
 
