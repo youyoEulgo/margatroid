@@ -544,6 +544,7 @@ fn validate_messages(messages: &[Message]) -> Result<(), InferenceError> {
     for message in messages {
         let size = match message {
             Message::System { content } | Message::User { content } => content.len(),
+            Message::Error { message } => message.len(),
             Message::Assistant {
                 reasoning,
                 content,

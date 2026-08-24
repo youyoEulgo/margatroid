@@ -216,6 +216,7 @@ impl IntoDomain<Message> for MessageDto {
                 tool_call_id,
                 content,
             }),
+            Self::Error { message } => Ok(Message::Error { message }),
         }
     }
 }
@@ -263,6 +264,9 @@ pub enum MessageDto {
         tool_call_id: String,
         content: String,
     },
+    Error {
+        message: String,
+    },
 }
 
 impl FromDomain<&Message> for MessageDto {
@@ -291,6 +295,9 @@ impl FromDomain<&Message> for MessageDto {
                 resource_id: ResourceIdDto::from_domain(resource_id, ())?,
                 tool_call_id: tool_call_id.clone(),
                 content: content.clone(),
+            }),
+            Message::Error { message } => Ok(Self::Error {
+                message: message.clone(),
             }),
             Message::System { .. } => Err(ProtocolError::new(
                 ProtocolErrorKind::UnsupportedMessage,

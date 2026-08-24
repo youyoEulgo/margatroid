@@ -446,10 +446,10 @@ fn migrate_realtime(transaction: &Transaction<'_>) -> Result<(), MemoryError> {
                 context.tool_context.push(message.clone());
                 context.ordered_messages.push(message);
             }
-            Message::System { .. } => {
+            Message::System { .. } | Message::Error { .. } => {
                 return Err(MemoryError::new(
                     MemoryErrorKind::DecodeFailed,
-                    "legacy realtime context contains a system message",
+                    "legacy realtime context contains an invalid message",
                 ));
             }
         }
@@ -556,6 +556,9 @@ fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>,
                     )
                 })?,
                 content: content.unwrap_or_default(),
+            },
+            "error" if tool_calls.is_empty() && tool_schema.is_empty() => Message::Error {
+                message: content.unwrap_or_default(),
             },
             _ => {
                 return Err(MemoryError::new(
@@ -772,6 +775,9 @@ fn insert_history_message_values(
             Some(resource_id.to_string()),
             Some(tool_call_id.clone()),
         ),
+        Message::Error { message } => {
+            ("error", None, Some(message.clone()), Vec::new(), None, None)
+        }
         Message::System { .. } => {
             return Err(MemoryError::new(
                 MemoryErrorKind::WriteFailed,

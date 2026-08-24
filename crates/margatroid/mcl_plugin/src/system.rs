@@ -9,7 +9,7 @@ use lua_runtime_plugin::{
     LuaValue, LuaVmMessageReceived,
 };
 use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentMessage, AgentRealtimeContextReadCompleted,
+    AgentFailure, AgentMessage, AgentRealtimeContextReadCompleted,
     AgentRealtimeContextReadRequested, CapturedInferenceRequest, CapturedInferenceResponse,
     InferenceRequestEvent, Message, ResourceId, ToolCall, ToolCallEvent,
 };
@@ -273,6 +273,10 @@ fn mcl_message_to_json(
             "resource_id": resource_id,
             "tool_call_id": tool_call_id,
             "content": content,
+        }),
+        margatroid_types::Message::Error { message } => serde_json::json!({
+            "type": "error",
+            "message": message,
         }),
     };
     if let Some(usage) = message.usage {
@@ -658,6 +662,9 @@ pub fn mcl_domain_system(world: &mut World) {
                         .turn
                         .finish(&turn)
                         .map_err(|_| MclError::TurnMismatch)?;
+                    if let Some(pending) = world.get_resource_mut::<PendingMclEffects>() {
+                        pending.failures.remove(&(agent, turn));
+                    }
                     Ok(crate::MclDomainValue::Unit)
                 }
                 MclOperation::Emit { .. } => Ok(crate::MclDomainValue::Unit),
@@ -915,6 +922,9 @@ pub fn mcl_effect_response_system(world: &mut World) {
                         {
                             return Err(MclError::TurnMismatch)
                         }
+                        margatroid_types::Message::Error { .. } => {
+                            agent.turn.abort();
+                        }
                         _ => {}
                     }
                     if let Some(usage) = envelope.message.usage.as_ref() {
@@ -1000,48 +1010,22 @@ pub fn mcl_effect_response_system(world: &mut World) {
         .cloned()
         .collect::<Vec<_>>();
     for failure in failures {
-        let pending_key = world
-            .get_resource::<PendingMclEffects>()
-            .and_then(|pending| {
-                pending.effects.iter().find_map(|(key, state)| {
-                    (state.agent == failure.agent
-                        && world
-                            .get_component::<Agent>(state.agent)
-                            .and_then(|agent| agent.turn.turn_id.as_deref())
-                            == Some(failure.id.as_str())
-                        && matches!(state.kind, crate::MclPendingEffectKind::Start { .. }))
-                    .then(|| key.clone())
-                })
-            });
-        if let Some(key) = pending_key {
-            if let Some(state) = world
-                .get_resource_mut::<PendingMclEffects>()
-                .and_then(|pending| pending.effects.remove(&key))
-            {
-                let error = match failure.kind {
-                    AgentFailureKind::Inference => MclError::InferenceFailed,
-                    AgentFailureKind::Tool => MclError::ToolCallInvalid,
-                    AgentFailureKind::Agent => MclError::EffectInvalid,
-                };
-                tracing::warn!(agent = %state.agent_id, error = %error, "agent failure cleared while start is pending");
-                world
-                    .get_resource_mut::<PendingMclEffects>()
-                    .map(|pending| {
-                        pending
-                            .failures
-                            .insert((failure.agent, failure.id.clone()), error);
-                    });
-            }
-        } else {
-            world
-                .get_resource_mut::<PendingMclEffects>()
-                .map(|pending| {
-                    pending
-                        .failures
-                        .insert((failure.agent, failure.id), MclError::InferenceFailed);
-                });
-        }
+        let agent_label = world
+            .get_component::<ResourceId>(failure.agent)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("Entity({:?})", failure.agent));
+        let error = failure.message.clone();
+        tracing::warn!(agent = %agent_label, error = %error, "agent failure delivered as error message");
+        world.send_event(AgentMessage {
+            id: failure.id,
+            agent: failure.agent,
+            message: Message::Error {
+                message: failure.message,
+            },
+            usage: None,
+        });
     }
+
 }
 
 fn parse_mailbox_message(

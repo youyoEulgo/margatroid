@@ -321,6 +321,9 @@ pub enum Message {
         tool_call_id: String,
         content: String,
     },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
