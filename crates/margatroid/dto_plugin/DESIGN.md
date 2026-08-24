@@ -163,7 +163,7 @@ report_workspace_stop_events(world: &World, targets: &[WebSocketMessageTarget])
     报告Workspace停止：私有函数，发送WorkspaceStopped或WorkspaceStopFailed并记录日志
 
 report_agent_messages(world: &World, targets: &[WebSocketMessageTarget])
-    报告Agent消息：私有函数，将外部可见User和Assistant转换为AgentMessage协议事件；跳过System和Tool
+    报告Agent消息：私有函数，将外部可见User和Assistant转换为AgentMessage协议事件；跳过System、Tool和Error；Error只通过历史状态同步渲染
 
 report_agent_failures(world: &World, targets: &[WebSocketMessageTarget])
     报告Agent失败：私有函数，将AgentFailure转换为协议事件并记录warn

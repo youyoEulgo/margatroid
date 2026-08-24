@@ -23,6 +23,9 @@ MessageDto::Assistant：Assistant展示消息DTO
     content: Option<String>--Assistant正文
     tool_calls: Vec<ToolCallDto>
 
+MessageDto::Error：错误展示消息DTO
+    message: String--Agent创建成功后的轮次级稳定错误文本
+
 ServerMessage::AgentMessageReasoningDelta：思考流式分片
     type: agent.message.reasoning_delta
     id: String--轮次ID

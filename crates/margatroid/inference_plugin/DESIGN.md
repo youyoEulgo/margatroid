@@ -724,7 +724,7 @@ DeepSeekAccumulator：DeepSeek SSE累积器，私有结构体
 私有：
 ```text
 openai_message(message: &Message) -> serde_json::Value
-    OpenAI消息转换：私有函数，System、User、Assistant、Tool转OpenAI JSON；Assistant无tool_calls时不写tool_calls
+    OpenAI消息转换：私有函数，System、User、Assistant、Tool、Error转OpenAI JSON；Error按User内容兜底；Assistant无tool_calls时不写tool_calls
 
 deepseek_message(message: &Message) -> serde_json::Value
     DeepSeek消息转换：私有函数，只有带tool_calls的Assistant写reasoning_content；其余委托openai_message

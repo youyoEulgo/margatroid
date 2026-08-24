@@ -270,6 +270,7 @@ insert_history_message_values(transaction: &Transaction, turn_id: &str, message:
         User写role=user和content，tool_calls与tool_schema固定为[]，reasoning、resource_id与tool_call_id为空
         Assistant写role=assistant、可空reasoning、可空content、tool_calls和tool_schema，resource_id与tool_call_id为空
         Tool写role=tool、content、resource_id和tool_call_id，reasoning为空且tool_calls与tool_schema固定为[]
+        Error写role=error和message，reasoning、resource_id与tool_call_id为空，tool_calls与tool_schema固定为[]
         System返回WriteFailed
         只有Assistant可以携带tool_schema和usage
 

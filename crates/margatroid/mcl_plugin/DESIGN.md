@@ -124,7 +124,7 @@ PendingMclImports：等待资源 Provider 响应的 IMPORT 事务，公开 Resou
 
 PendingMclEffects：等待外部结果的 Effect 事务，公开 Resource
     effects: HashMap<String, MclEffectState>--以 mcl-effect:<command_id> 为键的等待型 Effect 事务
-    failures: HashMap<(Entity, String), MclError>--普通推理或工具链失败先于下一次 start 时，按 Agent 和 turn_id 暂存唯一失败
+    failures: HashMap<(Entity, String), MclError>--兼容字段；当前失败统一通过 AgentMessage(Error) 交付，不再写入暂存
     impl Default for PendingMclEffects
     impl Resource for PendingMclEffects
 ```
@@ -192,7 +192,7 @@ mcl_effect_response_system(world: &mut World)
         Start 响应校验 vm_id、解析邮箱消息、建立或校验 Agent.turn、累加 token usage
         RealtimeLoad 响应包装为 BlockInner::Message
         CatchInference 响应包装为 Text
-        AgentFailure 若匹配等待中的 Start 事务则完成该事务为错误；否则暂存 failures 供下一次 start 使用
+        AgentFailure 统一转换为 AgentMessage(Error) 投递给目标 Agent；Base Lua 通过 start 收到 Error 后写入历史，不回 Err、不暂存、不终止 VM
 
 mcl_import_response_system(world: &mut World)
     IMPORT 响应 System：公开 System
@@ -219,7 +219,7 @@ command_value_to_lua(value: MclCommandValue) -> Result<LuaValue, LuaRuntimeError
     MCL 值转 Lua：私有函数，按 MclDomainValue 变体逐项转换
 
 mcl_message_to_json(message: MclMessage) -> Result<serde_json::Value, LuaRuntimeError>
-    MCL 消息转 JSON：私有函数，Message 字段平铺并追加可选 usage
+    MCL 消息转 JSON：私有函数，Message 字段平铺并追加可选 usage；Error 输出 {type:"error",message}
 
 json_to_lua(value: serde_json::Value) -> Result<LuaValue, LuaRuntimeError>
     JSON 转 Lua：私有函数，递归转换 JSON 值
@@ -354,7 +354,7 @@ parse_message(value: &serde_json::Value) -> Result<MclMessage, MclError>
     解析消息绑定：私有函数，调用 message_from_lua_json
 
 message_from_lua_json(value: serde_json::Value) -> Result<MclMessage, MclError>
-    从 Lua JSON 解析消息：私有函数，按 type 字段解析 system/user/assistant/tool 消息
+    从 Lua JSON 解析消息：私有函数，按 type 字段解析 system/user/assistant/tool/error 消息
 
 empty_inner(kind: InnerType) -> BlockInner
     构造空 BlockInner：私有函数，按 InnerType 返回空数组

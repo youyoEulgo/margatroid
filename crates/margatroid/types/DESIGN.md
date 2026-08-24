@@ -177,6 +177,9 @@ Message：统一消息，公开枚举--所有Margatroid消息Plugin共享的静�
         tool_call_id: String--对应Assistant ToolCall::id
         content: String--工具成功输出或稳定错误文本
     }
+    Error {
+        message: String--Agent完成创建后的轮次级稳定错误文本；由mcl_plugin从AgentFailure转换，Base Lua只写入历史
+    }
     impl Clone for Message
         Clone：公开trait实现
     impl PartialEq + Eq for Message
@@ -193,7 +196,7 @@ AgentMessage：统一Agent消息事件，公开结构体--Margatroid内部所有
         Event：公开trait实现
     impl Clone for AgentMessage
         Clone：公开trait实现
-    限制：message只能是User、Assistant或Tool，不能是System；结构体不提供业务方法；AgentPlugin只投递，Base Lua根据start返回的Message结构决定后续Effect
+    限制：message可以是User、Assistant、Tool或Error，不能是System；结构体不提供业务方法；AgentPlugin只投递，Base Lua根据start返回的Message结构决定后续Effect
 
 AgentFailureKind：Agent执行失败来源，公开枚举--标识无法表示成Message的轮次级失败
     Agent--AgentPlugin在消息分支、上下文或工具定义准备失败时产生
@@ -345,9 +348,11 @@ Workspace定义：
         -> Base Lua通过MCL、Inference和Tool领域组织完整控制循环
 
 失败通道：
-    推理失败不能伪装成Message
+    Agent创建成功后的轮次级失败
         -> InferencePlugin发送AgentFailure
-        -> 后续处理契约暂不定义
+        -> mcl_plugin转换为AgentMessage(Error)投递给Agent
+        -> Base Lua收到Error只执行history_append写入历史
+        -> 前端从历史渲染错误消息
 
 记忆事件：
     Base Lua通过MCL HistoryAppend Effect
