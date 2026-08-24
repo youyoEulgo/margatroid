@@ -520,6 +520,16 @@ fn message_from_lua_json(
             },
             None,
         )),
+        "error" => Ok(margatroid_types::MclMessage::new(
+            Message::Error {
+                message: value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            },
+            None,
+        )),
         _ => Err(MclError::TypeMismatch),
     }
 }

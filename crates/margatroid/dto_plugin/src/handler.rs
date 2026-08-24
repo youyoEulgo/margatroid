@@ -399,7 +399,7 @@ fn report_agent_messages(world: &World, targets: &[WebSocketMessageTarget]) {
                 tool_calls = tool_calls.len(),
                 "assistant message sent"
             ),
-            MessageDto::Tool { .. } => continue,
+            MessageDto::Tool { .. } | MessageDto::Error { .. } => continue,
         }
         send_to_targets(world, targets, ServerMessage::AgentMessage { message });
     }

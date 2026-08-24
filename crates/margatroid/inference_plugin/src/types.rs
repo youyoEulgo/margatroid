@@ -685,6 +685,7 @@ fn openai_message(message: &Message) -> serde_json::Value {
     match message {
         Message::System { content } => serde_json::json!({"role":"system", "content":content}),
         Message::User { content } => serde_json::json!({"role":"user", "content":content}),
+        Message::Error { message } => serde_json::json!({"role":"user", "content":message}),
         Message::Assistant {
             content,
             tool_calls,
