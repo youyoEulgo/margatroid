@@ -110,7 +110,7 @@ app.add_plugin(RuntimePlugin::default())
 ```
 
 官方 daemon 组合负责确定主目录并传入绝对路径。Loader 不根据当前工作目录猜测位置，也不要求
-InferencePlugin、WorkspacePlugin 或 BuiltinToolPlugin 已经安装。
+InferencePlugin、WorkspacePlugin 或 ToolPlugin 已经安装。
 
 ## 加载镜像
 
@@ -181,7 +181,7 @@ fn inspect_loaded_images(world: &mut World) {
 AgentImage 后续刷新不会改变运行中实例；执行 `workspace reload` 后创建的新实例才使用新默认值。
 
 资源内容不进入可见性数据。WorkspacePlugin 同时挂载 `AgentToolEnvironment`；每次请求由
-WorkspacePlugin 遍历动态可见资源并逐个交给 BuiltinToolPlugin 注册工具；具体隐藏执行器从
+WorkspacePlugin 遍历动态可见资源并交给 ToolPlugin 注册工具；具体执行器从
 `AgentToolEnvironment` 取得项目根和镜像根。
 
 ```text
