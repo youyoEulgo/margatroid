@@ -1,9 +1,7 @@
 # AgentPlugin
 
 `AgentPlugin`只拥有Agent实例的Workspace关联、上下文、默认/动态可见性、轮次状态和累计Token状态。它消费
-`AgentCreateRequest`创建Agent自身组件，再发布`AgentCreated`，由WorkspacePlugin按请求ID绑定
-其他组件。每个实例同时挂载`AgentIdentity`，保存完整资源ID，例如`agent:demo/coder:latest`。
-Memory、Inference和Tool组件。
+`AgentCreateRequest`创建Agent自身组件，再通过`AgentCreateReply`把Entity返回给WorkspacePlugin；WorkspacePlugin按请求ID绑定其他组件。每个实例同时挂载`ResourceId`，保存完整资源ID，例如`agent:demo/coder:latest`。Memory、Inference和Tool组件。
 
 `AgentTokenUsage`累计普通Assistant响应的输入、输出和缓存命中Token，并维护累计缓存命中率。该状态在
 Agent创建时由MemoryPlugin从历史Assistant行恢复；上下文压缩推理不进入这份对话统计。

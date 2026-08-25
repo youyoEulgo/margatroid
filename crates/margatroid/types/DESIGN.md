@@ -310,8 +310,8 @@ is_tag_character(character: char) -> bool
 作为资源键：
     AgentImageLoaderPlugin发现scope/name目录
         -> 构造ResourceName
-        -> WorkspacePlugin、BuiltinToolPlugin和具体资源执行器共享同一值类型
-        -> WorkspacePlugin用它保存可见资源，BuiltinToolPlugin用type选择隐藏执行器
+        -> WorkspacePlugin、ToolPlugin和具体资源执行器共享同一值类型
+        -> WorkspacePlugin用它保存可见资源，ToolPlugin用type选择隐藏执行器
 
 构造统一资源ID：
     ResourceId::parse(value)
