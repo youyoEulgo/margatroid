@@ -310,6 +310,8 @@ impl FromDomain<&Message> for MessageDto {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterConnectionDto {
     pub client_type: String,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl IntoDomain<RegisterConnection, (String, WebSocketConnectionId)> for RegisterConnectionDto {
@@ -321,6 +323,7 @@ impl IntoDomain<RegisterConnection, (String, WebSocketConnectionId)> for Registe
             id,
             connection_id,
             client_type: self.client_type,
+            name: self.name,
         })
     }
 }
@@ -475,6 +478,21 @@ impl ClientMessage {
             id: id.into(),
             message: RegisterConnectionDto {
                 client_type: client_type.into(),
+                name: None,
+            },
+        }
+    }
+
+    pub fn register_connection_with_name(
+        id: impl Into<String>,
+        client_type: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self::ConnectionRegister {
+            id: id.into(),
+            message: RegisterConnectionDto {
+                client_type: client_type.into(),
+                name: Some(name.into()),
             },
         }
     }

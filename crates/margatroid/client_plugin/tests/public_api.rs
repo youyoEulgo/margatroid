@@ -1,17 +1,19 @@
 use std::net::SocketAddr;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
+use client_plugin::{Client, ClientPlugin};
 use config_plugin::{ConfigPlugin, LogLevel, MargatroidConfig, WebSocketMessageTarget};
-use connection_plugin::ConnectionPlugin;
 use core_plugin::{App, World};
 use dto_plugin::{DtoPlugin, WebSocketMessageSend};
 use futures_util::{SinkExt, StreamExt};
 use log_plugin::LogPlugin;
 use margatroid_protocol::{ClientMessage, LogRecordDto, ServerMessage, WorkspaceReferenceDto};
-use margatroid_types::{Message, RouteAgentMessage};
+use margatroid_types::{Message, ResourceId, RouteAgentMessage};
+use resource_id_plugin::ResourceIdPlugin;
 use server_plugin::{ServerHandle, ServerPlugin};
 
 fn start(app: &mut App) -> SocketAddr {
@@ -30,8 +32,7 @@ fn start(app: &mut App) -> SocketAddr {
     }
 }
 
-#[test]
-fn registered_client_receives_messages_targeted_by_type() {
+fn build_app() -> App {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
@@ -49,40 +50,62 @@ fn registered_client_receives_messages_targeted_by_type() {
             )
             .unwrap(),
         ))
+        .add_plugin(ResourceIdPlugin)
         .add_plugin(DtoPlugin::default())
-        .add_plugin(ConnectionPlugin::default())
-        .add_system(RuntimePlugin::UPDATE, |world: &mut World| {
-            let requests = world
-                .event_reader::<RouteAgentMessage>()
-                .into_iter()
-                .filter_map(|request| match &request.message {
-                    Message::User { content, .. } => Some(content.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            for content in requests {
-                world.send_event(WebSocketMessageSend {
-                    target: WebSocketMessageTarget::Type("webui".into()),
-                    message: ServerMessage::Log {
-                        record: LogRecordDto {
-                            timestamp_millis: 1,
-                            level: "INFO".into(),
-                            target: "test".into(),
-                            message: content,
-                            fields: Vec::new(),
-                            spans: Vec::new(),
-                        },
+        .add_plugin(ClientPlugin::default());
+    app
+}
+
+fn client_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+fn first_client(app: &App) -> Option<(Client, ResourceId)> {
+    let entity = app
+        .world()
+        .query_with::<Client>()
+        .result()
+        .into_iter()
+        .next()?;
+    let client = app.world().get_component::<Client>(entity)?.clone();
+    let resource_id = app.world().get_component::<ResourceId>(entity)?.clone();
+    Some((client, resource_id))
+}
+
+#[test]
+fn registered_client_receives_messages_targeted_by_type() {
+    let mut app = build_app();
+    app.add_system(RuntimePlugin::UPDATE, |world: &mut World| {
+        let requests = world
+            .event_reader::<RouteAgentMessage>()
+            .into_iter()
+            .filter_map(|request| match &request.message {
+                Message::User { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for content in requests {
+            world.send_event(WebSocketMessageSend {
+                target: WebSocketMessageTarget::Type("webui".into()),
+                message: ServerMessage::Log {
+                    record: LogRecordDto {
+                        timestamp_millis: 1,
+                        level: "INFO".into(),
+                        target: "test".into(),
+                        message: content,
+                        fields: Vec::new(),
+                        spans: Vec::new(),
                     },
-                });
-            }
-        });
+                },
+            });
+        }
+    });
     let address = start(&mut app);
     let client = thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async move {
+        client_runtime().block_on(async move {
             let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/ws"))
                 .await
                 .unwrap();
@@ -140,4 +163,62 @@ fn registered_client_receives_messages_targeted_by_type() {
         response,
         ServerMessage::Log { record } if record.message == "routed"
     ));
+}
+
+#[test]
+fn registration_creates_and_disconnect_removes_a_client_entity() {
+    let mut app = build_app();
+    let address = start(&mut app);
+    let (release, released) = mpsc::channel::<()>();
+    let client =
+        thread::spawn(move || {
+            let runtime = client_runtime();
+            let (mut socket, _) = runtime
+                .block_on(tokio_tungstenite::connect_async(format!(
+                    "ws://{address}/ws"
+                )))
+                .unwrap();
+            let registration = serde_json::to_string(
+                &ClientMessage::register_connection_with_name("register-1", "webui", "console"),
+            )
+            .unwrap();
+            runtime
+                .block_on(socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                    registration.into(),
+                )))
+                .unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            runtime.block_on(socket.close(None)).unwrap();
+        });
+
+    let mut observed = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while observed.is_none() {
+        app.tick();
+        observed = first_client(&app);
+        assert!(Instant::now() < deadline, "client entity was never created");
+        thread::yield_now();
+    }
+    let (client_state, resource_id) = observed.unwrap();
+    assert_eq!(client_state.client_type(), "webui");
+    assert_eq!(client_state.name(), "console");
+    assert_eq!(
+        resource_id.to_string(),
+        format!(
+            "client:webui/console:{}",
+            client_state.connection_id().get()
+        )
+    );
+
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while first_client(&app).is_some() {
+        app.tick();
+        assert!(
+            Instant::now() < deadline,
+            "client entity was not removed after disconnect"
+        );
+        thread::yield_now();
+    }
+    client.join().unwrap();
 }

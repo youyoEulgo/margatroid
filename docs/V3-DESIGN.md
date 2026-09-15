@@ -37,7 +37,7 @@ crates/margatroid/
 ├── resource_id_plugin  ResourceId 身份基础
 ├── agent_image_loader_plugin  AgentImage 加载与布局校验
 ├── config_plugin       全局配置 Resource
-├── connection_plugin   WebSocket 连接元数据注册
+├── client_plugin       注册客户端实体化与连接元数据注册
 ├── dto_plugin          入站/出站 DTO 转换与 WebSocket 消息路由
 ├── lua_runtime_plugin  Lua VM 创建、调度、宿主函数与邮箱
 ├── mcl_plugin          MCL 命令解析、Block、Effect、推理/工具协调
