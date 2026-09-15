@@ -6,6 +6,7 @@ use crate::{MclCommandId, MclCommandReply, MclError, MclOperation};
 #[derive(Clone, Debug)]
 pub struct MclCommandRequest {
     pub id: MclCommandId,
+    pub source: String,
     pub agent_id: ResourceId,
     pub command: String,
     pub binding: Option<serde_json::Value>,

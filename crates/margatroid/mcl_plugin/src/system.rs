@@ -167,16 +167,10 @@ impl LuaHostFunction for MclHostFunction {
             };
             let id = crate::MclCommandId::new(format!("lua-mcl-{}", next_mcl_call_id()))
                 .map_err(|error| LuaRuntimeError::EnvironmentFailed(error.to_string()))?;
-            let target = agent_id.to_string();
-            MclAudit {
-                source: context.owner.owner_id.as_str(),
-                target: target.as_str(),
-                command: command.as_str(),
-            }
-            .log(id.as_str());
             let (sender, receiver) = tokio::sync::oneshot::channel();
             events.send_event(MclCommandRequest {
                 id,
+                source: context.owner.owner_id,
                 agent_id,
                 command,
                 binding,
@@ -212,11 +206,21 @@ impl MclAudit<'_> {
         let mcl = self.command;
         let mcl_id = command_id;
         if self.level() == tracing::Level::INFO {
-            tracing::info!(%source, %target, %mcl, %mcl_id, "agent driver issued MCL command");
+            tracing::info!(%source, %target, %mcl, %mcl_id, "MCL command issued");
         } else {
-            tracing::debug!(%source, %target, %mcl, %mcl_id, "agent driver issued MCL command");
+            tracing::debug!(%source, %target, %mcl, %mcl_id, "MCL command issued");
         }
     }
+}
+
+fn audit_mcl_request(request: &MclCommandRequest) {
+    let target = request.agent_id.to_string();
+    MclAudit {
+        source: request.source.as_str(),
+        target: target.as_str(),
+        command: request.command.as_str(),
+    }
+    .log(request.id.as_str());
 }
 
 fn next_mcl_call_id() -> u64 {
@@ -363,6 +367,7 @@ pub fn mcl_command_request_system(world: &mut World) {
         .cloned()
         .collect::<Vec<_>>();
     for request in requests {
+        audit_mcl_request(&request);
         if request.agent_id.resource_type() != "agent" {
             request.reply.send(Err(MclError::InvalidAgentId));
             continue;
@@ -1270,9 +1275,7 @@ pub fn mcl_command_reply_system(world: &mut World) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     fn audit(command: &str) -> MclAudit<'_> {
         MclAudit {
@@ -1334,10 +1337,6 @@ mod tests {
         }
     }
 
-    async fn first_poll(mut future: HostFuture) {
-        let _ = tokio::time::timeout(Duration::from_millis(50), &mut future).await;
-    }
-
     fn capture_log() -> (CapturedLog, tracing::subscriber::DefaultGuard) {
         let captured = CapturedLog::default();
         let subscriber = tracing_subscriber::fmt()
@@ -1350,46 +1349,52 @@ mod tests {
         (captured, guard)
     }
 
-    async fn log_of(command: &str) -> String {
+    fn request(source: &str, command: &str, id: &str) -> MclCommandRequest {
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        MclCommandRequest {
+            id: crate::MclCommandId::new(id).expect("test command id is valid"),
+            source: source.to_owned(),
+            agent_id: ResourceId::parse("agent:demo/reviewer:latest")
+                .expect("test agent id is valid"),
+            command: command.to_owned(),
+            binding: None,
+            reply: crate::MclCommandReply::new(sender),
+        }
+    }
+
+    fn log_of(source: &str, command: &str) -> String {
         let (captured, _guard) = capture_log();
-
-        let mut app = App::new();
-        app.add_plugin(RuntimePlugin::default());
-        let host = MclHostFunction {
-            events: app.world().event_sender(),
-        };
-        let context = LuaEnvironmentContext {
-            request_id: "request-1".to_owned(),
-            owner: lua_runtime_plugin::LuaVmOwner {
-                owner_id: "agent:demo/coder:latest".to_owned(),
-            },
-            values: BTreeMap::new(),
-        };
-        let arguments = LuaValue::Array(vec![
-            LuaValue::String("agent:demo/reviewer:latest".to_owned()),
-            LuaValue::String(command.to_owned()),
-        ]);
-
-        first_poll(host.call(arguments, context, CancellationToken::default())).await;
+        audit_mcl_request(&request(source, command, "lua-mcl-1"));
         captured.text()
     }
 
-    #[tokio::test]
-    async fn mcl_call_logs_source_target_and_command() {
-        let text = log_of("EMIT EFFECT finish").await;
+    #[test]
+    fn audit_reports_the_source_target_and_command_of_the_request() {
+        let text = log_of("agent:demo/coder:latest", "EMIT EFFECT finish");
 
-        assert!(text.contains("agent driver issued MCL command"), "{text}");
+        assert!(text.contains("MCL command issued"), "{text}");
         assert!(text.contains("source=agent:demo/coder:latest"), "{text}");
         assert!(text.contains("target=agent:demo/reviewer:latest"), "{text}");
         assert!(text.contains("mcl=EMIT EFFECT finish"), "{text}");
-        assert!(text.contains("mcl_id=lua-mcl-"), "{text}");
+        assert!(text.contains("mcl_id=lua-mcl-1"), "{text}");
         assert!(text.contains("INFO"), "{text}");
         assert!(!text.contains("DEBUG"), "{text}");
     }
 
-    #[tokio::test]
-    async fn block_only_mcl_is_logged_at_debug() {
-        let text = log_of("SELECT recent_conversation FROM msg").await;
+    #[test]
+    fn audit_covers_client_sources_with_the_same_code_path() {
+        let text = log_of("client:webui/console:7", "EMIT EFFECT inference (req)");
+
+        assert!(text.contains("source=client:webui/console:7"), "{text}");
+        assert!(text.contains("INFO"), "{text}");
+    }
+
+    #[test]
+    fn block_only_mcl_is_logged_at_debug() {
+        let text = log_of(
+            "agent:demo/coder:latest",
+            "SELECT recent_conversation FROM msg",
+        );
 
         assert!(
             text.contains("mcl=SELECT recent_conversation FROM msg"),

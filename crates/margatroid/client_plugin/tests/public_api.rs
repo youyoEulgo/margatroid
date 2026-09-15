@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
-use client_plugin::{Client, ClientPlugin};
+use client_plugin::{client_source, Client, ClientPlugin};
 use config_plugin::{ConfigPlugin, LogLevel, MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::{App, World};
 use dto_plugin::{DtoPlugin, WebSocketMessageSend};
@@ -208,6 +208,14 @@ fn registration_creates_and_disconnect_removes_a_client_entity() {
             "client:webui/console:{}",
             client_state.connection_id().get()
         )
+    );
+    assert_eq!(
+        client_source(Some("webui"), Some("console"), client_state.connection_id()),
+        resource_id.to_string()
+    );
+    assert_eq!(
+        client_source(None, None, client_state.connection_id()),
+        format!("unregistered:{}", client_state.connection_id().get())
     );
 
     release.send(()).unwrap();

@@ -417,13 +417,15 @@ impl
         RouteMclCommand,
         (
             String,
+            String,
             std::sync::mpsc::Sender<Result<serde_json::Value, String>>,
         ),
     > for MclCommandDto
 {
     fn into_domain(
         self,
-        (id, reply): (
+        (id, source, reply): (
+            String,
             String,
             std::sync::mpsc::Sender<Result<serde_json::Value, String>>,
         ),
@@ -436,6 +438,7 @@ impl
         }
         Ok(RouteMclCommand {
             id,
+            source,
             workspace: self.workspace.into_domain(())?,
             agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
             command: self.command,
@@ -1360,8 +1363,11 @@ mod tests {
             panic!("expected mcl.command");
         };
         let (reply, _) = std::sync::mpsc::channel();
-        let route: RouteMclCommand = message.into_domain((id, reply)).unwrap();
+        let route: RouteMclCommand = message
+            .into_domain((id, "client:webui/console:1".to_owned(), reply))
+            .unwrap();
         assert_eq!(route.id, "mcl-1");
+        assert_eq!(route.source, "client:webui/console:1");
         assert_eq!(route.workspace.name, "demo");
         assert_eq!(route.agent.unwrap().to_string(), "agent:demo/coder:latest");
         assert_eq!(route.command, "SELECT recent_conversation FROM msg");

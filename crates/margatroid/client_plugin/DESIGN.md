@@ -36,7 +36,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 # system     src/system.rs     System 函数
 # handler    src/handler.rs    处理函数
 # events     src/events.rs     事件类型（当前无）
-# types      src/types.rs      其余类型（当前无）
+# types      src/types.rs      来源标识构造
 # error      src/error.rs      Error 与公开错误分类
 ```
 
@@ -168,8 +168,16 @@ ClientPlugin 不定义 ECS 事件；它消费 server_plugin 的 RegisterConnecti
 
 # types
 
+## 函数
+
+公开：
 ```text
-ClientPlugin 不定义其他类型。
+client_source(client_type: Option<&str>, name: Option<&str>, connection_id: WebSocketConnectionId) -> String
+    计算客户端来源标识：公开函数，供统一来源审计与诊断使用
+    行为：
+        类型与名称都存在时返回 client:<client_type>/<name>:<connection_id>，与 Client Entity 的资源 ID 相同
+        任一缺失时返回 unregistered:<connection_id>
+    边界：返回值是标识文本，不保证是合法 ResourceId；未注册的连接没有 Client Entity，用 unregistered 前缀区分
 ```
 
 # error
@@ -205,6 +213,12 @@ ClientError：客户端错误，公开枚举--不回显客户端提供的类型�
         -> WebSocketConnections::set_name
         -> WebSocketConnections::set_connection_type
         -> spawn Entity + ResourceId + Client
+
+MCL 来源标识：
+    DtoPlugin 收到 mcl.command
+        -> 从 WebSocketConnections 读取该连接的类型与名称
+        -> ClientPlugin::client_source 得到 client:<type>/<name>:<connection_id> 或 unregistered:<connection_id>
+        -> 随 RouteMclCommand 传到 MclPlugin，由 mcl_command_request_system 统一审计
 
 客户端连接断开：
     ServerPlugin 关闭连接并从注册表移除发送器

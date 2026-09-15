@@ -279,6 +279,7 @@ impl Event for RouteAgentMessage {}
 #[derive(Clone, Debug)]
 pub struct RouteMclCommand {
     pub id: String,
+    pub source: String,
     pub workspace: WorkspaceReference,
     pub agent: Option<ResourceId>,
     pub command: String,

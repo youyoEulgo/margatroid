@@ -146,6 +146,7 @@ pub(crate) fn route_mcl_command(
     let (sender, receiver) = tokio::sync::oneshot::channel();
     world.send_event(MclCommandRequest {
         id: command_id,
+        source: command.source,
         agent_id,
         command: command.command,
         binding: command.binding,

@@ -4,7 +4,7 @@ use server_plugin::{
     RegisterConnection, WebSocketConnectionId, WebSocketConnections, WebSocketNameError,
 };
 
-use crate::{Client, ClientError};
+use crate::{client_source, Client, ClientError};
 
 pub(crate) fn handle_client_registration(
     world: &mut World,
@@ -72,7 +72,7 @@ fn client_resource_id(
 ) -> Result<ResourceId, ClientError> {
     let id = connection_id.get().to_string();
     let name = name.unwrap_or(&id);
-    ResourceId::parse(format!("client:{client_type}/{name}:{id}"))
+    ResourceId::parse(client_source(Some(client_type), Some(name), connection_id))
         .map_err(|_| ClientError::InvalidResourceId)
 }
 

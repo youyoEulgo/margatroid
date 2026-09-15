@@ -221,7 +221,7 @@ route_mcl_command(world: &mut World, command: RouteMclCommand) -> Result<(), Wor
     行为：
         解析 Workspace；命令带 agent_id 时按资源 ID 查找，否则使用 manager
         读取 Agent 的 ResourceId，创建 MclCommandId 和 oneshot 回执
-        发送 MclCommandRequest，并把外部回执和 oneshot 接收器写入 pending_mcl_commands
+        原样转发命令的 source，发送 MclCommandRequest，并把外部回执和 oneshot 接收器写入 pending_mcl_commands
 ```
 
 # events
