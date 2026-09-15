@@ -1,6 +1,6 @@
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
-use config_plugin::{ConfigPlugin, MargatroidConfig, WebSocketMessageTarget};
+use config_plugin::{ConfigPlugin, LogLevel, MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::App;
 use dto_plugin::{DtoPlugin, WebSocketMessageSend};
 use log_plugin::LogPlugin;
@@ -17,6 +17,8 @@ fn documented_public_api_publishes_state_for_the_configured_frontend_type() {
         .add_plugin(ConfigPlugin::new(
             MargatroidConfig::new(
                 "127.0.0.1:0".parse().unwrap(),
+                LogLevel::default(),
+                None,
                 vec![WebSocketMessageTarget::Broadcast],
                 vec![WebSocketMessageTarget::Type("browser".into())],
                 vec![WebSocketMessageTarget::Broadcast],

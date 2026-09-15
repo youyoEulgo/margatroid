@@ -124,7 +124,7 @@ impl LuaHostFunction for MclHostFunction {
     fn call(
         &self,
         arguments: LuaValue,
-        _context: LuaEnvironmentContext,
+        context: LuaEnvironmentContext,
         cancel: CancellationToken,
     ) -> HostFuture {
         let events = self.events.clone();
@@ -155,7 +155,7 @@ impl LuaHostFunction for MclHostFunction {
                     ))
                 }
             };
-            let agent_id = match values.pop() {
+            let agent_id: ResourceId = match values.pop() {
                 Some(LuaValue::String(value)) => value.parse().map_err(|_| {
                     LuaRuntimeError::InvalidRequest("mcl agent id is invalid".into())
                 })?,
@@ -167,6 +167,13 @@ impl LuaHostFunction for MclHostFunction {
             };
             let id = crate::MclCommandId::new(format!("lua-mcl-{}", next_mcl_call_id()))
                 .map_err(|error| LuaRuntimeError::EnvironmentFailed(error.to_string()))?;
+            let target = agent_id.to_string();
+            MclAudit {
+                source: context.owner.owner_id.as_str(),
+                target: target.as_str(),
+                command: command.as_str(),
+            }
+            .log(id.as_str());
             let (sender, receiver) = tokio::sync::oneshot::channel();
             events.send_event(MclCommandRequest {
                 id,
@@ -181,6 +188,34 @@ impl LuaHostFunction for MclHostFunction {
                 .map_err(|error| LuaRuntimeError::EnvironmentFailed(error.to_string()))?;
             command_value_to_lua(value)
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MclAudit<'a> {
+    source: &'a str,
+    target: &'a str,
+    command: &'a str,
+}
+
+impl MclAudit<'_> {
+    fn level(&self) -> tracing::Level {
+        match self.command.split_whitespace().next() {
+            Some("IMPORT") | Some("EMIT") => tracing::Level::INFO,
+            _ => tracing::Level::DEBUG,
+        }
+    }
+
+    fn log(&self, command_id: &str) {
+        let source = self.source;
+        let target = self.target;
+        let mcl = self.command;
+        let mcl_id = command_id;
+        if self.level() == tracing::Level::INFO {
+            tracing::info!(%source, %target, %mcl, %mcl_id, "agent driver issued MCL command");
+        } else {
+            tracing::debug!(%source, %target, %mcl, %mcl_id, "agent driver issued MCL command");
+        }
     }
 }
 
@@ -1025,7 +1060,6 @@ pub fn mcl_effect_response_system(world: &mut World) {
             usage: None,
         });
     }
-
 }
 
 fn parse_mailbox_message(
@@ -1230,5 +1264,137 @@ pub fn mcl_command_reply_system(world: &mut World) {
         response
             .reply
             .send(response.result.map(crate::domain_to_command));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn audit(command: &str) -> MclAudit<'_> {
+        MclAudit {
+            source: "agent:demo/coder:latest",
+            target: "agent:demo/reviewer:latest",
+            command,
+        }
+    }
+
+    #[test]
+    fn audit_levels_commands_that_leave_the_vm_above_block_only_operations() {
+        for command in [
+            "IMPORT prompt:system/soul:latest AS soul",
+            "EMIT EFFECT inference (req)",
+            "  EMIT EFFECT finish",
+        ] {
+            assert_eq!(audit(command).level(), tracing::Level::INFO, "{command}");
+        }
+        for command in [
+            "CREATE BLOCK msg (system_prompt MESSAGE,)",
+            "INJECT soul TO system_prompt FROM msg",
+            "SELECT recent_conversation FROM msg",
+            "COVER history_conversation FROM msg",
+            "DELETE pending_tool FROM msg WHERE id == ?",
+        ] {
+            assert_eq!(audit(command).level(), tracing::Level::DEBUG, "{command}");
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("log buffer poisoned").clone())
+                .expect("log output is UTF-8")
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer poisoned")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    async fn first_poll(mut future: HostFuture) {
+        let _ = tokio::time::timeout(Duration::from_millis(50), &mut future).await;
+    }
+
+    fn capture_log() -> (CapturedLog, tracing::subscriber::DefaultGuard) {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (captured, guard)
+    }
+
+    async fn log_of(command: &str) -> String {
+        let (captured, _guard) = capture_log();
+
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default());
+        let host = MclHostFunction {
+            events: app.world().event_sender(),
+        };
+        let context = LuaEnvironmentContext {
+            request_id: "request-1".to_owned(),
+            owner: lua_runtime_plugin::LuaVmOwner {
+                owner_id: "agent:demo/coder:latest".to_owned(),
+            },
+            values: BTreeMap::new(),
+        };
+        let arguments = LuaValue::Array(vec![
+            LuaValue::String("agent:demo/reviewer:latest".to_owned()),
+            LuaValue::String(command.to_owned()),
+        ]);
+
+        first_poll(host.call(arguments, context, CancellationToken::default())).await;
+        captured.text()
+    }
+
+    #[tokio::test]
+    async fn mcl_call_logs_source_target_and_command() {
+        let text = log_of("EMIT EFFECT finish").await;
+
+        assert!(text.contains("agent driver issued MCL command"), "{text}");
+        assert!(text.contains("source=agent:demo/coder:latest"), "{text}");
+        assert!(text.contains("target=agent:demo/reviewer:latest"), "{text}");
+        assert!(text.contains("mcl=EMIT EFFECT finish"), "{text}");
+        assert!(text.contains("mcl_id=lua-mcl-"), "{text}");
+        assert!(text.contains("INFO"), "{text}");
+        assert!(!text.contains("DEBUG"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn block_only_mcl_is_logged_at_debug() {
+        let text = log_of("SELECT recent_conversation FROM msg").await;
+
+        assert!(
+            text.contains("mcl=SELECT recent_conversation FROM msg"),
+            "{text}"
+        );
+        assert!(text.contains("DEBUG"), "{text}");
     }
 }

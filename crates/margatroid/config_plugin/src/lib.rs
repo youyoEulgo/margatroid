@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use core_plugin::{App, Plugin};
 
 pub use error::ConfigError;
-pub use types::{MargatroidConfig, WebSocketMessageTarget};
+pub use types::{LogLevel, MargatroidConfig, WebSocketMessageTarget};
 
 use crate::types::{ConfigDocument, MAX_CONFIG_BYTES};
 

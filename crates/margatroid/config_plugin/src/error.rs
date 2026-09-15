@@ -7,6 +7,8 @@ pub enum ConfigError {
     TooLarge,
     DecodeFailed,
     InvalidServerBind,
+    InvalidLogLevel,
+    InvalidLogFilter,
     EmptyTargets(&'static str),
     InvalidTarget(&'static str),
     DuplicateTarget(&'static str),
@@ -26,6 +28,12 @@ impl fmt::Display for ConfigError {
             Self::DecodeFailed => formatter.write_str("configuration could not be decoded"),
             Self::InvalidServerBind => {
                 formatter.write_str("configuration field `server.bind` is not a socket address")
+            }
+            Self::InvalidLogLevel => formatter.write_str(
+                "configuration field `log.level` is not off, error, warn, info, debug or trace",
+            ),
+            Self::InvalidLogFilter => {
+                formatter.write_str("configuration field `log.filter` is empty")
             }
             Self::EmptyTargets(field) => {
                 write!(formatter, "configuration field `{field}` has no targets")
