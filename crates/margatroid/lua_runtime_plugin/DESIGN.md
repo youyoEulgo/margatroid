@@ -159,10 +159,19 @@ handle_lua_runtime_finished(world: &mut World, finished: Vec<LuaRuntimeTaskFinis
 
 私有：
 ```text
+create_minimal_lua() -> Result<Lua, LuaRuntimeError>
+    创建最小VM：私有函数，用于LuaStandardLibraries::Minimal
+    行为：
+        以StdLib::NONE创建Lua状态，只得到基础库
+        逐个把MINIMAL_REMOVED_GLOBALS中的全局量置为nil：dofile、loadfile、load、loadstring、require、collectgarbage、print、warn
+        失败映射为VmCreationFailed
+    边界：mlua没有基础库开关，基础库总是随状态创建，因此必须建后裁剪；
+          裁剪在provider注入之前完成，所以mcl与agent_info不受影响
+
 execute_lua(program: LuaProgram, context: LuaEnvironmentContext, providers: Vec<String>, registry: Option<Arc<RwLock<LuaEnvironmentRegistry>>>, cancellation: CancellationToken) -> Result<LuaValue, LuaRuntimeError>
     执行VM：私有函数
     行为：
-        按LuaStandardLibraries创建独立Lua VM
+        按LuaStandardLibraries创建独立Lua VM；Minimal走create_minimal_lua
         安装环境提供器生成的全局值、宿主函数和模块
         编译并执行源码或入口函数
         宿主函数调用按阻塞函数语义暂停当前VM，等待宿主Future完成后恢复
@@ -261,8 +270,13 @@ LuaProgram：Lua程序，公开结构体
     libraries: LuaStandardLibraries--显式允许的Lua标准库集合
 
 LuaStandardLibraries：Lua标准库集合，公开枚举
-    Safe--只开放不直接访问文件、进程、动态库和调试器的基础库
-    Full--开放完整Lua标准库
+    Minimal--不开放任何标准库：基础库只保留语言本体，并在建VM后摘掉宿主访问入口
+    Safe--开放mlua的ALL_SAFE，即除FFI与DEBUG外的全部标准库；仍含io、os、package，不等于进程隔离
+    Full--开放完整Lua标准库，含FFI与DEBUG
+    边界：Minimal保留的基础库全局量为type、ipairs、pairs、error、assert、pcall、xpcall、next、select、
+          tostring、tonumber、setmetatable、getmetatable、rawget、rawset、rawequal、rawlen、_G、_VERSION；
+          摘掉的是dofile、loadfile、load、loadstring、require、collectgarbage、print、warn
+          三档都只约束Lua标准库，不约束provider注入的宿主函数（如mcl、agent_info）自身能做什么
 
 LuaEnvironmentContext：环境上下文，公开结构体
     request_id: String--本次请求标识

@@ -44,6 +44,7 @@ pub struct LuaProgram {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LuaStandardLibraries {
+    Minimal,
     Safe,
     Full,
 }
