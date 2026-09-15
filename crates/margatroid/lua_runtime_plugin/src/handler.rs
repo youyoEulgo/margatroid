@@ -283,6 +283,29 @@ pub(crate) fn handle_lua_runtime_finished(
     }
 }
 
+const MINIMAL_REMOVED_GLOBALS: [&str; 8] = [
+    "dofile",
+    "loadfile",
+    "load",
+    "loadstring",
+    "require",
+    "collectgarbage",
+    "print",
+    "warn",
+];
+
+fn create_minimal_lua() -> Result<Lua, LuaRuntimeError> {
+    let lua = Lua::new_with(StdLib::NONE, LuaOptions::default())
+        .map_err(|error| LuaRuntimeError::VmCreationFailed(error.to_string()))?;
+    let globals = lua.globals();
+    for name in MINIMAL_REMOVED_GLOBALS {
+        globals
+            .set(name, MlValue::Nil)
+            .map_err(|error| LuaRuntimeError::VmCreationFailed(error.to_string()))?;
+    }
+    Ok(lua)
+}
+
 fn execute_lua(
     program: LuaProgram,
     context: LuaEnvironmentContext,
@@ -291,6 +314,7 @@ fn execute_lua(
     cancellation: CancellationToken,
 ) -> Result<LuaValue, LuaRuntimeError> {
     let lua = match program.libraries {
+        crate::types::LuaStandardLibraries::Minimal => create_minimal_lua()?,
         crate::types::LuaStandardLibraries::Safe => {
             Lua::new_with(StdLib::ALL_SAFE, LuaOptions::default())
                 .map_err(|error| LuaRuntimeError::VmCreationFailed(error.to_string()))?
@@ -520,4 +544,188 @@ fn from_ml_value(value: MlValue) -> Result<LuaValue, LuaRuntimeError> {
             ))
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE_DRIVER: &str = include_str!("../tests/fixtures/base_driver.lua");
+
+    const BASE_GLOBALS: [&str; 19] = [
+        "_G",
+        "_VERSION",
+        "assert",
+        "error",
+        "getmetatable",
+        "ipairs",
+        "next",
+        "pairs",
+        "pcall",
+        "rawequal",
+        "rawget",
+        "rawlen",
+        "rawset",
+        "select",
+        "setmetatable",
+        "tonumber",
+        "tostring",
+        "type",
+        "xpcall",
+    ];
+
+    const HOST_ACCESS_GLOBALS: [&str; 17] = [
+        "dofile",
+        "loadfile",
+        "load",
+        "loadstring",
+        "require",
+        "collectgarbage",
+        "print",
+        "warn",
+        "io",
+        "os",
+        "package",
+        "debug",
+        "string",
+        "table",
+        "math",
+        "utf8",
+        "coroutine",
+    ];
+
+    fn minimal_globals() -> Vec<String> {
+        let lua = create_minimal_lua().expect("minimal VM is created");
+        let names = lua
+            .load(
+                r#"
+                local names = ""
+                for name, _ in pairs(_G) do
+                    names = names .. name .. "\n"
+                end
+                return names
+                "#,
+            )
+            .eval::<String>()
+            .expect("globals can be enumerated");
+        let mut names = names.lines().map(str::to_owned).collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn minimal_vm_exposes_only_the_base_language() {
+        let mut expected = BASE_GLOBALS.map(str::to_owned).to_vec();
+        expected.sort();
+        assert_eq!(minimal_globals(), expected);
+    }
+
+    #[test]
+    fn minimal_vm_has_no_host_access_globals() {
+        let lua = create_minimal_lua().expect("minimal VM is created");
+        for name in HOST_ACCESS_GLOBALS {
+            let value = lua
+                .globals()
+                .get::<MlValue>(name)
+                .expect("global can be read");
+            assert!(matches!(value, MlValue::Nil), "{name} is still visible");
+        }
+    }
+
+    #[test]
+    fn minimal_vm_runs_the_agent_image_driver() {
+        let lua = create_minimal_lua().expect("minimal VM is created");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent_info = lua.create_table().expect("agent info table is created");
+        agent_info
+            .set("id", "agent:demo/coder:latest")
+            .expect("agent id is set");
+        let model = lua.create_table().expect("model table is created");
+        model
+            .set("context_window_tokens", 200_000)
+            .expect("context window is set");
+        agent_info.set("model", model).expect("model is set");
+        lua.globals()
+            .set("agent_info", agent_info)
+            .expect("agent info is injected");
+        let recorder = calls.clone();
+        let counter = starts.clone();
+        let mcl = lua
+            .create_function(
+                move |lua, (_target, command, _binding): (String, String, MlValue)| {
+                    recorder
+                        .lock()
+                        .expect("call log is not poisoned")
+                        .push(command.clone());
+                    match command.trim() {
+                        "EMIT EFFECT realtime_load" | "SELECT recent_conversation FROM msg" => {
+                            Ok(MlValue::Table(lua.create_table()?))
+                        }
+                        "EMIT EFFECT start" => {
+                            if counter.fetch_add(1, Ordering::Relaxed) == 0 {
+                                let message = lua.create_table()?;
+                                message.set("type", "assistant")?;
+                                Ok(MlValue::Table(message))
+                            } else {
+                                Err(mlua::Error::external("driver loop stop"))
+                            }
+                        }
+                        _ => Ok(MlValue::Nil),
+                    }
+                },
+            )
+            .expect("mcl stub is created");
+        lua.globals().set("mcl", mcl).expect("mcl is injected");
+
+        let result = lua.load(BASE_DRIVER).exec();
+        assert!(result.is_err(), "the driver loop is stopped by the stub");
+
+        let calls = calls.lock().expect("call log is not poisoned").clone();
+        let expected = [
+            "IMPORT prompt:system/soul:latest AS soul",
+            "IMPORT prompt:user/compact:latest AS compact",
+            "INJECT soul TO system_prompt FROM msg",
+            "EMIT EFFECT realtime_load",
+            "EMIT EFFECT start",
+            "INJECT ? TO recent_conversation FROM msg",
+            "EMIT EFFECT history_append",
+            "EMIT EFFECT finish",
+        ];
+        let mut position = 0;
+        for call in &calls {
+            if position < expected.len() && call == expected[position] {
+                position += 1;
+            }
+        }
+        assert_eq!(position, expected.len(), "recorded calls: {calls:?}");
+    }
+
+    #[test]
+    fn minimal_vm_runs_driver_message_loop_idioms() {
+        let lua = create_minimal_lua().expect("minimal VM is created");
+        let kept = lua
+            .load(
+                r#"
+                local restored = {
+                    { type = "user" },
+                    { type = "assistant" },
+                    { type = nil },
+                }
+                local messages = {}
+                for _, message in ipairs(restored) do
+                    if type(message.type) == "string" then
+                        messages[#messages + 1] = message
+                    end
+                end
+                if #messages ~= 2 then
+                    error("driver message filter changed behaviour")
+                end
+                return #messages
+                "#,
+            )
+            .eval::<i64>()
+            .expect("driver idioms run");
+        assert_eq!(kept, 2);
+    }
 }

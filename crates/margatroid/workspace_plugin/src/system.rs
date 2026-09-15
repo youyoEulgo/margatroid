@@ -306,7 +306,7 @@ pub(crate) fn collect_agent_image_system(world: &mut World) {
                 source: base_lua.source().to_owned(),
                 origin: base_lua.origin().display().to_string(),
                 entry: None,
-                libraries: lua_runtime_plugin::LuaStandardLibraries::Safe,
+                libraries: lua_runtime_plugin::LuaStandardLibraries::Minimal,
             },
             project_root: configuration.project_root().to_path_buf(),
             image_root: image_root.clone(),
