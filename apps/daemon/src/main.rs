@@ -7,8 +7,8 @@ use agent_image_loader_plugin::AgentImageLoaderPlugin;
 use agent_plugin::AgentPlugin;
 use app_runtime_plugin::{AppRunExt, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimePlugin;
+use client_plugin::ClientPlugin;
 use config_plugin::{ConfigPlugin, LogLevel as ConfigLogLevel};
-use connection_plugin::ConnectionPlugin;
 use core_plugin::App;
 use dto_plugin::DtoPlugin;
 use inference_plugin::InferencePlugin;
@@ -80,7 +80,7 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(mcl)
         .add_plugin(workspace)
         .add_plugin(DtoPlugin::default())
-        .add_plugin(ConnectionPlugin::default());
+        .add_plugin(ClientPlugin::default());
 
     info!(address = %bind, data_root = %data_root.display(), config = %config_path.display(), models = %models_path.display(), "margatroid daemon starting");
     app.run();

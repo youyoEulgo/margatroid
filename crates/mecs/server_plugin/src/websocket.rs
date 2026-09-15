@@ -31,6 +31,7 @@ pub struct RegisterConnection {
     pub id: String,
     pub connection_id: WebSocketConnectionId,
     pub client_type: String,
+    pub name: Option<String>,
 }
 
 impl Event for RegisterConnection {}

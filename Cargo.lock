@@ -333,6 +333,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "client_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "config_plugin",
+ "core_plugin",
+ "dto_plugin",
+ "futures-util",
+ "log_plugin",
+ "margatroid_protocol",
+ "margatroid_types",
+ "resource_id_plugin",
+ "serde_json",
+ "server_plugin",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "closure_plugin"
 version = "0.1.0"
 dependencies = [
@@ -364,26 +385,6 @@ dependencies = [
  "serde",
  "tempfile",
  "toml",
-]
-
-[[package]]
-name = "connection_plugin"
-version = "0.1.0"
-dependencies = [
- "app_runtime_plugin",
- "async_runtime_plugin",
- "config_plugin",
- "core_plugin",
- "dto_plugin",
- "futures-util",
- "log_plugin",
- "margatroid_protocol",
- "margatroid_types",
- "serde_json",
- "server_plugin",
- "tokio",
- "tokio-tungstenite",
- "tracing",
 ]
 
 [[package]]
@@ -1144,8 +1145,8 @@ dependencies = [
  "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "client_plugin",
  "config_plugin",
- "connection_plugin",
  "core_plugin",
  "dto_plugin",
  "inference_plugin",

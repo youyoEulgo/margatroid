@@ -1,8 +1,8 @@
 # Margatroid Daemon
 
 daemon 是 Margatroid 的产品组合根，只负责读取启动配置、安装 Plugin 并运行 App。DtoPlugin 处理
-WebSocket API 收发、DTO 与领域命令转换、完整状态及日志的出站投影，ConnectionPlugin 管理客户端
-连接类型和名称。
+WebSocket API 收发、DTO 与领域命令转换、完整状态及日志的出站投影，ClientPlugin 管理客户端
+连接类型和名称，并把注册成功的客户端实体化为 Client Entity。
 
 启动：
 

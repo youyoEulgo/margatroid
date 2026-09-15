@@ -18,7 +18,7 @@ run() -> Result<(), Error>
         将全局只读WebSocket目标配置交给DtoPlugin和InferencePlugin
         打开AgentImage、Workspace、ToolPlugin和LuaRuntimePlugin所需目录
         安装运行时、日志、Server和全部领域Plugin
-        安装DtoPlugin和ConnectionPlugin
+        安装DtoPlugin和ClientPlugin
         记录启动信息并调用AppRunExt::run
 
 data_root() -> Result<PathBuf, Error>
