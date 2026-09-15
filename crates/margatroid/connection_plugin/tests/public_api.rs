@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
-use config_plugin::{ConfigPlugin, MargatroidConfig, WebSocketMessageTarget};
+use config_plugin::{ConfigPlugin, LogLevel, MargatroidConfig, WebSocketMessageTarget};
 use connection_plugin::ConnectionPlugin;
 use core_plugin::{App, World};
 use dto_plugin::{DtoPlugin, WebSocketMessageSend};
@@ -40,6 +40,8 @@ fn registered_client_receives_messages_targeted_by_type() {
         .add_plugin(ConfigPlugin::new(
             MargatroidConfig::new(
                 "127.0.0.1:0".parse().unwrap(),
+                LogLevel::default(),
+                None,
                 vec![WebSocketMessageTarget::Broadcast],
                 vec![WebSocketMessageTarget::Broadcast],
                 vec![WebSocketMessageTarget::Broadcast],

@@ -145,15 +145,40 @@ MclEnvironmentProvider：mcl Lua 环境提供器，crate公开结构体--向 Lua
 MclHostFunction：mcl 宿主函数，私有结构体
     events: RuntimeEventSender--事件发送器，私有
     impl LuaHostFunction for MclHostFunction
-        call(&self, arguments: LuaValue, _context: LuaEnvironmentContext, cancel: CancellationToken) -> HostFuture
+        call(&self, arguments: LuaValue, context: LuaEnvironmentContext, cancel: CancellationToken) -> HostFuture
             调用 mcl：私有方法
             行为：
                 取消时返回 Cancelled
                 参数必须是 2 或 3 个元素的 Lua 数组；否则 InvalidRequest
                 第三个参数不为 Nil 时转换为 JSON binding
                 第二个参数必须是字符串 command；第一个参数必须是可解析为 ResourceId 的字符串
-                生成 MclCommandId，创建 oneshot 回执并发送 MclCommandRequest
+                生成 MclCommandId
+                以 context.owner.owner_id 为来源、第一个参数为目标产出 MclAudit 并交给日志输出
+                创建 oneshot 回执并发送 MclCommandRequest
                 等待回执，错误映射为 EnvironmentFailed，成功值转换为 Lua 值
+            边界：来源只取 context.owner（daemon 创建 VM 时填入，Lua 无法伪造）；第一个参数只作目标，不充当来源
+
+MclAudit：MCL 审计元组，私有结构体--目前唯一消费者是日志
+    source: &str--来源：发出指令的 VM 归属，取 context.owner.owner_id；driver VM 的归属即所属 agent 的资源 id
+    target: &str--目标：指令作用的 agent 资源 id，取 Lua 传入的第一个参数
+    command: &str--指令原文
+    level(&self) -> tracing::Level
+        审计级别：私有方法
+        行为：首个关键字为 IMPORT 或 EMIT 时返回 INFO（越出 VM），否则返回 DEBUG（只改内存中的 Block）
+        边界：只看首个关键字，不解析指令本身，也不判断指令是否合法
+              DEBUG 默认被过滤——daemon 以 config.toml 的 log.level（默认 info）和可选的 log.filter
+              构造 LogPlugin，而 log_plugin 的 build_filter 用该配置构造 EnvFilter 并作用于包括
+              出站日志流在内的所有 layer，因此高频 Block 操作不进控制台与面板；全量审计可在
+              config.toml 设 log.level = "debug"，或用 log.filter = "info,mcl_plugin::system=debug"
+              只放开这里
+    log(&self, command_id: &str)
+        输出审计：私有方法
+        行为：按 level 选择 info 或 debug，记录 source、target、mcl、mcl_id 四个字段
+        边界：不记录 binding（体积不可控且可能含消息正文）；tracing 的事件级别必须是编译期常量，故按级别分支
+              走 tracing 宏而不是 EventLog：本审计在 Lua 宿主函数（异步任务）中产出，不需要 ECS 传播语义，
+              而 EventLog 使用固定 target 且不携带字段——固定 target 会失去按 target 过滤的能力
+              （"只打开 driver MCL 审计"依赖 mcl_plugin::system=debug），无字段则只能把 source/target
+              拼进 message，违反 EventLog 的"上下文需要时扩展而不是解析 message"约束
 ```
 
 ## 函数
@@ -612,6 +637,7 @@ MclError：MCL 错误，公开枚举
 ```text
 Lua mcl 调用：
     Base Lua -> mcl(agent_id, command, binding?)
+    MclHostFunction -> 产出 MclAudit（来源=context.owner.owner_id，目标=agent_id）-> 日志输出
     MclHostFunction -> 生成 MclCommandRequest -> MclPlugin
     mcl_command_request_system 解析命令
         Import/Emit -> MclDomainRequest -> mcl_domain_system

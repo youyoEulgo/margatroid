@@ -7,12 +7,12 @@ use agent_image_loader_plugin::AgentImageLoaderPlugin;
 use agent_plugin::AgentPlugin;
 use app_runtime_plugin::{AppRunExt, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimePlugin;
-use config_plugin::ConfigPlugin;
+use config_plugin::{ConfigPlugin, LogLevel as ConfigLogLevel};
 use connection_plugin::ConnectionPlugin;
 use core_plugin::App;
 use dto_plugin::DtoPlugin;
 use inference_plugin::InferencePlugin;
-use log_plugin::LogPlugin;
+use log_plugin::{LogLevel, LogPlugin};
 use lua_runtime_plugin::LuaRuntimePlugin;
 use mcl_plugin::MclPlugin;
 use memory_plugin::MemoryPlugin;
@@ -54,12 +54,18 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let bind = global_config.config().server_bind();
     let mcl = MclPlugin::open(&data_root)
         .map_err(|error| format!("cannot open MCL resource root: {error}"))?;
+    let mut log_plugin = LogPlugin::default()
+        .with_stream(LOG_STREAM_CAPACITY)
+        .with_level(log_level(global_config.config().log_level()));
+    if let Some(filter) = global_config.config().log_filter() {
+        log_plugin = log_plugin.with_filter(filter);
+    }
 
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(LuaRuntimePlugin::default())
-        .add_plugin(LogPlugin::default().with_stream(LOG_STREAM_CAPACITY))
+        .add_plugin(log_plugin)
         .add_plugin(ServerPlugin::with_options(ServerOptions::bind(bind)))
         .add_plugin(global_config)
         .add_plugin(ResourceIdPlugin)
@@ -84,4 +90,15 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
 fn data_root() -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
     let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
     Ok(PathBuf::from(home).join(DATA_ROOT_NAME))
+}
+
+fn log_level(level: ConfigLogLevel) -> LogLevel {
+    match level {
+        ConfigLogLevel::Off => LogLevel::Off,
+        ConfigLogLevel::Error => LogLevel::Error,
+        ConfigLogLevel::Warn => LogLevel::Warn,
+        ConfigLogLevel::Info => LogLevel::Info,
+        ConfigLogLevel::Debug => LogLevel::Debug,
+        ConfigLogLevel::Trace => LogLevel::Trace,
+    }
 }
