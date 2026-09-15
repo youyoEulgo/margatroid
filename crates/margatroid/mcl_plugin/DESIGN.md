@@ -153,14 +153,13 @@ MclHostFunction：mcl 宿主函数，私有结构体
                 第三个参数不为 Nil 时转换为 JSON binding
                 第二个参数必须是字符串 command；第一个参数必须是可解析为 ResourceId 的字符串
                 生成 MclCommandId
-                以 context.owner.owner_id 为来源、第一个参数为目标产出 MclAudit 并交给日志输出
-                创建 oneshot 回执并发送 MclCommandRequest
+                以 context.owner.owner_id 作为 source 创建并发送 MclCommandRequest
                 等待回执，错误映射为 EnvironmentFailed，成功值转换为 Lua 值
-            边界：来源只取 context.owner（daemon 创建 VM 时填入，Lua 无法伪造）；第一个参数只作目标，不充当来源
+            边界：source 只取 context.owner（daemon 创建 VM 时填入，Lua 无法伪造）；第一个参数只作目标，不充当来源
 
 MclAudit：MCL 审计元组，私有结构体--目前唯一消费者是日志
-    source: &str--来源：发出指令的 VM 归属，取 context.owner.owner_id；driver VM 的归属即所属 agent 的资源 id
-    target: &str--目标：指令作用的 agent 资源 id，取 Lua 传入的第一个参数
+    source: &str--来源：MclCommandRequest.source；driver VM 的归属即所属 agent 的资源 id
+    target: &str--目标：指令作用的 agent 资源 id，取 MclCommandRequest.agent_id
     command: &str--指令原文
     level(&self) -> tracing::Level
         审计级别：私有方法
@@ -175,9 +174,9 @@ MclAudit：MCL 审计元组，私有结构体--目前唯一消费者是日志
         输出审计：私有方法
         行为：按 level 选择 info 或 debug，记录 source、target、mcl、mcl_id 四个字段
         边界：不记录 binding（体积不可控且可能含消息正文）；tracing 的事件级别必须是编译期常量，故按级别分支
-              走 tracing 宏而不是 EventLog：本审计在 Lua 宿主函数（异步任务）中产出，不需要 ECS 传播语义，
+              走 tracing 宏而不是 EventLog：本审计在 mcl_plugin 的请求 System 中产出，不需要 ECS 传播语义，
               而 EventLog 使用固定 target 且不携带字段——固定 target 会失去按 target 过滤的能力
-              （"只打开 driver MCL 审计"依赖 mcl_plugin::system=debug），无字段则只能把 source/target
+              （"只看 MCL 审计"依赖 mcl_plugin::system=debug），无字段则只能把 source/target
               拼进 message，违反 EventLog 的"上下文需要时扩展而不是解析 message"约束
 ```
 
@@ -194,6 +193,7 @@ mcl_command_request_system(world: &mut World)
     处理事件：MclCommandRequest
     行为：
         克隆本帧全部请求并逐个处理
+        逐个调用 audit_mcl_request 产出审计日志；审计先于目标校验
         agent_id 的 resource_type 不是 agent 时回复 InvalidAgentId
         解析命令失败时回复解析错误
         Import 或 Emit 操作转发为 MclDomainRequest
@@ -237,6 +237,12 @@ mcl_command_reply_system(world: &mut World)
 
 私有：
 ```text
+audit_mcl_request(request: &MclCommandRequest)
+    审计请求：私有函数
+    行为：取 request.source 为来源、request.agent_id 为目标、request.command 为指令、request.id 为命令 ID，
+          构造 MclAudit 并交给日志输出
+    边界：在命令解析和目标校验之前调用，因此非法目标的请求同样被审计
+
 next_mcl_call_id() -> u64
     生成 MCL 调用 ID：私有函数，原子递增
 
@@ -400,6 +406,7 @@ binding_to_inner(value: &serde_json::Value, kind: InnerType, aliases: &HashMap<S
 ```text
 MclCommandRequest：MCL 命令请求，公开事件--所有入口提交给 MclPlugin 的统一请求
     id: MclCommandId--进程内唯一命令 ID
+    source: String--发起方稳定标识；driver 入口填所属 Agent 资源 ID，客户端入口填客户端来源标识
     agent_id: ResourceId--目标 Agent 完整资源 ID
     command: String--命令文本
     binding: Option<serde_json::Value>--命令绑定值
@@ -637,14 +644,19 @@ MclError：MCL 错误，公开枚举
 ```text
 Lua mcl 调用：
     Base Lua -> mcl(agent_id, command, binding?)
-    MclHostFunction -> 产出 MclAudit（来源=context.owner.owner_id，目标=agent_id）-> 日志输出
-    MclHostFunction -> 生成 MclCommandRequest -> MclPlugin
+    MclHostFunction -> 以 context.owner.owner_id 为 source 生成 MclCommandRequest -> MclPlugin
+客户端 mcl 调用：
+    DtoPlugin -> 以客户端来源标识为 source 生成 RouteMclCommand
+        -> WorkspacePlugin 解析目标 Agent -> MclCommandRequest
+统一来源审计：
+    mcl_command_request_system -> audit_mcl_request -> 日志输出
+        两个入口共用同一实现；新增入口只需填好 source
     mcl_command_request_system 解析命令
         Import/Emit -> MclDomainRequest -> mcl_domain_system
         其他 -> execute_direct_operation -> 立即完成回执
     mcl_domain_system 按 Effect 类型执行：
         Start/CatchInference/RealtimeLoad -> 登记 PendingMclEffects 并等待外部响应
-        Import -> 登记 PendingMclImports 并发送 AgentResourceRegisterRequest
+        Import -> 登记 PendingMclImports 并发送 ToolRegisterRequest
         HistoryAppend/RealtimeSource/Inference/ToolCall/VisibilitySource/DefaultVisibilitySource/Finish -> 直接执行
     外部响应经 mcl_import_response_system 或 mcl_effect_response_system 完成 MclDomainResponse
     mcl_command_reply_system 把 MclDomainResponse 转换后发送原命令回执

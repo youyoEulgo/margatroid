@@ -116,6 +116,17 @@ RouteAgentTurnAbort：逻辑Agent轮次中止命令，公开事件--由DTO层产
     impl Event for RouteAgentTurnAbort
         Event：公开trait实现
 
+RouteMclCommand：逻辑MCL命令路由命令，公开事件--由DTO层产生并交给WorkspacePlugin解析Entity后转发给MclPlugin
+    id: String--API请求ID
+    source: String--发起方稳定标识，由DTO层按连接注册状态填写；MclPlugin用它产出统一来源审计
+    workspace: WorkspaceReference
+    agent: Option<ResourceId>--空时路由到Workspace manager
+    command: String--MCL命令文本
+    binding: Option<serde_json::Value>--命令绑定值
+    reply: std::sync::mpsc::Sender<Result<serde_json::Value, String>>--回发给发起连接的一次性回执
+    impl Event for RouteMclCommand
+        Event：公开trait实现
+
 AgentVisibilityRouteAction：Agent默认资源可见性操作，公开枚举
     Inject
     Remove

@@ -15,3 +15,7 @@ client:<client_type>/<name>:<connection_id>
 
 `Client` Entity 必须挂载 `Client` 组件和 `ResourceId` 组件。类型与名称都只是客户端自报的标签，
 只用于构造可读资源 ID 与出站路由，不表示认证结果或权限。
+
+`client_source(client_type, name, connection_id)` 是同一套标识的公开构造函数，供统一 MCL 来源审计使用：
+类型与名称都存在时返回 `client:<client_type>/<name>:<connection_id>`，与客户端实体的资源 ID 相同；
+连接未注册时返回 `unregistered:<connection_id>`，因为未注册的连接没有实体。

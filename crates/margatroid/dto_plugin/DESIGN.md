@@ -118,6 +118,7 @@ handle_inbound_message(world: &mut World, connection_id: WebSocketConnectionId, 
         要求消息为Text
         反序列化统一{type,id,message}信封为ClientMessage
         按type调用对应DTO::into_domain并发送领域事件
+        MCL命令先用mcl_source算出客户端来源标识并随转换上下文传入
         MCL命令转换成功后把响应接收器写入PendingMclCommandResponses
         转换失败时写warn日志并丢弃当前请求
 
@@ -153,6 +154,11 @@ forward_logs(stream: TracingStream, events: RuntimeEventSender, targets: Vec<Web
 
 私有：
 ```text
+mcl_source(world: &World, connection_id: WebSocketConnectionId) -> String
+    计算MCL来源标识：私有函数，从WebSocketConnections读取该连接的类型与名称
+    行为：两者都存在时调用client_plugin::client_source得到client:<type>/<name>:<connection_id>；
+          任一缺失（连接未注册或注册未完成）时得到unregistered:<connection_id>
+
 report_server_events(world: &World)
     报告Server事件：私有函数，将Server启停、WebSocket连接、断开和协议失败投影为结构化日志
 

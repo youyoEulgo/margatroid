@@ -1,4 +1,5 @@
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
+use client_plugin::client_source;
 use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::World;
 use log_plugin::{TracingStream, TracingStreamError};
@@ -18,6 +19,14 @@ use crate::types::{
     BackendStateReportCache, PendingMclCommandResponse, PendingMclCommandResponses,
 };
 use crate::WebSocketMessageSend;
+
+fn mcl_source(world: &World, connection_id: WebSocketConnectionId) -> String {
+    let connections = world.get_resource::<WebSocketConnections>();
+    let client_type =
+        connections.and_then(|connections| connections.connection_type(connection_id));
+    let name = connections.and_then(|connections| connections.name(connection_id));
+    client_source(client_type.as_deref(), name.as_deref(), connection_id)
+}
 
 pub(crate) fn handle_inbound_message(
     world: &mut World,
@@ -97,7 +106,8 @@ pub(crate) fn handle_inbound_message(
         ClientMessage::MclCommand { id, message } => {
             tracing::info!(connection = connection_id.get(), request_id = %id, api_type = "mcl.command", "API request received");
             let (reply, response) = std::sync::mpsc::channel();
-            match message.into_domain((id.clone(), reply)) {
+            let source = mcl_source(world, connection_id);
+            match message.into_domain((id.clone(), source, reply)) {
                 Ok(event) => {
                     world.send_event(event);
                     world
