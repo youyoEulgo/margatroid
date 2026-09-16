@@ -124,8 +124,6 @@ impl Plugin for ToolPlugin {
             home_root: self.shell_root.clone(),
         });
         app.world_mut().insert_resource(self.shell_limits);
-        app.world_mut()
-            .insert_resource(handler::shell::PersistentShells::default());
         app.add_system(&self.schedule, tool_register_system)
             .add_system(&self.schedule, handler::skill::skill_register_system)
             .add_system(&self.schedule, handler::hook::hook_register_system)
