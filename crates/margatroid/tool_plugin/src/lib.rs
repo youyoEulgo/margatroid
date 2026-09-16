@@ -249,3 +249,5 @@ pub fn validate_agent_tool_calls(
     }
     Ok(())
 }
+
+pub use handler::lua::{run_lua_tool, LuaExecutionLimits, LuaToolRunRequest};
