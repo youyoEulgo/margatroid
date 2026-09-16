@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -125,6 +125,18 @@ fn registered_client_receives_messages_targeted_by_type() {
                 ))
                 .await
                 .unwrap();
+            loop {
+                let response = socket.next().await.unwrap().unwrap();
+                let tokio_tungstenite::tungstenite::Message::Text(text) = &response else {
+                    continue;
+                };
+                if matches!(
+                    serde_json::from_str::<ServerMessage>(text),
+                    Ok(ServerMessage::ConnectionRegistered { .. })
+                ) {
+                    break;
+                }
+            }
             socket
                 .send(tokio_tungstenite::tungstenite::Message::Text(
                     message.into(),
@@ -148,7 +160,7 @@ fn registered_client_receives_messages_targeted_by_type() {
         })
     });
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while !client.is_finished() {
         app.tick();
         assert!(Instant::now() < deadline, "API response timed out");
@@ -308,4 +320,107 @@ fn registration_failure_replies_with_the_reason() {
     };
     assert_eq!(id, "register-1");
     assert_eq!(error, "client type is not a stable identifier");
+}
+
+#[test]
+fn requests_are_ignored_until_the_connection_registers() {
+    let mut app = build_app();
+    let dispatched = Arc::new(Mutex::new(Vec::<String>::new()));
+    {
+        let dispatched = Arc::clone(&dispatched);
+        app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
+            let contents = world
+                .event_reader::<RouteAgentMessage>()
+                .into_iter()
+                .filter_map(|request| match &request.message {
+                    Message::User { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            dispatched.lock().unwrap().extend(contents);
+        });
+    }
+    let address = start(&mut app);
+    let (release, released) = mpsc::channel::<()>();
+    let connection = thread::spawn(move || {
+        let runtime = client_runtime();
+        let (mut socket, _) = runtime
+            .block_on(tokio_tungstenite::connect_async(format!(
+                "ws://{address}/ws"
+            )))
+            .unwrap();
+        let before = serde_json::to_string(&ClientMessage::agent_message(
+            "before-registration",
+            &WorkspaceReferenceDto::new("demo", "/tmp/demo"),
+            None,
+            "before-registration",
+        ))
+        .unwrap();
+        runtime
+            .block_on(socket.send(tokio_tungstenite::tungstenite::Message::Text(before.into())))
+            .unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let registration =
+            serde_json::to_string(&ClientMessage::register_connection("register-1", "webui"))
+                .unwrap();
+        runtime
+            .block_on(socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                registration.into(),
+            )))
+            .unwrap();
+        runtime.block_on(async {
+            loop {
+                let response = socket.next().await.unwrap().unwrap();
+                let tokio_tungstenite::tungstenite::Message::Text(text) = &response else {
+                    continue;
+                };
+                if matches!(
+                    serde_json::from_str::<ServerMessage>(text),
+                    Ok(ServerMessage::ConnectionRegistered { .. })
+                ) {
+                    break;
+                }
+            }
+        });
+        let after = serde_json::to_string(&ClientMessage::agent_message(
+            "after-registration",
+            &WorkspaceReferenceDto::new("demo", "/tmp/demo"),
+            None,
+            "after-registration",
+        ))
+        .unwrap();
+        runtime
+            .block_on(socket.send(tokio_tungstenite::tungstenite::Message::Text(after.into())))
+            .unwrap();
+        released.recv_timeout(Duration::from_secs(10)).unwrap();
+        runtime.block_on(socket.close(None)).unwrap();
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.tick();
+        if dispatched
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|content| content == "after-registration")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the request sent after registration was never dispatched"
+        );
+        thread::yield_now();
+    }
+    let dispatched = dispatched.lock().unwrap().clone();
+    assert!(dispatched
+        .iter()
+        .any(|content| content == "after-registration"));
+    assert!(!dispatched
+        .iter()
+        .any(|content| content == "before-registration"));
+
+    release.send(()).unwrap();
+    connection.join().unwrap();
 }

@@ -10,7 +10,7 @@
 - AgentInstance 是运行中的 Agent，只在启动时读取镜像。
 - Workspace 由 Workspace 文件编排的一组 AgentInstance。
 - Memory 默认按项目和 Agent 自动分配 SQLite 文件。
-- MCL（Model Context Language）通过 Base Lua 驱动 Agent 的消息循环、上下文管理、推理和工具调用。
+- MCL（Margatroid Control Language）是 Margatroid 的控制语言，通过 Base Lua 驱动 Agent 的消息循环、上下文管理、推理和工具调用。
 
 当前为本地单机产品：CLI 与 daemon 共享文件系统，CLI 通过 WebSocket 连接 daemon。
 

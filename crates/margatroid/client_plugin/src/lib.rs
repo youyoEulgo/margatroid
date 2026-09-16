@@ -11,6 +11,7 @@ use server_plugin::{WebSocketConnectionId, WebSocketConnections};
 
 pub use error::ClientError;
 pub use events::{ClientRegistrationResult, RegisteredClient};
+pub use handler::registered_client;
 pub use types::client_source;
 
 use crate::system::{client_disconnect_system, client_registration_system};

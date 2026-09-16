@@ -223,10 +223,12 @@ fn registration_reply(
     request_id: &str,
 ) -> Option<Result<ClientInfoDto, Box<dyn Error + Send + Sync>>> {
     match serde_json::from_str::<ServerMessage>(text) {
-        Ok(ServerMessage::ConnectionRegistered { id, client }) if id == request_id => Some(Ok(client)),
-        Ok(ServerMessage::ConnectionRegisterFailed { id, error }) if id == request_id => {
-            Some(Err(format!("connection registration failed: {error}").into()))
+        Ok(ServerMessage::ConnectionRegistered { id, client }) if id == request_id => {
+            Some(Ok(client))
         }
+        Ok(ServerMessage::ConnectionRegisterFailed { id, error }) if id == request_id => Some(Err(
+            format!("connection registration failed: {error}").into(),
+        )),
         _ => None,
     }
 }

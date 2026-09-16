@@ -117,10 +117,15 @@ handle_inbound_message(world: &mut World, connection_id: WebSocketConnectionId, 
     行为：
         要求消息为Text
         反序列化统一{type,id,message}信封为ClientMessage
+        注册检查：connection.register以外的请求要求连接已注册，未注册时写warn日志并丢弃
         按type调用对应DTO::into_domain并发送领域事件
         MCL命令先用mcl_source算出客户端来源标识并随转换上下文传入
         MCL命令转换成功后把响应接收器写入PendingMclCommandResponses
         转换失败时写warn日志并丢弃当前请求
+
+注册检查的边界：只看处理该请求这一帧的状态——连接此时已注册就服务，否则丢弃；不做延后、不重试。
+            回执在Client实体创建之后发出，等待回执再发后续请求的客户端必然满足该条件；
+            不等待回执的客户端落在契约之外，其请求服务与否取决于注册与请求两帧是否落在同一帧，daemon不作保证
 
 handle_pending_mcl_responses(world: &mut World)
     处理MCL响应：crate公开函数

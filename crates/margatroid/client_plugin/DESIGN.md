@@ -141,12 +141,17 @@ handle_client_registration(world: &mut World, connections: &WebSocketConnections
         写info日志，包含request_id、connection_id、client_type、name和resource_id
         返回Entity
 
+registered_client(world: &World, connection_id: WebSocketConnectionId) -> Option<ResourceId>
+    查询已注册客户端：crate公开函数，dto_plugin的注册检查用它判定连接是否可信
+    行为：按connection_id找到Client实体后返回其ResourceId；未注册时返回None
+
 handle_client_disconnect(world: &mut World, connection_id: WebSocketConnectionId)
     处理客户端断开：crate公开函数
     行为：
-        在query_with::<Client>()的结果中查找connection_id匹配的Entity
+        按connection_id找到Client实体
         命中时despawn该Entity
         未命中时不做任何事
+    边界：与registered_client共用client_entity查找
 ```
 
 私有：
