@@ -63,7 +63,7 @@ ToolPlugin：工具插件，公开结构体--统一安装内置工具根、注�
     hook_root: Arc<PathBuf>--hook 根目录，私有
     lua_root: Arc<PathBuf>--lua 工具根目录，私有
     shell_root: Arc<PathBuf>--shell 根目录，私有
-    lua_limits: LuaExecutionLimits--Lua 执行限制，私有
+    lua_limits: LuaExecutionLimits--Lua 执行限制，公开（runner bin 目标要按同一份限额构造请求）
     shell_limits: ShellExecutionLimits--Shell 执行限制，私有
     open(root: impl Into<PathBuf>) -> Result<Self, ToolError>
         打开插件：公开关联函数，要求 root 绝对且无父级跳转
@@ -133,6 +133,35 @@ mod.rs   finish_tool_call(world, request, result)
 skill.rs skill_register_system / execute_skill_call
 hook.rs  hook_register_system / execute_hook_call
 lua.rs   lua_tool_register_system / prepare_lua_call / execute_prepared_lua_tool / lua_task_result_system
+         / run_lua_tool / spawn_tool_runner / runner_failure / tool_runner_path
+
+run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError>
+    执行 Lua 工具：公开异步函数，插件进程内与 runner 进程共用同一段逻辑
+    行为：读工具包（main.lua 与 input schema）→ 校验 arguments → 建 VM（StdLib::ALL + 内存上限 + 执行钩子 + 注入宿主面）
+          → 加载 main.lua → 调用全局 execute → 结果长度不超过 max_output_bytes
+    约束：request 携带 package_root、arguments、agent_id、turn_id、resource_id、project_root、image_root、
+          limits 与可选 http client（插件侧传共享 client，runner 侧传 None 自行创建）
+
+spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolError>
+    派生 runner 执行工具：私有异步函数
+    行为：把请求序列化成 JSON 写 runner 的 stdin，读 stdout 作为工具结果，stderr 用于还原错误
+          runner 路径取环境变量 MARGATROID_TOOL_RUNNER，缺省取当前可执行文件同目录下的 tool_runner
+          超时用 limits.max_execution_time，输出上限用 limits.max_output_bytes（截断即 ExecutionFailed）
+    边界：runner 无法启动、流失败或超时统一记为 RunnerFailed，与"工具执行失败"严格区分（§5.2 的 runner_failure_hints）
+
+runner_failure(stderr: &str) -> ToolError
+    还原 runner 错误：私有函数，解析 stderr 的 JSON 并映射错误种类
+    行为：kind 为 InvalidRequest / InvalidArguments / InvalidDefinition 时保留原种类，其余与不可解析一律 ExecutionFailed
+
+tool_runner_path() -> Result<PathBuf, ToolError>
+    定位 runner：私有函数，先看环境变量，再看当前可执行文件同目录
+
+tool_runner（src/bin/tool_runner.rs，bin 目标）：独立进程执行 Lua 工具，与上面的 spawn 路径成对
+    请求：stdin 传 JSON（也接受 argv[1] 指定文件），字段与 LuaToolRunRequest 对齐，
+          limits 里的时间以毫秒表示（max_execution_time_ms / max_host_call_time_ms）
+    输出：工具返回值原样写 stdout
+    退出码：0 成功；2 插件侧问题（InvalidRequest / InvalidArguments / InvalidDefinition）；3 工具执行失败
+    stderr：非零退出时输出 {"kind": "...", "message": "..."}，供 spawn_tool_runner 还原
 shell.rs shell_register_system / prepare_shell_call / execute_prepared_shell / shell_task_result_system（每次调用一次性 PTY，stdout 与 stderr 合并）
 ```
 

@@ -19,8 +19,8 @@ use futures_util::StreamExt;
 use margatroid_types::ResourceId;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 const LUA_RUNTIME_ID: &str = "tool:builtin/lua-runtime:latest";
@@ -486,7 +486,8 @@ pub struct LuaToolRunRequest {
 
 pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError> {
     let limits = request.limits.clone();
-    let package = read_lua_tool_package(&request.package_root, &request.resource_id, &limits).await?;
+    let package =
+        read_lua_tool_package(&request.package_root, &request.resource_id, &limits).await?;
     let arguments =
         serde_json::from_str::<serde_json::Value>(&request.arguments).map_err(|_| {
             ToolError::new(
@@ -544,7 +545,8 @@ pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolErro
         limits: limits.clone(),
     };
     let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
-    lua.set_memory_limit(limits.max_memory_bytes).map_err(lua_tool_error)?;
+    lua.set_memory_limit(limits.max_memory_bytes)
+        .map_err(lua_tool_error)?;
     install_execution_hook(&lua, &limits)?;
     let context = install_lua_environment(&lua, &handle)?;
     lua.load(&package.script)
@@ -647,10 +649,16 @@ async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolEr
         })?;
     }
     let stdout = child.stdout.take().ok_or_else(|| {
-        ToolError::new(ToolErrorKind::RunnerFailed, "tool runner stdout is unavailable")
+        ToolError::new(
+            ToolErrorKind::RunnerFailed,
+            "tool runner stdout is unavailable",
+        )
     })?;
     let stderr = child.stderr.take().ok_or_else(|| {
-        ToolError::new(ToolErrorKind::RunnerFailed, "tool runner stderr is unavailable")
+        ToolError::new(
+            ToolErrorKind::RunnerFailed,
+            "tool runner stderr is unavailable",
+        )
     })?;
     let limit = request.limits.max_output_bytes;
     let outcome = tokio::time::timeout(request.limits.max_execution_time, async {
@@ -686,6 +694,10 @@ async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolEr
         }
         return Ok(String::from_utf8_lossy(&stdout.bytes).into_owned());
     }
+    Err(runner_failure(&stderr))
+}
+
+fn runner_failure(stderr: &str) -> ToolError {
     let reported = serde_json::from_str::<serde_json::Value>(stderr.trim()).ok();
     let kind = match reported
         .as_ref()
@@ -703,7 +715,7 @@ async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolEr
         .and_then(|value| value.as_str())
         .unwrap_or("Lua tool execution failed")
         .to_owned();
-    Err(ToolError::new(kind, message))
+    ToolError::new(kind, message)
 }
 
 async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, ToolError> {
@@ -1407,4 +1419,99 @@ fn lua_tool_error(error: mlua::Error) -> ToolError {
         ToolErrorKind::ExecutionFailed,
         format!("Lua tool execution failed: {error}"),
     )
+}
+
+#[cfg(test)]
+mod runner_tests {
+    use super::*;
+
+    fn limits(output_bytes: usize, execution_ms: u64) -> LuaExecutionLimits {
+        LuaExecutionLimits {
+            max_definition_bytes: 1 << 20,
+            max_script_bytes: 1 << 20,
+            max_argument_bytes: 1 << 20,
+            max_output_bytes: output_bytes,
+            max_memory_bytes: 1 << 28,
+            max_instructions: 1_000_000_000,
+            max_execution_time: Duration::from_millis(execution_ms),
+            max_host_call_time: Duration::from_millis(execution_ms),
+        }
+    }
+
+    fn request(limits: LuaExecutionLimits) -> LuaToolRunRequest {
+        LuaToolRunRequest {
+            package_root: PathBuf::from("/nonexistent/package"),
+            arguments: "{}".to_owned(),
+            agent_id: ResourceId::parse("agent:test/coder:latest").unwrap(),
+            turn_id: "turn-1".to_owned(),
+            resource_id: ResourceId::parse("tool:local/glob:latest").unwrap(),
+            project_root: PathBuf::from("/tmp"),
+            image_root: PathBuf::from("/tmp"),
+            limits,
+            client: None,
+        }
+    }
+
+    #[test]
+    fn runner_failure_mapping_is_stable() {
+        let invalid = runner_failure(r#"{"kind":"InvalidArguments","message":"bad arguments"}"#);
+        assert_eq!(invalid.kind(), ToolErrorKind::InvalidArguments);
+        assert_eq!(invalid.message(), "bad arguments");
+
+        let failed = runner_failure(r#"{"kind":"ExecutionFailed","message":"boom"}"#);
+        assert_eq!(failed.kind(), ToolErrorKind::ExecutionFailed);
+
+        let unreadable = runner_failure("not json at all");
+        assert_eq!(unreadable.kind(), ToolErrorKind::ExecutionFailed);
+        assert_eq!(unreadable.message(), "Lua tool execution failed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_failures_are_classified() {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::env::set_var("MARGATROID_TOOL_RUNNER", "/nonexistent/tool_runner");
+        let missing = spawn_tool_runner(&request(limits(1 << 20, 5_000)))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.kind(), ToolErrorKind::RunnerFailed);
+        assert!(
+            missing.message().contains("could not start"),
+            "{}",
+            missing.message()
+        );
+
+        let script = std::env::temp_dir().join(format!("tool-runner-test-{}", std::process::id()));
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("MARGATROID_TOOL_RUNNER", &script);
+        let timed_out = spawn_tool_runner(&request(limits(1 << 20, 200)))
+            .await
+            .unwrap_err();
+        assert_eq!(timed_out.kind(), ToolErrorKind::RunnerFailed);
+        assert!(
+            timed_out.message().contains("timed out"),
+            "{}",
+            timed_out.message()
+        );
+
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 200 ]; do echo 0123456789; i=$((i+1)); done\n",
+        )
+        .unwrap();
+        let oversized = spawn_tool_runner(&request(limits(16, 5_000)))
+            .await
+            .unwrap_err();
+        assert_eq!(oversized.kind(), ToolErrorKind::ExecutionFailed);
+        assert!(
+            oversized.message().contains("size limit"),
+            "{}",
+            oversized.message()
+        );
+
+        std::fs::remove_file(&script).ok();
+        std::env::remove_var("MARGATROID_TOOL_RUNNER");
+    }
 }
