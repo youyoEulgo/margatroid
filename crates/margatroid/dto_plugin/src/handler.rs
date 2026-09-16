@@ -92,17 +92,6 @@ pub(crate) fn handle_inbound_message(
                 ),
             }
         }
-        ClientMessage::AgentAssistant { id, message } => {
-            tracing::info!(connection = connection_id.get(), request_id = %id, api_type = "agent.assistant", "API request received");
-            match message.into_domain(id) {
-                Ok(event) => world.send_event(event),
-                Err(error) => tracing::warn!(
-                    connection = connection_id.get(),
-                    error = %error,
-                    "invalid agent.assistant payload"
-                ),
-            }
-        }
         ClientMessage::MclCommand { id, message } => {
             tracing::info!(connection = connection_id.get(), request_id = %id, api_type = "mcl.command", "API request received");
             let (reply, response) = std::sync::mpsc::channel();

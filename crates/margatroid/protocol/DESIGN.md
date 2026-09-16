@@ -18,12 +18,13 @@ Message::Tool：工具结果消息，公开消息变体
     tool_call_id: String--对应ToolCall.id
     content: String--工具结果或稳定错误
 
-MessageDto::Assistant：Assistant展示消息DTO
+MessageDto::Assistant：Assistant展示消息DTO，客户端可注入的两种方向之一
     reasoning: Option<String>--Provider公开的完整思考内容
     content: Option<String>--Assistant正文
     tool_calls: Vec<ToolCallDto>
 
 MessageDto::Error：错误展示消息DTO
+    边界：MessageDto同时用于出站投影与入站注入；入站方向只接受User与Assistant，Tool与Error返回InvalidRequest
     message: String--Agent创建成功后的轮次级稳定错误文本
 
 ServerMessage::AgentMessageReasoningDelta：思考流式分片
@@ -37,9 +38,6 @@ ClientMessage::AgentVisibilityInject / AgentVisibilityRemove：前端默认资�
 
 ClientMessage::AgentTurnAbort：前端中止当前Agent轮次命令
     行为：使用WorkspaceReference和可选Agent资源ID路由为RouteAgentTurnAbort；不由前端提供turn_id
-
-ClientMessage::AgentAssistant：外部构造Assistant消息
-    行为：仅用于显式手动资源调用；ToolCall携带resource_id而不是Agent内部tool_name，由AgentPlugin校验动态可见性并转换后交给Base Driver
 
 ClientMessage::AgentWorkflowAttach / AgentWorkflowDetach：前端Workflow热插拔命令
     行为：第一阶段保留协议形状但转换后返回Unsupported；待MCL Workflow权限和消息订阅模型确定后实现
