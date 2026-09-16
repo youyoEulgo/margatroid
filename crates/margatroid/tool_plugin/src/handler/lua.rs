@@ -28,15 +28,15 @@ const TOOL_SCHEMA_FILE: &str = "input.schema.json";
 const TOOL_SCRIPT_FILE: &str = "main.lua";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LuaExecutionLimits {
-    max_definition_bytes: usize,
-    max_script_bytes: usize,
-    max_argument_bytes: usize,
-    max_output_bytes: usize,
-    max_memory_bytes: usize,
-    max_instructions: u64,
-    max_execution_time: Duration,
-    max_host_call_time: Duration,
+pub struct LuaExecutionLimits {
+    pub max_definition_bytes: usize,
+    pub max_script_bytes: usize,
+    pub max_argument_bytes: usize,
+    pub max_output_bytes: usize,
+    pub max_memory_bytes: usize,
+    pub max_instructions: u64,
+    pub max_execution_time: Duration,
+    pub max_host_call_time: Duration,
 }
 
 impl LuaExecutionLimits {
@@ -471,15 +471,23 @@ pub(crate) async fn execute_prepared_lua_tool(
     Ok(())
 }
 
-async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, ToolError> {
-    let package = read_lua_tool_package(
-        &prepared.package_root,
-        &prepared.handle.context.resource_id,
-        &prepared.handle.limits,
-    )
-    .await?;
+pub struct LuaToolRunRequest {
+    pub package_root: PathBuf,
+    pub arguments: String,
+    pub agent_id: ResourceId,
+    pub turn_id: String,
+    pub resource_id: ResourceId,
+    pub project_root: PathBuf,
+    pub image_root: PathBuf,
+    pub limits: LuaExecutionLimits,
+    pub client: Option<reqwest::Client>,
+}
+
+pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError> {
+    let limits = request.limits.clone();
+    let package = read_lua_tool_package(&request.package_root, &request.resource_id, &limits).await?;
     let arguments =
-        serde_json::from_str::<serde_json::Value>(&prepared.arguments).map_err(|_| {
+        serde_json::from_str::<serde_json::Value>(&request.arguments).map_err(|_| {
             ToolError::new(
                 ToolErrorKind::InvalidArguments,
                 "Lua tool arguments must be valid JSON",
@@ -504,13 +512,42 @@ async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, Tool
         ));
     }
 
+    let package_root = Arc::new(request.package_root.clone());
+    let handle = LuaExecutionHandle {
+        context: LuaCallContext {
+            agent_id: request.agent_id.clone(),
+            turn_id: request.turn_id.clone(),
+            resource_id: request.resource_id.clone(),
+            project_root: Arc::new(request.project_root.clone()),
+            image_root: Arc::new(request.image_root.clone()),
+            package_root: Arc::clone(&package_root),
+        },
+        capabilities: LuaDirectCapabilityHandle {
+            fs: LuaFileHandle {
+                limits: limits.clone(),
+            },
+            http: LuaHttpHandle {
+                client: request.client.clone().unwrap_or_default(),
+                limits: limits.clone(),
+            },
+            json: LuaJsonHandle,
+            log: LuaLogHandle {
+                agent_id: request.agent_id.clone(),
+                turn_id: request.turn_id.clone(),
+                resource_id: request.resource_id.clone(),
+            },
+            process: LuaProcessHandle {
+                limits: limits.clone(),
+            },
+        },
+        limits: limits.clone(),
+    };
     let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
-    lua.set_memory_limit(prepared.handle.limits.max_memory_bytes)
-        .map_err(lua_tool_error)?;
-    install_execution_hook(&lua, &prepared.handle.limits)?;
-    let context = install_lua_environment(&lua, &prepared.handle)?;
+    lua.set_memory_limit(limits.max_memory_bytes).map_err(lua_tool_error)?;
+    install_execution_hook(&lua, &limits)?;
+    let context = install_lua_environment(&lua, &handle)?;
     lua.load(&package.script)
-        .set_name(prepared.handle.context.resource_id.to_string())
+        .set_name(request.resource_id.to_string())
         .exec()
         .map_err(lua_tool_error)?;
     let execute = lua.globals().get::<Function>("execute").map_err(|_| {
@@ -524,13 +561,28 @@ async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, Tool
         .call_async::<String>((lua_arguments, context))
         .await
         .map_err(lua_tool_error)?;
-    if result.len() > prepared.handle.limits.max_output_bytes {
+    if result.len() > limits.max_output_bytes {
         return Err(ToolError::new(
             ToolErrorKind::ExecutionFailed,
             "Lua tool output exceeds the size limit",
         ));
     }
     Ok(result)
+}
+
+async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, ToolError> {
+    run_lua_tool(LuaToolRunRequest {
+        package_root: prepared.package_root.as_ref().clone(),
+        arguments: prepared.arguments.clone(),
+        agent_id: prepared.handle.context.agent_id.clone(),
+        turn_id: prepared.handle.context.turn_id.clone(),
+        resource_id: prepared.handle.context.resource_id.clone(),
+        project_root: prepared.handle.context.project_root.as_ref().clone(),
+        image_root: prepared.handle.context.image_root.as_ref().clone(),
+        limits: prepared.handle.limits.clone(),
+        client: Some(prepared.handle.capabilities.http.client.clone()),
+    })
+    .await
 }
 
 pub(crate) fn lua_task_result_system(world: &mut World) {
