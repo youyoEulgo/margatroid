@@ -620,7 +620,7 @@ DeepSeekAdapterFactory：DeepSeek协议工厂，公开结构体
     new() -> Self
         构造工厂：公开关联函数
     impl ProviderAdapterFactory for DeepSeekAdapterFactory
-        构造DeepSeek适配器：校验thinking和reasoning_effort组合，启用思考时要求high或max
+        构造DeepSeek适配器：把thinking解析为ThinkingMode，校验thinking和reasoning_effort组合，启用思考时要求high或max
 ```
 
 crate公开：
@@ -649,13 +649,25 @@ OpenAiAdapter：OpenAI协议适配器，私有结构体
         build_request：使用/chat/completions和流式SSE，构造OpenAI兼容请求体
         begin_response：非成功状态返回ResponseStatus
 
+ThinkingMode：DeepSeek思考模式，私有枚举
+    Enabled | Disabled
+    parse(&str) -> Option<Self>
+        解析：只接受enabled与disabled
+    as_str(self) -> &'static str
+        输出：写回请求体的type字段
+    thinks(self) -> bool
+        判定：只有Enabled让上游处于思考模式
+
 DeepSeekAdapter：DeepSeek协议适配器，私有结构体
     base_url: Url
     api_key: String
-    thinking: bool
+    thinking: Option<ThinkingMode>
     reasoning_effort: Option<String>
     impl ProviderAdapter for DeepSeekAdapter
         build_request：使用/chat/completions和流式SSE，写入thinking与reasoning_effort
+        行为：声明thinking时按模式写type，disabled必须显式写入而不能省略
+        边界：DeepSeek把缺失的thinking视为未指定，模型按自身默认运行（deepseek-flash默认思考），
+              因此省略字段无法表达"关闭思考"
         begin_response：非成功状态返回ResponseStatus
 
 OpenAiRequest：OpenAI兼容请求体，私有结构体
@@ -728,8 +740,8 @@ openai_message(message: &Message) -> serde_json::Value
 
 deepseek_message(message: &Message, thinking: bool) -> serde_json::Value
     DeepSeek消息转换：私有函数，Assistant写content与tool_calls，其余委托openai_message
-    行为：启用思考时每条Assistant都写reasoning_content，思考内容缺失时写空串；
-          未启用思考时只对带tool_calls的Assistant写该字段（沿用既有行为）
+    行为：上游可能处于思考模式（声明enabled或未声明thinking）时每条Assistant都写reasoning_content，
+          思考内容缺失时写空串；显式disabled时只对带tool_calls的Assistant写该字段
     边界：DeepSeek在思考模式下要求把assistant消息的reasoning_content回传，缺字段会被Provider拒绝；
           注入或历史里没有思考内容的assistant消息必须补空串，不能省略字段
 
