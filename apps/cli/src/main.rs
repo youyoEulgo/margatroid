@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use compose::compile;
 use futures_util::{SinkExt, StreamExt};
-use margatroid_protocol::{ClientMessage, ServerMessage};
+use margatroid_protocol::{ClientInfoDto, ClientMessage, ServerMessage};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio_tungstenite::connect_async;
@@ -77,8 +77,9 @@ async fn run_workspace_up(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let definition = compile(&workspace_file)?;
     let start_request_id = request_id();
+    let register_request_id = format!("{start_request_id}-register");
     let registration = serde_json::to_string(&ClientMessage::register_connection(
-        format!("{start_request_id}-register"),
+        register_request_id.as_str(),
         "cli",
     ))?;
     let request = ClientMessage::start_workspace(&start_request_id, &definition);
@@ -105,6 +106,14 @@ async fn run_workspace_up(
     print_cli_event("INFO", "backend WebSocket connected");
     socket.send(Message::Text(registration.into())).await?;
     print_cli_event("INFO", "connection.register sent (client_type=cli)");
+    let registered = wait_for_register_ack(&mut socket, &register_request_id).await?;
+    print_cli_event(
+        "INFO",
+        &format!(
+            "connection registered (client={}, type={}, name={})",
+            registered.resource_id, registered.client_type, registered.name
+        ),
+    );
     socket.send(Message::Text(encoded.into())).await?;
     print_cli_event(
         "INFO",
@@ -164,6 +173,59 @@ fn workspace_start_error(text: &str, request_id: &str) -> Option<String> {
     match serde_json::from_str::<ServerMessage>(text) {
         Ok(ServerMessage::WorkspaceStartFailed { id, error }) if id == request_id => {
             Some(format!("workspace start failed: {error}"))
+        }
+        _ => None,
+    }
+}
+
+async fn wait_for_register_ack(
+    socket: &mut (impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+              + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+              + Unpin),
+    request_id: &str,
+) -> Result<ClientInfoDto, Box<dyn Error + Send + Sync>> {
+    let mut deadline = Box::pin(tokio::time::sleep(Duration::from_secs(5)));
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return Err("timed out waiting for connection.registered".into()),
+            signal = wait_for_shutdown_signal() => {
+                signal?;
+                futures_util::SinkExt::close(socket).await?;
+                return Err("shutdown requested before registration completed".into());
+            }
+            message = socket.next() => {
+                let Some(message) = message else { return Err("backend disconnected before registration completed".into()); };
+                match message? {
+                    Message::Text(text) => {
+                        print_backend_message(&text);
+                        if let Some(reply) = registration_reply(&text, request_id) {
+                            return reply;
+                        }
+                    }
+                    Message::Binary(bytes) => if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                        print_backend_message(&text);
+                        if let Some(reply) = registration_reply(&text, request_id) {
+                            return reply;
+                        }
+                    },
+                    Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
+                    Message::Pong(_) => {},
+                    Message::Close(_) => return Err("backend closed before registration completed".into()),
+                    Message::Frame(_) => {},
+                }
+            }
+        }
+    }
+}
+
+fn registration_reply(
+    text: &str,
+    request_id: &str,
+) -> Option<Result<ClientInfoDto, Box<dyn Error + Send + Sync>>> {
+    match serde_json::from_str::<ServerMessage>(text) {
+        Ok(ServerMessage::ConnectionRegistered { id, client }) if id == request_id => Some(Ok(client)),
+        Ok(ServerMessage::ConnectionRegisterFailed { id, error }) if id == request_id => {
+            Some(Err(format!("connection registration failed: {error}").into()))
         }
         _ => None,
     }
