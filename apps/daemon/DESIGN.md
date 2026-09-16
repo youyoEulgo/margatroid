@@ -12,8 +12,8 @@ run() -> Result<(), Error>
     行为：
         从HOME固定得到~/.margatroid并创建主目录
         检查models.toml和config.toml存在
-        加载并验证config.toml中的server.bind、日志配置和全部出站配置
-        使用server.bind构造ServerPlugin
+        加载并验证config.toml中的server.bind、server.allow、日志配置和全部出站配置
+        使用server.bind构造ServerPlugin，并把server.allow解析出的入口策略作为握手判定接缝注入
         使用log.level和可选的log.filter构造LogPlugin；filter存在时优先于level
         将全局只读WebSocket目标配置交给DtoPlugin和InferencePlugin
         打开AgentImage、Workspace、ToolPlugin和LuaRuntimePlugin所需目录
@@ -35,7 +35,7 @@ log_level(level: ConfigLogLevel) -> LogLevel
 main
     -> run
         -> 打开~/.margatroid/config.toml
-        -> 使用server.bind安装ServerPlugin
+        -> 使用server.bind与入口策略安装ServerPlugin
         -> 使用log.level与log.filter安装LogPlugin
         -> 按依赖顺序安装ToolPlugin、LuaRuntimePlugin、MclPlugin等全部Plugin
         -> AppRunExt::run

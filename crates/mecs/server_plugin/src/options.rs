@@ -1,11 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use core_plugin::Resource;
 
-use crate::ServerError;
+use crate::{AllowAllHandshakes, HandshakeGuard, ServerError};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ServerOptions {
     pub(crate) bind_address: SocketAddr,
     pub(crate) body_limit: usize,
@@ -13,6 +14,7 @@ pub struct ServerOptions {
     pub(crate) stream_buffer_capacity: usize,
     pub(crate) websocket_buffer_capacity: usize,
     pub(crate) shutdown_timeout: Duration,
+    pub(crate) handshake_guard: Arc<dyn HandshakeGuard>,
 }
 
 impl ServerOptions {
@@ -62,6 +64,11 @@ impl ServerOptions {
         self
     }
 
+    pub fn with_handshake_guard<G: HandshakeGuard>(mut self, guard: G) -> Self {
+        self.handshake_guard = Arc::new(guard);
+        self
+    }
+
     pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
         if timeout.is_zero() {
             ServerError::InvalidShutdownTimeout { timeout }.panic();
@@ -93,6 +100,10 @@ impl ServerOptions {
     pub fn shutdown_timeout(&self) -> Duration {
         self.shutdown_timeout
     }
+
+    pub fn handshake_guard(&self) -> Arc<dyn HandshakeGuard> {
+        Arc::clone(&self.handshake_guard)
+    }
 }
 
 impl Default for ServerOptions {
@@ -104,6 +115,7 @@ impl Default for ServerOptions {
             stream_buffer_capacity: 32,
             websocket_buffer_capacity: 64,
             shutdown_timeout: Duration::from_secs(10),
+            handshake_guard: Arc::new(AllowAllHandshakes),
         }
     }
 }

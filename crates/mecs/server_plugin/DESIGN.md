@@ -105,6 +105,7 @@ ServerOptions：服务器配置，公开结构体--配置监听、HTTP、WebSock
     stream_buffer_capacity: usize--HTTP流缓冲容量，crate公开
     websocket_buffer_capacity: usize--WebSocket通道容量，crate公开
     shutdown_timeout: Duration--优雅停止超时，crate公开
+    handshake_guard: Arc<dyn HandshakeGuard>--握手判定接缝，crate公开，默认AllowAllHandshakes
     DEFAULT_PORT: u16--默认端口3939，公开关联常量
     bind(address: SocketAddr) -> Self
         使用地址构造：公开关联函数，address替换默认监听地址
@@ -609,7 +610,7 @@ build_router(router: Router, event_routes: Vec<EventRoute>, websocket_routes: Ve
     构建Router：将HTTP事件Handler和WebSocket升级Handler按路由合并到原生Router
 
 run_server(options: ServerOptions, router: Router, handle: ServerHandle, event_sender: RuntimeEventSender, shutdown_receiver: oneshot::Receiver<()>)
-    运行服务器：私有异步函数，绑定TCP Listener，发送ServerStarted、ServerFailed和ServerStopped，并执行有超时的优雅停止
+    运行服务器：私有异步函数，绑定TCP Listener，用into_make_service_with_connect_info提供对端地址，发送ServerStarted、ServerFailed和ServerStopped，并执行有超时的优雅停止
 
 handle_event_request(State(state): State<ServerBridgeState>, request: Request) -> Response<Body>
     处理HTTP委托请求：私有异步函数，缓冲受限Body，发送HttpRequestReceived，等待完整响应或流式响应开始
@@ -617,8 +618,10 @@ handle_event_request(State(state): State<ServerBridgeState>, request: Request) -
 is_body_limit_error(error: &axum::Error) -> bool
     检查Body上限错误：私有函数，遍历error source链查找LengthLimitError
 
-handle_websocket_upgrade(State(state): State<WebSocketRouteState>, upgrade: WebSocketUpgrade) -> impl IntoResponse
-    处理WebSocket升级：私有异步函数，分配连接ID并将升级后的socket交给run_websocket_connection
+handle_websocket_upgrade(State(state): State<WebSocketRouteState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> axum::response::Response
+    处理WebSocket升级：私有异步函数，取对端地址与Origin/Host交给handshake_guard判定
+    行为：判定失败时写warn日志并返回403，socket不建立；通过后分配连接ID并把升级后的socket交给run_websocket_connection
+    边界：mecs只定义接缝与默认放行，允许哪些对端与Origin由业务侧实现；判定只发生在这一个位置
 
 run_websocket_connection(route: WebSocketRouteState, connection_id: WebSocketConnectionId, socket: WebSocket)
     运行WebSocket连接：私有异步函数，注册发送器，并发运行读写循环，结束时清理并发送断开事件

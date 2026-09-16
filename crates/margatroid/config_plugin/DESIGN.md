@@ -106,6 +106,32 @@ MAX_CONFIG_BYTES: usize = 64 * 1024--配置文件最大字节数
 
 公开：
 ```text
+CidrBlock：地址块，公开结构体--network与prefix
+    parse(&str) -> Option<Self>
+        解析：接受IP或IP/前缀，前缀越界返回None
+    contains(&self, address: IpAddr) -> bool
+        匹配：按前缀比较，只在同一地址族内比较，不做IPv4映射转换
+    network(&self) -> IpAddr
+    prefix(&self) -> u8
+    covers_everything(&self) -> bool
+        判定：前缀为0时覆盖全部地址
+    is_unspecified_host(&self) -> bool
+        判定：是否为0.0.0.0或::本身，用于拒绝数组里读起来像白名单的写法
+
+IngressPolicy：入口策略，公开枚举--Localhost | Any | Addresses(Vec<CidrBlock>)
+    localhost() / any() / addresses(Vec<CidrBlock>) -> Self
+    allows_peer(&self, peer: IpAddr) -> bool
+    admits_non_loopback(&self) -> bool
+    allows_origin(&self, origin: Option<&str>, host: Option<&str>) -> bool
+    evaluate(&self, peer: SocketAddr, origin: Option<&str>, host: Option<&str>) -> Result<(), String>
+        判定：先查对端是否在策略内，再查Origin
+        行为：无Origin视为非浏览器请求并放行；Origin为null、缺少Host、authority与Host不一致时拒绝并给出原因
+        边界：策略住在业务层，mecs只接收判定结果
+    impl Display for IngressPolicy
+        输出：localhost、all或逗号分隔的地址块，用于启动日志
+    impl HandshakeGuard for IngressPolicy
+        实现：把evaluate交给server_plugin的握手接缝
+
 WebSocketMessageTarget：WebSocket消息目标，公开枚举--保存尚未解析为连接发送器的目标
     Broadcast--全部当前连接
     Type(String)--指定连接类型
@@ -175,6 +201,16 @@ OutboundDocument：出站配置文档，crate公开结构体--拒绝未知字段
 
 私有：
 ```text
+decode_ingress(allow: Option<&toml::Value>, bind: SocketAddr) -> Result<IngressPolicy, ConfigError>
+    解析入口策略：私有函数
+    行为：allow缺省时取localhost；标量只接受localhost、127.0.0.1、all与0.0.0.0；
+          数组逐项解析为CidrBlock，非字符串或非法条目返回InvalidIngressEntry(index)，
+          覆盖全部地址的条目返回IngressEntryCoversEverything(index)
+    边界：bind为回环地址而策略放行非回环对端时返回IngressWiderThanBind，在加载期就失败
+
+authority_of(origin: &str) -> Option<&str>
+    提取Origin的authority：私有函数，去掉scheme与userinfo，截到首个/、?或#
+
 decode_log_level(level: &str) -> Result<LogLevel, ConfigError>
     解析日志级别：接受off、error、warn、info、debug和trace，其余返回InvalidLogLevel
 

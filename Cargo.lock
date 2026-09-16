@@ -383,6 +383,7 @@ version = "0.1.0"
 dependencies = [
  "core_plugin",
  "serde",
+ "server_plugin",
  "tempfile",
  "toml",
 ]

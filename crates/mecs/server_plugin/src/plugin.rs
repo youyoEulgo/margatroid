@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error as _;
 use std::future::IntoFuture;
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,9 +10,9 @@ use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, World
 use async_runtime_plugin::{AsyncRuntimeHandle, WorldAsyncExt};
 use axum::body::{to_bytes, Body};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Request, State};
-use axum::http::{Method, Response, StatusCode};
-use axum::response::IntoResponse;
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::{header, HeaderMap, Method, Response, StatusCode};
+use axum::response::{IntoResponse, Response as AxumResponse};
 use axum::routing::{get, on, MethodFilter};
 use axum::Router;
 use core_plugin::{App, Plugin, World};
@@ -21,8 +21,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::resource::{ErasedWebSocketClassifier, RouteRegistry, ServerHandle, WebSocketRoute};
 use crate::websocket::{
-    JsonWebSocketMessageClassifier, SharedConnectionState, SharedStreamState, WebSocketConnected,
-    WebSocketConnectionId, WebSocketConnections, WebSocketDisconnected,
+    HandshakeGuard, JsonWebSocketMessageClassifier, SharedConnectionState, SharedStreamState,
+    WebSocketConnected, WebSocketConnectionId, WebSocketConnections, WebSocketDisconnected,
     WebSocketMessageClassification, WebSocketMessageClassifier, WebSocketMessageReceived,
     WebSocketProtocolError, WebSocketProtocolFailed, WebSocketSender, WebSocketStream,
     WebSocketStreamOpened, WebSocketStreamPhase, WebSocketStreamReceiver,
@@ -153,6 +153,7 @@ struct ServerBridgeState {
     response_start_timeout: Duration,
     stream_buffer_capacity: usize,
     websocket_buffer_capacity: usize,
+    handshake_guard: Arc<dyn HandshakeGuard>,
 }
 
 #[derive(Clone)]
@@ -182,6 +183,7 @@ fn start_server(world: &mut World) {
         response_start_timeout: options.response_start_timeout,
         stream_buffer_capacity: options.stream_buffer_capacity,
         websocket_buffer_capacity: options.websocket_buffer_capacity,
+        handshake_guard: options.handshake_guard(),
     };
     let (router, event_routes, websocket_routes) = world
         .get_resource::<RouteRegistry>()
@@ -261,11 +263,14 @@ async fn run_server(
     event_sender.send_event(ServerStarted { address });
 
     let (graceful_sender, graceful_receiver) = oneshot::channel();
-    let server = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            let _ = graceful_receiver.await;
-        })
-        .into_future();
+    let server = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = graceful_receiver.await;
+    })
+    .into_future();
     tokio::pin!(server);
 
     tokio::select! {
@@ -335,15 +340,34 @@ fn is_body_limit_error(error: &axum::Error) -> bool {
 
 async fn handle_websocket_upgrade(
     State(state): State<WebSocketRouteState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> AxumResponse {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    if let Err(rejection) = state.bridge.handshake_guard.guard(peer, origin, host) {
+        tracing::warn!(
+            peer = %peer,
+            origin = ?origin,
+            rejection = %rejection,
+            "rejected WebSocket upgrade"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let connection_id = WebSocketConnectionId::new(
         state
             .bridge
             .next_websocket_id
             .fetch_add(1, Ordering::Relaxed),
     );
-    upgrade.on_upgrade(move |socket| run_websocket_connection(state, connection_id, socket))
+    upgrade
+        .on_upgrade(move |socket| run_websocket_connection(state, connection_id, socket))
+        .into_response()
 }
 
 async fn run_websocket_connection(

@@ -31,6 +31,7 @@ daemon不接受启动参数，固定使用 `~/.margatroid` 主目录。监听地
 ```toml
 [server]
 bind = "127.0.0.1:3939"
+allow = "localhost"
 
 [outbound]
 logs = ["type:cli", "type:webui"]
@@ -39,7 +40,9 @@ member_messages = ["type:webui"]
 streaming_member_messages = ["type:webui"]
 ```
 
-`server.bind` 是ServerPlugin的监听地址。目标支持 `broadcast`、`type:<连接类型>` 和
+`server.bind` 是ServerPlugin的监听地址。`server.allow` 是入口策略：默认 `"localhost"` 只接受回环对端，
+也可以写 `"all"`（需同时放宽 `bind`）或 IP/CIDR 数组；带 `Origin` 的请求还要求其 authority 与 `Host` 一致，
+不通过的升级请求在握手阶段返回 403、socket 不建立。`allow` 与 `bind` 不一致时 daemon 在启动时报错。目标支持 `broadcast`、`type:<连接类型>` 和
 `name:<连接名称>`。Workspace 启动、停止、失败或异常结果，以及成员
 失败或异常，都归入 `logs`；完整成员消息和流式成员消息分别使用后两个字段。模型路由文件不再保存
 WebSocket target。

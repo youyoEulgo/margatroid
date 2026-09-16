@@ -15,4 +15,4 @@ cargo run -p margatroid_daemon
 ```
 
 daemon不接受启动参数，固定读取 `~/.margatroid/config.toml` 和 `~/.margatroid/models.toml`。
-监听地址由 `config.toml` 的 `server.bind` 配置。
+监听地址由 `config.toml` 的 `server.bind` 配置，入口策略由同节的 `server.allow` 配置（默认 `"localhost"`，即只接受回环对端且要求 `Origin` 与 `Host` 同源）。

@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -113,6 +115,29 @@ impl fmt::Display for WebSocketProtocolError {
 }
 
 impl std::error::Error for WebSocketProtocolError {}
+
+pub trait HandshakeGuard: Debug + Send + Sync + 'static {
+    fn guard(
+        &self,
+        peer: SocketAddr,
+        origin: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<(), String>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllowAllHandshakes;
+
+impl HandshakeGuard for AllowAllHandshakes {
+    fn guard(
+        &self,
+        _peer: SocketAddr,
+        _origin: Option<&str>,
+        _host: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 pub trait WebSocketMessageClassifier: Send + Sync + 'static {
     fn classify(

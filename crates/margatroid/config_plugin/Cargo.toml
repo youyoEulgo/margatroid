@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 core_plugin = { path = "../../mecs/core_plugin" }
 serde = { workspace = true }
+server_plugin = { path = "../../mecs/server_plugin" }
 toml = { workspace = true }
 
 [dev-dependencies]

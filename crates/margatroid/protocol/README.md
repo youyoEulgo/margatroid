@@ -19,6 +19,23 @@ DTO 转换统一使用 `FromDomain` 和 `IntoDomain`。领域类型根据这些�
 }
 ```
 
+注册成功时后端发送复用请求 ID 的 `connection.registered`，携带分配到的身份：
+
+```json
+{
+  "type": "connection.registered",
+  "id": "register-1",
+  "client": {
+    "resource_id": "client:webui/console:12",
+    "client_type": "webui",
+    "name": "console"
+  }
+}
+```
+
+注册失败时发送 `connection.register_failed { id, error }`；`error` 是稳定的英文文本。两者都只发给
+发起注册的连接，客户端应等待回执后再发其它请求：未完成注册的连接发出的其它请求会被忽略。
+
 Workspace 启动请求：
 
 ```json
