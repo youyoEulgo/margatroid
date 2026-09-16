@@ -1,10 +1,11 @@
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use margatroid_types::ResourceId;
 use serde::Deserialize;
-use tool_plugin::{run_lua_tool, LuaExecutionLimits, LuaToolRunRequest};
+use tool_plugin::{run_lua_tool, LuaExecutionLimits, LuaToolRunRequest, ToolError, ToolErrorKind};
 
 #[derive(Deserialize)]
 struct RunnerRequest {
@@ -30,30 +31,69 @@ struct RunnerLimits {
     max_host_call_time_ms: u64,
 }
 
-fn usage(message: &str) -> ExitCode {
-    eprintln!("tool_runner: {message}");
-    eprintln!("usage: tool_runner <request.json>");
-    ExitCode::from(2)
+fn kind_name(kind: ToolErrorKind) -> &'static str {
+    match kind {
+        ToolErrorKind::InvalidRequest => "InvalidRequest",
+        ToolErrorKind::InvalidArguments => "InvalidArguments",
+        ToolErrorKind::InvalidDefinition => "InvalidDefinition",
+        ToolErrorKind::RunnerFailed => "RunnerFailed",
+        _ => "ExecutionFailed",
+    }
+}
+
+fn report(error: &ToolError) -> ExitCode {
+    let payload = serde_json::json!({
+        "kind": kind_name(error.kind()),
+        "message": error.message(),
+    });
+    eprintln!("{payload}");
+    match error.kind() {
+        ToolErrorKind::InvalidRequest
+        | ToolErrorKind::InvalidArguments
+        | ToolErrorKind::InvalidDefinition => ExitCode::from(2),
+        _ => ExitCode::from(3),
+    }
+}
+
+fn request_payload() -> Result<String, String> {
+    if let Some(path) = std::env::args_os().nth(1) {
+        return std::fs::read_to_string(&path).map_err(|error| format!("cannot read request: {error}"));
+    }
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_to_string(&mut raw)
+        .map_err(|error| format!("cannot read request from stdin: {error}"))?;
+    Ok(raw)
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let Some(path) = std::env::args_os().nth(1) else {
-        return usage("missing request file");
-    };
-    let raw = match std::fs::read_to_string(&path) {
+    let raw = match request_payload() {
         Ok(raw) => raw,
-        Err(error) => return usage(&format!("cannot read request: {error}")),
+        Err(message) => {
+            eprintln!("{}", serde_json::json!({ "kind": "RunnerFailed", "message": message }));
+            return ExitCode::from(2);
+        }
     };
     let request = match serde_json::from_str::<RunnerRequest>(&raw) {
         Ok(request) => request,
-        Err(error) => return usage(&format!("invalid request: {error}")),
+        Err(error) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({ "kind": "RunnerFailed", "message": format!("invalid request: {error}") })
+            );
+            return ExitCode::from(2);
+        }
     };
     let (Ok(agent_id), Ok(resource_id)) = (
         ResourceId::parse(&request.agent_id),
         ResourceId::parse(&request.resource_id),
     ) else {
-        return usage("invalid resource id");
+        eprintln!(
+            "{}",
+            serde_json::json!({ "kind": "RunnerFailed", "message": "invalid resource id" })
+        );
+        return ExitCode::from(2);
     };
     let limits = LuaExecutionLimits {
         max_definition_bytes: request.limits.max_definition_bytes,
@@ -79,12 +119,9 @@ async fn main() -> ExitCode {
     .await;
     match outcome {
         Ok(result) => {
-            print!("{result}");
+            let _ = std::io::stdout().write_all(result.as_bytes());
             ExitCode::SUCCESS
         }
-        Err(error) => {
-            eprintln!("tool_runner: {error}");
-            ExitCode::from(3)
-        }
+        Err(error) => report(&error),
     }
 }
