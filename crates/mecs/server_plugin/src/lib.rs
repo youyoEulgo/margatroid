@@ -16,10 +16,11 @@ pub use plugin::{AppServerExt, ServerPlugin};
 pub use resource::ServerHandle;
 pub use response::{HttpResponse, HttpResponseHead, HttpResponseSession};
 pub use websocket::{
-    JsonWebSocketMessageClassifier, RegisterConnection, WebSocketCloseReason, WebSocketConnected,
-    WebSocketConnectionId, WebSocketConnections, WebSocketDisconnected, WebSocketMessage,
-    WebSocketMessageClassification, WebSocketMessageClassifier, WebSocketMessageReceived,
-    WebSocketMessageSender, WebSocketProtocolError, WebSocketProtocolFailed, WebSocketSender,
-    WebSocketStreamId, WebSocketStreamOpened, WebSocketStreamPhase, WebSocketStreamReceiver,
+    AllowAllHandshakes, HandshakeGuard, JsonWebSocketMessageClassifier, RegisterConnection,
+    WebSocketCloseReason, WebSocketConnected, WebSocketConnectionId, WebSocketConnections,
+    WebSocketDisconnected, WebSocketMessage, WebSocketMessageClassification,
+    WebSocketMessageClassifier, WebSocketMessageReceived, WebSocketMessageSender,
+    WebSocketProtocolError, WebSocketProtocolFailed, WebSocketSender, WebSocketStreamId,
+    WebSocketStreamOpened, WebSocketStreamPhase, WebSocketStreamReceiver,
     WebSocketStreamReceiverHandle,
 };

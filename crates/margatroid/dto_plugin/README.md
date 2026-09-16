@@ -3,7 +3,7 @@
 `DtoPlugin` 是 WebSocket DTO 转换层。它消费 ServerPlugin 的 `WebSocketMessageReceived`，解析统一的
 `{ type, id, message }` 信封，调用对应 DTO 的 `into_domain` 方法，并直接发送领域事件。
 
-入站路由：
+入站路由（`connection.register` 之外的请求要求连接已注册，未注册时写 warn 并丢弃）：
 
 ```text
 connection.register -> RegisterConnection
@@ -16,7 +16,9 @@ agent.visibility.remove -> RouteAgentVisibility { Remove }
 ```
 
 它还收集允许发送给外部的 `StartWorkspaceResult`、`StopWorkspaceByReferenceResult`、`AgentMessage` 和 `AgentFailure`，调用 Protocol
-定义的 DTO 转换，构造 `ServerMessage` 并包装为 `WebSocketMessageSend`。Workspace启动失败会同时
+定义的 DTO 转换，构造 `ServerMessage` 并包装为 `WebSocketMessageSend`。`ClientRegistrationResult`
+单独投影为 `connection.registered` 或 `connection.register_failed`，两者都按连接的 `connection_id`
+直达发起注册的那条连接，与 `mcl.command_result` 同属请求-响应路径，不参与目标分类。Workspace启动失败会同时
 写错误日志并发送可按请求ID配对的`workspace.start_failed`终止回执。DtoPlugin 会从 Workspace、
 Agent 和 Memory 构造完整 `state.sync`，但仅在状态内容或目标前端连接集合变化时发送，默认只发给类型为
 `webui` 的连接。目标将改为统一读取主目录 `config.toml` 的 `backend_state` 字段。缓存避免出站事件持续唤醒 event-driven Runtime。

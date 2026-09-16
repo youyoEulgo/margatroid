@@ -12,6 +12,10 @@ pub enum ConfigError {
     EmptyTargets(&'static str),
     InvalidTarget(&'static str),
     DuplicateTarget(&'static str),
+    InvalidIngressAllow,
+    InvalidIngressEntry(usize),
+    IngressEntryCoversEverything(usize),
+    IngressWiderThanBind,
 }
 
 impl fmt::Display for ConfigError {
@@ -50,6 +54,24 @@ impl fmt::Display for ConfigError {
                     "configuration field `{field}` contains a duplicate target"
                 )
             }
+            Self::InvalidIngressAllow => formatter.write_str(
+                "configuration field `server.allow` is not localhost, 127.0.0.1, all, 0.0.0.0 or an array of addresses",
+            ),
+            Self::InvalidIngressEntry(index) => {
+                write!(
+                    formatter,
+                    "configuration field `server.allow` entry {index} is not an address or CIDR block"
+                )
+            }
+            Self::IngressEntryCoversEverything(index) => {
+                write!(
+                    formatter,
+                    "configuration field `server.allow` entry {index} covers every address"
+                )
+            }
+            Self::IngressWiderThanBind => formatter.write_str(
+                "configuration field `server.allow` admits non-loopback peers while `server.bind` is loopback",
+            ),
         }
     }
 }

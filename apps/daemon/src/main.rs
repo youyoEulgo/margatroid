@@ -52,6 +52,7 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let global_config = ConfigPlugin::open(&config_path)
         .map_err(|error| format!("cannot open global configuration: {error}"))?;
     let bind = global_config.config().server_bind();
+    let ingress = global_config.config().server_ingress().clone();
     let mcl = MclPlugin::open(&data_root)
         .map_err(|error| format!("cannot open MCL resource root: {error}"))?;
     let mut log_plugin = LogPlugin::default()
@@ -66,7 +67,9 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(LuaRuntimePlugin::default())
         .add_plugin(log_plugin)
-        .add_plugin(ServerPlugin::with_options(ServerOptions::bind(bind)))
+        .add_plugin(ServerPlugin::with_options(
+            ServerOptions::bind(bind).with_handshake_guard(ingress.clone()),
+        ))
         .add_plugin(global_config)
         .add_plugin(ResourceIdPlugin)
         .add_plugin(agent_images)
@@ -82,7 +85,7 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(DtoPlugin::default())
         .add_plugin(ClientPlugin::default());
 
-    info!(address = %bind, data_root = %data_root.display(), config = %config_path.display(), models = %models_path.display(), "margatroid daemon starting");
+    info!(address = %bind, allow = %ingress, data_root = %data_root.display(), config = %config_path.display(), models = %models_path.display(), "margatroid daemon starting");
     app.run();
     Ok(())
 }

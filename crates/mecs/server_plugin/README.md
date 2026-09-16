@@ -3,7 +3,8 @@
 ## 介绍
 
 `server_plugin` 将 Axum HTTP 与 WebSocket 服务接入 mecs。它负责连接、路由、流式通道、
-背压和生命周期；业务协议仍由其他 Plugin 的 System 处理。
+背压和生命周期；业务协议仍由其他 Plugin 的 System 处理，握手的准入判定也由业务侧通过
+`HandshakeGuard` 接缝注入。
 
 Axum 持有协议状态、连接和网络通道，ECS 持有同步状态并做业务编排。完整消息交给同步 System；
 需要等待的数据留在异步线程累积或转发。流分片不逐条进入事件队列，避免网络速率改变 ECS 帧语义。
@@ -308,5 +309,39 @@ Plugin 仍可另外维护自己的索引。
 
 二进制流或其他信封格式可以通过 `add_websocket_event_route_with` 注册自定义
 `WebSocketMessageClassifier`。
+
+### 握手判定接缝
+
+升级请求到达时，ServerPlugin 把对端地址与请求的 `Origin`、`Host` 交给 `HandshakeGuard`；
+判定失败即返回 403 并写 warn，**socket 不建立**。默认实现 `AllowAllHandshakes` 一律放行，
+因此不注入时行为与没有该接缝时相同。ServerPlugin 只定义接缝与默认放行，允许哪些对端与
+`Origin` 属于业务策略：
+
+```rust
+use core_plugin::World;
+use server_plugin::{HandshakeGuard, ServerOptions};
+
+struct LocalOnly;
+
+impl HandshakeGuard for LocalOnly {
+    fn guard(
+        &self,
+        peer: std::net::SocketAddr,
+        _origin: Option<&str>,
+        _host: Option<&str>,
+    ) -> Result<(), String> {
+        if peer.ip().is_loopback() {
+            Ok(())
+        } else {
+            Err(format!("peer {peer} is not allowed"))
+        }
+    }
+}
+
+let options = ServerOptions::default().with_handshake_guard(LocalOnly);
+```
+
+对端地址来自 `into_make_service_with_connect_info`，所以判定使用的 `peer` 是真实连接来源，
+不受转发头影响。判定只存在于这一处；业务侧可以只做记录、只做拒绝，或两者都做。
 
 完整伪代码和边界说明见 [DESIGN.md](DESIGN.md)。
