@@ -19,6 +19,7 @@ pub enum ToolErrorKind {
     InvalidRequest,
     InvalidArguments,
     ExecutionFailed,
+    RunnerFailed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

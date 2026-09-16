@@ -20,6 +20,7 @@ use margatroid_types::ResourceId;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 const LUA_RUNTIME_ID: &str = "tool:builtin/lua-runtime:latest";
@@ -570,8 +571,143 @@ pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolErro
     Ok(result)
 }
 
+fn tool_runner_path() -> Result<PathBuf, ToolError> {
+    if let Some(path) = std::env::var_os("MARGATROID_TOOL_RUNNER") {
+        return Ok(PathBuf::from(path));
+    }
+    let executable = std::env::current_exe().map_err(|error| {
+        ToolError::new(
+            ToolErrorKind::RunnerFailed,
+            format!("tool runner location is unknown: {error}"),
+        )
+    })?;
+    let directory = executable.parent().ok_or_else(|| {
+        ToolError::new(
+            ToolErrorKind::RunnerFailed,
+            "tool runner location is unknown",
+        )
+    })?;
+    let name = if cfg!(windows) {
+        "tool_runner.exe"
+    } else {
+        "tool_runner"
+    };
+    Ok(directory.join(name))
+}
+
+async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolError> {
+    let payload = serde_json::json!({
+        "package_root": request.package_root.to_string_lossy(),
+        "arguments": request.arguments,
+        "agent_id": request.agent_id.to_string(),
+        "turn_id": request.turn_id,
+        "resource_id": request.resource_id.to_string(),
+        "project_root": request.project_root.to_string_lossy(),
+        "image_root": request.image_root.to_string_lossy(),
+        "limits": {
+            "max_definition_bytes": request.limits.max_definition_bytes,
+            "max_script_bytes": request.limits.max_script_bytes,
+            "max_argument_bytes": request.limits.max_argument_bytes,
+            "max_output_bytes": request.limits.max_output_bytes,
+            "max_memory_bytes": request.limits.max_memory_bytes,
+            "max_instructions": request.limits.max_instructions,
+            "max_execution_time_ms": request.limits.max_execution_time.as_millis() as u64,
+            "max_host_call_time_ms": request.limits.max_host_call_time.as_millis() as u64,
+        },
+    });
+    let payload = serde_json::to_vec(&payload).map_err(|error| {
+        ToolError::new(
+            ToolErrorKind::RunnerFailed,
+            format!("tool runner request could not be encoded: {error}"),
+        )
+    })?;
+    let runner = tool_runner_path()?;
+    let mut command = Command::new(&runner);
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|error| {
+        ToolError::new(
+            ToolErrorKind::RunnerFailed,
+            format!("tool runner could not start: {error}"),
+        )
+    })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let write = async {
+            stdin.write_all(&payload).await?;
+            stdin.shutdown().await
+        };
+        write.await.map_err(|error| {
+            ToolError::new(
+                ToolErrorKind::RunnerFailed,
+                format!("tool runner request could not be delivered: {error}"),
+            )
+        })?;
+    }
+    let stdout = child.stdout.take().ok_or_else(|| {
+        ToolError::new(ToolErrorKind::RunnerFailed, "tool runner stdout is unavailable")
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        ToolError::new(ToolErrorKind::RunnerFailed, "tool runner stderr is unavailable")
+    })?;
+    let limit = request.limits.max_output_bytes;
+    let outcome = tokio::time::timeout(request.limits.max_execution_time, async {
+        tokio::try_join!(
+            child.wait(),
+            read_process_output(stdout, limit),
+            read_process_output(stderr, limit),
+        )
+    })
+    .await;
+    let (status, stdout, stderr) = match outcome {
+        Ok(Ok(parts)) => parts,
+        Ok(Err(error)) => {
+            return Err(ToolError::new(
+                ToolErrorKind::RunnerFailed,
+                format!("tool runner stream failed: {error}"),
+            ))
+        }
+        Err(_) => {
+            return Err(ToolError::new(
+                ToolErrorKind::RunnerFailed,
+                "tool runner timed out",
+            ))
+        }
+    };
+    let stderr = String::from_utf8_lossy(&stderr.bytes).into_owned();
+    if status.success() {
+        if stdout.truncated {
+            return Err(ToolError::new(
+                ToolErrorKind::ExecutionFailed,
+                "Lua tool output exceeds the size limit",
+            ));
+        }
+        return Ok(String::from_utf8_lossy(&stdout.bytes).into_owned());
+    }
+    let reported = serde_json::from_str::<serde_json::Value>(stderr.trim()).ok();
+    let kind = match reported
+        .as_ref()
+        .and_then(|value| value.get("kind"))
+        .and_then(|value| value.as_str())
+    {
+        Some("InvalidRequest") => ToolErrorKind::InvalidRequest,
+        Some("InvalidArguments") => ToolErrorKind::InvalidArguments,
+        Some("InvalidDefinition") => ToolErrorKind::InvalidDefinition,
+        _ => ToolErrorKind::ExecutionFailed,
+    };
+    let message = reported
+        .as_ref()
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("Lua tool execution failed")
+        .to_owned();
+    Err(ToolError::new(kind, message))
+}
+
 async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, ToolError> {
-    run_lua_tool(LuaToolRunRequest {
+    let request = LuaToolRunRequest {
         package_root: prepared.package_root.as_ref().clone(),
         arguments: prepared.arguments.clone(),
         agent_id: prepared.handle.context.agent_id.clone(),
@@ -581,8 +717,8 @@ async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, Tool
         image_root: prepared.handle.context.image_root.as_ref().clone(),
         limits: prepared.handle.limits.clone(),
         client: Some(prepared.handle.capabilities.http.client.clone()),
-    })
-    .await
+    };
+    spawn_tool_runner(&request).await
 }
 
 pub(crate) fn lua_task_result_system(world: &mut World) {
