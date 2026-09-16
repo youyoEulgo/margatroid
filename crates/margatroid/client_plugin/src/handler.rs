@@ -1,16 +1,16 @@
-use core_plugin::{Entity, World};
+use core_plugin::World;
 use resource_id_plugin::{ResourceId, ResourceIdLookupError, WorldResourceIdExt};
 use server_plugin::{
     RegisterConnection, WebSocketConnectionId, WebSocketConnections, WebSocketNameError,
 };
 
-use crate::{client_source, Client, ClientError};
+use crate::{client_source, Client, ClientError, RegisteredClient};
 
 pub(crate) fn handle_client_registration(
     world: &mut World,
     connections: &WebSocketConnections,
     request: &RegisterConnection,
-) -> Result<Entity, ClientError> {
+) -> Result<RegisteredClient, ClientError> {
     let client_type = request.client_type.trim();
     if !valid_client_type(client_type) {
         return Err(ClientError::InvalidClientType);
@@ -33,21 +33,22 @@ pub(crate) fn handle_client_registration(
     if !connections.set_connection_type(request.connection_id, client_type) {
         return Err(ClientError::ConnectionMissing);
     }
+    let client = Client::new(request.connection_id, client_type.to_owned(), name);
     let entity = world.spawn();
     world.insert_component(entity, resource_id.clone());
-    world.insert_component(
-        entity,
-        Client::new(request.connection_id, client_type.to_owned(), name.clone()),
-    );
+    world.insert_component(entity, client.clone());
     tracing::info!(
         request_id = %request.id,
         connection = request.connection_id.get(),
         client_type,
-        name,
+        name = client.name(),
         resource_id = %resource_id,
         "client registered"
     );
-    Ok(entity)
+    Ok(RegisteredClient {
+        resource_id,
+        client,
+    })
 }
 
 pub(crate) fn handle_client_disconnect(world: &mut World, connection_id: WebSocketConnectionId) {

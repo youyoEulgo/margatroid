@@ -27,6 +27,18 @@ MessageDto::Error：错误展示消息DTO
     边界：MessageDto同时用于出站投影与入站注入；入站方向只接受User与Assistant，Tool与Error返回InvalidRequest
     message: String--Agent创建成功后的轮次级稳定错误文本
 
+ServerMessage::ConnectionRegistered：注册成功回执
+    type: connection.registered
+    id: String--原样回显请求ID
+    client: ClientInfoDto--分配到的身份
+
+ServerMessage::ConnectionRegisterFailed：注册失败回执
+    type: connection.register_failed
+    id: String--原样回显请求ID
+    error: String--ClientError的稳定文本
+
+ClientInfoDto：客户端身份DTO，公开结构体--resource_id、client_type与name
+
 ServerMessage::AgentMessageReasoningDelta：思考流式分片
     type: agent.message.reasoning_delta
     id: String--轮次ID

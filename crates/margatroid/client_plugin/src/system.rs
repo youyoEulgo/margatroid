@@ -1,6 +1,8 @@
+use app_runtime_plugin::WorldEventExt;
 use core_plugin::World;
 use server_plugin::{RegisterConnection, WebSocketConnections, WebSocketDisconnected};
 
+use crate::events::ClientRegistrationResult;
 use crate::handler::{handle_client_disconnect, handle_client_registration};
 
 pub(crate) fn client_registration_system(world: &mut World) {
@@ -13,7 +15,8 @@ pub(crate) fn client_registration_system(world: &mut World) {
         return;
     };
     for request in requests {
-        if let Err(error) = handle_client_registration(world, &connections, &request) {
+        let result = handle_client_registration(world, &connections, &request);
+        if let Err(error) = &result {
             tracing::warn!(
                 request_id = %request.id,
                 connection = request.connection_id.get(),
@@ -21,6 +24,11 @@ pub(crate) fn client_registration_system(world: &mut World) {
                 "client registration failed"
             );
         }
+        world.send_event(ClientRegistrationResult {
+            id: request.id.clone(),
+            connection_id: request.connection_id,
+            result,
+        });
     }
 }
 

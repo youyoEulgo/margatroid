@@ -35,7 +35,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 # lib        src/lib.rs        图书馆组件与 Plugin
 # system     src/system.rs     System 函数
 # handler    src/handler.rs    处理函数
-# events     src/events.rs     事件类型（当前无）
+# events     src/events.rs     注册结果事件（ClientRegistrationResult与RegisteredClient）
 # types      src/types.rs      来源标识构造
 # error      src/error.rs      Error 与公开错误分类
 ```
@@ -110,6 +110,7 @@ client_registration_system(world: &mut World)
         克隆本帧全部RegisterConnection
         读取并克隆WebSocketConnections；不存在时直接返回
         逐个调用handle_client_registration；返回错误时写warn日志并继续
+        每个请求都发出ClientRegistrationResult事件，携带请求ID、连接ID与Ok/Err结果
 
 client_disconnect_system(world: &mut World)
     客户端断开System：crate公开System
@@ -127,7 +128,7 @@ handler 放处理函数。
 
 crate公开：
 ```text
-handle_client_registration(world: &mut World, connections: &WebSocketConnections, request: &RegisterConnection) -> Result<Entity, ClientError>
+handle_client_registration(world: &mut World, connections: &WebSocketConnections, request: &RegisterConnection) -> Result<RegisteredClient, ClientError>
     处理客户端注册：crate公开函数
     行为：
         去除client_type首尾空白
@@ -163,7 +164,10 @@ valid_client_type(value: &str) -> bool
 # events
 
 ```text
-ClientPlugin 不定义 ECS 事件；它消费 server_plugin 的 RegisterConnection 和 WebSocketDisconnected 事件。
+ClientPlugin 定义ClientRegistrationResult事件，携带请求ID、连接ID与注册结果；消费server_plugin的RegisterConnection和WebSocketDisconnected事件。
+RegisteredClient：注册成功后回执所需的数据，公开结构体--resource_id与client
+ClientRegistrationResult：注册结果，公开结构体--id、connection_id与result。id原样回显，用于客户端关联
+    边界：注册是唯一需要客户端等待的握手步骤，回执必须在Client实体创建之后发出，客户端据此确定依赖请求可以安全发出
 ```
 
 # types

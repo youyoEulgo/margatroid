@@ -1,11 +1,11 @@
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
-use client_plugin::client_source;
+use client_plugin::{client_source, ClientRegistrationResult};
 use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::World;
 use log_plugin::{TracingStream, TracingStreamError};
 use margatroid_protocol::{
-    AgentFailureDto, AgentMessageDto, BackendStateDto, ClientMessage, IntoDomain, IntoDto,
-    LogRecordDto, MessageDto, ProtocolErrorKind, ServerMessage, WorkspaceInfoDto,
+    AgentFailureDto, AgentMessageDto, BackendStateDto, ClientInfoDto, ClientMessage, IntoDomain,
+    IntoDto, LogRecordDto, MessageDto, ProtocolErrorKind, ServerMessage, WorkspaceInfoDto,
 };
 use margatroid_types::{AgentFailure, AgentMessage};
 use server_plugin::{
@@ -217,11 +217,59 @@ pub(crate) fn handle_collect_external_events(world: &mut World) {
         .cloned()
         .expect("ConfigPlugin must be installed before DtoPlugin");
     report_server_events(world);
+    report_client_registrations(world);
     report_workspace_events(world, targets.logs());
     report_workspace_stop_events(world, targets.logs());
     report_agent_messages(world, targets.member_messages());
     report_agent_failures(world, targets.logs());
     report_backend_state(world, targets.backend_state());
+}
+
+fn report_client_registrations(world: &World) {
+    for result in world.event_reader::<ClientRegistrationResult>() {
+        let message = match &result.result {
+            Ok(registered) => match registered.resource_id.clone().into_dto(()) {
+                Ok(resource_id) => ServerMessage::ConnectionRegistered {
+                    id: result.id.clone(),
+                    client: ClientInfoDto {
+                        resource_id,
+                        client_type: registered.client.client_type().to_owned(),
+                        name: registered.client.name().to_owned(),
+                    },
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        request_id = %result.id,
+                        error = %error,
+                        "client resource id DTO conversion failed"
+                    );
+                    continue;
+                }
+            },
+            Err(error) => ServerMessage::ConnectionRegisterFailed {
+                id: result.id.clone(),
+                error: error.to_string(),
+            },
+        };
+        send_to_connection(world, result.connection_id, &message);
+    }
+}
+
+fn send_to_connection(
+    world: &World,
+    connection_id: WebSocketConnectionId,
+    message: &ServerMessage,
+) {
+    let Some(sender) = world
+        .get_resource::<WebSocketConnections>()
+        .and_then(|connections| connections.get(connection_id))
+    else {
+        return;
+    };
+    let Ok(encoded) = serde_json::to_string(message) else {
+        return;
+    };
+    let _ = sender.try_send(WebSocketMessage::Text(encoded.into()));
 }
 
 fn report_workspace_stop_events(world: &World, targets: &[WebSocketMessageTarget]) {
