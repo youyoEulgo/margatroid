@@ -91,6 +91,10 @@ pub enum ServerMessage {
     Log { record: LogRecordDto },
     #[serde(rename = "state.sync")]
     StateSync { state: BackendStateDto },
+    #[serde(rename = "connection.registered")]
+    ConnectionRegistered { id: String, client: ClientInfoDto },
+    #[serde(rename = "connection.register_failed")]
+    ConnectionRegisterFailed { id: String, error: String },
     #[serde(rename = "workspace.started")]
     WorkspaceStarted {
         id: String,
@@ -529,6 +533,13 @@ impl IntoDomain<WorkspaceReference> for WorkspaceReferenceDto {
             project_root: PathBuf::from(self.project_root),
         })
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientInfoDto {
+    pub resource_id: ResourceIdDto,
+    pub client_type: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

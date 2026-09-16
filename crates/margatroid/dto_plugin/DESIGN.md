@@ -142,7 +142,7 @@ handle_collect_external_events(world: &mut World)
     收集外部事件：crate公开函数
     行为：
         读取MargatroidConfig目标
-        依次调用report_server_events、report_workspace_events、report_workspace_stop_events、report_agent_messages、report_agent_failures和report_backend_state
+        依次调用report_server_events、report_client_registrations、report_workspace_events、report_workspace_stop_events、report_agent_messages、report_agent_failures和report_backend_state
 
 forward_logs(stream: TracingStream, events: RuntimeEventSender, targets: Vec<WebSocketMessageTarget>)
     转发结构化日志：crate公开异步函数
@@ -161,6 +161,14 @@ mcl_source(world: &World, connection_id: WebSocketConnectionId) -> String
 
 report_server_events(world: &World)
     报告Server事件：私有函数，将Server启停、WebSocket连接、断开和协议失败投影为结构化日志
+
+report_client_registrations(world: &World)
+    报告客户端注册：私有函数，把ClientRegistrationResult投影为ServerMessage
+    行为：成功时构造ConnectionRegistered（含ClientInfoDto），失败时构造ConnectionRegisterFailed；两者都按result.connection_id直达该连接
+    边界：回执属于请求-响应，与mcl.command_result同样绕过WebSocketMessageSend的目标分类，直接向发起请求的连接发送
+
+send_to_connection(world: &World, connection_id: WebSocketConnectionId, message: &ServerMessage)
+    按连接发送：私有函数，从WebSocketConnections取WebSocketSender并try_send序列化文本；连接不存在或序列化失败时静默返回
 
 report_workspace_events(world: &World, targets: &[WebSocketMessageTarget])
     报告Workspace启动：私有函数，成功时发送WorkspaceStarted，失败时写error日志并发送WorkspaceStartFailed

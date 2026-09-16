@@ -230,3 +230,82 @@ fn registration_creates_and_disconnect_removes_a_client_entity() {
     }
     client.join().unwrap();
 }
+
+fn registration_reply(client_type: &str, name: &str) -> ServerMessage {
+    let client_type = client_type.to_owned();
+    let name = name.to_owned();
+    let mut app = build_app();
+    let address = start(&mut app);
+    let connection = thread::spawn(move || {
+        client_runtime().block_on(async move {
+            let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/ws"))
+                .await
+                .unwrap();
+            let registration = serde_json::to_string(
+                &ClientMessage::register_connection_with_name("register-1", &client_type, &name),
+            )
+            .unwrap();
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    registration.into(),
+                ))
+                .await
+                .unwrap();
+            let message = loop {
+                let response = socket.next().await.unwrap().unwrap();
+                let tokio_tungstenite::tungstenite::Message::Text(text) = &response else {
+                    continue;
+                };
+                let Ok(message) = serde_json::from_str::<ServerMessage>(text) else {
+                    continue;
+                };
+                if matches!(
+                    message,
+                    ServerMessage::ConnectionRegistered { .. }
+                        | ServerMessage::ConnectionRegisterFailed { .. }
+                ) {
+                    break message;
+                }
+            };
+            let _ = socket.close(None).await;
+            message
+        })
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !connection.is_finished() {
+        app.tick();
+        assert!(Instant::now() < deadline, "registration reply timed out");
+        thread::yield_now();
+    }
+    connection.join().unwrap()
+}
+
+#[test]
+fn registration_replies_with_the_assigned_client_identity() {
+    let reply = registration_reply("webui", "console");
+    let ServerMessage::ConnectionRegistered { id, client } = reply else {
+        panic!("expected connection.registered, got {reply:?}");
+    };
+    assert_eq!(id, "register-1");
+    assert_eq!(client.client_type, "webui");
+    assert_eq!(client.name, "console");
+    assert!(
+        client
+            .resource_id
+            .to_string()
+            .starts_with("client:webui/console:"),
+        "unexpected resource id {}",
+        client.resource_id
+    );
+}
+
+#[test]
+fn registration_failure_replies_with_the_reason() {
+    let reply = registration_reply("WebUI", "console");
+    let ServerMessage::ConnectionRegisterFailed { id, error } = reply else {
+        panic!("expected connection.register_failed, got {reply:?}");
+    };
+    assert_eq!(id, "register-1");
+    assert_eq!(error, "client type is not a stable identifier");
+}

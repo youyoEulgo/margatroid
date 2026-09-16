@@ -1,5 +1,6 @@
 use margatroid_protocol::{
-    ClientMessage, IntoDomain, MessageDto, ProtocolErrorKind, ResourceIdDto, ToolCallDto,
+    ClientInfoDto, ClientMessage, IntoDomain, MessageDto, ProtocolErrorKind, ResourceIdDto,
+    ServerMessage, ToolCallDto,
 };
 use margatroid_types::{Message, ToolCall};
 
@@ -77,4 +78,34 @@ fn the_standalone_assistant_message_type_is_gone() {
         }
     });
     assert!(serde_json::from_value::<ClientMessage>(request).is_err());
+}
+
+#[test]
+fn registration_receipts_use_stable_server_shapes() {
+    let registered = serde_json::to_value(ServerMessage::ConnectionRegistered {
+        id: "register-1".into(),
+        client: ClientInfoDto {
+            resource_id: ResourceIdDto("client:webui/console:1".into()),
+            client_type: "webui".into(),
+            name: "console".into(),
+        },
+    })
+    .unwrap();
+    assert_eq!(registered["type"], "connection.registered");
+    assert_eq!(registered["id"], "register-1");
+    assert_eq!(
+        registered["client"]["resource_id"],
+        "client:webui/console:1"
+    );
+    assert_eq!(registered["client"]["client_type"], "webui");
+    assert_eq!(registered["client"]["name"], "console");
+
+    let failed = serde_json::to_value(ServerMessage::ConnectionRegisterFailed {
+        id: "register-2".into(),
+        error: "client type is not a stable identifier".into(),
+    })
+    .unwrap();
+    assert_eq!(failed["type"], "connection.register_failed");
+    assert_eq!(failed["id"], "register-2");
+    assert_eq!(failed["error"], "client type is not a stable identifier");
 }
