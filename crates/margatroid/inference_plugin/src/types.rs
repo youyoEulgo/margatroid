@@ -640,7 +640,11 @@ impl OpenAiRequest {
         thinking: bool,
         reasoning_effort: Option<String>,
     ) -> Self {
-        let messages = input.messages().iter().map(deepseek_message).collect();
+        let messages = input
+            .messages()
+            .iter()
+            .map(|message| deepseek_message(message, thinking))
+            .collect();
         let tools = input
             .tools()
             .iter()
@@ -720,7 +724,7 @@ fn openai_message(message: &Message) -> serde_json::Value {
     }
 }
 
-fn deepseek_message(message: &Message) -> serde_json::Value {
+fn deepseek_message(message: &Message, thinking: bool) -> serde_json::Value {
     match message {
         Message::Assistant {
             reasoning,
@@ -742,7 +746,7 @@ fn deepseek_message(message: &Message) -> serde_json::Value {
                         .collect(),
                 );
             }
-            if !tool_calls.is_empty() {
+            if thinking || !tool_calls.is_empty() {
                 message["reasoning_content"] =
                     serde_json::Value::String(reasoning.clone().unwrap_or_default());
             }
@@ -1184,7 +1188,7 @@ data: [DONE]
     }
 
     #[test]
-    fn deepseek_request_only_returns_tool_call_reasoning_to_the_provider() {
+    fn deepseek_request_carries_reasoning_content_for_every_assistant_message() {
         let messages = vec![
             Message::Assistant {
                 reasoning: Some("ordinary reasoning".into()),
@@ -1220,7 +1224,10 @@ data: [DONE]
         assert_eq!(value["thinking"]["type"], "enabled");
         assert_eq!(value["stream_options"]["include_usage"], true);
         assert_eq!(value["reasoning_effort"], "high");
-        assert!(value["messages"][0].get("reasoning_content").is_none());
+        assert_eq!(
+            value["messages"][0]["reasoning_content"],
+            "ordinary reasoning"
+        );
         assert!(value["messages"][0].get("tool_calls").is_none());
         assert_eq!(value["messages"][1]["reasoning_content"], "tool reasoning");
         assert_eq!(
@@ -1228,6 +1235,30 @@ data: [DONE]
             1
         );
         assert_eq!(value["messages"][2]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn deepseek_request_fills_empty_reasoning_content_when_it_is_missing() {
+        let messages = vec![Message::Assistant {
+            reasoning: None,
+            content: Some("answer".into()),
+            tool_calls: Vec::new(),
+        }];
+        let thinking = serde_json::to_value(OpenAiRequest::from_deepseek_input(
+            ProviderInput::new("model", &InferenceParameters::default(), &messages, &[]),
+            true,
+            Some("high".into()),
+        ))
+        .unwrap();
+        assert_eq!(thinking["messages"][0]["reasoning_content"], "");
+
+        let plain = serde_json::to_value(OpenAiRequest::from_deepseek_input(
+            ProviderInput::new("model", &InferenceParameters::default(), &messages, &[]),
+            false,
+            None,
+        ))
+        .unwrap();
+        assert!(plain["messages"][0].get("reasoning_content").is_none());
     }
 
     #[test]

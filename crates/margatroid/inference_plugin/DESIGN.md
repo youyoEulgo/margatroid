@@ -726,8 +726,12 @@ DeepSeekAccumulator：DeepSeek SSE累积器，私有结构体
 openai_message(message: &Message) -> serde_json::Value
     OpenAI消息转换：私有函数，System、User、Assistant、Tool、Error转OpenAI JSON；Error按User内容兜底；Assistant无tool_calls时不写tool_calls
 
-deepseek_message(message: &Message) -> serde_json::Value
-    DeepSeek消息转换：私有函数，只有带tool_calls的Assistant写reasoning_content；其余委托openai_message
+deepseek_message(message: &Message, thinking: bool) -> serde_json::Value
+    DeepSeek消息转换：私有函数，Assistant写content与tool_calls，其余委托openai_message
+    行为：启用思考时每条Assistant都写reasoning_content，思考内容缺失时写空串；
+          未启用思考时只对带tool_calls的Assistant写该字段（沿用既有行为）
+    边界：DeepSeek在思考模式下要求把assistant消息的reasoning_content回传，缺字段会被Provider拒绝；
+          注入或历史里没有思考内容的assistant消息必须补空串，不能省略字段
 
 decode_token_usage(usage: OpenAiUsage) -> TokenUsage
     统一Token统计：私有函数

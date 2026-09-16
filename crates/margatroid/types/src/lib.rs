@@ -236,25 +236,6 @@ pub struct RouteAgentTurnAbort {
 impl Event for RouteAgentTurnAbort {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RouteAgentAssistant {
-    pub id: String,
-    pub workspace: WorkspaceReference,
-    pub agent: Option<ResourceId>,
-    pub content: Option<String>,
-    pub reasoning: Option<String>,
-    pub tool_calls: Vec<RouteAgentAssistantToolCall>,
-}
-
-impl Event for RouteAgentAssistant {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RouteAgentAssistantToolCall {
-    pub id: String,
-    pub resource_id: ResourceId,
-    pub arguments: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteAgentWorkflowAttach {
     pub id: String,
     pub workspace: WorkspaceReference,

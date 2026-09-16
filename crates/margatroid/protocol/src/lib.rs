@@ -5,9 +5,9 @@ use agent_plugin::{Agent, HistoryMessage};
 use core_plugin::{Entity, World};
 use log_plugin::{TracingField, TracingRecord};
 use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, RouteAgentAssistant,
-    RouteAgentAssistantToolCall, RouteAgentMessage, RouteAgentTurnAbort, RouteMclCommand,
-    StartWorkspace, ToolCall, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceReference,
+    AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, RouteAgentMessage,
+    RouteAgentTurnAbort, RouteMclCommand, StartWorkspace, ToolCall, WorkspaceAgentDefinition,
+    WorkspaceDefinition, WorkspaceReference,
 };
 
 use serde::{Deserialize, Serialize};
@@ -74,11 +74,6 @@ pub enum ClientMessage {
     AgentMessage {
         id: String,
         message: RouteAgentMessageDto,
-    },
-    #[serde(rename = "agent.assistant")]
-    AgentAssistant {
-        id: String,
-        message: RouteAgentAssistantDto,
     },
     #[serde(rename = "mcl.command")]
     MclCommand { id: String, message: MclCommandDto },
@@ -177,20 +172,6 @@ impl FromDomain<TracingRecord> for LogRecordDto {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UserMessageDto {
-    pub content: String,
-}
-
-impl IntoDomain<Message> for UserMessageDto {
-    fn into_domain(self, (): ()) -> Result<Message, ProtocolError> {
-        Ok(Message::User {
-            content: self.content,
-        })
-    }
-}
-
 impl IntoDomain<Message> for MessageDto {
     fn into_domain(self, (): ()) -> Result<Message, ProtocolError> {
         match self {
@@ -207,16 +188,10 @@ impl IntoDomain<Message> for MessageDto {
                     .map(|call| call.into_domain(()))
                     .collect::<Result<Vec<_>, _>>()?,
             }),
-            Self::Tool {
-                resource_id,
-                tool_call_id,
-                content,
-            } => Ok(Message::Tool {
-                resource_id: resource_id.into_domain(())?,
-                tool_call_id,
-                content,
-            }),
-            Self::Error { message } => Ok(Message::Error { message }),
+            Self::Tool { .. } | Self::Error { .. } => Err(ProtocolError::new(
+                ProtocolErrorKind::InvalidRequest,
+                "clients may only inject user or assistant messages",
+            )),
         }
     }
 }
@@ -361,47 +336,6 @@ pub struct RouteAgentMessageDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: Option<ResourceIdDto>,
     pub message: MessageDto,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RouteAgentAssistantDto {
-    pub workspace: WorkspaceReferenceDto,
-    pub agent: Option<ResourceIdDto>,
-    pub content: Option<String>,
-    pub reasoning: Option<String>,
-    #[serde(default)]
-    pub tool_calls: Vec<RouteAgentAssistantToolCallDto>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RouteAgentAssistantToolCallDto {
-    pub id: String,
-    pub resource_id: ResourceIdDto,
-    pub arguments: String,
-}
-
-impl IntoDomain<RouteAgentAssistant, String> for RouteAgentAssistantDto {
-    fn into_domain(self, id: String) -> Result<RouteAgentAssistant, ProtocolError> {
-        let tool_calls = self
-            .tool_calls
-            .into_iter()
-            .map(|call| {
-                Ok(RouteAgentAssistantToolCall {
-                    id: call.id,
-                    resource_id: call.resource_id.into_domain(())?,
-                    arguments: call.arguments,
-                })
-            })
-            .collect::<Result<Vec<_>, ProtocolError>>()?;
-        Ok(RouteAgentAssistant {
-            id,
-            workspace: self.workspace.into_domain(())?,
-            agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
-            content: self.content,
-            reasoning: self.reasoning,
-            tool_calls,
-        })
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1386,38 +1320,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(failure["result"]["Err"], "TypeMismatch: unknown field");
-    }
-
-    #[test]
-    fn manual_assistant_routes_resource_tool_calls_without_internal_names() {
-        let request: ClientMessage = serde_json::from_value(json!({
-            "type": "agent.assistant",
-            "id": "manual-1",
-            "message": {
-                "workspace": workspace_reference(),
-                "agent": "agent:demo/coder:latest",
-                "content": null,
-                "reasoning": null,
-                "tool_calls": [{
-                    "id": "call-1",
-                    "resource_id": "skill:local/review:latest",
-                    "arguments": "{}"
-                }]
-            }
-        }))
-        .unwrap();
-        let ClientMessage::AgentAssistant { id, message } = request else {
-            panic!("expected agent.assistant");
-        };
-        let route: RouteAgentAssistant = message.into_domain(id).unwrap();
-        assert_eq!(route.id, "manual-1");
-        assert_eq!(route.workspace.name, "demo");
-        assert_eq!(route.tool_calls.len(), 1);
-        assert_eq!(
-            route.tool_calls[0].resource_id.to_string(),
-            "skill:local/review:latest"
-        );
-        assert_eq!(route.tool_calls[0].arguments, "{}");
     }
 
     #[test]
