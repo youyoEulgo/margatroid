@@ -73,7 +73,7 @@ ToolPlugin：工具插件，公开结构体--统一安装内置工具根、注�
     impl Plugin for ToolPlugin
         build(self, app: &mut App)
             安装插件：要求 RuntimePlugin 和 AsyncRuntimePlugin 已安装
-            插入 ToolPluginInstalled、四类 roots、lua/shell 限制、LuaHttpClient、PersistentShells
+            插入 ToolPluginInstalled、四类 roots、lua/shell 限制和 LuaHttpClient
             依次挂载注册、调用路由、异步执行、任务结果、取消和清理 System
 
 ToolPluginInstalled：工具插件安装标记，公开单元 Resource
@@ -133,7 +133,7 @@ mod.rs   finish_tool_call(world, request, result)
 skill.rs skill_register_system / execute_skill_call
 hook.rs  hook_register_system / execute_hook_call
 lua.rs   lua_tool_register_system / prepare_lua_call / execute_prepared_lua_tool / lua_task_result_system
-shell.rs shell_register_system / prepare_shell_call / execute_prepared_shell / shell_task_result_system
+shell.rs shell_register_system / prepare_shell_call / execute_prepared_shell / shell_task_result_system（每次调用一次性 PTY，stdout 与 stderr 合并）
 ```
 
 # events
@@ -273,7 +273,7 @@ App
     ├── ToolPluginInstalled
     ├── SkillRoots / HookRoots / LuaRoots / ShellRoots
     ├── LuaExecutionLimits / LuaHttpClient
-    ├── ShellExecutionLimits / PersistentShells
+    ├── ShellExecutionLimits
     └── Agent
         ├── resources: AgentResourceMap
         └── tools.pending: HashMap<(Entity, String, String), AgentToolPending>
