@@ -424,30 +424,33 @@ impl ProviderAdapterFactory for DeepSeekAdapterFactory {
             ));
         }
         let thinking = match route.thinking() {
-            None | Some("disabled") => false,
-            Some("enabled") => true,
-            Some(_) => {
+            None => None,
+            Some(value) => match ThinkingMode::parse(value) {
+                Some(mode) => Some(mode),
+                None => {
+                    return Err(InferenceError::new(
+                        InferenceErrorKind::InvalidModelRoute,
+                        "DeepSeek thinking must be enabled or disabled",
+                    ))
+                }
+            },
+        };
+        let reasoning_effort = match (thinking, route.reasoning_effort()) {
+            (Some(ThinkingMode::Enabled), Some(value @ ("high" | "max"))) => Some(value.to_owned()),
+            (Some(ThinkingMode::Enabled), None) => {
                 return Err(InferenceError::new(
                     InferenceErrorKind::InvalidModelRoute,
-                    "DeepSeek thinking must be enabled or disabled",
+                    "enabled DeepSeek thinking requires reasoning_effort",
+                ))
+            }
+            (_, None) => None,
+            _ => {
+                return Err(InferenceError::new(
+                    InferenceErrorKind::InvalidModelRoute,
+                    "DeepSeek reasoning_effort must be high or max and requires enabled thinking",
                 ))
             }
         };
-        let reasoning_effort =
-            match (thinking, route.reasoning_effort()) {
-                (true, Some(value @ ("high" | "max"))) => Some(value.to_owned()),
-                (true, None) => {
-                    return Err(InferenceError::new(
-                        InferenceErrorKind::InvalidModelRoute,
-                        "enabled DeepSeek thinking requires reasoning_effort",
-                    ))
-                }
-                (false, None) => None,
-                _ => return Err(InferenceError::new(
-                    InferenceErrorKind::InvalidModelRoute,
-                    "DeepSeek reasoning_effort must be high or max and requires enabled thinking",
-                )),
-            };
         Ok(Arc::new(DeepSeekAdapter {
             base_url: route.base_url().clone(),
             api_key: route.api_key().to_owned(),
@@ -457,10 +460,37 @@ impl ProviderAdapterFactory for DeepSeekAdapterFactory {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThinkingMode {
+    Enabled,
+    Disabled,
+}
+
+impl ThinkingMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "enabled" => Some(Self::Enabled),
+            "disabled" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    fn thinks(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
 struct DeepSeekAdapter {
     base_url: Url,
     api_key: String,
-    thinking: bool,
+    thinking: Option<ThinkingMode>,
     reasoning_effort: Option<String>,
 }
 
@@ -637,13 +667,13 @@ impl OpenAiRequest {
 
     fn from_deepseek_input(
         input: ProviderInput<'_>,
-        thinking: bool,
+        thinking: Option<ThinkingMode>,
         reasoning_effort: Option<String>,
     ) -> Self {
         let messages = input
             .messages()
             .iter()
-            .map(|message| deepseek_message(message, thinking))
+            .map(|message| deepseek_message(message, thinking.is_none_or(ThinkingMode::thinks)))
             .collect();
         let tools = input
             .tools()
@@ -671,8 +701,8 @@ impl OpenAiRequest {
             max_tokens: input.parameters().max_output_tokens(),
             top_p: input.parameters().top_p(),
             stop: input.parameters().stop().to_vec(),
-            thinking: thinking.then_some(DeepSeekThinking {
-                thinking_type: "enabled",
+            thinking: thinking.map(|mode| DeepSeekThinking {
+                thinking_type: mode.as_str(),
             }),
             reasoning_effort,
         }
@@ -1216,7 +1246,7 @@ data: [DONE]
         ];
         let request = OpenAiRequest::from_deepseek_input(
             ProviderInput::new("model", &InferenceParameters::default(), &messages, &[]),
-            true,
+            Some(ThinkingMode::Enabled),
             Some("high".into()),
         );
         let value = serde_json::to_value(request).unwrap();
@@ -1244,21 +1274,26 @@ data: [DONE]
             content: Some("answer".into()),
             tool_calls: Vec::new(),
         }];
-        let thinking = serde_json::to_value(OpenAiRequest::from_deepseek_input(
-            ProviderInput::new("model", &InferenceParameters::default(), &messages, &[]),
-            true,
-            Some("high".into()),
-        ))
-        .unwrap();
-        assert_eq!(thinking["messages"][0]["reasoning_content"], "");
+        let request = |thinking| {
+            serde_json::to_value(OpenAiRequest::from_deepseek_input(
+                ProviderInput::new("model", &InferenceParameters::default(), &messages, &[]),
+                thinking,
+                None,
+            ))
+            .unwrap()
+        };
 
-        let plain = serde_json::to_value(OpenAiRequest::from_deepseek_input(
-            ProviderInput::new("model", &InferenceParameters::default(), &messages, &[]),
-            false,
-            None,
-        ))
-        .unwrap();
-        assert!(plain["messages"][0].get("reasoning_content").is_none());
+        let enabled = request(Some(ThinkingMode::Enabled));
+        assert_eq!(enabled["thinking"]["type"], "enabled");
+        assert_eq!(enabled["messages"][0]["reasoning_content"], "");
+
+        let unspecified = request(None);
+        assert!(unspecified.get("thinking").is_none());
+        assert_eq!(unspecified["messages"][0]["reasoning_content"], "");
+
+        let disabled = request(Some(ThinkingMode::Disabled));
+        assert_eq!(disabled["thinking"]["type"], "disabled");
+        assert!(disabled["messages"][0].get("reasoning_content").is_none());
     }
 
     #[test]
