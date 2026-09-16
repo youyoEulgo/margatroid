@@ -1,5 +1,5 @@
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
-use client_plugin::{client_source, ClientRegistrationResult};
+use client_plugin::{client_source, registered_client, ClientRegistrationResult};
 use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::World;
 use log_plugin::{TracingStream, TracingStreamError};
@@ -47,6 +47,15 @@ pub(crate) fn handle_inbound_message(
             return;
         }
     };
+    if !matches!(request, ClientMessage::ConnectionRegister { .. })
+        && registered_client(world, connection_id).is_none()
+    {
+        tracing::warn!(
+            connection = connection_id.get(),
+            "ignoring API request from an unregistered connection"
+        );
+        return;
+    }
     match request {
         ClientMessage::ConnectionRegister { id, message } => {
             tracing::info!(connection = connection_id.get(), request_id = %id, api_type = "connection.register", "API request received");

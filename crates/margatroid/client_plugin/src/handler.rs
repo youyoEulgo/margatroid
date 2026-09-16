@@ -1,4 +1,4 @@
-use core_plugin::World;
+use core_plugin::{Entity, World};
 use resource_id_plugin::{ResourceId, ResourceIdLookupError, WorldResourceIdExt};
 use server_plugin::{
     RegisterConnection, WebSocketConnectionId, WebSocketConnections, WebSocketNameError,
@@ -51,8 +51,22 @@ pub(crate) fn handle_client_registration(
     })
 }
 
+pub fn registered_client(
+    world: &World,
+    connection_id: WebSocketConnectionId,
+) -> Option<ResourceId> {
+    let entity = client_entity(world, connection_id)?;
+    world.get_component::<ResourceId>(entity).cloned()
+}
+
 pub(crate) fn handle_client_disconnect(world: &mut World, connection_id: WebSocketConnectionId) {
-    let entity = world
+    if let Some(entity) = client_entity(world, connection_id) {
+        world.despawn(entity);
+    }
+}
+
+fn client_entity(world: &World, connection_id: WebSocketConnectionId) -> Option<Entity> {
+    world
         .query_with::<Client>()
         .result()
         .into_iter()
@@ -60,10 +74,7 @@ pub(crate) fn handle_client_disconnect(world: &mut World, connection_id: WebSock
             world
                 .get_component::<Client>(*entity)
                 .is_some_and(|client| client.connection_id() == connection_id)
-        });
-    if let Some(entity) = entity {
-        world.despawn(entity);
-    }
+        })
 }
 
 fn client_resource_id(
