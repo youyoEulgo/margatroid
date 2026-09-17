@@ -405,19 +405,9 @@ mod tests {
         assert_eq!(
             columns,
             [
-                "sequence",
-                "turn_id",
-                "role",
-                "reasoning",
-                "content",
-                "tool_calls",
-                "tool_schema",
-                "resource_id",
-                "tool_call_id",
-                "input_tokens",
-                "output_tokens",
-                "cache_hit_tokens",
-                "created_at_ms",
+                "sequence", "kind", "event", "turn_id", "role", "reasoning", "content", "tool_calls",
+                "tool_schema", "resource_id", "tool_call_id", "input_tokens", "output_tokens",
+                "cache_hit_tokens", "created_at_ms"
             ]
         );
     }

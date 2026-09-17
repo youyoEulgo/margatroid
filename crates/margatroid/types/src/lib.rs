@@ -410,6 +410,7 @@ pub struct AgentRealtimeContextWriteRequested {
 
 impl Event for AgentRealtimeContextWriteRequested {}
 
+
 /// A synchronous MCL effect asks MemoryPlugin to return the persisted
 /// realtime snapshot. The reply stays at the MCL boundary; it is never an
 /// implicit Agent creation input.

@@ -12,6 +12,8 @@ use crate::error::{MemoryError, MemoryErrorKind};
 const HISTORY_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS history_messages (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL DEFAULT 'message',
+    event TEXT,
     turn_id TEXT NOT NULL,
     role TEXT NOT NULL,
     reasoning TEXT,
@@ -31,6 +33,11 @@ CREATE TABLE IF NOT EXISTS realtime_context (
     input_tokens INTEGER,
     output_tokens INTEGER,
     cache_hit_tokens INTEGER
+);
+CREATE TABLE IF NOT EXISTS setting (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL
 );
 "#;
 
