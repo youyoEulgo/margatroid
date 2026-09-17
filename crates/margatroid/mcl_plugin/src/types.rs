@@ -174,20 +174,39 @@ pub struct RefMergeDeclaration {
 #[derive(Clone, Debug)]
 pub enum MclEffectCommand {
     Start,
-    CatchInference { ref_block_id: String },
-    Inference { ref_block_id: String },
-    ToolCall { calls: Vec<ToolCall> },
+    CatchInference {
+        ref_block_id: String,
+    },
+    Inference {
+        ref_block_id: String,
+    },
+    ToolCall {
+        calls: Vec<ToolCall>,
+    },
     Finish,
-    HistoryAppend { message: MclMessage },
+    HistoryAppend {
+        message: MclMessage,
+    },
     HistoryRecord {
         kind: String,
         content: String,
         payload: String,
     },
-    RealtimeSource { ref_block_id: String },
-    SettingSource { ref_block_id: String },
-    VisibilitySource { source: BlockPath },
-    DefaultVisibilitySource { source: BlockPath },
+    RealtimeSource {
+        ref_block_id: String,
+    },
+    SettingSource {
+        ref_block_id: String,
+    },
+    VisibilitySource {
+        source: BlockPath,
+    },
+    DefaultVisibilitySource {
+        source: BlockPath,
+    },
+    SettingLoad {
+        key: String,
+    },
     RealtimeLoad,
 }
 #[derive(Clone, Debug)]
