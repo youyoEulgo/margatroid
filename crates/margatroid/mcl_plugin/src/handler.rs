@@ -133,7 +133,7 @@ fn parse_create(command: &str) -> Result<MclOperation, MclError> {
             let inner_type = match kind {
                 "MESSAGE" => InnerType::Message,
                 "TOOL_CALL" => InnerType::ToolCall,
-                "TOOL" => InnerType::ResourceId,
+                "RESOURCE" => InnerType::ResourceId,
                 _ => return Err(MclError::TypeMismatch),
             };
             fields.push(BlockFieldDeclaration::Empty {

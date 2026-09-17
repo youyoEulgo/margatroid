@@ -868,7 +868,7 @@ fn begin_catch_inference(
         .values()
         .any(|merge| !matches!(merge, margatroid_types::RefMerge::Message(_)));
     if message_merge != 1 || forbidden_merge {
-        return Err(MclError::MessageSourceUnavailable);
+        return Err(MclError::TypeMismatch);
     }
     let merge_id = block
         .merges
