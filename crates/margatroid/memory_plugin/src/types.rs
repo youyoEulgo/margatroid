@@ -153,6 +153,41 @@ impl AgentMemoryStore for AgentMemory {
         })
     }
 
+    fn append_record(
+        &self,
+        kind: &str,
+        content: &str,
+        payload: &str,
+        source: &str,
+    ) -> Result<(), AgentMemoryStoreError> {
+        let mut connection = lock_connection(self).map_err(memory_store_error)?;
+        let transaction = connection.transaction().map_err(|error| {
+            memory_store_error(MemoryError::new(
+                MemoryErrorKind::WriteFailed,
+                error.to_string(),
+            ))
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO history_messages (kind, created_at_ms, content, payload, source) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    kind,
+                    current_unix_milliseconds().map_err(memory_store_error)?,
+                    content,
+                    payload,
+                    source
+                ],
+            )
+            .map_err(schema_error)
+            .map_err(memory_store_error)?;
+        transaction.commit().map_err(|error| {
+            memory_store_error(MemoryError::new(
+                MemoryErrorKind::WriteFailed,
+                error.to_string(),
+            ))
+        })
+    }
+
     fn rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError> {
         let mut connection = lock_connection(self).map_err(memory_store_error)?;
         let transaction = connection.transaction().map_err(|error| {

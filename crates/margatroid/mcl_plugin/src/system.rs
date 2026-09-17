@@ -474,6 +474,20 @@ pub fn mcl_domain_system(world: &mut World) {
                     &request.source,
                 ),
                 MclOperation::Emit {
+                    effect: crate::MclEffectCommand::HistoryRecord {
+                        kind,
+                        content,
+                        payload,
+                    },
+                } => crate::history_record(
+                    world,
+                    &request.agent_id,
+                    kind,
+                    content,
+                    payload,
+                    &request.source,
+                ),
+                MclOperation::Emit {
                     effect: crate::MclEffectCommand::RealtimeSource { ref_block_id },
                 } => crate::realtime_source(world, &request.agent_id, ref_block_id),
                 MclOperation::Emit {

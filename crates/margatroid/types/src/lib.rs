@@ -401,6 +401,19 @@ pub struct AgentHistoryMessageWriteRequested {
 
 impl Event for AgentHistoryMessageWriteRequested {}
 
+/// Appends one MCL command to the same timeline as the conversation, exactly as
+/// the issuer supplied it: `kind` (for example `mcl`), `content` and `payload`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentHistoryRecordWriteRequested {
+    pub agent: Entity,
+    pub source: String,
+    pub kind: String,
+    pub content: String,
+    pub payload: String,
+}
+
+impl Event for AgentHistoryRecordWriteRequested {}
+
 /// Requests a complete replacement of the persisted MCL realtime-context
 /// snapshot. The source block is selected explicitly by the Base Driver.
 #[derive(Clone, Debug, PartialEq, Eq)]
