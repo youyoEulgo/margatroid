@@ -483,6 +483,16 @@ mod tests {
     struct EmptyMemory;
 
     impl AgentMemoryStore for EmptyMemory {
+        fn append_record(
+            &self,
+            _kind: &str,
+            _content: &str,
+            _payload: &str,
+            _source: &str,
+        ) -> Result<(), AgentMemoryStoreError> {
+            Ok(())
+        }
+
         fn set_setting(
             &self,
             _entries: &[(String, String)],

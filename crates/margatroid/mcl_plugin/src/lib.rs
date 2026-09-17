@@ -7,7 +7,8 @@ mod types;
 pub use error::MclError;
 pub use events::*;
 pub use handler::{
-    domain_to_command, execute_direct_operation, history_append, parse_operation, realtime_load,
+    domain_to_command, execute_direct_operation, history_append, history_record,
+    parse_operation, realtime_load,
     setting_source,
     realtime_source,
 };

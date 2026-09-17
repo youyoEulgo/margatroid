@@ -356,6 +356,14 @@ pub trait AgentMemoryStore: Send + Sync + 'static {
 
     fn set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError>;
 
+    fn append_record(
+        &self,
+        kind: &str,
+        content: &str,
+        payload: &str,
+        source: &str,
+    ) -> Result<(), AgentMemoryStoreError>;
+
     fn rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError>;
 
     fn read_realtime(&self) -> Result<Vec<MclMessage>, AgentMemoryStoreError>;
@@ -401,6 +409,16 @@ impl AgentMemoryHandle {
 
     pub fn set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError> {
         self.inner.set_setting(entries)
+    }
+
+    pub fn append_record(
+        &self,
+        kind: &str,
+        content: &str,
+        payload: &str,
+        source: &str,
+    ) -> Result<(), AgentMemoryStoreError> {
+        self.inner.append_record(kind, content, payload, source)
     }
 
     pub fn rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError> {

@@ -179,6 +179,11 @@ pub enum MclEffectCommand {
     ToolCall { calls: Vec<ToolCall> },
     Finish,
     HistoryAppend { message: MclMessage },
+    HistoryRecord {
+        kind: String,
+        content: String,
+        payload: String,
+    },
     RealtimeSource { ref_block_id: String },
     SettingSource { ref_block_id: String },
     VisibilitySource { source: BlockPath },

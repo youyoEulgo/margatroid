@@ -14,7 +14,7 @@ pub use types::{AgentMemory, RealtimeContext};
 
 use crate::system::{
     read_realtime_context_system, sync_history_messages_system, sync_realtime_context_system,
-    sync_settings_system,
+    sync_history_records_system, sync_settings_system,
 };
 
 pub struct MemoryPlugin {
@@ -57,7 +57,8 @@ impl Plugin for MemoryPlugin {
         app.add_system(&self.schedule, sync_history_messages_system)
             .add_system(&self.schedule, read_realtime_context_system)
             .add_system(&self.schedule, sync_realtime_context_system)
-            .add_system(&self.schedule, sync_settings_system);
+            .add_system(&self.schedule, sync_settings_system)
+            .add_system(&self.schedule, sync_history_records_system);
     }
 }
 

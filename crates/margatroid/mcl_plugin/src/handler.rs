@@ -315,11 +315,32 @@ fn parse_effect(
             })
         }
         ("history_append", 3 | 4) if words.get(3).is_none_or(|value| *value == "?") => {
-            Ok(MclOperation::Emit {
-                effect: MclEffectCommand::HistoryAppend {
-                    message: parse_message(required_binding(binding)?)?,
-                },
-            })
+            let value = required_binding(binding)?;
+            if value.get("kind").is_some() {
+                Ok(MclOperation::Emit {
+                    effect: MclEffectCommand::HistoryRecord {
+                        kind: value
+                            .get("kind")
+                            .and_then(|inner| inner.as_str())
+                            .unwrap_or("mcl")
+                            .to_owned(),
+                        content: serde_json::json!({
+                            "command": value.get("cmd").cloned().unwrap_or(serde_json::Value::Null),
+                        })
+                        .to_string(),
+                        payload: serde_json::json!({
+                            "args": value.get("arg").cloned().unwrap_or(serde_json::Value::Null),
+                        })
+                        .to_string(),
+                    },
+                })
+            } else {
+                Ok(MclOperation::Emit {
+                    effect: MclEffectCommand::HistoryAppend {
+                        message: parse_message(value)?,
+                    },
+                })
+            }
         }
         ("visibility_source", 7)
             if words.get(3) == Some(&"(SELECT")
@@ -851,6 +872,27 @@ pub fn execute_direct_operation(
         });
     }
     Ok(value)
+}
+
+pub fn history_record(
+    world: &mut World,
+    agent_id: &ResourceId,
+    kind: String,
+    content: String,
+    payload: String,
+    source: &str,
+) -> Result<MclDomainValue, MclError> {
+    let entity = world
+        .entity_by_resource_id(agent_id)
+        .map_err(|_| MclError::AgentMissing)?;
+    world.emit_event(margatroid_types::AgentHistoryRecordWriteRequested {
+        agent: entity,
+        source: source.to_owned(),
+        kind,
+        content,
+        payload,
+    });
+    Ok(MclDomainValue::Unit)
 }
 
 pub fn realtime_source(
