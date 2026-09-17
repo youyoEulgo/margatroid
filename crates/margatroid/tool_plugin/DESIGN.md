@@ -73,7 +73,7 @@ ToolPlugin：工具插件，公开结构体--统一安装内置工具根、注�
     impl Plugin for ToolPlugin
         build(self, app: &mut App)
             安装插件：要求 RuntimePlugin 和 AsyncRuntimePlugin 已安装
-            插入 ToolPluginInstalled、四类 roots、lua/shell 限制和 LuaHttpClient
+            插入 ToolPluginInstalled、四类 roots 与 lua/shell 限制
             依次挂载注册、调用路由、异步执行、任务结果、取消和清理 System
 
 ToolPluginInstalled：工具插件安装标记，公开单元 Resource
@@ -159,10 +159,17 @@ spawn_tool_runner 的沙箱分支：
 runner_failure 补充：stderr 里可能混入 landstrip 的拒绝事件，所以按"最后一条 kind 属于
     ToolErrorKind 的 JSON 行"取值，trap 事件不会把错误种类带偏
 
+install_lua_environment(lua, handle) -> Result<Table, ToolError>
+    注入工具环境：私有函数，注入面只有一个入口函数
+    行为：建 entry 表（version / arguments / context / json）放进 Lua 注册表；
+          把全局 margatroid 设为"返回该表"的函数；arguments 由 run_lua_tool 在调用前填入
+    约束：json 的 encode / decode 用 serde_json 直接实现，不额外注入宿主表；
+          不再有 fs / process / http / json / log 这些表——文件、网络、派生一律走标准库，由沙箱约束
+
 run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError>
     执行 Lua 工具：公开异步函数，插件进程内与 runner 进程共用同一段逻辑
     行为：读工具包（main.lua 与 input schema）→ 校验 arguments → 建 VM（StdLib::ALL + 内存上限 + 执行钩子 + 注入宿主面）
-          → 加载 main.lua → 调用全局 execute → 结果长度不超过 max_output_bytes
+          → 把 arguments 填进入口表 → 加载 main.lua → 调用全局 execute → 结果长度不超过 max_output_bytes
     约束：request 携带 package_root、arguments、agent_id、turn_id、resource_id、project_root、image_root、
           limits 与可选 http client（插件侧传共享 client，runner 侧传 None 自行创建）
 
@@ -325,7 +332,7 @@ App
 └── World
     ├── ToolPluginInstalled
     ├── SkillRoots / HookRoots / LuaRoots / ShellRoots
-    ├── LuaExecutionLimits / LuaHttpClient
+    ├── LuaExecutionLimits
     ├── ShellExecutionLimits
     └── Agent
         ├── resources: AgentResourceMap
