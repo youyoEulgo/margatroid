@@ -573,6 +573,85 @@ pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolErro
     Ok(result)
 }
 
+const SANDBOX_POLICY_PATH: &str = "/tmp/margatroid-sandbox-policy.json";
+
+fn sandbox_backend() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("MARGATROID_SANDBOX_BACKEND") {
+        return Some(PathBuf::from(path));
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&paths) {
+            let candidate = directory.join("landstrip");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let directory = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let candidate = directory.join("landstrip");
+    candidate.is_file().then_some(candidate)
+}
+
+fn sandbox_environment_ok(backend: &Path) -> Result<(), ToolError> {
+    let doctor = std::process::Command::new(backend)
+        .arg("doctor")
+        .output()
+        .map_err(|error| {
+            ToolError::new(
+                ToolErrorKind::RunnerFailed,
+                format!("sandbox backend could not be inspected: {error}"),
+            )
+        })?;
+    let healthy = serde_json::from_slice::<serde_json::Value>(&doctor.stdout)
+        .ok()
+        .and_then(|value| value.get("ok").and_then(|flag| flag.as_bool()))
+        .unwrap_or(false);
+    if !doctor.status.success() || !healthy {
+        return Err(ToolError::new(
+            ToolErrorKind::RunnerFailed,
+            format!(
+                "sandbox backend is not usable: {}",
+                String::from_utf8_lossy(&doctor.stderr).trim()
+            ),
+        ));
+    }
+    let validate = std::process::Command::new(backend)
+        .args(["policy", "validate", "-p", SANDBOX_POLICY_PATH])
+        .output()
+        .map_err(|error| {
+            ToolError::new(
+                ToolErrorKind::RunnerFailed,
+                format!("sandbox policy could not be validated: {error}"),
+            )
+        })?;
+    if !validate.status.success() {
+        return Err(ToolError::new(
+            ToolErrorKind::RunnerFailed,
+            format!(
+                "sandbox policy is rejected: {}",
+                String::from_utf8_lossy(&validate.stderr).trim()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_sandbox() -> Result<(), ToolError> {
+    if !Path::new(SANDBOX_POLICY_PATH).is_file() {
+        return Ok(());
+    }
+    let backend = sandbox_backend().ok_or_else(|| {
+        ToolError::new(
+            ToolErrorKind::RunnerFailed,
+            format!(
+                "sandbox policy {SANDBOX_POLICY_PATH} is present but the landstrip backend was not found; \
+                 install landstrip or remove the policy file"
+            ),
+        )
+    })?;
+    sandbox_environment_ok(&backend)
+}
+
 fn tool_runner_path() -> Result<PathBuf, ToolError> {
     if let Some(path) = std::env::var_os("MARGATROID_TOOL_RUNNER") {
         return Ok(PathBuf::from(path));
@@ -624,8 +703,27 @@ async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolEr
         )
     })?;
     let runner = tool_runner_path()?;
-    let mut command = Command::new(&runner);
+    let mut command = if Path::new(SANDBOX_POLICY_PATH).is_file() {
+        let backend = sandbox_backend().ok_or_else(|| {
+            ToolError::new(
+                ToolErrorKind::RunnerFailed,
+                format!("sandbox policy {SANDBOX_POLICY_PATH} is present but the landstrip backend was not found"),
+            )
+        })?;
+        let mut command = Command::new(backend);
+        command
+            .arg("run")
+            .arg("-p")
+            .arg(SANDBOX_POLICY_PATH)
+            .arg("--")
+            .arg(&runner);
+        command
+    } else {
+        Command::new(&runner)
+    };
     command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -698,7 +796,20 @@ async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolEr
 }
 
 fn runner_failure(stderr: &str) -> ToolError {
-    let reported = serde_json::from_str::<serde_json::Value>(stderr.trim()).ok();
+    let reported = stderr
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find(|value| {
+            matches!(
+                value.get("kind").and_then(|kind| kind.as_str()),
+                Some("InvalidRequest")
+                    | Some("InvalidArguments")
+                    | Some("InvalidDefinition")
+                    | Some("ExecutionFailed")
+                    | Some("RunnerFailed")
+            )
+        });
     let kind = match reported
         .as_ref()
         .and_then(|value| value.get("kind"))
@@ -1464,6 +1575,13 @@ mod runner_tests {
         let unreadable = runner_failure("not json at all");
         assert_eq!(unreadable.kind(), ToolErrorKind::ExecutionFailed);
         assert_eq!(unreadable.message(), "Lua tool execution failed");
+    }
+
+    #[test]
+    fn sandbox_backend_prefers_the_environment_override() {
+        std::env::set_var("MARGATROID_SANDBOX_BACKEND", "/opt/landstrip");
+        assert_eq!(sandbox_backend(), Some(PathBuf::from("/opt/landstrip")));
+        std::env::remove_var("MARGATROID_SANDBOX_BACKEND");
     }
 
     #[cfg(unix)]
