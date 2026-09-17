@@ -5,7 +5,6 @@ mod system;
 mod types;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use agent_plugin::{Agent, AgentResourceEntry};
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
@@ -26,10 +25,6 @@ use system::{
 
 pub struct ToolPlugin {
     schedule: String,
-    skill_root: Arc<PathBuf>,
-    hook_root: Arc<PathBuf>,
-    lua_root: Arc<PathBuf>,
-    shell_root: Arc<PathBuf>,
     lua_limits: handler::lua::LuaExecutionLimits,
     shell_limits: handler::shell::ShellExecutionLimits,
 }
@@ -50,10 +45,6 @@ impl ToolPlugin {
         }
         Ok(Self {
             schedule: RuntimePlugin::UPDATE.to_owned(),
-            skill_root: Arc::new(root.join("skills")),
-            hook_root: Arc::new(root.join("hooks")),
-            lua_root: Arc::new(root.join("tools")),
-            shell_root: Arc::new(root.join("shells")),
             lua_limits: handler::lua::LuaExecutionLimits::default(),
             shell_limits: handler::shell::ShellExecutionLimits::default(),
         })
@@ -69,10 +60,6 @@ impl Default for ToolPlugin {
     fn default() -> Self {
         Self {
             schedule: RuntimePlugin::UPDATE.to_owned(),
-            skill_root: Arc::new(PathBuf::new()),
-            hook_root: Arc::new(PathBuf::new()),
-            lua_root: Arc::new(PathBuf::new()),
-            shell_root: Arc::new(PathBuf::new()),
             lua_limits: handler::lua::LuaExecutionLimits::default(),
             shell_limits: handler::shell::ShellExecutionLimits::default(),
         }
@@ -106,19 +93,7 @@ impl Plugin for ToolPlugin {
             .panic();
         }
         app.world_mut().insert_resource(ToolPluginInstalled);
-        app.world_mut().insert_resource(handler::skill::SkillRoots {
-            home_root: self.skill_root.clone(),
-        });
-        app.world_mut().insert_resource(handler::hook::HookRoots {
-            home_root: self.hook_root.clone(),
-        });
-        app.world_mut().insert_resource(handler::lua::LuaRoots {
-            home_root: self.lua_root.clone(),
-        });
         app.world_mut().insert_resource(self.lua_limits);
-        app.world_mut().insert_resource(handler::shell::ShellRoots {
-            home_root: self.shell_root.clone(),
-        });
         app.world_mut().insert_resource(self.shell_limits);
         app.add_system(&self.schedule, tool_register_system)
             .add_system(&self.schedule, handler::skill::skill_register_system)

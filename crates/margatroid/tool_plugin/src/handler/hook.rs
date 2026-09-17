@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use crate::{
     candidate_resource_entry, ToolCallRequest, ToolError, ToolErrorKind, ToolRegisterRequest,
@@ -8,7 +7,7 @@ use crate::{
 };
 use agent_plugin::Agent;
 use app_runtime_plugin::WorldEventExt;
-use core_plugin::{Resource, World};
+use core_plugin::World;
 use margatroid_types::ResourceId;
 use serde::Deserialize;
 
@@ -23,11 +22,6 @@ struct HookMetadata {
     name: String,
     description: String,
 }
-pub(crate) struct HookRoots {
-    pub(crate) home_root: Arc<PathBuf>,
-}
-impl Resource for HookRoots {}
-
 pub(crate) fn hook_register_system(world: &mut World) {
     let requests = world
         .event_reader::<ToolRegisterRequest>()
@@ -49,13 +43,9 @@ pub(crate) fn hook_register_system(world: &mut World) {
             })
             .and_then(|agent| {
                 validate_hook_resource(&request.resource_id)?;
-                let roots = world
-                    .get_resource::<HookRoots>()
-                    .expect("HookPlugin is installed");
                 let package_root = find_hook_package(
                     &agent.info.project_root,
                     &agent.info.image_root,
-                    &roots.home_root,
                     &request.resource_id,
                 )?;
                 let metadata = read_hook_metadata(&package_root)?;
@@ -128,13 +118,11 @@ fn read_hook_schema(package_root: &Path) -> Result<serde_json::Value, ToolError>
 fn find_hook_package(
     project_root: &Path,
     image_root: &Path,
-    home_root: &Path,
     resource: &ResourceId,
 ) -> Result<PathBuf, ToolError> {
     let candidates = [
         project_root.join(".margatroid").join("hooks"),
         image_root.join("hooks"),
-        home_root.to_path_buf(),
     ];
     for root in candidates {
         let package = root
