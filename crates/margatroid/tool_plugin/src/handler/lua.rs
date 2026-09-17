@@ -16,7 +16,7 @@ use async_runtime_plugin::{AsyncTaskError, WorldAsyncExt};
 use core_plugin::{Entity, Event, Resource, World};
 use margatroid_types::ResourceId;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
-use serde::{Deserialize};
+use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -126,9 +126,7 @@ impl fmt::Display for LuaError {
 
 impl std::error::Error for LuaError {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-
-#[derive(Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LuaToolMetadata {
     schema_version: u32,
@@ -167,12 +165,6 @@ struct LuaExecutionHandle {
     context: LuaCallContext,
     limits: LuaExecutionLimits,
 }
-
-
-
-
-
-
 
 struct LuaToolResponseGuard {
     locator: Option<LuaToolCallLocator>,
@@ -377,13 +369,7 @@ fn prepare_lua_tool_call(
         package_root: Arc::clone(&package_root),
     };
 
-    Ok((
-        package_root,
-        LuaExecutionHandle {
-            context,
-            limits,
-        },
-    ))
+    Ok((package_root, LuaExecutionHandle { context, limits }))
 }
 
 pub(crate) async fn execute_prepared_lua_tool(
@@ -1002,10 +988,6 @@ fn read_only_proxy(lua: &Lua, values: Table) -> Result<Table, ToolError> {
     Ok(proxy)
 }
 
-
-
-
-
 struct ProcessOutputBuffer {
     bytes: Vec<u8>,
     truncated: bool,
@@ -1030,13 +1012,6 @@ async fn read_process_output(
     }
     Ok(ProcessOutputBuffer { bytes, truncated })
 }
-
-
-
-
-
-
-
 
 fn read_bounded_sync(path: &Path, limit: usize, label: &str) -> Result<String, ToolError> {
     let file = fs::File::open(path).map_err(|_| {
@@ -1126,7 +1101,6 @@ mod runner_tests {
             project_root: PathBuf::from("/tmp"),
             image_root: PathBuf::from("/tmp"),
             limits,
-            client: None,
         }
     }
 
