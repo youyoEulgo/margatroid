@@ -836,6 +836,13 @@ pub fn realtime_source(
             if messages.next().is_some() {
                 return Err(MclError::TypeMismatch);
             }
+            if block
+                .merges
+                .values()
+                .any(|merge| !matches!(merge, margatroid_types::RefMerge::Message(_)))
+            {
+                return Err(MclError::TypeMismatch);
+            }
             let source = margatroid_types::MclRealtimeSource {
                 ref_block_id: ref_block_id.clone(),
                 message_merge_id: merge_id.clone(),

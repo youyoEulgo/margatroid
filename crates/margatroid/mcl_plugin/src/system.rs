@@ -508,8 +508,8 @@ pub fn mcl_domain_system(world: &mut World) {
                         .merges
                         .values()
                         .any(|merge| matches!(merge, margatroid_types::RefMerge::ToolCall(_)));
-                    if message_merges != 1 || resource_merges > 1 || has_unsupported_merge {
-                        return Err(MclError::MessageSourceUnavailable);
+                    if message_merges != 1 || resource_merges != 1 || has_unsupported_merge {
+                        return Err(MclError::TypeMismatch);
                     }
                     let merge_id = block
                         .merges
