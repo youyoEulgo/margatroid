@@ -356,6 +356,8 @@ pub trait AgentMemoryStore: Send + Sync + 'static {
 
     fn set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError>;
 
+    fn setting_value(&self, key: &str) -> Result<Vec<String>, AgentMemoryStoreError>;
+
     fn append_record(
         &self,
         kind: &str,
@@ -409,6 +411,10 @@ impl AgentMemoryHandle {
 
     pub fn set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError> {
         self.inner.set_setting(entries)
+    }
+
+    pub fn setting_value(&self, key: &str) -> Result<Vec<String>, AgentMemoryStoreError> {
+        self.inner.setting_value(key)
     }
 
     pub fn append_record(

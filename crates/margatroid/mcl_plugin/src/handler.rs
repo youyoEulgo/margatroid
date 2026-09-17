@@ -282,6 +282,14 @@ fn parse_effect(
                 effect: MclEffectCommand::RealtimeLoad,
             })
         }
+        ("setting_load", 4) => {
+            reject_binding(binding)?;
+            Ok(MclOperation::Emit {
+                effect: MclEffectCommand::SettingLoad {
+                    key: effect_ref_block(words[3])?,
+                },
+            })
+        }
         ("realtime_source", 4) => {
             reject_binding(binding)?;
             Ok(MclOperation::Emit {
@@ -1127,6 +1135,29 @@ pub fn setting_source(
         state.resources.setting_sources = paths;
     }
     Ok(MclDomainValue::Unit)
+}
+
+pub fn setting_load(
+    world: &mut World,
+    agent_id: &ResourceId,
+    key: String,
+) -> Result<MclDomainValue, MclError> {
+    let entity = world
+        .entity_by_resource_id(agent_id)
+        .map_err(|_| MclError::AgentMissing)?;
+    let stored = world
+        .get_component::<Agent>(entity)
+        .ok_or(MclError::AgentMissing)?
+        .memory
+        .setting_value(&key)
+        .map_err(|_| MclError::ImportMissing("stored setting could not be read".to_owned()))?;
+    let values = stored
+        .iter()
+        .filter_map(|resource| resource.parse().ok())
+        .collect::<Vec<ResourceId>>();
+    Ok(MclDomainValue::Inner(
+        margatroid_types::BlockInner::ResourceId(values),
+    ))
 }
 
 pub fn realtime_load(world: &mut World, agent_id: &ResourceId) -> Result<MclDomainValue, MclError> {

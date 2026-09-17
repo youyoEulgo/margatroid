@@ -488,6 +488,9 @@ pub fn mcl_domain_system(world: &mut World) {
                     &request.source,
                 ),
                 MclOperation::Emit {
+                    effect: crate::MclEffectCommand::SettingLoad { key },
+                } => crate::setting_load(world, &request.agent_id, key),
+                MclOperation::Emit {
                     effect: crate::MclEffectCommand::RealtimeSource { ref_block_id },
                 } => crate::realtime_source(world, &request.agent_id, ref_block_id),
                 MclOperation::Emit {

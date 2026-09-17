@@ -483,6 +483,10 @@ mod tests {
     struct EmptyMemory;
 
     impl AgentMemoryStore for EmptyMemory {
+        fn setting_value(&self, _key: &str) -> Result<Vec<String>, AgentMemoryStoreError> {
+            Ok(Vec::new())
+        }
+
         fn append_record(
             &self,
             _kind: &str,

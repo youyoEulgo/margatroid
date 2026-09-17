@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_plugin::{AgentMemoryStore, AgentMemoryStoreError, HistoryMessage};
 use margatroid_types::{MclMessage, Message, TokenUsage, ToolDefinition};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::error::{MemoryError, MemoryErrorKind};
 
@@ -121,6 +121,28 @@ impl AgentMemoryStore for AgentMemory {
         transaction.commit().map_err(|error| {
             memory_store_error(MemoryError::new(
                 MemoryErrorKind::WriteFailed,
+                error.to_string(),
+            ))
+        })
+    }
+
+    fn setting_value(&self, key: &str) -> Result<Vec<String>, AgentMemoryStoreError> {
+        let connection = lock_connection(self).map_err(memory_store_error)?;
+        let value = connection
+            .query_row(
+                "SELECT value FROM setting WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(read_error)
+            .map_err(memory_store_error)?;
+        let Some(value) = value else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str::<Vec<String>>(&value).map_err(|error| {
+            memory_store_error(MemoryError::new(
+                MemoryErrorKind::DecodeFailed,
                 error.to_string(),
             ))
         })
