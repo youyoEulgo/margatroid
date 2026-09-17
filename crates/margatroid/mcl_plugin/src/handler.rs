@@ -786,29 +786,68 @@ pub fn execute_direct_operation(
             }
         }
     }
-    if let (Some(changed), Some(source)) =
-        (changed.as_ref(), agent.mcl().realtime_source().cloned())
-    {
-        if !source
-            .dependencies
-            .iter()
-            .any(|dependency| dependency == changed)
-        {
-            return Ok(value);
+    let realtime_write = match (changed.as_ref(), agent.mcl().realtime_source().cloned()) {
+        (Some(changed), Some(source)) => {
+            if source
+                .dependencies
+                .iter()
+                .any(|dependency| dependency == changed)
+            {
+                let values = agent
+                    .mcl
+                    .select(&BlockPath {
+                        block_id: source.ref_block_id,
+                        inner_id: source.message_merge_id,
+                    })
+                    .map_err(|_| MclError::MessageSourceUnavailable)?;
+                let BlockInner::Message(messages) = values else {
+                    return Err(MclError::TypeMismatch);
+                };
+                Some(messages)
+            } else {
+                None
+            }
         }
-        let values = agent
-            .mcl
-            .select(&BlockPath {
-                block_id: source.ref_block_id,
-                inner_id: source.message_merge_id,
-            })
-            .map_err(|_| MclError::MessageSourceUnavailable)?;
-        let BlockInner::Message(messages) = values else {
-            return Err(MclError::TypeMismatch);
-        };
+        _ => None,
+    };
+    let setting_entries = match changed.as_ref() {
+        Some(changed)
+            if agent
+                .resources
+                .setting_sources
+                .iter()
+                .any(|source| source == changed) =>
+        {
+            let mut entries = Vec::new();
+            for source in agent.resources.setting_sources.clone() {
+                if let Ok(margatroid_types::BlockInner::ResourceId(values)) =
+                    agent.mcl.select(&source)
+                {
+                    let key = format!("{}/{}", source.block_id, source.inner_id);
+                    let value = serde_json::to_string(
+                        &values
+                            .iter()
+                            .map(|resource| resource.to_string())
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_else(|_| "[]".to_owned());
+                    entries.push(margatroid_types::AgentSettingEntry { key, value });
+                }
+            }
+            entries
+        }
+        _ => Vec::new(),
+    };
+    if let Some(messages) = realtime_write {
         world.emit_event(margatroid_types::AgentRealtimeContextWriteRequested {
             agent: entity,
-            messages: messages.clone(),
+            messages,
+        });
+    }
+    if !setting_entries.is_empty() {
+        world.emit_event(margatroid_types::AgentSettingWriteRequested {
+            agent: entity,
+            entries: setting_entries,
         });
     }
     Ok(value)
@@ -971,6 +1010,7 @@ pub fn history_append(
     agent_id: &ResourceId,
     message: margatroid_types::MclMessage,
     fallback_turn_id: &str,
+    source: &str,
 ) -> Result<MclDomainValue, MclError> {
     let entity = world
         .entity_by_resource_id(agent_id)
@@ -995,6 +1035,7 @@ pub fn history_append(
     };
     world.emit_event(margatroid_types::AgentHistoryMessageWriteRequested {
         id: turn_id,
+        source: source.to_owned(),
         agent: entity,
         message: message.message,
         tool_schema,

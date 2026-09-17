@@ -257,17 +257,98 @@ pub struct AgentToolState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct HistoryMessage {
     pub sequence: i64,
-    pub turn_id: String,
-    pub message: Message,
-    pub tool_schema: Vec<ToolDefinition>,
-    pub usage: Option<TokenUsage>,
+    pub kind: String,
     pub created_at_ms: i64,
+    pub content: String,
+    pub payload: String,
+    pub source: Option<String>,
+}
+
+impl HistoryMessage {
+    fn payload_value(&self) -> serde_json::Value {
+        serde_json::from_str(&self.payload).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn content_value(&self) -> serde_json::Value {
+        serde_json::from_str(&self.content).unwrap_or(serde_json::Value::Null)
+    }
+
+    pub fn turn_id(&self) -> String {
+        self.payload_value()
+            .get("turn_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    pub fn tool_schema(&self) -> Vec<ToolDefinition> {
+        serde_json::from_value(
+            self.payload_value()
+                .get("tool_schema")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+        .unwrap_or_default()
+    }
+
+    pub fn usage(&self) -> Option<TokenUsage> {
+        if self.kind != "message.assistant" {
+            return None;
+        }
+        let payload = self.payload_value();
+        let count = |key: &str| {
+            payload
+                .get(key)
+                .and_then(|value| value.as_u64())
+                .unwrap_or_default()
+        };
+        Some(TokenUsage {
+            input_tokens: count("input_tokens"),
+            output_tokens: count("output_tokens"),
+            cache_hit_tokens: count("cache_hit_tokens"),
+        })
+    }
+
+    pub fn message(&self) -> Option<Message> {
+        let content = self.content_value();
+        let payload = self.payload_value();
+        let text = |value: &serde_json::Value, key: &str| {
+            value
+                .get(key)
+                .and_then(|inner| inner.as_str())
+                .map(str::to_owned)
+        };
+        match self.kind.as_str() {
+            "message.user" => Some(Message::User {
+                content: text(&content, "content").unwrap_or_default(),
+            }),
+            "message.assistant" => Some(Message::Assistant {
+                reasoning: text(&content, "reasoning"),
+                content: text(&content, "content"),
+                tool_calls: payload
+                    .get("tool_calls")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default(),
+            }),
+            "message.tool" => Some(Message::Tool {
+                resource_id: text(&payload, "resource_id")?.parse().ok()?,
+                tool_call_id: text(&payload, "tool_call_id")?,
+                content: text(&content, "content").unwrap_or_default(),
+            }),
+            "message.error" => Some(Message::Error {
+                message: text(&content, "content").unwrap_or_default(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 pub trait AgentMemoryStore: Send + Sync + 'static {
     fn append_history(
         &self,
         turn_id: &str,
+        source: &str,
         message: &Message,
         tool_schema: &[ToolDefinition],
         usage: Option<&TokenUsage>,
@@ -307,12 +388,13 @@ impl AgentMemoryHandle {
     pub fn append_history(
         &self,
         turn_id: &str,
+        source: &str,
         message: &Message,
         tool_schema: &[ToolDefinition],
         usage: Option<&TokenUsage>,
     ) -> Result<(), AgentMemoryStoreError> {
         self.inner
-            .append_history(turn_id, message, tool_schema, usage)
+            .append_history(turn_id, source, message, tool_schema, usage)
     }
 
     pub fn rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError> {

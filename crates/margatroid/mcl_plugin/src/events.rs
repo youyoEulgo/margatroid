@@ -17,6 +17,7 @@ impl Event for MclCommandRequest {}
 #[derive(Clone, Debug)]
 pub struct MclDomainRequest {
     pub id: MclCommandId,
+    pub source: String,
     pub agent_id: ResourceId,
     pub operation: MclOperation,
     pub reply: MclCommandReply,

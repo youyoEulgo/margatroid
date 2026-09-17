@@ -392,6 +392,7 @@ impl Event for AgentContextMessagesUpdated {}
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentHistoryMessageWriteRequested {
     pub id: String,
+    pub source: String,
     pub agent: Entity,
     pub message: Message,
     pub tool_schema: Vec<ToolDefinition>,
@@ -409,6 +410,22 @@ pub struct AgentRealtimeContextWriteRequested {
 }
 
 impl Event for AgentRealtimeContextWriteRequested {}
+
+/// Requests that the live configuration be persisted. One entry per declared
+/// source field; `key` is the block path and `value` is its serialised content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSettingEntry {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSettingWriteRequested {
+    pub agent: Entity,
+    pub entries: Vec<AgentSettingEntry>,
+}
+
+impl Event for AgentSettingWriteRequested {}
 
 
 /// A synchronous MCL effect asks MemoryPlugin to return the persisted

@@ -384,6 +384,7 @@ pub fn mcl_command_request_system(world: &mut World) {
             MclOperation::Import { .. } | MclOperation::Emit { .. }
         ) {
             world.send_event(MclDomainRequest {
+                source: request.source.clone(),
                 id: request.id,
                 agent_id: request.agent_id,
                 operation,
@@ -465,7 +466,13 @@ pub fn mcl_domain_system(world: &mut World) {
             match request.operation.clone() {
                 MclOperation::Emit {
                     effect: crate::MclEffectCommand::HistoryAppend { message },
-                } => crate::history_append(world, &request.agent_id, message, request.id.as_str()),
+                } => crate::history_append(
+                    world,
+                    &request.agent_id,
+                    message,
+                    request.id.as_str(),
+                    &request.source,
+                ),
                 MclOperation::Emit {
                     effect: crate::MclEffectCommand::RealtimeSource { ref_block_id },
                 } => crate::realtime_source(world, &request.agent_id, ref_block_id),

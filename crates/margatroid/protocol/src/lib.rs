@@ -678,8 +678,16 @@ impl FromDomain<HistoryMessage> for HistoryMessageDto {
     fn from_domain(message: HistoryMessage, (): ()) -> Result<Self, ProtocolError> {
         Ok(Self {
             sequence: message.sequence,
-            turn_id: message.turn_id,
-            message: (&message.message).into_dto(())?,
+            turn_id: message.turn_id(),
+            message: (&message
+                .message()
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorKind::HistoryEntryInvalid,
+                        "history entry is not a message",
+                    )
+                })?)
+                .into_dto(())?,
             created_at_ms: message.created_at_ms,
         })
     }
@@ -1120,6 +1128,7 @@ fn agent_resource_id(workspace: &str, agent: &str) -> Result<ResourceId, Protoco
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolErrorKind {
+    HistoryEntryInvalid,
     AgentNotFound,
     InvalidRequest,
     InvalidImageReference,

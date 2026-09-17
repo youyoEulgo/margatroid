@@ -486,6 +486,7 @@ mod tests {
         fn append_history(
             &self,
             _turn_id: &str,
+            _source: &str,
             _message: &Message,
             _tool_schema: &[ToolDefinition],
             _usage: Option<&TokenUsage>,
