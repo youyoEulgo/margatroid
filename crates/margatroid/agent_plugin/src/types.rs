@@ -354,6 +354,8 @@ pub trait AgentMemoryStore: Send + Sync + 'static {
         usage: Option<&TokenUsage>,
     ) -> Result<(), AgentMemoryStoreError>;
 
+    fn set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError>;
+
     fn rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError>;
 
     fn read_realtime(&self) -> Result<Vec<MclMessage>, AgentMemoryStoreError>;
@@ -395,6 +397,10 @@ impl AgentMemoryHandle {
     ) -> Result<(), AgentMemoryStoreError> {
         self.inner
             .append_history(turn_id, source, message, tool_schema, usage)
+    }
+
+    pub fn set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError> {
+        self.inner.set_setting(entries)
     }
 
     pub fn rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError> {
