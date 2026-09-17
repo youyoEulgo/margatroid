@@ -126,6 +126,33 @@ impl AgentMemoryStore for AgentMemory {
         })
     }
 
+    fn set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError> {
+        let mut connection = lock_connection(self).map_err(memory_store_error)?;
+        let transaction = connection.transaction().map_err(|error| {
+            memory_store_error(MemoryError::new(
+                MemoryErrorKind::WriteFailed,
+                error.to_string(),
+            ))
+        })?;
+        let now = current_unix_milliseconds().map_err(memory_store_error)?;
+        for (key, value) in entries {
+            transaction
+                .execute(
+                    "INSERT INTO setting (key, value, updated_at_ms) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at_ms = excluded.updated_at_ms",
+                    params![key, value, now],
+                )
+                .map_err(schema_error)
+                .map_err(memory_store_error)?;
+        }
+        transaction.commit().map_err(|error| {
+            memory_store_error(MemoryError::new(
+                MemoryErrorKind::WriteFailed,
+                error.to_string(),
+            ))
+        })
+    }
+
     fn rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError> {
         let mut connection = lock_connection(self).map_err(memory_store_error)?;
         let transaction = connection.transaction().map_err(|error| {
