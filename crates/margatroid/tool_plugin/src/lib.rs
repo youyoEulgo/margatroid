@@ -116,11 +116,6 @@ impl Plugin for ToolPlugin {
             home_root: self.lua_root.clone(),
         });
         app.world_mut().insert_resource(self.lua_limits);
-        app.world_mut().insert_resource(handler::lua::LuaHttpClient(
-            reqwest::Client::builder()
-                .build()
-                .expect("Lua HTTP client could not be built"),
-        ));
         app.world_mut().insert_resource(handler::shell::ShellRoots {
             home_root: self.shell_root.clone(),
         });

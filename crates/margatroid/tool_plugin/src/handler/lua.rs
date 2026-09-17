@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -15,10 +14,9 @@ use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
 use async_runtime_plugin::{AsyncTaskError, WorldAsyncExt};
 use core_plugin::{Entity, Event, Resource, World};
-use futures_util::StreamExt;
 use margatroid_types::ResourceId;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize};
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -134,8 +132,6 @@ pub(crate) struct LuaRoots {
 }
 impl Resource for LuaRoots {}
 
-pub(crate) struct LuaHttpClient(pub(crate) reqwest::Client);
-impl Resource for LuaHttpClient {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,40 +170,14 @@ struct LuaCallContext {
 
 struct LuaExecutionHandle {
     context: LuaCallContext,
-    capabilities: LuaDirectCapabilityHandle,
     limits: LuaExecutionLimits,
 }
 
-struct LuaDirectCapabilityHandle {
-    fs: LuaFileHandle,
-    http: LuaHttpHandle,
-    json: LuaJsonHandle,
-    log: LuaLogHandle,
-    process: LuaProcessHandle,
-}
 
-struct LuaFileHandle {
-    limits: LuaExecutionLimits,
-}
 
-#[derive(Clone)]
-struct LuaHttpHandle {
-    client: reqwest::Client,
-    limits: LuaExecutionLimits,
-}
 
-struct LuaJsonHandle;
 
-struct LuaLogHandle {
-    agent_id: ResourceId,
-    turn_id: String,
-    resource_id: ResourceId,
-}
 
-#[derive(Clone)]
-struct LuaProcessHandle {
-    limits: LuaExecutionLimits,
-}
 
 struct LuaToolResponseGuard {
     locator: Option<LuaToolCallLocator>,
@@ -413,11 +383,6 @@ fn prepare_lua_tool_call(
         home_root,
         &request.resource_id,
     )?);
-    let client = world
-        .get_resource::<LuaHttpClient>()
-        .expect("LuaPlugin is installed")
-        .0
-        .clone();
     let context = LuaCallContext {
         agent_id,
         turn_id: request.turn_id.clone(),
@@ -426,29 +391,11 @@ fn prepare_lua_tool_call(
         image_root: Arc::new(agent.info.image_root.clone()),
         package_root: Arc::clone(&package_root),
     };
-    let capabilities = LuaDirectCapabilityHandle {
-        fs: LuaFileHandle {
-            limits: limits.clone(),
-        },
-        http: LuaHttpHandle {
-            client,
-            limits: limits.clone(),
-        },
-        json: LuaJsonHandle,
-        log: LuaLogHandle {
-            agent_id: context.agent_id.clone(),
-            turn_id: context.turn_id.clone(),
-            resource_id: context.resource_id.clone(),
-        },
-        process: LuaProcessHandle {
-            limits: limits.clone(),
-        },
-    };
+
     Ok((
         package_root,
         LuaExecutionHandle {
             context,
-            capabilities,
             limits,
         },
     ))
@@ -481,7 +428,6 @@ pub struct LuaToolRunRequest {
     pub project_root: PathBuf,
     pub image_root: PathBuf,
     pub limits: LuaExecutionLimits,
-    pub client: Option<reqwest::Client>,
 }
 
 pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError> {
@@ -514,7 +460,6 @@ pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolErro
         ));
     }
 
-    let package_root = Arc::new(request.package_root.clone());
     let handle = LuaExecutionHandle {
         context: LuaCallContext {
             agent_id: request.agent_id.clone(),
@@ -522,25 +467,7 @@ pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolErro
             resource_id: request.resource_id.clone(),
             project_root: Arc::new(request.project_root.clone()),
             image_root: Arc::new(request.image_root.clone()),
-            package_root: Arc::clone(&package_root),
-        },
-        capabilities: LuaDirectCapabilityHandle {
-            fs: LuaFileHandle {
-                limits: limits.clone(),
-            },
-            http: LuaHttpHandle {
-                client: request.client.clone().unwrap_or_default(),
-                limits: limits.clone(),
-            },
-            json: LuaJsonHandle,
-            log: LuaLogHandle {
-                agent_id: request.agent_id.clone(),
-                turn_id: request.turn_id.clone(),
-                resource_id: request.resource_id.clone(),
-            },
-            process: LuaProcessHandle {
-                limits: limits.clone(),
-            },
+            package_root: Arc::new(request.package_root.clone()),
         },
         limits: limits.clone(),
     };
@@ -560,6 +487,11 @@ pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolErro
         )
     })?;
     let lua_arguments = lua.to_value(&arguments).map_err(lua_tool_error)?;
+    if let Ok(entry) = lua.named_registry_value::<Table>("margatroid_entry") {
+        entry
+            .set("arguments", &lua_arguments)
+            .map_err(lua_tool_error)?;
+    }
     let result = execute
         .call_async::<String>((lua_arguments, context))
         .await
@@ -839,7 +771,6 @@ async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, Tool
         project_root: prepared.handle.context.project_root.as_ref().clone(),
         image_root: prepared.handle.context.image_root.as_ref().clone(),
         limits: prepared.handle.limits.clone(),
-        client: Some(prepared.handle.capabilities.http.client.clone()),
     };
     spawn_tool_runner(&request).await
 }
@@ -1031,14 +962,37 @@ fn install_lua_environment<'lua>(
         )
         .map_err(lua_tool_error)?;
     let context = read_only_proxy(lua, context_values)?;
-    let margatroid = lua.create_table().map_err(lua_tool_error)?;
-    handle.capabilities.fs.install(lua, &margatroid)?;
-    handle.capabilities.http.install(lua, &margatroid)?;
-    handle.capabilities.json.install(lua, &margatroid)?;
-    handle.capabilities.log.install(lua, &margatroid)?;
-    handle.capabilities.process.install(lua, &margatroid)?;
+    let entry = lua.create_table().map_err(lua_tool_error)?;
+    entry.set("version", 1).map_err(lua_tool_error)?;
+    entry.set("context", &context).map_err(lua_tool_error)?;
+    let json = lua.create_table().map_err(lua_tool_error)?;
+    json.set(
+        "encode",
+        lua.create_function(|lua, value: Value| {
+            let value = lua.from_value::<serde_json::Value>(value)?;
+            serde_json::to_string(&value).map_err(mlua::Error::external)
+        })
+        .map_err(lua_tool_error)?,
+    )
+    .map_err(lua_tool_error)?;
+    json.set(
+        "decode",
+        lua.create_function(|lua, text: String| {
+            let value: serde_json::Value =
+                serde_json::from_str(&text).map_err(mlua::Error::external)?;
+            lua.to_value(&value)
+        })
+        .map_err(lua_tool_error)?,
+    )
+    .map_err(lua_tool_error)?;
+    entry.set("json", &json).map_err(lua_tool_error)?;
+    lua.set_named_registry_value("margatroid_entry", &entry)
+        .map_err(lua_tool_error)?;
+    let entry_function = lua
+        .create_function(|lua, ()| lua.named_registry_value::<Table>("margatroid_entry"))
+        .map_err(lua_tool_error)?;
     lua.globals()
-        .set("margatroid", margatroid)
+        .set("margatroid", entry_function)
         .map_err(lua_tool_error)?;
     Ok(context)
 }
@@ -1065,206 +1019,9 @@ fn read_only_proxy(lua: &Lua, values: Table) -> Result<Table, ToolError> {
     Ok(proxy)
 }
 
-impl LuaFileHandle {
-    fn install(&self, lua: &Lua, margatroid: &Table) -> Result<(), ToolError> {
-        let fs_api = lua.create_table().map_err(lua_tool_error)?;
-        let timeout = self.limits.max_host_call_time;
-        let max_bytes = self.limits.max_output_bytes;
-        fs_api
-            .set(
-                "read_text",
-                lua.create_async_function(move |_, path: String| async move {
-                    host_timeout(timeout, async {
-                        let metadata = tokio::fs::metadata(&path).await?;
-                        if metadata.len() > max_bytes as u64 {
-                            return Err(std::io::Error::other("file exceeds the size limit"));
-                        }
-                        tokio::fs::read_to_string(path).await
-                    })
-                    .await
-                    .map_err(mlua::Error::external)
-                })
-                .map_err(lua_tool_error)?,
-            )
-            .map_err(lua_tool_error)?;
-        let timeout = self.limits.max_host_call_time;
-        let max_bytes = self.limits.max_output_bytes;
-        fs_api
-            .set(
-                "write_text",
-                lua.create_async_function(move |_, (path, content): (String, String)| async move {
-                    if content.len() > max_bytes {
-                        return Err(mlua::Error::runtime("content exceeds the size limit"));
-                    }
-                    host_timeout(timeout, tokio::fs::write(path, content))
-                        .await
-                        .map_err(mlua::Error::external)
-                })
-                .map_err(lua_tool_error)?,
-            )
-            .map_err(lua_tool_error)?;
-        let timeout = self.limits.max_host_call_time;
-        fs_api
-            .set(
-                "create_dir_all",
-                lua.create_async_function(move |_, path: String| async move {
-                    host_timeout(timeout, tokio::fs::create_dir_all(path))
-                        .await
-                        .map_err(mlua::Error::external)
-                })
-                .map_err(lua_tool_error)?,
-            )
-            .map_err(lua_tool_error)?;
-        let timeout = self.limits.max_host_call_time;
-        fs_api
-            .set(
-                "remove",
-                lua.create_async_function(move |_, path: String| async move {
-                    host_timeout(timeout, async {
-                        let metadata = tokio::fs::symlink_metadata(&path).await?;
-                        if metadata.is_dir() {
-                            tokio::fs::remove_dir_all(path).await
-                        } else {
-                            tokio::fs::remove_file(path).await
-                        }
-                    })
-                    .await
-                    .map_err(mlua::Error::external)
-                })
-                .map_err(lua_tool_error)?,
-            )
-            .map_err(lua_tool_error)?;
-        let timeout = self.limits.max_host_call_time;
-        fs_api
-            .set(
-                "rename",
-                lua.create_async_function(move |_, (from, to): (String, String)| async move {
-                    host_timeout(timeout, tokio::fs::rename(from, to))
-                        .await
-                        .map_err(mlua::Error::external)
-                })
-                .map_err(lua_tool_error)?,
-            )
-            .map_err(lua_tool_error)?;
-        let timeout = self.limits.max_host_call_time;
-        fs_api
-            .set(
-                "list",
-                lua.create_async_function(move |lua, path: String| async move {
-                    let mut entries = host_timeout(timeout, async {
-                        let mut directory = tokio::fs::read_dir(path).await?;
-                        let mut entries = Vec::new();
-                        while let Some(entry) = directory.next_entry().await? {
-                            let file_type = entry.file_type().await?;
-                            let kind = if file_type.is_file() {
-                                "file"
-                            } else if file_type.is_dir() {
-                                "directory"
-                            } else if file_type.is_symlink() {
-                                "symlink"
-                            } else {
-                                "other"
-                            };
-                            entries.push(LuaDirectoryEntry {
-                                name: entry.file_name().to_string_lossy().into_owned(),
-                                path: entry.path().to_string_lossy().into_owned(),
-                                kind: kind.to_owned(),
-                            });
-                        }
-                        Ok::<_, std::io::Error>(entries)
-                    })
-                    .await
-                    .map_err(mlua::Error::external)?;
-                    entries.sort_by(|left, right| left.name.cmp(&right.name));
-                    lua.to_value(&entries)
-                })
-                .map_err(lua_tool_error)?,
-            )
-            .map_err(lua_tool_error)?;
-        margatroid.set("fs", fs_api).map_err(lua_tool_error)
-    }
-}
 
-#[derive(Serialize)]
-struct LuaDirectoryEntry {
-    name: String,
-    path: String,
-    kind: String,
-}
 
-impl LuaProcessHandle {
-    fn install(&self, lua: &Lua, margatroid: &Table) -> Result<(), ToolError> {
-        let api = lua.create_table().map_err(lua_tool_error)?;
-        let handle = self.clone();
-        api.set(
-            "run",
-            lua.create_async_function(move |lua, options: Table| {
-                let handle = handle.clone();
-                async move {
-                    let program = options.get::<String>("program")?;
-                    let args = options
-                        .get::<Option<Vec<String>>>("args")?
-                        .unwrap_or_default();
-                    let cwd = options.get::<Option<String>>("cwd")?;
-                    if program.trim().is_empty()
-                        || program.as_bytes().contains(&0)
-                        || args.iter().any(|arg| arg.as_bytes().contains(&0))
-                        || args.iter().map(String::len).sum::<usize>()
-                            > handle.limits.max_argument_bytes
-                    {
-                        return Err(mlua::Error::runtime("process arguments are invalid"));
-                    }
-                    let mut command = Command::new(program);
-                    command.args(args).kill_on_drop(true);
-                    if let Some(cwd) = cwd {
-                        command.current_dir(cwd);
-                    }
-                    command
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped());
-                    let mut child = command.spawn().map_err(mlua::Error::external)?;
-                    let stdout = child.stdout.take().ok_or_else(|| {
-                        mlua::Error::runtime("process stdout pipe is unavailable")
-                    })?;
-                    let stderr = child.stderr.take().ok_or_else(|| {
-                        mlua::Error::runtime("process stderr pipe is unavailable")
-                    })?;
-                    let limit = handle.limits.max_output_bytes;
-                    let (status, stdout, stderr) =
-                        tokio::time::timeout(handle.limits.max_host_call_time, async {
-                            tokio::try_join!(
-                                child.wait(),
-                                read_process_output(stdout, limit),
-                                read_process_output(stderr, limit),
-                            )
-                        })
-                        .await
-                        .map_err(|_| mlua::Error::runtime("process timed out"))?
-                        .map_err(mlua::Error::external)?;
-                    lua.to_value(&LuaProcessOutput {
-                        exit_code: status.code(),
-                        stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
-                        stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
-                        stdout_truncated: stdout.truncated,
-                        stderr_truncated: stderr.truncated,
-                    })
-                }
-            })
-            .map_err(lua_tool_error)?,
-        )
-        .map_err(lua_tool_error)?;
-        margatroid.set("process", api).map_err(lua_tool_error)
-    }
-}
 
-#[derive(Serialize)]
-struct LuaProcessOutput {
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
-    stdout_truncated: bool,
-    stderr_truncated: bool,
-}
 
 struct ProcessOutputBuffer {
     bytes: Vec<u8>,
@@ -1291,185 +1048,12 @@ async fn read_process_output(
     Ok(ProcessOutputBuffer { bytes, truncated })
 }
 
-impl LuaHttpHandle {
-    fn install(&self, lua: &Lua, margatroid: &Table) -> Result<(), ToolError> {
-        let api = lua.create_table().map_err(lua_tool_error)?;
-        let handle = self.clone();
-        api.set(
-            "request",
-            lua.create_async_function(move |lua, options: Table| {
-                let handle = handle.clone();
-                async move {
-                    let method = options
-                        .get::<Option<String>>("method")?
-                        .unwrap_or_else(|| "GET".into());
-                    let url = options.get::<String>("url")?;
-                    let headers = options
-                        .get::<Option<BTreeMap<String, String>>>("headers")?
-                        .unwrap_or_default();
-                    let body = options.get::<Option<String>>("body")?;
-                    let method = reqwest::Method::from_bytes(method.as_bytes())
-                        .map_err(mlua::Error::external)?;
-                    let mut request = handle.client.request(method, url);
-                    for (name, value) in headers {
-                        request = request.header(name, value);
-                    }
-                    if let Some(body) = body {
-                        request = request.body(body);
-                    }
-                    let response =
-                        tokio::time::timeout(handle.limits.max_host_call_time, request.send())
-                            .await
-                            .map_err(|_| mlua::Error::runtime("HTTP request timed out"))?
-                            .map_err(mlua::Error::external)?;
-                    let status = response.status().as_u16();
-                    let headers = response
-                        .headers()
-                        .iter()
-                        .map(|(name, value)| {
-                            (
-                                name.to_string(),
-                                value.to_str().unwrap_or_default().to_owned(),
-                            )
-                        })
-                        .collect::<BTreeMap<_, _>>();
-                    let body =
-                        read_bounded_response(response, handle.limits.max_output_bytes).await?;
-                    lua.to_value(&LuaHttpResponse {
-                        status,
-                        headers,
-                        body,
-                    })
-                }
-            })
-            .map_err(lua_tool_error)?,
-        )
-        .map_err(lua_tool_error)?;
-        margatroid.set("http", api).map_err(lua_tool_error)
-    }
-}
 
-#[derive(Serialize)]
-struct LuaHttpResponse {
-    status: u16,
-    headers: BTreeMap<String, String>,
-    body: String,
-}
 
-impl LuaJsonHandle {
-    fn install(&self, lua: &Lua, margatroid: &Table) -> Result<(), ToolError> {
-        let api = lua.create_table().map_err(lua_tool_error)?;
-        api.set(
-            "encode",
-            lua.create_function(|lua, value: Value| {
-                let value = lua.from_value::<serde_json::Value>(value)?;
-                serde_json::to_string(&value).map_err(mlua::Error::external)
-            })
-            .map_err(lua_tool_error)?,
-        )
-        .map_err(lua_tool_error)?;
-        api.set(
-            "decode",
-            lua.create_function(|lua, source: String| {
-                let value = serde_json::from_str::<serde_json::Value>(&source)
-                    .map_err(mlua::Error::external)?;
-                lua.to_value(&value)
-            })
-            .map_err(lua_tool_error)?,
-        )
-        .map_err(lua_tool_error)?;
-        margatroid.set("json", api).map_err(lua_tool_error)
-    }
-}
 
-impl LuaLogHandle {
-    fn install(&self, lua: &Lua, margatroid: &Table) -> Result<(), ToolError> {
-        let api = lua.create_table().map_err(lua_tool_error)?;
-        install_log_function(
-            lua,
-            &api,
-            "trace",
-            self,
-            |agent, turn, resource, message| {
-                tracing::trace!(agent, turn_id = turn, resource, "{message}")
-            },
-        )?;
-        install_log_function(
-            lua,
-            &api,
-            "debug",
-            self,
-            |agent, turn, resource, message| {
-                tracing::debug!(agent, turn_id = turn, resource, "{message}")
-            },
-        )?;
-        install_log_function(lua, &api, "info", self, |agent, turn, resource, message| {
-            tracing::info!(agent, turn_id = turn, resource, "{message}")
-        })?;
-        install_log_function(lua, &api, "warn", self, |agent, turn, resource, message| {
-            tracing::warn!(agent, turn_id = turn, resource, "{message}")
-        })?;
-        install_log_function(
-            lua,
-            &api,
-            "error",
-            self,
-            |agent, turn, resource, message| {
-                tracing::error!(agent, turn_id = turn, resource, "{message}")
-            },
-        )?;
-        margatroid.set("log", api).map_err(lua_tool_error)
-    }
-}
 
-fn install_log_function<F>(
-    lua: &Lua,
-    api: &Table,
-    name: &str,
-    handle: &LuaLogHandle,
-    log: F,
-) -> Result<(), ToolError>
-where
-    F: Fn(&str, &str, &str, &str) + Send + 'static,
-{
-    let agent = handle.agent_id.to_string();
-    let turn = handle.turn_id.clone();
-    let resource = handle.resource_id.to_string();
-    api.set(
-        name,
-        lua.create_function(move |_, message: String| {
-            log(&agent, &turn, &resource, &message);
-            Ok(())
-        })
-        .map_err(lua_tool_error)?,
-    )
-    .map_err(lua_tool_error)
-}
 
-async fn read_bounded_response(
-    response: reqwest::Response,
-    limit: usize,
-) -> Result<String, mlua::Error> {
-    let mut bytes = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(mlua::Error::external)?;
-        if bytes.len().saturating_add(chunk.len()) > limit {
-            return Err(mlua::Error::runtime("HTTP response exceeds the size limit"));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    String::from_utf8(bytes).map_err(mlua::Error::external)
-}
 
-async fn host_timeout<T>(
-    timeout: Duration,
-    future: impl std::future::Future<Output = std::io::Result<T>>,
-) -> std::io::Result<T> {
-    tokio::time::timeout(timeout, future)
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "host call timed out"))?
-}
 
 fn read_bounded_sync(path: &Path, limit: usize, label: &str) -> Result<String, ToolError> {
     let file = fs::File::open(path).map_err(|_| {

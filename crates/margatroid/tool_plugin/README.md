@@ -44,3 +44,17 @@ daemon（tool_plugin） → spawn tool_runner → 请求走 stdin，结果走 st
 这是刻意的一次性形态：最终的沙箱策略是镜像里的具名资源，由 `base.lua` 用 `IMPORT` 引入、
 再用 MCL 指令启用（见设计文档 §3.1、§5.6）。到那时这个硬编码路径会连同它的校验一起删掉。
 
+## 工具里能用什么
+
+宿主在工具 VM 里只注入**一个入口函数**：
+
+```lua
+local api = margatroid()   -- { version, arguments, context, json }
+```
+
+- `arguments`：本次调用的入参（已按 input.schema.json 校验过）
+- `context`：本次轮次与工具包只读元数据（agent / turn / resource / 各层根目录）
+- `json`：`encode` / `decode`
+- 除此之外没有别的注入：读文件、跑程序、出网一律用 Lua 标准库（`io` / `os`），
+  也就是说这些动作全都发生在被沙箱包装的 runner 进程里，由策略决定能不能做
+

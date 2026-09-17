@@ -114,7 +114,6 @@ async fn main() -> ExitCode {
         project_root: request.project_root,
         image_root: request.image_root,
         limits,
-        client: None,
     })
     .await;
     match outcome {
