@@ -134,6 +134,30 @@ skill.rs skill_register_system / execute_skill_call
 hook.rs  hook_register_system / execute_hook_call
 lua.rs   lua_tool_register_system / prepare_lua_call / execute_prepared_lua_tool / lua_task_result_system
          / run_lua_tool / spawn_tool_runner / runner_failure / tool_runner_path
+         / verify_sandbox / sandbox_backend / sandbox_environment_ok
+
+SANDBOX_POLICY_PATH（常量）：临时脚手架，固定为 /tmp/margatroid-sandbox-policy.json
+    语义：文件存在 ⇒ 启用沙箱；不存在 ⇒ 无沙箱
+    说明：这是刻意的一次性形态，由镜像具名策略 + base.lua IMPORT + MCL 启用取代后删除
+
+verify_sandbox() -> Result<(), ToolError>
+    启动期校验：crate 内公开，由 ToolPlugin::open 调用
+    行为：策略文件不存在直接 Ok；存在则定位后端，跑 doctor（要求 ok 为 true）与
+          policy validate -p <路径>，任一失败即返回错误
+    边界：fail-closed 的落点——声明了策略而后端不可用就拒绝启动，不静默降级
+
+sandbox_backend() -> Option<PathBuf>
+    定位后端：环境变量 MARGATROID_SANDBOX_BACKEND → PATH 里的 landstrip → 当前可执行文件同目录
+
+sandbox_environment_ok(backend: &Path) -> Result<(), ToolError>
+    后端体检：私有函数，跑 doctor 与 policy validate，把 stderr 带进错误信息
+
+spawn_tool_runner 的沙箱分支：
+    策略文件存在时命令为 landstrip run -p <SANDBOX_POLICY_PATH> -- <tool_runner>
+    两条分支都做环境最小化：env_clear() 后只给 PATH（landstrip 不管环境变量这一轴）
+
+runner_failure 补充：stderr 里可能混入 landstrip 的拒绝事件，所以按"最后一条 kind 属于
+    ToolErrorKind 的 JSON 行"取值，trap 事件不会把错误种类带偏
 
 run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError>
     执行 Lua 工具：公开异步函数，插件进程内与 runner 进程共用同一段逻辑

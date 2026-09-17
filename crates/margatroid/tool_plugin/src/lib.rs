@@ -36,6 +36,7 @@ pub struct ToolPlugin {
 
 impl ToolPlugin {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ToolError> {
+        crate::handler::lua::verify_sandbox()?;
         let root = root.into();
         if !root.is_absolute()
             || root
