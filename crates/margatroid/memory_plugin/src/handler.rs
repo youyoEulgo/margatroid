@@ -36,11 +36,7 @@ pub(crate) fn handle_history_message_write(
     })?;
     agent
         .memory
-        .append_history(
-            &event.id,
-            &event.message,
-            &event.tool_schema,
-            event.usage.as_ref(),
+        .append_history(&event.id, &event.source, &event.message, &event.tool_schema, event.usage.as_ref(),
         )
         .map_err(handle_store_error)
 }

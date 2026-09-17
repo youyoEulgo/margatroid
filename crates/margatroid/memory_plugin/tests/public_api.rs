@@ -66,6 +66,7 @@ fn documented_public_api_composes_from_an_external_crate() {
         .add_plugin(MemoryPlugin::default());
     let agent = attach_agent(&mut app, memory);
     app.world().emit_event(AgentHistoryMessageWriteRequested {
+        source: "test".to_owned(),
         id: "turn-1".into(),
         agent,
         message: Message::User {
@@ -84,9 +85,9 @@ fn documented_public_api_composes_from_an_external_crate() {
         .history_messages()
         .unwrap();
     assert_eq!(history.len(), 1);
-    assert_eq!(history[0].turn_id, "turn-1");
+    assert_eq!(history[0].turn_id(), "turn-1");
     assert_eq!(
-        history[0].message,
+        history[0].message().unwrap(),
         Message::User {
             content: "hello".into(),
         }

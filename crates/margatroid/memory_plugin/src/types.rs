@@ -5,27 +5,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_plugin::{AgentMemoryStore, AgentMemoryStoreError, HistoryMessage};
 use margatroid_types::{MclMessage, Message, TokenUsage, ToolDefinition};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, Transaction};
 
 use crate::error::{MemoryError, MemoryErrorKind};
 
 const HISTORY_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS history_messages (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL DEFAULT 'message',
-    event TEXT,
-    turn_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    reasoning TEXT,
+    kind TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
     content TEXT,
-    tool_calls TEXT NOT NULL,
-    tool_schema TEXT NOT NULL,
-    resource_id TEXT,
-    tool_call_id TEXT,
-    input_tokens INTEGER NOT NULL DEFAULT 0,
-    output_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
-    created_at_ms INTEGER NOT NULL
+    payload TEXT,
+    source TEXT
 );
 CREATE TABLE IF NOT EXISTS realtime_context (
     position INTEGER PRIMARY KEY,
@@ -55,16 +46,6 @@ pub struct RealtimeContext {
     pub last_input_tokens: u64,
 }
 
-#[derive(Clone, Copy)]
-struct HistoryLayout {
-    has_reasoning: bool,
-    has_resource_id: bool,
-    has_tool_call_id: bool,
-    has_tool_schema: bool,
-    has_input_tokens: bool,
-    has_output_tokens: bool,
-    has_cache_hit_tokens: bool,
-}
 
 impl AgentMemory {
     pub fn open(path: impl Into<PathBuf>) -> Result<(Self, RealtimeContext), MemoryError> {
@@ -115,6 +96,7 @@ impl AgentMemoryStore for AgentMemory {
     fn append_history(
         &self,
         turn_id: &str,
+        source: &str,
         message: &Message,
         tool_schema: &[ToolDefinition],
         usage: Option<&TokenUsage>,
@@ -129,6 +111,7 @@ impl AgentMemoryStore for AgentMemory {
         insert_history_message_values(
             &transaction,
             turn_id,
+            source,
             message,
             tool_schema,
             usage,
@@ -217,34 +200,8 @@ fn lock_connection<'a>(
 }
 
 fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
-    let legacy_history = table_has_column(connection, "history_messages", "message")?;
-    let history_exists = table_exists(connection, "history_messages")?;
-    let history_has_resource_id = table_has_column(connection, "history_messages", "resource_id")?;
-    let history_has_tool_call_id =
-        table_has_column(connection, "history_messages", "tool_call_id")?;
-    let history_has_reasoning = table_has_column(connection, "history_messages", "reasoning")?;
-    let history_has_tool_schema = table_has_column(connection, "history_messages", "tool_schema")?;
-    let history_has_input_tokens =
-        table_has_column(connection, "history_messages", "input_tokens")?;
-    let history_has_output_tokens =
-        table_has_column(connection, "history_messages", "output_tokens")?;
-    let history_has_cache_hit_tokens =
-        table_has_column(connection, "history_messages", "cache_hit_tokens")?;
-    let history_layout = HistoryLayout {
-        has_reasoning: history_has_reasoning,
-        has_resource_id: history_has_resource_id,
-        has_tool_call_id: history_has_tool_call_id,
-        has_tool_schema: history_has_tool_schema,
-        has_input_tokens: history_has_input_tokens,
-        has_output_tokens: history_has_output_tokens,
-        has_cache_hit_tokens: history_has_cache_hit_tokens,
-    };
-    let legacy_history_layout = history_exists
-        && !legacy_history
-        && (!history_has_tool_schema
-            || !history_has_input_tokens
-            || !history_has_output_tokens
-            || !history_has_cache_hit_tokens);
+    let history_is_current = table_has_column(connection, "history_messages", "kind")?;
+    let stale_history = table_exists(connection, "history_messages")? && !history_is_current;
     let legacy_realtime = table_has_column(connection, "realtime_messages", "position")?
         && !table_has_column(connection, "realtime_messages", "context")?;
     let realtime_context_exists = table_exists(connection, "realtime_context")?;
@@ -257,20 +214,14 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
             "memory schema transaction failed",
         )
     })?;
-    if legacy_history {
+    if stale_history {
         transaction
-            .execute(
-                "ALTER TABLE history_messages RENAME TO history_messages_legacy",
-                [],
-            )
+            .execute("DROP TABLE history_messages", [])
             .map_err(schema_error)?;
     }
-    if legacy_history_layout {
+    for leftover in ["history_messages_legacy", "history_messages_layout_legacy"] {
         transaction
-            .execute(
-                "ALTER TABLE history_messages RENAME TO history_messages_layout_legacy",
-                [],
-            )
+            .execute(&format!("DROP TABLE IF EXISTS {leftover}"), [])
             .map_err(schema_error)?;
     }
     if legacy_realtime {
@@ -299,18 +250,6 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
                     .map_err(schema_error)?;
             }
         }
-    }
-    if legacy_history {
-        migrate_history(&transaction)?;
-        transaction
-            .execute("DROP TABLE history_messages_legacy", [])
-            .map_err(schema_error)?;
-    }
-    if legacy_history_layout {
-        migrate_history_layout(&transaction, history_layout)?;
-        transaction
-            .execute("DROP TABLE history_messages_layout_legacy", [])
-            .map_err(schema_error)?;
     }
     if legacy_realtime {
         migrate_realtime(&transaction)?;
@@ -352,81 +291,7 @@ fn table_has_column(
     Ok(false)
 }
 
-fn migrate_history(transaction: &Transaction<'_>) -> Result<(), MemoryError> {
-    let mut statement = transaction
-        .prepare(
-            "SELECT turn_id, message, created_at_ms FROM history_messages_legacy ORDER BY sequence",
-        )
-        .map_err(schema_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })
-        .map_err(schema_error)?;
-    for row in rows {
-        let (turn_id, encoded, created_at_ms) = row.map_err(schema_error)?;
-        let message = serde_json::from_str(&encoded).map_err(|_| {
-            MemoryError::new(
-                MemoryErrorKind::DecodeFailed,
-                "legacy history could not be decoded",
-            )
-        })?;
-        insert_history_message_values(transaction, &turn_id, &message, &[], None, created_at_ms)?;
-    }
-    Ok(())
-}
 
-fn migrate_history_layout(
-    transaction: &Transaction<'_>,
-    layout: HistoryLayout,
-) -> Result<(), MemoryError> {
-    let reasoning = if layout.has_reasoning {
-        "reasoning"
-    } else {
-        "NULL"
-    };
-    let resource_id = if layout.has_resource_id {
-        "resource_id"
-    } else {
-        "NULL"
-    };
-    let tool_call_id = if layout.has_tool_call_id {
-        "tool_call_id"
-    } else {
-        "NULL"
-    };
-    let tool_schema = if layout.has_tool_schema {
-        "tool_schema"
-    } else {
-        "'[]'"
-    };
-    let input_tokens = if layout.has_input_tokens {
-        "input_tokens"
-    } else {
-        "0"
-    };
-    let output_tokens = if layout.has_output_tokens {
-        "output_tokens"
-    } else {
-        "0"
-    };
-    let cache_hit_tokens = if layout.has_cache_hit_tokens {
-        "cache_hit_tokens"
-    } else {
-        "0"
-    };
-    let statement = format!(
-        "INSERT INTO history_messages (sequence, turn_id, role, reasoning, content, tool_calls, tool_schema, resource_id, tool_call_id, input_tokens, output_tokens, cache_hit_tokens, created_at_ms) \
-         SELECT sequence, turn_id, role, {reasoning}, content, tool_calls, {tool_schema}, {resource_id}, {tool_call_id}, {input_tokens}, {output_tokens}, {cache_hit_tokens}, created_at_ms \
-         FROM history_messages_layout_legacy ORDER BY sequence"
-    );
-    transaction.execute(&statement, []).map_err(schema_error)?;
-    Ok(())
-}
 
 fn migrate_realtime(transaction: &Transaction<'_>) -> Result<(), MemoryError> {
     let mut statement = transaction
@@ -483,154 +348,43 @@ fn schema_error(_: rusqlite::Error) -> MemoryError {
 
 fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>, MemoryError> {
     let mut statement = connection
-        .prepare("SELECT sequence, turn_id, role, reasoning, content, tool_calls, tool_schema, resource_id, tool_call_id, input_tokens, output_tokens, cache_hit_tokens, created_at_ms FROM history_messages ORDER BY sequence ASC")
+        .prepare("SELECT sequence, kind, created_at_ms, content, payload, source FROM history_messages ORDER BY sequence ASC")
         .map_err(read_error)?;
     let rows = statement
         .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, i64>(9)?,
-                row.get::<_, i64>(10)?,
-                row.get::<_, i64>(11)?,
-                row.get::<_, i64>(12)?,
-            ))
+            Ok(HistoryMessage {
+                sequence: row.get(0)?,
+                kind: row.get(1)?,
+                created_at_ms: row.get(2)?,
+                content: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "{}".to_owned()),
+                payload: row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "{}".to_owned()),
+                source: row.get(5)?,
+            })
         })
         .map_err(read_error)?;
-    rows.map(|row| {
-        let (
-            sequence,
-            turn_id,
-            role,
-            reasoning,
-            content,
-            calls,
-            schema,
-            resource_id,
-            call_id,
-            input_tokens,
-            output_tokens,
-            cache_hit_tokens,
-            created_at_ms,
-        ) = row.map_err(read_error)?;
-        let tool_calls = serde_json::from_str(&calls).map_err(|_| {
-            MemoryError::new(
-                MemoryErrorKind::DecodeFailed,
-                "history tool calls could not be decoded",
-            )
-        })?;
-        let tool_schema = serde_json::from_str::<Vec<ToolDefinition>>(&schema).map_err(|_| {
-            MemoryError::new(
-                MemoryErrorKind::DecodeFailed,
-                "history tool schema could not be decoded",
-            )
-        })?;
-        let message = match role.as_str() {
-            "user" if tool_schema.is_empty() => Message::User {
-                content: content.unwrap_or_default(),
-            },
-            "assistant" => Message::Assistant {
-                reasoning,
-                content,
-                tool_calls,
-            },
-            "tool" if tool_calls.is_empty() && tool_schema.is_empty() => Message::Tool {
-                resource_id: resource_id
-                    .ok_or_else(|| {
-                        MemoryError::new(
-                            MemoryErrorKind::DecodeFailed,
-                            "tool history resource ID is missing",
-                        )
-                    })?
-                    .parse()
-                    .map_err(|_| {
-                        MemoryError::new(
-                            MemoryErrorKind::DecodeFailed,
-                            "tool history resource ID is invalid",
-                        )
-                    })?,
-                tool_call_id: call_id.ok_or_else(|| {
-                    MemoryError::new(
-                        MemoryErrorKind::DecodeFailed,
-                        "tool history call ID is missing",
-                    )
-                })?,
-                content: content.unwrap_or_default(),
-            },
-            "error" if tool_calls.is_empty() && tool_schema.is_empty() => Message::Error {
-                message: content.unwrap_or_default(),
-            },
-            _ => {
-                return Err(MemoryError::new(
-                    MemoryErrorKind::DecodeFailed,
-                    "history message role is invalid",
-                ))
-            }
-        };
-        let usage = if matches!(message, Message::Assistant { .. }) {
-            Some(TokenUsage {
-                input_tokens: decode_token_count(input_tokens)?,
-                output_tokens: decode_token_count(output_tokens)?,
-                cache_hit_tokens: decode_token_count(cache_hit_tokens)?,
-            })
-        } else {
-            None
-        };
-        Ok(HistoryMessage {
-            sequence,
-            turn_id,
-            message,
-            tool_schema,
-            usage,
-            created_at_ms,
-        })
-    })
-    .collect()
+    rows.collect::<Result<Vec<_>, _>>().map_err(read_error)
 }
 
 fn load_token_usage(connection: &Connection) -> Result<TokenUsage, MemoryError> {
-    let (input_tokens, output_tokens, cache_hit_tokens) = connection
-        .query_row(
-            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_hit_tokens), 0) FROM history_messages WHERE role = 'assistant'",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
-        )
-        .map_err(read_error)?;
-    Ok(TokenUsage {
-        input_tokens: decode_token_count(input_tokens)?,
-        output_tokens: decode_token_count(output_tokens)?,
-        cache_hit_tokens: decode_token_count(cache_hit_tokens)?,
-    })
+    let mut usage = TokenUsage::default();
+    for entry in load_history_messages(connection)? {
+        if let Some(entry_usage) = entry.usage() {
+            usage.input_tokens += entry_usage.input_tokens;
+            usage.output_tokens += entry_usage.output_tokens;
+            usage.cache_hit_tokens += entry_usage.cache_hit_tokens;
+        }
+    }
+    Ok(usage)
 }
 
 fn load_last_input_tokens(connection: &Connection) -> Result<u64, MemoryError> {
-    let input_tokens = connection
-        .query_row(
-            "SELECT input_tokens FROM history_messages WHERE role = 'assistant' ORDER BY sequence DESC LIMIT 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(read_error)?
-        .unwrap_or(0);
-    decode_token_count(input_tokens)
+    Ok(load_history_messages(connection)?
+        .iter()
+        .rev()
+        .find_map(|entry| entry.usage().map(|usage| usage.input_tokens))
+        .unwrap_or_default())
 }
 
-fn decode_token_count(value: i64) -> Result<u64, MemoryError> {
-    u64::try_from(value).map_err(|_| {
-        MemoryError::new(
-            MemoryErrorKind::DecodeFailed,
-            "history token usage is negative",
-        )
-    })
-}
 
 fn load_realtime_context(connection: &Connection) -> Result<RealtimeContext, MemoryError> {
     let entries = load_ordered_realtime_messages(connection)?;
@@ -751,40 +505,52 @@ fn rewrite_realtime_context(
 fn insert_history_message_values(
     transaction: &Transaction<'_>,
     turn_id: &str,
+    source: &str,
     message: &Message,
     tool_schema: &[ToolDefinition],
     usage: Option<&TokenUsage>,
     created_at_ms: i64,
 ) -> Result<(), MemoryError> {
-    let (role, reasoning, content, tool_calls, resource_id, tool_call_id) = match message {
-        Message::User { content } => ("user", None, Some(content.clone()), Vec::new(), None, None),
+    let encode = |value: &serde_json::Value| {
+        serde_json::to_string(value).map_err(|_| {
+            MemoryError::new(
+                MemoryErrorKind::WriteFailed,
+                "history entry could not be encoded",
+            )
+        })
+    };
+    let (kind, content, mut payload) = match message {
+        Message::User { content } => (
+            "message.user",
+            serde_json::json!({ "content": content }),
+            serde_json::json!({}),
+        ),
         Message::Assistant {
             reasoning,
             content,
             tool_calls,
         } => (
-            "assistant",
-            reasoning.clone(),
-            content.clone(),
-            tool_calls.clone(),
-            None,
-            None,
+            "message.assistant",
+            serde_json::json!({ "reasoning": reasoning, "content": content }),
+            serde_json::json!({ "tool_calls": tool_calls }),
         ),
         Message::Tool {
             resource_id,
             tool_call_id,
             content,
         } => (
-            "tool",
-            None,
-            Some(content.clone()),
-            Vec::new(),
-            Some(resource_id.to_string()),
-            Some(tool_call_id.clone()),
+            "message.tool",
+            serde_json::json!({ "content": content }),
+            serde_json::json!({
+                "resource_id": resource_id.to_string(),
+                "tool_call_id": tool_call_id,
+            }),
         ),
-        Message::Error { message } => {
-            ("error", None, Some(message.clone()), Vec::new(), None, None)
-        }
+        Message::Error { message } => (
+            "message.error",
+            serde_json::json!({ "content": message }),
+            serde_json::json!({}),
+        ),
         Message::System { .. } => {
             return Err(MemoryError::new(
                 MemoryErrorKind::WriteFailed,
@@ -792,50 +558,29 @@ fn insert_history_message_values(
             ))
         }
     };
-    let encoded_calls = serde_json::to_string(&tool_calls).map_err(|_| {
-        MemoryError::new(
-            MemoryErrorKind::WriteFailed,
-            "history tool calls could not be encoded",
-        )
-    })?;
-    if !matches!(message, Message::Assistant { .. }) && !tool_schema.is_empty() {
-        return Err(MemoryError::new(
-            MemoryErrorKind::WriteFailed,
-            "only assistant history can contain a tool schema",
-        ));
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("turn_id".to_owned(), serde_json::json!(turn_id));
+        if matches!(message, Message::Assistant { .. }) {
+            object.insert(
+                "tool_schema".to_owned(),
+                serde_json::to_value(tool_schema).unwrap_or_default(),
+            );
+            if let Some(usage) = usage {
+                object.insert("input_tokens".to_owned(), serde_json::json!(usage.input_tokens));
+                object.insert("output_tokens".to_owned(), serde_json::json!(usage.output_tokens));
+                object.insert(
+                    "cache_hit_tokens".to_owned(),
+                    serde_json::json!(usage.cache_hit_tokens),
+                );
+            }
+        }
     }
-    if !matches!(message, Message::Assistant { .. }) && usage.is_some() {
-        return Err(MemoryError::new(
-            MemoryErrorKind::WriteFailed,
-            "only assistant history can contain token usage",
-        ));
-    }
-    let encoded_schema = serde_json::to_string(tool_schema).map_err(|_| {
-        MemoryError::new(
-            MemoryErrorKind::WriteFailed,
-            "history tool schema could not be encoded",
+    transaction
+        .execute(
+            "INSERT INTO history_messages (kind, created_at_ms, content, payload, source) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![kind, created_at_ms, encode(&content)?, encode(&payload)?, source],
         )
-    })?;
-    let usage = usage.cloned().unwrap_or_default();
-    let input_tokens = i64::try_from(usage.input_tokens).map_err(|_| {
-        MemoryError::new(
-            MemoryErrorKind::WriteFailed,
-            "input token usage exceeds SQLite integer range",
-        )
-    })?;
-    let output_tokens = i64::try_from(usage.output_tokens).map_err(|_| {
-        MemoryError::new(
-            MemoryErrorKind::WriteFailed,
-            "output token usage exceeds SQLite integer range",
-        )
-    })?;
-    let cache_hit_tokens = i64::try_from(usage.cache_hit_tokens).map_err(|_| {
-        MemoryError::new(
-            MemoryErrorKind::WriteFailed,
-            "cache-hit token usage exceeds SQLite integer range",
-        )
-    })?;
-    transaction.execute("INSERT INTO history_messages (turn_id, role, reasoning, content, tool_calls, tool_schema, resource_id, tool_call_id, input_tokens, output_tokens, cache_hit_tokens, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)", params![turn_id, role, reasoning, content, encoded_calls, encoded_schema, resource_id, tool_call_id, input_tokens, output_tokens, cache_hit_tokens, created_at_ms]).map_err(write_error)?;
+        .map_err(schema_error)?;
     Ok(())
 }
 

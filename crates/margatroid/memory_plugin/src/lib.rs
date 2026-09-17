@@ -72,7 +72,6 @@ mod tests {
         AgentHistoryMessageWriteRequested, AgentRealtimeContextWriteRequested, MclMessage, Message,
         ResourceId, TokenUsage, ToolDefinition,
     };
-    use rusqlite::Connection;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -211,6 +210,7 @@ mod tests {
                 Vec::new()
             };
             app.world().emit_event(AgentHistoryMessageWriteRequested {
+                source: "test".to_owned(),
                 id: "turn-1".into(),
                 agent,
                 message,
@@ -227,24 +227,30 @@ mod tests {
         let memory = app.world().get_component::<Agent>(agent).unwrap();
         let history = memory.memory.history_messages().unwrap();
         assert_eq!(history.len(), 3);
-        assert!(matches!(history[0].message, Message::User { .. }));
-        assert_eq!(history[0].usage, None);
-        assert_eq!(history[1].usage.as_ref().unwrap().input_tokens, 120);
-        assert_eq!(history[1].usage.as_ref().unwrap().output_tokens, 30);
-        assert_eq!(history[1].usage.as_ref().unwrap().cache_hit_tokens, 80);
-        assert_eq!(history[2].usage, None);
+        assert!(matches!(
+            history[0].message().unwrap(),
+            Message::User { .. }
+        ));
+        assert_eq!(history[0].usage(), None);
+        assert_eq!(history[1].usage().as_ref().unwrap().input_tokens, 120);
+        assert_eq!(history[1].usage().as_ref().unwrap().output_tokens, 30);
+        assert_eq!(history[1].usage().as_ref().unwrap().cache_hit_tokens, 80);
+        assert_eq!(history[2].usage(), None);
 
         assert!(matches!(
-            &history[1].message,
+            &history[1].message().unwrap(),
             Message::Assistant {
                 reasoning: Some(reasoning),
                 ..
             } if reasoning == "checking"
         ));
-        assert!(matches!(history[2].message, Message::Tool { .. }));
-        assert!(history[0].tool_schema.is_empty());
-        assert_eq!(history[1].tool_schema[0].name, "tool0_read");
-        assert!(history[2].tool_schema.is_empty());
+        assert!(matches!(
+            history[2].message().unwrap(),
+            Message::Tool { .. }
+        ));
+        assert!(history[0].tool_schema().is_empty());
+        assert_eq!(history[1].tool_schema()[0].name, "tool0_read");
+        assert!(history[2].tool_schema().is_empty());
 
         drop(app);
         let (_, restored) = AgentMemory::open(&path).unwrap();
@@ -297,120 +303,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn open_migrates_the_previous_message_schema() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("memory.sql");
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE history_messages (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    turn_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    resources TEXT NOT NULL DEFAULT '[]',
-                    created_at_ms INTEGER NOT NULL
-                );
-                CREATE TABLE realtime_messages (
-                    position INTEGER PRIMARY KEY,
-                    message TEXT NOT NULL
-                );",
-            )
-            .unwrap();
-        let message = r#"{"User":{"content":"legacy"}}"#;
-        connection
-            .execute(
-                "INSERT INTO history_messages (turn_id, role, message, created_at_ms) VALUES ('turn-1', 'user', ?1, 1)",
-                [message],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO realtime_messages (position, message) VALUES (0, ?1)",
-                [message],
-            )
-            .unwrap();
-        drop(connection);
 
-        let (memory, context) = AgentMemory::open(&path).unwrap();
-        assert_eq!(context.messages.len(), 1);
-        assert!(context.tool_context.is_empty());
-        assert_eq!(memory.history_messages().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn open_rebuilds_the_split_history_schema_in_canonical_order() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("memory.sql");
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                r#"CREATE TABLE history_messages (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    turn_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT,
-                    tool_calls TEXT NOT NULL,
-                    resource_id TEXT,
-                    tool_call_id TEXT,
-                    created_at_ms INTEGER NOT NULL,
-                    reasoning TEXT,
-                    tool_schema TEXT NOT NULL
-                );
-                CREATE TABLE realtime_messages (
-                    context TEXT NOT NULL,
-                    position INTEGER NOT NULL,
-                    message TEXT NOT NULL,
-                    PRIMARY KEY (context, position)
-                );
-                INSERT INTO history_messages
-                    (turn_id, role, content, tool_calls, created_at_ms, reasoning, tool_schema)
-                    VALUES (
-                        'turn-1',
-                        'assistant',
-                        'legacy answer',
-                        '[]',
-                        1,
-                        'legacy thought',
-                        '[{"name":"tool0_read","description":"Read a file.","input_schema":{"type":"object"}}]'
-                    );"#,
-            )
-            .unwrap();
-        drop(connection);
-
-        let (memory, _) = AgentMemory::open(&path).unwrap();
-        let history = memory.history_messages().unwrap();
-
-        assert!(matches!(
-            &history[0].message,
-            Message::Assistant {
-                reasoning: Some(reasoning),
-                content: Some(content),
-                ..
-            } if reasoning == "legacy thought" && content == "legacy answer"
-        ));
-        assert_eq!(history[0].tool_schema[0].name, "tool0_read");
-        assert_eq!(history[0].usage, Some(TokenUsage::default()));
-
-        let connection = Connection::open(&path).unwrap();
-        let mut statement = connection
-            .prepare("PRAGMA table_info(history_messages)")
-            .unwrap();
-        let columns = statement
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(
-            columns,
-            [
-                "sequence", "kind", "event", "turn_id", "role", "reasoning", "content", "tool_calls",
-                "tool_schema", "resource_id", "tool_call_id", "input_tokens", "output_tokens",
-                "cache_hit_tokens", "created_at_ms"
-            ]
-        );
-    }
 
     #[test]
     fn memory_requires_runtime_schedule() {
