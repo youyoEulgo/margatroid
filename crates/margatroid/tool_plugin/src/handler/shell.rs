@@ -112,11 +112,6 @@ impl fmt::Display for ShellError {
 impl std::error::Error for ShellError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ShellRoots {
-    pub(crate) home_root: Arc<PathBuf>,
-}
-impl Resource for ShellRoots {}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ShellMetadata {
@@ -259,17 +254,12 @@ fn register_shell_resource(
             "agent tool environment is missing",
         )
     })?;
-    let roots = &world
-        .get_resource::<ShellRoots>()
-        .expect("ShellPlugin is installed")
-        .home_root;
     let limits = world
         .get_resource::<ShellExecutionLimits>()
         .expect("ShellPlugin is installed");
     let package_root = find_shell_package(
         &agent.info.project_root,
         &agent.info.image_root,
-        roots,
         &request.resource_id,
     )?;
     let metadata = read_bounded_sync(
@@ -347,14 +337,9 @@ fn prepare_shell_tool_call(
             "agent tool environment is missing",
         )
     })?;
-    let roots = &world
-        .get_resource::<ShellRoots>()
-        .expect("ShellPlugin is installed")
-        .home_root;
     let package_root = Arc::new(find_shell_package(
         &agent.info.project_root,
         &agent.info.image_root,
-        roots,
         &request.resource_id,
     )?);
     Ok((
@@ -568,14 +553,12 @@ pub(crate) fn shell_task_result_system(world: &mut World) {
 fn find_shell_package(
     project_root: &Path,
     image_root: &Path,
-    home_root: &Path,
     resource_id: &ResourceId,
 ) -> Result<PathBuf, ToolError> {
     validate_shell_resource(resource_id)?;
     let roots = [
         project_root.join(".margatroid").join("shells"),
         image_root.join("shells"),
-        home_root.to_path_buf(),
     ];
     for root in roots {
         let package = root

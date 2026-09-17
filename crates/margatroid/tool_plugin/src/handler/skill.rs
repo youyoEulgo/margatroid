@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use crate::{
     candidate_resource_entry, ToolCallRequest, ToolError, ToolErrorKind, ToolRegisterRequest,
@@ -8,7 +7,7 @@ use crate::{
 };
 use agent_plugin::Agent;
 use app_runtime_plugin::WorldEventExt;
-use core_plugin::{Resource, World};
+use core_plugin::World;
 use margatroid_types::ResourceId;
 use serde::Deserialize;
 use serde_json::json;
@@ -28,11 +27,6 @@ struct SkillDocument {
     metadata: SkillMetadata,
     body: String,
 }
-pub(crate) struct SkillRoots {
-    pub(crate) home_root: Arc<PathBuf>,
-}
-impl Resource for SkillRoots {}
-
 pub(crate) fn skill_register_system(world: &mut World) {
     let requests = world
         .event_reader::<ToolRegisterRequest>()
@@ -51,13 +45,9 @@ pub(crate) fn skill_register_system(world: &mut World) {
             })
             .and_then(|agent| {
                 validate_skill_resource(&request.resource_id)?;
-                let roots = world
-                    .get_resource::<SkillRoots>()
-                    .expect("SkillPlugin is installed");
                 let path = find_skill_file(
                     &agent.info.project_root,
                     &agent.info.image_root,
-                    &roots.home_root,
                     &request.resource_id,
                 )?;
                 let document = read_skill_document(&path)?;
@@ -96,13 +86,9 @@ pub(crate) fn execute_skill_call(
         )
     })?;
     validate_skill_resource(&request.resource_id)?;
-    let roots = world
-        .get_resource::<SkillRoots>()
-        .expect("SkillPlugin is installed");
     let path = find_skill_file(
         &agent.info.project_root,
         &agent.info.image_root,
-        &roots.home_root,
         &request.resource_id,
     )?;
     serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&request.arguments)
@@ -159,13 +145,11 @@ fn read_skill_document(path: &Path) -> Result<SkillDocument, ToolError> {
 fn find_skill_file(
     project_root: &Path,
     image_root: &Path,
-    home_root: &Path,
     resource: &ResourceId,
 ) -> Result<PathBuf, ToolError> {
     let candidates = [
         project_root.join(".margatroid").join("skills"),
         image_root.join("skills"),
-        home_root.to_path_buf(),
     ];
     for root in candidates {
         let package = root

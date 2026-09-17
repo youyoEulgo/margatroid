@@ -127,11 +127,6 @@ impl fmt::Display for LuaError {
 impl std::error::Error for LuaError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LuaRoots {
-    pub(crate) home_root: Arc<PathBuf>,
-}
-impl Resource for LuaRoots {}
-
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -290,17 +285,12 @@ fn register_lua_tool(
             "agent tool environment is missing",
         )
     })?;
-    let home_root = &world
-        .get_resource::<LuaRoots>()
-        .expect("LuaPlugin is installed")
-        .home_root;
     let limits = world
         .get_resource::<LuaExecutionLimits>()
         .expect("LuaPlugin is installed");
     let package = find_lua_tool_package(
         &agent.info.project_root,
         &agent.info.image_root,
-        home_root,
         &request.resource_id,
     )?;
     let metadata = read_bounded_sync(
@@ -373,14 +363,9 @@ fn prepare_lua_tool_call(
                 "Agent resource id is missing",
             )
         })?;
-    let home_root = &world
-        .get_resource::<LuaRoots>()
-        .expect("LuaPlugin is installed")
-        .home_root;
     let package_root = Arc::new(find_lua_tool_package(
         &agent.info.project_root,
         &agent.info.image_root,
-        home_root,
         &request.resource_id,
     )?);
     let context = LuaCallContext {
@@ -786,7 +771,6 @@ pub(crate) fn lua_task_result_system(world: &mut World) {
 fn find_lua_tool_package(
     project_root: &Path,
     image_root: &Path,
-    home_root: &Path,
     resource_id: &ResourceId,
 ) -> Result<PathBuf, ToolError> {
     if resource_id.resource_type() != "tool" {
@@ -798,7 +782,6 @@ fn find_lua_tool_package(
     let roots = [
         project_root.join(".margatroid").join("tools"),
         image_root.join("tools"),
-        home_root.to_path_buf(),
     ];
     for root in roots {
         let package = root
