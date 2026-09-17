@@ -470,6 +470,9 @@ pub fn mcl_domain_system(world: &mut World) {
                     effect: crate::MclEffectCommand::RealtimeSource { ref_block_id },
                 } => crate::realtime_source(world, &request.agent_id, ref_block_id),
                 MclOperation::Emit {
+                    effect: crate::MclEffectCommand::SettingSource { ref_block_id },
+                } => crate::setting_source(world, &request.agent_id, ref_block_id),
+                MclOperation::Emit {
                     effect: crate::MclEffectCommand::Start,
                 } => Err(MclError::EffectInvalid),
                 MclOperation::Emit {

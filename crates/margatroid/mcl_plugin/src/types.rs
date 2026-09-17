@@ -180,6 +180,7 @@ pub enum MclEffectCommand {
     Finish,
     HistoryAppend { message: MclMessage },
     RealtimeSource { ref_block_id: String },
+    SettingSource { ref_block_id: String },
     VisibilitySource { source: BlockPath },
     DefaultVisibilitySource { source: BlockPath },
     RealtimeLoad,
@@ -267,6 +268,9 @@ pub enum MclEffect {
     RealtimeSource {
         source: MclRealtimeSource,
         values: Vec<MclMessage>,
+    },
+    SettingSource {
+        values: Vec<ResourceId>,
     },
     RealtimeLoad,
 }

@@ -290,6 +290,14 @@ fn parse_effect(
                 },
             })
         }
+        ("setting_source", 4) => {
+            reject_binding(binding)?;
+            Ok(MclOperation::Emit {
+                effect: MclEffectCommand::SettingSource {
+                    ref_block_id: effect_ref_block(words[3])?,
+                },
+            })
+        }
         ("inference", 4) => {
             reject_binding(binding)?;
             Ok(MclOperation::Emit {
@@ -994,6 +1002,50 @@ pub fn history_append(
     });
     Ok(MclDomainValue::Unit)
 }
+pub fn setting_source(
+    world: &mut World,
+    agent_id: &ResourceId,
+    ref_block_id: String,
+) -> Result<MclDomainValue, MclError> {
+    let entity = world
+        .entity_by_resource_id(agent_id)
+        .map_err(|_| MclError::AgentMissing)?;
+    {
+        let state = world
+            .get_component_mut::<Agent>(entity)
+            .ok_or(MclError::AgentMissing)?;
+        let block = state
+            .mcl
+            .ref_blocks()
+            .blocks
+            .get(&ref_block_id)
+            .ok_or(MclError::RefBlockMissing {
+                assembly: "agent".into(),
+                block: ref_block_id.clone(),
+            })?;
+        if block
+            .merges
+            .values()
+            .any(|merge| !matches!(merge, margatroid_types::RefMerge::ResourceId(_)))
+        {
+            return Err(MclError::TypeMismatch);
+        }
+        let paths = block
+            .merges
+            .values()
+            .flat_map(|merge| match merge {
+                margatroid_types::RefMerge::ResourceId(paths) => paths.clone(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return Err(MclError::TypeMismatch);
+        }
+        state.resources.setting_sources = paths;
+    }
+    Ok(MclDomainValue::Unit)
+}
+
 pub fn realtime_load(world: &mut World, agent_id: &ResourceId) -> Result<MclDomainValue, MclError> {
     let entity = world
         .entity_by_resource_id(agent_id)

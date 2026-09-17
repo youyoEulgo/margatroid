@@ -180,6 +180,7 @@ pub struct AgentResourceMap {
     pub default_visible: BTreeSet<ResourceId>,
     pub visible_source: Option<BlockPath>,
     pub default_visible_source: Option<BlockPath>,
+    pub setting_sources: Vec<BlockPath>,
     pub tool_entries: Vec<AgentResourceEntry>,
 }
 
