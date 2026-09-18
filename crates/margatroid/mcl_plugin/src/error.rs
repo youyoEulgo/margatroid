@@ -25,7 +25,6 @@ pub enum MclError {
     MailboxFailed,
     InferenceFailed,
     ToolCallInvalid,
-    RealtimeReadFailed,
     EffectInvalid,
     SourceReadFailed,
     InvalidResourceId,

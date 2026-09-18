@@ -10,12 +10,9 @@ use core_plugin::{App, Plugin, Resource};
 pub use agent_plugin::HistoryMessage;
 pub use error::{MemoryError, MemoryErrorKind};
 pub use events::AgentMemoryWriteFailed;
-pub use types::{AgentMemory, RealtimeContext};
+pub use types::AgentMemory;
 
-use crate::system::{
-    read_realtime_context_system, sync_history_messages_system, sync_realtime_context_system,
-    sync_history_records_system, sync_settings_system,
-};
+use crate::system::{sync_history_messages_system, sync_history_records_system, sync_settings_system};
 
 pub struct MemoryPlugin {
     schedule: String,
@@ -55,8 +52,6 @@ impl Plugin for MemoryPlugin {
 
         app.world_mut().insert_resource(MemoryPluginInstalled);
         app.add_system(&self.schedule, sync_history_messages_system)
-            .add_system(&self.schedule, read_realtime_context_system)
-            .add_system(&self.schedule, sync_realtime_context_system)
             .add_system(&self.schedule, sync_settings_system)
             .add_system(&self.schedule, sync_history_records_system);
     }
@@ -72,7 +67,7 @@ mod tests {
     use app_runtime_plugin::RuntimePlugin;
     use core_plugin::{App, Entity, World};
     use margatroid_types::{
-        AgentHistoryMessageWriteRequested, AgentRealtimeContextWriteRequested, MclMessage, Message,
+        AgentHistoryMessageWriteRequested, Message,
         ResourceId, TokenUsage, ToolDefinition,
     };
     use std::sync::Arc;
@@ -132,57 +127,10 @@ mod tests {
     }
 
     #[test]
-    fn open_creates_schema_and_restores_realtime_messages() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("memory.sql");
-        let (memory, _) = AgentMemory::open(&path).unwrap();
-        let mut app = test_app();
-        let context = RealtimeContext {
-            messages: vec![Message::User {
-                content: "restored".into(),
-            }],
-            tool_context: vec![Message::Tool {
-                resource_id: ResourceId::parse("tool:local/test:latest").unwrap(),
-                tool_call_id: "call-1".into(),
-                content: "tool output".into(),
-            }],
-            ordered_messages: vec![
-                Message::User {
-                    content: "restored".into(),
-                },
-                Message::Tool {
-                    resource_id: ResourceId::parse("tool:local/test:latest").unwrap(),
-                    tool_call_id: "call-1".into(),
-                    content: "tool output".into(),
-                },
-            ],
-            token_usage: TokenUsage::default(),
-            last_input_tokens: 0,
-        };
-        let agent = attach_agent(app.world_mut(), memory);
-        app.world().emit_event(AgentRealtimeContextWriteRequested {
-            agent,
-            messages: context
-                .ordered_messages
-                .iter()
-                .cloned()
-                .map(|message| MclMessage {
-                    message,
-                    usage: None,
-                })
-                .collect(),
-        });
-        app.tick();
-
-        let (_, restored) = AgentMemory::open(&path).unwrap();
-        assert_eq!(restored, context);
-    }
-
-    #[test]
     fn history_events_store_user_assistant_and_tool_messages() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("memory.sql");
-        let (memory, _) = AgentMemory::open(&path).unwrap();
+        let memory = AgentMemory::open(&path).unwrap();
         let mut app = test_app();
         let agent = attach_agent(app.world_mut(), memory);
         for (index, message) in [
@@ -256,63 +204,10 @@ mod tests {
         assert!(history[2].tool_schema().is_empty());
 
         drop(app);
-        let (_, restored) = AgentMemory::open(&path).unwrap();
-        assert_eq!(
-            restored.token_usage,
-            TokenUsage {
-                input_tokens: 120,
-                output_tokens: 30,
-                cache_hit_tokens: 80,
-            }
-        );
-        assert_eq!(restored.last_input_tokens, 120);
-    }
-
-    #[test]
-    fn realtime_effect_replaces_the_previous_snapshot() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("memory.sql");
-        let (memory, _) = AgentMemory::open(&path).unwrap();
-        let mut app = test_app();
-        let agent = attach_agent(app.world_mut(), memory);
-        app.world().emit_event(AgentRealtimeContextWriteRequested {
-            agent,
-            messages: vec![MclMessage {
-                message: Message::User {
-                    content: "keep".into(),
-                },
-                usage: None,
-            }],
-        });
-        app.tick();
-        app.world().emit_event(AgentRealtimeContextWriteRequested {
-            agent,
-            messages: vec![MclMessage {
-                message: Message::User {
-                    content: "new".into(),
-                },
-                usage: None,
-            }],
-        });
-
-        app.tick();
-
-        let (_, restored) = AgentMemory::open(&path).unwrap();
-        assert_eq!(
-            restored.ordered_messages,
-            vec![Message::User {
-                content: "new".into()
-            }]
-        );
+        let restored = AgentMemory::open(&path).unwrap();
+        let history = restored.history_messages().unwrap();
+        assert_eq!(history[1].usage().unwrap().input_tokens, 120);
     }
 
 
-
-    #[test]
-    fn memory_requires_runtime_schedule() {
-        let result = std::panic::catch_unwind(|| {
-            App::new().add_plugin(MemoryPlugin::default());
-        });
-        assert!(result.is_err());
-    }
 }

@@ -659,7 +659,7 @@ mod tests {
                         .expect("call log is not poisoned")
                         .push(command.clone());
                     match command.trim() {
-                        "EMIT EFFECT realtime_load" | "SELECT recent_conversation FROM msg" => {
+                        "GET msg.recent_conversation" | "GET req.ctx" => {
                             Ok(MlValue::Table(lua.create_table()?))
                         }
                         "EMIT EFFECT start" => {
@@ -685,10 +685,9 @@ mod tests {
         let expected = [
             "IMPORT prompt:system/soul:latest AS soul",
             "IMPORT prompt:user/compact:latest AS compact",
-            "INJECT soul TO system_prompt FROM msg",
-            "EMIT EFFECT realtime_load",
+            "INJECT soul TO msg.system_prompt",
             "EMIT EFFECT start",
-            "INJECT ? TO recent_conversation FROM msg",
+            "INJECT ? TO msg.recent_conversation",
             "EMIT EFFECT history_append",
             "EMIT EFFECT finish",
         ];

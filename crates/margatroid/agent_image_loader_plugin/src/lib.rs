@@ -185,7 +185,7 @@ id = "tool:local/list-directory:latest"
         fs::write(image.join("SOUL.md"), soul).unwrap();
         fs::write(
             image.join("base.lua"),
-            "mcl_command(\"IMPORT skill:local/code-review:latest AS review\")\nmcl_command(\"IMPORT tool:local/list-directory:latest AS list_dir\")\nmcl_command(\"INJECT review, list_dir TO tool_default FROM tool\")\nmcl_command(\"INJECT SELECT tool_default FROM tool COVER tool_dynamic FROM tool\")\n",
+            "mcl_command(\"IMPORT skill:local/code-review:latest AS review\")\nmcl_command(\"IMPORT tool:local/list-directory:latest AS list_dir\")\nmcl_command(\"INJECT review, list_dir TO tool.tool_default\")\nmcl_command(\"INJECT tool.tool_default TO tool.tool_dynamic\")\n",
         )
         .unwrap();
     }

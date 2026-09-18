@@ -1,5 +1,5 @@
 use agent_plugin::{AgentCreateReply, AgentMcl, AgentTurnState, TokenUsageState};
-use margatroid_types::{Block, BlockInner, BlockPath, MclDeleteSelection, RefBlock, TokenUsage};
+use margatroid_types::{Block, BlockInner, BlockPath, RefBlock, TokenUsage};
 
 fn message_path() -> BlockPath {
     BlockPath {
@@ -56,9 +56,7 @@ fn agent_mcl_delete_is_atomic_when_an_index_is_invalid() {
         inner_id: "tools".to_owned(),
     };
 
-    assert!(mcl
-        .delete(&path, MclDeleteSelection::Indices(vec![0, 4]))
-        .is_err());
+    assert!(mcl.delete(&path, vec![0, 4]).is_err());
     assert_eq!(mcl.select(&path).unwrap().len(), 2);
 }
 

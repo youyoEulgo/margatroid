@@ -272,7 +272,7 @@ pub(crate) fn collect_agent_image_system(world: &mut World) {
                 .join(&definition.name)
                 .join("memory.sql")
         });
-        let Ok((memory, context)) = AgentMemory::open(memory_path) else {
+        let Ok(memory) = AgentMemory::open(memory_path) else {
             tracing::error!(workspace = %workspace_name, agent = %name, "agent memory could not be opened");
             if let Some(value) = world.get_component_mut::<Workspace>(workspace) {
                 value.states.insert(
@@ -313,7 +313,7 @@ pub(crate) fn collect_agent_image_system(world: &mut World) {
             home_root: configuration.definition().project_root.clone(),
             model,
             memory: AgentMemoryHandle::new(Arc::new(memory)),
-            token_usage: context.token_usage,
+            token_usage: Default::default(),
             image_dependencies: Arc::from(
                 image_data
                     .dependencies()

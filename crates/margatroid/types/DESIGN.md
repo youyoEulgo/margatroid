@@ -5,7 +5,7 @@
 ```text
 Agent以及其内嵌的AgentInfo、AgentCreationState、AgentLuaState、AgentMcl、AgentResourceMap、AgentMemoryHandle、AgentMemoryStore、AgentMemoryStoreError、AgentInferenceState、AgentToolState、AgentTurnState和TokenUsageState均定义在agent_plugin，对应agent_plugin/DESIGN.md的lib和types板块。
 AgentPlugin负责创建Entity并分别挂载ResourceId和唯一Agent组件；Agent组件的存在本身表明该Entity是Agent。其他领域Plugin通过agent_plugin公开的Agent组件读取或修改自己负责的数据，不再为同一Agent挂载第二份状态Component。
-MCL的纯值类型MclMessage、MclRealtimeSource、Block、BlockAssembly、RefMerge、RefBlock和RefBlockAssembly以及LuaVmId定义在types crate，由对应Plugin重新导出；它们不持有Agent生命周期或领域入口。
+MCL的纯值类型MclMessage、Block、BlockAssembly、RefMerge、RefBlock和RefBlockAssembly以及LuaVmId定义在types crate，由对应Plugin重新导出；它们不持有Agent生命周期或领域入口。
 ResourceId及其World查询扩展实际定义在ResourceIdPlugin；types crate中的共享结构只引用ResourceId，不拥有其实现。
 types crate只定义数据结构、局部数据方法和AgentMemoryStore这类依赖反转接口，不包含System、事件路由或数据库、推理、工具、Lua VM的具体实现。
 ```
@@ -14,7 +14,7 @@ types crate只定义数据结构、局部数据方法和AgentMemoryStore这类�
 
 ```text
 resource_id_plugin是身份基础crate，只依赖core_plugin；ResourceId、ResourceIdError、ResourceIdLookupError和WorldResourceIdExt只在该crate定义。
-types依赖resource_id_plugin并持有跨领域纯值：Block、RefBlock、MclMessage、MclRealtimeSource、LuaVmId、AgentError、ToolError和StopReason。
+types依赖resource_id_plugin并持有跨领域纯值：Block、RefBlock、MclMessage、LuaVmId、AgentError、ToolError和StopReason。
 agent_plugin拥有唯一Agent聚合根及其内嵌状态；mcl_plugin、memory_plugin、tool_plugin和inference_plugin依赖agent_plugin访问该聚合根，并分别实现自己的System、Provider和领域事件。
 types不得依赖任何业务Plugin；Agent的业务聚合状态统一由Agent组件持有，其他Plugin不得为同一个Agent重复挂载第二份资源映射、工具状态或生命周期状态Component。
 AgentMcl的机械Block方法统一返回AgentError；各领域Plugin在边界处把AgentError转换为自己的错误类型。
@@ -369,9 +369,9 @@ Workspace定义：
     Base Lua通过MCL HistoryAppend Effect
         -> 发送AgentHistoryMessageWriteRequested
         -> MCL conversation保存完整Tool正文
-    MCL realtime_source声明或其依赖字段修改
-        -> MemoryPlugin定义的AgentRealtimeContextWriteRequested携带完整MclMessage快照
-    MemoryPlugin通过事件执行持久化，并从Agent.memory取得目标存储句柄；不维护第二份Agent内存状态
+    MCL driver 修改已绑定的 state Block
+        -> MCL 序列化完整 Block 并通过 AgentMemoryHandle 写入 setting 表
+    MemoryPlugin通过通用 state 存储执行持久化，并从Agent.memory取得目标存储句柄；不维护第二份Agent内存状态
 ```
 
 ## 持有关系

@@ -625,14 +625,20 @@ fn parse_default_visibility(
     let Some(inject) = source
         .lines()
         .map(str::trim)
-        .find(|line| line.contains("INJECT") && line.contains("TO tool_default"))
+        .find(|line| line.contains("INJECT") && (line.contains("TO tool_default") || line.contains("TO tool.tool_default")))
     else {
         return Ok(BTreeSet::new());
     };
     let names = inject
         .split("INJECT")
         .nth(1)
-        .and_then(|value| value.split("TO tool_default").next())
+        .and_then(|value| {
+            if value.contains("TO tool_default") {
+                value.split("TO tool_default").next()
+            } else {
+                value.split("TO tool.tool_default").next()
+            }
+        })
         .unwrap_or_default();
     let mut result = BTreeSet::new();
     for alias in names.split(',').map(str::trim) {

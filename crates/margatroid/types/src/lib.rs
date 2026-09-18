@@ -414,16 +414,6 @@ pub struct AgentHistoryRecordWriteRequested {
 
 impl Event for AgentHistoryRecordWriteRequested {}
 
-/// Requests a complete replacement of the persisted MCL realtime-context
-/// snapshot. The source block is selected explicitly by the Base Driver.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentRealtimeContextWriteRequested {
-    pub agent: Entity,
-    pub messages: Vec<MclMessage>,
-}
-
-impl Event for AgentRealtimeContextWriteRequested {}
-
 /// Requests that the live configuration be persisted. One entry per declared
 /// source field; `key` is the block path and `value` is its serialised content.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -440,26 +430,6 @@ pub struct AgentSettingWriteRequested {
 
 impl Event for AgentSettingWriteRequested {}
 
-
-/// A synchronous MCL effect asks MemoryPlugin to return the persisted
-/// realtime snapshot. The reply stays at the MCL boundary; it is never an
-/// implicit Agent creation input.
-#[derive(Clone, Debug)]
-pub struct AgentRealtimeContextReadRequested {
-    pub id: String,
-    pub agent: Entity,
-}
-
-impl Event for AgentRealtimeContextReadRequested {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentRealtimeContextReadCompleted {
-    pub id: String,
-    pub agent: Entity,
-    pub result: Result<Vec<MclMessage>, String>,
-}
-
-impl Event for AgentRealtimeContextReadCompleted {}
 
 // The following data types are deliberately free of plugin-specific behavior.
 // Domain plugins store and mutate them through the narrow methods below.
@@ -491,17 +461,15 @@ impl MclMessage {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockInner {
     Message(Vec<MclMessage>),
-    ToolCall(Vec<ToolCall>),
     ResourceId(Vec<ResourceId>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InnerType {
     Message,
-    ToolCall,
     ResourceId,
 }
 
@@ -509,14 +477,12 @@ impl BlockInner {
     pub fn inner_type(&self) -> InnerType {
         match self {
             Self::Message(_) => InnerType::Message,
-            Self::ToolCall(_) => InnerType::ToolCall,
             Self::ResourceId(_) => InnerType::ResourceId,
         }
     }
     pub fn len(&self) -> usize {
         match self {
             Self::Message(v) => v.len(),
-            Self::ToolCall(v) => v.len(),
             Self::ResourceId(v) => v.len(),
         }
     }
@@ -525,46 +491,43 @@ impl BlockInner {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlockPath {
     pub block_id: String,
     pub inner_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Block {
     pub inners: HashMap<String, BlockInner>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BlockAssembly {
     pub blocks: HashMap<String, Block>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefMerge {
     Message(Vec<BlockPath>),
-    ToolCall(Vec<BlockPath>),
     ResourceId(Vec<BlockPath>),
 }
 
 impl RefMerge {
     pub fn paths(&self) -> &[BlockPath] {
         match self {
-            Self::Message(v) | Self::ToolCall(v) | Self::ResourceId(v) => v,
+            Self::Message(v) | Self::ResourceId(v) => v,
         }
     }
     pub fn inner_type(&self) -> InnerType {
         match self {
             Self::Message(_) => InnerType::Message,
-            Self::ToolCall(_) => InnerType::ToolCall,
             Self::ResourceId(_) => InnerType::ResourceId,
         }
     }
     pub fn iter(&self, blocks: &BlockAssembly) -> Result<BlockInner, AgentError> {
         let mut out = match self {
             Self::Message(_) => BlockInner::Message(Vec::new()),
-            Self::ToolCall(_) => BlockInner::ToolCall(Vec::new()),
             Self::ResourceId(_) => BlockInner::ResourceId(Vec::new()),
         };
         for path in self.paths() {
@@ -584,9 +547,6 @@ impl RefMerge {
             }
             match (&mut out, value) {
                 (BlockInner::Message(dst), BlockInner::Message(src)) => {
-                    dst.extend(src.iter().cloned())
-                }
-                (BlockInner::ToolCall(dst), BlockInner::ToolCall(src)) => {
                     dst.extend(src.iter().cloned())
                 }
                 (BlockInner::ResourceId(dst), BlockInner::ResourceId(src)) => {
@@ -612,20 +572,6 @@ pub struct RefBlock {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RefBlockAssembly {
     pub blocks: HashMap<String, RefBlock>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MclDeleteSelection {
-    All,
-    First,
-    Indices(Vec<usize>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MclRealtimeSource {
-    pub ref_block_id: String,
-    pub message_merge_id: String,
-    pub dependencies: Vec<BlockPath>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

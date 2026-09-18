@@ -50,7 +50,7 @@ system 放 System、Plugin、Lua 环境、等待型 Effect 处理函数。System
 
 ## handler
 
-handler 放命令解析函数和直接操作处理函数。直接操作指不进入 MclDomainRequest 的 Block、REF_MERGE、INJECT、SELECT、DELETE 等命令。
+handler 放命令解析函数和直接操作处理函数。直接操作指不进入 MclDomainRequest 的 Block、REF_MERGE、INJECT、GET、BIND、LOAD 等命令。
 
 ## events
 
@@ -78,8 +78,7 @@ mod types;
 pub use error::MclError;
 pub use events::*;
 pub use handler::{
-    domain_to_command, execute_direct_operation, history_append, parse_operation, realtime_load,
-    realtime_source,
+    domain_to_command, execute_direct_operation, history_append, parse_operation,
 };
 pub use system::{
     command_value_to_json, mcl_command_reply_system, mcl_command_request_system, mcl_domain_system,
@@ -204,18 +203,17 @@ mcl_domain_system(world: &mut World)
     处理事件：MclDomainRequest
     行为：
         克隆本帧全部请求并逐个处理
-        Start 调用 begin_start；Import 调用 begin_import；RealtimeLoad 调用 begin_realtime_load；CatchInference 调用 begin_catch_inference
+        Start 调用 begin_start；Import 调用 begin_import；CatchInference 调用 begin_catch_inference
         上述等待型操作成功登记后不回复；同步失败发送 Err MclDomainResponse
         其余 Emit 操作按 effect 类型直接执行并发送 MclDomainResponse
         其余操作返回 EffectInvalid 并发送 MclDomainResponse
 
 mcl_effect_response_system(world: &mut World)
     Effect 响应 System：公开 System
-    处理事件：LuaVmMessageReceived、AgentRealtimeContextReadCompleted、CapturedInferenceResponse、AgentFailure
+    处理事件：LuaVmMessageReceived、CapturedInferenceResponse、AgentFailure
     行为：
         按响应 id 从 PendingMclEffects 移除事务，未找到则跳过
         Start 响应校验 vm_id、解析邮箱消息、建立或校验 Agent.turn、累加 token usage
-        RealtimeLoad 响应包装为 BlockInner::Message
         CatchInference 响应包装为 Text
         AgentFailure 统一转换为 AgentMessage(Error) 投递给目标 Agent；Base Lua 通过 start 收到 Error 后写入历史，不回 Err、不暂存、不终止 VM
 
@@ -276,10 +274,6 @@ begin_start(world: &mut World, request: MclDomainRequest) -> Result<(), MclError
         调用 LuaRuntimeHandle::receive_message 等待邮箱消息
         首次登记成功后若 Agent 仍 Creating 且未完成初始化，发送 AgentInitializationCompleted
 
-begin_realtime_load(world: &mut World, request: MclDomainRequest) -> Result<(), MclError>
-    开始 realtime_load：私有函数
-    行为：登记 MclEffectState::RealtimeLoad 并发送 AgentRealtimeContextReadRequested
-
 begin_catch_inference(world: &mut World, request: MclDomainRequest, ref_block_id: String) -> Result<(), MclError>
     开始 catch_inference：私有函数
     行为：
@@ -306,32 +300,28 @@ parse_operation(command: &str, binding: Option<&serde_json::Value>) -> Result<Mc
     解析 MCL 命令：公开函数
     行为：
         拒绝分号；空白统一后按首词分派
-        IMPORT、CREATE、SELECT、MERGE、REF_MERGE、DELETE、INJECT、EMIT EFFECT 走对应解析器
+        IMPORT、CREATE、MERGE、REF_MERGE、GET、INJECT、BIND、LOAD、EMIT EFFECT 走对应解析器
         其余返回 InvalidCommand
 
 execute_direct_operation(world: &mut World, request: &MclCommandRequest, operation: MclOperation) -> Result<MclCommandValue, MclError>
     执行直接操作：公开函数
     行为：
         查找 Agent 并取得可变的 AgentMcl
-        CreateBlock/CreateRefBlock/Merge/RefMerge/Inject/InjectMany/CoverValue/CoverInner/Select/DeleteAll/DeleteFirst/DeleteWhere 逐项执行
+        CreateBlock/CreateRefBlock/Merge/RefMerge/Get/Inject/BindState/LoadState 逐项执行
         修改可见性来源或默认可见性来源对应字段时，刷新 Agent.resources.visible 或 default_visible
-        修改实时上下文来源依赖字段时，重新选择消息并发送 AgentRealtimeContextWriteRequested
         Import 或 Emit 返回 EffectInvalid
 
-realtime_source(world: &mut World, agent_id: &ResourceId, ref_block_id: String) -> Result<MclDomainValue, MclError>
-    声明实时来源：公开函数
-    行为：
-        RefBlock 必须恰好一个 Message RefMerge
-        构造 MclRealtimeSource 并写入 AgentMcl.realtime_source
-        展开当前快照并发送 AgentRealtimeContextWriteRequested
-
-history_append(world: &mut World, agent_id: &ResourceId, message: MclMessage, fallback_turn_id: &str) -> Result<MclDomainValue, MclError>
+history_append(world: &mut World, agent_id: &ResourceId, message: MclMessage, fallback_turn_id: &str, source: &str) -> Result<MclDomainValue, MclError>
     追加历史：公开函数
-    行为：turn_id 取当前 turn，缺失时用 fallback_turn_id；Assistant 消息携带当前推理 tool_schema；发送 AgentHistoryMessageWriteRequested
+    行为：turn_id 取当前 turn，缺失时用 fallback_turn_id；Assistant 消息携带当前推理 tool_schema；发送 AgentHistoryMessageWriteRequested 并带上 source
 
-realtime_load(world: &mut World, agent_id: &ResourceId) -> Result<MclDomainValue, MclError>
-    读取实时上下文：公开函数
-    行为：从 Agent.memory 读取实时上下文，过滤 System 消息后返回 BlockInner::Message
+history_record(world: &mut World, agent_id: &ResourceId, kind: String, content: String, payload: String, source: &str) -> Result<MclDomainValue, MclError>
+    追加显式记录：公开函数
+    行为：按发起者给出的 kind、content、payload 发送 AgentHistoryRecordWriteRequested，与消息共用同一时间线
+
+setting_source(world: &mut World, agent_id: &ResourceId, ref_block_id: String) -> Result<MclDomainValue, MclError>
+    声明配置来源：公开函数
+    行为：要求 RefBlock 全部由 RESOURCE merge 组成，把展开的路径记录到 Agent.resources.setting_sources；不发送事件
 
 domain_to_command(value: MclDomainValue) -> MclCommandValue
     领域值转命令值：公开函数，当前直接返回 value
@@ -342,7 +332,7 @@ domain_to_command(value: MclDomainValue) -> MclCommandValue
 parse_create(command: &str) -> Result<MclOperation, MclError>
     CREATE 解析：私有函数
     行为：
-        CREATE BLOCK 支持空字段（MESSAGE/TOOL_CALL/TOOL）和 MERGE ... FROM ... AS ...
+        CREATE BLOCK 支持空字段（MESSAGE/RESOURCE）和 MERGE ... FROM ... AS ...
         CREATE REF_BLOCK 支持 REF_MERGE ... FROM ... AS ...
         block_id 和 inner_id 必须通过 validate_identifier
         任一字段重复或非法返回错误
@@ -350,21 +340,49 @@ parse_create(command: &str) -> Result<MclOperation, MclError>
 parse_inject(words: &[&str], binding: Option<&serde_json::Value>) -> Result<MclOperation, MclError>
     INJECT 解析：私有函数
     行为：
-        INJECT SELECT ... FROM ... COVER ... FROM ... 解析为 CoverInner
-        其他 INJECT 按 TO/FROM 拆分，解析单个或多个值
-        ? 占位符必须独占且绑定存在；多个值不允许绑定
+        INJECT 按 `INJECT source TO target` 解析，source 和 target 均可使用完整、单值或范围选择器
+        普通 Block 可作为右值，RefBlock 只能作为 source 左值；target 无索引时整体覆盖，单索引时插入，范围时替换范围
+        [] 解析为空序列，用于清空数组或删除范围；? 读取绑定值，缺少 binding 返回 BindingMissing
+
+parse_selector(value: &str) -> Result<MclSelector, MclError>
+    解析选择器：私有函数
+    行为：
+        支持 block.inner、block.inner[index] 和 block.inner[start, end]
+        非负范围要求 0 <= start < end；负数范围要求 start < end < 0；两端不得异号
+        单索引可正可负，整数文本由 Lua 侧计算后拼入
+
+selector_path(selector: &MclSelector) -> BlockPath
+    读取选择器路径：私有函数
+
+get_selector_value(mcl: &AgentMcl, selector: &MclSelector) -> Result<MclDomainValue, MclError>
+    读取选择器结果：私有函数，单索引返回单个 Message 或 Unit，其余返回 BlockInner
+
+select_selector(mcl: &AgentMcl, selector: &MclSelector) -> Result<BlockInner, MclError>
+    读取选择器切片：私有函数，按完整、单索引或范围返回同类型内积
+
+resolve_index(index: i64, length: usize) -> Result<usize, MclError>
+    解析单索引：私有函数，负数从末尾计算，越界返回 TypeMismatch
+
+resolve_range(start: i64, end: i64, length: usize) -> Result<(usize, usize), MclError>
+    解析范围：私有函数，非负为左闭右开，负数为左开右闭，越界返回 TypeMismatch
+
+slice_inner(values: &BlockInner, start: usize, end: usize) -> Result<BlockInner, MclError>
+    切片内积：私有函数，保持元素类型
+
+append_inner(target: &mut BlockInner, values: BlockInner) -> Result<(), MclError>
+    追加内积：私有函数，类型不一致返回 TypeMismatch
+
+normalize_command(command: &str) -> String
+    规范化命令：私有函数，折叠空白但保留选择器内部的索引与逗号
 
 parse_effect(words: &[&str], binding: Option<&serde_json::Value>) -> Result<MclOperation, MclError>
     EMIT EFFECT 解析：私有函数
     行为：
-        start/finish/realtime_load 为无参 Effect
-        realtime_source/inference/catch_inference 读取括号 RefBlock ID
+        start/finish 为无参 Effect
+        inference/catch_inference 读取括号 RefBlock ID
         history_append 读取绑定 MclMessage
-        visibility_source/default_visibility_source 解析 SELECT ... FROM ... 并构造 BlockPath
+        visibility_source/default_visibility_source 读取括号 BlockPath
         tool_call 读取绑定 ToolCall 数组并校验 id/name/arguments 非空且 id 唯一
-
-parse_delete(words: &[&str], binding: Option<&serde_json::Value>) -> Result<MclOperation, MclError>
-    DELETE 解析：私有函数，支持全部删除、FIRST、WHERE id == ?
 
 path(block_id: &str, inner_id: &str) -> Result<BlockPath, MclError>
     构造 BlockPath：私有函数，先校验两个标识符
@@ -394,7 +412,7 @@ binding_to_inner(value: &serde_json::Value, kind: InnerType, aliases: &HashMap<S
     绑定转 BlockInner：私有函数
     行为：
         Message 字段支持别名引用（从 sources 取内容并按 scope 构造 System/User）、消息对象或消息数组
-        ToolCall 字段支持别名引用、ToolCall 数组或单个 ToolCall
+        ToolCall 已从 MCL Block 类型移除；tool_call effect 仍读取绑定的 ToolCall 数组
         ResourceId 字段支持别名、完整资源 ID 字符串、资源 ID 数组
 ```
 
@@ -516,8 +534,14 @@ MclCommandReply：MCL 命令回执，公开结构体
 
 MclBinding：MCL 绑定值，公开结构体，包装 serde_json::Value
 
-MclPredicate：MCL 删除谓词，公开枚举
-    IdEquals(String)
+MclSelector：MCL 选择器，公开枚举--作用于单个 Block inner
+    All(BlockPath)--完整数组，等价于 [0, length]
+    Index { path: BlockPath, index: i64 }--单个元素，负数从末尾计算
+    Range { path: BlockPath, start: i64, end: i64 }--范围，非负为左闭右开、负数为左开右闭
+
+MclInjectSource：INJECT 左值来源，公开枚举
+    Selector(MclSelector)--来自同一或其他 Block 的选择器结果
+    Bindings(Vec<MclBinding>)--来自绑定值、别名或 [] 空序列
 
 BlockFieldDeclaration：Block 字段声明，公开枚举
     Empty { inner_id: String, inner_type: InnerType }
@@ -531,13 +555,13 @@ MclEffectCommand：MCL Effect 命令，公开枚举
     Start
     CatchInference { ref_block_id: String }
     Inference { ref_block_id: String }
-    ToolCall { calls: Vec<ToolCall> }
+    ToolCall { calls: Vec<ToolCall> }--tool_call effect 的参数协议，不属于 MCL Block 类型
     Finish
     HistoryAppend { message: MclMessage }
-    RealtimeSource { ref_block_id: String }
+    HistoryRecord { kind: String, content: String, payload: String }
+    SettingSource { ref_block_id: String }
     VisibilitySource { source: BlockPath }
     DefaultVisibilitySource { source: BlockPath }
-    RealtimeLoad
 
 MclOperation：MCL 操作，公开枚举
     CreateBlock { block_id: String, fields: Vec<BlockFieldDeclaration> }
@@ -545,14 +569,10 @@ MclOperation：MCL 操作，公开枚举
     Merge { sources: Vec<BlockPath> }
     RefMerge { sources: Vec<BlockPath> }
     Import { resource_id: ResourceId, alias: String }
-    Inject { target: BlockPath, value: MclBinding }
-    InjectMany { target: BlockPath, values: Vec<MclBinding> }
-    CoverValue { target: BlockPath, value: MclBinding }
-    CoverInner { source: BlockPath, target: BlockPath }
-    Select { source: BlockPath }
-    DeleteAll { target: BlockPath }
-    DeleteFirst { target: BlockPath }
-    DeleteWhere { target: BlockPath, predicate: MclPredicate }
+    Get { selector: MclSelector }
+    Inject { source: MclInjectSource, target: MclSelector }
+    BindState { block_id: String, state_name: String }
+    LoadState { state_name: String, block_id: String }
     Emit { effect: MclEffectCommand }
 
 MclDomainValue：MCL 领域值，公开枚举
@@ -572,14 +592,27 @@ MclEffect：MCL Effect，公开枚举
     ToolCall { calls: Vec<ToolCall> }
     Finish
     HistoryAppend { message: MclMessage }
-    RealtimeSource { source: MclRealtimeSource, values: Vec<MclMessage> }
-    RealtimeLoad
+    SettingSource { values: Vec<ResourceId> }
 
 MclPendingEffectKind：等待型 Effect 分类，公开枚举
     Start { vm_id: LuaVmId }
     CatchInference
-    RealtimeLoad
+    ```
+
+## STATE 语义
+
+```text
+BIND <block> TO STATE <name>
+    要求 block 是普通 Block；同一 state 只能绑定一个 block，重复绑定同一对是幂等
+    绑定后，block 任一字段被修改时，MCL 序列化完整 block 并写入 state
+LOAD STATE <name> INTO <block>
+    读取 state blob；不存在时保持 block 当前默认值
+    state 中存在且当前 block 也存在的字段按类型覆盖；未知字段忽略
+    state 存在但字段为空数组时覆盖默认值为空数组
+
 ```
+
+history_messages 与 state 是两条独立通道：`history_append` 显式写入对话时间线，state 写入保存在 `setting` 表中，两者互不自动同步。实时上下文不再有专用 source effect；driver 声明普通 `realtime_state` block，通过 `LOAD`、`INJECT` 和 `BIND` 自行维护。
 
 ## 函数
 
@@ -626,7 +659,6 @@ MclError：MCL 错误，公开枚举
     MailboxFailed
     InferenceFailed
     ToolCallInvalid
-    RealtimeReadFailed
     EffectInvalid
     SourceReadFailed
     InvalidResourceId
@@ -655,9 +687,9 @@ Lua mcl 调用：
         Import/Emit -> MclDomainRequest -> mcl_domain_system
         其他 -> execute_direct_operation -> 立即完成回执
     mcl_domain_system 按 Effect 类型执行：
-        Start/CatchInference/RealtimeLoad -> 登记 PendingMclEffects 并等待外部响应
+        Start/CatchInference -> 登记 PendingMclEffects 并等待外部响应
         Import -> 登记 PendingMclImports 并发送 ToolRegisterRequest
-        HistoryAppend/RealtimeSource/Inference/ToolCall/VisibilitySource/DefaultVisibilitySource/Finish -> 直接执行
+        HistoryAppend/Inference/ToolCall/VisibilitySource/DefaultVisibilitySource/Finish -> 直接执行
     外部响应经 mcl_import_response_system 或 mcl_effect_response_system 完成 MclDomainResponse
     mcl_command_reply_system 把 MclDomainResponse 转换后发送原命令回执
 ```

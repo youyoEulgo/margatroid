@@ -57,9 +57,7 @@ fn attach_agent(app: &mut App, memory: AgentMemory) -> core_plugin::Entity {
 fn documented_public_api_composes_from_an_external_crate() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("memory.sql");
-    let (memory, restored) = AgentMemory::open(&path).unwrap();
-    assert!(restored.messages.is_empty());
-    assert!(restored.tool_context.is_empty());
+    let memory = AgentMemory::open(&path).unwrap();
 
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())

@@ -1,14 +1,50 @@
 use agent_plugin::Agent;
 use core_plugin::World;
-use margatroid_types::{
-    Block, BlockInner, BlockPath, InnerType, Message, RefBlock, ResourceId, ToolCall,
-};
+use margatroid_types::{Block, BlockInner, BlockPath, InnerType, Message, RefBlock, ResourceId, ToolCall};
 use resource_id_plugin::WorldResourceIdExt;
 
 use crate::{
     BlockFieldDeclaration, MclBinding, MclCommandRequest, MclCommandValue, MclDomainValue,
-    MclEffectCommand, MclError, MclOperation, RefMergeDeclaration,
+    MclEffectCommand, MclError, MclInjectSource, MclOperation, MclSelector,
+    RefMergeDeclaration,
 };
+
+fn normalize_command(command: &str) -> String {
+    let mut normalized = String::new();
+    let mut in_selector = false;
+    let mut pending_space = false;
+    for character in command.chars() {
+        match character {
+            '[' => {
+                in_selector = true;
+                if pending_space {
+                    normalized.push(' ');
+                    pending_space = false;
+                }
+                normalized.push(character);
+            }
+            ']' => {
+                in_selector = false;
+                normalized.push(character);
+            }
+            ',' if in_selector => {
+                normalized.push(',');
+                pending_space = false;
+            }
+            character if character.is_whitespace() => {
+                pending_space = true;
+            }
+            character => {
+                if pending_space && !normalized.ends_with('[') && !normalized.ends_with(',') {
+                    normalized.push(' ');
+                }
+                pending_space = false;
+                normalized.push(character);
+            }
+        }
+    }
+    normalized.trim().to_owned()
+}
 
 pub fn parse_operation(
     command: &str,
@@ -17,7 +53,7 @@ pub fn parse_operation(
     if command.contains(';') {
         return Err(MclError::InvalidCommand);
     }
-    let command = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let command = normalize_command(command);
     let words = command.split_whitespace().collect::<Vec<_>>();
     match words.first().copied().unwrap_or("") {
         "IMPORT" if words.len() == 4 && words[2] == "AS" => {
@@ -32,10 +68,10 @@ pub fn parse_operation(
             reject_binding(binding)?;
             parse_create(&command)
         }
-        "SELECT" if words.len() == 4 && words[2] == "FROM" => {
+        "GET" if words.len() == 2 => {
             reject_binding(binding)?;
-            Ok(MclOperation::Select {
-                source: path(words[3], words[1])?,
+            Ok(MclOperation::Get {
+                selector: parse_selector(words[1])?,
             })
         }
         "MERGE" if words.len() >= 4 && words[words.len() - 2] == "FROM" => {
@@ -58,14 +94,30 @@ pub fn parse_operation(
                     .collect::<Result<_, _>>()?,
             })
         }
-        "DELETE" => parse_delete(&words, binding),
         "INJECT" => parse_inject(&words, binding),
+        "BIND" if words.len() == 5 && words[2] == "TO" && words[3] == "STATE" => {
+            reject_binding(binding)?;
+            validate_identifier(words[1])?;
+            validate_identifier(words[4])?;
+            Ok(MclOperation::BindState {
+                block_id: words[1].to_owned(),
+                state_name: words[4].to_owned(),
+            })
+        }
+        "LOAD" if words.len() == 5 && words[1] == "STATE" && words[3] == "INTO" => {
+            reject_binding(binding)?;
+            validate_identifier(words[2])?;
+            validate_identifier(words[4])?;
+            Ok(MclOperation::LoadState {
+                state_name: words[2].to_owned(),
+                block_id: words[4].to_owned(),
+            })
+        }
         "EMIT" if words.get(1) == Some(&"EFFECT") => parse_effect(&words, binding),
         _ => Err(MclError::InvalidCommand),
     }
 }
 
-use crate::MclPredicate;
 fn parse_create(command: &str) -> Result<MclOperation, MclError> {
     let open = command.find('(').ok_or(MclError::ParseFailed)?;
     let close = command.rfind(')').ok_or(MclError::ParseFailed)?;
@@ -132,7 +184,6 @@ fn parse_create(command: &str) -> Result<MclOperation, MclError> {
             validate_identifier(inner_id)?;
             let inner_type = match kind {
                 "MESSAGE" => InnerType::Message,
-                "TOOL_CALL" => InnerType::ToolCall,
                 "RESOURCE" => InnerType::ResourceId,
                 _ => return Err(MclError::TypeMismatch),
             };
@@ -194,68 +245,76 @@ fn parse_inject(
     words: &[&str],
     binding: Option<&serde_json::Value>,
 ) -> Result<MclOperation, MclError> {
-    if words.len() == 9
-        && words[1] == "SELECT"
-        && words[3] == "FROM"
-        && words[5] == "COVER"
-        && words[7] == "FROM"
-    {
-        reject_binding(binding)?;
-        return Ok(MclOperation::CoverInner {
-            source: path(words[4], words[2])?,
-            target: path(words[8], words[6])?,
-        });
-    }
     let to_index = words
         .iter()
         .position(|word| *word == "TO")
         .ok_or(MclError::InvalidCommand)?;
-    let from_index = words
-        .iter()
-        .position(|word| *word == "FROM")
-        .ok_or(MclError::InvalidCommand)?;
-    if from_index < 2 || from_index + 1 >= words.len() || to_index < 1 || to_index + 1 >= from_index
-    {
+    if to_index < 2 || to_index + 1 >= words.len() || to_index + 2 != words.len() {
         return Err(MclError::InvalidCommand);
     }
-    let source = words[from_index + 1];
-    let target = path(source, words[to_index + 1])?;
-    let raw_values = words[1..to_index].to_vec();
-    if raw_values.is_empty() {
-        return Err(MclError::InvalidCommand);
-    }
-    let values = raw_values
-        .iter()
-        .enumerate()
-        .map(|(index, raw)| {
-            let raw = raw.trim_end_matches(',');
-            if raw == "?" {
-                if raw_values.len() != 1 {
-                    return Err(MclError::InvalidCommand);
-                }
-                binding
-                    .cloned()
-                    .map(MclBinding)
-                    .ok_or(MclError::BindingMissing)
-            } else {
-                if index != 0 && binding.is_some() {
-                    return Err(MclError::InvalidCommand);
-                }
-                validate_identifier(raw)?;
-                if binding.is_some() {
-                    return Err(MclError::InvalidCommand);
-                }
-                Ok(MclBinding(serde_json::Value::String(raw.to_owned())))
-            }
-        })
-        .collect::<Result<Vec<_>, MclError>>()?;
-    if values.len() == 1 {
-        Ok(MclOperation::Inject {
-            target,
-            value: values.into_iter().next().expect("length checked"),
-        })
+    let source_words = &words[1..to_index];
+    let target = parse_selector(words[to_index + 1])?;
+    let source = if source_words == ["[]"] {
+        reject_binding(binding)?;
+        MclInjectSource::Bindings(vec![MclBinding(serde_json::Value::Array(Vec::new()))])
+    } else if source_words == ["?"] {
+        MclInjectSource::Bindings(vec![MclBinding(
+            binding.cloned().ok_or(MclError::BindingMissing)?,
+        )])
+    } else if source_words.len() == 1 && source_words[0].contains('.') {
+        MclInjectSource::Selector(parse_selector(source_words[0])?)
     } else {
-        Ok(MclOperation::InjectMany { target, values })
+        let mut values = Vec::new();
+        for raw in source_words {
+            let raw = raw.trim_end_matches(',');
+            if raw.is_empty() || raw == "?" {
+                return Err(MclError::InvalidCommand);
+            }
+            if binding.is_some() {
+                return Err(MclError::InvalidCommand);
+            }
+            validate_identifier(raw)?;
+            values.push(MclBinding(serde_json::Value::String(raw.to_owned())));
+        }
+        MclInjectSource::Bindings(values)
+    };
+    Ok(MclOperation::Inject { source, target })
+}
+
+fn parse_selector(value: &str) -> Result<MclSelector, MclError> {
+    let (path_value, suffix) = match value.find('[') {
+        Some(index) => {
+            if !value.ends_with(']') {
+                return Err(MclError::InvalidCommand);
+            }
+            (&value[..index], Some(&value[index + 1..value.len() - 1]))
+        }
+        None => (value, None),
+    };
+    let (block_id, inner_id) = path_value
+        .split_once('.')
+        .ok_or(MclError::InvalidCommand)?;
+    let path = path(block_id, inner_id)?;
+    match suffix {
+        None => Ok(MclSelector::All(path)),
+        Some(value) => {
+            let values = value.split(',').collect::<Vec<_>>();
+            match values.as_slice() {
+                [index] => Ok(MclSelector::Index {
+                    path,
+                    index: index.parse().map_err(|_| MclError::InvalidCommand)?,
+                }),
+                [start, end] => {
+                    let start = start.parse().map_err(|_| MclError::InvalidCommand)?;
+                    let end = end.parse().map_err(|_| MclError::InvalidCommand)?;
+                    if start >= end || (start < 0) != (end < 0) {
+                        return Err(MclError::InvalidCommand);
+                    }
+                    Ok(MclSelector::Range { path, start, end })
+                }
+                _ => Err(MclError::InvalidCommand),
+            }
+        }
     }
 }
 
@@ -274,33 +333,6 @@ fn parse_effect(
             reject_binding(binding)?;
             Ok(MclOperation::Emit {
                 effect: MclEffectCommand::Finish,
-            })
-        }
-        ("realtime_load", 3) => {
-            reject_binding(binding)?;
-            Ok(MclOperation::Emit {
-                effect: MclEffectCommand::RealtimeLoad,
-            })
-        }
-        ("setting_load", 7)
-            if words.get(3) == Some(&"(SELECT")
-                && words.get(5) == Some(&"FROM")
-                && words.get(6).is_some_and(|value| value.ends_with(')')) =>
-        {
-            reject_binding(binding)?;
-            let block_id = words[6].strip_suffix(')').ok_or(MclError::InvalidCommand)?;
-            Ok(MclOperation::Emit {
-                effect: MclEffectCommand::SettingLoad {
-                    source: path(block_id, words[4])?,
-                },
-            })
-        }
-        ("realtime_source", 4) => {
-            reject_binding(binding)?;
-            Ok(MclOperation::Emit {
-                effect: MclEffectCommand::RealtimeSource {
-                    ref_block_id: effect_ref_block(words[3])?,
-                },
             })
         }
         ("setting_source", 4) => {
@@ -355,30 +387,30 @@ fn parse_effect(
                 })
             }
         }
-        ("visibility_source", 7)
-            if words.get(3) == Some(&"(SELECT")
-                && words.get(5) == Some(&"FROM")
-                && words.get(6).is_some_and(|value| value.ends_with(')')) =>
-        {
+        ("visibility_source", 4) => {
             reject_binding(binding)?;
-            let block_id = words[6].strip_suffix(')').ok_or(MclError::InvalidCommand)?;
+            let selector = words[3]
+                .strip_prefix('(')
+                .and_then(|value| value.strip_suffix(')'))
+                .ok_or(MclError::InvalidCommand)?;
+            let MclSelector::All(source) = parse_selector(selector)? else {
+                return Err(MclError::InvalidCommand);
+            };
             Ok(MclOperation::Emit {
-                effect: MclEffectCommand::VisibilitySource {
-                    source: path(block_id, words[4])?,
-                },
+                effect: MclEffectCommand::VisibilitySource { source },
             })
         }
-        ("default_visibility_source", 7)
-            if words.get(3) == Some(&"(SELECT")
-                && words.get(5) == Some(&"FROM")
-                && words.get(6).is_some_and(|value| value.ends_with(')')) =>
-        {
+        ("default_visibility_source", 4) => {
             reject_binding(binding)?;
-            let block_id = words[6].strip_suffix(')').ok_or(MclError::InvalidCommand)?;
+            let selector = words[3]
+                .strip_prefix('(')
+                .and_then(|value| value.strip_suffix(')'))
+                .ok_or(MclError::InvalidCommand)?;
+            let MclSelector::All(source) = parse_selector(selector)? else {
+                return Err(MclError::InvalidCommand);
+            };
             Ok(MclOperation::Emit {
-                effect: MclEffectCommand::DefaultVisibilitySource {
-                    source: path(block_id, words[4])?,
-                },
+                effect: MclEffectCommand::DefaultVisibilitySource { source },
             })
         }
         ("tool_call", 4) if words[3] == "?" => {
@@ -403,35 +435,101 @@ fn parse_effect(
     }
 }
 
-fn parse_delete(
-    words: &[&str],
-    binding: Option<&serde_json::Value>,
-) -> Result<MclOperation, MclError> {
-    match words {
-        ["DELETE", inner, "FROM", block] => {
-            reject_binding(binding)?;
-            Ok(MclOperation::DeleteAll {
-                target: path(block, inner)?,
-            })
-        }
-        ["DELETE", inner, "FIRST", "FROM", block] => {
-            reject_binding(binding)?;
-            Ok(MclOperation::DeleteFirst {
-                target: path(block, inner)?,
-            })
-        }
-        ["DELETE", inner, "FROM", block, "WHERE", "id", "==", "?"] => {
-            let value = required_binding(binding)?
-                .as_str()
-                .filter(|value| !value.is_empty())
-                .ok_or(MclError::TypeMismatch)?;
-            Ok(MclOperation::DeleteWhere {
-                target: path(block, inner)?,
-                predicate: MclPredicate::IdEquals(value.to_owned()),
-            })
-        }
-        _ => Err(MclError::InvalidCommand),
+fn selector_path(selector: &MclSelector) -> BlockPath {
+    match selector {
+        MclSelector::All(path)
+        | MclSelector::Index { path, .. }
+        | MclSelector::Range { path, .. } => path.clone(),
     }
+}
+
+fn get_selector_value(
+    mcl: &agent_plugin::AgentMcl,
+    selector: &MclSelector,
+) -> Result<MclDomainValue, MclError> {
+    let values = select_selector(mcl, selector)?;
+    match selector {
+        MclSelector::Index { index: _, .. } => match values {
+            BlockInner::Message(mut values) => Ok(values
+                .pop()
+                .map(MclDomainValue::Message)
+                .unwrap_or(MclDomainValue::Unit)),
+            BlockInner::ResourceId(mut values) => Ok(values
+                .pop()
+                .map(|value| MclDomainValue::Inner(BlockInner::ResourceId(vec![value])))
+                .unwrap_or(MclDomainValue::Unit)),
+        },
+        MclSelector::All(_) | MclSelector::Range { .. } => Ok(MclDomainValue::Inner(values)),
+    }
+}
+
+fn select_selector(
+    mcl: &agent_plugin::AgentMcl,
+    selector: &MclSelector,
+) -> Result<BlockInner, MclError> {
+    let path = selector_path(selector);
+    let values = mcl.select(&path).map_err(|_| MclError::TypeMismatch)?;
+    match selector {
+        MclSelector::All(_) => Ok(values),
+        MclSelector::Index { index, .. } => {
+            let index = resolve_index(*index, values.len())?;
+            slice_inner(&values, index, index + 1)
+        }
+        MclSelector::Range { start, end, .. } => {
+            let (start, end) = resolve_range(*start, *end, values.len())?;
+            slice_inner(&values, start, end)
+        }
+    }
+}
+
+fn resolve_index(index: i64, length: usize) -> Result<usize, MclError> {
+    let index = if index >= 0 {
+        index as usize
+    } else {
+        length
+            .checked_sub(index.unsigned_abs() as usize)
+            .ok_or(MclError::TypeMismatch)?
+    };
+    (index < length).then_some(index).ok_or(MclError::TypeMismatch)
+}
+
+fn resolve_range(start: i64, end: i64, length: usize) -> Result<(usize, usize), MclError> {
+    if start >= 0 {
+        let end = end as usize;
+        let start = start as usize;
+        if end <= length && start < end {
+            return Ok((start, end));
+        }
+    } else {
+        let start = start
+            .checked_add(length as i64 + 1)
+            .map(|value| value as usize);
+        let end = end
+            .checked_add(length as i64 + 1)
+            .map(|value| value as usize);
+        if let (Some(start), Some(end)) = (start, end) {
+            if start < end && end <= length {
+                return Ok((start, end));
+            }
+        }
+    }
+    Err(MclError::TypeMismatch)
+}
+
+fn slice_inner(values: &BlockInner, start: usize, end: usize) -> Result<BlockInner, MclError> {
+    match values {
+        BlockInner::Message(values) => Ok(BlockInner::Message(values[start..end].to_vec())),
+        BlockInner::ResourceId(values) => Ok(BlockInner::ResourceId(values[start..end].to_vec())),
+    }
+}
+
+fn append_inner(target: &mut BlockInner, values: BlockInner) -> Result<(), MclError> {
+    match (target, values) {
+        (BlockInner::Message(target), BlockInner::Message(values)) => target.extend(values),
+        (BlockInner::ResourceId(target), BlockInner::ResourceId(values)) => target.extend(values),
+        _ => return Err(MclError::TypeMismatch),
+    }
+    Ok(())
 }
 
 fn path(block_id: &str, inner_id: &str) -> Result<BlockPath, MclError> {
@@ -643,158 +741,82 @@ pub fn execute_direct_operation(
                 .map_err(|_| MclError::TypeMismatch)?;
             MclDomainValue::Unit
         }
-        MclOperation::Select { source } => {
-            MclDomainValue::Inner(agent.mcl.select(&source).map_err(|_| {
-                MclError::BlockMissing {
-                    assembly: "agent".into(),
-                    block: source.block_id,
-                }
-            })?)
-        }
-        MclOperation::Merge { sources } => MclDomainValue::Inner(
+        MclOperation::Get { selector } => get_selector_value(&agent.mcl, &selector)?,
+        MclOperation::BindState { block_id, state_name } => {
             agent
                 .mcl
-                .merge(&sources)
-                .map_err(|_| MclError::TypeMismatch)?,
-        ),
-        MclOperation::RefMerge { sources } => MclDomainValue::Paths(
-            agent
-                .mcl
-                .ref_merge(&sources)
-                .map_err(|_| MclError::TypeMismatch)?
-                .paths()
-                .to_vec(),
-        ),
-        MclOperation::Inject { target, value } => {
-            agent
-                .mcl
-                .insert(
-                    &target,
-                    binding_to_inner(
-                        &value.0,
-                        agent
-                            .mcl
-                            .select(&target)
-                            .map_err(|_| MclError::InnerMissing {
-                                block: target.block_id.clone(),
-                                inner: target.inner_id.clone(),
-                            })?
-                            .inner_type(),
-                        &agent.resources.aliases,
-                        &dependency_sources,
-                    )?,
-                )
+                .bind_state(block_id.clone(), state_name.clone())
                 .map_err(|_| MclError::TypeMismatch)?;
-            changed = Some(target);
+            let block = agent.mcl.block(&block_id).map_err(|_| MclError::BlockMissing {
+                assembly: "agent".into(),
+                block: block_id.clone(),
+            })?;
+            let value = serde_json::to_string(&block).map_err(|_| MclError::TypeMismatch)?;
+            agent
+                .memory
+                .set_state(&state_name, &value)
+                .map_err(|_| MclError::ImportMissing("state could not be written".into()))?;
             MclDomainValue::Unit
         }
-        MclOperation::InjectMany { target, values } => {
-            let kind = agent
-                .mcl
-                .select(&target)
-                .map_err(|_| MclError::InnerMissing {
-                    block: target.block_id.clone(),
-                    inner: target.inner_id.clone(),
-                })?
-                .inner_type();
-            for value in values {
+        MclOperation::LoadState { state_name, block_id } => {
+            let value = agent
+                .memory
+                .state_value(&state_name)
+                .map_err(|_| MclError::ImportMissing("state could not be read".into()))?;
+            if let Some(value) = value {
+                let block = serde_json::from_str(&value).map_err(|_| MclError::TypeMismatch)?;
                 agent
                     .mcl
-                    .insert(
-                        &target,
-                        binding_to_inner(
-                            &value.0,
-                            kind,
-                            &agent.resources.aliases,
-                            &dependency_sources,
-                        )?,
-                    )
+                    .merge_block(&block_id, block)
                     .map_err(|_| MclError::TypeMismatch)?;
             }
-            changed = Some(target);
             MclDomainValue::Unit
         }
-        MclOperation::CoverValue { target, value } => {
-            let kind = agent
+        MclOperation::Inject { source, target } => {
+            let target_path = selector_path(&target);
+            let target_values = agent
                 .mcl
-                .select(&target)
-                .map_err(|_| MclError::TypeMismatch)?
-                .inner_type();
-            agent
-                .mcl
-                .cover(
-                    &target,
-                    binding_to_inner(
-                        &value.0,
-                        kind,
-                        &agent.resources.aliases,
-                        &dependency_sources,
-                    )?,
-                )
+                .select(&target_path)
                 .map_err(|_| MclError::TypeMismatch)?;
-            changed = Some(target);
-            MclDomainValue::Unit
-        }
-        MclOperation::CoverInner { source, target } => {
-            let values = agent
-                .mcl
-                .select(&source)
-                .map_err(|_| MclError::TypeMismatch)?;
-            agent
-                .mcl
-                .cover(&target, values)
-                .map_err(|_| MclError::TypeMismatch)?;
-            changed = Some(target);
-            MclDomainValue::Unit
-        }
-        MclOperation::DeleteAll { target } => {
-            agent
-                .mcl
-                .delete(&target, margatroid_types::MclDeleteSelection::All)
-                .map_err(|_| MclError::TypeMismatch)?;
-            changed = Some(target);
-            MclDomainValue::Unit
-        }
-        MclOperation::DeleteFirst { target } => {
-            agent
-                .mcl
-                .delete(&target, margatroid_types::MclDeleteSelection::First)
-                .map_err(|_| MclError::TypeMismatch)?;
-            changed = Some(target);
-            MclDomainValue::Unit
-        }
-        MclOperation::DeleteWhere {
-            target,
-            predicate: MclPredicate::IdEquals(id),
-        } => {
-            let values = agent
-                .mcl
-                .select(&target)
-                .map_err(|_| MclError::InnerMissing {
-                    block: target.block_id.clone(),
-                    inner: target.inner_id.clone(),
-                })?;
-            let indices = match values {
-                BlockInner::ToolCall(calls) => calls
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, call)| (call.id == id).then_some(index))
-                    .collect::<Vec<_>>(),
-                BlockInner::ResourceId(resources) => resources
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, resource)| (resource.to_string() == id).then_some(index))
-                    .collect::<Vec<_>>(),
-                _ => return Err(MclError::TypeMismatch),
+            let source_values = match source {
+                MclInjectSource::Selector(selector) => select_selector(&agent.mcl, &selector)?,
+                MclInjectSource::Bindings(values) => {
+                    let mut result = empty_inner(target_values.inner_type());
+                    for value in values {
+                        let next = {
+                            binding_to_inner(
+                                &value.0,
+                                target_values.inner_type(),
+                                &agent.resources.aliases,
+                                &dependency_sources,
+                            )?
+                        };
+                        append_inner(&mut result, next)?;
+                    }
+                    result
+                }
             };
-            agent
-                .mcl
-                .delete(
-                    &target,
-                    margatroid_types::MclDeleteSelection::Indices(indices),
-                )
-                .map_err(|_| MclError::TypeMismatch)?;
-            changed = Some(target);
+            match target {
+                MclSelector::All(_) => agent
+                    .mcl
+                    .cover(&target_path, source_values)
+                    .map_err(|_| MclError::TypeMismatch)?,
+                MclSelector::Index { index, .. } => {
+                    let actual = resolve_index(index, target_values.len())?;
+                    agent
+                        .mcl
+                        .insert_at(&target_path, actual, index < 0, source_values)
+                        .map_err(|_| MclError::TypeMismatch)?;
+                }
+                MclSelector::Range { start, end, .. } => {
+                    let (start, end) = resolve_range(start, end, target_values.len())?;
+                    agent
+                        .mcl
+                        .replace_range(&target_path, start, end, source_values)
+                        .map_err(|_| MclError::TypeMismatch)?;
+                }
+            }
+            changed = Some(target_path);
             MclDomainValue::Unit
         }
         _ => return Err(MclError::EffectInvalid),
@@ -820,30 +842,14 @@ pub fn execute_direct_operation(
             }
         }
     }
-    let realtime_write = match (changed.as_ref(), agent.mcl().realtime_source().cloned()) {
-        (Some(changed), Some(source)) => {
-            if source
-                .dependencies
-                .iter()
-                .any(|dependency| dependency == changed)
-            {
-                let values = agent
-                    .mcl
-                    .select(&BlockPath {
-                        block_id: source.ref_block_id,
-                        inner_id: source.message_merge_id,
-                    })
-                    .map_err(|_| MclError::MessageSourceUnavailable)?;
-                let BlockInner::Message(messages) = values else {
-                    return Err(MclError::TypeMismatch);
-                };
-                Some(messages)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
+    let state_write = changed.as_ref().and_then(|changed| {
+        agent
+            .mcl
+            .state_bindings()
+            .get(&changed.block_id)
+            .cloned()
+            .map(|state_name| (state_name, changed.block_id.clone()))
+    });
     let setting_entries = match changed.as_ref() {
         Some(changed)
             if agent
@@ -872,17 +878,30 @@ pub fn execute_direct_operation(
         }
         _ => Vec::new(),
     };
-    if let Some(messages) = realtime_write {
-        world.emit_event(margatroid_types::AgentRealtimeContextWriteRequested {
-            agent: entity,
-            messages,
-        });
-    }
+    let state_value = if let Some((state_name, block_id)) = state_write {
+        let block = agent
+            .mcl
+            .block(&block_id)
+            .map_err(|_| MclError::BlockMissing {
+                assembly: "agent".into(),
+                block: block_id,
+            })?;
+        let value = serde_json::to_string(&block).map_err(|_| MclError::TypeMismatch)?;
+        Some((state_name, value))
+    } else {
+        None
+    };
+    let memory = agent.memory.clone();
     if !setting_entries.is_empty() {
         world.emit_event(margatroid_types::AgentSettingWriteRequested {
             agent: entity,
             entries: setting_entries,
         });
+    }
+    if let Some((state_name, value)) = state_value {
+        memory
+            .set_state(&state_name, &value)
+            .map_err(|_| MclError::ImportMissing("state could not be written".into()))?;
     }
     Ok(value)
 }
@@ -908,72 +927,9 @@ pub fn history_record(
     Ok(MclDomainValue::Unit)
 }
 
-pub fn realtime_source(
-    world: &mut World,
-    agent_id: &ResourceId,
-    ref_block_id: String,
-) -> Result<MclDomainValue, MclError> {
-    let entity = world
-        .entity_by_resource_id(agent_id)
-        .map_err(|_| MclError::AgentMissing)?;
-    let snapshot =
-        {
-            let agent = world
-                .get_component_mut::<Agent>(entity)
-                .ok_or(MclError::AgentMissing)?;
-            let block = agent.mcl.ref_blocks().blocks.get(&ref_block_id).ok_or(
-                MclError::RefBlockMissing {
-                    assembly: "agent".into(),
-                    block: ref_block_id.clone(),
-                },
-            )?;
-            let mut messages = block
-                .merges
-                .iter()
-                .filter(|(_, merge)| matches!(merge, margatroid_types::RefMerge::Message(_)));
-            let Some((merge_id, margatroid_types::RefMerge::Message(paths))) = messages.next()
-            else {
-                return Err(MclError::MessageSourceUnavailable);
-            };
-            if messages.next().is_some() {
-                return Err(MclError::TypeMismatch);
-            }
-            if block
-                .merges
-                .values()
-                .any(|merge| !matches!(merge, margatroid_types::RefMerge::Message(_)))
-            {
-                return Err(MclError::TypeMismatch);
-            }
-            let source = margatroid_types::MclRealtimeSource {
-                ref_block_id: ref_block_id.clone(),
-                message_merge_id: merge_id.clone(),
-                dependencies: paths.clone(),
-            };
-            let values = agent
-                .mcl
-                .select(&BlockPath {
-                    block_id: ref_block_id,
-                    inner_id: merge_id.clone(),
-                })
-                .map_err(|_| MclError::MessageSourceUnavailable)?;
-            let BlockInner::Message(snapshot) = values else {
-                return Err(MclError::TypeMismatch);
-            };
-            agent.mcl_mut().set_realtime_source(source.clone());
-            snapshot
-        };
-    world.emit_event(margatroid_types::AgentRealtimeContextWriteRequested {
-        agent: entity,
-        messages: snapshot,
-    });
-    Ok(MclDomainValue::Unit)
-}
-
 fn empty_inner(kind: InnerType) -> BlockInner {
     match kind {
         InnerType::Message => BlockInner::Message(Vec::new()),
-        InnerType::ToolCall => BlockInner::ToolCall(Vec::new()),
         InnerType::ResourceId => BlockInner::ResourceId(Vec::new()),
     }
 }
@@ -1016,23 +972,6 @@ fn binding_to_inner(
                 Ok(BlockInner::Message(values))
             } else {
                 parse_message(value).map(|v| BlockInner::Message(vec![v]))
-            }
-        }
-        InnerType::ToolCall => {
-            if let Some(alias) = value.as_str() {
-                let resource = aliases.get(alias).ok_or_else(|| {
-                    MclError::ImportMissing(format!("alias `{alias}` is not imported"))
-                })?;
-                return Ok(BlockInner::ResourceId(vec![resource.clone()]));
-            }
-            if value.is_array() {
-                serde_json::from_value(value.clone())
-                    .map(BlockInner::ToolCall)
-                    .map_err(|_| MclError::TypeMismatch)
-            } else {
-                serde_json::from_value::<ToolCall>(value.clone())
-                    .map(|v| BlockInner::ToolCall(vec![v]))
-                    .map_err(|_| MclError::TypeMismatch)
             }
         }
         InnerType::ResourceId => {
@@ -1142,50 +1081,7 @@ pub fn setting_source(
     Ok(MclDomainValue::Unit)
 }
 
-pub fn setting_load(
-    world: &mut World,
-    agent_id: &ResourceId,
-    source: BlockPath,
-) -> Result<MclDomainValue, MclError> {
-    let key = format!("{}/{}", source.block_id, source.inner_id);
-    let entity = world
-        .entity_by_resource_id(agent_id)
-        .map_err(|_| MclError::AgentMissing)?;
-    let stored = world
-        .get_component::<Agent>(entity)
-        .ok_or(MclError::AgentMissing)?
-        .memory
-        .setting_value(&key)
-        .map_err(|_| MclError::ImportMissing("stored setting could not be read".to_owned()))?;
-    let Some(stored) = stored else {
-        return Ok(MclDomainValue::Unit);
-    };
-    let values = stored
-        .iter()
-        .filter_map(|resource| resource.parse().ok())
-        .collect::<Vec<ResourceId>>();
-    Ok(MclDomainValue::Inner(
-        margatroid_types::BlockInner::ResourceId(values),
-    ))
-}
 
-pub fn realtime_load(world: &mut World, agent_id: &ResourceId) -> Result<MclDomainValue, MclError> {
-    let entity = world
-        .entity_by_resource_id(agent_id)
-        .map_err(|_| MclError::AgentMissing)?;
-    let memory = world
-        .get_component::<Agent>(entity)
-        .map(|agent| agent.memory.clone())
-        .ok_or(MclError::AgentRuntimeMissing)?;
-    Ok(MclDomainValue::Inner(BlockInner::Message(
-        memory
-            .read_realtime()
-            .map_err(|_| MclError::RealtimeReadFailed)?
-            .into_iter()
-            .filter(|message| !matches!(message.message, margatroid_types::Message::System { .. }))
-            .collect(),
-    )))
-}
 pub fn domain_to_command(value: MclDomainValue) -> MclCommandValue {
     value
 }

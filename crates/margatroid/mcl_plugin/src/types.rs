@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 pub use agent_plugin::AgentMcl;
 pub use margatroid_types::{
-    Block, BlockAssembly, BlockInner, BlockPath, InnerType, MclMessage, MclRealtimeSource,
+    Block, BlockAssembly, BlockInner, BlockPath, InnerType, MclMessage,
     RefBlock, RefBlockAssembly, RefMerge,
 };
 
@@ -151,9 +151,16 @@ impl MclCommandReply {
 
 #[derive(Clone, Debug)]
 pub struct MclBinding(pub serde_json::Value);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MclSelector {
+    All(BlockPath),
+    Index { path: BlockPath, index: i64 },
+    Range { path: BlockPath, start: i64, end: i64 },
+}
 #[derive(Clone, Debug)]
-pub enum MclPredicate {
-    IdEquals(String),
+pub enum MclInjectSource {
+    Selector(MclSelector),
+    Bindings(Vec<MclBinding>),
 }
 #[derive(Clone, Debug)]
 pub enum BlockFieldDeclaration {
@@ -192,9 +199,6 @@ pub enum MclEffectCommand {
         content: String,
         payload: String,
     },
-    RealtimeSource {
-        ref_block_id: String,
-    },
     SettingSource {
         ref_block_id: String,
     },
@@ -204,8 +208,6 @@ pub enum MclEffectCommand {
     DefaultVisibilitySource {
         source: BlockPath,
     },
-    SettingLoad { source: BlockPath },
-    RealtimeLoad,
 }
 #[derive(Clone, Debug)]
 pub enum MclOperation {
@@ -227,34 +229,20 @@ pub enum MclOperation {
         resource_id: ResourceId,
         alias: String,
     },
+    Get {
+        selector: MclSelector,
+    },
     Inject {
-        target: BlockPath,
-        value: MclBinding,
+        source: MclInjectSource,
+        target: MclSelector,
     },
-    InjectMany {
-        target: BlockPath,
-        values: Vec<MclBinding>,
+    BindState {
+        block_id: String,
+        state_name: String,
     },
-    CoverValue {
-        target: BlockPath,
-        value: MclBinding,
-    },
-    CoverInner {
-        source: BlockPath,
-        target: BlockPath,
-    },
-    Select {
-        source: BlockPath,
-    },
-    DeleteAll {
-        target: BlockPath,
-    },
-    DeleteFirst {
-        target: BlockPath,
-    },
-    DeleteWhere {
-        target: BlockPath,
-        predicate: MclPredicate,
+    LoadState {
+        state_name: String,
+        block_id: String,
     },
     Emit {
         effect: MclEffectCommand,
@@ -287,21 +275,15 @@ pub enum MclEffect {
     HistoryAppend {
         message: MclMessage,
     },
-    RealtimeSource {
-        source: MclRealtimeSource,
-        values: Vec<MclMessage>,
-    },
     SettingSource {
         values: Vec<ResourceId>,
     },
-    RealtimeLoad,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MclPendingEffectKind {
     Start { vm_id: margatroid_types::LuaVmId },
     CatchInference,
-    RealtimeLoad,
 }
 
 pub fn compile_mcl(request: MclCompileRequest) -> Result<Arc<MclProgram>, crate::MclError> {

@@ -9,8 +9,7 @@ use lua_runtime_plugin::{
     LuaValue, LuaVmMessageReceived,
 };
 use margatroid_types::{
-    AgentFailure, AgentMessage, AgentRealtimeContextReadCompleted,
-    AgentRealtimeContextReadRequested, CapturedInferenceRequest, CapturedInferenceResponse,
+    AgentFailure, AgentMessage, CapturedInferenceRequest, CapturedInferenceResponse,
     InferenceRequestEvent, Message, ResourceId, ToolCall, ToolCallEvent,
 };
 use resource_id_plugin::ResourceIdPluginInstalled;
@@ -233,7 +232,7 @@ fn command_value_to_lua(value: crate::MclCommandValue) -> Result<LuaValue, LuaRu
     match value {
         crate::MclDomainValue::Unit => Ok(LuaValue::Nil),
         crate::MclDomainValue::Text(value) => Ok(LuaValue::String(value)),
-        crate::MclDomainValue::Inner(value) => match value { margatroid_types::BlockInner::Message(values) => { let values = values.into_iter().map(mcl_message_to_json).collect::<Result<Vec<_>, _>>()?; json_to_lua(serde_json::to_value(values).map_err(|error| LuaRuntimeError::EnvironmentFailed(error.to_string()))?) } margatroid_types::BlockInner::ToolCall(values) => json_to_lua(serde_json::to_value(values).map_err(|error| LuaRuntimeError::EnvironmentFailed(error.to_string()))?), margatroid_types::BlockInner::ResourceId(values) => Ok(LuaValue::Array(values.into_iter().map(|value| LuaValue::String(value.to_string())).collect())) },
+        crate::MclDomainValue::Inner(value) => match value { margatroid_types::BlockInner::Message(values) => { let values = values.into_iter().map(mcl_message_to_json).collect::<Result<Vec<_>, _>>()?; json_to_lua(serde_json::to_value(values).map_err(|error| LuaRuntimeError::EnvironmentFailed(error.to_string()))?) } margatroid_types::BlockInner::ResourceId(values) => Ok(LuaValue::Array(values.into_iter().map(|value| LuaValue::String(value.to_string())).collect())) },
         crate::MclDomainValue::Message(value) => json_to_lua(mcl_message_to_json(value)?),
         crate::MclDomainValue::Paths(values) => json_to_lua(serde_json::to_value(values.into_iter().map(|value| serde_json::json!({"block_id": value.block_id, "inner_id": value.inner_id})).collect::<Vec<_>>()).unwrap()),
         crate::MclDomainValue::ResourceImport(value) => json_to_lua(serde_json::json!({"resource_id": value.resource_id.to_string(), "alias": value.alias, "available": value.available, "error": value.error})),
@@ -252,9 +251,6 @@ pub fn command_value_to_json(value: crate::MclCommandValue) -> Result<serde_json
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|_| MclError::TypeMismatch)?,
             ),
-            margatroid_types::BlockInner::ToolCall(values) => {
-                serde_json::to_value(values).map_err(|_| MclError::TypeMismatch)?
-            }
             margatroid_types::BlockInner::ResourceId(values) => serde_json::Value::Array(
                 values
                     .into_iter()
@@ -379,10 +375,7 @@ pub fn mcl_command_request_system(world: &mut World) {
                 continue;
             }
         };
-        if matches!(
-            operation,
-            MclOperation::Import { .. } | MclOperation::Emit { .. }
-        ) {
+        if matches!(operation, MclOperation::Import { .. } | MclOperation::Emit { .. }) {
             world.send_event(MclDomainRequest {
                 source: request.source.clone(),
                 id: request.id,
@@ -432,22 +425,6 @@ pub fn mcl_domain_system(world: &mut World) {
             }
             continue;
         }
-        if matches!(
-            request.operation,
-            MclOperation::Emit {
-                effect: crate::MclEffectCommand::RealtimeLoad
-            }
-        ) {
-            if let Err(error) = begin_realtime_load(world, request.clone()) {
-                world.send_event(MclDomainResponse {
-                    id: request.id,
-                    agent_id: request.agent_id,
-                    result: Err(error),
-                    reply: request.reply,
-                });
-            }
-            continue;
-        }
         if let MclOperation::Emit {
             effect: crate::MclEffectCommand::CatchInference { ref_block_id },
         } = request.operation.clone()
@@ -488,12 +465,6 @@ pub fn mcl_domain_system(world: &mut World) {
                     &request.source,
                 ),
                 MclOperation::Emit {
-                    effect: crate::MclEffectCommand::SettingLoad { source },
-                } => crate::setting_load(world, &request.agent_id, source),
-                MclOperation::Emit {
-                    effect: crate::MclEffectCommand::RealtimeSource { ref_block_id },
-                } => crate::realtime_source(world, &request.agent_id, ref_block_id),
-                MclOperation::Emit {
                     effect: crate::MclEffectCommand::SettingSource { ref_block_id },
                 } => crate::setting_source(world, &request.agent_id, ref_block_id),
                 MclOperation::Emit {
@@ -531,11 +502,7 @@ pub fn mcl_domain_system(world: &mut World) {
                         .values()
                         .filter(|merge| matches!(merge, margatroid_types::RefMerge::ResourceId(_)))
                         .count();
-                    let has_unsupported_merge = block
-                        .merges
-                        .values()
-                        .any(|merge| matches!(merge, margatroid_types::RefMerge::ToolCall(_)));
-                    if message_merges != 1 || resource_merges != 1 || has_unsupported_merge {
+                    if message_merges != 1 || resource_merges != 1 {
                         return Err(MclError::TypeMismatch);
                     }
                     let merge_id = block
@@ -838,29 +805,6 @@ fn begin_start(world: &mut World, request: MclDomainRequest) -> Result<(), MclEr
     Ok(())
 }
 
-fn begin_realtime_load(world: &mut World, request: MclDomainRequest) -> Result<(), MclError> {
-    let agent = world
-        .entity_by_resource_id(&request.agent_id)
-        .map_err(|_| MclError::AgentMissing)?;
-    let id = format!("mcl-effect:{}", request.id.as_str());
-    let state = crate::MclEffectState {
-        command_id: request.id,
-        agent_id: request.agent_id,
-        agent,
-        vm_id: None,
-        kind: crate::MclPendingEffectKind::RealtimeLoad,
-        reply: request.reply,
-    };
-    let pending = world
-        .get_resource_mut::<PendingMclEffects>()
-        .ok_or(MclError::EffectAlreadyPending)?;
-    if pending.effects.insert(id.clone(), state).is_some() {
-        return Err(MclError::EffectAlreadyPending);
-    }
-    world.send_event(AgentRealtimeContextReadRequested { id, agent });
-    Ok(())
-}
-
 fn begin_catch_inference(
     world: &mut World,
     request: MclDomainRequest,
@@ -999,38 +943,6 @@ pub fn mcl_effect_response_system(world: &mut World) {
                     }
                     Ok(crate::MclDomainValue::Message(envelope.message))
                 })
-        };
-        world.send_event(MclDomainResponse {
-            id: state.command_id,
-            agent_id: state.agent_id,
-            result,
-            reply: state.reply,
-        });
-    }
-
-    let realtime = world
-        .event_reader::<AgentRealtimeContextReadCompleted>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    for response in realtime {
-        let state = world
-            .get_resource_mut::<PendingMclEffects>()
-            .and_then(|pending| pending.effects.remove(&response.id));
-        let Some(state) = state else { continue };
-        let result = match state.kind {
-            crate::MclPendingEffectKind::RealtimeLoad => match response.result {
-                Ok(messages) => Ok(crate::MclDomainValue::Inner(
-                    margatroid_types::BlockInner::Message(messages),
-                )),
-                Err(error) => {
-                    tracing::warn!(agent = %state.agent_id, error = %error, "realtime context read failed; returning empty context");
-                    Ok(crate::MclDomainValue::Inner(
-                        margatroid_types::BlockInner::Message(Vec::new()),
-                    ))
-                }
-            },
-            _ => Err(MclError::EffectResponseMismatch),
         };
         world.send_event(MclDomainResponse {
             id: state.command_id,
@@ -1323,10 +1235,10 @@ mod tests {
         }
         for command in [
             "CREATE BLOCK msg (system_prompt MESSAGE,)",
-            "INJECT soul TO system_prompt FROM msg",
-            "SELECT recent_conversation FROM msg",
-            "COVER history_conversation FROM msg",
-            "DELETE pending_tool FROM msg WHERE id == ?",
+            "INJECT soul TO msg.system_prompt",
+            "GET msg.recent_conversation",
+            "INJECT msg.history_conversation TO msg.history_conversation",
+            "INJECT ? TO msg.recent_conversation[0]",
         ] {
             assert_eq!(audit(command).level(), tracing::Level::DEBUG, "{command}");
         }
@@ -1420,11 +1332,11 @@ mod tests {
     fn block_only_mcl_is_logged_at_debug() {
         let text = log_of(
             "agent:demo/coder:latest",
-            "SELECT recent_conversation FROM msg",
+            "GET msg.recent_conversation",
         );
 
         assert!(
-            text.contains("mcl=SELECT recent_conversation FROM msg"),
+            text.contains("mcl=GET msg.recent_conversation"),
             "{text}"
         );
         assert!(text.contains("DEBUG"), "{text}");

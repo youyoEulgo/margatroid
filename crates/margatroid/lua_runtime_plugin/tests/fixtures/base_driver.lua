@@ -1,6 +1,5 @@
 -- Base Driver for every Agent image.
--- `mcl` is the host boundary injected by Margatroid. The block layout,
--- message routing, pending tool state, and effect loop are all defined here.
+-- `mcl` is the host boundary injected by Margatroid.
 
 local function mcl_command(command, binding)
     return mcl(agent_info.id, command, binding)
@@ -23,14 +22,21 @@ mcl_command([[
         compact_context MESSAGE,
         history_conversation MESSAGE,
         recent_conversation MESSAGE,
-        pending_tool TOOL_CALL,
+    )
+]])
+
+mcl_command([[
+    CREATE BLOCK realtime_state (
+        compact_context MESSAGE,
+        history_conversation MESSAGE,
+        recent_conversation MESSAGE,
     )
 ]])
 
 mcl_command([[
     CREATE BLOCK tool (
-        tool_default TOOL,
-        tool_dynamic TOOL,
+        tool_default RESOURCE,
+        tool_dynamic RESOURCE,
     )
 ]])
 
@@ -42,33 +48,38 @@ mcl_command([[
 ]])
 
 mcl_command([[
-    CREATE REF_BLOCK realtime (
-        REF_MERGE compact_context, history_conversation, recent_conversation FROM msg AS ctx,
-    )
-]])
-
-mcl_command([[
     CREATE REF_BLOCK com (
         REF_MERGE system_prompt, compact_context, history_conversation, compact_prompt FROM msg AS ctx,
     )
 ]])
 
-mcl_command("INJECT soul TO system_prompt FROM msg")
-mcl_command("INJECT compact TO compact_prompt FROM msg")
-mcl_command("INJECT read_file, write_file, edit, grep, glob, bash, list_directory TO tool_default FROM tool")
-mcl_command("INJECT SELECT tool_default FROM tool COVER tool_dynamic FROM tool")
-mcl_command("EMIT EFFECT visibility_source (SELECT tool_dynamic FROM tool)")
-mcl_command("EMIT EFFECT default_visibility_source (SELECT tool_default FROM tool)")
+mcl_command("INJECT soul TO msg.system_prompt")
+mcl_command("INJECT compact TO msg.compact_prompt")
+mcl_command("INJECT read_file, write_file, edit, grep, glob, bash, list_directory TO tool.tool_default")
+mcl_command("INJECT tool.tool_default TO tool.tool_dynamic")
+mcl_command("LOAD STATE realtime INTO realtime_state")
+mcl_command("INJECT realtime_state.compact_context TO msg.compact_context")
+mcl_command("INJECT realtime_state.history_conversation TO msg.history_conversation")
+mcl_command("INJECT realtime_state.recent_conversation TO msg.recent_conversation")
+
+mcl_command("BIND realtime_state TO STATE realtime")
+
+local function sync_realtime()
+    mcl_command("INJECT msg.compact_context TO realtime_state.compact_context")
+    mcl_command("INJECT msg.history_conversation TO realtime_state.history_conversation")
+    mcl_command("INJECT msg.recent_conversation TO realtime_state.recent_conversation")
+end
 
 local function append_recent(message)
-    mcl_command("INJECT ? TO recent_conversation FROM msg", message)
+    mcl_command("INJECT ? TO msg.recent_conversation", message)
+    sync_realtime()
     mcl_command("EMIT EFFECT history_append", message)
 end
 
 local function move_old_recent_messages()
     local assistant_seen = false
     while true do
-        local recent = mcl_command("SELECT recent_conversation FROM msg")
+        local recent = mcl_command("GET msg.recent_conversation")
         if #recent == 0 then
             return
         end
@@ -79,17 +90,14 @@ local function move_old_recent_messages()
             end
             assistant_seen = true
         end
-        mcl_command("INJECT ? TO history_conversation FROM msg", first)
-        mcl_command("DELETE recent_conversation FIRST FROM msg")
+        mcl_command("INJECT ? TO msg.history_conversation", first)
+        mcl_command("INJECT [] TO msg.recent_conversation[0,1]")
     end
 end
 
-local restored = mcl_command("EMIT EFFECT realtime_load")
-for _, message in ipairs(restored) do
-    mcl_command("INJECT ? TO recent_conversation FROM msg", message)
-end
 move_old_recent_messages()
-mcl_command("EMIT EFFECT realtime_source (realtime)")
+mcl_command("EMIT EFFECT visibility_source (tool.tool_dynamic)")
+mcl_command("EMIT EFFECT default_visibility_source (tool.tool_default)")
 
 local MAX_CONTEXT_TOKENS = agent_info.model.context_window_tokens
 local RECENT_CONTEXT_RATIO = 0.16
@@ -97,14 +105,32 @@ local COMPACTION_CONTEXT_RATIO = 0.80
 local RECENT_CONTEXT_LIMIT = MAX_CONTEXT_TOKENS * RECENT_CONTEXT_RATIO
 local COMPACTION_CONTEXT_LIMIT = MAX_CONTEXT_TOKENS * COMPACTION_CONTEXT_RATIO
 
+local function all_tool_calls_completed()
+    local context = mcl_command("GET req.ctx")
+    local completed = {}
+    for index = #context, 1, -1 do
+        local current = context[index]
+        if current.type == "tool" then
+            completed[current.tool_call_id] = true
+        elseif current.type == "assistant" then
+            for _, call in ipairs(current.tool_calls or {}) do
+                if not completed[call.id] then
+                    return false
+                end
+            end
+            return true
+        else
+            return false
+        end
+    end
+    return false
+end
+
 local function maybe_compact(message)
-    if message.type ~= "assistant"
-        or not message.usage
-        or #(message.tool_calls or {}) > 0
-    then
+    if message.type ~= "assistant" or not message.usage then
         return
     end
-    local recent = mcl_command("SELECT recent_conversation FROM msg")
+    local recent = mcl_command("GET msg.recent_conversation")
     local first_assistant_tokens
     for _, entry in ipairs(recent) do
         if entry.type == "assistant" and entry.usage then
@@ -120,44 +146,35 @@ local function maybe_compact(message)
     if message.usage.input_tokens >= COMPACTION_CONTEXT_LIMIT then
         move_old_recent_messages()
         local summary = mcl_command("EMIT EFFECT catch_inference (com)")
-        -- Replace the compressed state, then promote the current recent window.
-        mcl_command("INJECT ? COVER compact_context FROM msg", {
+        mcl_command("INJECT ? TO msg.compact_context", {
             type = "user",
             content = summary,
         })
-        mcl_command("INJECT SELECT recent_conversation COVER history_conversation FROM msg")
-        mcl_command("DELETE recent_conversation FROM msg")
+        mcl_command("INJECT msg.recent_conversation TO msg.history_conversation")
+        mcl_command("INJECT [] TO msg.recent_conversation")
+        sync_realtime()
     end
 end
 
 while true do
     local message = mcl_command("EMIT EFFECT start")
-
     if message.type == "user" then
         append_recent(message)
         mcl_command("EMIT EFFECT inference (req)")
-
     elseif message.type == "assistant" then
         append_recent(message)
         maybe_compact(message)
         local tool_calls = message.tool_calls or {}
         if #tool_calls > 0 then
-            for _, tool_call in ipairs(tool_calls) do
-                mcl_command("INJECT ? TO pending_tool FROM msg", tool_call)
-            end
             mcl_command("EMIT EFFECT tool_call ?", tool_calls)
         else
             mcl_command("EMIT EFFECT finish")
         end
-
     elseif message.type == "tool" then
         append_recent(message)
-        mcl_command("DELETE pending_tool FROM msg WHERE id == ?", message.tool_call_id)
-        local pending_tools = mcl_command("SELECT pending_tool FROM msg")
-        if #pending_tools == 0 then
+        if all_tool_calls_completed() then
             mcl_command("EMIT EFFECT inference (req)")
         end
-
     elseif message.type == "error" then
         mcl_command("EMIT EFFECT history_append", message)
     end

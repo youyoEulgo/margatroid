@@ -96,9 +96,9 @@ Base Lua 是每个 Agent 的 Driver。它通过注入的 `mcl(agent_id, command,
 IMPORT prompt:system/soul:latest AS soul
 CREATE BLOCK msg (...)
 CREATE REF_BLOCK req (...)
-INJECT ... TO ... FROM ...
-EMIT EFFECT realtime_load
-EMIT EFFECT realtime_source (req)
+INJECT ... TO ...
+LOAD STATE realtime INTO realtime_state
+BIND realtime_state TO STATE realtime
 EMIT EFFECT history_append ...
 EMIT EFFECT inference (req)
 EMIT EFFECT tool_call ?
@@ -111,8 +111,8 @@ Base Lua 消息循环：
 start
   -> 收到 User：写 recent/history，发 inference
   -> 收到 Assistant：写 recent/history，若 tool_calls 非空发 tool_call，否则 finish
-  -> 收到 Tool：写 recent/history，删除 pending_tool，全部完成后发 inference
-  -> 收到 Error：只写 history，不进入推理或实时上下文
+  -> 收到 Tool：写 recent/history，从 req.ctx 推导未完成调用，全部完成后发 inference
+  -> 收到 Error：只写 history，不进入推理或 state
 ```
 
 ## 7. Agent 生命周期与失败
@@ -150,13 +150,14 @@ ToolCallEvent
 每个 Agent 一个独立 SQLite 文件：
 
 ```text
-history_messages  User / Assistant / Tool / Error
-realtime_context  ordered MclMessage { Message, Option<TokenUsage> }
+history_messages  User / Assistant / Tool / Error 以及显式 mcl 记录
+setting           通用 state blob（含实时上下文快照）
 ```
 
 - 历史表：客户端可展示对话的唯一来源。
-- 实时表：Base Lua 恢复上下文用的有序快照；上下文压缩只替换实时表。
-- Error 只进入历史表，不进入实时上下文。
+- state 表：保存 driver 通过 `BIND ... TO STATE` 声明的动态 block；实时上下文是其中一个普通 state。
+- Error 只进入历史表，不进入 state。
+- 上下文压缩由 driver 显式更新 `realtime_state` block，state 表随绑定自动落盘。
 
 ## 11. API 与前端
 
