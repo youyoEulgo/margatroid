@@ -204,9 +204,7 @@ pub enum MclEffectCommand {
     DefaultVisibilitySource {
         source: BlockPath,
     },
-    SettingLoad {
-        key: String,
-    },
+    SettingLoad { source: BlockPath },
     RealtimeLoad,
 }
 #[derive(Clone, Debug)]

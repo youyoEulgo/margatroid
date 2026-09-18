@@ -126,7 +126,7 @@ impl AgentMemoryStore for AgentMemory {
         })
     }
 
-    fn setting_value(&self, key: &str) -> Result<Vec<String>, AgentMemoryStoreError> {
+    fn setting_value(&self, key: &str) -> Result<Option<Vec<String>>, AgentMemoryStoreError> {
         let connection = lock_connection(self).map_err(memory_store_error)?;
         let value = connection
             .query_row(
@@ -138,9 +138,9 @@ impl AgentMemoryStore for AgentMemory {
             .map_err(read_error)
             .map_err(memory_store_error)?;
         let Some(value) = value else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
-        serde_json::from_str::<Vec<String>>(&value).map_err(|error| {
+        serde_json::from_str::<Vec<String>>(&value).map(Some).map_err(|error| {
             memory_store_error(MemoryError::new(
                 MemoryErrorKind::DecodeFailed,
                 error.to_string(),
