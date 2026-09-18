@@ -282,11 +282,16 @@ fn parse_effect(
                 effect: MclEffectCommand::RealtimeLoad,
             })
         }
-        ("setting_load", 4) => {
+        ("setting_load", 7)
+            if words.get(3) == Some(&"(SELECT")
+                && words.get(5) == Some(&"FROM")
+                && words.get(6).is_some_and(|value| value.ends_with(')')) =>
+        {
             reject_binding(binding)?;
+            let block_id = words[6].strip_suffix(')').ok_or(MclError::InvalidCommand)?;
             Ok(MclOperation::Emit {
                 effect: MclEffectCommand::SettingLoad {
-                    key: effect_ref_block(words[3])?,
+                    source: path(block_id, words[4])?,
                 },
             })
         }
@@ -1140,8 +1145,9 @@ pub fn setting_source(
 pub fn setting_load(
     world: &mut World,
     agent_id: &ResourceId,
-    key: String,
+    source: BlockPath,
 ) -> Result<MclDomainValue, MclError> {
+    let key = format!("{}/{}", source.block_id, source.inner_id);
     let entity = world
         .entity_by_resource_id(agent_id)
         .map_err(|_| MclError::AgentMissing)?;
@@ -1151,6 +1157,9 @@ pub fn setting_load(
         .memory
         .setting_value(&key)
         .map_err(|_| MclError::ImportMissing("stored setting could not be read".to_owned()))?;
+    let Some(stored) = stored else {
+        return Ok(MclDomainValue::Unit);
+    };
     let values = stored
         .iter()
         .filter_map(|resource| resource.parse().ok())
