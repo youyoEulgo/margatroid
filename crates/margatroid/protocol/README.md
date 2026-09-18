@@ -129,7 +129,7 @@ API 中间事件。WorkspacePlugin直接按完整`ResourceId`查找Agent并解�
       "project_root": "/project/demo"
     },
     "agent": "agent:demo/coder:latest",
-    "command": "SELECT pending_tool FROM msg",
+    "command": "GET msg.recent_conversation",
     "binding": null
   }
 }

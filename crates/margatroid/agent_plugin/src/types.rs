@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use core_plugin::Entity;
 use margatroid_types::{
     AgentError, AgentErrorKind, Block, BlockAssembly, BlockInner, BlockPath, InnerType, LuaVmId,
-    MclDeleteSelection, MclMessage, MclRealtimeSource, Message, RefBlock, RefBlockAssembly,
+    Message, RefBlock, RefBlockAssembly,
     RefMerge, ResourceId, TokenUsage, ToolDefinition,
 };
 use tokio::sync::oneshot;
@@ -358,6 +358,10 @@ pub trait AgentMemoryStore: Send + Sync + 'static {
 
     fn setting_value(&self, key: &str) -> Result<Option<Vec<String>>, AgentMemoryStoreError>;
 
+    fn set_state(&self, key: &str, value: &str) -> Result<(), AgentMemoryStoreError>;
+
+    fn state_value(&self, key: &str) -> Result<Option<String>, AgentMemoryStoreError>;
+
     fn append_record(
         &self,
         kind: &str,
@@ -365,10 +369,6 @@ pub trait AgentMemoryStore: Send + Sync + 'static {
         payload: &str,
         source: &str,
     ) -> Result<(), AgentMemoryStoreError>;
-
-    fn rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError>;
-
-    fn read_realtime(&self) -> Result<Vec<MclMessage>, AgentMemoryStoreError>;
 
     fn history_messages(&self) -> Result<Vec<HistoryMessage>, AgentMemoryStoreError>;
 }
@@ -417,6 +417,14 @@ impl AgentMemoryHandle {
         self.inner.setting_value(key)
     }
 
+    pub fn set_state(&self, key: &str, value: &str) -> Result<(), AgentMemoryStoreError> {
+        self.inner.set_state(key, value)
+    }
+
+    pub fn state_value(&self, key: &str) -> Result<Option<String>, AgentMemoryStoreError> {
+        self.inner.state_value(key)
+    }
+
     pub fn append_record(
         &self,
         kind: &str,
@@ -425,14 +433,6 @@ impl AgentMemoryHandle {
         source: &str,
     ) -> Result<(), AgentMemoryStoreError> {
         self.inner.append_record(kind, content, payload, source)
-    }
-
-    pub fn rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError> {
-        self.inner.rewrite_realtime(messages)
-    }
-
-    pub fn read_realtime(&self) -> Result<Vec<MclMessage>, AgentMemoryStoreError> {
-        self.inner.read_realtime()
     }
 
     pub fn history_messages(&self) -> Result<Vec<HistoryMessage>, AgentMemoryStoreError> {
@@ -450,7 +450,7 @@ impl fmt::Debug for AgentMemoryHandle {
 pub struct AgentMcl {
     blocks: BlockAssembly,
     ref_blocks: RefBlockAssembly,
-    realtime_source: Option<MclRealtimeSource>,
+    state_bindings: HashMap<String, String>,
 }
 
 impl AgentMcl {
@@ -460,6 +460,51 @@ impl AgentMcl {
 
     pub fn ref_blocks(&self) -> &RefBlockAssembly {
         &self.ref_blocks
+    }
+
+    pub fn block(&self, block_id: &str) -> Result<Block, AgentError> {
+        self.blocks
+            .blocks
+            .get(block_id)
+            .cloned()
+            .ok_or_else(|| AgentError::new(AgentErrorKind::BlockMissing, "block is missing"))
+    }
+
+    pub fn merge_block(&mut self, block_id: &str, stored: Block) -> Result<(), AgentError> {
+        let target = self
+            .blocks
+            .blocks
+            .get_mut(block_id)
+            .ok_or_else(|| AgentError::new(AgentErrorKind::BlockMissing, "block is missing"))?;
+        for (inner_id, value) in stored.inners {
+            if let Some(existing) = target.inners.get(&inner_id) {
+                if existing.inner_type() != value.inner_type() {
+                    return Err(type_mismatch());
+                }
+                target.inners.insert(inner_id, value);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn bind_state(&mut self, block_id: String, state_name: String) -> Result<(), AgentError> {
+        if !self.blocks.blocks.contains_key(&block_id) {
+            return Err(AgentError::new(AgentErrorKind::BlockMissing, "block is missing"));
+        }
+        if let Some(existing) = self.state_bindings.get(&state_name) {
+            if existing != &block_id {
+                return Err(AgentError::new(
+                    AgentErrorKind::InvalidRequest,
+                    "state is already bound",
+                ));
+            }
+        }
+        self.state_bindings.insert(state_name, block_id);
+        Ok(())
+    }
+
+    pub fn state_bindings(&self) -> &HashMap<String, String> {
+        &self.state_bindings
     }
 
     pub fn select(&self, target: &BlockPath) -> Result<BlockInner, AgentError> {
@@ -504,7 +549,6 @@ impl AgentMcl {
         }
         Ok(match kind {
             InnerType::Message => RefMerge::Message(sources.to_vec()),
-            InnerType::ToolCall => RefMerge::ToolCall(sources.to_vec()),
             InnerType::ResourceId => RefMerge::ResourceId(sources.to_vec()),
         })
     }
@@ -532,17 +576,10 @@ impl AgentMcl {
     pub fn delete(
         &mut self,
         target: &BlockPath,
-        selection: MclDeleteSelection,
+        selection: Vec<usize>,
     ) -> Result<(), AgentError> {
         let slot = self.real_inner_mut(target)?;
-        let mut indices = match selection {
-            MclDeleteSelection::All => {
-                *slot = empty_inner(slot.inner_type());
-                return Ok(());
-            }
-            MclDeleteSelection::First => vec![0],
-            MclDeleteSelection::Indices(indices) => indices,
-        };
+        let mut indices = selection;
         indices.sort_unstable();
         indices.dedup();
         if indices.iter().any(|index| *index >= slot.len()) {
@@ -554,9 +591,6 @@ impl AgentMcl {
         for index in indices.into_iter().rev() {
             match slot {
                 BlockInner::Message(values) => {
-                    values.remove(index);
-                }
-                BlockInner::ToolCall(values) => {
                     values.remove(index);
                 }
                 BlockInner::ResourceId(values) => {
@@ -576,12 +610,51 @@ impl AgentMcl {
         Ok(())
     }
 
-    pub fn realtime_source(&self) -> Option<&MclRealtimeSource> {
-        self.realtime_source.as_ref()
+    pub fn insert_at(
+        &mut self,
+        target: &BlockPath,
+        index: usize,
+        after: bool,
+        values: BlockInner,
+    ) -> Result<(), AgentError> {
+        let slot = self.real_inner_mut(target)?;
+        if slot.inner_type() != values.inner_type() || index >= slot.len() {
+            return Err(type_mismatch());
+        }
+        let position = if after { index + 1 } else { index };
+        match (slot, values) {
+            (BlockInner::Message(target), BlockInner::Message(values)) => {
+                target.splice(position..position, values);
+            }
+            (BlockInner::ResourceId(target), BlockInner::ResourceId(values)) => {
+                target.splice(position..position, values);
+            }
+            _ => return Err(type_mismatch()),
+        }
+        Ok(())
     }
 
-    pub fn set_realtime_source(&mut self, source: MclRealtimeSource) {
-        self.realtime_source = Some(source);
+    pub fn replace_range(
+        &mut self,
+        target: &BlockPath,
+        start: usize,
+        end: usize,
+        values: BlockInner,
+    ) -> Result<(), AgentError> {
+        let slot = self.real_inner_mut(target)?;
+        if slot.inner_type() != values.inner_type() || start > end || end > slot.len() {
+            return Err(type_mismatch());
+        }
+        match (slot, values) {
+            (BlockInner::Message(target), BlockInner::Message(values)) => {
+                target.splice(start..end, values);
+            }
+            (BlockInner::ResourceId(target), BlockInner::ResourceId(values)) => {
+                target.splice(start..end, values);
+            }
+            _ => return Err(type_mismatch()),
+        }
+        Ok(())
     }
 
     fn ensure_block_id_available(&self, block_id: &str) -> Result<(), AgentError> {
@@ -620,7 +693,6 @@ impl AgentMcl {
 fn empty_inner(kind: InnerType) -> BlockInner {
     match kind {
         InnerType::Message => BlockInner::Message(Vec::new()),
-        InnerType::ToolCall => BlockInner::ToolCall(Vec::new()),
         InnerType::ResourceId => BlockInner::ResourceId(Vec::new()),
     }
 }
@@ -628,7 +700,6 @@ fn empty_inner(kind: InnerType) -> BlockInner {
 fn append_inner(target: &mut BlockInner, values: BlockInner) -> Result<(), AgentError> {
     match (target, values) {
         (BlockInner::Message(target), BlockInner::Message(values)) => target.extend(values),
-        (BlockInner::ToolCall(target), BlockInner::ToolCall(values)) => target.extend(values),
         (BlockInner::ResourceId(target), BlockInner::ResourceId(values)) => target.extend(values),
         _ => return Err(type_mismatch()),
     }

@@ -1308,7 +1308,7 @@ mod tests {
             "message": {
                 "workspace": workspace_reference(),
                 "agent": "agent:demo/coder:latest",
-                "command": "SELECT recent_conversation FROM msg",
+                "command": "GET msg.recent_conversation",
                 "binding": null
             }
         }))
@@ -1324,7 +1324,7 @@ mod tests {
         assert_eq!(route.source, "client:webui/console:1");
         assert_eq!(route.workspace.name, "demo");
         assert_eq!(route.agent.unwrap().to_string(), "agent:demo/coder:latest");
-        assert_eq!(route.command, "SELECT recent_conversation FROM msg");
+        assert_eq!(route.command, "GET msg.recent_conversation");
 
         let success = serde_json::to_value(ServerMessage::MclCommandResult {
             id: "mcl-1".into(),

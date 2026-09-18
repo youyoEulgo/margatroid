@@ -206,7 +206,7 @@ handle_agent_message(world: &mut World, event: AgentMessage)
         要求目标Entity同时具有Agent和ResourceId、Agent.lifecycle为Running且Agent.lua.vm_id存在
         验证User不携带tool_calls
         将event.id、event.message和event.usage组合成AgentLuaMessageEnvelope，再转换为LuaValue并调用LuaRuntimeHandle::send_message
-        不解析消息角色、不维护pending_tool、不写上下文、不启动下一轮推理
+        不解析消息角色、不维护待完成工具调用、不写上下文、不启动下一轮推理
         投递成功即结束；投递失败时写入Agent.last_error、把生命周期设为Failed并停止长期VM，使正在等待start的邮箱receive以错误完成
 
 handle_lua_vm_started(world: &mut World, event: LuaVmStarted)
@@ -396,7 +396,7 @@ crate公开：
 AgentMcl：MCL数据，公开结构体--Agent持有的MCL运行时存储，由自身封装Block和RefBlock的机械存取
     blocks: BlockAssembly--真实Block程序集，私有
     ref_blocks: RefBlockAssembly--引用Block程序集，私有
-    realtime_source: Option<MclRealtimeSource>--MclPlugin声明的实时上下文Message RefMerge来源；未声明时为空
+    state_bindings: HashMap<String, String>--MCL state 名称到普通 Block ID 的绑定
     blocks(&self) -> &BlockAssembly
         读取真实Block程序集：公开方法
     ref_blocks(&self) -> &RefBlockAssembly
@@ -422,10 +422,14 @@ AgentMcl：MCL数据，公开结构体--Agent持有的MCL运行时存储，由�
         删除字段值：公开方法，找到目标Block字段并按已经解析的删除范围移除元素；保持剩余元素顺序，整个方法原子完成
     cover(&mut self, target: &BlockPath, values: BlockInner) -> Result<(), AgentError>
         覆盖字段值：公开方法，找到目标Block字段，验证BlockInner类型一致后整体替换数组；整个方法原子完成
-    realtime_source(&self) -> Option<&MclRealtimeSource>
-        读取实时来源：crate公开方法，只返回当前来源描述
-    set_realtime_source(&mut self, source: MclRealtimeSource)
-        设置实时来源：crate公开方法，用新声明整体替换旧来源；MclPlugin必须在调用前完成RefMerge验证和当前快照展开
+    block(&self, block_id: &str) -> Result<Block, AgentError>
+        读取普通 Block 快照：公开方法，用于 state 序列化
+    merge_block(&mut self, block_id: &str, stored: Block) -> Result<(), AgentError>
+        将 state 中已存在且类型匹配的字段覆盖回普通 Block
+    bind_state(&mut self, block_id: String, state_name: String) -> Result<(), AgentError>
+        建立普通 Block 到 state 的幂等绑定
+    state_bindings(&self) -> &HashMap<String, String>
+        读取 state 绑定表
 
 AgentResourceMap：Agent资源数据，crate公开结构体--ToolPlugin写入的唯一Agent资源聚合；不再挂载独立工具映射Component
     resources: BTreeMap<ResourceId, bool>--已通过IMPORT验证的资源及可用状态
@@ -451,22 +455,31 @@ HistoryMessage：可展示历史条目，crate公开结构体--MemoryPlugin实�
     impl Clone + PartialEq for HistoryMessage
 
 AgentMemoryHandle：Agent存储数据，crate公开结构体--MemoryPlugin创建的可克隆存储句柄
-    inner: Arc<dyn AgentMemoryStore>--历史与实时存储接口
-    append_history(&self, turn_id: &str, message: &Message, tool_schema: &[ToolDefinition], usage: Option<&TokenUsage>) -> Result<(), AgentMemoryStoreError>
+    inner: Arc<dyn AgentMemoryStore>--历史、配置与 state 存储接口
+    append_history(&self, turn_id: &str, source: &str, message: &Message, tool_schema: &[ToolDefinition], usage: Option<&TokenUsage>) -> Result<(), AgentMemoryStoreError>
         追加历史：crate公开方法，转发给inner
-    rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError>
-        覆盖实时上下文：crate公开方法，转发完整快照给inner
-    read_realtime(&self) -> Result<Vec<MclMessage>, AgentMemoryStoreError>
-        读取实时上下文：crate公开方法，返回完整有序快照
+    set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError>
+        写入 RESOURCE 配置：crate公开方法，按键 upsert
+    setting_value(&self, key: &str) -> Result<Option<Vec<String>>, AgentMemoryStoreError>
+        读取 RESOURCE 配置：crate公开方法，None 表示从未设置，Some(vec) 表示已设置（可空）
+    set_state(&self, key: &str, value: &str) -> Result<(), AgentMemoryStoreError>
+        写入 state blob：crate公开方法，保存完整 Block JSON
+    state_value(&self, key: &str) -> Result<Option<String>, AgentMemoryStoreError>
+        读取 state blob：crate公开方法
+    append_record(&self, kind: &str, content: &str, payload: &str, source: &str) -> Result<(), AgentMemoryStoreError>
+        追加显式时间线记录：crate公开方法
     history_messages(&self) -> Result<Vec<HistoryMessage>, AgentMemoryStoreError>
         读取展示历史：crate公开方法，转发给inner
     impl Clone for AgentMemoryHandle
 
 AgentMemoryStore：Agent存储接口，crate公开trait--由MemoryPlugin实现，types crate只定义协议
     继承：Send + Sync + 'static
-    append_history(&self, turn_id: &str, message: &Message, tool_schema: &[ToolDefinition], usage: Option<&TokenUsage>) -> Result<(), AgentMemoryStoreError>
-    rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError>
-    read_realtime(&self) -> Result<Vec<MclMessage>, AgentMemoryStoreError>
+    append_history(&self, turn_id: &str, source: &str, message: &Message, tool_schema: &[ToolDefinition], usage: Option<&TokenUsage>) -> Result<(), AgentMemoryStoreError>
+    set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError>
+    setting_value(&self, key: &str) -> Result<Option<Vec<String>>, AgentMemoryStoreError>
+    set_state(&self, key: &str, value: &str) -> Result<(), AgentMemoryStoreError>
+    state_value(&self, key: &str) -> Result<Option<String>, AgentMemoryStoreError>
+    append_record(&self, kind: &str, content: &str, payload: &str, source: &str) -> Result<(), AgentMemoryStoreError>
     history_messages(&self) -> Result<Vec<HistoryMessage>, AgentMemoryStoreError>
 
 AgentMemoryStoreError：Agent存储接口错误，crate公开结构体--不包含数据库内容、SQL或消息正文

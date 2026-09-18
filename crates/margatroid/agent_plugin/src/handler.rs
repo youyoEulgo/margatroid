@@ -64,15 +64,6 @@ pub fn handle_agent_create(world: &mut World, request: AgentCreateRequest) {
         return;
     }
 
-    if let Err(error) = request.memory.read_realtime() {
-        tracing::error!(request_id = %request.id, error = %error, "agent memory is unavailable");
-        request.reply.send(Err(failure(
-            AgentFailureKind::InvalidRequest,
-            format!("agent memory is unavailable: {error}"),
-        )));
-        return;
-    }
-
     let entity = world.spawn();
     let info = AgentInfo {
         image_entity: request.image_entity,
@@ -475,7 +466,7 @@ fn json_to_lua(value: serde_json::Value) -> LuaValue {
 mod tests {
     use std::sync::Arc;
 
-    use margatroid_types::{AgentError, LuaVmId, MclMessage, Message, TokenUsage, ToolDefinition};
+    use margatroid_types::{AgentError, LuaVmId, Message, TokenUsage, ToolDefinition};
 
     use super::*;
     use crate::{AgentMemoryHandle, AgentMemoryStore, AgentMemoryStoreError};
@@ -484,6 +475,14 @@ mod tests {
 
     impl AgentMemoryStore for EmptyMemory {
         fn setting_value(&self, _key: &str) -> Result<Option<Vec<String>>, AgentMemoryStoreError> {
+            Ok(None)
+        }
+
+        fn set_state(&self, _key: &str, _value: &str) -> Result<(), AgentMemoryStoreError> {
+            Ok(())
+        }
+
+        fn state_value(&self, _key: &str) -> Result<Option<String>, AgentMemoryStoreError> {
             Ok(None)
         }
 
@@ -513,14 +512,6 @@ mod tests {
             _usage: Option<&TokenUsage>,
         ) -> Result<(), AgentMemoryStoreError> {
             Ok(())
-        }
-
-        fn rewrite_realtime(&self, _messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError> {
-            Ok(())
-        }
-
-        fn read_realtime(&self) -> Result<Vec<MclMessage>, AgentMemoryStoreError> {
-            Ok(Vec::new())
         }
 
         fn history_messages(&self) -> Result<Vec<crate::HistoryMessage>, AgentMemoryStoreError> {

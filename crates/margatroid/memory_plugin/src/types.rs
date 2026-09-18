@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_plugin::{AgentMemoryStore, AgentMemoryStoreError, HistoryMessage};
-use margatroid_types::{MclMessage, Message, TokenUsage, ToolDefinition};
+use margatroid_types::{Message, TokenUsage, ToolDefinition};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::error::{MemoryError, MemoryErrorKind};
@@ -18,13 +18,6 @@ CREATE TABLE IF NOT EXISTS history_messages (
     payload TEXT,
     source TEXT
 );
-CREATE TABLE IF NOT EXISTS realtime_context (
-    position INTEGER PRIMARY KEY,
-    message TEXT NOT NULL,
-    input_tokens INTEGER,
-    output_tokens INTEGER,
-    cache_hit_tokens INTEGER
-);
 CREATE TABLE IF NOT EXISTS setting (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -37,18 +30,8 @@ pub struct AgentMemory {
     connection: Mutex<Connection>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RealtimeContext {
-    pub messages: Vec<Message>,
-    pub tool_context: Vec<Message>,
-    pub ordered_messages: Vec<Message>,
-    pub token_usage: TokenUsage,
-    pub last_input_tokens: u64,
-}
-
-
 impl AgentMemory {
-    pub fn open(path: impl Into<PathBuf>) -> Result<(Self, RealtimeContext), MemoryError> {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, MemoryError> {
         let path = path.into();
         validate_path(&path)?;
         let parent = path.parent().ok_or_else(|| {
@@ -70,16 +53,10 @@ impl AgentMemory {
             )
         })?;
         initialize_schema(&mut connection)?;
-        let mut context = load_realtime_context(&connection)?;
-        context.token_usage = load_token_usage(&connection)?;
-        context.last_input_tokens = load_last_input_tokens(&connection)?;
-        Ok((
-            Self {
-                path,
-                connection: Mutex::new(connection),
-            },
-            context,
-        ))
+        Ok(Self {
+            path,
+            connection: Mutex::new(connection),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -148,6 +125,32 @@ impl AgentMemoryStore for AgentMemory {
         })
     }
 
+    fn set_state(&self, key: &str, value: &str) -> Result<(), AgentMemoryStoreError> {
+        let connection = lock_connection(self).map_err(memory_store_error)?;
+        let now = current_unix_milliseconds().map_err(memory_store_error)?;
+        connection
+            .execute(
+                "INSERT INTO setting (key, value, updated_at_ms) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at_ms = excluded.updated_at_ms",
+                params![format!("mcl.state/{key}"), value, now],
+            )
+            .map_err(schema_error)
+            .map_err(memory_store_error)?;
+        Ok(())
+    }
+
+    fn state_value(&self, key: &str) -> Result<Option<String>, AgentMemoryStoreError> {
+        let connection = lock_connection(self).map_err(memory_store_error)?;
+        connection
+            .query_row(
+                "SELECT value FROM setting WHERE key = ?1",
+                params![format!("mcl.state/{key}")],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(read_error)
+            .map_err(memory_store_error)
+    }
+
     fn set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError> {
         let mut connection = lock_connection(self).map_err(memory_store_error)?;
         let transaction = connection.transaction().map_err(|error| {
@@ -210,46 +213,6 @@ impl AgentMemoryStore for AgentMemory {
         })
     }
 
-    fn rewrite_realtime(&self, messages: &[MclMessage]) -> Result<(), AgentMemoryStoreError> {
-        let mut connection = lock_connection(self).map_err(memory_store_error)?;
-        let transaction = connection.transaction().map_err(|error| {
-            memory_store_error(MemoryError::new(
-                MemoryErrorKind::WriteFailed,
-                error.to_string(),
-            ))
-        })?;
-        let entries = messages
-            .iter()
-            .cloned()
-            .map(|entry| MclMessage {
-                message: entry.message,
-                usage: entry.usage,
-            })
-            .collect::<Vec<_>>();
-        rewrite_realtime_context(&transaction, &entries).map_err(memory_store_error)?;
-        transaction.commit().map_err(|error| {
-            memory_store_error(MemoryError::new(
-                MemoryErrorKind::WriteFailed,
-                error.to_string(),
-            ))
-        })
-    }
-
-    fn read_realtime(&self) -> Result<Vec<MclMessage>, AgentMemoryStoreError> {
-        let connection = lock_connection(self).map_err(memory_store_error)?;
-        load_ordered_realtime_messages(&connection)
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|entry| MclMessage {
-                        message: entry.message,
-                        usage: entry.usage,
-                    })
-                    .collect()
-            })
-            .map_err(memory_store_error)
-    }
-
     fn history_messages(&self) -> Result<Vec<HistoryMessage>, AgentMemoryStoreError> {
         AgentMemory::history_messages(self).map_err(memory_store_error)
     }
@@ -288,10 +251,6 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
     let stale_history = table_exists(connection, "history_messages")? && !history_is_current;
     let legacy_realtime = table_has_column(connection, "realtime_messages", "position")?
         && !table_has_column(connection, "realtime_messages", "context")?;
-    let realtime_context_exists = table_exists(connection, "realtime_context")?;
-    let realtime_has_input = table_has_column(connection, "realtime_context", "input_tokens")?;
-    let realtime_has_output = table_has_column(connection, "realtime_context", "output_tokens")?;
-    let realtime_has_cache = table_has_column(connection, "realtime_context", "cache_hit_tokens")?;
     let transaction = connection.transaction().map_err(|_| {
         MemoryError::new(
             MemoryErrorKind::SchemaFailed,
@@ -319,24 +278,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
     transaction
         .execute_batch(HISTORY_SCHEMA)
         .map_err(schema_error)?;
-    if realtime_context_exists {
-        for (missing, column) in [
-            (!realtime_has_input, "input_tokens"),
-            (!realtime_has_output, "output_tokens"),
-            (!realtime_has_cache, "cache_hit_tokens"),
-        ] {
-            if missing {
-                transaction
-                    .execute(
-                        &format!("ALTER TABLE realtime_context ADD COLUMN {column} INTEGER"),
-                        [],
-                    )
-                    .map_err(schema_error)?;
-            }
-        }
-    }
     if legacy_realtime {
-        migrate_realtime(&transaction)?;
         transaction
             .execute("DROP TABLE realtime_messages_legacy", [])
             .map_err(schema_error)?;
@@ -377,52 +319,6 @@ fn table_has_column(
 
 
 
-fn migrate_realtime(transaction: &Transaction<'_>) -> Result<(), MemoryError> {
-    let mut statement = transaction
-        .prepare("SELECT message FROM realtime_messages_legacy ORDER BY position")
-        .map_err(schema_error)?;
-    let rows = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(schema_error)?;
-    let mut context = RealtimeContext::default();
-    for row in rows {
-        let encoded = row.map_err(schema_error)?;
-        let message = serde_json::from_str(&encoded).map_err(|_| {
-            MemoryError::new(
-                MemoryErrorKind::DecodeFailed,
-                "legacy realtime message could not be decoded",
-            )
-        })?;
-        match message {
-            Message::User { .. } | Message::Assistant { .. } => {
-                context.messages.push(message.clone());
-                context.ordered_messages.push(message);
-            }
-            Message::Tool { .. } => {
-                context.tool_context.push(message.clone());
-                context.ordered_messages.push(message);
-            }
-            Message::System { .. } | Message::Error { .. } => {
-                return Err(MemoryError::new(
-                    MemoryErrorKind::DecodeFailed,
-                    "legacy realtime context contains an invalid message",
-                ));
-            }
-        }
-    }
-    rewrite_realtime_context(
-        transaction,
-        &context
-            .ordered_messages
-            .into_iter()
-            .map(|message| MclMessage {
-                message,
-                usage: None,
-            })
-            .collect::<Vec<_>>(),
-    )
-}
-
 fn schema_error(_: rusqlite::Error) -> MemoryError {
     MemoryError::new(
         MemoryErrorKind::SchemaFailed,
@@ -449,142 +345,6 @@ fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>,
     rows.collect::<Result<Vec<_>, _>>().map_err(read_error)
 }
 
-fn load_token_usage(connection: &Connection) -> Result<TokenUsage, MemoryError> {
-    let mut usage = TokenUsage::default();
-    for entry in load_history_messages(connection)? {
-        if let Some(entry_usage) = entry.usage() {
-            usage.input_tokens += entry_usage.input_tokens;
-            usage.output_tokens += entry_usage.output_tokens;
-            usage.cache_hit_tokens += entry_usage.cache_hit_tokens;
-        }
-    }
-    Ok(usage)
-}
-
-fn load_last_input_tokens(connection: &Connection) -> Result<u64, MemoryError> {
-    Ok(load_history_messages(connection)?
-        .iter()
-        .rev()
-        .find_map(|entry| entry.usage().map(|usage| usage.input_tokens))
-        .unwrap_or_default())
-}
-
-
-fn load_realtime_context(connection: &Connection) -> Result<RealtimeContext, MemoryError> {
-    let entries = load_ordered_realtime_messages(connection)?;
-    let ordered_messages = entries
-        .iter()
-        .map(|entry| entry.message.clone())
-        .collect::<Vec<_>>();
-    Ok(RealtimeContext {
-        messages: ordered_messages
-            .iter()
-            .filter(|message| matches!(message, Message::User { .. } | Message::Assistant { .. }))
-            .cloned()
-            .collect(),
-        tool_context: ordered_messages
-            .iter()
-            .filter(|message| matches!(message, Message::Tool { .. }))
-            .cloned()
-            .collect(),
-        ordered_messages,
-        ..RealtimeContext::default()
-    })
-}
-
-fn load_ordered_realtime_messages(connection: &Connection) -> Result<Vec<MclMessage>, MemoryError> {
-    let mut statement = connection
-        .prepare("SELECT position, message, input_tokens, output_tokens, cache_hit_tokens FROM realtime_context ORDER BY position")
-        .map_err(read_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-            ))
-        })
-        .map_err(read_error)?;
-    let mut messages = Vec::new();
-    for row in rows {
-        let (position, encoded, input, output, cache_hit) = row.map_err(read_error)?;
-        if position != messages.len() as i64 {
-            return Err(MemoryError::new(
-                MemoryErrorKind::DecodeFailed,
-                "ordered realtime message positions are not continuous",
-            ));
-        }
-        let message = serde_json::from_str::<Message>(&encoded).map_err(|_| {
-            MemoryError::new(
-                MemoryErrorKind::DecodeFailed,
-                "ordered realtime message JSON could not be decoded",
-            )
-        })?;
-        let usage = match (input, output, cache_hit) {
-            (None, None, None) => None,
-            (Some(input), Some(output), Some(cache_hit)) => Some(TokenUsage {
-                input_tokens: u64::try_from(input).map_err(|_| {
-                    MemoryError::new(
-                        MemoryErrorKind::DecodeFailed,
-                        "realtime input token usage is negative",
-                    )
-                })?,
-                output_tokens: u64::try_from(output).map_err(|_| {
-                    MemoryError::new(
-                        MemoryErrorKind::DecodeFailed,
-                        "realtime output token usage is negative",
-                    )
-                })?,
-                cache_hit_tokens: u64::try_from(cache_hit).map_err(|_| {
-                    MemoryError::new(
-                        MemoryErrorKind::DecodeFailed,
-                        "realtime cache token usage is negative",
-                    )
-                })?,
-            }),
-            _ => {
-                return Err(MemoryError::new(
-                    MemoryErrorKind::DecodeFailed,
-                    "realtime token usage is incomplete",
-                ))
-            }
-        };
-        messages.push(MclMessage { message, usage });
-    }
-    Ok(messages)
-}
-
-fn rewrite_realtime_context(
-    transaction: &Transaction<'_>,
-    ordered_messages: &[MclMessage],
-) -> Result<(), MemoryError> {
-    transaction
-        .execute("DELETE FROM realtime_context", [])
-        .map_err(write_error)?;
-    for (position, entry) in ordered_messages.iter().enumerate() {
-        let encoded = serde_json::to_string(&entry.message).map_err(|_| {
-            MemoryError::new(
-                MemoryErrorKind::WriteFailed,
-                "ordered realtime message JSON could not be encoded",
-            )
-        })?;
-        transaction
-            .execute(
-                "INSERT INTO realtime_context (position, message, input_tokens, output_tokens, cache_hit_tokens) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    position as i64,
-                    encoded,
-                    entry.usage.as_ref().map(|usage| usage.input_tokens as i64),
-                    entry.usage.as_ref().map(|usage| usage.output_tokens as i64),
-                    entry.usage.as_ref().map(|usage| usage.cache_hit_tokens as i64),
-                ],
-            )
-            .map_err(write_error)?;
-    }
-    Ok(())
-}
 
 fn insert_history_message_values(
     transaction: &Transaction<'_>,
@@ -685,8 +445,4 @@ fn current_unix_milliseconds() -> Result<i64, MemoryError> {
 
 fn read_error(_: rusqlite::Error) -> MemoryError {
     MemoryError::new(MemoryErrorKind::ReadFailed, "memory database read failed")
-}
-
-fn write_error(_: rusqlite::Error) -> MemoryError {
-    MemoryError::new(MemoryErrorKind::WriteFailed, "memory database write failed")
 }
