@@ -162,7 +162,11 @@ end
 
 while true do
     local message = mcl_command("EMIT EFFECT start")
-    if message.type == "user" then
+    if message.type == "inject" then
+        for _, injected in ipairs(message.messages or {}) do
+            append_recent(injected)
+        end
+    elseif message.type == "user" then
         append_recent(message)
         mcl_command("EMIT EFFECT inference FROM req")
     elseif message.type == "assistant" then

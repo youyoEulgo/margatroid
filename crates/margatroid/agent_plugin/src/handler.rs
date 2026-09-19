@@ -185,6 +185,18 @@ pub fn handle_agent_control(world: &mut World, event: AgentControl) {
 }
 
 pub fn handle_agent_message(world: &mut World, event: AgentMessage) {
+    if let Message::Inject { .. } = &event.message {
+        let working = world
+            .get_component::<Agent>(event.agent)
+            .is_some_and(|agent| agent.turn.turn_id.is_some());
+        if working {
+            tracing::warn!(
+                agent = %agent_label(world, event.agent),
+                "context injection ignored while a turn is in flight"
+            );
+            return;
+        }
+    }
     let result = deliver_agent_message(world, &event);
     if let Err(error) = result {
         tracing::error!(agent = %agent_label(world, event.agent), error = %error, "agent message delivery failed");
@@ -355,6 +367,23 @@ fn deliver_agent_message(
             AgentFailureKind::InvalidRequest,
             "system messages cannot enter the agent mailbox",
         ));
+    }
+    if let Message::Inject { messages } = &event.message {
+        if messages.is_empty() {
+            return Err(failure(
+                AgentFailureKind::InvalidRequest,
+                "a context injection cannot be empty",
+            ));
+        }
+        if messages
+            .iter()
+            .any(|inner| matches!(inner, Message::System { .. } | Message::Inject { .. }))
+        {
+            return Err(failure(
+                AgentFailureKind::InvalidRequest,
+                "a context injection may only carry user, assistant, tool or error messages",
+            ));
+        }
     }
     let vm_id = agent
         .lua

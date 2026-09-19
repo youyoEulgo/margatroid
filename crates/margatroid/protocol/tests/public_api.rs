@@ -61,6 +61,58 @@ fn clients_may_not_inject_server_side_facts() {
 }
 
 #[test]
+fn clients_may_inject_context_carrying_any_message_but_an_injection() {
+    let injected = MessageDto::Inject {
+        messages: vec![
+            MessageDto::User {
+                content: "please review".into(),
+            },
+            MessageDto::Assistant {
+                reasoning: None,
+                content: None,
+                tool_calls: vec![ToolCallDto {
+                    id: "manual-1".into(),
+                    tool_name: "code_review".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+        ],
+    };
+    let message = injected.into_domain(()).unwrap();
+    let Message::Inject { messages } = message else {
+        panic!("expected a context injection")
+    };
+    assert_eq!(messages.len(), 2);
+    assert!(matches!(messages[0], Message::User { .. }));
+    assert!(matches!(messages[1], Message::Assistant { .. }));
+
+    let nested = MessageDto::Inject {
+        messages: vec![MessageDto::Inject { messages: vec![] }],
+    };
+    let error = nested.into_domain(()).unwrap_err();
+    assert!(matches!(error.kind(), ProtocolErrorKind::InvalidRequest));
+
+    let server_side = MessageDto::Inject {
+        messages: vec![
+            MessageDto::Tool {
+                resource_id: ResourceIdDto("tool:local/read-file:latest".into()),
+                tool_call_id: "call-1".into(),
+                content: "recorded".into(),
+            },
+            MessageDto::Error {
+                message: "recorded failure".into(),
+            },
+        ],
+    };
+    let message = server_side.into_domain(()).unwrap();
+    let Message::Inject { messages } = message else {
+        panic!("expected a context injection")
+    };
+    assert!(matches!(messages[0], Message::Tool { .. }));
+    assert!(matches!(messages[1], Message::Error { .. }));
+}
+
+#[test]
 fn the_standalone_assistant_message_type_is_gone() {
     let request = serde_json::json!({
         "type": "agent.assistant",

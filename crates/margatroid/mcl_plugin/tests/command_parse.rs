@@ -107,6 +107,42 @@ fn parses_state_bind_and_load() {
 }
 
 #[test]
+fn parses_sandbox_use_arguments() {
+    assert!(matches!(
+        parse_operation(
+            "EMIT EFFECT sandbox_use FROM ?",
+            Some(&json!("workspace_write"))
+        )
+        .unwrap(),
+        MclOperation::Emit {
+            effect: MclEffectCommand::SandboxUse { .. }
+        }
+    ));
+    assert!(matches!(
+        parse_operation(
+            "EMIT EFFECT sandbox_use FROM ?",
+            Some(&json!(["workspace_write", "read_only"]))
+        )
+        .unwrap(),
+        MclOperation::Emit {
+            effect: MclEffectCommand::SandboxUse { .. }
+        }
+    ));
+    assert!(matches!(
+        parse_operation("EMIT EFFECT sandbox_use FROM ?", Some(&json!({}))).unwrap(),
+        MclOperation::Emit {
+            effect: MclEffectCommand::SandboxUse { .. }
+        }
+    ));
+    assert!(parse_operation(
+        "EMIT EFFECT sandbox_use FROM ?",
+        Some(&json!({"unexpected": "field"}))
+    )
+    .is_err());
+    assert!(parse_operation("EMIT EFFECT sandbox_use FROM ?", Some(&json!(7))).is_err());
+}
+
+#[test]
 fn parses_uniform_effect_arguments() {
     assert!(matches!(
         parse_operation("EMIT EFFECT start", None).unwrap(),

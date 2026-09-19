@@ -177,8 +177,8 @@ impl FromDomain<TracingRecord> for LogRecordDto {
     }
 }
 
-impl IntoDomain<Message> for MessageDto {
-    fn into_domain(self, (): ()) -> Result<Message, ProtocolError> {
+impl MessageDto {
+    fn into_message(self, server_side_allowed: bool) -> Result<Message, ProtocolError> {
         match self {
             Self::User { content } => Ok(Message::User { content }),
             Self::Assistant {
@@ -193,11 +193,39 @@ impl IntoDomain<Message> for MessageDto {
                     .map(|call| call.into_domain(()))
                     .collect::<Result<Vec<_>, _>>()?,
             }),
+            Self::Tool {
+                resource_id,
+                tool_call_id,
+                content,
+            } if server_side_allowed => Ok(Message::Tool {
+                resource_id: resource_id.into_domain(())?,
+                tool_call_id,
+                content,
+            }),
+            Self::Error { message } if server_side_allowed => Ok(Message::Error { message }),
             Self::Tool { .. } | Self::Error { .. } => Err(ProtocolError::new(
                 ProtocolErrorKind::InvalidRequest,
                 "clients may only inject user or assistant messages",
             )),
+            Self::Inject { messages } => Ok(Message::Inject {
+                messages: messages
+                    .into_iter()
+                    .map(|inner| match inner {
+                        Self::Inject { .. } => Err(ProtocolError::new(
+                            ProtocolErrorKind::InvalidRequest,
+                            "a context injection cannot nest another injection",
+                        )),
+                        inner => inner.into_message(true),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
         }
+    }
+}
+
+impl IntoDomain<Message> for MessageDto {
+    fn into_domain(self, (): ()) -> Result<Message, ProtocolError> {
+        self.into_message(false)
     }
 }
 
@@ -247,6 +275,9 @@ pub enum MessageDto {
     Error {
         message: String,
     },
+    Inject {
+        messages: Vec<MessageDto>,
+    },
 }
 
 impl FromDomain<&Message> for MessageDto {
@@ -278,6 +309,12 @@ impl FromDomain<&Message> for MessageDto {
             }),
             Message::Error { message } => Ok(Self::Error {
                 message: message.clone(),
+            }),
+            Message::Inject { messages } => Ok(Self::Inject {
+                messages: messages
+                    .iter()
+                    .map(|inner| inner.into_dto(()))
+                    .collect::<Result<Vec<_>, _>>()?,
             }),
             Message::System { .. } => Err(ProtocolError::new(
                 ProtocolErrorKind::UnsupportedMessage,
