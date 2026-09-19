@@ -36,7 +36,10 @@ fn normalize_command(command: &str) -> String {
                 pending_space = true;
             }
             character => {
-                if pending_space && !normalized.ends_with('[') && !normalized.ends_with(',') {
+                if pending_space
+                    && !normalized.ends_with('[')
+                    && (!in_selector || !normalized.ends_with(','))
+                {
                     normalized.push(' ');
                 }
                 pending_space = false;
@@ -377,6 +380,27 @@ fn parse_effect(
                 effect: MclEffectCommand::HistoryAppend {
                     message: parse_message(required_binding(binding)?)?,
                 },
+            })
+        }
+        "sandbox_use" if words == ["EMIT", "EFFECT", "sandbox_use", "FROM", "?"] => {
+            let value = required_binding(binding)?;
+            let aliases = if value.is_array() {
+                value
+                    .as_array()
+                    .ok_or(MclError::TypeMismatch)?
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .ok_or(MclError::TypeMismatch)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                vec![value.as_str().ok_or(MclError::TypeMismatch)?.to_owned()]
+            };
+            Ok(MclOperation::Emit {
+                effect: MclEffectCommand::SandboxUse { aliases },
             })
         }
         "history_record" if words == ["EMIT", "EFFECT", "history_record", "FROM", "?"] => {

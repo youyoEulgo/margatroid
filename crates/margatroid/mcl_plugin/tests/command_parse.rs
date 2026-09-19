@@ -132,6 +132,12 @@ fn parses_uniform_effect_arguments() {
 }
 
 #[test]
+fn parses_multiline_driver_block() {
+    let command = "CREATE BLOCK msg (\n        system_prompt MESSAGE,\n        compact_prompt MESSAGE,\n        compact_context MESSAGE,\n        history_conversation MESSAGE,\n        recent_conversation MESSAGE,\n    )";
+    assert!(parse_operation(command, None).is_ok());
+}
+
+#[test]
 fn parses_create_fields_and_discards_comma_tokens() {
     let operation = parse_operation(
         "CREATE BLOCK msg ( system_prompt MESSAGE history MESSAGE )",

@@ -17,7 +17,6 @@ use core_plugin::{Entity, Event, Resource, World};
 use margatroid_types::ResourceId;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 const SHELL_TYPE: &str = "shell";
 const SHELL_FILE: &str = "shell.toml";
@@ -111,8 +110,7 @@ impl fmt::Display for ShellError {
 
 impl std::error::Error for ShellError {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ShellMetadata {
     schema_version: u32,
@@ -132,6 +130,7 @@ struct ShellPackage {
 struct ShellCallContext {
     project_root: Arc<PathBuf>,
     resource_id: ResourceId,
+    sandbox_policies: Vec<Arc<str>>,
 }
 
 struct ShellResponseGuard {
@@ -337,6 +336,7 @@ fn prepare_shell_tool_call(
             "agent tool environment is missing",
         )
     })?;
+    let sandbox_policies = crate::handler::sandbox::active_sandbox_policies(&agent.resources)?;
     let package_root = Arc::new(find_shell_package(
         &agent.info.project_root,
         &agent.info.image_root,
@@ -347,6 +347,7 @@ fn prepare_shell_tool_call(
         ShellCallContext {
             project_root: Arc::new(agent.info.project_root.clone()),
             resource_id: request.resource_id.clone(),
+            sandbox_policies,
         },
         limits,
     ))
@@ -402,7 +403,24 @@ async fn execute_shell(prepared: &PreparedShellToolCall) -> Result<String, ToolE
             )
         })?;
     let script = prepared.package_root.join(SHELL_SCRIPT_FILE);
-    let (master, mut child) = spawn_pty_shell(&script, command, &prepared.context.project_root)?;
+    let policy_paths = prepared
+        .context
+        .sandbox_policies
+        .iter()
+        .map(|policy| crate::handler::sandbox::write_policy_file(policy))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (master, mut child) = match spawn_pty_shell(
+        &script,
+        command,
+        &prepared.context.project_root,
+        &policy_paths,
+    ) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            crate::handler::sandbox::remove_policy_files(&policy_paths);
+            return Err(error);
+        }
+    };
     let limit = prepared.limits.max_output_bytes;
     let reader = tokio::task::spawn_blocking(move || read_pty_bounded(master, limit));
     let (status, captured) = tokio::time::timeout(prepared.limits.max_execution_time, async {
@@ -418,6 +436,7 @@ async fn execute_shell(prepared: &PreparedShellToolCall) -> Result<String, ToolE
             "Shell process could not be awaited",
         )
     })?;
+    crate::handler::sandbox::remove_policy_files(&policy_paths);
     let captured = captured
         .map_err(|_| {
             ToolError::new(
@@ -468,6 +487,7 @@ fn spawn_pty_shell(
     script: &Path,
     command: &str,
     project_root: &Path,
+    sandbox_policies: &[PathBuf],
 ) -> Result<(std::fs::File, tokio::process::Child), ToolError> {
     let pty = nix::pty::openpty(None, None).map_err(|_| {
         ToolError::new(
@@ -486,7 +506,8 @@ fn spawn_pty_shell(
     let stdin = Stdio::from(pty.slave.try_clone().map_err(duplicate)?);
     let stdout = Stdio::from(pty.slave.try_clone().map_err(duplicate)?);
     let stderr = Stdio::from(pty.slave);
-    let mut process = Command::new("bash");
+    let mut process =
+        crate::handler::sandbox::confined_command(sandbox_policies, Path::new("bash"))?;
     process
         .arg(script)
         .arg(command)

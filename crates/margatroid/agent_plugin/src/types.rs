@@ -184,6 +184,8 @@ pub struct AgentResourceMap {
     pub default_visible_source: Option<BlockPath>,
     pub exposed: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     pub expose_mappings: BTreeMap<String, BTreeMap<String, String>>,
+    pub sandbox_policies: BTreeMap<ResourceId, Arc<str>>,
+    pub active_sandboxes: BTreeSet<ResourceId>,
     pub tool_entries: Vec<AgentResourceEntry>,
 }
 

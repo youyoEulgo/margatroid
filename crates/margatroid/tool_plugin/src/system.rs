@@ -30,7 +30,7 @@ pub(crate) fn tool_register_system(world: &mut World) {
             continue;
         }
         let resource_type = request.resource_id.resource_type();
-        if matches!(resource_type, "skill" | "hook" | "shell") {
+        if matches!(resource_type, "skill" | "hook" | "shell" | "sandbox") {
             continue;
         }
         if resource_type == "tool" {
