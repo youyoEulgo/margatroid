@@ -31,7 +31,6 @@ pub struct ToolPlugin {
 
 impl ToolPlugin {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ToolError> {
-        crate::handler::lua::verify_sandbox()?;
         let root = root.into();
         if !root.is_absolute()
             || root
@@ -98,6 +97,7 @@ impl Plugin for ToolPlugin {
         app.add_system(&self.schedule, tool_register_system)
             .add_system(&self.schedule, handler::skill::skill_register_system)
             .add_system(&self.schedule, handler::hook::hook_register_system)
+            .add_system(&self.schedule, handler::sandbox::sandbox_register_system)
             .add_system(&self.schedule, handler::lua::lua_tool_register_system)
             .add_system(&self.schedule, handler::shell::shell_register_system)
             .add_system(&self.schedule, tool_call_route_system)

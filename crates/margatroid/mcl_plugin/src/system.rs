@@ -525,6 +525,32 @@ pub fn mcl_domain_system(world: &mut World) {
                     &request.source,
                 ),
                 MclOperation::Emit {
+                    effect: crate::MclEffectCommand::SandboxUse { aliases },
+                } => {
+                    let agent = world
+                        .entity_by_resource_id(&request.agent_id)
+                        .map_err(|_| MclError::AgentMissing)?;
+                    let state = world
+                        .get_component_mut::<Agent>(agent)
+                        .ok_or(MclError::AgentMissing)?;
+                    for alias in aliases {
+                        let resource = state
+                            .resources
+                            .aliases
+                            .get(&alias)
+                            .cloned()
+                            .or_else(|| alias.parse::<ResourceId>().ok())
+                            .ok_or_else(|| MclError::ImportMissing(alias.clone()))?;
+                        if resource.resource_type() != "sandbox"
+                            || !state.resources.sandbox_policies.contains_key(&resource)
+                        {
+                            return Err(MclError::TypeMismatch);
+                        }
+                        state.resources.active_sandboxes.insert(resource);
+                    }
+                    Ok(crate::MclDomainValue::Unit)
+                }
+                MclOperation::Emit {
                     effect:
                         crate::MclEffectCommand::HistoryRecord {
                             kind,
@@ -1233,9 +1259,16 @@ pub fn mcl_import_response_system(world: &mut World) {
                     let is_prompt = entry.tool_id.is_none()
                         && entry.template.is_none()
                         && matches!(entry.content.as_ref(), Some(ResourceContent::Prompt { .. }));
+                    let is_sandbox = entry.tool_id.is_none()
+                        && entry.template.is_none()
+                        && matches!(
+                            entry.content.as_ref(),
+                            Some(ResourceContent::Sandbox { .. })
+                        );
                     if alias_conflict
                         || (!is_prompt
-                            && register_agent_resource(world, state.agent, entry).is_err())
+                            && !is_sandbox
+                            && register_agent_resource(world, state.agent, entry.clone()).is_err())
                     {
                         Err(MclError::ImportFailed)
                     } else if let Some(agent) = world.get_component_mut::<Agent>(state.agent) {
@@ -1243,6 +1276,14 @@ pub fn mcl_import_response_system(world: &mut World) {
                             .resources
                             .resources
                             .insert(state.resource_id.clone(), true);
+                        if is_sandbox {
+                            if let Some(ResourceContent::Sandbox { policy }) = entry.content {
+                                agent
+                                    .resources
+                                    .sandbox_policies
+                                    .insert(state.resource_id.clone(), policy);
+                            }
+                        }
                         agent
                             .resources
                             .aliases

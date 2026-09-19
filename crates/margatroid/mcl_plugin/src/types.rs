@@ -206,6 +206,9 @@ pub enum MclEffectCommand {
         content: String,
         payload: String,
     },
+    SandboxUse {
+        aliases: Vec<String>,
+    },
     VisibilitySource {
         source: BlockPath,
     },

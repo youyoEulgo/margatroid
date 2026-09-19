@@ -19,7 +19,6 @@ use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, 
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
 
 const LUA_RUNTIME_ID: &str = "tool:builtin/lua-runtime:latest";
 const TOOL_METADATA_FILE: &str = "tool.toml";
@@ -159,6 +158,7 @@ struct LuaCallContext {
     project_root: Arc<PathBuf>,
     image_root: Arc<PathBuf>,
     package_root: Arc<PathBuf>,
+    sandbox_policies: Vec<PathBuf>,
 }
 
 struct LuaExecutionHandle {
@@ -360,6 +360,10 @@ fn prepare_lua_tool_call(
         &agent.info.image_root,
         &request.resource_id,
     )?);
+    let sandbox_policies = crate::handler::sandbox::active_sandbox_policies(&agent.resources)?
+        .iter()
+        .map(|policy| crate::handler::sandbox::write_policy_file(policy))
+        .collect::<Result<Vec<_>, _>>()?;
     let context = LuaCallContext {
         agent_id,
         turn_id: request.turn_id.clone(),
@@ -367,6 +371,7 @@ fn prepare_lua_tool_call(
         project_root: Arc::new(agent.info.project_root.clone()),
         image_root: Arc::new(agent.info.image_root.clone()),
         package_root: Arc::clone(&package_root),
+        sandbox_policies,
     };
 
     Ok((package_root, LuaExecutionHandle { context, limits }))
@@ -399,6 +404,7 @@ pub struct LuaToolRunRequest {
     pub project_root: PathBuf,
     pub image_root: PathBuf,
     pub limits: LuaExecutionLimits,
+    pub sandbox_policies: Vec<PathBuf>,
 }
 
 pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError> {
@@ -439,6 +445,7 @@ pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolErro
             project_root: Arc::new(request.project_root.clone()),
             image_root: Arc::new(request.image_root.clone()),
             package_root: Arc::new(request.package_root.clone()),
+            sandbox_policies: request.sandbox_policies.clone(),
         },
         limits: limits.clone(),
     };
@@ -476,85 +483,6 @@ pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolErro
     Ok(result)
 }
 
-const SANDBOX_POLICY_PATH: &str = "/tmp/margatroid-sandbox-policy.json";
-
-fn sandbox_backend() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("MARGATROID_SANDBOX_BACKEND") {
-        return Some(PathBuf::from(path));
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for directory in std::env::split_paths(&paths) {
-            let candidate = directory.join("landstrip");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    let directory = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let candidate = directory.join("landstrip");
-    candidate.is_file().then_some(candidate)
-}
-
-fn sandbox_environment_ok(backend: &Path) -> Result<(), ToolError> {
-    let doctor = std::process::Command::new(backend)
-        .arg("doctor")
-        .output()
-        .map_err(|error| {
-            ToolError::new(
-                ToolErrorKind::RunnerFailed,
-                format!("sandbox backend could not be inspected: {error}"),
-            )
-        })?;
-    let healthy = serde_json::from_slice::<serde_json::Value>(&doctor.stdout)
-        .ok()
-        .and_then(|value| value.get("ok").and_then(|flag| flag.as_bool()))
-        .unwrap_or(false);
-    if !doctor.status.success() || !healthy {
-        return Err(ToolError::new(
-            ToolErrorKind::RunnerFailed,
-            format!(
-                "sandbox backend is not usable: {}",
-                String::from_utf8_lossy(&doctor.stderr).trim()
-            ),
-        ));
-    }
-    let validate = std::process::Command::new(backend)
-        .args(["policy", "validate", "-p", SANDBOX_POLICY_PATH])
-        .output()
-        .map_err(|error| {
-            ToolError::new(
-                ToolErrorKind::RunnerFailed,
-                format!("sandbox policy could not be validated: {error}"),
-            )
-        })?;
-    if !validate.status.success() {
-        return Err(ToolError::new(
-            ToolErrorKind::RunnerFailed,
-            format!(
-                "sandbox policy is rejected: {}",
-                String::from_utf8_lossy(&validate.stderr).trim()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn verify_sandbox() -> Result<(), ToolError> {
-    if !Path::new(SANDBOX_POLICY_PATH).is_file() {
-        return Ok(());
-    }
-    let backend = sandbox_backend().ok_or_else(|| {
-        ToolError::new(
-            ToolErrorKind::RunnerFailed,
-            format!(
-                "sandbox policy {SANDBOX_POLICY_PATH} is present but the landstrip backend was not found; \
-                 install landstrip or remove the policy file"
-            ),
-        )
-    })?;
-    sandbox_environment_ok(&backend)
-}
-
 fn tool_runner_path() -> Result<PathBuf, ToolError> {
     if let Some(path) = std::env::var_os("MARGATROID_TOOL_RUNNER") {
         return Ok(PathBuf::from(path));
@@ -588,6 +516,11 @@ async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolEr
         "resource_id": request.resource_id.to_string(),
         "project_root": request.project_root.to_string_lossy(),
         "image_root": request.image_root.to_string_lossy(),
+        "sandbox_policies": request
+            .sandbox_policies
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>(),
         "limits": {
             "max_definition_bytes": request.limits.max_definition_bytes,
             "max_script_bytes": request.limits.max_script_bytes,
@@ -606,24 +539,8 @@ async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolEr
         )
     })?;
     let runner = tool_runner_path()?;
-    let mut command = if Path::new(SANDBOX_POLICY_PATH).is_file() {
-        let backend = sandbox_backend().ok_or_else(|| {
-            ToolError::new(
-                ToolErrorKind::RunnerFailed,
-                format!("sandbox policy {SANDBOX_POLICY_PATH} is present but the landstrip backend was not found"),
-            )
-        })?;
-        let mut command = Command::new(backend);
-        command
-            .arg("run")
-            .arg("-p")
-            .arg(SANDBOX_POLICY_PATH)
-            .arg("--")
-            .arg(&runner);
-        command
-    } else {
-        Command::new(&runner)
-    };
+    let mut command =
+        crate::handler::sandbox::confined_command(&request.sandbox_policies, &runner)?;
     command
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -742,8 +659,13 @@ async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, Tool
         project_root: prepared.handle.context.project_root.as_ref().clone(),
         image_root: prepared.handle.context.image_root.as_ref().clone(),
         limits: prepared.handle.limits.clone(),
+        sandbox_policies: prepared.handle.context.sandbox_policies.clone(),
     };
-    spawn_tool_runner(&request).await
+    let result = spawn_tool_runner(&request).await;
+    for policy in &prepared.handle.context.sandbox_policies {
+        let _ = fs::remove_file(policy);
+    }
+    result
 }
 
 pub(crate) fn lua_task_result_system(world: &mut World) {
@@ -1101,6 +1023,7 @@ mod runner_tests {
             project_root: PathBuf::from("/tmp"),
             image_root: PathBuf::from("/tmp"),
             limits,
+            sandbox_policies: Vec::new(),
         }
     }
 
@@ -1121,7 +1044,10 @@ mod runner_tests {
     #[test]
     fn sandbox_backend_prefers_the_environment_override() {
         std::env::set_var("MARGATROID_SANDBOX_BACKEND", "/opt/landstrip");
-        assert_eq!(sandbox_backend(), Some(PathBuf::from("/opt/landstrip")));
+        assert_eq!(
+            crate::handler::sandbox::sandbox_backend(),
+            Some(PathBuf::from("/opt/landstrip"))
+        );
         std::env::remove_var("MARGATROID_SANDBOX_BACKEND");
     }
 

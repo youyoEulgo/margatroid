@@ -16,6 +16,8 @@ struct RunnerRequest {
     resource_id: String,
     project_root: PathBuf,
     image_root: PathBuf,
+    #[serde(default)]
+    sandbox_policies: Vec<PathBuf>,
     limits: RunnerLimits,
 }
 
@@ -57,7 +59,8 @@ fn report(error: &ToolError) -> ExitCode {
 
 fn request_payload() -> Result<String, String> {
     if let Some(path) = std::env::args_os().nth(1) {
-        return std::fs::read_to_string(&path).map_err(|error| format!("cannot read request: {error}"));
+        return std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read request: {error}"));
     }
     let mut raw = String::new();
     std::io::stdin()
@@ -71,7 +74,10 @@ async fn main() -> ExitCode {
     let raw = match request_payload() {
         Ok(raw) => raw,
         Err(message) => {
-            eprintln!("{}", serde_json::json!({ "kind": "RunnerFailed", "message": message }));
+            eprintln!(
+                "{}",
+                serde_json::json!({ "kind": "RunnerFailed", "message": message })
+            );
             return ExitCode::from(2);
         }
     };
@@ -114,6 +120,7 @@ async fn main() -> ExitCode {
         project_root: request.project_root,
         image_root: request.image_root,
         limits,
+        sandbox_policies: request.sandbox_policies,
     })
     .await;
     match outcome {

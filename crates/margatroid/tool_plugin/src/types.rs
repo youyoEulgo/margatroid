@@ -41,6 +41,7 @@ pub struct ToolTemplate {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResourceContent {
     Prompt { role: String, content: Arc<str> },
+    Sandbox { policy: Arc<str> },
 }
 
 impl ToolTemplate {
