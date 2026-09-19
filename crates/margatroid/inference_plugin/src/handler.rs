@@ -557,6 +557,12 @@ fn validate_messages(messages: &[Message]) -> Result<(), InferenceError> {
                         .map(|call| call.id.len() + call.tool_name.len() + call.arguments.len())
                         .sum::<usize>()
             }
+            Message::Inject { .. } => {
+                return Err(InferenceError::new(
+                    InferenceErrorKind::InvalidMessages,
+                    "an inject wrapper must be expanded before inference",
+                ))
+            }
             Message::Tool {
                 tool_call_id,
                 content,

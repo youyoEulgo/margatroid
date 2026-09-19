@@ -384,6 +384,16 @@ fn mcl_message_to_json(
             "type": "error",
             "message": message,
         }),
+        margatroid_types::Message::Inject { messages } => serde_json::json!({
+            "type": "inject",
+            "messages": messages
+                .iter()
+                .map(|inner| mcl_message_to_json(margatroid_types::MclMessage::new(
+                    inner.clone(),
+                    None,
+                )))
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
     };
     if let Some(usage) = message.usage {
         if let Some(object) = value.as_object_mut() {
@@ -1034,6 +1044,7 @@ pub fn mcl_effect_response_system(world: &mut World) {
                         margatroid_types::Message::Error { .. } => {
                             agent.turn.abort();
                         }
+                        margatroid_types::Message::Inject { .. } => {}
                         _ => {}
                     }
                     if let Some(usage) = envelope.message.usage.as_ref() {

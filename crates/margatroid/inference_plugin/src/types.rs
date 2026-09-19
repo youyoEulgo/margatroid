@@ -633,7 +633,12 @@ struct OpenAiStreamOptions {
 
 impl OpenAiRequest {
     fn from_input(input: ProviderInput<'_>) -> Self {
-        let messages = input.messages().iter().map(openai_message).collect();
+        let messages = input
+            .messages()
+            .iter()
+            .map(openai_message)
+            .filter(|value| !value.is_null())
+            .collect();
         let tools = input
             .tools()
             .iter()
@@ -717,6 +722,7 @@ struct DeepSeekThinking {
 
 fn openai_message(message: &Message) -> serde_json::Value {
     match message {
+        Message::Inject { .. } => serde_json::Value::Null,
         Message::System { content } => serde_json::json!({"role":"system", "content":content}),
         Message::User { content } => serde_json::json!({"role":"user", "content":content}),
         Message::Error { message } => serde_json::json!({"role":"user", "content":message}),

@@ -306,6 +306,9 @@ pub enum Message {
     Error {
         message: String,
     },
+    Inject {
+        messages: Vec<Message>,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

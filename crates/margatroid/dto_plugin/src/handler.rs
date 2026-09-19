@@ -455,7 +455,9 @@ fn report_agent_messages(world: &World, targets: &[WebSocketMessageTarget]) {
                 tool_calls = tool_calls.len(),
                 "assistant message sent"
             ),
-            MessageDto::Tool { .. } | MessageDto::Error { .. } => continue,
+            MessageDto::Tool { .. }
+            | MessageDto::Error { .. }
+            | MessageDto::Inject { .. } => continue,
         }
         send_to_targets(world, targets, ServerMessage::AgentMessage { message });
     }

@@ -396,6 +396,11 @@ fn parse_effect(
                             .ok_or(MclError::TypeMismatch)
                     })
                     .collect::<Result<Vec<_>, _>>()?
+            } else if value.is_object() {
+                if value.as_object().is_none_or(|fields| !fields.is_empty()) {
+                    return Err(MclError::TypeMismatch);
+                }
+                Vec::new()
             } else {
                 vec![value.as_str().ok_or(MclError::TypeMismatch)?.to_owned()]
             };

@@ -347,6 +347,12 @@ fn insert_history_message_values(
                 "system messages cannot be stored as history",
             ))
         }
+        Message::Inject { .. } => {
+            return Err(MemoryError::new(
+                MemoryErrorKind::WriteFailed,
+                "an inject wrapper is not a history entry",
+            ))
+        }
     };
     if let Some(object) = payload.as_object_mut() {
         object.insert("turn_id".to_owned(), serde_json::json!(turn_id));
