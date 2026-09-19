@@ -40,27 +40,6 @@ fn agent_mcl_rejects_wrong_types_without_mutating_the_field() {
 }
 
 #[test]
-fn agent_mcl_delete_is_atomic_when_an_index_is_invalid() {
-    let mut mcl = AgentMcl::default();
-    let mut block = Block::default();
-    block.inners.insert(
-        "tools".to_owned(),
-        BlockInner::ResourceId(vec![
-            "tool:local/one:latest".parse().unwrap(),
-            "tool:local/two:latest".parse().unwrap(),
-        ]),
-    );
-    mcl.create_block("conversation".to_owned(), block).unwrap();
-    let path = BlockPath {
-        block_id: "conversation".to_owned(),
-        inner_id: "tools".to_owned(),
-    };
-
-    assert!(mcl.delete(&path, vec![0, 4]).is_err());
-    assert_eq!(mcl.select(&path).unwrap().len(), 2);
-}
-
-#[test]
 fn turn_state_only_finishes_the_active_turn() {
     let mut turn = AgentTurnState::default();
     turn.begin("turn-1".to_owned()).unwrap();

@@ -105,13 +105,84 @@ impl LuaEnvironmentProvider for MclEnvironmentProvider {
     }
     fn provide(&self, _context: &LuaEnvironmentContext) -> Result<LuaEnvironment, LuaRuntimeError> {
         Ok(LuaEnvironment {
-            globals: vec![LuaGlobalBinding {
-                name: "mcl".into(),
-                binding: LuaBindingValue::Function(Arc::new(MclHostFunction {
-                    events: self.events.clone(),
-                })),
-            }],
+            globals: vec![
+                LuaGlobalBinding {
+                    name: "mcl".into(),
+                    binding: LuaBindingValue::Function(Arc::new(MclHostFunction {
+                        events: self.events.clone(),
+                    })),
+                },
+                LuaGlobalBinding {
+                    name: "mcl_expose".into(),
+                    binding: LuaBindingValue::Function(Arc::new(MclExposeFunction {
+                        events: self.events.clone(),
+                    })),
+                },
+            ],
             modules: Vec::new(),
+        })
+    }
+}
+
+struct MclExposeFunction {
+    events: RuntimeEventSender,
+}
+
+impl LuaHostFunction for MclExposeFunction {
+    fn call(
+        &self,
+        arguments: LuaValue,
+        context: LuaEnvironmentContext,
+        cancel: CancellationToken,
+    ) -> HostFuture {
+        let events = self.events.clone();
+        Box::pin(async move {
+            if cancel.is_cancelled() {
+                return Err(LuaRuntimeError::Cancelled);
+            }
+            let LuaValue::Array(mut values) = arguments else {
+                return Err(LuaRuntimeError::InvalidRequest(
+                    "mcl_expose expects domain and mapping".into(),
+                ));
+            };
+            if values.len() != 2 {
+                return Err(LuaRuntimeError::InvalidRequest(
+                    "mcl_expose expects domain and mapping".into(),
+                ));
+            }
+            let mapping = values.pop().ok_or_else(|| {
+                LuaRuntimeError::InvalidRequest("mcl_expose mapping is missing".into())
+            })?;
+            let domain = match values.pop() {
+                Some(LuaValue::String(value)) => value,
+                _ => {
+                    return Err(LuaRuntimeError::InvalidRequest(
+                        "mcl_expose domain must be a string".into(),
+                    ))
+                }
+            };
+            let binding = lua_to_json_binding(mapping)?;
+            let agent_id: ResourceId = context
+                .owner
+                .owner_id
+                .parse()
+                .map_err(|_| LuaRuntimeError::InvalidRequest("agent id is invalid".into()))?;
+            let id = crate::MclCommandId::new(format!("lua-mcl-{}", next_mcl_call_id()))
+                .map_err(|error| LuaRuntimeError::EnvironmentFailed(error.to_string()))?;
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            events.send_event(MclCommandRequest {
+                id,
+                source: context.owner.owner_id,
+                agent_id,
+                command: format!("EXPOSE {domain}"),
+                binding: Some(binding),
+                reply: crate::MclCommandReply::new(sender),
+            });
+            let value = receiver
+                .await
+                .map_err(|_| LuaRuntimeError::RuntimeClosed)?
+                .map_err(|error| LuaRuntimeError::EnvironmentFailed(error.to_string()))?;
+            command_value_to_lua(value)
         })
     }
 }
@@ -375,7 +446,10 @@ pub fn mcl_command_request_system(world: &mut World) {
                 continue;
             }
         };
-        if matches!(operation, MclOperation::Import { .. } | MclOperation::Emit { .. }) {
+        if matches!(
+            operation,
+            MclOperation::Import { .. } | MclOperation::Emit { .. }
+        ) {
             world.send_event(MclDomainRequest {
                 source: request.source.clone(),
                 id: request.id,
@@ -451,11 +525,12 @@ pub fn mcl_domain_system(world: &mut World) {
                     &request.source,
                 ),
                 MclOperation::Emit {
-                    effect: crate::MclEffectCommand::HistoryRecord {
-                        kind,
-                        content,
-                        payload,
-                    },
+                    effect:
+                        crate::MclEffectCommand::HistoryRecord {
+                            kind,
+                            content,
+                            payload,
+                        },
                 } => crate::history_record(
                     world,
                     &request.agent_id,
@@ -464,9 +539,6 @@ pub fn mcl_domain_system(world: &mut World) {
                     payload,
                     &request.source,
                 ),
-                MclOperation::Emit {
-                    effect: crate::MclEffectCommand::SettingSource { ref_block_id },
-                } => crate::setting_source(world, &request.agent_id, ref_block_id),
                 MclOperation::Emit {
                     effect: crate::MclEffectCommand::Start,
                 } => Err(MclError::EffectInvalid),
@@ -1228,7 +1300,7 @@ mod tests {
     fn audit_levels_commands_that_leave_the_vm_above_block_only_operations() {
         for command in [
             "IMPORT prompt:system/soul:latest AS soul",
-            "EMIT EFFECT inference (req)",
+            "EMIT EFFECT inference FROM req",
             "  EMIT EFFECT finish",
         ] {
             assert_eq!(audit(command).level(), tracing::Level::INFO, "{command}");
@@ -1322,7 +1394,7 @@ mod tests {
 
     #[test]
     fn audit_covers_client_sources_with_the_same_code_path() {
-        let text = log_of("client:webui/console:7", "EMIT EFFECT inference (req)");
+        let text = log_of("client:webui/console:7", "EMIT EFFECT inference FROM req");
 
         assert!(text.contains("source=client:webui/console:7"), "{text}");
         assert!(text.contains("INFO"), "{text}");
@@ -1330,15 +1402,9 @@ mod tests {
 
     #[test]
     fn block_only_mcl_is_logged_at_debug() {
-        let text = log_of(
-            "agent:demo/coder:latest",
-            "GET msg.recent_conversation",
-        );
+        let text = log_of("agent:demo/coder:latest", "GET msg.recent_conversation");
 
-        assert!(
-            text.contains("mcl=GET msg.recent_conversation"),
-            "{text}"
-        );
+        assert!(text.contains("mcl=GET msg.recent_conversation"), "{text}");
         assert!(text.contains("DEBUG"), "{text}");
     }
 }

@@ -4,7 +4,7 @@
 
 - `history_messages` 是客户端可展示对话的权威来源，追加 User、Assistant 和 Tool。
   Assistant同时保存本次输入、输出和缓存命中Token；Skill Tool只保存资源ID，不保存Skill正文。
-- `setting` 保存 MCL driver 通过 `BIND <block> TO STATE <name>` 声明的动态 state，值是完整 block 的 JSON。实时上下文也是普通 state，由 driver 声明 `realtime_state` block 后通过 `LOAD STATE realtime` 恢复、通过 `BIND realtime_state TO STATE realtime` 持久化。
+- `state` 保存 MCL driver 通过 `BIND <block> TO STATE <name>` 声明的通用持久化 state，key 是 state 名称，value 是完整 block JSON。实时上下文也是普通 state，由 driver 声明 `realtime_state` block 后通过 `LOAD STATE realtime` 恢复、通过 `BIND realtime_state TO STATE realtime` 持久化。
 
 ```rust
 use agent_plugin::AgentMemoryHandle;
@@ -22,7 +22,7 @@ let handle = AgentMemoryHandle::new(Arc::new(memory));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Base Lua通过显式`history_append` effect请求追加历史，不直接调用SQLite；AgentPlugin只补齐工具
+Base Lua通过显式`EMIT EFFECT history_append FROM ?`请求追加历史，不直接调用SQLite；AgentPlugin只补齐工具
 schema等领域元数据。state 的读取和写入由 MCL 的 `LOAD STATE`、`BIND ... TO STATE` 完成，driver
 负责决定何时将消息 block 同步到 `realtime_state`，MemoryPlugin只提供通用 state blob 存储。
 

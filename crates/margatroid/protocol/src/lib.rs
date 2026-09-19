@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -611,6 +612,8 @@ pub struct AgentStateDto {
     #[serde(default)]
     pub resources: Vec<AgentResourceDto>,
     #[serde(default)]
+    pub exposed: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    #[serde(default)]
     pub mcl: Option<AgentMclStateDto>,
     #[serde(default)]
     pub total_input_tokens: u64,
@@ -679,14 +682,12 @@ impl FromDomain<HistoryMessage> for HistoryMessageDto {
         Ok(Self {
             sequence: message.sequence,
             turn_id: message.turn_id(),
-            message: (&message
-                .message()
-                .ok_or_else(|| {
-                    ProtocolError::new(
-                        ProtocolErrorKind::HistoryEntryInvalid,
-                        "history entry is not a message",
-                    )
-                })?)
+            message: (&message.message().ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorKind::HistoryEntryInvalid,
+                    "history entry is not a message",
+                )
+            })?)
                 .into_dto(())?,
             created_at_ms: message.created_at_ms,
         })
@@ -800,6 +801,7 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
             default_visibility_source,
             visibility_source,
             resources,
+            exposed: runtime_agent.resources.exposed.clone(),
             mcl: None,
             total_input_tokens: token_usage.total_input_tokens,
             total_output_tokens: token_usage.total_output_tokens,
@@ -868,6 +870,7 @@ impl FromDomain<(), &World> for BackendStateDto {
                         default_visibility_source: None,
                         visibility_source: None,
                         resources: Vec::new(),
+                        exposed: BTreeMap::new(),
                         mcl: None,
                         total_input_tokens: 0,
                         total_output_tokens: 0,
@@ -887,6 +890,7 @@ impl FromDomain<(), &World> for BackendStateDto {
                         default_visibility_source: None,
                         visibility_source: None,
                         resources: Vec::new(),
+                        exposed: BTreeMap::new(),
                         mcl: None,
                         total_input_tokens: 0,
                         total_output_tokens: 0,
@@ -1465,6 +1469,7 @@ mod tests {
                     error: None,
                     default_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
                     visible_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
+                    exposed: BTreeMap::new(),
                     mcl: None,
                     total_input_tokens: 1_000,
                     total_output_tokens: 200,

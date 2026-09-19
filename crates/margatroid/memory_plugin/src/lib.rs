@@ -12,7 +12,7 @@ pub use error::{MemoryError, MemoryErrorKind};
 pub use events::AgentMemoryWriteFailed;
 pub use types::AgentMemory;
 
-use crate::system::{sync_history_messages_system, sync_history_records_system, sync_settings_system};
+use crate::system::{sync_history_messages_system, sync_history_records_system};
 
 pub struct MemoryPlugin {
     schedule: String,
@@ -52,7 +52,6 @@ impl Plugin for MemoryPlugin {
 
         app.world_mut().insert_resource(MemoryPluginInstalled);
         app.add_system(&self.schedule, sync_history_messages_system)
-            .add_system(&self.schedule, sync_settings_system)
             .add_system(&self.schedule, sync_history_records_system);
     }
 }
@@ -67,8 +66,7 @@ mod tests {
     use app_runtime_plugin::RuntimePlugin;
     use core_plugin::{App, Entity, World};
     use margatroid_types::{
-        AgentHistoryMessageWriteRequested, Message,
-        ResourceId, TokenUsage, ToolDefinition,
+        AgentHistoryMessageWriteRequested, Message, ResourceId, TokenUsage, ToolDefinition,
     };
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -208,6 +206,4 @@ mod tests {
         let history = restored.history_messages().unwrap();
         assert_eq!(history[1].usage().unwrap().input_tokens, 120);
     }
-
-
 }

@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 
 pub use agent_plugin::AgentMcl;
 pub use margatroid_types::{
-    Block, BlockAssembly, BlockInner, BlockPath, InnerType, MclMessage,
-    RefBlock, RefBlockAssembly, RefMerge,
+    Block, BlockAssembly, BlockInner, BlockPath, InnerType, MclMessage, RefBlock, RefBlockAssembly,
+    RefMerge,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -154,8 +154,15 @@ pub struct MclBinding(pub serde_json::Value);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MclSelector {
     All(BlockPath),
-    Index { path: BlockPath, index: i64 },
-    Range { path: BlockPath, start: i64, end: i64 },
+    Index {
+        path: BlockPath,
+        index: i64,
+    },
+    Range {
+        path: BlockPath,
+        start: i64,
+        end: i64,
+    },
 }
 #[derive(Clone, Debug)]
 pub enum MclInjectSource {
@@ -199,9 +206,6 @@ pub enum MclEffectCommand {
         content: String,
         payload: String,
     },
-    SettingSource {
-        ref_block_id: String,
-    },
     VisibilitySource {
         source: BlockPath,
     },
@@ -244,6 +248,10 @@ pub enum MclOperation {
         state_name: String,
         block_id: String,
     },
+    Expose {
+        domain: String,
+        mappings: Vec<(String, String)>,
+    },
     Emit {
         effect: MclEffectCommand,
     },
@@ -258,28 +266,6 @@ pub enum MclDomainValue {
     Text(String),
 }
 pub type MclCommandValue = MclDomainValue;
-#[derive(Clone, Debug)]
-pub enum MclEffect {
-    Start,
-    CatchInference {
-        messages: Vec<MclMessage>,
-    },
-    Inference {
-        messages: Vec<MclMessage>,
-        visible_resources: Vec<ResourceId>,
-    },
-    ToolCall {
-        calls: Vec<ToolCall>,
-    },
-    Finish,
-    HistoryAppend {
-        message: MclMessage,
-    },
-    SettingSource {
-        values: Vec<ResourceId>,
-    },
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MclPendingEffectKind {
     Start { vm_id: margatroid_types::LuaVmId },

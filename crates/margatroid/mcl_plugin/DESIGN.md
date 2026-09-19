@@ -319,10 +319,6 @@ history_record(world: &mut World, agent_id: &ResourceId, kind: String, content: 
     追加显式记录：公开函数
     行为：按发起者给出的 kind、content、payload 发送 AgentHistoryRecordWriteRequested，与消息共用同一时间线
 
-setting_source(world: &mut World, agent_id: &ResourceId, ref_block_id: String) -> Result<MclDomainValue, MclError>
-    声明配置来源：公开函数
-    行为：要求 RefBlock 全部由 RESOURCE merge 组成，把展开的路径记录到 Agent.resources.setting_sources；不发送事件
-
 domain_to_command(value: MclDomainValue) -> MclCommandValue
     领域值转命令值：公开函数，当前直接返回 value
 ```
@@ -378,11 +374,13 @@ normalize_command(command: &str) -> String
 parse_effect(words: &[&str], binding: Option<&serde_json::Value>) -> Result<MclOperation, MclError>
     EMIT EFFECT 解析：私有函数
     行为：
-        start/finish 为无参 Effect
-        inference/catch_inference 读取括号 RefBlock ID
-        history_append 读取绑定 MclMessage
-        visibility_source/default_visibility_source 读取括号 BlockPath
-        tool_call 读取绑定 ToolCall 数组并校验 id/name/arguments 非空且 id 唯一
+        start/finish 为无参 Effect，拒绝 FROM 参数和 binding
+        其余 Effect 统一使用 `EMIT EFFECT <name> FROM <argument>`
+        inference/catch_inference 的 argument 是 RefBlock ID
+        history_append 的 argument 必须是 ?，binding 解码为 MclMessage
+        history_record 的 argument 必须是 ?，binding 显式携带 kind/cmd/arg
+        visibility_source/default_visibility_source 的 argument 是完整 BlockPath
+        tool_call 的 argument 必须是 ?，binding 解码为 ToolCall 数组并校验 id/name/arguments 非空且 id 唯一
 
 path(block_id: &str, inner_id: &str) -> Result<BlockPath, MclError>
     构造 BlockPath：私有函数，先校验两个标识符
@@ -559,7 +557,6 @@ MclEffectCommand：MCL Effect 命令，公开枚举
     Finish
     HistoryAppend { message: MclMessage }
     HistoryRecord { kind: String, content: String, payload: String }
-    SettingSource { ref_block_id: String }
     VisibilitySource { source: BlockPath }
     DefaultVisibilitySource { source: BlockPath }
 
@@ -585,15 +582,6 @@ MclDomainValue：MCL 领域值，公开枚举
 
 MclCommandValue：MCL 命令值，公开类型别名，等于 MclDomainValue
 
-MclEffect：MCL Effect，公开枚举
-    Start
-    CatchInference { messages: Vec<MclMessage> }
-    Inference { messages: Vec<MclMessage>, visible_resources: Vec<ResourceId> }
-    ToolCall { calls: Vec<ToolCall> }
-    Finish
-    HistoryAppend { message: MclMessage }
-    SettingSource { values: Vec<ResourceId> }
-
 MclPendingEffectKind：等待型 Effect 分类，公开枚举
     Start { vm_id: LuaVmId }
     CatchInference
@@ -612,7 +600,7 @@ LOAD STATE <name> INTO <block>
 
 ```
 
-history_messages 与 state 是两条独立通道：`history_append` 显式写入对话时间线，state 写入保存在 `setting` 表中，两者互不自动同步。实时上下文不再有专用 source effect；driver 声明普通 `realtime_state` block，通过 `LOAD`、`INJECT` 和 `BIND` 自行维护。
+history_messages 与 state 是两条独立通道：`history_append` 显式写入对话时间线，state 写入保存在 `state` 表中，两者互不自动同步。实时上下文不再有专用 source effect；driver 声明普通 `realtime_state` block，通过 `LOAD`、`INJECT` 和 `BIND` 自行维护。
 
 ## 函数
 

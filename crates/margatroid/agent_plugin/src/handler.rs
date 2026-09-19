@@ -474,10 +474,6 @@ mod tests {
     struct EmptyMemory;
 
     impl AgentMemoryStore for EmptyMemory {
-        fn setting_value(&self, _key: &str) -> Result<Option<Vec<String>>, AgentMemoryStoreError> {
-            Ok(None)
-        }
-
         fn set_state(&self, _key: &str, _value: &str) -> Result<(), AgentMemoryStoreError> {
             Ok(())
         }
@@ -492,13 +488,6 @@ mod tests {
             _content: &str,
             _payload: &str,
             _source: &str,
-        ) -> Result<(), AgentMemoryStoreError> {
-            Ok(())
-        }
-
-        fn set_setting(
-            &self,
-            _entries: &[(String, String)],
         ) -> Result<(), AgentMemoryStoreError> {
             Ok(())
         }

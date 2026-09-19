@@ -418,8 +418,6 @@ AgentMcl：MCL数据，公开结构体--Agent持有的MCL运行时存储，由�
         创建引用Block：公开方法，block_id已存在于真实Block或RefBlock程序集时失败
     insert(&mut self, target: &BlockPath, values: BlockInner) -> Result<(), AgentError>
         插入字段值：公开方法，找到目标Block字段，验证BlockInner类型一致后按顺序追加；整个方法原子完成
-    delete(&mut self, target: &BlockPath, selection: MclDeleteSelection) -> Result<(), AgentError>
-        删除字段值：公开方法，找到目标Block字段并按已经解析的删除范围移除元素；保持剩余元素顺序，整个方法原子完成
     cover(&mut self, target: &BlockPath, values: BlockInner) -> Result<(), AgentError>
         覆盖字段值：公开方法，找到目标Block字段，验证BlockInner类型一致后整体替换数组；整个方法原子完成
     block(&self, block_id: &str) -> Result<Block, AgentError>
@@ -458,10 +456,6 @@ AgentMemoryHandle：Agent存储数据，crate公开结构体--MemoryPlugin创建
     inner: Arc<dyn AgentMemoryStore>--历史、配置与 state 存储接口
     append_history(&self, turn_id: &str, source: &str, message: &Message, tool_schema: &[ToolDefinition], usage: Option<&TokenUsage>) -> Result<(), AgentMemoryStoreError>
         追加历史：crate公开方法，转发给inner
-    set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError>
-        写入 RESOURCE 配置：crate公开方法，按键 upsert
-    setting_value(&self, key: &str) -> Result<Option<Vec<String>>, AgentMemoryStoreError>
-        读取 RESOURCE 配置：crate公开方法，None 表示从未设置，Some(vec) 表示已设置（可空）
     set_state(&self, key: &str, value: &str) -> Result<(), AgentMemoryStoreError>
         写入 state blob：crate公开方法，保存完整 Block JSON
     state_value(&self, key: &str) -> Result<Option<String>, AgentMemoryStoreError>
@@ -475,8 +469,6 @@ AgentMemoryHandle：Agent存储数据，crate公开结构体--MemoryPlugin创建
 AgentMemoryStore：Agent存储接口，crate公开trait--由MemoryPlugin实现，types crate只定义协议
     继承：Send + Sync + 'static
     append_history(&self, turn_id: &str, source: &str, message: &Message, tool_schema: &[ToolDefinition], usage: Option<&TokenUsage>) -> Result<(), AgentMemoryStoreError>
-    set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError>
-    setting_value(&self, key: &str) -> Result<Option<Vec<String>>, AgentMemoryStoreError>
     set_state(&self, key: &str, value: &str) -> Result<(), AgentMemoryStoreError>
     state_value(&self, key: &str) -> Result<Option<String>, AgentMemoryStoreError>
     append_record(&self, kind: &str, content: &str, payload: &str, source: &str) -> Result<(), AgentMemoryStoreError>

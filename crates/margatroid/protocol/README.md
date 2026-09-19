@@ -101,7 +101,7 @@ DtoPlugin 反序列化 DTO 后直接调用 `into_domain` 发送领域事件，�
 API 中间事件。WorkspacePlugin直接按完整`ResourceId`查找Agent并解析为ECS Entity；出站DTO再通过
 `World`将Entity投影为相同的稳定资源ID，协议不会暴露Entity。
 
-客户端通过 `agent.message` 注入对话消息，只接受两种方向：`User`（用户输入）与 `Assistant`（手工轮次，含手动 `tool_calls`，前端据此加载 Skill 与 Hook）。`Tool` 与 `Error` 属于服务端事实，注入返回 `InvalidRequest`；需要写入历史时改用 `mcl.command` 的 `INJECT` 与 `EMIT EFFECT history_append`（前端即如此）。后端可展示消息使用
+客户端通过 `agent.message` 注入对话消息，只接受两种方向：`User`（用户输入）与 `Assistant`（手工轮次，含手动 `tool_calls`，前端据此加载 Skill 与 Hook）。`Tool` 与 `Error` 属于服务端事实，注入返回 `InvalidRequest`；需要写入历史时改用 `mcl.command` 的 `INJECT` 与 `EMIT EFFECT history_append FROM ?`（前端即如此）。后端可展示消息使用
 `MessageDto`，包含 User、Assistant 和历史Tool；领域 `Message` 与 `ToolCall` 不直接进入协议字段。
 
 后端状态通过 `state.sync` 发送完整快照。前端以该快照替换业务状态，不自行持久化或从增量消息拼接

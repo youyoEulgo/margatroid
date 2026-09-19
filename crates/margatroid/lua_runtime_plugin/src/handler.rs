@@ -677,6 +677,12 @@ mod tests {
             )
             .expect("mcl stub is created");
         lua.globals().set("mcl", mcl).expect("mcl is injected");
+        let mcl_expose = lua
+            .create_function(|_, (_domain, _mapping): (String, MlValue)| Ok(()))
+            .expect("mcl_expose stub is created");
+        lua.globals()
+            .set("mcl_expose", mcl_expose)
+            .expect("mcl_expose is injected");
 
         let result = lua.load(BASE_DRIVER).exec();
         assert!(result.is_err(), "the driver loop is stopped by the stub");
@@ -688,7 +694,7 @@ mod tests {
             "INJECT soul TO msg.system_prompt",
             "EMIT EFFECT start",
             "INJECT ? TO msg.recent_conversation",
-            "EMIT EFFECT history_append",
+            "EMIT EFFECT history_append FROM ?",
             "EMIT EFFECT finish",
         ];
         let mut position = 0;

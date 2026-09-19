@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS history_messages (
     payload TEXT,
     source TEXT
 );
-CREATE TABLE IF NOT EXISTS setting (
+CREATE TABLE IF NOT EXISTS state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at_ms INTEGER NOT NULL
@@ -103,35 +103,13 @@ impl AgentMemoryStore for AgentMemory {
         })
     }
 
-    fn setting_value(&self, key: &str) -> Result<Option<Vec<String>>, AgentMemoryStoreError> {
-        let connection = lock_connection(self).map_err(memory_store_error)?;
-        let value = connection
-            .query_row(
-                "SELECT value FROM setting WHERE key = ?1",
-                params![key],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(read_error)
-            .map_err(memory_store_error)?;
-        let Some(value) = value else {
-            return Ok(None);
-        };
-        serde_json::from_str::<Vec<String>>(&value).map(Some).map_err(|error| {
-            memory_store_error(MemoryError::new(
-                MemoryErrorKind::DecodeFailed,
-                error.to_string(),
-            ))
-        })
-    }
-
     fn set_state(&self, key: &str, value: &str) -> Result<(), AgentMemoryStoreError> {
         let connection = lock_connection(self).map_err(memory_store_error)?;
         let now = current_unix_milliseconds().map_err(memory_store_error)?;
         connection
             .execute(
-                "INSERT INTO setting (key, value, updated_at_ms) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at_ms = excluded.updated_at_ms",
-                params![format!("mcl.state/{key}"), value, now],
+                "INSERT INTO state (key, value, updated_at_ms) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at_ms = excluded.updated_at_ms",
+                params![key, value, now],
             )
             .map_err(schema_error)
             .map_err(memory_store_error)?;
@@ -142,40 +120,13 @@ impl AgentMemoryStore for AgentMemory {
         let connection = lock_connection(self).map_err(memory_store_error)?;
         connection
             .query_row(
-                "SELECT value FROM setting WHERE key = ?1",
-                params![format!("mcl.state/{key}")],
+                "SELECT value FROM state WHERE key = ?1",
+                params![key],
                 |row| row.get::<_, String>(0),
             )
             .optional()
             .map_err(read_error)
             .map_err(memory_store_error)
-    }
-
-    fn set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError> {
-        let mut connection = lock_connection(self).map_err(memory_store_error)?;
-        let transaction = connection.transaction().map_err(|error| {
-            memory_store_error(MemoryError::new(
-                MemoryErrorKind::WriteFailed,
-                error.to_string(),
-            ))
-        })?;
-        let now = current_unix_milliseconds().map_err(memory_store_error)?;
-        for (key, value) in entries {
-            transaction
-                .execute(
-                    "INSERT INTO setting (key, value, updated_at_ms) VALUES (?1, ?2, ?3) \
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at_ms = excluded.updated_at_ms",
-                    params![key, value, now],
-                )
-                .map_err(schema_error)
-                .map_err(memory_store_error)?;
-        }
-        transaction.commit().map_err(|error| {
-            memory_store_error(MemoryError::new(
-                MemoryErrorKind::WriteFailed,
-                error.to_string(),
-            ))
-        })
     }
 
     fn append_record(
@@ -249,8 +200,7 @@ fn lock_connection<'a>(
 fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
     let history_is_current = table_has_column(connection, "history_messages", "kind")?;
     let stale_history = table_exists(connection, "history_messages")? && !history_is_current;
-    let legacy_realtime = table_has_column(connection, "realtime_messages", "position")?
-        && !table_has_column(connection, "realtime_messages", "context")?;
+    let legacy_state = table_exists(connection, "setting")?;
     let transaction = connection.transaction().map_err(|_| {
         MemoryError::new(
             MemoryErrorKind::SchemaFailed,
@@ -267,25 +217,20 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), MemoryError> {
             .execute(&format!("DROP TABLE IF EXISTS {leftover}"), [])
             .map_err(schema_error)?;
     }
-    if legacy_realtime {
-        transaction
-            .execute(
-                "ALTER TABLE realtime_messages RENAME TO realtime_messages_legacy",
-                [],
-            )
-            .map_err(schema_error)?;
-    }
     transaction
         .execute_batch(HISTORY_SCHEMA)
         .map_err(schema_error)?;
-    if legacy_realtime {
+    if legacy_state {
         transaction
-            .execute("DROP TABLE realtime_messages_legacy", [])
+            .execute(
+                "INSERT INTO state (key, value, updated_at_ms) SELECT substr(key, 11), value, updated_at_ms FROM setting WHERE key LIKE 'mcl.state/%' ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at_ms = excluded.updated_at_ms",
+                [],
+            )
+            .map_err(schema_error)?;
+        transaction
+            .execute("DROP TABLE setting", [])
             .map_err(schema_error)?;
     }
-    transaction
-        .execute("DROP TABLE IF EXISTS realtime_messages", [])
-        .map_err(schema_error)?;
     transaction.commit().map_err(schema_error)
 }
 
@@ -317,8 +262,6 @@ fn table_has_column(
     Ok(false)
 }
 
-
-
 fn schema_error(_: rusqlite::Error) -> MemoryError {
     MemoryError::new(
         MemoryErrorKind::SchemaFailed,
@@ -336,15 +279,18 @@ fn load_history_messages(connection: &Connection) -> Result<Vec<HistoryMessage>,
                 sequence: row.get(0)?,
                 kind: row.get(1)?,
                 created_at_ms: row.get(2)?,
-                content: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "{}".to_owned()),
-                payload: row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "{}".to_owned()),
+                content: row
+                    .get::<_, Option<String>>(3)?
+                    .unwrap_or_else(|| "{}".to_owned()),
+                payload: row
+                    .get::<_, Option<String>>(4)?
+                    .unwrap_or_else(|| "{}".to_owned()),
                 source: row.get(5)?,
             })
         })
         .map_err(read_error)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(read_error)
 }
-
 
 fn insert_history_message_values(
     transaction: &Transaction<'_>,
@@ -410,8 +356,14 @@ fn insert_history_message_values(
                 serde_json::to_value(tool_schema).unwrap_or_default(),
             );
             if let Some(usage) = usage {
-                object.insert("input_tokens".to_owned(), serde_json::json!(usage.input_tokens));
-                object.insert("output_tokens".to_owned(), serde_json::json!(usage.output_tokens));
+                object.insert(
+                    "input_tokens".to_owned(),
+                    serde_json::json!(usage.input_tokens),
+                );
+                object.insert(
+                    "output_tokens".to_owned(),
+                    serde_json::json!(usage.output_tokens),
+                );
                 object.insert(
                     "cache_hit_tokens".to_owned(),
                     serde_json::json!(usage.cache_hit_tokens),

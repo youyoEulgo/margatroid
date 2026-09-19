@@ -73,7 +73,7 @@ end
 local function append_recent(message)
     mcl_command("INJECT ? TO msg.recent_conversation", message)
     sync_realtime()
-    mcl_command("EMIT EFFECT history_append", message)
+    mcl_command("EMIT EFFECT history_append FROM ?", message)
 end
 
 local function move_old_recent_messages()
@@ -96,8 +96,12 @@ local function move_old_recent_messages()
 end
 
 move_old_recent_messages()
-mcl_command("EMIT EFFECT visibility_source (tool.tool_dynamic)")
-mcl_command("EMIT EFFECT default_visibility_source (tool.tool_default)")
+mcl_command("EMIT EFFECT visibility_source FROM tool.tool_dynamic")
+mcl_command("EMIT EFFECT default_visibility_source FROM tool.tool_default")
+mcl_expose("tools", {
+    visible = "tool.tool_dynamic",
+    default = "tool.tool_default",
+})
 
 local MAX_CONTEXT_TOKENS = agent_info.model.context_window_tokens
 local RECENT_CONTEXT_RATIO = 0.16
@@ -145,7 +149,7 @@ local function maybe_compact(message)
     end
     if message.usage.input_tokens >= COMPACTION_CONTEXT_LIMIT then
         move_old_recent_messages()
-        local summary = mcl_command("EMIT EFFECT catch_inference (com)")
+        local summary = mcl_command("EMIT EFFECT catch_inference FROM com")
         mcl_command("INJECT ? TO msg.compact_context", {
             type = "user",
             content = summary,
@@ -160,22 +164,22 @@ while true do
     local message = mcl_command("EMIT EFFECT start")
     if message.type == "user" then
         append_recent(message)
-        mcl_command("EMIT EFFECT inference (req)")
+        mcl_command("EMIT EFFECT inference FROM req")
     elseif message.type == "assistant" then
         append_recent(message)
         maybe_compact(message)
         local tool_calls = message.tool_calls or {}
         if #tool_calls > 0 then
-            mcl_command("EMIT EFFECT tool_call ?", tool_calls)
+            mcl_command("EMIT EFFECT tool_call FROM ?", tool_calls)
         else
             mcl_command("EMIT EFFECT finish")
         end
     elseif message.type == "tool" then
         append_recent(message)
         if all_tool_calls_completed() then
-            mcl_command("EMIT EFFECT inference (req)")
+            mcl_command("EMIT EFFECT inference FROM req")
         end
     elseif message.type == "error" then
-        mcl_command("EMIT EFFECT history_append", message)
+        mcl_command("EMIT EFFECT history_append FROM ?", message)
     end
 end

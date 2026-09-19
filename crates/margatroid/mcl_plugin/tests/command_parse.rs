@@ -64,32 +64,34 @@ fn parses_unified_inject_sources_and_targets() {
 fn rejects_old_select_delete_and_tool_call_block_syntax() {
     assert!(parse_operation("SELECT messages FROM msg", None).is_err());
     assert!(parse_operation("DELETE messages FROM msg", None).is_err());
-    assert!(parse_operation(
-        "CREATE BLOCK msg ( pending TOOL_CALL, )",
-        None
-    )
-    .is_err());
+    assert!(parse_operation("CREATE BLOCK msg ( pending TOOL_CALL, )", None).is_err());
 }
 
 #[test]
-fn parses_flat_assistant_message_for_history_append() {
-    let operation = parse_operation(
-        "EMIT EFFECT history_append ?",
-        Some(&json!({
-            "type": "assistant",
-            "reasoning": null,
-            "content": "hello",
-            "tool_calls": [],
-            "usage": {"input_tokens": 1, "output_tokens": 2, "cache_hit_tokens": 3}
-        })),
-    )
-    .unwrap();
+fn parses_explicit_history_effects() {
+    let message = json!({
+        "type": "assistant",
+        "reasoning": null,
+        "content": "hello",
+        "tool_calls": [],
+        "usage": {"input_tokens": 1, "output_tokens": 2, "cache_hit_tokens": 3}
+    });
     assert!(matches!(
-        operation,
+        parse_operation("EMIT EFFECT history_append FROM ?", Some(&message)).unwrap(),
         MclOperation::Emit {
             effect: MclEffectCommand::HistoryAppend { .. }
         }
     ));
+    let record = json!({"kind": "mcl", "cmd": "GET req.ctx", "arg": null});
+    assert!(matches!(
+        parse_operation("EMIT EFFECT history_record FROM ?", Some(&record)).unwrap(),
+        MclOperation::Emit {
+            effect: MclEffectCommand::HistoryRecord { .. }
+        }
+    ));
+    assert!(parse_operation("EMIT EFFECT history_append ?", Some(&message)).is_err());
+    assert!(parse_operation("EMIT EFFECT history_append FROM ?", Some(&record)).is_err());
+    assert!(parse_operation("EMIT EFFECT history_record FROM ?", Some(&message)).is_err());
 }
 
 #[test]
@@ -105,20 +107,28 @@ fn parses_state_bind_and_load() {
 }
 
 #[test]
-fn parses_effect_parameter_shapes() {
+fn parses_uniform_effect_arguments() {
     assert!(matches!(
         parse_operation("EMIT EFFECT start", None).unwrap(),
         MclOperation::Emit {
             effect: MclEffectCommand::Start
         }
     ));
-    assert!(parse_operation("EMIT EFFECT start (req)", None).is_err());
     assert!(matches!(
-        parse_operation("EMIT EFFECT inference (req)", None).unwrap(),
+        parse_operation("EMIT EFFECT inference FROM req", None).unwrap(),
         MclOperation::Emit {
             effect: MclEffectCommand::Inference { .. }
         }
     ));
+    assert!(matches!(
+        parse_operation("EMIT EFFECT visibility_source FROM tool.dynamic", None).unwrap(),
+        MclOperation::Emit {
+            effect: MclEffectCommand::VisibilitySource { .. }
+        }
+    ));
+    assert!(parse_operation("EMIT EFFECT start FROM req", None).is_err());
+    assert!(parse_operation("EMIT EFFECT inference (req)", None).is_err());
+    assert!(parse_operation("EMIT EFFECT tool_call ?", Some(&json!([]))).is_err());
 }
 
 #[test]

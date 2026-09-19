@@ -1,6 +1,6 @@
 use agent_plugin::Agent;
 use core_plugin::World;
-use margatroid_types::{AgentHistoryMessageWriteRequested, AgentHistoryRecordWriteRequested, AgentSettingWriteRequested};
+use margatroid_types::{AgentHistoryMessageWriteRequested, AgentHistoryRecordWriteRequested};
 
 use crate::error::{MemoryError, MemoryErrorKind};
 
@@ -33,7 +33,12 @@ pub(crate) fn handle_history_message_write(
     })?;
     agent
         .memory
-        .append_history(&event.id, &event.source, &event.message, &event.tool_schema, event.usage.as_ref(),
+        .append_history(
+            &event.id,
+            &event.source,
+            &event.message,
+            &event.tool_schema,
+            event.usage.as_ref(),
         )
         .map_err(handle_store_error)
 }
@@ -52,22 +57,4 @@ pub(crate) fn handle_history_record_write(
         .memory
         .append_record(&event.kind, &event.content, &event.payload, &event.source)
         .map_err(handle_store_error)
-}
-
-pub(crate) fn handle_setting_write(
-    world: &World,
-    event: &AgentSettingWriteRequested,
-) -> Result<(), MemoryError> {
-    let agent = world.get_component::<Agent>(event.agent).ok_or_else(|| {
-        MemoryError::new(
-            MemoryErrorKind::AgentMemoryMissing,
-            "agent does not have memory",
-        )
-    })?;
-    let entries = event
-        .entries
-        .iter()
-        .map(|entry| (entry.key.clone(), entry.value.clone()))
-        .collect::<Vec<_>>();
-    agent.memory.set_setting(&entries).map_err(handle_store_error)
 }
