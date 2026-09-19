@@ -125,12 +125,14 @@ struct ShellDefinition {
 
 struct ShellPackage {
     definition: ShellDefinition,
+    script: String,
 }
 
 struct ShellCallContext {
     project_root: Arc<PathBuf>,
     resource_id: ResourceId,
     sandbox_policies: Vec<Arc<str>>,
+    temp_dir: Arc<PathBuf>,
 }
 
 struct ShellResponseGuard {
@@ -205,6 +207,7 @@ pub(crate) struct PreparedShellToolCall {
     context: ShellCallContext,
     limits: ShellExecutionLimits,
     response: ShellResponseGuard,
+    _temp_dir: crate::handler::sandbox::CallTempDir,
 }
 impl Event for PreparedShellToolCall {}
 
@@ -299,7 +302,7 @@ pub(crate) fn prepare_shell_call(
     world: &mut World,
     request: ToolCallRequest,
 ) -> Result<(), ToolError> {
-    let (package_root, context, limits) = prepare_shell_tool_call(world, &request)?;
+    let (package_root, context, limits, temp_dir) = prepare_shell_tool_call(world, &request)?;
     let response = ShellResponseGuard::new(&request, world.event_sender());
     world.send_async_event(PreparedShellToolCall {
         package_root,
@@ -307,6 +310,7 @@ pub(crate) fn prepare_shell_call(
         context,
         limits,
         response,
+        _temp_dir: temp_dir,
     });
     Ok(())
 }
@@ -314,7 +318,15 @@ pub(crate) fn prepare_shell_call(
 fn prepare_shell_tool_call(
     world: &World,
     request: &ToolCallRequest,
-) -> Result<(Arc<PathBuf>, ShellCallContext, ShellExecutionLimits), ToolError> {
+) -> Result<
+    (
+        Arc<PathBuf>,
+        ShellCallContext,
+        ShellExecutionLimits,
+        crate::handler::sandbox::CallTempDir,
+    ),
+    ToolError,
+> {
     let limits = world
         .get_resource::<ShellExecutionLimits>()
         .expect("ShellPlugin is installed")
@@ -337,6 +349,7 @@ fn prepare_shell_tool_call(
         )
     })?;
     let sandbox_policies = crate::handler::sandbox::active_sandbox_policies(&agent.resources)?;
+    let temp_dir = crate::handler::sandbox::CallTempDir::create(&agent.info.project_root)?;
     let package_root = Arc::new(find_shell_package(
         &agent.info.project_root,
         &agent.info.image_root,
@@ -348,8 +361,10 @@ fn prepare_shell_tool_call(
             project_root: Arc::new(agent.info.project_root.clone()),
             resource_id: request.resource_id.clone(),
             sandbox_policies,
+            temp_dir: Arc::new(temp_dir.path().to_path_buf()),
         },
         limits,
+        temp_dir,
     ))
 }
 
@@ -402,41 +417,45 @@ async fn execute_shell(prepared: &PreparedShellToolCall) -> Result<String, ToolE
                 "Shell arguments must contain a cmd string",
             )
         })?;
-    let script = prepared.package_root.join(SHELL_SCRIPT_FILE);
-    let policy_paths = prepared
-        .context
-        .sandbox_policies
-        .iter()
-        .map(|policy| crate::handler::sandbox::write_policy_file(policy))
-        .collect::<Result<Vec<_>, _>>()?;
-    let (master, mut child) = match spawn_pty_shell(
-        &script,
-        command,
-        &prepared.context.project_root,
-        &policy_paths,
-    ) {
-        Ok(spawned) => spawned,
-        Err(error) => {
-            crate::handler::sandbox::remove_policy_files(&policy_paths);
-            return Err(error);
-        }
-    };
+    let script = prepared.context.temp_dir.join(SHELL_SCRIPT_FILE);
+    fs::write(&script, package.script.as_bytes()).map_err(|error| {
+        ToolError::new(
+            ToolErrorKind::ExecutionFailed,
+            format!("Shell script could not be staged: {error}"),
+        )
+    })?;
+    let spawn = crate::handler::sandbox::ConfinedSpawn::new(&prepared.context.sandbox_policies)?;
+    let (master, mut child) =
+        spawn_pty_shell(&script, command, &prepared.context.project_root, &spawn)?;
+    let mut group = crate::handler::sandbox::ProcessGroup::confined(
+        spawn.is_confined(),
+        child.id().unwrap_or_default(),
+    );
     let limit = prepared.limits.max_output_bytes;
     let reader = tokio::task::spawn_blocking(move || read_pty_bounded(master, limit));
-    let (status, captured) = tokio::time::timeout(prepared.limits.max_execution_time, async {
+    let outcome = tokio::time::timeout(prepared.limits.max_execution_time, async {
         let status = child.wait().await;
+        group.reclaim();
         let captured = reader.await;
         (status, captured)
     })
-    .await
-    .map_err(|_| ToolError::new(ToolErrorKind::ExecutionFailed, "Shell process timed out"))?;
+    .await;
+    let (status, captured) = match outcome {
+        Ok(parts) => parts,
+        Err(_) => {
+            group.reclaim();
+            return Err(ToolError::new(
+                ToolErrorKind::ExecutionFailed,
+                "Shell process timed out",
+            ));
+        }
+    };
     let status = status.map_err(|_| {
         ToolError::new(
             ToolErrorKind::ExecutionFailed,
             "Shell process could not be awaited",
         )
     })?;
-    crate::handler::sandbox::remove_policy_files(&policy_paths);
     let captured = captured
         .map_err(|_| {
             ToolError::new(
@@ -487,7 +506,7 @@ fn spawn_pty_shell(
     script: &Path,
     command: &str,
     project_root: &Path,
-    sandbox_policies: &[PathBuf],
+    spawn: &crate::handler::sandbox::ConfinedSpawn,
 ) -> Result<(std::fs::File, tokio::process::Child), ToolError> {
     let pty = nix::pty::openpty(None, None).map_err(|_| {
         ToolError::new(
@@ -506,13 +525,10 @@ fn spawn_pty_shell(
     let stdin = Stdio::from(pty.slave.try_clone().map_err(duplicate)?);
     let stdout = Stdio::from(pty.slave.try_clone().map_err(duplicate)?);
     let stderr = Stdio::from(pty.slave);
-    let mut process =
-        crate::handler::sandbox::confined_command(sandbox_policies, Path::new("bash"))?;
+    let mut process = spawn.command(Path::new("bash"), project_root)?;
     process
         .arg(script)
         .arg(command)
-        .current_dir(project_root)
-        .kill_on_drop(true)
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr);
@@ -703,6 +719,7 @@ async fn read_shell_package(
     }
     Ok(ShellPackage {
         definition: parse_shell_definition(&metadata, &schema, resource_id)?,
+        script,
     })
 }
 
