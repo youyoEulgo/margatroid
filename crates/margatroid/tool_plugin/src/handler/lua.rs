@@ -139,8 +139,8 @@ struct LuaToolDefinition {
 }
 
 struct LuaToolPackage {
-    #[allow(dead_code)]
-    definition: LuaToolDefinition,
+    metadata: String,
+    schema: String,
     script: String,
 }
 
@@ -156,14 +156,14 @@ struct LuaCallContext {
     turn_id: String,
     resource_id: ResourceId,
     project_root: Arc<PathBuf>,
-    image_root: Arc<PathBuf>,
-    package_root: Arc<PathBuf>,
-    sandbox_policies: Vec<PathBuf>,
+    temp_dir: Arc<PathBuf>,
+    sandbox_policies: Vec<Arc<str>>,
 }
 
 struct LuaExecutionHandle {
     context: LuaCallContext,
     limits: LuaExecutionLimits,
+    package: LuaToolPackage,
 }
 
 struct LuaToolResponseGuard {
@@ -226,10 +226,10 @@ impl Drop for LuaToolResponseGuard {
 }
 
 pub(crate) struct PreparedLuaToolCall {
-    package_root: Arc<PathBuf>,
     arguments: String,
     handle: LuaExecutionHandle,
     response: LuaToolResponseGuard,
+    _temp_dir: crate::handler::sandbox::CallTempDir,
 }
 impl Event for PreparedLuaToolCall {}
 
@@ -313,13 +313,13 @@ pub(crate) fn prepare_lua_call(
     world: &mut World,
     request: ToolCallRequest,
 ) -> Result<(), ToolError> {
-    let (package_root, handle) = prepare_lua_tool_call(world, &request)?;
+    let (handle, temp_dir) = prepare_lua_tool_call(world, &request)?;
     let response = LuaToolResponseGuard::new(&request, world.event_sender());
     world.send_async_event(PreparedLuaToolCall {
-        package_root,
         arguments: request.arguments,
         handle,
         response,
+        _temp_dir: temp_dir,
     });
     Ok(())
 }
@@ -327,7 +327,7 @@ pub(crate) fn prepare_lua_call(
 fn prepare_lua_tool_call(
     world: &World,
     request: &ToolCallRequest,
-) -> Result<(Arc<PathBuf>, LuaExecutionHandle), ToolError> {
+) -> Result<(LuaExecutionHandle, crate::handler::sandbox::CallTempDir), ToolError> {
     let limits = world
         .get_resource::<LuaExecutionLimits>()
         .expect("LuaPlugin is installed")
@@ -355,26 +355,31 @@ fn prepare_lua_tool_call(
                 "Agent resource id is missing",
             )
         })?;
-    let package_root = Arc::new(find_lua_tool_package(
+    let package_root = find_lua_tool_package(
         &agent.info.project_root,
         &agent.info.image_root,
         &request.resource_id,
-    )?);
-    let sandbox_policies = crate::handler::sandbox::active_sandbox_policies(&agent.resources)?
-        .iter()
-        .map(|policy| crate::handler::sandbox::write_policy_file(policy))
-        .collect::<Result<Vec<_>, _>>()?;
+    )?;
+    let package = read_lua_tool_package(&package_root, &request.resource_id, &limits)?;
+    let sandbox_policies = crate::handler::sandbox::active_sandbox_policies(&agent.resources)?;
+    let temp_dir = crate::handler::sandbox::CallTempDir::create(&agent.info.project_root)?;
     let context = LuaCallContext {
         agent_id,
         turn_id: request.turn_id.clone(),
         resource_id: request.resource_id.clone(),
         project_root: Arc::new(agent.info.project_root.clone()),
-        image_root: Arc::new(agent.info.image_root.clone()),
-        package_root: Arc::clone(&package_root),
+        temp_dir: Arc::new(temp_dir.path().to_path_buf()),
         sandbox_policies,
     };
 
-    Ok((package_root, LuaExecutionHandle { context, limits }))
+    Ok((
+        LuaExecutionHandle {
+            context,
+            limits,
+            package,
+        },
+        temp_dir,
+    ))
 }
 
 pub(crate) async fn execute_prepared_lua_tool(
@@ -396,21 +401,23 @@ pub(crate) async fn execute_prepared_lua_tool(
 }
 
 pub struct LuaToolRunRequest {
-    pub package_root: PathBuf,
+    pub metadata: String,
+    pub schema: String,
+    pub script: String,
+    pub temp_dir: PathBuf,
     pub arguments: String,
     pub agent_id: ResourceId,
     pub turn_id: String,
     pub resource_id: ResourceId,
     pub project_root: PathBuf,
-    pub image_root: PathBuf,
     pub limits: LuaExecutionLimits,
-    pub sandbox_policies: Vec<PathBuf>,
+    pub sandbox_policies: Vec<Arc<str>>,
 }
 
 pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError> {
     let limits = request.limits.clone();
-    let package =
-        read_lua_tool_package(&request.package_root, &request.resource_id, &limits).await?;
+    let definition =
+        parse_lua_tool_definition(&request.metadata, &request.schema, &request.resource_id)?;
     let arguments =
         serde_json::from_str::<serde_json::Value>(&request.arguments).map_err(|_| {
             ToolError::new(
@@ -424,7 +431,7 @@ pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolErro
             "Lua tool arguments must be a JSON object",
         ));
     }
-    let validator = jsonschema::validator_for(&package.definition.parameters).map_err(|_| {
+    let validator = jsonschema::validator_for(&definition.parameters).map_err(|_| {
         ToolError::new(
             ToolErrorKind::InvalidDefinition,
             "Lua tool input schema is invalid",
@@ -443,18 +450,22 @@ pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolErro
             turn_id: request.turn_id.clone(),
             resource_id: request.resource_id.clone(),
             project_root: Arc::new(request.project_root.clone()),
-            image_root: Arc::new(request.image_root.clone()),
-            package_root: Arc::new(request.package_root.clone()),
+            temp_dir: Arc::new(request.temp_dir.clone()),
             sandbox_policies: request.sandbox_policies.clone(),
         },
         limits: limits.clone(),
+        package: LuaToolPackage {
+            metadata: request.metadata.clone(),
+            schema: request.schema.clone(),
+            script: request.script.clone(),
+        },
     };
     let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
     lua.set_memory_limit(limits.max_memory_bytes)
         .map_err(lua_tool_error)?;
     install_execution_hook(&lua, &limits)?;
     let context = install_lua_environment(&lua, &handle)?;
-    lua.load(&package.script)
+    lua.load(&handle.package.script)
         .set_name(request.resource_id.to_string())
         .exec()
         .map_err(lua_tool_error)?;
@@ -509,18 +520,15 @@ fn tool_runner_path() -> Result<PathBuf, ToolError> {
 
 async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolError> {
     let payload = serde_json::json!({
-        "package_root": request.package_root.to_string_lossy(),
+        "metadata": request.metadata,
+        "schema": request.schema,
+        "script": request.script,
+        "temp_dir": request.temp_dir.to_string_lossy(),
         "arguments": request.arguments,
         "agent_id": request.agent_id.to_string(),
         "turn_id": request.turn_id,
         "resource_id": request.resource_id.to_string(),
         "project_root": request.project_root.to_string_lossy(),
-        "image_root": request.image_root.to_string_lossy(),
-        "sandbox_policies": request
-            .sandbox_policies
-            .iter()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>(),
         "limits": {
             "max_definition_bytes": request.limits.max_definition_bytes,
             "max_script_bytes": request.limits.max_script_bytes,
@@ -539,21 +547,30 @@ async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolEr
         )
     })?;
     let runner = tool_runner_path()?;
-    let mut command =
-        crate::handler::sandbox::confined_command(&request.sandbox_policies, &runner)?;
+    let spawn = crate::handler::sandbox::ConfinedSpawn::new(&request.sandbox_policies)?;
+    let mut command = spawn.command(&runner, &request.project_root)?;
     command
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(std::process::Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if nix::unistd::setsid().is_err() {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = command.spawn().map_err(|error| {
         ToolError::new(
             ToolErrorKind::RunnerFailed,
             format!("tool runner could not start: {error}"),
         )
     })?;
+    let mut group = crate::handler::sandbox::ProcessGroup::confined(
+        spawn.is_confined(),
+        child.id().unwrap_or_default(),
+    );
     if let Some(mut stdin) = child.stdin.take() {
         let write = async {
             stdin.write_all(&payload).await?;
@@ -580,11 +597,13 @@ async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolEr
     })?;
     let limit = request.limits.max_output_bytes;
     let outcome = tokio::time::timeout(request.limits.max_execution_time, async {
-        tokio::try_join!(
-            child.wait(),
+        let status = child.wait().await?;
+        group.reclaim();
+        let (stdout, stderr) = tokio::try_join!(
             read_process_output(stdout, limit),
             read_process_output(stderr, limit),
-        )
+        )?;
+        Ok::<_, std::io::Error>((status, stdout, stderr))
     })
     .await;
     let (status, stdout, stderr) = match outcome {
@@ -596,10 +615,11 @@ async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolEr
             ))
         }
         Err(_) => {
+            group.reclaim();
             return Err(ToolError::new(
                 ToolErrorKind::RunnerFailed,
                 "tool runner timed out",
-            ))
+            ));
         }
     };
     let stderr = String::from_utf8_lossy(&stderr.bytes).into_owned();
@@ -651,21 +671,19 @@ fn runner_failure(stderr: &str) -> ToolError {
 
 async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, ToolError> {
     let request = LuaToolRunRequest {
-        package_root: prepared.package_root.as_ref().clone(),
+        metadata: prepared.handle.package.metadata.clone(),
+        schema: prepared.handle.package.schema.clone(),
+        script: prepared.handle.package.script.clone(),
+        temp_dir: prepared.handle.context.temp_dir.as_ref().clone(),
         arguments: prepared.arguments.clone(),
         agent_id: prepared.handle.context.agent_id.clone(),
         turn_id: prepared.handle.context.turn_id.clone(),
         resource_id: prepared.handle.context.resource_id.clone(),
         project_root: prepared.handle.context.project_root.as_ref().clone(),
-        image_root: prepared.handle.context.image_root.as_ref().clone(),
         limits: prepared.handle.limits.clone(),
         sandbox_policies: prepared.handle.context.sandbox_policies.clone(),
     };
-    let result = spawn_tool_runner(&request).await;
-    for policy in &prepared.handle.context.sandbox_policies {
-        let _ = fs::remove_file(policy);
-    }
-    result
+    spawn_tool_runner(&request).await
 }
 
 pub(crate) fn lua_task_result_system(world: &mut World) {
@@ -767,37 +785,36 @@ fn parse_lua_tool_definition(
     })
 }
 
-async fn read_lua_tool_package(
+fn read_lua_tool_package(
     package_root: &Path,
     resource_id: &ResourceId,
     limits: &LuaExecutionLimits,
 ) -> Result<LuaToolPackage, ToolError> {
-    let metadata = read_bounded_async(
+    let metadata = read_bounded_sync(
         &package_root.join(TOOL_METADATA_FILE),
         limits.max_definition_bytes,
         "Lua tool metadata",
-    )
-    .await?;
-    let schema = read_bounded_async(
+    )?;
+    let schema = read_bounded_sync(
         &package_root.join(TOOL_SCHEMA_FILE),
         limits.max_definition_bytes,
         "Lua tool schema",
-    )
-    .await?;
-    let script = read_bounded_async(
+    )?;
+    let script = read_bounded_sync(
         &package_root.join(TOOL_SCRIPT_FILE),
         limits.max_script_bytes,
         "Lua tool script",
-    )
-    .await?;
+    )?;
     if script.trim().is_empty() {
         return Err(ToolError::new(
             ToolErrorKind::InvalidDefinition,
             "Lua tool script is empty",
         ));
     }
+    parse_lua_tool_definition(&metadata, &schema, resource_id)?;
     Ok(LuaToolPackage {
-        definition: parse_lua_tool_definition(&metadata, &schema, resource_id)?,
+        metadata,
+        schema,
         script,
     })
 }
@@ -842,14 +859,8 @@ fn install_lua_environment<'lua>(
         .map_err(lua_tool_error)?;
     context_values
         .set(
-            "image_root",
-            handle.context.image_root.to_string_lossy().as_ref(),
-        )
-        .map_err(lua_tool_error)?;
-    context_values
-        .set(
-            "package_root",
-            handle.context.package_root.to_string_lossy().as_ref(),
+            "temp_dir",
+            handle.context.temp_dir.to_string_lossy().as_ref(),
         )
         .map_err(lua_tool_error)?;
     let context = read_only_proxy(lua, context_values)?;
@@ -954,26 +965,6 @@ fn read_bounded_sync(path: &Path, limit: usize, label: &str) -> Result<String, T
     decode_bounded(bytes, limit, label)
 }
 
-async fn read_bounded_async(path: &Path, limit: usize, label: &str) -> Result<String, ToolError> {
-    let file = tokio::fs::File::open(path).await.map_err(|_| {
-        ToolError::new(
-            ToolErrorKind::ResourceResolutionFailed,
-            format!("{label} could not be read"),
-        )
-    })?;
-    let mut bytes = Vec::new();
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|_| {
-            ToolError::new(
-                ToolErrorKind::ResourceResolutionFailed,
-                format!("{label} could not be read"),
-            )
-        })?;
-    decode_bounded(bytes, limit, label)
-}
-
 fn decode_bounded(bytes: Vec<u8>, limit: usize, label: &str) -> Result<String, ToolError> {
     if bytes.len() > limit {
         return Err(ToolError::new(
@@ -1015,13 +1006,15 @@ mod runner_tests {
 
     fn request(limits: LuaExecutionLimits) -> LuaToolRunRequest {
         LuaToolRunRequest {
-            package_root: PathBuf::from("/nonexistent/package"),
+            metadata: "schema_version = 1\nname = \"glob\"\ndescription = \"test\"\n".to_owned(),
+            schema: r#"{"type":"object"}"#.to_owned(),
+            script: String::new(),
+            temp_dir: PathBuf::from("/tmp"),
             arguments: "{}".to_owned(),
             agent_id: ResourceId::parse("agent:test/coder:latest").unwrap(),
             turn_id: "turn-1".to_owned(),
             resource_id: ResourceId::parse("tool:local/glob:latest").unwrap(),
             project_root: PathBuf::from("/tmp"),
-            image_root: PathBuf::from("/tmp"),
             limits,
             sandbox_policies: Vec::new(),
         }

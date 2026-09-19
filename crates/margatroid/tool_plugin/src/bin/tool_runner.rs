@@ -9,15 +9,15 @@ use tool_plugin::{run_lua_tool, LuaExecutionLimits, LuaToolRunRequest, ToolError
 
 #[derive(Deserialize)]
 struct RunnerRequest {
-    package_root: PathBuf,
+    metadata: String,
+    schema: String,
+    script: String,
+    temp_dir: PathBuf,
     arguments: String,
     agent_id: String,
     turn_id: String,
     resource_id: String,
     project_root: PathBuf,
-    image_root: PathBuf,
-    #[serde(default)]
-    sandbox_policies: Vec<PathBuf>,
     limits: RunnerLimits,
 }
 
@@ -112,15 +112,17 @@ async fn main() -> ExitCode {
         max_host_call_time: Duration::from_millis(request.limits.max_host_call_time_ms),
     };
     let outcome = run_lua_tool(LuaToolRunRequest {
-        package_root: request.package_root,
+        metadata: request.metadata,
+        schema: request.schema,
+        script: request.script,
+        temp_dir: request.temp_dir,
         arguments: request.arguments,
         agent_id,
         turn_id: request.turn_id,
         resource_id,
         project_root: request.project_root,
-        image_root: request.image_root,
         limits,
-        sandbox_policies: request.sandbox_policies,
+        sandbox_policies: Vec::new(),
     })
     .await;
     match outcome {
