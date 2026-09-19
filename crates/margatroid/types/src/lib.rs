@@ -414,23 +414,6 @@ pub struct AgentHistoryRecordWriteRequested {
 
 impl Event for AgentHistoryRecordWriteRequested {}
 
-/// Requests that the live configuration be persisted. One entry per declared
-/// source field; `key` is the block path and `value` is its serialised content.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentSettingEntry {
-    pub key: String,
-    pub value: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentSettingWriteRequested {
-    pub agent: Entity,
-    pub entries: Vec<AgentSettingEntry>,
-}
-
-impl Event for AgentSettingWriteRequested {}
-
-
 // The following data types are deliberately free of plugin-specific behavior.
 // Domain plugins store and mutate them through the narrow methods below.
 

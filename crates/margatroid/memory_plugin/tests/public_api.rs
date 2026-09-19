@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use agent_plugin::AgentMemoryStore;
 use app_runtime_plugin::RuntimePlugin;
 use core_plugin::App;
 use margatroid_types::{AgentHistoryMessageWriteRequested, Message};
@@ -51,6 +52,38 @@ fn attach_agent(app: &mut App, memory: AgentMemory) -> core_plugin::Entity {
         },
     );
     entity
+}
+
+#[test]
+fn state_table_migrates_the_legacy_setting_namespace() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("memory.sql");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE setting (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at_ms INTEGER NOT NULL);\
+             INSERT INTO setting VALUES ('mcl.state/realtime', '{\"inners\":{}}', 1);\
+             INSERT INTO setting VALUES ('setting/tool_dynamic', '[]', 2);",
+        )
+        .unwrap();
+    drop(connection);
+
+    let memory = AgentMemory::open(&path).unwrap();
+    assert_eq!(
+        memory.state_value("realtime").unwrap().as_deref(),
+        Some("{\"inners\":{}}")
+    );
+    assert_eq!(memory.state_value("setting/tool_dynamic").unwrap(), None);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let tables = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(tables, ["history_messages", "state"]);
 }
 
 #[test]

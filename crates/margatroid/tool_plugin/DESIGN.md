@@ -318,7 +318,7 @@ Base Lua IMPORT -> MclPlugin -> ToolRegisterRequest
     -> ToolRegisterResponse -> MclPlugin 完成 IMPORT
 
 调用：
-Base Lua EMIT EFFECT tool_call -> MclPlugin -> ToolCallEvent
+Base Lua EMIT EFFECT tool_call FROM ? -> MclPlugin -> ToolCallEvent
     -> tool_call_route_system
         -> skill/hook: 同步执行 -> finish_tool_call -> AgentMessage::Tool
         -> lua/shell: prepare -> 异步执行 -> 异步 guard 发送 AgentMessage::Tool

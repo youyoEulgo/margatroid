@@ -6,14 +6,16 @@ use std::sync::{Arc, Mutex};
 use core_plugin::Entity;
 use margatroid_types::{
     AgentError, AgentErrorKind, Block, BlockAssembly, BlockInner, BlockPath, InnerType, LuaVmId,
-    Message, RefBlock, RefBlockAssembly,
-    RefMerge, ResourceId, TokenUsage, ToolDefinition,
+    Message, RefBlock, RefBlockAssembly, RefMerge, ResourceId, TokenUsage, ToolDefinition,
 };
 use tokio::sync::oneshot;
 
+type AgentCreateResultSender = Arc<Mutex<Option<oneshot::Sender<Result<Entity, AgentError>>>>>;
+type AgentControlResultSender = Arc<Mutex<Option<oneshot::Sender<Result<(), AgentError>>>>>;
+
 #[derive(Clone, Debug)]
 pub struct AgentCreateReply {
-    sender: Arc<Mutex<Option<oneshot::Sender<Result<Entity, AgentError>>>>>,
+    sender: AgentCreateResultSender,
 }
 
 impl AgentCreateReply {
@@ -40,7 +42,7 @@ pub enum AgentControlKind {
 
 #[derive(Clone, Debug)]
 pub struct AgentControlReply {
-    sender: Arc<Mutex<Option<oneshot::Sender<Result<(), AgentError>>>>>,
+    sender: AgentControlResultSender,
 }
 
 impl AgentControlReply {
@@ -180,7 +182,8 @@ pub struct AgentResourceMap {
     pub default_visible: BTreeSet<ResourceId>,
     pub visible_source: Option<BlockPath>,
     pub default_visible_source: Option<BlockPath>,
-    pub setting_sources: Vec<BlockPath>,
+    pub exposed: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    pub expose_mappings: BTreeMap<String, BTreeMap<String, String>>,
     pub tool_entries: Vec<AgentResourceEntry>,
 }
 
@@ -354,10 +357,6 @@ pub trait AgentMemoryStore: Send + Sync + 'static {
         usage: Option<&TokenUsage>,
     ) -> Result<(), AgentMemoryStoreError>;
 
-    fn set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError>;
-
-    fn setting_value(&self, key: &str) -> Result<Option<Vec<String>>, AgentMemoryStoreError>;
-
     fn set_state(&self, key: &str, value: &str) -> Result<(), AgentMemoryStoreError>;
 
     fn state_value(&self, key: &str) -> Result<Option<String>, AgentMemoryStoreError>;
@@ -407,14 +406,6 @@ impl AgentMemoryHandle {
     ) -> Result<(), AgentMemoryStoreError> {
         self.inner
             .append_history(turn_id, source, message, tool_schema, usage)
-    }
-
-    pub fn set_setting(&self, entries: &[(String, String)]) -> Result<(), AgentMemoryStoreError> {
-        self.inner.set_setting(entries)
-    }
-
-    pub fn setting_value(&self, key: &str) -> Result<Option<Vec<String>>, AgentMemoryStoreError> {
-        self.inner.setting_value(key)
     }
 
     pub fn set_state(&self, key: &str, value: &str) -> Result<(), AgentMemoryStoreError> {
@@ -489,7 +480,10 @@ impl AgentMcl {
 
     pub fn bind_state(&mut self, block_id: String, state_name: String) -> Result<(), AgentError> {
         if !self.blocks.blocks.contains_key(&block_id) {
-            return Err(AgentError::new(AgentErrorKind::BlockMissing, "block is missing"));
+            return Err(AgentError::new(
+                AgentErrorKind::BlockMissing,
+                "block is missing",
+            ));
         }
         if let Some(existing) = self.state_bindings.get(&state_name) {
             if existing != &block_id {
@@ -571,34 +565,6 @@ impl AgentMcl {
 
     pub fn insert(&mut self, target: &BlockPath, values: BlockInner) -> Result<(), AgentError> {
         append_inner(self.real_inner_mut(target)?, values)
-    }
-
-    pub fn delete(
-        &mut self,
-        target: &BlockPath,
-        selection: Vec<usize>,
-    ) -> Result<(), AgentError> {
-        let slot = self.real_inner_mut(target)?;
-        let mut indices = selection;
-        indices.sort_unstable();
-        indices.dedup();
-        if indices.iter().any(|index| *index >= slot.len()) {
-            return Err(AgentError::new(
-                AgentErrorKind::InvalidRequest,
-                "delete index is out of range",
-            ));
-        }
-        for index in indices.into_iter().rev() {
-            match slot {
-                BlockInner::Message(values) => {
-                    values.remove(index);
-                }
-                BlockInner::ResourceId(values) => {
-                    values.remove(index);
-                }
-            }
-        }
-        Ok(())
     }
 
     pub fn cover(&mut self, target: &BlockPath, values: BlockInner) -> Result<(), AgentError> {

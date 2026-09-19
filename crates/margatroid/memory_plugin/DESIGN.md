@@ -3,7 +3,7 @@
 MemoryPlugin 为每个 Agent 提供独占的 SQLite 存储。历史消息和 MCL state 是两种不同语义：
 
 - `history_messages` 是追加式对话时间线，由 `history_append` 显式写入；
-- `setting` 是由 MCL driver 声明的动态 state 存储，按 key 保存 JSON blob；
+- `state` 是由 MCL driver 声明的通用持久化存储，按 key 保存完整 Block JSON；
 - state 的字段形状由 driver 的 `CREATE BLOCK` 决定，MemoryPlugin 不预设业务字段。
 
 # lib
@@ -16,21 +16,19 @@ MemoryPlugin：Agent 记忆插件
     new() -> Self
     with_schedule(mut self, schedule: impl Into<String>) -> Self
     build(self, app: &mut App)
-        安装历史写入、配置写入和 state 写入系统
+        安装历史消息与显式记录写入系统；state 由 MCL direct operation 通过 AgentMemoryHandle 同步读写
 
 MemoryPluginInstalled：插件安装标记
 
 AgentMemory：单 Agent SQLite 存储
     open(path: impl Into<PathBuf>) -> Result<Self, MemoryError>
-        创建父目录、打开数据库并初始化 history_messages 与 setting 表
+        创建父目录、打开数据库并初始化 history_messages 与 state 表
     path(&self) -> &Path
     history_messages(&self) -> Result<Vec<HistoryMessage>, MemoryError>
         按 sequence 读取展示历史
     impl AgentMemoryStore for AgentMemory
         append_history：追加一条消息历史
-        set_setting：按 key upsert RESOURCE 配置值
-        setting_value：读取 RESOURCE 配置值，并区分缺失与空数组
-        set_state：按 mcl.state/<name> key 写入完整 block JSON
+        set_state：按 <name> key 写入完整 block JSON
         state_value：读取完整 state JSON blob
         append_record：追加显式 MCL timeline record
 ```
@@ -46,8 +44,6 @@ sync_history_messages_system(world: &mut World)
 sync_history_records_system(world: &mut World)
     处理 AgentHistoryRecordWriteRequested，失败时发送 AgentMemoryWriteFailed
 
-sync_settings_system(world: &mut World)
-    处理 AgentSettingWriteRequested，写入 setting 表
 ```
 
 MCL state 的读取在 MCL direct operation 中通过 Agent.memory 同步完成；state 的写入同样通过
@@ -63,14 +59,11 @@ handle_history_message_write(world, event)
 
 handle_history_record_write(world, event)
     校验 Agent.memory 后追加显式 timeline record
-
-handle_setting_write(world, event)
-    校验 Agent.memory 后 upsert RESOURCE 配置项
 ```
 
 # events
 
-MemoryPlugin 只处理历史消息、显式记录和设置写入事件。不存在 realtime 专用读写事件。
+MemoryPlugin 只处理历史消息与显式记录事件。state 通过 AgentMemoryStore 的通用 blob API 同步读写，不定义业务专用事件。
 
 # types
 
@@ -78,19 +71,21 @@ MemoryPlugin 只处理历史消息、显式记录和设置写入事件。不存�
 
 ```sql
 CREATE TABLE history_messages (...);
-CREATE TABLE setting (
+CREATE TABLE state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at_ms INTEGER NOT NULL
 );
 ```
 
-`setting` 同时承载两类数据：
+`state` 只承载一种通用数据：
 
 ```text
-普通配置：key = block/inner，value = RESOURCE ID 数组 JSON
-MCL state：key = mcl.state/<state-name>，value = 完整 Block JSON
+key = <state-name>
+value = 完整 Block JSON
 ```
+
+打开旧数据库时，如果存在旧 `setting` 表，只迁移其中 `mcl.state/<name>` 行为裸 `<name>` key；旧 RESOURCE 配置行被丢弃，迁移后删除旧表。
 
 state 的读取规则由 MCL 定义：
 
@@ -115,7 +110,7 @@ Agent 启动
     -> BIND realtime_state TO STATE realtime
 
 普通消息写入
-    -> Base Lua EMIT EFFECT history_append
+    -> Base Lua EMIT EFFECT history_append FROM ?
     -> AgentHistoryMessageWriteRequested
     -> sync_history_messages_system
     -> history_messages 追加一行
@@ -124,11 +119,11 @@ state 更新
     -> Base Lua INJECT 数据到已绑定 block
     -> MCL 序列化完整 block
     -> AgentMemoryHandle::set_state
-    -> setting 表 upsert
+    -> state 表 upsert
 ```
 
 # 边界
 
-MemoryPlugin 负责通用 SQLite 存储，不知道 `setting` 中具体保存的是 sandbox、工具可见性还是实时上下文。
+MemoryPlugin 负责通用 SQLite 存储，不知道 `state` 中具体保存的是 sandbox、工具可见性还是实时上下文。
 Base Lua 负责 block 形状、默认值、加载顺序以及何时把消息上下文同步到 `realtime_state`。
 `history_messages` 和 state 不互相恢复，也不自动将 state 记录到 timeline。

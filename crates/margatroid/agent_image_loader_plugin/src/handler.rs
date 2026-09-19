@@ -622,11 +622,10 @@ fn parse_default_visibility(
             aliases.insert(alias.to_owned(), resource.to_owned());
         }
     }
-    let Some(inject) = source
-        .lines()
-        .map(str::trim)
-        .find(|line| line.contains("INJECT") && (line.contains("TO tool_default") || line.contains("TO tool.tool_default")))
-    else {
+    let Some(inject) = source.lines().map(str::trim).find(|line| {
+        line.contains("INJECT")
+            && (line.contains("TO tool_default") || line.contains("TO tool.tool_default"))
+    }) else {
         return Ok(BTreeSet::new());
     };
     let names = inject

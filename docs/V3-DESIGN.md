@@ -99,9 +99,9 @@ CREATE REF_BLOCK req (...)
 INJECT ... TO ...
 LOAD STATE realtime INTO realtime_state
 BIND realtime_state TO STATE realtime
-EMIT EFFECT history_append ...
-EMIT EFFECT inference (req)
-EMIT EFFECT tool_call ?
+EMIT EFFECT history_append FROM ?
+EMIT EFFECT inference FROM req
+EMIT EFFECT tool_call FROM ?
 EMIT EFFECT finish
 ```
 
@@ -151,7 +151,7 @@ ToolCallEvent
 
 ```text
 history_messages  User / Assistant / Tool / Error 以及显式 mcl 记录
-setting           通用 state blob（含实时上下文快照）
+state             通用持久化 blob（含实时上下文快照）
 ```
 
 - 历史表：客户端可展示对话的唯一来源。

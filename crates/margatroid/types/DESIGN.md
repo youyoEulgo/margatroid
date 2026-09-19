@@ -370,7 +370,7 @@ Workspace定义：
         -> 发送AgentHistoryMessageWriteRequested
         -> MCL conversation保存完整Tool正文
     MCL driver 修改已绑定的 state Block
-        -> MCL 序列化完整 Block 并通过 AgentMemoryHandle 写入 setting 表
+        -> MCL 序列化完整 Block 并通过 AgentMemoryHandle 写入 state 表
     MemoryPlugin通过通用 state 存储执行持久化，并从Agent.memory取得目标存储句柄；不维护第二份Agent内存状态
 ```
 
