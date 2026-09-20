@@ -54,6 +54,10 @@ AgentMemoryHandle 完成，不再经过 realtime 专用读写事件。
 ## 函数
 
 ```text
+handle_store_error(error: AgentMemoryStoreError) -> MemoryError
+    转换存储错误：crate 内公开函数，把 AgentMemoryStoreError 的 kind 映射成 MemoryErrorKind，
+    并保留稳定描述；未知 kind 归为 AgentMemoryMissing
+
 handle_history_message_write(world, event)
     校验 Agent.memory 后追加历史消息
 
@@ -97,6 +101,33 @@ state 存在且字段有值：覆盖默认值
 ```
 
 未知字段被忽略，当前 block 新增字段使用 driver 默认值。
+
+# error
+
+```text
+MemoryError：MemoryPlugin错误，公开结构体--不包含数据库内容或消息正文
+    kind: MemoryErrorKind--稳定有限分类
+    message: String--稳定有界描述，构造时截断到 512 字节
+
+    new(kind: MemoryErrorKind, message: impl Into<String>) -> Self
+        构造：crate 内公开关联函数，超长描述按字符边界截断并追加省略号
+    kind(&self) -> MemoryErrorKind
+        读取分类：公开方法
+    message(&self) -> &str
+        读取描述：公开方法
+    impl Clone + PartialEq + Eq + fmt::Display + std::error::Error
+
+MemoryErrorKind：MemoryPlugin错误分类，公开枚举
+    InvalidPath--数据库路径非法
+    DirectoryCreateFailed--父目录创建失败
+    OpenFailed--数据库打开失败
+    SchemaFailed--建表或迁移失败
+    ReadFailed--查询失败
+    DecodeFailed--存储值无法解码
+    AgentNotAlive--目标Agent不存活
+    AgentMemoryMissing--目标Agent没有记忆
+    WriteFailed--写入失败
+```
 
 # 逻辑
 

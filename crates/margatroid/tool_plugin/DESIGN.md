@@ -134,30 +134,115 @@ skill.rs skill_register_system / execute_skill_call
 hook.rs  hook_register_system / execute_hook_call
 lua.rs   lua_tool_register_system / prepare_lua_call / execute_prepared_lua_tool / lua_task_result_system
          / run_lua_tool / spawn_tool_runner / runner_failure / tool_runner_path
-         / verify_sandbox / sandbox_backend / sandbox_environment_ok
+sandbox.rs
+         sandbox_register_system / register_sandbox_resource / find_sandbox_package
+         / active_sandbox_policies / sandbox_backend / ConfinedSpawn / CallTempDir / ProcessGroup
 
-SANDBOX_POLICY_PATH（常量）：临时脚手架，固定为 /tmp/margatroid-sandbox-policy.json
-    语义：文件存在 ⇒ 启用沙箱；不存在 ⇒ 无沙箱
-    说明：这是刻意的一次性形态，由镜像具名策略 + base.lua IMPORT + MCL 启用取代后删除
+sandbox_register_system(world)
+    注册沙箱资源：处理 resource_id 类型为 sandbox 的 ToolRegisterRequest
+    行为：定位策略包 → 读取 policy.json → 校验非空、不超过 MAX_POLICY_BYTES、是合法 JSON
+          → 返回 ResourceMapEntry，content 为 ResourceContent::Sandbox 且 tool_id 与 template 为空
+    边界：失败只记日志并回错误响应，不影响其他资源
 
-verify_sandbox() -> Result<(), ToolError>
-    启动期校验：crate 内公开，由 ToolPlugin::open 调用
-    行为：策略文件不存在直接 Ok；存在则定位后端，跑 doctor（要求 ok 为 true）与
-          policy validate -p <路径>，任一失败即返回错误
-    边界：fail-closed 的落点——声明了策略而后端不可用就拒绝启动，不静默降级
+find_sandbox_package(project_root, image_root, resource_id)
+    定位策略包：私有函数，按 <project_root>/.margatroid/sandboxes 再到 <image_root>/sandboxes 顺序查找
+    行为：要求类型为 sandbox；命中含 policy.json 的目录即返回，两处都没有则报资源未找到
+
+active_sandbox_policies(resources: &AgentResourceMap) -> Result<Vec<Arc<str>>, ToolError>
+    解析本次调用生效的策略：crate 内公开
+    行为：按 active_sandboxes 的集合序遍历，逐个取回策略文本；按声明顺序返回，交由 landstrip 合并
+    边界：已激活却没有策略、或策略为空，一律报错而不是静默降级
 
 sandbox_backend() -> Option<PathBuf>
     定位后端：环境变量 MARGATROID_SANDBOX_BACKEND → PATH 里的 landstrip → 当前可执行文件同目录
 
-sandbox_environment_ok(backend: &Path) -> Result<(), ToolError>
-    后端体检：私有函数，跑 doctor 与 policy validate，把 stderr 带进错误信息
+ConfinedSpawn：一次受限调用的全部约定，crate 内公开结构体
+    policies: Vec<PathBuf>--本次调用暂存的策略文件，私有
+    new(policies: &[Arc<str>]) -> Result<Self, ToolError>
+        暂存策略：crate 内公开关联函数，逐份写进独立临时文件，任一份失败时清掉已写的
+    is_confined(&self) -> bool
+        是否受限：crate 内公开方法，策略集合非空即为真；同时决定是否整树回收
+    command(&self, program: &Path, project_root: &Path) -> Result<tokio::process::Command, ToolError>
+        构造命令：crate 内公开方法
+        行为：受限时包成 landstrip run -p <策略>... -- <program>，未受限时直接执行 program；
+              两种情况统一设置工作目录为项目根、env_clear 后只给 PATH、kill_on_drop
+        边界：有策略而后端不可用则 fail-closed，拒绝执行而不是绕过策略
+    impl Drop for ConfinedSpawn
+        删除本次调用暂存的所有策略文件
+
+    说明：Lua 与 shell 两条路径共用本类型，工作目录、环境、策略暂存与回收模式只有这一处定义；
+          工作目录必须是项目根，因为可移植策略写的是 "."，否则会解析到 daemon 自己的目录
+
+CallTempDir：一次调用的临时目录，crate 内公开结构体
+    path: PathBuf--<项目根>/.margatroid/tmp/<序号>，私有
+    create(project_root: &Path) -> Result<Self, ToolError>
+        创建临时目录：crate 内公开关联函数，供工具存放 stderr 等中间产物
+    path(&self) -> &Path
+        读取路径：crate 内公开方法，注入到工具上下文的 temp_dir
+    impl Drop for CallTempDir
+        递归删除该目录
+
+    说明：受限调用除工作区外只允许写这里，所以策略里的项目根就已覆盖，不需要放开共享的 /tmp
+
+ProcessGroup：受限调用的进程树回收，crate 内公开结构体
+    leader: Option<u32>--进程组首进程；未受限时为 None，私有
+    confined(confined: bool, leader: u32) -> Self
+        构造：crate 内公开关联函数，仅当本次受限时才记录首进程
+    reclaim(&mut self)
+        回收进程树：crate 内公开方法，对首进程所在进程组发送 SIGKILL；幂等，首次调用后失效
+    impl Drop for ProcessGroup
+        兜底回收
+
+    说明：kill_on_drop 只覆盖直接子进程；工具自行派生的后台进程会带着本次策略活过调用边界
 
 spawn_tool_runner 的沙箱分支：
-    策略文件存在时命令为 landstrip run -p <SANDBOX_POLICY_PATH> -- <tool_runner>
-    两条分支都做环境最小化：env_clear() 后只给 PATH（landstrip 不管环境变量这一轴）
+    受限时命令为 landstrip run -p <策略>... -- <tool_runner>，未受限时直接执行 runner
+    两条分支都由 ConfinedSpawn 统一做环境最小化与工作目录设置
 
 runner_failure 补充：stderr 里可能混入 landstrip 的拒绝事件，所以按"最后一条 kind 属于
     ToolErrorKind 的 JSON 行"取值，trap 事件不会把错误种类带偏
+
+HOOK_TOOL_ID（常量）：hook 执行器的内建资源ID，crate 内公开，固定为 tool:builtin/hook:latest
+SKILL_LOADER_ID（常量）：Skill 加载器的内建资源ID，crate 内公开，固定为 tool:builtin/skill-loader:latest
+    used_by：system 的路由分支、skill.rs 与 hook.rs 的注册路径按这两个ID识别内建执行器
+
+LuaError：Lua 执行限额错误，公开结构体--只用于构造期的参数校验
+    kind: LuaErrorKind--稳定有限分类
+    message: String--稳定有界描述
+    impl Clone + PartialEq + Eq + fmt::Display + std::error::Error
+
+LuaErrorKind：Lua 限额错误分类，公开枚举
+    InvalidLimits--限额为零、互不自洽，或宿主调用时限超过总执行时限
+
+ShellError：Shell 执行限额错误，公开结构体--只用于构造期的参数校验
+    kind: ShellErrorKind--稳定有限分类
+    message: String--稳定有界描述
+    impl Clone + PartialEq + Eq + fmt::Display + std::error::Error
+
+ShellErrorKind：Shell 限额错误分类，公开枚举
+    InvalidLimits--限额为零或执行时限为零
+
+PreparedLuaToolCall：待执行的 Lua 工具调用，crate 内公开事件--prepare 与 execute 之间的载荷
+    arguments: String--模型给出的原始参数
+    handle: LuaExecutionHandle--执行上下文、限额与已内联的工具包内容
+    response: LuaToolResponseGuard--兜底回执，未显式响应时由 Drop 发出失败结果
+    temp_dir: CallTempDir--本次调用的临时目录守卫，随载荷释放而清理
+
+PreparedShellToolCall：待执行的 Shell 工具调用，crate 内公开事件
+    package_root: Arc<PathBuf>--Shell 包目录
+    arguments: String--模型给出的原始参数
+    context: ShellCallContext--执行上下文，含项目根、资源ID、策略与临时目录
+    limits: ShellExecutionLimits--执行限额
+    response: ShellResponseGuard--兜底回执
+    temp_dir: CallTempDir--本次调用的临时目录守卫
+
+LuaTaskError：Lua 异步任务错误，crate 内公开结构体--包装 async_runtime_plugin 的任务错误
+    source: AsyncTaskError--底层任务错误
+    impl From<AsyncTaskError>
+
+ShellTaskError：Shell 异步任务错误，crate 内公开结构体--包装 async_runtime_plugin 的任务错误
+    source: AsyncTaskError--底层任务错误
+    impl From<AsyncTaskError>
 
 install_lua_environment(lua, handle) -> Result<Table, ToolError>
     注入工具环境：私有函数，注入面只有一个入口函数
@@ -170,8 +255,9 @@ run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError>
     执行 Lua 工具：公开异步函数，插件进程内与 runner 进程共用同一段逻辑
     行为：读工具包（main.lua 与 input schema）→ 校验 arguments → 建 VM（StdLib::ALL + 内存上限 + 执行钩子 + 注入宿主面）
           → 把 arguments 填进入口表 → 加载 main.lua → 调用全局 execute → 结果长度不超过 max_output_bytes
-    约束：request 携带 package_root、arguments、agent_id、turn_id、resource_id、project_root、image_root、
-          limits 与可选 http client（插件侧传共享 client，runner 侧传 None 自行创建）
+    行为补充：工具包内容由 daemon 读取后随请求下发，沙箱内不再有进程需要读镜像根
+    约束：request 携带 metadata、schema、script、temp_dir、arguments、agent_id、turn_id、
+          resource_id、project_root、limits 与 sandbox_policies
 
 spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolError>
     派生 runner 执行工具：私有异步函数
