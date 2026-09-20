@@ -1,0 +1,2407 @@
+/* ============================================================
+   Margatroid UI — DeepSeek Harness visual port
+   Class names and component structure remain untouched. The
+   visual layer below follows DeepSeek Harness' web frontend:
+   - 280px sidebar / centered 748px chat column / 360px details
+   - compact 32/34px sidebar rows
+   - right-aligned 22px-radius user bubble, plain assistant text
+   - capsule composer with bottom toolbar row
+   - light + auto dark palettes
+   ============================================================ */
+
+:root {
+  color-scheme: light;
+
+  --mg-bg-base: #ffffff;
+  --mg-bg-sidebar: #f9fafb;
+  --mg-bg-panel: #fbfcfd;
+  --mg-bg-subtle: #f7f8fa;
+  --mg-bg-hover: rgba(38, 49, 72, 0.06);
+  --mg-bg-active: rgba(38, 49, 72, 0.1);
+  --mg-bg-elevated: #ffffff;
+
+  --mg-text-primary: #0f1115;
+  --mg-text-secondary: #61666b;
+  --mg-text-tertiary: #81858c;
+  --mg-text-quaternary: #adb2b8;
+  --mg-text-on-brand: #ffffff;
+
+  --mg-border-l1: rgba(0, 0, 0, 0.04);
+  --mg-border: rgba(0, 0, 0, 0.1);
+  --mg-border-strong: rgba(0, 0, 0, 0.12);
+  --mg-border-focus: rgba(57, 100, 254, 0.38);
+
+  --mg-brand: #4176e6;
+  --mg-brand-hover: #4d93fe;
+  --mg-brand-active: #2f63d1;
+  --mg-brand-soft: #edf3fe;
+  --mg-brand-soft-strong: #e4edfd;
+  --mg-brand-ring: rgba(65, 118, 230, 0.14);
+  --mg-brand-blue: #4176e6;
+  --mg-brand-blue-hover: #679efe;
+
+  --mg-success: #22c55e;
+  --mg-success-soft: rgba(34, 197, 94, 0.12);
+  --mg-warn: #f59e0b;
+  --mg-warn-soft: rgba(245, 158, 11, 0.14);
+  --mg-error: #ec1313;
+  --mg-error-soft: rgba(236, 19, 19, 0.06);
+
+  --mg-bubble: #edf3fe;
+
+  --mg-font-sans:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --mg-font-mono:
+    'SF Mono', 'JetBrains Mono', 'Fira Code', Consolas, 'Liberation Mono', Menlo, 'Courier New',
+    monospace;
+
+  --mg-sidebar-width: 280px;
+  --mg-panel-width: 360px;
+  --mg-chat-width: 748px;
+  --mg-composer-width: 780px;
+
+  --mg-shadow-card: 0 2px 12px rgba(15, 17, 21, 0.06);
+  --mg-shadow-dialog: 0 24px 70px rgba(15, 17, 21, 0.2);
+  --mg-ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+  --mg-scroll-thumb: rgba(15, 17, 21, 0.14);
+  --mg-scroll-thumb-hover: rgba(15, 17, 21, 0.26);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+
+    --mg-bg-base: #151517;
+    --mg-bg-sidebar: #1b1b1c;
+    --mg-bg-panel: #19191a;
+    --mg-bg-subtle: #1f1f20;
+    --mg-bg-hover: rgba(255, 255, 255, 0.07);
+    --mg-bg-active: rgba(255, 255, 255, 0.12);
+    --mg-bg-elevated: #2c2c2d;
+
+    --mg-text-primary: #f5f6f7;
+    --mg-text-secondary: #cfd3d6;
+    --mg-text-tertiary: #adb2b8;
+    --mg-text-quaternary: #7d8288;
+    --mg-text-on-brand: #ffffff;
+
+    --mg-border-l1: rgba(255, 255, 255, 0.06);
+    --mg-border: rgba(255, 255, 255, 0.12);
+    --mg-border-strong: rgba(255, 255, 255, 0.16);
+    --mg-border-focus: rgba(77, 147, 248, 0.42);
+
+    --mg-brand: #4d93fe;
+    --mg-brand-hover: #679efe;
+    --mg-brand-active: #3d83ea;
+    --mg-brand-soft: rgba(77, 147, 248, 0.14);
+    --mg-brand-soft-strong: rgba(77, 147, 248, 0.24);
+    --mg-brand-ring: rgba(77, 147, 248, 0.2);
+    --mg-brand-blue: #679efe;
+    --mg-brand-blue-hover: #4176e6;
+
+    --mg-success: #4ed17e;
+    --mg-success-soft: rgba(78, 209, 126, 0.14);
+    --mg-warn: #f7ad31;
+    --mg-warn-soft: rgba(247, 173, 49, 0.14);
+    --mg-error: #f25a5a;
+    --mg-error-soft: rgba(242, 90, 90, 0.14);
+
+    --mg-bubble: #232324;
+
+    --mg-shadow-card: 0 2px 12px rgba(0, 0, 0, 0.24);
+    --mg-shadow-dialog: 0 24px 70px rgba(0, 0, 0, 0.5);
+
+    --mg-scroll-thumb: rgba(255, 255, 255, 0.16);
+    --mg-scroll-thumb-hover: rgba(255, 255, 255, 0.28);
+  }
+}
+
+/* ============================================================
+   Base
+   ============================================================ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  min-width: 320px;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  color: var(--mg-text-primary);
+  background: var(--mg-bg-base);
+  font-family: var(--mg-font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+textarea {
+  font-family: inherit;
+}
+
+button {
+  color: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--mg-brand);
+  outline-offset: 2px;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--mg-scroll-thumb) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: var(--mg-scroll-thumb);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--mg-scroll-thumb-hover);
+  background-clip: padding-box;
+}
+
+/* ============================================================
+   App frame — 280 | 1fr | 360, matching DSH AppFrame defaults
+   ============================================================ */
+
+.app-shell {
+  display: grid;
+  grid-template-columns: var(--mg-sidebar-width) minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--mg-bg-base);
+  transition: grid-template-columns 300ms var(--mg-ease);
+}
+
+.app-shell:has(.activity-panel) {
+  grid-template-columns: var(--mg-sidebar-width) minmax(0, 1fr) var(--mg-panel-width);
+}
+
+/* ============================================================
+   Sidebar (SidebarRoot + Rows)
+   ============================================================ */
+
+.workspace-sidebar {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  padding: 6px 12px;
+  border-right: 1px solid var(--mg-border-l1);
+  background: var(--mg-bg-sidebar);
+  color: var(--mg-text-primary);
+  font-size: 14px;
+}
+
+/* Logo row: 60px, wordmark left. */
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 60px;
+  padding: 8px 4px 8px 4px;
+  margin-bottom: 8px;
+}
+
+.brand-mark {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--mg-text-primary);
+  background: transparent;
+}
+
+.brand-row strong {
+  display: block;
+  color: var(--mg-text-primary);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 24px;
+  letter-spacing: -0.01em;
+}
+
+/* DSH shows only the wordmark on the logo row. */
+.brand-row span {
+  display: none;
+}
+
+.brand-row .icon-button {
+  margin-left: auto;
+}
+
+.sidebar-close,
+.mobile-menu {
+  display: none !important;
+}
+
+/* Round, quiet icon buttons. */
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: var(--mg-text-secondary);
+  background: transparent;
+  cursor: pointer;
+  transition:
+    color 120ms var(--mg-ease),
+    background-color 120ms var(--mg-ease);
+}
+
+.icon-button:hover:not(:disabled),
+.icon-button--active {
+  color: var(--mg-text-primary);
+  background: var(--mg-bg-hover);
+}
+
+.icon-button:disabled,
+.footer-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.38;
+}
+
+/* Connection card doubles as the New Session bar. */
+.connection-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: 38px;
+  padding: 8px 16px;
+  margin: 0 2px 8px;
+  border: 1px solid var(--mg-border);
+  border-radius: 12px;
+  color: var(--mg-text-primary);
+  background: var(--mg-bg-elevated);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 140ms var(--mg-ease),
+    background-color 140ms var(--mg-ease);
+}
+
+.connection-strip:hover {
+  background: var(--mg-bg-hover);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: 50%;
+  background: var(--mg-text-quaternary);
+}
+
+.status-dot--online {
+  background: var(--mg-success);
+  box-shadow: 0 0 0 3px var(--mg-success-soft);
+}
+
+.status-dot--connecting {
+  background: var(--mg-warn);
+  box-shadow: 0 0 0 3px var(--mg-warn-soft);
+}
+
+.connection-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.connection-copy strong,
+.connection-copy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-copy strong {
+  color: var(--mg-text-primary);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 22px;
+}
+
+.connection-copy small {
+  margin-top: 1px;
+  color: var(--mg-text-tertiary);
+  font-family: var(--mg-font-mono);
+  font-size: 10px;
+}
+
+/* Compact section headers (Workspaces / Members). */
+.sidebar-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 36px;
+  padding: 0 4px;
+  margin: 2px -4px 4px;
+  color: var(--mg-text-tertiary);
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.sidebar-heading--members {
+  margin-top: 14px;
+}
+
+.count-badge {
+  display: grid;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  place-items: center;
+  border-radius: 999px;
+  color: var(--mg-text-secondary);
+  background: var(--mg-bg-hover);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.workspace-list,
+.member-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 16px;
+  scrollbar-gutter: stable;
+}
+
+/* DSH row geometry: project 34px, session 32px, radius 8. */
+.workspace-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 34px;
+  gap: 6px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--mg-text-primary);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms var(--mg-ease);
+}
+
+.member-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 32px;
+  gap: 6px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--mg-text-primary);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms var(--mg-ease);
+}
+
+.workspace-item:hover,
+.member-item:hover,
+.workspace-item--active,
+.member-item--active {
+  background: var(--mg-bg-hover);
+}
+
+.workspace-item--active {
+  font-weight: 500;
+}
+
+.workspace-item--active > svg {
+  color: var(--mg-brand);
+}
+
+.workspace-item__copy,
+.member-item__copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.workspace-item__copy strong,
+.workspace-item__copy small,
+.member-item__copy strong,
+.member-item__copy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-item__copy strong,
+.member-item__copy strong {
+  color: inherit;
+  font-size: 14px;
+  font-weight: 450;
+  line-height: 20px;
+}
+
+/* DSH rows are one line; the project path / member role is hidden. */
+.workspace-item__copy small,
+.member-item__copy small {
+  display: none;
+}
+
+.sidebar-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  color: var(--mg-text-tertiary);
+  font-size: 12px;
+}
+
+.text-button {
+  width: max-content;
+  padding: 0;
+  border: 0;
+  color: var(--mg-brand);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.text-button:hover {
+  color: var(--mg-brand-hover);
+  text-decoration: underline;
+}
+
+.member-avatar {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--mg-text-tertiary);
+  background: transparent;
+}
+
+.member-avatar--manager {
+  color: var(--mg-brand);
+}
+
+.sidebar-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--mg-border-l1);
+}
+
+.footer-action {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--mg-text-primary);
+  background: transparent;
+  font-size: 14px;
+  line-height: 22px;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color 120ms var(--mg-ease),
+    background-color 120ms var(--mg-ease);
+}
+
+.footer-action:hover:not(:disabled) {
+  color: var(--mg-text-primary);
+  background: var(--mg-bg-hover);
+}
+
+/* ============================================================
+   Conversation column
+   ============================================================ */
+
+.conversation-pane {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  background: var(--mg-bg-base);
+  position: relative;
+}
+
+.conversation-header {
+  display: flex;
+  align-items: center;
+  min-height: 52px;
+  padding: 12px 20px 12px 24px;
+  border-bottom: 1px solid var(--mg-border-l1);
+}
+
+.conversation-heading {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+/* DSH headers are breadcrumb text; avatar and subtitle stay hidden. */
+.channel-avatar,
+.channel-subtitle {
+  display: none;
+}
+
+.channel-title {
+  overflow: hidden;
+  color: var(--mg-text-primary);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.header-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+/* Message scrollport. Sides mirror DSH: composer clearance + 16px. */
+.message-list {
+  min-height: 0;
+  flex: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+  /* Reserve room under the floating composer so the last message can scroll
+     above it while the scrollbar itself still reaches the viewport bottom. */
+  padding: 16px 32px calc(var(--mg-composer-height, 220px) + 28px);
+  scrollbar-gutter: stable;
+}
+
+.empty-state {
+  display: flex;
+  align-items: center;
+  max-width: 440px;
+  min-height: 260px;
+  margin: 16vh auto 0;
+  flex-direction: column;
+  gap: 12px;
+  color: var(--mg-text-tertiary);
+  text-align: center;
+}
+
+.empty-state strong {
+  color: var(--mg-text-primary);
+  font-size: 26px;
+  font-weight: 500;
+  line-height: 32px;
+}
+
+.empty-state span {
+  font-size: 14px;
+  line-height: 22px;
+}
+
+.empty-state--conversation {
+  min-height: 220px;
+  margin-top: 13vh;
+}
+
+.empty-icon {
+  display: grid;
+  width: 52px;
+  height: 52px;
+  margin-bottom: 2px;
+  place-items: center;
+  border-radius: 16px;
+  color: var(--mg-text-primary);
+  background: var(--mg-brand-soft);
+}
+
+.primary-button,
+.secondary-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 0 16px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background-color 140ms var(--mg-ease),
+    border-color 140ms var(--mg-ease);
+}
+
+.primary-button {
+  border: 0;
+  color: #ffffff;
+  background: var(--mg-brand);
+}
+
+.primary-button:hover {
+  background: var(--mg-brand-hover);
+}
+
+.secondary-button {
+  border: 1px solid var(--mg-border);
+  color: var(--mg-text-primary);
+  background: var(--mg-bg-elevated);
+}
+
+.secondary-button:hover {
+  background: var(--mg-bg-hover);
+}
+
+/* ============================================================
+   Chat flow — the DSH message column
+   ============================================================ */
+
+.message-row {
+  display: flex;
+  max-width: var(--mg-chat-width);
+  gap: 0;
+  margin: 0 auto;
+  animation: mg-message-in 160ms var(--mg-ease);
+}
+
+.message-row + .message-row {
+  margin-top: 16px;
+}
+
+@keyframes mg-message-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+}
+
+/* Assistant: no avatar bubble — plain narration, 16px/28px. */
+.message-row--assistant {
+  display: block;
+}
+
+.message-row--assistant .message-avatar {
+  display: none;
+}
+
+.message-row--assistant .message-body {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.message-row--assistant .message-meta {
+  order: 3;
+  min-height: 20px;
+  margin-top: 12px;
+}
+
+.message-row--error {
+  align-items: flex-start;
+}
+
+.message-row--error .message-avatar {
+  display: none;
+}
+
+.message-row--error .message-body {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+
+.message-row--error .message-content {
+  order: 1;
+}
+
+.message-row--error .message-meta {
+  order: 2;
+  min-height: 20px;
+  margin-top: 6px;
+}
+
+.message-row--error .message-meta strong {
+  display: none;
+}
+
+.message-row--error .message-content {
+  color: var(--mg-danger, #dc2626);
+}
+
+.message-row--error .message-content a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* Assistant turns don't repeat the agent id after the content. */
+.message-row--assistant .message-meta strong {
+  display: none;
+}
+
+/* Only turns with an actual content block keep the trailing timestamp;
+   tool-call-only and thinking-only turns stay clean. */
+.message-row--assistant:not(:has(.message-content)) .message-meta {
+  display: none;
+}
+
+.message-row--assistant .message-thinking {
+  order: 1;
+}
+
+.message-row--assistant .message-content {
+  order: 2;
+}
+
+.message-row--assistant .tool-call-list {
+  order: 4;
+}
+
+.message-row--assistant .tool-response-label {
+  order: 5;
+}
+
+.message-row--user {
+  align-items: flex-start;
+  justify-content: flex-end;
+}
+
+.message-avatar {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--mg-text-secondary);
+  background: var(--mg-bg-subtle);
+}
+
+.message-row--assistant .message-avatar {
+  color: var(--mg-brand);
+  background: var(--mg-brand-soft);
+}
+
+.message-row--user .message-avatar {
+  display: none;
+}
+
+.message-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.message-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-height: 21px;
+}
+
+.message-meta strong {
+  color: var(--mg-text-primary);
+  font-size: 13px;
+  font-weight: 550;
+  line-height: 20px;
+}
+
+.message-meta > span {
+  color: var(--mg-text-tertiary);
+  font-family: var(--mg-font-mono);
+  font-size: 11px;
+}
+
+@media (hover: hover) {
+  .message-row--user .message-meta,
+  .message-row--assistant .message-meta > span,
+  .message-row--error .message-meta > span {
+    opacity: 0;
+    transition: opacity 80ms var(--mg-ease);
+  }
+
+  .message-row--user:hover .message-meta,
+  .message-row--user:focus-within .message-meta,
+  .message-row--assistant:hover .message-meta > span,
+  .message-row--assistant:focus-within .message-meta > span,
+  .message-row--error:hover .message-meta > span,
+  .message-row--error:focus-within .message-meta > span {
+    opacity: 1;
+  }
+}
+
+.message-content {
+  margin: 0;
+  color: var(--mg-text-primary);
+  font-size: 16px;
+  line-height: 28px;
+  overflow-wrap: anywhere;
+}
+
+.message-row--assistant .message-content {
+  margin-top: 2px;
+}
+
+/* Rendered markdown (assistant and user body text). */
+.message-content > :first-child {
+  margin-top: 0;
+}
+
+.message-content > :last-child {
+  margin-bottom: 0;
+}
+
+.message-content h1,
+.message-content h2,
+.message-content h3,
+.message-content h4,
+.message-content h5,
+.message-content h6 {
+  margin: 18px 0 8px;
+  color: var(--mg-text-primary);
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.message-content h1 {
+  font-size: 20px;
+}
+
+.message-content h2 {
+  font-size: 18px;
+}
+
+.message-content h3 {
+  font-size: 17px;
+}
+
+.message-content h4,
+.message-content h5,
+.message-content h6 {
+  font-size: 16px;
+}
+
+.message-content p {
+  margin: 0 0 8px;
+}
+
+.message-content ul,
+.message-content ol {
+  margin: 0 0 8px;
+  padding-left: 22px;
+}
+
+.message-content li {
+  margin: 2px 0;
+}
+
+.message-content a {
+  color: var(--mg-brand);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.message-content a:hover {
+  color: var(--mg-brand-hover);
+}
+
+.message-content strong {
+  font-weight: 650;
+}
+
+.message-content code {
+  padding: 1px 5px;
+  border: 1px solid var(--mg-border-l1);
+  border-radius: 6px;
+  background: var(--mg-bg-subtle);
+  font-family: var(--mg-font-mono);
+  font-size: 0.85em;
+}
+
+.message-content pre {
+  margin: 8px 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  border: 1px solid var(--mg-border-l1);
+  border-radius: 8px;
+  background: var(--mg-bg-subtle);
+}
+
+.message-content pre code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 12px;
+  line-height: 20px;
+  white-space: pre;
+}
+
+.message-content blockquote {
+  margin: 8px 0;
+  padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--mg-border-strong);
+  color: var(--mg-text-secondary);
+}
+
+.message-content hr {
+  height: 1px;
+  margin: 16px 0;
+  border: 0;
+  background: var(--mg-border-l1);
+}
+
+.message-content table {
+  display: block;
+  max-width: 100%;
+  margin: 8px 0;
+  overflow-x: auto;
+  border-spacing: 0;
+  border-collapse: collapse;
+}
+
+.message-content th,
+.message-content td {
+  padding: 6px 10px;
+  border: 1px solid var(--mg-border-l1);
+  text-align: left;
+}
+
+.message-content th {
+  background: var(--mg-bg-subtle);
+  font-weight: 650;
+}
+
+.message-content img {
+  max-width: 100%;
+  border-radius: 8px;
+}
+
+.message-content .math-inline {
+  display: inline;
+  overflow-wrap: normal;
+}
+
+.message-content .math-display {
+  display: block;
+  max-width: 100%;
+  margin: 10px 0;
+  padding: 2px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  color: inherit;
+  text-align: center;
+}
+
+.message-content .math-display .katex-display {
+  width: max-content;
+  min-width: 100%;
+  margin: 0;
+}
+
+.message-content .katex {
+  color: inherit;
+  font-size: 1.05em;
+}
+
+/* User bubble (MessageItem.userRow): right-aligned, 22px radius. */
+.message-row--user .message-body {
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.message-row--user .message-content {
+  /* Short messages stay on one line; only the 525px cap wraps. */
+  display: block;
+  width: max-content;
+  max-width: 525px;
+  padding: 10px 16px;
+  border-radius: 22px;
+  color: var(--mg-text-primary);
+  background: var(--mg-bubble);
+  font-size: 16px;
+  line-height: 24px;
+  overflow-wrap: anywhere;
+}
+
+.message-row--user .message-meta {
+  order: 2;
+  min-height: 20px;
+  margin-top: 6px;
+  padding-right: 4px;
+}
+
+.message-row--user .message-meta strong {
+  display: none;
+}
+
+/* Thinking = DSH Think row: gray, 14/24, indented body. */
+.message-thinking {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--mg-text-tertiary);
+  background: transparent;
+}
+
+.message-thinking summary {
+  width: fit-content;
+  max-width: 100%;
+  padding: 1px 0;
+  cursor: pointer;
+  color: var(--mg-text-tertiary);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 24px;
+  list-style: none;
+  user-select: none;
+}
+
+.message-thinking summary::-webkit-details-marker {
+  display: none;
+}
+
+.message-thinking summary::before {
+  content: '›';
+  display: inline-block;
+  margin-right: 8px;
+  font-size: 15px;
+  transition: transform 140ms var(--mg-ease);
+}
+
+.message-thinking[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.message-thinking[open] summary {
+  margin-bottom: 2px;
+}
+
+.message-thinking p {
+  margin: 0;
+  padding: 2px 0 2px 22px;
+  color: var(--mg-text-tertiary);
+  font-size: 14px;
+  line-height: 24px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* Tool call rows = DSH ToolRow: one 24px collapsed line with a
+   thinking-style triangle; the full arguments live in the expanded body. */
+.tool-call-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0 0;
+}
+
+.tool-call-row {
+  display: block;
+  min-width: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--mg-text-secondary);
+  background: transparent;
+  font-size: 14px;
+  line-height: 24px;
+}
+
+.tool-call-row summary {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+  padding: 0;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.tool-call-row summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool-call-row summary::before {
+  content: '›';
+  display: inline-block;
+  flex: 0 0 auto;
+  margin-right: 2px;
+  color: var(--mg-text-quaternary);
+  font-size: 15px;
+  line-height: 24px;
+  transition: transform 140ms var(--mg-ease);
+}
+
+.tool-call-row[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.tool-call-row summary > svg {
+  flex: none;
+  color: var(--mg-brand);
+}
+
+.tool-call-row span {
+  flex: none;
+  color: var(--mg-text-primary);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 24px;
+}
+
+/* [wrench] Call <tool-name> · <arguments> */
+.tool-call-row span::before {
+  content: 'Call';
+  display: inline-block;
+  margin-right: 8px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--mg-brand-soft);
+  color: var(--mg-brand);
+  font-family: var(--mg-font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  vertical-align: 1px;
+}
+
+.tool-call-row span::after {
+  content: '·';
+  display: inline-block;
+  margin-left: 8px;
+  color: var(--mg-text-quaternary);
+}
+
+.tool-call-row code {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--mg-text-tertiary);
+  font-family: var(--mg-font-mono);
+  font-size: 12px;
+  line-height: 24px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-call-detail {
+  margin: 4px 0 0 24px;
+  padding: 8px 10px;
+  border: 1px solid var(--mg-border-l1);
+  border-radius: 8px;
+  background: var(--mg-bg-subtle);
+  color: var(--mg-text-secondary);
+  font-family: var(--mg-font-mono);
+  font-size: 12px;
+  line-height: 20px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Tool response mirrors the request row grammar:
+   small wrench + Response badge + truncated text, expandable like thinking. */
+.message-row--tool {
+  display: flex;
+  align-items: flex-start;
+  /* Match the request row prefix: triangle + 6px + wrench + 6px. */
+  gap: 6px;
+}
+
+/* Triangle sits before the wrench, mirroring the call row order. */
+.message-row--tool::before {
+  content: '›';
+  display: inline-flex;
+  height: 20px;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--mg-text-quaternary);
+  font-size: 15px;
+  line-height: 20px;
+  transition: transform 140ms var(--mg-ease);
+}
+
+.message-row--tool:has(.tool-response[open])::before {
+  transform: rotate(90deg);
+}
+
+.message-row--tool .message-avatar {
+  display: grid;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  margin-top: 5px;
+  place-items: center;
+  border-radius: 0;
+  color: var(--mg-success);
+  background: transparent;
+}
+
+.message-row--tool .message-avatar svg {
+  width: 14px;
+  height: 14px;
+}
+
+.message-row--tool .message-body {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tool-response {
+  min-width: 0;
+}
+
+.tool-response summary {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.tool-response summary::-webkit-details-marker {
+  display: none;
+}
+
+/* The DOM label becomes the distinguishing badge. Hide its long text and
+   render the compact Response label, symmetric with the Call badge. */
+.message-row--tool .tool-response-label {
+  display: inline-flex;
+  width: fit-content;
+  flex: 0 0 auto;
+  margin: 0 0 0 2px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--mg-success-soft);
+  color: var(--mg-success);
+  font-family: var(--mg-font-sans);
+  font-size: 0;
+  font-weight: 600;
+  line-height: 18px;
+  text-transform: none;
+}
+
+.message-row--tool .tool-response-label::before {
+  content: 'Response';
+  font-size: 11px;
+  line-height: 18px;
+}
+
+/* Collapsed response: one line, clipped with ellipsis. */
+.tool-response-summary {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  color: var(--mg-text-secondary);
+  font-size: 14px;
+  line-height: 24px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-response-detail {
+  /* Align with the call detail: the response body starts after the triangle,
+     wrench and gaps, so pull the card back to the shared 24px inset. */
+  margin: 4px 0 0 -7px;
+  padding: 10px 12px;
+  border: 1px solid var(--mg-border-l1);
+  border-radius: 8px;
+  background: var(--mg-bg-subtle);
+  color: var(--mg-text-secondary);
+  font-family: var(--mg-font-mono);
+  font-size: 12px;
+  line-height: 20px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.message-row--tool .message-meta {
+  display: none;
+}
+
+.message-row--system .message-content {
+  color: var(--mg-text-tertiary);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.tool-response-label {
+  margin-top: 4px;
+  color: var(--mg-text-quaternary);
+  font-family: var(--mg-font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.inline-error {
+  display: flex;
+  align-items: center;
+  max-width: var(--mg-chat-width);
+  gap: 8px;
+  margin: 10px auto 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: var(--mg-error);
+  background: var(--mg-error-soft);
+  font-size: 13px;
+}
+
+/* ============================================================
+   Composer — DSH capsule card
+   ============================================================ */
+
+.composer {
+  /* DSH: the card is chat-width + 32px and keeps a 16px clearance
+     on each side when the center column is narrower. */
+  width: min(calc(var(--mg-composer-width) + 32px), 100%);
+  margin: 0 auto;
+  padding: 0 16px 8px;
+}
+
+/* Active chat: composer floats over the full-height transcript, leaving the
+   scrollbar track running all the way to the viewport bottom. The status row
+   stays transparent; only the trigger pill and input card carry surfaces. */
+.conversation-pane:not(:has(.empty-state)) .composer {
+  position: absolute;
+  z-index: 3;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  margin: 0 auto;
+  border-top: 0;
+  background: var(--mg-bg-base);
+}
+
+.composer-context {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  padding-left: 12px;
+  color: var(--mg-text-tertiary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.context-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--mg-success);
+}
+
+.tool-manager {
+  position: relative;
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+/* Trigger reads as one of the quiet pills above the composer. */
+.tool-manager-trigger {
+  display: flex;
+  width: fit-content;
+  max-width: 100%;
+  min-width: 0;
+  min-height: 28px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  border: 0;
+  padding: 2px 8px 2px 6px;
+  border-radius: 999px;
+  color: var(--mg-text-secondary);
+  background: var(--mg-bg-subtle);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 18px;
+  transition:
+    color 120ms var(--mg-ease),
+    background-color 120ms var(--mg-ease);
+}
+
+.token-usage {
+  display: flex;
+  min-width: 0;
+  flex: 0 1 auto;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 3px 10px;
+  margin-left: auto;
+  color: var(--mg-text-quaternary);
+  font-family: var(--mg-font-mono);
+  font-size: 10px;
+  line-height: 16px;
+}
+
+.token-usage-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.token-usage-item strong {
+  color: var(--mg-text-tertiary);
+  font-weight: 500;
+}
+
+.context-window-usage {
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  align-items: center;
+  justify-content: center;
+}
+
+.context-window-usage svg {
+  display: block;
+  width: 18px;
+  height: 18px;
+  transform: rotate(-90deg);
+}
+
+.context-window-track,
+.context-window-value {
+  fill: none;
+  stroke-width: 2;
+}
+
+.context-window-track {
+  stroke: var(--mg-border-strong);
+}
+
+.context-window-value {
+  stroke: var(--mg-brand);
+  stroke-linecap: round;
+  stroke-dasharray: 44;
+  transition: stroke-dashoffset 180ms var(--mg-ease);
+}
+
+.tool-manager-trigger:hover,
+.tool-manager-trigger[aria-expanded='true'] {
+  color: var(--mg-text-primary);
+  background: var(--mg-bg-active);
+}
+
+.tool-manager-chevron {
+  flex: 0 0 auto;
+  transition: transform 140ms var(--mg-ease);
+}
+
+.tool-manager-chevron.is-open {
+  transform: rotate(90deg);
+}
+
+.active-tool {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 180px;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 2px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--mg-text-secondary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.active-tool-dot,
+.resource-state-dot {
+  width: 5px;
+  height: 5px;
+  flex: 0 0 5px;
+  border-radius: 50%;
+  background: var(--mg-text-quaternary);
+}
+
+.active-tool-dot,
+.resource-state-dot.is-active {
+  background: var(--mg-success);
+}
+
+.tool-manager-empty {
+  color: var(--mg-text-quaternary);
+}
+
+/* Expanded panel is a floating menu anchored to the trigger; opening it
+   does not push the composer around. */
+.tool-manager-panel {
+  position: absolute;
+  z-index: 40;
+  right: 0;
+  bottom: calc(100% + 8px);
+  left: 0;
+  display: grid;
+  max-height: min(420px, 58vh);
+  overflow-y: auto;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--mg-border);
+  border-radius: 14px;
+  background: var(--mg-bg-elevated);
+  box-shadow: var(--mg-shadow-dialog);
+  animation: mg-tool-panel-in 140ms var(--mg-ease);
+}
+
+@keyframes mg-tool-panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.99);
+  }
+}
+
+.tool-resource-group {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--mg-border-l1);
+  border-radius: 10px;
+  background: var(--mg-bg-subtle);
+}
+
+.tool-resource-heading {
+  display: flex;
+  min-height: 22px;
+  align-items: center;
+  gap: 6px;
+  color: var(--mg-text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
+}
+
+.tool-resource-heading > span:first-child {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-resource-heading > span:nth-child(2) {
+  color: var(--mg-text-tertiary);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.tool-group-action {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  color: var(--mg-text-tertiary);
+  background: transparent;
+  cursor: pointer;
+  transition:
+    color 120ms var(--mg-ease),
+    background-color 120ms var(--mg-ease);
+}
+
+.tool-group-action:hover {
+  color: var(--mg-error);
+  background: var(--mg-error-soft);
+}
+
+.tool-resource-list {
+  display: grid;
+  gap: 2px;
+  margin-top: 4px;
+}
+
+.tool-resource-row {
+  display: grid;
+  min-width: 0;
+  min-height: 28px;
+  grid-template-columns: 6px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px;
+  border-radius: 8px;
+  transition: background-color 120ms var(--mg-ease);
+}
+
+.tool-resource-row:hover {
+  background: var(--mg-bg-hover);
+}
+
+.tool-resource-row code {
+  overflow: hidden;
+  color: var(--mg-text-secondary);
+  font-family: var(--mg-font-mono);
+  font-size: 11px;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-row-action {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  color: var(--mg-text-tertiary);
+  background: transparent;
+  cursor: pointer;
+  transition:
+    color 120ms var(--mg-ease),
+    background-color 120ms var(--mg-ease);
+}
+
+.tool-row-action:hover:not(:disabled, .is-readonly) {
+  color: var(--mg-brand);
+  background: var(--mg-brand-soft);
+}
+
+.tool-row-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.tool-row-action.is-readonly {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.tool-resource-empty {
+  display: block;
+  margin-top: 4px;
+  color: var(--mg-text-quaternary);
+  font-size: 11px;
+  line-height: 20px;
+}
+
+/* The card itself: textarea on top, send control bottom-right. */
+.composer-box {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-height: 118px;
+  padding: 10px 8px 8px 16px;
+  gap: 4px;
+  border: 1px solid var(--mg-border);
+  border-radius: 22px;
+  background: var(--mg-bg-elevated);
+  box-shadow:
+    0 4px 12px rgba(0, 0, 0, 0.02),
+    0 2px 8px rgba(0, 0, 0, 0.04);
+  transition:
+    border-color 150ms var(--mg-ease),
+    box-shadow 150ms var(--mg-ease);
+}
+
+.composer-box:focus-within {
+  border-color: var(--mg-border-focus);
+  box-shadow:
+    0 0 0 4px var(--mg-brand-ring),
+    var(--mg-shadow-card);
+}
+
+.composer-call-row {
+  display: flex;
+  width: 100%;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.composer-call-block {
+  display: flex;
+  width: auto;
+  max-width: 100%;
+  min-width: min(42%, 240px);
+  min-height: 42px;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 6px 6px 10px;
+  border: 1px solid var(--mg-border-l1);
+  border-radius: 8px;
+  background: var(--mg-bg-subtle);
+}
+
+.composer-input-row {
+  display: flex;
+  width: 100%;
+  min-height: 52px;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.composer-call-copy {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 1px;
+}
+
+.composer-call-kind {
+  color: var(--mg-text-quaternary);
+  font-size: 10px;
+  line-height: 13px;
+}
+
+.composer-call-copy strong {
+  overflow: hidden;
+  color: var(--mg-text-secondary);
+  font-family: var(--mg-font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 17px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-call-block > button {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  color: var(--mg-text-tertiary);
+  background: transparent;
+  cursor: pointer;
+}
+
+.composer-call-block > button:hover {
+  color: var(--mg-text-primary);
+  background: var(--mg-bg-hover);
+}
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: auto;
+}
+
+.composer-add-menu {
+  position: static;
+}
+
+.composer-add-button {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  color: var(--mg-text-tertiary);
+  background: transparent;
+  cursor: pointer;
+}
+
+.composer-add-button:hover:not(:disabled) {
+  color: var(--mg-text-primary);
+  background: var(--mg-bg-hover);
+}
+
+.composer-add-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.composer-add-popover {
+  position: absolute;
+  z-index: 45;
+  bottom: calc(100% + 8px);
+  left: 8px;
+  display: grid;
+  min-width: 190px;
+  gap: 2px;
+  padding: 8px;
+  border: 1px solid var(--mg-border);
+  border-radius: 10px;
+  background: var(--mg-bg-elevated);
+  box-shadow: var(--mg-shadow-dialog);
+}
+
+.composer-add-heading {
+  padding: 3px 8px 5px;
+  color: var(--mg-text-quaternary);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.composer-add-popover > button {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 6px;
+  padding: 4px 8px;
+  color: var(--mg-text-secondary);
+  background: transparent;
+  cursor: pointer;
+  font-family: var(--mg-font-mono);
+  font-size: 11px;
+  text-align: left;
+}
+
+.composer-add-popover > button:hover {
+  background: var(--mg-bg-hover);
+}
+
+.composer-add-empty {
+  padding: 6px 8px;
+  color: var(--mg-text-quaternary);
+  font-size: 11px;
+}
+
+.composer-box textarea {
+  min-width: 0;
+  width: 100%;
+  min-height: 52px;
+  max-height: 168px;
+  flex: 1 1 auto;
+  padding: 4px 12px 0 0;
+  resize: none;
+  overflow-y: auto;
+  border: 0;
+  outline: 0;
+  color: var(--mg-text-primary);
+  background: transparent;
+  caret-color: var(--mg-brand);
+  font-size: 16px;
+  line-height: 24px;
+}
+
+.composer-box textarea::placeholder {
+  color: var(--mg-text-quaternary);
+}
+
+.send-button {
+  display: grid;
+  align-self: flex-end;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  place-items: center;
+  margin-top: auto;
+  border: 0;
+  border-radius: 50%;
+  color: #ffffff;
+  background: var(--mg-brand-blue);
+  cursor: pointer;
+  transition: background-color 120ms var(--mg-ease);
+}
+
+.send-button:hover:not(:disabled) {
+  background: var(--mg-brand-blue-hover);
+}
+
+/* The stop button keeps the same circular blue geometry as send; only the
+   square glyph changes to communicate "stop". */
+.send-button--stop {
+  border-radius: 50%;
+  background: var(--mg-brand-blue);
+}
+
+.send-button--stop:hover:not(:disabled) {
+  background: var(--mg-brand-blue-hover);
+}
+
+.send-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+/* ============================================================
+   Blank / hero state — DSH centers the composer and hides the
+   session header until the first message arrives.
+   ============================================================ */
+
+.conversation-pane:has(.empty-state) {
+  position: relative;
+}
+
+.conversation-pane:has(.empty-state) .message-list {
+  flex: 1;
+}
+
+.conversation-pane:has(.empty-state) .empty-state {
+  position: absolute;
+  left: 50%;
+  top: calc(50% - 135px);
+  width: min(440px, calc(100% - 48px));
+  min-height: 0;
+  margin: 0;
+  gap: 0;
+  transform: translateX(-50%);
+}
+
+.conversation-pane:has(.empty-state) .empty-icon,
+.conversation-pane:has(.empty-state) .empty-state > span {
+  display: none;
+}
+
+.conversation-pane:has(.empty-state) .empty-state strong {
+  width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.conversation-pane:has(.empty-state) .composer {
+  position: absolute;
+  top: calc(50% + 29px);
+  right: auto;
+  bottom: auto;
+  left: 50%;
+  z-index: 1;
+  margin: 0;
+  transform: translate(-50%, -50%);
+}
+
+/* ============================================================
+   Activity / details panel
+   ============================================================ */
+
+.activity-panel {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  border-left: 1px solid var(--mg-border-l1);
+  background: var(--mg-bg-panel);
+}
+
+.activity-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  min-height: 64px;
+  padding: 15px 16px 12px 20px;
+}
+
+.eyebrow {
+  color: var(--mg-text-tertiary);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.activity-header h2,
+.dialog-header h2 {
+  margin: 4px 0 0;
+  color: var(--mg-text-primary);
+  font-size: 15px;
+  font-weight: 550;
+}
+
+/* DSH-style underlined tabs. */
+.activity-tabs {
+  display: flex;
+  gap: 28px;
+  min-height: 36px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--mg-border-l1);
+}
+
+.activity-tabs button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 0 9px;
+  border: 0;
+  border-radius: 0;
+  color: var(--mg-text-tertiary);
+  background: transparent;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 18px;
+  cursor: pointer;
+}
+
+.activity-tabs button::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: -1px;
+  left: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: transparent;
+}
+
+.activity-tabs button:hover {
+  color: var(--mg-text-primary);
+  background: transparent;
+}
+
+.activity-tabs button.active {
+  color: var(--mg-brand);
+  background: transparent;
+}
+
+.activity-tabs button.active::after {
+  background: var(--mg-brand);
+}
+
+.activity-tabs button span {
+  display: grid;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 5px;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--mg-bg-hover);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.activity-list {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 14px 16px;
+}
+
+.activity-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 130px;
+  color: var(--mg-text-quaternary);
+  font-size: 12px;
+}
+
+.log-entry {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 6px;
+  border-bottom: 1px solid var(--mg-border-l1);
+}
+
+.log-level {
+  min-width: 38px;
+  padding-top: 2px;
+  color: var(--mg-text-quaternary);
+  font-family: var(--mg-font-mono);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.log-level--error {
+  color: var(--mg-error);
+}
+
+.log-level--warn {
+  color: var(--mg-warn);
+}
+
+.log-level--info {
+  color: var(--mg-brand);
+}
+
+.log-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.log-copy p {
+  margin: 0;
+  color: var(--mg-text-primary);
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+
+.log-copy small,
+.log-copy code {
+  display: block;
+  margin-top: 3px;
+  color: var(--mg-text-tertiary);
+  font-family: var(--mg-font-mono);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.log-copy code {
+  color: var(--mg-text-secondary);
+}
+
+.activity-clear {
+  min-height: 34px;
+  margin: 0 14px 14px;
+  border: 1px solid var(--mg-border);
+  border-radius: 999px;
+  color: var(--mg-text-secondary);
+  background: var(--mg-bg-elevated);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    color 120ms var(--mg-ease),
+    background-color 120ms var(--mg-ease);
+}
+
+.activity-clear:hover {
+  color: var(--mg-text-primary);
+  background: var(--mg-bg-hover);
+}
+
+/* ============================================================
+   Settings dialog
+   ============================================================ */
+
+.dialog-backdrop {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(15, 17, 21, 0.42);
+  backdrop-filter: blur(3px);
+}
+
+.dialog {
+  width: min(520px, 100%);
+  padding: 24px;
+  border: 1px solid var(--mg-border-l1);
+  border-radius: 18px;
+  background: var(--mg-bg-elevated);
+  box-shadow: var(--mg-shadow-dialog);
+}
+
+.dialog-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+.field-label {
+  display: block;
+  margin: 14px 0 7px;
+  color: var(--mg-text-primary);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.field-input {
+  width: 100%;
+  min-height: 44px;
+  padding: 7px 16px;
+  border: 1px solid var(--mg-border);
+  border-radius: 22px;
+  outline: none;
+  color: var(--mg-text-primary);
+  background: transparent;
+  font-size: 14px;
+}
+
+.field-input:focus {
+  border-color: var(--mg-border-focus);
+  box-shadow: 0 0 0 4px var(--mg-brand-ring);
+}
+
+.field-input::placeholder {
+  color: var(--mg-text-quaternary);
+}
+
+.field-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.field-hint {
+  margin: 9px 0 0;
+  color: var(--mg-text-tertiary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.form-error {
+  margin: 12px 0 0;
+  color: var(--mg-error);
+  font-size: 12px;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 24px;
+}
+
+/* ============================================================
+   Mobile
+   ============================================================ */
+
+.mobile-scrim {
+  display: none;
+}
+
+@media (max-width: 1180px) {
+  .app-shell,
+  .app-shell:has(.activity-panel) {
+    grid-template-columns: 240px minmax(0, 1fr);
+  }
+
+  .activity-panel {
+    position: fixed;
+    z-index: 12;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(360px, 92vw);
+    border-left: 1px solid var(--mg-border-l1);
+    box-shadow: -18px 0 40px rgba(15, 17, 21, 0.16);
+  }
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    display: block;
+  }
+
+  .workspace-sidebar {
+    position: fixed;
+    z-index: 15;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: min(286px, 88vw);
+    border-right: 1px solid var(--mg-border-l1);
+    transform: translateX(-102%);
+    transition: transform 180ms var(--mg-ease);
+    box-shadow: 15px 0 40px rgba(15, 17, 21, 0.16);
+  }
+
+  .workspace-sidebar--open {
+    transform: translateX(0);
+  }
+
+  .sidebar-close,
+  .mobile-menu {
+    display: inline-flex !important;
+  }
+
+  .mobile-scrim {
+    position: fixed;
+    z-index: 14;
+    inset: 0;
+    display: block;
+    background: rgba(15, 17, 21, 0.42);
+  }
+
+  .conversation-header {
+    min-height: 60px;
+    padding: 11px 14px;
+  }
+
+  .mobile-menu {
+    margin-right: 8px;
+  }
+
+  .message-list {
+    padding: 16px;
+  }
+
+  .message-row,
+  .message-row--user {
+    max-width: 100%;
+  }
+
+  .message-row--user .message-content {
+    max-width: min(520px, 86vw);
+  }
+
+  .composer {
+    width: 100%;
+    padding: 0 12px 8px;
+  }
+
+  .tool-manager-panel {
+    grid-template-columns: 1fr;
+    max-height: 52vh;
+  }
+
+  .field-grid {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .message-row {
+    animation: none;
+  }
+
+  * {
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
