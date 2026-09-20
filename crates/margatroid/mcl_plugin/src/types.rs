@@ -154,16 +154,37 @@ pub struct MclBinding(pub serde_json::Value);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MclSelector {
     All(BlockPath),
-    Index {
+    Raw {
         path: BlockPath,
-        index: i64,
+        range: MclRange,
+        position: MclSelectorPosition,
     },
-    Range {
+    Standard {
         path: BlockPath,
-        start: i64,
-        end: i64,
+        start: usize,
+        end: usize,
     },
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MclRange {
+    Empty,
+    Single(i64),
+    Range(MclEndpoint, MclEndpoint),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MclSelectorPosition {
+    Get,
+    Inject,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MclEndpoint {
+    Value(i64),
+    Open,
+}
+
 #[derive(Clone, Debug)]
 pub enum MclInjectSource {
     Selector(MclSelector),

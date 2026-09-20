@@ -1,4 +1,7 @@
-use mcl_plugin::{parse_operation, MclEffectCommand, MclInjectSource, MclOperation, MclSelector};
+use mcl_plugin::{
+    parse_operation, MclEffectCommand, MclEndpoint, MclInjectSource, MclOperation, MclRange,
+    MclSelector, MclSelectorPosition,
+};
 use serde_json::json;
 
 #[test]
@@ -12,20 +15,23 @@ fn parses_get_selectors() {
     assert!(matches!(
         parse_operation("GET req.ctx[-1]", None).unwrap(),
         MclOperation::Get {
-            selector: MclSelector::Index { index: -1, .. }
+            selector: MclSelector::Raw {
+                range: MclRange::Single(-1),
+                position: MclSelectorPosition::Get,
+                ..
+            }
         }
     ));
     assert!(matches!(
         parse_operation("GET req.ctx[0, 4]", None).unwrap(),
         MclOperation::Get {
-            selector: MclSelector::Range {
-                start: 0,
-                end: 4,
+            selector: MclSelector::Raw {
+                range: MclRange::Range(MclEndpoint::Value(0), MclEndpoint::Value(4)),
                 ..
             }
         }
     ));
-    assert!(parse_operation("GET req.ctx[0,-1]", None).is_err());
+    assert!(parse_operation("GET req.ctx[0,-1]", None).is_ok());
 }
 
 #[test]
@@ -47,14 +53,25 @@ fn parses_unified_inject_sources_and_targets() {
     assert!(matches!(
         parse_operation("INJECT req.ctx[0,4] TO msg.recent_conversation[-1]", None).unwrap(),
         MclOperation::Inject {
-            source: MclInjectSource::Selector(MclSelector::Range { .. }),
-            target: MclSelector::Index { index: -1, .. }
+            source: MclInjectSource::Selector(MclSelector::Raw {
+                range: MclRange::Range(..),
+                position: MclSelectorPosition::Get,
+                ..
+            }),
+            target: MclSelector::Raw {
+                range: MclRange::Single(-1),
+                position: MclSelectorPosition::Inject,
+                ..
+            }
         }
     ));
     assert!(matches!(
         parse_operation("INJECT req.ctx TO msg.recent_conversation[0,4]", None).unwrap(),
         MclOperation::Inject {
-            target: MclSelector::Range { .. },
+            target: MclSelector::Raw {
+                range: MclRange::Range(..),
+                ..
+            },
             ..
         }
     ));
@@ -171,6 +188,63 @@ fn parses_uniform_effect_arguments() {
 fn parses_multiline_driver_block() {
     let command = "CREATE BLOCK msg (\n        system_prompt MESSAGE,\n        compact_prompt MESSAGE,\n        compact_context MESSAGE,\n        history_conversation MESSAGE,\n        recent_conversation MESSAGE,\n    )";
     assert!(parse_operation(command, None).is_ok());
+}
+
+#[test]
+fn parses_every_selector_form_into_its_lexical_range() {
+    let range = |command: &str| match parse_operation(command, None).unwrap() {
+        MclOperation::Get {
+            selector: MclSelector::Raw { range, .. },
+        } => range,
+        other => panic!("expected a raw selector for {command}: {other:?}"),
+    };
+    assert_eq!(range("GET msg.a[2]"), MclRange::Single(2));
+    assert_eq!(range("GET msg.a[-2]"), MclRange::Single(-2));
+    assert_eq!(
+        range("GET msg.a[1,]"),
+        MclRange::Range(MclEndpoint::Value(1), MclEndpoint::Open)
+    );
+    assert_eq!(
+        range("GET msg.a[,1]"),
+        MclRange::Range(MclEndpoint::Open, MclEndpoint::Value(1))
+    );
+    assert_eq!(
+        range("GET msg.a[1,2]"),
+        MclRange::Range(MclEndpoint::Value(1), MclEndpoint::Value(2))
+    );
+    assert_eq!(range("GET msg.a[]"), MclRange::Empty);
+    assert_eq!(
+        range("GET msg.a[,]"),
+        MclRange::Range(MclEndpoint::Open, MclEndpoint::Open)
+    );
+    assert_eq!(
+        range("GET msg.a[1,-2]"),
+        MclRange::Range(MclEndpoint::Value(1), MclEndpoint::Value(-2))
+    );
+}
+
+#[test]
+fn parses_inject_targets_with_the_inject_position() {
+    let target = |command: &str| match parse_operation(command, Some(&json!({}))).unwrap() {
+        MclOperation::Inject { target, .. } => target,
+        other => panic!("expected an inject for {command}: {other:?}"),
+    };
+    assert!(matches!(
+        target("INJECT ? TO msg.a[-1]"),
+        MclSelector::Raw {
+            range: MclRange::Single(-1),
+            position: MclSelectorPosition::Inject,
+            ..
+        }
+    ));
+    assert!(matches!(
+        target("INJECT ? TO msg.a[0,2]"),
+        MclSelector::Raw {
+            range: MclRange::Range(..),
+            position: MclSelectorPosition::Inject,
+            ..
+        }
+    ));
 }
 
 #[test]

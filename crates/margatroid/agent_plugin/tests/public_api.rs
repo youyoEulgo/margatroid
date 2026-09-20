@@ -1,5 +1,5 @@
 use agent_plugin::{AgentCreateReply, AgentMcl, AgentTurnState, TokenUsageState};
-use margatroid_types::{Block, BlockInner, BlockPath, RefBlock, TokenUsage};
+use margatroid_types::{Block, BlockInner, BlockPath, Message, RefBlock, TokenUsage};
 
 fn message_path() -> BlockPath {
     BlockPath {
@@ -34,7 +34,7 @@ fn agent_mcl_rejects_wrong_types_without_mutating_the_field() {
     mcl.create_block("conversation".to_owned(), block).unwrap();
 
     assert!(mcl
-        .insert(&message_path(), BlockInner::ResourceId(Vec::new()))
+        .replace_range(&message_path(), 0, 0, BlockInner::ResourceId(Vec::new()))
         .is_err());
     assert_eq!(mcl.select(&message_path()).unwrap().len(), 0);
 }
@@ -68,4 +68,34 @@ async fn create_reply_closes_when_all_reply_handles_are_dropped() {
     let reply = AgentCreateReply::new(sender);
     drop(reply);
     assert!(receiver.await.is_err());
+}
+
+#[test]
+fn agent_mcl_replace_range_covers_the_empty_and_past_end_slot() {
+    let mut mcl = AgentMcl::default();
+    let mut block = Block::default();
+    block
+        .inners
+        .insert("messages".to_owned(), BlockInner::Message(Vec::new()));
+    mcl.create_block("conversation".to_owned(), block).unwrap();
+    let path = BlockPath {
+        block_id: "conversation".to_owned(),
+        inner_id: "messages".to_owned(),
+    };
+    let message = |content: &str| {
+        BlockInner::Message(vec![margatroid_types::MclMessage::new(
+            Message::User {
+                content: content.to_owned(),
+            },
+            None,
+        )])
+    };
+
+    mcl.replace_range(&path, 0, 0, message("first")).unwrap();
+    assert_eq!(mcl.select(&path).unwrap().len(), 1);
+    mcl.replace_range(&path, 1, 1, message("second")).unwrap();
+    assert_eq!(mcl.select(&path).unwrap().len(), 2);
+    mcl.replace_range(&path, 0, 2, message("replaced")).unwrap();
+    assert_eq!(mcl.select(&path).unwrap().len(), 1);
+    assert!(mcl.replace_range(&path, 0, 3, message("past-end")).is_err());
 }

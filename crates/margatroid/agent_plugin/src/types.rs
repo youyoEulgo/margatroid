@@ -569,43 +569,6 @@ impl AgentMcl {
         Ok(())
     }
 
-    pub fn insert(&mut self, target: &BlockPath, values: BlockInner) -> Result<(), AgentError> {
-        append_inner(self.real_inner_mut(target)?, values)
-    }
-
-    pub fn cover(&mut self, target: &BlockPath, values: BlockInner) -> Result<(), AgentError> {
-        let slot = self.real_inner_mut(target)?;
-        if slot.inner_type() != values.inner_type() {
-            return Err(type_mismatch());
-        }
-        *slot = values;
-        Ok(())
-    }
-
-    pub fn insert_at(
-        &mut self,
-        target: &BlockPath,
-        index: usize,
-        after: bool,
-        values: BlockInner,
-    ) -> Result<(), AgentError> {
-        let slot = self.real_inner_mut(target)?;
-        if slot.inner_type() != values.inner_type() || index >= slot.len() {
-            return Err(type_mismatch());
-        }
-        let position = if after { index + 1 } else { index };
-        match (slot, values) {
-            (BlockInner::Message(target), BlockInner::Message(values)) => {
-                target.splice(position..position, values);
-            }
-            (BlockInner::ResourceId(target), BlockInner::ResourceId(values)) => {
-                target.splice(position..position, values);
-            }
-            _ => return Err(type_mismatch()),
-        }
-        Ok(())
-    }
-
     pub fn replace_range(
         &mut self,
         target: &BlockPath,

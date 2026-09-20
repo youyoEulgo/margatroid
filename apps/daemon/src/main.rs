@@ -19,8 +19,8 @@ use memory_plugin::MemoryPlugin;
 use resource_id_plugin::ResourceIdPlugin;
 use server_plugin::{AppServerExt, ServerOptions, ServerPlugin};
 use tool_plugin::ToolPlugin;
-use ui_plugin::UiPlugin;
 use tracing::info;
+use ui_plugin::UiPlugin;
 use workspace_plugin::WorkspacePlugin;
 
 const DATA_ROOT_NAME: &str = ".margatroid";

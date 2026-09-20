@@ -421,16 +421,11 @@ AgentMcl：MCL数据，公开结构体--Agent持有的MCL运行时存储，由�
         创建真实Block：公开方法，block_id已存在于真实Block或RefBlock程序集时失败
     create_ref_block(&mut self, block_id: String, block: RefBlock) -> Result<(), AgentError>
         创建引用Block：公开方法，block_id已存在于真实Block或RefBlock程序集时失败
-    insert(&mut self, target: &BlockPath, values: BlockInner) -> Result<(), AgentError>
-        插入字段值：公开方法，找到目标Block字段，验证BlockInner类型一致后按顺序追加；整个方法原子完成
-    cover(&mut self, target: &BlockPath, values: BlockInner) -> Result<(), AgentError>
-        覆盖字段值：公开方法，找到目标Block字段，验证BlockInner类型一致后整体替换数组；整个方法原子完成
-    insert_at(&mut self, target: &BlockPath, index: usize, after: bool, values: BlockInner) -> Result<(), AgentError>
-        指定位置插入：公开方法，index必须是已存在元素的索引，after为真时插到该元素之后、否则之前
-        行为：要求目标字段存在、类型一致且index小于当前长度，再按after换算成插入位置并拼接；整个方法原子完成
     replace_range(&mut self, target: &BlockPath, start: usize, end: usize, values: BlockInner) -> Result<(), AgentError>
-        范围替换：公开方法，要求目标字段存在、类型一致、start不大于end且end不超过当前长度
-        行为：用values替换[start, end)区间的元素；区间为空时等价于在start处插入
+        范围替换：公开方法，唯一的字段写入口
+        行为：要求目标字段存在、类型一致、start不大于end且end不超过当前长度
+              用values替换[start, end)区间的元素；区间为空时等价于在该位置插入
+        说明：整段替换、单点插入、范围覆盖与清空都由本方法表达，不再有独立的插入与覆盖方法
     block(&self, block_id: &str) -> Result<Block, AgentError>
         读取普通 Block 快照：公开方法，用于 state 序列化
     merge_block(&mut self, block_id: &str, stored: Block) -> Result<(), AgentError>
