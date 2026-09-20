@@ -147,6 +147,7 @@ LogLevel：日志级别，公开枚举--与log_plugin的LogLevel同词表但独�
 
 MargatroidConfig：Margatroid全局配置，公开只读Resource--从主目录config.toml完整加载
     server_bind: SocketAddr--ServerPlugin监听地址
+    server_ingress: IngressPolicy--入口策略，默认localhost；由workspace up的参数覆盖时经with_ingress设置
     log_level: LogLevel--进程级tracing过滤级别
     log_filter: Option<String>--进程级tracing过滤表达式；非空时优先于log_level
     logs: Vec<WebSocketMessageTarget>--日志、Workspace启停结果及成员失败异常的目标
@@ -157,6 +158,10 @@ MargatroidConfig：Margatroid全局配置，公开只读Resource--从主目录co
         构造配置：公开关联函数，保存监听地址和日志配置并验证四组目标非空、合法且不重复，log_filter存在时要求其trim后非空
     server_bind(&self) -> SocketAddr
         读取监听地址：公开方法
+    with_ingress(mut self, ingress: IngressPolicy) -> Self
+        覆盖入口策略：公开方法，供workspace up按参数替换默认的localhost策略
+    server_ingress(&self) -> &IngressPolicy
+        读取入口策略：公开方法
     log_level(&self) -> LogLevel
         读取日志级别：公开方法
     log_filter(&self) -> Option<&str>

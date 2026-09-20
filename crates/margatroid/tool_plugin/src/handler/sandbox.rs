@@ -15,11 +15,6 @@ const POLICY_FILE: &str = "policy.json";
 const MAX_POLICY_BYTES: usize = 1024 * 1024;
 static POLICY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Resolve the effective policies for a tool invocation.
-///
-/// Every activated sandbox contributes its policy, in a deterministic order;
-/// landstrip merges them so the result can only narrow. An activated sandbox
-/// without a usable policy is a hard error rather than a silent downgrade.
 pub(crate) fn active_sandbox_policies(
     resources: &AgentResourceMap,
 ) -> Result<Vec<Arc<str>>, ToolError> {
@@ -62,10 +57,6 @@ pub(crate) fn sandbox_backend() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// Materialise an active policy for a single confined spawn.
-///
-/// Each invocation gets its own file because the policy is per-agent state and
-/// never a process-wide constant.
 fn write_policy_file(policy: &str) -> Result<PathBuf, ToolError> {
     let path = std::env::temp_dir().join(format!(
         "margatroid-sandbox-policy-{}-{}.json",
@@ -87,12 +78,6 @@ fn remove_policy_files(policies: &[PathBuf]) {
     }
 }
 
-/// The one place that decides how a tool runs under the active policies.
-///
-/// Both the Lua runner and the shell share this so that the spawn contract
-/// cannot drift: working directory, environment, policy staging and the
-/// reclaim mode all come from here. A declared policy with no usable backend
-/// fails closed instead of running outside the policy the driver selected.
 pub(crate) struct ConfinedSpawn {
     policies: Vec<PathBuf>,
 }
@@ -112,17 +97,10 @@ impl ConfinedSpawn {
         Ok(Self { policies: staged })
     }
 
-    /// True when this spawn is confined, which also means its process tree is
-    /// reclaimed once the call ends.
     pub(crate) fn is_confined(&self) -> bool {
         !self.policies.is_empty()
     }
 
-    /// Build the command for `program`.
-    ///
-    /// The working directory is the agent project root because a portable
-    /// policy says `.`; without it every policy would resolve against the
-    /// daemon's own directory.
     pub(crate) fn command(
         &self,
         program: &Path,
@@ -160,11 +138,6 @@ impl Drop for ConfinedSpawn {
     }
 }
 
-/// A per-call scratch directory inside the project root.
-///
-/// Tools need somewhere to put temporary files, and this is the only place a
-/// confined call may write besides the workspace itself, so the project-root
-/// policy already covers it without granting the shared `/tmp`.
 pub(crate) struct CallTempDir {
     path: PathBuf,
 }
@@ -195,11 +168,6 @@ impl Drop for CallTempDir {
     }
 }
 
-/// Reclaims a confined call's whole process tree.
-///
-/// `kill_on_drop` only reaches the direct child, so a tool that detaches a
-/// background process would otherwise outlive the call still holding the
-/// policy it was granted.
 pub(crate) struct ProcessGroup {
     leader: Option<u32>,
 }
@@ -211,7 +179,6 @@ impl ProcessGroup {
         }
     }
 
-    /// Idempotent: the first call wins, later calls are no-ops.
     pub(crate) fn reclaim(&mut self) {
         let Some(leader) = self.leader.take() else {
             return;

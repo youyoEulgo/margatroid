@@ -203,11 +203,16 @@ handle_agent_control(world: &mut World, event: AgentControl)
 handle_agent_message(world: &mut World, event: AgentMessage)
     处理消息：crate公开函数
     行为：
+        先做轮次归属检查：Agent.turn.turn_id存在时，Inject、Assistant与Tool三类消息的event.id必须等于该值，
+        否则记录警告并直接丢弃，不投递也不报错
+        其余类型不受轮次归属限制：User负责开启新轮，Error与System是通知
         要求目标Entity同时具有Agent和ResourceId、Agent.lifecycle为Running且Agent.lua.vm_id存在
         验证User不携带tool_calls
         将event.id、event.message和event.usage组合成AgentLuaMessageEnvelope，再转换为LuaValue并调用LuaRuntimeHandle::send_message
         不解析消息角色、不维护待完成工具调用、不写上下文、不启动下一轮推理
         投递成功即结束；投递失败时写入Agent.last_error、把生命周期设为Failed并停止长期VM，使正在等待start的邮箱receive以错误完成
+    边界：轮次归属检查必须在投递前完成。若交给Base Lua判断，start会以effect错误结束并让整个VM退出，
+          一次时机错误的客户端投递就会毁掉Agent
 
 handle_lua_vm_started(world: &mut World, event: LuaVmStarted)
     处理VM启动：crate公开函数
@@ -420,6 +425,12 @@ AgentMcl：MCL数据，公开结构体--Agent持有的MCL运行时存储，由�
         插入字段值：公开方法，找到目标Block字段，验证BlockInner类型一致后按顺序追加；整个方法原子完成
     cover(&mut self, target: &BlockPath, values: BlockInner) -> Result<(), AgentError>
         覆盖字段值：公开方法，找到目标Block字段，验证BlockInner类型一致后整体替换数组；整个方法原子完成
+    insert_at(&mut self, target: &BlockPath, index: usize, after: bool, values: BlockInner) -> Result<(), AgentError>
+        指定位置插入：公开方法，index必须是已存在元素的索引，after为真时插到该元素之后、否则之前
+        行为：要求目标字段存在、类型一致且index小于当前长度，再按after换算成插入位置并拼接；整个方法原子完成
+    replace_range(&mut self, target: &BlockPath, start: usize, end: usize, values: BlockInner) -> Result<(), AgentError>
+        范围替换：公开方法，要求目标字段存在、类型一致、start不大于end且end不超过当前长度
+        行为：用values替换[start, end)区间的元素；区间为空时等价于在start处插入
     block(&self, block_id: &str) -> Result<Block, AgentError>
         读取普通 Block 快照：公开方法，用于 state 序列化
     merge_block(&mut self, block_id: &str, stored: Block) -> Result<(), AgentError>
@@ -435,6 +446,13 @@ AgentResourceMap：Agent资源数据，crate公开结构体--ToolPlugin写入的
     visible: BTreeSet<ResourceId>--当前可见资源
     default_visible: BTreeSet<ResourceId>--默认可见资源
     tool_entries: Vec<AgentResourceEntry>--已注册的可执行资源候选及Provider无关ToolSpec
+    register_tool(&mut self, entry: AgentResourceEntry) -> Result<(), AgentError>
+        注册可执行资源：公开方法
+        行为：同一个resource_id与resource_name的组合重复时按幂等成功返回；仅resource_name冲突时报错
+    tool_by_name(&self, name: &str) -> Option<&AgentResourceEntry>
+        按模型可见名称查找：公开方法，返回首个匹配的条目
+    tools_by_resource(&self, resource_id: &ResourceId) -> Vec<&AgentResourceEntry>
+        按资源查找：公开方法，返回该资源在当前Agent内的全部别名条目
 
 AgentResourceEntry：Agent可执行资源条目，crate公开结构体--ToolPlugin注册成功后写入Agent.resources
     resource_id: ResourceId--具体资源完整ID
@@ -521,5 +539,12 @@ AgentCreateResult：Agent创建结果，公开事件--Agent Entity已经创建�
     id: String--原AgentCreateRequest.id
     result: Result<Entity, AgentError>--成功时返回已挂载Agent和ResourceId的Entity
     impl Event + Clone for AgentCreateResult
+```
+
+私有：
+```text
+failure(kind: AgentFailureKind, message: impl Into<String>) -> AgentError
+    构造失败：私有函数，把 AgentFailureKind 映射成 AgentErrorKind 并保留稳定描述
+```
 ```
 

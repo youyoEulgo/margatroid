@@ -394,9 +394,6 @@ required_binding(binding: Option<&serde_json::Value>) -> Result<&serde_json::Val
 reject_binding(binding: Option<&serde_json::Value>) -> Result<(), MclError>
     拒绝绑定：私有函数，存在时返回 InvalidCommand
 
-effect_ref_block(value: &str) -> Result<String, MclError>
-    解析 Effect RefBlock：私有函数，去掉括号并校验标识符
-
 parse_message(value: &serde_json::Value) -> Result<MclMessage, MclError>
     解析消息绑定：私有函数，调用 message_from_lua_json
 

@@ -127,18 +127,6 @@ RouteMclCommand：逻辑MCL命令路由命令，公开事件--由DTO层产生并
     impl Event for RouteMclCommand
         Event：公开trait实现
 
-AgentVisibilityRouteAction：Agent默认资源可见性操作，公开枚举
-    Inject
-    Remove
-
-RouteAgentVisibility：逻辑Agent默认资源可见性路由命令，公开事件--由DTO层产生并交给WorkspacePlugin解析Entity
-    id: String--请求ID
-    workspace: WorkspaceReference--目标Workspace逻辑引用
-    agent: Option<ResourceId>--目标Agent完整资源ID，None表示manager
-    resource_id: ResourceId--待开关的完整资源ID
-    action: AgentVisibilityRouteAction
-    impl Event for RouteAgentVisibility
-
 RouteAgentWorkflowAttach：逻辑Workflow挂载命令，公开事件--由DTO层产生并交给WorkspacePlugin解析Entity与资源根
     id: String--请求ID，同时作为新Workflow实例ID
     workspace: WorkspaceReference--目标Workspace逻辑引用
@@ -187,9 +175,13 @@ Message：统一消息，公开枚举--所有Margatroid消息Plugin共享的静�
         resource_id: ResourceId--本次调用对应的具体资源ID
         tool_call_id: String--对应Assistant ToolCall::id
         content: String--工具成功输出或稳定错误文本
+        failed: bool--本次调用是否失败；内容序列化时默认false，缺省即视为成功
     }
     Error {
         message: String--Agent完成创建后的轮次级稳定错误文本；由mcl_plugin从AgentFailure转换，Base Lua只写入历史
+    }
+    Inject {
+        messages: Vec<Message>--需要由driver记录进上下文的原始消息
     }
     impl Clone for Message
         Clone：公开trait实现
@@ -212,9 +204,13 @@ AgentMessage：统一Agent消息事件，公开结构体--Margatroid内部所有
 AgentFailureKind：Agent执行失败来源，公开枚举--标识无法表示成Message的轮次级失败
     Agent--AgentPlugin在消息分支、上下文或工具定义准备失败时产生
     Inference--InferencePlugin在准备或执行推理失败时产生
-    Tool--ToolPlugin在调用无法路由且不能产生合法Tool消息时产生
+    Tool--为"会终止轮次的工具失败"预留；工具执行失败改以Tool消息回传，当前没有生产者
     impl Clone + Copy + PartialEq + Eq for AgentFailureKind
         值语义：公开trait实现
+    ends_the_turn(&self) -> bool
+        是否终止轮次：公开方法，Agent与Inference为真，Tool为假
+        说明：失败是可上报的状态而不是停止信号，是否终止由知道失败种类的这一层决定；
+              工具失败不终止，因为结果会作为Tool消息交回推理
 
 AgentFailure：兼容性失败事件，公开结构体--仅供非Agent领域向观察者报告无法转换为AgentControlReply的失败；AgentPlugin自身不发布该事件
     id: String--原完整交互轮次ID
@@ -259,53 +255,130 @@ AgentErrorKind：Agent共享错误分类，公开枚举
     Memory
     Stopped
 
-AgentInferencePending：推理飞行事务，公开结构体--只保存取消和关联所需的最小定位
-    id: String
-    tool_schema: Vec<ToolDefinition>
-
-AgentToolPending：工具飞行事务，公开结构体--只保存迟到响应匹配所需的定位
-    turn_id: String
-    tool_call_id: String
-    resource_id: ResourceId
-    tool_id: ResourceId
-
-AgentToolEnvironment：工具运行环境，公开结构体--由Workspace构造并由具体工具Provider读取
-    project_root: PathBuf
-    image_root: PathBuf
-    impl Clone
-
-StopReason：Provider无关推理停止原因，公开枚举
-    Completed
-    ToolCalls
-    Length
-    Cancelled
-    Error
-    impl Clone + Copy + PartialEq + Eq
+归属说明：AgentInferencePending 与 AgentToolPending 定义在 agent_plugin，
+    AgentToolEnvironment 定义在 tool_plugin，StopReason 定义在 inference_plugin；
+    四者都不属于 types crate，各自的字段与行为写在对应 crate 的 DESIGN.md。
 
 TokenUsage：单次模型响应Token用量，公开纯数据结构
     input_tokens: u64--本次请求输入Token数
     output_tokens: u64--本次响应输出Token数
     cache_hit_tokens: u64--本次输入中命中Provider缓存的Token数；Provider未提供该字段时为0
+
+### Block 值类型
+
+```text
+BlockInner：Block字段内容，公开枚举--字段值只有消息数组与资源ID数组两种形态
+    Message(Vec<MclMessage>)
+    ResourceId(Vec<ResourceId>)
+    inner_type(&self) -> InnerType
+        读取字段类型：公开方法，与变体一一对应
+    len(&self) -> usize
+        读取元素个数：公开方法
+    is_empty(&self) -> bool
+        是否为空：公开方法，等价于len为0
+    impl Clone + PartialEq + Eq + Serialize + Deserialize
+
+InnerType：Block字段类型标记，公开枚举
+    Message--消息数组字段
+    ResourceId--资源ID数组字段
+    impl Clone + Copy + PartialEq + Eq
+
+BlockPath：字段定位，公开结构体--block_id与inner_id共同确定一个字段
+    block_id: String--所属Block
+    inner_id: String--Block内的字段名
+    impl Clone + PartialEq + Eq + Hash + Serialize + Deserialize
+
+Block：普通Block，公开结构体--按字段名持有BlockInner
+    inners: HashMap<String, BlockInner>--字段名到内容
+    impl Clone + PartialEq + Eq + Default + Serialize + Deserialize
+
+BlockAssembly：普通Block程序集，公开结构体
+    blocks: HashMap<String, Block>--block_id到Block
+    impl Clone + PartialEq + Eq + Default + Serialize + Deserialize
+
+RefMerge：引用合并结果，公开枚举--记录来源路径而非元素本身
+    Message(Vec<BlockPath>)
+    ResourceId(Vec<BlockPath>)
+    paths(&self) -> &[BlockPath]
+        读取来源路径：公开方法
+    inner_type(&self) -> InnerType
+        读取字段类型：公开方法
+    iter(&self, blocks: &BlockAssembly) -> Result<BlockInner, AgentError>
+        展开为字段内容：公开方法，逐个路径读取并按声明顺序拼接；任一来源缺失或类型不一致即失败
+    impl Clone + PartialEq + Eq + Serialize + Deserialize
+```
+
+### 消息与事件
+
+```text
+AgentLuaMessageEnvelope：投递到长期Lua VM的消息封装，公开结构体
+    turn_id: String--完整交互轮次ID
+    message: MclMessage--携带用量的统一消息
+    impl Clone + PartialEq + Eq + Serialize + Deserialize
+
+MclMessage：带用量的消息，公开结构体--仅Assistant响应携带用量
+    message: Message
+    usage: Option<TokenUsage>
+    new(message: Message, usage: Option<TokenUsage>) -> Self
+        构造：公开关联函数
+    message(&self) -> &Message
+        读取消息：公开方法
+    usage(&self) -> Option<&TokenUsage>
+        读取用量：公开方法
+    impl Clone + PartialEq + Eq + Serialize + Deserialize
+
+InferenceRequestEvent：推理请求事件，公开事件--由MclPlugin发出，携带完整消息与工具定义
+    id: String
+    agent: Entity
+    agent_id: ResourceId
+    messages: Vec<Message>
+    tools: Vec<ToolDefinition>
+
+CapturedInferenceRequest：捕获式推理请求事件，公开事件--只携带消息，用于上下文压缩一类旁路推理
+    id: String
+    agent: Entity
+    agent_id: ResourceId
+    messages: Vec<Message>
+
+CapturedInferenceResponse：捕获式推理响应事件，公开事件
+    id: String
+    agent: Entity
+    result: Result<String, String>
+
+ToolCallEvent：工具调用事件，公开事件--Base Lua发出后由ToolPlugin路由到具体执行器
+    turn_id: String--所属轮次
+    agent: Entity
+    call: ToolCall--模型请求的调用
+
+AgentContextMessagesUpdated：上下文更新事件，公开事件--宣告该Agent的完整上下文已替换
+    agent: Entity
+    messages: Vec<Message>--当前完整上下文
+    tool_context: Vec<Message>--仅工具相关的消息
+    ordered_messages: Vec<Message>--按投递顺序排列的消息
+
+AgentHistoryRecordWriteRequested：历史记录写入请求，公开事件--把一条显式记录追加到与对话相同的时间线
+    agent: Entity
+    source: String--发起者
+    kind: String--记录种类，例如mcl
+    content: String--记录内容
+    payload: String--结构化附加信息
+
+AgentImageReferenceError：AgentImage引用错误，公开结构体--迁移兼容层使用
+```
+
+### 迁移兼容公开类型
+
+```text
+ResourceRefError：资源引用错误，公开结构体--只存在于迁移兼容层，不得作为新的领域身份
+```
 ```
 
 ## 函数
 
 私有：
 ```text
-validate_part(part: &str) -> Result<(), ResourceNameError>
-    验证名称段：私有函数，拒绝空值、.、..、控制字符和反斜杠
-
-validate_resource_type(resource_type: &str) -> Result<(), ResourceIdError>
-    验证资源类型：私有函数，只接受非空的小写ASCII字母、数字、下划线和连字符
-
-validate_resource_part(part: &str, error: ResourceIdError) -> Result<(), ResourceIdError>
-    验证scope或name：私有函数，拒绝空值、.、..、控制字符、分隔符和冒号
-
-validate_resource_tag(tag: &str) -> Result<(), ResourceIdError>
-    验证资源tag：私有函数，检查长度、首字符和允许字符
-
-is_tag_character(character: char) -> bool
-    检查标签字符：私有函数，只接受ASCII字母、数字、下划线、点和连字符
+归属说明：资源名的解析与校验（validate_part、validate_resource_type、validate_resource_part、
+    validate_resource_tag、is_tag_character）定义在 resource_id_plugin，由该 crate 的 DESIGN.md 描述。
 ```
 
 ## 逻辑

@@ -185,17 +185,23 @@ pub fn handle_agent_control(world: &mut World, event: AgentControl) {
 }
 
 pub fn handle_agent_message(world: &mut World, event: AgentMessage) {
-    if let Message::Inject { .. } = &event.message {
-        let working = world
-            .get_component::<Agent>(event.agent)
-            .is_some_and(|agent| agent.turn.turn_id.is_some());
-        if working {
-            tracing::warn!(
-                agent = %agent_label(world, event.agent),
-                "context injection ignored while a turn is in flight"
-            );
-            return;
-        }
+    let conflicting_turn = world
+        .get_component::<Agent>(event.agent)
+        .and_then(|agent| agent.turn.turn_id.clone())
+        .filter(|active| match &event.message {
+            Message::Inject { .. } | Message::Assistant { .. } | Message::Tool { .. } => {
+                active != &event.id
+            }
+            Message::User { .. } | Message::Error { .. } | Message::System { .. } => false,
+        });
+    if let Some(active) = conflicting_turn {
+        tracing::warn!(
+            agent = %agent_label(world, event.agent),
+            active_turn = %active,
+            message_turn = %event.id,
+            "agent message ignored: it does not belong to the turn in flight"
+        );
+        return;
     }
     let result = deliver_agent_message(world, &event);
     if let Err(error) = result {

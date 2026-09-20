@@ -375,12 +375,6 @@ pub enum AgentFailureKind {
 }
 
 impl AgentFailureKind {
-    /// Whether this failure leaves the turn unusable and must end it.
-    ///
-    /// A failure is a state the agent can report, not an automatic reason to
-    /// stop: only the kinds that leave the turn with nothing to continue from
-    /// end it. Tool failures are excluded because the result is handed back to
-    /// inference as a Tool message.
     pub fn ends_the_turn(&self) -> bool {
         match self {
             Self::Agent | Self::Inference => true,

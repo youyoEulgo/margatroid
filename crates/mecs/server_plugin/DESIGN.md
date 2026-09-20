@@ -122,6 +122,9 @@ ServerOptions：服务器配置，公开结构体--配置监听、HTTP、WebSock
     with_stream_buffer_capacity(mut self, capacity: usize) -> Self
         设置HTTP流缓冲容量：公开方法
         行为：capacity为0时报告InvalidStreamBufferCapacity，否则保存并返回自身
+    with_handshake_guard<G: HandshakeGuard>(mut self, guard: G) -> Self
+        设置握手判定：公开方法，把guard装箱为Arc<dyn HandshakeGuard>替换默认的AllowAllHandshakes
+        说明：业务层通过这个接缝注入自己的入口策略，mecs不感知策略内容
     with_websocket_buffer_capacity(mut self, capacity: usize) -> Self
         设置WebSocket通道容量：公开方法
         行为：capacity为0时报告InvalidWebSocketBufferCapacity，否则保存并返回自身

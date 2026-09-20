@@ -34,7 +34,6 @@ impl Resource for PendingMclImports {}
 #[derive(Default)]
 pub struct PendingMclEffects {
     pub effects: HashMap<String, crate::MclEffectState>,
-    pub failures: HashMap<(core_plugin::Entity, String), MclError>,
 }
 impl Resource for PendingMclEffects {}
 
@@ -807,9 +806,6 @@ pub fn mcl_domain_system(world: &mut World) {
                         .turn
                         .finish(&turn)
                         .map_err(|_| MclError::TurnMismatch)?;
-                    if let Some(pending) = world.get_resource_mut::<PendingMclEffects>() {
-                        pending.failures.remove(&(agent, turn));
-                    }
                     Ok(crate::MclDomainValue::Unit)
                 }
                 MclOperation::Emit { .. } => Ok(crate::MclDomainValue::Unit),
@@ -850,24 +846,6 @@ fn begin_start(world: &mut World, request: MclDomainRequest) -> Result<(), MclEr
     let agent = world
         .entity_by_resource_id(&request.agent_id)
         .map_err(|_| MclError::AgentMissing)?;
-    if let Some(turn_id) = world
-        .get_component::<Agent>(agent)
-        .and_then(|value| value.turn.turn_id.clone())
-    {
-        if let Some(error) = world
-            .get_resource_mut::<PendingMclEffects>()
-            .and_then(|pending| pending.failures.remove(&(agent, turn_id.clone())))
-        {
-            tracing::warn!(
-                agent = %request.agent_id,
-                error = %error,
-                "inference failure cleared; agent keeps waiting for the next message"
-            );
-            if let Some(agent_state) = world.get_component_mut::<Agent>(agent) {
-                agent_state.turn.abort();
-            }
-        }
-    }
     let vm_id = world
         .get_component::<Agent>(agent)
         .ok_or(MclError::AgentMissing)
