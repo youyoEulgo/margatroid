@@ -336,28 +336,60 @@ parse_create(command: &str) -> Result<MclOperation, MclError>
 parse_inject(words: &[&str], binding: Option<&serde_json::Value>) -> Result<MclOperation, MclError>
     INJECT 解析：私有函数
     行为：
-        INJECT 按 `INJECT source TO target` 解析，source 和 target 均可使用完整、单值或范围选择器
-        普通 Block 可作为右值，RefBlock 只能作为 source 左值；target 无索引时整体覆盖，单索引时插入，范围时替换范围
-        [] 解析为空序列，用于清空数组或删除范围；? 读取绑定值，缺少 binding 返回 BindingMissing
+        INJECT 按 `INJECT source TO target` 解析，source 和 target 均可使用完整或区间选择器
+        普通 Block 可作为右值，RefBlock 只能作为 source 左值
+        [] 解析为空序列；? 读取绑定值，缺少 binding 返回 BindingMissing
+        target 一律以 Inject 位置解析，source 选择器一律以 Get 位置解析
 
-parse_selector(value: &str) -> Result<MclSelector, MclError>
-    解析选择器：私有函数
+parse_index(value: &str) -> Result<i64, MclError>
+    解析单索引：私有函数，整数文本直接转换
+
+parse_endpoint(value: &str) -> Result<MclEndpoint, MclError>
+    解析端点：私有函数，空文本为 Open，其余按整数解析
+
+parse_selector(value: &str, position: MclSelectorPosition) -> Result<MclSelector, MclError>
+    解析选择器：私有函数，只做语法识别，不做数值判断
     行为：
-        支持 block.inner、block.inner[index] 和 block.inner[start, end]
-        非负范围要求 0 <= start < end；负数范围要求 start < end < 0；两端不得异号
-        单索引可正可负，整数文本由 Lua 侧计算后拼入
+        无方括号返回 All，方括号内为空返回 Empty
+        一段文本为单索引，两段为区间，其余形状返回 InvalidCommand
+        同号与越界不在本函数判断，留给 map_selector
+
+map_selector(selector: &MclSelector, length: usize) -> Result<MclSelector, MclError>
+    映射选择器：私有函数，唯一把语法映射为标准格式的位置，只映射一次
+    行为：
+        All 映射为 [0, length]
+        Empty 映射为 [0, 0]
+        单索引按位置映射：Get 取一个元素，Inject 取锚点
+        区间按端点映射，混号与双开返回 InvalidCommand
+        已是 Standard 的原样返回
+
+map_single(position, index: i64, length: usize) -> Result<(usize, usize), MclError>
+    映射单索引：私有函数，负值按 length + 1 补正，结果交 select_range 校验
+    Get 映射为 [x, x+1]，Inject 映射为 [x, x]（非负时）或 [len+1+x, len+1+x]（负数时）
+
+map_endpoints(start: MclEndpoint, end: MclEndpoint, length: usize) -> Result<(usize, usize), MclError>
+    映射区间端点：私有函数，负值按 length + 1 补正，省略端取该侧边界
+
+select_range(start: i64, end: i64, length: usize) -> Result<(usize, usize), MclError>
+    标准格式约束：私有函数，唯一的越界判定点
+    行为：length 为 0 时只接受 [0, 0]，否则要求 0 <= start <= end <= length
 
 selector_path(selector: &MclSelector) -> BlockPath
     读取选择器路径：私有函数
 
 get_selector_value(mcl: &AgentMcl, selector: &MclSelector) -> Result<MclDomainValue, MclError>
-    读取选择器结果：私有函数，单索引返回单个 Message 或 Unit，其余返回 BlockInner
+    读取选择器结果：私有函数
+    行为：先读字段长度，再 map_selector，再交给 select_standard
+          单索引选择器返回单个 Message 或 Unit，其余返回 BlockInner
 
 select_selector(mcl: &AgentMcl, selector: &MclSelector) -> Result<BlockInner, MclError>
-    读取选择器切片：私有函数，按完整、单索引或范围返回同类型内积
+    读取选择器切片：私有函数，先映射再取标准区间
 
-resolve_index(index: i64, length: usize) -> Result<usize, MclError>
-    解析单索引：私有函数，负数从末尾计算，越界返回 TypeMismatch
+select_standard(mcl: &AgentMcl, selector: &MclSelector) -> Result<BlockInner, MclError>
+    读取标准区间：私有函数，只接受 Standard，按左闭右开切片
+
+slice_inner(values: &BlockInner, start: usize, end: usize) -> Result<BlockInner, MclError>
+    切片：私有函数，越界返回 TypeMismatch
 
 resolve_range(start: i64, end: i64, length: usize) -> Result<(usize, usize), MclError>
     解析范围：私有函数，非负为左闭右开，负数为左开右闭，越界返回 TypeMismatch
@@ -530,9 +562,22 @@ MclCommandReply：MCL 命令回执，公开结构体
 MclBinding：MCL 绑定值，公开结构体，包装 serde_json::Value
 
 MclSelector：MCL 选择器，公开枚举--作用于单个 Block inner
-    All(BlockPath)--完整数组，等价于 [0, length]
-    Index { path: BlockPath, index: i64 }--单个元素，负数从末尾计算
-    Range { path: BlockPath, start: i64, end: i64 }--范围，非负为左闭右开、负数为左开右闭
+    All(BlockPath)--无索引；解析结果，映射为 [0, length]；也用于提取字段路径
+    Raw { path: BlockPath, range: MclRange, position: MclSelectorPosition }--解析产物，尚未做数值判断
+    Standard { path: BlockPath, start: usize, end: usize }--标准格式，两端均非负，左闭右开
+
+MclRange：选择器语法形态，公开枚举
+    Empty--[]，方括号内为空
+    Single(i64)--[x]，单索引
+    Range(MclEndpoint, MclEndpoint)--[x, y]、[x, ]、[, x]，区间或省略端点
+
+MclEndpoint：区间端点，公开枚举
+    Value(i64)--显式数值
+    Open--省略
+
+MclSelectorPosition：选择器位置，公开枚举--决定单索引的映射方向
+    Get--取值，单索引映射为长度 1 的区间
+    Inject--落位，单索引映射为锚点
 
 MclInjectSource：INJECT 左值来源，公开枚举
     Selector(MclSelector)--来自同一或其他 Block 的选择器结果

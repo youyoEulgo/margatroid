@@ -1,10 +1,10 @@
+use app_runtime_plugin::RuntimePlugin;
 use axum::body::Body;
 use axum::extract::Path;
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
-use app_runtime_plugin::RuntimePlugin;
 use core_plugin::{App, Plugin, Resource};
 use rust_embed::RustEmbed;
 
