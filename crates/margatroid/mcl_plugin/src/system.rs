@@ -374,11 +374,13 @@ fn mcl_message_to_json(
             resource_id,
             tool_call_id,
             content,
+            failed,
         } => serde_json::json!({
             "type": "tool",
             "resource_id": resource_id,
             "tool_call_id": tool_call_id,
             "content": content,
+            "failed": failed,
         }),
         margatroid_types::Message::Error { message } => serde_json::json!({
             "type": "error",
@@ -735,6 +737,7 @@ pub fn mcl_domain_system(world: &mut World) {
                                         "tool call rejected: `{}` is not visible for this turn",
                                         call.tool_name
                                     ),
+                                    failed: true,
                                 },
                                 usage: None,
                             });
@@ -1041,9 +1044,7 @@ pub fn mcl_effect_response_system(world: &mut World) {
                         {
                             return Err(MclError::TurnMismatch)
                         }
-                        margatroid_types::Message::Error { .. } => {
-                            agent.turn.abort();
-                        }
+                        margatroid_types::Message::Error { .. } => {}
                         margatroid_types::Message::Inject { .. } => {}
                         _ => {}
                     }
@@ -1103,6 +1104,11 @@ pub fn mcl_effect_response_system(world: &mut World) {
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("Entity({:?})", failure.agent));
         let error = failure.message.clone();
+        if let Some(agent) = world.get_component_mut::<Agent>(failure.agent) {
+            if failure.kind.ends_the_turn() {
+                agent.turn.abort();
+            }
+        }
         tracing::warn!(agent = %agent_label, error = %error, "agent failure delivered as error message");
         world.send_event(AgentMessage {
             id: failure.id,

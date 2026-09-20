@@ -144,6 +144,7 @@ mod tests {
                 resource_id: ResourceId::parse("tool:local/test:latest").unwrap(),
                 tool_call_id: "call-1".into(),
                 content: "tool output".into(),
+                failed: false,
             },
         ]
         .into_iter()

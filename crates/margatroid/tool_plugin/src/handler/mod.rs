@@ -28,6 +28,7 @@ pub(crate) fn finish_tool_call(
     if pending.is_none() {
         return;
     }
+    let failed = result.is_err();
     let content = result.unwrap_or_else(|error| error.to_string());
     world.send_event(AgentMessage {
         id: request.turn_id,
@@ -36,6 +37,7 @@ pub(crate) fn finish_tool_call(
             resource_id: request.resource_id,
             tool_call_id: request.tool_call_id,
             content,
+            failed,
         },
         usage: None,
     });
