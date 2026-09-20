@@ -17,8 +17,9 @@ use lua_runtime_plugin::LuaRuntimePlugin;
 use mcl_plugin::MclPlugin;
 use memory_plugin::MemoryPlugin;
 use resource_id_plugin::ResourceIdPlugin;
-use server_plugin::{ServerOptions, ServerPlugin};
+use server_plugin::{AppServerExt, ServerOptions, ServerPlugin};
 use tool_plugin::ToolPlugin;
+use ui_plugin::UiPlugin;
 use tracing::info;
 use workspace_plugin::WorkspacePlugin;
 
@@ -83,7 +84,10 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(mcl)
         .add_plugin(workspace)
         .add_plugin(DtoPlugin::default())
-        .add_plugin(ClientPlugin::default());
+        .add_plugin(ClientPlugin::default())
+        .add_plugin(UiPlugin::default());
+
+    app.add_http_routes(UiPlugin::router());
 
     info!(address = %bind, allow = %ingress, data_root = %data_root.display(), config = %config_path.display(), models = %models_path.display(), "margatroid daemon starting");
     app.run();

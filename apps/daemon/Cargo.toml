@@ -24,5 +24,6 @@ mcl_plugin = { path = "../../crates/margatroid/mcl_plugin" }
 resource_id_plugin = { path = "../../crates/margatroid/resource_id_plugin" }
 server_plugin = { path = "../../crates/mecs/server_plugin" }
 tool_plugin = { path = "../../crates/margatroid/tool_plugin" }
+ui_plugin = { path = "../../crates/margatroid/ui_plugin" }
 tracing = { workspace = true }
 workspace_plugin = { path = "../../crates/margatroid/workspace_plugin" }
