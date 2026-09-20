@@ -165,6 +165,7 @@ impl ShellResponseGuard {
             .locator
             .take()
             .expect("Shell tool response was already sent");
+        let failed = result.is_err();
         let content = result.unwrap_or_else(|error| error.to_string());
         self.events.send_event(margatroid_types::AgentMessage {
             id: locator.turn_id,
@@ -173,6 +174,7 @@ impl ShellResponseGuard {
                 resource_id: locator.resource_id,
                 tool_call_id: locator.tool_call_id,
                 content,
+                failed,
             },
             usage: None,
         });
@@ -195,6 +197,7 @@ impl Drop for ShellResponseGuard {
                     "Shell tool task did not complete",
                 )
                 .to_string(),
+                failed: true,
             },
             usage: None,
         });

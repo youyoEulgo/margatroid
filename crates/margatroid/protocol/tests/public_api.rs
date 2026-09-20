@@ -49,6 +49,7 @@ fn clients_may_not_inject_server_side_facts() {
             resource_id: ResourceIdDto("tool:local/read-file:latest".into()),
             tool_call_id: "call-1".into(),
             content: "contents".into(),
+            failed: false,
         },
         MessageDto::Error {
             message: "boom".into(),
@@ -98,6 +99,7 @@ fn clients_may_inject_context_carrying_any_message_but_an_injection() {
                 resource_id: ResourceIdDto("tool:local/read-file:latest".into()),
                 tool_call_id: "call-1".into(),
                 content: "recorded".into(),
+                failed: false,
             },
             MessageDto::Error {
                 message: "recorded failure".into(),

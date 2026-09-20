@@ -328,12 +328,14 @@ fn insert_history_message_values(
             resource_id,
             tool_call_id,
             content,
+            failed,
         } => (
             "message.tool",
             serde_json::json!({ "content": content }),
             serde_json::json!({
                 "resource_id": resource_id.to_string(),
                 "tool_call_id": tool_call_id,
+                "failed": failed,
             }),
         ),
         Message::Error { message } => (

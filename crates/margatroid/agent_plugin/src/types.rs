@@ -340,6 +340,10 @@ impl HistoryMessage {
                 resource_id: text(&payload, "resource_id")?.parse().ok()?,
                 tool_call_id: text(&payload, "tool_call_id")?,
                 content: text(&content, "content").unwrap_or_default(),
+                failed: payload
+                    .get("failed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             }),
             "message.error" => Some(Message::Error {
                 message: text(&content, "content").unwrap_or_default(),

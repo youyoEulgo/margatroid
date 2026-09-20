@@ -714,6 +714,10 @@ fn message_from_lua_json(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
+                failed: value
+                    .get("failed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             },
             None,
         )),

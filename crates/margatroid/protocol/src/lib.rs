@@ -197,10 +197,12 @@ impl MessageDto {
                 resource_id,
                 tool_call_id,
                 content,
+                failed,
             } if server_side_allowed => Ok(Message::Tool {
                 resource_id: resource_id.into_domain(())?,
                 tool_call_id,
                 content,
+                failed,
             }),
             Self::Error { message } if server_side_allowed => Ok(Message::Error { message }),
             Self::Tool { .. } | Self::Error { .. } => Err(ProtocolError::new(
@@ -271,6 +273,8 @@ pub enum MessageDto {
         resource_id: ResourceIdDto,
         tool_call_id: String,
         content: String,
+        #[serde(default)]
+        failed: bool,
     },
     Error {
         message: String,
@@ -302,10 +306,12 @@ impl FromDomain<&Message> for MessageDto {
                 resource_id,
                 tool_call_id,
                 content,
+                failed,
             } => Ok(Self::Tool {
                 resource_id: ResourceIdDto::from_domain(resource_id, ())?,
                 tool_call_id: tool_call_id.clone(),
                 content: content.clone(),
+                failed: *failed,
             }),
             Message::Error { message } => Ok(Self::Error {
                 message: message.clone(),
@@ -1460,6 +1466,7 @@ mod tests {
             resource_id: ResourceId::parse("skill:local/context:latest").unwrap(),
             tool_call_id: "call-1".into(),
             content: "result".into(),
+            failed: false,
         };
         assert!(matches!((&tool).into_dto(()), Ok(MessageDto::Tool { .. })));
     }
