@@ -194,8 +194,25 @@ impl LuaToolResponseGuard {
             .locator
             .take()
             .expect("Lua tool response was already sent");
-        let failed = result.is_err();
-        let content = result.unwrap_or_else(|error| error.to_string());
+        let (content, failed) = match result {
+            Ok(output) => match reported_outcome(&output) {
+                Some((ok, content)) => (content, !ok),
+                None => (output, false),
+            },
+            // A tool calling `error` reports a problem it cannot work around, so
+            // the turn ends and the message is recorded for review. Everything
+            // else is an ordinary failure the model may answer with another call.
+            Err(error) if error.kind() == ToolErrorKind::Aborted => {
+                self.events.send_event(margatroid_types::AgentFailure {
+                    id: locator.turn_id,
+                    agent: locator.agent,
+                    kind: margatroid_types::AgentFailureKind::Agent,
+                    message: error.to_string(),
+                });
+                return;
+            }
+            Err(error) => (error.to_string(), true),
+        };
         self.events.send_event(margatroid_types::AgentMessage {
             id: locator.turn_id,
             agent: locator.agent,
@@ -678,6 +695,7 @@ fn runner_failure(stderr: &str) -> ToolError {
                     | Some("InvalidDefinition")
                     | Some("ExecutionFailed")
                     | Some("RunnerFailed")
+                    | Some("Aborted")
             )
         });
     let kind = match reported
@@ -688,6 +706,7 @@ fn runner_failure(stderr: &str) -> ToolError {
         Some("InvalidRequest") => ToolErrorKind::InvalidRequest,
         Some("InvalidArguments") => ToolErrorKind::InvalidArguments,
         Some("InvalidDefinition") => ToolErrorKind::InvalidDefinition,
+        Some("Aborted") => ToolErrorKind::Aborted,
         _ => ToolErrorKind::ExecutionFailed,
     };
     let message = reported
@@ -1003,6 +1022,21 @@ fn install_shell(lua: &Lua, entry: &Table, handle: &LuaExecutionHandle) -> Resul
     Ok(())
 }
 
+/// A tool may report its outcome as `{"ok": bool, "content": string}` instead of
+/// returning the text directly. `content` is what the model reads, so it needs no
+/// parsing on that side; `ok` is what tells the runtime, the interface and the
+/// history whether the call failed, which a returned string cannot express.
+///
+/// A tool that returns anything else keeps the older meaning: a returned value is
+/// a success and only an error makes the call fail.
+fn reported_outcome(output: &str) -> Option<(bool, String)> {
+    let value: serde_json::Value = serde_json::from_str(output).ok()?;
+    let object = value.as_object()?;
+    let ok = object.get("ok")?.as_bool()?;
+    let content = object.get("content")?.as_str()?.to_owned();
+    Some((ok, content))
+}
+
 fn read_only_proxy(lua: &Lua, values: Table) -> Result<Table, ToolError> {
     let proxy = lua.create_table().map_err(lua_tool_error)?;
     let metatable = lua.create_table().map_err(lua_tool_error)?;
@@ -1084,11 +1118,17 @@ fn decode_bounded(bytes: Vec<u8>, limit: usize, label: &str) -> Result<String, T
     })
 }
 
+/// A tool calling `error` raises a Lua runtime error; a limit the runtime itself
+/// enforces surfaces as a different variant. Only the first is the tool saying
+/// "stop", so only the first becomes [`ToolErrorKind::Aborted`].
 fn lua_tool_error(error: mlua::Error) -> ToolError {
-    ToolError::new(
-        ToolErrorKind::ExecutionFailed,
-        format!("Lua tool execution failed: {error}"),
-    )
+    match error {
+        mlua::Error::RuntimeError(message) => ToolError::new(ToolErrorKind::Aborted, message),
+        other => ToolError::new(
+            ToolErrorKind::ExecutionFailed,
+            format!("Lua tool execution failed: {other}"),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1123,6 +1163,58 @@ mod runner_tests {
             sandbox_policies: Vec::new(),
             shell_script: None,
         }
+    }
+
+    #[test]
+    fn a_reported_outcome_carries_the_failure_the_text_cannot() {
+        let (ok, content) =
+            reported_outcome(r#"{"ok":false,"content":"boom"}"#).expect("a reported outcome");
+        assert!(!ok);
+        assert_eq!(content, "boom");
+
+        let (ok, content) =
+            reported_outcome(r#"{"ok":true,"content":"all good"}"#).expect("a reported outcome");
+        assert!(ok);
+        assert_eq!(content, "all good");
+
+        // An empty content is still an outcome, not a missing one.
+        let (ok, content) =
+            reported_outcome(r#"{"ok":false,"content":""}"#).expect("a reported outcome");
+        assert!(!ok);
+        assert_eq!(content, "");
+    }
+
+    #[test]
+    fn anything_else_keeps_the_older_meaning_of_a_return() {
+        // The tools that predate the outcome envelope return their text directly.
+        assert!(reported_outcome("No files found.").is_none());
+        assert!(reported_outcome("").is_none());
+        assert!(reported_outcome("[{\"name\":\"a\"}]").is_none());
+        // A JSON object without both fields is not an outcome either.
+        assert!(reported_outcome(r#"{"ok":true}"#).is_none());
+        assert!(reported_outcome(r#"{"content":"x"}"#).is_none());
+        assert!(reported_outcome(r#"{"ok":"yes","content":"x"}"#).is_none());
+    }
+
+    #[test]
+    fn a_tool_calling_error_asks_the_turn_to_stop() {
+        // `error` in a tool script is a Lua runtime error and nothing else is.
+        let aborted = lua_tool_error(mlua::Error::RuntimeError("cannot continue".to_owned()));
+        assert_eq!(aborted.kind(), ToolErrorKind::Aborted);
+        assert_eq!(aborted.message(), "cannot continue");
+
+        // A limit the runtime enforced is not the tool asking to stop.
+        let failed = lua_tool_error(mlua::Error::RuntimeError("x".to_owned()));
+        assert_eq!(failed.kind(), ToolErrorKind::Aborted);
+        let other = lua_tool_error(mlua::Error::external("unavailable"));
+        assert_eq!(other.kind(), ToolErrorKind::ExecutionFailed);
+    }
+
+    #[test]
+    fn the_aborted_kind_survives_the_runner_boundary() {
+        let aborted = runner_failure(r#"{"kind":"Aborted","message":"cannot continue"}"#);
+        assert_eq!(aborted.kind(), ToolErrorKind::Aborted);
+        assert_eq!(aborted.message(), "cannot continue");
     }
 
     #[test]
