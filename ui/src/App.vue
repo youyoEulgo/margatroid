@@ -20,7 +20,12 @@ import {
   PanelRight,
   Send,
   Square,
+  Circle,
+  CircleDot,
+  Info,
   Settings2,
+  ShieldCheck,
+  ShieldOff,
   UserRound,
   UsersRound,
   Wifi,
@@ -34,6 +39,7 @@ import {
   resourceName,
   workspaceKey,
   type ConversationEntry,
+  type ConversationRecord,
   type RuntimeLog,
 } from '@/stores/workbench';
 import { renderMarkdown } from '@/lib/markdown';
@@ -51,6 +57,7 @@ const {
   selectedAgentReady,
   selectedAgentWorking,
   resourceVisibility,
+  sandboxOptions,
   visibleMessages,
   logs,
   lastFailures,
@@ -305,6 +312,21 @@ function toggleResourceVisibility(resource: string, visible: boolean) {
   store.setResourceVisibility(resource, visible);
 }
 
+const NO_SANDBOX = '';
+const sandboxChoices = computed(() => [
+  { value: NO_SANDBOX, label: 'None', hint: 'No sandbox: tools run with the daemon user permissions' },
+  ...sandboxOptions.value.options.map((resource) => ({
+    value: resource,
+    label: resourceName(resource),
+    hint: resource,
+  })),
+]);
+const sandboxSelection = computed(() => sandboxOptions.value.activated[0] ?? NO_SANDBOX);
+
+function selectSandbox(value: string) {
+  store.setSandbox(value === NO_SANDBOX ? null : value);
+}
+
 function selectWorkspace(key: string) {
   store.selectWorkspace(key);
   sidebarOpen.value = false;
@@ -373,7 +395,58 @@ function roleLabel(message: ConversationEntry) {
   if (message.role === 'assistant') return resourceName(message.agent);
   if (message.role === 'tool') return 'Tool response';
   if (message.role === 'error') return 'Agent error';
+  if (message.role === 'record') return 'Note';
   return 'System';
+}
+
+// A history record is a note the driver left on the timeline rather than a
+// message exchanged with the model. Each known kind renders as one short line
+// of prose; an unknown kind falls back to the record's own content.
+function recordNote(message: ConversationEntry) {
+  const record = message.record;
+  if (!record) return message.content;
+  if (record.kind !== 'mcl') return message.content || record.kind;
+  return mclRecordNote(record);
+}
+
+function mclRecordNote(record: ConversationRecord) {
+  const command = mclRecordCommand(record);
+  if (!command) return record.content || 'mcl command';
+  const [verb, ...rest] = command.split(/\s+/);
+  if (verb !== 'sandbox') return command;
+  const target = rest.join(' ').trim();
+  if (!target || target === 'none' || target === '[]') return 'sandbox off';
+  return `sandbox ${resourceName(target)} used`;
+}
+
+// The command text sits under `cmd` for the live record and under `command` for
+// the rows written before that shape settled, so both are accepted.
+function mclRecordCommand(record: ConversationRecord): string {
+  for (const source of [record.payload, record.content]) {
+    const value = parseRecordPayload(source);
+    for (const key of ['cmd', 'command']) {
+      const candidate = value?.[key];
+      if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+    }
+  }
+  return '';
+}
+
+function recordNoteTitle(message: ConversationEntry) {
+  const record = message.record;
+  if (!record) return '';
+  return record.payload ? `record:${record.kind}` : record.kind;
+}
+
+function parseRecordPayload(payload: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(payload);
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function toolArguments(argumentsText: string) {
@@ -548,53 +621,69 @@ function logLevelClass(log: RuntimeLog) {
           </span>
         </div>
 
-        <article
-          v-for="message in visibleMessages"
-          :key="message.key"
-          :class="['message-row', `message-row--${message.role}`]"
-        >
-          <div class="message-avatar">
-            <UserRound v-if="message.role === 'user'" :size="16" />
-            <Bot v-else-if="message.role === 'assistant'" :size="16" />
-            <Wrench v-else-if="message.role === 'tool'" :size="15" />
-            <CircleAlert v-else-if="message.role === 'error'" :size="15" />
-            <Zap v-else :size="15" />
-          </div>
-          <div class="message-body">
-            <div class="message-meta">
-              <strong>{{ roleLabel(message) }}</strong>
-              <span>{{ formatTime(message.timestamp) }}</span>
+        <template v-for="message in visibleMessages" :key="message.key">
+          <p
+            v-if="message.role === 'record'"
+            class="record-note"
+            :class="`record-note--${message.record?.kind ?? 'unknown'}`"
+            :title="recordNoteTitle(message)"
+          >
+            <Info :size="12" />
+            <span>{{ recordNote(message) }}</span>
+            <span class="record-note-time">{{ formatTime(message.timestamp) }}</span>
+          </p>
+
+          <article
+            v-else
+            :class="[
+              'message-row',
+              `message-row--${message.role}`,
+              { 'message-row--failed': message.failed },
+            ]"
+          >
+            <div class="message-avatar">
+              <UserRound v-if="message.role === 'user'" :size="16" />
+              <Bot v-else-if="message.role === 'assistant'" :size="16" />
+              <Wrench v-else-if="message.role === 'tool'" :size="15" />
+              <CircleAlert v-else-if="message.role === 'error'" :size="15" />
+              <Zap v-else :size="15" />
             </div>
-            <details v-if="message.thinking" class="message-thinking">
-              <summary>Thinking</summary>
-              <p>{{ message.thinking }}</p>
-            </details>
-            <details v-if="message.role === 'tool' && message.content" class="tool-response">
-              <summary>
-                <span class="tool-response-label">Tool response</span>
-                <span class="tool-response-summary">{{ message.content }}</span>
-              </summary>
-              <pre class="tool-response-detail">{{ message.content }}</pre>
-            </details>
-            <div
-              v-else-if="message.content"
-              class="message-content"
-              v-html="renderMarkdown(message.content)"
-            ></div>
-            <div v-if="message.toolCalls.length" class="tool-call-list">
-              <details v-for="tool in message.toolCalls" :key="tool.id" class="tool-call-row">
-                <summary>
-                  <Wrench :size="14" />
-                  <span>{{ tool.tool_name }}</span>
-                  <code v-if="tool.arguments">{{ toolArguments(tool.arguments) }}</code>
-                </summary>
-                <pre class="tool-call-detail">{{
-                  tool.arguments ? toolArguments(tool.arguments) : '{}'
-                }}</pre>
+            <div class="message-body">
+              <div class="message-meta">
+                <strong>{{ roleLabel(message) }}</strong>
+                <span>{{ formatTime(message.timestamp) }}</span>
+              </div>
+              <details v-if="message.thinking" class="message-thinking">
+                <summary>Thinking</summary>
+                <p>{{ message.thinking }}</p>
               </details>
+              <details v-if="message.role === 'tool' && message.content" class="tool-response">
+                <summary>
+                  <span class="tool-response-label">Tool response</span>
+                  <span class="tool-response-summary">{{ message.content }}</span>
+                </summary>
+                <pre class="tool-response-detail">{{ message.content }}</pre>
+              </details>
+              <div
+                v-else-if="message.content"
+                class="message-content"
+                v-html="renderMarkdown(message.content)"
+              ></div>
+              <div v-if="message.toolCalls.length" class="tool-call-list">
+                <details v-for="tool in message.toolCalls" :key="tool.id" class="tool-call-row">
+                  <summary>
+                    <Wrench :size="14" />
+                    <span>{{ tool.tool_name }}</span>
+                    <code v-if="tool.arguments">{{ toolArguments(tool.arguments) }}</code>
+                  </summary>
+                  <pre class="tool-call-detail">{{
+                    tool.arguments ? toolArguments(tool.arguments) : '{}'
+                  }}</pre>
+                </details>
+              </div>
             </div>
-          </div>
-        </article>
+          </article>
+        </template>
 
         <div v-if="connectionError" class="inline-error">
           <CloudOff :size="16" />
@@ -745,6 +834,36 @@ function logLevelClass(log: RuntimeLog) {
           </div>
 
           <div v-if="toolsOpen" id="tool-manager-panel" class="tool-manager-panel">
+            <section class="tool-resource-group">
+              <div class="tool-resource-heading">
+                <span>Sandbox</span>
+                <span>{{ sandboxOptions.options.length }}</span>
+              </div>
+              <div class="tool-resource-list">
+                <div
+                  v-for="choice in sandboxChoices"
+                  :key="choice.value || 'none'"
+                  class="tool-resource-row"
+                  :title="choice.hint"
+                >
+                  <ShieldCheck v-if="choice.value" :size="14" />
+                  <ShieldOff v-else :size="14" />
+                  <code :title="choice.hint">{{ choice.label }}</code>
+                  <button
+                    class="tool-row-action"
+                    type="button"
+                    :title="sandboxSelection === choice.value ? 'Active sandbox' : 'Use this sandbox'"
+                    :aria-label="sandboxSelection === choice.value ? 'Active sandbox' : 'Use this sandbox'"
+                    :disabled="connectionStatus !== 'online' || !selectedAgentReady"
+                    @click="selectSandbox(choice.value)"
+                  >
+                    <CircleDot v-if="sandboxSelection === choice.value" :size="14" />
+                    <Circle v-else :size="14" />
+                  </button>
+                </div>
+              </div>
+            </section>
+
             <section v-for="group in resourceGroups" :key="group.type" class="tool-resource-group">
               <div class="tool-resource-heading">
                 <span>{{ group.label }}</span>

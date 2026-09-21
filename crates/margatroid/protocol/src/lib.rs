@@ -699,8 +699,18 @@ pub struct AgentHistoryDto {
 pub struct HistoryMessageDto {
     pub sequence: i64,
     pub turn_id: String,
-    pub message: MessageDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<MessageDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<HistoryRecordDto>,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryRecordDto {
+    pub kind: String,
+    pub content: String,
+    pub payload: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -722,18 +732,27 @@ pub struct AgentFailureDto {
 
 impl FromDomain<HistoryMessage> for HistoryMessageDto {
     fn from_domain(message: HistoryMessage, (): ()) -> Result<Self, ProtocolError> {
-        Ok(Self {
-            sequence: message.sequence,
-            turn_id: message.turn_id(),
-            message: (&message.message().ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorKind::HistoryEntryInvalid,
-                    "history entry is not a message",
-                )
-            })?)
-                .into_dto(())?,
-            created_at_ms: message.created_at_ms,
-        })
+        let dto = match message.message() {
+            Some(value) => Self {
+                sequence: message.sequence,
+                turn_id: message.turn_id(),
+                message: Some((&value).into_dto(())?),
+                record: None,
+                created_at_ms: message.created_at_ms,
+            },
+            None => Self {
+                sequence: message.sequence,
+                turn_id: message.turn_id(),
+                message: None,
+                record: Some(HistoryRecordDto {
+                    kind: message.kind.clone(),
+                    content: message.content.clone(),
+                    payload: message.payload.clone(),
+                }),
+                created_at_ms: message.created_at_ms,
+            },
+        };
+        Ok(dto)
     }
 }
 

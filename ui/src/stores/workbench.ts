@@ -26,7 +26,13 @@ function sameOriginEndpoint(): string {
 }
 
 export type ConnectionStatus = 'offline' | 'connecting' | 'online';
-export type MessageRole = 'system' | 'user' | 'assistant' | 'tool' | 'error';
+export type MessageRole = 'system' | 'user' | 'assistant' | 'tool' | 'error' | 'record';
+
+export interface ConversationRecord {
+  kind: string;
+  content: string;
+  payload: string;
+}
 
 export interface ConversationEntry {
   key: string;
@@ -38,7 +44,9 @@ export interface ConversationEntry {
   thinking: string;
   content: string;
   toolCalls: ToolCall[];
+  failed: boolean;
   timestamp: number;
+  record: ConversationRecord | null;
 }
 
 export interface RuntimeLog {
@@ -134,6 +142,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       default: defaults.has(resource),
       visible: visible.has(resource),
     }));
+  });
+
+  const sandboxOptions = computed(() => {
+    const state = selectedAgentState.value;
+    const exposed = state?.exposed?.sandbox;
+    const options = Array.isArray(exposed?.options) ? (exposed.options as string[]) : [];
+    const activated = Array.isArray(exposed?.activated) ? (exposed.activated as string[]) : [];
+    return {
+      options: [...options].sort(),
+      activated,
+    };
   });
 
   const visibleMessages = computed(() => {
@@ -426,6 +445,55 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     return id;
   }
 
+  function setSandbox(resource: string | null): string | null {
+    const workspace = selectedWorkspace.value;
+    const state = selectedAgentState.value;
+    const exposed = state?.exposed?.sandbox;
+    if (
+      !workspace ||
+      !selectedAgentReady.value ||
+      !socket ||
+      socket.readyState !== WebSocket.OPEN ||
+      !exposed
+    )
+      return null;
+    const activated = Array.isArray(exposed.activated) ? (exposed.activated as string[]) : [];
+    const next = resource ? [resource] : [];
+    if (sameStrings(activated, next)) return null;
+    const id = crypto.randomUUID();
+    const command = (text: string, binding: unknown) => {
+      const request: ClientMessage = {
+        type: 'mcl.command',
+        id: crypto.randomUUID(),
+        message: {
+          workspace: workspaceReference(workspace),
+          agent: selectedAgent.value,
+          command: text,
+          binding: binding as never,
+        },
+      };
+      socket!.send(JSON.stringify(request));
+    };
+    const label = resource ? resourceName(resource) : 'none';
+    logs.value.push({
+      key: `sandbox-log:${id}`,
+      timestamp: Date.now(),
+      level: 'INFO',
+      target: `agent/${selectedAgent.value || workspace.manager}`,
+      message: `sandbox set to ${label}`,
+      fields: [{ name: 'activated', value: next.join(',') || 'none' }],
+    });
+    if (logs.value.length > MAX_LOGS) logs.value.splice(0, logs.value.length - MAX_LOGS);
+    command('INJECT ? TO setting.sandbox_activated', next);
+    command('EMIT EFFECT sandbox_use FROM ?', next);
+    command('EMIT EFFECT history_record FROM ?', {
+      kind: 'mcl',
+      cmd: `sandbox ${label}`,
+      arg: next,
+    });
+    return id;
+  }
+
   function clearLogs() {
     logs.value = [];
   }
@@ -532,7 +600,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           thinking: '',
           content: event.content,
           toolCalls: [],
+          failed: false,
           timestamp: Date.now(),
+          record: null,
           completed: false,
           backendAgentId: event.agent,
         };
@@ -562,7 +632,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           thinking: event.content,
           content: '',
           toolCalls: [],
+          failed: false,
           timestamp: Date.now(),
+          record: null,
           completed: false,
           backendAgentId: event.agent,
         };
@@ -591,7 +663,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       thinking: event.message.Assistant.reasoning ?? '',
       content: event.message.Assistant.content ?? '',
       toolCalls: event.message.Assistant.tool_calls,
+      failed: false,
       timestamp: existing?.timestamp ?? Date.now(),
+      record: null,
       completed: true,
       backendAgentId: existing?.backendAgentId ?? '',
     };
@@ -698,20 +772,40 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   function synchronizeHistories(histories: AgentHistory[]) {
     messages.value = histories.flatMap((history) =>
-      history.messages.flatMap((entry) => {
-        const decoded = decodeMessage(entry.message);
-        if (!decoded) return [];
-        return [{
+      history.messages.flatMap((entry): ConversationEntry[] => {
+        const base = {
           key: `history:${workspaceKey(history.workspace)}:${history.agent}:${entry.sequence}`,
           id: entry.turn_id,
           sequence: entry.sequence,
           workspaceKey: workspaceKey(history.workspace),
           agent: history.agent,
+          timestamp: entry.created_at_ms,
+        };
+        if (entry.record) {
+          return [{
+            ...base,
+            role: 'record',
+            thinking: '',
+            content: entry.record.content,
+            toolCalls: [],
+            failed: false,
+            record: {
+              kind: entry.record.kind,
+              content: entry.record.content,
+              payload: entry.record.payload,
+            },
+          }];
+        }
+        const decoded = entry.message ? decodeMessage(entry.message) : null;
+        if (!decoded) return [];
+        return [{
+          ...base,
           role: decoded.role,
           thinking: decoded.thinking,
           content: decoded.content,
           toolCalls: decoded.toolCalls,
-          timestamp: entry.created_at_ms,
+          failed: decoded.failed,
+          record: null,
         }];
       }),
     );
@@ -787,6 +881,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedAgentReady,
     selectedAgentWorking,
     resourceVisibility,
+    sandboxOptions,
+    setSandbox,
     visibleMessages,
     logs,
     connect,
@@ -822,6 +918,7 @@ function decodeMessage(message: AgentMessage): {
   thinking: string;
   content: string;
   toolCalls: ToolCall[];
+  failed: boolean;
 } | null {
   if ('Inject' in message) return null;
   if ('User' in message) {
@@ -830,6 +927,7 @@ function decodeMessage(message: AgentMessage): {
       thinking: '',
       content: message.User.content,
       toolCalls: [],
+      failed: false,
     };
   }
   if ('Assistant' in message) {
@@ -838,6 +936,7 @@ function decodeMessage(message: AgentMessage): {
       thinking: message.Assistant.reasoning ?? '',
       content: message.Assistant.content ?? '',
       toolCalls: message.Assistant.tool_calls,
+      failed: false,
     };
   }
   if ('Error' in message) {
@@ -846,14 +945,20 @@ function decodeMessage(message: AgentMessage): {
       thinking: '',
       content: message.Error.message,
       toolCalls: [],
+      failed: true,
     };
   }
   return {
-    role: message.Tool.failed ? 'error' : 'tool',
+    role: 'tool',
     thinking: '',
     content: message.Tool.content,
     toolCalls: [],
+    failed: message.Tool.failed,
   };
+}
+
+function sameStrings(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function uniqueNames(names: string[]): string[] {
