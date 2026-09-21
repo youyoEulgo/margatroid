@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use agent_plugin::{Agent, AgentInferencePending, AgentInitializationCompleted};
 use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, WorldEventExt};
@@ -544,6 +544,7 @@ pub fn mcl_domain_system(world: &mut World) {
                     let state = world
                         .get_component_mut::<Agent>(agent)
                         .ok_or(MclError::AgentMissing)?;
+                    let mut activated = BTreeSet::new();
                     for alias in aliases {
                         let resource = state
                             .resources
@@ -557,8 +558,9 @@ pub fn mcl_domain_system(world: &mut World) {
                         {
                             return Err(MclError::TypeMismatch);
                         }
-                        state.resources.active_sandboxes.insert(resource);
+                        activated.insert(resource);
                     }
+                    state.resources.active_sandboxes = activated;
                     Ok(crate::MclDomainValue::Unit)
                 }
                 MclOperation::Emit {
