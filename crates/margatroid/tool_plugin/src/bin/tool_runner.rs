@@ -42,6 +42,7 @@ fn kind_name(kind: ToolErrorKind) -> &'static str {
         ToolErrorKind::InvalidArguments => "InvalidArguments",
         ToolErrorKind::InvalidDefinition => "InvalidDefinition",
         ToolErrorKind::RunnerFailed => "RunnerFailed",
+        ToolErrorKind::Aborted => "Aborted",
         _ => "ExecutionFailed",
     }
 }

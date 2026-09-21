@@ -20,6 +20,10 @@ pub enum ToolErrorKind {
     InvalidArguments,
     ExecutionFailed,
     RunnerFailed,
+    /// The tool called `error`, which is reserved for a problem serious enough
+    /// that the turn cannot continue. The runtime stops the turn and records the
+    /// message for review, instead of handing the model something to retry.
+    Aborted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

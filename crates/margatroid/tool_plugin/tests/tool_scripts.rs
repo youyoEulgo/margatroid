@@ -11,8 +11,9 @@ use margatroid_types::ResourceId;
 use tool_plugin::{run_lua_tool, LuaExecutionLimits, LuaToolRunRequest};
 
 fn runner_path() -> Option<PathBuf> {
-    // The integration test binary sits next to the runner in target/debug.
-    let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/tool_runner");
+    // The workspace target directory sits three levels above this crate:
+    // crates/margatroid/tool_plugin -> crates/margatroid -> crates -> <root>.
+    let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/debug/tool_runner");
     candidate.is_file().then_some(candidate)
 }
 
@@ -184,8 +185,13 @@ fn the_list_directory_tool_returns_entries_through_the_injected_shell() {
     std::env::remove_var("MARGATROID_TOOL_RUNNER");
 
     let output = result.expect("list-directory should run");
-    assert!(output.contains("main.rs"), "entry missing: {output}");
-    assert!(output.contains("\"file\""), "kind missing: {output}");
+    let value: serde_json::Value = serde_json::from_str(&output).expect("the outcome envelope");
+    assert_eq!(value["ok"], true, "{output}");
+    let entries = value["content"]
+        .as_str()
+        .expect("content is the entry list");
+    assert!(entries.contains("main.rs"), "entry missing: {entries}");
+    assert!(entries.contains("\"file\""), "kind missing: {entries}");
     let _ = std::fs::remove_dir_all(&project);
 }
 
@@ -207,5 +213,102 @@ fn a_tool_without_a_shell_reports_that_clearly() {
         error.contains("imports no shell"),
         "expected the no-shell wording: {error}"
     );
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+#[test]
+fn the_bash_tool_reports_an_outcome_the_model_can_read_directly() {
+    let Some((runner, _)) = ready("bash") else {
+        eprintln!("skipping: the coder image or tool_runner is unavailable");
+        return;
+    };
+    let project = scratch("bash");
+    std::fs::write(project.join("note.txt"), "hi\n").unwrap();
+    let shell = stage_shell(&project);
+
+    std::env::set_var("MARGATROID_TOOL_RUNNER", &runner);
+    let failed = run_tool(
+        "bash",
+        r#"{"cmd":"echo hello; exit 3"}"#,
+        &project,
+        Some(shell.clone()),
+    );
+    let succeeded = run_tool("bash", r#"{"cmd":"echo fine"}"#, &project, Some(shell));
+    std::env::remove_var("MARGATROID_TOOL_RUNNER");
+
+    // The envelope carries two fields: what the model reads, and whether the
+    // runtime should treat the call as failed.
+    let failed = failed.expect("bash should run");
+    let value: serde_json::Value =
+        serde_json::from_str(&failed).expect("bash output must be the outcome envelope");
+    assert_eq!(value["ok"], false, "a non-zero exit is a failure: {failed}");
+    assert!(
+        value["content"].as_str().unwrap().contains("hello"),
+        "the command's output is the content: {failed}"
+    );
+
+    let succeeded = succeeded.expect("bash should run");
+    let value: serde_json::Value =
+        serde_json::from_str(&succeeded).expect("bash output must be the outcome envelope");
+    assert_eq!(value["ok"], true, "a zero exit succeeds: {succeeded}");
+    assert!(value["content"].as_str().unwrap().contains("fine"));
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+#[test]
+fn the_bash_tool_runs_with_the_project_root_as_its_working_directory() {
+    let Some((runner, _)) = ready("bash") else {
+        eprintln!("skipping: the coder image or tool_runner is unavailable");
+        return;
+    };
+    let project = scratch("bash-cwd");
+    std::fs::write(project.join("marker.txt"), "here\n").unwrap();
+    let shell = stage_shell(&project);
+
+    std::env::set_var("MARGATROID_TOOL_RUNNER", &runner);
+    let result = run_tool("bash", r#"{"cmd":"cat marker.txt"}"#, &project, Some(shell));
+    std::env::remove_var("MARGATROID_TOOL_RUNNER");
+
+    let output = result.expect("bash should run");
+    assert!(
+        output.contains("here"),
+        "the command should run from the project root: {output}"
+    );
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+#[test]
+fn a_failing_command_with_no_output_still_says_something() {
+    let Some((runner, _)) = ready("bash") else {
+        eprintln!("skipping: the coder image or tool_runner is unavailable");
+        return;
+    };
+    let project = scratch("bash-silent");
+    let shell = stage_shell(&project);
+
+    std::env::set_var("MARGATROID_TOOL_RUNNER", &runner);
+    let failed = run_tool("bash", r#"{"cmd":"exit 4"}"#, &project, Some(shell.clone()));
+    let quiet = run_tool("bash", r#"{"cmd":"true"}"#, &project, Some(shell));
+    std::env::remove_var("MARGATROID_TOOL_RUNNER");
+
+    // A tool that can answer at all must answer with something the model can act
+    // on; an empty body leaves it guessing why the call failed.
+    let failed = failed.expect("bash should run");
+    let value: serde_json::Value = serde_json::from_str(&failed).unwrap();
+    assert_eq!(value["ok"], false);
+    let content = value["content"].as_str().unwrap();
+    assert!(
+        !content.is_empty(),
+        "a silent failure must still explain itself"
+    );
+    assert!(
+        content.contains('4'),
+        "the exit code belongs in it: {content}"
+    );
+
+    let quiet = quiet.expect("bash should run");
+    let value: serde_json::Value = serde_json::from_str(&quiet).unwrap();
+    assert_eq!(value["ok"], true);
+    assert!(!value["content"].as_str().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&project);
 }
