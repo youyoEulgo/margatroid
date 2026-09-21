@@ -774,7 +774,7 @@ textarea:focus-visible {
 }
 
 .message-row--error .message-content {
-  color: var(--mg-danger, #dc2626);
+  color: var(--mg-error);
 }
 
 .message-row--error .message-content a {
@@ -2404,4 +2404,55 @@ textarea:focus-visible {
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* A failed tool result keeps the tool layout and turns red: the icon, the
+   Response badge, the collapsed summary and the expanded body. */
+.message-row--failed .message-avatar {
+  color: var(--mg-error);
+}
+
+.message-row--tool.message-row--failed .tool-response-label {
+  background: var(--mg-error-soft);
+  color: var(--mg-error);
+}
+
+.message-row--failed .tool-response-summary,
+.message-row--failed .tool-response-detail {
+  color: var(--mg-error);
+}
+
+.message-row--failed .tool-response-detail {
+  border-color: var(--mg-error-soft);
+}
+
+/* A history record is a note on the timeline, not a message: one short line of
+   muted prose with the same column width as the chat flow. */
+.record-note {
+  display: flex;
+  max-width: var(--mg-chat-width);
+  align-items: center;
+  gap: 6px;
+  margin: 10px auto;
+  padding: 0 2px;
+  color: var(--mg-text-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.record-note svg {
+  flex: none;
+  opacity: 0.75;
+}
+
+.record-note-time {
+  margin-left: auto;
+  color: var(--mg-text-quaternary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The sandbox note mirrors the state it records, so it keeps a subtle accent
+   instead of reading as ordinary chrome. */
+.record-note--mcl {
+  color: var(--mg-text-secondary);
 }

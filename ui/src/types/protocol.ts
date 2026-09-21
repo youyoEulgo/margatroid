@@ -56,13 +56,19 @@ export interface AgentMclState {
   plan_generation: number;
 }
 
+export interface HistoryRecord {
+  kind: string;
+  content: string;
+  payload: string;
+}
+
 export interface HistoryMessage {
   sequence: number;
   turn_id: string;
-  message: AgentMessage;
+  message?: AgentMessage;
+  record?: HistoryRecord;
   created_at_ms: number;
 }
-
 export interface AgentHistory {
   workspace: WorkspaceRef;
   agent: string;
