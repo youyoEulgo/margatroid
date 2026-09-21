@@ -147,7 +147,19 @@ pub fn candidate_resource_entry(
     resource_id: ResourceId,
     alias: Option<String>,
     tool_id: ResourceId,
+    template: ToolTemplate,
+) -> Result<ResourceMapEntry, ToolError> {
+    candidate_resource_entry_with_content(resource_id, alias, tool_id, template, None)
+}
+
+/// The same candidate entry, carrying content that later stages need — a
+/// sandbox's policy or a shell's script — alongside the template.
+pub fn candidate_resource_entry_with_content(
+    resource_id: ResourceId,
+    alias: Option<String>,
+    tool_id: ResourceId,
     mut template: ToolTemplate,
+    content: Option<ResourceContent>,
 ) -> Result<ResourceMapEntry, ToolError> {
     let resource_name = alias.clone().unwrap_or_else(|| resource_id.to_string());
     if resource_name.trim().is_empty() {
@@ -164,7 +176,7 @@ pub fn candidate_resource_entry(
         alias,
         tool_id: Some(tool_id),
         template: Some(template),
-        content: None,
+        content,
     })
 }
 

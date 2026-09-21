@@ -2,13 +2,12 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolError, ToolErrorKind,
-    ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
+    candidate_resource_entry_with_content, ResourceContent, ResourceMapEntry, ToolCallRequest,
+    ToolError, ToolErrorKind, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
 };
 use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
@@ -18,10 +17,11 @@ use margatroid_types::ResourceId;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
+pub(crate) use crate::handler::pty::SHELL_SCRIPT_FILE;
+
 const SHELL_TYPE: &str = "shell";
 const SHELL_FILE: &str = "shell.toml";
 const SHELL_SCHEMA_FILE: &str = "input.schema.json";
-const SHELL_SCRIPT_FILE: &str = "main.sh";
 const SHELL_EXECUTOR_ID: &str = "tool:builtin/shell:latest";
 const SHELL_COMMAND_PROPERTY: &str = "cmd";
 
@@ -289,7 +289,7 @@ fn register_shell_resource(
         ));
     }
     let definition = parse_shell_definition(&metadata, &schema, &request.resource_id)?;
-    candidate_resource_entry(
+    candidate_resource_entry_with_content(
         request.resource_id.clone(),
         request.alias.clone(),
         ResourceId::parse(SHELL_EXECUTOR_ID).expect("built-in Shell ID is valid"),
@@ -298,6 +298,9 @@ fn register_shell_resource(
             definition.metadata.description,
             definition.parameters,
         )?,
+        Some(ResourceContent::Shell {
+            script: Arc::from(script),
+        }),
     )
 }
 
@@ -428,55 +431,23 @@ async fn execute_shell(prepared: &PreparedShellToolCall) -> Result<String, ToolE
         )
     })?;
     let spawn = crate::handler::sandbox::ConfinedSpawn::new(&prepared.context.sandbox_policies)?;
-    let (master, mut child) =
-        spawn_pty_shell(&script, command, &prepared.context.project_root, &spawn)?;
-    let mut group = crate::handler::sandbox::ProcessGroup::confined(
-        spawn.is_confined(),
-        child.id().unwrap_or_default(),
-    );
-    let limit = prepared.limits.max_output_bytes;
-    let reader = tokio::task::spawn_blocking(move || read_pty_bounded(master, limit));
-    let outcome = tokio::time::timeout(prepared.limits.max_execution_time, async {
-        let status = child.wait().await;
-        group.reclaim();
-        let captured = reader.await;
-        (status, captured)
-    })
-    .await;
-    let (status, captured) = match outcome {
-        Ok(parts) => parts,
-        Err(_) => {
-            group.reclaim();
-            return Err(ToolError::new(
-                ToolErrorKind::ExecutionFailed,
-                "Shell process timed out",
-            ));
-        }
-    };
-    let status = status.map_err(|_| {
-        ToolError::new(
-            ToolErrorKind::ExecutionFailed,
-            "Shell process could not be awaited",
-        )
-    })?;
-    let captured = captured
-        .map_err(|_| {
-            ToolError::new(
-                ToolErrorKind::ExecutionFailed,
-                "Shell output reader could not be joined",
-            )
-        })?
-        .map_err(|_| {
-            ToolError::new(
-                ToolErrorKind::ExecutionFailed,
-                "Shell process output could not be read",
-            )
-        })?;
+    let outcome = crate::handler::pty::run_in_pty(
+        crate::handler::pty::PtyRequest {
+            program: Path::new("bash"),
+            script: &script,
+            command,
+            project_root: &prepared.context.project_root,
+            max_output_bytes: prepared.limits.max_output_bytes,
+            max_execution_time: prepared.limits.max_execution_time,
+        },
+        &spawn,
+    )
+    .await?;
     let output = ShellOutput {
-        exit_code: status.code(),
-        stdout: String::from_utf8_lossy(&captured.bytes).replace("\r\n", "\n"),
+        exit_code: outcome.exit_code,
+        stdout: crate::handler::pty::normalize_pty_text(&outcome.bytes),
         stderr: String::new(),
-        stdout_truncated: captured.truncated,
+        stdout_truncated: outcome.truncated,
         stderr_truncated: false,
     };
     serde_json::to_string(&output).map_err(|_| {
@@ -485,89 +456,6 @@ async fn execute_shell(prepared: &PreparedShellToolCall) -> Result<String, ToolE
             "Shell process result could not be encoded",
         )
     })
-}
-
-#[derive(Default)]
-struct BoundedOutput {
-    bytes: Vec<u8>,
-    truncated: bool,
-}
-
-fn extend_bounded(output: &mut BoundedOutput, chunk: &[u8], limit: usize) {
-    let remaining = limit.saturating_sub(output.bytes.len());
-    if remaining > 0 {
-        output
-            .bytes
-            .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-    }
-    if chunk.len() > remaining {
-        output.truncated = true;
-    }
-}
-
-fn spawn_pty_shell(
-    script: &Path,
-    command: &str,
-    project_root: &Path,
-    spawn: &crate::handler::sandbox::ConfinedSpawn,
-) -> Result<(std::fs::File, tokio::process::Child), ToolError> {
-    let pty = nix::pty::openpty(None, None).map_err(|_| {
-        ToolError::new(
-            ToolErrorKind::ExecutionFailed,
-            "Shell PTY could not be created",
-        )
-    })?;
-    let master = std::fs::File::from(pty.master);
-    let slave_fd = std::os::fd::AsRawFd::as_raw_fd(&pty.slave);
-    let duplicate = |error: std::io::Error| {
-        ToolError::new(
-            ToolErrorKind::ExecutionFailed,
-            format!("Shell PTY could not be duplicated: {error}"),
-        )
-    };
-    let stdin = Stdio::from(pty.slave.try_clone().map_err(duplicate)?);
-    let stdout = Stdio::from(pty.slave.try_clone().map_err(duplicate)?);
-    let stderr = Stdio::from(pty.slave);
-    let mut process = spawn.command(Path::new("bash"), project_root)?;
-    process
-        .arg(script)
-        .arg(command)
-        .stdin(stdin)
-        .stdout(stdout)
-        .stderr(stderr);
-    unsafe {
-        process.pre_exec(move || {
-            if nix::unistd::setsid().is_err() {
-                return Err(std::io::Error::last_os_error());
-            }
-            if nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let child = process.spawn().map_err(|_| {
-        ToolError::new(
-            ToolErrorKind::ExecutionFailed,
-            "Shell process could not be started",
-        )
-    })?;
-    Ok((master, child))
-}
-
-fn read_pty_bounded(mut master: std::fs::File, limit: usize) -> std::io::Result<BoundedOutput> {
-    let mut output = BoundedOutput::default();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        match master.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => extend_bounded(&mut output, &buffer[..read], limit),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) if error.raw_os_error() == Some(nix::libc::EIO) => break,
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(output)
 }
 
 #[derive(Serialize)]

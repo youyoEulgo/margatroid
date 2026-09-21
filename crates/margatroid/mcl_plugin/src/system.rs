@@ -1262,9 +1262,13 @@ pub fn mcl_import_response_system(world: &mut World) {
                             entry.content.as_ref(),
                             Some(ResourceContent::Sandbox { .. })
                         );
+                    let is_shell = entry.tool_id.is_none()
+                        && entry.template.is_none()
+                        && matches!(entry.content.as_ref(), Some(ResourceContent::Shell { .. }));
                     if alias_conflict
                         || (!is_prompt
                             && !is_sandbox
+                            && !is_shell
                             && register_agent_resource(world, state.agent, entry.clone()).is_err())
                     {
                         Err(MclError::ImportFailed)
@@ -1274,11 +1278,19 @@ pub fn mcl_import_response_system(world: &mut World) {
                             .resources
                             .insert(state.resource_id.clone(), true);
                         if is_sandbox {
-                            if let Some(ResourceContent::Sandbox { policy }) = entry.content {
+                            if let Some(ResourceContent::Sandbox { policy }) = &entry.content {
                                 agent
                                     .resources
                                     .sandbox_policies
-                                    .insert(state.resource_id.clone(), policy);
+                                    .insert(state.resource_id.clone(), policy.clone());
+                            }
+                        }
+                        if is_shell {
+                            if let Some(ResourceContent::Shell { script }) = &entry.content {
+                                agent
+                                    .resources
+                                    .shell_scripts
+                                    .insert(state.resource_id.clone(), script.clone());
                             }
                         }
                         agent

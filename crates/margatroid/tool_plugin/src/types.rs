@@ -40,8 +40,19 @@ pub struct ToolTemplate {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResourceContent {
-    Prompt { role: String, content: Arc<str> },
-    Sandbox { policy: Arc<str> },
+    Prompt {
+        role: String,
+        content: Arc<str>,
+    },
+    Sandbox {
+        policy: Arc<str>,
+    },
+    /// The interpreter script a shell resource runs commands through. Keeping it
+    /// with the resource is what lets a Lua tool reach the same shell the shell
+    /// tool uses, instead of every caller reading the package again.
+    Shell {
+        script: Arc<str>,
+    },
 }
 
 impl ToolTemplate {

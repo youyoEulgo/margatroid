@@ -78,6 +78,42 @@ fn remove_policy_files(policies: &[PathBuf]) {
     }
 }
 
+/// Variable names that never reach a tool process, matched case-insensitively as
+/// substrings the way the reference harness matches them. A tool needs the
+/// ambient environment — `HOME`, locale, proxy settings — for ordinary CLIs to
+/// work, so the environment is inherited and only credential-shaped names are
+/// withheld rather than cleared wholesale.
+const WITHHELD_ENV_PATTERN: [&str; 4] = ["KEY", "PASSWORD", "SECRET", "TOKEN"];
+
+/// The environment every tool process starts from, minus credential-shaped
+/// names. Returned as a list so the filtering is testable on its own.
+fn inherited_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter(|(name, _)| !is_withheld_env_name(&name.to_string_lossy()))
+        .collect()
+}
+
+fn is_withheld_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    WITHHELD_ENV_PATTERN
+        .iter()
+        .any(|pattern| upper.contains(pattern))
+}
+
+fn inherit_environment(command: &mut tokio::process::Command) {
+    command.env_clear();
+    for (name, value) in inherited_environment() {
+        command.env(name, value);
+    }
+    // A tool reads a pipe here, not a terminal: keep paging and colour out of
+    // captured output. The pty path sets its own terminal type instead.
+    command
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .env("PAGER", "cat")
+        .env("GIT_PAGER", "cat");
+}
+
 pub(crate) struct ConfinedSpawn {
     policies: Vec<PathBuf>,
 }
@@ -123,11 +159,8 @@ impl ConfinedSpawn {
         } else {
             tokio::process::Command::new(program)
         };
-        command
-            .current_dir(project_root)
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .kill_on_drop(true);
+        command.current_dir(project_root).kill_on_drop(true);
+        inherit_environment(&mut command);
         Ok(command)
     }
 }
@@ -303,4 +336,65 @@ fn find_sandbox_package(
         ToolErrorKind::ResourceResolutionFailed,
         "sandbox policy was not found",
     ))
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+
+    #[test]
+    fn credential_shaped_names_are_withheld() {
+        for name in [
+            "OPENAI_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "api_key",
+            "GITHUB_TOKEN",
+            "DB_PASSWORD",
+            "AWS_SECRET_ACCESS_KEY",
+            "secret",
+        ] {
+            assert!(is_withheld_env_name(name), "{name} should be withheld");
+        }
+    }
+
+    #[test]
+    fn ordinary_names_survive() {
+        for name in [
+            "PATH",
+            "HOME",
+            "USER",
+            "LANG",
+            "LC_ALL",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "SSL_CERT_FILE",
+            "HTTP_PROXY",
+            "PWD",
+        ] {
+            assert!(!is_withheld_env_name(name), "{name} should survive");
+        }
+    }
+
+    #[test]
+    fn the_scan_is_case_insensitive() {
+        assert!(is_withheld_env_name("my_token"));
+        assert!(is_withheld_env_name("My_ToKeN"));
+        assert!(is_withheld_env_name("someKey"));
+    }
+
+    #[test]
+    fn the_ambient_environment_keeps_home_and_path() {
+        let inherited = inherited_environment();
+        let names: Vec<String> = inherited
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        // HOME and PATH are what every ordinary CLI needs; the previous
+        // wholesale clear kept only PATH, which is why `$HOME` expanded empty.
+        assert!(names.iter().any(|name| name == "PATH"));
+        if std::env::var_os("HOME").is_some() {
+            assert!(names.iter().any(|name| name == "HOME"));
+        }
+        assert!(names.iter().all(|name| !is_withheld_env_name(name)));
+    }
 }
