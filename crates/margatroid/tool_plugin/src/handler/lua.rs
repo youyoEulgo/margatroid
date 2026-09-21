@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::handler::pty::SHELL_SCRIPT_FILE;
 use crate::{
     candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolError, ToolErrorKind,
     ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
@@ -158,6 +159,10 @@ struct LuaCallContext {
     project_root: Arc<PathBuf>,
     temp_dir: Arc<PathBuf>,
     sandbox_policies: Vec<Arc<str>>,
+    /// Where `margatroid().shell` finds its interpreter script. The host stages
+    /// the file because the runner may sit behind a policy that forbids writing
+    /// the scratch directory; the runner only reads it.
+    shell_script: Option<Arc<PathBuf>>,
 }
 
 struct LuaExecutionHandle {
@@ -365,7 +370,26 @@ fn prepare_lua_tool_call(
     )?;
     let package = read_lua_tool_package(&package_root, &request.resource_id, &limits)?;
     let sandbox_policies = crate::handler::sandbox::active_sandbox_policies(&agent.resources)?;
+    let shell = agent.resources.the_shell_script().map_err(|message| {
+        ToolError::new(
+            ToolErrorKind::InvalidDefinition,
+            format!("the shell available to this tool is ambiguous: {message}"),
+        )
+    })?;
     let temp_dir = crate::handler::sandbox::CallTempDir::create(&agent.info.project_root)?;
+    let shell_script = match shell {
+        Some(script) => {
+            let path = temp_dir.path().join(SHELL_SCRIPT_FILE);
+            std::fs::write(&path, script.as_bytes()).map_err(|error| {
+                ToolError::new(
+                    ToolErrorKind::ExecutionFailed,
+                    format!("Shell script could not be staged: {error}"),
+                )
+            })?;
+            Some(Arc::new(path))
+        }
+        None => None,
+    };
     let context = LuaCallContext {
         agent_id,
         turn_id: request.turn_id.clone(),
@@ -373,6 +397,7 @@ fn prepare_lua_tool_call(
         project_root: Arc::new(agent.info.project_root.clone()),
         temp_dir: Arc::new(temp_dir.path().to_path_buf()),
         sandbox_policies,
+        shell_script,
     };
 
     Ok((
@@ -415,6 +440,7 @@ pub struct LuaToolRunRequest {
     pub project_root: PathBuf,
     pub limits: LuaExecutionLimits,
     pub sandbox_policies: Vec<Arc<str>>,
+    pub shell_script: Option<Arc<PathBuf>>,
 }
 
 pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError> {
@@ -455,6 +481,7 @@ pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolErro
             project_root: Arc::new(request.project_root.clone()),
             temp_dir: Arc::new(request.temp_dir.clone()),
             sandbox_policies: request.sandbox_policies.clone(),
+            shell_script: request.shell_script.clone(),
         },
         limits: limits.clone(),
         package: LuaToolPackage {
@@ -685,6 +712,7 @@ async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, Tool
         project_root: prepared.handle.context.project_root.as_ref().clone(),
         limits: prepared.handle.limits.clone(),
         sandbox_policies: prepared.handle.context.sandbox_policies.clone(),
+        shell_script: prepared.handle.context.shell_script.clone(),
     };
     spawn_tool_runner(&request).await
 }
@@ -891,6 +919,7 @@ fn install_lua_environment<'lua>(
     )
     .map_err(lua_tool_error)?;
     entry.set("json", &json).map_err(lua_tool_error)?;
+    install_shell(&lua, &entry, handle)?;
     lua.set_named_registry_value("margatroid_entry", &entry)
         .map_err(lua_tool_error)?;
     let entry_function = lua
@@ -900,6 +929,78 @@ fn install_lua_environment<'lua>(
         .set("margatroid", entry_function)
         .map_err(lua_tool_error)?;
     Ok(context)
+}
+
+/// Give the tool a way to run a command in a real terminal.
+///
+/// A Lua tool that shells out through `io.popen` gets a pipe: no terminal, no
+/// process-group cleanup, and no way to bound what the command does. This hands
+/// the tool the same runner the shell tool uses, so a command behaves the same
+/// whichever tool asked for it. The function is absent when the agent imports no
+/// shell, and calling it there says so rather than failing obscurely.
+fn install_shell(lua: &Lua, entry: &Table, handle: &LuaExecutionHandle) -> Result<(), ToolError> {
+    let script = handle.context.shell_script.clone();
+    let project_root = Arc::clone(&handle.context.project_root);
+    let max_output_bytes = handle.limits.max_output_bytes;
+    let max_execution_time = handle.limits.max_execution_time;
+    let shell = lua
+        .create_async_function(move |lua, (command, options): (String, Option<Table>)| {
+            let script = script.clone();
+            let project_root = Arc::clone(&project_root);
+            async move {
+                let script = script.ok_or_else(|| {
+                    mlua::Error::runtime(
+                        "this agent imports no shell; add a shell resource to run commands",
+                    )
+                })?;
+                if command.trim().is_empty() {
+                    return Err(mlua::Error::runtime("shell command is empty"));
+                }
+                let output_limit = match options.as_ref() {
+                    Some(options) => options
+                        .get::<Option<usize>>("max_output_bytes")?
+                        .unwrap_or(max_output_bytes),
+                    None => max_output_bytes,
+                };
+                let timeout = match options.as_ref() {
+                    Some(options) => options
+                        .get::<Option<u64>>("timeout_ms")?
+                        .map(Duration::from_millis)
+                        .unwrap_or(max_execution_time),
+                    None => max_execution_time,
+                };
+                let spawn = crate::handler::sandbox::ConfinedSpawn::new(&[]).map_err(|error| {
+                    mlua::Error::runtime(format!("shell could not be prepared: {error}"))
+                })?;
+                let outcome = crate::handler::pty::run_in_pty(
+                    crate::handler::pty::PtyRequest {
+                        program: Path::new("bash"),
+                        script: &script,
+                        command: &command,
+                        project_root: &project_root,
+                        max_output_bytes: output_limit,
+                        max_execution_time: timeout,
+                    },
+                    &spawn,
+                )
+                .await
+                .map_err(|error| mlua::Error::runtime(format!("shell failed: {error}")))?;
+                let result = lua.create_table()?;
+                match outcome.exit_code {
+                    Some(code) => result.set("exit_code", code)?,
+                    None => result.set("exit_code", Value::Nil)?,
+                }
+                result.set(
+                    "stdout",
+                    crate::handler::pty::normalize_pty_text(&outcome.bytes),
+                )?;
+                result.set("truncated", outcome.truncated)?;
+                Ok(result)
+            }
+        })
+        .map_err(lua_tool_error)?;
+    entry.set("shell", shell).map_err(lua_tool_error)?;
+    Ok(())
 }
 
 fn read_only_proxy(lua: &Lua, values: Table) -> Result<Table, ToolError> {
@@ -1020,6 +1121,7 @@ mod runner_tests {
             project_root: PathBuf::from("/tmp"),
             limits,
             sandbox_policies: Vec::new(),
+            shell_script: None,
         }
     }
 
@@ -1094,5 +1196,91 @@ mod runner_tests {
 
         std::fs::remove_file(&script).ok();
         std::env::remove_var("MARGATROID_TOOL_RUNNER");
+    }
+
+    #[tokio::test]
+    async fn an_injected_shell_runs_a_command_in_a_terminal() {
+        let directory =
+            std::env::temp_dir().join(format!("margatroid-lua-shell-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let script = directory.join(SHELL_SCRIPT_FILE);
+        std::fs::write(&script, "exec bash -lc \"$1\"\n").unwrap();
+
+        let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
+        let handle = LuaExecutionHandle {
+            context: LuaCallContext {
+                agent_id: ResourceId::parse("agent:test/coder:latest").unwrap(),
+                turn_id: "turn-1".to_owned(),
+                resource_id: ResourceId::parse("tool:local/glob:latest").unwrap(),
+                project_root: Arc::new(directory.clone()),
+                temp_dir: Arc::new(directory.clone()),
+                sandbox_policies: Vec::new(),
+                shell_script: Some(Arc::new(script.clone())),
+            },
+            limits: limits(1 << 20, 10_000),
+            package: LuaToolPackage {
+                metadata: "schema_version = 1\nname = \"glob\"\ndescription = \"test\"\n"
+                    .to_owned(),
+                schema: r#"{"type":"object"}"#.to_owned(),
+                script: "-- no setup needed\n".to_owned(),
+            },
+        };
+        install_lua_environment(&lua, &handle).unwrap();
+        let entry = lua
+            .named_registry_value::<Table>("margatroid_entry")
+            .unwrap();
+        let shell = entry.get::<Function>("shell").unwrap();
+
+        let result = shell
+            .call_async::<Table>(("test -t 1 && echo tty=yes || echo tty=no", Value::Nil))
+            .await
+            .unwrap();
+        assert_eq!(result.get::<i64>("exit_code").unwrap(), 0);
+        assert!(
+            result.get::<String>("stdout").unwrap().contains("tty=yes"),
+            "the injected shell should give the command a terminal"
+        );
+
+        let missing = shell
+            .call_async::<Table>(("exit 7", Value::Nil))
+            .await
+            .unwrap();
+        assert_eq!(missing.get::<i64>("exit_code").unwrap(), 7);
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[tokio::test]
+    async fn an_agent_without_a_shell_says_so() {
+        let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
+        let handle = LuaExecutionHandle {
+            context: LuaCallContext {
+                agent_id: ResourceId::parse("agent:test/reviewer:latest").unwrap(),
+                turn_id: "turn-1".to_owned(),
+                resource_id: ResourceId::parse("tool:local/glob:latest").unwrap(),
+                project_root: Arc::new(PathBuf::from("/tmp")),
+                temp_dir: Arc::new(PathBuf::from("/tmp")),
+                sandbox_policies: Vec::new(),
+                shell_script: None,
+            },
+            limits: limits(1 << 20, 10_000),
+            package: LuaToolPackage {
+                metadata: "schema_version = 1\nname = \"glob\"\ndescription = \"test\"\n"
+                    .to_owned(),
+                schema: r#"{"type":"object"}"#.to_owned(),
+                script: "-- no setup needed\n".to_owned(),
+            },
+        };
+        install_lua_environment(&lua, &handle).unwrap();
+        let entry = lua
+            .named_registry_value::<Table>("margatroid_entry")
+            .unwrap();
+        let shell = entry.get::<Function>("shell").unwrap();
+
+        let error = shell
+            .call_async::<Table>(("echo hello", Value::Nil))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("imports no shell"), "{error}");
     }
 }

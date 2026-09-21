@@ -186,7 +186,25 @@ pub struct AgentResourceMap {
     pub expose_mappings: BTreeMap<String, BTreeMap<String, String>>,
     pub sandbox_policies: BTreeMap<ResourceId, Arc<str>>,
     pub active_sandboxes: BTreeSet<ResourceId>,
+    /// The interpreter script of each imported shell, kept by resource id so a
+    /// tool that wants a terminal can run commands through the same shell the
+    /// shell tool uses.
+    pub shell_scripts: BTreeMap<ResourceId, Arc<str>>,
     pub tool_entries: Vec<AgentResourceEntry>,
+}
+
+impl AgentResourceMap {
+    /// The shell a tool should run commands through. Zero imported shells means
+    /// the agent has no shell at all; more than one is ambiguous, so the caller
+    /// is told rather than silently getting an arbitrary pick.
+    pub fn the_shell_script(&self) -> Result<Option<Arc<str>>, String> {
+        let mut scripts = self.shell_scripts.values();
+        let first = scripts.next().cloned();
+        if scripts.next().is_some() {
+            return Err("the agent imports more than one shell resource".to_owned());
+        }
+        Ok(first)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
