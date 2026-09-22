@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    candidate_resource_entry_with_content, ResourceContent, ResourceMapEntry, ToolCallRequest,
-    ToolError, ToolErrorKind, ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
+    ResourceContent, ResourceMapEntry, ToolCallRequest, ToolError, ToolErrorKind,
+    ToolRegisterRequest, ToolRegisterResponse,
 };
 use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
@@ -22,7 +22,6 @@ pub(crate) use crate::handler::pty::SHELL_SCRIPT_FILE;
 const SHELL_TYPE: &str = "shell";
 const SHELL_FILE: &str = "shell.toml";
 const SHELL_SCHEMA_FILE: &str = "input.schema.json";
-const SHELL_EXECUTOR_ID: &str = "tool:builtin/shell:latest";
 const SHELL_COMMAND_PROPERTY: &str = "cmd";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,8 +117,10 @@ struct ShellMetadata {
     description: String,
 }
 
+/// The parts of a shell package the runtime still needs. The metadata is
+/// validated while parsing and then dropped: a shell is not a tool the model
+/// calls, so nothing reads its name or description afterwards.
 struct ShellDefinition {
-    metadata: ShellMetadata,
     parameters: serde_json::Value,
 }
 
@@ -288,20 +289,25 @@ fn register_shell_resource(
             "Shell script is empty",
         ));
     }
-    let definition = parse_shell_definition(&metadata, &schema, &request.resource_id)?;
-    candidate_resource_entry_with_content(
-        request.resource_id.clone(),
-        request.alias.clone(),
-        ResourceId::parse(SHELL_EXECUTOR_ID).expect("built-in Shell ID is valid"),
-        ToolTemplate::new(
-            request.resource_id.to_string(),
-            definition.metadata.description,
-            definition.parameters,
-        )?,
-        Some(ResourceContent::Shell {
+    let _definition = parse_shell_definition(&metadata, &schema, &request.resource_id)?;
+    // A shell is not a tool the model calls, so the entry carries no executor and
+    // no template: it exists to hand its interpreter to whatever runs commands.
+    // Importing it is what puts the script on the agent, which is how a Lua tool
+    // reaches a terminal. A template here would also make the import look like a
+    // visible tool and keep the script out of the agent's shells.
+    Ok(ResourceMapEntry {
+        resource_id: request.resource_id.clone(),
+        resource_name: request
+            .alias
+            .clone()
+            .unwrap_or_else(|| request.resource_id.to_string()),
+        alias: request.alias.clone(),
+        tool_id: None,
+        template: None,
+        content: Some(ResourceContent::Shell {
             script: Arc::from(script),
         }),
-    )
+    })
 }
 
 pub(crate) fn prepare_shell_call(
@@ -573,10 +579,7 @@ fn parse_shell_definition(
             "Shell input schema must require a string command",
         ));
     }
-    Ok(ShellDefinition {
-        metadata,
-        parameters,
-    })
+    Ok(ShellDefinition { parameters })
 }
 
 async fn read_shell_package(
