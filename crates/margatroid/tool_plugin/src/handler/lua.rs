@@ -565,8 +565,11 @@ fn tool_runner_path() -> Result<PathBuf, ToolError> {
     Ok(directory.join(name))
 }
 
-async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolError> {
-    let payload = serde_json::json!({
+/// The request a runner process receives. Kept apart from the spawn so the wire
+/// shape is testable: a field added to `LuaToolRunRequest` but forgotten here
+/// would otherwise only show up as a tool that silently cannot do its job.
+fn runner_payload(request: &LuaToolRunRequest) -> serde_json::Value {
+    serde_json::json!({
         "metadata": request.metadata,
         "schema": request.schema,
         "script": request.script,
@@ -576,6 +579,10 @@ async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolEr
         "turn_id": request.turn_id,
         "resource_id": request.resource_id.to_string(),
         "project_root": request.project_root.to_string_lossy(),
+        "shell_script": request
+            .shell_script
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
         "limits": {
             "max_definition_bytes": request.limits.max_definition_bytes,
             "max_script_bytes": request.limits.max_script_bytes,
@@ -586,8 +593,11 @@ async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolEr
             "max_execution_time_ms": request.limits.max_execution_time.as_millis() as u64,
             "max_host_call_time_ms": request.limits.max_host_call_time.as_millis() as u64,
         },
-    });
-    let payload = serde_json::to_vec(&payload).map_err(|error| {
+    })
+}
+
+async fn spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolError> {
+    let payload = serde_json::to_vec(&runner_payload(request)).map_err(|error| {
         ToolError::new(
             ToolErrorKind::RunnerFailed,
             format!("tool runner request could not be encoded: {error}"),
@@ -1014,6 +1024,10 @@ fn install_shell(lua: &Lua, entry: &Table, handle: &LuaExecutionHandle) -> Resul
                     crate::handler::pty::normalize_pty_text(&outcome.bytes),
                 )?;
                 result.set("truncated", outcome.truncated)?;
+                // A sandbox may withhold the pty device, in which case the
+                // command still ran but saw no terminal. A tool that depends on
+                // one can say so rather than silently misbehave.
+                result.set("terminal", outcome.terminal)?;
                 Ok(result)
             }
         })
@@ -1215,6 +1229,43 @@ mod runner_tests {
         let aborted = runner_failure(r#"{"kind":"Aborted","message":"cannot continue"}"#);
         assert_eq!(aborted.kind(), ToolErrorKind::Aborted);
         assert_eq!(aborted.message(), "cannot continue");
+    }
+
+    #[test]
+    fn the_runner_request_carries_every_field_a_tool_needs() {
+        let mut request = request(limits(1 << 20, 5_000));
+        request.shell_script = Some(Arc::new(PathBuf::from("/scratch/main.sh")));
+        let payload = runner_payload(&request);
+        // The runner reads this to stage the interpreter a tool runs commands
+        // through; leaving it out of the wire shape is invisible until a tool
+        // tries to use a shell and is told there is none.
+        assert_eq!(
+            payload["shell_script"].as_str(),
+            Some("/scratch/main.sh"),
+            "the runner must be told where the shell script is"
+        );
+        for key in [
+            "metadata",
+            "schema",
+            "script",
+            "temp_dir",
+            "arguments",
+            "agent_id",
+            "turn_id",
+            "resource_id",
+            "project_root",
+            "limits",
+        ] {
+            assert!(!payload[key].is_null(), "the request must carry {key}");
+        }
+    }
+
+    #[test]
+    fn a_request_without_a_shell_says_so_on_the_wire() {
+        let request = request(limits(1 << 20, 5_000));
+        let payload = runner_payload(&request);
+        // Absent, not empty: the runner distinguishes "no shell" from a path.
+        assert!(payload["shell_script"].is_null());
     }
 
     #[test]
