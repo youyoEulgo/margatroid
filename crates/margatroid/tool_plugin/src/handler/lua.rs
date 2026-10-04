@@ -199,10 +199,7 @@ impl LuaToolResponseGuard {
                 Some((ok, content)) => (content, !ok),
                 None => (output, false),
             },
-            // A tool calling `error` reports a problem it cannot work around, so
-            // the turn ends and the message is recorded for review. Everything
-            // else is an ordinary failure the model may answer with another call.
-            Err(error) if error.kind() == ToolErrorKind::Aborted => {
+            Err(error) if ends_the_turn(error.kind()) => {
                 self.events.send_event(margatroid_types::AgentFailure {
                     id: locator.turn_id,
                     agent: locator.agent,
@@ -1036,6 +1033,21 @@ fn install_shell(lua: &Lua, entry: &Table, handle: &LuaExecutionHandle) -> Resul
     Ok(())
 }
 
+/// Whether a failed tool call leaves the model nothing to try.
+///
+/// Two failures qualify because another call cannot change them: the tool called
+/// `error` to say it cannot go on, or the runner itself failed — it could not be
+/// started, its streams broke, or it ran out of time. Both describe the
+/// environment rather than the call, so the turn ends and the message is kept
+/// for review.
+///
+/// Everything else stays an ordinary failure the model answers by calling again:
+/// a command that exited non-zero, a script that rejected an argument, a tool
+/// that reported `ok = false`.
+fn ends_the_turn(kind: ToolErrorKind) -> bool {
+    matches!(kind, ToolErrorKind::Aborted | ToolErrorKind::RunnerFailed)
+}
+
 /// A tool may report its outcome as `{"ok": bool, "content": string}` instead of
 /// returning the text directly. `content` is what the model reads, so it needs no
 /// parsing on that side; `ok` is what tells the runtime, the interface and the
@@ -1222,6 +1234,21 @@ mod runner_tests {
         assert_eq!(failed.kind(), ToolErrorKind::Aborted);
         let other = lua_tool_error(mlua::Error::external("unavailable"));
         assert_eq!(other.kind(), ToolErrorKind::ExecutionFailed);
+    }
+
+    #[test]
+    fn only_failures_the_model_cannot_answer_end_the_turn() {
+        // Retrying cannot help: the tool refused to go on, or the runner that
+        // executes tools is broken.
+        assert!(ends_the_turn(ToolErrorKind::Aborted));
+        assert!(ends_the_turn(ToolErrorKind::RunnerFailed));
+
+        // Retrying can help, so the model keeps the turn and answers the message.
+        assert!(!ends_the_turn(ToolErrorKind::ExecutionFailed));
+        assert!(!ends_the_turn(ToolErrorKind::InvalidArguments));
+        assert!(!ends_the_turn(ToolErrorKind::InvalidRequest));
+        assert!(!ends_the_turn(ToolErrorKind::InvalidDefinition));
+        assert!(!ends_the_turn(ToolErrorKind::ResourceUnavailable));
     }
 
     #[test]

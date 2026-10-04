@@ -48,7 +48,9 @@ src/handler/
 ├── skill.rs         skill 资源注册与执行
 ├── hook.rs          hook 资源注册与 no-op 执行
 ├── lua.rs           lua 工具注册、准备与异步执行
-└── shell.rs         shell 工具注册、准备与异步执行
+├── pty.rs           命令的终端执行：分配 PTY、回收进程组、超时与输出限额
+├── sandbox.rs       沙箱策略解析、受限 spawn 与进程组
+└── shell.rs         shell 资源注册：只供给解释器脚本，不暴露为工具
 ```
 
 # lib
@@ -64,7 +66,7 @@ ToolPlugin：工具插件，公开结构体--统一安装内置工具根、注�
     lua_root: Arc<PathBuf>--lua 工具根目录，私有
     shell_root: Arc<PathBuf>--shell 根目录，私有
     lua_limits: LuaExecutionLimits--Lua 执行限制，公开（runner bin 目标要按同一份限额构造请求）
-    shell_limits: ShellExecutionLimits--Shell 执行限制，私有
+    shell_limits: ShellExecutionLimits--Shell 包读取限额，私有
     open(root: impl Into<PathBuf>) -> Result<Self, ToolError>
         打开插件：公开关联函数，要求 root 绝对且无父级跳转
     with_schedule(mut self, schedule: impl Into<String>) -> Self
@@ -73,7 +75,7 @@ ToolPlugin：工具插件，公开结构体--统一安装内置工具根、注�
     impl Plugin for ToolPlugin
         build(self, app: &mut App)
             安装插件：要求 RuntimePlugin 和 AsyncRuntimePlugin 已安装
-            插入 ToolPluginInstalled、四类 roots 与 lua/shell 限制
+            插入 ToolPluginInstalled、四类 roots 与 lua/shell 限额
             依次挂载注册、调用路由、异步执行、任务结果、取消和清理 System
 
 ToolPluginInstalled：工具插件安装标记，公开单元 Resource
@@ -107,11 +109,13 @@ tool_register_system(world: &mut World)
     注册路由 System
     处理事件：ToolRegisterRequest
     行为：id 为空 -> InvalidRequest；skill/hook/shell/tool 类型交给对应 handler；tool:builtin/* 除 hook 外拒绝；未知类型 -> ProviderMissing
+    说明：shell 类型只做资源注册，注册结果不带工具身份，因此模型看不到它
 
 tool_call_route_system(world: &mut World)
     调用路由 System
     处理事件：ToolCallEvent
-    行为：校验事件和参数，解析 ToolCallRequest，写入 Agent.tools.pending，按 tool_id 分派 skill/hook/lua/shell handler
+    行为：校验事件和参数，解析 ToolCallRequest，写入 Agent.tools.pending，按 tool_id 分派 skill/hook/lua handler
+    说明：shell 已不再是模型可调用的工具，命令统一经 Lua 工具的 margatroid().shell 执行
 
 tool_message_cleanup_system(world: &mut World)
     消息清理 System
@@ -165,13 +169,15 @@ ConfinedSpawn：一次受限调用的全部约定，crate 内公开结构体
     command(&self, program: &Path, project_root: &Path) -> Result<tokio::process::Command, ToolError>
         构造命令：crate 内公开方法
         行为：受限时包成 landstrip run -p <策略>... -- <program>，未受限时直接执行 program；
-              两种情况统一设置工作目录为项目根、env_clear 后只给 PATH、kill_on_drop
+              两种情况统一设置工作目录为项目根、继承环境但剔除凭据形变量、kill_on_drop
         边界：有策略而后端不可用则 fail-closed，拒绝执行而不是绕过策略
     impl Drop for ConfinedSpawn
         删除本次调用暂存的所有策略文件
 
-    说明：Lua 与 shell 两条路径共用本类型，工作目录、环境、策略暂存与回收模式只有这一处定义；
-          工作目录必须是项目根，因为可移植策略写的是 "."，否则会解析到 daemon 自己的目录
+    说明：工具进程共用本类型，工作目录、环境、策略暂存与回收模式只有这一处定义；
+          工作目录必须是项目根，因为可移植策略写的是 "."，否则会解析到 daemon 自己的目录；
+          环境是继承而非清空：把 HOME、locale、代理都留给工具，只拦下 KEY/PASSWORD/SECRET/TOKEN
+          这类凭据形名字，否则普通 CLI 无法正常工作
 
 CallTempDir：一次调用的临时目录，crate 内公开结构体
     path: PathBuf--<项目根>/.margatroid/tmp/<序号>，私有
@@ -214,13 +220,13 @@ LuaError：Lua 执行限额错误，公开结构体--只用于构造期的参数
 LuaErrorKind：Lua 限额错误分类，公开枚举
     InvalidLimits--限额为零、互不自洽，或宿主调用时限超过总执行时限
 
-ShellError：Shell 执行限额错误，公开结构体--只用于构造期的参数校验
+ShellError：Shell 限额错误，公开结构体--只用于构造期的参数校验
     kind: ShellErrorKind--稳定有限分类
     message: String--稳定有界描述
     impl Clone + PartialEq + Eq + fmt::Display + std::error::Error
 
 ShellErrorKind：Shell 限额错误分类，公开枚举
-    InvalidLimits--限额为零或执行时限为零
+    InvalidLimits--限额为零
 
 PreparedLuaToolCall：待执行的 Lua 工具调用，crate 内公开事件--prepare 与 execute 之间的载荷
     arguments: String--模型给出的原始参数
@@ -228,28 +234,19 @@ PreparedLuaToolCall：待执行的 Lua 工具调用，crate 内公开事件--pre
     response: LuaToolResponseGuard--兜底回执，未显式响应时由 Drop 发出失败结果
     temp_dir: CallTempDir--本次调用的临时目录守卫，随载荷释放而清理
 
-PreparedShellToolCall：待执行的 Shell 工具调用，crate 内公开事件
-    package_root: Arc<PathBuf>--Shell 包目录
-    arguments: String--模型给出的原始参数
-    context: ShellCallContext--执行上下文，含项目根、资源ID、策略与临时目录
-    limits: ShellExecutionLimits--执行限额
-    response: ShellResponseGuard--兜底回执
-    temp_dir: CallTempDir--本次调用的临时目录守卫
-
 LuaTaskError：Lua 异步任务错误，crate 内公开结构体--包装 async_runtime_plugin 的任务错误
-    source: AsyncTaskError--底层任务错误
-    impl From<AsyncTaskError>
-
-ShellTaskError：Shell 异步任务错误，crate 内公开结构体--包装 async_runtime_plugin 的任务错误
     source: AsyncTaskError--底层任务错误
     impl From<AsyncTaskError>
 
 install_lua_environment(lua, handle) -> Result<Table, ToolError>
     注入工具环境：私有函数，注入面只有一个入口函数
-    行为：建 entry 表（version / arguments / context / json）放进 Lua 注册表；
+    行为：建 entry 表（version / arguments / context / json / shell）放进 Lua 注册表；
           把全局 margatroid 设为"返回该表"的函数；arguments 由 run_lua_tool 在调用前填入
-    约束：json 的 encode / decode 用 serde_json 直接实现，不额外注入宿主表；
-          不再有 fs / process / http / json / log 这些表——文件、网络、派生一律走标准库，由沙箱约束
+    注入面：json 的 encode / decode 用 serde_json 直接实现；
+            shell(command, options?) 走 runner 内的终端执行，返回 { exit_code, stdout, truncated, terminal }；
+            agent 未导入 shell 时该函数报"imports no shell"，而不是返回一个空结果
+    约束：不再有 fs / process / http / json / log 这些表——文件、网络、派生一律走标准库，由沙箱约束；
+          命令执行没有走 io.popen，因为管道没有终端、没有可回收的进程组、也没有执行限额
 
 run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError>
     执行 Lua 工具：公开异步函数，插件进程内与 runner 进程共用同一段逻辑
@@ -257,18 +254,20 @@ run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError>
           → 把 arguments 填进入口表 → 加载 main.lua → 调用全局 execute → 结果长度不超过 max_output_bytes
     行为补充：工具包内容由 daemon 读取后随请求下发，沙箱内不再有进程需要读镜像根
     约束：request 携带 metadata、schema、script、temp_dir、arguments、agent_id、turn_id、
-          resource_id、project_root、limits 与 sandbox_policies
+          resource_id、project_root、limits、sandbox_policies 与 shell_script；
+          shell_script 由 host 落地成文件后再传路径，因为 runner 可能处在禁止写暂存区的策略下
 
 spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolError>
     派生 runner 执行工具：私有异步函数
     行为：把请求序列化成 JSON 写 runner 的 stdin，读 stdout 作为工具结果，stderr 用于还原错误
           runner 路径取环境变量 MARGATROID_TOOL_RUNNER，缺省取当前可执行文件同目录下的 tool_runner
           超时用 limits.max_execution_time，输出上限用 limits.max_output_bytes（截断即 ExecutionFailed）
-    边界：runner 无法启动、流失败或超时统一记为 RunnerFailed，与"工具执行失败"严格区分（§5.2 的 runner_failure_hints）
+    边界：runner 无法启动、流失败或超时统一记为 RunnerFailed，与"工具执行失败"严格区分：前者结束当前轮，后者交回模型重试
 
 runner_failure(stderr: &str) -> ToolError
     还原 runner 错误：私有函数，解析 stderr 的 JSON 并映射错误种类
-    行为：kind 为 InvalidRequest / InvalidArguments / InvalidDefinition 时保留原种类，其余与不可解析一律 ExecutionFailed
+    行为：kind 为 InvalidRequest / InvalidArguments / InvalidDefinition / Aborted 时保留原种类，
+          其余与不可解析一律 ExecutionFailed
 
 tool_runner_path() -> Result<PathBuf, ToolError>
     定位 runner：私有函数，先看环境变量，再看当前可执行文件同目录
@@ -279,7 +278,9 @@ tool_runner（src/bin/tool_runner.rs，bin 目标）：独立进程执行 Lua �
     输出：工具返回值原样写 stdout
     退出码：0 成功；2 插件侧问题（InvalidRequest / InvalidArguments / InvalidDefinition）；3 工具执行失败
     stderr：非零退出时输出 {"kind": "...", "message": "..."}，供 spawn_tool_runner 还原
-shell.rs shell_register_system / prepare_shell_call / execute_prepared_shell / shell_task_result_system（每次调用一次性 PTY，stdout 与 stderr 合并）
+shell.rs shell_register_system（只注册 shell 资源，注册结果携带解释器脚本而不带工具身份）
+pty.rs   run_in_pty（分配 PTY 或退回管道执行命令；回收进程组、施加超时与输出限额）
+        说明：终端不可用时退回管道而不是失败，两路输出都会合并成一路交给调用方
 ```
 
 # events
@@ -382,6 +383,8 @@ ToolErrorKind：工具错误分类，公开枚举
     InvalidRequest
     InvalidArguments
     ExecutionFailed
+    RunnerFailed--runner 定位、启动、管道或超时失败：环境问题，重试无益
+    Aborted--工具主动调用 error，表示它无法继续
 
 ToolError：工具错误，公开结构体--稳定分类和有界安全描述
     kind: ToolErrorKind--错误分类，私有
@@ -395,6 +398,21 @@ ToolError：工具错误，公开结构体--稳定分类和有界安全描述
     impl std::error::Error for ToolError
 ```
 
+## 失败之后：继续还是中止
+
+工具失败有两种去向，区别在于模型再试一次是否可能得到不同结果：
+
+```text
+AgentFailure{kind: Agent}：Aborted、RunnerFailed
+    工具声明自己无法继续，或执行工具的 runner 本身坏了。二者都是环境问题，
+    再调用一次不会改变结果，因此结束当前轮，错误留给人工查看。
+AgentMessage::Tool{failed: true}：其余一切
+    命令以非零码退出、脚本拒绝了参数、工具回了 ok = false。
+    模型可以用又一次调用回应，这正是把消息交回给它的理由。
+```
+
+Lua 侧由 `ends_the_turn(ToolErrorKind)` 判定，推理侧由 `AgentFailureKind::Inference` 判定。
+
 # 逻辑
 
 ```text
@@ -407,7 +425,8 @@ Base Lua IMPORT -> MclPlugin -> ToolRegisterRequest
 Base Lua EMIT EFFECT tool_call FROM ? -> MclPlugin -> ToolCallEvent
     -> tool_call_route_system
         -> skill/hook: 同步执行 -> finish_tool_call -> AgentMessage::Tool
-        -> lua/shell: prepare -> 异步执行 -> 异步 guard 发送 AgentMessage::Tool
+        -> lua: prepare -> 异步执行 -> 异步 guard 发送 AgentMessage::Tool
+    说明：shell 不在调用路径上；命令由 Lua 工具的 margatroid().shell 经 runner 执行
     -> AgentPlugin 投递回 Base Lua
 ```
 

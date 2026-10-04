@@ -182,7 +182,8 @@ AgentImage 后续刷新不会改变运行中实例；执行 `workspace reload` �
 
 资源内容不进入可见性数据。WorkspacePlugin 同时挂载 `AgentToolEnvironment`；每次请求由
 WorkspacePlugin 遍历动态可见资源并交给 ToolPlugin 注册工具；具体执行器从
-`AgentToolEnvironment` 取得项目根和镜像根。
+`AgentToolEnvironment` 取得项目根和镜像根。shell 资源不注册为模型工具，IMPORT 时只把解释器脚本
+放入 AgentResourceMap，供 Lua 工具的 `margatroid().shell` 使用。
 
 ```text
 项目级 .margatroid/<资源目录>/<scope>/<name>/<tag>
