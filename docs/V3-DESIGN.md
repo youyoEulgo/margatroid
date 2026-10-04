@@ -42,7 +42,7 @@ crates/margatroid/
 ├── lua_runtime_plugin  Lua VM 创建、调度、宿主函数与邮箱
 ├── mcl_plugin          MCL 命令解析、Block、Effect、推理/工具协调
 ├── inference_plugin    Provider 路由、HTTP 流式推理
-├── tool_plugin         工具调用路由与 skill/hook/lua/shell 执行器
+├── tool_plugin         工具调用路由与 skill/hook/lua 执行器（shell 只供给脚本）
 ├── memory_plugin       SQLite 历史与实时上下文存储
 ├── agent_plugin        Agent 组件、创建、消息投递、生命周期
 └── workspace_plugin    Workspace 运行对象与 Agent 编排
@@ -129,7 +129,7 @@ start
 - ResourceId 格式：`type:scope/name:tag`，默认 tag `latest`。
 - Prompt 依赖：`prompt:<scope>/<name>:<tag>`，文件名为 `<NAME 大写>.md`。
 - Agent 持有 `AgentResourceMap`：资源定义、别名、可见性、默认可见性、可执行工具候选。
-- `tool_plugin` 从 `AgentResourceMap` 和 MCL 可见性生成 Provider ToolSpec；skill/hook/lua/shell 都是 tool handler 的一部分。
+- `tool_plugin` 从 `AgentResourceMap` 和 MCL 可见性生成 Provider ToolSpec；skill、hook 与 lua 是 tool handler，shell 只提供解释器脚本。
 
 ## 9. 工具链
 
@@ -139,7 +139,7 @@ ToolCallEvent
   -> AgentMessage(Tool)
 ```
 
-`tool_plugin` 不再有独立的 `builtin_tool_plugin` 或四个 `tool_definition_plugins`；skill/hook/lua/shell 全部位于 `tool_plugin/src/handler/`。
+`tool_plugin` 不再有独立的 `builtin_tool_plugin` 或四个 `tool_definition_plugins`；skill、hook、lua、shell 与 pty 全部位于 `tool_plugin/src/handler/`。
 
 ## 10. Memory
 

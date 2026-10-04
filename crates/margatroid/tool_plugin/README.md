@@ -24,37 +24,41 @@ daemon（tool_plugin） → spawn tool_runner → 请求走 stdin，结果走 st
 - runner 把工具的返回值原样写 stdout；出错时以非零退出并把 `{"kind", "message"}` 写到 stderr，
   由 `spawn_tool_runner` 还原成同样的 `ToolError`
 - runner 的路径默认取 daemon 可执行文件同目录，可用 `MARGATROID_TOOL_RUNNER` 覆盖
-- runner 起不来、流失败或超时记为 `RunnerFailed`，与"工具执行失败"分开
+- runner 起不来、流失败或超时记为 `RunnerFailed`：这是环境问题，会结束当前轮；
+  工具自身返回的业务失败则留给模型重试
 
-这样做的原因：沙箱只能约束进程，工具执行必须先有一个进程边界，才谈得上把它关进沙箱（下一步）。
+这样做的原因：沙箱只能约束进程，工具执行必须先有一个进程边界，才谈得上把它关进沙箱。
 
-## 沙箱（临时脚手架）
+## 沙箱
 
-工具执行外面可以套一层沙箱，开关**不来自配置**，而是硬编码一个路径：
+沙箱策略来自镜像中的具名 `sandbox` 资源，由 `base.lua` 通过 MCL `IMPORT` 引入，
+再用 `BIND`/`LOAD` 与 `sandbox_use` 选择。每次工具调用都变成：
 
-    /tmp/margatroid-sandbox-policy.json
+```text
+landstrip run -p <镜像策略文件> -- tool_runner
+```
 
-- 这个文件**存在** ⇒ 每次工具调用都变成 `landstrip run -p <该文件> -- tool_runner`，
-  并且 daemon 启动时会先跑 `landstrip doctor` 与 `landstrip policy validate -p <该文件>`，
-  任一失败即拒绝启动（fail-closed）
-- 这个文件**不存在** ⇒ 行为与没有沙箱时完全一致
-- 后端定位顺序：`MARGATROID_SANDBOX_BACKEND` → `PATH` → daemon 可执行文件同目录
-- 两条分支都会 `env_clear()` 后只传 `PATH`，避免把 daemon 的环境（含 token）带给被沙箱化的进程
+后端定位顺序：`MARGATROID_SANDBOX_BACKEND` → `PATH` → daemon 可执行文件同目录。
+策略故障会 fail-closed，不会绕过沙箱执行。
 
-这是刻意的一次性形态：最终的沙箱策略是镜像里的具名资源，由 `base.lua` 用 `IMPORT` 引入、
-再用 MCL 指令启用（见设计文档 §3.1、§5.6）。到那时这个硬编码路径会连同它的校验一起删掉。
+工具进程继承宿主环境的正常 CLI 部分（`HOME`、`PATH`、locale、代理等），
+只剔除名称含 `KEY`、`PASSWORD`、`SECRET`、`TOKEN` 的凭据形变量，并覆盖
+`NO_COLOR`、`TERM`、`PAGER` 与 `GIT_PAGER` 以稳定输出。
 
 ## 工具里能用什么
 
-宿主在工具 VM 里只注入**一个入口函数**：
+宿主在工具 VM 里只注入一个入口函数：
 
 ```lua
-local api = margatroid()   -- { version, arguments, context, json }
+local api = margatroid()   -- { version, arguments, context, json, shell }
 ```
 
 - `arguments`：本次调用的入参（已按 input.schema.json 校验过）
 - `context`：本次轮次与工具包只读元数据（agent / turn / resource / 各层根目录）
 - `json`：`encode` / `decode`
-- 除此之外没有别的注入：读文件、跑程序、出网一律用 Lua 标准库（`io` / `os`），
-  也就是说这些动作全都发生在被沙箱包装的 runner 进程里，由策略决定能不能做
+- `shell(command, options?)`：经 runner 执行命令，返回
+  `{ exit_code, stdout, truncated, terminal }`；pty 不可用时自动退化为 pipe
+- 工具不应使用标准库 `io.popen` 或 `os.execute` 执行命令，因为它们没有统一的
+  pty、进程组回收、超时与输出限额；命令统一走 `margatroid().shell`
+- shell 资源只提供解释器脚本，不是模型可调用的工具；模型看到的是 Lua 工具资源
 

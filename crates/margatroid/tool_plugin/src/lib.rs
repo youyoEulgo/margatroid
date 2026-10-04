@@ -103,8 +103,6 @@ impl Plugin for ToolPlugin {
             .add_system(&self.schedule, tool_call_route_system)
             .add_async_system(&self.schedule, handler::lua::execute_prepared_lua_tool)
             .add_system(&self.schedule, handler::lua::lua_task_result_system)
-            .add_async_system(&self.schedule, handler::shell::execute_prepared_shell)
-            .add_system(&self.schedule, handler::shell::shell_task_result_system)
             .add_system(&self.schedule, cancel_tool_turn_system)
             .add_system(&self.schedule, tool_message_cleanup_system);
     }

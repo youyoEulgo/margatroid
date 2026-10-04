@@ -144,11 +144,6 @@ pub(crate) fn tool_call_route_system(world: &mut World) {
                 if let Err(error) = result {
                     handler::finish_tool_call(world, request, Err(error));
                 }
-            } else if request.tool_id == ResourceId::parse("tool:builtin/shell:latest").unwrap() {
-                let result = handler::shell::prepare_shell_call(world, request.clone());
-                if let Err(error) = result {
-                    handler::finish_tool_call(world, request, Err(error));
-                }
             } else {
                 let error = ToolError::new(
                     ToolErrorKind::ProviderMissing,
