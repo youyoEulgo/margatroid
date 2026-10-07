@@ -176,27 +176,32 @@ while true do
                 append_recent(injected)
             end
         elseif message.type == "user" then
-            append_recent(message)
             mcl_command("EMIT EFFECT start_turn")
+            append_recent(message)
             local reply = mcl_command("EMIT EFFECT inference FROM req")
-            append_recent(reply)
-            maybe_compact(reply)
-            local tool_calls = reply.tool_calls or {}
-            if #tool_calls > 0 then
+            while reply and reply.type == "assistant" do
+                append_recent(reply)
+                maybe_compact(reply)
+                local tool_calls = reply.tool_calls or {}
+                if #tool_calls == 0 then
+                    break
+                end
                 local results = mcl_command("EMIT EFFECT tool_call FROM ?", tool_calls)
                 for _, result in ipairs(results or {}) do
                     append_recent(result)
                 end
-                local final = mcl_command("EMIT EFFECT inference FROM req")
-                append_recent(final)
-                maybe_compact(final)
+                reply = mcl_command("EMIT EFFECT inference FROM req")
             end
-            mcl_command("EMIT EFFECT end_turn")
             mcl_command("EMIT EFFECT finish")
         elseif message.type == "error" then
             mcl_command("EMIT EFFECT history_append FROM ?", message)
         end
     else
-        mcl_wait()
+        mcl_reserve_wait()
+        if mcl_command("GET entry.pending[0]") then
+            mcl_yield()
+        else
+            mcl_wait()
+        end
     end
 end

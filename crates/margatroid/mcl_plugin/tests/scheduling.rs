@@ -6,15 +6,15 @@ use agent_plugin::{
 };
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
-use core_plugin::{App, Entity, Plugin, World};
-use lua_runtime_plugin::{
-    LuaRuntimeHandle, LuaRuntimePlugin, LuaValue, LuaVmId, LuaVmMessageArrived, LuaVmOwner,
-};
+use core_plugin::{App, Entity, World};
+use lua_runtime_plugin::{LuaRuntimeHandle, LuaRuntimePlugin, LuaVmId};
 use margatroid_types::{AgentError, Message, ResourceId, TokenUsage, ToolDefinition};
 use mcl_plugin::{
-    MclCommandId, MclCommandReply, MclCommandRequest, MclDomainRequest, MclEffectCommand,
-    MclOperation, MclPlugin, ENTRY_BLOCK_ID, ENTRY_INNER_ID,
+    MclCommandId, MclCommandReply, MclDomainRequest, MclEffectCommand, MclOperation, MclPlugin,
 };
+
+const ENTRY_BLOCK_ID: &str = "entry";
+const ENTRY_INNER_ID: &str = "pending";
 use resource_id_plugin::ResourceIdPlugin;
 use tool_plugin::ToolPlugin;
 
@@ -112,7 +112,38 @@ fn spawn_agent(world: &mut World, lifecycle: AgentLifecycleState, vm: Option<Lua
             last_error: None,
         },
     );
+    register_probe_tool(world, entity);
     entity
+}
+
+fn register_probe_tool(world: &mut World, agent: Entity) {
+    let resource_id: ResourceId = "tool:local/probe:latest".parse().unwrap();
+    let tool_id: ResourceId = "tool:builtin/skill-loader:latest".parse().unwrap();
+    tool_plugin::register_agent_resource(
+        world,
+        agent,
+        tool_plugin::candidate_resource_entry_with_content(
+            resource_id.clone(),
+            Some("probe".to_owned()),
+            tool_id,
+            tool_plugin::ToolTemplate::new(
+                "probe",
+                "A probe tool.",
+                serde_json::json!({"type": "object"}),
+            )
+            .expect("the probe template is valid"),
+            None,
+        )
+        .expect("the probe entry is valid"),
+    )
+    .expect("the probe tool is registered");
+    if let Some(state) = world.get_component_mut::<Agent>(agent) {
+        state.resources.visible.insert(resource_id);
+        state
+            .resources
+            .default_visible
+            .insert("tool:local/probe:latest".parse().unwrap());
+    }
 }
 
 fn send_effect(app: &mut App, effect: MclEffectCommand) -> Result<(), mcl_plugin::MclError> {
@@ -162,7 +193,7 @@ fn turn_of(world: &World, agent: Entity) -> Option<String> {
 
 #[test]
 fn a_waiting_agent_is_released_by_wake() {
-    let mut app = build_app();
+    let app = build_app();
     let handle = app
         .world()
         .get_resource::<LuaRuntimeHandle>()
@@ -207,7 +238,7 @@ fn one_agent_may_only_wait_once_at_a_time() {
 }
 
 #[test]
-fn the_entry_block_and_inner_have_stable_names() {
+fn the_entry_block_name_is_a_driver_convention_only() {
     assert_eq!(ENTRY_BLOCK_ID, "entry");
     assert_eq!(ENTRY_INNER_ID, "pending");
 }
@@ -228,7 +259,7 @@ fn the_mcl_environment_provides_wait() {
             &["mcl".to_owned()],
             &lua_runtime_plugin::LuaEnvironmentContext {
                 request_id: "test".into(),
-                owner: LuaVmOwner {
+                owner: lua_runtime_plugin::LuaVmOwner {
                     owner_id: "agent:test/coder:latest".into(),
                 },
                 values: Default::default(),
@@ -397,140 +428,6 @@ fn a_turn_can_be_reopened_after_it_closes() {
 }
 
 #[test]
-fn a_delivery_without_a_matching_agent_is_ignored() {
-    let mut app = build_app();
-    app.world_mut().send_event(LuaVmMessageArrived {
-        vm_id: LuaVmId(99),
-        owner: LuaVmOwner {
-            owner_id: "agent:missing/ghost:latest".to_owned(),
-        },
-        value: LuaValue::Nil,
-    });
-    for _ in 0..3 {
-        app.tick();
-    }
-    let deliveries = app
-        .world()
-        .event_reader::<MclCommandRequest>()
-        .into_iter()
-        .count();
-    assert_eq!(deliveries, 0, "nothing is delivered for an unknown agent");
-}
-
-#[test]
-fn a_delivery_targets_the_entry_block() {
-    let mut app = build_app();
-    spawn_agent(
-        app.world_mut(),
-        AgentLifecycleState::Running,
-        Some(LuaVmId(10)),
-    );
-    let envelope = margatroid_types::AgentLuaMessageEnvelope {
-        turn_id: "turn-1".to_owned(),
-        message: margatroid_types::MclMessage::new(
-            Message::User {
-                content: "hello".to_owned(),
-            },
-            None,
-        ),
-    };
-    let value = json_to_lua(serde_json::to_value(&envelope).unwrap());
-    app.world_mut().send_event(LuaVmMessageArrived {
-        vm_id: LuaVmId(10),
-        owner: LuaVmOwner {
-            owner_id: "agent:test/coder:latest".to_owned(),
-        },
-        value,
-    });
-    let mut commands = Vec::new();
-    for _ in 0..4 {
-        app.tick();
-        commands.extend(
-            app.world()
-                .event_reader::<MclCommandRequest>()
-                .into_iter()
-                .map(|request| request.command.clone()),
-        );
-    }
-    assert!(
-        commands
-            .iter()
-            .any(|command| command.contains("entry.pending[-1]")),
-        "the delivery reaches the entry block: {commands:?}"
-    );
-}
-
-#[test]
-fn a_delivery_carries_the_payload_of_the_message() {
-    let mut app = build_app();
-    spawn_agent(
-        app.world_mut(),
-        AgentLifecycleState::Running,
-        Some(LuaVmId(11)),
-    );
-    let envelope = margatroid_types::AgentLuaMessageEnvelope {
-        turn_id: "turn-1".to_owned(),
-        message: margatroid_types::MclMessage::new(
-            Message::User {
-                content: "carried".to_owned(),
-            },
-            None,
-        ),
-    };
-    let value = json_to_lua(serde_json::to_value(&envelope).unwrap());
-    app.world_mut().send_event(LuaVmMessageArrived {
-        vm_id: LuaVmId(11),
-        owner: LuaVmOwner {
-            owner_id: "agent:test/coder:latest".to_owned(),
-        },
-        value,
-    });
-    let mut payloads = Vec::new();
-    for _ in 0..4 {
-        app.tick();
-        payloads.extend(
-            app.world()
-                .event_reader::<MclCommandRequest>()
-                .into_iter()
-                .filter_map(|request| request.binding.clone()),
-        );
-    }
-    let carried = payloads
-        .iter()
-        .any(|payload| payload.get("content").and_then(|v| v.as_str()) == Some("carried"));
-    assert!(
-        carried,
-        "the message content reaches the entry block: {payloads:?}"
-    );
-}
-
-#[test]
-fn a_malformed_delivery_is_ignored() {
-    let mut app = build_app();
-    spawn_agent(
-        app.world_mut(),
-        AgentLifecycleState::Running,
-        Some(LuaVmId(12)),
-    );
-    app.world_mut().send_event(LuaVmMessageArrived {
-        vm_id: LuaVmId(12),
-        owner: LuaVmOwner {
-            owner_id: "agent:test/coder:latest".to_owned(),
-        },
-        value: LuaValue::String("not an envelope".to_owned()),
-    });
-    for _ in 0..3 {
-        app.tick();
-    }
-    let deliveries = app
-        .world()
-        .event_reader::<MclCommandRequest>()
-        .into_iter()
-        .count();
-    assert_eq!(deliveries, 0, "a malformed message is not delivered");
-}
-
-#[test]
 fn the_runtime_is_reachable_from_the_world_after_a_tick() {
     let mut app = build_app();
     for _ in 0..3 {
@@ -539,23 +436,274 @@ fn the_runtime_is_reachable_from_the_world_after_a_tick() {
     assert!(app.world().get_resource::<LuaRuntimeHandle>().is_some());
 }
 
-fn json_to_lua(value: serde_json::Value) -> LuaValue {
-    match value {
-        serde_json::Value::Null => LuaValue::Nil,
-        serde_json::Value::Bool(value) => LuaValue::Boolean(value),
-        serde_json::Value::Number(value) => match value.as_i64() {
-            Some(value) => LuaValue::Integer(value),
-            None => LuaValue::Number(value.as_f64().unwrap_or_default()),
+fn send_tool_call(
+    app: &mut App,
+    calls: Vec<margatroid_types::ToolCall>,
+) -> (
+    Option<Result<mcl_plugin::MclCommandValue, mcl_plugin::MclError>>,
+    String,
+) {
+    let (sender, mut receiver) = tokio::sync::oneshot::channel();
+    let command_id = MclCommandId::new("tool-1").unwrap();
+    app.world_mut().send_event(MclDomainRequest {
+        id: command_id.clone(),
+        source: "agent:test/coder:latest".to_owned(),
+        agent_id: "agent:test/coder:latest".parse().unwrap(),
+        operation: MclOperation::Emit {
+            effect: MclEffectCommand::ToolCall { calls },
         },
-        serde_json::Value::String(value) => LuaValue::String(value),
-        serde_json::Value::Array(values) => {
-            LuaValue::Array(values.into_iter().map(json_to_lua).collect())
-        }
-        serde_json::Value::Object(values) => LuaValue::Object(
-            values
-                .into_iter()
-                .map(|(key, value)| (key, json_to_lua(value)))
-                .collect(),
-        ),
+        reply: MclCommandReply::new(sender),
+    });
+    let effect_id = "mcl-effect:tool-1".to_owned();
+    for _ in 0..3 {
+        app.tick();
     }
+    let mut answered = None;
+    for _ in 0..3 {
+        app.tick();
+        if let Ok(result) = receiver.try_recv() {
+            answered = Some(result);
+            break;
+        }
+    }
+    (answered, effect_id)
+}
+
+fn call(id: &str, name: &str) -> margatroid_types::ToolCall {
+    margatroid_types::ToolCall {
+        id: id.to_owned(),
+        tool_name: name.to_owned(),
+        arguments: "{}".to_owned(),
+    }
+}
+
+#[test]
+fn a_tool_call_is_answered_by_a_real_executor() {
+    let mut app = build_app();
+    spawn_agent(
+        app.world_mut(),
+        AgentLifecycleState::Running,
+        Some(LuaVmId(30)),
+    );
+    send_effect(&mut app, MclEffectCommand::StartTurn).expect("a turn starts");
+    let (answered, _effect_id) = send_tool_call(&mut app, vec![call("call-1", "probe")]);
+    let result = answered.expect("a real executor answers the call");
+    assert!(result.is_ok(), "the caller receives a result: {result:?}");
+    let pending = app
+        .world()
+        .get_resource::<mcl_plugin::PendingMclEffects>()
+        .map(|pending| pending.effects.is_empty())
+        .unwrap_or(true);
+    assert!(pending, "the call is forgotten once answered");
+}
+
+#[test]
+fn a_tool_call_result_carries_the_tool_call_id() {
+    let mut app = build_app();
+    spawn_agent(
+        app.world_mut(),
+        AgentLifecycleState::Running,
+        Some(LuaVmId(31)),
+    );
+    send_effect(&mut app, MclEffectCommand::StartTurn).expect("a turn starts");
+    let (answered, _effect_id) = send_tool_call(&mut app, vec![call("call-1", "probe")]);
+    let result = answered.expect("the call is answered");
+    let margatroid_types::BlockInner::Message(messages) = inner_of(&result) else {
+        panic!("a tool answer carries messages");
+    };
+    assert_eq!(messages.len(), 1, "one call yields one message");
+    let margatroid_types::Message::Tool { tool_call_id, .. } = &messages[0].message else {
+        panic!("the answer is a tool message");
+    };
+    assert_eq!(tool_call_id, "call-1", "the answer is tied to its call");
+}
+
+#[test]
+fn a_batch_returns_one_message_per_call() {
+    let mut app = build_app();
+    spawn_agent(
+        app.world_mut(),
+        AgentLifecycleState::Running,
+        Some(LuaVmId(32)),
+    );
+    send_effect(&mut app, MclEffectCommand::StartTurn).expect("a turn starts");
+    let (answered, _effect_id) = send_tool_call(
+        &mut app,
+        vec![call("call-1", "probe"), call("call-2", "probe")],
+    );
+    let result = answered.expect("the batch is answered");
+    let margatroid_types::BlockInner::Message(messages) = inner_of(&result) else {
+        panic!("a batch answer carries messages");
+    };
+    assert_eq!(messages.len(), 2, "every call in the batch is answered");
+}
+
+#[test]
+fn an_unknown_tool_is_rejected_with_a_failed_message() {
+    let mut app = build_app();
+    spawn_agent(
+        app.world_mut(),
+        AgentLifecycleState::Running,
+        Some(LuaVmId(33)),
+    );
+    send_effect(&mut app, MclEffectCommand::StartTurn).expect("a turn starts");
+    let (answered, _effect_id) = send_tool_call(&mut app, vec![call("call-1", "not-visible")]);
+    let result = answered.expect("a rejected call is answered immediately");
+    let margatroid_types::BlockInner::Message(messages) = inner_of(&result) else {
+        panic!("a rejection carries messages");
+    };
+    let margatroid_types::Message::Tool {
+        failed, content, ..
+    } = &messages[0].message
+    else {
+        panic!("the rejection is a tool message");
+    };
+    assert!(failed, "the rejection is marked failed");
+    assert!(content.contains("not visible"), "content: {content}");
+}
+
+fn inner_of(
+    result: &Result<mcl_plugin::MclCommandValue, mcl_plugin::MclError>,
+) -> margatroid_types::BlockInner {
+    match result.as_ref().expect("the call succeeded") {
+        mcl_plugin::MclCommandValue::Inner(inner) => inner.clone(),
+        other => panic!("expected an inner value, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_tool_error_answers_the_caller_and_reports_failure() {
+    let mut app = build_app();
+    let agent = spawn_agent(
+        app.world_mut(),
+        AgentLifecycleState::Running,
+        Some(LuaVmId(34)),
+    );
+    send_effect(&mut app, MclEffectCommand::StartTurn).expect("a turn starts");
+    let (_answered, effect_id) = send_tool_call(&mut app, vec![call("call-1", "probe")]);
+    app.world_mut()
+        .send_event(margatroid_types::MclEffectReply {
+            id: effect_id,
+            agent,
+            result: Err("the runner died".to_owned()),
+            usage: None,
+        });
+    for _ in 0..3 {
+        app.tick();
+    }
+}
+
+#[test]
+fn an_unknown_tool_is_rejected_without_waiting() {
+    let mut app = build_app();
+    spawn_agent(
+        app.world_mut(),
+        AgentLifecycleState::Running,
+        Some(LuaVmId(35)),
+    );
+    send_effect(&mut app, MclEffectCommand::StartTurn).expect("a turn starts");
+    let (answered, _effect_id) = send_tool_call(&mut app, vec![call("call-1", "not-visible")]);
+    assert!(
+        answered.is_some(),
+        "a rejected call answers immediately instead of waiting"
+    );
+}
+
+#[test]
+fn a_tool_call_without_a_turn_is_rejected() {
+    let mut app = build_app();
+    spawn_agent(
+        app.world_mut(),
+        AgentLifecycleState::Running,
+        Some(LuaVmId(36)),
+    );
+    let error = send_effect(
+        &mut app,
+        MclEffectCommand::ToolCall {
+            calls: vec![call("call-1", "probe")],
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, mcl_plugin::MclError::TurnMissing));
+}
+
+#[test]
+fn an_empty_tool_batch_is_rejected() {
+    let mut app = build_app();
+    spawn_agent(
+        app.world_mut(),
+        AgentLifecycleState::Running,
+        Some(LuaVmId(37)),
+    );
+    send_effect(&mut app, MclEffectCommand::StartTurn).expect("a turn starts");
+    let error =
+        send_effect(&mut app, MclEffectCommand::ToolCall { calls: Vec::new() }).unwrap_err();
+    assert!(matches!(error, mcl_plugin::MclError::ToolCallInvalid));
+}
+
+#[test]
+fn ending_a_turn_with_a_tracked_tool_call_is_rejected() {
+    let mut app = build_app();
+    let agent = spawn_agent(
+        app.world_mut(),
+        AgentLifecycleState::Running,
+        Some(LuaVmId(38)),
+    );
+    send_effect(&mut app, MclEffectCommand::StartTurn).expect("a turn starts");
+    let turn = turn_of(app.world(), agent).expect("the turn is open");
+    if let Some(state) = app.world_mut().get_component_mut::<Agent>(agent) {
+        state.tools.pending.insert(
+            (agent, turn.clone(), "call-1".to_owned()),
+            agent_plugin::AgentToolPending {
+                turn_id: turn,
+                tool_call_id: "call-1".to_owned(),
+                resource_id: "tool:local/probe:latest".parse().unwrap(),
+                tool_id: "tool:builtin/skill-loader:latest".parse().unwrap(),
+            },
+        );
+    }
+    let error = send_effect(&mut app, MclEffectCommand::EndTurn).unwrap_err();
+    assert!(matches!(error, mcl_plugin::MclError::EffectInvalid));
+}
+
+#[test]
+fn cancelling_a_suspended_agent_drops_its_wait() {
+    let app = build_app();
+    let handle = app
+        .world()
+        .get_resource::<LuaRuntimeHandle>()
+        .cloned()
+        .expect("the Lua runtime is installed");
+    let mut waiting = handle
+        .suspend("agent:test/coder:latest".into())
+        .expect("the agent may wait");
+    handle.forget_suspension("agent:test/coder:latest");
+    assert!(
+        waiting.try_recv().is_err(),
+        "the released wait never reports a wake"
+    );
+    assert!(
+        handle.wake("agent:test/coder:latest").is_err(),
+        "nothing is left to wake"
+    );
+}
+
+#[test]
+fn a_reservation_survives_until_it_is_claimed_or_dropped() {
+    let app = build_app();
+    let handle = app
+        .world()
+        .get_resource::<LuaRuntimeHandle>()
+        .cloned()
+        .expect("the Lua runtime is installed");
+    handle
+        .reserve_suspension("agent:test/coder:latest")
+        .expect("the reservation succeeds");
+    handle.forget_suspension("agent:test/coder:latest");
+    assert!(
+        handle.is_reserved("agent:test/coder:latest"),
+        "forgetting a wait does not clear a reservation"
+    );
+    handle.drop_reservation("agent:test/coder:latest");
+    assert!(!handle.is_reserved("agent:test/coder:latest"));
 }

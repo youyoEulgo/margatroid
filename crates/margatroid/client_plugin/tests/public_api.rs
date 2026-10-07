@@ -12,7 +12,7 @@ use dto_plugin::{DtoPlugin, WebSocketMessageSend};
 use futures_util::{SinkExt, StreamExt};
 use log_plugin::LogPlugin;
 use margatroid_protocol::{ClientMessage, LogRecordDto, ServerMessage, WorkspaceReferenceDto};
-use margatroid_types::{Message, ResourceId, RouteAgentMessage};
+use margatroid_types::{ResourceId, RouteMclCommand};
 use resource_id_plugin::ResourceIdPlugin;
 use server_plugin::{ServerHandle, ServerPlugin};
 
@@ -80,12 +80,9 @@ fn registered_client_receives_messages_targeted_by_type() {
     let mut app = build_app();
     app.add_system(RuntimePlugin::UPDATE, |world: &mut World| {
         let requests = world
-            .event_reader::<RouteAgentMessage>()
+            .event_reader::<RouteMclCommand>()
             .into_iter()
-            .filter_map(|request| match &request.message {
-                Message::User { content, .. } => Some(content.clone()),
-                _ => None,
-            })
+            .map(|request| request.command.clone())
             .collect::<Vec<_>>();
         for content in requests {
             world.send_event(WebSocketMessageSend {
@@ -112,11 +109,12 @@ fn registered_client_receives_messages_targeted_by_type() {
             let registration =
                 serde_json::to_string(&ClientMessage::register_connection("register-1", "webui"))
                     .unwrap();
-            let message = serde_json::to_string(&ClientMessage::agent_message(
+            let message = serde_json::to_string(&ClientMessage::mcl_command(
                 "message-1",
                 &WorkspaceReferenceDto::new("demo", "/tmp/demo"),
                 None,
                 "routed",
+                None,
             ))
             .unwrap();
             socket
@@ -329,15 +327,12 @@ fn requests_are_ignored_until_the_connection_registers() {
     {
         let dispatched = Arc::clone(&dispatched);
         app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
-            let contents = world
-                .event_reader::<RouteAgentMessage>()
+            let commands = world
+                .event_reader::<RouteMclCommand>()
                 .into_iter()
-                .filter_map(|request| match &request.message {
-                    Message::User { content, .. } => Some(content.clone()),
-                    _ => None,
-                })
+                .map(|request| request.command.clone())
                 .collect::<Vec<_>>();
-            dispatched.lock().unwrap().extend(contents);
+            dispatched.lock().unwrap().extend(commands);
         });
     }
     let address = start(&mut app);
@@ -349,11 +344,12 @@ fn requests_are_ignored_until_the_connection_registers() {
                 "ws://{address}/ws"
             )))
             .unwrap();
-        let before = serde_json::to_string(&ClientMessage::agent_message(
+        let before = serde_json::to_string(&ClientMessage::mcl_command(
             "before-registration",
             &WorkspaceReferenceDto::new("demo", "/tmp/demo"),
             None,
             "before-registration",
+            None,
         ))
         .unwrap();
         runtime
@@ -382,11 +378,12 @@ fn requests_are_ignored_until_the_connection_registers() {
                 }
             }
         });
-        let after = serde_json::to_string(&ClientMessage::agent_message(
+        let after = serde_json::to_string(&ClientMessage::mcl_command(
             "after-registration",
             &WorkspaceReferenceDto::new("demo", "/tmp/demo"),
             None,
             "after-registration",
+            None,
         ))
         .unwrap();
         runtime

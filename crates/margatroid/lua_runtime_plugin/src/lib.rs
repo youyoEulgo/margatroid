@@ -4,7 +4,7 @@ mod handler;
 mod system;
 mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
@@ -24,7 +24,6 @@ pub use types::{
 
 use crate::system::{
     lua_runtime_cancel_system, lua_runtime_request_system, lua_runtime_result_system,
-    lua_vm_message_system, lua_vm_receive_system,
 };
 use crate::types::LuaRuntimeState;
 
@@ -81,14 +80,13 @@ impl Plugin for LuaRuntimePlugin {
             events,
             environments,
             suspended: Arc::new(Mutex::new(HashMap::new())),
+            reserved: Arc::new(Mutex::new(HashSet::new())),
         });
         app.world_mut().insert_resource(self.config);
         app.world_mut().insert_resource(LuaRuntimeState::default());
         app.world_mut().insert_resource(LuaRuntimePluginInstalled);
         app.add_system(&self.schedule, lua_runtime_request_system)
             .add_system(&self.schedule, lua_runtime_cancel_system)
-            .add_system(&self.schedule, lua_vm_message_system)
-            .add_system(&self.schedule, lua_vm_receive_system)
             .add_system(&self.schedule, lua_runtime_result_system);
     }
 }

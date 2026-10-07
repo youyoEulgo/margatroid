@@ -200,6 +200,12 @@ impl LuaToolResponseGuard {
                 None => (output, false),
             },
             Err(error) if ends_the_turn(error.kind()) => {
+                self.events.send_event(margatroid_types::MclEffectReply {
+                    id: locator.turn_id.clone(),
+                    agent: locator.agent,
+                    result: Err(error.to_string()),
+                    usage: None,
+                });
                 self.events.send_event(margatroid_types::AgentFailure {
                     id: locator.turn_id,
                     agent: locator.agent,
@@ -210,15 +216,15 @@ impl LuaToolResponseGuard {
             }
             Err(error) => (error.to_string(), true),
         };
-        self.events.send_event(margatroid_types::AgentMessage {
+        self.events.send_event(margatroid_types::MclEffectReply {
             id: locator.turn_id,
             agent: locator.agent,
-            message: margatroid_types::Message::Tool {
+            result: Ok(margatroid_types::Message::Tool {
                 resource_id: locator.resource_id,
                 tool_call_id: locator.tool_call_id,
                 content,
                 failed,
-            },
+            }),
             usage: None,
         });
     }
@@ -229,10 +235,10 @@ impl Drop for LuaToolResponseGuard {
         let Some(locator) = self.locator.take() else {
             return;
         };
-        self.events.send_event(margatroid_types::AgentMessage {
+        self.events.send_event(margatroid_types::MclEffectReply {
             id: locator.turn_id,
             agent: locator.agent,
-            message: margatroid_types::Message::Tool {
+            result: Ok(margatroid_types::Message::Tool {
                 resource_id: locator.resource_id,
                 tool_call_id: locator.tool_call_id,
                 content: ToolError::new(
@@ -241,7 +247,7 @@ impl Drop for LuaToolResponseGuard {
                 )
                 .to_string(),
                 failed: true,
-            },
+            }),
             usage: None,
         });
     }

@@ -16,14 +16,12 @@ pub use error::{failure, AgentCreateResult, AgentFailureKind};
 pub use events::*;
 pub use handler::{
     control_stop, handle_agent_control, handle_agent_create, handle_agent_initialization_completed,
-    handle_agent_message, handle_lua_vm_finished, handle_lua_vm_started,
+    handle_lua_vm_finished, handle_lua_vm_started,
 };
 pub use margatroid_types::{
     AgentError, AgentErrorKind, AgentLuaMessageEnvelope, AgentMessage, MclMessage,
 };
-pub use system::{
-    agent_control_system, agent_create_system, agent_lua_vm_state_system, agent_message_system,
-};
+pub use system::{agent_control_system, agent_create_system, agent_lua_vm_state_system};
 pub use types::*;
 
 #[derive(Clone, Debug)]
@@ -110,7 +108,6 @@ impl Plugin for AgentPlugin {
 
         app.add_system(&self.schedule, agent_create_system)
             .add_system(&self.schedule, agent_control_system)
-            .add_system(&self.schedule, agent_message_system)
             .add_system(&self.schedule, agent_lua_vm_state_system);
     }
 }

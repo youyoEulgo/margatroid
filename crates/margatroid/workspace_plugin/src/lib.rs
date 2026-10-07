@@ -25,7 +25,7 @@ pub use events::*;
 use system::{
     begin_workspace_command_system, collect_agent_image_system,
     collect_agent_initialization_system, collect_mcl_command_response_system,
-    route_agent_message_system, route_agent_turn_abort_system, route_mcl_command_system,
+    route_agent_turn_abort_system, route_mcl_command_system,
 };
 pub use types::{WorkspaceAgentState, WorkspaceRegistry};
 
@@ -131,7 +131,6 @@ impl Plugin for WorkspacePlugin {
             ..WorkspaceRegistry::default()
         });
         app.add_system(&self.schedule, begin_workspace_command_system)
-            .add_system(&self.schedule, route_agent_message_system)
             .add_system(&self.schedule, route_agent_turn_abort_system)
             .add_system(&self.schedule, route_mcl_command_system)
             .add_system(&self.schedule, collect_mcl_command_response_system)

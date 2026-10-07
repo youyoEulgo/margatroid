@@ -6,9 +6,9 @@ use agent_plugin::{Agent, HistoryMessage};
 use core_plugin::{Entity, World};
 use log_plugin::{TracingField, TracingRecord};
 use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, RouteAgentMessage,
-    RouteAgentTurnAbort, RouteMclCommand, StartWorkspace, ToolCall, WorkspaceAgentDefinition,
-    WorkspaceDefinition, WorkspaceReference,
+    AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, RouteAgentTurnAbort,
+    RouteMclCommand, StartWorkspace, ToolCall, WorkspaceAgentDefinition, WorkspaceDefinition,
+    WorkspaceReference,
 };
 
 use serde::{Deserialize, Serialize};
@@ -70,11 +70,6 @@ pub enum ClientMessage {
     WorkspaceStop {
         id: String,
         message: StopWorkspaceDto,
-    },
-    #[serde(rename = "agent.message")]
-    AgentMessage {
-        id: String,
-        message: RouteAgentMessageDto,
     },
     #[serde(rename = "mcl.command")]
     MclCommand { id: String, message: MclCommandDto },
@@ -380,13 +375,6 @@ impl IntoDomain<StopWorkspaceByReference, String> for StopWorkspaceDto {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RouteAgentMessageDto {
-    pub workspace: WorkspaceReferenceDto,
-    pub agent: Option<ResourceIdDto>,
-    pub message: MessageDto,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MclCommandDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: Option<ResourceIdDto>,
@@ -434,17 +422,6 @@ impl
 pub struct RouteAgentTargetDto {
     pub workspace: WorkspaceReferenceDto,
     pub agent: Option<ResourceIdDto>,
-}
-
-impl IntoDomain<RouteAgentMessage, String> for RouteAgentMessageDto {
-    fn into_domain(self, id: String) -> Result<RouteAgentMessage, ProtocolError> {
-        Ok(RouteAgentMessage {
-            id,
-            workspace: self.workspace.into_domain(())?,
-            agent: self.agent.map(|agent| agent.into_domain(())).transpose()?,
-            message: self.message.into_domain(())?,
-        })
-    }
 }
 
 impl IntoDomain<RouteAgentTurnAbort, String> for RouteAgentTargetDto {
@@ -502,20 +479,20 @@ impl ClientMessage {
         }
     }
 
-    pub fn agent_message(
+    pub fn mcl_command(
         id: impl Into<String>,
         workspace: &WorkspaceReferenceDto,
         agent: Option<ResourceIdDto>,
-        content: impl Into<String>,
+        command: impl Into<String>,
+        binding: Option<serde_json::Value>,
     ) -> Self {
-        Self::AgentMessage {
+        Self::MclCommand {
             id: id.into(),
-            message: RouteAgentMessageDto {
+            message: MclCommandDto {
                 workspace: workspace.clone(),
                 agent,
-                message: MessageDto::User {
-                    content: content.into(),
-                },
+                command: command.into(),
+                binding,
             },
         }
     }
@@ -764,6 +741,21 @@ impl FromDomain<&AgentMessage, &World> for AgentMessageDto {
             workspace,
             agent,
             message: (&message.message).into_dto(())?,
+        })
+    }
+}
+
+impl FromDomain<&margatroid_types::AgentConversationObserved, &World> for AgentMessageDto {
+    fn from_domain(
+        observed: &margatroid_types::AgentConversationObserved,
+        world: &World,
+    ) -> Result<Self, ProtocolError> {
+        let (workspace, agent) = agent_route(world, observed.agent)?;
+        Ok(Self {
+            id: observed.turn_id.clone(),
+            workspace,
+            agent,
+            message: (&observed.message.message).into_dto(())?,
         })
     }
 }

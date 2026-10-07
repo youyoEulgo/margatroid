@@ -219,14 +219,6 @@ pub struct StartWorkspace {
 impl Event for StartWorkspace {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RouteAgentMessage {
-    pub id: String,
-    pub workspace: WorkspaceReference,
-    pub agent: Option<ResourceId>,
-    pub message: Message,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteAgentTurnAbort {
     pub id: String,
     pub workspace: WorkspaceReference,
@@ -254,8 +246,6 @@ pub struct RouteAgentWorkflowDetach {
 }
 
 impl Event for RouteAgentWorkflowDetach {}
-
-impl Event for RouteAgentMessage {}
 
 #[derive(Clone, Debug)]
 pub struct RouteMclCommand {
@@ -329,6 +319,15 @@ pub struct AgentMessage {
 }
 
 impl Event for AgentMessage {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentConversationObserved {
+    pub agent: Entity,
+    pub turn_id: String,
+    pub message: MclMessage,
+}
+
+impl Event for AgentConversationObserved {}
 
 #[derive(Clone, Debug)]
 pub struct InferenceRequestEvent {

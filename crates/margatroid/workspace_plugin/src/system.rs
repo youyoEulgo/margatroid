@@ -9,10 +9,7 @@ use agent_plugin::{
 use app_runtime_plugin::WorldEventExt;
 use core_plugin::World;
 use lua_runtime_plugin::LuaProgram;
-use margatroid_types::{
-    AgentMessage, ResourceId, RouteAgentMessage, RouteAgentTurnAbort, RouteMclCommand,
-    StartWorkspace,
-};
+use margatroid_types::{ResourceId, RouteAgentTurnAbort, RouteMclCommand, StartWorkspace};
 use memory_plugin::AgentMemory;
 use resource_id_plugin::WorldResourceIdExt;
 
@@ -97,30 +94,6 @@ pub(crate) fn begin_workspace_command_system(world: &mut World) {
             previous: request.workspace,
             result,
         });
-    }
-}
-
-pub(crate) fn route_agent_message_system(world: &mut World) {
-    let events = world
-        .event_reader::<RouteAgentMessage>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    for event in events {
-        let workspace = world.entity_by_resource_id(&event.workspace.id).ok();
-        let agent = event
-            .agent
-            .as_ref()
-            .and_then(|id| world.entity_by_resource_id(id).ok())
-            .or_else(|| workspace.and_then(|id| world.workspace_manager(id)));
-        if let Some(agent) = agent {
-            world.send_event(AgentMessage {
-                id: event.id,
-                agent,
-                message: event.message,
-                usage: None,
-            });
-        }
     }
 }
 
