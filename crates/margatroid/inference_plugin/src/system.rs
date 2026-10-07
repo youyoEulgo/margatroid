@@ -35,7 +35,7 @@ pub(crate) fn prepare_inference_system(world: &mut World) {
             agent_id: command.agent_id,
             messages: command.messages,
             tools: command.tools,
-            output: InferenceOutputKind::AgentMessage,
+            output: InferenceOutputKind::MclReply,
         })
         .collect::<Vec<_>>();
     commands.extend(

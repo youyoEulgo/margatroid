@@ -149,7 +149,7 @@ local function maybe_compact(message)
     end
     if message.usage.input_tokens >= COMPACTION_CONTEXT_LIMIT then
         move_old_recent_messages()
-        local summary = mcl_command("EMIT EFFECT catch_inference FROM com")
+        local summary = mcl_command("EMIT EFFECT inference FROM com")
         mcl_command("INJECT ? TO msg.compact_context", {
             type = "user",
             content = summary,
@@ -160,30 +160,43 @@ local function maybe_compact(message)
     end
 end
 
+mcl_command([[
+    CREATE BLOCK entry (
+        pending MESSAGE,
+    )
+]])
+mcl_command("EMIT EFFECT ready")
+
 while true do
-    local message = mcl_command("EMIT EFFECT start")
-    if message.type == "inject" then
-        for _, injected in ipairs(message.messages or {}) do
-            append_recent(injected)
-        end
-    elseif message.type == "user" then
-        append_recent(message)
-        mcl_command("EMIT EFFECT inference FROM req")
-    elseif message.type == "assistant" then
-        append_recent(message)
-        maybe_compact(message)
-        local tool_calls = message.tool_calls or {}
-        if #tool_calls > 0 then
-            mcl_command("EMIT EFFECT tool_call FROM ?", tool_calls)
-        else
+    local message = mcl_command("GET entry.pending[0]")
+    if message then
+        mcl_command("INJECT [] TO entry.pending[0, 1]")
+        if message.type == "inject" then
+            for _, injected in ipairs(message.messages or {}) do
+                append_recent(injected)
+            end
+        elseif message.type == "user" then
+            append_recent(message)
+            mcl_command("EMIT EFFECT start_turn")
+            local reply = mcl_command("EMIT EFFECT inference FROM req")
+            append_recent(reply)
+            maybe_compact(reply)
+            local tool_calls = reply.tool_calls or {}
+            if #tool_calls > 0 then
+                local results = mcl_command("EMIT EFFECT tool_call FROM ?", tool_calls)
+                for _, result in ipairs(results or {}) do
+                    append_recent(result)
+                end
+                local final = mcl_command("EMIT EFFECT inference FROM req")
+                append_recent(final)
+                maybe_compact(final)
+            end
+            mcl_command("EMIT EFFECT end_turn")
             mcl_command("EMIT EFFECT finish")
+        elseif message.type == "error" then
+            mcl_command("EMIT EFFECT history_append FROM ?", message)
         end
-    elseif message.type == "tool" then
-        append_recent(message)
-        if all_tool_calls_completed() then
-            mcl_command("EMIT EFFECT inference FROM req")
-        end
-    elseif message.type == "error" then
-        mcl_command("EMIT EFFECT history_append FROM ?", message)
+    else
+        mcl_wait()
     end
 end

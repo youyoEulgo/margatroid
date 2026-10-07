@@ -64,7 +64,7 @@ pub(crate) struct InferenceRoute {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InferenceOutputKind {
-    AgentMessage,
+    MclReply,
     ContextCompaction,
     Captured,
 }

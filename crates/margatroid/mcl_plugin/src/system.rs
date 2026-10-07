@@ -1,24 +1,24 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use agent_plugin::{Agent, AgentInferencePending, AgentInitializationCompleted};
+use agent_plugin::{Agent, AgentInitializationCompleted};
 use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Plugin, Resource, World};
 use lua_runtime_plugin::{
     CancellationToken, HostFuture, LuaBindingValue, LuaEnvironment, LuaEnvironmentContext,
     LuaEnvironmentProvider, LuaGlobalBinding, LuaHostFunction, LuaRuntimeError, LuaRuntimeHandle,
-    LuaValue, LuaVmMessageReceived,
+    LuaValue, LuaVmMessageArrived,
 };
 use margatroid_types::{
-    AgentFailure, AgentMessage, CapturedInferenceRequest, CapturedInferenceResponse,
-    InferenceRequestEvent, Message, ResourceId, ToolCall, ToolCallEvent,
+    AgentFailure, AgentMessage, CapturedInferenceResponse, InferenceRequestEvent, Message,
+    ResourceId, ToolCall, ToolCallEvent,
 };
 use resource_id_plugin::ResourceIdPluginInstalled;
 use resource_id_plugin::WorldResourceIdExt;
 use std::sync::Arc;
 use tool_plugin::ToolPluginInstalled;
 use tool_plugin::{
-    register_agent_resource, resolve_agent_tool_definitions, ResourceContent, ResourceMapEntry,
-    ToolRegisterRequest, ToolRegisterResponse,
+    register_agent_resource, ResourceContent, ResourceMapEntry, ToolRegisterRequest,
+    ToolRegisterResponse,
 };
 
 use crate::{
@@ -36,6 +36,21 @@ pub struct PendingMclEffects {
     pub effects: HashMap<String, crate::MclEffectState>,
 }
 impl Resource for PendingMclEffects {}
+
+pub struct PendingAgentDelivery {
+    pub agent: core_plugin::Entity,
+    pub vm_id: margatroid_types::LuaVmId,
+    pub receiver: tokio::sync::oneshot::Receiver<Result<crate::MclDomainValue, MclError>>,
+}
+
+#[derive(Default)]
+pub struct PendingAgentDeliveries {
+    pub deliveries: HashMap<String, PendingAgentDelivery>,
+}
+impl Resource for PendingAgentDeliveries {}
+
+pub const ENTRY_BLOCK_ID: &str = "entry";
+pub const ENTRY_INNER_ID: &str = "pending";
 
 pub struct MclPlugin {
     schedule: String,
@@ -81,22 +96,33 @@ impl Plugin for MclPlugin {
             .insert_resource(PendingMclImports::default());
         app.world_mut()
             .insert_resource(PendingMclEffects::default());
+        app.world_mut()
+            .insert_resource(PendingAgentDeliveries::default());
         let events = app.world().event_sender();
-        app.world()
+        let runtime = app
+            .world()
             .get_resource::<LuaRuntimeHandle>()
             .expect("MclPlugin requires LuaRuntimePlugin")
-            .register_provider(Box::new(MclEnvironmentProvider { events }))
+            .clone();
+        runtime
+            .register_provider(Box::new(MclEnvironmentProvider {
+                events,
+                runtime: runtime.clone(),
+            }))
             .expect("mcl provider registration failed");
-        app.add_system(&self.schedule, mcl_command_request_system)
+        app.add_system(&self.schedule, mcl_agent_delivery_system)
+            .add_system(&self.schedule, mcl_command_request_system)
             .add_system(&self.schedule, mcl_domain_system)
             .add_system(&self.schedule, mcl_import_response_system)
             .add_system(&self.schedule, mcl_effect_response_system)
+            .add_system(&self.schedule, mcl_agent_delivery_response_system)
             .add_system(&self.schedule, mcl_command_reply_system);
     }
 }
 
 pub(crate) struct MclEnvironmentProvider {
     events: RuntimeEventSender,
+    runtime: LuaRuntimeHandle,
 }
 impl LuaEnvironmentProvider for MclEnvironmentProvider {
     fn name(&self) -> &str {
@@ -117,8 +143,52 @@ impl LuaEnvironmentProvider for MclEnvironmentProvider {
                         events: self.events.clone(),
                     })),
                 },
+                LuaGlobalBinding {
+                    name: "mcl_wait".into(),
+                    binding: LuaBindingValue::Function(Arc::new(MclWaitFunction {
+                        runtime: self.runtime.clone(),
+                    })),
+                },
             ],
             modules: Vec::new(),
+        })
+    }
+}
+
+struct MclWaitFunction {
+    runtime: LuaRuntimeHandle,
+}
+
+impl LuaHostFunction for MclWaitFunction {
+    fn call(
+        &self,
+        arguments: LuaValue,
+        context: LuaEnvironmentContext,
+        cancel: CancellationToken,
+    ) -> HostFuture {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            match &arguments {
+                LuaValue::Nil => {}
+                LuaValue::Array(values) if values.is_empty() => {}
+                _ => {
+                    return Err(LuaRuntimeError::InvalidRequest(
+                        "mcl_wait takes no arguments".into(),
+                    ))
+                }
+            }
+            let owner = context.owner.owner_id.clone();
+            let receiver = runtime.suspend(owner.clone())?;
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    runtime.forget_suspension(&owner);
+                    Err(LuaRuntimeError::Cancelled)
+                }
+                result = receiver => {
+                    result.map_err(|_| LuaRuntimeError::RuntimeClosed)?;
+                    Ok(LuaValue::Nil)
+                }
+            }
         })
     }
 }
@@ -438,6 +508,97 @@ fn lua_to_json_binding(value: LuaValue) -> Result<serde_json::Value, LuaRuntimeE
     lua_to_json(value).map_err(|error| LuaRuntimeError::InvalidRequest(error.to_string()))
 }
 
+pub fn mcl_agent_delivery_system(world: &mut World) {
+    let arrived = world
+        .event_reader::<LuaVmMessageArrived>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for message in arrived {
+        let owner = message.owner.owner_id.clone();
+        let Ok(agent_id) = owner.parse::<ResourceId>() else {
+            continue;
+        };
+        let Ok(agent) = world.entity_by_resource_id(&agent_id) else {
+            continue;
+        };
+        let Ok(envelope) = lua_to_json_binding(message.value.clone()) else {
+            continue;
+        };
+        let Ok(envelope) =
+            serde_json::from_value::<margatroid_types::AgentLuaMessageEnvelope>(envelope)
+        else {
+            continue;
+        };
+        let Ok(binding) = mcl_message_to_json(envelope.message) else {
+            continue;
+        };
+        let Ok(id) =
+            crate::MclCommandId::new(format!("lua-mcl-deliver-{}-{}", owner, next_mcl_call_id()))
+        else {
+            continue;
+        };
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        world.send_event(MclCommandRequest {
+            id,
+            source: owner.clone(),
+            agent_id,
+            command: format!(
+                "INJECT ? TO {}.{}[-1]",
+                crate::ENTRY_BLOCK_ID,
+                crate::ENTRY_INNER_ID
+            ),
+            binding: Some(binding),
+            reply: crate::MclCommandReply::new(sender),
+        });
+        if let Some(pending) = world.get_resource_mut::<PendingAgentDeliveries>() {
+            pending.deliveries.insert(
+                owner,
+                PendingAgentDelivery {
+                    agent,
+                    vm_id: message.vm_id,
+                    receiver,
+                },
+            );
+        }
+    }
+}
+
+pub fn mcl_agent_delivery_response_system(world: &mut World) {
+    let ready = world
+        .get_resource_mut::<PendingAgentDeliveries>()
+        .map(|pending| {
+            let mut ready = Vec::new();
+            pending
+                .deliveries
+                .retain(|owner, delivery| match delivery.receiver.try_recv() {
+                    Ok(result) => {
+                        ready.push((owner.clone(), delivery.vm_id, result));
+                        false
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        ready.push((owner.clone(), delivery.vm_id, Err(MclError::EffectInvalid)));
+                        false
+                    }
+                });
+            ready
+        })
+        .unwrap_or_default();
+    for (owner, vm_id, result) in ready {
+        if let Err(error) = &result {
+            tracing::warn!(agent = %owner, vm = ?vm_id, error = %error, "entry block injection failed");
+            continue;
+        }
+        let Some(runtime) = world.get_resource::<LuaRuntimeHandle>().cloned() else {
+            continue;
+        };
+        if let Err(error) = runtime.wake(&owner) {
+            tracing::debug!(agent = %owner, vm = ?vm_id, error = %error, "the agent was not waiting");
+        }
+    }
+}
+
 pub fn mcl_command_request_system(world: &mut World) {
     let requests = world
         .event_reader::<MclCommandRequest>()
@@ -486,10 +647,26 @@ pub fn mcl_domain_system(world: &mut World) {
         if matches!(
             request.operation,
             MclOperation::Emit {
-                effect: crate::MclEffectCommand::Start
+                effect: crate::MclEffectCommand::Wake
             }
         ) {
-            if let Err(error) = begin_start(world, request.clone()) {
+            if let Err(error) = begin_wake(world, request.clone()) {
+                world.send_event(MclDomainResponse {
+                    id: request.id,
+                    agent_id: request.agent_id,
+                    result: Err(error),
+                    reply: request.reply,
+                });
+            }
+            continue;
+        }
+        if matches!(
+            request.operation,
+            MclOperation::Emit {
+                effect: crate::MclEffectCommand::Ready
+            }
+        ) {
+            if let Err(error) = begin_ready(world, request.clone()) {
                 world.send_event(MclDomainResponse {
                     id: request.id,
                     agent_id: request.agent_id,
@@ -511,10 +688,10 @@ pub fn mcl_domain_system(world: &mut World) {
             continue;
         }
         if let MclOperation::Emit {
-            effect: crate::MclEffectCommand::CatchInference { ref_block_id },
+            effect: crate::MclEffectCommand::Inference { ref_block_id },
         } = request.operation.clone()
         {
-            if let Err(error) = begin_catch_inference(world, request.clone(), ref_block_id) {
+            if let Err(error) = begin_inference(world, request.clone(), ref_block_id) {
                 world.send_event(MclDomainResponse {
                     id: request.id,
                     agent_id: request.agent_id,
@@ -524,6 +701,7 @@ pub fn mcl_domain_system(world: &mut World) {
             }
             continue;
         }
+        let handled = std::cell::Cell::new(false);
         let result = (|| -> Result<crate::MclDomainValue, MclError> {
             match request.operation.clone() {
                 MclOperation::Emit {
@@ -579,102 +757,52 @@ pub fn mcl_domain_system(world: &mut World) {
                     &request.source,
                 ),
                 MclOperation::Emit {
-                    effect: crate::MclEffectCommand::Start,
+                    effect: crate::MclEffectCommand::Wake,
                 } => Err(MclError::EffectInvalid),
                 MclOperation::Emit {
-                    effect: crate::MclEffectCommand::Inference { ref_block_id },
+                    effect: crate::MclEffectCommand::Ready,
+                } => Err(MclError::EffectInvalid),
+                MclOperation::Emit {
+                    effect: crate::MclEffectCommand::StartTurn,
                 } => {
                     let agent = world
                         .entity_by_resource_id(&request.agent_id)
                         .map_err(|_| MclError::AgentMissing)?;
-                    let turn_id = world
-                        .get_component::<Agent>(agent)
-                        .and_then(|value| value.turn.turn_id.clone())
-                        .ok_or(MclError::TurnMissing)?;
-                    let agent_state = world
-                        .get_component::<Agent>(agent)
+                    let state = world
+                        .get_component_mut::<Agent>(agent)
                         .ok_or(MclError::AgentMissing)?;
-                    let block = agent_state
-                        .mcl
-                        .ref_blocks()
-                        .blocks
-                        .get(&ref_block_id)
-                        .ok_or(MclError::RefBlockMissing {
-                            assembly: "agent".into(),
-                            block: ref_block_id.clone(),
-                        })?;
-                    let message_merges = block
-                        .merges
-                        .values()
-                        .filter(|merge| matches!(merge, margatroid_types::RefMerge::Message(_)))
-                        .count();
-                    let resource_merges = block
-                        .merges
-                        .values()
-                        .filter(|merge| matches!(merge, margatroid_types::RefMerge::ResourceId(_)))
-                        .count();
-                    if message_merges != 1 || resource_merges != 1 {
-                        return Err(MclError::TypeMismatch);
+                    let turn_id = format!("mcl-turn:{}", next_mcl_call_id());
+                    if state.turn.turn_id.is_some() {
+                        return Err(MclError::TurnMismatch);
                     }
-                    let merge_id = block
-                        .merges
-                        .iter()
-                        .find_map(|(id, merge)| {
-                            matches!(merge, margatroid_types::RefMerge::Message(_))
-                                .then_some(id.clone())
-                        })
-                        .ok_or(MclError::MessageSourceUnavailable)?;
-                    let values = agent_state
-                        .mcl
-                        .select(&margatroid_types::BlockPath {
-                            block_id: ref_block_id.clone(),
-                            inner_id: merge_id,
-                        })
-                        .map_err(|_| MclError::MessageSourceUnavailable)?;
-                    let margatroid_types::BlockInner::Message(messages) = values else {
-                        return Err(MclError::TypeMismatch);
-                    };
-                    let resource_merge_id = block.merges.iter().find_map(|(id, merge)| {
-                        matches!(merge, margatroid_types::RefMerge::ResourceId(_)).then_some(id)
-                    });
-                    let visible_resources = if let Some(merge_id) = resource_merge_id {
-                        match agent_state
-                            .mcl
-                            .select(&margatroid_types::BlockPath {
-                                block_id: ref_block_id.clone(),
-                                inner_id: merge_id.clone(),
-                            })
-                            .map_err(|_| MclError::MessageSourceUnavailable)?
-                        {
-                            margatroid_types::BlockInner::ResourceId(values) => values,
-                            _ => return Err(MclError::TypeMismatch),
-                        }
-                    } else {
-                        Vec::new()
-                    };
-                    let tools = resolve_agent_tool_definitions(world, agent, &visible_resources)
-                        .map_err(|_| {
-                            MclError::ImportMissing(
-                                "visible resources could not be resolved into tool definitions"
-                                    .into(),
-                            )
-                        })?;
-                    if let Some(agent_state) = world.get_component_mut::<Agent>(agent) {
-                        agent_state.inference.pending.insert(
-                            (agent, turn_id.clone()),
-                            AgentInferencePending {
-                                id: turn_id.clone(),
-                                tool_schema: tools.clone(),
-                            },
-                        );
+                    state
+                        .turn
+                        .begin(turn_id)
+                        .map_err(|_| MclError::TurnMismatch)?;
+                    Ok(crate::MclDomainValue::Unit)
+                }
+                MclOperation::Emit {
+                    effect: crate::MclEffectCommand::EndTurn,
+                } => {
+                    let agent = world
+                        .entity_by_resource_id(&request.agent_id)
+                        .map_err(|_| MclError::AgentMissing)?;
+                    let state = world
+                        .get_component_mut::<Agent>(agent)
+                        .ok_or(MclError::AgentMissing)?;
+                    let turn = state.turn.turn_id.clone().ok_or(MclError::TurnMissing)?;
+                    if state
+                        .tools
+                        .pending
+                        .keys()
+                        .any(|(_, pending_turn, _)| pending_turn == &turn)
+                    {
+                        return Err(MclError::EffectInvalid);
                     }
-                    world.send_event(InferenceRequestEvent {
-                        id: turn_id,
-                        agent,
-                        agent_id: request.agent_id.clone(),
-                        messages: messages.into_iter().map(|value| value.message).collect(),
-                        tools,
-                    });
+                    state
+                        .turn
+                        .finish(&turn)
+                        .map_err(|_| MclError::TurnMismatch)?;
                     Ok(crate::MclDomainValue::Unit)
                 }
                 MclOperation::Emit {
@@ -719,19 +847,39 @@ pub fn mcl_domain_system(world: &mut World) {
                             pending_tools.or(Some(visible_tools))
                         })
                         .ok_or(MclError::ToolCallInvalid)?;
+                    let effect_id = format!("mcl-effect:{}", request.id.as_str());
+                    let state = crate::MclEffectState {
+                        command_id: request.id.clone(),
+                        agent_id: request.agent_id.clone(),
+                        agent,
+                        vm_id: None,
+                        kind: crate::MclPendingEffectKind::ToolCall {
+                            expected: calls.len(),
+                        },
+                        collected: Vec::new(),
+                        reply: request.reply.clone(),
+                    };
+                    let pending = world
+                        .get_resource_mut::<PendingMclEffects>()
+                        .ok_or(MclError::EffectAlreadyPending)?;
+                    if pending.effects.insert(effect_id.clone(), state).is_some() {
+                        return Err(MclError::EffectAlreadyPending);
+                    }
+                    handled.set(true);
+                    let mut rejected = Vec::new();
                     for call in calls {
                         if allowed_tools.contains(&call.tool_name) {
                             world.send_event(ToolCallEvent {
-                                turn_id: turn_id.clone(),
+                                turn_id: effect_id.clone(),
                                 agent,
                                 call,
                             });
                         } else {
                             let resource_id = rejected_tool_resource(world, agent, &call);
-                            world.send_event(AgentMessage {
-                                id: turn_id.clone(),
+                            rejected.push(margatroid_types::MclEffectReply {
+                                id: effect_id.clone(),
                                 agent,
-                                message: Message::Tool {
+                                result: Ok(Message::Tool {
                                     resource_id,
                                     tool_call_id: call.id,
                                     content: format!(
@@ -739,10 +887,13 @@ pub fn mcl_domain_system(world: &mut World) {
                                         call.tool_name
                                     ),
                                     failed: true,
-                                },
+                                }),
                                 usage: None,
                             });
                         }
+                    }
+                    for reply in rejected {
+                        world.send_event(reply);
                     }
                     Ok(crate::MclDomainValue::Unit)
                 }
@@ -789,25 +940,22 @@ pub fn mcl_domain_system(world: &mut World) {
                 MclOperation::Emit {
                     effect: crate::MclEffectCommand::Finish,
                 } => {
-                    let agent = world
+                    if let Some(state) = world
                         .entity_by_resource_id(&request.agent_id)
-                        .map_err(|_| MclError::AgentMissing)?;
-                    let state = world
-                        .get_component_mut::<Agent>(agent)
-                        .ok_or(MclError::AgentMissing)?;
-                    let turn = state.turn.turn_id.clone().ok_or(MclError::TurnMissing)?;
-                    if state
-                        .tools
-                        .pending
-                        .keys()
-                        .any(|(_, pending_turn, _)| pending_turn == &turn)
+                        .ok()
+                        .and_then(|agent| world.get_component::<Agent>(agent))
                     {
-                        return Err(MclError::EffectInvalid);
+                        if let Some(turn) = state.turn.turn_id.clone() {
+                            if state
+                                .tools
+                                .pending
+                                .keys()
+                                .any(|(_, pending_turn, _)| pending_turn == &turn)
+                            {
+                                return Err(MclError::EffectInvalid);
+                            }
+                        }
                     }
-                    state
-                        .turn
-                        .finish(&turn)
-                        .map_err(|_| MclError::TurnMismatch)?;
                     Ok(crate::MclDomainValue::Unit)
                 }
                 MclOperation::Emit { .. } => Ok(crate::MclDomainValue::Unit),
@@ -815,6 +963,9 @@ pub fn mcl_domain_system(world: &mut World) {
                 _ => Err(MclError::EffectInvalid),
             }
         })();
+        if handled.get() {
+            continue;
+        }
         world.send_event(MclDomainResponse {
             id: request.id,
             agent_id: request.agent_id,
@@ -844,48 +995,41 @@ fn rejected_tool_resource(
         })
 }
 
-fn begin_start(world: &mut World, request: MclDomainRequest) -> Result<(), MclError> {
+fn begin_wake(world: &mut World, request: MclDomainRequest) -> Result<(), MclError> {
+    let agent = world
+        .entity_by_resource_id(&request.agent_id)
+        .map_err(|_| MclError::AgentMissing)?;
+    let state = world
+        .get_component::<Agent>(agent)
+        .ok_or(MclError::AgentMissing)?;
+    if !matches!(
+        state.lifecycle,
+        agent_plugin::AgentLifecycleState::Creating | agent_plugin::AgentLifecycleState::Running
+    ) {
+        return Err(MclError::AgentRuntimeMissing);
+    }
+    if state.lua.vm_id.is_none() {
+        return Err(MclError::AgentRuntimeMissing);
+    }
+    let runtime = world
+        .get_resource::<LuaRuntimeHandle>()
+        .cloned()
+        .ok_or(MclError::AgentRuntimeMissing)?;
+    runtime
+        .wake(&request.agent_id.to_string())
+        .map_err(|_| MclError::EffectInvalid)?;
+    request.reply.send(Ok(crate::MclDomainValue::Unit));
+    Ok(())
+}
+
+fn begin_ready(world: &mut World, request: MclDomainRequest) -> Result<(), MclError> {
     let agent = world
         .entity_by_resource_id(&request.agent_id)
         .map_err(|_| MclError::AgentMissing)?;
     let vm_id = world
         .get_component::<Agent>(agent)
         .ok_or(MclError::AgentMissing)
-        .and_then(|value| {
-            if !matches!(
-                value.lifecycle,
-                agent_plugin::AgentLifecycleState::Creating
-                    | agent_plugin::AgentLifecycleState::Running
-            ) {
-                return Err(MclError::AgentRuntimeMissing);
-            }
-            value.lua.vm_id.ok_or(MclError::AgentRuntimeMissing)
-        })?;
-    let effect_id = format!("mcl-effect:{}", request.id.as_str());
-    let state = crate::MclEffectState {
-        command_id: request.id,
-        agent_id: request.agent_id,
-        agent,
-        vm_id: Some(vm_id),
-        kind: crate::MclPendingEffectKind::Start { vm_id },
-        reply: request.reply,
-    };
-    let pending = world
-        .get_resource_mut::<PendingMclEffects>()
-        .ok_or(MclError::EffectAlreadyPending)?;
-    if pending.effects.insert(effect_id.clone(), state).is_some() {
-        return Err(MclError::EffectAlreadyPending);
-    }
-    let runtime = world
-        .get_resource::<LuaRuntimeHandle>()
-        .cloned()
-        .ok_or(MclError::AgentRuntimeMissing)?;
-    if runtime.receive_message(effect_id.clone(), vm_id).is_err() {
-        world
-            .get_resource_mut::<PendingMclEffects>()
-            .map(|value| value.effects.remove(&effect_id));
-        return Err(MclError::MailboxFailed);
-    }
+        .and_then(|value| value.lua.vm_id.ok_or(MclError::AgentRuntimeMissing))?;
     let should_complete = world.get_component::<Agent>(agent).is_some_and(|value| {
         value.lifecycle == agent_plugin::AgentLifecycleState::Creating
             && !value.creation.initialization.complete
@@ -893,10 +1037,11 @@ fn begin_start(world: &mut World, request: MclDomainRequest) -> Result<(), MclEr
     if should_complete {
         world.send_event(AgentInitializationCompleted { agent, vm_id });
     }
+    request.reply.send(Ok(crate::MclDomainValue::Unit));
     Ok(())
 }
 
-fn begin_catch_inference(
+fn begin_inference(
     world: &mut World,
     request: MclDomainRequest,
     ref_block_id: String,
@@ -904,10 +1049,11 @@ fn begin_catch_inference(
     let agent = world
         .entity_by_resource_id(&request.agent_id)
         .map_err(|_| MclError::AgentMissing)?;
-    let _turn_id = world
+    let turn_id = world
         .get_component::<Agent>(agent)
         .and_then(|value| value.turn.turn_id.clone())
         .ok_or(MclError::TurnMissing)?;
+    let effect_id = format!("mcl-effect:{}", request.id.as_str());
     let agent_state = world
         .get_component::<Agent>(agent)
         .ok_or(MclError::AgentMissing)?;
@@ -925,11 +1071,12 @@ fn begin_catch_inference(
         .values()
         .filter(|merge| matches!(merge, margatroid_types::RefMerge::Message(_)))
         .count();
-    let forbidden_merge = block
+    let resource_merge = block
         .merges
         .values()
-        .any(|merge| !matches!(merge, margatroid_types::RefMerge::Message(_)));
-    if message_merge != 1 || forbidden_merge {
+        .filter(|merge| matches!(merge, margatroid_types::RefMerge::ResourceId(_)))
+        .count();
+    if message_merge != 1 || resource_merge > 1 {
         return Err(MclError::TypeMismatch);
     }
     let merge_id = block
@@ -942,20 +1089,52 @@ fn begin_catch_inference(
     let values = agent_state
         .mcl
         .select(&margatroid_types::BlockPath {
-            block_id: ref_block_id,
+            block_id: ref_block_id.clone(),
             inner_id: merge_id,
         })
         .map_err(|_| MclError::MessageSourceUnavailable)?;
     let margatroid_types::BlockInner::Message(messages) = values else {
         return Err(MclError::TypeMismatch);
     };
-    let effect_id = format!("mcl-effect:{}", request.id.as_str());
+    let resource_merge_id = block.merges.iter().find_map(|(id, merge)| {
+        matches!(merge, margatroid_types::RefMerge::ResourceId(_)).then_some(id.clone())
+    });
+    let visible_resources = match resource_merge_id {
+        Some(merge_id) => match agent_state
+            .mcl
+            .select(&margatroid_types::BlockPath {
+                block_id: ref_block_id.clone(),
+                inner_id: merge_id,
+            })
+            .map_err(|_| MclError::MessageSourceUnavailable)?
+        {
+            margatroid_types::BlockInner::ResourceId(values) => values,
+            _ => return Err(MclError::TypeMismatch),
+        },
+        None => Vec::new(),
+    };
+    let tools = tool_plugin::resolve_agent_tool_definitions(world, agent, &visible_resources)
+        .map_err(|_| {
+            MclError::ImportMissing(
+                "visible resources could not be resolved into tool definitions".into(),
+            )
+        })?;
+    if let Some(state) = world.get_component_mut::<Agent>(agent) {
+        state.inference.pending.insert(
+            (agent, turn_id.clone()),
+            agent_plugin::AgentInferencePending {
+                id: turn_id.clone(),
+                tool_schema: tools.clone(),
+            },
+        );
+    }
     let state = crate::MclEffectState {
         command_id: request.id,
         agent_id: request.agent_id.clone(),
         agent,
         vm_id: None,
-        kind: crate::MclPendingEffectKind::CatchInference,
+        kind: crate::MclPendingEffectKind::Inference,
+        collected: Vec::new(),
         reply: request.reply,
     };
     let pending = world
@@ -964,82 +1143,98 @@ fn begin_catch_inference(
     if pending.effects.insert(effect_id.clone(), state).is_some() {
         return Err(MclError::EffectAlreadyPending);
     }
-    world.send_event(CapturedInferenceRequest {
+    world.send_event(InferenceRequestEvent {
         id: effect_id.clone(),
         agent,
         agent_id: request.agent_id,
         messages: messages.into_iter().map(|value| value.message).collect(),
+        tools,
     });
     Ok(())
 }
 
 pub fn mcl_effect_response_system(world: &mut World) {
-    let responses = world
-        .event_reader::<LuaVmMessageReceived>()
+    let replies = world
+        .event_reader::<margatroid_types::MclEffectReply>()
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
-    for response in responses {
-        let state = world
+    for reply in replies {
+        let Some(mut state) = world
             .get_resource_mut::<PendingMclEffects>()
-            .and_then(|pending| pending.effects.remove(&response.id));
-        let Some(state) = state else {
+            .and_then(|pending| pending.effects.remove(&reply.id))
+        else {
             continue;
         };
-        let is_start = matches!(state.kind, crate::MclPendingEffectKind::Start { .. });
-        let result = if !is_start {
-            Err(MclError::EffectResponseMismatch)
-        } else if Some(response.vm_id) != state.vm_id {
-            Err(MclError::EffectResponseMismatch)
-        } else {
-            response
-                .result
-                .map_err(|_| MclError::MailboxFailed)
-                .and_then(parse_mailbox_message)
-                .and_then(|envelope| {
-                    let agent = world
-                        .get_component_mut::<Agent>(state.agent)
-                        .ok_or(MclError::AgentMissing)?;
-                    match &envelope.message.message {
-                        margatroid_types::Message::User { .. } => agent
-                            .turn
-                            .begin(envelope.turn_id.clone())
-                            .map_err(|_| MclError::TurnMismatch)?,
-                        margatroid_types::Message::Assistant { .. } => {
-                            match agent.turn.turn_id.as_deref() {
-                                Some(current) if current != envelope.turn_id.as_str() => {
-                                    return Err(MclError::TurnMismatch)
-                                }
-                                None => {
-                                    agent
-                                        .turn
-                                        .begin(envelope.turn_id.clone())
-                                        .map_err(|_| MclError::TurnMismatch)?;
-                                }
-                                _ => {}
-                            }
+        if state.agent != reply.agent {
+            world.send_event(MclDomainResponse {
+                id: state.command_id,
+                agent_id: state.agent_id,
+                result: Err(MclError::EffectResponseMismatch),
+                reply: state.reply,
+            });
+            continue;
+        }
+        match reply.result {
+            Ok(message) => match &state.kind {
+                crate::MclPendingEffectKind::Inference => {
+                    if let Some(usage) = reply.usage.as_ref() {
+                        if let Some(agent) = world.get_component_mut::<Agent>(state.agent) {
+                            agent.token_usage.add(usage);
                         }
-                        margatroid_types::Message::Tool { .. }
-                            if agent.turn.turn_id.as_deref() != Some(envelope.turn_id.as_str()) =>
-                        {
-                            return Err(MclError::TurnMismatch)
+                    }
+                    let turn_id = world
+                        .get_component::<Agent>(state.agent)
+                        .and_then(|value| value.turn.turn_id.clone())
+                        .unwrap_or_else(|| reply.id.clone());
+                    world.send_event(AgentMessage {
+                        id: turn_id,
+                        agent: state.agent,
+                        message: message.clone(),
+                        usage: reply.usage.clone(),
+                    });
+                    world.send_event(MclDomainResponse {
+                        id: state.command_id,
+                        agent_id: state.agent_id,
+                        result: Ok(crate::MclDomainValue::Message(
+                            margatroid_types::MclMessage::new(message, reply.usage),
+                        )),
+                        reply: state.reply,
+                    });
+                }
+                crate::MclPendingEffectKind::ToolCall { expected } => {
+                    state.collected.push(message);
+                    if state.collected.len() < *expected {
+                        if let Some(pending) = world.get_resource_mut::<PendingMclEffects>() {
+                            pending.effects.insert(reply.id.clone(), state);
                         }
-                        margatroid_types::Message::Error { .. } => {}
-                        margatroid_types::Message::Inject { .. } => {}
-                        _ => {}
+                        continue;
                     }
-                    if let Some(usage) = envelope.message.usage.as_ref() {
-                        agent.token_usage.add(usage);
-                    }
-                    Ok(crate::MclDomainValue::Message(envelope.message))
-                })
-        };
-        world.send_event(MclDomainResponse {
-            id: state.command_id,
-            agent_id: state.agent_id,
-            result,
-            reply: state.reply,
-        });
+                    world.send_event(MclDomainResponse {
+                        id: state.command_id,
+                        agent_id: state.agent_id,
+                        result: Ok(crate::MclDomainValue::Inner(
+                            margatroid_types::BlockInner::Message(
+                                state
+                                    .collected
+                                    .into_iter()
+                                    .map(|message| margatroid_types::MclMessage::new(message, None))
+                                    .collect(),
+                            ),
+                        )),
+                        reply: state.reply,
+                    });
+                }
+            },
+            Err(error) => {
+                world.send_event(MclDomainResponse {
+                    id: state.command_id,
+                    agent_id: state.agent_id,
+                    result: Err(MclError::EffectFailed(error)),
+                    reply: state.reply,
+                });
+            }
+        }
     }
 
     let captured = world
@@ -1052,9 +1247,7 @@ pub fn mcl_effect_response_system(world: &mut World) {
             .get_resource_mut::<PendingMclEffects>()
             .and_then(|pending| pending.effects.remove(&response.id));
         let Some(state) = state else { continue };
-        let result = if state.agent != response.agent
-            || !matches!(state.kind, crate::MclPendingEffectKind::CatchInference)
-        {
+        let result = if state.agent != response.agent {
             Err(MclError::EffectResponseMismatch)
         } else {
             match response.result {
@@ -1101,14 +1294,6 @@ pub fn mcl_effect_response_system(world: &mut World) {
     }
 }
 
-fn parse_mailbox_message(
-    value: LuaValue,
-) -> Result<margatroid_types::AgentLuaMessageEnvelope, MclError> {
-    let envelope: margatroid_types::AgentLuaMessageEnvelope =
-        serde_json::from_value(lua_to_json(value)?).map_err(|_| MclError::MailboxFailed)?;
-    Ok(envelope)
-}
-
 fn lua_to_json(value: LuaValue) -> Result<serde_json::Value, MclError> {
     Ok(match value {
         LuaValue::Nil => serde_json::Value::Null,
@@ -1116,7 +1301,7 @@ fn lua_to_json(value: LuaValue) -> Result<serde_json::Value, MclError> {
         LuaValue::Integer(value) => serde_json::Value::Number(value.into()),
         LuaValue::Number(value) => serde_json::Number::from_f64(value)
             .map(serde_json::Value::Number)
-            .ok_or(MclError::MailboxFailed)?,
+            .ok_or(MclError::TypeMismatch)?,
         LuaValue::String(value) => serde_json::Value::String(value),
         LuaValue::Array(values) => serde_json::Value::Array(
             values

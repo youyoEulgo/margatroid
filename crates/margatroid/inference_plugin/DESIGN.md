@@ -328,7 +328,7 @@ Base Lua
     -> AgentFailure { id: turn_id, kind: Inference }
     -> MclPlugin完成当前或下一次start为Err并中止该turn，不留下永久pending回执
 
-MclPlugin的catch_inference Effect
+MclPlugin的inference Effect
     -> CapturedInferenceRequest { messages, tools=[] }
     -> 不发送流式前端消息
     -> CapturedInferenceResponse

@@ -203,19 +203,18 @@ mcl_domain_system(world: &mut World)
     处理事件：MclDomainRequest
     行为：
         克隆本帧全部请求并逐个处理
-        Start 调用 begin_start；Import 调用 begin_import；CatchInference 调用 begin_catch_inference
+        Wake 调用 begin_wake；Ready 调用 begin_ready；Import 调用 begin_import；Inference 调用 begin_inference
         上述等待型操作成功登记后不回复；同步失败发送 Err MclDomainResponse
         其余 Emit 操作按 effect 类型直接执行并发送 MclDomainResponse
         其余操作返回 EffectInvalid 并发送 MclDomainResponse
 
 mcl_effect_response_system(world: &mut World)
     Effect 响应 System：公开 System
-    处理事件：LuaVmMessageReceived、CapturedInferenceResponse、AgentFailure
+    处理事件：CapturedInferenceResponse、AgentFailure
     行为：
         按响应 id 从 PendingMclEffects 移除事务，未找到则跳过
-        Start 响应校验 vm_id、解析邮箱消息、建立或校验 Agent.turn、累加 token usage
-        CatchInference 响应包装为 Text
-        AgentFailure 统一转换为 AgentMessage(Error) 投递给目标 Agent；Base Lua 通过 start 收到 Error 后写入历史，不回 Err、不暂存、不终止 VM
+        Inference 响应包装为 Text
+        AgentFailure 统一转换为 AgentMessage(Error) 投递给目标 Agent；Base Lua 通过待办 block 收到 Error 后写入历史，不回 Err、不暂存、不终止 VM
 
 mcl_import_response_system(world: &mut World)
     IMPORT 响应 System：公开 System
@@ -265,17 +264,22 @@ parse_mailbox_message(value: LuaValue) -> Result<AgentLuaMessageEnvelope, MclErr
 rejected_tool_resource(world: &World, agent: Entity, call: &ToolCall) -> ResourceId
     解析被拒绝工具的资源 ID：私有函数，优先从 AgentResourceMap 按 tool_name 查找，失败时解析 tool_name，最终返回 tool:builtin/invalid
 
-begin_start(world: &mut World, request: MclDomainRequest) -> Result<(), MclError>
-    开始 start：私有函数
+begin_wake(world: &mut World, request: MclDomainRequest) -> Result<(), MclError>
+    唤醒目标 Agent：私有函数
     行为：
-        查找 Agent；存在当前 turn 时先取出并 abort 暂存失败
-        要求 Agent 为 Creating 或 Running 且长期 VM 存在
-        以 mcl-effect:<command_id> 登记 MclEffectState，重复 ID 返回 EffectAlreadyPending
-        调用 LuaRuntimeHandle::receive_message 等待邮箱消息
-        首次登记成功后若 Agent 仍 Creating 且未完成初始化，发送 AgentInitializationCompleted
+        查找 Agent，要求为 Creating 或 Running 且长期 VM 存在
+        调用 LuaRuntimeHandle::wake 释放该 Agent 的挂起等待
+        目标未处于等待时返回 EffectInvalid
 
-begin_catch_inference(world: &mut World, request: MclDomainRequest, ref_block_id: String) -> Result<(), MclError>
-    开始 catch_inference：私有函数
+begin_ready(world: &mut World, request: MclDomainRequest) -> Result<(), MclError>
+    宣告初始化完成：私有函数
+    行为：
+        查找 Agent 并要求长期 VM 存在
+        Agent 仍 Creating 且未完成初始化时发送 AgentInitializationCompleted
+        立即回复 Unit
+
+begin_inference(world: &mut World, request: MclDomainRequest, ref_block_id: String) -> Result<(), MclError>
+    开始捕获式推理：私有函数
     行为：
         要求 Agent 存在且当前 turn 存在
         RefBlock 必须恰好一个 Message RefMerge 且无其他类型 RefMerge
@@ -406,9 +410,9 @@ normalize_command(command: &str) -> String
 parse_effect(words: &[&str], binding: Option<&serde_json::Value>) -> Result<MclOperation, MclError>
     EMIT EFFECT 解析：私有函数
     行为：
-        start/finish 为无参 Effect，拒绝 FROM 参数和 binding
+        wake/ready/finish 为无参 Effect，拒绝 FROM 参数和 binding
         其余 Effect 统一使用 `EMIT EFFECT <name> FROM <argument>`
-        inference/catch_inference 的 argument 是 RefBlock ID
+        inference 的 argument 是 RefBlock ID
         history_append 的 argument 必须是 ?，binding 解码为 MclMessage
         history_record 的 argument 必须是 ?，binding 显式携带 kind/cmd/arg
         visibility_source/default_visibility_source 的 argument 是完整 BlockPath
@@ -487,7 +491,7 @@ MclEffectState：等待型 Effect 事务，公开结构体
     command_id: MclCommandId--原 MCL 命令 ID
     agent_id: ResourceId--原命令目标 Agent 资源 ID
     agent: Entity--开始 Effect 时解析出的目标 Agent Entity
-    vm_id: Option<LuaVmId>--Start Effect 使用的长期 VM，其他 Effect 为空
+    vm_id: Option<LuaVmId>--登记时的长期 VM，仅用于校验响应归属
     kind: MclPendingEffectKind--等待型 Effect 分类
     reply: MclCommandReply--原命令的一次性回执，由响应链最终完成
 ```
@@ -592,7 +596,8 @@ RefMergeDeclaration：RefBlock 合并声明，公开结构体
     sources: Vec<BlockPath>--引用路径
 
 MclEffectCommand：MCL Effect 命令，公开枚举
-    Start
+    Wake
+    Ready
     CatchInference { ref_block_id: String }
     Inference { ref_block_id: String }
     ToolCall { calls: Vec<ToolCall> }--tool_call effect 的参数协议，不属于 MCL Block 类型
@@ -625,7 +630,7 @@ MclDomainValue：MCL 领域值，公开枚举
 MclCommandValue：MCL 命令值，公开类型别名，等于 MclDomainValue
 
 MclPendingEffectKind：等待型 Effect 分类，公开枚举
-    Start { vm_id: LuaVmId }
+    Inference
     CatchInference
     ```
 
@@ -717,7 +722,7 @@ Lua mcl 调用：
         Import/Emit -> MclDomainRequest -> mcl_domain_system
         其他 -> execute_direct_operation -> 立即完成回执
     mcl_domain_system 按 Effect 类型执行：
-        Start/CatchInference -> 登记 PendingMclEffects 并等待外部响应
+        Inference -> 登记 PendingMclEffects 并等待外部响应
         Import -> 登记 PendingMclImports 并发送 ToolRegisterRequest
         HistoryAppend/Inference/ToolCall/VisibilitySource/DefaultVisibilitySource/Finish -> 直接执行
     外部响应经 mcl_import_response_system 或 mcl_effect_response_system 完成 MclDomainResponse

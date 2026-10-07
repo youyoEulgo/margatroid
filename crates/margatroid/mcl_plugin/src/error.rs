@@ -20,6 +20,7 @@ pub enum MclError {
     MessageSourceUnavailable,
     EffectAlreadyPending,
     EffectResponseMismatch,
+    EffectFailed(String),
     TurnMissing,
     TurnMismatch,
     MailboxFailed,

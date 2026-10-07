@@ -49,6 +49,7 @@ pub struct MclEffectState {
     pub agent: Entity,
     pub vm_id: Option<margatroid_types::LuaVmId>,
     pub kind: crate::MclPendingEffectKind,
+    pub collected: Vec<margatroid_types::Message>,
     pub reply: MclCommandReply,
 }
 impl Event for MclDomainResponse {}
