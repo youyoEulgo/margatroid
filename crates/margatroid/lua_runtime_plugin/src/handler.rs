@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -9,8 +9,7 @@ use mlua::{Lua, LuaOptions, StdLib, Value as MlValue};
 
 use crate::error::LuaRuntimeError;
 use crate::events::{
-    LuaRuntimeCancelRequest, LuaRuntimeRequest, LuaRuntimeTaskFinished, LuaVmMessage,
-    LuaVmMessageArrived, LuaVmMessageReceiveRequest, LuaVmMessageReceived, LuaVmStarted,
+    LuaRuntimeCancelRequest, LuaRuntimeRequest, LuaRuntimeTaskFinished, LuaVmStarted,
 };
 use crate::types::{
     CancellationToken, LuaEnvironmentContext, LuaEnvironmentRegistry, LuaProgram, LuaRuntimeConfig,
@@ -78,7 +77,6 @@ pub(crate) fn handle_lua_runtime_request(world: &mut World, request: LuaRuntimeR
                 last_activity: now,
             },
         );
-        state.mailboxes.entry(vm_id).or_default();
         let cancel = CancellationToken::default();
         state
             .requests
@@ -181,90 +179,6 @@ pub(crate) fn handle_lua_runtime_cancels(
     }
 }
 
-pub(crate) fn handle_lua_vm_messages(world: &mut World, messages: Vec<LuaVmMessage>) {
-    let mut responses = Vec::new();
-    let mut arrived = Vec::new();
-    let Some(state) = world.get_resource_mut::<LuaRuntimeState>() else {
-        return;
-    };
-    for message in messages {
-        if let Some(waiting) = state
-            .receives
-            .get_mut(&message.vm_id)
-            .and_then(VecDeque::pop_front)
-        {
-            responses.push(LuaVmMessageReceived {
-                id: waiting.id,
-                vm_id: message.vm_id,
-                result: Ok(message.value.clone()),
-            });
-        } else if let Some(mailbox) = state.mailboxes.get_mut(&message.vm_id) {
-            mailbox.push_back(message.value.clone());
-        }
-        let owner = state
-            .sessions
-            .get(&message.vm_id)
-            .map(|session| session.owner.clone());
-        if let Some(owner) = owner {
-            arrived.push(LuaVmMessageArrived {
-                vm_id: message.vm_id,
-                owner,
-                value: message.value,
-            });
-        }
-    }
-    for response in responses {
-        world.emit_event(response);
-    }
-    for event in arrived {
-        world.emit_event(event);
-    }
-}
-
-pub(crate) fn handle_lua_vm_receives(world: &mut World, requests: Vec<LuaVmMessageReceiveRequest>) {
-    let mut responses = Vec::new();
-    let Some(state) = world.get_resource_mut::<LuaRuntimeState>() else {
-        return;
-    };
-    for request in requests {
-        match state
-            .mailboxes
-            .get_mut(&request.vm_id)
-            .and_then(VecDeque::pop_front)
-        {
-            Some(value) => responses.push(LuaVmMessageReceived {
-                id: request.id,
-                vm_id: request.vm_id,
-                result: Ok(value),
-            }),
-            None if state.sessions.contains_key(&request.vm_id) => {
-                let receives = state.receives.entry(request.vm_id).or_default();
-                if receives.is_empty() {
-                    receives.push_back(request);
-                } else {
-                    responses.push(LuaVmMessageReceived {
-                        id: request.id,
-                        vm_id: request.vm_id,
-                        result: Err(LuaRuntimeError::InvalidRequest(
-                            "only one receive may wait on a VM mailbox".into(),
-                        )),
-                    });
-                }
-            }
-            None => responses.push(LuaVmMessageReceived {
-                id: request.id,
-                vm_id: request.vm_id,
-                result: Err(LuaRuntimeError::VmExecutionFailed(
-                    "VM is not running".into(),
-                )),
-            }),
-        }
-    }
-    for response in responses {
-        world.emit_event(response);
-    }
-}
-
 pub(crate) fn handle_lua_runtime_finished(
     world: &mut World,
     finished: Vec<LuaRuntimeTaskFinished>,
@@ -272,29 +186,12 @@ pub(crate) fn handle_lua_runtime_finished(
     let Some(state) = world.get_resource_mut::<LuaRuntimeState>() else {
         return;
     };
-    let mut receive_failures = Vec::new();
     for event in finished {
         state.requests.remove(&event.request_id);
         state.owners.remove(&event.request_id);
         if let Some(vm_id) = event.vm_id {
             state.sessions.remove(&vm_id);
-            state.mailboxes.remove(&vm_id);
-            if let Some(receives) = state.receives.remove(&vm_id) {
-                for receive in receives {
-                    receive_failures.push(LuaVmMessageReceived {
-                        id: receive.id,
-                        vm_id,
-                        result: Err(event
-                            .error
-                            .clone()
-                            .unwrap_or(LuaRuntimeError::RuntimeClosed)),
-                    });
-                }
-            }
         }
-    }
-    for response in receive_failures {
-        world.emit_event(response);
     }
 }
 
@@ -726,7 +623,6 @@ mod tests {
             "EMIT EFFECT start_turn",
             "EMIT EFFECT inference FROM req",
             "EMIT EFFECT history_append FROM ?",
-            "EMIT EFFECT end_turn",
             "EMIT EFFECT finish",
         ];
         let mut position = 0;

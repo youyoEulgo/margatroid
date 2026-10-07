@@ -90,17 +90,6 @@ pub(crate) fn handle_inbound_message(
                 ),
             }
         }
-        ClientMessage::AgentMessage { id, message } => {
-            tracing::info!(connection = connection_id.get(), request_id = %id, api_type = "agent.message", "API request received");
-            match message.into_domain(id) {
-                Ok(event) => world.send_event(event),
-                Err(error) => tracing::warn!(
-                    connection = connection_id.get(),
-                    error = %error,
-                    "invalid agent.message payload"
-                ),
-            }
-        }
         ClientMessage::MclCommand { id, message } => {
             tracing::info!(connection = connection_id.get(), request_id = %id, api_type = "mcl.command", "API request received");
             let (reply, response) = std::sync::mpsc::channel();
@@ -230,6 +219,7 @@ pub(crate) fn handle_collect_external_events(world: &mut World) {
     report_workspace_events(world, targets.logs());
     report_workspace_stop_events(world, targets.logs());
     report_agent_messages(world, targets.member_messages());
+    report_observed_messages(world, targets.member_messages());
     report_agent_failures(world, targets.logs());
     report_backend_state(world, targets.backend_state());
 }
@@ -458,6 +448,36 @@ fn report_agent_messages(world: &World, targets: &[WebSocketMessageTarget]) {
             MessageDto::Tool { .. } | MessageDto::Error { .. } | MessageDto::Inject { .. } => {
                 continue
             }
+        }
+        send_to_targets(world, targets, ServerMessage::AgentMessage { message });
+    }
+}
+
+fn report_observed_messages(world: &World, targets: &[WebSocketMessageTarget]) {
+    let observed = world
+        .event_reader::<margatroid_types::AgentConversationObserved>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for observation in observed {
+        let message: AgentMessageDto = match (&observation).into_dto(world) {
+            Ok(message) => message,
+            Err(error) if error.kind() == ProtocolErrorKind::UnsupportedMessage => continue,
+            Err(error) => {
+                tracing::warn!(turn_id = %observation.turn_id, error = %error, "observed message DTO conversion failed");
+                continue;
+            }
+        };
+        if let MessageDto::Assistant { tool_calls, .. } = &message.message {
+            tracing::info!(
+                request_id = %message.id,
+                workspace = %message.workspace.name,
+                agent = %message.agent,
+                tool_calls = tool_calls.len(),
+                "assistant message sent"
+            );
+        } else {
+            continue;
         }
         send_to_targets(world, targets, ServerMessage::AgentMessage { message });
     }

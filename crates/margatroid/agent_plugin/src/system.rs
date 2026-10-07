@@ -3,8 +3,8 @@ use lua_runtime_plugin::{LuaRuntimeTaskFinished, LuaVmStarted};
 
 use crate::{
     handle_agent_control, handle_agent_create, handle_agent_initialization_completed,
-    handle_agent_message, handle_lua_vm_finished, handle_lua_vm_started, AgentControl,
-    AgentCreateRequest, AgentInitializationCompleted, AgentMessage,
+    handle_lua_vm_finished, handle_lua_vm_started, AgentControl, AgentCreateRequest,
+    AgentInitializationCompleted,
 };
 
 pub fn agent_create_system(world: &mut World) {
@@ -26,17 +26,6 @@ pub fn agent_control_system(world: &mut World) {
         .collect::<Vec<_>>();
     for event in events {
         handle_agent_control(world, event);
-    }
-}
-
-pub fn agent_message_system(world: &mut World) {
-    let events = world
-        .event_reader::<AgentMessage>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    for event in events {
-        handle_agent_message(world, event);
     }
 }
 

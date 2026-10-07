@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -14,9 +14,7 @@ use margatroid_types::LuaVmId;
 use tokio::sync::oneshot;
 
 use crate::error::LuaRuntimeError;
-use crate::events::{
-    LuaRuntimeCancelRequest, LuaRuntimeRequest, LuaVmMessage, LuaVmMessageReceiveRequest,
-};
+use crate::events::{LuaRuntimeCancelRequest, LuaRuntimeRequest};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LuaValue {
@@ -265,8 +263,6 @@ pub(crate) struct LuaRuntimeState {
     pub(crate) sessions: HashMap<LuaVmId, LuaVmSession>,
     pub(crate) requests: HashMap<String, CancellationToken>,
     pub(crate) owners: HashMap<String, String>,
-    pub(crate) mailboxes: HashMap<LuaVmId, VecDeque<LuaValue>>,
-    pub(crate) receives: HashMap<LuaVmId, VecDeque<LuaVmMessageReceiveRequest>>,
 }
 impl Resource for LuaRuntimeState {}
 
@@ -275,6 +271,7 @@ pub struct LuaRuntimeHandle {
     pub(crate) events: RuntimeEventSender,
     pub(crate) environments: Arc<RwLock<LuaEnvironmentRegistry>>,
     pub(crate) suspended: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    pub(crate) reserved: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 impl Resource for LuaRuntimeHandle {}
 impl LuaRuntimeHandle {
@@ -297,15 +294,6 @@ impl LuaRuntimeHandle {
         });
         Ok(())
     }
-    pub fn send_message(&self, vm_id: LuaVmId, value: LuaValue) -> Result<(), LuaRuntimeError> {
-        self.events.send_event(LuaVmMessage { vm_id, value });
-        Ok(())
-    }
-    pub fn receive_message(&self, id: String, vm_id: LuaVmId) -> Result<(), LuaRuntimeError> {
-        self.events
-            .send_event(LuaVmMessageReceiveRequest { id, vm_id });
-        Ok(())
-    }
     pub fn suspend(&self, owner: String) -> Result<oneshot::Receiver<()>, LuaRuntimeError> {
         let (sender, receiver) = oneshot::channel();
         {
@@ -321,6 +309,39 @@ impl LuaRuntimeHandle {
         }
         Ok(receiver)
     }
+    pub fn reserve_suspension(&self, owner: &str) -> Result<(), LuaRuntimeError> {
+        let mut reserved = self
+            .reserved
+            .lock()
+            .map_err(|_| LuaRuntimeError::RuntimeClosed)?;
+        if !reserved.insert(owner.to_owned()) {
+            return Err(LuaRuntimeError::InvalidRequest(
+                "a VM may only wait once at a time".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn claim_suspension(&self, owner: &str) -> Result<oneshot::Receiver<()>, LuaRuntimeError> {
+        let (sender, receiver) = oneshot::channel();
+        let mut suspended = self
+            .suspended
+            .lock()
+            .map_err(|_| LuaRuntimeError::RuntimeClosed)?;
+        if suspended.insert(owner.to_owned(), sender).is_some() {
+            return Err(LuaRuntimeError::InvalidRequest(
+                "a VM may only wait once at a time".into(),
+            ));
+        }
+        if let Ok(mut reserved) = self.reserved.lock() {
+            reserved.remove(owner);
+        }
+        Ok(receiver)
+    }
+    pub fn drop_reservation(&self, owner: &str) {
+        if let Ok(mut reserved) = self.reserved.lock() {
+            reserved.remove(owner);
+        }
+    }
     pub fn wake(&self, owner: &str) -> Result<(), LuaRuntimeError> {
         let sender = self
             .suspended
@@ -331,6 +352,12 @@ impl LuaRuntimeHandle {
         sender
             .send(())
             .map_err(|_| LuaRuntimeError::VmExecutionFailed("the VM is no longer waiting".into()))
+    }
+    pub fn is_reserved(&self, owner: &str) -> bool {
+        self.reserved
+            .lock()
+            .map(|reserved| reserved.contains(owner))
+            .unwrap_or(false)
     }
     pub fn forget_suspension(&self, owner: &str) {
         if let Ok(mut suspended) = self.suspended.lock() {

@@ -5,14 +5,13 @@ use lua_runtime_plugin::{
     LuaEnvironmentContext, LuaRuntimeHandle, LuaRuntimeReply, LuaRuntimeRequest,
     LuaRuntimeTaskFinished, LuaScheduler, LuaValue, LuaVmOwner, LuaVmStarted,
 };
-use margatroid_types::{AgentLuaMessageEnvelope, MclMessage, Message};
 use resource_id_plugin::ResourceId;
 
 use crate::{
     failure, Agent, AgentControl, AgentControlKind, AgentCreateRequest, AgentCreationState,
     AgentFailureKind, AgentInferenceState, AgentInfo, AgentInitializationCompleted,
-    AgentLifecycleState, AgentLuaState, AgentMcl, AgentMessage, AgentResourceMap, AgentToolState,
-    AgentTurnState, TokenUsageState,
+    AgentLifecycleState, AgentLuaState, AgentMcl, AgentResourceMap, AgentToolState, AgentTurnState,
+    TokenUsageState,
 };
 
 fn agent_label(world: &World, entity: Entity) -> String {
@@ -184,41 +183,6 @@ pub fn handle_agent_control(world: &mut World, event: AgentControl) {
     event.reply.send(result);
 }
 
-pub fn handle_agent_message(world: &mut World, event: AgentMessage) {
-    let conflicting_turn = world
-        .get_component::<Agent>(event.agent)
-        .and_then(|agent| agent.turn.turn_id.clone())
-        .filter(|active| match &event.message {
-            Message::Inject { .. } | Message::Assistant { .. } | Message::Tool { .. } => {
-                active != &event.id
-            }
-            Message::User { .. } | Message::Error { .. } | Message::System { .. } => false,
-        });
-    if let Some(active) = conflicting_turn {
-        tracing::warn!(
-            agent = %agent_label(world, event.agent),
-            active_turn = %active,
-            message_turn = %event.id,
-            "agent message ignored: it does not belong to the turn in flight"
-        );
-        return;
-    }
-    let result = deliver_agent_message(world, &event);
-    if let Err(error) = result {
-        tracing::error!(agent = %agent_label(world, event.agent), error = %error, "agent message delivery failed");
-        let vm_id = world
-            .get_component::<Agent>(event.agent)
-            .and_then(|agent| agent.lua.vm_id);
-        if let Some(agent) = world.get_component_mut::<Agent>(event.agent) {
-            agent.last_error = Some(error);
-            agent.lifecycle = AgentLifecycleState::Failed;
-        }
-        if vm_id.is_some() {
-            stop_runtime(world, event.agent);
-        }
-    }
-}
-
 pub fn handle_lua_vm_started(world: &mut World, event: LuaVmStarted) {
     let matches = world
         .query_with::<Agent>()
@@ -356,63 +320,6 @@ pub fn control_stop(world: &mut World, entity: Entity) -> Result<(), margatroid_
     Ok(())
 }
 
-fn deliver_agent_message(
-    world: &World,
-    event: &AgentMessage,
-) -> Result<(), margatroid_types::AgentError> {
-    let agent = world
-        .get_component::<Agent>(event.agent)
-        .ok_or_else(|| failure(AgentFailureKind::AgentMissing, "agent is missing"))?;
-    if world.get_component::<ResourceId>(event.agent).is_none()
-        || agent.lifecycle != AgentLifecycleState::Running
-    {
-        return Err(failure(AgentFailureKind::Stopped, "agent is not running"));
-    }
-    if matches!(event.message, Message::System { .. }) {
-        return Err(failure(
-            AgentFailureKind::InvalidRequest,
-            "system messages cannot enter the agent mailbox",
-        ));
-    }
-    if let Message::Inject { messages } = &event.message {
-        if messages.is_empty() {
-            return Err(failure(
-                AgentFailureKind::InvalidRequest,
-                "a context injection cannot be empty",
-            ));
-        }
-        if messages
-            .iter()
-            .any(|inner| matches!(inner, Message::System { .. } | Message::Inject { .. }))
-        {
-            return Err(failure(
-                AgentFailureKind::InvalidRequest,
-                "a context injection may only carry user, assistant, tool or error messages",
-            ));
-        }
-    }
-    let vm_id = agent
-        .lua
-        .vm_id
-        .ok_or_else(|| failure(AgentFailureKind::LuaRuntime, "agent VM is missing"))?;
-    let runtime = world
-        .get_resource::<LuaRuntimeHandle>()
-        .ok_or_else(|| failure(AgentFailureKind::LuaRuntime, "Lua runtime is missing"))?;
-    let envelope = AgentLuaMessageEnvelope {
-        turn_id: event.id.clone(),
-        message: MclMessage::new(event.message.clone(), event.usage.clone()),
-    };
-    let serialized = serde_json::to_value(envelope).map_err(|error| {
-        failure(
-            AgentFailureKind::InvalidRequest,
-            format!("agent message serialization failed: {error}"),
-        )
-    })?;
-    runtime
-        .send_message(vm_id, json_to_lua(serialized))
-        .map_err(|error| failure(AgentFailureKind::LuaRuntime, error.to_string()))
-}
-
 fn fail_creation(world: &mut World, entity: Entity, error: margatroid_types::AgentError) {
     tracing::error!(agent = %agent_label(world, entity), error = %error, "agent creation failed");
     if let Some(agent) = world.get_component_mut::<Agent>(entity) {
@@ -420,15 +327,6 @@ fn fail_creation(world: &mut World, entity: Entity, error: margatroid_types::Age
         agent.creation.initialization.failed = Some(error.clone());
         agent.last_error = Some(error.clone());
         agent.creation.reply.send(Err(error));
-    }
-}
-
-fn stop_runtime(world: &World, entity: Entity) {
-    let Some(id) = world.get_component::<ResourceId>(entity) else {
-        return;
-    };
-    if let Some(runtime) = world.get_resource::<LuaRuntimeHandle>() {
-        let _ = runtime.stop_long_running(&id.to_string());
     }
 }
 
@@ -473,28 +371,6 @@ fn agent_info_value(id: &ResourceId, info: &AgentInfo) -> LuaValue {
         ),
     );
     LuaValue::Object(value)
-}
-
-fn json_to_lua(value: serde_json::Value) -> LuaValue {
-    match value {
-        serde_json::Value::Null => LuaValue::Nil,
-        serde_json::Value::Bool(value) => LuaValue::Boolean(value),
-        serde_json::Value::Number(value) => value
-            .as_i64()
-            .map(LuaValue::Integer)
-            .or_else(|| value.as_f64().map(LuaValue::Number))
-            .unwrap_or(LuaValue::Nil),
-        serde_json::Value::String(value) => LuaValue::String(value),
-        serde_json::Value::Array(values) => {
-            LuaValue::Array(values.into_iter().map(json_to_lua).collect())
-        }
-        serde_json::Value::Object(values) => LuaValue::Object(
-            values
-                .into_iter()
-                .map(|(key, value)| (key, json_to_lua(value)))
-                .collect(),
-        ),
-    }
 }
 
 #[cfg(test)]

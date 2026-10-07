@@ -8,7 +8,7 @@ pub(crate) mod skill;
 use agent_plugin::Agent;
 use app_runtime_plugin::WorldEventExt;
 use core_plugin::World;
-use margatroid_types::{AgentMessage, Message};
+use margatroid_types::{MclEffectReply, Message};
 
 use crate::{ToolCallRequest, ToolError};
 
@@ -31,15 +31,15 @@ pub(crate) fn finish_tool_call(
     }
     let failed = result.is_err();
     let content = result.unwrap_or_else(|error| error.to_string());
-    world.send_event(AgentMessage {
+    world.send_event(MclEffectReply {
         id: request.turn_id,
         agent: request.agent,
-        message: Message::Tool {
+        result: Ok(Message::Tool {
             resource_id: request.resource_id,
             tool_call_id: request.tool_call_id,
             content,
             failed,
-        },
+        }),
         usage: None,
     });
 }

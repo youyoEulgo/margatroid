@@ -154,6 +154,12 @@ pub(crate) fn tool_call_route_system(world: &mut World) {
             Ok::<(), ToolError>(())
         })();
         if let Err(error) = result {
+            world.send_event(margatroid_types::MclEffectReply {
+                id: event.turn_id.clone(),
+                agent: event.agent,
+                result: Err(error.to_string()),
+                usage: None,
+            });
             world.send_event(AgentFailure {
                 id: event.turn_id,
                 agent: event.agent,

@@ -6,11 +6,11 @@ use core_plugin::{App, Plugin, Resource, World};
 use lua_runtime_plugin::{
     CancellationToken, HostFuture, LuaBindingValue, LuaEnvironment, LuaEnvironmentContext,
     LuaEnvironmentProvider, LuaGlobalBinding, LuaHostFunction, LuaRuntimeError, LuaRuntimeHandle,
-    LuaValue, LuaVmMessageArrived,
+    LuaValue,
 };
 use margatroid_types::{
-    AgentFailure, AgentMessage, CapturedInferenceResponse, InferenceRequestEvent, Message,
-    ResourceId, ToolCall, ToolCallEvent,
+    AgentFailure, CapturedInferenceResponse, InferenceRequestEvent, Message, ResourceId, ToolCall,
+    ToolCallEvent,
 };
 use resource_id_plugin::ResourceIdPluginInstalled;
 use resource_id_plugin::WorldResourceIdExt;
@@ -36,21 +36,6 @@ pub struct PendingMclEffects {
     pub effects: HashMap<String, crate::MclEffectState>,
 }
 impl Resource for PendingMclEffects {}
-
-pub struct PendingAgentDelivery {
-    pub agent: core_plugin::Entity,
-    pub vm_id: margatroid_types::LuaVmId,
-    pub receiver: tokio::sync::oneshot::Receiver<Result<crate::MclDomainValue, MclError>>,
-}
-
-#[derive(Default)]
-pub struct PendingAgentDeliveries {
-    pub deliveries: HashMap<String, PendingAgentDelivery>,
-}
-impl Resource for PendingAgentDeliveries {}
-
-pub const ENTRY_BLOCK_ID: &str = "entry";
-pub const ENTRY_INNER_ID: &str = "pending";
 
 pub struct MclPlugin {
     schedule: String,
@@ -96,8 +81,6 @@ impl Plugin for MclPlugin {
             .insert_resource(PendingMclImports::default());
         app.world_mut()
             .insert_resource(PendingMclEffects::default());
-        app.world_mut()
-            .insert_resource(PendingAgentDeliveries::default());
         let events = app.world().event_sender();
         let runtime = app
             .world()
@@ -110,12 +93,10 @@ impl Plugin for MclPlugin {
                 runtime: runtime.clone(),
             }))
             .expect("mcl provider registration failed");
-        app.add_system(&self.schedule, mcl_agent_delivery_system)
-            .add_system(&self.schedule, mcl_command_request_system)
+        app.add_system(&self.schedule, mcl_command_request_system)
             .add_system(&self.schedule, mcl_domain_system)
             .add_system(&self.schedule, mcl_import_response_system)
             .add_system(&self.schedule, mcl_effect_response_system)
-            .add_system(&self.schedule, mcl_agent_delivery_response_system)
             .add_system(&self.schedule, mcl_command_reply_system);
     }
 }
@@ -149,6 +130,18 @@ impl LuaEnvironmentProvider for MclEnvironmentProvider {
                         runtime: self.runtime.clone(),
                     })),
                 },
+                LuaGlobalBinding {
+                    name: "mcl_reserve_wait".into(),
+                    binding: LuaBindingValue::Function(Arc::new(MclReserveWaitFunction {
+                        runtime: self.runtime.clone(),
+                    })),
+                },
+                LuaGlobalBinding {
+                    name: "mcl_yield".into(),
+                    binding: LuaBindingValue::Function(Arc::new(MclYieldFunction {
+                        runtime: self.runtime.clone(),
+                    })),
+                },
             ],
             modules: Vec::new(),
         })
@@ -178,7 +171,7 @@ impl LuaHostFunction for MclWaitFunction {
                 }
             }
             let owner = context.owner.owner_id.clone();
-            let receiver = runtime.suspend(owner.clone())?;
+            let receiver = runtime.claim_suspension(&owner)?;
             tokio::select! {
                 _ = cancel.cancelled() => {
                     runtime.forget_suspension(&owner);
@@ -189,6 +182,62 @@ impl LuaHostFunction for MclWaitFunction {
                     Ok(LuaValue::Nil)
                 }
             }
+        })
+    }
+}
+
+struct MclReserveWaitFunction {
+    runtime: LuaRuntimeHandle,
+}
+
+impl LuaHostFunction for MclReserveWaitFunction {
+    fn call(
+        &self,
+        arguments: LuaValue,
+        context: LuaEnvironmentContext,
+        _cancel: CancellationToken,
+    ) -> HostFuture {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            match &arguments {
+                LuaValue::Nil => {}
+                LuaValue::Array(values) if values.is_empty() => {}
+                _ => {
+                    return Err(LuaRuntimeError::InvalidRequest(
+                        "mcl_reserve_wait takes no arguments".into(),
+                    ))
+                }
+            }
+            runtime.reserve_suspension(&context.owner.owner_id)?;
+            Ok(LuaValue::Nil)
+        })
+    }
+}
+
+struct MclYieldFunction {
+    runtime: LuaRuntimeHandle,
+}
+
+impl LuaHostFunction for MclYieldFunction {
+    fn call(
+        &self,
+        arguments: LuaValue,
+        context: LuaEnvironmentContext,
+        _cancel: CancellationToken,
+    ) -> HostFuture {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            match &arguments {
+                LuaValue::Nil => {}
+                LuaValue::Array(values) if values.is_empty() => {}
+                _ => {
+                    return Err(LuaRuntimeError::InvalidRequest(
+                        "mcl_yield takes no arguments".into(),
+                    ))
+                }
+            }
+            runtime.drop_reservation(&context.owner.owner_id);
+            Ok(LuaValue::Nil)
         })
     }
 }
@@ -506,97 +555,6 @@ fn json_to_lua(value: serde_json::Value) -> Result<LuaValue, LuaRuntimeError> {
 }
 fn lua_to_json_binding(value: LuaValue) -> Result<serde_json::Value, LuaRuntimeError> {
     lua_to_json(value).map_err(|error| LuaRuntimeError::InvalidRequest(error.to_string()))
-}
-
-pub fn mcl_agent_delivery_system(world: &mut World) {
-    let arrived = world
-        .event_reader::<LuaVmMessageArrived>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    for message in arrived {
-        let owner = message.owner.owner_id.clone();
-        let Ok(agent_id) = owner.parse::<ResourceId>() else {
-            continue;
-        };
-        let Ok(agent) = world.entity_by_resource_id(&agent_id) else {
-            continue;
-        };
-        let Ok(envelope) = lua_to_json_binding(message.value.clone()) else {
-            continue;
-        };
-        let Ok(envelope) =
-            serde_json::from_value::<margatroid_types::AgentLuaMessageEnvelope>(envelope)
-        else {
-            continue;
-        };
-        let Ok(binding) = mcl_message_to_json(envelope.message) else {
-            continue;
-        };
-        let Ok(id) =
-            crate::MclCommandId::new(format!("lua-mcl-deliver-{}-{}", owner, next_mcl_call_id()))
-        else {
-            continue;
-        };
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        world.send_event(MclCommandRequest {
-            id,
-            source: owner.clone(),
-            agent_id,
-            command: format!(
-                "INJECT ? TO {}.{}[-1]",
-                crate::ENTRY_BLOCK_ID,
-                crate::ENTRY_INNER_ID
-            ),
-            binding: Some(binding),
-            reply: crate::MclCommandReply::new(sender),
-        });
-        if let Some(pending) = world.get_resource_mut::<PendingAgentDeliveries>() {
-            pending.deliveries.insert(
-                owner,
-                PendingAgentDelivery {
-                    agent,
-                    vm_id: message.vm_id,
-                    receiver,
-                },
-            );
-        }
-    }
-}
-
-pub fn mcl_agent_delivery_response_system(world: &mut World) {
-    let ready = world
-        .get_resource_mut::<PendingAgentDeliveries>()
-        .map(|pending| {
-            let mut ready = Vec::new();
-            pending
-                .deliveries
-                .retain(|owner, delivery| match delivery.receiver.try_recv() {
-                    Ok(result) => {
-                        ready.push((owner.clone(), delivery.vm_id, result));
-                        false
-                    }
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
-                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                        ready.push((owner.clone(), delivery.vm_id, Err(MclError::EffectInvalid)));
-                        false
-                    }
-                });
-            ready
-        })
-        .unwrap_or_default();
-    for (owner, vm_id, result) in ready {
-        if let Err(error) = &result {
-            tracing::warn!(agent = %owner, vm = ?vm_id, error = %error, "entry block injection failed");
-            continue;
-        }
-        let Some(runtime) = world.get_resource::<LuaRuntimeHandle>().cloned() else {
-            continue;
-        };
-        if let Err(error) = runtime.wake(&owner) {
-            tracing::debug!(agent = %owner, vm = ?vm_id, error = %error, "the agent was not waiting");
-        }
-    }
 }
 
 pub fn mcl_command_request_system(world: &mut World) {
@@ -943,7 +901,7 @@ pub fn mcl_domain_system(world: &mut World) {
                     if let Some(state) = world
                         .entity_by_resource_id(&request.agent_id)
                         .ok()
-                        .and_then(|agent| world.get_component::<Agent>(agent))
+                        .and_then(|agent| world.get_component_mut::<Agent>(agent))
                     {
                         if let Some(turn) = state.turn.turn_id.clone() {
                             if state
@@ -954,6 +912,10 @@ pub fn mcl_domain_system(world: &mut World) {
                             {
                                 return Err(MclError::EffectInvalid);
                             }
+                            state
+                                .turn
+                                .finish(&turn)
+                                .map_err(|_| MclError::TurnMismatch)?;
                         }
                     }
                     Ok(crate::MclDomainValue::Unit)
@@ -1187,11 +1149,13 @@ pub fn mcl_effect_response_system(world: &mut World) {
                         .get_component::<Agent>(state.agent)
                         .and_then(|value| value.turn.turn_id.clone())
                         .unwrap_or_else(|| reply.id.clone());
-                    world.send_event(AgentMessage {
-                        id: turn_id,
+                    world.send_event(margatroid_types::AgentConversationObserved {
                         agent: state.agent,
-                        message: message.clone(),
-                        usage: reply.usage.clone(),
+                        turn_id,
+                        message: margatroid_types::MclMessage::new(
+                            message.clone(),
+                            reply.usage.clone(),
+                        ),
                     });
                     world.send_event(MclDomainResponse {
                         id: state.command_id,
@@ -1282,14 +1246,16 @@ pub fn mcl_effect_response_system(world: &mut World) {
                 agent.turn.abort();
             }
         }
-        tracing::warn!(agent = %agent_label, error = %error, "agent failure delivered as error message");
-        world.send_event(AgentMessage {
-            id: failure.id,
+        tracing::warn!(agent = %agent_label, error = %error, "agent failure observed");
+        world.send_event(margatroid_types::AgentConversationObserved {
             agent: failure.agent,
-            message: Message::Error {
-                message: failure.message,
-            },
-            usage: None,
+            turn_id: failure.id,
+            message: margatroid_types::MclMessage::new(
+                Message::Error {
+                    message: failure.message,
+                },
+                None,
+            ),
         });
     }
 }

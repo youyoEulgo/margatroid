@@ -188,7 +188,7 @@ mod tests {
     use super::*;
     use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
     use async_runtime_plugin::AsyncRuntimePlugin;
-    use margatroid_types::{AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId};
+    use margatroid_types::{AgentMessage, Message, ResourceId};
     use std::fs;
     use tempfile::tempdir;
 
