@@ -208,10 +208,10 @@ pub struct RefMergeDeclaration {
 }
 #[derive(Clone, Debug)]
 pub enum MclEffectCommand {
-    Start,
-    CatchInference {
-        ref_block_id: String,
-    },
+    Wake,
+    Ready,
+    StartTurn,
+    EndTurn,
     Inference {
         ref_block_id: String,
     },
@@ -292,8 +292,8 @@ pub enum MclDomainValue {
 pub type MclCommandValue = MclDomainValue;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MclPendingEffectKind {
-    Start { vm_id: margatroid_types::LuaVmId },
-    CatchInference,
+    Inference,
+    ToolCall { expected: usize },
 }
 
 pub fn compile_mcl(request: MclCompileRequest) -> Result<Arc<MclProgram>, crate::MclError> {

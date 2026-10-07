@@ -10,7 +10,7 @@ use mlua::{Lua, LuaOptions, StdLib, Value as MlValue};
 use crate::error::LuaRuntimeError;
 use crate::events::{
     LuaRuntimeCancelRequest, LuaRuntimeRequest, LuaRuntimeTaskFinished, LuaVmMessage,
-    LuaVmMessageReceiveRequest, LuaVmMessageReceived, LuaVmStarted,
+    LuaVmMessageArrived, LuaVmMessageReceiveRequest, LuaVmMessageReceived, LuaVmStarted,
 };
 use crate::types::{
     CancellationToken, LuaEnvironmentContext, LuaEnvironmentRegistry, LuaProgram, LuaRuntimeConfig,
@@ -183,6 +183,7 @@ pub(crate) fn handle_lua_runtime_cancels(
 
 pub(crate) fn handle_lua_vm_messages(world: &mut World, messages: Vec<LuaVmMessage>) {
     let mut responses = Vec::new();
+    let mut arrived = Vec::new();
     let Some(state) = world.get_resource_mut::<LuaRuntimeState>() else {
         return;
     };
@@ -195,14 +196,28 @@ pub(crate) fn handle_lua_vm_messages(world: &mut World, messages: Vec<LuaVmMessa
             responses.push(LuaVmMessageReceived {
                 id: waiting.id,
                 vm_id: message.vm_id,
-                result: Ok(message.value),
+                result: Ok(message.value.clone()),
             });
         } else if let Some(mailbox) = state.mailboxes.get_mut(&message.vm_id) {
-            mailbox.push_back(message.value);
+            mailbox.push_back(message.value.clone());
+        }
+        let owner = state
+            .sessions
+            .get(&message.vm_id)
+            .map(|session| session.owner.clone());
+        if let Some(owner) = owner {
+            arrived.push(LuaVmMessageArrived {
+                vm_id: message.vm_id,
+                owner,
+                value: message.value,
+            });
         }
     }
     for response in responses {
         world.emit_event(response);
+    }
+    for event in arrived {
+        world.emit_event(event);
     }
 }
 
@@ -662,15 +677,22 @@ mod tests {
                         "GET msg.recent_conversation" | "GET req.ctx" => {
                             Ok(MlValue::Table(lua.create_table()?))
                         }
-                        "EMIT EFFECT start" => {
-                            if counter.fetch_add(1, Ordering::Relaxed) == 0 {
+                        "GET entry.pending[0]" => {
+                            if counter.load(Ordering::Relaxed) == 0 {
                                 let message = lua.create_table()?;
-                                message.set("type", "assistant")?;
-                                Ok(MlValue::Table(message))
-                            } else {
-                                Err(mlua::Error::external("driver loop stop"))
+                                message.set("type", "user")?;
+                                counter.fetch_add(1, Ordering::Relaxed);
+                                return Ok(MlValue::Table(message));
                             }
+                            Ok(MlValue::Nil)
                         }
+                        "EMIT EFFECT inference FROM req" => {
+                            let reply = lua.create_table()?;
+                            reply.set("type", "assistant")?;
+                            reply.set("content", "ok")?;
+                            Ok(MlValue::Table(reply))
+                        }
+                        "mcl_wait" => Err(mlua::Error::external("driver loop stop")),
                         _ => Ok(MlValue::Nil),
                     }
                 },
@@ -683,6 +705,12 @@ mod tests {
         lua.globals()
             .set("mcl_expose", mcl_expose)
             .expect("mcl_expose is injected");
+        let mcl_wait = lua
+            .create_function(|_, ()| Err::<(), _>(mlua::Error::external("driver loop stop")))
+            .expect("mcl_wait stub is created");
+        lua.globals()
+            .set("mcl_wait", mcl_wait)
+            .expect("mcl_wait is injected");
 
         let result = lua.load(BASE_DRIVER).exec();
         assert!(result.is_err(), "the driver loop is stopped by the stub");
@@ -692,9 +720,13 @@ mod tests {
             "IMPORT prompt:system/soul:latest AS soul",
             "IMPORT prompt:user/compact:latest AS compact",
             "INJECT soul TO msg.system_prompt",
-            "EMIT EFFECT start",
-            "INJECT ? TO msg.recent_conversation",
+            "EMIT EFFECT ready",
+            "GET entry.pending[0]",
+            "INJECT [] TO entry.pending[0, 1]",
+            "EMIT EFFECT start_turn",
+            "EMIT EFFECT inference FROM req",
             "EMIT EFFECT history_append FROM ?",
+            "EMIT EFFECT end_turn",
             "EMIT EFFECT finish",
         ];
         let mut position = 0;

@@ -359,6 +359,16 @@ pub struct CapturedInferenceResponse {
 
 impl Event for CapturedInferenceResponse {}
 
+#[derive(Clone, Debug)]
+pub struct MclEffectReply {
+    pub id: String,
+    pub agent: Entity,
+    pub result: Result<Message, String>,
+    pub usage: Option<TokenUsage>,
+}
+
+impl Event for MclEffectReply {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallEvent {
     pub turn_id: String,

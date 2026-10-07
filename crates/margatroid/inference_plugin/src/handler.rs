@@ -10,10 +10,7 @@ use async_runtime_plugin::WorldAsyncExt;
 use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::{Entity, Resource, World};
 use futures_util::StreamExt;
-use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentMessage, CapturedInferenceResponse, Message, ResourceId,
-    ToolDefinition,
-};
+use margatroid_types::{CapturedInferenceResponse, Message, ResourceId, ToolDefinition};
 use reqwest::Url;
 use serde::Serialize;
 use server_plugin::{
@@ -457,7 +454,7 @@ fn prepare_inference(
         .client
         .clone();
     let senders = match route.output {
-        InferenceOutputKind::AgentMessage => {
+        InferenceOutputKind::MclReply => {
             let targets = world
                 .get_resource::<MargatroidConfig>()
                 .ok_or_else(|| {
@@ -845,26 +842,20 @@ pub(crate) fn handle_inference_task_output(world: &mut World, output: InferenceT
     let events = world.event_sender();
     match result {
         Ok(response) => match output.route.output {
-            InferenceOutputKind::AgentMessage => {
-                if response.content.is_none() && response.tool_calls.is_empty() {
-                    publish_inference_error(
-                        &events,
-                        output.route.clone(),
-                        InferenceError::new(
-                            InferenceErrorKind::ResponseIncomplete,
-                            "inference response contains an invalid tool call",
-                        ),
-                    );
-                    return;
-                }
-                events.send_event(AgentMessage {
-                    id: output.route.id.clone(),
-                    agent: output.route.agent,
-                    message: Message::Assistant {
+            InferenceOutputKind::MclReply => {
+                let result = if response.content.is_none() && response.tool_calls.is_empty() {
+                    Err("inference response contains neither content nor tool calls".to_owned())
+                } else {
+                    Ok(Message::Assistant {
                         reasoning: response.reasoning.clone(),
                         content: response.content.clone(),
                         tool_calls: response.tool_calls.clone(),
-                    },
+                    })
+                };
+                events.send_event(margatroid_types::MclEffectReply {
+                    id: output.route.id.clone(),
+                    agent: output.route.agent,
+                    result,
                     usage: response.usage.clone(),
                 });
             }
@@ -923,12 +914,6 @@ pub(crate) fn publish_inference_error(
     error: InferenceError,
 ) {
     match route.output {
-        InferenceOutputKind::AgentMessage => events.send_event(AgentFailure {
-            id: route.id,
-            agent: route.agent,
-            kind: AgentFailureKind::Inference,
-            message: error.to_string(),
-        }),
         InferenceOutputKind::ContextCompaction => {
             events.send_event(ContextCompactionInferenceResponse {
                 id: route.id,
@@ -936,6 +921,12 @@ pub(crate) fn publish_inference_error(
                 result: Err(error),
             })
         }
+        InferenceOutputKind::MclReply => events.send_event(margatroid_types::MclEffectReply {
+            id: route.id,
+            agent: route.agent,
+            result: Err(error.to_string()),
+            usage: None,
+        }),
         InferenceOutputKind::Captured => {
             events.send_event(margatroid_types::CapturedInferenceResponse {
                 id: route.id,

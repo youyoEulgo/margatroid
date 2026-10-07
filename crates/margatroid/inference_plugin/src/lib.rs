@@ -223,16 +223,16 @@ api_type = "openai"
         });
         app.tick();
         app.tick();
-        let failure = app
+        let reply = app
             .world()
-            .event_reader::<AgentFailure>()
+            .event_reader::<margatroid_types::MclEffectReply>()
             .into_iter()
             .next()
+            .cloned()
             .unwrap();
-        assert_eq!(failure.id, "request");
-        assert_eq!(failure.kind, AgentFailureKind::Inference);
+        assert_eq!(reply.id, "request");
         assert_eq!(
-            failure.message,
+            reply.result.err().unwrap(),
             "InferenceSnapshotMissing: agent inference snapshot is missing"
         );
 

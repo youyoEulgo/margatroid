@@ -33,6 +33,13 @@ pub struct LuaVmMessage {
     pub value: LuaValue,
 }
 impl Event for LuaVmMessage {}
+#[derive(Clone, Debug, PartialEq)]
+pub struct LuaVmMessageArrived {
+    pub vm_id: LuaVmId,
+    pub owner: LuaVmOwner,
+    pub value: LuaValue,
+}
+impl Event for LuaVmMessageArrived {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LuaVmMessageReceiveRequest {
     pub id: String,

@@ -19,5 +19,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
 tempfile = "3"
 tracing-subscriber = { workspace = true }

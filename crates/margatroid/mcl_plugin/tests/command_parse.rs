@@ -162,9 +162,15 @@ fn parses_sandbox_use_arguments() {
 #[test]
 fn parses_uniform_effect_arguments() {
     assert!(matches!(
-        parse_operation("EMIT EFFECT start", None).unwrap(),
+        parse_operation("EMIT EFFECT wake", None).unwrap(),
         MclOperation::Emit {
-            effect: MclEffectCommand::Start
+            effect: MclEffectCommand::Wake
+        }
+    ));
+    assert!(matches!(
+        parse_operation("EMIT EFFECT ready", None).unwrap(),
+        MclOperation::Emit {
+            effect: MclEffectCommand::Ready
         }
     ));
     assert!(matches!(
@@ -179,7 +185,8 @@ fn parses_uniform_effect_arguments() {
             effect: MclEffectCommand::VisibilitySource { .. }
         }
     ));
-    assert!(parse_operation("EMIT EFFECT start FROM req", None).is_err());
+    assert!(parse_operation("EMIT EFFECT wake FROM req", None).is_err());
+    assert!(parse_operation("EMIT EFFECT start", None).is_err());
     assert!(parse_operation("EMIT EFFECT inference (req)", None).is_err());
     assert!(parse_operation("EMIT EFFECT tool_call ?", Some(&json!([]))).is_err());
 }

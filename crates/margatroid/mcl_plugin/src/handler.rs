@@ -148,10 +148,28 @@ fn parse_effect(
 ) -> Result<MclOperation, MclError> {
     let effect = words.get(2).copied().ok_or(MclError::EffectInvalid)?;
     match effect {
-        "start" if words.len() == 3 => {
+        "wake" if words.len() == 3 => {
             reject_binding(binding)?;
             Ok(MclOperation::Emit {
-                effect: MclEffectCommand::Start,
+                effect: MclEffectCommand::Wake,
+            })
+        }
+        "ready" if words.len() == 3 => {
+            reject_binding(binding)?;
+            Ok(MclOperation::Emit {
+                effect: MclEffectCommand::Ready,
+            })
+        }
+        "start_turn" if words.len() == 3 => {
+            reject_binding(binding)?;
+            Ok(MclOperation::Emit {
+                effect: MclEffectCommand::StartTurn,
+            })
+        }
+        "end_turn" if words.len() == 3 => {
+            reject_binding(binding)?;
+            Ok(MclOperation::Emit {
+                effect: MclEffectCommand::EndTurn,
             })
         }
         "finish" if words.len() == 3 => {
@@ -165,15 +183,6 @@ fn parse_effect(
             validate_identifier(words[4])?;
             Ok(MclOperation::Emit {
                 effect: MclEffectCommand::Inference {
-                    ref_block_id: words[4].to_owned(),
-                },
-            })
-        }
-        "catch_inference" if words.len() == 5 && words[3] == "FROM" => {
-            reject_binding(binding)?;
-            validate_identifier(words[4])?;
-            Ok(MclOperation::Emit {
-                effect: MclEffectCommand::CatchInference {
                     ref_block_id: words[4].to_owned(),
                 },
             })
@@ -234,7 +243,8 @@ fn parse_effect(
         }
         "visibility_source" if words.len() == 5 && words[3] == "FROM" => {
             reject_binding(binding)?;
-            let MclSelector::All(source) = parse_selector(words[4], MclSelectorPosition::Get)? else {
+            let MclSelector::All(source) = parse_selector(words[4], MclSelectorPosition::Get)?
+            else {
                 return Err(MclError::InvalidCommand);
             };
             Ok(MclOperation::Emit {
@@ -243,7 +253,8 @@ fn parse_effect(
         }
         "default_visibility_source" if words.len() == 5 && words[3] == "FROM" => {
             reject_binding(binding)?;
-            let MclSelector::All(source) = parse_selector(words[4], MclSelectorPosition::Get)? else {
+            let MclSelector::All(source) = parse_selector(words[4], MclSelectorPosition::Get)?
+            else {
                 return Err(MclError::InvalidCommand);
             };
             Ok(MclOperation::Emit {
@@ -446,10 +457,7 @@ fn parse_endpoint(value: &str) -> Result<MclEndpoint, MclError> {
         .map_err(|_| MclError::InvalidCommand)
 }
 
-fn parse_selector(
-    value: &str,
-    position: MclSelectorPosition,
-) -> Result<MclSelector, MclError> {
+fn parse_selector(value: &str, position: MclSelectorPosition) -> Result<MclSelector, MclError> {
     let (path_value, suffix) = match value.find('[') {
         Some(index) => {
             if !value.ends_with(']') {
@@ -479,10 +487,7 @@ fn parse_selector(
 }
 
 fn parse_index(value: &str) -> Result<i64, MclError> {
-    value
-        .trim()
-        .parse()
-        .map_err(|_| MclError::InvalidCommand)
+    value.trim().parse().map_err(|_| MclError::InvalidCommand)
 }
 
 fn map_selector(selector: &MclSelector, length: usize) -> Result<MclSelector, MclError> {
@@ -518,6 +523,9 @@ fn map_single(
     index: i64,
     length: usize,
 ) -> Result<(usize, usize), MclError> {
+    if length == 0 && index == 0 && position == MclSelectorPosition::Get {
+        return Ok((0, 0));
+    }
     let offset = length as i64 + 1;
     let (start, end) = match (index >= 0, position) {
         (true, MclSelectorPosition::Get) => (index, index + 1),
@@ -539,9 +547,10 @@ fn map_endpoints(
         (MclEndpoint::Open, MclEndpoint::Value(end)) => {
             (0, if end >= 0 { end } else { offset + end })
         }
-        (MclEndpoint::Value(start), MclEndpoint::Open) => {
-            (if start >= 0 { start } else { offset + start }, length as i64)
-        }
+        (MclEndpoint::Value(start), MclEndpoint::Open) => (
+            if start >= 0 { start } else { offset + start },
+            length as i64,
+        ),
         (MclEndpoint::Value(start), MclEndpoint::Value(end)) => {
             if (start < 0) != (end < 0) {
                 return Err(MclError::InvalidCommand);
@@ -581,10 +590,7 @@ fn get_selector_value(
     selector: &MclSelector,
 ) -> Result<MclDomainValue, MclError> {
     let path = selector_path(selector);
-    let length = mcl
-        .select(&path)
-        .map_err(|_| MclError::TypeMismatch)?
-        .len();
+    let length = mcl.select(&path).map_err(|_| MclError::TypeMismatch)?.len();
     let standard = map_selector(selector, length)?;
     let values = select_standard(mcl, &standard)?;
     match selector {
@@ -610,10 +616,7 @@ fn select_selector(
     selector: &MclSelector,
 ) -> Result<BlockInner, MclError> {
     let path = selector_path(selector);
-    let length = mcl
-        .select(&path)
-        .map_err(|_| MclError::TypeMismatch)?
-        .len();
+    let length = mcl.select(&path).map_err(|_| MclError::TypeMismatch)?.len();
     let standard = map_selector(selector, length)?;
     select_standard(mcl, &standard)
 }

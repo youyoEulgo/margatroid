@@ -274,6 +274,7 @@ impl Resource for LuaRuntimeState {}
 pub struct LuaRuntimeHandle {
     pub(crate) events: RuntimeEventSender,
     pub(crate) environments: Arc<RwLock<LuaEnvironmentRegistry>>,
+    pub(crate) suspended: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
 }
 impl Resource for LuaRuntimeHandle {}
 impl LuaRuntimeHandle {
@@ -305,6 +306,37 @@ impl LuaRuntimeHandle {
             .send_event(LuaVmMessageReceiveRequest { id, vm_id });
         Ok(())
     }
+    pub fn suspend(&self, owner: String) -> Result<oneshot::Receiver<()>, LuaRuntimeError> {
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut suspended = self
+                .suspended
+                .lock()
+                .map_err(|_| LuaRuntimeError::RuntimeClosed)?;
+            if suspended.insert(owner.clone(), sender).is_some() {
+                return Err(LuaRuntimeError::InvalidRequest(
+                    "a VM may only wait once at a time".into(),
+                ));
+            }
+        }
+        Ok(receiver)
+    }
+    pub fn wake(&self, owner: &str) -> Result<(), LuaRuntimeError> {
+        let sender = self
+            .suspended
+            .lock()
+            .map_err(|_| LuaRuntimeError::RuntimeClosed)?
+            .remove(owner)
+            .ok_or_else(|| LuaRuntimeError::InvalidRequest("the VM is not waiting".into()))?;
+        sender
+            .send(())
+            .map_err(|_| LuaRuntimeError::VmExecutionFailed("the VM is no longer waiting".into()))
+    }
+    pub fn forget_suspension(&self, owner: &str) {
+        if let Ok(mut suspended) = self.suspended.lock() {
+            suspended.remove(owner);
+        }
+    }
     pub fn cancel(&self, request_id: &str) -> Result<(), LuaRuntimeError> {
         self.events.send_event(LuaRuntimeCancelRequest {
             request_id: request_id.to_owned(),
@@ -320,5 +352,8 @@ impl LuaRuntimeHandle {
             .write()
             .map_err(|_| LuaRuntimeError::RuntimeClosed)?
             .register(provider)
+    }
+    pub fn environments(&self) -> &Arc<RwLock<LuaEnvironmentRegistry>> {
+        &self.environments
     }
 }
