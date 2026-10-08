@@ -1,0 +1,8 @@
+[package]
+name = "library_component_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core_plugin = { path = "../../mecs/core_plugin" }
+app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }

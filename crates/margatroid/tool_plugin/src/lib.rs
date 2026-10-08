@@ -14,16 +14,13 @@ use margatroid_types::{ResourceId, ToolCall};
 
 pub use error::{ToolError, ToolErrorKind};
 pub use events::{CancelToolTurn, ToolCallEvent, ToolRegisterRequest, ToolRegisterResponse};
-pub use types::{
-    AgentToolEnvironment, ResourceContent, ResourceMapEntry, ToolCallRequest, ToolTemplate,
-};
+pub use types::{ResourceContent, ResourceMapEntry, ToolCallRequest, ToolTemplate};
 
 use system::{cancel_tool_turn_system, tool_call_route_system, tool_register_system};
 
 pub struct ToolPlugin {
     schedule: String,
     lua_limits: handler::lua::LuaExecutionLimits,
-    shell_limits: handler::shell::ShellExecutionLimits,
 }
 
 impl ToolPlugin {
@@ -42,7 +39,6 @@ impl ToolPlugin {
         Ok(Self {
             schedule: RuntimePlugin::UPDATE.to_owned(),
             lua_limits: handler::lua::LuaExecutionLimits::default(),
-            shell_limits: handler::shell::ShellExecutionLimits::default(),
         })
     }
 
@@ -57,7 +53,6 @@ impl Default for ToolPlugin {
         Self {
             schedule: RuntimePlugin::UPDATE.to_owned(),
             lua_limits: handler::lua::LuaExecutionLimits::default(),
-            shell_limits: handler::shell::ShellExecutionLimits::default(),
         }
     }
 }
@@ -90,13 +85,11 @@ impl Plugin for ToolPlugin {
         }
         app.world_mut().insert_resource(ToolPluginInstalled);
         app.world_mut().insert_resource(self.lua_limits);
-        app.world_mut().insert_resource(self.shell_limits);
         app.add_system(&self.schedule, tool_register_system)
             .add_system(&self.schedule, handler::skill::skill_register_system)
             .add_system(&self.schedule, handler::hook::hook_register_system)
             .add_system(&self.schedule, handler::sandbox::sandbox_register_system)
             .add_system(&self.schedule, handler::lua::lua_tool_register_system)
-            .add_system(&self.schedule, handler::shell::shell_register_system)
             .add_system(&self.schedule, tool_call_route_system)
             .add_async_system(&self.schedule, handler::lua::execute_prepared_lua_tool)
             .add_system(&self.schedule, handler::lua::lua_task_result_system)
@@ -147,7 +140,7 @@ pub fn candidate_resource_entry(
 }
 
 /// The same candidate entry, carrying content that later stages need — a
-/// sandbox's policy or a shell's script — alongside the template.
+/// sandbox's policy — alongside the template.
 pub fn candidate_resource_entry_with_content(
     resource_id: ResourceId,
     alias: Option<String>,

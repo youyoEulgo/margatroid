@@ -50,7 +50,6 @@ src/handler/
 ├── lua.rs           lua 工具注册、准备与异步执行
 ├── pty.rs           命令的终端执行：分配 PTY、回收进程组、超时与输出限额
 ├── sandbox.rs       沙箱策略解析、受限 spawn 与进程组
-└── shell.rs         shell 资源注册：只供给解释器脚本，不暴露为工具
 ```
 
 # lib
@@ -64,9 +63,7 @@ ToolPlugin：工具插件，公开结构体--统一安装内置工具根、注�
     skill_root: Arc<PathBuf>--skill 根目录，私有
     hook_root: Arc<PathBuf>--hook 根目录，私有
     lua_root: Arc<PathBuf>--lua 工具根目录，私有
-    shell_root: Arc<PathBuf>--shell 根目录，私有
     lua_limits: LuaExecutionLimits--Lua 执行限制，公开（runner bin 目标要按同一份限额构造请求）
-    shell_limits: ShellExecutionLimits--Shell 包读取限额，私有
     open(root: impl Into<PathBuf>) -> Result<Self, ToolError>
         打开插件：公开关联函数，要求 root 绝对且无父级跳转
     with_schedule(mut self, schedule: impl Into<String>) -> Self
@@ -75,7 +72,7 @@ ToolPlugin：工具插件，公开结构体--统一安装内置工具根、注�
     impl Plugin for ToolPlugin
         build(self, app: &mut App)
             安装插件：要求 RuntimePlugin 和 AsyncRuntimePlugin 已安装
-            插入 ToolPluginInstalled、四类 roots 与 lua/shell 限额
+            插入 ToolPluginInstalled、三类 roots 与 lua 限额
             依次挂载注册、调用路由、异步执行、任务结果、取消和清理 System
 
 ToolPluginInstalled：工具插件安装标记，公开单元 Resource
@@ -108,14 +105,13 @@ crate公开：
 tool_register_system(world: &mut World)
     注册路由 System
     处理事件：ToolRegisterRequest
-    行为：id 为空 -> InvalidRequest；skill/hook/shell/tool 类型交给对应 handler；tool:builtin/* 除 hook 外拒绝；未知类型 -> ProviderMissing
-    说明：shell 类型只做资源注册，注册结果不带工具身份，因此模型看不到它
+    行为：id 为空 -> InvalidRequest；skill/hook/tool 类型交给对应 handler；tool:builtin/* 除 hook 外拒绝；未知类型 -> ProviderMissing
 
 tool_call_route_system(world: &mut World)
     调用路由 System
     处理事件：ToolCallEvent
     行为：校验事件和参数，解析 ToolCallRequest，写入 Agent.tools.pending，按 tool_id 分派 skill/hook/lua handler
-    说明：shell 已不再是模型可调用的工具，命令统一经 Lua 工具的 margatroid().shell 执行
+    说明：命令统一经 Lua 工具的 margatroid().shell 执行，shell 不是资源也不是工具
 
 tool_message_cleanup_system(world: &mut World)
     消息清理 System
@@ -244,7 +240,7 @@ install_lua_environment(lua, handle) -> Result<Table, ToolError>
           把全局 margatroid 设为"返回该表"的函数；arguments 由 run_lua_tool 在调用前填入
     注入面：json 的 encode / decode 用 serde_json 直接实现；
             shell(command, options?) 走 runner 内的终端执行，返回 { exit_code, stdout, truncated, terminal }；
-            agent 未导入 shell 时该函数报"imports no shell"，而不是返回一个空结果
+            命令为空时该函数报错，而不是返回一个空结果
     约束：不再有 fs / process / http / json / log 这些表——文件、网络、派生一律走标准库，由沙箱约束；
           命令执行没有走 io.popen，因为管道没有终端、没有可回收的进程组、也没有执行限额
 
@@ -254,8 +250,7 @@ run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError>
           → 把 arguments 填进入口表 → 加载 main.lua → 调用全局 execute → 结果长度不超过 max_output_bytes
     行为补充：工具包内容由 daemon 读取后随请求下发，沙箱内不再有进程需要读镜像根
     约束：request 携带 metadata、schema、script、temp_dir、arguments、agent_id、turn_id、
-          resource_id、project_root、limits、sandbox_policies 与 shell_script；
-          shell_script 由 host 落地成文件后再传路径，因为 runner 可能处在禁止写暂存区的策略下
+          resource_id、project_root、limits 与 sandbox_policies；
 
 spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolError>
     派生 runner 执行工具：私有异步函数
@@ -278,7 +273,6 @@ tool_runner（src/bin/tool_runner.rs，bin 目标）：独立进程执行 Lua �
     输出：工具返回值原样写 stdout
     退出码：0 成功；2 插件侧问题（InvalidRequest / InvalidArguments / InvalidDefinition）；3 工具执行失败
     stderr：非零退出时输出 {"kind": "...", "message": "..."}，供 spawn_tool_runner 还原
-shell.rs shell_register_system（只注册 shell 资源，注册结果携带解释器脚本而不带工具身份）
 pty.rs   run_in_pty（分配 PTY 或退回管道执行命令；回收进程组、施加超时与输出限额）
         说明：终端不可用时退回管道而不是失败，两路输出都会合并成一路交给调用方
 ```
@@ -319,14 +313,6 @@ ToolCallEvent：模型工具调用事件，公开 re-export
 
 公开：
 ```text
-AgentToolEnvironment：Agent 工具环境，公开组件
-    project_root: Arc<PathBuf>--项目根目录，私有
-    image_root: Arc<PathBuf>--镜像根目录，私有
-    new(project_root, image_root) -> Self
-    project_root(&self) -> &Path
-    image_root(&self) -> &Path
-    impl Component for AgentToolEnvironment
-
 ToolTemplate：工具模板，公开结构体
     name: String--模型可见名称
     description: String--模型可见描述
@@ -438,7 +424,6 @@ App
     ├── ToolPluginInstalled
     ├── SkillRoots / HookRoots / LuaRoots / ShellRoots
     ├── LuaExecutionLimits
-    ├── ShellExecutionLimits
     └── Agent
         ├── resources: AgentResourceMap
         └── tools.pending: HashMap<(Entity, String, String), AgentToolPending>

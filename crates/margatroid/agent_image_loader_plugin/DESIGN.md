@@ -93,6 +93,7 @@ AgentImage：AgentImage 图书馆组件，公开 Component--AgentImage Entity �
     default_visibility(&self) -> impl Iterator<Item = &ResourceId> + '_
         读取默认可见资源：公开方法
     impl MecsComponent for AgentImage
+    impl LibraryComponent for AgentImage
 
 AgentImageLoaderPlugin：AgentImage 加载插件，公开结构体--配置镜像库根目录、加载限制和处理 Schedule
     root: PathBuf--agent-images 根目录，私有

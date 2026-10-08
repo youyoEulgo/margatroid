@@ -44,7 +44,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 lib 只放图书馆组件、Resource 和 Plugin。
 
-InferencePlugin 不创建 Entity，不挂载任何领域 Component；AgentInferenceSnapshot 是 types 中定义的领域 Component，由 workspace_plugin 通过 WorldInferenceExt 挂载到 Agent。
+InferencePlugin 不创建 Entity，不挂载任何图书馆组件；推理所需的模型与上下文窗口取自 Agent.info.model，采样参数取自 AgentImage。
 
 ## 类型
 
@@ -474,24 +474,6 @@ InferenceParameters：推理参数，公开结构体--Provider无关采样参数
         读取停止序列：公开方法
     validate(&self) -> Result<(), InferenceError>
         校验参数：crate公开方法，校验范围、停止序列数量和长度
-
-AgentInferenceSnapshot：Agent固定推理配置，公开Component--workspace_plugin通过WorldInferenceExt挂载
-    model: ModelId--模型ID，crate公开
-    context_window_tokens: u64--模型上下文窗口Token数，crate公开
-    parameters: InferenceParameters--采样参数，crate公开
-    workspace: Entity--所属Workspace，crate公开
-    source_image: Entity--来源AgentImage，crate公开
-    model(&self) -> &ModelId
-        读取模型ID：公开方法
-    context_window_tokens(&self) -> u64
-        读取上下文窗口：公开方法
-    parameters(&self) -> &InferenceParameters
-        读取参数：公开方法
-    workspace(&self) -> Entity
-        读取Workspace：公开方法
-    source_image(&self) -> Entity
-        读取来源镜像：公开方法
-    impl Component for AgentInferenceSnapshot
 
 ConfiguredModelRoute：模型路由配置，公开结构体
     model: String--Provider模型名，crate公开

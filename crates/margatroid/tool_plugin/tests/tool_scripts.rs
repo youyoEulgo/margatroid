@@ -52,12 +52,7 @@ fn limits() -> LuaExecutionLimits {
 }
 
 /// Run one tool script from the coder image against a scratch project.
-fn run_tool(
-    tool: &str,
-    arguments: &str,
-    project_root: &Path,
-    shell_script: Option<PathBuf>,
-) -> Result<String, String> {
+fn run_tool(tool: &str, arguments: &str, project_root: &Path) -> Result<String, String> {
     let image = image_root().ok_or("the agent image root is not available")?;
     let package = image
         .join("local/coder/latest/tools/local")
@@ -82,7 +77,6 @@ fn run_tool(
         project_root: project_root.to_path_buf(),
         limits: limits(),
         sandbox_policies: Vec::new(),
-        shell_script: shell_script.map(std::sync::Arc::new),
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -102,12 +96,6 @@ fn scratch(name: &str) -> PathBuf {
     directory
 }
 
-fn stage_shell(project_root: &Path) -> PathBuf {
-    let script = project_root.join("main.sh");
-    std::fs::write(&script, "exec bash -lc \"$1\"\n").expect("shell script");
-    script
-}
-
 #[test]
 fn the_glob_tool_lists_files_through_the_injected_shell() {
     let Some((runner, _)) = ready("glob") else {
@@ -119,10 +107,9 @@ fn the_glob_tool_lists_files_through_the_injected_shell() {
     std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
     std::fs::write(project.join("README.md"), "# hi\n").unwrap();
-    let shell = stage_shell(&project);
 
     std::env::set_var("MARGATROID_TOOL_RUNNER", &runner);
-    let result = run_tool("glob", r#"{"pattern":"**/*.rs"}"#, &project, Some(shell));
+    let result = run_tool("glob", r#"{"pattern":"**/*.rs"}"#, &project);
     std::env::remove_var("MARGATROID_TOOL_RUNNER");
 
     let output = result.expect("glob should run");
@@ -141,22 +128,11 @@ fn the_grep_tool_reports_matches_and_no_match_is_not_an_error() {
     let project = scratch("grep");
     std::fs::create_dir_all(project.join("src")).unwrap();
     std::fs::write(project.join("src/a.rs"), "let needle = 1;\n").unwrap();
-    let shell = stage_shell(&project);
 
     std::env::set_var("MARGATROID_TOOL_RUNNER", &runner);
-    let matched = run_tool(
-        "grep",
-        r#"{"pattern":"needle"}"#,
-        &project,
-        Some(shell.clone()),
-    );
+    let matched = run_tool("grep", r#"{"pattern":"needle"}"#, &project);
     // ripgrep exits 1 for "no match", which the tool must not treat as failure.
-    let unmatched = run_tool(
-        "grep",
-        r#"{"pattern":"definitely-not-present"}"#,
-        &project,
-        Some(shell),
-    );
+    let unmatched = run_tool("grep", r#"{"pattern":"definitely-not-present"}"#, &project);
     std::env::remove_var("MARGATROID_TOOL_RUNNER");
 
     let matched = matched.expect("grep should run");
@@ -178,10 +154,9 @@ fn the_list_directory_tool_returns_entries_through_the_injected_shell() {
     let project = scratch("list");
     std::fs::create_dir_all(project.join("src")).unwrap();
     std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
-    let shell = stage_shell(&project);
 
     std::env::set_var("MARGATROID_TOOL_RUNNER", &runner);
-    let result = run_tool("list-directory", r#"{"path":"src"}"#, &project, Some(shell));
+    let result = run_tool("list-directory", r#"{"path":"src"}"#, &project);
     std::env::remove_var("MARGATROID_TOOL_RUNNER");
 
     let output = result.expect("list-directory should run");
@@ -196,27 +171,6 @@ fn the_list_directory_tool_returns_entries_through_the_injected_shell() {
 }
 
 #[test]
-fn a_tool_without_a_shell_reports_that_clearly() {
-    let Some((runner, _)) = ready("glob") else {
-        eprintln!("skipping: the coder image or tool_runner is unavailable");
-        return;
-    };
-    let project = scratch("noshell");
-    std::fs::write(project.join("a.txt"), "x\n").unwrap();
-
-    std::env::set_var("MARGATROID_TOOL_RUNNER", &runner);
-    let result = run_tool("glob", r#"{"pattern":"*.txt"}"#, &project, None);
-    std::env::remove_var("MARGATROID_TOOL_RUNNER");
-
-    let error = result.expect_err("a tool without a shell cannot search");
-    assert!(
-        error.contains("imports no shell"),
-        "expected the no-shell wording: {error}"
-    );
-    let _ = std::fs::remove_dir_all(&project);
-}
-
-#[test]
 fn the_bash_tool_reports_an_outcome_the_model_can_read_directly() {
     let Some((runner, _)) = ready("bash") else {
         eprintln!("skipping: the coder image or tool_runner is unavailable");
@@ -224,16 +178,10 @@ fn the_bash_tool_reports_an_outcome_the_model_can_read_directly() {
     };
     let project = scratch("bash");
     std::fs::write(project.join("note.txt"), "hi\n").unwrap();
-    let shell = stage_shell(&project);
 
     std::env::set_var("MARGATROID_TOOL_RUNNER", &runner);
-    let failed = run_tool(
-        "bash",
-        r#"{"cmd":"echo hello; exit 3"}"#,
-        &project,
-        Some(shell.clone()),
-    );
-    let succeeded = run_tool("bash", r#"{"cmd":"echo fine"}"#, &project, Some(shell));
+    let failed = run_tool("bash", r#"{"cmd":"echo hello; exit 3"}"#, &project);
+    let succeeded = run_tool("bash", r#"{"cmd":"echo fine"}"#, &project);
     std::env::remove_var("MARGATROID_TOOL_RUNNER");
 
     // The envelope carries two fields: what the model reads, and whether the
@@ -263,10 +211,9 @@ fn the_bash_tool_runs_with_the_project_root_as_its_working_directory() {
     };
     let project = scratch("bash-cwd");
     std::fs::write(project.join("marker.txt"), "here\n").unwrap();
-    let shell = stage_shell(&project);
 
     std::env::set_var("MARGATROID_TOOL_RUNNER", &runner);
-    let result = run_tool("bash", r#"{"cmd":"cat marker.txt"}"#, &project, Some(shell));
+    let result = run_tool("bash", r#"{"cmd":"cat marker.txt"}"#, &project);
     std::env::remove_var("MARGATROID_TOOL_RUNNER");
 
     let output = result.expect("bash should run");
@@ -284,11 +231,10 @@ fn a_failing_command_with_no_output_still_says_something() {
         return;
     };
     let project = scratch("bash-silent");
-    let shell = stage_shell(&project);
 
     std::env::set_var("MARGATROID_TOOL_RUNNER", &runner);
-    let failed = run_tool("bash", r#"{"cmd":"exit 4"}"#, &project, Some(shell.clone()));
-    let quiet = run_tool("bash", r#"{"cmd":"true"}"#, &project, Some(shell));
+    let failed = run_tool("bash", r#"{"cmd":"exit 4"}"#, &project);
+    let quiet = run_tool("bash", r#"{"cmd":"true"}"#, &project);
     std::env::remove_var("MARGATROID_TOOL_RUNNER");
 
     // A tool that can answer at all must answer with something the model can act

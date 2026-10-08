@@ -16,7 +16,7 @@ pub use error::{InferenceError, InferenceErrorKind};
 pub use events::*;
 pub use handler::WorldInferenceExt;
 pub use types::{
-    AgentInferenceSnapshot, ConfiguredModelRoute, DeepSeekAdapterFactory, ErasedProviderAdapter,
+    ConfiguredModelRoute, DeepSeekAdapterFactory, ErasedProviderAdapter,
     ErasedProviderAdapterFactory, InferenceParameters, ModelId, ModelRoutesReloaded,
     OpenAiAdapterFactory, ProviderAdapter, ProviderAdapterFactory, ProviderHttpRequest,
     ProviderInferenceResponse, ProviderInput, ProviderResponseAccumulator, ProviderRouteInput,

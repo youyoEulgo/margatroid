@@ -1,7 +1,6 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::Duration;
 
 use margatroid_types::ResourceId;
@@ -20,8 +19,6 @@ struct RunnerRequest {
     resource_id: String,
     project_root: PathBuf,
     limits: RunnerLimits,
-    #[serde(default)]
-    shell_script: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -127,7 +124,6 @@ async fn main() -> ExitCode {
         project_root: request.project_root,
         limits,
         sandbox_policies: Vec::new(),
-        shell_script: request.shell_script.map(Arc::new),
     })
     .await;
     match outcome {

@@ -53,6 +53,7 @@ impl Agent {
 }
 
 impl Component for Agent {}
+impl library_component_plugin::LibraryComponent for Agent {}
 
 pub struct AgentPlugin {
     schedule: String,

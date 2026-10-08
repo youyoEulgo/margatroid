@@ -2,7 +2,6 @@ pub(crate) mod hook;
 pub(crate) mod lua;
 pub(crate) mod pty;
 pub(crate) mod sandbox;
-pub(crate) mod shell;
 pub(crate) mod skill;
 
 use agent_plugin::Agent;

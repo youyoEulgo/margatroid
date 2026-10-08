@@ -117,6 +117,7 @@ Agent：Agent Entity的数据图书馆，公开Component--组件存在本身表�
     mcl_mut(&mut self) -> &mut AgentMcl
         修改MCL数据：公开方法，只能通过AgentMcl公开的封装方法操作其私有存储
     impl Component for Agent
+    impl LibraryComponent for Agent
 
 AgentPluginInstalled：AgentPlugin安装标记，公开Resource
     impl Resource for AgentPluginInstalled
