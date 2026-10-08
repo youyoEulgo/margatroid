@@ -815,20 +815,23 @@ pub fn mcl_domain_system(world: &mut World) {
                             expected: calls.len(),
                         },
                         collected: Vec::new(),
+                        expected_calls: calls.iter().map(|call| call.id.clone()).collect(),
                         reply: request.reply.clone(),
                     };
                     let pending = world
                         .get_resource_mut::<PendingMclEffects>()
                         .ok_or(MclError::EffectAlreadyPending)?;
-                    if pending.effects.insert(effect_id.clone(), state).is_some() {
+                    if pending.effects.contains_key(&effect_id) {
                         return Err(MclError::EffectAlreadyPending);
                     }
+                    pending.effects.insert(effect_id.clone(), state);
                     handled.set(true);
                     let mut rejected = Vec::new();
                     for call in calls {
                         if allowed_tools.contains(&call.tool_name) {
                             world.send_event(ToolCallEvent {
-                                turn_id: effect_id.clone(),
+                                effect_id: effect_id.clone(),
+                                turn_id: turn_id.clone(),
                                 agent,
                                 call,
                             });
@@ -1097,14 +1100,16 @@ fn begin_inference(
         vm_id: None,
         kind: crate::MclPendingEffectKind::Inference,
         collected: Vec::new(),
+        expected_calls: Vec::new(),
         reply: request.reply,
     };
     let pending = world
         .get_resource_mut::<PendingMclEffects>()
         .ok_or(MclError::EffectAlreadyPending)?;
-    if pending.effects.insert(effect_id.clone(), state).is_some() {
+    if pending.effects.contains_key(&effect_id) {
         return Err(MclError::EffectAlreadyPending);
     }
+    pending.effects.insert(effect_id.clone(), state);
     world.send_event(InferenceRequestEvent {
         id: effect_id.clone(),
         agent,
@@ -1166,21 +1171,66 @@ pub fn mcl_effect_response_system(world: &mut World) {
                         reply: state.reply,
                     });
                 }
-                crate::MclPendingEffectKind::ToolCall { expected } => {
-                    state.collected.push(message);
-                    if state.collected.len() < *expected {
+                crate::MclPendingEffectKind::ToolCall { .. } => {
+                    let margatroid_types::Message::Tool { tool_call_id, .. } = &message else {
+                        world.send_event(MclDomainResponse {
+                            id: state.command_id,
+                            agent_id: state.agent_id,
+                            result: Err(MclError::EffectResponseMismatch),
+                            reply: state.reply,
+                        });
+                        continue;
+                    };
+                    if !state.expected_calls.iter().any(|id| id == tool_call_id) {
                         if let Some(pending) = world.get_resource_mut::<PendingMclEffects>() {
                             pending.effects.insert(reply.id.clone(), state);
                         }
                         continue;
                     }
+                    let already = state.collected.iter().any(|collected| {
+                        matches!(
+                            collected,
+                            margatroid_types::Message::Tool { tool_call_id: seen, .. }
+                                if seen == tool_call_id
+                        )
+                    });
+                    if already {
+                        if let Some(pending) = world.get_resource_mut::<PendingMclEffects>() {
+                            pending.effects.insert(reply.id.clone(), state);
+                        }
+                        continue;
+                    }
+                    if let Some(agent_state) = world.get_component_mut::<Agent>(state.agent) {
+                        agent_state.tools.pending.retain(|(entity, _, call_id), _| {
+                            *entity != state.agent || call_id != tool_call_id
+                        });
+                    }
+                    state.collected.push(message);
+                    if state.collected.len() < state.expected_calls.len() {
+                        if let Some(pending) = world.get_resource_mut::<PendingMclEffects>() {
+                            pending.effects.insert(reply.id.clone(), state);
+                        }
+                        continue;
+                    }
+                    let mut ordered = Vec::with_capacity(state.collected.len());
+                    for id in &state.expected_calls {
+                        if let Some(position) = state.collected.iter().position(|collected| {
+                            matches!(
+                                collected,
+                                margatroid_types::Message::Tool { tool_call_id, .. }
+                                    if tool_call_id == id
+                            )
+                        }) {
+                            ordered.push(state.collected.remove(position));
+                        }
+                    }
+                    ordered.extend(state.collected);
                     world.send_event(MclDomainResponse {
                         id: state.command_id,
                         agent_id: state.agent_id,
                         result: Ok(crate::MclDomainValue::Inner(
                             margatroid_types::BlockInner::Message(
-                                state
-                                    .collected
+                                ordered
                                     .into_iter()
                                     .map(|message| margatroid_types::MclMessage::new(message, None))
                                     .collect(),

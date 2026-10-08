@@ -370,6 +370,7 @@ impl Event for MclEffectReply {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallEvent {
+    pub effect_id: String,
     pub turn_id: String,
     pub agent: Entity,
     pub call: ToolCall,

@@ -185,6 +185,13 @@ fn send_effect_collecting(
     (answered.expect("the effect was never answered"), events)
 }
 
+fn wait_for(handle: &LuaRuntimeHandle, owner: &str) -> tokio::sync::oneshot::Receiver<()> {
+    handle
+        .reserve_suspension(owner)
+        .expect("the wait is reserved");
+    handle.claim_suspension(owner).expect("the wait is claimed")
+}
+
 fn turn_of(world: &World, agent: Entity) -> Option<String> {
     world
         .get_component::<Agent>(agent)
@@ -199,9 +206,7 @@ fn a_waiting_agent_is_released_by_wake() {
         .get_resource::<LuaRuntimeHandle>()
         .cloned()
         .expect("the Lua runtime is installed");
-    let mut waiting = handle
-        .suspend("agent:test/coder:latest".into())
-        .expect("the agent may wait");
+    let mut waiting = wait_for(&handle, "agent:test/coder:latest");
     assert!(waiting.try_recv().is_err(), "the agent is suspended");
     handle
         .wake("agent:test/coder:latest")
@@ -229,11 +234,13 @@ fn one_agent_may_only_wait_once_at_a_time() {
         .cloned()
         .expect("the Lua runtime is installed");
     let _first = handle
-        .suspend("agent:test/coder:latest".into())
-        .expect("the first wait is accepted");
+        .reserve_suspension("agent:test/coder:latest")
+        .expect("the first reservation succeeds");
     assert!(
-        handle.suspend("agent:test/coder:latest".into()).is_err(),
-        "a second wait on the same agent is rejected"
+        handle
+            .reserve_suspension("agent:test/coder:latest")
+            .is_err(),
+        "a second reservation on the same agent is rejected"
     );
 }
 
@@ -283,9 +290,7 @@ fn a_tick_does_not_release_a_waiting_agent() {
         .get_resource::<LuaRuntimeHandle>()
         .cloned()
         .expect("the Lua runtime is installed");
-    let mut waiting = handle
-        .suspend("agent:test/coder:latest".into())
-        .expect("the agent may wait");
+    let mut waiting = wait_for(&handle, "agent:test/coder:latest");
     app.tick();
     assert!(
         waiting.try_recv().is_err(),
@@ -306,9 +311,7 @@ fn wake_releases_an_agent_through_the_effect() {
         .get_resource::<LuaRuntimeHandle>()
         .cloned()
         .expect("the Lua runtime is installed");
-    let mut waiting = handle
-        .suspend("agent:test/coder:latest".into())
-        .expect("the agent may wait");
+    let mut waiting = wait_for(&handle, "agent:test/coder:latest");
     send_effect(&mut app, MclEffectCommand::Wake).expect("wake reaches the waiting agent");
     assert!(waiting.try_recv().is_ok(), "the waiting call returns");
 }
@@ -667,29 +670,7 @@ fn ending_a_turn_with_a_tracked_tool_call_is_rejected() {
 }
 
 #[test]
-fn cancelling_a_suspended_agent_drops_its_wait() {
-    let app = build_app();
-    let handle = app
-        .world()
-        .get_resource::<LuaRuntimeHandle>()
-        .cloned()
-        .expect("the Lua runtime is installed");
-    let mut waiting = handle
-        .suspend("agent:test/coder:latest".into())
-        .expect("the agent may wait");
-    handle.forget_suspension("agent:test/coder:latest");
-    assert!(
-        waiting.try_recv().is_err(),
-        "the released wait never reports a wake"
-    );
-    assert!(
-        handle.wake("agent:test/coder:latest").is_err(),
-        "nothing is left to wake"
-    );
-}
-
-#[test]
-fn a_reservation_survives_until_it_is_claimed_or_dropped() {
+fn a_wake_that_arrives_before_the_claim_is_not_lost() {
     let app = build_app();
     let handle = app
         .world()
@@ -699,11 +680,119 @@ fn a_reservation_survives_until_it_is_claimed_or_dropped() {
     handle
         .reserve_suspension("agent:test/coder:latest")
         .expect("the reservation succeeds");
+    handle
+        .wake("agent:test/coder:latest")
+        .expect("a reserved waiter accepts the wake");
+    let mut waiting = handle
+        .claim_suspension("agent:test/coder:latest")
+        .expect("the wait is claimed");
+    assert!(
+        waiting.try_recv().is_ok(),
+        "the wait returns immediately because the wake already arrived"
+    );
+}
+
+#[test]
+fn a_claimed_wait_is_released_by_a_later_wake() {
+    let app = build_app();
+    let handle = app
+        .world()
+        .get_resource::<LuaRuntimeHandle>()
+        .cloned()
+        .expect("the Lua runtime is installed");
+    let mut waiting = wait_for(&handle, "agent:test/coder:latest");
+    assert!(waiting.try_recv().is_err(), "the wait is parked");
+    handle
+        .wake("agent:test/coder:latest")
+        .expect("the claimed wait is released");
+    assert!(waiting.try_recv().is_ok(), "the wait returns");
+}
+
+#[test]
+fn a_claimed_slot_may_be_reserved_again_for_the_next_wait() {
+    let app = build_app();
+    let handle = app
+        .world()
+        .get_resource::<LuaRuntimeHandle>()
+        .cloned()
+        .expect("the Lua runtime is installed");
+    let mut first = wait_for(&handle, "agent:test/coder:latest");
+    handle
+        .wake("agent:test/coder:latest")
+        .expect("the first wait is released");
+    assert!(first.try_recv().is_ok(), "the first wait returns");
+    let mut second = wait_for(&handle, "agent:test/coder:latest");
+    handle
+        .wake("agent:test/coder:latest")
+        .expect("the second wait is released");
+    assert!(second.try_recv().is_ok(), "the second wait returns");
+}
+
+#[test]
+fn a_rejected_second_reservation_leaves_the_first_one_alive() {
+    let app = build_app();
+    let handle = app
+        .world()
+        .get_resource::<LuaRuntimeHandle>()
+        .cloned()
+        .expect("the Lua runtime is installed");
+    let _reserved = handle
+        .reserve_suspension("agent:test/coder:latest")
+        .expect("the first reservation succeeds");
+    assert!(
+        handle
+            .reserve_suspension("agent:test/coder:latest")
+            .is_err(),
+        "a second reservation is refused"
+    );
+    handle
+        .wake("agent:test/coder:latest")
+        .expect("the first waiter is still registered");
+    let mut waiting = handle
+        .claim_suspension("agent:test/coder:latest")
+        .expect("the first reservation is still claimable");
+    assert!(
+        waiting.try_recv().is_ok(),
+        "the refused reservation did not destroy the first wait"
+    );
+}
+
+#[test]
+fn dropping_a_reservation_releases_the_waiter() {
+    let app = build_app();
+    let handle = app
+        .world()
+        .get_resource::<LuaRuntimeHandle>()
+        .cloned()
+        .expect("the Lua runtime is installed");
+    let mut waiting = wait_for(&handle, "agent:test/coder:latest");
+    handle.drop_reservation("agent:test/coder:latest");
+    assert!(
+        waiting.try_recv().is_err(),
+        "a dropped wait never reports a wake"
+    );
+    assert!(
+        handle.wake("agent:test/coder:latest").is_err(),
+        "nothing is left to wake"
+    );
+}
+
+#[test]
+fn forgetting_a_wait_clears_the_whole_slot() {
+    let app = build_app();
+    let handle = app
+        .world()
+        .get_resource::<LuaRuntimeHandle>()
+        .cloned()
+        .expect("the Lua runtime is installed");
+    let _waiting = wait_for(&handle, "agent:test/coder:latest");
     handle.forget_suspension("agent:test/coder:latest");
     assert!(
-        handle.is_reserved("agent:test/coder:latest"),
-        "forgetting a wait does not clear a reservation"
+        !handle.is_reserved("agent:test/coder:latest"),
+        "forgetting a wait clears its slot"
     );
-    handle.drop_reservation("agent:test/coder:latest");
-    assert!(!handle.is_reserved("agent:test/coder:latest"));
+    assert!(
+        handle.wake("agent:test/coder:latest").is_err(),
+        "nothing is left to wake"
+    );
 }

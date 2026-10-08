@@ -4,7 +4,7 @@ mod handler;
 mod system;
 mod types;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
@@ -79,8 +79,7 @@ impl Plugin for LuaRuntimePlugin {
         app.world_mut().insert_resource(LuaRuntimeHandle {
             events,
             environments,
-            suspended: Arc::new(Mutex::new(HashMap::new())),
-            reserved: Arc::new(Mutex::new(HashSet::new())),
+            suspensions: Arc::new(Mutex::new(HashMap::new())),
         });
         app.world_mut().insert_resource(self.config);
         app.world_mut().insert_resource(LuaRuntimeState::default());

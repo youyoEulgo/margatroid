@@ -32,7 +32,7 @@ pub(crate) fn finish_tool_call(
     let failed = result.is_err();
     let content = result.unwrap_or_else(|error| error.to_string());
     world.send_event(MclEffectReply {
-        id: request.turn_id,
+        id: request.effect_id,
         agent: request.agent,
         result: Ok(Message::Tool {
             resource_id: request.resource_id,

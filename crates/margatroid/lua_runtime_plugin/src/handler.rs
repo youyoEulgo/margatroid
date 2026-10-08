@@ -608,9 +608,26 @@ mod tests {
         lua.globals()
             .set("mcl_wait", mcl_wait)
             .expect("mcl_wait is injected");
+        let mcl_reserve_wait = lua
+            .create_function(|lua, ()| Ok(MlValue::Table(lua.create_table()?)))
+            .expect("mcl_reserve_wait stub is created");
+        lua.globals()
+            .set("mcl_reserve_wait", mcl_reserve_wait)
+            .expect("mcl_reserve_wait is injected");
+        let mcl_yield = lua
+            .create_function(|lua, ()| Ok(MlValue::Table(lua.create_table()?)))
+            .expect("mcl_yield stub is created");
+        lua.globals()
+            .set("mcl_yield", mcl_yield)
+            .expect("mcl_yield is injected");
 
         let result = lua.load(BASE_DRIVER).exec();
-        assert!(result.is_err(), "the driver loop is stopped by the stub");
+        let error = result.expect_err("the driver loop is stopped by the waiting stub");
+        let text = error.to_string();
+        assert!(
+            text.contains("driver loop stop"),
+            "the driver reached its wait instead of failing earlier: {text}"
+        );
 
         let calls = calls.lock().expect("call log is not poisoned").clone();
         let expected = [

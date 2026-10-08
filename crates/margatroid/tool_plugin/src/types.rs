@@ -83,6 +83,7 @@ pub struct ResourceMapEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallRequest {
+    pub effect_id: String,
     pub turn_id: String,
     pub agent: Entity,
     pub tool_id: ResourceId,
