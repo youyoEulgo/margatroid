@@ -211,7 +211,6 @@ pub enum MclEffectCommand {
     Wake,
     Ready,
     StartTurn,
-    EndTurn,
     Inference {
         ref_block_id: String,
     },

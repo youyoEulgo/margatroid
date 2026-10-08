@@ -296,10 +296,12 @@ impl LuaHostFunction for MclExposeFunction {
                 binding: Some(binding),
                 reply: crate::MclCommandReply::new(sender),
             });
-            let value = receiver
-                .await
-                .map_err(|_| LuaRuntimeError::RuntimeClosed)?
-                .map_err(|error| LuaRuntimeError::EnvironmentFailed(error.to_string()))?;
+            let value = tokio::select! {
+                _ = cancel.cancelled() => return Err(LuaRuntimeError::Cancelled),
+                value = receiver => value
+                    .map_err(|_| LuaRuntimeError::RuntimeClosed)?
+                    .map_err(|error| LuaRuntimeError::EnvironmentFailed(error.to_string()))?,
+            };
             command_value_to_lua(value)
         })
     }
@@ -364,10 +366,12 @@ impl LuaHostFunction for MclHostFunction {
                 binding,
                 reply: crate::MclCommandReply::new(sender),
             });
-            let value = receiver
-                .await
-                .map_err(|_| LuaRuntimeError::RuntimeClosed)?
-                .map_err(|error| LuaRuntimeError::EnvironmentFailed(error.to_string()))?;
+            let value = tokio::select! {
+                _ = cancel.cancelled() => return Err(LuaRuntimeError::Cancelled),
+                value = receiver => value
+                    .map_err(|_| LuaRuntimeError::RuntimeClosed)?
+                    .map_err(|error| LuaRuntimeError::EnvironmentFailed(error.to_string()))?,
+            };
             command_value_to_lua(value)
         })
     }
@@ -740,30 +744,6 @@ pub fn mcl_domain_system(world: &mut World) {
                     Ok(crate::MclDomainValue::Unit)
                 }
                 MclOperation::Emit {
-                    effect: crate::MclEffectCommand::EndTurn,
-                } => {
-                    let agent = world
-                        .entity_by_resource_id(&request.agent_id)
-                        .map_err(|_| MclError::AgentMissing)?;
-                    let state = world
-                        .get_component_mut::<Agent>(agent)
-                        .ok_or(MclError::AgentMissing)?;
-                    let turn = state.turn.turn_id.clone().ok_or(MclError::TurnMissing)?;
-                    if state
-                        .tools
-                        .pending
-                        .keys()
-                        .any(|(_, pending_turn, _)| pending_turn == &turn)
-                    {
-                        return Err(MclError::EffectInvalid);
-                    }
-                    state
-                        .turn
-                        .finish(&turn)
-                        .map_err(|_| MclError::TurnMismatch)?;
-                    Ok(crate::MclDomainValue::Unit)
-                }
-                MclOperation::Emit {
                     effect: crate::MclEffectCommand::ToolCall { calls },
                 } => {
                     let agent = world
@@ -816,6 +796,7 @@ pub fn mcl_domain_system(world: &mut World) {
                         },
                         collected: Vec::new(),
                         expected_calls: calls.iter().map(|call| call.id.clone()).collect(),
+                        turn_id: Some(turn_id.clone()),
                         reply: request.reply.clone(),
                     };
                     let pending = world
@@ -1018,7 +999,6 @@ fn begin_inference(
         .get_component::<Agent>(agent)
         .and_then(|value| value.turn.turn_id.clone())
         .ok_or(MclError::TurnMissing)?;
-    let effect_id = format!("mcl-effect:{}", request.id.as_str());
     let agent_state = world
         .get_component::<Agent>(agent)
         .ok_or(MclError::AgentMissing)?;
@@ -1101,8 +1081,10 @@ fn begin_inference(
         kind: crate::MclPendingEffectKind::Inference,
         collected: Vec::new(),
         expected_calls: Vec::new(),
+        turn_id: Some(turn_id.clone()),
         reply: request.reply,
     };
+    let effect_id = turn_id.clone();
     let pending = world
         .get_resource_mut::<PendingMclEffects>()
         .ok_or(MclError::EffectAlreadyPending)?;
@@ -1111,7 +1093,7 @@ fn begin_inference(
     }
     pending.effects.insert(effect_id.clone(), state);
     world.send_event(InferenceRequestEvent {
-        id: effect_id.clone(),
+        id: effect_id,
         agent,
         agent_id: request.agent_id,
         messages: messages.into_iter().map(|value| value.message).collect(),
@@ -1150,10 +1132,7 @@ pub fn mcl_effect_response_system(world: &mut World) {
                             agent.token_usage.add(usage);
                         }
                     }
-                    let turn_id = world
-                        .get_component::<Agent>(state.agent)
-                        .and_then(|value| value.turn.turn_id.clone())
-                        .unwrap_or_else(|| reply.id.clone());
+                    let turn_id = state.turn_id.clone().unwrap_or_else(|| reply.id.clone());
                     world.send_event(margatroid_types::AgentConversationObserved {
                         agent: state.agent,
                         turn_id,

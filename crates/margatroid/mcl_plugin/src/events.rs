@@ -51,6 +51,7 @@ pub struct MclEffectState {
     pub kind: crate::MclPendingEffectKind,
     pub collected: Vec<margatroid_types::Message>,
     pub expected_calls: Vec<String>,
+    pub turn_id: Option<String>,
     pub reply: MclCommandReply,
 }
 impl Event for MclDomainResponse {}

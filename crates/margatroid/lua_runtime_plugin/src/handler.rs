@@ -183,14 +183,18 @@ pub(crate) fn handle_lua_runtime_finished(
     world: &mut World,
     finished: Vec<LuaRuntimeTaskFinished>,
 ) {
+    let handle = world.get_resource::<LuaRuntimeHandle>().cloned();
     let Some(state) = world.get_resource_mut::<LuaRuntimeState>() else {
         return;
     };
     for event in finished {
         state.requests.remove(&event.request_id);
-        state.owners.remove(&event.request_id);
+        let owner = state.owners.remove(&event.request_id);
         if let Some(vm_id) = event.vm_id {
             state.sessions.remove(&vm_id);
+        }
+        if let (Some(handle), Some(owner)) = (handle.as_ref(), owner.as_ref()) {
+            handle.forget_suspension(owner);
         }
     }
 }

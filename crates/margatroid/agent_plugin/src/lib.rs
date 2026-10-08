@@ -18,9 +18,7 @@ pub use handler::{
     control_stop, handle_agent_control, handle_agent_create, handle_agent_initialization_completed,
     handle_lua_vm_finished, handle_lua_vm_started,
 };
-pub use margatroid_types::{
-    AgentError, AgentErrorKind, AgentLuaMessageEnvelope, AgentMessage, MclMessage,
-};
+pub use margatroid_types::{AgentError, AgentErrorKind, AgentMessage, MclMessage};
 pub use system::{agent_control_system, agent_create_system, agent_lua_vm_state_system};
 pub use types::*;
 
