@@ -270,8 +270,14 @@ impl Resource for LuaRuntimeState {}
 pub struct LuaRuntimeHandle {
     pub(crate) events: RuntimeEventSender,
     pub(crate) environments: Arc<RwLock<LuaEnvironmentRegistry>>,
-    pub(crate) suspended: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
-    pub(crate) reserved: Arc<Mutex<std::collections::HashSet<String>>>,
+    pub(crate) suspensions: Arc<Mutex<HashMap<String, SuspensionSlot>>>,
+}
+
+#[derive(Default)]
+pub(crate) struct SuspensionSlot {
+    sender: Option<oneshot::Sender<()>>,
+    claimed: bool,
+    pending_wake: bool,
 }
 impl Resource for LuaRuntimeHandle {}
 impl LuaRuntimeHandle {
@@ -294,74 +300,77 @@ impl LuaRuntimeHandle {
         });
         Ok(())
     }
-    pub fn suspend(&self, owner: String) -> Result<oneshot::Receiver<()>, LuaRuntimeError> {
-        let (sender, receiver) = oneshot::channel();
-        {
-            let mut suspended = self
-                .suspended
-                .lock()
-                .map_err(|_| LuaRuntimeError::RuntimeClosed)?;
-            if suspended.insert(owner.clone(), sender).is_some() {
-                return Err(LuaRuntimeError::InvalidRequest(
-                    "a VM may only wait once at a time".into(),
-                ));
+    pub fn reserve_suspension(&self, owner: &str) -> Result<(), LuaRuntimeError> {
+        let mut slots = self
+            .suspensions
+            .lock()
+            .map_err(|_| LuaRuntimeError::RuntimeClosed)?;
+        match slots.get_mut(owner) {
+            Some(slot) if !slot.claimed => Err(LuaRuntimeError::InvalidRequest(
+                "a VM may only wait once at a time".into(),
+            )),
+            Some(slot) => {
+                *slot = SuspensionSlot::default();
+                Ok(())
+            }
+            None => {
+                slots.insert(owner.to_owned(), SuspensionSlot::default());
+                Ok(())
             }
         }
-        Ok(receiver)
-    }
-    pub fn reserve_suspension(&self, owner: &str) -> Result<(), LuaRuntimeError> {
-        let mut reserved = self
-            .reserved
-            .lock()
-            .map_err(|_| LuaRuntimeError::RuntimeClosed)?;
-        if !reserved.insert(owner.to_owned()) {
-            return Err(LuaRuntimeError::InvalidRequest(
-                "a VM may only wait once at a time".into(),
-            ));
-        }
-        Ok(())
     }
     pub fn claim_suspension(&self, owner: &str) -> Result<oneshot::Receiver<()>, LuaRuntimeError> {
-        let (sender, receiver) = oneshot::channel();
-        let mut suspended = self
-            .suspended
+        let mut slots = self
+            .suspensions
             .lock()
             .map_err(|_| LuaRuntimeError::RuntimeClosed)?;
-        if suspended.insert(owner.to_owned(), sender).is_some() {
-            return Err(LuaRuntimeError::InvalidRequest(
-                "a VM may only wait once at a time".into(),
-            ));
-        }
-        if let Ok(mut reserved) = self.reserved.lock() {
-            reserved.remove(owner);
+        let slot = slots.get_mut(owner).ok_or_else(|| {
+            LuaRuntimeError::InvalidRequest("the VM did not reserve a wait".into())
+        })?;
+        slot.claimed = true;
+        let (sender, receiver) = oneshot::channel();
+        if slot.pending_wake {
+            let _ = sender.send(());
+        } else {
+            slot.sender = Some(sender);
         }
         Ok(receiver)
     }
     pub fn drop_reservation(&self, owner: &str) {
-        if let Ok(mut reserved) = self.reserved.lock() {
-            reserved.remove(owner);
+        if let Ok(mut slots) = self.suspensions.lock() {
+            slots.remove(owner);
         }
     }
     pub fn wake(&self, owner: &str) -> Result<(), LuaRuntimeError> {
-        let sender = self
-            .suspended
+        let mut slots = self
+            .suspensions
             .lock()
-            .map_err(|_| LuaRuntimeError::RuntimeClosed)?
-            .remove(owner)
+            .map_err(|_| LuaRuntimeError::RuntimeClosed)?;
+        let slot = slots
+            .get_mut(owner)
             .ok_or_else(|| LuaRuntimeError::InvalidRequest("the VM is not waiting".into()))?;
-        sender
-            .send(())
-            .map_err(|_| LuaRuntimeError::VmExecutionFailed("the VM is no longer waiting".into()))
+        match slot.sender.take() {
+            Some(sender) => sender.send(()).map_err(|_| {
+                LuaRuntimeError::VmExecutionFailed("the VM is no longer waiting".into())
+            }),
+            None if !slot.claimed => {
+                slot.pending_wake = true;
+                Ok(())
+            }
+            None => Err(LuaRuntimeError::VmExecutionFailed(
+                "the VM is no longer waiting".into(),
+            )),
+        }
     }
     pub fn is_reserved(&self, owner: &str) -> bool {
-        self.reserved
+        self.suspensions
             .lock()
-            .map(|reserved| reserved.contains(owner))
+            .map(|slots| slots.contains_key(owner))
             .unwrap_or(false)
     }
     pub fn forget_suspension(&self, owner: &str) {
-        if let Ok(mut suspended) = self.suspended.lock() {
-            suspended.remove(owner);
+        if let Ok(mut slots) = self.suspensions.lock() {
+            slots.remove(owner);
         }
     }
     pub fn cancel(&self, request_id: &str) -> Result<(), LuaRuntimeError> {

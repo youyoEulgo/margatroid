@@ -18,10 +18,7 @@ pub use types::{
     AgentToolEnvironment, ResourceContent, ResourceMapEntry, ToolCallRequest, ToolTemplate,
 };
 
-use system::{
-    cancel_tool_turn_system, tool_call_route_system, tool_message_cleanup_system,
-    tool_register_system,
-};
+use system::{cancel_tool_turn_system, tool_call_route_system, tool_register_system};
 
 pub struct ToolPlugin {
     schedule: String,
@@ -103,8 +100,7 @@ impl Plugin for ToolPlugin {
             .add_system(&self.schedule, tool_call_route_system)
             .add_async_system(&self.schedule, handler::lua::execute_prepared_lua_tool)
             .add_system(&self.schedule, handler::lua::lua_task_result_system)
-            .add_system(&self.schedule, cancel_tool_turn_system)
-            .add_system(&self.schedule, tool_message_cleanup_system);
+            .add_system(&self.schedule, cancel_tool_turn_system);
     }
 }
 

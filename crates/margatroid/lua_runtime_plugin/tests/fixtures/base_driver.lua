@@ -150,10 +150,12 @@ local function maybe_compact(message)
     if message.usage.input_tokens >= COMPACTION_CONTEXT_LIMIT then
         move_old_recent_messages()
         local summary = mcl_command("EMIT EFFECT inference FROM com")
-        mcl_command("INJECT ? TO msg.compact_context", {
-            type = "user",
-            content = summary,
-        })
+        if summary and summary.type == "assistant" and summary.content then
+            mcl_command("INJECT ? TO msg.compact_context", {
+                type = "user",
+                content = summary.content,
+            })
+        end
         mcl_command("INJECT msg.recent_conversation TO msg.history_conversation")
         mcl_command("INJECT [] TO msg.recent_conversation")
         sync_realtime()

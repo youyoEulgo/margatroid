@@ -146,6 +146,7 @@ struct LuaToolPackage {
 }
 
 struct LuaToolCallLocator {
+    effect_id: String,
     turn_id: String,
     agent: Entity,
     tool_call_id: String,
@@ -180,6 +181,7 @@ impl LuaToolResponseGuard {
     fn new(request: &ToolCallRequest, events: RuntimeEventSender) -> Self {
         Self {
             locator: Some(LuaToolCallLocator {
+                effect_id: request.effect_id.clone(),
                 turn_id: request.turn_id.clone(),
                 agent: request.agent,
                 tool_call_id: request.tool_call_id.clone(),
@@ -201,7 +203,7 @@ impl LuaToolResponseGuard {
             },
             Err(error) if ends_the_turn(error.kind()) => {
                 self.events.send_event(margatroid_types::MclEffectReply {
-                    id: locator.turn_id.clone(),
+                    id: locator.effect_id.clone(),
                     agent: locator.agent,
                     result: Err(error.to_string()),
                     usage: None,
@@ -217,7 +219,7 @@ impl LuaToolResponseGuard {
             Err(error) => (error.to_string(), true),
         };
         self.events.send_event(margatroid_types::MclEffectReply {
-            id: locator.turn_id,
+            id: locator.effect_id,
             agent: locator.agent,
             result: Ok(margatroid_types::Message::Tool {
                 resource_id: locator.resource_id,
@@ -236,7 +238,7 @@ impl Drop for LuaToolResponseGuard {
             return;
         };
         self.events.send_event(margatroid_types::MclEffectReply {
-            id: locator.turn_id,
+            id: locator.effect_id,
             agent: locator.agent,
             result: Ok(margatroid_types::Message::Tool {
                 resource_id: locator.resource_id,

@@ -1,7 +1,7 @@
 use agent_plugin::{Agent, AgentToolPending};
 use app_runtime_plugin::WorldEventExt;
 use core_plugin::World;
-use margatroid_types::{AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId};
+use margatroid_types::{AgentFailure, AgentFailureKind, ResourceId};
 
 use crate::handler;
 use crate::{ToolCallRequest, ToolError, ToolErrorKind, ToolRegisterRequest, ToolRegisterResponse};
@@ -99,6 +99,7 @@ pub(crate) fn tool_call_route_system(world: &mut World) {
                     )
                 })?;
             let request = ToolCallRequest {
+                effect_id: event.effect_id.clone(),
                 turn_id: event.turn_id.clone(),
                 agent: event.agent,
                 tool_id: entry.tool_id.clone(),
@@ -169,29 +170,6 @@ pub(crate) fn tool_call_route_system(world: &mut World) {
         }
     }
 }
-
-pub(crate) fn tool_message_cleanup_system(world: &mut World) {
-    let messages = world
-        .event_reader::<AgentMessage>()
-        .into_iter()
-        .cloned()
-        .filter_map(|message| match &message.message {
-            Message::Tool { tool_call_id, .. } => {
-                Some((message.id.clone(), message.agent, tool_call_id.clone()))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    for (turn_id, agent, tool_call_id) in messages {
-        if let Some(agent_state) = world.get_component_mut::<Agent>(agent) {
-            agent_state
-                .tools
-                .pending
-                .remove(&(agent, turn_id, tool_call_id));
-        }
-    }
-}
-
 pub(crate) fn cancel_tool_turn_system(world: &mut World) {
     let cancellations = world
         .event_reader::<crate::CancelToolTurn>()
