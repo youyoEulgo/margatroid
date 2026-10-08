@@ -257,29 +257,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       return null;
     }
 
-    const id = crypto.randomUUID();
-    const request: ClientMessage = {
-      type: 'agent.message',
-      id,
-      message: {
-        workspace: workspaceReference(workspace),
-        agent: selectedAgent.value,
-        message: {
-          User: {
-            content: text,
-          },
-        },
-      },
-    };
-    pendingRoutes.set(id, {
-      workspaceKey: workspaceKey(workspace),
-      agent: selectedAgent.value || workspace.manager,
+    const requests = entryRequests(workspaceReference(workspace), selectedAgent.value, {
+      type: 'user',
+      content: text,
     });
     lastFailures.value.delete(
       `${workspaceKey(workspace)}:${selectedAgent.value || workspace.manager}`,
     );
-    socket.send(JSON.stringify(request));
-    return id;
+    for (const request of requests) {
+      socket!.send(JSON.stringify(request));
+    }
+    return requests[0]!.id;
   }
 
   function executeMclCommand(
@@ -336,21 +324,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       throw new Error('Connect to the daemon before loading a Skill');
     }
-    const id = crypto.randomUUID();
     const workspaceRef = workspaceReference(workspace);
     const agentRef = selectedAgent.value || workspace.manager;
     if (text) {
-      socket.send(
-        JSON.stringify({
-          type: 'agent.message',
-          id,
-          message: {
-            workspace: workspaceRef,
-            agent: agentRef,
-            message: { Inject: { messages: [{ User: { content: text } }] } },
-          },
-        }),
-      );
+      for (const request of entryRequests(workspaceRef, agentRef, {
+        type: 'inject',
+        messages: [{ type: 'user', content: text }],
+      })) {
+        socket.send(JSON.stringify(request));
+      }
     }
     const mapping = selectedAgentState.value?.resources.find(
       (entry) => entry.resource_id === resourceId,
@@ -358,36 +340,25 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (!mapping) {
       throw new Error('The selected Skill has no callable resource name for this agent');
     }
-    const request: ClientMessage = {
-      type: 'agent.message',
-      id,
-      message: {
-        workspace: workspaceRef,
-        agent: agentRef,
-        message: {
-          Assistant: {
-            reasoning: null,
-            content: null,
-            tool_calls: [
-              {
-                id: `manual-${crypto.randomUUID()}`,
-                tool_name: mapping.resource_name,
-                arguments: '{}',
-              },
-            ],
-          },
+    const requests = entryRequests(workspaceRef, agentRef, {
+      type: 'assistant',
+      reasoning: null,
+      content: null,
+      tool_calls: [
+        {
+          id: `manual-${crypto.randomUUID()}`,
+          tool_name: mapping.resource_name,
+          arguments: '{}',
         },
-      },
-    };
-    pendingRoutes.set(id, {
-      workspaceKey: workspaceKey(workspace),
-      agent: selectedAgent.value || workspace.manager,
+      ],
     });
     lastFailures.value.delete(
       `${workspaceKey(workspace)}:${selectedAgent.value || workspace.manager}`,
     );
-    socket.send(JSON.stringify(request));
-    return id;
+    for (const request of requests) {
+      socket!.send(JSON.stringify(request));
+    }
+    return requests[0]!.id;
   }
 
   function abortTurn(): string | null {
@@ -911,6 +882,28 @@ export function resourceName(resource: string): string {
 
 function workspaceReference(workspace: WorkspaceInfo): WorkspaceRef {
   return { id: workspace.id, name: workspace.name, project_root: workspace.project_root };
+}
+
+const ENTRY_SELECTOR = 'entry.pending[-1]';
+
+function entryRequests(
+  workspace: WorkspaceRef,
+  agent: string | null,
+  message: unknown,
+): ClientMessage[] {
+  const route = { workspace, agent };
+  return [
+    {
+      type: 'mcl.command',
+      id: crypto.randomUUID(),
+      message: { ...route, command: `INJECT ? TO ${ENTRY_SELECTOR}`, binding: message },
+    },
+    {
+      type: 'mcl.command',
+      id: crypto.randomUUID(),
+      message: { ...route, command: 'EMIT EFFECT wake', binding: null },
+    },
+  ];
 }
 
 function decodeMessage(message: AgentMessage): {

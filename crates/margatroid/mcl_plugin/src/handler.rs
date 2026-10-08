@@ -166,12 +166,6 @@ fn parse_effect(
                 effect: MclEffectCommand::StartTurn,
             })
         }
-        "end_turn" if words.len() == 3 => {
-            reject_binding(binding)?;
-            Ok(MclOperation::Emit {
-                effect: MclEffectCommand::EndTurn,
-            })
-        }
         "finish" if words.len() == 3 => {
             reject_binding(binding)?;
             Ok(MclOperation::Emit {

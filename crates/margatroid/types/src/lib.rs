@@ -450,12 +450,6 @@ pub struct MclMessage {
     pub usage: Option<TokenUsage>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentLuaMessageEnvelope {
-    pub turn_id: String,
-    pub message: MclMessage,
-}
-
 impl MclMessage {
     pub fn new(message: Message, usage: Option<TokenUsage>) -> Self {
         Self { message, usage }

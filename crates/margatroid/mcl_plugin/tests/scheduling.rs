@@ -385,7 +385,7 @@ fn start_turn_opens_a_turn_and_end_turn_closes_it() {
     assert!(turn_of(app.world(), agent).is_none());
     send_effect(&mut app, MclEffectCommand::StartTurn).expect("a turn starts");
     assert!(turn_of(app.world(), agent).is_some(), "the turn is open");
-    send_effect(&mut app, MclEffectCommand::EndTurn).expect("the turn ends");
+    send_effect(&mut app, MclEffectCommand::Finish).expect("the turn ends");
     assert!(turn_of(app.world(), agent).is_none(), "the turn is closed");
 }
 
@@ -403,15 +403,15 @@ fn a_second_turn_cannot_start_while_one_is_open() {
 }
 
 #[test]
-fn ending_a_turn_without_one_open_is_rejected() {
+fn finishing_without_an_open_turn_is_harmless() {
     let mut app = build_app();
     spawn_agent(
         app.world_mut(),
         AgentLifecycleState::Running,
         Some(LuaVmId(7)),
     );
-    let error = send_effect(&mut app, MclEffectCommand::EndTurn).unwrap_err();
-    assert!(matches!(error, mcl_plugin::MclError::TurnMissing));
+    send_effect(&mut app, MclEffectCommand::Finish)
+        .expect("finishing an idle agent does nothing and says so");
 }
 
 #[test]
@@ -424,7 +424,7 @@ fn a_turn_can_be_reopened_after_it_closes() {
     );
     send_effect(&mut app, MclEffectCommand::StartTurn).expect("the first turn starts");
     let first = turn_of(app.world(), agent).expect("the first turn is open");
-    send_effect(&mut app, MclEffectCommand::EndTurn).expect("the first turn ends");
+    send_effect(&mut app, MclEffectCommand::Finish).expect("the first turn ends");
     send_effect(&mut app, MclEffectCommand::StartTurn).expect("the second turn starts");
     let second = turn_of(app.world(), agent).expect("the second turn is open");
     assert_ne!(first, second, "each turn gets its own identity");
@@ -665,7 +665,7 @@ fn ending_a_turn_with_a_tracked_tool_call_is_rejected() {
             },
         );
     }
-    let error = send_effect(&mut app, MclEffectCommand::EndTurn).unwrap_err();
+    let error = send_effect(&mut app, MclEffectCommand::Finish).unwrap_err();
     assert!(matches!(error, mcl_plugin::MclError::EffectInvalid));
 }
 
