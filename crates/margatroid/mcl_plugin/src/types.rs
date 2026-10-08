@@ -1,10 +1,6 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use margatroid_types::{ResourceId, ToolCall};
-use sha2::{Digest, Sha256};
+use margatroid_types::{ResourceRef, ToolCall};
 
 pub use agent_plugin::AgentMcl;
 pub use margatroid_types::{
@@ -12,99 +8,9 @@ pub use margatroid_types::{
     RefMerge,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MclHash(String);
-impl MclHash {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-    fn digest(source: &str) -> Self {
-        let mut digest = Sha256::new();
-        digest.update(source.as_bytes());
-        Self(format!("{:x}", digest.finalize()))
-    }
-}
-impl std::fmt::Display for MclHash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MclProgramKind {
-    Base,
-    Workflow,
-    Module,
-}
-
-#[derive(Clone, Debug)]
-pub struct MclSource {
-    resource_id: ResourceId,
-    source: Arc<str>,
-    origin: Arc<PathBuf>,
-}
-impl MclSource {
-    pub fn new(
-        resource_id: ResourceId,
-        source: impl Into<Arc<str>>,
-        origin: impl Into<Arc<PathBuf>>,
-    ) -> Self {
-        Self {
-            resource_id,
-            source: source.into(),
-            origin: origin.into(),
-        }
-    }
-    pub fn resource_id(&self) -> &ResourceId {
-        &self.resource_id
-    }
-    pub fn source(&self) -> &str {
-        &self.source
-    }
-    pub fn origin(&self) -> &Path {
-        self.origin.as_path()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct MclProgram {
-    resource_id: ResourceId,
-    source: Arc<str>,
-    origin: Arc<PathBuf>,
-    kind: MclProgramKind,
-    source_hash: MclHash,
-    plan_hash: MclHash,
-}
-impl MclProgram {
-    pub fn source(&self) -> &str {
-        &self.source
-    }
-    pub fn origin(&self) -> &Path {
-        self.origin.as_path()
-    }
-    pub fn resource_id(&self) -> &ResourceId {
-        &self.resource_id
-    }
-    pub fn kind(&self) -> MclProgramKind {
-        self.kind
-    }
-    pub fn source_hash(&self) -> &MclHash {
-        &self.source_hash
-    }
-    pub fn plan_hash(&self) -> &MclHash {
-        &self.plan_hash
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct MclCompileRequest {
-    pub root: MclSource,
-    pub dependencies: BTreeMap<ResourceId, MclSource>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceImportReceipt {
-    pub resource_id: ResourceId,
+    pub resource_id: ResourceRef,
     pub alias: String,
     pub available: bool,
     pub error: Option<String>,
@@ -253,7 +159,7 @@ pub enum MclOperation {
         sources: Vec<BlockPath>,
     },
     Import {
-        resource_id: ResourceId,
+        resource_id: ResourceRef,
         alias: String,
     },
     Get {
@@ -293,39 +199,4 @@ pub type MclCommandValue = MclDomainValue;
 pub enum MclPendingEffectKind {
     Inference,
     ToolCall { expected: usize },
-}
-
-pub fn compile_mcl(request: MclCompileRequest) -> Result<Arc<MclProgram>, crate::MclError> {
-    let source = request.root.source().to_owned();
-    let hash = MclHash::digest(&source);
-    Ok(Arc::new(MclProgram {
-        resource_id: request.root.resource_id().clone(),
-        source: Arc::from(source),
-        origin: Arc::new(request.root.origin().to_path_buf()),
-        kind: MclProgramKind::Base,
-        source_hash: hash.clone(),
-        plan_hash: hash,
-    }))
-}
-
-pub fn load_mcl_program_from_path(
-    _roots: &[PathBuf],
-    resource_id: &ResourceId,
-    path: &Path,
-    expected: MclProgramKind,
-) -> Result<Arc<MclProgram>, crate::MclError> {
-    let source = String::from_utf8(fs::read(path).map_err(|_| crate::MclError::SourceReadFailed)?)
-        .map_err(|_| crate::MclError::SourceInvalidUtf8)?;
-    let program = compile_mcl(MclCompileRequest {
-        root: MclSource::new(
-            resource_id.clone(),
-            Arc::<str>::from(source),
-            Arc::new(path.to_path_buf()),
-        ),
-        dependencies: BTreeMap::new(),
-    })?;
-    if program.kind() != expected {
-        return Err(crate::MclError::InvalidProgramKind);
-    }
-    Ok(program)
 }

@@ -8,6 +8,8 @@ AgentPlugin负责创建Entity并分别挂载ResourceId和唯一Agent组件；Age
 MCL的纯值类型MclMessage、Block、BlockAssembly、RefMerge、RefBlock和RefBlockAssembly以及LuaVmId定义在types crate，由对应Plugin重新导出；它们不持有Agent生命周期或领域入口。
 ResourceId及其World查询扩展实际定义在ResourceIdPlugin；types crate中的共享结构只引用ResourceId，不拥有其实现。
 types crate只定义数据结构、局部数据方法和AgentMemoryStore这类依赖反转接口，不包含System、事件路由或数据库、推理、工具、Lua VM的具体实现。
+types crate中的跨领域数据类型刻意不含任何Plugin专属行为，领域Plugin只能通过各自公开的窄方法读写它们；
+    这样这些类型可以被多方共享而不把某个Plugin的实现细节带进依赖图。
 ```
 
 ### 规范归属与依赖方向
@@ -362,6 +364,8 @@ AgentHistoryRecordWriteRequested：历史记录写入请求，公开事件--把�
     kind: String--记录种类，例如mcl
     content: String--记录内容
     payload: String--结构化附加信息
+    说明：记录按发起方原样保存，不做解释或改写；
+        它与对话共用同一条时间线，因此顺序关系在写入时就已确定
 
 AgentImageReferenceError：AgentImage引用错误，公开结构体--迁移兼容层使用
 ```

@@ -15,8 +15,6 @@ pub enum AgentImageLoadErrorKind {
     ManifestDecodeFailed,
     UnsupportedSchema,
     InvalidModelConfig,
-    PromptReadFailed,
-    DuplicateDependency,
     InvalidResourceName,
     BaseMclLoadFailed,
     TaskPanicked,

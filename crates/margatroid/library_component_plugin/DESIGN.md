@@ -83,14 +83,27 @@ Agent：agent_plugin，Agent Entity 必须挂载 Agent + ResourceId
 Workspace：workspace_plugin，Workspace Entity 必须挂载 Workspace + ResourceId
 Client：client_plugin，Client Entity 必须挂载 Client + ResourceId
 AgentImage：agent_image_loader_plugin，AgentImage Entity 必须挂载 AgentImage + ResourceId
+ToolResource：resource_library_plugin，工具资源 Entity 必须挂载 ToolResource + ResourceId + ResourceOwners
+SkillResource：resource_library_plugin，技能资源 Entity 必须挂载 SkillResource + ResourceId + ResourceOwners
+PromptResource：resource_library_plugin，提示资源 Entity 必须挂载 PromptResource + ResourceId + ResourceOwners
+SandboxResource：resource_library_plugin，沙箱资源 Entity 必须挂载 SandboxResource + ResourceId + ResourceOwners
+HookResource：resource_library_plugin，钩子资源 Entity 必须挂载 HookResource + ResourceId + ResourceOwners
 ```
+
+前四种是「拥有者型」Entity：Agent、Workspace、Client、AgentImage 由运行时的生命周期驱动，进程运行期间持续存在，不因某个导入而出现或消失。
+
+后五种是「资源型」Entity：每个 Entity 只由全局资源库按需创建，只挂载一种资源组件，随最后一个持有者释放而回收。它们是资源全局唯一的落点——同一个资源地址在全进程只对应一个 Entity，多个 Agent 导入同一资源时共享它。
 
 Agent 的工具路径与推理配置不作为独立组件：项目根与镜像根属于 Agent.info，模型与上下文窗口属于 Agent.info.model，采样参数由 AgentImage 提供。曾存在的 AgentToolEnvironment 与 AgentInferenceSnapshot 无人挂载也无人查询，已删除。
 
 以下不属于图书馆组件：
 
 ```text
-ResourceId：全局标识值类型，被大量用作 map 键、结构体字段与跨边界序列化；
-    它确实会被挂载到 Entity 上，但挂载只是它的一种用途，其身份首先是值类型而非领域组件
+ResourceRef：资源地址值类型，被大量用作 map 键、结构体字段与跨边界序列化；
+    它不实现 Component，因此根本无法被挂载，其身份就是值类型
+ResourceId：把 ResourceRef 挂到 Entity 上的组件；它确实会被挂载，
+    但挂载只是它的唯一用途，它描述的是「这个 Entity 的地址是什么」，
+    而不是 Entity 自身的领域身份，所以不是图书馆组件
+ResourceOwners：描述资源与 Agent 之间的持有关系，而不是资源自身的领域身份
 Health、Name、Selected：core_plugin 自带的内置组件，不属于 margatroid 领域
 ```

@@ -1,50 +1,72 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use margatroid_types::ResourceId;
-use mcl_plugin::MclProgram;
+use margatroid_types::ResourceRef;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::error::AgentImageLoadError;
 
 #[derive(Clone, Debug)]
 pub struct AgentImageBaseDriver {
-    pub(crate) program: Arc<MclProgram>,
+    source: Arc<str>,
+    origin: Arc<PathBuf>,
+    source_hash: Arc<str>,
 }
 
 impl AgentImageBaseDriver {
-    pub fn program(&self) -> &Arc<MclProgram> {
-        &self.program
+    pub(crate) fn new(source: String, origin: PathBuf) -> Self {
+        let source_hash = format!("{:x}", Sha256::digest(source.as_bytes()));
+        Self {
+            source: Arc::from(source),
+            origin: Arc::new(origin),
+            source_hash: Arc::from(source_hash),
+        }
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn origin(&self) -> &Path {
+        self.origin.as_path()
+    }
+
+    pub fn source_hash(&self) -> &str {
+        &self.source_hash
     }
 }
 
-pub type AgentImageBaseMcl = AgentImageBaseDriver;
+#[cfg(test)]
+mod driver_tests {
+    use super::AgentImageBaseDriver;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentImageDependency {
-    pub(crate) resource_id: ResourceId,
-    pub(crate) source: Option<Arc<str>>,
-}
-
-impl AgentImageDependency {
-    pub fn resource_id(&self) -> &ResourceId {
-        &self.resource_id
-    }
-
-    pub fn source(&self) -> Option<&str> {
-        self.source.as_deref()
+    #[test]
+    fn driver_hashes_source_bytes_without_resource_identity_or_compilation() {
+        let driver = AgentImageBaseDriver::new("abc".into(), "base.lua".into());
+        assert_eq!(driver.source(), "abc");
+        assert_eq!(
+            driver.source_hash(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let relocated = AgentImageBaseDriver::new("abc".into(), "other/base.lua".into());
+        assert_eq!(driver.source_hash(), relocated.source_hash());
+        let changed = AgentImageBaseDriver::new("abc\n".into(), "base.lua".into());
+        assert_ne!(driver.source_hash(), changed.source_hash());
+        assert_eq!(driver.clone().source(), driver.source());
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct AgentImageDependencies {
-    pub(crate) entries: Arc<[AgentImageDependency]>,
+    pub(crate) entries: Arc<[ResourceRef]>,
 }
 
 impl AgentImageDependencies {
-    pub fn entries(&self) -> &[AgentImageDependency] {
+    pub fn entries(&self) -> &[ResourceRef] {
         &self.entries
     }
 }
@@ -93,11 +115,11 @@ impl AgentImageModelConfig {
 
 #[derive(Clone, Debug)]
 pub struct AgentImageDefaultVisibility {
-    pub(crate) resources: BTreeSet<ResourceId>,
+    pub(crate) resources: BTreeSet<ResourceRef>,
 }
 
 impl AgentImageDefaultVisibility {
-    pub fn resources(&self) -> impl Iterator<Item = &ResourceId> + '_ {
+    pub fn resources(&self) -> impl Iterator<Item = &ResourceRef> + '_ {
         self.resources.iter()
     }
 }
@@ -111,10 +133,9 @@ pub(crate) struct AgentImageManifest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AgentImageDependencyDocument {
     pub(crate) id: String,
-    #[serde(default)]
-    pub(crate) source: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -147,7 +168,7 @@ impl Default for AgentImageLoaderLimits {
 }
 
 pub(crate) struct PreparedAgentImage {
-    pub(crate) reference: ResourceId,
+    pub(crate) reference: ResourceRef,
     pub(crate) base_driver: AgentImageBaseDriver,
     pub(crate) dependencies: AgentImageDependencies,
     pub(crate) model: AgentImageModelConfig,
@@ -155,7 +176,7 @@ pub(crate) struct PreparedAgentImage {
 }
 
 pub(crate) struct AgentImageReadPayload {
-    pub(crate) reference: ResourceId,
+    pub(crate) reference: ResourceRef,
     pub(crate) result: Result<PreparedAgentImage, AgentImageLoadError>,
 }
 

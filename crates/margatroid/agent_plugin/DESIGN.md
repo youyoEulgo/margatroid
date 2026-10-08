@@ -231,10 +231,17 @@ handle_lua_vm_finished(world: &mut World, event: LuaRuntimeTaskFinished)
         启动前失败时按request_id定位Agent，设置lifecycle=Failed并通过创建回执返回错误
         运行后结束时按vm_id定位Agent，清空Agent.lua并根据结果设置Stopped或Failed
         失败时写入Agent.last_error
-        Agent仍处于Creating时结束：先发送创建回执，再despawn Agent Entity，释放agent_id供后续创建复用
+        Agent仍处于Creating时结束：只发送创建回执，不despawn
+            实体与资源的回收由workspace统一驱动，见下方回收边界
 
 control_stop(world: &mut World, agent: Entity) -> Result<(), AgentError>
     停止Agent：crate公开函数，将Agent.lifecycle设为Stopping并调用LuaRuntimeHandle::stop_long_running
+    说明：是否仍有在途执行按vm_id与request_id判断，而不是按lifecycle标签
+        Failed的VM仍可能持有正在运行的执行体，因此也必须允许取消
+
+回收边界：
+    在途工作的停止收敛与实体回收由workspace_plugin判定，agent_plugin不自行despawn
+    lifecycle标签本身不足以证明执行已结束
 ```
 
 私有：
@@ -252,6 +259,7 @@ deliver_agent_message(world: &World, event: &AgentMessage) -> Result<(), AgentEr
 
 fail_creation(world: &mut World, entity: Entity, error: AgentError)
     失败创建：私有函数，写入Failed生命周期、初始化失败、last_error并通过创建回执返回错误
+    行为：未提交VM时同时清空request_id，使该实体不再被视为在途
 
 stop_runtime(world: &World, entity: Entity)
     停止运行时：私有函数，读取ResourceId并调用LuaRuntimeHandle::stop_long_running

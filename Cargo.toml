@@ -12,6 +12,7 @@ members = [
     "crates/margatroid/types",
     "crates/margatroid/resource_id_plugin",
     "crates/margatroid/library_component_plugin",
+    "crates/margatroid/resource_library_plugin",
     "crates/margatroid/lua_runtime_plugin",
     "crates/margatroid/compose",
     "crates/margatroid/protocol",

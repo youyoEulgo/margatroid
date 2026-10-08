@@ -11,14 +11,14 @@ use std::sync::Arc;
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
 use async_runtime_plugin::AppAsyncExt;
 use core_plugin::{App, Component as MecsComponent, Plugin, Resource};
-use margatroid_types::ResourceId;
+use margatroid_types::ResourceRef;
 use resource_id_plugin::ResourceIdPluginInstalled;
 
 pub use error::{AgentImageLoadError, AgentImageLoadErrorKind};
 pub use events::{LoadAgentImage, LoadAgentImageResult};
 pub use types::{
-    AgentImageBaseDriver, AgentImageBaseMcl, AgentImageDefaultVisibility, AgentImageDependencies,
-    AgentImageDependency, AgentImageModelConfig, AgentImageModelParameters,
+    AgentImageBaseDriver, AgentImageDefaultVisibility, AgentImageDependencies,
+    AgentImageModelConfig, AgentImageModelParameters,
 };
 
 use handler::read_agent_image;
@@ -38,7 +38,7 @@ impl AgentImage {
         &self.base_driver
     }
 
-    pub fn dependencies(&self) -> &[AgentImageDependency] {
+    pub fn dependencies(&self) -> &[ResourceRef] {
         self.dependencies.entries()
     }
 
@@ -46,7 +46,7 @@ impl AgentImage {
         &self.model
     }
 
-    pub fn default_visibility(&self) -> impl Iterator<Item = &ResourceId> + '_ {
+    pub fn default_visibility(&self) -> impl Iterator<Item = &ResourceRef> + '_ {
         self.default_visibility.resources()
     }
 }
@@ -121,7 +121,7 @@ impl Resource for AgentImageLoaderPluginInstalled {}
 pub(crate) struct AgentImageLoaderState {
     pub(crate) root: Arc<PathBuf>,
     pub(crate) limits: AgentImageLoaderLimits,
-    pub(crate) pending: HashMap<ResourceId, Vec<String>>,
+    pub(crate) pending: HashMap<ResourceRef, Vec<String>>,
 }
 
 impl Resource for AgentImageLoaderState {}
@@ -136,7 +136,7 @@ mod tests {
     use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
     use async_runtime_plugin::AsyncRuntimePlugin;
     use core_plugin::{App, Entity};
-    use margatroid_types::ResourceId;
+    use margatroid_types::{ResourceId, ResourceRef};
     use resource_id_plugin::ResourceIdPlugin;
 
     use super::{
@@ -161,7 +161,7 @@ mod tests {
         library.join("local/coder/latest")
     }
 
-    fn write_image(library: &Path, soul: &str) {
+    fn write_image(library: &Path) {
         let image = image_root(library);
         fs::create_dir_all(&image).unwrap();
         fs::write(
@@ -183,7 +183,6 @@ id = "tool:local/list-directory:latest"
 "#,
         )
         .unwrap();
-        fs::write(image.join("SOUL.md"), soul).unwrap();
         fs::write(
             image.join("base.lua"),
             "mcl_command(\"IMPORT skill:local/code-review:latest AS review\")\nmcl_command(\"IMPORT tool:local/list-directory:latest AS list_dir\")\nmcl_command(\"INJECT review, list_dir TO tool.tool_default\")\nmcl_command(\"INJECT tool.tool_default TO tool.tool_dynamic\")\n",
@@ -203,7 +202,7 @@ id = "tool:local/list-directory:latest"
     fn load(
         app: &mut App,
         id: &str,
-        reference: &ResourceId,
+        reference: &ResourceRef,
     ) -> Result<Entity, AgentImageLoadError> {
         app.world().send_event(LoadAgentImage {
             id: id.to_owned(),
@@ -228,16 +227,23 @@ id = "tool:local/list-directory:latest"
     #[test]
     fn loads_an_image_into_complete_read_only_components() {
         let library = unique_directory("components");
-        write_image(&library, "You are a careful coder.\n");
+        write_image(&library);
         let mut app = app(&library);
-        let reference = ResourceId::parse("image:local/coder").unwrap();
+        let reference = ResourceRef::parse("image:local/coder").unwrap();
 
         let entity = load(&mut app, "load-components", &reference).unwrap();
 
         let identity = app.world().get_component::<ResourceId>(entity).unwrap();
         let image = app.world().get_component::<AgentImage>(entity).unwrap();
 
-        assert_eq!(identity, &reference);
+        assert_eq!(identity.as_ref(), &reference);
+        let driver = image.base_driver();
+        assert_eq!(
+            driver.source(),
+            fs::read_to_string(image_root(&library).join("base.lua")).unwrap()
+        );
+        assert_eq!(driver.origin(), image_root(&library).join("base.lua"));
+        assert_eq!(driver.source_hash().len(), 64);
         assert_eq!(image.model().model(), "deepseek-v4-flash");
         assert_eq!(image.model().parameters().temperature(), Some(0.7));
         assert_eq!(image.model().parameters().max_output_tokens(), Some(8192));
@@ -259,9 +265,9 @@ id = "tool:local/list-directory:latest"
     #[test]
     fn concurrent_requests_share_one_read_and_entity() {
         let library = unique_directory("concurrent");
-        write_image(&library, "Concurrent image.\n");
+        write_image(&library);
         let mut app = app(&library);
-        let reference = ResourceId::parse("image:local/coder:latest").unwrap();
+        let reference = ResourceRef::parse("image:local/coder:latest").unwrap();
         for id in ["first", "second"] {
             app.world().send_event(LoadAgentImage {
                 id: id.to_owned(),
@@ -296,15 +302,23 @@ id = "tool:local/list-directory:latest"
     #[test]
     fn successful_reload_reuses_the_entity_and_replaces_components() {
         let library = unique_directory("reload-success");
-        write_image(&library, "Old soul.\n");
+        write_image(&library);
         let mut app = app(&library);
-        let reference = ResourceId::parse("image:local/coder").unwrap();
+        let reference = ResourceRef::parse("image:local/coder").unwrap();
         let entity = load(&mut app, "initial", &reference).unwrap();
-        fs::write(image_root(&library).join("SOUL.md"), "New soul.\n").unwrap();
+        fs::write(image_root(&library).join("base.lua"), "-- updated driver\n").unwrap();
 
         let reloaded = load(&mut app, "reload", &reference).unwrap();
 
         assert_eq!(reloaded, entity);
+        assert_eq!(
+            app.world()
+                .get_component::<AgentImage>(entity)
+                .unwrap()
+                .base_driver()
+                .source(),
+            "-- updated driver\n"
+        );
         assert_eq!(app.world().entity_count(), 1);
         let _ = fs::remove_dir_all(library);
     }
@@ -312,11 +326,11 @@ id = "tool:local/list-directory:latest"
     #[test]
     fn failed_reload_preserves_the_previous_entity() {
         let library = unique_directory("reload-failure");
-        write_image(&library, "Stable soul.\n");
+        write_image(&library);
         let mut app = app(&library);
-        let reference = ResourceId::parse("image:local/coder").unwrap();
+        let reference = ResourceRef::parse("image:local/coder").unwrap();
         let _entity = load(&mut app, "initial", &reference).unwrap();
-        fs::write(image_root(&library).join("unknown.txt"), "invalid").unwrap();
+        fs::remove_file(image_root(&library).join("base.lua")).unwrap();
 
         let error = load(&mut app, "broken", &reference).unwrap_err();
 
@@ -330,7 +344,7 @@ id = "tool:local/list-directory:latest"
         let library = unique_directory("missing");
         fs::create_dir_all(&library).unwrap();
         let mut app = app(&library);
-        let reference = ResourceId::parse("image:local/missing").unwrap();
+        let reference = ResourceRef::parse("image:local/missing").unwrap();
 
         let error = load(&mut app, "missing", &reference).unwrap_err();
 
@@ -340,151 +354,107 @@ id = "tool:local/list-directory:latest"
     }
 
     #[test]
-    fn image_layout_allows_resource_directories_without_soul() {
-        let library = unique_directory("layout-dirs");
-        let image = image_root(&library);
-        fs::create_dir_all(image.join("skills")).unwrap();
-        fs::create_dir_all(image.join("hooks")).unwrap();
-        fs::create_dir_all(image.join("tools")).unwrap();
-        fs::write(
-            image.join("agent.toml"),
-            r#"schema_version = 1
-
-[inference]
-model = "deepseek-v4-flash"
-temperature = 0.7
-max_output_tokens = 8192
-top_p = 0.9
-stop = ["DONE"]
-"#,
-        )
-        .unwrap();
-        fs::write(
-            image.join("base.lua"),
-            "mcl_command(\"EMIT EFFECT finish\")\n",
-        )
-        .unwrap();
-
-        let mut app = app(&library);
-        let reference = ResourceId::parse("image:local/coder:latest").unwrap();
-        let entity = load(&mut app, "layout-dirs", &reference).unwrap();
-
-        assert!(app.world().get_component::<ResourceId>(entity).is_some());
-        let _ = fs::remove_dir_all(library);
+    fn image_layout_ignores_entries_the_image_does_not_own() {
+        for entry in [
+            "skills",
+            "hooks",
+            "tools",
+            "sandboxes",
+            "SOUL.md",
+            "README.md",
+        ] {
+            let library = unique_directory("layout-resource");
+            write_image(&library);
+            let path = image_root(&library).join(entry);
+            if entry.ends_with(".md") {
+                fs::write(path, "local prompt").unwrap();
+            } else {
+                fs::create_dir(path).unwrap();
+            }
+            let mut app = app(&library);
+            let reference = ResourceRef::parse("image:local/coder").unwrap();
+            load(&mut app, "ignore-resource", &reference)
+                .unwrap_or_else(|error| panic!("{entry} must not block a load: {error}"));
+            assert_eq!(app.world().entity_count(), 1, "{entry}");
+            let _ = fs::remove_dir_all(library);
+        }
     }
 
     #[test]
-    fn prompt_dependency_requires_uppercase_file_in_image_root() {
-        let library = unique_directory("prompt-deps");
-        let image = image_root(&library);
-        fs::create_dir_all(&image).unwrap();
-        fs::write(
-            image.join("agent.toml"),
-            r#"schema_version = 1
-
-[inference]
-model = "deepseek-v4-flash"
-temperature = 0.7
-max_output_tokens = 8192
-top_p = 0.9
-stop = ["DONE"]
-
-[[dependencies]]
-id = "prompt:system/test:latest"
-"#,
-        )
-        .unwrap();
-        fs::write(
-            image.join("base.lua"),
-            "mcl_command(\"EMIT EFFECT finish\")\n",
-        )
-        .unwrap();
-
-        let mut app = app(&library);
-        let reference = ResourceId::parse("image:local/coder:latest").unwrap();
-        let error = load(&mut app, "missing-test", &reference).unwrap_err();
-        assert_eq!(error.kind(), AgentImageLoadErrorKind::PromptReadFailed);
-
-        fs::write(image.join("TEST.md"), "You are a careful coder.\n").unwrap();
-        let entity = load(&mut app, "with-test", &reference).unwrap();
-        assert!(app.world().get_component::<ResourceId>(entity).is_some());
-        let _ = fs::remove_dir_all(library);
+    fn image_layout_still_requires_both_owned_files() {
+        for missing in ["agent.toml", "base.lua"] {
+            let library = unique_directory("layout-missing");
+            write_image(&library);
+            fs::remove_file(image_root(&library).join(missing)).unwrap();
+            let mut app = app(&library);
+            let reference = ResourceRef::parse("image:local/coder").unwrap();
+            let error = load(&mut app, "reject-missing", &reference).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                AgentImageLoadErrorKind::InvalidLayout,
+                "{missing}"
+            );
+            assert_eq!(app.world().entity_count(), 0);
+            let _ = fs::remove_dir_all(library);
+        }
     }
 
     #[test]
-    fn prompt_dependency_allows_same_file_for_system_and_user() {
-        let library = unique_directory("prompt-dual-role");
-        let image = image_root(&library);
-        fs::create_dir_all(&image).unwrap();
+    fn prompt_dependencies_are_references_without_local_files_or_role_validation() {
+        let library = unique_directory("global-prompts");
+        write_image(&library);
         fs::write(
-            image.join("agent.toml"),
+            image_root(&library).join("agent.toml"),
             r#"schema_version = 1
-
 [inference]
-model = "deepseek-v4-flash"
-temperature = 0.7
-max_output_tokens = 8192
-top_p = 0.9
-stop = ["DONE"]
-
+model = "test"
 [[dependencies]]
 id = "prompt:system/test:latest"
-
-[[dependencies]]
-id = "prompt:user/test:latest"
-"#,
-        )
-        .unwrap();
-        fs::write(
-            image.join("base.lua"),
-            "mcl_command(\"EMIT EFFECT finish\")\n",
-        )
-        .unwrap();
-        fs::write(image.join("TEST.md"), "Shared prompt.\n").unwrap();
-
-        let mut app = app(&library);
-        let reference = ResourceId::parse("image:local/coder:latest").unwrap();
-        let entity = load(&mut app, "dual-role", &reference).unwrap();
-
-        assert!(app.world().get_component::<ResourceId>(entity).is_some());
-        let _ = fs::remove_dir_all(library);
-    }
-
-    #[test]
-    fn duplicate_prompt_dependency_is_rejected() {
-        let library = unique_directory("prompt-duplicate");
-        let image = image_root(&library);
-        fs::create_dir_all(&image).unwrap();
-        fs::write(
-            image.join("agent.toml"),
-            r#"schema_version = 1
-
-[inference]
-model = "deepseek-v4-flash"
-temperature = 0.7
-max_output_tokens = 8192
-top_p = 0.9
-stop = ["DONE"]
-
-[[dependencies]]
-id = "prompt:system/test:latest"
-
 [[dependencies]]
 id = "prompt:system/test:v1"
+[[dependencies]]
+id = "prompt:local/global:latest"
 "#,
         )
         .unwrap();
+        let mut app = app(&library);
+        let reference = ResourceRef::parse("image:local/coder").unwrap();
+        let entity = load(&mut app, "global-prompts", &reference).unwrap();
+        let image = app.world().get_component::<AgentImage>(entity).unwrap();
+        assert_eq!(
+            image
+                .dependencies()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "prompt:system/test:latest",
+                "prompt:system/test:v1",
+                "prompt:local/global:latest"
+            ]
+        );
+        let _ = fs::remove_dir_all(library);
+    }
+
+    #[test]
+    fn dependency_source_bodies_are_rejected() {
+        let library = unique_directory("dependency-source");
+        write_image(&library);
         fs::write(
-            image.join("base.lua"),
-            "mcl_command(\"EMIT EFFECT finish\")\n",
+            image_root(&library).join("agent.toml"),
+            r#"schema_version = 1
+[inference]
+model = "test"
+[[dependencies]]
+id = "prompt:system/test:latest"
+source = "inline body is no longer supported"
+"#,
         )
         .unwrap();
-        fs::write(image.join("TEST.md"), "Shared prompt.\n").unwrap();
-
         let mut app = app(&library);
-        let reference = ResourceId::parse("image:local/coder:latest").unwrap();
-        let error = load(&mut app, "duplicate", &reference).unwrap_err();
-        assert_eq!(error.kind(), AgentImageLoadErrorKind::DuplicateDependency);
+        let reference = ResourceRef::parse("image:local/coder").unwrap();
+        let error = load(&mut app, "inline-source", &reference).unwrap_err();
+        assert_eq!(error.kind(), AgentImageLoadErrorKind::ManifestDecodeFailed);
         let _ = fs::remove_dir_all(library);
     }
 
@@ -494,14 +464,14 @@ id = "prompt:system/test:v1"
         use std::os::unix::fs::symlink;
 
         let library = unique_directory("symlink");
-        write_image(&library, "Symlink test.\n");
+        write_image(&library);
         symlink(
-            image_root(&library).join("SOUL.md"),
+            image_root(&library).join("base.lua"),
             image_root(&library).join("linked-soul"),
         )
         .unwrap();
         let mut app = app(&library);
-        let reference = ResourceId::parse("image:local/coder").unwrap();
+        let reference = ResourceRef::parse("image:local/coder").unwrap();
 
         let error = load(&mut app, "symlink", &reference).unwrap_err();
 

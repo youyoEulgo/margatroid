@@ -1,6 +1,6 @@
 use async_runtime_plugin::AsyncTaskError;
 use core_plugin::{Entity, Event};
-use margatroid_types::{Message, ResourceId};
+use margatroid_types::{Message, ResourceRef};
 use server_plugin::WebSocketSender;
 use tokio::sync::watch;
 
@@ -30,7 +30,7 @@ pub use margatroid_types::InferenceRequestEvent;
 pub struct ContextCompactionInferenceRequest {
     pub id: String,
     pub agent: Entity,
-    pub agent_id: ResourceId,
+    pub agent_id: ResourceRef,
     pub messages: Vec<Message>,
 }
 
@@ -71,7 +71,7 @@ pub(crate) enum InferenceOutputKind {
 
 pub(crate) struct PreparedInference {
     pub(crate) route: InferenceRoute,
-    pub(crate) agent_id: ResourceId,
+    pub(crate) agent_id: ResourceRef,
     pub(crate) client: reqwest::Client,
     pub(crate) request: ProviderHttpRequest,
     pub(crate) adapter: ErasedProviderAdapter,

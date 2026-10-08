@@ -1,5 +1,5 @@
 use core_plugin::{Entity, World};
-use resource_id_plugin::{ResourceId, ResourceIdLookupError, WorldResourceIdExt};
+use resource_id_plugin::{ResourceId, ResourceIdLookupError, ResourceRef, WorldResourceIdExt};
 use server_plugin::{
     RegisterConnection, WebSocketConnectionId, WebSocketConnections, WebSocketNameError,
 };
@@ -35,7 +35,15 @@ pub(crate) fn handle_client_registration(
     }
     let client = Client::new(request.connection_id, client_type.to_owned(), name);
     let entity = world.spawn();
-    world.insert_component(entity, resource_id.clone());
+    if let Err(error) = world.attach_resource_id(entity, resource_id.clone()) {
+        world.despawn(entity);
+        return Err(match error {
+            resource_id_plugin::ResourceIdAttachError::Lookup(
+                ResourceIdLookupError::Duplicate { .. },
+            ) => ClientError::DuplicateClient,
+            _ => ClientError::InvalidResourceId,
+        });
+    }
     world.insert_component(entity, client.clone());
     tracing::info!(
         request_id = %request.id,
@@ -54,9 +62,11 @@ pub(crate) fn handle_client_registration(
 pub fn registered_client(
     world: &World,
     connection_id: WebSocketConnectionId,
-) -> Option<ResourceId> {
+) -> Option<ResourceRef> {
     let entity = client_entity(world, connection_id)?;
-    world.get_component::<ResourceId>(entity).cloned()
+    world
+        .get_component::<ResourceId>(entity)
+        .map(|id| id.as_ref().clone())
 }
 
 pub(crate) fn handle_client_disconnect(world: &mut World, connection_id: WebSocketConnectionId) {
@@ -81,10 +91,10 @@ fn client_resource_id(
     client_type: &str,
     name: Option<&str>,
     connection_id: WebSocketConnectionId,
-) -> Result<ResourceId, ClientError> {
+) -> Result<ResourceRef, ClientError> {
     let id = connection_id.get().to_string();
     let name = name.unwrap_or(&id);
-    ResourceId::parse(client_source(Some(client_type), Some(name), connection_id))
+    ResourceRef::parse(client_source(Some(client_type), Some(name), connection_id))
         .map_err(|_| ClientError::InvalidResourceId)
 }
 

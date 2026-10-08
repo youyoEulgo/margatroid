@@ -167,6 +167,10 @@ impl World {
             .fast_forward();
     }
 
+    pub fn advance_event_frame(&mut self) {
+        self.tick();
+    }
+
     pub(crate) fn tick(&mut self) {
         let mut queue = self.event_queue.write().expect("event queue lock poisoned");
         self.event_registry.clear();

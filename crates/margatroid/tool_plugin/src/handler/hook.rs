@@ -2,19 +2,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    candidate_resource_entry, ToolCallRequest, ToolError, ToolErrorKind, ToolRegisterRequest,
-    ToolRegisterResponse, ToolTemplate,
+    ToolCallRequest, ToolError, ToolErrorKind, ToolRegisterRequest, ToolRegisterResponse,
+    ToolTemplate,
 };
 use agent_plugin::Agent;
 use app_runtime_plugin::WorldEventExt;
 use core_plugin::World;
-use margatroid_types::ResourceId;
+use margatroid_types::ResourceRef;
 use serde::Deserialize;
 
 const PROVIDER_ID: &str = "hook";
 const HOOK_FILE: &str = "hook.toml";
 const HOOK_SCHEMA_FILE: &str = "input.schema.json";
-const HOOK_EXECUTOR_ID: &str = "tool:builtin/hook:latest";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,10 +26,7 @@ pub(crate) fn hook_register_system(world: &mut World) {
         .event_reader::<ToolRegisterRequest>()
         .into_iter()
         .cloned()
-        .filter(|request| {
-            request.resource_id.resource_type() == "hook"
-                || request.resource_id.to_string() == HOOK_EXECUTOR_ID
-        })
+        .filter(|request| request.resource_id.resource_type() == "hook")
         .collect::<Vec<_>>();
     for request in requests {
         let result = world
@@ -41,13 +37,10 @@ pub(crate) fn hook_register_system(world: &mut World) {
                     "agent tool environment is missing",
                 )
             })
-            .and_then(|agent| {
+            .and_then(|_| {
                 validate_hook_resource(&request.resource_id)?;
-                let package_root = find_hook_package(
-                    &agent.info.project_root,
-                    &agent.info.image_root,
-                    &request.resource_id,
-                )?;
+                let package_root =
+                    find_hook_package(super::library_root(world)?, &request.resource_id)?;
                 let metadata = read_hook_metadata(&package_root)?;
                 let schema = read_hook_schema(&package_root)?;
                 ToolTemplate::new(
@@ -57,12 +50,12 @@ pub(crate) fn hook_register_system(world: &mut World) {
                 )
             });
         let result = result.and_then(|template| {
-            candidate_resource_entry(
+            crate::candidate_resource_entry_with_content(
                 request.resource_id.clone(),
                 request.alias.clone(),
-                ResourceId::parse(HOOK_EXECUTOR_ID)
-                    .expect("built-in Hook executor ID must be valid"),
+                agent_plugin::ToolExecutor::Hook,
                 template,
+                Some(crate::ResourceContent::Hook),
             )
         });
         world.send_event(ToolRegisterResponse {
@@ -115,15 +108,11 @@ fn read_hook_schema(package_root: &Path) -> Result<serde_json::Value, ToolError>
     })
 }
 
-fn find_hook_package(
-    project_root: &Path,
-    image_root: &Path,
-    resource: &ResourceId,
+pub(super) fn find_hook_package(
+    library_root: &Path,
+    resource: &ResourceRef,
 ) -> Result<PathBuf, ToolError> {
-    let candidates = [
-        project_root.join(".margatroid").join("hooks"),
-        image_root.join("hooks"),
-    ];
+    let candidates = [library_root.join("hooks")];
     for root in candidates {
         let package = root
             .join(resource.scope())
@@ -165,7 +154,7 @@ fn find_hook_package(
     ))
 }
 
-fn validate_hook_resource(resource: &ResourceId) -> Result<(), ToolError> {
+fn validate_hook_resource(resource: &ResourceRef) -> Result<(), ToolError> {
     if resource.resource_type() != PROVIDER_ID || resource.tag() != "latest" {
         return Err(ToolError::new(
             ToolErrorKind::ResourceResolutionFailed,

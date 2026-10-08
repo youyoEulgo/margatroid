@@ -6,7 +6,7 @@ use std::sync::Arc;
 use agent_plugin::{Agent, AgentResourceMap};
 use app_runtime_plugin::WorldEventExt;
 use core_plugin::World;
-use margatroid_types::ResourceId;
+use margatroid_types::ResourceRef;
 
 use crate::{ResourceContent, ResourceMapEntry, ToolError, ToolErrorKind, ToolRegisterRequest};
 
@@ -105,8 +105,6 @@ fn inherit_environment(command: &mut tokio::process::Command) {
     for (name, value) in inherited_environment() {
         command.env(name, value);
     }
-    // A tool reads a pipe here, not a terminal: keep paging and colour out of
-    // captured output. The pty path sets its own terminal type instead.
     command
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
@@ -264,17 +262,13 @@ fn register_sandbox_resource(
             "sandbox registration request is invalid",
         ));
     }
-    let agent = world.get_component::<Agent>(request.agent).ok_or_else(|| {
+    world.get_component::<Agent>(request.agent).ok_or_else(|| {
         ToolError::new(
             ToolErrorKind::ToolEnvironmentMissing,
             "agent tool environment is missing",
         )
     })?;
-    let root = find_sandbox_package(
-        &agent.info.project_root,
-        &agent.info.image_root,
-        &request.resource_id,
-    )?;
+    let root = find_sandbox_package(super::library_root(world)?, &request.resource_id)?;
     let policy = fs::read_to_string(root.join(POLICY_FILE)).map_err(|_| {
         ToolError::new(
             ToolErrorKind::InvalidDefinition,
@@ -300,7 +294,7 @@ fn register_sandbox_resource(
             .clone()
             .unwrap_or_else(|| request.resource_id.to_string()),
         alias: request.alias.clone(),
-        tool_id: None,
+        executor: None,
         template: None,
         content: Some(ResourceContent::Sandbox {
             policy: Arc::from(policy),
@@ -308,10 +302,9 @@ fn register_sandbox_resource(
     })
 }
 
-fn find_sandbox_package(
-    project_root: &Path,
-    image_root: &Path,
-    resource_id: &ResourceId,
+pub(super) fn find_sandbox_package(
+    library_root: &Path,
+    resource_id: &ResourceRef,
 ) -> Result<PathBuf, ToolError> {
     if resource_id.resource_type() != SANDBOX_TYPE {
         return Err(ToolError::new(
@@ -319,10 +312,7 @@ fn find_sandbox_package(
             "sandbox resource must use type sandbox",
         ));
     }
-    let roots = [
-        project_root.join(".margatroid").join("sandboxes"),
-        image_root.join("sandboxes"),
-    ];
+    let roots = [library_root.join("sandboxes")];
     for root in roots {
         let package = root
             .join(resource_id.scope())
@@ -389,8 +379,6 @@ mod environment_tests {
             .iter()
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect();
-        // HOME and PATH are what every ordinary CLI needs; the previous
-        // wholesale clear kept only PATH, which is why `$HOME` expanded empty.
         assert!(names.iter().any(|name| name == "PATH"));
         if std::env::var_os("HOME").is_some() {
             assert!(names.iter().any(|name| name == "HOME"));

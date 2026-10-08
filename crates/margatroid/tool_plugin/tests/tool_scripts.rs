@@ -1,25 +1,23 @@
 //! End-to-end checks for a tool script running through the real runner.
 //!
-//! These load a tool script from the on-disk agent image and execute it exactly
+//! These load a tool script from the global resource library and execute it exactly
 //! as a tool call would, so the shell the runner injects is exercised for real
 //! rather than through a stub.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use margatroid_types::ResourceId;
+use margatroid_types::ResourceRef;
 use tool_plugin::{run_lua_tool, LuaExecutionLimits, LuaToolRunRequest};
 
 fn runner_path() -> Option<PathBuf> {
-    // The workspace target directory sits three levels above this crate:
-    // crates/margatroid/tool_plugin -> crates/margatroid -> crates -> <root>.
     let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/debug/tool_runner");
     candidate.is_file().then_some(candidate)
 }
 
-fn image_root() -> Option<PathBuf> {
+fn library_root() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    let path = PathBuf::from(home).join(".margatroid/agent-images");
+    let path = PathBuf::from(home).join(".margatroid");
     path.is_dir().then_some(path)
 }
 
@@ -27,11 +25,8 @@ fn image_root() -> Option<PathBuf> {
 /// that need it announce a skip instead of failing where it is absent.
 fn ready(name: &str) -> Option<(PathBuf, PathBuf)> {
     let runner = runner_path()?;
-    let image = image_root()?;
-    let package = image
-        .join("local/coder/latest/tools/local")
-        .join(name)
-        .join("latest");
+    let image = library_root()?;
+    let package = image.join("tools/local").join(name).join("latest");
     if !package.join("main.lua").is_file() {
         return None;
     }
@@ -53,11 +48,8 @@ fn limits() -> LuaExecutionLimits {
 
 /// Run one tool script from the coder image against a scratch project.
 fn run_tool(tool: &str, arguments: &str, project_root: &Path) -> Result<String, String> {
-    let image = image_root().ok_or("the agent image root is not available")?;
-    let package = image
-        .join("local/coder/latest/tools/local")
-        .join(tool)
-        .join("latest");
+    let image = library_root().ok_or("the agent image root is not available")?;
+    let package = image.join("tools/local").join(tool).join("latest");
     let metadata = std::fs::read_to_string(package.join("tool.toml"))
         .map_err(|error| format!("tool.toml: {error}"))?;
     let schema = std::fs::read_to_string(package.join("input.schema.json"))
@@ -71,9 +63,9 @@ fn run_tool(tool: &str, arguments: &str, project_root: &Path) -> Result<String, 
         script,
         temp_dir: project_root.to_path_buf(),
         arguments: arguments.to_owned(),
-        agent_id: ResourceId::parse("agent:local/coder:latest").unwrap(),
+        agent_id: ResourceRef::parse("agent:local/coder:latest").unwrap(),
         turn_id: "turn-1".to_owned(),
-        resource_id: ResourceId::parse(&format!("tool:local/{tool}:latest")).unwrap(),
+        resource_id: ResourceRef::parse(&format!("tool:local/{tool}:latest")).unwrap(),
         project_root: project_root.to_path_buf(),
         limits: limits(),
         sandbox_policies: Vec::new(),
@@ -131,7 +123,6 @@ fn the_grep_tool_reports_matches_and_no_match_is_not_an_error() {
 
     std::env::set_var("MARGATROID_TOOL_RUNNER", &runner);
     let matched = run_tool("grep", r#"{"pattern":"needle"}"#, &project);
-    // ripgrep exits 1 for "no match", which the tool must not treat as failure.
     let unmatched = run_tool("grep", r#"{"pattern":"definitely-not-present"}"#, &project);
     std::env::remove_var("MARGATROID_TOOL_RUNNER");
 
@@ -184,8 +175,6 @@ fn the_bash_tool_reports_an_outcome_the_model_can_read_directly() {
     let succeeded = run_tool("bash", r#"{"cmd":"echo fine"}"#, &project);
     std::env::remove_var("MARGATROID_TOOL_RUNNER");
 
-    // The envelope carries two fields: what the model reads, and whether the
-    // runtime should treat the call as failed.
     let failed = failed.expect("bash should run");
     let value: serde_json::Value =
         serde_json::from_str(&failed).expect("bash output must be the outcome envelope");
@@ -237,8 +226,6 @@ fn a_failing_command_with_no_output_still_says_something() {
     let quiet = run_tool("bash", r#"{"cmd":"true"}"#, &project);
     std::env::remove_var("MARGATROID_TOOL_RUNNER");
 
-    // A tool that can answer at all must answer with something the model can act
-    // on; an empty body leaves it guessing why the call failed.
     let failed = failed.expect("bash should run");
     let value: serde_json::Value = serde_json::from_str(&failed).unwrap();
     assert_eq!(value["ok"], false);

@@ -8,14 +8,14 @@ use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::{App, Entity, World};
 use lua_runtime_plugin::{LuaRuntimeHandle, LuaRuntimePlugin, LuaVmId};
-use margatroid_types::{AgentError, Message, ResourceId, TokenUsage, ToolDefinition};
+use margatroid_types::{AgentError, Message, ResourceRef, TokenUsage, ToolDefinition};
 use mcl_plugin::{
     MclCommandId, MclCommandReply, MclDomainRequest, MclEffectCommand, MclOperation, MclPlugin,
 };
 
 const ENTRY_BLOCK_ID: &str = "entry";
 const ENTRY_INNER_ID: &str = "pending";
-use resource_id_plugin::ResourceIdPlugin;
+use resource_id_plugin::{ResourceIdPlugin, WorldResourceIdExt};
 use tool_plugin::ToolPlugin;
 
 struct EmptyMemory;
@@ -68,14 +68,14 @@ fn spawn_agent(world: &mut World, lifecycle: AgentLifecycleState, vm: Option<Lua
     let workspace = world.spawn();
     let image = world.spawn();
     let entity = world.spawn();
-    let id: ResourceId = "agent:test/coder:latest".parse().unwrap();
+    let id: ResourceRef = "agent:test/coder:latest".parse().unwrap();
     let (sender, _receiver) = tokio::sync::oneshot::channel::<Result<Entity, AgentError>>();
     let model = AgentModelInfo {
         provider: "test".to_owned(),
         model: "test".to_owned(),
         context_window_tokens: 1024,
     };
-    world.insert_component(entity, id);
+    world.attach_resource_id(entity, id).unwrap();
     world.insert_component(
         entity,
         Agent {
@@ -87,7 +87,6 @@ fn spawn_agent(world: &mut World, lifecycle: AgentLifecycleState, vm: Option<Lua
                 image_root: Default::default(),
                 home_root: Default::default(),
                 image_dependencies: Default::default(),
-                image_sources: Default::default(),
             },
             creation: AgentCreationState {
                 request_id: "create-1".to_owned(),
@@ -117,15 +116,14 @@ fn spawn_agent(world: &mut World, lifecycle: AgentLifecycleState, vm: Option<Lua
 }
 
 fn register_probe_tool(world: &mut World, agent: Entity) {
-    let resource_id: ResourceId = "tool:local/probe:latest".parse().unwrap();
-    let tool_id: ResourceId = "tool:builtin/skill-loader:latest".parse().unwrap();
+    let resource_id: ResourceRef = "tool:local/probe:latest".parse().unwrap();
     tool_plugin::register_agent_resource(
         world,
         agent,
         tool_plugin::candidate_resource_entry_with_content(
             resource_id.clone(),
             Some("probe".to_owned()),
-            tool_id,
+            agent_plugin::ToolExecutor::SkillLoader,
             tool_plugin::ToolTemplate::new(
                 "probe",
                 "A probe tool.",
@@ -661,7 +659,7 @@ fn ending_a_turn_with_a_tracked_tool_call_is_rejected() {
                 turn_id: turn,
                 tool_call_id: "call-1".to_owned(),
                 resource_id: "tool:local/probe:latest".parse().unwrap(),
-                tool_id: "tool:builtin/skill-loader:latest".parse().unwrap(),
+                executor: agent_plugin::ToolExecutor::SkillLoader,
             },
         );
     }

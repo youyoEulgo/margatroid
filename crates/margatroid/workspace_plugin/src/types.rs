@@ -14,12 +14,25 @@ pub enum WorkspaceAgentState {
     Failed { error: WorkspaceError },
 }
 
+#[derive(Default)]
+pub(crate) struct WorkspaceStopState {
+    pub(crate) agents: std::collections::HashSet<Entity>,
+    pub(crate) replies: Vec<WorkspaceStopReply>,
+}
+
+pub(crate) enum WorkspaceStopReply {
+    Stop(crate::StopWorkspace),
+    Reference(crate::StopWorkspaceByReference),
+    Reload(crate::ReloadWorkspace),
+}
+
 impl Resource for WorkspaceRegistry {}
 
 #[derive(Default)]
 pub struct WorkspaceRegistry {
     pub agent_images_root: Arc<PathBuf>,
     pub workspaces: Vec<Entity>,
+    pub(crate) stopping: std::collections::HashMap<Entity, WorkspaceStopState>,
     pub pending_images: BTreeMap<String, (Entity, String)>,
     pub pending_agents: BTreeMap<
         String,

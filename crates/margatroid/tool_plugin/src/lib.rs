@@ -6,11 +6,11 @@ mod types;
 
 use std::path::PathBuf;
 
-use agent_plugin::{Agent, AgentResourceEntry};
+use agent_plugin::{Agent, AgentResourceEntry, ToolExecutor};
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
 use async_runtime_plugin::AppAsyncExt;
 use core_plugin::{App, Plugin, Resource};
-use margatroid_types::{ResourceId, ToolCall};
+use margatroid_types::{ResourceRef, ToolCall};
 
 pub use error::{ToolError, ToolErrorKind};
 pub use events::{CancelToolTurn, ToolCallEvent, ToolRegisterRequest, ToolRegisterResponse};
@@ -19,6 +19,7 @@ pub use types::{ResourceContent, ResourceMapEntry, ToolCallRequest, ToolTemplate
 use system::{cancel_tool_turn_system, tool_call_route_system, tool_register_system};
 
 pub struct ToolPlugin {
+    root: Option<PathBuf>,
     schedule: String,
     lua_limits: handler::lua::LuaExecutionLimits,
 }
@@ -37,6 +38,7 @@ impl ToolPlugin {
             ));
         }
         Ok(Self {
+            root: Some(root),
             schedule: RuntimePlugin::UPDATE.to_owned(),
             lua_limits: handler::lua::LuaExecutionLimits::default(),
         })
@@ -51,6 +53,7 @@ impl ToolPlugin {
 impl Default for ToolPlugin {
     fn default() -> Self {
         Self {
+            root: None,
             schedule: RuntimePlugin::UPDATE.to_owned(),
             lua_limits: handler::lua::LuaExecutionLimits::default(),
         }
@@ -83,12 +86,43 @@ impl Plugin for ToolPlugin {
             )
             .panic();
         }
+        let installed_root = app
+            .world()
+            .get_resource::<resource_library_plugin::ResourceLibraryRoot>()
+            .map(|root| root.0.clone());
+        if let (Some(requested), Some(installed)) = (&self.root, &installed_root) {
+            assert_eq!(
+                requested, installed,
+                "ToolPlugin root conflicts with ResourceLibraryRoot"
+            );
+        }
+        let root = self.root.or(installed_root).unwrap_or_else(|| {
+            PathBuf::from(
+                std::env::var_os("HOME").expect("HOME or ResourceLibraryRoot is required"),
+            )
+            .join(".margatroid")
+        });
+        assert!(
+            root.is_absolute()
+                && !root
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir),
+            "ResourceLibraryRoot must be absolute and cannot contain parent traversal"
+        );
+        if !app
+            .world()
+            .contains_resource::<resource_library_plugin::ResourceLibraryRoot>()
+        {
+            app.world_mut()
+                .insert_resource(resource_library_plugin::ResourceLibraryRoot(root));
+        }
         app.world_mut().insert_resource(ToolPluginInstalled);
         app.world_mut().insert_resource(self.lua_limits);
         app.add_system(&self.schedule, tool_register_system)
             .add_system(&self.schedule, handler::skill::skill_register_system)
             .add_system(&self.schedule, handler::hook::hook_register_system)
             .add_system(&self.schedule, handler::sandbox::sandbox_register_system)
+            .add_system(&self.schedule, handler::prompt::prompt_register_system)
             .add_system(&self.schedule, handler::lua::lua_tool_register_system)
             .add_system(&self.schedule, tool_call_route_system)
             .add_async_system(&self.schedule, handler::lua::execute_prepared_lua_tool)
@@ -102,7 +136,7 @@ pub fn register_agent_resource(
     agent: core_plugin::Entity,
     entry: ResourceMapEntry,
 ) -> Result<ResourceMapEntry, ToolError> {
-    let tool_id = entry.tool_id.clone().ok_or_else(|| {
+    let executor = entry.executor.ok_or_else(|| {
         ToolError::new(
             ToolErrorKind::InvalidDefinition,
             "resource mapping is not executable",
@@ -122,7 +156,7 @@ pub fn register_agent_resource(
         .register_tool(AgentResourceEntry {
             resource_id: entry.resource_id.clone(),
             resource_name: entry.resource_name.clone(),
-            tool_id,
+            executor,
             description: template.description,
             parameters: template.parameters,
         })
@@ -131,20 +165,20 @@ pub fn register_agent_resource(
 }
 
 pub fn candidate_resource_entry(
-    resource_id: ResourceId,
+    resource_id: ResourceRef,
     alias: Option<String>,
-    tool_id: ResourceId,
+    executor: ToolExecutor,
     template: ToolTemplate,
 ) -> Result<ResourceMapEntry, ToolError> {
-    candidate_resource_entry_with_content(resource_id, alias, tool_id, template, None)
+    candidate_resource_entry_with_content(resource_id, alias, executor, template, None)
 }
 
 /// The same candidate entry, carrying content that later stages need — a
 /// sandbox's policy — alongside the template.
 pub fn candidate_resource_entry_with_content(
-    resource_id: ResourceId,
+    resource_id: ResourceRef,
     alias: Option<String>,
-    tool_id: ResourceId,
+    executor: ToolExecutor,
     mut template: ToolTemplate,
     content: Option<ResourceContent>,
 ) -> Result<ResourceMapEntry, ToolError> {
@@ -161,7 +195,7 @@ pub fn candidate_resource_entry_with_content(
         resource_id,
         resource_name,
         alias,
-        tool_id: Some(tool_id),
+        executor: Some(executor),
         template: Some(template),
         content,
     })
@@ -170,7 +204,7 @@ pub fn candidate_resource_entry_with_content(
 pub fn resolve_agent_tool_definitions(
     world: &core_plugin::World,
     agent: core_plugin::Entity,
-    resources: &[ResourceId],
+    resources: &[ResourceRef],
 ) -> Result<Vec<margatroid_types::ToolDefinition>, ToolError> {
     if resources.is_empty() {
         return Ok(Vec::new());

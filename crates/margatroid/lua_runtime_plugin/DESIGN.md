@@ -124,6 +124,7 @@ handle_lua_runtime_request(world: &mut World, request: LuaRuntimeRequest)
     行为：
         校验request_id、重复请求和源码大小
         分配LuaVmId和CancellationToken并写入LuaRuntimeState
+        若该request_id已在pre_cancelled中则先取出并立即标记取消
         LongRunning请求立即发送LuaVmStarted
         读取配置后将VM执行任务提交到独立线程
         任务结束时通过reply恰好发送一次结果，并发送LuaRuntimeTaskFinished
@@ -134,6 +135,14 @@ handle_lua_runtime_cancels(world: &mut World, requests: Vec<LuaRuntimeCancelRequ
     行为：
         按request_id标记取消令牌
         同时按owner_id匹配所有相关请求并取消
+        命中任一请求即视为已匹配
+        未匹配时把request_id写入pre_cancelled
+
+取消先于请求到达：
+    取消与请求各自经由事件传递，任意一方都可能先被观察到
+    只按已注册请求取消会漏掉先到的取消，请求随后仍会照常执行
+    pre_cancelled保存这类取消，注册时消费并让本体一起步就是取消态
+    因此执行体在第一次检查点即停止，而不是运行到结束
 
 handle_lua_vm_messages(world: &mut World, messages: Vec<LuaVmMessage>)
     处理长期VM消息：crate公开函数
@@ -153,6 +162,8 @@ handle_lua_runtime_finished(world: &mut World, finished: Vec<LuaRuntimeTaskFinis
     处理任务完成：crate公开函数
     行为：
         清理requests、owners、sessions、mailboxes和receives
+        仅当该request_id确实注册过时才清理其pre_cancelled：
+            未注册的ID必须继续等待属于自己的请求
         对仍挂起的receive发送失败响应
         不将结果转换为业务领域事件
 ```
@@ -400,6 +411,7 @@ LuaRuntimeState：运行时状态，crate公开Resource
     owners: HashMap<String, String>--请求ID到owner_id
     mailboxes: HashMap<LuaVmId, VecDeque<LuaValue>>--长期VM FIFO邮箱
     receives: HashMap<LuaVmId, VecDeque<LuaVmMessageReceiveRequest>>--pending receive
+    pre_cancelled: HashSet<String>--先于其请求到达的取消
     impl Resource for LuaRuntimeState
 ```
 

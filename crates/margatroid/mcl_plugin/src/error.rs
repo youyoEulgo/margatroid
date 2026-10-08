@@ -42,3 +42,39 @@ impl fmt::Display for MclError {
 }
 
 impl std::error::Error for MclError {}
+
+#[cfg(test)]
+mod tests {
+    use super::MclError;
+    use resource_id_plugin::{ResourceIdLookupError, ResourceRef};
+
+    #[test]
+    fn lookup_errors_preserve_missing_and_duplicate() {
+        let id = ResourceRef::parse("agent:local/demo").unwrap();
+        assert_eq!(
+            MclError::from(ResourceIdLookupError::Missing { id: id.clone() }),
+            MclError::AgentMissing
+        );
+        assert_eq!(
+            MclError::from(ResourceIdLookupError::Duplicate {
+                id,
+                entities: Vec::new()
+            }),
+            MclError::DuplicateAgent
+        );
+        assert_eq!(
+            MclError::from(ResourceIdLookupError::PluginMissing),
+            MclError::AgentRuntimeMissing
+        );
+    }
+}
+
+impl From<resource_id_plugin::ResourceIdLookupError> for MclError {
+    fn from(error: resource_id_plugin::ResourceIdLookupError) -> Self {
+        match error {
+            resource_id_plugin::ResourceIdLookupError::Missing { .. } => Self::AgentMissing,
+            resource_id_plugin::ResourceIdLookupError::Duplicate { .. } => Self::DuplicateAgent,
+            resource_id_plugin::ResourceIdLookupError::PluginMissing => Self::AgentRuntimeMissing,
+        }
+    }
+}

@@ -1,6 +1,6 @@
 //! End-to-end checks for a tool script running the way the daemon runs it.
 //!
-//! These load a tool script from the on-disk agent image and execute it exactly
+//! These load a tool script from the global resource library and execute it exactly
 //! as a tool call would, so the shell the runner injects is exercised for real
 //! rather than through a stub.
 //!
@@ -12,8 +12,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn runner_path() -> Option<PathBuf> {
-    // The workspace target directory sits three levels above this crate:
-    // crates/margatroid/tool_plugin -> crates/margatroid -> crates -> <root>.
     let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/debug/tool_runner");
     candidate.is_file().then_some(candidate)
 }
@@ -25,19 +23,23 @@ fn sandbox_backend() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-fn image_root() -> Option<PathBuf> {
+fn library_root() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    let path = PathBuf::from(home).join(".margatroid/agent-images");
+    let path = PathBuf::from(home).join(".margatroid");
     path.is_dir().then_some(path)
 }
 
 fn policy(tier: &str) -> Option<PathBuf> {
-    let image = image_root()?;
-    let path = image
-        .join("local/coder/latest/sandboxes/local")
+    let root = library_root()?;
+    let path = root
+        .join("sandboxes/local")
         .join(tier)
         .join("latest/policy.json");
     path.is_file().then_some(path)
+}
+
+fn tool_package(root: &Path, tool: &str) -> PathBuf {
+    root.join("tools/local").join(tool).join("latest")
 }
 
 /// Everything the checks need, or `None` to skip where the machine lacks it.
@@ -46,7 +48,7 @@ fn ready(tier: &str) -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
         runner_path()?,
         sandbox_backend()?,
         policy(tier)?,
-        image_root()?,
+        library_root()?,
     ))
 }
 
@@ -96,10 +98,8 @@ fn a_writable_sandbox_gives_the_command_a_terminal() {
     };
     let project = scratch("tty-write");
     let package = probe_tool(&project, &image);
-    let script = project.join("main.sh");
-    std::fs::write(&script, "exec bash -c \"$1\"\n").unwrap();
 
-    let request = request_for("probe", &package, &project, &script);
+    let request = request_for("probe", &package, &project);
     let output = run_with(&backend, &policy, &runner, &request).expect("sandboxed run");
     let value: serde_json::Value = serde_json::from_str(&output).expect("outcome envelope");
     let content = value["content"].as_str().unwrap();
@@ -120,10 +120,8 @@ fn a_read_only_sandbox_falls_back_to_pipes_and_still_runs() {
     };
     let project = scratch("tty-read");
     let package = probe_tool(&project, &image);
-    let script = project.join("main.sh");
-    std::fs::write(&script, "exec bash -c \"$1\"\n").unwrap();
 
-    let request = request_for("probe", &package, &project, &script);
+    let request = request_for("probe", &package, &project);
     let output = run_with(&backend, &policy, &runner, &request).expect("sandboxed run");
     let value: serde_json::Value = serde_json::from_str(&output).expect("outcome envelope");
     let content = value["content"].as_str().unwrap();
@@ -147,11 +145,9 @@ fn the_bash_tool_completes_behind_a_confining_policy() {
         return;
     };
     let project = scratch("bash-confined");
-    let package = image.join("local/coder/latest/tools/local/bash/latest");
-    let script = project.join("main.sh");
-    std::fs::write(&script, "exec bash -c \"$1\"\n").unwrap();
+    let package = tool_package(&image, "bash");
 
-    let request = request_for("bash", &package, &project, &script);
+    let request = request_for("bash", &package, &project);
     let output = run_with(&backend, &policy, &runner, &request).expect("sandboxed run");
     let value: serde_json::Value = serde_json::from_str(&output).expect("outcome envelope");
     assert_eq!(value["ok"], false, "a non-zero exit is a failure: {output}");
@@ -162,7 +158,7 @@ fn the_bash_tool_completes_behind_a_confining_policy() {
     let _ = std::fs::remove_dir_all(&project);
 }
 
-fn request_for(tool: &str, package: &Path, project: &Path, script: &Path) -> serde_json::Value {
+fn request_for(tool: &str, package: &Path, project: &Path) -> serde_json::Value {
     serde_json::json!({
         "metadata": std::fs::read_to_string(package.join("tool.toml")).unwrap(),
         "schema": std::fs::read_to_string(package.join("input.schema.json")).unwrap(),
@@ -177,7 +173,6 @@ fn request_for(tool: &str, package: &Path, project: &Path, script: &Path) -> ser
         "turn_id": "turn-1",
         "resource_id": format!("tool:local/{tool}:latest"),
         "project_root": project.to_string_lossy(),
-        "shell_script": script.to_string_lossy(),
         "limits": {
             "max_definition_bytes": 1 << 20,
             "max_script_bytes": 1 << 20,

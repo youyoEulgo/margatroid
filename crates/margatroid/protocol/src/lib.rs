@@ -6,9 +6,9 @@ use agent_plugin::{Agent, HistoryMessage};
 use core_plugin::{Entity, World};
 use log_plugin::{TracingField, TracingRecord};
 use margatroid_types::{
-    AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, RouteAgentTurnAbort,
-    RouteMclCommand, StartWorkspace, ToolCall, WorkspaceAgentDefinition, WorkspaceDefinition,
-    WorkspaceReference,
+    AgentFailure, AgentFailureKind, AgentMessage, Message, ResourceId, ResourceRef,
+    RouteAgentTurnAbort, RouteMclCommand, StartWorkspace, ToolCall, WorkspaceAgentDefinition,
+    WorkspaceDefinition, WorkspaceReference,
 };
 
 use serde::{Deserialize, Serialize};
@@ -508,7 +508,7 @@ pub struct WorkspaceReferenceDto {
 impl WorkspaceReferenceDto {
     pub fn new(name: impl Into<String>, project_root: impl Into<String>) -> Self {
         let name = name.into();
-        let id = ResourceId::new("workspace", "local", &name, None::<String>)
+        let id = ResourceRef::new("workspace", "local", &name, None::<String>)
             .expect("workspace reference name must be valid");
         Self::with_id(ResourceIdDto(id.to_string()), name, project_root)
     }
@@ -846,7 +846,7 @@ impl FromDomain<(Entity, &str, &WorkspaceInfoDto), &World> for AgentStateDto {
         let token_usage = &runtime_agent.token_usage;
         Ok(Self {
             workspace: workspace.reference(),
-            agent: identity.into_dto(())?,
+            agent: identity.as_ref().into_dto(())?,
             status: WorkspaceAgentStatusDto::Ready,
             working,
             error: None,
@@ -981,6 +981,7 @@ impl FromDomain<(), &World> for BackendStateDto {
                                 "Agent identity is missing",
                             )
                         })?
+                        .as_ref()
                         .into_dto(())?,
                     messages,
                 });
@@ -1111,14 +1112,14 @@ impl fmt::Display for ResourceIdDto {
     }
 }
 
-impl FromDomain<&ResourceId> for ResourceIdDto {
-    fn from_domain(resource: &ResourceId, (): ()) -> Result<Self, ProtocolError> {
+impl FromDomain<&ResourceRef> for ResourceIdDto {
+    fn from_domain(resource: &ResourceRef, (): ()) -> Result<Self, ProtocolError> {
         Ok(Self(resource.to_string()))
     }
 }
 
-impl FromDomain<ResourceId> for ResourceIdDto {
-    fn from_domain(resource: ResourceId, (): ()) -> Result<Self, ProtocolError> {
+impl FromDomain<ResourceRef> for ResourceIdDto {
+    fn from_domain(resource: ResourceRef, (): ()) -> Result<Self, ProtocolError> {
         Ok(Self(resource.to_string()))
     }
 }
@@ -1138,9 +1139,9 @@ impl FromDomain<&margatroid_types::BlockPath, ()> for BlockPathDto {
     }
 }
 
-impl IntoDomain<ResourceId> for ResourceIdDto {
-    fn into_domain(self, (): ()) -> Result<ResourceId, ProtocolError> {
-        ResourceId::parse(self.0).map_err(|error| {
+impl IntoDomain<ResourceRef> for ResourceIdDto {
+    fn into_domain(self, (): ()) -> Result<ResourceRef, ProtocolError> {
+        ResourceRef::parse(self.0).map_err(|error| {
             ProtocolError::new(
                 ProtocolErrorKind::InvalidResourceReference,
                 format!("invalid resource ID: {error}"),
@@ -1172,11 +1173,11 @@ fn agent_route(
         )
     })?;
     let workspace = configuration.definition().into_dto(())?;
-    Ok((workspace, identity.into_dto(())?))
+    Ok((workspace, identity.as_ref().into_dto(())?))
 }
 
-fn agent_resource_id(workspace: &str, agent: &str) -> Result<ResourceId, ProtocolError> {
-    ResourceId::new("agent", workspace, agent, None::<String>).map_err(|error| {
+fn agent_resource_id(workspace: &str, agent: &str) -> Result<ResourceRef, ProtocolError> {
+    ResourceRef::new("agent", workspace, agent, None::<String>).map_err(|error| {
         ProtocolError::new(
             ProtocolErrorKind::InvalidResourceReference,
             format!("invalid Agent resource ID: {error}"),
@@ -1234,502 +1235,3 @@ impl fmt::Display for ProtocolError {
 }
 
 impl std::error::Error for ProtocolError {}
-
-#[cfg(any())]
-mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::path::{Path, PathBuf};
-
-    /* legacy protocol integration tests are intentionally removed with the old driver API */
-    /* use agent_plugin::{AgentCreateRequest, AgentCreateResult, AgentPlugin, WorldAgentExt};
-    use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
-    use core_plugin::App;
-    use mcl_plugin::{compile_mcl, MclCompileRequest, MclPlugin, MclSource};
-    use serde_json::json;
-    use tool_plugin::{register_agent_resource, ToolPlugin, ToolTemplate}; */
-
-    use super::*;
-
-    /* fn base_mcl() -> std::sync::Arc<mcl_plugin::MclProgram> {
-            compile_mcl(MclCompileRequest {
-                root: MclSource::new(
-                    ResourceId::parse("mcl:local/test:latest").unwrap(),
-                    r#"base context test {
-    block conversation: context persistent;
-    view messages: messages { select entry from conversation; }
-    view tools: tools { select resource from capabilities.dynamic; }
-    request inference { system = agent.system; messages = messages; tools = tools; }
-    on agent.created { restore capabilities.dynamic from capabilities.default; }
-    }"#,
-                    PathBuf::from("/test/main.mcl"),
-                ),
-                dependencies: BTreeMap::new(),
-            })
-            .unwrap()
-        } */
-
-    fn definition() -> WorkspaceDefinition {
-        WorkspaceDefinition {
-            id: ResourceId::parse("workspace:local/demo").unwrap(),
-            name: "demo".into(),
-            project_root: Path::new("/tmp/demo").into(),
-            manager: "coder".into(),
-            agents: vec![WorkspaceAgentDefinition {
-                name: "coder".into(),
-                id: ResourceId::parse("agent:demo/coder:clone0").unwrap(),
-                image: ResourceId::parse("image:local/coder:v1").unwrap(),
-                resources: vec![ResourceId::parse("skill:local/context").unwrap()],
-                disable_resources: Vec::new(),
-                memory_path: None,
-            }],
-        }
-    }
-
-    fn workspace_reference() -> WorkspaceReferenceDto {
-        WorkspaceReferenceDto::with_id(
-            ResourceIdDto("workspace:local/demo:latest".into()),
-            "demo",
-            "/tmp/demo",
-        )
-    }
-
-    #[test]
-    fn request_uses_stable_workspace_start_shape() {
-        let value =
-            serde_json::to_value(ClientMessage::start_workspace("request-1", &definition()))
-                .unwrap();
-        assert_eq!(value["type"], "workspace.start");
-        assert_eq!(value["id"], "request-1");
-        assert_eq!(
-            value["message"]["definition"]["agents"][0]["id"],
-            "agent:demo/coder:clone0"
-        );
-        assert_eq!(
-            value["message"]["definition"]["agents"][0]["image"],
-            "image:local/coder:v1"
-        );
-        assert_eq!(
-            value["message"]["definition"]["agents"][0]["resources"][0],
-            "skill:local/context:latest"
-        );
-    }
-
-    #[test]
-    fn connection_registration_uses_stable_shape() {
-        let value = serde_json::to_value(ClientMessage::register_connection("register-1", "webui"))
-            .unwrap();
-
-        assert_eq!(value["type"], "connection.register");
-        assert_eq!(value["id"], "register-1");
-        assert_eq!(value["message"]["client_type"], "webui");
-    }
-
-    #[test]
-    fn workspace_stop_uses_workspace_reference_and_request_id() {
-        let workspace = workspace_reference();
-        let value =
-            serde_json::to_value(ClientMessage::stop_workspace("stop-1", &workspace)).unwrap();
-
-        assert_eq!(value["type"], "workspace.stop");
-        assert_eq!(value["id"], "stop-1");
-        assert_eq!(value["message"]["workspace"]["name"], "demo");
-        assert_eq!(value["message"]["workspace"]["project_root"], "/tmp/demo");
-    }
-
-    #[test]
-    #[test]
-    fn agent_turn_abort_uses_workspace_and_optional_agent_route() {
-        let request: ClientMessage = serde_json::from_value(json!({
-            "type": "agent.turn.abort",
-            "id": "abort-1",
-            "message": {
-                "workspace": workspace_reference(),
-                "agent": "agent:demo/coder:latest"
-            }
-        }))
-        .unwrap();
-        let ClientMessage::AgentTurnAbort { id, message } = request else {
-            panic!("expected agent.turn.abort");
-        };
-        let route: RouteAgentTurnAbort = message.into_domain(id).unwrap();
-
-        assert_eq!(route.id, "abort-1");
-        assert_eq!(route.workspace.name, "demo");
-        assert_eq!(route.agent.unwrap().to_string(), "agent:demo/coder:latest");
-    }
-
-    #[test]
-    fn mcl_command_uses_agent_route_and_stable_result_shape() {
-        let request: ClientMessage = serde_json::from_value(json!({
-            "type": "mcl.command",
-            "id": "mcl-1",
-            "message": {
-                "workspace": workspace_reference(),
-                "agent": "agent:demo/coder:latest",
-                "command": "GET msg.recent_conversation",
-                "binding": null
-            }
-        }))
-        .unwrap();
-        let ClientMessage::MclCommand { id, message } = request else {
-            panic!("expected mcl.command");
-        };
-        let (reply, _) = std::sync::mpsc::channel();
-        let route: RouteMclCommand = message
-            .into_domain((id, "client:webui/console:1".to_owned(), reply))
-            .unwrap();
-        assert_eq!(route.id, "mcl-1");
-        assert_eq!(route.source, "client:webui/console:1");
-        assert_eq!(route.workspace.name, "demo");
-        assert_eq!(route.agent.unwrap().to_string(), "agent:demo/coder:latest");
-        assert_eq!(route.command, "GET msg.recent_conversation");
-
-        let success = serde_json::to_value(ServerMessage::MclCommandResult {
-            id: "mcl-1".into(),
-            result: Ok(json!([{"type": "user", "content": "hello"}])),
-        })
-        .unwrap();
-        assert_eq!(success["type"], "mcl.command_result");
-        assert!(success["result"]["Ok"].is_array());
-
-        let failure = serde_json::to_value(ServerMessage::MclCommandResult {
-            id: "mcl-1".into(),
-            result: Err("TypeMismatch: unknown field".into()),
-        })
-        .unwrap();
-        assert_eq!(failure["result"]["Err"], "TypeMismatch: unknown field");
-    }
-
-    #[test]
-    fn workspace_stop_result_uses_stable_server_shapes() {
-        let workspace = workspace_reference();
-        let stopped = serde_json::to_value(ServerMessage::WorkspaceStopped {
-            id: "stop-1".into(),
-            workspace: workspace.clone(),
-        })
-        .unwrap();
-        assert_eq!(stopped["type"], "workspace.stopped");
-        assert_eq!(stopped["id"], "stop-1");
-
-        let failed = serde_json::to_value(ServerMessage::WorkspaceStopFailed {
-            id: "stop-1".into(),
-            error: "workspace is not started".into(),
-        })
-        .unwrap();
-        assert_eq!(failed["type"], "workspace.stop_failed");
-        assert_eq!(failed["error"], "workspace is not started");
-    }
-
-    #[test]
-    fn dto_round_trips_to_domain_definition() {
-        let original = definition();
-        let dto: WorkspaceDefinitionDto = (&original).into_dto(()).unwrap();
-        assert_eq!(WorkspaceDefinition::from_dto(dto, ()).unwrap(), original);
-    }
-
-    #[test]
-    fn agent_message_uses_workspace_identity_and_optional_agent_id() {
-        let workspace = workspace_reference();
-        let value = serde_json::to_value(ClientMessage::agent_message(
-            "message-1",
-            &workspace,
-            Some(ResourceIdDto("agent:demo/reviewer:latest".into())),
-            "Review this change.",
-        ))
-        .unwrap();
-
-        assert_eq!(value["type"], "agent.message");
-        assert_eq!(value["message"]["workspace"]["name"], "demo");
-        assert_eq!(value["message"]["workspace"]["project_root"], "/tmp/demo");
-        assert_eq!(value["message"]["agent"], "agent:demo/reviewer:latest");
-        assert_eq!(
-            value["message"]["message"]["content"],
-            "Review this change."
-        );
-    }
-
-    #[test]
-    fn omitted_agent_is_encoded_for_manager_fallback() {
-        let workspace = workspace_reference();
-        let value = serde_json::to_value(ClientMessage::agent_message(
-            "message-1",
-            &workspace,
-            None,
-            "Hello.",
-        ))
-        .unwrap();
-
-        assert!(value["message"]["agent"].is_null());
-    }
-
-    #[test]
-    fn internal_messages_are_not_externally_visible() {
-        let result: Result<MessageDto, _> = (&Message::System {
-            content: "system".into(),
-        })
-            .into_dto(());
-        assert_eq!(
-            result.unwrap_err().kind(),
-            ProtocolErrorKind::UnsupportedMessage
-        );
-
-        let tool = Message::Tool {
-            resource_id: ResourceId::parse("skill:local/context:latest").unwrap(),
-            tool_call_id: "call-1".into(),
-            content: "result".into(),
-            failed: false,
-        };
-        assert!(matches!((&tool).into_dto(()), Ok(MessageDto::Tool { .. })));
-    }
-
-    #[test]
-    fn workspace_started_exposes_manager_and_selectable_agents() {
-        let event = ServerMessage::WorkspaceStarted {
-            id: "request-1".into(),
-            workspace: (&definition()).into_dto(()).unwrap(),
-        };
-        let value = serde_json::to_value(event).unwrap();
-
-        assert_eq!(value["type"], "workspace.started");
-        assert_eq!(value["workspace"]["manager"], "agent:demo/coder:latest");
-        assert_eq!(value["workspace"]["agents"][0], "agent:demo/coder:latest");
-    }
-
-    #[test]
-    fn workspace_start_failure_uses_a_terminal_server_shape() {
-        let event = ServerMessage::WorkspaceStartFailed {
-            id: "request-1".into(),
-            error: "ResourceSetupFailed: skill file was not found".into(),
-        };
-        let value = serde_json::to_value(event).unwrap();
-
-        assert_eq!(value["type"], "workspace.start_failed");
-        assert_eq!(value["id"], "request-1");
-        assert_eq!(
-            value["error"],
-            "ResourceSetupFailed: skill file was not found"
-        );
-    }
-
-    #[test]
-    fn state_sync_contains_the_complete_workspace_snapshot() {
-        let event = ServerMessage::StateSync {
-            state: BackendStateDto {
-                workspaces: vec![(&definition()).into_dto(()).unwrap()],
-                agents: vec![AgentStateDto {
-                    workspace: workspace_reference(),
-                    agent: ResourceIdDto("agent:demo/coder:latest".into()),
-                    status: WorkspaceAgentStatusDto::Ready,
-                    working: false,
-                    error: None,
-                    default_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
-                    visible_resources: vec![ResourceIdDto("skill:local/review:latest".into())],
-                    exposed: BTreeMap::new(),
-                    mcl: None,
-                    total_input_tokens: 1_000,
-                    total_output_tokens: 200,
-                    total_cache_hit_tokens: 750,
-                    cache_hit_rate: 0.75,
-                    last_input_tokens: 800,
-                    context_window_tokens: 200_000,
-                }],
-                histories: vec![AgentHistoryDto {
-                    workspace: workspace_reference(),
-                    agent: ResourceIdDto("agent:demo/coder:latest".into()),
-                    messages: vec![HistoryMessageDto {
-                        sequence: 1,
-                        turn_id: "turn-1".into(),
-                        message: MessageDto::User {
-                            content: "hello".into(),
-                        },
-                        created_at_ms: 42,
-                    }],
-                }],
-            },
-        };
-        let value = serde_json::to_value(event).unwrap();
-
-        assert_eq!(value["type"], "state.sync");
-        assert_eq!(value["state"]["workspaces"][0]["name"], "demo");
-        assert_eq!(
-            value["state"]["workspaces"][0]["manager"],
-            "agent:demo/coder:latest"
-        );
-        assert_eq!(
-            value["state"]["agents"][0]["agent"],
-            "agent:demo/coder:latest"
-        );
-        assert_eq!(value["state"]["agents"][0]["working"], false);
-        assert_eq!(value["state"]["agents"][0]["total_input_tokens"], 1_000);
-        assert_eq!(value["state"]["agents"][0]["total_output_tokens"], 200);
-        assert_eq!(value["state"]["agents"][0]["total_cache_hit_tokens"], 750);
-        assert_eq!(value["state"]["agents"][0]["cache_hit_rate"], 0.75);
-        assert_eq!(value["state"]["agents"][0]["last_input_tokens"], 800);
-        assert_eq!(
-            value["state"]["agents"][0]["context_window_tokens"],
-            200_000
-        );
-        assert_eq!(
-            value["state"]["agents"][0]["visible_resources"][0],
-            "skill:local/review:latest"
-        );
-        assert_eq!(
-            value["state"]["histories"][0]["agent"],
-            "agent:demo/coder:latest"
-        );
-        assert_eq!(
-            value["state"]["histories"][0]["messages"][0]["turn_id"],
-            "turn-1"
-        );
-    }
-
-    #[test]
-    fn agent_state_projects_dynamic_visibility() {
-        let mut app = App::new();
-        app.add_plugin(RuntimePlugin::default())
-            .add_plugin(ToolPlugin::default())
-            .add_plugin(MclPlugin::open(std::env::temp_dir()).unwrap())
-            .add_plugin(AgentPlugin::default());
-        let workspace = app.world_mut().spawn();
-        let skill = ResourceId::parse("skill:local/review").unwrap();
-        app.world().send_event(AgentCreateRequest {
-            id: "create-1".into(),
-            agent_id: ResourceId::parse("agent:demo/coder").unwrap(),
-            workspace_id: workspace,
-            base_mcl: base_mcl(),
-            system_prompt: "system".into(),
-            messages: Vec::new(),
-            tool_context: Vec::new(),
-            ordered_messages: Vec::new(),
-            token_usage: margatroid_types::TokenUsage {
-                input_tokens: 400,
-                output_tokens: 100,
-                cache_hit_tokens: 250,
-            },
-            last_input_tokens: 400,
-            context_window_tokens: 1_000_000,
-            default_visibility: BTreeSet::from([skill.clone()]),
-        });
-        app.tick();
-        app.tick();
-        let agent = app
-            .world()
-            .event_reader::<AgentCreateResult>()
-            .into_iter()
-            .find(|event| event.id == "create-1")
-            .unwrap()
-            .result
-            .as_ref()
-            .copied()
-            .unwrap();
-        register_agent_resource(
-            app.world_mut(),
-            agent,
-            ResourceId::parse("tool:builtin/skill-loader:latest").unwrap(),
-            skill.clone(),
-            ToolTemplate::new("placeholder", "Load a skill.", json!({"type":"object"})).unwrap(),
-        )
-        .unwrap();
-        app.world()
-            .inject_agent_visible_resource("inject-1", agent, skill);
-        app.tick();
-        app.tick();
-        let workspace = (&definition()).into_dto(()).unwrap();
-
-        let state = AgentStateDto::from_domain((agent, "coder", &workspace), app.world()).unwrap();
-
-        assert_eq!(state.workspace.name, "demo");
-        assert_eq!(state.agent, ResourceIdDto("agent:demo/coder:latest".into()));
-        assert!(!state.working);
-        assert_eq!(state.visible_resources.len(), 1);
-        assert_eq!(state.default_resources.len(), 1);
-        assert_eq!(state.total_input_tokens, 400);
-        assert_eq!(state.total_output_tokens, 100);
-        assert_eq!(state.total_cache_hit_tokens, 250);
-        assert_eq!(state.cache_hit_rate, 0.625);
-        assert_eq!(state.last_input_tokens, 400);
-        assert_eq!(state.context_window_tokens, 1_000_000);
-        assert_eq!(
-            state.visible_resources[0],
-            ResourceIdDto("skill:local/review:latest".into())
-        );
-    }
-
-    #[test]
-    fn agent_message_event_exposes_resolved_route_and_message() {
-        let event = ServerMessage::AgentMessage {
-            message: AgentMessageDto {
-                id: "message-1".into(),
-                workspace: workspace_reference(),
-                agent: ResourceIdDto("agent:demo/coder:latest".into()),
-                message: MessageDto::Assistant {
-                    reasoning: Some("checking".into()),
-                    content: Some("Done.".into()),
-                    tool_calls: Vec::new(),
-                },
-            },
-        };
-        let value = serde_json::to_value(event).unwrap();
-
-        assert_eq!(value["type"], "agent.message");
-        assert_eq!(value["message"]["agent"], "agent:demo/coder:latest");
-        assert_eq!(
-            value["message"]["message"]["Assistant"]["reasoning"],
-            "checking"
-        );
-        assert_eq!(value["message"]["message"]["Assistant"]["content"], "Done.");
-    }
-
-    #[test]
-    fn agent_message_delta_serializes_as_a_flat_stream_frame() {
-        let event = ServerMessage::AgentMessageDelta {
-            id: "turn-1".into(),
-            agent: ResourceIdDto("agent:demo/coder:latest".into()),
-            content: "hello".into(),
-        };
-        let value = serde_json::to_value(event).unwrap();
-
-        assert_eq!(value["type"], "agent.message.delta");
-        assert_eq!(value["id"], "turn-1");
-        assert_eq!(value["agent"], "agent:demo/coder:latest");
-        assert_eq!(value["content"], "hello");
-    }
-
-    #[test]
-    fn agent_reasoning_delta_serializes_as_a_flat_stream_frame() {
-        let event = ServerMessage::AgentMessageReasoningDelta {
-            id: "turn-1".into(),
-            agent: ResourceIdDto("agent:demo/coder:latest".into()),
-            content: "checking".into(),
-        };
-        let value = serde_json::to_value(event).unwrap();
-
-        assert_eq!(value["type"], "agent.message.reasoning_delta");
-        assert_eq!(value["id"], "turn-1");
-        assert_eq!(value["agent"], "agent:demo/coder:latest");
-        assert_eq!(value["content"], "checking");
-    }
-
-    #[test]
-    fn server_log_event_decodes_without_llm_fields() {
-        let event: ServerMessage = serde_json::from_str(
-            r#"{
-                "type": "log",
-                "record": {
-                    "timestamp_millis": 1,
-                    "level": "INFO",
-                    "target": "workspace",
-                    "message": "started"
-                }
-            }"#,
-        )
-        .unwrap();
-        match event {
-            ServerMessage::Log { record } => {
-                assert_eq!(record.message, "started");
-                assert!(record.fields.is_empty());
-            }
-            _ => panic!("expected a log event"),
-        }
-    }
-}

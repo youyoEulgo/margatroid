@@ -637,6 +637,11 @@ World：ECS世界，公开结构体--统一持有并协调ECS数据
     fast_forward_events(&self)
         快进事件：公开方法
         行为：获取事件队列写锁并调用事件队列::fast_forward，锁中毒时终止并报告错误
+    advance_event_frame(&mut self)
+        跨事件帧：公开方法
+        行为：调用World::tick
+        说明：本帧写入的事件在下一帧才可读，这是tick在System运行前完成的事；
+            不运行Schedule而直接调用System的测试需要它来跨越帧边界
 
     tick(&mut self)
         更新事件：crate公开方法

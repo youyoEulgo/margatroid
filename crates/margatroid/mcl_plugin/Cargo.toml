@@ -10,6 +10,7 @@ core_plugin = { path = "../../mecs/core_plugin" }
 margatroid_types = { path = "../types" }
 lua_runtime_plugin = { path = "../lua_runtime_plugin" }
 resource_id_plugin = { path = "../resource_id_plugin" }
+resource_library_plugin = { path = "../resource_library_plugin" }
 tool_plugin = { path = "../tool_plugin" }
 mlua = { workspace = true }
 serde = { workspace = true }

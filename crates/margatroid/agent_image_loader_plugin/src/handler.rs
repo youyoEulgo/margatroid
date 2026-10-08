@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -6,8 +6,7 @@ use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::WorldAsyncExt;
 use core_plugin::World;
 use futures_util::FutureExt;
-use margatroid_types::ResourceId;
-use mcl_plugin::{load_mcl_program_from_path, MclProgramKind};
+use margatroid_types::ResourceRef;
 use resource_id_plugin::WorldResourceIdExt;
 use tokio::io::AsyncReadExt;
 
@@ -15,14 +14,13 @@ use crate::error::{AgentImageLoadError, AgentImageLoadErrorKind, AgentImageTaskE
 use crate::events::{AgentImageReadTask, LoadAgentImageResult};
 use crate::types::{
     AgentImageBaseDriver, AgentImageDefaultVisibility, AgentImageDependencies,
-    AgentImageDependency, AgentImageLoaderLimits, AgentImageManifest, AgentImageModelConfig,
-    AgentImageModelDocument, AgentImageModelParameters, AgentImageReadOutput,
-    AgentImageReadPayload, DirectoryEntryKind, DirectoryEntrySignature, DirectorySignature,
-    FileSignature, PreparedAgentImage,
+    AgentImageLoaderLimits, AgentImageManifest, AgentImageModelConfig, AgentImageModelDocument,
+    AgentImageModelParameters, AgentImageReadOutput, AgentImageReadPayload, DirectoryEntryKind,
+    DirectoryEntrySignature, DirectorySignature, FileSignature, PreparedAgentImage,
 };
 use crate::{AgentImage, AgentImageLoaderState};
 
-pub(crate) fn handle_agent_image_load(world: &mut World, id: String, reference: ResourceId) {
+pub(crate) fn handle_agent_image_load(world: &mut World, id: String, reference: ResourceRef) {
     if id.is_empty() {
         world.send_event(LoadAgentImageResult {
             id,
@@ -112,52 +110,27 @@ async fn read_agent_image_inner(
         .dependencies
         .into_iter()
         .map(|dependency| {
-            let resource_id = ResourceId::parse(&dependency.id).map_err(|_| {
+            let resource_id = ResourceRef::parse(&dependency.id).map_err(|_| {
                 AgentImageLoadError::new(
                     AgentImageLoadErrorKind::InvalidResourceName,
                     "agent image dependency ID is invalid",
                 )
             })?;
-            if dependency.source.as_deref().is_some_and(|source| {
-                source.trim().is_empty() || source.chars().any(char::is_control)
-            }) {
-                return Err(AgentImageLoadError::new(
-                    AgentImageLoadErrorKind::InvalidResourceName,
-                    "agent image dependency source is empty or contains control characters",
-                ));
-            }
-            Ok(AgentImageDependency {
-                resource_id,
-                source: dependency.source.map(Arc::from),
-            })
+            Ok(resource_id)
         })
         .collect::<Result<Arc<[_]>, _>>()?;
-    let base_driver_id = ResourceId::new(
-        "mcl",
-        task.reference.scope(),
-        task.reference.name(),
-        Some(task.reference.tag()),
-    )
-    .map_err(|_| {
-        AgentImageLoadError::new(
-            AgentImageLoadErrorKind::BaseMclLoadFailed,
-            "AgentImage reference cannot derive a Base Driver resource ID",
-        )
-    })?;
-    let base_driver = load_mcl_program_from_path(
-        std::slice::from_ref(&image_root),
-        &base_driver_id,
-        &image_root.join("base.lua"),
-        MclProgramKind::Base,
-    )
-    .map_err(|error| {
-        AgentImageLoadError::new(
-            AgentImageLoadErrorKind::BaseMclLoadFailed,
-            format!("Base Lua could not be loaded: {error}"),
-        )
-    })?;
+    let base_driver_path = image_root.join("base.lua");
+    let base_driver_source =
+        tokio::fs::read_to_string(&base_driver_path)
+            .await
+            .map_err(|error| {
+                AgentImageLoadError::new(
+                    AgentImageLoadErrorKind::BaseMclLoadFailed,
+                    format!("Base Lua could not be loaded: {error}"),
+                )
+            })?;
+    let base_driver = AgentImageBaseDriver::new(base_driver_source, base_driver_path);
 
-    validate_prompt_dependencies(&image_root, &dependencies)?;
     let layout_after = validate_image_layout(&image_root).await?;
     if layout_before != layout_after
         || manifest_signature
@@ -169,23 +142,11 @@ async fn read_agent_image_inner(
         ));
     }
 
-    let resources = parse_default_visibility(
-        &tokio::fs::read_to_string(image_root.join("base.lua"))
-            .await
-            .map_err(|_| {
-                AgentImageLoadError::new(
-                    AgentImageLoadErrorKind::BaseMclLoadFailed,
-                    "Base Driver could not be read",
-                )
-            })?,
-        &dependencies,
-    )?;
+    let resources = parse_default_visibility(base_driver.source(), &dependencies)?;
     let inference = manifest.inference;
     Ok(PreparedAgentImage {
         reference: task.reference,
-        base_driver: AgentImageBaseDriver {
-            program: base_driver,
-        },
+        base_driver,
         dependencies: AgentImageDependencies {
             entries: dependencies,
         },
@@ -255,7 +216,9 @@ pub(crate) fn apply_agent_image_payload(world: &mut World, payload: AgentImageRe
                 default_visibility,
                 ..
             } = prepared;
-            assert!(world.insert_component(entity, payload.reference.clone()));
+            world
+                .attach_resource_id(entity, payload.reference.clone())
+                .expect("agent image identity must have a unique live owner");
             assert!(world.insert_component(
                 entity,
                 AgentImage {
@@ -287,7 +250,7 @@ pub(crate) fn apply_agent_image_payload(world: &mut World, payload: AgentImageRe
 
 async fn resolve_image_root(
     root: &Path,
-    reference: &ResourceId,
+    reference: &ResourceRef,
 ) -> Result<PathBuf, AgentImageLoadError> {
     if reference.resource_type() != "image" {
         return Err(AgentImageLoadError::new(
@@ -322,17 +285,7 @@ async fn validate_image_layout(root: &Path) -> Result<DirectorySignature, AgentI
         match (entry.name.to_str(), entry.kind) {
             (Some("agent.toml"), DirectoryEntryKind::File) => manifest = true,
             (Some("base.lua"), DirectoryEntryKind::File) => base_driver = true,
-            (Some(name), DirectoryEntryKind::File) if name.ends_with(".md") => {}
-            (Some("skills"), DirectoryEntryKind::Directory) => {}
-            (Some("hooks"), DirectoryEntryKind::Directory) => {}
-            (Some("tools"), DirectoryEntryKind::Directory) => {}
-            (Some("sandboxes"), DirectoryEntryKind::Directory) => {}
-            _ => {
-                return Err(AgentImageLoadError::new(
-                    AgentImageLoadErrorKind::InvalidLayout,
-                    "agent image contains an unknown entry or invalid entry type",
-                ))
-            }
+            _ => {}
         }
     }
     if !manifest || !base_driver {
@@ -342,54 +295,6 @@ async fn validate_image_layout(root: &Path) -> Result<DirectorySignature, AgentI
         ));
     }
     Ok(signature)
-}
-
-fn validate_prompt_dependencies(
-    image_root: &Path,
-    dependencies: &[AgentImageDependency],
-) -> Result<(), AgentImageLoadError> {
-    let mut seen = HashSet::new();
-    for dependency in dependencies {
-        if dependency.resource_id.resource_type() != "prompt" {
-            continue;
-        }
-        let message_key = (
-            dependency.resource_id.scope().to_owned(),
-            dependency.resource_id.name().to_owned(),
-        );
-        if !seen.insert(message_key) {
-            return Err(AgentImageLoadError::new(
-                AgentImageLoadErrorKind::DuplicateDependency,
-                format!(
-                    "duplicate prompt message type `prompt:{}:{}` is not allowed",
-                    dependency.resource_id.scope(),
-                    dependency.resource_id.name()
-                ),
-            ));
-        }
-        let role = match dependency.resource_id.scope() {
-            "system" | "user" => dependency.resource_id.scope(),
-            _ => {
-                return Err(AgentImageLoadError::new(
-                    AgentImageLoadErrorKind::PromptReadFailed,
-                    format!(
-                        "prompt dependency `{}` must use scope system or user",
-                        dependency.resource_id
-                    ),
-                ))
-            }
-        };
-        let file_name = format!("{}.md", dependency.resource_id.name().to_uppercase());
-        let prompt_path = image_root.join(&file_name);
-        if !prompt_path.is_file() {
-            return Err(AgentImageLoadError::new(
-                AgentImageLoadErrorKind::PromptReadFailed,
-                format!("{file_name} is required by agent.toml prompt dependency but missing"),
-            ));
-        }
-        let _ = role;
-    }
-    Ok(())
 }
 
 pub(crate) fn normalize_root(root: PathBuf) -> Result<PathBuf, AgentImageLoadError> {
@@ -606,8 +511,8 @@ fn has_parent(path: &Path) -> bool {
 
 fn parse_default_visibility(
     source: &str,
-    dependencies: &[AgentImageDependency],
-) -> Result<BTreeSet<ResourceId>, AgentImageLoadError> {
+    dependencies: &[ResourceRef],
+) -> Result<BTreeSet<ResourceRef>, AgentImageLoadError> {
     let mut aliases = HashMap::new();
     for line in source.lines() {
         let Some(rest) = line.trim().strip_prefix("mcl_command(\"IMPORT ") else {
@@ -618,7 +523,7 @@ fn parse_default_visibility(
         };
         let resource = resource.trim();
         let alias = alias.trim().trim_end_matches("\")");
-        if ResourceId::parse(resource).is_ok() {
+        if ResourceRef::parse(resource).is_ok() {
             aliases.insert(alias.to_owned(), resource.to_owned());
         }
     }
@@ -644,18 +549,30 @@ fn parse_default_visibility(
         let Some(resource) = aliases.get(alias) else {
             continue;
         };
-        let resource = ResourceId::parse(resource).map_err(|_| {
+        let resource = ResourceRef::parse(resource).map_err(|_| {
             AgentImageLoadError::new(
                 AgentImageLoadErrorKind::InvalidResourceName,
                 "Base Driver visibility references an invalid resource",
             )
         })?;
-        if dependencies
-            .iter()
-            .any(|dependency| dependency.resource_id == resource)
-        {
+        if dependencies.contains(&resource) {
             result.insert(resource);
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_visibility_requires_declared_dependency() {
+        let declared = ResourceRef::parse("tool:local/allowed:latest").unwrap();
+        let source = r#"mcl_command("IMPORT tool:local/allowed:latest AS allowed")
+mcl_command("IMPORT tool:local/undeclared:latest AS undeclared")
+mcl_command("INJECT allowed, undeclared TO tool.tool_default")"#;
+        let visibility = parse_default_visibility(source, std::slice::from_ref(&declared)).unwrap();
+        assert_eq!(visibility, BTreeSet::from([declared]));
+    }
 }

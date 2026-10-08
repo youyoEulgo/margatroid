@@ -1,5 +1,5 @@
 use core_plugin::{Entity, Event};
-use margatroid_types::ResourceId;
+use margatroid_types::ResourceRef;
 
 use crate::{ResourceMapEntry, ToolError};
 
@@ -7,7 +7,7 @@ use crate::{ResourceMapEntry, ToolError};
 pub struct ToolRegisterRequest {
     pub id: String,
     pub agent: Entity,
-    pub resource_id: ResourceId,
+    pub resource_id: ResourceRef,
     pub alias: Option<String>,
 }
 impl Event for ToolRegisterRequest {}
@@ -16,7 +16,7 @@ impl Event for ToolRegisterRequest {}
 pub struct ToolRegisterResponse {
     pub id: String,
     pub agent: Entity,
-    pub resource_id: ResourceId,
+    pub resource_id: ResourceRef,
     pub alias: Option<String>,
     pub result: Result<ResourceMapEntry, ToolError>,
 }

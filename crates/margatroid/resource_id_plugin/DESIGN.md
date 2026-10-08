@@ -59,12 +59,24 @@ ResourceIdPluginInstalled：ResourceIdPlugin 安装标记，公开单元 Resourc
 
 公开：
 ```text
-WorldResourceIdExt：World 资源 ID 查询扩展，公开 trait
-    entity_by_resource_id(&self, id: &ResourceId) -> Result<Entity, ResourceIdLookupError>
-        按资源 ID 查询唯一 Entity：要求插件已安装；缺失返回 Missing，多条返回 Duplicate
+WorldResourceIdExt：World 资源地址扩展，公开 trait
+    entity_by_resource_id(&self, id: &ResourceRef) -> Result<Entity, ResourceIdLookupError>
+        按资源地址查询唯一 Entity：要求插件已安装；缺失返回 Missing，多条返回 Duplicate
+    attach_resource_id(&self, entity: Entity, id: ResourceRef) -> Result<(), ResourceIdAttachError>
+        挂载资源地址：不允许另一个 Entity 占用同一地址
+        行为：同一 Entity 重复挂载同一地址是幂等的
+        行为：挂载失败时 Entity 保持原有身份不变
+        行为：Entity 不存活时返回 MissingEntity
+        说明：底层 ECS 直接插入组件可以绕过受检入口，因此查询仍然必须把
+            重复地址诊断为 Duplicate，而不是当作缺失
     impl WorldResourceIdExt for World
         实现：以 World 当前组件为准，不维护第二份索引
 ```
+
+空板块：
+    某个板块在本 crate 中没有内容时，对应的源文件保持为空并仍然保留模块声明
+    空文件不是遗漏，而是"该板块在此 crate 中确实没有定义"的表示
+    保留文件与模块声明是为了让六个板块的位置固定，新增内容时不必再改结构
 
 # system
 
@@ -84,15 +96,15 @@ WorldResourceIdExt：World 资源 ID 查询扩展，公开 trait
 
 公开：
 ```text
-ResourceId：统一资源 ID 组件，公开类型--所有可寻址 Entity 统一使用的身份组件
+ResourceRef：资源地址值，公开类型--资源身份本身，可自由用作字段、集合键与序列化载荷
     resource_type: String--资源类型，私有
     scope: String--作用域，私有
     name: String--资源名，私有
     tag: String--标签，私有
     parse(value: impl AsRef<str>) -> Result<Self, ResourceIdError>
-        解析资源 ID：公开关联函数，调用 FromStr
+        解析资源地址：公开关联函数，调用 FromStr
     new(resource_type, scope, name, tag: Option) -> Result<Self, ResourceIdError>
-        构造资源 ID：公开关联函数，tag 省略时为 latest
+        构造资源地址：公开关联函数，tag 省略时为 latest
     resource_type(&self) -> &str
         读取类型：公开方法
     scope(&self) -> &str
@@ -101,15 +113,26 @@ ResourceId：统一资源 ID 组件，公开类型--所有可寻址 Entity 统�
         读取名称：公开方法
     tag(&self) -> &str
         读取标签：公开方法
-    impl FromStr for ResourceId
+    impl FromStr for ResourceRef
         解析：格式为 type:scope/name[:tag]，tag 省略时为 latest
-    impl fmt::Display for ResourceId
+    impl fmt::Display for ResourceRef
         输出：type:scope/name:tag
-    impl Serialize for ResourceId
+    impl Serialize for ResourceRef
         序列化：写为字符串
-    impl Deserialize for ResourceId
+    impl Deserialize for ResourceRef
         反序列化：从字符串解析
+    impl Ord + PartialOrd + Hash
+        可排序、可哈希：因此能作为 BTreeMap 与 HashMap 的键
+
+ResourceId：资源地址组件，公开类型--把 ResourceRef 挂载到 Entity 上的包装
     impl Component for ResourceId
+    说明：ResourceRef 不实现 Component，只有 ResourceId 可以挂载
+
+身份与挂载分离：
+    同一个值曾经既是地址又是组件，导致"引用"与"实例"难以区分
+    现在 ResourceRef 只是值，ResourceId 只是挂载载体，二者职责不再重叠
+    资源库据此把"按地址查找宿主 Entity"与"把地址挂到 Entity"表达成两个不同动作
+    引用不实现 Component 这一点由类型系统保证：没有 Component 实现就无法被挂载
 
 私有：
 ```text

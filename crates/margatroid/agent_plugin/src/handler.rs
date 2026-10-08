@@ -5,7 +5,7 @@ use lua_runtime_plugin::{
     LuaEnvironmentContext, LuaRuntimeHandle, LuaRuntimeReply, LuaRuntimeRequest,
     LuaRuntimeTaskFinished, LuaScheduler, LuaValue, LuaVmOwner, LuaVmStarted,
 };
-use resource_id_plugin::ResourceId;
+use resource_id_plugin::{ResourceId, ResourceRef, WorldResourceIdExt};
 
 use crate::{
     failure, Agent, AgentControl, AgentControlKind, AgentCreateRequest, AgentCreationState,
@@ -17,7 +17,7 @@ use crate::{
 fn agent_label(world: &World, entity: Entity) -> String {
     world
         .get_component::<ResourceId>(entity)
-        .map(ToString::to_string)
+        .map(|id| id.as_ref().to_string())
         .unwrap_or_else(|| format!("Entity({entity:?})"))
 }
 
@@ -32,7 +32,12 @@ pub fn handle_agent_create(world: &mut World, request: AgentCreateRequest) {
         .query_with::<ResourceId>()
         .result()
         .into_iter()
-        .any(|entity| world.get_component::<ResourceId>(entity) == Some(&request.agent_id))
+        .any(|entity| {
+            world
+                .get_component::<ResourceId>(entity)
+                .map(ResourceId::as_ref)
+                == Some(&request.agent_id)
+        })
     {
         Some("agent resource id already exists")
     } else if world
@@ -72,7 +77,6 @@ pub fn handle_agent_create(world: &mut World, request: AgentCreateRequest) {
         image_root: request.image_root.clone(),
         home_root: request.home_root.clone(),
         image_dependencies: request.image_dependencies.clone(),
-        image_sources: request.image_sources.clone(),
     };
     let agent = Agent {
         info: info.clone(),
@@ -99,7 +103,9 @@ pub fn handle_agent_create(world: &mut World, request: AgentCreateRequest) {
         last_error: None,
     };
 
-    if !world.insert_component(entity, request.agent_id.clone())
+    if world
+        .attach_resource_id(entity, request.agent_id.clone())
+        .is_err()
         || !world.insert_component(entity, agent)
     {
         tracing::error!(request_id = %request.id, "agent components could not be attached");
@@ -194,7 +200,7 @@ pub fn handle_lua_vm_started(world: &mut World, event: LuaVmStarted) {
                 .is_some_and(|agent| agent.lua.request_id.as_deref() == Some(&event.request_id))
                 && world
                     .get_component::<ResourceId>(*entity)
-                    .is_some_and(|id| id.to_string() == event.owner.owner_id)
+                    .is_some_and(|id| id.as_ref().to_string() == event.owner.owner_id)
         })
         .collect::<Vec<_>>();
     let [entity] = matches.as_slice() else {
@@ -258,7 +264,7 @@ pub fn handle_lua_vm_finished(world: &mut World, event: LuaRuntimeTaskFinished) 
     let Some(agent) = world.get_component_mut::<Agent>(entity) else {
         return;
     };
-    let was_creating = agent.lifecycle == AgentLifecycleState::Creating;
+    let was_creating = !agent.creation.initialization.complete;
     agent.lua.request_id = None;
     agent.lua.vm_id = None;
     if let Some(runtime_error) = event.error {
@@ -283,28 +289,22 @@ pub fn handle_lua_vm_finished(world: &mut World, event: LuaRuntimeTaskFinished) 
             )));
         }
     }
-    if was_creating {
-        world.despawn(entity);
-    }
 }
 
 pub fn control_stop(world: &mut World, entity: Entity) -> Result<(), margatroid_types::AgentError> {
-    let lifecycle = world
-        .get_component::<Agent>(entity)
-        .map(|agent| agent.lifecycle)
+    let agent = world
+        .get_component_mut::<Agent>(entity)
         .ok_or_else(|| failure(AgentFailureKind::AgentMissing, "agent is missing"))?;
-    if matches!(
-        lifecycle,
-        AgentLifecycleState::Stopped | AgentLifecycleState::Failed
-    ) {
-        return Err(failure(
-            AgentFailureKind::Stopped,
-            "agent is already stopped",
-        ));
+    if agent.lua.vm_id.is_none() && agent.lua.request_id.is_none() {
+        if agent.lifecycle != AgentLifecycleState::Failed {
+            agent.lifecycle = AgentLifecycleState::Stopped;
+        }
+        return Ok(());
     }
     let id = world
         .get_component::<ResourceId>(entity)
         .ok_or_else(|| failure(AgentFailureKind::AgentMissing, "agent identity is missing"))?
+        .as_ref()
         .to_string();
     let runtime = world
         .get_resource::<LuaRuntimeHandle>()
@@ -324,13 +324,15 @@ fn fail_creation(world: &mut World, entity: Entity, error: margatroid_types::Age
     tracing::error!(agent = %agent_label(world, entity), error = %error, "agent creation failed");
     if let Some(agent) = world.get_component_mut::<Agent>(entity) {
         agent.lifecycle = AgentLifecycleState::Failed;
+        agent.lua.request_id = None;
+        agent.lua.vm_id = None;
         agent.creation.initialization.failed = Some(error.clone());
         agent.last_error = Some(error.clone());
         agent.creation.reply.send(Err(error));
     }
 }
 
-fn agent_info_value(id: &ResourceId, info: &AgentInfo) -> LuaValue {
+fn agent_info_value(id: &ResourceRef, info: &AgentInfo) -> LuaValue {
     let mut value = BTreeMap::new();
     value.insert("id".to_owned(), LuaValue::String(id.to_string()));
     value.insert(
@@ -425,14 +427,15 @@ mod tests {
         let workspace = world.spawn();
         let image = world.spawn();
         let entity = world.spawn();
-        let id: ResourceId = "agent:test/coder:latest".parse().unwrap();
+        let id: ResourceRef = "agent:test/coder:latest".parse().unwrap();
         let (sender, mut receiver) = tokio::sync::oneshot::channel::<Result<Entity, AgentError>>();
         let model = crate::AgentModelInfo {
             provider: "test".to_owned(),
             model: "test".to_owned(),
             context_window_tokens: 1024,
         };
-        world.insert_component(entity, id.clone());
+        world.insert_resource(resource_id_plugin::ResourceIdPluginInstalled);
+        world.attach_resource_id(entity, id.clone()).unwrap();
         world.insert_component(
             entity,
             Agent {
@@ -444,7 +447,6 @@ mod tests {
                     image_root: Default::default(),
                     home_root: Default::default(),
                     image_dependencies: Default::default(),
-                    image_sources: Default::default(),
                 },
                 creation: AgentCreationState {
                     request_id: "create-1".to_owned(),

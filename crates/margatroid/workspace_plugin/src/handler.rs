@@ -20,51 +20,71 @@ pub(crate) fn stop_workspace_entity(
             "workspace is not alive",
         ));
     }
+    let registry = world
+        .get_resource_mut::<WorkspaceRegistry>()
+        .ok_or_else(|| {
+            WorkspaceError::new(
+                WorkspaceErrorKind::WorkspaceNotAlive,
+                "WorkspacePlugin is missing",
+            )
+        })?;
+    registry.stopping.entry(workspace).or_default();
+    registry
+        .pending_images
+        .retain(|_, (owner, _)| *owner != workspace);
+    stop_workspace_agents(world, workspace);
+    Ok(())
+}
+
+pub(crate) fn stop_workspace_agents(world: &mut World, workspace: Entity) {
     let agents = world
-        .get_component::<Workspace>(workspace)
-        .map(|value| value.iter().map(|(_, entity)| entity).collect::<Vec<_>>())
-        .unwrap_or_default();
+        .query_with::<agent_plugin::Agent>()
+        .result()
+        .into_iter()
+        .filter(|entity| {
+            world
+                .get_component::<agent_plugin::Agent>(*entity)
+                .is_some_and(|agent| agent.info.workspace_id == workspace)
+        })
+        .collect::<Vec<_>>();
     for agent in agents {
-        let (sender, _) = tokio::sync::oneshot::channel();
-        world.send_event(AgentControl {
-            id: format!("stop-{:?}", agent),
-            agent,
-            control: AgentControlKind::Stop,
-            reply: AgentControlReply::new(sender),
-        });
-        if world.is_alive(agent) {
-            world.despawn(agent);
+        let first_stop = world
+            .get_resource_mut::<WorkspaceRegistry>()
+            .and_then(|registry| registry.stopping.get_mut(&workspace))
+            .is_some_and(|state| state.agents.insert(agent));
+        if first_stop {
+            let (sender, _) = tokio::sync::oneshot::channel();
+            world.send_event(AgentControl {
+                id: format!("stop-{agent:?}"),
+                agent,
+                control: AgentControlKind::Stop,
+                reply: AgentControlReply::new(sender),
+            });
         }
     }
-    if let Some(registry) = world.get_resource_mut::<WorkspaceRegistry>() {
-        registry.workspaces.retain(|entity| *entity != workspace);
-        registry
-            .pending_images
-            .retain(|_, (owner, _)| *owner != workspace);
-        registry
-            .pending_agents
-            .retain(|_, (owner, _, _)| *owner != workspace);
-    }
-    if let Some(routes) = world.get_resource_mut::<inference_plugin::WorkspaceModelRoutesRegistry>()
-    {
-        routes.remove(workspace);
-    }
-    world.despawn(workspace);
-    Ok(())
 }
 
 pub(crate) fn create_workspace(
     world: &mut World,
     definition: &WorkspaceDefinition,
 ) -> Result<Entity, WorkspaceError> {
-    if world.entity_by_resource_id(&definition.id).is_ok() {
+    if matches!(
+        world.entity_by_resource_id(&definition.id),
+        Ok(_) | Err(resource_id_plugin::ResourceIdLookupError::Duplicate { .. })
+    ) {
         return Err(WorkspaceError::new(
             WorkspaceErrorKind::DuplicateWorkspace,
             "workspace already exists",
         ));
     }
     let entity = world.spawn();
-    world.insert_component(entity, definition.id.clone());
+    if let Err(error) = world.attach_resource_id(entity, definition.id.clone()) {
+        world.despawn(entity);
+        return Err(WorkspaceError::new(
+            WorkspaceErrorKind::InvalidRequest,
+            error.to_string(),
+        ));
+    }
     let mut workspace = Workspace {
         definition: Arc::new(definition.clone()),
         project_root: Arc::new(definition.project_root.clone()),
@@ -102,12 +122,16 @@ pub(crate) fn route_mcl_command(
 ) -> Result<(), WorkspaceError> {
     let workspace = world
         .entity_by_resource_id(&command.workspace.id)
-        .map_err(|_| {
-            WorkspaceError::new(
-                WorkspaceErrorKind::WorkspaceNotAlive,
-                "workspace is not alive",
-            )
-        })?;
+        .map_err(WorkspaceError::from)?;
+    if world
+        .get_resource::<WorkspaceRegistry>()
+        .is_some_and(|registry| registry.stopping.contains_key(&workspace))
+    {
+        return Err(WorkspaceError::new(
+            WorkspaceErrorKind::WorkspaceNotReady,
+            "workspace is stopping",
+        ));
+    }
     let workspace_data = world.get_component::<Workspace>(workspace).ok_or_else(|| {
         WorkspaceError::new(
             WorkspaceErrorKind::WorkspaceNotAlive,
@@ -115,12 +139,9 @@ pub(crate) fn route_mcl_command(
         )
     })?;
     let agent = match command.agent.clone() {
-        Some(agent_id) => world.entity_by_resource_id(&agent_id).map_err(|_| {
-            WorkspaceError::new(
-                WorkspaceErrorKind::WorkspaceNotReady,
-                "target agent is not alive",
-            )
-        })?,
+        Some(agent_id) => world
+            .entity_by_resource_id(&agent_id)
+            .map_err(WorkspaceError::from)?,
         None => workspace_data.manager().ok_or_else(|| {
             WorkspaceError::new(
                 WorkspaceErrorKind::WorkspaceNotReady,
@@ -130,7 +151,7 @@ pub(crate) fn route_mcl_command(
     };
     let agent_id = world
         .get_component::<ResourceId>(agent)
-        .cloned()
+        .map(|id| id.as_ref().clone())
         .ok_or_else(|| {
             WorkspaceError::new(
                 WorkspaceErrorKind::WorkspaceNotReady,

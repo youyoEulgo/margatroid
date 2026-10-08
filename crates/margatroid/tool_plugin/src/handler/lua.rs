@@ -7,20 +7,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{
-    candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolError, ToolErrorKind,
-    ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
+    ResourceMapEntry, ToolCallRequest, ToolError, ToolErrorKind, ToolRegisterRequest,
+    ToolRegisterResponse, ToolTemplate,
 };
 use agent_plugin::Agent;
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
 use async_runtime_plugin::{AsyncTaskError, WorldAsyncExt};
 use core_plugin::{Entity, Event, Resource, World};
-use margatroid_types::ResourceId;
+use margatroid_types::{ResourceId, ResourceRef};
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
+use resource_id_plugin::WorldResourceIdExt;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-const LUA_RUNTIME_ID: &str = "tool:builtin/lua-runtime:latest";
 const TOOL_METADATA_FILE: &str = "tool.toml";
 const TOOL_SCHEMA_FILE: &str = "input.schema.json";
 const TOOL_SCRIPT_FILE: &str = "main.lua";
@@ -149,13 +149,13 @@ struct LuaToolCallLocator {
     turn_id: String,
     agent: Entity,
     tool_call_id: String,
-    resource_id: ResourceId,
+    resource_id: ResourceRef,
 }
 
 struct LuaCallContext {
-    agent_id: ResourceId,
+    agent_id: ResourceRef,
     turn_id: String,
-    resource_id: ResourceId,
+    resource_id: ResourceRef,
     project_root: Arc<PathBuf>,
     temp_dir: Arc<PathBuf>,
     sandbox_policies: Vec<Arc<str>>,
@@ -296,7 +296,7 @@ fn register_lua_tool(
             "Lua tool registration request is invalid",
         ));
     }
-    let agent = world.get_component::<Agent>(request.agent).ok_or_else(|| {
+    world.get_component::<Agent>(request.agent).ok_or_else(|| {
         ToolError::new(
             ToolErrorKind::ToolEnvironmentMissing,
             "agent tool environment is missing",
@@ -305,11 +305,7 @@ fn register_lua_tool(
     let limits = world
         .get_resource::<LuaExecutionLimits>()
         .expect("LuaPlugin is installed");
-    let package = find_lua_tool_package(
-        &agent.info.project_root,
-        &agent.info.image_root,
-        &request.resource_id,
-    )?;
+    let package = find_lua_tool_package(super::library_root(world)?, &request.resource_id)?;
     let metadata = read_bounded_sync(
         &package.join(TOOL_METADATA_FILE),
         limits.max_definition_bytes,
@@ -326,11 +322,14 @@ fn register_lua_tool(
         definition.metadata.description,
         definition.parameters,
     )?;
-    candidate_resource_entry(
+    crate::candidate_resource_entry_with_content(
         request.resource_id.clone(),
         request.alias.clone(),
-        ResourceId::parse(LUA_RUNTIME_ID).expect("built-in Lua runtime ID is valid"),
+        agent_plugin::ToolExecutor::LuaRuntime,
         template,
+        Some(crate::ResourceContent::Tool {
+            script_path: package.join(TOOL_SCRIPT_FILE),
+        }),
     )
 }
 
@@ -373,19 +372,14 @@ fn prepare_lua_tool_call(
         .ok_or_else(|| ToolError::new(ToolErrorKind::InvalidRequest, "Agent is missing"))?;
     let agent_id = world
         .get_component::<ResourceId>(request.agent)
-        .cloned()
+        .map(|id| id.as_ref().clone())
         .ok_or_else(|| {
             ToolError::new(
                 ToolErrorKind::InvalidRequest,
                 "Agent resource id is missing",
             )
         })?;
-    let package_root = find_lua_tool_package(
-        &agent.info.project_root,
-        &agent.info.image_root,
-        &request.resource_id,
-    )?;
-    let package = read_lua_tool_package(&package_root, &request.resource_id, &limits)?;
+    let package = read_lua_tool_package(world, &request.resource_id, &limits)?;
     let sandbox_policies = crate::handler::sandbox::active_sandbox_policies(&agent.resources)?;
     let temp_dir = crate::handler::sandbox::CallTempDir::create(&agent.info.project_root)?;
     let context = LuaCallContext {
@@ -431,9 +425,9 @@ pub struct LuaToolRunRequest {
     pub script: String,
     pub temp_dir: PathBuf,
     pub arguments: String,
-    pub agent_id: ResourceId,
+    pub agent_id: ResourceRef,
     pub turn_id: String,
-    pub resource_id: ResourceId,
+    pub resource_id: ResourceRef,
     pub project_root: PathBuf,
     pub limits: LuaExecutionLimits,
     pub sandbox_policies: Vec<Arc<str>>,
@@ -727,10 +721,9 @@ pub(crate) fn lua_task_result_system(world: &mut World) {
     }
 }
 
-fn find_lua_tool_package(
-    project_root: &Path,
-    image_root: &Path,
-    resource_id: &ResourceId,
+pub(super) fn find_lua_tool_package(
+    library_root: &Path,
+    resource_id: &ResourceRef,
 ) -> Result<PathBuf, ToolError> {
     if resource_id.resource_type() != "tool" {
         return Err(ToolError::new(
@@ -738,10 +731,7 @@ fn find_lua_tool_package(
             "Lua resource must use type tool",
         ));
     }
-    let roots = [
-        project_root.join(".margatroid").join("tools"),
-        image_root.join("tools"),
-    ];
+    let roots = [library_root.join("tools")];
     for root in roots {
         let package = root
             .join(resource_id.scope())
@@ -782,7 +772,7 @@ fn find_lua_tool_package(
 fn parse_lua_tool_definition(
     metadata_source: &str,
     schema_source: &str,
-    resource_id: &ResourceId,
+    resource_id: &ResourceRef,
 ) -> Result<LuaToolDefinition, ToolError> {
     let metadata = toml::from_str::<LuaToolMetadata>(metadata_source).map_err(|_| {
         ToolError::new(
@@ -819,22 +809,24 @@ fn parse_lua_tool_definition(
 }
 
 fn read_lua_tool_package(
-    package_root: &Path,
-    resource_id: &ResourceId,
+    world: &World,
+    resource_id: &ResourceRef,
     limits: &LuaExecutionLimits,
 ) -> Result<LuaToolPackage, ToolError> {
-    let metadata = read_bounded_sync(
-        &package_root.join(TOOL_METADATA_FILE),
-        limits.max_definition_bytes,
-        "Lua tool metadata",
-    )?;
-    let schema = read_bounded_sync(
-        &package_root.join(TOOL_SCHEMA_FILE),
-        limits.max_definition_bytes,
-        "Lua tool schema",
-    )?;
+    let definition = world
+        .entity_by_resource_id(resource_id)
+        .ok()
+        .and_then(|entity| world.get_component::<resource_library_plugin::ToolResource>(entity))
+        .ok_or_else(|| {
+            ToolError::new(
+                ToolErrorKind::ResourceResolutionFailed,
+                "tool was not imported into the library",
+            )
+        })?;
+    let metadata = definition.description.clone();
+    let schema = definition.input_schema.to_string();
     let script = read_bounded_sync(
-        &package_root.join(TOOL_SCRIPT_FILE),
+        &definition.script_path,
         limits.max_script_bytes,
         "Lua tool script",
     )?;
@@ -844,7 +836,6 @@ fn read_lua_tool_package(
             "Lua tool script is empty",
         ));
     }
-    parse_lua_tool_definition(&metadata, &schema, resource_id)?;
     Ok(LuaToolPackage {
         metadata,
         schema,
@@ -989,9 +980,6 @@ fn install_shell(lua: &Lua, entry: &Table, handle: &LuaExecutionHandle) -> Resul
                     crate::handler::pty::normalize_pty_text(&outcome.bytes),
                 )?;
                 result.set("truncated", outcome.truncated)?;
-                // A sandbox may withhold the pty device, in which case the
-                // command still ran but saw no terminal. A tool that depends on
-                // one can say so rather than silently misbehave.
                 result.set("terminal", outcome.terminal)?;
                 Ok(result)
             }
@@ -1149,9 +1137,9 @@ mod runner_tests {
             script: String::new(),
             temp_dir: PathBuf::from("/tmp"),
             arguments: "{}".to_owned(),
-            agent_id: ResourceId::parse("agent:test/coder:latest").unwrap(),
+            agent_id: ResourceRef::parse("agent:test/coder:latest").unwrap(),
             turn_id: "turn-1".to_owned(),
-            resource_id: ResourceId::parse("tool:local/glob:latest").unwrap(),
+            resource_id: ResourceRef::parse("tool:local/glob:latest").unwrap(),
             project_root: PathBuf::from("/tmp"),
             limits,
             sandbox_policies: Vec::new(),
@@ -1170,7 +1158,6 @@ mod runner_tests {
         assert!(ok);
         assert_eq!(content, "all good");
 
-        // An empty content is still an outcome, not a missing one.
         let (ok, content) =
             reported_outcome(r#"{"ok":false,"content":""}"#).expect("a reported outcome");
         assert!(!ok);
@@ -1179,11 +1166,9 @@ mod runner_tests {
 
     #[test]
     fn anything_else_keeps_the_older_meaning_of_a_return() {
-        // The tools that predate the outcome envelope return their text directly.
         assert!(reported_outcome("No files found.").is_none());
         assert!(reported_outcome("").is_none());
         assert!(reported_outcome("[{\"name\":\"a\"}]").is_none());
-        // A JSON object without both fields is not an outcome either.
         assert!(reported_outcome(r#"{"ok":true}"#).is_none());
         assert!(reported_outcome(r#"{"content":"x"}"#).is_none());
         assert!(reported_outcome(r#"{"ok":"yes","content":"x"}"#).is_none());
@@ -1191,12 +1176,10 @@ mod runner_tests {
 
     #[test]
     fn a_tool_calling_error_asks_the_turn_to_stop() {
-        // `error` in a tool script is a Lua runtime error and nothing else is.
         let aborted = lua_tool_error(mlua::Error::RuntimeError("cannot continue".to_owned()));
         assert_eq!(aborted.kind(), ToolErrorKind::Aborted);
         assert_eq!(aborted.message(), "cannot continue");
 
-        // A limit the runtime enforced is not the tool asking to stop.
         let failed = lua_tool_error(mlua::Error::RuntimeError("x".to_owned()));
         assert_eq!(failed.kind(), ToolErrorKind::Aborted);
         let other = lua_tool_error(mlua::Error::external("unavailable"));
@@ -1205,12 +1188,9 @@ mod runner_tests {
 
     #[test]
     fn only_failures_the_model_cannot_answer_end_the_turn() {
-        // Retrying cannot help: the tool refused to go on, or the runner that
-        // executes tools is broken.
         assert!(ends_the_turn(ToolErrorKind::Aborted));
         assert!(ends_the_turn(ToolErrorKind::RunnerFailed));
 
-        // Retrying can help, so the model keeps the turn and answers the message.
         assert!(!ends_the_turn(ToolErrorKind::ExecutionFailed));
         assert!(!ends_the_turn(ToolErrorKind::InvalidArguments));
         assert!(!ends_the_turn(ToolErrorKind::InvalidRequest));
@@ -1326,9 +1306,9 @@ mod runner_tests {
         let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
         let handle = LuaExecutionHandle {
             context: LuaCallContext {
-                agent_id: ResourceId::parse("agent:test/coder:latest").unwrap(),
+                agent_id: ResourceRef::parse("agent:test/coder:latest").unwrap(),
                 turn_id: "turn-1".to_owned(),
-                resource_id: ResourceId::parse("tool:local/glob:latest").unwrap(),
+                resource_id: ResourceRef::parse("tool:local/glob:latest").unwrap(),
                 project_root: Arc::new(directory.clone()),
                 temp_dir: Arc::new(directory.clone()),
                 sandbox_policies: Vec::new(),
@@ -1371,9 +1351,9 @@ mod runner_tests {
         let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
         let handle = LuaExecutionHandle {
             context: LuaCallContext {
-                agent_id: ResourceId::parse("agent:test/reviewer:latest").unwrap(),
+                agent_id: ResourceRef::parse("agent:test/reviewer:latest").unwrap(),
                 turn_id: "turn-1".to_owned(),
-                resource_id: ResourceId::parse("tool:local/glob:latest").unwrap(),
+                resource_id: ResourceRef::parse("tool:local/glob:latest").unwrap(),
                 project_root: Arc::new(PathBuf::from("/tmp")),
                 temp_dir: Arc::new(PathBuf::from("/tmp")),
                 sandbox_policies: Vec::new(),

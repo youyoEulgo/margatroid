@@ -10,7 +10,7 @@ core_plugin = { path = "../../mecs/core_plugin" }
 library_component_plugin = { path = "../library_component_plugin" }
 futures-util = { workspace = true }
 margatroid_types = { path = "../types" }
-mcl_plugin = { path = "../mcl_plugin" }
+sha2 = { workspace = true }
 resource_id_plugin = { path = "../resource_id_plugin" }
 serde = { workspace = true }
 tokio = { workspace = true }

@@ -90,7 +90,7 @@ AgentImage：AgentImage 图书馆组件，公开 Component--AgentImage Entity �
         读取依赖清单：公开方法
     model(&self) -> &AgentImageModelConfig
         读取模型配置：公开方法
-    default_visibility(&self) -> impl Iterator<Item = &ResourceId> + '_
+    default_visibility(&self) -> impl Iterator<Item = &ResourceRef> + '_
         读取默认可见资源：公开方法
     impl MecsComponent for AgentImage
     impl LibraryComponent for AgentImage
@@ -125,7 +125,7 @@ crate公开：
 AgentImageLoaderState：AgentImage 加载状态，crate公开 Resource--保存根目录、加载限制和正在合并的请求
     root: Arc<PathBuf>--agent-images 根目录
     limits: AgentImageLoaderLimits--加载限制
-    pending: HashMap<ResourceId, Vec<String>>--同一镜像正在进行的请求 ID
+    pending: HashMap<ResourceRef, Vec<String>>--同一镜像正在进行的请求 ID
     impl Resource for AgentImageLoaderState
 ```
 
@@ -159,7 +159,7 @@ apply_agent_image_load_system(world: &mut World)
 
 crate公开：
 ```text
-handle_agent_image_load(world: &mut World, id: String, reference: ResourceId)
+handle_agent_image_load(world: &mut World, id: String, reference: ResourceRef)
     处理镜像加载请求：crate公开函数，合并同一镜像的并发读取并提交异步任务
     行为：
         id 为空时立即发送 InvalidRequest 结果
@@ -181,7 +181,7 @@ apply_agent_image_payload(world: &mut World, payload: AgentImageReadPayload)
     行为：
         从 pending 移除 payload.reference 并取得全部等待 ID
         失败时为每个等待 ID 发送克隆的 AgentImageLoadError
-        成功时复用存活 Entity 或创建新 Entity，插入 ResourceId 和 AgentImage 组件
+        成功时复用存活 Entity 或创建新 Entity，通过 attach_resource_id 挂载 ResourceId 身份组件并插入 AgentImage 组件
         为每个等待 ID 发送同一 reference 和 Entity 的 LoadAgentImageResult::Ok
 
 normalize_root(root: PathBuf) -> Result<PathBuf, AgentImageLoadError>
@@ -203,8 +203,7 @@ read_agent_image_inner(task: AgentImageReadTask) -> Result<PreparedAgentImage, A
         验证 model 非空、无控制字符且不超过读取上限
         解析 dependencies，校验资源 ID 和可选 source 的基本格式
         source 只作为安装提示保留，不在 Loader 阶段下载、复制或解析
-        从 base.lua 加载 Base Driver，身份继承 AgentImage 的 scope、name 和 tag 并使用 type=mcl
-        验证 prompt 依赖：每个 prompt 依赖按 name 的大写形式在镜像根目录查找 `<NAME>.md` 文件；scope 只允许 system 或 user
+        异步读取 base.lua 的 UTF-8 源码，保存来源路径并计算 SHA-256，不派生资源身份
         读取前后比较顶层目录与 manifest 文件签名
         从 base.lua 解析默认可见资源
         成功时构造 PreparedAgentImage
@@ -216,28 +215,26 @@ validate_model_document(
     验证模型文档：私有函数，只检查模型 ID、停止序列数量和单序列读取上限
     行为：不判断 temperature、top_p、max_output_tokens 或停止序列的业务语义
 
-resolve_image_root(root: &Path, reference: &ResourceId) -> Result<PathBuf, AgentImageLoadError>
+resolve_image_root(root: &Path, reference: &ResourceRef) -> Result<PathBuf, AgentImageLoadError>
     解析镜像目录：私有异步函数，将规范化引用映射到 root/scope/name/tag
     行为：reference 的 type 不是 image 时返回 InvalidResourceName；不存在返回 NotFound；symlink 返回 SymlinkNotAllowed；非目录返回 InvalidLayout
 
 validate_image_layout(root: &Path) -> Result<DirectorySignature, AgentImageLoadError>
-    验证镜像布局：私有异步函数，检查 AgentImage 顶层只包含规定文件与目录并返回快照
+    验证镜像布局：私有异步函数，确认 AgentImage 顶层包含两个自有文件并返回快照
     行为：
         agent.toml 和 base.lua 必须是普通文件
-        任意 `.md` 文件允许存在且必须是普通文件，作为可被依赖清单引用的提示词文档
-        skills、hooks、tools 和 shells 缺失时视为空，存在时必须是普通目录
-        顶层 symlink 返回 SymlinkNotAllowed；特殊文件和未知入口返回 InvalidLayout
+        二者缺任一返回 InvalidLayout
+        其余顶层入口一律忽略，不参与校验也不报错
 
-validate_prompt_dependencies(
-    image_root: &Path,
-    dependencies: &[AgentImageDependency],
-) -> Result<(), AgentImageLoadError>
-    验证 prompt 依赖：私有函数，检查依赖清单中的 prompt 资源在镜像根目录有对应大写文件，并拒绝重复的 prompt 依赖
-    行为：
-        prompt 依赖的 scope 必须是 system 或 user
-        prompt 依赖按 name 的大写形式在镜像根目录查找 `<NAME>.md` 文件
-        相同 prompt scope 和 name（相同 message 类型）重复声明时返回 DuplicateDependency，tag 不同也视为重复
-        对应文件不存在时返回 PromptReadFailed
+镜像只拥有两个文件：
+    资源已搬到全局资源库，镜像不再存放 tools、skills、hooks、sandboxes 或 prompt 文档
+    旧镜像目录里可能仍留着这些副本，它们属于历史遗留而非镜像的一部分
+    加载器只认自己拥有的两个文件，因此遗留文件不会阻塞加载，也不需要预先清理
+
+prompt 依赖不再于镜像内解析：
+    prompt 现在是和其它类型同等的全局资源，由 tool_plugin 从全局资源库解析
+    镜像只声明依赖 ID，不提供对应文件，因此不再有镜像内的大写 `<NAME>.md` 查找
+    作用域也不再限定 system 或 user，与其它资源一样是普通作用域
 
 check_directory(path: &Path, root: bool) -> Result<Option<PathBuf>, AgentImageLoadError>
     检查目录：私有异步函数，区分不存在、合法目录与无效镜像来源
@@ -264,7 +261,7 @@ has_parent(path: &Path) -> bool
 parse_default_visibility(
     source: &str,
     dependencies: &[AgentImageDependency],
-) -> Result<BTreeSet<ResourceId>, AgentImageLoadError>
+) -> Result<BTreeSet<ResourceRef>, AgentImageLoadError>
     解析默认可见资源：私有函数，从 base.lua 的 IMPORT 别名和 INJECT TO tool_default 行中发现依赖清单内的默认可见资源
     行为：只返回依赖清单中存在的资源 ID；找不到 INJECT 时返回空集合
 ```
@@ -277,12 +274,12 @@ parse_default_visibility(
 ```text
 LoadAgentImage：加载 AgentImage，公开事件--请求读取当前磁盘中的逻辑镜像
     id: String--调用方生成的请求 ID，用于配对结果
-    reference: ResourceId--type=image 的完整镜像资源 ID
+    reference: ResourceRef--type=image 的完整镜像资源 ID
     impl Event for LoadAgentImage
 
 LoadAgentImageResult：加载 AgentImage 结果，公开事件--每个已读取请求对应一个结果
     id: String--原请求 ID
-    reference: ResourceId--原镜像资源 ID
+    reference: ResourceRef--原镜像资源 ID
     result: Result<Entity, AgentImageLoadError>--成功时返回当前 AgentImage Entity
     impl Event for LoadAgentImageResult
 ```
@@ -290,7 +287,7 @@ LoadAgentImageResult：加载 AgentImage 结果，公开事件--每个已读取�
 crate公开：
 ```text
 AgentImageReadTask：AgentImage 异步读取任务，crate公开事件--不持有 World 引用
-    reference: ResourceId--type=image 的目标镜像资源 ID
+    reference: ResourceRef--type=image 的目标镜像资源 ID
     root: Arc<PathBuf>--镜像库根目录
     limits: AgentImageLoaderLimits--当前限制快照
     impl Event for AgentImageReadTask
@@ -302,17 +299,23 @@ AgentImageReadTask：AgentImage 异步读取任务，crate公开事件--不持�
 
 公开：
 ```text
-AgentImageBaseDriver：AgentImage Base Driver，公开结构体--已经通过大小、UTF-8 和 MCL 加载验证的 base.lua 程序
-    program: Arc<MclProgram>--MCL 程序，crate公开字段
-    program(&self) -> &Arc<MclProgram>
-        读取程序：公开方法
-
-AgentImageBaseMcl：AgentImage Base MCL 别名，公开类型别名--AgentImageBaseDriver 的同义词
+AgentImageBaseDriver：AgentImage Base Driver，公开结构体--镜像持有的 UTF-8 Lua 源码，不是资源或编译后的 MCL 程序
+    source: Arc<str>--Lua 源码，私有字段
+    origin: Arc<PathBuf>--来源路径，私有字段
+    source_hash: Arc<str>--源码字节的 SHA-256 小写十六进制哈希，私有字段
+    source(&self) -> &str
+        读取源码：公开方法
+    origin(&self) -> &Path
+        读取来源路径：公开方法
+    source_hash(&self) -> &str
+        读取源码哈希：公开方法
+    new(source: String, origin: PathBuf) -> Self
+        保存源码并计算哈希：crate公开关联函数，不派生 mcl ResourceId，不编译 MCL 或验证 Lua 语法
 
 AgentImageDependency：AgentImage 依赖项，公开结构体--保存规范化资源 ID 和可选来源
-    resource_id: ResourceId--依赖资源 ID，crate公开字段
+    resource_id: ResourceRef--依赖资源 ID，crate公开字段
     source: Option<Arc<str>>--可选来源，crate公开字段
-    resource_id(&self) -> &ResourceId
+    resource_id(&self) -> &ResourceRef
         读取资源 ID：公开方法
     source(&self) -> Option<&str>
         读取来源：公开方法
@@ -345,8 +348,8 @@ AgentImageModelConfig：AgentImage 模型配置，公开结构体--中立保存�
         读取模型参数：公开方法
 
 AgentImageDefaultVisibility：AgentImage 默认可见资源，公开结构体--保存镜像默认可见的资源 ID 集合
-    resources: BTreeSet<ResourceId>--默认可见资源，crate公开字段
-    resources(&self) -> impl Iterator<Item = &ResourceId> + '_
+    resources: BTreeSet<ResourceRef>--默认可见资源，crate公开字段
+    resources(&self) -> impl Iterator<Item = &ResourceRef> + '_
         读取默认可见资源：公开方法
 ```
 
@@ -377,14 +380,14 @@ AgentImageLoaderLimits：AgentImage 加载限制，crate公开结构体--限制�
         Default：crate公开 trait 实现，使用 64KiB 清单、1KiB 模型 ID、128 个停止序列和 4KiB 单序列限制
 
 PreparedAgentImage：已准备 AgentImage，crate公开结构体--镜像静态数据读取与名称发现均已完成
-    reference: ResourceId--type=image 的镜像资源 ID
+    reference: ResourceRef--type=image 的镜像资源 ID
     base_driver: AgentImageBaseDriver--已验证的 Base Driver
     dependencies: AgentImageDependencies--依赖清单
     model: AgentImageModelConfig--中立模型配置
     default_visibility: AgentImageDefaultVisibility--默认可见资源
 
 AgentImageReadPayload：AgentImage 读取载荷，crate公开结构体--无论成功失败都保留镜像引用
-    reference: ResourceId--type=image 的原镜像资源 ID
+    reference: ResourceRef--type=image 的原镜像资源 ID
     result: Result<PreparedAgentImage, AgentImageLoadError>--读取结果
 
 AgentImageReadOutput：AgentImage 读取输出，crate公开结构体--允许提交 System 从共享事件引用中取得一次载荷所有权
@@ -511,7 +514,7 @@ App
     ├── AgentImageLoaderState Resource
     │   ├── root: Arc<PathBuf>
     │   ├── limits: AgentImageLoaderLimits
-    │   └── pending: HashMap<ResourceId, Vec<String>>
+    │   └── pending: HashMap<ResourceRef, Vec<String>>
     └── AgentImage Entity
         ├── ResourceId
         └── AgentImage
@@ -522,15 +525,15 @@ App
 
 异步读取期间：
 AgentImageReadTask
-├── reference: ResourceId
+├── reference: ResourceRef
 ├── root: Arc<PathBuf>
 └── limits: AgentImageLoaderLimits
     -> AgentImageReadOutput
        └── payload: Mutex<Option<AgentImageReadPayload>>
-           ├── reference: ResourceId
+           ├── reference: ResourceRef
            └── result: Result<PreparedAgentImage, AgentImageLoadError>
                └── PreparedAgentImage
-                   ├── reference: ResourceId
+                   ├── reference: ResourceRef
                    ├── base_driver: AgentImageBaseDriver
                    ├── dependencies: AgentImageDependencies
                    ├── model: AgentImageModelConfig

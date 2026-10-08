@@ -10,7 +10,7 @@ use async_runtime_plugin::WorldAsyncExt;
 use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::{Entity, Resource, World};
 use futures_util::StreamExt;
-use margatroid_types::{CapturedInferenceResponse, Message, ResourceId, ToolDefinition};
+use margatroid_types::{CapturedInferenceResponse, Message, ResourceRef, ToolDefinition};
 use reqwest::Url;
 use serde::Serialize;
 use server_plugin::{
@@ -41,7 +41,7 @@ impl Resource for InFlightInferences {}
 pub(crate) struct InferenceCommand {
     pub(crate) id: String,
     pub(crate) agent: Entity,
-    pub(crate) agent_id: ResourceId,
+    pub(crate) agent_id: ResourceRef,
     pub(crate) messages: Vec<Message>,
     pub(crate) tools: Vec<ToolDefinition>,
     pub(crate) output: InferenceOutputKind,
@@ -652,13 +652,13 @@ struct AgentMessageDeltaFrame<'a> {
     #[serde(rename = "type")]
     message_type: &'static str,
     id: &'a str,
-    agent: &'a ResourceId,
+    agent: &'a ResourceRef,
     content: &'a str,
 }
 async fn send_stream_delta(
     senders: &[WebSocketSender],
     id: &str,
-    agent: &ResourceId,
+    agent: &ResourceRef,
     delta: ProviderStreamDelta,
 ) -> Result<(), InferenceError> {
     let (message_type, content) = match &delta {

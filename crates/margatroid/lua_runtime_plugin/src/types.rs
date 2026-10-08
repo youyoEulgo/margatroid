@@ -263,6 +263,7 @@ pub(crate) struct LuaRuntimeState {
     pub(crate) sessions: HashMap<LuaVmId, LuaVmSession>,
     pub(crate) requests: HashMap<String, CancellationToken>,
     pub(crate) owners: HashMap<String, String>,
+    pub(crate) pre_cancelled: std::collections::HashSet<String>,
 }
 impl Resource for LuaRuntimeState {}
 

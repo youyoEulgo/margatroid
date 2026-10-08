@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent_image_loader_plugin::{AgentImage, LoadAgentImageResult};
@@ -41,11 +40,21 @@ pub(crate) fn begin_workspace_command_system(world: &mut World) {
         .collect::<Vec<_>>();
     for request in stops {
         let result = stop_workspace_entity(world, request.workspace);
-        world.send_event(StopWorkspaceResult {
-            id: request.id,
-            workspace: request.workspace,
-            result,
-        });
+        match result {
+            Ok(()) => world
+                .get_resource_mut::<WorkspaceRegistry>()
+                .unwrap()
+                .stopping
+                .get_mut(&request.workspace)
+                .unwrap()
+                .replies
+                .push(crate::types::WorkspaceStopReply::Stop(request)),
+            Err(error) => world.send_event(StopWorkspaceResult {
+                id: request.id,
+                workspace: request.workspace,
+                result: Err(error),
+            }),
+        }
     }
 
     let references = world
@@ -56,12 +65,7 @@ pub(crate) fn begin_workspace_command_system(world: &mut World) {
     for request in references {
         let result = world
             .entity_by_resource_id(&request.workspace.id)
-            .map_err(|_| {
-                WorkspaceError::new(
-                    WorkspaceErrorKind::WorkspaceNotAlive,
-                    "workspace is not alive",
-                )
-            })
+            .map_err(WorkspaceError::from)
             .and_then(|workspace| {
                 let matches_root = world
                     .get_component::<Workspace>(workspace)
@@ -72,13 +76,23 @@ pub(crate) fn begin_workspace_command_system(world: &mut World) {
                         "workspace reference does not match the active project",
                     ));
                 }
-                stop_workspace_entity(world, workspace)
+                stop_workspace_entity(world, workspace).map(|_| workspace)
             });
-        world.send_event(StopWorkspaceByReferenceResult {
-            id: request.id,
-            workspace: request.workspace,
-            result,
-        });
+        match result {
+            Ok(workspace) => world
+                .get_resource_mut::<WorkspaceRegistry>()
+                .unwrap()
+                .stopping
+                .get_mut(&workspace)
+                .unwrap()
+                .replies
+                .push(crate::types::WorkspaceStopReply::Reference(request)),
+            Err(error) => world.send_event(StopWorkspaceByReferenceResult {
+                id: request.id,
+                workspace: request.workspace,
+                result: Err(error),
+            }),
+        }
     }
 
     let reloads = world
@@ -87,13 +101,110 @@ pub(crate) fn begin_workspace_command_system(world: &mut World) {
         .cloned()
         .collect::<Vec<_>>();
     for request in reloads {
-        let result = stop_workspace_entity(world, request.workspace)
-            .and_then(|_| create_workspace(world, &request.definition));
-        world.send_event(ReloadWorkspaceResult {
-            id: request.id,
-            previous: request.workspace,
-            result,
-        });
+        match stop_workspace_entity(world, request.workspace) {
+            Ok(()) => world
+                .get_resource_mut::<WorkspaceRegistry>()
+                .unwrap()
+                .stopping
+                .get_mut(&request.workspace)
+                .unwrap()
+                .replies
+                .push(crate::types::WorkspaceStopReply::Reload(request)),
+            Err(error) => world.send_event(ReloadWorkspaceResult {
+                id: request.id,
+                previous: request.workspace,
+                result: Err(error),
+            }),
+        }
+    }
+}
+
+pub(crate) fn collect_workspace_stop_system(world: &mut World) {
+    let workspaces = world
+        .get_resource::<WorkspaceRegistry>()
+        .map(|registry| registry.stopping.keys().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for workspace in workspaces {
+        crate::handler::stop_workspace_agents(world, workspace);
+        let agents = world.get_resource::<WorkspaceRegistry>().unwrap().stopping[&workspace]
+            .agents
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for entity in agents {
+            let drained = world.get_component::<Agent>(entity).is_none_or(|agent| {
+                agent.lua.vm_id.is_none()
+                    && agent.lua.request_id.is_none()
+                    && matches!(
+                        agent.lifecycle,
+                        agent_plugin::AgentLifecycleState::Stopped
+                            | agent_plugin::AgentLifecycleState::Failed
+                    )
+                    && agent.tools.pending.is_empty()
+                    && agent.inference.pending.is_empty()
+            });
+            if drained {
+                resource_library_plugin::release_resource_owner(world, entity);
+                if world.is_alive(entity) {
+                    world.despawn(entity);
+                }
+            }
+        }
+        let registry = world.get_resource::<WorkspaceRegistry>().unwrap();
+        let drained = registry.stopping[&workspace]
+            .agents
+            .iter()
+            .all(|entity| !world.is_alive(*entity))
+            && !registry
+                .pending_agents
+                .values()
+                .any(|(owner, _, _)| *owner == workspace);
+        if !drained {
+            continue;
+        }
+        let state = world
+            .get_resource_mut::<WorkspaceRegistry>()
+            .unwrap()
+            .stopping
+            .remove(&workspace)
+            .unwrap();
+        world
+            .get_resource_mut::<WorkspaceRegistry>()
+            .unwrap()
+            .workspaces
+            .retain(|entity| *entity != workspace);
+        if let Some(routes) =
+            world.get_resource_mut::<inference_plugin::WorkspaceModelRoutesRegistry>()
+        {
+            routes.remove(workspace);
+        }
+        world.despawn(workspace);
+        for reply in state.replies {
+            match reply {
+                crate::types::WorkspaceStopReply::Stop(request) => {
+                    world.send_event(StopWorkspaceResult {
+                        id: request.id,
+                        workspace,
+                        result: Ok(()),
+                    })
+                }
+                crate::types::WorkspaceStopReply::Reference(request) => {
+                    world.send_event(StopWorkspaceByReferenceResult {
+                        id: request.id,
+                        workspace: request.workspace,
+                        result: Ok(()),
+                    })
+                }
+                crate::types::WorkspaceStopReply::Reload(request) => {
+                    let result = create_workspace(world, &request.definition);
+                    world.send_event(ReloadWorkspaceResult {
+                        id: request.id,
+                        previous: workspace,
+                        result,
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -104,12 +215,23 @@ pub(crate) fn route_agent_turn_abort_system(world: &mut World) {
         .cloned()
         .collect::<Vec<_>>();
     for event in events {
-        let workspace = world.entity_by_resource_id(&event.workspace.id).ok();
-        let agent = event
-            .agent
-            .as_ref()
-            .and_then(|id| world.entity_by_resource_id(id).ok())
-            .or_else(|| workspace.and_then(|id| world.workspace_manager(id)));
+        let workspace = match world.entity_by_resource_id(&event.workspace.id) {
+            Ok(entity) => entity,
+            Err(error) => {
+                tracing::warn!(%error, "cannot route turn abort to workspace");
+                continue;
+            }
+        };
+        let agent = match event.agent.as_ref() {
+            Some(id) => match world.entity_by_resource_id(id) {
+                Ok(entity) => Some(entity),
+                Err(error) => {
+                    tracing::warn!(%error, "cannot route turn abort to agent");
+                    continue;
+                }
+            },
+            None => world.workspace_manager(workspace),
+        };
         if let Some(agent) = agent {
             let (sender, _) = tokio::sync::oneshot::channel();
             world.send_event(AgentControl {
@@ -218,7 +340,7 @@ pub(crate) fn collect_agent_image_system(world: &mut World) {
         let Some(image_data) = world.get_component::<AgentImage>(image).cloned() else {
             continue;
         };
-        let base_lua = image_data.base_driver().program().clone();
+        let base_lua = image_data.base_driver();
         let image_root = world
             .get_resource::<WorkspaceRegistry>()
             .map(|registry| {
@@ -287,40 +409,7 @@ pub(crate) fn collect_agent_image_system(world: &mut World) {
             model,
             memory: AgentMemoryHandle::new(Arc::new(memory)),
             token_usage: Default::default(),
-            image_dependencies: Arc::from(
-                image_data
-                    .dependencies()
-                    .iter()
-                    .map(|dependency| dependency.resource_id().clone())
-                    .collect::<Vec<_>>(),
-            ),
-            image_sources: {
-                let mut sources = image_data
-                    .dependencies()
-                    .iter()
-                    .filter_map(|dependency| {
-                        dependency.source().map(|source| {
-                            (dependency.resource_id().clone(), Arc::<str>::from(source))
-                        })
-                    })
-                    .collect::<HashMap<_, _>>();
-                for dependency in image_data.dependencies() {
-                    if dependency.resource_id().resource_type() != "prompt" {
-                        continue;
-                    }
-                    let file_name =
-                        format!("{}.md", dependency.resource_id().name().to_uppercase());
-                    if let Ok(content) = std::fs::read_to_string(image_root.join(file_name)) {
-                        if !content.trim().is_empty() {
-                            sources.insert(
-                                dependency.resource_id().clone(),
-                                Arc::<str>::from(content),
-                            );
-                        }
-                    }
-                }
-                sources
-            },
+            image_dependencies: Arc::from(image_data.dependencies()),
             reply: AgentCreateReply::new(sender),
         });
     }
@@ -382,7 +471,10 @@ pub(crate) fn collect_agent_initialization_system(world: &mut World) {
             continue;
         };
         let workspace = agent.info.workspace_id;
-        let Some(agent_id) = world.get_component::<ResourceId>(event.agent).cloned() else {
+        let Some(agent_id) = world
+            .get_component::<ResourceId>(event.agent)
+            .map(|id| id.as_ref().clone())
+        else {
             continue;
         };
         let Some(value) = world.get_component_mut::<Workspace>(workspace) else {
