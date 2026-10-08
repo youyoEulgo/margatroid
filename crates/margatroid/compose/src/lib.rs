@@ -2,7 +2,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use margatroid_types::{ResourceId, WorkspaceAgentDefinition, WorkspaceDefinition};
+use margatroid_types::{ResourceRef, WorkspaceAgentDefinition, WorkspaceDefinition};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 
@@ -211,7 +211,7 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
         } else {
             format!("image:{}", raw_agent.image)
         };
-        let image = ResourceId::parse(image_value).map_err(|error| {
+        let image = ResourceRef::parse(image_value).map_err(|error| {
             ComposeError::new(
                 ComposeErrorKind::InvalidImageReference,
                 format!("invalid image reference: {error}"),
@@ -238,7 +238,7 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
             .map(|path| resolve_path(&project_root, path))
             .transpose()?;
         agents.push(WorkspaceAgentDefinition {
-            id: ResourceId::new("agent", &raw.name, &name, None::<String>).map_err(|error| {
+            id: ResourceRef::new("agent", &raw.name, &name, None::<String>).map_err(|error| {
                 ComposeError::new(
                     ComposeErrorKind::InvalidDefinition,
                     format!("invalid Agent resource ID: {error}"),
@@ -277,7 +277,7 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
     }
 
     Ok(WorkspaceDefinition {
-        id: ResourceId::new("workspace", "local", &raw.name, None::<String>).map_err(|error| {
+        id: ResourceRef::new("workspace", "local", &raw.name, None::<String>).map_err(|error| {
             ComposeError::new(ComposeErrorKind::InvalidDefinition, error.to_string())
         })?,
         name: raw.name,
@@ -287,14 +287,14 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
     })
 }
 
-fn parse_resource(raw: RawResource) -> Result<ResourceId, ComposeError> {
+fn parse_resource(raw: RawResource) -> Result<ResourceRef, ComposeError> {
     let value = match raw {
         RawResource::Structured(resource) => {
             format!("{}:{}", resource.resource_type, resource.name)
         }
         RawResource::Shorthand(value) => value,
     };
-    ResourceId::parse(value).map_err(|error| {
+    ResourceRef::parse(value).map_err(|error| {
         ComposeError::new(
             ComposeErrorKind::InvalidResourceReference,
             format!("invalid resource reference: {error}"),

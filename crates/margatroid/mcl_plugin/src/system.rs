@@ -9,8 +9,8 @@ use lua_runtime_plugin::{
     LuaValue,
 };
 use margatroid_types::{
-    AgentFailure, CapturedInferenceResponse, InferenceRequestEvent, Message, ResourceId, ToolCall,
-    ToolCallEvent,
+    AgentFailure, CapturedInferenceResponse, InferenceRequestEvent, Message, ResourceId,
+    ResourceRef, ToolCall, ToolCallEvent,
 };
 use resource_id_plugin::ResourceIdPluginInstalled;
 use resource_id_plugin::WorldResourceIdExt;
@@ -280,7 +280,7 @@ impl LuaHostFunction for MclExposeFunction {
                 }
             };
             let binding = lua_to_json_binding(mapping)?;
-            let agent_id: ResourceId = context
+            let agent_id: ResourceRef = context
                 .owner
                 .owner_id
                 .parse()
@@ -345,7 +345,7 @@ impl LuaHostFunction for MclHostFunction {
                     ))
                 }
             };
-            let agent_id: ResourceId = match values.pop() {
+            let agent_id: ResourceRef = match values.pop() {
                 Some(LuaValue::String(value)) => value.parse().map_err(|_| {
                     LuaRuntimeError::InvalidRequest("mcl agent id is invalid".into())
                 })?,
@@ -680,7 +680,7 @@ pub fn mcl_domain_system(world: &mut World) {
                 } => {
                     let agent = world
                         .entity_by_resource_id(&request.agent_id)
-                        .map_err(|_| MclError::AgentMissing)?;
+                        .map_err(MclError::from)?;
                     let state = world
                         .get_component_mut::<Agent>(agent)
                         .ok_or(MclError::AgentMissing)?;
@@ -691,7 +691,7 @@ pub fn mcl_domain_system(world: &mut World) {
                             .aliases
                             .get(&alias)
                             .cloned()
-                            .or_else(|| alias.parse::<ResourceId>().ok())
+                            .or_else(|| alias.parse::<ResourceRef>().ok())
                             .ok_or_else(|| MclError::ImportMissing(alias.clone()))?;
                         if resource.resource_type() != "sandbox"
                             || !state.resources.sandbox_policies.contains_key(&resource)
@@ -729,7 +729,7 @@ pub fn mcl_domain_system(world: &mut World) {
                 } => {
                     let agent = world
                         .entity_by_resource_id(&request.agent_id)
-                        .map_err(|_| MclError::AgentMissing)?;
+                        .map_err(MclError::from)?;
                     let state = world
                         .get_component_mut::<Agent>(agent)
                         .ok_or(MclError::AgentMissing)?;
@@ -748,7 +748,7 @@ pub fn mcl_domain_system(world: &mut World) {
                 } => {
                     let agent = world
                         .entity_by_resource_id(&request.agent_id)
-                        .map_err(|_| MclError::AgentMissing)?;
+                        .map_err(MclError::from)?;
                     let turn_id = world
                         .get_component::<Agent>(agent)
                         .and_then(|value| value.turn.turn_id.clone())
@@ -844,7 +844,7 @@ pub fn mcl_domain_system(world: &mut World) {
                 } => {
                     let agent = world
                         .entity_by_resource_id(&request.agent_id)
-                        .map_err(|_| MclError::AgentMissing)?;
+                        .map_err(MclError::from)?;
                     let state = world
                         .get_component_mut::<Agent>(agent)
                         .ok_or(MclError::AgentMissing)?;
@@ -864,7 +864,7 @@ pub fn mcl_domain_system(world: &mut World) {
                 } => {
                     let agent = world
                         .entity_by_resource_id(&request.agent_id)
-                        .map_err(|_| MclError::AgentMissing)?;
+                        .map_err(MclError::from)?;
                     let state = world
                         .get_component_mut::<Agent>(agent)
                         .ok_or(MclError::AgentMissing)?;
@@ -882,11 +882,10 @@ pub fn mcl_domain_system(world: &mut World) {
                 MclOperation::Emit {
                     effect: crate::MclEffectCommand::Finish,
                 } => {
-                    if let Some(state) = world
+                    let entity = world
                         .entity_by_resource_id(&request.agent_id)
-                        .ok()
-                        .and_then(|agent| world.get_component_mut::<Agent>(agent))
-                    {
+                        .map_err(MclError::from)?;
+                    if let Some(state) = world.get_component_mut::<Agent>(entity) {
                         if let Some(turn) = state.turn.turn_id.clone() {
                             if state
                                 .tools
@@ -925,7 +924,7 @@ fn rejected_tool_resource(
     world: &World,
     agent: core_plugin::Entity,
     call: &ToolCall,
-) -> ResourceId {
+) -> ResourceRef {
     world
         .get_component::<Agent>(agent)
         .and_then(|agent_state| {
@@ -934,9 +933,9 @@ fn rejected_tool_resource(
                 .tool_by_name(&call.tool_name)
                 .map(|entry| entry.resource_id.clone())
         })
-        .or_else(|| call.tool_name.parse::<ResourceId>().ok())
+        .or_else(|| call.tool_name.parse::<ResourceRef>().ok())
         .unwrap_or_else(|| {
-            ResourceId::new("tool", "builtin", "invalid", None::<String>)
+            ResourceRef::new("tool", "builtin", "invalid", None::<String>)
                 .expect("built-in invalid tool id must be valid")
         })
 }
@@ -944,7 +943,7 @@ fn rejected_tool_resource(
 fn begin_wake(world: &mut World, request: MclDomainRequest) -> Result<(), MclError> {
     let agent = world
         .entity_by_resource_id(&request.agent_id)
-        .map_err(|_| MclError::AgentMissing)?;
+        .map_err(MclError::from)?;
     let state = world
         .get_component::<Agent>(agent)
         .ok_or(MclError::AgentMissing)?;
@@ -971,7 +970,7 @@ fn begin_wake(world: &mut World, request: MclDomainRequest) -> Result<(), MclErr
 fn begin_ready(world: &mut World, request: MclDomainRequest) -> Result<(), MclError> {
     let agent = world
         .entity_by_resource_id(&request.agent_id)
-        .map_err(|_| MclError::AgentMissing)?;
+        .map_err(MclError::from)?;
     let vm_id = world
         .get_component::<Agent>(agent)
         .ok_or(MclError::AgentMissing)
@@ -994,7 +993,7 @@ fn begin_inference(
 ) -> Result<(), MclError> {
     let agent = world
         .entity_by_resource_id(&request.agent_id)
-        .map_err(|_| MclError::AgentMissing)?;
+        .map_err(MclError::from)?;
     let turn_id = world
         .get_component::<Agent>(agent)
         .and_then(|value| value.turn.turn_id.clone())
@@ -1267,7 +1266,7 @@ pub fn mcl_effect_response_system(world: &mut World) {
     for failure in failures {
         let agent_label = world
             .get_component::<ResourceId>(failure.agent)
-            .map(ToString::to_string)
+            .map(|id| id.as_ref().to_string())
             .unwrap_or_else(|| format!("Entity({:?})", failure.agent));
         let error = failure.message.clone();
         if let Some(agent) = world.get_component_mut::<Agent>(failure.agent) {
@@ -1316,18 +1315,17 @@ fn lua_to_json(value: LuaValue) -> Result<serde_json::Value, MclError> {
 fn begin_import(
     world: &mut World,
     request: MclDomainRequest,
-    resource_id: margatroid_types::ResourceId,
+    resource_id: margatroid_types::ResourceRef,
     alias: String,
 ) -> Result<(), MclError> {
     let agent = world
         .entity_by_resource_id(&request.agent_id)
-        .map_err(|_| MclError::AgentMissing)?;
+        .map_err(MclError::from)?;
     let agent_info = world
         .get_component::<Agent>(agent)
         .ok_or(MclError::AgentMissing)?
         .info
         .clone();
-    let is_prompt = resource_id.resource_type() == "prompt";
     let is_hook_tool = resource_id.resource_type() == "tool"
         && resource_id.scope() == "builtin"
         && resource_id.name() == "hook";
@@ -1348,57 +1346,11 @@ fn begin_import(
         reply: request.reply.clone(),
     };
     let id = format!("mcl-import:{}", request.id.as_str());
-    let prompt_content = if is_prompt {
-        let role = match resource_id.scope() {
-            "system" | "user" => resource_id.scope(),
-            _ => {
-                return Err(MclError::ImportMissing(format!(
-                    "{resource_id} (prompt scope must be system or user)"
-                )))
-            }
-        };
-        let file_name = format!("{}.md", resource_id.name().to_uppercase());
-        let prompt_path = agent_info.image_root.join(&file_name);
-        let content = std::fs::read_to_string(&prompt_path).map_err(|_| {
-            MclError::ImportMissing(format!(
-                "{resource_id} ({file_name} is missing or unreadable)"
-            ))
-        })?;
-        if content.trim().is_empty() {
-            return Err(MclError::ImportMissing(format!(
-                "{resource_id} ({file_name} is empty)"
-            )));
-        }
-        Some((role, Arc::<str>::from(content)))
-    } else {
-        None
-    };
     world
         .get_resource_mut::<PendingMclImports>()
         .ok_or(MclError::ImportFailed)?
         .imports
         .insert(id.clone(), state);
-    if is_prompt {
-        let (role, content) = prompt_content.expect("prompt content was validated above");
-        world.send_event(ToolRegisterResponse {
-            id,
-            agent,
-            resource_id: resource_id.clone(),
-            alias: Some(alias.clone()),
-            result: Ok(ResourceMapEntry {
-                resource_id: resource_id.clone(),
-                resource_name: alias.clone(),
-                alias: Some(alias.clone()),
-                tool_id: None,
-                template: None,
-                content: Some(ResourceContent::Prompt {
-                    role: role.into(),
-                    content,
-                }),
-            }),
-        });
-        return Ok(());
-    }
     world.send_event(ToolRegisterRequest {
         id,
         agent,
@@ -1406,6 +1358,42 @@ fn begin_import(
         alias: Some(alias),
     });
     Ok(())
+}
+
+fn imported_resource_definition(
+    entry: &ResourceMapEntry,
+) -> Result<resource_library_plugin::ResourceDefinition, MclError> {
+    use resource_library_plugin::{
+        HookResource, PromptResource, ResourceDefinition, SandboxResource, SkillResource,
+        ToolResource,
+    };
+    let template = || entry.template.as_ref().ok_or(MclError::ImportFailed);
+    Ok(
+        match entry.content.as_ref().ok_or(MclError::ImportFailed)? {
+            ResourceContent::Tool { script_path } => ResourceDefinition::Tool(ToolResource {
+                description: template()?.description.clone(),
+                input_schema: template()?.parameters.clone(),
+                script_path: script_path.clone(),
+            }),
+            ResourceContent::Skill { content_path } => ResourceDefinition::Skill(SkillResource {
+                description: template()?.description.clone(),
+                content_path: content_path.clone(),
+            }),
+            ResourceContent::Hook => ResourceDefinition::Hook(HookResource {
+                description: template()?.description.clone(),
+                input_schema: template()?.parameters.clone(),
+            }),
+            ResourceContent::Prompt { role, content } => {
+                ResourceDefinition::Prompt(PromptResource {
+                    role: role.clone(),
+                    content: content.clone(),
+                })
+            }
+            ResourceContent::Sandbox { policy } => ResourceDefinition::Sandbox(SandboxResource {
+                policy: policy.clone(),
+            }),
+        },
+    )
 }
 
 pub fn mcl_import_response_system(world: &mut World) {
@@ -1426,22 +1414,32 @@ pub fn mcl_import_response_system(world: &mut World) {
         } else {
             match response.result {
                 Err(_) => Err(MclError::ImportFailed),
-                Ok(mut entry) => {
+                Ok(mut entry) => (|| -> Result<crate::MclDomainValue, MclError> {
                     entry.alias = Some(state.alias.clone());
                     entry.resource_name = state.alias.clone();
                     let alias_conflict = world
                         .get_component::<Agent>(state.agent)
                         .and_then(|agent| agent.resources.aliases.get(&state.alias))
                         .is_some_and(|resource| resource != &state.resource_id);
-                    let is_prompt = entry.tool_id.is_none()
+                    let is_prompt = entry.executor.is_none()
                         && entry.template.is_none()
                         && matches!(entry.content.as_ref(), Some(ResourceContent::Prompt { .. }));
-                    let is_sandbox = entry.tool_id.is_none()
+                    let is_sandbox = entry.executor.is_none()
                         && entry.template.is_none()
                         && matches!(
                             entry.content.as_ref(),
                             Some(ResourceContent::Sandbox { .. })
                         );
+                    if !alias_conflict {
+                        let definition = imported_resource_definition(&entry)?;
+                        resource_library_plugin::install_resource(
+                            world,
+                            state.resource_id.clone(),
+                            state.agent,
+                            definition,
+                        )
+                        .map_err(|_| MclError::ImportFailed)?;
+                    }
                     if alias_conflict
                         || (!is_prompt
                             && !is_sandbox
@@ -1476,7 +1474,7 @@ pub fn mcl_import_response_system(world: &mut World) {
                     } else {
                         Err(MclError::ImportFailed)
                     }
-                }
+                })(),
             }
         };
         world.send_event(MclDomainResponse {
@@ -1583,7 +1581,7 @@ mod tests {
         MclCommandRequest {
             id: crate::MclCommandId::new(id).expect("test command id is valid"),
             source: source.to_owned(),
-            agent_id: ResourceId::parse("agent:demo/reviewer:latest")
+            agent_id: ResourceRef::parse("agent:demo/reviewer:latest")
                 .expect("test agent id is valid"),
             command: command.to_owned(),
             binding: None,

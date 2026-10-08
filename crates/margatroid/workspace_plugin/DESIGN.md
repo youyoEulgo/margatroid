@@ -200,13 +200,34 @@ collect_agent_initialization_system(world: &mut World)
 crate公开：
 ```text
 stop_workspace_entity(world: &mut World, workspace: Entity) -> Result<(), WorkspaceError>
-    停止 Workspace Entity：crate公开函数
+    停止 Workspace Entity：crate公开函数，登记停止意图并发出取消，不直接回收
     行为：
         Workspace 不存活返回 WorkspaceNotAlive
-        遍历 Workspace.agents，逐个发送 AgentControl::Stop 并 despawn Agent
-        从 WorkspaceRegistry 移除 workspaces、pending_images、pending_agents
-        移除 WorkspaceModelRoutesRegistry 中的路由
-        despawn Workspace
+        在 WorkspaceRegistry.stopping 中登记该 Workspace 及其成员
+        遍历成员 Agent，首次登记时发送 AgentControl::Stop
+        不 despawn Agent，也不清理 registry，回收交给 collect_workspace_stop_system
+
+stop_workspace_agents(world: &mut World, workspace: Entity)
+    停止 Workspace 的成员：crate公开函数
+    行为：按 Agent.info.workspace_id 查找成员，因此 Creating 且尚未登记进 Workspace.agents 的成员也会被找到
+    行为：每个成员只在首次登记时发送一次 AgentControl::Stop
+
+collect_workspace_stop_system(world: &mut World)
+    收敛 Workspace 停止：crate公开 System，在途工作全部停止后才回收
+    行为：
+        对每个 stopping 中的 Workspace 先调用 stop_workspace_agents
+        逐个成员判断是否已排空：
+            Agent.lua.vm_id 与 Agent.lua.request_id 均为空
+            且 lifecycle 为 Stopped 或 Failed
+            且 tools.pending 与 inference.pending 均为空
+        已排空的成员先调用 resource_library_plugin::release_resource_owner 释放其持有的资源
+        再 despawn 该成员
+        所有成员都不存活且没有属于该 Workspace 的 pending_agents 时才算整体排空
+        整体排空后移除 registry 条目与模型路由，despawn Workspace，并回复所有挂起的停止请求
+
+排队中的创建：
+    仍在 pending_agents 中的创建请求尚未产生 Agent，但随后仍可能产生一个
+    因此必须等它的回执落地后才允许判定整体排空
 
 create_workspace(world: &mut World, definition: &WorkspaceDefinition) -> Result<Entity, WorkspaceError>
     创建 Workspace Entity：crate公开函数
@@ -344,10 +365,16 @@ WorkspaceError：Workspace 错误，公开结构体
 
 停止：
     StopWorkspace / StopWorkspaceByReference / ReloadWorkspace
-    -> stop_workspace_entity
-    -> 停止并 despawn 所有 Agent
-    -> 清理 pending_images / pending_agents / 模型路由
-    -> despawn Workspace
+    -> stop_workspace_entity 登记意图并发送 AgentControl::Stop
+    -> collect_workspace_stop_system 反复收敛直至排空
+    -> 成员排空时 release_resource_owner 释放其资源，再 despawn 成员
+    -> 整体排空后清理 pending_images / pending_agents / 模型路由
+    -> despawn Workspace 并回复挂起的停止请求
+
+停止收敛的判据：
+    生命周期标签本身不足以证明执行已结束，Failed的VM仍可能持有在途执行
+    因此要求 VM、tools.pending 与 inference.pending 同时为空
+    资源必须晚于在途工作释放，否则运行中的调用会失去自己的资源
 
 消息：
     RouteAgentMessage -> route_agent_message_system -> AgentMessage

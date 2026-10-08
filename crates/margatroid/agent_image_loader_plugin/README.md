@@ -119,11 +119,11 @@ WorkspacePlugin 为 Workspace 文件中的每个 Agent 发送加载请求：
 ```rust
 use agent_image_loader_plugin::LoadAgentImage;
 use app_runtime_plugin::WorldEventExt;
-use margatroid_types::ResourceId;
+use margatroid_types::ResourceRef;
 
 world.send_event(LoadAgentImage {
     id: "workspace/demo/coder".into(),
-    reference: ResourceId::parse("image:local/coder:latest")?,
+    reference: ResourceRef::parse("image:local/coder:latest")?,
 });
 ```
 
@@ -158,9 +158,9 @@ fn inspect_loaded_images(world: &mut World) {
 
         tracing::info!(
             ?image,
-            reference = %identity,
+            reference = %identity.as_ref(),
             model = image.model().model(),
-            base_driver_bytes = image.base_driver().program().source().len(),
+            base_driver_bytes = image.base_driver().source().len(),
             "agent image loaded"
         );
     }
@@ -172,9 +172,11 @@ fn inspect_loaded_images(world: &mut World) {
 
 ## Base Driver
 
-`AgentImageBaseDriver` 保存镜像根目录 `base.lua` 的已验证 MCL 程序。资源依赖由 `agent.toml`
-的 `dependencies` 声明，`base.lua` 中的 `IMPORT` 只负责引用和组织这些依赖；默认和动态工具
-可见性由 MCL 数组管理。
+`AgentImageBaseDriver` 保存镜像根目录 `base.lua` 的普通 Lua 数据：UTF-8 源码、来源路径和
+源码 SHA-256 哈希，通过 `source()`、`origin()`、`source_hash()` 读取。它不是独立资源，
+不派生 `mcl:` ID，也不进行 MCL 编译或 Lua 语法验证；Workspace 将源码交给 Lua runtime。
+资源依赖仍由 `agent.toml` 的 `dependencies` 声明；Lua 中调用的 MCL `IMPORT` 等指令仍正常执行，
+默认和动态工具可见性仍由 MCL 数组管理，资源解析规则不变。
 
 禁用始终优先。合并后的 `AgentDefaultVisibility` 交给 AgentPlugin；AgentPlugin 创建实例时复制出
 初始 `AgentDynamicVisibility`。前者只读，后者代表运行中的实际可见资源。

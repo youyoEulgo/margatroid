@@ -12,6 +12,8 @@ futures-util = { workspace = true }
 jsonschema = { workspace = true }
 mlua = { workspace = true }
 margatroid_types = { path = "../types" }
+resource_id_plugin = { path = "../resource_id_plugin" }
+resource_library_plugin = { path = "../resource_library_plugin" }
 nix = { version = "0.31.2", features = ["process", "signal", "term"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

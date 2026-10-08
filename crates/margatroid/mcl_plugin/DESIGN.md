@@ -502,48 +502,6 @@ MclEffectState：等待型 Effect 事务，公开结构体
 
 公开：
 ```text
-MclHash：MCL 源码哈希，公开结构体
-    as_str(&self) -> &str
-        读取哈希：公开方法
-    impl Clone + Debug + PartialEq + Eq + PartialOrd + Ord + Hash for MclHash
-    impl fmt::Display for MclHash
-
-MclProgramKind：MCL 程序类型，公开枚举
-    Base
-    Workflow
-    Module
-
-MclSource：MCL 源文件，公开结构体
-    resource_id: ResourceId--资源 ID，私有
-    source: Arc<str>--源码，私有
-    origin: Arc<PathBuf>--来源路径，私有
-    new(resource_id: ResourceId, source: impl Into<Arc<str>>, origin: impl Into<Arc<PathBuf>>) -> Self
-        构造源：公开关联函数
-    resource_id(&self) -> &ResourceId
-        读取资源 ID：公开方法
-    source(&self) -> &str
-        读取源码：公开方法
-    origin(&self) -> &Path
-        读取来源路径：公开方法
-
-MclProgram：MCL 程序，公开结构体
-    source(&self) -> &str
-        读取源码：公开方法
-    origin(&self) -> &Path
-        读取来源路径：公开方法
-    resource_id(&self) -> &ResourceId
-        读取资源 ID：公开方法
-    kind(&self) -> MclProgramKind
-        读取程序类型：公开方法
-    source_hash(&self) -> &MclHash
-        读取源码哈希：公开方法
-    plan_hash(&self) -> &MclHash
-        读取计划哈希：公开方法
-
-MclCompileRequest：MCL 编译请求，公开结构体
-    root: MclSource--根源文件
-    dependencies: BTreeMap<ResourceId, MclSource>--依赖源文件
-
 ResourceImportReceipt：资源导入回执，公开结构体
     resource_id: ResourceId--资源 ID
     alias: String--Agent 内别名
@@ -649,20 +607,11 @@ LOAD STATE <name> INTO <block>
 
 history_messages 与 state 是两条独立通道：`history_append` 显式写入对话时间线，state 写入保存在 `state` 表中，两者互不自动同步。实时上下文不再有专用 source effect；driver 声明普通 `realtime_state` block，通过 `LOAD`、`INJECT` 和 `BIND` 自行维护。
 
-## 函数
+## Driver 边界
 
-公开：
-```text
-compile_mcl(request: MclCompileRequest) -> Result<Arc<MclProgram>, MclError>
-    编译 MCL：公开函数，当前只计算 root.source 的 SHA-256 哈希并保存 source_hash 和 plan_hash
-
-load_mcl_program_from_path(_roots: &[PathBuf], resource_id: &ResourceId, path: &Path, expected: MclProgramKind) -> Result<Arc<MclProgram>, MclError>
-    从路径加载 MCL 程序：公开函数
-    行为：
-        有界读取 UTF-8 源码，读取失败返回 SourceReadFailed，非 UTF-8 返回 SourceInvalidUtf8
-        调用 compile_mcl 构造程序
-        程序类型与 expected 不一致时返回 InvalidProgramKind
-```
+镜像的 `base.lua` 由 AgentImageLoader 保存为普通 Lua source/origin/hash 数据，交给 Lua runtime。
+本插件不提供 Base/Workflow/Module 程序包装、程序资源 ID 或 `compile_mcl` 伪编译接口。
+Lua 调用的 MCL 指令仍由本插件解析、执行和返回回执；资源导入及解析规则保持不变。
 
 # error
 

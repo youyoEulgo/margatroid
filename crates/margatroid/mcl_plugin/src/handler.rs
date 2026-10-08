@@ -1,7 +1,7 @@
 use agent_plugin::Agent;
 use core_plugin::World;
 use margatroid_types::{
-    Block, BlockInner, BlockPath, InnerType, Message, RefBlock, ResourceId, ToolCall,
+    Block, BlockInner, BlockPath, InnerType, Message, RefBlock, ResourceRef, ToolCall,
 };
 use resource_id_plugin::WorldResourceIdExt;
 
@@ -840,11 +840,22 @@ pub fn execute_direct_operation(
 ) -> Result<MclCommandValue, MclError> {
     let entity = world
         .entity_by_resource_id(&request.agent_id)
-        .map_err(|_| MclError::AgentMissing)?;
-    let dependency_sources = world
-        .get_component::<Agent>(entity)
-        .map(|agent| agent.info.image_sources.clone())
-        .unwrap_or_default();
+        .map_err(MclError::from)?;
+    let mut dependency_sources = std::collections::HashMap::new();
+    if let Some(agent) = world.get_component::<Agent>(entity) {
+        for reference in agent.resources.resources.keys() {
+            if reference.resource_type() != "prompt" {
+                continue;
+            }
+            let host = world
+                .entity_by_resource_id(reference)
+                .map_err(MclError::from)?;
+            let prompt = world
+                .get_component::<resource_library_plugin::PromptResource>(host)
+                .ok_or(MclError::TypeMismatch)?;
+            dependency_sources.insert(reference.clone(), prompt.content.clone());
+        }
+    }
     let agent = world
         .get_component_mut::<Agent>(entity)
         .ok_or(MclError::AgentMissing)?;
@@ -1044,7 +1055,7 @@ pub fn execute_direct_operation(
 
 pub fn history_record(
     world: &mut World,
-    agent_id: &ResourceId,
+    agent_id: &ResourceRef,
     kind: String,
     content: String,
     payload: String,
@@ -1052,7 +1063,7 @@ pub fn history_record(
 ) -> Result<MclDomainValue, MclError> {
     let entity = world
         .entity_by_resource_id(agent_id)
-        .map_err(|_| MclError::AgentMissing)?;
+        .map_err(MclError::from)?;
     world.emit_event(margatroid_types::AgentHistoryRecordWriteRequested {
         agent: entity,
         source: source.to_owned(),
@@ -1072,8 +1083,8 @@ fn empty_inner(kind: InnerType) -> BlockInner {
 fn binding_to_inner(
     value: &serde_json::Value,
     kind: InnerType,
-    aliases: &std::collections::HashMap<String, ResourceId>,
-    sources: &std::collections::HashMap<ResourceId, std::sync::Arc<str>>,
+    aliases: &std::collections::HashMap<String, ResourceRef>,
+    sources: &std::collections::HashMap<ResourceRef, std::sync::Arc<str>>,
 ) -> Result<BlockInner, MclError> {
     match kind {
         InnerType::Message => {
@@ -1115,7 +1126,7 @@ fn binding_to_inner(
                 if let Some(resource) = aliases.get(alias) {
                     return Ok(BlockInner::ResourceId(vec![resource.clone()]));
                 }
-                let resource = alias.parse::<ResourceId>().map_err(|_| {
+                let resource = alias.parse::<ResourceRef>().map_err(|_| {
                     MclError::ImportMissing(format!("invalid resource id `{alias}`"))
                 })?;
                 return Ok(BlockInner::ResourceId(vec![resource]));
@@ -1137,14 +1148,14 @@ fn binding_to_inner(
 
 pub fn history_append(
     world: &mut World,
-    agent_id: &ResourceId,
+    agent_id: &ResourceRef,
     message: margatroid_types::MclMessage,
     fallback_turn_id: &str,
     source: &str,
 ) -> Result<MclDomainValue, MclError> {
     let entity = world
         .entity_by_resource_id(agent_id)
-        .map_err(|_| MclError::AgentMissing)?;
+        .map_err(MclError::from)?;
     let agent = world
         .get_component_mut::<Agent>(entity)
         .ok_or(MclError::AgentMissing)?;

@@ -1,13 +1,10 @@
-use agent_plugin::{Agent, AgentToolPending};
+use agent_plugin::{Agent, AgentToolPending, ToolExecutor};
 use app_runtime_plugin::WorldEventExt;
 use core_plugin::World;
-use margatroid_types::{AgentFailure, AgentFailureKind, ResourceId};
+use margatroid_types::{AgentFailure, AgentFailureKind};
 
 use crate::handler;
 use crate::{ToolCallRequest, ToolError, ToolErrorKind, ToolRegisterRequest, ToolRegisterResponse};
-
-pub(crate) const HOOK_TOOL_ID: &str = "tool:builtin/hook:latest";
-pub(crate) const SKILL_LOADER_ID: &str = "tool:builtin/skill-loader:latest";
 
 pub(crate) fn tool_register_system(world: &mut World) {
     let requests = world
@@ -30,26 +27,10 @@ pub(crate) fn tool_register_system(world: &mut World) {
             continue;
         }
         let resource_type = request.resource_id.resource_type();
-        if matches!(resource_type, "skill" | "hook" | "shell" | "sandbox") {
-            continue;
-        }
-        if resource_type == "tool" {
-            if request.resource_id.to_string() == HOOK_TOOL_ID {
-                continue;
-            }
-            if request.resource_id.scope() == "builtin" {
-                world.send_event(ToolRegisterResponse {
-                    id: request.id,
-                    agent: request.agent,
-                    resource_id: request.resource_id,
-                    alias: request.alias,
-                    result: Err(ToolError::new(
-                        ToolErrorKind::InvalidRequest,
-                        "built-in executors cannot be registered as visible resources",
-                    )),
-                });
-                continue;
-            }
+        if matches!(
+            resource_type,
+            "skill" | "hook" | "sandbox" | "tool" | "prompt"
+        ) {
             continue;
         }
         world.send_event(ToolRegisterResponse {
@@ -102,7 +83,7 @@ pub(crate) fn tool_call_route_system(world: &mut World) {
                 effect_id: event.effect_id.clone(),
                 turn_id: event.turn_id.clone(),
                 agent: event.agent,
-                tool_id: entry.tool_id.clone(),
+                executor: entry.executor,
                 resource_id: entry.resource_id.clone(),
                 tool_call_id: event.call.id.clone(),
                 arguments: event.call.arguments.clone(),
@@ -129,28 +110,24 @@ pub(crate) fn tool_call_route_system(world: &mut World) {
                     turn_id: request.turn_id.clone(),
                     tool_call_id: request.tool_call_id.clone(),
                     resource_id: request.resource_id.clone(),
-                    tool_id: request.tool_id.clone(),
+                    executor: request.executor,
                 },
             );
-            if request.tool_id == ResourceId::parse(SKILL_LOADER_ID).unwrap() {
-                let result = handler::skill::execute_skill_call(world, &request);
-                handler::finish_tool_call(world, request, result);
-            } else if request.tool_id == ResourceId::parse(HOOK_TOOL_ID).unwrap() {
-                let result = handler::hook::execute_hook_call(world, &request);
-                handler::finish_tool_call(world, request, result);
-            } else if request.tool_id
-                == ResourceId::parse("tool:builtin/lua-runtime:latest").unwrap()
-            {
-                let result = handler::lua::prepare_lua_call(world, request.clone());
-                if let Err(error) = result {
-                    handler::finish_tool_call(world, request, Err(error));
+            match request.executor {
+                ToolExecutor::SkillLoader => {
+                    let result = handler::skill::execute_skill_call(world, &request);
+                    handler::finish_tool_call(world, request, result);
                 }
-            } else {
-                let error = ToolError::new(
-                    ToolErrorKind::ProviderMissing,
-                    "tool executor is not registered for this Agent",
-                );
-                handler::finish_tool_call(world, request, Err(error));
+                ToolExecutor::Hook => {
+                    let result = handler::hook::execute_hook_call(world, &request);
+                    handler::finish_tool_call(world, request, result);
+                }
+                ToolExecutor::LuaRuntime => {
+                    let result = handler::lua::prepare_lua_call(world, request.clone());
+                    if let Err(error) = result {
+                        handler::finish_tool_call(world, request, Err(error));
+                    }
+                }
             }
             Ok::<(), ToolError>(())
         })();

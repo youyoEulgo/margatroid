@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use core_plugin::Entity;
 use margatroid_types::{
     AgentError, AgentErrorKind, Block, BlockAssembly, BlockInner, BlockPath, InnerType, LuaVmId,
-    Message, RefBlock, RefBlockAssembly, RefMerge, ResourceId, TokenUsage, ToolDefinition,
+    Message, RefBlock, RefBlockAssembly, RefMerge, ResourceRef, TokenUsage, ToolDefinition,
 };
 use tokio::sync::oneshot;
 
@@ -69,8 +69,7 @@ pub struct AgentInfo {
     pub project_root: PathBuf,
     pub image_root: PathBuf,
     pub home_root: PathBuf,
-    pub image_dependencies: Arc<[ResourceId]>,
-    pub image_sources: HashMap<ResourceId, Arc<str>>,
+    pub image_dependencies: Arc<[ResourceRef]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,24 +175,56 @@ impl From<&TokenUsage> for TokenUsageState {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AgentResourceMap {
-    pub resources: BTreeMap<ResourceId, bool>,
-    pub aliases: HashMap<String, ResourceId>,
-    pub visible: BTreeSet<ResourceId>,
-    pub default_visible: BTreeSet<ResourceId>,
+    pub resources: BTreeMap<ResourceRef, bool>,
+    pub aliases: HashMap<String, ResourceRef>,
+    pub visible: BTreeSet<ResourceRef>,
+    pub default_visible: BTreeSet<ResourceRef>,
     pub visible_source: Option<BlockPath>,
     pub default_visible_source: Option<BlockPath>,
     pub exposed: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     pub expose_mappings: BTreeMap<String, BTreeMap<String, String>>,
-    pub sandbox_policies: BTreeMap<ResourceId, Arc<str>>,
-    pub active_sandboxes: BTreeSet<ResourceId>,
+    pub sandbox_policies: BTreeMap<ResourceRef, Arc<str>>,
+    pub active_sandboxes: BTreeSet<ResourceRef>,
     pub tool_entries: Vec<AgentResourceEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ToolExecutor {
+    LuaRuntime,
+    SkillLoader,
+    Hook,
+}
+
+impl ToolExecutor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LuaRuntime => "lua-runtime",
+            Self::SkillLoader => "skill-loader",
+            Self::Hook => "hook",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "lua-runtime" => Some(Self::LuaRuntime),
+            "skill-loader" => Some(Self::SkillLoader),
+            "hook" => Some(Self::Hook),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ToolExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentResourceEntry {
-    pub resource_id: ResourceId,
+    pub resource_id: ResourceRef,
     pub resource_name: String,
-    pub tool_id: ResourceId,
+    pub executor: ToolExecutor,
     pub description: String,
     pub parameters: serde_json::Value,
 }
@@ -226,7 +257,7 @@ impl AgentResourceMap {
             .find(|entry| entry.resource_name == name)
     }
 
-    pub fn tools_by_resource(&self, resource_id: &ResourceId) -> Vec<&AgentResourceEntry> {
+    pub fn tools_by_resource(&self, resource_id: &ResourceRef) -> Vec<&AgentResourceEntry> {
         self.tool_entries
             .iter()
             .filter(|entry| &entry.resource_id == resource_id)
@@ -244,8 +275,8 @@ pub struct AgentInferencePending {
 pub struct AgentToolPending {
     pub turn_id: String,
     pub tool_call_id: String,
-    pub resource_id: ResourceId,
-    pub tool_id: ResourceId,
+    pub resource_id: ResourceRef,
+    pub executor: ToolExecutor,
 }
 
 #[derive(Clone, Debug)]

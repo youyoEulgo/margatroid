@@ -188,7 +188,7 @@ mod tests {
     use super::*;
     use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
     use async_runtime_plugin::AsyncRuntimePlugin;
-    use margatroid_types::{AgentMessage, Message, ResourceId};
+    use margatroid_types::{AgentMessage, Message, ResourceRef};
     use std::fs;
     use tempfile::tempdir;
 
@@ -215,7 +215,7 @@ api_type = "openai"
         app.world().send_event(InferenceRequestEvent {
             id: "request".into(),
             agent,
-            agent_id: ResourceId::parse("agent:test/agent0").unwrap(),
+            agent_id: ResourceRef::parse("agent:test/agent0").unwrap(),
             messages: vec![Message::User {
                 content: "hello".into(),
             }],
@@ -239,7 +239,7 @@ api_type = "openai"
         app.world().send_event(ContextCompactionInferenceRequest {
             id: "compact".into(),
             agent,
-            agent_id: ResourceId::parse("agent:test/agent0").unwrap(),
+            agent_id: ResourceRef::parse("agent:test/agent0").unwrap(),
             messages: vec![Message::User {
                 content: "summarize".into(),
             }],

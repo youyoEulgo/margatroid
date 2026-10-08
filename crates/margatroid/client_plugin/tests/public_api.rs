@@ -12,7 +12,7 @@ use dto_plugin::{DtoPlugin, WebSocketMessageSend};
 use futures_util::{SinkExt, StreamExt};
 use log_plugin::LogPlugin;
 use margatroid_protocol::{ClientMessage, LogRecordDto, ServerMessage, WorkspaceReferenceDto};
-use margatroid_types::{ResourceId, RouteMclCommand};
+use margatroid_types::{ResourceId, ResourceRef, RouteMclCommand};
 use resource_id_plugin::ResourceIdPlugin;
 use server_plugin::{ServerHandle, ServerPlugin};
 
@@ -63,7 +63,7 @@ fn client_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-fn first_client(app: &App) -> Option<(Client, ResourceId)> {
+fn first_client(app: &App) -> Option<(Client, ResourceRef)> {
     let entity = app
         .world()
         .query_with::<Client>()
@@ -71,7 +71,11 @@ fn first_client(app: &App) -> Option<(Client, ResourceId)> {
         .into_iter()
         .next()?;
     let client = app.world().get_component::<Client>(entity)?.clone();
-    let resource_id = app.world().get_component::<ResourceId>(entity)?.clone();
+    let resource_id = app
+        .world()
+        .get_component::<ResourceId>(entity)?
+        .as_ref()
+        .clone();
     Some((client, resource_id))
 }
 

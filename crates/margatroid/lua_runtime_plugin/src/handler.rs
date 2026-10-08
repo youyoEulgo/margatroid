@@ -78,6 +78,9 @@ pub(crate) fn handle_lua_runtime_request(world: &mut World, request: LuaRuntimeR
             },
         );
         let cancel = CancellationToken::default();
+        if state.pre_cancelled.remove(&request.request_id) {
+            cancel.cancel();
+        }
         state
             .requests
             .insert(request.request_id.clone(), cancel.clone());
@@ -162,19 +165,25 @@ pub(crate) fn handle_lua_runtime_cancels(
     world: &mut World,
     requests: Vec<LuaRuntimeCancelRequest>,
 ) {
-    let Some(state) = world.get_resource::<LuaRuntimeState>() else {
+    let Some(state) = world.get_resource_mut::<LuaRuntimeState>() else {
         return;
     };
     for request in requests {
+        let mut matched = false;
         if let Some(token) = state.requests.get(&request.request_id) {
             token.cancel();
+            matched = true;
         }
         for (request_id, owner_id) in &state.owners {
             if owner_id == &request.request_id {
                 if let Some(token) = state.requests.get(request_id) {
                     token.cancel();
                 }
+                matched = true;
             }
+        }
+        if !matched {
+            state.pre_cancelled.insert(request.request_id.clone());
         }
     }
 }
@@ -188,7 +197,9 @@ pub(crate) fn handle_lua_runtime_finished(
         return;
     };
     for event in finished {
-        state.requests.remove(&event.request_id);
+        if state.requests.remove(&event.request_id).is_some() {
+            state.pre_cancelled.remove(&event.request_id);
+        }
         let owner = state.owners.remove(&event.request_id);
         if let Some(vm_id) = event.vm_id {
             state.sessions.remove(&vm_id);
@@ -465,8 +476,108 @@ fn from_ml_value(value: MlValue) -> Result<LuaValue, LuaRuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{LuaEnvironmentContext, LuaStandardLibraries, LuaVmOwner};
+    use crate::{LuaRuntimeReply, LuaRuntimeResult};
 
     const BASE_DRIVER: &str = include_str!("../tests/fixtures/base_driver.lua");
+
+    #[test]
+    fn a_cancel_that_outruns_its_request_still_stops_it() {
+        let mut world = World::new();
+        world.insert_resource(LuaRuntimeState::default());
+        handle_lua_runtime_cancels(
+            &mut world,
+            vec![LuaRuntimeCancelRequest {
+                request_id: "early".into(),
+                vm_id: None,
+            }],
+        );
+        assert!(
+            world
+                .get_resource::<LuaRuntimeState>()
+                .unwrap()
+                .pre_cancelled
+                .contains("early"),
+            "an unmatched cancel must be remembered"
+        );
+    }
+
+    #[test]
+    fn a_matched_cancel_is_not_remembered() {
+        let mut world = World::new();
+        let mut state = LuaRuntimeState::default();
+        state
+            .requests
+            .insert("running".into(), CancellationToken::default());
+        world.insert_resource(state);
+        handle_lua_runtime_cancels(
+            &mut world,
+            vec![LuaRuntimeCancelRequest {
+                request_id: "running".into(),
+                vm_id: None,
+            }],
+        );
+        let state = world.get_resource::<LuaRuntimeState>().unwrap();
+        assert!(state.requests["running"].is_cancelled());
+        assert!(!state.pre_cancelled.contains("running"));
+    }
+
+    #[test]
+    fn a_request_that_registers_after_its_cancel_starts_cancelled() {
+        let mut world = World::new();
+        world.insert_resource(LuaRuntimeState::default());
+        world.insert_resource(LuaRuntimeConfig::default());
+        handle_lua_runtime_cancels(
+            &mut world,
+            vec![LuaRuntimeCancelRequest {
+                request_id: "early".into(),
+                vm_id: None,
+            }],
+        );
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let reply = LuaRuntimeReply::new(sender);
+        handle_lua_runtime_request(
+            &mut world,
+            LuaRuntimeRequest {
+                request_id: "early".into(),
+                owner: LuaVmOwner {
+                    owner_id: "owner".into(),
+                },
+                program: LuaProgram {
+                    source: "return 1".into(),
+                    origin: "test".into(),
+                    entry: None,
+                    libraries: LuaStandardLibraries::Minimal,
+                },
+                context: LuaEnvironmentContext {
+                    request_id: "early".into(),
+                    owner: LuaVmOwner {
+                        owner_id: "owner".into(),
+                    },
+                    values: Default::default(),
+                },
+                providers: Vec::new(),
+                scheduler: LuaScheduler::LongRunning,
+                deadline: None,
+                reply,
+            },
+        );
+        let result = receiver
+            .blocking_recv()
+            .expect("the cancelled request still answers");
+        assert!(
+            matches!(result, LuaRuntimeResult::Cancelled),
+            "a request cancelled before registration must not run: {result:?}"
+        );
+        assert!(
+            !world
+                .get_resource::<LuaRuntimeState>()
+                .unwrap()
+                .pre_cancelled
+                .contains("early"),
+            "registration must consume the tombstone"
+        );
+    }
 
     const BASE_GLOBALS: [&str; 19] = [
         "_G",

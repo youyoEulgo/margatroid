@@ -7,14 +7,14 @@ use serde::{Deserialize, Serialize};
 use crate::ResourceIdError;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ResourceId {
+pub struct ResourceRef {
     resource_type: String,
     scope: String,
     name: String,
     tag: String,
 }
 
-impl ResourceId {
+impl ResourceRef {
     pub fn parse(value: impl AsRef<str>) -> Result<Self, ResourceIdError> {
         value.as_ref().parse()
     }
@@ -58,7 +58,7 @@ impl ResourceId {
     }
 }
 
-impl FromStr for ResourceId {
+impl FromStr for ResourceRef {
     type Err = ResourceIdError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -83,7 +83,7 @@ impl FromStr for ResourceId {
     }
 }
 
-impl fmt::Display for ResourceId {
+impl fmt::Display for ResourceRef {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
@@ -93,7 +93,7 @@ impl fmt::Display for ResourceId {
     }
 }
 
-impl Serialize for ResourceId {
+impl Serialize for ResourceRef {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -102,7 +102,7 @@ impl Serialize for ResourceId {
     }
 }
 
-impl<'de> Deserialize<'de> for ResourceId {
+impl<'de> Deserialize<'de> for ResourceRef {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -110,6 +110,30 @@ impl<'de> Deserialize<'de> for ResourceId {
         String::deserialize(deserializer)?
             .parse()
             .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceId(pub ResourceRef);
+
+impl ResourceId {
+    pub fn as_ref(&self) -> &ResourceRef {
+        &self.0
+    }
+    pub fn into_inner(self) -> ResourceRef {
+        self.0
+    }
+}
+
+impl From<ResourceRef> for ResourceId {
+    fn from(value: ResourceRef) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<ResourceRef> for ResourceId {
+    fn as_ref(&self) -> &ResourceRef {
+        &self.0
     }
 }
 

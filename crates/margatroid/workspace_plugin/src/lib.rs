@@ -13,7 +13,7 @@ use agent_plugin::AgentPluginInstalled;
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use core_plugin::{App, Component, Entity, Plugin, World};
 use lua_runtime_plugin::LuaRuntimePluginInstalled;
-use margatroid_types::{ResourceId, StartWorkspace, WorkspaceDefinition};
+use margatroid_types::{ResourceRef, StartWorkspace, WorkspaceDefinition};
 use mcl_plugin::MclPluginInstalled;
 use memory_plugin::MemoryPluginInstalled;
 use resource_id_plugin::ResourceIdPluginInstalled;
@@ -25,7 +25,7 @@ pub use events::*;
 use system::{
     begin_workspace_command_system, collect_agent_image_system,
     collect_agent_initialization_system, collect_mcl_command_response_system,
-    route_agent_turn_abort_system, route_mcl_command_system,
+    collect_workspace_stop_system, route_agent_turn_abort_system, route_mcl_command_system,
 };
 pub use types::{WorkspaceAgentState, WorkspaceRegistry};
 
@@ -69,6 +69,226 @@ impl Workspace {
         self.agents
             .iter()
             .map(|(name, entity)| (name.as_str(), *entity))
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use agent_plugin::*;
+    use core_plugin::World;
+    use lua_runtime_plugin::{LuaRuntimeTaskFinished, LuaVmId, LuaVmOwner, LuaVmState};
+
+    fn agent(world: &mut World, workspace: Entity, creating: bool) -> Entity {
+        let entity = world.spawn();
+        let (sender, _) = tokio::sync::oneshot::channel();
+        let model = AgentModelInfo {
+            provider: "test".into(),
+            model: "test".into(),
+            context_window_tokens: 100,
+        };
+        world.insert_component(
+            entity,
+            Agent {
+                info: AgentInfo {
+                    workspace_id: workspace,
+                    image_entity: workspace,
+                    model: model.clone(),
+                    project_root: Default::default(),
+                    image_root: Default::default(),
+                    home_root: Default::default(),
+                    image_dependencies: Default::default(),
+                },
+                creation: AgentCreationState {
+                    request_id: "creation".into(),
+                    reply: AgentCreateReply::new(sender),
+                    initialization: AgentInitializationState {
+                        complete: !creating,
+                        failed: None,
+                    },
+                },
+                mcl: Default::default(),
+                resources: Default::default(),
+                memory: AgentMemoryHandle::new(Arc::new(
+                    memory_plugin::AgentMemory::open(":memory:").unwrap(),
+                )),
+                inference: AgentInferenceState {
+                    model,
+                    pending: Default::default(),
+                },
+                tools: Default::default(),
+                lua: AgentLuaState {
+                    request_id: creating.then(|| "creation".into()),
+                    vm_id: (!creating).then_some(LuaVmId(99)),
+                },
+                lifecycle: if creating {
+                    AgentLifecycleState::Creating
+                } else {
+                    AgentLifecycleState::Running
+                },
+                turn: Default::default(),
+                token_usage: Default::default(),
+                last_error: None,
+            },
+        );
+        entity
+    }
+
+    fn finish(world: &mut World, entity: Entity, creating: bool) {
+        handle_lua_vm_finished(
+            world,
+            LuaRuntimeTaskFinished {
+                request_id: "creation".into(),
+                vm_id: (!creating).then_some(LuaVmId(99)),
+                owner: LuaVmOwner {
+                    owner_id: "test".into(),
+                },
+                state: LuaVmState::Cancelled,
+                error: None,
+            },
+        );
+        assert!(
+            world.is_alive(entity),
+            "VM completion must not bypass owner release"
+        );
+    }
+
+    #[test]
+    fn stop_retains_vm_and_resource_until_finished_including_unlisted_creation() {
+        for creating in [false, true] {
+            let mut app = App::new();
+            app.add_plugin(RuntimePlugin::default())
+                .add_plugin(resource_id_plugin::ResourceIdPlugin);
+            let world = app.world_mut();
+            world.insert_resource(WorkspaceRegistry::default());
+            let workspace = world.spawn();
+            let entity = agent(world, workspace, creating);
+            let resource = resource_library_plugin::install_resource(
+                world,
+                ResourceRef::parse("prompt:system/stop-test").unwrap(),
+                entity,
+                resource_library_plugin::ResourceDefinition::Prompt(
+                    resource_library_plugin::PromptResource {
+                        role: "system".into(),
+                        content: Arc::from("test"),
+                    },
+                ),
+            )
+            .unwrap();
+            handler::stop_workspace_entity(world, workspace).unwrap();
+            system::collect_workspace_stop_system(world);
+            assert!(world.is_alive(entity));
+            assert!(world.is_alive(resource));
+            assert!(world.is_alive(workspace));
+            world.advance_event_frame();
+            assert_eq!(world.event_reader::<AgentControl>().len(), 1);
+            world.get_component_mut::<Agent>(entity).unwrap().lifecycle =
+                AgentLifecycleState::Stopping;
+            finish(world, entity, creating);
+            system::collect_workspace_stop_system(world);
+            assert!(!world.is_alive(entity));
+            assert!(!world.is_alive(resource));
+            assert!(!world.is_alive(workspace));
+        }
+    }
+
+    #[test]
+    fn stop_success_is_emitted_only_after_vm_completion() {
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default());
+        let world = app.world_mut();
+        world.insert_resource(WorkspaceRegistry::default());
+        let workspace = world.spawn();
+        let entity = agent(world, workspace, false);
+        world.send_event(StopWorkspace {
+            id: "stop".into(),
+            workspace,
+        });
+        world.advance_event_frame();
+        system::begin_workspace_command_system(world);
+        world.advance_event_frame();
+        assert!(world.event_reader::<StopWorkspaceResult>().is_empty());
+        system::collect_workspace_stop_system(world);
+        world.advance_event_frame();
+        assert!(world.event_reader::<StopWorkspaceResult>().is_empty());
+        finish(world, entity, false);
+        system::collect_workspace_stop_system(world);
+        world.advance_event_frame();
+        let results = world.event_reader::<StopWorkspaceResult>();
+        assert_eq!(results.len(), 1);
+        assert!(results.into_iter().next().unwrap().result.is_ok());
+    }
+
+    #[test]
+    fn finished_vm_waits_for_inflight_tool_and_inference() {
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default());
+        let world = app.world_mut();
+        world.insert_resource(WorkspaceRegistry::default());
+        let workspace = world.spawn();
+        let entity = agent(world, workspace, false);
+        handler::stop_workspace_entity(world, workspace).unwrap();
+        finish(world, entity, false);
+        let tool_key = (entity, "turn".to_owned(), "call".to_owned());
+        let inference_key = (entity, "infer".to_owned());
+        let agent = world.get_component_mut::<Agent>(entity).unwrap();
+        agent.tools.pending.insert(
+            tool_key.clone(),
+            AgentToolPending {
+                turn_id: "turn".into(),
+                tool_call_id: "call".into(),
+                resource_id: ResourceRef::parse("tool:local/test").unwrap(),
+                executor: agent_plugin::ToolExecutor::SkillLoader,
+            },
+        );
+        agent.inference.pending.insert(
+            inference_key.clone(),
+            AgentInferencePending {
+                id: "infer".into(),
+                tool_schema: vec![],
+            },
+        );
+        system::collect_workspace_stop_system(world);
+        assert!(world.is_alive(entity));
+        world
+            .get_component_mut::<Agent>(entity)
+            .unwrap()
+            .tools
+            .pending
+            .remove(&tool_key);
+        system::collect_workspace_stop_system(world);
+        assert!(world.is_alive(entity));
+        world
+            .get_component_mut::<Agent>(entity)
+            .unwrap()
+            .inference
+            .pending
+            .remove(&inference_key);
+        system::collect_workspace_stop_system(world);
+        assert!(!world.is_alive(entity));
+        assert!(!world.is_alive(workspace));
+    }
+
+    #[test]
+    fn queued_creation_prevents_workspace_reclamation() {
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default());
+        let world = app.world_mut();
+        world.insert_resource(WorkspaceRegistry::default());
+        let workspace = world.spawn();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        world
+            .get_resource_mut::<WorkspaceRegistry>()
+            .unwrap()
+            .pending_agents
+            .insert("queued".into(), (workspace, "agent".into(), receiver));
+        handler::stop_workspace_entity(world, workspace).unwrap();
+        system::collect_workspace_stop_system(world);
+        assert!(world.is_alive(workspace));
+        drop(sender);
+        system::collect_agent_image_system(world);
+        system::collect_workspace_stop_system(world);
+        assert!(!world.is_alive(workspace));
     }
 }
 
@@ -136,14 +356,18 @@ impl Plugin for WorkspacePlugin {
             .add_system(&self.schedule, route_mcl_command_system)
             .add_system(&self.schedule, collect_mcl_command_response_system)
             .add_system(&self.schedule, collect_agent_image_system)
-            .add_system(&self.schedule, collect_agent_initialization_system);
+            .add_system(&self.schedule, collect_agent_initialization_system)
+            .add_system(&self.schedule, collect_workspace_stop_system);
     }
 }
 
 pub trait WorldWorkspaceExt {
     fn start_workspace(&self, id: impl Into<String>, definition: WorkspaceDefinition);
     fn stop_workspace(&self, id: impl Into<String>, workspace: Entity);
-    fn workspace_by_id(&self, id: &ResourceId) -> Option<Entity>;
+    fn workspace_by_id(
+        &self,
+        id: &ResourceRef,
+    ) -> Result<Entity, resource_id_plugin::ResourceIdLookupError>;
     fn workspaces(&self) -> Vec<Entity>;
     fn workspace_agent(&self, workspace: Entity, name: &str) -> Option<Entity>;
     fn workspace_manager(&self, workspace: Entity) -> Option<Entity>;
@@ -165,8 +389,11 @@ impl WorldWorkspaceExt for World {
         });
     }
 
-    fn workspace_by_id(&self, id: &ResourceId) -> Option<Entity> {
-        self.entity_by_resource_id(id).ok()
+    fn workspace_by_id(
+        &self,
+        id: &ResourceRef,
+    ) -> Result<Entity, resource_id_plugin::ResourceIdLookupError> {
+        self.entity_by_resource_id(id)
     }
 
     fn workspaces(&self) -> Vec<Entity> {

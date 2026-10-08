@@ -73,6 +73,11 @@ daemon
         -> InferencePlugin读取streaming_member_messages
 ```
 
+空板块：
+    某个板块在本 crate 中没有内容时，对应的源文件保持为空并仍然保留模块声明
+    空文件不是遗漏，而是"该板块在此 crate 中确实没有定义"的表示
+    保留文件与模块声明是为了让六个板块的位置固定，新增内容时不必再改结构
+
 # system
 
 ```text

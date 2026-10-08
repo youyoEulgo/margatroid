@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use core_plugin::{Entity, Event};
 use serde::{Deserialize, Serialize};
 
-pub use resource_id_plugin::{ResourceId, ResourceIdError};
+pub use resource_id_plugin::{ResourceId, ResourceIdError, ResourceRef};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResourceNameError {
@@ -77,52 +77,6 @@ impl fmt::Display for ResourceName {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResourceRefError {
-    EmptyProvider,
-    InvalidProvider,
-}
-
-impl fmt::Display for ResourceRefError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyProvider => formatter.write_str("resource provider cannot be empty"),
-            Self::InvalidProvider => formatter.write_str("resource provider is invalid"),
-        }
-    }
-}
-
-impl std::error::Error for ResourceRefError {}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ResourceRef {
-    provider: String,
-    name: ResourceName,
-}
-
-impl ResourceRef {
-    pub fn new(provider: impl Into<String>, name: ResourceName) -> Result<Self, ResourceRefError> {
-        let provider = provider.into();
-        if provider.is_empty() {
-            return Err(ResourceRefError::EmptyProvider);
-        }
-        if !provider.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-        }) {
-            return Err(ResourceRefError::InvalidProvider);
-        }
-        Ok(Self { provider, name })
-    }
-
-    pub fn provider(&self) -> &str {
-        &self.provider
-    }
-
-    pub fn name(&self) -> &ResourceName {
-        &self.name
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentImageReferenceError {
     InvalidName,
     InvalidTag,
@@ -187,16 +141,16 @@ impl fmt::Display for AgentImageReference {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceAgentDefinition {
     pub name: String,
-    pub id: ResourceId,
-    pub image: ResourceId,
-    pub resources: Vec<ResourceId>,
-    pub disable_resources: Vec<ResourceId>,
+    pub id: ResourceRef,
+    pub image: ResourceRef,
+    pub resources: Vec<ResourceRef>,
+    pub disable_resources: Vec<ResourceRef>,
     pub memory_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceDefinition {
-    pub id: ResourceId,
+    pub id: ResourceRef,
     pub name: String,
     pub project_root: PathBuf,
     pub manager: String,
@@ -205,7 +159,7 @@ pub struct WorkspaceDefinition {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceReference {
-    pub id: ResourceId,
+    pub id: ResourceRef,
     pub name: String,
     pub project_root: PathBuf,
 }
@@ -222,7 +176,7 @@ impl Event for StartWorkspace {}
 pub struct RouteAgentTurnAbort {
     pub id: String,
     pub workspace: WorkspaceReference,
-    pub agent: Option<ResourceId>,
+    pub agent: Option<ResourceRef>,
 }
 
 impl Event for RouteAgentTurnAbort {}
@@ -231,8 +185,8 @@ impl Event for RouteAgentTurnAbort {}
 pub struct RouteAgentWorkflowAttach {
     pub id: String,
     pub workspace: WorkspaceReference,
-    pub agent: Option<ResourceId>,
-    pub resource_id: ResourceId,
+    pub agent: Option<ResourceRef>,
+    pub resource_id: ResourceRef,
 }
 
 impl Event for RouteAgentWorkflowAttach {}
@@ -241,7 +195,7 @@ impl Event for RouteAgentWorkflowAttach {}
 pub struct RouteAgentWorkflowDetach {
     pub id: String,
     pub workspace: WorkspaceReference,
-    pub agent: Option<ResourceId>,
+    pub agent: Option<ResourceRef>,
     pub instance_id: String,
 }
 
@@ -252,7 +206,7 @@ pub struct RouteMclCommand {
     pub id: String,
     pub source: String,
     pub workspace: WorkspaceReference,
-    pub agent: Option<ResourceId>,
+    pub agent: Option<ResourceRef>,
     pub command: String,
     pub binding: Option<serde_json::Value>,
     pub reply: std::sync::mpsc::Sender<Result<serde_json::Value, String>>,
@@ -289,7 +243,7 @@ pub enum Message {
         tool_calls: Vec<ToolCall>,
     },
     Tool {
-        resource_id: ResourceId,
+        resource_id: ResourceRef,
         tool_call_id: String,
         content: String,
         #[serde(default)]
@@ -333,7 +287,7 @@ impl Event for AgentConversationObserved {}
 pub struct InferenceRequestEvent {
     pub id: String,
     pub agent: Entity,
-    pub agent_id: ResourceId,
+    pub agent_id: ResourceRef,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
 }
@@ -343,7 +297,7 @@ impl Event for InferenceRequestEvent {}
 pub struct CapturedInferenceRequest {
     pub id: String,
     pub agent: Entity,
-    pub agent_id: ResourceId,
+    pub agent_id: ResourceRef,
     pub messages: Vec<Message>,
 }
 
@@ -425,8 +379,6 @@ pub struct AgentHistoryMessageWriteRequested {
 
 impl Event for AgentHistoryMessageWriteRequested {}
 
-/// Appends one MCL command to the same timeline as the conversation, exactly as
-/// the issuer supplied it: `kind` (for example `mcl`), `content` and `payload`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentHistoryRecordWriteRequested {
     pub agent: Entity,
@@ -437,9 +389,6 @@ pub struct AgentHistoryRecordWriteRequested {
 }
 
 impl Event for AgentHistoryRecordWriteRequested {}
-
-// The following data types are deliberately free of plugin-specific behavior.
-// Domain plugins store and mutate them through the narrow methods below.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LuaVmId(pub u64);
@@ -465,7 +414,7 @@ impl MclMessage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockInner {
     Message(Vec<MclMessage>),
-    ResourceId(Vec<ResourceId>),
+    ResourceId(Vec<ResourceRef>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -656,7 +605,7 @@ mod tests {
 
     #[test]
     fn resource_ids_default_to_latest_and_serialize_as_strings() {
-        let id = ResourceId::parse("agent:demo/coder").unwrap();
+        let id = ResourceRef::parse("agent:demo/coder").unwrap();
 
         assert_eq!(id.resource_type(), "agent");
         assert_eq!(id.scope(), "demo");
@@ -668,18 +617,18 @@ mod tests {
             r#""agent:demo/coder:latest""#
         );
         assert_eq!(
-            serde_json::from_str::<ResourceId>(r#""skill:local/review""#).unwrap(),
-            ResourceId::parse("skill:local/review:latest").unwrap()
+            serde_json::from_str::<ResourceRef>(r#""skill:local/review""#).unwrap(),
+            ResourceRef::parse("skill:local/review:latest").unwrap()
         );
     }
 
     #[test]
     fn resource_ids_reject_ambiguous_or_invalid_parts() {
-        assert!(ResourceId::parse("agent:demo/coder:clone0").is_ok());
-        assert!(ResourceId::parse("Agent:demo/coder").is_err());
-        assert!(ResourceId::parse("agent:demo/coder:tag:extra").is_err());
-        assert!(ResourceId::parse("agent:../coder").is_err());
-        assert!(ResourceId::parse("agent:demo/coder/extra").is_err());
+        assert!(ResourceRef::parse("agent:demo/coder:clone0").is_ok());
+        assert!(ResourceRef::parse("Agent:demo/coder").is_err());
+        assert!(ResourceRef::parse("agent:demo/coder:tag:extra").is_err());
+        assert!(ResourceRef::parse("agent:../coder").is_err());
+        assert!(ResourceRef::parse("agent:demo/coder/extra").is_err());
     }
 
     #[test]
@@ -703,23 +652,6 @@ mod tests {
         assert_eq!(
             ResourceName::new("local/bad\\name"),
             Err(ResourceNameError::InvalidCharacter)
-        );
-    }
-
-    #[test]
-    fn resource_references_validate_provider_ids() {
-        let name = ResourceName::new("local/review").unwrap();
-        let resource = ResourceRef::new("workflow", name.clone()).unwrap();
-
-        assert_eq!(resource.provider(), "workflow");
-        assert_eq!(resource.name(), &name);
-        assert_eq!(
-            ResourceRef::new("", name.clone()),
-            Err(ResourceRefError::EmptyProvider)
-        );
-        assert_eq!(
-            ResourceRef::new("Invalid Provider", name),
-            Err(ResourceRefError::InvalidProvider)
         );
     }
 

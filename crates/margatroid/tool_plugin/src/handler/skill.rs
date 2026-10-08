@@ -2,19 +2,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    candidate_resource_entry, ToolCallRequest, ToolError, ToolErrorKind, ToolRegisterRequest,
-    ToolRegisterResponse, ToolTemplate,
+    ToolCallRequest, ToolError, ToolErrorKind, ToolRegisterRequest, ToolRegisterResponse,
+    ToolTemplate,
 };
 use agent_plugin::Agent;
 use app_runtime_plugin::WorldEventExt;
 use core_plugin::World;
-use margatroid_types::ResourceId;
+use margatroid_types::ResourceRef;
 use serde::Deserialize;
 use serde_json::json;
 
 const PROVIDER_ID: &str = "skill";
 const SKILL_FILE: &str = "SKILL.md";
-const SKILL_LOADER_ID: &str = "tool:builtin/skill-loader:latest";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,26 +42,24 @@ pub(crate) fn skill_register_system(world: &mut World) {
                     "agent tool environment is missing",
                 )
             })
-            .and_then(|agent| {
+            .and_then(|_| {
                 validate_skill_resource(&request.resource_id)?;
-                let path = find_skill_file(
-                    &agent.info.project_root,
-                    &agent.info.image_root,
-                    &request.resource_id,
-                )?;
+                let path = find_skill_file(super::library_root(world)?, &request.resource_id)?;
                 let document = read_skill_document(&path)?;
-                ToolTemplate::new(
+                let template = ToolTemplate::new(
                     request.resource_id.to_string(),
                     document.metadata.description,
                     json!({"type":"object"}),
-                )
+                )?;
+                Ok((template, path))
             });
-        let result = result.and_then(|template| {
-            candidate_resource_entry(
+        let result = result.and_then(|(template, path)| {
+            crate::candidate_resource_entry_with_content(
                 request.resource_id.clone(),
                 request.alias.clone(),
-                ResourceId::parse(SKILL_LOADER_ID).expect("built-in Skill loader ID is valid"),
+                agent_plugin::ToolExecutor::SkillLoader,
                 template,
+                Some(crate::ResourceContent::Skill { content_path: path }),
             )
         });
         world.send_event(ToolRegisterResponse {
@@ -79,18 +76,14 @@ pub(crate) fn execute_skill_call(
     world: &World,
     request: &ToolCallRequest,
 ) -> Result<String, ToolError> {
-    let agent = world.get_component::<Agent>(request.agent).ok_or_else(|| {
+    world.get_component::<Agent>(request.agent).ok_or_else(|| {
         ToolError::new(
             ToolErrorKind::ToolEnvironmentMissing,
             "agent tool environment is missing",
         )
     })?;
     validate_skill_resource(&request.resource_id)?;
-    let path = find_skill_file(
-        &agent.info.project_root,
-        &agent.info.image_root,
-        &request.resource_id,
-    )?;
+    let path = super::imported_tool_script_path(world, &request.resource_id)?;
     serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&request.arguments)
         .map_err(|_| {
             ToolError::new(
@@ -142,15 +135,11 @@ fn read_skill_document(path: &Path) -> Result<SkillDocument, ToolError> {
     Ok(SkillDocument { metadata, body })
 }
 
-fn find_skill_file(
-    project_root: &Path,
-    image_root: &Path,
-    resource: &ResourceId,
+pub(super) fn find_skill_file(
+    library_root: &Path,
+    resource: &ResourceRef,
 ) -> Result<PathBuf, ToolError> {
-    let candidates = [
-        project_root.join(".margatroid").join("skills"),
-        image_root.join("skills"),
-    ];
+    let candidates = [library_root.join("skills")];
     for root in candidates {
         let package = root
             .join(resource.scope())
@@ -187,7 +176,7 @@ fn find_skill_file(
     ))
 }
 
-fn validate_skill_resource(resource: &ResourceId) -> Result<(), ToolError> {
+fn validate_skill_resource(resource: &ResourceRef) -> Result<(), ToolError> {
     if resource.resource_type() != PROVIDER_ID || resource.tag() != "latest" {
         return Err(ToolError::new(
             ToolErrorKind::ResourceResolutionFailed,

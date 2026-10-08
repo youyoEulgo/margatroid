@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use margatroid_types::ResourceId;
+use margatroid_types::ResourceRef;
 use serde::Deserialize;
 use tool_plugin::{run_lua_tool, LuaExecutionLimits, LuaToolRunRequest, ToolError, ToolErrorKind};
 
@@ -93,8 +93,8 @@ async fn main() -> ExitCode {
         }
     };
     let (Ok(agent_id), Ok(resource_id)) = (
-        ResourceId::parse(&request.agent_id),
-        ResourceId::parse(&request.resource_id),
+        ResourceRef::parse(&request.agent_id),
+        ResourceRef::parse(&request.resource_id),
     ) else {
         eprintln!(
             "{}",

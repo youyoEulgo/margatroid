@@ -29,7 +29,6 @@ fn attach_agent(app: &mut App, memory: AgentMemory) -> core_plugin::Entity {
                 image_root: Default::default(),
                 home_root: Default::default(),
                 image_dependencies: Default::default(),
-                image_sources: Default::default(),
             },
             creation: agent_plugin::AgentCreationState {
                 request_id: "test".to_owned(),

@@ -31,10 +31,10 @@ impl std::error::Error for ResourceIdError {}
 pub enum ResourceIdLookupError {
     PluginMissing,
     Missing {
-        id: crate::ResourceId,
+        id: crate::ResourceRef,
     },
     Duplicate {
-        id: crate::ResourceId,
+        id: crate::ResourceRef,
         entities: Vec<Entity>,
     },
 }
@@ -52,3 +52,20 @@ impl fmt::Display for ResourceIdLookupError {
 }
 
 impl std::error::Error for ResourceIdLookupError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResourceIdAttachError {
+    MissingEntity { entity: Entity },
+    Lookup(ResourceIdLookupError),
+}
+
+impl fmt::Display for ResourceIdAttachError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingEntity { entity } => write!(formatter, "entity {entity:?} is missing"),
+            Self::Lookup(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ResourceIdAttachError {}

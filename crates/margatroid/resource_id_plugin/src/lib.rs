@@ -6,8 +6,8 @@ mod types;
 
 use core_plugin::{Entity, Plugin, Resource, World};
 
-pub use error::{ResourceIdError, ResourceIdLookupError};
-pub use types::ResourceId;
+pub use error::{ResourceIdAttachError, ResourceIdError, ResourceIdLookupError};
+pub use types::{ResourceId, ResourceRef};
 
 pub struct ResourceIdPlugin;
 
@@ -23,12 +23,50 @@ impl Plugin for ResourceIdPlugin {
     }
 }
 
+pub fn attach_resource_id(
+    world: &mut World,
+    entity: Entity,
+    id: ResourceRef,
+) -> Result<(), ResourceIdAttachError> {
+    if !world.is_alive(entity) {
+        return Err(ResourceIdAttachError::MissingEntity { entity });
+    }
+    match world.entity_by_resource_id(&id) {
+        Err(ResourceIdLookupError::Missing { .. }) => {}
+        Ok(owner) if owner == entity => return Ok(()),
+        Ok(owner) => {
+            return Err(ResourceIdAttachError::Lookup(
+                ResourceIdLookupError::Duplicate {
+                    id,
+                    entities: vec![owner, entity],
+                },
+            ))
+        }
+        Err(error) => return Err(ResourceIdAttachError::Lookup(error)),
+    }
+    world.insert_component(entity, ResourceId(id));
+    Ok(())
+}
+
 pub trait WorldResourceIdExt {
-    fn entity_by_resource_id(&self, id: &ResourceId) -> Result<Entity, ResourceIdLookupError>;
+    fn attach_resource_id(
+        &mut self,
+        entity: Entity,
+        id: ResourceRef,
+    ) -> Result<(), ResourceIdAttachError>;
+    fn entity_by_resource_id(&self, id: &ResourceRef) -> Result<Entity, ResourceIdLookupError>;
 }
 
 impl WorldResourceIdExt for World {
-    fn entity_by_resource_id(&self, id: &ResourceId) -> Result<Entity, ResourceIdLookupError> {
+    fn attach_resource_id(
+        &mut self,
+        entity: Entity,
+        id: ResourceRef,
+    ) -> Result<(), ResourceIdAttachError> {
+        attach_resource_id(self, entity, id)
+    }
+
+    fn entity_by_resource_id(&self, id: &ResourceRef) -> Result<Entity, ResourceIdLookupError> {
         if !self.contains_resource::<ResourceIdPluginInstalled>() {
             return Err(ResourceIdLookupError::PluginMissing);
         }
@@ -38,7 +76,7 @@ impl WorldResourceIdExt for World {
             .into_iter()
             .filter(|entity| {
                 self.get_component::<ResourceId>(*entity)
-                    .is_some_and(|value| value == id)
+                    .is_some_and(|value| value.as_ref() == id)
             })
             .collect::<Vec<_>>();
         entities.sort_by_key(|entity| entity.index());

@@ -14,6 +14,7 @@ margatroid_types = { path = "../types" }
 lua_runtime_plugin = { path = "../lua_runtime_plugin" }
 mcl_plugin = { path = "../mcl_plugin" }
 resource_id_plugin = { path = "../resource_id_plugin" }
+resource_library_plugin = { path = "../resource_library_plugin" }
 memory_plugin = { path = "../memory_plugin" }
 serde_json = { workspace = true }
 tool_plugin = { path = "../tool_plugin" }

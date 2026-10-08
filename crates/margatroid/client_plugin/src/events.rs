@@ -1,12 +1,12 @@
 use core_plugin::Event;
-use resource_id_plugin::ResourceId;
+use resource_id_plugin::ResourceRef;
 use server_plugin::WebSocketConnectionId;
 
 use crate::{Client, ClientError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredClient {
-    pub resource_id: ResourceId,
+    pub resource_id: ResourceRef,
     pub client: Client,
 }
 

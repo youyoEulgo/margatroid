@@ -7,6 +7,7 @@ pub enum WorkspaceErrorKind {
     InvalidProjectRoot,
     InvalidAgentImagesRoot,
     DuplicateWorkspace,
+    DuplicateResource,
     WorkspaceNotAlive,
     WorkspaceNotReady,
     WorkspaceMismatch,
@@ -48,3 +49,20 @@ impl fmt::Display for WorkspaceError {
 }
 
 impl std::error::Error for WorkspaceError {}
+
+impl From<resource_id_plugin::ResourceIdLookupError> for WorkspaceError {
+    fn from(error: resource_id_plugin::ResourceIdLookupError) -> Self {
+        let kind = match &error {
+            resource_id_plugin::ResourceIdLookupError::Missing { .. } => {
+                WorkspaceErrorKind::WorkspaceNotAlive
+            }
+            resource_id_plugin::ResourceIdLookupError::Duplicate { .. } => {
+                WorkspaceErrorKind::DuplicateResource
+            }
+            resource_id_plugin::ResourceIdLookupError::PluginMissing => {
+                WorkspaceErrorKind::InvalidRequest
+            }
+        };
+        Self::new(kind, error.to_string())
+    }
+}

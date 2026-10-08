@@ -66,7 +66,7 @@ mod tests {
     use app_runtime_plugin::RuntimePlugin;
     use core_plugin::{App, Entity, World};
     use margatroid_types::{
-        AgentHistoryMessageWriteRequested, Message, ResourceId, TokenUsage, ToolDefinition,
+        AgentHistoryMessageWriteRequested, Message, ResourceRef, TokenUsage, ToolDefinition,
     };
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -99,7 +99,6 @@ mod tests {
                     image_root: Default::default(),
                     home_root: Default::default(),
                     image_dependencies: Default::default(),
-                    image_sources: Default::default(),
                 },
                 creation: AgentCreationState {
                     request_id: "test".to_owned(),
@@ -141,7 +140,7 @@ mod tests {
                 tool_calls: Vec::new(),
             },
             Message::Tool {
-                resource_id: ResourceId::parse("tool:local/test:latest").unwrap(),
+                resource_id: ResourceRef::parse("tool:local/test:latest").unwrap(),
                 tool_call_id: "call-1".into(),
                 content: "tool output".into(),
                 failed: false,

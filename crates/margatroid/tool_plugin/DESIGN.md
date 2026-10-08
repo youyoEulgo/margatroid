@@ -105,18 +105,13 @@ crate公开：
 tool_register_system(world: &mut World)
     注册路由 System
     处理事件：ToolRegisterRequest
-    行为：id 为空 -> InvalidRequest；skill/hook/tool 类型交给对应 handler；tool:builtin/* 除 hook 外拒绝；未知类型 -> ProviderMissing
+    行为：id 为空 -> InvalidRequest；skill/hook/sandbox/tool/prompt 类型交给对应 handler；未知类型 -> ProviderMissing
 
 tool_call_route_system(world: &mut World)
     调用路由 System
     处理事件：ToolCallEvent
-    行为：校验事件和参数，解析 ToolCallRequest，写入 Agent.tools.pending，按 tool_id 分派 skill/hook/lua handler
+    行为：校验事件和参数，解析 ToolCallRequest，写入 Agent.tools.pending，按 executor 分派 skill/hook/lua handler
     说明：命令统一经 Lua 工具的 margatroid().shell 执行，shell 不是资源也不是工具
-
-tool_message_cleanup_system(world: &mut World)
-    消息清理 System
-    处理事件：AgentMessage
-    行为：对 Message::Tool 按 (agent, turn_id, tool_call_id) 清理 Agent.tools.pending
 
 cancel_tool_turn_system(world: &mut World)
     取消工具轮次 System
@@ -134,19 +129,46 @@ skill.rs skill_register_system / execute_skill_call
 hook.rs  hook_register_system / execute_hook_call
 lua.rs   lua_tool_register_system / prepare_lua_call / execute_prepared_lua_tool / lua_task_result_system
          / run_lua_tool / spawn_tool_runner / runner_failure / tool_runner_path
+prompt.rs
+         prompt_register_system / register_prompt_resource / read_prompt_metadata
+         / read_prompt_content / find_prompt_package
 sandbox.rs
          sandbox_register_system / register_sandbox_resource / find_sandbox_package
          / active_sandbox_policies / sandbox_backend / ConfinedSpawn / CallTempDir / ProcessGroup
 
+prompt_register_system(world)
+    注册提示资源：处理 resource_id 类型为 prompt 的 ToolRegisterRequest
+    行为：定位提示包 → 读取 prompt.toml 取 role → 读取 content.md 取正文
+          → 校验 role 为 system、user 或 assistant，正文非空
+          → 返回 ResourceMapEntry，content 为 ResourceContent::Prompt 且 executor 与 template 为空
+
+find_prompt_package(library_root, resource_id)
+    定位提示包：私有函数，按 <library_root>/prompts/<scope>/<name>/<tag> 定位
+    行为：要求类型为 prompt 且 tag 为 latest；目录不存在则报资源未找到
+    说明：作用域是普通作用域，与其它资源一致，不再是 system 或 user 这类角色名
+        角色由 prompt.toml 的 role 字段描述，不编码进资源 ID
+
+资源库根：
+    handler::library_root(world) 从 ResourceLibraryRoot 取全局根目录并返回
+    所有 find_* 都只在该根目录下的对应集合中查找
+    不存在项目内 .margatroid 或镜像目录的回退路径，因此同名资源在全进程只有一份
+
+执行时读取导入时确定的路径：
+    Lua 工具的 metadata 与 schema 取自资源实体上的 ToolResource
+    脚本正文按 ToolResource.script_path 读取
+    技能正文按 SkillResource.content_path 读取
+    因此一次已经开始的调用持有自己的快照，重新导入不会改变它的内容
+
 sandbox_register_system(world)
     注册沙箱资源：处理 resource_id 类型为 sandbox 的 ToolRegisterRequest
     行为：定位策略包 → 读取 policy.json → 校验非空、不超过 MAX_POLICY_BYTES、是合法 JSON
-          → 返回 ResourceMapEntry，content 为 ResourceContent::Sandbox 且 tool_id 与 template 为空
+          → 返回 ResourceMapEntry，content 为 ResourceContent::Sandbox 且 executor 与 template 为空
     边界：失败只记日志并回错误响应，不影响其他资源
 
-find_sandbox_package(project_root, image_root, resource_id)
-    定位策略包：私有函数，按 <project_root>/.margatroid/sandboxes 再到 <image_root>/sandboxes 顺序查找
-    行为：要求类型为 sandbox；命中含 policy.json 的目录即返回，两处都没有则报资源未找到
+find_sandbox_package(library_root, resource_id)
+    定位策略包：私有函数，只在全局资源库的 sandboxes 集合下查找
+    行为：要求类型为 sandbox；命中含 policy.json 的目录即返回，否则报资源未找到
+    说明：不存在项目内或镜像内的回退路径，资源全局唯一
 
 active_sandbox_policies(resources: &AgentResourceMap) -> Result<Vec<Arc<str>>, ToolError>
     解析本次调用生效的策略：crate 内公开
@@ -174,6 +196,11 @@ ConfinedSpawn：一次受限调用的全部约定，crate 内公开结构体
           工作目录必须是项目根，因为可移植策略写的是 "."，否则会解析到 daemon 自己的目录；
           环境是继承而非清空：把 HOME、locale、代理都留给工具，只拦下 KEY/PASSWORD/SECRET/TOKEN
           这类凭据形名字，否则普通 CLI 无法正常工作
+          曾出现过的整表清空只保留 PATH，结果是 $HOME 展开为空，普通 CLI 因此失常
+          凭据形名字按子串、忽略大小写匹配，与参照实现的判定方式一致
+          管道模式下另外固定 NO_COLOR=1、TERM=dumb、PAGER=cat、GIT_PAGER=cat：
+              工具这里读到的是管道而不是终端，分页与颜色不应进入被捕获的输出
+              pty 路径由自己设置终端类型，不走这一组
 
 CallTempDir：一次调用的临时目录，crate 内公开结构体
     path: PathBuf--<项目根>/.margatroid/tmp/<序号>，私有
@@ -204,9 +231,12 @@ spawn_tool_runner 的沙箱分支：
 runner_failure 补充：stderr 里可能混入 landstrip 的拒绝事件，所以按"最后一条 kind 属于
     ToolErrorKind 的 JSON 行"取值，trap 事件不会把错误种类带偏
 
-HOOK_TOOL_ID（常量）：hook 执行器的内建资源ID，crate 内公开，固定为 tool:builtin/hook:latest
-SKILL_LOADER_ID（常量）：Skill 加载器的内建资源ID，crate 内公开，固定为 tool:builtin/skill-loader:latest
-    used_by：system 的路由分支、skill.rs 与 hook.rs 的注册路径按这两个ID识别内建执行器
+ToolExecutor（枚举）：工具执行器，由 agent_plugin 定义
+    变体：LuaRuntime、SkillLoader、Hook
+    说明：执行器是进程内的分派标签，不是资源，也没有资源 ID
+        早期实现用 tool:builtin/* 这类伪造资源 ID 区分执行器，现已删除：
+        伪 ID 会让人误以为它们是可导入的资源，而它们既无实体也无可解析内容
+    分派：tool_call_route_system 按 executor 直接分派，不再做字符串比较
 
 LuaError：Lua 执行限额错误，公开结构体--只用于构造期的参数校验
     kind: LuaErrorKind--稳定有限分类
@@ -243,6 +273,8 @@ install_lua_environment(lua, handle) -> Result<Table, ToolError>
             命令为空时该函数报错，而不是返回一个空结果
     约束：不再有 fs / process / http / json / log 这些表——文件、网络、派生一律走标准库，由沙箱约束；
           命令执行没有走 io.popen，因为管道没有终端、没有可回收的进程组、也没有执行限额
+    terminal 字段的用途：沙箱可能不授予 pty 设备，此时命令照样执行，只是看不到终端；
+          依赖终端的工具据此自行说明，而不是在无终端时悄悄做错
 
 run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError>
     执行 Lua 工具：公开异步函数，插件进程内与 runner 进程共用同一段逻辑
@@ -252,7 +284,23 @@ run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError>
     约束：request 携带 metadata、schema、script、temp_dir、arguments、agent_id、turn_id、
           resource_id、project_root、limits 与 sandbox_policies；
 
-spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolError>
+工具结果的取值约定：
+    工具可以返回 {"ok": bool, "content": string} 作为显式结果信封
+        content 是模型读到的内容，模型侧不需要再解析
+        ok 表示这次调用是否失败，这是单纯返回字符串无法表达的
+        ok 与 content 必须同时存在，只含其中一个的 JSON 对象不算信封
+        content 为空字符串仍是有效结果，不是"没有结果"
+    不满足信封形状的返回值保持旧语义：
+        返回值即成功，只有报错才算调用失败
+    由 Lua 的 error 触发的运行时错误是工具在说"停止"，映射为 Aborted
+        运行时限额触发的错误不是工具在要求停止，映射为 ExecutionFailed
+
+失败是否结束当前轮：
+    只有两种失败会结束当前轮并保留信息供人查看，因为重试无法改变它们：
+        工具调用 error 声明自己无法继续
+        执行工具的 runner 本身失败——无法启动、流中断或超时
+    其余失败都交回模型重试：命令非零退出、脚本拒绝参数、工具报告 ok=false
+
     派生 runner 执行工具：私有异步函数
     行为：把请求序列化成 JSON 写 runner 的 stdin，读 stdout 作为工具结果，stderr 用于还原错误
           runner 路径取环境变量 MARGATROID_TOOL_RUNNER，缺省取当前可执行文件同目录下的 tool_runner
@@ -267,6 +315,10 @@ runner_failure(stderr: &str) -> ToolError
 tool_runner_path() -> Result<PathBuf, ToolError>
     定位 runner：私有函数，先看环境变量，再看当前可执行文件同目录
 
+集成测试定位 runner 的相对路径：
+    测试与插件二进制都不带 runner，需要指向工作区构建产物
+    crates/margatroid/tool_plugin 到工作区根是三级，因此 runner 位于 ../../../target/debug/tool_runner
+
 tool_runner（src/bin/tool_runner.rs，bin 目标）：独立进程执行 Lua 工具，与上面的 spawn 路径成对
     请求：stdin 传 JSON（也接受 argv[1] 指定文件），字段与 LuaToolRunRequest 对齐，
           limits 里的时间以毫秒表示（max_execution_time_ms / max_host_call_time_ms）
@@ -275,6 +327,14 @@ tool_runner（src/bin/tool_runner.rs，bin 目标）：独立进程执行 Lua �
     stderr：非零退出时输出 {"kind": "...", "message": "..."}，供 spawn_tool_runner 还原
 pty.rs   run_in_pty（分配 PTY 或退回管道执行命令；回收进程组、施加超时与输出限额）
         说明：终端不可用时退回管道而不是失败，两路输出都会合并成一路交给调用方
+
+终端执行的四处细节：
+    PTY 在最后一个 slave 关闭时以 EIO 表示流结束，这是该循环的正常结束方式，不作为错误
+    终端把 stdout 与 stderr 合成一路，管道分支因此也把两者合并后交给调用方；
+        stderr 先进自己的缓冲区，避免两条管道互相阻塞
+    终端必须有具体的类型名，所以 pty 分支设置真实 TERM，而管道分支保留 TERM=dumb
+    子进程自建会话并把 slave 设为控制终端：
+        否则它会共用 runner 的会话，一个从未真正获得的终端会错误地报告自身状态
 ```
 
 # events
@@ -319,22 +379,31 @@ ToolTemplate：工具模板，公开结构体
     parameters: serde_json::Value--JSON Schema
     new(name, description, parameters) -> Result<Self, ToolError>
 
-ResourceContent：资源内容，公开枚举
-    Prompt { role: String, content: Arc<str> }
+ResourceContent：资源内容，公开枚举--导入时携带、供后续阶段使用的资源载荷
+    Tool { script_path: PathBuf }--Lua 工具脚本路径
+    Skill { content_path: PathBuf }--技能正文路径
+    Hook--钩子无附加载荷
+    Prompt { role: String, content: Arc<str> }--提示角色与正文
+    Sandbox { policy: Arc<str> }--沙箱策略 JSON 文本
+    说明：路径在导入时确定并写入资源实体，执行时直接读取，
+        因此重新解析资源库不会影响一次已经开始的调用
 
 ResourceMapEntry：资源映射条目，公开结构体
-    resource_id: ResourceId
+    resource_id: ResourceRef
     resource_name: String
     alias: Option<String>
-    tool_id: Option<ResourceId>
+    executor: Option<ToolExecutor>--可执行资源的执行器；prompt 与 sandbox 为空
     template: Option<ToolTemplate>
     content: Option<ResourceContent>
+    说明：executor 为空且 template 为空、content 为 Prompt 或 Sandbox 时，
+        该条目是资源而非可调用工具，不写入 Agent 的工具表
 
 ToolCallRequest：工具调用请求，公开内部类型--不再作为 ECS 事件
+    effect_id: String--所属效果的 ID
     turn_id: String--轮次 ID
     agent: Entity--目标 Agent
-    tool_id: ResourceId--隐藏执行器 ID
-    resource_id: ResourceId--资源 ID
+    executor: ToolExecutor--执行器标签
+    resource_id: ResourceRef--资源 ID
     tool_call_id: String--工具调用 ID
     arguments: String--参数 JSON 文本
 ```

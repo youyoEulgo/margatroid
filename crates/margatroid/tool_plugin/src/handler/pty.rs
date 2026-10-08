@@ -99,17 +99,12 @@ async fn collect(streams: Streams, limit: usize) -> (Vec<u8>, bool) {
                     Ok(0) => break,
                     Ok(read) => extend_bounded(&mut output, &buffer[..read], limit, &mut truncated),
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    // The PTY reports end-of-stream as EIO once the last slave
-                    // closes, which is the normal way this loop finishes.
                     Err(error) if error.raw_os_error() == Some(nix::libc::EIO) => break,
                     Err(_) => break,
                 }
             }
         }
         Streams::Pipes { stdout, stderr } => {
-            // A terminal merges the two streams, so the pipe path merges them
-            // too: a caller reads one stream either way. stderr is drained into
-            // its own buffer so neither pipe can block the other.
             let mut errors = Vec::new();
             let mut errors_truncated = false;
             tokio::join!(
@@ -153,12 +148,7 @@ fn spawn_command(
                 .stdout(stdout)
                 .stderr(stderr)
                 .kill_on_drop(true);
-            // A terminal needs a real type; the pipe path leaves TERM=dumb in
-            // place so captured output stays plain.
             process.env("TERM", "xterm-256color");
-            // The child takes its own session and makes the slave its controlling
-            // terminal. Without this the command shares the runner's session, and
-            // a terminal it never properly acquired misreports its own state.
             unsafe {
                 process.pre_exec(move || {
                     if nix::unistd::setsid().is_err() {
@@ -302,8 +292,6 @@ mod tests {
 
     #[tokio::test]
     async fn both_streams_reach_the_caller() {
-        // A terminal merges the streams; the pipe fallback has to merge them too
-        // or a command's diagnostics would vanish when no terminal is available.
         let directory = scratch("streams");
         let outcome = run(
             &directory,

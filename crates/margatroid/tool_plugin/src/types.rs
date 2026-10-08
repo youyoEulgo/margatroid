@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use agent_plugin::ToolExecutor;
 use core_plugin::Entity;
-use margatroid_types::ResourceId;
+use margatroid_types::ResourceRef;
 
 use crate::ToolError;
 
@@ -14,6 +15,9 @@ pub struct ToolTemplate {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResourceContent {
+    Tool { script_path: std::path::PathBuf },
+    Skill { content_path: std::path::PathBuf },
+    Hook,
     Prompt { role: String, content: Arc<str> },
     Sandbox { policy: Arc<str> },
 }
@@ -36,10 +40,10 @@ impl ToolTemplate {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResourceMapEntry {
-    pub resource_id: ResourceId,
+    pub resource_id: ResourceRef,
     pub resource_name: String,
     pub alias: Option<String>,
-    pub tool_id: Option<ResourceId>,
+    pub executor: Option<ToolExecutor>,
     pub template: Option<ToolTemplate>,
     pub content: Option<ResourceContent>,
 }
@@ -49,8 +53,8 @@ pub struct ToolCallRequest {
     pub effect_id: String,
     pub turn_id: String,
     pub agent: Entity,
-    pub tool_id: ResourceId,
-    pub resource_id: ResourceId,
+    pub executor: ToolExecutor,
+    pub resource_id: ResourceRef,
     pub tool_call_id: String,
     pub arguments: String,
 }
