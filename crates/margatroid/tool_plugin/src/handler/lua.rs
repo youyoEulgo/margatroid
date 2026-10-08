@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::handler::pty::SHELL_SCRIPT_FILE;
 use crate::{
     candidate_resource_entry, ResourceMapEntry, ToolCallRequest, ToolError, ToolErrorKind,
     ToolRegisterRequest, ToolRegisterResponse, ToolTemplate,
@@ -160,10 +159,6 @@ struct LuaCallContext {
     project_root: Arc<PathBuf>,
     temp_dir: Arc<PathBuf>,
     sandbox_policies: Vec<Arc<str>>,
-    /// Where `margatroid().shell` finds its interpreter script. The host stages
-    /// the file because the runner may sit behind a policy that forbids writing
-    /// the scratch directory; the runner only reads it.
-    shell_script: Option<Arc<PathBuf>>,
 }
 
 struct LuaExecutionHandle {
@@ -392,26 +387,7 @@ fn prepare_lua_tool_call(
     )?;
     let package = read_lua_tool_package(&package_root, &request.resource_id, &limits)?;
     let sandbox_policies = crate::handler::sandbox::active_sandbox_policies(&agent.resources)?;
-    let shell = agent.resources.the_shell_script().map_err(|message| {
-        ToolError::new(
-            ToolErrorKind::InvalidDefinition,
-            format!("the shell available to this tool is ambiguous: {message}"),
-        )
-    })?;
     let temp_dir = crate::handler::sandbox::CallTempDir::create(&agent.info.project_root)?;
-    let shell_script = match shell {
-        Some(script) => {
-            let path = temp_dir.path().join(SHELL_SCRIPT_FILE);
-            std::fs::write(&path, script.as_bytes()).map_err(|error| {
-                ToolError::new(
-                    ToolErrorKind::ExecutionFailed,
-                    format!("Shell script could not be staged: {error}"),
-                )
-            })?;
-            Some(Arc::new(path))
-        }
-        None => None,
-    };
     let context = LuaCallContext {
         agent_id,
         turn_id: request.turn_id.clone(),
@@ -419,7 +395,6 @@ fn prepare_lua_tool_call(
         project_root: Arc::new(agent.info.project_root.clone()),
         temp_dir: Arc::new(temp_dir.path().to_path_buf()),
         sandbox_policies,
-        shell_script,
     };
 
     Ok((
@@ -462,7 +437,6 @@ pub struct LuaToolRunRequest {
     pub project_root: PathBuf,
     pub limits: LuaExecutionLimits,
     pub sandbox_policies: Vec<Arc<str>>,
-    pub shell_script: Option<Arc<PathBuf>>,
 }
 
 pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError> {
@@ -503,7 +477,6 @@ pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolErro
             project_root: Arc::new(request.project_root.clone()),
             temp_dir: Arc::new(request.temp_dir.clone()),
             sandbox_policies: request.sandbox_policies.clone(),
-            shell_script: request.shell_script.clone(),
         },
         limits: limits.clone(),
         package: LuaToolPackage {
@@ -584,10 +557,6 @@ fn runner_payload(request: &LuaToolRunRequest) -> serde_json::Value {
         "turn_id": request.turn_id,
         "resource_id": request.resource_id.to_string(),
         "project_root": request.project_root.to_string_lossy(),
-        "shell_script": request
-            .shell_script
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned()),
         "limits": {
             "max_definition_bytes": request.limits.max_definition_bytes,
             "max_script_bytes": request.limits.max_script_bytes,
@@ -746,7 +715,6 @@ async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, Tool
         project_root: prepared.handle.context.project_root.as_ref().clone(),
         limits: prepared.handle.limits.clone(),
         sandbox_policies: prepared.handle.context.sandbox_policies.clone(),
-        shell_script: prepared.handle.context.shell_script.clone(),
     };
     spawn_tool_runner(&request).await
 }
@@ -973,20 +941,13 @@ fn install_lua_environment<'lua>(
 /// whichever tool asked for it. The function is absent when the agent imports no
 /// shell, and calling it there says so rather than failing obscurely.
 fn install_shell(lua: &Lua, entry: &Table, handle: &LuaExecutionHandle) -> Result<(), ToolError> {
-    let script = handle.context.shell_script.clone();
     let project_root = Arc::clone(&handle.context.project_root);
     let max_output_bytes = handle.limits.max_output_bytes;
     let max_execution_time = handle.limits.max_execution_time;
     let shell = lua
         .create_async_function(move |lua, (command, options): (String, Option<Table>)| {
-            let script = script.clone();
             let project_root = Arc::clone(&project_root);
             async move {
-                let script = script.ok_or_else(|| {
-                    mlua::Error::runtime(
-                        "this agent imports no shell; add a shell resource to run commands",
-                    )
-                })?;
                 if command.trim().is_empty() {
                     return Err(mlua::Error::runtime("shell command is empty"));
                 }
@@ -1009,7 +970,6 @@ fn install_shell(lua: &Lua, entry: &Table, handle: &LuaExecutionHandle) -> Resul
                 let outcome = crate::handler::pty::run_in_pty(
                     crate::handler::pty::PtyRequest {
                         program: Path::new("bash"),
-                        script: &script,
                         command: &command,
                         project_root: &project_root,
                         max_output_bytes: output_limit,
@@ -1195,7 +1155,6 @@ mod runner_tests {
             project_root: PathBuf::from("/tmp"),
             limits,
             sandbox_policies: Vec::new(),
-            shell_script: None,
         }
     }
 
@@ -1268,17 +1227,8 @@ mod runner_tests {
 
     #[test]
     fn the_runner_request_carries_every_field_a_tool_needs() {
-        let mut request = request(limits(1 << 20, 5_000));
-        request.shell_script = Some(Arc::new(PathBuf::from("/scratch/main.sh")));
+        let request = request(limits(1 << 20, 5_000));
         let payload = runner_payload(&request);
-        // The runner reads this to stage the interpreter a tool runs commands
-        // through; leaving it out of the wire shape is invisible until a tool
-        // tries to use a shell and is told there is none.
-        assert_eq!(
-            payload["shell_script"].as_str(),
-            Some("/scratch/main.sh"),
-            "the runner must be told where the shell script is"
-        );
         for key in [
             "metadata",
             "schema",
@@ -1293,14 +1243,6 @@ mod runner_tests {
         ] {
             assert!(!payload[key].is_null(), "the request must carry {key}");
         }
-    }
-
-    #[test]
-    fn a_request_without_a_shell_says_so_on_the_wire() {
-        let request = request(limits(1 << 20, 5_000));
-        let payload = runner_payload(&request);
-        // Absent, not empty: the runner distinguishes "no shell" from a path.
-        assert!(payload["shell_script"].is_null());
     }
 
     #[test]
@@ -1381,9 +1323,6 @@ mod runner_tests {
         let directory =
             std::env::temp_dir().join(format!("margatroid-lua-shell-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
-        let script = directory.join(SHELL_SCRIPT_FILE);
-        std::fs::write(&script, "exec bash -lc \"$1\"\n").unwrap();
-
         let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
         let handle = LuaExecutionHandle {
             context: LuaCallContext {
@@ -1393,7 +1332,6 @@ mod runner_tests {
                 project_root: Arc::new(directory.clone()),
                 temp_dir: Arc::new(directory.clone()),
                 sandbox_policies: Vec::new(),
-                shell_script: Some(Arc::new(script.clone())),
             },
             limits: limits(1 << 20, 10_000),
             package: LuaToolPackage {
@@ -1429,7 +1367,7 @@ mod runner_tests {
     }
 
     #[tokio::test]
-    async fn an_agent_without_a_shell_says_so() {
+    async fn a_tool_always_has_a_shell() {
         let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
         let handle = LuaExecutionHandle {
             context: LuaCallContext {
@@ -1439,7 +1377,6 @@ mod runner_tests {
                 project_root: Arc::new(PathBuf::from("/tmp")),
                 temp_dir: Arc::new(PathBuf::from("/tmp")),
                 sandbox_policies: Vec::new(),
-                shell_script: None,
             },
             limits: limits(1 << 20, 10_000),
             package: LuaToolPackage {
@@ -1456,9 +1393,12 @@ mod runner_tests {
         let shell = entry.get::<Function>("shell").unwrap();
 
         let error = shell
-            .call_async::<Table>(("echo hello", Value::Nil))
+            .call_async::<Table>(("", Value::Nil))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("imports no shell"), "{error}");
+        assert!(
+            error.to_string().contains("shell command is empty"),
+            "{error}"
+        );
     }
 }

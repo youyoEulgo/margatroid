@@ -67,6 +67,7 @@ Client：客户端图书馆组件，公开 Component--Client Entity 必须挂载
     name(&self) -> &str
         读取名称：公开方法
     impl Component for Client
+    impl LibraryComponent for Client
 
 ClientPlugin：客户端插件，公开结构体--把注册成功的客户端实体化，并在连接断开时清除
     schedule: String--注册与断开System所在的Runtime schedule，私有

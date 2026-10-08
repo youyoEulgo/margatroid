@@ -50,6 +50,7 @@ impl Client {
 }
 
 impl Component for Client {}
+impl library_component_plugin::LibraryComponent for Client {}
 
 #[derive(Clone, Debug)]
 pub struct ClientPlugin {

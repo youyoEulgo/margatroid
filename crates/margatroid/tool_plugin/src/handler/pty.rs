@@ -19,16 +19,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::handler::sandbox::{ConfinedSpawn, ProcessGroup};
 use crate::{ToolError, ToolErrorKind};
 
-/// The file name a staged interpreter script takes inside the scratch directory.
-/// The shell tool and the Lua shell share it because both hand the file to the
-/// same runner below.
-pub(crate) const SHELL_SCRIPT_FILE: &str = "main.sh";
-
-/// A command and the script that decides how to run it.
+/// A program and the command it should run.
 #[derive(Clone, Copy)]
 pub(crate) struct PtyRequest<'a> {
     pub(crate) program: &'a Path,
-    pub(crate) script: &'a Path,
     pub(crate) command: &'a str,
     pub(crate) project_root: &'a Path,
     pub(crate) max_output_bytes: usize,
@@ -153,7 +147,7 @@ fn spawn_command(
         Some((master, stdin, stdout, stderr, slave_fd)) => {
             let mut process = spawn.command(request.program, request.project_root)?;
             process
-                .arg(request.script)
+                .arg("-c")
                 .arg(request.command)
                 .stdin(stdin)
                 .stdout(stdout)
@@ -182,7 +176,7 @@ fn spawn_command(
         None => {
             let mut process = spawn.command(request.program, request.project_root)?;
             process
-                .arg(request.script)
+                .arg("-c")
                 .arg(request.command)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -261,13 +255,10 @@ mod tests {
         bytes: usize,
         ms: u64,
     ) -> Result<PtyOutcome, ToolError> {
-        let script = directory.join(SHELL_SCRIPT_FILE);
-        std::fs::write(&script, "exec bash -c \"$1\"\n").expect("script");
         let spawn = ConfinedSpawn::new(&[]).expect("unconfined spawn");
         run_in_pty(
             PtyRequest {
                 program: Path::new("bash"),
-                script: &script,
                 command,
                 project_root: directory,
                 max_output_bytes: bytes,

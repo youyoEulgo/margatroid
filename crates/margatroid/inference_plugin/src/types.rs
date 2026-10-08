@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use core_plugin::{Component, Entity, Resource};
+use core_plugin::{Entity, Resource};
 
 use crate::error::{InferenceError, InferenceErrorKind};
 use margatroid_types::{Message, TokenUsage, ToolCall, ToolDefinition};
@@ -112,39 +112,6 @@ impl InferenceParameters {
         Ok(())
     }
 }
-
-#[derive(Clone)]
-pub struct AgentInferenceSnapshot {
-    pub(crate) model: ModelId,
-    pub(crate) context_window_tokens: u64,
-    pub(crate) parameters: InferenceParameters,
-    pub(crate) workspace: Entity,
-    pub(crate) source_image: Entity,
-}
-
-impl AgentInferenceSnapshot {
-    pub fn model(&self) -> &ModelId {
-        &self.model
-    }
-
-    pub fn context_window_tokens(&self) -> u64 {
-        self.context_window_tokens
-    }
-
-    pub fn parameters(&self) -> &InferenceParameters {
-        &self.parameters
-    }
-
-    pub fn workspace(&self) -> Entity {
-        self.workspace
-    }
-
-    pub fn source_image(&self) -> Entity {
-        self.source_image
-    }
-}
-
-impl Component for AgentInferenceSnapshot {}
 
 #[derive(Clone)]
 pub struct ConfiguredModelRoute {

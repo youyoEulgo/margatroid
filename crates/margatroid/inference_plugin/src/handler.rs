@@ -3,7 +3,7 @@ use std::error::Error as StdError;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use agent_image_loader_plugin::{AgentImage, AgentImageModelConfig};
+use agent_image_loader_plugin::AgentImage;
 use agent_plugin::Agent;
 use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::WorldAsyncExt;
@@ -23,11 +23,11 @@ use crate::events::{
     InferenceRoute, InferenceTaskOutput, InferenceTaskResult, PreparedInference, ReloadModelRoutes,
 };
 use crate::types::{
-    AgentInferenceSnapshot, ConfiguredModelRoute, ErasedProviderAdapterFactory,
-    InferenceParameters, ModelId, ModelRouteDocument, ProviderHttpRequest,
-    ProviderInferenceResponse, ProviderInput, ProviderRouteInput, ProviderStreamDelta, StopReason,
-    WorkspaceModelRoutes, WorkspaceModelRoutesRegistry, MAX_CONFIG_BYTES, MAX_ERROR_BODY_BYTES,
-    MAX_MESSAGES_BYTES, MAX_MESSAGE_BYTES, MAX_TOOL_COUNT, MAX_TOOL_DESCRIPTION_BYTES,
+    ConfiguredModelRoute, ErasedProviderAdapterFactory, InferenceParameters, ModelId,
+    ModelRouteDocument, ProviderHttpRequest, ProviderInferenceResponse, ProviderInput,
+    ProviderRouteInput, ProviderStreamDelta, StopReason, WorkspaceModelRoutes,
+    WorkspaceModelRoutesRegistry, MAX_CONFIG_BYTES, MAX_ERROR_BODY_BYTES, MAX_MESSAGES_BYTES,
+    MAX_MESSAGE_BYTES, MAX_TOOL_COUNT, MAX_TOOL_DESCRIPTION_BYTES,
 };
 use crate::{GlobalModelRoutes, InferenceError, InferenceErrorKind, InferenceHttpClient};
 
@@ -55,13 +55,6 @@ pub trait WorldInferenceExt {
         workspace: Entity,
         project_root: &Path,
     ) -> Result<usize, InferenceError>;
-
-    fn build_agent_inference_snapshot(
-        &self,
-        workspace: Entity,
-        source_image: Entity,
-        config: &AgentImageModelConfig,
-    ) -> Result<AgentInferenceSnapshot, InferenceError>;
 }
 
 impl WorldInferenceExt for World {
@@ -109,54 +102,8 @@ impl WorldInferenceExt for World {
             .insert(workspace, WorkspaceModelRoutes { routes });
         Ok(count)
     }
-
-    fn build_agent_inference_snapshot(
-        &self,
-        workspace: Entity,
-        source_image: Entity,
-        config: &AgentImageModelConfig,
-    ) -> Result<AgentInferenceSnapshot, InferenceError> {
-        require_workspace(self, workspace)?;
-        if !self.is_alive(source_image) {
-            return Err(InferenceError::new(
-                InferenceErrorKind::InvalidCommand,
-                "source AgentImage entity is not alive",
-            ));
-        }
-        let model = ModelId::new(config.model())?;
-        let source = config.parameters();
-        let parameters = InferenceParameters::new(
-            source.temperature(),
-            source.max_output_tokens(),
-            source.top_p(),
-            source.stop().to_vec(),
-        );
-        parameters.validate()?;
-        if !model_is_routable(self, workspace, &model) {
-            return Err(InferenceError::new(
-                InferenceErrorKind::ModelRouteNotFound,
-                format!("model route `{model}` was not found"),
-            ));
-        }
-        let context_window_tokens = self
-            .get_resource::<WorkspaceModelRoutesRegistry>()
-            .and_then(|registry| registry.get(workspace))
-            .and_then(|routes| routes.get(&model))
-            .or_else(|| {
-                self.get_resource::<GlobalModelRoutes>()
-                    .and_then(|routes| routes.get(&model))
-            })
-            .map(|route| route.context_window_tokens())
-            .unwrap_or(1_000_000);
-        Ok(AgentInferenceSnapshot {
-            model,
-            context_window_tokens,
-            parameters,
-            workspace,
-            source_image,
-        })
-    }
 }
+
 fn parse_context_window(value: Option<&str>) -> Result<u64, InferenceError> {
     let value = value.unwrap_or("1m").trim().to_ascii_lowercase();
     let (number, multiplier) = if let Some(number) = value.strip_suffix('k') {
@@ -301,19 +248,6 @@ fn require_workspace(world: &World, workspace: Entity) -> Result<(), InferenceEr
     }
 }
 
-fn model_is_routable(world: &World, workspace: Entity, model: &ModelId) -> bool {
-    world
-        .get_resource::<WorkspaceModelRoutesRegistry>()
-        .and_then(|registry| registry.get(workspace))
-        .and_then(|routes| routes.get(model))
-        .or_else(|| {
-            world
-                .get_resource::<GlobalModelRoutes>()
-                .and_then(|routes| routes.get(model))
-        })
-        .is_some()
-}
-
 pub(crate) fn handle_reload_model_routes(
     world: &mut World,
     request: crate::events::ReloadModelRoutes,
@@ -412,6 +346,9 @@ fn prepare_inference(
         image.model().parameters().top_p(),
         image.model().parameters().stop().to_vec(),
     );
+    parameters
+        .validate()
+        .map_err(|error| (route.clone(), error))?;
     let workspace = agent.info.workspace_id;
     let model_route = world
         .get_resource::<WorkspaceModelRoutesRegistry>()

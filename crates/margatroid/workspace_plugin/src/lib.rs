@@ -73,6 +73,7 @@ impl Workspace {
 }
 
 impl Component for Workspace {}
+impl library_component_plugin::LibraryComponent for Workspace {}
 
 pub struct WorkspacePlugin {
     agent_images_root: PathBuf,

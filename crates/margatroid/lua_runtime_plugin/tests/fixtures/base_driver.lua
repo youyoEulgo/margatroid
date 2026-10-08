@@ -12,7 +12,6 @@ mcl_command("IMPORT tool:local/write-file:latest AS write_file")
 mcl_command("IMPORT tool:local/edit:latest AS edit")
 mcl_command("IMPORT tool:local/grep:latest AS grep")
 mcl_command("IMPORT tool:local/glob:latest AS glob")
-mcl_command("IMPORT shell:local/bash:latest AS bash")
 mcl_command("IMPORT tool:local/list-directory:latest AS list_directory")
 
 mcl_command([[

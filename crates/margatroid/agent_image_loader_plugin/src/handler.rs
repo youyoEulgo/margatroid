@@ -326,7 +326,6 @@ async fn validate_image_layout(root: &Path) -> Result<DirectorySignature, AgentI
             (Some("skills"), DirectoryEntryKind::Directory) => {}
             (Some("hooks"), DirectoryEntryKind::Directory) => {}
             (Some("tools"), DirectoryEntryKind::Directory) => {}
-            (Some("shells"), DirectoryEntryKind::Directory) => {}
             (Some("sandboxes"), DirectoryEntryKind::Directory) => {}
             _ => {
                 return Err(AgentImageLoadError::new(

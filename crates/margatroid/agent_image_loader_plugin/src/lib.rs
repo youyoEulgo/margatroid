@@ -52,6 +52,7 @@ impl AgentImage {
 }
 
 impl MecsComponent for AgentImage {}
+impl library_component_plugin::LibraryComponent for AgentImage {}
 
 pub struct AgentImageLoaderPlugin {
     root: PathBuf,
@@ -345,7 +346,6 @@ id = "tool:local/list-directory:latest"
         fs::create_dir_all(image.join("skills")).unwrap();
         fs::create_dir_all(image.join("hooks")).unwrap();
         fs::create_dir_all(image.join("tools")).unwrap();
-        fs::create_dir_all(image.join("shells")).unwrap();
         fs::write(
             image.join("agent.toml"),
             r#"schema_version = 1

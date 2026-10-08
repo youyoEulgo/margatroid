@@ -1,35 +1,9 @@
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use core_plugin::{Component, Entity};
+use core_plugin::Entity;
 use margatroid_types::ResourceId;
 
 use crate::ToolError;
-
-#[derive(Clone)]
-pub struct AgentToolEnvironment {
-    project_root: Arc<PathBuf>,
-    image_root: Arc<PathBuf>,
-}
-
-impl AgentToolEnvironment {
-    pub fn new(project_root: impl Into<PathBuf>, image_root: impl Into<PathBuf>) -> Self {
-        Self {
-            project_root: Arc::new(project_root.into()),
-            image_root: Arc::new(image_root.into()),
-        }
-    }
-
-    pub fn project_root(&self) -> &Path {
-        self.project_root.as_path()
-    }
-
-    pub fn image_root(&self) -> &Path {
-        self.image_root.as_path()
-    }
-}
-
-impl Component for AgentToolEnvironment {}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolTemplate {
@@ -40,19 +14,8 @@ pub struct ToolTemplate {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResourceContent {
-    Prompt {
-        role: String,
-        content: Arc<str>,
-    },
-    Sandbox {
-        policy: Arc<str>,
-    },
-    /// The interpreter script a shell resource runs commands through. Keeping it
-    /// with the resource is what lets a Lua tool reach the same shell the shell
-    /// tool uses, instead of every caller reading the package again.
-    Shell {
-        script: Arc<str>,
-    },
+    Prompt { role: String, content: Arc<str> },
+    Sandbox { policy: Arc<str> },
 }
 
 impl ToolTemplate {

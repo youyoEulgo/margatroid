@@ -100,6 +100,7 @@ Workspace：Workspace 图书馆组件，公开 Component--Workspace Entity 必�
     iter(&self) -> impl Iterator<Item = (&str, Entity)> + '_
         遍历成员 Entity：公开方法
     impl Component for Workspace
+    impl LibraryComponent for Workspace
 
 WorkspacePlugin：Workspace 运行编排插件，公开结构体--协调 Workspace 及 Agent 的创建、消息路由、MCL 命令和初始化收集
     agent_images_root: PathBuf--AgentImage 根目录，私有
