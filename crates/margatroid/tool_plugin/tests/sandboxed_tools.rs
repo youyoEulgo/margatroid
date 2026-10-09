@@ -160,8 +160,11 @@ fn the_bash_tool_completes_behind_a_confining_policy() {
 
 fn request_for(tool: &str, package: &Path, project: &Path) -> serde_json::Value {
     serde_json::json!({
-        "metadata": std::fs::read_to_string(package.join("tool.toml")).unwrap(),
-        "schema": std::fs::read_to_string(package.join("input.schema.json")).unwrap(),
+        "description": "A tool the sandbox checks run.",
+        "input_schema": serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(package.join("input.schema.json")).unwrap(),
+        )
+        .unwrap(),
         "script": std::fs::read_to_string(package.join("main.lua")).unwrap(),
         "temp_dir": project.to_string_lossy(),
         "arguments": if tool == "bash" {

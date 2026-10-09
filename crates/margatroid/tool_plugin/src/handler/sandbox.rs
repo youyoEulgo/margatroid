@@ -16,26 +16,28 @@ const MAX_POLICY_BYTES: usize = 1024 * 1024;
 static POLICY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn active_sandbox_policies(
+    world: &World,
     resources: &AgentResourceMap,
 ) -> Result<Vec<Arc<str>>, ToolError> {
     resources
         .active_sandboxes
         .iter()
         .map(|resource_id| {
-            let policy = resources.sandbox_policies.get(resource_id).ok_or_else(|| {
-                ToolError::new(
-                    ToolErrorKind::ExecutionFailed,
-                    format!("active sandbox {resource_id} has no policy"),
-                )
-            })?;
-            if policy.trim().is_empty() {
+            let sandbox =
+                resource_library_plugin::sandbox_resource(world, resource_id).map_err(|error| {
+                    ToolError::new(
+                        ToolErrorKind::ExecutionFailed,
+                        format!("active sandbox {resource_id} is unavailable: {error}"),
+                    )
+                })?;
+            if sandbox.policy.trim().is_empty() {
                 return Err(ToolError::new(
                     ToolErrorKind::ExecutionFailed,
                     format!("active sandbox {resource_id} has an empty policy"),
                 ));
             }
             tracing::debug!(sandbox = %resource_id, "resolved active sandbox policy");
-            Ok(Arc::clone(policy))
+            Ok(sandbox.policy)
         })
         .collect()
 }

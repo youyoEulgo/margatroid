@@ -1,3 +1,4 @@
+mod access;
 mod error;
 mod handler;
 mod types;
@@ -8,6 +9,10 @@ use resource_id_plugin::ResourceIdPluginInstalled;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub use access::{
+    find_resource, hook_resource, prompt_resource, read_skill_content, read_tool_script,
+    sandbox_resource, skill_resource, tool_definition, tool_resource, ExecutableDefinition,
+};
 pub use error::ResourceLibraryError;
 pub use handler::{install_resource, release_resource_owner};
 pub use types::{ResourceDefinition, ResourceOwners};

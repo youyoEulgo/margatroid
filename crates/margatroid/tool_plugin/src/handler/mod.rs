@@ -9,7 +9,6 @@ use agent_plugin::Agent;
 use app_runtime_plugin::WorldEventExt;
 use core_plugin::World;
 use margatroid_types::{MclEffectReply, Message};
-use resource_id_plugin::WorldResourceIdExt;
 
 use crate::{ToolCallRequest, ToolError};
 
@@ -86,35 +85,6 @@ pub(crate) fn library_root(world: &World) -> Result<&std::path::Path, ToolError>
                 "ResourceLibraryRoot is missing",
             )
         })
-}
-
-fn imported_content_path(
-    world: &World,
-    resource_id: &margatroid_types::ResourceRef,
-) -> Result<std::path::PathBuf, ToolError> {
-    let entity = world.entity_by_resource_id(resource_id).map_err(|_| {
-        ToolError::new(
-            crate::ToolErrorKind::ResourceResolutionFailed,
-            "resource was not imported into the library",
-        )
-    })?;
-    let tool = world.get_component::<resource_library_plugin::ToolResource>(entity);
-    let skill = world.get_component::<resource_library_plugin::SkillResource>(entity);
-    match (tool, skill) {
-        (Some(tool), _) => Ok(tool.script_path.clone()),
-        (_, Some(skill)) => Ok(skill.content_path.clone()),
-        _ => Err(ToolError::new(
-            crate::ToolErrorKind::ResourceResolutionFailed,
-            "imported resource carries no executable content",
-        )),
-    }
-}
-
-pub(crate) fn imported_tool_script_path(
-    world: &World,
-    resource_id: &margatroid_types::ResourceRef,
-) -> Result<std::path::PathBuf, ToolError> {
-    imported_content_path(world, resource_id)
 }
 
 pub(crate) fn finish_tool_call(

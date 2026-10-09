@@ -142,12 +142,6 @@ pub fn register_agent_resource(
             "resource mapping is not executable",
         )
     })?;
-    let template = entry.template.clone().ok_or_else(|| {
-        ToolError::new(
-            ToolErrorKind::InvalidDefinition,
-            "executable resource has no tool template",
-        )
-    })?;
     let agent_state = world.get_component_mut::<Agent>(agent).ok_or_else(|| {
         ToolError::new(ToolErrorKind::AgentNotAlive, "Agent component is missing")
     })?;
@@ -157,8 +151,6 @@ pub fn register_agent_resource(
             resource_id: entry.resource_id.clone(),
             resource_name: entry.resource_name.clone(),
             executor,
-            description: template.description,
-            parameters: template.parameters,
         })
         .map_err(|error| ToolError::new(ToolErrorKind::DuplicateResource, error.to_string()))?;
     Ok(entry)
@@ -222,10 +214,17 @@ pub fn resolve_agent_tool_definitions(
             ));
         }
         let entry = entries[0];
+        let definition =
+            resource_library_plugin::tool_definition(world, resource_id).map_err(|error| {
+                ToolError::new(
+                    ToolErrorKind::ResourceResolutionFailed,
+                    format!("visible resource is not readable: {error}"),
+                )
+            })?;
         definitions.push(margatroid_types::ToolDefinition {
             name: entry.resource_name.clone(),
-            description: entry.description.clone(),
-            input_schema: entry.parameters.clone(),
+            description: definition.description,
+            input_schema: definition.input_schema,
         });
     }
     Ok(definitions)

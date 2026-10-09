@@ -8,3 +8,6 @@ core_plugin = { path = "../../mecs/core_plugin" }
 resource_id_plugin = { path = "../resource_id_plugin" }
 library_component_plugin = { path = "../library_component_plugin" }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

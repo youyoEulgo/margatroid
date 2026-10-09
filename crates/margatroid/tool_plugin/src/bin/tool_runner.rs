@@ -9,8 +9,8 @@ use tool_plugin::{run_lua_tool, LuaExecutionLimits, LuaToolRunRequest, ToolError
 
 #[derive(Deserialize)]
 struct RunnerRequest {
-    metadata: String,
-    schema: String,
+    description: String,
+    input_schema: serde_json::Value,
     script: String,
     temp_dir: PathBuf,
     arguments: String,
@@ -113,8 +113,8 @@ async fn main() -> ExitCode {
         max_host_call_time: Duration::from_millis(request.limits.max_host_call_time_ms),
     };
     let outcome = run_lua_tool(LuaToolRunRequest {
-        metadata: request.metadata,
-        schema: request.schema,
+        description: request.description,
+        input_schema: request.input_schema,
         script: request.script,
         temp_dir: request.temp_dir,
         arguments: request.arguments,

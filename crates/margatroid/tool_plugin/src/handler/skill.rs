@@ -45,7 +45,13 @@ pub(crate) fn skill_register_system(world: &mut World) {
             .and_then(|_| {
                 validate_skill_resource(&request.resource_id)?;
                 let path = find_skill_file(super::library_root(world)?, &request.resource_id)?;
-                let document = read_skill_document(&path)?;
+                let source = fs::read_to_string(&path).map_err(|_| {
+                    ToolError::new(
+                        ToolErrorKind::ResourceResolutionFailed,
+                        "skill file could not be read",
+                    )
+                })?;
+                let document = parse_skill_document(&source)?;
                 let template = ToolTemplate::new(
                     request.resource_id.to_string(),
                     document.metadata.description,
@@ -83,7 +89,13 @@ pub(crate) fn execute_skill_call(
         )
     })?;
     validate_skill_resource(&request.resource_id)?;
-    let path = super::imported_tool_script_path(world, &request.resource_id)?;
+    let content = resource_library_plugin::read_skill_content(world, &request.resource_id)
+        .map_err(|error| {
+            ToolError::new(
+                ToolErrorKind::ResourceResolutionFailed,
+                format!("skill content could not be read: {error}"),
+            )
+        })?;
     serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&request.arguments)
         .map_err(|_| {
             ToolError::new(
@@ -91,16 +103,10 @@ pub(crate) fn execute_skill_call(
                 "skill arguments must be a JSON object",
             )
         })?;
-    read_skill_document(&path).map(|document| document.body)
+    parse_skill_document(&content).map(|document| document.body)
 }
 
-fn read_skill_document(path: &Path) -> Result<SkillDocument, ToolError> {
-    let source = fs::read_to_string(path).map_err(|_| {
-        ToolError::new(
-            ToolErrorKind::ResourceResolutionFailed,
-            "skill file could not be read",
-        )
-    })?;
+fn parse_skill_document(source: &str) -> Result<SkillDocument, ToolError> {
     let remainder = source.strip_prefix("+++\n").ok_or_else(|| {
         ToolError::new(
             ToolErrorKind::InvalidDefinition,

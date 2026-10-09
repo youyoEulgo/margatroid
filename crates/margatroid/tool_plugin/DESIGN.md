@@ -125,7 +125,7 @@ cancel_tool_turn_system(world: &mut World)
 mod.rs   finish_tool_call(world, request, result)
             从 Agent.tools.pending 移除请求并发送 AgentMessage::Tool
 
-skill.rs skill_register_system / execute_skill_call
+skill.rs skill_register_system / execute_skill_call / parse_skill_document
 hook.rs  hook_register_system / execute_hook_call
 lua.rs   lua_tool_register_system / prepare_lua_call / execute_prepared_lua_tool / lua_task_result_system
          / run_lua_tool / spawn_tool_runner / runner_failure / tool_runner_path
@@ -153,11 +153,19 @@ find_prompt_package(library_root, resource_id)
     所有 find_* 都只在该根目录下的对应集合中查找
     不存在项目内 .margatroid 或镜像目录的回退路径，因此同名资源在全进程只有一份
 
-执行时读取导入时确定的路径：
-    Lua 工具的 metadata 与 schema 取自资源实体上的 ToolResource
-    脚本正文按 ToolResource.script_path 读取
-    技能正文按 SkillResource.content_path 读取
-    因此一次已经开始的调用持有自己的快照，重新导入不会改变它的内容
+执行时经图书馆读取，不自行拼接路径：
+    描述与输入 schema 取自资源实体上的组件，导入时已校验
+    脚本正文经 resource_library_plugin::read_tool_script 读取
+    技能正文经 resource_library_plugin::read_skill_content 读取
+    调用方不拼 library_root，读盘职责收在图书馆的 access 板块
+    一次已经开始的调用持有自己的快照，重新导入不会改变它的内容
+
+执行路径不再解析 TOML：
+    tool.toml 只在导入时解析一次，用途是校验 schema_version、name 与描述
+    校验通过后组件里留下的是解析好的描述与 schema，执行时直接使用
+    LuaToolPackage 装的是 description: String 与 input_schema: Value
+        而不再是两个语义不明的 String（其中一个曾被误当作 TOML 文本）
+    这个错误因此在类型上不再可能发生
 
 sandbox_register_system(world)
     注册沙箱资源：处理 resource_id 类型为 sandbox 的 ToolRegisterRequest
@@ -170,10 +178,13 @@ find_sandbox_package(library_root, resource_id)
     行为：要求类型为 sandbox；命中含 policy.json 的目录即返回，否则报资源未找到
     说明：不存在项目内或镜像内的回退路径，资源全局唯一
 
-active_sandbox_policies(resources: &AgentResourceMap) -> Result<Vec<Arc<str>>, ToolError>
+active_sandbox_policies(world: &World, resources: &AgentResourceMap) -> Result<Vec<Arc<str>>, ToolError>
     解析本次调用生效的策略：crate 内公开
-    行为：按 active_sandboxes 的集合序遍历，逐个取回策略文本；按声明顺序返回，交由 landstrip 合并
-    边界：已激活却没有策略、或策略为空，一律报错而不是静默降级
+    行为：按 active_sandboxes 的集合序遍历，逐个经图书馆读取策略文本
+    行为：按声明顺序返回，交由 landstrip 合并
+    边界：资源不可读、或策略为空，一律报错而不是静默降级
+    说明：策略只存在于沙箱资源实体上；Agent 只记录哪些沙箱被激活，不再另存一份策略文本
+        快照粒度是一次调用：本次调用开始时取到的策略在这一轮内不变
 
 sandbox_backend() -> Option<PathBuf>
     定位后端：环境变量 MARGATROID_SANDBOX_BACKEND → PATH 里的 landstrip → 当前可执行文件同目录
@@ -281,8 +292,9 @@ run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError>
     行为：读工具包（main.lua 与 input schema）→ 校验 arguments → 建 VM（StdLib::ALL + 内存上限 + 执行钩子 + 注入宿主面）
           → 把 arguments 填进入口表 → 加载 main.lua → 调用全局 execute → 结果长度不超过 max_output_bytes
     行为补充：工具包内容由 daemon 读取后随请求下发，沙箱内不再有进程需要读镜像根
-    约束：request 携带 metadata、schema、script、temp_dir、arguments、agent_id、turn_id、
+    约束：request 携带 description、input_schema、script、temp_dir、arguments、agent_id、turn_id、
           resource_id、project_root、limits 与 sandbox_policies；
+          其中 description 与 input_schema 是已解析值，不是待解析的文档；
 
 工具结果的取值约定：
     工具可以返回 {"ok": bool, "content": string} 作为显式结果信封

@@ -16,7 +16,6 @@ use async_runtime_plugin::{AsyncTaskError, WorldAsyncExt};
 use core_plugin::{Entity, Event, Resource, World};
 use margatroid_types::{ResourceId, ResourceRef};
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
-use resource_id_plugin::WorldResourceIdExt;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -125,22 +124,26 @@ impl fmt::Display for LuaError {
 
 impl std::error::Error for LuaError {}
 
+/// What `tool.toml` says, before it is checked against the resource it claims
+/// to describe. Only the import path parses this.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LuaToolMetadata {
+struct LuaToolManifest {
     schema_version: u32,
     name: String,
     description: String,
 }
 
+/// A tool that already passed import validation: its description and schema
+/// are known good, so nothing downstream re-reads or re-parses them.
 struct LuaToolDefinition {
-    metadata: LuaToolMetadata,
+    description: String,
     parameters: serde_json::Value,
 }
 
 struct LuaToolPackage {
-    metadata: String,
-    schema: String,
+    description: String,
+    input_schema: serde_json::Value,
     script: String,
 }
 
@@ -319,7 +322,7 @@ fn register_lua_tool(
     let definition = parse_lua_tool_definition(&metadata, &schema, &request.resource_id)?;
     let template = ToolTemplate::new(
         request.resource_id.to_string(),
-        definition.metadata.description,
+        definition.description,
         definition.parameters,
     )?;
     crate::candidate_resource_entry_with_content(
@@ -380,7 +383,8 @@ fn prepare_lua_tool_call(
             )
         })?;
     let package = read_lua_tool_package(world, &request.resource_id, &limits)?;
-    let sandbox_policies = crate::handler::sandbox::active_sandbox_policies(&agent.resources)?;
+    let sandbox_policies =
+        crate::handler::sandbox::active_sandbox_policies(world, &agent.resources)?;
     let temp_dir = crate::handler::sandbox::CallTempDir::create(&agent.info.project_root)?;
     let context = LuaCallContext {
         agent_id,
@@ -420,8 +424,8 @@ pub(crate) async fn execute_prepared_lua_tool(
 }
 
 pub struct LuaToolRunRequest {
-    pub metadata: String,
-    pub schema: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
     pub script: String,
     pub temp_dir: PathBuf,
     pub arguments: String,
@@ -435,8 +439,10 @@ pub struct LuaToolRunRequest {
 
 pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError> {
     let limits = request.limits.clone();
-    let definition =
-        parse_lua_tool_definition(&request.metadata, &request.schema, &request.resource_id)?;
+    let definition = LuaToolDefinition {
+        description: request.description.clone(),
+        parameters: request.input_schema.clone(),
+    };
     let arguments =
         serde_json::from_str::<serde_json::Value>(&request.arguments).map_err(|_| {
             ToolError::new(
@@ -474,8 +480,8 @@ pub async fn run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolErro
         },
         limits: limits.clone(),
         package: LuaToolPackage {
-            metadata: request.metadata.clone(),
-            schema: request.schema.clone(),
+            description: request.description.clone(),
+            input_schema: request.input_schema.clone(),
             script: request.script.clone(),
         },
     };
@@ -542,8 +548,8 @@ fn tool_runner_path() -> Result<PathBuf, ToolError> {
 /// would otherwise only show up as a tool that silently cannot do its job.
 fn runner_payload(request: &LuaToolRunRequest) -> serde_json::Value {
     serde_json::json!({
-        "metadata": request.metadata,
-        "schema": request.schema,
+        "description": request.description,
+        "input_schema": request.input_schema,
         "script": request.script,
         "temp_dir": request.temp_dir.to_string_lossy(),
         "arguments": request.arguments,
@@ -698,8 +704,8 @@ fn runner_failure(stderr: &str) -> ToolError {
 
 async fn execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, ToolError> {
     let request = LuaToolRunRequest {
-        metadata: prepared.handle.package.metadata.clone(),
-        schema: prepared.handle.package.schema.clone(),
+        description: prepared.handle.package.description.clone(),
+        input_schema: prepared.handle.package.input_schema.clone(),
         script: prepared.handle.package.script.clone(),
         temp_dir: prepared.handle.context.temp_dir.as_ref().clone(),
         arguments: prepared.arguments.clone(),
@@ -774,16 +780,16 @@ fn parse_lua_tool_definition(
     schema_source: &str,
     resource_id: &ResourceRef,
 ) -> Result<LuaToolDefinition, ToolError> {
-    let metadata = toml::from_str::<LuaToolMetadata>(metadata_source).map_err(|_| {
+    let manifest = toml::from_str::<LuaToolManifest>(metadata_source).map_err(|_| {
         ToolError::new(
             ToolErrorKind::InvalidDefinition,
             "Lua tool metadata is invalid",
         )
     })?;
-    if metadata.schema_version != 1
-        || metadata.name.trim().is_empty()
-        || metadata.name != resource_id.name()
-        || metadata.description.trim().is_empty()
+    if manifest.schema_version != 1
+        || manifest.name.trim().is_empty()
+        || manifest.name != resource_id.name()
+        || manifest.description.trim().is_empty()
     {
         return Err(ToolError::new(
             ToolErrorKind::InvalidDefinition,
@@ -803,7 +809,7 @@ fn parse_lua_tool_definition(
         ));
     }
     Ok(LuaToolDefinition {
-        metadata,
+        description: manifest.description,
         parameters,
     })
 }
@@ -813,32 +819,28 @@ fn read_lua_tool_package(
     resource_id: &ResourceRef,
     limits: &LuaExecutionLimits,
 ) -> Result<LuaToolPackage, ToolError> {
-    let definition = world
-        .entity_by_resource_id(resource_id)
-        .ok()
-        .and_then(|entity| world.get_component::<resource_library_plugin::ToolResource>(entity))
-        .ok_or_else(|| {
+    let tool = resource_library_plugin::tool_resource(world, resource_id).map_err(|error| {
+        ToolError::new(
+            ToolErrorKind::ResourceResolutionFailed,
+            format!("tool was not imported into the library: {error}"),
+        )
+    })?;
+    let script =
+        resource_library_plugin::read_tool_script(world, resource_id).map_err(|error| {
             ToolError::new(
                 ToolErrorKind::ResourceResolutionFailed,
-                "tool was not imported into the library",
+                format!("Lua tool script could not be read: {error}"),
             )
         })?;
-    let metadata = definition.description.clone();
-    let schema = definition.input_schema.to_string();
-    let script = read_bounded_sync(
-        &definition.script_path,
-        limits.max_script_bytes,
-        "Lua tool script",
-    )?;
-    if script.trim().is_empty() {
+    if script.len() > limits.max_script_bytes || script.trim().is_empty() {
         return Err(ToolError::new(
             ToolErrorKind::InvalidDefinition,
-            "Lua tool script is empty",
+            "Lua tool script is empty or too large",
         ));
     }
     Ok(LuaToolPackage {
-        metadata,
-        schema,
+        description: tool.description,
+        input_schema: tool.input_schema,
         script,
     })
 }
@@ -1132,8 +1134,8 @@ mod runner_tests {
 
     fn request(limits: LuaExecutionLimits) -> LuaToolRunRequest {
         LuaToolRunRequest {
-            metadata: "schema_version = 1\nname = \"glob\"\ndescription = \"test\"\n".to_owned(),
-            schema: r#"{"type":"object"}"#.to_owned(),
+            description: "test".to_owned(),
+            input_schema: serde_json::json!({"type":"object"}),
             script: String::new(),
             temp_dir: PathBuf::from("/tmp"),
             arguments: "{}".to_owned(),
@@ -1210,8 +1212,8 @@ mod runner_tests {
         let request = request(limits(1 << 20, 5_000));
         let payload = runner_payload(&request);
         for key in [
-            "metadata",
-            "schema",
+            "description",
+            "input_schema",
             "script",
             "temp_dir",
             "arguments",
@@ -1315,9 +1317,8 @@ mod runner_tests {
             },
             limits: limits(1 << 20, 10_000),
             package: LuaToolPackage {
-                metadata: "schema_version = 1\nname = \"glob\"\ndescription = \"test\"\n"
-                    .to_owned(),
-                schema: r#"{"type":"object"}"#.to_owned(),
+                description: "test".to_owned(),
+                input_schema: serde_json::json!({"type":"object"}),
                 script: "-- no setup needed\n".to_owned(),
             },
         };
@@ -1360,9 +1361,8 @@ mod runner_tests {
             },
             limits: limits(1 << 20, 10_000),
             package: LuaToolPackage {
-                metadata: "schema_version = 1\nname = \"glob\"\ndescription = \"test\"\n"
-                    .to_owned(),
-                schema: r#"{"type":"object"}"#.to_owned(),
+                description: "test".to_owned(),
+                input_schema: serde_json::json!({"type":"object"}),
                 script: "-- no setup needed\n".to_owned(),
             },
         };

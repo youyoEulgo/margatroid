@@ -847,12 +847,8 @@ pub fn execute_direct_operation(
             if reference.resource_type() != "prompt" {
                 continue;
             }
-            let host = world
-                .entity_by_resource_id(reference)
-                .map_err(MclError::from)?;
-            let prompt = world
-                .get_component::<resource_library_plugin::PromptResource>(host)
-                .ok_or(MclError::TypeMismatch)?;
+            let prompt = resource_library_plugin::prompt_resource(world, reference)
+                .map_err(|_| MclError::TypeMismatch)?;
             dependency_sources.insert(reference.clone(), prompt.content.clone());
         }
     }
