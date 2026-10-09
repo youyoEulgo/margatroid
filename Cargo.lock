@@ -1831,6 +1831,7 @@ dependencies = [
  "library_component_plugin",
  "resource_id_plugin",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

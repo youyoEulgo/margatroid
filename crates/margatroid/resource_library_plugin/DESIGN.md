@@ -35,9 +35,13 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 # lib        src/lib.rs        资源定义组件、库根 Resource 与 Plugin
 # system     src/system.rs     System 函数（当前无）
 # handler    src/handler.rs    资源安装与回收
+# access     src/access.rs     资源的只读查询与按需读盘
 # events     src/events.rs     事件类型（当前无）
 # types      src/types.rs      ResourceDefinition 与 ResourceOwners
 # error      src/error.rs      Error 类型
+
+access 是六个标准板块之外的一个板块：handler 负责改变资源，access 只读取资源，
+    两者都是本 crate 对外的主要入口，但职责相反，混在一起会让「谁改、谁读」变得模糊
 ```
 
 # lib
@@ -134,6 +138,91 @@ matches_definition(world: &World, entity: Entity, definition: &ResourceDefinitio
 只有在 Agent 的在途工作真正停止后才允许释放其持有，否则运行中的调用会失去自己的资源。停止收敛的判据由 `workspace_plugin` 定义：VM 已结束（vm_id 与 request_id 均为 None）、生命周期为 Stopped 或 Failed、且 tools.pending 与 inference.pending 均为空。
 
 生命周期标签本身不足以证明执行已结束：一个进入 Failed 的 VM 仍可能持有正在运行的执行体，因此取消判定必须以在途请求为准。
+
+# access
+
+access 是本 crate 的读取面，也是全局资源库作为唯一数据来源的落点。
+
+## 类型
+
+公开：
+```text
+ExecutableDefinition：可执行资源对模型可见的定义，公开结构体
+    description: String--描述
+    input_schema: serde_json::Value--输入 schema
+```
+
+## 函数
+
+公开：
+```text
+find_resource(world: &World, reference: &ResourceRef) -> Result<Entity, ResourceLibraryError>
+    查找资源实体：返回该地址当前对应的 Entity
+    行为：查询失败时原样返回 ResourceIdLookupError
+
+tool_resource(world: &World, reference: &ResourceRef) -> Result<ToolResource, ResourceLibraryError>
+    读取工具资源：返回其组件的克隆
+    行为：地址不存在返回 Lookup；实体不是工具资源返回 WrongType
+    说明：返回克隆而不是引用，调用方不必持有 World 的借用
+
+skill_resource / prompt_resource / sandbox_resource / hook_resource
+    读取对应资源：与 tool_resource 同形，各自校验资源类型
+
+tool_definition(world: &World, reference: &ResourceRef) -> Result<ExecutableDefinition, ResourceLibraryError>
+    读取可执行定义：按资源类型返回对模型可见的描述与 schema
+    行为：tool 与 hook 返回各自组件中的描述与 schema
+    行为：skill 的 schema 固定为空对象 schema，因为技能不接受结构化参数
+    行为：其它类型返回 WrongType
+
+read_tool_script(world: &World, reference: &ResourceRef) -> Result<String, ResourceLibraryError>
+    读取工具脚本：按 ToolResource.script_path 读盘
+read_skill_content(world: &World, reference: &ResourceRef) -> Result<String, ResourceLibraryError>
+    读取技能正文：按 SkillResource.content_path 读盘
+    行为：读盘失败返回 ContentUnreadable，并带上资源地址与底层原因
+```
+
+## 唯一数据来源
+
+图书馆是资源的唯一数据来源，其它地方只保存引用：
+
+```text
+资源内容（描述、schema、策略、正文、路径）一律只存在于资源实体的组件上
+Agent 一侧只保存 ResourceRef，外加真正属于该 Agent 的私有属性
+    模型的可见名（别名后的名字）与执行器标签属于 Agent 视角，不是资源自身的属性
+任何调用方都不自行拼接资源库路径，需要内容时通过 access 读取
+```
+
+内存与磁盘的分工：
+
+```text
+描述、schema、策略、提示正文在 import 时读入内存并写入组件
+    这些东西小，且每次调用都要用，读盘没有收益
+工具脚本与技能正文只保存路径，由 access 按需读取
+    它们可能很大，且一次调用只读一次
+不落盘的内容不保留原始文件文本：
+    tool.toml 的 schema_version 与 name 是导入期的校验依据，校验完成后不再保留
+        资源的身份已由 ResourceId 承载，再存一份 name 就是重复
+    校验因此只在 import 时发生一次
+```
+
+调用方不拼接路径：
+    需要脚本或正文时调用 read_tool_script / read_skill_content
+    库根的拼接与读盘失败的错误包装都收在 access 内
+    调用方拿到的要么是内容，要么是一个带上资源地址的错误
+
+描述文本只是数据：
+    描述到达执行体时是 String，不是待解析的文档
+    因此描述里出现 "="、":" 之类的字符不会影响任何一次调用
+    测试用一句会被 TOML 拒绝的描述来钉住这一点
+
+这样安排的直接后果是执行路径不再解析 TOML：
+
+```text
+执行工具时读的是组件里已经校验过的描述与 schema
+    而不是把描述文本当成 TOML 文档再解析一遍
+类型上也不可能再犯这个错：LuaToolPackage 装的是 String 与 serde_json::Value，
+    而不是两个语义不明的 String
+```
 
 # types
 

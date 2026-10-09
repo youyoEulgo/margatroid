@@ -449,21 +449,29 @@ AgentResourceMap：Agent资源数据，crate公开结构体--ToolPlugin写入的
     aliases: HashMap<String, ResourceId>--Agent内别名到完整资源ID
     visible: BTreeSet<ResourceId>--当前可见资源
     default_visible: BTreeSet<ResourceId>--默认可见资源
-    tool_entries: Vec<AgentResourceEntry>--已注册的可执行资源候选及Provider无关ToolSpec
+    tool_entries: Vec<AgentResourceEntry>--该Agent已导入的可执行资源条目
     register_tool(&mut self, entry: AgentResourceEntry) -> Result<(), AgentError>
         注册可执行资源：公开方法
         行为：同一个resource_id与resource_name的组合重复时按幂等成功返回；仅resource_name冲突时报错
     tool_by_name(&self, name: &str) -> Option<&AgentResourceEntry>
         按模型可见名称查找：公开方法，返回首个匹配的条目
-    tools_by_resource(&self, resource_id: &ResourceId) -> Vec<&AgentResourceEntry>
+    tools_by_resource(&self, resource_id: &ResourceRef) -> Vec<&AgentResourceEntry>
         按资源查找：公开方法，返回该资源在当前Agent内的全部别名条目
 
 AgentResourceEntry：Agent可执行资源条目，crate公开结构体--ToolPlugin注册成功后写入Agent.resources
-    resource_id: ResourceId--具体资源完整ID
-    resource_name: String--当前Agent内模型可见名称
-    tool_id: ResourceId--实际执行该资源的隐藏内建工具
-    description: String--模型可见工具说明
-    parameters: serde_json::Value--Provider无关JSON Schema
+    resource_id: ResourceRef--指向全局资源库中的那个资源
+    resource_name: String--当前Agent内模型可见名称，由别名决定
+    executor: ToolExecutor--分派用的执行器标签
+
+AgentResourceEntry只保存引用与该Agent私有的属性：
+    资源的描述与输入schema属于资源本身，只存在于资源实体的组件上
+    模型可见名属于Agent视角：同一资源可以被不同Agent起不同的别名
+    执行器标签决定由哪段代码执行它，同样不随资源走
+    需要描述或schema时通过resource_library_plugin的access读取
+
+ToolExecutor：工具执行器，公开枚举--进程内的分派标签，不是资源
+    变体：LuaRuntime、SkillLoader、Hook
+    说明：执行器没有资源ID；早期实现用tool:builtin/*这类伪造ID区分执行器，已删除
 
 HistoryMessage：可展示历史条目，crate公开结构体--MemoryPlugin实现AgentMemoryStore时读取的展示历史行
     sequence: i64--单Agent永久递增序号

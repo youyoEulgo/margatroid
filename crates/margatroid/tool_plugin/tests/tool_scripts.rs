@@ -50,16 +50,24 @@ fn limits() -> LuaExecutionLimits {
 fn run_tool(tool: &str, arguments: &str, project_root: &Path) -> Result<String, String> {
     let image = library_root().ok_or("the agent image root is not available")?;
     let package = image.join("tools/local").join(tool).join("latest");
-    let metadata = std::fs::read_to_string(package.join("tool.toml"))
+    let manifest = std::fs::read_to_string(package.join("tool.toml"))
         .map_err(|error| format!("tool.toml: {error}"))?;
     let schema = std::fs::read_to_string(package.join("input.schema.json"))
         .map_err(|error| format!("input.schema.json: {error}"))?;
     let script = std::fs::read_to_string(package.join("main.lua"))
         .map_err(|error| format!("main.lua: {error}"))?;
 
+    let description = manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("description = "))
+        .map(|value| value.trim().trim_matches('"').to_owned())
+        .ok_or("tool.toml has no description")?;
+    let input_schema: serde_json::Value =
+        serde_json::from_str(&schema).map_err(|error| format!("input.schema.json: {error}"))?;
+
     let request = LuaToolRunRequest {
-        metadata,
-        schema,
+        description,
+        input_schema,
         script,
         temp_dir: project_root.to_path_buf(),
         arguments: arguments.to_owned(),

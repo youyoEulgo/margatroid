@@ -676,30 +676,37 @@ pub fn mcl_domain_system(world: &mut World) {
                     &request.source,
                 ),
                 MclOperation::Emit {
-                    effect: crate::MclEffectCommand::SandboxUse { aliases },
+                    effect:
+                        crate::MclEffectCommand::SandboxUse {
+                            aliases: aliases_to_activate,
+                        },
                 } => {
                     let agent = world
                         .entity_by_resource_id(&request.agent_id)
                         .map_err(MclError::from)?;
-                    let state = world
-                        .get_component_mut::<Agent>(agent)
-                        .ok_or(MclError::AgentMissing)?;
+                    let aliases = world
+                        .get_component::<Agent>(agent)
+                        .ok_or(MclError::AgentMissing)?
+                        .resources
+                        .aliases
+                        .clone();
                     let mut activated = BTreeSet::new();
-                    for alias in aliases {
-                        let resource = state
-                            .resources
-                            .aliases
+                    for alias in aliases_to_activate {
+                        let resource = aliases
                             .get(&alias)
                             .cloned()
                             .or_else(|| alias.parse::<ResourceRef>().ok())
                             .ok_or_else(|| MclError::ImportMissing(alias.clone()))?;
                         if resource.resource_type() != "sandbox"
-                            || !state.resources.sandbox_policies.contains_key(&resource)
+                            || resource_library_plugin::sandbox_resource(world, &resource).is_err()
                         {
                             return Err(MclError::TypeMismatch);
                         }
                         activated.insert(resource);
                     }
+                    let state = world
+                        .get_component_mut::<Agent>(agent)
+                        .ok_or(MclError::AgentMissing)?;
                     state.resources.active_sandboxes = activated;
                     Ok(crate::MclDomainValue::Unit)
                 }
@@ -1451,14 +1458,6 @@ pub fn mcl_import_response_system(world: &mut World) {
                             .resources
                             .resources
                             .insert(state.resource_id.clone(), true);
-                        if is_sandbox {
-                            if let Some(ResourceContent::Sandbox { policy }) = &entry.content {
-                                agent
-                                    .resources
-                                    .sandbox_policies
-                                    .insert(state.resource_id.clone(), policy.clone());
-                            }
-                        }
                         agent
                             .resources
                             .aliases

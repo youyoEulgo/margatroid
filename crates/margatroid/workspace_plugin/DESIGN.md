@@ -117,7 +117,7 @@ WorkspacePlugin：Workspace 运行编排插件，公开结构体--协调 Workspa
             安装插件：要求 schedule 和 ResourceIdPlugin、AgentImageLoaderPlugin、AgentPlugin、ToolPlugin、MemoryPlugin、MclPlugin、LuaRuntimePlugin 已安装
             行为：
                 插入 WorkspaceRegistry
-                依次挂载 begin_workspace_command_system、route_agent_message_system、route_agent_turn_abort_system、route_mcl_command_system、collect_mcl_command_response_system、collect_agent_image_system、collect_agent_initialization_system
+                依次挂载 begin_workspace_command_system、route_agent_turn_abort_system、route_mcl_command_system、collect_mcl_command_response_system、collect_agent_image_system、collect_agent_initialization_system、collect_workspace_stop_system
 ```
 
 公开 trait：
@@ -127,8 +127,8 @@ WorldWorkspaceExt：Workspace 世界扩展，公开 trait--为 World 提供 Work
         启动 Workspace：发送 StartWorkspace 事件
     stop_workspace(&self, id: impl Into<String>, workspace: Entity)
         停止 Workspace：发送 StopWorkspace 事件
-    workspace_by_id(&self, id: &ResourceId) -> Option<Entity>
-        按资源 ID 查找 Workspace Entity
+    workspace_by_id(&self, id: &ResourceRef) -> Result<Entity, resource_id_plugin::ResourceIdLookupError>
+        按资源地址查找 Workspace Entity；查询错误原样返回
     workspaces(&self) -> Vec<Entity>
         读取存活 Workspace Entity 列表
     workspace_agent(&self, workspace: Entity, name: &str) -> Option<Entity>
@@ -157,11 +157,6 @@ begin_workspace_command_system(world: &mut World)
         StopWorkspaceByReference 先按资源 ID 定位并校验 project_root，再调用 stop_workspace_entity 并发送 StopWorkspaceByReferenceResult
         ReloadWorkspace 先 stop 旧 Workspace，再 create 新 Workspace，发送 ReloadWorkspaceResult
 
-route_agent_message_system(world: &mut World)
-    成员消息路由 System：crate公开 System
-    处理事件：RouteAgentMessage
-    行为：解析 Workspace 和可选 Agent ID；Agent 为空时使用 manager；成功时发送 AgentMessage
-
 route_agent_turn_abort_system(world: &mut World)
     成员轮次中止路由 System：crate公开 System
     处理事件：RouteAgentTurnAbort
@@ -174,7 +169,9 @@ route_mcl_command_system(world: &mut World)
 
 collect_mcl_command_response_system(world: &mut World)
     MCL 命令响应收集 System：crate公开 System
-    行为：逐个尝试接收 pending_mcl_commands 中的 oneshot 回执；Empty 时写回注册表，Closed 时返回错误
+    行为：逐个尝试接收 pending_mcl_commands 中的 oneshot 回执
+    行为：Ok 时把 MclCommandValue 转为 JSON 后经外部回执发出，转换失败则回错误字符串
+    行为：Empty 时原样写回注册表等待下一帧；Closed 时回错误字符串
 
 collect_agent_image_system(world: &mut World)
     镜像结果收集 System：crate公开 System
@@ -182,8 +179,8 @@ collect_agent_image_system(world: &mut World)
     行为：
         按 event_id 从 pending_images 定位 Workspace 和成员名
         失败时标记成员 Failed 并记录带 workspace/agent 的日志
-        成功时准备 AgentCreateRequest：读取镜像依赖、Base Driver、模型、Memory，并构造 image_sources
-        image_sources 除依赖 source 字段外，还为每个 prompt 依赖读取镜像根目录 `<NAME 大写>.md` 内容
+        成功时准备 AgentCreateRequest：读取镜像依赖、Base Driver、模型、Memory
+        镜像依赖原样作为 AgentInfo.image_dependencies 传入，不在此处读取任何资源内容
         发送 AgentCreateRequest 并把 oneshot 接收器写入 pending_agents
         逐个消费 pending_agents 回执；成功时把 Agent 写入 Workspace.agents 和 Ready 状态，失败时标记 Failed
 
@@ -203,8 +200,9 @@ stop_workspace_entity(world: &mut World, workspace: Entity) -> Result<(), Worksp
     停止 Workspace Entity：crate公开函数，登记停止意图并发出取消，不直接回收
     行为：
         Workspace 不存活返回 WorkspaceNotAlive
-        在 WorkspaceRegistry.stopping 中登记该 Workspace 及其成员
-        遍历成员 Agent，首次登记时发送 AgentControl::Stop
+        在 WorkspaceRegistry.stopping 中为该 Workspace 开一个空状态
+        从 pending_images 中移除属于它的待处理镜像请求
+        调用 stop_workspace_agents 登记成员并发出取消
         不 despawn Agent，也不清理 registry，回收交给 collect_workspace_stop_system
 
 stop_workspace_agents(world: &mut World, workspace: Entity)
@@ -228,6 +226,21 @@ collect_workspace_stop_system(world: &mut World)
 排队中的创建：
     仍在 pending_agents 中的创建请求尚未产生 Agent，但随后仍可能产生一个
     因此必须等它的回执落地后才允许判定整体排空
+
+收敛失败时的现状：
+    判据不满足时本 System 直接跳过该 Workspace，下一帧再试
+    没有超时、没有重试上限、也没有降级路径
+    因此只要判据中任何一条永远不满足，该 Workspace 就永远留在 stopping 中
+    其后果是三条同时成立：
+        Workspace Entity 不回收，registry 条目不清除，模型路由不撤销
+        挂起在 replies 中的停止请求永远不回复
+        Workspace ResourceId 仍被占用，同名 Workspace 无法再次创建（DuplicateWorkspace）
+    排查顺序：先确认成员是否都满足判据，再看 pending_agents 是否有属于它的残留
+
+回复延迟的原因：
+    停止请求不立即回复，而是压入 WorkspaceStopState.replies
+    只有整体排空后才逐个转成结果事件
+    因此调用方看到的超时等价于"该 Workspace 没有排空"
 
 create_workspace(world: &mut World, definition: &WorkspaceDefinition) -> Result<Entity, WorkspaceError>
     创建 Workspace Entity：crate公开函数
@@ -307,11 +320,27 @@ WorkspaceAgentState：Workspace 成员状态，公开枚举
 WorkspaceRegistry：WorkspacePlugin 注册表，公开 Resource
     agent_images_root: Arc<PathBuf>--AgentImage 根目录
     workspaces: Vec<Entity>--已创建 Workspace Entity
+    stopping: HashMap<Entity, WorkspaceStopState>--正在停止的 Workspace 及其挂起请求，crate 内可见
     pending_images: BTreeMap<String, (Entity, String)>--待处理镜像请求 ID 到 Workspace 和成员名
     pending_agents: BTreeMap<String, (Entity, String, oneshot::Receiver<Result<Entity, AgentError>>)>--待处理创建请求 ID 到 Workspace、成员名和回执接收器
     pending_mcl_commands: BTreeMap<String, (mpsc::Sender<Result<serde_json::Value, String>>, oneshot::Receiver<Result<MclCommandValue, MclError>>)>--待处理 MCL 命令 ID 到外部回执和内部回执接收器
     impl Default for WorkspaceRegistry
     impl Resource for WorkspaceRegistry
+```
+
+crate内可见：
+```text
+WorkspaceStopState：一次停止过程的挂起状态，crate内可见结构体
+    agents: HashSet<Entity>--已被要求停止的成员
+    replies: Vec<WorkspaceStopReply>--已到达但尚未回复的停止请求
+    impl Default for WorkspaceStopState
+    说明：本类型不再对外暴露停止语义，只用于 collect_workspace_stop_system 判定排空
+
+WorkspaceStopReply：挂起的停止请求，crate内可见枚举
+    Stop(StopWorkspace)
+    Reference(StopWorkspaceByReference)
+    Reload(ReloadWorkspace)
+    说明：三种停止入口共用同一条排空流程，排空后按原变体回复
 ```
 
 # error
@@ -326,6 +355,7 @@ WorkspaceErrorKind：Workspace 错误分类，公开枚举
     InvalidProjectRoot
     InvalidAgentImagesRoot
     DuplicateWorkspace
+    DuplicateResource
     WorkspaceNotAlive
     WorkspaceNotReady
     WorkspaceMismatch
@@ -377,7 +407,6 @@ WorkspaceError：Workspace 错误，公开结构体
     资源必须晚于在途工作释放，否则运行中的调用会失去自己的资源
 
 消息：
-    RouteAgentMessage -> route_agent_message_system -> AgentMessage
     RouteAgentTurnAbort -> route_agent_turn_abort_system -> AgentControl::AbortTurn
     RouteMclCommand -> route_mcl_command_system -> MclCommandRequest -> collect_mcl_command_response_system -> 外部回执
 ```
@@ -390,6 +419,8 @@ App
     ├── WorkspaceRegistry Resource
     │   ├── agent_images_root: Arc<PathBuf>
     │   ├── workspaces: Vec<Entity>
+    │   ├── stopping: HashMap<Entity, WorkspaceStopState>
+    │   │   └── WorkspaceStopState { agents: HashSet<Entity>, replies: Vec<WorkspaceStopReply> }
     │   ├── pending_images: BTreeMap<String, (Entity, String)>
     │   ├── pending_agents: BTreeMap<String, (Entity, String, oneshot::Receiver<...>)>
     │   └── pending_mcl_commands: BTreeMap<String, (mpsc::Sender<...>, oneshot::Receiver<...>)>
