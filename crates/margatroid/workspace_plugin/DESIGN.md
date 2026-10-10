@@ -1,4 +1,5 @@
 # 伪代码格式
+
 ```text
 模块：使用一级标题，只写当前设计涉及的部分
 
@@ -29,116 +30,110 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # 板块格式
 
-每个 crate 的 DESIGN.md 在伪代码格式之后使用六个一级标题，按 `lib`、`system`、`handler`、`events`、`types`、`error` 顺序组织。每个标题对应 `src/` 下的同名 Rust 文件：
+正文按 `lib`、`system`、`handler`、`events`、`types`、`error` 六个一级标题组织。
 
 ```text
-# lib        src/lib.rs        图书馆组件与 Plugin
-# system     src/system.rs     System 函数
-# handler    src/handler.rs    处理函数
-# events     src/events.rs     事件类型
-# types      src/types.rs      其余类型
-# error      src/error.rs      Error 与公开错误分类
+lib        src/lib.rs        Workspace组件、Plugin和世界扩展
+system     src/system.rs     事件读取与Handler调度
+handler    src/handler.rs    启动、停止的事件处理
+events     共享types crate    workspace_events.rs中的事件契约，本crate只使用或重导出
+types      src/types.rs      Workspace状态机和操作进度
+error      共享错误契约       错误定义归属见error板块
 ```
 
-## lib
-
-lib 只放图书馆组件和 Plugin。
-
-图书馆组件是 Entity 必须挂载的领域组件，组件存在本身表明 Entity 的领域身份；例如：
-
-```text
-Agent Entity     必须挂载 Agent 组件 + ResourceId 组件
-Workspace Entity 必须挂载 Workspace 组件 + ResourceId 组件
-```
-
-WorkspacePlugin 等 Plugin 结构体，以及 Workspace 图书馆组件和 WorldWorkspaceExt 扩展 trait，也放在 lib。
-
-## system
-
-system 放 System 函数。System 只负责读取本帧领域事件并克隆，然后调用 handler 中的对应处理函数；System 不展开业务逻辑。
-
-## handler
-
-handler 放处理函数。每个 System 读到的领域事件在 handler 中展开为完整业务逻辑。
-
-## events
-
-events 放事件类型。事件类型只包含字段和 `impl Event`，不实现业务逻辑。
-
-## types
-
-types 放除事件和错误外的其余类型：状态、注册表、回执等。
-
-## error
-
-error 放 Error 类型和公开错误分类。
+**本文是目标设计，尚未同步到代码。本次只修改Workspace设计文档。**
 
 # lib
+
+## 组件定义位置
+
+Workspace图书馆组件及其实现方法；WorkspaceState等组件公开关联类型随组件契约组织，计划写入共享types crate的`workspace_components.rs`。对应公开事件写入各自的`*_events.rs`，不在插件实现crate重复定义。
+
+此处只标注未来源码归属，尚未创建或迁移源码文件。文档仍在lib板块描述图书馆类型和资源类型；Plugin、System、Handler及插件私有加载状态不随组件迁入共享文件。
 
 ## 类型
 
 公开：
 ```text
-Workspace：Workspace 图书馆组件，公开 Component--Workspace Entity 必须挂载 Workspace 和 ResourceId；组件存在本身表明 Entity 是 Workspace
-    definition: Arc<WorkspaceDefinition>--Compose 编译出的静态定义，crate公开字段
-    project_root: Arc<PathBuf>--项目根目录，crate公开字段
-    manager_name: String--manager 名称，crate公开字段
-    agents: BTreeMap<String, Entity>--已创建 Agent 名称到 Entity，crate公开字段
-    states: BTreeMap<String, WorkspaceAgentState>--成员状态，crate公开字段
+Workspace：工作区图书馆组件，公开Component--保存工作区自身身份，与镜像资源集合共同挂载到Workspace Entity
+    resourceid: ResourceID--工作区自身地址，由LibraryComponent提供查询
+    definition: Arc<WorkspaceDefinition>--静态工作区定义
+    project_root: Arc<PathBuf>--项目根目录
+    agents: BTreeMap<ResourceID, Entity>--已成功启动的成员Agent地址到Entity
+    state: WorkspaceState--工作区状态机，包含当前启动或停止过程
     definition(&self) -> &WorkspaceDefinition
-        读取定义：公开方法
+        读取定义：公开方法，返回静态定义
     project_root(&self) -> &Path
-        读取项目根：公开方法
-    manager(&self) -> Option<Entity>
-        读取 manager Entity：公开方法
-    agent(&self, name: &str) -> Option<Entity>
-        按名称读取 Agent：公开方法
-    state(&self, name: &str) -> Option<&WorkspaceAgentState>
-        读取成员状态：公开方法
-    states(&self) -> impl Iterator<Item = (&str, &WorkspaceAgentState)> + '_
-        遍历成员状态：公开方法
-    iter(&self) -> impl Iterator<Item = (&str, Entity)> + '_
-        遍历成员 Entity：公开方法
+        读取项目根：公开方法，返回项目路径
+    state(&self) -> &WorkspaceState
+        读取工作区状态：公开方法，返回state
+    iter(&self) -> impl Iterator<Item = (&ResourceID, Entity)> + '_
+        遍历成员：公开方法，返回已登记的Agent地址和实体，不过滤失效实体
     impl Component for Workspace
     impl LibraryComponent for Workspace
+        LibraryComponent：公开trait实现
+        resource_id(&self) -> &ResourceID
+            读取自身地址：返回resourceid字段
 
-WorkspacePlugin：Workspace 运行编排插件，公开结构体--协调 Workspace 及 Agent 的创建、消息路由、MCL 命令和初始化收集
-    agent_images_root: PathBuf--AgentImage 根目录，私有
-    schedule: String--System 所属 Schedule，私有
-    open(root: impl Into<PathBuf>) -> Result<Self, WorkspaceError>
-        打开插件：公开关联函数，要求 root 非空
+WorkspacePlugin：工作区生命周期插件，公开结构体
+    schedule: String--运行计划名称
     with_schedule(mut self, schedule: impl Into<String>) -> Self
-        设置 Schedule：公开构建方法
+        设置计划：公开方法，保存计划名并返回自身
     impl Default for WorkspacePlugin
-        Default：公开 trait 实现，使用空 root 和 RuntimePlugin::UPDATE
+        Default：公开trait实现
+        default() -> Self
+            构造默认插件：使用RuntimePlugin::UPDATE
     impl Plugin for WorkspacePlugin
-        Plugin：公开 trait 实现
+        Plugin：公开trait实现
         build(self, app: &mut App)
-            安装插件：要求 schedule 和 ResourceIdPlugin、AgentImageLoaderPlugin、AgentPlugin、ToolPlugin、MemoryPlugin、MclPlugin、LuaRuntimePlugin 已安装
+            安装插件：公开trait方法
             行为：
-                插入 WorkspaceRegistry
-                依次挂载 begin_workspace_command_system、route_agent_turn_abort_system、route_mcl_command_system、collect_mcl_command_response_system、collect_agent_image_system、collect_agent_initialization_system、collect_workspace_stop_system
+                要求运行计划和公共事件、统一ResourcePlugin可用
+                通过register_library::<Workspace>注册workspace地址类型
+                image地址类型由镜像领域注册为ResourceSet<AgentImage>，不在此重复注册
+                挂载start_workspace_system和stop_workspace_system
+                不插入WorkspaceRegistry
+                不通过Agent、AgentImage、Memory、Tool、MCL或LuaRuntime的插件安装标记建立业务插件依赖
 ```
 
-公开 trait：
+## 扩展 trait
+
+公开：
 ```text
-WorldWorkspaceExt：Workspace 世界扩展，公开 trait--为 World 提供 Workspace 查询和命令入口
+WorldWorkspaceExt：工作区世界扩展，公开trait
     start_workspace(&self, id: impl Into<String>, definition: WorkspaceDefinition)
-        启动 Workspace：发送 StartWorkspace 事件
+        请求启动：公开方法，发送StartWorkspace
     stop_workspace(&self, id: impl Into<String>, workspace: Entity)
-        停止 Workspace：发送 StopWorkspace 事件
-    workspace_by_id(&self, id: &ResourceRef) -> Result<Entity, resource_id_plugin::ResourceIdLookupError>
-        按资源地址查找 Workspace Entity；查询错误原样返回
+        请求停止：公开方法，发送StopWorkspace
+    workspace_by_id(&self, id: &ResourceID) -> Result<Entity, WorkspaceError>
+        查询工作区：公开方法，要求地址类型为workspace，调用ResourceID::find_entities并确认目标挂载Workspace
+        行为：无匹配返回WorkspaceNotAlive，唯一匹配返回Entity，多匹配返回ResourceResolutionFailed，不任取第一个
     workspaces(&self) -> Vec<Entity>
-        读取存活 Workspace Entity 列表
-    workspace_agent(&self, workspace: Entity, name: &str) -> Option<Entity>
-        读取成员 Agent Entity
-    workspace_manager(&self, workspace: Entity) -> Option<Entity>
-        读取 manager Agent Entity
-    workspace_of(&self, agent: Entity) -> Option<Entity>
-        读取 Agent 所属 Workspace Entity
+        查询工作区：公开方法，查询挂载Workspace组件的存活Entity，不读取注册表
     impl WorldWorkspaceExt for World
-        World：公开 trait 实现，按字段逐项实现
+        World：公开trait实现，按上述事件发送和查询规则实现
+```
+
+## 逻辑
+
+```text
+数据归属：
+    Workspace保存自己的resourceid、定义、成员引用和工作区状态
+    definition.id用于创建时初始化resourceid，挂载后自身身份以LibraryComponent::resource_id为准，不允许二者被独立修改
+    agents使用ResourceID作键，不再维护按成员名称查询的索引或扩展方法
+    成员名称可用于配置和展示，不作为运行时成员寻址键
+    镜像条目保存在同一Entity上的ResourceSet<AgentImage>中，Workspace内部不再保存agent_images
+    ResourceSet的键保存镜像ResourceID，条目是AgentImage内容，不是另一个镜像Entity
+    Workspace和ResourceSet<AgentImage>分别实现LibraryComponent与ResourcesComponent，允许共同挂载
+    state是整个工作区的一个状态，不按成员名称查询，也不需要Option返回值
+    没有manager，没有成员运行状态表
+    workspace_of由Agent侧提供，不属于本trait
+
+职责边界：
+    Workspace协调启动与停止，不打开Memory、不组装Lua VM、不执行工具或推理
+    Workspace不转发AgentControl、轮次中止或MCL业务命令
+    成员运行状态由Agent负责，Workspace只接收本次启动和停止操作的结果
+    镜像路径解析、加载、更新由AgentImage插件负责，WorkspacePlugin不再接收agent_images_root或提供open(root)
 ```
 
 # system
@@ -147,47 +142,43 @@ WorldWorkspaceExt：Workspace 世界扩展，公开 trait--为 World 提供 Work
 
 crate公开：
 ```text
-begin_workspace_command_system(world: &mut World)
-    命令入口 System：crate公开 System
-    处理事件：StartWorkspace、StopWorkspace、StopWorkspaceByReference、ReloadWorkspace
+start_workspace_system(world: &mut World)
+    启动System：crate公开System
+    处理事件：StartWorkspace、LoadAgentImageResult、StartAgentResult
+    产出事件：LoadAgentImage、StartAgent、StartWorkspaceResult
     行为：
-        克隆本帧全部命令并逐个处理
-        StartWorkspace 调用 handler::create_workspace 并发送 StartWorkspaceResult
-        StopWorkspace 调用 handler::stop_workspace_entity 并发送 StopWorkspaceResult
-        StopWorkspaceByReference 先按资源 ID 定位并校验 project_root，再调用 stop_workspace_entity 并发送 StopWorkspaceByReferenceResult
-        ReloadWorkspace 先 stop 旧 Workspace，再 create 新 Workspace，发送 ReloadWorkspaceResult
+        克隆本帧全部StartWorkspace，逐个调用handle_start_workspace
+        克隆本帧全部LoadAgentImageResult，逐个调用handle_agent_image_result
+        克隆本帧全部StartAgentResult，逐个调用handle_start_agent_result
 
-route_agent_turn_abort_system(world: &mut World)
-    成员轮次中止路由 System：crate公开 System
-    处理事件：RouteAgentTurnAbort
-    行为：解析 Workspace 和可选 Agent ID；Agent 为空时使用 manager；成功时发送 AgentControl::AbortTurn
-
-route_mcl_command_system(world: &mut World)
-    MCL 命令路由 System：crate公开 System
-    处理事件：RouteMclCommand
-    行为：克隆本帧全部命令并逐个调用 handler::route_mcl_command；失败时直接通过命令回执返回错误字符串
-
-collect_mcl_command_response_system(world: &mut World)
-    MCL 命令响应收集 System：crate公开 System
-    行为：逐个尝试接收 pending_mcl_commands 中的 oneshot 回执
-    行为：Ok 时把 MclCommandValue 转为 JSON 后经外部回执发出，转换失败则回错误字符串
-    行为：Empty 时原样写回注册表等待下一帧；Closed 时回错误字符串
-
-collect_agent_image_system(world: &mut World)
-    镜像结果收集 System：crate公开 System
-    处理事件：LoadAgentImageResult
+stop_workspace_system(world: &mut World)
+    停止System：crate公开System
+    处理事件：StopWorkspace、StopAgentResult
+    产出事件：StopAgent、StopWorkspaceResult
     行为：
-        按 event_id 从 pending_images 定位 Workspace 和成员名
-        失败时标记成员 Failed 并记录带 workspace/agent 的日志
-        成功时准备 AgentCreateRequest：读取镜像依赖、Base Driver、模型、Memory
-        镜像依赖原样作为 AgentInfo.image_dependencies 传入，不在此处读取任何资源内容
-        发送 AgentCreateRequest 并把 oneshot 接收器写入 pending_agents
-        逐个消费 pending_agents 回执；成功时把 Agent 写入 Workspace.agents 和 Ready 状态，失败时标记 Failed
+        克隆本帧全部StopWorkspace，逐个调用handle_stop_workspace
+        克隆本帧全部StopAgentResult，逐个调用handle_stop_agent_result
+```
 
-collect_agent_initialization_system(world: &mut World)
-    初始化收集 System：crate公开 System
-    处理事件：AgentInitializationCompleted
-    行为：按 Agent 所属 Workspace 和 ResourceId 解析成员名，写入 Workspace.agents 和 Ready 状态，并记录带 workspace/agent 的日志
+## 逻辑
+
+```text
+事件驱动：
+    System只读取事件并调用Handler，业务处理和事件发送在Handler展开
+    没有事件时不扫描工作区判断是否完成
+    最后一个必要结果到达时，在该事件的Handler中完成状态转换和结果发送
+    启动System接受三种事件、产出三种事件，停止System接受两种事件、产出两种事件
+    warning是日志，不另增事件种类
+
+移除的System：
+    begin_workspace_command_system
+    reload_workspace_system
+    collect_agent_image_system
+    collect_agent_initialization_system及其曾计划的新名agent_status_system
+    collect_workspace_stop_system
+    route_agent_turn_abort_system
+    route_mcl_command_system
+    collect_mcl_command_response_system
 ```
 
 # handler
@@ -196,113 +187,169 @@ collect_agent_initialization_system(world: &mut World)
 
 crate公开：
 ```text
-stop_workspace_entity(world: &mut World, workspace: Entity) -> Result<(), WorkspaceError>
-    停止 Workspace Entity：crate公开函数，登记停止意图并发出取消，不直接回收
+handle_start_workspace(world: &mut World, request: StartWorkspace)
+    处理启动请求：crate公开函数
     行为：
-        Workspace 不存活返回 WorkspaceNotAlive
-        在 WorkspaceRegistry.stopping 中为该 Workspace 开一个空状态
-        从 pending_images 中移除属于它的待处理镜像请求
-        调用 stop_workspace_agents 登记成员并发出取消
-        不 despawn Agent，也不清理 registry，回收交给 collect_workspace_stop_system
+        校验请求ID和工作区定义，失败发送StartWorkspaceResult的Err
+        按definition.id调用find_entities检查已有工作区，已存在时发送DuplicateWorkspace错误，不覆盖旧实例
+        创建Entity，通过受检图书馆挂载入口插入Workspace，resourceid取definition.id，agents为空，state为Starting
+        不再挂载独立ResourceId组件；镜像集合由镜像加载方在目标Workspace Entity上创建或更新
+        在Starting中保存原始启动请求ID，并按镜像地址归并需要该镜像的成员Agent地址
+        为每个不同镜像生成唯一加载子请求ID，在状态中登记关联后发送LoadAgentImage，携带目标Workspace完整Entity和镜像ResourceID
+        无成员时直接置Ready并发送StartWorkspaceResult的Ok(workspace)
+        有成员时不提前发送启动成功
 
-stop_workspace_agents(world: &mut World, workspace: Entity)
-    停止 Workspace 的成员：crate公开函数
-    行为：按 Agent.info.workspace_id 查找成员，因此 Creating 且尚未登记进 Workspace.agents 的成员也会被找到
-    行为：每个成员只在首次登记时发送一次 AgentControl::Stop
-
-collect_workspace_stop_system(world: &mut World)
-    收敛 Workspace 停止：crate公开 System，在途工作全部停止后才回收
+handle_agent_image_result(world: &mut World, event: LoadAgentImageResult)
+    处理镜像结果：crate公开函数
     行为：
-        对每个 stopping 中的 Workspace 先调用 stop_workspace_agents
-        逐个成员判断是否已排空：
-            Agent.lua.vm_id 与 Agent.lua.request_id 均为空
-            且 lifecycle 为 Stopped 或 Failed
-            且 tools.pending 与 inference.pending 均为空
-        已排空的成员先调用 resource_library_plugin::release_resource_owner 释放其持有的资源
-        再 despawn 该成员
-        所有成员都不存活且没有属于该 Workspace 的 pending_agents 时才算整体排空
-        整体排空后移除 registry 条目与模型路由，despawn Workspace，并回复所有挂起的停止请求
+        通过结果的子请求ID查找Starting中等待该结果的Workspace，未匹配时忽略
+        核对目标Workspace完整Entity及镜像ResourceID，拒绝不匹配结果，不消费合法请求的等待记录
+        匹配后移除对应镜像等待记录，重复结果不再次处理
+        失败时记录工作区启动错误，不启动依赖该镜像的成员
+        成功时确认目标Workspace Entity上的ResourceSet<AgentImage>包含该镜像ID；缺失则记录ResourceResolutionFailed且不启动对应成员
+        LoadAgentImageResult只是挂载完成通知，挂载由AgentImage插件完成，Workspace不重复插入或替换镜像集合
+        不登记依赖者，不创建镜像实体，也不在Workspace组件内另存镜像映射
+        为等待该镜像的每个成员生成唯一StartAgent子请求ID，登记成员关联后发送StartAgent
+        StartAgent携带工作区Entity、成员定义和镜像ResourceID，以工作区Entity加镜像ID定位具体镜像条目
+        不由Workspace复制镜像内部的VM或模型数据，不以全局镜像查询的首个Entity代替指定工作区
+        调用finish_workspace_start检查本次启动是否已完成
 
-排队中的创建：
-    仍在 pending_agents 中的创建请求尚未产生 Agent，但随后仍可能产生一个
-    因此必须等它的回执落地后才允许判定整体排空
-
-收敛失败时的现状：
-    判据不满足时本 System 直接跳过该 Workspace，下一帧再试
-    没有超时、没有重试上限、也没有降级路径
-    因此只要判据中任何一条永远不满足，该 Workspace 就永远留在 stopping 中
-    其后果是三条同时成立：
-        Workspace Entity 不回收，registry 条目不清除，模型路由不撤销
-        挂起在 replies 中的停止请求永远不回复
-        Workspace ResourceId 仍被占用，同名 Workspace 无法再次创建（DuplicateWorkspace）
-    排查顺序：先确认成员是否都满足判据，再看 pending_agents 是否有属于它的残留
-
-回复延迟的原因：
-    停止请求不立即回复，而是压入 WorkspaceStopState.replies
-    只有整体排空后才逐个转成结果事件
-    因此调用方看到的超时等价于"该 Workspace 没有排空"
-
-create_workspace(world: &mut World, definition: &WorkspaceDefinition) -> Result<Entity, WorkspaceError>
-    创建 Workspace Entity：crate公开函数
+handle_start_agent_result(world: &mut World, event: StartAgentResult)
+    处理成员启动结果：crate公开函数
     行为：
-        ResourceId 已存在返回 DuplicateWorkspace
-        创建 Entity 并插入 ResourceId 和 Workspace
-        为每个 Agent 初始化 Creating 状态并发送 LoadAgentImage
-        写入 WorkspaceRegistry.workspaces
-        不等待 Agent 创建完成
+        通过结果的子请求ID查找Starting中等待该结果的Workspace，未匹配时忽略
+        按等待记录确认成员身份，消费匹配记录，重复结果不再次处理
+        成功时将成员Agent地址和Entity写入agents
+        失败时记录工作区启动错误
+        调用finish_workspace_start检查本次启动是否已完成
 
-route_mcl_command(world: &mut World, command: RouteMclCommand) -> Result<(), WorkspaceError>
-    路由 MCL 命令：crate公开函数
+handle_stop_workspace(world: &mut World, request: StopWorkspace)
+    处理停止请求：crate公开函数
     行为：
-        解析 Workspace；命令带 agent_id 时按资源 ID 查找，否则使用 manager
-        读取 Agent 的 ResourceId，创建 MclCommandId 和 oneshot 回执
-        原样转发命令的 source，发送 MclCommandRequest，并把外部回执和 oneshot 接收器写入 pending_mcl_commands
+        检查目标Entity及Workspace组件，不存在时记录warning并发送WorkspaceNotAlive错误结果，不留下无回复请求
+        Starting时返回WorkspaceBusy，不打断尚未收齐结果的启动过程
+        Stopping时返回WorkspaceBusy，不重复发送成员停止请求
+        Ready或Failed时，取出agents中的所有成员，保存原停止请求ID并将state置为Stopping
+        为每个成员生成唯一StopAgent子请求ID，在Stopping中登记关联后发送StopAgent
+        agents为空时直接回收Workspace并发送StopWorkspaceResult的Ok(原Entity)
+        不读取Agent内部的VM、工具调用、推理或生命周期字段
+
+handle_stop_agent_result(world: &mut World, event: StopAgentResult)
+    处理成员停止结果：crate公开函数
+    行为：
+        通过结果的子请求ID查找Stopping中等待该结果的Workspace，未匹配时忽略
+        按等待记录确认目标成员，消费匹配记录，重复结果不再次处理
+        成功时从agents移除对应成员，Agent实体由Agent插件清理，不在此重复despawn
+        失败时记录停止错误并保留该成员引用
+        调用finish_workspace_stop检查本次停止是否已完成
+```
+
+私有：
+```text
+finish_workspace_start(world: &mut World, workspace: Entity)
+    完成启动判定：私有函数，只由启动事件Handler调用
+    行为：
+        Starting中还有等待镜像或等待成员请求时返回，不扫描Agent状态
+        全部请求结束且没有错误时将state置Ready，发送原始id对应的StartWorkspaceResult::Ok(workspace)
+        全部请求结束且有错误时将state置Failed，发送原始id对应的StartWorkspaceResult::Err(error)
+        失败时保留已创建成员和已加载的镜像集合，允许随后通过StopWorkspace清理，不偷偷销毁仍有成员的Workspace
+        转移状态后不再保留本次启动等待记录，原请求只回复一次
+
+finish_workspace_stop(world: &mut World, workspace: Entity)
+    完成停止判定：私有函数，只由停止事件Handler调用
+    行为：
+        Stopping中还有等待成员请求时返回
+        全部请求结束且没有错误时保存原始请求id与完整Workspace Entity，despawn Workspace，再发送StopWorkspaceResult::Ok(原Entity)
+        全部请求结束且有错误时将state置Failed，保留未成功停止的成员，发送StopWorkspaceResult::Err(error)
+        Workspace Entity销毁时，其Workspace组件与ResourceSet<AgentImage>一同释放
+        不调用release_resource_owner，不登记ResourceOwners，不等待GC，也不删除磁盘镜像包
+```
+
+## 逻辑
+
+```text
+启动：
+    StartWorkspace -> Starting -> LoadAgentImage
+    LoadAgentImageResult -> 确认本Entity镜像集合已更新 -> StartAgent
+    StartAgentResult -> 更新agents -> 全部成功后Ready -> StartWorkspaceResult
+    同一工作区的多个成员使用同一镜像时只提交一次加载，加载完成后分别启动成员
+    不同工作区可以各自保存同ID镜像条目，一方加载更新不会自动覆盖另一方集合
+    StartWorkspaceResult成功意味着定义中的全部成员都取得StartAgentResult成功结果，不再是仅创建了Workspace Entity
+    StartAgentResult成功的准确边界由Agent插件保证，Workspace不额外监听Agent初始化事件
+
+停止：
+    StopWorkspace -> Stopping -> StopAgent
+    StopAgentResult -> 更新成员集合 -> 全部成功后销毁Workspace -> StopWorkspaceResult
+    多成员工作区必须等待所有已发StopAgent请求结束，不能收到第一个结果就销毁Workspace
+    StopAgentResult成功必须表示Agent已完成清理，不能仅表示接受了停止请求
+    工具、推理、VM如何停止由Agent插件负责，Workspace不以轮询代替完成事件
+    成功结果中的Entity表示已清理的实例身份，不再保证能查询其组件
+
+过程关联：
+    顶层请求id与子请求id分开，子请求id在运行期唯一，不只用成员名或可复用的实体index构造
+    不使用全局WorkspaceRegistry，以Workspace.state中的等待表匹配结果
+    可在结果事件到达时查询Workspace组件寻找匹配的子请求，不增加每帧轮询System
+    一条等待记录只消费一次，旧结果不能推进新实例的操作
+
+尚待确认的异常策略：
+    本文为闭合流程暂定Starting和Stopping中的新停止请求返回WorkspaceBusy，不引入启动中取消协议
+    启动失败收齐已发请求后返回Err并保留部分实例；停止失败保留未清理成员，后续可再次Stop
+    不存在的Workspace按要求记录warning，同时暂定返回Err以完成请求关联
+    这些是成功链路之外的补充约定；如需启动中停止、失败自动回滚或停止幂等成功，后续再设计
+    未收到必要结果时保持对应状态，本次不引入超时或强制销毁策略
 ```
 
 # events
 
 ## 类型
 
-公开：
+公开，统一定义于共享types crate的workspace_events.rs：
 ```text
-StartWorkspaceResult：Workspace 启动结果，公开事件
-    id: String--原请求 ID
-    result: Result<Entity, WorkspaceError>--成功时返回 Workspace Entity
+StartWorkspace：Workspace启动请求，公开事件
+    id: String--请求ID
+    definition: WorkspaceDefinition--Workspace的定义
+    impl Event for StartWorkspace
+
+StartWorkspaceResult：Workspace启动结果，公开事件
+    id: String--原请求ID
+    result: Result<Entity, WorkspaceError>--成功时返回全部成员启动成功的Workspace Entity
     impl Event for StartWorkspaceResult
 
-ReloadWorkspace：Workspace 重载请求，公开事件
-    id: String--请求 ID
-    workspace: Entity--当前 Workspace Entity
-    definition: WorkspaceDefinition--重新编译的定义
-    impl Event for ReloadWorkspace
-
-ReloadWorkspaceResult：Workspace 重载结果，公开事件
-    id: String--原请求 ID
-    previous: Entity--被关闭的原 Workspace Entity
-    result: Result<Entity, WorkspaceError>--新 Workspace Entity
-    impl Event for ReloadWorkspaceResult
-
-StopWorkspace：Workspace 停止请求，公开事件
-    id: String--请求 ID
-    workspace: Entity--目标 Workspace Entity
+StopWorkspace：Workspace停止请求，公开事件
+    id: String--请求ID
+    workspace: Entity--目标Workspace Entity
     impl Event for StopWorkspace
 
-StopWorkspaceResult：Workspace 停止结果，公开事件
-    id: String--原请求 ID
-    workspace: Entity--原 Workspace Entity
-    result: Result<(), WorkspaceError>--停止结果
+StopWorkspaceResult：Workspace停止结果，公开事件
+    id: String--原请求ID
+    result: Result<Entity, WorkspaceError>--成功时返回已清理的原Workspace Entity
     impl Event for StopWorkspaceResult
+```
 
-StopWorkspaceByReference：按逻辑引用停止 Workspace，公开事件
-    id: String--请求 ID
-    workspace: WorkspaceReference--Workspace 逻辑引用
-    impl Event for StopWorkspaceByReference
+## 逻辑
 
-StopWorkspaceByReferenceResult：按逻辑引用停止结果，公开事件
-    id: String--原请求 ID
-    workspace: WorkspaceReference--原逻辑引用
-    result: Result<(), WorkspaceError>--停止结果
-    impl Event for StopWorkspaceByReferenceResult
+```text
+事件归属：
+    所有插件的事件统一在共享types crate定义，每个插件对应一个事件定义文件
+    Workspace使用workspace_events.rs，Agent和AgentImage的事件分别由其对应文件提供
+    本crate不重复定义事件，src/events.rs如保留则只重导出共享事件
+    删除ReloadWorkspace和ReloadWorkspaceResult，暂不提供reload
+    删除StopWorkspaceByReference和对应结果，不保留第二套停止入口
+
+外部事件的最小约定：
+    LoadAgentImage与LoadAgentImageResult必须能关联唯一子请求、目标Workspace完整Entity和镜像ResourceID
+    AgentImage插件加载或更新指定Entity上的ResourceSet<AgentImage>，写入完成后才发成功结果
+    目标Entity已销毁时不得向复用其index的新实体写入；不存在独立镜像Entity返回值
+    StartAgent与StartAgentResult必须能关联唯一子请求及成员
+    StartAgent至少能表达工作区Entity、成员定义与镜像ResourceID，结果成功返回Agent Entity
+    Agent插件从指定工作区的镜像集合取启动材料；若Agent需要长期持有镜像，则保存自身的资源集合条目或所需启动快照，不长期借用Workspace组件
+    StopAgent与StopAgentResult必须能关联唯一子请求及目标Agent，结果成功表示目标已完成清理
+    外部事件的完整字段和其他插件的实现以后设计，本文件只声明Workspace需要的契约
+
+依赖方向：
+    workspace_plugin通过共享types使用事件，不从agent_plugin或agent_image_plugin导入事件
+    共享事件涉及的WorkspaceDefinition、ResourceID和错误契约也必须可被共享层引用
+    共享types不得反向依赖workspace_plugin来取得WorkspaceError，否则产生循环依赖
 ```
 
 # types
@@ -311,124 +358,126 @@ StopWorkspaceByReferenceResult：按逻辑引用停止结果，公开事件
 
 公开：
 ```text
-WorkspaceAgentState：Workspace 成员状态，公开枚举
-    Creating
-    Ready { agent: Entity }
-    Failed { error: WorkspaceError }
-    impl Clone + Debug + PartialEq + Eq for WorkspaceAgentState
+WorkspaceState：工作区状态机，公开枚举--只表示工作区生命周期及本次操作进度，不跟踪成员运行状态
+    Starting(WorkspaceStartState)--成员启动过程尚未完成
+    Ready--定义中的全部成员已成功启动，本工作区不再监听其运行状态变化
+    Stopping(WorkspaceStopState)--等待成员停止结果
+    Failed { error: WorkspaceError }--一次启动或停止已结束但失败，保留尚需清理的工作区
 
-WorkspaceRegistry：WorkspacePlugin 注册表，公开 Resource
-    agent_images_root: Arc<PathBuf>--AgentImage 根目录
-    workspaces: Vec<Entity>--已创建 Workspace Entity
-    stopping: HashMap<Entity, WorkspaceStopState>--正在停止的 Workspace 及其挂起请求，crate 内可见
-    pending_images: BTreeMap<String, (Entity, String)>--待处理镜像请求 ID 到 Workspace 和成员名
-    pending_agents: BTreeMap<String, (Entity, String, oneshot::Receiver<Result<Entity, AgentError>>)>--待处理创建请求 ID 到 Workspace、成员名和回执接收器
-    pending_mcl_commands: BTreeMap<String, (mpsc::Sender<Result<serde_json::Value, String>>, oneshot::Receiver<Result<MclCommandValue, MclError>>)>--待处理 MCL 命令 ID 到外部回执和内部回执接收器
-    impl Default for WorkspaceRegistry
-    impl Resource for WorkspaceRegistry
+WorkspaceStartState：工作区启动进度，公开类型--由Workspace.state持有，不是独立Resource
+    request_id: String--原StartWorkspace请求ID
+    pending_images: BTreeMap<String, ResourceID>--镜像加载子请求ID到镜像地址
+    image_members: BTreeMap<ResourceID, Vec<ResourceID>>--镜像地址到依赖该镜像的成员Agent地址
+    pending_agents: BTreeMap<String, ResourceID>--成员启动子请求ID到成员Agent地址
+    error: Option<WorkspaceError>--本次启动首先记录的错误，其余错误记录日志
+
+WorkspaceStopState：工作区停止进度，公开类型--由Workspace.state持有，不是独立Resource
+    request_id: String--原StopWorkspace请求ID
+    pending_agents: BTreeMap<String, (ResourceID, Entity)>--停止子请求ID到成员Agent地址和完整Entity
+    error: Option<WorkspaceError>--本次停止首先记录的错误，其余错误记录日志
 ```
 
-crate内可见：
-```text
-WorkspaceStopState：一次停止过程的挂起状态，crate内可见结构体
-    agents: HashSet<Entity>--已被要求停止的成员
-    replies: Vec<WorkspaceStopReply>--已到达但尚未回复的停止请求
-    impl Default for WorkspaceStopState
-    说明：本类型不再对外暴露停止语义，只用于 collect_workspace_stop_system 判定排空
+## 逻辑
 
-WorkspaceStopReply：挂起的停止请求，crate内可见枚举
-    Stop(StopWorkspace)
-    Reference(StopWorkspaceByReference)
-    Reload(ReloadWorkspace)
-    说明：三种停止入口共用同一条排空流程，排空后按原变体回复
+```text
+命名：
+    Starting与StartWorkspace对应，Ready表示工作区启动已完成
+    Stopping与StopWorkspace对应，比Closing更直接
+    销毁实体就是停止完成，不为已不存在的实体保存Stopped状态
+
+状态转换：
+    不存在 -> StartWorkspace -> Starting
+    Starting -> 所有子请求成功 -> Ready
+    Starting -> 所有子请求结束且有错误 -> Failed
+    Ready或Failed -> StopWorkspace -> Stopping
+    Stopping -> 所有成员停止成功 -> Entity销毁
+    Stopping -> 所有停止子请求结束且有错误 -> Failed
+
+取消旧存储：
+    删除WorkspaceAgentState、WorkspaceRegistry和WorkspaceStopReply
+    agents不再配套states成员状态表
+    异步请求的关联不能凭空消失，因此仅将本次操作需要的等待表放入WorkspaceState
+    不保存oneshot回执，不轮询接收器，不另建全局工作区注册表
 ```
 
 # error
 
 ## 类型
 
-公开：
+公开，共享事件可引用的错误契约，目标定义位于共享types crate而非依赖Workspace插件：
 ```text
-WorkspaceErrorKind：Workspace 错误分类，公开枚举
+WorkspaceErrorKind：工作区错误分类，公开枚举
     InvalidRequest
     InvalidDefinition
-    InvalidProjectRoot
-    InvalidAgentImagesRoot
     DuplicateWorkspace
-    DuplicateResource
     WorkspaceNotAlive
-    WorkspaceNotReady
-    WorkspaceMismatch
+    WorkspaceBusy
+    ResourceResolutionFailed
     AgentImageLoadFailed
-    AgentImageComponentsMissing
-    InferenceSetupFailed
-    MemorySetupFailed
-    ResourceSetupFailed
-    AgentCreateFailed
+    AgentStartFailed
+    AgentStopFailed
 
-WorkspaceError：Workspace 错误，公开结构体
-    kind: WorkspaceErrorKind--错误分类，私有
-    message: String--错误描述，私有
+WorkspaceError：工作区错误，公开结构体
+    kind: WorkspaceErrorKind--错误分类
+    message: String--错误描述
     new(kind: WorkspaceErrorKind, message: impl Into<String>) -> Self
-        构造错误：公开关联函数
+        构造错误：公开关联函数，保存分类和消息
     kind(&self) -> WorkspaceErrorKind
         读取分类：公开方法
     message(&self) -> &str
-        读取描述：公开方法
+        读取消息：公开方法
     impl Clone + Debug + PartialEq + Eq for WorkspaceError
     impl fmt::Display for WorkspaceError
+        fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
+            格式化错误：输出分类与消息
     impl std::error::Error for WorkspaceError
 ```
 
-# 逻辑
+## 逻辑
 
 ```text
-启动：
-    StartWorkspace
-    -> create_workspace 创建 Workspace Entity 并登记 Registry
-    -> 为每个成员发送 LoadAgentImage
-    -> LoadAgentImageResult 经 collect_agent_image_system
-    -> 打开 Memory，构造 AgentCreateRequest
-    -> AgentCreateRequest 回执经 collect_agent_image_system 消费
-    -> Workspace.agents 登记成功成员
-    -> AgentInitializationCompleted 经 collect_agent_initialization_system 标记 Ready
-
-停止：
-    StopWorkspace / StopWorkspaceByReference / ReloadWorkspace
-    -> stop_workspace_entity 登记意图并发送 AgentControl::Stop
-    -> collect_workspace_stop_system 反复收敛直至排空
-    -> 成员排空时 release_resource_owner 释放其资源，再 despawn 成员
-    -> 整体排空后清理 pending_images / pending_agents / 模型路由
-    -> despawn Workspace 并回复挂起的停止请求
-
-停止收敛的判据：
-    生命周期标签本身不足以证明执行已结束，Failed的VM仍可能持有在途执行
-    因此要求 VM、tools.pending 与 inference.pending 同时为空
-    资源必须晚于在途工作释放，否则运行中的调用会失去自己的资源
-
-消息：
-    RouteAgentTurnAbort -> route_agent_turn_abort_system -> AgentControl::AbortTurn
-    RouteMclCommand -> route_mcl_command_system -> MclCommandRequest -> collect_mcl_command_response_system -> 外部回执
+错误边界：
+    Workspace只包装自己协调的请求与结果错误，不保留VM、Memory、工具或推理初始化的专属错误分类
+    外部插件的失败经其结果事件到达，由Workspace映射为镜像加载、成员启动或成员停止失败
+    不存在目标的停止记录warning；日志级别不代替结果事件
+    src/error.rs如保留则重导出共享错误，不在本插件与共享types之间互相依赖
 ```
 
-# 持有关系
+# 后续资源基础设施约定
+
+本节只记录Workspace使用最新资源设计的方式，不修改或完整设计其他插件。
 
 ```text
-App
-└── World
-    ├── WorkspaceRegistry Resource
-    │   ├── agent_images_root: Arc<PathBuf>
-    │   ├── workspaces: Vec<Entity>
-    │   ├── stopping: HashMap<Entity, WorkspaceStopState>
-    │   │   └── WorkspaceStopState { agents: HashSet<Entity>, replies: Vec<WorkspaceStopReply> }
-    │   ├── pending_images: BTreeMap<String, (Entity, String)>
-    │   ├── pending_agents: BTreeMap<String, (Entity, String, oneshot::Receiver<...>)>
-    │   └── pending_mcl_commands: BTreeMap<String, (mpsc::Sender<...>, oneshot::Receiver<...>)>
-    └── Workspace Entity
-        ├── ResourceId
-        └── Workspace
-            ├── definition: Arc<WorkspaceDefinition>
-            ├── project_root: Arc<PathBuf>
-            ├── manager_name: String
-            ├── agents: BTreeMap<String, Entity>
-            └── states: BTreeMap<String, WorkspaceAgentState>
+实体组成：
+    Workspace Entity
+        Workspace { resourceid, definition, project_root, agents, state }
+            实现Component和LibraryComponent，是本Entity唯一图书馆组件
+        ResourceSet<AgentImage>
+            实现Component和ResourcesComponent，以镜像ResourceID为键保存AgentImage条目
+    ResourceID只是地址值，不是独立组件
+    不存在独立镜像宿主Entity、依赖者集合或资源GC
+
+查询：
+    workspace地址通过Workspace::resource_id匹配，受检挂载保证图书馆地址唯一
+    image地址通过ResourceSet<AgentImage>::resource_ids匹配，可能查出多个工作区或其他持有者Entity
+    已知目标Workspace时直接在该Entity的镜像集合按ID取值，不进行全局任选匹配
+
+生命周期：
+    停止全部成员后销毁Workspace Entity，其镜像集合随之释放
+    其他Entity上的同ID镜像条目不受影响，磁盘镜像包保留
+    不调用release_resource_owner，不使用ResourceOwners，不引入GC System
+    Agent插件必须在StopAgentResult成功前完成成员清理，Workspace不能先销毁再让Agent继续借用其镜像集合
+
+依赖方向：
+    Workspace通过共享事件契约请求镜像加载，不直接调用AgentImage插件的加载Handler
+    如需读取ResourceSet<AgentImage>，AgentImage数据类型必须是可共享的资源契约，而非迫使Workspace依赖镜像插件实现
+    该类型的最终定义位置、镜像事件完整字段以及Agent侧取用材料的方式留待对应插件设计
+    统一资源插件提供地址、组件trait和类型注册；Workspace不自行实现第二套身份索引
+
+待后续落实：
+    三个基础插件的合并与ResourceID、ResourceSet实现
+    AgentImage插件向指定Entity加载镜像资源条目的事件契约
+    Agent启动和停止事件的完整字段及失败清理规则
+    MCL和轮次中止的新入口
+    本次不改Rust代码、不恢复reload
+```
