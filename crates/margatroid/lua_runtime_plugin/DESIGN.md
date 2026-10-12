@@ -29,451 +29,414 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # 板块格式
 
-每个 crate 的 DESIGN.md 在伪代码格式之后使用六个一级标题，按 `lib`、`system`、`handler`、`events`、`types`、`error` 顺序组织。每个标题对应 `src/` 下的同名 Rust 文件：
+正文按lib、system、handler、events、types、error六个板块组织。
 
 ```text
-# lib        src/lib.rs        图书馆组件与 Plugin
-# system     src/system.rs     System 函数
-# handler    src/handler.rs    处理函数
-# events     src/events.rs     事件类型
-# types      src/types.rs      其余类型
-# error      src/error.rs      Error 与公开错误分类
+lib        src/lib.rs        Plugin与执行职责
+system     src/system.rs     启动、停止及运行期异常事件调度
+handler    src/handler.rs    提交任务、安装槽位和使用关闭句柄
+events     共享types crate    lua_runtime_events.rs中的全部事件及异步输出契约
+types      共享契约及内部类型  实例关联、关闭能力、程序和环境
+error      共享错误契约       执行、通知与清理错误
 ```
+
+**本文是尚未实现的目标设计，不是当前代码说明。本次只改文档。**
+
+不再设置Lua注册表。Agent.lua保存常驻wake槽位、ready发送端暂存、ended接收端暂存及关闭句柄。
+Agent只提供存储并发送生命周期请求，MCL使用通知槽位，LuaRuntime安装并使用关闭句柄。
 
 # lib
 
-lib 放 Plugin、安装标记 Resource 和公开 re-export。
-
 ## 类型
 
 公开：
 ```text
-LuaVmId：虚拟机标识，公开元组结构体--由margatroid_types重新导出
-    0: u64--运行时内递增标识
-
-LuaRuntimePlugin：Lua运行时插件，公开单元结构体--统一创建、调度、执行和销毁Lua虚拟机，不包含任何业务领域语义
-    schedule: String--System所属Schedule，私有
-    config: LuaRuntimeConfig--运行时配置，私有
-    new() -> Self
-        构造插件：公开关联函数，默认UPDATE和LuaRuntimeConfig::default()
+LuaRuntimePlugin：Driver执行插件，公开结构体
+    schedule: String--请求和启动闭包结果处理计划
+    config: LuaRuntimeConfig--Lua执行限制
     with_schedule(mut self, schedule: impl Into<String>) -> Self
-        设置Schedule：公开构建方法
-    with_config(mut self, config: LuaRuntimeConfig) -> Self
-        设置配置：公开构建方法
+        设置计划：公开方法，保存计划名并返回自身
+    with_config(mut self, config: LuaRuntimeConfig) -> Result<Self, LuaRuntimeError>
+        设置配置：公开方法，检查限制有效后保存
     impl Default for LuaRuntimePlugin
-        Default：公开trait实现，调用new
+        default() -> Self
+            默认构造：使用RuntimePlugin::UPDATE与默认配置
     impl Plugin for LuaRuntimePlugin
-        Plugin：公开trait实现
         build(self, app: &mut App)
             安装插件：公开trait方法
             行为：
-                要求RuntimePlugin和AsyncRuntimePlugin已安装
-                重复安装时panic
-                Schedule不存在时panic
-                插入LuaRuntimeHandle、LuaRuntimeConfig、LuaRuntimeState和LuaRuntimePluginInstalled
-                在schedule依次挂载lua_runtime_request_system、lua_runtime_cancel_system、lua_vm_message_system、lua_vm_receive_system和lua_runtime_result_system
-
-LuaRuntimePluginInstalled：LuaRuntimePlugin安装标记，公开单元Resource--阻止重复安装
-    impl Resource for LuaRuntimePluginInstalled
-```
-
-# system
-
-system 放 System 函数。System 只读取本帧事件并克隆，然后调用 handler。
-
-## 函数
-
-crate公开：
-```text
-lua_runtime_request_system(world: &mut World)
-    接收执行请求：crate公开System
-    处理事件：LuaRuntimeRequest
-    行为：克隆本帧全部请求，逐个调用handle_lua_runtime_request
-
-lua_runtime_cancel_system(world: &mut World)
-    接收取消请求：crate公开System
-    处理事件：LuaRuntimeCancelRequest
-    行为：克隆本帧全部请求，调用handle_lua_runtime_cancels
-
-lua_vm_message_system(world: &mut World)
-    投递长期VM消息：crate公开System
-    处理事件：LuaVmMessage
-    行为：克隆本帧全部消息，调用handle_lua_vm_messages
-
-lua_vm_receive_system(world: &mut World)
-    长期VM邮箱读取：crate公开System
-    处理事件：LuaVmMessageReceiveRequest
-    行为：克隆本帧全部请求，调用handle_lua_vm_receives
-
-lua_runtime_result_system(world: &mut World)
-    收集运行时结果：crate公开System
-    处理事件：LuaRuntimeTaskFinished
-    行为：克隆本帧全部完成事件，调用handle_lua_runtime_finished
-```
-
-# handler
-
-handler 放处理函数。请求校验、VM执行、取消和邮箱配对逻辑都在此展开。
-
-## 函数
-
-crate公开：
-```text
-handle_lua_runtime_request(world: &mut World, request: LuaRuntimeRequest)
-    处理执行请求：crate公开函数
-    行为：
-        校验request_id、重复请求和源码大小
-        分配LuaVmId和CancellationToken并写入LuaRuntimeState
-        若该request_id已在pre_cancelled中则先取出并立即标记取消
-        LongRunning请求立即发送LuaVmStarted
-        读取配置后将VM执行任务提交到独立线程
-        任务结束时通过reply恰好发送一次结果，并发送LuaRuntimeTaskFinished
-        校验失败时立即fail回执并发送vm_id为空的LuaRuntimeTaskFinished
-
-handle_lua_runtime_cancels(world: &mut World, requests: Vec<LuaRuntimeCancelRequest>)
-    处理取消请求：crate公开函数
-    行为：
-        按request_id标记取消令牌
-        同时按owner_id匹配所有相关请求并取消
-        命中任一请求即视为已匹配
-        未匹配时把request_id写入pre_cancelled
-
-取消先于请求到达：
-    取消与请求各自经由事件传递，任意一方都可能先被观察到
-    只按已注册请求取消会漏掉先到的取消，请求随后仍会照常执行
-    pre_cancelled保存这类取消，注册时消费并让本体一起步就是取消态
-    因此执行体在第一次检查点即停止，而不是运行到结束
-
-handle_lua_vm_messages(world: &mut World, messages: Vec<LuaVmMessage>)
-    处理长期VM消息：crate公开函数
-    行为：
-        有pending receive时直接配对并发送LuaVmMessageReceived
-        否则把value追加到VM FIFO邮箱
-        不执行Lua代码
-
-handle_lua_vm_receives(world: &mut World, requests: Vec<LuaVmMessageReceiveRequest>)
-    处理邮箱读取：crate公开函数
-    行为：
-        邮箱非空时取出最早值并发送LuaVmMessageReceived
-        邮箱为空且VM存活时保存pending receive；已有pending receive时发送InvalidRequest响应
-        VM不存在时发送VmExecutionFailed响应
-
-handle_lua_runtime_finished(world: &mut World, finished: Vec<LuaRuntimeTaskFinished>)
-    处理任务完成：crate公开函数
-    行为：
-        清理requests、owners、sessions、mailboxes和receives
-        仅当该request_id确实注册过时才清理其pre_cancelled：
-            未注册的ID必须继续等待属于自己的请求
-        对仍挂起的receive发送失败响应
-        不将结果转换为业务领域事件
-```
-
-私有：
-```text
-create_minimal_lua() -> Result<Lua, LuaRuntimeError>
-    创建最小VM：私有函数，用于LuaStandardLibraries::Minimal
-    行为：
-        以StdLib::NONE创建Lua状态，只得到基础库
-        逐个把MINIMAL_REMOVED_GLOBALS中的全局量置为nil：dofile、loadfile、load、loadstring、require、collectgarbage、print、warn
-        失败映射为VmCreationFailed
-    边界：mlua没有基础库开关，基础库总是随状态创建，因此必须建后裁剪；
-          裁剪在provider注入之前完成，所以mcl与agent_info不受影响
-
-execute_lua(program: LuaProgram, context: LuaEnvironmentContext, providers: Vec<String>, registry: Option<Arc<RwLock<LuaEnvironmentRegistry>>>, cancellation: CancellationToken) -> Result<LuaValue, LuaRuntimeError>
-    执行VM：私有函数
-    行为：
-        按LuaStandardLibraries创建独立Lua VM；Minimal走create_minimal_lua
-        安装环境提供器生成的全局值、宿主函数和模块
-        编译并执行源码或入口函数
-        宿主函数调用按阻塞函数语义暂停当前VM，等待宿主Future完成后恢复
-        在宿主调用前后和指令检查点响应取消
-        返回值转换为LuaValue
-
-lua_value_size(value: &LuaValue) -> usize
-    计算LuaValue大小：私有函数
-
-to_ml_value(lua: &Lua, value: LuaValue) -> Result<MlValue, LuaRuntimeError>
-    LuaValue转mlua值：私有函数
-
-from_ml_value(value: MlValue) -> Result<LuaValue, LuaRuntimeError>
-    mlua值转LuaValue：私有函数
-```
-
-# events
-
-events 放事件类型。
-
-## 类型
-
-公开：
-```text
-LuaRuntimeRequest：Lua执行请求，公开事件--业务插件提交一个待执行的Lua程序
-    request_id: String--调用方用于匹配结果的请求标识
-    owner: LuaVmOwner--执行所属者和生命周期归属
-    program: LuaProgram--待执行程序
-    context: LuaEnvironmentContext--环境提供器使用的上下文
-    providers: Vec<String>--本次执行显式启用的环境提供器名称，按该顺序安装
-    scheduler: LuaScheduler--本次执行使用的调度模式
-    deadline: Option<Instant>--绝对截止时间；空时由调度模式决定是否使用默认时限
-    reply: LuaRuntimeReply--可从只读事件中安全取出的恰好一次回执
-    impl Event for LuaRuntimeRequest
-
-LuaRuntimeCancelRequest：Lua取消请求，公开事件
-    request_id: String--被取消请求的标识
-    vm_id: Option<LuaVmId>--已创建VM时指定VM标识，尚未创建时为空
-    impl Event for LuaRuntimeCancelRequest
-
-LuaVmMessage：Lua VM消息，公开事件
-    vm_id: LuaVmId--目标长期VM
-    value: LuaValue--投递给VM消息邮箱的结构化值
-    impl Event for LuaVmMessage
-
-LuaVmMessageReceiveRequest：长期Lua VM邮箱读取请求，公开事件
-    id: String--调用方生成的唯一请求ID
-    vm_id: LuaVmId--目标长期VM
-    impl Event + Clone for LuaVmMessageReceiveRequest
-
-LuaVmMessageReceived：长期Lua VM邮箱读取响应，公开事件
-    id: String--原读取请求ID
-    vm_id: LuaVmId--原目标长期VM
-    result: Result<LuaValue, LuaRuntimeError>--最早的邮箱值或稳定运行时错误
-    impl Event + Clone for LuaVmMessageReceived
-
-LuaVmStarted：Lua VM启动通知，公开事件--VM已经创建、环境已经完整安装且程序已经成功加载
-    request_id: String--原执行请求标识
-    vm_id: LuaVmId--新VM标识
-    owner: LuaVmOwner--原请求归属
-    impl Event for LuaVmStarted
-
-LuaRuntimeTaskFinished：Lua任务完成事件，公开事件--通知运行时所属业务清理请求索引和VM归属
-    request_id: String--完成请求的标识
-    vm_id: Option<LuaVmId>--已经分配时为VM标识，请求在调度前失败时为空
-    owner: LuaVmOwner--原请求归属
-    state: LuaVmState--任务终态
-    error: Option<LuaRuntimeError>--失败时的稳定错误，正常完成或取消时为空
-    impl Event for LuaRuntimeTaskFinished
-```
-
-# types
-
-types 放除事件和错误外的其余类型、环境注册表和运行时句柄。
-
-## 类型
-
-公开：
-```text
-LuaValue：Lua结果值，公开枚举--运行时边界允许传输的无环数据
-    Nil
-    Boolean(bool)
-    Integer(i64)
-    Number(f64)
-    String(String)
-    Array(Vec<LuaValue>)
-    Object(BTreeMap<String, LuaValue>)
-
-LuaVmOwner：VM归属，公开结构体
-    owner_id: String--归属资源或任务的稳定标识
-
-LuaProgram：Lua程序，公开结构体
-    source: String--UTF-8 Lua源码
-    origin: String--日志和错误定位用来源名
-    entry: Option<String>--入口函数名；空表示直接执行源码Chunk
-    libraries: LuaStandardLibraries--显式允许的Lua标准库集合
-
-LuaStandardLibraries：Lua标准库集合，公开枚举
-    Minimal--不开放任何标准库：基础库只保留语言本体，并在建VM后摘掉宿主访问入口
-    Safe--开放mlua的ALL_SAFE，即除FFI与DEBUG外的全部标准库；仍含io、os、package，不等于进程隔离
-    Full--开放完整Lua标准库，含FFI与DEBUG
-    边界：Minimal保留的基础库全局量为type、ipairs、pairs、error、assert、pcall、xpcall、next、select、
-          tostring、tonumber、setmetatable、getmetatable、rawget、rawset、rawequal、rawlen、_G、_VERSION；
-          摘掉的是dofile、loadfile、load、loadstring、require、collectgarbage、print、warn
-          三档都只约束Lua标准库，不约束provider注入的宿主函数（如mcl、agent_info）自身能做什么
-
-LuaEnvironmentContext：环境上下文，公开结构体
-    request_id: String--本次请求标识
-    owner: LuaVmOwner--请求归属
-    values: BTreeMap<String, LuaValue>--调用方提供的结构化只读数据
-
-LuaEnvironment：Lua环境，公开结构体
-    globals: Vec<LuaGlobalBinding>--全局绑定
-    modules: Vec<LuaModuleBinding>--模块绑定
-
-LuaGlobalBinding：Lua全局绑定，公开结构体
-    name: String--全局名称
-    binding: LuaBindingValue--绑定内容
-
-LuaBindingValue：Lua绑定内容，公开枚举
-    Value(LuaValue)--可序列化的只读值
-    Function(Arc<dyn LuaHostFunction>)--宿主异步函数
-
-LuaModuleBinding：Lua模块绑定，公开结构体
-    name: String--模块名称
-    exports: BTreeMap<String, LuaBindingValue>--模块导出值和函数
-
-LuaHostFunction：宿主函数，公开trait对象类型
-    继承：Send + Sync + 'static
-    call(&self, arguments: LuaValue, context: LuaEnvironmentContext, cancel: CancellationToken) -> HostFuture
-        调用宿主能力：公开方法，Lua调用点必须等待Future产生唯一结果
-
-HostFuture：宿主Future，公开类型别名
-    Pin<Box<dyn Future<Output = Result<LuaValue, LuaRuntimeError>> + Send + 'static>>
-
-CancellationToken：取消令牌，公开结构体
-    is_cancelled(&self) -> bool
-        查询取消：公开方法
-    cancelled(&self) -> impl Future<Output = ()>
-        等待取消：公开方法
-    cancel(&self)
-        请求取消：crate公开方法
-
-LuaScheduler：调度模式，公开枚举
-    LongRunning--长期服务或控制程序
-    WorkerPool--普通短任务
-    DedicatedThread--可能阻塞或需要线程隔离的任务
-
-LuaVmState：VM状态，公开枚举
-    Starting
-    Running
-    Waiting
-    Completed
-    Failed
-    Cancelled
-
-LuaRuntimeReply：Lua运行时回执，公开结构体
-    new(sender: oneshot::Sender<LuaRuntimeResult>) -> Self
-        构造回执：公开关联函数
-    take(&self) -> Option<oneshot::Sender<LuaRuntimeResult>>
-        取得发送器：crate公开方法
-    fail(&self, error: LuaRuntimeError)
-        发送失败：crate公开方法
-
-LuaRuntimeResult：Lua执行结果，公开枚举
-    Completed { value: LuaValue }
-    Failed { error: LuaRuntimeError }
-    Cancelled
-
-LuaEnvironmentProvider：环境提供器，公开trait
-    继承：Send + Sync + 'static
-    name(&self) -> &str
-        获取名称：公开方法
-    provide(&self, context: &LuaEnvironmentContext) -> Result<LuaEnvironment, LuaRuntimeError>
-        生成环境：公开方法，不访问World
-
-LuaEnvironmentRegistry：环境提供器注册表，公开结构体
-    providers: BTreeMap<String, Box<dyn LuaEnvironmentProvider>>--提供器，私有
-    register(&mut self, provider: Box<dyn LuaEnvironmentProvider>) -> Result<(), LuaRuntimeError>
-        注册提供器：公开方法
-    collect(&self, names: &[String], context: &LuaEnvironmentContext) -> Result<LuaEnvironment, LuaRuntimeError>
-        收集环境：公开方法，严格按names顺序合并，冲突立即失败
-
-LuaVmSession：VM会话，公开结构体
-    vm_id: LuaVmId--会话标识
-    owner: LuaVmOwner--会话归属
-    state: LuaVmState--当前状态
-    created_at: Instant--创建时间
-    last_activity: Instant--最近执行或宿主调用时间
-
-LuaRuntimeConfig：运行时配置，公开Resource
-    max_source_bytes: usize--单个程序源码上限
-    max_result_bytes: usize--序列化结果上限
-    default_timeout: Duration--未指定截止时间时使用的执行时长
-    queue_capacity: usize--调度队列容量
-    worker_count: usize--WorkerPool默认并发数
-    impl Default for LuaRuntimeConfig
-    impl Resource for LuaRuntimeConfig
-
-LuaRuntimeHandle：运行时句柄，公开Resource
-    events: RuntimeEventSender--向Runtime发送执行和取消事件，crate公开
-    environments: Arc<RwLock<LuaEnvironmentRegistry>>--环境提供器注册表，crate公开
-    submit(&self, request: LuaRuntimeRequest) -> Result<(), LuaRuntimeError>
-        提交执行：公开方法
-    register_long_running(&self, request: LuaRuntimeRequest) -> Result<(), LuaRuntimeError>
-        注册长期VM：公开方法
-    stop_long_running(&self, owner_id: &str) -> Result<(), LuaRuntimeError>
-        停止长期VM：公开方法
-    send_message(&self, vm_id: LuaVmId, value: LuaValue) -> Result<(), LuaRuntimeError>
-        投递长期VM消息：公开方法
-    receive_message(&self, id: String, vm_id: LuaVmId) -> Result<(), LuaRuntimeError>
-        请求邮箱消息：公开方法
-    cancel(&self, request_id: &str) -> Result<(), LuaRuntimeError>
-        取消执行：公开方法
-    register_provider(&self, provider: Box<dyn LuaEnvironmentProvider>) -> Result<(), LuaRuntimeError>
-        注册环境提供器：公开方法
-    impl Resource for LuaRuntimeHandle
-```
-
-crate公开：
-```text
-LuaRuntimeState：运行时状态，crate公开Resource
-    next_vm: AtomicU64--VM ID递增来源
-    sessions: HashMap<LuaVmId, LuaVmSession>--活跃会话
-    requests: HashMap<String, CancellationToken>--请求取消令牌
-    owners: HashMap<String, String>--请求ID到owner_id
-    mailboxes: HashMap<LuaVmId, VecDeque<LuaValue>>--长期VM FIFO邮箱
-    receives: HashMap<LuaVmId, VecDeque<LuaVmMessageReceiveRequest>>--pending receive
-    pre_cancelled: HashSet<String>--先于其请求到达的取消
-    impl Resource for LuaRuntimeState
-```
-
-# error
-
-error 放 Error 类型和公开错误分类。
-
-## 类型
-
-公开：
-```text
-LuaRuntimeError：运行时错误，公开枚举
-    RuntimeClosed
-    InvalidRequest(String)
-    SourceTooLarge
-    ResultTooLarge
-    ProviderAlreadyRegistered(String)
-    EnvironmentProviderNotFound(String)
-    EnvironmentConflict(String)
-    EnvironmentFailed(String)
-    SchedulerUnavailable
-    Timeout
-    Cancelled
-    VmCreationFailed(String)
-    VmExecutionFailed(String)
-    impl fmt::Display for LuaRuntimeError
-    impl std::error::Error for LuaRuntimeError
-    impl Clone for LuaRuntimeError
+                要求计划、Runtime、AsyncRuntime和Closure基础设施可用，拒绝重复安装
+                要求本计划已安装ClosureSystem，保存运行时配置
+                挂载start_driver_lua_vm_system、stop_driver_lua_vm_system、driver_lua_vm_exception_system
+                不插入Driver注册表，不安装独立owner等待表，不再提供notify_driver_ready的注册表访问接口
+                使用共享Agent组件契约，不依赖Agent或MCL插件Handler与安装标记
 ```
 
 ## 逻辑
 
 ```text
-请求执行：
-    业务插件显式构造LuaRuntimeRequest并提交
-    lua_runtime_request_system克隆事件并逐条交给handle_lua_runtime_request
-    校验失败立即reply.fail并发送LuaRuntimeTaskFinished
-    成功分配LuaVmId与CancellationToken，LongRunning先发LuaVmStarted
-    独立线程创建Lua VM、安装环境、执行脚本，结束后销毁VM
-    每个LuaRuntimeRequest最终恰好发送一个LuaRuntimeTaskFinished
-
-环境组合：
-    Provider只生成环境描述，不直接修改Lua VM
-    Registry严格按请求声明顺序合并Provider结果
-    全局或模块名称冲突是配置错误，整次请求失败
-
-长期VM邮箱：
-    LuaVmMessage投递到FIFO邮箱，不等待Lua处理
-    LuaVmMessageReceiveRequest在邮箱为空时挂起，至多一个pending receive
-    VM停止时关闭邮箱并完成pending receive为错误
-
-生命周期与取消：
-    VM在Completed、Failed或Cancelled后立即销毁
-    LongRunning只表示单次程序可以长期运行，不表示跨请求复用VM
-    取消不强行中断宿主Future，先发取消令牌
-    LuaRuntimeReply在System移交任务前保证失败可回执
+职责：
+    Workspace创建并拥有执行线程，LuaRuntime向指定工作区提交Driver本地任务，不为每个VM开线程
+    LuaRuntime创建Lua、安装环境、执行和清理Driver，不管理Agent生命周期
+    主线程可读取Agent.lua并克隆execution、mcl.drained及线程安全通知句柄；执行任务只使用捕获的共享对象，不借用World
+    Agent的Creating/Running/Stopping仍由Agent插件处理，LuaRuntime不改变它们
+    Agent.lua的通知与关闭存储由共享types定义，源码目标为agent_components.rs及其引用的VM共享契约
+    真正Lua状态与本地Future仅存在于工作区线程，不进入共享组件
 ```
 
-## 边界
+# system
+
+## 函数
+
+crate公开：
+```text
+start_driver_lua_vm_system(world: &mut World)
+    Driver启动System：crate公开System
+    处理事件：StartDriverLuaVm、Result<DriverLuaVmStartOutput, DriverLuaVmStartTaskError>
+    产出事件：ClosureRequest、StartDriverLuaVmResult
+    行为：
+        克隆本帧全部StartDriverLuaVm，逐个调用handle_start_driver_lua_vm
+        读取启动闭包结果，逐个调用handle_driver_lua_vm_start_result
+
+stop_driver_lua_vm_system(world: &mut World)
+    Driver停止System：crate公开System
+    处理事件：StopDriverLuaVm、Result<DriverLuaVmStopOutput, DriverLuaVmStopTaskError>
+    产出事件：ClosureRequest、StopDriverLuaVmResult
+    行为：
+        克隆本帧全部StopDriverLuaVm，逐个调用handle_stop_driver_lua_vm
+        读取停止闭包结果，逐个调用handle_driver_lua_vm_stop_result
+
+driver_lua_vm_exception_system(world: &mut World)
+    Driver运行期异常System：crate公开System
+    处理事件：DriverLuaVmException、Result<DriverLuaVmExceptionOutput, DriverLuaVmExceptionTaskError>
+    产出事件：ClosureRequest、DriverLuaVmExceptionResult
+    行为：
+        克隆本帧异常调用handle_driver_lua_vm_exception
+        读取异常协调闭包Result调用handle_driver_lua_vm_exception_result，不消费自身公开结果
+```
+
+## 逻辑
 
 ```text
-LuaRuntimePlugin不解析MCL，不创建Agent，不查找ResourceMap，不注册工具，不发送WebSocket消息。
-LuaRuntimePlugin不实现文件、HTTP、Shell或MCL操作；这些能力必须由LuaEnvironmentProvider注入。
-业务插件通过Provider和LuaRuntimeHandle接入运行时，结果转换由业务插件自身完成。
+事件通道：
+    启动闭包等待ready Receiver，返回后自动Pending升变为Result<DriverLuaVmStartOutput, DriverLuaVmStartTaskError>
+    启动结果Handler发公开启动结果，不能把异步Result当作裸输出或公开结果
+    停止闭包持有ended Receiver，返回后Pending升变为Result<DriverLuaVmStopOutput, DriverLuaVmStopTaskError>
+    停止结果Handler发送公开StopDriverLuaVmResult，正常结束不额外发送结束事件
+    Driver任务发生异常时通过RuntimeEventSender直接发送DriverLuaVmException，无论执行是否已经结束
+    异常System处理后发送DriverLuaVmExceptionResult，不替代启动或停止请求结果
+    无事件时不扫描Agent或注册表判断是否结束
+```
+
+# handler
+
+## 函数
+
+crate公开：
+```text
+handle_start_driver_lua_vm(world: &mut World, request: StartDriverLuaVm)
+    处理启动请求：crate公开函数
+    行为：
+        校验请求ID、完整Agent Entity、Creating操作关联、源码大小及环境配置
+        要求Agent.lua.close为空且没有不同启动实例正在使用这些槽位，冲突返回错误
+        以完整owner Entity和启动请求ID组成DriverLuaVmInstance，不另建vm_id到实体的映射
+        建立oneshot<Result<(), LuaRuntimeError>>，Receiver移动进启动闭包，Sender存入Agent.lua.ready
+        同时建立ended oneshot，将Receiver暂存Agent.lua.ended，Sender移入Driver任务；创建DriverCloseHandle，保存到Agent.lua.close；填入Agent.lua.instance，克隆其常驻wake槽位供Driver宿主函数使用
+        同时捕获Agent.execution和Agent.mcl.drained供最终清理使用；上述存储必须在任务可执行之前完成，提交失败撤销本次安装及未启动活动登记，不修改别的实例
+        构造Send任务创建闭包，向request.execution_entry提交；在工作区线程中创建Lua与Local Future，再spawn_local运行
+        Lua执行使用异步宿主调用，不在工作区线程block_on等待；保留Lua指令取消检查
+        启动协调闭包只await ready Receiver，收到Ok表示初始化就绪，收到Err表示本次初始化失败
+        ready等待超时先请求close取消，随后继续等待同一ready Receiver；Driver最终清理后通过尚未消费的ready Sender返回Err，不额外抢走ended
+        ready Receiver异常关闭时返回CleanupFailed并保留宿主、close和原ended，不能以丢Sender证明清理完成；普通错误只能在已有ready Err清理事实下回收
+        通过send_async_closure提交启动协调闭包，不关闭Runtime下一帧门，不创建独立Driver线程
+        任务在ready前发生普通错误、panic或提前返回时，执行统一最终清理后尝试从同一ready Sender存储take并发送Err；清理失败明确CleanupFailed
+        任务在ready后正常或异常结束时不再改写启动裁决
+
+handle_driver_lua_vm_start_result(world: &mut World, result: Result<DriverLuaVmStartOutput, DriverLuaVmStartTaskError>)
+    处理启动闭包结果：crate公开函数
+    行为：
+        取得原请求与实例，核对Agent.lua.instance和Creating中的启动子请求ID
+        成功时移除本次ready暂存，保留wake与close，发送StartDriverLuaVmResult::Ok(())
+        失败时清除本次ready暂存；确认没有遗留执行体或清理已完成后发送关联启动错误
+        失败且未能清理时保留关闭句柄并明确返回CleanupFailed，不能让Agent把一般失败当作可直接销毁的证明
+        无关或重复结果不推进其他实例，合法启动请求只回复一次
+        通用AsyncTaskError不包含请求ID，提交包装必须捕获原请求与instance并保证取消/提交失败仍有一次关联回执；不能依赖From<AsyncTaskError>凭空恢复关联
+
+handle_stop_driver_lua_vm(world: &mut World, request: StopDriverLuaVm)
+    处理停止请求：crate公开函数
+    行为：
+        从完整owner Entity的Agent.lua读取close，核对启动实例
+        take本次ended Receiver，移入停止异步闭包；不在每次Stop时重建通道
+        Receiver已被取走时拒绝重复停止等待，返回StopAlreadyWaiting，不覆盖在途等待
+        克隆关闭句柄请求取消，关闭共享wake槽位；核对Agent已关闭MCL与活动受理并请求根取消，不在Agent插件调用Driver关闭句柄
+        停止闭包await Receiver，收到Result<(), LuaRuntimeError>后返回带原请求和实例的DriverLuaVmStopOutput
+        接收端异常关闭转换为明确错误，不把Sender丢弃当作已完成清理
+        通过send_async_closure提交等待，不阻塞主线程，不join或关闭工作区线程
+
+handle_driver_lua_vm_stop_result(world: &mut World, result: Result<DriverLuaVmStopOutput, DriverLuaVmStopTaskError>)
+    处理停止闭包结果：crate公开函数
+    行为：
+        核对完整Agent实例和原停止子请求ID，旧结果不命中新实例
+        已收到ended的Ok时发送StopDriverLuaVmResult::Ok，证明Driver、execution全部活动真实清理及MCL已受理请求回执收口
+        ended错误或等待任务错误发送关联Err，保留仍需管理的Agent和关闭句柄
+        不销毁Agent，Agent插件在成功结果后完成实体清理
+        Receiver已消费或被丢弃后返回明确错误，保留关闭句柄、宿主及活动，不重建ended、不宣称可直接重试
+
+handle_driver_lua_vm_exception_result(world: &mut World, output: Result<DriverLuaVmExceptionOutput, DriverLuaVmExceptionTaskError>)
+    收口异常协调结果：crate公开函数
+    行为：保留原exception_id和instance，核对当前实例后一次性发送DriverLuaVmExceptionResult；监督错误带关联且完成事实为false，不抢ended、不产生新的Exception。
+
+handle_driver_lua_vm_exception(world: &mut World, event: DriverLuaVmException)
+    处理运行期异常：crate公开函数
+    行为：
+        核对完整owner与启动实例，旧或重复异常不作用到新实例
+        对本次异常请求Driver协作取消并关闭scope/MCL门，不抢走停止闭包独占的ended Receiver
+        事件已证明execution_ended和cleanup_completed时同步确认；否则回复已请求取消且两个完成事实为false
+        任务最终清理通过原ended向停止链交付，不用异常处理再等待Driver或创建第二完成通道
+        若其他运行时处理确需异步，仅返回DriverLuaVmExceptionOutput并由异常结果Handler完成，不等待或竞争ended
+        发送关联exception_id的DriverLuaVmExceptionResult，包含处理结果及处理后的执行和清理事实
+        不修改Agent.state，不直接销毁Agent或Workspace
+        result为处理成功/失败，原异常error不在DriverLuaVmExceptionResult字段中；不得让上层从result Ok推断原异常消失
+        处理完成前不报告cleanup_completed为true，失败保留关闭能力、宿主及活动，受理保持关闭；不消费自己的ExceptionResult，不再次产Exception形成循环
+
+```
+
+## 逻辑
+
+```text
+ready：
+    LuaRuntime受理启动时建立通道并把发送端暂存Agent.lua.ready，接收端由启动闭包独占
+    MCL ready根据目标Agent地址定位，核对宿主上下文的完整Entity和启动ID，取出同一Sender并send(Ok(()))
+    ready前失败路径也从同一共享存储take Sender，只有一方能取得，先取得者决定本次启动结果
+    Sender已经取出时不能把重复ready当成新成功；不设置第二份DriverStartupPhase
+    Sender先发送、Receiver后await仍可收到，不需要ready的pending_wake或全局ready表
+    ready仅完成启动等待，不结束Driver；MCL不得等待启动结果事件再返回ready宿主调用
+
+wait与wake：
+    Agent.lua.wake在Agent创建时就存在，wait宿主函数捕获Arc而非跨线程借用Agent
+    wait锁内检查closed、在途等待和pending_wake；有通知则消费并返回，无通知则建立oneshot并存Sender
+    锁在await Receiver之前释放，不支持同一Driver两个并发wait覆盖彼此
+    MCL wake按目标Agent寻址并核对完整实例，有Sender时take后发送()，无Sender时设置pending_wake
+    pending_wake只记已发生的wake，多次提前通知合并，不自动产生唤醒，业务数据仍存在Block里
+    LuaRuntime停止时关闭槽位并取消执行，wait必须能结束等待；不保留reserve/claim/yield协议
+
+ended协议：
+    通道在启动时创建，Driver任务持Sender，Agent.lua.ended暂存Receiver
+    Driver正常返回、异常、panic或取消都进入最终清理：关闭活动/MCL受理、请求根cancel及在途MCL取消，调用mcl.drained.close()；MCL command System第三阶段每帧检查execution整体受理门closed并收口未执行排队Cancelled，不新增MCL停止通知或执行结束事件
+    最终清理等待execution.wait_all中全部Inference/Sandbox/Other真实完成，并等待mcl.drained确认全部已受理请求回执收口；所有等待在异步设施中，不跨World借用
+    只有Driver自身退出与资源释放、作用域全部活动真实清理、MCL收口均成功才send(Ok(()))；失败send(Err(CleanupFailed))，原始运行错误独立经异常链报告
+    runner/长期进程在退出、管道收口与资源释放后才mark_completed，推理在实际结束/取消收口后完成；结果未读但已清理无需等待读结果
+    Driver先结束、停止后取Receiver仍能收到结果，不丢提前结束信号
+    Receiver只由一次停止闭包取走，Agent自己不await，不额外建立完成结果注册表
+    正常结束不是异常事件；长期Driver非预期返回可按协议报告Exception，但仍独立完成ended
+    等待闭包取消或ended错误后，原通道不可重新等待，不承诺任意失败后能重试
+    丢Future不保证派生进程清理，Lua检查点和宿主取消清理仍必须落实
+
+```
+
+# events
+
+## 定义位置
+
+所有业务和内部事件，以及自动异步Result需要的共享输出契约，定义在共享types的lua_runtime_events.rs。
+插件实现不保留events.rs。内部是用途标记，跨crate使用的类型必须公开可见。
+
+## 类型
+
+公开：
+```text
+StartDriverLuaVm：Driver启动请求，公开事件
+    id: String--Agent生成的唯一启动子请求ID
+    owner: Entity--完整Agent Entity
+    program: LuaProgram--Driver源码与标准库配置
+    environment: LuaEnvironment--已整理注入环境
+    execution_entry: WorkspaceExecutionEntry--所属工作区的启动授权或Running受检入口
+    impl Event for StartDriverLuaVm
+
+StartDriverLuaVmResult：Driver启动结果，公开事件
+    id: String--原请求ID
+    owner: Entity--完整Agent Entity
+    result: Result<(), LuaRuntimeError>--ready已完成或启动失败，关闭句柄已存Agent.lua
+    impl Event for StartDriverLuaVmResult
+
+StopDriverLuaVm：Driver停止请求，公开事件
+    id: String--唯一停止子请求ID
+    owner: Entity--完整Agent Entity
+    instance: DriverLuaVmInstance--期望操作的本次启动实例，不携带关闭句柄
+    impl Event for StopDriverLuaVm
+
+StopDriverLuaVmResult：Driver停止结果，公开事件
+    id: String--原请求ID
+    owner: Entity--完整Agent Entity
+    instance: DriverLuaVmInstance--原启动实例
+    result: Result<(), LuaRuntimeError>--成功证明Driver、全部作用域活动及MCL回执收口完成
+    impl Event for StopDriverLuaVmResult
+
+DriverLuaVmException：Driver异常通知，公开事件
+    exception_id: String--本次异常唯一ID，原异常error仅在本事件，Result不复制该字段
+    instance: DriverLuaVmInstance--完整启动实例
+    error: LuaRuntimeError--异常描述
+    execution_ended: bool--异常发生时执行是否已经结束
+    cleanup_completed: bool--异常发生时清理是否完成
+    impl Event for DriverLuaVmException
+
+DriverLuaVmExceptionResult：Driver异常处理结果，公开事件
+    exception_id: String--原异常ID
+    instance: DriverLuaVmInstance--原启动实例
+    result: Result<(), LuaRuntimeError>--异常处理成功或失败，不表示原异常不存在；本事件没有error和owner字段，owner从instance.owner取得
+    execution_ended: bool--处理后执行是否结束
+    cleanup_completed: bool--处理后清理是否完成
+    impl Event for DriverLuaVmExceptionResult
+
+```
+
+## 逻辑
+
+```text
+正常执行清理结果通过ended传递，不定义独立执行结束、停止完成或Finished事件
+异常由执行任务直接发Exception，异常System独占该异常处理职责并发ExceptionResult
+六种具名事件为start/result、stop/result、exception/result；自动异步Result通道另算
+启动前失败和主动停止失败仍回复原请求，异常结果不代替生命周期结果
+
+```
+
+## 具名异步载荷
+
+公开，lua_runtime_events.rs中的异步契约：
+```text
+DriverLuaVmStartOutput：启动等待输出，公开共享类型
+    request: StartDriverLuaVm--原请求上下文
+    instance: DriverLuaVmInstance--本次实例
+    result: Result<(), LuaRuntimeError>--ready成功或失败
+
+DriverLuaVmStopOutput：停止等待输出，公开共享类型
+    request: StopDriverLuaVm--原停止请求
+    instance: DriverLuaVmInstance--原启动实例
+    result: Result<(), LuaRuntimeError>--ended交付的全作用域及MCL收口证明
+
+DriverLuaVmExceptionOutput：异常处理异步输出，公开共享载荷--定义于lua_runtime_events.rs
+    event: DriverLuaVmException--原异常及其关联，保留原error但不添加到公开Result字段
+    result: Result<(), LuaRuntimeError>--处理成功或失败
+    execution_ended: bool--已验证执行事实
+    cleanup_completed: bool--已验证全作用域及MCL收口事实
+
+DriverLuaVmExceptionTaskError：异常协调监督错误，公开共享类型
+    event: DriverLuaVmException--原异常请求关联
+    source: AsyncTaskError
+    说明：提交包装负责保留event，From<AsyncTaskError>不能凭空恢复它。
+
+DriverLuaVmStopTaskError：停止协调任务错误，公开共享类型
+    说明：满足From<AsyncTaskError>，异常包装必须保留请求关联；Receiver丢失不可自动恢复
+
+DriverLuaVmStartTaskError：启动协调任务错误，公开共享类型
+    说明：满足From<AsyncTaskError>，该From自身不含请求ID，提交包装负责关联原请求并确保关闭与失败回复
+```
+
+
+# types
+
+## 类型
+
+公开，组件及执行能力契约定义与实现位于共享components（Agent存储在agent_components.rs，VM能力在lua_runtime_components.rs）；Plugin配置仍在插件侧：
+```text
+DriverLuaVmInstance：Driver启动身份，公开类型
+    owner: Entity--完整Agent Entity
+    start_request_id: String--唯一启动子请求ID
+    说明：不另设vm_id索引，一个Agent当前只能对应一个Driver；同Entity更换Driver也需新启动ID
+
+DriverCloseHandle：跨线程关闭句柄，公开可克隆类型--Agent保存，LuaRuntime操作
+    inner: Arc<Mutex<DriverCloseData>>--共享取消存储，不包含Lua VM或本地任务引用
+
+DriverCloseData：Driver执行控制数据，公开共享内部类型
+    instance: DriverLuaVmInstance--关联身份
+    cancellation: CancellationToken--协作停止信号
+    stop_requested: bool--主动停止已提出，不是Agent生命周期状态机
+    说明：不保存第二份ended结果或停止等待请求表，实际清理通过ended通道报告
+
+LuaProgram：Lua程序，公开类型
+    source: Arc<str>--源码
+    origin: Arc<PathBuf>--来源路径
+    libraries: LuaStandardLibraries--库权限
+
+LuaStandardLibraries：标准库选择，公开枚举
+    Minimal--基础语言库并裁剪宿主访问入口
+    Safe--mlua ALL_SAFE，不等于进程隔离
+    Full--mlua ALL，不等于沙箱
+
+LuaEnvironment：环境描述，公开类型
+    globals: Vec<LuaGlobalBinding>--注入值与宿主函数
+    modules: Vec<LuaModuleBinding>--受控模块
+    说明：宿主上下文携带完整实例、共享wake、AgentExecutionScope与AgentMclDrainHandle；只读配置需实际保护
+        wait从Agent提供的共享槽位建立Receiver，不通过全局map
+        详细Lua值、绑定和能力接口随执行内核实现确认，不能用旧block_on桥接替代本地异步等待
+
+LuaRuntimeConfig：执行限制，公开类型
+    max_source_bytes: usize--源码大小上限
+    max_memory_bytes: usize--内存上限
+    instruction_check_interval: u32--取消检查间隔
+    startup_timeout: Option<Duration>--可选ready等待上限，到期请求关闭并等实际清理，不直接释放宿主
+```
+
+
+## 逻辑
+
+```text
+删除旧设计：
+    删除DriverLuaVmRegistry、DriverLuaVmRecord、DriverStartupPhase和DriverLuaVmStatus
+    删除纯查询DriverLuaVMHandle、独立ready/wake表及重复的完成结果存储
+    不把上述注册表换名放进其他Resource，也不复制通知槽位
+
+槽位与能力归属：
+    AgentLua、DriverWakeSlot、DriverReadySlot与DriverEndedSlot定义在共享agent_components.rs，细节见Agent文档
+    Agent仅提供存储，不提供或调用ready、wake、wait、close业务方法
+    MCL取用ready Sender与wake共享槽位；LuaRuntime安装并取用close句柄
+    执行任务可以捕获同一个关闭数据和ready Sender存储的Arc，处理失败或更新结束结果，不跨线程访问World
+    主线程只取槽位和发取消，ended由停止异步闭包等待，不在ECS线程阻塞
+    关闭句柄跨线程必须Send和Sync，真实Lua、本地Future或LocalSet的任务对象不能装入它
+
+工作区执行：
+    一个工作区拥有一条线程及LocalSet，Driver动态加入退出
+    单个Driver关闭只结束该任务，不关闭工作区线程
+    工作区线程JoinHandle由Workspace的关闭能力持有，Agent和LuaRuntime不各存一份
+    Agent state保存操作关联，close数据只保存执行取消能力，ended独立报告完成，二者不是重复状态机
+```
+
+# error
+
+## 类型
+
+公开，共享错误契约：
+```text
+LuaRuntimeError：运行时错误，公开类型
+    InvalidRequest(String)
+    InstanceNotFound
+    InstanceMismatch
+    AlreadyReady
+    NotReady
+    SourceTooLarge
+    EnvironmentFailed(String)
+    CompileFailed(String)
+    ExecutionFailed(String)
+    StartupTimeout
+    Cancelled
+    CleanupFailed(String)
+    TaskFailed(String)
+    StopAlreadyWaiting
+    EndNotificationLost
+    impl Clone + Debug for LuaRuntimeError
+    impl fmt::Display for LuaRuntimeError
+        格式化错误：输出类别与有界详情
+    impl std::error::Error for LuaRuntimeError
+```
+
+## 逻辑
+
+```text
+安全边界：
+    ready前一般失败必须在清理后回复；CleanupFailed意味着仍可能有活动，Agent不能按普通启动失败直接销毁
+    Agent仅发StopDriverLuaVm，关闭动作由LuaRuntime取句柄完成
+    设置取消、关闭wake和真实执行清理完成是三个不同动作，不以其中一个代替另一个；ended Ok还必须证明MCL队列回执收口
+    活动Inference与Other不阻止沙箱切换但停止必须等待；agent_cleanup_tasks不取消Inference或Other，不得与根停止混为同一动作
+    未配合取消的原生阻塞或宿主执行不能被描述为已经安全停止
+    ready后异常由独立异常链通知，不替代已确定的启动结果或在途停止结果
 ```

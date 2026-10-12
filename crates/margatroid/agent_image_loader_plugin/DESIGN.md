@@ -36,7 +36,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 lib        src/lib.rs        插件与镜像资源契约
 system     src/system.rs     请求和异步结果调度
 handler    src/handler.rs    提交读取、挂载结果及少量读取辅助函数
-events     共享types crate    agent_image_events.rs中的公开事件
+events     共享types crate    agent_image_events.rs中的全部事件
 types      辅助及内部类型    模型配置、加载配置和异步结果
 error      共享契约及内部错误  读取、挂载和异步任务错误
 ```
@@ -47,7 +47,7 @@ error      共享契约及内部错误  读取、挂载和异步任务错误
 
 ## 组件定义位置
 
-AgentImage资源条目及其公开关联类型；ResourceSet<AgentImage>使用该共享类型实例化，计划写入共享types crate的`agent_image_components.rs`。对应公开事件写入各自的`*_events.rs`，不在插件实现crate重复定义。
+AgentImage资源条目及其公开关联类型；ResourceSet<AgentImage>使用该共享类型实例化，计划写入共享types crate的`agent_image_components.rs`。对应全部事件写入各自的`*_events.rs`，不在插件实现crate重复定义。
 
 此处只标注未来源码归属，尚未创建或迁移源码文件。文档仍在lib板块描述图书馆类型和资源类型；Plugin、System、Handler及插件私有加载状态不随组件迁入共享文件。
 
@@ -210,6 +210,14 @@ read_text_bounded(path: &Path, maximum: u64) -> Result<String, AgentImageLoadErr
 
 # events
 
+## 定义位置
+
+所有事件无论对外业务通知还是内部调度，都定义在共享types的`agent_image_events.rs`，插件实现不再有`events.rs`。内部仅表示用途，不意味着在共享crate中使用pub(crate)后其他crate仍能访问；供插件使用的事件需要公开可见。
+
+自动异步响应仍是框架的`Result<T, E>`，不另造包装事件；其中具名输出、错误及其传递所需的关联契约也在共享事件文件定义，不使共享types反向依赖插件私有类型。Plugin配置和非事件处理状态仍留在实现侧。基础设施事件如ClosureRequest沿用基础设施定义，不在业务文件复制。
+
+镜像继续以LoadAgentImageResult完成Workspace请求，不增加oneshot或公共LoadCompletion trait。读取输出携带共享Arc<AtomicBool>完成标记；私有保障对象由闭包捕获，正常读取返回后解除读取阶段兜底，由主线程结果收口承担后续完成责任。异常路径一次性设置标记并发送关联错误，不先于正常挂载发布成功。
+
 ## 类型
 
 公开，统一定义于共享types crate的agent_image_events.rs：
@@ -231,7 +239,7 @@ LoadAgentImageResult：镜像挂载结果通知，公开事件
 ## 逻辑
 
 ```text
-本插件只使用或重导出共享公开事件，不重复定义同名事件
+本插件直接使用共享types中的全部事件，不保留src/events.rs或同名事件定义
 ClosureRequest是通用闭包设施内部事件，不在本插件重新定义
 Result<AgentImageReadOutput, AsyncTaskError>是自动异步响应类型，不是另一份公开镜像事件
 结果id、target和resource_id在成功与失败两条路径都保留
@@ -266,24 +274,25 @@ AgentImageLoadLimits：镜像读取限制，crate公开结构体
     max_stop_sequences: usize--停止序列数量上限
     max_stop_sequence_bytes: usize--单个停止序列长度上限
 
-AgentImageData：异步准备的镜像数据，crate公开结构体--不含任何World借用
+AgentImageData：异步准备的镜像数据，公开共享契约--定义于agent_image_events.rs--不含任何World借用
     base_driver: Arc<str>--已读取源码
     origin: Arc<PathBuf>--来源路径
     dependencies: Arc<[ResourceID]>--已解析依赖地址
     model: AgentImageModelConfig--已解析模型配置
 
-AgentImageReadOutput：可关联的异步读取结果，crate公开结构体
+AgentImageReadOutput：可关联的异步读取结果，公开共享契约--定义于agent_image_events.rs，仅供内部结果通道使用
     request: LoadAgentImage--原请求上下文
     result: Result<AgentImageData, AgentImageLoadError>--普通读取成功或失败
-    completion: Arc<AgentImageLoadCompletion>--跨读取与挂载阶段的关联回执保障
+    completed: Arc<AtomicBool>--共享一次性结果发布标记，不引用插件保障类型或公共完成trait
 
 AgentImageLoadCompletion：加载请求回执保障，crate公开结构体--在异步任务非正常结束时仍能关联失败请求
     request: LoadAgentImage--原请求上下文
     events: RuntimeEventSender--线程安全事件发送器
-    completed: AtomicBool--本请求的业务结果是否已发出
+    completed: Arc<AtomicBool>--与读取输出共享一次性结果发布标记
+    armed: bool--私有读取兜底是否仍持有责任，正常转交主线程时解除
     impl Drop for AgentImageLoadCompletion
         drop(&mut self)
-            兜底回复：尚未完成时发送携带原请求上下文的LoadAgentImageResult::Err(TaskFailed)
+            兜底回复：armed且尚未完成时一次性设置共享标记并发送原请求LoadAgentImageResult::Err(TaskFailed)；正常读取转交时解除armed，主线程在挂载成功或失败时一次性完成标记与事件。
 ```
 
 ## 逻辑
