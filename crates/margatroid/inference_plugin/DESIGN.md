@@ -29,788 +29,499 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # 板块格式
 
-每个 crate 的 DESIGN.md 在伪代码格式之后使用六个一级标题，按 `lib`、`system`、`handler`、`events`、`types`、`error` 顺序组织。每个标题对应 `src/` 下的同名 Rust 文件：
-
 ```text
-# lib        src/lib.rs        图书馆组件与 Plugin
-# system     src/system.rs     System 函数
-# handler    src/handler.rs    处理函数
-# events     src/events.rs     事件类型
-# types      src/types.rs      其余类型
-# error      src/error.rs      Error 与公开错误分类
+lib        插件、全局配置Resource与客户端快照边界
+system     src/system.rs             请求及配置重载调度
+handler    src/handler.rs            主线程准备与异步执行
+events     共享types/inference_events.rs    全部请求、回复载荷与监督关联
+types      src/types.rs及共享纯值契约       Provider协议与配置辅助类型
+error      共享推理错误契约               校验、执行及协议错误
 ```
 
+**本文为重新设计的目标方案，尚未实现，不是当前源码参考。** 一个推理入口、一个准备System、一项异步闭包、一个oneshot结果。全局只有一份模型配置；提交前取得全部已注册webui客户端发送器快照，闭包直接推流，后来连接不加入本次推理。
+
 # lib
-
-lib 只放图书馆组件、Resource 和 Plugin。
-
-InferencePlugin 不创建 Entity，不挂载任何图书馆组件；推理所需的模型与上下文窗口取自 Agent.info.model，采样参数取自 AgentImage。
 
 ## 类型
 
 公开：
 ```text
-GlobalModelRoutes：全局模型路由，公开Resource--由models.toml加载的默认Provider路由，Workspace未配置自己的models.toml时使用
-    path: PathBuf--模型路由配置文件路径，私有
-    factories: Arc<HashMap<String, ErasedProviderAdapterFactory>>--已注册的api_type工厂，crate公开
-    routes: HashMap<ModelId, ConfiguredModelRoute>--ModelId到模型路由的映射，私有
-    load(path: PathBuf, factories: Arc<HashMap<String, ErasedProviderAdapterFactory>>) -> Result<Self, InferenceError>
-        加载全局路由：crate公开关联函数，读取并编译path处的models.toml
-    reload(&mut self) -> Result<usize, InferenceError>
-        重载全局路由：crate公开方法，重新读取同一路径并整体替换routes，返回路由数量
-    get(&self, id: &ModelId) -> Option<ConfiguredModelRoute>
-        读取路由：crate公开方法，按ModelId克隆返回配置
-    impl Resource for GlobalModelRoutes
-
-InferenceHttpClient：推理HTTP客户端，公开Resource--插件安装时创建的reqwest客户端
-    client: reqwest::Client--共享HTTP客户端，crate公开
-    new() -> Result<Self, InferenceError>
-        创建客户端：crate公开关联函数
-    impl Resource for InferenceHttpClient
-
-InferencePlugin：推理插件，公开结构体--加载全局模型路由、创建HTTP客户端并挂载推理System
-    schedule: String--System所属Schedule，私有
-    config_path: PathBuf--全局models.toml路径，私有
-    adapter_factories: HashMap<String, ErasedProviderAdapterFactory>--api_type到工厂的映射，私有
+InferencePlugin：推理插件，公开结构体
+    schedule: String--推理准备及重载计划
+    config_path: PathBuf--全局models.toml路径
+    factories: HashMap<String, ErasedProviderAdapterFactory>--协议工厂
     new() -> Self
-        构造插件：公开关联函数，默认PRE_UPDATE Schedule，注册openai和deepseek工厂
+        构造插件：公开关联函数
+        行为：默认PRE_UPDATE计划、HOME/.margatroid/models.toml，注册openai与deepseek工厂。
     with_schedule(mut self, schedule: impl Into<String>) -> Self
-        设置Schedule：公开构建方法
+        设置计划：公开方法
+        行为：保存计划名并返回自身。
     with_config_path(mut self, path: impl Into<PathBuf>) -> Self
-        设置全局配置路径：公开构建方法
-    with_api_type<Factory>(mut self, api_type: impl Into<String>, factory: Factory) -> Self
-        注册API工厂：公开构建方法，api_type为空或已注册时panic
-        约束：Factory: ProviderAdapterFactory
+        设置配置路径：公开方法
+        行为：保存全局路径，不新增工作区配置来源。
+    with_api_type<F>(mut self, api_type: impl Into<String>, factory: F) -> Self
+        注册协议工厂：公开方法
+        约束：F: ProviderAdapterFactory
+        行为：名称为空或重复则拒绝，保存工厂并返回自身。
     impl Default for InferencePlugin
-        Default：公开trait实现，调用new
+        default() -> Self
+            默认构造：公开trait方法
+            行为：调用new。
     impl Plugin for InferencePlugin
-        Plugin：公开trait实现
         build(self, app: &mut App)
-            安装插件：要求RuntimePlugin和AsyncRuntimePlugin已安装
+            安装插件：公开trait方法
             行为：
-                重复安装或Schedule不存在时panic
-                加载GlobalModelRoutes并插入World
-                创建InferenceHttpClient并插入World
-                插入WorkspaceModelRoutesRegistry和InFlightInferences
-                在schedule依次挂载reload_model_routes_system、cancel_inference_system、prepare_inference_system、execute_prepared_inference和publish_inference_output_system
+                检查计划、通用闭包执行设施及公共事件能力，重复安装拒绝
+                有界读取并完整编译全局模型配置，失败拒绝安装
+                创建共享HTTP客户端，插入InferenceConfig和安装标记
+                只挂载inference_system，不安装固定异步System或结果发布System
+
+InferenceConfig：推理配置，公开Resource--实现侧配置，不是图书馆组件
+    path: PathBuf--唯一模型配置路径
+    routes: HashMap<ModelId, ConfiguredModelRoute>--全局路由
+    factories: Arc<HashMap<String, ErasedProviderAdapterFactory>>--重载时使用的工厂
+    client: reqwest::Client--共享连接池
+    limits: InferenceLimits--输入、响应、超时及推流上限，私有字段
+    reload_id: Option<String>--当前全局配置重载关联，私有字段；初始None
+    impl Resource for InferenceConfig
 ```
 
 ## 逻辑
 
 ```text
-InferencePlugin 不消费 AgentControl、不读取 AgentResourceMap、不注册 ToolSpec、不写历史或实时上下文。
-全局模型路由由用户HOME下的.margatroid/models.toml提供；Workspace可以通过项目根目录.margatroid/models.toml覆盖。
-InferencePlugin 的公开入口是事件（InferenceRequestEvent、ContextCompactionInferenceRequest、CapturedInferenceRequest、CancelInferenceRequest、ReloadModelRoutes）和WorldInferenceExt。
+领域职责：
+    不创建Entity、不挂图书馆组件，不保存Agent上下文、turn或工具执行状态
+    Agent.info.model提供模型选择与采样参数快照，不在每次推理时重新读取AgentImage
+    全局只有InferenceConfig这一份配置，不设WorkspaceModelRoutes或路由注册表
+    Inference只执行一次模型请求，自动历史、MCL队列及指令结果由MCL负责
+    不接收AgentControl，不投递Lua邮箱，不发AgentFailure代替oneshot错误
+
+客户端边界：
+    主线程遍历已注册Client，筛选client_type为webui的连接，通过其连接句柄取得发送器
+    发送器去重并复制到闭包，未注册连接不纳入快照；无发送器也正常推理
+    使用共享Client组件与连接查询契约，不依赖ClientPlugin Handler
+    通过共享WorldClientExt.client_webui_senders()取得已注册webui发送器快照，不依赖客户端实现Handler
+    推流不按Workspace隔离；推流关联包含不透明agent_instance字符串及Agent逻辑地址供客户端区分；agent_instance仅为关联值，不能作为协议请求目标或解码为Entity
 ```
 
 # system
 
-system 放 System 函数。System 只读取本帧领域事件并克隆，然后调用 handler 中的对应处理函数；异步 System 直接消费 PreparedInference。
-
 ## 函数
 
 crate公开：
 ```text
-reload_model_routes_system(world: &mut World)
-    重载路由System：crate公开System
-    处理事件：ReloadModelRoutes
-    行为：克隆本帧全部ReloadModelRoutes，逐个调用handle_reload_model_routes
-
-prepare_inference_system(world: &mut World)
-    准备推理System：crate公开System
-    处理事件：InferenceRequestEvent、ContextCompactionInferenceRequest、CapturedInferenceRequest
+inference_system(world: &mut World)
+    推理System：crate公开System
+    处理事件：InferenceRequest、ReloadModelRoutes、Result<InferenceReloadOutput, InferenceReloadTaskError>
+    产出事件：ClosureRequest、ReloadModelRoutesResult
     行为：
-        读取三种请求并统一构造InferenceCommand
-        普通推理输出到AgentMessage，压缩推理输出到ContextCompactionInferenceResponse，捕获推理输出到CapturedInferenceResponse
-        逐个调用handle_prepare_inference
-
-cancel_inference_system(world: &mut World)
-    取消推理System：crate公开System
-    处理事件：CancelInferenceRequest
-    行为：克隆本帧全部CancelInferenceRequest，逐个调用handle_cancel_inference
-
-execute_prepared_inference(prepared: PreparedInference, _context: AsyncContext) -> Result<InferenceTaskOutput, InferenceTaskError>
-    执行推理：crate公开异步System
-    行为：
-        克隆路由和取消信号
-        在取消信号与run_provider之间biased select
-        取消时返回InferenceTaskResult::Cancelled
-        run_provider panic时转换为TaskPanicked错误并返回Completed
-
-publish_inference_output_system(world: &mut World)
-    发布推理结果System：crate公开System
-    处理事件：Result<InferenceTaskOutput, InferenceTaskError>
-    行为：
-        克隆本帧全部成功输出，Err输出仅记录warn日志
-        对每个成功输出调用handle_inference_task_output
-```
-
-# handler
-
-handler 放处理函数。每个 System 读到的领域事件在 handler 中展开为完整业务逻辑。
-
-## 类型
-
-公开：
-```text
-WorldInferenceExt：World推理扩展，公开trait--workspace_plugin和外部调用者配置模型路由与Agent推理快照
-    reload_model_routes(&self, id: impl Into<String>)
-        请求重载全局模型路由：公开方法，发送ReloadModelRoutes事件
-    load_workspace_model_routes(&mut self, workspace: Entity, project_root: &Path) -> Result<usize, InferenceError>
-        加载Workspace模型路由：公开方法
-        行为：
-            校验workspace存在
-            project_root/.margatroid/models.toml不存在时移除Workspace路由并返回0
-            读取GlobalModelRoutes中的工厂表，编译Workspace模型路由并写入WorkspaceModelRoutesRegistry
-    build_agent_inference_snapshot(&self, workspace: Entity, source_image: Entity, config: &AgentImageModelConfig) -> Result<AgentInferenceSnapshot, InferenceError>
-        构造Agent推理快照：公开方法
-        行为：
-            校验workspace和source_image存在
-            由AgentImageModelConfig构造ModelId和InferenceParameters并校验
-            确认模型可路由后读取全局或Workspace路由的context_window_tokens
-            返回挂载到Agent的AgentInferenceSnapshot
-    impl WorldInferenceExt for World
-        行为：实现上述三个方法
-```
-
-crate公开：
-```text
-InFlightInferences：飞行中推理表，crate公开Resource
-    requests: HashMap<(Entity, String), watch::Sender<bool>>--按Agent和turn_id定位取消信号，crate公开
-    impl Resource for InFlightInferences
-
-InferenceCommand：统一推理命令，crate公开结构体--三种推理事件在System中先转换为此结构
-    id: String--交互轮次ID
-    agent: Entity--目标Agent
-    agent_id: ResourceId--稳定Agent身份
-    messages: Vec<Message>--完整输入消息
-    tools: Vec<ToolDefinition>--Provider无关ToolSpec
-    output: InferenceOutputKind--输出路由
-```
-
-## 函数
-
-crate公开：
-```text
-default_config_path() -> PathBuf
-    默认配置路径：crate公开函数，返回HOME/.margatroid/models.toml
-
-load_model_routes(path: &Path, factories: &HashMap<String, ErasedProviderAdapterFactory>) -> Result<HashMap<ModelId, ConfiguredModelRoute>, InferenceError>
-    读取并编译模型路由：crate公开函数
-    行为：读取TOML文件，限制最大字节数，调用compile_model_routes
-
-summarize_reqwest_error(error: &reqwest::Error) -> String
-    归纳HTTP错误：crate公开函数，按超时、连接、Body、解码、请求构造分类并拼接最深source
-
-handle_reload_model_routes(world: &mut World, request: ReloadModelRoutes)
-    处理路由重载：crate公开函数
-    行为：校验ID非空后调用GlobalModelRoutes::reload并发送ReloadModelRoutesResult
-
-handle_prepare_inference(world: &mut World, command: InferenceCommand)
-    处理推理准备：crate公开函数
-    行为：
-        调用prepare_inference
-        成功时发送PreparedInference异步事件
-        失败时按route.output调用publish_inference_error
-
-handle_cancel_inference(world: &mut World, cancellation: CancelInferenceRequest)
-    处理取消推理：crate公开函数
-    行为：在InFlightInferences中查找匹配请求并发送取消信号
-
-run_provider(prepared: PreparedInference) -> Result<ProviderInferenceResponse, InferenceError>
-    执行Provider请求：crate公开异步函数
-    行为：
-        发送HTTP请求并校验状态码
-        失败时读取受限错误Body并解析Provider错误详情
-        成功时按流式分片推送给前端并累积响应
-        finish后发送尾部增量并返回ProviderInferenceResponse
-
-handle_inference_task_output(world: &mut World, output: InferenceTaskOutput)
-    处理推理任务输出：crate公开函数
-    行为：
-        从InFlightInferences移除当前请求；已取消或Cancelled直接返回
-        AgentMessage输出：空正文且无工具调用视为ResponseIncomplete失败，否则发送携带usage的AgentMessage
-        ContextCompaction输出：要求Completed、无tool_calls且正文非空，发送ContextCompactionInferenceResponse
-        Captured输出：同上校验后发送margatroid_types::CapturedInferenceResponse
-        失败时调用publish_inference_error
-
-publish_inference_error(events: &RuntimeEventSender, route: InferenceRoute, error: InferenceError)
-    发布推理错误：crate公开函数
-    行为：
-        AgentMessage输出发送AgentFailure { kind: Inference }
-        ContextCompaction输出发送ContextCompactionInferenceResponse::Err
-        Captured输出发送margatroid_types::CapturedInferenceResponse::Err
-```
-
-私有：
-```text
-parse_context_window(value: Option<&str>) -> Result<u64, InferenceError>
-    解析上下文窗口：私有函数，支持k/m/b/t后缀，缺省1m，数量必须为无符号整数且大于0
-
-compile_model_routes(source: &str, factories: &HashMap<String, ErasedProviderAdapterFactory>) -> Result<HashMap<ModelId, ConfiguredModelRoute>, InferenceError>
-    编译模型路由：私有函数
-    行为：
-        解码TOML并要求models非空
-        校验必填字段、ModelId唯一、base_url为http或https
-        按api_type选择工厂构造Provider Adapter
-        解析context_window并返回ModelId到ConfiguredModelRoute的映射
-
-require_workspace(world: &World, workspace: Entity) -> Result<(), InferenceError>
-    校验Workspace：私有函数，workspace不存在时返回AgentNotAlive
-
-model_is_routable(world: &World, workspace: Entity, model: &ModelId) -> bool
-    模型是否可路由：私有函数，先查Workspace路由再查全局路由
-
-prepare_inference(world: &mut World, command: InferenceCommand) -> Result<PreparedInference, (InferenceRoute, InferenceError)>
-    准备推理：私有函数
-    行为：
-        校验ID、agent_id类型、Agent存活、消息和工具
-        读取Agent.info和AgentImage模型参数，确认模型可路由
-        由Provider Adapter构造ProviderHttpRequest
-        普通Agent推理解析WebSocket流式目标；压缩和捕获推理使用空发送器
-        登记InFlightInferences并返回PreparedInference
-
-resolve_websocket_targets(connections: &WebSocketConnections, targets: &[WebSocketMessageTarget]) -> Vec<WebSocketSender>
-    解析流式目标：私有函数，按Broadcast、Type、Name去重收集发送器
-
-validate_messages(messages: &[Message]) -> Result<(), InferenceError>
-    校验消息：私有函数，限制单条和总大小，检查tool_call_id和assistant内容
-
-validate_tools(tools: &[ToolDefinition]) -> Result<(), InferenceError>
-    校验工具：私有函数，限制数量、名称字符、描述和Schema，拒绝重复名称
-
-send_provider_request(client: &reqwest::Client, request: ProviderHttpRequest) -> Result<reqwest::Response, InferenceError>
-    发送Provider请求：私有异步函数，失败时归纳reqwest错误
-
-send_stream_delta(senders: &[WebSocketSender], id: &str, agent: &ResourceId, delta: ProviderStreamDelta) -> Result<(), InferenceError>
-    发送流式增量：私有异步函数
-    行为：reasoning发送agent.message.reasoning_delta，content发送agent.message.delta；忽略已关闭连接
-
-safe_endpoint(url: &Url) -> String
-    安全端点：私有函数，只保留origin的ascii序列化，去除凭据和路径
-
-provider_error_detail(body: &[u8]) -> Option<String>
-    Provider错误详情：私有函数
-    行为：优先从JSON的error.message、error、message、detail提取；否则将文本控制字符替换为空格并压成单行
-
-single_line(value: &str) -> String
-    单行化：私有函数，控制字符替换为空格后按空白切分重新连接
-
-read_bounded_body(response: reqwest::Response, limit: usize) -> Vec<u8>
-    受限读取错误Body：私有异步函数，最多读取limit字节
-
-context_compaction_content(response: &ProviderInferenceResponse) -> Result<String, InferenceError>
-    压缩正文提取：私有函数，要求stop_reason=Completed、无tool_calls且content trim后非空
+        先处理本帧重载闭包结果，逐个调用handle_model_routes_reloaded
+        再克隆重载请求并调用handle_reload_model_routes
+        最后克隆推理请求并调用handle_inference，克隆只共享同一回复槽
+        无请求不轮询Agent或推理任务，没有业务推理结果转发阶段
 ```
 
 ## 逻辑
 
 ```text
-MclPlugin的inference Effect
-    -> InferenceRequestEvent { messages, tools }
-InferencePlugin主线程 prepare_inference_system
-    -> InferenceCommand
-    -> prepare_inference 构造 ProviderHttpRequest 和 WebSocket发送器
-    -> PreparedInference 异步事件
-异步任务 execute_prepared_inference
-    -> run_provider 请求Provider
-    -> reasoning_content 发送 agent.message.reasoning_delta
-    -> content 发送 agent.message.delta
-    -> ProviderInferenceResponse
-主线程 publish_inference_output_system
-    -> AgentMessage { Message::Assistant { reasoning, content, tool_calls }, usage }
-AgentPlugin
-    -> 把完整AgentMessage投递到长期Lua VM邮箱
-Base Lua
-    -> 下一次start取得Assistant消息并决定tool_call或finish
+推理完成路径：
+    异步执行直接发送oneshot，结果无需回写World
+    通用闭包Result只承担监督，不另建InferenceResult转发或权威结果通道
+    重载需要替换World中的配置，所以其异步结果由同一个System收口
+    重载期间新推理继续使用旧配置，不阻塞ECS主线程
+```
 
-普通推理失败
-    -> AgentFailure { id: turn_id, kind: Inference }
-    -> MclPlugin完成当前或下一次start为Err并中止该turn，不留下永久pending回执
+# handler
 
-MclPlugin的inference Effect
-    -> CapturedInferenceRequest { messages, tools=[] }
-    -> 不发送流式前端消息
-    -> CapturedInferenceResponse
-MclPlugin的context_compaction
-    -> ContextCompactionInferenceRequest { messages }
-    -> ContextCompactionInferenceResponse
+## 函数
+
+crate公开：
+```text
+handle_inference(world: &mut World, request: InferenceRequest)
+    准备推理：crate公开函数
+    行为：
+        校验请求ID、完整Agent Entity及取消状态；已失效或取消直接完成oneshot错误
+        复制Agent地址、info.model中的模型与采样参数，从全局配置查唯一模型路由
+        收集本次可见资源的工具定义，规范化消息，验证参数与输入上限
+        收集全部当前webui发送器快照，复制HTTP客户端、路由及协议适配器
+        保存拥有所有权的PreparedInference，不携带World、组件借用或Workspace配置
+        通过Agent.execution共享AgentExecutionScope受检入口登记Inference活动，令牌从该作用域派生；登记与沙箱更新复用同一互斥门，但Inference活动不阻止沙箱改变
+        建立一次性回复保障，提交执行闭包；准备或提交失败均完成原回复槽，提交失败撤销未启动活动登记
+        不要求Agent.turn非空，不用turn代号作为推理请求唯一ID
+
+handle_reload_model_routes(world: &mut World, request: ReloadModelRoutes)
+    发起全局配置重载：crate公开函数
+    行为：
+        校验ID，若本次重载仍在途则返回ConfigBusy，不并行发布不同版本
+        复制唯一配置路径和工厂，记录重载请求关联，异步有界读取并编译完整配置
+        返回InferenceReloadOutput，读取、解析或监督失败都保留旧配置
+        只重载全局配置，不接受workspace或项目路径覆盖
+
+handle_model_routes_reloaded(world: &mut World, output: Result<InferenceReloadOutput, InferenceReloadTaskError>)
+    收口配置重载：crate公开函数
+    行为：
+        核对本次重载关联，重复或迟到结果不替换其他版本
+        成功时整体替换routes，失败保持原配置；清除本次重载标记
+        发送关联原请求的ReloadModelRoutesResult，已开始推理继续使用自身路由快照
+```
+
+私有：
+```text
+collect_tool_definitions(world: &World, agent: Entity, visible: &[ResourceID]) -> Result<Vec<ToolDefinition>, InferenceError>
+    准备可见工具定义：私有函数
+    行为：
+        对visible完整ResourceID去重，只读取目标Agent Entity的资源集合
+        仅遍历tool与skill可调用资源条目，筛选map key属于visible的项，get_alias作为模型工具名
+        tool复制description和已加载输入schema；skill复制description并生成消费侧固定schema {"type":"object","properties":{},"additionalProperties":false}（参数仅{}），与ToolPlugin校验一致，不要求skill包增加schema文件；不读取或执行Lua脚本
+        指定ID缺失或缺乏模型工具定义时返回错误，不悄悄忽略；visible指定hook、prompt或sandbox等非可调用类型时返回UnsupportedResource
+        重复alias、非法工具名或不合法schema拒绝，空visible表示无工具，不回退默认集合
+        可调用集合与ToolPlugin保持tool+skill一致；hook仅为Driver解释的触发器，即使有schema也不暴露为模型工具，不把prompt/sandbox冒充工具
+
+normalize_messages(messages: Vec<AgentMessage>) -> Result<Vec<ProviderMessage>, InferenceError>
+    规范化输入消息：私有函数
+    行为：
+        inject递归按顺序展开内部AgentMessage数组，限制嵌套深度及展开后的数量和字节数
+        user、assistant、tool_call转为对应Provider消息；error转用户错误文本
+        保留assistant reasoning、工具调用ID及参数，工具结果保留对应调用ID
+        历史usage不作为Provider请求内容；未知或无法表达的结构返回错误，不静默丢弃
+        检查工具调用与结果的关联及必要字段，空输入及超限拒绝
+
+collect_webui_senders(world: &World) -> Vec<WebSocketSender>
+    收集当前推流发送器：私有函数
+    行为：调用WorldClientExt.client_webui_senders()，去重，忽略已断开的连接；返回本次快照，不保存全局推理订阅表。
+
+run_inference(prepared: PreparedInference) -> Result<InferenceResponse, InferenceError>
+    执行模型请求：私有异步函数
+    行为：
+        在取消令牌、回复Receiver关闭与整体超时之间监督执行，不无限等待网络
+        使用Adapter构造请求并发送HTTP，校验状态；失败有界读取错误body
+        成功时创建本次ResponseAccumulator，逐分片解析并累积assistant、工具调用和usage
+        解析到正文或reasoning增量就直接推送快照中的发送器，不发领域增量事件再中转
+        finish必须确认协议完整结束并推送尾部增量；网络提前结束、非法分片或超限返回错误
+        完整工具调用即使没有正文也可成功；Length返回已有结果及截断原因，不自动续写
+        ContentFilter保留真实停止原因；不把残缺网络响应当作正常截断
+        生成带既有内容及usage的assistant AgentMessage和stop_reason，返回完整结果
+        不查询Agent，不写历史，不执行工具，不重试请求
+
+execute_inference(prepared: PreparedInference)
+    执行并完成回复：私有异步函数
+    行为：
+        运行run_inference，捕获执行失败或panic并转换为InferenceError
+        在短锁内take回复槽中的唯一Sender，发送一次Result；重复完成不再发送
+        取消、超时、提前返回及任务丢弃由私有回复保障完成关联错误或关闭Sender，不能只记录日志
+        等待HTTP请求、流读取及本次推流执行真实结束并释放资源后，才mark_completed并释放Inference活动登记
+        正常运行结束后关闭保障，不再发送第二次错误；外层框架监督失败也不能留下永久等待，cleanup未完成不得仅靠Drop或关闭Sender标记活动完成
+
+push_stream(senders: &mut Vec<WebSocketSender>, id: &str, agent_instance: &str, agent_id: &ResourceID, sequence: u64, delta: ProviderStreamDelta)
+    直接推送增量：私有异步函数
+    行为：
+        保留正文与reasoning不同消息种类，携带请求ID、Agent地址、不透明agent_instance及递增序号；内部完整Entity只用于实例核对，不作为推流DTO字段或外部请求目标
+        使用客户端现有消息编码契约，发送器快照从开始到结束不再补充后来连接
+        关闭发送器从本次活动列表剔除；客户端失败不改变模型结果
+        不因慢客户端无限阻塞模型读取，使用有界队列或发送超时并停止向该慢连接推送
+        不逐增量写历史，不把未完整的工具参数当作可执行调用
+        最终成功或失败可向快照发送器发送终态标记，oneshot仍是唯一权威完成结果
+
+load_model_routes(path: &Path, factories: &HashMap<String, ErasedProviderAdapterFactory>) -> Result<HashMap<ModelId, ConfiguredModelRoute>, InferenceError>
+    加载全局模型路由：私有函数
+    行为：
+        有界读取UTF-8 TOML，要求模型列表非空，model id唯一
+        校验api_type工厂、http/https端点、凭据及Provider选项，禁止将凭据写入日志
+        解析context_window的k/m/b/t无符号整数后缀，值必须大于0，缺省沿用1m
+        所有条目编译成功才返回新map，部分失败不发布残缺配置
+```
+
+## 逻辑
+
+```text
+请求主线：
+    MCL参数快照 -> InferenceRequest -> 主线程模型/资源/发送器快照
+    通用异步闭包 -> Provider HTTP与SSE -> 直接向已收集webui发送器推流
+    完整assistant结果 -> oneshot -> MCL异步闭包 -> ECS收口并写assistant历史 -> MclCommandResult
+
+生命周期：
+    每次请求使用Agent.execution派生CancellationToken，在同一AgentExecutionScope登记Inference活动，不建立InFlightInferences全局表
+    Driver/Agent停止关闭整个作用域受理门，cancel全部活动并等待Inference、Sandbox、Other的真实cleanup及MCL命令实际收口完成，成功前不能销毁Agent或重建作用域
+    发出取消不等于任务已退出，该等待能力必须由任务所属执行设施提供，不能用oneshot通道关闭假称已清理
+    HTTP任务运行于通用异步执行设施，不阻塞Workspace Lua本地线程
+    Agent销毁后的快照仍不允许回写Agent；MCL收口核对Entity，旧结果不得命中新实例
+
+删除旧入口：
+    不保留CapturedInference、ContextCompaction专门请求及输出路由
+    不保留PreparedInference事件、固定异步System、publish_inference_output_system
+    不保留CancelInference按表查询事件、AgentFailure或Lua邮箱输出
+    若将来需要压缩，调用同一推理接口，由调用方解释结果
 ```
 
 # events
 
 ## 类型
 
-公开：
+公开，统一定义于共享types的inference_events.rs；包括内部重载输出和监督错误，不保留插件events.rs：
 ```text
-ReloadModelRoutes：全局模型路由重载请求，公开事件
-    id: String--请求ID
+InferenceRequest：统一推理请求，公开事件
+    id: String--本次推理请求唯一关联，不是turn代号
+    agent: Entity--完整Agent实例
+    messages: Vec<AgentMessage>--拥有所有权的消息快照
+    resources: Vec<ResourceID>--本次模型可见资源地址
+    cancel: CancellationToken--Agent.execution共享作用域派生取消令牌，准备时校验归属，不接受独立根令牌绕过停止
+    reply: Arc<Mutex<Option<oneshot::Sender<Result<InferenceResponse, InferenceError>>>>>--可Clone请求共享唯一Sender
+    impl Event for InferenceRequest
+
+InferenceResponse：完整推理响应，公开共享结构体--oneshot成功载荷，不是第二个结果事件
+    message: AgentMessage--assistant完整消息，含既有reasoning、tool_calls和usage
+    stop_reason: StopReason--保留Provider停止原因
+
+ReloadModelRoutes：全局配置重载请求，公开事件
+    id: String--请求关联
     impl Event for ReloadModelRoutes
 
-ReloadModelRoutesResult：全局模型路由重载结果，公开事件
+ReloadModelRoutesResult：全局配置重载结果，公开事件
     id: String--原请求ID
-    result: Result<ModelRoutesReloaded, InferenceError>--成功时携带路由数量
+    result: Result<usize, InferenceError>--成功为模型路由数量
     impl Event for ReloadModelRoutesResult
 
-InferenceRequestEvent：普通推理请求事件，公开事件--由margatroid_types重新导出
-    id: String--交互轮次ID
-    agent: Entity--目标Agent
-    agent_id: ResourceId--稳定Agent身份
-    messages: Vec<Message>--完整上下文
-    tools: Vec<ToolDefinition>--Provider无关ToolSpec
-    impl Event for InferenceRequestEvent
+InferenceReloadOutput：配置重载输出，公开共享内部类型
+    id: String--原重载请求ID
+    result: Result<HashMap<ModelId, ConfiguredModelRoute>, InferenceError>--完整候选配置
 
-ContextCompactionInferenceRequest：上下文压缩推理请求，公开事件--压缩Provider响应用到MCL上下文
-    id: String--交互轮次ID
-    agent: Entity--目标Agent
-    agent_id: ResourceId--稳定Agent身份
-    messages: Vec<Message>--待压缩消息
-    impl Event for ContextCompactionInferenceRequest
-
-ContextCompactionInferenceResponse：上下文压缩推理响应，公开事件
-    id: String--原请求ID
-    agent: Entity--目标Agent
-    result: Result<String, InferenceError>--成功时为非空压缩正文
-    impl Event for ContextCompactionInferenceResponse
-
-CapturedInferenceRequest：捕获式推理请求，公开事件--由margatroid_types重新导出
-    id: String--"mcl-effect:"命名空间下的请求ID
-    agent: Entity--目标Agent
-    agent_id: ResourceId--稳定Agent身份
-    messages: Vec<Message>--MCL RefBlock展开后的完整输入
-    impl Event for CapturedInferenceRequest
-
-CapturedInferenceResponse：捕获式推理响应，公开事件--由margatroid_types重新导出
-    id: String--原捕获请求ID
-    agent: Entity--目标Agent
-    result: Result<String, InferenceError>--成功时为非空完整正文
-    impl Event for CapturedInferenceResponse
-
-CancelInferenceRequest：取消推理请求，公开事件
-    id: String--要取消的交互轮次ID
-    agent: Entity--目标Agent
-    impl Event for CancelInferenceRequest
+InferenceReloadTaskError：配置重载监督错误，公开共享类型
+    id: String--必须保留重载关联
+    source: AsyncTaskError--通用执行错误
+    说明：From<AsyncTaskError>不能自动取得id，提交包装须保证关联；不可丢失请求仅记日志。
 ```
 
-crate公开：
+## 逻辑
+
 ```text
-InferenceRoute：推理路由，crate公开结构体
-    id: String--交互轮次ID
-    agent: Entity--目标Agent
-    output: InferenceOutputKind--输出类型
-
-InferenceOutputKind：推理输出类型，crate公开枚举
-    AgentMessage
-    ContextCompaction
-    Captured
-
-PreparedInference：已准备推理，crate公开事件--主线程完成路由、Provider适配和发送器解析后的异步任务输入
-    route: InferenceRoute--推理路由
-    agent_id: ResourceId--稳定Agent身份
-    client: reqwest::Client--共享HTTP客户端
-    request: ProviderHttpRequest--已编码Provider请求
-    adapter: ErasedProviderAdapter--Provider协议适配器
-    senders: Vec<WebSocketSender>--普通Agent推理的流式目标；压缩和捕获为空
-    cancellation: watch::Receiver<bool>--取消信号
-    impl Event for PreparedInference
-
-InferenceTaskOutput：异步推理结果，crate公开结构体--publish_inference_output_system读取的任务输出
-    route: InferenceRoute--推理路由
-    result: InferenceTaskResult--推理结局
-
-InferenceTaskResult：异步推理结局，crate公开枚举
-    Completed(Result<ProviderInferenceResponse, InferenceError>)
-    Cancelled
-
-InferenceTaskError：异步任务错误，crate公开结构体--携带AsyncTaskError供日志
-    source: AsyncTaskError--异步运行时错误
-    impl From<AsyncTaskError> for InferenceTaskError
+共享类型归属：
+    InferenceResponse依赖的AgentMessage、StopReason及InferenceError为共享纯值契约，不反向依赖InferencePlugin
+    模型路由纯值与Provider公开trait统一由共享inference_types提供；所有公开trait签名中的输入、请求、响应、累积器、增量、擦除别名及错误都必须公开可见，不能引用插件私有类型；协议具体实现仍在插件types
+    无领域World扩展，本次接口用事件即可，不新增WorldInferenceExt或Workspace路由配置方法
+    本文仅设计目标源码归属，实际文件迁移尚未进行
 ```
 
 # types
-
-types 放除事件和错误外的其余类型、Provider 协议适配器和响应累积器。
-
-## 常量
-
-crate公开：
-```text
-MAX_CONFIG_BYTES: usize = 1024 * 1024
-MAX_MESSAGES_BYTES: usize = 16 * 1024 * 1024
-MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024
-MAX_TOOL_DESCRIPTION_BYTES: usize = 8 * 1024
-MAX_TOOL_COUNT: usize = 256
-MAX_STOP_COUNT: usize = 64
-MAX_STOP_BYTES: usize = 256
-MAX_ERROR_BODY_BYTES: usize = 16 * 1024
-```
 
 ## 类型
 
 公开：
 ```text
-ModelId：模型ID，公开结构体--非空、不超过256字符且不含控制字符
-    new(value: impl Into<String>) -> Result<Self, InferenceError>
-        构造模型ID：公开关联函数
-    as_str(&self) -> &str
-        读取模型ID：公开方法
-    impl fmt::Display for ModelId
-        Display：公开trait实现，直接输出内部字符串
+ModelId：模型选择标识，公开值类型
+    value: String--非空、不超过256字符、不含控制字符
 
-InferenceParameters：推理参数，公开结构体--Provider无关采样参数
-    temperature: Option<f32>--温度，私有
-    max_output_tokens: Option<u32>--最大输出Token，私有
-    top_p: Option<f32>--核采样，私有
-    stop: Vec<String>--停止序列，私有
-    new(temperature: Option<f32>, max_output_tokens: Option<u32>, top_p: Option<f32>, stop: Vec<String>) -> Self
-        构造参数：公开关联函数
-    temperature(&self) -> Option<f32>
-        读取温度：公开方法
-    max_output_tokens(&self) -> Option<u32>
-        读取最大输出Token：公开方法
-    top_p(&self) -> Option<f32>
-        读取核采样：公开方法
-    stop(&self) -> &[String]
-        读取停止序列：公开方法
+ConfiguredModelRoute：已编译全局路由，公开纯值类型
+    model: String--Provider模型名
+    context_window_tokens: u64--上下文窗口信息，不假称可精确估算全部token
+    adapter: ErasedProviderAdapter--不可变协议适配器快照，内含端点及凭据
+
+InferenceParameters：采样参数，公开纯值类型
+    temperature: Option<f32>
+    max_output_tokens: Option<u32>
+    top_p: Option<f32>
+    stop: Vec<String>
     validate(&self) -> Result<(), InferenceError>
-        校验参数：crate公开方法，校验范围、停止序列数量和长度
+        验证采样参数：公开方法
+        行为：验证有限浮点及协议允许范围、非零输出上限、停止序列数量与长度；Provider特有不支持参数由Adapter拒绝。
 
-ConfiguredModelRoute：模型路由配置，公开结构体
-    model: String--Provider模型名，crate公开
-    context_window_tokens: u64--上下文窗口Token数，crate公开
-    adapter: ErasedProviderAdapter--协议适配器，crate公开
-    model(&self) -> &str
-        读取Provider模型名：公开方法
-    context_window_tokens(&self) -> u64
-        读取上下文窗口：公开方法
-    adapter(&self) -> &ErasedProviderAdapter
-        读取适配器：公开方法
+ToolDefinition：模型工具定义，公开共享值类型
+    name: String--资源alias
+    description: String--资源描述
+    input_schema: serde_json::Value--输入schema
 
-WorkspaceModelRoutes：Workspace模型路由，公开结构体
-    routes: HashMap<ModelId, ConfiguredModelRoute>--ModelId到模型路由，crate公开
-    get(&self, id: &ModelId) -> Option<ConfiguredModelRoute>
-        读取路由：公开方法
-    len(&self) -> usize
-        路由数量：公开方法
-    is_empty(&self) -> bool
-        是否为空：公开方法
+ProviderInput：协议无关输入，公开纯值类型
+    model: String
+    parameters: InferenceParameters
+    messages: Vec<ProviderMessage>--规范化后的消息
+    tools: Vec<ToolDefinition>
 
-WorkspaceModelRoutesRegistry：Workspace模型路由注册表，公开Resource
-    routes: HashMap<Entity, WorkspaceModelRoutes>--Workspace到路由，私有
-    get(&self, workspace: Entity) -> Option<&WorkspaceModelRoutes>
-        读取Workspace路由：公开方法
-    insert(&mut self, workspace: Entity, routes: WorkspaceModelRoutes)
-        写入Workspace路由：公开方法
-    remove(&mut self, workspace: Entity)
-        移除Workspace路由：公开方法
-    impl Resource for WorkspaceModelRoutesRegistry
+ProviderMessage：协议消息，公开纯值契约
+    说明：表达用户、assistant、工具结果和必要Provider角色；不包含Agent路由事件或inject容器。
 
-ProviderInput<'a>：Provider无关请求输入，公开结构体
-    model: &'a str--Provider模型名，私有
-    parameters: &'a InferenceParameters--采样参数，私有
-    messages: &'a [Message]--消息，私有
-    tools: &'a [ToolDefinition]--内部ToolSpec，私有
-    new(model: &'a str, parameters: &'a InferenceParameters, messages: &'a [Message], tools: &'a [ToolDefinition]) -> Self
-        构造输入：crate公开关联函数
-    model(&self) -> &str
-        读取模型名：公开方法
-    parameters(&self) -> &InferenceParameters
-        读取参数：公开方法
-    messages(&self) -> &[Message]
-        读取消息：公开方法
-    tools(&self) -> &[ToolDefinition]
-        读取工具：公开方法
+ProviderRouteInput：已解析路由输入，公开纯值结构体
+    provider: Option<String>
+    base_url: Url
+    api_key: String--禁止日志输出
+    thinking: Option<String>
+    reasoning_effort: Option<String>
 
-ProviderRouteInput<'a>：Provider路由输入，公开结构体--从ModelRouteConfig构造后交给工厂
-    provider: Option<&'a str>--Provider覆盖名，crate公开
-    base_url: &'a Url--基础URL，crate公开
-    api_key: &'a str--API Key，crate公开
-    thinking: Option<&'a str>--DeepSeek思考开关，crate公开
-    reasoning_effort: Option<&'a str>--DeepSeek思考强度，crate公开
-    provider(&self) -> Option<&str>
-        读取Provider覆盖名：公开方法
-    base_url(&self) -> &Url
-        读取基础URL：公开方法
-    api_key(&self) -> &str
-        读取API Key：公开方法
-    thinking(&self) -> Option<&str>
-        读取思考开关：公开方法
-    reasoning_effort(&self) -> Option<&str>
-        读取思考强度：公开方法
+ProviderAdapterFactory：协议工厂，公开trait
+    约束：Send + Sync + 'static
+    build(&self, config: &ProviderRouteInput) -> Result<ErasedProviderAdapter, InferenceError>
+        创建协议适配器：公开trait方法
+        行为：检查端点、凭据和api_type特有选项，返回不可变共享Adapter。
 
-ProviderHttpRequest：已编码Provider请求，公开结构体
-    method: Method--HTTP方法，crate公开
-    url: Url--请求URL，crate公开
-    headers: HeaderMap--请求头，crate公开
-    body: Vec<u8>--请求体，crate公开
-    new(method: Method, url: Url, headers: HeaderMap, body: Vec<u8>) -> Self
-        构造请求：公开关联函数
-
-ProviderAdapter：Provider协议适配器，公开trait
-    继承：Send + Sync + 'static
-    build_request(&self, input: ProviderInput<'_>) -> Result<ProviderHttpRequest, InferenceError>
-        构造Provider请求：把Provider无关输入编码为HTTP请求
+ProviderAdapter：协议适配器，公开trait
+    约束：Send + Sync + 'static
+    build_request(&self, input: &ProviderInput) -> Result<ProviderHttpRequest, InferenceError>
+        编码HTTP请求：公开trait方法
+        行为：将统一消息、schema和参数转换为Provider协议，不访问World。
     begin_response(&self, status: StatusCode, headers: &HeaderMap) -> Result<Box<dyn ProviderResponseAccumulator>, InferenceError>
-        开始响应：校验状态码并创建对应协议累积器
+        建立响应累积器：公开trait方法
+        行为：检查响应格式，为每次请求创建独立累积器。
 
-ProviderAdapterFactory：Provider适配器工厂，公开trait
-    继承：Send + Sync + 'static
-    build(&self, route: ProviderRouteInput<'_>) -> Result<ErasedProviderAdapter, InferenceError>
-        构造适配器：校验路由选项并返回适配器对象
-
-ProviderResponseAccumulator：Provider响应累积器，公开trait
-    继承：Send + 'static
+ProviderResponseAccumulator：响应累积器，公开trait
+    约束：Send + 'static
     push(&mut self, chunk: &[u8]) -> Result<Vec<ProviderStreamDelta>, InferenceError>
-        累积流式分片：解析SSE并返回有序增量
+        累积响应分片：公开trait方法
+        行为：处理跨分片字节与SSE结构，返回有序新增reasoning和正文。
     finish(self: Box<Self>) -> Result<(ProviderInferenceResponse, Vec<ProviderStreamDelta>), InferenceError>
-        完成响应：返回最终响应和尾部增量
+        完成累积：公开trait方法
+        行为：处理尾部并验证完整结束，返回最终响应及尚未推送的尾部增量，不把断流当完成。
 
-ErasedProviderAdapter：Provider适配器对象，公开类型别名
-    Arc<dyn ProviderAdapter>
+ProviderHttpRequest：已编码请求，公开纯值结构体
+    method: Method
+    url: Url
+    headers: HeaderMap
+    body: Vec<u8>
 
-ErasedProviderAdapterFactory：Provider适配器工厂对象，公开类型别名
-    Arc<dyn ProviderAdapterFactory>
+ProviderInferenceResponse：完整Provider响应，公开纯值结构体
+    reasoning: Option<String>
+    content: Option<String>
+    tool_calls: Vec<ToolCall>
+    usage: Option<TokenUsage>
+    stop_reason: StopReason
 
-StopReason：停止原因，公开枚举
+ProviderStreamDelta：增量，公开纯值枚举
+    Reasoning(String)
+    Content(String)
+
+StopReason：停止原因，公开共享枚举
     Completed
     ToolCalls
     Length
     ContentFilter
     Other(String)
 
-ProviderInferenceResponse：Provider响应，公开结构体--协议无关累积结果
-    reasoning: Option<String>--Provider公开的完整思考内容
-    content: Option<String>--Assistant文本
-    tool_calls: Vec<ToolCall>--保留Provider返回的调用ID、tool_name和参数
-    stop_reason: StopReason--停止原因
-    usage: Option<TokenUsage>--Provider返回usage时保存输入、输出和缓存命中Token
-
-ProviderStreamDelta：Provider流式增量，公开枚举--累积器区分思考与正文的有序输出
-    Reasoning(String)--新增思考文本
-    Content(String)--新增正文文本
-
-ModelRoutesReloaded：模型路由重载结果，公开结构体
-    route_count: usize--重载后的路由数量
-
-OpenAiAdapterFactory：OpenAI协议工厂，公开结构体
-    new() -> Self
-        构造工厂：公开关联函数
-    impl ProviderAdapterFactory for OpenAiAdapterFactory
-        构造OpenAI适配器：拒绝DeepSeek思考选项，校验API Key不含控制字符
-
-DeepSeekAdapterFactory：DeepSeek协议工厂，公开结构体
-    new() -> Self
-        构造工厂：公开关联函数
-    impl ProviderAdapterFactory for DeepSeekAdapterFactory
-        构造DeepSeek适配器：把thinking解析为ThinkingMode，校验thinking和reasoning_effort组合，启用思考时要求high或max
-```
-
-crate公开：
-```text
-ModelRouteDocument：models.toml文档，crate公开结构体
-    models: Vec<ModelRouteConfig>--模型路由列表
-
-ModelRouteConfig：模型路由配置，crate公开结构体
-    id: String--模型ID
-    model: String--Provider模型名
-    provider: Option<String>--Provider覆盖名
-    base_url: String--基础URL
-    api_key: String--API Key
-    api_type: String--选择Provider Adapter
-    thinking: Option<String>--DeepSeek思考开关
-    reasoning_effort: Option<String>--DeepSeek思考强度
-    context_window: Option<String>--模型总上下文窗口，使用k/m/b/t后缀
+ErasedProviderAdapter = Arc<dyn ProviderAdapter>：协议适配器，公开类型别名
+ErasedProviderAdapterFactory = Arc<dyn ProviderAdapterFactory>：协议工厂，公开类型别名
 ```
 
 私有：
 ```text
-OpenAiAdapter：OpenAI协议适配器，私有结构体
-    base_url: Url
-    api_key: String
-    impl ProviderAdapter for OpenAiAdapter
-        build_request：使用/chat/completions和流式SSE，构造OpenAI兼容请求体
-        begin_response：非成功状态返回ResponseStatus
+PreparedInference：闭包捕获快照，私有结构体--不是事件
+    id: String
+    agent: Entity
+    agent_id: ResourceID
+    agent_instance: String--主线程生成的不透明实例关联，不接受外部请求以此寻址
+    input: ProviderInput
+    adapter: ErasedProviderAdapter
+    client: reqwest::Client
+    senders: Vec<WebSocketSender>
+    cancel: CancellationToken
+    activity: ExecutionActivity--共享作用域登记的Inference活动句柄，真实cleanup后mark_completed
+    reply: Arc<Mutex<Option<oneshot::Sender<Result<InferenceResponse, InferenceError>>>>>
+    limits: InferenceLimits
 
-ThinkingMode：DeepSeek思考模式，私有枚举
-    Enabled | Disabled
-    parse(&str) -> Option<Self>
-        解析：只接受enabled与disabled
-    as_str(self) -> &'static str
-        输出：写回请求体的type字段
-    thinks(self) -> bool
-        判定：只有Enabled让上游处于思考模式
+InferenceLimits：安全上限，私有结构体
+    config_bytes: usize--默认1MiB
+    message_bytes: usize--默认单项4MiB
+    messages_bytes: usize--默认总量16MiB
+    tool_count: usize--默认256
+    tool_description_bytes: usize--默认8KiB
+    error_body_bytes: usize--默认16KiB
+    response_bytes: usize--必须有界，最终值实现前确定
+    inject_depth: usize--必须限制递归，最终值实现前确定
+    request_timeout: Duration--覆盖整个请求，默认值实现前确定
+    stream_send_timeout: Duration--慢客户端隔离上限，默认值实现前确定
 
-DeepSeekAdapter：DeepSeek协议适配器，私有结构体
-    base_url: Url
-    api_key: String
-    thinking: Option<ThinkingMode>
-    reasoning_effort: Option<String>
-    impl ProviderAdapter for DeepSeekAdapter
-        build_request：使用/chat/completions和流式SSE，写入thinking与reasoning_effort
-        行为：声明thinking时按模式写type，disabled必须显式写入而不能省略
-        边界：DeepSeek把缺失的thinking视为未指定，模型按自身默认运行（deepseek-flash默认思考），
-              因此省略字段无法表达"关闭思考"
-        begin_response：非成功状态返回ResponseStatus
-
-OpenAiRequest：OpenAI兼容请求体，私有结构体
+ModelRouteConfig：模型配置项，私有结构体
+    id: String
     model: String
-    messages: Vec<serde_json::Value>
-    tools: Vec<serde_json::Value>
-    stream: bool
-    stream_options: OpenAiStreamOptions
-    temperature: Option<f32>
-    max_tokens: Option<u32>
-    top_p: Option<f32>
-    stop: Vec<String>
-    thinking: Option<DeepSeekThinking>
+    provider: Option<String>
+    base_url: String
+    api_key: String
+    api_type: String
+    thinking: Option<String>
     reasoning_effort: Option<String>
-    from_input(input: ProviderInput<'_>) -> Self
-        从通用输入构造OpenAI请求：私有关联函数
-    from_deepseek_input(input: ProviderInput<'_>, thinking: bool, reasoning_effort: Option<String>) -> Self
-        从通用输入构造DeepSeek请求：私有关联函数
+    context_window: Option<String>
 
-OpenAiStreamOptions：流选项，私有结构体
-    include_usage: bool
+OpenAiAdapter与DeepSeekAdapter：协议实现，私有类型
+    说明：复用协议共同结构，但保持DeepSeek特有语义，不按base_url猜测api_type。
 
-DeepSeekThinking：DeepSeek思考开关，私有结构体
-    thinking_type: &'static str
-
-OpenAiAccumulator：OpenAI兼容SSE累积器，私有结构体
-    buffer: Vec<u8>
+OpenAiAccumulator：SSE累积器，私有结构体
+    buffer: Vec<u8>--跨分片保留，单行及总量有界
     reasoning: String
     content: String
-    tool_calls: Vec<OpenAiToolCallBuilder>
-    stop_reason: Option<StopReason>
+    tool_calls: BTreeMap<usize, ToolCallBuilder>--按Provider index累积
     usage: Option<TokenUsage>
-    saw_choice: bool
-    done: bool
-    capture_reasoning: bool
-    impl ProviderResponseAccumulator for OpenAiAccumulator
-        push：按行解析SSE，返回本帧产生的增量
-        finish：处理尾部行，校验完整性并返回ProviderInferenceResponse
-    consume_line(&mut self, line: &[u8]) -> Result<Vec<ProviderStreamDelta>, InferenceError>
-        消费单行SSE：私有方法
-    consume_chunk(&mut self, chunk: OpenAiChunk) -> Result<Vec<ProviderStreamDelta>, InferenceError>
-        消费单个JSON帧：私有方法，累积usage、content、reasoning和tool_calls
-
-OpenAiToolCallBuilder：OpenAI工具调用累积，私有结构体
-    id: String
-    name: String
-    arguments: String
-
-OpenAiChunk：OpenAI流式JSON帧，私有结构体
-OpenAiChoice：OpenAI选择，私有结构体
-OpenAiDelta：OpenAI增量，私有结构体
-OpenAiToolCallDelta：OpenAI工具调用增量，私有结构体
-OpenAiFunctionDelta：OpenAI函数增量，私有结构体
-OpenAiUsage：OpenAI用量，私有结构体
-OpenAiTokenDetails：OpenAI Token详情，私有结构体
-
-DeepSeekAccumulator：DeepSeek SSE累积器，私有结构体
-    inner: OpenAiAccumulator
-    impl ProviderResponseAccumulator for DeepSeekAccumulator
-        push：开启reasoning捕获后委托OpenAiAccumulator
-        finish：开启reasoning捕获后委托OpenAiAccumulator
-```
-
-## 函数
-
-私有：
-```text
-openai_message(message: &Message) -> serde_json::Value
-    OpenAI消息转换：私有函数，System、User、Assistant、Tool、Error转OpenAI JSON；Error按User内容兜底；Assistant无tool_calls时不写tool_calls
-
-deepseek_message(message: &Message, thinking: bool) -> serde_json::Value
-    DeepSeek消息转换：私有函数，Assistant写content与tool_calls，其余委托openai_message
-    行为：上游可能处于思考模式（声明enabled或未声明thinking）时每条Assistant都写reasoning_content，
-          思考内容缺失时写空串；显式disabled时只对带tool_calls的Assistant写该字段
-    边界：DeepSeek在思考模式下要求把assistant消息的reasoning_content回传，缺字段会被Provider拒绝；
-          注入或历史里没有思考内容的assistant消息必须补空串，不能省略字段
-
-decode_token_usage(usage: OpenAiUsage) -> TokenUsage
-    统一Token统计：私有函数
-    行为：输入与输出兼容input_tokens/output_tokens和prompt_tokens/completion_tokens；缓存命中依次兼容prompt_tokens_details.cached_tokens、input_tokens_details.cached_tokens和prompt_cache_hit_tokens
-
-parse_stop_reason(value: &str) -> StopReason
-    解析停止原因：私有函数，stop映射Completed，tool_calls/function_call映射ToolCalls，length映射Length，content_filter映射ContentFilter
+    stop_reason: Option<StopReason>
+    completed: bool--已观察到协议完整结束
 ```
 
 ## 逻辑
 
 ```text
-Provider Adapter 构造：
-    compile_model_routes 读取 api_type 并选择工厂
-    OpenAiAdapterFactory/DeepSeekAdapterFactory 校验路由选项
-    OpenAiAdapter/DeepSeekAdapter 在 build_request 中把内部ToolSpec转换为Provider ToolSpec
-    resource_name 原样作为本次请求的 Provider tool_name
-    stream_options.include_usage = true 以请求末尾Token统计
+OpenAI协议：
+    使用chat/completions流式请求，工具name原样为alias，stream_options.include_usage开启
+    SSE按完整行处理，支持CRLF、多data行及跨UTF-8分片，未完整的字节保留到下一分片
+    正文、reasoning与工具参数按delta累积，工具调用按index合并ID、name和arguments片段
+    usage尾部无choices也必须处理，统一input/output与prompt/completion计数及缓存命中字段
+    完整结束后检查工具ID唯一、名称存在及参数结构，不生成半条工具调用
 
-Provider 响应累积：
-    OpenAiAccumulator 解析SSE行，按顺序产生 Content 与 Reasoning 增量
-    DeepSeekAccumulator 开启 reasoning_content/reasoning 捕获后委托 OpenAiAccumulator
-    finish 时使用 decode_token_usage 统一Token统计，并把工具调用还原为内部 ToolCall
+DeepSeek协议：
+    thinking显式disabled必须写入请求，不能省略后误用模型默认思考模式
+    启用或未明确禁用思考时，assistant回传reasoning_content，缺内容补空串
+    显式disabled时仍按工具调用协议处理必要reasoning字段
+    校验thinking与reasoning_effort组合，不支持的组合在准备阶段失败
 
-边界：
-    types 不查询 AgentResourceMap，不写 AgentResourceMap。
-    api_type 决定协议语义，base_url 只决定请求目的地。
+边界与保密：
+    不自动截断输入、不自动压缩、不自动继续Length响应、不自动执行tool_calls
+    HTTP非成功状态有界提取error.message等Provider细节，控制字符单行化，消息截断
+    日志URL只保留安全origin，不记录API key、Authorization或完整含密钥请求
+    不默认记录完整prompt；用户MCL历史由MCL负责，不在推理日志复制一份
 ```
 
 # error
 
-error 放 Error 类型和公开错误分类。
-
 ## 类型
 
-公开：
+公开，共享推理错误契约：
 ```text
 InferenceErrorKind：推理错误分类，公开枚举
-    InvalidModelId
-    ConfigPathUnavailable
-    ConfigReadFailed
-    ConfigDecodeFailed
-    DuplicateModelId
-    InvalidModelRoute
-    UnsupportedApiType
-    InvalidCommand
+    InvalidRequest
     AgentNotAlive
-    InferenceSnapshotMissing
+    InvalidModelId
     ModelRouteNotFound
     InvalidParameters
     InvalidMessages
     InvalidToolDefinitions
+    ResourceMissing
+    UnsupportedResource
     UnsupportedInput
-    RequestBuildFailed
+    ConfigReadFailed
+    ConfigDecodeFailed
+    InvalidModelRoute
+    UnsupportedApiType
+    ConfigBusy
+    SubmitFailed
     RequestFailed
     ResponseStatus
     ResponseDecodeFailed
-    ResponseEncodeFailed
     ResponseIncomplete
+    ResponseTooLarge
+    Timeout
+    Cancelled
     TaskPanicked
+    TaskAborted
 
 InferenceError：推理错误，公开结构体
-    kind: InferenceErrorKind--错误分类，私有
-    message: String--有界错误消息，私有
-    status: Option<u16>--HTTP状态码，私有
-    new(kind: InferenceErrorKind, message: impl Into<String>) -> Self
-        构造错误：公开关联函数
-    with_status(kind: InferenceErrorKind, status: Option<u16>, message: impl Into<String>) -> Self
-        构造带状态错误：公开关联函数，消息超过512字节时截断为509字节加"..."
-    kind(&self) -> InferenceErrorKind
-        读取分类：公开方法
-    message(&self) -> &str
-        读取消息：公开方法
-    status(&self) -> Option<u16>
-        读取HTTP状态：公开方法
-    panic(self) -> !
-        panic：crate公开方法，直接panic该错误，只用于Plugin安装阶段
+    kind: InferenceErrorKind
+    message: String--不超过512字节，按UTF-8字符边界截断
+    status: Option<u16>--HTTP状态码
+    impl Clone + Debug + PartialEq + Eq for InferenceError
     impl fmt::Display for InferenceError
-        Display：公开trait实现，有status时输出"{kind:?} (HTTP {status}): {message}"
+        fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
+            格式化错误：公开trait方法
+            行为：输出分类、可选HTTP状态和有界描述，不输出凭据。
     impl std::error::Error for InferenceError
 ```
 
 ## 逻辑
 
 ```text
-InferenceError 只用于推理域错误。AgentFailure 由 handler 中的 publish_inference_error 使用 AgentFailureKind::Inference 包装，不经过 InferenceErrorKind 之外的公开分类。
-InferenceError 消息会被截断到512字节以内，避免Provider错误详情无限增长。
+任何失败都通过原请求oneshot完成，不能只记warning后静默返回
+客户端发送失败是推流旁路失败，不转换为模型失败；HTTP或协议失败则返回InferenceError
+收到部分增量后失败不会撤回已显示内容，终态应明确失败；没有自动重试避免重复内容与计费
+作用域取消和真实cleanup等待采用已批准的共享AgentExecutionScope契约，不再作为待定方案；Client快照使用WorldClientExt.client_webui_senders()；安全上限默认值仍须实施时落实
 ```

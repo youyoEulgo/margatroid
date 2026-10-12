@@ -36,12 +36,12 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 lib        src/lib.rs        统一插件、组件trait和注册入口
 system     src/system.rs     当前目标设计无System
 handler    src/handler.rs    类型注册、组件挂载和地址查询
-events     src/events.rs     当前目标设计无事件
+events     共享types crate    当前目标设计无事件，不保留插件events.rs
 types      src/types.rs      ResourceID、ResourceSet和类型注册表
 error      src/error.rs      解析、注册、挂载和查询错误
 ```
 
-**本文是新的目标设计，尚未实现。** 本crate将统一原resource_id_plugin、resource_library_plugin和library_component_plugin的基础职责。统一后的插件暂称ResourcePlugin，最终crate名称另定。本次只修改本文，不修改Rust代码和其他插件文档。
+**本文是新的目标设计，尚未实现。** 本crate将统一原resource_id_plugin、resource_library_plugin和library_component_plugin的基础职责。统一后的插件暂称ResourcePlugin，最终crate名称另定。本文仅定义基础设施目标，不修改Rust代码。
 
 # lib
 
@@ -49,9 +49,9 @@ error      src/error.rs      解析、注册、挂载和查询错误
 
 各领域图书馆组件与资源条目计划统一写入共享types crate对应的`xxx_components.rs`，本资源基础设施不再集中定义Agent、Workspace、AgentImage或工具等领域组件。
 
-统一资源插件的组件集合及trait契约（ResourceSet、LibraryComponent、ResourcesComponent）计划写入共享types crate的`resource_components.rs`。Plugin、注册表操作与查询处理仍属于插件实现。此处只标注源码目标位置，文档板块不移动，也尚未创建或迁移源码文件。
+统一资源插件的组件集合及trait契约（ResourceSet、ResourceInner、LibraryComponent、ResourcesComponent）计划写入共享types crate的`resource_components.rs`。Plugin只安装和登记类型；ResourceTypeRegistry、注册表数据契约、纯查询及WorldResourceExt实现下沉共享resource_components.rs，不让共享类型调用插件Handler。此处只标注源码目标位置，文档板块不移动，也尚未创建或迁移源码文件。
 
-实施迁移时必须同时确定ResourceID等基础值类型的归属，使共享types不反向依赖资源插件实现，避免循环依赖；本次不展开或修改依赖结构。
+ResourceID等基础值与集合契约统一归共享基础类型层；共享types不能反向依赖资源插件实现。公开trait的关联类型及方法签名只能引用公开可见契约，不引用插件私有类型。
 
 ## 类型
 
@@ -76,17 +76,29 @@ LibraryComponent：图书馆组件，公开trait--描述实体自身的领域身
     resource_id(&self) -> &ResourceID
         读取自身地址：公开trait方法，返回该图书馆组件保存的ResourceID
 
-ResourcesComponent：资源集合组件，公开trait--描述实体上挂载的一类资源集合
+ResourceInner：资源条目契约，公开trait--统一读取条目的本地别名，不保存第二份ID
+    约束：Send + Sync + 'static
+    get_alias(&self) -> &str
+        读取别名：公开trait方法，返回资源条目的alias
+
+ResourcesComponent：资源集合组件，公开trait--扩展已有集合契约，不另建重复的资源查询trait
     约束：Component
+    type Inner: Send + Sync + 'static--集合的具体资源条目类型；不强制镜像等既有条目实现ResourceInner
+    list_id(&self) -> impl Iterator<Item = &ResourceID> + '_
+        列出多个资源ID：公开trait方法，返回集合的全部ID，而非单个ID
+        约束：Self::Inner: ResourceInner
+    get_by_id(&self, id: &ResourceID) -> Option<&Self::Inner>
+        按ID读取条目：公开trait方法，命中时借用条目，不存在时返回None
+        约束：Self::Inner: ResourceInner
     resource_ids(&self) -> impl Iterator<Item = &ResourceID> + '_
-        列出资源地址：公开trait方法，遍历该组件中保存的资源ID
+        兼容基础查询：公开trait方法，不要求ResourceInner，保留注册、挂载校验和实体发现使用的接口
 ```
 
 ## 扩展 trait
 
 公开：
 ```text
-WorldResourceExt：资源管理世界扩展，公开trait
+WorldResourceExt：资源管理世界扩展，公开trait--定义及纯查询/注册/受检挂载实现下沉共享resource_components.rs，不调用插件Handler
     register_library<C>(&mut self, resource_type: &str) -> Result<(), ResourceError>
         注册图书馆类型：公开方法，建立地址类型到具体图书馆组件类型的对应关系
         约束：C: LibraryComponent
@@ -104,7 +116,7 @@ WorldResourceExt：资源管理世界扩展，公开trait
         约束：C: ResourcesComponent
         行为：调用insert_resources_component::<C>
     impl WorldResourceExt for World
-        World：公开trait实现，按上述处理函数实现
+        World：公开trait实现，按共享基础层中的上述纯处理函数实现；插件安装只调用这些共享入口
 ```
 
 ## 逻辑
@@ -120,7 +132,8 @@ WorldResourceExt：资源管理世界扩展，公开trait
 trait的能力边界：
     LibraryComponent要求返回自身ID，但Rust trait不能强制某个具体字段名称
     具体图书馆组件按约定包含resource_id: ResourceID字段
-    ResourcesComponent列出集合内部ID，ResourceSet<T>通过map的键提供，不重复在T中存ID
+    ResourcesComponent通过list_id列出集合内部ID，get_by_id按ID返回具体条目；resource_ids兼容基础查询
+    ResourceSet<T>通过map的键提供ID，五类资源条目T: ResourceInner通过get_alias返回alias；集合存储基本约束保持Send + Sync + 'static，不重复在T中存ID
     两个trait不是互斥机制，单个Entity只能有一个图书馆组件的检查由统一挂载入口完成
 
 ECS挂载边界：
@@ -148,6 +161,8 @@ ECS挂载边界：
 ```
 
 # handler
+
+本板块描述的注册、受检挂载、查询函数及其泛型辅助实现统一下沉共享resource_components.rs；板块只是文档组织，不表示共享契约依赖插件src/handler.rs。Plugin仅负责安装及调用共享注册入口。
 
 ## 函数
 
@@ -194,7 +209,7 @@ insert_resources_component<C>(world: &mut World, entity: Entity, component: C) -
         失败时不改变原有组件
 
 find_resource_entities(world: &World, id: &ResourceID) -> Result<Vec<Entity>, ResourceError>
-    查询包含地址的实体：crate公开函数
+    查询包含地址的实体：共享基础层公开纯查询函数，定义及实现于resource_components.rs
     行为：
         插件或注册表缺失时返回PluginMissing
         按id.resource_type()查找注册项，未注册时返回TypeNotRegistered
@@ -280,7 +295,7 @@ validate_tag(value: &str) -> Result<(), ResourceIDError>
 ```text
 组件注册、挂载与查询是同步API，不需要事件中转
 业务插件的加载、导入、启动和停止事件由共享types crate定义，本插件不代替它们制定流程
-共享types可以依赖本基础crate提供的ResourceID；本基础crate不反向依赖共享业务事件或具体业务插件
+ResourceID归共享基础类型层，资源插件实现依赖该共享契约；共享业务事件不反向依赖本插件或具体业务插件实现
 ```
 
 # types
@@ -307,7 +322,7 @@ ResourceID：资源地址值，公开结构体--不实现Component，可用于�
     tag(&self) -> &str
         读取标签：公开方法
     find_entities(&self, world: &World) -> Result<Vec<Entity>, ResourceError>
-        查询包含者：公开方法，调用find_resource_entities(world, self)
+        查询包含者：公开方法，调用共享resource_components.rs的纯查询find_resource_entities(world, self)，不引用插件Handler
     impl Clone + Debug + PartialEq + Eq + PartialOrd + Ord + Hash for ResourceID
     impl FromStr for ResourceID
         from_str(value: &str) -> Result<Self, ResourceIDError>
@@ -327,8 +342,14 @@ ResourceSet<T>：同类资源集合，公开泛型结构体--作为一个组件�
         构造空集合：公开关联函数
     insert(&mut self, id: ResourceID, value: T) -> Option<T>
         写入条目：公开方法，同ID更新并返回旧值，无旧值时返回None
+    list_id(&self) -> impl Iterator<Item = &ResourceID> + '_
+        列出多个ID：公开方法，返回entries的全部键
+        约束：T: ResourceInner
+    get_by_id(&self, id: &ResourceID) -> Option<&T>
+        读取条目：公开方法，按map中的ID键取值
+        约束：T: ResourceInner
     get(&self, id: &ResourceID) -> Option<&T>
-        读取条目：公开方法，按ID取值
+        兼容读取条目：公开方法，直接读取entries，不要求ResourceInner
     get_mut(&mut self, id: &ResourceID) -> Option<&mut T>
         修改条目：公开方法，按ID取可变条目；不提供map键的可变引用
     remove(&mut self, id: &ResourceID) -> Option<T>
@@ -347,23 +368,30 @@ ResourceSet<T>：同类资源集合，公开泛型结构体--作为一个组件�
     impl ResourcesComponent for ResourceSet<T>
         ResourcesComponent：公开泛型trait实现
         约束：T: Send + Sync + 'static
-        resource_ids(&self) -> impl Iterator<Item = &ResourceID> + '_
+        type Inner = T
+        list_id(&self) -> impl Iterator<Item = &ResourceID> + '_
             列出地址：返回entries的键迭代器
+            约束：T: ResourceInner
+        get_by_id(&self, id: &ResourceID) -> Option<&T>
+            读取条目：返回entries.get(id)
+            约束：T: ResourceInner
+        resource_ids(&self) -> impl Iterator<Item = &ResourceID> + '_
+            兼容基础查询：直接返回entries.keys()，不要求ResourceInner
 ```
 
 crate公开：
 ```text
-ResourceTypeRegistry：资源类型注册表，crate公开Resource--只保存类型关系和函数，不保存实例地址索引
+ResourceTypeRegistry：资源类型注册表，公开共享Resource--定义于resource_components.rs--只保存类型关系和函数，不保存实例地址索引
     registrations: HashMap<String, ResourceTypeRegistration>--地址类型段到具体组件注册项
     impl Resource for ResourceTypeRegistry
 
-ResourceTypeRegistration：具体组件注册项，crate公开结构体
+ResourceTypeRegistration：具体组件注册项，公开共享结构体--定义于resource_components.rs
     component_type: TypeId--具体组件类型
     kind: ResourceComponentKind--图书馆或资源集合分类
     query: fn(&World, &ResourceID) -> Vec<Entity>--针对已注册具体类型生成的查询函数
     contains: fn(&World, Entity) -> bool--检查目标是否挂载该具体组件
 
-ResourceComponentKind：组件分类，crate公开枚举
+ResourceComponentKind：组件分类，公开共享枚举--定义于resource_components.rs
     Library
     Resources
 ```
@@ -392,8 +420,10 @@ ResourceComponentKind：组件分类，crate公开枚举
     每个Entity自己的ResourceSet<T>是该Entity使用该类资源的数据来源
     不再要求同ID运行时内容在所有Entity间共享唯一实例
     磁盘包可以仍位于全局路径，与每个Entity拥有自己的运行时条目不冲突
-    Agent A重新IMPORT更新自己的条目，不自动覆盖Agent B的条目
-    alias属于所在Entity的本地使用名称，不属于全局ResourceID
+    重复IMPORT不因同ID已存在而跳过，仍重新加载；成功仅替换目标集合对应ID键，不自动覆盖其他Entity的条目
+    合理安全补充：读取、校验或挂载失败保留原条目并返回失败，不能把旧条目当作本次加载成功
+    IMPORT的Agent许可由调用方按Agent.info.image_dependencies完整ID精确匹配，无builtin例外；基础集合及加载插件不重复执行该领域许可检查
+    alias属于所在Entity的本地使用名称，不属于全局ResourceID；消费方准备可见集合时不同ID的alias冲突必须失败，Inference与tool_call一致
     一份集合内一个ID对应一个条目；需要同一资源多个别名时须另行设计别名表，不用重复map键表示
 
 使用与查询：
@@ -409,9 +439,11 @@ ResourceComponentKind：组件分类，crate公开枚举
     这些约束不靠额外身份副本或GC维持，后续实现需收紧领域写入API
 
 组件实现归属：
-    ResourceSet<T>定义在本crate，因此本crate可以为它实现外部Component trait
+    ResourceSet<T>与ResourceInner、ResourcesComponent按目标归属统一定义于共享resource_components.rs，由定义侧实现Component及集合trait
     业务crate不再分别为ResourceSet<ToolResource>等具体实例重复实现Component
-    ToolResource、AgentImage等条目的具体字段仍由各领域定义，本基础crate不依赖它们
+    ToolResource等条目的alias与ResourceInner实现由共享领域components文件定义，本基础设施不依赖具体领域类型
+    AgentImage本次不改，不新增alias或ResourceInner实现；ResourceSet的基本存储、get和resource_ids不要求ResourceInner，保持既有镜像集合兼容
+    ResourceInner约束只用于新增条目查询契约的方法，不扩散到集合的Component实现、注册及基础查询
 ```
 
 # error
@@ -466,6 +498,6 @@ ResourceError：资源管理错误，公开枚举
     原有ToolResource、SkillResource、PromptResource、SandboxResource、HookResource不再作为独立图书馆组件挂载
     AgentImage同样迁为ResourceSet<AgentImage>中的资源条目，删除其LibraryComponent身份
     移除依赖计数和资源GC计划，依靠实体拥有组件的生命周期释放资源条目
-    Workspace文档中此前的ResourceRef、独立镜像Entity及GC约定需要后续单独同步，本次不修改该文件
+    Workspace等领域文档与本契约同步；基础设施不保留ResourceRef、独立镜像Entity或GC作为兼容目标
     本文不落实其他插件的字段迁移、事件改造、磁盘加载接口或执行快照实现
 ```

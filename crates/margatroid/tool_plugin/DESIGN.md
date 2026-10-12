@@ -1,436 +1,896 @@
 # 伪代码格式
+
 ```text
 模块：使用一级标题，只写当前设计涉及的部分
-
 类型：使用二级标题，按私有、crate公开和公开分组
 TypeName：中文类型名，可见性类型--类型说明
     field_name: RustType--中文字段名，字段说明
     method_name<Generic>(self, parameter: ParameterType) -> ReturnType
         中文方法名：可见性方法，解释参数和用途
-        约束：使用标准Rust where约束；单个约束写在同一行
+        约束：使用标准Rust where约束
         行为：展开完整逻辑
     impl TraitName for TypeName
         TraitName：可见性trait实现
         trait_method_name(&self, parameter: ParameterType) -> ReturnType
             中文方法名：解释参数和用途
             行为：标准库trait的简单行为用一句话说明
-
 函数：使用二级标题，按私有和公开分组，只放置不属于某个类型的操作
 function_name<Generic>(parameter: ParameterType) -> ReturnType
     中文函数名：可见性函数，解释参数和用途
-    约束：使用标准Rust where约束；单个约束写在同一行
-    行为：展开完整逻辑
-
+    约束：使用标准Rust where约束
+    行为：多步逻辑只使用一个行为块，在其下缩进展开
 逻辑：使用二级标题，按执行顺序描述对象之间的调用关系
-注释：字段注释使用--，类型、方法和函数的说明直接写在标题中
+字段说明使用--，类型、方法和函数的说明直接写在标题中
 属性：不写Rust Attribute，实现时自行判断
 边界：对外使用泛型和具体类型，内部使用类型擦除
 ```
 
 # 板块格式
 
-每个 crate 的 DESIGN.md 在伪代码格式之后使用六个一级标题，按 `lib`、`system`、`handler`、`events`、`types`、`error` 顺序组织。每个标题对应 `src/` 下的同名 Rust 文件：
+本文描述当前Rust代码，不描述尚未实现的ResourceID、ResourceSet、共享组件文件或独立资源插件目标设计。
+当前使用ResourceRef值、独立ResourceId组件、Agent.resources及resource_library_plugin访问接口。
+
+迁移约定（尚未实现）：所有公开和内部事件将定义在共享types的tool_events.rs，插件不再保留events.rs。自动Result事件所需的具名载荷契约也归共享层。下文仍准确记录当前源码位置，不将未来迁移写成已经完成。
 
 ```text
-# lib        src/lib.rs        Plugin 与 crate 公开函数
-# system     src/system.rs     System 函数
-# handler    src/handler/      内置工具 handler 目录
-# events     src/events.rs     事件类型
-# types      src/types.rs      其余类型
-# error      src/error.rs      Error 类型
+lib        src/lib.rs                    Plugin、安装Resource、公开导出与函数
+system     src/system.rs及handler内System  当前实际调度入口
+handler    src/handler/*.rs               业务函数、读取、执行、进程处理
+events     src/events.rs及异步通道         当前请求、结果和公开事件引用
+types      src/types.rs、handler、bin      辅助数据结构与内部载荷
+error      src/error.rs及handler/lua.rs    错误分类和真实映射
 ```
 
-tool_plugin 的 handler 是目录，包含基础回执处理和四类内置工具实现：
-
-```text
-src/handler/
-├── mod.rs           finish_tool_call 与模块声明
-├── skill.rs         skill 资源注册与执行
-├── hook.rs          hook 资源注册与 no-op 执行
-├── lua.rs           lua 工具注册、准备与异步执行
-├── pty.rs           命令的终端执行：分配 PTY、回收进程组、超时与输出限额
-├── sandbox.rs       沙箱策略解析、受限 spawn 与进程组
-```
+handler是目录：mod、skill、hook、lua、prompt、pty、sandbox七个文件。bin/tool_runner.rs是独立可执行目标，
+在相应板块下单列。Component/Resource定义放lib说明；其余辅助类型在types说明。
+声明为pub(crate)的函数仅本crate可用，pub(super)的包定位函数只对handler父模块可用。
+handler模块本身私有；lua.rs中的pub类型不意味着从crate根可访问，只有显式重导出的项是公开入口。
 
 # lib
 
 ## 类型
 
-公开：
+公开，src/lib.rs：
 ```text
-ToolPlugin：工具插件，公开结构体--统一安装内置工具根、注册路由和调用路由
-    schedule: String--System 所属 Schedule，私有
-    skill_root: Arc<PathBuf>--skill 根目录，私有
-    hook_root: Arc<PathBuf>--hook 根目录，私有
-    lua_root: Arc<PathBuf>--lua 工具根目录，私有
-    lua_limits: LuaExecutionLimits--Lua 执行限制，公开（runner bin 目标要按同一份限额构造请求）
+ToolPlugin：工具插件，公开结构体--同时承担注册路由、资源包读取与调用分派
+    root: Option<PathBuf>--请求的全局库根，私有
+    schedule: String--运行计划，私有
+    lua_limits: handler::lua::LuaExecutionLimits--执行限额，私有；没有公开setter
     open(root: impl Into<PathBuf>) -> Result<Self, ToolError>
-        打开插件：公开关联函数，要求 root 绝对且无父级跳转
+        构造插件：公开关联函数
+        行为：要求root绝对且不含ParentDir，失败返回InvalidRequest；保存Some(root)、UPDATE计划和默认限额，不创建目录
     with_schedule(mut self, schedule: impl Into<String>) -> Self
-        设置 Schedule：公开构建方法
+        设置计划：公开方法，保存计划名并返回自身
     impl Default for ToolPlugin
+        default() -> Self
+            默认构造：root=None，计划为RuntimePlugin::UPDATE，限额为默认值
     impl Plugin for ToolPlugin
         build(self, app: &mut App)
-            安装插件：要求 RuntimePlugin 和 AsyncRuntimePlugin 已安装
-            插入 ToolPluginInstalled、三类 roots 与 lua 限额
-            依次挂载注册、调用路由、异步执行、任务结果、取消和清理 System
+            安装插件：公开trait方法
+            行为：
+                检查RuntimeHandle存在、ToolPluginInstalled不存在、指定计划存在；否则以对应ToolError panic
+                读取已存在的ResourceLibraryRoot；显式root与已有root不同则assert失败
+                按显式root、已有root、HOME/.margatroid的优先顺序选择根
+                没有可用root且HOME缺失时panic；根不是绝对路径或含ParentDir也panic
+                ResourceLibraryRoot缺失时插入；已存在时保留原Resource
+                插入ToolPluginInstalled与LuaExecutionLimits
+                依次安装tool_register_system、skill_register_system、hook_register_system、sandbox_register_system、prompt_register_system、lua_tool_register_system
+                再安装tool_call_route_system、异步execute_prepared_lua_tool、lua_task_result_system、cancel_tool_turn_system
+                build没有独立的AsyncRuntime安装检查，但add_async_system需要AsyncRegistry，缺失时由异步设施panic
+                不安装额外消息清理System，不插入SkillRoots、HookRoots、LuaRoots或ShellRoots
 
-ToolPluginInstalled：工具插件安装标记，公开单元 Resource
+ToolPluginInstalled：插件安装标记，公开Resource
     impl Resource for ToolPluginInstalled
+```
+
+公开，定义于src/handler/lua.rs并由lib重导出：
+```text
+LuaExecutionLimits：Lua限额，公开Resource--全部字段公开，可直接构造，因此不保证调用过new校验
+    max_definition_bytes: usize--注册时单个metadata/schema文件上限
+    max_script_bytes: usize--准备调用时脚本长度上限
+    max_argument_bytes: usize--准备调用时参数文本上限
+    max_output_bytes: usize--Lua字符串结果和进程输出保留上限
+    max_memory_bytes: usize--mlua内存上限
+    max_instructions: u64--指令预算
+    max_execution_time: Duration--总执行及默认shell时间预算
+    max_host_call_time: Duration--构造校验和载荷中保留的宿主时间配置，目前无执行消费者
+    new(max_definition_bytes: usize, max_script_bytes: usize, max_argument_bytes: usize, max_output_bytes: usize, max_memory_bytes: usize, max_instructions: u64, max_execution_time: Duration, max_host_call_time: Duration) -> Result<Self, LuaError>
+        构造限额：公开关联函数
+        行为：任一字节数为0、指令数为0、任一时长为0或宿主时长大于执行时长时返回InvalidLimits，否则保存字段
+    impl Default for LuaExecutionLimits
+        default() -> Self
+            默认限额：依次为64KiB、4MiB、1MiB、16MiB、256MiB、100000000指令、15分钟、5分钟，通过new构造
+    impl Resource for LuaExecutionLimits
+    impl Clone + Debug + PartialEq + Eq for LuaExecutionLimits
+```
+
+src/handler/sandbox.rs中的ConfinedSpawn、CallTempDir和ProcessGroup是crate公开辅助结构体，不实现Resource或Component，见types板块。
+本crate不定义Agent或五类资源图书馆组件；它读取外部Agent、ResourceId、ResourceLibraryRoot与资源组件。
+资源内容安装由其他消费注册结果的领域完成，注册handler本身只产出候选条目。
+
+## 公开导出
+
+```text
+src/error.rs：ToolError、ToolErrorKind
+src/events.rs：CancelToolTurn、ToolCallEvent、ToolRegisterRequest、ToolRegisterResponse
+src/types.rs：ResourceContent、ResourceMapEntry、ToolCallRequest、ToolTemplate
+src/handler/lua.rs：run_lua_tool、LuaExecutionLimits、LuaToolRunRequest
+ToolExecutor使用agent_plugin的公开类型，本crate不定义或重导出它
+LuaError与LuaErrorKind虽在lua.rs声明pub，但未重导出，不能通过tool_plugin::LuaError命名
 ```
 
 ## 函数
 
-公开：
+公开，src/lib.rs：
 ```text
 register_agent_resource(world: &mut World, agent: Entity, entry: ResourceMapEntry) -> Result<ResourceMapEntry, ToolError>
-    注册 Agent 资源：公开函数，把可执行条目写入 Agent.resources
+    登记Agent工具引用：公开函数
+    行为：
+        executor为空返回InvalidDefinition，Agent组件缺失返回AgentNotAlive
+        构造AgentResourceEntry，只复制resource_id、resource_name和executor
+        调用Agent.resources.register_tool，错误映射DuplicateResource，成功原样返回entry
+        不复制description或schema，不校验template存在，不在此安装资源组件
 
-candidate_resource_entry(resource_id: ResourceId, alias: Option<String>, tool_id: ResourceId, template: ToolTemplate) -> Result<ResourceMapEntry, ToolError>
-    构造候选资源条目：公开函数
+candidate_resource_entry(resource_id: ResourceRef, alias: Option<String>, executor: ToolExecutor, template: ToolTemplate) -> Result<ResourceMapEntry, ToolError>
+    构造候选：公开函数，调用带内容版本，content=None
 
-resolve_agent_tool_definitions(world: &World, agent: Entity, resources: &[ResourceId]) -> Result<Vec<ToolDefinition>, ToolError>
-    解析 Agent 工具定义：公开函数，要求每个可见资源恰好注册一次
+candidate_resource_entry_with_content(resource_id: ResourceRef, alias: Option<String>, executor: ToolExecutor, template: ToolTemplate, content: Option<ResourceContent>) -> Result<ResourceMapEntry, ToolError>
+    构造带载荷候选：公开函数
+    行为：
+        resource_name取alias，否则取完整地址字符串；去空白后为空则InvalidDefinition
+        覆盖template.name为resource_name并调用validate_template
+        返回executor和template均为Some的ResourceMapEntry，不验证content与ID类型一致
+
+resolve_agent_tool_definitions(world: &World, agent: Entity, resources: &[ResourceRef]) -> Result<Vec<ToolDefinition>, ToolError>
+    解析模型工具清单：公开函数
+    行为：
+        resources为空直接返回空Vec，不先检查Agent
+        非空时要求Agent存在；对每个地址要求Agent.resources.tools_by_resource恰好返回一条，否则ResourceResolutionFailed
+        经resource_library_plugin::tool_definition取得描述和schema，访问错误映射ResourceResolutionFailed
+        name取Agent条目的resource_name，description与input_schema取资源库，不读取Agent副本
+        按输入地址顺序返回ToolDefinition列表
 
 validate_agent_tool_calls(world: &World, agent: Entity, calls: &[ToolCall]) -> Result<(), ToolError>
-    校验 Agent 工具调用：公开函数，校验 tool_name 已注册
+    检查调用名称：公开函数
+    行为：要求Agent存在，逐条检查tool_by_name命中；未命中返回ResourceResolutionFailed，不校验参数schema或资源实体
 ```
 
 # system
 
 ## 函数
 
-crate公开：
+crate公开，src/system.rs：
 ```text
 tool_register_system(world: &mut World)
-    注册路由 System
+    注册总路由System：crate公开System
     处理事件：ToolRegisterRequest
-    行为：id 为空 -> InvalidRequest；skill/hook/sandbox/tool/prompt 类型交给对应 handler；未知类型 -> ProviderMissing
+    产出事件：ToolRegisterResponse
+    行为：
+        克隆本帧全部请求
+        id为空立即发InvalidRequest；已知skill、hook、sandbox、tool、prompt类型跳过，由各handler独立读取
+        未知类型发ProviderMissing
 
 tool_call_route_system(world: &mut World)
-    调用路由 System
+    调用路由System：crate公开System
     处理事件：ToolCallEvent
-    行为：校验事件和参数，解析 ToolCallRequest，写入 Agent.tools.pending，按 executor 分派 skill/hook/lua handler
-    说明：命令统一经 Lua 工具的 margatroid().shell 执行，shell 不是资源也不是工具
+    产出事件：MclEffectReply、AgentFailure、AsyncEventRequest<PreparedLuaToolCall>
+    行为：
+        克隆本帧全部ToolCallEvent
+        检查turn_id和call.id非空、Agent Entity存活、arguments能解析为JSON对象
+        从Agent.resources按tool_name查唯一实际使用条目，构造ToolCallRequest
+        要求Agent组件存在，拒绝重复(agent, turn_id, tool_call_id) pending键，再插入AgentToolPending
+        SkillLoader同步调用execute_skill_call并finish_tool_call
+        Hook同步调用execute_hook_call并finish_tool_call
+        LuaRuntime调用prepare_lua_call，准备失败交finish_tool_call
+        路由校验或重复pending失败时直接发MclEffectReply的Err和AgentFailure，kind=Agent
+        此错误分支的效果回复id实际取event.turn_id，而非event.effect_id；这是当前实现差异，不在文档中修正代码
 
 cancel_tool_turn_system(world: &mut World)
-    取消工具轮次 System
+    取消记账System：crate公开System
     处理事件：CancelToolTurn
-    行为：保留不属于该轮次的 pending 条目
+    产出事件：无
+    行为：存在Agent时移除属于目标Agent和turn_id的tools.pending条目；不取消异步任务或子进程，不通知Lua guard
+```
+
+crate公开，定义在handler各文件，实际仍是安装的System：
+```text
+skill_register_system(world: &mut World)
+    技能注册System：crate公开System，src/handler/skill.rs
+    处理事件：ToolRegisterRequest--只处理skill类型
+    产出事件：ToolRegisterResponse
+    行为：读取请求并执行skill注册读取流程，逐条发送保留id、agent、resource_id、alias的候选或错误
+
+hook_register_system(world: &mut World)
+    钩子注册System：crate公开System，src/handler/hook.rs
+    处理事件：ToolRegisterRequest--只处理hook类型
+    产出事件：ToolRegisterResponse
+    行为：读取请求并执行hook注册读取流程，逐条发送候选或错误
+
+sandbox_register_system(world: &mut World)
+    沙箱注册System：crate公开System，src/handler/sandbox.rs
+    处理事件：ToolRegisterRequest--只处理sandbox类型
+    产出事件：ToolRegisterResponse
+    行为：逐条调用register_sandbox_resource，失败记录error日志，然后发送候选或错误
+
+prompt_register_system(world: &mut World)
+    提示注册System：crate公开System，src/handler/prompt.rs
+    处理事件：ToolRegisterRequest--只处理prompt类型
+    产出事件：ToolRegisterResponse
+    行为：逐条调用register_prompt_resource并发送候选或错误
+
+lua_tool_register_system(world: &mut World)
+    Lua工具注册System：crate公开System，src/handler/lua.rs
+    处理事件：ToolRegisterRequest--只处理tool类型
+    产出事件：ToolRegisterResponse
+    行为：逐条调用register_lua_tool并发送候选或错误
+
+execute_prepared_lua_tool(prepared: PreparedLuaToolCall) -> Result<(), LuaTaskError>
+    Lua执行异步Handler：crate公开异步函数，src/handler/lua.rs，通过add_async_system安装
+    处理事件：AsyncEventRequest<PreparedLuaToolCall>--由通用异步System读取包装后传入拥有所有权的prepared
+    产出事件：Result<(), LuaTaskError>--自动Pending响应升变；MclEffectReply及可能的AgentFailure由回执guard发送
+    行为：以max_execution_time包装execute_lua_tool，超时得到ExecutionFailed，再调用guard.respond，正常结束返回Ok(())
+
+lua_task_result_system(world: &mut World)
+    异步监督结果System：crate公开System，src/handler/lua.rs
+    处理事件：Result<(), LuaTaskError>
+    产出事件：无
+    行为：只对Err记录warn，不清pending、不生成业务回复；未完成任务的业务兜底由guard Drop负责
+```
+
+## 逻辑
+
+```text
+多个注册System读取的是同一事件流，读取不独占消费
+空id请求可被总路由与具体注册System各回复一次，不能宣称每条注册请求恰好一个响应
+skill和hook具体注册流程不检查id是否为空；lua、sandbox和prompt自身也检查空id
+各注册流程同步读磁盘，不是新资源设计中的异步加载闭包
+异步执行请求、自动Result<(), LuaTaskError>和公开MclEffectReply是不同事件通道
+取消System只删除记账：同步finish发现pending不存在就不回复，Lua guard不检查pending仍可能回复
+Lua回执的pending清理由外部MCL接受Tool回复后处理；mcl_plugin/src/system.rs的mcl_effect_response_system按Agent和tool_call_id移除记录
 ```
 
 # handler
 
+## src/handler/mod.rs：公共根与同步回执
+
+crate公开：
 ```text
-mod.rs   finish_tool_call(world, request, result)
-            从 Agent.tools.pending 移除请求并发送 AgentMessage::Tool
+library_root(world: &World) -> Result<&Path, ToolError>
+    读取全局根：crate公开函数，缺ResourceLibraryRoot返回ToolEnvironmentMissing
 
-skill.rs skill_register_system / execute_skill_call / parse_skill_document
-hook.rs  hook_register_system / execute_hook_call
-lua.rs   lua_tool_register_system / prepare_lua_call / execute_prepared_lua_tool / lua_task_result_system
-         / run_lua_tool / spawn_tool_runner / runner_failure / tool_runner_path
-prompt.rs
-         prompt_register_system / register_prompt_resource / read_prompt_metadata
-         / read_prompt_content / find_prompt_package
-sandbox.rs
-         sandbox_register_system / register_sandbox_resource / find_sandbox_package
-         / active_sandbox_policies / sandbox_backend / ConfinedSpawn / CallTempDir / ProcessGroup
+finish_tool_call(world: &mut World, request: ToolCallRequest, result: Result<String, ToolError>)
+    完成同步调用：crate公开函数
+    行为：
+        移除Agent.tools.pending中的(agent, turn_id, tool_call_id)，没有记录则返回不发送结果
+        result为Err时把错误文本作为content并failed=true，为Ok时failed=false
+        发送MclEffectReply，id=request.effect_id，result=Ok(Message::Tool)，usage=None
+        不解析JSON结果信封，不根据错误kind发送AgentFailure
+```
 
-prompt_register_system(world)
-    注册提示资源：处理 resource_id 类型为 prompt 的 ToolRegisterRequest
-    行为：定位提示包 → 读取 prompt.toml 取 role → 读取 content.md 取正文
-          → 校验 role 为 system、user 或 assistant，正文非空
-          → 返回 ResourceMapEntry，content 为 ResourceContent::Prompt 且 executor 与 template 为空
+## src/handler/skill.rs：技能
 
-find_prompt_package(library_root, resource_id)
-    定位提示包：私有函数，按 <library_root>/prompts/<scope>/<name>/<tag> 定位
-    行为：要求类型为 prompt 且 tag 为 latest；目录不存在则报资源未找到
-    说明：作用域是普通作用域，与其它资源一致，不再是 system 或 user 这类角色名
-        角色由 prompt.toml 的 role 字段描述，不编码进资源 ID
+crate公开：
+```text
+execute_skill_call(world: &World, request: &ToolCallRequest) -> Result<String, ToolError>
+    执行技能读取：crate公开函数
+    行为：
+        要求Agent存在、地址类型skill且tag=latest
+        经资源库read_skill_content取得文本，错误映射ResourceResolutionFailed
+        验证arguments为JSON对象，重新解析SKILL.md的TOML前置信息并返回trim后的正文
+```
 
-资源库根：
-    handler::library_root(world) 从 ResourceLibraryRoot 取全局根目录并返回
-    所有 find_* 都只在该根目录下的对应集合中查找
-    不存在项目内 .margatroid 或镜像目录的回退路径，因此同名资源在全进程只有一份
+父模块可见：
+```text
+find_skill_file(library_root: &Path, resource: &ResourceRef) -> Result<PathBuf, ToolError>
+    定位技能文件：pub(super)函数，检查全局skills/scope/name/tag目录存在且为目录、SKILL.md为文件，返回文件路径
+```
 
-执行时经图书馆读取，不自行拼接路径：
-    描述与输入 schema 取自资源实体上的组件，导入时已校验
-    脚本正文经 resource_library_plugin::read_tool_script 读取
-    技能正文经 resource_library_plugin::read_skill_content 读取
-    调用方不拼 library_root，读盘职责收在图书馆的 access 板块
-    一次已经开始的调用持有自己的快照，重新导入不会改变它的内容
+私有：
+```text
+parse_skill_document(source: &str) -> Result<SkillDocument, ToolError>
+    解析技能：私有函数，要求+++换行起始和换行+++换行终止，TOML name/description非空、正文非空；不比较name与ID
+validate_skill_resource(resource: &ResourceRef) -> Result<(), ToolError>
+    校验技能地址：私有函数，只允许skill与latest
+```
 
-执行路径不再解析 TOML：
-    tool.toml 只在导入时解析一次，用途是校验 schema_version、name 与描述
-    校验通过后组件里留下的是解析好的描述与 schema，执行时直接使用
-    LuaToolPackage 装的是 description: String 与 input_schema: Value
-        而不再是两个语义不明的 String（其中一个曾被误当作 TOML 文本）
-    这个错误因此在类型上不再可能发生
+技能注册流程先要求Agent存在，再校验地址并直接read_to_string，解析文档后构造schema={"type":"object"}、
+executor=SkillLoader、content=Skill{content_path}的候选。该读取没有文件字节上限；执行阶段也重新解析前置TOML。
 
-sandbox_register_system(world)
-    注册沙箱资源：处理 resource_id 类型为 sandbox 的 ToolRegisterRequest
-    行为：定位策略包 → 读取 policy.json → 校验非空、不超过 MAX_POLICY_BYTES、是合法 JSON
-          → 返回 ResourceMapEntry，content 为 ResourceContent::Sandbox 且 executor 与 template 为空
-    边界：失败只记日志并回错误响应，不影响其他资源
+## src/handler/hook.rs：钩子
 
-find_sandbox_package(library_root, resource_id)
-    定位策略包：私有函数，只在全局资源库的 sandboxes 集合下查找
-    行为：要求类型为 sandbox；命中含 policy.json 的目录即返回，否则报资源未找到
-    说明：不存在项目内或镜像内的回退路径，资源全局唯一
+crate公开：
+```text
+execute_hook_call(_world: &World, _request: &ToolCallRequest) -> Result<String, ToolError>
+    执行钩子：crate公开函数，实际无校验、无后端行为，返回Ok空字符串
+```
 
-active_sandbox_policies(world: &World, resources: &AgentResourceMap) -> Result<Vec<Arc<str>>, ToolError>
-    解析本次调用生效的策略：crate 内公开
-    行为：按 active_sandboxes 的集合序遍历，逐个经图书馆读取策略文本
-    行为：按声明顺序返回，交由 landstrip 合并
-    边界：资源不可读、或策略为空，一律报错而不是静默降级
-    说明：策略只存在于沙箱资源实体上；Agent 只记录哪些沙箱被激活，不再另存一份策略文本
-        快照粒度是一次调用：本次调用开始时取到的策略在这一轮内不变
+父模块可见：
+```text
+find_hook_package(library_root: &Path, resource: &ResourceRef) -> Result<PathBuf, ToolError>
+    定位钩子包：pub(super)函数，检查全局hooks/scope/name/tag目录、hook.toml和input.schema.json
+```
 
-sandbox_backend() -> Option<PathBuf>
-    定位后端：环境变量 MARGATROID_SANDBOX_BACKEND → PATH 里的 landstrip → 当前可执行文件同目录
+私有：
+```text
+read_hook_metadata(package_root: &Path) -> Result<HookMetadata, ToolError>
+    读取元数据：私有函数，同步读TOML，未知字段拒绝，name和description非空；不比较name与资源ID
+read_hook_schema(package_root: &Path) -> Result<Value, ToolError>
+    读取schema：私有函数，同步读并解析JSON；本函数不构建JSON Schema验证器
+validate_hook_resource(resource: &ResourceRef) -> Result<(), ToolError>
+    校验钩子地址：私有函数，只允许hook与latest
+```
 
-ConfinedSpawn：一次受限调用的全部约定，crate 内公开结构体
-    policies: Vec<PathBuf>--本次调用暂存的策略文件，私有
-    new(policies: &[Arc<str>]) -> Result<Self, ToolError>
-        暂存策略：crate 内公开关联函数，逐份写进独立临时文件，任一份失败时清掉已写的
-    is_confined(&self) -> bool
-        是否受限：crate 内公开方法，策略集合非空即为真；同时决定是否整树回收
-    command(&self, program: &Path, project_root: &Path) -> Result<tokio::process::Command, ToolError>
-        构造命令：crate 内公开方法
-        行为：受限时包成 landstrip run -p <策略>... -- <program>，未受限时直接执行 program；
-              两种情况统一设置工作目录为项目根、继承环境但剔除凭据形变量、kill_on_drop
-        边界：有策略而后端不可用则 fail-closed，拒绝执行而不是绕过策略
-    impl Drop for ConfinedSpawn
-        删除本次调用暂存的所有策略文件
+钩子注册先要求Agent组件存在，读取元数据/schema，ToolTemplate只进一步要求schema是对象；候选executor=Hook、
+content=Hook。加载文件无字节上限。Hook本质是driver解释的触发器，本crate执行函数不产生触发行为。
 
-    说明：工具进程共用本类型，工作目录、环境、策略暂存与回收模式只有这一处定义；
-          工作目录必须是项目根，因为可移植策略写的是 "."，否则会解析到 daemon 自己的目录；
-          环境是继承而非清空：把 HOME、locale、代理都留给工具，只拦下 KEY/PASSWORD/SECRET/TOKEN
-          这类凭据形名字，否则普通 CLI 无法正常工作
-          曾出现过的整表清空只保留 PATH，结果是 $HOME 展开为空，普通 CLI 因此失常
-          凭据形名字按子串、忽略大小写匹配，与参照实现的判定方式一致
-          管道模式下另外固定 NO_COLOR=1、TERM=dumb、PAGER=cat、GIT_PAGER=cat：
-              工具这里读到的是管道而不是终端，分页与颜色不应进入被捕获的输出
-              pty 路径由自己设置终端类型，不走这一组
+## src/handler/prompt.rs：提示
 
-CallTempDir：一次调用的临时目录，crate 内公开结构体
-    path: PathBuf--<项目根>/.margatroid/tmp/<序号>，私有
-    create(project_root: &Path) -> Result<Self, ToolError>
-        创建临时目录：crate 内公开关联函数，供工具存放 stderr 等中间产物
-    path(&self) -> &Path
-        读取路径：crate 内公开方法，注入到工具上下文的 temp_dir
-    impl Drop for CallTempDir
-        递归删除该目录
+私有：
+```text
+register_prompt_resource(world: &World, request: &ToolRegisterRequest) -> Result<ResourceMapEntry, ToolError>
+    注册提示：私有函数
+    行为：
+        空id或Entity不存活返回InvalidRequest，不另检查Agent组件
+        定位包、读取role与正文，resource_name取alias或完整ID
+        返回executor=None、template=None、content=Prompt{role, content: Arc<str>}的条目
+read_prompt_metadata(package: &Path) -> Result<PromptMetadata, ToolError>
+    读取提示元数据：私有函数，同步读取prompt.toml，拒绝未知字段，role只允许system/user/assistant
+read_prompt_content(package: &Path) -> Result<String, ToolError>
+    读取提示正文：私有函数，同步读取content.md，trim为空则InvalidDefinition；返回原文本，不限大小
+```
 
-    说明：受限调用除工作区外只允许写这里，所以策略里的项目根就已覆盖，不需要放开共享的 /tmp
+父模块可见：
+```text
+find_prompt_package(library_root: &Path, resource_id: &ResourceRef) -> Result<PathBuf, ToolError>
+    定位提示目录：pub(super)函数，要求prompt与latest，检查全局prompts/scope/name/tag为目录；文件存在性由读取验证
+```
 
-ProcessGroup：受限调用的进程树回收，crate 内公开结构体
-    leader: Option<u32>--进程组首进程；未受限时为 None，私有
-    confined(confined: bool, leader: u32) -> Self
-        构造：crate 内公开关联函数，仅当本次受限时才记录首进程
-    reclaim(&mut self)
-        回收进程树：crate 内公开方法，对首进程所在进程组发送 SIGKILL；幂等，首次调用后失效
-    impl Drop for ProcessGroup
-        兜底回收
+## src/handler/lua.rs：注册、执行和runner
 
-    说明：kill_on_drop 只覆盖直接子进程；工具自行派生的后台进程会带着本次策略活过调用边界
+crate公开入口prepare_lua_call及私有准备：
+```text
+prepare_lua_call(world: &mut World, request: ToolCallRequest) -> Result<(), ToolError>
+    准备异步调用：crate公开函数
+    行为：调用prepare_lua_tool_call取得执行快照和临时目录，创建LuaToolResponseGuard，send_async_event(PreparedLuaToolCall)，不直接返回工具结果
 
-spawn_tool_runner 的沙箱分支：
-    受限时命令为 landstrip run -p <策略>... -- <tool_runner>，未受限时直接执行 runner
-    两条分支都由 ConfinedSpawn 统一做环境最小化与工作目录设置
+register_lua_tool(world: &mut World, request: &ToolRegisterRequest) -> Result<ResourceMapEntry, ToolError>
+    注册Lua候选：私有函数
+    行为：
+        空id或Agent Entity不存活返回InvalidRequest，要求Agent组件和已安装限额
+        在全局tools/scope/name/tag查找三文件齐备的目录
+        有界读取tool.toml和input.schema.json，调用parse_lua_tool_definition
+        构造executor=LuaRuntime、ToolTemplate和content=Tool{script_path}候选；注册时不读脚本文本
 
-runner_failure 补充：stderr 里可能混入 landstrip 的拒绝事件，所以按"最后一条 kind 属于
-    ToolErrorKind 的 JSON 行"取值，trap 事件不会把错误种类带偏
+prepare_lua_tool_call(world: &World, request: &ToolCallRequest) -> Result<(LuaExecutionHandle, CallTempDir), ToolError>
+    准备执行材料：私有函数
+    行为：
+        要求非空turn_id/tool_call_id、资源类型tool、参数长度未超上限、Agent存活
+        读取Agent及其ResourceId组件，缺失返回InvalidRequest
+        读取资源库已解析描述/schema和脚本，取得激活沙箱策略的本次快照
+        在Agent项目根创建CallTempDir，组装上下文和执行handle
 
-ToolExecutor（枚举）：工具执行器，由 agent_plugin 定义
-    变体：LuaRuntime、SkillLoader、Hook
-    说明：执行器是进程内的分派标签，不是资源，也没有资源 ID
-        早期实现用 tool:builtin/* 这类伪造资源 ID 区分执行器，现已删除：
-        伪 ID 会让人误以为它们是可导入的资源，而它们既无实体也无可解析内容
-    分派：tool_call_route_system 按 executor 直接分派，不再做字符串比较
+read_lua_tool_package(world: &World, resource_id: &ResourceRef, limits: &LuaExecutionLimits) -> Result<LuaToolPackage, ToolError>
+    读取执行包：私有函数
+    行为：经tool_resource和read_tool_script读取组件定义与脚本，库错误映射ResourceResolutionFailed；脚本读完后检查长度及非空，不解析TOML
 
-LuaError：Lua 执行限额错误，公开结构体--只用于构造期的参数校验
-    kind: LuaErrorKind--稳定有限分类
-    message: String--稳定有界描述
-    impl Clone + PartialEq + Eq + fmt::Display + std::error::Error
+parse_lua_tool_definition(metadata_source: &str, schema_source: &str, resource_id: &ResourceRef) -> Result<LuaToolDefinition, ToolError>
+    解析注册文件：私有函数
+    行为：
+        TOML反序列化LuaToolManifest，拒绝未知字段
+        schema_version必须为1，name非空且等于resource_id.name，description非空
+        JSON schema必须为对象且可构建验证器，返回已解析描述与parameters
+```
 
-LuaErrorKind：Lua 限额错误分类，公开枚举
-    InvalidLimits--限额为零、互不自洽，或宿主调用时限超过总执行时限
+父模块可见：
+```text
+find_lua_tool_package(library_root: &Path, resource_id: &ResourceRef) -> Result<PathBuf, ToolError>
+    定位Lua包：pub(super)函数，要求类型tool，任意合法tag按路径查找；验证目录与tool.toml/input.schema.json/main.lua三个文件
+```
 
-ShellError：Shell 限额错误，公开结构体--只用于构造期的参数校验
-    kind: ShellErrorKind--稳定有限分类
-    message: String--稳定有界描述
-    impl Clone + PartialEq + Eq + fmt::Display + std::error::Error
-
-ShellErrorKind：Shell 限额错误分类，公开枚举
-    InvalidLimits--限额为零
-
-PreparedLuaToolCall：待执行的 Lua 工具调用，crate 内公开事件--prepare 与 execute 之间的载荷
-    arguments: String--模型给出的原始参数
-    handle: LuaExecutionHandle--执行上下文、限额与已内联的工具包内容
-    response: LuaToolResponseGuard--兜底回执，未显式响应时由 Drop 发出失败结果
-    temp_dir: CallTempDir--本次调用的临时目录守卫，随载荷释放而清理
-
-LuaTaskError：Lua 异步任务错误，crate 内公开结构体--包装 async_runtime_plugin 的任务错误
-    source: AsyncTaskError--底层任务错误
-    impl From<AsyncTaskError>
-
-install_lua_environment(lua, handle) -> Result<Table, ToolError>
-    注入工具环境：私有函数，注入面只有一个入口函数
-    行为：建 entry 表（version / arguments / context / json / shell）放进 Lua 注册表；
-          把全局 margatroid 设为"返回该表"的函数；arguments 由 run_lua_tool 在调用前填入
-    注入面：json 的 encode / decode 用 serde_json 直接实现；
-            shell(command, options?) 走 runner 内的终端执行，返回 { exit_code, stdout, truncated, terminal }；
-            命令为空时该函数报错，而不是返回一个空结果
-    约束：不再有 fs / process / http / json / log 这些表——文件、网络、派生一律走标准库，由沙箱约束；
-          命令执行没有走 io.popen，因为管道没有终端、没有可回收的进程组、也没有执行限额
-    terminal 字段的用途：沙箱可能不授予 pty 设备，此时命令照样执行，只是看不到终端；
-          依赖终端的工具据此自行说明，而不是在无终端时悄悄做错
-
+公开导出：
+```text
 run_lua_tool(request: LuaToolRunRequest) -> Result<String, ToolError>
-    执行 Lua 工具：公开异步函数，插件进程内与 runner 进程共用同一段逻辑
-    行为：读工具包（main.lua 与 input schema）→ 校验 arguments → 建 VM（StdLib::ALL + 内存上限 + 执行钩子 + 注入宿主面）
-          → 把 arguments 填进入口表 → 加载 main.lua → 调用全局 execute → 结果长度不超过 max_output_bytes
-    行为补充：工具包内容由 daemon 读取后随请求下发，沙箱内不再有进程需要读镜像根
-    约束：request 携带 description、input_schema、script、temp_dir、arguments、agent_id、turn_id、
-          resource_id、project_root、limits 与 sandbox_policies；
-          其中 description 与 input_schema 是已解析值，不是待解析的文档；
+    执行内联Lua载荷：公开异步函数
+    行为：
+        使用request中已解析description/input_schema，不读磁盘包、不再解析TOML
+        解析arguments为JSON对象，构建schema验证器并验证参数
+        构造执行handle；创建unsafe StdLib::ALL Lua，设置内存限制，安装指令hook和margatroid环境
+        执行script顶层，按资源ID设置chunk名称；取得全局execute函数，缺失返回InvalidDefinition
+        此后才把arguments填入入口表，因此script顶层尚看不到已填充的入口arguments
+        调用execute(arguments, context)，通过call_async::<String>接收字符串，不接受任意Lua对象作为结果
+        最终字符串超过max_output_bytes返回ExecutionFailed，否则原样返回，不在本函数解包JSON信封
+```
 
-工具结果的取值约定：
-    工具可以返回 {"ok": bool, "content": string} 作为显式结果信封
-        content 是模型读到的内容，模型侧不需要再解析
-        ok 表示这次调用是否失败，这是单纯返回字符串无法表达的
-        ok 与 content 必须同时存在，只含其中一个的 JSON 对象不算信封
-        content 为空字符串仍是有效结果，不是"没有结果"
-    不满足信封形状的返回值保持旧语义：
-        返回值即成功，只有报错才算调用失败
-    由 Lua 的 error 触发的运行时错误是工具在说"停止"，映射为 Aborted
-        运行时限额触发的错误不是工具在要求停止，映射为 ExecutionFailed
-
-失败是否结束当前轮：
-    只有两种失败会结束当前轮并保留信息供人查看，因为重试无法改变它们：
-        工具调用 error 声明自己无法继续
-        执行工具的 runner 本身失败——无法启动、流中断或超时
-    其余失败都交回模型重试：命令非零退出、脚本拒绝参数、工具报告 ok=false
-
-    派生 runner 执行工具：私有异步函数
-    行为：把请求序列化成 JSON 写 runner 的 stdin，读 stdout 作为工具结果，stderr 用于还原错误
-          runner 路径取环境变量 MARGATROID_TOOL_RUNNER，缺省取当前可执行文件同目录下的 tool_runner
-          超时用 limits.max_execution_time，输出上限用 limits.max_output_bytes（截断即 ExecutionFailed）
-    边界：runner 无法启动、流失败或超时统一记为 RunnerFailed，与"工具执行失败"严格区分：前者结束当前轮，后者交回模型重试
-
-runner_failure(stderr: &str) -> ToolError
-    还原 runner 错误：私有函数，解析 stderr 的 JSON 并映射错误种类
-    行为：kind 为 InvalidRequest / InvalidArguments / InvalidDefinition / Aborted 时保留原种类，
-          其余与不可解析一律 ExecutionFailed
+私有执行函数：
+```text
+execute_lua_tool(prepared: &PreparedLuaToolCall) -> Result<String, ToolError>
+    执行准备载荷：私有异步函数，复制上下文、内容、限额和策略到LuaToolRunRequest，调用spawn_tool_runner
 
 tool_runner_path() -> Result<PathBuf, ToolError>
-    定位 runner：私有函数，先看环境变量，再看当前可执行文件同目录
+    定位runner：私有函数，优先MARGATROID_TOOL_RUNNER，否则当前可执行文件同目录的tool_runner或Windows名称tool_runner.exe；不预先检查文件存在
 
-集成测试定位 runner 的相对路径：
-    测试与插件二进制都不带 runner，需要指向工作区构建产物
-    crates/margatroid/tool_plugin 到工作区根是三级，因此 runner 位于 ../../../target/debug/tool_runner
+runner_payload(request: &LuaToolRunRequest) -> Value
+    编码runner请求：私有函数
+    行为：写description、input_schema、script、目录、参数与地址字符串，限额时长转u64毫秒；不包含sandbox_policies
 
-tool_runner（src/bin/tool_runner.rs，bin 目标）：独立进程执行 Lua 工具，与上面的 spawn 路径成对
-    请求：stdin 传 JSON（也接受 argv[1] 指定文件），字段与 LuaToolRunRequest 对齐，
-          limits 里的时间以毫秒表示（max_execution_time_ms / max_host_call_time_ms）
-    输出：工具返回值原样写 stdout
-    退出码：0 成功；2 插件侧问题（InvalidRequest / InvalidArguments / InvalidDefinition）；3 工具执行失败
-    stderr：非零退出时输出 {"kind": "...", "message": "..."}，供 spawn_tool_runner 还原
-pty.rs   run_in_pty（分配 PTY 或退回管道执行命令；回收进程组、施加超时与输出限额）
-        说明：终端不可用时退回管道而不是失败，两路输出都会合并成一路交给调用方
+spawn_tool_runner(request: &LuaToolRunRequest) -> Result<String, ToolError>
+    派生runner：私有异步函数
+    行为：
+        编码JSON，定位runner，用request.sandbox_policies建立ConfinedSpawn并构造命令
+        stdin/stdout/stderr均为管道，pre_exec调用setsid，启动子进程；只有策略非空时启用ProcessGroup守卫
+        写完stdin并shutdown；写入过程本函数没有内部timeout，外层异步执行timeout覆盖它
+        取得输出管道，在内部max_execution_time超时块中先await child.wait，再reclaim进程组，再try_join读取两条输出管道
+        内部等进程、读取失败或超时返回RunnerFailed；超时时reclaim
+        成功退出且stdout截断返回ExecutionFailed；未截断返回UTF-8有损转换的stdout，成功路径不使用stderr内容
+        非零退出经runner_failure解析stderr
 
-终端执行的四处细节：
-    PTY 在最后一个 slave 关闭时以 EIO 表示流结束，这是该循环的正常结束方式，不作为错误
-    终端把 stdout 与 stderr 合成一路，管道分支因此也把两者合并后交给调用方；
-        stderr 先进自己的缓冲区，避免两条管道互相阻塞
-    终端必须有具体的类型名，所以 pty 分支设置真实 TERM，而管道分支保留 TERM=dumb
-    子进程自建会话并把 slave 设为控制终端：
-        否则它会共用 runner 的会话，一个从未真正获得的终端会错误地报告自身状态
+runner_failure(stderr: &str) -> ToolError
+    还原runner错误：私有函数
+    行为：
+        从最后一行向前找可解析JSON且kind属于六种可识别分类的行，忽略其他trap日志
+        只保留InvalidRequest、InvalidArguments、InvalidDefinition、Aborted
+        ExecutionFailed、RunnerFailed及不可解析情况均映射ExecutionFailed，RunnerFailed会在此降级
+        message缺失使用Lua tool execution failed
+
+install_execution_hook(lua: &Lua, limits: &LuaExecutionLimits) -> Result<(), ToolError>
+    安装指令检查：私有函数，每1000条指令累加预算并检查Instant截止时间，超过预算或时间返回mlua运行时错误；不监控等待宿主期间的每个时刻
+
+install_lua_environment<'lua>(lua: &'lua Lua, handle: &LuaExecutionHandle) -> Result<Table, ToolError>
+    安装工具环境：私有函数
+    行为：
+        建立context表，含agent_id、turn_id、resource_id、project_root、temp_dir，并用read_only_proxy包裹
+        建立入口表version=1、context、json.encode/json.decode、shell，保存在注册表margatroid_entry
+        全局margatroid是取回入口表的函数，返回值是context代理供execute第二参数使用
+        此时不填arguments；始终安装shell，与是否导入shell资源无关
+
+install_shell(lua: &Lua, entry: &Table, handle: &LuaExecutionHandle) -> Result<(), ToolError>
+    安装命令入口：私有函数
+    行为：
+        注入异步shell(command: String, options: Option<Table>)，空白命令报mlua运行时错误
+        options.max_output_bytes和timeout_ms可覆盖默认值，不钳制到总限额，也不使用max_host_call_time
+        总是ConfinedSpawn::new(&[])，调用run_in_pty以bash -c执行命令
+        返回exit_code或nil、合并stdout文本、truncated和terminal；非零退出码本身不由此函数变成ToolError
+
+read_only_proxy(lua: &Lua, values: Table) -> Result<Table, ToolError>
+    构造context代理：私有函数，用__index读取底表，__newindex报错且隐藏metatable；不是冻结完整Lua环境，StdLib::ALL仍可提供其他修改能力
+
+ends_the_turn(kind: ToolErrorKind) -> bool
+    判定Lua guard终止分支：私有函数，仅Aborted或RunnerFailed返回true，不能用于概括其他路由和同步回执路径
+
+reported_outcome(output: &str) -> Option<(bool, String)>
+    读取结果信封：私有函数，要求JSON对象有bool型ok和string型content；允许额外字段与空content，其他字符串返回None
+
+read_process_output(reader: impl AsyncRead + Unpin, limit: usize) -> std::io::Result<ProcessOutputBuffer>
+    收集进程流：私有异步函数，每次读8192字节，超限只停止保留但继续排读到EOF，读错误向上返回
+
+read_bounded_sync(path: &Path, limit: usize, label: &str) -> Result<String, ToolError>
+    有界读取定义：私有函数，用take(limit+1)读取，文件和读取失败返回ResourceResolutionFailed，调用decode_bounded
+
+decode_bounded(bytes: Vec<u8>, limit: usize, label: &str) -> Result<String, ToolError>
+    校验定义文本：私有函数，超限或非UTF-8返回InvalidDefinition
+
+lua_tool_error(error: mlua::Error) -> ToolError
+    映射Lua错误：私有函数，直接RuntimeError变为Aborted，其余变ExecutionFailed；不检查错误是否由脚本主动调用error，不保证所有限额错误的外层变体相同
+```
+
+## src/handler/sandbox.rs：策略与进程设施
+
+crate公开：
+```text
+active_sandbox_policies(world: &World, resources: &AgentResourceMap) -> Result<Vec<Arc<str>>, ToolError>
+    获取策略快照：crate公开函数，按active_sandboxes集合序从资源库读取策略，不可用或trim为空返回ExecutionFailed，不读取Agent私有策略副本
+sandbox_backend() -> Option<PathBuf>
+    定位后端：crate公开函数，优先MARGATROID_SANDBOX_BACKEND，再PATH中的landstrip，再当前可执行文件同目录；环境覆盖不预检文件
+```
+
+父模块可见：
+```text
+find_sandbox_package(library_root: &Path, resource_id: &ResourceRef) -> Result<PathBuf, ToolError>
+    定位策略：pub(super)函数，要求sandbox类型，任意tag在全局sandboxes/scope/name/tag中寻找policy.json文件
+```
+
+私有：
+```text
+register_sandbox_resource(world: &World, request: &ToolRegisterRequest) -> Result<ResourceMapEntry, ToolError>
+    注册策略：私有函数
+    行为：
+        空id或Entity失效返回InvalidRequest，要求Agent组件
+        同步read_to_string(policy.json)，读失败返回InvalidDefinition
+        空字符串或超过MAX_POLICY_BYTES=1MiB拒绝，JSON可解析即可，不要求对象或特定后端schema
+        返回executor=None、template=None和Sandbox{policy}，resource_name取alias或完整ID，不经validate_template
+write_policy_file(policy: &str) -> Result<PathBuf, ToolError>
+    暂存策略：私有函数，在系统临时目录写margatroid-sandbox-policy-{pid}-{counter}.json，写失败RunnerFailed
+remove_policy_files(policies: &[PathBuf])
+    删除策略：私有函数，逐个删除，错误忽略
+inherited_environment() -> Vec<(OsString, OsString)>
+    继承环境：私有函数，过滤凭据形名字后的vars_os
+is_withheld_env_name(name: &str) -> bool
+    检查凭据名：私有函数，ASCII大写后包含KEY/PASSWORD/SECRET/TOKEN任一子串则过滤
+inherit_environment(command: &mut tokio::process::Command)
+    设置进程环境：私有函数，清空后写回过滤列表，再固定NO_COLOR=1、TERM=dumb、PAGER=cat、GIT_PAGER=cat
+```
+
+## src/handler/pty.rs：命令进程
+
+crate公开：
+```text
+run_in_pty(request: PtyRequest<'_>, spawn: &ConfinedSpawn) -> Result<PtyOutcome, ToolError>
+    执行命令：crate公开异步函数
+    行为：
+        spawn_command取得child与流，ProcessGroup只有spawn.is_confined时启用
+        构造collect Future但不立刻poll它，select等待child退出或超时
+        超时reclaim并返回ExecutionFailed，正常退出reclaim后才await collect
+        返回exit_code、bytes、truncated和terminal；wait错误也ExecutionFailed
+normalize_pty_text(bytes: &[u8]) -> String
+    规范输出：crate公开函数，UTF-8有损转换并把CRLF替换为LF
+```
+
+私有：
+```text
+collect(streams: Streams, limit: usize) -> (Vec<u8>, bool)
+    收集输出：私有异步函数，Terminal读master，EIO视正常结束；Pipes在本函数被poll后join读取stdout/stderr，先stdout后追加stderr，不保留跨流时序
+drain(reader: impl AsyncRead + Unpin, limit: usize, output: &mut Vec<u8>, truncated: &mut bool)
+    排读管道：私有异步函数，8192字节缓冲，Interrupted重试，其他错误直接结束不返回错误
+spawn_command(request: PtyRequest<'_>, spawn: &ConfinedSpawn) -> Result<(tokio::process::Child, Streams), ToolError>
+    构造命令：私有函数
+    行为：
+        open_terminal成功时用slave作为三个标准流，program -c command，TERM=xterm-256color
+        PTY分支pre_exec执行setsid和TIOCSCTTY，建立新的会话与控制终端
+        open_terminal失败时退回null stdin和两条piped输出，不设置新的session
+        两分支都经过ConfinedSpawn::command和kill_on_drop
+start(process: tokio::process::Command) -> Result<tokio::process::Child, ToolError>
+    启动子进程：私有函数，spawn失败映射ExecutionFailed
+open_terminal() -> Option<(tokio::fs::File, Stdio, Stdio, Stdio, RawFd)>
+    尝试终端：私有函数，openpty或slave克隆失败返回None，否则返回master和slave三标准流
+extend_bounded(output: &mut Vec<u8>, chunk: &[u8], limit: usize, truncated: &mut bool)
+    保留有界字节：私有函数，最多追加剩余容量，有丢弃则标记truncated
+```
+
+## src/bin/tool_runner.rs：独立程序
+
+全部函数bin私有：
+```text
+kind_name(kind: ToolErrorKind) -> &'static str
+    编码分类：私有函数，保留InvalidRequest/InvalidArguments/InvalidDefinition/RunnerFailed/Aborted，其余输出ExecutionFailed
+report(error: &ToolError) -> ExitCode
+    报告错误：私有函数，stderr输出kind与message JSON，三个Invalid分类返回2，其余返回3
+request_payload() -> Result<String, String>
+    读取请求：私有函数，有argv[1]时同步读文件，否则从stdin读到EOF，不自带字节上限
+main() -> ExitCode
+    runner入口：私有异步函数，Tokio current_thread运行
+    行为：
+        请求读取、JSON解码或地址解析失败时直接stderr输出RunnerFailed并返回2，不经report
+        将RunnerLimits毫秒值转Duration，直接构造LuaExecutionLimits，不调用new检查
+        将字符串地址解析成ResourceRef，构造sandbox_policies为空的LuaToolRunRequest并调用run_lua_tool
+        成功原样write_all字符串到stdout，忽略stdout写入错误并返回0；失败调用report
+```
+
+## 当前执行边界与限制
+
+```text
+原始文件与执行快照：
+    注册Lua工具时解析原始tool.toml和JSON文件；执行Lua时description/input_schema已经是解析值
+    run_lua_tool使用内联script，不读metadata或脚本路径；准备阶段从资源库取得脚本快照
+    read_lua_tool_package先读完整脚本再检查长度，不能宣称其读取过程本身有界
+    技能执行仍解析SKILL.md的TOML前置信息，不能概括全部执行路径都不解析TOML
+    包查找使用fs::metadata/is_file，未全面拒绝symlink，不承诺路径链不可替换
+
+沙箱范围：
+    常规异步插件路径在外部spawn_tool_runner时以策略包裹runner，策略不通过JSON传入runner
+    runner内shell用空策略ConfinedSpawn，依靠所在进程已经获得的外层约束，不二次包裹
+    直接公开调用run_lua_tool在当前进程创建StdLib::ALL VM，传入sandbox_policies不会自动隔离该VM或shell
+    shell始终安装，无shell资源导入要求，当前不存在独立ShellError或Shell工具资源
+
+输出与超时：
+    PTY先wait再poll collect，runner也是先wait再排读；大输出可能填满缓冲使子进程无法退出，最终超时
+    collect内部并发读两条管道不等于等待child期间也在读取，不能宣称已完整防阻塞
+    PTY超时仅覆盖wait，不覆盖其后的collect；后代保持流打开时收集阶段可能继续等待
+    runner内部timeout包含wait与后续排读，但不包含此前stdin投递；外层execute_prepared_lua_tool还包住完整执行
+    外层超时映射ExecutionFailed，内部runner超时映射RunnerFailed，两者不能统一描述成终止轮次
+
+进程组：
+    ProcessGroup仅策略非空才记录leader，killpg错误忽略，它不是任意进程树遍历
+    runner总是setsid，但无策略时ProcessGroup不启用
+    注入shell传空策略，因此它在run_in_pty里的ProcessGroup守卫不启用；PTY子进程又创建独立session
+    外层runner进程组回收不保证覆盖另建session的shell或其后代，不能宣称所有命令后台进程必定清理
+    kill_on_drop只处理直接子进程；pipe fallback也没有新的session设置
+    两种spawn都继承NO_COLOR和pager环境；PTY仅覆盖TERM，未清除其他固定值
 ```
 
 # events
 
 ## 类型
 
-公开：
+公开，src/events.rs：
 ```text
-ToolRegisterRequest：工具注册请求，公开事件
-    id: String--请求 ID
-    agent: Entity--目标 Agent
-    resource_id: ResourceId--资源 ID
-    alias: Option<String>--Agent 内别名
+ToolRegisterRequest：注册请求，公开事件
+    id: String--请求ID
+    agent: Entity--目标Agent
+    resource_id: ResourceRef--资源地址
+    alias: Option<String>--本地别名
+    impl Clone + Debug + PartialEq + Eq for ToolRegisterRequest
     impl Event for ToolRegisterRequest
-
-ToolRegisterResponse：工具注册响应，公开事件
-    id: String--原请求 ID
-    agent: Entity--目标 Agent
-    resource_id: ResourceId--资源 ID
-    alias: Option<String>--Agent 内别名
-    result: Result<ResourceMapEntry, ToolError>--注册结果
+ToolRegisterResponse：注册结果，公开事件
+    id: String--原请求ID
+    agent: Entity--原Agent
+    resource_id: ResourceRef--原资源地址
+    alias: Option<String>--原别名
+    result: Result<ResourceMapEntry, ToolError>--候选或错误
+    impl Clone + Debug + PartialEq for ToolRegisterResponse
     impl Event for ToolRegisterResponse
-
-CancelToolTurn：取消工具轮次，公开事件
-    turn_id: String--轮次 ID
-    agent: Entity--目标 Agent
+CancelToolTurn：取消记账请求，公开事件
+    turn_id: String--轮次ID
+    agent: Entity--目标Agent
+    impl Clone + Debug + PartialEq + Eq for CancelToolTurn
     impl Event for CancelToolTurn
+ToolCallEvent：共享margatroid_types事件，公开重导出
+    effect_id: String--效果ID
+    turn_id: String--轮次ID
+    agent: Entity--目标Agent
+    call: ToolCall--调用ID、名称、参数
+```
 
-ToolCallEvent：模型工具调用事件，公开 re-export
-    来自 margatroid_types，由 MclPlugin 发出
+crate公开，src/handler/lua.rs：
+```text
+PreparedLuaToolCall：异步输入，crate公开事件
+    arguments: String--参数，私有
+    handle: LuaExecutionHandle--快照，私有
+    response: LuaToolResponseGuard--业务回执，私有
+    _temp_dir: CallTempDir--临时目录守卫，私有
+    impl Event for PreparedLuaToolCall
+```
+
+## 逻辑
+
+```text
+send_async_event把PreparedLuaToolCall包成AsyncEventRequest<PreparedLuaToolCall>
+AsyncRuntime创建Pending<Result<(), LuaTaskError>>，完成后升变为普通Result事件
+业务回复不在这个自动Result中，由guard发送MclEffectReply
+正常Tool回复含resource_id、tool_call_id、content、failed，usage=None，效果回复关联effect_id
+Lua终止分支另外发AgentFailure，关联turn_id且kind=Agent
+路由校验失败也发上述两种事件，但效果回复目前关联turn_id
+本crate不发送AgentMessage，接收回执和推进Driver由外部MCL领域负责
 ```
 
 # types
 
-## 类型
+## src/types.rs：公开值类型
 
-公开：
 ```text
-ToolTemplate：工具模板，公开结构体
-    name: String--模型可见名称
-    description: String--模型可见描述
-    parameters: serde_json::Value--JSON Schema
-    new(name, description, parameters) -> Result<Self, ToolError>
-
-ResourceContent：资源内容，公开枚举--导入时携带、供后续阶段使用的资源载荷
-    Tool { script_path: PathBuf }--Lua 工具脚本路径
-    Skill { content_path: PathBuf }--技能正文路径
-    Hook--钩子无附加载荷
-    Prompt { role: String, content: Arc<str> }--提示角色与正文
-    Sandbox { policy: Arc<str> }--沙箱策略 JSON 文本
-    说明：路径在导入时确定并写入资源实体，执行时直接读取，
-        因此重新解析资源库不会影响一次已经开始的调用
-
-ResourceMapEntry：资源映射条目，公开结构体
+ToolTemplate：模型工具候选，公开结构体
+    name: String
+    description: String
+    parameters: serde_json::Value
+    new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Result<Self, ToolError>
+        构造模板：公开方法，调用validate_template；不检查name非空、不构建schema验证器
+    impl Clone + Debug + PartialEq for ToolTemplate
+ResourceContent：注册载荷，公开枚举
+    Tool { script_path: PathBuf }
+    Skill { content_path: PathBuf }
+    Hook
+    Prompt { role: String, content: Arc<str> }
+    Sandbox { policy: Arc<str> }
+    impl Clone + Debug + PartialEq for ResourceContent
+ResourceMapEntry：注册中转条目，公开结构体
     resource_id: ResourceRef
     resource_name: String
     alias: Option<String>
-    executor: Option<ToolExecutor>--可执行资源的执行器；prompt 与 sandbox 为空
+    executor: Option<ToolExecutor>
     template: Option<ToolTemplate>
     content: Option<ResourceContent>
-    说明：executor 为空且 template 为空、content 为 Prompt 或 Sandbox 时，
-        该条目是资源而非可调用工具，不写入 Agent 的工具表
-
-ToolCallRequest：工具调用请求，公开内部类型--不再作为 ECS 事件
-    effect_id: String--所属效果的 ID
-    turn_id: String--轮次 ID
-    agent: Entity--目标 Agent
-    executor: ToolExecutor--执行器标签
-    resource_id: ResourceRef--资源 ID
-    tool_call_id: String--工具调用 ID
-    arguments: String--参数 JSON 文本
+    impl Clone + Debug + PartialEq for ResourceMapEntry
+ToolCallRequest：内部已解析调用，公开结构体--不实现Event
+    effect_id: String
+    turn_id: String
+    agent: Entity
+    executor: ToolExecutor
+    resource_id: ResourceRef
+    tool_call_id: String
+    arguments: String
+    impl Clone + Debug + PartialEq + Eq for ToolCallRequest
 ```
 
-crate公开：
+crate公开函数，src/types.rs：
 ```text
 validate_template(template: &ToolTemplate) -> Result<(), ToolError>
-    校验工具模板：crate公开函数，描述非空且参数为对象
+    校验模板：crate公开函数，description.trim为空或parameters不是对象返回InvalidDefinition
 ```
+
+## 常量与静态变量
+
+```text
+src/handler/skill.rs：PROVIDER_ID="skill"、SKILL_FILE="SKILL.md"
+src/handler/hook.rs：PROVIDER_ID="hook"、HOOK_FILE="hook.toml"、HOOK_SCHEMA_FILE="input.schema.json"
+src/handler/prompt.rs：PROMPT_TYPE="prompt"、PROMPT_FILE="content.md"、PROMPT_METADATA_FILE="prompt.toml"
+src/handler/lua.rs：TOOL_METADATA_FILE="tool.toml"、TOOL_SCHEMA_FILE="input.schema.json"、TOOL_SCRIPT_FILE="main.lua"
+src/handler/sandbox.rs：SANDBOX_TYPE="sandbox"、POLICY_FILE="policy.json"、MAX_POLICY_BYTES=1048576
+    POLICY_FILE_COUNTER: AtomicU64--私有静态，初始0，临时策略文件和调用目录共用，Relaxed递增
+    WITHHELD_ENV_PATTERN: [&str; 4]--私有常量，KEY、PASSWORD、SECRET、TOKEN
+```
+
+## src/handler/lua.rs：执行载荷
+
+公开重导出：
+```text
+LuaToolRunRequest：内联执行请求，公开结构体--不实现Event、未派生Serialize或Deserialize
+    description: String
+    input_schema: serde_json::Value
+    script: String
+    temp_dir: PathBuf
+    arguments: String
+    agent_id: ResourceRef
+    turn_id: String
+    resource_id: ResourceRef
+    project_root: PathBuf
+    limits: LuaExecutionLimits
+    sandbox_policies: Vec<Arc<str>>
+```
+
+私有：
+```text
+LuaToolManifest：注册TOML对象，私有结构体--Deserialize拒绝未知字段
+    schema_version: u32
+    name: String
+    description: String
+    impl Clone + Debug + PartialEq + Eq for LuaToolManifest
+LuaToolDefinition：已解析定义，私有结构体
+    description: String
+    parameters: serde_json::Value
+LuaToolPackage：执行包快照，私有结构体
+    description: String
+    input_schema: serde_json::Value
+    script: String
+LuaToolCallLocator：回执关联，私有结构体
+    effect_id: String
+    turn_id: String
+    agent: Entity
+    tool_call_id: String
+    resource_id: ResourceRef
+LuaCallContext：调用上下文，私有结构体
+    agent_id: ResourceRef
+    turn_id: String
+    resource_id: ResourceRef
+    project_root: Arc<PathBuf>
+    temp_dir: Arc<PathBuf>
+    sandbox_policies: Vec<Arc<str>>
+LuaExecutionHandle：执行快照，私有结构体
+    context: LuaCallContext
+    limits: LuaExecutionLimits
+    package: LuaToolPackage
+LuaToolResponseGuard：业务回执守卫，私有结构体
+    locator: Option<LuaToolCallLocator>
+    events: RuntimeEventSender
+    new(request: &ToolCallRequest, events: RuntimeEventSender) -> Self
+        构造守卫：私有关联函数，复制请求关联
+    respond(&mut self, result: Result<String, ToolError>)
+        发送结果：私有方法
+        行为：
+            take locator，已经发送则panic
+            Ok字符串可解包信封时用content和!ok，否则保留原字符串并failed=false
+            Err且ends_the_turn为true时发送MclEffectReply Err与AgentFailure，返回
+            其他Err作为failed=true的Tool消息，正常结果均发送MclEffectReply Ok(Message::Tool)
+            不访问World或删除pending
+    impl Drop for LuaToolResponseGuard
+        drop(&mut self)
+            兜底回执：尚有locator时发送failed=true的Tool效果回复，错误为ExecutionFailed，不发AgentFailure
+ProcessOutputBuffer：有界进程输出，私有结构体
+    bytes: Vec<u8>
+    truncated: bool
+```
+
+## src/handler/skill.rs、hook.rs、prompt.rs：解析类型
+
+私有：
+```text
+SkillMetadata：技能TOML头，私有结构体--Deserialize拒绝未知字段
+    name: String
+    description: String
+SkillDocument：技能解析结果，私有结构体
+    metadata: SkillMetadata
+    body: String
+HookMetadata：钩子TOML头，私有结构体--Deserialize拒绝未知字段
+    name: String
+    description: String
+PromptMetadata：提示TOML头，私有结构体--Deserialize拒绝未知字段
+    role: String
+```
+
+## src/handler/sandbox.rs：进程和文件守卫
+
+crate公开，全部字段私有：
+```text
+ConfinedSpawn：派生命令配置，crate公开结构体
+    policies: Vec<PathBuf>--临时策略文件
+    new(policies: &[Arc<str>]) -> Result<Self, ToolError>
+        暂存策略：crate公开关联函数，逐个写临时文件，失败删除此前已写文件；无策略为非受限模式
+    is_confined(&self) -> bool
+        查询受限标志：crate公开方法，policies非空
+    command(&self, program: &Path, project_root: &Path) -> Result<tokio::process::Command, ToolError>
+        构造命令：crate公开方法
+        行为：策略非空时寻找landstrip后端，缺失返回RunnerFailed；构造landstrip run -p各策略 -- program；否则直接program，统一cwd、kill_on_drop和过滤环境
+    impl Drop for ConfinedSpawn
+        drop(&mut self)
+            删除策略文件：删除失败忽略
+CallTempDir：调用临时目录，crate公开结构体
+    path: PathBuf
+    create(project_root: &Path) -> Result<Self, ToolError>
+        创建目录：crate公开关联函数，以共享原子counter生成project_root/.margatroid/tmp/{counter}，create_dir_all失败ExecutionFailed
+    path(&self) -> &Path
+        读取路径：crate公开方法
+    impl Drop for CallTempDir
+        drop(&mut self)
+            清理目录：remove_dir_all，错误忽略
+ProcessGroup：可选进程组守卫，crate公开结构体
+    leader: Option<u32>
+    confined(confined: bool, leader: u32) -> Self
+        构造守卫：crate公开关联函数，仅confined=true保留leader
+    reclaim(&mut self)
+        请求组终止：crate公开方法，take leader后向非0组ID发送SIGKILL，忽略错误，后续调用无操作
+    impl Drop for ProcessGroup
+        drop(&mut self)
+            回收组：调用reclaim
+```
+
+## src/handler/pty.rs：终端载荷
+
+crate公开，字段均为pub(crate)：
+```text
+PtyRequest<'a>：命令请求，crate公开结构体
+    program: &'a Path
+    command: &'a str
+    project_root: &'a Path
+    max_output_bytes: usize
+    max_execution_time: Duration
+    impl Clone + Copy for PtyRequest<'a>
+PtyOutcome：命令结果，crate公开结构体
+    exit_code: Option<i32>
+    bytes: Vec<u8>
+    truncated: bool
+    terminal: bool
+    impl Debug for PtyOutcome
+```
+
+私有：
+```text
+Streams：子进程输出路径，私有枚举
+    Terminal(tokio::fs::File)
+    Pipes { stdout: tokio::process::ChildStdout, stderr: tokio::process::ChildStderr }
+```
+
+## src/bin/tool_runner.rs：bin私有反序列化类型
+
+```text
+RunnerRequest：JSON请求，bin私有结构体
+    description: String
+    input_schema: serde_json::Value
+    script: String
+    temp_dir: PathBuf
+    arguments: String
+    agent_id: String
+    turn_id: String
+    resource_id: String
+    project_root: PathBuf
+    limits: RunnerLimits
+    impl Deserialize for RunnerRequest
+RunnerLimits：JSON限额，bin私有结构体
+    max_definition_bytes: usize
+    max_script_bytes: usize
+    max_argument_bytes: usize
+    max_output_bytes: usize
+    max_memory_bytes: usize
+    max_instructions: u64
+    max_execution_time_ms: u64
+    max_host_call_time_ms: u64
+    impl Deserialize for RunnerLimits
+```
+
+地址和目录在JSON中序列化为字符串，目录采用to_string_lossy。策略字段故意不在RunnerRequest中，已在外部派生时应用。
+反序列化类型没有deny_unknown_fields；runner直接构造限额而不走new校验。
 
 # error
 
-## 类型
+## src/error.rs：公开错误
 
-公开：
 ```text
 ToolErrorKind：工具错误分类，公开枚举
     AgentMissing
@@ -450,61 +910,75 @@ ToolErrorKind：工具错误分类，公开枚举
     InvalidRequest
     InvalidArguments
     ExecutionFailed
-    RunnerFailed--runner 定位、启动、管道或超时失败：环境问题，重试无益
-    Aborted--工具主动调用 error，表示它无法继续
-
-ToolError：工具错误，公开结构体--稳定分类和有界安全描述
-    kind: ToolErrorKind--错误分类，私有
-    message: String--有界描述，私有
-    new(kind, message) -> Self
+    RunnerFailed
+    Aborted
+    impl Clone + Copy + Debug + PartialEq + Eq for ToolErrorKind
+ToolError：有界工具错误，公开结构体
+    kind: ToolErrorKind--私有字段
+    message: String--私有字段
+    new(kind: ToolErrorKind, message: impl Into<String>) -> Self
+        构造错误：公开关联函数，文本超过512字节时在509以内UTF-8边界截断并加三个点
     kind(&self) -> ToolErrorKind
+        读取分类：公开方法
     message(&self) -> &str
-    panic(self) -> !--crate公开方法，用于 Plugin 依赖缺失时终止
+        读取描述：公开方法
+    panic(self) -> !
+        终止：crate公开方法，以Display文本panic
     impl Clone + Debug + PartialEq + Eq for ToolError
     impl fmt::Display for ToolError
+        fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
+            格式化错误：输出Debug分类、冒号、消息
     impl std::error::Error for ToolError
 ```
 
-## 失败之后：继续还是中止
-
-工具失败有两种去向，区别在于模型再试一次是否可能得到不同结果：
+## src/handler/lua.rs：内部路径错误
 
 ```text
-AgentFailure{kind: Agent}：Aborted、RunnerFailed
-    工具声明自己无法继续，或执行工具的 runner 本身坏了。二者都是环境问题，
-    再调用一次不会改变结果，因此结束当前轮，错误留给人工查看。
-AgentMessage::Tool{failed: true}：其余一切
-    命令以非零码退出、脚本拒绝了参数、工具回了 ok = false。
-    模型可以用又一次调用回应，这正是把消息交回给它的理由。
+LuaErrorKind：限额构造错误，lua模块中pub枚举--不从crate根重导出
+    InvalidLimits
+    impl Clone + Copy + Debug + PartialEq + Eq for LuaErrorKind
+LuaError：限额构造错误，lua模块中pub结构体--未重导出，message不做512字节截断
+    kind: LuaErrorKind--私有
+    message: String--私有
+    new(kind: LuaErrorKind, message: impl Into<String>) -> Self
+        构造错误：私有关联函数，保存字段
+    impl Clone + Debug + PartialEq + Eq for LuaError
+    impl fmt::Display for LuaError
+        fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
+            格式化：Debug分类、冒号、消息
+    impl std::error::Error for LuaError
+LuaTaskError：异步监督错误，crate公开结构体
+    source: AsyncTaskError--私有字段
+    impl From<AsyncTaskError> for LuaTaskError
+        from(source: AsyncTaskError) -> Self
+            转换监督错误：保存source，不带tool请求ID
 ```
 
-Lua 侧由 `ends_the_turn(ToolErrorKind)` 判定，推理侧由 `AgentFailureKind::Inference` 判定。
-
-# 逻辑
+## 逻辑
 
 ```text
-注册：
-Base Lua IMPORT -> MclPlugin -> ToolRegisterRequest
-    -> tool_register_system 或四类 handler 系统
-    -> ToolRegisterResponse -> MclPlugin 完成 IMPORT
-
-调用：
-Base Lua EMIT EFFECT tool_call FROM ? -> MclPlugin -> ToolCallEvent
-    -> tool_call_route_system
-        -> skill/hook: 同步执行 -> finish_tool_call -> AgentMessage::Tool
-        -> lua: prepare -> 异步执行 -> 异步 guard 发送 AgentMessage::Tool
-    说明：shell 不在调用路径上；命令由 Lua 工具的 margatroid().shell 经 runner 执行
-    -> AgentPlugin 投递回 Base Lua
+路由校验失败：
+    直接MclEffectReply Err加AgentFailure，不受ends_the_turn的两个分类限制
+准备或同步执行失败：
+    finish_tool_call把任意错误转为failed=true的Tool消息，缺pending时不回复
+Lua guard收到执行结果：
+    仅Aborted和RunnerFailed走效果错误加AgentFailure分支，其余错误是failed=true的Tool消息
+    成功输出中的JSON信封仅由guard解包，run_lua_tool和bin本身返回原始String
+Lua错误：
+    RuntimeError直接归Aborted不代表一定是工具主动要求停止；其他mlua外层变体归ExecutionFailed
+两层timeout：
+    execute_prepared_lua_tool外层为ExecutionFailed，spawn_tool_runner内部为RunnerFailed
+    不据此保证每次超时都会终止轮次
+runner非零退出：
+    stderr中的RunnerFailed被runner_failure降级为ExecutionFailed，与直接spawn失败不同
+取消：
+    CancelToolTurn只删除pending记账，不取消已经开始的执行，不抑制Lua guard后续回执
 ```
 
-# 持有关系
+## 源码覆盖与测试边界
 
-```text
-App
-└── World
-    ├── ToolPluginInstalled
-    ├── SkillRoots / HookRoots / LuaRoots / ShellRoots
-    ├── LuaExecutionLimits
-    └── Agent
-        ├── resources: AgentResourceMap
-        └── tools.pending: HashMap<(Entity, String, String), AgentToolPending>
+本文核对13个src文件：五个根模块、七个handler文件、一个bin。上述清单涵盖全部非测试生产类型和函数，
+测试函数不作为运行时API逐个重复定义。已读取内嵌library_tests、environment_tests、pty::tests与lua::runner_tests。
+它们包含全局根解析、环境过滤、PTY结果/截断/超时、信封与错误映射、runner字段、shell注入测试。
+这些测试的存在不证明大输出不阻塞、任意后代必被回收、取消会杀任务或直接run_lua_tool自动受沙箱隔离。
+本次是文档核对与重写，没有运行测试，也没有修复上述代码限制。
