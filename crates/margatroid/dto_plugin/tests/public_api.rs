@@ -38,13 +38,8 @@ fn documented_public_api_publishes_state_for_the_configured_frontend_type() {
         .collect::<Vec<_>>();
     assert!(messages.iter().any(|message| {
         message.target == WebSocketMessageTarget::Type("browser".into())
-            && matches!(
-                &message.message,
-                ServerMessage::StateSync { state }
-                    if state.workspaces.is_empty()
-                        && state.agents.is_empty()
-                        && state.histories.is_empty()
-            )
+            && matches!(serde_json::from_value::<ServerMessage>(message.message.clone()).unwrap(),
+                ServerMessage::StateSync { state } if state.workspaces.is_empty() && state.agents.is_empty() && state.histories.is_empty())
     }));
 
     app.tick();
@@ -53,5 +48,5 @@ fn documented_public_api_publishes_state_for_the_configured_frontend_type() {
         .world()
         .event_reader::<WebSocketMessageSend>()
         .into_iter()
-        .all(|message| !matches!(message.message, ServerMessage::StateSync { .. })));
+        .all(|message| message.message["type"] != "state.sync"));
 }

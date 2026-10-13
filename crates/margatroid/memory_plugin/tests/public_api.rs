@@ -1,125 +1,71 @@
-use std::sync::Arc;
-
-use agent_plugin::AgentMemoryStore;
-use app_runtime_plugin::RuntimePlugin;
 use core_plugin::App;
-use margatroid_types::{AgentHistoryMessageWriteRequested, Message};
-use memory_plugin::{AgentMemory, MemoryPlugin};
+use memory_plugin::{
+    AgentHistoryHandle, AgentHistoryStore, HistoryError, HistoryRecord, MemoryPlugin,
+    MemoryPluginInstalled, SqliteHistoryStore,
+};
+use serde_json::json;
 use tempfile::tempdir;
 
-fn attach_agent(app: &mut App, memory: AgentMemory) -> core_plugin::Entity {
-    let world = app.world_mut();
-    let entity = world.spawn();
-    let workspace = world.spawn();
-    let image = world.spawn();
-    let model = agent_plugin::AgentModelInfo {
-        provider: "test".to_owned(),
-        model: "test".to_owned(),
-        context_window_tokens: 1024,
-    };
-    let (sender, _receiver) = tokio::sync::oneshot::channel();
-    world.insert_component(
-        entity,
-        agent_plugin::Agent {
-            info: agent_plugin::AgentInfo {
-                image_entity: image,
-                workspace_id: workspace,
-                model: model.clone(),
-                project_root: Default::default(),
-                image_root: Default::default(),
-                home_root: Default::default(),
-                image_dependencies: Default::default(),
-            },
-            creation: agent_plugin::AgentCreationState {
-                request_id: "test".to_owned(),
-                reply: agent_plugin::AgentCreateReply::new(sender),
-                initialization: Default::default(),
-            },
-            mcl: Default::default(),
-            resources: Default::default(),
-            memory: agent_plugin::AgentMemoryHandle::new(Arc::new(memory)),
-            inference: agent_plugin::AgentInferenceState {
-                model,
-                pending: Default::default(),
-            },
-            tools: Default::default(),
-            lua: Default::default(),
-            lifecycle: agent_plugin::AgentLifecycleState::Running,
-            turn: Default::default(),
-            token_usage: Default::default(),
-            last_error: None,
-        },
-    );
-    entity
+fn record(key: &str) -> HistoryRecord {
+    HistoryRecord {
+        key: key.into(),
+        source: "driver".into(),
+        turn: Some("turn-1".into()),
+        kind: "message.user".into(),
+        content: "hello".into(),
+        payload: json!({"message": {"role": "user", "content": "hello"}}),
+    }
 }
 
 #[test]
-fn state_table_migrates_the_legacy_setting_namespace() {
+fn documented_public_api_composes_without_an_agent_or_runtime() {
     let directory = tempdir().unwrap();
-    let path = directory.path().join("memory.sql");
-    let connection = rusqlite::Connection::open(&path).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE setting (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at_ms INTEGER NOT NULL);\
-             INSERT INTO setting VALUES ('mcl.state/realtime', '{\"inners\":{}}', 1);\
-             INSERT INTO setting VALUES ('setting/tool_dynamic', '[]', 2);",
-        )
-        .unwrap();
-    drop(connection);
+    let path = directory.path().join("history.sqlite");
+    let mut app = App::new();
+    app.add_plugin(MemoryPlugin::default());
+    assert!(app.world().contains_resource::<MemoryPluginInstalled>());
 
-    let memory = AgentMemory::open(&path).unwrap();
+    let store = SqliteHistoryStore::open(&path).unwrap();
+    let handle = AgentHistoryHandle::new(store.clone());
+    let first = record("first");
+    handle.append(first.clone()).unwrap();
+    assert_eq!(store.list().unwrap(), vec![first.clone()]);
+    drop(handle);
+    drop(store);
     assert_eq!(
-        memory.state_value("realtime").unwrap().as_deref(),
-        Some("{\"inners\":{}}")
+        SqliteHistoryStore::open(&path).unwrap().list().unwrap(),
+        vec![first]
     );
-    assert_eq!(memory.state_value("setting/tool_dynamic").unwrap(), None);
+}
 
+#[test]
+fn external_trait_handle_observes_idempotence_and_atomic_conflicts() {
+    let handle = AgentHistoryHandle::new(SqliteHistoryStore::open(":memory:").unwrap());
+    let first = record("first");
+    handle
+        .append_batch(vec![first.clone(), first.clone()])
+        .unwrap();
+    let mut conflict = first.clone();
+    conflict.turn = Some("turn-2".into());
+    assert_eq!(
+        handle.append_batch(vec![record("second"), conflict]),
+        Err(HistoryError::KeyConflict("first".into()))
+    );
+    assert_eq!(handle.list().unwrap(), vec![first]);
+}
+
+#[test]
+fn newly_opened_database_contains_only_history() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("history.sqlite");
+    SqliteHistoryStore::open(&path).unwrap();
     let connection = rusqlite::Connection::open(&path).unwrap();
     let tables = connection
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(tables, ["history_messages", "state"]);
-}
-
-#[test]
-fn documented_public_api_composes_from_an_external_crate() {
-    let directory = tempdir().unwrap();
-    let path = directory.path().join("memory.sql");
-    let memory = AgentMemory::open(&path).unwrap();
-
-    let mut app = App::new();
-    app.add_plugin(RuntimePlugin::default())
-        .add_plugin(MemoryPlugin::default());
-    let agent = attach_agent(&mut app, memory);
-    app.world().emit_event(AgentHistoryMessageWriteRequested {
-        source: "test".to_owned(),
-        id: "turn-1".into(),
-        agent,
-        message: Message::User {
-            content: "hello".into(),
-        },
-        tool_schema: Vec::new(),
-        usage: None,
-    });
-    app.tick();
-
-    let history = app
-        .world()
-        .get_component::<agent_plugin::Agent>(agent)
-        .unwrap()
-        .memory
-        .history_messages()
-        .unwrap();
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].turn_id(), "turn-1");
-    assert_eq!(
-        history[0].message().unwrap(),
-        Message::User {
-            content: "hello".into(),
-        }
-    );
+    assert_eq!(tables, ["history_records"]);
 }

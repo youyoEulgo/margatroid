@@ -36,7 +36,22 @@ types      src/types.rs及runner协议   执行快照、限额和进程协议
 error      共享工具错误契约          执行、取消与清理错误
 ```
 
-**本文是尚未实现的目标设计。当前代码参考仍保存在DESIGN.md。** MCL选择资源并管理调用批次，ToolPlugin执行一条明确ResourceID的调用，独立runner执行Lua，oneshot返回结果。长期任务是未来能力，本文件先确定所有权、沙箱和清理约束，不假称已有任务管理设施。
+**CallableResource snapshot请求及MCL typed arrays已实现；普通tool/skill runner的既有取消与真实cleanup机制保留，Hook执行明确返回UnsupportedHook，长期任务协议仍为未来约束。** 重写前设计归档于 [DESIGN.md](</home/eulgo/Documents/multi/margatroid/margatroid/crates/margatroid/tool_plugin/DESIGN.md>)。MCL选择不可变可调用资源快照并管理调用批次，ToolPlugin每个oneshot请求只执行一个匹配调用，独立runner基本协议不变。
+
+当前MCL只有MESSAGE、TOOL、SANDBOX三种typed arrays；TOOL是资源值，保存ResourceID、alias、description、schema与immutable shared snapshot，不是ToolCall请求数组。`IMPORT TOOL tool/skill/hook AS alias`与`GET alias`解析Agent ImportBindings，不新增插件注册表；`infer`接收MESSAGE array + TOOL array，不接受ResourceID array或重复global alias query。旧Block不会跟随reload暗变，新GET alias获取新快照。Hook允许导入TOOL，但Driver触发器及执行路线明确未定，不假定普通Lua执行。
+
+## 当前执行机制与保留边界
+
+以下runner机制与snapshot请求均已实现；资源选择准备消费已选定metadata snapshot，其余进程、取消及真实cleanup保证保留。
+
+- 主线程认领共享 reply Sender并复制Agent/turn，消费请求选定的CallableResource定义与执行材料而非按ResourceID重取ResourceSet最新版本；使用共享作用域原子登记和沙箱快照，skill固定空对象schema。排队任务丢弃会撤销未启动登记并回复错误。
+- 通用异步闭包启动独立 supervisor；调用者 Future 被取消或丢弃时请求取消，supervisor 仍持有执行所有权，完成真实进程、管道及临时目录清理后才 mark。执行所有者意外丢弃或清理证明缺失时保留登记并 `mark_cleanup_failed`。
+- `src/process.rs` 并行投递 stdin、排读有界 stdout/stderr、等待进程，统一截止时间、作用域取消、MCL logical 取消及 receiver 关闭监督。stdout 仅 JSON 协议，Lua print 写 stderr；非法协议或缺少清理证明不视为执行已回收。
+- Linux runner 在执行 Lua 前启用 child subreaper；结束时遍历、终止并 waitpid 回收所有后代，包括新 session。父进程以独立 childgroup 为强杀兜底；强制终止后无法证明脱离进程已收口时明确 CleanupFailed，不假称进程组能保证清理。
+- 可选 cgroup v2 执行边界通过 `MARGATROID_TOOL_CGROUP_ROOT` 指向已委派、可写且有 `cgroup.kill` 能力的真实 cgroup 根目录；runner 进入专用子组后才执行 Lua，清理要求 kill、populated 0 及目录移除。未配置时不声称具备 cgroup 隔离；配置不可用失败关闭。
+- 沙箱策略通过现有 landstrip CLI `run -p policy -- tool_runner` 启动，策略激活而后端不存在不会退化为无沙箱；环境过滤凭据及宿主注入变量。
+- shell 默认使用并行有界 stdout/stderr 管道。Linux 显式 `shell(command, {pty=true})` 使用非阻塞 AsyncFd PTY，建立 session 与控制终端，stdin/stdout/stderr 都连接 slave；终端输出合并在 `stdout`，`stderr` 为空，退出状态仍返回 `code`。PTY 读取和等待并行，取消、限额、超时及后代回收沿用同一执行预算；非 Linux 明确拒绝 PTY。
+- handoff 第一版固定 UnsupportedHandoff，未增加任务池、全局 pending 或旧资源注册入口。
 
 # lib
 
@@ -71,11 +86,11 @@ AgentExecutionScope：Agent所属共享执行作用域，公开共享契约--保
 
 ```text
 职责：
-    MCL完成可见ResourceID筛选及alias匹配，ToolPlugin请求直接带选定ResourceID，不再按名称选择另一个资源
-    ToolPlugin不管理批次、排序、turn生成、自动历史、推理或Driver邮箱
-    ToolResource、SkillResource加载由对应资源插件完成，本插件只消费目标Agent集合中的条目
-    tool执行独立runner中的Lua；skill有界读取正文并返回tool_call消息，不启动Lua
-    hook由Driver解释，不在ToolPlugin执行；prompt和sandbox不是工具调用入口
+    MCL完成TOOL可见快照与alias匹配，ToolPlugin请求直接带选定CallableResource，自带ResourceID；不按名称另选资源或按ResourceID重取latest
+    ToolPlugin不管理批次、排序、turn生成、自动历史、推理或Driver邮箱；每个匹配调用仍为一个独立oneshot请求
+    ToolResource、SkillResource、HookResource加载由对应资源插件完成，本插件只消费选定snapshot并validate_owner校验已导入及许可
+    tool执行独立runner中的Lua；skill有界读取选定正文材料并返回tool_call结果消息，不启动Lua
+    hook允许作为TOOL资源导入，但Driver触发器执行路线尚未定；未定路线必须明确拒绝执行，不能套用tool Lua runner；prompt和sandbox不是TOOL资源
 
 进程隔离：
     独立runner是短生命周期工具进程，方便CLI沙箱工具包装，不在Workspace Driver线程创建工具VM
@@ -113,10 +128,12 @@ crate公开：
 handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
     准备单次执行：crate公开函数
     行为：
-        校验请求ID、调用ID、完整Agent Entity、取消状态和资源类型
-        从该Agent的ResourceSet按resource读取条目，tool复制已加载schema与脚本路径，skill复制正文路径与alias快照，不读取不存在的skill schema
-        解码arguments并限制大小；tool按已加载schema验证，skill使用消费侧固定schema {"type":"object","properties":{},"additionalProperties":false}，只接受空对象{}，与Inference展示定义完全一致；不新增skill schema文件，不重新解析metadata或全局资源目录
-        tool执行经Agent.execution共享作用域受检入口检查受理门、登记Sandbox活动并取得当前沙箱策略与项目路径快照；取消令牌由该作用域派生
+        校验请求ID、调用ID、完整Agent Entity、取消状态和资源类型；validate_owner(request.resource.resource_id)校验目标ResourceSet存在、image_dependencies许可及ImportBindings的ID/TOOL kind已导入，不要求最新alias或定义与选定snapshot一致，允许仍有效的旧版本snapshot
+        消费request.resource的不可变共享definition及alias，验证call.tool_name与选定alias一致；不从ResourceSet按ID重取latest，不再次global alias query
+        tool使用选定schema与脚本材料引用，skill使用选定正文材料引用与alias；不重取最新collection。现有路径late read不能证明磁盘内容版本隔离，后续采用Arc脚本正文或版本化文件材料的具体方案尚未闭合，不能把metadata snapshot不变假称为磁盘内容不变
+        解码arguments并限制大小；tool按snapshot schema验证，skill使用snapshot中固定schema {"type":"object","properties":{},"additionalProperties":false}，只接受空对象{}，与Inference展示定义完全一致；不新增skill schema文件，不重新解析metadata或全局资源目录
+        hook的Driver触发器及执行路线未闭合时返回UnsupportedHook，不启动普通Lua runner；导入合法不等于该执行路线已经实现
+        tool执行经Agent.execution共享作用域受检入口检查受理门、登记Sandbox活动并取得Agent.sandbox选定SandboxValue的policy及项目路径快照；SandboxValue自带resource_id，不按沙箱ID重取latest；取消令牌由该作用域派生
         活动登记与沙箱快照取得必须和沙箱切换互斥，不能先检查后异步登记形成竞态
         skill由ToolPlugin在同一作用域登记Other活动并监督正文读取及输出限额；它不阻止沙箱切换，但Agent停止仍取消并等待读取清理与调用收口
         准备拥有所有权的数据，文件读取、临时目录创建及进程启动放入闭包，不阻塞ECS
@@ -128,8 +145,8 @@ handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
 execute_tool(prepared: PreparedToolExecution)
     执行并完成回执：私有异步函数
     行为：
-        skill有界读取已验证资源路径的UTF-8正文，将内容构造为tool_call消息
-        tool有界读取Lua脚本，建立本次临时目录并调用run_runner
+        skill有界读取snapshot选定的UTF-8正文材料引用，将内容构造为tool_call结果消息，保留选定resource_id及call_id
+        tool有界读取snapshot选定的Lua脚本材料引用，建立本次临时目录并调用run_runner；执行中不重新解析alias或读取最新资源定义；可变磁盘路径的内容版本隔离仍为待验收项
         捕获普通错误与panic，清理本次拥有且未转交的执行资源
         真实清理完成后mark_completed再释放活动登记；清理失败保留可管理的活动关联，不假称已经空闲
         在共享reply短锁内take唯一Sender，发送一次成功或错误；取消和任务丢弃也必须关闭或完成回复
@@ -170,9 +187,19 @@ handoff_long_task(activity: ExecutionActivity, specification: LongTaskSpecificat
 ## 逻辑
 
 ```text
+MCL tool_call effect（当前输入契约）：
+    参数顺序为MESSAGE array（恰好一条assistant）+ TOOL visible array，calls仅从assistant.tool_calls字段抽取
+    TOOL只含可调用资源；ToolCall仍是assistant字段中的纯值，不升级为Block或独立typed array
+    多条消息、非assistant、visible alias冲突或重复call ID必须在任何submit前使整个effect失败，不能部分提交后才报这些结构错误
+    空calls返回emptyMessage，不执行工具；assistant已经由infer收口记录，不在tool_call effect再次记录
+    对每个call按选定TOOL snapshot.alias匹配；每个匹配调用发送一个ToolExecuteRequest及oneshot，保持单调用基本runner不变
+    匹配失败由MCL按原槽位构造关联错误；成功与失败结果均保留call ID，已选定资源保留resource_id，不虚构缺失资源ID
+    MCL按原调用顺序收口tool结果并记录历史；所有已有message resource IDs必须保留，不因effect或history append丢失
+
 正常调用：
-    MCL选定资源 -> ToolExecuteRequest -> 主线程快照与活动登记
-    独立runner或skill读取 -> 清理本次执行资源 -> oneshot -> MCL填回原调用槽位并记录历史
+    MCL选定CallableResource snapshot -> ToolExecuteRequest -> 主线程归属校验与活动登记
+    独立runner或skill读取选定材料 -> 清理本次执行资源 -> oneshot -> MCL填回原调用槽位并记录历史
+    System为完整消息变体，prompt按真实role导入且infer支持System；history append是独立允许范围，不含System，不改变infer输入范围
 
 长期任务（未来约束，第一版拒绝handoff）：
     runner显式申请 -> 管理设施接管任务 -> 返回task ID -> runner退出
@@ -186,7 +213,7 @@ handoff_long_task(activity: ExecutionActivity, specification: LongTaskSpecificat
     检查与配置修改在同一受检入口，活动启动也走同一受理机制，不依赖MCL FIFO消除所有竞态
     重复选择完全相同的当前配置可幂等成功；同ID但策略内容变化属于配置改变
     激活沙箱同ID重载也不能绕过此约束；新材料可先准备，发布改变前须检查活动，忙时保留原条目
-    其他资源重载不改变已开始任务的快照；任务查询结果不视为仍拥有执行资源
+    其他资源重载不改变已有typed Block或已开始任务的不可变共享快照；新GET alias取得新版本，工具执行始终使用选定snapshot而非resource_id重取latest；任务查询结果不视为仍拥有执行资源
 
 清理接口：
     agent_cleanup_tasks只清理该作用域的Sandbox活动，关闭新的Sandbox执行受理门，取消普通runner及长期进程并异步等待真实执行体退出和资源释放；不取消Inference或其他非沙箱活动
@@ -210,7 +237,7 @@ handoff_long_task(activity: ExecutionActivity, specification: LongTaskSpecificat
 ToolExecuteRequest：单条工具执行请求，公开事件
     id: String--本次执行请求唯一关联
     agent: Entity--完整目标Agent实例
-    resource: ResourceID--MCL已选择的资源身份
+    resource: CallableResource--MCL选定的不可变共享资源snapshot，自带resource_id、alias、definition；不另设重复resource_id/snapshot字段
     call: ToolCall--调用ID、tool_name和arguments等既有内容
     turn: Option<String>--提交时轮次快照
     cancel: CancellationToken--所属执行作用域派生取消令牌
@@ -235,6 +262,12 @@ ToolExecuteResponse：单条成功响应，公开共享结构体--oneshot载荷�
 
 公开共享纯值契约：
 ```text
+CallableResource：TOOL元素，公开共享纯值契约--归共享types，本插件不另建注册表
+    resource_id: ResourceID--选定导入资源身份，validate_owner只校验已导入及许可，不取新版本
+    alias: String--模型可见及call匹配名称
+    definition: Arc<CallableDefinitionSnapshot>--不可变共享description、input_schema与资源种类/执行材料引用
+    说明：已有Block和请求持有同一snapshot；Agent ImportBindings是alias权威，GET alias取得当前绑定快照。请求仅resource持有此值，不重复ID和snapshot字段。
+
 ToolExecutionLimits：执行限额，公开结构体
     script_bytes: usize
     argument_bytes: usize
@@ -252,7 +285,7 @@ ToolExecutionLimits：执行限额，公开结构体
 ```text
 PreparedToolExecution：执行快照，私有结构体--闭包捕获，不是事件
     request: ToolExecuteRequest
-    resource: ToolExecutionResource--tool脚本/schema或skill正文路径快照
+    说明：资源身份、alias、schema和材料引用统一由request.resource: CallableResource拥有，不再另设resource: ToolExecutionResource或复制独立resource_id字段；runner只接收该snapshot派生的必要协议值。
     arguments: serde_json::Value--已验证参数
     project_root: PathBuf
     sandbox_policy: Option<SandboxPolicySnapshot>--本次执行固定策略
@@ -288,6 +321,7 @@ ToolErrorKind：工具错误分类，公开枚举
     AgentNotAlive
     ResourceMissing
     UnsupportedResource
+    UnsupportedHook
     UnsupportedHandoff
     InvalidArguments
     InvalidDefinition
@@ -320,5 +354,15 @@ ToolError：工具错误，公开结构体
 ```text
 单条工具失败不直接结束turn，不通过AgentException替代原请求结果
 清理失败须保留真实活动关联，禁止将错误回复等同于进程清理成功
-普通runner执行、作用域登记、取消和真实cleanup等待为第一版既定要求；平台沙箱边界和长期任务完整协议仍需详细设计，第一版不支持handoff
+普通runner执行、作用域登记、取消和真实cleanup等待保持既定要求；typed请求已实现，第一版仍不支持handoff
+
+当前同步验收与限制（未闭合项不得标为已完成）：
+    验证MESSAGE/TOOL/SANDBOX三个typed arrays、IMPORT TOOL tool/skill/hook AS alias和GET alias，资源值与ToolCall纯值严格区分
+    验证infer使用MESSAGE + TOOL及已准备definition/validate_owner，不接受ResourceID array、不重复global alias query
+    验证tool_call所有结构校验在submit前完成、空calls返回emptyMessage、不重复记录assistant、每匹配调用单oneshot及全部历史消息保留IDs
+    验证System/prompt真实role、infer接收System，与history append不含System的独立范围
+    验证reload后旧Block/已选定snapshot不变，新GET获得新快照；ToolExecuteRequest.resource是唯一CallableResource持有字段，Agent.sandbox使用选定SandboxValue策略
+    Hook导入与typed定义可验收，但Driver触发器/执行路线仍明确未定；不以普通Lua runner临时代替或宣称路线已闭合
+    脚本/skill正文材料的磁盘版本隔离方案尚未闭合；现有路径late read不提供该保证，需要进一步选择Arc正文或版本化材料并验收
+    平台沙箱边界及长期任务完整协议继续单独设计；保留取消后join进程、排读管道、后代回收、临时目录清理的真实证明要求
 ```

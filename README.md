@@ -4,9 +4,13 @@
 
 项目仍在早期开发中，功能并不完善，API 和架构可能随时变动。
 
-当前 workspace 保留 mecs 基础设施和正在重构的 Margatroid V3 业务 crate。CLI 负责编译
-Workspace 文件、通过 WebSocket 发送 Workspace 启动请求并打印后端日志；daemon 负责安装插件、
-创建 Workspace、提供 WebSocket 后端，并直接提供 Web 界面。LLM 消息输入输出仍未接入 CLI。
+当前 workspace 使用统一资源集合、共享组件和事件，以及 Agent 自有 MCL FIFO。CLI 负责编译
+Workspace 文件、通过 WebSocket 发送启动和停止请求并打印日志；daemon 安装插件并提供 Web UI。
+每个 Workspace 使用专属本地异步执行线程运行 Driver。
+资源使用显式 `IMPORT MESSAGE / TOOL / SANDBOX` 建立 alias，GET、INJECT 左侧和 effect 括号共用同类型数组求值。
+Prompt 按真实 role 转换为消息，工具调用直接接受一条 assistant 消息及可见 TOOL 数组，不再设置 RESOURCE 或 TOOL_CALL 字段。
+Web UI 使用显式 MCL 工作台，消息注入需要配置 Driver 的字段路径，不猜测上下文、不自动触发推理。
+旧 RefBlock、独立资源身份组件、邮箱、实时 STATE 和可见性绑定接口已移除，这是一次破坏兼容性的迁移。
 
 ## 目录
 
@@ -43,3 +47,23 @@ ws://127.0.0.1:3939/ws      WebSocket 后端
 
 daemon不接受启动参数，固定读取 `~/.margatroid/config.toml` 和 `~/.margatroid/models.toml`。
 监听地址由 `config.toml` 的 `server.bind` 配置，入口策略由同节的 `server.allow` 配置（默认 `"localhost"`，即只接受回环对端且要求 `Origin` 与 `Host` 同源）。
+
+## 重写后的约定
+
+- 资源包通过五类加载插件挂到目标实体的 `ResourceSet<T>`；重复 IMPORT 重载，失败保留旧内容。
+- 每条 MCL 除 `history_append` 外先记录原指令；执行后的历史失败单独返回 `history_error`，不会重做工具。
+- 工具 runner 是独立程序，构建 daemon 时应同时构建 `cargo build -p tool_plugin --bin tool_runner`，或设置 `MARGATROID_TOOL_RUNNER` 指向它。
+- Linux shell 支持显式 PTY；有激活沙箱但后端缺失时拒绝执行，不降级成无沙箱。
+- 首版不支持长期任务转交。真实清理失败保留活动及宿主并返回错误，不自动重启或删除。
+- 工作区必须先停止 Agent、等待执行作用域和 MCL 回执收口，再关闭线程；直接丢弃 App 不是强制清理协议。
+- 历史投影目前没有真实时间戳，Web UI 显示不可用；不将 `created_at_ms = 0` 当作真实执行时间。
+
+## 验证
+
+```text
+cargo test --workspace --all-targets
+cargo test --workspace --doc
+cd ui
+npm test
+npm run build
+```

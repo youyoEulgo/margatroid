@@ -1,508 +1,509 @@
-use std::collections::BTreeMap;
-
-use core_plugin::{Entity, World};
-use lua_runtime_plugin::{
-    LuaEnvironmentContext, LuaRuntimeHandle, LuaRuntimeReply, LuaRuntimeRequest,
-    LuaRuntimeTaskFinished, LuaScheduler, LuaValue, LuaVmOwner, LuaVmStarted,
+use crate::*;
+use app_runtime_plugin::WorldEventExt;
+use core_plugin::{Component, Entity, World};
+use margatroid_types::{
+    block_types::AgentBlock,
+    execution_components::AgentExecutionScope,
+    history_components::AgentHistoryHandle,
+    lua_environment::{
+        LuaBindingValue, LuaEnvironment, LuaGlobalBinding, LuaProgram, LuaStandardLibraries,
+        LuaValue,
+    },
+    lua_runtime_components::{AgentLua, DriverLuaVmInstance, LuaRuntimeErrorKind},
+    lua_runtime_events::*,
+    mcl_events::AgentMclQueue,
+    resource_components::*,
+    workspace_components::{Workspace, WorldWorkspaceExt},
 };
-use resource_id_plugin::{ResourceId, ResourceRef, WorldResourceIdExt};
+use resource_id_plugin::{LibraryComponent, ResourceSet, WorldResourceExt};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{
-    failure, Agent, AgentControl, AgentControlKind, AgentCreateRequest, AgentCreationState,
-    AgentFailureKind, AgentInferenceState, AgentInfo, AgentInitializationCompleted,
-    AgentLifecycleState, AgentLuaState, AgentMcl, AgentResourceMap, AgentToolState, AgentTurnState,
-    TokenUsageState,
-};
-
-fn agent_label(world: &World, entity: Entity) -> String {
-    world
-        .get_component::<ResourceId>(entity)
-        .map(|id| id.as_ref().to_string())
-        .unwrap_or_else(|| format!("Entity({entity:?})"))
+#[derive(Default)]
+struct HandledExceptions(HashSet<String>);
+impl Component for HandledExceptions {}
+fn next_id(kind: &str) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("agent:{kind}:{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
-
-pub fn handle_agent_create(world: &mut World, request: AgentCreateRequest) {
-    let invalid_reason = if request.id.is_empty() {
-        Some("request id is empty")
-    } else if request.agent_id.resource_type() != "agent" {
-        Some("agent id is not an agent resource")
-    } else if !world.is_alive(request.workspace_id) {
-        Some("workspace is not alive")
-    } else if world
-        .query_with::<ResourceId>()
-        .result()
-        .into_iter()
-        .any(|entity| {
-            world
-                .get_component::<ResourceId>(entity)
-                .map(ResourceId::as_ref)
-                == Some(&request.agent_id)
-        })
-    {
-        Some("agent resource id already exists")
-    } else if world
-        .query_with::<Agent>()
-        .result()
-        .into_iter()
-        .any(|entity| {
-            world
-                .get_component::<Agent>(entity)
-                .is_some_and(|agent| agent.creation.request_id == request.id)
-        })
-    {
-        Some("creation request id already exists")
-    } else {
-        None
-    };
-    if let Some(reason) = invalid_reason {
-        tracing::error!(
-            request_id = %request.id,
-            agent_id = %request.agent_id,
-            reason,
-            "agent creation request is invalid"
-        );
-        request.reply.send(Err(failure(
-            AgentFailureKind::InvalidRequest,
-            format!("agent creation request is invalid: {reason}"),
-        )));
-        return;
-    }
-
-    let entity = world.spawn();
-    let info = AgentInfo {
-        image_entity: request.image_entity,
-        workspace_id: request.workspace_id,
-        model: request.model.clone(),
-        project_root: request.project_root.clone(),
-        image_root: request.image_root.clone(),
-        home_root: request.home_root.clone(),
-        image_dependencies: request.image_dependencies.clone(),
-    };
-    let agent = Agent {
-        info: info.clone(),
-        creation: AgentCreationState {
-            request_id: request.id.clone(),
-            reply: request.reply.clone(),
-            initialization: Default::default(),
-        },
-        mcl: AgentMcl::default(),
-        resources: AgentResourceMap::default(),
-        memory: request.memory,
-        inference: AgentInferenceState {
-            model: request.model,
-            pending: Default::default(),
-        },
-        tools: AgentToolState::default(),
-        lua: AgentLuaState {
-            request_id: Some(request.id.clone()),
-            vm_id: None,
-        },
-        lifecycle: AgentLifecycleState::Creating,
-        turn: AgentTurnState::default(),
-        token_usage: TokenUsageState::from(&request.token_usage),
-        last_error: None,
-    };
-
-    if world
-        .attach_resource_id(entity, request.agent_id.clone())
-        .is_err()
-        || !world.insert_component(entity, agent)
-    {
-        tracing::error!(request_id = %request.id, "agent components could not be attached");
-        world.despawn(entity);
-        request.reply.send(Err(failure(
-            AgentFailureKind::InvalidRequest,
-            "agent components could not be attached",
-        )));
-        return;
-    }
-
-    let Some(runtime) = world.get_resource::<LuaRuntimeHandle>().cloned() else {
-        fail_creation(
-            world,
-            entity,
-            failure(
-                AgentFailureKind::LuaRuntime,
-                "LuaRuntimePlugin is unavailable",
-            ),
-        );
-        return;
-    };
-
-    let context = LuaEnvironmentContext {
-        request_id: request.id.clone(),
-        owner: LuaVmOwner {
-            owner_id: request.agent_id.to_string(),
-        },
-        values: [(
-            "agent_info".to_owned(),
-            agent_info_value(&request.agent_id, &info),
-        )]
-        .into_iter()
-        .collect(),
-    };
-    let (sender, _receiver) = tokio::sync::oneshot::channel();
-    let runtime_request = LuaRuntimeRequest {
-        request_id: request.id,
-        owner: context.owner.clone(),
-        program: request.base_lua,
-        context,
-        providers: vec!["agent_info".to_owned(), "mcl".to_owned()],
-        scheduler: LuaScheduler::LongRunning,
-        deadline: None,
-        reply: LuaRuntimeReply::new(sender),
-    };
-    if let Err(error) = runtime.register_long_running(runtime_request) {
-        fail_creation(
-            world,
-            entity,
-            failure(AgentFailureKind::LuaRuntime, error.to_string()),
-        );
+fn error(kind: AgentErrorKind, message: impl Into<String>) -> AgentError {
+    AgentError::new(kind, message)
+}
+fn close_admission(agent: &mut Agent) {
+    agent.execution.request_close();
+    agent.mcl.accepting = false;
+    agent.mcl.drained.close();
+    if let Some(pending) = &agent.mcl.pending {
+        pending.cancel.cancel();
     }
 }
-
-pub fn handle_agent_control(world: &mut World, event: AgentControl) {
-    let result = if world.get_component::<ResourceId>(event.agent).is_none()
-        || world.get_component::<Agent>(event.agent).is_none()
-    {
-        Err(failure(
-            AgentFailureKind::AgentMissing,
-            "target entity is not an addressable agent",
-        ))
-    } else {
-        match event.control {
-            AgentControlKind::Stop => control_stop(world, event.agent),
-            AgentControlKind::AbortTurn => world
-                .get_component_mut::<Agent>(event.agent)
-                .ok_or_else(|| failure(AgentFailureKind::AgentMissing, "agent is missing"))
-                .map(|agent| {
-                    agent.turn.abort();
-                }),
-        }
-    };
-
-    if let Err(error) = &result {
-        if let Some(agent) = world.get_component_mut::<Agent>(event.agent) {
-            agent.last_error = Some(error.clone());
-        }
-    }
-    event.reply.send(result);
-}
-
-pub fn handle_lua_vm_started(world: &mut World, event: LuaVmStarted) {
-    let matches = world
-        .query_with::<Agent>()
-        .result()
-        .into_iter()
-        .filter(|entity| {
-            world
-                .get_component::<Agent>(*entity)
-                .is_some_and(|agent| agent.lua.request_id.as_deref() == Some(&event.request_id))
-                && world
-                    .get_component::<ResourceId>(*entity)
-                    .is_some_and(|id| id.as_ref().to_string() == event.owner.owner_id)
-        })
-        .collect::<Vec<_>>();
-    let [entity] = matches.as_slice() else {
-        return;
-    };
-    let Some(agent) = world.get_component_mut::<Agent>(*entity) else {
-        return;
-    };
-    if agent.lifecycle != AgentLifecycleState::Creating {
-        return;
-    }
-    agent.lua.request_id = None;
-    agent.lua.vm_id = Some(event.vm_id);
-}
-
-pub fn handle_agent_initialization_completed(
-    world: &mut World,
-    event: AgentInitializationCompleted,
-) {
-    let label = agent_label(world, event.agent);
-    let Some(agent) = world.get_component_mut::<Agent>(event.agent) else {
-        return;
-    };
-    if agent.creation.initialization.complete {
-        return;
-    }
-    if agent.lifecycle != AgentLifecycleState::Creating
-        || agent.lua.vm_id != Some(event.vm_id)
-        || agent.creation.initialization.failed.is_some()
-    {
-        tracing::warn!(agent = %label, "agent initialization completion does not match the active VM");
-        agent.last_error = Some(failure(
-            AgentFailureKind::InvalidRequest,
-            "agent initialization completion does not match the active VM",
-        ));
-        return;
-    }
-    agent.creation.initialization.complete = true;
-    agent.lifecycle = AgentLifecycleState::Running;
-    tracing::info!(agent = %label, "agent initialization completed");
-    agent.creation.reply.send(Ok(event.agent));
-}
-
-pub fn handle_lua_vm_finished(world: &mut World, event: LuaRuntimeTaskFinished) {
-    let target = world
-        .query_with::<Agent>()
-        .result()
-        .into_iter()
-        .find(|entity| {
-            world.get_component::<Agent>(*entity).is_some_and(|agent| {
-                agent.lua.request_id.as_deref() == Some(&event.request_id)
-                    || event
-                        .vm_id
-                        .is_some_and(|vm_id| agent.lua.vm_id == Some(vm_id))
-            })
-        });
-    let Some(entity) = target else {
-        return;
-    };
-    let label = agent_label(world, entity);
-    let Some(agent) = world.get_component_mut::<Agent>(entity) else {
-        return;
-    };
-    let was_creating = !agent.creation.initialization.complete;
-    agent.lua.request_id = None;
-    agent.lua.vm_id = None;
-    if let Some(runtime_error) = event.error {
-        tracing::error!(agent = %label, error = %runtime_error, "agent Lua runtime finished with error");
-        let error = failure(AgentFailureKind::LuaRuntime, runtime_error.to_string());
-        agent.lifecycle = AgentLifecycleState::Failed;
-        agent.last_error = Some(error.clone());
+fn environment(agent: &Agent, entity: Entity) -> LuaEnvironment {
+    let mut info = BTreeMap::new();
+    info.insert("entity".into(), LuaValue::String(format!("{entity:?}")));
+    info.insert(
+        "resource_id".into(),
+        LuaValue::String(agent.resourceid.to_string()),
+    );
+    info.insert(
+        "workspace".into(),
+        LuaValue::String(agent.workspace.to_string()),
+    );
+    info.insert(
+        "image".into(),
+        LuaValue::String(agent.info.image.to_string()),
+    );
+    let mut model = BTreeMap::new();
+    model.insert(
+        "model".into(),
+        LuaValue::String(agent.info.model.model.clone()),
+    );
+    model.insert(
+        "temperature".into(),
         agent
-            .creation
-            .initialization
-            .failed
-            .get_or_insert(error.clone());
-        if was_creating {
-            agent.creation.reply.send(Err(error));
-        }
-    } else {
-        agent.lifecycle = AgentLifecycleState::Stopped;
-        if was_creating {
-            agent.creation.reply.send(Err(failure(
-                AgentFailureKind::Stopped,
-                "agent VM stopped before initialization completed",
-            )));
-        }
-    }
-}
-
-pub fn control_stop(world: &mut World, entity: Entity) -> Result<(), margatroid_types::AgentError> {
-    let agent = world
-        .get_component_mut::<Agent>(entity)
-        .ok_or_else(|| failure(AgentFailureKind::AgentMissing, "agent is missing"))?;
-    if agent.lua.vm_id.is_none() && agent.lua.request_id.is_none() {
-        if agent.lifecycle != AgentLifecycleState::Failed {
-            agent.lifecycle = AgentLifecycleState::Stopped;
-        }
-        return Ok(());
-    }
-    let id = world
-        .get_component::<ResourceId>(entity)
-        .ok_or_else(|| failure(AgentFailureKind::AgentMissing, "agent identity is missing"))?
-        .as_ref()
-        .to_string();
-    let runtime = world
-        .get_resource::<LuaRuntimeHandle>()
-        .cloned()
-        .ok_or_else(|| failure(AgentFailureKind::LuaRuntime, "Lua runtime is missing"))?;
-    runtime
-        .stop_long_running(&id)
-        .map_err(|error| failure(AgentFailureKind::LuaRuntime, error.to_string()))?;
-    world
-        .get_component_mut::<Agent>(entity)
-        .expect("agent disappeared during stop")
-        .lifecycle = AgentLifecycleState::Stopping;
-    Ok(())
-}
-
-fn fail_creation(world: &mut World, entity: Entity, error: margatroid_types::AgentError) {
-    tracing::error!(agent = %agent_label(world, entity), error = %error, "agent creation failed");
-    if let Some(agent) = world.get_component_mut::<Agent>(entity) {
-        agent.lifecycle = AgentLifecycleState::Failed;
-        agent.lua.request_id = None;
-        agent.lua.vm_id = None;
-        agent.creation.initialization.failed = Some(error.clone());
-        agent.last_error = Some(error.clone());
-        agent.creation.reply.send(Err(error));
-    }
-}
-
-fn agent_info_value(id: &ResourceRef, info: &AgentInfo) -> LuaValue {
-    let mut value = BTreeMap::new();
-    value.insert("id".to_owned(), LuaValue::String(id.to_string()));
-    value.insert(
-        "workspace_id".to_owned(),
-        LuaValue::Integer(info.workspace_id.index() as i64),
+            .info
+            .model
+            .temperature
+            .map(|value| LuaValue::Number(value as f64))
+            .unwrap_or(LuaValue::Nil),
     );
-    value.insert(
-        "project_root".to_owned(),
-        LuaValue::String(info.project_root.display().to_string()),
+    model.insert(
+        "max_output_tokens".into(),
+        agent
+            .info
+            .model
+            .max_output_tokens
+            .map(|value| LuaValue::Integer(value as i64))
+            .unwrap_or(LuaValue::Nil),
     );
-    value.insert(
-        "image_root".to_owned(),
-        LuaValue::String(info.image_root.display().to_string()),
+    model.insert(
+        "top_p".into(),
+        agent
+            .info
+            .model
+            .top_p
+            .map(|value| LuaValue::Number(value as f64))
+            .unwrap_or(LuaValue::Nil),
     );
-    value.insert(
-        "home_root".to_owned(),
-        LuaValue::String(info.home_root.display().to_string()),
-    );
-    value.insert(
-        "model".to_owned(),
-        LuaValue::Object(
-            [
-                (
-                    "provider".to_owned(),
-                    LuaValue::String(info.model.provider.clone()),
-                ),
-                (
-                    "model".to_owned(),
-                    LuaValue::String(info.model.model.clone()),
-                ),
-                (
-                    "context_window_tokens".to_owned(),
-                    LuaValue::Integer(info.model.context_window_tokens as i64),
-                ),
-            ]
-            .into_iter()
-            .collect(),
+    model.insert(
+        "stop".into(),
+        LuaValue::Array(
+            agent
+                .info
+                .model
+                .stop
+                .iter()
+                .cloned()
+                .map(LuaValue::String)
+                .collect(),
         ),
     );
-    LuaValue::Object(value)
+    info.insert("model".into(), LuaValue::Object(model));
+    info.insert(
+        "image_dependencies".into(),
+        LuaValue::Array(
+            agent
+                .info
+                .image_dependencies
+                .iter()
+                .map(|id| LuaValue::String(id.to_string()))
+                .collect(),
+        ),
+    );
+    info.insert(
+        "project_root".into(),
+        LuaValue::String(agent.info.project_root.to_string_lossy().into()),
+    );
+    info.insert(
+        "home_root".into(),
+        LuaValue::String(agent.info.home_root.to_string_lossy().into()),
+    );
+    LuaEnvironment {
+        globals: vec![LuaGlobalBinding {
+            name: "agent_info".into(),
+            binding: LuaBindingValue::Value(LuaValue::Object(info)),
+        }],
+        modules: vec![],
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use margatroid_types::{AgentError, LuaVmId, Message, TokenUsage, ToolDefinition};
-
-    use super::*;
-    use crate::{AgentMemoryHandle, AgentMemoryStore, AgentMemoryStoreError};
-
-    struct EmptyMemory;
-
-    impl AgentMemoryStore for EmptyMemory {
-        fn set_state(&self, _key: &str, _value: &str) -> Result<(), AgentMemoryStoreError> {
-            Ok(())
+pub fn handle_start_agent(world: &mut World, request: StartAgent) {
+    let prepared = (|| {
+        if request.id.is_empty()
+            || request.resource_id.resource_type() != "agent"
+            || request.image.resource_type() != "image"
+        {
+            return Err(error(
+                AgentErrorKind::InvalidRequest,
+                "invalid request ID or resource type",
+            ));
         }
-
-        fn state_value(&self, _key: &str) -> Result<Option<String>, AgentMemoryStoreError> {
-            Ok(None)
+        if request.definition.project_root.as_os_str().is_empty()
+            || request.definition.home_root.as_os_str().is_empty()
+            || request.definition.history_path.as_os_str().is_empty()
+        {
+            return Err(error(
+                AgentErrorKind::InvalidRequest,
+                "member paths must be explicit and nonempty",
+            ));
         }
-
-        fn append_record(
-            &self,
-            _kind: &str,
-            _content: &str,
-            _payload: &str,
-            _source: &str,
-        ) -> Result<(), AgentMemoryStoreError> {
-            Ok(())
+        if world.query_with::<Agent>().result().into_iter().any(|entity| {
+            matches!(&world.get_component::<Agent>(entity).unwrap().state, AgentState::Creating { request_id, .. } if request_id == &request.id)
+        }) {
+            return Err(error(AgentErrorKind::InvalidRequest, "start request ID already in flight"));
         }
-
-        fn append_history(
-            &self,
-            _turn_id: &str,
-            _source: &str,
-            _message: &Message,
-            _tool_schema: &[ToolDefinition],
-            _usage: Option<&TokenUsage>,
-        ) -> Result<(), AgentMemoryStoreError> {
-            Ok(())
+        let existing = world
+            .find_resource_entities(&request.resource_id)
+            .map_err(|e| error(AgentErrorKind::ResourceResolutionFailed, e.to_string()))?;
+        if !existing.is_empty() {
+            return Err(error(
+                AgentErrorKind::DuplicateAgent,
+                "agent address already exists",
+            ));
         }
-
-        fn history_messages(&self) -> Result<Vec<crate::HistoryMessage>, AgentMemoryStoreError> {
-            Ok(Vec::new())
+        let workspace = world
+            .get_component::<Workspace>(request.workspace)
+            .ok_or_else(|| error(AgentErrorKind::WorkspaceNotAlive, "workspace missing"))?;
+        let workspace_id = workspace.resource_id().clone();
+        if world
+            .find_resource_entities(&workspace_id)
+            .map_err(|e| error(AgentErrorKind::ResourceResolutionFailed, e.to_string()))?
+            != vec![request.workspace]
+        {
+            return Err(error(
+                AgentErrorKind::WorkspaceNotAlive,
+                "workspace identity is not unique",
+            ));
         }
+        let entry = world
+            .workspace_start_entry(request.workspace, &request.id)
+            .map_err(|e| error(AgentErrorKind::WorkspaceNotAlive, e.to_string()))?;
+        let image = world
+            .get_component::<ResourceSet<AgentImage>>(request.workspace)
+            .and_then(|set| set.get(&request.image))
+            .cloned()
+            .ok_or_else(|| {
+                error(
+                    AgentErrorKind::ImageNotLoaded,
+                    "image not loaded on requested workspace",
+                )
+            })?;
+        let mcl_environment = world
+            .get_resource::<margatroid_types::mcl_environment::MclEnvironmentFactory>()
+            .ok_or_else(|| {
+                error(
+                    AgentErrorKind::ResourceSetupFailed,
+                    "MCL environment factory missing",
+                )
+            })?
+            .build();
+        let history = memory_plugin::SqliteHistoryStore::open(&request.definition.history_path)
+            .map_err(|e| error(AgentErrorKind::HistorySetupFailed, e.to_string()))?;
+        Ok((
+            workspace_id,
+            entry,
+            image,
+            AgentHistoryHandle::new(history),
+            mcl_environment,
+        ))
+    })();
+    let (workspace, execution_entry, image, history, mut mcl_environment) = match prepared {
+        Ok(value) => value,
+        Err(error) => {
+            world.send_event(StartAgentResult {
+                id: request.id,
+                result: Err(error),
+            });
+            return;
+        }
+    };
+    let entity = world.spawn();
+    let vm_request_id = next_id("start");
+    let agent = Agent {
+        resourceid: request.resource_id,
+        workspace,
+        info: AgentInfo {
+            model: image.model.clone(),
+            project_root: request.definition.project_root,
+            home_root: request.definition.home_root,
+            image: request.image,
+            image_dependencies: image.dependencies.clone(),
+        },
+        sandbox: None,
+        import_bindings: Default::default(),
+        lua: AgentLua::default(),
+        state: AgentState::Creating {
+            request_id: request.id.clone(),
+            vm_request_id: vm_request_id.clone(),
+        },
+        history,
+        block: AgentBlock::default(),
+        mcl: AgentMclQueue::default(),
+        execution: AgentExecutionScope::new(),
+        turn: None,
+    };
+    let mut environment = environment(&agent, entity);
+    environment.globals.append(&mut mcl_environment.globals);
+    environment.modules.append(&mut mcl_environment.modules);
+    let mounted = (|| {
+        world.insert_library(entity, agent)?;
+        world.insert_resources(entity, ResourceSet::<ToolResource>::new())?;
+        world.insert_resources(entity, ResourceSet::<SkillResource>::new())?;
+        world.insert_resources(entity, ResourceSet::<HookResource>::new())?;
+        world.insert_resources(entity, ResourceSet::<PromptResource>::new())?;
+        world.insert_resources(entity, ResourceSet::<SandboxResource>::new())?;
+        Ok::<_, resource_id_plugin::ResourceError>(())
+    })();
+    if let Err(e) = mounted {
+        world.despawn(entity);
+        world.send_event(StartAgentResult {
+            id: request.id,
+            result: Err(error(AgentErrorKind::ResourceSetupFailed, e.to_string())),
+        });
+        return;
     }
+    world.insert_component(entity, HandledExceptions::default());
+    world.send_event(StartDriverLuaVm {
+        id: vm_request_id,
+        owner: entity,
+        program: LuaProgram {
+            source: image.base_driver,
+            origin: image.origin,
+            libraries: LuaStandardLibraries::Safe,
+        },
+        environment,
+        execution_entry,
+    });
+}
 
-    #[test]
-    fn vm_start_does_not_complete_creation_before_mcl_start() {
-        let mut world = World::new();
-        let workspace = world.spawn();
-        let image = world.spawn();
-        let entity = world.spawn();
-        let id: ResourceRef = "agent:test/coder:latest".parse().unwrap();
-        let (sender, mut receiver) = tokio::sync::oneshot::channel::<Result<Entity, AgentError>>();
-        let model = crate::AgentModelInfo {
-            provider: "test".to_owned(),
-            model: "test".to_owned(),
-            context_window_tokens: 1024,
+pub fn handle_start_driver_lua_vm_result(world: &mut World, event: StartDriverLuaVmResult) {
+    let Some(agent) = world.get_component_mut::<Agent>(event.owner) else {
+        return;
+    };
+    let AgentState::Creating {
+        request_id,
+        vm_request_id,
+    } = &agent.state
+    else {
+        return;
+    };
+    if vm_request_id != &event.id {
+        return;
+    }
+    let request_id = request_id.clone();
+    let expected = DriverLuaVmInstance {
+        owner: event.owner,
+        start_request_id: event.id.clone(),
+    };
+    let result = match event.result {
+        Ok(())
+            if agent.lua.instance.as_ref() == Some(&expected)
+                && agent
+                    .lua
+                    .close
+                    .as_ref()
+                    .is_some_and(|close| close.instance() == expected) =>
+        {
+            agent.lua.ready = None;
+            agent.state = AgentState::Running;
+            Ok(event.owner)
+        }
+        Ok(()) => {
+            close_admission(agent);
+            agent.state = AgentState::Stopping {
+                request_ids: vec![],
+                vm_request_id: None,
+            };
+            Err(error(
+                AgentErrorKind::DriverStartFailed,
+                "ready result lacks matching instance or close handle",
+            ))
+        }
+        Err(e) => {
+            if e.kind == LuaRuntimeErrorKind::CleanupFailed {
+                close_admission(agent);
+                agent.state = AgentState::Stopping {
+                    request_ids: vec![],
+                    vm_request_id: None,
+                };
+            } else {
+                world.despawn(event.owner);
+            }
+            Err(error(AgentErrorKind::DriverStartFailed, e.to_string()))
+        }
+    };
+    world.send_event(StartAgentResult {
+        id: request_id,
+        result,
+    });
+}
+
+pub fn handle_stop_agent(world: &mut World, request: StopAgent) {
+    let Some(agent) = world.get_component_mut::<Agent>(request.agent) else {
+        tracing::warn!(agent = ?request.agent, "stop target missing");
+        world.send_event(StopAgentResult {
+            id: request.id,
+            result: Err(error(AgentErrorKind::AgentNotAlive, "agent missing")),
+        });
+        return;
+    };
+    let rejection = if request.id.is_empty() {
+        Some(error(AgentErrorKind::InvalidRequest, "empty request ID"))
+    } else {
+        match &mut agent.state {
+            AgentState::Creating { .. } => {
+                Some(error(AgentErrorKind::AgentBusy, "agent still creating"))
+            }
+            AgentState::Stopping {
+                request_ids,
+                vm_request_id: Some(_),
+            } => {
+                if !request_ids.contains(&request.id) {
+                    request_ids.push(request.id);
+                }
+                return;
+            }
+            AgentState::Stopping { .. } => Some(error(
+                AgentErrorKind::DriverStopFailed,
+                "previous stop failed; no new completion proof",
+            )),
+            AgentState::Running => None,
+        }
+    };
+    if let Some(e) = rejection {
+        world.send_event(StopAgentResult {
+            id: request.id,
+            result: Err(e),
+        });
+        return;
+    }
+    close_admission(agent);
+    let Some(instance) = agent.lua.instance.clone() else {
+        agent.state = AgentState::Stopping {
+            request_ids: vec![],
+            vm_request_id: None,
         };
-        world.insert_resource(resource_id_plugin::ResourceIdPluginInstalled);
-        world.attach_resource_id(entity, id.clone()).unwrap();
-        world.insert_component(
-            entity,
-            Agent {
-                info: AgentInfo {
-                    image_entity: image,
-                    workspace_id: workspace,
-                    model: model.clone(),
-                    project_root: Default::default(),
-                    image_root: Default::default(),
-                    home_root: Default::default(),
-                    image_dependencies: Default::default(),
-                },
-                creation: AgentCreationState {
-                    request_id: "create-1".to_owned(),
-                    reply: crate::AgentCreateReply::new(sender),
-                    initialization: Default::default(),
-                },
-                mcl: Default::default(),
-                resources: Default::default(),
-                memory: AgentMemoryHandle::new(Arc::new(EmptyMemory)),
-                inference: AgentInferenceState {
-                    model,
-                    pending: Default::default(),
-                },
-                tools: Default::default(),
-                lua: AgentLuaState {
-                    request_id: Some("create-1".to_owned()),
-                    vm_id: None,
-                },
-                lifecycle: AgentLifecycleState::Creating,
-                turn: Default::default(),
-                token_usage: Default::default(),
-                last_error: None,
-            },
-        );
+        world.send_event(StopAgentResult {
+            id: request.id,
+            result: Err(error(
+                AgentErrorKind::DriverStopFailed,
+                "missing driver instance",
+            )),
+        });
+        return;
+    };
+    let id = next_id("stop");
+    agent.state = AgentState::Stopping {
+        request_ids: vec![request.id],
+        vm_request_id: Some(id.clone()),
+    };
+    world.send_event(StopDriverLuaVm {
+        id,
+        owner: request.agent,
+        instance,
+    });
+}
 
-        let vm_id = LuaVmId(9);
-        handle_lua_vm_started(
-            &mut world,
-            LuaVmStarted {
-                request_id: "create-1".to_owned(),
-                vm_id,
-                owner: LuaVmOwner {
-                    owner_id: id.to_string(),
-                },
-            },
-        );
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
-        assert_eq!(
-            world.get_component::<Agent>(entity).unwrap().lifecycle,
-            AgentLifecycleState::Creating
-        );
-
-        handle_agent_initialization_completed(
-            &mut world,
-            AgentInitializationCompleted {
-                agent: entity,
-                vm_id,
-            },
-        );
-        assert_eq!(receiver.try_recv().unwrap().unwrap(), entity);
-        assert_eq!(
-            world.get_component::<Agent>(entity).unwrap().lifecycle,
-            AgentLifecycleState::Running
-        );
+pub fn handle_stop_driver_lua_vm_result(world: &mut World, event: StopDriverLuaVmResult) {
+    let Some(agent) = world.get_component_mut::<Agent>(event.owner) else {
+        return;
+    };
+    if agent.lua.instance.as_ref() != Some(&event.instance) || event.instance.owner != event.owner {
+        return;
     }
+    let AgentState::Stopping {
+        request_ids,
+        vm_request_id,
+    } = &mut agent.state
+    else {
+        return;
+    };
+    if vm_request_id.as_ref() != Some(&event.id) {
+        return;
+    }
+    let ids = std::mem::take(request_ids);
+    *vm_request_id = None;
+    let result = event
+        .result
+        .map(|()| event.owner)
+        .map_err(|e| error(AgentErrorKind::DriverStopFailed, e.to_string()));
+    if result.is_ok() {
+        world.despawn(event.owner);
+    }
+    for id in ids {
+        world.send_event(StopAgentResult {
+            id,
+            result: result.clone(),
+        });
+    }
+}
+
+fn first_exception(world: &mut World, entity: Entity, id: &str) -> bool {
+    if !world.contains_component::<HandledExceptions>(entity) {
+        world.insert_component(entity, HandledExceptions::default());
+    }
+    world
+        .get_component_mut::<HandledExceptions>(entity)
+        .is_some_and(|handled| handled.0.insert(id.into()))
+}
+pub fn handle_driver_lua_vm_exception_result(world: &mut World, event: DriverLuaVmExceptionResult) {
+    let entity = event.instance.owner;
+    let Some(agent) = world.get_component::<Agent>(entity) else {
+        return;
+    };
+    if agent.lua.instance.as_ref() != Some(&event.instance) || event.exception_id.is_empty() {
+        return;
+    }
+    let resource_id = agent.resourceid.clone();
+    let workspace = agent.workspace.clone();
+    if !first_exception(world, entity, &event.exception_id) {
+        return;
+    }
+    close_admission(world.get_component_mut::<Agent>(entity).unwrap());
+    world.send_event(AgentExceptionResult {
+        exception_id: event.exception_id,
+        agent: entity,
+        resource_id,
+        workspace,
+        instance: event.instance,
+        error: None,
+        result: event
+            .result
+            .map_err(|e| error(AgentErrorKind::DriverStopFailed, e.to_string())),
+        execution_ended: event.execution_ended,
+        cleanup_completed: event.cleanup_completed,
+    });
+}
+pub fn handle_agent_exception(world: &mut World, event: AgentException) {
+    let valid = world
+        .get_component::<Agent>(event.agent)
+        .is_some_and(|agent| {
+            agent.resourceid == event.resource_id
+                && agent.workspace == event.workspace
+                && agent.lua.instance.as_ref() == Some(&event.instance)
+                && event.instance.owner == event.agent
+                && !event.exception_id.is_empty()
+        });
+    if valid && !first_exception(world, event.agent, &event.exception_id) {
+        return;
+    }
+    let result = if valid {
+        close_admission(world.get_component_mut::<Agent>(event.agent).unwrap());
+        Ok(())
+    } else {
+        Err(error(
+            AgentErrorKind::InvalidRequest,
+            "exception instance association mismatch",
+        ))
+    };
+    world.send_event(AgentExceptionResult {
+        exception_id: event.exception_id,
+        agent: event.agent,
+        resource_id: event.resource_id,
+        workspace: event.workspace,
+        instance: event.instance,
+        error: Some(event.error),
+        result,
+        execution_ended: valid && event.cleanup_completed,
+        cleanup_completed: valid && event.cleanup_completed,
+    });
 }

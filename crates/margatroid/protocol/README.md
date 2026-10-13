@@ -1,158 +1,57 @@
 # Margatroid Protocol
 
-`margatroid_protocol` 定义客户端与 daemon 之间的 JSON 协议 DTO。所有客户端请求统一使用三个
-顶层字段：`type`、`id` 和 `message`。
+`margatroid_protocol` 定义 JSON DTO、纯转换以及只读、受检的 Workspace/Agent 逻辑寻址。领域组件、消息和指令来自共享 types，不依赖 Agent、MCL、Workspace 或 Memory 插件实现。
 
-DTO 转换统一使用 `FromDomain` 和 `IntoDomain`。领域类型根据这些实现自动获得 `IntoDto` 和
-`FromDto`。转换上下文由具体 DTO 决定：纯静态转换使用 `()`，需要查询 ECS 身份时使用 `&World`，
-请求转换可以使用请求 ID 或连接 ID。
+## 请求与身份
 
-连接注册请求：
+客户端信封为 `{ "type": "...", "id": "...", "message": {...} }`。支持：
 
-```json
-{
-  "type": "connection.register",
-  "id": "register-1",
-  "message": {
-    "client_type": "webui"
-  }
-}
-```
+| type | message |
+| --- | --- |
+| `connection.register` | `{ client_type, name? }` |
+| `workspace.start` | `{ definition }` |
+| `workspace.stop` | `{ workspace }` |
+| `mcl.command` | `{ workspace, agent?, command, arguments }` |
+| `state.query` | `{}` |
+| `history.query` | `{ workspace, agent? }` |
 
-注册成功时后端发送复用请求 ID 的 `connection.registered`，携带分配到的身份：
+除注册外必须已经注册。错误回执为 `request.failed { id, error: { kind, message } }`，错误正文最多 512 UTF-8 字节。注册成功为 `connection.registered { id, client: { resource_id, client_type, name } }`；失败为 `connection.register_failed { id, error }`。等待注册回执后再提交请求。
 
-```json
-{
-  "type": "connection.registered",
-  "id": "register-1",
-  "client": {
-    "resource_id": "client:webui/console:12",
-    "client_type": "webui",
-    "name": "console"
-  }
-}
-```
+`workspace` 为 `{ id, name, project_root }`，三者必须与当前 Workspace 一致。`agent: null` 选择成员定义中的 manager；其他值必须是该 Workspace 当前成员的规范化资源地址。入站不接受 Entity index；出站 `agent_instance` 是包含 generation 的不透明实例标识，不授予寻址能力。
 
-注册失败时发送 `connection.register_failed { id, error }`；`error` 是稳定的英文文本。两者都只发给
-发起注册的连接，客户端应等待回执后再发其它请求：未完成注册的连接发出的其它请求会被忽略。
+Workspace definition 字段为 `id, name, project_root, manager, agents`。成员字段为 `id, name, image, home_root, history_path`，不含旧资源可见性、Workflow 或 memory 配置。
 
-Workspace 启动请求：
-
-```json
-{
-  "type": "workspace.start",
-  "id": "request-1",
-  "message": {
-    "definition": {
-      "id": "workspace:local/demo:latest",
-      "name": "demo",
-      "project_root": "/project/demo",
-      "manager": "coder",
-      "agents": []
-    }
-  }
-}
-```
-
-启动成功时后端发送复用请求ID的`workspace.started`；启动失败时发送
-`workspace.start_failed { id, error }`。两者都是`workspace.start`的终止回执，客户端不应通过
-日志正文推断启动结果。
-
-Workspace 停止请求和业务回执：
-
-```json
-{
-  "type": "workspace.stop",
-  "id": "stop-1",
-  "message": {
-    "workspace": {
-      "id": "workspace:local/demo:latest",
-      "name": "demo",
-      "project_root": "/project/demo"
-    }
-  }
-}
-```
-
-后端完成停止后发送 `workspace.stopped`（复用请求 ID）。停止失败发送
-`workspace.stop_failed`。客户端应等待成功回执后再关闭 WebSocket。
-
-Agent 消息请求：
-
-```json
-{
-  "type": "agent.message",
-  "id": "message-1",
-  "message": {
-    "workspace": {
-      "id": "workspace:local/demo:latest",
-      "name": "demo",
-      "project_root": "/project/demo"
-    },
-    "agent": "agent:demo/coder:latest",
-    "message": {
-      "content": "Review this change."
-    }
-  }
-}
-```
-
-DtoPlugin 反序列化 DTO 后直接调用 `into_domain` 发送领域事件，不再发送只复制字段的
-API 中间事件。WorkspacePlugin直接按完整`ResourceId`查找Agent并解析为ECS Entity；出站DTO再通过
-`World`将Entity投影为相同的稳定资源ID，协议不会暴露Entity。
-
-客户端通过 `agent.message` 注入对话消息，只接受两种方向：`User`（用户输入）与 `Assistant`（手工轮次，含手动 `tool_calls`，前端据此加载 Skill 与 Hook）。`Tool` 与 `Error` 属于服务端事实，注入返回 `InvalidRequest`；需要写入历史时改用 `mcl.command` 的 `INJECT` 与 `EMIT EFFECT history_append FROM ?`（前端即如此）。后端可展示消息使用
-`MessageDto`，包含 User、Assistant 和历史Tool；领域 `Message` 与 `ToolCall` 不直接进入协议字段。
-
-后端状态通过 `state.sync` 发送完整快照。前端以该快照替换业务状态，不自行持久化或从增量消息拼接
-历史。`histories` 包含可展示的 User、Assistant 和 Tool消息，不包含 System 或Skill正文。`agents`
-包含每个运行中Agent的`working`、`default_resources`、`visible_resources`以及累计输入、
-输出、缓存命中Token和缓存命中率。
-`working`表示Agent存在未结束的交互轮次，推理和工具调用期间均为`true`；客户端在该值恢复为
-`false`前不得发送下一条用户消息。
-客户端可发送`agent.turn.abort`中止当前轮次；Workspace和Agent仍按与`agent.message`相同的逻辑路由，
-具体turn ID由后端当前AgentStatus确定。
-`default_resources`来自MCL `tool.tool_default`，是用户可手动开关的集合；`visible_resources`
-来自`tool.tool_dynamic`。不在`default_resources`中的运行时可见资源只展示，不允许
-客户端开关。各字段中的资源均为规范化`type:scope/name:tag`字符串。
-
-外部控制端可以发送单条MCL命令：
+## MCL
 
 ```json
 {
   "type": "mcl.command",
   "id": "mcl-1",
   "message": {
-    "workspace": {
-      "id": "workspace:local/demo:latest",
-      "name": "demo",
-      "project_root": "/project/demo"
-    },
-    "agent": "agent:demo/coder:latest",
+    "workspace": { "id": "workspace:local/demo:latest", "name": "demo", "project_root": "/project/demo" },
+    "agent": null,
     "command": "GET msg.recent_conversation",
-    "binding": null
+    "arguments":[]
   }
 }
 ```
 
-后端使用相同ID返回`mcl.command_result`。该入口和Base Driver的`handle`共享MCL parser与事务执行器，
-一次请求只接受一条命令，不接受Lua源码。
+每个 `arguments` 项必须是数组，按顺序用于问号参数。一次请求仅一条 MCL 指令，不接受 Lua 源码。`source` 由 DTO 入口读取真实注册 Client 的资源地址，客户端不能提供。
 
-## 流式 Agent 响应
+结果仅发送到发起连接：`mcl.command_result { id, source, target, result, history_error }`。`result` 保留 Rust Result 的 `{"Ok": ...}` / `{"Err": {kind,message}}` 形状及 MclValue 类型标签。Inference 结果保留 `stop_reason`、完整 assistant 和 usage；`history_error` 独立报告执行后历史失败，不覆盖执行结果，也不表示需要重做指令。
 
-模型响应的正文分片通过 `agent.message.delta` 转发，思考分片通过
-`agent.message.reasoning_delta` 转发。两者只用于当前回复的实时渲染，不单独写入历史表，并与最终
-`agent.message` 使用相同的轮次 ID。前端为每个 Agent 保存当前轮次的思考和正文累积器，分别追加
-并渲染。
+Rust 构造 API：`ClientMessage::mcl_command(id, &workspace, agent, command, Vec<Value>)`，最后一项是 arguments，不是旧 binding。
 
-推理完成后，后端仍发送完整的 `agent.message`，用于上下文、记忆和最终校正。前端必须按轮次 ID
-将它的reasoning和content与当前累积器比较，相同则丢弃，不同则用完整消息替换当前内容。随后发送的 `state.sync` 必须
-确认同一轮次中这条完整Assistant已经进入后端历史；前端只有在reasoning、content和tool_calls都
-一致时才清空累积器并从完整历史重新渲染。
+## 消息、状态与历史
 
-完整 `agent.message` 同时是该轮流式响应的完成标记。后端必须保证同一发送目标下的所有分片先
-进入 WebSocket 发送顺序，再发送完整消息。发送器句柄可以复制，不要求分片和完整消息使用同一个
-句柄；只要两者的 `target` 相同即可。前端只屏蔽已经完成的同一轮次分片，不影响后续新轮次。流式
-状态按 `agent` 和 `id` 管理，避免不同轮次的内容互相覆盖。完整消息到达后，该轮不再接收任一类
-分片。按连接类型筛选的动态目标应在一轮响应
-开始时固定连接集合，或明确规定中途加入的连接从下一轮开始接收。
+`AgentMessageDto`（亦可用 `MessageDto` 名称）是 snake_case `type` 标签的递归消息值：`inject`、`user`、`assistant`、`tool_call`、`error`。Inject 可递归包含全部同类消息；转换限制深度 32、节点 4096、序列化大小 1 MiB，不采用旧内层白名单。Assistant 包含可选 usage；ToolCall 的 resource_id 可为 null。允许消息形状不表示网络入口有权伪造工具完成事实。
+
+`state.sync { state }` 包含 `workspaces, agents, histories`。Agent 快照包含 `workspace, agent, agent_instance, status, turn, sandbox, queued_commands, pending_command`；status 为 creating/running/stopping。历史来自 `Agent.history.list()`，不是旧实时 Memory/HistoryMessage 接口。
+
+历史消息字段为 `key, sequence, turn, kind, content, payload, created_at_ms`，payload 保留结构化消息、usage、命令及参数。**当前共享 HistoryRecord 不含持久序号与时间：sequence 是 list 顺序的 1-based 投影，created_at_ms 固定为 0，表示未知，不是真实创建时间。** `history.result { id, history }` 返回相同历史投影。
+
+推理流使用 `agent.message.delta` / `agent.message.reasoning_delta`，字段为 `id, agent, agent_instance, sequence, content`。id 是推理请求 ID，不是 turn。`agent.message.finished { id, agent, agent_instance, error }` 标记流终态；流及终态仅供渲染，MCL Result/领域 oneshot 才是操作完成权威。
+
+## 已归档的旧协议
+
+旧 `agent.message` 邮箱、`agent.turn.abort`、visibility、Workflow 入口及 `binding` 均已移除。旧 working、默认/动态可见性、AgentTokenUsage 副本与完整消息作为流完成标志的描述不再适用；本页为当前实现契约，旧行为仅属历史设计。

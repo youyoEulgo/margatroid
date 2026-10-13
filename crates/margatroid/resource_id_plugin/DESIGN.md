@@ -41,15 +41,15 @@ types      src/types.rs      ResourceID、ResourceSet和类型注册表
 error      src/error.rs      解析、注册、挂载和查询错误
 ```
 
-**本文是新的目标设计，尚未实现。** 本crate将统一原resource_id_plugin、resource_library_plugin和library_component_plugin的基础职责。统一后的插件暂称ResourcePlugin，最终crate名称另定。本文仅定义基础设施目标，不修改Rust代码。
+**统一资源基础设施已实现。** 本crate继续使用resource_id_plugin名称，对外安装ResourcePlugin，合并旧resource_library_plugin和library_component_plugin职责；旧两个crate只保留归档文档，不再是workspace成员。ResourceID、集合、trait、注册与查询基础实现均在本crate，且仅依赖core_plugin和serde，可被共享types直接依赖而无业务反向依赖。
 
 # lib
 
 ## 组件定义位置
 
-各领域图书馆组件与资源条目计划统一写入共享types crate对应的`xxx_components.rs`，本资源基础设施不再集中定义Agent、Workspace、AgentImage或工具等领域组件。
+领域图书馆组件和资源条目由共享types提供；五类条目目前组合在resource_components.rs，Agent、Workspace、Client分别有对应组件模块，本基础设施不依赖这些领域定义。
 
-统一资源插件的组件集合及trait契约（ResourceSet、ResourceInner、LibraryComponent、ResourcesComponent）计划写入共享types crate的`resource_components.rs`。Plugin只安装和登记类型；ResourceTypeRegistry、注册表数据契约、纯查询及WorldResourceExt实现下沉共享resource_components.rs，不让共享类型调用插件Handler。此处只标注源码目标位置，文档板块不移动，也尚未创建或迁移源码文件。
+ResourceSet与组件trait实际位于本crate的components.rs；ResourceID在types.rs；ResourceTypeRegistry及受检注册、查询和WorldResourceExt在handler.rs。本crate作为纯基础层不依赖业务types，Plugin只安装资源和注册表，因此共享types使用这些契约不会形成循环。
 
 ResourceID等基础值与集合契约统一归共享基础类型层；共享types不能反向依赖资源插件实现。公开trait的关联类型及方法签名只能引用公开可见契约，不引用插件私有类型。
 
@@ -98,7 +98,7 @@ ResourcesComponent：资源集合组件，公开trait--扩展已有集合契约�
 
 公开：
 ```text
-WorldResourceExt：资源管理世界扩展，公开trait--定义及纯查询/注册/受检挂载实现下沉共享resource_components.rs，不调用插件Handler
+WorldResourceExt：资源管理世界扩展，公开trait--定义及纯查询/注册/受检挂载实现位于本基础crate的handler.rs，不依赖业务插件
     register_library<C>(&mut self, resource_type: &str) -> Result<(), ResourceError>
         注册图书馆类型：公开方法，建立地址类型到具体图书馆组件类型的对应关系
         约束：C: LibraryComponent
@@ -128,6 +128,14 @@ WorldResourceExt：资源管理世界扩展，公开trait--定义及纯查询/�
     ToolResource、SkillResource、PromptResource、SandboxResource、HookResource和AgentImage属于资源条目
     资源条目通过ResourceSet<T>挂载，不把这些条目本身标为LibraryComponent
     AgentImage明确属于资源类，不再作为独立图书馆实体，不另挂旧ResourceId组件
+
+MCL目标分类（本轮尚未实现，不改变基础集合分类）：
+    IMPORT TOOL接受tool/skill/hook，IMPORT MESSAGE接受prompt，IMPORT SANDBOX接受sandbox
+    TOOL/MESSAGE/SANDBOX是MCL值能力分类，tool/skill/hook等仍使用原ResourceID类型段与具体ResourceSet
+    RESOURCE不再是目标Block字段类型，但ResourcesComponent和ResourceID基础概念不删除或改名
+    Agent.import_bindings是alias命名权威，受检导入跨集合检查冲突；本插件不新增全局alias表
+    CallableResource与SandboxValue携带所属ID及不可变共享快照，旧Block值不因集合重载自动变更
+    snapshot的resource_id是来源关联，不要求资源条目T重复保存map key；二者职责不同
 
 trait的能力边界：
     LibraryComponent要求返回自身ID，但Rust trait不能强制某个具体字段名称
@@ -162,7 +170,7 @@ ECS挂载边界：
 
 # handler
 
-本板块描述的注册、受检挂载、查询函数及其泛型辅助实现统一下沉共享resource_components.rs；板块只是文档组织，不表示共享契约依赖插件src/handler.rs。Plugin仅负责安装及调用共享注册入口。
+本板块函数及泛型辅助实现位于本基础crate的handler.rs。此crate作为共享基础层不依赖业务插件；Plugin仅负责安装资源，业务插件通过受检World入口注册领域类型。
 
 ## 函数
 
@@ -209,7 +217,7 @@ insert_resources_component<C>(world: &mut World, entity: Entity, component: C) -
         失败时不改变原有组件
 
 find_resource_entities(world: &World, id: &ResourceID) -> Result<Vec<Entity>, ResourceError>
-    查询包含地址的实体：共享基础层公开纯查询函数，定义及实现于resource_components.rs
+    查询包含地址的实体：共享基础层公开纯查询函数，定义及实现于本基础crate的handler.rs
     行为：
         插件或注册表缺失时返回PluginMissing
         按id.resource_type()查找注册项，未注册时返回TypeNotRegistered
@@ -322,7 +330,7 @@ ResourceID：资源地址值，公开结构体--不实现Component，可用于�
     tag(&self) -> &str
         读取标签：公开方法
     find_entities(&self, world: &World) -> Result<Vec<Entity>, ResourceError>
-        查询包含者：公开方法，调用共享resource_components.rs的纯查询find_resource_entities(world, self)，不引用插件Handler
+        查询包含者：公开方法，调用本基础crate的find_resource_entities(world, self)，不依赖业务Handler
     impl Clone + Debug + PartialEq + Eq + PartialOrd + Ord + Hash for ResourceID
     impl FromStr for ResourceID
         from_str(value: &str) -> Result<Self, ResourceIDError>
@@ -381,17 +389,17 @@ ResourceSet<T>：同类资源集合，公开泛型结构体--作为一个组件�
 
 crate公开：
 ```text
-ResourceTypeRegistry：资源类型注册表，公开共享Resource--定义于resource_components.rs--只保存类型关系和函数，不保存实例地址索引
+ResourceTypeRegistry：资源类型注册表，公开共享Resource--定义于本基础crate的handler.rs--只保存类型关系和函数，不保存实例地址索引
     registrations: HashMap<String, ResourceTypeRegistration>--地址类型段到具体组件注册项
     impl Resource for ResourceTypeRegistry
 
-ResourceTypeRegistration：具体组件注册项，公开共享结构体--定义于resource_components.rs
+ResourceTypeRegistration：具体组件注册项，公开共享结构体--定义于本基础crate的handler.rs
     component_type: TypeId--具体组件类型
     kind: ResourceComponentKind--图书馆或资源集合分类
     query: fn(&World, &ResourceID) -> Vec<Entity>--针对已注册具体类型生成的查询函数
     contains: fn(&World, Entity) -> bool--检查目标是否挂载该具体组件
 
-ResourceComponentKind：组件分类，公开共享枚举--定义于resource_components.rs
+ResourceComponentKind：组件分类，公开共享枚举--定义于本基础crate的handler.rs
     Library
     Resources
 ```
@@ -439,7 +447,7 @@ ResourceComponentKind：组件分类，公开共享枚举--定义于resource_com
     这些约束不靠额外身份副本或GC维持，后续实现需收紧领域写入API
 
 组件实现归属：
-    ResourceSet<T>与ResourceInner、ResourcesComponent按目标归属统一定义于共享resource_components.rs，由定义侧实现Component及集合trait
+    ResourceSet<T>与ResourceInner、ResourcesComponent实际定义于本基础crate的components.rs，由定义侧实现Component及集合trait
     业务crate不再分别为ResourceSet<ToolResource>等具体实例重复实现Component
     ToolResource等条目的alias与ResourceInner实现由共享领域components文件定义，本基础设施不依赖具体领域类型
     AgentImage本次不改，不新增alias或ResourceInner实现；ResourceSet的基本存储、get和resource_ids不要求ResourceInner，保持既有镜像集合兼容

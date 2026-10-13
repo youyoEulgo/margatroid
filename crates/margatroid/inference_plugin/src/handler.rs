@@ -1,108 +1,37 @@
 use std::collections::{HashMap, HashSet};
-use std::error::Error as StdError;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use agent_image_loader_plugin::AgentImage;
-use agent_plugin::Agent;
 use app_runtime_plugin::WorldEventExt;
-use async_runtime_plugin::WorldAsyncExt;
-use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
-use core_plugin::{Entity, Resource, World};
+use async_runtime_plugin::{AsyncTaskError, WorldAsyncExt};
+use core_plugin::{Entity, World};
 use futures_util::StreamExt;
-use margatroid_types::{CapturedInferenceResponse, Message, ResourceRef, ToolDefinition};
+use margatroid_types::agent_components::Agent;
+use margatroid_types::client_components::WorldClientExt;
+use margatroid_types::execution_components::{
+    ExecutionActivity, ExecutionActivityKind, ExecutionError,
+};
+use margatroid_types::inference_events::InferenceReply;
+use margatroid_types::message_types::{AgentMessage, ToolDefinition};
+use margatroid_types::resource_components::{
+    skill_input_schema, CallableDefinitionSnapshot, CallableResource, SkillResource, ToolResource,
+};
 use reqwest::Url;
+use resource_id_plugin::{ResourceID, ResourceSet};
 use serde::Serialize;
-use server_plugin::{
-    WebSocketConnections, WebSocketMessage, WebSocketMessageSender, WebSocketSender,
+use server_plugin::{WebSocketMessage, WebSocketMessageSender, WebSocketSender};
+use tokio_util::sync::CancellationToken;
+
+use crate::types::*;
+use crate::{InferenceConfig, InferenceError, InferenceErrorKind};
+use margatroid_types::inference_events::{
+    InferenceReloadOutput as ReloadOutput, InferenceRequest, ReloadModelRoutes,
+    ReloadModelRoutesResult,
 };
-use tokio::sync::watch;
-
-use crate::events::{
-    CancelInferenceRequest, ContextCompactionInferenceResponse, InferenceOutputKind,
-    InferenceRoute, InferenceTaskOutput, InferenceTaskResult, PreparedInference, ReloadModelRoutes,
-};
-use crate::types::{
-    ConfiguredModelRoute, ErasedProviderAdapterFactory, InferenceParameters, ModelId,
-    ModelRouteDocument, ProviderHttpRequest, ProviderInferenceResponse, ProviderInput,
-    ProviderRouteInput, ProviderStreamDelta, StopReason, WorkspaceModelRoutes,
-    WorkspaceModelRoutesRegistry, MAX_CONFIG_BYTES, MAX_ERROR_BODY_BYTES, MAX_MESSAGES_BYTES,
-    MAX_MESSAGE_BYTES, MAX_TOOL_COUNT, MAX_TOOL_DESCRIPTION_BYTES,
-};
-use crate::{GlobalModelRoutes, InferenceError, InferenceErrorKind, InferenceHttpClient};
-
-#[derive(Default)]
-pub(crate) struct InFlightInferences {
-    pub(crate) requests: HashMap<(Entity, String), watch::Sender<bool>>,
-}
-
-impl Resource for InFlightInferences {}
-
-pub(crate) struct InferenceCommand {
-    pub(crate) id: String,
-    pub(crate) agent: Entity,
-    pub(crate) agent_id: ResourceRef,
-    pub(crate) messages: Vec<Message>,
-    pub(crate) tools: Vec<ToolDefinition>,
-    pub(crate) output: InferenceOutputKind,
-}
-
-pub trait WorldInferenceExt {
-    fn reload_model_routes(&self, id: impl Into<String>);
-
-    fn load_workspace_model_routes(
-        &mut self,
-        workspace: Entity,
-        project_root: &Path,
-    ) -> Result<usize, InferenceError>;
-}
-
-impl WorldInferenceExt for World {
-    fn reload_model_routes(&self, id: impl Into<String>) {
-        self.send_event(ReloadModelRoutes { id: id.into() });
-    }
-
-    fn load_workspace_model_routes(
-        &mut self,
-        workspace: Entity,
-        project_root: &Path,
-    ) -> Result<usize, InferenceError> {
-        require_workspace(self, workspace)?;
-        let path = project_root.join(".margatroid").join("models.toml");
-        if !path.exists() {
-            self.get_resource_mut::<WorkspaceModelRoutesRegistry>()
-                .ok_or_else(|| {
-                    InferenceError::new(
-                        InferenceErrorKind::InvalidCommand,
-                        "workspace model route registry is missing",
-                    )
-                })?
-                .remove(workspace);
-            return Ok(0);
-        }
-        let factories = self
-            .get_resource::<GlobalModelRoutes>()
-            .ok_or_else(|| {
-                InferenceError::new(
-                    InferenceErrorKind::InvalidCommand,
-                    "InferencePlugin is not installed",
-                )
-            })?
-            .factories
-            .clone();
-        let routes = load_model_routes(&path, &factories)?;
-        let count = routes.len();
-        self.get_resource_mut::<WorkspaceModelRoutesRegistry>()
-            .ok_or_else(|| {
-                InferenceError::new(
-                    InferenceErrorKind::InvalidCommand,
-                    "workspace model route registry is missing",
-                )
-            })?
-            .insert(workspace, WorkspaceModelRoutes { routes });
-        Ok(count)
-    }
-}
+use margatroid_types::message_types::InferenceResponse;
 
 fn parse_context_window(value: Option<&str>) -> Result<u64, InferenceError> {
     let value = value.unwrap_or("1m").trim().to_ascii_lowercase();
@@ -149,19 +78,36 @@ pub(crate) fn load_model_routes(
     path: &Path,
     factories: &HashMap<String, ErasedProviderAdapterFactory>,
 ) -> Result<HashMap<ModelId, ConfiguredModelRoute>, InferenceError> {
-    let source = fs::read_to_string(path).map_err(|_| {
-        InferenceError::new(
-            InferenceErrorKind::ConfigReadFailed,
-            "model route configuration could not be read",
-        )
-    })?;
+    let source = read_model_source(path)?;
+    compile_model_routes(&source, factories)
+}
+
+fn read_model_source(path: &Path) -> Result<String, InferenceError> {
+    let mut source = String::new();
+    fs::File::open(path)
+        .and_then(|file| {
+            file.take((MAX_CONFIG_BYTES + 1) as u64)
+                .read_to_string(&mut source)
+        })
+        .map_err(|_| {
+            InferenceError::new(
+                InferenceErrorKind::ConfigReadFailed,
+                "model route configuration could not be read",
+            )
+        })?;
     if source.len() > MAX_CONFIG_BYTES {
         return Err(InferenceError::new(
             InferenceErrorKind::ConfigReadFailed,
             "model route configuration exceeds the size limit",
         ));
     }
-    compile_model_routes(&source, factories)
+    toml::from_str::<ModelRouteDocument>(&source).map_err(|_| {
+        InferenceError::new(
+            InferenceErrorKind::ConfigDecodeFailed,
+            "model route configuration could not be decoded",
+        )
+    })?;
+    Ok(source)
 }
 
 fn compile_model_routes(
@@ -237,397 +183,6 @@ fn compile_model_routes(
     Ok(routes)
 }
 
-fn require_workspace(world: &World, workspace: Entity) -> Result<(), InferenceError> {
-    if world.is_alive(workspace) {
-        Ok(())
-    } else {
-        Err(InferenceError::new(
-            InferenceErrorKind::AgentNotAlive,
-            "workspace entity is not alive",
-        ))
-    }
-}
-
-pub(crate) fn handle_reload_model_routes(
-    world: &mut World,
-    request: crate::events::ReloadModelRoutes,
-) {
-    let result = if request.id.is_empty() {
-        Err(InferenceError::new(
-            InferenceErrorKind::InvalidCommand,
-            "route reload ID cannot be empty",
-        ))
-    } else {
-        world
-            .get_resource_mut::<GlobalModelRoutes>()
-            .ok_or_else(|| {
-                InferenceError::new(
-                    InferenceErrorKind::InvalidCommand,
-                    "InferencePlugin is not installed",
-                )
-            })
-            .and_then(GlobalModelRoutes::reload)
-            .map(|route_count| crate::types::ModelRoutesReloaded { route_count })
-    };
-    world.send_event(crate::events::ReloadModelRoutesResult {
-        id: request.id,
-        result,
-    });
-}
-
-pub(crate) fn handle_prepare_inference(world: &mut World, command: InferenceCommand) {
-    match prepare_inference(world, command) {
-        Ok(prepared) => world.send_async_event(prepared),
-        Err((route, error)) => {
-            let events = world.event_sender();
-            publish_inference_error(&events, route, error);
-        }
-    }
-}
-
-fn prepare_inference(
-    world: &mut World,
-    command: InferenceCommand,
-) -> Result<PreparedInference, (InferenceRoute, InferenceError)> {
-    let route = InferenceRoute {
-        id: command.id.clone(),
-        agent: command.agent,
-        output: command.output,
-    };
-    if command.id.is_empty() || command.agent_id.resource_type() != "agent" {
-        return Err((
-            route,
-            InferenceError::new(
-                InferenceErrorKind::InvalidCommand,
-                "inference request and Agent IDs must be valid",
-            ),
-        ));
-    }
-    if !world.is_alive(command.agent) {
-        return Err((
-            route,
-            InferenceError::new(
-                InferenceErrorKind::AgentNotAlive,
-                "agent entity is not alive",
-            ),
-        ));
-    }
-    validate_messages(&command.messages).map_err(|error| (route.clone(), error))?;
-    validate_tools(&command.tools).map_err(|error| (route.clone(), error))?;
-    let agent = world.get_component::<Agent>(command.agent).ok_or_else(|| {
-        (
-            route.clone(),
-            InferenceError::new(
-                InferenceErrorKind::InferenceSnapshotMissing,
-                "agent inference snapshot is missing",
-            ),
-        )
-    })?;
-    let image = world
-        .get_component::<AgentImage>(agent.info.image_entity)
-        .ok_or_else(|| {
-            (
-                route.clone(),
-                InferenceError::new(
-                    InferenceErrorKind::InferenceSnapshotMissing,
-                    "agent source image is missing",
-                ),
-            )
-        })?;
-    let model = ModelId::new(agent.info.model.model.clone()).map_err(|error| {
-        (
-            route.clone(),
-            InferenceError::new(InferenceErrorKind::InvalidModelId, error.to_string()),
-        )
-    })?;
-    let parameters = InferenceParameters::new(
-        image.model().parameters().temperature(),
-        image.model().parameters().max_output_tokens(),
-        image.model().parameters().top_p(),
-        image.model().parameters().stop().to_vec(),
-    );
-    parameters
-        .validate()
-        .map_err(|error| (route.clone(), error))?;
-    let workspace = agent.info.workspace_id;
-    let model_route = world
-        .get_resource::<WorkspaceModelRoutesRegistry>()
-        .and_then(|registry| registry.get(workspace))
-        .and_then(|routes| routes.get(&model))
-        .or_else(|| {
-            world
-                .get_resource::<GlobalModelRoutes>()
-                .and_then(|routes| routes.get(&model))
-        })
-        .ok_or_else(|| {
-            (
-                route.clone(),
-                InferenceError::new(
-                    InferenceErrorKind::ModelRouteNotFound,
-                    format!("model route `{}` was not found", model),
-                ),
-            )
-        })?;
-    let adapter = model_route.adapter().clone();
-    let request = adapter
-        .build_request(ProviderInput::new(
-            model_route.model(),
-            &parameters,
-            &command.messages,
-            &command.tools,
-        ))
-        .map_err(|error| (route.clone(), error))?;
-    let client = world
-        .get_resource::<InferenceHttpClient>()
-        .ok_or_else(|| {
-            (
-                route.clone(),
-                InferenceError::new(
-                    InferenceErrorKind::InvalidCommand,
-                    "inference HTTP client is missing",
-                ),
-            )
-        })?
-        .client
-        .clone();
-    let senders = match route.output {
-        InferenceOutputKind::MclReply => {
-            let targets = world
-                .get_resource::<MargatroidConfig>()
-                .ok_or_else(|| {
-                    (
-                        route.clone(),
-                        InferenceError::new(
-                            InferenceErrorKind::InvalidCommand,
-                            "global configuration is missing",
-                        ),
-                    )
-                })?
-                .streaming_member_messages();
-            let connections = world
-                .get_resource::<WebSocketConnections>()
-                .ok_or_else(|| {
-                    (
-                        route.clone(),
-                        InferenceError::new(
-                            InferenceErrorKind::InvalidCommand,
-                            "WebSocket connection registry is missing",
-                        ),
-                    )
-                })?;
-            resolve_websocket_targets(connections, targets)
-        }
-        InferenceOutputKind::ContextCompaction | InferenceOutputKind::Captured => Vec::new(),
-    };
-    let (cancellation_sender, cancellation) = watch::channel(false);
-    world
-        .get_resource_mut::<InFlightInferences>()
-        .expect("InferencePlugin is installed")
-        .requests
-        .insert((route.agent, route.id.clone()), cancellation_sender);
-    Ok(PreparedInference {
-        route,
-        agent_id: command.agent_id,
-        client,
-        request,
-        adapter,
-        senders,
-        cancellation,
-    })
-}
-
-pub(crate) fn handle_cancel_inference(world: &mut World, cancellation: CancelInferenceRequest) {
-    let in_flight = world
-        .get_resource_mut::<InFlightInferences>()
-        .expect("InferencePlugin is installed");
-    if let Some(sender) = in_flight
-        .requests
-        .get(&(cancellation.agent, cancellation.id))
-    {
-        sender.send_replace(true);
-    }
-}
-
-fn resolve_websocket_targets(
-    connections: &WebSocketConnections,
-    targets: &[WebSocketMessageTarget],
-) -> Vec<WebSocketSender> {
-    let mut seen = HashSet::new();
-    targets
-        .iter()
-        .flat_map(|target| match target {
-            WebSocketMessageTarget::Broadcast => connections.get_all(),
-            WebSocketMessageTarget::Type(connection_type) => {
-                connections.get_by_type(connection_type)
-            }
-            WebSocketMessageTarget::Name(name) => {
-                connections.get_by_name(name).into_iter().collect()
-            }
-        })
-        .filter(|sender| seen.insert(sender.connection_id()))
-        .collect()
-}
-fn validate_messages(messages: &[Message]) -> Result<(), InferenceError> {
-    if messages.is_empty() {
-        return Err(InferenceError::new(
-            InferenceErrorKind::InvalidMessages,
-            "inference messages cannot be empty",
-        ));
-    }
-    let mut total_bytes = 0usize;
-    for message in messages {
-        let size = match message {
-            Message::System { content } | Message::User { content } => content.len(),
-            Message::Error { message } => message.len(),
-            Message::Assistant {
-                reasoning,
-                content,
-                tool_calls,
-            } => {
-                reasoning.as_deref().unwrap_or("").len()
-                    + content.as_deref().unwrap_or("").len()
-                    + tool_calls
-                        .iter()
-                        .map(|call| call.id.len() + call.tool_name.len() + call.arguments.len())
-                        .sum::<usize>()
-            }
-            Message::Inject { .. } => {
-                return Err(InferenceError::new(
-                    InferenceErrorKind::InvalidMessages,
-                    "an inject wrapper must be expanded before inference",
-                ))
-            }
-            Message::Tool {
-                tool_call_id,
-                content,
-                ..
-            } => {
-                if tool_call_id.is_empty() {
-                    return Err(InferenceError::new(
-                        InferenceErrorKind::InvalidMessages,
-                        "tool message call ID cannot be empty",
-                    ));
-                }
-                tool_call_id.len() + content.len()
-            }
-        };
-        if size > MAX_MESSAGE_BYTES {
-            return Err(InferenceError::new(
-                InferenceErrorKind::InvalidMessages,
-                "one inference message exceeds the size limit",
-            ));
-        }
-        total_bytes = total_bytes.saturating_add(size);
-        if total_bytes > MAX_MESSAGES_BYTES {
-            return Err(InferenceError::new(
-                InferenceErrorKind::InvalidMessages,
-                "inference messages exceed the total size limit",
-            ));
-        }
-        if let Message::Assistant {
-            content,
-            tool_calls,
-            ..
-        } = message
-        {
-            if content.is_none() && tool_calls.is_empty() {
-                return Err(InferenceError::new(
-                    InferenceErrorKind::InvalidMessages,
-                    "assistant message must contain content or tool calls",
-                ));
-            }
-            for call in tool_calls {
-                if call.id.is_empty() {
-                    return Err(InferenceError::new(
-                        InferenceErrorKind::InvalidMessages,
-                        "assistant tool call ID and name cannot be empty",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-fn validate_tools(tools: &[ToolDefinition]) -> Result<(), InferenceError> {
-    if tools.len() > MAX_TOOL_COUNT {
-        return Err(InferenceError::new(
-            InferenceErrorKind::InvalidToolDefinitions,
-            "inference tool count exceeds the limit",
-        ));
-    }
-    let mut names = HashSet::new();
-    for tool in tools {
-        if tool.name.is_empty()
-            || tool.name.len() > 64
-            || !tool
-                .name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-            || tool.description.trim().is_empty()
-            || tool.description.len() > MAX_TOOL_DESCRIPTION_BYTES
-            || !tool.input_schema.is_object()
-            || !names.insert(tool.name.clone())
-        {
-            return Err(InferenceError::new(
-                InferenceErrorKind::InvalidToolDefinitions,
-                "inference tool definitions are invalid or duplicated",
-            ));
-        }
-    }
-    Ok(())
-}
-pub(crate) async fn run_provider(
-    prepared: PreparedInference,
-) -> Result<ProviderInferenceResponse, InferenceError> {
-    let endpoint = safe_endpoint(&prepared.request.url);
-    let response = send_provider_request(&prepared.client, prepared.request).await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = read_bounded_body(response, MAX_ERROR_BODY_BYTES).await;
-        let detail = provider_error_detail(&body)
-            .map(|detail| format!("inference provider rejected the request: {detail}"))
-            .unwrap_or_else(|| "inference provider returned an empty error response".into());
-        return Err(InferenceError::with_status(
-            InferenceErrorKind::ResponseStatus,
-            Some(status.as_u16()),
-            detail,
-        ));
-    }
-    let headers = response.headers().clone();
-    let mut accumulator = prepared.adapter.begin_response(status, &headers)?;
-    let mut body = response.bytes_stream();
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|error| {
-            InferenceError::new(
-                InferenceErrorKind::RequestFailed,
-                format!(
-                    "inference response stream failed at {endpoint}: {}",
-                    summarize_reqwest_error(&error)
-                ),
-            )
-        })?;
-        for delta in accumulator.push(&chunk)? {
-            send_stream_delta(
-                &prepared.senders,
-                &prepared.route.id,
-                &prepared.agent_id,
-                delta,
-            )
-            .await?;
-        }
-    }
-    let (response, deltas) = accumulator.finish()?;
-    for delta in deltas {
-        send_stream_delta(
-            &prepared.senders,
-            &prepared.route.id,
-            &prepared.agent_id,
-            delta,
-        )
-        .await?;
-    }
-    Ok(response)
-}
 async fn send_provider_request(
     client: &reqwest::Client,
     request: ProviderHttpRequest,
@@ -647,48 +202,6 @@ async fn send_provider_request(
     })
 }
 
-#[derive(Serialize)]
-struct AgentMessageDeltaFrame<'a> {
-    #[serde(rename = "type")]
-    message_type: &'static str,
-    id: &'a str,
-    agent: &'a ResourceRef,
-    content: &'a str,
-}
-async fn send_stream_delta(
-    senders: &[WebSocketSender],
-    id: &str,
-    agent: &ResourceRef,
-    delta: ProviderStreamDelta,
-) -> Result<(), InferenceError> {
-    let (message_type, content) = match &delta {
-        ProviderStreamDelta::Reasoning(content) => {
-            ("agent.message.reasoning_delta", content.as_str())
-        }
-        ProviderStreamDelta::Content(content) => ("agent.message.delta", content.as_str()),
-    };
-    let encoded = serde_json::to_string(&AgentMessageDeltaFrame {
-        message_type,
-        id,
-        agent,
-        content,
-    })
-    .map_err(|_| {
-        InferenceError::new(
-            InferenceErrorKind::ResponseEncodeFailed,
-            "inference stream message could not be encoded",
-        )
-    })?;
-    let active = senders
-        .iter()
-        .filter(|sender| !sender.is_closed())
-        .cloned()
-        .collect::<Vec<_>>();
-    WebSocketMessageSender::new(active, WebSocketMessage::Text(encoded.into()))
-        .send()
-        .await;
-    Ok(())
-}
 fn safe_endpoint(url: &Url) -> String {
     url.origin().ascii_serialization()
 }
@@ -706,16 +219,7 @@ pub(crate) fn summarize_reqwest_error(error: &reqwest::Error) -> String {
     } else {
         "HTTP transport failed"
     };
-    let mut source = StdError::source(error);
-    let mut deepest = None;
-    while let Some(current) = source {
-        deepest = Some(current.to_string());
-        source = current.source();
-    }
-    match deepest.filter(|detail| !detail.trim().is_empty()) {
-        Some(detail) => format!("{category}: {}", single_line(&detail)),
-        None => category.into(),
-    }
+    category.into()
 }
 fn provider_error_detail(body: &[u8]) -> Option<String> {
     if body.is_empty() {
@@ -763,244 +267,1388 @@ async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Vec<u8>
     body
 }
 
-pub(crate) fn handle_inference_task_output(world: &mut World, output: InferenceTaskOutput) {
-    let cancelled = world
-        .get_resource_mut::<InFlightInferences>()
-        .expect("InferencePlugin is installed")
-        .requests
-        .remove(&(output.route.agent, output.route.id.clone()))
-        .is_some_and(|sender| *sender.borrow());
-    if cancelled || matches!(output.result, InferenceTaskResult::Cancelled) {
-        return;
-    }
-    let InferenceTaskResult::Completed(result) = &output.result else {
-        unreachable!();
-    };
-    let events = world.event_sender();
-    match result {
-        Ok(response) => match output.route.output {
-            InferenceOutputKind::MclReply => {
-                let result = if response.content.is_none() && response.tool_calls.is_empty() {
-                    Err("inference response contains neither content nor tool calls".to_owned())
-                } else {
-                    Ok(Message::Assistant {
-                        reasoning: response.reasoning.clone(),
-                        content: response.content.clone(),
-                        tool_calls: response.tool_calls.clone(),
-                    })
-                };
-                events.send_event(margatroid_types::MclEffectReply {
-                    id: output.route.id.clone(),
-                    agent: output.route.agent,
-                    result,
-                    usage: response.usage.clone(),
-                });
-            }
-            InferenceOutputKind::ContextCompaction => {
-                let result = context_compaction_content(response);
-                events.send_event(ContextCompactionInferenceResponse {
-                    id: output.route.id.clone(),
-                    agent: output.route.agent,
-                    result,
-                });
-            }
-            InferenceOutputKind::Captured => {
-                let result = context_compaction_content(response);
-                events.send_event(CapturedInferenceResponse {
-                    id: output.route.id.clone(),
-                    agent: output.route.agent,
-                    result: result.map_err(|error| error.to_string()),
-                });
-            }
-        },
-        Err(error) => publish_inference_error(&events, output.route.clone(), error.clone()),
+struct PreparedInference {
+    #[cfg(test)]
+    terminal_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    id: String,
+    agent_id: ResourceID,
+    agent_instance: String,
+    client: reqwest::Client,
+    request: ProviderHttpRequest,
+    adapter: ErasedProviderAdapter,
+    tool_names: HashSet<String>,
+    senders: Vec<WebSocketSender>,
+    cancel: CancellationToken,
+    reply: InferenceReply,
+}
+
+fn complete(reply: &InferenceReply, result: Result<InferenceResponse, InferenceError>) {
+    if let Some(sender) = reply.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = sender.send(result);
     }
 }
 
-fn context_compaction_content(
-    response: &ProviderInferenceResponse,
-) -> Result<String, InferenceError> {
-    if response.stop_reason != StopReason::Completed {
+struct TaskGuard {
+    activity: ExecutionActivity,
+    reply: InferenceReply,
+    finished: bool,
+    started: bool,
+}
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if self.started {
+            self.activity
+                .mark_cleanup_failed(ExecutionError::CleanupFailed {
+                    activity_id: self.activity.id,
+                    message: "inference task dropped before cleanup proof".into(),
+                });
+        } else if let Err(error) = self.activity.rollback_submission() {
+            self.activity.mark_cleanup_failed(error);
+        }
+        complete(
+            &self.reply,
+            Err(InferenceError::new(
+                if self.started {
+                    InferenceErrorKind::TaskAborted
+                } else {
+                    InferenceErrorKind::SubmitFailed
+                },
+                "inference task did not finish",
+            )),
+        );
+    }
+}
+
+pub(crate) fn handle_inference(world: &mut World, mut request: InferenceRequest) {
+    let sender = request
+        .reply
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    let Some(sender) = sender else {
+        return;
+    };
+    request.reply = Arc::new(Mutex::new(Some(sender)));
+    let reply = request.reply.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prepare_inference(world, request)
+    }))
+    .unwrap_or_else(|_| {
+        Err(InferenceError::new(
+            InferenceErrorKind::TaskPanicked,
+            "inference preparation panicked",
+        ))
+    });
+    let (prepared, activity) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            complete(&reply, Err(error));
+            return;
+        }
+    };
+    let schedule = world
+        .get_resource::<InferenceConfig>()
+        .unwrap()
+        .schedule
+        .clone();
+    let submit_reply = reply.clone();
+    let guard = TaskGuard {
+        activity,
+        reply,
+        finished: false,
+        started: false,
+    };
+    let submit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        world.send_async_closure(&schedule, move || async move {
+            execute_inference(prepared, guard).await;
+            Ok::<(), AsyncTaskError>(())
+        });
+    }));
+    if submit.is_err() {
+        complete(
+            &submit_reply,
+            Err(InferenceError::new(
+                InferenceErrorKind::SubmitFailed,
+                "inference submission failed",
+            )),
+        );
+    }
+}
+
+fn prepare_inference(
+    world: &World,
+    request: InferenceRequest,
+) -> Result<(PreparedInference, ExecutionActivity), InferenceError> {
+    if request.id.trim().is_empty()
+        || request.id.len() > 256
+        || request.id.chars().any(char::is_control)
+    {
         return Err(InferenceError::new(
-            InferenceErrorKind::ResponseIncomplete,
-            "context compaction inference did not complete normally",
+            InferenceErrorKind::InvalidRequest,
+            "invalid inference request ID",
         ));
     }
-    if !response.tool_calls.is_empty() {
+    if request.cancel.is_cancelled() {
         return Err(InferenceError::new(
-            InferenceErrorKind::ResponseIncomplete,
-            "context compaction inference returned tool calls",
+            InferenceErrorKind::Cancelled,
+            "inference cancelled before preparation",
         ));
     }
-    let content = response
-        .content
-        .as_deref()
-        .map(str::trim)
-        .filter(|content| !content.is_empty())
-        .ok_or_else(|| {
+    if !world.is_alive(request.agent) {
+        return Err(InferenceError::new(
+            InferenceErrorKind::AgentNotAlive,
+            "agent instance is not alive",
+        ));
+    }
+    let agent = world.get_component::<Agent>(request.agent).ok_or_else(|| {
+        InferenceError::new(InferenceErrorKind::AgentMissing, "agent component missing")
+    })?;
+    let config = world.get_resource::<InferenceConfig>().ok_or_else(|| {
+        InferenceError::new(
+            InferenceErrorKind::PreparationFailed,
+            "inference plugin missing",
+        )
+    })?;
+    let model = ModelId::new(agent.info.model.model.clone())?;
+    let route = config.routes.get(&model).ok_or_else(|| {
+        InferenceError::new(
+            InferenceErrorKind::ModelRouteNotFound,
+            "model route not found",
+        )
+    })?;
+    let parameters = InferenceParameters::new(
+        agent.info.model.temperature,
+        agent.info.model.max_output_tokens,
+        agent.info.model.top_p,
+        agent.info.model.stop.clone(),
+    );
+    parameters.validate()?;
+    let tools = collect_tool_definitions(world, request.agent, &request.tools)?;
+    let messages = normalize_messages(request.messages)?;
+    let encoded = route.adapter.build_request(ProviderInput::new(
+        route.model(),
+        &parameters,
+        &messages,
+        &tools,
+    ))?;
+    let mut seen = HashSet::new();
+    let senders = world
+        .client_webui_senders()
+        .into_iter()
+        .filter(|s| !s.is_closed() && seen.insert(s.connection_id()))
+        .collect();
+    let activity = agent
+        .execution
+        .register(ExecutionActivityKind::Inference)
+        .map_err(|e| InferenceError::new(InferenceErrorKind::Cancelled, e.to_string()))?;
+
+    let prepared = PreparedInference {
+        #[cfg(test)]
+        terminal_gate: None,
+        id: request.id,
+        agent_id: agent.resourceid.clone(),
+        agent_instance: format!("{:?}", request.agent),
+        client: config.client.clone(),
+        request: encoded,
+        adapter: route.adapter.clone(),
+        tool_names: tools.into_iter().map(|t| t.name).collect(),
+        senders,
+        cancel: request.cancel,
+        reply: request.reply,
+    };
+    Ok((prepared, activity))
+}
+
+fn collect_tool_definitions(
+    world: &World,
+    agent: Entity,
+    visible: &[CallableResource],
+) -> Result<Vec<ToolDefinition>, InferenceError> {
+    let mut tools = Vec::new();
+    for selected in visible {
+        validate_owner(world, agent, &selected.resource_id)?;
+        let (description, input_schema) =
+            match (&*selected.definition, selected.resource_id.resource_type()) {
+                (CallableDefinitionSnapshot::Tool(resource), "tool") => {
+                    (resource.description.clone(), resource.input_schema.clone())
+                }
+                (CallableDefinitionSnapshot::Skill(resource), "skill") => {
+                    (resource.description.clone(), skill_input_schema())
+                }
+                (CallableDefinitionSnapshot::Hook(resource), "hook") => {
+                    (resource.description.clone(), resource.input_schema.clone())
+                }
+                _ => {
+                    return Err(InferenceError::new(
+                        InferenceErrorKind::UnsupportedResource,
+                        "snapshot kind does not match resource identity",
+                    ))
+                }
+            };
+        tools.push(ToolDefinition {
+            name: selected.alias.clone(),
+            description,
+            input_schema,
+        });
+    }
+    validate_tools(&tools)?;
+    Ok(tools)
+}
+
+fn validate_owner(world: &World, agent: Entity, id: &ResourceID) -> Result<(), InferenceError> {
+    use margatroid_types::resource_components::HookResource;
+    let present = match id.resource_type() {
+        "tool" => world
+            .get_component::<ResourceSet<ToolResource>>(agent)
+            .is_some_and(|set| set.get(id).is_some()),
+        "skill" => world
+            .get_component::<ResourceSet<SkillResource>>(agent)
+            .is_some_and(|set| set.get(id).is_some()),
+        "hook" => world
+            .get_component::<ResourceSet<HookResource>>(agent)
+            .is_some_and(|set| set.get(id).is_some()),
+        _ => {
+            return Err(InferenceError::new(
+                InferenceErrorKind::UnsupportedResource,
+                "resource is not callable",
+            ))
+        }
+    };
+    if !present {
+        return Err(InferenceError::new(
+            InferenceErrorKind::ResourceMissing,
+            "resource not loaded on target agent",
+        ));
+    }
+    let owner = world.get_component::<Agent>(agent).ok_or_else(|| {
+        InferenceError::new(
+            InferenceErrorKind::ResourceMissing,
+            "resource owner missing",
+        )
+    })?;
+    if !owner.info.image_dependencies.contains(id)
+        || !owner
+            .import_bindings
+            .contains_resource(id, margatroid_types::block_types::InnerType::Tool)
+    {
+        return Err(InferenceError::new(
+            InferenceErrorKind::ResourceMissing,
+            "resource is not imported or permitted for target agent",
+        ));
+    }
+    Ok(())
+}
+
+fn has_external_reference(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+            (key == "$ref"
+                && value
+                    .as_str()
+                    .is_some_and(|reference| !reference.starts_with('#')))
+                || has_external_reference(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(has_external_reference),
+        _ => false,
+    }
+}
+
+fn validate_tools(tools: &[ToolDefinition]) -> Result<(), InferenceError> {
+    if tools.len() > MAX_TOOL_COUNT {
+        return Err(InferenceError::new(
+            InferenceErrorKind::InvalidToolDefinitions,
+            "too many tools",
+        ));
+    }
+    let mut names = HashSet::new();
+    for tool in tools {
+        if tool.name.is_empty()
+            || tool.name.len() > 64
+            || !tool
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            || tool.description.trim().is_empty()
+            || tool.description.len() > MAX_TOOL_DESCRIPTION_BYTES
+            || !tool.input_schema.is_object()
+            || tool.input_schema.get("type").and_then(|v| v.as_str()) != Some("object")
+            || has_external_reference(&tool.input_schema)
+            || jsonschema::validator_for(&tool.input_schema).is_err()
+            || !names.insert(tool.name.clone())
+        {
+            return Err(InferenceError::new(
+                InferenceErrorKind::InvalidToolDefinitions,
+                "invalid or duplicate tool definition",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_messages(messages: Vec<AgentMessage>) -> Result<Vec<ProviderMessage>, InferenceError> {
+    fn expand(
+        messages: Vec<AgentMessage>,
+        depth: usize,
+        out: &mut Vec<ProviderMessage>,
+        bytes: &mut usize,
+    ) -> Result<(), InferenceError> {
+        if depth > 32 {
+            return Err(InferenceError::new(
+                InferenceErrorKind::InvalidMessages,
+                "inject nesting too deep",
+            ));
+        }
+        for message in messages {
+            if let AgentMessage::Inject { messages } = message {
+                expand(messages, depth + 1, out, bytes)?;
+                continue;
+            }
+            let size = serde_json::to_vec(&message)
+                .map_err(|_| {
+                    InferenceError::new(
+                        InferenceErrorKind::InvalidMessages,
+                        "message cannot be encoded",
+                    )
+                })?
+                .len();
+            *bytes = bytes.saturating_add(size);
+            if size > MAX_MESSAGE_BYTES || *bytes > MAX_MESSAGES_BYTES || out.len() >= 4096 {
+                return Err(InferenceError::new(
+                    InferenceErrorKind::InvalidMessages,
+                    "message size or count exceeds limit",
+                ));
+            }
+            out.push(match message {
+                AgentMessage::System { content } => ProviderMessage::System { content },
+                AgentMessage::User { content } => ProviderMessage::User { content },
+                AgentMessage::Error { message } => ProviderMessage::Error { message },
+                AgentMessage::Assistant {
+                    reasoning,
+                    content,
+                    tool_calls,
+                    ..
+                } => ProviderMessage::Assistant {
+                    reasoning,
+                    content,
+                    tool_calls,
+                },
+                AgentMessage::ToolCall {
+                    tool_call_id,
+                    content,
+                    ..
+                } => ProviderMessage::Tool {
+                    tool_call_id,
+                    content,
+                },
+                AgentMessage::Inject { .. } => unreachable!(),
+            });
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    expand(messages, 0, &mut out, &mut 0)?;
+    if out.is_empty() {
+        return Err(InferenceError::new(
+            InferenceErrorKind::InvalidMessages,
+            "empty inference messages",
+        ));
+    }
+    let mut pending = HashSet::new();
+    let mut ids = HashSet::new();
+    for message in &out {
+        match message {
+            ProviderMessage::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                if !pending.is_empty() || (content.is_none() && tool_calls.is_empty()) {
+                    return Err(InferenceError::new(
+                        InferenceErrorKind::InvalidMessages,
+                        "invalid assistant tool history",
+                    ));
+                }
+                for call in tool_calls {
+                    if call.id.is_empty()
+                        || call.tool_name.is_empty()
+                        || !ids.insert(call.id.clone())
+                        || !serde_json::from_str::<serde_json::Value>(&call.arguments)
+                            .is_ok_and(|v| v.is_object())
+                    {
+                        return Err(InferenceError::new(
+                            InferenceErrorKind::InvalidMessages,
+                            "invalid assistant tool call",
+                        ));
+                    }
+                    pending.insert(call.id.clone());
+                }
+            }
+            ProviderMessage::Tool { tool_call_id, .. } => {
+                if !pending.remove(tool_call_id) {
+                    return Err(InferenceError::new(
+                        InferenceErrorKind::InvalidMessages,
+                        "orphan or duplicate tool result",
+                    ));
+                }
+            }
+            _ if !pending.is_empty() => {
+                return Err(InferenceError::new(
+                    InferenceErrorKind::InvalidMessages,
+                    "tool calls lack adjacent results",
+                ))
+            }
+            _ => {}
+        }
+    }
+    if !pending.is_empty() {
+        return Err(InferenceError::new(
+            InferenceErrorKind::InvalidMessages,
+            "tool calls lack results",
+        ));
+    }
+    Ok(out)
+}
+
+async fn receiver_closed(reply: &InferenceReply) {
+    loop {
+        if reply
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_none_or(|sender| sender.is_closed())
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn execute_inference(prepared: PreparedInference, guard: TaskGuard) {
+    let owner_cancel = CancellationToken::new();
+    let owner_drop = owner_cancel.clone().drop_guard();
+    let supervisor = tokio::spawn(supervise_inference(prepared, guard, owner_cancel));
+    let _ = supervisor.await;
+    owner_drop.disarm();
+}
+
+async fn supervise_inference(
+    prepared: PreparedInference,
+    mut guard: TaskGuard,
+    owner_cancel: CancellationToken,
+) {
+    if let Err(error) = guard.activity.mark_started() {
+        complete(
+            &guard.reply,
+            Err(InferenceError::new(
+                InferenceErrorKind::ExecutionFailed,
+                error.to_string(),
+            )),
+        );
+        return;
+    }
+    guard.started = true;
+    let reply = prepared.reply.clone();
+    let cancel = prepared.cancel.clone();
+    let child = guard.activity.cancel.clone();
+    let terminal_senders = prepared.senders.clone();
+    let terminal_id = prepared.id.clone();
+    let terminal_agent = prepared.agent_id.clone();
+    let terminal_instance = prepared.agent_instance.clone();
+    #[cfg(test)]
+    let terminal_gate = prepared.terminal_gate.clone();
+    let mut worker = tokio::spawn(run_provider(prepared));
+    let mut joined = false;
+    let mut result = tokio::select! {
+        biased;
+        _ = owner_cancel.cancelled() => Err(InferenceError::new(InferenceErrorKind::TaskAborted, "inference owner aborted")),
+        _ = child.cancelled() => Err(InferenceError::new(InferenceErrorKind::Cancelled, "agent execution cancelled")),
+        _ = cancel.cancelled() => Err(InferenceError::new(InferenceErrorKind::Cancelled, "inference request cancelled")),
+        _ = receiver_closed(&reply) => Err(InferenceError::new(InferenceErrorKind::ResponseLost, "inference receiver closed")),
+        _ = tokio::time::sleep(Duration::from_secs(180)) => Err(InferenceError::new(InferenceErrorKind::Timeout, "inference request timed out")),
+        result = &mut worker => {
+            joined = true;
+            result.unwrap_or_else(|error| Err(InferenceError::new(if error.is_panic() { InferenceErrorKind::TaskPanicked } else { InferenceErrorKind::TaskAborted }, "inference HTTP worker stopped")))
+        },
+    };
+    if !joined {
+        worker.abort();
+        let _ = worker.await;
+    }
+    {
+        let terminal = async {
+            #[cfg(test)]
+            if let Some((entered, release)) = terminal_gate {
+                entered.notify_one();
+                release.notified().await;
+            }
+            push_finished(
+                terminal_senders,
+                &terminal_id,
+                &terminal_agent,
+                &terminal_instance,
+                result.as_ref().err(),
+            )
+            .await;
+        };
+        tokio::pin!(terminal);
+        let terminal_aborted = tokio::select! {
+            biased;
+            _ = owner_cancel.cancelled() => true,
+            _ = &mut terminal => false,
+        };
+        if terminal_aborted {
+            drop(terminal);
+        }
+    }
+    if owner_cancel.is_cancelled() {
+        result = Err(InferenceError::new(
+            InferenceErrorKind::TaskAborted,
+            "inference owner aborted",
+        ));
+    }
+    match guard.activity.mark_completed() {
+        Ok(()) => {
+            guard.finished = true;
+            complete(&reply, result);
+        }
+        Err(error) => {
+            guard.activity.mark_cleanup_failed(error.clone());
+            complete(
+                &reply,
+                Err(InferenceError::new(
+                    InferenceErrorKind::ExecutionFailed,
+                    error.to_string(),
+                )),
+            );
+        }
+    }
+}
+
+async fn run_provider(
+    mut prepared: PreparedInference,
+) -> Result<InferenceResponse, InferenceError> {
+    let response = send_provider_request(&prepared.client, prepared.request).await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = read_bounded_body(response, MAX_ERROR_BODY_BYTES).await;
+        return Err(InferenceError::with_status(
+            InferenceErrorKind::ResponseStatus,
+            Some(status.as_u16()),
+            provider_error_detail(&body).unwrap_or_else(|| "provider rejected request".into()),
+        ));
+    }
+    let mut accumulator = prepared
+        .adapter
+        .begin_response(status, response.headers())?;
+    let mut body = response.bytes_stream();
+    let mut bytes = 0usize;
+    let mut sequence = 0u64;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|_| {
             InferenceError::new(
                 InferenceErrorKind::ResponseIncomplete,
-                "context compaction inference returned no summary content",
+                "provider stream disconnected",
             )
         })?;
-    Ok(content.to_owned())
-}
-pub(crate) fn publish_inference_error(
-    events: &app_runtime_plugin::RuntimeEventSender,
-    route: InferenceRoute,
-    error: InferenceError,
-) {
-    match route.output {
-        InferenceOutputKind::ContextCompaction => {
-            events.send_event(ContextCompactionInferenceResponse {
-                id: route.id,
-                agent: route.agent,
-                result: Err(error),
-            })
+        bytes = bytes.saturating_add(chunk.len());
+        if bytes > 32 * 1024 * 1024 {
+            return Err(InferenceError::new(
+                InferenceErrorKind::ResponseTooLarge,
+                "provider response exceeds limit",
+            ));
         }
-        InferenceOutputKind::MclReply => events.send_event(margatroid_types::MclEffectReply {
-            id: route.id,
-            agent: route.agent,
-            result: Err(error.to_string()),
-            usage: None,
-        }),
-        InferenceOutputKind::Captured => {
-            events.send_event(margatroid_types::CapturedInferenceResponse {
-                id: route.id,
-                agent: route.agent,
-                result: Err(error.to_string()),
-            })
+        for delta in accumulator.push(&chunk)? {
+            sequence += 1;
+            push_stream(
+                &mut prepared.senders,
+                &prepared.id,
+                &prepared.agent_instance,
+                &prepared.agent_id,
+                sequence,
+                delta,
+            )
+            .await;
         }
     }
+    let (response, deltas) = accumulator.finish()?;
+    if response
+        .tool_calls
+        .iter()
+        .any(|call| !prepared.tool_names.contains(&call.tool_name))
+    {
+        return Err(InferenceError::new(
+            InferenceErrorKind::ResponseDecodeFailed,
+            "provider returned an unknown tool name",
+        ));
+    }
+    for delta in deltas {
+        sequence += 1;
+        push_stream(
+            &mut prepared.senders,
+            &prepared.id,
+            &prepared.agent_instance,
+            &prepared.agent_id,
+            sequence,
+            delta,
+        )
+        .await;
+    }
+    Ok(InferenceResponse {
+        message: AgentMessage::Assistant {
+            reasoning: response.reasoning,
+            content: response.content,
+            tool_calls: response.tool_calls,
+            usage: response.usage,
+        },
+        stop_reason: response.stop_reason,
+    })
+}
+
+#[derive(Serialize)]
+struct DeltaFrame<'a> {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    id: &'a str,
+    agent: &'a ResourceID,
+    agent_instance: &'a str,
+    sequence: u64,
+    content: &'a str,
+}
+async fn push_stream(
+    senders: &mut Vec<WebSocketSender>,
+    id: &str,
+    agent_instance: &str,
+    agent: &ResourceID,
+    sequence: u64,
+    delta: ProviderStreamDelta,
+) {
+    let (message_type, content) = match &delta {
+        ProviderStreamDelta::Reasoning(content) => ("agent.message.reasoning_delta", content),
+        ProviderStreamDelta::Content(content) => ("agent.message.delta", content),
+    };
+    let Ok(encoded) = serde_json::to_string(&DeltaFrame {
+        message_type,
+        id,
+        agent,
+        agent_instance,
+        sequence,
+        content,
+    }) else {
+        return;
+    };
+    let results = futures_util::future::join_all(senders.iter().map(|sender| {
+        let encoded = encoded.clone();
+        async move {
+            if sender.is_closed() {
+                return false;
+            }
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                WebSocketMessageSender::new(
+                    vec![sender.clone()],
+                    WebSocketMessage::Text(encoded.into()),
+                )
+                .send(),
+            )
+            .await
+            .is_ok()
+        }
+    }))
+    .await;
+    let mut index = 0;
+    senders.retain(|sender| {
+        let keep = results[index] && !sender.is_closed();
+        index += 1;
+        keep
+    });
+}
+
+#[derive(Serialize)]
+struct FinishedError<'a> {
+    kind: String,
+    message: &'a str,
+}
+#[derive(Serialize)]
+struct FinishedFrame<'a> {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    id: &'a str,
+    agent: &'a ResourceID,
+    agent_instance: &'a str,
+    error: Option<FinishedError<'a>>,
+}
+async fn push_finished(
+    senders: Vec<WebSocketSender>,
+    id: &str,
+    agent: &ResourceID,
+    agent_instance: &str,
+    error: Option<&InferenceError>,
+) {
+    let frame = FinishedFrame {
+        message_type: "agent.message.finished",
+        id,
+        agent,
+        agent_instance,
+        error: error.map(|e| FinishedError {
+            kind: format!("{:?}", e.kind),
+            message: &e.message,
+        }),
+    };
+    let Ok(encoded) = serde_json::to_string(&frame) else {
+        return;
+    };
+    futures_util::future::join_all(
+        senders
+            .into_iter()
+            .filter(|s| !s.is_closed())
+            .map(|sender| {
+                let encoded = encoded.clone();
+                async move {
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(100),
+                        WebSocketMessageSender::new(
+                            vec![sender],
+                            WebSocketMessage::Text(encoded.into()),
+                        )
+                        .send(),
+                    )
+                    .await;
+                }
+            }),
+    )
+    .await;
+}
+
+struct ReloadGuard {
+    id: String,
+    events: app_runtime_plugin::RuntimeEventSender,
+    finished: bool,
+}
+impl ReloadGuard {
+    fn complete(mut self, result: Result<String, InferenceError>) {
+        self.events.send_event(ReloadOutput {
+            id: self.id.clone(),
+            result,
+        });
+        self.finished = true;
+    }
+}
+impl Drop for ReloadGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.events.send_event(ReloadOutput {
+                id: self.id.clone(),
+                result: Err(InferenceError::new(
+                    InferenceErrorKind::TaskAborted,
+                    "model reload task aborted",
+                )),
+            });
+        }
+    }
+}
+pub(crate) fn handle_reload_model_routes(world: &mut World, request: ReloadModelRoutes) {
+    let config = world.get_resource_mut::<InferenceConfig>().unwrap();
+    let error = if request.id.trim().is_empty()
+        || request.id.len() > 256
+        || request.id.chars().any(char::is_control)
+    {
+        Some(InferenceError::new(
+            InferenceErrorKind::InvalidRequest,
+            "invalid reload ID",
+        ))
+    } else if config.reload_id.is_some() {
+        Some(InferenceError::new(
+            InferenceErrorKind::ConfigBusy,
+            "model reload already running",
+        ))
+    } else {
+        None
+    };
+    if let Some(error) = error {
+        world.send_event(ReloadModelRoutesResult {
+            id: request.id,
+            result: Err(error),
+        });
+        return;
+    }
+    config.reload_id = Some(request.id.clone());
+    let path = config.path.clone();
+    let schedule = config.schedule.clone();
+    let guard = ReloadGuard {
+        id: request.id,
+        events: world.event_sender(),
+        finished: false,
+    };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        world.send_async_closure(&schedule, move || async move {
+            let result = tokio::task::spawn_blocking(move || read_model_source(&path))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(InferenceError::new(
+                        InferenceErrorKind::TaskPanicked,
+                        "model reload task panicked",
+                    ))
+                });
+            guard.complete(result);
+            Ok::<(), AsyncTaskError>(())
+        })
+    }));
+}
+pub(crate) fn handle_model_routes_reloaded(world: &mut World, output: ReloadOutput) {
+    let config = world.get_resource_mut::<InferenceConfig>().unwrap();
+    if config.reload_id.as_deref() != Some(&output.id) {
+        return;
+    }
+    config.reload_id = None;
+    let result = output
+        .result
+        .and_then(|source| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                compile_model_routes(&source, &config.factories)
+            }))
+            .unwrap_or_else(|_| {
+                Err(InferenceError::new(
+                    InferenceErrorKind::TaskPanicked,
+                    "model route compilation panicked",
+                ))
+            })
+        })
+        .map(|routes| {
+            let count = routes.len();
+            config.routes = routes;
+            count
+        });
+    world.send_event(ReloadModelRoutesResult {
+        id: output.id,
+        result,
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::CancelInferenceRequest;
-    use crate::system::cancel_inference_system;
-    use app_runtime_plugin::RuntimePlugin;
-    use core_plugin::App;
-    use margatroid_types::ToolCall;
-    use reqwest::Url;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::sync::watch;
+    use margatroid_types::execution_components::AgentExecutionScope;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
 
-    #[test]
-    fn context_window_uses_decimal_units_and_defaults_to_one_million() {
-        assert_eq!(parse_context_window(None).unwrap(), 1_000_000);
-        assert_eq!(parse_context_window(Some("200k")).unwrap(), 200_000);
-        assert_eq!(parse_context_window(Some("500K")).unwrap(), 500_000);
-        assert_eq!(parse_context_window(Some("1m")).unwrap(), 1_000_000);
-        assert_eq!(parse_context_window(Some("3b")).unwrap(), 3_000_000_000);
-        assert_eq!(parse_context_window(Some("2t")).unwrap(), 2_000_000_000_000);
-        assert!(parse_context_window(Some("1g")).is_err());
-        assert!(parse_context_window(Some("200000")).is_err());
-        assert!(parse_context_window(Some("1.5m")).is_err());
+    async fn mock(body: &'static str, hold: bool) -> (Url, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/v1", listener.local_addr().unwrap())).unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 65536];
+            socket.read(&mut request).await.unwrap();
+            let header = if hold {
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                    .to_owned()
+            } else {
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length:{}\r\nConnection: close\r\n\r\n", body.len())
+            };
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+            if hold {
+                let mut byte = [0];
+                let _ = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut byte)).await;
+            }
+        });
+        (url, task)
+    }
+
+    fn prepared(
+        url: &Url,
+        deepseek: bool,
+    ) -> (
+        PreparedInference,
+        TaskGuard,
+        oneshot::Receiver<Result<InferenceResponse, InferenceError>>,
+        AgentExecutionScope,
+    ) {
+        let adapter = if deepseek {
+            DeepSeekAdapterFactory
+                .build(ProviderRouteInput {
+                    provider: None,
+                    base_url: url,
+                    api_key: "test",
+                    thinking: Some("disabled"),
+                    reasoning_effort: None,
+                })
+                .unwrap()
+        } else {
+            OpenAiAdapterFactory
+                .build(ProviderRouteInput {
+                    provider: None,
+                    base_url: url,
+                    api_key: "test",
+                    thinking: None,
+                    reasoning_effort: None,
+                })
+                .unwrap()
+        };
+        let request = adapter
+            .build_request(ProviderInput::new(
+                "mock",
+                &InferenceParameters::default(),
+                &[ProviderMessage::User {
+                    content: "hi".into(),
+                }],
+                &[],
+            ))
+            .unwrap();
+        let (tx, rx) = oneshot::channel();
+        let reply = Arc::new(Mutex::new(Some(tx)));
+        let scope = AgentExecutionScope::new();
+        let activity = scope.register(ExecutionActivityKind::Inference).unwrap();
+        let guard = TaskGuard {
+            activity,
+            reply: reply.clone(),
+            started: false,
+            finished: false,
+        };
+        (
+            PreparedInference {
+                terminal_gate: None,
+                id: "mock".into(),
+                agent_id: ResourceID::parse("agent:test/main").unwrap(),
+                agent_instance: "opaque".into(),
+                client: reqwest::Client::new(),
+                request,
+                adapter,
+                tool_names: HashSet::from(["echo".into()]),
+                senders: vec![],
+                cancel: CancellationToken::new(),
+                reply,
+            },
+            guard,
+            rx,
+            scope,
+        )
+    }
+
+    #[tokio::test]
+    async fn mock_http_preserves_reasoning_tool_fragments_usage_and_length() {
+        let (url, server) = mock("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\",\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"function\":{\"name\":\"echo\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]},\"finish_reason\":\"length\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"prompt_cache_hit_tokens\":3}}\n\ndata: [DONE]\n\n", false).await;
+        let (prepared, guard, rx, scope) = prepared(&url, true);
+        execute_inference(prepared, guard).await;
+        let response = rx.await.unwrap().unwrap();
+        assert_eq!(response.stop_reason, StopReason::Length);
+        let AgentMessage::Assistant {
+            reasoning,
+            tool_calls,
+            usage,
+            ..
+        } = response.message
+        else {
+            panic!()
+        };
+        assert_eq!(reasoning.as_deref(), Some("think"));
+        assert_eq!(tool_calls[0].arguments, "{}");
+        assert_eq!(usage.unwrap().cache_hit_tokens, 3);
+        assert_eq!(scope.activity_count(), 0);
+        server.await.unwrap();
+    }
+
+    struct PanickingAdapter;
+    impl ProviderAdapter for PanickingAdapter {
+        fn build_request(
+            &self,
+            _: ProviderInput<'_>,
+        ) -> Result<ProviderHttpRequest, InferenceError> {
+            panic!("encode panic")
+        }
+        fn begin_response(
+            &self,
+            _: reqwest::StatusCode,
+            _: &reqwest::header::HeaderMap,
+        ) -> Result<Box<dyn ProviderResponseAccumulator>, InferenceError> {
+            panic!("decode panic")
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_panic_still_completes_reply_after_activity_cleanup() {
+        let (url, server) = mock("", false).await;
+        let (mut prepared, guard, rx, scope) = prepared(&url, false);
+        prepared.adapter = Arc::new(PanickingAdapter);
+        execute_inference(prepared, guard).await;
+        assert_eq!(
+            rx.await.unwrap().unwrap_err().kind,
+            InferenceErrorKind::TaskPanicked
+        );
+        assert_eq!(scope.activity_count(), 0);
+        server.await.unwrap();
     }
 
     #[test]
-    fn provider_error_detail_extracts_json_and_sanitizes_text() {
+    fn config_bounds_and_error_details_are_safe() {
+        assert_eq!(parse_context_window(None).unwrap(), 1_000_000);
+        assert_eq!(parse_context_window(Some("200K")).unwrap(), 200_000);
+        for bad in ["0k", "1.5m", "18446744073709551615t", "1"] {
+            assert!(parse_context_window(Some(bad)).is_err());
+        }
         assert_eq!(
             provider_error_detail(br#"{"error":{"message":"quota\nexceeded"}}"#).as_deref(),
             Some("quota exceeded")
         );
         assert_eq!(
-            provider_error_detail(b"upstream\n\x1b[31m unavailable").as_deref(),
-            Some("upstream [31m unavailable")
+            safe_endpoint(&Url::parse("https://user:password@example.test/v1?key=secret").unwrap()),
+            "https://example.test"
         );
-        assert_eq!(provider_error_detail(b""), None);
+        let error = InferenceError::new(InferenceErrorKind::RequestFailed, "你".repeat(300));
+        assert!(error.message.len() <= 512);
     }
 
-    #[test]
-    fn safe_endpoint_excludes_credentials_and_query_parameters() {
-        let url =
-            Url::parse("https://user:password@example.test:8443/v1/chat/completions?token=secret")
+    #[tokio::test]
+    async fn mock_http_half_stream_is_not_success() {
+        let (url, server) = mock("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"stop\"}]}\n\n", false).await;
+        let (prepared, guard, rx, scope) = prepared(&url, false);
+        execute_inference(prepared, guard).await;
+        assert_eq!(
+            rx.await.unwrap().unwrap_err().kind,
+            InferenceErrorKind::ResponseIncomplete
+        );
+        assert_eq!(scope.activity_count(), 0);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_http_cancel_releases_real_activity_before_reply() {
+        let (url, server) = mock("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n", true).await;
+        let (prepared, guard, rx, scope) = prepared(&url, false);
+        let cancel = prepared.cancel.clone();
+        let task = tokio::spawn(execute_inference(prepared, guard));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cancel.cancel();
+        assert_eq!(
+            rx.await.unwrap().unwrap_err().kind,
+            InferenceErrorKind::Cancelled
+        );
+        assert_eq!(scope.activity_count(), 0);
+        task.await.unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn receiver_closed_stops_http_and_scope_cancel_is_merged() {
+        for close_receiver in [true, false] {
+            let (url, server) = mock("", true).await;
+            let (prepared, guard, rx, scope) = prepared(&url, false);
+            let task = tokio::spawn(execute_inference(prepared, guard));
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            if close_receiver {
+                drop(rx);
+            } else {
+                scope.request_close();
+                assert_eq!(
+                    rx.await.unwrap().unwrap_err().kind,
+                    InferenceErrorKind::Cancelled
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
                 .unwrap();
-        assert_eq!(safe_endpoint(&url), "https://example.test:8443");
+            assert_eq!(scope.activity_count(), 0);
+            server.abort();
+            let _ = server.await;
+        }
     }
 
-    #[test]
-    fn context_compaction_accepts_only_complete_text_without_tool_calls() {
-        let complete = ProviderInferenceResponse {
-            reasoning: Some("private reasoning".into()),
-            content: Some("  summary  ".into()),
-            tool_calls: Vec::new(),
-            stop_reason: StopReason::Completed,
-            usage: None,
-        };
-        assert_eq!(context_compaction_content(&complete).unwrap(), "summary");
-
-        let truncated = ProviderInferenceResponse {
-            stop_reason: StopReason::Length,
-            ..complete.clone()
-        };
-        assert_eq!(
-            context_compaction_content(&truncated).unwrap_err().kind(),
-            InferenceErrorKind::ResponseIncomplete
-        );
-
-        let tool_call = ProviderInferenceResponse {
-            content: None,
-            tool_calls: vec![ToolCall {
-                id: "call-1".into(),
-                tool_name: "tool0".into(),
-                arguments: "{}".into(),
-            }],
-            stop_reason: StopReason::ToolCalls,
-            ..complete
-        };
-        assert_eq!(
-            context_compaction_content(&tool_call).unwrap_err().kind(),
-            InferenceErrorKind::ResponseIncomplete
-        );
-    }
-
-    #[test]
-    fn cancellation_marks_the_matching_inference() {
-        let mut app = App::new();
-        app.add_plugin(RuntimePlugin::default());
-        app.world_mut()
-            .insert_resource(InFlightInferences::default());
-        app.add_system(RuntimePlugin::UPDATE, cancel_inference_system);
-        let agent = app.world_mut().spawn();
-        let (sender, receiver) = watch::channel(false);
-        app.world_mut()
-            .get_resource_mut::<InFlightInferences>()
+    #[tokio::test]
+    async fn owner_abort_joins_http_worker_before_scope_completion() {
+        let (url, server) = mock("", true).await;
+        let (prepared, guard, rx, scope) = prepared(&url, false);
+        let owner = tokio::spawn(execute_inference(prepared, guard));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        owner.abort();
+        let _ = owner.await;
+        let result = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
             .unwrap()
-            .requests
-            .insert((agent, "turn-1".into()), sender);
+            .unwrap();
+        assert_eq!(result.unwrap_err().kind, InferenceErrorKind::TaskAborted);
+        scope.request_close();
+        tokio::time::timeout(Duration::from_secs(1), scope.wait_all())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scope.activity_count(), 0);
+        server.abort();
+        let _ = server.await;
+    }
 
-        app.world().send_event(CancelInferenceRequest {
-            id: "turn-1".into(),
-            agent,
-        });
-        app.tick();
-
-        assert!(*receiver.borrow());
+    #[tokio::test]
+    async fn owner_abort_during_terminal_does_not_poison_scope() {
+        let (url, server) = mock("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", false).await;
+        let (mut prepared, guard, rx, scope) = prepared(&url, false);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        prepared.terminal_gate = Some((entered.clone(), release));
+        let owner = tokio::spawn(execute_inference(prepared, guard));
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        owner.abort();
+        let _ = owner.await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err()
+                .kind,
+            InferenceErrorKind::TaskAborted
+        );
+        scope.request_close();
+        tokio::time::timeout(Duration::from_secs(1), scope.wait_all())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scope.activity_count(), 0);
+        server.await.unwrap();
     }
 
     #[test]
-    fn model_routes_compile_and_reject_missing_factories() {
-        let mut factories = HashMap::new();
-        factories.insert(
-            "openai".to_owned(),
-            Arc::new(crate::OpenAiAdapterFactory) as crate::ErasedProviderAdapterFactory,
+    fn task_drop_is_cleanup_failure_not_fake_completion() {
+        let scope = AgentExecutionScope::new();
+        let activity = scope.register(ExecutionActivityKind::Inference).unwrap();
+        activity.mark_started().unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        drop(TaskGuard {
+            activity,
+            reply: Arc::new(Mutex::new(Some(tx))),
+            started: true,
+            finished: false,
+        });
+        assert_eq!(scope.activity_count(), 1);
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap_err().kind,
+            InferenceErrorKind::TaskAborted
         );
-        let routes = compile_model_routes(
-            r#"[[models]]
-id = "test"
-model = "test-model"
-base_url = "https://example.test/v1"
-api_key = "secret"
-api_type = "openai"
-"#,
-            &factories,
-        )
+    }
+
+    #[test]
+    fn visible_snapshots_survive_reload_and_alias_conflicts_are_rejected() {
+        let mut world = World::new();
+        world.insert_resource(resource_id_plugin::ResourcePluginInstalled);
+        world.insert_resource(resource_id_plugin::ResourceTypeRegistry::default());
+        use resource_id_plugin::WorldResourceExt;
+        world.register_library::<Agent>("agent").unwrap();
+        let agent = world.spawn();
+        let other = world.spawn();
+        let id = ResourceID::parse("tool:test/echo").unwrap();
+        let original = ToolResource {
+            alias: "echo".into(),
+            description: "Old description".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            script_path: PathBuf::new(),
+        };
+        let selected = CallableResource {
+            resource_id: id.clone(),
+            alias: "echo".into(),
+            definition: Arc::new(CallableDefinitionSnapshot::Tool(original.clone())),
+        };
+        let mut set = ResourceSet::new();
+        set.insert(id.clone(), original);
+        world.insert_component(agent, set);
+        use margatroid_types::agent_components::{
+            AgentInfo, AgentState, ImportedValue, WorldAgentExt,
+        };
+        use margatroid_types::history_components::{
+            AgentHistoryHandle, AgentHistoryStore, HistoryError, HistoryRecord,
+        };
+        struct History;
+        impl AgentHistoryStore for History {
+            fn append_batch(&self, _: Vec<HistoryRecord>) -> Result<(), HistoryError> {
+                Ok(())
+            }
+            fn list(&self) -> Result<Vec<HistoryRecord>, HistoryError> {
+                Ok(vec![])
+            }
+        }
+        let agent_id = ResourceID::parse("agent:test/main").unwrap();
+        world.insert_component(
+            agent,
+            Agent {
+                resourceid: agent_id.clone(),
+                workspace: ResourceID::parse("workspace:test/main").unwrap(),
+                sandbox: None,
+                info: AgentInfo {
+                    model: margatroid_types::resource_components::AgentImageModelConfig {
+                        model: "mock".into(),
+                        temperature: None,
+                        max_output_tokens: None,
+                        top_p: None,
+                        stop: vec![],
+                    },
+                    project_root: PathBuf::new(),
+                    home_root: PathBuf::new(),
+                    image: ResourceID::parse("agent_image:test/main").unwrap(),
+                    image_dependencies: Arc::from([id.clone()]),
+                },
+                lua: Default::default(),
+                state: AgentState::Running,
+                history: AgentHistoryHandle::new(History),
+                block: Default::default(),
+                import_bindings: Default::default(),
+                mcl: Default::default(),
+                execution: AgentExecutionScope::new(),
+                turn: None,
+            },
+        );
+        world
+            .agent_bind_import(
+                &agent_id,
+                "echo".into(),
+                ImportedValue::Tool(selected.clone()),
+            )
+            .unwrap();
+        world
+            .get_component_mut::<ResourceSet<ToolResource>>(agent)
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .description = "New description".into();
+        let definitions = collect_tool_definitions(&world, agent, &[selected.clone()]).unwrap();
+        assert_eq!(definitions[0].description, "Old description");
+        let hook_id = ResourceID::parse("hook:test/on-event").unwrap();
+        let hook = margatroid_types::resource_components::HookResource {
+            alias: "on_event".into(),
+            description: "Hook snapshot".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            script_path: PathBuf::new(),
+        };
+        let hook_selected = CallableResource {
+            resource_id: hook_id.clone(),
+            alias: "on_event".into(),
+            definition: Arc::new(CallableDefinitionSnapshot::Hook(hook.clone())),
+        };
+        let mut hooks = ResourceSet::new();
+        hooks.insert(hook_id.clone(), hook);
+        world.insert_component(agent, hooks);
+        world
+            .get_component_mut::<Agent>(agent)
+            .unwrap()
+            .info
+            .image_dependencies = Arc::from([id.clone(), hook_id]);
+        world
+            .agent_bind_import(
+                &agent_id,
+                "on_event".into(),
+                ImportedValue::Tool(hook_selected.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            collect_tool_definitions(&world, agent, &[hook_selected]).unwrap()[0].description,
+            "Hook snapshot"
+        );
+        world
+            .agent_bind_import(
+                &agent_id,
+                "renamed".into(),
+                ImportedValue::Tool(CallableResource {
+                    alias: "renamed".into(),
+                    ..selected.clone()
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            collect_tool_definitions(&world, agent, &[selected.clone()]).unwrap()[0].name,
+            "echo"
+        );
+        assert!(collect_tool_definitions(&world, agent, &[])
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            collect_tool_definitions(&world, other, &[selected.clone()])
+                .unwrap_err()
+                .kind,
+            InferenceErrorKind::ResourceMissing
+        );
+        assert_eq!(
+            collect_tool_definitions(&world, agent, &[selected.clone(), selected])
+                .unwrap_err()
+                .kind,
+            InferenceErrorKind::InvalidToolDefinitions
+        );
+    }
+
+    #[test]
+    fn system_role_survives_normalization_and_provider_encoding() {
+        let normalized = normalize_messages(vec![
+            AgentMessage::System {
+                content: "system prompt".into(),
+            },
+            AgentMessage::User {
+                content: "user prompt".into(),
+            },
+        ])
         .unwrap();
-        let route = routes.get(&ModelId::new("test").unwrap()).unwrap();
-        assert_eq!(route.model(), "test-model");
-        assert!(compile_model_routes("", &factories).is_err());
+        assert!(
+            matches!(&normalized[0], ProviderMessage::System { content } if content == "system prompt")
+        );
+        let url = Url::parse("http://127.0.0.1:1/v1").unwrap();
+        let adapter = OpenAiAdapterFactory
+            .build(ProviderRouteInput {
+                provider: None,
+                base_url: &url,
+                api_key: "mock",
+                thinking: None,
+                reasoning_effort: None,
+            })
+            .unwrap();
+        let request = adapter
+            .build_request(ProviderInput::new(
+                "mock",
+                &InferenceParameters::default(),
+                &normalized,
+                &[],
+            ))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["role"], "user");
+        let message = AgentMessage::System {
+            content: "system prompt".into(),
+        };
+        assert_eq!(
+            serde_json::from_value::<AgentMessage>(serde_json::to_value(&message).unwrap())
+                .unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn inject_expansion_checks_correlations_and_limits() {
+        assert_eq!(
+            normalize_messages(vec![AgentMessage::Inject {
+                messages: vec![AgentMessage::User {
+                    content: "ok".into()
+                }]
+            }])
+            .unwrap()
+            .len(),
+            1
+        );
+        assert!(normalize_messages(vec![AgentMessage::ToolCall {
+            resource_id: None,
+            tool_call_id: "orphan".into(),
+            tool_name: "echo".into(),
+            content: "bad".into(),
+            failed: true
+        }])
+        .is_err());
+        let mut nested = AgentMessage::User {
+            content: "hi".into(),
+        };
+        for _ in 0..34 {
+            nested = AgentMessage::Inject {
+                messages: vec![nested],
+            };
+        }
+        assert!(normalize_messages(vec![nested]).is_err());
     }
 }

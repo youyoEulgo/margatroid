@@ -1,43 +1,36 @@
 # InferencePlugin
 
-## 介绍
+## 介绍与职责
 
-`InferencePlugin` 是 Margatroid 统一 `Message` 与具体模型 API 之间的边界。Agent 核心只维护
-`messages`，不识别 OpenAI、OpenRouter 或其他 Provider 格式。
+`InferencePlugin` 执行一次模型请求：共享 `AgentMessage` 快照和选定 `CallableResource` 工具定义快照进入，完整 `InferenceResponse` 经 oneshot 返回。它不创建 Agent、不写历史、不执行工具、不自动重试、续写或压缩；历史及命令收口由 MCL 负责。压缩等调用方也使用同一个入口，自行解释响应。
 
-这里的 `inference` 指一次模型推理调用：输入 `messages`、工具定义和推理参数，输出一个完整
-Assistant 响应。它不是 Agent 的完整思考过程，不包含工具执行或 tool-call loop。
+全局只有一份 `InferenceConfig`，包含模型路由、配置路径、协议工厂、共享 HTTP client、调度计划及重载关联。没有项目路由覆盖、在途推理表、输出路由、固定异步 System 或业务结果转发 System。插件仅安装 `inference_system`，处理统一请求、重载请求和共享重载输出。
 
-Plugin 根据 AgentInstance 绑定的逻辑 `ModelId` 按项目级、全局顺序查询模型路由，将统一消息
-组装为 Provider Request，发送流式 HTTP 请求，将文本片段直接写入模型路由指定的 WebSocket，最后
-返回完整统一响应。
+## 安装
 
-Provider 请求失败时，错误会保留安全 endpoint、传输错误类别和最深层系统原因。非成功 HTTP 响应会
-优先提取常见 JSON 错误字段，并回退到有界、单行化的响应正文。错误不会包含 Authorization header、
-API key、请求正文、URL 凭据或查询参数，最终文本限制为 512 字节。
+需要 `RuntimePlugin`、`AsyncRuntimePlugin` 和已为相同计划注册的通用闭包执行设施。默认计划为 `PRE_UPDATE`；更换计划时也要注册该计划的 closure system。AgentImageLoaderPlugin 不再是插件依赖。
 
-AgentImageLoaderPlugin 只提供中立模型配置；InferencePlugin 负责把它转换为实例推理快照，
-并验证推理参数和模型路由。资源加载层不依赖推理业务层。
+```rust
+use app_runtime_plugin::RuntimePlugin;
+use async_runtime_plugin::AsyncRuntimePlugin;
+use closure_plugin::{AppClosureExt, ClosurePlugin};
+use core_plugin::App;
+use inference_plugin::InferencePlugin;
 
-这里的关键边界是：
+let mut app = App::new();
+app.add_plugin(RuntimePlugin::default())
+    .add_plugin(ClosurePlugin)
+    .add_closure_system(RuntimePlugin::PRE_UPDATE)
+    .add_plugin(AsyncRuntimePlugin)
+    .add_plugin(InferencePlugin::default()
+        .with_config_path("/etc/margatroid/models.toml"));
+```
 
-- Agent 传递统一 `Message`，InferencePlugin 解释模型协议。
-- `ModelId` 是逻辑路由键，不代表实际模型或供应商。
-- `provider` 是可选元数据，`api_type` 才决定请求和响应协议。
-- ProviderAdapter 组装请求，ProviderResponseAccumulator 累积并解析响应。
-- 流式思考与正文通过固定的 WebSocket 发送器集合分别直接转发，不为每个分片创建 ECS Event。
-- InferencePlugin 不修改 Agent 的 `messages`，不执行工具，不实现 tool-call loop。
+安装时有界读取并完整编译配置，失败或重复安装拒绝。`with_schedule`、`with_config_path` 和 `with_api_type` 可配置计划、唯一配置路径和额外协议工厂；空或重复协议名拒绝。安装时通过一次 no-op async closure 验证通用设施。
 
-上下文压缩使用独立的`ContextCompactionInferenceRequest`和`ContextCompactionInferenceResponse`。
-它复用相同模型路由、Provider Adapter、HTTP与取消机制，但不携带工具定义、不解析流式前端目标，也不生成
-普通`AgentMessage`。只有正常结束、没有工具调用且正文非空的响应才作为摘要返回AgentPlugin。
+## 全局模型路由与协议
 
-普通推理会通过`stream_options.include_usage`请求Provider在流末尾返回usage，并把输入、输出和缓存命中
-Token随`AgentMessage`交给AgentPlugin；Provider完全不返回usage时保持为空。
-
-## 模型路由表
-
-默认配置文件为 `~/.margatroid/models.toml`：
+默认配置为 `~/.margatroid/models.toml`：
 
 ```toml
 [[models]]
@@ -45,293 +38,104 @@ id = "deepseek-v4-flash"
 model = "deepseek/deepseek-v4-flash-latest"
 provider = "openrouter"
 base_url = "https://openrouter.ai/api/v1"
-api_key = "sk-123"
+api_key = "replace-with-your-key"
 api_type = "deepseek"
 thinking = "enabled"
 reasoning_effort = "high"
 context_window = "200k"
 ```
 
-`context_window`表示模型总上下文窗口，使用AI领域常见的英语数量级缩写且不区分大小写：
-`k=thousand`、`m=million`、`b=billion`、`t=trillion`。例如`200k`为200000 Token、
-`1m`为1000000 Token、`1b`为1000000000 Token。省略时默认`1m`。该值与只限制
-生成长度的`max_output_tokens`不同，并会标准化后提供给Agent Base Driver。
+`id` 是 Agent.info.model.model 选择的逻辑键；`model` 是发送给 Provider 的模型值，两者不必相同。`provider` 仅为可选元数据，`api_type` 显式选择协议，不根据 URL 猜测。配置必须非空、ID 唯一、必需字段非空、URL 使用 http/https，所有条目完整编译成功才能发布。
 
-`api_type = "deepseek"` 启用DeepSeek协议Adapter。`thinking = "enabled"`时请求携带
-`thinking = { type = "enabled" }`，`reasoning_effort`可为`high`或`max`；省略thinking或设为
-`disabled`时不发送思考参数。即使`base_url`指向OpenAI兼容反代，只要需要DeepSeek的
-`reasoning_content`语义，仍应选择`deepseek`。
-响应解析同时接受DeepSeek原生`reasoning_content`和OpenRouter兼容`reasoning`字段；请求历史回传
-始终使用DeepSeek语义的`reasoning_content`。
+`context_window` 使用不区分大小写的无符号整数后缀 `k/m/b/t`，分别乘以 1000、1000000、1000000000、1000000000000，必须大于零且不溢出；缺省为 `1m`。它是路由信息，不是假称精确 token 估算，也不是输出长度限制。采样参数直接复制已存在的 `Agent.info.model`，不会每次重新读取 AgentImage。
 
-AgentImage 只引用 `id = "deepseek-v4-flash"`。ID 通常直接写具体模型名，方便开发者辨认；
-`model` 则是构建 Provider Request 时直接使用的模型值。`base_url`、`api_key` 和 `api_type`
-也只属于路由表，`provider` 可以省略且不参与路由查找。WebSocket 发送目标不属于模型路由，统一
-来自主目录 `config.toml`。
+### OpenAI
 
-项目可以在 `<project>/.margatroid/models.toml` 使用相同格式定义项目级路由。查找顺序是：
+使用 `chat/completions` 流式请求，工具名直接为资源 alias，开启 `stream_options.include_usage`。累积器支持 CRLF、SSE 多 data 行和跨 UTF-8 字节分片，分别累积正文、reasoning 及工具调用 index 对应的 ID/name/arguments 片段。工具 index、ID、名称及参数均有界；最终检查唯一 ID、非空名称、JSON object 参数，以及名称是否属于本次可见工具。
 
-```text
-WorkspaceModelRoutes[ModelId]
-→ GlobalModelRoutes[ModelId]
-→ ModelRouteNotFound
-```
+usage 尾帧即使没有 choices 也处理；统一 input/output 与 prompt/completion 计数，支持缓存命中字段。必须观察 choice、真实停止原因及 `[DONE]` 才成功，半流或非法分片不能当正常截断。保留 `Length`、`ContentFilter` 和其他 Provider 停止原因，不因工具调用覆盖停止原因；完整工具响应没有正文也可成功。
 
-主目录配置是全局默认，项目级同名 ID 会覆盖它。项目级路由挂在 Workspace Entity 上，
-因此不同 Workspace 可以为同一 `ModelId` 使用不同实际模型。
+### DeepSeek
 
-ID 是面向 AgentImage 和开发者的稳定名称，`model` 是面向 Provider 的请求值，因此二者不要求
-字面相同。例如 `model` 可以包含供应商作用域或版本后缀，也可以在迁移、测试时指向其他兼容模型。
+`thinking = "disabled"` 会显式编码 `{type:"disabled"}`，不能省略后误启用模型默认思考。`enabled` 必须同时设置 `reasoning_effort = "high"` 或 `"max"`；其他组合在路由编译阶段拒绝。未指定 thinking 时不发送该配置字段，但历史 assistant 按思考协议回传 `reasoning_content`，缺失时补空串。显式 disabled 时，工具调用历史仍保留必要 reasoning 字段。
 
-修改某条项目级路由会影响该 Workspace 中引用它的 Agent；修改全局路由会影响所有没有
-项目级同名覆盖的 Agent。如果同一 Workspace 内也需要不同路由，应新增 ID，而不是在
-AgentInstance 内保存私有 Provider 配置。
+响应接受 `reasoning_content` 和兼容的 `reasoning`，正文与思考分别推送。原生 `prompt_cache_hit_tokens` 及兼容 cached-token details 都映射到共享 usage。
 
-`api_key` 只在配置加载、ProviderAdapter 和实际 HTTP 请求中使用，不得进入 Component、
-Event、Error 或日志。
+## 发起一次推理
 
-## 安装
-
-`InferencePlugin` 依赖 `RuntimePlugin`、`AsyncRuntimePlugin` 和 `AgentImageLoaderPlugin`：
-
-```rust
-use app_runtime_plugin::RuntimePlugin;
-use agent_image_loader_plugin::AgentImageLoaderPlugin;
-use async_runtime_plugin::AsyncRuntimePlugin;
-use core_plugin::App;
-use inference_plugin::InferencePlugin;
-
-let mut app = App::new();
-app.add_plugin(RuntimePlugin::default())
-    .add_plugin(AsyncRuntimePlugin)
-    .add_plugin(AgentImageLoaderPlugin::open(
-        "/home/user/.margatroid/agent-images",
-    )?)
-    .add_plugin(InferencePlugin::default());
-```
-
-默认在 `RuntimePlugin::PRE_UPDATE` 处理推理命令、重载命令和异步结果。可以在安装时
-替换配置路径或 Schedule：
-
-```rust
-use std::path::PathBuf;
-
-let inference = InferencePlugin::default()
-    .with_config_path(PathBuf::from("/etc/margatroid/models.toml"))
-    .with_schedule(RuntimePlugin::UPDATE);
-
-app.add_plugin(inference);
-```
-
-Plugin 安装时会加载并验证完整路由表。缺少文件、重复 ID、非法 URL、未注册
-`api_type` 或缺少必要字段都会导致配置失败。
-
-Plugin 安装只加载主目录全局默认路由。WorkspacePlugin 在 `workspace up/reload` 时调用
-`load_workspace_model_routes(workspace, project_root)`，将可选项目级路由挂到 Workspace Entity。
-
-## AgentImage 推理配置
-
-AgentImage 必须由 AgentImageLoaderPlugin 创建。Loader 解析模型 ID 和参数原值后，在
-AgentImage Entity 上挂载中立的 `AgentImageModelConfig`；它不调用 InferencePlugin，也不验证
-温度范围、停止序列业务规则或模型路由。
-
-```text
-AgentImage文件
-→ AgentImageLoaderPlugin创建AgentImage Entity
-→ 挂载AgentImageModelConfig { model: "deepseek-v4-flash", parameters }
-→ WorkspacePlugin调用world.build_agent_inference_snapshot(...)
-→ InferencePlugin验证参数和当前模型路由
-→ WorkspacePlugin把AgentInferenceSnapshot挂到新AgentInstance
-```
-
-Workspace 启动时先加载项目级路由，再调用：
-
-```rust
-use agent_image_loader_plugin::AgentImageModelConfig;
-use inference_plugin::WorldInferenceExt;
-
-let config = world
-    .get_component::<AgentImageModelConfig>(image)
-    .expect("loaded image must contain model config");
-
-let snapshot = world.build_agent_inference_snapshot(workspace, image, config)?;
-world.insert_component(agent, snapshot);
-```
-
-该方法把模型 ID 文本转换为 `ModelId`，把原始参数转换为 `InferenceParameters`，验证业务范围，
-并按项目级、全局顺序确认路由存在。它只返回组件，不创建 AgentInstance，也不修改 World。
-
-AgentImage 文件后续变化不会自动修改已启动实例；重新读取 AgentImage 和项目级模型路由都属于
-`workspace reload`。快照记录 Workspace Entity，供推理时优先查询项目级路由。
-
-## 发起推理
-
-Agent 核心发送当前完整 `messages` 快照。下面的 `agent` 由 Workspace 启动逻辑创建，
-并已挂载 `AgentInferenceSnapshot`：
+请求、错误及重载事件位于共享 `types::inference_events`，响应与消息位于共享 `types::message_types`；插件重新导出公开请求和响应，不再有插件 events 模块。
 
 ```rust
 use app_runtime_plugin::WorldEventExt;
 use inference_plugin::InferenceRequest;
-use margatroid_types::{Message, ToolDefinition};
+use margatroid_types::message_types::AgentMessage;
+use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
 
-app.world().send_event(InferenceRequest {
+let (sender, receiver) = oneshot::channel();
+world.send_event(InferenceRequest {
     id: "request-1".into(),
     agent,
-    agent_id: ResourceId::parse("agent:demo/coder:latest")?,
-    messages: vec![
-        Message::System {
-            content: "You are a coding agent.".into(),
-        },
-        Message::User {
-            content: "Review this patch.".into(),
-        },
-    ],
-    tools: Vec::<ToolDefinition>::new(),
+    messages: vec![AgentMessage::User { content: "Review this patch.".into() }],
+    tools: selected_callable_resources,
+    turn: None,
+    cancel: agent_scope.child_cancel(),
+    reply: Arc::new(Mutex::new(Some(sender))),
 });
+// 异步调用方 await receiver，收到 Result<InferenceResponse, InferenceError>。
 ```
 
-`id` 由调用方生成，用于区分同一 Agent 的并发请求；`agent` 是发起推理的 AgentInstance
-Entity。最终响应使用 `(agent, id)` 定位原 Agent 和原请求。
+主线程先认领原 Sender 并转入私有回复槽，重复克隆请求不会重复执行。校验完整 Agent Entity、请求 ID 和取消状态；从 `Agent.info.model` 获取模型与采样参数。`turn` 可为空，不作为推理唯一 ID。请求取消令牌与活动作用域派生 child 同时监督，即使请求使用独立令牌也不能绕过 Agent 停止。
 
-`tools`由AgentPlugin遍历当前`AgentDynamicVisibility.resources`，逐个调用ToolPlugin按资源类型返回定义；
-每个定义名都是完整`ResourceId`。InferencePlugin在主线程读取Agent推理快照，并在请求边界将资源ID转换为模型API工具名，根据`ModelId`组装请求，然后
-把网络请求交给 AsyncRuntime。不会把 `World` 或 Component 引用带入异步线程。
+`tools: Vec<CallableResource>` 保存完整 ResourceID、选定 alias 及 `Arc<CallableDefinitionSnapshot>`。直接消费该快照的描述、schema 和资源种类，不按 ID 重取最新定义，也不重复 global alias query。归属校验要求目标 ResourceSet 中该 ID 存在、Agent.image_dependencies 许可，以及 ImportBindings 中该 ID/TOOL kind 已导入；不要求旧 snapshot 与 reload 后的新 alias/定义一致。visible alias 必须唯一，不按重复 ID 静默去重。
 
-## 流式输出与最终结果
+tool 使用选定 schema；skill 固定 `{ "type":"object", "properties":{}, "additionalProperties":false }`，只允许 `{}`。Hook 可消费自身 description/schema 生成模型定义，但 ToolPlugin 执行明确返回 `UnsupportedHook`，不代表 Driver 触发器路线已闭合。prompt/sandbox 不能冒充 TOOL；空 tools 就是无工具，不回退默认集合。非法 schema、外部 `$ref` 或归属失败在 HTTP 提交前拒绝。
 
-后端对一次模型调用的有效处理都依赖完整响应：工具参数需要拼完才能解析，tool-call loop
-需要完整 Assistant Message，结束原因和 token usage 也只有流结束后才能确定。
+`Inject` 递归按序展开；System、user、assistant、工具结果及 error 转为公开 `ProviderMessage`，System 与 prompt 的真实 role 不降格为 user。保留 reasoning、工具 ID、参数和结果关联，历史 usage 不进入请求。检查工具调用/结果配对，空输入、孤立结果、重复调用和超限输入拒绝。history append 不接收 System 是独立约束，不缩窄 infer 输入。
 
-流式思考和正文的用途只是让前端实时显示。`InferenceRequest` 不携带发送器；`prepare_inference_system`
-读取全局配置的 `streaming_member_messages` 目标，通过 `WebSocketConnections` 解析并固定本轮的发送器集合，然后写入
-`PreparedInference`。异步推理解析出的正文构造`agent.message.delta`，DeepSeek思考内容构造
-`agent.message.reasoning_delta`，两者都通过`WebSocketMessageSender::send`直接发送。
+MCL `infer` 参数为 MESSAGE array + TOOL array；手工工具调用也先构造恰好一条 assistant MESSAGE，再传 visible TOOL array，calls 从 `assistant.tool_calls` 提取。`ToolCall` 仍为 assistant 的纯结构字段，没有 TOOL_CALL Block array。metadata reload 不改变已取出的 Block/请求；新 GET alias 取得新 snapshot。脚本和 Skill 正文仍按选定路径 late read，metadata snapshot 不保证磁盘文件内容版本隔离。
 
-思考和正文片段都不进入 ECS 事件队列；工具调用 ID、名称和参数片段也不转发，只在后端累积器中组装。
-前端已断开时，InferencePlugin 停止向对应连接转发，但不中断后端推理和最终响应累积。本轮开始后
-新增且符合相同 target 的连接从下一轮开始接收，以保持增量与最终消息的接收集合一致。
 
-流结束后，成功响应由 InferencePlugin 直接转换成共享 `AgentMessage::Assistant`。InferencePlugin
-不为响应附加意图，也不判断本轮是否结束；AgentPlugin 收到消息后根据 `tool_calls` 是否为空决定
-结束当前轮次或派发下一批工具调用：
+## 执行监督与真实 cleanup
+
+通用 async closure 调用 `execute_inference`。入口 spawn 独立 supervisor 并 await；入口丢弃仅通过私有 DropGuard 取消 owner token，supervisor 不随入口被丢弃。
+
+supervisor 在共享 AgentExecutionScope 登记活动的 `mark_started` 后 spawn HTTP worker，合并 scope child、请求 cancel、owner cancel、回复 receiver 关闭及整体超时。正常结果显式 join worker；取消、超时或 receiver 关闭则显式 abort worker 并 await JoinHandle，证明 HTTP/SSE/增量发送 future 已退出释放。Provider panic 经 JoinError 转为关联错误。
+
+随后有界发送终态，释放发送 future，才 `mark_completed` 并完成唯一 oneshot。终态阶段 owner abort 同样不会永久毒化作用域。未启动的提交失败 rollback；supervisor 自身异常退出且无法证明 cleanup 时，TaskGuard 标记 cleanup_failed 并保留活动，不以 Drop、日志或 Sender 关闭假称任务退出。
+
+## WebUI 推流
+
+准备阶段调用共享 `WorldClientExt::client_webui_senders()`：仅包含已注册、client_type 为 webui 的连接，发送器去重并忽略断开项。没有发送器仍正常推理；本次启动后新增连接不加入快照。不按 Workspace 隔离，不依赖 ClientPlugin Handler 或全局 config 的推流 target。
+
+正文使用 `agent.message.delta`，思考使用 `agent.message.reasoning_delta`，字段为 `id`、Agent 逻辑地址 `agent`、不透明 `agent_instance`、递增 `sequence` 和 `content`。实例字符串由完整 Entity 的 Debug 格式生成，与 Protocol Agent 快照一致，仅供关联，不接受入站解码寻址。工具参数碎片不推送为可执行调用。
+
+每连接并发发送超时为 100ms；慢或关闭连接从增量活动集合剔除，旁路失败不改变模型结果。最终向原快照发送：
+
+```json
+{"type":"agent.message.finished","id":"request-1","agent":"agent:demo/main","agent_instance":"opaque-instance","error":null}
+```
+
+失败时 `error` 为 `{ "kind": "ResponseIncomplete", "message": "..." }`。终态只是显示旁路，oneshot 是唯一权威结果。已显示部分增量后失败不撤回内容，也不自动重试。
+
+## 全局重载
 
 ```rust
-use core_plugin::World;
-use margatroid_types::{AgentMessage, Message};
-
-fn handle_inference_messages(world: &mut World) {
-    for event in world.event_reader::<AgentMessage>() {
-        if let Message::Assistant { reasoning, content, tool_calls } = &event.message {
-            tracing::info!(
-                agent = ?event.agent,
-                request_id = %event.id,
-                ?reasoning,
-                ?content,
-                tool_call_count = tool_calls.len(),
-                "agent inference completed"
-            );
-        }
-    }
-}
-
-app.add_system(RuntimePlugin::UPDATE, handle_inference_messages);
+use app_runtime_plugin::WorldEventExt;
+use inference_plugin::ReloadModelRoutes;
+world.send_event(ReloadModelRoutes { id: "reload-1".into() });
 ```
 
-无法表示成对话消息的推理失败通过 `AgentFailure { id, agent, kind, message }` 发布。AgentPlugin
-直接消费这两种共享事件：它将合法 Assistant 消息写入对应实例上下文，并根据消息结构继续工具
-调用或结束当前轮次；可配对的失败用于结束当前推理状态。InferencePlugin 不参与这些分支判断。
+一个重载在途时返回 `ConfigBusy`。后台有界读取并解析 TOML，共享 `InferenceReloadOutput { id, result: Result<String, InferenceError> }` 携带原始配置，不携带插件 Adapter。原始字符串包含凭据，只用于内部编译，不发客户端、不记日志。主线程核对关联并完整编译协议工厂，捕获工厂 panic，成功整体替换 routes；任一失败保持旧配置，清除标记并发送 `ReloadModelRoutesResult { id, result: Result<usize, InferenceError> }`。ReloadGuard 保证闭包丢弃仍投递带原 ID 的失败。
 
-## 重载模型路由
+重载期间新推理继续使用旧配置，已启动推理使用自己的协议快照。不监听文件变化，不接受项目路径覆盖。
 
-InferencePlugin 不监听文件变化。修改主目录全局 `models.toml` 后显式请求重载：
+## 上限、错误与扩展
 
-```rust
-use inference_plugin::WorldInferenceExt;
+实际固定上限：配置 1MiB；单消息序列化 4MiB、总输入 16MiB、4096 条、inject 深度 32；工具 256 个、名称 64 字节、描述 8KiB；stop 64 个且每项 256 字节；错误 body 16KiB；响应总量 32MiB；单 SSE buffer/event 4MiB；单项正文/reasoning/工具参数 4MiB；整体请求 180 秒；receiver 关闭每 20ms 检查。不存在可配置的 InferenceLimits 结构体。
 
-app.world().reload_model_routes("reload-models-1");
-```
+错误共享 `kind/message`，文本按 UTF-8 边界限制到 512 字节；HTTP 状态由 `with_status` 写入 message，没有独立 status 字段。HTTP 错误正文优先提取常见 JSON 字段并单行化；传输错误只使用安全 URL origin 和分类，不复制可能带凭据的底层错误链，不记录 Authorization、请求正文或完整 prompt。
 
-`reload_model_routes` 发送事件并唤醒 Runtime。内部 System 同步读取、验证并替换全局
-路由表；这是低频管理操作，允许阻塞当前帧。处理结果从 `ReloadModelRoutesResult` 读取：
+新协议通过 `with_api_type` 注册 `ProviderAdapterFactory`，工厂从借用的 `ProviderRouteInput` 构建 Adapter；Adapter 将借用的 `ProviderInput` 编码为拥有所有权的 `ProviderHttpRequest`，为每个响应创建 `ProviderResponseAccumulator`。累积器 `push` 返回有序增量，`finish` 返回完整响应和尾部增量，必须验证协议完成。公开 trait、路由和协议辅助值当前保留在插件 types 模块，共享消息、usage、StopReason 和错误不反向依赖插件。
 
-```rust
-use inference_plugin::ReloadModelRoutesResult;
-
-fn handle_model_route_reload(world: &mut World) {
-    for event in world.event_reader::<ReloadModelRoutesResult>() {
-        match &event.result {
-            Ok(reloaded) => tracing::info!(
-                route_count = reloaded.route_count,
-                "model routes reloaded"
-            ),
-            Err(error) => tracing::error!(%error, "model route reload failed"),
-        }
-    }
-}
-
-app.add_system(RuntimePlugin::UPDATE, handle_model_route_reload);
-```
-
-项目级 `models.toml` 不走这个全局重载入口，它随 `workspace up/reload` 重新加载。全局重载
-只影响未被项目级同名 ID 覆盖的 Agent。
-
-## 扩展 API 协议
-
-默认提供`openai`和`deepseek`协议工厂。新协议通过`InferencePlugin::with_api_type`注册：
-
-```rust
-let inference = InferencePlugin::default()
-    .with_api_type("anthropic", AnthropicAdapterFactory::new());
-```
-
-一种新 API 协议需要实现三个边界：
-
-- `ProviderAdapterFactory`：读取 `provider`、`base_url` 和 `api_key`，创建已配置 Adapter。
-- `ProviderAdapter`：将统一 `ProviderInput` 组装为 HTTP Request，并为每个响应创建累积器。
-- `ProviderResponseAccumulator`：接受任意网络分片边界，返回有序的`ProviderStreamDelta`，在内部累积
-  思考、正文和工具调用并最终构造`ProviderInferenceResponse`；`finish`也会返回缓冲区尾行解析出的分片。
-
-Adapter 只解释 Provider 协议，不读取 `World`、Agent Component 或会话状态。
-
-## 数据流
-
-```text
-Agent messages + AgentPlugin收集的ToolDefinition
-→ InferenceRequest { id, agent, agent_id, messages, tools }
-→ AgentInferenceSnapshot { workspace, model }
-→ WorkspaceModelRoutes[ModelId]
-→ 未命中时查询GlobalModelRoutes[ModelId]
-→ ProviderAdapter::build_request
-→ AsyncRuntime发送流式HTTP
-→ ProviderResponseAccumulator::push
-├→ Reasoning/Content分片 -> WebSocketMessageSender -> 前端
-└→ 后端内部累积完整响应
-→ ProviderResponseAccumulator::finish
-├→ 尾行分片 -> WebSocketMessageSender -> 前端
-├→ 成功：AgentMessage { id, agent, Message::Assistant }
-└→ 失败：AgentFailure { id, agent, kind: Inference, message }
-→ 成功消息由AgentPlugin记入上下文并根据tool_calls继续工具调用或结束；失败契约暂不定义
-```
-
-## 职责边界
-
-InferencePlugin 负责：
-
-- 加载、验证和重载主目录全局默认路由。
-- 提供将项目级路由覆盖加载到 Workspace Entity 的公开入口。
-- 把 AgentImageLoaderPlugin 的中立模型配置转换为经过验证的 AgentInferenceSnapshot。
-- 将统一 messages、工具定义和推理参数组装为 Provider Request。
-- 发送流式 HTTP 请求并解析增量与最终响应。
-- 将思考和正文片段写入固定 WebSocket 发送器集合，并按请求 ID 和 Agent Entity 发布 `AgentMessage` 或
-  `AgentFailure`。
-- 根据完整 Assistant 消息是否包含工具调用，直接赋予消息意图。
-
-InferencePlugin 不负责：
-
-- 创建 Workspace、AgentImage 或 AgentInstance。
-- 持有或修改 Agent 的 `messages`。
-- 执行工具或实现 tool-call loop。
-- 读取 Skill、Workflow 或 Memory。
-- 决定重试、上下文裁剪或对话结束策略。
-
-完整类型、函数和执行逻辑见 [DESIGN.md](DESIGN.md)。
+完整六板块契约见 [DESIGN.md](<DESIGN.md>)。回归覆盖协议 SSE/DeepSeek、资源可见性、半流、取消、receiver 关闭、panic、HTTP/终态 owner abort，以及重载忙碌与旧配置保留。

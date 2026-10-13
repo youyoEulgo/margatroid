@@ -1,41 +1,38 @@
-# AgentImageLoaderPlugin
+# AgentImagePlugin
 
-## 介绍
+## 契约
 
-`AgentImageLoaderPlugin` 是 AgentImage 的资源加载层。它从主目录读取人类可编辑的镜像，
-在 ECS 主线程创建或刷新 AgentImage Entity。
+crate 名称仍为 `agent_image_loader_plugin`。`AgentImagePlugin` 是公开结构体
+`AgentImageLoaderPlugin` 的别名，两者安装同一实现。插件从全局镜像根目录异步读取镜像，
+在 ECS 主线程将一个 key 挂载到请求指定的目标 `ResourceSet<AgentImage>`。
 
-AgentImage Entity 挂载两类数据：
+不创建独立 Image Entity，不挂 `ResourceId`，不使用 ResourceOwners 或 GC。
+成功回执为 `Result<(), ImageLoadError>`，表示目标上的镜像 key 已可用；失败保留原 key。
+
+共享条目与模型定义于 `margatroid_types::resource_components`：
 
 ```text
-ResourceId    身份组件，内容为 image:<scope>/<name>:<tag>
-AgentImage    聚合组件，保存 Base Driver、依赖清单、模型配置和默认可见性
+AgentImage { base_driver: Arc<str>, origin: Arc<PathBuf>,
+             dependencies: Arc<[ResourceID]>, model: AgentImageModelConfig }
+AgentImageModelConfig { model: String, temperature: Option<f32>,
+                        max_output_tokens: Option<u32>, top_p: Option<f32>, stop: Vec<String> }
 ```
 
-Loader 只描述镜像中“有什么”，不决定这些内容“怎么运行”：
+请求、业务回执、具名异步输出与错误统一定义于 `margatroid_types::agent_image_events`。
+Loader 不解释 Workspace 状态机，不启动 Agent，不查询推理路由，也不自动导入依赖。
 
-- Loader 加载 AgentImage，WorkspacePlugin 创建 AgentInstance。
-- Loader 保存模型 ID 文本和参数原值，InferencePlugin 解释参数并验证路由。
-- Loader 发现默认可见 ResourceId，WorkspacePlugin 计算 Agent 默认可见性，ToolPlugin 按动态可见性生成请求工具。
-- 默认可见性属于 AgentImage，最终可见性属于 AgentInstance。
-- 磁盘目录是权威内容，Entity 保存最近一次成功加载的镜像数据。
-- 文件读取走 AsyncRuntime，Entity 只能在 ECS 主线程创建或刷新。
+## 镜像目录与清单
 
-## 镜像目录
+传给 `open` 的路径是镜像根目录本身，不是其上一级 data root：
 
 ```text
 ~/.margatroid/agent-images/local/coder/latest/
-├── agent.toml         必需
-├── base.lua           必需
-├── SOUL.md            可选，提示词文档
-├── TEST.md            可选，提示词文档
-├── skills/            可选
-├── hooks/             可选
-├── tools/             可选
-└── shells/            可选
+├── agent.toml         必需且有界UTF-8
+└── base.lua           必需且有界UTF-8
 ```
 
-`agent.toml`：
+只读取这两个自有文件。其他文档、资源子目录或无关 symlink 均不扫描、不拒绝、不加载。
+自有文件和根至镜像目录路径链不允许 symlink，期望目录必须为普通目录，文件必须为普通文件。
 
 ```toml
 schema_version = 1
@@ -49,185 +46,129 @@ stop = ["DONE"]
 
 [[dependencies]]
 id = "skill:local/code-review:latest"
-source = "/home/user/.margatroid/skills/local/code-review/latest"
 
 [[dependencies]]
 id = "tool:local/list-directory:latest"
-source = "https://example.com/tools/list-directory.tar"
 
 [[dependencies]]
 id = "prompt:system/soul:latest"
-
-[[dependencies]]
-id = "prompt:system/test:latest"
-
-[[dependencies]]
-id = "prompt:user/test:latest"
 ```
 
-镜像资源 ID 使用 `image:scope/name:tag`，例如 `image:local/coder:latest`。省略 tag 时规范化为 `latest`。
-`model` 是模型路由 ID 文本；Provider、base URL 和 API key 属于 `models.toml`，不能写入镜像。
+资源 ID 使用完整 `type:scope/name:tag` 地址，省略 tag 规范化为 `latest`。
+每项 dependency **只允许 id**，`source` 或其他未知依赖字段会被拒绝。
+依赖仅保存为地址，不检查本地文件或资源存在性；prompt 不从镜像里的 Markdown 文件读取，
+不限制 prompt scope，不按 scope/name 去重。不从模型配置反向推断依赖。
 
-`dependencies` 只声明资源 ID 和可选来源。来源可以是本机路径或 URL，当前 Loader 只校验并保存，
-不负责下载或复制；安装流程会在后续阶段按本机资源查找优先级处理来源。
+清单需 `schema_version = 1`。模型名 trim 后不能为空，长度受限且无控制字符。
+可选 temperature 必须有限并在 `[0, 2]`，top_p 必须有限并在 `[0, 1]`，
+max_output_tokens 不能为 0。stop 数量及单项字节长度受限。
+模型路由是否存在、backend 是否可用不属于 Loader 校验。
 
-### 提示词文档
-
-提示词依赖以 `prompt:<scope>/<name>:<tag>` 形式声明，Loader 在镜像根目录查找
-`<name 大写>.md`：
-
-```text
-prompt:system/soul:latest   → SOUL.md
-prompt:system/test:latest   → TEST.md
-prompt:user/test:latest     → TEST.md
-```
-
-`scope` 就是消息类型：只允许 `system` 或 `user`，最终注入上下文时分别作为 `System` 或
-`User` 消息。提示词文档本身不关心自己的消息类型，以什么 scope 写进依赖就注入什么类型。
-
-同一份 `.md` 文档可以被多个 prompt 依赖引用，只要 scope 不同；相同 scope 和 name 的 prompt
-依赖不允许重复声明，即使 tag 不同。
+`base.lua` 保存为普通 UTF-8 源码和 origin 路径。不计算 source hash、不编译或执行 Lua，
+不解析 IMPORT、INJECT 或默认可见性。读取不承诺两个文件的原子版本快照，
+也不提供恶意并发路径替换场景下无 TOCTOU 的文件打开保证。
 
 ## 安装
 
 ```rust
-use std::path::PathBuf;
-
-use agent_image_loader_plugin::AgentImageLoaderPlugin;
+use agent_image_loader_plugin::AgentImagePlugin;
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
+use closure_plugin::{AppClosureExt, ClosurePlugin};
 use core_plugin::App;
-use resource_id_plugin::ResourceIdPlugin;
+use resource_id_plugin::ResourcePlugin;
 
-let data_root = PathBuf::from("/home/user/.margatroid");
-let agent_image_loader = AgentImageLoaderPlugin::open(data_root.join("agent-images"))?;
-
+let plugin = AgentImagePlugin::open("/home/user/.margatroid/agent-images")?;
 let mut app = App::new();
 app.add_plugin(RuntimePlugin::default())
     .add_plugin(AsyncRuntimePlugin)
-    .add_plugin(ResourceIdPlugin)
-    .add_plugin(agent_image_loader);
+    .add_plugin(ClosurePlugin)
+    .add_closure_system(RuntimePlugin::PRE_UPDATE)
+    .add_plugin(ResourcePlugin)
+    .add_plugin(plugin);
 ```
 
-官方 daemon 组合负责确定主目录并传入绝对路径。Loader 不根据当前工作目录猜测位置，也不要求
-InferencePlugin、WorkspacePlugin 或 ToolPlugin 已经安装。
+`open` 要求绝对路径且无父级跳转，消除 `.`，不创建目录也不预扫描。
+加载请求时才检查根是否存在。`with_schedule` 和 `with_limits` 可配置计划及读取限制。
+插件要求应用已经为目标计划注册 ClosureSystem，不重复安装；不依赖 Workspace 或 Inference 安装标记。
 
-## 加载镜像
+`AgentImageLoadLimits` 默认值：manifest 64 KiB、script 4 MiB、model ID 1024 字节、
+最多 128 个 stop、单 stop 最多 4096 字节。manifest 和 script 都最多读取上限加一字节后判定超限。
 
-WorkspacePlugin 为 Workspace 文件中的每个 Agent 发送加载请求：
+## 请求与目标挂载
 
 ```rust
-use agent_image_loader_plugin::LoadAgentImage;
 use app_runtime_plugin::WorldEventExt;
-use margatroid_types::ResourceRef;
+use margatroid_types::agent_image_events::LoadAgentImage;
+use resource_id_plugin::ResourceID;
 
+let target = world.spawn();
 world.send_event(LoadAgentImage {
     id: "workspace/demo/coder".into(),
-    reference: ResourceRef::parse("image:local/coder:latest")?,
+    target,
+    resource_id: ResourceID::parse("image:local/coder:latest")?,
 });
 ```
 
-加载不会阻塞当前帧。完成后 Loader 在主线程创建或刷新 AgentImage Entity，再发送结果：
+异步读取完成不意味着业务成功。唯一主线程 System 在挂载时再次检查完整目标 Entity 的 generation，
+克隆旧集合，仅插入或替换请求 key，再经受检 `insert_resources` 挂到目标。
+目标 index 被新 Entity 复用时，旧结果不能写入新 generation。
 
 ```rust
-use agent_image_loader_plugin::{AgentImage, LoadAgentImageResult};
 use core_plugin::World;
-use margatroid_types::ResourceId;
+use margatroid_types::{agent_image_events::LoadAgentImageResult, resource_components::AgentImage};
+use resource_id_plugin::ResourceSet;
 
 fn inspect_loaded_images(world: &mut World) {
     for event in world.event_reader::<LoadAgentImageResult>() {
-        let image = match &event.result {
-            Ok(image) => *image,
-            Err(error) => {
-                tracing::error!(
-                    request_id = %event.id,
-                    reference = %event.reference,
-                    %error,
-                    "agent image load failed"
-                );
-                continue;
+        match &event.result {
+            Ok(()) => {
+                let image = world.get_component::<ResourceSet<AgentImage>>(event.target)
+                    .and_then(|set| set.get(&event.resource_id))
+                    .expect("successful load must mount the requested key");
+                tracing::info!(model = %image.model.model, bytes = image.base_driver.len(), "image mounted");
             }
-        };
-
-        let identity = world
-            .get_component::<ResourceId>(image)
-            .expect("successful load must attach identity");
-        let image = world
-            .get_component::<AgentImage>(image)
-            .expect("successful load must attach AgentImage");
-
-        tracing::info!(
-            ?image,
-            reference = %identity.as_ref(),
-            model = image.model().model(),
-            base_driver_bytes = image.base_driver().source().len(),
-            "agent image loaded"
-        );
+            Err(error) => tracing::error!(id = %event.id, %error, "image load failed"),
+        }
     }
 }
 ```
 
-真正的消费者是 WorkspacePlugin。它必须等镜像和其他启动依赖全部成功后再创建 AgentInstance，
-不能在收到第一个成功结果时留下半成品运行对象。
+每个请求独立读取，不合并不同目标的同 ID。更新一个目标不传播其他目标。
+同 target 同 key 并发暂按挂载发生顺序覆盖，不保证最新提交优先。
+读取失败、目标失效或挂载失败均不删除旧集合/旧 key；其他 keys 保持不变。
 
-## Base Driver
+## 监督与错误
 
-`AgentImageBaseDriver` 保存镜像根目录 `base.lua` 的普通 Lua 数据：UTF-8 源码、来源路径和
-源码 SHA-256 哈希，通过 `source()`、`origin()`、`source_hash()` 读取。它不是独立资源，
-不派生 `mcl:` ID，也不进行 MCL 编译或 Lua 语法验证；Workspace 将源码交给 Lua runtime。
-资源依赖仍由 `agent.toml` 的 `dependencies` 声明；Lua 中调用的 MCL `IMPORT` 等指令仍正常执行，
-默认和动态工具可见性仍由 MCL 数组管理，资源解析规则不变。
-
-禁用始终优先。合并后的 `AgentDefaultVisibility` 交给 AgentPlugin；AgentPlugin 创建实例时复制出
-初始 `AgentDynamicVisibility`。前者只读，后者代表运行中的实际可见资源。
-AgentImage 后续刷新不会改变运行中实例；执行 `workspace reload` 后创建的新实例才使用新默认值。
-
-资源内容不进入可见性数据。WorkspacePlugin 同时挂载 `AgentToolEnvironment`；每次请求由
-WorkspacePlugin 遍历动态可见资源并交给 ToolPlugin 注册工具；具体执行器从
-`AgentToolEnvironment` 取得项目根和镜像根。shell 资源不注册为模型工具，IMPORT 时只把解释器脚本
-放入 AgentResourceMap，供 Lua 工具的 `margatroid().shell` 使用。
+外层异步响应使用框架的 `Result<AgentImageReadOutput, AsyncTaskError>`，不是裸输出事件。
+共享输出字段为：
 
 ```text
-项目级 .margatroid/<资源目录>/<scope>/<name>/<tag>
-→ AgentImage 内置 <资源目录>/<scope>/<name>/<tag>
-→ 主目录 ~/.margatroid/<资源目录>/<scope>/<name>/<tag>
+request: LoadAgentImage
+result: Result<AgentImage, ImageLoadError>
+completed: Arc<AtomicBool>
+supervision: Arc<dyn Send + Sync>
 ```
 
-资源目录按类型分别为 `skills/`、`hooks/`、`tools/`、`shells/`。修改已有资源内容会在下一次
-使用时生效；添加全新逻辑名称需要 `workspace reload`。
+`supervision` 持续拥有插件私有 `CompletionGuard`，从闭包捕获直到输出最后一份 clone 释放。
+没有 armed 字段，也不会在读取返回时解除 guard。任务取消、panic 或未消费输出被丢弃时，
+最后一份未完成 guard 发送一次关联失败；主线程发送正常业务结果后才设置 completed，
+正常释放或重复输出不重复回执。不新增 oneshot 或公共完成 trait，不修改 Workspace 依赖协议。
+Runtime 整体关闭后不保证事件继续被消费。
 
-## 模型配置边界
+共享 `ImageLoadError` 只有 `message`，无 ErrorKind；插件产生的描述限制为 512 UTF-8 字节。
+`AgentImageLoadError` 是该错误的兼容别名。
 
-`AgentImageModelConfig` 只读保存模型 ID 文本和 `agent.toml` 中的参数原值。Loader 不验证温度
-范围、停止序列业务规则，也不查询模型路由。
+## 验证
 
-WorkspacePlugin 创建 AgentInstance 时把该配置交给 InferencePlugin。InferencePlugin 负责：
-
-```text
-AgentImageModelConfig
-→ ModelId + InferenceParameters
-→ 参数业务验证
-→ 项目级 / 全局模型路由检查
-→ AgentInferenceSnapshot
+```sh
+cargo check -p agent_image_loader_plugin
+cargo test -p agent_image_loader_plugin
 ```
 
-这样 AgentImageLoaderPlugin 不依赖任何推理实现，未来替换 InferencePlugin 也不需要改变镜像
-加载层。
+14 项测试覆盖真实目标挂载与其他 keys 保留、多目标独立、成功重载、失败保旧、
+目标 generation 复用、忽略非自有文件/目录/symlink、自有 symlink 拒绝、两文件边界与 UTF-8、
+依赖 source/非法 ID/模型参数校验、构造无 mkdir 和路径检查，以及 guard 取消、panic、
+输出丢弃、重复失败恰好一次回执。
 
-## 失败语义
-
-以下情况会返回 `AgentImageLoadError`：
-
-- 镜像不存在或引用越界。
-- AgentImage 顶层出现 symlink、设备文件或非法结构。
-- `agent.toml`、Base Driver 或目录入口数量超过加载限制。
-- `agent.toml` 无法解析、版本不支持或模型配置缺少基本字段。
-- prompt 依赖缺少对应的 `<name 大写>.md` 文件。
-- prompt 依赖的 scope 不是 `system` 或 `user`。
-- 相同 scope 和 name 的 prompt 依赖重复声明。
-- 静态文件或资源目录在加载期间发生变化。
-
-加载成功不代表推理参数、模型路由或资源内容已经通过业务验证。失败不会创建半成品 Entity，
-也不会覆盖上一次成功加载的镜像内容；WorkspacePlugin 必须让本次启动或重载失败。
-
-完整类型、函数和执行逻辑见 [DESIGN.md](DESIGN.md)。
+完整六板块契约见 [DESIGN](<DESIGN.md>)。

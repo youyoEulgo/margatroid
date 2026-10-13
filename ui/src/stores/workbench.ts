@@ -1,43 +1,28 @@
-import { computed, reactive, ref } from 'vue';
+import { computed, ref } from 'vue';
 import { defineStore } from 'pinia';
-
 import {
   parseServerMessage,
+  isRecord,
+  isAgentMessage,
+  errorMessage,
   type AgentHistory,
   type AgentMessage,
   type AgentState,
   type ClientInfo,
   type ClientMessage,
-  type ResourceRef,
+  type HistoryMessage,
+  type ServerMessage,
+  type StreamDelta,
   type ToolCall,
   type WorkspaceInfo,
   type WorkspaceRef,
 } from '@/types/protocol';
 
-const DEFAULT_ENDPOINT = sameOriginEndpoint();
-const MAX_LOGS = 500;
-
-function sameOriginEndpoint(): string {
-  if (typeof window === 'undefined' || !window.location?.host) {
-    return 'ws://127.0.0.1:3939/ws';
-  }
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}/ws`;
-}
-
 export type ConnectionStatus = 'offline' | 'connecting' | 'online';
 export type MessageRole = 'system' | 'user' | 'assistant' | 'tool' | 'error' | 'record';
-
-export interface ConversationRecord {
-  kind: string;
-  content: string;
-  payload: string;
-}
-
 export interface ConversationEntry {
   key: string;
   id: string;
-  sequence: number;
   workspaceKey: string;
   agent: string;
   role: MessageRole;
@@ -46,9 +31,9 @@ export interface ConversationEntry {
   toolCalls: ToolCall[];
   failed: boolean;
   timestamp: number;
-  record: ConversationRecord | null;
+  kind: string;
+  payload: unknown;
 }
-
 export interface RuntimeLog {
   key: string;
   timestamp: number;
@@ -57,468 +42,506 @@ export interface RuntimeLog {
   message: string;
   fields: Array<{ name: string; value: string }>;
 }
-
-interface PendingMessageRoute {
-  workspaceKey: string;
-  agent: string;
-}
-
-interface CurrentMessage extends ConversationEntry {
+interface StreamEntry extends ConversationEntry {
+  instance: string;
+  lastSequence: number;
   completed: boolean;
-  backendAgentId: string;
 }
-
-interface PendingMclCommand {
+interface PendingCommand {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
 }
-
+const MAX_LOGS = 500;
+function defaultEndpoint(): string {
+  if (typeof window === 'undefined') return 'ws://127.0.0.1:3939/ws';
+  return `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
+}
+export function workspaceKey(workspace: WorkspaceRef): string {
+  return workspace.id;
+}
+export function resourceName(resource: string): string {
+  return resource.split('/').pop()?.split(':')[0] || resource;
+}
+export function contextInjection(
+  content: string,
+  path: string,
+): { command: string; arguments: unknown[][] } {
+  if (!path.trim() || !/^[A-Za-z_][A-Za-z0-9_.\[\]-]*$/.test(path.trim()))
+    throw new Error('Configure a valid driver context path before injecting a message');
+  return { command: `INJECT ? TO ${path.trim()}`, arguments: [[{ type: 'user', content }]] };
+}
+export function parseArguments(raw: string): unknown[][] {
+  const value: unknown = JSON.parse(raw);
+  if (!Array.isArray(value) || !value.every(Array.isArray))
+    throw new Error('Arguments must be a JSON array of arrays, one array per ? placeholder');
+  return value;
+}
+export function historyEntries(history: AgentHistory): ConversationEntry[] {
+  return history.messages.flatMap((entry) => {
+    const base = {
+      key: `${workspaceKey(history.workspace)}:${history.agent}:${entry.key}`,
+      id: payloadRequestId(entry),
+      workspaceKey: workspaceKey(history.workspace),
+      agent: history.agent,
+      timestamp: entry.created_at_ms,
+      kind: entry.kind,
+      payload: entry.payload,
+    };
+    const payload =
+      isRecord(entry.payload) && isAgentMessage(entry.payload.message)
+        ? entry.payload.message
+        : entry.payload;
+    if (isAgentMessage(payload))
+      return decodeMessage(payload).map((message, index) => ({
+        ...base,
+        ...message,
+        key: `${base.key}:${index}`,
+      }));
+    return [
+      {
+        ...base,
+        role: 'record' as const,
+        thinking: '',
+        content: entry.content,
+        toolCalls: [],
+        failed: false,
+      },
+    ];
+  });
+}
+function payloadRequestId(entry: HistoryMessage): string {
+  return isRecord(entry.payload) && typeof entry.payload.id === 'string'
+    ? entry.payload.id
+    : entry.key;
+}
+function decodeMessage(
+  message: AgentMessage,
+): Array<Pick<ConversationEntry, 'role' | 'thinking' | 'content' | 'toolCalls' | 'failed'>> {
+  switch (message.type) {
+    case 'inject':
+      return message.messages.flatMap(decodeMessage);
+    case 'system':
+    case 'user':
+      return [
+        {
+          role: message.type,
+          thinking: '',
+          content: message.content,
+          toolCalls: [],
+          failed: false,
+        },
+      ];
+    case 'assistant':
+      return [
+        {
+          role: 'assistant',
+          thinking: message.reasoning ?? '',
+          content: message.content ?? '',
+          toolCalls: message.tool_calls,
+          failed: false,
+        },
+      ];
+    case 'tool_call':
+      return [
+        {
+          role: 'tool',
+          thinking: '',
+          content: message.content,
+          toolCalls: [],
+          failed: message.failed,
+        },
+      ];
+    case 'error':
+      return [
+        { role: 'error', thinking: '', content: message.message, toolCalls: [], failed: true },
+      ];
+  }
+}
 export const useWorkbenchStore = defineStore('workbench', () => {
-  const endpoint = ref(DEFAULT_ENDPOINT);
+  const endpoint = ref(defaultEndpoint());
+  const driverContextPath = ref('');
   const connectionStatus = ref<ConnectionStatus>('offline');
   const connectionError = ref('');
   const registeredClient = ref<ClientInfo | null>(null);
   const workspaces = ref<WorkspaceInfo[]>([]);
   const agentStates = ref<AgentState[]>([]);
+  const histories = ref<AgentHistory[]>([]);
   const selectedWorkspaceKey = ref('');
   const selectedAgent = ref<string | null>(null);
-  const messages = ref<ConversationEntry[]>([]);
-  const currentMessages = ref<Map<string, CurrentMessage>>(new Map());
-  const pendingRoutes = reactive(new Map<string, PendingMessageRoute>());
   const logs = ref<RuntimeLog[]>([]);
-  const lastFailures = ref<Map<string, { kind: string; message: string }>>(new Map());
-  const pendingMclCommands = new Map<string, PendingMclCommand>();
-
+  const streams = ref(new Map<string, StreamEntry>());
+  const pending = new Map<string, PendingCommand>();
+  const completedStreams = new Set<string>();
   let socket: WebSocket | null = null;
-  let reconnectTimer: number | undefined;
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let reconnectAttempt = 0;
   let shouldReconnect = true;
-
   const selectedWorkspace = computed(
-    () =>
-      workspaces.value.find(
-        (workspace) => workspaceKey(workspace) === selectedWorkspaceKey.value,
-      ) ?? null,
+    () => workspaces.value.find((w) => workspaceKey(w) === selectedWorkspaceKey.value) ?? null,
   );
-
-  const selectedAgentName = computed(() => {
-    if (selectedAgent.value) return resourceName(selectedAgent.value);
-    return selectedWorkspace.value?.manager
-      ? resourceName(selectedWorkspace.value.manager)
-      : 'Manager';
-  });
-
-  const selectedAgentState = computed(() => {
-    const workspace = selectedWorkspace.value;
-    if (!workspace) return null;
-    const agent = selectedAgent.value || workspace.manager;
-    return (
+  const selectedAgentId = computed(
+    () => selectedAgent.value || selectedWorkspace.value?.manager || '',
+  );
+  const selectedAgentName = computed(() => resourceName(selectedAgentId.value) || 'Manager');
+  const selectedAgentState = computed(
+    () =>
       agentStates.value.find(
         (state) =>
-          workspaceKey(state.workspace) === workspaceKey(workspace) && state.agent === agent,
-      ) ?? null
-    );
-  });
-
-  const selectedAgentReady = computed(() => selectedAgentState.value?.status === 'ready');
-  const selectedAgentWorking = computed(() => {
-    if (selectedAgentState.value?.working === true) return true;
-    const workspace = selectedWorkspace.value;
-    if (!workspace) return false;
-    const key = workspaceKey(workspace);
-    const agent = selectedAgent.value || workspace.manager;
-    return [...pendingRoutes.values()].some(
-      (route) => route.workspaceKey === key && route.agent === agent,
-    );
-  });
-
-  const resourceVisibility = computed(() => {
-    const state = selectedAgentState.value;
-    if (!state) return [];
-    const defaults = new Set(state.default_resources);
-    const visible = new Set(state.visible_resources);
-    return [...new Set([...defaults, ...visible])].sort().map((resource) => ({
-      resource,
-      default: defaults.has(resource),
-      visible: visible.has(resource),
-    }));
-  });
-
-  const sandboxOptions = computed(() => {
-    const state = selectedAgentState.value;
-    const exposed = state?.exposed?.sandbox;
-    const options = Array.isArray(exposed?.options) ? (exposed.options as string[]) : [];
-    const activated = Array.isArray(exposed?.activated) ? (exposed.activated as string[]) : [];
-    return {
-      options: [...options].sort(),
-      activated,
-    };
-  });
-
+          state.workspace.id === selectedWorkspace.value?.id &&
+          state.agent === selectedAgentId.value,
+      ) ?? null,
+  );
+  const selectedAgentReady = computed(() => selectedAgentState.value?.status === 'running');
+  const selectedAgentWorking = computed(() => !!selectedAgentState.value?.pending_command);
+  const loadedResources = computed(() => selectedAgentState.value?.resources ?? []);
+  const selectedHistory = computed(() =>
+    histories.value.find(
+      (h) => h.workspace.id === selectedWorkspace.value?.id && h.agent === selectedAgentId.value,
+    ),
+  );
   const visibleMessages = computed(() => {
-    const workspace = selectedWorkspace.value;
-    if (!workspace) return [];
-
-    const routeAgent = selectedAgent.value || workspace.manager;
-    const history = messages.value.filter((entry) => {
-      if (entry.workspaceKey !== workspaceKey(workspace)) return false;
-      if (selectedAgent.value) return entry.agent === selectedAgent.value;
-      return workspace.manager ? entry.agent === workspace.manager : true;
-    });
-    const current = [...currentMessages.value.values()].filter(
-      (entry) => entry.workspaceKey === workspaceKey(workspace) && entry.agent === routeAgent,
+    const history = selectedHistory.value ? historyEntries(selectedHistory.value) : [];
+    const live = [...streams.value.values()].filter(
+      (s) => s.workspaceKey === selectedWorkspaceKey.value && s.agent === selectedAgentId.value,
     );
-    return [...history, ...current];
+    return [
+      ...history,
+      ...live.filter((s) => !history.some((h) => h.id === s.id && h.role === 'assistant')),
+    ];
   });
-
-  function connect(nextEndpoint?: string): boolean {
-    if (nextEndpoint !== undefined) {
+  const tokenUsage = computed(() => {
+    let input = 0,
+      output = 0,
+      cached = 0;
+    for (const row of selectedHistory.value?.messages ?? []) {
+      const value = isRecord(row.payload) ? row.payload : null;
+      const message = value && isRecord(value.message) ? value.message : value;
+      const usage = message && isRecord(message.usage) ? message.usage : null;
+      if (!usage) continue;
+      input += typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
+      output += typeof usage.output_tokens === 'number' ? usage.output_tokens : 0;
+      cached += typeof usage.cache_hit_tokens === 'number' ? usage.cache_hit_tokens : 0;
+    }
+    return { input, output, cached };
+  });
+  function addLog(
+    level: string,
+    message: string,
+    target = 'ui',
+    fields: RuntimeLog['fields'] = [],
+  ) {
+    logs.value.push({
+      key: crypto.randomUUID(),
+      timestamp: Date.now(),
+      level,
+      message,
+      target,
+      fields,
+    });
+    if (logs.value.length > MAX_LOGS) logs.value.splice(0, logs.value.length - MAX_LOGS);
+  }
+  function rejectPending(message: string) {
+    for (const command of pending.values()) {
+      clearTimeout(command.timeout);
+      command.reject(new Error(message));
+    }
+    pending.clear();
+  }
+  function closeSocket() {
+    if (socket) {
+      socket.onclose = null;
+      socket.close();
+      socket = null;
+    }
+    registeredClient.value = null;
+    streams.value = new Map();
+    rejectPending('Backend WebSocket closed');
+  }
+  function connect(rawEndpoint?: string): boolean {
+    if (rawEndpoint !== undefined) {
       try {
-        endpoint.value = normalizeEndpoint(nextEndpoint);
+        endpoint.value = normalizeEndpoint(rawEndpoint);
       } catch (error) {
-        connectionError.value = error instanceof Error ? error.message : String(error);
+        connectionError.value = errorMessage(error instanceof Error ? error.message : error);
         return false;
       }
     }
-
     shouldReconnect = true;
-    clearReconnectTimer();
+    clearTimeout(reconnectTimer);
     closeSocket();
-    clearCurrentMessages();
     connectionError.value = '';
     connectionStatus.value = 'connecting';
-
-    const nextSocket = new WebSocket(endpoint.value);
-    socket = nextSocket;
-
-    nextSocket.onopen = () => {
-      if (socket !== nextSocket) return;
-      const registration: ClientMessage = {
+    const next = new WebSocket(endpoint.value);
+    socket = next;
+    next.onopen = () => {
+      if (socket !== next) return;
+      const request: ClientMessage = {
         type: 'connection.register',
         id: crypto.randomUUID(),
-        message: {
-          client_type: 'webui',
-        },
+        message: { client_type: 'webui' },
       };
-      nextSocket.send(JSON.stringify(registration));
+      next.send(JSON.stringify(request));
     };
-
-    nextSocket.onmessage = (event) => {
-      if (typeof event.data !== 'string') return;
-      const message = parseServerMessage(event.data);
-      if (message) handleServerMessage(message);
+    next.onmessage = (event) => {
+      if (socket !== next || typeof event.data !== 'string') return;
+      const parsed = parseServerMessage(event.data);
+      if (parsed) handleServerMessage(parsed);
+      else addLog('WARN', 'Ignored an invalid or unsupported backend message');
     };
-
-    nextSocket.onerror = () => {
-      if (socket === nextSocket) connectionError.value = 'Unable to reach the daemon';
+    next.onerror = () => {
+      if (socket === next) connectionError.value = 'Unable to reach the daemon';
     };
-
-    nextSocket.onclose = () => {
-      if (socket !== nextSocket) return;
+    next.onclose = () => {
+      if (socket !== next) return;
       socket = null;
       connectionStatus.value = 'offline';
       registeredClient.value = null;
-      clearCurrentMessages();
-      rejectPendingMclCommands('Backend WebSocket disconnected');
-      if (shouldReconnect) scheduleReconnect();
+      streams.value = new Map();
+      rejectPending('Backend WebSocket disconnected');
+      if (shouldReconnect) {
+        const delay = Math.min(1000 * 2 ** reconnectAttempt++, 10000);
+        reconnectTimer = setTimeout(() => connect(), delay);
+      }
     };
     return true;
   }
-
   function disconnect() {
     shouldReconnect = false;
-    clearReconnectTimer();
+    clearTimeout(reconnectTimer);
     closeSocket();
-    clearCurrentMessages();
     connectionStatus.value = 'offline';
-    registeredClient.value = null;
   }
-
+  function queryHistory() {
+    const workspace = selectedWorkspace.value;
+    if (workspace && socket?.readyState === WebSocket.OPEN && registeredClient.value) {
+      const request: ClientMessage = {
+        type: 'history.query',
+        id: crypto.randomUUID(),
+        message: { workspace, agent: selectedAgent.value },
+      };
+      socket.send(JSON.stringify(request));
+    }
+  }
   function selectWorkspace(key: string) {
     selectedWorkspaceKey.value = key;
     selectedAgent.value = null;
+    queryHistory();
   }
-
   function selectAgent(agent: string | null) {
     selectedAgent.value = agent;
+    queryHistory();
   }
-
-  function sendMessage(content: string): string | null {
-    const workspace = selectedWorkspace.value;
-    const text = content.trim();
-    if (!workspace || !text) return null;
-    if (!selectedAgentReady.value) {
-      connectionError.value = selectedAgentState.value?.error || 'The selected agent is not ready';
-      return null;
-    }
-    if (selectedAgentWorking.value) return null;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      connectionError.value = 'Connect to the daemon before sending a message';
-      return null;
-    }
-
-    const requests = entryRequests(workspaceReference(workspace), selectedAgent.value, {
-      type: 'user',
-      content: text,
-    });
-    lastFailures.value.delete(
-      `${workspaceKey(workspace)}:${selectedAgent.value || workspace.manager}`,
-    );
-    for (const request of requests) {
-      socket!.send(JSON.stringify(request));
-    }
-    return requests[0]!.id;
-  }
-
   function executeMclCommand(
     command: string,
-    binding: unknown = null,
-    requestId = crypto.randomUUID(),
+    argumentsValue: unknown[][] = [],
+    id = crypto.randomUUID(),
   ): Promise<unknown> {
     const workspace = selectedWorkspace.value;
-    const source = command.trim();
-    if (!workspace || !source) return Promise.reject(new Error('MCL command is empty'));
-    if (!selectedAgentReady.value) {
-      return Promise.reject(
-        new Error(selectedAgentState.value?.error || 'The selected agent is not ready'),
-      );
-    }
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new Error('Connect to the daemon before executing an MCL command'));
-    }
-    const id = requestId;
+    if (!workspace || !command.trim())
+      return Promise.reject(new Error('Select a workspace and enter an MCL command'));
+    if (!selectedAgentReady.value)
+      return Promise.reject(new Error('The selected agent is not running'));
+    if (!Array.isArray(argumentsValue) || !argumentsValue.every(Array.isArray))
+      return Promise.reject(new Error('Arguments must be arrays'));
+    if (!socket || socket.readyState !== WebSocket.OPEN || !registeredClient.value)
+      return Promise.reject(new Error('Register a daemon connection first'));
     const request: ClientMessage = {
       type: 'mcl.command',
       id,
       message: {
-        workspace: workspaceReference(workspace),
+        workspace: { id: workspace.id, name: workspace.name, project_root: workspace.project_root },
         agent: selectedAgent.value,
-        command: source,
-        binding,
+        command: command.trim(),
+        arguments: argumentsValue,
       },
     };
     return new Promise((resolve, reject) => {
-      pendingMclCommands.set(id, { resolve, reject });
+      const timeout = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error('MCL result timed out; the backend command may still be running'));
+      }, 120000);
+      pending.set(id, { resolve, reject, timeout });
       try {
-        socket?.send(JSON.stringify(request));
+        socket!.send(JSON.stringify(request));
       } catch (error) {
-        pendingMclCommands.delete(id);
+        clearTimeout(timeout);
+        pending.delete(id);
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
   }
-
-  async function sendSkillInvocation(content: string, resourceId: ResourceRef): Promise<string> {
-    const workspace = selectedWorkspace.value;
-    const text = content.trim();
-    if (!workspace || !selectedAgentReady.value) {
-      throw new Error(selectedAgentState.value?.error || 'The selected agent is not ready');
+  function sendMessage(content: string): Promise<unknown> {
+    if (!content.trim()) return Promise.reject(new Error('Message is empty'));
+    try {
+      const instruction = contextInjection(content.trim(), driverContextPath.value);
+      return executeMclCommand(instruction.command, instruction.arguments);
+    } catch (error) {
+      return Promise.reject(error);
     }
-    if (selectedAgentWorking.value) throw new Error('The selected agent is already working');
-    if (!resourceId.startsWith('skill:') && !resourceId.startsWith('hook:')) {
-      throw new Error('Only Skill or Hook resources can be loaded');
-    }
-    if (!selectedAgentState.value?.visible_resources.includes(resourceId)) {
-      throw new Error('The selected Skill is not visible to this agent');
-    }
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      throw new Error('Connect to the daemon before loading a Skill');
-    }
-    const workspaceRef = workspaceReference(workspace);
-    const agentRef = selectedAgent.value || workspace.manager;
-    if (text) {
-      for (const request of entryRequests(workspaceRef, agentRef, {
-        type: 'inject',
-        messages: [{ type: 'user', content: text }],
-      })) {
-        socket.send(JSON.stringify(request));
-      }
-    }
-    const mapping = selectedAgentState.value?.resources.find(
-      (entry) => entry.resource_id === resourceId,
+  }
+  function handleDelta(event: StreamDelta, reasoning: boolean) {
+    const state = agentStates.value.find(
+      (s) => s.agent === event.agent && s.agent_instance === event.agent_instance,
     );
-    if (!mapping) {
-      throw new Error('The selected Skill has no callable resource name for this agent');
-    }
-    const requests = entryRequests(workspaceRef, agentRef, {
-      type: 'assistant',
-      reasoning: null,
-      content: null,
-      tool_calls: [
-        {
-          id: `manual-${crypto.randomUUID()}`,
-          tool_name: mapping.resource_name,
-          arguments: '{}',
-        },
-      ],
-    });
-    lastFailures.value.delete(
-      `${workspaceKey(workspace)}:${selectedAgent.value || workspace.manager}`,
-    );
-    for (const request of requests) {
-      socket!.send(JSON.stringify(request));
-    }
-    return requests[0]!.id;
+    if (!state) return;
+    const key = `${event.agent_instance}:${event.id}`;
+    if (completedStreams.has(key)) return;
+    const old = streams.value.get(key);
+    if (old && (old.completed || event.sequence <= old.lastSequence)) return;
+    const message: StreamEntry = old
+      ? { ...old }
+      : {
+          key,
+          id: event.id,
+          workspaceKey: workspaceKey(state.workspace),
+          agent: event.agent,
+          role: 'assistant',
+          thinking: '',
+          content: '',
+          toolCalls: [],
+          failed: false,
+          timestamp: Date.now(),
+          kind: 'stream',
+          payload: null,
+          instance: event.agent_instance,
+          lastSequence: -1,
+          completed: false,
+        };
+    if (reasoning) message.thinking += event.content;
+    else message.content += event.content;
+    message.lastSequence = event.sequence;
+    streams.value = new Map(streams.value).set(key, message);
   }
-
-  function abortTurn(): string | null {
-    const workspace = selectedWorkspace.value;
-    if (
-      !workspace ||
-      !selectedAgentReady.value ||
-      !selectedAgentWorking.value ||
-      !socket ||
-      socket.readyState !== WebSocket.OPEN
-    )
-      return null;
-    const id = crypto.randomUUID();
-    const request: ClientMessage = {
-      type: 'agent.turn.abort',
-      id,
-      message: {
-        workspace: workspaceReference(workspace),
-        agent: selectedAgent.value,
-      },
-    };
-    socket.send(JSON.stringify(request));
-    return id;
-  }
-
-  function setResourceVisibility(resourceId: ResourceRef, visible: boolean): string | null {
-    const workspace = selectedWorkspace.value;
-    const state = selectedAgentState.value;
-    const source = state?.visibility_source;
-    if (
-      !workspace ||
-      !selectedAgentReady.value ||
-      !state?.default_resources.includes(resourceId) ||
-      !source ||
-      !socket ||
-      socket.readyState !== WebSocket.OPEN
-    )
-      return null;
-    const id = crypto.randomUUID();
-    const resources = visible
-      ? [...new Set([...state.visible_resources, resourceId])]
-      : state.visible_resources.filter((resource) => resource !== resourceId);
-    const command = `INJECT ? TO ${source.block_id}.${source.inner_id}`;
-    const request: ClientMessage = {
-      type: 'mcl.command',
-      id,
-      message: {
-        workspace: workspaceReference(workspace),
-        agent: selectedAgent.value,
-        command,
-        binding: resources,
-      },
-    };
-    socket.send(JSON.stringify(request));
-    return id;
-  }
-
-  function setSandbox(resource: string | null): string | null {
-    const workspace = selectedWorkspace.value;
-    const state = selectedAgentState.value;
-    const exposed = state?.exposed?.sandbox;
-    if (
-      !workspace ||
-      !selectedAgentReady.value ||
-      !socket ||
-      socket.readyState !== WebSocket.OPEN ||
-      !exposed
-    )
-      return null;
-    const activated = Array.isArray(exposed.activated) ? (exposed.activated as string[]) : [];
-    const next = resource ? [resource] : [];
-    if (sameStrings(activated, next)) return null;
-    const id = crypto.randomUUID();
-    const command = (text: string, binding: unknown) => {
-      const request: ClientMessage = {
-        type: 'mcl.command',
-        id: crypto.randomUUID(),
-        message: {
-          workspace: workspaceReference(workspace),
-          agent: selectedAgent.value,
-          command: text,
-          binding: binding as never,
-        },
-      };
-      socket!.send(JSON.stringify(request));
-    };
-    const label = resource ? resourceName(resource) : 'none';
-    logs.value.push({
-      key: `sandbox-log:${id}`,
-      timestamp: Date.now(),
-      level: 'INFO',
-      target: `agent/${selectedAgent.value || workspace.manager}`,
-      message: `sandbox set to ${label}`,
-      fields: [{ name: 'activated', value: next.join(',') || 'none' }],
-    });
-    if (logs.value.length > MAX_LOGS) logs.value.splice(0, logs.value.length - MAX_LOGS);
-    command('INJECT ? TO setting.sandbox_activated', next);
-    command('EMIT EFFECT sandbox_use FROM ?', next);
-    command('EMIT EFFECT history_record FROM ?', {
-      kind: 'mcl',
-      cmd: `sandbox ${label}`,
-      arg: next,
-    });
-    return id;
-  }
-
-  function clearLogs() {
-    logs.value = [];
-  }
-
-  function handleServerMessage(event: ReturnType<typeof parseServerMessage> & object) {
-    if (!event) return;
+  function handleServerMessage(event: ServerMessage) {
     switch (event.type) {
       case 'connection.registered':
         registeredClient.value = event.client;
         connectionStatus.value = 'online';
         connectionError.value = '';
         reconnectAttempt = 0;
+        socket?.send(
+          JSON.stringify({
+            type: 'state.query',
+            id: crypto.randomUUID(),
+            message: {},
+          } satisfies ClientMessage),
+        );
         break;
       case 'connection.register_failed':
-        connectionError.value = `Registration failed: ${event.error}`;
-        connectionStatus.value = 'offline';
-        registeredClient.value = null;
+        connectionError.value = errorMessage(event.error);
+        shouldReconnect = false;
         socket?.close();
         break;
-      case 'state.sync':
-        synchronizeWorkspaces(event.state.workspaces);
-        synchronizeAgentStates(event.state.agents);
-        synchronizeHistories(event.state.histories);
-        reconcileCurrentMessages();
+      case 'state.sync': {
+        workspaces.value = event.state.workspaces;
+        agentStates.value = event.state.agents;
+        histories.value = event.state.histories;
+        if (!workspaces.value.some((w) => w.id === selectedWorkspaceKey.value))
+          selectWorkspace(workspaces.value[0]?.id ?? '');
+        if (selectedAgent.value && !selectedWorkspace.value?.agents.includes(selectedAgent.value))
+          selectedAgent.value = null;
+        const allHistory = histories.value.flatMap(historyEntries);
+        streams.value = new Map(
+          [...streams.value].filter(
+            ([, stream]) =>
+              agentStates.value.some(
+                (s) =>
+                  s.agent === stream.agent &&
+                  s.workspace.id === stream.workspaceKey &&
+                  s.agent_instance === stream.instance,
+              ) && !allHistory.some((h) => h.id === stream.id && h.role === 'assistant'),
+          ),
+        );
         break;
+      }
       case 'workspace.started':
-        upsertWorkspace(event.workspace);
-        if (!selectedWorkspaceKey.value) selectWorkspace(workspaceKey(event.workspace));
+        workspaces.value = [
+          ...workspaces.value.filter((w) => w.id !== event.workspace.id),
+          event.workspace,
+        ];
+        if (!selectedWorkspaceKey.value) selectWorkspace(event.workspace.id);
+        break;
+      case 'workspace.stopped':
+        workspaces.value = workspaces.value.filter((w) => w.id !== event.workspace.id);
         break;
       case 'workspace.start_failed':
-        break;
-      case 'agent.message':
-        receiveAgentMessage(event.message);
+      case 'workspace.stop_failed':
+        addLog('ERROR', errorMessage(event.error));
         break;
       case 'mcl.command_result': {
-        const pending = pendingMclCommands.get(event.id);
-        if (!pending) break;
-        pendingMclCommands.delete(event.id);
-        if ('Ok' in event.result) pending.resolve(event.result.Ok);
-        else pending.reject(new Error(event.result.Err));
+        const command = pending.get(event.id);
+        if (command) {
+          clearTimeout(command.timeout);
+          pending.delete(event.id);
+          if ('Ok' in event.result) command.resolve(event.result.Ok);
+          else command.reject(new Error(errorMessage(event.result.Err)));
+        }
+        queryHistory();
+        if (event.history_error)
+          addLog(
+            'WARN',
+            `Command completed but history persistence failed: ${errorMessage(event.history_error)}`,
+          );
         break;
       }
       case 'agent.message.delta':
-        receiveMessageDelta(event);
+        handleDelta(event, false);
         break;
       case 'agent.message.reasoning_delta':
-        receiveThinkingDelta(event);
+        handleDelta(event, true);
         break;
-      case 'agent.failure':
-        receiveFailure(event.failure);
+      case 'history.result':
+        histories.value = [
+          ...histories.value.filter(
+            (h) => h.agent !== event.history.agent || h.workspace.id !== event.history.workspace.id,
+          ),
+          event.history,
+        ];
+        streams.value = new Map(
+          [...streams.value].filter(
+            ([, stream]) =>
+              !stream.completed ||
+              stream.agent !== event.history.agent ||
+              stream.workspaceKey !== event.history.workspace.id,
+          ),
+        );
         break;
+      case 'request.failed': {
+        const command = pending.get(event.id);
+        if (command) {
+          clearTimeout(command.timeout);
+          pending.delete(event.id);
+          command.reject(new Error(errorMessage(event.error)));
+        } else addLog('ERROR', errorMessage(event.error));
+        break;
+      }
+      case 'agent.message.finished': {
+        if (
+          !agentStates.value.some(
+            (state) => state.agent === event.agent && state.agent_instance === event.agent_instance,
+          )
+        )
+          break;
+        const key = `${event.agent_instance}:${event.id}`;
+        if (completedStreams.has(key)) break;
+        completedStreams.add(key);
+        if (completedStreams.size > 1000)
+          completedStreams.delete(completedStreams.values().next().value!);
+        const old = streams.value.get(key);
+        if (old)
+          streams.value = new Map(streams.value).set(key, {
+            ...old,
+            completed: true,
+            failed: !!event.error,
+          });
+        if (event.error) addLog('ERROR', errorMessage(event.error), event.agent);
+        queryHistory();
+        break;
+      }
       case 'log':
         logs.value.push({
-          key: `log:${event.record.timestamp_millis}:${logs.value.length}`,
+          key: crypto.randomUUID(),
           timestamp: event.record.timestamp_millis,
           level: event.record.level,
           target: event.record.target,
@@ -529,316 +552,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         break;
     }
   }
-
-  function receiveFailure(event: {
-    id: string;
-    workspace: WorkspaceRef;
-    agent: string;
-    kind: string;
-    message: string;
-  }) {
-    removeCurrentMessage(event.id);
-    lastFailures.value.set(`${workspaceKey(event.workspace)}:${event.agent}`, {
-      kind: event.kind,
-      message: event.message,
-    });
-    logs.value.push({
-      key: `failure-log:${event.id}:${Date.now()}`,
-      timestamp: Date.now(),
-      level: 'ERROR',
-      target: `agent/${event.agent}`,
-      message: event.message,
-      fields: [{ name: 'kind', value: event.kind }],
-    });
+  function clearLogs() {
+    logs.value = [];
   }
-
-  function receiveMessageDelta(event: { id: string; agent: string; content: string }) {
-    const route = resolveMessageRoute(event.id, event.agent);
-    if (!route || !routeIsWorking(route)) return;
-    const existing = currentMessages.value.get(event.id);
-    if (existing?.completed) return;
-    if (existing?.backendAgentId && existing.backendAgentId !== event.agent) return;
-
-    const next: CurrentMessage = existing
-      ? { ...existing, content: existing.content + event.content, backendAgentId: event.agent }
-      : {
-          key: `current:${event.id}`,
-          id: event.id,
-          sequence: Number.MAX_SAFE_INTEGER,
-          workspaceKey: route.workspaceKey,
-          agent: route.agent,
-          role: 'assistant',
-          thinking: '',
-          content: event.content,
-          toolCalls: [],
-          failed: false,
-          timestamp: Date.now(),
-          record: null,
-          completed: false,
-          backendAgentId: event.agent,
-        };
-    replaceCurrentMessage(event.id, next);
-  }
-
-  function receiveThinkingDelta(event: { id: string; agent: string; content: string }) {
-    const route = resolveMessageRoute(event.id, event.agent);
-    if (!route || !routeIsWorking(route)) return;
-    const existing = currentMessages.value.get(event.id);
-    if (existing?.completed) return;
-    if (existing?.backendAgentId && existing.backendAgentId !== event.agent) return;
-
-    const next: CurrentMessage = existing
-      ? {
-          ...existing,
-          thinking: existing.thinking + event.content,
-          backendAgentId: event.agent,
-        }
-      : {
-          key: `current:${event.id}`,
-          id: event.id,
-          sequence: Number.MAX_SAFE_INTEGER,
-          workspaceKey: route.workspaceKey,
-          agent: route.agent,
-          role: 'assistant',
-          thinking: event.content,
-          content: '',
-          toolCalls: [],
-          failed: false,
-          timestamp: Date.now(),
-          record: null,
-          completed: false,
-          backendAgentId: event.agent,
-        };
-    replaceCurrentMessage(event.id, next);
-  }
-
-  function receiveAgentMessage(event: {
-    id: string;
-    workspace: WorkspaceRef;
-    agent: string;
-    message: AgentMessage;
-  }) {
-    if (!('Assistant' in event.message)) return;
-    const route = pendingRoutes.get(event.id) ?? {
-      workspaceKey: workspaceKey(event.workspace),
-      agent: event.agent,
-    };
-    const existing = currentMessages.value.get(event.id);
-    const next: CurrentMessage = {
-      key: `current:${event.id}`,
-      id: event.id,
-      sequence: Number.MAX_SAFE_INTEGER,
-      workspaceKey: route.workspaceKey,
-      agent: route.agent,
-      role: 'assistant',
-      thinking: event.message.Assistant.reasoning ?? '',
-      content: event.message.Assistant.content ?? '',
-      toolCalls: event.message.Assistant.tool_calls,
-      failed: false,
-      timestamp: existing?.timestamp ?? Date.now(),
-      record: null,
-      completed: true,
-      backendAgentId: existing?.backendAgentId ?? '',
-    };
-    pendingRoutes.set(event.id, route);
-    replaceCurrentMessage(event.id, next);
-    reconcileCurrentMessages();
-  }
-
-  function reconcileCurrentMessages() {
-    for (const [id, current] of currentMessages.value) {
-      const state = agentStates.value.find(
-        (candidate) =>
-          workspaceKey(candidate.workspace) === current.workspaceKey &&
-          candidate.agent === current.agent,
-      );
-      if (!current.completed && state?.status === 'ready' && !state.working) {
-        removeCurrentMessage(id);
-        continue;
-      }
-      if (!current.completed) continue;
-      const persisted = messages.value.some(
-        (message) =>
-          message.id === id &&
-          message.workspaceKey === current.workspaceKey &&
-          message.agent === current.agent &&
-          message.role === 'assistant' &&
-          message.thinking === current.thinking &&
-          message.content === current.content &&
-          sameToolCalls(message.toolCalls, current.toolCalls),
-      );
-      if (persisted) removeCurrentMessage(id);
-    }
-    for (const [id, route] of pendingRoutes) {
-      if (currentMessages.value.has(id)) continue;
-      const state = agentStates.value.find(
-        (candidate) =>
-          workspaceKey(candidate.workspace) === route.workspaceKey && candidate.agent === route.agent,
-      );
-      if (state?.status === 'ready' && !state.working) pendingRoutes.delete(id);
-    }
-  }
-
-  function replaceCurrentMessage(id: string, message: CurrentMessage) {
-    const next = new Map(currentMessages.value);
-    next.set(id, message);
-    currentMessages.value = next;
-  }
-
-  function resolveMessageRoute(id: string, agent: string): PendingMessageRoute | undefined {
-    return (
-      pendingRoutes.get(id) ??
-      messages.value.find((message) => message.id === id && message.agent === agent)
-    );
-  }
-
-  function routeIsWorking(route: PendingMessageRoute): boolean {
-    return agentStates.value.some(
-      (state) =>
-        workspaceKey(state.workspace) === route.workspaceKey &&
-        state.agent === route.agent &&
-        state.status === 'ready' &&
-        state.working,
-    );
-  }
-
-  function removeCurrentMessage(id: string) {
-    pendingRoutes.delete(id);
-    if (!currentMessages.value.has(id)) return;
-    const next = new Map(currentMessages.value);
-    next.delete(id);
-    currentMessages.value = next;
-  }
-
-  function clearCurrentMessages() {
-    pendingRoutes.clear();
-    currentMessages.value = new Map();
-  }
-
-  function upsertWorkspace(workspace: WorkspaceInfo) {
-    const key = workspaceKey(workspace);
-    const index = workspaces.value.findIndex((candidate) => workspaceKey(candidate) === key);
-    const normalized = normalizeWorkspace(workspace);
-    if (index === -1) workspaces.value.push(normalized);
-    else workspaces.value[index] = normalized;
-  }
-
-  function synchronizeWorkspaces(snapshot: WorkspaceInfo[]) {
-    const next = snapshot
-      .map(normalizeWorkspace)
-      .filter((workspace) => workspace.name && workspace.project_root);
-    if (sameWorkspaceList(workspaces.value, next)) return;
-
-    workspaces.value = next;
-    if (!next.some((workspace) => workspaceKey(workspace) === selectedWorkspaceKey.value)) {
-      selectedWorkspaceKey.value = next[0] ? workspaceKey(next[0]) : '';
-      selectedAgent.value = null;
-    } else if (
-      selectedAgent.value &&
-      !selectedWorkspace.value?.agents.includes(selectedAgent.value)
-    ) {
-      selectedAgent.value = null;
-    }
-  }
-
-  function synchronizeHistories(histories: AgentHistory[]) {
-    messages.value = histories.flatMap((history) =>
-      history.messages.flatMap((entry): ConversationEntry[] => {
-        const base = {
-          key: `history:${workspaceKey(history.workspace)}:${history.agent}:${entry.sequence}`,
-          id: entry.turn_id,
-          sequence: entry.sequence,
-          workspaceKey: workspaceKey(history.workspace),
-          agent: history.agent,
-          timestamp: entry.created_at_ms,
-        };
-        if (entry.record) {
-          return [{
-            ...base,
-            role: 'record',
-            thinking: '',
-            content: entry.record.content,
-            toolCalls: [],
-            failed: false,
-            record: {
-              kind: entry.record.kind,
-              content: entry.record.content,
-              payload: entry.record.payload,
-            },
-          }];
-        }
-        const decoded = entry.message ? decodeMessage(entry.message) : null;
-        if (!decoded) return [];
-        return [{
-          ...base,
-          role: decoded.role,
-          thinking: decoded.thinking,
-          content: decoded.content,
-          toolCalls: decoded.toolCalls,
-          failed: decoded.failed,
-          record: null,
-        }];
-      }),
-    );
-  }
-
-  function synchronizeAgentStates(snapshot: AgentState[]) {
-    agentStates.value = snapshot.map((state) => ({
-      workspace: { ...state.workspace },
-      agent: state.agent,
-      status: state.status,
-      working: state.working === true,
-      error: state.error ?? null,
-      default_resources: [...(state.default_resources ?? [])],
-      visible_resources: [...state.visible_resources],
-      default_visibility_source: state.default_visibility_source
-        ? { ...state.default_visibility_source }
-        : null,
-      visibility_source: state.visibility_source
-        ? { ...state.visibility_source }
-        : null,
-      resources: (state.resources ?? []).map((entry) => ({ ...entry })),
-      exposed: Object.fromEntries(
-        Object.entries(state.exposed ?? {}).map(([domain, fields]) => [domain, { ...fields }]),
-      ),
-      mcl: state.mcl ? { ...state.mcl } : null,
-      total_input_tokens: state.total_input_tokens ?? 0,
-      total_output_tokens: state.total_output_tokens ?? 0,
-      total_cache_hit_tokens: state.total_cache_hit_tokens ?? 0,
-      cache_hit_rate: state.cache_hit_rate ?? 0,
-      last_input_tokens: state.last_input_tokens ?? 0,
-      context_window_tokens: state.context_window_tokens ?? 0,
-    }));
-  }
-
-  function scheduleReconnect() {
-    clearReconnectTimer();
-    const delay = Math.min(1000 * 2 ** reconnectAttempt, 10_000);
-    reconnectAttempt += 1;
-    reconnectTimer = window.setTimeout(() => connect(), delay);
-  }
-
-  function clearReconnectTimer() {
-    if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
-    reconnectTimer = undefined;
-  }
-
-  function closeSocket() {
-    if (!socket) return;
-    const current = socket;
-    socket = null;
-    current.onclose = null;
-    current.close();
-    rejectPendingMclCommands('Backend WebSocket closed');
-  }
-
-  function rejectPendingMclCommands(message: string) {
-    for (const pending of pendingMclCommands.values()) pending.reject(new Error(message));
-    pendingMclCommands.clear();
-  }
-
   return {
     endpoint,
+    driverContextPath,
     connectionStatus,
     connectionError,
     registeredClient,
@@ -851,158 +570,20 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedAgentState,
     selectedAgentReady,
     selectedAgentWorking,
-    resourceVisibility,
-    sandboxOptions,
-    setSandbox,
+    loadedResources,
     visibleMessages,
+    tokenUsage,
     logs,
     connect,
     disconnect,
     selectWorkspace,
     selectAgent,
-    lastFailures,
     sendMessage,
     executeMclCommand,
-    sendSkillInvocation,
-    abortTurn,
-    setResourceVisibility,
     clearLogs,
+    handleServerMessage,
   };
 });
-
-export function workspaceKey(workspace: WorkspaceRef): string {
-  return `${workspace.project_root}\u0000${workspace.name}`;
-}
-
-export function resourceName(resource: string): string {
-  const identity = resource.includes(':') ? resource.slice(resource.indexOf(':') + 1) : resource;
-  const withoutTag = identity.includes(':') ? identity.slice(0, identity.lastIndexOf(':')) : identity;
-  return withoutTag.includes('/') ? withoutTag.slice(withoutTag.lastIndexOf('/') + 1) : withoutTag;
-}
-
-function workspaceReference(workspace: WorkspaceInfo): WorkspaceRef {
-  return { id: workspace.id, name: workspace.name, project_root: workspace.project_root };
-}
-
-const ENTRY_SELECTOR = 'entry.pending[-1]';
-
-function entryRequests(
-  workspace: WorkspaceRef,
-  agent: string | null,
-  message: unknown,
-): ClientMessage[] {
-  const route = { workspace, agent };
-  return [
-    {
-      type: 'mcl.command',
-      id: crypto.randomUUID(),
-      message: { ...route, command: `INJECT ? TO ${ENTRY_SELECTOR}`, binding: message },
-    },
-    {
-      type: 'mcl.command',
-      id: crypto.randomUUID(),
-      message: { ...route, command: 'EMIT EFFECT wake', binding: null },
-    },
-  ];
-}
-
-function decodeMessage(message: AgentMessage): {
-  role: MessageRole;
-  thinking: string;
-  content: string;
-  toolCalls: ToolCall[];
-  failed: boolean;
-} | null {
-  if ('Inject' in message) return null;
-  if ('User' in message) {
-    return {
-      role: 'user',
-      thinking: '',
-      content: message.User.content,
-      toolCalls: [],
-      failed: false,
-    };
-  }
-  if ('Assistant' in message) {
-    return {
-      role: 'assistant',
-      thinking: message.Assistant.reasoning ?? '',
-      content: message.Assistant.content ?? '',
-      toolCalls: message.Assistant.tool_calls,
-      failed: false,
-    };
-  }
-  if ('Error' in message) {
-    return {
-      role: 'error',
-      thinking: '',
-      content: message.Error.message,
-      toolCalls: [],
-      failed: true,
-    };
-  }
-  return {
-    role: 'tool',
-    thinking: '',
-    content: message.Tool.content,
-    toolCalls: [],
-    failed: message.Tool.failed,
-  };
-}
-
-function sameStrings(left: string[], right: string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-
-function uniqueNames(names: string[]): string[] {
-  return [...new Set(names.map((name) => name.trim()).filter(Boolean))];
-}
-
-function sameToolCalls(left: ToolCall[], right: ToolCall[]): boolean {
-  return (
-    left.length === right.length &&
-    left.every((call, index) => {
-      const candidate = right[index];
-      return (
-        candidate !== undefined &&
-        call.id === candidate.id &&
-        call.tool_name === candidate.tool_name &&
-        call.arguments === candidate.arguments
-      );
-    })
-  );
-}
-
-function normalizeWorkspace(workspace: WorkspaceInfo): WorkspaceInfo {
-  const normalized: WorkspaceInfo = {
-    id: workspace.id || `workspace:local/${workspace.name}:latest`,
-    name: workspace.name.trim(),
-    project_root: workspace.project_root.trim(),
-    manager: workspace.manager.trim(),
-    agents: uniqueNames(workspace.agents),
-  };
-  if (normalized.manager && !normalized.agents.includes(normalized.manager)) {
-    normalized.agents.unshift(normalized.manager);
-  }
-  return normalized;
-}
-
-function sameWorkspaceList(left: WorkspaceInfo[], right: WorkspaceInfo[]): boolean {
-  return (
-    left.length === right.length &&
-    left.every((workspace, index) => {
-      const candidate = right[index];
-      return (
-        candidate &&
-        workspaceKey(workspace) === workspaceKey(candidate) &&
-        workspace.manager === candidate.manager &&
-        workspace.agents.length === candidate.agents.length &&
-        workspace.agents.every((agent, agentIndex) => agent === candidate.agents[agentIndex])
-      );
-    })
-  );
-}
-
 function normalizeEndpoint(raw: string): string {
   let value = raw.trim();
   if (!value) throw new Error('Daemon URL is required');
@@ -1010,9 +591,8 @@ function normalizeEndpoint(raw: string): string {
   const url = new URL(value);
   if (url.protocol === 'http:') url.protocol = 'ws:';
   if (url.protocol === 'https:') url.protocol = 'wss:';
-  if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
+  if (!['ws:', 'wss:'].includes(url.protocol))
     throw new Error('Daemon URL must use ws:// or wss://');
-  }
   if (url.pathname === '/') url.pathname = '/ws';
   return url.toString();
 }

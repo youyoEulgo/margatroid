@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 core_plugin = { path = "../../mecs/core_plugin" }
+margatroid_types = { path = "../types" }
 serde = { workspace = true }
 server_plugin = { path = "../../mecs/server_plugin" }
 toml = { workspace = true }

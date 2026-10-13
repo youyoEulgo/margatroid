@@ -1,3 +1,7 @@
+# 历史设计归档
+
+本文归档重写前的实现（基线提交 `7c9055c`），不再描述当前源码。当前实现与第一版约束见 [DESIGN-NEXT.md](DESIGN-NEXT.md)。旧事件、旧 Agent 资源表、metadata loader、全局 pending 与主进程工具 Lua 入口均已移除。
+
 # 伪代码格式
 
 ```text

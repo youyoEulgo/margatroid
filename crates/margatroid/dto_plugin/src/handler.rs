@@ -1,182 +1,377 @@
+use crate::{
+    types::{
+        BackendStateReportCache, PendingMclCommandResponse, PendingMclCommandResponses,
+        PendingWorkspaceResponse,
+    },
+    WebSocketMessageSend,
+};
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
-use client_plugin::{client_source, registered_client, ClientRegistrationResult};
 use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::World;
 use log_plugin::{TracingStream, TracingStreamError};
 use margatroid_protocol::{
-    AgentFailureDto, AgentMessageDto, BackendStateDto, ClientInfoDto, ClientMessage, IntoDomain,
-    IntoDto, LogRecordDto, MessageDto, ProtocolErrorKind, ServerMessage, WorkspaceInfoDto,
+    resolve_agent, resolve_workspace, AgentHistoryDto, BackendStateDto, ClientInfoDto,
+    ClientMessage, IntoDomain, IntoDto, LogRecordDto, MclCommandResultDto, ProtocolError,
+    ProtocolErrorDto, ProtocolErrorKind, ServerMessage, WorkspaceInfoDto,
 };
-use margatroid_types::{AgentFailure, AgentMessage};
+use margatroid_types::{
+    client_components::{Client, WorldClientExt},
+    client_events::ClientRegistrationResult,
+    mcl_events::MclCommandResult,
+    workspace_components::WorldWorkspaceExt,
+    workspace_events::{StartWorkspaceResult, StopWorkspaceResult},
+};
 use server_plugin::{
     ServerFailed, ServerStarted, ServerStopped, WebSocketConnected, WebSocketConnectionId,
     WebSocketConnections, WebSocketDisconnected, WebSocketMessage, WebSocketMessageSender,
     WebSocketProtocolFailed,
 };
-use workspace_plugin::{StartWorkspaceResult, StopWorkspaceByReferenceResult};
-
-use crate::types::{
-    BackendStateReportCache, PendingMclCommandResponse, PendingMclCommandResponses,
-};
-use crate::WebSocketMessageSend;
-
-fn mcl_source(world: &World, connection_id: WebSocketConnectionId) -> String {
-    let connections = world.get_resource::<WebSocketConnections>();
-    let client_type =
-        connections.and_then(|connections| connections.connection_type(connection_id));
-    let name = connections.and_then(|connections| connections.name(connection_id));
-    client_source(client_type.as_deref(), name.as_deref(), connection_id)
-}
 
 pub(crate) fn handle_inbound_message(
     world: &mut World,
     connection_id: WebSocketConnectionId,
     message: WebSocketMessage,
 ) {
-    let WebSocketMessage::Text(text) = &message else {
-        tracing::warn!(
-            connection = connection_id.get(),
-            "ignoring non-text API message"
-        );
+    let WebSocketMessage::Text(text) = message else {
         return;
     };
-    let request = match serde_json::from_str::<ClientMessage>(text.as_str()) {
-        Ok(request) => request,
+    if text.len() > 1024 * 1024 {
+        return;
+    }
+    let request = match serde_json::from_str::<ClientMessage>(&text) {
+        Ok(value) => value,
         Err(error) => {
-            tracing::warn!(connection = connection_id.get(), error = %error, "ignoring invalid API request");
+            tracing::warn!(connection = connection_id.get(), error = %error, "invalid API request");
             return;
         }
     };
-    if !matches!(request, ClientMessage::ConnectionRegister { .. })
-        && registered_client(world, connection_id).is_none()
-    {
-        tracing::warn!(
-            connection = connection_id.get(),
-            "ignoring API request from an unregistered connection"
+    let id = request.id().to_owned();
+    let result = route_request(world, connection_id, request);
+    if let Err(error) = result {
+        send_to_connection(
+            world,
+            connection_id,
+            &ServerMessage::RequestFailed {
+                id,
+                error: error.into(),
+            },
         );
-        return;
+    }
+}
+fn operation_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    format!(
+        "dto:workspace:{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+fn route_request(
+    world: &mut World,
+    connection_id: WebSocketConnectionId,
+    request: ClientMessage,
+) -> Result<(), ProtocolError> {
+    if request.id().trim().is_empty() || request.id().len() > 512 {
+        return Err(ProtocolError::new(
+            ProtocolErrorKind::InvalidRequest,
+            "invalid request ID",
+        ));
+    }
+    if let ClientMessage::ConnectionRegister { id, message } = request {
+        world.send_event(message.into_domain((id, connection_id))?);
+        return Ok(());
+    }
+    let (client, identity) = world
+        .client_by_connection(connection_id)
+        .map(|(entity, client)| (entity, client.resource_id.clone()))
+        .ok_or_else(|| {
+            ProtocolError::new(ProtocolErrorKind::Unregistered, "connection not registered")
+        })?;
+    let pending = world
+        .get_resource::<PendingMclCommandResponses>()
+        .expect("DTO pending responses missing");
+    if pending
+        .commands
+        .iter()
+        .any(|p| p.source == identity && p.id == request.id())
+        || pending
+            .workspaces
+            .iter()
+            .any(|p| p.client == client && p.id == request.id())
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorKind::DuplicateRequest,
+            "request already in flight",
+        ));
     }
     match request {
-        ClientMessage::ConnectionRegister { id, message } => {
-            tracing::info!(connection = connection_id.get(), request_id = %id, api_type = "connection.register", "API request received");
-            match message.into_domain((id, connection_id)) {
-                Ok(event) => world.send_event(event),
-                Err(error) => tracing::warn!(
-                    connection = connection_id.get(),
-                    error = %error,
-                    "invalid connection.register payload"
-                ),
-            }
-        }
+        ClientMessage::ConnectionRegister { .. } => unreachable!(),
         ClientMessage::WorkspaceStart { id, message } => {
-            tracing::info!(connection = connection_id.get(), request_id = %id, api_type = "workspace.start", "API request received");
-            match message.into_domain(id) {
-                Ok(event) => world.send_event(event),
-                Err(error) => tracing::warn!(
-                    connection = connection_id.get(),
-                    error = %error,
-                    "invalid workspace.start payload"
-                ),
-            }
+            let operation_id = operation_id();
+            let event = message.into_domain(operation_id.clone())?;
+            let reference = (&event.definition).into_dto(())?;
+            world
+                .get_resource_mut::<PendingMclCommandResponses>()
+                .unwrap()
+                .workspaces
+                .push(PendingWorkspaceResponse {
+                    id,
+                    operation_id,
+                    connection_id,
+                    client,
+                    stopping: false,
+                    reference,
+                });
+            world.send_event(event);
         }
         ClientMessage::WorkspaceStop { id, message } => {
-            tracing::info!(connection = connection_id.get(), request_id = %id, api_type = "workspace.stop", "API request received");
-            match message.into_domain(id) {
-                Ok(event) => world.send_event(event),
-                Err(error) => tracing::warn!(
-                    connection = connection_id.get(),
-                    error = %error,
-                    "invalid workspace.stop payload"
-                ),
-            }
+            let entity = resolve_workspace(world, &message.workspace)?;
+            let operation_id = operation_id();
+            world
+                .workspace_stop(operation_id.clone(), entity)
+                .map_err(|error| {
+                    ProtocolError::new(ProtocolErrorKind::InvalidRequest, error.to_string())
+                })?;
+            world
+                .get_resource_mut::<PendingMclCommandResponses>()
+                .unwrap()
+                .workspaces
+                .push(PendingWorkspaceResponse {
+                    id,
+                    operation_id,
+                    connection_id,
+                    client,
+                    stopping: true,
+                    reference: message.workspace,
+                });
         }
         ClientMessage::MclCommand { id, message } => {
-            tracing::info!(connection = connection_id.get(), request_id = %id, api_type = "mcl.command", "API request received");
-            let (reply, response) = std::sync::mpsc::channel();
-            let source = mcl_source(world, connection_id);
-            match message.into_domain((id.clone(), source, reply)) {
-                Ok(event) => {
-                    world.send_event(event);
-                    world
-                        .get_resource_mut::<PendingMclCommandResponses>()
-                        .expect("DtoPlugin MCL command responses are missing")
-                        .commands
-                        .push(PendingMclCommandResponse {
-                            id,
-                            connection_id,
-                            response: std::sync::Mutex::new(response),
-                        });
-                }
-                Err(error) => {
-                    let response = ServerMessage::MclCommandResult {
-                        id,
-                        result: Err(error.to_string()),
-                    };
-                    if let (Some(sender), Ok(encoded)) = (
-                        world
-                            .get_resource::<WebSocketConnections>()
-                            .and_then(|connections| connections.get(connection_id)),
-                        serde_json::to_string(&response),
-                    ) {
-                        let _ = sender.try_send(WebSocketMessage::Text(encoded.into()));
-                    }
-                }
-            }
+            let (_, target) = resolve_agent(world, &message.workspace, message.agent.as_ref())?;
+            let event = message.into_domain((id.clone(), identity.clone(), target.clone()))?;
+            world
+                .get_resource_mut::<PendingMclCommandResponses>()
+                .unwrap()
+                .commands
+                .push(PendingMclCommandResponse {
+                    id,
+                    connection_id,
+                    client,
+                    source: identity,
+                    target,
+                });
+            world.send_event(event);
         }
-        ClientMessage::AgentTurnAbort { id, message } => {
-            tracing::info!(connection = connection_id.get(), request_id = %id, api_type = "agent.turn.abort", "API request received");
-            match message.into_domain(id) {
-                Ok(event) => world.send_event(event),
-                Err(error) => tracing::warn!(
-                    connection = connection_id.get(),
-                    error = %error,
-                    "invalid agent.turn.abort payload"
-                ),
+        ClientMessage::StateQuery { id: _, .. } => {
+            send_to_connection(
+                world,
+                connection_id,
+                &ServerMessage::StateSync {
+                    state: ().into_dto(&*world)?,
+                },
+            );
+        }
+        ClientMessage::HistoryQuery { id, message } => {
+            let (entity, _) = resolve_agent(world, &message.workspace, message.agent.as_ref())?;
+            let history: AgentHistoryDto = entity.into_dto(&*world)?;
+            send_to_connection(
+                world,
+                connection_id,
+                &ServerMessage::HistoryResult { id, history },
+            );
+        }
+    }
+    Ok(())
+}
+fn response_is_live<C: Copy + Eq + std::hash::Hash>(
+    live: &std::collections::HashSet<(C, core_plugin::Entity)>,
+    connection: C,
+    client: core_plugin::Entity,
+) -> bool {
+    live.contains(&(connection, client))
+}
+fn purge_disconnected_responses(world: &mut World) {
+    let disconnected: std::collections::HashSet<_> = world
+        .event_reader::<WebSocketDisconnected>()
+        .into_iter()
+        .map(|event| event.connection_id)
+        .collect();
+    let live: std::collections::HashSet<_> = world
+        .query_with::<Client>()
+        .result()
+        .into_iter()
+        .filter_map(|entity| {
+            let client = world.get_component::<Client>(entity)?;
+            let connected = world
+                .get_resource::<WebSocketConnections>()
+                .and_then(|connections| connections.get(client.connection_id))
+                .is_some();
+            (connected && !disconnected.contains(&client.connection_id))
+                .then_some((client.connection_id, entity))
+        })
+        .collect();
+    let pending = world
+        .get_resource_mut::<PendingMclCommandResponses>()
+        .unwrap();
+    pending
+        .commands
+        .retain(|pending| response_is_live(&live, pending.connection_id, pending.client));
+    pending
+        .workspaces
+        .retain(|pending| response_is_live(&live, pending.connection_id, pending.client));
+}
+pub(crate) fn handle_pending_mcl_responses(world: &mut World) {
+    purge_disconnected_responses(world);
+    let results: Vec<_> = world
+        .event_reader::<MclCommandResult>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for result in results {
+        let pending = world
+            .get_resource_mut::<PendingMclCommandResponses>()
+            .unwrap();
+        let Some(index) = pending.commands.iter().position(|p| {
+            p.id == result.id && p.source == result.source && p.target == result.target
+        }) else {
+            continue;
+        };
+        let pending = pending.commands.remove(index);
+        let valid = world
+            .client_by_connection(pending.connection_id)
+            .is_some_and(|(entity, client)| {
+                entity == pending.client && client.resource_id == pending.source
+            });
+        if valid {
+            if let Ok(dto) = MclCommandResultDto::from_domain(&result, ()) {
+                send_to_connection(world, pending.connection_id, &dto.into());
             }
         }
     }
 }
-
-pub(crate) fn handle_pending_mcl_responses(world: &mut World) {
-    let connections = world.get_resource::<WebSocketConnections>().cloned();
-    world
-        .get_resource_mut::<PendingMclCommandResponses>()
-        .expect("DtoPlugin MCL command responses are missing")
-        .commands
-        .retain(|pending| {
-            match pending
-                .response
-                .lock()
-                .expect("MCL command response lock poisoned")
-                .try_recv()
-            {
-                Ok(result) => {
-                    if let Some(sender) = connections
-                        .as_ref()
-                        .and_then(|connections| connections.get(pending.connection_id))
-                    {
-                        let message = ServerMessage::MclCommandResult {
-                            id: pending.id.clone(),
-                            result,
-                        };
-                        if let Ok(encoded) = serde_json::to_string(&message) {
-                            let _ = sender.try_send(WebSocketMessage::Text(encoded.into()));
-                        }
-                    }
-                    false
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => true,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
-            }
-        });
+use margatroid_protocol::FromDomain;
+pub(crate) fn handle_collect_external_events(world: &mut World) {
+    let targets = world
+        .get_resource::<MargatroidConfig>()
+        .cloned()
+        .expect("DTO config missing");
+    report_server_events(world);
+    report_client_registrations(world);
+    report_workspace_results(world);
+    report_backend_state(world, targets.backend_state());
 }
-
+fn report_client_registrations(world: &World) {
+    for event in world.event_reader::<ClientRegistrationResult>() {
+        let message = match &event.result {
+            Ok(registered) => {
+                let Some(client) = world.get_component::<Client>(registered.client) else {
+                    continue;
+                };
+                if client.connection_id != event.connection_id
+                    || client.resource_id != registered.resource_id
+                {
+                    continue;
+                }
+                ServerMessage::ConnectionRegistered {
+                    id: event.id.clone(),
+                    client: ClientInfoDto {
+                        resource_id: registered.resource_id.clone().into_dto(()).unwrap(),
+                        client_type: client.client_type.clone(),
+                        name: client.name.clone(),
+                    },
+                }
+            }
+            Err(error) => ServerMessage::ConnectionRegisterFailed {
+                id: event.id.clone(),
+                error: ProtocolErrorDto::new("ClientRegistrationFailed", error.to_string()),
+            },
+        };
+        send_to_connection(world, event.connection_id, &message);
+    }
+}
+fn report_workspace_results(world: &mut World) {
+    let starts: Vec<_> = world
+        .event_reader::<StartWorkspaceResult>()
+        .into_iter()
+        .cloned()
+        .collect();
+    let stops: Vec<_> = world
+        .event_reader::<StopWorkspaceResult>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for (id, stopping, result) in starts
+        .into_iter()
+        .map(|e| (e.id, false, e.result))
+        .chain(stops.into_iter().map(|e| (e.id, true, e.result)))
+    {
+        let pending = world
+            .get_resource_mut::<PendingMclCommandResponses>()
+            .unwrap();
+        let Some(index) = pending
+            .workspaces
+            .iter()
+            .position(|p| p.operation_id == id && p.stopping == stopping)
+        else {
+            continue;
+        };
+        let pending = pending.workspaces.remove(index);
+        if !world
+            .client_by_connection(pending.connection_id)
+            .is_some_and(|(entity, _)| entity == pending.client)
+        {
+            continue;
+        }
+        let id = pending.id;
+        let message = match (stopping, result) {
+            (false, Ok(entity)) => {
+                match IntoDto::<WorkspaceInfoDto, _>::into_dto(entity, &*world) {
+                    Ok(workspace) => ServerMessage::WorkspaceStarted { id, workspace },
+                    Err(error) => ServerMessage::WorkspaceStartFailed {
+                        id,
+                        error: error.into(),
+                    },
+                }
+            }
+            (false, Err(error)) => ServerMessage::WorkspaceStartFailed {
+                id,
+                error: ProtocolErrorDto::new("WorkspaceStartFailed", error.to_string()),
+            },
+            (true, Ok(_)) => ServerMessage::WorkspaceStopped {
+                id,
+                workspace: pending.reference,
+            },
+            (true, Err(error)) => ServerMessage::WorkspaceStopFailed {
+                id,
+                error: ProtocolErrorDto::new("WorkspaceStopFailed", error.to_string()),
+            },
+        };
+        send_to_connection(world, pending.connection_id, &message);
+    }
+}
+fn send_to_connection(
+    world: &World,
+    connection_id: WebSocketConnectionId,
+    message: &ServerMessage,
+) {
+    let Some(sender) = world
+        .get_resource::<WebSocketConnections>()
+        .and_then(|connections| connections.get(connection_id))
+    else {
+        return;
+    };
+    if let Ok(encoded) = serde_json::to_string(message) {
+        let _ = sender.try_send(WebSocketMessage::Text(encoded.into()));
+    }
+}
 pub(crate) fn handle_outbound_messages(world: &mut World, outgoing: Vec<WebSocketMessageSend>) {
     let Some(connections) = world.get_resource::<WebSocketConnections>().cloned() else {
         return;
     };
     for outgoing in outgoing {
-        let is_log = matches!(&outgoing.message, ServerMessage::Log { .. });
+        let is_log = outgoing
+            .message
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("log");
         let encoded = match serde_json::to_string(&outgoing.message) {
             Ok(encoded) => encoded,
             Err(error) => {
@@ -206,94 +401,6 @@ pub(crate) fn handle_outbound_messages(world: &mut World, outgoing: Vec<WebSocke
                 }
             }
         }
-    }
-}
-
-pub(crate) fn handle_collect_external_events(world: &mut World) {
-    let targets = world
-        .get_resource::<MargatroidConfig>()
-        .cloned()
-        .expect("ConfigPlugin must be installed before DtoPlugin");
-    report_server_events(world);
-    report_client_registrations(world);
-    report_workspace_events(world, targets.logs());
-    report_workspace_stop_events(world, targets.logs());
-    report_agent_messages(world, targets.member_messages());
-    report_observed_messages(world, targets.member_messages());
-    report_agent_failures(world, targets.logs());
-    report_backend_state(world, targets.backend_state());
-}
-
-fn report_client_registrations(world: &World) {
-    for result in world.event_reader::<ClientRegistrationResult>() {
-        let message = match &result.result {
-            Ok(registered) => match registered.resource_id.clone().into_dto(()) {
-                Ok(resource_id) => ServerMessage::ConnectionRegistered {
-                    id: result.id.clone(),
-                    client: ClientInfoDto {
-                        resource_id,
-                        client_type: registered.client.client_type().to_owned(),
-                        name: registered.client.name().to_owned(),
-                    },
-                },
-                Err(error) => {
-                    tracing::warn!(
-                        request_id = %result.id,
-                        error = %error,
-                        "client resource id DTO conversion failed"
-                    );
-                    continue;
-                }
-            },
-            Err(error) => ServerMessage::ConnectionRegisterFailed {
-                id: result.id.clone(),
-                error: error.to_string(),
-            },
-        };
-        send_to_connection(world, result.connection_id, &message);
-    }
-}
-
-fn send_to_connection(
-    world: &World,
-    connection_id: WebSocketConnectionId,
-    message: &ServerMessage,
-) {
-    let Some(sender) = world
-        .get_resource::<WebSocketConnections>()
-        .and_then(|connections| connections.get(connection_id))
-    else {
-        return;
-    };
-    let Ok(encoded) = serde_json::to_string(message) else {
-        return;
-    };
-    let _ = sender.try_send(WebSocketMessage::Text(encoded.into()));
-}
-
-fn report_workspace_stop_events(world: &World, targets: &[WebSocketMessageTarget]) {
-    for result in world.event_reader::<StopWorkspaceByReferenceResult>() {
-        let message = match &result.result {
-            Ok(()) => {
-                tracing::info!(request_id = %result.id, workspace = %result.workspace.name, project_root = %result.workspace.project_root.display(), "workspace stopped");
-                ServerMessage::WorkspaceStopped {
-                    id: result.id.clone(),
-                    workspace: result
-                        .workspace
-                        .clone()
-                        .into_dto(())
-                        .expect("workspace reference conversion cannot fail"),
-                }
-            }
-            Err(error) => {
-                tracing::error!(request_id = %result.id, workspace = %result.workspace.name, project_root = %result.workspace.project_root.display(), error = %error, "workspace stop failed");
-                ServerMessage::WorkspaceStopFailed {
-                    id: result.id.clone(),
-                    error: error.to_string(),
-                }
-            }
-        };
-        send_to_targets(world, targets, message);
     }
 }
 
@@ -380,135 +487,10 @@ fn report_backend_state(world: &mut World, targets: &[WebSocketMessageTarget]) {
     send_to_targets(world, targets, ServerMessage::StateSync { state });
 }
 
-fn report_workspace_events(world: &World, targets: &[WebSocketMessageTarget]) {
-    for result in world.event_reader::<StartWorkspaceResult>() {
-        match &result.result {
-            Ok(workspace) => match IntoDto::<WorkspaceInfoDto, _>::into_dto(*workspace, world) {
-                Ok(info) => {
-                    tracing::info!(request_id = %result.id, workspace = %info.name, project_root = %info.project_root, manager = %info.manager, agents = info.agents.len(), "workspace started");
-                    send_to_targets(
-                        world,
-                        targets,
-                        ServerMessage::WorkspaceStarted {
-                            id: result.id.clone(),
-                            workspace: info,
-                        },
-                    );
-                }
-                Err(error) => tracing::warn!(
-                    request_id = %result.id,
-                    error = %error,
-                    "workspace DTO conversion failed"
-                ),
-            },
-            Err(error) => {
-                tracing::error!(request_id = %result.id, error = %error, "workspace start failed");
-                send_to_targets(
-                    world,
-                    targets,
-                    ServerMessage::WorkspaceStartFailed {
-                        id: result.id.clone(),
-                        error: error.to_string(),
-                    },
-                );
-            }
-        }
-    }
-}
-
-fn report_agent_messages(world: &World, targets: &[WebSocketMessageTarget]) {
-    let messages = world
-        .event_reader::<AgentMessage>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    for message in messages {
-        let message: AgentMessageDto = match (&message).into_dto(world) {
-            Ok(message) => message,
-            Err(error) if error.kind() == ProtocolErrorKind::UnsupportedMessage => continue,
-            Err(error) => {
-                tracing::warn!(request_id = %message.id, error = %error, "Agent message DTO conversion failed");
-                continue;
-            }
-        };
-        match &message.message {
-            MessageDto::User { .. } => tracing::info!(
-                request_id = %message.id,
-                workspace = %message.workspace.name,
-                agent = %message.agent,
-                "user message sent"
-            ),
-            MessageDto::Assistant { tool_calls, .. } => tracing::info!(
-                request_id = %message.id,
-                workspace = %message.workspace.name,
-                agent = %message.agent,
-                tool_calls = tool_calls.len(),
-                "assistant message sent"
-            ),
-            MessageDto::Tool { .. } | MessageDto::Error { .. } | MessageDto::Inject { .. } => {
-                continue
-            }
-        }
-        send_to_targets(world, targets, ServerMessage::AgentMessage { message });
-    }
-}
-
-fn report_observed_messages(world: &World, targets: &[WebSocketMessageTarget]) {
-    let observed = world
-        .event_reader::<margatroid_types::AgentConversationObserved>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    for observation in observed {
-        let message: AgentMessageDto = match (&observation).into_dto(world) {
-            Ok(message) => message,
-            Err(error) if error.kind() == ProtocolErrorKind::UnsupportedMessage => continue,
-            Err(error) => {
-                tracing::warn!(turn_id = %observation.turn_id, error = %error, "observed message DTO conversion failed");
-                continue;
-            }
-        };
-        if let MessageDto::Assistant { tool_calls, .. } = &message.message {
-            tracing::info!(
-                request_id = %message.id,
-                workspace = %message.workspace.name,
-                agent = %message.agent,
-                tool_calls = tool_calls.len(),
-                "assistant message sent"
-            );
-        } else {
-            continue;
-        }
-        send_to_targets(world, targets, ServerMessage::AgentMessage { message });
-    }
-}
-
-fn report_agent_failures(world: &World, targets: &[WebSocketMessageTarget]) {
-    let failures = world
-        .event_reader::<AgentFailure>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    for failure in failures {
-        let dto: AgentFailureDto = match (&failure).into_dto(world) {
-            Ok(dto) => dto,
-            Err(error) => {
-                tracing::warn!(request_id = %failure.id, error = %error, "Agent failure DTO conversion failed");
-                continue;
-            }
-        };
-        tracing::warn!(
-            request_id = %failure.id,
-            agent = %dto.agent,
-            kind = %dto.kind,
-            error = %failure.message,
-            "agent turn failed"
-        );
-        send_to_targets(world, targets, ServerMessage::AgentFailure { failure: dto });
-    }
-}
-
 fn send_to_targets(world: &World, targets: &[WebSocketMessageTarget], message: ServerMessage) {
+    let Ok(message) = serde_json::to_value(message) else {
+        return;
+    };
     for target in targets {
         world.send_event(WebSocketMessageSend {
             target: target.clone(),
@@ -551,13 +533,41 @@ pub(crate) async fn forward_logs(
         let Ok(record): Result<LogRecordDto, _> = record.into_dto(()) else {
             continue;
         };
+        let Ok(message) = serde_json::to_value(ServerMessage::Log { record }) else {
+            continue;
+        };
         for target in &targets {
             events.send_event(WebSocketMessageSend {
                 target: target.clone(),
-                message: ServerMessage::Log {
-                    record: record.clone(),
-                },
+                message: message.clone(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::response_is_live;
+    use core_plugin::World;
+    use std::collections::HashSet;
+
+    #[test]
+    fn disconnected_mcl_start_and_stop_replies_are_purged_without_matching_new_client() {
+        let mut world = World::default();
+        let old = world.spawn();
+        let mut mcl = vec![(1u64, old)];
+        let mut starts = vec![(1u64, old)];
+        let mut stops = vec![(1u64, old)];
+        world.despawn(old);
+        let current = world.spawn();
+        let live = HashSet::from([(2u64, current)]);
+        for replies in [&mut mcl, &mut starts, &mut stops] {
+            replies.retain(|(connection, client)| response_is_live(&live, *connection, *client));
+            assert!(replies.is_empty());
+        }
+        assert!(!response_is_live(&live, 1, old));
+        assert!(!response_is_live(&HashSet::from([(1u64, current)]), 1, old));
+        assert!(response_is_live(&live, 2, current));
+        assert!(world.is_alive(current));
     }
 }

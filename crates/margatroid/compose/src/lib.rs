@@ -2,7 +2,8 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use margatroid_types::{ResourceRef, WorkspaceAgentDefinition, WorkspaceDefinition};
+use margatroid_types::workspace_components::{WorkspaceAgentDefinition, WorkspaceDefinition};
+use resource_id_plugin::ResourceID;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 
@@ -167,26 +168,9 @@ struct RawAgent {
     name: Option<String>,
     image: String,
     #[serde(default)]
-    resources: Vec<RawResource>,
-    #[serde(default)]
-    disable_resources: Vec<RawResource>,
-    #[serde(default)]
-    memory_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum RawResource {
-    Structured(RawStructuredResource),
-    Shorthand(String),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawStructuredResource {
-    #[serde(rename = "type", alias = "provider")]
-    resource_type: String,
-    name: String,
+    home_root: Option<PathBuf>,
+    #[serde(default, alias = "memory_path")]
+    history_path: Option<PathBuf>,
 }
 
 fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefinition, ComposeError> {
@@ -211,7 +195,7 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
         } else {
             format!("image:{}", raw_agent.image)
         };
-        let image = ResourceRef::parse(image_value).map_err(|error| {
+        let image = ResourceID::parse(image_value).map_err(|error| {
             ComposeError::new(
                 ComposeErrorKind::InvalidImageReference,
                 format!("invalid image reference: {error}"),
@@ -223,22 +207,23 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
                 "image reference must use type image",
             ));
         }
-        let resources = raw_agent
-            .resources
-            .into_iter()
-            .map(parse_resource)
-            .collect::<Result<Vec<_>, _>>()?;
-        let disable_resources = raw_agent
-            .disable_resources
-            .into_iter()
-            .map(parse_resource)
-            .collect::<Result<Vec<_>, _>>()?;
-        let memory_path = raw_agent
-            .memory_path
+        let home_root = match raw_agent.home_root {
+            Some(path) => resolve_path(&project_root, path)?,
+            None => normalize_path(PathBuf::from(std::env::var_os("HOME").ok_or_else(
+                || ComposeError::new(ComposeErrorKind::InvalidPath, "HOME is not configured"),
+            )?))?,
+        };
+        let history_path = raw_agent
+            .history_path
             .map(|path| resolve_path(&project_root, path))
-            .transpose()?;
+            .transpose()?
+            .unwrap_or_else(|| {
+                project_root
+                    .join(".margatroid/history")
+                    .join(format!("{name}.sqlite"))
+            });
         agents.push(WorkspaceAgentDefinition {
-            id: ResourceRef::new("agent", &raw.name, &name, None::<String>).map_err(|error| {
+            id: ResourceID::new("agent", &raw.name, &name, None::<String>).map_err(|error| {
                 ComposeError::new(
                     ComposeErrorKind::InvalidDefinition,
                     format!("invalid Agent resource ID: {error}"),
@@ -246,9 +231,8 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
             })?,
             name,
             image,
-            resources,
-            disable_resources,
-            memory_path,
+            home_root,
+            history_path,
         });
     }
 
@@ -261,15 +245,18 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
             ));
         }
     }
-    if agents.is_empty() {
-        return Err(ComposeError::new(
-            ComposeErrorKind::InvalidDefinition,
-            "workspace must define at least one Agent",
-        ));
+    let manager = raw.manager.unwrap_or_else(|| {
+        agents
+            .first()
+            .map(|agent| agent.name.clone())
+            .unwrap_or_default()
+    });
+    if !agents.is_empty() {
+        validate_logical_name(&manager, "manager")?;
     }
-    let manager = raw.manager.unwrap_or_else(|| agents[0].name.clone());
-    validate_logical_name(&manager, "manager")?;
-    if !names.contains(manager.as_str()) {
+    if (agents.is_empty() && !manager.is_empty())
+        || (!agents.is_empty() && !names.contains(manager.as_str()))
+    {
         return Err(ComposeError::new(
             ComposeErrorKind::MissingManager,
             "workspace manager must name one configured Agent",
@@ -277,28 +264,13 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
     }
 
     Ok(WorkspaceDefinition {
-        id: ResourceRef::new("workspace", "local", &raw.name, None::<String>).map_err(|error| {
+        id: ResourceID::new("workspace", "local", &raw.name, None::<String>).map_err(|error| {
             ComposeError::new(ComposeErrorKind::InvalidDefinition, error.to_string())
         })?,
         name: raw.name,
         project_root,
         manager,
         agents,
-    })
-}
-
-fn parse_resource(raw: RawResource) -> Result<ResourceRef, ComposeError> {
-    let value = match raw {
-        RawResource::Structured(resource) => {
-            format!("{}:{}", resource.resource_type, resource.name)
-        }
-        RawResource::Shorthand(value) => value,
-    };
-    ResourceRef::parse(value).map_err(|error| {
-        ComposeError::new(
-            ComposeErrorKind::InvalidResourceReference,
-            format!("invalid resource reference: {error}"),
-        )
     })
 }
 
@@ -372,6 +344,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compiles_empty_workspace_with_empty_manager() {
+        for source in [
+            "name: empty\nagents:	[]\n",
+            "name: empty\nmanager: ''\nagents:	{}\n",
+        ] {
+            let definition = compile_str(source, "/tmp/workspace.yaml").unwrap();
+            assert!(definition.agents.is_empty());
+            assert!(definition.manager.is_empty());
+            assert_eq!(definition.id.to_string(), "workspace:local/empty:latest");
+        }
+        assert_eq!(
+            compile_str(
+                "name: empty\nmanager: missing\nagents:	[]\n",
+                "/tmp/workspace.yaml"
+            )
+            .unwrap_err()
+            .kind(),
+            ComposeErrorKind::MissingManager
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_resource_lists_and_agent_tag() {
+        for field in [
+            "resources",
+            "disable_resources",
+            "tool_default",
+            "tool_dynamic",
+        ] {
+            let source =
+                format!("name: demo\nagents:\n  coder:\n    image: local/coder\n    {field}:	[]\n");
+            assert_eq!(
+                compile_str(&source, "/tmp/workspace.yaml")
+                    .unwrap_err()
+                    .kind(),
+                ComposeErrorKind::FileDecode,
+                "{field}"
+            );
+        }
+        assert_eq!(
+            compile_str(
+                "name: demo\nagents:\n  coder:\n    image: local/coder\n    tag: clone0\n",
+                "/tmp/workspace.yaml"
+            )
+            .unwrap_err()
+            .kind(),
+            ComposeErrorKind::FileDecode
+        );
+    }
+
+    #[test]
     fn compiles_mapping_agents_and_resolves_paths() {
         let source = r#"
 name: demo
@@ -380,15 +403,9 @@ manager: coder
 agents:
   coder:
     image: local/coder
-    resources:
-      - provider: skill
-        name: local/project-context
     memory_path: state/coder.sql
   reviewer:
     image: local/reviewer:stable
-    disable_resources:
-      - provider: workflow
-        name: local/release
 "#;
         let definition = compile_str(source, "/tmp/workspace/margatroid-workspace.yaml").unwrap();
         assert_eq!(definition.name, "demo");
@@ -407,23 +424,24 @@ agents:
         );
         assert_eq!(definition.agents[1].name, "reviewer");
         assert_eq!(
-            definition.agents[0].memory_path,
-            Some(PathBuf::from("/tmp/workspace/project/state/coder.sql"))
+            definition.agents[0].history_path,
+            PathBuf::from("/tmp/workspace/project/state/coder.sql")
         );
     }
 
     #[test]
-    fn compiles_sequence_agents_and_shorthand_resources() {
+    fn compiles_sequence_agents_and_history_paths() {
         let source = r#"
 name: demo
 agents:
   - name: manager
     image: local/coder:v1
-    resources: [skill:local/context]
 "#;
         let definition = compile_str(source, "/tmp/workspace.yaml").unwrap();
         assert_eq!(definition.manager, "manager");
-        assert_eq!(definition.agents[0].resources[0].resource_type(), "skill");
+        assert!(definition.agents[0]
+            .history_path
+            .ends_with("manager.sqlite"));
     }
 
     #[test]

@@ -40,10 +40,14 @@ types      共享契约及内部类型  实例关联、关闭能力、程序和�
 error      共享错误契约       执行、通知与清理错误
 ```
 
-**本文是尚未实现的目标设计，不是当前代码说明。本次只改文档。**
+**本文说明已迁移的Driver执行实现与共享契约，保留lib、system、handler、events、types、error六板块。源码与具名API以下述当前实现说明为准；不把取消请求、任务丢弃或通知通道关闭当作清理成功。**
 
 不再设置Lua注册表。Agent.lua保存常驻wake槽位、ready发送端暂存、ended接收端暂存及关闭句柄。
 Agent只提供存储并发送生命周期请求，MCL使用通知槽位，LuaRuntime安装并使用关闭句柄。
+
+共享源码实际归属：`lua_runtime_components.rs`定义Instance、AgentLua、通知槽、关闭句柄与错误；`lua_environment.rs`定义程序、环境、Lua值与宿主函数；`lua_runtime_events.rs`定义六种公开事件及具名异步输出。插件只保存配置与计划，不持VM注册表、owner邮箱或provider注册表。环境由调用方整理后随StartDriverLuaVm提交。
+
+默认限制为源码1 MiB、Lua内存64 MiB、每1000条Lua指令检查协作取消，startup_timeout默认None；with_config拒绝零限制或零超时。Full库不是隔离沙箱；模块require只解析本次注入模块。wait与mcl_wait捕获共享wake槽位并异步等待；没有reserve/claim/yield或宿主block_on桥接。
 
 # lib
 
@@ -112,7 +116,7 @@ driver_lua_vm_exception_system(world: &mut World)
     产出事件：ClosureRequest、DriverLuaVmExceptionResult
     行为：
         克隆本帧异常调用handle_driver_lua_vm_exception
-        读取异常协调闭包Result调用handle_driver_lua_vm_exception_result，不消费自身公开结果
+        当前异常Handler同步核对、取消并回复，不创建异常协调闭包；共享异常异步输出保留为契约但不是已安装处理链，不消费自身公开结果
 ```
 
 ## 逻辑
@@ -146,10 +150,15 @@ handle_start_driver_lua_vm(world: &mut World, request: StartDriverLuaVm)
         构造Send任务创建闭包，向request.execution_entry提交；在工作区线程中创建Lua与Local Future，再spawn_local运行
         Lua执行使用异步宿主调用，不在工作区线程block_on等待；保留Lua指令取消检查
         启动协调闭包只await ready Receiver，收到Ok表示初始化就绪，收到Err表示本次初始化失败
-        ready等待超时先请求close取消，随后继续等待同一ready Receiver；Driver最终清理后通过尚未消费的ready Sender返回Err，不额外抢走ended
+        ready等待超时先请求close取消，随后继续等待同一ready Receiver；监督任务最终清理后通过尚未消费的ready Sender返回Err，不额外抢走ended
+        当前超时不直接合成StartupTimeout裁决；最终返回同一通道交付的执行或清理错误，ready若已先行裁决则不改写它
         ready Receiver异常关闭时返回CleanupFailed并保留宿主、close和原ended，不能以丢Sender证明清理完成；普通错误只能在已有ready Err清理事实下回收
         通过send_async_closure提交启动协调闭包，不关闭Runtime下一帧门，不创建独立Driver线程
-        任务在ready前发生普通错误、panic或提前返回时，执行统一最终清理后尝试从同一ready Sender存储take并发送Err；清理失败明确CleanupFailed
+        工作区本地执行Future捕获panic并先释放Lua，再将执行结果交付execution_done oneshot
+        独立spawn_async_service监督任务持execution_done Receiver、共享ready Sender存储与ended Sender；不借用World、不依赖工作区任务继续存在来等待外部活动清理
+        监督任务收到执行完成后关闭scope、MCL与wake，使用join等待wait_all和wait_drained；两者都完成且没有清理错误才send ended Ok
+        任务在ready前发生普通错误、panic或提前返回时，监督任务在上述最终清理后尝试从同一ready Sender存储take并发送Err；清理失败明确CleanupFailed
+        execution_done通道异常关闭表示缺少Driver退出证明，监督任务仍取消并等待活动/MCL，最后返回CleanupFailed，不将Future被丢弃当作真实清理
         任务在ready后正常或异常结束时不再改写启动裁决
 
 handle_driver_lua_vm_start_result(world: &mut World, result: Result<DriverLuaVmStartOutput, DriverLuaVmStartTaskError>)
@@ -160,7 +169,9 @@ handle_driver_lua_vm_start_result(world: &mut World, result: Result<DriverLuaVmS
         失败时清除本次ready暂存；确认没有遗留执行体或清理已完成后发送关联启动错误
         失败且未能清理时保留关闭句柄并明确返回CleanupFailed，不能让Agent把一般失败当作可直接销毁的证明
         无关或重复结果不推进其他实例，合法启动请求只回复一次
-        通用AsyncTaskError不包含请求ID，提交包装必须捕获原请求与instance并保证取消/提交失败仍有一次关联回执；不能依赖From<AsyncTaskError>凭空恢复关联
+        通用AsyncTaskError不包含请求ID；实际CoordinationGuard捕获原请求、关闭句柄及共享上下文
+        启动或停止协调闭包/Future被丢弃时，Guard请求关闭并直接发送关联CleanupFailed公开结果；正常具名输出完成后disarm
+        From<AsyncTaskError>仅生成无关联监督错误，System不据此虚构实例或请求ID；关联失败回执由Guard负责
 
 handle_stop_driver_lua_vm(world: &mut World, request: StopDriverLuaVm)
     处理停止请求：crate公开函数
@@ -182,9 +193,8 @@ handle_driver_lua_vm_stop_result(world: &mut World, result: Result<DriverLuaVmSt
         不销毁Agent，Agent插件在成功结果后完成实体清理
         Receiver已消费或被丢弃后返回明确错误，保留关闭句柄、宿主及活动，不重建ended、不宣称可直接重试
 
-handle_driver_lua_vm_exception_result(world: &mut World, output: Result<DriverLuaVmExceptionOutput, DriverLuaVmExceptionTaskError>)
-    收口异常协调结果：crate公开函数
-    行为：保留原exception_id和instance，核对当前实例后一次性发送DriverLuaVmExceptionResult；监督错误带关联且完成事实为false，不抢ended、不产生新的Exception。
+异常具名异步输出：共享保留契约，当前未安装对应异步结果Handler
+    说明：实际handle_driver_lua_vm_exception同步核对当前实例并发送一次DriverLuaVmExceptionResult；不抢ended、不产生新的Exception，不宣称已有独立异步异常协调执行链。
 
 handle_driver_lua_vm_exception(world: &mut World, event: DriverLuaVmException)
     处理运行期异常：crate公开函数
@@ -221,7 +231,7 @@ wait与wake：
     LuaRuntime停止时关闭槽位并取消执行，wait必须能结束等待；不保留reserve/claim/yield协议
 
 ended协议：
-    通道在启动时创建，Driver任务持Sender，Agent.lua.ended暂存Receiver
+    通道在启动时创建，独立监督service持ended Sender，Agent.lua.ended暂存Receiver；工作区Driver任务只持execution_done Sender
     Driver正常返回、异常、panic或取消都进入最终清理：关闭活动/MCL受理、请求根cancel及在途MCL取消，调用mcl.drained.close()；MCL command System第三阶段每帧检查execution整体受理门closed并收口未执行排队Cancelled，不新增MCL停止通知或执行结束事件
     最终清理等待execution.wait_all中全部Inference/Sandbox/Other真实完成，并等待mcl.drained确认全部已受理请求回执收口；所有等待在异步设施中，不跨World借用
     只有Driver自身退出与资源释放、作用域全部活动真实清理、MCL收口均成功才send(Ok(()))；失败send(Err(CleanupFailed))，原始运行错误独立经异常链报告
@@ -320,16 +330,21 @@ DriverLuaVmExceptionOutput：异常处理异步输出，公开共享载荷--定�
     execution_ended: bool--已验证执行事实
     cleanup_completed: bool--已验证全作用域及MCL收口事实
 
-DriverLuaVmExceptionTaskError：异常协调监督错误，公开共享类型
-    event: DriverLuaVmException--原异常请求关联
+DriverLuaVmExceptionTaskError：共享异常监督错误契约，公开类型
+    event: Option<DriverLuaVmException>--可选原异常关联
     source: AsyncTaskError
-    说明：提交包装负责保留event，From<AsyncTaskError>不能凭空恢复它。
+    说明：当前异常Handler同步确认并发送公开结果，不启动第二个ended等待或使用该异步输出链；From不构造关联。
 
 DriverLuaVmStopTaskError：停止协调任务错误，公开共享类型
-    说明：满足From<AsyncTaskError>，异常包装必须保留请求关联；Receiver丢失不可自动恢复
+    request: Option<StopDriverLuaVm>--可选原请求
+    source: AsyncTaskError
+    说明：From产生request=None；协调Guard独立保证关联失败回执，Receiver丢失不可恢复。
 
 DriverLuaVmStartTaskError：启动协调任务错误，公开共享类型
-    说明：满足From<AsyncTaskError>，该From自身不含请求ID，提交包装负责关联原请求并确保关闭与失败回复
+    request: Option<StartDriverLuaVm>--可选原请求
+    instance: Option<DriverLuaVmInstance>--可选本次实例
+    source: AsyncTaskError
+    说明：From产生两个None；协调Guard独立保证关闭及关联失败回复，不依赖全局关联表。
 ```
 
 
@@ -368,7 +383,11 @@ LuaEnvironment：环境描述，公开类型
     modules: Vec<LuaModuleBinding>--受控模块
     说明：宿主上下文携带完整实例、共享wake、AgentExecutionScope与AgentMclDrainHandle；只读配置需实际保护
         wait从Agent提供的共享槽位建立Receiver，不通过全局map
-        详细Lua值、绑定和能力接口随执行内核实现确认，不能用旧block_on桥接替代本地异步等待
+        共享LuaValue支持Nil、Boolean、Integer、Number、String、Array与Object；环境已整理，不设provider注册表
+        LuaProgram没有entry字段，执行整个chunk的exec_async；实际origin为Arc<PathBuf>
+        LuaEnvironmentContext携带instance、values、wake、execution与mcl；LuaHostFunction.call(arguments, context, CancellationToken)返回Send HostFuture
+        globals可绑定值或Arc<dyn LuaHostFunction>，modules通过本次注入require读取；宿主使用create_async_function，不建立block_on桥接
+        Lua空table保留Object(empty)，manual参数数组的空表解释由MCL已知数组上下文处理，不全局改变普通消息对象
 
 LuaRuntimeConfig：执行限制，公开类型
     max_source_bytes: usize--源码大小上限
@@ -387,7 +406,8 @@ LuaRuntimeConfig：执行限制，公开类型
     不把上述注册表换名放进其他Resource，也不复制通知槽位
 
 槽位与能力归属：
-    AgentLua、DriverWakeSlot、DriverReadySlot与DriverEndedSlot定义在共享agent_components.rs，细节见Agent文档
+    AgentLua、DriverWakeSlot、DriverReadySlot与DriverEndedSlot实际定义在共享lua_runtime_components.rs，由Agent组件持有
+    AgentLua.handled_exceptions保存当前实例已处理异常ID，启动安装时清空，异常Handler按实例去重，不新增全局表
     Agent仅提供存储，不提供或调用ready、wake、wait、close业务方法
     MCL取用ready Sender与wake共享槽位；LuaRuntime安装并取用close句柄
     执行任务可以捕获同一个关闭数据和ready Sender存储的Arc，处理失败或更新结束结果，不跨线程访问World
@@ -407,26 +427,34 @@ LuaRuntimeConfig：执行限制，公开类型
 
 公开，共享错误契约：
 ```text
-LuaRuntimeError：运行时错误，公开类型
-    InvalidRequest(String)
+LuaRuntimeError：运行时错误，公开结构体，定义于共享lua_runtime_components.rs
+    kind: LuaRuntimeErrorKind--类别
+    description: String--UTF-8边界安全截断至最多512字节的详情
+    new(kind: LuaRuntimeErrorKind, description: impl Into<String>) -> Self
+        构造有界错误：公开方法
+    impl Clone + Debug + PartialEq + Eq for LuaRuntimeError
+    impl fmt::Display for LuaRuntimeError
+    impl std::error::Error for LuaRuntimeError
+
+LuaRuntimeErrorKind：运行时错误类别，公开枚举
+    InvalidRequest
     InstanceNotFound
     InstanceMismatch
     AlreadyReady
     NotReady
     SourceTooLarge
-    EnvironmentFailed(String)
-    CompileFailed(String)
-    ExecutionFailed(String)
+    EnvironmentFailed
+    CompileFailed
+    ExecutionFailed
     StartupTimeout
     Cancelled
-    CleanupFailed(String)
-    TaskFailed(String)
+    CleanupFailed
+    TaskFailed
     StopAlreadyWaiting
     EndNotificationLost
-    impl Clone + Debug for LuaRuntimeError
-    impl fmt::Display for LuaRuntimeError
-        格式化错误：输出类别与有界详情
-    impl std::error::Error for LuaRuntimeError
+    AlreadyWaiting
+    Closed
+    WakeNotificationLost
 ```
 
 ## 逻辑

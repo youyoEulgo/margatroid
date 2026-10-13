@@ -8,13 +8,11 @@ version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "closure_plugin",
  "core_plugin",
- "futures-util",
- "library_component_plugin",
  "margatroid_types",
  "resource_id_plugin",
  "serde",
- "sha2 0.10.9",
  "tokio",
  "toml",
  "tracing",
@@ -25,14 +23,10 @@ name = "agent_plugin"
 version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
- "async_runtime_plugin",
  "core_plugin",
- "library_component_plugin",
- "lua_runtime_plugin",
  "margatroid_types",
+ "memory_plugin",
  "resource_id_plugin",
- "serde",
- "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -349,16 +343,9 @@ version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
- "config_plugin",
  "core_plugin",
- "dto_plugin",
- "futures-util",
- "library_component_plugin",
- "log_plugin",
- "margatroid_protocol",
  "margatroid_types",
  "resource_id_plugin",
- "serde_json",
  "server_plugin",
  "tokio",
  "tokio-tungstenite",
@@ -384,6 +371,7 @@ name = "compose"
 version = "0.1.0"
 dependencies = [
  "margatroid_types",
+ "resource_id_plugin",
  "serde",
  "serde_yaml",
  "tempfile",
@@ -394,6 +382,7 @@ name = "config_plugin"
 version = "0.1.0"
 dependencies = [
  "core_plugin",
+ "margatroid_types",
  "serde",
  "server_plugin",
  "tempfile",
@@ -528,16 +517,15 @@ version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
- "client_plugin",
  "config_plugin",
  "core_plugin",
  "log_plugin",
  "margatroid_protocol",
  "margatroid_types",
+ "resource_id_plugin",
  "serde_json",
  "server_plugin",
  "tracing",
- "workspace_plugin",
 ]
 
 [[package]]
@@ -789,6 +777,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hook_resource_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "closure_plugin",
+ "core_plugin",
+ "jsonschema",
+ "margatroid_types",
+ "resource_id_plugin",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "http"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1019,20 +1024,21 @@ dependencies = [
 name = "inference_plugin"
 version = "0.1.0"
 dependencies = [
- "agent_image_loader_plugin",
- "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
- "config_plugin",
+ "closure_plugin",
  "core_plugin",
  "futures-util",
+ "jsonschema",
  "margatroid_types",
  "reqwest",
+ "resource_id_plugin",
  "serde",
  "serde_json",
  "server_plugin",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
 ]
@@ -1106,14 +1112,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
-name = "library_component_plugin"
-version = "0.1.0"
-dependencies = [
- "app_runtime_plugin",
- "core_plugin",
-]
-
-[[package]]
 name = "libsqlite3-sys"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1185,11 +1183,15 @@ version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "closure_plugin",
  "core_plugin",
+ "futures-util",
  "margatroid_types",
  "mlua",
+ "resource_id_plugin",
  "serde",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1225,17 +1227,27 @@ dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
  "client_plugin",
+ "closure_plugin",
  "config_plugin",
  "core_plugin",
  "dto_plugin",
+ "hook_resource_plugin",
  "inference_plugin",
  "log_plugin",
  "lua_runtime_plugin",
+ "margatroid_types",
  "mcl_plugin",
  "memory_plugin",
+ "prompt_resource_plugin",
  "resource_id_plugin",
+ "sandbox_resource_plugin",
+ "serde_json",
  "server_plugin",
+ "skill_resource_plugin",
+ "tempfile",
+ "tokio",
  "tool_plugin",
+ "tool_resource_plugin",
  "tracing",
  "ui_plugin",
  "workspace_plugin",
@@ -1245,28 +1257,30 @@ dependencies = [
 name = "margatroid_protocol"
 version = "0.1.0"
 dependencies = [
- "agent_plugin",
  "app_runtime_plugin",
  "core_plugin",
  "log_plugin",
  "margatroid_types",
- "mcl_plugin",
- "memory_plugin",
+ "resource_id_plugin",
  "serde",
  "serde_json",
  "server_plugin",
- "tool_plugin",
- "workspace_plugin",
+ "tokio",
 ]
 
 [[package]]
 name = "margatroid_types"
 version = "0.1.0"
 dependencies = [
+ "app_runtime_plugin",
+ "async_runtime_plugin",
  "core_plugin",
  "resource_id_plugin",
  "serde",
  "serde_json",
+ "server_plugin",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1288,23 +1302,15 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 name = "mcl_plugin"
 version = "0.1.0"
 dependencies = [
- "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
  "core_plugin",
- "lua_runtime_plugin",
  "margatroid_types",
- "mlua",
  "resource_id_plugin",
- "resource_library_plugin",
- "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "tokio",
- "tool_plugin",
- "tracing",
- "tracing-subscriber",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1317,14 +1323,11 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 name = "memory_plugin"
 version = "0.1.0"
 dependencies = [
- "agent_plugin",
- "app_runtime_plugin",
  "core_plugin",
  "margatroid_types",
  "rusqlite",
  "serde_json",
  "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -1601,6 +1604,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "prompt_resource_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "closure_plugin",
+ "core_plugin",
+ "jsonschema",
+ "margatroid_types",
+ "resource_id_plugin",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1817,21 +1837,9 @@ dependencies = [
 name = "resource_id_plugin"
 version = "0.1.0"
 dependencies = [
- "app_runtime_plugin",
  "core_plugin",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "resource_library_plugin"
-version = "0.1.0"
-dependencies = [
- "core_plugin",
- "library_component_plugin",
- "resource_id_plugin",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -1894,7 +1902,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42ffa149f6aa81b58a5b3011d01a857c4ed12c7a732d2c51947a4c7c692185f0"
 dependencies = [
  "globset",
- "sha2 0.11.0",
+ "sha2",
  "walkdir",
 ]
 
@@ -1983,6 +1991,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "sandbox_resource_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "closure_plugin",
+ "core_plugin",
+ "jsonschema",
+ "margatroid_types",
+ "resource_id_plugin",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -2153,17 +2178,6 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
-
-[[package]]
-name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
@@ -2216,6 +2230,23 @@ dependencies = [
  "core_plugin",
  "signal-hook",
  "tracing",
+]
+
+[[package]]
+name = "skill_resource_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "closure_plugin",
+ "core_plugin",
+ "jsonschema",
+ "margatroid_types",
+ "resource_id_plugin",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -2474,6 +2505,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -2523,9 +2555,9 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 name = "tool_plugin"
 version = "0.1.0"
 dependencies = [
- "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "closure_plugin",
  "core_plugin",
  "futures-util",
  "jsonschema",
@@ -2533,13 +2565,28 @@ dependencies = [
  "mlua",
  "nix",
  "resource_id_plugin",
- "resource_library_plugin",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "tool_resource_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "closure_plugin",
+ "core_plugin",
+ "jsonschema",
+ "margatroid_types",
+ "resource_id_plugin",
+ "serde",
+ "serde_json",
+ "tokio",
  "toml",
- "tracing",
 ]
 
 [[package]]
@@ -3121,23 +3168,12 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 name = "workspace_plugin"
 version = "0.1.0"
 dependencies = [
- "agent_image_loader_plugin",
- "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
  "core_plugin",
- "inference_plugin",
- "library_component_plugin",
- "lua_runtime_plugin",
  "margatroid_types",
- "mcl_plugin",
- "memory_plugin",
  "resource_id_plugin",
- "resource_library_plugin",
- "serde_json",
- "tempfile",
  "tokio",
- "tool_plugin",
  "tracing",
 ]
 

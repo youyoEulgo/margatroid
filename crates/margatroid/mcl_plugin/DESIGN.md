@@ -1,3 +1,7 @@
+# 归档：重写前实现
+
+本文归档重写前 revision `7c9055c` 的实现与旧解析规则，不再对应当前源码。当前 MCL 已迁移为共享 Agent FIFO、三类 typed 数组和 oneshot 收口，准确现状见 DESIGN-NEXT.md 与 README.md。下文所有“当前代码”或“尚未实现”均指归档时点，不表示现状。
+
 # 伪代码格式
 
 ```text

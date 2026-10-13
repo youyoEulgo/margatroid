@@ -1,21 +1,29 @@
 use std::fmt;
 use std::str::FromStr;
 
-use core_plugin::Component;
 use serde::{Deserialize, Serialize};
 
-use crate::ResourceIdError;
+use crate::ResourceIDError;
 
+/// Validated address value, serialized as `type:scope/name:tag`.
+/// Missing tags normalize to `latest`; this value is not an ECS component.
+///
+/// ```compile_fail
+/// use core_plugin::Component;
+/// use resource_id_plugin::ResourceID;
+/// fn require_component<T: Component>() {}
+/// require_component::<ResourceID>();
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ResourceRef {
+pub struct ResourceID {
     resource_type: String,
     scope: String,
     name: String,
     tag: String,
 }
 
-impl ResourceRef {
-    pub fn parse(value: impl AsRef<str>) -> Result<Self, ResourceIdError> {
+impl ResourceID {
+    pub fn parse(value: impl AsRef<str>) -> Result<Self, ResourceIDError> {
         value.as_ref().parse()
     }
 
@@ -23,15 +31,15 @@ impl ResourceRef {
         resource_type: impl Into<String>,
         scope: impl Into<String>,
         name: impl Into<String>,
-        tag: Option<impl Into<String>>,
-    ) -> Result<Self, ResourceIdError> {
+        tag: Option<String>,
+    ) -> Result<Self, ResourceIDError> {
         let resource_type = resource_type.into();
         let scope = scope.into();
         let name = name.into();
-        let tag = tag.map(Into::into).unwrap_or_else(|| "latest".into());
+        let tag = tag.unwrap_or_else(|| "latest".into());
         validate_type(&resource_type)?;
-        validate_part(&scope, ResourceIdError::InvalidScope)?;
-        validate_part(&name, ResourceIdError::InvalidName)?;
+        validate_part(&scope, ResourceIDError::InvalidScope)?;
+        validate_part(&name, ResourceIDError::InvalidName)?;
         validate_tag(&tag)?;
         Ok(Self {
             resource_type,
@@ -39,6 +47,13 @@ impl ResourceRef {
             name,
             tag,
         })
+    }
+
+    pub fn find_entities(
+        &self,
+        world: &core_plugin::World,
+    ) -> Result<Vec<core_plugin::Entity>, crate::ResourceError> {
+        crate::find_resource_entities(world, self)
     }
 
     pub fn resource_type(&self) -> &str {
@@ -58,32 +73,32 @@ impl ResourceRef {
     }
 }
 
-impl FromStr for ResourceRef {
-    type Err = ResourceIdError;
+impl FromStr for ResourceID {
+    type Err = ResourceIDError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if value.is_empty() {
-            return Err(ResourceIdError::Empty);
+            return Err(ResourceIDError::Empty);
         }
         let (resource_type, remainder) = value
             .split_once(':')
-            .ok_or(ResourceIdError::InvalidFormat)?;
+            .ok_or(ResourceIDError::InvalidFormat)?;
         let (scope, name_and_tag) = remainder
             .split_once('/')
-            .ok_or(ResourceIdError::InvalidFormat)?;
+            .ok_or(ResourceIDError::InvalidFormat)?;
         if name_and_tag.contains('/') {
-            return Err(ResourceIdError::InvalidFormat);
+            return Err(ResourceIDError::InvalidFormat);
         }
         let (name, tag) = match name_and_tag.split_once(':') {
             Some((name, tag)) if !tag.contains(':') => (name, Some(tag.to_owned())),
-            Some(_) => return Err(ResourceIdError::InvalidFormat),
+            Some(_) => return Err(ResourceIDError::InvalidFormat),
             None => (name_and_tag, None),
         };
         Self::new(resource_type, scope, name, tag)
     }
 }
 
-impl fmt::Display for ResourceRef {
+impl fmt::Display for ResourceID {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
@@ -93,7 +108,7 @@ impl fmt::Display for ResourceRef {
     }
 }
 
-impl Serialize for ResourceRef {
+impl Serialize for ResourceID {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -102,7 +117,7 @@ impl Serialize for ResourceRef {
     }
 }
 
-impl<'de> Deserialize<'de> for ResourceRef {
+impl<'de> Deserialize<'de> for ResourceID {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -113,51 +128,25 @@ impl<'de> Deserialize<'de> for ResourceRef {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResourceId(pub ResourceRef);
-
-impl ResourceId {
-    pub fn as_ref(&self) -> &ResourceRef {
-        &self.0
-    }
-    pub fn into_inner(self) -> ResourceRef {
-        self.0
-    }
-}
-
-impl From<ResourceRef> for ResourceId {
-    fn from(value: ResourceRef) -> Self {
-        Self(value)
-    }
-}
-
-impl AsRef<ResourceRef> for ResourceId {
-    fn as_ref(&self) -> &ResourceRef {
-        &self.0
-    }
-}
-
-impl Component for ResourceId {}
-
-fn validate_type(value: &str) -> Result<(), ResourceIdError> {
+pub(crate) fn validate_type(value: &str) -> Result<(), ResourceIDError> {
     if value.is_empty()
         || !value
             .bytes()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'-'))
     {
-        Err(ResourceIdError::InvalidType)
+        Err(ResourceIDError::InvalidType)
     } else {
         Ok(())
     }
 }
 
-fn validate_part(value: &str, error: ResourceIdError) -> Result<(), ResourceIdError> {
+fn validate_part(value: &str, error: ResourceIDError) -> Result<(), ResourceIDError> {
     if value.is_empty()
         || value == "."
         || value == ".."
         || value
-            .bytes()
-            .any(|c| c.is_ascii_control() || matches!(c, b'/' | b'\\' | b':'))
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
     {
         Err(error)
     } else {
@@ -165,15 +154,15 @@ fn validate_part(value: &str, error: ResourceIdError) -> Result<(), ResourceIdEr
     }
 }
 
-fn validate_tag(value: &str) -> Result<(), ResourceIdError> {
+fn validate_tag(value: &str) -> Result<(), ResourceIDError> {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
-        return Err(ResourceIdError::InvalidTag);
+        return Err(ResourceIDError::InvalidTag);
     };
     if !first.is_ascii_alphanumeric()
         || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
     {
-        Err(ResourceIdError::InvalidTag)
+        Err(ResourceIDError::InvalidTag)
     } else {
         Ok(())
     }

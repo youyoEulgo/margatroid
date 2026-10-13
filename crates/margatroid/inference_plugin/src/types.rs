@@ -1,14 +1,35 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use core_plugin::{Entity, Resource};
-
 use crate::error::{InferenceError, InferenceErrorKind};
-use margatroid_types::{Message, TokenUsage, ToolCall, ToolDefinition};
+pub use margatroid_types::message_types::StopReason;
+use margatroid_types::message_types::{TokenUsage, ToolCall, ToolDefinition};
+
+#[derive(Clone, Debug)]
+pub enum ProviderMessage {
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    Assistant {
+        reasoning: Option<String>,
+        content: Option<String>,
+        tool_calls: Vec<ToolCall>,
+    },
+    Tool {
+        tool_call_id: String,
+        content: String,
+    },
+    Error {
+        message: String,
+    },
+}
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Method, StatusCode, Url};
 use serde::{Deserialize, Serialize};
+use ProviderMessage as Message;
 
 pub(crate) const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_MESSAGES_BYTES: usize = 16 * 1024 * 1024;
@@ -84,7 +105,7 @@ impl InferenceParameters {
         &self.stop
     }
 
-    pub(crate) fn validate(&self) -> Result<(), InferenceError> {
+    pub fn validate(&self) -> Result<(), InferenceError> {
         if self
             .temperature
             .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
@@ -134,46 +155,6 @@ impl ConfiguredModelRoute {
     }
 }
 
-#[derive(Clone)]
-pub struct WorkspaceModelRoutes {
-    pub(crate) routes: HashMap<ModelId, ConfiguredModelRoute>,
-}
-
-impl WorkspaceModelRoutes {
-    pub fn get(&self, id: &ModelId) -> Option<ConfiguredModelRoute> {
-        self.routes.get(id).cloned()
-    }
-
-    pub fn len(&self) -> usize {
-        self.routes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
-    }
-}
-
-#[derive(Default)]
-pub struct WorkspaceModelRoutesRegistry {
-    routes: HashMap<Entity, WorkspaceModelRoutes>,
-}
-
-impl Resource for WorkspaceModelRoutesRegistry {}
-
-impl WorkspaceModelRoutesRegistry {
-    pub fn get(&self, workspace: Entity) -> Option<&WorkspaceModelRoutes> {
-        self.routes.get(&workspace)
-    }
-
-    pub fn insert(&mut self, workspace: Entity, routes: WorkspaceModelRoutes) {
-        self.routes.insert(workspace, routes);
-    }
-
-    pub fn remove(&mut self, workspace: Entity) {
-        self.routes.remove(&workspace);
-    }
-}
-
 pub struct ProviderInput<'a> {
     model: &'a str,
     parameters: &'a InferenceParameters,
@@ -182,7 +163,7 @@ pub struct ProviderInput<'a> {
 }
 
 impl<'a> ProviderInput<'a> {
-    pub(crate) fn new(
+    pub fn new(
         model: &'a str,
         parameters: &'a InferenceParameters,
         messages: &'a [Message],
@@ -214,11 +195,11 @@ impl<'a> ProviderInput<'a> {
 }
 
 pub struct ProviderRouteInput<'a> {
-    pub(crate) provider: Option<&'a str>,
-    pub(crate) base_url: &'a Url,
-    pub(crate) api_key: &'a str,
-    pub(crate) thinking: Option<&'a str>,
-    pub(crate) reasoning_effort: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub base_url: &'a Url,
+    pub api_key: &'a str,
+    pub thinking: Option<&'a str>,
+    pub reasoning_effort: Option<&'a str>,
 }
 
 impl<'a> ProviderRouteInput<'a> {
@@ -291,15 +272,6 @@ pub type ErasedProviderAdapter = Arc<dyn ProviderAdapter>;
 pub type ErasedProviderAdapterFactory = Arc<dyn ProviderAdapterFactory>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StopReason {
-    Completed,
-    ToolCalls,
-    Length,
-    ContentFilter,
-    Other(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderInferenceResponse {
     pub reasoning: Option<String>,
     pub content: Option<String>,
@@ -314,11 +286,6 @@ pub enum ProviderStreamDelta {
     Content(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModelRoutesReloaded {
-    pub route_count: usize,
-}
-
 #[derive(Deserialize)]
 pub(crate) struct ModelRouteDocument {
     pub(crate) models: Vec<ModelRouteConfig>,
@@ -328,12 +295,12 @@ pub(crate) struct ModelRouteDocument {
 pub(crate) struct ModelRouteConfig {
     pub(crate) id: String,
     pub(crate) model: String,
-    pub(crate) provider: Option<String>,
-    pub(crate) base_url: String,
-    pub(crate) api_key: String,
+    pub provider: Option<String>,
+    pub base_url: String,
+    pub api_key: String,
     pub(crate) api_type: String,
-    pub(crate) thinking: Option<String>,
-    pub(crate) reasoning_effort: Option<String>,
+    pub thinking: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub(crate) context_window: Option<String>,
 }
 
@@ -600,12 +567,7 @@ struct OpenAiStreamOptions {
 
 impl OpenAiRequest {
     fn from_input(input: ProviderInput<'_>) -> Self {
-        let messages = input
-            .messages()
-            .iter()
-            .map(openai_message)
-            .filter(|value| !value.is_null())
-            .collect();
+        let messages = input.messages().iter().map(openai_message).collect();
         let tools = input
             .tools()
             .iter()
@@ -689,7 +651,6 @@ struct DeepSeekThinking {
 
 fn openai_message(message: &Message) -> serde_json::Value {
     match message {
-        Message::Inject { .. } => serde_json::Value::Null,
         Message::System { content } => serde_json::json!({"role":"system", "content":content}),
         Message::User { content } => serde_json::json!({"role":"user", "content":content}),
         Message::Error { message } => serde_json::json!({"role":"user", "content":message}),
@@ -762,6 +723,8 @@ fn deepseek_message(message: &Message, thinking: bool) -> serde_json::Value {
 #[derive(Default)]
 struct OpenAiAccumulator {
     buffer: Vec<u8>,
+    event_data: Vec<u8>,
+    total_bytes: usize,
     reasoning: String,
     content: String,
     tool_calls: Vec<OpenAiToolCallBuilder>,
@@ -769,7 +732,6 @@ struct OpenAiAccumulator {
     usage: Option<TokenUsage>,
     saw_choice: bool,
     done: bool,
-    capture_reasoning: bool,
 }
 
 struct OpenAiToolCallBuilder {
@@ -780,6 +742,7 @@ struct OpenAiToolCallBuilder {
 
 #[derive(Deserialize)]
 struct OpenAiChunk {
+    #[serde(default)]
     choices: Vec<OpenAiChoice>,
     usage: Option<OpenAiUsage>,
 }
@@ -848,6 +811,15 @@ fn decode_token_usage(usage: OpenAiUsage) -> TokenUsage {
 
 impl ProviderResponseAccumulator for OpenAiAccumulator {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<ProviderStreamDelta>, InferenceError> {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len());
+        if self.total_bytes > 32 * 1024 * 1024
+            || self.buffer.len().saturating_add(chunk.len()) > MAX_MESSAGE_BYTES
+        {
+            return Err(InferenceError::new(
+                InferenceErrorKind::ResponseTooLarge,
+                "SSE buffer exceeds limit",
+            ));
+        }
         self.buffer.extend_from_slice(chunk);
         let mut text = Vec::new();
         while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
@@ -865,15 +837,22 @@ impl ProviderResponseAccumulator for OpenAiAccumulator {
             let line = std::mem::take(&mut self.buffer);
             text.extend(self.consume_line(&line)?);
         }
-        if !self.saw_choice || !self.done && self.stop_reason.is_none() {
+        text.extend(self.consume_event()?);
+        if !self.saw_choice || !self.done || self.stop_reason.is_none() {
             return Err(InferenceError::new(
                 InferenceErrorKind::ResponseIncomplete,
                 "inference response ended before a complete choice",
             ));
         }
         let mut calls = Vec::with_capacity(self.tool_calls.len());
+        let mut ids = std::collections::HashSet::new();
         for call in self.tool_calls {
-            if call.id.is_empty() || call.name.is_empty() {
+            if call.id.is_empty()
+                || call.name.is_empty()
+                || !ids.insert(call.id.clone())
+                || !serde_json::from_str::<serde_json::Value>(&call.arguments)
+                    .is_ok_and(|v| v.is_object())
+            {
                 return Err(InferenceError::new(
                     InferenceErrorKind::ResponseIncomplete,
                     "inference tool call is missing an ID or name",
@@ -885,17 +864,23 @@ impl ProviderResponseAccumulator for OpenAiAccumulator {
                 arguments: call.arguments,
             });
         }
-        if self.content.is_empty() && calls.is_empty() {
+        if self.content.is_empty()
+            && calls.is_empty()
+            && !matches!(
+                self.stop_reason,
+                Some(StopReason::ContentFilter | StopReason::Length)
+            )
+        {
             return Err(InferenceError::new(
                 InferenceErrorKind::ResponseIncomplete,
                 "inference response contains neither content nor tool calls",
             ));
         }
-        let reason = if calls.is_empty() {
-            self.stop_reason.unwrap_or(StopReason::Completed)
+        let reason = self.stop_reason.unwrap_or(if calls.is_empty() {
+            StopReason::Completed
         } else {
             StopReason::ToolCalls
-        };
+        });
         Ok((
             ProviderInferenceResponse {
                 reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
@@ -912,18 +897,44 @@ impl ProviderResponseAccumulator for OpenAiAccumulator {
 impl OpenAiAccumulator {
     fn consume_line(&mut self, line: &[u8]) -> Result<Vec<ProviderStreamDelta>, InferenceError> {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() || line.starts_with(b":") {
+        if line.is_empty() {
+            return self.consume_event();
+        }
+        if line.starts_with(b":") {
             return Ok(Vec::new());
         }
-        let payload = line
-            .strip_prefix(b"data:")
-            .map(|payload| payload.strip_prefix(b" ").unwrap_or(payload))
-            .unwrap_or(line);
+        if let Some(payload) = line.strip_prefix(b"data:") {
+            let payload = payload.strip_prefix(b" ").unwrap_or(payload);
+            if self.event_data.len().saturating_add(payload.len()) > MAX_MESSAGE_BYTES {
+                return Err(InferenceError::new(
+                    InferenceErrorKind::ResponseTooLarge,
+                    "SSE event exceeds limit",
+                ));
+            }
+            if !self.event_data.is_empty() {
+                self.event_data.push(b'\n');
+            }
+            self.event_data.extend_from_slice(payload);
+        }
+        Ok(Vec::new())
+    }
+
+    fn consume_event(&mut self) -> Result<Vec<ProviderStreamDelta>, InferenceError> {
+        let payload = std::mem::take(&mut self.event_data);
+        if payload.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.done {
+            return Err(InferenceError::new(
+                InferenceErrorKind::ResponseDecodeFailed,
+                "data after SSE completion",
+            ));
+        }
         if payload == b"[DONE]" {
             self.done = true;
             return Ok(Vec::new());
         }
-        let chunk = serde_json::from_slice::<OpenAiChunk>(payload).map_err(|_| {
+        let chunk = serde_json::from_slice::<OpenAiChunk>(&payload).map_err(|_| {
             InferenceError::new(
                 InferenceErrorKind::ResponseDecodeFailed,
                 "OpenAI-compatible response frame could not be decoded",
@@ -943,7 +954,7 @@ impl OpenAiAccumulator {
         for choice in chunk.choices {
             self.saw_choice = true;
             let delta = choice.delta.or(choice.message).unwrap_or_default();
-            if self.capture_reasoning {
+            {
                 if let Some(reasoning) = delta.reasoning_content.or(delta.reasoning) {
                     if self.reasoning.len().saturating_add(reasoning.len()) > MAX_MESSAGE_BYTES {
                         return Err(InferenceError::new(
@@ -968,6 +979,12 @@ impl OpenAiAccumulator {
             if let Some(tool_calls) = delta.tool_calls {
                 for call in tool_calls {
                     let index = call.index.unwrap_or(self.tool_calls.len());
+                    if index >= MAX_TOOL_COUNT {
+                        return Err(InferenceError::new(
+                            InferenceErrorKind::ResponseTooLarge,
+                            "tool call index exceeds limit",
+                        ));
+                    }
                     while self.tool_calls.len() <= index {
                         self.tool_calls.push(OpenAiToolCallBuilder {
                             id: String::new(),
@@ -979,9 +996,21 @@ impl OpenAiAccumulator {
                     if let Some(id) = call.id {
                         target.id.push_str(&id);
                     }
+                    if target.id.len() > 256 {
+                        return Err(InferenceError::new(
+                            InferenceErrorKind::ResponseTooLarge,
+                            "tool ID exceeds limit",
+                        ));
+                    }
                     if let Some(function) = call.function {
                         if let Some(name) = function.name {
                             target.name.push_str(&name);
+                        }
+                        if target.name.len() > 64 {
+                            return Err(InferenceError::new(
+                                InferenceErrorKind::ResponseTooLarge,
+                                "tool name exceeds limit",
+                            ));
                         }
                         if let Some(arguments) = function.arguments {
                             if target.arguments.len().saturating_add(arguments.len())
@@ -1012,14 +1041,12 @@ struct DeepSeekAccumulator {
 
 impl ProviderResponseAccumulator for DeepSeekAccumulator {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<ProviderStreamDelta>, InferenceError> {
-        self.inner.capture_reasoning = true;
         self.inner.push(chunk)
     }
 
     fn finish(
-        mut self: Box<Self>,
+        self: Box<Self>,
     ) -> Result<(ProviderInferenceResponse, Vec<ProviderStreamDelta>), InferenceError> {
-        self.inner.capture_reasoning = true;
         Box::new(self.inner).finish()
     }
 }
@@ -1037,8 +1064,36 @@ fn parse_stop_reason(value: &str) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use margatroid_types::{Message, TokenUsage, ToolCall, ToolDefinition};
+    use margatroid_types::message_types::{TokenUsage, ToolCall, ToolDefinition};
     use serde_json::json;
+
+    #[test]
+    fn sse_multiline_crlf_utf8_and_content_filter_are_preserved() {
+        let bytes = "event: message\r\ndata: {\"choices\":\r\ndata: [{\"delta\":{\"content\":\"你好\"},\"finish_reason\":\"content_filter\"}]}\r\n\r\ndata: [DONE]\r\n\r\n".as_bytes();
+        let mut accumulator = OpenAiAccumulator::default();
+        for byte in bytes {
+            accumulator.push(&[*byte]).unwrap();
+        }
+        let (response, _) = Box::new(accumulator).finish().unwrap();
+        assert_eq!(response.content.as_deref(), Some("你好"));
+        assert_eq!(response.stop_reason, StopReason::ContentFilter);
+    }
+
+    #[test]
+    fn unfinished_arguments_and_huge_tool_indices_are_rejected() {
+        let mut accumulator = OpenAiAccumulator::default();
+        accumulator.push(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"echo\",\"arguments\":\"{\"}}]},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n").unwrap();
+        assert_eq!(
+            Box::new(accumulator).finish().unwrap_err().kind(),
+            InferenceErrorKind::ResponseIncomplete
+        );
+        let mut accumulator = OpenAiAccumulator::default();
+        assert!(accumulator
+            .push(
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1000000000}]}}]}\n\n"
+            )
+            .is_err());
+    }
 
     #[test]
     fn openai_usage_reads_cached_prompt_tokens() {
@@ -1153,10 +1208,10 @@ data: [DONE]
             .unwrap();
         assert!(visible.is_empty());
 
-        let (response, trailing) = Box::new(accumulator).finish().unwrap();
-        assert_eq!(trailing, [ProviderStreamDelta::Content("tail".into())]);
-        assert_eq!(response.content, Some("tail".into()));
-        assert!(response.tool_calls.is_empty());
+        assert_eq!(
+            Box::new(accumulator).finish().unwrap_err().kind(),
+            InferenceErrorKind::ResponseIncomplete
+        );
     }
 
     #[test]
