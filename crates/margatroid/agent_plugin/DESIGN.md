@@ -44,6 +44,8 @@ error      共享错误契约       生命周期与历史写入错误
 
 Agent生命周期及此前共享组件迁移已实现。本文保留六板块契约格式；下列源码归属与差异说明以当前实现为准，未列为已实现的扩展契约不得视为可调用API。
 
+显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
+
 # lib
 
 ## 组件定义位置
@@ -155,7 +157,7 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
         批量追加历史：公开方法
         行为：定位唯一Agent Entity，调用history.append_batch，在同一事务中按幂等键追加全部记录；失败全部回滚并映射HistoryWriteFailed
             key包含完整Agent Entity、command id、kind及call id/index，同键同内容重试不重复追加，同键不同内容返回冲突
-            指令历史事务成功才执行；执行后的结果历史失败只报告独立history_error，不重做指令或外部副作用
+            指令审计事务成功才执行；message仅由显式history_append请求保存，写入失败返回该请求错误，不重做原指令或外部副作用
             只增量写历史，不覆盖旧记录、不维护实时表，也不自动停止或销毁Agent
     agent_append_history(&self, agent: &ResourceID, record: HistoryRecord) -> Result<(), AgentError>
         单条追加：公开兼容方法，委托agent_append_history_batch(agent, vec![record])，遵守同一事务与幂等契约
@@ -613,8 +615,8 @@ HistoryRecord：历史增量记录，公开共享类型
     删除AgentResourceMap、AgentResourceEntry和Agent内复制的资源内容，以五种ResourceSet替代
     Agent不再包含AgentInferenceState、AgentToolState及其pending表；执行结果由所属领域管理，公共取消、沙箱互斥及真实完成等待统一在execution，不丢弃在执行任务
     不在Agent保存AgentTurnState、TokenUsageState和last_error等旧聚合字段；只保留turn代号，start_turn生成并替换，finish清空
-    自动历史由MCL负责：除history_append外每条指令先批量事务记录成功才执行；inference追加assistant，tool_call按call id/index逐项记录结果含失败
-    history_append自身采用同一批量事务接口，执行后历史失败单独history_error，不重跑已执行指令
+    MCL指令审计由MCL负责：除合法history_append外先记录成功才执行；message历史只由显式history_append控制，inference与tool_call不追加任何结果消息
+    history_append自身采用批量事务接口，失败是该显式请求的错误；不隐式保存消息，不重跑已完成的推理或工具
     AgentMessage是共享types消息值，包含System（inject/system/user/assistant/tool_call/error），不实现旧路由Event；inject(Vec<AgentMessage>)递归同类型
     IMPORT MESSAGE prompt:... AS alias按实际role生成消息，infer支持System；不能将所有prompt强制转为System或User
     IMPORT TOOL tool:.../skill:.../hook:... AS alias与IMPORT SANDBOX sandbox:...使用同一Agent全域alias受检入口；hook执行行为尚未确认，TOOL导入类别不等于已有hook执行支持

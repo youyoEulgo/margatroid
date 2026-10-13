@@ -35,6 +35,8 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 实现说明：HistoryRecord目前不含持久sequence和创建时间；HistoryMessageDto.sequence按list顺序投影为1-based，created_at_ms固定为0表示未知。Stream使用完整Entity generation生成agent_instance，并通过agent.message.finished明确终态；终态不是操作完成权威。
 
+显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
+
 # lib
 
 ## 逻辑
@@ -91,7 +93,7 @@ MclCommandResultDto：指令结果，公开结构体
     source: ResourceIDDto
     target: ResourceIDDto
     result: Result<serde_json::Value, ProtocolErrorDto>--保留MclValue类型与真实结果
-    history_error: Option<ProtocolErrorDto>--执行后历史失败，不改写执行result
+    history_error: Option<ProtocolErrorDto>--取消等指令审计附带失败，不代表自动保存结果消息；不改写执行result
     说明：Inference结果保留assistant全部内容及stop_reason，tool_call结果MESSAGE数组保留调用顺序和失败项。
         目标GET结果仅Message/Tool/Sandbox三类数组，TOOL和SANDBOX投影身份与可展示定义，不向客户端泄漏内部script路径、句柄或策略敏感内容
         DTO对资源值的出站投影不等于可作为可信入站快照；入站资源解析仍须通过目标Agent导入绑定验证

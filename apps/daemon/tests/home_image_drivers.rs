@@ -7,7 +7,7 @@ use core_plugin::{App, Entity, World};
 use lua_runtime_plugin::LuaRuntimePlugin;
 use margatroid_types::block_types::{BlockInner, BlockPath};
 use margatroid_types::history_components::AgentHistoryStore;
-use margatroid_types::inference_events::InferenceRequest;
+use margatroid_types::inference_events::{InferenceError, InferenceErrorKind, InferenceRequest};
 use margatroid_types::mcl_events::{MclCommand, MclCommandResult, MclInstruction, MclValue};
 use margatroid_types::message_types::{AgentMessage, InferenceResponse, StopReason, ToolCall};
 use margatroid_types::resource_components::{
@@ -92,6 +92,16 @@ fn tick_until<T>(app: &mut App, label: &str, mut inspect: impl FnMut(&World) -> 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         app.tick();
+        let exceptions = app
+            .world()
+            .event_reader::<margatroid_types::lua_runtime_events::DriverLuaVmException>()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            exceptions.is_empty(),
+            "{label}: driver exceptions={exceptions:?}"
+        );
         if let Some(result) = inspect(app.world()) {
             return result;
         }
@@ -217,8 +227,174 @@ fn inject(app: &mut App, suffix: &str, content: &str) {
     );
     command(app, &format!("wake-{suffix}"), "EMIT EFFECT wake", vec![]);
 }
+fn inject_messages(app: &mut App, suffix: &str, messages: &[AgentMessage]) {
+    command(
+        app,
+        &format!("inject-{suffix}"),
+        "INJECT ? TO entry.pending",
+        vec![serde_json::to_value(messages).unwrap()],
+    );
+    command(app, &format!("wake-{suffix}"), "EMIT EFFECT wake", vec![]);
+}
+fn history_messages(app: &App, entity: Entity) -> Vec<AgentMessage> {
+    app.world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .history
+        .list()
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.kind == "message")
+        .map(|record| serde_json::from_value(record.payload).unwrap())
+        .collect()
+}
+fn exercise_entry_dispatch(app: &mut App, entity: Entity) {
+    let before = history_messages(app, entity);
+    let outer_assistant = assistant("external assistant without calls", vec![]);
+    let outer_error = AgentMessage::Error {
+        message: "external error".into(),
+    };
+    inject_messages(app, "outer-assistant", &[outer_assistant.clone()]);
+    turn_done(app, entity);
+    assert_eq!(
+        history_messages(app, entity),
+        [before.clone(), vec![outer_assistant.clone()]].concat()
+    );
+    inject_messages(app, "outer-error", &[outer_error.clone()]);
+    turn_done(app, entity);
+    let outer_tool = AgentMessage::ToolCall {
+        resource_id: Some(id("tool:local/list-directory:latest")),
+        tool_call_id: "external-result".into(),
+        tool_name: "list_dir".into(),
+        content: "external tool result triggers inference".into(),
+        failed: false,
+    };
+    inject_messages(app, "outer-tool", &[outer_tool.clone()]);
+    let request = inference(app, entity);
+    assert!(
+        request.turn.is_none(),
+        "tool result alone must not start a user turn"
+    );
+    assert_eq!(request.messages.last(), Some(&outer_tool));
+    let error_before = history_messages(app, entity);
+    request
+        .reply
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .send(Err(InferenceError::new(
+            InferenceErrorKind::ExecutionFailed,
+            "offline inference failure",
+        )))
+        .unwrap();
+    turn_done(app, entity);
+    let after_error = history_messages(app, entity);
+    assert_eq!(&after_error[..error_before.len()], error_before.as_slice());
+    assert_eq!(after_error.len(), error_before.len() + 1);
+    assert!(
+        matches!(after_error.last(), Some(AgentMessage::Error { message }) if message.contains("offline inference failure"))
+    );
+    let conversation = messages(command(
+        app,
+        "outer-context",
+        "GET msg.conversation",
+        vec![],
+    ));
+    assert_eq!(conversation.last(), after_error.last());
+    assert_eq!(
+        &after_error[before.len()..before.len() + 3],
+        &[outer_assistant, outer_error, outer_tool]
+    );
+
+    let calls = (0..2)
+        .map(|index| ToolCall {
+            id: format!("per-result-call-{index}"),
+            tool_name: "list_dir".into(),
+            arguments: "{}".into(),
+        })
+        .collect::<Vec<_>>();
+    let batch = assistant("external two-call assistant", calls.clone());
+    inject_messages(app, "per-result-batch", &[batch.clone()]);
+    let mut seen = BTreeSet::new();
+    let mut results = Vec::new();
+    tick_until(app, "two mocked external calls", |world| {
+        for request in world.event_reader::<ToolExecuteRequest>() {
+            if request.agent != entity || !seen.insert(request.call.id.clone()) {
+                continue;
+            }
+            assert!(calls.contains(&request.call));
+            assert!(request.turn.is_none());
+            let message = AgentMessage::ToolCall {
+                resource_id: Some(request.resource.resource_id.clone()),
+                tool_call_id: request.call.id.clone(),
+                tool_name: request.call.tool_name.clone(),
+                content: format!("per-result mock {}", request.call.id),
+                failed: false,
+            };
+            request
+                .reply
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(Ok(ToolExecuteResponse {
+                    message: message.clone(),
+                }))
+                .unwrap();
+            results.push(message);
+        }
+        (seen.len() == 2).then_some(())
+    });
+    let first = inference(app, entity);
+    assert!(first.turn.is_none());
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| first.messages.contains(result))
+            .count(),
+        1,
+        "the first tool result must trigger inference before the second result is consumed"
+    );
+    let first_answer = assistant("first per-result answer", vec![]);
+    respond(&first, first_answer.clone(), StopReason::Completed);
+    let second = inference(app, entity);
+    assert!(second.turn.is_none());
+    assert!(
+        second.messages.contains(&first_answer),
+        "inference result must be enqueued at the head before the remaining tool result"
+    );
+    for result in &results {
+        assert!(second.messages.contains(result));
+    }
+    let second_answer = assistant("second per-result answer", vec![]);
+    respond(&second, second_answer.clone(), StopReason::Completed);
+    turn_done(app, entity);
+    let history = history_messages(app, entity);
+    assert_eq!(
+        history.iter().filter(|message| **message == batch).count(),
+        1
+    );
+    for message in results.iter().chain([&first_answer, &second_answer]) {
+        assert_eq!(history.iter().filter(|item| *item == message).count(), 1);
+    }
+}
 fn turn_done(app: &mut App, entity: Entity) {
     tick_until(app, "turn completion and driver wait", |world| {
+        assert!(
+            world
+                .event_reader::<InferenceRequest>()
+                .into_iter()
+                .all(|request| request.agent != entity),
+            "unexpected inference while waiting for idle"
+        );
+        assert!(
+            world
+                .event_reader::<ToolExecuteRequest>()
+                .into_iter()
+                .all(|request| request.agent != entity),
+            "unexpected tool execution while waiting for idle"
+        );
         let agent = world.get_component::<Agent>(entity)?;
         let pending = agent
             .block
@@ -231,7 +407,11 @@ fn turn_done(app: &mut App, entity: Entity) {
             && pending.is_empty()
             && agent.execution.activity_count() == 0
             && agent.mcl.commands.is_empty()
-            && agent.mcl.pending.is_none())
+            && agent.mcl.pending.is_none()
+            && {
+                let wake = agent.lua.wake.lock().unwrap();
+                wake.waiting && wake.sender.is_some() && !wake.pending_wake
+            })
         .then_some(())
     });
 }
@@ -527,7 +707,7 @@ fn exercise(images: &Path, image: &str, reviewer: bool) {
         1
     );
     assert_eq!(second.tools, first.tools);
-    let calls = (0..2)
+    let calls = (0..1)
         .map(|index| ToolCall {
             id: format!("offline-call-{index}"),
             tool_name: "list_dir".into(),
@@ -602,13 +782,25 @@ fn exercise(images: &Path, image: &str, reviewer: bool) {
     respond(&third, final_answer.clone(), StopReason::Completed);
     turn_done(&mut app, entity);
     let context_only = assistant("offline context-only injection", vec![]);
+    let context_user = AgentMessage::User {
+        content: "context-only user must not start inference".into(),
+    };
+    let context_error = AgentMessage::Error {
+        message: "context-only error must not dispatch finish".into(),
+    };
+    let context_container = AgentMessage::Inject {
+        messages: vec![
+            context_only.clone(),
+            AgentMessage::Inject {
+                messages: vec![context_user.clone(), context_error.clone()],
+            },
+        ],
+    };
     command(
         &mut app,
         "inject-context-only",
         "INJECT ? TO entry.pending",
-        vec![serde_json::json!([
-            {"type": "inject", "messages": [context_only.clone()]}
-        ])],
+        vec![serde_json::json!([context_container.clone()])],
     );
     command(&mut app, "wake-context-only", "EMIT EFFECT wake", vec![]);
     tick_until(&mut app, "context-only injection recorded", |world| {
@@ -626,7 +818,7 @@ fn exercise(images: &Path, image: &str, reviewer: bool) {
         (conversation.contains(&context_only)
             && agent.history.list().unwrap().iter().any(|record| {
                 record.kind == "message"
-                    && record.payload == serde_json::to_value(&context_only).unwrap()
+                    && record.payload == serde_json::to_value(&context_container).unwrap()
             }))
         .then_some(())
     });
@@ -647,9 +839,10 @@ fn exercise(images: &Path, image: &str, reviewer: bool) {
         },
         batch_answer,
         tool_messages.remove(0),
-        tool_messages.remove(0),
         final_answer,
         context_only,
+        context_user,
+        context_error,
     ];
     for message in &expected {
         assert_eq!(
@@ -671,9 +864,11 @@ fn exercise(images: &Path, image: &str, reviewer: bool) {
         .filter(|record| record.kind == "message")
         .map(|record| serde_json::from_value::<AgentMessage>(record.payload.clone()).unwrap())
         .collect::<Vec<_>>();
+    let mut expected_history = expected[..expected.len() - 3].to_vec();
+    expected_history.push(context_container);
     assert_eq!(
-        stored_messages, expected,
-        "automatic history must not duplicate messages"
+        stored_messages, expected_history,
+        "history must preserve the original nested inject container, not flattened context leaves"
     );
     assert_eq!(
         history
@@ -774,7 +969,14 @@ fn exercise(images: &Path, image: &str, reviewer: bool) {
         .map(|record| serde_json::from_value::<AgentMessage>(record.payload.clone()).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(appended_messages, vec![summary, new_user, compact_final]);
-    let history = complete_history;
+    exercise_entry_dispatch(&mut app, entity);
+    let history = app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .history
+        .list()
+        .unwrap();
     stop(&mut app, workspace, entity);
     let persisted = SqliteHistoryStore::open(temp.path().join("history.sqlite"))
         .unwrap()

@@ -1,5 +1,8 @@
 # MCL Plugin
 
+显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
+
+
 新 MCL 的当前实现说明见 [DESIGN-NEXT.md](<DESIGN-NEXT.md>)。[DESIGN.md](<DESIGN.md>) 仅归档重写前 revision `7c9055c` 的旧实现；旧 REF/MERGE/BIND/LOAD/EXPOSE、visibility 与 history_record 路径已删除，不再受理。
 
 ## 安装与执行
@@ -56,7 +59,7 @@ IMPORT 资源必须精确属于 image_dependencies；无 builtin 隐含例外。
 
 tool_call 第一参数必须恰好一条 Assistant，直接从其 tool_calls 提取请求；不再使用 work.calls 或 TOOL_CALL 字段。调用 ID 与名称非空、批次 ID 唯一，可见 TOOL alias 冲突整批拒绝。空调用同步返回 typed MESSAGE 空数组且不提交任务；Hook 导入合法但执行语义未支持，明确返回失败。
 
-除合法 history_append 外，指令历史在执行前单独事务写入，失败不执行。结果历史在真实执行后单独批次事务追加，失败附 history_error，不覆盖真实结果或重试工具。此机制不是跨网络、Block 与历史的全局事务。System 消息保留上下文角色，但 history_append 会递归拒绝直接或嵌套 Inject 中的 System。工具结果自动写历史，不重复记录输入 Assistant。
+除合法 history_append 外，指令历史在执行前单独事务写入，失败不执行。message 历史完全由显式 history_append 控制；推理和工具只返回结果，不自动追加 assistant、工具成功或失败消息。显式追加失败返回 history_append 错误，不重新执行原推理或工具。此机制不是跨网络、Block 与历史的全局事务。System 消息保留上下文角色，但 history_append 会递归拒绝直接或嵌套 Inject 中的 System。输入 Assistant 和工具结果均不自动写 message 历史；需要保存时由 Driver 显式追加。
 
 资源值的宿主/网络输出采用安全投影，不发送完整执行材料或沙箱策略；内部 Block 与领域请求仍保留选定资源快照，重载不会改变旧 Block 中的版本。
 

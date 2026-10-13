@@ -42,6 +42,8 @@ error      共享推理错误契约               校验、执行及协议错误
 
 当前输入边界：MCL只有MESSAGE、TOOL、SANDBOX三种typed arrays。TOOL保存可调用资源值（ResourceID、alias、description、schema及不可变共享执行材料快照），不是ToolCall请求数组。`IMPORT TOOL tool/skill/hook AS alias`绑定资源，`GET alias`解析并取得typed snapshot；`infer`参数依次为MESSAGE array、TOOL array，不接受ResourceID array，不再次执行global alias query。旧Block不随reload暗变，新GET alias取得新快照。Hook允许导入TOOL，但Driver触发器与执行路线尚未闭合，不假定其为普通Lua工具。
 
+显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
+
 # lib
 
 ## 类型
@@ -99,7 +101,7 @@ InferenceConfig：推理配置，公开Resource--实现侧配置，不是图书�
     不创建Entity、不挂图书馆组件，不保存Agent上下文、turn或工具执行状态
     Agent.info.model提供模型选择与采样参数快照，不在每次推理时重新读取AgentImage
     全局只有InferenceConfig这一份配置，不设WorkspaceModelRoutes或路由注册表
-    Inference只执行一次模型请求，自动历史、MCL队列及指令结果由MCL负责
+    Inference只执行一次模型请求，MCL负责队列及指令回执；任何层都不能隐式保存assistant，message历史由显式history_append决定
     不接收AgentControl，不投递Lua邮箱，不发AgentFailure代替oneshot错误
 
 客户端边界：
@@ -253,7 +255,7 @@ load_model_routes(path: &Path, factories: &HashMap<String, ErasedProviderAdapter
 请求主线：
     MCL参数快照 -> InferenceRequest -> 主线程模型/资源/发送器快照
     通用异步闭包 -> Provider HTTP与SSE -> 直接向已收集webui发送器推流
-    完整assistant结果 -> oneshot -> MCL异步闭包 -> ECS收口并写assistant历史 -> MclCommandResult
+    完整assistant结果 -> oneshot -> MCL异步闭包 -> ECS收口 -> MclCommandResult；若需历史，由Driver另发history_append
 
 生命周期：
     每次请求使用Agent.execution派生CancellationToken，在同一AgentExecutionScope登记Inference活动，不建立InFlightInferences全局表

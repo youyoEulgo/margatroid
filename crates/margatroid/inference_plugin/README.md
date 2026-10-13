@@ -1,8 +1,11 @@
 # InferencePlugin
 
+显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
+
+
 ## 介绍与职责
 
-`InferencePlugin` 执行一次模型请求：共享 `AgentMessage` 快照和选定 `CallableResource` 工具定义快照进入，完整 `InferenceResponse` 经 oneshot 返回。它不创建 Agent、不写历史、不执行工具、不自动重试、续写或压缩；历史及命令收口由 MCL 负责。压缩等调用方也使用同一个入口，自行解释响应。
+`InferencePlugin` 执行一次模型请求：共享 `AgentMessage` 快照和选定 `CallableResource` 工具定义快照进入，完整 `InferenceResponse` 经 oneshot 返回。它不创建 Agent、不写历史、不执行工具、不自动重试、续写或压缩；命令收口由 MCL 负责；assistant 是否保存由调用方显式发出 history_append 决定，推理成功不触发 message 写入。压缩等调用方也使用同一个入口，自行解释响应。
 
 全局只有一份 `InferenceConfig`，包含模型路由、配置路径、协议工厂、共享 HTTP client、调度计划及重载关联。没有项目路由覆盖、在途推理表、输出路由、固定异步 System 或业务结果转发 System。插件仅安装 `inference_system`，处理统一请求、重载请求和共享重载输出。
 

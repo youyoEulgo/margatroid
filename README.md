@@ -51,7 +51,7 @@ daemon不接受启动参数，固定读取 `~/.margatroid/config.toml` 和 `~/.m
 ## 重写后的约定
 
 - 资源包通过五类加载插件挂到目标实体的 `ResourceSet<T>`；重复 IMPORT 重载，失败保留旧内容。
-- 每条 MCL 除 `history_append` 外先记录原指令；执行后的历史失败单独返回 `history_error`，不会重做工具。
+- MCL 指令审计与 message 历史分开。message 只能通过显式 `history_append` 保存，推理和工具不自动保存结果；示例 Driver 对需要保存的结果显式追加。显式追加失败不得重做原推理或工具。
 - 工具 runner 是独立程序，构建 daemon 时应同时构建 `cargo build -p tool_plugin --bin tool_runner`，或设置 `MARGATROID_TOOL_RUNNER` 指向它。
 - Linux shell 支持显式 PTY；有激活沙箱但后端缺失时拒绝执行，不降级成无沙箱。
 - 首版不支持长期任务转交。真实清理失败保留活动及宿主并返回错误，不自动重启或删除。
