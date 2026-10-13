@@ -51,6 +51,9 @@ daemon不接受启动参数，固定读取 `~/.margatroid/config.toml` 和 `~/.m
 ## 重写后的约定
 
 - 资源包通过五类加载插件挂到目标实体的 `ResourceSet<T>`；重复 IMPORT 重载，失败保留旧内容。
+- 所有 Block 使用 Agent 的真实 SQLite 数据库，GET／INJECT 异步事务化。CREATE BLOCK 创建或打开持久数据，CREATE TEMP BLOCK 使用启动实例隔离，不恢复旧 entry。CREATE 返回 BlockOpened，已有 schema 不匹配报错、不清空。
+- TOOL／SANDBOX 字段只保存 ResourceID，读取时解析当前导入值；已提交执行使用自己的定义快照。轮次结束指令为 finish_turn，旧 finish 已拒绝。
+- 项目根目录样例已验证重启恢复上下文和配置；主目录镜像尚未迁移，不应使用旧 Driver 启动新版运行时。
 - MCL 指令审计与 message 历史分开。message 只能通过显式 `history_append` 保存，推理和工具不自动保存结果；示例 Driver 对需要保存的结果显式追加。显式追加失败不得重做原推理或工具。
 - 工具 runner 是独立程序，构建 daemon 时应同时构建 `cargo build -p tool_plugin --bin tool_runner`，或设置 `MARGATROID_TOOL_RUNNER` 指向它。
 - Linux shell 支持显式 PTY；有激活沙箱但后端缺失时拒绝执行，不降级成无沙箱。

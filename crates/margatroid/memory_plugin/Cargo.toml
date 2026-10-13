@@ -6,8 +6,11 @@ edition = "2021"
 [dependencies]
 core_plugin = { path = "../../mecs/core_plugin" }
 margatroid_types = { path = "../types" }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["hooks"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+resource_id_plugin = { path = "../resource_id_plugin" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

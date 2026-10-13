@@ -43,6 +43,11 @@ impl Plugin for AgentPlugin {
             "AgentPlugin requires RuntimePlugin"
         );
         assert!(
+            app.world()
+                .contains_resource::<async_runtime_plugin::AsyncRuntimeHandle>(),
+            "AgentPlugin requires AsyncRuntimePlugin"
+        );
+        assert!(
             app.world().contains_resource::<ResourcePluginInstalled>(),
             "AgentPlugin requires ResourcePlugin"
         );

@@ -1,6 +1,7 @@
 pub mod agent_components;
 pub mod agent_events;
 pub mod agent_image_events;
+pub mod block_storage;
 pub mod block_types;
 pub mod client_components;
 pub mod client_events;
@@ -27,6 +28,10 @@ pub use agent_components::{
 };
 pub use agent_events::{
     AgentError, AgentErrorKind, StartAgent, StartAgentResult, StopAgent, StopAgentResult,
+};
+pub use block_storage::{
+    AgentBlockStorage, AgentBlockStorageHandle, AgentDatabaseHandle, BlockStorageError,
+    BlockStorageRequest, StoredBlockResult,
 };
 pub use block_types::{
     AgentBlock, Block, BlockInner, BlockOperation, BlockOperationResult, BlockPath, InnerType,

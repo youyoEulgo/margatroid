@@ -29,7 +29,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # 板块格式
 
-**本轮共享契约已实现：Block仅保留MESSAGE/TOOL/SANDBOX三种typed数组，删除RESOURCE（ResourceID）/TOOL_CALL（ToolCall）数组；System消息、Agent全域alias绑定及不可变导入定义和策略快照均已迁移。ToolCall纯输入仍保存在Assistant.tool_calls，不是独立Block类型。**
+**当前已实现MESSAGE/TOOL/SANDBOX typed数组、System消息、Agent全域alias绑定、真实SQLite Block、共享异步storage及持久ID resolve。Agent只保存database及同连接历史视图，不持有Block内容；数据库TOOL/SANDBOX不保存定义/policy快照。ToolCall纯输入仍保存在Assistant.tool_calls，不是独立Block类型。finish_turn已实现，旧finish拒绝。**
 
 共享值、组件与事件迁移及本轮typed数组与导入绑定均已实现。各领域文档描述对应完整行为，本文件统一依赖方向和跨领域数据，不继续混入旧邮箱、引用Block或ResourceId组件方案。ResourceID等基础契约由resource_id_plugin提供；types按组件、事件与纯值模块组织，不依赖业务Plugin实现。正文保持lib、system、handler、events、types、error六个标准板块。
 
@@ -138,7 +138,7 @@ CallableDefinitionSnapshot：可调用资源定义快照，公开枚举
     Tool(ToolResource)
     Skill(SkillResource)
     Hook(HookResource)
-    说明：复用共享资源定义，包含执行准备所需描述、schema及资源定义；不得回查可变集合替换旧值的定义。
+    说明：复用共享资源定义，包含执行准备所需描述、schema及资源定义；GET TOOL从StoredBlockInner中的ID在当前已导入绑定中resolve最新定义，执行提交后不得再回查替换已提交快照。
         快照固定描述、schema和资源定义字段（包括路径），不冻结路径对应磁盘文件内容；执行时按既有路径读取，不宣称文件正文版本已被快照。
         Hook是允许导入的TOOL资源类别，hook执行语义尚未确认，不能由此声明tool_call已支持hook执行。
 
@@ -157,12 +157,17 @@ ImportBindings：Agent导入绑定，公开共享类型--随Agent保存，不是
     get(&self, alias: &str) -> Option<&ImportedValue>
         只读绑定：公开方法，不绕过World受检写入。
     contains_resource(&self, resource_id: &ResourceID, kind: InnerType) -> bool
-        检查来源：公开方法，只检查ID与kind；旧Block快照不要求与最新alias或定义相等。
+        检查来源：公开方法，只检查ID与kind。
+    get_resource(&self, resource_id: &ResourceID, kind: InnerType) -> Option<&ImportedValue>
+        只读来源：按完整ID及kind取得本次绑定中的值，不加载资源。
+    resolve_resource(&self, resource_id: &ResourceID, kind: InnerType) -> Result<BlockInner, AgentError>
+        解析持久来源：在当前已导入绑定按完整ID/kind取得最新TOOL/SANDBOX定义；未导入或类型不符显式失败，不隐式加载，也不退回旧定义。
     说明：alias首字符必须是ASCII字母或下划线，后续仅ASCII字母、数字、下划线或连字符；不接受点、空白或非ASCII字符。
         受检更新与读取由共享agent_components中的WorldAgentExt统一实施，MCL只调用该契约。
         不按MESSAGE/TOOL/SANDBOX分别维护alias表；Agent全域同alias不同完整ID（含跨类型）拒绝。
         同ID同kind重载成功才替换对应alias的新值，失败保留旧绑定；重载alias改变时先查新alias冲突，成功时移除旧绑定再发布新绑定，不留下同来源不同alias分叉。
-        已取出的Block/GET值仍持有旧快照；Agent.sandbox选择SandboxValue的ID及policy快照，重载不暗改激活值。
+        alias/import bindings只留RAM，启动显式IMPORT恢复，不保存到数据库；每次GET持久ID都resolve当前最新已导入定义。
+        已完成GET的值及已提交execution快照保持不变；activeSandboxValue不恢复，须GET再显式sandbox_use，重载不暗改已激活策略。
 
 BlockInner：字段数组，公开枚举--只保留三种typed数组
     Message(Vec<AgentMessage>)--MESSAGE
@@ -186,12 +191,93 @@ BlockPath：字段地址，公开结构体
     block_id: String
     inner_id: String
 
-Block：普通字段容器，公开结构体
-    inners: HashMap<String, BlockInner>
+StoredBlockInner：数据库字段值，公开枚举--持久值与GET输出分离
+    Message(Vec<AgentMessage>)--结构化消息JSON，保留完整消息字段
+    Tool(Vec<ResourceID>)--只存完整来源ID，不序列化CallableDefinitionSnapshot
+    Sandbox(Vec<ResourceID>)--只存完整来源ID，不序列化policy
+    说明：空数组也有InnerType；rows为block definitions/fields及typed arrays，默认每field一行JSON，不强制每field独立SQL表。
 
-BlockAssembly：普通Block容器，公开结构体
-    blocks: HashMap<String, Block>
-    说明：不含RefBlock或RefMerge，机械操作由AgentBlock受检接口维护。
+BlockNamespace：数据库Block命名空间，公开枚举
+    Persistent { agent: ResourceID }--稳定Agent逻辑身份，重启仍打开同一数据
+    Temporary { instance: DriverLuaVmInstance }--完整启动instance隔离，旧实例重叠时不互见
+
+BlockOpened：CREATE结果，公开结构体
+    block_id: String--本次创建或打开的Block名称
+    created: bool--仅本命名空间首次创建为true；open已有Block为false
+    temporary: bool--区分CREATE BLOCK与CREATE TEMP BLOCK
+    说明：默认CREATE BLOCK持久open/validate，不清空；同instance CREATE TEMP BLOCK也幂等open并检查schema，不清空。
+        同一可见block名不同persistent/temporary lifecycle冲突拒绝，不因底层namespace不同静默选择另一Block。
+
+AgentDatabaseStore：组合数据库接口，公开object-safe trait
+    约束：AgentHistoryStore + AgentBlockStorage
+    说明：共享层通过小型history adapter委托同一Arc，不依赖memory_plugin，也不要求trait upcasting。
+
+AgentDatabaseHandle：Agent数据库能力，公开opaque可克隆句柄
+    store: Arc<dyn AgentDatabaseStore>--私有；两个视图共享同一store及连接管理器
+    new(store: impl AgentDatabaseStore) -> Self
+        构造能力：公开关联函数，只包装backend，不执行SQL。
+    history() -> AgentHistoryHandle
+        取得同一SQLite文件的历史分表视图。
+    block_storage() -> AgentBlockStorageHandle
+        取得同一文件与connection manager的Block存储视图；Agent.database只保存此句柄，不保存Block内存内容。
+
+AgentBlockStorage：共享Block存储接口，公开trait--Send + Sync + 'static
+    execute(&self, request: BlockStorageRequest) -> Result<StoredBlockResult, BlockStorageError>
+        阻塞机械操作：只在blocking worker调用；请求包含namespace、整次selectors/schema及INJECT必要检查，不由MCL拆成多个事务。
+
+AgentBlockStorageHandle：异步Block存储句柄，公开可克隆类型
+    execute(&self, request: BlockStorageRequest) -> impl Future<Output = Result<StoredBlockResult, BlockStorageError>>
+        异步入口：调度blocking worker并等待真实join；所有Block只用真实SQLite backend，不提供RAM Block backend。
+        GET在一次read transaction读取多selector同一snapshot；INJECT在同一write transaction读snapshot、执行map/type/range检查并replace，commit后才成功。
+        取消只请求worker停止，不以Future丢弃伪造rollback；已commit明确返回已提交事实，无法确认commit则显式CommitUnknown，不声明未写入。
+
+BlockStorageContext：完整请求命名空间上下文，公开结构体
+    agent: ResourceID--稳定Agent身份
+    instance: DriverLuaVmInstance--完整owner及启动关联；启动ID含进程session nonce，跨重启不复用TEMP
+
+BlockSchema：创建声明，公开结构体
+    name: String
+    fields: Vec<(String, InnerType)>
+    temporary: bool
+
+BlockRange：整数范围，公开枚举
+    All / Empty / Single(i64) / Range(Option<i64>, Option<i64>)
+    map(self, length: usize, write: bool) -> Result<(usize, usize), BlockStorageError>
+        将原范围映射为左闭右开区间，显式检查负端点、混号、逆序、越界及整数溢出；空Read[0]返回[0,0]。
+
+BlockSelector：类型化选择器，公开结构体
+    path: BlockPath
+    range: BlockRange
+
+BlockSource：事务求值来源，公开枚举
+    Values(StoredBlockInner)--提交前已将alias/manual快照转成持久值
+    Selector(BlockSelector)--仅worker在整次事务读取
+
+BlockExpression：有序表达式，公开枚举
+    Sources(Vec<BlockSource>)
+    Empty--仅INJECT []按目标kind构造typed空值；GET不接受无类型Empty
+
+BlockStorageOperation：机械操作，公开枚举
+    Create(BlockSchema)
+    Get { expressions: Vec<BlockExpression> }--同一read snapshot，保留参数边界
+    Inject { source: BlockExpression, target: BlockSelector }--同一write事务求值、检查及replace
+
+BlockStorageRequest：完整owned请求，公开结构体
+    context: BlockStorageContext
+    operation: BlockStorageOperation
+    cancel: CancellationToken
+
+StoredBlockResult：事务结果，公开枚举
+    BlockOpened(BlockOpened)
+    Arrays(Vec<StoredBlockInner>)--GET统一返回数组列表，单表达式由MCL取唯一项
+    Unit--INJECT确认commit成功
+    说明：机械契约不依赖MCL私有parser；Block/AgentBlock只可作为事务内或返回快照的纯值，不是Agent权威内存存储，不含RefBlock或RefMerge。
+
+BlockStorageError：存储错误，公开枚举
+    SchemaMismatch(String) / LifecycleMismatch(String) / BlockMissing(String) / FieldMissing(BlockPath)
+    TypeMismatch / InvalidRange / InvalidRequest(String) / Cancelled
+    CommitUnknown(String) / CleanupFailed(String) / Io(String)
+    说明：Cancelled仅用于确认未提交；CommitUnknown不伪称回滚。CleanupFailed表示事务清理未获证明，Other活动不能按普通错误释放。
 
 MclInstruction：指令内容，公开结构体
     text: String--原始指令文本
@@ -226,11 +312,16 @@ HistoryRecord：历史记录，公开共享契约
     Agent内alias跨所有导入类型唯一，由ImportBindings及共享受检World入口统一维护；同alias不同完整ID先拒绝，Inference和MCL工具准备不能绕过检查
     IMPORT必须精确属于Agent镜像依赖，无builtin例外；MCL与加载插件共用WorldAgentExt.agent_validate_import受检预检，不维护平行许可或alias规则
     IMPORT TOOL tool:.../skill:.../hook:... AS alias产生CallableResource；IMPORT MESSAGE prompt:... AS alias按实际role产生AgentMessage（包括新System契约）；IMPORT SANDBOX sandbox:...产生SandboxValue并遵守同一alias检查
-    重载成功更新资源条目及对应alias的新值，失败保留旧值；旧Block值持有不可变快照不暗变，激活沙箱改变策略时遵守Sandbox活动互斥
+    重载成功更新资源条目及对应alias的新值，失败保留旧值；持久Block只存TOOL/SANDBOX ID，后续GET解析新定义，既有GET/execution快照不暗变；激活沙箱改变策略时遵守Sandbox活动互斥
 
 值与输出：
     GET alias或selector lists始终返回MESSAGE/TOOL/SANDBOX typed数组；列表按顺序只拼接同类型，混合类型在空数组情况下也拒绝
     INJECT左侧与GET同一求值规则，右侧为唯一写入范围；handler不按目标字段类型转换输入值
+    selector GET的全部存储读取在一次read transaction，完成后基于本次RAM绑定快照resolve；INJECT读取snapshot、map检查和replace在同一write transaction，持久TOOL/SANDBOX只写ID
+    Agent.database保存一个Agent SQLite句柄，history是同文件分表视图；Block与history不同指令间没有跨事务原子保证
+    默认CREATE BLOCK open/validate不清空，created只标初建；启动prompt/conversation与默认工具配置仅created=true时填充，不能每次启动覆盖
+    CREATE TEMP BLOCK同instance幂等检查schema，TEMP entry不恢复；turn、pending、alias/import及active sandbox都不由数据库自动恢复
+    MCL start_turn及finish_turn仅改变本次运行turn；finish_turn清空且已为空时幂等成功，旧effect finish拒绝
     tool_call effect第一参数必须为恰好一个Assistant的MESSAGE数组，第二参数必须为TOOL数组；只执行该Assistant.tool_calls
     空tool_calls返回MESSAGE空数组；重复调用id、多个Assistant或工具alias冲突均在提交任何执行前失败，不产生部分submit
     输入Assistant不在tool_call effect中重复记录，输出为ToolCall结果消息组成的MESSAGE数组

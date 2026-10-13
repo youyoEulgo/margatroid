@@ -29,7 +29,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # 板块格式
 
-本文记录当前已实现的明确类型资源导入与数组表达式契约。Rust使用MESSAGE/TOOL/SANDBOX，旧RESOURCE/TOOL_CALL字段及省略声明类型的IMPORT已拒绝。队列、生命周期、oneshot及历史基础保持；资源加载通过受检主线程原子挂载与绑定发布。DESIGN.md保留重写前7c9055c的归档参考。
+本轮已实现：所有运行时Block统一存真实数据库，CREATE/GET/INJECT及包含选择器的参数求值异步事务化，旧effect `finish` 已删除并改为 `finish_turn`。明确类型资源导入与数组表达式契约保持，Rust使用MESSAGE/TOOL/SANDBOX。队列、完整实例生命周期、oneshot及历史基础保持；资源加载通过受检主线程原子挂载与绑定发布。DESIGN.md保留重写前7c9055c的归档参考。
 
 正文按lib、system、handler、events、types、error六板块组织。parser源码职责在handler板块描述，不另加第七板块。
 
@@ -80,11 +80,11 @@ Driver输入：
 ```text
 mcl_command_system(world: &mut World)
     命令System：公开System
-    处理事件：MclCommand、InternalMclHostSubmission、InternalMclCancellationSignal、MclAsyncOutput
+    处理事件：MclCommand、InternalMclHostSubmission、InternalMclCancellationSignal、MclAsyncOutput、MclCancelledOutput
     产出事件：领域加载/推理/工具请求、MclCommandResult
     行为：
         第一阶段绑定可信来源并逐条受理入目标Agent FIFO
-        第二阶段收口匹配的异步队首并派发回执，不保存任何message历史
+        第二阶段匹配完整pending identity，Completed派发回执，PreparedEffect/PreparedImport直接继续主线程动作，不重走队首parse或审计；取消审计批次完成后派发其回执
         第三阶段处理停止或来源取消，再推进各Agent队首
         同Agent异步等待不执行后续项，不同Agent独立推进；同步预算每Agent每帧64条
 ```
@@ -94,7 +94,7 @@ mcl_command_system(world: &mut World)
 ```text
 回执与关闭：
     Driver回执先通过私有HostReply对应oneshot同步发送，再发布公开观察结果
-    commands/pending为空且所有回执派发后才mark_drained
+    commands/pending为空、cancel_audits为零且所有回执派发后才mark_drained
     Stopping或执行作用域关闭拒绝新命令，未执行项Cancelled，在途取消但等待真实收口
     来源Driver关闭时只取消其完整实例关联的目标命令，取消signal唤醒事件驱动调度而不提供授权
     ready只允许当前Driver对本人调用；slot已清但实例匹配时返回已交付信息
@@ -110,16 +110,25 @@ parse_operation(instruction: &MclInstruction) -> Result<MclOperation, MclError>
     解析指令：私有函数
     行为：
         验证完整文本、关键字、括号与手动参数数量，不读取World
-        CREATE BLOCK字段仅MESSAGE、TOOL、SANDBOX，拒绝RESOURCE和TOOL_CALL
+        CREATE BLOCK与CREATE TEMP BLOCK字段仅MESSAGE、TOOL、SANDBOX，拒绝RESOURCE和TOOL_CALL；声明分别选择持久和本次启动隔离的表生命周期
         IMPORT严格为IMPORT <MESSAGE|TOOL|SANDBOX> <ResourceID> AS <alias>
         GET及INJECT左侧解析为同一种有序数组表达式，effect括号也使用此表达式
         不受理REF、MERGE、STATE、EXPOSE和旧visibility来源操作
+
+create_database_block(context: BlockExecutionContext, name: String, fields: Vec<FieldDeclaration>, temporary: bool) -> Result<MclValue, MclError>
+    创建或打开数据库Block：私有异步函数
+    行为：
+        普通Block以稳定AgentResourceID和block名称寻址，TEMP额外使用本次Driver启动实例命名空间
+        不存在则在事务中建立定义与typed空字段；已存在且完整字段声明相同则打开，不清空
+        同名生命周期、字段数量/名称/类型不匹配返回SchemaMismatch，不静默迁移、合并或覆盖旧数据
+        返回BlockOpened {created, temporary}，Driver只在created为true时填默认配置
+        所有Block都是真实数据库表/行，不提供另一套内存后端或BIND/SAVE/LOAD同步接口
 
 parse_array_expression(text: &str) -> Result<ArrayExpression, MclError>
     解析数组表达式：私有函数
     行为：
         仅按方括号之外的逗号切分，拒绝空项、尾逗号及不配对括号
-        每项为已导入alias或普通Block选择器；完整ResourceID仅在IMPORT中建立绑定，不新增裸地址读取语法
+        每项为已导入alias或数据库Block选择器；完整ResourceID仅在IMPORT中建立绑定，不新增裸地址读取语法
         alias采用首字符字母或下划线、后续字母数字下划线或连字符，不允许点以避免与block.field混淆
         选择器保留字段路径及原范围，不在解析阶段求值或冻结快照
 
@@ -138,36 +147,39 @@ begin_import(world: &mut World, request: &MclCommand, kind: InnerType, resource_
         IMPORT完成仅返回类型、资源ID和alias，不自动INJECT或执行effect
         取消后禁止挂载或发布新绑定，真实加载收口后才释放队首；观察Result不参与MCL等待
 
-evaluate_array_expression(world: &World, agent: Entity, expression: &ArrayExpression) -> Result<BlockInner, MclError>
-    统一数组求值：私有函数--GET、INJECT左项与effect括号唯一读取入口
+evaluate_array_expression(context: ArrayEvaluationContext, expression: ArrayExpression) -> Result<BlockInner, MclError>
+    统一数组求值：私有异步函数--GET、INJECT左项与effect括号唯一读取入口
     行为：
-        核对完整Agent实例，按书写顺序读取每个来源
+        主线程核对完整Agent并取得AgentDatabaseHandle/导入快照，执行任务按书写顺序读取来源，不携带World借用
         Alias从Agent.import_bindings取ImportedValue，转换为Message/Tool/Sandbox typed数组
-        Selector读取Agent.block对应字段，按范围复制值；只读取普通Block，不展开引用视图
+        Selector在同一数据库读事务中读取对应Block字段与范围，所有Block来自真实表；不保存独立内存内容或引用视图
         所有来源必须同类型，空区间也参与类型检查；按顺序拼接，保留重复元素，不隐式去重
         单索引仍返回数组，消息不包装为单Message，空结果不变为Unit
-        返回此刻快照，不建立自动更新关系；重载后重新GET alias取新版本，旧Block值保持旧快照
+        MESSAGE从数据库还原完整消息值；TOOL/SANDBOX字段保存完整ResourceID，读取时按本次Agent导入快照解析当前定义
+        普通及TEMP Block都不保存资源定义副本，重载后的下一次GET可取得新导入值；已开始执行的外部请求保持自身提交快照
+        ID未导入、kind不匹配或失去许可明确报错，不静默丢失配置，不以旧路径/旧policy恢复
         任何alias/字段缺失、混类型或范围错误均丢弃临时结果，无写入副作用
 
-execute_get(world: &World, agent: Entity, expression: &ArrayExpression) -> Result<MclValue, MclError>
-    执行读取：私有函数
+execute_get(context: ArrayEvaluationContext, expression: ArrayExpression) -> Result<MclValue, MclError>
+    执行读取：私有异步函数
     行为：直接调用evaluate_array_expression并返回Array，不按资源地址或调用方改变结果类型。
 
-prepare_inject(world: &World, agent: Entity, source: &ArrayParameter, target: &Selector, arguments: &[Value]) -> Result<PreparedInject, MclError>
-    准备注入快照：私有函数
+execute_inject(context: ArrayEvaluationContext, source: ArrayParameter, target: Selector, arguments: Vec<Value>) -> Result<MclValue, MclError>
+    事务注入：私有异步函数
     行为：
-        表达式来源直接调用与GET相同的evaluate_array_expression，不发送新GET事件
+        数据库工作线程在一个写事务内调用同一来源求值逻辑，不发送新GET事件、不先查后另开写事务
         手动MESSAGE问号严格解码完整消息数组；手动TOOL/SANDBOX仅接受已导入alias字符串数组，通过同一受检读取入口获得资源快照，拒绝裸ID及脚本/schema/policy对象；Empty按目标类型构造空数组
         求值结果必须与目标字段同类型，不将TOOL/SANDBOX转Message、不将Message转资源
-        全部读取、类型与范围检查成功后返回唯一目标路径及替换快照，执行阶段一次replace
+        在同一事务中完成全部来源读取、目标长度、类型及范围检查，然后一次replace并提交；错误回滚，不改任何字段
+        事务成功提交后才返回Unit并释放队首，不能把已提交成功改成Cancelled；提交事实未知须返回独立错误，不宣称回滚
         来源与目标相同也先读完所有来源，后续来源不读到本次修改
 
-evaluate_effect_parameters(world: &World, agent: Entity, operation: &MclOperation, arguments: &[Value]) -> Result<Vec<BlockInner>, MclError>
-    求值效果参数：私有函数
+evaluate_effect_parameters(context: ArrayEvaluationContext, operation: MclOperation, arguments: Vec<Value>) -> Result<Vec<BlockInner>, MclError>
+    求值效果参数：私有异步函数
     行为：
-        每个括号独立调用evaluate_array_expression；MESSAGE问号严格解码消息数组，TOOL/SANDBOX问号以alias字符串数组读取已导入快照，空数组保留要求类型
+        全部括号选择器在同一读事务求值，保持独立参数边界；MESSAGE问号严格解码消息数组，TOOL/SANDBOX问号以alias字符串数组读取已导入快照，空数组保留要求类型
         inference依次要求MESSAGE和TOOL，tool_call依次要求MESSAGE和TOOL
-        history_append要求MESSAGE，sandbox_use要求SANDBOX，wake/ready/start_turn/finish为零参数
+        history_append要求MESSAGE，sandbox_use要求SANDBOX，wake/ready/start_turn/finish_turn为零参数
         先检查全部数量与类型再提交，无部分执行，参数之间不拼接
 
 begin_tool_call(world: &mut World, request: &MclCommand, messages: Vec<AgentMessage>, visible: Vec<CallableResource>) -> Result<(), MclError>
@@ -193,24 +205,26 @@ begin_tool_call(world: &mut World, request: &MclCommand, messages: Vec<AgentMess
     IMPORT TOOL hook:local/review-flow:latest AS review-flow
     IMPORT MESSAGE prompt:local/coder-soul:latest AS soul
     IMPORT SANDBOX sandbox:local/workspace-write:latest AS workspace_write
-    CREATE BLOCK msg (instructions MESSAGE, conversation MESSAGE)
-    CREATE BLOCK setting (visible TOOL, activated SANDBOX)
+    CREATE TEMP BLOCK msg (instructions MESSAGE, compact_prompt MESSAGE)
+    CREATE BLOCK session (conversation MESSAGE, visible TOOL, activated SANDBOX)
+    CREATE TEMP BLOCK entry (pending MESSAGE)
+    EMIT EFFECT finish_turn
     GET soul, compact
     GET bash, review
     GET workspace_write
     GET msg.instructions, soul
     GET bash, soul--类型错误
     INJECT soul, compact TO msg.instructions
-    INJECT bash, review TO setting.visible
-    INJECT workspace_write TO setting.activated
-    EMIT EFFECT inference (msg.instructions, msg.conversation) (setting.visible)
-    EMIT EFFECT tool_call ? (setting.visible)
+    INJECT bash, review TO session.visible
+    INJECT workspace_write TO session.activated
+    EMIT EFFECT inference (msg.instructions, session.conversation) (session.visible)
+    EMIT EFFECT tool_call ? (session.visible)
     EMIT EFFECT history_append ?
-    EMIT EFFECT sandbox_use (setting.activated)
+    EMIT EFFECT sandbox_use (session.activated)
 
 Driver工具回合：
     assistant = inference结果.message
-    command("EMIT EFFECT tool_call ? (setting.visible)", {{assistant}})
+    command("EMIT EFFECT tool_call ? (session.visible)", {{assistant}})
     外层是arguments，内层单元素MESSAGE数组；不接受单对象特殊封装
     返回MESSAGE工具结果数组；Driver分别决定INJECT上下文和显式history_append，二者互不隐含
     删除work.calls及TOOL_CALL字段，不再单独INJECT tool_calls数组
@@ -220,7 +234,7 @@ Driver工具回合：
     非负Read[x]=[x,x+1]，负Read[x]=[len+x,len+1+x]
     非负Write[x]=[x,x]，负Write[x]=[len+1+x,len+1+x]
     空字段Read[0]返回typed空数组；双开放端点/显式混号/逆序/越界/溢出拒绝
-    INJECT[] TO b.f清空字段，INJECT[] TO b.f[]只替换空区间
+    INJECT [] TO b.f清空字段，INJECT [] TO b.f[]只替换空区间
     GET soul,compact为MESSAGE，GET bash,review为TOOL，GET workspace_write为SANDBOX
     混合类型即使包含空数组也报错，不在INJECT目标上重新解释来源
 
@@ -228,7 +242,18 @@ Driver工具回合：
     sandbox_use只接受SANDBOX数组，零项取消、一项激活、多项失败不修改
     策略快照来自选定SandboxValue，必须核对所属Agent导入许可，不从全局首个匹配者取值
     真实策略改变受Sandbox活动及受理门限制，Inference/Other不阻止
-    选中旧快照即使用旧策略，不因同ID集合重载暗换；相同ID但不同policy属于配置改变
+    已激活值及执行中的请求保持选定策略快照；数据库SANDBOX字段只保存ID，下一次GET解析当前导入值，再显式sandbox_use才切换；同ID不同policy是配置改变
+
+数据库与恢复：
+    所有Block操作通过AgentBlockStorageHandle异步执行，SQLite在阻塞工作线程，不在ECS执行I/O
+    命令开始登记Other活动，取消请求仍等待实际工作线程退出和事务结局，不丢Future假称回滚
+    同一Agent只使用其一份数据库，GET多来源读事务、INJECT全部来源与目标同写事务
+    alias及手动参数在任务提交时准备不可变快照；数据库TOOL/SANDBOX ID按该次导入快照解析，不跨World借用
+    非选择器的alias读取本身无SQL，但CREATE/GET/INJECT统一异步入口；effect动作本身在主线程同步通知，但每条命令的审计准备异步；带字段参数先一次异步读取所有独立参数再继续执行
+    History与Block共文件分表，INJECT不写message历史，history_append不修改Block，两条指令不承诺共同事务
+    TEMP entry按启动实例隔离，不恢复未处理请求；持久session恢复context及配置，不恢复turn/pending/VM活动
+    启动先IMPORT，再打开持久session并检查created，仅初建初始化visible/sandbox；TEMP prompt每次初始化
+    读取session.activated后显式sandbox_use，再ready；打开Block不自动激活沙箱或执行旧tool_calls
 
 历史：
     history_append只有完整参数求值与递归允许类型检查成功后才豁免命令记录，准备快照只追加一次
@@ -254,6 +279,9 @@ MclCommand：命令请求，公开事件
     target: ResourceID
     command: MclInstruction
     impl Event for MclCommand
+
+MclValue：命令成功值，公开枚举--保留Array、ResourceImport、Inference、Text与Unit
+    BlockOpened { block_id: String, created: bool, temporary: bool }--CREATE创建或打开结果，新建true、同schema打开false；两种Block均使用此值
 
 MclCommandResult：命令结果，公开事件
     id: String
@@ -306,6 +334,18 @@ ImportedValue：明确类型绑定，公开枚举
 ImportBindings：Agent本地alias绑定，公开共享类型
     bindings: BTreeMap<String, ImportedValue>--私有唯一命名权威，公开get及受检WorldAgentExt访问，不复制另一份全局alias索引
 
+StoredBlockInner：数据库字段值，公开共享枚举
+    Message(Vec<AgentMessage>)--完整消息结构，inject容器不拆
+    Tool(Vec<ResourceID>)--身份列表，不序列化schema/脚本路径/句柄
+    Sandbox(Vec<ResourceID>)--身份列表，不序列化policy定义
+
+ArrayEvaluationContext：异步读取准备，私有结构体
+    database: AgentBlockStorageHandle--受检取得的数据库视图
+    agent_id: ResourceID--持久命名空间
+    instance: DriverLuaVmInstance--TEMP命名空间
+    imports: ImportBindings--本次解析资源ID所需的不可变导入快照
+    cancel: CancellationToken
+
 ArrayExpression：有序读取表达式，私有类型
     sources: Vec<ArraySource>
 
@@ -316,7 +356,7 @@ ArraySource：读取来源，私有枚举
 ArrayParameter：完整数组参数，私有枚举
     Expression(ArrayExpression)
     Manual { index: usize }
-    Empty--仅INJECT[]，不新增内联JSON文本数组语法
+    Empty--仅INJECT []，不新增内联JSON文本数组语法
 
 ToolCall：assistant字段纯值，公开结构体
     id: String
@@ -332,7 +372,25 @@ ToolCall：assistant字段纯值，公开结构体
 ```text
 新增目标错误必须区分导入声明类型不匹配、alias绑定冲突、alias未导入、数组混型及资源能力不支持。
 普通错误完成本请求，不自动终止整个Driver，不以领域异常代替指令回执。
+StorageCommitUnknown明确表示提交事实不确定，不能投影成Cancelled或确认回滚；真实worker已退出且无未清理事务时可完成Other活动。
+StorageCleanupFailed表示回滚或事务清理仍未完成；保留Other活动并mark_cleanup_failed，关闭作用域及队列受理，执行作用域wait_all与drain wait返回清理失败，禁止虚假确认stop成功。取消审计本身的CleanupFailed也通过drain.mark_cleanup_failed报告，而不是永久等待无回执。
 已有停止、取消、幂等历史、history_error及完整Entity关联保持不变。
 本轮仍未实现Hook调用语义；允许声明TOOL不等于所有执行插件已支持其触发路线。
 旧RESOURCE/TOOL_CALL字段已迁移；Driver工具回合直接传单条Assistant消息数组，不保留work.calls。宿主与网络输出采用安全投影，不序列化完整调用执行材料或沙箱策略。
 ```
+
+## 目标验收
+
+```text
+数据库Block与finish_turn已实现；parser纯函数测试仍可使用AgentBlock作为不执行I/O的输入fixture，Agent运行时不保存该内存容器。
+验证重启恢复MESSAGE/TOOL/SANDBOX、TEMP不恢复、schema冲突保留旧数据、跨选择器事务快照、取消与提交事实、历史无隐式联动。
+finish_turn清空当前turn，已为空成功，返回Unit；start_turn保持生成新代号。不改StopAgent/Driver停止含义。
+```
+
+## 已实现的准备阶段收口
+
+每条受理命令只解析一次并登记一个Other准备活动；审计及SQLite操作均在阻塞工作线程，真实join后mark_completed。GET包括纯alias也走数据库入口，INJECT不materialize资源定义，仅持久化ResourceID。effect的所有独立参数合成一次Get(expressions)，在一个读事务中读取，随后按启动时owned ImportBindings快照按ID与kind解析当前资源定义。只含alias/manual的effect不额外发送Block RPC。
+
+MclAsyncPhase的Completed、PreparedEffect与PreparedImport避免将准备结果重新排回队首；准备结果携带pending.cancel，已取消的Prepared阶段不提交领域动作。已确认提交的CREATE/INJECT成功不因其后取消改成Cancelled。外部领域阶段继承同一取消token，避免准备与继续之间丢失来源取消。
+
+停止或来源取消的未开始命令被移出FIFO，一批worker追加取消审计，MclCancelledOutput真实join后派发回执并减少cancel_audits。即使作用域已关闭不能登记新Other活动，drain仍等待这些cleanup-owned审计批次。合法history_append一次消息批次不附加outer command audit；类型或容器校验失败只记录指令审计。任何推理、工具、GET或INJECT结果都不隐式保存message。

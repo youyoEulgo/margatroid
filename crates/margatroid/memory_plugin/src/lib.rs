@@ -1,7 +1,10 @@
+mod blocks;
+mod database;
 mod history;
 
 use core_plugin::{App, Plugin, Resource};
 
+pub use database::SqliteAgentDatabase;
 pub use history::SqliteHistoryStore;
 pub use margatroid_types::history_components::{
     AgentHistoryHandle, AgentHistoryStore, HistoryError, HistoryRecord,

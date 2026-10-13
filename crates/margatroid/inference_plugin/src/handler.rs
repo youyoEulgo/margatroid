@@ -1457,18 +1457,11 @@ mod tests {
         use margatroid_types::agent_components::{
             AgentInfo, AgentState, ImportedValue, WorldAgentExt,
         };
-        use margatroid_types::history_components::{
-            AgentHistoryHandle, AgentHistoryStore, HistoryError, HistoryRecord,
-        };
-        struct History;
-        impl AgentHistoryStore for History {
-            fn append_batch(&self, _: Vec<HistoryRecord>) -> Result<(), HistoryError> {
-                Ok(())
-            }
-            fn list(&self) -> Result<Vec<HistoryRecord>, HistoryError> {
-                Ok(vec![])
-            }
-        }
+        use margatroid_types::block_storage::AgentDatabaseHandle;
+        let root = tempfile::tempdir().unwrap();
+        let database = AgentDatabaseHandle::new(
+            memory_plugin::SqliteAgentDatabase::open(root.path().join("agent.sqlite")).unwrap(),
+        );
         let agent_id = ResourceID::parse("agent:test/main").unwrap();
         world.insert_component(
             agent,
@@ -1491,8 +1484,8 @@ mod tests {
                 },
                 lua: Default::default(),
                 state: AgentState::Running,
-                history: AgentHistoryHandle::new(History),
-                block: Default::default(),
+                history: database.history(),
+                database,
                 import_bindings: Default::default(),
                 mcl: Default::default(),
                 execution: AgentExecutionScope::new(),

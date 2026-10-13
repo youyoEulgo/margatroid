@@ -5,11 +5,19 @@
 
 新 MCL 的当前实现说明见 [DESIGN-NEXT.md](<DESIGN-NEXT.md>)。[DESIGN.md](<DESIGN.md>) 仅归档重写前 revision `7c9055c` 的旧实现；旧 REF/MERGE/BIND/LOAD/EXPOSE、visibility 与 history_record 路径已删除，不再受理。
 
+## 已实现的数据库 Block
+
+运行时所有 Block 统一使用 Agent SQLite，不保留内存后端。`CREATE BLOCK` 创建或打开持久数据，`CREATE TEMP BLOCK` 使用完整启动实例隔离的数据；均异步返回 `BlockOpened { block_id, created, temporary }`，相同 schema 再次打开不清空数据。GET 多来源使用同一读事务，INJECT 全部来源与目标使用同一写事务。TOOL/SANDBOX 在数据库中只保存完整 ResourceID，读取后按命令开始时取得的 owned 导入快照解析当前定义；已提交领域任务保持自身快照。MESSAGE 保留原始 typed 消息及 Inject 容器。`history_append` 只写历史，不修改 Block。旧 effect `finish` 已拒绝，只接受 `finish_turn`。
+
+本轮 Driver 示例调整限于仓库根 Driver；镜像目录中的 Driver 未修改。详细设计仍按 lib、system、handler、events、types、error 六板块组织。
+
 ## 安装与执行
 
 `MclPlugin::default()` 在 `RuntimePlugin::UPDATE` 注册唯一三阶段 System，需要安装 `AsyncRuntimePlugin`。插件使用共享 `Agent`，不依赖 Agent/Tool/Lua 插件的实现模块。Agent 启动合并共享 `MclEnvironmentFactory::build()`，factory 只提供 `mcl`；`wait`/`mcl_wait` 由 Lua 运行时提供，不进入 MCL 队列。
 
-每个目标 Agent 一个 FIFO。第一阶段受理请求，第二阶段收口异步结果，第三阶段推进队首，每 Agent 每帧同步预算 64 条。pending 未完成时只阻塞同一 Agent。停止取消未执行尾部并请求在途取消，仍等待实际执行方 oneshot 收口；队列和 pending 为空、所有回执已派发才通知 drained。
+每个目标 Agent 一个 FIFO。唯一 System 第一阶段受理请求，第二阶段收口异步结果，第三阶段推进队首；队首推进预算每 Agent 每帧 64 条。pending 未完成时只阻塞同一 Agent。共享 `MclAsyncPhase` 区分 Completed、PreparedEffect、PreparedImport；准备结果回主阶段直接继续动作，不重新解析队首、不重复审计。effect 的所有独立选择器参数统一一次数据库 Get 请求，在同一读事务完成后才提交领域操作；纯 alias/manual effect 不额外读取 Block，但 GET 始终使用异步数据库入口。
+
+停止或来源取消会取消未执行项并请求在途取消，仍等待实际 worker join 或执行方 oneshot。未开始项的取消审计使用异步批次，共享 `MclCancelledOutput` 收口；队列、pending 为空、`cancel_audits` 为零且全部回执已派发才通知 drained。准备活动在实际数据库操作前登记 Other，真实 join 后才标记完成；准备到领域阶段沿用同一取消 token。
 
 Driver 回执通过内部 oneshot **立即发送**，然后才发布 `MclCommandResult` 观察事件和移除队首。公开 Result 不是 Driver 回复通道。ready 仅允许当前 Driver 对本人调用，核对完整 Entity 和启动关联；客户端或其他 Driver 不能替另一个 Agent ready。
 
@@ -20,12 +28,13 @@ IMPORT MESSAGE prompt:local/soul AS soul
 IMPORT TOOL tool:local/demo AS demo
 IMPORT SANDBOX sandbox:local/write AS write
 CREATE BLOCK b (messages MESSAGE, visible TOOL, activated SANDBOX)
+CREATE TEMP BLOCK entry (pending MESSAGE)
 GET soul, b.messages[0,2], b.messages[]
 INJECT soul TO b.messages
 INJECT demo TO b.visible
 INJECT write TO b.activated
 INJECT ? TO b.messages[-1]
-INJECT[] TO b.messages
+INJECT [] TO b.messages
 EMIT EFFECT inference (b.messages) (b.visible)
 EMIT EFFECT tool_call ? (b.visible)
 EMIT EFFECT history_append ?
@@ -33,12 +42,12 @@ EMIT EFFECT sandbox_use (b.activated)
 EMIT EFFECT wake
 EMIT EFFECT ready
 EMIT EFFECT start_turn
-EMIT EFFECT finish
+EMIT EFFECT finish_turn
 ```
 
-字段只有三种 typed 数组：`MESSAGE`、`TOOL`、`SANDBOX`，拒绝旧 `RESOURCE` 和 `TOOL_CALL`。TOOL 是带本地 alias 的可调用资源快照，不是 Assistant 的 ToolCall 请求。GET 的 alias 与普通 Block 选择器按方括号外逗号切分，同类型拼接；空区间也参与类型检查。单索引和空字段读取始终返回数组。INJECT 在全部来源快照、目标范围与类型检查完成后，只做一次范围替换；错误不修改字段。
+字段只有三种 typed 数组：`MESSAGE`、`TOOL`、`SANDBOX`，拒绝旧 `RESOURCE` 和 `TOOL_CALL`。TOOL 是带本地 alias 的可调用资源快照，不是 Assistant 的 ToolCall 请求。GET 的 alias 与数据库 Block 选择器按方括号外逗号切分，同类型拼接；空区间也参与类型检查。单索引和空字段读取始终返回数组。INJECT 在全部来源快照、目标范围与类型检查完成后，只做一次范围替换；错误不修改字段。
 
-范围左闭右开，负端点使用 `len + 1`。`len=4` 时读取 `[-1]` 为 `[3,4]`，写入 `[-1]` 为 `[4,4]` 尾部插入；`INJECT[] TO b.f` 清空字段，而目标 `b.f[]` 只替换空区间。
+范围左闭右开，负端点使用 `len + 1`。`len=4` 时读取 `[-1]` 为 `[3,4]`，写入 `[-1]` 为 `[4,4]` 尾部插入；`INJECT [] TO b.f` 清空字段，而目标 `b.f[]` 只替换空区间。
 
 ## Driver 手动参数
 
@@ -59,9 +68,11 @@ IMPORT 资源必须精确属于 image_dependencies；无 builtin 隐含例外。
 
 tool_call 第一参数必须恰好一条 Assistant，直接从其 tool_calls 提取请求；不再使用 work.calls 或 TOOL_CALL 字段。调用 ID 与名称非空、批次 ID 唯一，可见 TOOL alias 冲突整批拒绝。空调用同步返回 typed MESSAGE 空数组且不提交任务；Hook 导入合法但执行语义未支持，明确返回失败。
 
-除合法 history_append 外，指令历史在执行前单独事务写入，失败不执行。message 历史完全由显式 history_append 控制；推理和工具只返回结果，不自动追加 assistant、工具成功或失败消息。显式追加失败返回 history_append 错误，不重新执行原推理或工具。此机制不是跨网络、Block 与历史的全局事务。System 消息保留上下文角色，但 history_append 会递归拒绝直接或嵌套 Inject 中的 System。输入 Assistant 和工具结果均不自动写 message 历史；需要保存时由 Driver 显式追加。
+数据库 Block、指令审计及显式消息历史均在阻塞工作线程执行，不在主 ECS 做 SQLite I/O。除合法 history_append 外，指令历史在执行前单独事务写入，失败不执行。message 历史完全由显式 history_append 控制；推理和工具只返回结果，不自动追加 assistant、工具成功或失败消息。显式追加失败返回 history_append 错误，不重新执行原推理或工具。此机制不是跨网络、Block 与历史的全局事务。System 消息保留上下文角色，但 history_append 会递归拒绝直接或嵌套 Inject 中的 System。输入 Assistant 和工具结果均不自动写 message 历史；需要保存时由 Driver 显式追加。
 
-资源值的宿主/网络输出采用安全投影，不发送完整执行材料或沙箱策略；内部 Block 与领域请求仍保留选定资源快照，重载不会改变旧 Block 中的版本。
+资源值的宿主/网络输出采用安全投影，不发送完整执行材料或沙箱策略；目标数据库 Block 只保留资源ID，下一次读取按当前导入值解析；领域执行请求仍保留提交时选定快照，不随重载变化。
+
+共享错误 `StorageCommitUnknown` 表示提交事实不确定，不伪装为 Cancelled 或确认回滚；worker 已退出且事务已结束时可以完成 Other。`StorageCleanupFailed` 表示清理尚未解决，保留并标记失败的 Other 活动，关闭作用域和新命令受理；作用域等待与队列 drain 等待返回清理失败，不能假称停止成功。取消审计批次的 CleanupFailed 也通过 drain 错误收口，回执仍携带 `history_error`，不是无限等待。
 
 长期后台 task 协议尚未支持。cleanupTasks 保留共享 World API，不是 MCL 指令。未来扩展必须另定合同，不能隐式恢复旧语法。
 
@@ -71,4 +82,4 @@ tool_call 第一参数必须恰好一条 Assistant，直接从其 tool_calls 提
 cargo test -p mcl_plugin
 ```
 
-测试覆盖显式 typed IMPORT、alias/selector 拼接及混型空数组、同 ID 重命名与旧 Block 快照、空 Assistant 调用无任务、导入 alias 冲突无 loader 请求、严格语法、typed 空数组、负索引、INJECT 不修改保证、FIFO 和预算、真实推理/工具/IMPORT oneshot、停止取消、历史失败以及 ready 身份和回执/drained 时序。
+当前 MCL 测试共 35 项通过（1 项单元、3 项解析、1 项宿主参数、26 项调度、4 项 typed 数组）。覆盖显式 typed IMPORT、alias/selector 拼接及混型空数组、同 ID 重命名与数据库 ID 读取当前定义、MESSAGE 原容器、创建/再次打开、TEMP bool、旧 finish 拒绝、typed 空数组、负索引及失败 INJECT 不修改保证；也覆盖 FIFO、真实推理/工具/IMPORT oneshot、ready 完整身份与回执/drained 时序、source/stop 取消、真实数据库 worker 阻塞期间保留 Other 活动、effect 全参数一次读取、审计不重复、无隐式 message 历史及未解决清理失败的 scope/drain 错误。

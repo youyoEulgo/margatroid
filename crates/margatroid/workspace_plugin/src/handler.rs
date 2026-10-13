@@ -14,9 +14,17 @@ use margatroid_types::workspace_execution::spawn_workspace_execution;
 use resource_id_plugin::{LibraryComponent, ResourceSet, WorldResourceExt};
 
 fn request_id() -> String {
+    static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     static NEXT: AtomicU64 = AtomicU64::new(1);
+    let session = SESSION.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must follow Unix epoch")
+            .as_nanos();
+        format!("{}:{nanos}", std::process::id())
+    });
     format!(
-        "workspace-operation-{}",
+        "workspace-operation-{session}:{}",
         NEXT.fetch_add(1, Ordering::Relaxed)
     )
 }

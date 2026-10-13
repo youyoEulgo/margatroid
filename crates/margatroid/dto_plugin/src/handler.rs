@@ -1,18 +1,24 @@
 use crate::{
     types::{
         BackendStateReportCache, PendingMclCommandResponse, PendingMclCommandResponses,
-        PendingWorkspaceResponse,
+        PendingSnapshot, PendingWorkspaceResponse,
     },
     WebSocketMessageSend,
 };
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
+use async_runtime_plugin::WorldAsyncExt;
 use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::World;
 use log_plugin::{TracingStream, TracingStreamError};
+use margatroid_protocol::AgentStateDto;
 use margatroid_protocol::{
     resolve_agent, resolve_workspace, AgentHistoryDto, BackendStateDto, ClientInfoDto,
     ClientMessage, IntoDomain, IntoDto, LogRecordDto, MclCommandResultDto, ProtocolError,
     ProtocolErrorDto, ProtocolErrorKind, ServerMessage, WorkspaceInfoDto,
+};
+use margatroid_types::{
+    agent_components::Agent, dto_events::DtoHistorySnapshotCompleted,
+    history_components::AgentHistoryHandle,
 };
 use margatroid_types::{
     client_components::{Client, WorldClientExt},
@@ -97,6 +103,10 @@ fn route_request(
             .workspaces
             .iter()
             .any(|p| p.client == client && p.id == request.id())
+        || pending
+            .snapshots
+            .iter()
+            .any(|p| p.client == client && p.id == request.id())
     {
         return Err(ProtocolError::new(
             ProtocolErrorKind::DuplicateRequest,
@@ -160,23 +170,22 @@ fn route_request(
                 });
             world.send_event(event);
         }
-        ClientMessage::StateQuery { id: _, .. } => {
-            send_to_connection(
-                world,
-                connection_id,
-                &ServerMessage::StateSync {
-                    state: ().into_dto(&*world)?,
-                },
-            );
+        ClientMessage::StateQuery { id, .. } => {
+            let state: BackendStateDto = ().into_dto(&*world)?;
+            let histories = prepare_histories(world, None)?;
+            queue_snapshot(world, connection_id, client, id, false, state, histories);
         }
         ClientMessage::HistoryQuery { id, message } => {
             let (entity, _) = resolve_agent(world, &message.workspace, message.agent.as_ref())?;
-            let history: AgentHistoryDto = entity.into_dto(&*world)?;
-            send_to_connection(
-                world,
-                connection_id,
-                &ServerMessage::HistoryResult { id, history },
-            );
+            let histories = prepare_histories(world, Some(entity))?;
+            let state = BackendStateDto {
+                agents: histories
+                    .iter()
+                    .map(|(metadata, _)| metadata.clone())
+                    .collect(),
+                ..BackendStateDto::default()
+            };
+            queue_snapshot(world, connection_id, client, id, true, state, histories);
         }
     }
     Ok(())
@@ -217,6 +226,9 @@ fn purge_disconnected_responses(world: &mut World) {
     pending
         .workspaces
         .retain(|pending| response_is_live(&live, pending.connection_id, pending.client));
+    pending
+        .snapshots
+        .retain(|pending| response_is_live(&live, pending.connection_id, pending.client));
 }
 pub(crate) fn handle_pending_mcl_responses(world: &mut World) {
     purge_disconnected_responses(world);
@@ -256,6 +268,12 @@ pub(crate) fn handle_collect_external_events(world: &mut World) {
     report_server_events(world);
     report_client_registrations(world);
     report_workspace_results(world);
+    if !world.event_reader::<MclCommandResult>().is_empty() {
+        world
+            .get_resource_mut::<BackendStateReportCache>()
+            .unwrap()
+            .dirty = true;
+    }
     report_backend_state(world, targets.backend_state());
 }
 fn report_client_registrations(world: &World) {
@@ -440,8 +458,213 @@ fn report_server_events(world: &World) {
     }
 }
 
+type HistoryRead = (AgentStateDto, AgentHistoryHandle);
+
+fn prepare_histories(
+    world: &World,
+    selected: Option<core_plugin::Entity>,
+) -> Result<Vec<HistoryRead>, ProtocolError> {
+    let mut entities = selected
+        .map(|entity| vec![entity])
+        .unwrap_or_else(|| world.query_with::<Agent>().result());
+    entities.sort_by_key(|entity| {
+        world
+            .get_component::<Agent>(*entity)
+            .unwrap()
+            .resourceid
+            .to_string()
+    });
+    entities
+        .into_iter()
+        .map(|entity| {
+            Ok((
+                entity.into_dto(world)?,
+                world
+                    .get_component::<Agent>(entity)
+                    .unwrap()
+                    .history
+                    .clone(),
+            ))
+        })
+        .collect()
+}
+
+fn spawn_snapshot(
+    world: &World,
+    id: String,
+    mut state: BackendStateDto,
+    histories: Vec<HistoryRead>,
+) {
+    let events = world.event_sender();
+    world.spawn_async_service(async move {
+        let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, String> {
+            state.histories = histories
+                .into_iter()
+                .map(|(metadata, handle)| {
+                    let records = handle.list().map_err(|error| error.to_string())?;
+                    AgentHistoryDto::from_domain((metadata, records), ())
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<_, _>>()?;
+            serde_json::to_value(state).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+        events.send_event(DtoHistorySnapshotCompleted { id, result });
+    });
+}
+
+fn queue_snapshot(
+    world: &mut World,
+    connection_id: WebSocketConnectionId,
+    client: core_plugin::Entity,
+    id: String,
+    history: bool,
+    state: BackendStateDto,
+    histories: Vec<HistoryRead>,
+) {
+    let operation_id = operation_id();
+    world
+        .get_resource_mut::<PendingMclCommandResponses>()
+        .unwrap()
+        .snapshots
+        .push(PendingSnapshot {
+            operation_id: operation_id.clone(),
+            id,
+            connection_id,
+            client,
+            history,
+        });
+    spawn_snapshot(world, operation_id, state, histories);
+}
+
 fn report_backend_state(world: &mut World, targets: &[WebSocketMessageTarget]) {
-    let state: BackendStateDto = match ().into_dto(&*world) {
+    let completed: Vec<_> = world
+        .event_reader::<DtoHistorySnapshotCompleted>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for completed in completed {
+        let backend = world
+            .get_resource::<BackendStateReportCache>()
+            .unwrap()
+            .pending
+            .as_ref()
+            == Some(&completed.id);
+        let result = completed.result.and_then(|value| {
+            serde_json::from_value::<BackendStateDto>(value).map_err(|error| error.to_string())
+        });
+        let live = result
+            .as_ref()
+            .map(|state| {
+                state.agents.iter().all(|metadata| {
+                    world
+                        .query_with::<Agent>()
+                        .result()
+                        .into_iter()
+                        .any(|entity| {
+                            world.get_component::<Agent>(entity).is_some_and(|agent| {
+                                agent.resourceid.to_string() == metadata.agent.0
+                                    && format!("{entity:?}") == metadata.agent_instance
+                            })
+                        })
+                })
+            })
+            .unwrap_or(true);
+        if backend {
+            world
+                .get_resource_mut::<BackendStateReportCache>()
+                .unwrap()
+                .pending = None;
+            if !live {
+                world
+                    .get_resource_mut::<BackendStateReportCache>()
+                    .unwrap()
+                    .dirty = true;
+                continue;
+            }
+            publish_backend_state(world, targets, result);
+        } else {
+            let pending = world
+                .get_resource_mut::<PendingMclCommandResponses>()
+                .unwrap();
+            let Some(index) = pending
+                .snapshots
+                .iter()
+                .position(|pending| pending.operation_id == completed.id)
+            else {
+                continue;
+            };
+            let pending = pending.snapshots.remove(index);
+            if !live {
+                continue;
+            }
+            if !world
+                .client_by_connection(pending.connection_id)
+                .is_some_and(|(entity, _)| entity == pending.client)
+            {
+                continue;
+            }
+            let message = match result {
+                Ok(mut state) if pending.history => match state.histories.pop() {
+                    Some(history) => ServerMessage::HistoryResult {
+                        id: pending.id,
+                        history,
+                    },
+                    None => continue,
+                },
+                Ok(state) => ServerMessage::StateSync { state },
+                Err(error) => ServerMessage::RequestFailed {
+                    id: pending.id,
+                    error: ProtocolErrorDto::new("HistoryReadFailed", error),
+                },
+            };
+            send_to_connection(world, pending.connection_id, &message);
+        }
+    }
+    if world
+        .get_resource::<BackendStateReportCache>()
+        .unwrap()
+        .pending
+        .is_some()
+    {
+        return;
+    }
+    let prepared = BackendStateDto::from_domain((), &*world)
+        .and_then(|state| Ok((state, prepare_histories(world, None)?)));
+    match prepared {
+        Ok((state, histories)) => {
+            let cache = world.get_resource_mut::<BackendStateReportCache>().unwrap();
+            if cache.prepared_state.as_ref() == Some(&state) && !cache.dirty {
+                if let Some(cached) = cache.state.clone() {
+                    publish_backend_state(world, targets, Ok(cached));
+                }
+                return;
+            }
+            cache.prepared_state = Some(state.clone());
+            cache.dirty = false;
+            if histories.is_empty() {
+                publish_backend_state(world, targets, Ok(state));
+                return;
+            }
+            let id = operation_id();
+            world
+                .get_resource_mut::<BackendStateReportCache>()
+                .unwrap()
+                .pending = Some(id.clone());
+            spawn_snapshot(world, id, state, histories);
+        }
+        Err(error) => publish_backend_state(world, targets, Err(error.to_string())),
+    }
+}
+
+fn publish_backend_state(
+    world: &mut World,
+    targets: &[WebSocketMessageTarget],
+    result: Result<BackendStateDto, String>,
+) {
+    let state = match result {
         Ok(state) => state,
         Err(error) => {
             let error = error.to_string();

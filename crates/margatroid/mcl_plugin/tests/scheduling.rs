@@ -73,7 +73,9 @@ fn spawn(app: &mut App, name: &str) -> (Entity, Store) {
                 lua: Default::default(),
                 state: AgentState::Running,
                 history: AgentHistoryHandle::new(store.clone()),
-                block: Default::default(),
+                database: margatroid_types::block_storage::AgentDatabaseHandle::new(
+                    memory_plugin::SqliteAgentDatabase::open(":memory:").unwrap(),
+                ),
                 import_bindings: Default::default(),
                 mcl: Default::default(),
                 execution: Default::default(),
@@ -81,8 +83,121 @@ fn spawn(app: &mut App, name: &str) -> (Entity, Store) {
             },
         )
         .unwrap();
+    app.world_mut()
+        .get_component_mut::<Agent>(entity)
+        .unwrap()
+        .lua
+        .instance = Some(DriverLuaVmInstance {
+        owner: entity,
+        start_request_id: format!("start:{name}"),
+    });
     (entity, store)
 }
+fn pump(app: &mut App, entity: Entity) {
+    process_mcl_queue(app.world_mut(), entity);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        app.world_mut().advance_event_frame();
+        let outputs = app
+            .world()
+            .event_reader::<MclAsyncOutput>()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for output in outputs {
+            complete_mcl_async(app.world_mut(), output);
+        }
+        let cancelled = app
+            .world()
+            .event_reader::<MclCancelledOutput>()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for output in cancelled {
+            for result in output.results {
+                app.world().send_event(result);
+            }
+            let agent = app
+                .world_mut()
+                .get_component_mut::<Agent>(output.entity)
+                .unwrap();
+            agent.mcl.cancel_audits -= 1;
+            if agent.mcl.commands.is_empty() && agent.mcl.pending.is_none() {
+                agent.mcl.drained.mark_drained();
+            }
+        }
+        process_mcl_queue(app.world_mut(), entity);
+        let agent = app.world().get_component::<Agent>(entity).unwrap();
+        if agent.mcl.drained.is_drained() {
+            app.world_mut().advance_event_frame();
+            break;
+        }
+        if agent
+            .mcl
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !pending.operation_id.starts_with("database:"))
+            && agent.mcl.cancel_audits == 0
+        {
+            app.world_mut().advance_event_frame();
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "preparation did not join"
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn tick_until_result(app: &mut App, id: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        app.tick();
+        if app
+            .world()
+            .event_reader::<MclCommandResult>()
+            .into_iter()
+            .any(|reply| reply.id == id)
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "missing result {id}");
+        std::thread::yield_now();
+    }
+}
+
+fn read_stored(
+    app: &App,
+    entity: Entity,
+    path: margatroid_types::block_types::BlockPath,
+) -> margatroid_types::block_storage::StoredBlockInner {
+    use margatroid_types::block_storage::*;
+    let agent = app.world().get_component::<Agent>(entity).unwrap();
+    let storage = agent.database.block_storage();
+    let request = BlockStorageRequest {
+        context: BlockStorageContext {
+            agent: agent.resourceid.clone(),
+            instance: agent.lua.instance.clone().unwrap(),
+        },
+        operation: BlockStorageOperation::Get {
+            expressions: vec![BlockExpression::Sources(vec![BlockSource::Selector(
+                BlockSelector {
+                    path,
+                    range: BlockRange::All,
+                },
+            )])],
+        },
+        cancel: Default::default(),
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let StoredBlockResult::Arrays(mut values) = runtime.block_on(storage.execute(request)).unwrap()
+    else {
+        panic!()
+    };
+    values.remove(0)
+}
+
 fn request(id: &str, target: &str, text: &str, args: Vec<serde_json::Value>) -> MclCommand {
     MclCommand {
         id: id.into(),
@@ -270,7 +385,7 @@ fn fifo_sync_and_history_first_failure() {
         app.world_mut(),
         request("3", "a", "EMIT EFFECT start_turn", vec![]),
     );
-    process_mcl_queue(app.world_mut(), entity);
+    pump(&mut app, entity);
     let agent = app.world().get_component::<Agent>(entity).unwrap();
     assert!(agent.turn.is_some());
     assert!(agent.mcl.commands.is_empty());
@@ -279,9 +394,9 @@ fn fifo_sync_and_history_first_failure() {
     *store.fail.lock().unwrap() = true;
     enqueue_mcl_command(
         app.world_mut(),
-        request("4", "a", "EMIT EFFECT finish", vec![]),
+        request("4", "a", "EMIT EFFECT finish_turn", vec![]),
     );
-    process_mcl_queue(app.world_mut(), entity);
+    pump(&mut app, entity);
     assert!(app
         .world()
         .get_component::<Agent>(entity)
@@ -298,7 +413,7 @@ fn duplicate_and_bounded_budget_and_independent_agents() {
     for i in 0..65 {
         enqueue_mcl_command(
             app.world_mut(),
-            request(&i.to_string(), "a", "EMIT EFFECT finish", vec![]),
+            request(&i.to_string(), "a", "EMIT EFFECT finish_turn", vec![]),
         );
     }
     enqueue_mcl_command(
@@ -309,8 +424,8 @@ fn duplicate_and_bounded_budget_and_independent_agents() {
         app.world_mut(),
         request("b", "b", "EMIT EFFECT start_turn", vec![]),
     );
-    process_mcl_queue(app.world_mut(), a);
-    process_mcl_queue(app.world_mut(), b);
+    pump(&mut app, a);
+    pump(&mut app, b);
     assert_eq!(
         app.world()
             .get_component::<Agent>(a)
@@ -318,7 +433,7 @@ fn duplicate_and_bounded_budget_and_independent_agents() {
             .mcl
             .commands
             .len(),
-        1
+        0
     );
     assert!(app
         .world()
@@ -326,7 +441,7 @@ fn duplicate_and_bounded_budget_and_independent_agents() {
         .unwrap()
         .turn
         .is_some());
-    process_mcl_queue(app.world_mut(), a);
+    pump(&mut app, a);
     assert!(app
         .world()
         .get_component::<Agent>(a)
@@ -349,7 +464,7 @@ fn pending_blocks_tail_stop_keeps_head_and_completion_is_correlated() {
     enqueue_mcl_command(app.world_mut(), head.clone());
     enqueue_mcl_command(
         app.world_mut(),
-        request("tail", "a", "EMIT EFFECT finish", vec![]),
+        request("tail", "a", "EMIT EFFECT finish_turn", vec![]),
     );
     let pending = MclPending {
         command_id: "head".into(),
@@ -366,14 +481,14 @@ fn pending_blocks_tail_stop_keeps_head_and_completion_is_correlated() {
             .set_pending_cancel(Some(pending.cancel.clone()));
         agent.turn = Some("original".into());
     }
-    process_mcl_queue(app.world_mut(), a);
+    pump(&mut app, a);
     assert_eq!(store.list().unwrap().len(), 0);
     app.world()
         .get_component::<Agent>(a)
         .unwrap()
         .execution
         .request_close();
-    process_mcl_queue(app.world_mut(), a);
+    pump(&mut app, a);
     assert!(pending.cancel.is_cancelled());
     assert!(!app
         .world()
@@ -387,15 +502,17 @@ fn pending_blocks_tail_stop_keeps_head_and_completion_is_correlated() {
         request: head,
         pending: pending.clone(),
         turn: Some("original".into()),
-        result: Ok(MclValue::Inference(InferenceResponse {
-            message: AgentMessage::Assistant {
-                reasoning: None,
-                content: Some("done".into()),
-                tool_calls: vec![],
-                usage: None,
+        result: Ok(MclAsyncPhase::Completed(MclValue::Inference(
+            InferenceResponse {
+                message: AgentMessage::Assistant {
+                    reasoning: None,
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                },
+                stop_reason: StopReason::Completed,
             },
-            stop_reason: StopReason::Completed,
-        })),
+        ))),
     };
     let mut stale = output.clone();
     stale.pending.operation_id = "stale".into();
@@ -446,12 +563,12 @@ fn wake_latches_and_ready_delivers_once_and_append_has_no_command_record() {
     ] {
         enqueue_mcl_command(app.world_mut(), request(id, "a", text, args));
     }
-    process_mcl_queue(app.world_mut(), a);
+    pump(&mut app, a);
     let mut first = driver_call(&app, a, "a", "EMIT EFFECT ready");
     let mut second = driver_call(&app, a, "a", "EMIT EFFECT ready");
     assert!(poll_host(&mut first).is_pending());
     assert!(poll_host(&mut second).is_pending());
-    for _ in 0..3 {
+    for _ in 0..10000 {
         app.tick();
     }
     assert!(poll_host(&mut first).is_ready());
@@ -485,9 +602,9 @@ fn real_inference_reply_unblocks_fifo_and_keeps_submission_turn() {
         vec![json!([]), json!([])],
     ));
     app.world()
-        .send_event(request("tail", "a", "EMIT EFFECT finish", vec![]));
+        .send_event(request("tail", "a", "EMIT EFFECT finish_turn", vec![]));
     let mut inference = None;
-    for _ in 0..4 {
+    for _ in 0..10000 {
         app.tick();
         if let Some(event) = app
             .world()
@@ -524,6 +641,7 @@ fn real_inference_reply_unblocks_fifo_and_keeps_submission_turn() {
             stop_reason: StopReason::Completed,
         }))
         .unwrap();
+    let mut replies = Vec::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while !app
         .world()
@@ -535,6 +653,12 @@ fn real_inference_reply_unblocks_fifo_and_keeps_submission_turn() {
         && std::time::Instant::now() < deadline
     {
         app.tick();
+        replies.extend(
+            app.world()
+                .event_reader::<MclCommandResult>()
+                .into_iter()
+                .cloned(),
+        );
         std::thread::yield_now();
     }
     assert!(app
@@ -554,13 +678,6 @@ fn real_inference_reply_unblocks_fifo_and_keeps_submission_turn() {
     assert_eq!(records.len(), 2);
     assert!(records.iter().all(|record| record.kind == "mcl"));
     assert_eq!(records[0].turn.as_deref(), Some("submitted"));
-    app.tick();
-    let replies = app
-        .world()
-        .event_reader::<MclCommandResult>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
     let reply = replies.iter().find(|reply| reply.id == "infer").unwrap();
     assert!(reply.history_error.is_none());
     let Ok(MclValue::Inference(response)) = &reply.result else {
@@ -577,7 +694,7 @@ fn real_inference_reply_unblocks_fifo_and_keeps_submission_turn() {
             vec![json!([message])],
         ),
     );
-    process_mcl_queue(app.world_mut(), a);
+    pump(&mut app, a);
     let records = store.list().unwrap();
     assert_eq!(records.len(), 3);
     assert_eq!(records[2].kind, "message");
@@ -605,7 +722,7 @@ fn unknown_tools_finish_synchronously_without_pending() {
         app.world_mut(),
         request("tail", "a", "EMIT EFFECT start_turn", vec![]),
     );
-    process_mcl_queue(app.world_mut(), a);
+    pump(&mut app, a);
     let agent = app.world().get_component::<Agent>(a).unwrap();
     assert!(agent.mcl.pending.is_none());
     assert!(agent.turn.is_some());
@@ -654,7 +771,7 @@ fn import_requires_exact_dependency_and_visible_alias_conflicts_prevent_submissi
             ],
         ),
     );
-    process_mcl_queue(app.world_mut(), a);
+    pump(&mut app, a);
     assert!(app
         .world()
         .get_component::<Agent>(a)
@@ -687,7 +804,7 @@ fn import_cancel_keeps_pending_until_real_loader_reply() {
     app.world()
         .send_event(request("tail", "a", "EMIT EFFECT wake", vec![]));
     let mut load = None;
-    for _ in 0..4 {
+    for _ in 0..10000 {
         app.tick();
         if let Some(event) = app
             .world()
@@ -726,7 +843,11 @@ fn import_cancel_keeps_pending_until_real_loader_reply() {
             .len(),
         1
     );
-    assert_eq!(store.list().unwrap().len(), 2);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while store.list().unwrap().len() != 2 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
     activity.mark_completed().unwrap();
     load.reply
         .lock()
@@ -794,7 +915,7 @@ fn driver_ready_is_owner_only_and_receipt_precedes_drained() {
     }
     let mut cross = driver_call(&app, a, "b", "EMIT EFFECT ready");
     assert!(poll_host(&mut cross).is_pending());
-    for _ in 0..3 {
+    for _ in 0..10000 {
         app.tick();
     }
     assert!(matches!(
@@ -806,12 +927,12 @@ fn driver_ready_is_owner_only_and_receipt_precedes_drained() {
         app.world_mut(),
         request("client-ready", "b", "EMIT EFFECT ready", vec![]),
     );
-    process_mcl_queue(app.world_mut(), b);
+    pump(&mut app, b);
     assert!(ready_rx.try_recv().is_err());
     let mut own = driver_call(&app, b, "b", "EMIT EFFECT ready");
     assert!(poll_host(&mut own).is_pending());
     let mut observed = false;
-    for _ in 0..3 {
+    for _ in 0..10000 {
         app.tick();
         if ready_rx.try_recv().is_ok() {
             observed = true;
@@ -837,7 +958,7 @@ fn driver_ready_is_owner_only_and_receipt_precedes_drained() {
         .ready = None;
     let mut repeated = driver_call(&app, b, "b", "EMIT EFFECT ready");
     assert!(poll_host(&mut repeated).is_pending());
-    for _ in 0..3 {
+    for _ in 0..10000 {
         app.tick();
     }
     assert!(
@@ -854,7 +975,7 @@ fn driver_ready_is_owner_only_and_receipt_precedes_drained() {
         .as_mut()
         .unwrap()
         .start_request_id = "new-start".into();
-    for _ in 0..3 {
+    for _ in 0..10000 {
         app.tick();
     }
     assert!(
@@ -892,15 +1013,17 @@ fn message_store_failure_does_not_affect_inference_result_or_trigger_implicit_wr
             request: req.clone(),
             pending,
             turn: None,
-            result: Ok(MclValue::Inference(InferenceResponse {
-                message: AgentMessage::Assistant {
-                    reasoning: None,
-                    content: Some("real".into()),
-                    tool_calls: vec![],
-                    usage: None,
+            result: Ok(MclAsyncPhase::Completed(MclValue::Inference(
+                InferenceResponse {
+                    message: AgentMessage::Assistant {
+                        reasoning: None,
+                        content: Some("real".into()),
+                        tool_calls: vec![],
+                        usage: None,
+                    },
+                    stop_reason: StopReason::Length,
                 },
-                stop_reason: StopReason::Length,
-            })),
+            ))),
         },
     );
     app.tick();
@@ -944,7 +1067,7 @@ fn real_tool_batch_returns_ordered_failures_and_only_caller_selected_messages_ar
     bind_tool(&mut app, a, callable("tool:test/one", "run"));
     app.world().send_event(request("batch","a","EMIT EFFECT tool_call ? ?",vec![json!([{"type":"assistant","tool_calls":[{"id":"first","tool_name":"run","arguments":"{}"},{"id":"second","tool_name":"run","arguments":"{}"},{"id":"third","tool_name":"missing","arguments":"{}"}]}]),json!(["run"])]));
     let mut calls = vec![];
-    for _ in 0..4 {
+    for _ in 0..10000 {
         app.tick();
         calls = app
             .world()
@@ -1043,7 +1166,7 @@ fn real_tool_batch_returns_ordered_failures_and_only_caller_selected_messages_ar
             vec![json!(selected)],
         ),
     );
-    process_mcl_queue(app.world_mut(), a);
+    pump(&mut app, a);
     let records = store.list().unwrap();
     assert_eq!(records.len(), 3);
     assert_eq!(records[1].payload, payloads[0]);
@@ -1101,7 +1224,7 @@ fn sandbox_switch_waits_for_activity_and_cardinality_error_is_non_mutating() {
             vec![json!(["one"])],
         ),
     );
-    process_mcl_queue(app.world_mut(), a);
+    pump(&mut app, a);
     assert!(app
         .world()
         .get_component::<Agent>(a)
@@ -1113,7 +1236,7 @@ fn sandbox_switch_waits_for_activity_and_cardinality_error_is_non_mutating() {
         app.world_mut(),
         request("ok", "a", "EMIT EFFECT sandbox_use ?", vec![json!(["one"])]),
     );
-    process_mcl_queue(app.world_mut(), a);
+    pump(&mut app, a);
     assert_eq!(
         app.world().get_component::<Agent>(a).unwrap().sandbox,
         Some(value.clone())
@@ -1127,7 +1250,7 @@ fn sandbox_switch_waits_for_activity_and_cardinality_error_is_non_mutating() {
             vec![json!(["one", "one"])],
         ),
     );
-    process_mcl_queue(app.world_mut(), a);
+    pump(&mut app, a);
     assert_eq!(
         app.world().get_component::<Agent>(a).unwrap().sandbox,
         Some(value)
@@ -1148,7 +1271,7 @@ fn closed_queue_cancels_even_when_history_fails() {
         .unwrap()
         .execution
         .request_close();
-    process_mcl_queue(app.world_mut(), a);
+    pump(&mut app, a);
     assert!(app
         .world()
         .get_component::<Agent>(a)
@@ -1213,7 +1336,7 @@ fn world_alias_get_inject_reload_preserves_old_block_snapshot() {
     ] {
         enqueue_mcl_command(app.world_mut(), request(id, "a", text, vec![]));
     }
-    process_mcl_queue(app.world_mut(), entity);
+    pump(&mut app, entity);
     let path = BlockPath {
         block_id: "msg".into(),
         inner_id: "ctx".into(),
@@ -1222,13 +1345,8 @@ fn world_alias_get_inject_reload_preserves_old_block_snapshot() {
         content: "old".into(),
     }]);
     assert_eq!(
-        app.world()
-            .get_component::<Agent>(entity)
-            .unwrap()
-            .block
-            .get(&path)
-            .unwrap(),
-        &old
+        read_stored(&app, entity, path.clone()),
+        margatroid_types::block_storage::StoredBlockInner::from(old.clone())
     );
     app.world_mut()
         .agent_bind_import(
@@ -1250,13 +1368,8 @@ fn world_alias_get_inject_reload_preserves_old_block_snapshot() {
         }])
     );
     assert_eq!(
-        app.world()
-            .get_component::<Agent>(entity)
-            .unwrap()
-            .block
-            .get(&path)
-            .unwrap(),
-        &old
+        read_stored(&app, entity, path.clone()),
+        margatroid_types::block_storage::StoredBlockInner::from(old.clone())
     );
 }
 
@@ -1271,8 +1384,7 @@ fn empty_assistant_calls_return_typed_message_and_submit_nothing() {
         "EMIT EFFECT tool_call ? ?",
         vec![json!([{"type":"assistant","tool_calls":[]}]), json!([])],
     ));
-    app.tick();
-    app.tick();
+    tick_until_result(&mut app, "empty");
     assert!(app
         .world()
         .event_reader::<ToolExecuteRequest>()
@@ -1318,8 +1430,7 @@ fn all_rejected_tools_return_failures_without_implicit_messages_and_append_once(
         "EMIT EFFECT tool_call ? ?",
         vec![json!([assistant.clone()]), json!([])],
     ));
-    app.tick();
-    app.tick();
+    tick_until_result(&mut app, "rejected");
     assert!(app.world().event_reader::<ToolExecuteRequest>().is_empty());
     let replies = app
         .world()
@@ -1354,7 +1465,7 @@ fn all_rejected_tools_return_failures_without_implicit_messages_and_append_once(
             vec![json!(selected)],
         ),
     );
-    process_mcl_queue(app.world_mut(), entity);
+    pump(&mut app, entity);
     let records = store.list().unwrap();
     assert_eq!(records.len(), 3);
     assert_eq!(records[0].kind, "mcl");
@@ -1393,15 +1504,15 @@ fn duplicate_tool_completion_never_writes_messages() {
         request: req,
         pending,
         turn: None,
-        result: Ok(MclValue::Array(BlockInner::Message(vec![
-            AgentMessage::ToolCall {
+        result: Ok(MclAsyncPhase::Completed(MclValue::Array(
+            BlockInner::Message(vec![AgentMessage::ToolCall {
                 resource_id: None,
                 tool_call_id: "failed".into(),
                 tool_name: "run".into(),
                 content: "failure".into(),
                 failed: true,
-            },
-        ]))),
+            }]),
+        ))),
     };
     complete_mcl_async(app.world_mut(), output.clone());
     complete_mcl_async(app.world_mut(), output);
@@ -1438,8 +1549,7 @@ fn import_alias_conflict_prechecks_before_loader_submission() {
         "IMPORT TOOL tool:test/two AS same",
         vec![],
     ));
-    app.tick();
-    app.tick();
+    tick_until_result(&mut app, "collision");
     assert!(app
         .world()
         .event_reader::<LoadToolResource>()
@@ -1488,23 +1598,22 @@ fn invalid_history_append_is_audited_without_message_records() {
     ] {
         let mut app = app();
         let (entity, store) = spawn(&mut app, "a");
-        app.world_mut()
-            .get_component_mut::<Agent>(entity)
-            .unwrap()
-            .block
-            .create(
-                "setting".into(),
-                vec![(
-                    "visible".into(),
-                    margatroid_types::block_types::InnerType::Tool,
-                )],
-            )
-            .unwrap();
+        enqueue_mcl_command(
+            app.world_mut(),
+            request(
+                "setting",
+                "a",
+                "CREATE BLOCK setting (visible TOOL)",
+                vec![],
+            ),
+        );
+        pump(&mut app, entity);
+        store.records.lock().unwrap().clear();
         enqueue_mcl_command(
             app.world_mut(),
             request("invalid", "a", text, arguments.clone()),
         );
-        process_mcl_queue(app.world_mut(), entity);
+        pump(&mut app, entity);
         let records = store.list().unwrap();
         assert_eq!(records.len(), 1, "{text}");
         assert_eq!(records[0].kind, "mcl");
@@ -1534,7 +1643,7 @@ fn valid_history_append_store_failure_does_not_add_command_audit() {
             vec![json!([{"type":"user","content":"message"}])],
         ),
     );
-    process_mcl_queue(app.world_mut(), entity);
+    pump(&mut app, entity);
     assert!(store.records.lock().unwrap().is_empty());
     assert!(app
         .world()
@@ -1543,4 +1652,366 @@ fn valid_history_append_store_failure_does_not_add_command_audit() {
         .mcl
         .drained
         .is_drained());
+}
+
+#[derive(Clone)]
+struct GatedDatabase {
+    database: memory_plugin::SqliteAgentDatabase,
+    gate: Arc<(Mutex<(bool, bool)>, std::sync::Condvar)>,
+    operations: Arc<Mutex<Vec<margatroid_types::block_storage::BlockStorageOperation>>>,
+}
+impl AgentHistoryStore for GatedDatabase {
+    fn append_batch(&self, records: Vec<HistoryRecord>) -> Result<(), HistoryError> {
+        self.database.append_batch(records)
+    }
+    fn list(&self) -> Result<Vec<HistoryRecord>, HistoryError> {
+        self.database.list()
+    }
+}
+impl margatroid_types::block_storage::AgentBlockStorage for GatedDatabase {
+    fn execute(
+        &self,
+        request: margatroid_types::block_storage::BlockStorageRequest,
+    ) -> Result<
+        margatroid_types::block_storage::StoredBlockResult,
+        margatroid_types::block_storage::BlockStorageError,
+    > {
+        self.operations
+            .lock()
+            .unwrap()
+            .push(request.operation.clone());
+        let (lock, signal) = &*self.gate;
+        let mut state = lock.lock().unwrap();
+        state.0 = true;
+        signal.notify_all();
+        while !state.1 {
+            state = signal.wait(state).unwrap();
+        }
+        drop(state);
+        margatroid_types::block_storage::AgentBlockStorage::execute(&self.database, request)
+    }
+}
+
+#[test]
+fn database_cancel_keeps_other_activity_and_fifo_until_worker_really_joins() {
+    use margatroid_types::block_storage::*;
+    let mut app = app();
+    let (entity, store) = spawn(&mut app, "a");
+    let backend = GatedDatabase {
+        database: memory_plugin::SqliteAgentDatabase::open(":memory:").unwrap(),
+        gate: Arc::new((Mutex::new((false, false)), std::sync::Condvar::new())),
+        operations: Default::default(),
+    };
+    app.world_mut()
+        .get_component_mut::<Agent>(entity)
+        .unwrap()
+        .database = AgentDatabaseHandle::new(backend.clone());
+    enqueue_mcl_command(
+        app.world_mut(),
+        request("blocked", "a", "CREATE TEMP BLOCK b (m MESSAGE)", vec![]),
+    );
+    enqueue_mcl_command(
+        app.world_mut(),
+        request("tail", "a", "EMIT EFFECT start_turn", vec![]),
+    );
+    process_mcl_queue(app.world_mut(), entity);
+    let (lock, signal) = &*backend.gate;
+    let state = lock.lock().unwrap();
+    let (state, timeout) = signal
+        .wait_timeout_while(state, std::time::Duration::from_secs(3), |state| !state.0)
+        .unwrap();
+    assert!(!timeout.timed_out());
+    drop(state);
+    let scope = app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .execution
+        .clone();
+    assert_eq!(scope.activity_count(), 1);
+    scope.request_close();
+    process_mcl_queue(app.world_mut(), entity);
+    assert_eq!(scope.activity_count(), 1);
+    let agent = app.world().get_component::<Agent>(entity).unwrap();
+    assert!(agent.mcl.pending.as_ref().unwrap().cancel.is_cancelled());
+    assert!(!agent.mcl.drained.is_drained());
+    assert!(agent.turn.is_none());
+    lock.lock().unwrap().1 = true;
+    signal.notify_all();
+    tick_until_result(&mut app, "blocked");
+    assert_eq!(scope.activity_count(), 0);
+    assert!(app
+        .world()
+        .event_reader::<MclCommandResult>()
+        .into_iter()
+        .any(|result| result.id == "blocked" && result.result == Err(MclError::Cancelled)));
+    pump(&mut app, entity);
+    assert!(app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .mcl
+        .drained
+        .is_drained());
+    assert_eq!(store.list().unwrap().len(), 2);
+}
+
+#[test]
+fn effect_selectors_use_one_database_request_and_current_import_ids() {
+    use margatroid_types::agent_components::{ImportedValue, WorldAgentExt};
+    use margatroid_types::block_storage::*;
+    use margatroid_types::inference_events::InferenceRequest;
+    let mut app = app();
+    let (entity, store) = spawn(&mut app, "a");
+    let backend = GatedDatabase {
+        database: memory_plugin::SqliteAgentDatabase::open(":memory:").unwrap(),
+        gate: Arc::new((Mutex::new((false, true)), std::sync::Condvar::new())),
+        operations: Default::default(),
+    };
+    let first = callable("tool:test/one", "old");
+    let agent_id = {
+        let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
+        agent.database = AgentDatabaseHandle::new(backend.clone());
+        agent.info.image_dependencies = Arc::from([first.resource_id.clone()]);
+        agent.resourceid.clone()
+    };
+    app.world_mut()
+        .agent_bind_import(&agent_id, "old".into(), ImportedValue::Tool(first.clone()))
+        .unwrap();
+    for (id, text, args) in [
+        ("create", "CREATE BLOCK b (m MESSAGE, t TOOL)", vec![]),
+        (
+            "message",
+            "INJECT ? TO b.m",
+            vec![json!([{"type":"inject","messages":[{"type":"user","content":"preserve"}]}])],
+        ),
+        ("tools", "INJECT old TO b.t", vec![]),
+    ] {
+        enqueue_mcl_command(app.world_mut(), request(id, "a", text, args));
+    }
+    pump(&mut app, entity);
+    let mut current = first.clone();
+    current.alias = "current".into();
+    app.world_mut()
+        .agent_bind_import(
+            &agent_id,
+            "current".into(),
+            ImportedValue::Tool(current.clone()),
+        )
+        .unwrap();
+    backend.operations.lock().unwrap().clear();
+    enqueue_mcl_command(
+        app.world_mut(),
+        request("infer", "a", "EMIT EFFECT inference (b.m) (b.t)", vec![]),
+    );
+    pump(&mut app, entity);
+    let requests = backend.operations.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let BlockStorageOperation::Get { expressions } = &requests[0] else {
+        panic!()
+    };
+    assert_eq!(expressions.len(), 2);
+    drop(requests);
+    let inference = app
+        .world()
+        .event_reader::<InferenceRequest>()
+        .into_iter()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(inference.tools, vec![current]);
+    assert!(
+        matches!(&inference.messages[..],[AgentMessage::Inject {messages}] if messages.len()==1)
+    );
+    assert_eq!(store.list().unwrap().len(), 4);
+    inference
+        .reply
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .send(Ok(InferenceResponse {
+            message: AgentMessage::Assistant {
+                reasoning: None,
+                content: None,
+                tool_calls: vec![],
+                usage: None,
+            },
+            stop_reason: StopReason::Completed,
+        }))
+        .unwrap();
+    tick_until_result(&mut app, "infer");
+    assert_eq!(store.list().unwrap().len(), 4);
+}
+
+#[test]
+fn create_returns_opened_and_failed_inject_preserves_stored_messages() {
+    use margatroid_types::block_storage::StoredBlockInner;
+    use margatroid_types::block_types::BlockPath;
+    let mut app = app();
+    let (entity, store) = spawn(&mut app, "a");
+    for (id, text, created) in [
+        ("first", "CREATE TEMP BLOCK b (m MESSAGE)", true),
+        ("reopen", "CREATE TEMP BLOCK b (m MESSAGE)", false),
+    ] {
+        app.world().send_event(request(id, "a", text, vec![]));
+        tick_until_result(&mut app, id);
+        assert!(app
+            .world()
+            .event_reader::<MclCommandResult>()
+            .into_iter()
+            .any(|reply| reply.id == id
+                && reply.result
+                    == Ok(MclValue::BlockOpened {
+                        block_id: "b".into(),
+                        created,
+                        temporary: true
+                    })));
+    }
+    enqueue_mcl_command(
+        app.world_mut(),
+        request(
+            "inject",
+            "a",
+            "INJECT ? TO b.m",
+            vec![json!([{"type":"inject","messages":[{"type":"user","content":"kept"}]}])],
+        ),
+    );
+    pump(&mut app, entity);
+    let path = BlockPath {
+        block_id: "b".into(),
+        inner_id: "m".into(),
+    };
+    let before = read_stored(&app, entity, path.clone());
+    assert!(
+        matches!(&before,StoredBlockInner::Message(messages) if matches!(&messages[..],[AgentMessage::Inject {..}]))
+    );
+    app.world().send_event(request(
+        "invalid",
+        "a",
+        "INJECT b.m[0], b.m[999] TO b.m",
+        vec![],
+    ));
+    tick_until_result(&mut app, "invalid");
+    assert_eq!(read_stored(&app, entity, path), before);
+    assert!(app
+        .world()
+        .event_reader::<MclCommandResult>()
+        .into_iter()
+        .any(|reply| reply.id == "invalid" && reply.result == Err(MclError::InvalidRange)));
+    assert_eq!(store.list().unwrap().len(), 4);
+    assert_eq!(*store.message_batches.lock().unwrap(), 0);
+}
+
+#[derive(Clone)]
+struct FailingDatabase {
+    history: bool,
+}
+impl AgentHistoryStore for FailingDatabase {
+    fn append_batch(&self, _: Vec<HistoryRecord>) -> Result<(), HistoryError> {
+        if self.history {
+            Err(HistoryError::CleanupFailed(
+                "unresolved audit rollback".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    fn list(&self) -> Result<Vec<HistoryRecord>, HistoryError> {
+        Ok(vec![])
+    }
+}
+impl margatroid_types::block_storage::AgentBlockStorage for FailingDatabase {
+    fn execute(
+        &self,
+        _: margatroid_types::block_storage::BlockStorageRequest,
+    ) -> Result<
+        margatroid_types::block_storage::StoredBlockResult,
+        margatroid_types::block_storage::BlockStorageError,
+    > {
+        Err(
+            margatroid_types::block_storage::BlockStorageError::CleanupFailed(
+                "unresolved block rollback".into(),
+            ),
+        )
+    }
+}
+
+#[test]
+fn unresolved_block_or_audit_cleanup_retains_the_execution_activity() {
+    use margatroid_types::block_storage::AgentDatabaseHandle;
+    use margatroid_types::execution_components::ExecutionError;
+    for history in [false, true] {
+        let mut app = app();
+        let (entity, _) = spawn(&mut app, "a");
+        let database = AgentDatabaseHandle::new(FailingDatabase { history });
+        {
+            let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
+            agent.history = database.history();
+            agent.database = database;
+        }
+        app.world()
+            .send_event(request("fail", "a", "CREATE BLOCK b (m MESSAGE)", vec![]));
+        tick_until_result(&mut app, "fail");
+        assert!(app
+            .world()
+            .event_reader::<MclCommandResult>()
+            .into_iter()
+            .any(|reply| reply.id == "fail"
+                && matches!(reply.result, Err(MclError::StorageCleanupFailed(_)))));
+        let agent = app.world().get_component::<Agent>(entity).unwrap();
+        assert_eq!(agent.execution.activity_count(), 1);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(matches!(
+            runtime.block_on(agent.execution.wait_all()),
+            Err(ExecutionError::CleanupFailed { .. })
+        ));
+        assert!(agent.mcl.pending.is_none());
+        assert!(!agent.mcl.drained.is_drained());
+        assert!(agent.execution.is_closed());
+        assert!(matches!(
+            runtime.block_on(agent.mcl.drained.wait_drained()),
+            Err(ExecutionError::CleanupFailed { .. })
+        ));
+    }
+}
+
+#[test]
+fn cancelled_audit_cleanup_failure_reports_receipt_but_fails_drain() {
+    use margatroid_types::block_storage::AgentDatabaseHandle;
+    use margatroid_types::execution_components::ExecutionError;
+    let mut app = app();
+    let (entity, _) = spawn(&mut app, "a");
+    let database = AgentDatabaseHandle::new(FailingDatabase { history: true });
+    {
+        let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
+        agent.history = database.history();
+        agent.database = database;
+    }
+    enqueue_mcl_command(
+        app.world_mut(),
+        request("cancelled", "a", "EMIT EFFECT start_turn", vec![]),
+    );
+    app.world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .execution
+        .request_close();
+    tick_until_result(&mut app, "cancelled");
+    assert!(app
+        .world()
+        .event_reader::<MclCommandResult>()
+        .into_iter()
+        .any(|reply| reply.id == "cancelled"
+            && reply.result == Err(MclError::Cancelled)
+            && matches!(reply.history_error, Some(HistoryError::CleanupFailed(_)))));
+    let agent = app.world().get_component::<Agent>(entity).unwrap();
+    assert_eq!(agent.mcl.cancel_audits, 0);
+    assert!(agent.mcl.commands.is_empty());
+    assert!(!agent.mcl.drained.is_drained());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    assert!(matches!(
+        runtime.block_on(agent.mcl.drained.wait_drained()),
+        Err(ExecutionError::CleanupFailed { .. })
+    ));
 }

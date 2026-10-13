@@ -891,14 +891,11 @@ pub struct AgentHistoryDto {
     pub agent: ResourceIdDto,
     pub messages: Vec<HistoryMessageDto>,
 }
-impl FromDomain<Entity, &World> for AgentHistoryDto {
-    fn from_domain(entity: Entity, world: &World) -> Result<Self, ProtocolError> {
-        let state = AgentStateDto::from_domain(entity, world)?;
-        let agent = world.get_component::<Agent>(entity).unwrap();
-        let records = agent
-            .history
-            .list()
-            .map_err(|e| ProtocolError::new(ProtocolErrorKind::HistoryReadFailed, e.to_string()))?;
+impl FromDomain<(AgentStateDto, Vec<HistoryRecord>)> for AgentHistoryDto {
+    fn from_domain(
+        (state, records): (AgentStateDto, Vec<HistoryRecord>),
+        (): (),
+    ) -> Result<Self, ProtocolError> {
         Ok(Self {
             workspace: state.workspace,
             agent: state.agent,
@@ -938,10 +935,7 @@ impl FromDomain<(), &World> for BackendStateDto {
                 .iter()
                 .map(|entity| (*entity).into_dto(world))
                 .collect::<Result<_, _>>()?,
-            histories: entities
-                .into_iter()
-                .map(|entity| entity.into_dto(world))
-                .collect::<Result<_, _>>()?,
+            histories: Vec::new(),
         })
     }
 }

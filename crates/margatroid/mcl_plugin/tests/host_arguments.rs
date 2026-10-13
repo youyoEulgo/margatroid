@@ -55,7 +55,9 @@ fn app() -> (App, Entity) {
                 lua: Default::default(),
                 state: AgentState::Running,
                 history: AgentHistoryHandle::new(Store::default()),
-                block: Default::default(),
+                database: margatroid_types::block_storage::AgentDatabaseHandle::new(
+                    memory_plugin::SqliteAgentDatabase::open(":memory:").unwrap(),
+                ),
                 import_bindings: Default::default(),
                 mcl: Default::default(),
                 execution: Default::default(),
@@ -107,7 +109,8 @@ fn call(
         Default::default(),
     );
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    for _ in 0..4 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
         if let std::task::Poll::Ready(result) = future.as_mut().poll(&mut cx) {
             return result;
         }

@@ -61,6 +61,11 @@ impl MclCommandResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MclValue {
     Unit,
+    BlockOpened {
+        block_id: String,
+        created: bool,
+        temporary: bool,
+    },
     Array(BlockInner),
     ResourceImport {
         kind: InnerType,
@@ -85,6 +90,8 @@ pub enum MclError {
     EffectInvalid,
     ToolCallInvalid,
     HistoryWriteFailed(String),
+    StorageCommitUnknown(String),
+    StorageCleanupFailed(String),
     ImportNotAllowed,
     ImportKindMismatch,
     AliasMissing,
@@ -112,6 +119,7 @@ pub struct AgentMclQueue {
     pub pending: Option<MclPending>,
     pub drained: AgentMclDrainHandle,
     pub accepting: bool,
+    pub cancel_audits: usize,
 }
 impl Default for AgentMclQueue {
     fn default() -> Self {
@@ -120,14 +128,36 @@ impl Default for AgentMclQueue {
             pending: None,
             drained: AgentMclDrainHandle::default(),
             accepting: true,
+            cancel_audits: 0,
         }
     }
 }
+#[derive(Clone, Debug)]
+pub enum MclAsyncPhase {
+    Completed(MclValue),
+    PreparedEffect {
+        name: String,
+        arrays: Vec<BlockInner>,
+    },
+    PreparedImport {
+        kind: InnerType,
+        resource_id: ResourceID,
+        alias: String,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct MclAsyncOutput {
     pub request: MclCommand,
     pub pending: MclPending,
     pub turn: Option<String>,
-    pub result: Result<MclValue, MclError>,
+    pub result: Result<MclAsyncPhase, MclError>,
 }
 impl Event for MclAsyncOutput {}
+
+#[derive(Clone, Debug)]
+pub struct MclCancelledOutput {
+    pub entity: Entity,
+    pub results: Vec<MclCommandResult>,
+}
+impl Event for MclCancelledOutput {}

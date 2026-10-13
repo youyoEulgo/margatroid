@@ -5,16 +5,14 @@ use core_plugin::{App, Entity};
 use margatroid_types::agent_components::{
     Agent, AgentInfo, AgentState, ImportedValue, WorldAgentExt,
 };
-use margatroid_types::block_types::AgentBlock;
+use margatroid_types::block_storage::AgentDatabaseHandle;
 use margatroid_types::execution_components::{AgentExecutionScope, ExecutionActivityKind};
-use margatroid_types::history_components::{
-    AgentHistoryHandle, AgentHistoryStore, HistoryError, HistoryRecord,
-};
 use margatroid_types::message_types::{AgentMessage, ToolCall};
 use margatroid_types::resource_components::{
     AgentImageModelConfig, CallableDefinitionSnapshot, CallableResource, HookResource,
     SandboxResource, SandboxValue, SkillResource, ToolResource,
 };
+use memory_plugin::SqliteAgentDatabase;
 use resource_id_plugin::{ResourceID, ResourceSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,20 +22,14 @@ use tool_plugin::{
     ToolPlugin,
 };
 
-struct History;
-impl AgentHistoryStore for History {
-    fn append_batch(&self, _: Vec<HistoryRecord>) -> Result<(), HistoryError> {
-        panic!("ToolPlugin must not record history")
-    }
-    fn list(&self) -> Result<Vec<HistoryRecord>, HistoryError> {
-        Ok(vec![])
-    }
-}
 fn id(kind: &str, name: &str) -> ResourceID {
     ResourceID::parse(&format!("{kind}:test/{name}:latest")).unwrap()
 }
 fn fixture(limits: ToolExecutionLimits) -> (App, Entity, tempfile::TempDir) {
     let root = tempfile::tempdir().unwrap();
+    let database = AgentDatabaseHandle::new(
+        SqliteAgentDatabase::open(root.path().join("agent.sqlite")).unwrap(),
+    );
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(resource_id_plugin::ResourcePlugin)
@@ -74,8 +66,8 @@ fn fixture(limits: ToolExecutionLimits) -> (App, Entity, tempfile::TempDir) {
             },
             lua: Default::default(),
             state: AgentState::Running,
-            history: AgentHistoryHandle::new(History),
-            block: AgentBlock::default(),
+            history: database.history(),
+            database,
             import_bindings: Default::default(),
             mcl: Default::default(),
             execution: AgentExecutionScope::new(),
@@ -252,6 +244,14 @@ async fn actual_runner_preserves_alias_context_and_raw_string() {
     let resource = add_tool(&mut app, entity, root.path(), "function execute(a,c) print('diagnostic'); return json.encode({value=a.value,turn=c.turn,call=c.call_id}) end", serde_json::json!({"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}));
     let (_, rx) = submit(&app, entity, resource, "{\"value\":\"ok\"}");
     let result = content(response(&mut app, rx).await.unwrap());
+    assert!(app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .history
+        .list()
+        .unwrap()
+        .is_empty());
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&result).unwrap(),
         serde_json::json!({"value":"ok","turn":"snapshot-turn","call":"call"})

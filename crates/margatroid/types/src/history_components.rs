@@ -16,6 +16,8 @@ pub enum HistoryError {
     WriteFailed(String),
     KeyConflict(String),
     InvalidRecord(String),
+    CleanupFailed(String),
+    CommitUnknown(String),
 }
 
 impl std::fmt::Display for HistoryError {

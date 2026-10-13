@@ -5,7 +5,7 @@ use std::time::Duration;
 use margatroid_types::history_components::{AgentHistoryStore, HistoryError, HistoryRecord};
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 
-const SCHEMA: &str = r#"
+pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS history_records (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     key TEXT NOT NULL UNIQUE CHECK(length(key) > 0),
@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS history_records (
 
 #[derive(Clone)]
 pub struct SqliteHistoryStore {
-    connection: Arc<Mutex<Connection>>,
+    pub(crate) connection: Arc<Mutex<Connection>>,
+    pub(crate) retired: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SqliteHistoryStore {
@@ -38,13 +39,21 @@ impl SqliteHistoryStore {
         connection.execute_batch(SCHEMA).map_err(write_failed)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
     fn lock_connection(&self) -> Result<MutexGuard<'_, Connection>, HistoryError> {
-        self.connection
+        let connection = self
+            .connection
             .lock()
-            .map_err(|_| HistoryError::WriteFailed("history connection mutex poisoned".into()))
+            .map_err(|_| HistoryError::WriteFailed("history connection mutex poisoned".into()))?;
+        if self.retired.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(HistoryError::CleanupFailed(
+                "database connection retired after uncertain transaction".into(),
+            ));
+        }
+        Ok(connection)
     }
 }
 
@@ -64,8 +73,9 @@ impl AgentHistoryStore for SqliteHistoryStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(write_failed)?;
-        for record in records {
-            let existing = transaction
+        let outcome = (|| {
+            for record in records {
+                let existing = transaction
                 .query_row(
                     "SELECT key, source, turn, kind, content, payload FROM history_records WHERE key = ?1",
                     params![record.key],
@@ -75,21 +85,63 @@ impl AgentHistoryStore for SqliteHistoryStore {
                 .map_err(write_failed)?
                 .map(decode_record)
                 .transpose()?;
-            if let Some(existing) = existing {
-                if existing != record {
-                    return Err(HistoryError::KeyConflict(record.key));
+                if let Some(existing) = existing {
+                    if existing != record {
+                        return Err(HistoryError::KeyConflict(record.key));
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let payload = serde_json::to_string(&record.payload).map_err(write_failed)?;
-            transaction
+                let payload = serde_json::to_string(&record.payload).map_err(write_failed)?;
+                transaction
                 .execute(
                     "INSERT INTO history_records (key, source, turn, kind, content, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![record.key, record.source, record.turn, record.kind, record.content, payload],
                 )
                 .map_err(write_failed)?;
+            }
+            transaction
+                .execute_batch("COMMIT")
+                .map_err(|error| match &error {
+                    rusqlite::Error::SqliteFailure(code, _)
+                        if matches!(
+                            code.code,
+                            rusqlite::ErrorCode::SystemIoFailure
+                                | rusqlite::ErrorCode::DiskFull
+                                | rusqlite::ErrorCode::CannotOpen
+                        ) =>
+                    {
+                        HistoryError::CommitUnknown(error.to_string())
+                    }
+                    _ => write_failed(error),
+                })
+        })();
+        if let Err(error) = outcome {
+            if !transaction.is_autocommit() {
+                if let Err(rollback) = transaction.execute_batch("ROLLBACK") {
+                    self.retired
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return Err(HistoryError::CleanupFailed(format!(
+                        "{error}; rollback failed: {rollback}"
+                    )));
+                }
+            }
+            if !transaction.is_autocommit() {
+                self.retired
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(HistoryError::CleanupFailed(format!(
+                    "{error}; transaction remains open"
+                )));
+            }
+            return Err(error);
         }
-        transaction.commit().map_err(write_failed)
+        if !transaction.is_autocommit() {
+            self.retired
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(HistoryError::CleanupFailed(
+                "commit did not close transaction".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn list(&self) -> Result<Vec<HistoryRecord>, HistoryError> {

@@ -5,6 +5,10 @@ use async_runtime_plugin::AsyncRuntimePlugin;
 use closure_plugin::{AppClosureExt, ClosurePlugin};
 use core_plugin::{App, Entity, World};
 use lua_runtime_plugin::LuaRuntimePlugin;
+use margatroid_types::block_storage::{
+    BlockExpression, BlockRange, BlockSelector, BlockSource, BlockStorageContext,
+    BlockStorageOperation, BlockStorageRequest, StoredBlockInner, StoredBlockResult,
+};
 use margatroid_types::block_types::{BlockInner, BlockPath};
 use margatroid_types::mcl_events::{MclCommand, MclCommandResult, MclInstruction, MclValue};
 use margatroid_types::workspace_components::{
@@ -27,7 +31,8 @@ local function command(text, arguments)
     if arguments then return mcl(agent_info.resource_id, text, arguments) end
     return mcl(agent_info.resource_id, text)
 end
-command('CREATE BLOCK entry (pending MESSAGE, processed MESSAGE)')
+command('CREATE TEMP BLOCK entry (pending MESSAGE)')
+command('CREATE BLOCK session (processed MESSAGE)')
 command('CREATE BLOCK resources (tools TOOL)')
 command('EMIT EFFECT ready')
 while true do
@@ -35,8 +40,9 @@ while true do
     local messages = response.Array.Message
     if #messages > 0 then
         command('EMIT EFFECT start_turn')
-        command('INJECT entry.pending TO entry.processed')
-        command('INJECT ? TO entry.pending', {{}})
+        command('INJECT entry.pending TO session.processed[-1]')
+        command('INJECT [] TO entry.pending')
+        command('EMIT EFFECT finish_turn')
     else
         wait()
     end
@@ -94,6 +100,37 @@ fn definition(root: &Path, images: &[&str]) -> WorkspaceDefinition {
             })
             .collect(),
     }
+}
+fn stored(agent: &Agent, block: &str, field: &str) -> StoredBlockInner {
+    let storage = agent.database.block_storage();
+    let request = BlockStorageRequest {
+        context: BlockStorageContext {
+            agent: agent.resourceid.clone(),
+            instance: agent.lua.instance.as_ref().unwrap().clone(),
+        },
+        operation: BlockStorageOperation::Get {
+            expressions: vec![BlockExpression::Sources(vec![BlockSource::Selector(
+                BlockSelector {
+                    path: BlockPath {
+                        block_id: block.into(),
+                        inner_id: field.into(),
+                    },
+                    range: BlockRange::All,
+                },
+            )])],
+        },
+        cancel: agent.execution.child_cancel(),
+    };
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(storage.execute(request))
+        .unwrap();
+    let StoredBlockResult::Arrays(mut arrays) = result else {
+        panic!("expected arrays")
+    };
+    arrays.remove(0)
 }
 fn diagnostics(world: &World) -> String {
     let agents = world
@@ -263,6 +300,34 @@ fn two_agents_in_one_workspace_drive_arrays_wake_and_join_cleanly() {
             Err(margatroid_types::mcl_events::MclError::InvalidRequest)
         );
     }
+    for agent_id in members.keys() {
+        assert_eq!(
+            command(
+                &mut app,
+                agent_id,
+                &format!("reopen-{agent_id}"),
+                "CREATE BLOCK session (processed MESSAGE)",
+                vec![]
+            )
+            .result
+            .unwrap(),
+            MclValue::BlockOpened {
+                block_id: "session".into(),
+                created: false,
+                temporary: false
+            }
+        );
+        let agent = app
+            .world()
+            .get_component::<Agent>(members[agent_id])
+            .unwrap();
+        assert!(agent
+            .history
+            .list()
+            .unwrap()
+            .iter()
+            .all(|record| record.kind != "message"));
+    }
     let first_id = id("agent:local/agent-0");
     let first = members[&first_id];
     let second = members[&id("agent:local/agent-1")];
@@ -298,21 +363,9 @@ fn two_agents_in_one_workspace_drive_arrays_wake_and_join_cleanly() {
     .unwrap();
     tick_until(&mut app, "driver processing after wake", |world| {
         let agent = world.get_component::<Agent>(first)?;
-        let processed = agent
-            .block
-            .get(&BlockPath {
-                block_id: "entry".into(),
-                inner_id: "processed".into(),
-            })
-            .ok()?;
-        let pending = agent
-            .block
-            .get(&BlockPath {
-                block_id: "entry".into(),
-                inner_id: "pending".into(),
-            })
-            .ok()?;
-        (processed.len() == 1 && pending.is_empty() && agent.turn.is_some()).then_some(())
+        let processed = stored(agent, "session", "processed");
+        let pending = stored(agent, "entry", "pending");
+        (processed.len() == 1 && pending.is_empty() && agent.turn.is_none()).then_some(())
     });
     assert!(app
         .world()
@@ -320,6 +373,95 @@ fn two_agents_in_one_workspace_drive_arrays_wake_and_join_cleanly() {
         .unwrap()
         .turn
         .is_none());
+    stop(&mut app, workspace);
+}
+#[test]
+fn persistent_session_reopens_and_temporary_entry_does_not_replay() {
+    let root = tempfile::tempdir().unwrap();
+    image(root.path(), "base", DRIVER, &[]);
+    let mut app = app(root.path());
+    let workspace = start(&mut app, definition(root.path(), &["base"])).unwrap();
+    let target = id("agent:local/agent-0");
+    let entity = app
+        .world()
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .iter()
+        .next()
+        .unwrap()
+        .1;
+    let instance = app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .lua
+        .instance
+        .clone()
+        .unwrap();
+    command(
+        &mut app,
+        &target,
+        "persist-session",
+        "INJECT ? TO session.processed",
+        vec![serde_json::json!([{"type":"user", "content":"persistent"}])],
+    )
+    .result
+    .unwrap();
+    tick_until(&mut app, "driver waiting before stale injection", |world| {
+        let agent = world.get_component::<Agent>(entity)?;
+        let wake = agent.lua.wake.lock().unwrap();
+        (wake.waiting && wake.sender.is_some()).then_some(())
+    });
+    command(
+        &mut app,
+        &target,
+        "stale-entry",
+        "INJECT ? TO entry.pending",
+        vec![serde_json::json!([{"type":"user", "content":"never replay"}])],
+    )
+    .result
+    .unwrap();
+    stop(&mut app, workspace);
+    let workspace = start(&mut app, definition(root.path(), &["base"])).unwrap();
+    let entity = app
+        .world()
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .iter()
+        .next()
+        .unwrap()
+        .1;
+    let agent = app.world().get_component::<Agent>(entity).unwrap();
+    assert_ne!(agent.lua.instance.as_ref().unwrap(), &instance);
+    assert_eq!(
+        stored(agent, "session", "processed"),
+        StoredBlockInner::Message(vec![margatroid_types::message_types::AgentMessage::User {
+            content: "persistent".into()
+        }])
+    );
+    assert!(stored(agent, "entry", "pending").is_empty());
+    assert!(agent
+        .history
+        .list()
+        .unwrap()
+        .iter()
+        .all(|record| record.kind != "message"));
+    assert_eq!(
+        command(
+            &mut app,
+            &target,
+            "restart-created",
+            "CREATE BLOCK session (processed MESSAGE)",
+            vec![]
+        )
+        .result
+        .unwrap(),
+        MclValue::BlockOpened {
+            block_id: "session".into(),
+            created: false,
+            temporary: false
+        }
+    );
     stop(&mut app, workspace);
 }
 #[test]
