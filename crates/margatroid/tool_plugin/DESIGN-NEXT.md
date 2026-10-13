@@ -53,6 +53,8 @@ error      共享工具错误契约          执行、取消与清理错误
 - shell 默认使用并行有界 stdout/stderr 管道。Linux 显式 `shell(command, {pty=true})` 使用非阻塞 AsyncFd PTY，建立 session 与控制终端，stdin/stdout/stderr 都连接 slave；终端输出合并在 `stdout`，`stderr` 为空，退出状态仍返回 `code`。PTY 读取和等待并行，取消、限额、超时及后代回收沿用同一执行预算；非 Linux 明确拒绝 PTY。
 - handoff 第一版固定 UnsupportedHandoff，未增加任务池、全局 pending 或旧资源注册入口。
 
+显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
+
 # lib
 
 ## 类型
@@ -359,7 +361,7 @@ ToolError：工具错误，公开结构体
 当前同步验收与限制（未闭合项不得标为已完成）：
     验证MESSAGE/TOOL/SANDBOX三个typed arrays、IMPORT TOOL tool/skill/hook AS alias和GET alias，资源值与ToolCall纯值严格区分
     验证infer使用MESSAGE + TOOL及已准备definition/validate_owner，不接受ResourceID array、不重复global alias query
-    验证tool_call所有结构校验在submit前完成、空calls返回emptyMessage、不重复记录assistant、每匹配调用单oneshot及全部历史消息保留IDs
+    验证tool_call所有结构校验在submit前完成、空calls返回emptyMessage、不隐式记录输入assistant或结果、每匹配调用单oneshot及显式历史消息保留IDs
     验证System/prompt真实role、infer接收System，与history append不含System的独立范围
     验证reload后旧Block/已选定snapshot不变，新GET获得新快照；ToolExecuteRequest.resource是唯一CallableResource持有字段，Agent.sandbox使用选定SandboxValue策略
     Hook导入与typed定义可验收，但Driver触发器/执行路线仍明确未定；不以普通Lua runner临时代替或宣称路线已闭合

@@ -33,6 +33,8 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 共享值、组件与事件迁移及本轮typed数组与导入绑定均已实现。各领域文档描述对应完整行为，本文件统一依赖方向和跨领域数据，不继续混入旧邮箱、引用Block或ResourceId组件方案。ResourceID等基础契约由resource_id_plugin提供；types按组件、事件与纯值模块组织，不依赖业务Plugin实现。正文保持lib、system、handler、events、types、error六个标准板块。
 
+显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
+
 # lib
 
 ## 逻辑
@@ -234,7 +236,7 @@ HistoryRecord：历史记录，公开共享契约
     输入Assistant不在tool_call effect中重复记录，输出为ToolCall结果消息组成的MESSAGE数组
     history_append允许范围独立保持inject/user/assistant/tool_call/error，System不通过此effect追加；infer支持System
     inference完整返回InferenceResponse，保留stop_reason，不只抽取assistant正文
-    MclCommandResult.result是真实执行结果，history_error单列执行后历史错误，不能因此重做工具
+    MclCommandResult.result是真实执行结果；message保存仅由显式history_append发起，history_error只用于附带指令审计错误，不能因此重做工具
 ```
 
 # error

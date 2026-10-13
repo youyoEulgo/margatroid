@@ -150,27 +150,7 @@ pub fn complete_mcl_async(world: &mut World, output: MclAsyncOutput) {
     if !matches {
         return;
     }
-    let history_error = match &output.result {
-        Ok(MclValue::Inference(response)) => append_messages(
-            world,
-            entity,
-            &output.request,
-            output.turn.clone(),
-            std::slice::from_ref(&response.message),
-        )
-        .err(),
-        Ok(MclValue::Array(BlockInner::Message(messages))) => append_messages(
-            world,
-            entity,
-            &output.request,
-            output.turn.clone(),
-            messages,
-        )
-        .err(),
-        _ => None,
-    };
-    let mut reply = MclCommandResult::from_request(&output.request, output.result);
-    reply.history_error = history_error;
+    let reply = MclCommandResult::from_request(&output.request, output.result);
     crate::runtime::publish_result(world, reply);
     finish_head(world, entity);
 }
@@ -626,12 +606,10 @@ fn begin_tools(
             .iter()
             .map(|call| failed_call(call, None, "tool not visible".into()))
             .collect::<Vec<_>>();
-        let history_error = append_messages(world, entity, request, turn, &messages).err();
-        let mut reply = MclCommandResult::from_request(
+        let reply = MclCommandResult::from_request(
             request,
             Ok(MclValue::Array(BlockInner::Message(messages))),
         );
-        reply.history_error = history_error;
         crate::runtime::publish_result(world, reply);
         finish_head(world, entity);
         return Ok(None);

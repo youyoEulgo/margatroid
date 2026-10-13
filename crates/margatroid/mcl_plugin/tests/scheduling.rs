@@ -17,10 +17,17 @@ use std::sync::{Arc, Mutex};
 struct Store {
     records: Arc<Mutex<Vec<HistoryRecord>>>,
     fail: Arc<Mutex<bool>>,
+    fail_messages: Arc<Mutex<bool>>,
+    message_batches: Arc<Mutex<usize>>,
 }
 impl AgentHistoryStore for Store {
     fn append_batch(&self, records: Vec<HistoryRecord>) -> Result<(), HistoryError> {
-        if *self.fail.lock().unwrap() {
+        let contains_messages = records.iter().any(|record| record.kind == "message");
+        if contains_messages {
+            *self.message_batches.lock().unwrap() += 1;
+        }
+        if *self.fail.lock().unwrap() || (contains_messages && *self.fail_messages.lock().unwrap())
+        {
             return Err(HistoryError::WriteFailed("unavailable".into()));
         }
         self.records.lock().unwrap().extend(records);
@@ -410,8 +417,9 @@ fn pending_blocks_tail_stop_keeps_head_and_completion_is_correlated() {
         .drained
         .is_drained());
     let records = store.list().unwrap();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[1].turn.as_deref(), Some("original"));
+    assert_eq!(records.len(), 1);
+    assert!(records.iter().all(|record| record.kind == "mcl"));
+    assert_eq!(*store.message_batches.lock().unwrap(), 0);
 }
 
 #[test]
@@ -543,9 +551,38 @@ fn real_inference_reply_unblocks_fifo_and_keeps_submission_turn() {
         .turn
         .is_none());
     let records = store.list().unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().all(|record| record.kind == "mcl"));
+    assert_eq!(records[0].turn.as_deref(), Some("submitted"));
+    app.tick();
+    let replies = app
+        .world()
+        .event_reader::<MclCommandResult>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let reply = replies.iter().find(|reply| reply.id == "infer").unwrap();
+    assert!(reply.history_error.is_none());
+    let Ok(MclValue::Inference(response)) = &reply.result else {
+        panic!("expected inference response: {reply:?}");
+    };
+    let message = response.message.clone();
+    assert_eq!(serde_json::to_value(&message).unwrap()["content"], "actual");
+    enqueue_mcl_command(
+        app.world_mut(),
+        request(
+            "save",
+            "a",
+            "EMIT EFFECT history_append ?",
+            vec![json!([message])],
+        ),
+    );
+    process_mcl_queue(app.world_mut(), a);
+    let records = store.list().unwrap();
     assert_eq!(records.len(), 3);
-    assert_eq!(records[1].turn.as_deref(), Some("submitted"));
-    assert_eq!(records[1].payload["content"], "actual");
+    assert_eq!(records[2].kind, "message");
+    assert_eq!(records[2].payload, json!(message));
+    assert_eq!(*store.message_batches.lock().unwrap(), 1);
 }
 
 #[test]
@@ -573,9 +610,9 @@ fn unknown_tools_finish_synchronously_without_pending() {
     assert!(agent.mcl.pending.is_none());
     assert!(agent.turn.is_some());
     let records = store.list().unwrap();
-    assert_eq!(records.len(), 3);
-    assert_eq!(records[1].payload["tool_call_id"], "one");
-    assert_eq!(records[1].payload["failed"], true);
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().all(|record| record.kind == "mcl"));
+    assert_eq!(*store.message_batches.lock().unwrap(), 0);
 }
 
 #[test]
@@ -827,7 +864,7 @@ fn driver_ready_is_owner_only_and_receipt_precedes_drained() {
 }
 
 #[test]
-fn successful_async_result_survives_history_error() {
+fn message_store_failure_does_not_affect_inference_result_or_trigger_implicit_write() {
     let mut app = app();
     let (a, store) = spawn(&mut app, "a");
     let req = request(
@@ -848,7 +885,7 @@ fn successful_async_result_survives_history_error() {
         .unwrap()
         .mcl
         .pending = Some(pending.clone());
-    *store.fail.lock().unwrap() = true;
+    *store.fail_messages.lock().unwrap() = true;
     complete_mcl_async(
         app.world_mut(),
         MclAsyncOutput {
@@ -876,14 +913,16 @@ fn successful_async_result_survives_history_error() {
     let reply = results.iter().find(|r| r.id == "head").unwrap();
     assert_eq!(reply.source, req.source);
     assert_eq!(reply.target, req.target);
-    assert!(reply.history_error.is_some());
+    assert!(reply.history_error.is_none());
+    assert!(store.list().unwrap().is_empty());
+    assert_eq!(*store.message_batches.lock().unwrap(), 0);
     assert!(
         matches!(&reply.result,Ok(MclValue::Inference(response)) if response.stop_reason==StopReason::Length)
     );
 }
 
 #[test]
-fn real_tool_batch_keeps_order_and_records_failed_items() {
+fn real_tool_batch_returns_ordered_failures_and_only_caller_selected_messages_are_saved() {
     use margatroid_types::resource_components::ToolResource;
     use margatroid_types::tool_events::{
         ToolError, ToolErrorKind, ToolExecuteRequest, ToolExecuteResponse,
@@ -966,12 +1005,50 @@ fn real_tool_batch_keeps_order_and_records_failed_items() {
         .drained
         .is_drained());
     let records = store.list().unwrap();
-    assert_eq!(records.len(), 4);
-    assert_eq!(records[1].payload["tool_call_id"], "first");
-    assert_eq!(records[2].payload["tool_call_id"], "second");
-    assert_eq!(records[3].payload["tool_call_id"], "third");
-    assert_eq!(records[2].payload["failed"], true);
-    assert_eq!(records[3].payload["failed"], true);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, "mcl");
+    assert_eq!(*store.message_batches.lock().unwrap(), 0);
+    app.tick();
+    let replies = app
+        .world()
+        .event_reader::<MclCommandResult>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let reply = replies.iter().find(|reply| reply.id == "batch").unwrap();
+    assert!(reply.history_error.is_none());
+    let Ok(MclValue::Array(margatroid_types::block_types::BlockInner::Message(messages))) =
+        &reply.result
+    else {
+        panic!("expected tool messages: {reply:?}");
+    };
+    let payloads = messages
+        .iter()
+        .map(|message| json!(message))
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 3);
+    for (index, id) in ["first", "second", "third"].into_iter().enumerate() {
+        assert_eq!(payloads[index]["tool_call_id"], id);
+    }
+    assert_eq!(payloads[0]["failed"], false);
+    assert_eq!(payloads[1]["failed"], true);
+    assert_eq!(payloads[2]["failed"], true);
+    let selected = vec![messages[0].clone(), messages[2].clone()];
+    enqueue_mcl_command(
+        app.world_mut(),
+        request(
+            "save-selected",
+            "a",
+            "EMIT EFFECT history_append ?",
+            vec![json!(selected)],
+        ),
+    );
+    process_mcl_queue(app.world_mut(), a);
+    let records = store.list().unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[1].payload, payloads[0]);
+    assert_eq!(records[2].payload, payloads[2]);
+    assert_eq!(*store.message_batches.lock().unwrap(), 1);
 }
 
 #[test]
@@ -1219,7 +1296,124 @@ fn empty_assistant_calls_return_typed_message_and_submit_nothing() {
         .mcl
         .pending
         .is_none());
-    assert_eq!(store.list().unwrap().len(), 1);
+    let records = store.list().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, "mcl");
+    assert_eq!(*store.message_batches.lock().unwrap(), 0);
+}
+
+#[test]
+fn all_rejected_tools_return_failures_without_implicit_messages_and_append_once() {
+    use margatroid_types::block_types::BlockInner;
+    use margatroid_types::tool_events::ToolExecuteRequest;
+    let mut app = app();
+    let (entity, store) = spawn(&mut app, "a");
+    let assistant = json!({"type":"assistant","content":"caller decides","tool_calls":[
+        {"id":"one","tool_name":"missing","arguments":"{}"},
+        {"id":"two","tool_name":"also_missing","arguments":"{}"}
+    ]});
+    app.world().send_event(request(
+        "rejected",
+        "a",
+        "EMIT EFFECT tool_call ? ?",
+        vec![json!([assistant.clone()]), json!([])],
+    ));
+    app.tick();
+    app.tick();
+    assert!(app.world().event_reader::<ToolExecuteRequest>().is_empty());
+    let replies = app
+        .world()
+        .event_reader::<MclCommandResult>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let reply = replies.iter().find(|reply| reply.id == "rejected").unwrap();
+    assert!(reply.history_error.is_none());
+    let Ok(MclValue::Array(BlockInner::Message(messages))) = &reply.result else {
+        panic!("expected rejected tool results: {reply:?}");
+    };
+    assert_eq!(messages.len(), 2);
+    assert_eq!(json!(messages[0])["tool_call_id"], "one");
+    assert_eq!(json!(messages[1])["tool_call_id"], "two");
+    assert!(messages
+        .iter()
+        .all(|message| json!(message)["failed"] == true));
+    assert_eq!(*store.message_batches.lock().unwrap(), 0);
+    assert!(store
+        .list()
+        .unwrap()
+        .iter()
+        .all(|record| record.kind == "mcl"));
+    let selected = vec![assistant, json!(messages[1])];
+    enqueue_mcl_command(
+        app.world_mut(),
+        request(
+            "save",
+            "a",
+            "EMIT EFFECT history_append ?",
+            vec![json!(selected)],
+        ),
+    );
+    process_mcl_queue(app.world_mut(), entity);
+    let records = store.list().unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].kind, "mcl");
+    assert_eq!(
+        records[1].payload,
+        json!(serde_json::from_value::<AgentMessage>(selected[0].clone()).unwrap())
+    );
+    assert_eq!(records[2].payload, selected[1]);
+    assert_eq!(*store.message_batches.lock().unwrap(), 1);
+}
+
+#[test]
+fn duplicate_tool_completion_never_writes_messages() {
+    use margatroid_types::block_types::BlockInner;
+    let mut app = app();
+    let (entity, store) = spawn(&mut app, "a");
+    let req = request(
+        "tool",
+        "a",
+        "EMIT EFFECT tool_call ? ?",
+        vec![json!([]), json!([])],
+    );
+    enqueue_mcl_command(app.world_mut(), req.clone());
+    let pending = MclPending {
+        command_id: "tool".into(),
+        target_entity: entity,
+        operation_id: "operation".into(),
+        cancel: Default::default(),
+    };
+    app.world_mut()
+        .get_component_mut::<Agent>(entity)
+        .unwrap()
+        .mcl
+        .pending = Some(pending.clone());
+    let output = MclAsyncOutput {
+        request: req,
+        pending,
+        turn: None,
+        result: Ok(MclValue::Array(BlockInner::Message(vec![
+            AgentMessage::ToolCall {
+                resource_id: None,
+                tool_call_id: "failed".into(),
+                tool_name: "run".into(),
+                content: "failure".into(),
+                failed: true,
+            },
+        ]))),
+    };
+    complete_mcl_async(app.world_mut(), output.clone());
+    complete_mcl_async(app.world_mut(), output);
+    assert!(store.list().unwrap().is_empty());
+    assert_eq!(*store.message_batches.lock().unwrap(), 0);
+    assert!(app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .mcl
+        .drained
+        .is_drained());
 }
 
 #[test]

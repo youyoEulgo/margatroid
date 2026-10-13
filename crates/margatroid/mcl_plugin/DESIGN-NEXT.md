@@ -33,6 +33,8 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 正文按lib、system、handler、events、types、error六板块组织。parser源码职责在handler板块描述，不另加第七板块。
 
+显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
+
 # lib
 
 ## 类型
@@ -82,7 +84,7 @@ mcl_command_system(world: &mut World)
     产出事件：领域加载/推理/工具请求、MclCommandResult
     行为：
         第一阶段绑定可信来源并逐条受理入目标Agent FIFO
-        第二阶段收口匹配的异步队首，记录结果历史并派发回执
+        第二阶段收口匹配的异步队首并派发回执，不保存任何message历史
         第三阶段处理停止或来源取消，再推进各Agent队首
         同Agent异步等待不执行后续项，不同Agent独立推进；同步预算每Agent每帧64条
 ```
@@ -178,8 +180,8 @@ begin_tool_call(world: &mut World, request: &MclCommand, messages: Vec<AgentMess
         每个可调用项发送一个ToolExecuteRequest，携带选定CallableResource快照及原调用ID/参数/turn，不按ID重新取最新定义
         Hook允许导入为TOOL，但具体触发/执行能力未闭合；当前不把Hook当普通Lua runner或假装执行成功，按不支持项完成明确失败
         逐项等待oneshot，失败或通道关闭填该项失败结果，按原tool_calls顺序收集MESSAGE数组
-        结果逐项自动写历史，包括拒绝和失败；不再写输入assistant历史，它由inference或显式history_append记录
-        只有MCL指令记录加N条工具结果，不额外生成调用数组的Block字段或额外assistant记录
+        结果只作为MESSAGE数组返回，包括拒绝和失败项；输入assistant与输出tool_call消息都不隐式写历史，保存必须显式history_append
+        默认只有MCL指令审计记录，不自动产生N条工具message记录；Driver决定哪些消息显式history_append，不生成调用数组Block字段
 ```
 
 ## 逻辑
@@ -210,7 +212,7 @@ Driver工具回合：
     assistant = inference结果.message
     command("EMIT EFFECT tool_call ? (setting.visible)", {{assistant}})
     外层是arguments，内层单元素MESSAGE数组；不接受单对象特殊封装
-    返回MESSAGE工具结果数组，Driver追加到上下文，不重复history_append自动结果
+    返回MESSAGE工具结果数组；Driver分别决定INJECT上下文和显式history_append，二者互不隐含
     删除work.calls及TOOL_CALL字段，不再单独INJECT tool_calls数组
 
 范围与拼接：
@@ -232,7 +234,10 @@ Driver工具回合：
     history_append只有完整参数求值与递归允许类型检查成功后才豁免命令记录，准备快照只追加一次
     非法history_append先审计原text和arguments再返回校验错误，不追加消息；合法写库失败不补写命令或重试
     除合法history_append外，执行前记录原text和展开arguments，失败不执行
-    自动结果历史单独批次事务，失败history_error不覆盖真实result，不重做外部操作
+    message历史唯一写入入口是显式history_append，包括用户、assistant、工具成功/失败、error及inject消息；推理、工具、GET、INJECT和IMPORT不写message记录
+    history_append按批次事务保存，写入失败返回本条history_append错误；推理和工具原结果不会因此重做
+    保留MCL指令审计自动记录，参数展开中的消息数据只是审计payload，不额外投影为message记录
+    history_error保留为取消项审计失败等附带错误，不再表示推理或工具自动结果message保存失败
     history_append允许inject/user/assistant/tool_call/error，System值可用于上下文但不通过此effect新增记录；递归检查Inject中的System，拒绝时不追加任何记录
     inject内部结构仍按完整AgentMessage契约，历史输入允许范围规则独立于消息值类型
 ```
