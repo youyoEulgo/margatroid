@@ -108,6 +108,7 @@ export type BlockInnerProjection =
 export type MclValueProjection =
   | 'Unit'
   | { Array: BlockInnerProjection }
+  | { BlockOpened: { block_id: string; created: boolean; temporary: boolean } }
   | { ResourceImport: { kind: 'Message' | 'Tool' | 'Sandbox'; resource_id: string; alias: string } }
   | { Inference: { message: AgentMessage; stop_reason: unknown } }
   | { Text: string };

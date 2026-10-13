@@ -13,3 +13,10 @@ pub struct WebSocketMessageSend {
     pub message: serde_json::Value,
 }
 impl Event for WebSocketMessageSend {}
+
+#[derive(Clone, Debug)]
+pub struct DtoHistorySnapshotCompleted {
+    pub id: String,
+    pub result: Result<serde_json::Value, String>,
+}
+impl Event for DtoHistorySnapshotCompleted {}

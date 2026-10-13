@@ -4,15 +4,73 @@ use async_runtime_plugin::AsyncRuntimePlugin;
 use closure_plugin::{AppClosureExt, ClosurePlugin};
 use core_plugin::{App, World};
 use margatroid_types::agent_components::{Agent, AgentInfo, AgentState};
-use margatroid_types::block_types::AgentBlock;
+use margatroid_types::block_storage::{
+    AgentBlockStorage, AgentDatabaseHandle, BlockStorageError, BlockStorageRequest,
+    StoredBlockResult,
+};
 use margatroid_types::execution_components::{AgentExecutionScope, ExecutionActivityKind};
-use margatroid_types::history_components::AgentHistoryHandle;
 use margatroid_types::mcl_events::AgentMclQueue;
 use margatroid_types::resource_components::AgentImageModelConfig;
 use margatroid_types::workspace_execution::spawn_workspace_execution;
 use resource_id_plugin::ResourceID;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+
+struct ArrayRoundTripHost;
+impl LuaHostFunction for ArrayRoundTripHost {
+    fn call(
+        &self,
+        arguments: LuaValue,
+        _: LuaEnvironmentContext,
+        _: CancellationToken,
+    ) -> HostFuture {
+        Box::pin(async move {
+            let LuaValue::Array(arguments) = arguments else {
+                panic!("arguments array")
+            };
+            if arguments.is_empty() {
+                return Ok(LuaValue::Object(BTreeMap::from([
+                    ("tool_calls".into(), LuaValue::Array(vec![])),
+                    ("object".into(), LuaValue::Object(BTreeMap::new())),
+                    (
+                        "nested".into(),
+                        LuaValue::Array(vec![LuaValue::Array(vec![])]),
+                    ),
+                ])));
+            }
+            let LuaValue::Object(message) = &arguments[0] else {
+                panic!("message object")
+            };
+            assert_eq!(message["tool_calls"], LuaValue::Array(vec![]));
+            assert_eq!(message["object"], LuaValue::Object(BTreeMap::new()));
+            assert_eq!(
+                message["nested"],
+                LuaValue::Array(vec![LuaValue::Array(vec![])])
+            );
+            assert_eq!(arguments[1], LuaValue::Object(BTreeMap::new()));
+            Ok(LuaValue::Nil)
+        })
+    }
+}
+
+#[tokio::test]
+async fn host_arrays_round_trip_empty_nested_fields_without_guessing_empty_objects() {
+    crate::handler::execute_lua(
+        program("local message = bridge(); assert(#message.tool_calls == 0); bridge(message, {})"),
+        LuaEnvironment {
+            globals: vec![LuaGlobalBinding {
+                name: "bridge".into(),
+                binding: LuaBindingValue::Function(Arc::new(ArrayRoundTripHost)),
+            }],
+            modules: vec![],
+        },
+        context(),
+        CancellationToken::new(),
+        LuaRuntimeConfig::default(),
+    )
+    .await
+    .unwrap();
+}
 
 fn context() -> LuaEnvironmentContext {
     let mut world = World::new();
@@ -60,8 +118,16 @@ impl margatroid_types::history_components::AgentHistoryStore for TestHistory {
         Ok(vec![])
     }
 }
+impl AgentBlockStorage for TestHistory {
+    fn execute(&self, _: BlockStorageRequest) -> Result<StoredBlockResult, BlockStorageError> {
+        Err(BlockStorageError::InvalidRequest(
+            "lifecycle fixture has no block backend".into(),
+        ))
+    }
+}
 fn agent(world: &mut World) -> core_plugin::Entity {
     let entity = world.spawn();
+    let database = AgentDatabaseHandle::new(TestHistory);
     let agent = Agent {
         resourceid: ResourceID::parse("agent:demo/test:latest").unwrap(),
         info: AgentInfo {
@@ -84,8 +150,8 @@ fn agent(world: &mut World) -> core_plugin::Entity {
             request_id: "start".into(),
             vm_request_id: "vm-start".into(),
         },
-        history: AgentHistoryHandle::new(TestHistory),
-        block: AgentBlock::default(),
+        history: database.history(),
+        database,
         import_bindings: Default::default(),
         mcl: AgentMclQueue::default(),
         execution: AgentExecutionScope::new(),
@@ -147,12 +213,31 @@ impl LuaHostFunction for RecordingHost {
                 let mut count = count.lock().unwrap();
                 *count += 1;
                 if *count == 1 {
-                    return Ok(LuaValue::Object(BTreeMap::from([(
-                        "type".into(),
-                        LuaValue::String("user".into()),
-                    )])));
+                    return Ok(LuaValue::Array(vec![LuaValue::Object(BTreeMap::from([
+                        ("type".into(), LuaValue::String("user".into())),
+                        ("content".into(), LuaValue::String("test user".into())),
+                    ]))]));
                 }
                 cancel.cancel();
+                return Ok(LuaValue::Array(vec![]));
+            }
+            if command.starts_with("CREATE") {
+                return Ok(LuaValue::Object(BTreeMap::from([
+                    ("created".into(), LuaValue::Boolean(true)),
+                    (
+                        "temporary".into(),
+                        LuaValue::Boolean(command.starts_with("CREATE TEMP")),
+                    ),
+                ])));
+            }
+            if command.starts_with("EMIT EFFECT inference") {
+                return Ok(LuaValue::Object(BTreeMap::from([(
+                    "message".into(),
+                    LuaValue::Object(BTreeMap::from([
+                        ("type".into(), LuaValue::String("assistant".into())),
+                        ("content".into(), LuaValue::String("test reply".into())),
+                    ])),
+                )])));
             }
             Ok(LuaValue::Nil)
         })
@@ -191,10 +276,14 @@ async fn minimal_vm_runs_updated_driver_with_async_host_calls() {
     assert_eq!(result.unwrap_err().kind, LuaRuntimeErrorKind::Cancelled);
     let calls = calls.lock().unwrap();
     assert!(calls.iter().any(|call| call == "EMIT EFFECT ready"));
+    assert!(calls.iter().any(|call| call
+        == "EMIT EFFECT inference (msg.system_prompt, session.conversation) (session.visible)"));
+    assert!(calls.iter().any(|call| call == "EMIT EFFECT finish_turn"));
     assert!(calls
         .iter()
-        .any(|call| call == "EMIT EFFECT inference FROM req"));
-    assert!(calls.iter().any(|call| call == "EMIT EFFECT finish"));
+        .any(|call| call == "EMIT EFFECT history_append ?"));
+    assert!(calls.iter().all(|call| !call.contains(" FROM ")));
+    assert!(calls.iter().all(|call| call != "EMIT EFFECT finish"));
 }
 
 #[tokio::test]

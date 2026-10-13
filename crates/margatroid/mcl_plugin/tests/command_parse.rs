@@ -59,4 +59,15 @@ fn create_and_effect_inputs_are_three_typed_arrays() {
     )
     .is_ok());
     assert!(parse("EMIT EFFECT inference ? ?", &[json!([])]).is_err());
+    for (text, expected) in [
+        ("CREATE BLOCK b (m MESSAGE)", false),
+        ("CREATE TEMP BLOCK b (m MESSAGE)", true),
+    ] {
+        let ParsedOperation::Create { temporary, .. } = parse(text, &[]).unwrap() else {
+            panic!()
+        };
+        assert_eq!(temporary, expected);
+    }
+    assert!(parse("EMIT EFFECT finish", &[]).is_err());
+    assert!(parse("EMIT EFFECT finish_turn", &[]).is_ok());
 }

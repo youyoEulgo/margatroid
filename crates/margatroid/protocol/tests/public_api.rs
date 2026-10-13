@@ -234,6 +234,35 @@ fn import_projection_retains_kind_and_manual_array_arguments_are_not_decoded_as_
     );
 }
 #[test]
+fn block_opened_serialization_keeps_exact_name_and_flags() {
+    for (created, temporary) in [(true, false), (false, false), (true, true), (false, true)] {
+        let event = MclCommandResult {
+            id: "block".into(),
+            source: id("client", "real"),
+            target: id("agent", "manager"),
+            result: Ok(MclValue::BlockOpened {
+                block_id: "Case-sensitive.block".into(),
+                created,
+                temporary,
+            }),
+            history_error: None,
+        };
+        let expected = serde_json::json!({"BlockOpened": {"block_id": "Case-sensitive.block", "created": created, "temporary": temporary}});
+        let dto: MclCommandResultDto = (&event).into_dto(()).unwrap();
+        assert_eq!(dto.result.unwrap(), expected);
+        assert_eq!(
+            margatroid_types::mcl_projection::project_mcl_value(event.result.as_ref().unwrap())
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(event.result.unwrap()).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn registration_and_errors_use_correlated_bounded_shapes() {
     let registered = ServerMessage::ConnectionRegistered {
         id: "register".into(),
@@ -291,9 +320,12 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
     use core_plugin::App;
     use margatroid_types::{
         agent_components::{Agent, AgentInfo, AgentState},
-        block_types::AgentBlock,
+        block_storage::{
+            AgentBlockStorage, AgentDatabaseHandle, BlockStorageError, BlockStorageRequest,
+            StoredBlockResult,
+        },
         execution_components::AgentExecutionScope,
-        history_components::{AgentHistoryHandle, AgentHistoryStore, HistoryError, HistoryRecord},
+        history_components::{AgentHistoryStore, HistoryError, HistoryRecord},
         lua_runtime_components::AgentLua,
         mcl_events::AgentMclQueue,
         resource_components::AgentImageModelConfig,
@@ -311,6 +343,13 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
         }
         fn list(&self) -> Result<Vec<HistoryRecord>, HistoryError> {
             Ok(vec![])
+        }
+    }
+    impl AgentBlockStorage for EmptyHistory {
+        fn execute(&self, _: BlockStorageRequest) -> Result<StoredBlockResult, BlockStorageError> {
+            Err(BlockStorageError::InvalidRequest(
+                "metadata-only fixture".into(),
+            ))
         }
     }
     let mut app = App::new();
@@ -340,34 +379,37 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
             Workspace::new(definition, WorkspaceState::Running, entry, close.clone()),
         )
         .unwrap();
-    let make_agent = || Agent {
-        resourceid: id("agent", "manager"),
-        workspace: id("workspace", "one"),
-        info: AgentInfo {
-            model: AgentImageModelConfig {
-                model: "model".into(),
-                temperature: None,
-                max_output_tokens: None,
-                top_p: None,
-                stop: vec![],
+    let make_agent = || {
+        let database = AgentDatabaseHandle::new(EmptyHistory);
+        Agent {
+            resourceid: id("agent", "manager"),
+            workspace: id("workspace", "one"),
+            info: AgentInfo {
+                model: AgentImageModelConfig {
+                    model: "model".into(),
+                    temperature: None,
+                    max_output_tokens: None,
+                    top_p: None,
+                    stop: vec![],
+                },
+                project_root: "/tmp/one".into(),
+                home_root: "/tmp/home".into(),
+                image: id("image", "base"),
+                image_dependencies: std::sync::Arc::from([]),
             },
-            project_root: "/tmp/one".into(),
-            home_root: "/tmp/home".into(),
-            image: id("image", "base"),
-            image_dependencies: std::sync::Arc::from([]),
-        },
-        sandbox: Some(margatroid_types::resource_components::SandboxValue {
-            resource_id: id("sandbox", "safe"),
-            policy: "private-policy".into(),
-        }),
-        import_bindings: Default::default(),
-        lua: AgentLua::default(),
-        state: AgentState::Running,
-        history: AgentHistoryHandle::new(EmptyHistory),
-        block: AgentBlock::default(),
-        mcl: AgentMclQueue::default(),
-        execution: AgentExecutionScope::new(),
-        turn: None,
+            sandbox: Some(margatroid_types::resource_components::SandboxValue {
+                resource_id: id("sandbox", "safe"),
+                policy: "private-policy".into(),
+            }),
+            import_bindings: Default::default(),
+            lua: AgentLua::default(),
+            state: AgentState::Running,
+            history: database.history(),
+            database,
+            mcl: AgentMclQueue::default(),
+            execution: AgentExecutionScope::new(),
+            turn: None,
+        }
     };
     let old = world.spawn();
     world.insert_library(old, make_agent()).unwrap();

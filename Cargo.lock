@@ -23,12 +23,14 @@ name = "agent_plugin"
 version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
+ "async_runtime_plugin",
  "core_plugin",
  "margatroid_types",
  "memory_plugin",
  "resource_id_plugin",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -525,6 +527,7 @@ dependencies = [
  "resource_id_plugin",
  "serde_json",
  "server_plugin",
+ "tokio",
  "tracing",
 ]
 
@@ -1031,6 +1034,7 @@ dependencies = [
  "futures-util",
  "jsonschema",
  "margatroid_types",
+ "memory_plugin",
  "reqwest",
  "resource_id_plugin",
  "serde",
@@ -1306,6 +1310,7 @@ dependencies = [
  "async_runtime_plugin",
  "core_plugin",
  "margatroid_types",
+ "memory_plugin",
  "resource_id_plugin",
  "serde_json",
  "tempfile",
@@ -1325,9 +1330,12 @@ version = "0.1.0"
 dependencies = [
  "core_plugin",
  "margatroid_types",
+ "resource_id_plugin",
  "rusqlite",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1613,9 +1621,11 @@ dependencies = [
  "core_plugin",
  "jsonschema",
  "margatroid_types",
+ "memory_plugin",
  "resource_id_plugin",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
 ]
@@ -2003,9 +2013,11 @@ dependencies = [
  "core_plugin",
  "jsonschema",
  "margatroid_types",
+ "memory_plugin",
  "resource_id_plugin",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
 ]
@@ -2562,6 +2574,7 @@ dependencies = [
  "futures-util",
  "jsonschema",
  "margatroid_types",
+ "memory_plugin",
  "mlua",
  "nix",
  "resource_id_plugin",
@@ -2582,9 +2595,11 @@ dependencies = [
  "core_plugin",
  "jsonschema",
  "margatroid_types",
+ "memory_plugin",
  "resource_id_plugin",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
 ]

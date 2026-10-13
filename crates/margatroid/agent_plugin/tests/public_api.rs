@@ -1,5 +1,6 @@
 use agent_plugin::*;
 use app_runtime_plugin::RuntimePlugin;
+use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::{App, Entity, Event, World};
 use margatroid_types::{
     execution_components::ExecutionActivityKind,
@@ -30,7 +31,8 @@ struct Fixture {
 fn fixture() -> Fixture {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
-        .add_plugin(ResourcePlugin);
+        .add_plugin(ResourcePlugin)
+        .add_plugin(AsyncRuntimePlugin::default());
     let world = app.world_mut();
     world.insert_resource(margatroid_types::mcl_environment::MclEnvironmentFactory(
         Arc::new(|| margatroid_types::lua_environment::LuaEnvironment::default()),
@@ -120,8 +122,26 @@ fn fixture() -> Fixture {
         _temp: temp,
     }
 }
-fn start(f: &mut Fixture) -> (Entity, StartDriverLuaVm) {
+async fn database_result(f: &mut Fixture) -> Result<DatabaseSetupOutput, DatabaseSetupError> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let mut results =
+                events::<Result<DatabaseSetupOutput, DatabaseSetupError>>(f.app.world_mut());
+            if let Some(result) = results.pop() {
+                return result;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap()
+}
+async fn start(f: &mut Fixture) -> (Entity, StartDriverLuaVm) {
     handle_start_agent(f.app.world_mut(), f.request.clone());
+    assert!(f.app.world().query_with::<Agent>().result().is_empty());
+    assert!(events::<StartDriverLuaVm>(f.app.world_mut()).is_empty());
+    let result = database_result(f).await;
+    handle_database_setup_result(f.app.world_mut(), result);
     let requests = events::<StartDriverLuaVm>(f.app.world_mut());
     assert_eq!(requests.len(), 1);
     (requests[0].owner, requests[0].clone())
@@ -156,7 +176,7 @@ fn make_running(
 #[tokio::test]
 async fn start_waits_for_ready_and_keeps_resources_empty() {
     let mut f = fixture();
-    let (entity, request) = start(&mut f);
+    let (entity, request) = start(&mut f).await;
     let world = f.app.world();
     let agent = world.get_component::<Agent>(entity).unwrap();
     assert!(matches!(agent.state, AgentState::Creating { .. }));
@@ -215,7 +235,7 @@ async fn failure_requires_cleanup_proof_before_despawn() {
         LuaRuntimeErrorKind::CleanupFailed,
     ] {
         let mut f = fixture();
-        let (entity, request) = start(&mut f);
+        let (entity, request) = start(&mut f).await;
         handle_start_driver_lua_vm_result(
             f.app.world_mut(),
             StartDriverLuaVmResult {
@@ -249,7 +269,7 @@ async fn failure_requires_cleanup_proof_before_despawn() {
 #[tokio::test]
 async fn stop_closes_admission_coalesces_waiters_and_requires_matching_result() {
     let mut f = fixture();
-    let (entity, request) = start(&mut f);
+    let (entity, request) = start(&mut f).await;
     handle_stop_agent(
         f.app.world_mut(),
         StopAgent {
@@ -317,7 +337,7 @@ async fn stop_closes_admission_coalesces_waiters_and_requires_matching_result() 
 #[tokio::test]
 async fn driver_exception_maps_once_without_inventing_original_error() {
     let mut f = fixture();
-    let (entity, request) = start(&mut f);
+    let (entity, request) = start(&mut f).await;
     let instance = make_running(&mut f, entity, &request);
     let event = DriverLuaVmExceptionResult {
         exception_id: "exception".into(),
@@ -365,7 +385,7 @@ async fn image_lookup_never_uses_another_entity() {
 #[tokio::test]
 async fn failed_stop_retains_host_and_never_reuses_consumed_end_channel() {
     let mut f = fixture();
-    let (entity, request) = start(&mut f);
+    let (entity, request) = start(&mut f).await;
     let instance = make_running(&mut f, entity, &request);
     handle_stop_agent(
         f.app.world_mut(),
@@ -422,7 +442,7 @@ async fn failed_stop_retains_host_and_never_reuses_consumed_end_channel() {
 #[tokio::test]
 async fn local_exception_preserves_error_and_rejects_mismatched_identity() {
     let mut f = fixture();
-    let (entity, request) = start(&mut f);
+    let (entity, request) = start(&mut f).await;
     let instance = make_running(&mut f, entity, &request);
     let agent = f.app.world().get_component::<Agent>(entity).unwrap();
     let mut event = AgentException {
@@ -462,27 +482,191 @@ async fn local_exception_preserves_error_and_rejects_mismatched_identity() {
     f.close.close().await.unwrap();
 }
 
-#[test]
-fn ordinary_block_namespace_type_and_range_invariants_are_preserved() {
-    use margatroid_types::block_types::{AgentBlock, BlockInner, BlockPath, InnerType};
-    let mut block = AgentBlock::default();
-    block
-        .create(
-            "conversation".into(),
-            vec![("messages".into(), InnerType::Message)],
-        )
-        .unwrap();
-    assert!(block.create("conversation".into(), vec![]).is_err());
-    let path = BlockPath {
-        block_id: "conversation".into(),
-        inner_id: "messages".into(),
+#[tokio::test]
+async fn database_handle_persists_blocks_across_agent_restart() {
+    use margatroid_types::{
+        block_storage::*,
+        block_types::{BlockPath, InnerType},
     };
-    assert!(block
-        .replace(&path, 0, 0, BlockInner::Tool(vec![]))
-        .is_err());
-    assert!(block.get(&path).unwrap().is_empty());
-    assert!(block
-        .replace(&path, 0, 1, BlockInner::Message(vec![]))
-        .is_err());
-    assert!(block.get(&path).unwrap().is_empty());
+    let mut f = fixture();
+    let (entity, vm) = start(&mut f).await;
+    let context = BlockStorageContext {
+        agent: f.request.resource_id.clone(),
+        instance: DriverLuaVmInstance {
+            owner: entity,
+            start_request_id: vm.id,
+        },
+    };
+    let execute = |context: BlockStorageContext, operation| BlockStorageRequest {
+        context,
+        operation,
+        cancel: tokio_util::sync::CancellationToken::new(),
+    };
+    let storage = f
+        .app
+        .world()
+        .agent_block_storage(&f.request.resource_id)
+        .unwrap();
+    let schema = BlockSchema {
+        name: "conversation".into(),
+        fields: vec![("messages".into(), InnerType::Message)],
+        temporary: false,
+    };
+    let opened = storage
+        .execute(execute(
+            context.clone(),
+            BlockStorageOperation::Create(schema.clone()),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        opened,
+        StoredBlockResult::BlockOpened(BlockOpened { created: true, .. })
+    ));
+    let selector = BlockSelector {
+        path: BlockPath {
+            block_id: "conversation".into(),
+            inner_id: "messages".into(),
+        },
+        range: BlockRange::All,
+    };
+    let values =
+        StoredBlockInner::Message(vec![margatroid_types::message_types::AgentMessage::User {
+            content: "persisted".into(),
+        }]);
+    storage
+        .execute(execute(
+            context.clone(),
+            BlockStorageOperation::Inject {
+                source: BlockExpression::Sources(vec![BlockSource::Values(values.clone())]),
+                target: selector.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    drop(storage);
+    f.app.world_mut().despawn(entity);
+    let (entity, vm) = start(&mut f).await;
+    let context = BlockStorageContext {
+        agent: f.request.resource_id.clone(),
+        instance: DriverLuaVmInstance {
+            owner: entity,
+            start_request_id: vm.id,
+        },
+    };
+    let storage = f
+        .app
+        .world()
+        .agent_block_storage(&f.request.resource_id)
+        .unwrap();
+    assert!(matches!(
+        storage
+            .execute(execute(
+                context.clone(),
+                BlockStorageOperation::Create(schema)
+            ))
+            .await
+            .unwrap(),
+        StoredBlockResult::BlockOpened(BlockOpened { created: false, .. })
+    ));
+    assert_eq!(
+        storage
+            .execute(execute(
+                context,
+                BlockStorageOperation::Get {
+                    expressions: vec![BlockExpression::Sources(vec![BlockSource::Selector(
+                        selector
+                    )])]
+                }
+            ))
+            .await
+            .unwrap(),
+        StoredBlockResult::Arrays(vec![values])
+    );
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn preparing_duplicate_is_guarded_and_workspace_close_never_spawns_agent() {
+    let mut f = fixture();
+    handle_start_agent(f.app.world_mut(), f.request.clone());
+    handle_start_agent(f.app.world_mut(), f.request.clone());
+    assert!(events::<StartAgentResult>(f.app.world_mut()).is_empty());
+    let mut duplicate = f.request.clone();
+    duplicate.id = "second".into();
+    handle_start_agent(f.app.world_mut(), duplicate);
+    assert_eq!(
+        events::<StartAgentResult>(f.app.world_mut())[0]
+            .result
+            .as_ref()
+            .unwrap_err()
+            .kind,
+        AgentErrorKind::DuplicateAgent
+    );
+    f.app
+        .world()
+        .get_component::<Workspace>(f.request.workspace)
+        .unwrap()
+        .close_admission();
+    let output = database_result(&mut f).await;
+    handle_database_setup_result(f.app.world_mut(), output.clone());
+    handle_database_setup_result(f.app.world_mut(), output);
+    let results = events::<StartAgentResult>(f.app.world_mut());
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, f.request.id);
+    assert_eq!(
+        results[0].result.as_ref().unwrap_err().kind,
+        AgentErrorKind::WorkspaceNotAlive
+    );
+    assert!(f.app.world().query_with::<Agent>().result().is_empty());
+    assert!(events::<StartDriverLuaVm>(f.app.world_mut()).is_empty());
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn database_preparation_retains_image_snapshot_and_rejects_stale_association() {
+    let mut f = fixture();
+    handle_start_agent(f.app.world_mut(), f.request.clone());
+    f.app
+        .world_mut()
+        .get_component_mut::<ResourceSet<AgentImage>>(f.request.workspace)
+        .unwrap()
+        .remove(&f.request.image);
+    let output = database_result(&mut f).await;
+    let mut stale = output.clone().unwrap();
+    stale.operation_id = "stale-database".into();
+    handle_database_setup_result(f.app.world_mut(), Ok(stale));
+    assert!(f.app.world().query_with::<Agent>().result().is_empty());
+    handle_database_setup_result(f.app.world_mut(), output.clone());
+    handle_database_setup_result(f.app.world_mut(), output);
+    let requests = events::<StartDriverLuaVm>(f.app.world_mut());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].program.source.as_ref(), "ready()");
+    let agent = f
+        .app
+        .world()
+        .get_component::<Agent>(requests[0].owner)
+        .unwrap();
+    assert_eq!(agent.info.model.model, "model-one");
+    assert_eq!(agent.info.image_dependencies.len(), 1);
+    assert!(agent.database.history().list().unwrap().is_empty());
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn database_open_failure_has_no_host_or_vm() {
+    let mut f = fixture();
+    f.request.definition.history_path = f._temp.path().to_path_buf();
+    handle_start_agent(f.app.world_mut(), f.request.clone());
+    let output = database_result(&mut f).await;
+    handle_database_setup_result(f.app.world_mut(), output);
+    let results = events::<StartAgentResult>(f.app.world_mut());
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].result.as_ref().unwrap_err().kind,
+        AgentErrorKind::DatabaseSetupFailed
+    );
+    assert!(f.app.world().query_with::<Agent>().result().is_empty());
+    assert!(events::<StartDriverLuaVm>(f.app.world_mut()).is_empty());
+    f.close.close().await.unwrap();
 }

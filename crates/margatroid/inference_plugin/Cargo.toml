@@ -23,3 +23,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 closure_plugin = { path = "../../mecs/closure_plugin" }
 tempfile = "3"
+memory_plugin = { path = "../memory_plugin" }

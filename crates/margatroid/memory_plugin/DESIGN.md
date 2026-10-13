@@ -1,30 +1,127 @@
-# MemoryPlugin 设计
+# 板块格式
+
+正文保留lib、system、handler、events、types、error六板块。**已实现一个Agent SQLite backend：Block持久化与history共享connection manager，CREATE/GET/INJECT通过共享异步storage入口调用blocking worker。** 本模块保留历史兼容API，不提供RAM Block或自动同步。Driver/Other登记及资源解析由调用方负责；本模块只报告真实事务与清理事实。
+
+# lib
 
 ## 边界
 
-memory_plugin 是只追加的事务历史存储模块。它依赖 margatroid_types 的历史契约，不依赖
-agent_plugin，不保存实时上下文、MCL state、设置或资源状态，不负责消息领域转换。
+memory_plugin提供一个真实SQLite backend，不提供RAM Block backend。一个Agent的Block与history共用同一SQLite文件、connection manager并分表存放。沿用AgentStartDefinition.history_path作为数据库路径，不在本轮引入启动参数改名。依赖共享types契约，不依赖agent_plugin或MCL解析实现，不负责消息领域转换、alias注册、资源加载、沙箱激活或Driver生命周期。
 
-公开导出 `SqliteHistoryStore`、`AgentHistoryStore`、`AgentHistoryHandle`、`HistoryRecord`、
-`HistoryError`。可选 `MemoryPlugin` 仅安装资源标记，不注册系统、事件或 schedule。
+Agent只保存AgentDatabaseHandle及同文件AgentHistoryHandle视图，不保存AgentBlock/BlockAssembly内存内容。SQL及连接管理留在本模块，opaque共享句柄不暴露Connection。历史是只追加领域；Block是显式CREATE/GET/INJECT管理的数据，不能用history恢复拼接Block，也不重建旧state表接口。
 
-## API
+## 类型
 
 ```text
-SqliteHistoryStore: Clone + Send + Sync
+SqliteAgentDatabase：已实现SQLite backend，Clone + Send + Sync
+    open(path: impl AsRef<Path>) -> Result<Self, BlockStorageError>
+        同步创建父目录、打开数据库、设置5秒忙等待并open/validate历史与Block表；调用方必须在blocking worker中调用，不清空已有数据。
+    impl AgentHistoryStore
+        append_batch(Vec<HistoryRecord>) -> Result<(), HistoryError>
+        list() -> Result<Vec<HistoryRecord>, HistoryError>
+    impl AgentBlockStorage
+        execute(BlockStorageRequest) -> Result<StoredBlockResult, BlockStorageError>
+    说明：AgentDatabaseStore由共享trait blanket实现；AgentDatabaseHandle::new(store)建立opaque能力。克隆共享Arc<Mutex<Connection>>及retired标记，不另为Block建立第二个数据库文件。
+
+SqliteHistoryStore：现有历史实现，Clone + Send + Sync
     open(path: impl AsRef<Path>) -> Result<Self, HistoryError>
-        创建父目录、打开数据库、设置 5 秒忙等待并初始化历史表
+        兼容API：创建父目录、打开数据库、设置5秒忙等待并仅初始化历史表；Agent统一启动使用SqliteAgentDatabase，再由数据库句柄取得共享连接的历史视图。
     impl AgentHistoryStore
         append_batch(Vec<HistoryRecord>) -> Result<(), HistoryError>
         list() -> Result<Vec<HistoryRecord>, HistoryError>
 
-MemoryPlugin: Default
+MemoryPlugin：Default，可选资源标记安装
     new() -> Self
     impl Plugin
-        build() 插入 MemoryPluginInstalled，重复安装报错
+        build() 插入MemoryPluginInstalled，重复安装报错；不注册system、event或schedule。
+```
+
+# system
+
+## 逻辑
+
+无业务System，不轮询数据库、不做RAM到SQLite同步、不隐式记录消息，不通过转发System写历史。ECS/MCL主线程不得执行SQLite IO；存储请求由async handle调度blocking worker，返回关联结果供原请求队列收口。启动open及恢复检查同样不阻塞ECS。
+
+# handler
+
+## 逻辑
+
+```text
+打开与生命周期：
+    数据库open/validate保留旧表与记录，不迁移删除既有无关表。
+    Persistent namespace = 稳定Agent ResourceID + block名，重启继续open。
+    Temporary namespace = Agent ResourceID + 完整Driver instance + block名；instance编码Entity index/generation与start_request_id。
+    启动方必须提供跨进程唯一的start_request_id（包含startup/session nonce），否则相同instance值仍指向同一TEMP定义；数据库不会为每次open另造nonce。
+    CREATE BLOCK默认持久；CREATE TEMP BLOCK也是真实SQLite数据，不是SQLite TEMP connection表或RAM假backend。
+    CREATE首次才返回BlockOpened.created=true；已有同schema返回false、不清空，schema不符失败且保持原数据。
+    同instance重复TEMP CREATE也幂等open/validate；同Agent/block名的persistent/temporary lifecycle由definitions全局保留，跨instance切换也拒绝。
+    旧TEMP物理行不自动删除且不同新instance不可见；它仍保留名称的temporary生命周期，不能静默改为persistent。未来显式清理/迁移不在当前API内。
+    可见定义完全由SQLite metadata查询，不另存RAM definition映射或Block缓存。
+    TEMP entry不恢复；启动不把旧TEMP当作本instance，不恢复turn、pending、alias/import或activeSandboxValue。
+    启动IMPORT重建RAM bindings；persistent conversation与工具配置只在created=true时初始化，不能每次启动覆盖。
+    activeSandboxValue需GET解析后显式sandbox_use；停止释放句柄不删除持久Block、history或磁盘资源。
+
+读取与写入：
+    GET一次read transaction读取全部selectors的同一snapshot并按顺序组装typed stored数组，不能逐selector独立事务。
+    TOOL/SANDBOX存完整ResourceID，GET基于本次当前RAM已导入绑定快照resolve最新定义/策略；未导入显式失败、不隐式加载、不fallback旧定义。
+    MESSAGE存结构化消息，保留System、usage、工具关联及递归inject等完整共享值，不只存content。
+    INJECT在同一write transaction读snapshot、检查map/type/range、执行replace并commit；检查失败未修改。
+    typed arrays空值仍有类型；不能把目标字段类型作为隐式转换依据。
+    每次GET结果及execution提交快照不可变；资源重载只影响后续GET，不回查替换已提交工具定义/策略。
+
+异步与取消：
+    AgentBlockStorageHandle.execute拥有完整requestData及namespace，blocking worker执行AgentBlockStorage.execute。
+    提交前登记scope Other；提交失败只撤销未启动登记，worker已启动必须等真实join及事务事实才mark_completed。
+    MCL pending可等待/取消但不重复登记另一数据库活动；Driver停止等待Other真实收口。
+    取消请求不等于rollback，更不允许丢弃Future就释放活动。commit已确认则显式已提交，未提交已确认才报告未提交，无法确认则CommitUnknown。
+    success只在COMMIT确认且connection处于autocommit后返回，commit后不再检查取消；不会为消除取消竞态补写或重跑已提交命令。
+    事务body失败或commit错误均显式执行ROLLBACK并检查autocommit；不以Transaction Drop忽略错误的行为证明清理。
+    清理完成但commit事实未知返回CommitUnknown；rollback失败或事务未关闭返回CleanupFailed，并共享retired标记拒绝所有clone及history视图继续IO。
+    CleanupFailed表示真实清理失败，不是已完成或已取消；调用方需将Other活动收口为cleanup failure，不能假mark_completed。
+
+历史边界：
+    message仅显式history_append写入；推理、tool_call、GET/INJECT不隐式append消息。
+    MCL自动指令审计仍由MCL发起，其payload消息不是独立message记录。
+    history_append批次自有一个事务；Block与历史不同指令之间没有跨事务原子保证，即使共文件也不能声称一起提交。
+```
+
+# events
+
+## 逻辑
+
+本模块不定义写入事件或转发事件，异步调用返回共享类型化结果，MCL/Agent原有请求关联、pending和生命周期结果链负责回执。不恢复旧MemoryError事件、AgentMemory写入事件、history_messages转发系统或通过观察事件证明commit/cleanup。
+
+# types
+
+## 共享接口
+
+```text
+AgentDatabaseHandle：共享opaque可克隆数据库能力
+    history() -> AgentHistoryHandle
+    block_storage() -> AgentBlockStorageHandle
+    说明：两个视图共文件分表及connection manager，具体SQLite不进入共享types。
+
+AgentBlockStorage：共享阻塞trait，Send + Sync + 'static
+    execute(&self, request: BlockStorageRequest) -> Result<StoredBlockResult, BlockStorageError>
+        仅blocking worker调用，完整机械契约见共享types与Block领域设计。
+
+AgentBlockStorageHandle：共享async存储入口
+    execute(&self, request: BlockStorageRequest) -> impl Future<Output = Result<StoredBlockResult, BlockStorageError>>
+        调度worker且保留真实join与事务结果，不在ECS主线程IO。
+
+StoredBlockInner：Message(Vec<AgentMessage>) / Tool(Vec<ResourceID>) / Sandbox(Vec<ResourceID>)
+BlockOpened：block_id: String, created: bool, temporary: bool
+    CREATE返回此值，而非无区别Unit；created仅标本namespace首次创建。
+
+AgentHistoryStore：现有只追加共享trait，Send + Sync + 'static
+    append_batch(&self, records: Vec<HistoryRecord>) -> Result<(), HistoryError>
+    list(&self) -> Result<Vec<HistoryRecord>, HistoryError>
+    说明：历史同步底层接口仍保留；MCL调用与读取目标在blocking worker，不再直接同步阻塞ECS。
 ```
 
 ## SQLite schema
+
+历史表现有schema完整保留：
 
 ```sql
 CREATE TABLE IF NOT EXISTS history_records (
@@ -38,33 +135,55 @@ CREATE TABLE IF NOT EXISTS history_records (
 );
 ```
 
-序号仅用于稳定排序，不是领域记录字段。`list()` 按 sequence ASC 返回完整记录快照。
-`turn` 保留可选字符串，payload 以 JSON 编码存储并在读取时解码为 Value。
-时间戳、message、tool schema、usage 等领域元数据如需持久化，由写入方显式放入 payload。
-新数据库不创建 state 表；打开旧数据库不会迁移或删除既有表。
+序号仅用于稳定排序，不是领域记录字段。list按sequence ASC返回完整记录快照；turn保留可选字符串，payload按JSON编码并解码为Value。时间戳、message、tool schema及usage元数据由调用方显式放入payload。新数据库不创建旧state表；打开旧数据库不删除既有表。
 
-## 原子写入与幂等
+Block已实现schema：
 
-先检查全部 key 非空；空批成功。非空批在 `Arc<Mutex<Connection>>` 下开启 Immediate 事务。
-逐条按 key 查询已存在记录（包括当前事务刚写入的记录），比较完整 HistoryRecord：
+```sql
+CREATE TABLE IF NOT EXISTS block_definitions (
+    id INTEGER PRIMARY KEY,
+    agent TEXT NOT NULL,
+    instance TEXT NOT NULL,
+    name TEXT NOT NULL CHECK(length(name) > 0),
+    temporary INTEGER NOT NULL CHECK(temporary IN (0, 1)),
+    schema_json TEXT NOT NULL,
+    UNIQUE(agent, instance, name),
+    CHECK(temporary = 1 OR instance = '')
+);
+CREATE TABLE IF NOT EXISTS block_fields (
+    definition_id INTEGER NOT NULL REFERENCES block_definitions(id),
+    name TEXT NOT NULL CHECK(length(name) > 0),
+    inner_type TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    PRIMARY KEY(definition_id, name)
+);
+```
 
-- 相同记录跳过，不生成新序号；JSON 使用 Value 比较而非字符串比较。
-- 不同记录返回 KeyConflict，事务回滚全部新增行。
-- 无已有 key 才执行 INSERT，保存所有字段。
-- 全部成功才 commit；SQL 或编码错误返回 WriteFailed 并回滚。
+persistent的instance为空字符串；TEMP的instance为完整Driver身份tuple的JSON。schema_json保存字段名/类型的canonical BTreeMap；每field一行typed array JSON，MESSAGE保留完整消息，TOOL/SANDBOX仅保存ResourceID。open启用foreign_keys，并在Immediate事务内校验列、类型、NOT NULL、主键、外键及非partial唯一键；不兼容旧表失败且不重建。CREATE验证schema、字段数量和已存typed值；lifecycle跨instance冲突在同一写事务查询metadata后拒绝。
 
-Immediate 事务防止不同连接在检查 key 与 INSERT 之间交错写入；忙等待为并发连接提供等待窗口。
-Clone 共享同一连接和互斥锁，AgentHistoryHandle 可将存储抽象跨线程传递。
+## 历史原子写入与幂等
 
-## 替代旧接口
+先检查全部key非空，空批成功。非空批在共享连接短锁下开启Immediate事务（现实现Arc<Mutex<Connection>>），逐条按key查询，包含本事务刚写入记录，并比较完整HistoryRecord：
 
-旧 AgentMemory/history_messages/set_state/state_value、写入事件、转发系统与 MemoryError 已移除。
-Agent 创建 SqliteHistoryStore 并保存 AgentHistoryHandle，效果处理直接同步调用 append_batch，
-根据返回结果决定是否继续领域状态提交。展示层读取 handle.list() 并在领域或 DTO 层转换，
-不从实时状态恢复或拼接历史。
+- 相同记录跳过且不生成新序号；JSON使用Value比较而非字符串比较。
+- 不同记录返回KeyConflict，回滚全部新增行。
+- 无已有key才INSERT并保存所有字段；全部成功才commit。
+- SQL或编码失败返回WriteFailed；已确认未提交才陈述rollback，目标未知commit不能伪称未写入。
 
-## 测试
+Immediate事务防止不同连接在key检查与INSERT间交错，忙等待提供等待窗口。Clone共享连接/manager，AgentHistoryHandle跨线程传递。展示层读取list后在领域/DTO转换，不从实时状态恢复拼接历史。旧AgentMemory/history_messages/set_state/state_value接口不恢复。
 
-内置测试覆盖重开持久化、JSON 和 turn 保存、表边界、同批及跨批幂等、JSON 对象顺序、
-完整字段冲突、整批回滚、数据库失败、空 key、稳定序号和线程共享。
-公开集成测试覆盖无 Agent/Runtime 的外部调用、trait handle 的原子冲突语义与纯历史表。
+## 验证契约
+
+现有测试覆盖重开持久化、JSON及turn、表边界、同批/跨批幂等、对象顺序、完整字段冲突、整批回滚、数据库失败、空key、稳定序号与线程共享；公开集成测试覆盖无Agent/Runtime外部调用及trait handle原子冲突语义。
+
+当前memory crate测试共27项通过：包含persistent重开完整MESSAGE（递归inject、System、工具关联、usage/cache_hit_tokens=0）及TOOL/SANDBOX canonical IDs、TEMP instance隔离及同instance幂等、跨instance lifecycle冲突保护旧TEMP、schema/range/type/SQL失败保留数据、self-source先读后替换、跨connection多selector同snapshot、async handle与history视图同manager、取消前无修改及已提交成功不翻转。坏schema测试覆盖partial UNIQUE、错误id主键、缺FK及可空列；SQLite authorizer真实拒绝ROLLBACK测试验证CleanupFailed、仍未关闭事务及两视图retired后拒绝IO。
+
+测试没有通过注入磁盘故障证明每种CommitUnknown，也不把成功后取消测试称为精确commit中间竞态注入。Other登记/Driver停止的端到端验证属于调用方，不由memory的测试替代。
+
+# error
+
+## 逻辑
+
+HistoryError保留KeyConflict/WriteFailed/InvalidRecord，新增CommitUnknown与CleanupFailed，不包含旧实时state错误。BlockStorageError区分SchemaMismatch/LifecycleMismatch/BlockMissing/FieldMissing/TypeMismatch/InvalidRange/InvalidRequest/Cancelled/CommitUnknown/CleanupFailed/Io；open返回该错误类型，不导出另一DatabaseError。资源resolve由MCL基于本次导入快照执行，不在SQLite backend内加载资源。
+
+Cancelled仅在提交前且事务已确认结束时返回；commit I/O类错误可能返回CommitUnknown，普通SQL错误不一律升级unknown。CommitUnknown表示事务已清理、提交事实无法确认，不降级成Cancelled/已回滚；CleanupFailed表示清理无法确认且连接被retire，不允许继续IO。失败不清空持久数据、不自动销毁Agent、不自动重试或重跑外部效果。历史失败由原history_append或审计请求报告，不覆盖已完成工具真实结果。

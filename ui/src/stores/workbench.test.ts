@@ -74,6 +74,13 @@ test('protocol accepts new structured error and terminal, rejects old transport 
     )?.type,
     'agent.message.finished',
   );
+  const opened = { BlockOpened: { block_id: 'Case-sensitive.block', created: false, temporary: true } };
+  const response = parseServerMessage(JSON.stringify({
+    type: 'mcl.command_result', id: 'block', source: 'client:local/a',
+    target: workspace.manager, result: { Ok: opened }, history_error: null,
+  }));
+  assert.ok(response?.type === 'mcl.command_result');
+  assert.deepEqual(response.result, { Ok: opened });
   assert.equal(
     parseServerMessage(
       JSON.stringify({

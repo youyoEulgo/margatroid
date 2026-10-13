@@ -373,6 +373,7 @@ impl ExecutionActivity {
 
 #[derive(Debug)]
 struct MclDrainData {
+    cleanup_error: Option<ExecutionError>,
     closed: bool,
     busy: bool,
     pending_cancel: Option<CancellationToken>,
@@ -395,6 +396,7 @@ impl AgentMclDrainHandle {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(MclDrainData {
+                cleanup_error: None,
                 closed: false,
                 busy: false,
                 pending_cancel: None,
@@ -409,7 +411,7 @@ impl AgentMclDrainHandle {
 
     pub fn is_drained(&self) -> bool {
         let data = lock(&self.inner);
-        !data.busy && data.pending_cancel.is_none()
+        data.cleanup_error.is_none() && !data.busy && data.pending_cancel.is_none()
     }
 
     /// Call before admitting a new command; no new queue entry is allowed on failure.
@@ -452,6 +454,13 @@ impl AgentMclDrainHandle {
         data.completion.notify_waiters();
     }
 
+    pub fn mark_cleanup_failed(&self, error: ExecutionError) {
+        let mut data = lock(&self.inner);
+        data.closed = true;
+        data.cleanup_error = Some(error);
+        data.completion.notify_waiters();
+    }
+
     pub async fn wait_drained(&self) -> Result<(), ExecutionError> {
         let completion = lock(&self.inner).completion.clone();
         loop {
@@ -460,6 +469,9 @@ impl AgentMclDrainHandle {
             {
                 let data = lock(&self.inner);
                 notified.as_mut().enable();
+                if let Some(error) = &data.cleanup_error {
+                    return Err(error.clone());
+                }
                 if !data.busy && data.pending_cancel.is_none() {
                     return Ok(());
                 }
@@ -662,6 +674,27 @@ mod tests {
         );
         worker.join().unwrap().unwrap().mark_completed().unwrap();
         scope.with_sandbox_switch(|| Ok(())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcl_cleanup_failure_wakes_waiters_without_success_proof() {
+        let drain = AgentMclDrainHandle::new();
+        drain.mark_busy().unwrap();
+        let error = ExecutionError::CleanupFailed {
+            activity_id: 0,
+            message: "transaction still open".into(),
+        };
+        let waiting = tokio::spawn({
+            let drain = drain.clone();
+            async move { drain.wait_drained().await }
+        });
+        tokio::task::yield_now().await;
+        drain.mark_cleanup_failed(error.clone());
+        assert_eq!(waiting.await.unwrap(), Err(error.clone()));
+        drain.mark_drained();
+        assert!(!drain.is_drained());
+        assert_eq!(drain.wait_drained().await, Err(error));
+        assert_eq!(drain.mark_busy(), Err(ExecutionError::Closed));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

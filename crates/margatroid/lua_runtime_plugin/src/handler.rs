@@ -627,6 +627,9 @@ fn to_ml_value(lua: &Lua, value: LuaValue) -> Result<MlValue, LuaRuntimeError> {
         LuaValue::String(value) => MlValue::String(lua.create_string(value).map_err(lua_error)?),
         LuaValue::Array(values) => {
             let table = lua.create_table().map_err(lua_error)?;
+            let metatable = lua.create_table().map_err(lua_error)?;
+            metatable.raw_set("__dsh_array", true).map_err(lua_error)?;
+            table.set_metatable(Some(metatable)).map_err(lua_error)?;
             for (index, value) in values.into_iter().enumerate() {
                 table
                     .set(index + 1, to_ml_value(lua, value)?)
@@ -653,6 +656,16 @@ fn from_ml_value(value: MlValue) -> Result<LuaValue, LuaRuntimeError> {
         MlValue::Number(value) => LuaValue::Number(value),
         MlValue::String(value) => LuaValue::String(value.to_str().map_err(lua_error)?.to_owned()),
         MlValue::Table(table) => {
+            let tagged_array = table
+                .metatable()
+                .map(|metatable| {
+                    metatable
+                        .raw_get::<MlValue>("__dsh_array")
+                        .map(|value| matches!(value, MlValue::Boolean(true)))
+                })
+                .transpose()
+                .map_err(lua_error)?
+                .unwrap_or(false);
             let mut integers = BTreeMap::new();
             let mut object = BTreeMap::new();
             for pair in table.pairs::<MlValue, MlValue>() {
@@ -675,7 +688,7 @@ fn from_ml_value(value: MlValue) -> Result<LuaValue, LuaRuntimeError> {
                     }
                 }
             }
-            if !integers.is_empty() {
+            if !integers.is_empty() || tagged_array {
                 if !object.is_empty() || integers.keys().copied().ne(1..=integers.len() as i64) {
                     return Err(failure(
                         LuaRuntimeErrorKind::ExecutionFailed,

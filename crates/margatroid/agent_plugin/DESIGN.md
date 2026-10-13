@@ -36,11 +36,11 @@ lib        src/lib.rs        Agent图书馆组件、实现方法与Plugin
 system     src/system.rs     启动和停止事件调度
 handler    src/handler.rs    生命周期及异常处理Handler
 events     共享types crate    agent_events.rs中的全部事件
-types      共享components及契约    状态机、配置、历史接口和运行时Block容器
+types      共享components及契约    状态机、配置、同文件历史视图和Block存储句柄
 error      共享错误契约       生命周期与历史写入错误
 ```
 
-**本轮共享基础已实现：Block仅保留MESSAGE/TOOL/SANDBOX三typed数组，Agent保存ImportBindings并提供统一受检alias预检、绑定和读取接口；资源定义及沙箱策略为不可变导入快照。System消息契约已补充，history_append原允许范围不变。旧RESOURCE/TOOL_CALL数组不再属于当前API。**
+**当前已实现三typed数组、System消息、统一RAM ImportBindings、真实SQLite Block、Agent.database句柄、异步storage与持久ID resolve。Agent不保存AgentBlock内存内容，history是同一store/connection manager的分表视图；GET解析当前已导入定义，已提交execution快照仍不变。history_append原允许范围不变。finish_turn已实现，旧finish拒绝。**
 
 Agent生命周期及此前共享组件迁移已实现。本文保留六板块契约格式；下列源码归属与差异说明以当前实现为准，未列为已实现的扩展契约不得视为可调用API。
 
@@ -52,7 +52,7 @@ Agent生命周期及此前共享组件迁移已实现。本文保留六板块契
 
 Agent图书馆组件、AgentInfo、AgentState及WorldAgentExt已定义在共享types的`agent_components.rs`；事件位于`agent_events.rs`。Plugin、System与生命周期Handler仍在Agent插件，不依赖LuaRuntime或MCL实现crate。
 
-当前共享基础拆分：AgentLua和Driver通知能力位于`lua_runtime_components.rs`，AgentExecutionScope及AgentMclDrainHandle位于`execution_components.rs`，AgentMclQueue位于`mcl_events.rs`，普通Block位于`block_types.rs`，历史追加接口位于`history_components.rs`。ExecutionError由共享AgentError映射，不产生插件依赖循环。AgentState当前采用Creating/Stopping具名字段变体，而非下面伪代码中的单独状态结构体。启动从共享MclEnvironmentFactory取得环境，使用显式路径的SQLite历史存储；本文保留的World扩展方法以共享trait实际导出为准，不宣称所有规划的兼容入口均已存在。
+当前共享基础拆分：AgentLua和Driver通知能力位于`lua_runtime_components.rs`，AgentExecutionScope及AgentMclDrainHandle位于`execution_components.rs`，AgentMclQueue位于`mcl_events.rs`，Block纯值位于`block_types.rs`，数据库句柄和类型化机械存储接口位于`block_storage.rs`，历史追加接口位于`history_components.rs`。ExecutionError由共享AgentError映射，不产生插件依赖循环。AgentState当前采用Creating/Stopping具名字段变体，而非下面伪代码中的单独状态结构体。启动从共享MclEnvironmentFactory取得环境，在blocking worker按显式history_path打开共用Block/history的SQLite数据库；本文保留的World扩展方法以共享trait实际导出为准，不宣称所有规划的兼容入口均已存在。
 
 ## 类型
 
@@ -65,8 +65,8 @@ Agent：Agent图书馆组件，公开Component--自身身份和运行数据的�
     sandbox: Option<SandboxValue>--当前选中的完整ID及不可变policy快照，None表示未激活；不另设active_policy字段
     state: AgentState--Agent生命周期及当前启动或停止操作
     lua: AgentLua--wake槽位、ready与ended暂存槽位和Driver关闭句柄，不复制VM状态
-    history: AgentHistoryHandle--历史表句柄，不含实时表或Block持久化接口
-    block: AgentBlock--仅保存普通Block的运行时容器，字段为MESSAGE/TOOL/SANDBOX typed数组
+    database: AgentDatabaseHandle--一个Agent真实SQLite数据库的opaque可克隆句柄，history_path所指同一文件及connection manager；不含Block内存内容
+    history: AgentHistoryHandle--database的只追加历史分表视图，与Block共文件而非共指令事务；不含实时表
     import_bindings: ImportBindings--Agent全域alias到ImportedValue的唯一权威绑定，存不可变快照/Arc而非重复资源正文
     execution: AgentExecutionScope--共享执行作用域，管理受理、根取消及活动真实完成等待
     mcl: AgentMclQueue--目标Agent的MCL指令FIFO队列、异步队首关联及收口通知
@@ -131,12 +131,11 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
         行为：受检寻址完整Entity，在execution短锁内检查对应受理门、登记活动并从Agent.sandbox选中的SandboxValue取得不可变沙箱策略快照，不用最新资源集合policy替换；Inference与Other不依赖沙箱
             返回活动cancel及完成能力，提交失败必须撤销未启动登记；提交成功后只能在真实清理完成时mark_completed
             不在World借用内await；普通runner、长期进程、Inference及Other都登记，停止统一等待，不用Future被丢弃代替清理
-    agent_operate_block(&mut self, agent: &ResourceID, operation: BlockOperation) -> Result<BlockOperationResult, AgentError>
-        操作Block：公开方法
-        行为：
-            定位唯一Agent Entity并取得block
-            调用Block容器对应的机械操作方法，保持字段类型和范围不变量
-            返回类型化结果或错误，不解析MCL，不按字段名称推断业务用途
+    agent_block_storage(&self, agent: &ResourceID) -> Result<AgentBlockStorageHandle, AgentError>
+        取得Block存储能力：公开方法
+        行为：定位唯一完整Agent Entity，取得database的storage视图；只做RAM寻址校验，不执行SQLite IO、不解析MCL、不按字段名推断用途。
+            调用方释放World借用后登记ExecutionActivityKind::Other并调用storage.execute(request).await；worker真实join后才mark_completed，停止等待真实数据库操作完成。
+            handle执行整次BlockStorageRequest，不能把GET多selector或INJECT读/mapcheck/replace拆成独立事务。
     agent_validate_import(&self, agent: &ResourceID, alias: &str, kind: InnerType, resource_id: &ResourceID) -> Result<(), AgentError>
         预检导入：公开方法，MCL与资源加载入口共用且不修改绑定。
         行为：定位完整Agent Entity，检查来源属于镜像依赖、kind匹配来源类型及Agent全域alias冲突。
@@ -149,13 +148,13 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
             同ID同kind只有加载/重载成功、快照准备完整后才更新绑定；失败不发布新值，不提交工具执行
             同ID重载改变alias时先检查新alias冲突，成功发布时移除旧alias绑定后写入新绑定，不留下同来源不同alias的分叉
             写入的是MESSAGE消息快照、CallableResource或SandboxValue；工具定义及策略使用Arc共享，不复制正文
-            旧Block/GET值不随绑定更新；沙箱激活或活动策略更新仍遵守原execution互斥，不由绑定更新绕过
+            数据库Block的TOOL/SANDBOX只存ID，后续GET按当前已导入ID resolve最新值；已完成GET及已提交execution不随绑定更新；沙箱激活或活动策略更新仍遵守原execution互斥，不由绑定更新绕过
     agent_get_import(&self, agent: &ResourceID, alias: &str) -> Result<BlockInner, AgentError>
         读取导入值：公开方法，由共享agent_components统一受检实现
         行为：定位完整Agent Entity，从唯一ImportBindings读取并返回对应typed数组快照；未知alias报错，不回查资源集合偷换快照
     agent_append_history_batch(&self, agent: &ResourceID, records: Vec<HistoryRecord>) -> Result<(), AgentError>
         批量追加历史：公开方法
-        行为：定位唯一Agent Entity，调用history.append_batch，在同一事务中按幂等键追加全部记录；失败全部回滚并映射HistoryWriteFailed
+        行为：保留同步受检facade，当前实现直接调用history.append_batch并映射HistoryWriteFailed，不是异步接口。MCL不在ECS主线程调用此同步SQL路径，而是取得owned历史句柄后在blocking worker追加；同一事务按幂等键处理全部记录，事务事实由backend错误保存。
             key包含完整Agent Entity、command id、kind及call id/index，同键同内容重试不重复追加，同键不同内容返回冲突
             指令审计事务成功才执行；message仅由显式history_append请求保存，写入失败返回该请求错误，不重做原指令或外部副作用
             只增量写历史，不覆盖旧记录、不维护实时表，也不自动停止或销毁Agent
@@ -187,7 +186,10 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
     Agent不执行ready、wake、wait或关闭操作；MCL取用通知槽位，LuaRuntime取用关闭句柄
     wake为常驻共享槽位，Driver宿主wait与MCL wake共享同一对象，不跨线程借用Agent组件
     ready暂存Sender，Receiver移入启动闭包；关闭句柄由LuaRuntime安装和使用，Agent仅保存
-    block仅包含普通Block，取消RefBlock、RefMerge和持久引用关系
+    database是唯一数据库句柄，不保存AgentBlock/BlockAssembly权威内存内容；所有普通Block都用同一真实SQLite backend，取消RefBlock/RefMerge，持久ID不是动态引用Block
+    默认CREATE BLOCK按稳定Agent ResourceID及block名持久open/validate不清空；CREATE TEMP BLOCK按完整Driver instance隔离，同instance重复CREATE检查schema且不清空，TEMP entry不恢复
+    同一可见block名不能以不同lifecycle重复声明，持久/TEMP冲突显式拒绝；BlockOpened.created仅标初建，工具配置及prompt/conversation仅初建填充，不覆盖恢复的conversation
+    alias/import bindings启动保持RAM空表并显式IMPORT；active sandbox初始None，恢复必须GET后显式sandbox_use；turn及MCL pending不恢复
     mcl保存目标Agent的指令队列，不复制Block或资源内容；不同来源的请求进入同一FIFO
     Agent只保存队列，入队、推进、异步收口及MCL结果发送由MCL插件负责
     历史句柄只提供追加历史能力，不沿用带实时state读写的旧AgentMemoryHandle
@@ -195,7 +197,7 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
 扩展归属与命名：
     WorldAgentExt及其World实现都在共享types中，调用方不需要依赖Agent插件
     领域提供的World扩展方法统一采用领域前缀：agent_xxx、workspace_xxx
-    历史批量追加为agent_append_history_batch，单条agent_append_history委托同一契约；沙箱切换为agent_switch_sandbox，活动登记为agent_register_activity，Block入口为agent_operate_block
+    历史批量追加为agent_append_history_batch，单条agent_append_history委托同一契约；沙箱切换为agent_switch_sandbox，活动登记为agent_register_activity，Block句柄入口为agent_block_storage
     校验封装在扩展内部，不要求每个调用者自行检查沙箱集合
     方法借用World而非取得所有权，返回后调用方自然继续使用World，不用返回World
     扩展只依赖共享组件、资源查询和历史抽象接口，不调用生命周期Handler、具体数据库或MCL解析器
@@ -205,7 +207,8 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
 
 MCL边界：
     不存在AgentControl入口，不转发MCL，不恢复长期VM邮箱投递
-    MCL解析命令后调用共享WorldAgentExt的agent_operate_block，通过block容器机械接口操作字段
+    MCL解析命令后调用共享WorldAgentExt.agent_block_storage取句柄，不在ECS主线程执行SQLite IO；释放World借用后异步storage.execute，在blocking worker处理事务
+    GET全部selector一次read transaction；INJECT同write transaction读snapshot/mapcheck/replace，commit后才success；Other活动保留到worker真实join，取消不能以丢弃Future宣称rollback，commit未知显式报告事实
     Agent插件不解释Block名称和内容用途，不代替MCL做语法解析
     同Agent按队首顺序执行，异步在途命令保留队首并设置pending；其他Agent独立推进
     Driver注入wait不进入MCL队列，不占用pending；队列不是Driver邮箱或Lua调用栈
@@ -261,14 +264,16 @@ crate公开：
 handle_start_agent(world: &mut World, request: StartAgent)
     处理启动请求：crate公开函数
     行为：
-        校验请求ID、Agent地址类型、成员定义和目标工作区完整Entity
+        校验请求ID、Agent地址类型、成员定义和目标工作区完整Entity；同一受理请求ID在数据库准备或Creating期间重复到达不重复启动。
+        数据库准备期间以私有PendingDatabases保存原请求及材料；同Agent地址的另一请求返回DuplicateAgent，不在worker完成前创建Agent Entity。
         按Agent地址查询已有实例，存在时返回DuplicateAgent，不覆盖旧实例
         从指定工作区Entity上的ResourceSet<AgentImage>按镜像ResourceID取得启动材料，不选择全局查询的首个匹配者
         取得模型配置、项目路径、Driver源码及声明的依赖地址，构造独立启动快照
-        准备历史表句柄，失败时返回HistorySetupFailed，不发VM请求
-        创建Agent Entity，通过受检图书馆入口挂载Agent，并挂载五种空资源集合
-        info保存配置，workspace保存工作区ResourceID，sandbox初始为空，lua初始化空wake槽位、空ready与ended暂存槽位和空关闭句柄，execution初始化共享开放作用域，block为空普通Block容器，import_bindings初始化为空唯一绑定表，mcl.commands为空VecDeque、mcl.pending为None、mcl.drained初始已收口，turn为None
-        生成VM启动子请求ID，先将原StartAgent请求ID和子请求ID写入Creating
+        异步blocking worker按现有history_path打开一个Agent SQLite数据库及Block/history分表，取得AgentDatabaseHandle与其AgentHistoryHandle视图；失败返回DatabaseSetupFailed，不发VM请求，ECS主线程不做SQLite IO
+        数据库准备结果按operation_id及完整Workspace Entity收口，再核对工作区逻辑身份、唯一寻址、启动受理门未关闭及Agent地址仍无占用；迟到或重复结果不推进其他请求。
+        通过复核后创建Agent Entity，通过受检图书馆入口挂载Agent，并挂载五种空资源集合
+        info保存配置，workspace保存工作区ResourceID，sandbox初始为空，lua初始化空wake槽位、空ready与ended暂存槽位和空关闭句柄，execution初始化共享开放作用域，database保存已打开句柄、history为同文件历史视图，不加载Block内容到Agent，import_bindings初始化为空唯一RAM绑定表，mcl.commands为空VecDeque、mcl.pending为None、mcl.drained初始已收口，turn为None
+        生成包含进程session nonce及单调序号的VM启动子请求ID，跨进程重启不复用TEMP instance；先将原StartAgent请求ID和子请求ID写入Creating
         整理注入环境，包含完整Agent Entity、Agent地址、启动配置及所需环境能力，提交StartDriverLuaVm
         提交VM前的任何失败均释放本次已创建Entity和句柄，发送关联原请求的StartAgentResult::Err
         不在发出VM请求后提前返回启动成功
@@ -487,7 +492,7 @@ AgentStopState：Agent停止过程，公开结构体--由state持有，不保存
 AgentStartDefinition：成员启动参数，公开共享契约
     project_root: PathBuf--项目工作目录
     home_root: PathBuf--主目录
-    history_path: PathBuf--历史表存储位置
+    history_path: PathBuf--沿用现有参数名，为一个Agent SQLite文件，含历史及Block分表；参数重命名不属于本轮docs
 
 AgentMclQueue：目标Agent指令队列，公开类型--随Agent定义于共享agent_components.rs，不是独立Component或Resource
     commands: VecDeque<MclCommand>--受理顺序排列，异步在途指令仍保留在队首
@@ -509,20 +514,22 @@ ImportBindings与ImportedValue：共享导入绑定契约，具体定义由types
     说明：ImportedValue::Message { resource_id, messages: Arc<[AgentMessage]> }保留prompt来源；Tool(CallableResource)/Sandbox(SandboxValue)由typed值自身保留来源ID，不重复身份字段。
         CallableResource保留resource_id、alias及Arc<CallableDefinitionSnapshot>，定义分Tool/Skill/Hook typed变体；SandboxValue保留resource_id及Arc策略。
         Callable定义固定描述、schema和路径等字段，不冻结路径对应的磁盘正文；执行仍按既有路径读取，不宣称文件内容版本快照。
-        ImportBindings.get提供只读alias查询，contains_resource只核对来源ID和kind，不以最新alias或definition替换旧Block快照。
-        同alias不同ID跨类型也拒绝；成功重载使新GET读取新值，旧Block持有旧快照不暗变；没有重复资源正文及额外registries。
+        ImportBindings.get提供只读alias查询，contains_resource核对来源ID和kind；持久Block GET另按ID/kind在当前已导入绑定resolve，未导入显式失败。
+        同alias不同ID跨类型也拒绝；成功重载使后续GET取得最新定义，已取GET及execution提交快照不暗变；没有重复资源正文及额外registries。
 
-AgentBlock：运行时Block容器，公开类型--仅承载普通Block，不是额外Component
-    blocks: BlockAssembly--普通Block存储，私有字段
-    说明：复用共享Block字段类型及范围检查，不保留RefBlockAssembly、RefBlock或RefMerge
-        类型和范围合法性由容器接口维护，MCL不绕过接口任意改内部map
-        字段只允许MESSAGE/TOOL/SANDBOX，删除RESOURCE/TOOL_CALL Block；ToolCall纯输入仍只属于Assistant.tool_calls，不构成GET数组
-        GET alias与selector lists由MCL按顺序取值并拼接同类型快照，mixed types先拒绝，空数组也保留type；不建立引用或新增MERGE机械操作
-        INJECT左侧使用相同GET规则，handler不按右侧目标字段做隐式类型转换
-        不保留实时表、state_bindings或数据库同步职责；完整机械方法契约在Block领域设计中维护
+AgentDatabaseHandle：Agent数据库句柄，公开opaque可克隆类型
+    说明：一个Agent一个真实SQLite文件及共享connection manager；只提供数据库能力，不在Agent中缓存AgentBlock内容。
+        history()取得AgentHistoryHandle，block_storage()取得AgentBlockStorageHandle，两者同文件分表；具体SQLite实现在memory_plugin，不进入共享types。
 
-BlockOperation与BlockOperationResult：共享Block领域的类型化操作和结果契约
-    说明：供agent_operate_block使用，具体变体随Block领域设计确定，不把任意JSON当作机械操作
+AgentBlockStorageHandle：共享异步Block存储视图，公开类型
+    execute(&self, request: BlockStorageRequest) -> impl Future<Output = Result<StoredBlockResult, BlockStorageError>>
+        行为：将完整类型化操作移入blocking worker，按共享Block机械类型/range契约事务执行；scope Other登记直到真实join收口。
+        字段只允许MESSAGE/TOOL/SANDBOX，MESSAGE结构化JSON，TOOL/SANDBOX存ID；ToolCall纯输入仍仅在Assistant.tool_calls。
+        GET多selector同read snapshot，空数组保留type，混合类型拒绝；INJECT同writeTx读取snapshot、mapcheck、replace，handler无隐式类型转换。
+        commit后success；取消保留已提交/未提交事实，未知commit显式CommitUnknown，不能伪rollback。完整机械方法由Block领域文档维护。
+
+BlockStorageRequest与StoredBlockResult：共享类型化存储操作及结果
+    说明：CREATE返回BlockOpened { created, temporary }，其余按共享Block契约返回typed stored数组，TOOL/SANDBOX ID在GET时resolve当前导入绑定；不把任意JSON当作机械操作。
 
 AgentExecutionScope：Agent执行作用域，公开可克隆共享句柄--定义及实现位于共享agent_components.rs
     inner: Arc<Mutex<AgentExecutionData>>--短锁维护受理门、根cancel、活动登记和完成等待通知，不跨await
@@ -608,13 +615,13 @@ HistoryRecord：历史增量记录，公开共享类型
 外部句柄：
     DriverCloseHandle由共享VM契约提供，Agent只存储，LuaRuntime负责安装与请求取消，停止闭包通过ended取得清理结果
     不提供Agent::ready、Agent::wake或Agent::close方法，不把这些动作加入WorldAgentExt
-    历史句柄取得方式由存储领域后续明确；允许通过公开工厂或依赖反转接口提供，不恢复实时表接口
+    历史句柄由AgentDatabaseHandle.history()取得同文件分表视图；启动open及MCL的SQL调用在blocking worker，不恢复实时state表接口
 
 移除旧聚合：
     AgentCreationState、AgentInitializationState、AgentLuaState和AgentLifecycleState由新的state和lua替代
     删除AgentResourceMap、AgentResourceEntry和Agent内复制的资源内容，以五种ResourceSet替代
     Agent不再包含AgentInferenceState、AgentToolState及其pending表；执行结果由所属领域管理，公共取消、沙箱互斥及真实完成等待统一在execution，不丢弃在执行任务
-    不在Agent保存AgentTurnState、TokenUsageState和last_error等旧聚合字段；只保留turn代号，start_turn生成并替换，finish清空
+    不在Agent保存AgentTurnState、TokenUsageState和last_error等旧聚合字段；只保留turn代号，start_turn生成并替换，finish_turn清空且空值幂等成功，旧finish拒绝
     MCL指令审计由MCL负责：除合法history_append外先记录成功才执行；message历史只由显式history_append控制，inference与tool_call不追加任何结果消息
     history_append自身采用批量事务接口，失败是该显式请求的错误；不隐式保存消息，不重跑已完成的推理或工具
     AgentMessage是共享types消息值，包含System（inject/system/user/assistant/tool_call/error），不实现旧路由Event；inject(Vec<AgentMessage>)递归同类型
@@ -624,7 +631,7 @@ HistoryRecord：历史增量记录，公开共享类型
     重复调用id、多个Assistant及工具alias冲突在任何submit前失败；tool_call effect不重复记输入Assistant，按call id/index记执行结果
     tool_call结果消息的resource_id为Option<ResourceID>，无匹配工具为None，不虚构资源地址；其余正文、usage及错误字段遵循共享消息值契约
     history_append允许范围独立保持inject/user/assistant/tool_call/error（包含inject递归内容校验），System不通过此effect追加；保留assistant usage和tool_call关联/失败详情，旧同名AgentMessage路由事件不继续
-    不保存实时数据库句柄，不在Agent定义MCL转发和字段业务用途
+    Agent仅保存database句柄及history视图，不保存Block内存内容、不定义MCL转发和字段业务用途；历史与Block不同指令不保证跨事务原子性
 ```
 
 # error
@@ -642,7 +649,8 @@ AgentErrorKind：Agent生命周期及受检访问错误分类，公开枚举
     WorkspaceNotAlive
     ImageNotLoaded
     ResourceSetupFailed
-    HistorySetupFailed
+    HistorySetupFailed--现有历史setup错误基线
+    DatabaseSetupFailed--同文件Block/history打开失败
     DriverStartFailed
     DriverStopFailed
     ResourceResolutionFailed

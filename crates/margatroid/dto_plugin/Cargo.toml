@@ -14,4 +14,5 @@ margatroid_types = { path = "../types" }
 serde_json = { workspace = true }
 server_plugin = { path = "../../mecs/server_plugin" }
 tracing = { workspace = true }
+tokio = { workspace = true }
 resource_id_plugin = { path = "../resource_id_plugin" }

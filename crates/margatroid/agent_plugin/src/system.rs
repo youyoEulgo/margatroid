@@ -13,6 +13,14 @@ pub fn start_agent_system(world: &mut World) {
     for request in requests {
         handle_start_agent(world, request);
     }
+    let database_results: Vec<_> = world
+        .event_reader::<Result<DatabaseSetupOutput, DatabaseSetupError>>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for result in database_results {
+        handle_database_setup_result(world, result);
+    }
     let results: Vec<_> = world
         .event_reader::<StartDriverLuaVmResult>()
         .into_iter()

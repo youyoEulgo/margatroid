@@ -16,6 +16,7 @@ pub enum AgentErrorKind {
     ImageNotLoaded,
     ResourceSetupFailed,
     HistorySetupFailed,
+    DatabaseSetupFailed,
     HistoryWriteFailed,
     DriverStartFailed,
     DriverStopFailed,
@@ -76,6 +77,18 @@ pub struct StartAgentResult {
     pub result: Result<Entity, AgentError>,
 }
 impl Event for StartAgentResult {}
+#[derive(Clone, Debug)]
+pub struct DatabaseSetupOutput {
+    pub operation_id: String,
+    pub workspace: Entity,
+    pub database: crate::block_storage::AgentDatabaseHandle,
+}
+#[derive(Clone, Debug)]
+pub struct DatabaseSetupError {
+    pub operation_id: String,
+    pub workspace: Entity,
+    pub error: AgentError,
+}
 #[derive(Clone, Debug)]
 pub struct StopAgent {
     pub id: String,

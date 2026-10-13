@@ -125,6 +125,14 @@ pub fn mcl_command_system(world: &mut World) {
     for output in outputs {
         complete_mcl_async(world, output);
     }
+    let cancelled = world
+        .event_reader::<MclCancelledOutput>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for output in cancelled {
+        complete_cancelled(world, output);
+    }
     let entities = world.query_with::<Agent>().result();
     for entity in entities {
         process_mcl_queue(world, entity);

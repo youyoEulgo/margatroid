@@ -1,5 +1,6 @@
 use crate::agent_events::{AgentError, AgentErrorKind};
-use crate::block_types::{AgentBlock, BlockInner, BlockOperation, BlockOperationResult, InnerType};
+use crate::block_storage::{AgentBlockStorageHandle, AgentDatabaseHandle};
+use crate::block_types::{BlockInner, InnerType};
 use crate::execution_components::{
     AgentExecutionScope, ExecutionActivity, ExecutionActivityKind, SandboxPolicySnapshot,
 };
@@ -74,6 +75,36 @@ impl ImportBindings {
     pub fn get(&self, alias: &str) -> Option<&ImportedValue> {
         self.bindings.get(alias)
     }
+    pub fn get_resource(
+        &self,
+        resource_id: &ResourceID,
+        kind: InnerType,
+    ) -> Option<&ImportedValue> {
+        self.bindings
+            .values()
+            .find(|value| value.resource_id() == resource_id && value.inner_type() == kind)
+    }
+    pub fn resource_value(
+        &self,
+        resource_id: &ResourceID,
+        kind: InnerType,
+    ) -> Option<ImportedValue> {
+        self.get_resource(resource_id, kind).cloned()
+    }
+    pub fn resolve_resource(
+        &self,
+        resource_id: &ResourceID,
+        kind: InnerType,
+    ) -> Result<BlockInner, AgentError> {
+        self.resource_value(resource_id, kind)
+            .map(|value| value.array())
+            .ok_or_else(|| {
+                AgentError::new(
+                    AgentErrorKind::ResourceResolutionFailed,
+                    format!("resource {resource_id} is not imported as {kind:?}"),
+                )
+            })
+    }
     pub fn contains_resource(&self, resource_id: &ResourceID, kind: InnerType) -> bool {
         self.bindings
             .values()
@@ -110,7 +141,7 @@ pub struct Agent {
     pub lua: crate::lua_runtime_components::AgentLua,
     pub state: AgentState,
     pub history: AgentHistoryHandle,
-    pub block: AgentBlock,
+    pub database: AgentDatabaseHandle,
     pub import_bindings: ImportBindings,
     pub mcl: AgentMclQueue,
     pub execution: AgentExecutionScope,
@@ -178,11 +209,7 @@ pub trait WorldAgentExt {
         value: ImportedValue,
     ) -> Result<(), AgentError>;
     fn agent_get_import(&self, id: &ResourceID, alias: &str) -> Result<BlockInner, AgentError>;
-    fn agent_operate_block(
-        &mut self,
-        id: &ResourceID,
-        operation: BlockOperation,
-    ) -> Result<BlockOperationResult, AgentError>;
+    fn agent_block_storage(&self, id: &ResourceID) -> Result<AgentBlockStorageHandle, AgentError>;
 }
 impl WorldAgentExt for World {
     fn agent_by_id(&self, id: &ResourceID) -> Result<Entity, AgentError> {
@@ -396,43 +423,20 @@ impl WorldAgentExt for World {
                 )
             })
     }
-    fn agent_operate_block(
-        &mut self,
-        id: &ResourceID,
-        operation: BlockOperation,
-    ) -> Result<BlockOperationResult, AgentError> {
+    fn agent_block_storage(&self, id: &ResourceID) -> Result<AgentBlockStorageHandle, AgentError> {
         let entity = self.agent_by_id(id)?;
-        let agent = self.get_component_mut::<Agent>(entity).unwrap();
-        let result = match operation {
-            BlockOperation::Create { id, fields } => agent
-                .block
-                .create(id, fields)
-                .map(|_| BlockOperationResult::Unit),
-            BlockOperation::Read { path, start, end } => agent
-                .block
-                .get(&path)
-                .and_then(|inner| inner.slice(start, end.unwrap_or(inner.len())))
-                .map(BlockOperationResult::Array),
-            BlockOperation::Replace {
-                path,
-                start,
-                end,
-                value,
-            } => agent
-                .block
-                .replace(&path, start, end, value)
-                .map(|_| BlockOperationResult::Unit),
-        };
-        result.map_err(|error| {
-            AgentError::new(AgentErrorKind::BlockOperationFailed, error.to_string())
-        })
+        Ok(self
+            .get_component::<Agent>(entity)
+            .unwrap()
+            .database
+            .block_storage())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_types::{BlockInner, BlockPath, InnerType};
+    use crate::block_types::{BlockInner, InnerType};
     use crate::execution_components::ExecutionAdmission;
     use crate::execution_components::ExecutionError;
     use crate::history_components::{AgentHistoryStore, HistoryError};
@@ -450,6 +454,17 @@ mod tests {
         }
         fn list(&self) -> Result<Vec<HistoryRecord>, HistoryError> {
             Ok(self.0.lock().unwrap().clone())
+        }
+    }
+    impl crate::block_storage::AgentBlockStorage for History {
+        fn execute(
+            &self,
+            _: crate::block_storage::BlockStorageRequest,
+        ) -> Result<crate::block_storage::StoredBlockResult, crate::block_storage::BlockStorageError>
+        {
+            Err(crate::block_storage::BlockStorageError::InvalidRequest(
+                "fixture has no block backend".into(),
+            ))
         }
     }
     fn id(value: &str) -> ResourceID {
@@ -479,6 +494,7 @@ mod tests {
             .unwrap();
         let agent_id = id("agent:local/test");
         let entity = app.world_mut().spawn();
+        let database = AgentDatabaseHandle::new(History::default());
         let agent = Agent {
             resourceid: agent_id.clone(),
             info: AgentInfo {
@@ -503,8 +519,8 @@ mod tests {
             sandbox: None,
             lua: Default::default(),
             state: AgentState::Running,
-            history: AgentHistoryHandle::new(History::default()),
-            block: Default::default(),
+            history: database.history(),
+            database,
             import_bindings: Default::default(),
             mcl: Default::default(),
             execution: Default::default(),
@@ -1052,82 +1068,24 @@ mod tests {
         }
     }
     #[test]
-    fn typed_block_operations_and_failure_paths_are_non_mutating() {
-        let (mut app, entity, agent_id) = app(false);
-        app.world_mut()
-            .agent_operate_block(
-                &agent_id,
-                BlockOperation::Create {
-                    id: "tool".into(),
-                    fields: vec![("available".into(), InnerType::Sandbox)],
-                },
-            )
-            .unwrap();
-        let path = BlockPath {
-            block_id: "tool".into(),
-            inner_id: "available".into(),
-        };
-        let value = BlockInner::Sandbox(vec![sandbox("first")]);
-        app.world_mut()
-            .agent_operate_block(
-                &agent_id,
-                BlockOperation::Replace {
-                    path: path.clone(),
-                    start: 0,
-                    end: 0,
-                    value: value.clone(),
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            app.world_mut()
-                .agent_operate_block(
-                    &agent_id,
-                    BlockOperation::Read {
-                        path: path.clone(),
-                        start: 0,
-                        end: None
-                    }
-                )
-                .unwrap(),
-            BlockOperationResult::Array(value)
-        );
-        let before = app
-            .world()
-            .get_component::<Agent>(entity)
-            .unwrap()
-            .block
-            .clone();
-        assert_eq!(
-            app.world_mut()
-                .agent_operate_block(
-                    &agent_id,
-                    BlockOperation::Replace {
-                        path: path.clone(),
-                        start: 0,
-                        end: 1,
-                        value: BlockInner::Tool(vec![])
-                    }
-                )
-                .unwrap_err()
-                .kind,
-            AgentErrorKind::BlockOperationFailed
-        );
-        assert_eq!(
-            app.world().get_component::<Agent>(entity).unwrap().block,
-            before
-        );
+    fn database_view_lookup_is_checked_and_history_shares_the_store() {
+        let (app, entity, agent_id) = app(false);
+        app.world().agent_block_storage(&agent_id).unwrap();
         assert!(app
-            .world_mut()
-            .agent_operate_block(
-                &agent_id,
-                BlockOperation::Read {
-                    path,
-                    start: 3,
-                    end: None
-                }
-            )
+            .world()
+            .agent_block_storage(&id("agent:local/missing"))
             .is_err());
+        let agent = app.world().get_component::<Agent>(entity).unwrap();
+        let record = HistoryRecord {
+            key: "shared-view".into(),
+            source: "test".into(),
+            turn: None,
+            kind: "test".into(),
+            content: "same store".into(),
+            payload: serde_json::Value::Null,
+        };
+        agent.database.history().append(record.clone()).unwrap();
+        assert_eq!(agent.history.list().unwrap(), vec![record]);
     }
     #[test]
     fn new_turn_updates_agent_and_history_append_uses_its_own_handle() {

@@ -31,6 +31,8 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 本文协议已迁移到共享AgentMessage、ResourceID及MclInstruction，不保留旧邮箱、默认可见性和Workflow入口。README描述当前wire与构造API。
 
+数据库Block已实现：CREATE BLOCK持久打开、CREATE TEMP BLOCK启动隔离；MclValue新增BlockOpened {block_id, created, temporary}，Lua/网络保持外层BlockOpened标签。轮次结束指令为finish_turn，旧finish已拒绝。DTO在ECS只捕获组件元数据，历史读取在blocking worker，具名共享完成事件唤醒收口；Protocol转换只消费提供的数据，不隐藏SQLite访问。
+
 本轮三类型数组与System消息已实现：MCL仅MESSAGE/TOOL/SANDBOX，显式IMPORT与alias求值；tool_call以单条assistant消息数组为第一参数。网络与Lua资源出站都采用安全投影，TOOL仅resource_id/alias/description/input_schema，SANDBOX仅resource_id，不泄漏脚本路径或policy，也不能将出站对象当作可信入站快照。
 
 实现说明：HistoryRecord目前不含持久sequence和创建时间；HistoryMessageDto.sequence按list顺序投影为1-based，created_at_ms固定为0表示未知。Stream使用完整Entity generation生成agent_instance，并通过agent.message.finished明确终态；终态不是操作完成权威。
@@ -159,7 +161,7 @@ StreamDeltaDto：推理增量，公开契约
 
 ```text
 客户端命令族：注册、Workspace启动/停止、MCL命令、状态及历史查询。
-移除visibility来源操作、旧turn中止查表及Workflow热插拔旧路由；轮次变化走MCL start_turn/finish。
+移除visibility来源操作、旧turn中止查表及Workflow热插拔旧路由；轮次变化走MCL start_turn/finish_turn。
 外部mcl.command一次一条，不允许网络上传Lua源码或取得执行句柄。
 状态同步与历史读取不会修改执行状态，不从工具名称恢复全局ResourceMap。
 认证和访问权限另属入口控制，source绑定只保证请求来源与连接一致，不冒充完整认证系统。

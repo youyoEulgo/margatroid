@@ -1,10 +1,9 @@
 use crate::*;
 use app_runtime_plugin::WorldEventExt;
-use core_plugin::{Component, Entity, World};
+use async_runtime_plugin::WorldAsyncExt;
+use core_plugin::{Component, Entity, Resource, World};
 use margatroid_types::{
-    block_types::AgentBlock,
     execution_components::AgentExecutionScope,
-    history_components::AgentHistoryHandle,
     lua_environment::{
         LuaBindingValue, LuaEnvironment, LuaGlobalBinding, LuaProgram, LuaStandardLibraries,
         LuaValue,
@@ -23,8 +22,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 struct HandledExceptions(HashSet<String>);
 impl Component for HandledExceptions {}
 fn next_id(kind: &str) -> String {
+    static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    format!("agent:{kind}:{}", NEXT.fetch_add(1, Ordering::Relaxed))
+    let session = SESSION.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must follow Unix epoch")
+            .as_nanos();
+        format!("{}:{nanos}", std::process::id())
+    });
+    format!(
+        "agent:{kind}:{session}:{}",
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 fn error(kind: AgentErrorKind, message: impl Into<String>) -> AgentError {
     AgentError::new(kind, message)
@@ -127,6 +137,12 @@ fn environment(agent: &Agent, entity: Entity) -> LuaEnvironment {
 }
 
 pub fn handle_start_agent(world: &mut World, request: StartAgent) {
+    if world.get_resource::<PendingDatabases>().is_some_and(|pending| pending.0.values().any(|value| value.request.id == request.id))
+        || world.query_with::<Agent>().result().into_iter().any(|entity| {
+            matches!(&world.get_component::<Agent>(entity).unwrap().state, AgentState::Creating { request_id, .. } if request_id == &request.id)
+        }) {
+        return;
+    }
     let prepared = (|| {
         if request.id.is_empty()
             || request.resource_id.resource_type() != "agent"
@@ -146,10 +162,19 @@ pub fn handle_start_agent(world: &mut World, request: StartAgent) {
                 "member paths must be explicit and nonempty",
             ));
         }
-        if world.query_with::<Agent>().result().into_iter().any(|entity| {
-            matches!(&world.get_component::<Agent>(entity).unwrap().state, AgentState::Creating { request_id, .. } if request_id == &request.id)
-        }) {
-            return Err(error(AgentErrorKind::InvalidRequest, "start request ID already in flight"));
+        if world
+            .get_resource::<PendingDatabases>()
+            .is_some_and(|pending| {
+                pending
+                    .0
+                    .values()
+                    .any(|value| value.request.resource_id == request.resource_id)
+            })
+        {
+            return Err(error(
+                AgentErrorKind::DuplicateAgent,
+                "agent address already preparing",
+            ));
         }
         let existing = world
             .find_resource_entities(&request.resource_id)
@@ -196,17 +221,15 @@ pub fn handle_start_agent(world: &mut World, request: StartAgent) {
                 )
             })?
             .build();
-        let history = memory_plugin::SqliteHistoryStore::open(&request.definition.history_path)
-            .map_err(|e| error(AgentErrorKind::HistorySetupFailed, e.to_string()))?;
-        Ok((
-            workspace_id,
-            entry,
-            image,
-            AgentHistoryHandle::new(history),
-            mcl_environment,
-        ))
+        if entry.is_closed() {
+            return Err(error(
+                AgentErrorKind::WorkspaceNotAlive,
+                "workspace admission closed",
+            ));
+        }
+        Ok((workspace_id, image, mcl_environment))
     })();
-    let (workspace, execution_entry, image, history, mut mcl_environment) = match prepared {
+    let (workspace, image, mcl_environment) = match prepared {
         Ok(value) => value,
         Err(error) => {
             world.send_event(StartAgentResult {
@@ -216,6 +239,139 @@ pub fn handle_start_agent(world: &mut World, request: StartAgent) {
             return;
         }
     };
+    let operation_id = next_id("database");
+    let path = request.definition.history_path.clone();
+    let target = request.workspace;
+    if !world.contains_resource::<PendingDatabases>() {
+        world.insert_resource(PendingDatabases::default());
+    }
+    world
+        .get_resource_mut::<PendingDatabases>()
+        .unwrap()
+        .0
+        .insert(
+            operation_id.clone(),
+            PendingDatabase {
+                request,
+                workspace,
+                image,
+                mcl_environment,
+            },
+        );
+    let events = world.event_sender();
+    world.spawn_async_service(async move {
+        let result =
+            tokio::task::spawn_blocking(move || memory_plugin::SqliteAgentDatabase::open(path))
+                .await
+                .map_err(|e| error(AgentErrorKind::DatabaseSetupFailed, e.to_string()))
+                .and_then(|result| {
+                    result.map_err(|e| error(AgentErrorKind::DatabaseSetupFailed, e.to_string()))
+                })
+                .map(|store| DatabaseSetupOutput {
+                    operation_id: operation_id.clone(),
+                    workspace: target,
+                    database: margatroid_types::block_storage::AgentDatabaseHandle::new(store),
+                })
+                .map_err(|error| DatabaseSetupError {
+                    operation_id,
+                    workspace: target,
+                    error,
+                });
+        events.send_event(result);
+    });
+}
+
+#[derive(Default)]
+struct PendingDatabases(BTreeMap<String, PendingDatabase>);
+impl Resource for PendingDatabases {}
+struct PendingDatabase {
+    request: StartAgent,
+    workspace: resource_id_plugin::ResourceID,
+    image: AgentImage,
+    mcl_environment: LuaEnvironment,
+}
+
+pub fn handle_database_setup_result(
+    world: &mut World,
+    result: Result<DatabaseSetupOutput, DatabaseSetupError>,
+) {
+    let (operation_id, target) = match &result {
+        Ok(output) => (&output.operation_id, output.workspace),
+        Err(error) => (&error.operation_id, error.workspace),
+    };
+    let Some(pending) = world
+        .get_resource_mut::<PendingDatabases>()
+        .and_then(|pending| {
+            if pending
+                .0
+                .get(operation_id)
+                .is_some_and(|value| value.request.workspace == target)
+            {
+                pending.0.remove(operation_id)
+            } else {
+                None
+            }
+        })
+    else {
+        return;
+    };
+    let PendingDatabase {
+        request,
+        workspace,
+        image,
+        mut mcl_environment,
+    } = pending;
+    let attached = (|| {
+        let database = result.map_err(|error| error.error)?.database;
+        let component = world.get_component::<Workspace>(target).ok_or_else(|| {
+            error(
+                AgentErrorKind::WorkspaceNotAlive,
+                "workspace missing after database setup",
+            )
+        })?;
+        if component.resource_id() != &workspace
+            || world
+                .find_resource_entities(&workspace)
+                .map_err(|e| error(AgentErrorKind::ResourceResolutionFailed, e.to_string()))?
+                != vec![target]
+        {
+            return Err(error(
+                AgentErrorKind::WorkspaceNotAlive,
+                "workspace identity changed",
+            ));
+        }
+        let entry = world
+            .workspace_start_entry(target, &request.id)
+            .map_err(|e| error(AgentErrorKind::WorkspaceNotAlive, e.to_string()))?;
+        if entry.is_closed() {
+            return Err(error(
+                AgentErrorKind::WorkspaceNotAlive,
+                "workspace admission closed",
+            ));
+        }
+        if !world
+            .find_resource_entities(&request.resource_id)
+            .map_err(|e| error(AgentErrorKind::ResourceResolutionFailed, e.to_string()))?
+            .is_empty()
+        {
+            return Err(error(
+                AgentErrorKind::DuplicateAgent,
+                "agent address occupied during database setup",
+            ));
+        }
+        Ok((database, entry))
+    })();
+    let (database, execution_entry) = match attached {
+        Ok(value) => value,
+        Err(error) => {
+            world.send_event(StartAgentResult {
+                id: request.id,
+                result: Err(error),
+            });
+            return;
+        }
+    };
+    let history = database.history();
     let entity = world.spawn();
     let vm_request_id = next_id("start");
     let agent = Agent {
@@ -236,7 +392,7 @@ pub fn handle_start_agent(world: &mut World, request: StartAgent) {
             vm_request_id: vm_request_id.clone(),
         },
         history,
-        block: AgentBlock::default(),
+        database,
         mcl: AgentMclQueue::default(),
         execution: AgentExecutionScope::new(),
         turn: None,

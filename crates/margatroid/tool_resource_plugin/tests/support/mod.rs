@@ -1,25 +1,30 @@
 use core_plugin::{App, Entity};
 use margatroid_types::agent_components::{Agent, AgentInfo, AgentState};
-use margatroid_types::history_components::{
-    AgentHistoryHandle, AgentHistoryStore, HistoryError, HistoryRecord,
-};
+use margatroid_types::block_storage::AgentDatabaseHandle;
 use margatroid_types::resource_components::AgentImageModelConfig;
+use memory_plugin::SqliteAgentDatabase;
 use resource_id_plugin::{ResourceID, WorldResourceExt};
 use std::sync::Arc;
 
-struct History;
-impl AgentHistoryStore for History {
-    fn append_batch(&self, _: Vec<HistoryRecord>) -> Result<(), HistoryError> {
-        Ok(())
-    }
-    fn list(&self) -> Result<Vec<HistoryRecord>, HistoryError> {
-        Ok(Vec::new())
-    }
-}
+#[derive(Default)]
+struct DatabaseFixtures(Vec<tempfile::TempDir>);
+impl core_plugin::Resource for DatabaseFixtures {}
 pub fn agent(app: &mut App, dependencies: &[&str]) -> (Entity, ResourceID) {
     app.world_mut().register_library::<Agent>("agent").unwrap();
     let entity = app.world_mut().spawn();
     let id = ResourceID::parse("agent:local/test").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let database = AgentDatabaseHandle::new(
+        SqliteAgentDatabase::open(root.path().join("agent.sqlite")).unwrap(),
+    );
+    if app.world().get_resource::<DatabaseFixtures>().is_none() {
+        app.world_mut().insert_resource(DatabaseFixtures::default());
+    }
+    app.world_mut()
+        .get_resource_mut::<DatabaseFixtures>()
+        .unwrap()
+        .0
+        .push(root);
     let agent = Agent {
         resourceid: id.clone(),
         info: AgentInfo {
@@ -44,8 +49,8 @@ pub fn agent(app: &mut App, dependencies: &[&str]) -> (Entity, ResourceID) {
         sandbox: None,
         lua: Default::default(),
         state: AgentState::Running,
-        history: AgentHistoryHandle::new(History),
-        block: Default::default(),
+        history: database.history(),
+        database,
         import_bindings: Default::default(),
         mcl: Default::default(),
         execution: Default::default(),

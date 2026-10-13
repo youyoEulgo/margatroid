@@ -11,6 +11,7 @@ use crate::MclError;
 pub enum ParsedOperation {
     Create {
         block_id: String,
+        temporary: bool,
         fields: Vec<FieldDeclaration>,
     },
     Get {
@@ -171,6 +172,12 @@ pub fn validate_identifier(value: &str) -> Result<(), MclError> {
 
 fn parse_create(body: &str) -> Result<ParsedOperation, MclError> {
     let (keyword, tail) = take_word(body);
+    let temporary = keyword == "TEMP";
+    let (keyword, tail) = if temporary {
+        take_word(tail)
+    } else {
+        (keyword, tail)
+    };
     if keyword != "BLOCK" {
         return Err(MclError::InvalidCommand);
     }
@@ -212,6 +219,7 @@ fn parse_create(body: &str) -> Result<ParsedOperation, MclError> {
     }
     Ok(ParsedOperation::Create {
         block_id: block_id.into(),
+        temporary,
         fields,
     })
 }
@@ -364,7 +372,7 @@ fn validate_arguments(arguments: &[Value], expected: usize) -> Result<(), MclErr
 
 pub fn effect_types(name: &str) -> Result<&'static [InnerType], MclError> {
     match name {
-        "wake" | "ready" | "start_turn" | "finish" => Ok(&[]),
+        "wake" | "ready" | "start_turn" | "finish_turn" => Ok(&[]),
         "inference" => Ok(&[InnerType::Message, InnerType::Tool]),
         "tool_call" => Ok(&[InnerType::Message, InnerType::Tool]),
         "history_append" => Ok(&[InnerType::Message]),

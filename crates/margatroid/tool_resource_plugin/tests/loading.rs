@@ -4,7 +4,11 @@ use async_runtime_plugin::AsyncRuntimePlugin;
 use closure_plugin::{AppClosureExt, ClosurePlugin};
 use core_plugin::{App, Entity};
 use margatroid_types::agent_components::{Agent, WorldAgentExt};
-use margatroid_types::block_types::{BlockInner, BlockOperation, BlockPath, InnerType};
+use margatroid_types::block_storage::{
+    BlockExpression, BlockRange, BlockSchema, BlockSelector, BlockSource, BlockStorageContext,
+    BlockStorageOperation, BlockStorageRequest, StoredBlockInner, StoredBlockResult,
+};
+use margatroid_types::block_types::{BlockInner, BlockPath, InnerType};
 use margatroid_types::execution_components::{AgentExecutionScope, ExecutionActivityKind};
 use margatroid_types::resource_events::ToolResourceTaskError;
 use margatroid_types::resource_events::{
@@ -395,37 +399,52 @@ fn import(
     assert_eq!(scope.activity_count(), 0);
     result
 }
-#[test]
-fn typed_import_reload_rename_preserves_block_snapshot_and_failed_reload() {
+#[tokio::test]
+async fn typed_import_reload_rename_preserves_block_snapshot_and_failed_reload() {
     let root = fixture();
     let mut app = app(&root);
     let (target, id) = support::agent(&mut app, &["tool:local/sample"]);
     import(&mut app, target, "old", InnerType::Tool).unwrap();
     let old = app.world().agent_get_import(&id, "old").unwrap();
     assert!(matches!(&old, BlockInner::Tool(v) if v.len() == 1 && v[0].alias == "old"));
-    app.world_mut()
-        .agent_operate_block(
-            &id,
-            BlockOperation::Create {
-                id: "saved".into(),
+    let storage = app.world().agent_block_storage(&id).unwrap();
+    let context = BlockStorageContext {
+        agent: id.clone(),
+        instance: margatroid_types::lua_runtime_components::DriverLuaVmInstance {
+            owner: target,
+            start_request_id: "fixture".into(),
+        },
+    };
+    storage
+        .execute(BlockStorageRequest {
+            context: context.clone(),
+            operation: BlockStorageOperation::Create(BlockSchema {
+                name: "saved".into(),
                 fields: vec![("tools".into(), InnerType::Tool)],
-            },
-        )
+                temporary: false,
+            }),
+            cancel: Default::default(),
+        })
+        .await
         .unwrap();
     let path = BlockPath {
         block_id: "saved".into(),
         inner_id: "tools".into(),
     };
-    app.world_mut()
-        .agent_operate_block(
-            &id,
-            BlockOperation::Replace {
-                path: path.clone(),
-                start: 0,
-                end: 0,
-                value: old.clone(),
+    let stored = StoredBlockInner::from(old.clone());
+    storage
+        .execute(BlockStorageRequest {
+            context: context.clone(),
+            operation: BlockStorageOperation::Inject {
+                source: BlockExpression::Sources(vec![BlockSource::Values(stored.clone())]),
+                target: BlockSelector {
+                    path: path.clone(),
+                    range: BlockRange::Empty,
+                },
             },
-        )
+            cancel: Default::default(),
+        })
+        .await
         .unwrap();
     fs::write(
         root.join("tools/local/sample/latest/tool.toml"),
@@ -435,13 +454,22 @@ fn typed_import_reload_rename_preserves_block_snapshot_and_failed_reload() {
     import(&mut app, target, "renamed", InnerType::Tool).unwrap();
     assert!(app.world().agent_get_import(&id, "old").is_err());
     assert_eq!(
-        app.world()
-            .get_component::<Agent>(target)
-            .unwrap()
-            .block
-            .get(&path)
+        storage
+            .execute(BlockStorageRequest {
+                context,
+                operation: BlockStorageOperation::Get {
+                    expressions: vec![BlockExpression::Sources(vec![BlockSource::Selector(
+                        BlockSelector {
+                            path,
+                            range: BlockRange::All
+                        },
+                    )])],
+                },
+                cancel: Default::default(),
+            })
+            .await
             .unwrap(),
-        &old
+        StoredBlockResult::Arrays(vec![stored]),
     );
     let updated = app.world().agent_get_import(&id, "renamed").unwrap();
     assert_ne!(updated, old);

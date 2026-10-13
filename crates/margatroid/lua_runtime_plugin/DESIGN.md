@@ -387,7 +387,9 @@ LuaEnvironment：环境描述，公开类型
         LuaProgram没有entry字段，执行整个chunk的exec_async；实际origin为Arc<PathBuf>
         LuaEnvironmentContext携带instance、values、wake、execution与mcl；LuaHostFunction.call(arguments, context, CancellationToken)返回Send HostFuture
         globals可绑定值或Arc<dyn LuaHostFunction>，modules通过本次注入require读取；宿主使用create_async_function，不建立block_on桥接
-        Lua空table保留Object(empty)，manual参数数组的空表解释由MCL已知数组上下文处理，不全局改变普通消息对象
+        宿主输出的LuaValue::Array（包括嵌套空数组）在Lua table metatable登记__dsh_array=true；返回宿主时读取该标记，空数组仍还原Array(empty)，不把Assistant.tool_calls=[]变成Object(empty)。标记不是消息字段或授权能力，Lua可修改它。
+        普通未标记Lua空table仍保留Object(empty)，manual参数数组的空表解释由MCL已知数组上下文处理，不按role或字段名猜测；标记数组的混合键和稀疏索引仍拒绝。
+        GET/推理结果可原样重新作为INJECT或history_append输入，Driver不需要删除tool_calls等合法字段来绕过数组桥接；此桥接不负责MCL语法或持久ID resolve。
 
 LuaRuntimeConfig：执行限制，公开类型
     max_source_bytes: usize--源码大小上限
