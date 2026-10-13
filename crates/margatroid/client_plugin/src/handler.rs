@@ -1,103 +1,117 @@
-use core_plugin::{Entity, World};
-use resource_id_plugin::{ResourceId, ResourceIdLookupError, ResourceRef, WorldResourceIdExt};
+use crate::{Client, ClientError, RegisteredClient, WorldClientExt};
+use core_plugin::World;
+use resource_id_plugin::{ResourceID, WorldResourceExt};
 use server_plugin::{
     RegisterConnection, WebSocketConnectionId, WebSocketConnections, WebSocketNameError,
 };
-
-use crate::{client_source, Client, ClientError, RegisteredClient};
 
 pub(crate) fn handle_client_registration(
     world: &mut World,
     connections: &WebSocketConnections,
     request: &RegisterConnection,
 ) -> Result<RegisteredClient, ClientError> {
-    let client_type = request.client_type.trim();
-    if !valid_client_type(client_type) {
+    if request.id.trim().is_empty() {
+        return Err(ClientError::InvalidRequest);
+    }
+    if !valid_client_type(&request.client_type) {
         return Err(ClientError::InvalidClientType);
     }
-    let resource_id =
-        client_resource_id(client_type, request.name.as_deref(), request.connection_id)?;
-    if matches!(
-        world.entity_by_resource_id(&resource_id),
-        Ok(_) | Err(ResourceIdLookupError::Duplicate { .. })
-    ) {
+    if connections
+        .get(request.connection_id)
+        .is_none_or(|sender| sender.is_closed())
+    {
+        return Err(ClientError::ConnectionMissing);
+    }
+    if world.client_by_connection(request.connection_id).is_some() {
         return Err(ClientError::DuplicateClient);
     }
-    let name = resource_id.name().to_owned();
+    let fallback = request.connection_id.get().to_string();
+    let name = request.name.as_deref().unwrap_or(&fallback);
+    let resource_id = ResourceID::new("client", &request.client_type, name, Some(fallback.clone()))
+        .map_err(|_| ClientError::InvalidResourceID)?;
+    let owners = world
+        .find_resource_entities(&resource_id)
+        .map_err(|_| ClientError::ResourceSetupFailed)?;
+    if !owners.is_empty() {
+        return Err(ClientError::DuplicateClient);
+    }
+    if world
+        .query_with::<Client>()
+        .result()
+        .into_iter()
+        .any(|entity| {
+            world
+                .get_component::<Client>(entity)
+                .is_some_and(|client| client.name == name)
+        })
+    {
+        return Err(ClientError::DuplicateName);
+    }
+    let old_name = connections.name(request.connection_id).unwrap_or_default();
+    let old_type = connections
+        .connection_type(request.connection_id)
+        .unwrap_or_default();
     connections
-        .set_name(request.connection_id, name.clone())
+        .set_name(request.connection_id, name)
         .map_err(|error| match error {
             WebSocketNameError::NameAlreadyExists { .. } => ClientError::DuplicateName,
             _ => ClientError::ConnectionMissing,
         })?;
-    if !connections.set_connection_type(request.connection_id, client_type) {
+    if !connections.set_connection_type(request.connection_id, &request.client_type) {
+        let _ = connections.set_name(request.connection_id, old_name);
         return Err(ClientError::ConnectionMissing);
     }
-    let client = Client::new(request.connection_id, client_type.to_owned(), name);
     let entity = world.spawn();
-    if let Err(error) = world.attach_resource_id(entity, resource_id.clone()) {
+    let client = Client {
+        resource_id: resource_id.clone(),
+        connection_id: request.connection_id,
+        client_type: request.client_type.clone(),
+        name: name.into(),
+    };
+    if world.insert_library(entity, client).is_err() {
         world.despawn(entity);
-        return Err(match error {
-            resource_id_plugin::ResourceIdAttachError::Lookup(
-                ResourceIdLookupError::Duplicate { .. },
-            ) => ClientError::DuplicateClient,
-            _ => ClientError::InvalidResourceId,
-        });
+        let _ = connections.set_name(request.connection_id, old_name);
+        connections.set_connection_type(request.connection_id, old_type);
+        return Err(ClientError::ResourceSetupFailed);
     }
-    world.insert_component(entity, client.clone());
-    tracing::info!(
-        request_id = %request.id,
-        connection = request.connection_id.get(),
-        client_type,
-        name = client.name(),
-        resource_id = %resource_id,
-        "client registered"
-    );
+    if connections
+        .get(request.connection_id)
+        .is_none_or(|sender| sender.is_closed())
+    {
+        world.despawn(entity);
+        let _ = connections.set_name(request.connection_id, old_name);
+        connections.set_connection_type(request.connection_id, old_type);
+        return Err(ClientError::ConnectionMissing);
+    }
     Ok(RegisteredClient {
+        client: entity,
         resource_id,
-        client,
     })
 }
 
 pub fn registered_client(
     world: &World,
     connection_id: WebSocketConnectionId,
-) -> Option<ResourceRef> {
-    let entity = client_entity(world, connection_id)?;
+) -> Option<ResourceID> {
     world
-        .get_component::<ResourceId>(entity)
-        .map(|id| id.as_ref().clone())
+        .client_by_connection(connection_id)
+        .map(|(_, client)| client.resource_id.clone())
 }
-
 pub(crate) fn handle_client_disconnect(world: &mut World, connection_id: WebSocketConnectionId) {
-    if let Some(entity) = client_entity(world, connection_id) {
-        world.despawn(entity);
-    }
-}
-
-fn client_entity(world: &World, connection_id: WebSocketConnectionId) -> Option<Entity> {
-    world
+    let entities = world
         .query_with::<Client>()
         .result()
         .into_iter()
-        .find(|entity| {
+        .filter(|entity| {
             world
                 .get_component::<Client>(*entity)
-                .is_some_and(|client| client.connection_id() == connection_id)
+                .is_some_and(|client| client.connection_id == connection_id)
         })
+        .collect::<Vec<_>>();
+    for entity in entities {
+        world.despawn(entity);
+    }
 }
-
-fn client_resource_id(
-    client_type: &str,
-    name: Option<&str>,
-    connection_id: WebSocketConnectionId,
-) -> Result<ResourceRef, ClientError> {
-    let id = connection_id.get().to_string();
-    let name = name.unwrap_or(&id);
-    ResourceRef::parse(client_source(Some(client_type), Some(name), connection_id))
-        .map_err(|_| ClientError::InvalidResourceId)
-}
-
 fn valid_client_type(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| {

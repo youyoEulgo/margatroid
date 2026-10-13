@@ -28,82 +28,58 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 边界：对外使用泛型和具体类型，内部使用类型擦除
 ```
 
-# 板块格式
-
-正文按lib、system、handler、events、types、error六个板块组织。
-
-```text
-lib        src/lib.rs        钩子资源类型与Plugin
-system     src/system.rs     请求和异步结果调度
-handler    src/handler.rs    提交读取与主线程挂载
-events     共享types crate    hook_resource_events.rs中的全部事件
-types      src/types.rs      加载配置、准备数据和异步关联
-error      共享错误契约       钩子资源加载错误
-```
-
-**本文是目标设计，不是当前实现。目录仅包含设计文档，尚未创建Cargo crate或注册Workspace成员。**
-
-统一资源基础设施只提供ResourceID、ResourceInner、LibraryComponent、ResourcesComponent、ResourceSet与类型注册。
-本插件承接钩子资源的加载与挂载，不把具体资源定义留在基础设施中。
-
 # lib
 
-## 组件定义位置
+## 源码归属与当前状态
 
-HookResource资源条目及其实现方法；ResourceSet<HookResource>使用该共享类型实例化，计划写入共享types crate的`hook_resource_components.rs`。对应全部事件写入各自的`*_events.rs`，不在插件实现crate重复定义。
+本文件描述已实现的加载、明确类型导入及主线程受检发布插件。源码按lib、system、handler、types组织，files为私有路径与读取辅助模块；所有业务及内部事件统一位于共享types，不存在插件events.rs。
 
-此处只标注未来源码归属，尚未创建或迁移源码文件。文档仍在lib板块描述图书馆类型和资源类型；Plugin、System、Handler及插件私有加载状态不随组件迁入共享文件。
+组件实际归属共享`types/src/resource_components.rs`，模块路径为`margatroid_types::resource_components`；全部加载事件与错误实际归属`types/src/resource_events.rs`，模块路径为`margatroid_types::resource_events`。并非每类资源单独一个components或events文件。统一ResourceID、ResourceSet、LibraryComponent及注册入口归resource_id_plugin。
 
 ## 类型
 
 公开：
 ```text
-HookResource：钩子资源内容，公开结构体--ResourceSet<HookResource>中的一个条目，不是LibraryComponent
-    alias: String--所在Entity内的本地别名
+HookResource：钩子资源条目，公开共享结构体--不是LibraryComponent
+    alias: String--目标Entity的本地别名
     description: String--钩子描述
-    input_schema: serde_json::Value--已解析输入schema
+    input_schema: serde_json::Value--通过构建验证器的对象schema
+    script_path: PathBuf--包内main.lua预期路径；本插件不检查、读取或执行此路径
     impl ResourceInner for HookResource
         get_alias(&self) -> &str
-            读取本地别名：返回self.alias的字符串借用
+            读取别名：返回alias借用
 
-HookResourcePlugin：钩子资源加载插件，公开结构体
-    root: PathBuf--全局资源根目录，私有字段，通常为HOME/.margatroid
-    schedule: String--请求、闭包分发与挂载所属计划，私有字段
-    limits: HookResourceLoadLimits--读取限制，私有字段
-    open(root: impl Into<PathBuf>) -> Result<Self, HookResourceLoadError>
-        构造插件：公开关联函数，要求绝对路径且不含父级跳转，保存配置，不扫描或创建资源包
+HookResourcePlugin：钩子加载插件，公开结构体
+    root: PathBuf--固定全局资源根目录
+    schedule: String--请求与闭包分发计划
+    limits: HookResourceLoadLimits--读取限制
+    open(root: impl Into<PathBuf>) -> Result<Self, ResourceLoadError>
+        构造插件：要求绝对路径且无父级跳转；不扫描或创建资源包
     with_schedule(mut self, schedule: impl Into<String>) -> Self
-        设置计划：公开方法，保存计划名并返回自身
+        设置计划：默认RuntimePlugin::PRE_UPDATE
+    with_limits(mut self, limits: HookResourceLoadLimits) -> Self
+        设置上限：保留调用方提供的读取限制
     impl Plugin for HookResourcePlugin
-        Plugin：公开trait实现
         build(self, app: &mut App)
-            安装插件：公开trait方法
-            行为：
-                要求计划、Runtime、AsyncRuntime、Closure和统一ResourcePlugin可用，拒绝重复安装
-                要求目标计划已安装ClosureSystem，不重复注册
-                保存HookResourceLoadConfig，默认计划为RuntimePlugin::PRE_UPDATE
-                调用register_resources::<ResourceSet<HookResource>>("hook")注册资源类型
-                挂载load_hook_resource_system，不注册固定异步System
-                不依赖Agent、Workspace、MCL或其他资源插件的安装标记
+            安装插件：要求Runtime、AsyncRuntime、目标计划和已安装的ClosureSystem，拒绝重复配置；通过send_closure空闭包检查Closure设施，不重复注册ClosureSystem
+            调用register_resources::<ResourceSet<HookResource>>("hook")；保存配置并挂一个领域System，不安装固定异步System
 ```
 
 ## 逻辑
 
 ```text
-类型与所有权：
-    HookResource在lib板块定义，辅助配置与中转数据在types板块定义
-    ResourceSet<HookResource>由统一资源设施提供Component和ResourcesComponent实现，本插件不重复实现
-    ResourceID只存在于集合键中，不在条目中添加另一份ID，不挂独立ResourceId组件
-    每个目标Entity有自己的资源集合，同ID可存在于多个Entity上，不创建独立资源Entity
-    alias是目标Entity的本地使用名称，非全局身份；集合内一个ID只对应一个条目
-    HookResource应作为可共享的公开数据契约提供，事件层或其他消费方不需依赖本插件Handler实现
-    条目与ResourceInner实现归属共享hook_resource_components.rs；ResourceInner与集合trait归属resource_components.rs，不让共享types反向依赖本插件
-
-插件职责：
-    IMPORT的Agent依赖许可由调用方在投递加载请求前检查Agent.info.image_dependencies，按完整ResourceID精确匹配（含tag），无builtin例外
-    加载插件允许任意目标Entity，只负责资源读取、校验与挂载，不重复承担Agent许可检查，也不把资源已加载视为许可
-    Agent IMPORT由调用方登记Other活动后移交加载设施（不与MCL重复登记）；读取、取消和主线程挂载收口完成并真实释放资源后才mark_completed；提交失败且未启动时rollback_submission
-    Hook是由driver解释的触发器。加载插件只提供描述与输入schema，后端不因加载或命中hook执行行为；发生什么由driver决定。
+身份与所有权：
+    ResourceID只在ResourceSet键中；同ID可独立存在于不同目标，不创建独立资源Entity或ResourceId组件
+    alias不改变全局身份；import_kind为None时是普通加载，Agent及非Agent目标均不发布import_bindings
+    import_kind为Some(InnerType::Tool)时执行明确类型导入；声明与地址不匹配立即拒绝，目标必须是唯一解析到原完整Entity的Agent
+    validate_resource_import在提交及挂载阶段调用agent_validate_import，检查image_dependencies精确许可、alias及同ID同kind规则；不依赖AgentPlugin安装标记
+    Agent.import_bindings是唯一alias绑定事实，同alias其他ID或kind冲突保旧；同ID改名先预检新名，成功发布删除旧名，不复制全局alias注册表
+    本crate重导出共享条目、加载请求、观察结果、公共错误与本类读取限制；本类LoadError及LoadErrorKind是通用错误类型别名
+    Tool与Skill共享条目当前没有read_script/read_content异步方法；按需读取由消费侧负责，不宣称本插件已提供此API
+根目录：
+    资源包只能来自root/hooks/scope/name/tag；没有项目、镜像目录或builtin回退
+    root是通常HOME/.margatroid的全局根，不是已经包含hooks的子目录
+    与AgentImageLoaderPlugin不同：Image插件open接受独立agentimages根，直接拼scope/name/tag；不能把Image根的解释套给本插件
 ```
 
 # system
@@ -113,24 +89,20 @@ HookResourcePlugin：钩子资源加载插件，公开结构体
 crate公开：
 ```text
 load_hook_resource_system(world: &mut World)
-    钩子资源加载System：crate公开System
-    处理事件：LoadHookResource、Result<HookResourceReadOutput, HookResourceTaskError>
-    产出事件：ClosureRequest、LoadHookResourceResult
-    行为：
-        克隆本帧全部LoadHookResource，逐个调用handle_load_hook_resource；克隆只共享回复槽，不克隆Sender
-        读取本帧全部Result<HookResourceReadOutput, HookResourceTaskError>
-        成功取得异步输出时逐个调用handle_mount_hook_resource
-        外层监督错误调用handle_hook_resource_task_failed，确认读取任务与附属I/O真实退出后完成失败收口并释放原Other活动；不能只记录日志或只回错
+    加载System：克隆本帧LoadHookResource，逐个提交读取
+    读取Result<HookResourceReadOutput, HookResourceTaskError>；正常输出交mount，关联监督错误交task_failed
+    一次请求一个关联上下文，不建立全局pending合并表，不因已有条目跳过重新读取
 ```
 
 ## 逻辑
 
 ```text
-调度：
-    只有一个领域System和两个主Handler，无固定异步事件Handler或额外结果收集System
-    异步闭包由通用ClosureSystem分发，产出事件中的ClosureRequest指基础设施内部包装
-    Pending响应完成后升变为整个Result<HookResourceReadOutput, HookResourceTaskError>，不是裸输出事件
-    异步线程只准备数据，不能发送成功回执；通用监督设施仅在读取任务及附属I/O真实退出后投递正常输出或具名TaskError；主线程插入ResourceSet完成后才发送oneshot成功结果，并发布LoadHookResourceResult供观察
+异步边界：
+    使用现有WorldAsyncExt::send_async_closure；API返回()而非提交Result，并要求错误实现From<AsyncTaskError>
+    闭包调度async future，future提交一个spawn_blocking只读准备工作并await专用oneshot
+    独立tokio监督任务持有读取JoinHandle及原请求；等待整个读取工作真实退出，才转发成功/普通失败或带请求的TaskError
+    外层dispatcher退出并丢弃接收端时，监督任务仍等待真实读取退出再发布关联TaskError；不把发出取消或Drop作为I/O退出证明
+    整体Runtime关闭后不保证继续消费主线程结果，不能把这一边界描述为应用关闭后仍可靠回执
 ```
 
 # handler
@@ -140,106 +112,91 @@ load_hook_resource_system(world: &mut World)
 crate公开：
 ```text
 handle_load_hook_resource(world: &mut World, request: LoadHookResource)
-    处理钩子加载请求：crate公开函数
-    行为：
-        校验请求id、alias非空、取消状态、目标完整Entity存活和resource_id类型段为hook
-        请求非法时完成oneshot错误回执，同时发布关联原请求的LoadHookResourceResult错误事件
-        复制根路径、限制及可复制的请求上下文，将请求中的共享reply槽交给本次关联回执保障；不复制Sender
-        在函数内构造异步闭包，读取全局根目录/hooks/scope/name/tag下的必要文件
-        必要文件为hook.toml、input.schema.json，其他目录项忽略；不使用项目内或镜像内回退路径
-        检查必要路径的目录或普通文件类型，不接受symlink，拒绝父级跳转，有界读取并要求UTF-8
-        解析hook.toml，要求name与description非空；name沿用包的描述字段，不存为另一份资源身份
-        解析input.schema.json，要求JSON对象且可构建JSON Schema验证器
-        保存描述和schema，不读取或执行额外脚本
-        将准备数据或普通读取错误装入HookResourceReadOutput，保留id、target、resource_id、alias请求上下文与共享reply槽，不保留另一份Sender
-        读取和解析各阶段监督request.cancel，取消时停止读取、等待本次读取资源释放并产出Cancelled关联错误，不继续准备或提交挂载
-        通过send_async_closure提交，外层错误类型为HookResourceTaskError，提交监督包装保留原请求上下文、reply及activity，不创建全局pending合并表；提交失败完成原回复槽并rollback_submission
+    准备请求：校验id与alias非空、取消状态、完整Entity存活、resource_id类型段为hook
+    调用共享validate_resource_import；None不附加Agent导入校验，Some必须满足声明类型、完整Agent身份、依赖和alias约束
+    非法或未开始请求收口回执并rollback_submission原activity，不重复登记Other活动
+    复制配置与共享请求槽，构造SubmissionGuard并通过send_async_closure提交；捕获同步提交panic
+    spawn_blocking工作开始前mark_started；按固定路径校验并准备资源条目
+    只读取hook.toml和input.schema.json。name与description要求非空，name为展示字段。schema要求JSON对象且可构建验证器，拒绝外部引用。保存main.lua预期路径以满足共享组件字段，但不检查或读取该脚本，不执行Lua。
 
 handle_mount_hook_resource(world: &mut World, output: HookResourceReadOutput)
-    处理钩子挂载结果：crate公开函数
-    行为：
-        reply槽已经被take的请求不重复挂载或回复，但仍确认读取已退出并收口原activity，不能因此跳过mark_completed
-        主线程再次检查output.cancel；已取消则完成Cancelled回执及观察事件且保留旧条目，禁止把取消前准备结果挂载
-        取消检查与发布处于同一受检主线程收口步骤，调用方停止须等待本次收口，不以取消发送或Receiver关闭代替完成
-        普通读取失败时完成oneshot错误回执并发布LoadHookResourceResult错误事件，不改变旧条目
-        重新检查目标完整Entity存活，目标失效时发送TargetNotAlive，不把旧结果写入复用index的新Entity
-        根据准备数据构造HookResource，alias取原请求alias
-        已有ResourceSet<HookResource>时仅更新resource_id对应条目，不替换其他资源
-        无集合时创建并插入条目，通过受检资源挂载入口挂到目标Entity
-        校验或挂载失败返回MountFailed，不先删除旧集合或旧条目
-        主线程完成ResourceSet对应键的插入后，一次性发送oneshot Ok(())，并发布关联原请求的LoadHookResourceResult成功观察事件；标记回执完成
-        不修改目标的LibraryComponent，不发送其他领域的启动、执行或激活事件
-        所有返回路径（成功、取消、普通失败、目标失效、reply已完成）均在确认读取资源释放并完成主线程收口后mark_completed原activity
+    主线程挂载：持reply槽锁检查唯一Sender是否尚在；reply已take不重复挂载或通知，但仍mark_completed原activity
+    再次检查取消与完整Entity存活，取消时保旧返回Cancelled，目标复用返回TargetNotAlive
+    普通读取失败保留旧条目及旧绑定；正常准备条目的alias覆盖为原请求alias
+    import_kind为Some时构造ImportedValue::Tool，CallableResource携带完整ID、alias及Arc<CallableDefinitionSnapshot::Hook>，共享准备好的描述、schema和预期script_path；导入成功不代表Hook执行语义已实现。
+    调用共享mount_resource_import完成单个受检主线程步骤：复检导入许可，克隆目标ResourceSet或建立空集合，仅替换原resource_id键
+    借用既有ResourceTypeRegistry预检component_type、Resources分类及全部条目地址；不复制registry，ResourceSet按ID键存储，不添加重复ID
+    核对ImportedValue身份和kind，保存原ImportBindings，再调用agent_bind_import；随后受检insert_resources发布集合
+    insert_resources错误不修改集合，helper精确恢复本次主线程步骤前的ImportBindings；任何读取、声明、alias或挂载失败均保old set/binding
+    None仅受检发布集合，不构造或修改binding；成功重载后新GET读取新快照，已取出的Block保持旧快照
+    插入完成后take一次Sender发送Ok，并发布LoadHookResourceResult观察事件；随后mark_completed原activity
 
-handle_hook_resource_task_failed(world: &mut World, error: HookResourceTaskError)
-    收口读取监督失败：crate公开函数
-    行为：
-        监督设施确认读取任务（含panic/abort）及附属I/O已经真实退出，才投递本关联错误；不可把发出abort或Drop当作退出证明
-        主线程保留旧条目，完成尚未完成的TaskFailed回执与观察事件，随后mark_completed原activity；重复结果幂等
-        若尚有未退出I/O，监督设施继续取消和等待，不提前投递可释放活动的终态；Runtime关闭前必须保持此收口设施运行
+handle_hook_resource_task_failed(world: &mut World, task: HookResourceTaskError)
+    收口监督异常：只处理request为Some的关联错误，保旧回TaskFailed后mark_completed
+    request为None是框架无法携带业务关联的外层错误，不能凭空猜请求或释放别人的activity；关联读取由独立监督或未开始SubmissionGuard负责
 ```
 
-## 逻辑
+## 共享公开辅助函数
+
+下列辅助实际定义在共享resource_events模块，由五类加载器复用，不是插件私有Handler，也不复制资源注册表。
 
 ```text
-更新语义：
-    重复IMPORT同一ID也必须重新发起加载，不因已存在而跳过；每次重新读取对应磁盘包，成功后仅替换目标Entity集合对应ID键的条目（包括alias）
-    合理安全补充：读取、校验或挂载失败均保留原条目（含原alias），但仍返回失败，不能用旧内容伪装加载成功
-    同一目标同ID并发加载暂按实际挂载顺序覆盖，不保证最后提交者胜出
-    不同目标的同ID资源独立更新；调用方需要内容时从指定Entity的集合读取，不取全局查询的第一个实体
-    已经开始的调用如需稳定内容，由消费方在开始时取得自己的快照
-
-生命周期：
-    目标Entity销毁时集合一同释放，无ResourceOwners、release_resource_owner或GC
-    只挂载内存内容或路径，不删除磁盘资源包
-    加载通知表示挂载完成，调用方不重复挂载
-    调用方停止（含Agent停止）须cancel并等待读取清理和主线程挂载拒绝/完成收口；不直接丢弃IMPORT等待，也不隐式销毁目标
+validate_resource_import(world: &World, target: Entity, resource_id: &ResourceID, alias: &str, kind: Option<InnerType>) -> Result<(), ResourceLoadError>
+    导入预检：None直接成功；Some核对声明与地址、Agent组件、唯一Agent地址解析对应原Entity，并调用agent_validate_import检查许可和alias规则
+mount_resource_import<T>(world: &mut World, target: Entity, resource_id: &ResourceID, alias: &str, kind: Option<InnerType>, resource: T, imported: Option<ImportedValue>) -> Result<(), ResourceLoadError>
+    约束：T: Clone + Send + Sync + 'static
+    原子领域发布：同一主线程步骤内预检集合及绑定，bind后受检insert_resources；后续失败精确恢复旧bindings，集合错误不会写入
+    边界：调用加载器负责在持回复槽锁的挂载入口复检cancel及target存活；本helper不读取磁盘、不切换激活沙箱、不管理activity
 ```
 
 # events
 
-## 定义位置
-
-所有事件无论对外业务通知还是内部调度，都定义在共享types的`hook_resource_events.rs`，插件实现不再有`events.rs`。内部仅表示用途，不意味着在共享crate中使用pub(crate)后其他crate仍能访问；供插件使用的事件需要公开可见。
-
-自动异步响应仍是框架的`Result<T, E>`，不另造包装事件；其中具名输出、错误及请求关联载荷也在共享事件文件定义，不使共享types反向依赖插件私有类型。Plugin配置和非事件处理状态仍留在实现侧。基础设施事件如ClosureRequest沿用基础设施定义，不在业务文件复制。
-
-请求与内部输出直接共享reply槽，完成时对槽加锁并take唯一Sender，确保一次发送；不新增公共完成trait。插件可用私有回执保障对象处理panic或取消兜底，其类型不进入共享事件契约。
-
 ## 类型
 
-公开，统一定义于共享types crate的hook_resource_events.rs：
+公开，统一位于共享resource_events模块：
 ```text
-LoadHookResource：加载钩子资源请求，公开事件
-    id: String--唯一请求ID
-    target: Entity--目标完整Entity，不限制为Agent或Workspace类型
-    resource_id: ResourceID--hook类型的资源地址
-    alias: String--目标内本地别名，由调用方解析缺省值后提供
-    cancel: CancellationToken--调用方派生取消令牌；Agent IMPORT使用activity.cancel，供读取及主线程挂载复检
-    activity: Option<ExecutionActivity>--Agent IMPORT移交的Other活动，非Agent加载可为None；加载设施接管到真实清理与主线程收口结束
-    reply: Arc<Mutex<Option<oneshot::Sender<Result<(), HookResourceLoadError>>>>>--请求携带唯一Sender的共享回复槽；克隆请求共享该槽，成功仅在主线程插入集合后发送
+ResourceLoadReply：共享回复槽，公开类型别名
+    Arc<Mutex<Option<oneshot::Sender<Result<(), ResourceLoadError>>>>>
+
+LoadHookResource：加载请求，公开事件--Clone只共享槽与activity，不克隆Sender
+    id: String--原请求ID
+    target: Entity--包含generation的完整目标
+    resource_id: ResourceID--本类完整地址
+    alias: String--本地别名
+    import_kind: Option<InnerType>--None普通加载不绑定；Some(Tool)明确类型Agent导入
+    cancel: CancellationToken--读取及挂载共同检查的派生取消令牌
+    reply: ResourceLoadReply--唯一回复Sender槽
+    activity: Option<Arc<ExecutionActivity>>--调用方登记并移交的Other活动；非Agent加载可None
     impl Event for LoadHookResource
 
-LoadHookResourceResult：钩子资源挂载结果，公开事件
+LoadHookResourceResult：公开观察事件
     id: String--原请求ID
-    target: Entity--原目标完整Entity
-    resource_id: ResourceID--原资源地址
-    result: Result<(), HookResourceLoadError>--成功表示集合条目已可用，不返回独立资源Entity
+    target: Entity--原完整目标
+    resource_id: ResourceID--原地址
+    result: Result<(), ResourceLoadError>--成功代表主线程集合已可查询；Some导入时对应binding也已发布
     impl Event for LoadHookResourceResult
+
+HookResourceReadOutput：内部正常结果载荷，公开共享结构体
+    request: LoadHookResource--保留完整原请求和共享槽
+    result: Result<HookResource, ResourceLoadError>--已准备共享条目或普通读取错误
+
+HookResourceTaskError：内部监督错误，公开共享结构体
+    request: Option<LoadHookResource>--独立监督产生关联错误为Some，框架转换不能补关联为None
+    message: String--监督错误描述
+    impl From<AsyncTaskError> for HookResourceTaskError
+        from(source: AsyncTaskError) -> Self
+            框架转换：保存source字符串且request为None，不制造虚假请求
 ```
 
 ## 逻辑
 
 ```text
-事件边界：
-    业务请求、业务结果和内部事件均由共享事件层定义，本插件直接使用，不保留src/events.rs
-    请求携带的oneshot是调用方（包括MCL）等待的完成通道；MCL不等待公开Result事件，也不把磁盘读取完成当作导入完成
-    公开Result事件继续保留，仅供观察，不承担MCL等待或重新挂载职责
-    成功与失败都必须保留id、target、resource_id，以便观察者关联请求
-    Sender本身不可Clone；请求通过Arc共享回复槽保持可Clone，完成时加锁take一次，不能为每份事件副本创建独立Sender
-    加载System仍为请求的领域处理者，观察者不得take回复槽或重复提交挂载
-    内部异步Result通道与公开加载结果不同，不重复定义ClosureRequest
-    本插件只保存调用方指定的本地别名；消费方准备本次可见集合时，不同完整ID的alias冲突必须失败，不按顺序覆盖或任取一项；Inference与tool_call采用相同规则
+回执：
+    oneshot是调用方等待的权威结果；观察事件不承担等待或再次挂载职责
+    挂载步骤持共享槽锁，取消复检、受检发布、take及通知在主线程收口；调用方须cancel后等待，不直接丢弃IMPORT等待
+    取消后拒绝挂载及binding发布，保原条目和绑定，等待真实读取收口后完成activity
+    Receiver已丢弃时忽略send失败，不撤销已成功集合及binding发布
+    外层async Result不是裸ReadOutput事件，也不新增业务ClosureRequest
 ```
 
 # types
@@ -248,100 +205,79 @@ LoadHookResourceResult：钩子资源挂载结果，公开事件
 
 crate公开：
 ```text
-HookResourceLoadConfig：钩子加载配置，crate公开Resource
-    root: Arc<PathBuf>--全局根目录
-    schedule: String--闭包分发计划
+HookResourceLoadConfig：私有加载配置，crate公开Resource
+    root: PathBuf--固定全局根目录；现实现不是Arc<PathBuf>
+    schedule: String--所属计划
     limits: HookResourceLoadLimits--读取限制
     impl Resource for HookResourceLoadConfig
 
-HookResourceLoadLimits：钩子读取限制，crate公开结构体
-    max_definition_bytes: u64--元数据和schema等定义文件的单文件上限
+HookResourceLoadLimits：公开读取限制结构体--各插件采用同一字段形状，未使用的上限不产生额外文件要求
+    max_definition_bytes: u64--元数据/schema单文件上限；默认1MiB
+    max_content_bytes: u64--正文上限；默认8MiB
+    max_script_bytes: u64--脚本加载检查上限；默认8MiB
+    max_policy_bytes: u64--策略上限；默认8MiB
+```
 
-HookResourceData：异步准备数据，公开共享契约--定义于hook_resource_events.rs--包含HookResource除alias之外的已读取字段，不含World借用
-
-HookResourceReadOutput：异步输出，公开共享契约--定义于hook_resource_events.rs，仅供内部结果通道使用
-    id: String--原请求ID
-    target: Entity--原目标完整Entity
-    resource_id: ResourceID--原资源地址
-    alias: String--原请求别名
-    cancel: CancellationToken--与原请求同一派生令牌，主线程取消后拒绝挂载
-    activity: Option<ExecutionActivity>--原请求同一Other活动，不新建重复登记
-    result: Result<HookResourceData, HookResourceLoadError>--普通加载成功或失败
-    reply: Arc<Mutex<Option<oneshot::Sender<Result<(), HookResourceLoadError>>>>>--与请求共享唯一Sender槽，主线程插入集合后take并回复
-
-HookResourceTaskError：读取监督错误，公开共享载荷--定义于hook_resource_events.rs
-    request: LoadHookResource--保留原id、target、resource_id、reply、cancel及activity，不依赖私有保障类型
-    source: AsyncTaskError--真实退出后由监督设施生成；From<AsyncTaskError>不能凭空补齐原请求关联
-    说明：异常监督包装独立持有原activity，读取Future丢弃不丢失收口责任；可取消I/O必须由同一监督设施等待，禁止脱离任务的读操作。
-
-HookResourceLoadCompletion：关联回执保障，私有结构体
-    id: String--原请求ID
-    target: Entity--原目标完整Entity
-    resource_id: ResourceID--原资源地址
-    alias: String--原请求别名
-    cancel: CancellationToken--原请求取消状态，兜底保留关联
-    activity: Option<ExecutionActivity>--兜底只完成回复，不凭Drop释放活动；真实清理及收口完成才mark_completed
-    reply: Arc<Mutex<Option<oneshot::Sender<Result<(), HookResourceLoadError>>>>>--一次性持有Sender，正常及异常路径共享同一完成门闩
-    events: RuntimeEventSender--线程安全观察事件发送器
-    impl Drop for HookResourceLoadCompletion
+私有：
+```text
+SubmissionGuard：未开始提交回执保障
+    request: Option<LoadHookResource>--未移交读取监督前保留请求
+    events: RuntimeEventSender--观察事件发送器
+    impl Drop for SubmissionGuard
         drop(&mut self)
-            兜底回复：未完成时一次性完成oneshot Err(TaskFailed)，并发布携带原请求上下文的LoadHookResourceResult错误观察事件；不写World，不改旧条目
+            未开始兜底：take唯一回复槽回TaskFailed并发布观察事件，rollback_submission而不是mark_completed；工作启动后移交关联责任并清空request
+```
+
+## 函数
+
+私有：
+```text
+prepare(config: &HookResourceLoadConfig, request: &LoadHookResource) -> Result<HookResource, ResourceLoadError>
+    同步只读准备：在spawn_blocking工作中运行；不得借用World或发送成功回执
+normalize_root(root: PathBuf) -> Result<PathBuf, ResourceLoadError>
+    根路径校验：绝对路径且无ParentDir，不扫描磁盘
+checked_path(path: &Path, directory: bool) -> Result<(), ResourceLoadError>
+    路径校验：逐祖先symlink_metadata，禁止symlink和ParentDir，要求目录及必要普通文件类型
+read_text(path: &Path, maximum: u64, cancelled: impl Fn() -> bool) -> Result<String, ResourceLoadError>
+    有界读取：检查文件长度并逐8KiB块读取，检查累计上限、取消、UTF-8及非空内容
 ```
 
 ## 逻辑
 
 ```text
-错误关联：
-    AsyncTaskError本身没有原请求id，不能只记录外层错误而丢失业务回复
-    私有回执保障由闭包捕获；正常读取产出包含共享reply槽的内部输出，正常路径在主线程插入集合后take回复
-    保障对象不得因正常读取结束先于挂载而发兜底错误；正常产出后将异常兜底责任转移给主线程结果处理，转移本身不完成回复；所有载荷仍由共享events定义
-    panic或取消触发未完成回执保障时发送oneshot关联错误并发布观察事件；Drop不mark_completed，独立监督包装仍持有activity，任务真实退出后通过具名TaskError交主线程释放
-    oneshot Receiver已丢弃时忽略send失败，不回滚已成功插入的条目，仍发布观察事件
-    本System是该具名内部输出的唯一挂载消费者；实现必须测试各路径恰好回复一次
-    Runtime整体关闭后不保证应用继续消费结果
-
-必要的辅助实现：
-    路径定位、有界读取和格式解析可用少量私有函数复用，不额外建立领域System
-    不引入目录快照、修改时间比较或原子版本快照承诺
-    注册表、资源集合、异步执行器复用公共基础设施，不在本插件重写
+边界与测试：
+    忽略非必要目录项，拒绝必要路径及祖先symlink；不承诺对恶意并发目录替换的原子快照或TOCTOU防护
+    不编译Lua、不创建runner、不改LibraryComponent、不管理激活或资源GC；Entity销毁时集合自然释放
+    测试覆盖加载成功、重复读取alias更新、失败保旧、取消前/挂载前取消、完整target复用、独立目标alias、其他key保留、reply幂等、监督错误、限长、UTF-8与symlink
+    Tool/Hook额外覆盖无效schema与外部ref；Hook额外证明不读取Lua
+    五插件联合导入回归覆盖typed GET、错误类型/alias冲突与依赖失败保旧、改名移除旧alias、旧Block快照、取消不绑定、普通加载不绑定；Prompt验证角色忠实，Sandbox验证活动忙时纯重载不改选中快照
+    CallableResource的Arc冻结元数据及文件路径，不冻结文件内容；不承诺以后按路径执行仍是导入时script版本或多文件原子快照
 ```
 
 # error
 
 ## 类型
 
-公开，共享错误契约：
+公开共享契约，位于resource_events模块：
 ```text
-HookResourceLoadErrorKind：钩子加载错误分类，公开枚举
-    InvalidRequest
-    InvalidRoot
-    InvalidResourceID
-    NotFound
-    InvalidFileType
-    SymlinkNotAllowed
-    LimitExceeded
-    ReadFailed
-    DecodeFailed
-    InvalidDefinition
-    TargetNotAlive
-    MountFailed
-    TaskFailed
-    Cancelled
+ResourceLoadErrorKind：公共错误分类，公开枚举
+    InvalidRequest, InvalidRoot, InvalidResourceID, NotFound, InvalidFileType,
+    SymlinkNotAllowed, LimitExceeded, ReadFailed, DecodeFailed, InvalidDefinition,
+    TargetNotAlive, MountFailed, ExecutionBusy, TaskFailed, Cancelled
 
-HookResourceLoadError：钩子资源加载错误，公开结构体
-    kind: HookResourceLoadErrorKind--错误分类
-    message: String--有界错误描述
-    impl Clone + Debug + PartialEq + Eq for HookResourceLoadError
-    impl fmt::Display for HookResourceLoadError
-        格式化错误：输出分类和描述
-    impl std::error::Error for HookResourceLoadError
-```
+ResourceLoadError：公共加载错误，公开结构体
+    kind: ResourceLoadErrorKind--分类
+    message: String--new构造时最多512个Unicode字符，不宣称512字节
+    new(kind: ResourceLoadErrorKind, message: impl Into<String>) -> Self
+        构造错误：按字符有界截断
+    kind(&self) -> ResourceLoadErrorKind
+        读取分类：返回Copy分类
+    impl Clone + Debug + PartialEq + Eq for ResourceLoadError
+    impl fmt::Display for ResourceLoadError
+        fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
+            格式化错误：输出分类和描述
+    impl std::error::Error for ResourceLoadError
 
-## 逻辑
-
-```text
-共享契约：
-    公开事件涉及的ResourceID、资源数据和错误必须能从共享层单向引用，不能让共享types反向依赖业务插件实现
-    本文件只设计加载和挂载，不定义资源执行协议或修改其他插件
-    本轮仅同步设计文档，不迁移旧代码、不添加Cargo.toml、不修改工作区成员
+HookResourceLoadError：兼容公开别名--等同ResourceLoadError
+HookResourceLoadErrorKind：兼容公开别名--等同ResourceLoadErrorKind
 ```

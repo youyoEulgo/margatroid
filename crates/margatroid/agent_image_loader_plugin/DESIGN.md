@@ -1,5 +1,4 @@
 # 伪代码格式
-
 ```text
 模块：使用一级标题，只写当前设计涉及的部分
 
@@ -30,76 +29,61 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # 板块格式
 
-正文按lib、system、handler、events、types、error六个板块组织。
+本文描述已实现的镜像加载契约，按 lib、system、handler、events、types、error 六个板块组织。
+crate 保留 `agent_image_loader_plugin` 名称；公开结构体为 `AgentImageLoaderPlugin`，另导出 `AgentImagePlugin` 别名。不存在另一份插件实现。
 
 ```text
-lib        src/lib.rs        插件与镜像资源契约
-system     src/system.rs     请求和异步结果调度
-handler    src/handler.rs    提交读取、挂载结果及少量读取辅助函数
-events     共享types crate    agent_image_events.rs中的全部事件
-types      辅助及内部类型    模型配置、加载配置和异步结果
-error      共享契约及内部错误  读取、挂载和异步任务错误
+lib        src/lib.rs        插件与共享镜像资源契约的导出
+system     src/system.rs     一个请求/异步结果调度System
+handler    src/handler.rs    两个主Handler、私有监督guard及读取辅助
+events     共享types crate   agent_image_events.rs中的请求、通知与具名异步输出
+types      src/types.rs      加载配置、公开限制及私有清单文档
+error      共享types crate   ImageLoadError与框架AsyncTaskError
 ```
 
-**本文是目标设计，代码尚未同步。crate计划由agent_image_loader_plugin改名为agent_image_plugin。本轮只改文档，不改Rust实现。**
-
 # lib
-
-## 组件定义位置
-
-AgentImage资源条目及其公开关联类型；ResourceSet<AgentImage>使用该共享类型实例化，计划写入共享types crate的`agent_image_components.rs`。对应全部事件写入各自的`*_events.rs`，不在插件实现crate重复定义。
-
-此处只标注未来源码归属，尚未创建或迁移源码文件。文档仍在lib板块描述图书馆类型和资源类型；Plugin、System、Handler及插件私有加载状态不随组件迁入共享文件。
-
-图书馆类型与资源类型统一在lib板块定义；types板块只放辅助数据、配置和内部处理类型。
 
 ## 类型
 
 公开：
 ```text
-AgentImage：镜像资源内容，公开结构体--ResourceSet<AgentImage>中的一个条目
+AgentImage：共享资源条目，定义于types/resource_components.rs
     base_driver: Arc<str>--base.lua的UTF-8源码
     origin: Arc<PathBuf>--base.lua来源路径
-    dependencies: Arc<[ResourceID]>--清单声明的依赖地址，不代表资源已导入
-    model: AgentImageModelConfig--模型名和可选推理参数
+    dependencies: Arc<[ResourceID]>--清单声明的地址，不代表依赖已导入
+    model: AgentImageModelConfig--公开模型配置
 
-AgentImagePlugin：镜像资源插件，公开结构体
-    root: PathBuf--全局agent-images根目录，私有字段
-    schedule: String--请求受理、闭包分发和结果挂载所属计划，私有字段
+AgentImageLoaderPlugin：镜像资源插件，公开结构体
+    root: PathBuf--全局镜像根目录，私有字段
+    schedule: String--请求、闭包分发及挂载计划，私有字段
     limits: AgentImageLoadLimits--读取限制，私有字段
-    open(root: impl Into<PathBuf>) -> Result<Self, AgentImageLoadError>
-        构造插件：公开关联函数，要求绝对路径且不含父级跳转，使用默认限制和RuntimePlugin::PRE_UPDATE
-        行为：不扫描具体镜像，不加载资源；镜像根是否存在由加载时检查，不为每个请求创建目录
-    with_schedule(mut self, schedule: impl Into<String>) -> Self
-        设置计划：公开方法，保存计划名并返回自身
-    impl Plugin for AgentImagePlugin
-        Plugin：公开trait实现
+    open(root: impl Into<PathBuf>) -> Result<Self, ImageLoadError>
+        构造：要求绝对路径且无ParentDir，消除CurDir；默认PRE_UPDATE及默认限制
+        不创建目录、不扫描镜像，根存在性在请求读取时检查
+    with_schedule(self, schedule: impl Into<String>) -> Self
+        配置计划
+    with_limits(self, limits: AgentImageLoadLimits) -> Self
+        配置读取限制
+    impl Plugin
         build(self, app: &mut App)
-            安装插件：公开trait方法
-            行为：
-                要求计划存在，Runtime、AsyncRuntime、Closure和统一资源基础设施已安装
-                要求该计划已注册ClosureSystem，不重复为应用安装ClosureSystem
-                拒绝重复安装，保存AgentImageLoadConfig
-                调用register_resources::<ResourceSet<AgentImage>>("image")注册镜像资源集合类型
-                挂载load_agent_image_system，不调用add_async_system注册固定异步Handler
-                不依赖WorkspacePlugin安装标记，不创建镜像宿主Entity
+            要求Runtime、AsyncRuntime和目标计划存在，拒绝重复安装
+            通过send_closure要求ClosurePlugin和该计划ClosureSystem已注册，不重复安装System
+            通过受检register_resources::<ResourceSet<AgentImage>>("image")要求统一资源设施并注册集合
+            保存AgentImageLoadConfig，挂载一个load_agent_image_system
+            不依赖Workspace安装标记，不创建镜像宿主Entity，不注册固定异步Handler
+
+AgentImagePlugin：AgentImageLoaderPlugin的公开别名
+AgentImageLoadError：ImageLoadError的公开兼容别名
 ```
 
 ## 逻辑
 
 ```text
-资源分类：
-    AgentImage是资源条目，不是图书馆组件，也不单独实现Component
-    ResourceSet<AgentImage>由统一资源设施实现Component和ResourcesComponent
-    image地址类型对应ResourceSet<AgentImage>，本插件负责注册该具体类型
-    AgentImage类型由共享数据契约提供，Workspace和Agent可以使用它而不依赖本插件实现
-    ID只存在于ResourceSet的键，不在AgentImage中再添加resourceid字段
-
-实体组成：
-    Workspace Entity
-        Workspace--唯一LibraryComponent，内部保存自己的ResourceID
-        ResourceSet<AgentImage>--以镜像ResourceID为键保存AgentImage
-    不挂独立ResourceId组件，不创建AgentImage Entity，不登记ResourceOwners，不使用GC
+AgentImage不是Component或LibraryComponent；ResourceSet<AgentImage>才是资源集合Component
+共享条目/模型由types/resource_components.rs提供，所有镜像事件由types/agent_image_events.rs提供
+Workspace或其他存活目标Entity保存ResourceSet<AgentImage>，ResourceID仅作为集合key
+不创建AgentImage Entity，不挂ResourceId，不登记ResourceOwners，不使用GC
+插件只负责加载与指定目标挂载，不修改Workspace状态机、不启动Agent
 ```
 
 # system
@@ -109,26 +93,20 @@ AgentImagePlugin：镜像资源插件，公开结构体
 crate公开：
 ```text
 load_agent_image_system(world: &mut World)
-    镜像加载System：crate公开System
-    处理事件：LoadAgentImage、Result<AgentImageReadOutput, AsyncTaskError>
-    产出事件：ClosureRequest、LoadAgentImageResult
-    行为：
-        克隆本帧全部LoadAgentImage，逐个调用handle_load_agent_image
-        读取本帧全部Result<AgentImageReadOutput, AsyncTaskError>
-        成功取得异步输出时逐个调用handle_mount_agent_image
-        外层监督错误记录日志；对应请求失败由关联回执保障发送，不能只记日志而让请求永久等待
+    克隆本帧全部LoadAgentImage，逐个调用handle_load_agent_image
+    读取Result<AgentImageReadOutput, AsyncTaskError>
+    Ok输出克隆后逐个调用handle_mount_agent_image
+    Err记录监督错误日志；关联业务失败由CompletionGuard保障
 ```
 
 ## 逻辑
 
 ```text
-异步通道：
-    提交闭包是Handler行为，实际入口事件是ClosurePlugin的ClosureRequest
-    闭包分发后由AsyncRuntime创建Pending响应节点
-    完成时Pending升变为Result<AgentImageReadOutput, AsyncTaskError>普通事件
-    该结果在后续事件帧由本System读取，不是裸AgentImageReadOutput事件
-    LoadAgentImageResult是挂载后的公开业务通知，不由异步运行时自动生成
-    不手动发送第二份相同异步成功结果，不在异步线程访问World
+LoadAgentImage -> request Handler -> send_async_closure/ClosureRequest
+    -> AsyncRuntime Pending -> Result<AgentImageReadOutput, AsyncTaskError>
+    -> mount Handler -> LoadAgentImageResult
+不发送裸AgentImageReadOutput事件，不重复发送异步成功，不在异步线程访问World
+LoadAgentImageResult::Ok只在主线程受检挂载完成之后发布
 ```
 
 # handler
@@ -138,111 +116,91 @@ load_agent_image_system(world: &mut World)
 crate公开：
 ```text
 handle_load_agent_image(world: &mut World, request: LoadAgentImage)
-    处理加载请求：crate公开函数
-    行为：
-        校验请求id、目标完整Entity的存活性以及resource_id的image类型段
-        校验失败直接发送关联原请求的LoadAgentImageResult::Err
-        复制根目录、限制和原请求，建立本次请求的关联回执保障
-        在函数内部构造拥有全部读取参数的异步闭包
-        闭包调用read_image_files读取和解析所有镜像内容，将普通读取错误保存在输出中
-        闭包返回AgentImageReadOutput，保留原请求和关联回执保障；外层错误类型为AsyncTaskError
-        通过send_async_closure将闭包提交到配置的计划
-        不建立按镜像ID合并并发请求的全局pending表
+    检查id.trim()非空、resource_id类型为image、完整target Entity存活
+    失败直接发送保留id/target/resource_id的LoadAgentImageResult::Err
+    克隆配置，建立Arc<AtomicBool>及Arc<CompletionGuard>
+    构造拥有所有参数的异步闭包，调用read_image_files
+    普通读取错误放在输出result中，外层类型为AsyncTaskError
+    输出持有supervision类型擦除Arc，持续拥有guard；不提前解除监督责任
+    send_async_closure提交到配置计划，每个请求独立读取，不合并同ID或不同target
 
 handle_mount_agent_image(world: &mut World, output: AgentImageReadOutput)
-    处理挂载结果：crate公开函数
-    行为：
-        取得原请求和读取结果，已完成回复的请求不重复挂载或回复
-        读取失败时发送关联原请求的LoadAgentImageResult::Err，原镜像条目不改变
-        读取成功时重新检查目标完整Entity是否存活，目标失效时发送TargetNotAlive错误
-        根据读取数据构造AgentImage
-        目标已有ResourceSet<AgentImage>时，仅按请求resource_id插入或替换该条目
-        目标没有集合时创建集合、插入条目，再通过受检资源集合挂载入口挂到目标Entity
-        挂载失败发送MountFailed错误，不先删除旧集合或旧条目
-        挂载完成后发送LoadAgentImageResult::Ok，表示指定目标上的条目已可用
-        将本次关联回执标记为完成，避免正常释放时再次报告失败
-        不修改Workspace组件、不启动Agent、不解释工作区状态机
+    completed为true则跳过，避免重复挂载/回复
+    普通读取失败保持目标旧集合与key不变
+    成功时重新检查完整target的generation及存活性
+    克隆已有ResourceSet或创建空集合，只插入/替换请求resource_id对应条目
+    调用insert_resources受检入口挂载集合；失败不先删除旧集合/旧key
+    发送关联LoadAgentImageResult，发送后才completed.store(true)
 ```
 
 私有：
 ```text
-read_image_files(root: &Path, id: &ResourceID, limits: &AgentImageLoadLimits) -> Result<AgentImageData, AgentImageLoadError>
-    读取镜像数据：私有异步函数
-    行为：
-        按root/scope/name/tag定位目录，检查路径链及两个必需文件为允许的普通目录和文件，不接受symlink
-        只读取agent.toml和base.lua，不扫描或拒绝无关目录项
-        通过read_text_bounded有界读取两个文件，要求有效UTF-8
-        解析agent.toml并检查schema_version为1，模型ID非空且无控制字符
-        读取模型名和可选推理参数，检查模型ID、停止序列数量和单序列长度上限
-        将依赖id解析为ResourceID，依赖项只包含id，不接受source字段
-        保存base.lua源码和来源路径，不编译、不执行Lua，也不解析IMPORT或INJECT语句
-        全部成功后返回AgentImageData；任一失败不提交部分镜像内容
+read_image_files(root: &Path, id: &ResourceID, limits: &AgentImageLoadLimits) -> Result<AgentImage, ImageLoadError>
+    检查root全部路径组件及scope/name/tag目录链为普通目录，拒绝symlink
+    仅读取agent.toml、base.lua，不扫描、不拒绝其他目录项，包括无关symlink
+    对两个自有文件执行普通文件检查、有界读取及UTF-8校验
+    解析agent.toml：schema_version必须为1；inference模型配置必需
+    模型名trim非空、长度有界且无控制字符
+    temperature若存在需有限且位于[0,2]；top_p若存在需有限且位于[0,1]
+    max_output_tokens若存在不能为0；stop数量和每项字节长度受限
+    dependencies默认空，每项只允许id字段，source及其他未知依赖字段拒绝
+    每个依赖id解析为ResourceID；不校验依赖存在性，不从模型配置推理依赖
+    base.lua仅保存源码和origin，不编译/执行Lua，不解析IMPORT、INJECT或默认可见性
+    全部成功后返回共享AgentImage；不提交部分内容
 
-read_text_bounded(path: &Path, maximum: u64) -> Result<String, AgentImageLoadError>
-    有界读取文本：私有异步函数
-    行为：
-        确认允许的普通文件类型，最多读取maximum加一字节
-        超过上限返回LimitExceeded，读取失败返回ReadFailed，非UTF-8返回DecodeFailed
+read_text_bounded(path: &Path, maximum: u64) -> Result<String, ImageLoadError>
+    symlink_metadata确认普通文件且非symlink
+    open后take(maximum.saturating_add(1))，最多读取上限加一字节
+    超限、I/O错误或非UTF-8均返回ImageLoadError
+
+normalize_root(root: PathBuf) -> Result<PathBuf, ImageLoadError>
+    要求绝对路径、拒ParentDir，消除CurDir，不mkdir
+
+check_path(path: &Path, directory: bool) -> Result<(), ImageLoadError>
+    使用symlink_metadata检查存在性、非symlink和期望普通类型
 ```
 
 ## 逻辑
 
 ```text
-挂载与通知：
-    LoadAgentImage -> 异步读取 -> 主线程挂载ResourceSet<AgentImage> -> LoadAgentImageResult
-    Workspace收到成功通知只确认目标集合中存在对应ID，不再次挂载镜像
-    加载失败不清空旧资源；读取全部成功且目标有效时才替换条目
-    目标Entity的generation必须匹配，不将旧结果写入复用其index的新实体
-
-并发与所有权：
-    每个请求独立读取，不合并不同目标Entity的请求
-    一个目标的更新不会自动传播到其他Entity的同ID条目
-    同一目标同ID并发加载暂按挂载发生顺序覆盖，不保证较晚提交请求最终胜出
-    若后续需要最新请求优先，应另加版本校验，不假称当前机制已保证
-    组件与资源集合随目标Entity销毁，加载插件不延长目标生命周期
-
-读取边界：
-    保留基础路径检查、有界读取、UTF-8和清单校验
-    删除完整目录快照、文件修改时间签名和读取前后对比，不承诺两个文件的原子版本快照
-    不保留无消费方的源码SHA-256字段，不把源码哈希当成加载正确性保证
-    不验证推理后端是否存在，不执行依赖资源的IMPORT，不验证Lua业务行为
+读取失败、目标失效、受检挂载失败都保留旧key；目标index复用不接受旧generation输出
+单目标单key更新不传播其他目标；同target同key并发按挂载发生顺序覆盖，不保证最新提交胜出
+只检查路径及两个自有文件；删除目录完整snapshot、mtime签名、前后版本对比与sourcehash
+不承诺两文件原子快照，也不承诺对恶意并发路径替换提供无TOCTOU的安全打开
+不查询推理backend/模型路由，不导入依赖，不验证Lua业务逻辑
 ```
 
 # events
 
-## 定义位置
-
-所有事件无论对外业务通知还是内部调度，都定义在共享types的`agent_image_events.rs`，插件实现不再有`events.rs`。内部仅表示用途，不意味着在共享crate中使用pub(crate)后其他crate仍能访问；供插件使用的事件需要公开可见。
-
-自动异步响应仍是框架的`Result<T, E>`，不另造包装事件；其中具名输出、错误及其传递所需的关联契约也在共享事件文件定义，不使共享types反向依赖插件私有类型。Plugin配置和非事件处理状态仍留在实现侧。基础设施事件如ClosureRequest沿用基础设施定义，不在业务文件复制。
-
-镜像继续以LoadAgentImageResult完成Workspace请求，不增加oneshot或公共LoadCompletion trait。读取输出携带共享Arc<AtomicBool>完成标记；私有保障对象由闭包捕获，正常读取返回后解除读取阶段兜底，由主线程结果收口承担后续完成责任。异常路径一次性设置标记并发送关联错误，不先于正常挂载发布成功。
-
 ## 类型
 
-公开，统一定义于共享types crate的agent_image_events.rs：
+公开，定义于共享types/agent_image_events.rs：
 ```text
-LoadAgentImage：加载并挂载镜像请求，公开事件
-    id: String--唯一加载请求ID
-    target: Entity--目标完整Entity，Workspace创建流程传入Workspace Entity
-    resource_id: ResourceID--image类型的镜像地址
-    impl Event for LoadAgentImage
+LoadAgentImage：请求，impl Event，Clone + Debug
+    id: String
+    target: Entity--完整目标Entity
+    resource_id: ResourceID
 
-LoadAgentImageResult：镜像挂载结果通知，公开事件
-    id: String--原请求ID
-    target: Entity--原目标完整Entity
-    resource_id: ResourceID--原镜像地址
-    result: Result<(), AgentImageLoadError>--成功表示条目已挂载，不返回独立镜像Entity
-    impl Event for LoadAgentImageResult
+LoadAgentImageResult：挂载后的通知，impl Event，Clone + Debug
+    id: String
+    target: Entity
+    resource_id: ResourceID
+    result: Result<(), ImageLoadError>--Ok表示指定target上的key已可用，不返回镜像Entity
+
+AgentImageReadOutput：内部异步通道具名输出，Clone
+    request: LoadAgentImage
+    result: Result<AgentImage, ImageLoadError>--使用共享条目，无额外AgentImageData搬运层
+    completed: Arc<AtomicBool>--一次性完成标记
+    supervision: Arc<dyn Send + Sync>--类型擦除的私有CompletionGuard所有权
 ```
 
 ## 逻辑
 
 ```text
-本插件直接使用共享types中的全部事件，不保留src/events.rs或同名事件定义
-ClosureRequest是通用闭包设施内部事件，不在本插件重新定义
-Result<AgentImageReadOutput, AsyncTaskError>是自动异步响应类型，不是另一份公开镜像事件
-结果id、target和resource_id在成功与失败两条路径都保留
+没有插件本地events.rs或重复事件；基础ClosureRequest沿用框架定义
+自动异步结果为Result<AgentImageReadOutput, AsyncTaskError>，不增加包装Event
+Workspace仍通过LoadAgentImageResult完成关联，不增加oneshot或公共LoadCompletion trait
+supervision随输出及其所有Clone持续存活，避免读取完成后解除guard导致的输出丢弃窗口
 ```
 
 # types
@@ -251,108 +209,83 @@ Result<AgentImageReadOutput, AsyncTaskError>是自动异步响应类型，不是
 
 公开：
 ```text
-AgentImageModelConfig：镜像模型配置，公开结构体
-    model: String--模型ID
-    temperature: Option<f32>--可选采样温度
-    max_output_tokens: Option<u32>--可选输出上限
-    top_p: Option<f32>--可选核采样参数
-    stop: Vec<String>--停止序列
+AgentImageModelConfig：共享types/resource_components.rs中的公开结构体
+    model: String
+    temperature: Option<f32>
+    max_output_tokens: Option<u32>
+    top_p: Option<f32>
+    stop: Vec<String>
+
+AgentImageLoadLimits：插件公开结构体，Clone + Copy + Debug
+    max_manifest_bytes: u64--默认64KiB
+    max_script_bytes: u64--默认4MiB
+    max_model_id_bytes: usize--默认1024
+    max_stop_sequences: usize--默认128
+    max_stop_sequence_bytes: usize--默认4096
 ```
 
 crate公开：
 ```text
-AgentImageLoadConfig：镜像加载配置，crate公开Resource--只保存配置，不保存请求注册表
-    root: Arc<PathBuf>--全局镜像根目录
-    schedule: String--闭包分发计划
-    limits: AgentImageLoadLimits--读取限制
-    impl Resource for AgentImageLoadConfig
+AgentImageLoadConfig：Clone + Resource，只保存配置，无pending表
+    root: PathBuf
+    schedule: String
+    limits: AgentImageLoadLimits
 
-AgentImageLoadLimits：镜像读取限制，crate公开结构体
-    max_manifest_bytes: u64--清单读取上限
-    max_script_bytes: u64--Lua源码读取上限，必须有界
-    max_model_id_bytes: usize--模型ID长度上限
-    max_stop_sequences: usize--停止序列数量上限
-    max_stop_sequence_bytes: usize--单个停止序列长度上限
+AgentImageManifest：Deserialize
+    schema_version: u32
+    inference: AgentImageModelConfig
+    dependencies: Vec<AgentImageDependencyDocument>--默认空
 
-AgentImageData：异步准备的镜像数据，公开共享契约--定义于agent_image_events.rs--不含任何World借用
-    base_driver: Arc<str>--已读取源码
-    origin: Arc<PathBuf>--来源路径
-    dependencies: Arc<[ResourceID]>--已解析依赖地址
-    model: AgentImageModelConfig--已解析模型配置
+AgentImageDependencyDocument：Deserialize，deny_unknown_fields
+    id: String
+```
 
-AgentImageReadOutput：可关联的异步读取结果，公开共享契约--定义于agent_image_events.rs，仅供内部结果通道使用
-    request: LoadAgentImage--原请求上下文
-    result: Result<AgentImageData, AgentImageLoadError>--普通读取成功或失败
-    completed: Arc<AtomicBool>--共享一次性结果发布标记，不引用插件保障类型或公共完成trait
-
-AgentImageLoadCompletion：加载请求回执保障，crate公开结构体--在异步任务非正常结束时仍能关联失败请求
-    request: LoadAgentImage--原请求上下文
-    events: RuntimeEventSender--线程安全事件发送器
-    completed: Arc<AtomicBool>--与读取输出共享一次性结果发布标记
-    armed: bool--私有读取兜底是否仍持有责任，正常转交主线程时解除
-    impl Drop for AgentImageLoadCompletion
-        drop(&mut self)
-            兜底回复：armed且尚未完成时一次性设置共享标记并发送原请求LoadAgentImageResult::Err(TaskFailed)；正常读取转交时解除armed，主线程在挂载成功或失败时一次性完成标记与事件。
+私有，定义于handler：
+```text
+CompletionGuard：关联请求监督保障
+    request: LoadAgentImage
+    events: RuntimeEventSender
+    completed: Arc<AtomicBool>
+    impl Drop
+        最后一份Arc释放时，completed.swap(true)仍为false则发送一次关联业务失败
+        消息为image task failed before mount completion
+        捕获发送过程panic以避免析构二次panic；不保证Runtime退出后继续消费
+    没有armed字段，没有提前解除读取阶段监督的分支
 ```
 
 ## 逻辑
 
 ```text
-简化的数据流：
-    不保留AgentImageReadTask事件、全局pending等待表或并发合并列表
-    删除AgentImageDependencies、AgentImageBaseDriver和AgentImageModelParameters的薄包装
-    删除默认可见性字段、方法、类型及parse_default_visibility
-    AgentImageData用于区分异步准备数据与最终挂载条目，不再叠加Prepared、Payload、Mutex<Option<Output>>多层搬运
-    读取结果用Arc支持低成本复制；关联回执对象由异步闭包持有并转交到输出中
-
-监督失败关联：
-    AsyncTaskError本身不带原请求ID，不能只依赖From<AsyncTaskError>完成业务失败路由
-    关联回执对象从任务捕获阶段一直活到挂载结束
-    任务panic或取消导致捕获内容释放时，由最后一份未完成的回执对象发送关联失败
-    正常读取成功或普通失败时，回执随输出存活，主线程发出业务结果后再标记完成
-    本System是该内部结果类型唯一的挂载消费者，完成标记防止重复结果被再次处理
-    实现时必须验证成功、读取错误、panic和取消都恰好回复一次，不能出现先标记完成后丢失结果的窗口
-    Runtime整体关闭后不保证消费方继续接收，回执保障不意味着应用退出后仍可处理事件
+guard在闭包提交捕获阶段建立；取消或panic释放捕获内容时回复失败
+正常读取后guard转入output.supervision，结果事件被丢弃时仍触发失败
+正常主线程回复后设置completed，guard正常释放不再次报告
+完成标记由唯一主线程挂载消费者使用；不将异步线程成功当成挂载成功
+无Prepared/Payload/Mutex<Option<Output>>层，无AgentImageData和旧模型/源码/依赖薄包装
+14个测试覆盖实际target挂载/其他keys保留、多target、成功重载、失败保旧、generation复用、
+    无关文件/目录/symlink忽略、自有symlink拒绝、两文件UTF-8及边界、清单参数/依赖source校验、
+    open无mkdir/路径检查、guard取消/panic/输出丢弃/重复失败恰好一次回复
 ```
 
 # error
 
 ## 类型
 
-公开，共享错误契约：
+公开，定义于共享types/agent_image_events.rs：
 ```text
-AgentImageLoadErrorKind：镜像加载错误分类，公开枚举
-    InvalidRequest
-    InvalidRoot
-    InvalidResourceID
-    NotFound
-    InvalidFileType
-    SymlinkNotAllowed
-    LimitExceeded
-    ReadFailed
-    DecodeFailed
-    UnsupportedSchema
-    InvalidModelConfig
-    TargetNotAlive
-    MountFailed
-    TaskFailed
-
-AgentImageLoadError：镜像加载错误，公开结构体
-    kind: AgentImageLoadErrorKind--错误分类
-    message: String--有界错误描述
-    impl Clone + Debug + PartialEq + Eq for AgentImageLoadError
-    impl fmt::Display for AgentImageLoadError
-        格式化错误：输出分类与错误描述
-    impl std::error::Error for AgentImageLoadError
+ImageLoadError：Clone + Debug + PartialEq + Eq
+    message: String--共享构造器保存文本；插件私有error helper限制描述为512 UTF-8字节
+    new(message: impl Into<String>) -> Self
+    impl Display + std::error::Error
+        Display仅输出message
+AgentImageLoadError：插件导出的ImageLoadError兼容别名
 ```
 
 ## 逻辑
 
 ```text
-错误返回：
-    公开结果的错误表示请求未成功挂载，旧条目不会因此被删除
-    AsyncTaskError仅作为自动异步响应的外层监督错误，不包含请求关联信息
-    删除旧AgentImageTaskError业务中转层，由关联回执保障补齐监督失败通知
-    不保留默认可见性、Prompt读取、BaseMcl或目录快照变化相关的旧错误分类
-    错误及公开镜像数据必须可由共享事件层引用，不让共享types反向依赖本插件形成循环
+无ImageLoadErrorKind/AgentImageLoadErrorKind；错误以有界描述关联业务请求
+AsyncTaskError沿用框架，仅为外层监督错误，本身不携带原请求ID
+CompletionGuard补齐关联失败，不只记日志让请求等待
+不保留本地error.rs或旧AgentImageTaskError中转层
+失败不删除目标旧镜像key；读取成功仍不表示推理路由或依赖内容已经可用
 ```

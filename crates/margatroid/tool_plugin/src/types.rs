@@ -1,70 +1,81 @@
-use std::sync::Arc;
+use crate::{ToolError, ToolErrorKind};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::time::Duration;
 
-use agent_plugin::ToolExecutor;
-use core_plugin::Entity;
-use margatroid_types::ResourceRef;
-
-use crate::ToolError;
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ToolTemplate {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolExecutionLimits {
+    pub script_bytes: usize,
+    pub argument_bytes: usize,
+    pub output_bytes: usize,
+    pub diagnostic_bytes: usize,
+    pub memory_bytes: usize,
+    pub instruction_budget: u64,
+    pub execution_timeout: Duration,
+    pub host_call_timeout: Duration,
+    pub cleanup_timeout: Duration,
 }
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ResourceContent {
-    Tool { script_path: std::path::PathBuf },
-    Skill { content_path: std::path::PathBuf },
-    Hook,
-    Prompt { role: String, content: Arc<str> },
-    Sandbox { policy: Arc<str> },
-}
-
-impl ToolTemplate {
-    pub fn new(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        parameters: serde_json::Value,
-    ) -> Result<Self, ToolError> {
-        let template = Self {
-            name: name.into(),
-            description: description.into(),
-            parameters,
-        };
-        validate_template(&template)?;
-        Ok(template)
+impl Default for ToolExecutionLimits {
+    fn default() -> Self {
+        Self {
+            script_bytes: 1024 * 1024,
+            argument_bytes: 256 * 1024,
+            output_bytes: 1024 * 1024,
+            diagnostic_bytes: 256 * 1024,
+            memory_bytes: 64 * 1024 * 1024,
+            instruction_budget: 10_000_000,
+            execution_timeout: Duration::from_secs(30),
+            host_call_timeout: Duration::from_secs(10),
+            cleanup_timeout: Duration::from_secs(3),
+        }
     }
 }
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ResourceMapEntry {
-    pub resource_id: ResourceRef,
-    pub resource_name: String,
-    pub alias: Option<String>,
-    pub executor: Option<ToolExecutor>,
-    pub template: Option<ToolTemplate>,
-    pub content: Option<ResourceContent>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolCallRequest {
-    pub effect_id: String,
-    pub turn_id: String,
-    pub agent: Entity,
-    pub executor: ToolExecutor,
-    pub resource_id: ResourceRef,
-    pub tool_call_id: String,
-    pub arguments: String,
-}
-
-pub(crate) fn validate_template(template: &ToolTemplate) -> Result<(), ToolError> {
-    if template.description.trim().is_empty() || !template.parameters.is_object() {
-        return Err(ToolError::new(
-            crate::ToolErrorKind::InvalidDefinition,
-            "tool template is invalid",
-        ));
+impl ToolExecutionLimits {
+    pub fn validate(&self) -> Result<(), ToolError> {
+        if [
+            self.script_bytes,
+            self.argument_bytes,
+            self.output_bytes,
+            self.diagnostic_bytes,
+            self.memory_bytes,
+        ]
+        .contains(&0)
+            || self.instruction_budget == 0
+            || self.execution_timeout.is_zero()
+            || self.host_call_timeout.is_zero()
+            || self.cleanup_timeout.is_zero()
+            || self.host_call_timeout > self.execution_timeout
+        {
+            return Err(ToolError::new(
+                ToolErrorKind::InvalidRequest,
+                "invalid execution limits",
+            ));
+        }
+        Ok(())
     }
-    Ok(())
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolContext {
+    pub agent_id: String,
+    pub resource_id: String,
+    pub call_id: String,
+    pub turn: Option<String>,
+    pub project_root: PathBuf,
+    pub temp_dir: PathBuf,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[doc(hidden)]
+pub struct RunnerRequest {
+    pub protocol_version: u32,
+    pub script: String,
+    pub arguments: serde_json::Value,
+    pub context: ToolContext,
+    pub limits: ToolExecutionLimits,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[doc(hidden)]
+pub struct RunnerResponse {
+    pub protocol_version: u32,
+    pub result: Result<String, ToolError>,
+    pub cleanup_proven: bool,
 }

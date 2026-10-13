@@ -41,15 +41,15 @@ types      共享components    Workspace状态机、操作进度与执行能力
 error      共享错误契约       错误定义归属见error板块
 ```
 
-**本文是目标设计，尚未同步到代码。本次只修改Workspace设计文档。**
+**Workspace生命周期、共享组件与工作区执行线程已实现。本文保留六板块契约格式；当前源码归属与实现边界见下文，不将规划接口或外部运行能力当作已完成证明。**
 
 # lib
 
 ## 组件定义位置
 
-Workspace图书馆组件及其实现方法、WorldWorkspaceExt声明与World实现；WorkspaceState等组件公开关联类型随组件契约组织，计划写入共享types crate的`workspace_components.rs`。对应全部事件写入各自的`*_events.rs`，不在插件实现crate重复定义。
+Workspace组件、状态与WorldWorkspaceExt已位于共享types的`workspace_components.rs`；事件位于`workspace_events.rs`，线程执行能力位于`workspace_execution.rs`。Plugin、System与生命周期Handler仍在Workspace插件。
 
-此处只标注未来源码归属，尚未创建或迁移源码文件。文档仍在lib板块描述图书馆类型和资源类型；Plugin、System、Handler及插件私有加载状态不随组件迁入共享文件。
+实际执行入口接收Send的FnOnce工厂，非Send本地Future在工作区线程的current-thread runtime与LocalSet中创建和运行。关闭受理与线程join分开：close_admission拒绝新任务但不取消已受理任务；WorkspaceExecutionClose.close异步等待所有受理任务收口并缓存join结果，取消一个close等待者不丢失线程句柄。工作区停止必须先完成Agent停止链；线程join不是Driver、活动或MCL清理的替代证明。执行入口本身只做低层受理，Running及启动授权由共享World扩展检查。
 
 ## 类型
 

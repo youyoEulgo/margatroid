@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 margatroid_types = { path = "../types" }
+resource_id_plugin = { path = "../resource_id_plugin" }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 

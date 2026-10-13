@@ -1,56 +1,20 @@
-mod error;
-mod events;
 mod handler;
 mod system;
 mod types;
 
 use app_runtime_plugin::RuntimePlugin;
-use core_plugin::{App, Component, Plugin, Resource};
-use resource_id_plugin::ResourceIdPluginInstalled;
-use server_plugin::{WebSocketConnectionId, WebSocketConnections};
+use core_plugin::{App, Plugin, Resource};
+use resource_id_plugin::{ResourcePluginInstalled, WorldResourceExt};
+use server_plugin::WebSocketConnections;
 
-pub use error::ClientError;
-pub use events::{ClientRegistrationResult, RegisteredClient};
 pub use handler::registered_client;
+pub use margatroid_types::client_components::{Client, WorldClientExt};
+pub use margatroid_types::client_events::{
+    ClientError, ClientRegistrationResult, RegisteredClient,
+};
 pub use types::client_source;
 
 use crate::system::{client_disconnect_system, client_registration_system};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Client {
-    connection_id: WebSocketConnectionId,
-    client_type: String,
-    name: String,
-}
-
-impl Client {
-    pub(crate) fn new(
-        connection_id: WebSocketConnectionId,
-        client_type: String,
-        name: String,
-    ) -> Self {
-        Self {
-            connection_id,
-            client_type,
-            name,
-        }
-    }
-
-    pub fn connection_id(&self) -> WebSocketConnectionId {
-        self.connection_id
-    }
-
-    pub fn client_type(&self) -> &str {
-        &self.client_type
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl Component for Client {}
-impl library_component_plugin::LibraryComponent for Client {}
 
 #[derive(Clone, Debug)]
 pub struct ClientPlugin {
@@ -91,9 +55,12 @@ impl Plugin for ClientPlugin {
         if !app.world().contains_resource::<WebSocketConnections>() {
             panic!("ServerPlugin must be installed before ClientPlugin");
         }
-        if !app.world().contains_resource::<ResourceIdPluginInstalled>() {
-            panic!("ResourceIdPlugin must be installed before ClientPlugin");
+        if !app.world().contains_resource::<ResourcePluginInstalled>() {
+            panic!("ResourcePlugin must be installed before ClientPlugin");
         }
+        app.world_mut()
+            .register_library::<Client>("client")
+            .expect("client library registration failed");
         app.world_mut().insert_resource(ClientPluginInstalled);
         app.add_system(&self.schedule, client_registration_system)
             .add_system(&self.schedule, client_disconnect_system);

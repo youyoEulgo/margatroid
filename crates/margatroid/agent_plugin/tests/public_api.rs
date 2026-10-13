@@ -1,101 +1,488 @@
-use agent_plugin::{AgentCreateReply, AgentMcl, AgentTurnState, TokenUsageState};
-use margatroid_types::{Block, BlockInner, BlockPath, Message, RefBlock, TokenUsage};
+use agent_plugin::*;
+use app_runtime_plugin::RuntimePlugin;
+use core_plugin::{App, Entity, Event, World};
+use margatroid_types::{
+    execution_components::ExecutionActivityKind,
+    lua_runtime_components::{
+        DriverCloseHandle, DriverLuaVmInstance, LuaRuntimeError, LuaRuntimeErrorKind,
+    },
+    lua_runtime_events::*,
+    resource_components::*,
+    workspace_components::*,
+    workspace_execution::spawn_workspace_execution,
+};
+use resource_id_plugin::{ResourceID, ResourcePlugin, ResourceSet, WorldResourceExt};
+use std::{collections::BTreeMap, sync::Arc};
 
-fn message_path() -> BlockPath {
-    BlockPath {
-        block_id: "conversation".to_owned(),
-        inner_id: "messages".to_owned(),
+fn id(kind: &str, name: &str) -> ResourceID {
+    ResourceID::new(kind, "test", name, None).unwrap()
+}
+fn events<E: Event + Clone>(world: &mut World) -> Vec<E> {
+    world.advance_event_frame();
+    world.event_reader::<E>().into_iter().cloned().collect()
+}
+struct Fixture {
+    app: App,
+    request: StartAgent,
+    close: margatroid_types::workspace_execution::WorkspaceExecutionClose,
+    _temp: tempfile::TempDir,
+}
+fn fixture() -> Fixture {
+    let mut app = App::new();
+    app.add_plugin(RuntimePlugin::default())
+        .add_plugin(ResourcePlugin);
+    let world = app.world_mut();
+    world.insert_resource(margatroid_types::mcl_environment::MclEnvironmentFactory(
+        Arc::new(|| margatroid_types::lua_environment::LuaEnvironment::default()),
+    ));
+    world.register_library::<Workspace>("workspace").unwrap();
+    world
+        .register_resources::<ResourceSet<AgentImage>>("image")
+        .unwrap();
+    world
+        .register_resources::<ResourceSet<ToolResource>>("tool")
+        .unwrap();
+    world
+        .register_resources::<ResourceSet<SkillResource>>("skill")
+        .unwrap();
+    world
+        .register_resources::<ResourceSet<HookResource>>("hook")
+        .unwrap();
+    world
+        .register_resources::<ResourceSet<PromptResource>>("prompt")
+        .unwrap();
+    world
+        .register_resources::<ResourceSet<SandboxResource>>("sandbox")
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = world.spawn();
+    let request = StartAgent {
+        id: "original".into(),
+        resource_id: id("agent", "one"),
+        workspace,
+        image: id("image", "base"),
+        definition: AgentStartDefinition {
+            project_root: temp.path().into(),
+            home_root: temp.path().join("home"),
+            history_path: temp.path().join("history.sqlite"),
+        },
+    };
+    let (entry, close) = spawn_workspace_execution().unwrap();
+    let definition = WorkspaceDefinition {
+        id: id("workspace", "one"),
+        name: "one".into(),
+        manager: "one".into(),
+        project_root: temp.path().into(),
+        agents: vec![],
+    };
+    world
+        .insert_library(
+            workspace,
+            Workspace::new(
+                definition,
+                WorkspaceState::Starting(WorkspaceStartState {
+                    request_id: "workspace-start".into(),
+                    pending_images: BTreeMap::new(),
+                    image_members: BTreeMap::new(),
+                    pending_agents: BTreeMap::from([(
+                        request.id.clone(),
+                        request.resource_id.clone(),
+                    )]),
+                    error: None,
+                }),
+                entry,
+                close.clone(),
+            ),
+        )
+        .unwrap();
+    let mut images = ResourceSet::new();
+    images.insert(
+        request.image.clone(),
+        AgentImage {
+            base_driver: Arc::from("ready()"),
+            origin: Arc::new(temp.path().join("driver.lua")),
+            dependencies: Arc::from([id("tool", "not-preloaded")]),
+            model: AgentImageModelConfig {
+                model: "model-one".into(),
+                temperature: Some(0.2),
+                max_output_tokens: None,
+                top_p: None,
+                stop: vec![],
+            },
+        },
+    );
+    world.insert_resources(workspace, images).unwrap();
+    app.add_plugin(AgentPlugin::default());
+    Fixture {
+        app,
+        request,
+        close,
+        _temp: temp,
     }
 }
-
-#[test]
-fn agent_mcl_owns_blocks_and_enforces_one_block_namespace() {
-    let mut mcl = AgentMcl::default();
-    let mut block = Block::default();
-    block
-        .inners
-        .insert("messages".to_owned(), BlockInner::Message(Vec::new()));
-    mcl.create_block("conversation".to_owned(), block).unwrap();
-
-    assert!(mcl
-        .create_ref_block("conversation".to_owned(), RefBlock::default())
-        .is_err());
-    assert_eq!(mcl.blocks().blocks.len(), 1);
-    assert!(mcl.ref_blocks().blocks.is_empty());
+fn start(f: &mut Fixture) -> (Entity, StartDriverLuaVm) {
+    handle_start_agent(f.app.world_mut(), f.request.clone());
+    let requests = events::<StartDriverLuaVm>(f.app.world_mut());
+    assert_eq!(requests.len(), 1);
+    (requests[0].owner, requests[0].clone())
 }
-
-#[test]
-fn agent_mcl_rejects_wrong_types_without_mutating_the_field() {
-    let mut mcl = AgentMcl::default();
-    let mut block = Block::default();
-    block
-        .inners
-        .insert("messages".to_owned(), BlockInner::Message(Vec::new()));
-    mcl.create_block("conversation".to_owned(), block).unwrap();
-
-    assert!(mcl
-        .replace_range(&message_path(), 0, 0, BlockInner::ResourceId(Vec::new()))
-        .is_err());
-    assert_eq!(mcl.select(&message_path()).unwrap().len(), 0);
-}
-
-#[test]
-fn turn_state_only_finishes_the_active_turn() {
-    let mut turn = AgentTurnState::default();
-    turn.begin("turn-1".to_owned()).unwrap();
-    assert!(turn.begin("turn-2".to_owned()).is_err());
-    assert!(turn.finish("turn-2").is_err());
-    turn.finish("turn-1").unwrap();
-    assert_eq!(turn.turn_id, None);
-}
-
-#[test]
-fn token_usage_saturates_and_updates_the_cache_hit_rate() {
-    let mut state = TokenUsageState::default();
-    state.add(&TokenUsage {
-        input_tokens: 100,
-        output_tokens: 20,
-        cache_hit_tokens: 25,
-    });
-    assert_eq!(state.total_input_tokens, 100);
-    assert_eq!(state.last_input_tokens, 100);
-    assert_eq!(state.cache_hit_rate, 0.25);
+fn make_running(
+    f: &mut Fixture,
+    entity: Entity,
+    request: &StartDriverLuaVm,
+) -> DriverLuaVmInstance {
+    let instance = DriverLuaVmInstance {
+        owner: entity,
+        start_request_id: request.id.clone(),
+    };
+    let agent = f
+        .app
+        .world_mut()
+        .get_component_mut::<Agent>(entity)
+        .unwrap();
+    agent.lua.instance = Some(instance.clone());
+    agent.lua.close = Some(DriverCloseHandle::new(instance.clone()));
+    handle_start_driver_lua_vm_result(
+        f.app.world_mut(),
+        StartDriverLuaVmResult {
+            id: request.id.clone(),
+            owner: entity,
+            result: Ok(()),
+        },
+    );
+    instance
 }
 
 #[tokio::test]
-async fn create_reply_closes_when_all_reply_handles_are_dropped() {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    let reply = AgentCreateReply::new(sender);
-    drop(reply);
-    assert!(receiver.await.is_err());
+async fn start_waits_for_ready_and_keeps_resources_empty() {
+    let mut f = fixture();
+    let (entity, request) = start(&mut f);
+    let world = f.app.world();
+    let agent = world.get_component::<Agent>(entity).unwrap();
+    assert!(matches!(agent.state, AgentState::Creating { .. }));
+    assert_eq!(agent.info.model.model, "model-one");
+    assert_eq!(agent.info.image_dependencies.len(), 1);
+    assert!(agent.history.list().unwrap().is_empty());
+    assert!(world
+        .get_component::<ResourceSet<ToolResource>>(entity)
+        .unwrap()
+        .is_empty());
+    assert!(world
+        .get_component::<ResourceSet<SkillResource>>(entity)
+        .unwrap()
+        .is_empty());
+    assert!(world
+        .get_component::<ResourceSet<HookResource>>(entity)
+        .unwrap()
+        .is_empty());
+    assert!(world
+        .get_component::<ResourceSet<PromptResource>>(entity)
+        .unwrap()
+        .is_empty());
+    assert!(world
+        .get_component::<ResourceSet<SandboxResource>>(entity)
+        .unwrap()
+        .is_empty());
+    assert!(request
+        .environment
+        .globals
+        .iter()
+        .any(|g| g.name == "agent_info"));
+    handle_start_driver_lua_vm_result(
+        f.app.world_mut(),
+        StartDriverLuaVmResult {
+            id: "stale".into(),
+            owner: entity,
+            result: Ok(()),
+        },
+    );
+    assert!(matches!(
+        f.app.world().get_component::<Agent>(entity).unwrap().state,
+        AgentState::Creating { .. }
+    ));
+    make_running(&mut f, entity, &request);
+    let replies = events::<StartAgentResult>(f.app.world_mut());
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].id, "original");
+    assert_eq!(replies[0].result, Ok(entity));
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn failure_requires_cleanup_proof_before_despawn() {
+    for kind in [
+        LuaRuntimeErrorKind::CompileFailed,
+        LuaRuntimeErrorKind::CleanupFailed,
+    ] {
+        let mut f = fixture();
+        let (entity, request) = start(&mut f);
+        handle_start_driver_lua_vm_result(
+            f.app.world_mut(),
+            StartDriverLuaVmResult {
+                id: request.id,
+                owner: entity,
+                result: Err(LuaRuntimeError::new(kind, "failed")),
+            },
+        );
+        assert_eq!(
+            f.app.world().is_alive(entity),
+            kind == LuaRuntimeErrorKind::CleanupFailed
+        );
+        if let Some(agent) = f.app.world().get_component::<Agent>(entity) {
+            assert!(matches!(
+                agent.state,
+                AgentState::Stopping {
+                    vm_request_id: None,
+                    ..
+                }
+            ));
+            assert!(agent.execution.is_closed());
+            assert!(!agent.mcl.accepting);
+        }
+        assert!(events::<StartAgentResult>(f.app.world_mut())[0]
+            .result
+            .is_err());
+        f.close.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn stop_closes_admission_coalesces_waiters_and_requires_matching_result() {
+    let mut f = fixture();
+    let (entity, request) = start(&mut f);
+    handle_stop_agent(
+        f.app.world_mut(),
+        StopAgent {
+            id: "too-early".into(),
+            agent: entity,
+        },
+    );
+    assert!(events::<StopAgentResult>(f.app.world_mut())[0]
+        .result
+        .is_err());
+    let instance = make_running(&mut f, entity, &request);
+    let activity = f
+        .app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .execution
+        .register(ExecutionActivityKind::Other)
+        .unwrap();
+    handle_stop_agent(
+        f.app.world_mut(),
+        StopAgent {
+            id: "stop-1".into(),
+            agent: entity,
+        },
+    );
+    handle_stop_agent(
+        f.app.world_mut(),
+        StopAgent {
+            id: "stop-2".into(),
+            agent: entity,
+        },
+    );
+    let stop = events::<StopDriverLuaVm>(f.app.world_mut());
+    assert_eq!(stop.len(), 1);
+    assert!(activity.cancel.is_cancelled());
+    assert!(f.app.world().is_alive(entity));
+    handle_stop_driver_lua_vm_result(
+        f.app.world_mut(),
+        StopDriverLuaVmResult {
+            id: "stale".into(),
+            owner: entity,
+            instance: instance.clone(),
+            result: Ok(()),
+        },
+    );
+    assert!(f.app.world().is_alive(entity));
+    activity.mark_completed().unwrap();
+    handle_stop_driver_lua_vm_result(
+        f.app.world_mut(),
+        StopDriverLuaVmResult {
+            id: stop[0].id.clone(),
+            owner: entity,
+            instance,
+            result: Ok(()),
+        },
+    );
+    assert!(!f.app.world().is_alive(entity));
+    let replies = events::<StopAgentResult>(f.app.world_mut());
+    assert_eq!(replies.len(), 2);
+    assert!(replies.iter().all(|reply| reply.result == Ok(entity)));
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn driver_exception_maps_once_without_inventing_original_error() {
+    let mut f = fixture();
+    let (entity, request) = start(&mut f);
+    let instance = make_running(&mut f, entity, &request);
+    let event = DriverLuaVmExceptionResult {
+        exception_id: "exception".into(),
+        instance,
+        result: Ok(()),
+        execution_ended: true,
+        cleanup_completed: true,
+    };
+    handle_driver_lua_vm_exception_result(f.app.world_mut(), event.clone());
+    handle_driver_lua_vm_exception_result(f.app.world_mut(), event);
+    let replies = events::<AgentExceptionResult>(f.app.world_mut());
+    assert_eq!(replies.len(), 1);
+    assert!(replies[0].error.is_none());
+    assert!(replies[0].cleanup_completed);
+    assert!(f.app.world().is_alive(entity));
+    assert_eq!(
+        f.app
+            .world()
+            .event_reader::<AgentException>()
+            .into_iter()
+            .count(),
+        0
+    );
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn image_lookup_never_uses_another_entity() {
+    let mut f = fixture();
+    f.app
+        .world_mut()
+        .get_component_mut::<ResourceSet<AgentImage>>(f.request.workspace)
+        .unwrap()
+        .remove(&f.request.image);
+    handle_start_agent(f.app.world_mut(), f.request.clone());
+    let replies = events::<StartAgentResult>(f.app.world_mut());
+    assert_eq!(
+        replies[0].result.as_ref().unwrap_err().kind,
+        AgentErrorKind::ImageNotLoaded
+    );
+    assert!(f.app.world().query_with::<Agent>().result().is_empty());
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_stop_retains_host_and_never_reuses_consumed_end_channel() {
+    let mut f = fixture();
+    let (entity, request) = start(&mut f);
+    let instance = make_running(&mut f, entity, &request);
+    handle_stop_agent(
+        f.app.world_mut(),
+        StopAgent {
+            id: "first".into(),
+            agent: entity,
+        },
+    );
+    let stops = events::<StopDriverLuaVm>(f.app.world_mut());
+    handle_stop_driver_lua_vm_result(
+        f.app.world_mut(),
+        StopDriverLuaVmResult {
+            id: stops[0].id.clone(),
+            owner: entity,
+            instance,
+            result: Err(LuaRuntimeError::new(
+                LuaRuntimeErrorKind::CleanupFailed,
+                "activity cleanup failed",
+            )),
+        },
+    );
+    let replies = events::<StopAgentResult>(f.app.world_mut());
+    assert_eq!(replies.len(), 1);
+    assert!(replies[0].result.is_err());
+    let agent = f.app.world().get_component::<Agent>(entity).unwrap();
+    assert!(matches!(
+        agent.state,
+        AgentState::Stopping {
+            vm_request_id: None,
+            ..
+        }
+    ));
+    assert!(agent.lua.close.is_some());
+    handle_stop_agent(
+        f.app.world_mut(),
+        StopAgent {
+            id: "retry".into(),
+            agent: entity,
+        },
+    );
+    assert!(events::<StopDriverLuaVm>(f.app.world_mut()).is_empty());
+    assert!(f
+        .app
+        .world()
+        .event_reader::<StopAgentResult>()
+        .into_iter()
+        .next()
+        .unwrap()
+        .result
+        .is_err());
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_exception_preserves_error_and_rejects_mismatched_identity() {
+    let mut f = fixture();
+    let (entity, request) = start(&mut f);
+    let instance = make_running(&mut f, entity, &request);
+    let agent = f.app.world().get_component::<Agent>(entity).unwrap();
+    let mut event = AgentException {
+        exception_id: "local".into(),
+        agent: entity,
+        resource_id: agent.resourceid.clone(),
+        workspace: agent.workspace.clone(),
+        instance,
+        error: AgentError::new(AgentErrorKind::BlockOperationFailed, "bad block"),
+        cleanup_completed: false,
+    };
+    event.resource_id = id("agent", "wrong");
+    handle_agent_exception(f.app.world_mut(), event.clone());
+    let rejected = events::<AgentExceptionResult>(f.app.world_mut());
+    assert!(rejected[0].result.is_err());
+    assert!(!f
+        .app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .execution
+        .is_closed());
+    event.resource_id = f.request.resource_id.clone();
+    handle_agent_exception(f.app.world_mut(), event.clone());
+    handle_agent_exception(f.app.world_mut(), event.clone());
+    let replies = events::<AgentExceptionResult>(f.app.world_mut());
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].error, Some(event.error));
+    assert!(!replies[0].cleanup_completed);
+    assert!(f
+        .app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .execution
+        .is_closed());
+    f.close.close().await.unwrap();
 }
 
 #[test]
-fn agent_mcl_replace_range_covers_the_empty_and_past_end_slot() {
-    let mut mcl = AgentMcl::default();
-    let mut block = Block::default();
+fn ordinary_block_namespace_type_and_range_invariants_are_preserved() {
+    use margatroid_types::block_types::{AgentBlock, BlockInner, BlockPath, InnerType};
+    let mut block = AgentBlock::default();
     block
-        .inners
-        .insert("messages".to_owned(), BlockInner::Message(Vec::new()));
-    mcl.create_block("conversation".to_owned(), block).unwrap();
+        .create(
+            "conversation".into(),
+            vec![("messages".into(), InnerType::Message)],
+        )
+        .unwrap();
+    assert!(block.create("conversation".into(), vec![]).is_err());
     let path = BlockPath {
-        block_id: "conversation".to_owned(),
-        inner_id: "messages".to_owned(),
+        block_id: "conversation".into(),
+        inner_id: "messages".into(),
     };
-    let message = |content: &str| {
-        BlockInner::Message(vec![margatroid_types::MclMessage::new(
-            Message::User {
-                content: content.to_owned(),
-            },
-            None,
-        )])
-    };
-
-    mcl.replace_range(&path, 0, 0, message("first")).unwrap();
-    assert_eq!(mcl.select(&path).unwrap().len(), 1);
-    mcl.replace_range(&path, 1, 1, message("second")).unwrap();
-    assert_eq!(mcl.select(&path).unwrap().len(), 2);
-    mcl.replace_range(&path, 0, 2, message("replaced")).unwrap();
-    assert_eq!(mcl.select(&path).unwrap().len(), 1);
-    assert!(mcl.replace_range(&path, 0, 3, message("past-end")).is_err());
+    assert!(block
+        .replace(&path, 0, 0, BlockInner::Tool(vec![]))
+        .is_err());
+    assert!(block.get(&path).unwrap().is_empty());
+    assert!(block
+        .replace(&path, 0, 1, BlockInner::Message(vec![]))
+        .is_err());
+    assert!(block.get(&path).unwrap().is_empty());
 }

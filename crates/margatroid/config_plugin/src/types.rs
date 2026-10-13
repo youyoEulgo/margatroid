@@ -10,12 +10,7 @@ use crate::ConfigError;
 
 pub(crate) const MAX_CONFIG_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum WebSocketMessageTarget {
-    Broadcast,
-    Type(String),
-    Name(String),
-}
+pub use margatroid_types::dto_events::WebSocketMessageTarget;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LogLevel {

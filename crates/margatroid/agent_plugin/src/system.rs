@@ -1,59 +1,60 @@
+use crate::*;
 use core_plugin::World;
-use lua_runtime_plugin::{LuaRuntimeTaskFinished, LuaVmStarted};
-
-use crate::{
-    handle_agent_control, handle_agent_create, handle_agent_initialization_completed,
-    handle_lua_vm_finished, handle_lua_vm_started, AgentControl, AgentCreateRequest,
-    AgentInitializationCompleted,
+use margatroid_types::lua_runtime_events::{
+    DriverLuaVmExceptionResult, StartDriverLuaVmResult, StopDriverLuaVmResult,
 };
 
-pub fn agent_create_system(world: &mut World) {
-    let requests = world
-        .event_reader::<AgentCreateRequest>()
+pub fn start_agent_system(world: &mut World) {
+    let requests: Vec<_> = world
+        .event_reader::<StartAgent>()
         .into_iter()
         .cloned()
-        .collect::<Vec<_>>();
+        .collect();
     for request in requests {
-        handle_agent_create(world, request);
+        handle_start_agent(world, request);
+    }
+    let results: Vec<_> = world
+        .event_reader::<StartDriverLuaVmResult>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for result in results {
+        handle_start_driver_lua_vm_result(world, result);
     }
 }
-
-pub fn agent_control_system(world: &mut World) {
-    let events = world
-        .event_reader::<AgentControl>()
+pub fn stop_agent_system(world: &mut World) {
+    let requests: Vec<_> = world
+        .event_reader::<StopAgent>()
         .into_iter()
         .cloned()
-        .collect::<Vec<_>>();
-    for event in events {
-        handle_agent_control(world, event);
+        .collect();
+    for request in requests {
+        handle_stop_agent(world, request);
+    }
+    let results: Vec<_> = world
+        .event_reader::<StopDriverLuaVmResult>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for result in results {
+        handle_stop_driver_lua_vm_result(world, result);
     }
 }
-
-pub fn agent_lua_vm_state_system(world: &mut World) {
-    let started = world
-        .event_reader::<LuaVmStarted>()
+pub fn agent_exception_system(world: &mut World) {
+    let results: Vec<_> = world
+        .event_reader::<DriverLuaVmExceptionResult>()
         .into_iter()
         .cloned()
-        .collect::<Vec<_>>();
-    for event in started {
-        handle_lua_vm_started(world, event);
+        .collect();
+    for result in results {
+        handle_driver_lua_vm_exception_result(world, result);
     }
-
-    let completed = world
-        .event_reader::<AgentInitializationCompleted>()
+    let requests: Vec<_> = world
+        .event_reader::<AgentException>()
         .into_iter()
         .cloned()
-        .collect::<Vec<_>>();
-    for event in completed {
-        handle_agent_initialization_completed(world, event);
-    }
-
-    let finished = world
-        .event_reader::<LuaRuntimeTaskFinished>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    for event in finished {
-        handle_lua_vm_finished(world, event);
+        .collect();
+    for request in requests {
+        handle_agent_exception(world, request);
     }
 }

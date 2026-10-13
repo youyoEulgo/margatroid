@@ -1,66 +1,53 @@
-mod error;
-mod events;
 mod handler;
 mod system;
+#[cfg(test)]
+mod tests;
 mod types;
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
-
-use app_runtime_plugin::{RuntimeHandle, RuntimePlugin, WorldEventExt};
+use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimeHandle;
+use closure_plugin::WorldClosureExt;
 use core_plugin::{App, Plugin, Resource};
 
-pub use error::LuaRuntimeError;
-pub use events::*;
-pub use margatroid_types::LuaVmId;
-pub use types::{
-    CancellationToken, HostFuture, LuaBindingValue, LuaEnvironment, LuaEnvironmentContext,
-    LuaEnvironmentProvider, LuaEnvironmentRegistry, LuaGlobalBinding, LuaHostFunction,
-    LuaModuleBinding, LuaProgram, LuaRuntimeConfig, LuaRuntimeHandle, LuaRuntimeReply,
-    LuaRuntimeResult, LuaScheduler, LuaStandardLibraries, LuaValue, LuaVmOwner, LuaVmSession,
-    LuaVmState,
-};
+pub use margatroid_types::lua_environment::*;
+pub use margatroid_types::lua_runtime_components::*;
+pub use margatroid_types::lua_runtime_events::*;
+pub use tokio_util::sync::CancellationToken;
+pub use types::LuaRuntimeConfig;
 
-use crate::system::{
-    lua_runtime_cancel_system, lua_runtime_request_system, lua_runtime_result_system,
+use system::{
+    driver_lua_vm_exception_system, start_driver_lua_vm_system, stop_driver_lua_vm_system,
 };
-use crate::types::LuaRuntimeState;
+use types::LuaRuntimeSchedule;
 
 pub struct LuaRuntimePlugin {
     schedule: String,
     config: LuaRuntimeConfig,
 }
-
 impl LuaRuntimePlugin {
     pub fn new() -> Self {
-        Self {
-            schedule: RuntimePlugin::UPDATE.to_owned(),
-            config: LuaRuntimeConfig::default(),
-        }
+        Self::default()
     }
-
     pub fn with_schedule(mut self, schedule: impl Into<String>) -> Self {
         self.schedule = schedule.into();
         self
     }
-
-    pub fn with_config(mut self, config: LuaRuntimeConfig) -> Self {
+    pub fn with_config(mut self, config: LuaRuntimeConfig) -> Result<Self, LuaRuntimeError> {
+        config.validate()?;
         self.config = config;
-        self
+        Ok(self)
     }
 }
-
 impl Default for LuaRuntimePlugin {
     fn default() -> Self {
-        Self::new()
+        Self {
+            schedule: RuntimePlugin::UPDATE.into(),
+            config: LuaRuntimeConfig::default(),
+        }
     }
 }
-
 pub struct LuaRuntimePluginInstalled;
-
 impl Resource for LuaRuntimePluginInstalled {}
-
 impl Plugin for LuaRuntimePlugin {
     fn build(self, app: &mut App) {
         if !app.world().contains_resource::<RuntimeHandle>()
@@ -74,18 +61,14 @@ impl Plugin for LuaRuntimePlugin {
         if !app.contains_schedule(&self.schedule) {
             panic!("LuaRuntimePlugin schedule does not exist");
         }
-        let events = app.world().event_sender();
-        let environments = Arc::new(RwLock::new(LuaEnvironmentRegistry::default()));
-        app.world_mut().insert_resource(LuaRuntimeHandle {
-            events,
-            environments,
-            suspensions: Arc::new(Mutex::new(HashMap::new())),
-        });
+        self.config.validate().expect("invalid Lua limits");
+        app.world().send_closure(&self.schedule, |_| {});
         app.world_mut().insert_resource(self.config);
-        app.world_mut().insert_resource(LuaRuntimeState::default());
+        app.world_mut()
+            .insert_resource(LuaRuntimeSchedule(self.schedule.clone()));
         app.world_mut().insert_resource(LuaRuntimePluginInstalled);
-        app.add_system(&self.schedule, lua_runtime_request_system)
-            .add_system(&self.schedule, lua_runtime_cancel_system)
-            .add_system(&self.schedule, lua_runtime_result_system);
+        app.add_system(&self.schedule, start_driver_lua_vm_system)
+            .add_system(&self.schedule, stop_driver_lua_vm_system)
+            .add_system(&self.schedule, driver_lua_vm_exception_system);
     }
 }

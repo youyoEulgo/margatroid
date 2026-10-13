@@ -27,3 +27,16 @@ tool_plugin = { path = "../../crates/margatroid/tool_plugin" }
 ui_plugin = { path = "../../crates/margatroid/ui_plugin" }
 tracing = { workspace = true }
 workspace_plugin = { path = "../../crates/margatroid/workspace_plugin" }
+
+closure_plugin = { path = "../../crates/mecs/closure_plugin" }
+tool_resource_plugin = { path = "../../crates/margatroid/tool_resource_plugin" }
+skill_resource_plugin = { path = "../../crates/margatroid/skill_resource_plugin" }
+hook_resource_plugin = { path = "../../crates/margatroid/hook_resource_plugin" }
+prompt_resource_plugin = { path = "../../crates/margatroid/prompt_resource_plugin" }
+sandbox_resource_plugin = { path = "../../crates/margatroid/sandbox_resource_plugin" }
+
+[dev-dependencies]
+margatroid_types = { path = "../../crates/margatroid/types" }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tempfile = "3"

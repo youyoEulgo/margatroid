@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 core_plugin = { path = "../../mecs/core_plugin" }
-app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 serde = { workspace = true }
 
 [dev-dependencies]

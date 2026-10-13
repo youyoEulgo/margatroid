@@ -1,133 +1,57 @@
-mod error;
-mod events;
 mod handler;
 mod system;
-mod types;
 
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
-use core_plugin::{App, Component, Plugin, Resource};
-use lua_runtime_plugin::{
-    LuaBindingValue, LuaEnvironment, LuaEnvironmentContext, LuaEnvironmentProvider,
-    LuaGlobalBinding, LuaRuntimeError, LuaRuntimeHandle, LuaRuntimePluginInstalled,
-};
-use resource_id_plugin::ResourceIdPluginInstalled;
+use core_plugin::{App, Plugin, Resource};
+use resource_id_plugin::{ResourcePluginInstalled, WorldResourceExt};
 
-pub use error::{failure, AgentCreateResult, AgentFailureKind};
-pub use events::*;
-pub use handler::{
-    control_stop, handle_agent_control, handle_agent_create, handle_agent_initialization_completed,
-    handle_lua_vm_finished, handle_lua_vm_started,
-};
-pub use margatroid_types::{AgentError, AgentErrorKind, AgentMessage, MclMessage};
-pub use system::{agent_control_system, agent_create_system, agent_lua_vm_state_system};
-pub use types::*;
-
-#[derive(Clone, Debug)]
-pub struct Agent {
-    pub info: AgentInfo,
-    pub creation: AgentCreationState,
-    pub mcl: AgentMcl,
-    pub resources: AgentResourceMap,
-    pub memory: AgentMemoryHandle,
-    pub inference: AgentInferenceState,
-    pub tools: AgentToolState,
-    pub lua: AgentLuaState,
-    pub lifecycle: AgentLifecycleState,
-    pub turn: AgentTurnState,
-    pub token_usage: TokenUsageState,
-    pub last_error: Option<AgentError>,
-}
-
-impl Agent {
-    pub fn info(&self) -> &AgentInfo {
-        &self.info
-    }
-
-    pub fn mcl(&self) -> &AgentMcl {
-        &self.mcl
-    }
-
-    pub fn mcl_mut(&mut self) -> &mut AgentMcl {
-        &mut self.mcl
-    }
-}
-
-impl Component for Agent {}
-impl library_component_plugin::LibraryComponent for Agent {}
+pub use handler::*;
+pub use margatroid_types::agent_components::{Agent, AgentInfo, AgentState, WorldAgentExt};
+pub use margatroid_types::agent_events::*;
+pub use system::*;
 
 pub struct AgentPlugin {
     schedule: String,
 }
-
 impl AgentPlugin {
     pub fn new() -> Self {
-        Self {
-            schedule: RuntimePlugin::UPDATE.to_owned(),
-        }
+        Self::default()
     }
-
     pub fn with_schedule(mut self, schedule: impl Into<String>) -> Self {
         self.schedule = schedule.into();
         self
     }
 }
-
 impl Default for AgentPlugin {
     fn default() -> Self {
-        Self::new()
+        Self {
+            schedule: RuntimePlugin::UPDATE.into(),
+        }
     }
 }
-
 pub struct AgentPluginInstalled;
 impl Resource for AgentPluginInstalled {}
-
 impl Plugin for AgentPlugin {
     fn build(self, app: &mut App) {
-        if app.world().contains_resource::<AgentPluginInstalled>() {
-            panic!("AgentPlugin is already installed");
-        }
-        if !app.contains_schedule(&self.schedule)
-            || !app.world().contains_resource::<RuntimeHandle>()
-        {
-            panic!("AgentPlugin requires RuntimePlugin");
-        }
-        if !app.world().contains_resource::<ResourceIdPluginInstalled>() {
-            panic!("AgentPlugin requires ResourceIdPlugin");
-        }
-        if !app.world().contains_resource::<LuaRuntimePluginInstalled>() {
-            panic!("AgentPlugin requires LuaRuntimePlugin");
-        }
-
+        assert!(
+            !app.world().contains_resource::<AgentPluginInstalled>(),
+            "AgentPlugin is already installed"
+        );
+        assert!(
+            app.contains_schedule(&self.schedule)
+                && app.world().contains_resource::<RuntimeHandle>(),
+            "AgentPlugin requires RuntimePlugin"
+        );
+        assert!(
+            app.world().contains_resource::<ResourcePluginInstalled>(),
+            "AgentPlugin requires ResourcePlugin"
+        );
+        app.world_mut()
+            .register_library::<Agent>("agent")
+            .expect("agent library registration failed");
         app.world_mut().insert_resource(AgentPluginInstalled);
-        app.world()
-            .get_resource::<LuaRuntimeHandle>()
-            .expect("LuaRuntimePlugin installed without LuaRuntimeHandle")
-            .register_provider(Box::new(AgentInfoEnvironmentProvider))
-            .expect("agent_info provider registration failed");
-
-        app.add_system(&self.schedule, agent_create_system)
-            .add_system(&self.schedule, agent_control_system)
-            .add_system(&self.schedule, agent_lua_vm_state_system);
-    }
-}
-
-struct AgentInfoEnvironmentProvider;
-
-impl LuaEnvironmentProvider for AgentInfoEnvironmentProvider {
-    fn name(&self) -> &str {
-        "agent_info"
-    }
-
-    fn provide(&self, context: &LuaEnvironmentContext) -> Result<LuaEnvironment, LuaRuntimeError> {
-        let value = context.values.get("agent_info").cloned().ok_or_else(|| {
-            LuaRuntimeError::EnvironmentFailed("agent_info is missing".to_owned())
-        })?;
-        Ok(LuaEnvironment {
-            globals: vec![LuaGlobalBinding {
-                name: "agent_info".to_owned(),
-                binding: LuaBindingValue::Value(value),
-            }],
-            modules: Vec::new(),
-        })
+        app.add_system(&self.schedule, start_agent_system)
+            .add_system(&self.schedule, stop_agent_system)
+            .add_system(&self.schedule, agent_exception_system);
     }
 }

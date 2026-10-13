@@ -1,165 +1,416 @@
-use margatroid_protocol::{
-    ClientInfoDto, ClientMessage, IntoDomain, MessageDto, ProtocolErrorKind, ResourceIdDto,
-    ServerMessage, ToolCallDto,
+use margatroid_protocol::*;
+use margatroid_types::{
+    history_components::HistoryError,
+    mcl_events::{MclCommand, MclCommandResult, MclValue},
+    message_types::{AgentMessage, InferenceResponse, StopReason, TokenUsage},
 };
-use margatroid_types::{Message, ToolCall};
-
-fn assistant(tool_name: &str) -> MessageDto {
-    MessageDto::Assistant {
-        reasoning: None,
-        content: None,
-        tool_calls: vec![ToolCallDto {
-            id: "manual-1".into(),
-            tool_name: tool_name.into(),
-            arguments: "{}".into(),
-        }],
-    }
+use resource_id_plugin::ResourceID;
+fn id(kind: &str, name: &str) -> ResourceID {
+    ResourceID::new(kind, "test", name, None).unwrap()
 }
-
 #[test]
-fn clients_may_inject_user_and_assistant_messages() {
-    assert_eq!(
-        MessageDto::User {
-            content: "hello".into(),
-        }
-        .into_domain(())
-        .unwrap(),
-        Message::User {
-            content: "hello".into(),
-        }
-    );
-    assert_eq!(
-        assistant("code_review").into_domain(()).unwrap(),
-        Message::Assistant {
-            reasoning: None,
-            content: None,
-            tool_calls: vec![ToolCall {
-                id: "manual-1".into(),
-                tool_name: "code_review".into(),
-                arguments: "{}".into(),
-            }],
-        }
-    );
-}
-
-#[test]
-fn clients_may_not_inject_server_side_facts() {
-    let rejected = [
-        MessageDto::Tool {
-            resource_id: ResourceIdDto("tool:local/read-file:latest".into()),
-            tool_call_id: "call-1".into(),
-            content: "contents".into(),
-            failed: false,
-        },
-        MessageDto::Error {
-            message: "boom".into(),
-        },
-    ];
-    for message in rejected {
-        let error = message.into_domain(()).unwrap_err();
-        assert!(matches!(error.kind(), ProtocolErrorKind::InvalidRequest));
-    }
-}
-
-#[test]
-fn clients_may_inject_context_carrying_any_message_but_an_injection() {
-    let injected = MessageDto::Inject {
+fn nested_injection_preserves_all_shared_message_shapes() {
+    let dto = AgentMessageDto::Inject {
         messages: vec![
-            MessageDto::User {
-                content: "please review".into(),
+            AgentMessageDto::Inject {
+                messages: vec![
+                    AgentMessageDto::ToolCall {
+                        resource_id: None,
+                        tool_call_id: "call".into(),
+                        tool_name: "unknown".into(),
+                        content: "failed".into(),
+                        failed: true,
+                    },
+                    AgentMessageDto::Assistant {
+                        reasoning: Some("thought".into()),
+                        content: None,
+                        tool_calls: vec![],
+                        usage: Some(TokenUsage {
+                            input_tokens: 9,
+                            output_tokens: 1,
+                            cache_hit_tokens: 2,
+                        }),
+                    },
+                ],
             },
-            MessageDto::Assistant {
+            AgentMessageDto::Error {
+                message: "error".into(),
+            },
+            AgentMessageDto::System {
+                content: "real system prompt".into(),
+            },
+        ],
+    };
+    let domain: AgentMessage = dto.clone().into_domain(()).unwrap();
+    let roundtrip: AgentMessageDto = (&domain).into_dto(()).unwrap();
+    assert_eq!(roundtrip, dto);
+    assert_eq!(
+        serde_json::to_value(&roundtrip).unwrap()["messages"][2]["type"],
+        "system"
+    );
+    assert_eq!(
+        serde_json::to_value(&roundtrip).unwrap()["messages"][0]["messages"][0]["type"],
+        "tool_call"
+    );
+}
+#[test]
+fn command_uses_arguments_and_source_only_from_conversion_context() {
+    let message = ClientMessage::mcl_command(
+        "command",
+        &WorkspaceReferenceDto::new("demo", "/tmp/demo"),
+        None,
+        "INJECT ?",
+        vec![serde_json::json!([{ "type": "user", "content": "hello" }])],
+    );
+    let value = serde_json::to_value(&message).unwrap();
+    assert_eq!(value["type"], "mcl.command");
+    assert!(value["message"].get("source").is_none());
+    assert!(value["message"].get("binding").is_none());
+    let ClientMessage::MclCommand {
+        id: request_id,
+        message,
+    } = message
+    else {
+        unreachable!()
+    };
+    let command: MclCommand = message
+        .into_domain((request_id, id("client", "real"), id("agent", "manager")))
+        .unwrap();
+    assert_eq!(command.source, id("client", "real"));
+    assert_eq!(command.command.arguments.len(), 1);
+}
+#[test]
+fn command_result_keeps_inference_stop_reason_usage_and_independent_history_error() {
+    let event = MclCommandResult {
+        id: "command".into(),
+        source: id("client", "real"),
+        target: id("agent", "manager"),
+        result: Ok(MclValue::Inference(InferenceResponse {
+            message: AgentMessage::Assistant {
                 reasoning: None,
-                content: None,
-                tool_calls: vec![ToolCallDto {
-                    id: "manual-1".into(),
-                    tool_name: "code_review".into(),
-                    arguments: "{}".into(),
-                }],
+                content: Some("partial".into()),
+                tool_calls: vec![],
+                usage: Some(TokenUsage {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                    cache_hit_tokens: 0,
+                }),
             },
-        ],
+            stop_reason: StopReason::Length,
+        })),
+        history_error: Some(HistoryError::WriteFailed("database".into())),
     };
-    let message = injected.into_domain(()).unwrap();
-    let Message::Inject { messages } = message else {
-        panic!("expected a context injection")
-    };
-    assert_eq!(messages.len(), 2);
-    assert!(matches!(messages[0], Message::User { .. }));
-    assert!(matches!(messages[1], Message::Assistant { .. }));
-
-    let nested = MessageDto::Inject {
-        messages: vec![MessageDto::Inject { messages: vec![] }],
-    };
-    let error = nested.into_domain(()).unwrap_err();
-    assert!(matches!(error.kind(), ProtocolErrorKind::InvalidRequest));
-
-    let server_side = MessageDto::Inject {
-        messages: vec![
-            MessageDto::Tool {
-                resource_id: ResourceIdDto("tool:local/read-file:latest".into()),
-                tool_call_id: "call-1".into(),
-                content: "recorded".into(),
-                failed: false,
-            },
-            MessageDto::Error {
-                message: "recorded failure".into(),
-            },
-        ],
-    };
-    let message = server_side.into_domain(()).unwrap();
-    let Message::Inject { messages } = message else {
-        panic!("expected a context injection")
-    };
-    assert!(matches!(messages[0], Message::Tool { .. }));
-    assert!(matches!(messages[1], Message::Error { .. }));
+    let dto: MclCommandResultDto = (&event).into_dto(()).unwrap();
+    let value = serde_json::to_value(ServerMessage::from(dto)).unwrap();
+    assert_eq!(value["type"], "mcl.command_result");
+    assert_eq!(value["result"]["Ok"]["Inference"]["stop_reason"], "length");
+    assert_eq!(
+        value["result"]["Ok"]["Inference"]["message"]["usage"]["input_tokens"],
+        2
+    );
+    assert_eq!(value["history_error"]["kind"], "HistoryWriteFailed");
 }
-
 #[test]
-fn the_standalone_assistant_message_type_is_gone() {
-    let request = serde_json::json!({
-        "type": "agent.assistant",
-        "id": "manual-1",
-        "message": {
-            "workspace": {
-                "id": "workspace:local/demo:latest",
-                "name": "demo",
-                "project_root": "/tmp/demo"
-            },
-            "agent": null,
-            "content": null,
-            "reasoning": null,
-            "tool_calls": []
+fn typed_arrays_project_resources_without_private_snapshots() {
+    use margatroid_types::{
+        block_types::BlockInner,
+        resource_components::{
+            CallableDefinitionSnapshot, CallableResource, HookResource, SandboxValue,
+            SkillResource, ToolResource,
+        },
+    };
+    let definitions = vec![
+        CallableDefinitionSnapshot::Tool(ToolResource {
+            alias: "original".into(),
+            description: "tool".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            script_path: "/private/tool.lua".into(),
+        }),
+        CallableDefinitionSnapshot::Hook(HookResource {
+            alias: "original".into(),
+            description: "hook".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            script_path: "/private/hook.lua".into(),
+        }),
+        CallableDefinitionSnapshot::Skill(SkillResource {
+            alias: "original".into(),
+            description: "skill".into(),
+            content_path: "/private/skill.md".into(),
+        }),
+    ];
+    let arrays = [
+        BlockInner::Tool(
+            definitions
+                .into_iter()
+                .enumerate()
+                .map(|(index, definition)| CallableResource {
+                    resource_id: id(["tool", "hook", "skill"][index], "resource"),
+                    alias: format!("bound{index}"),
+                    definition: std::sync::Arc::new(definition),
+                })
+                .collect(),
+        ),
+        BlockInner::Sandbox(vec![SandboxValue {
+            resource_id: id("sandbox", "safe"),
+            policy: "private-policy".into(),
+        }]),
+        BlockInner::Message(vec![AgentMessage::Inject {
+            messages: vec![AgentMessage::System {
+                content: "system".into(),
+            }],
+        }]),
+    ];
+    for array in arrays {
+        let event = MclCommandResult {
+            id: "get".into(),
+            source: id("client", "real"),
+            target: id("agent", "manager"),
+            result: Ok(MclValue::Array(array)),
+            history_error: None,
+        };
+        let dto: MclCommandResultDto = (&event).into_dto(()).unwrap();
+        let value = dto.result.unwrap();
+        assert_eq!(
+            value,
+            margatroid_types::mcl_projection::project_mcl_value(event.result.as_ref().unwrap())
+                .unwrap()
+        );
+        let encoded = value.to_string();
+        for private in [
+            "private",
+            "script_path",
+            "content_path",
+            "policy",
+            "definition",
+        ] {
+            assert!(!encoded.contains(private), "{encoded}");
         }
-    });
-    assert!(serde_json::from_value::<ClientMessage>(request).is_err());
+        if let Some(tools) = value["Array"].get("Tool") {
+            assert_eq!(tools[0]["alias"], "bound0");
+            assert_eq!(tools[0]["description"], "tool");
+            assert_eq!(tools[0].as_object().unwrap().len(), 4);
+            assert!(serde_json::from_value::<CallableResource>(tools[0].clone()).is_err());
+        }
+        if let Some(sandboxes) = value["Array"].get("Sandbox") {
+            assert_eq!(sandboxes[0].as_object().unwrap().len(), 1);
+        }
+        if let Some(messages) = value["Array"].get("Message") {
+            assert_eq!(messages[0]["messages"][0]["type"], "system");
+        }
+    }
 }
-
 #[test]
-fn registration_receipts_use_stable_server_shapes() {
-    let registered = serde_json::to_value(ServerMessage::ConnectionRegistered {
-        id: "register-1".into(),
+fn import_projection_retains_kind_and_manual_array_arguments_are_not_decoded_as_snapshots() {
+    use margatroid_types::block_types::InnerType;
+    let event = MclCommandResult {
+        id: "import".into(),
+        source: id("client", "real"),
+        target: id("agent", "manager"),
+        result: Ok(MclValue::ResourceImport {
+            kind: InnerType::Tool,
+            resource_id: id("tool", "read"),
+            alias: "reader".into(),
+        }),
+        history_error: None,
+    };
+    let dto: MclCommandResultDto = (&event).into_dto(()).unwrap();
+    assert_eq!(dto.result.unwrap()["ResourceImport"]["kind"], "Tool");
+    let dto = MclCommandDto {
+        workspace: WorkspaceReferenceDto::new("demo", "/tmp/demo"),
+        agent: None,
+        command: "SET TOOLS ?".into(),
+        arguments: vec![serde_json::json!(["reader"])],
+    };
+    let command: MclCommand = dto
+        .into_domain((
+            "manual".into(),
+            id("client", "real"),
+            id("agent", "manager"),
+        ))
+        .unwrap();
+    assert_eq!(
+        command.command.arguments,
+        vec![serde_json::json!(["reader"])]
+    );
+}
+#[test]
+fn registration_and_errors_use_correlated_bounded_shapes() {
+    let registered = ServerMessage::ConnectionRegistered {
+        id: "register".into(),
         client: ClientInfoDto {
             resource_id: ResourceIdDto("client:webui/console:1".into()),
             client_type: "webui".into(),
             name: "console".into(),
         },
+    };
+    let value = serde_json::to_value(registered).unwrap();
+    assert_eq!(value["type"], "connection.registered");
+    assert_eq!(value["client"]["resource_id"], "client:webui/console:1");
+    let error = ProtocolErrorDto::new("InvalidRequest", "错误".repeat(1000));
+    assert!(error.message.len() <= 512);
+    let value = serde_json::to_value(ServerMessage::ConnectionRegisterFailed {
+        id: "register".into(),
+        error,
     })
     .unwrap();
-    assert_eq!(registered["type"], "connection.registered");
-    assert_eq!(registered["id"], "register-1");
-    assert_eq!(
-        registered["client"]["resource_id"],
-        "client:webui/console:1"
-    );
-    assert_eq!(registered["client"]["client_type"], "webui");
-    assert_eq!(registered["client"]["name"], "console");
+    assert_eq!(value["error"]["kind"], "InvalidRequest");
+}
+#[test]
+fn old_mailbox_and_abort_entrypoints_are_not_accepted() {
+    for kind in [
+        "agent.assistant",
+        "agent.turn.abort",
+        "workflow.load",
+        "agent.message",
+    ] {
+        assert!(serde_json::from_value::<ClientMessage>(
+            serde_json::json!({"type": kind, "id": "old", "message": {}})
+        )
+        .is_err());
+    }
+    let domain: ResourceID = ResourceIdDto("tool:test/read".into())
+        .into_domain(())
+        .unwrap();
+    assert_eq!(domain.to_string(), "tool:test/read:latest");
+}
+#[test]
+fn message_conversion_enforces_depth_limit_without_a_type_whitelist() {
+    let mut dto = AgentMessageDto::Error {
+        message: "leaf".into(),
+    };
+    for _ in 0..34 {
+        dto = AgentMessageDto::Inject {
+            messages: vec![dto],
+        };
+    }
+    assert!(IntoDomain::<AgentMessage>::into_domain(dto, ()).is_err());
+}
 
-    let failed = serde_json::to_value(ServerMessage::ConnectionRegisterFailed {
-        id: "register-2".into(),
-        error: "client type is not a stable identifier".into(),
-    })
-    .unwrap();
-    assert_eq!(failed["type"], "connection.register_failed");
-    assert_eq!(failed["id"], "register-2");
-    assert_eq!(failed["error"], "client type is not a stable identifier");
+#[test]
+fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
+    use core_plugin::App;
+    use margatroid_types::{
+        agent_components::{Agent, AgentInfo, AgentState},
+        block_types::AgentBlock,
+        execution_components::AgentExecutionScope,
+        history_components::{AgentHistoryHandle, AgentHistoryStore, HistoryError, HistoryRecord},
+        lua_runtime_components::AgentLua,
+        mcl_events::AgentMclQueue,
+        resource_components::AgentImageModelConfig,
+        workspace_components::{
+            Workspace, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceError,
+            WorkspaceErrorKind, WorkspaceState,
+        },
+        workspace_execution::spawn_workspace_execution,
+    };
+    use resource_id_plugin::WorldResourceExt;
+    struct EmptyHistory;
+    impl AgentHistoryStore for EmptyHistory {
+        fn append_batch(&self, _: Vec<HistoryRecord>) -> Result<(), HistoryError> {
+            Ok(())
+        }
+        fn list(&self) -> Result<Vec<HistoryRecord>, HistoryError> {
+            Ok(vec![])
+        }
+    }
+    let mut app = App::new();
+    app.add_plugin(resource_id_plugin::ResourcePlugin);
+    let world = app.world_mut();
+    world.register_library::<Workspace>("workspace").unwrap();
+    world.register_library::<Agent>("agent").unwrap();
+    let workspace = world.spawn();
+    let (entry, close) = spawn_workspace_execution().unwrap();
+    let definition = WorkspaceDefinition {
+        id: id("workspace", "one"),
+        name: "one".into(),
+        manager: "manager".into(),
+        project_root: "/tmp/one".into(),
+        agents: vec![WorkspaceAgentDefinition {
+            id: id("agent", "manager"),
+            name: "manager".into(),
+            image: id("image", "base"),
+            home_root: "/tmp/home".into(),
+            history_path: "/tmp/history".into(),
+        }],
+    };
+    let reference: WorkspaceReferenceDto = (&definition).into_dto(()).unwrap();
+    world
+        .insert_library(
+            workspace,
+            Workspace::new(definition, WorkspaceState::Running, entry, close.clone()),
+        )
+        .unwrap();
+    let make_agent = || Agent {
+        resourceid: id("agent", "manager"),
+        workspace: id("workspace", "one"),
+        info: AgentInfo {
+            model: AgentImageModelConfig {
+                model: "model".into(),
+                temperature: None,
+                max_output_tokens: None,
+                top_p: None,
+                stop: vec![],
+            },
+            project_root: "/tmp/one".into(),
+            home_root: "/tmp/home".into(),
+            image: id("image", "base"),
+            image_dependencies: std::sync::Arc::from([]),
+        },
+        sandbox: Some(margatroid_types::resource_components::SandboxValue {
+            resource_id: id("sandbox", "safe"),
+            policy: "private-policy".into(),
+        }),
+        import_bindings: Default::default(),
+        lua: AgentLua::default(),
+        state: AgentState::Running,
+        history: AgentHistoryHandle::new(EmptyHistory),
+        block: AgentBlock::default(),
+        mcl: AgentMclQueue::default(),
+        execution: AgentExecutionScope::new(),
+        turn: None,
+    };
+    let old = world.spawn();
+    world.insert_library(old, make_agent()).unwrap();
+    world
+        .get_component_mut::<Workspace>(workspace)
+        .unwrap()
+        .insert_agent(id("agent", "manager"), old);
+    assert_eq!(resolve_agent(&world, &reference, None).unwrap().0, old);
+    let old_state: AgentStateDto = old.into_dto(&*world).unwrap();
+    assert_eq!(
+        old_state.sandbox,
+        Some(ResourceIdDto(id("sandbox", "safe").to_string()))
+    );
+    assert!(!serde_json::to_string(&old_state)
+        .unwrap()
+        .contains("private-policy"));
+    world.despawn(old);
+    let new = world.spawn();
+    world.insert_library(new, make_agent()).unwrap();
+    assert!(resolve_agent(&world, &reference, None).is_err());
+    world
+        .get_component_mut::<Workspace>(workspace)
+        .unwrap()
+        .insert_agent(id("agent", "manager"), new);
+    assert_eq!(resolve_agent(&world, &reference, None).unwrap().0, new);
+    let new_state: AgentStateDto = new.into_dto(&*world).unwrap();
+    assert_ne!(old_state.agent_instance, new_state.agent_instance);
+    let mut wrong = reference.clone();
+    wrong.project_root = "/tmp/wrong".into();
+    assert!(resolve_agent(&world, &wrong, None).is_err());
+    world
+        .get_component_mut::<Workspace>(workspace)
+        .unwrap()
+        .set_state(WorkspaceState::Failed {
+            error: WorkspaceError::new(WorkspaceErrorKind::InvalidRequest, "test cleanup"),
+        });
+    tokio_runtime_close(close);
+}
+fn tokio_runtime_close(close: margatroid_types::workspace_execution::WorkspaceExecutionClose) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(close.close())
+        .unwrap();
 }

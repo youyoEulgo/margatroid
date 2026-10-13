@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
-client_plugin = { path = "../client_plugin" }
 config_plugin = { path = "../config_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
 log_plugin = { path = "../../mecs/log_plugin" }
@@ -15,4 +14,4 @@ margatroid_types = { path = "../types" }
 serde_json = { workspace = true }
 server_plugin = { path = "../../mecs/server_plugin" }
 tracing = { workspace = true }
-workspace_plugin = { path = "../workspace_plugin" }
+resource_id_plugin = { path = "../resource_id_plugin" }

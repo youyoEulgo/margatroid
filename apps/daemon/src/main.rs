@@ -8,17 +8,23 @@ use agent_plugin::AgentPlugin;
 use app_runtime_plugin::{AppRunExt, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimePlugin;
 use client_plugin::ClientPlugin;
+use closure_plugin::{AppClosureExt, ClosurePlugin};
 use config_plugin::{ConfigPlugin, LogLevel as ConfigLogLevel};
 use core_plugin::App;
 use dto_plugin::DtoPlugin;
+use hook_resource_plugin::HookResourcePlugin;
 use inference_plugin::InferencePlugin;
 use log_plugin::{LogLevel, LogPlugin};
 use lua_runtime_plugin::LuaRuntimePlugin;
 use mcl_plugin::MclPlugin;
 use memory_plugin::MemoryPlugin;
-use resource_id_plugin::ResourceIdPlugin;
+use prompt_resource_plugin::PromptResourcePlugin;
+use resource_id_plugin::ResourcePlugin;
+use sandbox_resource_plugin::SandboxResourcePlugin;
 use server_plugin::{AppServerExt, ServerOptions, ServerPlugin};
+use skill_resource_plugin::SkillResourcePlugin;
 use tool_plugin::ToolPlugin;
+use tool_resource_plugin::ToolResourcePlugin;
 use tracing::info;
 use ui_plugin::UiPlugin;
 use workspace_plugin::WorkspacePlugin;
@@ -48,14 +54,12 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let agent_images = AgentImageLoaderPlugin::open(&agent_images_root)
         .map_err(|error| format!("cannot open agent image root: {error}"))?;
-    let workspace = WorkspacePlugin::open(&agent_images_root)
-        .map_err(|error| format!("cannot open workspace agent image root: {error}"))?;
+    let workspace = WorkspacePlugin::default();
     let global_config = ConfigPlugin::open(&config_path)
         .map_err(|error| format!("cannot open global configuration: {error}"))?;
     let bind = global_config.config().server_bind();
     let ingress = global_config.config().server_ingress().clone();
-    let mcl = MclPlugin::open(&data_root)
-        .map_err(|error| format!("cannot open MCL resource root: {error}"))?;
+    let mcl = MclPlugin::default();
     let mut log_plugin = LogPlugin::default()
         .with_stream(LOG_STREAM_CAPACITY)
         .with_level(log_level(global_config.config().log_level()));
@@ -66,19 +70,24 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
+        .add_plugin(ClosurePlugin)
+        .add_closure_system(RuntimePlugin::PRE_UPDATE)
+        .add_closure_system(RuntimePlugin::UPDATE)
         .add_plugin(LuaRuntimePlugin::default())
         .add_plugin(log_plugin)
         .add_plugin(ServerPlugin::with_options(
             ServerOptions::bind(bind).with_handshake_guard(ingress.clone()),
         ))
         .add_plugin(global_config)
-        .add_plugin(ResourceIdPlugin)
+        .add_plugin(ResourcePlugin)
+        .add_plugin(ToolResourcePlugin::open(data_root.clone())?)
+        .add_plugin(SkillResourcePlugin::open(data_root.clone())?)
+        .add_plugin(HookResourcePlugin::open(data_root.clone())?)
+        .add_plugin(PromptResourcePlugin::open(data_root.clone())?)
+        .add_plugin(SandboxResourcePlugin::open(data_root.clone())?)
         .add_plugin(agent_images)
         .add_plugin(InferencePlugin::default().with_config_path(models_path.clone()))
-        .add_plugin(
-            ToolPlugin::open(data_root.clone())
-                .map_err(|error| format!("cannot open tool root: {error}"))?,
-        )
+        .add_plugin(ToolPlugin::default())
         .add_plugin(MemoryPlugin::default())
         .add_plugin(AgentPlugin::default())
         .add_plugin(mcl)

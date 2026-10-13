@@ -40,9 +40,17 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 # error      src/error.rs      Error 与公开错误分类
 ```
 
+# 当前实现与旧设计归档
+
+当前实现以README及protocol当前wire为准。下文六板块保留为迁移前设计档案，不再要求恢复其中旧Mailbox、AgentFailure、资源visibility、Memory和oneshot pending轮询接口。
+
+当前入站仅connection.register、workspace.start/stop、mcl.command、state.query、history.query；source绑定共享Client.resource_id。共享WebSocketMessageSend为target+serde_json::Value，事件定义在types::dto_events，插件仅re-export。MCL结果按id/source/target关联并核对完整Client Entity；Workspace结果使用内部唯一operation_id还原网络id。断连清理MCL/start/stop网络pending，不取消已提交领域操作，迟到结果不重建网络关联。
+
+状态来自共享Agent.state/turn/sandbox/mcl和history.list；快照及接收连接集合未变化时不发送，避免event-driven自循环。HistoryRecord无持久sequence/time，投影sequence为list顺序1-based、created_at_ms=0表示未知。旧实时Memory、消息广播与AgentTokenUsage聚合不保留。
+
 # lib
 
-lib 放 Plugin、安装标记 Resource 和公开 re-export。
+以下为归档设计：lib 放 Plugin、安装标记 Resource 和公开 re-export。
 
 ## 类型
 

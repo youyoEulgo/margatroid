@@ -1,162 +1,106 @@
 # Compose
 
-## 统一资源身份约定
+## 统一身份与归属
 
 ```text
-Compose在输入边界解析AgentImage资源ID
-image进入WorkspaceDefinition前转换为ResourceId
-省略tag时补latest；编译结果不保留旧的provider + scope/name身份结构
-Compose只验证语法，不解析资源正文；运行时Provider负责按完整ResourceId查找资源
+输出类型定义于共享types的workspace_components模块：
+    WorkspaceDefinition { id, name, manager, project_root, agents }
+    WorkspaceAgentDefinition { id, name, image, home_root, history_path }
+地址统一使用ResourceID纯值，完整格式type:scope/name:tag，缺省标签latest。
+Compose只验证地址语法，不解析资源正文，不创建World或Entity。
 ```
 
 ## 类型
 
 公开：
 ```text
-ComposeErrorKind：Workspace文件编译错误分类，公开枚举--描述读取、解析和静态校验失败
+ComposeErrorKind：编译错误分类
     FileRead
     FileDecode
     InvalidDefinition
     InvalidPath
     InvalidName
     InvalidImageReference
-    InvalidResourceId
+    InvalidResourceReference
     DuplicateAgent
     MissingManager
-    impl Clone + Copy + PartialEq + Eq for ComposeErrorKind
-        值语义：公开trait实现
 
-ComposeError：Workspace文件编译错误，公开结构体--保存稳定分类和有界描述
-    kind: ComposeErrorKind--错误分类，私有
-    message: String--不包含完整配置正文的稳定描述，私有
+ComposeError：有界错误，公开值类型
+    kind: ComposeErrorKind--私有分类
+    message: String--私有描述，最多512字节，UTF-8边界截断
     kind(&self) -> ComposeErrorKind
-        取得分类：公开方法，返回错误分类
     message(&self) -> &str
-        取得描述：公开方法，返回有界错误描述
-    new(kind: ComposeErrorKind, message: impl Into<String>) -> Self
-        构造错误：私有关联函数，保存分类和有界描述
-    impl Clone + PartialEq + Eq for ComposeError
-        值语义：公开trait实现
-    impl fmt::Display for ComposeError
-        Display：公开trait实现，输出分类和描述
-    impl std::error::Error for ComposeError
-        Error：公开trait实现
+    impl Clone + Debug + PartialEq + Eq + Display + Error
 ```
 
 私有：
 ```text
-WorkspaceFile：YAML顶层文档，私有结构体--保存反序列化后的原始静态字段
-    name: String--Workspace逻辑名称
-    project_root: Option<PathBuf>--相对workspace文件目录的项目根
-    manager: Option<String>--默认入口Agent名称
-    agents: AgentDocuments--Agent映射或列表
+WorkspaceFile：拒绝未知字段的YAML顶层文档
+    name: String--必填逻辑名称
+    project_root: Option<PathBuf>--相对配置文件目录的项目根
+    manager: Option<String>--默认入口成员名称
+    agents: AgentDocuments--必填，可为空
 
-AgentDocuments：Agent文档集合，私有结构体--保留配置出现顺序
-    0: Vec<RawAgent>--原始Agent配置
-    impl Deserialize for AgentDocuments
-        Deserialize：公开trait实现，接受名称映射或带name字段的列表
-        deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            反序列化：使用AgentDocumentsVisitor接受映射或序列
+AgentDocuments：接受映射或序列并保留出现顺序
+    0: Vec<RawAgent>
+    Deserialize：映射键填入name；内部name若存在必须匹配键
+        序列保留条目，name必填检查在构造阶段执行
 
-AgentDocumentsVisitor：Agent集合访问器，deserialize内私有局部单元结构体
-    impl Visitor for AgentDocumentsVisitor
-        Value = AgentDocuments--反序列化结果
-        expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
-            描述输入：要求Agent定义映射或序列
-        visit_map<A>(self, map: A) -> Result<AgentDocuments, A::Error>
-            读取映射：把键写入RawAgent.name；内部name存在且与键不一致时失败
-        visit_seq<A>(self, sequence: A) -> Result<AgentDocuments, A::Error>
-            读取序列：按原顺序收集RawAgent，name必填校验留给build_definition
-
-RawAgent：Agent原始文档，私有结构体--等待编译为WorkspaceAgentDefinition
-    name: Option<String>--列表中的Agent名称；映射形式由键赋值
-    tag: Option<String>--Agent实例标签；省略时为latest
-    image: String--AgentImage引用文本
-    memory_path: Option<PathBuf>--Memory SQLite路径
+RawAgent：拒绝未知字段的成员输入
+    name: Option<String>--映射由键提供，序列必须显式提供
+    image: String--必填镜像地址
+    home_root: Option<PathBuf>--缺省读取真实HOME
+    history_path: Option<PathBuf>--输入别名memory_path
+    不接受tag、resources、disable_resources、tool_default或tool_dynamic字段
 ```
 
 ## 函数
 
-公开：
 ```text
 compile(path: impl AsRef<Path>) -> Result<WorkspaceDefinition, ComposeError>
-    编译Workspace文件：公开函数，读取并编译给定YAML文件
-    行为：将文件路径规范化后读取UTF-8 YAML，并以其父目录作为相对路径基准，返回静态WorkspaceDefinition
+    canonicalize文件路径，读取UTF-8 YAML，调用compile_str
+    路径读取失败返回FileRead
 
 compile_str(source: &str, workspace_file: impl AsRef<Path>) -> Result<WorkspaceDefinition, ComposeError>
-    编译Workspace文本：公开函数，使用给定workspace文件路径的父目录解析相对路径
-    行为：反序列化YAML，校验所有逻辑名称、ResourceId、Agent唯一性和manager，返回静态定义
-```
+    反序列化WorkspaceFile；缺字段、未知字段或无效YAML返回FileDecode
+    将workspace_file转绝对路径，以其父目录作为base，调用build_definition
 
-私有：
-```text
 build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefinition, ComposeError>
-    构造Workspace定义：私有函数，将原始文档转换为margatroid_types值类型
-    行为：解析项目根，按name构造workspace:local/<name>:latest资源ID，按Workspace名称、Agent名称和显式tag构造完整Agent资源ID，按配置顺序构造所有Agent，默认manager为第一个Agent，检查唯一性和manager存在
+    校验Workspace名称
+    project_root省略时使用base，显式路径按base解析
+    按原顺序逐个构造成员：
+        要求并校验name
+        image若无image:前缀则补前缀，解析为type=image的ResourceID
+        id固定为agent:<workspace-name>/<agent-name>:latest，无成员tag字段
+        home_root显式路径相对project_root；省略时读取并规范化真实HOME
+        history_path显式路径相对project_root；省略时生成
+            <project_root>/.margatroid/history/<agent-name>.sqlite
+    拒绝重复成员名称
+    非空成员：manager缺省第一个成员，要求合法且存在
+    空成员：manager缺省为空；显式空串合法，非空manager返回MissingManager
+    生成workspace:local/<workspace-name>:latest，返回完整静态定义
 
 validate_logical_name(value: &str, kind: &str) -> Result<(), ComposeError>
-    校验逻辑名称：私有函数，执行WorkspacePlugin相同的单路径段、长度和控制字符约束
+    非空、最多128字节、不是点或双点、不含斜杠反斜杠与控制字符
+    地址构造仍由ResourceID复核其字段约束
 
 absolute_path(path: &Path) -> Result<PathBuf, ComposeError>
-    取得绝对路径：私有函数，将相对路径按当前工作目录转换并执行词法规范化
+    相对输入先按当前目录拼接，再normalize_path
 
 resolve_path(base: &Path, path: PathBuf) -> Result<PathBuf, ComposeError>
-    解析相对路径：私有函数，将相对path按base转换为绝对路径并拒绝parent traversal
+    相对路径按base拼接，绝对路径直接规范化
 
 normalize_path(path: PathBuf) -> Result<PathBuf, ComposeError>
-    规范化路径：私有函数，移除当前目录组件并拒绝ParentDir，返回绝对路径
+    要求绝对路径，移除CurDir，拒绝任何ParentDir
 ```
 
-## 逻辑
+## 边界与生命周期
 
 ```text
-compile(path)
-    -> canonicalize workspace文件路径
-    -> 读取UTF-8文本
-    -> compile_str(source, canonical路径)
-
-compile_str(source, workspace_file)
-    -> serde_yaml反序列化WorkspaceFile；失败返回FileDecode
-    -> 确定workspace_file父目录作为base
-    -> build_definition(raw, base)
-
-build_definition
-    -> 校验Workspace名称
-    -> project_root省略时使用base，否则按base解析为绝对路径
-    -> 按agents配置顺序逐个处理
-       -> 映射形式把键写入name，列表形式要求name字段
-       -> 校验Agent名称
-       -> 构造type=image的ResourceId，失败返回InvalidImageReference
-       -> memory_path省略时保持None，否则相对project_root解析为绝对路径
-    -> 空Agent列表失败
-    -> 重复Agent名称失败
-    -> manager省略时取第一个Agent名称
-    -> manager不存在失败
-    -> 返回WorkspaceDefinition
-
-边界：
-    Compose只解析引用和路径，不读取AgentImage、Skill、Workflow、models.toml或Memory
-    Compose不创建World/Entity，不连接daemon，不发送网络请求
-    CLI或protocol负责将WorkspaceDefinition转换为后端请求
-    WorkspacePlugin仍对收到的WorkspaceDefinition执行运行时复核
-```
-
-## 持有关系
-
-```text
-Compose调用栈
-├── source: &str（compile_str期间借用）
-├── WorkspaceFile
-│   ├── name
-│   ├── project_root
-│   ├── manager
-│   └── AgentDocuments
-│       └── Vec<RawAgent>
-└── WorkspaceDefinition
-    └── Vec<WorkspaceAgentDefinition>
-        ├── id: ResourceId
-        ├── image: ResourceId
-        ├── Vec<ResourceId>
-        ├── Vec<ResourceId>
-        └── memory_path
+Compose不读取镜像、工具、Skill、模型路由或历史正文，不打开数据库。
+Compose不创建资源默认列表，不执行资源IMPORT，不维护可见性列表。
+memory_path只是一种输入拼写，不引入第二份Memory路径字段。
+输出只保存纯地址、名称与路径，无ECS Entity或运行期线程能力。
+CLI/protocol将定义发至后端，Workspace插件再执行运行期校验和生命周期管理。
+空工作区仍由Workspace插件创建专属执行线程，不等首个成员才创建。
 ```

@@ -40,15 +40,17 @@ types      共享components及契约    状态机、配置、历史接口和运�
 error      共享错误契约       生命周期与历史写入错误
 ```
 
-**本文是目标设计，尚未同步到Rust代码。本次只改Agent设计文档，不实现其他插件。**
+**本轮共享基础已实现：Block仅保留MESSAGE/TOOL/SANDBOX三typed数组，Agent保存ImportBindings并提供统一受检alias预检、绑定和读取接口；资源定义及沙箱策略为不可变导入快照。System消息契约已补充，history_append原允许范围不变。旧RESOURCE/TOOL_CALL数组不再属于当前API。**
+
+Agent生命周期及此前共享组件迁移已实现。本文保留六板块契约格式；下列源码归属与差异说明以当前实现为准，未列为已实现的扩展契约不得视为可调用API。
 
 # lib
 
 ## 组件定义位置
 
-Agent图书馆组件、AgentInfo、AgentState等公开关联类型，以及WorldAgentExt的声明和World实现，计划写入共享types crate的`agent_components.rs`。对应全部事件写入各自的`*_events.rs`，不在插件实现crate重复定义。
+Agent图书馆组件、AgentInfo、AgentState及WorldAgentExt已定义在共享types的`agent_components.rs`；事件位于`agent_events.rs`。Plugin、System与生命周期Handler仍在Agent插件，不依赖LuaRuntime或MCL实现crate。
 
-此处只标注未来源码归属，尚未创建或迁移源码文件。文档仍在lib板块描述图书馆类型和资源类型；Plugin、System、Handler及插件私有加载状态不随组件迁入共享文件。
+当前共享基础拆分：AgentLua和Driver通知能力位于`lua_runtime_components.rs`，AgentExecutionScope及AgentMclDrainHandle位于`execution_components.rs`，AgentMclQueue位于`mcl_events.rs`，普通Block位于`block_types.rs`，历史追加接口位于`history_components.rs`。ExecutionError由共享AgentError映射，不产生插件依赖循环。AgentState当前采用Creating/Stopping具名字段变体，而非下面伪代码中的单独状态结构体。启动从共享MclEnvironmentFactory取得环境，使用显式路径的SQLite历史存储；本文保留的World扩展方法以共享trait实际导出为准，不宣称所有规划的兼容入口均已存在。
 
 ## 类型
 
@@ -58,11 +60,12 @@ Agent：Agent图书馆组件，公开Component--自身身份和运行数据的�
     resourceid: ResourceID--Agent自身地址
     info: AgentInfo--从启动镜像和成员定义取得的静态配置快照
     workspace: ResourceID--所属工作区的逻辑地址
-    sandbox: Option<ResourceID>--当前激活的沙箱地址，None表示未激活
+    sandbox: Option<SandboxValue>--当前选中的完整ID及不可变policy快照，None表示未激活；不另设active_policy字段
     state: AgentState--Agent生命周期及当前启动或停止操作
     lua: AgentLua--wake槽位、ready与ended暂存槽位和Driver关闭句柄，不复制VM状态
     history: AgentHistoryHandle--历史表句柄，不含实时表或Block持久化接口
-    block: AgentBlock--仅保存普通Block的运行时容器
+    block: AgentBlock--仅保存普通Block的运行时容器，字段为MESSAGE/TOOL/SANDBOX typed数组
+    import_bindings: ImportBindings--Agent全域alias到ImportedValue的唯一权威绑定，存不可变快照/Arc而非重复资源正文
     execution: AgentExecutionScope--共享执行作用域，管理受理、根取消及活动真实完成等待
     mcl: AgentMclQueue--目标Agent的MCL指令FIFO队列、异步队首关联及收口通知
     turn: Option<String>--当前轮次代号，不保存旧turn聚合状态
@@ -95,22 +98,22 @@ AgentPlugin：Agent生命周期插件，公开结构体
 
 ## 扩展 trait
 
-公开，声明与实现均计划位于共享types crate的agent_components.rs：
+公开，声明与实现均位于共享types crate的agent_components.rs：
 ```text
 WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享类型层，不依赖agent_plugin实现
-    agent_switch_sandbox(&mut self, agent: &ResourceID, sandbox: Option<ResourceID>) -> Result<(), AgentError>
+    agent_switch_sandbox(&mut self, agent: &ResourceID, sandbox: Option<SandboxValue>) -> Result<(), AgentError>
         切换沙箱：公开方法
         行为：
             按agent地址查询唯一图书馆Entity，检查agent类型段及Agent组件
-            sandbox为Some时检查sandbox类型段，并检查该Entity的ResourceSet<SandboxResource>包含此ID
-            完全相同的当前配置为无修改操作，可幂等成功；同ID策略已改变不能仅按ID相等跳过检查
+            sandbox为Some时检查值的resource_id为sandbox类型，核对镜像许可、已导入来源及该Entity资源集合中的来源存在性；选择的是传入值的policy快照，不回查最新policy替换
+            完全相同的ID及policy为无修改操作，可幂等成功；同ID不同policy仍是策略切换，不能仅按ID相等跳过检查
             在execution短锁下检查沙箱活动并更新配置；普通runner、长期进程及取消中或清理失败的Sandbox活动未释放时返回ExecutionBusy
             Inference与Other活动不阻止切换；Stopping或清理失败受理关闭时拒绝修改
             活动登记、取得沙箱策略快照和沙箱配置切换使用同一把短锁，不能先检查后另行登记；锁不跨await
             查询或检查失败返回错误，保持原激活沙箱不变
             结束查询的不可变借用后取得Agent可变引用，更新sandbox；None表示取消激活
-            不加载资源，不修改已开始调用的策略快照；激活沙箱同ID策略重载也须经过活动检查
-    agent_cleanup_tasks(&mut self, agent: &ResourceID) -> Result<oneshot::Receiver<Result<(), AgentError>>, AgentError>
+            不加载资源，不修改已开始调用的策略快照；资源或alias重载不暗改Agent.sandbox，显式选择同ID新策略仍须经过活动检查
+    agent_cleanup_tasks(&self, agent: &ResourceID) -> Result<oneshot::Receiver<Result<(), AgentError>>, AgentError>
         请求清理所属任务：公开方法
         行为：
             定位完整Agent Entity，在execution短锁下暂停Sandbox活动受理并发起清理，仅取消Sandbox活动，不取消Inference或作用域根cancel
@@ -121,9 +124,9 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
             已结束且资源已清理、仅结果未被读取的任务不阻止沙箱切换
             清理后切换仍重新检查；清理与切换不是组合原子操作，受理登记与单次切换始终互斥
             清理具名输出与错误关联载荷定义在共享agent_events.rs，不调用ToolPlugin私有Handler
-    agent_register_activity(&mut self, agent: &ResourceID, kind: ExecutionActivityKind) -> Result<ExecutionActivity, AgentError>
+    agent_register_activity(&self, agent: &ResourceID, kind: ExecutionActivityKind) -> Result<ExecutionActivity, AgentError>
         登记活动：公开方法
-        行为：受检寻址完整Entity，在execution短锁内检查对应受理门、登记活动并取得不可变沙箱策略快照；Inference与Other不依赖沙箱
+        行为：受检寻址完整Entity，在execution短锁内检查对应受理门、登记活动并从Agent.sandbox选中的SandboxValue取得不可变沙箱策略快照，不用最新资源集合policy替换；Inference与Other不依赖沙箱
             返回活动cancel及完成能力，提交失败必须撤销未启动登记；提交成功后只能在真实清理完成时mark_completed
             不在World借用内await；普通runner、长期进程、Inference及Other都登记，停止统一等待，不用Future被丢弃代替清理
     agent_operate_block(&mut self, agent: &ResourceID, operation: BlockOperation) -> Result<BlockOperationResult, AgentError>
@@ -132,6 +135,22 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
             定位唯一Agent Entity并取得block
             调用Block容器对应的机械操作方法，保持字段类型和范围不变量
             返回类型化结果或错误，不解析MCL，不按字段名称推断业务用途
+    agent_validate_import(&self, agent: &ResourceID, alias: &str, kind: InnerType, resource_id: &ResourceID) -> Result<(), AgentError>
+        预检导入：公开方法，MCL与资源加载入口共用且不修改绑定。
+        行为：定位完整Agent Entity，检查来源属于镜像依赖、kind匹配来源类型及Agent全域alias冲突。
+            alias首字符为ASCII字母或下划线，后续仅ASCII字母、数字、下划线或连字符；点、空白及非ASCII字符拒绝。
+    agent_bind_import(&mut self, agent: &ResourceID, alias: String, value: ImportedValue) -> Result<(), AgentError>
+        绑定导入值：公开方法，声明与受检实现均属于共享agent_components，不是Agent插件或MCL私有registry
+        行为：
+            复用agent_validate_import预检，另核对CallableDefinitionSnapshot变体及CallableResource.alias与绑定alias相符
+            在统一ImportBindings检查alias，已有同alias不同完整ResourceID（含跨类型）返回AliasConflict，保持旧绑定不变
+            同ID同kind只有加载/重载成功、快照准备完整后才更新绑定；失败不发布新值，不提交工具执行
+            同ID重载改变alias时先检查新alias冲突，成功发布时移除旧alias绑定后写入新绑定，不留下同来源不同alias的分叉
+            写入的是MESSAGE消息快照、CallableResource或SandboxValue；工具定义及策略使用Arc共享，不复制正文
+            旧Block/GET值不随绑定更新；沙箱激活或活动策略更新仍遵守原execution互斥，不由绑定更新绕过
+    agent_get_import(&self, agent: &ResourceID, alias: &str) -> Result<BlockInner, AgentError>
+        读取导入值：公开方法，由共享agent_components统一受检实现
+        行为：定位完整Agent Entity，从唯一ImportBindings读取并返回对应typed数组快照；未知alias报错，不回查资源集合偷换快照
     agent_append_history_batch(&self, agent: &ResourceID, records: Vec<HistoryRecord>) -> Result<(), AgentError>
         批量追加历史：公开方法
         行为：定位唯一Agent Entity，调用history.append_batch，在同一事务中按幂等键追加全部记录；失败全部回滚并映射HistoryWriteFailed
@@ -178,7 +197,9 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
     校验封装在扩展内部，不要求每个调用者自行检查沙箱集合
     方法借用World而非取得所有权，返回后调用方自然继续使用World，不用返回World
     扩展只依赖共享组件、资源查询和历史抽象接口，不调用生命周期Handler、具体数据库或MCL解析器
-    资源集合仍是资源数据来源，Agent不复制工具描述、schema、正文或沙箱策略
+    资源集合仍是资源加载来源；Agent.import_bindings只保存alias绑定及共享不可变快照，不另复制工具描述、schema、正文或沙箱策略仓库
+    ImportBindings只有一个BTreeMap<String, ImportedValue>权威表，不为MESSAGE/TOOL/SANDBOX增设平行alias registries
+    统一alias校验与绑定读取属于共享agent_components的受检WorldAgentExt实现，MCL、Inference及工具准备不得各自维护不一致的检查
 
 MCL边界：
     不存在AgentControl入口，不转发MCL，不恢复长期VM邮箱投递
@@ -244,7 +265,7 @@ handle_start_agent(world: &mut World, request: StartAgent)
         取得模型配置、项目路径、Driver源码及声明的依赖地址，构造独立启动快照
         准备历史表句柄，失败时返回HistorySetupFailed，不发VM请求
         创建Agent Entity，通过受检图书馆入口挂载Agent，并挂载五种空资源集合
-        info保存配置，workspace保存工作区ResourceID，sandbox初始为空，lua初始化空wake槽位、空ready与ended暂存槽位和空关闭句柄，execution初始化共享开放作用域，block为空普通Block容器，mcl.commands为空VecDeque、mcl.pending为None、mcl.drained初始已收口，turn为None
+        info保存配置，workspace保存工作区ResourceID，sandbox初始为空，lua初始化空wake槽位、空ready与ended暂存槽位和空关闭句柄，execution初始化共享开放作用域，block为空普通Block容器，import_bindings初始化为空唯一绑定表，mcl.commands为空VecDeque、mcl.pending为None、mcl.drained初始已收口，turn为None
         生成VM启动子请求ID，先将原StartAgent请求ID和子请求ID写入Creating
         整理注入环境，包含完整Agent Entity、Agent地址、启动配置及所需环境能力，提交StartDriverLuaVm
         提交VM前的任何失败均释放本次已创建Entity和句柄，发送关联原请求的StartAgentResult::Err
@@ -481,11 +502,21 @@ MclPending：异步队首关联，公开类型--随队列定义于共享agent_co
     operation_id: String--本次异步操作唯一关联，防止迟到或重复结果命中另一操作
     cancel: CancellationToken--在途指令取消能力，Stopping时请求取消，结果路径仍完成回执
 
+ImportBindings与ImportedValue：共享导入绑定契约，具体定义由types统一维护
+    bindings: BTreeMap<String, ImportedValue>--ImportBindings唯一私有字段，alias在整个Agent内唯一
+    说明：ImportedValue::Message { resource_id, messages: Arc<[AgentMessage]> }保留prompt来源；Tool(CallableResource)/Sandbox(SandboxValue)由typed值自身保留来源ID，不重复身份字段。
+        CallableResource保留resource_id、alias及Arc<CallableDefinitionSnapshot>，定义分Tool/Skill/Hook typed变体；SandboxValue保留resource_id及Arc策略。
+        Callable定义固定描述、schema和路径等字段，不冻结路径对应的磁盘正文；执行仍按既有路径读取，不宣称文件内容版本快照。
+        ImportBindings.get提供只读alias查询，contains_resource只核对来源ID和kind，不以最新alias或definition替换旧Block快照。
+        同alias不同ID跨类型也拒绝；成功重载使新GET读取新值，旧Block持有旧快照不暗变；没有重复资源正文及额外registries。
+
 AgentBlock：运行时Block容器，公开类型--仅承载普通Block，不是额外Component
     blocks: BlockAssembly--普通Block存储，私有字段
     说明：复用共享Block字段类型及范围检查，不保留RefBlockAssembly、RefBlock或RefMerge
         类型和范围合法性由容器接口维护，MCL不绕过接口任意改内部map
-        多选择器读取由MCL按顺序取值并拼接快照，不建立引用，也不新增MERGE机械操作
+        字段只允许MESSAGE/TOOL/SANDBOX，删除RESOURCE/TOOL_CALL Block；ToolCall纯输入仍只属于Assistant.tool_calls，不构成GET数组
+        GET alias与selector lists由MCL按顺序取值并拼接同类型快照，mixed types先拒绝，空数组也保留type；不建立引用或新增MERGE机械操作
+        INJECT左侧使用相同GET规则，handler不按右侧目标字段做隐式类型转换
         不保留实时表、state_bindings或数据库同步职责；完整机械方法契约在Block领域设计中维护
 
 BlockOperation与BlockOperationResult：共享Block领域的类型化操作和结果契约
@@ -584,9 +615,13 @@ HistoryRecord：历史增量记录，公开共享类型
     不在Agent保存AgentTurnState、TokenUsageState和last_error等旧聚合字段；只保留turn代号，start_turn生成并替换，finish清空
     自动历史由MCL负责：除history_append外每条指令先批量事务记录成功才执行；inference追加assistant，tool_call按call id/index逐项记录结果含失败
     history_append自身采用同一批量事务接口，执行后历史失败单独history_error，不重跑已执行指令
-    AgentMessage是共享types消息值（inject/user/assistant/tool_call/error），不实现旧路由Event；inject(Vec<AgentMessage>)递归同类型，不设置内部白名单
-    tool_call的resource_id为Option<ResourceID>，无匹配工具为None，不虚构资源地址；其余正文、usage及错误字段遵循共享消息值契约
-    history_append接受AgentMessage数组，保留assistant usage和tool_call关联/失败详情；旧同名AgentMessage路由事件不继续
+    AgentMessage是共享types消息值，包含System（inject/system/user/assistant/tool_call/error），不实现旧路由Event；inject(Vec<AgentMessage>)递归同类型
+    IMPORT MESSAGE prompt:... AS alias按实际role生成消息，infer支持System；不能将所有prompt强制转为System或User
+    IMPORT TOOL tool:.../skill:.../hook:... AS alias与IMPORT SANDBOX sandbox:...使用同一Agent全域alias受检入口；hook执行行为尚未确认，TOOL导入类别不等于已有hook执行支持
+    tool_call effect第一MESSAGE数组恰好包含一个Assistant，第二参数为TOOL数组，从Assistant.tool_calls执行并返回MESSAGE结果；empty calls返回MESSAGE空数组
+    重复调用id、多个Assistant及工具alias冲突在任何submit前失败；tool_call effect不重复记输入Assistant，按call id/index记执行结果
+    tool_call结果消息的resource_id为Option<ResourceID>，无匹配工具为None，不虚构资源地址；其余正文、usage及错误字段遵循共享消息值契约
+    history_append允许范围独立保持inject/user/assistant/tool_call/error（包含inject递归内容校验），System不通过此effect追加；保留assistant usage和tool_call关联/失败详情，旧同名AgentMessage路由事件不继续
     不保存实时数据库句柄，不在Agent定义MCL转发和字段业务用途
 ```
 
@@ -610,6 +645,7 @@ AgentErrorKind：Agent生命周期及受检访问错误分类，公开枚举
     DriverStopFailed
     ResourceResolutionFailed
     InvalidResourceID
+    AliasConflict--Agent全域alias冲突在更新绑定或执行提交前失败
     SandboxNotLoaded
     ExecutionBusy
     TaskCleanupFailed
