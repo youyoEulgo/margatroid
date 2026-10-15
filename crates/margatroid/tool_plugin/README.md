@@ -1,8 +1,16 @@
 # ToolPlugin
 
+## 用户轮次中止目标（待实现）
+
+以下为已批准、尚待实现的目标，不表示当前运行时已支持。无 `get_turn`；状态采用 `creating/idle/working/stopping`。中止立即清空 turn，清理期间仍为 Working，正常 finish 收口才 Idle；同步必须同时包含 turn 与 status。用户轮次中止与根 Agent shutdown、owner abort、timeout、receiver closed 不同，不统一归一为正常取消。
+
+用户轮次中止且真实清理成功返回 `Ok(ToolExecuteResponse)`：ToolCall `failed=true`、`content="Tool call aborted."`，保留调用 ID、名称及已知 resource_id；未启动调用同用该正文。已完成结果保留；每个批次调用（含未启动项）按原顺序恰有一个结果。不伪造部分执行成功，取消不撤销已发生副作用。`CleanupFailed` 仍是 Err，保留活动，不宣称取消成功或空闲。
+
+AbortSystem 先于 MCL 实际执行与工具 admission；共享中止事件由各消费者独立观察，不依赖 take reply 独占通知。实际受理再次核对当前 turn 与请求快照；None 或已中止旧轮次不启动 runner，返回正常取消结果。
+
 ## 职责与请求
 
-ToolPlugin 每个 `ToolExecuteRequest` 只执行一个选定资源及匹配调用，通过唯一 oneshot 返回 `ToolExecuteResponse`。它不加载 metadata、不维护资源注册表或批次，不写历史、不执行推理，也不直接结束 turn；MCL 负责匹配、排序、结果收口及历史。
+ToolPlugin 每个 `ToolExecuteRequest` 只执行一个选定资源及匹配调用，通过唯一 oneshot 返回 `ToolExecuteResponse`。它不加载 metadata、不维护资源注册表或批次，不写历史、不执行推理，也不直接结束 turn；MCL 负责匹配、排序与结果收口；历史仅由显式 history_append 保存。
 
 共享请求位于 `margatroid_types::tool_events`，插件重新导出：
 

@@ -3,6 +3,14 @@
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
 
+## 用户轮次中止目标（待实现）
+
+本节及下文标注的中止行为是已批准的目标契约，不表示当前代码已实现；既有实现说明仅适用于未被该目标替换的部分。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
+
+Assistant 新增 `stop_reason`，包括 `StopReason::Cancelled`（`cancelled`）；兼容保留外层 `InferenceResponse.stop_reason`，两处从单一权威映射构造且始终相同。仅用户轮次中止在真实 cleanup 成功后返回 Ok：assistant `content="Turn aborted."`、`reasoning=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Cancelled`。`CleanupFailed` 仍为 Err，不能伪造取消或空闲；根 Agent shutdown、owner abort、timeout、receiver closed 保留独立原因。
+
+取消 assistant 可显式保存到历史，stop_reason 留在 payload 元数据而非正文，但不能放入 infer 上下文（含 Inject 嵌套）。AbortSystem 先于 MCL 执行及推理受理；共享事件由各消费者独立观察，不靠 take reply 独占通知。
+
 ## 介绍与职责
 
 `InferencePlugin` 执行一次模型请求：共享 `AgentMessage` 快照和选定 `CallableResource` 工具定义快照进入，完整 `InferenceResponse` 经 oneshot 返回。它不创建 Agent、不写历史、不执行工具、不自动重试、续写或压缩；命令收口由 MCL 负责；assistant 是否保存由调用方显式发出 history_append 决定，推理成功不触发 message 写入。压缩等调用方也使用同一个入口，自行解释响应。
@@ -81,20 +89,20 @@ world.send_event(InferenceRequest {
     agent,
     messages: vec![AgentMessage::User { content: "Review this patch.".into() }],
     tools: selected_callable_resources,
-    turn: None,
+    turn: Some("turn-1".into()), // 目标：当前活动轮次快照
     cancel: agent_scope.child_cancel(),
     reply: Arc::new(Mutex::new(Some(sender))),
 });
 // 异步调用方 await receiver，收到 Result<InferenceResponse, InferenceError>。
 ```
 
-主线程先认领原 Sender 并转入私有回复槽，重复克隆请求不会重复执行。校验完整 Agent Entity、请求 ID 和取消状态；从 `Agent.info.model` 获取模型与采样参数。`turn` 可为空，不作为推理唯一 ID。请求取消令牌与活动作用域派生 child 同时监督，即使请求使用独立令牌也不能绕过 Agent 停止。
+主线程先认领原 Sender 并转入私有回复槽，重复克隆请求不会重复执行。校验完整 Agent Entity、请求 ID 和取消状态；从 `Agent.info.model` 获取模型与采样参数。目标在实际受理时再次核对当前 turn 与请求快照；None 或已中止旧轮次返回正常 cancelled 响应，不启动 HTTP；turn 不作为推理唯一 ID。请求取消令牌与活动作用域派生 child 同时监督，即使请求使用独立令牌也不能绕过 Agent 停止。
 
 `tools: Vec<CallableResource>` 保存完整 ResourceID、选定 alias 及 `Arc<CallableDefinitionSnapshot>`。直接消费该快照的描述、schema 和资源种类，不按 ID 重取最新定义，也不重复 global alias query。归属校验要求目标 ResourceSet 中该 ID 存在、Agent.image_dependencies 许可，以及 ImportBindings 中该 ID/TOOL kind 已导入；不要求旧 snapshot 与 reload 后的新 alias/定义一致。visible alias 必须唯一，不按重复 ID 静默去重。
 
 tool 使用选定 schema；仅 tool 资源可作为 TOOL。空 tools 就是无工具，不回退默认集合。非法 schema、外部 `$ref` 或归属失败在 HTTP 提交前拒绝。
 
-`Inject` 递归按序展开；System、user、assistant、工具结果及 error 转为公开 `ProviderMessage`，System 与 prompt 的真实 role 不降格为 user。保留 reasoning、工具 ID、参数和结果关联，历史 usage 不进入请求。检查工具调用/结果配对，空输入、孤立结果、重复调用和超限输入拒绝。history append 不接收 System 是独立约束，不缩窄 infer 输入。
+`Inject` 递归按序展开；System、user、assistant、工具结果及 error 转为公开 `ProviderMessage`，System 与 prompt 的真实 role 不降格为 user。保留 reasoning、工具 ID、参数和结果关联，历史 usage 与 stop_reason 不进入请求，cancelled assistant 拒绝作为上下文。检查工具调用/结果配对，空输入、孤立结果、重复调用和超限输入拒绝。history append 不接收 System 是独立约束，不缩窄 infer 输入。
 
 MCL `infer` 参数为 MESSAGE array + TOOL array；手工工具调用也先构造恰好一条 assistant MESSAGE，再传 visible TOOL array，calls 从 `assistant.tool_calls` 提取。`ToolCall` 仍为 assistant 的纯结构字段，没有 TOOL_CALL Block array。metadata reload 不改变已取出的 Block/请求；新 GET alias 取得新 snapshot。脚本仍按选定路径 late read，metadata snapshot 不保证磁盘文件内容版本隔离。
 

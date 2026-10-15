@@ -1,22 +1,18 @@
 # AgentPlugin
 
-`AgentPlugin`只拥有Agent实例的Workspace关联、上下文、默认/动态可见性、轮次状态和累计Token状态。它消费
-`AgentCreateRequest`创建Agent自身组件，再通过`AgentCreateReply`把Entity返回给WorkspacePlugin；WorkspacePlugin按请求ID绑定其他组件。每个实例同时挂载`ResourceId`，保存完整资源ID，例如`agent:demo/coder:latest`。Memory、Inference和Tool组件。
+AgentPlugin负责Agent实例的启动、停止、异常关联与生命周期；共享Agent组件保存身份、Workspace关联、配置快照、Lua通知句柄、execution作用域、MCL队列、turn、导入绑定及数据库/历史句柄。Block在真实SQLite中，Agent不保存Block权威内存内容。消息历史只由显式MCL `history_append`追加，推理与工具仅返回结果，不自动保存消息。
 
-`AgentTokenUsage`累计普通Assistant响应的输入、输出和缓存命中Token，并维护累计缓存命中率。该状态在
-Agent创建时由MemoryPlugin从历史Assistant行恢复；上下文压缩推理不进入这份对话统计。
+## 已批准目标：轮次中止（待实现）
 
-`AgentMessage.agent`始终是已解析的Entity。三种消息都通过事件请求MemoryPlugin写历史，并作为
-MCL领域事件进入对应的类型化消息数组。待完成的工具调用不再单独存储：Base Lua从`req.ctx`中最近的
-Assistant消息和其后连续的Tool消息推导尚未完成的调用，全部完成时MCL才发送下一次推理请求。
-ToolPlugin的`Agent.tools.pending`只负责异步工具请求与响应关联。
+以下是批准的目标设计，**不是已实现功能**。详细目标与现有基线见[设计](<DESIGN.md>)；当前代码的运行期`Running`及无条件轮次生成行为尚待迁移。
 
-每次推理请求都根据`AgentDynamicVisibility`重新构造工具定义，定义名保持完整`ResourceId`。
-API合法工具名的双向转换只由InferencePlugin在当前请求内完成，不保存为Agent组件。
+- 目标状态为`Creating / Idle / Working / Stopping`。启动成功进入`Idle`、`turn=None`。`start_turn`仅允许Idle，原子创建turn并置Working，不覆盖已有轮次。
+- abort是独立控制事件，不进入MCL FIFO。控制System先于MCL继续动作及Inference/Tool受理执行；Working收到abort立即清空`agent.turn`，仍保持Working，直到Driver沿正常消息链调用`finish_turn`才进入Idle。Working且turn=None重复abort幂等pending。
+- 协议目标`agent.turn.abort {id, message:{workspace, agent?, turn_id}}`要求非空turn_id；服务器内部核对实际Agent实例，不接受用户Entity。`agent.turn.abort_result`按id关联，Ok只表示控制受理，不代表清理完成或Idle；同一旧轮次重试使用保留取消关联，不建立平行旧pending权威。
+- 五种观察点（abort前Working且turn存在）均须覆盖：inference未受理、inference已受理、tool_call未受理、tool_call已受理、Driver消息处理/下个effect之间的间隙。未受理请求取消路径claim一次性reply恰好一次；已受理请求取消token并等待真实清理，之后返回正常形状取消结果；Driver间隙由下一effect实际动作的turn门覆盖。Working且turn=None的重复abort另按幂等pending处理。finish_turn须对应当前Driver结果链且本轮清理已完成，Idle重复完成幂等，不得以迟到旧完成覆盖新的Working轮次。
+- `inference/tool_call`在异步准备后的实际effect动作处要求turn。无turn返回Ok取消Assistant/工具结果，而非通用取消错误；不新增`get_turn`，Driver不检查turn。
+- Assistant消息携带`stop_reason=Cancelled`（序列化`cancelled`），取消正文为`Turn aborted.`，`tool_calls=[]`、`usage=None`；工具取消保留调用ID与顺序，`failed=true`、正文`Tool call aborted.`。消息历史/Block/投影保留stop_reason。
+- Driver读取entry第一条并移除同一条，显式历史保留原值。Inject仅递归展开容器并追加非容器上下文（嵌套取消Assistant也跳过），不执行子消息控制分支；User追加上下文、start_turn、推理；取消Assistant仅入历史，正常Assistant入上下文，无调用Assistant是唯一finish_turn路径，否则发工具批次；全部工具结果入上下文，批次齐后即使turn=None仍推理，取得取消Assistant收尾。Error不得直接finish或伪造取消消息。
+- 前端仅Idle允许发送、Working允许abort；服务端用户消息受理也必须验证Idle，不能只依赖按钮。清理失败仍返回错误并保留未清理活动，不转Idle。
 
-Memory写入失败继续使用`AgentMemoryWriteFailed`；其他消息处理或工具定义准备错误统一发送
-`AgentFailure { kind: Agent }`，不再静默丢弃，也不伪造成Assistant或Tool消息。
-
-AgentPlugin公开`AgentContextCompactRequest`作为压缩机制入口，但不主动发送该事件，也不决定触发阈值。
-请求显式指定原样保留的末尾消息数量；压缩期间Agent进入工作状态。摘要成功后，AgentPlugin用一条带
-`compacted-summary`标记的User检查点替换较早消息，并通过`rewrite_messages`更新实时记忆；历史消息不修改。
+轮次abort不是停止Agent，不关闭Driver或根execution作用域。Creating/Stopping、StopAgent根取消、全部活动真实完成、MCL回执drained与失败保留宿主的原清理语义不变。本次仅文档修订，不声明代码、协议或前端已经实现目标。

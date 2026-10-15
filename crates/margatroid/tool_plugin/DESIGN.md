@@ -40,6 +40,14 @@ error      共享工具错误契约          执行、取消与清理错误
 
 当前MCL只有MESSAGE、TOOL、SANDBOX三种typed arrays；TOOL是资源值，保存ResourceID、alias、description、schema与immutable shared snapshot，不是ToolCall请求数组。`IMPORT TOOL tool AS alias`与`GET alias`解析Agent ImportBindings，不新增插件注册表；`infer`接收MESSAGE array + TOOL array，不接受ResourceID array或重复global alias query。旧Block不会跟随reload暗变，新GET alias获取新快照。CallableDefinitionSnapshot 只有 Tool，其他资源类型不能导入 TOOL。
 
+## 用户轮次中止目标（待实现）
+
+以下为已批准、尚待实现的目标，不表示当前运行时已支持。无 `get_turn`；状态采用 `creating/idle/working/stopping`。中止立即清空 turn，清理期间仍为 Working，正常 finish 收口才 Idle；同步必须同时包含 turn 与 status。用户轮次中止与根 Agent shutdown、owner abort、timeout、receiver closed 不同，不统一归一为正常取消。
+
+用户轮次取消且真实cleanup成功，oneshot返回Ok ToolExecuteResponse，其ToolCall消息failed=true、content="Tool call aborted."，保留调用ID、名称和已知resource_id。未启动调用同用此规范正文；不伪造执行成功，不撤销已经发生的副作用。CleanupFailed仍返回Err并保留活动，不能伪造取消或空闲。
+
+AbortSystem先于MCL实际执行与工具受理；每个消费者独立观察共享中止事件，不靠take reply独占通知。实际受理再次核对当前turn与请求turn；None或已中止旧轮次不启动runner，返回正常取消结果。MCL批次保留已完成真实结果，其余调用（包括未启动项）按原顺序每项恰有一个取消结果。
+
 ## 当前执行机制与保留边界
 
 以下runner机制与snapshot请求均已实现；资源选择准备消费已选定metadata snapshot，其余进程、取消及真实cleanup保证保留。
@@ -129,7 +137,7 @@ crate公开：
 handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
     准备单次执行：crate公开函数
     行为：
-        校验请求ID、调用ID、完整Agent Entity、取消状态和资源类型；validate_owner(request.resource.resource_id)校验目标ResourceSet存在、image_dependencies许可及ImportBindings的ID/TOOL kind已导入，不要求最新alias或定义与选定snapshot一致，允许仍有效的旧版本snapshot
+        先按待实现目标检查轮次中止与受理关联，再校验请求ID、调用ID、完整Agent Entity、取消状态和资源类型；validate_owner(request.resource.resource_id)校验目标ResourceSet存在、image_dependencies许可及ImportBindings的ID/TOOL kind已导入，不要求最新alias或定义与选定snapshot一致，允许仍有效的旧版本snapshot
         消费request.resource的不可变共享definition及alias，验证call.tool_name与选定alias一致；不从ResourceSet按ID重取latest，不再次global alias query
         tool使用选定schema与脚本材料引用及alias；不重取最新collection。现有路径late read不能证明磁盘内容版本隔离，后续采用Arc脚本正文或版本化文件材料的具体方案尚未闭合，不能把metadata snapshot不变假称为磁盘内容不变
         解码arguments并限制大小；tool按snapshot schema验证，不重新解析metadata或全局资源目录
@@ -147,7 +155,7 @@ execute_tool(prepared: PreparedToolExecution)
         tool有界读取snapshot选定的Lua脚本材料引用，建立本次临时目录并调用run_runner；执行中不重新解析alias或读取最新资源定义；可变磁盘路径的内容版本隔离仍为待验收项
         捕获普通错误与panic，清理本次拥有且未转交的执行资源
         真实清理完成后mark_completed再释放活动登记；清理失败保留可管理的活动关联，不假称已经空闲
-        在共享reply短锁内take唯一Sender，发送一次成功或错误；取消和任务丢弃也必须关闭或完成回复
+        在共享reply短锁内take唯一Sender，发送一次成功或错误；目标用户轮次取消且cleanup成功返回Ok failed=true ToolCall，正文="Tool call aborted."；其他监督失败保持真实错误
         不记录message历史，由Driver显式history_append；不直接结束turn或发送Agent异常代替回执
 
 run_runner(prepared: &PreparedToolExecution) -> Result<String, ToolError>
@@ -189,14 +197,14 @@ MCL tool_call effect（当前输入契约）：
     参数顺序为MESSAGE array（恰好一条assistant）+ TOOL visible array，calls仅从assistant.tool_calls字段抽取
     TOOL只含可调用资源；ToolCall仍是assistant字段中的纯值，不升级为Block或独立typed array
     多条消息、非assistant、visible alias冲突或重复call ID必须在任何submit前使整个effect失败，不能部分提交后才报这些结构错误
-    空calls返回emptyMessage，不执行工具；assistant已经由infer收口记录，不在tool_call effect再次记录
+    空calls返回emptyMessage，不执行工具；assistant不由infer隐式记录，tool_call effect也不重复记录
     对每个call按选定TOOL snapshot.alias匹配；每个匹配调用发送一个ToolExecuteRequest及oneshot，保持单调用基本runner不变
     匹配失败由MCL按原槽位构造关联错误；成功与失败结果均保留call ID，已选定资源保留resource_id，不虚构缺失资源ID
-    MCL按原调用顺序收口tool结果并记录历史；所有已有message resource IDs必须保留，不因effect或history append丢失
+    MCL按原调用顺序收口tool结果，历史仅由显式history_append保存；所有已有message resource IDs必须保留，不因effect或history append丢失
 
 正常调用：
     MCL选定CallableResource snapshot -> ToolExecuteRequest -> 主线程归属校验与活动登记
-    独立runner读取选定材料 -> 清理本次执行资源 -> oneshot -> MCL填回原调用槽位并记录历史
+    独立runner读取选定材料 -> 清理本次执行资源 -> oneshot -> MCL填回原调用槽位；历史另发显式history_append
     System为完整消息变体，prompt按真实role导入且infer支持System；history append是独立允许范围，不含System，不改变infer输入范围
 
 长期任务（未来约束，第一版拒绝handoff）：
@@ -237,7 +245,7 @@ ToolExecuteRequest：单条工具执行请求，公开事件
     agent: Entity--完整目标Agent实例
     resource: CallableResource--MCL选定的不可变共享资源snapshot，自带resource_id、alias、definition；不另设重复resource_id/snapshot字段
     call: ToolCall--调用ID、tool_name和arguments等既有内容
-    turn: Option<String>--提交时轮次快照
+    turn: Option<String>--提交时轮次快照；目标在实际受理再次校验，None或已中止旧轮次不启动执行
     cancel: CancellationToken--所属执行作用域派生取消令牌
     reply: Arc<Mutex<Option<oneshot::Sender<Result<ToolExecuteResponse, ToolError>>>>>
     impl Event for ToolExecuteRequest
@@ -249,7 +257,7 @@ ToolExecuteResponse：单条成功响应，公开共享结构体--oneshot载荷�
 ## 逻辑
 
 ```text
-成功或失败只通过原oneshot完成，批次失败模板由MCL生成
+成功或失败只通过原oneshot完成，批次失败模板由MCL生成；目标正常用户轮次中止是Ok failed=true消息，不是执行成功证明
 准备失败也必须完成reply，独立runner协议错误不允许丢失调用关联
 任务创建、查询、清理的内部异步载荷未来统一定义于任务领域events，不暴露插件私有状态
 ```

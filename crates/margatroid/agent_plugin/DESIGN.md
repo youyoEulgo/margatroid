@@ -46,6 +46,36 @@ Agent生命周期及此前共享组件迁移已实现。本文保留六板块契
 
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
+# 已批准目标：轮次与中止（待实现）
+
+本节及下文标为目标的状态/轮次伪代码是用户批准的目标设计，**尚未实现**，不是当前代码能力声明；其余已实现的存储、历史与生命周期基线保持。目标用 Creating / Idle / Working / Stopping 替换运行期 Running；启动成功进入 Idle，turn=None。Creating/Stopping 原有启动、停止、异常与真实清理契约不变，中止轮次不是 StopAgent，不关闭 Driver 或 execution 根作用域。
+
+```text
+目标轮次状态：
+    start_turn仅允许Idle，在同一次受理中生成唯一turn并置Working；拒绝覆盖现有轮次
+    finish_turn由Driver的无工具调用Assistant分支唯一发出，清空turn并将Working置Idle
+    abort是独立控制事件，不是MCL effect，也不排入目标Agent FIFO
+    协议目标agent.turn.abort {id, message:{workspace, agent?, turn_id}}要求非空turn_id；服务端内部校验实际Agent实例，不接收用户Entity
+    agent.turn.abort_result按id关联，Ok仅证明控制已受理，不证明执行清理或回Idle；旧轮次重试用保留的取消关联幂等，不建立平行旧pending权威
+    控制System先于MCL推进、PreparedEffect继续以及Inference/Tool受理运行
+    Working收到abort立即取走/清空agent.turn，但state仍为Working
+    清空turn和判定请求受理按同一控制顺序串行化，之后不得受理该轮新Inference/Tool执行
+    Working且turn=None再次abort是幂等pending，不提前转Idle
+    Idle不接受abort，Creating/Stopping维持原有生命周期限制
+    只有正常结果链走到finish_turn才能回Idle；真实失败或清理失败仍为错误，不强制finish或伪造取消消息
+
+五种中止观察点（abort前均为Working且turn存在，控制先清turn）：
+    1. inference outstanding尚未受理：取消路径对一次性reply claim一次，返回正常取消Assistant；禁止迟到启动或重复回复
+    2. inference已受理：取消token，等待执行真实清理后，正常返回取消Assistant
+    3. tool_call outstanding尚未受理：逐调用claim一次性reply，按原ID和顺序返回正常取消工具结果；禁止迟到执行
+    4. tool_call已受理：取消token，真实退出、管道及资源清理后返回正常取消工具结果；未受理兄弟项按上一规则收口
+    5. Driver间隙（例如Assistant处理后、tool_call或下一次inference之前）：无需Driver查turn；后续effect实际动作无turn时返回正常取消结果
+    Working且turn=None等待结果不是第六个执行分支；重复abort幂等pending，不抢先finish
+    finish_turn仅对应当前Driver结果链且必须已证明本轮清理完成；Idle重复完成幂等，不得让迟到旧完成覆盖新Working轮次
+```
+
+前端仅在 Idle 允许发送用户消息、仅在 Working 提供 abort；服务端同样必须在用户输入受理处验证 Idle，不能只靠按钮禁用。控制中止不取消与该轮无关的存储/导入，也不能改变原 StopAgent 的根取消、MCL drained、活动真实完成和 Creating/Stopping 的清理失败语义。
+
 # lib
 
 ## 组件定义位置
@@ -71,9 +101,9 @@ Agent：Agent图书馆组件，公开Component--自身身份和运行数据的�
     execution: AgentExecutionScope--共享执行作用域，管理受理、根取消及活动真实完成等待
     mcl: AgentMclQueue--目标Agent的MCL指令FIFO队列、异步队首关联及收口通知
     turn: Option<String>--当前轮次代号，不保存旧turn聚合状态
-    new_turn(&mut self) -> String
-        生成新轮次：公开方法
-        行为：生成新的唯一轮次代号，替换turn并返回代号；不启动外部操作。
+    start_turn(&mut self) -> Result<String, AgentError>
+        开始轮次：目标方法，待实现，不声明当前已有此API
+        行为：仅Idle可受理；原子生成唯一代号写入turn并置Working，返回代号；不覆盖已有轮次，不启动外部操作。
     impl Component for Agent
     impl LibraryComponent for Agent
         LibraryComponent：公开trait实现
@@ -284,7 +314,7 @@ handle_start_driver_lua_vm_result(world: &mut World, event: StartDriverLuaVmResu
     处理Driver启动结果：crate公开函数
     行为：
         核对目标完整Agent Entity、Creating状态和VM启动子请求ID，旧结果或重复结果不推进其他实例
-        成功时检查本次lua实例关联，确认关闭句柄已由LuaRuntime保存，将state改为Running，发送原请求ID对应的StartAgentResult::Ok(agent)
+        成功时检查本次lua实例关联，确认关闭句柄已由LuaRuntime保存，将state改为Idle、turn保持None（目标，待实现；当前为Running），发送原请求ID对应的StartAgentResult::Ok(agent)
         失败时确认VM结果契约保证本次执行体已清理，保存原请求上下文，销毁Agent并发送StartAgentResult::Err
         CleanupFailed表示无法保证没有遗留活动，收到时保留宿主与关闭句柄并报告启动错误，不执行普通失败的despawn路径
         将state置Stopping且vm_request_id=None、request_ids为空，execution与MCL门保持关闭，表示启动已失败且宿主仅用于清理管理；不保留无结果的Creating等待，不自动重新启动或销毁
@@ -295,7 +325,7 @@ handle_stop_agent(world: &mut World, request: StopAgent)
     行为：
         检查目标Entity和Agent，不存在时记录warning并发送AgentNotAlive错误
         Creating时返回AgentBusy，不抢先销毁正在等待VM启动的Agent
-        Running时在同步受理操作中置Stopping，关闭MCL及所有活动受理，取消execution根token和pending.cancel，MCL完成未执行排队Cancelled；保存原请求及VM停止子请求ID，再发送StopDriverLuaVm
+        Idle或Working时在同步受理操作中置Stopping（目标，待实现；替换当前Running入口），关闭MCL及所有活动受理，取消execution根token和pending.cancel，MCL完成未执行排队Cancelled；保存原请求及VM停止子请求ID，再发送StopDriverLuaVm
         Stopping且已有停止请求在途时，追加本次请求ID，不重复提交VM停止
         Stopping且上次停止已失败时保留宿主、活动及关闭受理；ended已消费时返回DriverStopFailed，不重建结束通道或虚构完成证明
         关闭句柄的缺失不能被当作执行已停止的证明，仍通知LuaRuntime核对本次执行；Agent自己不调用句柄关闭
@@ -332,7 +362,7 @@ handle_agent_exception(world: &mut World, event: AgentException)
 ```text
 启动：
     StartAgent -> 准备信息与实体 -> Creating -> StartDriverLuaVm
-    StartDriverLuaVmResult成功 -> Running -> StartAgentResult成功
+    StartDriverLuaVmResult成功 -> Idle且turn=None -> StartAgentResult成功（目标，待实现；当前Running）
     StartDriverLuaVmResult失败且执行体已清理 -> 销毁Agent -> StartAgentResult失败
     Creating信息必须在VM请求发出之前登记，避免结果先到却无法关联
 
@@ -377,7 +407,7 @@ StartAgent：Agent启动请求，公开事件
 
 StartAgentResult：Agent启动结果，公开事件
     id: String--原启动请求ID
-    result: Result<Entity, AgentError>--成功时返回Running的Agent Entity
+    result: Result<Entity, AgentError>--目标成功时返回Idle的Agent Entity（待实现；当前Running）
     impl Event for StartAgentResult
 
 StopAgent：Agent停止请求，公开事件
@@ -478,9 +508,10 @@ AgentInfo：启动配置快照，公开结构体
     image: ResourceID--启动镜像的来源地址，不是独立镜像Entity
     image_dependencies: Arc<[ResourceID]>--镜像声明的可导入地址，不表示资源已加载
 
-AgentState：Agent生命周期，公开枚举
+AgentState：Agent生命周期，公开枚举--目标待实现；当前运行期仍为Running
     Creating(AgentStartState)
-    Running
+    Idle--无活动轮次，允许用户输入
+    Working--轮次处理或中止收尾，turn可能已清空
     Stopping(AgentStopState)
 
 AgentStartState：Agent启动过程，公开结构体--由state持有，不是独立Resource
@@ -623,7 +654,7 @@ HistoryRecord：历史增量记录，公开共享类型
     AgentCreationState、AgentInitializationState、AgentLuaState和AgentLifecycleState由新的state和lua替代
     删除AgentResourceMap、AgentResourceEntry和Agent内复制的资源内容，以三种ResourceSet替代
     Agent不再包含AgentInferenceState、AgentToolState及其pending表；执行结果由所属领域管理，公共取消、沙箱互斥及真实完成等待统一在execution，不丢弃在执行任务
-    不在Agent保存AgentTurnState、TokenUsageState和last_error等旧聚合字段；只保留turn代号，start_turn生成并替换，finish_turn清空且空值幂等成功，旧finish拒绝
+    不在Agent保存AgentTurnState、TokenUsageState和last_error等旧聚合字段；目标待实现：start_turn仅Idle生成turn并置Working，不覆盖；abort立即清turn但保持Working；Driver无工具调用Assistant分支finish_turn才置Idle，空turn可幂等完成；旧finish拒绝。替代旧的无条件生成覆盖与finish仅清字段契约
     MCL指令审计由MCL负责：除合法history_append外先记录成功才执行；message历史只由显式history_append控制，inference与tool_call不追加任何结果消息
     history_append自身采用批量事务接口，失败是该显式请求的错误；不隐式保存消息，不重跑已完成的推理或工具
     AgentMessage是共享types消息值，包含System（inject/system/user/assistant/tool_call/error），不实现旧路由Event；inject(Vec<AgentMessage>)递归同类型

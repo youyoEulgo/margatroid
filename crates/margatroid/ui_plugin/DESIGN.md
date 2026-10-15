@@ -84,6 +84,39 @@ content_type(path: &str) -> &'static str
     点击切换展开；展开态保留Sandbox选择及统一Tools可见性列表，不改变资源加载和调用语义
 ```
 
+## 回合中止交互（已确认设计，待实现）
+
+```text
+状态与输入：
+    state.sync同时携带status与turn；发送/中止可用性依赖status，不以turn或pending_command替代
+    idle：允许发送用户消息，禁止中止
+    working：禁止发送用户消息，允许发起中止；首次请求后可禁用重复点击并显示收口中
+    working且turn为空：表示中止已请求但Driver尚未finish，不恢复发送按钮
+    creating/stopping：不允许发送；不把非运行生命周期当作idle
+    后端同样校验状态，拒绝working期间的新用户输入，不能只依靠前端禁用
+
+中止控制：
+    中止请求使用独立控制路由，不排入正在等待推理或工具的MCL FIFO
+    请求针对当前完整Agent实例及目标turn，迟到请求不得中止随后新回合
+    请求回执表示中止已受理，不代表工具已清理，也不表示Agent已经idle
+    只有finish_turn后的状态同步确认idle，前端才恢复发送
+
+取消assistant展示：
+    从历史message payload.stop_reason识别cancelled，不根据正文、usage缺失或turn空值猜测
+    标准正文为英文Turn aborted.，tool_calls为空，不展示虚构usage
+    在主对话区渲染为红色assistant消息，保留assistant角色与取消标签，不改成普通Error消息
+    兼容历史拆分契约：正文仍从content取得，结束原因等元数据仍从payload取得
+    旧历史缺少stop_reason按普通历史展示，不回填或根据文本推断取消
+    取消消息允许显式记历史，但Driver不得把它注入推理上下文；前端渲染不替代这项执行规则
+
+工具取消展示：
+    仍按tool_call结果展示，原tool_call_id/tool_name保留，failed为true，正文为英文取消说明
+    部分已完成工具保留真实结果，其他工具真实清理后返回取消结果；不声称撤销已有副作用
+    CleanupFailed继续明确显示错误和不可继续状态，不伪装成正常取消assistant或idle
+```
+
+上述状态与回执仅为本次确认的实现目标；当前源码尚未支持完整回合中止，不能据此宣称按钮已可用。
+
 ## 边界
 
 ```text

@@ -5,6 +5,18 @@
 
 当前实现说明见 [DESIGN.md](<DESIGN.md>)。旧 REF/MERGE/BIND/LOAD/EXPOSE、visibility 与 history_record 路径已删除，不再受理。
 
+## 已批准目标：轮次中止（待实现）
+
+以下为用户批准的目标，**尚未实现**，不能把已有`finish_turn`名称、来源取消或数据库基线当作该目标已经完成。完整规则及Driver分支伪代码见[设计](<DESIGN.md>)。
+
+- Agent运行期由`Running`改为`Idle / Working`，保留Creating/Stopping。启动Idle；`start_turn`仅Idle生成turn并置Working，不覆盖；`finish_turn`在本轮真实清理完成后清turn并转Idle。重复Idle完成幂等，旧关联不能覆盖新Working。
+- abort为独立控制事件，先于MCL继续及推理/工具受理，不入FIFO。Working立即清turn但保持Working至Driver收尾；Working且turn=None重复abort幂等pending。协议目标`agent.turn.abort`要求非空turn_id，关联`agent.turn.abort_result`的Ok仅证明受理，不证明清理完成。前端及服务端用户消息受理均只允许Idle，Working只允许abort。
+- `inference/tool_call`必须在异步审计/参数准备之后的实际effect动作处检查turn；无turn不提交执行，返回Ok正常形状取消结果。不新增`get_turn`，Driver不检查turn。
+- 五种情况（abort前Working且turn存在）为：inference未受理/已受理、tool_call未受理/已受理、Driver间隙。未受理outstanding请求claim一次性reply一次且禁止迟到执行；已受理取消token并等待真实清理；Driver间隙由下一effect的实际动作turn门覆盖。
+- Assistant消息自身携带`stop_reason=Cancelled`，序列化为`cancelled`，正文`Turn aborted.`、空tool_calls、usage=None；保持正常Inference外层形状。工具取消结果保持原调用ID、顺序及身份关联，`failed=true`，正文`Tool call aborted.`。stop_reason贯穿消息、Block、历史及投影。
+- Driver读取第一条entry并移除同一第一条，显式历史保留原值，各分支自行更新上下文。Inject只递归展开容器并追加非容器上下文，跳过包括嵌套的取消Assistant，不执行子消息控制分支。User追加上下文/start_turn/推理；取消Assistant仅历史，正常Assistant入上下文，无tool_calls是唯一finish_turn路径，否则发工具批次；全部工具结果入上下文，批次完成即使turn=None仍推理，取得取消Assistant完成收尾。
+- Error不得直接finish_turn；真实失败不得伪造cancelled Assistant。清理失败保持Err、Working及未清理活动，不虚假转Idle。轮次abort不改变Creating/Stopping、StopAgent根取消、MCL回执drained及真实清理的原语义。
+
 ## 已实现的数据库 Block
 
 运行时所有 Block 统一使用 Agent SQLite，不保留内存后端。`CREATE BLOCK` 创建或打开持久数据，`CREATE TEMP BLOCK` 使用完整启动实例隔离的数据；均异步返回 `BlockOpened { block_id, created, temporary }`，相同 schema 再次打开不清空数据。GET 多来源使用同一读事务，INJECT 全部来源与目标使用同一写事务。TOOL/SANDBOX 在数据库中只保存完整 ResourceID，读取后按命令开始时取得的 owned 导入快照解析当前定义；已提交领域任务保持自身快照。MESSAGE 保留原始 typed 消息及 Inject 容器。`history_append` 只写历史，不修改 Block。旧 effect `finish` 已拒绝，只接受 `finish_turn`。

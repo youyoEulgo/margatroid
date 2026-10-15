@@ -33,7 +33,11 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 共享值、组件与事件迁移及本轮typed数组与导入绑定均已实现。各领域文档描述对应完整行为，本文件统一依赖方向和跨领域数据，不继续混入旧邮箱、引用Block或ResourceId组件方案。ResourceID等基础契约由resource_id_plugin提供；types按组件、事件与纯值模块组织，不依赖业务Plugin实现。正文保持lib、system、handler、events、types、error六个标准板块。
 
-显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。history_components::message_history_parts将实际正文放入HistoryRecord.content，payload保留type及其余字段并移除顶层content；Error正文取message并从payload移除，Inject正文为空且完整保留嵌套messages。Assistant无正文按空字符串展示。不修改AgentMessage领域公开类型。旧行不迁移，消费者兼容旧payload.content/message。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
+显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。history_components::message_history_parts将实际正文放入HistoryRecord.content，payload保留type及其余字段并移除顶层content；Error正文取message并从payload移除，Inject正文为空且完整保留嵌套messages。Assistant无正文按空字符串展示。本轮待实现目标会为Assistant新增stop_reason字段，历史映射同步保留该元数据。旧行不迁移，消费者兼容旧payload.content/message。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
+
+## 用户轮次中止目标（待实现）
+
+本节及下文标注的中止行为是已批准的目标契约，不表示当前代码已实现；既有实现说明仅适用于未被该目标替换的部分。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
 
 # lib
 
@@ -119,13 +123,16 @@ AgentMessage：消息值，公开枚举--不是Event，不包含路由Entity
     Inject { messages: Vec<AgentMessage> }
     System { content: String }--系统消息，prompt导入及推理按实际role保留
     User { content: String }
-    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCall>, usage: Option<TokenUsage> }
+    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCall>, usage: Option<TokenUsage>, stop_reason: StopReason }
     ToolCall { resource_id: Option<ResourceID>, tool_call_id: String, tool_name: String, content: String, failed: bool }
     Error { message: String }
     impl Clone + PartialEq + Eq + Serialize + Deserialize for AgentMessage
     说明：JSON type为inject/system/user/assistant/tool_call/error；未知资源的可见性拒绝结果resource_id为None，不虚构builtin/invalid地址。
         inject递归包含同一消息值类型；history_append的允许范围独立校验，不能从消息枚举自动推导
-        Assistant可只有合法工具调用而无正文，usage保留于结果及历史，不回传作为模型输入
+        Assistant可只有合法工具调用而无正文；usage与新增stop_reason保留于结果及显式历史元数据，不回传作为模型输入
+        目标stop_reason覆盖全部推理原因，新增StopReason::Cancelled序列化cancelled；兼容InferenceResponse.stop_reason由同一权威映射生成且两处始终相同
+        用户轮次中止且真实cleanup成功返回Ok assistant：content="Turn aborted."、reasoning=None、tool_calls=[]、usage=None、stop_reason=Cancelled；不伪造部分执行成功
+        cancelled assistant允许显式history_append，stop_reason保存在payload元数据而非content；不允许进入infer上下文（含Inject嵌套）
         infer接受System，prompt导入按资源实际role构造消息，不把所有prompt强制转换为System或User
         ToolCall结构体仍是Assistant.tool_calls的纯输入元素；AgentMessage::ToolCall是执行结果消息，两者都不构成独立TOOL_CALL Block或GET数组
 
@@ -324,6 +331,12 @@ HistoryRecord：历史记录，公开共享契约
     输入Assistant不在tool_call effect中重复记录，输出为ToolCall结果消息组成的MESSAGE数组
     history_append允许范围独立保持inject/user/assistant/tool_call/error，System不通过此effect追加；infer支持System
     inference完整返回InferenceResponse，保留stop_reason，不只抽取assistant正文
+    待实现：AbortSystem先于MCL实际执行及Inference/Tool受理；共享中止事件由各消费者独立观察，不依赖take reply独占通知
+    实际执行infer/tool_call再次核对请求turn与当前turn；None或已中止旧轮次返回正常取消结果，不启动HTTP/runner
+    工具用户轮次取消且cleanup成功返回Ok ToolCall：failed=true、content="Tool call aborted."，保留调用ID/名称及已知resource_id；未启动项同用该正文
+    批次每个调用恰有一个原序结果；保留已完成真实结果，其余项（含未启动项）取消，不撤销已发生副作用
+    CleanupFailed仍为Err并保留活动，不伪造cancelled或Idle；根Agent shutdown、owner abort、timeout、receiver closed保持独立原因
+    finish_turn只结束正常无工具调用assistant或cancelled assistant的正常返回路径；真实Err不得伪造cancelled继续正常收口
     MclCommandResult.result是真实执行结果；message保存仅由显式history_append发起，history_error只用于附带指令审计错误，不能因此重做工具
 ```
 
