@@ -36,7 +36,7 @@ types      src/types.rs及runner协议   执行快照、限额和进程协议
 error      共享工具错误契约          执行、取消与清理错误
 ```
 
-**CallableResource snapshot请求及MCL typed arrays已实现；普通tool/skill runner的既有取消与真实cleanup机制保留，Hook执行明确返回UnsupportedHook，长期任务协议仍为未来约束。** 重写前设计归档于 [DESIGN.md](</home/eulgo/Documents/multi/margatroid/margatroid/crates/margatroid/tool_plugin/DESIGN.md>)。MCL选择不可变可调用资源快照并管理调用批次，ToolPlugin每个oneshot请求只执行一个匹配调用，独立runner基本协议不变。
+**CallableResource snapshot请求及MCL typed arrays已实现；普通tool/skill runner提供取消与真实cleanup；可信supervisor与受限worker分离，兼容既有工具Lua环境，Hook执行明确返回UnsupportedHook，长期任务协议仍为未来约束。** 重写前设计归档于 [DESIGN.md](</home/eulgo/Documents/multi/margatroid/margatroid/crates/margatroid/tool_plugin/DESIGN.md>)。MCL选择不可变可调用资源快照并管理调用批次，ToolPlugin每个oneshot请求只执行一个匹配调用，独立runner基本协议不变。
 
 当前MCL只有MESSAGE、TOOL、SANDBOX三种typed arrays；TOOL是资源值，保存ResourceID、alias、description、schema与immutable shared snapshot，不是ToolCall请求数组。`IMPORT TOOL tool/skill/hook AS alias`与`GET alias`解析Agent ImportBindings，不新增插件注册表；`infer`接收MESSAGE array + TOOL array，不接受ResourceID array或重复global alias query。旧Block不会跟随reload暗变，新GET alias获取新快照。Hook允许导入TOOL，但Driver触发器及执行路线明确未定，不假定普通Lua执行。
 
@@ -47,10 +47,10 @@ error      共享工具错误契约          执行、取消与清理错误
 - 主线程认领共享 reply Sender并复制Agent/turn，消费请求选定的CallableResource定义与执行材料而非按ResourceID重取ResourceSet最新版本；使用共享作用域原子登记和沙箱快照，skill固定空对象schema。排队任务丢弃会撤销未启动登记并回复错误。
 - 通用异步闭包启动独立 supervisor；调用者 Future 被取消或丢弃时请求取消，supervisor 仍持有执行所有权，完成真实进程、管道及临时目录清理后才 mark。执行所有者意外丢弃或清理证明缺失时保留登记并 `mark_cleanup_failed`。
 - `src/process.rs` 并行投递 stdin、排读有界 stdout/stderr、等待进程，统一截止时间、作用域取消、MCL logical 取消及 receiver 关闭监督。stdout 仅 JSON 协议，Lua print 写 stderr；非法协议或缺少清理证明不视为执行已回收。
-- Linux runner 在执行 Lua 前启用 child subreaper；结束时遍历、终止并 waitpid 回收所有后代，包括新 session。父进程以独立 childgroup 为强杀兜底；强制终止后无法证明脱离进程已收口时明确 CleanupFailed，不假称进程组能保证清理。
+- Linux 工具进程分为可信 supervisor 与受限 worker：supervisor 位于工具沙箱之外，启用 child subreaper 并负责读取进程元数据、终止及 waitpid 回收所有后代，包括新 session；只有执行 Lua 的 worker 及其子进程进入本次 landstrip 策略。策略可以继续禁止工具读取 /proc，清理监督不能放进同一个禁读边界。父进程以独立 childgroup 为强杀兜底；无法证明后代已收口时明确 CleanupFailed，不假称进程组能保证清理。
 - 可选 cgroup v2 执行边界通过 `MARGATROID_TOOL_CGROUP_ROOT` 指向已委派、可写且有 `cgroup.kill` 能力的真实 cgroup 根目录；runner 进入专用子组后才执行 Lua，清理要求 kill、populated 0 及目录移除。未配置时不声称具备 cgroup 隔离；配置不可用失败关闭。
-- 沙箱策略通过现有 landstrip CLI `run -p policy -- tool_runner` 启动，策略激活而后端不存在不会退化为无沙箱；环境过滤凭据及宿主注入变量。
-- shell 默认使用并行有界 stdout/stderr 管道。Linux 显式 `shell(command, {pty=true})` 使用非阻塞 AsyncFd PTY，建立 session 与控制终端，stdin/stdout/stderr 都连接 slave；终端输出合并在 `stdout`，`stderr` 为空，退出状态仍返回 `code`。PTY 读取和等待并行，取消、限额、超时及后代回收沿用同一执行预算；非 Linux 明确拒绝 PTY。
+- 父进程启动可信 tool_runner supervisor，supervisor 通过现有 landstrip CLI `run -p policy -- tool_runner --margatroid-tool-worker` 启动受限 worker；策略激活而后端不存在不会退化为无沙箱。环境过滤凭据及宿主注入变量，工具不获得修改 supervisor 策略与执行模式的宿主入口。
+- shell 默认使用并行有界 stdout/stderr 管道。Linux 显式 `shell(command, {pty=true})` 使用非阻塞 AsyncFd PTY，建立 session 与控制终端，stdin/stdout/stderr 都连接 slave；终端输出合并在 `stdout`，`stderr` 为空，退出状态同时返回 `exit_code` 与兼容 `code`，并返回 `truncated`；max_output_bytes及timeout_ms按宿主总限额截断，不允许调用参数放宽总预算。PTY 读取和等待并行，取消、限额、超时及后代回收沿用同一执行预算；非 Linux 明确拒绝 PTY。
 - handoff 第一版固定 UnsupportedHandoff，未增加任务池、全局 pending 或旧资源注册入口。
 
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
@@ -152,7 +152,7 @@ execute_tool(prepared: PreparedToolExecution)
         捕获普通错误与panic，清理本次拥有且未转交的执行资源
         真实清理完成后mark_completed再释放活动登记；清理失败保留可管理的活动关联，不假称已经空闲
         在共享reply短锁内take唯一Sender，发送一次成功或错误；取消和任务丢弃也必须关闭或完成回复
-        不记录历史，MCL逐项记录成功和失败；不直接结束turn或发送Agent异常代替回执
+        不记录message历史，由Driver显式history_append；不直接结束turn或发送Agent异常代替回执
 
 run_runner(prepared: &PreparedToolExecution) -> Result<String, ToolError>
     监督独立runner：私有异步函数
@@ -170,9 +170,9 @@ run_lua_in_runner(payload: RunnerRequest) -> Result<String, ToolError>
     行为：
         在runner内创建工具VM，安装内存、指令及时间限制，按最小必要能力开放库与宿主
         在脚本顶层执行前准备arguments和context，加载脚本并取得execute入口
-        execute(arguments, context)返回有界String作为工具正文，不隐式解包字符串内JSON信封
+        execute(arguments, context)返回有界String；普通tool兼容既有结果契约：当字符串解析为含ok布尔与content字符串的JSON对象时，模型正文取content、failed取!ok；其他字符串原样成功。skill正文不套用tool结果信封
         context包含agent_id、resource_id、call_id、turn快照、project_root和temp_dir
-        提供JSON编解码和shell；不注入MCL、ready、wake或Driver调用能力，避免等待同Agent队列产生循环依赖
+        提供margatroid().json/shell及兼容全局json/shell、package.config和工具所需IO/OS文件能力；os.execute经有界异步shell返回标准Lua状态元组，不提供io.popen绕过进程预算。日志和普通stdout写入转诊断流，不污染JSON协议。不注入MCL、ready、wake或Driver调用能力，避免等待同Agent队列产生循环依赖
         shell单次超时和输出限额不能超过本次总预算，不接受参数放宽总限额
         普通shell使用管道，PTY作为显式选项；非零退出码由脚本决定是否转成工具失败
 

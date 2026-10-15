@@ -47,7 +47,23 @@ fn close_admission(agent: &mut Agent) {
         pending.cancel.cancel();
     }
 }
-fn environment(agent: &Agent, entity: Entity) -> LuaEnvironment {
+fn close_exception_admission(agent: &mut Agent, execution_ended: bool) {
+    close_admission(agent);
+    if matches!(agent.state, AgentState::Running) {
+        agent.state = AgentState::Stopping {
+            request_ids: vec![],
+            vm_request_id: None,
+        };
+    }
+    if execution_ended {
+        agent.turn = None;
+    }
+}
+fn environment(
+    agent: &Agent,
+    entity: Entity,
+    runtime: &margatroid_types::model_components::ModelRuntimeInfo,
+) -> LuaEnvironment {
     let mut info = BTreeMap::new();
     info.insert("entity".into(), LuaValue::String(format!("{entity:?}")));
     info.insert(
@@ -107,6 +123,30 @@ fn environment(agent: &Agent, entity: Entity) -> LuaEnvironment {
                 .collect(),
         ),
     );
+    model.insert(
+        "provider_model".into(),
+        LuaValue::String(runtime.model.clone()),
+    );
+    model.insert(
+        "api_type".into(),
+        LuaValue::String(runtime.api_type.clone()),
+    );
+    model.insert(
+        "context_window_tokens".into(),
+        LuaValue::Integer(
+            i64::try_from(runtime.context_window_tokens).expect("validated model context window"),
+        ),
+    );
+    for (name, value) in [
+        ("provider", &runtime.provider),
+        ("thinking", &runtime.thinking),
+        ("reasoning_effort", &runtime.reasoning_effort),
+    ] {
+        model.insert(
+            name.into(),
+            value.clone().map(LuaValue::String).unwrap_or(LuaValue::Nil),
+        );
+    }
     info.insert("model".into(), LuaValue::Object(model));
     info.insert(
         "image_dependencies".into(),
@@ -212,6 +252,24 @@ pub fn handle_start_agent(world: &mut World, request: StartAgent) {
                     "image not loaded on requested workspace",
                 )
             })?;
+        let model_runtime = world
+            .get_resource::<margatroid_types::model_components::ModelRuntimeCatalog>()
+            .and_then(|catalog| catalog.get(&image.model.model))
+            .cloned()
+            .ok_or_else(|| {
+                error(
+                    AgentErrorKind::ModelRouteNotFound,
+                    format!("model route `{}` is not configured", image.model.model),
+                )
+            })?;
+        if model_runtime.context_window_tokens == 0
+            || i64::try_from(model_runtime.context_window_tokens).is_err()
+        {
+            return Err(error(
+                AgentErrorKind::InvalidDefinition,
+                "model context window must be positive and fit a Lua integer",
+            ));
+        }
         let mcl_environment = world
             .get_resource::<margatroid_types::mcl_environment::MclEnvironmentFactory>()
             .ok_or_else(|| {
@@ -227,9 +285,9 @@ pub fn handle_start_agent(world: &mut World, request: StartAgent) {
                 "workspace admission closed",
             ));
         }
-        Ok((workspace_id, image, mcl_environment))
+        Ok((workspace_id, image, mcl_environment, model_runtime))
     })();
-    let (workspace, image, mcl_environment) = match prepared {
+    let (workspace, image, mcl_environment, model_runtime) = match prepared {
         Ok(value) => value,
         Err(error) => {
             world.send_event(StartAgentResult {
@@ -256,6 +314,7 @@ pub fn handle_start_agent(world: &mut World, request: StartAgent) {
                 workspace,
                 image,
                 mcl_environment,
+                model_runtime,
             },
         );
     let events = world.event_sender();
@@ -289,6 +348,7 @@ struct PendingDatabase {
     workspace: resource_id_plugin::ResourceID,
     image: AgentImage,
     mcl_environment: LuaEnvironment,
+    model_runtime: margatroid_types::model_components::ModelRuntimeInfo,
 }
 
 pub fn handle_database_setup_result(
@@ -320,6 +380,7 @@ pub fn handle_database_setup_result(
         workspace,
         image,
         mut mcl_environment,
+        model_runtime,
     } = pending;
     let attached = (|| {
         let database = result.map_err(|error| error.error)?.database;
@@ -397,7 +458,7 @@ pub fn handle_database_setup_result(
         execution: AgentExecutionScope::new(),
         turn: None,
     };
-    let mut environment = environment(&agent, entity);
+    let mut environment = environment(&agent, entity, &model_runtime);
     environment.globals.append(&mut mcl_environment.globals);
     environment.modules.append(&mut mcl_environment.modules);
     let mounted = (|| {
@@ -614,17 +675,30 @@ pub fn handle_driver_lua_vm_exception_result(world: &mut World, event: DriverLua
     if !first_exception(world, entity, &event.exception_id) {
         return;
     }
-    close_admission(world.get_component_mut::<Agent>(entity).unwrap());
+    close_exception_admission(
+        world.get_component_mut::<Agent>(entity).unwrap(),
+        event.execution_ended,
+    );
+    let original_error = event
+        .error
+        .map(|e| error(AgentErrorKind::DriverStopFailed, e.to_string()));
+    let result = event
+        .result
+        .map_err(|e| error(AgentErrorKind::DriverStopFailed, e.to_string()));
+    if let Some(failure) = original_error.as_ref().or(result.as_ref().err()) {
+        world.insert_component(
+            entity,
+            margatroid_types::agent_components::AgentFailure(failure.clone()),
+        );
+    }
     world.send_event(AgentExceptionResult {
         exception_id: event.exception_id,
         agent: entity,
         resource_id,
         workspace,
         instance: event.instance,
-        error: None,
-        result: event
-            .result
-            .map_err(|e| error(AgentErrorKind::DriverStopFailed, e.to_string())),
+        error: original_error,
+        result,
         execution_ended: event.execution_ended,
         cleanup_completed: event.cleanup_completed,
     });
@@ -643,7 +717,14 @@ pub fn handle_agent_exception(world: &mut World, event: AgentException) {
         return;
     }
     let result = if valid {
-        close_admission(world.get_component_mut::<Agent>(event.agent).unwrap());
+        close_exception_admission(
+            world.get_component_mut::<Agent>(event.agent).unwrap(),
+            event.cleanup_completed,
+        );
+        world.insert_component(
+            event.agent,
+            margatroid_types::agent_components::AgentFailure(event.error.clone()),
+        );
         Ok(())
     } else {
         Err(error(

@@ -47,7 +47,7 @@ agents:	[]
 `history_path` 可选，相对路径以 `project_root` 为基准。`memory_path` 仅作为此字段的输入别名保留，编译结果只有 `history_path`。默认路径由 Compose 生成：
 
 ```text
-<project_root>/.margatroid/history/<agent-name>.sqlite
+<project_root>/.margatroid/<workspace-name>/history/<agent-name>.sqlite
 ```
 
 全部路径最终必须为绝对路径，移除当前目录组件并拒绝任何 `..`；编译不会创建目录或打开 SQLite。

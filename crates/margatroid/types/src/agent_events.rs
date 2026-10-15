@@ -14,6 +14,7 @@ pub enum AgentErrorKind {
     AgentStopping,
     WorkspaceNotAlive,
     ImageNotLoaded,
+    ModelRouteNotFound,
     ResourceSetupFailed,
     HistorySetupFailed,
     DatabaseSetupFailed,

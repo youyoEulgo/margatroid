@@ -426,6 +426,31 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
     assert!(!serde_json::to_string(&old_state)
         .unwrap()
         .contains("private-policy"));
+    assert!(old_state.error.is_none());
+    let serialized = serde_json::to_value(&old_state).unwrap();
+    assert!(serialized.get("error").is_none());
+    let compatible: AgentStateDto = serde_json::from_value(serialized).unwrap();
+    assert!(compatible.error.is_none());
+    world.get_component_mut::<Agent>(old).unwrap().state = AgentState::Stopping {
+        request_ids: vec![],
+        vm_request_id: None,
+    };
+    world.insert_component(
+        old,
+        margatroid_types::agent_components::AgentFailure(
+            margatroid_types::agent_events::AgentError::new(
+                margatroid_types::agent_events::AgentErrorKind::DriverStopFailed,
+                "driver failed: missing tool response",
+            ),
+        ),
+    );
+    let failed_state: AgentStateDto = old.into_dto(&*world).unwrap();
+    assert_eq!(failed_state.status, "stopping");
+    assert!(failed_state.turn.is_none());
+    assert_eq!(
+        failed_state.error.unwrap(),
+        ProtocolErrorDto::new("DriverStopFailed", "driver failed: missing tool response",)
+    );
     world.despawn(old);
     let new = world.spawn();
     world.insert_library(new, make_agent()).unwrap();

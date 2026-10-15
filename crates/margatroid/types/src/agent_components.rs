@@ -132,6 +132,11 @@ pub enum AgentState {
         vm_request_id: Option<String>,
     },
 }
+/// Last accepted exception, retained on the host for state snapshots.
+#[derive(Clone, Debug)]
+pub struct AgentFailure(pub AgentError);
+impl Component for AgentFailure {}
+
 #[derive(Debug)]
 pub struct Agent {
     pub resourceid: ResourceID,

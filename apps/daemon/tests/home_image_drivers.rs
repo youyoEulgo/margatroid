@@ -49,6 +49,19 @@ fn global_home() -> PathBuf {
 fn app(images: &Path) -> App {
     let home = global_home();
     let mut app = App::new();
+    app.world_mut().insert_resource(
+        margatroid_types::model_components::ModelRuntimeCatalog::new([
+            margatroid_types::model_components::ModelRuntimeInfo {
+                id: "openrouter/deepseek-v4.1-flash".into(),
+                model: "offline-model".into(),
+                api_type: "deepseek".into(),
+                provider: Some("offline".into()),
+                context_window_tokens: 1000000,
+                thinking: Some("enabled".into()),
+                reasoning_effort: Some("high".into()),
+            },
+        ]),
+    );
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(ClosurePlugin)
         .add_closure_system(RuntimePlugin::PRE_UPDATE)
@@ -1132,53 +1145,69 @@ fn exercise_root_restart(images: &Path, image: &str) {
         content: "offline persistent user".into(),
     };
     assert_eq!(first.messages, [soul.clone(), vec![user.clone()]].concat());
-    let call = ToolCall {
-        id: "root-offline-call".into(),
-        tool_name: "list_dir".into(),
-        arguments: "{}".into(),
-    };
-    let batch = assistant("offline tool request", vec![call.clone()]);
+    let calls = (0..2)
+        .map(|index| ToolCall {
+            id: format!("root-offline-call-{index}"),
+            tool_name: "list_dir".into(),
+            arguments: "{}".into(),
+        })
+        .collect::<Vec<_>>();
+    let batch = assistant("offline tool request", calls.clone());
     respond(&first, batch.clone(), StopReason::ToolCalls);
-    let tool = tick_until(&mut app, "root mock tool", |world| {
-        world
-            .event_reader::<ToolExecuteRequest>()
-            .into_iter()
-            .find(|request| request.agent == entity)
-            .cloned()
+    let mut seen = BTreeSet::new();
+    let mut tool_results = Vec::new();
+    tick_until(&mut app, "root mock tool batch", |world| {
+        for tool in world.event_reader::<ToolExecuteRequest>() {
+            if tool.agent != entity || !seen.insert(tool.call.id.clone()) {
+                continue;
+            }
+            assert!(calls.contains(&tool.call));
+            assert_eq!(tool.turn, first.turn);
+            assert_eq!(tool.resource, tools[0]);
+            assert!(!tool.cancel.is_cancelled());
+            let tool_result = AgentMessage::ToolCall {
+                resource_id: Some(tool.resource.resource_id.clone()),
+                tool_call_id: tool.call.id.clone(),
+                tool_name: tool.call.tool_name.clone(),
+                content: format!("offline mock result {}", tool.call.id),
+                failed: false,
+            };
+            tool.reply
+                .lock()
+                .unwrap()
+                .take()
+                .expect("tool reply consumed once")
+                .send(Ok(ToolExecuteResponse {
+                    message: tool_result.clone(),
+                }))
+                .unwrap();
+            tool_results.push(tool_result);
+        }
+        (seen.len() == calls.len()).then_some(())
     });
-    assert_eq!(tool.call, call);
-    assert_eq!(tool.turn, first.turn);
-    assert_eq!(tool.resource, tools[0]);
-    let tool_result = AgentMessage::ToolCall {
-        resource_id: Some(tool.resource.resource_id.clone()),
-        tool_call_id: call.id,
-        tool_name: call.tool_name,
-        content: "offline mock result".into(),
-        failed: false,
-    };
-    tool.reply
-        .lock()
-        .unwrap()
-        .take()
-        .unwrap()
-        .send(Ok(ToolExecuteResponse {
-            message: tool_result.clone(),
-        }))
-        .unwrap();
     let followup = inference(&mut app, entity);
     assert_eq!(followup.turn, first.turn);
+    assert_eq!(followup.tools, first.tools);
+    for result in &tool_results {
+        assert_eq!(
+            followup.messages.iter().filter(|message| *message == result).count(),
+            1,
+            "all results from the assistant's two tool calls must be in context before the next inference"
+        );
+    }
     assert_eq!(
         followup.messages,
         [
             soul.clone(),
-            vec![user.clone(), batch.clone(), tool_result.clone()]
+            vec![user.clone(), batch.clone()],
+            tool_results.clone(),
         ]
         .concat()
     );
     let answer = assistant("offline final response", vec![]);
     respond(&followup, answer.clone(), StopReason::Completed);
     turn_done(&mut app, entity);
-    let conversation = vec![user, batch, tool_result, answer];
+    let conversation = [vec![user, batch], tool_results, vec![answer]].concat();
     assert_eq!(
         messages(command(
             &mut app,

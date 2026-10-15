@@ -74,11 +74,19 @@ test('protocol accepts new structured error and terminal, rejects old transport 
     )?.type,
     'agent.message.finished',
   );
-  const opened = { BlockOpened: { block_id: 'Case-sensitive.block', created: false, temporary: true } };
-  const response = parseServerMessage(JSON.stringify({
-    type: 'mcl.command_result', id: 'block', source: 'client:local/a',
-    target: workspace.manager, result: { Ok: opened }, history_error: null,
-  }));
+  const opened = {
+    BlockOpened: { block_id: 'Case-sensitive.block', created: false, temporary: true },
+  };
+  const response = parseServerMessage(
+    JSON.stringify({
+      type: 'mcl.command_result',
+      id: 'block',
+      source: 'client:local/a',
+      target: workspace.manager,
+      result: { Ok: opened },
+      history_error: null,
+    }),
+  );
   assert.ok(response?.type === 'mcl.command_result');
   assert.deepEqual(response.result, { Ok: opened });
   assert.equal(
@@ -202,6 +210,187 @@ test('streams reject stale instances and duplicate sequence, terminal blocks lat
   store.handleServerMessage({ ...delta, sequence: 2, content: 'late' });
   assert.equal(store.visibleMessages.length, 0);
 });
+test('compatibility failures and abort remain truthful without legacy protocol', async () => {
+  setActivePinia(createPinia());
+  const store = useWorkbenchStore();
+  store.handleServerMessage({ type: 'state.sync', state });
+  assert.equal(store.driverContextPath, 'entry.pending[-1]');
+  assert.deepEqual(store.resourceVisibility, []);
+  assert.deepEqual(store.sandboxOptions, { options: [], activated: [] });
+  assert.equal(store.canAbortTurn, false);
+  await assert.rejects(store.abortTurn(), /not supported/);
+  await assert.rejects(store.sendSkillInvocation('', 'hook:local/test'), /Hook execution/);
+  await assert.rejects(
+    store.setResourceVisibility('tool:local/unknown', true),
+    /verified current TOOL alias/,
+  );
+  await assert.rejects(store.setSandbox('sandbox:local/unknown'), /verified current SANDBOX alias/);
+  store.handleServerMessage({
+    type: 'state.sync',
+    state: {
+      ...state,
+      agents: [{ ...state.agents[0]!, turn: 'active' }],
+    },
+  });
+  assert.equal(store.selectedAgentWorking, true);
+  store.handleServerMessage({
+    type: 'agent.message.finished',
+    id: 'failed',
+    agent: workspace.manager,
+    agent_instance: 'Entity(1, 2)',
+    error: { kind: 'InferenceFailed', message: 'real failure' },
+  });
+  assert.deepEqual(store.lastFailures.get(`${workspace.id}:${workspace.manager}`), {
+    message: 'real failure',
+  });
+  store.handleServerMessage({
+    type: 'agent.message.finished',
+    id: 'stale',
+    agent: workspace.manager,
+    agent_instance: 'old',
+    error: { kind: 'InferenceFailed', message: 'stale failure' },
+  });
+  assert.equal(
+    store.lastFailures.get(`${workspace.id}:${workspace.manager}`)?.message,
+    'real failure',
+  );
+});
+
+test('current typed GET restores resource controls and composer uses array arguments plus wake', async () => {
+  setActivePinia(createPinia());
+  const store = useWorkbenchStore();
+  const sent: Array<{
+    type: string;
+    id: string;
+    message: { command?: string; arguments?: unknown[][] };
+  }> = [];
+  const review = {
+    resource_id: 'skill:local/review',
+    alias: 'review',
+    description: '',
+    input_schema: {},
+  };
+  const sandbox = { resource_id: 'sandbox:local/write' };
+  let visible = [review];
+  let activated = [sandbox];
+  const oldSocket = globalThis.WebSocket;
+  class Socket {
+    static OPEN = 1;
+    readyState = 1;
+    onopen: (() => void) | null = null;
+    onclose: (() => void) | null = null;
+    onmessage = null;
+    onerror = null;
+    close() {}
+    send(raw: string) {
+      const request = JSON.parse(raw) as (typeof sent)[number];
+      sent.push(request);
+      if (request.type !== 'mcl.command') return;
+      const command = request.message.command!;
+      let result: unknown = 'Unit';
+      if (command === 'GET review') result = { Array: { Tool: [review] } };
+      if (command === 'GET write') result = { Array: { Sandbox: [sandbox] } };
+      if (command === 'GET session.visible') result = { Array: { Tool: visible } };
+      if (command === 'GET session.sandbox_activated') result = { Array: { Sandbox: activated } };
+      if (command === 'INJECT ? TO session.visible')
+        visible = request.message.arguments?.[0]?.length ? [review] : [];
+      if (command === 'INJECT ? TO session.sandbox_activated')
+        activated = request.message.arguments?.[0]?.length ? [sandbox] : [];
+      queueMicrotask(() =>
+        store.handleServerMessage({
+          type: 'mcl.command_result',
+          id: request.id,
+          source: 'client:test',
+          target: workspace.manager,
+          result: { Ok: result } as never,
+          history_error: null,
+        }),
+      );
+    }
+  }
+  globalThis.WebSocket = Socket as unknown as typeof WebSocket;
+  try {
+    store.handleServerMessage({
+      type: 'state.sync',
+      state: {
+        ...state,
+        histories: [
+          {
+            workspace,
+            agent: workspace.manager,
+            messages: [
+              'IMPORT TOOL skill:local/review AS review',
+              'IMPORT SANDBOX sandbox:local/write AS write',
+            ].map((text, index) => ({
+              key: String(index),
+              sequence: index,
+              turn: null,
+              kind: 'mcl',
+              content: text,
+              payload: { text, arguments: [] },
+              created_at_ms: 0,
+            })),
+          },
+        ],
+      },
+    });
+    store.connect();
+    store.handleServerMessage({
+      type: 'connection.registered',
+      id: 'register',
+      client: { resource_id: 'client:test', name: 'test', client_type: 'webui' },
+    });
+    await store.refreshDriverResources(true);
+    assert.deepEqual(store.resourceVisibility, [
+      { resource: review.resource_id, visible: true, default: false },
+    ]);
+    assert.deepEqual(store.sandboxOptions, {
+      options: [sandbox.resource_id],
+      activated: [sandbox.resource_id],
+    });
+    await store.setResourceVisibility(review.resource_id, false);
+    assert.equal(store.resourceVisibility[0]?.visible, false);
+    await store.setSandbox(null);
+    assert.deepEqual(store.sandboxOptions.activated, []);
+    await store.sendMessage(' hello ');
+    const commands = sent.filter((request) => request.type === 'mcl.command');
+    assert.deepEqual(commands.at(-2)?.message, {
+      workspace: { id: workspace.id, name: workspace.name, project_root: workspace.project_root },
+      agent: null,
+      command: 'INJECT ? TO entry.pending[-1]',
+      arguments: [[{ type: 'user', content: 'hello' }]],
+    });
+    assert.equal(commands.at(-1)?.message.command, 'EMIT EFFECT wake');
+    assert.ok(sent.every((request) => !request.type.startsWith('agent.')));
+  } finally {
+    store.disconnect();
+    globalThis.WebSocket = oldSocket;
+  }
+});
+
+test('ended Driver failure remains visible in state snapshots', () => {
+  setActivePinia(createPinia());
+  const store = useWorkbenchStore();
+  store.handleServerMessage({
+    type: 'state.sync',
+    state: {
+      ...state,
+      agents: state.agents.map((agent) => ({
+        ...agent,
+        status: 'stopping' as const,
+        turn: null,
+        error: { kind: 'DriverExecutionFailed', message: 'tool calls lack results' },
+      })),
+    },
+  });
+  assert.equal(store.selectedAgentReady, false);
+  assert.equal(store.selectedAgentWorking, false);
+  assert.equal(
+    store.lastFailures.get(`${workspace.id}:${workspace.manager}`)?.message,
+    'tool calls lack results',
+  );
+});
+
 test('usage comes from persisted history, not state token counters', () => {
   setActivePinia(createPinia());
   const store = useWorkbenchStore();

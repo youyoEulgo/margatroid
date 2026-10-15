@@ -57,11 +57,11 @@ fn parse_context_window(value: Option<&str>) -> Result<u64, InferenceError> {
     })?;
     count
         .checked_mul(multiplier)
-        .filter(|value| *value > 0)
+        .filter(|value| *value > 0 && *value <= i64::MAX as u64)
         .ok_or_else(|| {
             InferenceError::new(
                 InferenceErrorKind::InvalidModelRoute,
-                "context_window must be greater than zero",
+                "context_window must be positive and fit a Lua integer",
             )
         })
 }
@@ -163,6 +163,7 @@ fn compile_model_routes(
                 "model route api type is not registered",
             )
         })?;
+        let context_window_tokens = parse_context_window(config.context_window.as_deref())?;
         let adapter = factory.build(ProviderRouteInput {
             provider: config.provider.as_deref(),
             base_url: &base_url,
@@ -170,13 +171,22 @@ fn compile_model_routes(
             thinking: config.thinking.as_deref(),
             reasoning_effort: config.reasoning_effort.as_deref(),
         })?;
-        let context_window_tokens = parse_context_window(config.context_window.as_deref())?;
+        let runtime_info = margatroid_types::model_components::ModelRuntimeInfo {
+            id: id.as_str().to_owned(),
+            model: config.model.clone(),
+            api_type: config.api_type,
+            provider: config.provider,
+            context_window_tokens,
+            thinking: config.thinking,
+            reasoning_effort: config.reasoning_effort,
+        };
         routes.insert(
             id,
             ConfiguredModelRoute {
                 model: config.model,
                 context_window_tokens,
                 adapter,
+                runtime_info,
             },
         );
     }
@@ -1121,6 +1131,10 @@ pub(crate) fn handle_model_routes_reloaded(world: &mut World, output: ReloadOutp
             config.routes = routes;
             count
         });
+    if result.is_ok() {
+        let catalog = crate::runtime_catalog(&config.routes);
+        world.insert_resource(catalog);
+    }
     world.send_event(ReloadModelRoutesResult {
         id: output.id,
         result,

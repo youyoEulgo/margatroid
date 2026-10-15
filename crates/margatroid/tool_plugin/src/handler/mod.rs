@@ -391,17 +391,39 @@ async fn execute(mut prepared: Prepared) {
     } else {
         let _ = prepared.activity.mark_completed();
     }
-    let result = result.map(|content| ToolExecuteResponse {
-        message: AgentMessage::ToolCall {
-            resource_id: Some(prepared.request.resource.resource_id.clone()),
-            tool_call_id: prepared.request.call.id.clone(),
-            tool_name: prepared.request.call.tool_name.clone(),
-            content,
-            failed: false,
-        },
+    let result = result.map(|output| {
+        let (content, failed) = if matches!(
+            prepared.request.resource.definition.as_ref(),
+            CallableDefinitionSnapshot::Tool(_)
+        ) {
+            tool_outcome(output)
+        } else {
+            (output, false)
+        };
+        ToolExecuteResponse {
+            message: AgentMessage::ToolCall {
+                resource_id: Some(prepared.request.resource.resource_id.clone()),
+                tool_call_id: prepared.request.call.id.clone(),
+                tool_name: prepared.request.call.tool_name.clone(),
+                content,
+                failed,
+            },
+        }
     });
     reply(&prepared.request, result);
     prepared.finished = true;
+}
+
+fn tool_outcome(output: String) -> (String, bool) {
+    if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(&output) {
+        if let (Some(ok), Some(content)) = (
+            fields.get("ok").and_then(serde_json::Value::as_bool),
+            fields.get("content").and_then(serde_json::Value::as_str),
+        ) {
+            return (content.to_owned(), !ok);
+        }
+    }
+    (output, false)
 }
 
 #[cfg(test)]
@@ -413,6 +435,25 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    #[test]
+    fn tool_reported_outcome_preserves_failure_and_plain_text() {
+        assert_eq!(
+            tool_outcome(r#"{"ok":false,"content":"denied"}"#.into()),
+            ("denied".into(), true)
+        );
+        assert_eq!(
+            tool_outcome(r#"{"ok":true,"content":"done"}"#.into()),
+            ("done".into(), false)
+        );
+        for output in [
+            "plain text",
+            r#"{"ok":true}"#,
+            r#"{"ok":"yes","content":"x"}"#,
+        ] {
+            assert_eq!(tool_outcome(output.into()), (output.into(), false));
+        }
+    }
 
     #[tokio::test]
     async fn caller_abort_leaves_owned_supervisor_to_finish_receipt_and_cleanup() {

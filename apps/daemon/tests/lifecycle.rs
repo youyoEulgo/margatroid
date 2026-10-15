@@ -63,6 +63,19 @@ fn image(root: &Path, name: &str, driver: &str, dependencies: &[&str]) {
 }
 fn app(root: &Path) -> App {
     let mut app = App::new();
+    app.world_mut().insert_resource(
+        margatroid_types::model_components::ModelRuntimeCatalog::new([
+            margatroid_types::model_components::ModelRuntimeInfo {
+                id: "offline-test".into(),
+                model: "offline-test".into(),
+                api_type: "openai".into(),
+                provider: None,
+                context_window_tokens: 128000,
+                thinking: None,
+                reasoning_effort: None,
+            },
+        ]),
+    );
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(ClosurePlugin)
         .add_closure_system(RuntimePlugin::PRE_UPDATE)
@@ -530,13 +543,16 @@ fn missing_import_dependency_returns_failure_without_mount_and_can_stop() {
         .1;
     let set = app.world().get_component::<resource_id_plugin::ResourceSet<margatroid_types::resource_components::SkillResource>>(entity).unwrap();
     assert!(set.is_empty());
-    assert_eq!(
-        app.world()
-            .get_component::<Agent>(entity)
-            .unwrap()
-            .execution
-            .activity_count(),
-        0
+    tick_until(
+        &mut app,
+        "failed import and driver activity drain",
+        |world| {
+            let agent = world.get_component::<Agent>(entity).unwrap();
+            (agent.execution.activity_count() == 0
+                && agent.mcl.pending.is_none()
+                && agent.mcl.drained.is_drained())
+            .then_some(())
+        },
     );
     stop(&mut app, workspace);
 }

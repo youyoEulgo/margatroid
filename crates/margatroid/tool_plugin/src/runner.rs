@@ -11,17 +11,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 fn error(kind: ToolErrorKind, message: impl Into<String>) -> ToolError {
     ToolError::new(kind, message)
 }
-async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: R, limit: usize) -> mlua::Result<String> {
-    let mut bytes = Vec::new();
-    pipe.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(mlua::Error::external)?;
-    if bytes.len() > limit {
-        return Err(mlua::Error::external("shell output exceeds limit"));
-    }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
 async fn lua_execute(
     request: &RunnerRequest,
     cancelled: Arc<AtomicBool>,
@@ -34,7 +23,13 @@ async fn lua_execute(
         ));
     }
     let lua = Lua::new_with(
-        StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8 | StdLib::COROUTINE,
+        StdLib::TABLE
+            | StdLib::STRING
+            | StdLib::MATH
+            | StdLib::UTF8
+            | StdLib::COROUTINE
+            | StdLib::IO
+            | StdLib::OS,
         LuaOptions::default(),
     )
     .map_err(|_| error(ToolErrorKind::ExecutionFailed, "Lua initialization failed"))?;
@@ -110,17 +105,68 @@ async fn lua_execute(
         .unwrap(),
     )
     .unwrap();
-    globals.set("json", json).unwrap();
+    globals.set("json", json.clone()).unwrap();
+    let package = lua.create_table().unwrap();
+    package
+        .set(
+            "config",
+            format!("{}\n;\n?\n!\n-\n", std::path::MAIN_SEPARATOR),
+        )
+        .unwrap();
+    globals.set("package", package).unwrap();
+    let io: mlua::Table = globals.get("io").unwrap();
+    let diagnostic_stream: Value = io.get("stderr").unwrap();
+    io.get::<mlua::Function>("output")
+        .unwrap()
+        .call::<()>(diagnostic_stream.clone())
+        .unwrap();
+    io.set("stdout", diagnostic_stream).unwrap();
+    io.set(
+        "popen",
+        lua.create_function(|_, _: mlua::MultiValue| {
+            Err::<(), _>(mlua::Error::external(
+                "use margatroid().shell for subprocesses",
+            ))
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let os: mlua::Table = globals.get("os").unwrap();
+    os.set(
+        "exit",
+        lua.create_function(|_, _: mlua::MultiValue| {
+            Err::<(), _>(mlua::Error::external("os.exit is unavailable in tools"))
+        })
+        .unwrap(),
+    )
+    .unwrap();
     let output_limit = request.limits.output_bytes;
     let diagnostic_limit = request.limits.diagnostic_bytes;
     let host_timeout = request.limits.host_call_timeout;
     let project_root = request.context.project_root.clone();
     let shell_cancel = cancelled.clone();
-    globals.set("shell", lua.create_async_function(move |lua, (script, options): (String, Option<mlua::Table>)| {
+    let shell = lua.create_async_function(move |lua, (script, options): (String, Option<mlua::Table>)| {
         let project_root = project_root.clone();
         let cancelled = shell_cancel.clone();
         async move {
-            let use_pty = options.as_ref().is_some_and(|t| t.get::<bool>("pty").unwrap_or(false));
+            async fn capture<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, limit: usize) -> mlua::Result<(String, bool)> {
+                let mut bytes = Vec::new();
+                let mut truncated = false;
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let count = pipe.read(&mut chunk).await.map_err(mlua::Error::external)?;
+                    if count == 0 { break; }
+                    let retained = limit.saturating_sub(bytes.len()).min(count);
+                    bytes.extend_from_slice(&chunk[..retained]);
+                    truncated |= retained < count;
+                }
+                Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+            }
+            if script.trim().is_empty() { return Err(mlua::Error::external("shell command is empty")); }
+            let requested_limit = options.as_ref().map(|t| t.get::<Option<usize>>("max_output_bytes")).transpose()?.flatten().unwrap_or(output_limit);
+            let capture_limit = requested_limit.min(output_limit);
+            let requested_timeout = options.as_ref().map(|t| t.get::<Option<u64>>("timeout_ms")).transpose()?.flatten().map(Duration::from_millis).unwrap_or(host_timeout);
+            let use_pty = options.as_ref().map(|t| t.get::<Option<bool>>("pty")).transpose()?.flatten().unwrap_or(false);
             #[cfg(not(target_os = "linux"))]
             if use_pty { return Err(mlua::Error::external("PTY requires Linux")); }
             let mut command = tokio::process::Command::new("/bin/sh");
@@ -132,28 +178,67 @@ async fn lua_execute(
             drop(command);
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
-            let remaining = deadline.saturating_duration_since(Instant::now()).min(host_timeout);
+            let remaining = deadline.saturating_duration_since(Instant::now()).min(host_timeout).min(requested_timeout);
             let io = async {
                 let output = async {
                     #[cfg(target_os = "linux")]
-                    if let Some(terminal) = terminal { return Ok::<_, mlua::Error>((crate::pty::drain(terminal, output_limit).await?, String::new())); }
-                    let (stdout, stderr) = tokio::try_join!(read_pipe(stdout.unwrap(), output_limit), read_pipe(stderr.unwrap(), diagnostic_limit))?;
-                    Ok((stdout, stderr))
+                    if let Some(terminal) = terminal {
+                        let (stdout, truncated) = crate::pty::drain(terminal, capture_limit).await?;
+                        return Ok::<_, mlua::Error>((stdout, String::new(), truncated));
+                    }
+                    let ((stdout, stdout_truncated), (stderr, stderr_truncated)) = tokio::try_join!(capture(stdout.unwrap(), capture_limit), capture(stderr.unwrap(), diagnostic_limit.min(capture_limit)))?;
+                    Ok((stdout, stderr, stdout_truncated || stderr_truncated))
                 };
-                let (status, (stdout, stderr)) = tokio::try_join!(async { child.wait().await.map_err(mlua::Error::external) }, output)?;
+                let (status, (stdout, stderr, truncated)) = tokio::try_join!(async { child.wait().await.map_err(mlua::Error::external) }, output)?;
                 let table = lua.create_table()?;
-                table.set("stdout", stdout)?; table.set("stderr", stderr)?; table.set("code", status.code().unwrap_or(-1))?;
+                let code = status.code().unwrap_or(-1);
+                table.set("stdout", stdout)?;
+                table.set("stderr", stderr)?;
+                table.set("code", code)?;
+                table.set("exit_code", code)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    table.set("signal", status.signal())?;
+                }
+                table.set("truncated", truncated)?;
+                table.set("terminal", use_pty)?;
                 Ok::<_, mlua::Error>(table)
             };
             let cancellation = async { loop { if cancelled.load(Ordering::Acquire) { return; } tokio::time::sleep(Duration::from_millis(10)).await; } };
             let result = tokio::select! {
-                result = tokio::time::timeout(remaining, io) => result.map_err(|_| mlua::Error::external("shell deadline exceeded"))?,
+                result = tokio::time::timeout(remaining, io) => result.unwrap_or_else(|_| Err(mlua::Error::external("shell deadline exceeded"))),
                 _ = cancellation => Err(mlua::Error::external("cancelled")),
             };
             if result.is_err() { let _ = child.start_kill(); let _ = child.wait().await; }
             result
         }
-    }).map_err(|e| error(ToolErrorKind::ExecutionFailed, e.to_string()))?).unwrap();
+    }).map_err(|e| error(ToolErrorKind::ExecutionFailed, e.to_string()))?;
+    globals.set("shell", shell.clone()).unwrap();
+    let os_shell = shell.clone();
+    os.set(
+        "execute",
+        lua.create_async_function(move |_, command: Option<String>| {
+            let shell = os_shell.clone();
+            async move {
+                let Some(command) = command else {
+                    return Ok((Some(true), None::<String>, None::<i32>));
+                };
+                let result: mlua::Table = shell.call_async(command).await?;
+                if let Some(signal) = result.get::<Option<i32>>("signal")? {
+                    return Ok((None, Some("signal".to_owned()), Some(signal)));
+                }
+                let code: i32 = result.get("exit_code")?;
+                Ok((
+                    if code == 0 { Some(true) } else { None },
+                    Some("exit".to_owned()),
+                    Some(code),
+                ))
+            }
+        })
+        .unwrap(),
+    )
+    .unwrap();
     globals
         .set(
             "handoff",
@@ -171,6 +256,23 @@ async fn lua_execute(
         .map_err(|e| error(ToolErrorKind::InvalidRequest, e.to_string()))?;
     globals.set("args", arguments.clone()).unwrap();
     globals.set("context", context.clone()).unwrap();
+    let entry = lua.create_table().unwrap();
+    entry.set("version", 1).unwrap();
+    entry.set("context", context.clone()).unwrap();
+    entry.set("arguments", arguments.clone()).unwrap();
+    entry.set("json", json).unwrap();
+    entry.set("shell", shell).unwrap();
+    lua.set_named_registry_value("margatroid_entry", entry)
+        .unwrap();
+    globals
+        .set(
+            "margatroid",
+            lua.create_function(|lua, ()| {
+                lua.named_registry_value::<mlua::Table>("margatroid_entry")
+            })
+            .unwrap(),
+        )
+        .unwrap();
     let execution = async {
         lua.load(&request.script)
             .set_name("tool")
@@ -207,99 +309,11 @@ async fn lua_execute(
     Ok(result)
 }
 
-#[cfg(target_os = "linux")]
-fn descendants() -> std::io::Result<Vec<i32>> {
-    let mut parents = std::collections::BTreeMap::new();
-    for entry in std::fs::read_dir("/proc")? {
-        let entry = entry?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        let Some((_, suffix)) = stat.rsplit_once(") ") else {
-            continue;
-        };
-        if let Some(ppid) = suffix
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse::<i32>().ok())
-        {
-            parents.insert(pid, ppid);
-        }
-    }
-    let root = std::process::id() as i32;
-    Ok(parents
-        .keys()
-        .copied()
-        .filter(|pid| {
-            let mut current = *pid;
-            for _ in 0..parents.len() {
-                match parents.get(&current) {
-                    Some(parent) if *parent == root => return true,
-                    Some(parent) => current = *parent,
-                    None => break,
-                }
-            }
-            false
-        })
-        .collect())
-}
-#[cfg(target_os = "linux")]
-async fn cleanup(timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let Ok(children) = descendants() else {
-            return false;
-        };
-        for pid in children {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-        loop {
-            match nix::sys::wait::waitpid(
-                nix::unistd::Pid::from_raw(-1),
-                Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-            ) {
-                Err(nix::errno::Errno::ECHILD) => return descendants().is_ok_and(|p| p.is_empty()),
-                Ok(nix::sys::wait::WaitStatus::StillAlive) => break,
-                Ok(_) => continue,
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(_) => return false,
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
 #[doc(hidden)]
 pub async fn runner_main() -> i32 {
-    #[cfg(target_os = "linux")]
-    if nix::sys::prctl::set_child_subreaper(true).is_err() {
-        return 3;
-    }
-    #[cfg(not(target_os = "linux"))]
-    return 3;
-    if let Some(path) = std::env::var_os("MARGATROID_RUNNER_CGROUP") {
-        if tokio::fs::write(
-            std::path::PathBuf::from(path).join("cgroup.procs"),
-            std::process::id().to_string(),
-        )
-        .await
-        .is_err()
-        {
-            return 3;
-        }
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args != [std::ffi::OsString::from("--margatroid-tool-worker")] {
+        return crate::supervisor::supervisor_main(args).await;
     }
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal_cancel = cancelled.clone();
@@ -327,22 +341,18 @@ pub async fn runner_main() -> i32 {
         return 2;
     };
     let result = lua_execute(&request, cancelled).await;
-    let cleanup_proven = cleanup(request.limits.cleanup_timeout).await;
-    let result = if cleanup_proven {
-        result
-    } else {
-        Err(error(
-            ToolErrorKind::CleanupFailed,
-            "runner descendant cleanup failed",
-        ))
-    };
     let response = RunnerResponse {
         protocol_version: 1,
         result,
-        cleanup_proven,
+        cleanup_proven: false,
     };
     let bytes = serde_json::to_vec(&response).unwrap();
-    let result = tokio::io::stdout().write_all(&bytes).await;
+    let mut stdout = tokio::io::stdout();
+    let result = async {
+        stdout.write_all(&bytes).await?;
+        stdout.flush().await
+    }
+    .await;
     signal.abort();
     if result.is_ok() {
         0

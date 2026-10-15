@@ -41,8 +41,12 @@ pub(crate) fn configure(
     AsyncFd::new(master)
 }
 
-pub(crate) async fn drain(master: AsyncFd<std::fs::File>, limit: usize) -> mlua::Result<String> {
+pub(crate) async fn drain(
+    master: AsyncFd<std::fs::File>,
+    limit: usize,
+) -> mlua::Result<(String, bool)> {
     let mut bytes = Vec::new();
+    let mut truncated = false;
     let mut chunk = [0u8; 8192];
     loop {
         let mut ready = master.readable().await.map_err(mlua::Error::external)?;
@@ -52,10 +56,9 @@ pub(crate) async fn drain(master: AsyncFd<std::fs::File>, limit: usize) -> mlua:
         }) {
             Ok(Ok(0)) => break,
             Ok(Ok(count)) => {
-                if bytes.len().saturating_add(count) > limit {
-                    return Err(mlua::Error::external("shell output exceeds limit"));
-                }
-                bytes.extend_from_slice(&chunk[..count]);
+                let retained = limit.saturating_sub(bytes.len()).min(count);
+                bytes.extend_from_slice(&chunk[..retained]);
+                truncated |= retained < count;
             }
             Ok(Err(error)) if error.raw_os_error() == Some(nix::libc::EIO) => break,
             Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -63,5 +66,5 @@ pub(crate) async fn drain(master: AsyncFd<std::fs::File>, limit: usize) -> mlua:
             Err(_) => continue,
         }
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }

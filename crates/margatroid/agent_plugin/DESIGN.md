@@ -274,7 +274,11 @@ handle_start_agent(world: &mut World, request: StartAgent)
         通过复核后创建Agent Entity，通过受检图书馆入口挂载Agent，并挂载五种空资源集合
         info保存配置，workspace保存工作区ResourceID，sandbox初始为空，lua初始化空wake槽位、空ready与ended暂存槽位和空关闭句柄，execution初始化共享开放作用域，database保存已打开句柄、history为同文件历史视图，不加载Block内容到Agent，import_bindings初始化为空唯一RAM绑定表，mcl.commands为空VecDeque、mcl.pending为None、mcl.drained初始已收口，turn为None
         生成包含进程session nonce及单调序号的VM启动子请求ID，跨进程重启不复用TEMP instance；先将原StartAgent请求ID和子请求ID写入Creating
-        整理注入环境，包含完整Agent Entity、Agent地址、启动配置及所需环境能力，提交StartDriverLuaVm
+        整理agent_info注入环境，包含实例描述、Agent/Workspace/Image地址、项目/主目录、完整依赖列表及模型选择/采样参数
+        从共享ModelRuntimeCatalog取得启动时非敏感模型路由快照，model.model仍为路由ID，补充provider_model、api_type、provider、context_window_tokens、thinking及reasoning_effort
+        模型元数据由Inference全局路由发布，Agent不依赖Inference实现；未配置模型明确返回ModelRouteNotFound，不注入0窗口或猜默认值
+        Lua环境是启动快照，路由重载后旧Driver不暗改；新启动使用新目录投影，正在执行推理仍使用自己的请求快照
+        不注入api_key、Authorization、认证头或请求端点。整理宿主能力后提交StartDriverLuaVm
         提交VM前的任何失败均释放本次已创建Entity和句柄，发送关联原请求的StartAgentResult::Err
         不在发出VM请求后提前返回启动成功
 

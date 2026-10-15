@@ -139,6 +139,7 @@ pub struct ConfiguredModelRoute {
     pub(crate) model: String,
     pub(crate) context_window_tokens: u64,
     pub(crate) adapter: ErasedProviderAdapter,
+    pub(crate) runtime_info: margatroid_types::model_components::ModelRuntimeInfo,
 }
 
 impl ConfiguredModelRoute {

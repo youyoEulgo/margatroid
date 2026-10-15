@@ -1,7 +1,7 @@
 # Margatroid UI
 
 Margatroid 的 Web 工作台，使用 Vue 3、Vite 和 Pinia，直接连接 daemon WebSocket。
-提供聊天历史、显式 MCL 指令工作台、Agent 状态和运行日志；不包含旧动态可见性、Workflow 热插拔或 turn abort 路由。
+提供聊天输入与历史、显式 MCL 指令工作台、Agent 状态、资源可见性、Sandbox 选择和运行日志。所有操作使用当前 typed-array MCL 协议；不恢复旧 transport、Workflow 热插拔或 turn abort 路由。
 
 ## 启动
 
@@ -17,7 +17,7 @@ npm run dev
 在 **Connection & driver** 设置中指定实际 daemon 地址，例如 `ws://127.0.0.1:3939/ws`。
 
 ```sh
-cargo run -p margatroid_daemon -- --data-root ~/.margatroid
+cargo run -p margatroid_daemon
 cargo run -p margatroid_cli -- workspace up ../demo_workspace/margatroid-workspace.yaml
 ```
 
@@ -25,7 +25,7 @@ cargo run -p margatroid_cli -- workspace up ../demo_workspace/margatroid-workspa
 
 ## MCL 工作台与用户消息
 
-默认输入模式是 **MCL command**，一次发送一条明确指令。Arguments 输入框必须是 JSON 数组，
+默认输入模式是聊天。切换到 **MCL command** 时一次发送一条明确指令。Arguments 输入框必须是 JSON 数组，
 其中每项也必须是数组，依次对应指令中的 `?` 占位符。无占位符时使用 `[]`。
 
 例如，由 driver 自己定义 `driver.messages` 上下文路径时，可显式输入：
@@ -40,13 +40,14 @@ Arguments：
 [[{"type":"user","content":"请检查这个项目"}]]
 ```
 
-`driver.messages` 只是示例 driver 约定，不是协议默认字段。UI 不推断上下文路径，
-不自动发送 wake，也不因为注入成功而假定已触发推理。
+`driver.messages` 只是示例 driver 约定，不是协议默认字段。聊天输入使用根 Driver 的
+`entry.pending[-1]` 约定，先等待 `INJECT ? TO <配置路径>` 成功，再发送 `EMIT EFFECT wake`。
+`Driver context path` 可在设置中修改，仅保存在当前页面内存。自定义 Driver 若不提供该入口，
+后端会返回真实错误；注入或 wake 成功不代表推理已经完成。
 
-**Inject user message** 模式仅是上述单条指令的便利入口：先在设置中填写
-`Driver context path`，UI 才会发送 `INJECT ? TO <配置路径>`，使用同样的二维数组参数。
-该配置默认留空，只保存在当前页面内存。启动轮次、调用推理或修改 sandbox 均应使用
-实际 driver 支持的显式 MCL 指令，而不是旧 `agent.message` 或 `agent.turn.abort` 请求。
+Skill 手动调用使用当前可见 TOOL 投影中的 alias，向同一入口追加可选的 Inject 用户上下文和
+单条 Assistant ToolCall，然后 wake。Hook 执行在当前后端不受支持，按钮禁用且 store 明确拒绝。
+Turn abort 同样无当前协议支持，按钮禁用；不会伪造 `agent.turn.abort` 或取消成功。
 
 manager 路由使用 `agent: null`，后端根据工作区 manager 解析目标；普通 Agent 使用完整资源地址。
 所有命令都通过 `mcl.command` 发送，来源身份由注册连接绑定。命令结果直接展示真实返回值；
@@ -56,8 +57,14 @@ manager 路由使用 `agent: null`，后端根据工作区 manager 解析目标�
 
 注册成功后请求 `state.query`；切换工作区或 Agent 时请求 `history.query`。
 `state.sync` 提供工作区以及 Agent 的 `status`、`turn`、`sandbox`、排队数量和 pending command。
-Sandbox 面板仅显示当前状态，不使用旧 exposed 配置推断或修改 sandbox。
-当前协议未发布已加载资源集合时，资源面板会明确提示不可用，不推断默认或动态可见资源。
+资源面板读取 `GET session.visible` 的 TOOL 投影；Sandbox 读取
+`GET session.sandbox_activated` 的 SANDBOX 投影。当前 AgentState 不提供导入列表：
+UI 从当前指令历史的显式 IMPORT 审计取得候选 alias，并逐个 `GET alias` 验证当前导入绑定。
+无法枚举没有审计的隐藏导入，不臆造旧 default_resources 元数据，旧兼容 default 标记为 false。
+可见性修改使用已验证 alias 的二维参数注入 `session.visible`；Sandbox 注入
+`session.sandbox_activated` 后调用当前 `sandbox_use` effect。不发送旧 RESOURCE 数组、
+exposed、visibility 或 history_record 合同。自定义 Driver 不支持这些路径时显示真实错误。
+资源快照按工作区、Agent 和启动实例隔离，历史候选不能直接当成当前有效绑定。
 
 聊天历史来自后端 `state.sync.histories` 或 `history.result`，按持久记录 key、sequence 和 JSON payload
 渲染消息、工具执行失败、嵌套 Inject 和指令记录。Token usage 从历史 payload 汇总，
