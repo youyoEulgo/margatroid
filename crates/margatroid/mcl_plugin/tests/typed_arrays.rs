@@ -50,14 +50,14 @@ fn resolve(alias: &str) -> Result<BlockInner, MclError> {
 fn explicit_import_kind_alias_and_removed_contracts() {
     for text in [
         "IMPORT TOOL tool:local/bash:latest AS bash",
-        "IMPORT TOOL skill:local/review AS review",
-        "IMPORT TOOL hook:local/run AS review-flow",
         "IMPORT MESSAGE prompt:local/soul AS soul",
         "IMPORT SANDBOX sandbox:local/write AS workspace_write",
     ] {
         assert!(parse(text, &[]).is_ok(), "{text}");
     }
     for text in [
+        "IMPORT TOOL skill:local/review AS review",
+        "IMPORT TOOL hook:local/run AS review-flow",
         "IMPORT tool:local/bash AS bash",
         "IMPORT TOOL prompt:local/soul AS soul",
         "IMPORT MESSAGE tool:local/bash AS bash",

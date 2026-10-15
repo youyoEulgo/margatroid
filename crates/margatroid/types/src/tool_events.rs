@@ -12,7 +12,6 @@ pub enum ToolErrorKind {
     AgentNotAlive,
     ResourceMissing,
     UnsupportedResource,
-    UnsupportedHook,
     UnsupportedHandoff,
     InvalidArguments,
     InvalidDefinition,

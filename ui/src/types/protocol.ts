@@ -58,6 +58,7 @@ export interface AgentState {
   pending_command: string | null;
   resources?: string[];
   error?: ProtocolError | null;
+  context_window_tokens?: number;
 }
 export interface HistoryMessage {
   key: string;

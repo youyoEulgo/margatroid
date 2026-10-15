@@ -60,12 +60,6 @@ fn fixture() -> Fixture {
         .register_resources::<ResourceSet<ToolResource>>("tool")
         .unwrap();
     world
-        .register_resources::<ResourceSet<SkillResource>>("skill")
-        .unwrap();
-    world
-        .register_resources::<ResourceSet<HookResource>>("hook")
-        .unwrap();
-    world
         .register_resources::<ResourceSet<PromptResource>>("prompt")
         .unwrap();
     world
@@ -216,6 +210,16 @@ async fn model_environment_is_complete_private_and_an_admission_snapshot() {
         LuaValue::String("upstream-model".into())
     );
     assert_eq!(model["context_window_tokens"], LuaValue::Integer(128_000));
+    assert_eq!(
+        f.app
+            .world()
+            .get_component::<margatroid_types::model_components::ModelRuntimeInfo>(
+                requests[0].owner
+            )
+            .unwrap()
+            .context_window_tokens,
+        128_000
+    );
     assert_eq!(model["api_type"], LuaValue::String("deepseek".into()));
     assert_eq!(model["provider"], LuaValue::String("test-provider".into()));
     assert_eq!(model["thinking"], LuaValue::String("enabled".into()));
@@ -287,14 +291,6 @@ async fn start_waits_for_ready_and_keeps_resources_empty() {
     assert!(agent.history.list().unwrap().is_empty());
     assert!(world
         .get_component::<ResourceSet<ToolResource>>(entity)
-        .unwrap()
-        .is_empty());
-    assert!(world
-        .get_component::<ResourceSet<SkillResource>>(entity)
-        .unwrap()
-        .is_empty());
-    assert!(world
-        .get_component::<ResourceSet<HookResource>>(entity)
         .unwrap()
         .is_empty());
     assert!(world

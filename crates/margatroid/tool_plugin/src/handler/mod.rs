@@ -11,8 +11,7 @@ use margatroid_types::execution_components::{
 };
 use margatroid_types::message_types::AgentMessage;
 use margatroid_types::resource_components::{
-    skill_input_schema, CallableDefinitionSnapshot, CallableResource, HookResource, SkillResource,
-    ToolResource,
+    CallableDefinitionSnapshot, CallableResource, ToolResource,
 };
 use resource_id_plugin::ResourceSet;
 use std::panic::AssertUnwindSafe;
@@ -40,7 +39,6 @@ pub(crate) fn receiver_closed(request: &ToolExecuteRequest) -> bool {
 struct Prepared {
     request: ToolExecuteRequest,
     path: PathBuf,
-    skill: bool,
     arguments: serde_json::Value,
     context: ToolContext,
     activity: ExecutionActivity,
@@ -87,12 +85,6 @@ fn validate_owner(
     let present = match id.resource_type() {
         "tool" => world
             .get_component::<ResourceSet<ToolResource>>(entity)
-            .is_some_and(|set| set.get(id).is_some()),
-        "skill" => world
-            .get_component::<ResourceSet<SkillResource>>(entity)
-            .is_some_and(|set| set.get(id).is_some()),
-        "hook" => world
-            .get_component::<ResourceSet<HookResource>>(entity)
             .is_some_and(|set| set.get(id).is_some()),
         _ => {
             return Err(ToolError::new(
@@ -169,31 +161,9 @@ fn prepare(world: &World, request: ToolExecuteRequest) -> Result<Prepared, ToolE
             "call name does not match selected alias",
         ));
     }
-    let (path, schema, skill) = match (
-        &*request.resource.definition,
-        request.resource.resource_id.resource_type(),
-    ) {
-        (CallableDefinitionSnapshot::Tool(resource), "tool") => (
-            resource.script_path.clone(),
-            resource.input_schema.clone(),
-            false,
-        ),
-        (CallableDefinitionSnapshot::Skill(resource), "skill") => {
-            (resource.content_path.clone(), skill_input_schema(), true)
-        }
-        (CallableDefinitionSnapshot::Hook(_), "hook") => {
-            return Err(ToolError::new(
-                ToolErrorKind::UnsupportedHook,
-                "hook execution route is not supported",
-            ))
-        }
-        _ => {
-            return Err(ToolError::new(
-                ToolErrorKind::UnsupportedResource,
-                "snapshot kind does not match resource identity",
-            ))
-        }
-    };
+    let CallableDefinitionSnapshot::Tool(resource) = request.resource.definition.as_ref();
+    let path = resource.script_path.clone();
+    let schema = resource.input_schema.clone();
     fn has_external_reference(value: &serde_json::Value) -> bool {
         match value {
             serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
@@ -221,14 +191,9 @@ fn prepare(world: &World, request: ToolExecuteRequest) -> Result<Prepared, ToolE
             "arguments do not match schema",
         ));
     }
-    let kind = if skill {
-        ExecutionActivityKind::Other
-    } else {
-        ExecutionActivityKind::Sandbox
-    };
     let activity = agent
         .execution
-        .register_with_snapshot(kind, || {
+        .register_with_snapshot(ExecutionActivityKind::Sandbox, || {
             agent
                 .sandbox
                 .as_ref()
@@ -257,7 +222,6 @@ fn prepare(world: &World, request: ToolExecuteRequest) -> Result<Prepared, ToolE
     Ok(Prepared {
         request,
         path,
-        skill,
         arguments,
         context,
         activity,
@@ -356,7 +320,7 @@ async fn execute(mut prepared: Prepared) {
     let result = AssertUnwindSafe(async {
         let timeout = tokio::time::sleep(prepared.config.limits.execution_timeout);
         tokio::pin!(timeout);
-        let file = bounded_file(&prepared.path, if prepared.skill { prepared.config.limits.output_bytes } else { prepared.config.limits.script_bytes });
+        let file = bounded_file(&prepared.path, prepared.config.limits.script_bytes);
         let text = tokio::select! {
             result = file => result?,
             _ = prepared.activity.cancel.cancelled() => return Err(ToolError::new(ToolErrorKind::Cancelled, "scope cancelled")),
@@ -365,7 +329,6 @@ async fn execute(mut prepared: Prepared) {
             _ = crate::process::closed(&prepared.request.reply) => return Err(ToolError::new(ToolErrorKind::Cancelled, "receiver closed")),
         };
         if prepared.activity.cancel.is_cancelled() || prepared.request.cancel.is_cancelled() || receiver_closed(&prepared.request) { return Err(ToolError::new(ToolErrorKind::Cancelled, "request cancelled")); }
-        if prepared.skill { return Ok(text); }
         let temp = tempfile::Builder::new().prefix("margatroid-tool-").tempdir().map_err(|_| ToolError::new(ToolErrorKind::PreparationFailed, "temporary directory creation failed"))?;
         prepared.context.temp_dir = temp.path().to_path_buf();
         let mut limits = prepared.config.limits.clone();
@@ -392,14 +355,7 @@ async fn execute(mut prepared: Prepared) {
         let _ = prepared.activity.mark_completed();
     }
     let result = result.map(|output| {
-        let (content, failed) = if matches!(
-            prepared.request.resource.definition.as_ref(),
-            CallableDefinitionSnapshot::Tool(_)
-        ) {
-            tool_outcome(output)
-        } else {
-            (output, false)
-        };
+        let (content, failed) = tool_outcome(output);
         ToolExecuteResponse {
             message: AgentMessage::ToolCall {
                 resource_id: Some(prepared.request.resource.resource_id.clone()),
@@ -458,27 +414,28 @@ mod tests {
     #[tokio::test]
     async fn caller_abort_leaves_owned_supervisor_to_finish_receipt_and_cleanup() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("skill.md");
-        std::fs::write(&path, "body").unwrap();
+        let path = root.path().join("main.lua");
+        std::fs::write(&path, "function execute() return 'body' end").unwrap();
         let scope = AgentExecutionScope::new();
-        let activity = scope.register(ExecutionActivityKind::Other).unwrap();
+        let activity = scope.register(ExecutionActivityKind::Sandbox).unwrap();
         let (tx, rx) = oneshot::channel();
-        let resource = ResourceID::parse("skill:test/skill:latest").unwrap();
+        let resource = ResourceID::parse("tool:test/tool:latest").unwrap();
         let request = ToolExecuteRequest {
             id: "req".into(),
             agent: World::default().spawn(),
             resource: CallableResource {
                 resource_id: resource.clone(),
-                alias: "skill".into(),
-                definition: Arc::new(CallableDefinitionSnapshot::Skill(SkillResource {
-                    alias: "skill".into(),
-                    description: "skill".into(),
-                    content_path: path.clone(),
+                alias: "tool".into(),
+                definition: Arc::new(CallableDefinitionSnapshot::Tool(ToolResource {
+                    alias: "tool".into(),
+                    description: "tool".into(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    script_path: path.clone(),
                 })),
             },
             call: ToolCall {
                 id: "call".into(),
-                tool_name: "skill".into(),
+                tool_name: "tool".into(),
                 arguments: "{}".into(),
             },
             turn: None,
@@ -489,7 +446,6 @@ mod tests {
         let prepared = Prepared {
             request,
             path,
-            skill: true,
             arguments: serde_json::json!({}),
             context: ToolContext {
                 agent_id: "agent:test/a:latest".into(),

@@ -59,8 +59,6 @@ impl ImportedValue {
             Self::Tool(value) => matches!(
                 (&*value.definition, kind),
                 (CallableDefinitionSnapshot::Tool(_), "tool")
-                    | (CallableDefinitionSnapshot::Skill(_), "skill")
-                    | (CallableDefinitionSnapshot::Hook(_), "hook")
             ),
         }
     }
@@ -364,7 +362,7 @@ impl WorldAgentExt for World {
         let valid_kind = matches!(
             (kind, resource_id.resource_type()),
             (InnerType::Message, "prompt")
-                | (InnerType::Tool, "tool" | "skill" | "hook")
+                | (InnerType::Tool, "tool")
                 | (InnerType::Sandbox, "sandbox")
         );
         let mut alias_bytes = alias.bytes();
@@ -624,6 +622,45 @@ mod tests {
                 BlockInner::Message(vec![])
             );
         }
+    }
+
+    #[test]
+    fn declared_legacy_dependencies_cannot_be_imported_as_tools() {
+        let (mut app, entity, agent_id) = app(false);
+        let legacy = [id("skill:local/first"), id("hook:local/first")];
+        app.world_mut()
+            .get_component_mut::<Agent>(entity)
+            .unwrap()
+            .info
+            .image_dependencies = Arc::from(legacy.clone());
+        for source in legacy {
+            assert_eq!(
+                app.world()
+                    .agent_validate_import(&agent_id, "legacy", InnerType::Tool, &source)
+                    .unwrap_err()
+                    .kind,
+                AgentErrorKind::InvalidDefinition
+            );
+            assert_eq!(
+                crate::resource_events::validate_resource_import(
+                    app.world(),
+                    entity,
+                    &source,
+                    "legacy",
+                    Some(InnerType::Tool)
+                )
+                .unwrap_err()
+                .kind,
+                crate::resource_events::ResourceLoadErrorKind::InvalidRequest
+            );
+        }
+        assert!(app
+            .world()
+            .get_component::<Agent>(entity)
+            .unwrap()
+            .import_bindings
+            .get("legacy")
+            .is_none());
     }
 
     #[test]
@@ -1082,6 +1119,7 @@ mod tests {
             .is_err());
         let agent = app.world().get_component::<Agent>(entity).unwrap();
         let record = HistoryRecord {
+            created_at_ms: 1,
             key: "shared-view".into(),
             source: "test".into(),
             turn: None,
@@ -1101,6 +1139,7 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(agent.turn.as_ref(), Some(&second));
         let record = HistoryRecord {
+            created_at_ms: 1,
             key: "record".into(),
             source: agent_id.to_string(),
             turn: Some(second),

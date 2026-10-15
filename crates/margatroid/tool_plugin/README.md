@@ -15,9 +15,9 @@ ToolExecuteRequest {
 }
 ```
 
-`resource` 是唯一资源快照字段，没有重复 resource_id。准备阶段消费选定 Tool/Skill metadata 的 schema、脚本/正文路径，不按 ID 重取 latest，也不再次 global alias query。`call.tool_name` 必须等于选定 alias。归属校验要求目标 ResourceSet 存在该 ID、Agent.image_dependencies 许可及 ImportBindings 已导入该 ID/TOOL kind；不要求旧 snapshot 与 reload 后的新 alias/定义一致。
+`resource` 是唯一资源快照字段，没有重复 resource_id。准备阶段消费选定 Tool metadata 的 schema、脚本路径，不按 ID 重取 latest，也不再次 global alias query。`call.tool_name` 必须等于选定 alias。归属校验要求目标 ResourceSet 存在该 ID、Agent.image_dependencies 许可及 ImportBindings 已导入该 ID/TOOL kind；不要求旧 snapshot 与 reload 后的新 alias/定义一致。
 
-Tool 按选定 schema 校验 JSON 参数；Skill 固定 schema 为 `{ "type":"object", "properties":{}, "additionalProperties":false }`，只允许 `{}`，有界读取选定正文并返回工具结果。Hook 可导入 TOOL、可提供推理模型定义，但执行明确返回 `UnsupportedHook`，不启动普通 Lua runner；Driver 触发器执行路线仍未闭合。prompt/sandbox 不是可执行 TOOL。
+Tool 按选定 schema 校验 JSON 参数，统一通过独立 Lua runner 执行。CallableDefinitionSnapshot 只包含 Tool；其他资源类型不能作为可执行 TOOL。
 
 MCL `tool_call` 接收 MESSAGE array（恰好一条 assistant）+ visible TOOL array，调用只从 `assistant.tool_calls` 提取；手工调用也使用这个结构。`ToolCall` 是纯值，不存在 TOOL_CALL Block array。visible alias 冲突、重复 call ID、多条或非 assistant 在任何 submit 前失败；空 calls 返回 emptyMessage，不重复记录 assistant。
 
@@ -27,7 +27,7 @@ MCL `tool_call` 接收 MESSAGE array（恰好一条 assistant）+ visible TOOL a
 
 ```text
 选定 CallableResource -> ToolExecuteRequest -> 主线程校验与作用域登记
-    -> 独立 tool_runner / Skill 有界读取 -> 真实 cleanup -> oneshot -> MCL 收口
+    -> 独立 tool_runner -> 真实 cleanup -> oneshot -> MCL 收口
 ```
 
 Lua 工具在独立 `tool_runner` 可执行目标执行，不在 daemon 或 Workspace Driver VM 内执行。请求经 stdin 发送结构化 JSON；stdout 只承载版本化结果协议，Lua print 和日志写 stderr。协议无效、非零退出、输出超限、启动失败及 cleanup 缺失均返回明确错误，不隐式解包返回字符串中的业务 JSON 信封。
@@ -36,7 +36,7 @@ runner 默认在当前可执行文件同目录，可由 `MARGATROID_TOOL_RUNNER`
 
 ## 沙箱快照与生命周期
 
-Agent.sandbox 为选定 `SandboxValue { resource_id, policy: Arc<str> }`。执行登记与策略快照获取在共享作用域同一互斥门内，直接复制选定 policy，不按沙箱 ID 重取最新 ResourceSet。Tool 登记 Sandbox 活动，Skill 登记 Other 活动。
+Agent.sandbox 为选定 `SandboxValue { resource_id, policy: Arc<str> }`。执行登记与策略快照获取在共享作用域同一互斥门内，直接复制选定 policy，不按沙箱 ID 重取最新 ResourceSet。Tool 登记 Sandbox 活动。
 
 有策略时通过 landstrip CLI `run -p policy -- tool_runner` 启动；后端缺失或不可用失败关闭，不退化为无沙箱。无策略的独立进程不等于安全沙箱。后端定位使用 `MARGATROID_SANDBOX_BACKEND`、PATH 或当前可执行文件同目录；继承环境过滤凭据及宿主注入变量。
 
@@ -52,6 +52,6 @@ Agent.sandbox 为选定 `SandboxValue { resource_id, policy: Arc<str> }`。执�
 
 ## snapshot 限制与回归
 
-metadata snapshot 保留选定 alias、描述、schema 和材料路径；资源 reload 不暗改已有 Block 或请求，新 GET alias 取得新快照。脚本和 Skill 正文仍按选定路径 late read：路径对应磁盘文件可能被修改，因此本轮不承诺正文内容版本隔离，也没有 content hash 体系。
+metadata snapshot 保留选定 alias、描述、schema 和材料路径；资源 reload 不暗改已有 Block 或请求，新 GET alias 取得新快照。脚本仍按选定路径 late read：路径对应磁盘文件可能被修改，因此本轮不承诺正文内容版本隔离，也没有 content hash 体系。
 
-本地回归保留 worker/supervisor 取消、重复认领、真实 cleanup、subreaper、新 session 后代、并行大输出、PTY、作用域停止及输出/协议限制，并覆盖选定 metadata 在 collection reload 后仍生效、许可拒绝、alias 匹配、Skill 空对象及 UnsupportedHook。完整契约和未闭合项见 [DESIGN-NEXT.md](<DESIGN-NEXT.md>)；历史设计不作为当前 API。
+本地回归保留 worker/supervisor 取消、重复认领、真实 cleanup、subreaper、新 session 后代、并行大输出、PTY、作用域停止及输出/协议限制，并覆盖选定 metadata 在 collection reload 后仍生效、许可拒绝、alias 匹配、空对象 schema 参数校验及不支持的资源类型拒绝。完整契约和未闭合项见 [DESIGN.md](<DESIGN.md>)。

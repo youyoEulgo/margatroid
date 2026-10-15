@@ -12,6 +12,14 @@ const resolvedOutput = await realpath(outputDirectory);
 if (dirname(resolvedOutput) !== temporaryRoot || !basename(resolvedOutput).startsWith('margatroid-ui-tests-')) {
   throw new Error('Test output directory is not the expected temporary child');
 }
+async function cleanTestOutput() {
+  const cleanupTarget = await realpath(outputDirectory);
+  if (cleanupTarget !== resolvedOutput || dirname(cleanupTarget) !== temporaryRoot) {
+    throw new Error('Refusing to clean up an unexpected test output directory');
+  }
+  await rm(cleanupTarget, { recursive: true });
+}
+
 try {
   await build({
     root,
@@ -33,9 +41,5 @@ try {
   if (result.error) throw result.error;
   process.exitCode = result.status ?? 1;
 } finally {
-  const cleanupTarget = await realpath(outputDirectory);
-  if (cleanupTarget !== resolvedOutput || dirname(cleanupTarget) !== temporaryRoot) {
-    throw new Error('Refusing to clean up an unexpected test output directory');
-  }
-  await rm(cleanupTarget, { recursive: true });
+  await cleanTestOutput();
 }

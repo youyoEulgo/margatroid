@@ -2,13 +2,37 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { createPinia, setActivePinia } from 'pinia';
-import { contextInjection, parseArguments, historyEntries, useWorkbenchStore } from './workbench';
+import {
+  contextInjection,
+  parseArguments,
+  historyEntries,
+  latestContextTokens,
+  useWorkbenchStore,
+} from './workbench';
 import {
   isAgentMessage,
   parseServerMessage,
   type AgentHistory,
   type BackendState,
 } from '../types/protocol';
+import { formatRecordTime } from '../lib/time';
+
+test('history time renders real timestamps and never formats unknown time as epoch', () => {
+  for (const timestamp of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 9e20])
+    assert.equal(formatRecordTime(timestamp), 'Time unavailable');
+  const timestamp = Date.UTC(2026, 9, 15, 4, 21, 43);
+  for (const seconds of [false, true]) {
+    assert.equal(
+      formatRecordTime(timestamp, seconds),
+      new Intl.DateTimeFormat(undefined, {
+        hour: '2-digit',
+        minute: '2-digit',
+        ...(seconds ? { second: '2-digit' as const } : {}),
+      }).format(timestamp),
+    );
+  }
+});
+
 const workspace = {
   id: 'workspace:local/test:latest',
   name: 'test',
@@ -219,7 +243,7 @@ test('compatibility failures and abort remain truthful without legacy protocol',
   assert.deepEqual(store.sandboxOptions, { options: [], activated: [] });
   assert.equal(store.canAbortTurn, false);
   await assert.rejects(store.abortTurn(), /not supported/);
-  await assert.rejects(store.sendSkillInvocation('', 'hook:local/test'), /Hook execution/);
+  assert.equal('sendSkillInvocation' in store, false);
   await assert.rejects(
     store.setResourceVisibility('tool:local/unknown', true),
     /verified current TOOL alias/,
@@ -265,10 +289,15 @@ test('current typed GET restores resource controls and composer uses array argum
     message: { command?: string; arguments?: unknown[][] };
   }> = [];
   const review = {
-    resource_id: 'skill:local/review',
+    resource_id: 'tool:local/review',
     alias: 'review',
-    description: '',
-    input_schema: {},
+    description: 'Review a change with an explicit target',
+    input_schema: {
+      type: 'object',
+      properties: { target: { type: 'string' } },
+      required: ['target'],
+      additionalProperties: false,
+    },
   };
   const sandbox = { resource_id: 'sandbox:local/write' };
   let visible = [review];
@@ -319,7 +348,7 @@ test('current typed GET restores resource controls and composer uses array argum
             workspace,
             agent: workspace.manager,
             messages: [
-              'IMPORT TOOL skill:local/review AS review',
+              'IMPORT TOOL tool:local/review AS review',
               'IMPORT SANDBOX sandbox:local/write AS write',
             ].map((text, index) => ({
               key: String(index),
@@ -389,6 +418,76 @@ test('ended Driver failure remains visible in state snapshots', () => {
     store.lastFailures.get(`${workspace.id}:${workspace.manager}`)?.message,
     'tool calls lack results',
   );
+});
+
+test('split message records reconstruct text and use only latest assistant context usage', () => {
+  setActivePinia(createPinia());
+  const store = useWorkbenchStore();
+  const row = (key: string, content: string, payload: unknown) => ({
+    key,
+    sequence: 1,
+    turn: null,
+    kind: 'message',
+    content,
+    payload,
+    created_at_ms: 123,
+  });
+  const history: AgentHistory = {
+    workspace,
+    agent: workspace.manager,
+    messages: [
+      row('user', 'actual user text', { type: 'user' }),
+      row('old', 'legacy assistant', {
+        type: 'assistant',
+        content: 'legacy text',
+        reasoning: null,
+        tool_calls: [],
+        usage: { input_tokens: 100, output_tokens: 20, cache_hit_tokens: 50 },
+      }),
+      row('new', 'new assistant text', {
+        type: 'assistant',
+        reasoning: 'think',
+        tool_calls: [],
+        usage: { input_tokens: 600, output_tokens: 40, cache_hit_tokens: 200 },
+      }),
+      row('tool', 'actual tool output', {
+        type: 'tool_call',
+        resource_id: null,
+        tool_call_id: 'call',
+        tool_name: 'test',
+        failed: false,
+      }),
+      row('error', 'actual error', { type: 'error' }),
+      row('inject', '', { type: 'inject', messages: [{ type: 'user', content: 'nested user' }] }),
+    ],
+  };
+  assert.deepEqual(
+    historyEntries(history).map((entry) => entry.content),
+    [
+      'actual user text',
+      'legacy text',
+      'new assistant text',
+      'actual tool output',
+      'actual error',
+      'nested user',
+    ],
+  );
+  assert.equal(latestContextTokens(history), 640);
+  store.handleServerMessage({
+    type: 'state.sync',
+    state: {
+      ...state,
+      agents: state.agents.map((agent) => ({ ...agent, context_window_tokens: 1000 })),
+      histories: [history],
+    },
+  });
+  assert.equal(store.contextTokens, 640);
+  assert.equal(store.contextWindowTokens, 1000);
+  assert.deepEqual(store.tokenUsage, { input: 700, output: 60, cached: 250 });
+  history.messages.push(
+    row('unknown', 'no usage', { type: 'assistant', reasoning: null, tool_calls: [], usage: null }),
+  );
+  assert.equal(latestContextTokens(history), null);
 });
 
 test('usage comes from persisted history, not state token counters', () => {

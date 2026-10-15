@@ -9,6 +9,58 @@ fn id(kind: &str, name: &str) -> ResourceID {
     ResourceID::new(kind, "test", name, None).unwrap()
 }
 #[test]
+fn history_projection_preserves_real_and_unknown_creation_times() {
+    for created_at_ms in [0, 1_800_000_123_456] {
+        let record = margatroid_types::history_components::HistoryRecord {
+            created_at_ms,
+            key: "history-key".into(),
+            source: "test".into(),
+            turn: None,
+            kind: "message".into(),
+            content: "hello".into(),
+            payload: serde_json::json!({}),
+        };
+        let dto: HistoryMessageDto = (4usize, record).into_dto(()).unwrap();
+        assert_eq!(dto.sequence, 5);
+        assert_eq!(dto.created_at_ms, created_at_ms);
+        assert_eq!(
+            serde_json::to_value(dto).unwrap()["created_at_ms"],
+            created_at_ms
+        );
+    }
+}
+
+#[test]
+fn history_projection_preserves_split_and_legacy_message_rows_without_rewriting() {
+    for (content, payload) in [
+        ("hello", serde_json::json!({"type":"user"})),
+        ("failed", serde_json::json!({"type":"error"})),
+        (
+            "",
+            serde_json::json!({"type":"inject","messages":[{"type":"user","content":"nested"}]}),
+        ),
+        (
+            "legacy serialized JSON",
+            serde_json::json!({"type":"user","content":"old"}),
+        ),
+    ] {
+        let record = margatroid_types::history_components::HistoryRecord {
+            created_at_ms: 123,
+            key: "key".into(),
+            source: "test".into(),
+            turn: Some("turn".into()),
+            kind: "message".into(),
+            content: content.into(),
+            payload: payload.clone(),
+        };
+        let dto: HistoryMessageDto = (0usize, record).into_dto(()).unwrap();
+        assert_eq!(dto.content, content);
+        assert_eq!(dto.payload, payload);
+        assert_eq!(dto.created_at_ms, 123);
+    }
+}
+
+#[test]
 fn nested_injection_preserves_all_shared_message_shapes() {
     let dto = AgentMessageDto::Inject {
         messages: vec![
@@ -115,36 +167,22 @@ fn typed_arrays_project_resources_without_private_snapshots() {
     use margatroid_types::{
         block_types::BlockInner,
         resource_components::{
-            CallableDefinitionSnapshot, CallableResource, HookResource, SandboxValue,
-            SkillResource, ToolResource,
+            CallableDefinitionSnapshot, CallableResource, SandboxValue, ToolResource,
         },
     };
-    let definitions = vec![
-        CallableDefinitionSnapshot::Tool(ToolResource {
-            alias: "original".into(),
-            description: "tool".into(),
-            input_schema: serde_json::json!({"type":"object"}),
-            script_path: "/private/tool.lua".into(),
-        }),
-        CallableDefinitionSnapshot::Hook(HookResource {
-            alias: "original".into(),
-            description: "hook".into(),
-            input_schema: serde_json::json!({"type":"object"}),
-            script_path: "/private/hook.lua".into(),
-        }),
-        CallableDefinitionSnapshot::Skill(SkillResource {
-            alias: "original".into(),
-            description: "skill".into(),
-            content_path: "/private/skill.md".into(),
-        }),
-    ];
+    let definitions = vec![CallableDefinitionSnapshot::Tool(ToolResource {
+        alias: "original".into(),
+        description: "tool".into(),
+        input_schema: serde_json::json!({"type":"object"}),
+        script_path: "/private/tool.lua".into(),
+    })];
     let arrays = [
         BlockInner::Tool(
             definitions
                 .into_iter()
                 .enumerate()
                 .map(|(index, definition)| CallableResource {
-                    resource_id: id(["tool", "hook", "skill"][index], "resource"),
+                    resource_id: id("tool", "resource"),
                     alias: format!("bound{index}"),
                     definition: std::sync::Arc::new(definition),
                 })
@@ -413,6 +451,24 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
     };
     let old = world.spawn();
     world.insert_library(old, make_agent()).unwrap();
+    let model_runtime = margatroid_types::model_components::ModelRuntimeInfo {
+        id: "model".into(),
+        model: "upstream-model".into(),
+        api_type: "deepseek".into(),
+        provider: None,
+        context_window_tokens: 128_000,
+        thinking: None,
+        reasoning_effort: None,
+    };
+    world.insert_component(old, model_runtime.clone());
+    world.insert_resource(
+        margatroid_types::model_components::ModelRuntimeCatalog::new([
+            margatroid_types::model_components::ModelRuntimeInfo {
+                context_window_tokens: 256_000,
+                ..model_runtime
+            },
+        ]),
+    );
     world
         .get_component_mut::<Workspace>(workspace)
         .unwrap()
@@ -427,7 +483,16 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
         .unwrap()
         .contains("private-policy"));
     assert!(old_state.error.is_none());
+    assert_eq!(old_state.context_window_tokens, Some(128_000));
     let serialized = serde_json::to_value(&old_state).unwrap();
+    assert_eq!(serialized["context_window_tokens"], 128_000);
+    let mut legacy = serialized.clone();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("context_window_tokens");
+    let compatible: AgentStateDto = serde_json::from_value(legacy).unwrap();
+    assert!(compatible.context_window_tokens.is_none());
     assert!(serialized.get("error").is_none());
     let compatible: AgentStateDto = serde_json::from_value(serialized).unwrap();
     assert!(compatible.error.is_none());
@@ -461,6 +526,12 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
         .insert_agent(id("agent", "manager"), new);
     assert_eq!(resolve_agent(&world, &reference, None).unwrap().0, new);
     let new_state: AgentStateDto = new.into_dto(&*world).unwrap();
+    // A fresh entity cannot inherit metadata from the old generation or catalog.
+    assert!(new_state.context_window_tokens.is_none());
+    assert!(serde_json::to_value(&new_state)
+        .unwrap()
+        .get("context_window_tokens")
+        .is_none());
     assert_ne!(old_state.agent_instance, new_state.agent_instance);
     let mut wrong = reference.clone();
     wrong.project_root = "/tmp/wrong".into();

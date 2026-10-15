@@ -9,8 +9,6 @@ pub fn project_mcl_value(value: &MclValue) -> Result<Value, serde_json::Error> {
             let values = resources.iter().map(|resource| {
                 let (description, schema) = match resource.definition.as_ref() {
                     CallableDefinitionSnapshot::Tool(definition) => (&definition.description, definition.input_schema.clone()),
-                    CallableDefinitionSnapshot::Skill(definition) => (&definition.description, crate::resource_components::skill_input_schema()),
-                    CallableDefinitionSnapshot::Hook(definition) => (&definition.description, definition.input_schema.clone()),
                 };
                 json!({ "resource_id": resource.resource_id, "alias": resource.alias, "description": description, "input_schema": schema })
             }).collect::<Vec<_>>();

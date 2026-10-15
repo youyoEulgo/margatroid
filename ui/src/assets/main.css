@@ -1505,11 +1505,16 @@ textarea:focus-visible {
 
 .context-window-usage {
   display: inline-flex;
-  width: 18px;
   height: 18px;
-  flex: 0 0 18px;
+  flex: none;
+  gap: 5px;
   align-items: center;
   justify-content: center;
+  white-space: nowrap;
+}
+
+.context-window-percentage {
+  color: var(--mg-text-tertiary);
 }
 
 .context-window-usage svg {
@@ -1768,27 +1773,6 @@ textarea:focus-visible {
     var(--mg-shadow-card);
 }
 
-.composer-call-row {
-  display: flex;
-  width: 100%;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.composer-call-block {
-  display: flex;
-  width: auto;
-  max-width: 100%;
-  min-width: min(42%, 240px);
-  min-height: 42px;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 6px 6px 10px;
-  border: 1px solid var(--mg-border-l1);
-  border-radius: 8px;
-  background: var(--mg-bg-subtle);
-}
-
 .composer-input-row {
   display: flex;
   width: 100%;
@@ -1797,128 +1781,11 @@ textarea:focus-visible {
   gap: 8px;
 }
 
-.composer-call-copy {
-  display: grid;
-  min-width: 0;
-  flex: 1;
-  gap: 1px;
-}
-
-.composer-call-kind {
-  color: var(--mg-text-quaternary);
-  font-size: 10px;
-  line-height: 13px;
-}
-
-.composer-call-copy strong {
-  overflow: hidden;
-  color: var(--mg-text-secondary);
-  font-family: var(--mg-font-mono);
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 17px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.composer-call-block > button {
-  display: grid;
-  width: 26px;
-  height: 26px;
-  flex: 0 0 26px;
-  place-items: center;
-  border: 0;
-  border-radius: 6px;
-  color: var(--mg-text-tertiary);
-  background: transparent;
-  cursor: pointer;
-}
-
-.composer-call-block > button:hover {
-  color: var(--mg-text-primary);
-  background: var(--mg-bg-hover);
-}
-
 .composer-actions {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   margin-top: auto;
-}
-
-.composer-add-menu {
-  position: static;
-}
-
-.composer-add-button {
-  display: grid;
-  width: 34px;
-  height: 34px;
-  place-items: center;
-  border: 0;
-  border-radius: 50%;
-  color: var(--mg-text-tertiary);
-  background: transparent;
-  cursor: pointer;
-}
-
-.composer-add-button:hover:not(:disabled) {
-  color: var(--mg-text-primary);
-  background: var(--mg-bg-hover);
-}
-
-.composer-add-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.4;
-}
-
-.composer-add-popover {
-  position: absolute;
-  z-index: 45;
-  bottom: calc(100% + 8px);
-  left: 8px;
-  display: grid;
-  min-width: 190px;
-  gap: 2px;
-  padding: 8px;
-  border: 1px solid var(--mg-border);
-  border-radius: 10px;
-  background: var(--mg-bg-elevated);
-  box-shadow: var(--mg-shadow-dialog);
-}
-
-.composer-add-heading {
-  padding: 3px 8px 5px;
-  color: var(--mg-text-quaternary);
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-}
-
-.composer-add-popover > button {
-  display: flex;
-  min-height: 30px;
-  align-items: center;
-  gap: 8px;
-  border: 0;
-  border-radius: 6px;
-  padding: 4px 8px;
-  color: var(--mg-text-secondary);
-  background: transparent;
-  cursor: pointer;
-  font-family: var(--mg-font-mono);
-  font-size: 11px;
-  text-align: left;
-}
-
-.composer-add-popover > button:hover {
-  background: var(--mg-bg-hover);
-}
-
-.composer-add-empty {
-  padding: 6px 8px;
-  color: var(--mg-text-quaternary);
-  font-size: 11px;
 }
 
 .composer-box textarea {

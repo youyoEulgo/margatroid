@@ -464,8 +464,6 @@ pub fn handle_database_setup_result(
     let mounted = (|| {
         world.insert_library(entity, agent)?;
         world.insert_resources(entity, ResourceSet::<ToolResource>::new())?;
-        world.insert_resources(entity, ResourceSet::<SkillResource>::new())?;
-        world.insert_resources(entity, ResourceSet::<HookResource>::new())?;
         world.insert_resources(entity, ResourceSet::<PromptResource>::new())?;
         world.insert_resources(entity, ResourceSet::<SandboxResource>::new())?;
         Ok::<_, resource_id_plugin::ResourceError>(())
@@ -478,6 +476,7 @@ pub fn handle_database_setup_result(
         });
         return;
     }
+    world.insert_component(entity, model_runtime);
     world.insert_component(entity, HandledExceptions::default());
     world.send_event(StartDriverLuaVm {
         id: vm_request_id,

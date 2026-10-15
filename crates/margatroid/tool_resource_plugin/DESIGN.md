@@ -75,7 +75,7 @@ ToolResourcePlugin：工具加载插件，公开结构体
     validate_resource_import在提交及挂载阶段调用agent_validate_import，检查image_dependencies精确许可、alias及同ID同kind规则；不依赖AgentPlugin安装标记
     Agent.import_bindings是唯一alias绑定事实，同alias其他ID或kind冲突保旧；同ID改名先预检新名，成功发布删除旧名，不复制全局alias注册表
     本crate重导出共享条目、加载请求、观察结果、公共错误与本类读取限制；本类LoadError及LoadErrorKind是通用错误类型别名
-    Tool与Skill共享条目当前没有read_script/read_content异步方法；按需读取由消费侧负责，不宣称本插件已提供此API
+    Tool共享条目只保存脚本路径；按需读取由执行消费侧负责，不宣称资源加载插件提供read_script异步方法
 根目录：
     资源包只能来自root/tools/scope/name/tag；没有项目、镜像目录或builtin回退
     root是通常HOME/.margatroid的全局根，不是已经包含tools的子目录
@@ -249,8 +249,8 @@ read_text(path: &Path, maximum: u64, cancelled: impl Fn() -> bool) -> Result<Str
     忽略非必要目录项，拒绝必要路径及祖先symlink；不承诺对恶意并发目录替换的原子快照或TOCTOU防护
     不编译Lua、不创建runner、不改LibraryComponent、不管理激活或资源GC；Entity销毁时集合自然释放
     测试覆盖加载成功、重复读取alias更新、失败保旧、取消前/挂载前取消、完整target复用、独立目标alias、其他key保留、reply幂等、监督错误、限长、UTF-8与symlink
-    Tool/Hook额外覆盖无效schema与外部ref；Hook额外证明不读取Lua
-    五插件联合导入回归覆盖typed GET、错误类型/alias冲突与依赖失败保旧、改名移除旧alias、旧Block快照、取消不绑定、普通加载不绑定；Prompt验证角色忠实，Sandbox验证活动忙时纯重载不改选中快照
+    Tool额外覆盖无效schema与外部ref；资源加载阶段不执行Lua
+    Tool、Prompt、Sandbox三插件联合导入回归覆盖typed GET、错误类型/alias冲突与依赖失败保旧、改名移除旧alias、旧Block快照、取消不绑定、普通加载不绑定；Prompt验证角色忠实，Sandbox验证活动忙时纯重载不改选中快照
     CallableResource的Arc冻结元数据及文件路径，不冻结文件内容；不承诺以后按路径执行仍是导入时script版本或多文件原子快照
 ```
 

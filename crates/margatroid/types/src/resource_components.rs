@@ -11,19 +11,6 @@ pub struct ToolResource {
     pub script_path: PathBuf,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SkillResource {
-    pub alias: String,
-    pub description: String,
-    pub content_path: PathBuf,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HookResource {
-    pub alias: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
-    pub script_path: PathBuf,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptResource {
     pub alias: String,
     pub role: String,
@@ -42,13 +29,7 @@ macro_rules! resource_inner {
         })+
     };
 }
-resource_inner!(
-    ToolResource,
-    SkillResource,
-    HookResource,
-    PromptResource,
-    SandboxResource
-);
+resource_inner!(ToolResource, PromptResource, SandboxResource);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentImageModelConfig {
@@ -71,10 +52,6 @@ pub struct AgentImage {
     pub model: AgentImageModelConfig,
 }
 
-pub fn skill_input_schema() -> serde_json::Value {
-    serde_json::json!({"type":"object", "properties":{}, "additionalProperties": false})
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallableResource {
     pub resource_id: ResourceID,
@@ -85,8 +62,6 @@ pub struct CallableResource {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CallableDefinitionSnapshot {
     Tool(ToolResource),
-    Skill(SkillResource),
-    Hook(HookResource),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,35 +75,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn callable_snapshots_share_definitions_and_round_trip_all_kinds() {
-        let definitions = [
-            (
-                "tool",
-                CallableDefinitionSnapshot::Tool(ToolResource {
-                    alias: "source".into(),
-                    description: "tool".into(),
-                    input_schema: serde_json::json!({"type": "object"}),
-                    script_path: "tool.lua".into(),
-                }),
-            ),
-            (
-                "skill",
-                CallableDefinitionSnapshot::Skill(SkillResource {
-                    alias: "source".into(),
-                    description: "skill".into(),
-                    content_path: "skill.md".into(),
-                }),
-            ),
-            (
-                "hook",
-                CallableDefinitionSnapshot::Hook(HookResource {
-                    alias: "source".into(),
-                    description: "hook".into(),
-                    input_schema: serde_json::json!({"type": "object"}),
-                    script_path: "hook.lua".into(),
-                }),
-            ),
-        ];
+    fn callable_snapshots_share_definitions_and_round_trip_tools() {
+        let definitions = [(
+            "tool",
+            CallableDefinitionSnapshot::Tool(ToolResource {
+                alias: "source".into(),
+                description: "tool".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                script_path: "tool.lua".into(),
+            }),
+        )];
         for (kind, definition) in definitions {
             let value = CallableResource {
                 resource_id: ResourceID::parse(&format!("{kind}:local/test")).unwrap(),
@@ -142,6 +98,19 @@ mod tests {
                 serde_json::from_str::<CallableResource>(&encoded).unwrap(),
                 value
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod rejected_legacy_snapshots {
+    use super::*;
+
+    #[test]
+    fn legacy_definition_variants_are_rejected() {
+        for kind in ["Skill", "Hook"] {
+            let value = serde_json::json!({kind: {"alias":"legacy", "description":"legacy"}});
+            assert!(serde_json::from_value::<CallableDefinitionSnapshot>(value).is_err());
         }
     }
 }

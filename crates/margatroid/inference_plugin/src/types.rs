@@ -1219,12 +1219,12 @@ data: [DONE]
     fn provider_tools_keep_agent_local_names() {
         let tools = vec![
             ToolDefinition {
-                name: "skill0_review".into(),
+                name: "tool0_review".into(),
                 description: "Review code.".into(),
                 input_schema: json!({"type":"object"}),
             },
             ToolDefinition {
-                name: "skill1_commit".into(),
+                name: "tool1_commit".into(),
                 description: "Commit code.".into(),
                 input_schema: json!({"type":"object"}),
             },
@@ -1237,8 +1237,8 @@ data: [DONE]
             }],
             &tools,
         ));
-        assert_eq!(request.tools[0]["function"]["name"], "skill0_review");
-        assert_eq!(request.tools[1]["function"]["name"], "skill1_commit");
+        assert_eq!(request.tools[0]["function"]["name"], "tool0_review");
+        assert_eq!(request.tools[1]["function"]["name"], "tool1_commit");
         assert!(
             serde_json::to_value(request).unwrap()["stream_options"]["include_usage"]
                 .as_bool()

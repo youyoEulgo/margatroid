@@ -10,15 +10,15 @@ CLI/daemon 网络 DTO。
 ```rust
 use margatroid_types::ResourceId;
 
-let skill = ResourceId::parse("skill:local/code-review")?;
-assert_eq!(skill.to_string(), "skill:local/code-review:latest");
+let tool = ResourceId::parse("tool:local/code-review")?;
+assert_eq!(tool.to_string(), "tool:local/code-review:latest");
 
 let image = ResourceId::parse("image:local/coder:latest")?;
 assert_eq!(image.resource_type(), "image");
 ```
 
 资源ID固定使用 `type:scope/name:tag`。省略tag时规范化为 `latest`。Agent、Workspace、AgentImage、
-Skill、Workflow和Tool都使用同一种身份格式。`ResourceId`是跨Plugin查找资源的统一地址；
+Prompt、Sandbox和Tool都使用同一种身份格式。`ResourceId`是跨Plugin查找资源的统一地址；
 `core_plugin::Entity`只作为当前World内的运行时句柄，不进入协议、日志或Memory。
 
 Compose使用 `WorkspaceDefinition` 和 `WorkspaceAgentDefinition` 把配置文件编译成进程内静态业务
@@ -34,11 +34,10 @@ Agent资源ID解析，协议 DTO 使用稳定 Agent ID，不暴露 ECS 内部句
 命令构造一条Assistant工具调用消息，遵守Provider要求的Assistant/Tool消息顺序。
 
 AgentPlugin使用`BTreeSet<ResourceId>`保存Agent可见性。`ResourceId.resource_type`负责选择工具
-定义Plugin，普通工具、Skill和Workflow不再建立不同通道。每次请求由AgentPlugin遍历该集合，并把单个
+定义Plugin，可执行工具统一使用Tool。每次请求由AgentPlugin遍历该集合，并把单个
 `ResourceId`交给对应Provider构造工具。Provider不得忽略tag。
 
-历史写入统一使用`AgentHistoryMessageWriteRequested`。Skill正文不进入历史事件，只写入
-`skill: <scope/name> loaded`标记。
+历史消息由显式 MCL `history_append` 保存；工具执行不隐式写入消息历史。
 
 无法表示成消息的轮次失败使用 `AgentFailure`。`kind=Agent` 表示 AgentPlugin 在处理消息或准备可见工具
 时失败，`kind=Inference` 表示 InferencePlugin 在准备或执行模型请求时失败。

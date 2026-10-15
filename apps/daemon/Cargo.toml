@@ -30,8 +30,6 @@ workspace_plugin = { path = "../../crates/margatroid/workspace_plugin" }
 
 closure_plugin = { path = "../../crates/mecs/closure_plugin" }
 tool_resource_plugin = { path = "../../crates/margatroid/tool_resource_plugin" }
-skill_resource_plugin = { path = "../../crates/margatroid/skill_resource_plugin" }
-hook_resource_plugin = { path = "../../crates/margatroid/hook_resource_plugin" }
 prompt_resource_plugin = { path = "../../crates/margatroid/prompt_resource_plugin" }
 sandbox_resource_plugin = { path = "../../crates/margatroid/sandbox_resource_plugin" }
 

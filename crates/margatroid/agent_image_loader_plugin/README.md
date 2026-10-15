@@ -45,7 +45,7 @@ top_p = 0.9
 stop = ["DONE"]
 
 [[dependencies]]
-id = "skill:local/code-review:latest"
+id = "tool:local/code-review:latest"
 
 [[dependencies]]
 id = "tool:local/list-directory:latest"

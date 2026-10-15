@@ -189,6 +189,7 @@ mod transaction_tests {
     fn history_rollback_denial_retires_block_view() {
         let db = SqliteAgentDatabase::open(":memory:").unwrap();
         let record = HistoryRecord {
+            created_at_ms: 0,
             key: "key".into(),
             source: "test".into(),
             turn: None,

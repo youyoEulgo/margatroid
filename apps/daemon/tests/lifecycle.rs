@@ -83,8 +83,6 @@ fn app(root: &Path) -> App {
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(ResourcePlugin)
         .add_plugin(tool_resource_plugin::ToolResourcePlugin::open(root).unwrap())
-        .add_plugin(skill_resource_plugin::SkillResourcePlugin::open(root).unwrap())
-        .add_plugin(hook_resource_plugin::HookResourcePlugin::open(root).unwrap())
         .add_plugin(prompt_resource_plugin::PromptResourcePlugin::open(root).unwrap())
         .add_plugin(sandbox_resource_plugin::SandboxResourcePlugin::open(root).unwrap())
         .add_plugin(AgentImageLoaderPlugin::open(root.join("images")).unwrap())
@@ -520,7 +518,7 @@ fn driver_failure_before_ready_removes_agents_and_retains_failed_workspace() {
 #[test]
 fn missing_import_dependency_returns_failure_without_mount_and_can_stop() {
     let root = tempfile::tempdir().unwrap();
-    image(root.path(), "base", DRIVER, &["skill:local/missing:latest"]);
+    image(root.path(), "base", DRIVER, &["tool:local/missing:latest"]);
     let mut app = app(root.path());
     let workspace = start(&mut app, definition(root.path(), &["base"])).unwrap();
     let target = id("agent:local/agent-0");
@@ -528,7 +526,7 @@ fn missing_import_dependency_returns_failure_without_mount_and_can_stop() {
         &mut app,
         &target,
         "failed-import",
-        "IMPORT TOOL skill:local/missing:latest AS missing",
+        "IMPORT TOOL tool:local/missing:latest AS missing",
         vec![]
     )
     .result
@@ -541,7 +539,7 @@ fn missing_import_dependency_returns_failure_without_mount_and_can_stop() {
         .next()
         .unwrap()
         .1;
-    let set = app.world().get_component::<resource_id_plugin::ResourceSet<margatroid_types::resource_components::SkillResource>>(entity).unwrap();
+    let set = app.world().get_component::<resource_id_plugin::ResourceSet<margatroid_types::resource_components::ToolResource>>(entity).unwrap();
     assert!(set.is_empty());
     tick_until(
         &mut app,
@@ -562,8 +560,6 @@ fn client_imports_all_resource_types_with_local_aliases_then_stops() {
     let root = tempfile::tempdir().unwrap();
     let dependencies = [
         "tool:local/sample:latest",
-        "skill:local/sample:latest",
-        "hook:local/sample:latest",
         "prompt:local/sample:latest",
         "sandbox:local/sample:latest",
     ];
@@ -578,20 +574,6 @@ fn client_imports_all_resource_types_with_local_aliases_then_stops() {
                 ),
                 ("input.schema.json", "{\"type\":\"object\"}"),
                 ("main.lua", "error('load must not execute Lua')"),
-            ],
-        ),
-        (
-            "skills",
-            vec![(
-                "SKILL.md",
-                "+++\nname = \"skill\"\ndescription = \"skill\"\n+++\nbody\n",
-            )],
-        ),
-        (
-            "hooks",
-            vec![
-                ("hook.toml", "name = \"hook\"\ndescription = \"hook\"\n"),
-                ("input.schema.json", "{\"type\":\"object\"}"),
             ],
         ),
         (
@@ -620,8 +602,8 @@ fn client_imports_all_resource_types_with_local_aliases_then_stops() {
             &format!(
                 "IMPORT {} {dependency} AS alias-{index}",
                 match index {
-                    3 => "MESSAGE",
-                    4 => "SANDBOX",
+                    1 => "MESSAGE",
+                    2 => "SANDBOX",
                     _ => "TOOL",
                 }
             ),
@@ -629,8 +611,8 @@ fn client_imports_all_resource_types_with_local_aliases_then_stops() {
         );
         assert!(
             matches!(result.result, Ok(MclValue::ResourceImport { resource_id, alias, kind }) if resource_id == id(dependency) && alias == format!("alias-{index}") && kind == match index {
-                3 => margatroid_types::block_types::InnerType::Message,
-                4 => margatroid_types::block_types::InnerType::Sandbox,
+                1 => margatroid_types::block_types::InnerType::Message,
+                2 => margatroid_types::block_types::InnerType::Sandbox,
                 _ => margatroid_types::block_types::InnerType::Tool,
             })
         );
@@ -657,10 +639,8 @@ fn client_imports_all_resource_types_with_local_aliases_then_stops() {
         };
     }
     alias!(margatroid_types::resource_components::ToolResource, 0);
-    alias!(margatroid_types::resource_components::SkillResource, 1);
-    alias!(margatroid_types::resource_components::HookResource, 2);
-    alias!(margatroid_types::resource_components::PromptResource, 3);
-    alias!(margatroid_types::resource_components::SandboxResource, 4);
+    alias!(margatroid_types::resource_components::PromptResource, 1);
+    alias!(margatroid_types::resource_components::SandboxResource, 2);
     assert_eq!(
         app.world()
             .get_component::<Agent>(entity)

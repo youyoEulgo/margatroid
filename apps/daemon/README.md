@@ -18,7 +18,6 @@ daemon不接受启动参数，固定使用 `~/.margatroid` 主目录。监听地
 ```text
 ~/.margatroid/
 ├── agent-images/
-├── skills/
 ├── tools/
 ├── workflows/
 ├── config.toml
@@ -47,10 +46,9 @@ streaming_member_messages = ["type:webui"]
 失败或异常，都归入 `logs`；完整成员消息和流式成员消息分别使用后两个字段。模型路由文件不再保存
 WebSocket target。
 AgentImage 由 `agent-images/` 提供，Workspace 文件仍由 CLI 编译，daemon 不读取 YAML。
-daemon 把主目录交给 ToolPlugin；ToolPlugin 的 handler 内置 skill、hook 与 lua 三类执行器。
-shell 不再是执行器，也不再是模型可调用的工具：它作为资源提供解释器脚本，命令统一由 Lua 工具的
-`margatroid().shell` 经 runner 执行。LLM 只看到由执行器注册的 `skill:*` 与 `tool:*` 资源，
-不会看到 `tool:builtin/*`，也不会看到 shell 资源。
+daemon 把主目录交给 ToolResourcePlugin 加载工具资源，ToolPlugin 只消费已选定的 Tool 快照，
+通过独立 Lua runner 执行。LLM 的 TOOL 数组只包含 `tool:*` 资源；prompt 和 sandbox 使用各自 typed array。
+命令统一由 Lua 工具的 `margatroid().shell` 经 runner 执行，shell 不是单独的可调用资源。
 
 客户端连接后应先注册连接类型，再发送业务请求：
 

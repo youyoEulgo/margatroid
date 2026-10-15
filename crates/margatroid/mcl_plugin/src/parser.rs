@@ -668,7 +668,7 @@ pub fn validate_import_kind(kind: InnerType, id: &ResourceID) -> Result<(), MclE
     if matches!(
         (kind, id.resource_type()),
         (InnerType::Message, "prompt")
-            | (InnerType::Tool, "tool" | "skill" | "hook")
+            | (InnerType::Tool, "tool")
             | (InnerType::Sandbox, "sandbox")
     ) {
         Ok(())
