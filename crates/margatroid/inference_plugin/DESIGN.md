@@ -44,6 +44,10 @@ error      共享推理错误契约               校验、执行及协议错误
 
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
+## 用户轮次中止目标（待实现）
+
+本节及下文标注的中止行为是已批准的目标契约，不表示当前代码已实现；既有实现说明仅适用于未被该目标替换的部分。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
+
 # lib
 
 ## 类型
@@ -149,7 +153,7 @@ crate公开：
 handle_inference(world: &mut World, request: InferenceRequest)
     准备推理：crate公开函数
     行为：
-        先take共享原回复Sender并转入私有回复槽，克隆重复请求不再执行；捕获准备panic；校验请求ID（非空、至多256字节、无控制字符）、完整Agent Entity及取消状态；已失效或取消直接完成oneshot错误
+        先take共享原回复Sender并转入私有回复槽，克隆重复请求不再执行；捕获准备panic；校验请求ID（非空、至多256字节、无控制字符）、完整Agent Entity及取消状态；已失效直接完成oneshot错误；待实现目标中用户轮次取消按正常cancelled响应完成，不能统一归为错误
         复制Agent地址、info.model中的模型与采样参数，从全局配置查唯一模型路由
         从request.tools的CallableResource不可变共享快照准备typed tool definitions；对各snapshot自带ResourceID使用validate_owner验证目标Agent ResourceSet存在、image_dependencies许可及ImportBindings的ID/TOOL kind已导入归属，不按ID重取latest、不再次global alias query
         完整校验alias唯一、定义与schema后规范化消息，验证参数与输入上限；旧Block在资源reload后仍使用选定的旧定义快照
@@ -157,7 +161,7 @@ handle_inference(world: &mut World, request: InferenceRequest)
         保存拥有所有权的PreparedInference，不携带World、组件借用或Workspace配置
         通过Agent.execution共享AgentExecutionScope受检入口登记Inference活动，令牌从该作用域派生；登记与沙箱更新复用同一互斥门，但Inference活动不阻止沙箱改变
         建立一次性回复保障，提交执行闭包；准备或提交失败均完成原回复槽，提交失败撤销未启动活动登记
-        不要求Agent.turn非空，不用turn代号作为推理请求唯一ID
+        待实现：AbortSystem先执行；实际受理再次核对当前turn与request.turn，None或已中止旧轮次不启动HTTP而返回正常cancelled响应；turn仍不是请求唯一ID
 
 handle_reload_model_routes(world: &mut World, request: ReloadModelRoutes)
     发起全局配置重载：crate公开函数
@@ -194,7 +198,7 @@ normalize_messages(messages: Vec<AgentMessage>) -> Result<Vec<ProviderMessage>, 
         System、user、assistant、tool_call按各自真实role转为对应Provider消息；prompt导入保留其真实role，不能一律改为user；error转用户错误文本
         System是完整AgentMessage变体，infer可接收System；history append的独立允许范围不含System，不能用该限制缩窄infer
         保留全部消息已有resource_id及工具调用ID、assistant reasoning和参数；Provider编码保留角色与调用关联，内部ID不因编码或历史收口丢失
-        历史usage不作为Provider请求内容；未知或无法表达的结构返回错误，不静默丢弃
+        历史usage和stop_reason不作为Provider请求内容；cancelled assistant（含Inject内嵌）拒绝进入上下文；未知或无法表达的结构返回错误，不静默丢弃
         检查工具调用与结果的关联及必要字段，空输入及超限拒绝
 
 prepare_inference内联收集发送器：没有独立collect_webui_senders函数
@@ -210,7 +214,7 @@ run_provider(prepared: PreparedInference) -> Result<InferenceResponse, Inference
         finish必须确认协议完整结束并推送尾部增量；网络提前结束、非法分片或超限返回错误
         完整工具调用即使没有正文也可成功；Length返回已有结果及截断原因，不自动续写
         ContentFilter保留真实停止原因；不把残缺网络响应当作正常截断
-        验证返回工具名称属于本次可见alias集合，生成带既有内容及usage的assistant AgentMessage和stop_reason，返回完整结果
+        验证返回工具名称属于本次可见alias集合；以一个权威映射将所有Provider停止原因同时写入Assistant.stop_reason和兼容InferenceResponse.stop_reason，二者始终相同
         不查询Agent，不写历史，不执行工具，不重试请求
 
 execute_inference(prepared: PreparedInference, guard: TaskGuard)
@@ -229,7 +233,9 @@ supervise_inference(prepared: PreparedInference, guard: TaskGuard, owner_cancel:
         其它分支显式worker.abort后await worker JoinHandle，取得future已退出及资源已释放的证明
         向原快照发送器有界发送agent.message.finished；owner取消可中断终态发送并释放其future
         HTTP worker join且终态future释放后才mark_completed，再take私有Sender发送一次Result
-        mark_completed失败标cleanup_failed并回复错误；不关闭Sender冒充真实cleanup
+        mark_completed失败标cleanup_failed并回复Err CleanupFailed；不关闭Sender冒充真实cleanup，不返回cancelled或宣称Idle
+        待实现：仅用户轮次中止在worker join及真实cleanup成功后返回Ok InferenceResponse；assistant content="Turn aborted."、reasoning=None、tool_calls=[]、usage=None、stop_reason=Cancelled，外层stop_reason同值
+        不将根Agent shutdown、owner abort、timeout或receiver closed一律归一为该正常中止；保留原因分类，已完成真实结果不改写为伪造部分成功
 
 push_stream(senders: &mut Vec<WebSocketSender>, id: &str, agent_instance: &str, agent_id: &ResourceID, sequence: u64, delta: ProviderStreamDelta)
     直接推送增量：私有异步函数
@@ -283,14 +289,14 @@ InferenceRequest：统一推理请求，公开事件
     agent: Entity--完整Agent实例
     messages: Vec<AgentMessage>--拥有所有权的消息快照
     tools: Vec<CallableResource>--TOOL array选定的可调用资源不可变共享快照，自带resource_id、alias及definition，不是ResourceID array或ToolCall array
-    turn: Option<String>--调用方关联快照，不作为请求唯一ID；推理不要求非空
+    turn: Option<String>--调用方轮次快照，不作为请求唯一ID；目标在受理时重新校验，None或已中止旧轮次返回正常取消结果
     cancel: CancellationToken--请求取消令牌；现CancellationToken接口无法检查父子归属，supervisor始终同时监督独立登记活动的scope child，不能绕过Agent停止
     reply: Arc<Mutex<Option<oneshot::Sender<Result<InferenceResponse, InferenceError>>>>>--可Clone请求共享唯一Sender
     impl Event for InferenceRequest
 
 InferenceResponse：完整推理响应，公开共享结构体--oneshot成功载荷，不是第二个结果事件
-    message: AgentMessage--assistant完整消息，含既有reasoning、tool_calls和usage
-    stop_reason: StopReason--保留Provider停止原因
+    message: AgentMessage--assistant完整消息，含reasoning、tool_calls、usage与新增stop_reason（待实现）
+    stop_reason: StopReason--兼容保留；与Assistant.stop_reason来自同一权威映射且始终相同
 
 ReloadModelRoutes：全局配置重载请求，公开事件
     id: String--请求关联
@@ -415,6 +421,7 @@ StopReason：停止原因，公开共享枚举
     ToolCalls
     Length
     ContentFilter
+    Cancelled--待实现；序列化cancelled，仅正常用户轮次中止结果
     Other(String)
 
 ErasedProviderAdapter = Arc<dyn ProviderAdapter>：协议适配器，公开类型别名
@@ -559,6 +566,7 @@ InferenceErrorKind：推理错误分类，公开枚举
     Cancelled
     TaskPanicked
     TaskAborted
+    CleanupFailed--待实现；不能转为正常cancelled响应
 
 InferenceError：推理错误，公开结构体
     kind: InferenceErrorKind

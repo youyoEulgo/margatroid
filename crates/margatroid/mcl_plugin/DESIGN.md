@@ -35,6 +35,38 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。message记录的content保存实际正文（Error保存message文本，Inject为空，Assistant无正文为空）；payload只保存type及其余元数据，不重复顶层content/Error.message。Inject的messages保留完整嵌套消息结构。旧行原样读取，由消费者兼容payload中的旧正文，不破坏性迁移。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
+# 已批准目标：实际动作受理与中止（待实现）
+
+以下是用户批准但**尚未实现**的目标，不把当前数据库/历史基线、已有finish_turn名称或既有来源取消当作目标轮次中止已实现。Agent目标状态为Creating / Idle / Working / Stopping，启动进入Idle；start_turn要求Idle，生成turn并置Working，不再无条件生成覆盖。finish_turn清turn并将Working置Idle，重复空turn完成可幂等；Driver仅在无工具调用Assistant分支发出它。原StopAgent及Creating/Stopping真实清理契约不变。
+
+```text
+控制与受理：
+    abort为独立控制事件，不是MCL命令、不走FIFO；控制System先于MCL推进及推理/工具受理
+    abort在Working立即清agent.turn并请求所属轮次取消，Working保持至Driver finish_turn
+    Working+turn=None重复abort幂等pending；前端仅Idle可发送、Working可abort，服务端同样校验用户输入仅Idle可受理
+    inference/tool_call在异步审计和参数准备完成后的实际effect执行处检查当前turn
+    不在准备开始时冻结turn门；PreparedEffect继续仍须检查，不依赖get_turn effect或Driver检查turn
+    无turn时不提交领域执行，返回Ok及正常Inference/工具MESSAGE数组形状的取消结果
+    turn存在时携带该轮次关联提交；领域受理与abort控制顺序互斥，不能在清turn后迟到启动执行
+    outstanding未受理请求由取消路径claim一次性reply恰好一次，迟到受理不得再执行或回复
+    已受理请求取消token，真实清理完成后沿正常结果通道返回；清理失败保持Err及未清理活动，不回Idle
+    五种状态以abort前Working且turn存在为前提：inference未受理、inference已受理、tool_call未受理、tool_call已受理、Driver间隙
+    前两类按Assistant正常结果收口，中间工具两类按原调用ID逐项收口，Driver间隙由下一effect实际动作的turn门补上
+    Working+turn=None重复abort幂等pending另行保持，不是第五类的替代
+    finish_turn只完成当前Driver关联结果链且必须本轮真实清理完成；Idle重复完成可幂等，迟到旧完成不得覆盖新Working轮次
+
+取消消息值与结果形状：
+    Assistant消息自身携带stop_reason，新增Cancelled枚举并序列化为cancelled
+    取消Assistant content为英文'Turn aborted.'，tool_calls为空，usage=None
+    inference正常外层成功值及message结构保持，取消不是MclError::Cancelled替代结果
+    每个取消工具结果保留原调用ID、原顺序及既有工具身份关联，failed=true，content为'Tool call aborted.'
+    无turn的tool_call仍按原Assistant.tool_calls逐项返回取消结果，空批次仍是typed空MESSAGE数组
+    stop_reason随消息经过Block、历史和宿主投影，不只停留在推理外层返回值
+    真实推理、工具、存储或清理失败继续原错误契约；不为实际失败编造cancelled Assistant，不直接finish_turn
+```
+
+普通MCL命令仍按目标FIFO顺序推进；轮次abort的控制优先级不等于停止整个队列，不应把未执行inference/tool_call一律作为FIFO取消错误丢掉。它们实际执行时无turn会生成上述正常取消结果供Driver收尾。停止/来源关闭的既有队列取消与审计收口独立保留。
+
 # lib
 
 ## 类型
@@ -187,6 +219,7 @@ begin_tool_call(world: &mut World, request: &MclCommand, messages: Vec<AgentMess
     行为：
         第一参数必须恰好一条Assistant，从其tool_calls读取调用请求，非assistant或多条消息拒绝
         工具调用ID和名称须非空，批次ID唯一；TOOL数组alias冲突整批准备失败，不按遍历顺序任选
+        目标待实现：异步准备后实际动作处要求turn；无turn按全部原调用返回正常形状取消结果，不提交任务；存在turn才允许提交并在领域受理处防迟到启动
         tool_calls为空直接返回typed空MESSAGE数组，不提交任务
         按每个tool_name在visible快照中匹配alias，无匹配填对应失败消息
         每个可调用项发送一个ToolExecuteRequest，携带选定CallableResource快照及原调用ID/参数/turn，不按ID重新取最新定义
@@ -264,6 +297,35 @@ Driver工具回合：
     history_append允许inject/user/assistant/tool_call/error，System值可用于上下文但不通过此effect新增记录；递归检查Inject中的System，拒绝时不追加任何记录
     inject内部结构仍按完整AgentMessage契约，历史输入允许范围规则独立于消息值类型
 ```
+
+## 目标Driver分支（待实现）
+
+```text
+处理entry：
+    读取entry.pending第一条原始消息，完成本次取出后移除同一第一条，不取末条或整批清空
+    显式history_append保留原始消息值，不用改写后的上下文值冒充原始历史
+    每个分支自行决定conversation更新，不在分支前统一追加所有消息
+
+Inject：
+    显式保留原Inject容器历史，inject_context递归展开嵌套Inject并追加非容器消息到conversation
+    不递归执行User/Assistant等控制分支，不start_turn、不inference、不finish_turn；嵌套cancelled Assistant同样跳过上下文，原始嵌套历史不改写
+User：
+    显式追加原始历史，追加conversation，start_turn，然后inference
+Assistant：
+    显式追加原始历史
+    stop_reason=cancelled时仅历史，不追加conversation
+    正常Assistant追加conversation
+    tool_calls为空时调用finish_turn，这是Driver唯一finish_turn路径
+    否则调用tool_call批次，不检查turn；无turn由effect返回逐调用取消结果
+工具结果批次：
+    显式追加全部原始工具结果历史，并将全部结果追加conversation（包括failed取消结果）
+    跟踪本批完成，全部结果齐后发inference，不检查turn或因取消跳过
+    即使turn=None也发inference，由实际effect返回cancelled Assistant，走上述无调用分支finish_turn
+Error：
+    按原错误协议显式保留历史/报告，不直接finish_turn，不为实际失败造cancelled Assistant
+```
+
+同一原始输入只按既有显式历史策略记录，不因递归或批次处理重复追加同一条记录。上述取消结果是控制取消的正常值，不是把真实执行失败隐藏成取消；清理失败仍为错误并保留Working，不以恢复Idle掩盖未完成清理。
 
 # events
 
@@ -381,7 +443,7 @@ StorageCleanupFailed表示回滚或事务清理仍未完成；保留Other活动�
 ```text
 数据库Block与finish_turn已实现；parser纯函数测试仍可使用AgentBlock作为不执行I/O的输入fixture，Agent运行时不保存该内存容器。
 验证重启恢复MESSAGE/TOOL/SANDBOX、TEMP不恢复、schema冲突保留旧数据、跨选择器事务快照、取消与提交事实、历史无隐式联动。
-finish_turn清空当前turn，已为空成功，返回Unit；start_turn保持生成新代号。不改StopAgent/Driver停止含义。
+目标待实现：start_turn仅Idle生成新代号并置Working；abort清turn仍Working；finish_turn清turn且转Idle，已为空可幂等，返回Unit。替代当前start_turn无条件生成覆盖及finish_turn仅清字段的行为；不改StopAgent/Driver停止含义。
 ```
 
 ## 已实现的准备阶段收口

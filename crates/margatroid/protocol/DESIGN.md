@@ -39,6 +39,20 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
+## 用户轮次中止目标（待实现）
+
+本节为已批准的待实现契约，不声称当前代码已支持；不是复活旧邮箱、中止查表或全局 pending 实现。无 `get_turn`。
+
+- 请求：`{ "type":"agent.turn.abort", "id":"abort-1", "message":{ "workspace":{id,name,project_root}, "agent":null, "turn_id":"turn-1" } }`。`id` 为网络请求关联，`turn_id` 为必填非空的预期活动轮次；agent 为 null 时选择 manager，其余身份规则与 MCL 相同。
+- 回执：`agent.turn.abort_result { id, workspace, agent, turn_id, result }`；result 使用 `{"Ok":null}` / `{"Err":{kind,message}}`。Ok 仅确认中止已受理或该关联轮次已中止，不证明执行 cleanup 已结束；失败保留请求 id。仅回复发起连接，source 来自真实注册 Client。
+- 入口受检解析 Workspace 与当前成员的完整实例，实际处理再次核对 turn_id；旧/不匹配轮次不得取消新轮次。对同一已中止轮次（含 Working 且 turn=None）重复请求幂等成功，仅保留必要已中止关联，不恢复全局 pending 表；未识别轮次报关联错误。
+- 状态为 `creating/idle/working/stopping`。中止立即清空 turn，真实清理期间保持 Working，正常 finish 收口才 Idle；状态同步同时发布 turn 与 status。前端据 status 显示运行态、据 turn 关联中止，不能把回执或 turn=None 当作 Idle。
+- AbortSystem 必须先于 MCL 实际执行及 inference/tool admission。共享事件允许各消费者独立观察，不靠 take reply 独占中止通知；执行前再次核对请求轮次，turn=None 或已中止旧轮次不启动推理/工具而返回正常取消结果。
+- Assistant 新增 stop_reason，覆盖全部推理原因，新增 `StopReason::Cancelled` 序列化 `cancelled`。兼容保留 `InferenceResponse.stop_reason`，单一权威映射生成，两处始终相同。用户轮次中止且真实清理成功返回 Ok assistant：`content="Turn aborted."`、`reasoning=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Cancelled`。
+- 取消工具且清理成功返回 Ok ToolCall：`failed=true`、`content="Tool call aborted."`，保留调用 ID、名称及已知 resource_id。批次保留已完成真实结果，其余每个调用（包括未启动项）各有一个原序结果；不虚构部分执行成功，不撤销已发生副作用。
+- `CleanupFailed` 仍为 Err，保留活动，不伪造取消或 Idle。用户轮次中止不同于根 Agent shutdown、owner abort、timeout、receiver closed，不统一转换这些原因。
+- 历史只经显式 history_append 保存；Assistant stop_reason 存入 payload 元数据而非 content。cancelled assistant 可入历史，不得进入 infer 上下文（包括 Inject 嵌套）。
+
 # lib
 
 ## 逻辑
@@ -101,10 +115,10 @@ MclCommandResultDto：指令结果，公开结构体
         DTO对资源值的出站投影不等于可作为可信入站快照；入站资源解析仍须通过目标Agent导入绑定验证
 
 AgentMessageDto：消息值投影，公开契约
-    System { content: String }--本轮未实现目标，保持prompt系统角色；支持消息值不等于开放任意网络入口权限
+    System { content: String }--已实现消息类型，保持prompt系统角色；支持消息值不等于开放任意网络入口权限
     Inject { messages: Vec<AgentMessageDto> }
     User { content: String }
-    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCall>, usage: Option<TokenUsage> }
+    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCall>, usage: Option<TokenUsage>, stop_reason: StopReason }
     ToolCall { resource_id: Option<ResourceIDDto>, tool_call_id: String, tool_name: String, content: String, failed: bool }
     Error { message: String }
     说明：按共享消息契约递归转换，不存在比AgentMessage更窄的inject内层白名单；限制深度和大小。
@@ -126,7 +140,7 @@ WorkspaceInfoDto：工作区快照，公开结构体
     agents: Vec<ResourceIDDto>
 
 AgentStateDto：Agent快照，公开契约
-    status: String--creating/running/stopping，与AgentState一致
+    status: String--目标creating/idle/working/stopping，与AgentState一致（待实现）
     turn: Option<String>
     sandbox: Option<ResourceIDDto>
     queued_commands: usize
@@ -141,7 +155,7 @@ HistoryMessageDto：历史投影，公开契约
     turn: Option<String>
     kind: String
     content: String--message记录的真实正文；error保存错误文本；inject根正文为空
-    payload: serde_json::Value--message类型、reasoning、tool_calls、usage等非正文元数据；inject保留完整嵌套消息；MCL保留指令原文及展开参数
+    payload: serde_json::Value--message类型、reasoning、tool_calls、usage、stop_reason等非正文元数据；inject保留完整嵌套消息；MCL保留指令原文及展开参数
     created_at_ms: i64
 
 ClientInfoDto：客户端身份，公开契约
@@ -163,7 +177,7 @@ StreamDeltaDto：推理增量，公开契约
 
 ```text
 客户端命令族：注册、Workspace启动/停止、MCL命令、状态及历史查询。
-移除visibility来源操作、旧turn中止查表及Workflow热插拔旧路由；轮次变化走MCL start_turn/finish_turn。
+移除visibility来源操作、旧turn中止查表及Workflow热插拔旧路由；正常轮次变化走MCL start_turn/finish_turn，新增agent.turn.abort仅指上文待实现控制契约。
 外部mcl.command一次一条，不允许网络上传Lua源码或取得执行句柄。
 状态同步与历史读取不会修改执行状态，不从工具名称恢复全局ResourceMap。
 认证和访问权限另属入口控制，source绑定只保证请求来源与连接一致，不冒充完整认证系统。
