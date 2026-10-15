@@ -41,7 +41,7 @@ app.add_plugin(RuntimePlugin::default())
 
 一个领域 System 使用 `send_async_closure` 调度读取；`spawn_blocking`只读准备工作，独立 supervisor 等待 JoinHandle 真正退出才交主线程结果。未开始提交失败 rollback，已开始工作在主线程收口后 mark_completed。取消须等待收口，不把发送取消或丢弃 Receiver 当作 I/O退出证明。
 
-必要路径与祖先拒绝 symlink 和父级跳转，文件要求普通文件、有界 UTF-8、非空。Tool/Hook schema拒绝外部引用。非必要目录项忽略。路径检查不是对恶意并发替换目录的原子快照保证。
+必要路径与祖先拒绝 symlink 和父级跳转，文件要求普通文件、有界 UTF-8、非空。Tool schema拒绝外部引用。非必要目录项忽略。路径检查不是对恶意并发替换目录的原子快照保证。
 
 重复加载重新读取，成功仅替换一个 ID键，普通读取失败保留旧条目和alias。挂载前再次检查取消与完整 Entity generation，禁止迟到结果写入复用index。reply已take不重复挂载，但仍完成活动收口。Some导入同时检查binding冲突，不按加载顺序任取资源；取消后禁止挂载及binding发布。
 

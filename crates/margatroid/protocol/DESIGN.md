@@ -131,15 +131,17 @@ AgentStateDto：Agent快照，公开契约
     sandbox: Option<ResourceIDDto>
     queued_commands: usize
     pending_command: Option<String>
-    说明：无默认可见性、Lua程序包装或AgentTokenUsage副本；Token汇总从历史取得。
+    context_window_tokens: Option<u64>--与Lua环境相同的Agent启动受理模型窗口快照；没有元数据则省略，不以0冒充
+    error: Option<ProtocolErrorDto>--保留的Driver异常
+    说明：无默认可见性、Lua程序包装或AgentTokenUsage副本；Token汇总从历史取得。上下文占用取最近assistant的input_tokens加output_tokens，除以上述窗口；cache_hit不重复相加，不把历史累计用量当上下文占用。
 
 HistoryMessageDto：历史投影，公开契约
     key: String--持久记录幂等键
     sequence: i64
     turn: Option<String>
     kind: String
-    content: String
-    payload: serde_json::Value--消息、usage、指令原文及展开参数
+    content: String--message记录的真实正文；error保存错误文本；inject根正文为空
+    payload: serde_json::Value--message类型、reasoning、tool_calls、usage等非正文元数据；inject保留完整嵌套消息；MCL保留指令原文及展开参数
     created_at_ms: i64
 
 ClientInfoDto：客户端身份，公开契约

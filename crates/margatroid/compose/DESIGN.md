@@ -97,7 +97,7 @@ normalize_path(path: PathBuf) -> Result<PathBuf, ComposeError>
 ## 边界与生命周期
 
 ```text
-Compose不读取镜像、工具、Skill、模型路由或历史正文，不打开数据库。
+Compose不读取镜像、工具、模型路由或历史正文，不打开数据库。
 Compose不创建资源默认列表，不执行资源IMPORT，不维护可见性列表。
 memory_path只是一种输入拼写，不引入第二份Memory路径字段。
 输出只保存纯地址、名称与路径，无ECS Entity或运行期线程能力。

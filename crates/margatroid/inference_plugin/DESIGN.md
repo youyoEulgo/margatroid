@@ -40,7 +40,7 @@ error      共享推理错误契约               校验、执行及协议错误
 
 **本文描述已实现的typed snapshot请求：InferenceRequest.tools为Vec<CallableResource>，System消息保留真实Provider role。** 既有单推理入口、准备System、通用异步闭包及独立supervisor/HTTP worker、oneshot与真实cleanup边界保持不变；现消费MCL选定的不可变typed snapshots。全局仍只有一份模型配置；提交前取得全部已注册webui客户端发送器快照，闭包直接推流，后来连接不加入本次推理。
 
-当前输入边界：MCL只有MESSAGE、TOOL、SANDBOX三种typed arrays。TOOL保存可调用资源值（ResourceID、alias、description、schema及不可变共享执行材料快照），不是ToolCall请求数组。`IMPORT TOOL tool/skill/hook AS alias`绑定资源，`GET alias`解析并取得typed snapshot；`infer`参数依次为MESSAGE array、TOOL array，不接受ResourceID array，不再次执行global alias query。旧Block不随reload暗变，新GET alias取得新快照。Hook允许导入TOOL，但Driver触发器与执行路线尚未闭合，不假定其为普通Lua工具。
+当前输入边界：MCL只有MESSAGE、TOOL、SANDBOX三种typed arrays。TOOL保存可调用资源值（ResourceID、alias、description、schema及不可变共享执行材料快照），不是ToolCall请求数组。`IMPORT TOOL tool AS alias`绑定资源，`GET alias`解析并取得typed snapshot；`infer`参数依次为MESSAGE array、TOOL array，不接受ResourceID array，不再次执行global alias query。旧Block不随reload暗变，新GET alias取得新快照。TOOL仅允许tool资源，旧skill/hook导入明确拒绝。
 
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
@@ -182,8 +182,8 @@ collect_tool_definitions(world: &World, agent: Entity, tools: &[CallableResource
     行为：
         消费TOOL array已选定的CallableResource快照；逐项以快照内完整ResourceID进行validate_owner，World只用于ResourceSet存在、依赖许可及已导入ID/kind校验，不要求最新alias或定义与旧snapshot一致，不遍历global alias集合、不按ResourceID重新读取最新ResourceSet定义
         模型工具名使用snapshot.alias；description、input_schema使用同一snapshot的准备值，不从当前重载资源重新生成
-        tool保存已加载输入schema；skill快照采用固定schema {"type":"object","properties":{},"additionalProperties":false}（参数仅{}），与ToolPlugin校验一致，不要求skill包增加schema文件；准备阶段不执行脚本
-        hook允许导入TOOL并消费其已准备typed定义；ToolPlugin执行明确返回UnsupportedHook；这不代表Driver触发器执行路线已确定，更不赋予普通Lua runner执行语义；prompt/sandbox不能冒充TOOL
+        tool保存已加载输入schema；准备阶段不执行脚本
+        仅tool可作为TOOL，其他资源类别不能冒充工具
         归属无效、缺乏模型工具定义、重复alias、非法工具名或不合法schema均在HTTP提交前拒绝，不悄悄忽略；空tools表示无工具，不回退默认集合
         CallableResource共享快照不可变；资源reload只影响后续GET alias，不能改变已有Block或在途推理定义
 
@@ -344,7 +344,7 @@ InferenceParameters：采样参数，公开纯值类型
 CallableResource：TOOL元素，公开共享纯值契约--定义归共享types，本插件消费而不另建副本类型
     resource_id: ResourceID--导入资源完整身份，validate_owner仅校验已导入及许可，不取得新版本
     alias: String--导入绑定的模型可见alias
-    definition: Arc<CallableDefinitionSnapshot>--不可变共享定义与执行材料，包含description、input_schema及tool/skill/hook种类材料；clone不复制或刷新版本
+    definition: Arc<CallableDefinitionSnapshot>--不可变共享定义与执行材料，包含description、input_schema及tool种类材料；clone不复制或刷新版本
     说明：Agent ImportBindings为权威alias绑定；不新增插件资源注册表。GET alias得到当前绑定的新快照，已有Block保留旧snapshot。
 
 ToolDefinition：模型工具定义，公开共享值类型
@@ -585,6 +585,6 @@ InferenceError：推理错误，公开结构体
     System消息及prompt真实role可完整规范化，infer范围不被history append不含System的独立限制缩窄；输入与历史既有resource IDs保留
     重复alias、无效归属或定义失败发生于HTTP提交前；reload不暗改旧Block/在途定义，新GET alias得到新snapshot
     tool_call effect以单assistant MESSAGE array + TOOL visible array取assistant.tool_calls，空calls返回emptyMessage、不再次记录assistant；alias冲突/重复call ID/多条或非assistant先失败且不部分submit
-    Hook允许导入及提供typed定义，但Driver触发器/执行路线仍未闭合，不宣称普通Lua执行；工具脚本/skill正文磁盘材料版本隔离也需另行闭合，不以metadata snapshot保证冒充该能力
+    工具脚本磁盘材料版本隔离仍需另行闭合，不以metadata snapshot保证冒充该能力
     现有测试验证HTTP worker abort并join、终态future释放后mark_completed的真实cleanup，而非仅oneshot关闭
 ```

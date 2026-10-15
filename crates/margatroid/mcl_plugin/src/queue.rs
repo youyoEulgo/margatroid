@@ -79,6 +79,7 @@ fn history_record(
     payload: serde_json::Value,
 ) -> HistoryRecord {
     HistoryRecord {
+        created_at_ms: 0,
         key: format!("{entity:?}:{}:{kind}:{suffix}", request.id),
         source: request.source.to_string(),
         turn,
@@ -86,7 +87,7 @@ fn history_record(
         content: if kind == "mcl" {
             request.command.text.clone()
         } else {
-            payload.to_string()
+            String::new()
         },
         payload,
     }
@@ -538,14 +539,18 @@ async fn finish_preparation(
             .iter()
             .enumerate()
             .map(|(index, message)| {
-                history_record(
+                let (content, payload) =
+                    margatroid_types::history_components::message_history_parts(message);
+                let mut record = history_record(
                     entity,
                     request,
                     turn.clone(),
                     "message",
                     &index.to_string(),
-                    serde_json::to_value(message).unwrap(),
-                )
+                    payload,
+                );
+                record.content = content;
+                record
             })
             .collect();
         tokio::task::spawn_blocking(move || history.append_batch(records))
@@ -838,10 +843,7 @@ fn begin_import(
             _ => MclError::ImportNotAllowed,
         })?;
     let kind = resource_id.resource_type().to_owned();
-    if !matches!(
-        kind.as_str(),
-        "tool" | "skill" | "hook" | "prompt" | "sandbox"
-    ) {
+    if !matches!(kind.as_str(), "tool" | "prompt" | "sandbox") {
         return Err(MclError::InvalidResourceId);
     }
     let activity = Arc::new(
@@ -869,8 +871,6 @@ fn begin_import(
     }
     match kind.as_str() {
         "tool" => load!(LoadToolResource),
-        "skill" => load!(LoadSkillResource),
-        "hook" => load!(LoadHookResource),
         "prompt" => load!(LoadPromptResource),
         "sandbox" => load!(LoadSandboxResource),
         _ => unreachable!(),

@@ -21,8 +21,6 @@ members = [
     "crates/margatroid/inference_plugin",
     "crates/margatroid/tool_plugin",
     "crates/margatroid/tool_resource_plugin",
-    "crates/margatroid/skill_resource_plugin",
-    "crates/margatroid/hook_resource_plugin",
     "crates/margatroid/prompt_resource_plugin",
     "crates/margatroid/sandbox_resource_plugin",
     "crates/margatroid/memory_plugin",

@@ -17,7 +17,7 @@ use margatroid_types::execution_components::{
 use margatroid_types::inference_events::InferenceReply;
 use margatroid_types::message_types::{AgentMessage, ToolDefinition};
 use margatroid_types::resource_components::{
-    skill_input_schema, CallableDefinitionSnapshot, CallableResource, SkillResource, ToolResource,
+    CallableDefinitionSnapshot, CallableResource, ToolResource,
 };
 use reqwest::Url;
 use resource_id_plugin::{ResourceID, ResourceSet};
@@ -485,12 +485,6 @@ fn collect_tool_definitions(
                 (CallableDefinitionSnapshot::Tool(resource), "tool") => {
                     (resource.description.clone(), resource.input_schema.clone())
                 }
-                (CallableDefinitionSnapshot::Skill(resource), "skill") => {
-                    (resource.description.clone(), skill_input_schema())
-                }
-                (CallableDefinitionSnapshot::Hook(resource), "hook") => {
-                    (resource.description.clone(), resource.input_schema.clone())
-                }
                 _ => {
                     return Err(InferenceError::new(
                         InferenceErrorKind::UnsupportedResource,
@@ -509,16 +503,9 @@ fn collect_tool_definitions(
 }
 
 fn validate_owner(world: &World, agent: Entity, id: &ResourceID) -> Result<(), InferenceError> {
-    use margatroid_types::resource_components::HookResource;
     let present = match id.resource_type() {
         "tool" => world
             .get_component::<ResourceSet<ToolResource>>(agent)
-            .is_some_and(|set| set.get(id).is_some()),
-        "skill" => world
-            .get_component::<ResourceSet<SkillResource>>(agent)
-            .is_some_and(|set| set.get(id).is_some()),
-        "hook" => world
-            .get_component::<ResourceSet<HookResource>>(agent)
             .is_some_and(|set| set.get(id).is_some()),
         _ => {
             return Err(InferenceError::new(
@@ -1521,37 +1508,18 @@ mod tests {
             .description = "New description".into();
         let definitions = collect_tool_definitions(&world, agent, &[selected.clone()]).unwrap();
         assert_eq!(definitions[0].description, "Old description");
-        let hook_id = ResourceID::parse("hook:test/on-event").unwrap();
-        let hook = margatroid_types::resource_components::HookResource {
-            alias: "on_event".into(),
-            description: "Hook snapshot".into(),
-            input_schema: serde_json::json!({"type":"object"}),
-            script_path: PathBuf::new(),
-        };
-        let hook_selected = CallableResource {
-            resource_id: hook_id.clone(),
-            alias: "on_event".into(),
-            definition: Arc::new(CallableDefinitionSnapshot::Hook(hook.clone())),
-        };
-        let mut hooks = ResourceSet::new();
-        hooks.insert(hook_id.clone(), hook);
-        world.insert_component(agent, hooks);
-        world
-            .get_component_mut::<Agent>(agent)
-            .unwrap()
-            .info
-            .image_dependencies = Arc::from([id.clone(), hook_id]);
-        world
-            .agent_bind_import(
-                &agent_id,
-                "on_event".into(),
-                ImportedValue::Tool(hook_selected.clone()),
-            )
-            .unwrap();
-        assert_eq!(
-            collect_tool_definitions(&world, agent, &[hook_selected]).unwrap()[0].description,
-            "Hook snapshot"
-        );
+        for kind in ["skill", "hook"] {
+            let legacy = CallableResource {
+                resource_id: ResourceID::parse(&format!("{kind}:test/legacy")).unwrap(),
+                ..selected.clone()
+            };
+            assert_eq!(
+                collect_tool_definitions(&world, agent, &[legacy])
+                    .unwrap_err()
+                    .kind,
+                InferenceErrorKind::UnsupportedResource
+            );
+        }
         world
             .agent_bind_import(
                 &agent_id,

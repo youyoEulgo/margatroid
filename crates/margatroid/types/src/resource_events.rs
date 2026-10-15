@@ -1,9 +1,7 @@
 use crate::agent_components::{Agent, ImportedValue, WorldAgentExt};
 use crate::block_types::InnerType;
 use crate::execution_components::ExecutionActivity;
-use crate::resource_components::{
-    HookResource, PromptResource, SandboxResource, SkillResource, ToolResource,
-};
+use crate::resource_components::{PromptResource, SandboxResource, ToolResource};
 use core_plugin::{Entity, Event};
 use resource_id_plugin::ResourceID;
 use std::fmt;
@@ -62,7 +60,7 @@ pub fn validate_resource_import(
         return Ok(());
     };
     let matches = match kind {
-        InnerType::Tool => matches!(resource_id.resource_type(), "tool" | "skill" | "hook"),
+        InnerType::Tool => resource_id.resource_type() == "tool",
         InnerType::Message => resource_id.resource_type() == "prompt",
         InnerType::Sandbox => resource_id.resource_type() == "sandbox",
     };
@@ -214,20 +212,6 @@ load_events!(
     ToolResourceReadOutput,
     ToolResourceTaskError,
     ToolResource
-);
-load_events!(
-    LoadSkillResource,
-    LoadSkillResourceResult,
-    SkillResourceReadOutput,
-    SkillResourceTaskError,
-    SkillResource
-);
-load_events!(
-    LoadHookResource,
-    LoadHookResourceResult,
-    HookResourceReadOutput,
-    HookResourceTaskError,
-    HookResource
 );
 load_events!(
     LoadPromptResource,

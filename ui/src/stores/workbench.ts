@@ -67,7 +67,7 @@ export function contextInjection(
   content: string,
   path: string,
 ): { command: string; arguments: unknown[][] } {
-  if (!path.trim() || !/^[A-Za-z_][A-Za-z0-9_.\[\]-]*$/.test(path.trim()))
+  if (!path.trim() || !/^[A-Za-z_][A-Za-z0-9_.[\]-]*$/.test(path.trim()))
     throw new Error('Configure a valid driver context path before injecting a message');
   return { command: `INJECT ? TO ${path.trim()}`, arguments: [[{ type: 'user', content }]] };
 }
@@ -88,11 +88,8 @@ export function historyEntries(history: AgentHistory): ConversationEntry[] {
       kind: entry.kind,
       payload: entry.payload,
     };
-    const payload =
-      isRecord(entry.payload) && isAgentMessage(entry.payload.message)
-        ? entry.payload.message
-        : entry.payload;
-    if (isAgentMessage(payload))
+    const payload = historyMessage(entry);
+    if (payload)
       return decodeMessage(payload).map((message, index) => ({
         ...base,
         ...message,
@@ -110,6 +107,45 @@ export function historyEntries(history: AgentHistory): ConversationEntry[] {
     ];
   });
 }
+export function historyMessage(entry: HistoryMessage): AgentMessage | null {
+  const payload =
+    isRecord(entry.payload) && isRecord(entry.payload.message)
+      ? entry.payload.message
+      : entry.payload;
+  if (isAgentMessage(payload)) return payload;
+  if (entry.kind !== 'message' || !isRecord(payload)) return null;
+  const message =
+    payload.type === 'error'
+      ? { ...payload, message: entry.content }
+      : { ...payload, content: entry.content };
+  return isAgentMessage(message) ? message : null;
+}
+
+export function latestContextTokens(history: AgentHistory | undefined): number | null {
+  let latest: number | null = null;
+  function visit(message: AgentMessage) {
+    if (message.type === 'inject') {
+      for (const nested of message.messages) visit(nested);
+    } else if (message.type === 'assistant') {
+      const usage = message.usage;
+      latest =
+        usage &&
+        Number.isFinite(usage.input_tokens) &&
+        usage.input_tokens >= 0 &&
+        Number.isFinite(usage.output_tokens) &&
+        usage.output_tokens >= 0
+          ? usage.input_tokens + usage.output_tokens
+          : null;
+    }
+  }
+  for (const row of history?.messages ?? []) {
+    if (row.kind !== 'message') continue;
+    const message = historyMessage(row);
+    if (message) visit(message);
+  }
+  return latest;
+}
+
 function payloadRequestId(entry: HistoryMessage): string {
   return isRecord(entry.payload) && typeof entry.payload.id === 'string'
     ? entry.payload.id
@@ -254,6 +290,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       ...live.filter((s) => !history.some((h) => h.id === s.id && h.role === 'assistant')),
     ];
   });
+  const contextTokens = computed(() => latestContextTokens(selectedHistory.value));
+  const contextWindowTokens = computed(
+    () => selectedAgentState.value?.context_window_tokens ?? null,
+  );
   const tokenUsage = computed(() => {
     let input = 0,
       output = 0,
@@ -551,31 +591,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     await refreshDriverResources(true);
     return result;
   }
-  async function sendSkillInvocation(text: string, resource: string): Promise<unknown> {
-    const key = driverKey.value;
-    contextInjection('', driverContextPath.value);
-    if (resource.startsWith('hook:'))
-      throw new Error('Hook execution is not supported by the current backend');
-    if (!resource.startsWith('skill:')) throw new Error('Only Skill resources can be invoked');
-    const mapping = driverState.value?.visible.find((item) => item.resource_id === resource);
-    if (!mapping) throw new Error('Skill has no verified visible TOOL alias');
-    if (selectedAgentWorking.value) throw new Error('The selected agent is already working');
-    const messages: AgentMessage[] = [];
-    if (text.trim())
-      messages.push({ type: 'inject', messages: [{ type: 'user', content: text.trim() }] });
-    messages.push({
-      type: 'assistant',
-      reasoning: null,
-      content: null,
-      tool_calls: [
-        { id: `manual-${crypto.randomUUID()}`, tool_name: mapping.alias, arguments: '{}' },
-      ],
-    });
-    lastFailures.value.delete(`${selectedWorkspaceKey.value}:${selectedAgentId.value}`);
-    await executeMclCommand(`INJECT ? TO ${driverContextPath.value}`, [messages]);
-    assertDriverRoute(key);
-    return executeMclCommand('EMIT EFFECT wake');
-  }
   function abortTurn(): Promise<never> {
     return Promise.reject(
       new Error('Turn cancellation is not supported by the current backend protocol'),
@@ -795,12 +810,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     lastFailures,
     canAbortTurn,
     refreshDriverResources,
-    sendSkillInvocation,
     setResourceVisibility,
     setSandbox,
     abortTurn,
     visibleMessages,
     tokenUsage,
+    contextTokens,
+    contextWindowTokens,
     logs,
     connect,
     disconnect,

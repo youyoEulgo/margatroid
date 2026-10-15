@@ -8,6 +8,7 @@ use tempfile::tempdir;
 
 fn record(key: &str) -> HistoryRecord {
     HistoryRecord {
+        created_at_ms: 1,
         key: key.into(),
         source: "driver".into(),
         turn: Some("turn-1".into()),

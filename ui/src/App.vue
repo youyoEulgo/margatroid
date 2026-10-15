@@ -14,7 +14,6 @@ import {
   Eye,
   EyeOff,
   LockKeyhole,
-  Plus,
   Menu,
   MessageSquare,
   PanelRight,
@@ -40,12 +39,15 @@ import {
   type ConversationEntry,
 } from '@/stores/workbench';
 import { renderMarkdown } from '@/lib/markdown';
+import { formatRecordTime } from '@/lib/time';
 
 const store = useWorkbenchStore();
 const {
   endpoint,
   driverContextPath,
   tokenUsage,
+  contextTokens,
+  contextWindowTokens,
   connectionStatus,
   connectionError,
   workspaces,
@@ -64,8 +66,7 @@ const {
 const canAbortTurn = computed(() => store.canAbortTurn);
 
 const draft = ref('');
-const pendingSkill = ref<string | null>(null);
-const submittingSkill = ref(false);
+const submittingMessage = ref(false);
 const draftInput = ref<HTMLTextAreaElement | null>(null);
 const messageList = ref<HTMLElement | null>(null);
 const conversationPane = ref<HTMLElement | null>(null);
@@ -75,7 +76,6 @@ const toolManager = ref<HTMLElement | null>(null);
 const sidebarOpen = ref(false);
 const activityOpen = ref(false);
 const toolsOpen = ref(false);
-const composerActionsOpen = ref(false);
 const settingsOpen = ref(false);
 const logFilter = ref<'all' | 'errors'>('all');
 const panelTab = ref<'activity' | 'mcl'>('activity');
@@ -109,29 +109,8 @@ const connectionLabel = computed(() => {
   return 'Offline';
 });
 
-const resourceGroups = computed(() => {
-  const groups = [
-    { type: 'skill', label: 'Skills', resources: [] as typeof resourceVisibility.value },
-    { type: 'hook', label: 'Hooks', resources: [] as typeof resourceVisibility.value },
-    { type: 'tool', label: 'Tools', resources: [] as typeof resourceVisibility.value },
-    { type: 'shell', label: 'Shells', resources: [] as typeof resourceVisibility.value },
-  ];
-  for (const resource of resourceVisibility.value) {
-    groups
-      .find((group) => resource.resource.startsWith(`${group.type}:`))
-      ?.resources.push(resource);
-  }
-  return groups;
-});
-
-const activeToolResources = computed(() =>
-  resourceVisibility.value
-    .filter(
-      (entry) =>
-        entry.visible &&
-        (entry.resource.startsWith('skill:') || entry.resource.startsWith('hook:')),
-    )
-    .map((entry) => entry.resource),
+const toolResources = computed(() =>
+  resourceVisibility.value.filter((entry) => entry.resource.startsWith('tool:')),
 );
 
 function compactTokenNumber(value: number) {
@@ -178,16 +157,23 @@ const tokenUsageItems = computed(() => {
 });
 
 const contextWindowUsage = computed(() => {
-  const used = 0;
-  const maximum = 0;
-  const ratio = maximum > 0 ? Math.min(used / maximum, 1) : 0;
+  const used = contextTokens.value;
+  const maximum = contextWindowTokens.value;
+  const known =
+    used !== null &&
+    Number.isFinite(used) &&
+    used >= 0 &&
+    maximum !== null &&
+    Number.isFinite(maximum) &&
+    maximum > 0;
+  const ratio = known ? used / maximum : 0;
   return {
     ratio,
-    dashOffset: 44 * (1 - ratio),
-    title:
-      maximum > 0
-        ? `Context window: ${used.toLocaleString()} / ${maximum.toLocaleString()} tokens (${(ratio * 100).toFixed(1)}%)`
-        : 'Context window usage unavailable',
+    dashOffset: 44 * (1 - Math.min(ratio, 1)),
+    label: known ? `${(ratio * 100).toFixed(1)}%` : '—',
+    title: known
+      ? `Context window: ${used.toLocaleString()} / ${maximum.toLocaleString()} tokens (${(ratio * 100).toFixed(1)}%). Based on the latest assistant usage.`
+      : 'Context window usage unavailable',
   };
 });
 
@@ -229,9 +215,6 @@ function autosizeDraft() {
 }
 
 watch(draft, () => nextTick(autosizeDraft));
-watch([selectedWorkspace, selectedAgent], () => {
-  pendingSkill.value = null;
-});
 
 function followMcL() {
   panelTab.value = 'mcl';
@@ -248,12 +231,6 @@ function logLevelClass(log: { level: string }) {
 
 function closeToolsOnOutsideClick(event: MouseEvent) {
   const target = event.target;
-  if (
-    composerActionsOpen.value &&
-    (!(target instanceof Element) || !target.closest('.composer-add-menu'))
-  ) {
-    composerActionsOpen.value = false;
-  }
   if (!toolsOpen.value) return;
   if (target instanceof Node && toolManager.value && !toolManager.value.contains(target)) {
     toolsOpen.value = false;
@@ -284,38 +261,17 @@ onBeforeUnmount(() => {
 
 async function submitMessage() {
   const text = draft.value.trim();
-  if ((!text && !pendingSkill.value) || submittingSkill.value) return;
-  submittingSkill.value = true;
+  if (!text || submittingMessage.value) return;
+  submittingMessage.value = true;
   try {
-    if (pendingSkill.value) await store.sendSkillInvocation(text, pendingSkill.value);
-    else await store.sendMessage(text);
+    await store.sendMessage(text);
     draft.value = '';
-    pendingSkill.value = null;
     nextTick(scrollMessages);
   } catch (error) {
     connectionError.value = error instanceof Error ? error.message : String(error);
   } finally {
-    submittingSkill.value = false;
+    submittingMessage.value = false;
   }
-}
-
-function selectSkill(resource: string) {
-  pendingSkill.value = resource;
-  composerActionsOpen.value = false;
-  nextTick(() => draftInput.value?.focus());
-}
-
-function cancelPendingSkill() {
-  pendingSkill.value = null;
-  nextTick(() => draftInput.value?.focus());
-}
-
-function handleDraftBackspace(event: KeyboardEvent) {
-  const input = event.currentTarget;
-  if (!(input instanceof HTMLTextAreaElement) || !pendingSkill.value) return;
-  if (input.selectionStart !== 0 || input.selectionEnd !== 0) return;
-  event.preventDefault();
-  cancelPendingSkill();
 }
 
 async function runAgentAction(action: () => Promise<unknown>) {
@@ -406,17 +362,11 @@ function handleComposerWheel(event: WheelEvent) {
 }
 
 function formatTime(timestamp: number) {
-  return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }).format(
-    timestamp,
-  );
+  return formatRecordTime(timestamp);
 }
 
 function formatLogTime(timestamp: number) {
-  return new Intl.DateTimeFormat(undefined, {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  }).format(timestamp);
+  return formatRecordTime(timestamp, true);
 }
 
 function roleLabel(message: ConversationEntry) {
@@ -486,11 +436,7 @@ function mclEntryResult(message: ConversationEntry) {
           <strong>margatroid</strong>
           <span>agent workspace</span>
         </div>
-        <button
-          class="icon-button sidebar-close"
-          title="Close navigation"
-          @click="sidebarOpen = false"
-        >
+        <button class="icon-button sidebar-close" title="Close navigation" @click="sidebarOpen = false">
           <X :size="17" />
         </button>
       </div>
@@ -509,27 +455,20 @@ function mclEntryResult(message: ConversationEntry) {
       </div>
 
       <nav class="workspace-list" aria-label="Workspaces">
-        <button
-          v-for="workspace in workspaces"
-          :key="workspaceKey(workspace)"
-          :class="[
-            'workspace-item',
-            {
-              'workspace-item--active':
-                selectedWorkspace && workspaceKey(selectedWorkspace) === workspaceKey(workspace),
-            },
-          ]"
-          @click="selectWorkspace(workspaceKey(workspace))"
-        >
+        <button v-for="workspace in workspaces" :key="workspaceKey(workspace)" :class="[
+          'workspace-item',
+          {
+            'workspace-item--active':
+              selectedWorkspace && workspaceKey(selectedWorkspace) === workspaceKey(workspace),
+          },
+        ]" @click="selectWorkspace(workspaceKey(workspace))">
           <FolderKanban :size="17" />
           <span class="workspace-item__copy">
             <strong>{{ workspace.name }}</strong>
             <small>{{ workspace.project_root }}</small>
           </span>
-          <ChevronDown
-            v-if="selectedWorkspace && workspaceKey(selectedWorkspace) === workspaceKey(workspace)"
-            :size="15"
-          />
+          <ChevronDown v-if="selectedWorkspace && workspaceKey(selectedWorkspace) === workspaceKey(workspace)"
+            :size="15" />
         </button>
         <div v-if="!workspaces.length" class="sidebar-empty">
           <span>No workspace running</span>
@@ -542,10 +481,8 @@ function mclEntryResult(message: ConversationEntry) {
           <span class="count-badge">{{ selectedWorkspace.agents.length }}</span>
         </div>
         <div class="member-list">
-          <button
-            :class="['member-item', { 'member-item--active': selectedAgent === null }]"
-            @click="selectMember(null)"
-          >
+          <button :class="['member-item', { 'member-item--active': selectedAgent === null }]"
+            @click="selectMember(null)">
             <span class="member-avatar member-avatar--manager">
               <Zap :size="15" />
             </span>
@@ -555,12 +492,8 @@ function mclEntryResult(message: ConversationEntry) {
             </span>
             <Check v-if="selectedAgent === null" :size="15" />
           </button>
-          <button
-            v-for="agent in memberList"
-            :key="agent"
-            :class="['member-item', { 'member-item--active': selectedAgent === agent }]"
-            @click="selectMember(agent)"
-          >
+          <button v-for="agent in memberList" :key="agent"
+            :class="['member-item', { 'member-item--active': selectedAgent === agent }]" @click="selectMember(agent)">
             <span class="member-avatar">
               <Bot :size="15" />
             </span>
@@ -604,12 +537,8 @@ function mclEntryResult(message: ConversationEntry) {
           </div>
         </div>
         <div class="header-actions">
-          <button
-            class="icon-button"
-            :class="{ 'icon-button--active': activityOpen }"
-            title="Toggle activity"
-            @click="activityOpen = !activityOpen"
-          >
+          <button class="icon-button" :class="{ 'icon-button--active': activityOpen }" title="Toggle activity"
+            @click="activityOpen = !activityOpen">
             <PanelRight :size="18" />
           </button>
         </div>
@@ -635,13 +564,11 @@ function mclEntryResult(message: ConversationEntry) {
         </div>
 
         <template v-for="message in conversationMessages" :key="message.key">
-          <article
-            :class="[
-              'message-row',
-              `message-row--${message.role}`,
-              { 'message-row--failed': message.failed },
-            ]"
-          >
+          <article :class="[
+            'message-row',
+            `message-row--${message.role}`,
+            { 'message-row--failed': message.failed },
+          ]">
             <div class="message-avatar">
               <UserRound v-if="message.role === 'user'" :size="16" />
               <Bot v-else-if="message.role === 'assistant'" :size="16" />
@@ -665,11 +592,7 @@ function mclEntryResult(message: ConversationEntry) {
                 </summary>
                 <pre class="tool-response-detail">{{ message.content }}</pre>
               </details>
-              <div
-                v-else-if="message.content"
-                class="message-content"
-                v-html="renderMarkdown(message.content)"
-              ></div>
+              <div v-else-if="message.content" class="message-content" v-html="renderMarkdown(message.content)"></div>
               <div v-if="message.toolCalls.length" class="tool-call-list">
                 <details v-for="tool in message.toolCalls" :key="tool.id" class="tool-call-row">
                   <summary>
@@ -695,160 +618,59 @@ function mclEntryResult(message: ConversationEntry) {
 
       <footer ref="composerFooter" class="composer" @wheel="handleComposerWheel">
         <form class="composer-box" @submit.prevent="submitMessage">
-          <div v-if="pendingSkill" class="composer-call-row">
-            <div class="composer-call-block">
-              <div class="composer-call-copy">
-                <span class="composer-call-kind">Skill</span>
-                <strong>{{ resourceName(pendingSkill) }}</strong>
-              </div>
-              <button type="button" title="Cancel Skill call" @click="cancelPendingSkill">
-                <X :size="14" />
-              </button>
-            </div>
-          </div>
           <div class="composer-input-row">
-            <textarea
-              ref="draftInput"
-              v-model="draft"
-              :disabled="!selectedWorkspace || connectionStatus !== 'online' || !selectedAgentReady"
-              rows="1"
-              :placeholder="
-                !selectedWorkspace
+            <textarea ref="draftInput" v-model="draft"
+              :disabled="!selectedWorkspace || connectionStatus !== 'online' || !selectedAgentReady" rows="1"
+              :placeholder="!selectedWorkspace
                   ? 'Select a workspace...'
                   : selectedAgentReady
                     ? selectedAgentWorking
                       ? `${selectedAgentName} is working...`
                       : `Message ${selectedAgentName}...`
                     : 'Agent is not ready...'
-              "
-              @keydown.enter.exact.prevent="submitMessage"
-              @keydown.backspace="handleDraftBackspace"
-            ></textarea>
+                " @keydown.enter.exact.prevent="submitMessage"></textarea>
           </div>
           <div class="composer-actions">
-            <div class="composer-add-menu">
-              <button
-                class="composer-add-button"
-                type="button"
-                title="Add to message"
-                :aria-expanded="composerActionsOpen"
-                :disabled="
-                  !selectedWorkspace || connectionStatus !== 'online' || !selectedAgentReady
-                "
-                @click="composerActionsOpen = !composerActionsOpen"
-              >
-                <Plus :size="18" />
-              </button>
-              <div v-if="composerActionsOpen" class="composer-add-popover">
-                <template
-                  v-for="group in resourceGroups.filter(
-                    (group) => group.type === 'skill' || group.type === 'hook',
-                  )"
-                  :key="group.type"
-                >
-                  <div class="composer-add-heading">{{ group.label }}</div>
-                  <button
-                    v-for="entry in group.resources.filter((item) => item.visible)"
-                    :key="entry.resource"
-                    type="button"
-                    :disabled="group.type === 'hook'"
-                    :title="
-                      group.type === 'hook'
-                        ? 'Hook invocation is not supported by the current runtime'
-                        : undefined
-                    "
-                    @click="selectSkill(entry.resource)"
-                  >
-                    <span class="resource-state-dot is-active" />
-                    <span>{{ resourceName(entry.resource) }}</span>
-                  </button>
-                  <span
-                    v-if="!group.resources.some((item) => item.visible)"
-                    class="composer-add-empty"
-                    >No visible {{ group.label }}</span
-                  >
-                </template>
-              </div>
-            </div>
-            <button
-              v-if="selectedAgentWorking"
-              class="send-button send-button--stop"
-              type="button"
-              :title="
-                canAbortTurn
-                  ? 'Stop current turn'
-                  : 'Stopping a turn is not supported by the current runtime'
-              "
-              :disabled="
-                !canAbortTurn ||
+            <button v-if="selectedAgentWorking" class="send-button send-button--stop" type="button" :title="canAbortTurn
+                ? 'Stop current turn'
+                : 'Stopping a turn is not supported by the current runtime'
+              " :disabled="!canAbortTurn ||
                 !selectedWorkspace ||
                 connectionStatus !== 'online' ||
                 !selectedAgentReady
-              "
-              @click="abortTurn"
-            >
+                " @click="abortTurn">
               <Square :size="14" :stroke-width="0" fill="currentColor" />
             </button>
-            <button
-              v-else
-              class="send-button"
-              type="submit"
-              title="Send message"
-              :disabled="
-                (!draft.trim() && !pendingSkill) ||
-                submittingSkill ||
-                !selectedWorkspace ||
-                connectionStatus !== 'online' ||
-                !selectedAgentReady
-              "
-            >
+            <button v-else class="send-button" type="submit" title="Send message" :disabled="!draft.trim() ||
+              submittingMessage ||
+              !selectedWorkspace ||
+              connectionStatus !== 'online' ||
+              !selectedAgentReady
+              ">
               <Send :size="18" />
             </button>
           </div>
         </form>
         <div v-if="selectedWorkspace" ref="toolManager" class="tool-manager">
-          <button
-            class="tool-manager-trigger"
-            type="button"
-            :aria-expanded="toolsOpen"
-            aria-controls="tool-manager-panel"
-            title="Manage agent tools"
-            @click="toolsOpen = !toolsOpen"
-          >
+          <button class="tool-manager-trigger" type="button" :aria-expanded="toolsOpen"
+            aria-controls="tool-manager-panel" title="Manage agent tools" @click="toolsOpen = !toolsOpen">
             <ChevronRight :class="['tool-manager-chevron', { 'is-open': toolsOpen }]" :size="13" />
-            <span v-for="resource in activeToolResources" :key="resource" class="active-tool">
-              <span class="active-tool-dot"></span>
-              <span>{{ resourceName(resource) }}</span>
-            </span>
-            <span v-if="!activeToolResources.length" class="tool-manager-empty">Tools</span>
+            <span class="tool-manager-empty">Resources Panel</span>
           </button>
 
           <div class="token-usage" aria-label="Agent token usage">
-            <span
-              v-for="item in tokenUsageItems"
-              :key="item.label"
-              class="token-usage-item"
-              :title="item.title"
-            >
+            <span v-for="item in tokenUsageItems" :key="item.label" class="token-usage-item" :title="item.title">
               <span>{{ item.label }}</span>
               <strong>{{ item.value }}</strong>
             </span>
-            <span
-              class="context-window-usage"
-              role="img"
-              :aria-label="contextWindowUsage.title"
-              :title="contextWindowUsage.title"
-            >
+            <span class="context-window-usage" role="img" :aria-label="contextWindowUsage.title"
+              :title="contextWindowUsage.title">
               <svg viewBox="0 0 18 18" aria-hidden="true">
                 <circle class="context-window-track" cx="9" cy="9" r="7" />
-                <circle
-                  class="context-window-value"
-                  cx="9"
-                  cy="9"
-                  r="7"
-                  :style="{ strokeDashoffset: contextWindowUsage.dashOffset }"
-                />
+                <circle class="context-window-value" cx="9" cy="9" r="7"
+                  :style="{ strokeDashoffset: contextWindowUsage.dashOffset }" />
               </svg>
+              <span class="context-window-percentage">{{ contextWindowUsage.label }}</span>
             </span>
           </div>
 
@@ -859,27 +681,15 @@ function mclEntryResult(message: ConversationEntry) {
                 <span>{{ sandboxOptions.options.length }}</span>
               </div>
               <div class="tool-resource-list">
-                <div
-                  v-for="choice in sandboxChoices"
-                  :key="choice.value || 'none'"
-                  class="tool-resource-row"
-                  :title="choice.hint"
-                >
+                <div v-for="choice in sandboxChoices" :key="choice.value || 'none'" class="tool-resource-row"
+                  :title="choice.hint">
                   <ShieldCheck v-if="choice.value" :size="14" />
                   <ShieldOff v-else :size="14" />
                   <code :title="choice.hint">{{ choice.label }}</code>
-                  <button
-                    class="tool-row-action"
-                    type="button"
-                    :title="
-                      sandboxSelection === choice.value ? 'Active sandbox' : 'Use this sandbox'
-                    "
-                    :aria-label="
-                      sandboxSelection === choice.value ? 'Active sandbox' : 'Use this sandbox'
-                    "
-                    :disabled="connectionStatus !== 'online' || !selectedAgentReady"
-                    @click="selectSandbox(choice.value)"
-                  >
+                  <button class="tool-row-action" type="button" :title="sandboxSelection === choice.value ? 'Active sandbox' : 'Use this sandbox'
+                    " :aria-label="sandboxSelection === choice.value ? 'Active sandbox' : 'Use this sandbox'
+                      " :disabled="connectionStatus !== 'online' || !selectedAgentReady"
+                    @click="selectSandbox(choice.value)">
                     <CircleDot v-if="sandboxSelection === choice.value" :size="14" />
                     <Circle v-else :size="14" />
                   </button>
@@ -887,28 +697,20 @@ function mclEntryResult(message: ConversationEntry) {
               </div>
             </section>
 
-            <section v-for="group in resourceGroups" :key="group.type" class="tool-resource-group">
+            <section class="tool-resource-group">
               <div class="tool-resource-heading">
-                <span>{{ group.label }}</span>
-                <span>{{ group.resources.length }}</span>
+                <span>Tools</span>
+                <span>{{ toolResources.length }}</span>
               </div>
-              <div v-if="group.resources.length" class="tool-resource-list">
-                <div
-                  v-for="entry in group.resources"
-                  :key="entry.resource"
-                  class="tool-resource-row"
-                >
+              <div v-if="toolResources.length" class="tool-resource-list">
+                <div v-for="entry in toolResources" :key="entry.resource" class="tool-resource-row">
                   <span :class="['resource-state-dot', { 'is-active': entry.visible }]" />
                   <code :title="entry.resource">{{ resourceName(entry.resource) }}</code>
-                  <button
-                    v-if="entry.default"
-                    class="tool-row-action"
-                    type="button"
+                  <button v-if="entry.default" class="tool-row-action" type="button"
                     :title="entry.visible ? 'Remove visibility' : 'Inject visibility'"
                     :aria-label="entry.visible ? 'Remove visibility' : 'Inject visibility'"
                     :disabled="connectionStatus !== 'online' || !selectedAgentReady"
-                    @click="toggleResourceVisibility(entry.resource, !entry.visible)"
-                  >
+                    @click="toggleResourceVisibility(entry.resource, !entry.visible)">
                     <Eye v-if="entry.visible" :size="14" />
                     <EyeOff v-else :size="14" />
                   </button>
@@ -948,7 +750,7 @@ function mclEntryResult(message: ConversationEntry) {
           Errors
           <span>{{
             logs.filter((log) => log.level === 'ERROR' || log.level === 'WARN').length
-          }}</span>
+            }}</span>
         </button>
       </div>
       <div v-if="panelTab === 'activity'" class="activity-list">
@@ -961,9 +763,7 @@ function mclEntryResult(message: ConversationEntry) {
           <div class="log-copy">
             <p>{{ log.message }}</p>
             <small>{{ log.target }} · {{ formatLogTime(log.timestamp) }}</small>
-            <code v-for="field in log.fields" :key="field.name"
-              >{{ field.name }}={{ field.value }}</code
-            >
+            <code v-for="field in log.fields" :key="field.name">{{ field.name }}={{ field.value }}</code>
           </div>
         </div>
       </div>
@@ -972,12 +772,7 @@ function mclEntryResult(message: ConversationEntry) {
           <Command :size="18" />
           <span>No MCL commands yet</span>
         </div>
-        <div
-          v-for="record in mclRecords"
-          :key="record.key"
-          class="mcl-entry"
-          :title="record.content"
-        >
+        <div v-for="record in mclRecords" :key="record.key" class="mcl-entry" :title="record.content">
           <code>{{ mclEntryCommand(record) || record.content }}</code>
           <small>{{ formatLogTime(record.timestamp) }}</small>
           <code v-if="mclEntryResult(record)" class="mcl-entry-result">{{
@@ -1002,28 +797,20 @@ function mclEntryResult(message: ConversationEntry) {
           </button>
         </div>
         <label class="field-label" for="endpoint">WebSocket endpoint</label>
-        <input
-          id="endpoint"
-          v-model="endpointDraft"
-          class="field-input"
-          placeholder="ws://127.0.0.1:3939/ws"
-          @keydown.enter="saveSettings"
-        />
+        <input id="endpoint" v-model="endpointDraft" class="field-input" placeholder="ws://127.0.0.1:3939/ws"
+          @keydown.enter="saveSettings" />
         <label class="field-label" for="context-path">Driver context path</label>
-        <input
-          id="context-path"
-          v-model="contextPathDraft"
-          class="field-input"
-          placeholder="Path defined by your driver"
-          @keydown.enter="saveSettings"
-        />
+        <input id="context-path" v-model="contextPathDraft" class="field-input"
+          placeholder="Path defined by your driver" @keydown.enter="saveSettings" />
         <p class="field-label">
           Driver-defined destination for messages. Change only if your driver uses a different path.
         </p>
         <p v-if="formError" class="form-error">{{ formError }}</p>
         <div class="dialog-actions">
           <button class="secondary-button" @click="settingsOpen = false">Cancel</button>
-          <button class="primary-button" @click="saveSettings"><Wifi :size="16" /> Connect</button>
+          <button class="primary-button" @click="saveSettings">
+            <Wifi :size="16" /> Connect
+          </button>
         </div>
       </section>
     </div>

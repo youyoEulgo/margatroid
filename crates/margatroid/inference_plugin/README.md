@@ -92,11 +92,11 @@ world.send_event(InferenceRequest {
 
 `tools: Vec<CallableResource>` 保存完整 ResourceID、选定 alias 及 `Arc<CallableDefinitionSnapshot>`。直接消费该快照的描述、schema 和资源种类，不按 ID 重取最新定义，也不重复 global alias query。归属校验要求目标 ResourceSet 中该 ID 存在、Agent.image_dependencies 许可，以及 ImportBindings 中该 ID/TOOL kind 已导入；不要求旧 snapshot 与 reload 后的新 alias/定义一致。visible alias 必须唯一，不按重复 ID 静默去重。
 
-tool 使用选定 schema；skill 固定 `{ "type":"object", "properties":{}, "additionalProperties":false }`，只允许 `{}`。Hook 可消费自身 description/schema 生成模型定义，但 ToolPlugin 执行明确返回 `UnsupportedHook`，不代表 Driver 触发器路线已闭合。prompt/sandbox 不能冒充 TOOL；空 tools 就是无工具，不回退默认集合。非法 schema、外部 `$ref` 或归属失败在 HTTP 提交前拒绝。
+tool 使用选定 schema；仅 tool 资源可作为 TOOL。空 tools 就是无工具，不回退默认集合。非法 schema、外部 `$ref` 或归属失败在 HTTP 提交前拒绝。
 
 `Inject` 递归按序展开；System、user、assistant、工具结果及 error 转为公开 `ProviderMessage`，System 与 prompt 的真实 role 不降格为 user。保留 reasoning、工具 ID、参数和结果关联，历史 usage 不进入请求。检查工具调用/结果配对，空输入、孤立结果、重复调用和超限输入拒绝。history append 不接收 System 是独立约束，不缩窄 infer 输入。
 
-MCL `infer` 参数为 MESSAGE array + TOOL array；手工工具调用也先构造恰好一条 assistant MESSAGE，再传 visible TOOL array，calls 从 `assistant.tool_calls` 提取。`ToolCall` 仍为 assistant 的纯结构字段，没有 TOOL_CALL Block array。metadata reload 不改变已取出的 Block/请求；新 GET alias 取得新 snapshot。脚本和 Skill 正文仍按选定路径 late read，metadata snapshot 不保证磁盘文件内容版本隔离。
+MCL `infer` 参数为 MESSAGE array + TOOL array；手工工具调用也先构造恰好一条 assistant MESSAGE，再传 visible TOOL array，calls 从 `assistant.tool_calls` 提取。`ToolCall` 仍为 assistant 的纯结构字段，没有 TOOL_CALL Block array。metadata reload 不改变已取出的 Block/请求；新 GET alias 取得新 snapshot。脚本仍按选定路径 late read，metadata snapshot 不保证磁盘文件内容版本隔离。
 
 
 ## 执行监督与真实 cleanup

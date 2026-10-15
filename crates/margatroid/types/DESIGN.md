@@ -33,7 +33,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 共享值、组件与事件迁移及本轮typed数组与导入绑定均已实现。各领域文档描述对应完整行为，本文件统一依赖方向和跨领域数据，不继续混入旧邮箱、引用Block或ResourceId组件方案。ResourceID等基础契约由resource_id_plugin提供；types按组件、事件与纯值模块组织，不依赖业务Plugin实现。正文保持lib、system、handler、events、types、error六个标准板块。
 
-显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
+显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。history_components::message_history_parts将实际正文放入HistoryRecord.content，payload保留type及其余字段并移除顶层content；Error正文取message并从payload移除，Inject正文为空且完整保留嵌套messages。Assistant无正文按空字符串展示。不修改AgentMessage领域公开类型。旧行不迁移，消费者兼容旧payload.content/message。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
 # lib
 
@@ -136,11 +136,8 @@ CallableResource：可调用资源值，公开结构体--TOOL数组元素，不�
 
 CallableDefinitionSnapshot：可调用资源定义快照，公开枚举
     Tool(ToolResource)
-    Skill(SkillResource)
-    Hook(HookResource)
     说明：复用共享资源定义，包含执行准备所需描述、schema及资源定义；GET TOOL从StoredBlockInner中的ID在当前已导入绑定中resolve最新定义，执行提交后不得再回查替换已提交快照。
         快照固定描述、schema和资源定义字段（包括路径），不冻结路径对应磁盘文件内容；执行时按既有路径读取，不宣称文件正文版本已被快照。
-        Hook是允许导入的TOOL资源类别，hook执行语义尚未确认，不能由此声明tool_call已支持hook执行。
 
 SandboxValue：沙箱资源值，公开结构体--SANDBOX数组元素
     resource_id: ResourceID--完整来源身份
@@ -304,14 +301,14 @@ HistoryRecord：历史记录，公开共享契约
     execution_components：AgentExecutionScope及活动机制，Agent只引用一个作用域，不挂平行活动组件
     workspace_components：工作区身份、成员及WorldWorkspaceExt；workspace_execution提供线程入口与关闭能力
     resource_id_plugin：ResourceID、ResourceInner、ResourcesComponent、LibraryComponent、ResourceSet和基础查询
-    types/resource_components：五类资源及AgentImage，AgentImage不强制有alias
+    types/resource_components：三类资源及AgentImage，AgentImage不强制有alias
     client_components：Client和其连接/发送器受检查询契约
 
 资源规则：
     ResourceSet按完整ID存放目标Entity本地条目，可跨Entity有同ID，不能全局取第一个匹配者
     Agent内alias跨所有导入类型唯一，由ImportBindings及共享受检World入口统一维护；同alias不同完整ID先拒绝，Inference和MCL工具准备不能绕过检查
     IMPORT必须精确属于Agent镜像依赖，无builtin例外；MCL与加载插件共用WorldAgentExt.agent_validate_import受检预检，不维护平行许可或alias规则
-    IMPORT TOOL tool:.../skill:.../hook:... AS alias产生CallableResource；IMPORT MESSAGE prompt:... AS alias按实际role产生AgentMessage（包括新System契约）；IMPORT SANDBOX sandbox:...产生SandboxValue并遵守同一alias检查
+    IMPORT TOOL tool:... AS alias产生CallableResource；IMPORT MESSAGE prompt:... AS alias按实际role产生AgentMessage（包括新System契约）；IMPORT SANDBOX sandbox:...产生SandboxValue并遵守同一alias检查
     重载成功更新资源条目及对应alias的新值，失败保留旧值；持久Block只存TOOL/SANDBOX ID，后续GET解析新定义，既有GET/execution快照不暗变；激活沙箱改变策略时遵守Sandbox活动互斥
 
 值与输出：

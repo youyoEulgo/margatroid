@@ -61,7 +61,7 @@ impl SqliteAgentDatabase {
                 .execute_batch(BLOCK_SCHEMA)
                 .map_err(|error| BlockStorageError::Io(error.to_string()))?;
             for query in [
-                "SELECT sequence,key,source,turn,kind,content,payload FROM history_records LIMIT 0",
+                "SELECT sequence,key,source,turn,kind,content,payload,created_at_ms FROM history_records LIMIT 0",
                 "SELECT id,agent,instance,name,temporary,schema_json FROM block_definitions LIMIT 0",
                 "SELECT definition_id,name,inner_type,value_json FROM block_fields LIMIT 0",
             ] {

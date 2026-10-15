@@ -1,9 +1,4 @@
-# 归档：重写前实现
-
-本文归档重写前 revision `7c9055c` 的实现与旧解析规则，不再对应当前源码。当前 MCL 已迁移为共享 Agent FIFO、三类 typed 数组和 oneshot 收口，准确现状见 DESIGN-NEXT.md 与 README.md。下文所有“当前代码”或“尚未实现”均指归档时点，不表示现状。
-
 # 伪代码格式
-
 ```text
 模块：使用一级标题，只写当前设计涉及的部分
 
@@ -34,600 +29,365 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # 板块格式
 
-正文按lib、system、handler、events、types、error六板块组织，按实际源码位置说明，不假称Plugin或函数已迁移。新架构另见DESIGN-NEXT.md，尚未实现。
+本轮已实现：所有运行时Block统一存真实数据库，CREATE/GET/INJECT及包含选择器的参数求值异步事务化，旧effect `finish` 已删除并改为 `finish_turn`。明确类型资源导入与数组表达式契约保持，Rust使用MESSAGE/TOOL/SANDBOX。队列、完整实例生命周期、oneshot及历史基础保持；资源加载通过受检主线程原子挂载与绑定发布。
 
-本文对应当前源码，不是下一代资源架构。`ResourceRef` 是传递、解析及保存的引用值；`ResourceId` 是 ECS 身份组件。`BlockInner::ResourceId`、`InnerType::ResourceId`、`RefMerge::ResourceId` 是现有变体名，不能据此把引用值误写成 ResourceId。
+正文按lib、system、handler、events、types、error六板块组织。parser源码职责在handler板块描述，不另加第七板块。
+
+显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。message记录的content保存实际正文（Error保存message文本，Inject为空，Assistant无正文为空）；payload只保存type及其余元数据，不重复顶层content/Error.message。Inject的messages保留完整嵌套消息结构。旧行原样读取，由消费者兼容payload中的旧正文，不破坏性迁移。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
 # lib
 
-## 模块与公开导出
-
-```text
-mod error;
-mod events;
-mod handler;
-mod system;
-mod types;
-pub use error::MclError;
-pub use events::*;
-pub use handler::{domain_to_command, execute_direct_operation, history_append, history_record, parse_operation};
-pub use system::{command_value_to_json, mcl_command_reply_system, mcl_command_request_system,
-    mcl_domain_system, mcl_effect_response_system, mcl_import_response_system,
-    MclPlugin, MclPluginInstalled, PendingMclEffects, PendingMclImports};
-pub use types::*;
-```
-
-Plugin 定义在 system；handler/system 模块自身私有，列出的 API 从 crate 根重新导出。
-
-# system
-
 ## 类型
 
 公开：
-
 ```text
-PendingMclImports：公开结构体
-    imports: HashMap<String, crate::MclImportState>--键 mcl-import:<command_id>，公开
-    impl Default for PendingMclImports--空映射
-    impl Resource for PendingMclImports
-PendingMclEffects：公开结构体
-    effects: HashMap<String, crate::MclEffectState>--推理键 turn_id；工具键 mcl-effect:<command_id>，公开
-    impl Default for PendingMclEffects--空映射，没有 failures 字段
-    impl Resource for PendingMclEffects
-MclPluginInstalled：公开单元结构体
-    impl Resource for MclPluginInstalled
-MclPlugin：公开结构体
-    schedule: String--私有
-    new() -> Self
-        构造插件：公开关联函数
-        行为：使用 RuntimePlugin::UPDATE。
-    open(_root: impl Into<std::path::PathBuf>) -> Result<Self, MclError>
-        构造插件：公开关联函数
-        行为：忽略 root，返回 Ok(Self::new())，不打开文件。
-    with_schedule(mut self, schedule: impl Into<String>) -> Self
-        设置计划：公开方法
-        行为：替换 schedule 后返回 self。
-    impl Default for MclPlugin
-        default() -> Self
-            默认构造：公开trait方法
-            行为：调用 new。
+MclPlugin：MCL命令插件，公开结构体
+    schedule: String--唯一命令System所在计划
     impl Plugin for MclPlugin
         build(self, app: &mut App)
             安装插件：公开trait方法
-            行为：要求 RuntimeHandle、指定 Schedule、LuaRuntimeHandle、ResourceIdPluginInstalled、ToolPluginInstalled 存在，否则 panic；插入安装标记和两个空 pending Resource；注册 MclEnvironmentProvider（失败 expect/panic）；依次添加 command_request、domain、import_response、effect_response、command_reply 五个系统。
+            行为：安装共享Driver环境factory与私有运输回执表，挂载唯一mcl_command_system，不依赖其他领域Plugin的Handler。
+
+MclEnvironmentFactory：Driver环境工厂，公开共享Resource
+    build(&self) -> LuaEnvironment
+        构造环境：公开方法
+        行为：提供mcl宿主函数，捕获事件发送能力，不保存World借用；wait由LuaRuntime直接提供。
 ```
 
-## 类型
-
-crate公开：
+## 逻辑
 
 ```text
-MclEnvironmentProvider：MCL环境提供器，crate公开结构体
-    events: RuntimeEventSender--私有
-    runtime: LuaRuntimeHandle--私有
-    impl LuaEnvironmentProvider for MclEnvironmentProvider
-        name(&self) -> &str
-            读取环境名称：公开trait方法
-            行为：返回 "mcl"。
-        provide(&self, _context: &LuaEnvironmentContext) -> Result<LuaEnvironment, LuaRuntimeError>
-            提供环境：公开trait方法
-            行为：注册 globals mcl、mcl_expose、mcl_wait、mcl_reserve_wait、mcl_yield，分别对应下列宿主函数；modules 为空。
+Driver输入：
+    mcl(target_resource_id, text, arguments)
+    arguments始终为外层参数列表，每项为对应一个问号的完整数组
+    零问号省略第三参数，不能显式传nil；一个问号也不省略外层
+    Lua空table仅在外层列表或已明确的手动数组位置转换为空数组，消息内部对象不递归猜测
+
+资源能力：
+    TOOL：tool的可调用资源值，不是模型请求ToolCall结构
+    MESSAGE：AgentMessage数组，prompt按自身role转换为消息，不按目标字段猜角色
+    SANDBOX：沙箱资源值数组
+    资源地址仍统一为ResourceID，但RESOURCE不再是Block或GET的数组类型
+    IMPORT只加载、验证并命名，不自动注入上下文、不自动开放模型工具、不自动激活沙箱
+    Agent.import_bindings保存单一alias绑定事实，资源正文仍由ResourceSet持有；不可变内容通过Arc共享
 ```
 
-私有：
-```text
-MclHostFunction：MCL宿主调用，私有结构体
-    events: RuntimeEventSender--私有
-    impl LuaHostFunction for MclHostFunction
-        call(&self, arguments: LuaValue, context: LuaEnvironmentContext, cancel: CancellationToken) -> HostFuture
-            执行宿主调用：公开trait方法
-            行为：预先取消返回 Cancelled；要求长度 2/3 的 Array；第三项非 Nil 时转 JSON binding，前两项必须是可解析 ResourceRef 的目标 agent 字符串和 command 字符串；生成 lua-mcl-<计数> ID/oneshot，以 context.owner.owner_id 为 source 发送 MclCommandRequest；取消或等待回执，通道关闭为 RuntimeClosed，MclError 为 EnvironmentFailed，成功值转 Lua。
-            限制：source 来自宿主 owner，不从目标参数取；取消等待不撤销已发送命令。
-MclExposeFunction：私有结构体
-    events: RuntimeEventSender--私有
-    impl LuaHostFunction for MclExposeFunction
-        call(&self, arguments: LuaValue, context: LuaEnvironmentContext, cancel: CancellationToken) -> HostFuture
-            执行宿主调用：公开trait方法
-            行为：预先检查取消，要求两项 Array(domain 字符串、mapping)；mapping 转 JSON；目标从 owner_id 解析，source 同 owner_id；生成 ID 并发送 command="EXPOSE <domain>" 请求，以与 mcl 相同方式等待和转换回执。
-MclWaitFunction：私有结构体
-    runtime: LuaRuntimeHandle--私有
-    impl LuaHostFunction for MclWaitFunction
-        call(&self, arguments: LuaValue, context: LuaEnvironmentContext, cancel: CancellationToken) -> HostFuture
-            执行宿主调用：公开trait方法
-            行为：只接受 Nil 或空 Array；以 owner_id claim_suspension；取消则 forget_suspension/Cancelled，接收器关闭为 RuntimeClosed，唤醒成功返回 Nil。
-MclReserveWaitFunction：私有结构体
-    runtime: LuaRuntimeHandle--私有
-    impl LuaHostFunction for MclReserveWaitFunction
-        call(&self, arguments: LuaValue, context: LuaEnvironmentContext, _cancel: CancellationToken) -> HostFuture
-            执行宿主调用：公开trait方法
-            行为：只接受 Nil 或空 Array；以 owner_id reserve_suspension，成功返回 Nil；忽略取消令牌。
-MclYieldFunction：私有结构体
-    runtime: LuaRuntimeHandle--私有
-    impl LuaHostFunction for MclYieldFunction
-        call(&self, arguments: LuaValue, context: LuaEnvironmentContext, _cancel: CancellationToken) -> HostFuture
-            执行宿主调用：公开trait方法
-            行为：只接受 Nil 或空 Array；以 owner_id drop_reservation，返回 Nil；不是调度器 yield，忽略取消令牌。
-MclAudit<'a>：私有结构体，Clone + Copy + Debug
-    source: &'a str--私有
-    target: &'a str--私有
-    command: &'a str--私有
-    level(&self) -> tracing::Level
-        确定审计级别：私有方法
-        行为：split_whitespace 首词 IMPORT/EMIT 返回 INFO，其余 DEBUG，不判断合法性。
-    log(&self, command_id: &str)
-        记录审计：私有方法
-        行为：按级别走 tracing::info!/debug!，记录 source、target、mcl、mcl_id，不记录 binding。
-```
-
-审计先于目标校验和命令解析，非法请求也被审计。DEBUG 的实际输出由外部 tracing 过滤配置控制；这里不发 EventLog，也不做来源授权。
+# system
 
 ## 函数
 
 公开：
-
 ```text
-command_value_to_json(value: crate::MclCommandValue) -> Result<serde_json::Value, MclError>
-    转换命令 JSON：公开函数
-    行为：Unit=null，Text=字符串，Message/Message inner=消息对象/数组，ResourceId inner=引用字符串数组，Paths=[{block_id,inner_id}]，ResourceImport={resource_id,alias,available,error}；消息/序列化错误转 TypeMismatch。
-mcl_command_request_system(world: &mut World)
-    命令请求System：公开System
-    处理事件：MclCommandRequest
-    产出事件：MclDomainRequest（仅 Import/Emit）；其他结果直接回 oneshot。
-    行为：克隆本帧请求逐个审计；目标 resource_type 不是 agent 则 InvalidAgentId；parse_operation 失败立即回复；Import/Emit 携带 source/原回执转领域请求，其余 execute_direct_operation 并直接回复。
-mcl_domain_system(world: &mut World)
-    领域System：公开System
-    处理事件：MclDomainRequest
-    产出事件：MclDomainResponse、ToolRegisterRequest、InferenceRequestEvent、ToolCallEvent、MclEffectReply、AgentInitializationCompleted、AgentHistoryMessageWriteRequested、AgentHistoryRecordWriteRequested（含 helper 调用）。
+mcl_command_system(world: &mut World)
+    命令System：公开System
+    处理事件：MclCommand、InternalMclHostSubmission、InternalMclCancellationSignal、MclAsyncOutput、MclCancelledOutput
+    产出事件：领域加载/推理/工具请求、MclCommandResult
     行为：
-        克隆请求逐个分派；Wake/Ready helper 直接完成成功回执；Import/Inference 成功登记等待，失败发 Err 领域响应；其他同步结果发领域响应，ToolCall 登记等待后不发即时成功。
-        HistoryAppend/HistoryRecord：调用 handler 对应函数，传 source。
-        SandboxUse：别名查 aliases，找不到时尝试 ResourceRef 解析；必须 sandbox 且资源库查询成功，否则 ImportMissing/TypeMismatch；全部验证后以 BTreeSet 替换 active_sandboxes，空序列清空。
-        StartTurn：要求 Agent 无当前 turn，否则 TurnMismatch；生成 mcl-turn:<计数> 并 turn.begin，失败 TurnMismatch。
-        ToolCall：要求当前 turn、非空 calls/id；allowed_tools 优先当前 inference.pending 的 tool_schema 名称（即使为空），无 pending 才取 visible 对应已注册 tools；登记 ToolCall pending，重复 effect_id/缺 Resource 为 EffectAlreadyPending；允许的调用发 ToolCallEvent，拒绝的调用发 Ok(Message::Tool{failed:true}) 的 MclEffectReply，不是执行 builtin 工具兜底。
-        VisibilitySource/DefaultVisibilitySource：select 完整字段，必须 ResourceId inner；设置对应集合及 source 路径。
-        Finish：Agent 有 turn 且 tools.pending 有该 turn 的键则 EffectInvalid，否则 turn.finish（失败 TurnMismatch）；无 turn 或 entity 无 Agent 组件时成功 Unit。
-        非领域操作返回 EffectInvalid；保留 Emit 兜底 Unit 分支，当前 effect 枚举已全部显式处理。
-mcl_effect_response_system(world: &mut World)
-    Effect响应System：公开System
-    处理事件：margatroid_types::MclEffectReply、CapturedInferenceResponse、AgentFailure（按此顺序）。
-    产出事件：MclDomainResponse、AgentConversationObserved。
-    行为：
-        按 MclEffectReply.id 移除 pending，缺失忽略；agent 不符则 EffectResponseMismatch；Err(String) 则 EffectFailed(String)。Inference 成功累加可选 usage，发 AgentConversationObserved，返回带 usage 的 Message。ToolCall 成功须 Tool 消息，未知 call id/重复响应把 state 放回并忽略；新响应清理对应 agent.tools.pending，收集至 expected_calls.len()，按原 ID 顺序返回 Message inner（usage=None），未齐全放回 pending。
-        CapturedInferenceResponse 同样按 id 移除 pending、校验 agent；成功返回 Text，失败 warning 后返回空 Text。
-        AgentFailure 查 ResourceId 组件仅用于日志标签；kind.ends_the_turn() 时 abort turn；warning 并发带 Error 的 AgentConversationObserved，不完成 pending、不投递邮箱。
-    限制：CapturedInferenceResponse 是兼容读取分支，本插件无捕获式推理发起路径/CatchInference 变体，此分支不校验 pending.kind；MclEffectReply 不校验 vm_id/current turn；ToolCall.expected 未用于完成判断；没有超时清理/failures 暂存。
-mcl_import_response_system(world: &mut World)
-    IMPORT响应System：公开System
-    处理事件：ToolRegisterResponse
-    产出事件：MclDomainResponse
-    行为：按 response.id 移除 IMPORT state，缺失忽略；校验 agent/resource_id，不符 ImportResponseMismatch；Provider Err 丢弃细节转 ImportFailed；成功强制 entry.alias/resource_name 为原 alias，检查 alias 冲突；无冲突时 imported_resource_definition/install_resource；prompt/sandbox 在 executor/template 均 None 且 content 匹配时跳过 register_agent_resource，其他 entry 注册；成功写 resources[reference]=true/aliases，返回 available=true/error=None 回执；失败 ImportFailed。
-    限制：先安装资源库后注册 Agent，失败不回滚；不额外校验返回 entry.resource_id 与原事务一致。
-mcl_command_reply_system(world: &mut World)
-    命令回执System：公开System
-    处理事件：MclDomainResponse
-    产出事件：无，完成 oneshot。
-    行为：克隆响应，result.map(domain_to_command) 后 reply.send。
+        第一阶段绑定可信来源并逐条受理入目标Agent FIFO
+        第二阶段匹配完整pending identity，Completed派发回执，PreparedEffect/PreparedImport直接继续主线程动作，不重走队首parse或审计；取消审计批次完成后派发其回执
+        第三阶段处理停止或来源取消，再推进各Agent队首
+        同Agent异步等待不执行后续项，不同Agent独立推进；同步预算每Agent每帧64条
 ```
 
-## 函数
-
-私有：
+## 逻辑
 
 ```text
-audit_mcl_request(request: &MclCommandRequest)
-    审计命令请求：私有函数
-    行为：将目标引用转字符串，构造 MclAudit，以 request.id 记录 source/target/原文。
-next_mcl_call_id() -> u64
-    生成调用序号：私有函数
-    行为：静态 AtomicU64 从 1 起，Relaxed fetch_add(1)，命令和 turn 共用。
-command_value_to_lua(value: crate::MclCommandValue) -> Result<LuaValue, LuaRuntimeError>
-    转换命令Lua值：私有函数
-    行为：Unit=Nil、Text=String、ResourceId inner=字符串 Array；消息经 mcl_message_to_json/json_to_lua；Paths 和 ResourceImport 输出与 JSON API 相同字段。
-mcl_message_to_json(message: margatroid_types::MclMessage) -> Result<serde_json::Value, LuaRuntimeError>
-    转换消息JSON：私有函数
-    行为：输出 type=system/user/assistant/tool/error/inject 的对象和对应 content/reasoning/tool_calls/resource_id/tool_call_id/failed/message；Inject 递归转换内部消息（usage=None）；外层可选 usage 序列化后附加，失败 EnvironmentFailed。
-json_to_lua(value: serde_json::Value) -> Result<LuaValue, LuaRuntimeError>
-    转换JSON为Lua值：私有函数
-    行为：递归转换 Null/Bool/Number/String/Array/Object；数字优先 i64 后 f64，不支持则 EnvironmentFailed。
-lua_to_json_binding(value: LuaValue) -> Result<serde_json::Value, LuaRuntimeError>
-    转换Lua绑定数据：私有函数
-    行为：lua_to_json 的错误映射 InvalidRequest。
-lua_to_json(value: LuaValue) -> Result<serde_json::Value, MclError>
-    转换Lua值为JSON：私有函数
-    行为：递归转换 Nil/Boolean/Integer/Number/String/Array/Object；非有限 f64 无法构造 JSON Number 时 TypeMismatch。
-rejected_tool_resource(world: &World, agent: core_plugin::Entity, call: &ToolCall) -> ResourceRef
-    取得拒绝调用的资源标识：私有函数
-    行为：tool_by_name 查 entry.resource_id；失败尝试解析 tool_name；再失败构造 tool:builtin/invalid，仅作为拒绝消息身份占位。
-begin_wake(world: &mut World, request: MclDomainRequest) -> Result<(), MclError>
-    执行唤醒：私有函数
-    行为：查 entity/Agent，要求 lifecycle=Creating/Running、lua.vm_id 及 LuaRuntimeHandle；按目标引用字符串 runtime.wake，失败 EffectInvalid；成功直接 reply.send(Unit)，不登记 pending。
-begin_ready(world: &mut World, request: MclDomainRequest) -> Result<(), MclError>
-    执行就绪通知：私有函数
-    行为：要求 Agent/lua.vm_id；仅 Creating 且 initialization 未 complete 时发 AgentInitializationCompleted；直接 reply.send(Unit)，不登记 pending。
-begin_inference(world: &mut World, request: MclDomainRequest, ref_block_id: String) -> Result<(), MclError>
-    发起推理：私有函数
-    行为：要求 entity、当前 turn、Agent、指定 RefBlock；恰好一个 Message RefMerge，至多一个 ResourceId RefMerge；select 动态消息/资源（无资源 merge 时空列表）；resolve_agent_tool_definitions 失败 ImportMissing；先写 inference.pending[(agent,turn)] 的 tool_schema，再登记 Inference state（vm_id=None、turn_id=Some(turn)、collected/expected_calls 为空）到 effects[turn_id]，键冲突/缺 Resource 为 EffectAlreadyPending；发 InferenceRequestEvent，消息只取 MclMessage.message。
-    限制：inference.pending 更新先于 effects 冲突检查，不回滚；无资源 merge 时不退回 visible/default_visible 工具列表。
-begin_import(world: &mut World, request: MclDomainRequest, resource_id: margatroid_types::ResourceRef, alias: String) -> Result<(), MclError>
-    发起资源导入：私有函数
-    行为：要求 Agent；引用须精确在 info.image_dependencies 中，tool:builtin/hook 按 type/scope/name 判断为例外（不额外检查 tag）；登记 mcl-import:<command_id> state，发 ToolRegisterRequest{alias:Some(alias)}；缺 pending Resource 为 ImportFailed。
-    限制：所有资源均经 Provider，不在镜像目录读 prompt；insert 不检查同键事务。
-imported_resource_definition(entry: &ResourceMapEntry) -> Result<resource_library_plugin::ResourceDefinition, MclError>
-    构造导入资源定义：私有函数
-    行为：要求 content；Tool/Skill/Hook 还要求 template，使用 description/parameters 和 script_path/content_path 构造对应定义；Prompt 使用 role/content；Sandbox 使用 policy；缺数据 ImportFailed。
-```
-
-## 调用与持有关系
-
-```text
-App.World -> PendingMclImports、PendingMclEffects、LuaRuntimeHandle。
-LuaRuntimeHandle -> mcl provider（sender/runtime clone）-> 宿主函数。
-命令事件 -> 审计/解析 -> 直接操作回执，或领域事件 -> 同步回执/等待 Provider、推理、工具响应。
-等待响应 -> MclDomainResponse -> command_reply_system -> 原 oneshot（共享回执最多完成一次）。
-Agent -> 实际 blocks/ref_blocks、state_bindings、资源映射、turn、inference/tools pending、memory。
+回执与关闭：
+    Driver回执先通过私有HostReply对应oneshot同步发送，再发布公开观察结果
+    commands/pending为空、cancel_audits为零且所有回执派发后才mark_drained
+    Stopping或执行作用域关闭拒绝新命令，未执行项Cancelled，在途取消但等待真实收口
+    来源Driver关闭时只取消其完整实例关联的目标命令，取消signal唤醒事件驱动调度而不提供授权
+    ready只允许当前Driver对本人调用；slot已清但实例匹配时返回已交付信息
 ```
 
 # handler
 
 ## 函数
 
-公开：
-
-```text
-parse_operation(command: &str, binding: Option<&serde_json::Value>) -> Result<MclOperation, MclError>
-    解析命令：公开函数
-    行为：
-        任何分号都 InvalidCommand；normalize_command 后区分大小写分派 IMPORT/CREATE/GET/MERGE/REF_MERGE/INJECT/BIND/LOAD/EXPOSE/EMIT EFFECT，其他形状 InvalidCommand。
-        IMPORT <ResourceRef> AS <alias>：严格四词，拒绝 binding，校验 alias，引用解析失败 InvalidResourceId。
-        CREATE/GET/MERGE/REF_MERGE/BIND/LOAD 拒绝 binding；GET 严格两词。
-        MERGE/REF_MERGE <inners...> FROM <block>：至少四词，inner 去尾逗号后 path 校验，仅产出 sources。
-        BIND <block> TO STATE <name> / LOAD STATE <name> INTO <block>：严格五词并校验标识符。
-        EXPOSE <domain>：严格两词，binding 必须 object（缺失/非对象均 BindingMissing）；校验 domain/field；值须 selector 字符串（否则 TypeMismatch），此时只检查语法。
-execute_direct_operation(world: &mut World, request: &MclCommandRequest, operation: MclOperation) -> Result<MclCommandValue, MclError>
-    执行直接操作：公开函数
-    行为：
-        查 entity；取得可变 Agent 前，把 resources.resources 中所有 prompt 引用从资源库收集 content（任一失败 TypeMismatch，即使命令不需要 prompt）；取得 Agent 后分派。
-        CreateBlock：空声明构造 typed 空数组，Merge 声明 AgentMcl.merge 拷贝 sources 当前值；字段重复 InvalidCommand；create_block 的已有 ID 等错误统一 TypeMismatch。
-        CreateRefBlock：AgentMcl.ref_merge 保存同类型普通字段路径；重复 merge_id 后者覆盖；create_ref_block 错误 TypeMismatch。
-        Get：get_selector_value，支持普通字段和 RefMerge 实时展开值。
-        BindState：bind_state 后立即序列化整个普通 block 并 memory.set_state，绑定失败 TypeMismatch、写失败 ImportMissing。
-        LoadState：读 blob，缺失无操作；存在则反序列化 Block/merge_block，只覆盖当前已有同类型字段，未知字段忽略，空数组也覆盖；错误 TypeMismatch/ImportMissing。
-        Expose：解析并实际选择每个 selector，保存 selector_to_string BTreeMap；替换该 domain 的 expose_mappings，再 refresh_exposed 全部 domain。
-        Inject：读目标类型/长度；source selector 取快照，bindings 按目标类型转换并追加；map_selector 后 replace_range，普通 Block 才可写；记录 changed=目标路径。
-        其他（包括顶层 Merge/RefMerge、Import/Emit）EffectInvalid。
-        仅 changed 存在（INJECT）时，精确匹配 visible/default_visible_source 路径则更新对应集合；refresh_exposed 全部 domain；state_bindings 找首个绑定该 block 的 state，将完整 block 序列化写回 memory，最后返回值。
-    限制：非事务，INJECT 后 expose/写 state 失败不恢复 block，EXPOSE 刷新失败不恢复映射；CREATE/LOAD 不刷新 exposed/visibility 或自动写 state。
-history_append(world: &mut World, agent_id: &ResourceRef, message: margatroid_types::MclMessage, fallback_turn_id: &str, source: &str) -> Result<MclDomainValue, MclError>
-    追加历史消息：公开函数
-    行为：查 entity/Agent；当前 turn 优先，缺失用 fallback；Assistant 取当前 inference.pending tool_schema，其余为空；emit AgentHistoryMessageWriteRequested，传 message.message/usage/source，返回 Unit，不自动 INJECT/写 state。
-history_record(world: &mut World, agent_id: &ResourceRef, kind: String, content: String, payload: String, source: &str) -> Result<MclDomainValue, MclError>
-    追加历史记录：公开函数
-    行为：只查 entity（不额外要求 Agent 组件），emit AgentHistoryRecordWriteRequested 携带原字符串/source，返回 Unit。
-domain_to_command(value: MclDomainValue) -> MclCommandValue
-    转换领域结果：公开函数
-    行为：直接返回 value，命令值为领域值别名。
-```
-
-## 函数（解析与绑定）
-
 私有：
-
 ```text
-normalize_command(command: &str) -> String
-    规范化命令文本：私有函数
-    行为：折叠外部空白，选择器内部去紧邻 '['/逗号后的空白，保留数字/逗号，最后 trim；不是完整词法分析器。
-parse_effect(words: &[&str], binding: Option<&serde_json::Value>) -> Result<MclOperation, MclError>
-    解析效果指令：私有函数
+parse_operation(instruction: &MclInstruction) -> Result<MclOperation, MclError>
+    解析指令：私有函数
     行为：
-        缺 effect 名 EffectInvalid；wake/ready/start_turn/finish 严格三词且拒绝 binding；inference FROM <ref_block> 严格五词/校验 ID/拒绝 binding；visibility_source/default_visibility_source FROM <path> 须 All（无方括号）且拒绝 binding；history_append/history_record/tool_call/sandbox_use 须严格 FROM ?/required_binding；其他 EffectInvalid。
-        history_append：parse_message。
-        history_record：kind 非空字符串；content=JSON字符串 {command:cmd 或 null}，payload=JSON字符串 {args:arg 或 null}。
-        tool_call：反序列化 Vec<ToolCall>，非空、id/tool_name/arguments 字符串非空、id 唯一，否则 ToolCallInvalid；不在此验证 arguments 是合法 JSON。
-        sandbox_use：字符串为单 alias，字符串数组为多个，空 object 为零个（Lua 空表兼容），非空 object/其他类型 TypeMismatch。
-parse_create(command: &str) -> Result<MclOperation, MclError>
-    解析创建指令：私有函数
-    行为：取首 '(' 与末 ')'，缺括号 ParseFailed；head 须三词、校验 block_id；BLOCK body 按空白解析 <inner> MESSAGE/RESOURCE 及 MERGE <inners...> FROM <block> AS <inner>，接受独立逗号/尾逗号；REF_BLOCK body 按 REF_MERGE 子串切段，解析 REF_MERGE <inners...> FROM <block> AS <merge>，仅校验 merge_id，source 路径此分支直接构造；返回声明，存在性/类型由执行检查。
-    限制：不检查 ')' 后余文；REF_BLOCK 无 REF_MERGE 时可为空 merges、前缀可能忽略；普通重复字段执行时拒绝，引用重复字段覆盖，非统一解析拒绝。
-parse_inject(words: &[&str], binding: Option<&serde_json::Value>) -> Result<MclOperation, MclError>
-    解析注入指令：私有函数
-    行为：首 TO 前须至少一个来源、后恰好一个目标；target 按 Inject 解析；source=[] 拒绝 binding/转空 JSON Array，source=? 要 binding；单来源含 '.' 按 Get selector 解析；其他多个去尾逗号的标识符转字符串 bindings，拒绝空文本、? 及 binding。
-    限制：selector source 分支不 reject_binding，额外 binding 被忽略；完整引用可通过 ? 字符串 binding 传入，不作为裸 alias 标识符语法。
-parse_endpoint(value: &str) -> Result<MclEndpoint, MclError>
-    解析区间端点：私有函数
-    行为：trim 后空=Open，否则解析 i64，失败 InvalidCommand。
-parse_index(value: &str) -> Result<i64, MclError>
-    解析索引：私有函数
-    行为：trim 后解析 i64，失败 InvalidCommand。
-parse_selector(value: &str, position: MclSelectorPosition) -> Result<MclSelector, MclError>
-    解析选择器：私有函数
-    行为：有 '[' 要求末字符 ']'；取首 '[' 前路径，按首 '.' 分 block/inner 并 path 校验；无括号为 All，括号空为 Empty，一个整数为 Single，两段逗号分隔为 Range（可 Open），更多段 InvalidCommand；返回 Raw，不检查符号/越界。
-path(block_id: &str, inner_id: &str) -> Result<BlockPath, MclError>
-    构造字段路径：私有函数
-    行为：分别 validate_identifier 后复制为 BlockPath。
-validate_identifier(value: &str) -> Result<(), MclError>
-    验证标识符：私有函数
-    行为：首字节 ASCII 字母/_，余字节只能 ASCII 字母数字/_/./-，拒绝空、.、..，失败 InvalidCommand。
-required_binding<'a>(binding: Option<&'a serde_json::Value>) -> Result<&'a serde_json::Value, MclError>
-    取得必需绑定：私有函数
-    行为：None 返回 BindingMissing。
-reject_binding(binding: Option<&serde_json::Value>) -> Result<(), MclError>
-    拒绝额外绑定：私有函数
-    行为：Some（包括 JSON null）InvalidCommand，否则成功。
-parse_message(value: &serde_json::Value) -> Result<margatroid_types::MclMessage, MclError>
-    解析消息绑定：私有函数
-    行为：clone 后 message_from_lua_json。
-message_from_lua_json(value: serde_json::Value) -> Result<margatroid_types::MclMessage, MclError>
-    转换Lua消息JSON：私有函数
-    行为：type 须字符串，支持 system/user/assistant/tool/error；system/user content 非字符串/缺失默认空；assistant reasoning/content 为可选字符串，tool_calls 数组反序列化（空 object/其他值为零个），usage 可选反序列化；tool resource_id 必需且反序列化 ResourceRef，tool_call_id/content 默认空、failed 默认 false；error message 默认空；除 Assistant 外 usage=None；未知 type（包括 inject）/转换失败 TypeMismatch。
-empty_inner(kind: InnerType) -> BlockInner
-    构造空字段：私有函数
-    行为：Message/ResourceId 分别构造 typed 空 Vec。
-binding_to_inner(value: &serde_json::Value, kind: InnerType, aliases: &std::collections::HashMap<String, ResourceRef>, sources: &std::collections::HashMap<ResourceRef, std::sync::Arc<str>>) -> Result<BlockInner, MclError>
-    转换绑定为字段值：私有函数
-    行为：Message 字符串须已导入 alias 且 sources 有 prompt 内容，scope=system 构造 System，其余 scope 一律 User（不读取 PromptResource.role），缺 alias/content ImportMissing；Message 数组逐项 message_from_lua_json，非数组 parse_message；ResourceId 字符串优先 aliases 再完整 ResourceRef 解析（失败 ImportMissing），数组直接反序列化 Vec<ResourceRef>、元素不展开 alias，其他 TypeMismatch。
+        验证完整文本、关键字、括号与手动参数数量，不读取World
+        CREATE BLOCK与CREATE TEMP BLOCK字段仅MESSAGE、TOOL、SANDBOX，拒绝RESOURCE和TOOL_CALL；声明分别选择持久和本次启动隔离的表生命周期
+        IMPORT严格为IMPORT <MESSAGE|TOOL|SANDBOX> <ResourceID> AS <alias>
+        GET及INJECT左侧解析为同一种有序数组表达式，effect括号也使用此表达式
+        不受理REF、MERGE、STATE、EXPOSE和旧visibility来源操作
+
+create_database_block(context: BlockExecutionContext, name: String, fields: Vec<FieldDeclaration>, temporary: bool) -> Result<MclValue, MclError>
+    创建或打开数据库Block：私有异步函数
+    行为：
+        普通Block以稳定AgentResourceID和block名称寻址，TEMP额外使用本次Driver启动实例命名空间
+        不存在则在事务中建立定义与typed空字段；已存在且完整字段声明相同则打开，不清空
+        同名生命周期、字段数量/名称/类型不匹配返回SchemaMismatch，不静默迁移、合并或覆盖旧数据
+        返回BlockOpened {created, temporary}，Driver只在created为true时填默认配置
+        所有Block都是真实数据库表/行，不提供另一套内存后端或BIND/SAVE/LOAD同步接口
+
+parse_array_expression(text: &str) -> Result<ArrayExpression, MclError>
+    解析数组表达式：私有函数
+    行为：
+        仅按方括号之外的逗号切分，拒绝空项、尾逗号及不配对括号
+        每项为已导入alias或数据库Block选择器；完整ResourceID仅在IMPORT中建立绑定，不新增裸地址读取语法
+        alias采用首字符字母或下划线、后续字母数字下划线或连字符，不允许点以避免与block.field混淆
+        选择器保留字段路径及原范围，不在解析阶段求值或冻结快照
+
+begin_import(world: &mut World, request: &MclCommand, kind: InnerType, resource_id: ResourceID, alias: String) -> Result<(), MclError>
+    发起明确类型导入：私有函数
+    行为：
+        TOOL仅允许tool，MESSAGE仅允许prompt，SANDBOX仅允许sandbox，不匹配立即拒绝
+        resource_id须精确属于目标Agent.info.image_dependencies，无builtin隐含例外
+        alias在一个Agent内跨所有类别唯一，已有绑定只能由同一ResourceID及同一声明类型重载；其他资源或类型占用则AliasConflict
+        准备对应资源加载请求并移交Other活动，Sender槽和取消能力随请求，MCL等待唯一Receiver
+        请求携带import_kind: Some(kind)，加载方主线程收口核对完整Entity、取消能力及导入许可，构造ImportedValue快照并原子挂载与发布绑定；MCL仅等待oneshot，不在后续帧二次绑定
+        MESSAGE从PromptResource.role/content构造消息数组，system必须是System消息，不降级为User
+        TOOL构造带原ResourceID/alias及不可变调用定义的CallableResource；SANDBOX构造SandboxValue
+        资源替换及绑定发布通过同一受检主线程收口，加载或类型/绑定校验失败不覆盖旧条目和旧绑定
+        每次IMPORT重读资源，即使同ID已存在；ID在同Agent采用一个本地alias，同ID改alias时移除旧名，冲突先检查
+        IMPORT完成仅返回类型、资源ID和alias，不自动INJECT或执行effect
+        取消后禁止挂载或发布新绑定，真实加载收口后才释放队首；观察Result不参与MCL等待
+
+evaluate_array_expression(context: ArrayEvaluationContext, expression: ArrayExpression) -> Result<BlockInner, MclError>
+    统一数组求值：私有异步函数--GET、INJECT左项与effect括号唯一读取入口
+    行为：
+        主线程核对完整Agent并取得AgentDatabaseHandle/导入快照，执行任务按书写顺序读取来源，不携带World借用
+        Alias从Agent.import_bindings取ImportedValue，转换为Message/Tool/Sandbox typed数组
+        Selector在同一数据库读事务中读取对应Block字段与范围，所有Block来自真实表；不保存独立内存内容或引用视图
+        所有来源必须同类型，空区间也参与类型检查；按顺序拼接，保留重复元素，不隐式去重
+        单索引仍返回数组，消息不包装为单Message，空结果不变为Unit
+        MESSAGE从数据库还原完整消息值；TOOL/SANDBOX字段保存完整ResourceID，读取时按本次Agent导入快照解析当前定义
+        普通及TEMP Block都不保存资源定义副本，重载后的下一次GET可取得新导入值；已开始执行的外部请求保持自身提交快照
+        ID未导入、kind不匹配或失去许可明确报错，不静默丢失配置，不以旧路径/旧policy恢复
+        任何alias/字段缺失、混类型或范围错误均丢弃临时结果，无写入副作用
+
+execute_get(context: ArrayEvaluationContext, expression: ArrayExpression) -> Result<MclValue, MclError>
+    执行读取：私有异步函数
+    行为：直接调用evaluate_array_expression并返回Array，不按资源地址或调用方改变结果类型。
+
+execute_inject(context: ArrayEvaluationContext, source: ArrayParameter, target: Selector, arguments: Vec<Value>) -> Result<MclValue, MclError>
+    事务注入：私有异步函数
+    行为：
+        数据库工作线程在一个写事务内调用同一来源求值逻辑，不发送新GET事件、不先查后另开写事务
+        手动MESSAGE问号严格解码完整消息数组；手动TOOL/SANDBOX仅接受已导入alias字符串数组，通过同一受检读取入口获得资源快照，拒绝裸ID及脚本/schema/policy对象；Empty按目标类型构造空数组
+        求值结果必须与目标字段同类型，不将TOOL/SANDBOX转Message、不将Message转资源
+        在同一事务中完成全部来源读取、目标长度、类型及范围检查，然后一次replace并提交；错误回滚，不改任何字段
+        事务成功提交后才返回Unit并释放队首，不能把已提交成功改成Cancelled；提交事实未知须返回独立错误，不宣称回滚
+        来源与目标相同也先读完所有来源，后续来源不读到本次修改
+
+evaluate_effect_parameters(context: ArrayEvaluationContext, operation: MclOperation, arguments: Vec<Value>) -> Result<Vec<BlockInner>, MclError>
+    求值效果参数：私有异步函数
+    行为：
+        全部括号选择器在同一读事务求值，保持独立参数边界；MESSAGE问号严格解码消息数组，TOOL/SANDBOX问号以alias字符串数组读取已导入快照，空数组保留要求类型
+        inference依次要求MESSAGE和TOOL，tool_call依次要求MESSAGE和TOOL
+        history_append要求MESSAGE，sandbox_use要求SANDBOX，wake/ready/start_turn/finish_turn为零参数
+        先检查全部数量与类型再提交，无部分执行，参数之间不拼接
+
+begin_tool_call(world: &mut World, request: &MclCommand, messages: Vec<AgentMessage>, visible: Vec<CallableResource>) -> Result<(), MclError>
+    执行assistant工具调用：私有函数
+    行为：
+        第一参数必须恰好一条Assistant，从其tool_calls读取调用请求，非assistant或多条消息拒绝
+        工具调用ID和名称须非空，批次ID唯一；TOOL数组alias冲突整批准备失败，不按遍历顺序任选
+        tool_calls为空直接返回typed空MESSAGE数组，不提交任务
+        按每个tool_name在visible快照中匹配alias，无匹配填对应失败消息
+        每个可调用项发送一个ToolExecuteRequest，携带选定CallableResource快照及原调用ID/参数/turn，不按ID重新取最新定义
+        逐项等待oneshot，失败或通道关闭填该项失败结果，按原tool_calls顺序收集MESSAGE数组
+        结果只作为MESSAGE数组返回，包括拒绝和失败项；输入assistant与输出tool_call消息都不隐式写历史，保存必须显式history_append
+        默认只有MCL指令审计记录，不自动产生N条工具message记录；Driver决定哪些消息显式history_append，不生成调用数组Block字段
 ```
 
-## 函数（选择与刷新）
-
-私有：
+## 逻辑
 
 ```text
-map_selector(selector: &MclSelector, length: usize) -> Result<MclSelector, MclError>
-    映射选择器：私有函数
-    行为：All -> Standard[0,len]；Standard 原样 clone（不重新校验）；Raw Empty -> [0,0]，Single 调 map_single，Range 调 map_endpoints；保留路径。
-map_single(position: MclSelectorPosition, index: i64, length: usize) -> Result<(usize, usize), MclError>
-    映射单索引：私有函数
-    行为：空字段 Get[0] 特例 [0,0]；offset=len+1；非负 Get=[x,x+1]，非负 Inject=[x,x]，负 Get=[offset+x-1,offset+x]，负 Inject=[offset+x,offset+x]；交 select_range。
-map_endpoints(start: MclEndpoint, end: MclEndpoint, length: usize) -> Result<(usize, usize), MclError>
-    映射区间端点：私有函数
-    行为：双 Open InvalidCommand；左 Open 起点=0，右 Open 终点=len；显式非负端点原样，负端点加 len+1；两个显式端点混号 InvalidCommand；交 select_range。
-select_range(start: i64, end: i64, length: usize) -> Result<(usize, usize), MclError>
-    验证标准区间：私有函数
-    行为：len=0 仅 [0,0] 有效，其他要求 0<=start<=end<=len，失败 TypeMismatch，成功转 usize。
-selector_path(selector: &MclSelector) -> BlockPath
-    取得选择器路径：私有函数
-    行为：从任何变体 clone path。
-get_selector_value(mcl: &agent_plugin::AgentMcl, selector: &MclSelector) -> Result<MclDomainValue, MclError>
-    读取选择器结果值：私有函数
-    行为：select 取长度、map_selector、select_standard；原 Raw Single 时 Message 返回单个 Message，ResourceId 返回单元素 inner，空结果 Unit；其他返回 Inner。
-select_selector(mcl: &agent_plugin::AgentMcl, selector: &MclSelector) -> Result<BlockInner, MclError>
-    选择字段区间：私有函数
-    行为：select 取长度后 map_selector/select_standard，始终返回 typed inner。
-select_standard(mcl: &agent_plugin::AgentMcl, selector: &MclSelector) -> Result<BlockInner, MclError>
-    执行标准选择：私有函数
-    行为：只接受 Standard，按 path select 后 slice_inner；AgentMcl 错误 TypeMismatch。
-slice_inner(values: &BlockInner, start: usize, end: usize) -> Result<BlockInner, MclError>
-    切片字段值：私有函数
-    行为：左闭右开 get(start..end) 并 clone，保持变体；越界 TypeMismatch。
-append_inner(target: &mut BlockInner, values: BlockInner) -> Result<(), MclError>
-    追加字段值：私有函数
-    行为：同变体 extend，不同变体 TypeMismatch。
-selector_to_string(selector: &MclSelector) -> String
-    序列化选择器文本：私有函数
-    行为：输出 block.inner、block.inner[]、[x] 或 [start,end]；Open 输出空，Standard 输出非负双端，不映射 Raw 数值。
-refresh_exposed(resources: &mut agent_plugin::AgentResourceMap, mcl: &agent_plugin::AgentMcl) -> Result<(), MclError>
-    刷新公开映射：私有函数
-    行为：遍历全部 expose_mappings，以 Get 解析/读取并 command_value_to_json；构造嵌套 BTreeMap，全部成功才整体替换 resources.exposed。
+语法示例：
+    IMPORT TOOL tool:local/bash:latest AS bash
+    IMPORT TOOL tool:local/review:latest AS review
+    IMPORT MESSAGE prompt:local/coder-soul:latest AS soul
+    IMPORT SANDBOX sandbox:local/workspace-write:latest AS workspace_write
+    CREATE TEMP BLOCK msg (instructions MESSAGE, compact_prompt MESSAGE)
+    CREATE BLOCK session (conversation MESSAGE, visible TOOL, activated SANDBOX)
+    CREATE TEMP BLOCK entry (pending MESSAGE)
+    EMIT EFFECT finish_turn
+    GET soul, compact
+    GET bash, review
+    GET workspace_write
+    GET msg.instructions, soul
+    GET bash, soul--类型错误
+    INJECT soul, compact TO msg.instructions
+    INJECT bash, review TO session.visible
+    INJECT workspace_write TO session.activated
+    EMIT EFFECT inference (msg.instructions, session.conversation) (session.visible)
+    EMIT EFFECT tool_call ? (session.visible)
+    EMIT EFFECT history_append ?
+    EMIT EFFECT sandbox_use (session.activated)
+
+Driver工具回合：
+    assistant = inference结果.message
+    command("EMIT EFFECT tool_call ? (session.visible)", {{assistant}})
+    外层是arguments，内层单元素MESSAGE数组；不接受单对象特殊封装
+    返回MESSAGE工具结果数组；Driver分别决定INJECT上下文和显式history_append，二者互不隐含
+    删除work.calls及TOOL_CALL字段，不再单独INJECT tool_calls数组
+
+范围与拼接：
+    All=[0,len]，Empty=[0,0]，最终左闭右开；负端点加len+1
+    非负Read[x]=[x,x+1]，负Read[x]=[len+x,len+1+x]
+    非负Write[x]=[x,x]，负Write[x]=[len+1+x,len+1+x]
+    空字段Read[0]返回typed空数组；双开放端点/显式混号/逆序/越界/溢出拒绝
+    INJECT [] TO b.f清空字段，INJECT [] TO b.f[]只替换空区间
+    GET soul,compact为MESSAGE，GET bash,review为TOOL，GET workspace_write为SANDBOX
+    混合类型即使包含空数组也报错，不在INJECT目标上重新解释来源
+
+沙箱：
+    sandbox_use只接受SANDBOX数组，零项取消、一项激活、多项失败不修改
+    策略快照来自选定SandboxValue，必须核对所属Agent导入许可，不从全局首个匹配者取值
+    真实策略改变受Sandbox活动及受理门限制，Inference/Other不阻止
+    已激活值及执行中的请求保持选定策略快照；数据库SANDBOX字段只保存ID，下一次GET解析当前导入值，再显式sandbox_use才切换；同ID不同policy是配置改变
+
+数据库与恢复：
+    所有Block操作通过AgentBlockStorageHandle异步执行，SQLite在阻塞工作线程，不在ECS执行I/O
+    命令开始登记Other活动，取消请求仍等待实际工作线程退出和事务结局，不丢Future假称回滚
+    同一Agent只使用其一份数据库，GET多来源读事务、INJECT全部来源与目标同写事务
+    alias及手动参数在任务提交时准备不可变快照；数据库TOOL/SANDBOX ID按该次导入快照解析，不跨World借用
+    非选择器的alias读取本身无SQL，但CREATE/GET/INJECT统一异步入口；effect动作本身在主线程同步通知，但每条命令的审计准备异步；带字段参数先一次异步读取所有独立参数再继续执行
+    History与Block共文件分表，INJECT不写message历史，history_append不修改Block，两条指令不承诺共同事务
+    TEMP entry按启动实例隔离，不恢复未处理请求；持久session恢复context及配置，不恢复turn/pending/VM活动
+    启动先IMPORT，再打开持久session并检查created，仅初建初始化visible/sandbox；TEMP prompt每次初始化
+    读取session.activated后显式sandbox_use，再ready；打开Block不自动激活沙箱或执行旧tool_calls
+
+历史：
+    history_append只有完整参数求值与递归允许类型检查成功后才豁免命令记录，准备快照只追加一次
+    非法history_append先审计原text和arguments再返回校验错误，不追加消息；合法写库失败不补写命令或重试
+    除合法history_append外，执行前记录原text和展开arguments，失败不执行
+    message历史唯一写入入口是显式history_append，包括用户、assistant、工具成功/失败、error及inject消息；推理、工具、GET、INJECT和IMPORT不写message记录
+    history_append按批次事务保存，写入失败返回本条history_append错误；推理和工具原结果不会因此重做
+    保留MCL指令审计自动记录，参数展开中的消息数据只是审计payload，不额外投影为message记录
+    history_error保留为取消项审计失败等附带错误，不再表示推理或工具自动结果message保存失败
+    history_append允许inject/user/assistant/tool_call/error，System值可用于上下文但不通过此effect新增记录；递归检查Inject中的System，拒绝时不追加任何记录
+    inject内部结构仍按完整AgentMessage契约，历史输入允许范围规则独立于消息值类型
 ```
-
-## 选择器、合并和 STATE 语义
-
-支持 `b.f`、`b.f[]`、`b.f[x]`、`b.f[x,y]`、`b.f[,y]`、`b.f[x,]`。最终标准区间左闭右开；正双端原样，负双端都加 len+1，可理解为负索引左开右闭。例如 len=4：GET[-1] 取最后一个，GET[-3,-1] 映射 [2,4]；INJECT[-1] 为尾部插入，INJECT[0] 为头部插入。`[,]`、显式混号区间 InvalidCommand，逆序/越界 TypeMismatch；空字段 GET[0] 为 Unit。`[]` 目标是 [0,0] 插入，不是清空整字段；`INJECT [] TO b.f`才清空整字段。
-
-普通 Block 可读写；RefBlock 的合并字段是只读实时视图，可作 INJECT 来源、不可作目标。CREATE BLOCK 内 MERGE 拷贝值，可读取 AgentMcl.select 支持的字段；CREATE REF_BLOCK 内 REF_MERGE 只保存普通 Block 字段路径，不可引用 RefBlock。顶层 MERGE/REF_MERGE 虽解析成功，实际执行 EffectInvalid，当前不返回 Paths。
-
-```text
-BIND <block> TO STATE <name>
-    行为：普通 block 必须存在；同 state 绑定不同 block 失败，同一对幂等；本命令立即写完整 block。一个 block 可以绑定多个 state，但 INJECT 自动写回只找 HashMap 中首个匹配，顺序不稳定。
-LOAD STATE <name> INTO <block>
-    行为：blob 不存在保留默认值（此路径不强制验证 block 存在）；存在则覆盖已有同类型字段，未知字段忽略、空数组也覆盖；不自动建立绑定。
-INJECT 已绑定普通 block
-    行为：修改后写回完整 block 到首个匹配 state；不是“所有修改都会持久化”，LOAD/CREATE 无 changed 标记。
-```
-
-history 事件与 state blob 是独立通道，不自动同步。Driver 的 Lua source/origin/hash 和 VM 由外部插件管理；本插件没有程序包装、程序资源 ID、compile_mcl 或 mailbox 解析函数。
 
 # events
 
 ## 类型
 
-公开：
-
-以下结构体均 Clone + Debug；所有列出字段均 pub，事务状态不是 Event。
-
+公开，全部具名载荷统一在共享xxx_events.rs：
 ```text
-MclCommandRequest：公开事件
-    id: MclCommandId--命令 ID
-    source: String--调用方来源标识
-    agent_id: ResourceRef--目标 agent
-    command: String--原文
-    binding: Option<serde_json::Value>
-    reply: MclCommandReply
-    impl Event for MclCommandRequest
-MclDomainRequest：公开事件
-    id: MclCommandId
-    source: String--保留来源，history 使用
-    agent_id: ResourceRef
-    operation: MclOperation
-    reply: MclCommandReply
-    impl Event for MclDomainRequest
-MclDomainResponse：公开事件
-    id: MclCommandId
-    agent_id: ResourceRef
-    result: Result<crate::MclDomainValue, MclError>
-    reply: MclCommandReply
-    impl Event for MclDomainResponse
-MclImportState：公开结构体
-    command_id: MclCommandId
-    agent_id: ResourceRef
-    agent: Entity
-    resource_id: ResourceRef
-    alias: String
-    reply: MclCommandReply
-MclEffectState：公开结构体
-    command_id: MclCommandId
-    agent_id: ResourceRef
-    agent: Entity
-    vm_id: Option<margatroid_types::LuaVmId>--当前发起路径 None，响应不校验
-    kind: crate::MclPendingEffectKind
-    collected: Vec<margatroid_types::Message>
-    expected_calls: Vec<String>--调用 ID 原始顺序
-    turn_id: Option<String>
-    reply: MclCommandReply
+MclCommand：命令请求，公开事件
+    id: String
+    source: ResourceID
+    target: ResourceID
+    command: MclInstruction
+    impl Event for MclCommand
+
+MclValue：命令成功值，公开枚举--保留Array、ResourceImport、Inference、Text与Unit
+    BlockOpened { block_id: String, created: bool, temporary: bool }--CREATE创建或打开结果，新建true、同schema打开false；两种Block均使用此值
+
+MclCommandResult：命令结果，公开事件
+    id: String
+    source: ResourceID--原值不交换
+    target: ResourceID--原值不交换
+    result: Result<MclValue, MclError>
+    history_error: Option<HistoryError>
+    impl Event for MclCommandResult
+
+InferenceRequest：统一推理请求，公开事件
+    tools: Vec<CallableResource>--替代resources:Vec<ResourceID>，定义于inference_events
+    说明：其他关联、消息、取消与oneshot字段沿用领域契约，不由MCL复制完整结构。
+
+ToolExecuteRequest：单调用执行请求，公开事件
+    resource: CallableResource--选定共享快照，自含ResourceID，不另建重复resource_id字段
+    call: ToolCall--仅来自输入assistant.tool_calls
+    说明：其余agent、turn、cancel、reply字段沿用共享tool_events。
 ```
 
 # types
 
-## 公开重导出
-
-```text
-pub use agent_plugin::AgentMcl;
-pub use margatroid_types::{Block, BlockAssembly, BlockInner, BlockPath, InnerType,
-    MclMessage, RefBlock, RefBlockAssembly, RefMerge};
-```
-
-这些类型在其他 crate 定义；本文件没有 MCL 程序加载函数。以下为本地全部类型。
-
 ## 类型
 
-公开：
-
+公开共享契约：
 ```text
-ResourceImportReceipt：公开结构体，Clone + Debug + PartialEq + Eq
-    resource_id: ResourceRef--公开字段
-    alias: String--公开字段
-    available: bool--公开字段
-    error: Option<String>--公开字段
-MclCommandId(String)：命令标识，公开元组结构体，String 私有，Clone + Debug + PartialEq + Eq
-    new(value: impl Into<String>) -> Result<Self, crate::MclError>
-        构造命令标识：公开关联函数
-        行为：只拒绝空字符串为 InvalidCommand，不检查唯一性/trim。
-    as_str(&self) -> &str
-        借用命令标识：公开方法
-        行为：借用内部字符串。
-MclCommandReply：公开结构体，Clone + Debug
-    sender: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<MclCommandValue, crate::MclError>>>>>--私有
-    new(sender: tokio::sync::oneshot::Sender<Result<MclCommandValue, crate::MclError>>) -> Self
-        构造命令回执：公开关联函数
-        行为：Arc/Mutex/Some 包装 sender。
-    send(&self, result: Result<MclCommandValue, crate::MclError>)
-        发送命令回执：公开方法
-        行为：锁成功则 take sender 并发送，最多一次；忽略接收端关闭和 poisoned 锁。
-MclBinding(serde_json::Value)：绑定值，公开元组结构体，内部字段公开，Clone + Debug
-MclSelector：公开枚举，Clone + Debug + PartialEq + Eq
-    All(BlockPath)
-    Raw { path: BlockPath, range: MclRange, position: MclSelectorPosition }
-    Standard { path: BlockPath, start: usize, end: usize }
-MclRange：公开枚举，Clone + Copy + Debug + PartialEq + Eq
-    Empty
-    Single(i64)
-    Range(MclEndpoint, MclEndpoint)
-MclSelectorPosition：公开枚举，Clone + Copy + Debug + PartialEq + Eq
-    Get
-    Inject
-MclEndpoint：公开枚举，Clone + Copy + Debug + PartialEq + Eq
-    Value(i64)
-    Open
-MclInjectSource：公开枚举，Clone + Debug
-    Selector(MclSelector)
-    Bindings(Vec<MclBinding>)
-BlockFieldDeclaration：公开枚举，Clone + Debug
-    Empty { inner_id: String, inner_type: InnerType }
-    Merge { inner_id: String, sources: Vec<BlockPath> }
-RefMergeDeclaration：公开结构体，Clone + Debug
-    merge_id: String--公开字段
-    sources: Vec<BlockPath>--公开字段
-MclEffectCommand：公开枚举，Clone + Debug
-    Wake
-    Ready
-    StartTurn
-    Inference { ref_block_id: String }
-    ToolCall { calls: Vec<ToolCall> }
-    Finish
-    HistoryAppend { message: MclMessage }
-    HistoryRecord { kind: String, content: String, payload: String }
-    SandboxUse { aliases: Vec<String> }
-    VisibilitySource { source: BlockPath }
-    DefaultVisibilitySource { source: BlockPath }
-MclOperation：公开枚举，Clone + Debug
-    CreateBlock { block_id: String, fields: Vec<BlockFieldDeclaration> }
-    CreateRefBlock { block_id: String, merges: Vec<RefMergeDeclaration> }
-    Merge { sources: Vec<BlockPath> }
-    RefMerge { sources: Vec<BlockPath> }
-    Import { resource_id: ResourceRef, alias: String }
-    Get { selector: MclSelector }
-    Inject { source: MclInjectSource, target: MclSelector }
-    BindState { block_id: String, state_name: String }
-    LoadState { state_name: String, block_id: String }
-    Expose { domain: String, mappings: Vec<(String, String)> }
-    Emit { effect: MclEffectCommand }
-MclDomainValue：公开枚举，Clone + Debug
-    Unit
-    Inner(BlockInner)
-    Paths(Vec<BlockPath>)
-    Message(MclMessage)
-    ResourceImport(ResourceImportReceipt)
-    Text(String)
-MclCommandValue = MclDomainValue：命令值，公开类型别名
-MclPendingEffectKind：公开枚举，Clone + Debug + PartialEq + Eq
-    Inference
-    ToolCall { expected: usize }
-```
+InnerType：字段类型，公开枚举
+    Message
+    Tool
+    Sandbox
 
-ToolCall 是 effect 参数，不是 Block inner。Paths 保留公开协议/转换分支，但当前操作没有产生它的成功执行路径；Text 由兼容 CapturedInferenceResponse 分支产生，普通 inference 返回 Message。
+BlockInner：字段数组，公开枚举
+    Message(Vec<AgentMessage>)
+    Tool(Vec<CallableResource>)
+    Sandbox(Vec<SandboxValue>)
+
+CallableResource：可调用资源值，公开结构体
+    resource_id: ResourceID--具体资源身份
+    alias: String--本地模型调用名
+    definition: Arc<CallableDefinitionSnapshot>--描述、schema及Tool具体执行材料快照
+
+SandboxValue：沙箱资源值，公开结构体
+    resource_id: ResourceID
+    policy: Arc<str>--不可变策略快照
+
+ImportedValue：明确类型绑定，公开枚举
+    Message { resource_id: ResourceID, messages: Arc<[AgentMessage]> }
+    Tool(CallableResource)
+    Sandbox(SandboxValue)
+
+ImportBindings：Agent本地alias绑定，公开共享类型
+    bindings: BTreeMap<String, ImportedValue>--私有唯一命名权威，公开get及受检WorldAgentExt访问，不复制另一份全局alias索引
+
+StoredBlockInner：数据库字段值，公开共享枚举
+    Message(Vec<AgentMessage>)--完整消息结构，inject容器不拆
+    Tool(Vec<ResourceID>)--身份列表，不序列化schema/脚本路径/句柄
+    Sandbox(Vec<ResourceID>)--身份列表，不序列化policy定义
+
+ArrayEvaluationContext：异步读取准备，私有结构体
+    database: AgentBlockStorageHandle--受检取得的数据库视图
+    agent_id: ResourceID--持久命名空间
+    instance: DriverLuaVmInstance--TEMP命名空间
+    imports: ImportBindings--本次解析资源ID所需的不可变导入快照
+    cancel: CancellationToken
+
+ArrayExpression：有序读取表达式，私有类型
+    sources: Vec<ArraySource>
+
+ArraySource：读取来源，私有枚举
+    Alias(String)
+    Selector(Selector)
+
+ArrayParameter：完整数组参数，私有枚举
+    Expression(ArrayExpression)
+    Manual { index: usize }
+    Empty--仅INJECT []，不新增内联JSON文本数组语法
+
+ToolCall：assistant字段纯值，公开结构体
+    id: String
+    tool_name: String
+    arguments: String
+    说明：保留消息和Provider请求结构，但删除作为Block数组、GET结果或effect独立调用数组的用途。
+```
 
 # error
 
-## 类型
-
-公开：
+## 逻辑
 
 ```text
-MclError：公开枚举，Clone + Debug + PartialEq + Eq
-    ParseFailed
-    InvalidAgentId
-    AgentMissing
-    DuplicateAgent
-    AgentRuntimeMissing
-    BlockMissing { assembly: String, block: String }
-    InnerMissing { block: String, inner: String }
-    RefBlockMissing { assembly: String, block: String }
-    MergeMissing { block: String, merge: String }
-    TypeMismatch
-    BindingMissing
-    InvalidCommand
-    ImportMissing(String)
-    ImportFailed
-    ImportResponseMismatch
-    MessageSourceUnavailable
-    EffectAlreadyPending
-    EffectResponseMismatch
-    EffectFailed(String)
-    TurnMissing
-    TurnMismatch
-    MailboxFailed
-    InferenceFailed
-    ToolCallInvalid
-    EffectInvalid
-    SourceReadFailed
-    InvalidResourceId
-    SourceTooLarge
-    SourceInvalidUtf8
-    ImportCycle
-    InvalidProgramKind
-    impl fmt::Display for MclError
-        fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
-            格式化错误：公开trait方法
-            行为：write!(f, "{self:?}")，按 Debug 显示。
-    impl std::error::Error for MclError--无自定义方法
-    impl From<resource_id_plugin::ResourceIdLookupError> for MclError
-        from(error: resource_id_plugin::ResourceIdLookupError) -> Self
-            转换查询错误：公开trait方法
-            行为：Missing -> AgentMissing，Duplicate -> DuplicateAgent，PluginMissing -> AgentRuntimeMissing。
+新增目标错误必须区分导入声明类型不匹配、alias绑定冲突、alias未导入、数组混型及资源能力不支持。
+普通错误完成本请求，不自动终止整个Driver，不以领域异常代替指令回执。
+StorageCommitUnknown明确表示提交事实不确定，不能投影成Cancelled或确认回滚；真实worker已退出且无未清理事务时可完成Other活动。
+StorageCleanupFailed表示回滚或事务清理仍未完成；保留Other活动并mark_cleanup_failed，关闭作用域及队列受理，执行作用域wait_all与drain wait返回清理失败，禁止虚假确认stop成功。取消审计本身的CleanupFailed也通过drain.mark_cleanup_failed报告，而不是永久等待无回执。
+已有停止、取消、幂等历史、history_error及完整Entity关联保持不变。
+旧RESOURCE/TOOL_CALL字段已迁移；Driver工具回合直接传单条Assistant消息数组，不保留work.calls。宿主与网络输出采用安全投影，不序列化完整调用执行材料或沙箱策略。
 ```
 
-## 使用边界与覆盖
+## 目标验收
 
-六文件非测试逻辑没有构造 `InnerMissing`、`MergeMissing`、`MailboxFailed`、`InferenceFailed`、`SourceReadFailed`、`SourceTooLarge`、`SourceInvalidUtf8`、`ImportCycle`、`InvalidProgramKind`。保留错误变体不证明对应功能存在。大量 AgentMcl 错误折叠为 TypeMismatch，Provider 错误折叠为 ImportFailed；EffectFailed 保留外部字符串。BlockMissing/RefBlockMissing 仅少数明确读取处保留字段，不是所有缺字段都有精细分类。
+```text
+数据库Block与finish_turn已实现；parser纯函数测试仍可使用AgentBlock作为不执行I/O的输入fixture，Agent运行时不保存该内存容器。
+验证重启恢复MESSAGE/TOOL/SANDBOX、TEMP不恢复、schema冲突保留旧数据、跨选择器事务快照、取消与提交事实、历史无隐式联动。
+finish_turn清空当前turn，已为空成功，返回Unit；start_turn保持生成新代号。不改StopAgent/Driver停止含义。
+```
 
-完整阅读范围：lib 17、system 1625、handler 1185、events 57、types 202、error 80 行（含测试以识别边界）；本文覆盖本地全部非测试类型、字段、变体、方法、trait 实现与自由函数。另核对 AgentMcl 的 merge/ref_merge/replace_range/bind_state/merge_block 委托语义。外部 Provider/组件/资源库内部实现不在六文件内展开；这里只陈述实际调用，不承诺端到端事务或资源生命周期保证。
+## 已实现的准备阶段收口
+
+每条受理命令只解析一次并登记一个Other准备活动；审计及SQLite操作均在阻塞工作线程，真实join后mark_completed。GET包括纯alias也走数据库入口，INJECT不materialize资源定义，仅持久化ResourceID。effect的所有独立参数合成一次Get(expressions)，在一个读事务中读取，随后按启动时owned ImportBindings快照按ID与kind解析当前资源定义。只含alias/manual的effect不额外发送Block RPC。
+
+MclAsyncPhase的Completed、PreparedEffect与PreparedImport避免将准备结果重新排回队首；准备结果携带pending.cancel，已取消的Prepared阶段不提交领域动作。已确认提交的CREATE/INJECT成功不因其后取消改成Cancelled。外部领域阶段继承同一取消token，避免准备与继续之间丢失来源取消。
+
+停止或来源取消的未开始命令被移出FIFO，一批worker追加取消审计，MclCancelledOutput真实join后派发回执并减少cancel_audits。即使作用域已关闭不能登记新Other活动，drain仍等待这些cleanup-owned审计批次。合法history_append一次消息批次不附加outer command audit；类型或容器校验失败只记录指令审计。任何推理、工具、GET或INJECT结果都不隐式保存message。

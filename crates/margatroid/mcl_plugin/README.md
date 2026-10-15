@@ -3,7 +3,7 @@
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
 
-新 MCL 的当前实现说明见 [DESIGN-NEXT.md](<DESIGN-NEXT.md>)。[DESIGN.md](<DESIGN.md>) 仅归档重写前 revision `7c9055c` 的旧实现；旧 REF/MERGE/BIND/LOAD/EXPOSE、visibility 与 history_record 路径已删除，不再受理。
+当前实现说明见 [DESIGN.md](<DESIGN.md>)。旧 REF/MERGE/BIND/LOAD/EXPOSE、visibility 与 history_record 路径已删除，不再受理。
 
 ## 已实现的数据库 Block
 
@@ -66,7 +66,7 @@ IMPORT、inference、tool_call 通过领域请求共享一次性 Sender 槽、MC
 
 IMPORT 资源必须精确属于 image_dependencies；无 builtin 隐含例外。声明类型必须匹配资源种类，alias 不能包含点、允许连字符。同 Agent alias 跨类别唯一，同 ID 重命名移除旧 alias；冲突在提交 loader 前检查，并在 loader 主线程收口再次检查，挂载失败回滚绑定。IMPORT 仅加载与绑定，不自动注入或执行。工具本次可见集合来自 TOOL 数组中的不可变快照，alias 冲突在准备阶段拒绝；每项执行失败或不可见结果均保留输入调用 ID 和顺序。推理结果保留 usage 和 stop_reason。
 
-tool_call 第一参数必须恰好一条 Assistant，直接从其 tool_calls 提取请求；不再使用 work.calls 或 TOOL_CALL 字段。调用 ID 与名称非空、批次 ID 唯一，可见 TOOL alias 冲突整批拒绝。空调用同步返回 typed MESSAGE 空数组且不提交任务；Hook 导入合法但执行语义未支持，明确返回失败。
+tool_call 第一参数必须恰好一条 Assistant，直接从其 tool_calls 提取请求；不再使用 work.calls 或 TOOL_CALL 字段。调用 ID 与名称非空、批次 ID 唯一，可见 TOOL alias 冲突整批拒绝。空调用同步返回 typed MESSAGE 空数组且不提交任务。TOOL 仅允许 tool 资源；旧 skill/hook ID 在导入时拒绝。
 
 数据库 Block、指令审计及显式消息历史均在阻塞工作线程执行，不在主 ECS 做 SQLite I/O。除合法 history_append 外，指令历史在执行前单独事务写入，失败不执行。message 历史完全由显式 history_append 控制；推理和工具只返回结果，不自动追加 assistant、工具成功或失败消息。显式追加失败返回 history_append 错误，不重新执行原推理或工具。此机制不是跨网络、Block 与历史的全局事务。System 消息保留上下文角色，但 history_append 会递归拒绝直接或嵌套 Inject 中的 System。输入 Assistant 和工具结果均不自动写 message 历史；需要保存时由 Driver 显式追加。
 

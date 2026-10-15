@@ -135,7 +135,7 @@ fn persistent_restart_preserves_full_message_ids_and_history_is_separate() {
     inject(&db, &c, selector("session", "messages"), messages.clone());
     let tools = StoredBlockInner::Tool(vec![
         ResourceID::parse("tool:local/bash").unwrap(),
-        ResourceID::parse("skill:local/review:v1").unwrap(),
+        ResourceID::parse("tool:local/review:v1").unwrap(),
     ]);
     let sandboxes =
         StoredBlockInner::Sandbox(vec![ResourceID::parse("sandbox:local/write").unwrap()]);
@@ -383,6 +383,7 @@ fn async_handle_and_history_view_share_database_and_worker_commit_truth() {
     handle
         .history()
         .append(memory_plugin::HistoryRecord {
+            created_at_ms: 0,
             key: "one".into(),
             source: "test".into(),
             turn: None,

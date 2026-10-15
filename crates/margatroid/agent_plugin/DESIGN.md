@@ -94,7 +94,7 @@ AgentPlugin：Agent生命周期插件，公开结构体
                 要求运行计划、公共事件与统一资源基础设施可用，拒绝重复安装
                 调用register_library::<Agent>("agent")注册图书馆类型
                 挂载start_agent_system、stop_agent_system和agent_exception_system
-                不注册资源类型，tool、skill、hook、prompt、sandbox分别由其资源插件注册
+                不注册资源类型，tool、prompt、sandbox分别由其资源插件注册
                 不直接依赖Workspace、AgentImage或Driver VM插件的Handler和安装标记
 ```
 
@@ -171,11 +171,9 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
     Agent Entity
         Agent--唯一LibraryComponent，内部保存resourceid
         ResourceSet<ToolResource>
-        ResourceSet<SkillResource>
-        ResourceSet<HookResource>
         ResourceSet<PromptResource>
         ResourceSet<SandboxResource>
-    五个集合均为ResourcesComponent，可与Agent共同挂载
+    三个集合均为ResourcesComponent，可与Agent共同挂载
     启动时挂载空集合，不等于把镜像依赖全部预加载；后续导入通过各资源加载插件更新
     不挂独立ResourceId组件，不使用ResourceRef、ResourceOwners或资源GC
 
@@ -271,7 +269,7 @@ handle_start_agent(world: &mut World, request: StartAgent)
         取得模型配置、项目路径、Driver源码及声明的依赖地址，构造独立启动快照
         异步blocking worker按现有history_path打开一个Agent SQLite数据库及Block/history分表，取得AgentDatabaseHandle与其AgentHistoryHandle视图；失败返回DatabaseSetupFailed，不发VM请求，ECS主线程不做SQLite IO
         数据库准备结果按operation_id及完整Workspace Entity收口，再核对工作区逻辑身份、唯一寻址、启动受理门未关闭及Agent地址仍无占用；迟到或重复结果不推进其他请求。
-        通过复核后创建Agent Entity，通过受检图书馆入口挂载Agent，并挂载五种空资源集合
+        通过复核后创建Agent Entity，通过受检图书馆入口挂载Agent，并挂载三种空资源集合
         info保存配置，workspace保存工作区ResourceID，sandbox初始为空，lua初始化空wake槽位、空ready与ended暂存槽位和空关闭句柄，execution初始化共享开放作用域，database保存已打开句柄、history为同文件历史视图，不加载Block内容到Agent，import_bindings初始化为空唯一RAM绑定表，mcl.commands为空VecDeque、mcl.pending为None、mcl.drained初始已收口，turn为None
         生成包含进程session nonce及单调序号的VM启动子请求ID，跨进程重启不复用TEMP instance；先将原StartAgent请求ID和子请求ID写入Creating
         整理agent_info注入环境，包含实例描述、Agent/Workspace/Image地址、项目/主目录、完整依赖列表及模型选择/采样参数
@@ -310,7 +308,7 @@ handle_stop_driver_lua_vm_result(world: &mut World, event: StopDriverLuaVmResult
         成功结果必须保证Driver、作用域全部活动真实清理和MCL队列回执收口均完成；保存等待回复的请求ID，销毁Agent，再逐个发送StopAgentResult::Ok(原Entity)
         停止失败时保留Agent、通知存储和关闭句柄，清空本次在途请求标记，向全部等待者发送DriverStopFailed错误
         失败后仍为Stopping；不承诺已消费ended后可直接重试，不将还可能运行的执行体与宿主分离
-        Entity销毁时五种资源集合和历史句柄自然释放，不删除历史记录或磁盘资源包
+        Entity销毁时三种资源集合和历史句柄自然释放，不删除历史记录或磁盘资源包
 
 handle_driver_lua_vm_exception_result(world: &mut World, event: DriverLuaVmExceptionResult)
     处理Driver异常结果：crate公开函数
@@ -516,7 +514,7 @@ MclPending：异步队首关联，公开类型--随队列定义于共享agent_co
 ImportBindings与ImportedValue：共享导入绑定契约，具体定义由types统一维护
     bindings: BTreeMap<String, ImportedValue>--ImportBindings唯一私有字段，alias在整个Agent内唯一
     说明：ImportedValue::Message { resource_id, messages: Arc<[AgentMessage]> }保留prompt来源；Tool(CallableResource)/Sandbox(SandboxValue)由typed值自身保留来源ID，不重复身份字段。
-        CallableResource保留resource_id、alias及Arc<CallableDefinitionSnapshot>，定义分Tool/Skill/Hook typed变体；SandboxValue保留resource_id及Arc策略。
+        CallableResource保留resource_id、alias及Arc<CallableDefinitionSnapshot>，定义分Tool typed变体；SandboxValue保留resource_id及Arc策略。
         Callable定义固定描述、schema和路径等字段，不冻结路径对应的磁盘正文；执行仍按既有路径读取，不宣称文件内容版本快照。
         ImportBindings.get提供只读alias查询，contains_resource核对来源ID和kind；持久Block GET另按ID/kind在当前已导入绑定resolve，未导入显式失败。
         同alias不同ID跨类型也拒绝；成功重载使后续GET取得最新定义，已取GET及execution提交快照不暗变；没有重复资源正文及额外registries。
@@ -570,7 +568,7 @@ ExecutionActivityState：活动登记状态，公开共享内部结构体
 ExecutionActivityKind：执行活动类别，公开枚举
     Inference--停止时取消并等待，不阻止沙箱切换，不被agent_cleanup_tasks取消
     Sandbox--普通runner或长期进程，真实清理前阻止沙箱切换
-    Other--skill、IMPORT及一般无沙箱异步活动；停止取消并等待，不阻止沙箱切换，不被单独Sandbox清理取消
+    Other--IMPORT及一般无沙箱异步活动；停止取消并等待，不阻止沙箱切换，不被单独Sandbox清理取消
 
 ExecutionActivity：活动登记句柄，公开共享类型
     id: ActivityID--作用域内唯一关联
@@ -623,14 +621,14 @@ HistoryRecord：历史增量记录，公开共享类型
 
 移除旧聚合：
     AgentCreationState、AgentInitializationState、AgentLuaState和AgentLifecycleState由新的state和lua替代
-    删除AgentResourceMap、AgentResourceEntry和Agent内复制的资源内容，以五种ResourceSet替代
+    删除AgentResourceMap、AgentResourceEntry和Agent内复制的资源内容，以三种ResourceSet替代
     Agent不再包含AgentInferenceState、AgentToolState及其pending表；执行结果由所属领域管理，公共取消、沙箱互斥及真实完成等待统一在execution，不丢弃在执行任务
     不在Agent保存AgentTurnState、TokenUsageState和last_error等旧聚合字段；只保留turn代号，start_turn生成并替换，finish_turn清空且空值幂等成功，旧finish拒绝
     MCL指令审计由MCL负责：除合法history_append外先记录成功才执行；message历史只由显式history_append控制，inference与tool_call不追加任何结果消息
     history_append自身采用批量事务接口，失败是该显式请求的错误；不隐式保存消息，不重跑已完成的推理或工具
     AgentMessage是共享types消息值，包含System（inject/system/user/assistant/tool_call/error），不实现旧路由Event；inject(Vec<AgentMessage>)递归同类型
     IMPORT MESSAGE prompt:... AS alias按实际role生成消息，infer支持System；不能将所有prompt强制转为System或User
-    IMPORT TOOL tool:.../skill:.../hook:... AS alias与IMPORT SANDBOX sandbox:...使用同一Agent全域alias受检入口；hook执行行为尚未确认，TOOL导入类别不等于已有hook执行支持
+    IMPORT TOOL tool:... AS alias与IMPORT SANDBOX sandbox:...使用同一Agent全域alias受检入口；旧skill/hook导入明确拒绝
     tool_call effect第一MESSAGE数组恰好包含一个Assistant，第二参数为TOOL数组，从Assistant.tool_calls执行并返回MESSAGE结果；empty calls返回MESSAGE空数组
     重复调用id、多个Assistant及工具alias冲突在任何submit前失败；tool_call effect不重复记输入Assistant，按call id/index记执行结果
     tool_call结果消息的resource_id为Option<ResourceID>，无匹配工具为None，不虚构资源地址；其余正文、usage及错误字段遵循共享消息值契约

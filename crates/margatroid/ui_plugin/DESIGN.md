@@ -65,6 +65,23 @@ content_type(path: &str) -> &'static str
 
 前端连接：
     ui 的默认后端地址取同源（页面协议与主机拼出 /ws），因此从 daemon 地址打开即可直接工作
+
+历史展示：
+    新message记录从content取得正文，从payload取得type、reasoning、tool_calls、usage与工具关联数据
+    Error从content还原message文本，Inject保留payload中的完整嵌套messages并递归展示
+    兼容旧payload中的完整消息正文，不修改旧数据库行；普通消息只在对话区渲染，MCL审计在右侧可展开面板渲染
+    时间使用created_at_ms；0或无效时间显示Time unavailable，不渲染为epoch本地时间
+
+上下文用量：
+    从AgentStateDto.context_window_tokens取得与Lua环境一致的启动模型窗口快照；缺失时不猜测
+    从当前Agent历史中最近一条assistant取得usage.input_tokens加usage.output_tokens，嵌套Inject递归处理
+    不将cache_hit_tokens重复相加，不以历史累计In/Out替代上下文占用；最近assistant无usage则显示未知
+    百分比为上述最近用量除以窗口；圆圈绘制比例限制在0到1，文字保留真实百分比，未知显示横线
+    该值是最近推理返回的usage，不声称实时计量之后新追加的消息或工具输出
+
+资源面板：
+    左下角收起态只显示小三角与资源面板文字，不排列可用工具名称
+    点击切换展开；展开态保留Sandbox选择及统一Tools可见性列表，不改变资源加载和调用语义
 ```
 
 ## 边界

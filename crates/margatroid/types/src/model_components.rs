@@ -1,6 +1,9 @@
-use core_plugin::Resource;
+use core_plugin::{Component, Resource};
 use std::collections::HashMap;
 
+/// Non-sensitive model metadata, captured on each agent at admission.
+/// The component remains the same snapshot used by its Lua startup environment,
+/// even when the configured route catalog is subsequently reloaded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelRuntimeInfo {
     pub id: String,
@@ -11,6 +14,7 @@ pub struct ModelRuntimeInfo {
     pub thinking: Option<String>,
     pub reasoning_effort: Option<String>,
 }
+impl Component for ModelRuntimeInfo {}
 
 /// Non-sensitive projection of configured routes, not an inference routing authority.
 ///

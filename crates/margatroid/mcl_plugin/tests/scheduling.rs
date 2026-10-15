@@ -540,6 +540,37 @@ fn pending_blocks_tail_stop_keeps_head_and_completion_is_correlated() {
 }
 
 #[test]
+fn history_append_splits_text_and_preserves_nested_inject_messages() {
+    let mut app = app();
+    let (agent, store) = spawn(&mut app, "a");
+    let messages = json!([
+        {"type":"user","content":"hello"},
+        {"type":"error","message":"failed"},
+        {"type":"inject","messages":[{"type":"inject","messages":[{"type":"user","content":"nested"}]}]}
+    ]);
+    enqueue_mcl_command(
+        app.world_mut(),
+        request(
+            "split",
+            "a",
+            "EMIT EFFECT history_append ?",
+            vec![messages.clone()],
+        ),
+    );
+    pump(&mut app, agent);
+    let records = store.list().unwrap();
+    assert_eq!(records.len(), 3);
+    assert!(records.iter().all(|record| record.kind == "message"));
+    assert_eq!(records[0].content, "hello");
+    assert_eq!(records[0].payload, json!({"type":"user"}));
+    assert_eq!(records[1].content, "failed");
+    assert_eq!(records[1].payload, json!({"type":"error"}));
+    assert_eq!(records[2].content, "");
+    assert_eq!(records[2].payload, messages[2]);
+    assert_eq!(*store.message_batches.lock().unwrap(), 1);
+}
+
+#[test]
 fn wake_latches_and_ready_delivers_once_and_append_has_no_command_record() {
     let mut app = app();
     let (a, store) = spawn(&mut app, "a");
@@ -698,7 +729,11 @@ fn real_inference_reply_unblocks_fifo_and_keeps_submission_turn() {
     let records = store.list().unwrap();
     assert_eq!(records.len(), 3);
     assert_eq!(records[2].kind, "message");
-    assert_eq!(records[2].payload, json!(message));
+    let (content, payload) = margatroid_types::history_components::message_history_parts(&message);
+    assert_eq!(records[2].content, content);
+    assert_eq!(records[2].payload, payload);
+    assert_eq!(records[2].content, "actual");
+    assert!(records[2].payload.get("content").is_none());
     assert_eq!(*store.message_batches.lock().unwrap(), 1);
 }
 
@@ -1169,8 +1204,13 @@ fn real_tool_batch_returns_ordered_failures_and_only_caller_selected_messages_ar
     pump(&mut app, a);
     let records = store.list().unwrap();
     assert_eq!(records.len(), 3);
-    assert_eq!(records[1].payload, payloads[0]);
-    assert_eq!(records[2].payload, payloads[2]);
+    for (record, message) in records[1..].iter().zip(&selected) {
+        let (content, payload) =
+            margatroid_types::history_components::message_history_parts(message);
+        assert_eq!(record.content, content);
+        assert_eq!(record.payload, payload);
+        assert!(record.payload.get("content").is_none());
+    }
     assert_eq!(*store.message_batches.lock().unwrap(), 1);
 }
 
@@ -1469,11 +1509,14 @@ fn all_rejected_tools_return_failures_without_implicit_messages_and_append_once(
     let records = store.list().unwrap();
     assert_eq!(records.len(), 3);
     assert_eq!(records[0].kind, "mcl");
-    assert_eq!(
-        records[1].payload,
-        json!(serde_json::from_value::<AgentMessage>(selected[0].clone()).unwrap())
-    );
-    assert_eq!(records[2].payload, selected[1]);
+    for (record, value) in records[1..].iter().zip(&selected) {
+        let message = serde_json::from_value::<AgentMessage>(value.clone()).unwrap();
+        let (content, payload) =
+            margatroid_types::history_components::message_history_parts(&message);
+        assert_eq!(record.content, content);
+        assert_eq!(record.payload, payload);
+        assert!(record.payload.get("content").is_none());
+    }
     assert_eq!(*store.message_batches.lock().unwrap(), 1);
 }
 

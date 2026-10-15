@@ -6,9 +6,7 @@ use margatroid_types::{
     history_components::HistoryRecord,
     mcl_events::{MclCommand, MclCommandResult, MclInstruction, MclValue},
     message_types::{AgentMessage, TokenUsage, ToolCall},
-    resource_components::{
-        skill_input_schema, CallableDefinitionSnapshot, CallableResource, SandboxValue,
-    },
+    resource_components::{CallableDefinitionSnapshot, CallableResource, SandboxValue},
     workspace_components::{
         Workspace, WorkspaceAgentDefinition, WorkspaceDefinition, WorldWorkspaceExt,
     },
@@ -531,13 +529,6 @@ impl FromDomain<&CallableResource> for CallableResourceDto {
                 definition.description.clone(),
                 definition.input_schema.clone(),
             ),
-            CallableDefinitionSnapshot::Hook(definition) => (
-                definition.description.clone(),
-                definition.input_schema.clone(),
-            ),
-            CallableDefinitionSnapshot::Skill(definition) => {
-                (definition.description.clone(), skill_input_schema())
-            }
         };
         Ok(Self {
             resource_id: (&value.resource_id).into_dto(())?,
@@ -821,6 +812,9 @@ pub struct AgentStateDto {
     pub sandbox: Option<ResourceIdDto>,
     pub queued_commands: usize,
     pub pending_command: Option<String>,
+    /// Actual model window captured at admission, matching the Lua startup snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ProtocolErrorDto>,
 }
@@ -858,6 +852,9 @@ impl FromDomain<Entity, &World> for AgentStateDto {
                 .pending
                 .as_ref()
                 .map(|pending| pending.command_id.clone()),
+            context_window_tokens: world
+                .get_component::<margatroid_types::model_components::ModelRuntimeInfo>(entity)
+                .map(|model| model.context_window_tokens),
             error: world.get_component::<AgentFailure>(entity).map(|failure| {
                 ProtocolErrorDto::new(format!("{:?}", failure.0.kind), failure.0.message.clone())
             }),
@@ -870,7 +867,10 @@ pub struct HistoryMessageDto {
     pub sequence: i64,
     pub turn: Option<String>,
     pub kind: String,
+    /// Message text, error text, or MCL command text; Inject envelopes use empty text.
     pub content: String,
+    /// Message discriminator and metadata without top-level text. Legacy rows may
+    /// still contain complete messages; projections preserve them unchanged.
     pub payload: serde_json::Value,
     pub created_at_ms: i64,
 }
@@ -886,7 +886,7 @@ impl FromDomain<(usize, HistoryRecord)> for HistoryMessageDto {
             kind: record.kind,
             content: record.content,
             payload: record.payload,
-            created_at_ms: 0,
+            created_at_ms: record.created_at_ms,
         })
     }
 }

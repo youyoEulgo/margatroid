@@ -10,6 +10,8 @@ memory_plugin提供一个真实SQLite backend，不提供RAM Block backend。一
 
 Agent只保存AgentDatabaseHandle及同文件AgentHistoryHandle视图，不保存AgentBlock/BlockAssembly内存内容。SQL及连接管理留在本模块，opaque共享句柄不暴露Connection。历史是只追加领域；Block是显式CREATE/GET/INJECT管理的数据，不能用history恢复拼接Block，也不重建旧state表接口。
 
+历史created_at_ms持久保存真实Unix毫秒时间；未指定时间的新记录在事务写入时取得当前时间，幂等重试不覆盖已存时间。旧history_records表缺少时间列时通过事务迁移增加列，旧行保留0表示不可恢复的未知时间；不得以迁移时间、文件修改时间或sequence推测旧时间。协议直接投影已存值，历史顺序仍以sequence为准。
+
 ## 类型
 
 ```text

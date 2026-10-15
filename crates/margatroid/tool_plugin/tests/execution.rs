@@ -9,8 +9,8 @@ use margatroid_types::block_storage::AgentDatabaseHandle;
 use margatroid_types::execution_components::{AgentExecutionScope, ExecutionActivityKind};
 use margatroid_types::message_types::{AgentMessage, ToolCall};
 use margatroid_types::resource_components::{
-    AgentImageModelConfig, CallableDefinitionSnapshot, CallableResource, HookResource,
-    SandboxResource, SandboxValue, SkillResource, ToolResource,
+    AgentImageModelConfig, CallableDefinitionSnapshot, CallableResource, SandboxResource,
+    SandboxValue, ToolResource,
 };
 use memory_plugin::SqliteAgentDatabase;
 use resource_id_plugin::{ResourceID, ResourceSet};
@@ -110,22 +110,6 @@ fn bind(app: &mut App, entity: Entity, resource: &ResourceID) {
                 .unwrap()
                 .clone(),
         ),
-        "skill" => CallableDefinitionSnapshot::Skill(
-            app.world()
-                .get_component::<ResourceSet<SkillResource>>(entity)
-                .unwrap()
-                .get(resource)
-                .unwrap()
-                .clone(),
-        ),
-        "hook" => CallableDefinitionSnapshot::Hook(
-            app.world()
-                .get_component::<ResourceSet<HookResource>>(entity)
-                .unwrap()
-                .get(resource)
-                .unwrap()
-                .clone(),
-        ),
         _ => panic!("unsupported fixture"),
     };
     let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
@@ -155,33 +139,14 @@ fn submit(
     oneshot::Receiver<Result<ToolExecuteResponse, ToolError>>,
 ) {
     let (tx, rx) = oneshot::channel();
-    let definition = match resource.resource_type() {
-        "tool" => CallableDefinitionSnapshot::Tool(
-            app.world()
-                .get_component::<ResourceSet<ToolResource>>(entity)
-                .unwrap()
-                .get(&resource)
-                .unwrap()
-                .clone(),
-        ),
-        "skill" => CallableDefinitionSnapshot::Skill(
-            app.world()
-                .get_component::<ResourceSet<SkillResource>>(entity)
-                .unwrap()
-                .get(&resource)
-                .unwrap()
-                .clone(),
-        ),
-        "hook" => CallableDefinitionSnapshot::Hook(
-            app.world()
-                .get_component::<ResourceSet<HookResource>>(entity)
-                .unwrap()
-                .get(&resource)
-                .unwrap()
-                .clone(),
-        ),
-        _ => panic!("unsupported fixture"),
-    };
+    let definition = CallableDefinitionSnapshot::Tool(
+        app.world()
+            .get_component::<ResourceSet<ToolResource>>(entity)
+            .unwrap()
+            .get(&resource)
+            .unwrap()
+            .clone(),
+    );
     let request = ToolExecuteRequest {
         id: "request".into(),
         agent: entity,
@@ -266,22 +231,15 @@ async fn actual_runner_preserves_alias_context_and_raw_string() {
     );
 }
 #[tokio::test]
-async fn skill_empty_object_direct_body_and_invalid_arguments() {
+async fn tool_empty_object_body_and_invalid_arguments() {
     let (mut app, entity, root) = fixture(ToolExecutionLimits::default());
-    let path = root.path().join("SKILL.md");
-    std::fs::write(&path, "# skill\nbody").unwrap();
-    let resource = id("skill", "skill");
-    let mut set = ResourceSet::new();
-    set.insert(
-        resource.clone(),
-        SkillResource {
-            alias: "keep-alias".into(),
-            description: "skill".into(),
-            content_path: path,
-        },
+    let resource = add_tool(
+        &mut app,
+        entity,
+        root.path(),
+        "function execute() return '# context\\nbody' end",
+        serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
     );
-    assert!(app.world_mut().insert_component(entity, set));
-    bind(&mut app, entity, &resource);
     let sandbox = app
         .world()
         .get_component::<Agent>(entity)
@@ -292,7 +250,7 @@ async fn skill_empty_object_direct_body_and_invalid_arguments() {
     let (_, rx) = submit(&app, entity, resource.clone(), "{}");
     assert_eq!(
         content(response(&mut app, rx).await.unwrap()),
-        "# skill\nbody"
+        "# context\nbody"
     );
     sandbox.mark_completed().unwrap();
     let (_, rx) = submit(&app, entity, resource, "{\"extra\":true}");
@@ -302,7 +260,7 @@ async fn skill_empty_object_direct_body_and_invalid_arguments() {
     );
 }
 #[tokio::test]
-async fn invalid_schema_and_hook_rejected_before_activity() {
+async fn invalid_schema_rejected_before_activity() {
     let (mut app, entity, root) = fixture(ToolExecutionLimits::default());
     let resource = add_tool(
         &mut app,
@@ -316,23 +274,35 @@ async fn invalid_schema_and_hook_rejected_before_activity() {
         response(&mut app, rx).await.unwrap_err().kind,
         ToolErrorKind::InvalidDefinition
     );
-    let (mut app, entity, root) = fixture(ToolExecutionLimits::default());
-    let mut hooks = ResourceSet::new();
-    hooks.insert(
-        id("hook", "hook"),
-        HookResource {
-            alias: "keep-alias".into(),
-            description: "hook".into(),
-            input_schema: serde_json::json!({"type":"object"}),
-            script_path: root.path().join("never.lua"),
-        },
+    assert_eq!(
+        app.world()
+            .get_component::<Agent>(entity)
+            .unwrap()
+            .execution
+            .activity_count(),
+        0
     );
-    app.world_mut().insert_component(entity, hooks);
-    bind(&mut app, entity, &id("hook", "hook"));
-    let (_, rx) = submit(&app, entity, id("hook", "hook"), "{}");
+}
+#[tokio::test]
+async fn non_tool_identity_rejected_before_activity() {
+    let (mut app, entity, root) = fixture(ToolExecutionLimits::default());
+    let resource = add_tool(
+        &mut app,
+        entity,
+        root.path(),
+        "error('must not execute')",
+        serde_json::json!({"type":"object"}),
+    );
+    let unsupported = id("prompt", "not-callable");
+    let set = app
+        .world_mut()
+        .get_component_mut::<ResourceSet<ToolResource>>(entity)
+        .unwrap();
+    set.insert(unsupported.clone(), set.get(&resource).unwrap().clone());
+    let (_, rx) = submit(&app, entity, unsupported, "{}");
     assert_eq!(
         response(&mut app, rx).await.unwrap_err().kind,
-        ToolErrorKind::UnsupportedHook
+        ToolErrorKind::UnsupportedResource
     );
     assert_eq!(
         app.world()

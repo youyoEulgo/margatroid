@@ -41,7 +41,7 @@ types      src/types.rs      ResourceID、ResourceSet和类型注册表
 error      src/error.rs      解析、注册、挂载和查询错误
 ```
 
-**统一资源基础设施已实现。** 本crate继续使用resource_id_plugin名称，对外安装ResourcePlugin，合并旧resource_library_plugin和library_component_plugin职责；旧两个crate只保留归档文档，不再是workspace成员。ResourceID、集合、trait、注册与查询基础实现均在本crate，且仅依赖core_plugin和serde，可被共享types直接依赖而无业务反向依赖。
+**统一资源基础设施已实现。** 本crate继续使用resource_id_plugin名称，对外安装ResourcePlugin，合并旧resource_library_plugin和library_component_plugin职责；旧两个crate及其文档已移除，不再是workspace成员。ResourceID、集合、trait、注册与查询基础实现均在本crate，且仅依赖core_plugin和serde，可被共享types直接依赖而无业务反向依赖。
 
 # lib
 
@@ -125,13 +125,14 @@ WorldResourceExt：资源管理世界扩展，公开trait--定义及纯查询/�
 组件分类：
     一个领域Entity恰好有一个LibraryComponent，可以同时有多个不同具体类型的ResourcesComponent
     Agent、Workspace、Client属于图书馆组件，各自在组件内部保存自身ResourceID
-    ToolResource、SkillResource、PromptResource、SandboxResource、HookResource和AgentImage属于资源条目
+    ToolResource、PromptResource、SandboxResource和AgentImage属于资源条目
     资源条目通过ResourceSet<T>挂载，不把这些条目本身标为LibraryComponent
     AgentImage明确属于资源类，不再作为独立图书馆实体，不另挂旧ResourceId组件
 
-MCL目标分类（本轮尚未实现，不改变基础集合分类）：
-    IMPORT TOOL接受tool/skill/hook，IMPORT MESSAGE接受prompt，IMPORT SANDBOX接受sandbox
-    TOOL/MESSAGE/SANDBOX是MCL值能力分类，tool/skill/hook等仍使用原ResourceID类型段与具体ResourceSet
+MCL当前分类（不改变基础集合分类）：
+    IMPORT TOOL仅接受tool，IMPORT MESSAGE接受prompt，IMPORT SANDBOX接受sandbox
+    TOOL/MESSAGE/SANDBOX是MCL值能力分类，分别解析tool、prompt、sandbox资源类型和具体ResourceSet
+    Skill与Hook资源类型、资源插件及专用执行入口已移除，指导正文也由普通Tool返回
     RESOURCE不再是目标Block字段类型，但ResourcesComponent和ResourceID基础概念不删除或改名
     Agent.import_bindings是alias命名权威，受检导入跨集合检查冲突；本插件不新增全局alias表
     CallableResource与SandboxValue携带所属ID及不可变共享快照，旧Block值不因集合重载自动变更
@@ -268,10 +269,8 @@ validate_tag(value: &str) -> Result<(), ResourceIDError>
 注册与查询：
     业务插件在安装时用具体组件类型注册自己的地址类型
     tool -> ResourceSet<ToolResource>
-    skill -> ResourceSet<SkillResource>
     prompt -> ResourceSet<PromptResource>
     sandbox -> ResourceSet<SandboxResource>
-    hook -> ResourceSet<HookResource>
     image -> ResourceSet<AgentImage>
     agent -> Agent
     workspace -> Workspace
@@ -412,8 +411,7 @@ ResourceComponentKind：组件分类，公开共享枚举--定义于本基础cra
         Agent { resource_id: agent:demo/a:latest }
         ResourceSet<ToolResource>
             tool:local/bash:latest -> ToolResource { alias, description, input_schema, script_path }
-        ResourceSet<SkillResource>
-            skill:local/review:latest -> SkillResource
+            tool:local/review:latest -> ToolResource
         ResourceSet<AgentImage>
             image:local/coder:latest -> AgentImage
     Agent B Entity
@@ -503,7 +501,7 @@ ResourceError：资源管理错误，公开枚举
     删除独立ResourceId组件，把图书馆自身ID移入具体图书馆组件
     删除ResourceOwners、install_resource创建共享资源实体的模式及release_resource_owner回收模式
     LibraryComponent由空标记改为提供自身ID的方法，新增ResourcesComponent
-    原有ToolResource、SkillResource、PromptResource、SandboxResource、HookResource不再作为独立图书馆组件挂载
+    原有ToolResource、PromptResource、SandboxResource不再作为独立图书馆组件挂载
     AgentImage同样迁为ResourceSet<AgentImage>中的资源条目，删除其LibraryComponent身份
     移除依赖计数和资源GC计划，依靠实体拥有组件的生命周期释放资源条目
     Workspace等领域文档与本契约同步；基础设施不保留ResourceRef、独立镜像Entity或GC作为兼容目标

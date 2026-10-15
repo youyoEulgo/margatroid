@@ -12,7 +12,6 @@ use closure_plugin::{AppClosureExt, ClosurePlugin};
 use config_plugin::{ConfigPlugin, LogLevel as ConfigLogLevel};
 use core_plugin::App;
 use dto_plugin::DtoPlugin;
-use hook_resource_plugin::HookResourcePlugin;
 use inference_plugin::InferencePlugin;
 use log_plugin::{LogLevel, LogPlugin};
 use lua_runtime_plugin::LuaRuntimePlugin;
@@ -22,7 +21,6 @@ use prompt_resource_plugin::PromptResourcePlugin;
 use resource_id_plugin::ResourcePlugin;
 use sandbox_resource_plugin::SandboxResourcePlugin;
 use server_plugin::{AppServerExt, ServerOptions, ServerPlugin};
-use skill_resource_plugin::SkillResourcePlugin;
 use tool_plugin::ToolPlugin;
 use tool_resource_plugin::ToolResourcePlugin;
 use tracing::info;
@@ -81,8 +79,6 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(global_config)
         .add_plugin(ResourcePlugin)
         .add_plugin(ToolResourcePlugin::open(data_root.clone())?)
-        .add_plugin(SkillResourcePlugin::open(data_root.clone())?)
-        .add_plugin(HookResourcePlugin::open(data_root.clone())?)
         .add_plugin(PromptResourcePlugin::open(data_root.clone())?)
         .add_plugin(SandboxResourcePlugin::open(data_root.clone())?)
         .add_plugin(agent_images)
