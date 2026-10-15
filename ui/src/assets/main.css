@@ -1676,12 +1676,17 @@ textarea:focus-visible {
   display: grid;
   min-width: 0;
   min-height: 28px;
-  grid-template-columns: 6px minmax(0, 1fr) auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   padding: 0 6px;
   border-radius: 8px;
   transition: background-color 120ms var(--mg-ease);
+}
+
+.tool-resource-row > svg {
+  justify-self: center;
+  color: var(--mg-text-tertiary);
 }
 
 .tool-resource-row:hover {
@@ -2022,6 +2027,53 @@ textarea:focus-visible {
 /* ============================================================
    Activity / details panel
    ============================================================ */
+
+.activity-filter {
+  display: flex;
+  gap: 6px;
+  padding: 0 14px 10px;
+}
+
+.activity-filter button {
+  min-height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--mg-border);
+  border-radius: 999px;
+  color: var(--mg-text-tertiary);
+  background: var(--mg-bg-elevated);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.activity-filter button.active {
+  color: var(--mg-text-primary);
+  background: var(--mg-bg-active);
+}
+
+.mcl-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 6px;
+  border-bottom: 1px solid var(--mg-border-l1);
+}
+
+.mcl-entry code {
+  color: var(--mg-text-primary);
+  font-family: var(--mg-font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.mcl-entry small {
+  color: var(--mg-text-tertiary);
+  font-family: var(--mg-font-mono);
+  font-size: 10px;
+}
+
+.mcl-entry-result {
+  color: var(--mg-text-secondary);
+}
 
 .activity-panel {
   display: flex;

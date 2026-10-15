@@ -53,6 +53,7 @@ impl Event for DriverLuaVmException {}
 pub struct DriverLuaVmExceptionResult {
     pub exception_id: String,
     pub instance: DriverLuaVmInstance,
+    pub error: Option<LuaRuntimeError>,
     pub result: Result<(), LuaRuntimeError>,
     pub execution_ended: bool,
     pub cleanup_completed: bool,

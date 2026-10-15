@@ -74,7 +74,7 @@ build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefinition,
         id固定为agent:<workspace-name>/<agent-name>:latest，无成员tag字段
         home_root显式路径相对project_root；省略时读取并规范化真实HOME
         history_path显式路径相对project_root；省略时生成
-            <project_root>/.margatroid/history/<agent-name>.sqlite
+            <project_root>/.margatroid/<workspace-name>/history/<agent-name>.sqlite
     拒绝重复成员名称
     非空成员：manager缺省第一个成员，要求合法且存在
     空成员：manager缺省为空；显式空串合法，非空manager返回MissingManager

@@ -41,6 +41,14 @@ impl InferenceConfig {
     }
 }
 
+fn runtime_catalog(
+    routes: &HashMap<ModelId, ConfiguredModelRoute>,
+) -> margatroid_types::model_components::ModelRuntimeCatalog {
+    margatroid_types::model_components::ModelRuntimeCatalog::new(
+        routes.values().map(|route| route.runtime_info.clone()),
+    )
+}
+
 pub struct InferencePlugin {
     schedule: String,
     config_path: PathBuf,
@@ -107,6 +115,7 @@ impl Plugin for InferencePlugin {
             .unwrap_or_else(|_| panic!("HTTP client creation failed"));
         app.world()
             .send_async_closure(&self.schedule, || async { Ok::<(), AsyncTaskError>(()) });
+        app.world_mut().insert_resource(runtime_catalog(&routes));
         app.world_mut().insert_resource(InferenceConfig {
             path: self.config_path,
             factories,

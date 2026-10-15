@@ -160,7 +160,19 @@ function decodeMessage(
 }
 export const useWorkbenchStore = defineStore('workbench', () => {
   const endpoint = ref(defaultEndpoint());
-  const driverContextPath = ref('');
+  const driverContextPath = ref('entry.pending[-1]');
+  const lastFailures = ref(new Map<string, { message: string }>());
+  const driverResources = ref(
+    new Map<
+      string,
+      {
+        imports: Array<{ resource_id: string; alias: string; kind: string }>;
+        visible: Array<{ resource_id: string; alias: string }>;
+        activated: string[];
+      }
+    >(),
+  );
+  const canAbortTurn = computed(() => false);
   const connectionStatus = ref<ConnectionStatus>('offline');
   const connectionError = ref('');
   const registeredClient = ref<ClientInfo | null>(null);
@@ -173,6 +185,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const streams = ref(new Map<string, StreamEntry>());
   const pending = new Map<string, PendingCommand>();
   const completedStreams = new Set<string>();
+  const readCommands = new Set<string>();
   let socket: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let reconnectAttempt = 0;
@@ -193,8 +206,39 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       ) ?? null,
   );
   const selectedAgentReady = computed(() => selectedAgentState.value?.status === 'running');
-  const selectedAgentWorking = computed(() => !!selectedAgentState.value?.pending_command);
-  const loadedResources = computed(() => selectedAgentState.value?.resources ?? []);
+  const selectedAgentWorking = computed(
+    () => !!selectedAgentState.value?.turn || !!selectedAgentState.value?.pending_command,
+  );
+  const driverKey = computed(() =>
+    selectedAgentState.value
+      ? `${selectedWorkspaceKey.value}:${selectedAgentId.value}:${selectedAgentState.value.agent_instance}`
+      : '',
+  );
+  const driverState = computed(() => driverResources.value.get(driverKey.value));
+  const loadedResources = computed(
+    () => driverState.value?.imports.map((item) => item.resource_id) ?? [],
+  );
+  const resourceVisibility = computed(() => {
+    const state = driverState.value;
+    if (!state) return [];
+    const visible = new Set(state.visible.map((item) => item.resource_id));
+    return [
+      ...new Set([
+        ...state.imports.filter((item) => item.kind === 'Tool').map((item) => item.resource_id),
+        ...visible,
+      ]),
+    ]
+      .sort()
+      .map((resource) => ({ resource, visible: visible.has(resource), default: false }));
+  });
+  const sandboxOptions = computed(() => ({
+    options:
+      driverState.value?.imports
+        .filter((item) => item.kind === 'Sandbox')
+        .map((item) => item.resource_id)
+        .sort() ?? [],
+    activated: driverState.value?.activated ?? [],
+  }));
   const selectedHistory = computed(() =>
     histories.value.find(
       (h) => h.workspace.id === selectedWorkspace.value?.id && h.agent === selectedAgentId.value,
@@ -327,10 +371,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedWorkspaceKey.value = key;
     selectedAgent.value = null;
     queryHistory();
+    void refreshDriverResources();
   }
   function selectAgent(agent: string | null) {
     selectedAgent.value = agent;
     queryHistory();
+    void refreshDriverResources();
   }
   function executeMclCommand(
     command: string,
@@ -361,7 +407,16 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         pending.delete(id);
         reject(new Error('MCL result timed out; the backend command may still be running'));
       }, 120000);
-      pending.set(id, { resolve, reject, timeout });
+      if (command.trim().startsWith('GET ')) readCommands.add(id);
+      const failureKey = `${workspace.id}:${selectedAgentId.value}`;
+      pending.set(id, {
+        resolve,
+        reject: (error) => {
+          if (!readCommands.has(id)) lastFailures.value.set(failureKey, { message: error.message });
+          reject(error);
+        },
+        timeout,
+      });
       try {
         socket!.send(JSON.stringify(request));
       } catch (error) {
@@ -371,14 +426,160 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       }
     });
   }
-  function sendMessage(content: string): Promise<unknown> {
-    if (!content.trim()) return Promise.reject(new Error('Message is empty'));
-    try {
-      const instruction = contextInjection(content.trim(), driverContextPath.value);
-      return executeMclCommand(instruction.command, instruction.arguments);
-    } catch (error) {
-      return Promise.reject(error);
+  async function sendMessage(content: string): Promise<unknown> {
+    if (!content.trim()) throw new Error('Message is empty');
+    const key = driverKey.value;
+    const instruction = contextInjection(content.trim(), driverContextPath.value);
+    lastFailures.value.delete(`${selectedWorkspaceKey.value}:${selectedAgentId.value}`);
+    await executeMclCommand(instruction.command, instruction.arguments);
+    assertDriverRoute(key);
+    return executeMclCommand('EMIT EFFECT wake');
+  }
+  function importCandidates() {
+    const candidates = new Map<string, { resource_id: string; alias: string; kind: string }>();
+    for (const row of selectedHistory.value?.messages ?? []) {
+      const text =
+        isRecord(row.payload) && typeof row.payload.text === 'string'
+          ? row.payload.text
+          : row.content;
+      const match = /^IMPORT (MESSAGE|TOOL|SANDBOX) (\S+) AS ([A-Za-z_][A-Za-z0-9_-]*)$/.exec(
+        text.trim(),
+      );
+      if (match)
+        candidates.set(match[3]!, {
+          resource_id: match[2]!,
+          alias: match[3]!,
+          kind: match[1] === 'TOOL' ? 'Tool' : match[1] === 'SANDBOX' ? 'Sandbox' : 'Message',
+        });
     }
+    return [...candidates.values()];
+  }
+  const refreshing = new Set<string>();
+  const refreshedImports = new Map<string, string>();
+  function assertDriverRoute(key: string) {
+    if (driverKey.value !== key) throw new Error('Selected agent changed during the operation');
+  }
+  async function refreshDriverResources(force = false): Promise<void> {
+    const key = driverKey.value;
+    if (
+      !key ||
+      !selectedAgentReady.value ||
+      !socket ||
+      !registeredClient.value ||
+      refreshing.has(key)
+    )
+      return;
+    const candidates = importCandidates();
+    const signature = JSON.stringify(candidates);
+    if (!force && refreshedImports.get(key) === signature) return;
+    refreshing.add(key);
+    const snapshot = {
+      imports: [] as ReturnType<typeof importCandidates>,
+      visible: [] as Array<{ resource_id: string; alias: string }>,
+      activated: [] as string[],
+    };
+    try {
+      const visible = await executeMclCommand('GET session.visible');
+      if (isRecord(visible) && isRecord(visible.Array) && Array.isArray(visible.Array.Tool))
+        snapshot.visible = visible.Array.Tool.filter(
+          (item): item is { resource_id: string; alias: string } =>
+            isRecord(item) &&
+            typeof item.resource_id === 'string' &&
+            typeof item.alias === 'string',
+        );
+      for (const candidate of candidates) {
+        assertDriverRoute(key);
+        try {
+          const result = await executeMclCommand(`GET ${candidate.alias}`);
+          if (!isRecord(result) || !isRecord(result.Array)) continue;
+          const values = result.Array[candidate.kind];
+          if (
+            Array.isArray(values) &&
+            values.some((item) => isRecord(item) && item.resource_id === candidate.resource_id)
+          )
+            snapshot.imports.push(candidate);
+        } catch {}
+      }
+      assertDriverRoute(key);
+      const sandbox = await executeMclCommand('GET session.sandbox_activated');
+      if (isRecord(sandbox) && isRecord(sandbox.Array) && Array.isArray(sandbox.Array.Sandbox))
+        snapshot.activated = sandbox.Array.Sandbox.flatMap((item) =>
+          isRecord(item) && typeof item.resource_id === 'string' ? [item.resource_id] : [],
+        );
+      assertDriverRoute(key);
+      driverResources.value.set(key, snapshot);
+      refreshedImports.set(key, signature);
+    } catch (error) {
+      addLog(
+        'WARN',
+        `Driver resource controls unavailable: ${errorMessage(error instanceof Error ? error.message : error)}`,
+      );
+    } finally {
+      refreshing.delete(key);
+    }
+  }
+  async function setResourceVisibility(resource: string, visible: boolean): Promise<unknown> {
+    const key = driverKey.value;
+    const state = driverState.value;
+    const imported = state?.imports.find(
+      (item) => item.resource_id === resource && item.kind === 'Tool',
+    );
+    const current = state?.visible.find((item) => item.resource_id === resource);
+    if (!state || (!imported && !current))
+      throw new Error('Resource has no verified current TOOL alias');
+    const aliases = state.visible
+      .filter((item) => item.resource_id !== resource)
+      .map((item) => item.alias);
+    if (visible) aliases.push((imported ?? current)!.alias);
+    const result = await executeMclCommand('INJECT ? TO session.visible', [[...new Set(aliases)]]);
+    assertDriverRoute(key);
+    await refreshDriverResources(true);
+    return result;
+  }
+  async function setSandbox(resource: string | null): Promise<unknown> {
+    const key = driverKey.value;
+    const imported = driverState.value?.imports.find(
+      (item) => item.resource_id === resource && item.kind === 'Sandbox',
+    );
+    if (resource && !imported) throw new Error('Sandbox has no verified current SANDBOX alias');
+    await executeMclCommand('INJECT ? TO session.sandbox_activated', [
+      imported ? [imported.alias] : [],
+    ]);
+    assertDriverRoute(key);
+    const result = await executeMclCommand('EMIT EFFECT sandbox_use (session.sandbox_activated)');
+    assertDriverRoute(key);
+    await refreshDriverResources(true);
+    return result;
+  }
+  async function sendSkillInvocation(text: string, resource: string): Promise<unknown> {
+    const key = driverKey.value;
+    contextInjection('', driverContextPath.value);
+    if (resource.startsWith('hook:'))
+      throw new Error('Hook execution is not supported by the current backend');
+    if (!resource.startsWith('skill:')) throw new Error('Only Skill resources can be invoked');
+    const mapping = driverState.value?.visible.find((item) => item.resource_id === resource);
+    if (!mapping) throw new Error('Skill has no verified visible TOOL alias');
+    if (selectedAgentWorking.value) throw new Error('The selected agent is already working');
+    const messages: AgentMessage[] = [];
+    if (text.trim())
+      messages.push({ type: 'inject', messages: [{ type: 'user', content: text.trim() }] });
+    messages.push({
+      type: 'assistant',
+      reasoning: null,
+      content: null,
+      tool_calls: [
+        { id: `manual-${crypto.randomUUID()}`, tool_name: mapping.alias, arguments: '{}' },
+      ],
+    });
+    lastFailures.value.delete(`${selectedWorkspaceKey.value}:${selectedAgentId.value}`);
+    await executeMclCommand(`INJECT ? TO ${driverContextPath.value}`, [messages]);
+    assertDriverRoute(key);
+    return executeMclCommand('EMIT EFFECT wake');
+  }
+  function abortTurn(): Promise<never> {
+    return Promise.reject(
+      new Error('Turn cancellation is not supported by the current backend protocol'),
+    );
   }
   function handleDelta(event: StreamDelta, reasoning: boolean) {
     const state = agentStates.value.find(
@@ -436,11 +637,19 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       case 'state.sync': {
         workspaces.value = event.state.workspaces;
         agentStates.value = event.state.agents;
+        for (const state of agentStates.value) {
+          if (state.error) {
+            lastFailures.value.set(`${state.workspace.id}:${state.agent}`, {
+              message: errorMessage(state.error),
+            });
+          }
+        }
         histories.value = event.state.histories;
         if (!workspaces.value.some((w) => w.id === selectedWorkspaceKey.value))
           selectWorkspace(workspaces.value[0]?.id ?? '');
         if (selectedAgent.value && !selectedWorkspace.value?.agents.includes(selectedAgent.value))
           selectedAgent.value = null;
+        void refreshDriverResources();
         const allHistory = histories.value.flatMap(historyEntries);
         streams.value = new Map(
           [...streams.value].filter(
@@ -477,7 +686,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           if ('Ok' in event.result) command.resolve(event.result.Ok);
           else command.reject(new Error(errorMessage(event.result.Err)));
         }
-        queryHistory();
+        const wasRead = readCommands.delete(event.id);
+        if (!wasRead) queryHistory();
         if (event.history_error)
           addLog(
             'WARN',
@@ -498,6 +708,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           ),
           event.history,
         ];
+        void refreshDriverResources();
         streams.value = new Map(
           [...streams.value].filter(
             ([, stream]) =>
@@ -535,7 +746,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
             completed: true,
             failed: !!event.error,
           });
-        if (event.error) addLog('ERROR', errorMessage(event.error), event.agent);
+        if (event.error) {
+          const state = agentStates.value.find(
+            (item) => item.agent === event.agent && item.agent_instance === event.agent_instance,
+          )!;
+          lastFailures.value.set(`${state.workspace.id}:${event.agent}`, {
+            message: errorMessage(event.error),
+          });
+          addLog('ERROR', errorMessage(event.error), event.agent);
+        }
         queryHistory();
         break;
       }
@@ -571,6 +790,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedAgentReady,
     selectedAgentWorking,
     loadedResources,
+    resourceVisibility,
+    sandboxOptions,
+    lastFailures,
+    canAbortTurn,
+    refreshDriverResources,
+    sendSkillInvocation,
+    setResourceVisibility,
+    setSandbox,
+    abortTurn,
     visibleMessages,
     tokenUsage,
     logs,

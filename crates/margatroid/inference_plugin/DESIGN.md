@@ -78,6 +78,7 @@ InferencePlugin：推理插件，公开结构体
                 检查计划、通用闭包执行设施及公共事件能力，重复安装拒绝
                 有界读取并完整编译全局模型配置，失败拒绝安装
                 创建共享HTTP客户端，插入InferenceConfig；该Resource同时作为重复安装检查
+                从编译成功的routes发布共享ModelRuntimeCatalog非敏感元数据投影，供Agent完整注入Lua环境；不是第二份执行路由，禁止放入凭据或端点
                 只挂载inference_system，不安装固定异步System或结果发布System
 
 InferenceConfig：推理配置，公开Resource--实现侧配置，不是图书馆组件
@@ -170,7 +171,7 @@ handle_model_routes_reloaded(world: &mut World, output: InferenceReloadOutput)
     收口配置重载：crate公开函数
     行为：
         核对本次重载关联，重复或迟到结果不替换其他版本
-        对原始String在主线程完整编译并捕获工厂panic，成功整体替换routes，失败保持原配置；清除本次重载标记
+        对原始String在主线程完整编译并捕获工厂panic，成功在同一主线程收口整体替换routes及ModelRuntimeCatalog，失败保持两者旧值；清除本次重载标记
         发送关联原请求的ReloadModelRoutesResult，已开始推理继续使用自身路由快照
 ```
 

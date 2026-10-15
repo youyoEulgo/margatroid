@@ -102,7 +102,9 @@ pub(crate) async fn run_runner(
     reply: &ToolExecuteReply,
 ) -> Result<String, ToolError> {
     let deadline = tokio::time::Instant::now() + payload.limits.execution_timeout;
-    let mut command = if let Some(policy) = policy {
+    let mut command = tokio::process::Command::new(runner);
+    command.arg("--margatroid-tool-supervisor");
+    if let Some(policy) = policy {
         let backend = backend().ok_or_else(|| {
             error(
                 ToolErrorKind::SandboxUnavailable,
@@ -120,12 +122,8 @@ pub(crate) async fn run_runner(
             .await
             .map_err(|_| error(ToolErrorKind::Timeout, "policy staging timed out"))?
             .map_err(|_| error(ToolErrorKind::PreparationFailed, "policy staging failed"))?;
-        let mut cmd = tokio::process::Command::new(backend);
-        cmd.arg("run").arg("-p").arg(path).arg("--").arg(runner);
-        cmd
-    } else {
-        tokio::process::Command::new(runner)
-    };
+        command.arg("--sandbox").arg(backend).arg(path);
+    }
     filtered_environment(&mut command);
     command
         .current_dir(&payload.context.project_root)

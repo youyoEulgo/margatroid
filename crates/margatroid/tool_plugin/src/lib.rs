@@ -4,6 +4,7 @@ mod process;
 #[cfg(target_os = "linux")]
 mod pty;
 mod runner;
+mod supervisor;
 mod system;
 mod types;
 

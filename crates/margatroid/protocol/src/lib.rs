@@ -1,7 +1,7 @@
 use core_plugin::{Entity, World};
 use log_plugin::{TracingField, TracingRecord};
 use margatroid_types::{
-    agent_components::{Agent, AgentState, WorldAgentExt},
+    agent_components::{Agent, AgentFailure, AgentState, WorldAgentExt},
     block_types::BlockInner,
     history_components::HistoryRecord,
     mcl_events::{MclCommand, MclCommandResult, MclInstruction, MclValue},
@@ -821,6 +821,8 @@ pub struct AgentStateDto {
     pub sandbox: Option<ResourceIdDto>,
     pub queued_commands: usize,
     pub pending_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ProtocolErrorDto>,
 }
 impl FromDomain<Entity, &World> for AgentStateDto {
     fn from_domain(entity: Entity, world: &World) -> Result<Self, ProtocolError> {
@@ -856,6 +858,9 @@ impl FromDomain<Entity, &World> for AgentStateDto {
                 .pending
                 .as_ref()
                 .map(|pending| pending.command_id.clone()),
+            error: world.get_component::<AgentFailure>(entity).map(|failure| {
+                ProtocolErrorDto::new(format!("{:?}", failure.0.kind), failure.0.message.clone())
+            }),
         })
     }
 }

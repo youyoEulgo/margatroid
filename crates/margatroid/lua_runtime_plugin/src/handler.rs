@@ -441,6 +441,7 @@ pub(crate) fn handle_driver_lua_vm_exception(world: &mut World, event: DriverLua
     world.emit_event(DriverLuaVmExceptionResult {
         exception_id: event.exception_id,
         instance: event.instance,
+        error: valid.then_some(event.error),
         result,
         execution_ended: valid && event.execution_ended,
         cleanup_completed: valid && event.cleanup_completed,

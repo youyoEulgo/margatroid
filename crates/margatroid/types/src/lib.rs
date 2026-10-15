@@ -16,6 +16,7 @@ pub mod mcl_environment;
 pub mod mcl_events;
 pub mod mcl_projection;
 pub mod message_types;
+pub mod model_components;
 pub mod resource_components;
 pub mod resource_events;
 pub mod tool_events;

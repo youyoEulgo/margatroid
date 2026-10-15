@@ -219,7 +219,9 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
             .transpose()?
             .unwrap_or_else(|| {
                 project_root
-                    .join(".margatroid/history")
+                    .join(".margatroid")
+                    .join(&raw.name)
+                    .join("history")
                     .join(format!("{name}.sqlite"))
             });
         agents.push(WorkspaceAgentDefinition {
@@ -439,9 +441,34 @@ agents:
 "#;
         let definition = compile_str(source, "/tmp/workspace.yaml").unwrap();
         assert_eq!(definition.manager, "manager");
-        assert!(definition.agents[0]
-            .history_path
-            .ends_with("manager.sqlite"));
+        assert_eq!(
+            definition.agents[0].history_path,
+            PathBuf::from("/tmp/.margatroid/demo/history/manager.sqlite")
+        );
+    }
+
+    #[test]
+    fn workspaces_in_the_same_project_have_separate_databases() {
+        let first = compile_str(
+            "name: first\nagents:\n  coder:\n    image: local/coder\n",
+            "/tmp/shared/first.yaml",
+        )
+        .unwrap();
+        let second = compile_str(
+            "name: second\nagents:\n  coder:\n    image: local/coder\n",
+            "/tmp/shared/second.yaml",
+        )
+        .unwrap();
+        assert_eq!(first.project_root, second.project_root);
+        assert_eq!(
+            first.agents[0].history_path,
+            PathBuf::from("/tmp/shared/.margatroid/first/history/coder.sqlite")
+        );
+        assert_eq!(
+            second.agents[0].history_path,
+            PathBuf::from("/tmp/shared/.margatroid/second/history/coder.sqlite")
+        );
+        assert_ne!(first.agents[0].history_path, second.agents[0].history_path);
     }
 
     #[test]

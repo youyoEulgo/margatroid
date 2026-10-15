@@ -28,12 +28,27 @@ struct Fixture {
     close: margatroid_types::workspace_execution::WorkspaceExecutionClose,
     _temp: tempfile::TempDir,
 }
+fn test_catalog(
+    context_window_tokens: u64,
+) -> margatroid_types::model_components::ModelRuntimeCatalog {
+    use margatroid_types::model_components::*;
+    ModelRuntimeCatalog::new([ModelRuntimeInfo {
+        id: "model-one".into(),
+        model: "upstream-model".into(),
+        api_type: "deepseek".into(),
+        provider: Some("test-provider".into()),
+        context_window_tokens,
+        thinking: Some("enabled".into()),
+        reasoning_effort: Some("high".into()),
+    }])
+}
 fn fixture() -> Fixture {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(ResourcePlugin)
         .add_plugin(AsyncRuntimePlugin::default());
     let world = app.world_mut();
+    world.insert_resource(test_catalog(128_000));
     world.insert_resource(margatroid_types::mcl_environment::MclEnvironmentFactory(
         Arc::new(|| margatroid_types::lua_environment::LuaEnvironment::default()),
     ));
@@ -171,6 +186,93 @@ fn make_running(
         },
     );
     instance
+}
+
+#[tokio::test]
+async fn model_environment_is_complete_private_and_an_admission_snapshot() {
+    use margatroid_types::lua_environment::{LuaBindingValue, LuaValue};
+    let mut f = fixture();
+    handle_start_agent(f.app.world_mut(), f.request.clone());
+    f.app.world_mut().insert_resource(test_catalog(256_000));
+    let result = database_result(&mut f).await;
+    handle_database_setup_result(f.app.world_mut(), result);
+    let requests = events::<StartDriverLuaVm>(f.app.world_mut());
+    let binding = &requests[0]
+        .environment
+        .globals
+        .iter()
+        .find(|g| g.name == "agent_info")
+        .unwrap()
+        .binding;
+    let LuaBindingValue::Value(LuaValue::Object(info)) = binding else {
+        panic!("agent_info object missing")
+    };
+    let LuaValue::Object(model) = &info["model"] else {
+        panic!("model object missing")
+    };
+    assert_eq!(model["model"], LuaValue::String("model-one".into()));
+    assert_eq!(
+        model["provider_model"],
+        LuaValue::String("upstream-model".into())
+    );
+    assert_eq!(model["context_window_tokens"], LuaValue::Integer(128_000));
+    assert_eq!(model["api_type"], LuaValue::String("deepseek".into()));
+    assert_eq!(model["provider"], LuaValue::String("test-provider".into()));
+    assert_eq!(model["thinking"], LuaValue::String("enabled".into()));
+    assert_eq!(model["reasoning_effort"], LuaValue::String("high".into()));
+    assert_eq!(model["temperature"], LuaValue::Number(0.2_f32 as f64));
+    assert_eq!(model["max_output_tokens"], LuaValue::Nil);
+    assert_eq!(model["top_p"], LuaValue::Nil);
+    assert_eq!(model["stop"], LuaValue::Array(vec![]));
+    assert_eq!(model.len(), 11);
+    for field in ["api_key", "base_url", "headers", "authorization"] {
+        assert!(!model.contains_key(field));
+    }
+    assert_eq!(
+        f.app
+            .world()
+            .get_resource::<margatroid_types::model_components::ModelRuntimeCatalog>()
+            .unwrap()
+            .get("model-one")
+            .unwrap()
+            .context_window_tokens,
+        256_000
+    );
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn missing_catalog_rejects_without_inventing_context_window() {
+    let mut f = fixture();
+    f.app
+        .world_mut()
+        .remove_resource::<margatroid_types::model_components::ModelRuntimeCatalog>();
+    handle_start_agent(f.app.world_mut(), f.request.clone());
+    let results = events::<StartAgentResult>(f.app.world_mut());
+    assert_eq!(
+        results[0].result.as_ref().unwrap_err().kind,
+        AgentErrorKind::ModelRouteNotFound
+    );
+    assert!(!f.request.definition.history_path.exists());
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn missing_model_route_rejects_before_database_or_vm_creation() {
+    let mut f = fixture();
+    f.app
+        .world_mut()
+        .insert_resource(margatroid_types::model_components::ModelRuntimeCatalog::default());
+    handle_start_agent(f.app.world_mut(), f.request.clone());
+    let results = events::<StartAgentResult>(f.app.world_mut());
+    assert_eq!(
+        results[0].result.as_ref().unwrap_err().kind,
+        AgentErrorKind::ModelRouteNotFound
+    );
+    assert!(f.app.world().query_with::<Agent>().result().is_empty());
+    assert!(events::<StartDriverLuaVm>(f.app.world_mut()).is_empty());
+    assert!(!f.request.definition.history_path.exists());
+    f.close.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -339,9 +441,15 @@ async fn driver_exception_maps_once_without_inventing_original_error() {
     let mut f = fixture();
     let (entity, request) = start(&mut f).await;
     let instance = make_running(&mut f, entity, &request);
+    f.app
+        .world_mut()
+        .get_component_mut::<Agent>(entity)
+        .unwrap()
+        .new_turn();
     let event = DriverLuaVmExceptionResult {
         exception_id: "exception".into(),
         instance,
+        error: None,
         result: Ok(()),
         execution_ended: true,
         cleanup_completed: true,
@@ -353,6 +461,17 @@ async fn driver_exception_maps_once_without_inventing_original_error() {
     assert!(replies[0].error.is_none());
     assert!(replies[0].cleanup_completed);
     assert!(f.app.world().is_alive(entity));
+    let agent = f.app.world().get_component::<Agent>(entity).unwrap();
+    assert!(matches!(
+        agent.state,
+        AgentState::Stopping {
+            vm_request_id: None,
+            ..
+        }
+    ));
+    assert!(agent.turn.is_none());
+    assert!(agent.execution.is_closed());
+    assert!(!agent.mcl.accepting);
     assert_eq!(
         f.app
             .world()
@@ -360,6 +479,164 @@ async fn driver_exception_maps_once_without_inventing_original_error() {
             .into_iter()
             .count(),
         0
+    );
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn exception_before_ready_preserves_start_result_correlation() {
+    let mut f = fixture();
+    let (entity, request) = start(&mut f).await;
+    let instance = DriverLuaVmInstance {
+        owner: entity,
+        start_request_id: request.id.clone(),
+    };
+    f.app
+        .world_mut()
+        .get_component_mut::<Agent>(entity)
+        .unwrap()
+        .lua
+        .instance = Some(instance.clone());
+    handle_driver_lua_vm_exception_result(
+        f.app.world_mut(),
+        DriverLuaVmExceptionResult {
+            exception_id: "before-ready".into(),
+            instance,
+            error: Some(LuaRuntimeError::new(
+                LuaRuntimeErrorKind::ExecutionFailed,
+                "driver failed before ready",
+            )),
+            result: Ok(()),
+            execution_ended: true,
+            cleanup_completed: true,
+        },
+    );
+    let agent = f.app.world().get_component::<Agent>(entity).unwrap();
+    assert!(
+        matches!(&agent.state, AgentState::Creating { request_id, vm_request_id }
+        if request_id == &f.request.id && vm_request_id == &request.id)
+    );
+    assert!(agent.execution.is_closed());
+    handle_start_driver_lua_vm_result(
+        f.app.world_mut(),
+        StartDriverLuaVmResult {
+            id: request.id,
+            owner: entity,
+            result: Err(LuaRuntimeError::new(
+                LuaRuntimeErrorKind::ExecutionFailed,
+                "driver failed before ready",
+            )),
+        },
+    );
+    assert!(!f.app.world().is_alive(entity));
+    let results = events::<StartAgentResult>(f.app.world_mut());
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, f.request.id);
+    assert!(results[0].result.is_err());
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_exception_cannot_close_agent_or_clear_turn() {
+    let mut f = fixture();
+    let (entity, request) = start(&mut f).await;
+    let mut instance = make_running(&mut f, entity, &request);
+    let turn = f
+        .app
+        .world_mut()
+        .get_component_mut::<Agent>(entity)
+        .unwrap()
+        .new_turn();
+    instance.start_request_id = "stale".into();
+    let mut event = DriverLuaVmExceptionResult {
+        exception_id: "exception".into(),
+        instance,
+        error: None,
+        result: Ok(()),
+        execution_ended: true,
+        cleanup_completed: true,
+    };
+    handle_driver_lua_vm_exception_result(f.app.world_mut(), event.clone());
+    let agent = f.app.world().get_component::<Agent>(entity).unwrap();
+    assert!(matches!(agent.state, AgentState::Running));
+    assert_eq!(agent.turn.as_ref(), Some(&turn));
+    assert!(!agent.execution.is_closed());
+    assert!(events::<AgentExceptionResult>(f.app.world_mut()).is_empty());
+    event.instance.start_request_id = request.id;
+    event.execution_ended = false;
+    event.cleanup_completed = false;
+    handle_driver_lua_vm_exception_result(f.app.world_mut(), event);
+    let agent = f.app.world().get_component::<Agent>(entity).unwrap();
+    assert!(matches!(agent.state, AgentState::Stopping { .. }));
+    assert_eq!(agent.turn.as_ref(), Some(&turn));
+    assert!(agent.execution.is_closed());
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn driver_exception_preserves_failure_and_pending_stop_completion() {
+    use margatroid_types::agent_components::AgentFailure;
+    let mut f = fixture();
+    let (entity, request) = start(&mut f).await;
+    let instance = make_running(&mut f, entity, &request);
+    f.app
+        .world_mut()
+        .get_component_mut::<Agent>(entity)
+        .unwrap()
+        .new_turn();
+    handle_stop_agent(
+        f.app.world_mut(),
+        StopAgent {
+            id: "stop".into(),
+            agent: entity,
+        },
+    );
+    let stop = events::<StopDriverLuaVm>(f.app.world_mut()).pop().unwrap();
+    handle_driver_lua_vm_exception_result(
+        f.app.world_mut(),
+        DriverLuaVmExceptionResult {
+            exception_id: "failed".into(),
+            instance: instance.clone(),
+            error: Some(LuaRuntimeError::new(
+                LuaRuntimeErrorKind::ExecutionFailed,
+                "tool response missing",
+            )),
+            result: Ok(()),
+            execution_ended: true,
+            cleanup_completed: false,
+        },
+    );
+    let replies = events::<AgentExceptionResult>(f.app.world_mut());
+    assert_eq!(replies.len(), 1);
+    let failure = replies[0].error.as_ref().unwrap();
+    assert!(failure.message.contains("tool response missing"));
+    assert_eq!(
+        &f.app
+            .world()
+            .get_component::<AgentFailure>(entity)
+            .unwrap()
+            .0,
+        failure
+    );
+    let agent = f.app.world().get_component::<Agent>(entity).unwrap();
+    assert!(agent.turn.is_none());
+    assert!(
+        matches!(&agent.state, AgentState::Stopping { request_ids, vm_request_id }
+        if request_ids == &["stop"] && vm_request_id.as_ref() == Some(&stop.id))
+    );
+    handle_stop_driver_lua_vm_result(
+        f.app.world_mut(),
+        StopDriverLuaVmResult {
+            id: stop.id,
+            owner: entity,
+            instance,
+            result: Ok(()),
+        },
+    );
+    assert!(!f.app.world().is_alive(entity));
+    assert_eq!(
+        events::<StopAgentResult>(f.app.world_mut())[0].result,
+        Ok(entity)
     );
     f.close.close().await.unwrap();
 }
