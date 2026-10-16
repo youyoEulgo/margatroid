@@ -137,6 +137,7 @@ fn tool_calls_are_extracted_only_from_one_assistant() {
         content: None,
         tool_calls: vec![],
         usage: None,
+        stop_reason: None,
     };
     assert!(validate_tool_parameters(&[
         BlockInner::Message(vec![assistant.clone()]),
@@ -165,6 +166,7 @@ fn tool_calls_are_extracted_only_from_one_assistant() {
         content: None,
         tool_calls: vec![duplicate.clone(), duplicate],
         usage: None,
+        stop_reason: None,
     };
     assert_eq!(
         validate_tool_parameters(&[BlockInner::Message(vec![message]), BlockInner::Tool(vec![])]),

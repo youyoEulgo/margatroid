@@ -64,14 +64,14 @@ mod message_history_tests {
                 json!({"type":"user"}),
             ),
             (
-                json!({"type":"assistant","content":"answer","reasoning":"thinking","tool_calls":[],"usage":null}),
+                json!({"type":"assistant","content":"answer","reasoning":"thinking","tool_calls":[],"usage":null,"stop_reason":null}),
                 "answer",
-                json!({"type":"assistant","reasoning":"thinking","tool_calls":[],"usage":null}),
+                json!({"type":"assistant","reasoning":"thinking","tool_calls":[],"usage":null,"stop_reason":null}),
             ),
             (
-                json!({"type":"assistant","content":null,"reasoning":null,"tool_calls":[],"usage":null}),
+                json!({"type":"assistant","content":null,"reasoning":null,"tool_calls":[],"usage":null,"stop_reason":null}),
                 "",
-                json!({"type":"assistant","reasoning":null,"tool_calls":[],"usage":null}),
+                json!({"type":"assistant","reasoning":null,"tool_calls":[],"usage":null,"stop_reason":null}),
             ),
             (
                 json!({"type":"tool_call","resource_id":null,"tool_call_id":"call","tool_name":"tool","content":"result","failed":true}),
@@ -88,6 +88,17 @@ mod message_history_tests {
             let message: AgentMessage = serde_json::from_value(input).unwrap();
             assert_eq!(message_history_parts(&message), (content.into(), payload));
         }
+    }
+
+    #[test]
+    fn cancelled_assistant_projects_stop_reason_without_losing_text() {
+        assert_eq!(
+            message_history_parts(&AgentMessage::aborted_assistant()),
+            (
+                "Turn aborted.".into(),
+                json!({"type":"assistant","reasoning":null,"tool_calls":[],"usage":null,"stop_reason":"cancelled"}),
+            )
+        );
     }
 
     #[test]

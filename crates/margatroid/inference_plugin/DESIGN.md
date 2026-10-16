@@ -44,9 +44,9 @@ error      共享推理错误契约               校验、执行及协议错误
 
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
-## 用户轮次中止目标（待实现）
+## 用户轮次中止契约（已实现）
 
-本节及下文标注的中止行为是已批准的目标契约，不表示当前代码已实现；既有实现说明仅适用于未被该目标替换的部分。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
+本节描述用户轮次中止契约；受理核对Working及非空匹配turn，活动登记保存turn并监督独立turn_cancel令牌。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
 
 # lib
 
@@ -153,7 +153,7 @@ crate公开：
 handle_inference(world: &mut World, request: InferenceRequest)
     准备推理：crate公开函数
     行为：
-        先take共享原回复Sender并转入私有回复槽，克隆重复请求不再执行；捕获准备panic；校验请求ID（非空、至多256字节、无控制字符）、完整Agent Entity及取消状态；已失效直接完成oneshot错误；待实现目标中用户轮次取消按正常cancelled响应完成，不能统一归为错误
+        先take共享原回复Sender并转入私有回复槽，克隆重复请求不再执行；捕获准备panic；校验请求ID（非空、至多256字节、无控制字符）、完整Agent Entity及取消状态；已失效直接完成oneshot错误；用户轮次取消按正常cancelled响应完成，不能统一归为错误
         复制Agent地址、info.model中的模型与采样参数，从全局配置查唯一模型路由
         从request.tools的CallableResource不可变共享快照准备typed tool definitions；对各snapshot自带ResourceID使用validate_owner验证目标Agent ResourceSet存在、image_dependencies许可及ImportBindings的ID/TOOL kind已导入归属，不按ID重取latest、不再次global alias query
         完整校验alias唯一、定义与schema后规范化消息，验证参数与输入上限；旧Block在资源reload后仍使用选定的旧定义快照
@@ -161,7 +161,7 @@ handle_inference(world: &mut World, request: InferenceRequest)
         保存拥有所有权的PreparedInference，不携带World、组件借用或Workspace配置
         通过Agent.execution共享AgentExecutionScope受检入口登记Inference活动，令牌从该作用域派生；登记与沙箱更新复用同一互斥门，但Inference活动不阻止沙箱改变
         建立一次性回复保障，提交执行闭包；准备或提交失败均完成原回复槽，提交失败撤销未启动活动登记
-        待实现：AbortSystem先执行；实际受理再次核对当前turn与request.turn，None或已中止旧轮次不启动HTTP而返回正常cancelled响应；turn仍不是请求唯一ID
+        AbortSystem先执行；实际受理再次核对当前turn与request.turn，None或已中止旧轮次不启动HTTP而返回正常cancelled响应；turn仍不是请求唯一ID
 
 handle_reload_model_routes(world: &mut World, request: ReloadModelRoutes)
     发起全局配置重载：crate公开函数
@@ -234,7 +234,7 @@ supervise_inference(prepared: PreparedInference, guard: TaskGuard, owner_cancel:
         向原快照发送器有界发送agent.message.finished；owner取消可中断终态发送并释放其future
         HTTP worker join且终态future释放后才mark_completed，再take私有Sender发送一次Result
         mark_completed失败标cleanup_failed并回复Err CleanupFailed；不关闭Sender冒充真实cleanup，不返回cancelled或宣称Idle
-        待实现：仅用户轮次中止在worker join及真实cleanup成功后返回Ok InferenceResponse；assistant content="Turn aborted."、reasoning=None、tool_calls=[]、usage=None、stop_reason=Cancelled，外层stop_reason同值
+        仅用户轮次中止在worker join及真实cleanup成功后返回Ok InferenceResponse；assistant content="Turn aborted."、reasoning=None、tool_calls=[]、usage=None、stop_reason=Cancelled，外层stop_reason同值
         不将根Agent shutdown、owner abort、timeout或receiver closed一律归一为该正常中止；保留原因分类，已完成真实结果不改写为伪造部分成功
 
 push_stream(senders: &mut Vec<WebSocketSender>, id: &str, agent_instance: &str, agent_id: &ResourceID, sequence: u64, delta: ProviderStreamDelta)
@@ -295,7 +295,7 @@ InferenceRequest：统一推理请求，公开事件
     impl Event for InferenceRequest
 
 InferenceResponse：完整推理响应，公开共享结构体--oneshot成功载荷，不是第二个结果事件
-    message: AgentMessage--assistant完整消息，含reasoning、tool_calls、usage与新增stop_reason（待实现）
+    message: AgentMessage--assistant完整消息，含reasoning、tool_calls、usage与stop_reason: Option<StopReason>（旧文件缺字段为None；实际推理输出为Some）
     stop_reason: StopReason--兼容保留；与Assistant.stop_reason来自同一权威映射且始终相同
 
 ReloadModelRoutes：全局配置重载请求，公开事件
@@ -421,7 +421,7 @@ StopReason：停止原因，公开共享枚举
     ToolCalls
     Length
     ContentFilter
-    Cancelled--待实现；序列化cancelled，仅正常用户轮次中止结果
+    Cancelled--序列化cancelled，仅正常用户轮次中止结果
     Other(String)
 
 ErasedProviderAdapter = Arc<dyn ProviderAdapter>：协议适配器，公开类型别名
@@ -566,7 +566,7 @@ InferenceErrorKind：推理错误分类，公开枚举
     Cancelled
     TaskPanicked
     TaskAborted
-    CleanupFailed--待实现；不能转为正常cancelled响应
+    CleanupFailed--不能转为正常cancelled响应
 
 InferenceError：推理错误，公开结构体
     kind: InferenceErrorKind

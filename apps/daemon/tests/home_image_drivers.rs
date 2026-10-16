@@ -193,7 +193,7 @@ fn start(app: &mut App, root: &Path, image: &str) -> (Entity, Entity) {
         .unwrap()
         .1;
     let agent = app.world().get_component::<Agent>(entity).unwrap();
-    assert!(matches!(agent.state, AgentState::Running));
+    assert!(matches!(agent.state, AgentState::Idle));
     assert!(agent.lua.ready.is_none());
     assert_eq!(agent.lua.instance.as_ref().unwrap().owner, entity);
     (workspace, entity)
@@ -235,6 +235,11 @@ fn assistant(content: &str, tool_calls: Vec<ToolCall>) -> AgentMessage {
     AgentMessage::Assistant {
         reasoning: None,
         content: Some(content.into()),
+        stop_reason: Some(if tool_calls.is_empty() {
+            StopReason::Completed
+        } else {
+            StopReason::ToolCalls
+        }),
         tool_calls,
         usage: None,
     }
@@ -688,4 +693,84 @@ fn root_sample_driver_with_coder_manifest_offline_lifecycle() {
     let root_driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../base.lua");
     fs::copy(root_driver, directory.join("base.lua")).unwrap();
     exercise_root_restart(temp.path(), "image:local/coder:latest");
+}
+
+#[test]
+#[ignore = "requires read-only global-home resource packages; verifies abort Driver context and idle recovery"]
+fn root_driver_abort_keeps_history_out_of_context_and_accepts_next_turn() {
+    use margatroid_types::agent_events::{AbortAgentTurn, AbortAgentTurnResult};
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("local/coder/latest");
+    fs::create_dir_all(&directory).unwrap();
+    fs::copy(
+        global_home().join("agent-images/local/coder/latest/agent.toml"),
+        directory.join("agent.toml"),
+    )
+    .unwrap();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../base.lua"),
+        directory.join("base.lua"),
+    )
+    .unwrap();
+    let mut app = app(temp.path());
+    let (workspace, entity) = start(&mut app, temp.path(), "image:local/coder:latest");
+    inject(&mut app, "abort-user", "please work");
+    let request = inference(&mut app, entity);
+    let agent = app.world().get_component::<Agent>(entity).unwrap();
+    let turn = agent.turn.clone().unwrap();
+    app.world().send_event(AbortAgentTurn {
+        id: "abort-test".into(),
+        agent: entity,
+        resource_id: agent.resourceid.clone(),
+        workspace: agent.workspace.clone(),
+        instance: agent.lua.instance.clone().unwrap(),
+        expected_turn_id: turn,
+    });
+    let abort = tick_until(&mut app, "abort accepted", |world| {
+        world
+            .event_reader::<AbortAgentTurnResult>()
+            .into_iter()
+            .find(|event| event.id == "abort-test")
+            .cloned()
+    });
+    assert!(abort.result.is_ok(), "{abort:?}");
+    assert!(app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .turn
+        .is_none());
+    if let Some(reply) = request.reply.lock().unwrap().take() {
+        reply
+            .send(Ok(
+                margatroid_types::message_types::InferenceResponse::aborted(),
+            ))
+            .unwrap();
+    }
+    turn_done(&mut app, entity);
+    assert!(matches!(
+        app.world().get_component::<Agent>(entity).unwrap().state,
+        AgentState::Idle
+    ));
+    let history = history_messages(&app, entity);
+    assert!(history.iter().any(|message| matches!(message, AgentMessage::Assistant {stop_reason: Some(StopReason::Cancelled),content:Some(content),..} if content=="Turn aborted.")));
+    let context = messages(command(
+        &mut app,
+        "abort-context",
+        "GET session.conversation",
+        vec![],
+    ));
+    assert!(!context.iter().any(|message| matches!(
+        message,
+        AgentMessage::Assistant {
+            stop_reason: Some(StopReason::Cancelled),
+            ..
+        }
+    )));
+    inject(&mut app, "after-abort", "new turn");
+    let next = inference(&mut app, entity);
+    assert_ne!(next.turn, request.turn);
+    respond(&next, assistant("recovered", vec![]), StopReason::Completed);
+    turn_done(&mut app, entity);
+    stop(&mut app, workspace, entity);
 }

@@ -35,9 +35,9 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。message记录的content保存实际正文（Error保存message文本，Inject为空，Assistant无正文为空）；payload只保存type及其余元数据，不重复顶层content/Error.message。Inject的messages保留完整嵌套消息结构。旧行原样读取，由消费者兼容payload中的旧正文，不破坏性迁移。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
-# 已批准目标：实际动作受理与中止（待实现）
+# 实际动作受理与中止
 
-以下是用户批准但**尚未实现**的目标，不把当前数据库/历史基线、已有finish_turn名称或既有来源取消当作目标轮次中止已实现。Agent目标状态为Creating / Idle / Working / Stopping，启动进入Idle；start_turn要求Idle，生成turn并置Working，不再无条件生成覆盖。finish_turn清turn并将Working置Idle，重复空turn完成可幂等；Driver仅在无工具调用Assistant分支发出它。原StopAgent及Creating/Stopping真实清理契约不变。
+MCL已实现Creating / Idle / Working / Stopping轮次effect。start_turn要求Idle，生成turn并置Working，不覆盖；finish_turn核对准备阶段捕获的turn或当前实例最近中止关联，并要求该轮所有execution注册真实释放后才进入Idle。Idle完成幂等，Stopping不能被finish覆盖。inference/tool_call在异步准备后的实际动作核对当前turn；空turn或已失效捕获turn返回正常取消结果，不发领域请求。原StopAgent及Creating/Stopping真实清理契约不变。AgentPlugin控制System使用PRE_UPDATE，领域与MCL使用UPDATE；自定义schedule须保留控制优先。下列Driver/领域/协议跨插件规则需结合各自实现验证。
 
 ```text
 控制与受理：
@@ -219,7 +219,7 @@ begin_tool_call(world: &mut World, request: &MclCommand, messages: Vec<AgentMess
     行为：
         第一参数必须恰好一条Assistant，从其tool_calls读取调用请求，非assistant或多条消息拒绝
         工具调用ID和名称须非空，批次ID唯一；TOOL数组alias冲突整批准备失败，不按遍历顺序任选
-        目标待实现：异步准备后实际动作处要求turn；无turn按全部原调用返回正常形状取消结果，不提交任务；存在turn才允许提交并在领域受理处防迟到启动
+        已实现：异步准备后实际动作处要求turn；无turn按全部原调用返回正常形状取消结果，不提交任务；存在turn才允许提交并在领域受理处防迟到启动
         tool_calls为空直接返回typed空MESSAGE数组，不提交任务
         按每个tool_name在visible快照中匹配alias，无匹配填对应失败消息
         每个可调用项发送一个ToolExecuteRequest，携带选定CallableResource快照及原调用ID/参数/turn，不按ID重新取最新定义
@@ -298,7 +298,7 @@ Driver工具回合：
     inject内部结构仍按完整AgentMessage契约，历史输入允许范围规则独立于消息值类型
 ```
 
-## 目标Driver分支（待实现）
+## Driver分支契约（Driver实现由应用层提供）
 
 ```text
 处理entry：
@@ -443,7 +443,7 @@ StorageCleanupFailed表示回滚或事务清理仍未完成；保留Other活动�
 ```text
 数据库Block与finish_turn已实现；parser纯函数测试仍可使用AgentBlock作为不执行I/O的输入fixture，Agent运行时不保存该内存容器。
 验证重启恢复MESSAGE/TOOL/SANDBOX、TEMP不恢复、schema冲突保留旧数据、跨选择器事务快照、取消与提交事实、历史无隐式联动。
-目标待实现：start_turn仅Idle生成新代号并置Working；abort清turn仍Working；finish_turn清turn且转Idle，已为空可幂等，返回Unit。替代当前start_turn无条件生成覆盖及finish_turn仅清字段的行为；不改StopAgent/Driver停止含义。
+已实现：start_turn仅Idle生成新代号并置Working；abort清turn仍Working；finish_turn经轮次关联与真实清理检查后清turn且转Idle，Idle重复完成幂等，返回Unit；不改StopAgent/Driver停止含义。
 ```
 
 ## 已实现的准备阶段收口

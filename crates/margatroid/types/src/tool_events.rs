@@ -53,6 +53,19 @@ impl std::error::Error for ToolError {}
 pub struct ToolExecuteResponse {
     pub message: AgentMessage,
 }
+impl ToolExecuteResponse {
+    pub fn aborted(resource_id: Option<resource_id_plugin::ResourceID>, call: &ToolCall) -> Self {
+        Self {
+            message: AgentMessage::ToolCall {
+                resource_id,
+                tool_call_id: call.id.clone(),
+                tool_name: call.tool_name.clone(),
+                content: "Tool call aborted.".into(),
+                failed: true,
+            },
+        }
+    }
+}
 pub type ToolExecuteReply =
     Arc<Mutex<Option<oneshot::Sender<Result<ToolExecuteResponse, ToolError>>>>>;
 #[derive(Clone, Debug)]

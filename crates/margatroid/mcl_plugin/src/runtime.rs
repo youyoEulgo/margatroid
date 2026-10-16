@@ -94,6 +94,20 @@ pub fn mcl_command_system(world: &mut World) {
             });
             continue;
         };
+        let key = (host.id.clone(), source.clone(), host.target.clone());
+        if world
+            .get_resource::<HostReplies>()
+            .is_some_and(|replies| replies.0.contains_key(&key))
+        {
+            let _ = sender.send(MclCommandResult {
+                id: host.id,
+                source,
+                target: host.target,
+                result: Err(MclError::DuplicateRequest),
+                history_error: None,
+            });
+            continue;
+        }
         if let Some(replies) = world.get_resource_mut::<HostReplies>() {
             replies.0.insert(
                 (host.id.clone(), source.clone(), host.target.clone()),
@@ -204,7 +218,8 @@ pub(crate) fn driver_ready_authorized(
                 && matches!(
                     agent.state,
                     margatroid_types::agent_components::AgentState::Creating { .. }
-                        | margatroid_types::agent_components::AgentState::Running
+                        | margatroid_types::agent_components::AgentState::Idle
+                        | margatroid_types::agent_components::AgentState::Working
                 )
         })
 }

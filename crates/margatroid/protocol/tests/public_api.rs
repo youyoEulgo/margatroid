@@ -77,6 +77,7 @@ fn nested_injection_preserves_all_shared_message_shapes() {
                         reasoning: Some("thought".into()),
                         content: None,
                         tool_calls: vec![],
+                        stop_reason: None,
                         usage: Some(TokenUsage {
                             input_tokens: 9,
                             output_tokens: 1,
@@ -142,6 +143,7 @@ fn command_result_keeps_inference_stop_reason_usage_and_independent_history_erro
                 reasoning: None,
                 content: Some("partial".into()),
                 tool_calls: vec![],
+                stop_reason: None,
                 usage: Some(TokenUsage {
                     input_tokens: 2,
                     output_tokens: 1,
@@ -323,7 +325,7 @@ fn registration_and_errors_use_correlated_bounded_shapes() {
     assert_eq!(value["error"]["kind"], "InvalidRequest");
 }
 #[test]
-fn old_mailbox_and_abort_entrypoints_are_not_accepted() {
+fn old_mailbox_and_unscoped_abort_entrypoints_are_not_accepted() {
     for kind in [
         "agent.assistant",
         "agent.turn.abort",
@@ -441,7 +443,7 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
             }),
             import_bindings: Default::default(),
             lua: AgentLua::default(),
-            state: AgentState::Running,
+            state: AgentState::Idle,
             history: database.history(),
             database,
             mcl: AgentMclQueue::default(),
@@ -484,6 +486,12 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
         .contains("private-policy"));
     assert!(old_state.error.is_none());
     assert_eq!(old_state.context_window_tokens, Some(128_000));
+    assert_eq!(old_state.status, "idle");
+    world.get_component_mut::<Agent>(old).unwrap().state = AgentState::Working;
+    let working: AgentStateDto = old.into_dto(&*world).unwrap();
+    assert_eq!(working.status, "working");
+    assert!(working.turn.is_none());
+    world.get_component_mut::<Agent>(old).unwrap().state = AgentState::Idle;
     let serialized = serde_json::to_value(&old_state).unwrap();
     assert_eq!(serialized["context_window_tokens"], 128_000);
     let mut legacy = serialized.clone();
@@ -551,4 +559,50 @@ fn tokio_runtime_close(close: margatroid_types::workspace_execution::WorkspaceEx
         .unwrap()
         .block_on(close.close())
         .unwrap();
+}
+
+#[test]
+fn abort_wire_requires_turn_and_never_accepts_entity_identity() {
+    let request = serde_json::json!({"type":"agent.turn.abort","id":"abort-1","message":{"workspace":{"id":"workspace:test/demo","name":"demo","project_root":"/tmp/demo"},"turn_id":"turn-1"}});
+    let parsed: ClientMessage = serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(parsed.id(), "abort-1");
+    let ClientMessage::AgentTurnAbort { message, .. } = parsed else {
+        panic!("wrong request")
+    };
+    assert!(message.agent.is_none());
+    assert_eq!(message.turn_id, "turn-1");
+    let mut missing = request;
+    missing["message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("turn_id");
+    assert!(serde_json::from_value::<ClientMessage>(missing).is_err());
+    let response = ServerMessage::AgentTurnAbortResult {
+        id: "abort-1".into(),
+        workspace: message.workspace,
+        agent: ResourceIdDto("agent:test/demo".into()),
+        turn_id: message.turn_id,
+        result: Ok(()),
+    };
+    let json = serde_json::to_value(response).unwrap();
+    assert_eq!(json["type"], "agent.turn.abort_result");
+    assert_eq!(json["result"], serde_json::json!({"Ok":null}));
+}
+
+#[test]
+fn cancelled_assistant_round_trip_and_legacy_default() {
+    let message = AgentMessage::aborted_assistant();
+    let dto: AgentMessageDto = (&message).into_dto(()).unwrap();
+    let wire = serde_json::to_value(&dto).unwrap();
+    assert_eq!(wire["type"], "assistant");
+    assert_eq!(wire["stop_reason"], "cancelled");
+    assert_eq!(dto.into_domain(()).unwrap(), message);
+    let legacy: AgentMessageDto = serde_json::from_value(serde_json::json!({"type":"assistant","reasoning":null,"content":"Turn aborted.","tool_calls":[],"usage":null})).unwrap();
+    assert!(matches!(
+        legacy,
+        AgentMessageDto::Assistant {
+            stop_reason: None,
+            ..
+        }
+    ));
 }

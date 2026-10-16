@@ -23,7 +23,7 @@ ws://127.0.0.1:3939/ws      WebSocket
 `ui/dist` 不入库，构建前先执行 `scripts/build-ui.sh`。嵌入发生在编译期，因此改动界面后需要
 重新构建界面并重新编译 daemon。
 
-## 回合中止交互设计（待实现）
+## 回合中止交互（已实现）
 
 - 发送与中止以同步状态为准：`idle` 允许发送；`working` 只允许中止；`creating/stopping` 不允许发送。
 - 中止立即清空 `turn`，但收口期间仍为 `working`，不能提前开放新消息；只有 Driver 的 `finish_turn` 完成并同步 `idle` 后恢复发送。
@@ -32,4 +32,6 @@ ws://127.0.0.1:3939/ws      WebSocket
 - 取消 assistant 允许记录历史但不进入模型上下文；取消工具结果仍保存历史与上下文，保留调用关联。
 - 真正清理失败仍显示错误，不伪装成取消成功或可继续状态。
 
-以上为已确认设计，尚未实现完整中止入口；当前行为以源码为准。
+停止按钮发送 agent.turn.abort，并按请求 ID、workspace、agent 和 turn_id 核对回执；受理成功后保持禁用，等待状态同步确认 Idle。
+
+中止执行顺序：AgentPlugin 的 abort_agent_turn_system 固定运行于 RuntimePlugin::PRE_UPDATE，先于 UPDATE 的 MCL 与推理/工具 admission；UI 仅发送控制请求并等待权威状态同步，不承担清理完成判定。

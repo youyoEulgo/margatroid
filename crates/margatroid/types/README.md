@@ -28,14 +28,14 @@ Compose使用 `WorkspaceDefinition` 和 `WorkspaceAgentDefinition` 把配置文�
 
 `AgentMessage` 是纯消息值，不是带 Entity 的路由事件；包含 Inject、System、User、Assistant、ToolCall 结果及 Error。`ToolCall` 输入只存在于 Assistant.tool_calls。资源可见性由 Agent 的显式导入绑定与 MESSAGE/TOOL/SANDBOX typed arrays 决定，不恢复旧 AgentFailure、邮箱或可见性集合。
 
-## 用户轮次中止目标（待实现）
+## 用户轮次中止契约（已实现）
 
-本节及下文标注的中止行为是已批准的目标契约，不表示当前代码已实现；既有实现说明仅适用于未被该目标替换的部分。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
+无 `get_turn`。Agent采用 Creating / Idle / Working / Stopping，对外同步为 `creating/idle/working/stopping`，同时发布 turn 与 status。启动成功进入 Idle、turn=None；`start_turn` 仅允许 Idle，原子创建唯一 turn 并置 Working，不覆盖已有轮次。`AbortAgentTurn` 验证完整Agent实例、workspace、Driver实例及expected_turn_id；受理后立即清空 turn，但保持 Working，只取消匹配活动的独立 `turn_cancel`，不关闭根作用域。正常结果链的 `finish_turn` 核对当前Driver关联与真实清理完成后才置 Idle；Idle重复完成幂等，Working且turn=None并不代表完成，迟到旧完成不能覆盖新轮次。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
 
-Assistant 新增 `stop_reason: StopReason`，覆盖所有推理原因，包含新增 `StopReason::Cancelled`（序列化 `cancelled`）。兼容保留 `InferenceResponse.stop_reason`，同一权威映射一次构造两处，必须相同。用户轮次中止且真实清理成功返回 Ok assistant：`content="Turn aborted."`、`reasoning=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Cancelled`。
+Assistant 的 `stop_reason: Option<StopReason>` 使用serde默认值兼容旧文件缺字段为None；prompt等非模型生成消息使用None，每个实际推理输出使用Some，覆盖所有推理原因，包含 `StopReason::Cancelled`（序列化 `cancelled`）。兼容保留 `InferenceResponse.stop_reason`，由同一权威映射构造，必须与Assistant中的Some值相同。用户轮次中止且真实清理成功返回 Ok assistant：`content="Turn aborted."`、`reasoning=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Some(Cancelled)`。
 
 取消工具且真实清理成功返回 Ok ToolCall 结果：`failed=true`、`content="Tool call aborted."`，保留调用 ID、名称及已知 resource_id；未启动项同用该正文。批次每个调用均有一个结果，保留已完成结果，不虚构部分成功，不撤销已发生副作用。`CleanupFailed` 仍为 Err，保留活动，不宣称空闲。
 
-AbortSystem 必须先于 MCL 实际执行与 inference/tool admission。共享中止事件允许多个消费者独立观察，不靠 take reply 独占通知；实际执行时重新核对请求 turn，turn=None 或已中止旧轮次返回正常取消结果，不启动执行。
+AbortAgentTurn控制系统注册在 `RuntimePlugin::PRE_UPDATE`，先于UPDATE中的 MCL 实际执行与 inference/tool admission；自定义调度必须保留这个先后关系。共享中止事件允许多个消费者独立观察，不靠 take reply 独占通知；实际受理重新核对Working及非空匹配的请求 turn，turn=None 或已中止旧轮次返回正常取消结果，不启动执行。
 
 历史仅由显式 MCL `history_append` 保存。Assistant stop_reason 存在历史 payload 元数据，不混入正文；cancelled assistant 可入历史但不可进入 infer 上下文（包括 Inject 嵌套）。领域请求、结果与错误保持各自 oneshot/共享事件关联，不恢复 AgentFailure 路由。

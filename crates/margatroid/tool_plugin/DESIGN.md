@@ -40,9 +40,9 @@ error      共享工具错误契约          执行、取消与清理错误
 
 当前MCL只有MESSAGE、TOOL、SANDBOX三种typed arrays；TOOL是资源值，保存ResourceID、alias、description、schema与immutable shared snapshot，不是ToolCall请求数组。`IMPORT TOOL tool AS alias`与`GET alias`解析Agent ImportBindings，不新增插件注册表；`infer`接收MESSAGE array + TOOL array，不接受ResourceID array或重复global alias query。旧Block不会跟随reload暗变，新GET alias获取新快照。CallableDefinitionSnapshot 只有 Tool，其他资源类型不能导入 TOOL。
 
-## 用户轮次中止目标（待实现）
+## 用户轮次中止契约（已实现）
 
-以下为已批准、尚待实现的目标，不表示当前运行时已支持。无 `get_turn`；状态采用 `creating/idle/working/stopping`。中止立即清空 turn，清理期间仍为 Working，正常 finish 收口才 Idle；同步必须同时包含 turn 与 status。用户轮次中止与根 Agent shutdown、owner abort、timeout、receiver closed 不同，不统一归一为正常取消。
+工具受理及独立turn_cancel监督已实现；活动登记原子保存turn与沙箱快照。无 `get_turn`；状态采用 `creating/idle/working/stopping`。中止立即清空 turn，清理期间仍为 Working，正常 finish 收口才 Idle；同步必须同时包含 turn 与 status。用户轮次中止与根 Agent shutdown、owner abort、timeout、receiver closed 不同，不统一归一为正常取消。
 
 用户轮次取消且真实cleanup成功，oneshot返回Ok ToolExecuteResponse，其ToolCall消息failed=true、content="Tool call aborted."，保留调用ID、名称和已知resource_id。未启动调用同用此规范正文；不伪造执行成功，不撤销已经发生的副作用。CleanupFailed仍返回Err并保留活动，不能伪造取消或空闲。
 
@@ -137,7 +137,7 @@ crate公开：
 handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
     准备单次执行：crate公开函数
     行为：
-        先按待实现目标检查轮次中止与受理关联，再校验请求ID、调用ID、完整Agent Entity、取消状态和资源类型；validate_owner(request.resource.resource_id)校验目标ResourceSet存在、image_dependencies许可及ImportBindings的ID/TOOL kind已导入，不要求最新alias或定义与选定snapshot一致，允许仍有效的旧版本snapshot
+        认领共享Sender后检查Working及非空匹配turn，再检查轮次中止与受理关联，再校验请求ID、调用ID、完整Agent Entity、取消状态和资源类型；validate_owner(request.resource.resource_id)校验目标ResourceSet存在、image_dependencies许可及ImportBindings的ID/TOOL kind已导入，不要求最新alias或定义与选定snapshot一致，允许仍有效的旧版本snapshot
         消费request.resource的不可变共享definition及alias，验证call.tool_name与选定alias一致；不从ResourceSet按ID重取latest，不再次global alias query
         tool使用选定schema与脚本材料引用及alias；不重取最新collection。现有路径late read不能证明磁盘内容版本隔离，后续采用Arc脚本正文或版本化文件材料的具体方案尚未闭合，不能把metadata snapshot不变假称为磁盘内容不变
         解码arguments并限制大小；tool按snapshot schema验证，不重新解析metadata或全局资源目录
@@ -158,7 +158,7 @@ execute_tool(prepared: PreparedToolExecution)
         在共享reply短锁内take唯一Sender，发送一次成功或错误；目标用户轮次取消且cleanup成功返回Ok failed=true ToolCall，正文="Tool call aborted."；其他监督失败保持真实错误
         不记录message历史，由Driver显式history_append；不直接结束turn或发送Agent异常代替回执
 
-run_runner(prepared: &PreparedToolExecution) -> Result<String, ToolError>
+run_runner(...) -> Result<Option<String>, ToolError>--Some为真实输出，None仅代表用户turn取消且cleanup已证明
     监督独立runner：私有异步函数
     行为：
         按本次沙箱策略建立执行边界，以结构化协议启动独立runner

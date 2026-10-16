@@ -33,11 +33,11 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 共享值、组件与事件迁移及本轮typed数组与导入绑定均已实现。各领域文档描述对应完整行为，本文件统一依赖方向和跨领域数据，不继续混入旧邮箱、引用Block或ResourceId组件方案。ResourceID等基础契约由resource_id_plugin提供；types按组件、事件与纯值模块组织，不依赖业务Plugin实现。正文保持lib、system、handler、events、types、error六个标准板块。
 
-显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。history_components::message_history_parts将实际正文放入HistoryRecord.content，payload保留type及其余字段并移除顶层content；Error正文取message并从payload移除，Inject正文为空且完整保留嵌套messages。Assistant无正文按空字符串展示。本轮待实现目标会为Assistant新增stop_reason字段，历史映射同步保留该元数据。旧行不迁移，消费者兼容旧payload.content/message。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
+显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。history_components::message_history_parts将实际正文放入HistoryRecord.content，payload保留type及其余字段并移除顶层content；Error正文取message并从payload移除，Inject正文为空且完整保留嵌套messages。Assistant无正文按空字符串展示。Assistant.stop_reason为Option<StopReason>，旧文件缺字段默认None；模型实际输出始终Some，历史payload保留该元数据。旧行不迁移，消费者兼容旧payload.content/message。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
-## 用户轮次中止目标（待实现）
+## 用户轮次中止契约（已实现）
 
-本节及下文标注的中止行为是已批准的目标契约，不表示当前代码已实现；既有实现说明仅适用于未被该目标替换的部分。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
+无 `get_turn`。Agent状态为 Creating / Idle / Working / Stopping，对外同步为 `creating/idle/working/stopping`，同时发布 turn 与 status。启动成功进入 Idle、turn=None；start_turn仅允许Idle，原子创建唯一turn并置Working，不覆盖已有轮次。AbortAgentTurn控制系统在RuntimePlugin::PRE_UPDATE执行，先于UPDATE中的MCL实际动作及Inference/Tool受理；自定义调度必须保留该顺序。控制受理验证完整Agent实例、workspace、Driver实例及expected_turn_id，立即清空turn但保持Working，仅取消匹配活动的独立turn_cancel，不关闭根作用域。正常finish_turn核对当前Driver结果关联及真实清理完成后才置Idle；Working收口期间同一中止关联重复请求幂等，不能让迟到旧完成覆盖新轮次。用户轮次中止不等于根Agent shutdown、owner abort、timeout或receiver closed。
 
 # lib
 
@@ -123,7 +123,7 @@ AgentMessage：消息值，公开枚举--不是Event，不包含路由Entity
     Inject { messages: Vec<AgentMessage> }
     System { content: String }--系统消息，prompt导入及推理按实际role保留
     User { content: String }
-    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCall>, usage: Option<TokenUsage>, stop_reason: StopReason }
+    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCall>, usage: Option<TokenUsage>, stop_reason: Option<StopReason> }
     ToolCall { resource_id: Option<ResourceID>, tool_call_id: String, tool_name: String, content: String, failed: bool }
     Error { message: String }
     impl Clone + PartialEq + Eq + Serialize + Deserialize for AgentMessage
@@ -325,13 +325,13 @@ HistoryRecord：历史记录，公开共享契约
     Agent.database保存一个Agent SQLite句柄，history是同文件分表视图；Block与history不同指令间没有跨事务原子保证
     默认CREATE BLOCK open/validate不清空，created只标初建；启动prompt/conversation与默认工具配置仅created=true时填充，不能每次启动覆盖
     CREATE TEMP BLOCK同instance幂等检查schema，TEMP entry不恢复；turn、pending、alias/import及active sandbox都不由数据库自动恢复
-    MCL start_turn及finish_turn仅改变本次运行turn；finish_turn清空且已为空时幂等成功，旧effect finish拒绝
+    MCL start_turn仅允许Idle，原子创建唯一turn并置Working；abort立即清空turn但保持Working；finish_turn核对当前Driver结果关联及本轮真实清理完成后清空turn并置Idle，Idle重复完成幂等，Working且turn=None不代表已完成；旧effect finish拒绝
     tool_call effect第一参数必须为恰好一个Assistant的MESSAGE数组，第二参数必须为TOOL数组；只执行该Assistant.tool_calls
     空tool_calls返回MESSAGE空数组；重复调用id、多个Assistant或工具alias冲突均在提交任何执行前失败，不产生部分submit
     输入Assistant不在tool_call effect中重复记录，输出为ToolCall结果消息组成的MESSAGE数组
     history_append允许范围独立保持inject/user/assistant/tool_call/error，System不通过此effect追加；infer支持System
     inference完整返回InferenceResponse，保留stop_reason，不只抽取assistant正文
-    待实现：AbortSystem先于MCL实际执行及Inference/Tool受理；共享中止事件由各消费者独立观察，不依赖take reply独占通知
+    AbortAgentTurn控制系统在RuntimePlugin::PRE_UPDATE执行，先于UPDATE中的MCL实际执行及Inference/Tool受理；共享中止事件由各消费者独立观察，不依赖take reply独占通知；自定义调度保留该顺序
     实际执行infer/tool_call再次核对请求turn与当前turn；None或已中止旧轮次返回正常取消结果，不启动HTTP/runner
     工具用户轮次取消且cleanup成功返回Ok ToolCall：failed=true、content="Tool call aborted."，保留调用ID/名称及已知resource_id；未启动项同用该正文
     批次每个调用恰有一个原序结果；保留已完成真实结果，其余项（含未启动项）取消，不撤销已发生副作用

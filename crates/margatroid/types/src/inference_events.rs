@@ -12,6 +12,7 @@ pub enum InferenceErrorKind {
     Cancelled,
     PreparationFailed,
     ExecutionFailed,
+    CleanupFailed,
     ResponseLost,
     InvalidModelId,
     ConfigReadFailed,

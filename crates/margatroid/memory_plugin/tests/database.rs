@@ -109,6 +109,7 @@ fn full_message() -> StoredBlockInner {
                     output_tokens: 3,
                     cache_hit_tokens: 0,
                 }),
+                stop_reason: None,
             },
             AgentMessage::ToolCall {
                 resource_id: Some(ResourceID::parse("tool:local/bash").unwrap()),

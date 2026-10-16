@@ -57,7 +57,9 @@ pub struct SandboxPolicySnapshot {
 pub struct ExecutionActivityState {
     pub kind: ExecutionActivityKind,
     pub cancel: CancellationToken,
+    pub turn_cancel: CancellationToken,
     pub cleanup_error: Option<ExecutionError>,
+    turn: Option<String>,
     started: bool,
 }
 
@@ -133,6 +135,26 @@ impl AgentExecutionScope {
     where
         F: FnOnce() -> Result<Option<SandboxPolicySnapshot>, ExecutionError>,
     {
+        self.register_for_turn_with_snapshot(kind, None, snapshot)
+    }
+
+    pub fn register_for_turn(
+        &self,
+        kind: ExecutionActivityKind,
+        turn: Option<String>,
+    ) -> Result<ExecutionActivity, ExecutionError> {
+        self.register_for_turn_with_snapshot(kind, turn, || Ok(None))
+    }
+
+    pub fn register_for_turn_with_snapshot<F>(
+        &self,
+        kind: ExecutionActivityKind,
+        turn: Option<String>,
+        snapshot: F,
+    ) -> Result<ExecutionActivity, ExecutionError>
+    where
+        F: FnOnce() -> Result<Option<SandboxPolicySnapshot>, ExecutionError>,
+    {
         let mut data = lock(&self.inner);
         check_admission(&data, kind)?;
         let next_id = data
@@ -147,11 +169,14 @@ impl AgentExecutionScope {
         let id = data.next_id;
         data.next_id = next_id;
         let cancel = data.root_cancel.child_token();
+        let turn_cancel = CancellationToken::new();
         data.activities.insert(
             id,
             ExecutionActivityState {
                 kind,
                 cancel: cancel.clone(),
+                turn_cancel: turn_cancel.clone(),
+                turn,
                 cleanup_error: None,
                 started: false,
             },
@@ -160,6 +185,7 @@ impl AgentExecutionScope {
             id,
             kind,
             cancel,
+            turn_cancel,
             sandbox_snapshot,
             scope: Arc::downgrade(&self.inner),
         })
@@ -193,6 +219,23 @@ impl AgentExecutionScope {
             return Err(ExecutionError::ExecutionBusy);
         }
         update()
+    }
+
+    pub fn cancel_turn(&self, turn: &str) {
+        let data = lock(&self.inner);
+        for activity in data.activities.values() {
+            if activity.turn.as_deref() == Some(turn) {
+                activity.turn_cancel.cancel();
+            }
+        }
+        data.completion.notify_waiters();
+    }
+
+    pub fn turn_is_drained(&self, turn: &str) -> bool {
+        !lock(&self.inner)
+            .activities
+            .values()
+            .any(|activity| activity.turn.as_deref() == Some(turn))
     }
 
     pub fn request_close(&self) {
@@ -314,6 +357,7 @@ pub struct ExecutionActivity {
     pub id: ActivityID,
     pub kind: ExecutionActivityKind,
     pub cancel: CancellationToken,
+    pub turn_cancel: CancellationToken,
     pub sandbox_snapshot: Option<SandboxPolicySnapshot>,
     scope: Weak<Mutex<AgentExecutionData>>,
 }
@@ -486,6 +530,29 @@ mod tests {
     use super::*;
     use std::sync::Barrier;
     use std::time::Duration;
+
+    #[test]
+    fn turn_abort_only_signals_matching_turn_without_closing_root() {
+        let scope = AgentExecutionScope::new();
+        let current = scope
+            .register_for_turn(ExecutionActivityKind::Inference, Some("current".into()))
+            .unwrap();
+        let other = scope
+            .register_for_turn(ExecutionActivityKind::Sandbox, Some("other".into()))
+            .unwrap();
+        let root = scope.child_cancel();
+        scope.cancel_turn("current");
+        scope.cancel_turn("current");
+        assert!(current.turn_cancel.is_cancelled());
+        assert!(!current.cancel.is_cancelled());
+        assert!(!other.turn_cancel.is_cancelled());
+        assert!(!root.is_cancelled());
+        assert_eq!(scope.admission(), ExecutionAdmission::Open);
+        assert!(!scope.turn_is_drained("current"));
+        current.mark_completed().unwrap();
+        assert!(scope.turn_is_drained("current"));
+        other.mark_completed().unwrap();
+    }
 
     #[test]
     fn concurrent_registration_and_sandbox_cleanup_are_serialized() {

@@ -33,6 +33,8 @@ pub enum AgentMessage {
         #[serde(default)]
         tool_calls: Vec<ToolCall>,
         usage: Option<TokenUsage>,
+        #[serde(default)]
+        stop_reason: Option<StopReason>,
     },
     ToolCall {
         resource_id: Option<ResourceID>,
@@ -47,6 +49,18 @@ pub enum AgentMessage {
     },
 }
 
+impl AgentMessage {
+    pub fn aborted_assistant() -> Self {
+        Self::Assistant {
+            reasoning: None,
+            content: Some("Turn aborted.".into()),
+            tool_calls: Vec::new(),
+            usage: None,
+            stop_reason: Some(StopReason::Cancelled),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
@@ -54,6 +68,7 @@ pub enum StopReason {
     ToolCalls,
     Length,
     ContentFilter,
+    Cancelled,
     Other(String),
 }
 
@@ -61,6 +76,15 @@ pub enum StopReason {
 pub struct InferenceResponse {
     pub message: AgentMessage,
     pub stop_reason: StopReason,
+}
+
+impl InferenceResponse {
+    pub fn aborted() -> Self {
+        Self {
+            message: AgentMessage::aborted_assistant(),
+            stop_reason: StopReason::Cancelled,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +97,32 @@ pub struct ToolDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_assistant_defaults_stop_reason_and_abort_round_trips() {
+        let legacy: AgentMessage = serde_json::from_str(
+            r#"{"type":"assistant","content":"old","reasoning":null,"tool_calls":[],"usage":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            AgentMessage::Assistant {
+                stop_reason: None,
+                ..
+            }
+        ));
+        let aborted = InferenceResponse::aborted();
+        assert_eq!(aborted.stop_reason, StopReason::Cancelled);
+        assert_eq!(
+            serde_json::from_value::<InferenceResponse>(serde_json::to_value(&aborted).unwrap())
+                .unwrap(),
+            aborted
+        );
+        assert!(matches!(aborted.message, AgentMessage::Assistant {
+            reasoning: None, content: Some(content), tool_calls, usage: None,
+            stop_reason: Some(StopReason::Cancelled),
+        } if content == "Turn aborted." && tool_calls.is_empty()));
+    }
 
     #[test]
     fn system_role_round_trips_without_changing_assistant_tool_calls() {
@@ -114,6 +164,7 @@ mod tests {
                 reasoning: None,
                 content: Some("partial".into()),
                 tool_calls: vec![],
+                stop_reason: Some(StopReason::Length),
                 usage: Some(TokenUsage {
                     input_tokens: 2,
                     output_tokens: 1,

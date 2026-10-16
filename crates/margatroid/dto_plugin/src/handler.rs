@@ -1,7 +1,7 @@
 use crate::{
     types::{
-        BackendStateReportCache, PendingMclCommandResponse, PendingMclCommandResponses,
-        PendingSnapshot, PendingWorkspaceResponse,
+        BackendStateReportCache, PendingAbortResponse, PendingMclCommandResponse,
+        PendingMclCommandResponses, PendingSnapshot, PendingWorkspaceResponse,
     },
     WebSocketMessageSend,
 };
@@ -17,7 +17,9 @@ use margatroid_protocol::{
     ProtocolErrorDto, ProtocolErrorKind, ServerMessage, WorkspaceInfoDto,
 };
 use margatroid_types::{
-    agent_components::Agent, dto_events::DtoHistorySnapshotCompleted,
+    agent_components::{Agent, AgentState},
+    agent_events::{AbortAgentTurn, AbortAgentTurnResult},
+    dto_events::DtoHistorySnapshotCompleted,
     history_components::AgentHistoryHandle,
 };
 use margatroid_types::{
@@ -96,9 +98,13 @@ fn route_request(
         .get_resource::<PendingMclCommandResponses>()
         .expect("DTO pending responses missing");
     if pending
-        .commands
+        .aborts
         .iter()
-        .any(|p| p.source == identity && p.id == request.id())
+        .any(|p| p.client == client && p.id == request.id())
+        || pending
+            .commands
+            .iter()
+            .any(|p| p.source == identity && p.id == request.id())
         || pending
             .workspaces
             .iter()
@@ -154,8 +160,59 @@ fn route_request(
                     reference: message.workspace,
                 });
         }
+        ClientMessage::AgentTurnAbort { id, message } => {
+            if message.turn_id.trim().is_empty() || message.turn_id.len() > 512 {
+                return Err(ProtocolError::new(
+                    ProtocolErrorKind::InvalidRequest,
+                    "invalid turn ID",
+                ));
+            }
+            let (entity, resource_id) =
+                resolve_agent(world, &message.workspace, message.agent.as_ref())?;
+            let agent = world.get_component::<Agent>(entity).unwrap();
+            let instance = agent.lua.instance.clone().ok_or_else(|| {
+                ProtocolError::new(ProtocolErrorKind::InvalidRequest, "agent VM is not ready")
+            })?;
+            let workspace = agent.workspace.clone();
+            let operation_id = operation_id();
+            let event = AbortAgentTurn {
+                id: operation_id.clone(),
+                agent: entity,
+                resource_id: resource_id.clone(),
+                workspace,
+                instance: instance.clone(),
+                expected_turn_id: message.turn_id.clone(),
+            };
+            world
+                .get_resource_mut::<PendingMclCommandResponses>()
+                .unwrap()
+                .aborts
+                .push(PendingAbortResponse {
+                    id,
+                    operation_id,
+                    connection_id,
+                    client,
+                    agent: entity,
+                    resource_id,
+                    workspace: message.workspace,
+                    instance,
+                    turn_id: message.turn_id,
+                });
+            world.send_event(event);
+        }
         ClientMessage::MclCommand { id, message } => {
-            let (_, target) = resolve_agent(world, &message.workspace, message.agent.as_ref())?;
+            let (entity, target) =
+                resolve_agent(world, &message.workspace, message.agent.as_ref())?;
+            if matches!(
+                world.get_component::<Agent>(entity).unwrap().state,
+                AgentState::Working
+            ) && is_user_injection(&message.command, &message.arguments)
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorKind::InvalidRequest,
+                    "cannot inject a user message while the agent is working",
+                ));
+            }
             let event = message.into_domain((id.clone(), identity.clone(), target.clone()))?;
             world
                 .get_resource_mut::<PendingMclCommandResponses>()
@@ -190,6 +247,24 @@ fn route_request(
     }
     Ok(())
 }
+fn is_user_injection(command: &str, arguments: &[serde_json::Value]) -> bool {
+    fn contains_user(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Array(values) => values.iter().any(contains_user),
+            serde_json::Value::Object(value) => {
+                value.get("type").and_then(|value| value.as_str()) == Some("user")
+                    || value.get("messages").is_some_and(contains_user)
+            }
+            _ => false,
+        }
+    }
+    let words: Vec<_> = command.split_whitespace().collect();
+    words.len() == 4
+        && words[0].eq_ignore_ascii_case("INJECT")
+        && words[1] == "?"
+        && words[2].eq_ignore_ascii_case("TO")
+        && arguments.iter().any(contains_user)
+}
 fn response_is_live<C: Copy + Eq + std::hash::Hash>(
     live: &std::collections::HashSet<(C, core_plugin::Entity)>,
     connection: C,
@@ -221,6 +296,9 @@ fn purge_disconnected_responses(world: &mut World) {
         .get_resource_mut::<PendingMclCommandResponses>()
         .unwrap();
     pending
+        .aborts
+        .retain(|pending| response_is_live(&live, pending.connection_id, pending.client));
+    pending
         .commands
         .retain(|pending| response_is_live(&live, pending.connection_id, pending.client));
     pending
@@ -232,6 +310,45 @@ fn purge_disconnected_responses(world: &mut World) {
 }
 pub(crate) fn handle_pending_mcl_responses(world: &mut World) {
     purge_disconnected_responses(world);
+    let aborts: Vec<_> = world
+        .event_reader::<AbortAgentTurnResult>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for result in aborts {
+        let pending = world
+            .get_resource_mut::<PendingMclCommandResponses>()
+            .unwrap();
+        let Some(index) = pending.aborts.iter().position(|p| {
+            p.operation_id == result.id
+                && p.agent == result.agent
+                && p.resource_id == result.resource_id
+                && p.workspace.id.0 == result.workspace.to_string()
+                && p.instance == result.instance
+                && p.turn_id == result.expected_turn_id
+        }) else {
+            continue;
+        };
+        let pending = pending.aborts.remove(index);
+        if world
+            .client_by_connection(pending.connection_id)
+            .is_some_and(|(entity, _)| entity == pending.client)
+        {
+            send_to_connection(
+                world,
+                pending.connection_id,
+                &ServerMessage::AgentTurnAbortResult {
+                    id: pending.id,
+                    workspace: pending.workspace,
+                    agent: pending.resource_id.into_dto(()).unwrap(),
+                    turn_id: pending.turn_id,
+                    result: result.result.map_err(|error| {
+                        ProtocolErrorDto::new(format!("{:?}", error.kind), error.message)
+                    }),
+                },
+            );
+        }
+    }
     let results: Vec<_> = world
         .event_reader::<MclCommandResult>()
         .into_iter()
@@ -770,7 +887,29 @@ pub(crate) async fn forward_logs(
 
 #[cfg(test)]
 mod response_tests {
-    use super::response_is_live;
+    use super::{is_user_injection, response_is_live};
+
+    #[test]
+    fn busy_user_injection_detection_handles_nested_messages_without_hiding_admin_arrays() {
+        assert!(is_user_injection(
+            "INJECT ? TO entry.pending[-1]",
+            &[
+                serde_json::json!([{ "type": "inject", "messages": [{ "type": "user", "content": "hello" }] }])
+            ]
+        ));
+        assert!(!is_user_injection(
+            "INJECT ? TO session.visible",
+            &[serde_json::json!(["tool_alias"])]
+        ));
+        assert!(!is_user_injection(
+            "GET entry.pending",
+            &[serde_json::json!([{ "type": "user", "content": "hello" }])]
+        ));
+        assert!(!is_user_injection(
+            "INJECT ? TO entry.pending[-1]",
+            &[serde_json::json!([{ "type": "assistant", "content": "user text" }])]
+        ));
+    }
     use core_plugin::World;
     use std::collections::HashSet;
 

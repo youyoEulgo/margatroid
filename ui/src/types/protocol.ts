@@ -36,6 +36,14 @@ export type AgentMessage =
       content: string | null;
       tool_calls: ToolCall[];
       usage?: TokenUsage | null;
+      stop_reason?:
+        | 'completed'
+        | 'tool_calls'
+        | 'length'
+        | 'content_filter'
+        | 'cancelled'
+        | { other: string }
+        | null;
     }
   | {
       type: 'tool_call';
@@ -51,7 +59,7 @@ export interface AgentState {
   workspace: WorkspaceRef;
   agent: string;
   agent_instance: string;
-  status: 'creating' | 'running' | 'stopping';
+  status: 'creating' | 'idle' | 'working' | 'stopping';
   turn: string | null;
   sandbox: string | null;
   queued_commands: number;
@@ -116,6 +124,11 @@ export type MclValueProjection =
   | { Text: string };
 export type MclCommandResult = { Ok: MclValueProjection } | { Err: ProtocolError };
 export type ClientMessage =
+  | {
+      type: 'agent.turn.abort';
+      id: string;
+      message: { workspace: WorkspaceRef; agent?: string | null; turn_id: string };
+    }
   | { type: 'connection.register'; id: string; message: { client_type: string } }
   | { type: 'state.query'; id: string; message: Record<string, never> }
   | {
@@ -134,6 +147,14 @@ export type ClientMessage =
       };
     };
 export type ServerMessage =
+  | {
+      type: 'agent.turn.abort_result';
+      id: string;
+      workspace: WorkspaceRef;
+      agent: string;
+      turn_id: string;
+      result: { Ok: null } | { Err: ProtocolError };
+    }
   | { type: 'connection.registered'; id: string; client: ClientInfo }
   | { type: 'connection.register_failed'; id: string; error: ProtocolError }
   | { type: 'state.sync'; state: BackendState }
@@ -224,6 +245,15 @@ export function parseServerMessage(raw: string): ServerMessage | null {
       case 'workspace.started':
       case 'workspace.stopped':
         return isRecord(value.workspace) ? (value as unknown as ServerMessage) : null;
+      case 'agent.turn.abort_result':
+        return typeof value.id === 'string' &&
+          isRecord(value.workspace) &&
+          typeof value.agent === 'string' &&
+          typeof value.turn_id === 'string' &&
+          isRecord(value.result) &&
+          (value.result.Ok === null || isRecord(value.result.Err))
+          ? (value as unknown as ServerMessage)
+          : null;
       case 'mcl.command_result':
         return typeof value.id === 'string' &&
           isRecord(value.result) &&

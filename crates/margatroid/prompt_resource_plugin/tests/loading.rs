@@ -392,7 +392,8 @@ fn typed_prompt_import_faithfully_preserves_system_user_and_assistant_roles() {
                     reasoning: None,
                     content: Some("prompt body".into()),
                     tool_calls: Vec::new(),
-                    usage: None
+                    usage: None,
+                    stop_reason: None,
                 },
             }]
         );

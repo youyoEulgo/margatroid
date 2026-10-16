@@ -136,7 +136,7 @@ fn prepare(world: &World, request: ToolExecuteRequest) -> Result<Prepared, ToolE
     let agent = world
         .get_component::<Agent>(request.agent)
         .ok_or_else(|| ToolError::new(ToolErrorKind::AgentNotAlive, "Agent missing"))?;
-    if !matches!(agent.state, AgentState::Running) {
+    if !matches!(agent.state, AgentState::Working) {
         return Err(ToolError::new(
             ToolErrorKind::AgentNotAlive,
             "agent not running",
@@ -193,18 +193,22 @@ fn prepare(world: &World, request: ToolExecuteRequest) -> Result<Prepared, ToolE
     }
     let activity = agent
         .execution
-        .register_with_snapshot(ExecutionActivityKind::Sandbox, || {
-            agent
-                .sandbox
-                .as_ref()
-                .map(|selected| {
-                    Ok(SandboxPolicySnapshot {
-                        resource_id: selected.resource_id.clone(),
-                        policy: selected.policy.clone(),
+        .register_for_turn_with_snapshot(
+            ExecutionActivityKind::Sandbox,
+            request.turn.clone(),
+            || {
+                agent
+                    .sandbox
+                    .as_ref()
+                    .map(|selected| {
+                        Ok(SandboxPolicySnapshot {
+                            resource_id: selected.resource_id.clone(),
+                            policy: selected.policy.clone(),
+                        })
                     })
-                })
-                .transpose()
-        })
+                    .transpose()
+            },
+        )
         .map_err(|_| {
             ToolError::new(
                 ToolErrorKind::ExecutionBusy,
@@ -248,6 +252,23 @@ pub(crate) fn handle_tool_execute(world: &mut World, mut request: ToolExecuteReq
         return;
     };
     request.reply = std::sync::Arc::new(std::sync::Mutex::new(Some(sender)));
+    if world
+        .get_component::<Agent>(request.agent)
+        .is_some_and(|agent| {
+            !matches!(agent.state, AgentState::Working)
+                || request.turn.is_none()
+                || request.turn != agent.turn
+        })
+    {
+        reply(
+            &request,
+            Ok(ToolExecuteResponse::aborted(
+                Some(request.resource.resource_id.clone()),
+                &request.call,
+            )),
+        );
+        return;
+    }
     let prepared = match prepare(world, request.clone()) {
         Ok(p) => p,
         Err(e) => {
@@ -317,18 +338,21 @@ async fn execute(mut prepared: Prepared) {
     }
     prepared.started = true;
     let started_at = tokio::time::Instant::now();
-    let result = AssertUnwindSafe(async {
+    let mut result = AssertUnwindSafe(async {
         let timeout = tokio::time::sleep(prepared.config.limits.execution_timeout);
         tokio::pin!(timeout);
         let file = bounded_file(&prepared.path, prepared.config.limits.script_bytes);
         let text = tokio::select! {
-            result = file => result?,
+            biased;
             _ = prepared.activity.cancel.cancelled() => return Err(ToolError::new(ToolErrorKind::Cancelled, "scope cancelled")),
             _ = prepared.request.cancel.cancelled() => return Err(ToolError::new(ToolErrorKind::Cancelled, "request cancelled")),
+            _ = prepared.activity.turn_cancel.cancelled() => return Ok(None),
             _ = &mut timeout => return Err(ToolError::new(ToolErrorKind::Timeout, "resource read timed out")),
             _ = crate::process::closed(&prepared.request.reply) => return Err(ToolError::new(ToolErrorKind::Cancelled, "receiver closed")),
+            result = file => result?,
         };
         if prepared.activity.cancel.is_cancelled() || prepared.request.cancel.is_cancelled() || receiver_closed(&prepared.request) { return Err(ToolError::new(ToolErrorKind::Cancelled, "request cancelled")); }
+        if prepared.activity.turn_cancel.is_cancelled() { return Ok(None); }
         let temp = tempfile::Builder::new().prefix("margatroid-tool-").tempdir().map_err(|_| ToolError::new(ToolErrorKind::PreparationFailed, "temporary directory creation failed"))?;
         prepared.context.temp_dir = temp.path().to_path_buf();
         let mut limits = prepared.config.limits.clone();
@@ -336,7 +360,7 @@ async fn execute(mut prepared: Prepared) {
         limits.host_call_timeout = limits.host_call_timeout.min(limits.execution_timeout);
         if limits.execution_timeout.is_zero() { return Err(ToolError::new(ToolErrorKind::Timeout, "preparation exhausted deadline")); }
         let payload = RunnerRequest { protocol_version: 1, script: text, arguments: prepared.arguments.clone(), context: prepared.context.clone(), limits };
-        let result = crate::process::run_runner(&prepared.config.runner_path, payload, prepared.activity.sandbox_snapshot.as_ref().map(|s| s.policy.as_ref()), &prepared.activity.cancel, &prepared.request.cancel, &prepared.request.reply).await;
+        let result = crate::process::run_runner(&prepared.config.runner_path, payload, prepared.activity.sandbox_snapshot.as_ref().map(|s| s.policy.as_ref()), &prepared.activity.cancel, &prepared.request.cancel, &prepared.activity.turn_cancel, &prepared.request.reply).await;
         if result.as_ref().is_err_and(|e| e.kind == ToolErrorKind::CleanupFailed) { let _ = temp.keep(); return result; }
         if temp.close().is_err() { return Err(ToolError::new(ToolErrorKind::CleanupFailed, "temporary directory cleanup failed")); }
         result
@@ -352,9 +376,21 @@ async fn execute(mut prepared: Prepared) {
                 message: "tool execution cleanup failed".into(),
             });
     } else {
-        let _ = prepared.activity.mark_completed();
+        if let Err(error) = prepared.activity.mark_completed() {
+            prepared.activity.mark_cleanup_failed(error.clone());
+            result = Err(ToolError::new(
+                ToolErrorKind::CleanupFailed,
+                error.to_string(),
+            ));
+        }
     }
     let result = result.map(|output| {
+        let Some(output) = output else {
+            return ToolExecuteResponse::aborted(
+                Some(prepared.request.resource.resource_id.clone()),
+                &prepared.request.call,
+            );
+        };
         let (content, failed) = tool_outcome(output);
         ToolExecuteResponse {
             message: AgentMessage::ToolCall {

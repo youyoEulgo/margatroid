@@ -104,6 +104,29 @@ pub struct StopAgentResult {
 impl Event for StopAgentResult {}
 
 #[derive(Clone, Debug)]
+pub struct AbortAgentTurn {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceID,
+    pub workspace: ResourceID,
+    pub instance: crate::lua_runtime_components::DriverLuaVmInstance,
+    pub expected_turn_id: String,
+}
+impl Event for AbortAgentTurn {}
+
+#[derive(Clone, Debug)]
+pub struct AbortAgentTurnResult {
+    pub id: String,
+    pub agent: Entity,
+    pub resource_id: ResourceID,
+    pub workspace: ResourceID,
+    pub instance: crate::lua_runtime_components::DriverLuaVmInstance,
+    pub expected_turn_id: String,
+    pub result: Result<(), AgentError>,
+}
+impl Event for AbortAgentTurnResult {}
+
+#[derive(Clone, Debug)]
 pub struct AgentException {
     pub exception_id: String,
     pub agent: Entity,

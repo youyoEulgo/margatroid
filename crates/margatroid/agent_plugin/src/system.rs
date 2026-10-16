@@ -4,6 +4,17 @@ use margatroid_types::lua_runtime_events::{
     DriverLuaVmExceptionResult, StartDriverLuaVmResult, StopDriverLuaVmResult,
 };
 
+pub fn abort_agent_turn_system(world: &mut World) {
+    let requests = world
+        .event_reader::<AbortAgentTurn>()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for request in requests {
+        handle_abort_agent_turn(world, request);
+    }
+}
+
 pub fn start_agent_system(world: &mut World) {
     let requests: Vec<_> = world
         .event_reader::<StartAgent>()

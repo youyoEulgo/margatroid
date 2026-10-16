@@ -2375,3 +2375,12 @@ textarea:focus-visible {
 .record-note--mcl {
   color: var(--mg-text-secondary);
 }
+
+.message-row--aborted .message-content {
+  color: var(--color-error, #e05252);
+}
+
+.abort-pending-label {
+  color: var(--mg-text-quaternary);
+  font-size: 12px;
+}

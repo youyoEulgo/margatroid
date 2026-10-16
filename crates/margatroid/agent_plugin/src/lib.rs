@@ -55,6 +55,7 @@ impl Plugin for AgentPlugin {
             .register_library::<Agent>("agent")
             .expect("agent library registration failed");
         app.world_mut().insert_resource(AgentPluginInstalled);
+        app.add_system(RuntimePlugin::PRE_UPDATE, abort_agent_turn_system);
         app.add_system(&self.schedule, start_agent_system)
             .add_system(&self.schedule, stop_agent_system)
             .add_system(&self.schedule, agent_exception_system);

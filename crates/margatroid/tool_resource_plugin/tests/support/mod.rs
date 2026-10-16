@@ -48,7 +48,7 @@ pub fn agent(app: &mut App, dependencies: &[&str]) -> (Entity, ResourceID) {
         workspace: ResourceID::parse("workspace:local/test").unwrap(),
         sandbox: None,
         lua: Default::default(),
-        state: AgentState::Running,
+        state: AgentState::Idle,
         history: database.history(),
         database,
         import_bindings: Default::default(),

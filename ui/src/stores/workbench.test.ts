@@ -47,7 +47,7 @@ const state: BackendState = {
       workspace,
       agent: workspace.manager,
       agent_instance: 'Entity(1, 2)',
-      status: 'running',
+      status: 'idle',
       turn: null,
       sandbox: null,
       queued_commands: 0,
@@ -242,7 +242,7 @@ test('compatibility failures and abort remain truthful without legacy protocol',
   assert.deepEqual(store.resourceVisibility, []);
   assert.deepEqual(store.sandboxOptions, { options: [], activated: [] });
   assert.equal(store.canAbortTurn, false);
-  await assert.rejects(store.abortTurn(), /not supported/);
+  await assert.rejects(store.abortTurn(), /No abortable turn/);
   assert.equal('sendSkillInvocation' in store, false);
   await assert.rejects(
     store.setResourceVisibility('tool:local/unknown', true),
@@ -253,7 +253,7 @@ test('compatibility failures and abort remain truthful without legacy protocol',
     type: 'state.sync',
     state: {
       ...state,
-      agents: [{ ...state.agents[0]!, turn: 'active' }],
+      agents: [{ ...state.agents[0]!, status: 'working', turn: 'active' }],
     },
   });
   assert.equal(store.selectedAgentWorking, true);
@@ -523,4 +523,144 @@ test('usage comes from persisted history, not state token counters', () => {
     },
   });
   assert.deepEqual(store.tokenUsage, { input: 10, output: 5, cached: 3 });
+});
+
+test('composer gates on status not turn or generic MCL pending', async () => {
+  setActivePinia(createPinia());
+  const store = useWorkbenchStore();
+  const sync = (
+    status: 'idle' | 'working' | 'creating' | 'stopping',
+    turn: string | null,
+    pending_command: string | null,
+  ) =>
+    store.handleServerMessage({
+      type: 'state.sync',
+      state: { ...state, agents: [{ ...state.agents[0]!, status, turn, pending_command }] },
+    });
+  sync('idle', 'stale', 'admin-command');
+  assert.equal(store.selectedAgentIdle, true);
+  assert.equal(store.selectedAgentWorking, false);
+  assert.equal(store.canAbortTurn, false);
+  sync('working', 'turn-1', null);
+  assert.equal(store.selectedAgentIdle, false);
+  assert.equal(store.canAbortTurn, true);
+  await assert.rejects(store.sendMessage('no overlap'), /not idle/);
+  sync('working', null, null);
+  assert.equal(store.selectedAgentWorking, true);
+  assert.equal(store.abortPending, true);
+  assert.equal(store.canAbortTurn, false);
+  for (const status of ['creating', 'stopping'] as const) {
+    sync(status, null, null);
+    assert.equal(store.selectedAgentIdle, false);
+    assert.equal(store.selectedAgentWorking, false);
+  }
+});
+
+test('cancelled assistant history preserves split metadata without content inference', () => {
+  const history: AgentHistory = {
+    workspace,
+    agent: workspace.manager,
+    messages: [
+      {
+        key: 'cancel',
+        sequence: 1,
+        turn: 't',
+        kind: 'message',
+        content: 'other text',
+        payload: {
+          type: 'assistant',
+          reasoning: null,
+          tool_calls: [],
+          usage: null,
+          stop_reason: 'cancelled',
+        },
+        created_at_ms: 123,
+      },
+      {
+        key: 'ordinary',
+        sequence: 2,
+        turn: 't',
+        kind: 'message',
+        content: 'Turn aborted.',
+        payload: { type: 'assistant', reasoning: null, tool_calls: [] },
+        created_at_ms: 124,
+      },
+    ],
+  };
+  const entries = historyEntries(history);
+  assert.equal(entries[0]?.role, 'assistant');
+  assert.equal(entries[0]?.content, 'Turn aborted.');
+  assert.equal(entries[0]?.aborted, true);
+  assert.equal(entries[0]?.failed, false);
+  assert.equal(entries[0]?.timestamp, 123);
+  assert.equal(entries[1]?.aborted, false);
+  assert.deepEqual(entries[0]?.payload, history.messages[0]?.payload);
+});
+
+test('abort uses independent API and ignores mismatched correlation', async () => {
+  setActivePinia(createPinia());
+  const store = useWorkbenchStore();
+  const sent: Array<{ type: string; id: string; message: { turn_id: string } }> = [];
+  const oldSocket = globalThis.WebSocket;
+  class Socket {
+    static OPEN = 1;
+    readyState = 1;
+    onopen = null;
+    onclose = null;
+    onmessage = null;
+    onerror = null;
+    close() {}
+    send(raw: string) {
+      sent.push(JSON.parse(raw));
+    }
+  }
+  globalThis.WebSocket = Socket as unknown as typeof WebSocket;
+  try {
+    store.handleServerMessage({
+      type: 'state.sync',
+      state: { ...state, agents: [{ ...state.agents[0]!, status: 'working', turn: 'turn-1' }] },
+    });
+    store.connect();
+    store.handleServerMessage({
+      type: 'connection.registered',
+      id: 'r',
+      client: { resource_id: 'client:test', client_type: 'webui', name: 'test' },
+    });
+    const promise = store.abortTurn();
+    const request = sent.find((item) => item.type === 'agent.turn.abort')!;
+    assert.equal(request.message.turn_id, 'turn-1');
+    assert.equal(store.abortPending, true);
+    await assert.rejects(store.abortTurn(), /No abortable/);
+    store.handleServerMessage({
+      type: 'agent.turn.abort_result',
+      id: request.id,
+      workspace,
+      agent: workspace.manager,
+      turn_id: 'wrong',
+      result: { Ok: null },
+    });
+    assert.equal(store.abortPending, true);
+    store.handleServerMessage({
+      type: 'agent.turn.abort_result',
+      id: request.id,
+      workspace,
+      agent: workspace.manager,
+      turn_id: 'turn-1',
+      result: { Ok: null },
+    });
+    await promise;
+    assert.equal(store.selectedAgentIdle, false);
+    assert.equal(store.abortPending, true);
+    store.handleServerMessage({
+      type: 'state.sync',
+      state: { ...state, agents: [{ ...state.agents[0]!, status: 'working', turn: null }] },
+    });
+    assert.equal(store.abortPending, true);
+    store.handleServerMessage({ type: 'state.sync', state });
+    assert.equal(store.abortPending, false);
+    assert.equal(store.selectedAgentIdle, true);
+  } finally {
+    store.disconnect();
+    globalThis.WebSocket = oldSocket;
+  }
 });

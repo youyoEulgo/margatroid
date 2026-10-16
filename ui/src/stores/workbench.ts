@@ -30,6 +30,7 @@ export interface ConversationEntry {
   content: string;
   toolCalls: ToolCall[];
   failed: boolean;
+  aborted?: boolean;
   timestamp: number;
   kind: string;
   payload: unknown;
@@ -153,7 +154,9 @@ function payloadRequestId(entry: HistoryMessage): string {
 }
 function decodeMessage(
   message: AgentMessage,
-): Array<Pick<ConversationEntry, 'role' | 'thinking' | 'content' | 'toolCalls' | 'failed'>> {
+): Array<
+  Pick<ConversationEntry, 'role' | 'thinking' | 'content' | 'toolCalls' | 'failed' | 'aborted'>
+> {
   switch (message.type) {
     case 'inject':
       return message.messages.flatMap(decodeMessage);
@@ -173,7 +176,8 @@ function decodeMessage(
         {
           role: 'assistant',
           thinking: message.reasoning ?? '',
-          content: message.content ?? '',
+          content: message.stop_reason === 'cancelled' ? 'Turn aborted.' : (message.content ?? ''),
+          aborted: message.stop_reason === 'cancelled',
           toolCalls: message.tool_calls,
           failed: false,
         },
@@ -208,7 +212,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       }
     >(),
   );
-  const canAbortTurn = computed(() => false);
+  const abortRequests = ref(
+    new Map<string, { workspace: string; agent: string; turn: string; instance: string }>(),
+  );
   const connectionStatus = ref<ConnectionStatus>('offline');
   const connectionError = ref('');
   const registeredClient = ref<ClientInfo | null>(null);
@@ -241,9 +247,25 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           state.agent === selectedAgentId.value,
       ) ?? null,
   );
-  const selectedAgentReady = computed(() => selectedAgentState.value?.status === 'running');
-  const selectedAgentWorking = computed(
-    () => !!selectedAgentState.value?.turn || !!selectedAgentState.value?.pending_command,
+  const selectedAgentReady = computed(() =>
+    ['idle', 'working'].includes(selectedAgentState.value?.status ?? ''),
+  );
+  const selectedAgentIdle = computed(() => selectedAgentState.value?.status === 'idle');
+  const selectedAgentWorking = computed(() => selectedAgentState.value?.status === 'working');
+  const abortPending = computed(
+    () =>
+      selectedAgentWorking.value &&
+      (!selectedAgentState.value?.turn ||
+        [...abortRequests.value.values()].some(
+          (request) =>
+            request.workspace === selectedWorkspaceKey.value &&
+            request.agent === selectedAgentId.value &&
+            request.instance === selectedAgentState.value?.agent_instance &&
+            request.turn === selectedAgentState.value?.turn,
+        )),
+  );
+  const canAbortTurn = computed(
+    () => selectedAgentWorking.value && !!selectedAgentState.value?.turn && !abortPending.value,
   );
   const driverKey = computed(() =>
     selectedAgentState.value
@@ -331,6 +353,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       command.reject(new Error(message));
     }
     pending.clear();
+    abortRequests.value.clear();
   }
   function closeSocket() {
     if (socket) {
@@ -468,6 +491,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
   async function sendMessage(content: string): Promise<unknown> {
     if (!content.trim()) throw new Error('Message is empty');
+    if (!selectedAgentIdle.value) throw new Error('The selected agent is not idle');
     const key = driverKey.value;
     const instruction = contextInjection(content.trim(), driverContextPath.value);
     lastFailures.value.delete(`${selectedWorkspaceKey.value}:${selectedAgentId.value}`);
@@ -591,10 +615,45 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     await refreshDriverResources(true);
     return result;
   }
-  function abortTurn(): Promise<never> {
-    return Promise.reject(
-      new Error('Turn cancellation is not supported by the current backend protocol'),
-    );
+  function abortTurn(): Promise<unknown> {
+    const workspace = selectedWorkspace.value;
+    const state = selectedAgentState.value;
+    if (!workspace || !state || !canAbortTurn.value || !state.turn)
+      return Promise.reject(new Error('No abortable turn is active'));
+    if (!socket || socket.readyState !== WebSocket.OPEN || !registeredClient.value)
+      return Promise.reject(new Error('Register a daemon connection first'));
+    const id = crypto.randomUUID();
+    const request: ClientMessage = {
+      type: 'agent.turn.abort',
+      id,
+      message: {
+        workspace: { id: workspace.id, name: workspace.name, project_root: workspace.project_root },
+        agent: state.agent,
+        turn_id: state.turn,
+      },
+    };
+    abortRequests.value.set(id, {
+      workspace: workspace.id,
+      agent: state.agent,
+      turn: state.turn,
+      instance: state.agent_instance,
+    });
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        pending.delete(id);
+        abortRequests.value.delete(id);
+        reject(new Error('Abort result timed out; cleanup may still be pending'));
+      }, 120000);
+      pending.set(id, { resolve, reject, timeout });
+      try {
+        socket!.send(JSON.stringify(request));
+      } catch (error) {
+        clearTimeout(timeout);
+        pending.delete(id);
+        abortRequests.value.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
   }
   function handleDelta(event: StreamDelta, reasoning: boolean) {
     const state = agentStates.value.find(
@@ -652,6 +711,20 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       case 'state.sync': {
         workspaces.value = event.state.workspaces;
         agentStates.value = event.state.agents;
+        for (const [id, request] of abortRequests.value) {
+          if (
+            !pending.has(id) &&
+            !agentStates.value.some(
+              (state) =>
+                state.workspace.id === request.workspace &&
+                state.agent === request.agent &&
+                state.agent_instance === request.instance &&
+                state.status === 'working' &&
+                (state.turn === request.turn || state.turn === null),
+            )
+          )
+            abortRequests.value.delete(id);
+        }
         for (const state of agentStates.value) {
           if (state.error) {
             lastFailures.value.set(`${state.workspace.id}:${state.agent}`, {
@@ -693,6 +766,27 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       case 'workspace.stop_failed':
         addLog('ERROR', errorMessage(event.error));
         break;
+      case 'agent.turn.abort_result': {
+        const request = abortRequests.value.get(event.id);
+        if (
+          !request ||
+          request.workspace !== event.workspace.id ||
+          request.agent !== event.agent ||
+          request.turn !== event.turn_id
+        )
+          break;
+        const command = pending.get(event.id);
+        if (command) {
+          clearTimeout(command.timeout);
+          pending.delete(event.id);
+          if ('Ok' in event.result) command.resolve(null);
+          else {
+            abortRequests.value.delete(event.id);
+            command.reject(new Error(errorMessage(event.result.Err)));
+          }
+        }
+        break;
+      }
       case 'mcl.command_result': {
         const command = pending.get(event.id);
         if (command) {
@@ -734,6 +828,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         );
         break;
       case 'request.failed': {
+        abortRequests.value.delete(event.id);
         const command = pending.get(event.id);
         if (command) {
           clearTimeout(command.timeout);
@@ -803,6 +898,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedAgentName,
     selectedAgentState,
     selectedAgentReady,
+    selectedAgentIdle,
+    abortPending,
     selectedAgentWorking,
     loadedResources,
     resourceVisibility,
