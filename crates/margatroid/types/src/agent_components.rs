@@ -8,7 +8,7 @@ use crate::history_components::{AgentHistoryHandle, HistoryRecord};
 use crate::mcl_events::AgentMclQueue;
 use crate::message_types::AgentMessage;
 use crate::resource_components::{
-    AgentImageModelConfig, CallableDefinitionSnapshot, CallableResource, SandboxResource,
+    AgentDriverModelConfig, CallableDefinitionSnapshot, CallableResource, SandboxResource,
     SandboxValue,
 };
 use async_runtime_plugin::{AsyncRuntimeHandle, WorldAsyncExt};
@@ -112,11 +112,11 @@ impl ImportBindings {
 
 #[derive(Clone, Debug)]
 pub struct AgentInfo {
-    pub model: AgentImageModelConfig,
+    pub model: AgentDriverModelConfig,
     pub project_root: PathBuf,
     pub home_root: PathBuf,
-    pub image: ResourceID,
-    pub image_dependencies: Arc<[ResourceID]>,
+    pub driver: ResourceID,
+    pub driver_dependencies: Arc<[ResourceID]>,
 }
 #[derive(Clone, Debug)]
 pub enum AgentState {
@@ -254,7 +254,7 @@ impl WorldAgentExt for World {
         let agent = self.get_component::<Agent>(entity).unwrap();
         if let Some(ref value) = sandbox {
             if value.resource_id.resource_type() != "sandbox"
-                || !agent.info.image_dependencies.contains(&value.resource_id)
+                || !agent.info.driver_dependencies.contains(&value.resource_id)
                 || !agent.import_bindings.bindings.values().any(|binding| {
                     matches!(binding,
                     ImportedValue::Sandbox(imported) if imported.resource_id == value.resource_id)
@@ -378,7 +378,7 @@ impl WorldAgentExt for World {
             .next()
             .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
             && alias_bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
-        if !valid_alias || !valid_kind || !agent.info.image_dependencies.contains(resource_id) {
+        if !valid_alias || !valid_kind || !agent.info.driver_dependencies.contains(resource_id) {
             return Err(AgentError::new(
                 AgentErrorKind::InvalidDefinition,
                 "invalid import alias, kind or undeclared source",
@@ -509,7 +509,7 @@ mod tests {
         let agent = Agent {
             resourceid: agent_id.clone(),
             info: AgentInfo {
-                model: AgentImageModelConfig {
+                model: AgentDriverModelConfig {
                     model: "test".into(),
                     temperature: None,
                     max_output_tokens: None,
@@ -518,8 +518,8 @@ mod tests {
                 },
                 project_root: PathBuf::from("/tmp/project"),
                 home_root: PathBuf::from("/tmp/home"),
-                image: id("image:local/test"),
-                image_dependencies: Arc::from([
+                driver: id("driver:local/test"),
+                driver_dependencies: Arc::from([
                     id("sandbox:local/first"),
                     id("sandbox:local/second"),
                     id("prompt:local/first"),
@@ -640,7 +640,7 @@ mod tests {
             .get_component_mut::<Agent>(entity)
             .unwrap()
             .info
-            .image_dependencies = Arc::from(legacy.clone());
+            .driver_dependencies = Arc::from(legacy.clone());
         for source in legacy {
             assert_eq!(
                 app.world()

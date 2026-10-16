@@ -8,7 +8,7 @@ use margatroid_types::history_components::{
 use margatroid_types::lua_environment::*;
 use margatroid_types::lua_runtime_components::DriverLuaVmInstance;
 use margatroid_types::mcl_environment::MclEnvironmentFactory;
-use margatroid_types::resource_components::AgentImageModelConfig;
+use margatroid_types::resource_components::AgentDriverModelConfig;
 use mcl_plugin::MclPlugin;
 use resource_id_plugin::{ResourcePlugin, WorldResourceExt};
 use std::sync::{Arc, Mutex};
@@ -38,7 +38,7 @@ fn app() -> (App, Entity) {
             Agent {
                 resourceid: "agent:test/a".parse().unwrap(),
                 info: AgentInfo {
-                    model: AgentImageModelConfig {
+                    model: AgentDriverModelConfig {
                         model: "test".into(),
                         temperature: None,
                         max_output_tokens: None,
@@ -47,8 +47,8 @@ fn app() -> (App, Entity) {
                     },
                     project_root: Default::default(),
                     home_root: Default::default(),
-                    image: "agent_image:test/a".parse().unwrap(),
-                    image_dependencies: Arc::from([]),
+                    driver: "driver:test/a".parse().unwrap(),
+                    driver_dependencies: Arc::from([]),
                 },
                 workspace: "workspace:test/a".parse().unwrap(),
                 sandbox: None,

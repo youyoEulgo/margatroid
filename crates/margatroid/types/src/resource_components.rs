@@ -32,7 +32,7 @@ macro_rules! resource_inner {
 resource_inner!(ToolResource, PromptResource, SandboxResource);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AgentImageModelConfig {
+pub struct AgentDriverModelConfig {
     pub model: String,
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -45,11 +45,11 @@ pub struct AgentImageModelConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct AgentImage {
+pub struct AgentDriver {
     pub base_driver: Arc<str>,
     pub origin: Arc<PathBuf>,
     pub dependencies: Arc<[resource_id_plugin::ResourceID]>,
-    pub model: AgentImageModelConfig,
+    pub model: AgentDriverModelConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -83,7 +83,7 @@ ResourceInner：资源条目契约，公开trait--统一读取条目的本地别
 
 ResourcesComponent：资源集合组件，公开trait--扩展已有集合契约，不另建重复的资源查询trait
     约束：Component
-    type Inner: Send + Sync + 'static--集合的具体资源条目类型；不强制镜像等既有条目实现ResourceInner
+    type Inner: Send + Sync + 'static--集合的具体资源条目类型；不强制驱动等既有条目实现ResourceInner
     list_id(&self) -> impl Iterator<Item = &ResourceID> + '_
         列出多个资源ID：公开trait方法，返回集合的全部ID，而非单个ID
         约束：Self::Inner: ResourceInner
@@ -125,9 +125,9 @@ WorldResourceExt：资源管理世界扩展，公开trait--定义及纯查询/�
 组件分类：
     一个领域Entity恰好有一个LibraryComponent，可以同时有多个不同具体类型的ResourcesComponent
     Agent、Workspace、Client属于图书馆组件，各自在组件内部保存自身ResourceID
-    ToolResource、PromptResource、SandboxResource和AgentImage属于资源条目
+    ToolResource、PromptResource、SandboxResource和AgentDriver属于资源条目
     资源条目通过ResourceSet<T>挂载，不把这些条目本身标为LibraryComponent
-    AgentImage明确属于资源类，不再作为独立图书馆实体，不另挂旧ResourceId组件
+    AgentDriver明确属于资源类，不再作为独立图书馆实体，不另挂旧ResourceId组件
 
 MCL当前分类（不改变基础集合分类）：
     IMPORT TOOL仅接受tool，IMPORT MESSAGE接受prompt，IMPORT SANDBOX接受sandbox
@@ -146,7 +146,7 @@ trait的能力边界：
     两个trait不是互斥机制，单个Entity只能有一个图书馆组件的检查由统一挂载入口完成
 
 ECS挂载边界：
-    ResourceSet<ToolResource>与ResourceSet<AgentImage>是不同具体组件类型，可以共存
+    ResourceSet<ToolResource>与ResourceSet<AgentDriver>是不同具体组件类型，可以共存
     再次插入同一具体组件类型遵循ECS语义，替换整份旧组件，不自动合并集合
     只更新一个资源条目时修改集合的对应键，不重新插入整份集合
     基础ECS的insert_component仍可能绕过检查；实现时所有领域图书馆挂载必须收口到受检入口
@@ -271,7 +271,7 @@ validate_tag(value: &str) -> Result<(), ResourceIDError>
     tool -> ResourceSet<ToolResource>
     prompt -> ResourceSet<PromptResource>
     sandbox -> ResourceSet<SandboxResource>
-    image -> ResourceSet<AgentImage>
+    driver -> ResourceSet<AgentDriver>
     agent -> Agent
     workspace -> Workspace
     client -> Client
@@ -412,15 +412,15 @@ ResourceComponentKind：组件分类，公开共享枚举--定义于本基础cra
         ResourceSet<ToolResource>
             tool:local/bash:latest -> ToolResource { alias, description, input_schema, script_path }
             tool:local/review:latest -> ToolResource
-        ResourceSet<AgentImage>
-            image:local/coder:latest -> AgentImage
+        ResourceSet<AgentDriver>
+            driver:local/coder:latest -> AgentDriver
     Agent B Entity
         Agent { resource_id: agent:demo/b:latest }
         ResourceSet<ToolResource>
             tool:local/bash:latest -> ToolResource { alias, description, input_schema, script_path }
     查询tool:local/bash:latest返回Agent A和Agent B的Entity
-    查询image:local/coder:latest返回所有挂载对应镜像条目的Entity，而不是独立镜像实体
-    示例不规定只能由Agent保存镜像，Workspace也可挂载ResourceSet<AgentImage>
+    查询driver:local/coder:latest返回所有挂载对应驱动条目的Entity，而不是独立驱动实体
+    示例不规定只能由Agent保存驱动，Workspace也可挂载ResourceSet<AgentDriver>
 
 数据唯一来源：
     每个Entity自己的ResourceSet<T>是该Entity使用该类资源的数据来源
@@ -428,7 +428,7 @@ ResourceComponentKind：组件分类，公开共享枚举--定义于本基础cra
     磁盘包可以仍位于全局路径，与每个Entity拥有自己的运行时条目不冲突
     重复IMPORT不因同ID已存在而跳过，仍重新加载；成功仅替换目标集合对应ID键，不自动覆盖其他Entity的条目
     合理安全补充：读取、校验或挂载失败保留原条目并返回失败，不能把旧条目当作本次加载成功
-    IMPORT的Agent许可由调用方按Agent.info.image_dependencies完整ID精确匹配，无builtin例外；基础集合及加载插件不重复执行该领域许可检查
+    IMPORT的Agent许可由调用方按Agent.info.driver_dependencies完整ID精确匹配，无builtin例外；基础集合及加载插件不重复执行该领域许可检查
     alias属于所在Entity的本地使用名称，不属于全局ResourceID；消费方准备可见集合时不同ID的alias冲突必须失败，Inference与tool_call一致
     一份集合内一个ID对应一个条目；需要同一资源多个别名时须另行设计别名表，不用重复map键表示
 
@@ -448,7 +448,7 @@ ResourceComponentKind：组件分类，公开共享枚举--定义于本基础cra
     ResourceSet<T>与ResourceInner、ResourcesComponent实际定义于本基础crate的components.rs，由定义侧实现Component及集合trait
     业务crate不再分别为ResourceSet<ToolResource>等具体实例重复实现Component
     ToolResource等条目的alias与ResourceInner实现由共享领域components文件定义，本基础设施不依赖具体领域类型
-    AgentImage本次不改，不新增alias或ResourceInner实现；ResourceSet的基本存储、get和resource_ids不要求ResourceInner，保持既有镜像集合兼容
+    AgentDriver本次不改，不新增alias或ResourceInner实现；ResourceSet的基本存储、get和resource_ids不要求ResourceInner，保持既有驱动集合兼容
     ResourceInner约束只用于新增条目查询契约的方法，不扩散到集合的Component实现、注册及基础查询
 ```
 
@@ -502,8 +502,8 @@ ResourceError：资源管理错误，公开枚举
     删除ResourceOwners、install_resource创建共享资源实体的模式及release_resource_owner回收模式
     LibraryComponent由空标记改为提供自身ID的方法，新增ResourcesComponent
     原有ToolResource、PromptResource、SandboxResource不再作为独立图书馆组件挂载
-    AgentImage同样迁为ResourceSet<AgentImage>中的资源条目，删除其LibraryComponent身份
+    AgentDriver同样迁为ResourceSet<AgentDriver>中的资源条目，删除其LibraryComponent身份
     移除依赖计数和资源GC计划，依靠实体拥有组件的生命周期释放资源条目
-    Workspace等领域文档与本契约同步；基础设施不保留ResourceRef、独立镜像Entity或GC作为兼容目标
+    Workspace等领域文档与本契约同步；基础设施不保留ResourceRef、独立驱动Entity或GC作为兼容目标
     本文不落实其他插件的字段迁移、事件改造、磁盘加载接口或执行快照实现
 ```

@@ -74,14 +74,14 @@ SandboxResourcePlugin：沙箱加载插件，公开结构体
     ResourceID只在ResourceSet键中；同ID可独立存在于不同目标，不创建独立资源Entity或ResourceId组件
     alias不改变全局身份；import_kind为None时是普通加载，Agent及非Agent目标均不发布import_bindings
     import_kind为Some(InnerType::Sandbox)时执行明确类型导入；声明与地址不匹配立即拒绝，目标必须是唯一解析到原完整Entity的Agent
-    validate_resource_import在提交及挂载阶段调用agent_validate_import，检查image_dependencies精确许可、alias及同ID同kind规则；不依赖AgentPlugin安装标记
+    validate_resource_import在提交及挂载阶段调用agent_validate_import，检查driver_dependencies精确许可、alias及同ID同kind规则；不依赖AgentPlugin安装标记
     Agent.import_bindings是唯一alias绑定事实，同alias其他ID或kind冲突保旧；同ID改名先预检新名，成功发布删除旧名，不复制全局alias注册表
     本crate重导出共享条目、加载请求、观察结果、公共错误与本类读取限制；本类LoadError及LoadErrorKind是通用错误类型别名
     Tool共享条目只保存脚本路径；按需读取由执行消费侧负责，不宣称资源加载插件提供read_script异步方法
 根目录：
-    资源包只能来自root/sandboxes/scope/name/tag；没有项目、镜像目录或builtin回退
+    资源包只能来自root/sandboxes/scope/name/tag；没有项目、Driver目录或builtin回退
     root是通常HOME/.margatroid的全局根，不是已经包含sandboxes的子目录
-    与AgentImageLoaderPlugin不同：Image插件open接受独立agentimages根，直接拼scope/name/tag；不能把Image根的解释套给本插件
+    与AgentDriverLoaderPlugin不同：Driver插件open接受独立agent-drivers根，直接拼scope/name/tag；不能把Driver根的解释套给本插件
 ```
 
 # system

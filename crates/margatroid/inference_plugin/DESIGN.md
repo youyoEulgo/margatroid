@@ -104,7 +104,7 @@ InferenceConfig：推理配置，公开Resource--实现侧配置，不是图书�
 ```text
 领域职责：
     不创建Entity、不挂图书馆组件，不保存Agent上下文、turn或工具执行状态
-    Agent.info.model提供模型选择与采样参数快照，不在每次推理时重新读取AgentImage
+    Agent.info.model提供模型选择与采样参数快照，不在每次推理时重新读取AgentDriver
     全局只有InferenceConfig这一份配置，不设WorkspaceModelRoutes或路由注册表
     Inference只执行一次模型请求，MCL负责队列及指令回执；任何层都不能隐式保存assistant，message历史由显式history_append决定
     不接收AgentControl，不投递Lua邮箱，不发AgentFailure代替oneshot错误
@@ -155,7 +155,7 @@ handle_inference(world: &mut World, request: InferenceRequest)
     行为：
         先take共享原回复Sender并转入私有回复槽，克隆重复请求不再执行；捕获准备panic；校验请求ID（非空、至多256字节、无控制字符）、完整Agent Entity及取消状态；已失效直接完成oneshot错误；用户轮次取消按正常cancelled响应完成，不能统一归为错误
         复制Agent地址、info.model中的模型与采样参数，从全局配置查唯一模型路由
-        从request.tools的CallableResource不可变共享快照准备typed tool definitions；对各snapshot自带ResourceID使用validate_owner验证目标Agent ResourceSet存在、image_dependencies许可及ImportBindings的ID/TOOL kind已导入归属，不按ID重取latest、不再次global alias query
+        从request.tools的CallableResource不可变共享快照准备typed tool definitions；对各snapshot自带ResourceID使用validate_owner验证目标Agent ResourceSet存在、driver_dependencies许可及ImportBindings的ID/TOOL kind已导入归属，不按ID重取latest、不再次global alias query
         完整校验alias唯一、定义与schema后规范化消息，验证参数与输入上限；旧Block在资源reload后仍使用选定的旧定义快照
         收集全部当前webui发送器快照，复制HTTP客户端、路由及协议适配器
         保存拥有所有权的PreparedInference，不携带World、组件借用或Workspace配置

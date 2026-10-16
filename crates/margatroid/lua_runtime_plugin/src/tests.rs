@@ -10,7 +10,7 @@ use margatroid_types::block_storage::{
 };
 use margatroid_types::execution_components::{AgentExecutionScope, ExecutionActivityKind};
 use margatroid_types::mcl_events::AgentMclQueue;
-use margatroid_types::resource_components::AgentImageModelConfig;
+use margatroid_types::resource_components::AgentDriverModelConfig;
 use margatroid_types::workspace_execution::spawn_workspace_execution;
 use resource_id_plugin::ResourceID;
 use std::collections::BTreeMap;
@@ -131,7 +131,7 @@ fn agent(world: &mut World) -> core_plugin::Entity {
     let agent = Agent {
         resourceid: ResourceID::parse("agent:demo/test:latest").unwrap(),
         info: AgentInfo {
-            model: AgentImageModelConfig {
+            model: AgentDriverModelConfig {
                 model: "test".into(),
                 temperature: None,
                 max_output_tokens: None,
@@ -140,8 +140,8 @@ fn agent(world: &mut World) -> core_plugin::Entity {
             },
             project_root: ".".into(),
             home_root: ".".into(),
-            image: ResourceID::parse("agent_image:demo/test:latest").unwrap(),
-            image_dependencies: Arc::from([]),
+            driver: ResourceID::parse("driver:demo/test:latest").unwrap(),
+            driver_dependencies: Arc::from([]),
         },
         workspace: ResourceID::parse("workspace:demo/test:latest").unwrap(),
         sandbox: None,

@@ -21,7 +21,7 @@ MCL已实现Idle/Working轮次effect、准备完成后的当前turn门、正常�
 
 运行时所有 Block 统一使用 Agent SQLite，不保留内存后端。`CREATE BLOCK` 创建或打开持久数据，`CREATE TEMP BLOCK` 使用完整启动实例隔离的数据；均异步返回 `BlockOpened { block_id, created, temporary }`，相同 schema 再次打开不清空数据。GET 多来源使用同一读事务，INJECT 全部来源与目标使用同一写事务。TOOL/SANDBOX 在数据库中只保存完整 ResourceID，读取后按命令开始时取得的 owned 导入快照解析当前定义；已提交领域任务保持自身快照。MESSAGE 保留原始 typed 消息及 Inject 容器。`history_append` 只写历史，不修改 Block。旧 effect `finish` 已拒绝，只接受 `finish_turn`。
 
-本轮 Driver 示例调整限于仓库根 Driver；镜像目录中的 Driver 未修改。详细设计仍按 lib、system、handler、events、types、error 六板块组织。
+本轮 Driver 示例调整限于仓库根 Driver；驱动目录中的 Driver 未修改。详细设计仍按 lib、system、handler、events、types、error 六板块组织。
 
 ## 安装与执行
 
@@ -76,7 +76,7 @@ mcl("agent:local/demo", "INJECT ? TO b.messages", [messages_array])
 
 IMPORT、inference、tool_call 通过领域请求共享一次性 Sender 槽、MCL 独占 Receiver。当前等待实现是 managed async service，内部监督等待任务并发送带原请求/pending 的收口事件，**不是** `ClosureRequest` 自动结果协议。资源加载登记 Other 活动并移交加载方；推理和工具执行方负责实际活动登记。
 
-IMPORT 资源必须精确属于 image_dependencies；无 builtin 隐含例外。声明类型必须匹配资源种类，alias 不能包含点、允许连字符。同 Agent alias 跨类别唯一，同 ID 重命名移除旧 alias；冲突在提交 loader 前检查，并在 loader 主线程收口再次检查，挂载失败回滚绑定。IMPORT 仅加载与绑定，不自动注入或执行。工具本次可见集合来自 TOOL 数组中的不可变快照，alias 冲突在准备阶段拒绝；每项执行失败或不可见结果均保留输入调用 ID 和顺序。推理结果保留 usage 和 stop_reason。
+IMPORT 资源必须精确属于 driver_dependencies；无 builtin 隐含例外。声明类型必须匹配资源种类，alias 不能包含点、允许连字符。同 Agent alias 跨类别唯一，同 ID 重命名移除旧 alias；冲突在提交 loader 前检查，并在 loader 主线程收口再次检查，挂载失败回滚绑定。IMPORT 仅加载与绑定，不自动注入或执行。工具本次可见集合来自 TOOL 数组中的不可变快照，alias 冲突在准备阶段拒绝；每项执行失败或不可见结果均保留输入调用 ID 和顺序。推理结果保留 usage 和 stop_reason。
 
 tool_call 第一参数必须恰好一条 Assistant，直接从其 tool_calls 提取请求；不再使用 work.calls 或 TOOL_CALL 字段。调用 ID 与名称非空、批次 ID 唯一，可见 TOOL alias 冲突整批拒绝。空调用同步返回 typed MESSAGE 空数组且不提交任务。TOOL 仅允许 tool 资源；旧 skill/hook ID 在导入时拒绝。
 

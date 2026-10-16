@@ -1,4 +1,4 @@
-use agent_image_loader_plugin::AgentImageLoaderPlugin;
+use agent_driver_loader_plugin::AgentDriverLoaderPlugin;
 use agent_plugin::{Agent, AgentPlugin, AgentState};
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
@@ -51,14 +51,14 @@ end
 fn id(value: &str) -> ResourceID {
     ResourceID::parse(value).unwrap()
 }
-fn image(root: &Path, name: &str, driver: &str, dependencies: &[&str]) {
-    let directory = root.join("images/local").join(name).join("latest");
+fn driver(root: &Path, name: &str, driver: &str, dependencies: &[&str]) {
+    let directory = root.join("drivers/local").join(name).join("latest");
     fs::create_dir_all(&directory).unwrap();
     let mut manifest = "schema_version = 1\n[inference]\nmodel = \"offline-test\"\n".to_owned();
     for dependency in dependencies {
         manifest.push_str(&format!("\n[[dependencies]]\nid = {dependency:?}\n"));
     }
-    fs::write(directory.join("agent.toml"), manifest).unwrap();
+    fs::write(directory.join("driver.toml"), manifest).unwrap();
     fs::write(directory.join("base.lua"), driver).unwrap();
 }
 fn app(root: &Path) -> App {
@@ -85,7 +85,7 @@ fn app(root: &Path) -> App {
         .add_plugin(tool_resource_plugin::ToolResourcePlugin::open(root).unwrap())
         .add_plugin(prompt_resource_plugin::PromptResourcePlugin::open(root).unwrap())
         .add_plugin(sandbox_resource_plugin::SandboxResourcePlugin::open(root).unwrap())
-        .add_plugin(AgentImageLoaderPlugin::open(root.join("images")).unwrap())
+        .add_plugin(AgentDriverLoaderPlugin::open(root.join("drivers")).unwrap())
         .add_plugin(MemoryPlugin::new())
         .add_plugin(MclPlugin::default())
         .add_plugin(LuaRuntimePlugin::default())
@@ -93,19 +93,19 @@ fn app(root: &Path) -> App {
         .add_plugin(WorkspacePlugin::default());
     app
 }
-fn definition(root: &Path, images: &[&str]) -> WorkspaceDefinition {
+fn definition(root: &Path, drivers: &[&str]) -> WorkspaceDefinition {
     WorkspaceDefinition {
         id: id("workspace:local/lifecycle"),
         name: "lifecycle".into(),
         manager: "agent-0".into(),
         project_root: root.join("project"),
-        agents: images
+        agents: drivers
             .iter()
             .enumerate()
-            .map(|(index, image)| WorkspaceAgentDefinition {
+            .map(|(index, driver)| WorkspaceAgentDefinition {
                 id: id(&format!("agent:local/agent-{index}")),
                 name: format!("agent-{index}"),
-                image: id(&format!("image:local/{image}")),
+                driver: id(&format!("driver:local/{driver}")),
                 home_root: root.join(format!("home-{index}")),
                 history_path: root.join(format!("history-{index}.sqlite")),
             })
@@ -283,7 +283,7 @@ fn stop(app: &mut App, workspace: Entity) {
 #[test]
 fn two_agents_in_one_workspace_drive_arrays_wake_and_join_cleanly() {
     let root = tempfile::tempdir().unwrap();
-    image(root.path(), "base", DRIVER, &[]);
+    driver(root.path(), "base", DRIVER, &[]);
     let mut app = app(root.path());
     let workspace = start(&mut app, definition(root.path(), &["base", "base"])).unwrap();
     let members = app
@@ -389,7 +389,7 @@ fn two_agents_in_one_workspace_drive_arrays_wake_and_join_cleanly() {
 #[test]
 fn persistent_session_reopens_and_temporary_entry_does_not_replay() {
     let root = tempfile::tempdir().unwrap();
-    image(root.path(), "base", DRIVER, &[]);
+    driver(root.path(), "base", DRIVER, &[]);
     let mut app = app(root.path());
     let workspace = start(&mut app, definition(root.path(), &["base"])).unwrap();
     let target = id("agent:local/agent-0");
@@ -478,7 +478,7 @@ fn persistent_session_reopens_and_temporary_entry_does_not_replay() {
 #[test]
 fn driver_failure_before_ready_removes_agents_and_retains_failed_workspace() {
     let root = tempfile::tempdir().unwrap();
-    image(
+    driver(
         root.path(),
         "broken",
         "error('intentional early failure')",
@@ -518,7 +518,7 @@ fn driver_failure_before_ready_removes_agents_and_retains_failed_workspace() {
 #[test]
 fn missing_import_dependency_returns_failure_without_mount_and_can_stop() {
     let root = tempfile::tempdir().unwrap();
-    image(root.path(), "base", DRIVER, &["tool:local/missing:latest"]);
+    driver(root.path(), "base", DRIVER, &["tool:local/missing:latest"]);
     let mut app = app(root.path());
     let workspace = start(&mut app, definition(root.path(), &["base"])).unwrap();
     let target = id("agent:local/agent-0");
@@ -563,7 +563,7 @@ fn client_imports_all_resource_types_with_local_aliases_then_stops() {
         "prompt:local/sample:latest",
         "sandbox:local/sample:latest",
     ];
-    image(root.path(), "base", DRIVER, &dependencies);
+    driver(root.path(), "base", DRIVER, &dependencies);
     for (directory, files) in [
         (
             "tools",

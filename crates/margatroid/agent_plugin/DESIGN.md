@@ -90,7 +90,7 @@ Agent图书馆组件、AgentInfo、AgentState及WorldAgentExt已定义在共享t
 ```text
 Agent：Agent图书馆组件，公开Component--自身身份和运行数据的唯一领域组件
     resourceid: ResourceID--Agent自身地址
-    info: AgentInfo--从启动镜像和成员定义取得的静态配置快照
+    info: AgentInfo--从启动驱动和成员定义取得的静态配置快照
     workspace: ResourceID--所属工作区的逻辑地址
     sandbox: Option<SandboxValue>--当前选中的完整ID及不可变policy快照，None表示未激活；不另设active_policy字段
     state: AgentState--Agent生命周期及当前启动或停止操作
@@ -125,7 +125,7 @@ AgentPlugin：Agent生命周期插件，公开结构体
                 调用register_library::<Agent>("agent")注册图书馆类型
                 挂载start_agent_system、stop_agent_system和agent_exception_system
                 不注册资源类型，tool、prompt、sandbox分别由其资源插件注册
-                不直接依赖Workspace、AgentImage或Driver VM插件的Handler和安装标记
+                不直接依赖Workspace、AgentDriver或Driver VM插件的Handler和安装标记
 ```
 
 ## 扩展 trait
@@ -137,7 +137,7 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
         切换沙箱：公开方法
         行为：
             按agent地址查询唯一图书馆Entity，检查agent类型段及Agent组件
-            sandbox为Some时检查值的resource_id为sandbox类型，核对镜像许可、已导入来源及该Entity资源集合中的来源存在性；选择的是传入值的policy快照，不回查最新policy替换
+            sandbox为Some时检查值的resource_id为sandbox类型，核对驱动许可、已导入来源及该Entity资源集合中的来源存在性；选择的是传入值的policy快照，不回查最新policy替换
             完全相同的ID及policy为无修改操作，可幂等成功；同ID不同policy仍是策略切换，不能仅按ID相等跳过检查
             在execution短锁下检查沙箱活动并更新配置；普通runner、长期进程及取消中或清理失败的Sandbox活动未释放时返回ExecutionBusy
             Inference与Other活动不阻止切换；Stopping或清理失败受理关闭时拒绝修改
@@ -168,7 +168,7 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
             handle执行整次BlockStorageRequest，不能把GET多selector或INJECT读/mapcheck/replace拆成独立事务。
     agent_validate_import(&self, agent: &ResourceID, alias: &str, kind: InnerType, resource_id: &ResourceID) -> Result<(), AgentError>
         预检导入：公开方法，MCL与资源加载入口共用且不修改绑定。
-        行为：定位完整Agent Entity，检查来源属于镜像依赖、kind匹配来源类型及Agent全域alias冲突。
+        行为：定位完整Agent Entity，检查来源属于驱动依赖、kind匹配来源类型及Agent全域alias冲突。
             alias首字符为ASCII字母或下划线，后续仅ASCII字母、数字、下划线或连字符；点、空白及非ASCII字符拒绝。
     agent_bind_import(&mut self, agent: &ResourceID, alias: String, value: ImportedValue) -> Result<(), AgentError>
         绑定导入值：公开方法，声明与受检实现均属于共享agent_components，不是Agent插件或MCL私有registry
@@ -204,11 +204,11 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
         ResourceSet<PromptResource>
         ResourceSet<SandboxResource>
     三个集合均为ResourcesComponent，可与Agent共同挂载
-    启动时挂载空集合，不等于把镜像依赖全部预加载；后续导入通过各资源加载插件更新
+    启动时挂载空集合，不等于把驱动依赖全部预加载；后续导入通过各资源加载插件更新
     不挂独立ResourceId组件，不使用ResourceRef、ResourceOwners或资源GC
 
 数据归属：
-    info是启动配置快照，源镜像后续更新不自动修改运行中的Agent
+    info是启动配置快照，源驱动后续更新不自动修改运行中的Agent
     workspace只记录逻辑地址，异步结果按完整Agent Entity和子请求ID关联
     lua只提供通知槽位和关闭句柄的存储，AgentState是Agent生命周期的唯一存储
     Agent不执行ready、wake、wait或关闭操作；MCL取用通知槽位，LuaRuntime取用关闭句柄
@@ -295,14 +295,14 @@ handle_start_agent(world: &mut World, request: StartAgent)
         校验请求ID、Agent地址类型、成员定义和目标工作区完整Entity；同一受理请求ID在数据库准备或Creating期间重复到达不重复启动。
         数据库准备期间以私有PendingDatabases保存原请求及材料；同Agent地址的另一请求返回DuplicateAgent，不在worker完成前创建Agent Entity。
         按Agent地址查询已有实例，存在时返回DuplicateAgent，不覆盖旧实例
-        从指定工作区Entity上的ResourceSet<AgentImage>按镜像ResourceID取得启动材料，不选择全局查询的首个匹配者
+        从指定工作区Entity上的ResourceSet<AgentDriver>按驱动ResourceID取得启动材料，不选择全局查询的首个匹配者
         取得模型配置、项目路径、Driver源码及声明的依赖地址，构造独立启动快照
         异步blocking worker按现有history_path打开一个Agent SQLite数据库及Block/history分表，取得AgentDatabaseHandle与其AgentHistoryHandle视图；失败返回DatabaseSetupFailed，不发VM请求，ECS主线程不做SQLite IO
         数据库准备结果按operation_id及完整Workspace Entity收口，再核对工作区逻辑身份、唯一寻址、启动受理门未关闭及Agent地址仍无占用；迟到或重复结果不推进其他请求。
         通过复核后创建Agent Entity，通过受检图书馆入口挂载Agent，并挂载三种空资源集合
         info保存配置，workspace保存工作区ResourceID，sandbox初始为空，lua初始化空wake槽位、空ready与ended暂存槽位和空关闭句柄，execution初始化共享开放作用域，database保存已打开句柄、history为同文件历史视图，不加载Block内容到Agent，import_bindings初始化为空唯一RAM绑定表，mcl.commands为空VecDeque、mcl.pending为None、mcl.drained初始已收口，turn为None
         生成包含进程session nonce及单调序号的VM启动子请求ID，跨进程重启不复用TEMP instance；先将原StartAgent请求ID和子请求ID写入Creating
-        整理agent_info注入环境，包含实例描述、Agent/Workspace/Image地址、项目/主目录、完整依赖列表及模型选择/采样参数
+        整理agent_info注入环境，包含实例描述、Agent/Workspace/Driver地址、项目/主目录、完整依赖列表及模型选择/采样参数
         从共享ModelRuntimeCatalog取得启动时非敏感模型路由快照，model.model仍为路由ID，补充provider_model、api_type、provider、context_window_tokens、thinking及reasoning_effort
         模型元数据由Inference全局路由发布，Agent不依赖Inference实现；未配置模型明确返回ModelRouteNotFound，不注入0窗口或猜默认值
         Lua环境是启动快照，路由重载后旧Driver不暗改；新启动使用新目录投影，正在执行推理仍使用自己的请求快照
@@ -401,7 +401,7 @@ StartAgent：Agent启动请求，公开事件
     id: String--唯一请求ID
     resource_id: ResourceID--待创建Agent的地址
     workspace: Entity--启动材料所在工作区完整Entity
-    image: ResourceID--该工作区镜像集合中的镜像地址
+    driver: ResourceID--该工作区驱动集合中的驱动地址
     definition: AgentStartDefinition--成员路径、历史配置等启动参数，不含VM本体
     impl Event for StartAgent
 
@@ -502,11 +502,11 @@ DriverEndedSlot：结束接收端暂存，公开共享类型
         Agent仅保存，不接收信号、不主动关闭；停止等待取走后不在原字段建立替代通道
 
 AgentInfo：启动配置快照，公开结构体
-    model: AgentImageModelConfig--从启动镜像复制的模型及采样参数
+    model: AgentDriverModelConfig--从启动驱动复制的模型及采样参数
     project_root: PathBuf--启动工作目录
     home_root: PathBuf--显式主目录配置，不擅自把它等同于project_root
-    image: ResourceID--启动镜像的来源地址，不是独立镜像Entity
-    image_dependencies: Arc<[ResourceID]>--镜像声明的可导入地址，不表示资源已加载
+    driver: ResourceID--启动驱动的来源地址，不是独立驱动Entity
+    driver_dependencies: Arc<[ResourceID]>--驱动声明的可导入地址，不表示资源已加载
 
 AgentState：Agent生命周期，公开枚举--Creating / Idle / Working / Stopping
     Creating(AgentStartState)
@@ -680,7 +680,7 @@ AgentErrorKind：Agent生命周期及受检访问错误分类，公开枚举
     AgentNotAlive
     AgentBusy
     WorkspaceNotAlive
-    ImageNotLoaded
+    DriverNotLoaded
     ResourceSetupFailed
     HistorySetupFailed--现有历史setup错误基线
     DatabaseSetupFailed--同文件Block/history打开失败

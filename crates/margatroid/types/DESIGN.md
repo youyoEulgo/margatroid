@@ -85,7 +85,7 @@ AgentExecutionScope拥有活动受理、取消和完成等待的共享机制，�
     workspace_events：启动/停止及WorkspaceException、WorkspaceExceptionResult
     lua_runtime_events：Driver启动/停止、异常及对应结果，ended仍是oneshot槽位不是额外事件
     各资源events：加载请求、一次性回复槽、公开观察Result及读取输出
-    AgentImage保留Workspace依赖的加载Result；完成保障是私有实现，不建立跨插件LoadCompletion公共trait
+    AgentDriver保留Workspace依赖的加载Result；完成保障是私有实现，不建立跨插件LoadCompletion公共trait
 
 完成通道：
     oneshot：一次请求完成，Clone事件共享同一个Arc<Mutex<Option<Sender>>>槽
@@ -308,13 +308,13 @@ HistoryRecord：历史记录，公开共享契约
     execution_components：AgentExecutionScope及活动机制，Agent只引用一个作用域，不挂平行活动组件
     workspace_components：工作区身份、成员及WorldWorkspaceExt；workspace_execution提供线程入口与关闭能力
     resource_id_plugin：ResourceID、ResourceInner、ResourcesComponent、LibraryComponent、ResourceSet和基础查询
-    types/resource_components：三类资源及AgentImage，AgentImage不强制有alias
+    types/resource_components：三类资源及AgentDriver，AgentDriver不强制有alias
     client_components：Client和其连接/发送器受检查询契约
 
 资源规则：
     ResourceSet按完整ID存放目标Entity本地条目，可跨Entity有同ID，不能全局取第一个匹配者
     Agent内alias跨所有导入类型唯一，由ImportBindings及共享受检World入口统一维护；同alias不同完整ID先拒绝，Inference和MCL工具准备不能绕过检查
-    IMPORT必须精确属于Agent镜像依赖，无builtin例外；MCL与加载插件共用WorldAgentExt.agent_validate_import受检预检，不维护平行许可或alias规则
+    IMPORT必须精确属于Agent驱动依赖，无builtin例外；MCL与加载插件共用WorldAgentExt.agent_validate_import受检预检，不维护平行许可或alias规则
     IMPORT TOOL tool:... AS alias产生CallableResource；IMPORT MESSAGE prompt:... AS alias按实际role产生AgentMessage（包括新System契约）；IMPORT SANDBOX sandbox:...产生SandboxValue并遵守同一alias检查
     重载成功更新资源条目及对应alias的新值，失败保留旧值；持久Block只存TOOL/SANDBOX ID，后续GET解析新定义，既有GET/execution快照不暗变；激活沙箱改变策略时遵守Sandbox活动互斥
 

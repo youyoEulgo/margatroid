@@ -19,7 +19,7 @@ Assistant 新增 `stop_reason: Option<StopReason>`（旧文件缺字段默认为
 
 ## 安装
 
-需要 `RuntimePlugin`、`AsyncRuntimePlugin` 和已为相同计划注册的通用闭包执行设施。默认计划为 `PRE_UPDATE`；更换计划时也要注册该计划的 closure system。AgentImageLoaderPlugin 不再是插件依赖。
+需要 `RuntimePlugin`、`AsyncRuntimePlugin` 和已为相同计划注册的通用闭包执行设施。默认计划为 `PRE_UPDATE`；更换计划时也要注册该计划的 closure system。AgentDriverLoaderPlugin 不再是插件依赖。
 
 ```rust
 use app_runtime_plugin::RuntimePlugin;
@@ -58,7 +58,7 @@ context_window = "200k"
 
 `id` 是 Agent.info.model.model 选择的逻辑键；`model` 是发送给 Provider 的模型值，两者不必相同。`provider` 仅为可选元数据，`api_type` 显式选择协议，不根据 URL 猜测。配置必须非空、ID 唯一、必需字段非空、URL 使用 http/https，所有条目完整编译成功才能发布。
 
-`context_window` 使用不区分大小写的无符号整数后缀 `k/m/b/t`，分别乘以 1000、1000000、1000000000、1000000000000，必须大于零且不溢出；缺省为 `1m`。它是路由信息，不是假称精确 token 估算，也不是输出长度限制。采样参数直接复制已存在的 `Agent.info.model`，不会每次重新读取 AgentImage。
+`context_window` 使用不区分大小写的无符号整数后缀 `k/m/b/t`，分别乘以 1000、1000000、1000000000、1000000000000，必须大于零且不溢出；缺省为 `1m`。它是路由信息，不是假称精确 token 估算，也不是输出长度限制。采样参数直接复制已存在的 `Agent.info.model`，不会每次重新读取 AgentDriver。
 
 ### OpenAI
 
@@ -98,7 +98,7 @@ world.send_event(InferenceRequest {
 
 主线程先认领原 Sender 并转入私有回复槽，重复克隆请求不会重复执行。校验完整 Agent Entity、请求 ID 和取消状态；从 `Agent.info.model` 获取模型与采样参数。目标在实际受理时再次核对当前 turn 与请求快照；None 或已中止旧轮次返回正常 cancelled 响应，不启动 HTTP；turn 不作为推理唯一 ID。请求取消令牌与活动作用域派生 child 同时监督，即使请求使用独立令牌也不能绕过 Agent 停止。
 
-`tools: Vec<CallableResource>` 保存完整 ResourceID、选定 alias 及 `Arc<CallableDefinitionSnapshot>`。直接消费该快照的描述、schema 和资源种类，不按 ID 重取最新定义，也不重复 global alias query。归属校验要求目标 ResourceSet 中该 ID 存在、Agent.image_dependencies 许可，以及 ImportBindings 中该 ID/TOOL kind 已导入；不要求旧 snapshot 与 reload 后的新 alias/定义一致。visible alias 必须唯一，不按重复 ID 静默去重。
+`tools: Vec<CallableResource>` 保存完整 ResourceID、选定 alias 及 `Arc<CallableDefinitionSnapshot>`。直接消费该快照的描述、schema 和资源种类，不按 ID 重取最新定义，也不重复 global alias query。归属校验要求目标 ResourceSet 中该 ID 存在、Agent.driver_dependencies 许可，以及 ImportBindings 中该 ID/TOOL kind 已导入；不要求旧 snapshot 与 reload 后的新 alias/定义一致。visible alias 必须唯一，不按重复 ID 静默去重。
 
 tool 使用选定 schema；仅 tool 资源可作为 TOOL。空 tools 就是无工具，不回退默认集合。非法 schema、外部 `$ref` 或归属失败在 HTTP 提交前拒绝。
 

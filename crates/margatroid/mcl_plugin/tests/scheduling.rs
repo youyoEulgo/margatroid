@@ -7,7 +7,7 @@ use margatroid_types::history_components::{
 };
 use margatroid_types::lua_runtime_components::{DriverLuaVmInstance, DriverReadySlot};
 use margatroid_types::message_types::{AgentMessage, InferenceResponse, StopReason};
-use margatroid_types::resource_components::AgentImageModelConfig;
+use margatroid_types::resource_components::AgentDriverModelConfig;
 use mcl_plugin::*;
 use resource_id_plugin::{ResourceID, ResourcePlugin, WorldResourceExt};
 use serde_json::json;
@@ -56,7 +56,7 @@ fn spawn(app: &mut App, name: &str) -> (Entity, Store) {
             Agent {
                 resourceid: id,
                 info: AgentInfo {
-                    model: AgentImageModelConfig {
+                    model: AgentDriverModelConfig {
                         model: "test".into(),
                         temperature: None,
                         max_output_tokens: None,
@@ -65,8 +65,8 @@ fn spawn(app: &mut App, name: &str) -> (Entity, Store) {
                     },
                     project_root: Default::default(),
                     home_root: Default::default(),
-                    image: "agent_image:test/demo".parse().unwrap(),
-                    image_dependencies: Arc::from([]),
+                    driver: "driver:test/demo".parse().unwrap(),
+                    driver_dependencies: Arc::from([]),
                 },
                 workspace: "workspace:test/demo".parse().unwrap(),
                 sandbox: None,
@@ -990,7 +990,7 @@ fn import_cancel_keeps_pending_until_real_loader_reply() {
         .get_component_mut::<Agent>(a)
         .unwrap()
         .info
-        .image_dependencies = Arc::from([id]);
+        .driver_dependencies = Arc::from([id]);
     app.world().send_event(request(
         "load",
         "a",
@@ -1562,7 +1562,7 @@ fn sandbox_switch_waits_for_activity_and_cardinality_error_is_non_mutating() {
     };
     let agent_id = {
         let agent = app.world_mut().get_component_mut::<Agent>(a).unwrap();
-        agent.info.image_dependencies = Arc::from([id.clone()]);
+        agent.info.driver_dependencies = Arc::from([id.clone()]);
         agent.resourceid.clone()
     };
     app.world_mut()
@@ -1678,7 +1678,7 @@ fn world_alias_get_inject_reload_preserves_old_block_snapshot() {
     let prompt: ResourceID = "prompt:test/soul".parse().unwrap();
     let agent_id = {
         let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
-        agent.info.image_dependencies = Arc::from([prompt.clone()]);
+        agent.info.driver_dependencies = Arc::from([prompt.clone()]);
         agent.resourceid.clone()
     };
     app.world_mut()
@@ -1904,7 +1904,7 @@ fn import_alias_conflict_prechecks_before_loader_submission() {
     let second: ResourceID = "tool:test/two".parse().unwrap();
     let agent_id = {
         let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
-        agent.info.image_dependencies = Arc::from([first.resource_id.clone(), second]);
+        agent.info.driver_dependencies = Arc::from([first.resource_id.clone(), second]);
         agent.resourceid.clone()
     };
     app.world_mut()
@@ -1942,7 +1942,7 @@ fn bind_tool(
     use margatroid_types::agent_components::{ImportedValue, WorldAgentExt};
     let id = {
         let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
-        agent.info.image_dependencies = Arc::from([tool.resource_id.clone()]);
+        agent.info.driver_dependencies = Arc::from([tool.resource_id.clone()]);
         agent.resourceid.clone()
     };
     app.world_mut()
@@ -2139,7 +2139,7 @@ fn effect_selectors_use_one_database_request_and_current_import_ids() {
     let agent_id = {
         let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
         agent.database = AgentDatabaseHandle::new(backend.clone());
-        agent.info.image_dependencies = Arc::from([first.resource_id.clone()]);
+        agent.info.driver_dependencies = Arc::from([first.resource_id.clone()]);
         agent.resourceid.clone()
     };
     app.world_mut()

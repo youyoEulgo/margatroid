@@ -9,7 +9,7 @@ use margatroid_types::block_storage::AgentDatabaseHandle;
 use margatroid_types::execution_components::{AgentExecutionScope, ExecutionActivityKind};
 use margatroid_types::message_types::{AgentMessage, ToolCall};
 use margatroid_types::resource_components::{
-    AgentImageModelConfig, CallableDefinitionSnapshot, CallableResource, SandboxResource,
+    AgentDriverModelConfig, CallableDefinitionSnapshot, CallableResource, SandboxResource,
     SandboxValue, ToolResource,
 };
 use memory_plugin::SqliteAgentDatabase;
@@ -52,7 +52,7 @@ fn fixture(limits: ToolExecutionLimits) -> (App, Entity, tempfile::TempDir) {
             workspace: id("workspace", "workspace"),
             sandbox: None,
             info: AgentInfo {
-                model: AgentImageModelConfig {
+                model: AgentDriverModelConfig {
                     model: "test".into(),
                     temperature: None,
                     max_output_tokens: None,
@@ -61,8 +61,8 @@ fn fixture(limits: ToolExecutionLimits) -> (App, Entity, tempfile::TempDir) {
                 },
                 project_root: root.path().into(),
                 home_root: root.path().into(),
-                image: id("agent_image", "image"),
-                image_dependencies: Arc::from([]),
+                driver: id("agent_driver", "driver"),
+                driver_dependencies: Arc::from([]),
             },
             lua: Default::default(),
             state: AgentState::Working,
@@ -113,9 +113,9 @@ fn bind(app: &mut App, entity: Entity, resource: &ResourceID) {
         _ => panic!("unsupported fixture"),
     };
     let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
-    let mut dependencies = agent.info.image_dependencies.to_vec();
+    let mut dependencies = agent.info.driver_dependencies.to_vec();
     dependencies.push(resource.clone());
-    agent.info.image_dependencies = dependencies.into();
+    agent.info.driver_dependencies = dependencies.into();
     let id = agent.resourceid.clone();
     app.world_mut()
         .agent_bind_import(
@@ -688,7 +688,7 @@ async fn loaded_but_unpermitted_resource_is_rejected_without_activity() {
         .get_component_mut::<Agent>(entity)
         .unwrap()
         .info
-        .image_dependencies = Arc::from([]);
+        .driver_dependencies = Arc::from([]);
     let (_, rx) = submit(&app, entity, resource, "{}");
     assert_eq!(
         response(&mut app, rx).await.unwrap_err().kind,

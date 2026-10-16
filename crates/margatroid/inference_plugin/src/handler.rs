@@ -537,7 +537,7 @@ fn validate_owner(world: &World, agent: Entity, id: &ResourceID) -> Result<(), I
             "resource owner missing",
         )
     })?;
-    if !owner.info.image_dependencies.contains(id)
+    if !owner.info.driver_dependencies.contains(id)
         || !owner
             .import_bindings
             .contains_resource(id, margatroid_types::block_types::InnerType::Tool)
@@ -1515,7 +1515,7 @@ mod tests {
                 workspace: ResourceID::parse("workspace:test/main").unwrap(),
                 sandbox: None,
                 info: AgentInfo {
-                    model: margatroid_types::resource_components::AgentImageModelConfig {
+                    model: margatroid_types::resource_components::AgentDriverModelConfig {
                         model: "mock".into(),
                         temperature: None,
                         max_output_tokens: None,
@@ -1524,8 +1524,8 @@ mod tests {
                     },
                     project_root: PathBuf::new(),
                     home_root: PathBuf::new(),
-                    image: ResourceID::parse("agent_image:test/main").unwrap(),
-                    image_dependencies: Arc::from([id.clone()]),
+                    driver: ResourceID::parse("driver:test/main").unwrap(),
+                    driver_dependencies: Arc::from([id.clone()]),
                 },
                 lua: Default::default(),
                 state: AgentState::Working,

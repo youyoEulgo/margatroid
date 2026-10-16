@@ -5,7 +5,7 @@
 ```text
 输出类型定义于共享types的workspace_components模块：
     WorkspaceDefinition { id, name, manager, project_root, agents }
-    WorkspaceAgentDefinition { id, name, image, home_root, history_path }
+    WorkspaceAgentDefinition { id, name, driver, home_root, history_path }
 地址统一使用ResourceID纯值，完整格式type:scope/name:tag，缺省标签latest。
 Compose只验证地址语法，不解析资源正文，不创建World或Entity。
 ```
@@ -20,7 +20,7 @@ ComposeErrorKind：编译错误分类
     InvalidDefinition
     InvalidPath
     InvalidName
-    InvalidImageReference
+    InvalidDriverReference
     InvalidResourceReference
     DuplicateAgent
     MissingManager
@@ -48,7 +48,7 @@ AgentDocuments：接受映射或序列并保留出现顺序
 
 RawAgent：拒绝未知字段的成员输入
     name: Option<String>--映射由键提供，序列必须显式提供
-    image: String--必填镜像地址
+    driver: String--必填驱动地址
     home_root: Option<PathBuf>--缺省读取真实HOME
     history_path: Option<PathBuf>--输入别名memory_path
     不接受tag、resources、disable_resources、tool_default或tool_dynamic字段
@@ -70,7 +70,7 @@ build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefinition,
     project_root省略时使用base，显式路径按base解析
     按原顺序逐个构造成员：
         要求并校验name
-        image若无image:前缀则补前缀，解析为type=image的ResourceID
+        driver若无driver:前缀则补前缀，解析为type=driver的ResourceID
         id固定为agent:<workspace-name>/<agent-name>:latest，无成员tag字段
         home_root显式路径相对project_root；省略时读取并规范化真实HOME
         history_path显式路径相对project_root；省略时生成
@@ -97,7 +97,7 @@ normalize_path(path: PathBuf) -> Result<PathBuf, ComposeError>
 ## 边界与生命周期
 
 ```text
-Compose不读取镜像、工具、模型路由或历史正文，不打开数据库。
+Compose不读取驱动、工具、模型路由或历史正文，不打开数据库。
 Compose不创建资源默认列表，不执行资源IMPORT，不维护可见性列表。
 memory_path只是一种输入拼写，不引入第二份Memory路径字段。
 输出只保存纯地址、名称与路径，无ECS Entity或运行期线程能力。

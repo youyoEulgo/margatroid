@@ -17,7 +17,7 @@ members = [
     "crates/margatroid/config_plugin",
     "crates/margatroid/dto_plugin",
     "crates/margatroid/client_plugin",
-    "crates/margatroid/agent_image_loader_plugin",
+    "crates/margatroid/agent_driver_loader_plugin",
     "crates/margatroid/inference_plugin",
     "crates/margatroid/tool_plugin",
     "crates/margatroid/tool_resource_plugin",

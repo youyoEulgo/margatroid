@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process;
 
-use agent_image_loader_plugin::AgentImageLoaderPlugin;
+use agent_driver_loader_plugin::AgentDriverLoaderPlugin;
 use agent_plugin::AgentPlugin;
 use app_runtime_plugin::{AppRunExt, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimePlugin;
@@ -40,7 +40,7 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let data_root = data_root()?;
     fs::create_dir_all(&data_root)?;
-    let agent_images_root = data_root.join("agent-images");
+    let agent_drivers_root = data_root.join("agent-drivers");
     let config_path = data_root.join("config.toml");
     let models_path = data_root.join("models.toml");
     if !models_path.is_file() {
@@ -50,8 +50,8 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         )
         .into());
     }
-    let agent_images = AgentImageLoaderPlugin::open(&agent_images_root)
-        .map_err(|error| format!("cannot open agent image root: {error}"))?;
+    let agent_drivers = AgentDriverLoaderPlugin::open(&agent_drivers_root)
+        .map_err(|error| format!("cannot open agent driver root: {error}"))?;
     let workspace = WorkspacePlugin::default();
     let global_config = ConfigPlugin::open(&config_path)
         .map_err(|error| format!("cannot open global configuration: {error}"))?;
@@ -81,7 +81,7 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(ToolResourcePlugin::open(data_root.clone())?)
         .add_plugin(PromptResourcePlugin::open(data_root.clone())?)
         .add_plugin(SandboxResourcePlugin::open(data_root.clone())?)
-        .add_plugin(agent_images)
+        .add_plugin(agent_drivers)
         .add_plugin(InferencePlugin::default().with_config_path(models_path.clone()))
         .add_plugin(ToolPlugin::default())
         .add_plugin(MemoryPlugin::default())

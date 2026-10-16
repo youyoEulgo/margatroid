@@ -698,7 +698,7 @@ pub struct WorkspaceDefinitionDto {
 pub struct WorkspaceAgentDefinitionDto {
     pub name: String,
     pub id: ResourceIdDto,
-    pub image: ResourceIdDto,
+    pub driver: ResourceIdDto,
     pub home_root: String,
     pub history_path: String,
 }
@@ -707,7 +707,7 @@ impl FromDomain<&WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto {
         Ok(Self {
             name: agent.name.clone(),
             id: (&agent.id).into_dto(())?,
-            image: (&agent.image).into_dto(())?,
+            driver: (&agent.driver).into_dto(())?,
             home_root: agent.home_root.to_string_lossy().into(),
             history_path: agent.history_path.to_string_lossy().into(),
         })
@@ -716,9 +716,9 @@ impl FromDomain<&WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto {
 impl IntoDomain<WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto {
     fn into_domain(self, (): ()) -> Result<WorkspaceAgentDefinition, ProtocolError> {
         let id: ResourceID = self.id.into_domain(())?;
-        let image: ResourceID = self.image.into_domain(())?;
+        let driver: ResourceID = self.driver.into_domain(())?;
         if id.resource_type() != "agent"
-            || image.resource_type() != "image"
+            || driver.resource_type() != "driver"
             || self.home_root.is_empty()
             || self.history_path.is_empty()
         {
@@ -730,7 +730,7 @@ impl IntoDomain<WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto {
         Ok(WorkspaceAgentDefinition {
             name: self.name,
             id,
-            image,
+            driver,
             home_root: self.home_root.into(),
             history_path: self.history_path.into(),
         })

@@ -137,7 +137,7 @@ crate公开：
 handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
     准备单次执行：crate公开函数
     行为：
-        认领共享Sender后检查Working及非空匹配turn，再检查轮次中止与受理关联，再校验请求ID、调用ID、完整Agent Entity、取消状态和资源类型；validate_owner(request.resource.resource_id)校验目标ResourceSet存在、image_dependencies许可及ImportBindings的ID/TOOL kind已导入，不要求最新alias或定义与选定snapshot一致，允许仍有效的旧版本snapshot
+        认领共享Sender后检查Working及非空匹配turn，再检查轮次中止与受理关联，再校验请求ID、调用ID、完整Agent Entity、取消状态和资源类型；validate_owner(request.resource.resource_id)校验目标ResourceSet存在、driver_dependencies许可及ImportBindings的ID/TOOL kind已导入，不要求最新alias或定义与选定snapshot一致，允许仍有效的旧版本snapshot
         消费request.resource的不可变共享definition及alias，验证call.tool_name与选定alias一致；不从ResourceSet按ID重取latest，不再次global alias query
         tool使用选定schema与脚本材料引用及alias；不重取最新collection。现有路径late read不能证明磁盘内容版本隔离，后续采用Arc脚本正文或版本化文件材料的具体方案尚未闭合，不能把metadata snapshot不变假称为磁盘内容不变
         解码arguments并限制大小；tool按snapshot schema验证，不重新解析metadata或全局资源目录

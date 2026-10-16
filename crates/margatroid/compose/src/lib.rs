@@ -17,7 +17,7 @@ pub enum ComposeErrorKind {
     InvalidDefinition,
     InvalidPath,
     InvalidName,
-    InvalidImageReference,
+    InvalidDriverReference,
     InvalidResourceReference,
     DuplicateAgent,
     MissingManager,
@@ -166,7 +166,7 @@ impl<'de> Deserialize<'de> for AgentDocuments {
 struct RawAgent {
     #[serde(default)]
     name: Option<String>,
-    image: String,
+    driver: String,
     #[serde(default)]
     home_root: Option<PathBuf>,
     #[serde(default, alias = "memory_path")]
@@ -190,21 +190,21 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
             )
         })?;
         validate_logical_name(&name, "agent")?;
-        let image_value = if raw_agent.image.starts_with("image:") {
-            raw_agent.image
+        let driver_value = if raw_agent.driver.starts_with("driver:") {
+            raw_agent.driver
         } else {
-            format!("image:{}", raw_agent.image)
+            format!("driver:{}", raw_agent.driver)
         };
-        let image = ResourceID::parse(image_value).map_err(|error| {
+        let driver = ResourceID::parse(driver_value).map_err(|error| {
             ComposeError::new(
-                ComposeErrorKind::InvalidImageReference,
-                format!("invalid image reference: {error}"),
+                ComposeErrorKind::InvalidDriverReference,
+                format!("invalid driver reference: {error}"),
             )
         })?;
-        if image.resource_type() != "image" {
+        if driver.resource_type() != "driver" {
             return Err(ComposeError::new(
-                ComposeErrorKind::InvalidImageReference,
-                "image reference must use type image",
+                ComposeErrorKind::InvalidDriverReference,
+                "driver reference must use type driver",
             ));
         }
         let home_root = match raw_agent.home_root {
@@ -232,7 +232,7 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
                 )
             })?,
             name,
-            image,
+            driver,
             home_root,
             history_path,
         });
@@ -375,8 +375,9 @@ mod tests {
             "tool_default",
             "tool_dynamic",
         ] {
-            let source =
-                format!("name: demo\nagents:\n  coder:\n    image: local/coder\n    {field}:	[]\n");
+            let source = format!(
+                "name: demo\nagents:\n  coder:\n    driver: local/coder\n    {field}:	[]\n"
+            );
             assert_eq!(
                 compile_str(&source, "/tmp/workspace.yaml")
                     .unwrap_err()
@@ -387,13 +388,23 @@ mod tests {
         }
         assert_eq!(
             compile_str(
-                "name: demo\nagents:\n  coder:\n    image: local/coder\n    tag: clone0\n",
+                "name: demo\nagents:\n  coder:\n    driver: local/coder\n    tag: clone0\n",
                 "/tmp/workspace.yaml"
             )
             .unwrap_err()
             .kind(),
             ComposeErrorKind::FileDecode
         );
+    }
+
+    #[test]
+    fn rejects_old_image_config_field() {
+        let error = compile_str(
+            "name: demo\nagents:\n  coder:\n    image: local/coder\n",
+            "/tmp/workspace.yaml",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ComposeErrorKind::FileDecode);
     }
 
     #[test]
@@ -404,10 +415,10 @@ project_root: project
 manager: coder
 agents:
   coder:
-    image: local/coder
+    driver: local/coder
     memory_path: state/coder.sql
   reviewer:
-    image: local/reviewer:stable
+    driver: local/reviewer:stable
 "#;
         let definition = compile_str(source, "/tmp/workspace/margatroid-workspace.yaml").unwrap();
         assert_eq!(definition.name, "demo");
@@ -421,8 +432,8 @@ agents:
             "agent:demo/coder:latest"
         );
         assert_eq!(
-            definition.agents[0].image.to_string(),
-            "image:local/coder:latest"
+            definition.agents[0].driver.to_string(),
+            "driver:local/coder:latest"
         );
         assert_eq!(definition.agents[1].name, "reviewer");
         assert_eq!(
@@ -437,7 +448,7 @@ agents:
 name: demo
 agents:
   - name: manager
-    image: local/coder:v1
+    driver: local/coder:v1
 "#;
         let definition = compile_str(source, "/tmp/workspace.yaml").unwrap();
         assert_eq!(definition.manager, "manager");
@@ -450,12 +461,12 @@ agents:
     #[test]
     fn workspaces_in_the_same_project_have_separate_databases() {
         let first = compile_str(
-            "name: first\nagents:\n  coder:\n    image: local/coder\n",
+            "name: first\nagents:\n  coder:\n    driver: local/coder\n",
             "/tmp/shared/first.yaml",
         )
         .unwrap();
         let second = compile_str(
-            "name: second\nagents:\n  coder:\n    image: local/coder\n",
+            "name: second\nagents:\n  coder:\n    driver: local/coder\n",
             "/tmp/shared/second.yaml",
         )
         .unwrap();
@@ -479,7 +490,7 @@ project_root: ../project
 manager: missing
 agents:
   manager:
-    image: local/coder
+    driver: local/coder
 "#;
         let error = compile_str(source, "/tmp/workspace.yaml").unwrap_err();
         assert_eq!(error.kind(), ComposeErrorKind::InvalidPath);
@@ -491,7 +502,7 @@ agents:
         let path = directory.path().join("margatroid-workspace.yaml");
         fs::write(
             &path,
-            "name: demo\nagents:\n  manager:\n    image: local/coder\n",
+            "name: demo\nagents:\n  manager:\n    driver: local/coder\n",
         )
         .unwrap();
         assert_eq!(compile(&path).unwrap().project_root, directory.path());

@@ -368,7 +368,7 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
         history_components::{AgentHistoryStore, HistoryError, HistoryRecord},
         lua_runtime_components::AgentLua,
         mcl_events::AgentMclQueue,
-        resource_components::AgentImageModelConfig,
+        resource_components::AgentDriverModelConfig,
         workspace_components::{
             Workspace, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceError,
             WorkspaceErrorKind, WorkspaceState,
@@ -407,7 +407,7 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
         agents: vec![WorkspaceAgentDefinition {
             id: id("agent", "manager"),
             name: "manager".into(),
-            image: id("image", "base"),
+            driver: id("driver", "base"),
             home_root: "/tmp/home".into(),
             history_path: "/tmp/history".into(),
         }],
@@ -425,7 +425,7 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
             resourceid: id("agent", "manager"),
             workspace: id("workspace", "one"),
             info: AgentInfo {
-                model: AgentImageModelConfig {
+                model: AgentDriverModelConfig {
                     model: "model".into(),
                     temperature: None,
                     max_output_tokens: None,
@@ -434,8 +434,8 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
                 },
                 project_root: "/tmp/one".into(),
                 home_root: "/tmp/home".into(),
-                image: id("image", "base"),
-                image_dependencies: std::sync::Arc::from([]),
+                driver: id("driver", "base"),
+                driver_dependencies: std::sync::Arc::from([]),
             },
             sandbox: Some(margatroid_types::resource_components::SandboxValue {
                 resource_id: id("sandbox", "safe"),

@@ -547,7 +547,7 @@ fn alias_conflict_and_missing_dependency_preserve_old_bindings_and_set() {
         .get_component_mut::<Agent>(target)
         .unwrap()
         .info
-        .image_dependencies = Arc::from([]);
+        .driver_dependencies = Arc::from([]);
     assert!(import(&mut app, target, "new", InnerType::Tool).is_err());
     assert_eq!(
         app.world()

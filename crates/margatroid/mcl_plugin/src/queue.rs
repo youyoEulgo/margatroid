@@ -905,7 +905,7 @@ fn begin_import(
     alias: String,
 ) -> Result<Option<MclValue>, MclError> {
     let agent = world.get_component::<Agent>(entity).unwrap();
-    if !agent.info.image_dependencies.contains(&resource_id) {
+    if !agent.info.driver_dependencies.contains(&resource_id) {
         return Err(MclError::ImportNotAllowed);
     }
     parser::validate_import_kind(declared_kind, &resource_id)?;

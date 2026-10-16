@@ -1,6 +1,6 @@
 # Compose
 
-`compose` 是 CLI 的 Workspace YAML 编译器。它返回共享 `workspace_components` 中的静态 `WorkspaceDefinition`，不创建 ECS Entity、不连接后端，也不加载镜像、资源正文或历史数据库。
+`compose` 是 CLI 的 Workspace YAML 编译器。它返回共享 `workspace_components` 中的静态 `WorkspaceDefinition`，不创建 ECS Entity、不连接后端，也不加载驱动、资源正文或历史数据库。
 
 ```rust
 use compose::compile;
@@ -15,7 +15,7 @@ project_root: .
 manager: coder
 agents:
   coder:
-    image: image:local/coder:latest
+    driver: driver:local/coder:latest
     home_root: /home/example
     history_path: state/coder.sqlite
 ```
@@ -38,9 +38,9 @@ agents:	[]
 
 ## 成员字段
 
-每个成员只接受 `name`、`image`、`home_root` 和 `history_path`。
+每个成员只接受 `name`、`driver`、`home_root` 和 `history_path`。
 
-`image` 必填，完整格式为 `image:scope/name[:tag]`，省略标签时规范化为 `latest`。也接受省略 `image:` 前缀的 `scope/name[:tag]` 输入，编译后始终保存纯值 `ResourceID`。
+`driver` 必填，完整格式为 `driver:scope/name[:tag]`，省略标签时规范化为 `latest`。也接受省略 `driver:` 前缀的 `scope/name[:tag]` 输入，编译后始终保存纯值 `ResourceID`。
 
 `home_root` 可选，默认真实环境变量 `HOME`。没有配置该字段且 HOME 缺失时编译失败。显式相对路径以 `project_root` 为基准。
 
@@ -56,8 +56,8 @@ agents:	[]
 
 - Workspace 地址：`workspace:local/<name>:latest`。
 - 成员地址：`agent:<workspace-name>/<agent-name>:latest`。
-- Agent 不支持独立 `tag` 字段；镜像标签只写在 `image` 地址中。
-- 输出保留 `name`、`manager`、`project_root`，成员保留 `id`、`name`、`image`、`home_root`、`history_path`。
+- Agent 不支持独立 `tag` 字段；驱动标签只写在 `driver` 地址中。
+- 输出保留 `name`、`manager`、`project_root`，成员保留 `id`、`name`、`driver`、`home_root`、`history_path`。
 
 Workspace 文件不接受 `resources`、`disable_resources`、`tool_default` 或 `tool_dynamic` 等旧资源列表。资源导入及可见性属于运行期 Agent/MCL 契约，不由 Compose 生成默认资源或执行旧 `handle` 逻辑。
 

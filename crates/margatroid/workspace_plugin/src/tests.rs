@@ -2,12 +2,12 @@ use crate::*;
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
 use core_plugin::{App, Entity};
+use margatroid_types::agent_driver_events::{LoadAgentDriver, LoadAgentDriverResult};
 use margatroid_types::agent_events::{
     AgentError, AgentErrorKind, AgentStartDefinition, StartAgent, StartAgentResult, StopAgent,
     StopAgentResult,
 };
-use margatroid_types::agent_image_events::{LoadAgentImage, LoadAgentImageResult};
-use margatroid_types::resource_components::{AgentImage, AgentImageModelConfig};
+use margatroid_types::resource_components::{AgentDriver, AgentDriverModelConfig};
 use resource_id_plugin::{ResourceID, ResourcePlugin, ResourceSet, WorldResourceExt};
 use std::sync::Arc;
 
@@ -122,7 +122,7 @@ fn app() -> App {
         .add_plugin(ResourcePlugin)
         .add_plugin(WorkspacePlugin::default());
     app.world_mut()
-        .register_resources::<ResourceSet<AgentImage>>("image")
+        .register_resources::<ResourceSet<AgentDriver>>("driver")
         .unwrap();
     app
 }
@@ -136,7 +136,7 @@ fn definition(members: usize) -> WorkspaceDefinition {
             .map(|n| WorkspaceAgentDefinition {
                 id: id(&format!("agent:local/a{n}")),
                 name: format!("a{n}"),
-                image: id("image:local/shared"),
+                driver: id("driver:local/shared"),
                 home_root: "/home/test".into(),
                 history_path: format!("/history/a{n}").into(),
             })
@@ -153,15 +153,15 @@ fn start(app: &mut App, members: usize) -> Entity {
     );
     app.world().workspace_list()[0]
 }
-fn install_image(app: &mut App, entity: Entity) {
-    let mut images = ResourceSet::new();
-    images.insert(
-        id("image:local/shared"),
-        AgentImage {
+fn install_driver(app: &mut App, entity: Entity) {
+    let mut drivers = ResourceSet::new();
+    drivers.insert(
+        id("driver:local/shared"),
+        AgentDriver {
             base_driver: Arc::from(""),
-            origin: Arc::new("/image/driver.lua".into()),
+            origin: Arc::new("/driver/driver.lua".into()),
             dependencies: Arc::from([]),
-            model: AgentImageModelConfig {
+            model: AgentDriverModelConfig {
                 model: "test".into(),
                 temperature: None,
                 max_output_tokens: None,
@@ -170,7 +170,7 @@ fn install_image(app: &mut App, entity: Entity) {
             },
         },
     );
-    app.world_mut().insert_resources(entity, images).unwrap();
+    app.world_mut().insert_resources(entity, drivers).unwrap();
 }
 async fn cleanup(app: &App, entity: Entity) {
     if let Some(workspace) = app.world().get_component::<Workspace>(entity) {
@@ -219,7 +219,7 @@ async fn empty_workspace_is_running_and_duplicate_start_preserves_original() {
 }
 
 #[tokio::test]
-async fn startup_waits_for_shared_image_and_all_members_with_exact_correlation() {
+async fn startup_waits_for_shared_driver_and_all_members_with_exact_correlation() {
     let mut app = app();
     let entity = start(&mut app, 2);
     app.world_mut().advance_event_frame();
@@ -229,17 +229,17 @@ async fn startup_waits_for_shared_image_and_all_members_with_exact_correlation()
         .is_empty());
     let loads: Vec<_> = app
         .world()
-        .event_reader::<LoadAgentImage>()
+        .event_reader::<LoadAgentDriver>()
         .into_iter()
         .cloned()
         .collect();
     assert_eq!(loads.len(), 1);
     let load = &loads[0];
-    install_image(&mut app, entity);
+    install_driver(&mut app, entity);
     let wrong = app.world_mut().spawn();
-    handler::handle_agent_image_result(
+    handler::handle_agent_driver_result(
         app.world_mut(),
-        LoadAgentImageResult {
+        LoadAgentDriverResult {
             id: load.id.clone(),
             target: wrong,
             resource_id: load.resource_id.clone(),
@@ -247,11 +247,11 @@ async fn startup_waits_for_shared_image_and_all_members_with_exact_correlation()
         },
     );
     assert!(
-        matches!(app.world().get_component::<Workspace>(entity).unwrap().state(), WorkspaceState::Starting(state) if state.pending_images.len() == 1)
+        matches!(app.world().get_component::<Workspace>(entity).unwrap().state(), WorkspaceState::Starting(state) if state.pending_drivers.len() == 1)
     );
-    handler::handle_agent_image_result(
+    handler::handle_agent_driver_result(
         app.world_mut(),
-        LoadAgentImageResult {
+        LoadAgentDriverResult {
             id: load.id.clone(),
             target: entity,
             resource_id: load.resource_id.clone(),
@@ -323,20 +323,20 @@ async fn startup_waits_for_shared_image_and_all_members_with_exact_correlation()
 }
 
 #[tokio::test]
-async fn falsely_successful_image_result_fails_start_without_destroying_workspace() {
+async fn falsely_successful_driver_result_fails_start_without_destroying_workspace() {
     let mut app = app();
     let entity = start(&mut app, 1);
     app.world_mut().advance_event_frame();
     let load = app
         .world()
-        .event_reader::<LoadAgentImage>()
+        .event_reader::<LoadAgentDriver>()
         .into_iter()
         .next()
         .unwrap()
         .clone();
-    handler::handle_agent_image_result(
+    handler::handle_agent_driver_result(
         app.world_mut(),
-        LoadAgentImageResult {
+        LoadAgentDriverResult {
             id: load.id,
             target: entity,
             resource_id: load.resource_id,
@@ -366,7 +366,7 @@ async fn stop_waits_for_dynamic_creation_and_all_agent_cleanup_before_join() {
                 id: "dynamic".into(),
                 resource_id: id("agent:local/dynamic"),
                 workspace: entity,
-                image: id("image:local/shared"),
+                driver: id("driver:local/shared"),
                 definition: AgentStartDefinition {
                     project_root: "/project".into(),
                     home_root: "/home".into(),
