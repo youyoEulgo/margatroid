@@ -1,6 +1,6 @@
 # InferencePlugin
 
-> 状态：格式/vendor分层重构已实现。共享拥有所有权的领域请求、三种格式转换与严格SSE累积器、必填vendor和显式七组合路由已落地；执行、资源及真实cleanup边界保持不变。当前内容仍为纯文本，不声明图像支持。
+> 状态：格式/vendor分层重构已实现。共享拥有所有权的领域请求、三种格式转换与严格SSE累积器、必填vendor和显式七组合路由已落地；执行、资源及真实cleanup边界保持不变。用户图像通过共享校验后转换为三种格式的原生图像块。
 
 ## 已实现的请求分层
 
@@ -23,7 +23,7 @@
 
 未知provider、格式或未列出组合在加载/重载时拒绝；无URL猜测、无隐式openai兜底。具体vendor/model能力还可进一步限制输入。配置唯一来源仍为现有 `models.toml`，不是新增并行 `config.toml`；旧 `api_type = "openai"` / `"deepseek"` 已拒绝，必须改为实际格式值并明确provider。全部路由与catalog编译成功才原子发布；重载失败同时保留旧配置和旧catalog，在途请求保留原快照。
 
-多模态仅为后续概念：User及工具结果ToolCall的content可扩展为有类型content blocks，当前不实现。图像base64不能当普通文本拼入来宣称vision支持；格式/vendor/model不支持时应可失败拒绝，不丢块、不伪装能力。
+用户图像：`User { content, images: Vec<UserImage> }` 使用原始标准base64，空images默认并省略。handler预检及格式normalize均调用共享 `validate_user_images`：仅png/jpeg/gif/webp、每消息最多8张、每图5MiB、每消息解码总量20MiB，校验magic与MIME一致。仅User允许图像，System/Assistant/Tool不支持。顺序统一为非空文本在前、图像按输入顺序在后；纯图像不生成空文本块。Chat使用image_url data URL，Messages使用base64 image source，Responses使用input_image data URL；无图像时保持旧请求体。七组合的API形状支持不保证上游模型视觉能力，尤其不声明DeepSeek模型支持视觉。
 
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
@@ -32,7 +32,7 @@
 
 受理核对 Working 及非空匹配 turn，活动登记关联 turn 并监督独立 turn_cancel 令牌。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
 
-Assistant 新增 `stop_reason: Option<StopReason>`（旧文件缺字段默认为 None，prompt 非模型消息为 None，实际推理输出始终 Some），包括 `StopReason::Cancelled`（`cancelled`）；兼容保留外层 `InferenceResponse.stop_reason`，两处从单一权威映射构造且始终相同。仅用户轮次中止在真实 cleanup 成功后返回 Ok：assistant `content="Turn aborted."`、`reasoning=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Cancelled`。`CleanupFailed` 仍为 Err，不能伪造取消或空闲；根 Agent shutdown、owner abort、timeout、receiver closed 保留独立原因。
+Assistant 新增 `stop_reason: Option<StopReason>`（旧文件缺字段默认为 None，prompt 非模型消息为 None，实际推理输出始终 Some），包括 `StopReason::Cancelled`（`cancelled`）；兼容保留外层 `InferenceResponse.stop_reason`，两处从单一权威映射构造且始终相同。仅用户轮次中止在真实 cleanup 成功后返回 Ok：先 abort 并 await 本地 HTTP/SSE worker，随后返回已接受的正文与 reasoning 部分快照，`tool_calls=[]`、`replay=None`、`usage=None`、`stop_reason=Cancelled`；没有任何正文或 reasoning 时，`content=None`、`reasoning=None`，保持空 assistant，不填充提示正文。快照在每批 ProviderStreamDelta 被接受后、任何 websocket await 之前更新，因此慢客户端不会丢失已接受文本，也不会在 worker join 后追加迟到字节。不调用 vendor abort API。`CleanupFailed` 仍为 Err，不能伪造取消或空闲；根 Agent shutdown、owner abort、timeout、receiver closed 保留独立原因。
 
 取消 assistant 可显式保存到历史，stop_reason 留在 payload 元数据而非正文，但不能放入 infer 上下文（含 Inject 嵌套）。AbortSystem 先于 MCL 执行及推理受理；共享事件由各消费者独立观察，不靠 take reply 独占通知。
 
@@ -107,7 +107,7 @@ Messages将System提取为system文本块，工具调用/结果编码为tool_use
 
 Responses每次发送完整本地上下文，`store: false` 且 `include: ["reasoning.encrypted_content"]`；不依赖conversation或previous_response_id。函数调用与输出以call_id关联；不支持stop序列时显式拒绝。SSE按output item/content part及格式自己的终态检查完成，不把[DONE]当作所有格式的结束条件。
 
-Assistant新增可选 `replay: Option<serde_json::Value>`，旧消息缺字段默认为None。它是领域层不解释的API-tagged JSON信封：`{ "api_format": "messages" | "responses", "items": [...] }`。Messages保留thinking的文本及signature、redacted_thinking的data；Responses保留reasoning item的id、summary及可用的content/encrypted_content。完整响应和显式历史/DTO往返保留它，显示reasoning不能代替它。不兼容格式、无效信封及缺少必要replay的历史reasoning在HTTP前拒绝；Chat Completions不接受外来replay，OpenAI chat也拒绝非空历史reasoning。当前User和工具结果仍为String纯文本，没有图像content blocks。
+Assistant新增可选 `replay: Option<serde_json::Value>`，旧消息缺字段默认为None。它是领域层不解释的API-tagged JSON信封：`{ "api_format": "messages" | "responses", "items": [...] }`。Messages保留thinking的文本及signature、redacted_thinking的data；Responses保留reasoning item的id、summary及可用的content/encrypted_content。完整响应和显式历史/DTO往返保留它，显示reasoning不能代替它。不兼容格式、无效信封及缺少必要replay的历史reasoning在HTTP前拒绝；Chat Completions不接受外来replay，OpenAI chat也拒绝非空历史reasoning。User支持独立images，工具结果仍为String纯文本。
 
 ## 发起一次推理
 
@@ -124,7 +124,7 @@ let (sender, receiver) = oneshot::channel();
 world.send_event(InferenceRequest {
     id: "request-1".into(),
     agent,
-    messages: vec![AgentMessage::User { content: "Review this patch.".into() }],
+    messages: vec![AgentMessage::User { content: "Review this patch.".into(), images: vec![] }],
     tools: selected_callable_resources,
     turn: Some("turn-1".into()), // 当前活动轮次快照
     cancel: agent_scope.child_cancel(),
@@ -180,7 +180,7 @@ world.send_event(ReloadModelRoutes { id: "reload-1".into() });
 
 ## 上限、错误与扩展
 
-实际固定上限：配置 1MiB；单消息序列化 4MiB、总输入 16MiB、4096 条、inject 深度 32；工具 256 个、名称 64 字节、描述 8KiB；stop 64 个且每项 256 字节；错误 body 16KiB；响应总量 32MiB；单 SSE buffer/event 4MiB；单项正文/reasoning/工具参数 4MiB；整体请求 180 秒；receiver 关闭每 20ms 检查。不存在可配置的 InferenceLimits 结构体。
+实际固定上限：配置 1MiB；单消息文本序列化 4MiB、总文本输入 16MiB、含base64消息上下文及最终HTTP请求体32MiB、4096 条、inject 深度 32；工具 256 个、名称 64 字节、描述 8KiB；stop 64 个且每项 256 字节；错误 body 16KiB；响应总量 32MiB；单 SSE buffer/event 4MiB；单项正文/reasoning/工具参数 4MiB；整体请求 180 秒；receiver 关闭每 20ms 检查。不存在可配置的 InferenceLimits 结构体。
 
 错误共享 `kind/message`，文本按 UTF-8 边界限制到 512 字节；HTTP 状态由 `with_status` 写入 message，没有独立 status 字段。HTTP 错误正文优先提取常见 JSON 字段并单行化；传输错误只使用安全 URL origin 和分类，不复制可能带凭据的底层错误链，不记录 Authorization、请求正文或完整 prompt。
 

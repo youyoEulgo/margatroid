@@ -101,13 +101,16 @@ content_type(path: &str) -> &'static str
     请求回执表示中止已受理，不代表工具已清理，也不表示Agent已经idle
     只有finish_turn后的状态同步确认idle，前端才恢复发送
 
-取消assistant展示：
-    从历史message payload.stop_reason识别cancelled，不根据正文、usage缺失或turn空值猜测
-    标准正文为英文Turn aborted.，tool_calls为空，不展示虚构usage
-    在主对话区渲染为红色assistant消息，保留assistant角色与取消标签，不改成普通Error消息
+assistant展示与本地中止：
+    所有assistant统一按已有reasoning和content展示；cancelled只保留为领域stop_reason元数据
+    不使用红色、Cancelled标签或Turn aborted.兜底；空内容保持为空，reasoning-only不伪造正文
     兼容历史拆分契约：正文仍从content取得，结束原因等元数据仍从payload取得
-    旧历史缺少stop_reason按普通历史展示，不回填或根据文本推断取消
     取消消息允许显式记历史，但Driver不得把它注入推理上下文；前端渲染不替代这项执行规则
+    点击中止即为当前完整Agent实例/turn安装临时显示屏障，并冻结已知请求ID；无需等待控制回执或HTTP取消
+    屏障阻止该实例的未知请求分片，直到权威状态确认新回合；已知旧请求ID的有界tombstone跨新回合保留
+    关联拒绝仅在相同实例/turn仍有效时解除临时屏障及该请求新加的tombstone，并显示真实错误
+    受理回执保留屏障；真实finished仍用于权威历史收口，历史可对齐服务端接受的部分输出
+    不伪造finished、Idle或清理完成；没有turn字段的未知旧请求在权威新回合后无法再区分，依赖HTTP取消与真实terminal边界
 
 工具取消展示：
     仍按tool_call结果展示，原tool_call_id/tool_name保留，failed为true，正文为英文取消说明
@@ -116,6 +119,16 @@ content_type(path: &str) -> &'static str
 ```
 
 停止按钮使用 agent.turn.abort 独立控制协议；请求关联保留至状态确认不再处于该 Working 轮次，受理回执不提前恢复发送。
+
+## 用户图片输入与历史
+
+- 编辑器拖入图片与左下角加号菜单的唯一项目「上传图片 / Upload image」共用导入路径；支持多次导入和删除。
+- 图片独占不换行、可横向滚动的一行；文字在独立行。无文字也可发送图片；发送失败保留草稿，不插入本地乐观历史。
+- 每条消息最多 8 张，每张最多 5 MiB，总解码字节最多 20 MiB。仅接受 PNG/JPEG/GIF/WebP，校验 MIME 与文件签名，拒绝 SVG 等格式；错误简洁显示。
+- 异步导入和发送固定捕获 workspace/agent，切换目标即清空草稿、图片和错误；迟到结果不能写入新目标或清空新草稿。
+- 现有 MCL 发送契约为 `{type:'user',content:string,images?:[{media_type:string,data:string}]}`；data 为无 data URL 前缀的原始 base64，不转成 provider 格式。文件名只留在编辑器 UI。
+- 历史以服务端记录为准，从 user payload.images 渲染独立图片行；图片数据不展示于活动、元数据或 JSON 文本。
+- 后端再次执行相同格式、大小和数量限制，浏览器校验不替代服务端边界。
 
 ## 边界
 

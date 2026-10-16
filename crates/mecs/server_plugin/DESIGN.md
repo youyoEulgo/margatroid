@@ -624,6 +624,7 @@ is_body_limit_error(error: &axum::Error) -> bool
 handle_websocket_upgrade(State(state): State<WebSocketRouteState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> axum::response::Response
     处理WebSocket升级：私有异步函数，取对端地址与Origin/Host交给handshake_guard判定
     行为：判定失败时写warn日志并返回403，socket不建立；通过后分配连接ID并把升级后的socket交给run_websocket_connection
+    传输边界：max_frame_size和max_message_size均显式设为32 MiB，允许有界base64图片请求以单帧传输；不在传输层解释媒体、累计历史或绕过业务图片数量/解码大小校验
     边界：mecs只定义接缝与默认放行，允许哪些对端与Origin由业务侧实现；判定只发生在这一个位置
 
 run_websocket_connection(route: WebSocketRouteState, connection_id: WebSocketConnectionId, socket: WebSocket)

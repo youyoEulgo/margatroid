@@ -11,7 +11,7 @@ Agent生命周期层已实现`Idle / Working`及独立`AbortAgentTurn`控制事�
 - 协议目标`agent.turn.abort {id, message:{workspace, agent?, turn_id}}`要求非空turn_id；服务器内部核对实际Agent实例，不接受用户Entity。`agent.turn.abort_result`按id关联，Ok只表示控制受理，不代表清理完成或Idle；同一旧轮次重试使用保留取消关联，不建立平行旧pending权威。
 - 五种观察点（abort前Working且turn存在）均须覆盖：inference未受理、inference已受理、tool_call未受理、tool_call已受理、Driver消息处理/下个effect之间的间隙。未受理请求取消路径claim一次性reply恰好一次；已受理请求取消token并等待真实清理，之后返回正常形状取消结果；Driver间隙由下一effect实际动作的turn门覆盖。Working且turn=None的重复abort另按幂等pending处理。finish_turn须对应当前Driver结果链且本轮清理已完成，Idle重复完成幂等，不得以迟到旧完成覆盖新的Working轮次。
 - `inference/tool_call`在异步准备后的实际effect动作处要求turn。无turn返回Ok取消Assistant/工具结果，而非通用取消错误；不新增`get_turn`，Driver不检查turn。
-- Assistant消息携带`stop_reason=Cancelled`（序列化`cancelled`），取消正文为`Turn aborted.`，`tool_calls=[]`、`usage=None`；工具取消保留调用ID与顺序，`failed=true`、正文`Tool call aborted.`。消息历史/Block/投影保留stop_reason。
+- Assistant消息携带`stop_reason=Cancelled`（序列化`cancelled`），保留已有正文和思考，无输出保持空值，`tool_calls=[]`、`usage=None`；工具取消保留调用ID与顺序，`failed=true`、正文`Tool call aborted.`。消息历史/Block/投影保留stop_reason。
 - Driver读取entry第一条并移除同一条，显式历史保留原值。Inject仅递归展开容器并追加非容器上下文（嵌套取消Assistant也跳过），不执行子消息控制分支；User追加上下文、start_turn、推理；取消Assistant仅入历史，正常Assistant入上下文，无调用Assistant是唯一finish_turn路径，否则发工具批次；全部工具结果入上下文，批次齐后即使turn=None仍推理，取得取消Assistant收尾。Error不得直接finish或伪造取消消息。
 - 前端仅Idle允许发送、Working允许abort；服务端用户消息受理也必须验证Idle，不能只依赖按钮。清理失败仍返回错误并保留未清理活动，不转Idle。
 

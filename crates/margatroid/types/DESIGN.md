@@ -153,7 +153,7 @@ TokenUsage：单次推理统计，公开结构体
 AgentMessage：消息值，公开枚举--不是Event，不包含路由Entity
     Inject { messages: Vec<AgentMessage> }
     System { content: String }--系统消息，prompt导入及推理按实际role保留
-    User { content: String }
+    User { content: String, images: Vec<UserImage> }
     Assistant { replay: Option<serde_json::Value>, reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCall>, usage: Option<TokenUsage>, stop_reason: Option<StopReason> }
     ToolCall { resource_id: Option<ResourceID>, tool_call_id: String, tool_name: String, content: String, failed: bool }
     Error { message: String }
@@ -163,10 +163,10 @@ AgentMessage：消息值，公开枚举--不是Event，不包含路由Entity
         replay缺字段serde默认为None，是不透明API标签信封{api_format,items}，共享层不依赖ApiFormat枚举
         Messages replay保留thinking文本/signature及redacted_thinking.data；Responses保留reasoning.id/summary及可用content/encrypted_content
         DTO和显式持久历史保留replay元数据，不与正文或显示reasoning混合；格式边界验证兼容性并拒绝不能表达的重放
-        当前User和工具结果仍为String纯文本，图像content blocks未实现
+        User支持独立images数组，工具结果仍为String纯文本
         Assistant可只有合法工具调用而无正文；usage与新增stop_reason保留于结果及显式历史元数据，不回传作为模型输入
         目标stop_reason覆盖全部推理原因，新增StopReason::Cancelled序列化cancelled；兼容InferenceResponse.stop_reason由同一权威映射生成且两处始终相同
-        用户轮次中止且真实cleanup成功返回Ok assistant：content="Turn aborted."、reasoning=None、tool_calls=[]、usage=None、stop_reason=Cancelled；不伪造部分执行成功
+        用户轮次中止且真实cleanup成功返回Ok assistant：保留已接受的部分content与reasoning（二者皆空时均为None，不填充提示正文）、replay=None、tool_calls=[]、usage=None、stop_reason=Cancelled；不伪造部分执行成功
         cancelled assistant允许显式history_append，stop_reason保存在payload元数据而非content；不允许进入infer上下文（含Inject嵌套）
         infer接受System，prompt导入按资源实际role构造消息，不把所有prompt强制转换为System或User
         ToolCall结构体仍是Assistant.tool_calls的纯输入元素；AgentMessage::ToolCall是执行结果消息，两者都不构成独立TOOL_CALL Block或GET数组
@@ -393,3 +393,7 @@ Workspace 自身定义校验、创建或执行线程创建失败才返回 StartW
 Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>；失败值包含 driver 与 error，工作区身份由所属组件提供。这是持久到该工作区停止的失败诊断，不是重复 Agent 生命周期表。每个失败成员产生 WorkspaceMemberStartFailed，携带 workspace Entity、workspace_id、agent、driver、error；共享驱动失败按成员展开，动态创建失败同样记录并通知，成功加入清除该成员旧失败。Stopping 中已受理动态创建失败只结束等待，不污染健康工作区的停止结果。
 
 WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。
+
+## 用户图像契约
+
+User保持 `content: String`，增加 `images: Vec<UserImage>`；缺少images反序列化为 `[]`，空数组序列化省略。`UserImage { media_type: String, data: String }` 中data是规范标准base64（含必要padding），不是data URL；允许image/png、image/jpeg、image/gif、image/webp。每条User最多8张，每张解码后最多5 MiB，总计最多20 MiB。共享公开函数 `validate_user_images(images: &[UserImage]) -> Result<(), String>` 在解码前检查数量、编码长度及解码长度上界，再严格验证base64及与MIME一致的PNG/JPEG/GIF/WebP魔数，不执行完整图像解码。错误只含索引、限制和原因，不回显base64。领域User反序列化也调用共享验证，覆盖直接MCL/Lua/持久化入站；Protocol入站递归转换调用共享验证，出站原样保留images；MESSAGE、Lua及历史payload保留图像，不将base64拼入正文。协议原有1 MiB非图像消息限制独立保留，图像编码单独按上述限制计量。

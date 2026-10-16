@@ -17,6 +17,7 @@ import {
   Menu,
   MessageSquare,
   PanelRight,
+  Plus,
   Send,
   Square,
   Circle,
@@ -40,6 +41,7 @@ import {
 } from '@/stores/workbench';
 import { renderMarkdown } from '@/lib/markdown';
 import { formatRecordTime } from '@/lib/time';
+import { IMAGE_ACCEPT, importImage, imageSource, validateImageBudget, wireImages, metadataText, type DraftImage } from '@/lib/images';
 
 const store = useWorkbenchStore();
 const {
@@ -68,7 +70,58 @@ const {
 const canAbortTurn = computed(() => store.canAbortTurn);
 
 const draft = ref('');
+const draftImages = ref<DraftImage[]>([]);
+const imagePicker = ref<HTMLInputElement | null>(null);
+const uploadMenuOpen = ref(false);
+const composerError = ref('');
+const importingImages = ref(false);
+let draftGeneration = 0;
+let pickerGeneration = 0;
+function openImagePicker() {
+  uploadMenuOpen.value = false;
+  pickerGeneration = draftGeneration;
+  imagePicker.value?.click();
+}
+const composerRoute = computed(() => `${endpoint.value}:${selectedWorkspace.value?.id}:${selectedAgent.value}:${selectedAgentState.value?.agent_instance}`);
+watch(composerRoute, () => {
+  draftGeneration++;
+  draft.value = '';
+  draftImages.value = [];
+  composerError.value = '';
+  importingImages.value = false;
+  submittingMessage.value = false;
+  sendStage.value = null;
+  uploadMenuOpen.value = false;
+  if (imagePicker.value) imagePicker.value.value = '';
+}, { flush: 'sync' });
+const canEditComposer = computed(() => !!selectedWorkspace.value && connectionStatus.value === 'online' && selectedAgentIdle.value && !submittingMessage.value);
+async function importFiles(files: File[]) {
+  if (!canEditComposer.value || importingImages.value || !files.length) return;
+  const generation = draftGeneration;
+  importingImages.value = true;
+  composerError.value = '';
+  try {
+    validateImageBudget([...draftImages.value.map((image) => image.size), ...files.map((file) => file.size)]);
+    const imported: DraftImage[] = [];
+    for (const file of files) imported.push(await importImage(file));
+    if (generation === draftGeneration) draftImages.value.push(...imported);
+  } catch (error) {
+    if (generation === draftGeneration) composerError.value = error instanceof Error ? error.message : 'Image import failed';
+  } finally {
+    if (generation === draftGeneration) importingImages.value = false;
+  }
+}
+function pickImages(event: Event) {
+  const input = event.target as HTMLInputElement;
+  if (pickerGeneration === draftGeneration) void importFiles(Array.from(input.files ?? []));
+  input.value = '';
+}
+function dropImages(event: DragEvent) {
+  void importFiles(Array.from(event.dataTransfer?.files ?? []));
+}
+
 const submittingMessage = ref(false);
+const sendStage = ref<'injecting' | 'waking' | null>(null);
 const draftInput = ref<HTMLTextAreaElement | null>(null);
 const messageList = ref<HTMLElement | null>(null);
 const conversationPane = ref<HTMLElement | null>(null);
@@ -263,16 +316,25 @@ onBeforeUnmount(() => {
 
 async function submitMessage() {
   const text = draft.value.trim();
-  if (!text || submittingMessage.value) return;
+  if ((!text && !draftImages.value.length) || !canEditComposer.value || importingImages.value) return;
+  const generation = draftGeneration;
   submittingMessage.value = true;
+  composerError.value = '';
   try {
-    await store.sendMessage(text);
+    await store.sendMessage(text, wireImages(draftImages.value), (stage) => {
+      if (generation === draftGeneration) sendStage.value = stage;
+    });
+    if (generation !== draftGeneration) return;
     draft.value = '';
+    draftImages.value = [];
     nextTick(scrollMessages);
   } catch (error) {
-    connectionError.value = error instanceof Error ? error.message : String(error);
+    if (generation === draftGeneration) composerError.value = error instanceof Error ? error.message : 'Send failed';
   } finally {
-    submittingMessage.value = false;
+    if (generation === draftGeneration) {
+      submittingMessage.value = false;
+      sendStage.value = null;
+    }
   }
 }
 
@@ -352,7 +414,7 @@ function handleComposerWheel(event: WheelEvent) {
   const target = event.target;
   if (target instanceof Element) {
     // Keep native scrolling inside the expanded tool manager panel.
-    if (target.closest('.tool-manager-panel')) return;
+    if (target.closest('.tool-manager-panel, .image-row')) return;
     // Keep native scrolling inside an overflowing textarea draft.
     if (target instanceof HTMLTextAreaElement && target.scrollHeight > target.clientHeight) {
       return;
@@ -422,7 +484,7 @@ function mclEntryCommand(message: ConversationEntry) {
 function mclEntryResult(message: ConversationEntry) {
   const result = parseRecordPayload(message.payload)?.result;
   if (result === undefined || result === null) return '';
-  return typeof result === 'string' ? result : JSON.stringify(result);
+  return typeof result === 'string' ? result : metadataText(result);
 }
 </script>
 
@@ -569,7 +631,7 @@ function mclEntryResult(message: ConversationEntry) {
           <article :class="[
             'message-row',
             `message-row--${message.role}`,
-            { 'message-row--failed': message.failed, 'message-row--aborted': message.aborted },
+            { 'message-row--failed': message.failed },
           ]">
             <div class="message-avatar">
               <UserRound v-if="message.role === 'user'" :size="16" />
@@ -582,6 +644,9 @@ function mclEntryResult(message: ConversationEntry) {
               <div class="message-meta">
                 <strong>{{ roleLabel(message) }}</strong>
                 <span>{{ formatTime(message.timestamp) }}</span>
+              </div>
+              <div v-if="message.images?.length" class="image-row history-image-row" aria-label="Message images">
+                <img v-for="(image, index) in message.images" :key="index" :src="imageSource(image)" :alt="`Image ${index + 1}`" loading="lazy" />
               </div>
               <details v-if="message.thinking" class="message-thinking">
                 <summary>Thinking</summary>
@@ -619,10 +684,17 @@ function mclEntryResult(message: ConversationEntry) {
       </section>
 
       <footer ref="composerFooter" class="composer" @wheel="handleComposerWheel">
-        <form class="composer-box" @submit.prevent="submitMessage">
+        <form class="composer-box" @submit.prevent="submitMessage" @dragover.prevent @drop.prevent="dropImages">
+          <input ref="imagePicker" class="image-picker" type="file" :accept="IMAGE_ACCEPT" multiple @change="pickImages" />
+          <div v-if="draftImages.length" class="image-row draft-image-row" aria-label="Attached images">
+            <div v-for="image in draftImages" :key="image.id" class="draft-image">
+              <img :src="imageSource(image)" :alt="image.name" :title="image.name" />
+              <button type="button" :disabled="submittingMessage" :aria-label="`Remove ${image.name}`" @click="draftImages = draftImages.filter((item) => item.id !== image.id)"><X :size="14" /></button>
+            </div>
+          </div>
           <div class="composer-input-row">
             <textarea ref="draftInput" v-model="draft"
-              :disabled="!selectedWorkspace || connectionStatus !== 'online' || !selectedAgentIdle" rows="1"
+              :disabled="!canEditComposer" rows="1"
               :placeholder="!selectedWorkspace
                   ? 'Select a workspace...'
                   : selectedAgentReady
@@ -632,7 +704,16 @@ function mclEntryResult(message: ConversationEntry) {
                     : 'Agent is not ready...'
                 " @keydown.enter.exact.prevent="submitMessage"></textarea>
           </div>
+          <div v-if="composerError" class="composer-error" role="alert">{{ composerError }}</div>
           <div class="composer-actions">
+            <div class="upload-control">
+              <button class="icon-button" type="button" title="Add image" aria-label="Add image" :aria-expanded="uploadMenuOpen" :disabled="!canEditComposer || importingImages" @click="uploadMenuOpen = !uploadMenuOpen"><Plus :size="19" /></button>
+              <div v-if="uploadMenuOpen" class="upload-menu">
+                <button type="button" @click="openImagePicker">上传图片 / Upload image</button>
+              </div>
+            </div>
+            <span v-if="importingImages" class="image-import-label">Importing images…</span>
+            <span v-if="submittingMessage" class="image-import-label" role="status">{{ sendStage === 'waking' ? 'Message injected; waiting for wake acknowledgement…' : 'Sending; waiting for daemon acknowledgement…' }}</span>
             <span v-if="abortPending" class="abort-pending-label">Abort pending</span>
             <button v-if="selectedAgentWorking" class="send-button send-button--stop" type="button" :title="canAbortTurn
                 ? 'Stop current turn'
@@ -644,8 +725,8 @@ function mclEntryResult(message: ConversationEntry) {
                 " @click="abortTurn">
               <Square :size="14" :stroke-width="0" fill="currentColor" />
             </button>
-            <button v-else class="send-button" type="submit" title="Send message" :disabled="!draft.trim() ||
-              submittingMessage ||
+            <button v-else class="send-button" type="submit" title="Send message" :disabled="(!draft.trim() && !draftImages.length) ||
+              importingImages || submittingMessage ||
               !selectedWorkspace ||
               connectionStatus !== 'online' ||
               !selectedAgentIdle

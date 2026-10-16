@@ -2376,11 +2376,23 @@ textarea:focus-visible {
   color: var(--mg-text-secondary);
 }
 
-.message-row--aborted .message-content {
-  color: var(--color-error, #e05252);
-}
-
 .abort-pending-label {
   color: var(--mg-text-quaternary);
   font-size: 12px;
 }
+
+/* User attachments always occupy one separate, nonwrapping row. */
+.image-picker { display: none; }
+.image-row { display: flex; flex-flow: row nowrap; gap: 10px; overflow-x: auto; max-width: 100%; min-width: 0; padding: 6px 0; }
+.image-row img { display: block; width: 104px; height: 88px; object-fit: contain; border-radius: 8px; background: var(--mg-bg-subtle); flex: 0 0 auto; }
+.history-image-row { margin-bottom: 8px; }
+.history-image-row img { width: 160px; height: 128px; }
+.draft-image-row { width: 100%; }
+.draft-image { position: relative; flex: 0 0 auto; }
+.draft-image button { position: absolute; top: 0; right: 0; display: grid; place-items: center; padding: 3px; border-radius: 50%; background: var(--mg-bg-elevated); color: var(--mg-text-primary); border: 1px solid var(--mg-border); cursor: pointer; }
+.upload-control { position: relative; margin-right: auto; }
+.upload-menu { position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 20; white-space: nowrap; padding: 5px; background: var(--mg-bg-elevated); border: 1px solid var(--mg-border); border-radius: 10px; box-shadow: 0 4px 18px #0002; }
+.upload-menu button { padding: 8px 12px; color: var(--mg-text-primary); background: transparent; border: 0; border-radius: 6px; cursor: pointer; }
+.upload-menu button:hover { background: var(--mg-bg-hover); }
+.composer-error { color: #d43e45; font-size: 12px; padding: 4px 0; }
+.image-import-label { font-size: 12px; color: var(--mg-text-secondary); }

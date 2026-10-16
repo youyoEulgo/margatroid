@@ -82,7 +82,11 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(PromptResourcePlugin::open(data_root.clone())?)
         .add_plugin(SandboxResourcePlugin::open(data_root.clone())?)
         .add_plugin(agent_drivers)
-        .add_plugin(InferencePlugin::default().with_config_path(models_path.clone()))
+        .add_plugin(
+            InferencePlugin::default()
+                .with_config_path(models_path.clone())
+                .with_schedule(RuntimePlugin::UPDATE),
+        )
         .add_plugin(ToolPlugin::default())
         .add_plugin(MemoryPlugin::default())
         .add_plugin(AgentPlugin::default())

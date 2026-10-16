@@ -14,7 +14,7 @@ Agent只保存AgentDatabaseHandle及同文件AgentHistoryHandle视图，不保�
 
 ## 回合中止消息的存储边界（已实现）
 
-取消assistant仍属于显式message历史：content保存英文`Turn aborted.`，payload保留`type: assistant`与`stop_reason: cancelled`及其余元数据，不重复正文。工具取消结果保留调用ID、名称、resource_id与failed，正文保存英文取消说明。历史追加仍由Driver显式history_append执行；存储层不因取消自动创建消息，不根据正文判断取消，也不删除已发生的历史。取消assistant不进模型上下文是Driver规则，不是SQLite暗中拒绝该消息；工具结果则正常进入历史和上下文。Block与历史是不同事务，仍不承诺跨操作原子性，取消不撤销已提交的数据库写入。
+取消assistant仍属于显式message历史：content保存实际累计正文，无输出保持空字符串，不自动填入文案，payload保留`type: assistant`与`stop_reason: cancelled`及其余元数据，不重复正文。工具取消结果保留调用ID、名称、resource_id与failed，正文保存英文取消说明。历史追加仍由Driver显式history_append执行；存储层不因取消自动创建消息，不根据正文判断取消，也不删除已发生的历史。取消assistant不进模型上下文是Driver规则，不是SQLite暗中拒绝该消息；工具结果则正常进入历史和上下文。Block与历史是不同事务，仍不承诺跨操作原子性，取消不撤销已提交的数据库写入。
 
 ## 类型
 

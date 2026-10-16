@@ -16,6 +16,7 @@ import {
   type ToolCall,
   type WorkspaceInfo,
   type WorkspaceRef,
+  type UserImage,
 } from '@/types/protocol';
 
 export type ConnectionStatus = 'offline' | 'connecting' | 'online';
@@ -30,7 +31,7 @@ export interface ConversationEntry {
   content: string;
   toolCalls: ToolCall[];
   failed: boolean;
-  aborted?: boolean;
+  images?: UserImage[];
   timestamp: number;
   kind: string;
   payload: unknown;
@@ -67,10 +68,12 @@ export function resourceName(resource: string): string {
 export function contextInjection(
   content: string,
   path: string,
+  images: UserImage[] = [],
 ): { command: string; arguments: unknown[][] } {
   if (!path.trim() || !/^[A-Za-z_][A-Za-z0-9_.[\]-]*$/.test(path.trim()))
     throw new Error('Configure a valid driver context path before injecting a message');
-  return { command: `INJECT ? TO ${path.trim()}`, arguments: [[{ type: 'user', content }]] };
+  return { command: `INJECT ? TO ${path.trim()}`, arguments: [[{ type: 'user', content,
+    ...(images.length ? { images: images.map(({ media_type, data }) => ({ media_type, data })) } : {}) }]] };
 }
 export function parseArguments(raw: string): unknown[][] {
   const value: unknown = JSON.parse(raw);
@@ -155,7 +158,7 @@ function payloadRequestId(entry: HistoryMessage): string {
 function decodeMessage(
   message: AgentMessage,
 ): Array<
-  Pick<ConversationEntry, 'role' | 'thinking' | 'content' | 'toolCalls' | 'failed' | 'aborted'>
+  Pick<ConversationEntry, 'role' | 'thinking' | 'content' | 'toolCalls' | 'failed' | 'images'>
 > {
   switch (message.type) {
     case 'inject':
@@ -165,6 +168,7 @@ function decodeMessage(
       return [
         {
           role: message.type,
+          images: message.type === 'user' ? message.images : undefined,
           thinking: '',
           content: message.content,
           toolCalls: [],
@@ -176,8 +180,7 @@ function decodeMessage(
         {
           role: 'assistant',
           thinking: message.reasoning ?? '',
-          content: message.stop_reason === 'cancelled' ? 'Turn aborted.' : (message.content ?? ''),
-          aborted: message.stop_reason === 'cancelled',
+          content: message.content ?? '',
           toolCalls: message.tool_calls,
           failed: false,
         },
@@ -213,8 +216,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     >(),
   );
   const abortRequests = ref(
-    new Map<string, { workspace: string; agent: string; turn: string; instance: string }>(),
+    new Map<string, { workspace: string; agent: string; turn: string; instance: string; streamKeys: string[] }>(),
   );
+  const abortGuards = new Map<string, { workspace: string; agent: string; turn: string; instance: string; streamKeys: string[] }>();
   const connectionStatus = ref<ConnectionStatus>('offline');
   const connectionError = ref('');
   const registeredClient = ref<ClientInfo | null>(null);
@@ -227,8 +231,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const streams = ref(new Map<string, StreamEntry>());
   const pending = new Map<string, PendingCommand>();
   const completedStreams = new Set<string>();
+  // Keep abort suppression separate from completion: finished/history still reconcile partial output.
+  const abortedStreams = new Set<string>();
   const readCommands = new Set<string>();
   let socket: WebSocket | null = null;
+  let routeRevision = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let reconnectAttempt = 0;
   let shouldReconnect = true;
@@ -431,12 +438,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
   }
   function selectWorkspace(key: string) {
+    routeRevision++;
     selectedWorkspaceKey.value = key;
     selectedAgent.value = null;
     queryHistory();
     void refreshDriverResources();
   }
   function selectAgent(agent: string | null) {
+    routeRevision++;
     selectedAgent.value = agent;
     queryHistory();
     void refreshDriverResources();
@@ -460,7 +469,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       id,
       message: {
         workspace: { id: workspace.id, name: workspace.name, project_root: workspace.project_root },
-        agent: selectedAgent.value,
+        agent: selectedAgentId.value,
         command: command.trim(),
         arguments: argumentsValue,
       },
@@ -489,15 +498,37 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       }
     });
   }
-  async function sendMessage(content: string): Promise<unknown> {
-    if (!content.trim()) throw new Error('Message is empty');
+  async function sendMessage(
+    content: string,
+    images: UserImage[] = [],
+    onStage?: (stage: 'injecting' | 'waking') => void,
+  ): Promise<unknown> {
+    if (!content.trim() && !images.length) throw new Error('Message is empty');
     if (!selectedAgentIdle.value) throw new Error('The selected agent is not idle');
     const key = driverKey.value;
-    const instruction = contextInjection(content.trim(), driverContextPath.value);
+    const revision = routeRevision;
+    const instruction = contextInjection(content.trim(), driverContextPath.value, images);
     lastFailures.value.delete(`${selectedWorkspaceKey.value}:${selectedAgentId.value}`);
-    await executeMclCommand(instruction.command, instruction.arguments);
-    assertDriverRoute(key);
-    return executeMclCommand('EMIT EFFECT wake');
+    let stage: 'injecting' | 'waking' = 'injecting';
+    onStage?.(stage);
+    addLog('INFO', 'Sending message; waiting for daemon injection acknowledgement', 'ui.send', [
+      { name: 'images', value: String(images.length) },
+    ]);
+    try {
+      await executeMclCommand(instruction.command, instruction.arguments);
+      if (revision !== routeRevision) throw new Error('Selected agent changed during send');
+      assertDriverRoute(key);
+      stage = 'waking';
+      onStage?.(stage);
+      addLog('INFO', 'Message injected; waiting for daemon wake acknowledgement', 'ui.send');
+      const result = await executeMclCommand('EMIT EFFECT wake');
+      addLog('INFO', 'Daemon acknowledged message and wake', 'ui.send');
+      return result;
+    } catch (error) {
+      // Backend errors may contain submitted arguments; keep activity diagnostics payload-free.
+      addLog('ERROR', `Message send failed while awaiting ${stage === 'injecting' ? 'injection' : 'wake'} acknowledgement; see composer error`, 'ui.send');
+      throw error;
+    }
   }
   function importCandidates() {
     const candidates = new Map<string, { resource_id: string; alias: string; kind: string }>();
@@ -637,7 +668,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       agent: state.agent,
       turn: state.turn,
       instance: state.agent_instance,
+      streamKeys: [...streams.value].filter(([, stream]) =>
+        stream.workspaceKey === workspace.id && stream.agent === state.agent &&
+        stream.instance === state.agent_instance && !stream.completed && !abortedStreams.has(stream.key),
+      ).map(([key]) => key),
     });
+    const guard = abortRequests.value.get(id)!;
+    abortGuards.set(id, guard);
+    for (const key of guard.streamKeys) rememberAbortedStream(key);
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         pending.delete(id);
@@ -650,10 +688,28 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       } catch (error) {
         clearTimeout(timeout);
         pending.delete(id);
+        releaseAbortGuard(id);
         abortRequests.value.delete(id);
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
+  }
+  function rememberAbortedStream(key: string) {
+    abortedStreams.add(key);
+    while (abortedStreams.size > 1000)
+      abortedStreams.delete(abortedStreams.values().next().value!);
+  }
+  function releaseAbortGuard(id: string) {
+    const guard = abortGuards.get(id);
+    if (!guard) return;
+    // A late rejection must not revive old requests after an authoritative new turn.
+    if (agentStates.value.some((state) =>
+      state.workspace.id === guard.workspace && state.agent === guard.agent &&
+      state.agent_instance === guard.instance && (state.turn === guard.turn || state.turn === null),
+    )) {
+      for (const key of guard.streamKeys) abortedStreams.delete(key);
+    }
+    abortGuards.delete(id);
   }
   function handleDelta(event: StreamDelta, reasoning: boolean) {
     const state = agentStates.value.find(
@@ -661,7 +717,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     );
     if (!state) return;
     const key = `${event.agent_instance}:${event.id}`;
-    if (completedStreams.has(key)) return;
+    if (completedStreams.has(key) || abortedStreams.has(key)) return;
+    const guard = [...abortGuards.values()].find((request) =>
+      request.workspace === state.workspace.id && request.agent === event.agent &&
+      request.instance === event.agent_instance &&
+      (state.turn === request.turn || state.turn === null),
+    );
+    if (guard) {
+      guard.streamKeys.push(key);
+      rememberAbortedStream(key);
+      return;
+    }
     const old = streams.value.get(key);
     if (old && (old.completed || event.sequence <= old.lastSequence)) return;
     const message: StreamEntry = old
@@ -711,6 +777,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       case 'state.sync': {
         workspaces.value = event.state.workspaces;
         agentStates.value = event.state.agents;
+        for (const [id, guard] of abortGuards) {
+          if (!agentStates.value.some((state) =>
+            state.workspace.id === guard.workspace && state.agent === guard.agent &&
+            state.agent_instance === guard.instance &&
+            (state.turn === guard.turn || state.turn === null),
+          )) abortGuards.delete(id);
+        }
         for (const [id, request] of abortRequests.value) {
           if (
             !pending.has(id) &&
@@ -775,6 +848,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           request.turn !== event.turn_id
         )
           break;
+        if ('Err' in event.result) {
+          releaseAbortGuard(event.id);
+          abortRequests.value.delete(event.id);
+        }
         const command = pending.get(event.id);
         if (command) {
           clearTimeout(command.timeout);
@@ -828,6 +905,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         );
         break;
       case 'request.failed': {
+        releaseAbortGuard(event.id);
         abortRequests.value.delete(event.id);
         const command = pending.get(event.id);
         if (command) {

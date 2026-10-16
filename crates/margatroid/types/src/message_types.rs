@@ -1,5 +1,87 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use resource_id_plugin::ResourceID;
 use serde::{Deserialize, Serialize};
+
+pub const MAX_USER_IMAGES: usize = 8;
+pub const MAX_USER_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+pub const MAX_USER_IMAGES_BYTES: usize = 20 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserImage {
+    pub media_type: String,
+    pub data: String,
+}
+
+fn deserialize_user_images<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<UserImage>, D::Error> {
+    let images = Vec::<UserImage>::deserialize(deserializer)?;
+    validate_user_images(&images).map_err(serde::de::Error::custom)?;
+    Ok(images)
+}
+
+pub fn validate_user_images(images: &[UserImage]) -> Result<(), String> {
+    if images.len() > MAX_USER_IMAGES {
+        return Err(format!(
+            "user message permits at most {MAX_USER_IMAGES} images"
+        ));
+    }
+    let mut total = 0usize;
+    for (index, image) in images.iter().enumerate() {
+        let error = |reason: &str| format!("user image {}: {reason}", index + 1);
+        if !matches!(
+            image.media_type.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) {
+            return Err(error(
+                "unsupported media type; expected image/png, image/jpeg, image/gif or image/webp",
+            ));
+        }
+        if image.data.len() > MAX_USER_IMAGE_BYTES.div_ceil(3) * 4 {
+            return Err(error("decoded size exceeds 5 MiB per-image limit"));
+        }
+        if image.data.is_empty() || image.data.len() % 4 != 0 {
+            return Err(error(
+                "expected canonical standard base64 with required padding (not a data URL)",
+            ));
+        }
+        let padding = image
+            .data
+            .as_bytes()
+            .iter()
+            .rev()
+            .take_while(|&&byte| byte == b'=')
+            .count();
+        if padding > 2 {
+            return Err(error("invalid canonical standard base64 padding"));
+        }
+        let decoded_len = image.data.len() / 4 * 3 - padding;
+        if decoded_len > MAX_USER_IMAGE_BYTES {
+            return Err(error("decoded size exceeds 5 MiB per-image limit"));
+        }
+        total += decoded_len;
+        if total > MAX_USER_IMAGES_BYTES {
+            return Err(error("total decoded size exceeds 20 MiB per-message limit"));
+        }
+    }
+    for (index, image) in images.iter().enumerate() {
+        let error = |reason: &str| format!("user image {}: {reason}", index + 1);
+        let bytes = STANDARD
+            .decode(&image.data)
+            .map_err(|_| error("invalid canonical standard base64"))?;
+        let valid_magic = match image.media_type.as_str() {
+            "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "image/jpeg" => bytes.starts_with(b"\xff\xd8\xff"),
+            "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+            _ => false,
+        };
+        if !valid_magic {
+            return Err(error("image signature does not match media type"));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -26,6 +108,12 @@ pub enum AgentMessage {
     },
     User {
         content: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "deserialize_user_images"
+        )]
+        images: Vec<UserImage>,
     },
     Assistant {
         reasoning: Option<String>,
@@ -57,7 +145,7 @@ impl AgentMessage {
         Self::Assistant {
             reasoning: None,
             replay: None,
-            content: Some("Turn aborted.".into()),
+            content: None,
             tool_calls: Vec::new(),
             usage: None,
             stop_reason: Some(StopReason::Cancelled),
@@ -125,9 +213,9 @@ mod tests {
         );
         assert!(matches!(aborted.message, AgentMessage::Assistant {
             reasoning: None,
-            replay: None, content: Some(content), tool_calls, usage: None,
+            replay: None, content: None, tool_calls, usage: None,
             stop_reason: Some(StopReason::Cancelled),
-        } if content == "Turn aborted." && tool_calls.is_empty()));
+        } if tool_calls.is_empty()));
     }
 
     #[test]

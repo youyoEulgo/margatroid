@@ -43,13 +43,52 @@ pub(crate) fn handle_inbound_message(
     let WebSocketMessage::Text(text) = message else {
         return;
     };
-    if text.len() > 1024 * 1024 {
+    if text.len() > 32 * 1024 * 1024 {
+        tracing::warn!(
+            connection = connection_id.get(),
+            bytes = text.len(),
+            "API request exceeds 32 MiB transport limit"
+        );
+        close_invalid_request(
+            world,
+            connection_id,
+            1009,
+            "API request exceeds 32 MiB limit",
+        );
         return;
     }
     let request = match serde_json::from_str::<ClientMessage>(&text) {
         Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(connection = connection_id.get(), error = %error, "invalid API request");
+        Err(_) => {
+            tracing::warn!(
+                connection = connection_id.get(),
+                bytes = text.len(),
+                "invalid API request structure"
+            );
+            let id = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .filter(|id| !id.is_empty() && id.len() <= 512)
+                        .map(str::to_owned)
+                });
+            if let Some(id) = id {
+                send_to_connection(
+                    world,
+                    connection_id,
+                    &ServerMessage::RequestFailed {
+                        id,
+                        error: ProtocolErrorDto::new(
+                            "InvalidRequest",
+                            "invalid API request structure",
+                        ),
+                    },
+                );
+            } else {
+                close_invalid_request(world, connection_id, 1007, "invalid API request structure");
+            }
             return;
         }
     };
@@ -66,6 +105,26 @@ pub(crate) fn handle_inbound_message(
         );
     }
 }
+fn close_invalid_request(
+    world: &World,
+    connection_id: WebSocketConnectionId,
+    code: u16,
+    reason: &'static str,
+) {
+    let Some(sender) = world
+        .get_resource::<WebSocketConnections>()
+        .and_then(|connections| connections.get(connection_id))
+    else {
+        return;
+    };
+    use async_runtime_plugin::WorldAsyncExt;
+    world.spawn_async_service(async move {
+        let _ = sender
+            .close(server_plugin::WebSocketCloseReason::new(code, reason))
+            .await;
+    });
+}
+
 fn prepare_workspace_start(
     message: margatroid_protocol::StartWorkspaceDto,
     operation_id: String,

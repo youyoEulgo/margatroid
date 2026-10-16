@@ -57,7 +57,7 @@ MCL已实现Creating / Idle / Working / Stopping轮次effect。start_turn要求I
 
 取消消息值与结果形状：
     Assistant消息自身携带stop_reason，新增Cancelled枚举并序列化为cancelled
-    取消Assistant content为英文'Turn aborted.'，tool_calls为空，usage=None
+    取消Assistant保留已累计content/reasoning，无输出时保持None，不填充文案；tool_calls为空，usage=None
     inference正常外层成功值及message结构保持，取消不是MclError::Cancelled替代结果
     每个取消工具结果保留原调用ID、原顺序及既有工具身份关联，failed=true，content为'Tool call aborted.'
     无turn的tool_call仍按原Assistant.tool_calls逐项返回取消结果，空批次仍是typed空MESSAGE数组
@@ -354,7 +354,7 @@ MclCommandResult：命令结果，公开事件
 InferenceRequest：统一推理请求，公开事件
     tools: Vec<CallableResource>--替代resources:Vec<ResourceID>，定义于inference_events
     说明：其他关联、消息、取消与oneshot字段沿用领域契约，不由MCL复制完整结构。
-    推理分层（已实现）：MCL继续只提交领域消息与选定工具快照，不选择API格式或厂商，也不直接构造HTTP。InferencePlugin验证后构造共享纯值DomainRequest，再按模型路由provider与api_type转换；InferenceRequest仍为执行事件，不被DomainRequest替代。Driver无需因Chat Completions、Messages或无状态Responses切换而更换。Assistant可选replay随MESSAGE、显式history_append及结果保留；旧值缺字段为None，MCL不解释或伪造签名/加密API元数据。格式转换会拒绝跨格式replay和不可表达的参数，不通过丢失reasoning实现兼容；User和工具结果仍纯文本，图像未实现。
+    推理分层（已实现）：MCL继续只提交领域消息与选定工具快照，不选择API格式或厂商，也不直接构造HTTP。InferencePlugin验证后构造共享纯值DomainRequest，再按模型路由provider与api_type转换；InferenceRequest仍为执行事件，不被DomainRequest替代。Driver无需因Chat Completions、Messages或无状态Responses切换而更换。Assistant可选replay随MESSAGE、显式history_append及结果保留；旧值缺字段为None，MCL不解释或伪造签名/加密API元数据。格式转换会拒绝跨格式replay和不可表达的参数，不通过丢失reasoning实现兼容；User支持独立images数组（media_type和原始base64 data），MESSAGE反序列化调用共享校验，MCL/Lua/持久上下文/显式历史保留图片；content仍单独保存文本，工具结果仍纯文本。MCL不生成data URL或厂商图片块，这些由后续API适配器负责。
 
 ToolExecuteRequest：单调用执行请求，公开事件
     resource: CallableResource--选定共享快照，自含ResourceID，不另建重复resource_id字段

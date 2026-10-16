@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::error::{InferenceError, InferenceErrorKind};
-use margatroid_types::message_types::{AgentMessage, TokenUsage, ToolCall};
+use margatroid_types::message_types::{
+    validate_user_images, AgentMessage, TokenUsage, ToolCall, UserImage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -123,7 +125,7 @@ fn normalize(request: &mut DomainRequest) -> Result<()> {
         output: &mut Vec<AgentMessage>,
         depth: usize,
     ) -> Result<()> {
-        if depth > 64 {
+        if depth > 32 {
             return Err(invalid("message nesting exceeds limit"));
         }
         for message in messages {
@@ -140,9 +142,10 @@ fn normalize(request: &mut DomainRequest) -> Result<()> {
             }
             match message {
                 AgentMessage::Inject { messages } => flatten(messages, output, depth + 1)?,
-                AgentMessage::Error { message } => {
-                    output.push(AgentMessage::User { content: message })
-                }
+                AgentMessage::Error { message } => output.push(AgentMessage::User {
+                    content: message,
+                    images: vec![],
+                }),
                 other => output.push(other),
             }
         }
@@ -173,12 +176,16 @@ fn normalize(request: &mut DomainRequest) -> Result<()> {
     let mut pending = HashMap::new();
     let mut ids = HashSet::new();
     let mut bytes = 0usize;
+    let mut encoded_bytes = 0usize;
     for message in &messages {
-        let size = serde_json::to_vec(message)
-            .map_err(|_| invalid("invalid message"))?
-            .len();
+        let (size, encoded_size) = validated_message_sizes(message)?;
         bytes = bytes.saturating_add(size);
-        if size > 4 * 1024 * 1024 || bytes > 16 * 1024 * 1024 {
+        encoded_bytes = encoded_bytes.saturating_add(encoded_size);
+        if size > super::MAX_MESSAGE_BYTES
+            || bytes > super::MAX_MESSAGES_BYTES
+            || encoded_bytes > super::MAX_REQUEST_BYTES
+            || messages.len() > 4096
+        {
             return Err(invalid("messages exceed limit"));
         }
         match message {
@@ -222,6 +229,51 @@ fn normalize(request: &mut DomainRequest) -> Result<()> {
     }
     request.messages = messages;
     Ok(())
+}
+
+pub(crate) fn validated_message_sizes(message: &AgentMessage) -> Result<(usize, usize)> {
+    if let AgentMessage::User { images, .. } = message {
+        validate_user_images(images)
+            .map_err(|error| InferenceError::new(InferenceErrorKind::InvalidMessages, error))?;
+    }
+    let encoded = serde_json::to_vec(message)
+        .map_err(|_| invalid("invalid message"))?
+        .len();
+    let text = match message {
+        AgentMessage::User { content, images } if !images.is_empty() => {
+            serde_json::to_vec(&AgentMessage::User {
+                content: content.clone(),
+                images: vec![],
+            })
+            .map_err(|_| invalid("invalid message"))?
+            .len()
+        }
+        _ => encoded,
+    };
+    Ok((text, encoded))
+}
+
+fn user_content(content: String, images: Vec<UserImage>, format: ApiFormat) -> Value {
+    if images.is_empty() && format != ApiFormat::Messages {
+        return json!(content);
+    }
+    let mut parts = Vec::new();
+    if !content.is_empty() || images.is_empty() {
+        let kind = if format == ApiFormat::Responses {
+            "input_text"
+        } else {
+            "text"
+        };
+        parts.push(json!({"type":kind,"text":content}));
+    }
+    for image in images {
+        parts.push(match format {
+            ApiFormat::ChatCompletions => json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{}",image.media_type,image.data)}}),
+            ApiFormat::Messages => json!({"type":"image","source":{"type":"base64","media_type":image.media_type,"data":image.data}}),
+            ApiFormat::Responses => json!({"type":"input_image","image_url":format!("data:{};base64,{}",image.media_type,image.data)}),
+        });
+    }
+    json!(parts)
 }
 
 fn replay_items(
@@ -289,7 +341,7 @@ impl TryFrom<DomainRequest> for ChatCompletionsRequest {
         }
         let messages = request.messages.into_iter().map(|message| match message {
             AgentMessage::System { content } => json!({"role":"system","content":content}),
-            AgentMessage::User { content } => json!({"role":"user","content":content}),
+            AgentMessage::User { content, images } => json!({"role":"user","content":user_content(content, images, ApiFormat::ChatCompletions)}),
             AgentMessage::Assistant { reasoning, content, tool_calls, .. } => {
                 let mut value = json!({"role":"assistant","content":content});
                 if let Some(reasoning) = reasoning { value["reasoning_content"] = json!(reasoning); }
@@ -334,10 +386,13 @@ impl TryFrom<DomainRequest> for MessagesRequest {
                     }
                     system.push(json!({"type":"text","text":content}));
                 }
-                AgentMessage::User { content } => merge_message(
+                AgentMessage::User { content, images } => merge_message(
                     &mut messages,
                     "user",
-                    vec![json!({"type":"text","text":content})],
+                    user_content(content, images, ApiFormat::Messages)
+                        .as_array()
+                        .unwrap()
+                        .clone(),
                 ),
                 AgentMessage::Assistant {
                     reasoning,
@@ -391,8 +446,8 @@ impl TryFrom<DomainRequest> for ResponsesRequest {
                 AgentMessage::System { content } => {
                     input.push(json!({"role":"system","content":content}))
                 }
-                AgentMessage::User { content } => {
-                    input.push(json!({"role":"user","content":content}))
+                AgentMessage::User { content, images } => {
+                    input.push(json!({"role":"user","content":user_content(content, images, ApiFormat::Responses)}))
                 }
                 AgentMessage::Assistant {
                     reasoning,
@@ -1113,6 +1168,116 @@ mod tests {
         ]
     }
 
+    fn test_images() -> Vec<UserImage> {
+        [
+            ("image/png", "iVBORw0KGgo="),
+            ("image/jpeg", "/9j/"),
+            ("image/gif", "R0lGODlh"),
+            ("image/webp", "UklGRgAAAABXRUJQ"),
+        ]
+        .into_iter()
+        .map(|(mime, data)| UserImage {
+            media_type: mime.into(),
+            data: data.into(),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn all_formats_preserve_all_image_types_order_and_text_compatibility() {
+        for format in [
+            ApiFormat::ChatCompletions,
+            ApiFormat::Messages,
+            ApiFormat::Responses,
+        ] {
+            for text in ["", "describe"] {
+                let user = AgentMessage::User {
+                    content: text.into(),
+                    images: test_images(),
+                };
+                let value =
+                    serde_json::to_value(format.build_request(request(vec![user])).unwrap())
+                        .unwrap();
+                let key = if format == ApiFormat::Responses {
+                    "input"
+                } else {
+                    "messages"
+                };
+                let parts = value[key][0]["content"].as_array().unwrap();
+                let offset = usize::from(!text.is_empty());
+                assert_eq!(parts.len(), 4 + offset);
+                if offset == 1 {
+                    assert_eq!(parts[0]["text"], text);
+                }
+                for (part, image) in parts[offset..].iter().zip(test_images()) {
+                    let url = format!("data:{};base64,{}", image.media_type, image.data);
+                    match format {
+                        ApiFormat::ChatCompletions => {
+                            assert_eq!(part, &json!({"type":"image_url","image_url":{"url":url}}))
+                        }
+                        ApiFormat::Messages => assert_eq!(
+                            part,
+                            &json!({"type":"image","source":{"type":"base64","media_type":image.media_type,"data":image.data}})
+                        ),
+                        ApiFormat::Responses => {
+                            assert_eq!(part, &json!({"type":"input_image","image_url":url}))
+                        }
+                    }
+                }
+            }
+            let value = serde_json::to_value(
+                format
+                    .build_request(request(vec![AgentMessage::User {
+                        content: "legacy".into(),
+                        images: vec![],
+                    }]))
+                    .unwrap(),
+            )
+            .unwrap();
+            match format {
+                ApiFormat::Messages => assert_eq!(
+                    value["messages"][0]["content"],
+                    json!([{"type":"text","text":"legacy"}])
+                ),
+                ApiFormat::ChatCompletions => assert_eq!(value["messages"][0]["content"], "legacy"),
+                ApiFormat::Responses => assert_eq!(value["input"][0]["content"], "legacy"),
+            }
+            let invalid_image = UserImage {
+                media_type: "image/jpeg".into(),
+                data: "iVBORw0KGgo=".into(),
+            };
+            let error = format
+                .build_request(request(vec![AgentMessage::User {
+                    content: String::new(),
+                    images: vec![invalid_image],
+                }]))
+                .unwrap_err();
+            assert!(!error.to_string().contains("iVBORw0KGgo="));
+        }
+    }
+
+    #[test]
+    fn encoded_image_context_is_bounded_separately_from_text() {
+        let image = UserImage {
+            media_type: "image/png".into(),
+            data: format!(
+                "iVBORw0KGgoA{}",
+                "AAAA".repeat((4 * 1024 * 1024 + 512 * 1024 - 9) / 3)
+            ),
+        };
+        let user = AgentMessage::User {
+            content: String::new(),
+            images: vec![image; 4],
+        };
+        let (text, encoded) = validated_message_sizes(&user).unwrap();
+        assert!(text < 1024);
+        assert!(encoded > super::super::MAX_MESSAGES_BYTES);
+        let mut single = request(vec![user.clone()]);
+        normalize(&mut single).unwrap();
+        let mut multiple = request(vec![user.clone(), user]);
+        assert!(normalize(&mut multiple).is_err());
+    }
+
     #[test]
     fn format_names_and_stateless_tool_batch() {
         assert_eq!(
@@ -1149,11 +1314,13 @@ mod tests {
     fn no_silent_loss_or_invalid_linkage() {
         let mut r = request(vec![AgentMessage::User {
             content: "hi".into(),
+            images: vec![],
         }]);
         r.config.stop.push("stop".into());
         assert!(ResponsesRequest::try_from(r).is_err());
         let mut r = request(vec![AgentMessage::User {
             content: "hi".into(),
+            images: vec![],
         }]);
         r.config.max_output_tokens = None;
         assert!(MessagesRequest::try_from(r).is_err());

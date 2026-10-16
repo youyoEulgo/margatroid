@@ -45,6 +45,7 @@ fn public_api_installs_reloads_and_replies_to_missing_agent() {
         agent,
         messages: vec![AgentMessage::User {
             content: "hello".into(),
+            images: vec![],
         }],
         tools: vec![],
         turn: None,

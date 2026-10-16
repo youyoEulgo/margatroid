@@ -29,6 +29,7 @@ fn blocks() -> AgentBlock {
             BlockInner::Message(
                 (0..4)
                     .map(|i| AgentMessage::User {
+                        images: Vec::new(),
                         content: i.to_string(),
                     })
                     .collect(),
@@ -131,6 +132,19 @@ fn checked_ranges_and_typed_empty() {
     );
 }
 #[test]
+fn manual_user_images_round_trip_and_invalid_input_is_rejected() {
+    let wire = json!([{"type":"user","content":"describe","images":[{"media_type":"image/png","data":"iVBORw0KGgo="}]}]);
+    let decoded = decode_manual_array(&wire, InnerType::Message).unwrap();
+    let BlockInner::Message(messages) = decoded else {
+        panic!("not messages")
+    };
+    assert_eq!(serde_json::to_value(&messages).unwrap(), wire);
+    let invalid = json!([{"type":"user","content":"describe","images":[{"media_type":"image/png","data":"payload_secret_invalid"}]}]);
+    let error = decode_manual_array(&invalid, InnerType::Message).unwrap_err();
+    assert!(!format!("{error:?}").contains("payload_secret_invalid"));
+}
+
+#[test]
 fn tool_calls_are_extracted_only_from_one_assistant() {
     let assistant = AgentMessage::Assistant {
         replay: None,
@@ -148,6 +162,7 @@ fn tool_calls_are_extracted_only_from_one_assistant() {
     for messages in [
         vec![],
         vec![AgentMessage::User {
+            images: Vec::new(),
             content: "no".into(),
         }],
         vec![assistant.clone(), assistant],

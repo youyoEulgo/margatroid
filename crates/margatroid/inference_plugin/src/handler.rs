@@ -272,6 +272,8 @@ async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Vec<u8>
 struct PreparedInference {
     #[cfg(test)]
     terminal_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(test)]
+    stream_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     id: String,
     agent_id: ResourceID,
     agent_instance: String,
@@ -466,6 +468,8 @@ fn prepare_inference(
     let prepared = PreparedInference {
         #[cfg(test)]
         terminal_gate: None,
+        #[cfg(test)]
+        stream_gate: None,
         id: request.id,
         agent_id: agent.resourceid.clone(),
         agent_instance: format!("{:?}", request.agent),
@@ -599,6 +603,7 @@ fn normalize_messages(messages: Vec<AgentMessage>) -> Result<Vec<ProviderMessage
         depth: usize,
         out: &mut Vec<ProviderMessage>,
         bytes: &mut usize,
+        encoded_bytes: &mut usize,
     ) -> Result<(), InferenceError> {
         if depth > 32 {
             return Err(InferenceError::new(
@@ -620,19 +625,17 @@ fn normalize_messages(messages: Vec<AgentMessage>) -> Result<Vec<ProviderMessage
                 ));
             }
             if let AgentMessage::Inject { messages } = message {
-                expand(messages, depth + 1, out, bytes)?;
+                expand(messages, depth + 1, out, bytes, encoded_bytes)?;
                 continue;
             }
-            let size = serde_json::to_vec(&message)
-                .map_err(|_| {
-                    InferenceError::new(
-                        InferenceErrorKind::InvalidMessages,
-                        "message cannot be encoded",
-                    )
-                })?
-                .len();
+            let (size, encoded_size) = formats::validated_message_sizes(&message)?;
             *bytes = bytes.saturating_add(size);
-            if size > MAX_MESSAGE_BYTES || *bytes > MAX_MESSAGES_BYTES || out.len() >= 4096 {
+            *encoded_bytes = encoded_bytes.saturating_add(encoded_size);
+            if size > MAX_MESSAGE_BYTES
+                || *bytes > MAX_MESSAGES_BYTES
+                || *encoded_bytes > MAX_REQUEST_BYTES
+                || out.len() >= 4096
+            {
                 return Err(InferenceError::new(
                     InferenceErrorKind::InvalidMessages,
                     "message size or count exceeds limit",
@@ -640,7 +643,7 @@ fn normalize_messages(messages: Vec<AgentMessage>) -> Result<Vec<ProviderMessage
             }
             out.push(match message {
                 AgentMessage::System { content } => ProviderMessage::System { content },
-                AgentMessage::User { content } => ProviderMessage::User { content },
+                AgentMessage::User { content, images } => ProviderMessage::User { content, images },
                 AgentMessage::Error { message } => ProviderMessage::Error { message },
                 AgentMessage::Assistant {
                     reasoning,
@@ -666,7 +669,7 @@ fn normalize_messages(messages: Vec<AgentMessage>) -> Result<Vec<ProviderMessage
         Ok(())
     }
     let mut out = Vec::new();
-    expand(messages, 0, &mut out, &mut 0)?;
+    expand(messages, 0, &mut out, &mut 0, &mut 0)?;
     if out.is_empty() {
         return Err(InferenceError::new(
             InferenceErrorKind::InvalidMessages,
@@ -751,6 +754,40 @@ async fn execute_inference(prepared: PreparedInference, guard: TaskGuard) {
     owner_drop.disarm();
 }
 
+#[derive(Default)]
+struct PartialResponse {
+    reasoning: String,
+    content: String,
+}
+
+impl PartialResponse {
+    fn accept(&mut self, deltas: &[ProviderStreamDelta]) {
+        for delta in deltas {
+            match delta {
+                ProviderStreamDelta::Reasoning(text) => self.reasoning.push_str(text),
+                ProviderStreamDelta::Content(text) => self.content.push_str(text),
+            }
+        }
+    }
+
+    fn cancelled(&self) -> InferenceResponse {
+        if self.reasoning.is_empty() && self.content.is_empty() {
+            return InferenceResponse::aborted();
+        }
+        InferenceResponse {
+            message: AgentMessage::Assistant {
+                replay: None,
+                reasoning: (!self.reasoning.is_empty()).then(|| self.reasoning.clone()),
+                content: (!self.content.is_empty()).then(|| self.content.clone()),
+                tool_calls: vec![],
+                usage: None,
+                stop_reason: Some(StopReason::Cancelled),
+            },
+            stop_reason: StopReason::Cancelled,
+        }
+    }
+}
+
 async fn supervise_inference(
     prepared: PreparedInference,
     mut guard: TaskGuard,
@@ -777,14 +814,19 @@ async fn supervise_inference(
     let terminal_instance = prepared.agent_instance.clone();
     #[cfg(test)]
     let terminal_gate = prepared.terminal_gate.clone();
-    let mut worker = tokio::spawn(run_provider(prepared));
+    let partial = Arc::new(Mutex::new(PartialResponse::default()));
+    let mut worker = tokio::spawn(run_provider(prepared, partial.clone()));
     let mut joined = false;
+    let mut turn_aborted = false;
     let mut result = tokio::select! {
         biased;
         _ = owner_cancel.cancelled() => Err(InferenceError::new(InferenceErrorKind::TaskAborted, "inference owner aborted")),
         _ = child.cancelled() => Err(InferenceError::new(InferenceErrorKind::Cancelled, "agent execution cancelled")),
         _ = cancel.cancelled() => Err(InferenceError::new(InferenceErrorKind::Cancelled, "inference request cancelled")),
-        _ = turn_cancel.cancelled() => Ok(InferenceResponse::aborted()),
+        _ = turn_cancel.cancelled() => {
+            turn_aborted = true;
+            Ok(InferenceResponse::aborted())
+        },
         _ = receiver_closed(&reply) => Err(InferenceError::new(InferenceErrorKind::ResponseLost, "inference receiver closed")),
         _ = tokio::time::sleep(Duration::from_secs(180)) => Err(InferenceError::new(InferenceErrorKind::Timeout, "inference request timed out")),
         result = &mut worker => {
@@ -795,6 +837,12 @@ async fn supervise_inference(
     if !joined {
         worker.abort();
         let _ = worker.await;
+    }
+    if turn_aborted {
+        result = Ok(partial
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancelled());
     }
     {
         let terminal = async {
@@ -848,6 +896,7 @@ async fn supervise_inference(
 
 async fn run_provider(
     mut prepared: PreparedInference,
+    partial: Arc<Mutex<PartialResponse>>,
 ) -> Result<InferenceResponse, InferenceError> {
     let response = send_provider_request(&prepared.client, prepared.request).await?;
     let status = response.status();
@@ -879,7 +928,23 @@ async fn run_provider(
                 "provider response exceeds limit",
             ));
         }
-        for delta in accumulator.push(&chunk)? {
+        let deltas = accumulator.push(&chunk)?;
+        partial
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .accept(&deltas);
+        #[cfg(test)]
+        if let Some((entered, release)) = &prepared.stream_gate {
+            let ready = {
+                let snapshot = partial.lock().unwrap_or_else(|e| e.into_inner());
+                !snapshot.content.is_empty() && !snapshot.reasoning.is_empty()
+            };
+            if ready {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        for delta in deltas {
             sequence += 1;
             push_stream(
                 &mut prepared.senders,
@@ -903,6 +968,10 @@ async fn run_provider(
             "provider returned an unknown tool name",
         ));
     }
+    partial
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .accept(&deltas);
     for delta in deltas {
         sequence += 1;
         push_stream(
@@ -1210,6 +1279,7 @@ mod tests {
             .build_request(DomainRequest {
                 messages: vec![AgentMessage::User {
                     content: "hi".into(),
+                    images: vec![],
                 }],
                 tools: vec![],
                 config: DomainRequestConfig {
@@ -1231,6 +1301,8 @@ mod tests {
         (
             PreparedInference {
                 terminal_gate: None,
+                #[cfg(test)]
+                stream_gate: None,
                 id: "mock".into(),
                 agent_id: ResourceID::parse("agent:test/main").unwrap(),
                 agent_instance: "opaque".into(),
@@ -1347,6 +1419,194 @@ mod tests {
         task.await.unwrap();
         server.abort();
         let _ = server.await;
+    }
+
+    fn partial_stream(format: formats::ApiFormat) -> String {
+        use serde_json::json;
+        let events = match format {
+            formats::ApiFormat::ChatCompletions => vec![
+                json!({"choices":[{"delta":{"reasoning_content":"think","content":"answer","tool_calls":[{"index":0,"id":"unfinished","function":{"name":"echo","arguments":"{"}}]},"finish_reason":null}]}),
+            ],
+            formats::ApiFormat::Messages => vec![
+                json!({"type":"message_start","message":{"role":"assistant","content":[],"usage":{"input_tokens":15}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think"}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signature"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}),
+            ],
+            formats::ApiFormat::Responses => vec![
+                json!({"type":"response.created","response":{"status":"in_progress"}}),
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}),
+                json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"think"}),
+                json!({"type":"response.output_item.added","output_index":1,"item":{"type":"message"}}),
+                json!({"type":"response.output_text.delta","output_index":1,"delta":"answer"}),
+            ],
+        };
+        events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect()
+    }
+
+    async fn open_partial_stream(body: String) -> (Url, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/v1", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&request[..end]);
+                    let length = header
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+            socket
+                .write_all(format!("{:x}\r\n{}\r\n", body.len(), body).as_bytes())
+                .await
+                .unwrap();
+            let n = tokio::time::timeout(Duration::from_secs(1), socket.read(&mut buf))
+                .await
+                .expect("HTTP client did not disconnect promptly")
+                .unwrap();
+            assert_eq!(n, 0, "expected local HTTP stream close on turn abort");
+            let _ = socket
+                .write_all(
+                    b"3b\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"LATE\"}}]}\n\n\r\n",
+                )
+                .await;
+        });
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn turn_cancel_keeps_accepted_partials_and_closes_all_formats_under_backpressure() {
+        for format in [
+            formats::ApiFormat::ChatCompletions,
+            formats::ApiFormat::Messages,
+            formats::ApiFormat::Responses,
+        ] {
+            for backpressured in [false, true] {
+                let (url, server) = open_partial_stream(partial_stream(format)).await;
+                let (mut prepared, guard, rx, scope) = prepared(&url, false);
+                prepared.adapter = vendors::build_adapter(
+                    Vendor::DeepSeek,
+                    format,
+                    ProviderRouteInput {
+                        base_url: &url,
+                        api_key: "test",
+                        thinking: None,
+                        reasoning_effort: None,
+                    },
+                )
+                .unwrap();
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(tokio::sync::Notify::new());
+                prepared.stream_gate = Some((entered.clone(), release.clone()));
+                let cancel = guard.activity.turn_cancel.clone();
+                let task = tokio::spawn(execute_inference(prepared, guard));
+                tokio::time::timeout(Duration::from_secs(1), entered.notified())
+                    .await
+                    .unwrap();
+                if !backpressured {
+                    release.notify_one();
+                    tokio::task::yield_now().await;
+                }
+                cancel.cancel();
+                let result = tokio::time::timeout(Duration::from_millis(500), rx)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(result.stop_reason, StopReason::Cancelled);
+                let AgentMessage::Assistant {
+                    content,
+                    reasoning,
+                    tool_calls,
+                    replay,
+                    usage,
+                    stop_reason,
+                } = &result.message
+                else {
+                    panic!()
+                };
+                assert_eq!(content.as_deref(), Some("answer"));
+                assert_eq!(reasoning.as_deref(), Some("think"));
+                assert_eq!(*stop_reason, Some(StopReason::Cancelled));
+                assert!(tool_calls.is_empty());
+                assert!(replay.is_none());
+                assert!(usage.is_none());
+                assert_eq!(scope.activity_count(), 0);
+                assert!(!scope.is_closed());
+                task.await.unwrap();
+                server.await.unwrap();
+                assert!(!serde_json::to_string(&result.message)
+                    .unwrap()
+                    .contains("LATE"));
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_snapshot_preserves_reasoning_only_and_content_only() {
+        for (deltas, expected_reasoning, expected_content) in [
+            (vec![], None, None),
+            (
+                vec![
+                    ProviderStreamDelta::Reasoning(String::new()),
+                    ProviderStreamDelta::Content(String::new()),
+                ],
+                None,
+                None,
+            ),
+            (
+                vec![ProviderStreamDelta::Reasoning("think".into())],
+                Some("think"),
+                None,
+            ),
+            (
+                vec![ProviderStreamDelta::Content("answer".into())],
+                None,
+                Some("answer"),
+            ),
+        ] {
+            let mut partial = PartialResponse::default();
+            partial.accept(&deltas);
+            assert_eq!(
+                partial.cancelled(),
+                InferenceResponse {
+                    message: AgentMessage::Assistant {
+                        reasoning: expected_reasoning.map(str::to_owned),
+                        content: expected_content.map(str::to_owned),
+                        replay: None,
+                        tool_calls: vec![],
+                        usage: None,
+                        stop_reason: Some(StopReason::Cancelled),
+                    },
+                    stop_reason: StopReason::Cancelled,
+                }
+            );
+        }
+        assert_eq!(
+            PartialResponse::default().cancelled(),
+            InferenceResponse::aborted()
+        );
     }
 
     #[tokio::test]
@@ -1619,6 +1879,7 @@ mod tests {
             },
             AgentMessage::User {
                 content: "user prompt".into(),
+                images: vec![],
             },
         ])
         .unwrap();
@@ -1645,6 +1906,7 @@ mod tests {
                     },
                     AgentMessage::User {
                         content: "user prompt".into(),
+                        images: vec![],
                     },
                 ],
                 tools: vec![],
@@ -1668,6 +1930,38 @@ mod tests {
     }
 
     #[test]
+    fn image_preflight_keeps_images_in_legacy_projection() {
+        let images = vec![margatroid_types::message_types::UserImage {
+            media_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+        }];
+        let normalized = normalize_messages(vec![AgentMessage::Inject {
+            messages: vec![AgentMessage::User {
+                content: String::new(),
+                images: images.clone(),
+            }],
+        }])
+        .unwrap();
+        assert!(
+            matches!(&normalized[0], ProviderMessage::User { content, images: actual } if content.is_empty() && actual == &images)
+        );
+        let mut invalid = images.clone();
+        invalid[0].media_type = "image/jpeg".into();
+        let error = normalize_messages(vec![AgentMessage::User {
+            content: String::new(),
+            images: invalid,
+        }])
+        .unwrap_err();
+        assert_eq!(error.kind, InferenceErrorKind::InvalidMessages);
+        assert!(!error.to_string().contains(&images[0].data));
+        assert!(normalize_messages(vec![AgentMessage::User {
+            content: "a".repeat(MAX_MESSAGE_BYTES),
+            images
+        }])
+        .is_err());
+    }
+
+    #[test]
     fn inject_expansion_checks_correlations_and_limits() {
         for message in [
             AgentMessage::aborted_assistant(),
@@ -1683,7 +1977,8 @@ mod tests {
         assert_eq!(
             normalize_messages(vec![AgentMessage::Inject {
                 messages: vec![AgentMessage::User {
-                    content: "ok".into()
+                    content: "ok".into(),
+                    images: vec![]
                 }]
             }])
             .unwrap()
@@ -1700,6 +1995,7 @@ mod tests {
         .is_err());
         let mut nested = AgentMessage::User {
             content: "hi".into(),
+            images: vec![],
         };
         for _ in 0..34 {
             nested = AgentMessage::Inject {
