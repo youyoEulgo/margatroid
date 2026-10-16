@@ -191,6 +191,7 @@ function decodeMessage(
           role: 'tool',
           thinking: '',
           content: message.content,
+          images: message.images,
           toolCalls: [],
           failed: message.failed,
         },

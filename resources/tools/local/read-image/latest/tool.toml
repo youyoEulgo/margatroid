@@ -1,0 +1,3 @@
+schema_version = 1
+name = "read-image"
+description = "Read a PNG, JPEG, GIF or WebP image (maximum 5 MiB) for visual inspection. The image file path may be absolute or relative to the current project root. File format is detected from its contents, not its extension."

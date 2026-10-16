@@ -571,6 +571,7 @@ fn openai_responses_reassembles_function_arguments_and_replays_items() {
         content: "ok".into(),
         resource_id: Some(id("tool")),
         tool_name: "echo".into(),
+        images: vec![],
         failed: false,
     });
     assert_assistant(&fixture.infer(history, vec![tool]), StopReason::Completed);
@@ -674,4 +675,156 @@ fn invalid_format_routes_reload_atomically_without_replacing_dispatch() {
     }
     assert_assistant(&fixture.infer(input(), vec![]), StopReason::Completed);
     assert_eq!(server.join().unwrap()[0].path, "/v1/messages");
+}
+
+#[test]
+fn tool_images_preserve_parallel_batches_native_outputs_and_repeat_requests() {
+    for (vendor, format) in [
+        ("openai", "chat_completions"),
+        ("openai", "responses"),
+        ("anthropic", "messages"),
+        ("deepseek", "chat_completions"),
+        ("deepseek", "messages"),
+        ("deepseek", "responses"),
+        ("openrouter", "chat_completions"),
+    ] {
+        let stream = match format {
+            "messages" => messages_stream(),
+            "responses" => responses_stream(false),
+            _ => "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+        };
+        let (url, server) = mock(vec![stream.clone(), stream]);
+        let mut fixture = Fixture::new(&route(&url, vendor, format));
+        let assistant = |ids: &[&str]| AgentMessage::Assistant {
+            reasoning: None,
+            replay: match format {
+                "messages" => Some(
+                    json!({"api_format":"messages","items":[{"type":"thinking","thinking":"thought","signature":"signed"}]}),
+                ),
+                "responses" => Some(
+                    json!({"api_format":"responses","items":[{"type":"reasoning","id":"reasoning-1","summary":[],"encrypted_content":"opaque"}]}),
+                ),
+                _ => None,
+            },
+            content: None,
+            tool_calls: ids
+                .iter()
+                .map(|id| margatroid_types::message_types::ToolCall {
+                    id: (*id).into(),
+                    tool_name: "echo".into(),
+                    arguments: "{}".into(),
+                })
+                .collect(),
+            usage: None,
+            stop_reason: Some(StopReason::ToolCalls),
+        };
+        let result =
+            |id: &str, text: &str, pictures: Vec<UserImage>, failed| AgentMessage::ToolCall {
+                resource_id: Some(self::id("tool")),
+                tool_call_id: id.into(),
+                tool_name: "echo".into(),
+                content: text.into(),
+                images: pictures,
+                failed,
+            };
+        let mut history = input();
+        history.extend([
+            assistant(&["a", "b"]),
+            result("a", "hello", images(), false),
+            result("b", "plain", vec![], false),
+            assistant(&["c"]),
+            result("c", "", images(), true),
+        ]);
+        let original = serde_json::to_value(&history).unwrap();
+        let tool = fixture.tool();
+        for _ in 0..2 {
+            assert_assistant(
+                &fixture.infer(history.clone(), vec![tool.clone()]),
+                StopReason::Completed,
+            );
+        }
+        assert_eq!(serde_json::to_value(&history).unwrap(), original);
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0].body, requests[1].body);
+        let body = &requests[0].body;
+        match format {
+            "messages" => {
+                let results = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|message| message["content"].as_array().unwrap())
+                    .filter(|part| part["type"] == "tool_result")
+                    .collect::<Vec<_>>();
+                assert_eq!(results.len(), 3);
+                assert_eq!(results[0]["tool_use_id"], "a");
+                assert_image_parts(&results[0]["content"], format, true);
+                assert_eq!(results[1]["tool_use_id"], "b");
+                assert_eq!(results[1]["content"], "plain");
+                assert_eq!(results[2]["tool_use_id"], "c");
+                assert_image_parts(&results[2]["content"], format, false);
+                assert_eq!(results[2]["is_error"], true);
+            }
+            "responses" => {
+                let items = body["input"].as_array().unwrap();
+                assert_eq!(
+                    items.iter().filter(|item| item["role"] == "user").count(),
+                    1
+                );
+                let outputs = items
+                    .iter()
+                    .filter(|item| item["type"] == "function_call_output")
+                    .collect::<Vec<_>>();
+                assert_eq!(outputs.len(), 3);
+                assert_eq!(outputs[0]["call_id"], "a");
+                assert_image_parts(&outputs[0]["output"], format, true);
+                assert_eq!(outputs[1]["call_id"], "b");
+                assert_eq!(outputs[1]["output"], "plain");
+                assert_eq!(outputs[2]["call_id"], "c");
+                assert_image_parts(&outputs[2]["output"], format, false);
+                assert!(items
+                    .iter()
+                    .any(|item| item["encrypted_content"] == "opaque"));
+            }
+            _ => {
+                let messages = body["messages"].as_array().unwrap();
+                let mut pending = std::collections::HashSet::new();
+                let mut synthetic = Vec::new();
+                let mut linked = Vec::new();
+                for message in messages {
+                    if let Some(calls) = message["tool_calls"].as_array() {
+                        assert!(pending.is_empty());
+                        for call in calls {
+                            pending.insert(call["id"].as_str().unwrap());
+                        }
+                    }
+                    if message["role"] == "tool" {
+                        let id = message["tool_call_id"].as_str().unwrap();
+                        assert!(pending.remove(id));
+                        linked.push(id);
+                        assert!(message["content"].is_string());
+                    } else if message["role"] == "user" {
+                        assert!(pending.is_empty(), "user interrupted parallel results");
+                        if message["content"].is_array() {
+                            synthetic.push(message);
+                        }
+                    }
+                }
+                assert!(pending.is_empty());
+                assert_eq!(linked, ["a", "b", "c"]);
+                assert_eq!(synthetic.len(), 2);
+                for (message, id) in synthetic.into_iter().zip(["a", "c"]) {
+                    let blocks = message["content"].as_array().unwrap();
+                    assert_eq!(blocks.len(), images().len() * 2);
+                    for (pair, image) in blocks.chunks_exact(2).zip(images()) {
+                        assert_eq!(pair[0]["text"], format!("tool_call_id: {id}"));
+                        assert_eq!(
+                            pair[1]["image_url"]["url"],
+                            format!("data:{};base64,{}", image.media_type, image.data)
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

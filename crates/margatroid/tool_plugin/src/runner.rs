@@ -261,6 +261,19 @@ async fn lua_execute(
     entry.set("context", context.clone()).unwrap();
     entry.set("arguments", arguments.clone()).unwrap();
     entry.set("json", json).unwrap();
+    entry
+        .set(
+            "base64_encode",
+            lua.create_function(|_, bytes: mlua::String| {
+                use base64::Engine as _;
+                if bytes.as_bytes().len() > margatroid_types::message_types::MAX_USER_IMAGE_BYTES {
+                    return Err(mlua::Error::external("base64 input exceeds 5 MiB"));
+                }
+                Ok(base64::engine::general_purpose::STANDARD.encode(bytes.as_bytes()))
+            })
+            .unwrap(),
+        )
+        .unwrap();
     entry.set("shell", shell).unwrap();
     lua.set_named_registry_value("margatroid_entry", entry)
         .unwrap();
@@ -300,12 +313,7 @@ async fn lua_execute(
         };
         error(kind, message)
     })?;
-    if result.len() > output_limit {
-        return Err(error(
-            ToolErrorKind::OutputTooLarge,
-            "tool output exceeds limit",
-        ));
-    }
+    crate::handler::tool_outcome(result.clone(), &request.limits)?;
     Ok(result)
 }
 

@@ -127,7 +127,7 @@ assistant展示与本地中止：
 - 每条消息最多 8 张，每张最多 5 MiB，总解码字节最多 20 MiB。仅接受 PNG/JPEG/GIF/WebP，校验 MIME 与文件签名，拒绝 SVG 等格式；错误简洁显示。
 - 异步导入和发送固定捕获 workspace/agent，切换目标即清空草稿、图片和错误；迟到结果不能写入新目标或清空新草稿。
 - 现有 MCL 发送契约为 `{type:'user',content:string,images?:[{media_type:string,data:string}]}`；data 为无 data URL 前缀的原始 base64，不转成 provider 格式。文件名只留在编辑器 UI。
-- 历史以服务端记录为准，从 user payload.images 渲染独立图片行；图片数据不展示于活动、元数据或 JSON 文本。
+- 历史以服务端记录为准，从 User 或 ToolCall payload.images 渲染独立图片行；图片数据不展示于活动、元数据或 JSON 文本。工具读图结果保留tool角色和原调用关联，不伪造User历史。
 - 后端再次执行相同格式、大小和数量限制，浏览器校验不替代服务端边界。
 
 ## 边界

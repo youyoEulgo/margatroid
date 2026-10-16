@@ -61,6 +61,7 @@ impl ToolExecuteResponse {
                 tool_call_id: call.id.clone(),
                 tool_name: call.tool_name.clone(),
                 content: "Tool call aborted.".into(),
+                images: vec![],
                 failed: true,
             },
         }

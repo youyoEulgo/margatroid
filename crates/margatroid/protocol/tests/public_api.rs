@@ -166,6 +166,7 @@ fn nested_injection_preserves_all_shared_message_shapes() {
                         tool_call_id: "call".into(),
                         tool_name: "unknown".into(),
                         content: "failed".into(),
+                        images: vec![],
                         failed: true,
                     },
                     AgentMessageDto::Assistant {

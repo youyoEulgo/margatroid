@@ -179,8 +179,8 @@ pub(crate) async fn run_runner(
         stdout,
         payload
             .limits
-            .output_bytes
-            .saturating_mul(6)
+            .result_bytes
+            .saturating_add(payload.limits.output_bytes.saturating_mul(6))
             .saturating_add(4096),
         overflow.clone(),
     );
@@ -304,7 +304,7 @@ pub(crate) async fn run_runner(
         ));
     }
     let output = response.result?;
-    if output.len() > payload.limits.output_bytes {
+    if output.len() > payload.limits.result_bytes {
         return Err(error(
             ToolErrorKind::OutputTooLarge,
             "tool result exceeds limit",

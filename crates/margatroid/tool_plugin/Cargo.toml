@@ -9,6 +9,7 @@ async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
 closure_plugin = { path = "../../mecs/closure_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
 futures-util = { workspace = true }
+base64 = "0.22"
 jsonschema = { workspace = true }
 mlua = { workspace = true }
 margatroid_types = { path = "../types" }

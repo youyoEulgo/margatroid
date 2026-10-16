@@ -155,7 +155,7 @@ AgentMessage：消息值，公开枚举--不是Event，不包含路由Entity
     System { content: String }--系统消息，prompt导入及推理按实际role保留
     User { content: String, images: Vec<UserImage> }
     Assistant { replay: Option<serde_json::Value>, reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCall>, usage: Option<TokenUsage>, stop_reason: Option<StopReason> }
-    ToolCall { resource_id: Option<ResourceID>, tool_call_id: String, tool_name: String, content: String, failed: bool }
+    ToolCall { resource_id: Option<ResourceID>, tool_call_id: String, tool_name: String, content: String, images: Vec<UserImage>, failed: bool }
     Error { message: String }
     impl Clone + PartialEq + Eq + Serialize + Deserialize for AgentMessage
     说明：JSON type为inject/system/user/assistant/tool_call/error；未知资源的可见性拒绝结果resource_id为None，不虚构builtin/invalid地址。
@@ -163,7 +163,7 @@ AgentMessage：消息值，公开枚举--不是Event，不包含路由Entity
         replay缺字段serde默认为None，是不透明API标签信封{api_format,items}，共享层不依赖ApiFormat枚举
         Messages replay保留thinking文本/signature及redacted_thinking.data；Responses保留reasoning.id/summary及可用content/encrypted_content
         DTO和显式持久历史保留replay元数据，不与正文或显示reasoning混合；格式边界验证兼容性并拒绝不能表达的重放
-        User支持独立images数组，工具结果仍为String纯文本
+        User和ToolCall结果均支持独立images数组，content保持String
         Assistant可只有合法工具调用而无正文；usage与新增stop_reason保留于结果及显式历史元数据，不回传作为模型输入
         目标stop_reason覆盖全部推理原因，新增StopReason::Cancelled序列化cancelled；兼容InferenceResponse.stop_reason由同一权威映射生成且两处始终相同
         用户轮次中止且真实cleanup成功返回Ok assistant：保留已接受的部分content与reasoning（二者皆空时均为None，不填充提示正文）、replay=None、tool_calls=[]、usage=None、stop_reason=Cancelled；不伪造部分执行成功
@@ -394,6 +394,6 @@ Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>�
 
 WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。
 
-## 用户图像契约
+## 用户及工具结果图像契约
 
-User保持 `content: String`，增加 `images: Vec<UserImage>`；缺少images反序列化为 `[]`，空数组序列化省略。`UserImage { media_type: String, data: String }` 中data是规范标准base64（含必要padding），不是data URL；允许image/png、image/jpeg、image/gif、image/webp。每条User最多8张，每张解码后最多5 MiB，总计最多20 MiB。共享公开函数 `validate_user_images(images: &[UserImage]) -> Result<(), String>` 在解码前检查数量、编码长度及解码长度上界，再严格验证base64及与MIME一致的PNG/JPEG/GIF/WebP魔数，不执行完整图像解码。错误只含索引、限制和原因，不回显base64。领域User反序列化也调用共享验证，覆盖直接MCL/Lua/持久化入站；Protocol入站递归转换调用共享验证，出站原样保留images；MESSAGE、Lua及历史payload保留图像，不将base64拼入正文。协议原有1 MiB非图像消息限制独立保留，图像编码单独按上述限制计量。
+User与ToolCall执行结果保持 `content: String`，增加 `images: Vec<UserImage>`；缺少images反序列化为 `[]`，空数组序列化省略。`UserImage { media_type: String, data: String }` 中data是规范标准base64（含必要padding），不是data URL；允许image/png、image/jpeg、image/gif、image/webp。每条User或ToolCall结果最多8张，每张解码后最多5 MiB，总计最多20 MiB。共享公开函数 `validate_user_images(images: &[UserImage]) -> Result<(), String>` 在解码前检查数量、编码长度及解码长度上界，再严格验证base64及与MIME一致的PNG/JPEG/GIF/WebP魔数，不执行完整图像解码。错误只含索引、限制和原因，不回显base64。公开serde辅助函数 `deserialize_user_images` 供共享消息及边界复用；领域User和ToolCall结果反序列化也调用共享验证，覆盖直接MCL/Lua/持久化入站；Protocol入站递归转换调用共享验证，出站原样保留images；MESSAGE、Lua及历史payload保留图像，不将base64拼入正文。协议原有1 MiB非图像消息限制独立保留，图像编码单独按上述限制计量。

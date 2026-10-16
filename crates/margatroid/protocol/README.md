@@ -62,7 +62,7 @@ Rust 构造 API：`ClientMessage::mcl_command(id, &workspace, agent, command, Ve
 
 ## reasoning replay
 
-Assistant的 `replay: Option<serde_json::Value>` 在AgentMessageDto与领域消息之间双向保留（包括Inject内嵌），缺字段默认None。它是不透明JSON信封 `{ "api_format": "messages" | "responses", "items": [...] }`：Messages保存thinking文本/signature及redacted_thinking.data，Responses保存reasoning item id、summary及可用content/encrypted_content。Protocol不解释、改写或伪造这些API字段；推理格式边界检查标签及内容并拒绝不兼容重放。结果与显式历史payload保留replay，显示reasoning和正文不代替它。Responses每次完整本地上下文，store=false并请求reasoning.encrypted_content；不依赖远端conversation。User的content仍为String，图像单独保存在images；ToolCall结果仍为纯文本String。
+Assistant的 `replay: Option<serde_json::Value>` 在AgentMessageDto与领域消息之间双向保留（包括Inject内嵌），缺字段默认None。它是不透明JSON信封 `{ "api_format": "messages" | "responses", "items": [...] }`：Messages保存thinking文本/signature及redacted_thinking.data，Responses保存reasoning item id、summary及可用content/encrypted_content。Protocol不解释、改写或伪造这些API字段；推理格式边界检查标签及内容并拒绝不兼容重放。结果与显式历史payload保留replay，显示reasoning和正文不代替它。Responses每次完整本地上下文，store=false并请求reasoning.encrypted_content；不依赖远端conversation。User和ToolCall结果的content仍为String，图像单独保存在images。
 
 ## 消息、状态与历史
 
@@ -86,6 +86,6 @@ Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>�
 
 WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。
 
-## 用户图像契约
+## 用户及工具结果图像契约
 
-User保持 `content: String`，增加 `images: Vec<UserImage>`；缺少images反序列化为 `[]`，空数组序列化省略。`UserImage { media_type: String, data: String }` 中data是规范标准base64（含必要padding），不是data URL；允许image/png、image/jpeg、image/gif、image/webp。每条User最多8张，每张解码后最多5 MiB，总计最多20 MiB。共享公开函数 `validate_user_images(images: &[UserImage]) -> Result<(), String>` 在解码前检查数量、编码长度及解码长度上界，再严格验证base64及与MIME一致的PNG/JPEG/GIF/WebP魔数，不执行完整图像解码。错误只含索引、限制和原因，不回显base64。领域User反序列化也调用共享验证，覆盖直接MCL/Lua/持久化入站；Protocol入站递归转换调用共享验证，出站原样保留images；MESSAGE、Lua及历史payload保留图像，不将base64拼入正文。协议原有1 MiB非图像消息限制独立保留，图像编码单独按上述限制计量。
+User与ToolCall执行结果保持 `content: String`，增加 `images: Vec<UserImage>`；缺少images反序列化为 `[]`，空数组序列化省略。`UserImage { media_type: String, data: String }` 中data是规范标准base64（含必要padding），不是data URL；允许image/png、image/jpeg、image/gif、image/webp。每条User或ToolCall结果最多8张，每张解码后最多5 MiB，总计最多20 MiB。共享公开函数 `validate_user_images(images: &[UserImage]) -> Result<(), String>` 在解码前检查数量、编码长度及解码长度上界，再严格验证base64及与MIME一致的PNG/JPEG/GIF/WebP魔数，不执行完整图像解码。错误只含索引、限制和原因，不回显base64。公开serde辅助函数 `deserialize_user_images` 供共享消息及边界复用；领域User和ToolCall结果反序列化也调用共享验证，覆盖直接MCL/Lua/持久化入站；Protocol入站递归转换调用共享验证，出站原样保留images；MESSAGE、Lua及历史payload保留图像，不将base64拼入正文。协议原有1 MiB非图像消息限制独立保留，图像编码单独按上述限制计量。

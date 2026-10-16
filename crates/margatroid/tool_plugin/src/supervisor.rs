@@ -103,8 +103,8 @@ pub(crate) async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
             };
             let limit = request
                 .limits
-                .output_bytes
-                .saturating_mul(6)
+                .result_bytes
+                .saturating_add(request.limits.output_bytes.saturating_mul(6))
                 .saturating_add(4096);
             let output = async {
                 let mut bytes = Vec::new();

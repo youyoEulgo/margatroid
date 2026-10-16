@@ -68,6 +68,7 @@ command("IMPORT MESSAGE prompt:local/compact:latest AS compact")
 command("IMPORT TOOL tool:local/code-review:latest AS review")
 command("IMPORT TOOL tool:local/list-directory:latest AS list_dir")
 command("IMPORT TOOL tool:local/read-file:latest AS read_file")
+command("IMPORT TOOL tool:local/read-image:latest AS read_image")
 command("IMPORT TOOL tool:local/write-file:latest AS write_file")
 command("IMPORT TOOL tool:local/edit:latest AS edit")
 command("IMPORT TOOL tool:local/grep:latest AS grep")
@@ -82,7 +83,7 @@ local session = command("CREATE BLOCK session (conversation MESSAGE, visible TOO
 command("INJECT soul TO msg.instructions")
 command("INJECT compact TO msg.compact_prompt")
 if session.created then
-    command("INJECT review, list_dir, read_file, write_file, edit, grep, glob, bash TO session.visible")
+    command("INJECT review, list_dir, read_file, read_image, write_file, edit, grep, glob, bash TO session.visible")
     command("INJECT workspace_write TO session.sandbox_activated")
 end
 command("EMIT EFFECT sandbox_use (session.sandbox_activated)")

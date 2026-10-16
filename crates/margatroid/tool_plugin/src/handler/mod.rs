@@ -9,7 +9,7 @@ use margatroid_types::agent_components::{Agent, AgentState};
 use margatroid_types::execution_components::{
     ExecutionActivity, ExecutionActivityKind, ExecutionError, SandboxPolicySnapshot,
 };
-use margatroid_types::message_types::AgentMessage;
+use margatroid_types::message_types::{validate_user_images, AgentMessage, UserImage};
 use margatroid_types::resource_components::{
     CallableDefinitionSnapshot, CallableResource, ToolResource,
 };
@@ -384,38 +384,82 @@ async fn execute(mut prepared: Prepared) {
             ));
         }
     }
-    let result = result.map(|output| {
+    let result = result.and_then(|output| {
         let Some(output) = output else {
-            return ToolExecuteResponse::aborted(
+            return Ok(ToolExecuteResponse::aborted(
                 Some(prepared.request.resource.resource_id.clone()),
                 &prepared.request.call,
-            );
+            ));
         };
-        let (content, failed) = tool_outcome(output);
-        ToolExecuteResponse {
+        let (content, failed, images) = tool_outcome(output, &prepared.config.limits)?;
+        Ok(ToolExecuteResponse {
             message: AgentMessage::ToolCall {
                 resource_id: Some(prepared.request.resource.resource_id.clone()),
                 tool_call_id: prepared.request.call.id.clone(),
                 tool_name: prepared.request.call.tool_name.clone(),
                 content,
                 failed,
+                images,
             },
-        }
+        })
     });
     reply(&prepared.request, result);
     prepared.finished = true;
 }
 
-fn tool_outcome(output: String) -> (String, bool) {
-    if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(&output) {
+pub(crate) fn tool_outcome(
+    output: String,
+    limits: &crate::ToolExecutionLimits,
+) -> Result<(String, bool, Vec<UserImage>), ToolError> {
+    let oversized = || ToolError::new(ToolErrorKind::OutputTooLarge, "tool output exceeds limit");
+    if output.len() > limits.result_bytes {
+        return Err(oversized());
+    }
+    if let Ok(serde_json::Value::Object(mut fields)) = serde_json::from_str(&output) {
         if let (Some(ok), Some(content)) = (
             fields.get("ok").and_then(serde_json::Value::as_bool),
             fields.get("content").and_then(serde_json::Value::as_str),
         ) {
-            return (content.to_owned(), !ok);
+            let content = content.to_owned();
+            let images: Vec<UserImage> = fields
+                .remove("images")
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| {
+                    ToolError::new(
+                        ToolErrorKind::RunnerProtocolFailed,
+                        "invalid tool result images",
+                    )
+                })?
+                .unwrap_or_default();
+            validate_user_images(&images).map_err(|reason| {
+                ToolError::new(
+                    ToolErrorKind::RunnerProtocolFailed,
+                    format!("invalid tool result images: {reason}"),
+                )
+            })?;
+            if serde_json::to_vec(&fields).map_err(|_| oversized())?.len() > limits.output_bytes {
+                return Err(oversized());
+            }
+            if !ok && !images.is_empty() {
+                return Err(ToolError::new(
+                    ToolErrorKind::RunnerProtocolFailed,
+                    "failed tool result must not contain images",
+                ));
+            }
+            return Ok((content, !ok, images));
+        }
+        if fields.contains_key("images") {
+            return Err(ToolError::new(
+                ToolErrorKind::RunnerProtocolFailed,
+                "images require a valid tool result envelope",
+            ));
         }
     }
-    (output, false)
+    if output.len() > limits.output_bytes {
+        return Err(oversized());
+    }
+    Ok((output, false, Vec::new()))
 }
 
 #[cfg(test)]
@@ -431,20 +475,79 @@ mod tests {
     #[test]
     fn tool_reported_outcome_preserves_failure_and_plain_text() {
         assert_eq!(
-            tool_outcome(r#"{"ok":false,"content":"denied"}"#.into()),
-            ("denied".into(), true)
+            tool_outcome(
+                r#"{"ok":false,"content":"denied"}"#.into(),
+                &crate::ToolExecutionLimits::default()
+            )
+            .unwrap(),
+            ("denied".into(), true, vec![])
         );
         assert_eq!(
-            tool_outcome(r#"{"ok":true,"content":"done"}"#.into()),
-            ("done".into(), false)
+            tool_outcome(
+                r#"{"ok":true,"content":"done"}"#.into(),
+                &crate::ToolExecutionLimits::default()
+            )
+            .unwrap(),
+            ("done".into(), false, vec![])
         );
         for output in [
             "plain text",
             r#"{"ok":true}"#,
             r#"{"ok":"yes","content":"x"}"#,
         ] {
-            assert_eq!(tool_outcome(output.into()), (output.into(), false));
+            assert_eq!(
+                tool_outcome(output.into(), &crate::ToolExecutionLimits::default()).unwrap(),
+                (output.into(), false, vec![])
+            );
         }
+    }
+
+    #[test]
+    fn image_envelope_is_typed_and_never_silently_falls_back() {
+        let limits = crate::ToolExecutionLimits::default();
+        let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII=";
+        let output = serde_json::json!({"ok":true,"content":"image summary","images":[{"media_type":"image/png","data":data}]}).to_string();
+        let (content, failed, images) = tool_outcome(output, &limits).unwrap();
+        assert_eq!(content, "image summary");
+        assert!(!failed);
+        assert_eq!(images[0].data, data);
+        for images in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!([{"media_type":"image/png","data":"SECRET_NOT_BASE64"}]),
+        ] {
+            let error = tool_outcome(
+                serde_json::json!({"ok":true,"content":"summary","images":images}).to_string(),
+                &limits,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, ToolErrorKind::RunnerProtocolFailed);
+            assert!(!error.message.contains("SECRET_NOT_BASE64"));
+        }
+        for output in [
+            serde_json::json!({"images":[]}),
+            serde_json::json!({"ok":true,"images":[{"data":data,"media_type":"image/png"}]}),
+        ] {
+            assert_eq!(
+                tool_outcome(output.to_string(), &limits).unwrap_err().kind,
+                ToolErrorKind::RunnerProtocolFailed
+            );
+        }
+        let mut tiny = limits;
+        tiny.output_bytes = 32;
+        assert_eq!(
+            tool_outcome("x".repeat(33), &tiny).unwrap_err().kind,
+            ToolErrorKind::OutputTooLarge
+        );
+        assert_eq!(
+            tool_outcome(
+                serde_json::json!({"ok":true,"content":"x".repeat(33)}).to_string(),
+                &tiny
+            )
+            .unwrap_err()
+            .kind,
+            ToolErrorKind::OutputTooLarge
+        );
     }
 
     #[tokio::test]

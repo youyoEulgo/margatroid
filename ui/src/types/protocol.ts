@@ -48,6 +48,7 @@ export type AgentMessage =
     }
   | {
       type: 'tool_call';
+      images?: UserImage[];
       resource_id: string | null;
       tool_call_id: string;
       tool_name: string;
@@ -192,16 +193,18 @@ export function errorMessage(value: unknown): string {
       ? value
       : 'Unknown backend error';
 }
+function hasImageArray(value: unknown): boolean {
+  return value === undefined || (Array.isArray(value) && value.every((image) => isRecord(image) &&
+    ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(String(image.media_type)) &&
+    typeof image.data === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(image.data)));
+}
 export function isAgentMessage(value: unknown): value is AgentMessage {
   if (!isRecord(value)) return false;
   switch (value.type) {
     case 'system':
       return typeof value.content === 'string';
     case 'user':
-      return typeof value.content === 'string' && (value.images === undefined ||
-        (Array.isArray(value.images) && value.images.every((image) => isRecord(image) &&
-          ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(String(image.media_type)) &&
-          typeof image.data === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(image.data))));
+      return typeof value.content === 'string' && hasImageArray(value.images);
     case 'assistant':
       return (
         (value.content === null || typeof value.content === 'string') &&
@@ -212,7 +215,7 @@ export function isAgentMessage(value: unknown): value is AgentMessage {
       return (
         typeof value.content === 'string' &&
         typeof value.tool_call_id === 'string' &&
-        typeof value.failed === 'boolean'
+        typeof value.failed === 'boolean' && hasImageArray(value.images)
       );
     case 'error':
       return typeof value.message === 'string';

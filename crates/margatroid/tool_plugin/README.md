@@ -38,7 +38,7 @@ MCL `tool_call` 接收 MESSAGE array（恰好一条 assistant）+ visible TOOL a
     -> 独立 tool_runner -> 真实 cleanup -> oneshot -> MCL 收口
 ```
 
-Lua 工具在独立 `tool_runner` 可执行目标执行，不在 daemon 或 Workspace Driver VM 内执行。请求经 stdin 发送结构化 JSON；stdout 只承载版本化结果协议，Lua print 和日志写 stderr。协议无效、非零退出、输出超限、启动失败及 cleanup 缺失均返回明确错误，不隐式解包返回字符串中的业务 JSON 信封。
+Lua 工具在独立 `tool_runner` 可执行目标执行，不在 daemon 或 Workspace Driver VM 内执行。请求经 stdin 发送结构化 JSON；stdout 只承载版本化结果协议，Lua print 和日志写 stderr。协议无效、非零退出、输出超限、启动失败及 cleanup 缺失均返回明确错误；返回字符串中的已知业务 JSON 信封按下述图片结果契约解包。
 
 runner 默认在当前可执行文件同目录，可由 `MARGATROID_TOOL_RUNNER` 或 `with_runner_path` 指定。stdin 投递、stdout/stderr 有界排读和进程等待并行，统一受总执行预算、作用域取消、请求取消及 receiver 关闭监督。
 
@@ -57,6 +57,14 @@ Agent.sandbox 为选定 `SandboxValue { resource_id, policy: Arc<str> }`。执�
 工具 VM 在脚本顶层执行前准备 arguments 和只读 context，提供 JSON 编解码与 shell，不注入 MCL、ready、wake 或 Driver 能力。context 保留 agent/resource/call ID、turn、project_root 及 temp_dir。
 
 普通 shell 并行使用有界 stdout/stderr 管道；Linux 显式 `{pty=true}` 使用非阻塞 PTY，建立 session 和控制终端，输出合并在 stdout、stderr 为空，返回 code。非 Linux 明确拒绝 PTY，不自动降级。单次宿主超时和输出限额不得扩大总执行预算；取消、超时和后代回收沿用同一执行边界。handoff 当前固定返回 `UnsupportedHandoff`，未实现长期任务池或任务转交协议。
+
+## 图片结果
+
+runner结果仍为String。含`ok: boolean`与`content: string`的JSON envelope可携带`images: [{media_type, data}]`（raw base64）；共享图片校验失败明确返回ToolError，不将坏图片当作普通文本，也不在诊断中回显base64。旧纯文本输出不变。
+
+`local/read-image`最多读取5MiB+1，按PNG/JPEG/GIF/WebP magic识别，路径支持绝对路径或项目根相对路径。通用`margatroid().base64_encode`宿主helper限制输入5MiB，以线性时间编码而不耗费纯Lua逐字节指令预算。
+
+`ToolExecutionLimits.result_bytes`默认32MiB，限制含图片的String结果。`output_bytes`仍默认1MiB，限制旧纯文本、去除images后的JSON envelope以及shell输出；stderr诊断不提高预算。worker与父进程均检查，坏图片明确失败，不按工具身份特殊分支，也不允许通过额外字段逃避文本限额。协议管道仍有单独的有界JSON转义开销。
 
 ## snapshot 限制与回归
 

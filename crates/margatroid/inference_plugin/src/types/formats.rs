@@ -232,7 +232,7 @@ fn normalize(request: &mut DomainRequest) -> Result<()> {
 }
 
 pub(crate) fn validated_message_sizes(message: &AgentMessage) -> Result<(usize, usize)> {
-    if let AgentMessage::User { images, .. } = message {
+    if let AgentMessage::User { images, .. } | AgentMessage::ToolCall { images, .. } = message {
         validate_user_images(images)
             .map_err(|error| InferenceError::new(InferenceErrorKind::InvalidMessages, error))?;
     }
@@ -247,6 +247,15 @@ pub(crate) fn validated_message_sizes(message: &AgentMessage) -> Result<(usize, 
             })
             .map_err(|_| invalid("invalid message"))?
             .len()
+        }
+        AgentMessage::ToolCall { images, .. } if !images.is_empty() => {
+            let mut text_only = message.clone();
+            if let AgentMessage::ToolCall { images, .. } = &mut text_only {
+                images.clear();
+            }
+            serde_json::to_vec(&text_only)
+                .map_err(|_| invalid("invalid message"))?
+                .len()
         }
         _ => encoded,
     };
@@ -339,18 +348,59 @@ impl TryFrom<DomainRequest> for ChatCompletionsRequest {
                 "Chat Completions cannot replay foreign reasoning metadata",
             ));
         }
-        let messages = request.messages.into_iter().map(|message| match message {
-            AgentMessage::System { content } => json!({"role":"system","content":content}),
-            AgentMessage::User { content, images } => json!({"role":"user","content":user_content(content, images, ApiFormat::ChatCompletions)}),
-            AgentMessage::Assistant { reasoning, content, tool_calls, .. } => {
-                let mut value = json!({"role":"assistant","content":content});
-                if let Some(reasoning) = reasoning { value["reasoning_content"] = json!(reasoning); }
-                if !tool_calls.is_empty() { value["tool_calls"] = json!(tool_calls.into_iter().map(|call| json!({"id":call.id,"type":"function","function":{"name":call.tool_name,"arguments":call.arguments}})).collect::<Vec<_>>()); }
-                value
+        let mut messages = Vec::new();
+        let mut pending = HashSet::new();
+        let mut image_blocks = Vec::new();
+        for message in request.messages {
+            let value = match message {
+                AgentMessage::System { content } => json!({"role":"system","content":content}),
+                AgentMessage::User { content, images } => {
+                    json!({"role":"user","content":user_content(content, images, ApiFormat::ChatCompletions)})
+                }
+                AgentMessage::Assistant {
+                    reasoning,
+                    content,
+                    tool_calls,
+                    ..
+                } => {
+                    pending.extend(tool_calls.iter().map(|call| call.id.clone()));
+                    let mut value = json!({"role":"assistant","content":content});
+                    if let Some(reasoning) = reasoning {
+                        value["reasoning_content"] = json!(reasoning);
+                    }
+                    if !tool_calls.is_empty() {
+                        value["tool_calls"] = json!(tool_calls.into_iter().map(|call| json!({"id":call.id,"type":"function","function":{"name":call.tool_name,"arguments":call.arguments}})).collect::<Vec<_>>());
+                    }
+                    value
+                }
+                AgentMessage::ToolCall {
+                    tool_call_id,
+                    content,
+                    images,
+                    ..
+                } => {
+                    pending.remove(&tool_call_id);
+                    for image in images {
+                        image_blocks.push(
+                            json!({"type":"text","text":format!("tool_call_id: {tool_call_id}")}),
+                        );
+                        image_blocks.extend(
+                            user_content(String::new(), vec![image], ApiFormat::ChatCompletions)
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .cloned(),
+                        );
+                    }
+                    json!({"role":"tool","tool_call_id":tool_call_id,"content":content})
+                }
+                _ => unreachable!(),
+            };
+            messages.push(value);
+            if pending.is_empty() && !image_blocks.is_empty() {
+                messages.push(json!({"role":"user","content":std::mem::take(&mut image_blocks)}));
             }
-            AgentMessage::ToolCall { tool_call_id, content, .. } => json!({"role":"tool","tool_call_id":tool_call_id,"content":content}),
-            _ => unreachable!(),
-        }).collect();
+        }
         Ok(Self { model: request.config.model, messages, tools: request.tools.into_iter().map(|tool| json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}})).collect(), stream:true, stream_options:json!({"include_usage":true}), temperature:request.config.temperature, max_tokens:request.config.max_output_tokens, top_p:request.config.top_p, stop:request.config.stop })
     }
 }
@@ -417,13 +467,14 @@ impl TryFrom<DomainRequest> for MessagesRequest {
                 AgentMessage::ToolCall {
                     tool_call_id,
                     content,
+                    images,
                     failed,
                     ..
                 } => merge_message(
                     &mut messages,
                     "user",
                     vec![
-                        json!({"type":"tool_result","tool_use_id":tool_call_id,"content":content,"is_error":failed}),
+                        json!({"type":"tool_result","tool_use_id":tool_call_id,"content":if images.is_empty() { json!(content) } else { user_content(content, images, ApiFormat::Messages) },"is_error":failed}),
                     ],
                 ),
                 _ => unreachable!(),
@@ -471,9 +522,10 @@ impl TryFrom<DomainRequest> for ResponsesRequest {
                 AgentMessage::ToolCall {
                     tool_call_id,
                     content,
+                    images,
                     ..
                 } => input.push(
-                    json!({"type":"function_call_output","call_id":tool_call_id,"output":content}),
+                    json!({"type":"function_call_output","call_id":tool_call_id,"output":user_content(content, images, ApiFormat::Responses)}),
                 ),
                 _ => unreachable!(),
             }
@@ -1135,6 +1187,7 @@ mod tests {
             tool_call_id: id.into(),
             tool_name: "echo".into(),
             content: "ok".into(),
+            images: vec![],
             failed: false,
         }
     }
@@ -1275,6 +1328,32 @@ mod tests {
         let mut single = request(vec![user.clone()]);
         normalize(&mut single).unwrap();
         let mut multiple = request(vec![user.clone(), user]);
+        assert!(normalize(&mut multiple).is_err());
+    }
+
+    #[test]
+    fn tool_image_context_uses_encoded_budget_without_charging_text_budget() {
+        let image = UserImage {
+            media_type: "image/png".into(),
+            data: format!(
+                "iVBORw0KGgoA{}",
+                "AAAA".repeat((4 * 1024 * 1024 + 512 * 1024 - 9) / 3)
+            ),
+        };
+        let mut result = tool("a");
+        if let AgentMessage::ToolCall { images, .. } = &mut result {
+            *images = vec![image; 4];
+        }
+        let (text, encoded) = validated_message_sizes(&result).unwrap();
+        assert!(text < 1024);
+        assert!(encoded > super::super::MAX_MESSAGES_BYTES);
+        let mut single = request(vec![assistant(vec![call("a")]), result.clone()]);
+        normalize(&mut single).unwrap();
+        let mut second = result.clone();
+        if let AgentMessage::ToolCall { tool_call_id, .. } = &mut second {
+            *tool_call_id = "b".into();
+        }
+        let mut multiple = request(vec![assistant(vec![call("a"), call("b")]), result, second]);
         assert!(normalize(&mut multiple).is_err());
     }
 

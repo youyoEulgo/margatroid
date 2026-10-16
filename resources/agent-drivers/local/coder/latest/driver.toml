@@ -17,6 +17,9 @@ id = "tool:local/list-directory:latest"
 id = "tool:local/read-file:latest"
 
 [[dependencies]]
+id = "tool:local/read-image:latest"
+
+[[dependencies]]
 id = "tool:local/write-file:latest"
 
 [[dependencies]]

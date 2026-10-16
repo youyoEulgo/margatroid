@@ -43,8 +43,8 @@ pub use mcl_events::{
     AgentMclQueue, MclCommand, MclCommandResult, MclError, MclInstruction, MclPending, MclValue,
 };
 pub use message_types::{
-    validate_user_images, AgentMessage, InferenceResponse, StopReason, TokenUsage, ToolCall,
-    ToolDefinition, UserImage,
+    deserialize_user_images, validate_user_images, AgentMessage, InferenceResponse, StopReason,
+    TokenUsage, ToolCall, ToolDefinition, UserImage,
 };
 pub use resource_components::{CallableDefinitionSnapshot, CallableResource, SandboxValue};
 pub use resource_id_plugin::{

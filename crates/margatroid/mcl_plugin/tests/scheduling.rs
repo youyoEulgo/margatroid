@@ -1306,6 +1306,7 @@ fn real_tool_batch_returns_ordered_failures_and_only_caller_selected_messages_ar
                 tool_call_id: "first".into(),
                 tool_name: "run".into(),
                 content: "done".into(),
+                images: vec![],
                 failed: false,
             },
         }))
@@ -1438,6 +1439,10 @@ fn partial_tool_batch_abort_preserves_completed_reply_and_finishes_normally() {
         tool_call_id: "first".into(),
         tool_name: "run".into(),
         content: "completed before abort".into(),
+        images: vec![margatroid_types::UserImage {
+            media_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+        }],
         failed: false,
     };
     calls[0]
@@ -1880,6 +1885,7 @@ fn duplicate_tool_completion_never_writes_messages() {
                 tool_call_id: "failed".into(),
                 tool_name: "run".into(),
                 content: "failure".into(),
+                images: vec![],
                 failed: true,
             }]),
         ))),

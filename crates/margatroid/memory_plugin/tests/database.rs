@@ -117,6 +117,10 @@ fn full_message() -> StoredBlockInner {
                 tool_call_id: "call".into(),
                 tool_name: "bash".into(),
                 content: "output".into(),
+                images: vec![margatroid_types::UserImage {
+                    media_type: "image/png".into(),
+                    data: "iVBORw0KGgo=".into(),
+                }],
                 failed: true,
             },
         ],

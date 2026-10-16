@@ -51,6 +51,7 @@ AgentDriver 由 `agent-drivers/` 提供，Workspace 文件仍由 CLI 编译，da
 仓库 `resources/` 包含 coder 和 reviewer 两个 Driver 及其依赖；安装时保持目录结构复制到主目录。
 reviewer 使用独立 Lua 实例、会话和历史数据库，默认启用 read-only 沙箱，可见工具为 code-review、project-context 和 list-directory。
 双成员 Workspace 可用 coder 作为 manager，同时声明 `local/coder:latest` 和 `local/reviewer:latest`；离线集成测试覆盖两者同时就绪和独立运行。旧 `agent-images/` 目录不参与 Driver 加载。
+内置 coder 可见 read_image 工具：Lua 在当前沙箱内读取 PNG/JPEG/GIF/WebP 文件（相对路径基于 project_root），返回含独立 images 的工具结果。Messages 与 Responses 使用原生含图片工具结果，Chat 在整批工具结果齐全之后附加 User 图片消息，仅转换 HTTP 上下文，不改写本地历史身份。已有持久 session.visible 不被启动脚本自动覆盖，升级旧会话需显式导入并加入该工具或使用新会话。
 User 消息可携带独立 images 数组，图片为 media_type 和原始 base64 data，不混入 content；MCL、Lua 会话、SQLite 历史和恢复均须保留图片，history.content 仍只保存文本。默认 Driver 无须按 API 分叉；离线回归覆盖带图片用户消息经过真实 Driver 后进入推理、历史、停止并重启恢复。API 图片转换不等于任意已配置模型都具备视觉能力。
 daemon 把主目录交给 ToolResourcePlugin 加载工具资源，ToolPlugin 只消费已选定的 Tool 快照，
 通过独立 Lua runner 执行。LLM 的 TOOL 数组只包含 `tool:*` 资源；prompt 和 sandbox 使用各自 typed array。

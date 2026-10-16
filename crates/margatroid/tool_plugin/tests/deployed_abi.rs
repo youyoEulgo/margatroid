@@ -41,7 +41,71 @@ fn run(
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("iVBORw0KGgo"),
+        "image data leaked to diagnostics"
+    );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn read_image_real_runner_handles_paths_formats_and_limits() {
+    use base64::Engine as _;
+    let root = tempfile::tempdir().unwrap();
+    let script = include_str!("../../../../resources/tools/local/read-image/latest/main.lua");
+    let png = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII=").unwrap();
+    let file = root.path().join("actual image.weird");
+    std::fs::write(&file, &png).unwrap();
+    for path in [
+        "actual image.weird".to_owned(),
+        file.to_string_lossy().into_owned(),
+    ] {
+        let response = run(
+            root.path(),
+            script,
+            serde_json::json!({"path":path}),
+            ToolExecutionLimits::default(),
+        );
+        assert!(response.cleanup_proven);
+        let envelope: serde_json::Value = serde_json::from_str(&response.result.unwrap()).unwrap();
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["images"][0]["media_type"], "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(envelope["images"][0]["data"].as_str().unwrap())
+                .unwrap(),
+            png
+        );
+        assert!(!envelope["content"].as_str().unwrap().contains("iVBOR"));
+    }
+    std::fs::write(root.path().join("fake.png"), "not an image").unwrap();
+    let mut maximum = vec![0u8; 5 * 1024 * 1024];
+    maximum[..png.len()].copy_from_slice(&png);
+    std::fs::write(root.path().join("maximum.png"), &maximum).unwrap();
+    let response = run(
+        root.path(),
+        script,
+        serde_json::json!({"path":"maximum.png"}),
+        ToolExecutionLimits::default(),
+    );
+    assert!(response.cleanup_proven);
+    let envelope: serde_json::Value = serde_json::from_str(&response.result.unwrap()).unwrap();
+    assert_eq!(envelope["ok"], true);
+    assert!(envelope["images"][0]["data"].as_str().unwrap().len() > 6 * 1024 * 1024);
+    maximum.push(0);
+    std::fs::write(root.path().join("oversize.png"), maximum).unwrap();
+    for path in ["missing.png", "fake.png", "oversize.png"] {
+        let response = run(
+            root.path(),
+            script,
+            serde_json::json!({"path":path}),
+            ToolExecutionLimits::default(),
+        );
+        assert!(response.cleanup_proven);
+        let envelope: serde_json::Value = serde_json::from_str(&response.result.unwrap()).unwrap();
+        assert_eq!(envelope["ok"], false);
+        assert!(envelope.get("images").is_none());
+    }
 }
 
 #[test]
