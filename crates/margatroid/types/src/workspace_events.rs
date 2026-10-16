@@ -54,3 +54,13 @@ pub struct WorkspaceExceptionResult {
     pub result: Result<(), WorkspaceError>,
 }
 impl Event for WorkspaceExceptionResult {}
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceMemberStartFailed {
+    pub workspace: Entity,
+    pub workspace_id: ResourceID,
+    pub agent: ResourceID,
+    pub driver: ResourceID,
+    pub error: WorkspaceError,
+}
+impl Event for WorkspaceMemberStartFailed {}

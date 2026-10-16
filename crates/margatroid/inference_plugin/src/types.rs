@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::error::{InferenceError, InferenceErrorKind};
 pub use margatroid_types::message_types::StopReason;
-use margatroid_types::message_types::{TokenUsage, ToolCall, ToolDefinition};
+use margatroid_types::message_types::{TokenUsage, ToolCall};
 
 #[derive(Clone, Debug)]
 pub enum ProviderMessage {
@@ -26,10 +26,14 @@ pub enum ProviderMessage {
         message: String,
     },
 }
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::HeaderMap;
 use reqwest::{Method, StatusCode, Url};
-use serde::{Deserialize, Serialize};
-use ProviderMessage as Message;
+use serde::Deserialize;
+
+pub(crate) mod formats;
+pub(crate) mod vendors;
+use margatroid_types::inference_request_types::DomainRequest;
+pub use vendors::Vendor;
 
 pub(crate) const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_MESSAGES_BYTES: usize = 16 * 1024 * 1024;
@@ -156,47 +160,7 @@ impl ConfiguredModelRoute {
     }
 }
 
-pub struct ProviderInput<'a> {
-    model: &'a str,
-    parameters: &'a InferenceParameters,
-    messages: &'a [Message],
-    tools: &'a [ToolDefinition],
-}
-
-impl<'a> ProviderInput<'a> {
-    pub fn new(
-        model: &'a str,
-        parameters: &'a InferenceParameters,
-        messages: &'a [Message],
-        tools: &'a [ToolDefinition],
-    ) -> Self {
-        Self {
-            model,
-            parameters,
-            messages,
-            tools,
-        }
-    }
-
-    pub fn model(&self) -> &str {
-        self.model
-    }
-
-    pub fn parameters(&self) -> &InferenceParameters {
-        self.parameters
-    }
-
-    pub fn messages(&self) -> &[Message] {
-        self.messages
-    }
-
-    pub fn tools(&self) -> &[ToolDefinition] {
-        self.tools
-    }
-}
-
 pub struct ProviderRouteInput<'a> {
-    pub provider: Option<&'a str>,
     pub base_url: &'a Url,
     pub api_key: &'a str,
     pub thinking: Option<&'a str>,
@@ -204,10 +168,6 @@ pub struct ProviderRouteInput<'a> {
 }
 
 impl<'a> ProviderRouteInput<'a> {
-    pub fn provider(&self) -> Option<&str> {
-        self.provider
-    }
-
     pub fn base_url(&self) -> &Url {
         self.base_url
     }
@@ -244,21 +204,13 @@ impl ProviderHttpRequest {
 }
 
 pub trait ProviderAdapter: Send + Sync + 'static {
-    fn build_request(
-        &self,
-        input: ProviderInput<'_>,
-    ) -> Result<ProviderHttpRequest, InferenceError>;
+    fn build_request(&self, input: DomainRequest) -> Result<ProviderHttpRequest, InferenceError>;
 
     fn begin_response(
         &self,
         status: StatusCode,
         headers: &HeaderMap,
     ) -> Result<Box<dyn ProviderResponseAccumulator>, InferenceError>;
-}
-
-pub trait ProviderAdapterFactory: Send + Sync + 'static {
-    fn build(&self, route: ProviderRouteInput<'_>)
-        -> Result<ErasedProviderAdapter, InferenceError>;
 }
 
 pub trait ProviderResponseAccumulator: Send + 'static {
@@ -270,10 +222,10 @@ pub trait ProviderResponseAccumulator: Send + 'static {
 }
 
 pub type ErasedProviderAdapter = Arc<dyn ProviderAdapter>;
-pub type ErasedProviderAdapterFactory = Arc<dyn ProviderAdapterFactory>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderInferenceResponse {
+    pub replay: Option<serde_json::Value>,
     pub reasoning: Option<String>,
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
@@ -288,111 +240,23 @@ pub enum ProviderStreamDelta {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ModelRouteDocument {
     pub(crate) models: Vec<ModelRouteConfig>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ModelRouteConfig {
     pub(crate) id: String,
     pub(crate) model: String,
-    pub provider: Option<String>,
+    pub provider: Vendor,
     pub base_url: String,
     pub api_key: String,
-    pub(crate) api_type: String,
+    pub(crate) api_type: formats::ApiFormat,
     pub thinking: Option<String>,
     pub reasoning_effort: Option<String>,
     pub(crate) context_window: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct OpenAiAdapterFactory;
-
-impl OpenAiAdapterFactory {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl ProviderAdapterFactory for OpenAiAdapterFactory {
-    fn build(
-        &self,
-        route: ProviderRouteInput<'_>,
-    ) -> Result<ErasedProviderAdapter, InferenceError> {
-        if route.thinking().is_some() || route.reasoning_effort().is_some() {
-            return Err(InferenceError::new(
-                InferenceErrorKind::InvalidModelRoute,
-                "OpenAI model route cannot contain DeepSeek reasoning options",
-            ));
-        }
-        if route.api_key().bytes().any(|byte| byte.is_ascii_control()) {
-            return Err(InferenceError::new(
-                InferenceErrorKind::InvalidModelRoute,
-                "provider API key contains an invalid control character",
-            ));
-        }
-        Ok(Arc::new(OpenAiAdapter {
-            base_url: route.base_url().clone(),
-            api_key: route.api_key().to_owned(),
-        }))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DeepSeekAdapterFactory;
-
-impl DeepSeekAdapterFactory {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl ProviderAdapterFactory for DeepSeekAdapterFactory {
-    fn build(
-        &self,
-        route: ProviderRouteInput<'_>,
-    ) -> Result<ErasedProviderAdapter, InferenceError> {
-        if route.api_key().bytes().any(|byte| byte.is_ascii_control()) {
-            return Err(InferenceError::new(
-                InferenceErrorKind::InvalidModelRoute,
-                "provider API key contains an invalid control character",
-            ));
-        }
-        let thinking = match route.thinking() {
-            None => None,
-            Some(value) => match ThinkingMode::parse(value) {
-                Some(mode) => Some(mode),
-                None => {
-                    return Err(InferenceError::new(
-                        InferenceErrorKind::InvalidModelRoute,
-                        "DeepSeek thinking must be enabled or disabled",
-                    ))
-                }
-            },
-        };
-        let reasoning_effort = match (thinking, route.reasoning_effort()) {
-            (Some(ThinkingMode::Enabled), Some(value @ ("high" | "max"))) => Some(value.to_owned()),
-            (Some(ThinkingMode::Enabled), None) => {
-                return Err(InferenceError::new(
-                    InferenceErrorKind::InvalidModelRoute,
-                    "enabled DeepSeek thinking requires reasoning_effort",
-                ))
-            }
-            (_, None) => None,
-            _ => {
-                return Err(InferenceError::new(
-                    InferenceErrorKind::InvalidModelRoute,
-                    "DeepSeek reasoning_effort must be high or max and requires enabled thinking",
-                ))
-            }
-        };
-        Ok(Arc::new(DeepSeekAdapter {
-            base_url: route.base_url().clone(),
-            api_key: route.api_key().to_owned(),
-            thinking,
-            reasoning_effort,
-        }))
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -416,313 +280,10 @@ impl ThinkingMode {
             Self::Disabled => "disabled",
         }
     }
-
-    fn thinks(self) -> bool {
-        matches!(self, Self::Enabled)
-    }
-}
-
-struct DeepSeekAdapter {
-    base_url: Url,
-    api_key: String,
-    thinking: Option<ThinkingMode>,
-    reasoning_effort: Option<String>,
-}
-
-impl ProviderAdapter for DeepSeekAdapter {
-    fn build_request(
-        &self,
-        input: ProviderInput<'_>,
-    ) -> Result<ProviderHttpRequest, InferenceError> {
-        let endpoint = format!(
-            "{}/chat/completions",
-            self.base_url.as_str().trim_end_matches('/')
-        );
-        let url = Url::parse(&endpoint).map_err(|_| {
-            InferenceError::new(
-                InferenceErrorKind::RequestBuildFailed,
-                "DeepSeek chat endpoint is invalid",
-            )
-        })?;
-        let body =
-            OpenAiRequest::from_deepseek_input(input, self.thinking, self.reasoning_effort.clone());
-        let body = serde_json::to_vec(&body).map_err(|_| {
-            InferenceError::new(
-                InferenceErrorKind::RequestBuildFailed,
-                "DeepSeek request could not be encoded",
-            )
-        })?;
-        let authorization =
-            HeaderValue::from_str(&format!("Bearer {}", self.api_key)).map_err(|_| {
-                InferenceError::new(
-                    InferenceErrorKind::RequestBuildFailed,
-                    "provider authorization header is invalid",
-                )
-            })?;
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, authorization);
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        Ok(ProviderHttpRequest::new(Method::POST, url, headers, body))
-    }
-
-    fn begin_response(
-        &self,
-        status: StatusCode,
-        _headers: &HeaderMap,
-    ) -> Result<Box<dyn ProviderResponseAccumulator>, InferenceError> {
-        if !status.is_success() {
-            return Err(InferenceError::with_status(
-                InferenceErrorKind::ResponseStatus,
-                Some(status.as_u16()),
-                "DeepSeek returned a non-success status",
-            ));
-        }
-        Ok(Box::new(DeepSeekAccumulator::default()))
-    }
-}
-
-struct OpenAiAdapter {
-    base_url: Url,
-    api_key: String,
-}
-
-impl ProviderAdapter for OpenAiAdapter {
-    fn build_request(
-        &self,
-        input: ProviderInput<'_>,
-    ) -> Result<ProviderHttpRequest, InferenceError> {
-        let endpoint = format!(
-            "{}/chat/completions",
-            self.base_url.as_str().trim_end_matches('/')
-        );
-        let url = Url::parse(&endpoint).map_err(|_| {
-            InferenceError::new(
-                InferenceErrorKind::RequestBuildFailed,
-                "OpenAI-compatible chat endpoint is invalid",
-            )
-        })?;
-        let body = OpenAiRequest::from_input(input);
-        let body = serde_json::to_vec(&body).map_err(|_| {
-            InferenceError::new(
-                InferenceErrorKind::RequestBuildFailed,
-                "OpenAI-compatible request could not be encoded",
-            )
-        })?;
-        let authorization =
-            HeaderValue::from_str(&format!("Bearer {}", self.api_key)).map_err(|_| {
-                InferenceError::new(
-                    InferenceErrorKind::RequestBuildFailed,
-                    "provider authorization header is invalid",
-                )
-            })?;
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, authorization);
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        Ok(ProviderHttpRequest::new(Method::POST, url, headers, body))
-    }
-
-    fn begin_response(
-        &self,
-        status: StatusCode,
-        _headers: &HeaderMap,
-    ) -> Result<Box<dyn ProviderResponseAccumulator>, InferenceError> {
-        if !status.is_success() {
-            return Err(InferenceError::with_status(
-                InferenceErrorKind::ResponseStatus,
-                Some(status.as_u16()),
-                "inference provider returned a non-success status",
-            ));
-        }
-        Ok(Box::new(OpenAiAccumulator::default()))
-    }
-}
-
-#[derive(Serialize)]
-struct OpenAiRequest {
-    model: String,
-    messages: Vec<serde_json::Value>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<serde_json::Value>,
-    stream: bool,
-    stream_options: OpenAiStreamOptions,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f32>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    stop: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thinking: Option<DeepSeekThinking>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<String>,
-}
-
-#[derive(Serialize)]
-struct OpenAiStreamOptions {
-    include_usage: bool,
-}
-
-impl OpenAiRequest {
-    fn from_input(input: ProviderInput<'_>) -> Self {
-        let messages = input.messages().iter().map(openai_message).collect();
-        let tools = input
-            .tools()
-            .iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.input_schema,
-                    }
-                })
-            })
-            .collect();
-        Self {
-            model: input.model().to_owned(),
-            messages,
-            tools,
-            stream: true,
-            stream_options: OpenAiStreamOptions {
-                include_usage: true,
-            },
-            temperature: input.parameters().temperature(),
-            max_tokens: input.parameters().max_output_tokens(),
-            top_p: input.parameters().top_p(),
-            stop: input.parameters().stop().to_vec(),
-            thinking: None,
-            reasoning_effort: None,
-        }
-    }
-
-    fn from_deepseek_input(
-        input: ProviderInput<'_>,
-        thinking: Option<ThinkingMode>,
-        reasoning_effort: Option<String>,
-    ) -> Self {
-        let messages = input
-            .messages()
-            .iter()
-            .map(|message| deepseek_message(message, thinking.is_none_or(ThinkingMode::thinks)))
-            .collect();
-        let tools = input
-            .tools()
-            .iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.input_schema,
-                    }
-                })
-            })
-            .collect();
-        Self {
-            model: input.model().to_owned(),
-            messages,
-            tools,
-            stream: true,
-            stream_options: OpenAiStreamOptions {
-                include_usage: true,
-            },
-            temperature: input.parameters().temperature(),
-            max_tokens: input.parameters().max_output_tokens(),
-            top_p: input.parameters().top_p(),
-            stop: input.parameters().stop().to_vec(),
-            thinking: thinking.map(|mode| DeepSeekThinking {
-                thinking_type: mode.as_str(),
-            }),
-            reasoning_effort,
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct DeepSeekThinking {
-    #[serde(rename = "type")]
-    thinking_type: &'static str,
-}
-
-fn openai_message(message: &Message) -> serde_json::Value {
-    match message {
-        Message::System { content } => serde_json::json!({"role":"system", "content":content}),
-        Message::User { content } => serde_json::json!({"role":"user", "content":content}),
-        Message::Error { message } => serde_json::json!({"role":"user", "content":message}),
-        Message::Assistant {
-            content,
-            tool_calls,
-            ..
-        } => {
-            let mut value = serde_json::json!({"role": "assistant", "content": content});
-            if !tool_calls.is_empty() {
-                value["tool_calls"] = serde_json::Value::Array(
-                    tool_calls
-                        .iter()
-                        .map(|call| {
-                            serde_json::json!({
-                                "id": call.id,
-                                "type": "function",
-                                "function": {"name": call.tool_name, "arguments": call.arguments}
-                            })
-                        })
-                        .collect(),
-                );
-            }
-            value
-        }
-        Message::Tool {
-            tool_call_id,
-            content,
-            ..
-        } => serde_json::json!({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": content,
-        }),
-    }
-}
-
-fn deepseek_message(message: &Message, thinking: bool) -> serde_json::Value {
-    match message {
-        Message::Assistant {
-            reasoning,
-            content,
-            tool_calls,
-        } => {
-            let mut message = serde_json::json!({"role": "assistant", "content": content});
-            if !tool_calls.is_empty() {
-                message["tool_calls"] = serde_json::Value::Array(
-                    tool_calls
-                        .iter()
-                        .map(|call| {
-                            serde_json::json!({
-                                "id": call.id,
-                                "type": "function",
-                                "function": {"name": call.tool_name, "arguments": call.arguments}
-                            })
-                        })
-                        .collect(),
-                );
-            }
-            if thinking || !tool_calls.is_empty() {
-                message["reasoning_content"] =
-                    serde_json::Value::String(reasoning.clone().unwrap_or_default());
-            }
-            message
-        }
-        _ => openai_message(message),
-    }
 }
 
 #[derive(Default)]
-struct OpenAiAccumulator {
+pub(super) struct OpenAiAccumulator {
     buffer: Vec<u8>,
     event_data: Vec<u8>,
     total_bytes: usize,
@@ -884,6 +445,7 @@ impl ProviderResponseAccumulator for OpenAiAccumulator {
         });
         Ok((
             ProviderInferenceResponse {
+                replay: None,
                 reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
                 content: (!self.content.is_empty()).then_some(self.content),
                 tool_calls: calls,
@@ -1035,23 +597,6 @@ impl OpenAiAccumulator {
     }
 }
 
-#[derive(Default)]
-struct DeepSeekAccumulator {
-    inner: OpenAiAccumulator,
-}
-
-impl ProviderResponseAccumulator for DeepSeekAccumulator {
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<ProviderStreamDelta>, InferenceError> {
-        self.inner.push(chunk)
-    }
-
-    fn finish(
-        self: Box<Self>,
-    ) -> Result<(ProviderInferenceResponse, Vec<ProviderStreamDelta>), InferenceError> {
-        Box::new(self.inner).finish()
-    }
-}
-
 fn parse_stop_reason(value: &str) -> StopReason {
     match value {
         "stop" => StopReason::Completed,
@@ -1065,8 +610,7 @@ fn parse_stop_reason(value: &str) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use margatroid_types::message_types::{TokenUsage, ToolCall, ToolDefinition};
-    use serde_json::json;
+    use margatroid_types::message_types::{TokenUsage, ToolCall};
 
     #[test]
     fn sse_multiline_crlf_utf8_and_content_filter_are_preserved() {
@@ -1119,7 +663,7 @@ data: [DONE]
 
     #[test]
     fn deepseek_usage_reads_prompt_cache_hit_tokens() {
-        let mut accumulator = DeepSeekAccumulator::default();
+        let mut accumulator = OpenAiAccumulator::default();
         accumulator
             .push(br#"data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":90,"completion_tokens":10,"total_tokens":100,"prompt_cache_hit_tokens":60}}
 
@@ -1216,139 +760,8 @@ data: [DONE]
     }
 
     #[test]
-    fn provider_tools_keep_agent_local_names() {
-        let tools = vec![
-            ToolDefinition {
-                name: "tool0_review".into(),
-                description: "Review code.".into(),
-                input_schema: json!({"type":"object"}),
-            },
-            ToolDefinition {
-                name: "tool1_commit".into(),
-                description: "Commit code.".into(),
-                input_schema: json!({"type":"object"}),
-            },
-        ];
-        let request = OpenAiRequest::from_input(ProviderInput::new(
-            "model",
-            &InferenceParameters::default(),
-            &[Message::User {
-                content: "hello".into(),
-            }],
-            &tools,
-        ));
-        assert_eq!(request.tools[0]["function"]["name"], "tool0_review");
-        assert_eq!(request.tools[1]["function"]["name"], "tool1_commit");
-        assert!(
-            serde_json::to_value(request).unwrap()["stream_options"]["include_usage"]
-                .as_bool()
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn deepseek_request_carries_reasoning_content_for_every_assistant_message() {
-        let messages = vec![
-            Message::Assistant {
-                reasoning: Some("ordinary reasoning".into()),
-                content: Some("ordinary answer".into()),
-                tool_calls: Vec::new(),
-            },
-            Message::Assistant {
-                reasoning: Some("tool reasoning".into()),
-                content: None,
-                tool_calls: vec![ToolCall {
-                    id: "call-1".into(),
-                    tool_name: "tool0".into(),
-                    arguments: "{}".into(),
-                }],
-            },
-            Message::Assistant {
-                reasoning: None,
-                content: None,
-                tool_calls: vec![ToolCall {
-                    id: "call-2".into(),
-                    tool_name: "tool0".into(),
-                    arguments: "{}".into(),
-                }],
-            },
-        ];
-        let request = OpenAiRequest::from_deepseek_input(
-            ProviderInput::new("model", &InferenceParameters::default(), &messages, &[]),
-            Some(ThinkingMode::Enabled),
-            Some("high".into()),
-        );
-        let value = serde_json::to_value(request).unwrap();
-
-        assert_eq!(value["thinking"]["type"], "enabled");
-        assert_eq!(value["stream_options"]["include_usage"], true);
-        assert_eq!(value["reasoning_effort"], "high");
-        assert_eq!(
-            value["messages"][0]["reasoning_content"],
-            "ordinary reasoning"
-        );
-        assert!(value["messages"][0].get("tool_calls").is_none());
-        assert_eq!(value["messages"][1]["reasoning_content"], "tool reasoning");
-        assert_eq!(
-            value["messages"][1]["tool_calls"].as_array().unwrap().len(),
-            1
-        );
-        assert_eq!(value["messages"][2]["reasoning_content"], "");
-    }
-
-    #[test]
-    fn deepseek_request_fills_empty_reasoning_content_when_it_is_missing() {
-        let messages = vec![Message::Assistant {
-            reasoning: None,
-            content: Some("answer".into()),
-            tool_calls: Vec::new(),
-        }];
-        let request = |thinking| {
-            serde_json::to_value(OpenAiRequest::from_deepseek_input(
-                ProviderInput::new("model", &InferenceParameters::default(), &messages, &[]),
-                thinking,
-                None,
-            ))
-            .unwrap()
-        };
-
-        let enabled = request(Some(ThinkingMode::Enabled));
-        assert_eq!(enabled["thinking"]["type"], "enabled");
-        assert_eq!(enabled["messages"][0]["reasoning_content"], "");
-
-        let unspecified = request(None);
-        assert!(unspecified.get("thinking").is_none());
-        assert_eq!(unspecified["messages"][0]["reasoning_content"], "");
-
-        let disabled = request(Some(ThinkingMode::Disabled));
-        assert_eq!(disabled["thinking"]["type"], "disabled");
-        assert!(disabled["messages"][0].get("reasoning_content").is_none());
-    }
-
-    #[test]
-    fn openai_assistant_omits_empty_tool_calls() {
-        let without_tools = openai_message(&Message::Assistant {
-            reasoning: None,
-            content: Some("answer".into()),
-            tool_calls: Vec::new(),
-        });
-        let with_tools = openai_message(&Message::Assistant {
-            reasoning: None,
-            content: None,
-            tool_calls: vec![ToolCall {
-                id: "call-1".into(),
-                tool_name: "tool0".into(),
-                arguments: "{}".into(),
-            }],
-        });
-
-        assert!(without_tools.get("tool_calls").is_none());
-        assert_eq!(with_tools["tool_calls"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
     fn deepseek_accumulator_separates_reasoning_and_content() {
-        let mut accumulator = DeepSeekAccumulator::default();
+        let mut accumulator = OpenAiAccumulator::default();
         let visible = accumulator
             .push(
                 br#"data: {"choices":[{"delta":{"reasoning_content":"think","content":null},"finish_reason":null}]}

@@ -49,3 +49,13 @@ MCL Result 按 id/source/target 匹配待回复记录，仅向发起连接发送
 旧 agent.message 邮箱、旧 agent.turn.abort 查表实现、visibility、Workflow 与 pending oneshot 轮询表已移除；上文 agent.turn.abort 使用新的共享控制事件，不恢复旧实现。旧 Memory/HistoryMessage、默认可见性、AgentTokenUsage 副本与消息广播报告不是当前接口。当前 pending 是网络请求回复关联，由共享结果事件驱动，不是 Agent 的执行 pending。
 
 中止网络关联使用内部唯一 operation_id，并核对 agent Entity、resource_id、workspace、完整 VM instance 与 expected_turn_id；只回复原 Client 实例与连接，断连清除关联但不撤回已受理中止。Working 期间拒绝 INJECT ? 中递归包含 user 的消息参数；工具可见性、sandbox 等非用户数组不被此守卫误拦截。
+
+## Workspace 成员启动失败隔离契约
+
+外部 `workspace.start` API 必须在成员定义中声明 manager，因为出站 `WorkspaceInfoDto.manager` 是必填资源地址。DTO 在发送 `StartWorkspace`、保存网络关联或创建领域实体之前验证定义可投影；空成员或缺少 manager 定义返回可操作的 `InvalidRequest`，不占用工作区地址。此入口限制不改变领域内部对空 Workspace 的支持，也不改变 wire 字段。已声明 manager 但全部成员启动失败仍可正常投影为 `workspace.started`。
+
+Workspace 自身定义校验、创建或执行线程创建失败才返回 StartWorkspaceResult::Err；创建前失败不占用新地址，重复地址保留旧实例并报告其 ID、状态、成功成员数及失败成员数，不覆盖或自动附着。初始驱动和成员请求全部结束后，即使全部成员失败也进入 Running 并返回 Ok，成员失败不得关闭提交门。
+
+Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>；失败值包含 driver 与 error，工作区身份由所属组件提供。这是持久到该工作区停止的失败诊断，不是重复 Agent 生命周期表。每个失败成员产生 WorkspaceMemberStartFailed，携带 workspace Entity、workspace_id、agent、driver、error；共享驱动失败按成员展开，动态创建失败同样记录并通知，成功加入清除该成员旧失败。Stopping 中已受理动态创建失败只结束等待，不污染健康工作区的停止结果。
+
+WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。

@@ -261,7 +261,7 @@ guard在闭包提交捕获阶段建立；取消或panic释放捕获内容时回�
 正常主线程回复后设置completed，guard正常释放不再次报告
 完成标记由唯一主线程挂载消费者使用；不将异步线程成功当成挂载成功
 无Prepared/Payload/Mutex<Option<Output>>层，无AgentDriverData和旧模型/源码/依赖薄包装
-14个测试覆盖实际target挂载/其他keys保留、多target、成功重载、失败保旧、generation复用、
+16个测试覆盖实际target挂载/其他keys保留、多target、成功重载、失败保旧、generation复用、
     无关文件/目录/symlink忽略、自有symlink拒绝、两文件UTF-8及边界、清单参数/依赖source校验、
     open无mkdir/路径检查、guard取消/panic/输出丢弃/重复失败恰好一次回复
 ```
@@ -273,7 +273,7 @@ guard在闭包提交捕获阶段建立；取消或panic释放捕获内容时回�
 公开，定义于共享types/agent_driver_events.rs：
 ```text
 DriverLoadError：Clone + Debug + PartialEq + Eq
-    message: String--共享构造器保存文本；插件私有error helper限制描述为512 UTF-8字节
+    message: String--共享构造器保存文本；插件私有error helper完整保存诊断上下文
     new(message: impl Into<String>) -> Self
     impl Display + std::error::Error
         Display仅输出message
@@ -283,9 +283,17 @@ AgentDriverLoadError：插件导出的DriverLoadError兼容别名
 ## 逻辑
 
 ```text
-无DriverLoadErrorKind/AgentDriverLoadErrorKind；错误以有界描述关联业务请求
+无DriverLoadErrorKind/AgentDriverLoadErrorKind；错误以完整诊断描述关联业务请求
 AsyncTaskError沿用框架，仅为外层监督错误，本身不携带原请求ID
 CompletionGuard补齐关联失败，不只记日志让请求等待
 不保留本地error.rs或旧AgentDriverTaskError中转层
 失败不删除目标旧驱动key；读取成功仍不表示推理路由或依赖内容已经可用
 ```
+
+## 可操作的加载诊断
+
+加载失败必须保留完整 ResourceID、实际尝试的绝对文件或目录路径，以及底层 I/O、UTF-8、清单解析或校验原因；不得用笼统的“读取失败”覆盖原因，也不得在添加上下文时截断路径或原因。逐祖先检查失败同时保留最终尝试路径和失败的祖先路径。
+
+依赖加载器在原有错误外添加资源上下文，保留上层调用方已经提供的依赖链（包括请求 id 中的关联链）；本插件不凭空推断驱动来源，也不递归加载依赖。调用方应将 `driver -> dependency` 链追加在本错误之外；Driver 清单声明的依赖仍只解析地址，不检查存在性。缺失依赖由对应 tool、prompt 或 sandbox 加载器报告其自身完整地址及实际绝对路径。
+
+错误在异步读取、主线程挂载及业务回执之间传播时保留原分类和原因；诊断文本不再受插件的旧 512 字节/字符截断限制，公共错误类型不变。回归测试覆盖缺失驱动目录、缺失 driver.toml/base.lua，以及缺失各类依赖文件。

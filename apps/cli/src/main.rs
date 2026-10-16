@@ -119,35 +119,46 @@ async fn run_workspace_up(workspace_file: PathBuf, backend_url: String) -> Resul
         &format!("workspace.start sent (request_id={start_request_id})"),
     );
 
+    let mut started = false;
+    let mut stop_requested = false;
+    let mut shutdown = Box::pin(wait_for_shutdown_signal());
     loop {
+        if started && stop_requested {
+            let stop_id = request_id();
+            let stop = ClientMessage::stop_workspace(&stop_id, &workspace);
+            socket
+                .send(Message::Text(serde_json::to_string(&stop)?.into()))
+                .await?;
+            print_cli_event(
+                "INFO",
+                &format!("workspace.stop sent (request_id={stop_id})"),
+            );
+            wait_for_stop_ack(&mut socket, &stop_id).await?;
+            print_cli_event("INFO", &format!("workspace stopped (request_id={stop_id})"));
+            socket.close(None).await?;
+            print_cli_event("INFO", "backend WebSocket closed");
+            return Ok(());
+        }
         tokio::select! {
-            signal = wait_for_shutdown_signal() => {
+            signal = &mut shutdown => {
                 signal?;
-                let stop_id = request_id();
-                let stop = ClientMessage::stop_workspace(&stop_id, &workspace);
-                socket.send(Message::Text(serde_json::to_string(&stop)?.into())).await?;
-                print_cli_event("INFO", &format!("workspace.stop sent (request_id={stop_id})"));
-                wait_for_stop_ack(&mut socket, &stop_id).await?;
-                print_cli_event("INFO", &format!("workspace stopped (request_id={stop_id})"));
-                socket.close(None).await?;
-                print_cli_event("INFO", "backend WebSocket closed");
-                return Ok(());
+                shutdown = Box::pin(wait_for_shutdown_signal());
+                stop_requested = true;
+                if !started {
+                    print_cli_event("INFO", "shutdown requested; waiting for workspace startup result before stopping");
+                }
             }
             message = socket.next() => {
                 let Some(message) = message else { return Ok(()); };
                 match message? {
                     Message::Text(text) => {
                         print_backend_message(&text);
-                        if let Some(error) = workspace_start_error(&text, &start_request_id) {
-                            return Err(CliError::Remote(error));
-                        }
+                        handle_workspace_start_reply(&text, &start_request_id, &mut started)?;
                     },
                     Message::Binary(bytes) => match String::from_utf8(bytes.to_vec()) {
                         Ok(text) => {
                             print_backend_message(&text);
-                            if let Some(error) = workspace_start_error(&text, &start_request_id) {
-                                return Err(CliError::Remote(error));
-                            }
+                            handle_workspace_start_reply(&text, &start_request_id, &mut started)?;
                         },
                         Err(_) => print_cli_event("WARN", &format!("non-UTF-8 backend message ignored (bytes={})", bytes.len())),
                     },
@@ -168,14 +179,46 @@ async fn run_workspace_up(workspace_file: PathBuf, backend_url: String) -> Resul
     }
 }
 
-fn workspace_start_error(text: &str, request_id: &str) -> Option<String> {
+fn handle_workspace_start_reply(
+    text: &str,
+    request_id: &str,
+    started: &mut bool,
+) -> Result<(), CliError> {
+    if *started {
+        return Ok(());
+    }
     match serde_json::from_str::<ServerMessage>(text) {
-        Ok(ServerMessage::WorkspaceStartFailed { id, error }) if id == request_id => Some(format!(
-            "workspace start failed: {kind}: {message}",
-            kind = error.kind,
-            message = error.message
-        )),
-        _ => None,
+        Ok(ServerMessage::WorkspaceStarted { id, workspace }) if id == request_id => {
+            *started = true;
+            print_cli_event(
+                "INFO",
+                &format!(
+                    "workspace started (workspace={}, member_failures={})",
+                    workspace.id.0,
+                    workspace.member_failures.len()
+                ),
+            );
+            for failure in workspace.member_failures {
+                print_cli_event(
+                    "ERROR",
+                    &format!(
+                        "workspace member failed to start (workspace={}, agent={}, driver={}, cause={})",
+                        workspace.id.0, failure.agent.0, failure.driver.0, failure.error
+                    ),
+                );
+            }
+            Ok(())
+        }
+        Ok(ServerMessage::WorkspaceStartFailed { id, error })
+        | Ok(ServerMessage::RequestFailed { id, error })
+            if id == request_id =>
+        {
+            Err(CliError::Remote(format!(
+                "workspace start failed: {}: {}",
+                error.kind, error.message
+            )))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -550,20 +593,67 @@ mod tests {
     }
 
     #[test]
+    fn workspace_success_with_any_number_of_member_failures_is_nonterminal() {
+        for failures in [
+            serde_json::json!([]),
+            serde_json::json!([
+                {"agent":"agent:test/coder:latest", "driver":"driver:local/missing:latest", "error":"missing coder"},
+                {"agent":"agent:test/reviewer:latest", "driver":"driver:local/missing:latest", "error":"missing reviewer"}
+            ]),
+        ] {
+            let text = serde_json::json!({
+                "type":"workspace.started", "id":"start",
+                "workspace":{"id":"workspace:local/test:latest", "name":"test", "project_root":"/project",
+                    "manager":"agent:test/coder:latest", "agents":[], "member_failures":failures}
+            }).to_string();
+            let mut started = false;
+            handle_workspace_start_reply(&text, "other", &mut started).unwrap();
+            assert!(!started);
+            handle_workspace_start_reply(&text, "start", &mut started).unwrap();
+            assert!(started);
+        }
+        let mut started = false;
+        handle_workspace_start_reply("not JSON", "start", &mut started).unwrap();
+        assert!(!started);
+    }
+
+    #[test]
+    fn matching_start_request_rejection_is_terminal_before_success_only() {
+        let text = serde_json::to_string(&ServerMessage::RequestFailed {
+            id: "start".into(),
+            error: margatroid_protocol::ProtocolErrorDto::new(
+                "InvalidRequest",
+                "manager definition missing before creation",
+            ),
+        })
+        .unwrap();
+        let mut started = false;
+        handle_workspace_start_reply(&text, "other", &mut started).unwrap();
+        assert!(handle_workspace_start_reply(&text, "start", &mut started).is_err());
+        started = true;
+        handle_workspace_start_reply(&text, "start", &mut started).unwrap();
+    }
+
+    #[test]
     fn matching_workspace_start_failure_is_terminal() {
         let message = serde_json::to_string(&ServerMessage::WorkspaceStartFailed {
             id: "start-1".into(),
             error: margatroid_protocol::ProtocolErrorDto::new(
-                "ResourceSetupFailed",
-                "skill file was not found",
+                "ExecutionStartFailed",
+                "workspace execution thread could not start",
             ),
         })
         .unwrap();
 
-        assert_eq!(
-            workspace_start_error(&message, "start-1").as_deref(),
-            Some("workspace start failed: ResourceSetupFailed: skill file was not found")
-        );
-        assert_eq!(workspace_start_error(&message, "other-start"), None);
+        let mut started = false;
+        let error = handle_workspace_start_reply(&message, "start-1", &mut started).unwrap_err();
+        assert!(error.to_string().contains("ExecutionStartFailed"));
+        assert!(error
+            .to_string()
+            .contains("workspace execution thread could not start"));
+        assert!(!started);
+        handle_workspace_start_reply(&message, "other-start", &mut started).unwrap();
+        started = true;
+        handle_workspace_start_reply(&message, "start-1", &mut started).unwrap();
     }
 }

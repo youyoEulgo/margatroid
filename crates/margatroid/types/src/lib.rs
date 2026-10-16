@@ -9,6 +9,7 @@ pub mod dto_events;
 pub mod execution_components;
 pub mod history_components;
 pub mod inference_events;
+pub mod inference_request_types;
 pub mod lua_environment;
 pub mod lua_runtime_components;
 pub mod lua_runtime_events;

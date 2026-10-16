@@ -29,6 +29,9 @@ pub enum AgentMessage {
     },
     Assistant {
         reasoning: Option<String>,
+        /// Opaque, API-format-tagged reasoning state required to replay this turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay: Option<serde_json::Value>,
         content: Option<String>,
         #[serde(default)]
         tool_calls: Vec<ToolCall>,
@@ -53,6 +56,7 @@ impl AgentMessage {
     pub fn aborted_assistant() -> Self {
         Self::Assistant {
             reasoning: None,
+            replay: None,
             content: Some("Turn aborted.".into()),
             tool_calls: Vec::new(),
             usage: None,
@@ -108,6 +112,7 @@ mod tests {
             legacy,
             AgentMessage::Assistant {
                 stop_reason: None,
+                replay: None,
                 ..
             }
         ));
@@ -119,9 +124,29 @@ mod tests {
             aborted
         );
         assert!(matches!(aborted.message, AgentMessage::Assistant {
-            reasoning: None, content: Some(content), tool_calls, usage: None,
+            reasoning: None,
+            replay: None, content: Some(content), tool_calls, usage: None,
             stop_reason: Some(StopReason::Cancelled),
         } if content == "Turn aborted." && tool_calls.is_empty()));
+    }
+
+    #[test]
+    fn assistant_replay_round_trips_and_none_is_omitted() {
+        let mut message = AgentMessage::aborted_assistant();
+        assert!(serde_json::to_value(&message)
+            .unwrap()
+            .get("replay")
+            .is_none());
+        if let AgentMessage::Assistant { replay, .. } = &mut message {
+            *replay = Some(
+                serde_json::json!({"api_format":"messages","items":[{"type":"redacted_thinking","data":"opaque"}]}),
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<AgentMessage>(serde_json::to_value(&message).unwrap())
+                .unwrap(),
+            message
+        );
     }
 
     #[test]
@@ -162,6 +187,7 @@ mod tests {
         let response = InferenceResponse {
             message: AgentMessage::Assistant {
                 reasoning: None,
+                replay: None,
                 content: Some("partial".into()),
                 tool_calls: vec![],
                 stop_reason: Some(StopReason::Length),

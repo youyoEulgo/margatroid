@@ -24,11 +24,15 @@ Prompt、Sandbox和Tool都使用同一种身份格式。`ResourceId`是跨Plugin
 Compose使用 `WorkspaceDefinition` 和 `WorkspaceAgentDefinition` 把配置文件编译成进程内静态业务
 输入。它们不包含运行时Entity，也不负责加载驱动、打开Memory或创建AgentInstance。
 
-## 领域推理请求分层（已批准，待实现）
+## 领域推理请求分层（已实现）
 
 共享层单独以 `inference_request_types.rs` 保存纯值 `DomainRequest { messages: Vec<AgentMessage>, tools: Vec<ToolDefinition>, config: DomainRequestConfig }`。`DomainRequestConfig` 只包含上游模型名、temperature、max_output_tokens、top_p、stop；不包含厂商扩展、URL、密钥、HTTP Client、Entity、取消或回复通道。Default 是空请求，不是有效的默认模型路由。
 
-`InferenceRequest` 继续表示带运行期关联和 oneshot 的执行事件，不能与纯值请求混为一体。API 格式、三种具体请求、`ApiRequest`、`ApiAdapter`、厂商处理器及转换错误只在 `inference_plugin::types` 定义；共享层不依赖推理插件。可失败转换采用 `TryFrom` / `try_into()?`，不为方便而丢弃消息信息。完整类型与转换边界见本 crate 设计及推理插件设计；本节不声明新结构已经实现。
+`InferenceRequest` 继续表示带运行期关联和 oneshot 的执行事件，不能与纯值请求混为一体。API 格式、三种具体请求、`ApiRequest`、厂商处理器及转换错误只在 `inference_plugin::types` 定义；共享层不依赖推理插件。可失败转换采用 `TryFrom` / `try_into()?`，不为方便而丢弃消息信息。三个具体格式转换及vendor处理已经实现；共享层不包含具体HTTP格式。
+
+## reasoning replay（已实现）
+
+Assistant包含可选 `replay: Option<serde_json::Value>`；旧消息缺字段默认None。共享层将其视为不透明纯JSON：`{ "api_format": "messages" | "responses", "items": [...] }`。Messages保存signed thinking的文本/signature及redacted_thinking.data；Responses保存reasoning item的id、summary和可用的content/encrypted_content。DTO、持久MESSAGE和显式历史保留replay，不把它拼入正文，也不以可显示reasoning代替签名或加密元数据。格式边界拒绝不兼容/无效replay及无法无损表达的历史；Responses使用store=false及include reasoning.encrypted_content实现完整本地无状态重放。当前User和工具结果仍为纯文本String，图像未实现。
 
 ## 共享消息与执行边界
 
@@ -45,3 +49,11 @@ Assistant 的 `stop_reason: Option<StopReason>` 使用serde默认值兼容旧文
 AbortAgentTurn控制系统注册在 `RuntimePlugin::PRE_UPDATE`，先于UPDATE中的 MCL 实际执行与 inference/tool admission；自定义调度必须保留这个先后关系。共享中止事件允许多个消费者独立观察，不靠 take reply 独占通知；实际受理重新核对Working及非空匹配的请求 turn，turn=None 或已中止旧轮次返回正常取消结果，不启动执行。
 
 历史仅由显式 MCL `history_append` 保存。Assistant stop_reason 存在历史 payload 元数据，不混入正文；cancelled assistant 可入历史但不可进入 infer 上下文（包括 Inject 嵌套）。领域请求、结果与错误保持各自 oneshot/共享事件关联，不恢复 AgentFailure 路由。
+
+## Workspace 成员启动失败隔离契约
+
+Workspace 自身定义校验、创建或执行线程创建失败才返回 StartWorkspaceResult::Err；创建前失败不占用新地址，重复地址保留旧实例并报告其 ID、状态、成功成员数及失败成员数，不覆盖或自动附着。初始驱动和成员请求全部结束后，即使全部成员失败也进入 Running 并返回 Ok，成员失败不得关闭提交门。
+
+Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>；失败值包含 driver 与 error，工作区身份由所属组件提供。这是持久到该工作区停止的失败诊断，不是重复 Agent 生命周期表。每个失败成员产生 WorkspaceMemberStartFailed，携带 workspace Entity、workspace_id、agent、driver、error；共享驱动失败按成员展开，动态创建失败同样记录并通知，成功加入清除该成员旧失败。Stopping 中已受理动态创建失败只结束等待，不污染健康工作区的停止结果。
+
+WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。

@@ -1,4 +1,4 @@
-use crate::files::{checked_path, definition, error, field, read_text, schema};
+use crate::files::{checked_path, context, definition, error, field, read_text, schema};
 use crate::types::ToolResourceLoadConfig;
 use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::WorldAsyncExt;
@@ -21,7 +21,10 @@ impl Drop for SubmissionGuard {
         if let Some(request) = self.request.take() {
             let result = Err(error(
                 Kind::TaskFailed,
-                "read submission dropped before I/O start",
+                format!(
+                    "request {}, resource {}: read submission dropped before I/O start",
+                    request.id, request.resource_id
+                ),
             ));
             if let Some(sender) = request
                 .reply
@@ -62,6 +65,12 @@ fn finish(
     result: Result<(), ResourceLoadError>,
     rollback: bool,
 ) {
+    let result = result.map_err(|e| {
+        context(
+            format!("request {}, resource {}", request.id, request.resource_id),
+            e,
+        )
+    });
     let sender = request
         .reply
         .lock()
@@ -230,6 +239,12 @@ pub(crate) fn handle_mount_tool_resource(world: &mut World, output: ToolResource
             )
         })
     };
+    let result = result.map_err(|e| {
+        context(
+            format!("request {}, resource {}", request.id, request.resource_id),
+            e,
+        )
+    });
     let sender = reply.take().unwrap();
     drop(reply);
     let _ = sender.send(result.clone());
@@ -256,36 +271,55 @@ fn prepare(
         .join(request.resource_id.scope())
         .join(request.resource_id.name())
         .join(request.resource_id.tag());
-    checked_path(&directory, true)?;
-    let read = |name: &str, maximum| {
-        read_text(&directory.join(name), maximum, || {
-            request.cancel.is_cancelled()
+    let result = (|| {
+        checked_path(&directory, true)?;
+        let read = |name: &str, maximum| {
+            read_text(&directory.join(name), maximum, || {
+                request.cancel.is_cancelled()
+            })
+        };
+        let metadata = definition(&read("tool.toml", config.limits.max_definition_bytes)?)
+            .map_err(|e| context(directory.join("tool.toml").display(), e))?;
+        let name = field(&metadata, "name")
+            .map_err(|e| context(directory.join("tool.toml").display(), e))?;
+        let description = field(&metadata, "description")
+            .map_err(|e| context(directory.join("tool.toml").display(), e))?;
+        if metadata
+            .get("schema_version")
+            .and_then(toml::Value::as_integer)
+            != Some(1)
+            || name != request.resource_id.name()
+        {
+            return Err(error(
+                Kind::InvalidDefinition,
+                format!(
+                    "{}: version must be 1 and name must match resource ID",
+                    directory.join("tool.toml").display()
+                ),
+            ));
+        }
+        let script_path = directory.join("main.lua");
+        read("main.lua", config.limits.max_script_bytes)?;
+        let input_schema = schema(&read(
+            "input.schema.json",
+            config.limits.max_definition_bytes,
+        )?)
+        .map_err(|e| context(directory.join("input.schema.json").display(), e))?;
+        Ok(ToolResource {
+            alias: request.alias.clone(),
+            description,
+            input_schema,
+            script_path,
         })
-    };
-    let metadata = definition(&read("tool.toml", config.limits.max_definition_bytes)?)?;
-    let name = field(&metadata, "name")?;
-    let description = field(&metadata, "description")?;
-    if metadata
-        .get("schema_version")
-        .and_then(toml::Value::as_integer)
-        != Some(1)
-        || name != request.resource_id.name()
-    {
-        return Err(error(
-            Kind::InvalidDefinition,
-            "tool version must be 1 and name must match resource ID",
-        ));
-    }
-    let script_path = directory.join("main.lua");
-    read("main.lua", config.limits.max_script_bytes)?;
-    let input_schema = schema(&read(
-        "input.schema.json",
-        config.limits.max_definition_bytes,
-    )?)?;
-    Ok(ToolResource {
-        alias: request.alias.clone(),
-        description,
-        input_schema,
-        script_path,
+    })();
+    result.map_err(|e| {
+        context(
+            format!(
+                "resource {}, directory {}",
+                request.resource_id,
+                directory.display()
+            ),
+            e,
+        )
     })
 }

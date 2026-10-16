@@ -22,14 +22,20 @@ ws://127.0.0.1:3939/ws
 -> WebSocket 发送 connection.register(client_type=cli)
 -> WebSocket 发送 workspace.start
 -> 持续接收并打印后端消息
--> 收到匹配请求ID的 workspace.start_failed：立即报错并以非零状态退出
--> 首次 Ctrl+C/SIGTERM：WebSocket 发送 workspace.stop
+-> 收到匹配请求ID的 workspace.started：显示成功和成员失败详情，继续连接
+-> 成功前收到匹配请求ID的 workspace.start_failed：报错并以非零状态退出
+-> 首次 Ctrl+C/SIGTERM：启动回执未到时保留停止意图；启动成功后 WebSocket 发送 workspace.stop
 -> 等待匹配 request id 的 workspace.stopped
 -> 收到回执后关闭 WebSocket 并退出
 ~~~
 
-CLI 不读取 stdin，不发送用户消息、AgentMessage 或 LLM 请求；打印`log`消息，并把匹配当前启动请求的
-`workspace.start_failed`作为终止错误。其他后端事件忽略。非 UTF-8 二进制消息只打印长度提示。关闭信号不会直接终止进程，而是先请求后端停止
+CLI 不读取 stdin，不发送用户消息、AgentMessage 或 LLM 请求。打印 `log` 消息及匹配启动请求的
+`workspace.started` 摘要；成功回执中的 `member_failures` 逐条显示 Agent、Driver 和具体原因，但不会使 CLI 退出。
+即使全部初始成员失败，已建立的 Workspace 仍保持连接并可正常停止；manager 不可用不等于 Workspace 未建立。
+只有成功回执之前匹配当前请求的 `workspace.start_failed`（Workspace 自身无法创建），或协议预检的 `request.failed`（请求被拒绝、尚未创建），才作为启动终止错误。
+后端必须确保这种失败不留下本次创建的占位；已有同地址 Workspace 的冲突不覆盖旧实例，诊断包含旧实例状态和成员情况。
+成员后续失败不改变 CLI 生命周期；成功回执后重复或延迟的启动失败回执不再终止会话。
+非 UTF-8 二进制消息只打印长度提示。关闭信号不会直接终止进程，而是先请求后端停止
 workspace；停止失败、超时、重复信号或后端提前断开时命令报错退出。
 
 CLI 生命周期事件与后端日志统一显示 RFC 3339 UTC 时间、等级和事件目标，例如：

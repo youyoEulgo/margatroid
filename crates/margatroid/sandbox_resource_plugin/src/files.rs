@@ -4,7 +4,10 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 pub(crate) fn error(kind: Kind, message: impl Into<String>) -> ResourceLoadError {
-    ResourceLoadError::new(kind, message)
+    ResourceLoadError {
+        kind,
+        message: message.into(),
+    }
 }
 pub(crate) fn normalize_root(root: PathBuf) -> Result<PathBuf, ResourceLoadError> {
     if !root.is_absolute()
@@ -14,7 +17,10 @@ pub(crate) fn normalize_root(root: PathBuf) -> Result<PathBuf, ResourceLoadError
     {
         return Err(error(
             Kind::InvalidRoot,
-            "root must be absolute without parent traversal",
+            format!(
+                "root {} must be absolute without parent traversal",
+                root.display()
+            ),
         ));
     }
     Ok(root)
@@ -30,6 +36,10 @@ fn io_error(e: std::io::Error) -> ResourceLoadError {
     )
 }
 pub(crate) fn checked_path(path: &Path, directory: bool) -> Result<(), ResourceLoadError> {
+    checked_path_inner(path, directory)
+        .map_err(|e| context(format!("attempted path {}", path.display()), e))
+}
+fn checked_path_inner(path: &Path, directory: bool) -> Result<(), ResourceLoadError> {
     let mut current = PathBuf::new();
     let parts: Vec<_> = path.components().collect();
     for (index, part) in parts.iter().enumerate() {
@@ -37,21 +47,36 @@ pub(crate) fn checked_path(path: &Path, directory: bool) -> Result<(), ResourceL
             return Err(error(Kind::InvalidRoot, "parent traversal"));
         }
         current.push(part.as_os_str());
-        let metadata = fs::symlink_metadata(&current).map_err(io_error)?;
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|e| context(format!("inspect {}", current.display()), io_error(e)))?;
         if metadata.file_type().is_symlink() {
-            return Err(error(Kind::SymlinkNotAllowed, "symlink path component"));
+            return Err(error(
+                Kind::SymlinkNotAllowed,
+                format!("symlink path component {}", current.display()),
+            ));
         }
         let is_directory = index + 1 < parts.len() || directory;
         if (is_directory && !metadata.is_dir()) || (!is_directory && !metadata.is_file()) {
             return Err(error(
                 Kind::InvalidFileType,
-                "expected directory or ordinary file",
+                format!(
+                    "expected directory or ordinary file at {}",
+                    current.display()
+                ),
             ));
         }
     }
     Ok(())
 }
 pub(crate) fn read_text(
+    path: &Path,
+    maximum: u64,
+    cancelled: impl Fn() -> bool,
+) -> Result<String, ResourceLoadError> {
+    read_text_inner(path, maximum, cancelled)
+        .map_err(|e| context(format!("read {}", path.display()), e))
+}
+fn read_text_inner(
     path: &Path,
     maximum: u64,
     cancelled: impl Fn() -> bool,
@@ -87,4 +112,11 @@ pub(crate) fn read_text(
         return Err(error(Kind::Cancelled, "load cancelled"));
     }
     Ok(text)
+}
+
+pub(crate) fn context(
+    context: impl std::fmt::Display,
+    source: ResourceLoadError,
+) -> ResourceLoadError {
+    error(source.kind, format!("{context}: {}", source.message))
 }

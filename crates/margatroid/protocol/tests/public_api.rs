@@ -9,6 +9,101 @@ fn id(kind: &str, name: &str) -> ResourceID {
     ResourceID::new(kind, "test", name, None).unwrap()
 }
 #[test]
+fn workspace_member_failures_are_backward_compatible_and_lossless() {
+    let legacy = serde_json::json!({
+        "id": "workspace:test/demo:latest", "name": "demo", "project_root": "/tmp/demo",
+        "manager": "agent:test/manager:latest", "agents": ["agent:test/manager:latest"]
+    });
+    let mut dto: WorkspaceInfoDto = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(dto.member_failures.is_empty());
+    assert_eq!(serde_json::to_value(&dto).unwrap(), legacy);
+    dto.member_failures.push(WorkspaceMemberFailureDto {
+        agent: ResourceIdDto("agent:test/manager:latest".into()),
+        driver: ResourceIdDto("agent-driver:test/broken:latest".into()),
+        error: "AgentStartFailed:原始错误".into(),
+    });
+    let encoded = serde_json::to_value(&dto).unwrap();
+    assert_eq!(
+        encoded["member_failures"][0]["error"],
+        "AgentStartFailed:原始错误"
+    );
+    assert_eq!(
+        serde_json::from_value::<WorkspaceInfoDto>(encoded).unwrap(),
+        dto
+    );
+}
+
+#[test]
+fn workspace_entity_and_backend_project_failures_but_definition_does_not() {
+    use core_plugin::App;
+    use margatroid_types::{
+        agent_components::Agent,
+        workspace_components::{
+            Workspace, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceError,
+            WorkspaceErrorKind, WorkspaceMemberFailure, WorkspaceState,
+        },
+        workspace_execution::spawn_workspace_execution,
+    };
+    use resource_id_plugin::WorldResourceExt;
+    let mut app = App::new();
+    app.add_plugin(resource_id_plugin::ResourcePlugin);
+    let world = app.world_mut();
+    world.register_library::<Workspace>("workspace").unwrap();
+    world.register_library::<Agent>("agent").unwrap();
+    let definition = WorkspaceDefinition {
+        id: id("workspace", "partial"),
+        name: "partial".into(),
+        manager: "manager".into(),
+        project_root: "/tmp/partial".into(),
+        agents: vec![WorkspaceAgentDefinition {
+            id: id("agent", "manager"),
+            name: "manager".into(),
+            driver: id("agent-driver", "broken"),
+            home_root: "/tmp/home".into(),
+            history_path: "/tmp/history".into(),
+        }],
+    };
+    let definition_dto: WorkspaceInfoDto = (&definition).into_dto(()).unwrap();
+    assert!(definition_dto.member_failures.is_empty());
+    let (entry, close) = spawn_workspace_execution().unwrap();
+    let mut component = Workspace::new(definition, WorkspaceState::Running, entry, close.clone());
+    let error = WorkspaceError::new(
+        WorkspaceErrorKind::AgentDriverLoadFailed,
+        "missing module 原始错误",
+    );
+    component.record_member_failure(
+        id("agent", "manager"),
+        WorkspaceMemberFailure {
+            driver: id("agent-driver", "broken"),
+            error: error.clone(),
+        },
+    );
+    let entity = world.spawn();
+    world.insert_library(entity, component).unwrap();
+    let actual: WorkspaceInfoDto = entity.into_dto(&*world).unwrap();
+    assert_eq!(
+        actual.member_failures,
+        vec![WorkspaceMemberFailureDto {
+            agent: id("agent", "manager").into_dto(()).unwrap(),
+            driver: id("agent-driver", "broken").into_dto(()).unwrap(),
+            error: error.to_string(),
+        }]
+    );
+    let backend: BackendStateDto = ().into_dto(&*world).unwrap();
+    assert_eq!(backend.workspaces, vec![actual.clone()]);
+    let missing = resolve_agent(world, &actual.reference(), None).unwrap_err();
+    assert_eq!(missing.kind(), ProtocolErrorKind::AgentNotFound);
+    assert!(missing.message().contains("manager unavailable"));
+    assert!(missing.message().contains("missing module 原始错误"));
+    let wrong = WorkspaceReferenceDto::new("wrong", "/tmp/wrong");
+    assert_eq!(
+        resolve_agent(world, &wrong, None).unwrap_err().kind(),
+        ProtocolErrorKind::WorkspaceNotFound
+    );
+    tokio_runtime_close(close);
+}
+
+#[test]
 fn history_projection_preserves_real_and_unknown_creation_times() {
     for created_at_ms in [0, 1_800_000_123_456] {
         let record = margatroid_types::history_components::HistoryRecord {
@@ -74,6 +169,7 @@ fn nested_injection_preserves_all_shared_message_shapes() {
                         failed: true,
                     },
                     AgentMessageDto::Assistant {
+                        replay: None,
                         reasoning: Some("thought".into()),
                         content: None,
                         tool_calls: vec![],
@@ -106,6 +202,76 @@ fn nested_injection_preserves_all_shared_message_shapes() {
         "tool_call"
     );
 }
+#[test]
+fn opaque_assistant_replay_round_trips_through_messages_and_history() {
+    use margatroid_types::history_components::{message_history_parts, HistoryRecord};
+
+    let replay = serde_json::json!({
+        "messages": {"signed_reasoning": [{"signature": "opaque+/=", "data": [1, null, false]}]},
+        "responses": {"encrypted_content": "opaque-token", "unknown": {"future": true}}
+    });
+    let wire = serde_json::json!({
+        "type": "assistant", "reasoning": "thought", "content": "answer",
+        "tool_calls": [], "usage": null, "stop_reason": null, "replay": replay
+    });
+    let dto: AgentMessageDto = serde_json::from_value(wire.clone()).unwrap();
+    let domain: AgentMessage = dto.into_domain(()).unwrap();
+    let roundtrip: AgentMessageDto = (&domain).into_dto(()).unwrap();
+    assert_eq!(serde_json::to_value(&roundtrip).unwrap(), wire);
+    assert_eq!(roundtrip.into_domain(()).unwrap(), domain);
+
+    let (content, payload) = message_history_parts(&domain);
+    assert_eq!(payload["replay"], replay);
+    let history: HistoryMessageDto = (
+        0,
+        HistoryRecord {
+            created_at_ms: 123,
+            key: "signed-message".into(),
+            source: "test".into(),
+            turn: None,
+            kind: "message".into(),
+            content,
+            payload,
+        },
+    )
+        .into_dto(())
+        .unwrap();
+    let history: HistoryMessageDto =
+        serde_json::from_value(serde_json::to_value(history).unwrap()).unwrap();
+    assert_eq!(history.payload["replay"], replay);
+    let mut restored = history.payload;
+    restored["content"] = serde_json::Value::String(history.content);
+    let restored: AgentMessageDto = serde_json::from_value(restored).unwrap();
+    assert_eq!(restored.into_domain(()).unwrap(), domain);
+}
+
+#[test]
+fn legacy_assistant_replay_defaults_to_none_and_is_omitted() {
+    for replay in [None, Some(serde_json::Value::Null)] {
+        let mut wire = serde_json::json!({"type":"assistant","content":"legacy"});
+        if let Some(replay) = replay {
+            wire["replay"] = replay;
+        }
+        let dto: AgentMessageDto = serde_json::from_value(wire.clone()).unwrap();
+        assert!(matches!(
+            &dto,
+            AgentMessageDto::Assistant { replay: None, .. }
+        ));
+        assert!(serde_json::to_value(&dto).unwrap().get("replay").is_none());
+        let domain: AgentMessage = dto.into_domain(()).unwrap();
+        assert!(matches!(
+            &domain,
+            AgentMessage::Assistant { replay: None, .. }
+        ));
+        let legacy_domain: AgentMessage = serde_json::from_value(wire).unwrap();
+        assert_eq!(legacy_domain, domain);
+        assert!(serde_json::to_value(domain)
+            .unwrap()
+            .get("replay")
+            .is_none());
+    }
+}
+
 #[test]
 fn command_uses_arguments_and_source_only_from_conversion_context() {
     let message = ClientMessage::mcl_command(
@@ -140,6 +306,7 @@ fn command_result_keeps_inference_stop_reason_usage_and_independent_history_erro
         target: id("agent", "manager"),
         result: Ok(MclValue::Inference(InferenceResponse {
             message: AgentMessage::Assistant {
+                replay: None,
                 reasoning: None,
                 content: Some("partial".into()),
                 tool_calls: vec![],
@@ -456,7 +623,7 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
     let model_runtime = margatroid_types::model_components::ModelRuntimeInfo {
         id: "model".into(),
         model: "upstream-model".into(),
-        api_type: "deepseek".into(),
+        api_type: "chat_completions".into(),
         provider: None,
         context_window_tokens: 128_000,
         thinking: None,

@@ -124,9 +124,13 @@ AgentMessageDto：消息值投影，公开契约
     System { content: String }--已实现消息类型，保持prompt系统角色；支持消息值不等于开放任意网络入口权限
     Inject { messages: Vec<AgentMessageDto> }
     User { content: String }
-    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCall>, usage: Option<TokenUsage>, stop_reason: Option<StopReason> }
+    Assistant { replay: Option<serde_json::Value>, reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCall>, usage: Option<TokenUsage>, stop_reason: Option<StopReason> }
     ToolCall { resource_id: Option<ResourceIDDto>, tool_call_id: String, tool_name: String, content: String, failed: bool }
     Error { message: String }
+    说明：replay缺字段默认None，双向转换原样保留（包括Inject）；不在Protocol解释或伪造API元数据
+        信封为{api_format,items}，Messages保存signed thinking文本/signature及redacted_thinking.data
+        Responses保存reasoning id/summary及可用content/encrypted_content；格式边界拒绝不兼容replay
+        replay随结果及显式历史payload保存，不进入正文；当前User/工具结果仍纯文本，图像未实现
     说明：按共享消息契约递归转换，不存在比AgentMessage更窄的inject内层白名单；限制深度和大小。
         允许消息形状不等于任意入口有权限伪造工具执行完成；工具结果权威来源仍为实际调用oneshot。
 
@@ -161,7 +165,7 @@ HistoryMessageDto：历史投影，公开契约
     turn: Option<String>
     kind: String
     content: String--message记录的真实正文；error保存错误文本；inject根正文为空
-    payload: serde_json::Value--message类型、reasoning、tool_calls、usage、stop_reason等非正文元数据；inject保留完整嵌套消息；MCL保留指令原文及展开参数
+    payload: serde_json::Value--message类型、replay、reasoning、tool_calls、usage、stop_reason等非正文元数据；inject保留完整嵌套消息；MCL保留指令原文及展开参数
     created_at_ms: i64
 
 ClientInfoDto：客户端身份，公开契约
@@ -200,3 +204,11 @@ ProtocolErrorDto：网络错误，公开结构体
     message: String--有界、不泄漏凭据
     说明：区分未注册、无目标、非法参数、重复请求及历史记录错误，不丢失关联ID。
 ```
+
+## Workspace 成员启动失败隔离契约
+
+Workspace 自身定义校验、创建或执行线程创建失败才返回 StartWorkspaceResult::Err；创建前失败不占用新地址，重复地址保留旧实例并报告其 ID、状态、成功成员数及失败成员数，不覆盖或自动附着。初始驱动和成员请求全部结束后，即使全部成员失败也进入 Running 并返回 Ok，成员失败不得关闭提交门。
+
+Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>；失败值包含 driver 与 error，工作区身份由所属组件提供。这是持久到该工作区停止的失败诊断，不是重复 Agent 生命周期表。每个失败成员产生 WorkspaceMemberStartFailed，携带 workspace Entity、workspace_id、agent、driver、error；共享驱动失败按成员展开，动态创建失败同样记录并通知，成功加入清除该成员旧失败。Stopping 中已受理动态创建失败只结束等待，不污染健康工作区的停止结果。
+
+WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。

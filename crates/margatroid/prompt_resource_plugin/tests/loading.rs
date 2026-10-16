@@ -389,6 +389,7 @@ fn typed_prompt_import_faithfully_preserves_system_user_and_assistant_roles() {
                     content: "prompt body".into()
                 },
                 _ => AgentMessage::Assistant {
+                    replay: None,
                     reasoning: None,
                     content: Some("prompt body".into()),
                     tool_calls: Vec::new(),
@@ -404,4 +405,78 @@ fn typed_prompt_import_faithfully_preserves_system_user_and_assistant_roles() {
         .unwrap()
         .sandbox
         .is_none());
+}
+
+#[test]
+fn missing_dependency_directory_preserves_chain_resource_path_and_cause() {
+    let root = fixture();
+    let mut app = app(&root);
+    let target = app.world_mut().spawn();
+    let (mut request, rx, scope) = request(target, "dependency");
+    let chain = format!(
+        "driver:local/coder:latest -> {} -> dependency",
+        "parent".repeat(100)
+    );
+    request.id = chain.clone();
+    request.resource_id = ResourceID::parse("prompt:local/absent:latest").unwrap();
+    app.world().send_event(request);
+    let error = wait(&mut app, rx).unwrap_err();
+    assert_eq!(error.kind(), Kind::NotFound);
+    assert!(error.message.contains(&chain), "{error}");
+    assert!(
+        error.message.contains("prompt:local/absent:latest"),
+        "{error}"
+    );
+    let path = root.join("prompts/local/absent/latest");
+    assert!(error.message.contains(path.to_str().unwrap()), "{error}");
+    let ancestor = root.join("prompts/local/absent");
+    let cause = fs::symlink_metadata(&ancestor).unwrap_err().to_string();
+    assert!(
+        error.message.contains(ancestor.to_str().unwrap()),
+        "{error}"
+    );
+    assert!(error.message.contains(&cause), "{error}");
+    assert_eq!(scope.activity_count(), 0);
+}
+
+#[test]
+fn missing_dependency_files_report_exact_path_and_preserve_old_entry() {
+    for filename in ["prompt.toml", "content.md"] {
+        let root = fixture();
+        let mut app = app(&root);
+        let target = app.world_mut().spawn();
+        load(&mut app, target, "old").unwrap();
+        let path = root.join("prompts/local/sample/latest").join(filename);
+        assert!(path.is_absolute() && path.starts_with(&root));
+        fs::remove_file(&path).unwrap();
+        let error = load(&mut app, target, "new").unwrap_err();
+        assert_eq!(error.kind(), Kind::NotFound);
+        assert!(
+            error.message.contains("prompt:local/sample:latest"),
+            "{error}"
+        );
+        assert!(error.message.contains(path.to_str().unwrap()), "{error}");
+        let cause = fs::symlink_metadata(&path).unwrap_err().to_string();
+        assert!(error.message.contains(&cause), "{error}");
+        let set = app
+            .world()
+            .get_component::<ResourceSet<PromptResource>>(target)
+            .unwrap();
+        assert_eq!(set.iter().next().unwrap().1.alias, "old");
+    }
+}
+
+#[test]
+fn malformed_definition_preserves_parser_cause_and_absolute_file() {
+    let root = fixture();
+    let path = root.join("prompts/local/sample/latest/prompt.toml");
+    let body = "{ invalid definition";
+    fs::write(&path, body).unwrap();
+    let cause = toml::from_str::<toml::Value>(body).unwrap_err().to_string();
+    let mut app = app(&root);
+    let target = app.world_mut().spawn();
+    let error = load(&mut app, target, "invalid").unwrap_err();
+    assert_eq!(error.kind(), Kind::InvalidDefinition);
+    assert!(error.message.contains(path.to_str().unwrap()), "{error}");
+    assert!(error.message.contains(&cause), "{error}");
 }

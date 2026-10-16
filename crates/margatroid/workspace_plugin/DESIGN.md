@@ -60,6 +60,7 @@ Workspace：工作区图书馆组件，公开Component--保存工作区自身身
     definition: Arc<WorkspaceDefinition>--静态工作区定义
     project_root: Arc<PathBuf>--项目根目录
     agents: BTreeMap<ResourceID, Entity>--已成功启动的成员Agent地址到Entity
+    member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>--成员启动失败诊断，含驱动和原错误，不是生命周期表
     state: WorkspaceState--工作区状态机，包含当前启动或停止过程
     execution_entry: Option<WorkspaceExecutionEntry>--工作区专属线程的任务提交入口，私有，不直接向外暴露
     execution_close: Option<WorkspaceExecutionClose>--关闭该线程并等待退出的能力，私有
@@ -233,7 +234,7 @@ handle_agent_driver_result(world: &mut World, event: LoadAgentDriverResult)
         通过结果的子请求ID查找Starting中等待该结果的Workspace，未匹配时忽略
         核对目标Workspace完整Entity及驱动ResourceID，拒绝不匹配结果，不消费合法请求的等待记录
         匹配后移除对应驱动等待记录，重复结果不再次处理
-        失败时记录工作区启动错误，不启动依赖该驱动的成员
+        失败时逐成员记录member_failures并发送WorkspaceMemberStartFailed，不启动依赖该驱动的成员
         成功时确认目标Workspace Entity上的ResourceSet<AgentDriver>包含该驱动ID；缺失则记录ResourceResolutionFailed且不启动对应成员
         LoadAgentDriverResult只是挂载完成通知，挂载由AgentDriver插件完成，Workspace不重复插入或替换驱动集合
         不登记依赖者，不创建驱动实体，也不在Workspace组件内另存驱动映射
@@ -249,7 +250,7 @@ handle_start_agent_result(world: &mut World, event: StartAgentResult)
         通过结果的子请求ID查找Starting中等待该结果的Workspace，未匹配时忽略
         按等待记录确认成员身份，消费匹配记录，重复结果不再次处理
         成功时将成员Agent地址和Entity写入agents
-        失败时记录工作区启动错误
+        失败时逐成员记录member_failures并发送WorkspaceMemberStartFailed
         调用finish_workspace_start检查本次启动是否已完成
 
 handle_stop_workspace(world: &mut World, request: StopWorkspace)
@@ -306,9 +307,9 @@ finish_workspace_start(world: &mut World, workspace: Entity)
     完成启动判定：私有函数，只由启动事件Handler调用
     行为：
         Starting中还有等待驱动或等待成员请求时返回，不扫描Agent状态
-        全部请求结束且没有错误时将state置Running，发送原始id对应的StartWorkspaceResult::Ok(workspace)
-        全部请求结束且有错误时将state置Failed，发送原始id对应的StartWorkspaceResult::Err(error)
-        失败时保留已创建成员、驱动集合及执行线程，不偷偷销毁仍有执行体的工作区
+        全部请求结束时将state置Running，发送原始id对应的StartWorkspaceResult::Ok(workspace)，成员失败不阻断
+        成员失败只写member_failures，不置Failed、不关闭提交门
+        成员失败时保留健康成员、驱动集合及执行线程
         Failed不受理普通StopWorkspace，关闭提交门并保留成员及线程；异常结果只确认/记录失败，不隐式恢复Running或强制销毁
         转移状态后不再保留本次启动等待记录，原请求只回复一次
 
@@ -330,10 +331,10 @@ finish_workspace_stop(world: &mut World, workspace: Entity)
 启动：
     StartWorkspace -> Starting -> 创建工作区执行线程并保存入口和关闭能力 -> LoadAgentDriver
     LoadAgentDriverResult -> 确认本Entity驱动集合已更新 -> StartAgent
-    StartAgentResult -> 更新agents -> 全部成功后Running -> StartWorkspaceResult
+    StartAgentResult -> 更新agents/member_failures -> 全部收口后Running -> StartWorkspaceResult
     同一工作区的多个成员使用同一驱动时只提交一次加载，加载完成后分别启动成员
     不同工作区可以各自保存同ID驱动条目，一方加载更新不会自动覆盖另一方集合
-    StartWorkspaceResult成功意味着定义中的全部成员都取得StartAgentResult成功结果，不再是仅创建了Workspace Entity
+    StartWorkspaceResult成功意味着工作区线程可用且全部初始请求已收口；成员失败由member_failures单独表达
     StartAgentResult成功的准确边界由Agent插件保证，Workspace不额外监听Agent初始化事件
 
 停止：
@@ -352,7 +353,7 @@ finish_workspace_stop(world: &mut World, workspace: Entity)
 
 异常与失败边界：
     只有Running受理停止事件和开放提交入口；Starting、Stopping、Failed均拒绝，未设计启动中取消协议
-    启动或停止失败返回Err并保留需要管理的实例和线程；Failed关闭提交门且不接受普通Stop，异常处理不得隐式恢复或强制回收
+    工作区自身停止失败返回Err并保留需要管理的实例和线程；创建前失败不留下新实例；Failed关闭提交门且不接受普通Stop，异常处理不得隐式恢复或强制回收
     不存在的Workspace记录warning，同时返回Err完成请求关联
     本契约不提供启动中停止、失败自动回滚或停止幂等成功，不以异常结果替代必要生命周期回执
     未收到必要结果时保持对应状态，本次不引入超时或强制销毁策略
@@ -377,7 +378,7 @@ StartWorkspace：Workspace启动请求，公开事件
 
 StartWorkspaceResult：Workspace启动结果，公开事件
     id: String--原请求ID
-    result: Result<Entity, WorkspaceError>--成功时返回全部成员启动成功的Workspace Entity
+    result: Result<Entity, WorkspaceError>--成功时返回初始成员请求已收口的Workspace Entity
     impl Event for StartWorkspaceResult
 
 StopWorkspace：Workspace停止请求，公开事件
@@ -456,16 +457,16 @@ WorkspaceExecutionCloseOutput：线程关闭等待结果，公开共享类型--�
 ```text
 WorkspaceState：工作区状态机，公开枚举--只表示工作区生命周期及本次操作进度，不跟踪成员运行状态
     Starting(WorkspaceStartState)--成员启动过程尚未完成
-    Running--线程可用且初始成员启动成功，开放提交入口和停止受理，允许成员动态加入或退出
+    Running--线程可用且初始成员请求已收口，开放提交入口和停止受理，允许成员动态加入或退出
     Stopping(WorkspaceStopState)--等待成员停止结果
-    Failed { error: WorkspaceError }--一次启动或停止已结束但失败，保留尚需清理的工作区
+    Failed { error: WorkspaceError }--工作区自身停止已结束但失败，保留尚需清理的工作区
 
 WorkspaceStartState：工作区启动进度，公开类型--由Workspace.state持有，不是独立Resource
     request_id: String--原StartWorkspace请求ID
     pending_drivers: BTreeMap<String, ResourceID>--驱动加载子请求ID到驱动地址
     driver_members: BTreeMap<ResourceID, Vec<ResourceID>>--驱动地址到依赖该驱动的成员Agent地址
     pending_agents: BTreeMap<String, ResourceID>--成员启动子请求ID到成员Agent地址
-    error: Option<WorkspaceError>--本次启动首先记录的错误，其余错误记录日志
+    error: Option<WorkspaceError>--兼容保留字段；成员失败不再写入此字段
 
 WorkspaceStopState：工作区停止进度，公开类型--由Workspace.state持有，不是独立Resource
     request_id: String--原StopWorkspace请求ID
@@ -543,8 +544,7 @@ WorkspaceAdmission：提交门，公开共享内部类型
 
 状态转换：
     不存在 -> StartWorkspace -> Starting
-    Starting -> 所有子请求成功 -> Running
-    Starting -> 所有子请求结束且有错误 -> Failed
+    Starting -> 所有子请求收口（含成员失败） -> Running
     Running -> StopWorkspace -> Stopping
     Starting、Stopping或Failed -> StopWorkspace -> 错误结果，状态不变
     Stopping -> 所有成员停止成功 -> 关闭线程并等待退出 -> Entity销毁
@@ -641,3 +641,11 @@ WorkspaceError：工作区错误，公开结构体
     MCL由其队列及AgentExecutionScope完成取消和回执收口，Workspace不路由旧AgentMessage事件
     本次不改Rust代码、不恢复reload
 ```
+
+## Workspace 成员启动失败隔离契约
+
+Workspace 自身定义校验、创建或执行线程创建失败才返回 StartWorkspaceResult::Err；创建前失败不占用新地址，重复地址保留旧实例并报告其 ID、状态、成功成员数及失败成员数，不覆盖或自动附着。初始驱动和成员请求全部结束后，即使全部成员失败也进入 Running 并返回 Ok，成员失败不得关闭提交门。
+
+Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>；失败值包含 driver 与 error，工作区身份由所属组件提供。这是持久到该工作区停止的失败诊断，不是重复 Agent 生命周期表。每个失败成员产生 WorkspaceMemberStartFailed，携带 workspace Entity、workspace_id、agent、driver、error；共享驱动失败按成员展开，动态创建失败同样记录并通知，成功加入清除该成员旧失败。Stopping 中已受理动态创建失败只结束等待，不污染健康工作区的停止结果。
+
+WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。

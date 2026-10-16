@@ -164,7 +164,7 @@ supervision: Arc<dyn Send + Sync>
 正常释放或重复输出不重复回执。不新增 oneshot 或公共完成 trait，不修改 Workspace 依赖协议。
 Runtime 整体关闭后不保证事件继续被消费。
 
-共享 `DriverLoadError` 只有 `message`，无 ErrorKind；插件产生的描述限制为 512 UTF-8 字节。
+共享 `DriverLoadError` 只有 `message`，无 ErrorKind；插件产生的描述完整保留资源、路径和底层原因。
 `AgentDriverLoadError` 是该错误的兼容别名。
 
 ## 验证
@@ -174,9 +174,17 @@ cargo check -p agent_driver_loader_plugin
 cargo test -p agent_driver_loader_plugin
 ```
 
-14 项测试覆盖真实目标挂载与其他 keys 保留、多目标独立、成功重载、失败保旧、
+16 项测试覆盖真实目标挂载与其他 keys 保留、多目标独立、成功重载、失败保旧、
 目标 generation 复用、忽略非自有文件/目录/symlink、自有 symlink 拒绝、两文件边界与 UTF-8、
 依赖 source/非法 ID/模型参数校验、构造无 mkdir 和路径检查，以及 guard 取消、panic、
 输出丢弃、重复失败恰好一次回执。
 
 完整六板块契约见 [DESIGN](<DESIGN.md>)。
+
+## 可操作的加载诊断
+
+加载失败必须保留完整 ResourceID、实际尝试的绝对文件或目录路径，以及底层 I/O、UTF-8、清单解析或校验原因；不得用笼统的“读取失败”覆盖原因，也不得在添加上下文时截断路径或原因。逐祖先检查失败同时保留最终尝试路径和失败的祖先路径。
+
+依赖加载器在原有错误外添加资源上下文，保留上层调用方已经提供的依赖链（包括请求 id 中的关联链）；本插件不凭空推断驱动来源，也不递归加载依赖。调用方应将 `driver -> dependency` 链追加在本错误之外；Driver 清单声明的依赖仍只解析地址，不检查存在性。缺失依赖由对应 tool、prompt 或 sandbox 加载器报告其自身完整地址及实际绝对路径。
+
+错误在异步读取、主线程挂载及业务回执之间传播时保留原分类和原因；诊断文本不再受插件的旧 512 字节/字符截断限制，公共错误类型不变。回归测试覆盖缺失驱动目录、缺失 driver.toml/base.lua，以及缺失各类依赖文件。

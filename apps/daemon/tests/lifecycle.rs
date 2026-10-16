@@ -68,7 +68,7 @@ fn app(root: &Path) -> App {
             margatroid_types::model_components::ModelRuntimeInfo {
                 id: "offline-test".into(),
                 model: "offline-test".into(),
-                api_type: "openai".into(),
+                api_type: "chat_completions".into(),
                 provider: None,
                 context_window_tokens: 128000,
                 thinking: None,
@@ -476,7 +476,7 @@ fn persistent_session_reopens_and_temporary_entry_does_not_replay() {
     stop(&mut app, workspace);
 }
 #[test]
-fn driver_failure_before_ready_removes_agents_and_retains_failed_workspace() {
+fn driver_failure_before_ready_removes_agents_and_keeps_running_workspace() {
     let root = tempfile::tempdir().unwrap();
     driver(
         root.path(),
@@ -485,7 +485,7 @@ fn driver_failure_before_ready_removes_agents_and_retains_failed_workspace() {
         &[],
     );
     let mut app = app(root.path());
-    assert!(start(&mut app, definition(root.path(), &["broken", "broken"])).is_err());
+    let entity = start(&mut app, definition(root.path(), &["broken", "broken"])).unwrap();
     tick_until(&mut app, "startup failure cleanup", |world| {
         world
             .query_with::<Agent>()
@@ -501,19 +501,16 @@ fn driver_failure_before_ready_removes_agents_and_retains_failed_workspace() {
         .unwrap();
     assert!(matches!(
         workspace.state(),
-        margatroid_types::workspace_components::WorkspaceState::Failed { .. }
+        margatroid_types::workspace_components::WorkspaceState::Running
     ));
-    let close = workspace.execution_close();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(5), close.close())
-            .await
-            .unwrap()
-            .unwrap();
-    });
+    assert_eq!(workspace.member_failures().len(), 2);
+    assert!(workspace.member_failures().values().all(|failure| failure
+        .error
+        .message()
+        .contains("intentional early failure")));
+    stop(&mut app, entity);
+    let restarted = start(&mut app, definition(root.path(), &["broken", "broken"])).unwrap();
+    stop(&mut app, restarted);
 }
 #[test]
 fn missing_import_dependency_returns_failure_without_mount_and_can_stop() {

@@ -38,9 +38,9 @@ types      src/types.rs及共享纯值契约       Provider协议与配置辅助
 error      共享推理错误契约               校验、执行及协议错误
 ```
 
-**状态：本文既记录当前实现基线，也记录已批准但待实现的格式/vendor分层重构；带“待实现”的目标不是现有代码能力。未特别标记的既有类型和流程仍描述当前实现。**
+**状态：格式/vendor分层重构已实现。本文六板块描述当前源码：共享DomainRequest、三个具体格式转换及严格SSE累积、必填Vendor与七组合矩阵；当前内容仅纯文本，多模态未实现。**
 
-已批准目标（待实现）：共享types的专用 `inference_request_types.rs` 只定义单一纯领域请求 `DomainRequest`（拥有 `Vec<AgentMessage>`、`Vec<ToolDefinition>` 和纯 `DomainRequestConfig` 公共语义配置）；执行事件 `InferenceRequest` 仍承担Entity、turn、cancel和oneshot。插件内按 `DomainRequest -> 具体格式请求 -> vendor handler -> HTTP` 正向转换，SSE响应按vendor与格式逆向归一。`ApiFormat` 与必填执行选择器provider相互独立，model也不决定两者；唯一配置仍为现有 `models.toml`，不新增并行 `config.toml`。本次只更新文档，不创建该源文件、不实现重构。
+共享types的独立inference_request_types模块定义拥有所有权的DomainRequest和DomainRequestConfig；InferenceRequest仍是执行事件。正向为DomainRequest -> 具体格式请求/ApiRequest -> VendorAdapter -> HTTP，响应经对应格式累积器归一。provider与api_type独立且必填，不由URL/model推断；唯一配置仍为models.toml。
 
 **当前已实现的typed snapshot请求：InferenceRequest.tools为Vec<CallableResource>，System消息保留真实Provider role。** 既有单推理入口、准备System、通用异步闭包及独立supervisor/HTTP worker、oneshot与真实cleanup边界保持不变；现消费MCL选定的不可变typed snapshots。全局仍只有一份模型配置；提交前取得全部已注册webui客户端发送器快照，闭包直接推流，后来连接不加入本次推理。
 
@@ -61,20 +61,15 @@ error      共享推理错误契约               校验、执行及协议错误
 InferencePlugin：推理插件，公开结构体
     schedule: String--推理准备及重载计划
     config_path: PathBuf--全局models.toml路径
-    factories: HashMap<String, ErasedProviderAdapterFactory>--协议工厂
     new() -> Self
         构造插件：公开关联函数
-        行为：默认PRE_UPDATE计划、HOME/.margatroid/models.toml，注册openai与deepseek工厂。
+        行为：默认PRE_UPDATE计划、HOME/.margatroid/models.toml。
     with_schedule(mut self, schedule: impl Into<String>) -> Self
         设置计划：公开方法
         行为：保存计划名并返回自身。
     with_config_path(mut self, path: impl Into<PathBuf>) -> Self
         设置配置路径：公开方法
         行为：保存全局路径，不新增工作区配置来源。
-    with_api_type<F>(mut self, api_type: impl Into<String>, factory: F) -> Self
-        注册协议工厂：公开方法
-        约束：F: ProviderAdapterFactory
-        行为：名称为空或重复则拒绝，保存工厂并返回自身。
     impl Default for InferencePlugin
         default() -> Self
             默认构造：公开trait方法
@@ -92,7 +87,6 @@ InferencePlugin：推理插件，公开结构体
 InferenceConfig：推理配置，公开Resource--实现侧配置，不是图书馆组件
     path: PathBuf--唯一模型配置路径
     routes: HashMap<ModelId, ConfiguredModelRoute>--全局路由
-    factories: Arc<HashMap<String, ErasedProviderAdapterFactory>>--重载时使用的工厂
     client: reqwest::Client--共享连接池
     schedule: String--通用异步闭包投递计划
     reload_id: Option<String>--当前全局配置重载关联，私有字段；初始None
@@ -121,17 +115,17 @@ InferenceConfig：推理配置，公开Resource--实现侧配置，不是图书�
     推流不按Workspace隔离；推流关联包含不透明agent_instance字符串及Agent逻辑地址供客户端区分；agent_instance仅为关联值，不能作为协议请求目标或解码为Entity
 ```
 
-## 已批准目标边界（待实现）
+## 已实现配置边界
 
 ```text
 配置编译：
-    当前with_api_type及ProviderAdapterFactory注册方式仅为旧实现基线，不是目标扩展协议
-    目标分别解析ApiFormat与必填provider，model保持独立的远端模型名称
+    不存在with_api_type或ProviderAdapterFactory注册表；分支由枚举与明确矩阵编译
+    分别解析ApiFormat与必填provider，model保持独立的远端模型名称
     在唯一models.toml加载和重载时验证明确支持矩阵及每条路由的选项/能力；未知格式、vendor或组合一律拒绝
     不按base_url猜格式或vendor，不在未知组合上回退到openai或通用HTTP实现
     全部路由与非敏感ModelRuntimeCatalog投影编译成功后原子发布；任一失败同时保留旧配置及旧catalog
     新格式通过具体格式类型/ApiRequest分支及双向编解码扩展；新vendor通过显式handler及矩阵登记扩展
-    类型擦除只在插件内部调度边界使用，不把旧api_type字符串工厂伪装成已完成的目标架构
+    ErasedProviderAdapter用于路由调度；formats/vendors内部定义不作为共享层依赖
 ```
 
 # system
@@ -192,7 +186,7 @@ handle_model_routes_reloaded(world: &mut World, output: InferenceReloadOutput)
     收口配置重载：crate公开函数
     行为：
         核对本次重载关联，重复或迟到结果不替换其他版本
-        对原始String在主线程完整编译并捕获工厂panic，成功在同一主线程收口整体替换routes及ModelRuntimeCatalog，失败保持两者旧值；清除本次重载标记
+        对原始String在主线程完整编译并捕获编译panic，成功在同一主线程收口整体替换routes及ModelRuntimeCatalog，失败保持两者旧值；清除本次重载标记
         发送关联原请求的ReloadModelRoutesResult，已开始推理继续使用自身路由快照
 ```
 
@@ -214,7 +208,7 @@ normalize_messages(messages: Vec<AgentMessage>) -> Result<Vec<ProviderMessage>, 
         inject递归按顺序展开内部AgentMessage数组，限制嵌套深度及展开后的数量和字节数
         System、user、assistant、tool_call按各自真实role转为对应Provider消息；prompt导入保留其真实role，不能一律改为user；error转用户错误文本
         System是完整AgentMessage变体，infer可接收System；history append的独立允许范围不含System，不能用该限制缩窄infer
-        保留全部消息已有resource_id及工具调用ID、assistant reasoning和参数；Provider编码保留角色与调用关联，内部ID不因编码或历史收口丢失
+        该旧ProviderMessage投影仅作预检且被丢弃；原始领域消息（含resource_id及replay）仍拥有所有权地进入DomainRequest，格式层再次验证/编码，内部resource_id不发送给远端API
         历史usage和stop_reason不作为Provider请求内容；cancelled assistant（含Inject内嵌）拒绝进入上下文；未知或无法表达的结构返回错误，不静默丢弃
         检查工具调用与结果的关联及必要字段，空输入及超限拒绝
 
@@ -264,11 +258,11 @@ push_stream(senders: &mut Vec<WebSocketSender>, id: &str, agent_instance: &str, 
         不逐增量写历史，不把未完整的工具参数当作可执行调用
         成功或失败向快照发送器发送agent.message.finished {id,agent,agent_instance,error:null|{kind,message}}；oneshot仍是唯一权威完成结果
 
-load_model_routes(path: &Path, factories: &HashMap<String, ErasedProviderAdapterFactory>) -> Result<HashMap<ModelId, ConfiguredModelRoute>, InferenceError>
+load_model_routes(path: &Path) -> Result<HashMap<ModelId, ConfiguredModelRoute>, InferenceError>
     加载全局模型路由：私有函数
     行为：
         有界读取UTF-8 TOML，要求模型列表非空，model id唯一
-        校验api_type工厂、http/https端点、凭据及Provider选项，禁止将凭据写入日志
+        校验必填Vendor/ApiFormat、七组合矩阵、http/https端点、凭据及厂商选项，禁止将凭据写入日志
         解析context_window的k/m/b/t无符号整数后缀，值必须大于0，缺省沿用1m
         所有条目编译成功才返回新map，部分失败不发布残缺配置
 ```
@@ -295,28 +289,27 @@ load_model_routes(path: &Path, factories: &HashMap<String, ErasedProviderAdapter
     若将来需要压缩，调用同一推理接口，由调用方解释结果
 ```
 
-## 已批准请求及响应主线（待实现）
+## 已实现请求及响应主线
 
 ```text
 准备与编码：
-    保留现有InferenceRequest事件、资源validate_owner、真实role、typed snapshots及监督/cleanup边界
-    主线程收集所选工具的纯ToolDefinition与拥有所有权的AgentMessage，构造唯一DomainRequest
-    DomainRequest包含公共语义参数，不携带Entity、turn、cancel、reply、HTTP/URL/key/provider或执行状态
-    保留完整领域输入；已有resource IDs、工具调用ID、reasoning、参数及工具结果关联不得在中间层静默丢失
-    解析路由后先取得vendor/model能力快照；涉及消息结构的能力差异必须在格式转换前参与验证/编码
-    以TryFrom<DomainRequest>或TryFrom<EncodeInput>调用.try_into()得到具体格式请求，再以ApiRequest调度到对应vendor handler
-    EncodeInput若需要能力，只是插件内编码辅助输入，不是第二套共享请求；不得把路由、HTTP或执行设施塞进DomainRequest
-    无法表达或不支持的语义在vendor process/HTTP前显式失败；不先做有损通用编码再由vendor补救
-    vendor process接收具体格式类型（如OpenAi<ChatCompletionsRequest>），应用厂商参数、鉴权、端点及传输规则
-    Responses首期为普通无状态请求：每次携带完整本地上下文，不依赖远端conversation/previous_response_id等状态
+    先核对turn、资源许可、typed snapshots及参数/大小
+    仍调用normalize_messages(request.messages.clone())预检并丢弃旧ProviderMessage投影
+    用原始AgentMessage、纯ToolDefinition及上游模型/通用参数构造拥有所有权的DomainRequest
+    ProviderAdapter.build_request(DomainRequest)调用ApiFormat.build_request
+    TryFrom<DomainRequest> / .try_into()?得到三个具体格式请求之一，ApiRequest交VendorAdapter.process_request
+    formats再验证并展开Inject；保留真实role和工具ID/结果关联；厂商只处理具体格式请求、选项、鉴权及端点
+    Responses拒绝stop；Messages必须有max_output_tokens；无效或跨格式replay显式失败
+    没有EncodeInput、ApiAdapter或泛型vendor handler，不假称已建立独立model能力快照系统
 
 响应与终态：
-    原始HTTP/SSE -> vendor特有解析/兼容处理 -> 对应格式响应累积/解码 -> 统一InferenceResponse
-    格式层理解ChatCompletions/Messages/Responses各自事件与结束条件，不把所有格式按[DONE]或choice判断
-    vendor层保留厂商reasoning、usage及停止原因差异；格式层保留工具调用ID、name、arguments与结果关联
-    以统一响应构造helper保留reasoning、tool_calls、usage、真实stop_reason，外层与Assistant.stop_reason来自同一权威映射
-    正常完成和用户轮次abort使用同一不变量/helper；abort仍为真实cleanup成功后的正常Cancelled响应，不混同其他取消原因
-    继续拒绝半流、重复/缺失工具ID、非法参数及未知工具；不以清空字段伪造格式兼容
+    Chat Completions观察choice、真实finish_reason及[DONE]
+    Messages观察message_start、完整关闭的内容块、停止原因及message_stop
+    Responses验证output item/content part及真实终态，不依赖[DONE]
+    三种累积器有界处理SSE字节/事件并拒绝残缺、非法或终止后数据
+    保留reasoning、工具ID/name/JSON object参数、usage及真实stop_reason；最终检查工具属于本次可见alias
+    ProviderInferenceResponse.replay随完整Assistant返回，响应helper将同一stop_reason写入内外两处
+    正常用户轮次abort仍只在真实cleanup成功后返回Cancelled，不混同根取消/超时/owner abort
 ```
 
 # events
@@ -330,7 +323,7 @@ InferenceRequest：统一推理请求，公开事件
     agent: Entity--完整Agent实例
     messages: Vec<AgentMessage>--拥有所有权的消息快照
     tools: Vec<CallableResource>--TOOL array选定的可调用资源不可变共享快照，自带resource_id、alias及definition，不是ResourceID array或ToolCall array
-    turn: Option<String>--调用方轮次快照，不作为请求唯一ID；目标在受理时重新校验，None或已中止旧轮次返回正常取消结果
+    turn: Option<String>--调用方轮次快照，不作为请求唯一ID；实际在受理时重新校验，None或已中止旧轮次返回正常取消结果
     cancel: CancellationToken--请求取消令牌；现CancellationToken接口无法检查父子归属，supervisor始终同时监督独立登记活动的scope child，不能绕过Agent停止
     reply: Arc<Mutex<Option<oneshot::Sender<Result<InferenceResponse, InferenceError>>>>>--可Clone请求共享唯一Sender
     impl Event for InferenceRequest
@@ -367,62 +360,49 @@ InferenceReloadOutput：配置重载输出，公开共享内部事件
 
 # types
 
-## 已批准类型与handler目标（待实现）
-
-以下为目标伪代码，不代表现有类型已经替换。下方原有ProviderInput、ProviderMessage、ProviderAdapter等清单仍为当前实现基线。
+## 已实现领域、格式与vendor类型
 
 ```text
-共享types/inference_request_types.rs（纯领域值，不依赖插件）：
-    DomainRequest：唯一共享领域请求
-        messages: Vec<AgentMessage>--拥有完整领域消息快照
-        tools: Vec<ToolDefinition>--已完成归属校验的纯工具定义，不是CallableResource执行材料
-        config: DomainRequestConfig--公共语义配置
-    DomainRequestConfig：纯语义配置，不是插件InferenceConfig Resource
-        model: String--上游模型名称；默认空值在执行前拒绝，不从名称猜vendor或格式
-        temperature: Option<f32>
-        max_output_tokens: Option<u32>
-        top_p: Option<f32>
-        stop: Vec<String>
-    约束：不含HTTP、URL、key、provider、Entity、turn、执行状态、CancellationToken或channel；不平行复制第二套DomainRequest
+共享inference_request_types：
+    DomainRequest { messages: Vec<AgentMessage>, tools: Vec<ToolDefinition>, config: DomainRequestConfig }
+    DomainRequestConfig { model: String, temperature: Option<f32>, max_output_tokens: Option<u32>, top_p: Option<f32>, stop: Vec<String> }
+    Default为空请求，不编造有效模型；不含HTTP/URL/key/provider/Entity/turn/cancel/reply
 
-inference_plugin::types（插件自有格式与vendor层）：
-    ApiFormat：格式枚举
-        ChatCompletions--稳定配置值chat_completions
-        Messages--稳定配置值messages
-        Responses--稳定配置值responses
-    ChatCompletionsRequest / MessagesRequest / ResponsesRequest：各自格式的具体请求结构体
-        说明：表达对应消息、工具和公共参数的格式结构；不是共享领域契约，也不是同一通用JSON壳
-        impl TryFrom<DomainRequest>或TryFrom<EncodeInput> for 对应具体请求
-            type Error = InferenceError
-            行为：使用.try_into()执行可失败转换；验证完整语义及目标能力，不能以From或默认字段掩盖不支持输入
-    ApiRequest：格式请求调度枚举
-        ChatCompletions(ChatCompletionsRequest)
-        Messages(MessagesRequest)
-        Responses(ResponsesRequest)
-    EncodeInput：可选插件内编码输入
-        说明：若结构转换依赖能力，组合DomainRequest与不可变能力快照；不是第二个共享请求或执行事件
-    Vendor：必填provider对应的执行选择枚举
-        OpenAi / Anthropic / DeepSeek / OpenRouter
-        说明：与ApiFormat独立，与model名称独立；不存在隐式默认或仅用作展示的provider
-    ApiAdapter：插件内vendor/format组合分发边界
-        行为：仅构造支持矩阵中的具体handler，不以URL或模型名猜测，不以任意兼容handler兜底
-    OpenAi<TConcreteRequest> / Anthropic<TConcreteRequest> / DeepSeek<TConcreteRequest> / OpenRouter<TConcreteRequest>：具体vendor handler
-        说明：泛型参数为具体格式结构体，如OpenAi<ResponsesRequest>；不能把ApiRequest枚举变体当作Rust类型参数
-        process：接收已完成能力校验的格式请求，处理该vendor的选项、鉴权、端点与HTTP执行
-        响应：配合对应格式解码器逆向归一；不把vendor差异混入共享DomainRequest
+插件formats模块（crate内部）：
+    ApiFormat：ChatCompletions / Messages / Responses；公开由插件根重新导出
+    稳定值：chat_completions / messages / responses
+    ChatCompletionsRequest：model/messages/tools/stream/stream_options/temperature/max_tokens/top_p/stop
+    MessagesRequest：model/system/messages/tools/stream/max_tokens/temperature/top_p/stop_sequences
+    ResponsesRequest：model/input/tools/stream/store/include/temperature/max_output_tokens/top_p
+    三个具体结构均impl TryFrom<DomainRequest, Error=InferenceError>
+    ApiRequest：分别装载三个具体请求的调度枚举；不重复共享领域模型
 
-初始支持矩阵（已批准建议，待实现；只允许下列显式组合）：
+插件vendors模块：
+    Vendor：OpenAi / Anthropic / DeepSeek / OpenRouter；公开由插件根重新导出
+    canonical配置值：openai / anthropic / deepseek / openrouter
+    Vendor.supports(ApiFormat)：明确七组合，不依据URL或model名猜测
     openai      chat_completions / responses
     anthropic   messages
     deepseek    chat_completions / messages / responses
-    openrouter  chat_completions--显式generic-compatible handler，不是未知vendor回退
-    说明：矩阵不是当前运行时能力声明；实现时需分别提供并验证对应编解码及能力限制，不因矩阵条目就假定所有模型支持所有语义
-    加载与重载拒绝未知或未列出组合；vendor/model能力约束可以进一步缩窄输入，不能静默降级
+    openrouter  chat_completions
+    VendorAdapter：私有，保存vendor/format、base_url、api_key及已验证选项
+    process_request(ApiRequest)：序列化具体格式、应用厂商选项和鉴权，生成ProviderHttpRequest
+    build_adapter(Vendor, ApiFormat, ProviderRouteInput) -> Result<ErasedProviderAdapter, InferenceError>
+        加载/重载拒绝矩阵外组合、未知字段及不支持选项，不回退默认vendor
 
-多模态后续概念（未实现，不属于本轮代码改动）：
-    User及工具结果ToolCall内容未来可由纯文本扩展为有类型content blocks，保留文本、图像等来源/媒介语义
-    不能把图像base64当普通文本插入来宣称视觉支持；工具结果同样不得丢失或伪造媒体语义
-    当前目标格式/vendor/model若不支持相应block，使用可失败转换明确拒绝，不静默丢块、不伪装vision能力
+Replay：
+    AgentMessage.Assistant.replay: Option<serde_json::Value>，旧值缺字段默认为None
+    信封为 { api_format: "messages" | "responses", items: [...] }，领域层不解释其API私有结构
+    Messages保留thinking文本/signature与redacted_thinking.data；没有有效签名不伪造历史thinking
+    Responses保留reasoning.id、summary及可用content/encrypted_content
+    格式边界验证标签与items；不匹配、非法或非空reasoning缺少必要replay时在HTTP前拒绝
+    Chat Completions拒绝foreign replay；OpenAI chat还拒绝非空历史reasoning
+    Responses每次完整本地上下文，store=false，include=["reasoning.encrypted_content"]，不使用远端conversation/previous_response_id
+    replay随结果、DTO及显式历史保留，不作为正文或工具调用，不等于显示reasoning
+
+当前多模态边界：
+    User和ToolCall结果content仍为String；未实现图像或有类型媒体content blocks
+    不把base64普通文本视为vision能力
 ```
 
 ## 类型
@@ -430,12 +410,13 @@ inference_plugin::types（插件自有格式与vendor层）：
 公开：
 ```text
 ModelId：模型选择标识，公开值类型
-    value: String--非空、不超过256字符、不含控制字符
+    value: String--非空、不超过256字节、不含控制字符
 
 ConfiguredModelRoute：已编译全局路由，公开纯值类型
     model: String--Provider模型名
     context_window_tokens: u64--上下文窗口信息，不假称可精确估算全部token
     adapter: ErasedProviderAdapter--不可变协议适配器快照，内含端点及凭据；字段crate公开，公开只读accessor
+    runtime_info: ModelRuntimeInfo--安全catalog投影，canonical provider/format、模型、窗口及选项，不含端点、密钥或adapter
 
 InferenceParameters：采样参数，公开纯值类型
     temperature: Option<f32>
@@ -457,34 +438,20 @@ ToolDefinition：模型工具定义，公开共享值类型
     description: String--选定definition的描述
     input_schema: serde_json::Value--选定definition的输入schema
 
-ProviderInput<'a>：协议无关输入借用，公开结构体
-    model: &str
-    parameters: &InferenceParameters
-    messages: &[ProviderMessage]--规范化后的消息借用
-    tools: &[ToolDefinition]
-    说明：ProviderInput带生命周期，主线程编码request后不进入异步任务。
-
 ProviderMessage：协议消息，公开纯值契约
     说明：明确表达System、用户、assistant和工具结果真实角色；不包含Agent路由事件或inject容器，不能把System降格为用户消息。
 
 ProviderRouteInput<'a>：已解析路由输入借用，公开结构体
-    provider: Option<&str>
     base_url: &Url
     api_key: &str--禁止日志输出
     thinking: Option<&str>
     reasoning_effort: Option<&str>
 
-ProviderAdapterFactory：协议工厂，公开trait
-    约束：Send + Sync + 'static
-    build(&self, config: ProviderRouteInput<'_>) -> Result<ErasedProviderAdapter, InferenceError>
-        创建协议适配器：公开trait方法
-        行为：检查端点、凭据和api_type特有选项，返回不可变共享Adapter。
-
 ProviderAdapter：协议适配器，公开trait
     约束：Send + Sync + 'static
-    build_request(&self, input: ProviderInput<'_>) -> Result<ProviderHttpRequest, InferenceError>
+    build_request(&self, input: DomainRequest) -> Result<ProviderHttpRequest, InferenceError>
         编码HTTP请求：公开trait方法
-        行为：将统一消息、schema和参数转换为Provider协议，不访问World。
+        行为：消费拥有所有权的领域请求，经具体格式转换与vendor处理得到HTTP请求，不访问World。
     begin_response(&self, status: StatusCode, headers: &HeaderMap) -> Result<Box<dyn ProviderResponseAccumulator>, InferenceError>
         建立响应累积器：公开trait方法
         行为：检查响应格式，为每次请求创建独立累积器。
@@ -505,6 +472,7 @@ ProviderHttpRequest：已编码请求，公开纯值结构体
     body: Vec<u8>
 
 ProviderInferenceResponse：完整Provider响应，公开纯值结构体
+    replay: Option<serde_json::Value>--格式标签及reasoning replay items
     reasoning: Option<String>
     content: Option<String>
     tool_calls: Vec<ToolCall>
@@ -524,7 +492,6 @@ StopReason：停止原因，公开共享枚举
     Other(String)
 
 ErasedProviderAdapter = Arc<dyn ProviderAdapter>：协议适配器，公开类型别名
-ErasedProviderAdapterFactory = Arc<dyn ProviderAdapterFactory>：协议工厂，公开类型别名
 ```
 
 私有：
@@ -533,7 +500,7 @@ PreparedInference：闭包捕获快照，私有结构体--不是事件
     id: String
     agent_id: ResourceID
     agent_instance: String--主线程format!("{:?}",完整Entity)，与Protocol快照一致，仅作不透明关联；不接受入站解码寻址
-    request: ProviderHttpRequest--主线程已编码请求，不再携带ProviderInput借用
+    request: ProviderHttpRequest--主线程已编码请求，不携带领域消息或World借用
     adapter: ErasedProviderAdapter
     client: reqwest::Client
     tool_names: HashSet<String>--本次可见alias，用于最终工具名称校验
@@ -579,16 +546,16 @@ ReloadGuard：重载回复保障，私有结构体
 ModelRouteConfig：模型配置项，私有结构体
     id: String
     model: String
-    provider: Option<String>
+    provider: Vendor--必填执行厂商
     base_url: String
     api_key: String
-    api_type: String
+    api_type: ApiFormat--必填格式
     thinking: Option<String>
     reasoning_effort: Option<String>
     context_window: Option<String>
 
-OpenAiAdapter与DeepSeekAdapter：协议实现，私有类型
-    说明：复用协议共同结构，但保持DeepSeek特有语义，不按base_url猜测api_type。
+VendorAdapter：七组合共用的私有厂商处理器，按明确Vendor/ApiFormat分支处理，不猜base_url。
+FormatAccumulator：Messages/Responses的严格事件状态机，独立维护块、索引、完成状态及replay。
 
 OpenAiAccumulator：SSE累积器，私有结构体
     buffer: Vec<u8>--跨分片保留，4MiB上限；总流量32MiB
@@ -606,14 +573,20 @@ OpenAiAccumulator：SSE累积器，私有结构体
 ## 逻辑
 
 ```text
-OpenAI协议：
+Chat Completions格式：
     使用chat/completions流式请求，工具name原样为alias，stream_options.include_usage开启
     SSE按完整行处理，支持CRLF、多data行及跨UTF-8分片，未完整的字节保留到下一分片
     正文、reasoning与工具参数按delta累积，工具调用按index合并ID、name和arguments片段
     usage尾部无choices也必须处理，统一input/output与prompt/completion计数及缓存命中字段
     完整结束后检查工具ID唯一、名称存在及参数结构，不生成半条工具调用
 
-DeepSeek协议：
+端点、鉴权与厂商选项：
+    base_url是API前缀，只追加/chat/completions、/messages或/responses；不猜DeepSeek路径
+    如需/anthropic/v1/messages，用户base_url必须包含/anthropic/v1
+    Messages使用x-api-key及anthropic-version，其他格式使用Bearer
+    DeepSeek thinking/reasoning_effort仅允许chat_completions，messages/responses设置任一项即拒绝
+    DeepSeek enabled必须搭配high/max；OpenRouter enabled只允许high并映射reasoning.enabled/effort
+    OpenRouter disabled映射reasoning.enabled=false，不发送DeepSeek字段；OpenAI/Anthropic拒绝两项选项
     thinking显式disabled必须写入请求，不能省略后误用模型默认思考模式
     启用或未明确禁用思考时，assistant回传reasoning_content，缺内容补空串
     显式disabled时仍按工具调用协议处理必要reasoning字段

@@ -48,7 +48,7 @@ fn app(drivers: &Path) -> App {
             margatroid_types::model_components::ModelRuntimeInfo {
                 id: "openrouter/deepseek-v4.1-flash".into(),
                 model: "offline-model".into(),
-                api_type: "deepseek".into(),
+                api_type: "chat_completions".into(),
                 provider: Some("offline".into()),
                 context_window_tokens: 1000000,
                 thinking: Some("enabled".into()),
@@ -200,10 +200,19 @@ fn command(
     text: &str,
     arguments: Vec<serde_json::Value>,
 ) -> MclValue {
+    command_to(app, "agent:local/driver", request, text, arguments)
+}
+fn command_to(
+    app: &mut App,
+    target: &str,
+    request: &str,
+    text: &str,
+    arguments: Vec<serde_json::Value>,
+) -> MclValue {
     app.world().send_event(MclCommand {
         id: request.into(),
         source: id("client:webui/bundled-driver-test:1"),
-        target: id("agent:local/driver"),
+        target: id(target),
         command: MclInstruction {
             text: text.into(),
             arguments,
@@ -229,6 +238,7 @@ fn messages(value: MclValue) -> Vec<AgentMessage> {
 }
 fn assistant(content: &str, tool_calls: Vec<ToolCall>) -> AgentMessage {
     AgentMessage::Assistant {
+        replay: None,
         reasoning: None,
         content: Some(content.into()),
         stop_reason: Some(if tool_calls.is_empty() {
@@ -326,9 +336,16 @@ fn turn_done(app: &mut App, entity: Entity) {
     });
 }
 fn stop(app: &mut App, workspace: Entity, entity: Entity) {
-    let agent = app.world().get_component::<Agent>(entity).unwrap();
-    let scope = agent.execution.clone();
-    let drain = agent.mcl.drained.clone();
+    stop_agents(app, workspace, &[entity]);
+}
+fn stop_agents(app: &mut App, workspace: Entity, entities: &[Entity]) {
+    let handles = entities
+        .iter()
+        .map(|entity| {
+            let agent = app.world().get_component::<Agent>(*entity).unwrap();
+            (agent.execution.clone(), agent.mcl.drained.clone())
+        })
+        .collect::<Vec<_>>();
     let close = app
         .world()
         .get_component::<Workspace>(workspace)
@@ -347,10 +364,12 @@ fn stop(app: &mut App, workspace: Entity, entity: Entity) {
     });
     assert_eq!(result.unwrap(), workspace);
     assert!(!app.world().is_alive(workspace));
-    assert!(!app.world().is_alive(entity));
-    assert!(scope.is_closed());
-    assert_eq!(scope.activity_count(), 0);
-    assert!(drain.is_drained());
+    for (entity, (scope, drain)) in entities.iter().zip(handles) {
+        assert!(!app.world().is_alive(*entity));
+        assert!(scope.is_closed());
+        assert_eq!(scope.activity_count(), 0);
+        assert!(drain.is_drained());
+    }
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -362,7 +381,7 @@ fn stop(app: &mut App, workspace: Entity, entity: Entity) {
                 .unwrap();
         });
 }
-fn exercise_root_restart(drivers: &Path, driver: &str) {
+fn exercise_root_restart(drivers: &Path, driver: &str, soul_name: &str) {
     let temp = tempfile::tempdir().unwrap();
     let mut app = app(drivers);
     let (workspace, entity) = start(&mut app, temp.path(), driver);
@@ -379,7 +398,7 @@ fn exercise_root_restart(drivers: &Path, driver: &str) {
     let compact = messages(command(&mut app, "root-compact", "GET compact", vec![]));
     assert!(!soul.is_empty());
     assert!(!compact.is_empty());
-    for (name, imported) in [("coder-soul", &soul), ("compact", &compact)] {
+    for (name, imported) in [(soul_name, &soul), ("compact", &compact)] {
         let resource = app
             .world()
             .get_component::<ResourceSet<PromptResource>>(entity)
@@ -680,7 +699,245 @@ fn bundled_coder_driver_offline_lifecycle() {
     exercise_root_restart(
         &bundled_resources().join("agent-drivers"),
         "driver:local/coder:latest",
+        "coder-soul",
     );
+}
+
+#[test]
+fn bundled_reviewer_driver_offline_lifecycle() {
+    exercise_root_restart(
+        &bundled_resources().join("agent-drivers"),
+        "driver:local/reviewer:latest",
+        "reviewer-soul",
+    );
+}
+
+#[test]
+fn bundled_coder_and_reviewer_share_workspace_with_isolated_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir_all(root.join("project")).unwrap();
+    let mut app = app(&bundled_resources().join("agent-drivers"));
+    app.world().send_event(StartWorkspace {
+        id: "start-pair".into(),
+        definition: WorkspaceDefinition {
+            id: id("workspace:local/bundled-pair"),
+            name: "bundled-pair".into(),
+            manager: "coder".into(),
+            project_root: root.join("project"),
+            agents: ["coder", "reviewer"]
+                .into_iter()
+                .map(|name| WorkspaceAgentDefinition {
+                    id: id(&format!("agent:local/{name}")),
+                    name: name.into(),
+                    driver: id(&format!("driver:local/{name}:latest")),
+                    home_root: root.join(name).join("home"),
+                    history_path: root.join(name).join("history.sqlite"),
+                })
+                .collect(),
+        },
+    });
+    let workspace = tick_until(&mut app, "paired drivers ready", |world| {
+        world
+            .event_reader::<StartWorkspaceResult>()
+            .into_iter()
+            .find(|event| event.id == "start-pair")
+            .map(|event| event.result.clone())
+    })
+    .unwrap();
+    assert_eq!(app.world().query_with::<Workspace>().result().len(), 1);
+    let members = app
+        .world()
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .iter()
+        .map(|(_, entity)| entity)
+        .collect::<Vec<_>>();
+    assert_eq!(members.len(), 2);
+    let find_agent = |name: &str| {
+        *members
+            .iter()
+            .find(|entity| {
+                app.world()
+                    .get_component::<Agent>(**entity)
+                    .unwrap()
+                    .resourceid
+                    == id(&format!("agent:local/{name}"))
+            })
+            .unwrap()
+    };
+    let coder = find_agent("coder");
+    let reviewer = find_agent("reviewer");
+    let coder_instance = app
+        .world()
+        .get_component::<Agent>(coder)
+        .unwrap()
+        .lua
+        .instance
+        .clone()
+        .unwrap();
+    let reviewer_instance = app
+        .world()
+        .get_component::<Agent>(reviewer)
+        .unwrap()
+        .lua
+        .instance
+        .clone()
+        .unwrap();
+    assert_ne!(coder_instance, reviewer_instance);
+    assert_eq!(coder_instance.owner, coder);
+    assert_eq!(reviewer_instance.owner, reviewer);
+    for (name, entity, sandbox, expected_tools) in [
+        (
+            "coder",
+            coder,
+            "workspace-write",
+            vec![
+                "review",
+                "list_dir",
+                "read_file",
+                "write_file",
+                "edit",
+                "grep",
+                "glob",
+                "bash",
+            ],
+        ),
+        (
+            "reviewer",
+            reviewer,
+            "read-only",
+            vec!["review", "project_context", "list_dir"],
+        ),
+    ] {
+        let agent = app.world().get_component::<Agent>(entity).unwrap();
+        assert!(matches!(agent.state, AgentState::Idle));
+        assert!(agent.lua.ready.is_none());
+        assert_eq!(agent.workspace, id("workspace:local/bundled-pair"));
+        let selected = agent.sandbox.as_ref().unwrap().clone();
+        assert_eq!(
+            selected.resource_id,
+            id(&format!("sandbox:local/{sandbox}:latest"))
+        );
+        let policy: serde_json::Value = serde_json::from_str(&selected.policy).unwrap();
+        if name == "reviewer" {
+            assert_eq!(
+                policy["filesystem"]["denyWrite"],
+                serde_json::json!(["/**"])
+            );
+            assert!(policy["filesystem"]["allowWrite"].is_null());
+        } else {
+            assert!(policy["filesystem"]["allowWrite"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(".")));
+            assert!(policy["filesystem"]["denyWrite"].is_null());
+        }
+        let target = format!("agent:local/{name}");
+        let MclValue::Array(BlockInner::Tool(tools)) = command_to(
+            &mut app,
+            &target,
+            &format!("{name}-visible"),
+            "GET session.visible",
+            vec![],
+        ) else {
+            panic!("{name} must have typed visible tools")
+        };
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.alias.as_str())
+                .collect::<Vec<_>>(),
+            expected_tools
+        );
+        for tool in &tools {
+            let resource_name = match tool.alias.as_str() {
+                "review" => "code-review",
+                "project_context" => "project-context",
+                "list_dir" => "list-directory",
+                "read_file" => "read-file",
+                "write_file" => "write-file",
+                alias => alias,
+            };
+            assert_eq!(
+                tool.resource_id,
+                id(&format!("tool:local/{resource_name}:latest"))
+            );
+        }
+        let MclValue::Array(BlockInner::Sandbox(sandboxes)) = command_to(
+            &mut app,
+            &target,
+            &format!("{name}-sandbox"),
+            "GET session.sandbox_activated",
+            vec![],
+        ) else {
+            panic!("{name} must have a typed active sandbox")
+        };
+        assert_eq!(sandboxes, vec![selected]);
+        assert!(messages(command_to(
+            &mut app,
+            &target,
+            &format!("{name}-empty-context"),
+            "GET session.conversation",
+            vec![],
+        ))
+        .is_empty());
+        command_to(
+            &mut app,
+            &target,
+            &format!("{name}-inject"),
+            "INJECT ? TO entry.pending",
+            vec![serde_json::json!([{"type":"user", "content":format!("private {name} request")}])],
+        );
+        command_to(
+            &mut app,
+            &target,
+            &format!("{name}-wake"),
+            "EMIT EFFECT wake",
+            vec![],
+        );
+        let request = inference(&mut app, entity);
+        assert_eq!(request.tools, tools);
+        respond(
+            &request,
+            assistant(&format!("private {name} answer"), vec![]),
+            StopReason::Completed,
+        );
+        turn_done(&mut app, entity);
+    }
+    let mut histories = Vec::new();
+    for (name, entity) in [("coder", coder), ("reviewer", reviewer)] {
+        let expected = vec![
+            AgentMessage::User {
+                content: format!("private {name} request"),
+            },
+            assistant(&format!("private {name} answer"), vec![]),
+        ];
+        assert_eq!(
+            messages(command_to(
+                &mut app,
+                &format!("agent:local/{name}"),
+                &format!("{name}-context"),
+                "GET session.conversation",
+                vec![],
+            )),
+            expected
+        );
+        assert_eq!(history_messages(&app, entity), expected);
+        let agent = app.world().get_component::<Agent>(entity).unwrap();
+        assert!(matches!(agent.state, AgentState::Idle));
+        histories.push((name, agent.history.list().unwrap()));
+    }
+    stop_agents(&mut app, workspace, &[coder, reviewer]);
+    assert!(app.world().query_with::<Agent>().result().is_empty());
+    for (name, expected) in histories {
+        let database = root.join(name).join("history.sqlite");
+        assert!(database.is_file());
+        assert_eq!(
+            SqliteAgentDatabase::open(database).unwrap().list().unwrap(),
+            expected
+        );
+    }
 }
 
 #[test]

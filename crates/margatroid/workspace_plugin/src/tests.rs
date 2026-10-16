@@ -323,7 +323,7 @@ async fn startup_waits_for_shared_driver_and_all_members_with_exact_correlation(
 }
 
 #[tokio::test]
-async fn falsely_successful_driver_result_fails_start_without_destroying_workspace() {
+async fn falsely_successful_driver_result_records_member_failure_without_failing_workspace() {
     let mut app = app();
     let entity = start(&mut app, 1);
     app.world_mut().advance_event_frame();
@@ -343,10 +343,22 @@ async fn falsely_successful_driver_result_fails_start_without_destroying_workspa
             result: Ok(()),
         },
     );
-    assert!(
-        matches!(app.world().get_component::<Workspace>(entity).unwrap().state(), WorkspaceState::Failed { error } if error.kind() == WorkspaceErrorKind::ResourceResolutionFailed)
+    assert!(matches!(
+        app.world()
+            .get_component::<Workspace>(entity)
+            .unwrap()
+            .state(),
+        WorkspaceState::Running
+    ));
+    assert!(app.world().workspace_stop("stop", entity).is_ok());
+    assert_eq!(
+        app.world()
+            .get_component::<Workspace>(entity)
+            .unwrap()
+            .member_failures()
+            .len(),
+        1
     );
-    assert!(app.world().workspace_stop("stop", entity).is_err());
     cleanup(&app, entity).await;
 }
 
@@ -517,5 +529,342 @@ async fn failed_member_stop_preserves_workspace_and_member() {
         1
     );
     assert!(app.world().is_alive(agent));
+    cleanup(&app, entity).await;
+}
+
+#[tokio::test]
+async fn shared_missing_driver_fans_out_failures_and_all_failed_workspace_can_restart() {
+    use margatroid_types::agent_driver_events::DriverLoadError;
+    let mut app = app();
+    let entity = start(&mut app, 2);
+    app.world_mut().advance_event_frame();
+    let load = app
+        .world()
+        .event_reader::<LoadAgentDriver>()
+        .into_iter()
+        .next()
+        .unwrap()
+        .clone();
+    handler::handle_agent_driver_result(
+        app.world_mut(),
+        LoadAgentDriverResult {
+            id: load.id,
+            target: entity,
+            resource_id: load.resource_id.clone(),
+            result: Err(DriverLoadError::new("missing driver source")),
+        },
+    );
+    let workspace = app.world().get_component::<Workspace>(entity).unwrap();
+    assert!(matches!(workspace.state(), WorkspaceState::Running));
+    assert_eq!(workspace.member_failures().len(), 2);
+    assert!(workspace
+        .member_failures()
+        .values()
+        .all(|failure| failure.driver == load.resource_id
+            && failure.error.message().contains("missing driver source")));
+    assert!(app
+        .world()
+        .workspace_submit(entity, Box::new(|| Box::pin(async {})))
+        .is_ok());
+    app.world_mut().advance_event_frame();
+    let failures = app.world().event_reader::<WorkspaceMemberStartFailed>();
+    assert_eq!(failures.len(), 2);
+    assert!(failures
+        .into_iter()
+        .all(|failure| failure.workspace == entity
+            && failure.workspace_id == id("workspace:local/test")));
+    assert_eq!(
+        app.world()
+            .event_reader::<StartWorkspaceResult>()
+            .into_iter()
+            .next()
+            .unwrap()
+            .result,
+        Ok(entity)
+    );
+    handler::handle_stop_workspace(
+        app.world_mut(),
+        StopWorkspace {
+            id: "stop".into(),
+            workspace: entity,
+        },
+    );
+    cleanup(&app, entity).await;
+    handler::handle_workspace_execution_closed(
+        app.world_mut(),
+        WorkspaceExecutionCloseOutput {
+            workspace: entity,
+            request_id: "stop".into(),
+            result: Ok(()),
+        },
+    );
+    assert!(!app.world().is_alive(entity));
+    let restarted = start(&mut app, 0);
+    assert_ne!(restarted, entity);
+    assert!(app
+        .world()
+        .get_component::<Workspace>(restarted)
+        .unwrap()
+        .member_failures()
+        .is_empty());
+    cleanup(&app, restarted).await;
+}
+
+#[tokio::test]
+async fn member_failure_does_not_block_healthy_member_or_dynamic_stop() {
+    let mut app = app();
+    let entity = start(&mut app, 2);
+    app.world_mut().advance_event_frame();
+    let load = app
+        .world()
+        .event_reader::<LoadAgentDriver>()
+        .into_iter()
+        .next()
+        .unwrap()
+        .clone();
+    install_driver(&mut app, entity);
+    handler::handle_agent_driver_result(
+        app.world_mut(),
+        LoadAgentDriverResult {
+            id: load.id,
+            target: entity,
+            resource_id: load.resource_id,
+            result: Ok(()),
+        },
+    );
+    app.world_mut().advance_event_frame();
+    let starts: Vec<_> = app
+        .world()
+        .event_reader::<StartAgent>()
+        .into_iter()
+        .cloned()
+        .collect();
+    let healthy = app.world_mut().spawn();
+    handler::handle_start_agent_result(
+        app.world_mut(),
+        StartAgentResult {
+            id: starts[0].id.clone(),
+            result: Ok(healthy),
+        },
+    );
+    handler::handle_start_agent_result(
+        app.world_mut(),
+        StartAgentResult {
+            id: starts[1].id.clone(),
+            result: Err(AgentError::new(
+                AgentErrorKind::CleanupFailed,
+                "member startup detail",
+            )),
+        },
+    );
+    let workspace = app.world().get_component::<Workspace>(entity).unwrap();
+    assert!(matches!(workspace.state(), WorkspaceState::Running));
+    assert_eq!(workspace.iter().count(), 1);
+    assert_eq!(workspace.member_failures().len(), 1);
+    app.world_mut()
+        .workspace_accept_agent_start(
+            entity,
+            StartAgent {
+                id: "dynamic-fail".into(),
+                resource_id: id("agent:local/dynamic-fail"),
+                workspace: entity,
+                driver: id("driver:local/dynamic"),
+                definition: AgentStartDefinition {
+                    project_root: "/project".into(),
+                    home_root: "/home".into(),
+                    history_path: "/history".into(),
+                },
+            },
+        )
+        .unwrap();
+    handler::handle_stop_workspace(
+        app.world_mut(),
+        StopWorkspace {
+            id: "stop".into(),
+            workspace: entity,
+        },
+    );
+    handler::handle_start_agent_result(
+        app.world_mut(),
+        StartAgentResult {
+            id: "dynamic-fail".into(),
+            result: Err(AgentError::new(
+                AgentErrorKind::CleanupFailed,
+                "dynamic creation rejected",
+            )),
+        },
+    );
+    let workspace = app.world().get_component::<Workspace>(entity).unwrap();
+    assert_eq!(workspace.member_failures().len(), 2);
+    assert!(
+        matches!(workspace.state(), WorkspaceState::Stopping(state) if state.error.is_none() && state.pending_creations.is_empty())
+    );
+    app.world_mut().advance_event_frame();
+    let stop = app
+        .world()
+        .event_reader::<StopAgent>()
+        .into_iter()
+        .next()
+        .unwrap()
+        .clone();
+    handler::handle_stop_agent_result(
+        app.world_mut(),
+        StopAgentResult {
+            id: stop.id,
+            result: Ok(healthy),
+        },
+    );
+    cleanup(&app, entity).await;
+    handler::handle_workspace_execution_closed(
+        app.world_mut(),
+        WorkspaceExecutionCloseOutput {
+            workspace: entity,
+            request_id: "stop".into(),
+            result: Ok(()),
+        },
+    );
+    assert!(!app.world().is_alive(entity));
+}
+
+#[tokio::test]
+async fn healthy_and_missing_driver_finish_running_with_full_failure_context() {
+    use margatroid_types::agent_driver_events::DriverLoadError;
+    let mut app = app();
+    let mut definition = definition(2);
+    definition.agents[1].driver = id("driver:local/missing");
+    handler::handle_start_workspace(
+        app.world_mut(),
+        StartWorkspace {
+            id: "mixed".into(),
+            definition,
+        },
+    );
+    let entity = app.world().workspace_list()[0];
+    app.world_mut().advance_event_frame();
+    let loads: Vec<_> = app
+        .world()
+        .event_reader::<LoadAgentDriver>()
+        .into_iter()
+        .cloned()
+        .collect();
+    install_driver(&mut app, entity);
+    for load in loads {
+        let result = if load.resource_id == id("driver:local/missing") {
+            Err(DriverLoadError::new(
+                "missing manifest: /drivers/missing/driver.toml",
+            ))
+        } else {
+            Ok(())
+        };
+        handler::handle_agent_driver_result(
+            app.world_mut(),
+            LoadAgentDriverResult {
+                id: load.id,
+                target: entity,
+                resource_id: load.resource_id,
+                result,
+            },
+        );
+    }
+    assert!(matches!(
+        app.world()
+            .get_component::<Workspace>(entity)
+            .unwrap()
+            .state(),
+        WorkspaceState::Starting(_)
+    ));
+    app.world_mut().advance_event_frame();
+    let request = app
+        .world()
+        .event_reader::<StartAgent>()
+        .into_iter()
+        .next()
+        .unwrap()
+        .clone();
+    let healthy = app.world_mut().spawn();
+    handler::handle_start_agent_result(
+        app.world_mut(),
+        StartAgentResult {
+            id: request.id,
+            result: Ok(healthy),
+        },
+    );
+    let workspace = app.world().get_component::<Workspace>(entity).unwrap();
+    assert!(matches!(workspace.state(), WorkspaceState::Running));
+    assert_eq!(workspace.iter().count(), 1);
+    let failure = &workspace.member_failures()[&id("agent:local/a1")];
+    assert_eq!(failure.driver, id("driver:local/missing"));
+    assert!(failure
+        .error
+        .message()
+        .contains("/drivers/missing/driver.toml"));
+    assert!(app
+        .world()
+        .workspace_submit(entity, Box::new(|| Box::pin(async {})))
+        .is_ok());
+    cleanup(&app, entity).await;
+}
+
+#[tokio::test]
+async fn precreation_and_duplicate_errors_are_distinct_and_do_not_replace_instances() {
+    let mut app = app();
+    let mut invalid = definition(0);
+    invalid.project_root = "".into();
+    handler::handle_start_workspace(
+        app.world_mut(),
+        StartWorkspace {
+            id: "invalid".into(),
+            definition: invalid.clone(),
+        },
+    );
+    assert!(app.world().workspace_list().is_empty());
+    assert!(id("workspace:local/test")
+        .find_entities(app.world())
+        .unwrap()
+        .is_empty());
+    let entity = start(&mut app, 0);
+    handler::handle_start_workspace(
+        app.world_mut(),
+        StartWorkspace {
+            id: "duplicate".into(),
+            definition: definition(0),
+        },
+    );
+    app.world_mut().advance_event_frame();
+    let results: Vec<_> = app
+        .world()
+        .event_reader::<StartWorkspaceResult>()
+        .into_iter()
+        .cloned()
+        .collect();
+    let invalid = results
+        .iter()
+        .find(|result| result.id == "invalid")
+        .unwrap()
+        .result
+        .as_ref()
+        .unwrap_err();
+    let duplicate = results
+        .iter()
+        .find(|result| result.id == "duplicate")
+        .unwrap()
+        .result
+        .as_ref()
+        .unwrap_err();
+    assert_eq!(invalid.kind(), WorkspaceErrorKind::InvalidDefinition);
+    assert_eq!(duplicate.kind(), WorkspaceErrorKind::DuplicateWorkspace);
+    for context in [
+        "workspace:local/test:latest",
+        "state=Running",
+        "members=0",
+        "member_failures=0",
+    ] {
+        assert!(
+            duplicate.message().contains(context),
+            "{}",
+            duplicate.message()
+        );
+    }
+    assert_eq!(app.world().workspace_list(), vec![entity]);
     cleanup(&app, entity).await;
 }

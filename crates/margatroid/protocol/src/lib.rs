@@ -299,6 +299,8 @@ pub enum AgentMessageDto {
         content: String,
     },
     Assistant {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay: Option<serde_json::Value>,
         reasoning: Option<String>,
         content: Option<String>,
         #[serde(default)]
@@ -340,12 +342,14 @@ impl AgentMessageDto {
             Self::System { content } => AgentMessage::System { content },
             Self::User { content } => AgentMessage::User { content },
             Self::Assistant {
+                replay,
                 reasoning,
                 content,
                 tool_calls,
                 usage,
                 stop_reason,
             } => AgentMessage::Assistant {
+                replay,
                 reasoning,
                 content,
                 tool_calls,
@@ -400,12 +404,14 @@ impl FromDomain<&AgentMessage> for AgentMessageDto {
                 content: content.clone(),
             },
             AgentMessage::Assistant {
+                replay,
                 reasoning,
                 content,
                 tool_calls,
                 usage,
                 stop_reason,
             } => Self::Assistant {
+                replay: replay.clone(),
                 reasoning: reasoning.clone(),
                 content: content.clone(),
                 tool_calls: tool_calls.clone(),
@@ -780,6 +786,14 @@ pub struct WorkspaceInfoDto {
     pub project_root: String,
     pub manager: ResourceIdDto,
     pub agents: Vec<ResourceIdDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_failures: Vec<WorkspaceMemberFailureDto>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceMemberFailureDto {
+    pub agent: ResourceIdDto,
+    pub driver: ResourceIdDto,
+    pub error: String,
 }
 impl WorkspaceInfoDto {
     pub fn reference(&self) -> WorkspaceReferenceDto {
@@ -808,18 +822,28 @@ impl FromDomain<&WorkspaceDefinition> for WorkspaceInfoDto {
                 .iter()
                 .map(|agent| (&agent.id).into_dto(()))
                 .collect::<Result<_, _>>()?,
+            member_failures: Vec::new(),
         })
     }
 }
 impl FromDomain<Entity, &World> for WorkspaceInfoDto {
     fn from_domain(entity: Entity, world: &World) -> Result<Self, ProtocolError> {
-        world
-            .get_component::<Workspace>(entity)
-            .ok_or_else(|| {
-                ProtocolError::new(ProtocolErrorKind::WorkspaceNotFound, "workspace missing")
-            })?
-            .definition()
-            .into_dto(())
+        let workspace = world.get_component::<Workspace>(entity).ok_or_else(|| {
+            ProtocolError::new(ProtocolErrorKind::WorkspaceNotFound, "workspace missing")
+        })?;
+        let mut dto: Self = workspace.definition().into_dto(())?;
+        dto.member_failures = workspace
+            .member_failures()
+            .iter()
+            .map(|(agent, failure)| {
+                Ok(WorkspaceMemberFailureDto {
+                    agent: agent.into_dto(())?,
+                    driver: (&failure.driver).into_dto(())?,
+                    error: failure.error.to_string(),
+                })
+            })
+            .collect::<Result<_, ProtocolError>>()?;
+        Ok(dto)
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1012,19 +1036,33 @@ pub fn resolve_agent(
             .id
             .clone(),
     };
-    let entity = world
-        .agent_by_id(&id)
-        .map_err(|e| ProtocolError::new(ProtocolErrorKind::AgentNotFound, e.to_string()))?;
+    let unavailable = || {
+        let role = if requested.is_none() {
+            "manager"
+        } else {
+            "agent"
+        };
+        let detail = component
+            .member_failures()
+            .get(&id)
+            .map(|failure| format!("; driver {}: {}", failure.driver, failure.error))
+            .unwrap_or_default();
+        ProtocolError::new(
+            ProtocolErrorKind::AgentNotFound,
+            format!(
+                "{role} unavailable: {id} in workspace {}{detail}",
+                component.definition().id
+            ),
+        )
+    };
+    let entity = world.agent_by_id(&id).map_err(|_| unavailable())?;
     let agent = world.get_component::<Agent>(entity).unwrap();
     if agent.workspace != component.definition().id
         || !component
             .iter()
             .any(|(member, current)| member == &id && current == entity)
     {
-        return Err(ProtocolError::new(
-            ProtocolErrorKind::AgentNotFound,
-            "agent is not a current workspace member",
-        ));
+        return Err(unavailable());
     }
     Ok((entity, id))
 }
