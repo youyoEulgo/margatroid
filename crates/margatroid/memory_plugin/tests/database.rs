@@ -435,6 +435,7 @@ fn concurrent_multi_get_keeps_one_snapshot_even_across_connections() {
                 &wc,
                 selector("b", "messages"),
                 StoredBlockInner::Message(vec![AgentMessage::User {
+                    images: Vec::new(),
                     content: n.to_string(),
                 }]),
             );

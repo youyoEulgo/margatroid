@@ -408,7 +408,10 @@ fn exercise_root_restart(drivers: &Path, driver: &str, soul_name: &str) {
         let content = resource.content.to_string();
         let expected = match resource.role.as_str() {
             "system" => AgentMessage::System { content },
-            "user" => AgentMessage::User { content },
+            "user" => AgentMessage::User {
+                content,
+                images: Vec::new(),
+            },
             "assistant" => assistant(&content, vec![]),
             role => panic!("unexpected prompt role {role}"),
         };
@@ -480,6 +483,7 @@ fn exercise_root_restart(drivers: &Path, driver: &str, soul_name: &str) {
     assert!(first.turn.is_some());
     assert_eq!(first.tools, *tools);
     let user = AgentMessage::User {
+        images: Vec::new(),
         content: "offline persistent user".into(),
     };
     assert_eq!(first.messages, [soul.clone(), vec![user.clone()]].concat());
@@ -674,6 +678,7 @@ fn exercise_root_restart(drivers: &Path, driver: &str, soul_name: &str) {
     let restarted = inference(&mut app, entity);
     assert_eq!(restarted.tools, *tools);
     let new_user = AgentMessage::User {
+        images: Vec::new(),
         content: "offline after restart".into(),
     };
     assert_eq!(
@@ -909,6 +914,7 @@ fn bundled_coder_and_reviewer_share_workspace_with_isolated_state() {
     for (name, entity) in [("coder", coder), ("reviewer", reviewer)] {
         let expected = vec![
             AgentMessage::User {
+                images: Vec::new(),
                 content: format!("private {name} request"),
             },
             assistant(&format!("private {name} answer"), vec![]),
@@ -972,11 +978,20 @@ fn bundled_driver_abort_keeps_history_out_of_context_and_accepts_next_turn() {
         .unwrap()
         .turn
         .is_none());
+    let partial = AgentMessage::Assistant {
+        reasoning: Some("Partial thought before cancellation".into()),
+        replay: None,
+        content: Some("Partial answer before cancellation".into()),
+        tool_calls: vec![],
+        usage: None,
+        stop_reason: Some(StopReason::Cancelled),
+    };
     if let Some(reply) = request.reply.lock().unwrap().take() {
         reply
-            .send(Ok(
-                margatroid_types::message_types::InferenceResponse::aborted(),
-            ))
+            .send(Ok(InferenceResponse {
+                message: partial.clone(),
+                stop_reason: StopReason::Cancelled,
+            }))
             .unwrap();
     }
     turn_done(&mut app, entity);
@@ -985,7 +1000,7 @@ fn bundled_driver_abort_keeps_history_out_of_context_and_accepts_next_turn() {
         AgentState::Idle
     ));
     let history = history_messages(&app, entity);
-    assert!(history.iter().any(|message| matches!(message, AgentMessage::Assistant {stop_reason: Some(StopReason::Cancelled),content:Some(content),..} if content=="Turn aborted.")));
+    assert!(history.contains(&partial));
     let context = messages(command(
         &mut app,
         "abort-context",
@@ -1002,7 +1017,72 @@ fn bundled_driver_abort_keeps_history_out_of_context_and_accepts_next_turn() {
     inject(&mut app, "after-abort", "new turn");
     let next = inference(&mut app, entity);
     assert_ne!(next.turn, request.turn);
+    assert!(!next.messages.contains(&partial));
     respond(&next, assistant("recovered", vec![]), StopReason::Completed);
+    turn_done(&mut app, entity);
+    stop(&mut app, workspace, entity);
+}
+
+#[test]
+fn bundled_driver_preserves_user_images_through_lua_history_and_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let drivers = bundled_resources().join("agent-drivers");
+    let mut app = app(&drivers);
+    let (workspace, entity) = start(&mut app, temp.path(), "driver:local/coder:latest");
+    let user: AgentMessage = serde_json::from_value(serde_json::json!({
+        "type":"user", "content":"Inspect this pixel",
+        "images":[{"media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6X8AAAAASUVORK5CYII="}]
+    })).unwrap();
+    command(
+        &mut app,
+        "image-inject",
+        "INJECT ? TO entry.pending",
+        vec![serde_json::json!([user.clone()])],
+    );
+    command(&mut app, "image-wake", "EMIT EFFECT wake", vec![]);
+    let first = inference(&mut app, entity);
+    assert!(first.messages.contains(&user));
+    respond(
+        &first,
+        assistant("Pixel received", vec![]),
+        StopReason::Completed,
+    );
+    turn_done(&mut app, entity);
+    assert_eq!(history_messages(&app, entity)[0], user);
+    let records = app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .history
+        .list()
+        .unwrap();
+    let record = records
+        .iter()
+        .find(|record| record.kind == "message")
+        .unwrap();
+    assert_eq!(record.content, "Inspect this pixel");
+    assert_eq!(record.payload["images"][0]["media_type"], "image/png");
+    assert!(!record.content.contains("iVBOR"));
+    stop(&mut app, workspace, entity);
+    let (workspace, entity) = start(&mut app, temp.path(), "driver:local/coder:latest");
+    assert_eq!(history_messages(&app, entity)[0], user);
+    assert_eq!(
+        messages(command(
+            &mut app,
+            "image-restored",
+            "GET session.conversation",
+            vec![]
+        ))[0],
+        user
+    );
+    inject(&mut app, "image-next-turn", "Still remember the image?");
+    let next = inference(&mut app, entity);
+    assert!(next.messages.contains(&user));
+    respond(
+        &next,
+        assistant("History retained", vec![]),
+        StopReason::Completed,
+    );
     turn_done(&mut app, entity);
     stop(&mut app, workspace, entity);
 }

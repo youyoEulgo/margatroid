@@ -11,7 +11,7 @@ use margatroid_types::agent_components::{
 };
 use margatroid_types::block_storage::AgentDatabaseHandle;
 use margatroid_types::execution_components::AgentExecutionScope;
-use margatroid_types::message_types::{AgentMessage, InferenceResponse, StopReason};
+use margatroid_types::message_types::{AgentMessage, InferenceResponse, StopReason, UserImage};
 use margatroid_types::model_components::ModelRuntimeCatalog;
 use margatroid_types::resource_components::{
     AgentDriverModelConfig, CallableDefinitionSnapshot, CallableResource, ToolResource,
@@ -289,8 +289,120 @@ fn input() -> Vec<AgentMessage> {
         },
         AgentMessage::User {
             content: "hello".into(),
+            images: vec![],
         },
     ]
+}
+
+fn images() -> Vec<UserImage> {
+    vec![
+        UserImage {
+            media_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+        },
+        UserImage {
+            media_type: "image/gif".into(),
+            data: "R0lGODlh".into(),
+        },
+        UserImage {
+            media_type: "image/jpeg".into(),
+            data: "/9j/".into(),
+        },
+        UserImage {
+            media_type: "image/webp".into(),
+            data: "UklGRgAAAABXRUJQ".into(),
+        },
+    ]
+}
+
+fn assert_image_parts(value: &Value, format: &str, text: bool) {
+    let parts = value.as_array().unwrap();
+    assert_eq!(parts.len(), images().len() + usize::from(text));
+    let offset = usize::from(text);
+    if text {
+        assert_eq!(parts[0]["text"], "hello");
+        assert_eq!(
+            parts[0]["type"],
+            if format == "responses" {
+                "input_text"
+            } else {
+                "text"
+            }
+        );
+    }
+    for (part, image) in parts[offset..].iter().zip(images()) {
+        let url = format!("data:{};base64,{}", image.media_type, image.data);
+        match format {
+            "messages" => assert_eq!(
+                part,
+                &json!({"type":"image","source":{"type":"base64","media_type":image.media_type,"data":image.data}})
+            ),
+            "responses" => assert_eq!(part, &json!({"type":"input_image","image_url":url})),
+            _ => assert_eq!(part, &json!({"type":"image_url","image_url":{"url":url}})),
+        }
+    }
+}
+
+#[test]
+fn invalid_images_rejected_before_http_without_data_leaks() {
+    for (vendor, format) in [
+        ("openai", "chat_completions"),
+        ("openai", "responses"),
+        ("anthropic", "messages"),
+        ("deepseek", "chat_completions"),
+        ("deepseek", "messages"),
+        ("deepseek", "responses"),
+        ("openrouter", "chat_completions"),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let mut fixture = Fixture::new(&route(&url, vendor, format));
+        for image in [
+            UserImage {
+                media_type: "image/png".into(),
+                data: "PRIVATE-INVALID-BASE64".into(),
+            },
+            UserImage {
+                media_type: "image/jpeg".into(),
+                data: "iVBORw0KGgo=".into(),
+            },
+        ] {
+            let data = image.data.clone();
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            fixture.app.world().send_event(InferenceRequest {
+                id: "invalid-image".into(),
+                agent: fixture.agent,
+                messages: vec![AgentMessage::Inject {
+                    messages: vec![AgentMessage::User {
+                        content: String::new(),
+                        images: vec![image],
+                    }],
+                }],
+                tools: vec![],
+                turn: Some("http-turn".into()),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                reply: Arc::new(Mutex::new(Some(tx))),
+            });
+            fixture.app.tick();
+            let error = rx.try_recv().unwrap().unwrap_err();
+            assert_eq!(error.kind, InferenceErrorKind::InvalidMessages);
+            assert!(!error.to_string().contains(&data));
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+            assert_eq!(
+                fixture
+                    .app
+                    .world()
+                    .get_component::<Agent>(fixture.agent)
+                    .unwrap()
+                    .execution
+                    .activity_count(),
+                0
+            );
+        }
+    }
 }
 
 fn assert_assistant(response: &InferenceResponse, expected: StopReason) {
@@ -323,10 +435,43 @@ fn every_supported_vendor_format_dispatches_real_http() {
             "responses" => responses_stream(false),
             _ => "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
         };
-        let (url, server) = mock(vec![stream]);
+        let (url, server) = mock(vec![stream.clone(), stream]);
         let mut fixture = Fixture::new(&route(&url, vendor, format));
-        assert_assistant(&fixture.infer(input(), vec![]), StopReason::Completed);
+        let mut history = input();
+        history[1] = AgentMessage::User {
+            content: "hello".into(),
+            images: images(),
+        };
+        let first = fixture.infer(history.clone(), vec![]);
+        assert_assistant(&first, StopReason::Completed);
+        history.push(first.message);
+        history.push(AgentMessage::User {
+            content: String::new(),
+            images: images(),
+        });
+        assert_assistant(&fixture.infer(history, vec![]), StopReason::Completed);
         let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            let (key, index) = if format == "responses" {
+                ("input", 1)
+            } else if format == "messages" {
+                ("messages", 0)
+            } else {
+                ("messages", 1)
+            };
+            assert_image_parts(&request.body[key][index]["content"], format, true);
+        }
+        let key = if format == "responses" {
+            "input"
+        } else {
+            "messages"
+        };
+        assert_image_parts(
+            &requests[1].body[key].as_array().unwrap().last().unwrap()["content"],
+            format,
+            false,
+        );
         let request = &requests[0];
         assert_eq!(request.path, format!("/v1/{suffix}"), "{vendor}/{format}");
         assert_eq!(request.headers["content-type"], "application/json");
@@ -384,6 +529,7 @@ fn anthropic_signed_messages_replay_through_public_inference() {
     history.push(first.message);
     history.push(AgentMessage::User {
         content: "continue".into(),
+        images: vec![],
     });
     assert_assistant(&fixture.infer(history, vec![]), StopReason::Completed);
     let requests = server.join().unwrap();

@@ -877,6 +877,7 @@ async fn database_handle_persists_blocks_across_agent_restart() {
     };
     let values =
         StoredBlockInner::Message(vec![margatroid_types::message_types::AgentMessage::User {
+            images: Vec::new(),
             content: "persisted".into(),
         }]);
     storage

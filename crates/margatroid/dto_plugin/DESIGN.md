@@ -57,7 +57,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 - 入口受检解析 Workspace 与当前成员的完整实例，实际处理再次核对 turn_id；旧/不匹配轮次不得取消新轮次。对同一已中止轮次（含 Working 且 turn=None）重复请求幂等成功，仅保留必要已中止关联，不恢复全局 pending 表；未识别轮次报关联错误。
 - 状态为 `creating/idle/working/stopping`。中止立即清空 turn，真实清理期间保持 Working，正常 finish 收口才 Idle；状态同步同时发布 turn 与 status。前端据 status 显示运行态、据 turn 关联中止，不能把回执或 turn=None 当作 Idle。
 - AgentPlugin 将 abort_agent_turn_system 固定安装到 RuntimePlugin::PRE_UPDATE，先于 UPDATE 中的 MCL 实际执行及 inference/tool admission。共享事件允许各消费者独立观察，不靠 take reply 独占中止通知；执行前再次核对请求轮次，turn=None 或已中止旧轮次不启动推理/工具而返回正常取消结果。
-- Assistant 新增 stop_reason，覆盖全部推理原因，新增 `StopReason::Cancelled` 序列化 `cancelled`。兼容保留 `InferenceResponse.stop_reason`，单一权威映射生成，两处始终相同。用户轮次中止且真实清理成功返回 Ok assistant：`content="Turn aborted."`、`reasoning=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Cancelled`。
+- Assistant 新增 stop_reason，覆盖全部推理原因，新增 `StopReason::Cancelled` 序列化 `cancelled`。兼容保留 `InferenceResponse.stop_reason`，单一权威映射生成，两处始终相同。用户轮次中止且真实清理成功返回 Ok assistant：保留已接受的部分 `content` 与 `reasoning`（二者皆空则保持空值，不填充取消文案），`replay=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Cancelled`。
 - 取消工具且清理成功返回 Ok ToolCall：`failed=true`、`content="Tool call aborted."`，保留调用 ID、名称及已知 resource_id。批次保留已完成真实结果，其余每个调用（包括未启动项）各有一个原序结果；不虚构部分执行成功，不撤销已发生副作用。
 - `CleanupFailed` 仍为 Err，保留活动，不伪造取消或 Idle。用户轮次中止不同于根 Agent shutdown、owner abort、timeout、receiver closed，不统一转换这些原因。
 - 历史只经显式 history_append 保存；Assistant stop_reason 存入 payload 元数据而非 content。cancelled assistant 可入历史，不得进入 infer 上下文（包括 Inject 嵌套）。
@@ -137,13 +137,14 @@ crate公开：
 handle_inbound_message(world: &mut World, connection_id: WebSocketConnectionId, message: WebSocketMessage)
     处理入站消息：crate公开函数
     行为：
-        要求消息为Text
-        反序列化统一{type,id,message}信封为ClientMessage
-        注册检查：connection.register以外的请求要求连接已注册，未注册时写warn日志并丢弃
+        要求消息为Text；DTO入口总字节上限32 MiB与WebSocket一致，不再以旧1 MiB限制静默丢弃图片请求
+        超出上限记录不含载荷的长度诊断并发送1009关闭，客户端立即失败而非等待MCL超时
+        有界反序列化统一{type,id,message}信封为ClientMessage；结构错误但存在非空有界id时返回关联request.failed，无可用id时发送1007关闭，禁止只丢弃
+        注册检查：connection.register以外的请求要求连接已注册，未注册时返回关联request.failed，不延后受理
         按type调用对应DTO::into_domain并发送领域事件
         MCL命令先用mcl_source算出客户端来源标识并随转换上下文传入
         MCL命令转换成功后把响应接收器写入PendingMclCommandResponses
-        转换失败时写warn日志并丢弃当前请求
+        路由或转换失败时返回关联request.failed；诊断不包含原始图片数据
 
 注册检查的边界：只看处理该请求这一帧的状态——连接此时已注册就服务，否则丢弃；不做延后、不重试。
             回执在Client实体创建之后发出，等待回执再发后续请求的客户端必然满足该条件；

@@ -210,6 +210,12 @@ impl VendorAdapter {
                 "provider request could not be encoded",
             )
         })?;
+        if body.len() > MAX_REQUEST_BYTES {
+            return Err(InferenceError::new(
+                InferenceErrorKind::InvalidMessages,
+                "encoded provider request exceeds 32 MiB",
+            ));
+        }
         Ok(ProviderHttpRequest::new(Method::POST, url, headers, body))
     }
 }
@@ -250,6 +256,7 @@ mod tests {
         DomainRequest {
             messages: vec![AgentMessage::User {
                 content: "hello".into(),
+                images: vec![],
             }],
             tools: vec![],
             config: DomainRequestConfig {
@@ -258,6 +265,46 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn final_serialized_request_counts_base64_and_envelope_overhead() {
+        let base = Url::parse("http://127.0.0.1:1/v1").unwrap();
+        let adapter = build_adapter(
+            Vendor::OpenAi,
+            ApiFormat::ChatCompletions,
+            ProviderRouteInput {
+                base_url: &base,
+                api_key: "test",
+                thinking: None,
+                reasoning_effort: None,
+            },
+        )
+        .unwrap();
+        let image = margatroid_types::message_types::UserImage {
+            media_type: "image/png".into(),
+            data: format!(
+                "iVBORw0KGgoA{}",
+                "AAAA".repeat((4 * 1024 * 1024 + 512 * 1024 - 9) / 3)
+            ),
+        };
+        let mut input = request();
+        input.messages = vec![AgentMessage::User {
+            content: String::new(),
+            images: vec![image; 4],
+        }];
+        let small = adapter.build_request(input.clone()).unwrap();
+        let remaining = MAX_REQUEST_BYTES - small.body.len();
+        input
+            .tools
+            .push(margatroid_types::message_types::ToolDefinition {
+                name: "echo".into(),
+                description: "a".repeat(remaining),
+                input_schema: serde_json::json!({"type":"object"}),
+            });
+        let error = adapter.build_request(input).err().unwrap();
+        assert_eq!(error.kind, InferenceErrorKind::InvalidMessages);
+        assert!(!error.to_string().contains("iVBORw0KGgoA"));
     }
 
     #[test]

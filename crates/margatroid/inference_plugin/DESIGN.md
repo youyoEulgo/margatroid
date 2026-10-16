@@ -38,7 +38,7 @@ types      src/types.rs及共享纯值契约       Provider协议与配置辅助
 error      共享推理错误契约               校验、执行及协议错误
 ```
 
-**状态：格式/vendor分层重构已实现。本文六板块描述当前源码：共享DomainRequest、三个具体格式转换及严格SSE累积、必填Vendor与七组合矩阵；当前内容仅纯文本，多模态未实现。**
+**状态：格式/vendor分层重构已实现。本文六板块描述当前源码：共享DomainRequest、三个具体格式转换及严格SSE累积、必填Vendor与七组合矩阵；用户图像采用共享UserImage值及三种原生格式转换。**
 
 共享types的独立inference_request_types模块定义拥有所有权的DomainRequest和DomainRequestConfig；InferenceRequest仍是执行事件。正向为DomainRequest -> 具体格式请求/ApiRequest -> VendorAdapter -> HTTP，响应经对应格式累积器归一。provider与api_type独立且必填，不由URL/model推断；唯一配置仍为models.toml。
 
@@ -245,7 +245,8 @@ supervise_inference(prepared: PreparedInference, guard: TaskGuard, owner_cancel:
         向原快照发送器有界发送agent.message.finished；owner取消可中断终态发送并释放其future
         HTTP worker join且终态future释放后才mark_completed，再take私有Sender发送一次Result
         mark_completed失败标cleanup_failed并回复Err CleanupFailed；不关闭Sender冒充真实cleanup，不返回cancelled或宣称Idle
-        仅用户轮次中止在worker join及真实cleanup成功后返回Ok InferenceResponse；assistant content="Turn aborted."、reasoning=None、tool_calls=[]、usage=None、stop_reason=Cancelled，外层stop_reason同值
+        仅用户轮次中止在worker abort并join及真实cleanup成功后返回Ok InferenceResponse；从共享部分快照构造assistant正文与reasoning，tool_calls=[]、replay=None、usage=None、stop_reason=Cancelled，外层stop_reason同值；两种文本皆空时content=None、reasoning=None，保持空assistant，不填充提示正文
+        worker将整批已接受ProviderStreamDelta同步写入共享快照后才await websocket推送，快照锁不跨await；join之后才读取取消快照，迟到HTTP字节不能继续追加；无需vendor abort API
         不将根Agent shutdown、owner abort、timeout或receiver closed一律归一为该正常中止；保留原因分类，已完成真实结果不改写为伪造部分成功
 
 push_stream(senders: &mut Vec<WebSocketSender>, id: &str, agent_instance: &str, agent_id: &ResourceID, sequence: u64, delta: ProviderStreamDelta)
@@ -401,8 +402,12 @@ Replay：
     replay随结果、DTO及显式历史保留，不作为正文或工具调用，不等于显示reasoning
 
 当前多模态边界：
-    User和ToolCall结果content仍为String；未实现图像或有类型媒体content blocks
-    不把base64普通文本视为vision能力
+    User { content: String, images: Vec<UserImage> }，空images默认并省略；仅用户图像
+    handler及format normalize调用共享validate_user_images：png/jpeg/gif/webp、8张/消息、5MiB/图、20MiB解码/消息，magic/MIME一致
+    非空文本在前，图像保持顺序在后；纯图像省略空文本，纯文本保持既有请求体
+    Chat image_url与Responses input_image使用data URL；Messages image.source使用type=base64/media_type/data
+    API七组合形状支持不保证模型视觉能力，不声明DeepSeek模型支持视觉
+    保留4MiB单消息文本及16MiB总文本上限，另限含base64的消息上下文及最终HTTP请求体32MiB；不调整响应/SSE上限
 ```
 
 ## 类型
@@ -527,8 +532,9 @@ ReloadGuard：重载回复保障，私有结构体
 
 安全上限：编译期常量及执行函数固定值，不存在InferenceLimits结构体
     config_bytes: 1MiB--File.take(limit+1)有界读取
-    message_bytes: 4MiB--单条序列化消息及单项响应文本/工具参数
-    messages_bytes: 16MiB--展开消息总序列化字节
+    message_bytes: 4MiB--单条去图像序列化消息及单项响应文本/工具参数
+    messages_bytes: 16MiB--展开消息去图像总序列化字节
+    request_bytes: 32MiB--含base64的展开消息及最终HTTP请求体
     messages_count: 4096
     inject_depth: 32
     tool_count: 256--输入工具数及响应tool index

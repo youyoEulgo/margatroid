@@ -386,7 +386,8 @@ fn typed_prompt_import_faithfully_preserves_system_user_and_assistant_roles() {
                     content: "prompt body".into()
                 },
                 "user" => AgentMessage::User {
-                    content: "prompt body".into()
+                    images: Vec::new(),
+                    content: "prompt body".into(),
                 },
                 _ => AgentMessage::Assistant {
                     replay: None,

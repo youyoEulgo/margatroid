@@ -13,7 +13,7 @@ MCL已实现Idle/Working轮次effect、准备完成后的当前turn门、正常�
 - abort为独立控制事件，先于MCL继续及推理/工具受理，不入FIFO。Working立即清turn但保持Working至Driver收尾；Working且turn=None重复abort幂等pending。协议目标`agent.turn.abort`要求非空turn_id，关联`agent.turn.abort_result`的Ok仅证明受理，不证明清理完成。前端及服务端用户消息受理均只允许Idle，Working只允许abort。
 - `inference/tool_call`必须在异步审计/参数准备之后的实际effect动作处检查turn；无turn不提交执行，返回Ok正常形状取消结果。不新增`get_turn`，Driver不检查turn。
 - 五种情况（abort前Working且turn存在）为：inference未受理/已受理、tool_call未受理/已受理、Driver间隙。未受理outstanding请求claim一次性reply一次且禁止迟到执行；已受理取消token并等待真实清理；Driver间隙由下一effect的实际动作turn门覆盖。
-- Assistant消息自身携带`stop_reason=Cancelled`，序列化为`cancelled`，正文`Turn aborted.`、空tool_calls、usage=None；保持正常Inference外层形状。工具取消结果保持原调用ID、顺序及身份关联，`failed=true`，正文`Tool call aborted.`。stop_reason贯穿消息、Block、历史及投影。
+- Assistant消息自身携带`stop_reason=Cancelled`，序列化为`cancelled`，保留已有正文和思考，无输出保持空值、空tool_calls、usage=None；保持正常Inference外层形状。工具取消结果保持原调用ID、顺序及身份关联，`failed=true`，正文`Tool call aborted.`。stop_reason贯穿消息、Block、历史及投影。
 - Driver读取第一条entry并移除同一第一条，显式历史保留原值，各分支自行更新上下文。Inject只递归展开容器并追加非容器上下文，跳过包括嵌套的取消Assistant，不执行子消息控制分支。User追加上下文/start_turn/推理；取消Assistant仅历史，正常Assistant入上下文，无tool_calls是唯一finish_turn路径，否则发工具批次；全部工具结果入上下文，批次完成即使turn=None仍推理，取得取消Assistant完成收尾。
 - Error不得直接finish_turn；真实失败不得伪造cancelled Assistant。清理失败保持Err、Working及未清理活动，不虚假转Idle。轮次abort不改变Creating/Stopping、StopAgent根取消、MCL回执drained及真实清理的原语义。
 

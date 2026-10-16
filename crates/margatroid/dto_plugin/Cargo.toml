@@ -16,3 +16,8 @@ server_plugin = { path = "../../mecs/server_plugin" }
 tracing = { workspace = true }
 tokio = { workspace = true }
 resource_id_plugin = { path = "../resource_id_plugin" }
+
+[dev-dependencies]
+client_plugin = { path = "../client_plugin" }
+futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }

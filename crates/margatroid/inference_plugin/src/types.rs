@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::error::{InferenceError, InferenceErrorKind};
 pub use margatroid_types::message_types::StopReason;
-use margatroid_types::message_types::{TokenUsage, ToolCall};
+use margatroid_types::message_types::{TokenUsage, ToolCall, UserImage};
 
 #[derive(Clone, Debug)]
 pub enum ProviderMessage {
@@ -12,6 +12,7 @@ pub enum ProviderMessage {
     },
     User {
         content: String,
+        images: Vec<UserImage>,
     },
     Assistant {
         reasoning: Option<String>,
@@ -35,6 +36,7 @@ pub(crate) mod vendors;
 use margatroid_types::inference_request_types::DomainRequest;
 pub use vendors::Vendor;
 
+pub(crate) const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_MESSAGES_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;

@@ -324,3 +324,55 @@ fn native_axum_routes_remain_available() {
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.ends_with("ok"), "{response}");
 }
+
+#[test]
+fn websocket_accepts_image_sized_single_frame_with_explicit_bounds() {
+    let mut app = app();
+    app.add_websocket_event_route("/images").add_system(
+        RuntimePlugin::UPDATE,
+        |world: &mut World| {
+            let connections = world.get_resource::<WebSocketConnections>().unwrap();
+            for event in world.event_reader::<WebSocketMessageReceived>() {
+                if let AxumMessage::Text(text) = &event.message {
+                    assert_eq!(text.len(), 17 * 1024 * 1024);
+                    connections
+                        .get(event.connection_id)
+                        .unwrap()
+                        .try_send(AxumMessage::Text("accepted".into()))
+                        .unwrap();
+                }
+            }
+        },
+    );
+    let address = start(&mut app);
+    let client = thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                use tokio_tungstenite::tungstenite::Message;
+                let (mut socket, _) =
+                    tokio_tungstenite::connect_async(format!("ws://{address}/images"))
+                        .await
+                        .unwrap();
+                socket
+                    .send(Message::Text("A".repeat(17 * 1024 * 1024).into()))
+                    .await
+                    .unwrap();
+                let reply = socket.next().await.unwrap().unwrap();
+                assert_eq!(reply, Message::Text("accepted".into()));
+                let _ = socket.close(None).await;
+            });
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !client.is_finished() {
+        app.tick();
+        assert!(
+            Instant::now() < deadline,
+            "image-sized WebSocket frame timed out"
+        );
+        thread::yield_now();
+    }
+    client.join().unwrap();
+}

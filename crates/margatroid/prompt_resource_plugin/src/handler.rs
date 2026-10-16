@@ -221,6 +221,7 @@ pub(crate) fn handle_mount_prompt_resource(world: &mut World, output: PromptReso
                             content: resource.content.to_string(),
                         },
                         "user" => margatroid_types::message_types::AgentMessage::User {
+                            images: Vec::new(),
                             content: resource.content.to_string(),
                         },
                         "assistant" => margatroid_types::message_types::AgentMessage::Assistant {

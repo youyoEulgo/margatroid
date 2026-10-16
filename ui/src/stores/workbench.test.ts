@@ -16,6 +16,7 @@ import {
   type BackendState,
 } from '../types/protocol';
 import { formatRecordTime } from '../lib/time';
+import { imageMediaType, validateImageBudget, metadataText, wireImages, importImage } from '../lib/images';
 
 test('history time renders real timestamps and never formats unknown time as epoch', () => {
   for (const timestamp of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 9e20])
@@ -385,7 +386,7 @@ test('current typed GET restores resource controls and composer uses array argum
     const commands = sent.filter((request) => request.type === 'mcl.command');
     assert.deepEqual(commands.at(-2)?.message, {
       workspace: { id: workspace.id, name: workspace.name, project_root: workspace.project_root },
-      agent: null,
+      agent: workspace.manager,
       command: 'INJECT ? TO entry.pending[-1]',
       arguments: [[{ type: 'user', content: 'hello' }]],
     });
@@ -589,12 +590,20 @@ test('cancelled assistant history preserves split metadata without content infer
   };
   const entries = historyEntries(history);
   assert.equal(entries[0]?.role, 'assistant');
-  assert.equal(entries[0]?.content, 'Turn aborted.');
-  assert.equal(entries[0]?.aborted, true);
+  assert.equal(entries[0]?.content, 'other text');
   assert.equal(entries[0]?.failed, false);
   assert.equal(entries[0]?.timestamp, 123);
-  assert.equal(entries[1]?.aborted, false);
   assert.deepEqual(entries[0]?.payload, history.messages[0]?.payload);
+  const reasoningOnly: AgentHistory = { ...history, messages: [{
+    ...history.messages[0]!, content: '', payload: { type: 'assistant', reasoning: 'Partial reasoning', content: null, tool_calls: [], stop_reason: 'cancelled' },
+  }] };
+  const reasoningEntry = historyEntries(reasoningOnly)[0]!;
+  assert.equal(reasoningEntry.thinking, 'Partial reasoning');
+  assert.equal(reasoningEntry.content, '');
+  assert.equal('aborted' in reasoningEntry, false);
+  const empty = historyEntries({ ...reasoningOnly, messages: [{ ...reasoningOnly.messages[0]!, payload: { type: 'assistant', reasoning: null, content: null, tool_calls: [], stop_reason: 'cancelled' } }] })[0]!;
+  assert.equal(empty.content, '');
+  assert.equal(empty.thinking, '');
 });
 
 test('abort uses independent API and ignores mismatched correlation', async () => {
@@ -626,11 +635,29 @@ test('abort uses independent API and ignores mismatched correlation', async () =
       id: 'r',
       client: { resource_id: 'client:test', client_type: 'webui', name: 'test' },
     });
+    const delta = {
+      type: 'agent.message.delta' as const,
+      id: 'aborted-inference',
+      agent: workspace.manager,
+      agent_instance: state.agents[0]!.agent_instance,
+      sequence: 1,
+      content: 'partial',
+    };
+    store.handleServerMessage(delta);
+    store.handleServerMessage({ ...delta, type: 'agent.message.reasoning_delta', sequence: 2, content: 'thought' });
     const promise = store.abortTurn();
     const request = sent.find((item) => item.type === 'agent.turn.abort')!;
     assert.equal(request.message.turn_id, 'turn-1');
     assert.equal(store.abortPending, true);
     await assert.rejects(store.abortTurn(), /No abortable/);
+    // Click-time suppression, before even a mismatched acknowledgement arrives.
+    store.handleServerMessage({ ...delta, sequence: 3, content: ' pre-ack output' });
+    store.handleServerMessage({ ...delta, type: 'agent.message.reasoning_delta', sequence: 4, content: ' pre-ack thought' });
+    store.handleServerMessage({ ...delta, id: 'unseen-old', sequence: 1, content: 'unseen output' });
+    store.handleServerMessage({ ...delta, id: 'unseen-reasoning', type: 'agent.message.reasoning_delta', sequence: 1, content: 'unseen thought' });
+    assert.equal(store.visibleMessages.length, 1);
+    assert.equal(store.visibleMessages[0]?.content, 'partial');
+    assert.equal(store.visibleMessages[0]?.thinking, 'thought');
     store.handleServerMessage({
       type: 'agent.turn.abort_result',
       id: request.id,
@@ -649,6 +676,10 @@ test('abort uses independent API and ignores mismatched correlation', async () =
       result: { Ok: null },
     });
     await promise;
+    store.handleServerMessage({ ...delta, sequence: 3, content: ' late output' });
+    store.handleServerMessage({ ...delta, type: 'agent.message.reasoning_delta', sequence: 4, content: ' late thought' });
+    assert.equal(store.visibleMessages[0]?.content, 'partial');
+    assert.equal(store.visibleMessages[0]?.thinking, 'thought');
     assert.equal(store.selectedAgentIdle, false);
     assert.equal(store.abortPending, true);
     store.handleServerMessage({
@@ -659,8 +690,236 @@ test('abort uses independent API and ignores mismatched correlation', async () =
     store.handleServerMessage({ type: 'state.sync', state });
     assert.equal(store.abortPending, false);
     assert.equal(store.selectedAgentIdle, true);
+    store.handleServerMessage({
+      type: 'state.sync',
+      state: { ...state, agents: [{ ...state.agents[0]!, status: 'working', turn: 'turn-2' }] },
+    });
+    store.handleServerMessage({ ...delta, sequence: 5, content: ' stale next turn' });
+    store.handleServerMessage({ ...delta, id: 'unseen-old', sequence: 2, content: ' stale unseen' });
+    store.handleServerMessage({ ...delta, id: 'unseen-reasoning', type: 'agent.message.reasoning_delta', sequence: 2, content: ' stale unseen thought' });
+    assert.equal(store.visibleMessages[0]?.content, 'partial');
+    store.handleServerMessage({ ...delta, id: 'new-inference', sequence: 1, content: 'new output' });
+    assert.equal(store.visibleMessages[1]?.content, 'new output');
+    // Suppression does not consume the real terminal event or authoritative history.
+    store.handleServerMessage({
+      type: 'agent.message.finished', id: delta.id, agent: delta.agent,
+      agent_instance: delta.agent_instance, error: null,
+    });
+    store.handleServerMessage({
+      type: 'history.result', id: 'history',
+      history: { workspace, agent: workspace.manager, messages: [{
+        key: 'persisted-partial', sequence: 1, turn: 'turn-1', kind: 'message',
+        content: 'partial', created_at_ms: 0,
+        payload: { type: 'assistant', content: 'partial', reasoning: 'thought', tool_calls: [], usage: null, stop_reason: 'cancelled' },
+      }] },
+    });
+    assert.equal(store.visibleMessages[0]?.content, 'partial');
+    assert.equal('aborted' in store.visibleMessages[0]!, false);
+    assert.equal(store.visibleMessages[1]?.content, 'new output');
+    store.handleServerMessage({ ...delta, sequence: 6, content: ' resurrected' });
+    assert.equal(store.visibleMessages.length, 2);
   } finally {
     store.disconnect();
     globalThis.WebSocket = oldSocket;
   }
+});
+
+
+test('image contract strips UI names and reconstructs backend image-only history', () => {
+  const image = { media_type: 'image/png', data: 'iVBORw0KGgo=', name: 'private.png', size: 8 };
+  const images = wireImages([image]);
+  assert.deepEqual(images, [{ media_type: 'image/png', data: 'iVBORw0KGgo=' }]);
+  assert.deepEqual(contextInjection('', 'entry.pending[-1]', [image]).arguments,
+    [[{ type: 'user', content: '', images }]]);
+  const entries = historyEntries({ workspace, agent: workspace.manager, messages: [{
+    key: 'image', sequence: 1, turn: null, kind: 'message', content: '', created_at_ms: 1,
+    payload: { type: 'user', images },
+  }] });
+  assert.equal(entries[0]?.role, 'user');
+  assert.equal(entries[0]?.content, '');
+  assert.deepEqual(entries[0]?.images, images);
+  assert.ok(!metadataText({ messages: [{ images }] }).includes(image.data));
+  assert.equal(isAgentMessage({ type: 'user', content: '', images: [{ media_type: 'image/svg+xml', data: 'abcd' }] }), false);
+});
+
+test('image budgets and magic reject unsupported and oversized imports', async () => {
+  const mib = 1024 * 1024;
+  validateImageBudget(Array(8).fill(2 * mib));
+  validateImageBudget(Array(4).fill(5 * mib));
+  assert.throws(() => validateImageBudget(Array(9).fill(1)), /8 images/);
+  assert.throws(() => validateImageBudget([5 * mib + 1]), /5 MiB/);
+  assert.throws(() => validateImageBudget(Array(5).fill(5 * mib)), /20 MiB/);
+  assert.equal(imageMediaType(new Uint8Array([137,80,78,71,13,10,26,10])), 'image/png');
+  assert.equal(imageMediaType(new Uint8Array([255,216,255])), 'image/jpeg');
+  assert.equal(imageMediaType(new TextEncoder().encode('GIF89a')), 'image/gif');
+  assert.equal(imageMediaType(new TextEncoder().encode('RIFFxxxxWEBP')), 'image/webp');
+  assert.equal(imageMediaType(new TextEncoder().encode('<svg />')), null);
+  await assert.rejects(importImage(new File(['<svg />'], 'fake.png', { type: 'image/png' })), /Invalid image/);
+  await assert.rejects(importImage(new File(['text'], 'a.svg', { type: 'image/svg+xml' })), /Use PNG/);
+});
+
+test('image-only send uses MCL and route switching prevents late wake even after switching back', async () => {
+  setActivePinia(createPinia());
+  const store = useWorkbenchStore();
+  const oldSocket = globalThis.WebSocket;
+  const sent: Array<{ type: string; id: string; message: { command: string; agent: string; arguments: unknown[][] } }> = [];
+  class Socket {
+    static OPEN = 1;
+    readyState = 1;
+    close() {}
+    send(raw: string) {
+      const request = JSON.parse(raw) as typeof sent[number];
+      sent.push(request);
+      if (request.message.command?.startsWith('GET ')) queueMicrotask(() => reply(request.id));
+    }
+  }
+  function reply(id: string) {
+    store.handleServerMessage({ type: 'mcl.command_result', id, source: 'client:test', target: workspace.manager, result: { Ok: 'Unit' }, history_error: null });
+  }
+  globalThis.WebSocket = Socket as unknown as typeof WebSocket;
+  try {
+    store.handleServerMessage({ type: 'state.sync', state });
+    store.connect();
+    store.handleServerMessage({ type: 'connection.registered', id: 'r', client: { resource_id: 'client:test', name: 'test', client_type: 'webui' } });
+    const image = { media_type: 'image/png', data: 'iVBORw0KGgo=' };
+    const sending = store.sendMessage('', [image]);
+    const injected = sent.find((request) => request.message.command?.startsWith('INJECT'))!;
+    assert.equal(injected.message.agent, workspace.manager);
+    assert.deepEqual(injected.message.arguments, [[{ type: 'user', content: '', images: [image] }]]);
+    assert.equal(store.visibleMessages.length, 0);
+    store.selectAgent('agent:other');
+    store.selectAgent(null);
+    reply(injected.id);
+    await assert.rejects(sending, /changed/);
+    assert.ok(!sent.some((request) => request.message.command === 'EMIT EFFECT wake'));
+  } finally { store.disconnect(); globalThis.WebSocket = oldSocket; }
+});
+
+
+test('multi-MiB serialized images wait for parsed acknowledgements and recover after rejection', async () => {
+  const oldSocket = globalThis.WebSocket;
+  // Transport-size fixture, not a browser decode fixture: exceeds the former 1 MiB daemon cutoff.
+  const image = { media_type: 'image/png', data: 'A'.repeat(2 * 1024 * 1024) };
+  try {
+    for (const failure of [false, true]) {
+      setActivePinia(createPinia());
+      const store = useWorkbenchStore();
+      const sent: Array<{ type: string; id: string; message: { command?: string; arguments?: unknown[][] } }> = [];
+      const sockets: Socket[] = [];
+      class Socket {
+        static OPEN = 1;
+        readyState = 1;
+        onmessage: ((event: { data: string }) => void) | null = null;
+        constructor() { sockets.push(this); }
+        close() {}
+        send(raw: string) {
+          const request = JSON.parse(raw) as typeof sent[number];
+          sent.push(request);
+          if (request.message.command?.startsWith('GET ')) queueMicrotask(() => acknowledge(request.id));
+        }
+      }
+      function receive(event: unknown) { sockets.at(-1)?.onmessage?.({ data: JSON.stringify(event) }); }
+      function acknowledge(id: string) {
+        receive({ type: 'mcl.command_result', id, source: 'client:test', target: workspace.manager,
+          result: { Ok: 'Unit' }, history_error: null });
+      }
+      globalThis.WebSocket = Socket as unknown as typeof WebSocket;
+      try {
+        store.handleServerMessage({ type: 'state.sync', state });
+        store.connect();
+        receive({ type: 'connection.registered', id: 'r', client: { resource_id: 'client:test', name: 'test', client_type: 'webui' } });
+        const stages: string[] = [];
+        const sending = store.sendMessage('', [image], (stage) => stages.push(stage));
+        const injected = sent.find((request) => request.message.command?.startsWith('INJECT'))!;
+        assert.deepEqual(injected.message.arguments, [[{ type: 'user', content: '', images: [image] }]]);
+        assert.ok(JSON.stringify(injected).length > 1024 * 1024);
+        assert.deepEqual(stages, ['injecting']);
+        assert.ok(!sent.some((request) => request.message.command === 'EMIT EFFECT wake'));
+        if (failure) {
+          receive({ type: 'request.failed', id: injected.id, error: { kind: 'MessageTooLarge', message: 'Message exceeds transport budget' } });
+          await assert.rejects(sending, /transport budget/);
+          assert.ok(!sent.some((request) => request.message.command === 'EMIT EFFECT wake'));
+          assert.match(store.lastFailures.get(`${workspace.id}:${workspace.manager}`)!.message, /transport budget/);
+          const retry = store.sendMessage('retry');
+          acknowledge(sent.filter((request) => request.message.command?.startsWith('INJECT')).at(-1)!.id);
+          await Promise.resolve();
+          acknowledge(sent.find((request) => request.message.command === 'EMIT EFFECT wake')!.id);
+          await retry;
+        } else {
+          acknowledge(injected.id);
+          await Promise.resolve();
+          assert.deepEqual(stages, ['injecting', 'waking']);
+          acknowledge(sent.find((request) => request.message.command === 'EMIT EFFECT wake')!.id);
+          await sending;
+          receive({ type: 'history.result', id: 'h', history: { workspace, agent: workspace.manager, messages: [{
+            key: 'image', sequence: 1, turn: null, kind: 'message', content: '', created_at_ms: 1,
+            payload: { type: 'user', images: [image] },
+          }] } });
+          assert.equal(store.visibleMessages[0]?.images?.[0]?.data.length, image.data.length);
+        }
+        const diagnostics = JSON.stringify(store.logs.filter((entry) => entry.target === 'ui.send'));
+        assert.ok(!diagnostics.includes(image.data));
+        assert.ok(diagnostics.includes('acknowledgement'));
+      } finally { store.disconnect(); }
+    }
+  } finally { globalThis.WebSocket = oldSocket; }
+});
+
+
+test('correlated abort rejection releases only the still-current turn suppression', async () => {
+  const oldSocket = globalThis.WebSocket;
+  const sent: Array<{ type: string; id: string }> = [];
+  class Socket {
+    static OPEN = 1;
+    readyState = 1;
+    onopen = null;
+    onclose = null;
+    onmessage = null;
+    onerror = null;
+    close() {}
+    send(raw: string) { sent.push(JSON.parse(raw)); }
+  }
+  globalThis.WebSocket = Socket as unknown as typeof WebSocket;
+  for (const outcome of ['same-turn', 'new-turn', 'request-failed'] as const) {
+    setActivePinia(createPinia());
+    const store = useWorkbenchStore();
+    try {
+      const sync = (turn: string) => store.handleServerMessage({ type: 'state.sync',
+        state: { ...state, agents: [{ ...state.agents[0]!, status: 'working', turn }] } });
+      sync('turn-1');
+      store.connect();
+      store.handleServerMessage({ type: 'connection.registered', id: 'r',
+        client: { resource_id: 'client:test', client_type: 'webui', name: 'test' } });
+      const delta = { type: 'agent.message.delta' as const, id: 'known', agent: workspace.manager,
+        agent_instance: state.agents[0]!.agent_instance, sequence: 1, content: 'partial' };
+      store.handleServerMessage(delta);
+      const promise = store.abortTurn();
+      const rejection = assert.rejects(promise, /denied/);
+      const request = sent.filter((event) => event.type === 'agent.turn.abort').at(-1)!;
+      store.handleServerMessage({ ...delta, id: 'unseen', content: 'hidden' });
+      assert.equal(store.visibleMessages.length, 1);
+      if (outcome === 'new-turn') sync('turn-2');
+      if (outcome === 'request-failed') {
+        store.handleServerMessage({ type: 'request.failed', id: request.id, error: { kind: 'abort_rejected', message: 'denied' } });
+      } else {
+        store.handleServerMessage({ type: 'agent.turn.abort_result', id: request.id, workspace,
+          agent: workspace.manager, turn_id: 'turn-1', result: { Err: { kind: 'abort_rejected', message: 'denied' } } });
+      }
+      await rejection;
+      assert.equal(store.abortPending, false);
+      assert.equal(store.selectedAgentIdle, false);
+      store.handleServerMessage({ ...delta, sequence: 2, content: ' resumed' });
+      store.handleServerMessage({ ...delta, id: 'unseen', sequence: 2, content: 'resumed unseen' });
+      if (outcome === 'new-turn') {
+        assert.equal(store.visibleMessages.length, 1);
+        assert.equal(store.visibleMessages[0]?.content, 'partial');
+        store.handleServerMessage({ ...delta, id: 'fresh', content: 'new output' });
+        assert.equal(store.visibleMessages[1]?.content, 'new output');
+      } else {
+        assert.equal(store.visibleMessages[0]?.content, 'partial resumed');
+        assert.equal(store.visibleMessages[1]?.content, 'resumed unseen');
+      }
+    } finally { store.disconnect(); }
+  }
+  globalThis.WebSocket = oldSocket;
 });

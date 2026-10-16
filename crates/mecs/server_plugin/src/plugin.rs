@@ -366,6 +366,8 @@ async fn handle_websocket_upgrade(
             .fetch_add(1, Ordering::Relaxed),
     );
     upgrade
+        .max_frame_size(32 * 1024 * 1024)
+        .max_message_size(32 * 1024 * 1024)
         .on_upgrade(move |socket| run_websocket_connection(state, connection_id, socket))
         .into_response()
 }

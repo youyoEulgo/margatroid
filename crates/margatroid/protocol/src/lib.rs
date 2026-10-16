@@ -5,7 +5,7 @@ use margatroid_types::{
     block_types::BlockInner,
     history_components::HistoryRecord,
     mcl_events::{MclCommand, MclCommandResult, MclInstruction, MclValue},
-    message_types::{AgentMessage, StopReason, TokenUsage, ToolCall},
+    message_types::{validate_user_images, AgentMessage, StopReason, TokenUsage, ToolCall},
     resource_components::{CallableDefinitionSnapshot, CallableResource, SandboxValue},
     workspace_components::{
         Workspace, WorkspaceAgentDefinition, WorkspaceDefinition, WorldWorkspaceExt,
@@ -16,6 +16,8 @@ use resource_id_plugin::ResourceID;
 use serde::{Deserialize, Serialize};
 use server_plugin::{RegisterConnection, WebSocketConnectionId};
 use std::{fmt, path::PathBuf};
+
+pub use margatroid_types::message_types::UserImage;
 
 pub trait FromDomain<Domain, Context = ()>: Sized {
     fn from_domain(domain: Domain, context: Context) -> Result<Self, ProtocolError>;
@@ -297,6 +299,8 @@ pub enum AgentMessageDto {
     },
     User {
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<UserImage>,
     },
     Assistant {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -340,7 +344,12 @@ impl AgentMessageDto {
                     .collect::<Result<_, _>>()?,
             },
             Self::System { content } => AgentMessage::System { content },
-            Self::User { content } => AgentMessage::User { content },
+            Self::User { content, images } => {
+                validate_user_images(&images).map_err(|message| {
+                    ProtocolError::new(ProtocolErrorKind::InvalidRequest, message)
+                })?;
+                AgentMessage::User { content, images }
+            }
             Self::Assistant {
                 replay,
                 reasoning,
@@ -375,17 +384,40 @@ impl AgentMessageDto {
 }
 impl IntoDomain<AgentMessage> for AgentMessageDto {
     fn into_domain(self, (): ()) -> Result<AgentMessage, ProtocolError> {
-        if serde_json::to_vec(&self)
-            .map_err(|e| ProtocolError::new(ProtocolErrorKind::InvalidRequest, e.to_string()))?
-            .len()
-            > 1024 * 1024
-        {
+        let message = self.convert(0, &mut 0)?;
+        struct ByteCount(usize);
+        impl std::io::Write for ByteCount {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        fn image_bytes(message: &AgentMessage) -> usize {
+            match message {
+                AgentMessage::User { images, .. } => {
+                    images.iter().map(|image| image.data.len()).sum()
+                }
+                AgentMessage::Inject { messages } => messages.iter().map(image_bytes).sum(),
+                _ => 0,
+            }
+        }
+        let mut count = ByteCount(0);
+        serde_json::to_writer(&mut count, &message).map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorKind::InvalidRequest,
+                "message serialization failed",
+            )
+        })?;
+        if count.0.saturating_sub(image_bytes(&message)) > 1024 * 1024 {
             return Err(ProtocolError::new(
                 ProtocolErrorKind::InvalidRequest,
-                "message size limit exceeded",
+                "non-image message size limit exceeded",
             ));
         }
-        self.convert(0, &mut 0)
+        Ok(message)
     }
 }
 impl FromDomain<&AgentMessage> for AgentMessageDto {
@@ -400,8 +432,9 @@ impl FromDomain<&AgentMessage> for AgentMessageDto {
             AgentMessage::System { content } => Self::System {
                 content: content.clone(),
             },
-            AgentMessage::User { content } => Self::User {
+            AgentMessage::User { content, images } => Self::User {
                 content: content.clone(),
+                images: images.clone(),
             },
             AgentMessage::Assistant {
                 replay,

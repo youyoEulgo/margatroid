@@ -447,7 +447,8 @@ fn persistent_session_reopens_and_temporary_entry_does_not_replay() {
     assert_eq!(
         stored(agent, "session", "processed"),
         StoredBlockInner::Message(vec![margatroid_types::message_types::AgentMessage::User {
-            content: "persistent".into()
+            images: Vec::new(),
+            content: "persistent".into(),
         }])
     );
     assert!(stored(agent, "entry", "pending").is_empty());

@@ -27,9 +27,10 @@ export interface ToolCall {
   tool_name: string;
   arguments: string;
 }
+export interface UserImage { media_type: string; data: string }
 export type AgentMessage =
   | { type: 'system'; content: string }
-  | { type: 'user'; content: string }
+  | { type: 'user'; content: string; images?: UserImage[] }
   | {
       type: 'assistant';
       reasoning: string | null;
@@ -195,8 +196,12 @@ export function isAgentMessage(value: unknown): value is AgentMessage {
   if (!isRecord(value)) return false;
   switch (value.type) {
     case 'system':
-    case 'user':
       return typeof value.content === 'string';
+    case 'user':
+      return typeof value.content === 'string' && (value.images === undefined ||
+        (Array.isArray(value.images) && value.images.every((image) => isRecord(image) &&
+          ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(String(image.media_type)) &&
+          typeof image.data === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(image.data))));
     case 'assistant':
       return (
         (value.content === null || typeof value.content === 'string') &&

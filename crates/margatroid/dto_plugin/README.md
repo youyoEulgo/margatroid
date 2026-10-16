@@ -11,7 +11,7 @@ DtoPlugin 是 WebSocket 传输与共享领域事件之间的转换层。协议�
 - 入口受检解析 Workspace 与当前成员的完整实例，实际处理再次核对 turn_id；旧/不匹配轮次不得取消新轮次。对同一已中止轮次（含 Working 且 turn=None）重复请求幂等成功，仅保留必要已中止关联，不恢复全局 pending 表；未识别轮次报关联错误。
 - 状态为 `creating/idle/working/stopping`。中止立即清空 turn，真实清理期间保持 Working，正常 finish 收口才 Idle；状态同步同时发布 turn 与 status。前端据 status 显示运行态、据 turn 关联中止，不能把回执或 turn=None 当作 Idle。
 - AgentPlugin 将 abort_agent_turn_system 固定安装到 RuntimePlugin::PRE_UPDATE，先于 UPDATE 中的 MCL 实际执行及 inference/tool admission。共享事件允许各消费者独立观察，不靠 take reply 独占中止通知；执行前再次核对请求轮次，turn=None 或已中止旧轮次不启动推理/工具而返回正常取消结果。
-- Assistant 新增 stop_reason，覆盖全部推理原因，新增 `StopReason::Cancelled` 序列化 `cancelled`。兼容保留 `InferenceResponse.stop_reason`，单一权威映射生成，两处始终相同。用户轮次中止且真实清理成功返回 Ok assistant：`content="Turn aborted."`、`reasoning=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Cancelled`。
+- Assistant 新增 stop_reason，覆盖全部推理原因，新增 `StopReason::Cancelled` 序列化 `cancelled`。兼容保留 `InferenceResponse.stop_reason`，单一权威映射生成，两处始终相同。用户轮次中止且真实清理成功返回 Ok assistant：保留已接受的部分 `content` 与 `reasoning`（二者皆空则保持空值，不填充取消文案），`replay=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Cancelled`。
 - 取消工具且清理成功返回 Ok ToolCall：`failed=true`、`content="Tool call aborted."`，保留调用 ID、名称及已知 resource_id。批次保留已完成真实结果，其余每个调用（包括未启动项）各有一个原序结果；不虚构部分执行成功，不撤销已发生副作用。
 - `CleanupFailed` 仍为 Err，保留活动，不伪造取消或 Idle。用户轮次中止不同于根 Agent shutdown、owner abort、timeout、receiver closed，不统一转换这些原因。
 - 历史只经显式 history_append 保存；Assistant stop_reason 存入 payload 元数据而非 content。cancelled assistant 可入历史，不得进入 infer 上下文（包括 Inject 嵌套）。
@@ -29,6 +29,7 @@ DtoPlugin 是 WebSocket 传输与共享领域事件之间的转换层。协议�
 | `history.query` | 从当前 Agent.history.list 读取历史，直达请求连接 |
 
 除注册外，未注册连接返回关联请求 ID 的 `request.failed`，不延后受理。注册成功回执仅在共享 Client 实体存在且身份匹配后发送。
+入站 JSON 总上限为 32 MiB，与 WebSocket 图片传输边界一致；图片请求不再被旧 1 MiB 检查静默丢弃。业务层继续校验图片数量、解码大小和格式。超限关闭连接并记录字节数，不记录图片正文；结构错误有合法请求 ID 时返回 `request.failed`，无法关联时以协议错误关闭，客户端不应无反馈等待。
 
 MCL Result 按 id/source/target 匹配待回复记录，仅向发起连接发送。回复前再次检查完整 Client Entity generation 与 source，迟到结果不会发送给复用身份的新实例。Workspace 请求使用内部唯一 operation_id 关联领域结果，网络回复还原原始 id，防止不同 Client 的相同网络请求 ID 相互混淆。
 

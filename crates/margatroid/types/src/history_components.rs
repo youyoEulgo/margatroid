@@ -28,7 +28,7 @@ pub fn message_history_parts(
     let mut payload = serde_json::to_value(message).expect("AgentMessage is JSON serializable");
     let content = match message {
         AgentMessage::System { content }
-        | AgentMessage::User { content }
+        | AgentMessage::User { content, .. }
         | AgentMessage::ToolCall { content, .. } => content.clone(),
         AgentMessage::Assistant { content, .. } => content.clone().unwrap_or_default(),
         AgentMessage::Error { message } => message.clone(),
@@ -91,11 +91,11 @@ mod message_history_tests {
     }
 
     #[test]
-    fn cancelled_assistant_projects_stop_reason_without_losing_text() {
+    fn empty_cancelled_assistant_projects_stop_reason_without_filler() {
         assert_eq!(
             message_history_parts(&AgentMessage::aborted_assistant()),
             (
-                "Turn aborted.".into(),
+                String::new(),
                 json!({"type":"assistant","reasoning":null,"tool_calls":[],"usage":null,"stop_reason":"cancelled"}),
             )
         );

@@ -763,8 +763,10 @@ fn cancelled_assistant_round_trip_and_legacy_default() {
     let wire = serde_json::to_value(&dto).unwrap();
     assert_eq!(wire["type"], "assistant");
     assert_eq!(wire["stop_reason"], "cancelled");
+    assert!(wire["content"].is_null());
+    assert!(wire["reasoning"].is_null());
     assert_eq!(dto.into_domain(()).unwrap(), message);
-    let legacy: AgentMessageDto = serde_json::from_value(serde_json::json!({"type":"assistant","reasoning":null,"content":"Turn aborted.","tool_calls":[],"usage":null})).unwrap();
+    let legacy: AgentMessageDto = serde_json::from_value(serde_json::json!({"type":"assistant","reasoning":null,"content":"legacy answer","tool_calls":[],"usage":null})).unwrap();
     assert!(matches!(
         legacy,
         AgentMessageDto::Assistant {
