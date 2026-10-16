@@ -433,6 +433,63 @@ async fn stop_closes_admission_coalesces_waiters_and_requires_matching_result() 
 }
 
 #[tokio::test]
+async fn abort_validates_identity_is_idempotent_and_never_closes_agent() {
+    let mut f = fixture();
+    let (entity, start) = start(&mut f).await;
+    let instance = make_running(&mut f, entity, &start);
+    let agent = f
+        .app
+        .world_mut()
+        .get_component_mut::<Agent>(entity)
+        .unwrap();
+    let turn = agent.new_turn();
+    agent.state = AgentState::Working;
+    let activity = agent
+        .execution
+        .register_for_turn(ExecutionActivityKind::Inference, Some(turn.clone()))
+        .unwrap();
+    let request = AbortAgentTurn {
+        id: "abort".into(),
+        agent: entity,
+        resource_id: agent.resourceid.clone(),
+        workspace: agent.workspace.clone(),
+        instance,
+        expected_turn_id: turn,
+    };
+    let mut stale = request.clone();
+    stale.instance.start_request_id = "stale".into();
+    handle_abort_agent_turn(f.app.world_mut(), stale);
+    assert!(events::<AbortAgentTurnResult>(f.app.world_mut())[0]
+        .result
+        .is_err());
+    assert!(!activity.turn_cancel.is_cancelled());
+    handle_abort_agent_turn(f.app.world_mut(), request.clone());
+    handle_abort_agent_turn(f.app.world_mut(), request.clone());
+    let results = events::<AbortAgentTurnResult>(f.app.world_mut());
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|result| result.result.is_ok()));
+    let agent = f.app.world().get_component::<Agent>(entity).unwrap();
+    assert!(agent.turn.is_none());
+    assert!(matches!(agent.state, AgentState::Working));
+    assert!(!agent.execution.is_closed());
+    assert!(agent.mcl.accepting);
+    assert!(activity.turn_cancel.is_cancelled());
+    assert!(!activity.cancel.is_cancelled());
+    activity.mark_completed().unwrap();
+    let agent = f
+        .app
+        .world_mut()
+        .get_component_mut::<Agent>(entity)
+        .unwrap();
+    agent.new_turn();
+    handle_abort_agent_turn(f.app.world_mut(), request);
+    assert!(events::<AbortAgentTurnResult>(f.app.world_mut())[0]
+        .result
+        .is_err());
+    f.close.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn driver_exception_maps_once_without_inventing_original_error() {
     let mut f = fixture();
     let (entity, request) = start(&mut f).await;
@@ -554,7 +611,7 @@ async fn stale_exception_cannot_close_agent_or_clear_turn() {
     };
     handle_driver_lua_vm_exception_result(f.app.world_mut(), event.clone());
     let agent = f.app.world().get_component::<Agent>(entity).unwrap();
-    assert!(matches!(agent.state, AgentState::Running));
+    assert!(matches!(agent.state, AgentState::Idle));
     assert_eq!(agent.turn.as_ref(), Some(&turn));
     assert!(!agent.execution.is_closed());
     assert!(events::<AgentExceptionResult>(f.app.world_mut()).is_empty());

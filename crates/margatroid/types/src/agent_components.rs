@@ -124,7 +124,8 @@ pub enum AgentState {
         request_id: String,
         vm_request_id: String,
     },
-    Running,
+    Idle,
+    Working,
     Stopping {
         request_ids: Vec<String>,
         vm_request_id: Option<String>,
@@ -134,6 +135,13 @@ pub enum AgentState {
 #[derive(Clone, Debug)]
 pub struct AgentFailure(pub AgentError);
 impl Component for AgentFailure {}
+
+#[derive(Clone, Debug)]
+pub struct AbortedAgentTurn {
+    pub instance: crate::lua_runtime_components::DriverLuaVmInstance,
+    pub turn_id: String,
+}
+impl Component for AbortedAgentTurn {}
 
 #[derive(Debug)]
 pub struct Agent {
@@ -280,7 +288,7 @@ impl WorldAgentExt for World {
         let agent = self.get_component::<Agent>(entity).unwrap();
         agent
             .execution
-            .register_with_snapshot(kind, || {
+            .register_for_turn_with_snapshot(kind, agent.turn.clone(), || {
                 if kind != ExecutionActivityKind::Sandbox {
                     return Ok(None);
                 }
@@ -521,7 +529,7 @@ mod tests {
             workspace: id("workspace:local/test"),
             sandbox: None,
             lua: Default::default(),
-            state: AgentState::Running,
+            state: AgentState::Idle,
             history: database.history(),
             database,
             import_bindings: Default::default(),

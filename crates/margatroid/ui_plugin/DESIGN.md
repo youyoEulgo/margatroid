@@ -67,7 +67,7 @@ content_type(path: &str) -> &'static str
     ui 的默认后端地址取同源（页面协议与主机拼出 /ws），因此从 daemon 地址打开即可直接工作
 
 历史展示：
-    新message记录从content取得正文，从payload取得type、reasoning、tool_calls、usage与工具关联数据
+    新message记录从content取得正文，从payload取得type、reasoning、tool_calls、usage、stop_reason与工具关联数据
     Error从content还原message文本，Inject保留payload中的完整嵌套messages并递归展示
     兼容旧payload中的完整消息正文，不修改旧数据库行；普通消息只在对话区渲染，MCL审计在右侧可展开面板渲染
     时间使用created_at_ms；0或无效时间显示Time unavailable，不渲染为epoch本地时间
@@ -84,7 +84,7 @@ content_type(path: &str) -> &'static str
     点击切换展开；展开态保留Sandbox选择及统一Tools可见性列表，不改变资源加载和调用语义
 ```
 
-## 回合中止交互（已确认设计，待实现）
+## 回合中止交互（已实现）
 
 ```text
 状态与输入：
@@ -115,7 +115,7 @@ content_type(path: &str) -> &'static str
     CleanupFailed继续明确显示错误和不可继续状态，不伪装成正常取消assistant或idle
 ```
 
-上述状态与回执仅为本次确认的实现目标；当前源码尚未支持完整回合中止，不能据此宣称按钮已可用。
+停止按钮使用 agent.turn.abort 独立控制协议；请求关联保留至状态确认不再处于该 Working 轮次，受理回执不提前恢复发送。
 
 ## 边界
 
@@ -125,3 +125,5 @@ ui/dist不入库，构建前必须先跑 scripts/build-ui.sh，否则编译期�
 嵌入发生在编译期：改了界面必须重新构建并重新编译daemon，运行期不会读磁盘
 路由只覆盖"/"与"/{*path}"；/ws由DtoPlugin注册，两者互不冲突
 ```
+
+中止执行顺序：AgentPlugin 的 abort_agent_turn_system 固定运行于 RuntimePlugin::PRE_UPDATE，先于 UPDATE 的 MCL 与推理/工具 admission；UI 仅发送控制请求并等待权威状态同步，不承担清理完成判定。

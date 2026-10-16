@@ -3,11 +3,11 @@
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
 
-## 用户轮次中止目标（待实现）
+## 用户轮次中止（已实现）
 
-本节及下文标注的中止行为是已批准的目标契约，不表示当前代码已实现；既有实现说明仅适用于未被该目标替换的部分。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
+受理核对 Working 及非空匹配 turn，活动登记关联 turn 并监督独立 turn_cancel 令牌。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
 
-Assistant 新增 `stop_reason`，包括 `StopReason::Cancelled`（`cancelled`）；兼容保留外层 `InferenceResponse.stop_reason`，两处从单一权威映射构造且始终相同。仅用户轮次中止在真实 cleanup 成功后返回 Ok：assistant `content="Turn aborted."`、`reasoning=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Cancelled`。`CleanupFailed` 仍为 Err，不能伪造取消或空闲；根 Agent shutdown、owner abort、timeout、receiver closed 保留独立原因。
+Assistant 新增 `stop_reason: Option<StopReason>`（旧文件缺字段默认为 None，prompt 非模型消息为 None，实际推理输出始终 Some），包括 `StopReason::Cancelled`（`cancelled`）；兼容保留外层 `InferenceResponse.stop_reason`，两处从单一权威映射构造且始终相同。仅用户轮次中止在真实 cleanup 成功后返回 Ok：assistant `content="Turn aborted."`、`reasoning=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Cancelled`。`CleanupFailed` 仍为 Err，不能伪造取消或空闲；根 Agent shutdown、owner abort、timeout、receiver closed 保留独立原因。
 
 取消 assistant 可显式保存到历史，stop_reason 留在 payload 元数据而非正文，但不能放入 infer 上下文（含 Inject 嵌套）。AbortSystem 先于 MCL 执行及推理受理；共享事件由各消费者独立观察，不靠 take reply 独占通知。
 
@@ -111,7 +111,7 @@ MCL `infer` 参数为 MESSAGE array + TOOL array；手工工具调用也先构�
 
 通用 async closure 调用 `execute_inference`。入口 spawn 独立 supervisor 并 await；入口丢弃仅通过私有 DropGuard 取消 owner token，supervisor 不随入口被丢弃。
 
-supervisor 在共享 AgentExecutionScope 登记活动的 `mark_started` 后 spawn HTTP worker，合并 scope child、请求 cancel、owner cancel、回复 receiver 关闭及整体超时。正常结果显式 join worker；取消、超时或 receiver 关闭则显式 abort worker 并 await JoinHandle，证明 HTTP/SSE/增量发送 future 已退出释放。Provider panic 经 JoinError 转为关联错误。
+supervisor 在共享 AgentExecutionScope 登记活动的 `mark_started` 后 spawn HTTP worker，分别监督 scope child、用户 turn_cancel、请求 cancel、owner cancel、回复 receiver 关闭及整体超时。正常结果显式 join worker；取消、超时或 receiver 关闭则显式 abort worker 并 await JoinHandle，证明 HTTP/SSE/增量发送 future 已退出释放。Provider panic 经 JoinError 转为关联错误。
 
 随后有界发送终态，释放发送 future，才 `mark_completed` 并完成唯一 oneshot。终态阶段 owner abort 同样不会永久毒化作用域。未启动的提交失败 rollback；supervisor 自身异常退出且无法证明 cleanup 时，TaskGuard 标记 cleanup_failed 并保留活动，不以 Drop、日志或 Sender 关闭假称任务退出。
 

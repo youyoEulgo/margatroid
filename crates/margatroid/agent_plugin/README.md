@@ -2,9 +2,9 @@
 
 AgentPlugin负责Agent实例的启动、停止、异常关联与生命周期；共享Agent组件保存身份、Workspace关联、配置快照、Lua通知句柄、execution作用域、MCL队列、turn、导入绑定及数据库/历史句柄。Block在真实SQLite中，Agent不保存Block权威内存内容。消息历史只由显式MCL `history_append`追加，推理与工具仅返回结果，不自动保存消息。
 
-## 已批准目标：轮次中止（待实现）
+## 轮次中止
 
-以下是批准的目标设计，**不是已实现功能**。详细目标与现有基线见[设计](<DESIGN.md>)；当前代码的运行期`Running`及无条件轮次生成行为尚待迁移。
+Agent生命周期层已实现`Idle / Working`及独立`AbortAgentTurn`控制事件。控制系统注册在`RuntimePlugin::PRE_UPDATE`，先于UPDATE中的MCL与领域受理；自定义调度必须保留这个先后关系。只保留当前实例最近一次已中止turn的关联，重复请求仅在Working收口期间成功。详细契约与跨插件行为见[设计](<DESIGN.md>)。
 
 - 目标状态为`Creating / Idle / Working / Stopping`。启动成功进入`Idle`、`turn=None`。`start_turn`仅允许Idle，原子创建turn并置Working，不覆盖已有轮次。
 - abort是独立控制事件，不进入MCL FIFO。控制System先于MCL继续动作及Inference/Tool受理执行；Working收到abort立即清空`agent.turn`，仍保持Working，直到Driver沿正常消息链调用`finish_turn`才进入Idle。Working且turn=None重复abort幂等pending。
@@ -15,4 +15,4 @@ AgentPlugin负责Agent实例的启动、停止、异常关联与生命周期；�
 - Driver读取entry第一条并移除同一条，显式历史保留原值。Inject仅递归展开容器并追加非容器上下文（嵌套取消Assistant也跳过），不执行子消息控制分支；User追加上下文、start_turn、推理；取消Assistant仅入历史，正常Assistant入上下文，无调用Assistant是唯一finish_turn路径，否则发工具批次；全部工具结果入上下文，批次齐后即使turn=None仍推理，取得取消Assistant收尾。Error不得直接finish或伪造取消消息。
 - 前端仅Idle允许发送、Working允许abort；服务端用户消息受理也必须验证Idle，不能只依赖按钮。清理失败仍返回错误并保留未清理活动，不转Idle。
 
-轮次abort不是停止Agent，不关闭Driver或根execution作用域。Creating/Stopping、StopAgent根取消、全部活动真实完成、MCL回执drained与失败保留宿主的原清理语义不变。本次仅文档修订，不声明代码、协议或前端已经实现目标。
+轮次abort不是停止Agent，不关闭Driver或根execution作用域。Creating/Stopping、StopAgent根取消、全部活动真实完成、MCL回执drained与失败保留宿主的原清理语义不变。协议、Driver与前端支持由各自插件提供；本插件的成功回执仅证明中止控制已受理。

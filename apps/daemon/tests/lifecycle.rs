@@ -296,7 +296,7 @@ fn two_agents_in_one_workspace_drive_arrays_wake_and_join_cleanly() {
     assert_eq!(members.len(), 2);
     for (agent_id, entity) in &members {
         let agent = app.world().get_component::<Agent>(*entity).unwrap();
-        assert!(matches!(agent.state, AgentState::Running));
+        assert!(matches!(agent.state, AgentState::Idle));
         assert_eq!(agent.lua.instance.as_ref().unwrap().owner, *entity);
         assert!(agent.lua.ready.is_none());
         assert_eq!(

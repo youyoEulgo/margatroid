@@ -15,6 +15,7 @@ pub(crate) struct BackendStateReportCache {
 impl Resource for BackendStateReportCache {}
 #[derive(Default)]
 pub(crate) struct PendingMclCommandResponses {
+    pub(crate) aborts: Vec<PendingAbortResponse>,
     pub(crate) commands: Vec<PendingMclCommandResponse>,
     pub(crate) workspaces: Vec<PendingWorkspaceResponse>,
     pub(crate) snapshots: Vec<PendingSnapshot>,
@@ -41,4 +42,16 @@ pub(crate) struct PendingWorkspaceResponse {
     pub(crate) client: Entity,
     pub(crate) stopping: bool,
     pub(crate) reference: WorkspaceReferenceDto,
+}
+
+pub(crate) struct PendingAbortResponse {
+    pub(crate) id: String,
+    pub(crate) operation_id: String,
+    pub(crate) connection_id: WebSocketConnectionId,
+    pub(crate) client: Entity,
+    pub(crate) agent: Entity,
+    pub(crate) resource_id: ResourceID,
+    pub(crate) workspace: WorkspaceReferenceDto,
+    pub(crate) instance: margatroid_types::lua_runtime_components::DriverLuaVmInstance,
+    pub(crate) turn_id: String,
 }

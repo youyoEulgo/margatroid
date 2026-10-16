@@ -9,7 +9,7 @@ use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::{AsyncTaskError, WorldAsyncExt};
 use core_plugin::{Entity, World};
 use futures_util::StreamExt;
-use margatroid_types::agent_components::Agent;
+use margatroid_types::agent_components::{Agent, AgentState};
 use margatroid_types::client_components::WorldClientExt;
 use margatroid_types::execution_components::{
     ExecutionActivity, ExecutionActivityKind, ExecutionError,
@@ -343,6 +343,17 @@ pub(crate) fn handle_inference(world: &mut World, mut request: InferenceRequest)
     };
     request.reply = Arc::new(Mutex::new(Some(sender)));
     let reply = request.reply.clone();
+    if world
+        .get_component::<Agent>(request.agent)
+        .is_some_and(|agent| {
+            !matches!(agent.state, AgentState::Working)
+                || request.turn.is_none()
+                || request.turn != agent.turn
+        })
+    {
+        complete(&reply, Ok(InferenceResponse::aborted()));
+        return;
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         prepare_inference(world, request)
     }))
@@ -452,7 +463,7 @@ fn prepare_inference(
         .collect();
     let activity = agent
         .execution
-        .register(ExecutionActivityKind::Inference)
+        .register_for_turn(ExecutionActivityKind::Inference, request.turn.clone())
         .map_err(|e| InferenceError::new(InferenceErrorKind::Cancelled, e.to_string()))?;
 
     let prepared = PreparedInference {
@@ -599,6 +610,18 @@ fn normalize_messages(messages: Vec<AgentMessage>) -> Result<Vec<ProviderMessage
             ));
         }
         for message in messages {
+            if matches!(
+                &message,
+                AgentMessage::Assistant {
+                    stop_reason: Some(margatroid_types::message_types::StopReason::Cancelled),
+                    ..
+                }
+            ) {
+                return Err(InferenceError::new(
+                    InferenceErrorKind::InvalidMessages,
+                    "cancelled assistant cannot enter inference context",
+                ));
+            }
             if let AgentMessage::Inject { messages } = message {
                 expand(messages, depth + 1, out, bytes)?;
                 continue;
@@ -750,6 +773,7 @@ async fn supervise_inference(
     let reply = prepared.reply.clone();
     let cancel = prepared.cancel.clone();
     let child = guard.activity.cancel.clone();
+    let turn_cancel = guard.activity.turn_cancel.clone();
     let terminal_senders = prepared.senders.clone();
     let terminal_id = prepared.id.clone();
     let terminal_agent = prepared.agent_id.clone();
@@ -763,6 +787,7 @@ async fn supervise_inference(
         _ = owner_cancel.cancelled() => Err(InferenceError::new(InferenceErrorKind::TaskAborted, "inference owner aborted")),
         _ = child.cancelled() => Err(InferenceError::new(InferenceErrorKind::Cancelled, "agent execution cancelled")),
         _ = cancel.cancelled() => Err(InferenceError::new(InferenceErrorKind::Cancelled, "inference request cancelled")),
+        _ = turn_cancel.cancelled() => Ok(InferenceResponse::aborted()),
         _ = receiver_closed(&reply) => Err(InferenceError::new(InferenceErrorKind::ResponseLost, "inference receiver closed")),
         _ = tokio::time::sleep(Duration::from_secs(180)) => Err(InferenceError::new(InferenceErrorKind::Timeout, "inference request timed out")),
         result = &mut worker => {
@@ -816,7 +841,7 @@ async fn supervise_inference(
             complete(
                 &reply,
                 Err(InferenceError::new(
-                    InferenceErrorKind::ExecutionFailed,
+                    InferenceErrorKind::CleanupFailed,
                     error.to_string(),
                 )),
             );
@@ -899,6 +924,7 @@ async fn run_provider(
             content: response.content,
             tool_calls: response.tool_calls,
             usage: response.usage,
+            stop_reason: Some(response.stop_reason.clone()),
         },
         stop_reason: response.stop_reason,
     })
@@ -1239,11 +1265,13 @@ mod tests {
             reasoning,
             tool_calls,
             usage,
+            stop_reason,
             ..
         } = response.message
         else {
             panic!()
         };
+        assert_eq!(stop_reason, Some(response.stop_reason));
         assert_eq!(reasoning.as_deref(), Some("think"));
         assert_eq!(tool_calls[0].arguments, "{}");
         assert_eq!(usage.unwrap().cache_hit_tokens, 3);
@@ -1312,6 +1340,22 @@ mod tests {
         );
         assert_eq!(scope.activity_count(), 0);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn turn_cancel_returns_normal_reply_after_http_cleanup() {
+        let (url, server) = mock("", true).await;
+        let (prepared, guard, rx, scope) = prepared(&url, false);
+        let turn_cancel = guard.activity.turn_cancel.clone();
+        let task = tokio::spawn(execute_inference(prepared, guard));
+        tokio::task::yield_now().await;
+        turn_cancel.cancel();
+        assert_eq!(rx.await.unwrap().unwrap(), InferenceResponse::aborted());
+        assert_eq!(scope.activity_count(), 0);
+        assert!(!scope.is_closed());
+        task.await.unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -1484,7 +1528,7 @@ mod tests {
                     image_dependencies: Arc::from([id.clone()]),
                 },
                 lua: Default::default(),
-                state: AgentState::Running,
+                state: AgentState::Working,
                 history: database.history(),
                 database,
                 import_bindings: Default::default(),
@@ -1506,6 +1550,31 @@ mod tests {
             .get_mut(&id)
             .unwrap()
             .description = "New description".into();
+        let (tx, mut rx) = oneshot::channel();
+        let stale = InferenceRequest {
+            id: String::new(),
+            agent,
+            messages: vec![],
+            tools: vec![],
+            turn: Some("old-turn".into()),
+            cancel: CancellationToken::new(),
+            reply: Arc::new(Mutex::new(Some(tx))),
+        };
+        handle_inference(&mut world, stale.clone());
+        handle_inference(&mut world, stale.clone());
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap(),
+            InferenceResponse::aborted()
+        );
+        assert!(stale.reply.lock().unwrap().is_none());
+        assert_eq!(
+            world
+                .get_component::<Agent>(agent)
+                .unwrap()
+                .execution
+                .activity_count(),
+            0
+        );
         let definitions = collect_tool_definitions(&world, agent, &[selected.clone()]).unwrap();
         assert_eq!(definitions[0].description, "Old description");
         for kind in ["skill", "hook"] {
@@ -1598,6 +1667,17 @@ mod tests {
 
     #[test]
     fn inject_expansion_checks_correlations_and_limits() {
+        for message in [
+            AgentMessage::aborted_assistant(),
+            AgentMessage::Inject {
+                messages: vec![AgentMessage::aborted_assistant()],
+            },
+        ] {
+            assert_eq!(
+                normalize_messages(vec![message]).unwrap_err().kind,
+                InferenceErrorKind::InvalidMessages
+            );
+        }
         assert_eq!(
             normalize_messages(vec![AgentMessage::Inject {
                 messages: vec![AgentMessage::User {

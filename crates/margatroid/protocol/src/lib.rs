@@ -5,7 +5,7 @@ use margatroid_types::{
     block_types::BlockInner,
     history_components::HistoryRecord,
     mcl_events::{MclCommand, MclCommandResult, MclInstruction, MclValue},
-    message_types::{AgentMessage, TokenUsage, ToolCall},
+    message_types::{AgentMessage, StopReason, TokenUsage, ToolCall},
     resource_components::{CallableDefinitionSnapshot, CallableResource, SandboxValue},
     workspace_components::{
         Workspace, WorkspaceAgentDefinition, WorkspaceDefinition, WorldWorkspaceExt,
@@ -64,6 +64,11 @@ pub enum ClientMessage {
         id: String,
         message: StopWorkspaceDto,
     },
+    #[serde(rename = "agent.turn.abort")]
+    AgentTurnAbort {
+        id: String,
+        message: AbortAgentTurnDto,
+    },
     #[serde(rename = "mcl.command")]
     MclCommand { id: String, message: MclCommandDto },
     #[serde(rename = "state.query")]
@@ -84,6 +89,7 @@ impl ClientMessage {
             Self::ConnectionRegister { id, .. }
             | Self::WorkspaceStart { id, .. }
             | Self::WorkspaceStop { id, .. }
+            | Self::AgentTurnAbort { id, .. }
             | Self::MclCommand { id, .. }
             | Self::StateQuery { id, .. }
             | Self::HistoryQuery { id, .. } => id,
@@ -173,6 +179,14 @@ pub enum ServerMessage {
     },
     #[serde(rename = "workspace.stop_failed")]
     WorkspaceStopFailed { id: String, error: ProtocolErrorDto },
+    #[serde(rename = "agent.turn.abort_result")]
+    AgentTurnAbortResult {
+        id: String,
+        workspace: WorkspaceReferenceDto,
+        agent: ResourceIdDto,
+        turn_id: String,
+        result: Result<(), ProtocolErrorDto>,
+    },
     #[serde(rename = "mcl.command_result")]
     MclCommandResult {
         id: String,
@@ -290,6 +304,8 @@ pub enum AgentMessageDto {
         #[serde(default)]
         tool_calls: Vec<ToolCall>,
         usage: Option<TokenUsage>,
+        #[serde(default)]
+        stop_reason: Option<StopReason>,
     },
     ToolCall {
         resource_id: Option<ResourceIdDto>,
@@ -328,11 +344,13 @@ impl AgentMessageDto {
                 content,
                 tool_calls,
                 usage,
+                stop_reason,
             } => AgentMessage::Assistant {
                 reasoning,
                 content,
                 tool_calls,
                 usage,
+                stop_reason,
             },
             Self::ToolCall {
                 resource_id,
@@ -386,11 +404,13 @@ impl FromDomain<&AgentMessage> for AgentMessageDto {
                 content,
                 tool_calls,
                 usage,
+                stop_reason,
             } => Self::Assistant {
                 reasoning: reasoning.clone(),
                 content: content.clone(),
                 tool_calls: tool_calls.clone(),
                 usage: usage.clone(),
+                stop_reason: stop_reason.clone(),
             },
             AgentMessage::ToolCall {
                 resource_id,
@@ -475,6 +495,12 @@ impl IntoDomain<StartWorkspace, String> for StartWorkspaceDto {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StopWorkspaceDto {
     pub workspace: WorkspaceReferenceDto,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbortAgentTurnDto {
+    pub workspace: WorkspaceReferenceDto,
+    pub agent: Option<ResourceIdDto>,
+    pub turn_id: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteAgentTargetDto {
@@ -836,7 +862,8 @@ impl FromDomain<Entity, &World> for AgentStateDto {
             agent_instance: format!("{entity:?}"),
             status: match agent.state {
                 AgentState::Creating { .. } => "creating",
-                AgentState::Running => "running",
+                AgentState::Idle => "idle",
+                AgentState::Working => "working",
                 AgentState::Stopping { .. } => "stopping",
             }
             .into(),

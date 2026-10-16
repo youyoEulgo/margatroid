@@ -12,7 +12,7 @@ Agent只保存AgentDatabaseHandle及同文件AgentHistoryHandle视图，不保�
 
 历史created_at_ms持久保存真实Unix毫秒时间；未指定时间的新记录在事务写入时取得当前时间，幂等重试不覆盖已存时间。旧history_records表缺少时间列时通过事务迁移增加列，旧行保留0表示不可恢复的未知时间；不得以迁移时间、文件修改时间或sequence推测旧时间。协议直接投影已存值，历史顺序仍以sequence为准。
 
-## 回合中止消息的存储边界（已确认设计，待实现）
+## 回合中止消息的存储边界（已实现）
 
 取消assistant仍属于显式message历史：content保存英文`Turn aborted.`，payload保留`type: assistant`与`stop_reason: cancelled`及其余元数据，不重复正文。工具取消结果保留调用ID、名称、resource_id与failed，正文保存英文取消说明。历史追加仍由Driver显式history_append执行；存储层不因取消自动创建消息，不根据正文判断取消，也不删除已发生的历史。取消assistant不进模型上下文是Driver规则，不是SQLite暗中拒绝该消息；工具结果则正常进入历史和上下文。Block与历史是不同事务，仍不承诺跨操作原子性，取消不撤销已提交的数据库写入。
 

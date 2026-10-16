@@ -65,13 +65,13 @@ fn fixture(limits: ToolExecutionLimits) -> (App, Entity, tempfile::TempDir) {
                 image_dependencies: Arc::from([]),
             },
             lua: Default::default(),
-            state: AgentState::Running,
+            state: AgentState::Working,
             history: database.history(),
             database,
             import_bindings: Default::default(),
             mcl: Default::default(),
             execution: AgentExecutionScope::new(),
-            turn: Some("live-turn".into()),
+            turn: Some("snapshot-turn".into()),
         },
     );
     (app, entity, root)
@@ -203,6 +203,58 @@ fn content(result: ToolExecuteResponse) -> String {
         _ => panic!("not tool call"),
     }
 }
+#[tokio::test]
+async fn stale_turn_replies_once_without_starting_tool() {
+    let (mut app, entity, root) = fixture(ToolExecutionLimits::default());
+    let resource = add_tool(
+        &mut app,
+        entity,
+        root.path(),
+        "invalid Lua must never run",
+        serde_json::json!({"type":"object"}),
+    );
+    let (request, rx) = submit(&app, entity, resource.clone(), "not JSON");
+    let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
+    agent.turn = Some("new-turn".into());
+    let scope = agent.execution.clone();
+    app.world().send_event(request.clone());
+    assert_eq!(
+        response(&mut app, rx).await.unwrap(),
+        ToolExecuteResponse::aborted(Some(resource), &request.call)
+    );
+    assert_eq!(scope.activity_count(), 0);
+    assert!(!scope.is_closed());
+    assert!(request.reply.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn turn_abort_cleans_runner_and_returns_failed_tool_message() {
+    let (mut app, entity, root) = fixture(ToolExecutionLimits::default());
+    let resource = add_tool(
+        &mut app,
+        entity,
+        root.path(),
+        "function execute() os.execute('sleep 30'); return 'late' end",
+        serde_json::json!({"type":"object"}),
+    );
+    let (request, rx) = submit(&app, entity, resource.clone(), "{}");
+    app.tick();
+    let scope = app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .execution
+        .clone();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    scope.cancel_turn("snapshot-turn");
+    assert_eq!(
+        response(&mut app, rx).await.unwrap(),
+        ToolExecuteResponse::aborted(Some(resource), &request.call)
+    );
+    assert_eq!(scope.activity_count(), 0);
+    assert!(!scope.is_closed());
+}
+
 #[tokio::test]
 async fn actual_runner_preserves_alias_context_and_raw_string() {
     let (mut app, entity, root) = fixture(ToolExecutionLimits::default());

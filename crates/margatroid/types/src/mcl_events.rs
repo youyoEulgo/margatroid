@@ -82,6 +82,7 @@ pub enum MclError {
     DuplicateRequest,
     AgentMissing,
     AgentStopping,
+    AgentBusy,
     TypeMismatch,
     InvalidRange,
     BindingMissing,

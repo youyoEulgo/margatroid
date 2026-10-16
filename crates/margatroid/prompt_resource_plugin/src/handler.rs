@@ -219,6 +219,7 @@ pub(crate) fn handle_mount_prompt_resource(world: &mut World, output: PromptReso
                             content: Some(resource.content.to_string()),
                             tool_calls: Vec::new(),
                             usage: None,
+                            stop_reason: None,
                         },
                         _ => return Err(error(Kind::InvalidDefinition, "invalid prompt role")),
                     }]),

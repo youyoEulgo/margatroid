@@ -56,6 +56,8 @@ const {
   selectedAgentName,
   selectedAgentState,
   selectedAgentReady,
+  selectedAgentIdle,
+  abortPending,
   selectedAgentWorking,
   resourceVisibility,
   sandboxOptions,
@@ -567,7 +569,7 @@ function mclEntryResult(message: ConversationEntry) {
           <article :class="[
             'message-row',
             `message-row--${message.role}`,
-            { 'message-row--failed': message.failed },
+            { 'message-row--failed': message.failed, 'message-row--aborted': message.aborted },
           ]">
             <div class="message-avatar">
               <UserRound v-if="message.role === 'user'" :size="16" />
@@ -620,7 +622,7 @@ function mclEntryResult(message: ConversationEntry) {
         <form class="composer-box" @submit.prevent="submitMessage">
           <div class="composer-input-row">
             <textarea ref="draftInput" v-model="draft"
-              :disabled="!selectedWorkspace || connectionStatus !== 'online' || !selectedAgentReady" rows="1"
+              :disabled="!selectedWorkspace || connectionStatus !== 'online' || !selectedAgentIdle" rows="1"
               :placeholder="!selectedWorkspace
                   ? 'Select a workspace...'
                   : selectedAgentReady
@@ -631,9 +633,10 @@ function mclEntryResult(message: ConversationEntry) {
                 " @keydown.enter.exact.prevent="submitMessage"></textarea>
           </div>
           <div class="composer-actions">
+            <span v-if="abortPending" class="abort-pending-label">Abort pending</span>
             <button v-if="selectedAgentWorking" class="send-button send-button--stop" type="button" :title="canAbortTurn
                 ? 'Stop current turn'
-                : 'Stopping a turn is not supported by the current runtime'
+                : abortPending ? 'Abort pending' : 'No abortable turn'
               " :disabled="!canAbortTurn ||
                 !selectedWorkspace ||
                 connectionStatus !== 'online' ||
@@ -645,7 +648,7 @@ function mclEntryResult(message: ConversationEntry) {
               submittingMessage ||
               !selectedWorkspace ||
               connectionStatus !== 'online' ||
-              !selectedAgentReady
+              !selectedAgentIdle
               ">
               <Send :size="18" />
             </button>

@@ -49,7 +49,7 @@ fn close_admission(agent: &mut Agent) {
 }
 fn close_exception_admission(agent: &mut Agent, execution_ended: bool) {
     close_admission(agent);
-    if matches!(agent.state, AgentState::Running) {
+    if matches!(agent.state, AgentState::Idle | AgentState::Working) {
         agent.state = AgentState::Stopping {
             request_ids: vec![],
             vm_request_id: None,
@@ -520,7 +520,7 @@ pub fn handle_start_driver_lua_vm_result(world: &mut World, event: StartDriverLu
                     .is_some_and(|close| close.instance() == expected) =>
         {
             agent.lua.ready = None;
-            agent.state = AgentState::Running;
+            agent.state = AgentState::Idle;
             Ok(event.owner)
         }
         Ok(()) => {
@@ -549,6 +549,62 @@ pub fn handle_start_driver_lua_vm_result(world: &mut World, event: StartDriverLu
     };
     world.send_event(StartAgentResult {
         id: request_id,
+        result,
+    });
+}
+
+pub fn handle_abort_agent_turn(world: &mut World, request: AbortAgentTurn) {
+    use margatroid_types::agent_components::AbortedAgentTurn;
+    let result = (|| {
+        let agent = world
+            .get_component::<Agent>(request.agent)
+            .ok_or_else(|| error(AgentErrorKind::AgentNotAlive, "agent missing"))?;
+        if request.id.is_empty()
+            || request.expected_turn_id.is_empty()
+            || request.instance.owner != request.agent
+            || agent.resourceid != request.resource_id
+            || agent.workspace != request.workspace
+            || agent.lua.instance.as_ref() != Some(&request.instance)
+        {
+            return Err(error(
+                AgentErrorKind::InvalidRequest,
+                "abort identity mismatch",
+            ));
+        }
+        if !matches!(agent.state, AgentState::Working) || agent.execution.is_closed() {
+            return Err(error(AgentErrorKind::AgentBusy, "agent is not working"));
+        }
+        if agent.turn.is_none()
+            && world
+                .get_component::<AbortedAgentTurn>(request.agent)
+                .is_some_and(|last| {
+                    last.instance == request.instance && last.turn_id == request.expected_turn_id
+                })
+        {
+            return Ok(());
+        }
+        if agent.turn.as_ref() != Some(&request.expected_turn_id) {
+            return Err(error(AgentErrorKind::InvalidRequest, "turn mismatch"));
+        }
+        let agent = world.get_component_mut::<Agent>(request.agent).unwrap();
+        agent.turn = None;
+        agent.execution.cancel_turn(&request.expected_turn_id);
+        world.insert_component(
+            request.agent,
+            AbortedAgentTurn {
+                instance: request.instance.clone(),
+                turn_id: request.expected_turn_id.clone(),
+            },
+        );
+        Ok(())
+    })();
+    world.send_event(AbortAgentTurnResult {
+        id: request.id,
+        agent: request.agent,
+        resource_id: request.resource_id,
+        workspace: request.workspace,
+        instance: request.instance,
+        expected_turn_id: request.expected_turn_id,
         result,
     });
 }
@@ -582,7 +638,7 @@ pub fn handle_stop_agent(world: &mut World, request: StopAgent) {
                 AgentErrorKind::DriverStopFailed,
                 "previous stop failed; no new completion proof",
             )),
-            AgentState::Running => None,
+            AgentState::Idle | AgentState::Working => None,
         }
     };
     if let Some(e) = rejection {

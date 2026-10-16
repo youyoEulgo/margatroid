@@ -99,8 +99,9 @@ pub(crate) async fn run_runner(
     policy: Option<&str>,
     cancel: &CancellationToken,
     request_cancel: &CancellationToken,
+    turn_cancel: &CancellationToken,
     reply: &ToolExecuteReply,
-) -> Result<String, ToolError> {
+) -> Result<Option<String>, ToolError> {
     let deadline = tokio::time::Instant::now() + payload.limits.execution_timeout;
     let mut command = tokio::process::Command::new(runner);
     command.arg("--margatroid-tool-supervisor");
@@ -189,6 +190,7 @@ pub(crate) async fn run_runner(
     let mut output_result = None;
     let mut diagnostic_result = None;
     let mut status = None;
+    let mut turn_aborted = false;
     let failure = loop {
         if input_result.is_some()
             && output_result.is_some()
@@ -198,13 +200,18 @@ pub(crate) async fn run_runner(
             break None;
         }
         tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break Some(error(ToolErrorKind::Cancelled, "scope cancelled")),
+            _ = request_cancel.cancelled() => break Some(error(ToolErrorKind::Cancelled, "request cancelled")),
             value = &mut input, if input_result.is_none() => { let failure = value.as_ref().err().cloned(); input_result = Some(value); if failure.is_some() { break failure; } },
             value = &mut out, if output_result.is_none() => { let failure = value.as_ref().err().cloned(); output_result = Some(value); if failure.is_some() { break failure; } },
             value = &mut err, if diagnostic_result.is_none() => { let failure = value.as_ref().err().cloned(); diagnostic_result = Some(value); if failure.is_some() { break failure; } },
             _ = overflow.cancelled() => break Some(error(ToolErrorKind::OutputTooLarge, "runner pipe exceeds limit")),
             value = child.wait(), if status.is_none() => { status = Some(value.map_err(|_| error(ToolErrorKind::CleanupFailed, "runner wait failed"))?); },
-            _ = cancel.cancelled() => break Some(error(ToolErrorKind::Cancelled, "scope cancelled")),
-            _ = request_cancel.cancelled() => break Some(error(ToolErrorKind::Cancelled, "request cancelled")),
+            _ = turn_cancel.cancelled() => {
+                turn_aborted = true;
+                break Some(error(ToolErrorKind::Cancelled, "turn aborted"));
+            },
             _ = closed(reply) => break Some(error(ToolErrorKind::Cancelled, "receiver closed")),
             _ = tokio::time::sleep_until(deadline) => break Some(error(ToolErrorKind::Timeout, "execution deadline exceeded")),
         }
@@ -231,10 +238,11 @@ pub(crate) async fn run_runner(
                 }
                 Ok::<(), ToolError>(())
             };
-        if tokio::time::timeout(payload.limits.cleanup_timeout, cleanup)
-            .await
-            .is_err()
-        {
+        let cleanup_result = tokio::time::timeout(payload.limits.cleanup_timeout, cleanup).await;
+        if let Ok(Err(error)) = &cleanup_result {
+            return Err(error.clone());
+        }
+        if cleanup_result.is_err() {
             #[cfg(unix)]
             let _ = nix::sys::signal::killpg(
                 nix::unistd::Pid::from_raw(pid as i32),
@@ -267,7 +275,11 @@ pub(crate) async fn run_runner(
                 "runner did not prove descendant cleanup",
             ));
         }
-        return Err(failure);
+        return if turn_aborted && !cancel.is_cancelled() && !request_cancel.is_cancelled() {
+            Ok(None)
+        } else {
+            Err(failure)
+        };
     }
     if let Some(boundary) = &cgroup {
         boundary.cleanup(payload.limits.cleanup_timeout).await?;
@@ -298,5 +310,5 @@ pub(crate) async fn run_runner(
             "tool result exceeds limit",
         ));
     }
-    Ok(output)
+    Ok(Some(output))
 }

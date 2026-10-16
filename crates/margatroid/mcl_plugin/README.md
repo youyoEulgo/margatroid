@@ -5,9 +5,9 @@
 
 当前实现说明见 [DESIGN.md](<DESIGN.md>)。旧 REF/MERGE/BIND/LOAD/EXPOSE、visibility 与 history_record 路径已删除，不再受理。
 
-## 已批准目标：轮次中止（待实现）
+## 轮次中止
 
-以下为用户批准的目标，**尚未实现**，不能把已有`finish_turn`名称、来源取消或数据库基线当作该目标已经完成。完整规则及Driver分支伪代码见[设计](<DESIGN.md>)。
+MCL已实现Idle/Working轮次effect、准备完成后的当前turn门、正常形状取消结果及finish清理校验。控制事件由AgentPlugin的PRE_UPDATE系统处理，不进入FIFO；自定义调度需确保控制先于本插件。完整跨插件规则及Driver分支见[设计](<DESIGN.md>)。客户端手工MESSAGE参数中的递归User INJECT在Working时拒绝；agent来源普通写入仍允许。别名/selector读取内容不作为用户消息入口，外部用户发送入口须使用受检手工参数。
 
 - Agent运行期由`Running`改为`Idle / Working`，保留Creating/Stopping。启动Idle；`start_turn`仅Idle生成turn并置Working，不覆盖；`finish_turn`在本轮真实清理完成后清turn并转Idle。重复Idle完成幂等，旧关联不能覆盖新Working。
 - abort为独立控制事件，先于MCL继续及推理/工具受理，不入FIFO。Working立即清turn但保持Working至Driver收尾；Working且turn=None重复abort幂等pending。协议目标`agent.turn.abort`要求非空turn_id，关联`agent.turn.abort_result`的Ok仅证明受理，不证明清理完成。前端及服务端用户消息受理均只允许Idle，Working只允许abort。

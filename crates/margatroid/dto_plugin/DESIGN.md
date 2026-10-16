@@ -42,21 +42,21 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # 当前实现与旧设计归档
 
-当前实现以README及protocol当前wire为准。下文六板块保留为迁移前设计档案（新增中止目标节除外），不再要求恢复其中旧Mailbox、AgentFailure、资源visibility、Memory和oneshot pending轮询接口。
+当前实现以README及protocol当前wire为准。下文六板块保留为迁移前设计档案（已实现的中止契约节除外），不再要求恢复其中旧Mailbox、AgentFailure、资源visibility、Memory和oneshot pending轮询接口。
 
-当前入站仅connection.register、workspace.start/stop、mcl.command、state.query、history.query；source绑定共享Client.resource_id。共享WebSocketMessageSend为target+serde_json::Value，事件定义在types::dto_events，插件仅re-export。MCL结果按id/source/target关联并核对完整Client Entity；Workspace结果使用内部唯一operation_id还原网络id。断连清理MCL/start/stop网络pending，不取消已提交领域操作，迟到结果不重建网络关联。
+当前入站为connection.register、workspace.start/stop、agent.turn.abort、mcl.command、state.query、history.query；source绑定共享Client.resource_id。共享WebSocketMessageSend为target+serde_json::Value，事件定义在types::dto_events，插件仅re-export。MCL结果按id/source/target关联并核对完整Client Entity；Workspace结果使用内部唯一operation_id还原网络id。断连清理MCL/start/stop/abort/snapshot网络pending，不取消已提交领域操作，迟到结果不重建网络关联。
 
-状态来自共享Agent.state/turn/sandbox/mcl和history.list；快照及接收连接集合未变化时不发送，避免event-driven自循环。HistoryRecord无持久sequence/time，投影sequence为list顺序1-based、created_at_ms=0表示未知。旧实时Memory、消息广播与AgentTokenUsage聚合不保留。
+状态来自共享Agent.state/turn/sandbox/mcl和history.list；快照及接收连接集合未变化时不发送，避免event-driven自循环。投影sequence为list顺序1-based，created_at_ms保留HistoryRecord创建时间，旧记录0表示未知。旧实时Memory、消息广播与AgentTokenUsage聚合不保留。
 
-## 用户轮次中止目标（待实现）
+## 用户轮次中止契约（已实现）
 
-本节为已批准的待实现契约，不声称当前代码已支持；不是复活旧邮箱、中止查表或全局 pending 实现。无 `get_turn`。
+独立控制请求转换为共享 AbortAgentTurn；网络层仅保存发起连接与完整领域关联，不恢复旧邮箱或执行 pending 轮询。无 `get_turn`。
 
 - 请求：`{ "type":"agent.turn.abort", "id":"abort-1", "message":{ "workspace":{id,name,project_root}, "agent":null, "turn_id":"turn-1" } }`。`id` 为网络请求关联，`turn_id` 为必填非空的预期活动轮次；agent 为 null 时选择 manager，其余身份规则与 MCL 相同。
 - 回执：`agent.turn.abort_result { id, workspace, agent, turn_id, result }`；result 使用 `{"Ok":null}` / `{"Err":{kind,message}}`。Ok 仅确认中止已受理或该关联轮次已中止，不证明执行 cleanup 已结束；失败保留请求 id。仅回复发起连接，source 来自真实注册 Client。
 - 入口受检解析 Workspace 与当前成员的完整实例，实际处理再次核对 turn_id；旧/不匹配轮次不得取消新轮次。对同一已中止轮次（含 Working 且 turn=None）重复请求幂等成功，仅保留必要已中止关联，不恢复全局 pending 表；未识别轮次报关联错误。
 - 状态为 `creating/idle/working/stopping`。中止立即清空 turn，真实清理期间保持 Working，正常 finish 收口才 Idle；状态同步同时发布 turn 与 status。前端据 status 显示运行态、据 turn 关联中止，不能把回执或 turn=None 当作 Idle。
-- AbortSystem 必须先于 MCL 实际执行及 inference/tool admission。共享事件允许各消费者独立观察，不靠 take reply 独占中止通知；执行前再次核对请求轮次，turn=None 或已中止旧轮次不启动推理/工具而返回正常取消结果。
+- AgentPlugin 将 abort_agent_turn_system 固定安装到 RuntimePlugin::PRE_UPDATE，先于 UPDATE 中的 MCL 实际执行及 inference/tool admission。共享事件允许各消费者独立观察，不靠 take reply 独占中止通知；执行前再次核对请求轮次，turn=None 或已中止旧轮次不启动推理/工具而返回正常取消结果。
 - Assistant 新增 stop_reason，覆盖全部推理原因，新增 `StopReason::Cancelled` 序列化 `cancelled`。兼容保留 `InferenceResponse.stop_reason`，单一权威映射生成，两处始终相同。用户轮次中止且真实清理成功返回 Ok assistant：`content="Turn aborted."`、`reasoning=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Cancelled`。
 - 取消工具且清理成功返回 Ok ToolCall：`failed=true`、`content="Tool call aborted."`，保留调用 ID、名称及已知 resource_id。批次保留已完成真实结果，其余每个调用（包括未启动项）各有一个原序结果；不虚构部分执行成功，不撤销已发生副作用。
 - `CleanupFailed` 仍为 Err，保留活动，不伪造取消或 Idle。用户轮次中止不同于根 Agent shutdown、owner abort、timeout、receiver closed，不统一转换这些原因。
@@ -319,3 +319,5 @@ LogPlugin负责：生成TracingStream，不感知DTO、WebSocket或连接目标�
 WorkspacePlugin负责：消费Workspace领域命令、解析Workspace和Agent逻辑身份。
 AgentPlugin负责：处理已经携带Entity的AgentMessage。
 ```
+
+中止网络关联使用内部唯一 operation_id，并核对 agent Entity、resource_id、workspace、完整 VM instance 与 expected_turn_id；只回复原 Client 实例与连接，断连清除关联但不撤回已受理中止。Working 期间拒绝 INJECT ? 中递归包含 user 的消息参数；工具可见性、sandbox 等非用户数组不被此守卫误拦截。

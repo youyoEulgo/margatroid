@@ -1,8 +1,8 @@
 # ToolPlugin
 
-## 用户轮次中止目标（待实现）
+## 用户轮次中止（已实现）
 
-以下为已批准、尚待实现的目标，不表示当前运行时已支持。无 `get_turn`；状态采用 `creating/idle/working/stopping`。中止立即清空 turn，清理期间仍为 Working，正常 finish 收口才 Idle；同步必须同时包含 turn 与 status。用户轮次中止与根 Agent shutdown、owner abort、timeout、receiver closed 不同，不统一归一为正常取消。
+工具受理及独立 turn_cancel 监督已实现，登记原子保存 turn 与沙箱快照。无 `get_turn`；状态采用 `creating/idle/working/stopping`。中止立即清空 turn，清理期间仍为 Working，正常 finish 收口才 Idle；同步必须同时包含 turn 与 status。用户轮次中止与根 Agent shutdown、owner abort、timeout、receiver closed 不同，不统一归一为正常取消。
 
 用户轮次中止且真实清理成功返回 `Ok(ToolExecuteResponse)`：ToolCall `failed=true`、`content="Tool call aborted."`，保留调用 ID、名称及已知 resource_id；未启动调用同用该正文。已完成结果保留；每个批次调用（含未启动项）按原顺序恰有一个结果。不伪造部分执行成功，取消不撤销已发生副作用。`CleanupFailed` 仍是 Err，保留活动，不宣称取消成功或空闲。
 

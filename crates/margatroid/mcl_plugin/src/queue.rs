@@ -27,6 +27,25 @@ fn stopped(agent: &Agent) -> bool {
         || agent.mcl.drained.is_closed()
 }
 
+fn user_injection(request: &MclCommand) -> bool {
+    fn contains_user(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Array(values) => values.iter().any(contains_user),
+            serde_json::Value::Object(value) => {
+                value.get("type").and_then(|value| value.as_str()) == Some("user")
+                    || value.get("messages").is_some_and(contains_user)
+            }
+            _ => false,
+        }
+    }
+    request.source.resource_type() == "client"
+        && matches!(
+            parser::parse(&request.command.text, &request.command.arguments),
+            Ok(ParsedOperation::Inject { .. })
+        )
+        && request.command.arguments.iter().any(contains_user)
+}
+
 pub fn enqueue_mcl_command(world: &mut World, request: MclCommand) {
     let checked = (|| {
         if request.id.trim().is_empty()
@@ -43,6 +62,9 @@ pub fn enqueue_mcl_command(world: &mut World, request: MclCommand) {
             .ok_or(MclError::AgentMissing)?;
         if stopped(agent) {
             return Err(MclError::AgentStopping);
+        }
+        if matches!(agent.state, AgentState::Working) && user_injection(&request) {
+            return Err(MclError::AgentBusy);
         }
         if agent
             .mcl
@@ -410,6 +432,9 @@ fn begin_database(
     let agent = world
         .get_component::<Agent>(entity)
         .ok_or(MclError::AgentMissing)?;
+    if matches!(agent.state, AgentState::Working) && user_injection(request) {
+        return Err(MclError::AgentBusy);
+    }
     let bindings = agent.import_bindings.clone();
     let context = agent
         .lua
@@ -613,11 +638,41 @@ fn execute_effect(
             }))
         }
         "start_turn" => {
-            world.get_component_mut::<Agent>(entity).unwrap().new_turn();
+            let agent = world.get_component_mut::<Agent>(entity).unwrap();
+            if !matches!(agent.state, AgentState::Idle) {
+                return Err(MclError::EffectInvalid);
+            }
+            agent.new_turn();
+            agent.state = AgentState::Working;
+            world.remove_component::<margatroid_types::agent_components::AbortedAgentTurn>(entity);
             Ok(Some(MclValue::Unit))
         }
         "finish_turn" => {
-            world.get_component_mut::<Agent>(entity).unwrap().turn = None;
+            let agent = world.get_component::<Agent>(entity).unwrap();
+            if matches!(agent.state, AgentState::Idle) {
+                return Ok(Some(MclValue::Unit));
+            }
+            if !matches!(agent.state, AgentState::Working) {
+                return Err(MclError::AgentStopping);
+            }
+            let aborted = world
+                .get_component::<margatroid_types::agent_components::AbortedAgentTurn>(entity)
+                .filter(|last| agent.lua.instance.as_ref() == Some(&last.instance));
+            let active = agent
+                .turn
+                .as_ref()
+                .or_else(|| aborted.map(|last| &last.turn_id));
+            if (agent.turn.is_some() && turn.as_ref() != agent.turn.as_ref())
+                || turn
+                    .as_ref()
+                    .is_some_and(|captured| Some(captured) != active)
+                || active.is_some_and(|id| !agent.execution.turn_is_drained(id))
+            {
+                return Err(MclError::EffectInvalid);
+            }
+            let agent = world.get_component_mut::<Agent>(entity).unwrap();
+            agent.turn = None;
+            agent.state = AgentState::Idle;
             Ok(Some(MclValue::Unit))
         }
         _ => Err(MclError::EffectInvalid),
@@ -687,6 +742,12 @@ fn begin_inference(
     let Some(BlockInner::Tool(tools)) = arrays.next() else {
         return Err(MclError::TypeMismatch);
     };
+    let current = world.get_component::<Agent>(entity).unwrap().turn.clone();
+    if current.is_none() || current != turn {
+        return Ok(Some(MclValue::Inference(
+            margatroid_types::message_types::InferenceResponse::aborted(),
+        )));
+    }
     let (tx, rx) = oneshot::channel();
     let pending = pending(world, entity, request);
     world.send_event(InferenceRequest {
@@ -760,6 +821,20 @@ fn begin_tools(
     };
     let calls = calls.clone();
     let aliases = visible_aliases(&visible)?;
+    let current = world.get_component::<Agent>(entity).unwrap().turn.clone();
+    if current.is_none() || current != turn {
+        let messages = calls
+            .iter()
+            .map(|call| {
+                failed_call(
+                    call,
+                    aliases.get(&call.tool_name).map(|r| r.resource_id.clone()),
+                    "Tool call aborted.".into(),
+                )
+            })
+            .collect();
+        return Ok(Some(MclValue::Array(BlockInner::Message(messages))));
+    }
     if calls
         .iter()
         .all(|call| !aliases.contains_key(&call.tool_name))

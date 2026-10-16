@@ -71,7 +71,7 @@ fn spawn(app: &mut App, name: &str) -> (Entity, Store) {
                 workspace: "workspace:test/demo".parse().unwrap(),
                 sandbox: None,
                 lua: Default::default(),
-                state: AgentState::Running,
+                state: AgentState::Idle,
                 history: AgentHistoryHandle::new(store.clone()),
                 database: margatroid_types::block_storage::AgentDatabaseHandle::new(
                     memory_plugin::SqliteAgentDatabase::open(":memory:").unwrap(),
@@ -266,6 +266,9 @@ fn source_cancel_wakes_event_driven_target_and_waits_for_real_reply() {
     let mut app = app();
     let (a, _) = spawn(&mut app, "a");
     let (b, _) = spawn(&mut app, "b");
+    let agent = app.world_mut().get_component_mut::<Agent>(b).unwrap();
+    agent.new_turn();
+    agent.state = AgentState::Working;
     app.world_mut()
         .get_component_mut::<Agent>(a)
         .unwrap()
@@ -362,6 +365,160 @@ fn source_cancel_wakes_event_driven_target_and_waits_for_real_reply() {
         .mcl
         .drained
         .is_drained());
+}
+
+#[test]
+fn aborted_effects_return_normal_results_and_finish_waits_for_cleanup() {
+    use margatroid_types::block_types::BlockInner;
+    use margatroid_types::execution_components::ExecutionActivityKind;
+    let mut app = app();
+    let (entity, _) = spawn(&mut app, "a");
+    let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
+    let turn = agent.new_turn();
+    agent.state = AgentState::Working;
+    let activity = agent
+        .execution
+        .register_for_turn(ExecutionActivityKind::Inference, Some(turn.clone()))
+        .unwrap();
+    let instance = agent.lua.instance.clone().unwrap();
+    agent.turn = None;
+    app.world_mut().insert_component(
+        entity,
+        margatroid_types::agent_components::AbortedAgentTurn {
+            instance,
+            turn_id: turn,
+        },
+    );
+    enqueue_mcl_command(
+        app.world_mut(),
+        request(
+            "infer-aborted",
+            "a",
+            "EMIT EFFECT inference ? ?",
+            vec![json!([]), json!([])],
+        ),
+    );
+    pump(&mut app, entity);
+    assert!(app
+        .world()
+        .event_reader::<margatroid_types::inference_events::InferenceRequest>()
+        .is_empty());
+    let result = app
+        .world()
+        .event_reader::<MclCommandResult>()
+        .into_iter()
+        .find(|reply| reply.id == "infer-aborted")
+        .unwrap();
+    assert_eq!(
+        result.result,
+        Ok(MclValue::Inference(InferenceResponse::aborted()))
+    );
+    enqueue_mcl_command(
+        app.world_mut(),
+        request(
+            "tools-aborted",
+            "a",
+            "EMIT EFFECT tool_call ? ?",
+            vec![
+                json!([{"type":"assistant","reasoning":null,"content":null,"usage":null,"tool_calls":[
+                    {"id":"first","tool_name":"missing","arguments":"{}"},
+                    {"id":"second","tool_name":"missing","arguments":"{}"}
+                ]}]),
+                json!([]),
+            ],
+        ),
+    );
+    pump(&mut app, entity);
+    assert!(app
+        .world()
+        .event_reader::<margatroid_types::tool_events::ToolExecuteRequest>()
+        .is_empty());
+    let result = app
+        .world()
+        .event_reader::<MclCommandResult>()
+        .into_iter()
+        .find(|reply| reply.id == "tools-aborted")
+        .unwrap();
+    let Ok(MclValue::Array(BlockInner::Message(messages))) = &result.result else {
+        panic!("{result:?}")
+    };
+    for (message, id) in messages.iter().zip(["first", "second"]) {
+        assert!(
+            matches!(message, AgentMessage::ToolCall { tool_call_id, content, failed:true, .. } if tool_call_id == id && content == "Tool call aborted.")
+        );
+    }
+    assert_eq!(messages.len(), 2);
+    enqueue_mcl_command(
+        app.world_mut(),
+        request("blocked-finish", "a", "EMIT EFFECT finish_turn", vec![]),
+    );
+    pump(&mut app, entity);
+    assert!(matches!(
+        app.world().get_component::<Agent>(entity).unwrap().state,
+        AgentState::Working
+    ));
+    activity.mark_completed().unwrap();
+    enqueue_mcl_command(
+        app.world_mut(),
+        request("finish", "a", "EMIT EFFECT finish_turn", vec![]),
+    );
+    pump(&mut app, entity);
+    assert!(matches!(
+        app.world().get_component::<Agent>(entity).unwrap().state,
+        AgentState::Idle
+    ));
+}
+
+#[test]
+fn start_requires_idle_and_client_user_admission_does_not_block_driver_writes() {
+    let mut app = app();
+    let (entity, _) = spawn(&mut app, "a");
+    enqueue_mcl_command(
+        app.world_mut(),
+        request("start", "a", "EMIT EFFECT start_turn", vec![]),
+    );
+    pump(&mut app, entity);
+    let turn = app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .turn
+        .clone();
+    enqueue_mcl_command(
+        app.world_mut(),
+        request("start-again", "a", "EMIT EFFECT start_turn", vec![]),
+    );
+    pump(&mut app, entity);
+    assert_eq!(
+        app.world().get_component::<Agent>(entity).unwrap().turn,
+        turn
+    );
+    let inject = request(
+        "user",
+        "a",
+        "INJECT ? TO entry.m",
+        vec![json!([{"type":"inject","messages":[{"type":"user","content":"busy"}]}])],
+    );
+    enqueue_mcl_command(app.world_mut(), inject.clone());
+    app.world_mut().advance_event_frame();
+    assert!(app
+        .world()
+        .event_reader::<MclCommandResult>()
+        .into_iter()
+        .any(|reply| reply.id == "user" && reply.result == Err(MclError::AgentBusy)));
+    let mut driver = inject;
+    driver.id = "driver".into();
+    driver.source = "agent:test/a".parse().unwrap();
+    enqueue_mcl_command(app.world_mut(), driver);
+    assert_eq!(
+        app.world()
+            .get_component::<Agent>(entity)
+            .unwrap()
+            .mcl
+            .commands
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -509,6 +666,7 @@ fn pending_blocks_tail_stop_keeps_head_and_completion_is_correlated() {
                     content: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
+                    stop_reason: None,
                 },
                 stop_reason: StopReason::Completed,
             },
@@ -625,7 +783,9 @@ fn real_inference_reply_unblocks_fifo_and_keeps_submission_turn() {
     use margatroid_types::inference_events::InferenceRequest;
     let mut app = app();
     let (a, store) = spawn(&mut app, "a");
-    app.world_mut().get_component_mut::<Agent>(a).unwrap().turn = Some("submitted".into());
+    let agent = app.world_mut().get_component_mut::<Agent>(a).unwrap();
+    agent.turn = Some("submitted".into());
+    agent.state = AgentState::Working;
     app.world().send_event(request(
         "infer",
         "a",
@@ -668,6 +828,7 @@ fn real_inference_reply_unblocks_fifo_and_keeps_submission_turn() {
                 content: Some("actual".into()),
                 tool_calls: vec![],
                 usage: None,
+                stop_reason: None,
             },
             stop_reason: StopReason::Completed,
         }))
@@ -1055,6 +1216,7 @@ fn message_store_failure_does_not_affect_inference_result_or_trigger_implicit_wr
                         content: Some("real".into()),
                         tool_calls: vec![],
                         usage: None,
+                        stop_reason: None,
                     },
                     stop_reason: StopReason::Length,
                 },
@@ -1088,6 +1250,9 @@ fn real_tool_batch_returns_ordered_failures_and_only_caller_selected_messages_ar
     use resource_id_plugin::ResourceSet;
     let mut app = app();
     let (a, store) = spawn(&mut app, "a");
+    let agent = app.world_mut().get_component_mut::<Agent>(a).unwrap();
+    agent.new_turn();
+    agent.state = AgentState::Working;
     let mut tools = ResourceSet::new();
     tools.insert(
         "tool:test/one".parse().unwrap(),
@@ -1212,6 +1377,165 @@ fn real_tool_batch_returns_ordered_failures_and_only_caller_selected_messages_ar
         assert!(record.payload.get("content").is_none());
     }
     assert_eq!(*store.message_batches.lock().unwrap(), 1);
+}
+
+#[test]
+fn partial_tool_batch_abort_preserves_completed_reply_and_finishes_normally() {
+    use margatroid_types::agent_components::AbortedAgentTurn;
+    use margatroid_types::block_types::BlockInner;
+    use margatroid_types::execution_components::ExecutionActivityKind;
+    use margatroid_types::inference_events::InferenceRequest;
+    use margatroid_types::tool_events::{ToolExecuteRequest, ToolExecuteResponse};
+    let mut app = app();
+    let (entity, _) = spawn(&mut app, "a");
+    bind_tool(&mut app, entity, callable("tool:test/one", "run"));
+    let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
+    let turn = agent.new_turn();
+    agent.state = AgentState::Working;
+    app.world().send_event(request(
+        "partial",
+        "a",
+        "EMIT EFFECT tool_call ? ?",
+        vec![
+            json!([{"type":"assistant","tool_calls":[
+                {"id":"first","tool_name":"run","arguments":"{}"},
+                {"id":"second","tool_name":"run","arguments":"{}"}
+            ]}]),
+            json!(["run"]),
+        ],
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let calls = loop {
+        app.tick();
+        let calls = app
+            .world()
+            .event_reader::<ToolExecuteRequest>()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if !calls.is_empty() {
+            break calls;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+    assert_eq!(calls.len(), 2);
+    let agent = app.world().get_component::<Agent>(entity).unwrap();
+    let activities = calls
+        .iter()
+        .map(|_| {
+            agent
+                .execution
+                .register_for_turn(ExecutionActivityKind::Sandbox, Some(turn.clone()))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let first = AgentMessage::ToolCall {
+        resource_id: Some(calls[0].resource.resource_id.clone()),
+        tool_call_id: "first".into(),
+        tool_name: "run".into(),
+        content: "completed before abort".into(),
+        failed: false,
+    };
+    calls[0]
+        .reply
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .send(Ok(ToolExecuteResponse {
+            message: first.clone(),
+        }))
+        .unwrap();
+    activities[0].mark_completed().unwrap();
+    app.tick();
+    assert!(app
+        .world()
+        .get_component::<Agent>(entity)
+        .unwrap()
+        .mcl
+        .pending
+        .is_some());
+    let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
+    agent.turn = None;
+    agent.execution.cancel_turn(&turn);
+    let instance = agent.lua.instance.clone().unwrap();
+    app.world_mut().insert_component(
+        entity,
+        AbortedAgentTurn {
+            instance,
+            turn_id: turn,
+        },
+    );
+    assert!(activities[1].turn_cancel.is_cancelled());
+    assert!(!activities[1].cancel.is_cancelled());
+    activities[1].mark_completed().unwrap();
+    calls[1]
+        .reply
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .send(Ok(ToolExecuteResponse::aborted(
+            Some(calls[1].resource.resource_id.clone()),
+            &calls[1].call,
+        )))
+        .unwrap();
+    tick_until_result(&mut app, "partial");
+    let reply = app
+        .world()
+        .event_reader::<MclCommandResult>()
+        .into_iter()
+        .find(|reply| reply.id == "partial")
+        .unwrap()
+        .clone();
+    let Ok(MclValue::Array(BlockInner::Message(messages))) = &reply.result else {
+        panic!("{reply:?}")
+    };
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0], first);
+    assert!(
+        matches!(&messages[1], AgentMessage::ToolCall {tool_call_id, content, failed:true, ..} if tool_call_id == "second" && content == "Tool call aborted.")
+    );
+    assert!(matches!(
+        app.world().get_component::<Agent>(entity).unwrap().state,
+        AgentState::Working
+    ));
+    enqueue_mcl_command(
+        app.world_mut(),
+        request(
+            "after-batch",
+            "a",
+            "EMIT EFFECT inference ? ?",
+            vec![json!(messages), json!([])],
+        ),
+    );
+    tick_until_result(&mut app, "after-batch");
+    assert!(app.world().event_reader::<InferenceRequest>().is_empty());
+    let reply = app
+        .world()
+        .event_reader::<MclCommandResult>()
+        .into_iter()
+        .find(|reply| reply.id == "after-batch")
+        .unwrap();
+    assert_eq!(
+        reply.result,
+        Ok(MclValue::Inference(InferenceResponse::aborted()))
+    );
+    enqueue_mcl_command(
+        app.world_mut(),
+        request(
+            "after-cancelled-assistant",
+            "a",
+            "EMIT EFFECT finish_turn",
+            vec![],
+        ),
+    );
+    tick_until_result(&mut app, "after-cancelled-assistant");
+    let agent = app.world().get_component::<Agent>(entity).unwrap();
+    assert!(matches!(agent.state, AgentState::Idle));
+    assert!(agent.turn.is_none());
+    assert!(!agent.execution.is_closed());
 }
 
 #[test]
@@ -1843,6 +2167,9 @@ fn effect_selectors_use_one_database_request_and_current_import_ids() {
         )
         .unwrap();
     backend.operations.lock().unwrap().clear();
+    let agent = app.world_mut().get_component_mut::<Agent>(entity).unwrap();
+    agent.new_turn();
+    agent.state = AgentState::Working;
     enqueue_mcl_command(
         app.world_mut(),
         request("infer", "a", "EMIT EFFECT inference (b.m) (b.t)", vec![]),
@@ -1879,6 +2206,7 @@ fn effect_selectors_use_one_database_request_and_current_import_ids() {
                 content: None,
                 tool_calls: vec![],
                 usage: None,
+                stop_reason: None,
             },
             stop_reason: StopReason::Completed,
         }))

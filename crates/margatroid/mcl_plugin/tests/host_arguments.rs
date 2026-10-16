@@ -53,7 +53,7 @@ fn app() -> (App, Entity) {
                 workspace: "workspace:test/a".parse().unwrap(),
                 sandbox: None,
                 lua: Default::default(),
-                state: AgentState::Running,
+                state: AgentState::Idle,
                 history: AgentHistoryHandle::new(Store::default()),
                 database: margatroid_types::block_storage::AgentDatabaseHandle::new(
                     memory_plugin::SqliteAgentDatabase::open(":memory:").unwrap(),
