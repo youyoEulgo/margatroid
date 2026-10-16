@@ -39,6 +39,37 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 无 `get_turn`。Agent状态为 Creating / Idle / Working / Stopping，对外同步为 `creating/idle/working/stopping`，同时发布 turn 与 status。启动成功进入 Idle、turn=None；start_turn仅允许Idle，原子创建唯一turn并置Working，不覆盖已有轮次。AbortAgentTurn控制系统在RuntimePlugin::PRE_UPDATE执行，先于UPDATE中的MCL实际动作及Inference/Tool受理；自定义调度必须保留该顺序。控制受理验证完整Agent实例、workspace、Driver实例及expected_turn_id，立即清空turn但保持Working，仅取消匹配活动的独立turn_cancel，不关闭根作用域。正常finish_turn核对当前Driver结果关联及真实清理完成后才置Idle；Working收口期间同一中止关联重复请求幂等，不能让迟到旧完成覆盖新轮次。用户轮次中止不等于根Agent shutdown、owner abort、timeout或receiver closed。
 
+## 领域推理请求分层（已批准，待实现）
+
+```text
+归属：
+    在共享types新增独立inference_request_types.rs，定义DomainRequest及其直接需要的纯值请求参数
+    不把API格式、厂商适配器、HTTP、URL、凭据、ECS实例、取消令牌或oneshot放入DomainRequest
+    ApiFormat、ApiRequest、三种具体API请求、厂商处理器、能力配置与转换错误全部归inference_plugin::types
+
+DomainRequest：领域推理请求，公开纯值结构体
+    messages: Vec<AgentMessage>--按本地上下文顺序组织的领域消息
+    tools: Vec<ToolDefinition>--已经选定alias、描述与schema的纯工具定义
+    config: DomainRequestConfig--通用模型名与采样/输出限制；不是插件的InferenceConfig Resource
+    说明：拥有数据，不借用World；Default仅产生空消息/工具与空缺省参数，不选择厂商或编造有效模型
+
+DomainRequestConfig：通用请求配置，公开纯值结构体
+    model: String--上游模型名，不是本地route ID；默认空值必须在执行前拒绝
+    temperature: Option<f32>
+    max_output_tokens: Option<u32>
+    top_p: Option<f32>
+    stop: Vec<String>
+    说明：厂商私有参数保留在推理插件的编译路由，不能倒灌到共享配置
+
+与执行事件的区别：
+    InferenceRequest仍为执行事件，包含Agent Entity、turn、cancel与唯一reply
+    资源许可、回合受理和选定Tool快照投影完成后，由推理插件构造DomainRequest
+    转换使用TryFrom/TryInto，失败必须显式返回；不能为.into便利静默丢失信息
+    Driver保持领域上下文与回合流程，不因API格式切换而更换；Responses初期同样采用本地完整无状态上下文
+```
+
+该分层是待实现目标，当前ProviderInput等旧接口的源码归属在实现迁移前保持不变。
+
 # lib
 
 ## 逻辑

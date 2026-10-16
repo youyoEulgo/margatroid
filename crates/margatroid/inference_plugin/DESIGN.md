@@ -38,7 +38,11 @@ types      src/types.rs及共享纯值契约       Provider协议与配置辅助
 error      共享推理错误契约               校验、执行及协议错误
 ```
 
-**本文描述已实现的typed snapshot请求：InferenceRequest.tools为Vec<CallableResource>，System消息保留真实Provider role。** 既有单推理入口、准备System、通用异步闭包及独立supervisor/HTTP worker、oneshot与真实cleanup边界保持不变；现消费MCL选定的不可变typed snapshots。全局仍只有一份模型配置；提交前取得全部已注册webui客户端发送器快照，闭包直接推流，后来连接不加入本次推理。
+**状态：本文既记录当前实现基线，也记录已批准但待实现的格式/vendor分层重构；带“待实现”的目标不是现有代码能力。未特别标记的既有类型和流程仍描述当前实现。**
+
+已批准目标（待实现）：共享types的专用 `inference_request_types.rs` 只定义单一纯领域请求 `DomainRequest`（拥有 `Vec<AgentMessage>`、`Vec<ToolDefinition>` 和纯 `DomainRequestConfig` 公共语义配置）；执行事件 `InferenceRequest` 仍承担Entity、turn、cancel和oneshot。插件内按 `DomainRequest -> 具体格式请求 -> vendor handler -> HTTP` 正向转换，SSE响应按vendor与格式逆向归一。`ApiFormat` 与必填执行选择器provider相互独立，model也不决定两者；唯一配置仍为现有 `models.toml`，不新增并行 `config.toml`。本次只更新文档，不创建该源文件、不实现重构。
+
+**当前已实现的typed snapshot请求：InferenceRequest.tools为Vec<CallableResource>，System消息保留真实Provider role。** 既有单推理入口、准备System、通用异步闭包及独立supervisor/HTTP worker、oneshot与真实cleanup边界保持不变；现消费MCL选定的不可变typed snapshots。全局仍只有一份模型配置；提交前取得全部已注册webui客户端发送器快照，闭包直接推流，后来连接不加入本次推理。
 
 当前输入边界：MCL只有MESSAGE、TOOL、SANDBOX三种typed arrays。TOOL保存可调用资源值（ResourceID、alias、description、schema及不可变共享执行材料快照），不是ToolCall请求数组。`IMPORT TOOL tool AS alias`绑定资源，`GET alias`解析并取得typed snapshot；`infer`参数依次为MESSAGE array、TOOL array，不接受ResourceID array，不再次执行global alias query。旧Block不随reload暗变，新GET alias取得新快照。TOOL仅允许tool资源，旧skill/hook导入明确拒绝。
 
@@ -115,6 +119,19 @@ InferenceConfig：推理配置，公开Resource--实现侧配置，不是图书�
     使用共享Client组件与连接查询契约，不依赖ClientPlugin Handler
     通过共享WorldClientExt.client_webui_senders()取得已注册webui发送器快照，不依赖客户端实现Handler
     推流不按Workspace隔离；推流关联包含不透明agent_instance字符串及Agent逻辑地址供客户端区分；agent_instance仅为关联值，不能作为协议请求目标或解码为Entity
+```
+
+## 已批准目标边界（待实现）
+
+```text
+配置编译：
+    当前with_api_type及ProviderAdapterFactory注册方式仅为旧实现基线，不是目标扩展协议
+    目标分别解析ApiFormat与必填provider，model保持独立的远端模型名称
+    在唯一models.toml加载和重载时验证明确支持矩阵及每条路由的选项/能力；未知格式、vendor或组合一律拒绝
+    不按base_url猜格式或vendor，不在未知组合上回退到openai或通用HTTP实现
+    全部路由与非敏感ModelRuntimeCatalog投影编译成功后原子发布；任一失败同时保留旧配置及旧catalog
+    新格式通过具体格式类型/ApiRequest分支及双向编解码扩展；新vendor通过显式handler及矩阵登记扩展
+    类型擦除只在插件内部调度边界使用，不把旧api_type字符串工厂伪装成已完成的目标架构
 ```
 
 # system
@@ -278,6 +295,30 @@ load_model_routes(path: &Path, factories: &HashMap<String, ErasedProviderAdapter
     若将来需要压缩，调用同一推理接口，由调用方解释结果
 ```
 
+## 已批准请求及响应主线（待实现）
+
+```text
+准备与编码：
+    保留现有InferenceRequest事件、资源validate_owner、真实role、typed snapshots及监督/cleanup边界
+    主线程收集所选工具的纯ToolDefinition与拥有所有权的AgentMessage，构造唯一DomainRequest
+    DomainRequest包含公共语义参数，不携带Entity、turn、cancel、reply、HTTP/URL/key/provider或执行状态
+    保留完整领域输入；已有resource IDs、工具调用ID、reasoning、参数及工具结果关联不得在中间层静默丢失
+    解析路由后先取得vendor/model能力快照；涉及消息结构的能力差异必须在格式转换前参与验证/编码
+    以TryFrom<DomainRequest>或TryFrom<EncodeInput>调用.try_into()得到具体格式请求，再以ApiRequest调度到对应vendor handler
+    EncodeInput若需要能力，只是插件内编码辅助输入，不是第二套共享请求；不得把路由、HTTP或执行设施塞进DomainRequest
+    无法表达或不支持的语义在vendor process/HTTP前显式失败；不先做有损通用编码再由vendor补救
+    vendor process接收具体格式类型（如OpenAi<ChatCompletionsRequest>），应用厂商参数、鉴权、端点及传输规则
+    Responses首期为普通无状态请求：每次携带完整本地上下文，不依赖远端conversation/previous_response_id等状态
+
+响应与终态：
+    原始HTTP/SSE -> vendor特有解析/兼容处理 -> 对应格式响应累积/解码 -> 统一InferenceResponse
+    格式层理解ChatCompletions/Messages/Responses各自事件与结束条件，不把所有格式按[DONE]或choice判断
+    vendor层保留厂商reasoning、usage及停止原因差异；格式层保留工具调用ID、name、arguments与结果关联
+    以统一响应构造helper保留reasoning、tool_calls、usage、真实stop_reason，外层与Assistant.stop_reason来自同一权威映射
+    正常完成和用户轮次abort使用同一不变量/helper；abort仍为真实cleanup成功后的正常Cancelled响应，不混同其他取消原因
+    继续拒绝半流、重复/缺失工具ID、非法参数及未知工具；不以清空字段伪造格式兼容
+```
+
 # events
 
 ## 类型
@@ -325,6 +366,64 @@ InferenceReloadOutput：配置重载输出，公开共享内部事件
 ```
 
 # types
+
+## 已批准类型与handler目标（待实现）
+
+以下为目标伪代码，不代表现有类型已经替换。下方原有ProviderInput、ProviderMessage、ProviderAdapter等清单仍为当前实现基线。
+
+```text
+共享types/inference_request_types.rs（纯领域值，不依赖插件）：
+    DomainRequest：唯一共享领域请求
+        messages: Vec<AgentMessage>--拥有完整领域消息快照
+        tools: Vec<ToolDefinition>--已完成归属校验的纯工具定义，不是CallableResource执行材料
+        config: DomainRequestConfig--公共语义配置
+    DomainRequestConfig：纯语义配置，不是插件InferenceConfig Resource
+        model: String--上游模型名称；默认空值在执行前拒绝，不从名称猜vendor或格式
+        temperature: Option<f32>
+        max_output_tokens: Option<u32>
+        top_p: Option<f32>
+        stop: Vec<String>
+    约束：不含HTTP、URL、key、provider、Entity、turn、执行状态、CancellationToken或channel；不平行复制第二套DomainRequest
+
+inference_plugin::types（插件自有格式与vendor层）：
+    ApiFormat：格式枚举
+        ChatCompletions--稳定配置值chat_completions
+        Messages--稳定配置值messages
+        Responses--稳定配置值responses
+    ChatCompletionsRequest / MessagesRequest / ResponsesRequest：各自格式的具体请求结构体
+        说明：表达对应消息、工具和公共参数的格式结构；不是共享领域契约，也不是同一通用JSON壳
+        impl TryFrom<DomainRequest>或TryFrom<EncodeInput> for 对应具体请求
+            type Error = InferenceError
+            行为：使用.try_into()执行可失败转换；验证完整语义及目标能力，不能以From或默认字段掩盖不支持输入
+    ApiRequest：格式请求调度枚举
+        ChatCompletions(ChatCompletionsRequest)
+        Messages(MessagesRequest)
+        Responses(ResponsesRequest)
+    EncodeInput：可选插件内编码输入
+        说明：若结构转换依赖能力，组合DomainRequest与不可变能力快照；不是第二个共享请求或执行事件
+    Vendor：必填provider对应的执行选择枚举
+        OpenAi / Anthropic / DeepSeek / OpenRouter
+        说明：与ApiFormat独立，与model名称独立；不存在隐式默认或仅用作展示的provider
+    ApiAdapter：插件内vendor/format组合分发边界
+        行为：仅构造支持矩阵中的具体handler，不以URL或模型名猜测，不以任意兼容handler兜底
+    OpenAi<TConcreteRequest> / Anthropic<TConcreteRequest> / DeepSeek<TConcreteRequest> / OpenRouter<TConcreteRequest>：具体vendor handler
+        说明：泛型参数为具体格式结构体，如OpenAi<ResponsesRequest>；不能把ApiRequest枚举变体当作Rust类型参数
+        process：接收已完成能力校验的格式请求，处理该vendor的选项、鉴权、端点与HTTP执行
+        响应：配合对应格式解码器逆向归一；不把vendor差异混入共享DomainRequest
+
+初始支持矩阵（已批准建议，待实现；只允许下列显式组合）：
+    openai      chat_completions / responses
+    anthropic   messages
+    deepseek    chat_completions / messages / responses
+    openrouter  chat_completions--显式generic-compatible handler，不是未知vendor回退
+    说明：矩阵不是当前运行时能力声明；实现时需分别提供并验证对应编解码及能力限制，不因矩阵条目就假定所有模型支持所有语义
+    加载与重载拒绝未知或未列出组合；vendor/model能力约束可以进一步缩窄输入，不能静默降级
+
+多模态后续概念（未实现，不属于本轮代码改动）：
+    User及工具结果ToolCall内容未来可由纯文本扩展为有类型content blocks，保留文本、图像等来源/媒介语义
+    不能把图像base64当普通文本插入来宣称视觉支持；工具结果同样不得丢失或伪造媒体语义
+    当前目标格式/vendor/model若不支持相应block，使用可失败转换明确拒绝，不静默丢块、不伪装vision能力
+```
 
 ## 类型
 

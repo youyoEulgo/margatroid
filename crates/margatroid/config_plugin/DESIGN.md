@@ -44,6 +44,8 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 lib 只放 Plugin 与安装逻辑。MargatroidConfig 是配置 Resource，放在 types。
 
+模型配置职责：config.toml继续只保存Server、日志与出站策略；模型路由唯一来源为InferencePlugin读取的models.toml，不在本crate维护重复路由或API适配器。已批准待实现的路由规则为provider与api_type共同选择执行分支：api_type仅chat_completions/messages/responses，provider为必需厂商选择而非显示元数据。枚举、组合支持矩阵、凭据和协议校验归InferencePlugin；ConfigPlugin不依赖其实现类型。旧models.toml值的迁移在该目标实现时进行，本次文档变更不改主目录配置。
+
 ## 类型
 
 公开：

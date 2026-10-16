@@ -16,6 +16,8 @@ member_messages = ["type:webui"]
 streaming_member_messages = ["type:webui"]
 ```
 
+模型路由仍只在 `~/.margatroid/models.toml` 配置，不在 `config.toml` 复制一份。已批准、待实现的路由规则将使 `provider` 成为执行厂商选择，并与三种 `api_type`（`chat_completions`、`messages`、`responses`）共同决定分支；对应解析、兼容组合及重载校验均归 InferencePlugin。本 crate 的配置职责不变，本次未迁移实际配置文件。
+
 `server.allow` 是入口策略，缺省为 `"localhost"`：只接受回环对端，并且带 `Origin` 的请求要求其
 authority 与 `Host` 一致。也可以写 `"all"`（需同时放宽 `bind`）或 IP/CIDR 数组。策略由
 `IngressPolicy` 实现 ServerPlugin 的 `HandshakeGuard` 接缝，因此业务词表留在本 crate，

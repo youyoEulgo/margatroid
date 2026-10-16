@@ -24,6 +24,12 @@ Prompt、Sandbox和Tool都使用同一种身份格式。`ResourceId`是跨Plugin
 Compose使用 `WorkspaceDefinition` 和 `WorkspaceAgentDefinition` 把配置文件编译成进程内静态业务
 输入。它们不包含运行时Entity，也不负责加载驱动、打开Memory或创建AgentInstance。
 
+## 领域推理请求分层（已批准，待实现）
+
+共享层单独以 `inference_request_types.rs` 保存纯值 `DomainRequest { messages: Vec<AgentMessage>, tools: Vec<ToolDefinition>, config: DomainRequestConfig }`。`DomainRequestConfig` 只包含上游模型名、temperature、max_output_tokens、top_p、stop；不包含厂商扩展、URL、密钥、HTTP Client、Entity、取消或回复通道。Default 是空请求，不是有效的默认模型路由。
+
+`InferenceRequest` 继续表示带运行期关联和 oneshot 的执行事件，不能与纯值请求混为一体。API 格式、三种具体请求、`ApiRequest`、`ApiAdapter`、厂商处理器及转换错误只在 `inference_plugin::types` 定义；共享层不依赖推理插件。可失败转换采用 `TryFrom` / `try_into()?`，不为方便而丢弃消息信息。完整类型与转换边界见本 crate 设计及推理插件设计；本节不声明新结构已经实现。
+
 ## 共享消息与执行边界
 
 `AgentMessage` 是纯消息值，不是带 Entity 的路由事件；包含 Inject、System、User、Assistant、ToolCall 结果及 Error。`ToolCall` 输入只存在于 Assistant.tool_calls。资源可见性由 Agent 的显式导入绑定与 MESSAGE/TOOL/SANDBOX typed arrays 决定，不恢复旧 AgentFailure、邮箱或可见性集合。

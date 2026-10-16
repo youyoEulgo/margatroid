@@ -354,6 +354,7 @@ MclCommandResult：命令结果，公开事件
 InferenceRequest：统一推理请求，公开事件
     tools: Vec<CallableResource>--替代resources:Vec<ResourceID>，定义于inference_events
     说明：其他关联、消息、取消与oneshot字段沿用领域契约，不由MCL复制完整结构。
+    推理分层目标（待实现）：MCL继续只提交领域消息与选定工具快照，不选择API格式或厂商，也不直接构造HTTP。InferencePlugin验证后构造共享纯值DomainRequest，再按模型路由provider与api_type转换；InferenceRequest仍为执行事件，不被DomainRequest替代。Driver无需因Chat Completions、Messages或无状态Responses切换而更换。
 
 ToolExecuteRequest：单调用执行请求，公开事件
     resource: CallableResource--选定共享快照，自含ResourceID，不另建重复resource_id字段
