@@ -23,7 +23,7 @@
 
 未知provider、格式或未列出组合在加载/重载时拒绝；无URL猜测、无隐式openai兜底。具体vendor/model能力还可进一步限制输入。配置唯一来源仍为现有 `models.toml`，不是新增并行 `config.toml`；旧 `api_type = "openai"` / `"deepseek"` 已拒绝，必须改为实际格式值并明确provider。全部路由与catalog编译成功才原子发布；重载失败同时保留旧配置和旧catalog，在途请求保留原快照。
 
-用户图像：`User { content, images: Vec<UserImage> }` 使用原始标准base64，空images默认并省略。handler预检及格式normalize均调用共享 `validate_user_images`：仅png/jpeg/gif/webp、每消息最多8张、每图5MiB、每消息解码总量20MiB，校验magic与MIME一致。仅User允许图像，System/Assistant/Tool不支持。顺序统一为非空文本在前、图像按输入顺序在后；纯图像不生成空文本块。Chat使用image_url data URL，Messages使用base64 image source，Responses使用input_image data URL；无图像时保持旧请求体。七组合的API形状支持不保证上游模型视觉能力，尤其不声明DeepSeek模型支持视觉。
+用户图像：`User { content, images: Vec<UserImage> }` 使用原始标准base64，空images默认并省略。handler预检及格式normalize均调用共享 `validate_user_images`：仅png/jpeg/gif/webp、每消息最多8张、每图5MiB、每消息解码总量20MiB，校验magic与MIME一致。User和ToolCall结果允许图像，System/Assistant不支持。工具结果保留原content纯文本及tool_call_id关联：Messages非空images使用tool_result.content文本/图像数组；Responses使用原生function_call_output.output的input_text/input_image数组，不包装为user。Chat保留所有role=tool文本结果，等当前并行批次全部tool_call_id满足后才追加格式层合成user图像消息；每张图像前标注tool_call_id来源，保持结果及图像顺序。转换不修改DomainRequest之外的权威本地历史，重复构建不累积合成消息。顺序统一为非空文本在前、图像按输入顺序在后；纯图像不生成空文本块。Chat使用image_url data URL，Messages使用base64 image source，Responses使用input_image data URL；无图像时保持旧请求体。七组合的API形状支持不保证上游模型视觉能力，尤其不声明DeepSeek模型支持视觉。
 
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
@@ -107,7 +107,7 @@ Messages将System提取为system文本块，工具调用/结果编码为tool_use
 
 Responses每次发送完整本地上下文，`store: false` 且 `include: ["reasoning.encrypted_content"]`；不依赖conversation或previous_response_id。函数调用与输出以call_id关联；不支持stop序列时显式拒绝。SSE按output item/content part及格式自己的终态检查完成，不把[DONE]当作所有格式的结束条件。
 
-Assistant新增可选 `replay: Option<serde_json::Value>`，旧消息缺字段默认为None。它是领域层不解释的API-tagged JSON信封：`{ "api_format": "messages" | "responses", "items": [...] }`。Messages保留thinking的文本及signature、redacted_thinking的data；Responses保留reasoning item的id、summary及可用的content/encrypted_content。完整响应和显式历史/DTO往返保留它，显示reasoning不能代替它。不兼容格式、无效信封及缺少必要replay的历史reasoning在HTTP前拒绝；Chat Completions不接受外来replay，OpenAI chat也拒绝非空历史reasoning。User支持独立images，工具结果仍为String纯文本。
+Assistant新增可选 `replay: Option<serde_json::Value>`，旧消息缺字段默认为None。它是领域层不解释的API-tagged JSON信封：`{ "api_format": "messages" | "responses", "items": [...] }`。Messages保留thinking的文本及signature、redacted_thinking的data；Responses保留reasoning item的id、summary及可用的content/encrypted_content。完整响应和显式历史/DTO往返保留它，显示reasoning不能代替它。不兼容格式、无效信封及缺少必要replay的历史reasoning在HTTP前拒绝；Chat Completions不接受外来replay，OpenAI chat也拒绝非空历史reasoning。User和ToolCall结果支持独立images；工具结果content仍为String，空images保持旧文本请求体，失败标志在Messages中保留is_error。工具图像与用户图像使用相同共享校验和32MiB上下文/请求体上限。
 
 ## 发起一次推理
 

@@ -63,6 +63,14 @@ AbortSystem先于MCL实际执行与工具受理；每个消费者独立观察共
 
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
+## 图片工具结果契约
+
+runner继续返回String；仅含ok布尔及content字符串的JSON envelope被识别为结构化结果。可选images必须反序列化为共享UserImage并经validate_user_images校验，错误明确返回ToolError而非退回纯文本；普通字符串保持原样。成功ToolCall传递images，取消与失败不附图。错误诊断不得回显图片base64。
+
+local/read-image以io.open(path, "rb")读取最多5MiB+1，按PNG/JPEG/GIF/WebP magic识别而非扩展名，使用margatroid().base64_encode通用runtime helper编码（单次输入最多5MiB，线性时间，避免纯Lua循环超出指令预算）；相对路径以context.project_root为根，绝对路径保持原样，所有IO仍在受限worker及现有真实cleanup监督下执行。
+
+通用ToolExecutionLimits.result_bytes默认32MiB，独立限制图片base64 envelope结果String；output_bytes继续默认1MiB并限制旧纯文本、去掉images后的JSON envelope及shell输出，diagnostic_bytes不变。worker和父进程均验证结果，非图片字段不可借结果预算突破文本限额；不按工具身份特殊分支，不增加metadata提额入口。协议管道额外保留有界JSON转义开销，图片data不写stderr诊断。
+
 # lib
 
 ## 类型
@@ -277,7 +285,8 @@ CallableResource：TOOL元素，公开共享纯值契约--归共享types，本�
 ToolExecutionLimits：执行限额，公开结构体
     script_bytes: usize
     argument_bytes: usize
-    output_bytes: usize
+    output_bytes: usize--纯文本、去除images后的JSON及shell上限，默认1MiB
+    result_bytes: usize--含图片base64的结构化结果String上限，默认32MiB
     diagnostic_bytes: usize
     memory_bytes: usize
     instruction_budget: u64

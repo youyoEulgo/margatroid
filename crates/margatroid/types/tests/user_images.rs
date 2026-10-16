@@ -125,3 +125,35 @@ fn limits_accept_exact_boundaries_and_reject_overages() {
         .unwrap_err()
         .contains("5 MiB"));
 }
+
+#[test]
+fn tool_result_images_preserve_legacy_wire_and_history() {
+    let legacy = json!({"type":"tool_call","resource_id":null,"tool_call_id":"read","tool_name":"read_image","content":"loaded","failed":false});
+    let message: AgentMessage = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(matches!(&message, AgentMessage::ToolCall { images, .. } if images.is_empty()));
+    assert_eq!(serde_json::to_value(message).unwrap(), legacy);
+    let mut wire = legacy;
+    wire["images"] = json!([image("image/png", b"\x89PNG\r\n\x1a\n")]);
+    let message: AgentMessage = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&message).unwrap(), wire);
+    let (content, mut payload) =
+        margatroid_types::history_components::message_history_parts(&message);
+    assert_eq!(content, "loaded");
+    assert_eq!(payload["images"], wire["images"]);
+    assert!(payload.get("content").is_none());
+    payload["content"] = content.into();
+    assert_eq!(
+        serde_json::from_value::<AgentMessage>(payload).unwrap(),
+        message
+    );
+    for images in [
+        json!([{"media_type":"image/png","data":"secret_invalid"}]),
+        json!(vec![image("image/png", b"\x89PNG\r\n\x1a\n"); 9]),
+    ] {
+        wire["images"] = images;
+        let error = serde_json::from_value::<AgentMessage>(wire.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("secret_invalid"));
+    }
+}

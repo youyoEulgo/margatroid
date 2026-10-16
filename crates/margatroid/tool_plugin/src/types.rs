@@ -8,6 +8,8 @@ pub struct ToolExecutionLimits {
     pub script_bytes: usize,
     pub argument_bytes: usize,
     pub output_bytes: usize,
+    #[serde(default = "default_result_bytes")]
+    pub result_bytes: usize,
     pub diagnostic_bytes: usize,
     pub memory_bytes: usize,
     pub instruction_budget: u64,
@@ -15,12 +17,16 @@ pub struct ToolExecutionLimits {
     pub host_call_timeout: Duration,
     pub cleanup_timeout: Duration,
 }
+fn default_result_bytes() -> usize {
+    32 * 1024 * 1024
+}
 impl Default for ToolExecutionLimits {
     fn default() -> Self {
         Self {
             script_bytes: 1024 * 1024,
             argument_bytes: 256 * 1024,
             output_bytes: 1024 * 1024,
+            result_bytes: default_result_bytes(),
             diagnostic_bytes: 256 * 1024,
             memory_bytes: 64 * 1024 * 1024,
             instruction_budget: 10_000_000,
@@ -36,6 +42,7 @@ impl ToolExecutionLimits {
             self.script_bytes,
             self.argument_bytes,
             self.output_bytes,
+            self.result_bytes,
             self.diagnostic_bytes,
             self.memory_bytes,
         ]

@@ -508,6 +508,10 @@ fn exercise_root_restart(drivers: &Path, driver: &str, soul_name: &str) {
             assert_eq!(tool.resource, tools[0]);
             assert!(!tool.cancel.is_cancelled());
             let tool_result = AgentMessage::ToolCall {
+                images: vec![margatroid_types::UserImage {
+                    media_type: "image/png".into(),
+                    data: "iVBORw0KGgo=".into(),
+                }],
                 resource_id: Some(tool.resource.resource_id.clone()),
                 tool_call_id: tool.call.id.clone(),
                 tool_name: tool.call.tool_name.clone(),
@@ -801,6 +805,7 @@ fn bundled_coder_and_reviewer_share_workspace_with_isolated_state() {
                 "review",
                 "list_dir",
                 "read_file",
+                "read_image",
                 "write_file",
                 "edit",
                 "grep",
@@ -861,6 +866,7 @@ fn bundled_coder_and_reviewer_share_workspace_with_isolated_state() {
                 "project_context" => "project-context",
                 "list_dir" => "list-directory",
                 "read_file" => "read-file",
+                "read_image" => "read-image",
                 "write_file" => "write-file",
                 alias => alias,
             };

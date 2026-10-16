@@ -193,7 +193,9 @@ fn content(result: ToolExecuteResponse) -> String {
             resource_id,
             content,
             failed,
+            images,
         } => {
+            assert!(images.is_empty());
             assert_eq!(tool_name, "keep-alias");
             assert_eq!(tool_call_id, "call");
             assert!(resource_id.is_some());
@@ -203,6 +205,63 @@ fn content(result: ToolExecuteResponse) -> String {
         _ => panic!("not tool call"),
     }
 }
+#[tokio::test]
+async fn image_envelope_reaches_tool_message_and_cleans_activity() {
+    let (mut app, entity, root) = fixture(ToolExecutionLimits::default());
+    use base64::Engine as _;
+    let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII=";
+    std::fs::write(
+        root.path().join("image space.png"),
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap(),
+    )
+    .unwrap();
+    let resource = add_tool(
+        &mut app,
+        entity,
+        root.path(),
+        include_str!("../../../../resources/tools/local/read-image/latest/main.lua"),
+        serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+    );
+    let (_, rx) = submit(
+        &app,
+        entity,
+        resource.clone(),
+        r#"{"path":"image space.png"}"#,
+    );
+    let result = response(&mut app, rx).await.unwrap();
+    match result.message {
+        AgentMessage::ToolCall {
+            resource_id,
+            tool_call_id,
+            tool_name,
+            content,
+            failed,
+            images,
+        } => {
+            assert_eq!(resource_id, Some(resource));
+            assert_eq!(tool_call_id, "call");
+            assert_eq!(tool_name, "keep-alias");
+            assert!(!failed);
+            assert!(content.contains("image space.png"));
+            assert!(!content.contains(data));
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].media_type, "image/png");
+            assert_eq!(images[0].data, data);
+        }
+        _ => panic!("expected tool message"),
+    }
+    assert_eq!(
+        app.world()
+            .get_component::<Agent>(entity)
+            .unwrap()
+            .execution
+            .activity_count(),
+        0
+    );
+}
+
 #[tokio::test]
 async fn stale_turn_replies_once_without_starting_tool() {
     let (mut app, entity, root) = fixture(ToolExecutionLimits::default());

@@ -923,3 +923,17 @@ test('correlated abort rejection releases only the still-current turn suppressio
   }
   globalThis.WebSocket = oldSocket;
 });
+
+
+test('tool image history retains tool identity and image metadata', () => {
+  const image = {media_type:'image/png',data:'iVBORw0KGgo='};
+  const entry = historyEntries({workspace,agent:workspace.manager,messages:[{
+    key:'read-image',sequence:1,turn:'turn-image',kind:'message',content:'Read image screenshot.png',
+    payload:{type:'tool_call',tool_call_id:'read-1',tool_name:'read_image',resource_id:'tool:local/read-image:latest',failed:false,images:[image]},created_at_ms:123,
+  }]})[0]!;
+  assert.equal(entry.role,'tool');
+  assert.equal(entry.content,'Read image screenshot.png');
+  assert.deepEqual(entry.images,[image]);
+  assert.equal((entry.payload as {tool_call_id:string}).tool_call_id,'read-1');
+  assert.equal(entry.failed,false);
+});

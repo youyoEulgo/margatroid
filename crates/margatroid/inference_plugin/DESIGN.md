@@ -402,7 +402,11 @@ Replay：
     replay随结果、DTO及显式历史保留，不作为正文或工具调用，不等于显示reasoning
 
 当前多模态边界：
-    User { content: String, images: Vec<UserImage> }，空images默认并省略；仅用户图像
+    User及ToolCall结果拥有images: Vec<UserImage>，空images默认并省略；ToolCall.content保持原String，ProviderMessage.ToolCall预检投影保留images
+    工具图像和用户图像复用共享校验及文本/编码大小计算，计入32MiB上下文和最终请求体上限
+    Messages非空工具images编码为tool_result.content的text/image source数组，保留is_error；Responses编码为原生function_call_output.output的input_text/input_image data URL数组，不包装成user
+    Chat始终保留role=tool文本及tool_call_id；收集图像结果并等待当前assistant批次全部结果满足后才追加合成user图像消息，每张图像前以tool_call_id文本标注来源，保持结果和图像顺序
+    合成消息仅存在具体格式转换，不回写DomainRequest的调用方或本地权威历史；重放不重复累积；连续批次分别在全部结果之后追加
     handler及format normalize调用共享validate_user_images：png/jpeg/gif/webp、8张/消息、5MiB/图、20MiB解码/消息，magic/MIME一致
     非空文本在前，图像保持顺序在后；纯图像省略空文本，纯文本保持既有请求体
     Chat image_url与Responses input_image使用data URL；Messages image.source使用type=base64/media_type/data

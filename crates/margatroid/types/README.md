@@ -32,7 +32,7 @@ Compose使用 `WorkspaceDefinition` 和 `WorkspaceAgentDefinition` 把配置文�
 
 ## reasoning replay（已实现）
 
-Assistant包含可选 `replay: Option<serde_json::Value>`；旧消息缺字段默认None。共享层将其视为不透明纯JSON：`{ "api_format": "messages" | "responses", "items": [...] }`。Messages保存signed thinking的文本/signature及redacted_thinking.data；Responses保存reasoning item的id、summary和可用的content/encrypted_content。DTO、持久MESSAGE和显式历史保留replay，不把它拼入正文，也不以可显示reasoning代替签名或加密元数据。格式边界拒绝不兼容/无效replay及无法无损表达的历史；Responses使用store=false及include reasoning.encrypted_content实现完整本地无状态重放。User支持独立images数组，工具结果仍为纯文本String。
+Assistant包含可选 `replay: Option<serde_json::Value>`；旧消息缺字段默认None。共享层将其视为不透明纯JSON：`{ "api_format": "messages" | "responses", "items": [...] }`。Messages保存signed thinking的文本/signature及redacted_thinking.data；Responses保存reasoning item的id、summary和可用的content/encrypted_content。DTO、持久MESSAGE和显式历史保留replay，不把它拼入正文，也不以可显示reasoning代替签名或加密元数据。格式边界拒绝不兼容/无效replay及无法无损表达的历史；Responses使用store=false及include reasoning.encrypted_content实现完整本地无状态重放。User和ToolCall结果均支持独立images数组，content保持String。
 
 ## 共享消息与执行边界
 
@@ -58,6 +58,6 @@ Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>�
 
 WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。
 
-## 用户图像契约
+## 用户及工具结果图像契约
 
-User保持 `content: String`，增加 `images: Vec<UserImage>`；缺少images反序列化为 `[]`，空数组序列化省略。`UserImage { media_type: String, data: String }` 中data是规范标准base64（含必要padding），不是data URL；允许image/png、image/jpeg、image/gif、image/webp。每条User最多8张，每张解码后最多5 MiB，总计最多20 MiB。共享公开函数 `validate_user_images(images: &[UserImage]) -> Result<(), String>` 在解码前检查数量、编码长度及解码长度上界，再严格验证base64及与MIME一致的PNG/JPEG/GIF/WebP魔数，不执行完整图像解码。错误只含索引、限制和原因，不回显base64。领域User反序列化也调用共享验证，覆盖直接MCL/Lua/持久化入站；Protocol入站递归转换调用共享验证，出站原样保留images；MESSAGE、Lua及历史payload保留图像，不将base64拼入正文。协议原有1 MiB非图像消息限制独立保留，图像编码单独按上述限制计量。
+User与ToolCall执行结果保持 `content: String`，增加 `images: Vec<UserImage>`；缺少images反序列化为 `[]`，空数组序列化省略。`UserImage { media_type: String, data: String }` 中data是规范标准base64（含必要padding），不是data URL；允许image/png、image/jpeg、image/gif、image/webp。每条User或ToolCall结果最多8张，每张解码后最多5 MiB，总计最多20 MiB。共享公开函数 `validate_user_images(images: &[UserImage]) -> Result<(), String>` 在解码前检查数量、编码长度及解码长度上界，再严格验证base64及与MIME一致的PNG/JPEG/GIF/WebP魔数，不执行完整图像解码。错误只含索引、限制和原因，不回显base64。公开serde辅助函数 `deserialize_user_images` 供共享消息及边界复用；领域User和ToolCall结果反序列化也调用共享验证，覆盖直接MCL/Lua/持久化入站；Protocol入站递归转换调用共享验证，出站原样保留images；MESSAGE、Lua及历史payload保留图像，不将base64拼入正文。协议原有1 MiB非图像消息限制独立保留，图像编码单独按上述限制计量。

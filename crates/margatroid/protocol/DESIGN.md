@@ -125,12 +125,12 @@ AgentMessageDto：消息值投影，公开契约
     Inject { messages: Vec<AgentMessageDto> }
     User { content: String, images: Vec<UserImage> }
     Assistant { replay: Option<serde_json::Value>, reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCall>, usage: Option<TokenUsage>, stop_reason: Option<StopReason> }
-    ToolCall { resource_id: Option<ResourceIDDto>, tool_call_id: String, tool_name: String, content: String, failed: bool }
+    ToolCall { resource_id: Option<ResourceIDDto>, tool_call_id: String, tool_name: String, content: String, images: Vec<UserImage>, failed: bool }
     Error { message: String }
     说明：replay缺字段默认None，双向转换原样保留（包括Inject）；不在Protocol解释或伪造API元数据
         信封为{api_format,items}，Messages保存signed thinking文本/signature及redacted_thinking.data
         Responses保存reasoning id/summary及可用content/encrypted_content；格式边界拒绝不兼容replay
-        replay随结果及显式历史payload保存，不进入正文；User支持独立images数组，工具结果仍纯文本
+        replay随结果及显式历史payload保存，不进入正文；User和ToolCall结果均支持独立images数组，content保持String
     说明：按共享消息契约递归转换，不存在比AgentMessage更窄的inject内层白名单；限制深度和大小。
         允许消息形状不等于任意入口有权限伪造工具执行完成；工具结果权威来源仍为实际调用oneshot。
 
@@ -213,6 +213,6 @@ Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>�
 
 WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。
 
-## 用户图像契约
+## 用户及工具结果图像契约
 
-User保持 `content: String`，增加 `images: Vec<UserImage>`；缺少images反序列化为 `[]`，空数组序列化省略。`UserImage { media_type: String, data: String }` 中data是规范标准base64（含必要padding），不是data URL；允许image/png、image/jpeg、image/gif、image/webp。每条User最多8张，每张解码后最多5 MiB，总计最多20 MiB。共享公开函数 `validate_user_images(images: &[UserImage]) -> Result<(), String>` 在解码前检查数量、编码长度及解码长度上界，再严格验证base64及与MIME一致的PNG/JPEG/GIF/WebP魔数，不执行完整图像解码。错误只含索引、限制和原因，不回显base64。领域User反序列化也调用共享验证，覆盖直接MCL/Lua/持久化入站；Protocol入站递归转换调用共享验证，出站原样保留images；MESSAGE、Lua及历史payload保留图像，不将base64拼入正文。协议原有1 MiB非图像消息限制独立保留，图像编码单独按上述限制计量。
+User与ToolCall执行结果保持 `content: String`，增加 `images: Vec<UserImage>`；缺少images反序列化为 `[]`，空数组序列化省略。`UserImage { media_type: String, data: String }` 中data是规范标准base64（含必要padding），不是data URL；允许image/png、image/jpeg、image/gif、image/webp。每条User或ToolCall结果最多8张，每张解码后最多5 MiB，总计最多20 MiB。共享公开函数 `validate_user_images(images: &[UserImage]) -> Result<(), String>` 在解码前检查数量、编码长度及解码长度上界，再严格验证base64及与MIME一致的PNG/JPEG/GIF/WebP魔数，不执行完整图像解码。错误只含索引、限制和原因，不回显base64。公开serde辅助函数 `deserialize_user_images` 供共享消息及边界复用；领域User和ToolCall结果反序列化也调用共享验证，覆盖直接MCL/Lua/持久化入站；Protocol入站递归转换调用共享验证，出站原样保留images；MESSAGE、Lua及历史payload保留图像，不将base64拼入正文。协议原有1 MiB非图像消息限制独立保留，图像编码单独按上述限制计量。

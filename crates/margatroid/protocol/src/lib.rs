@@ -318,6 +318,12 @@ pub enum AgentMessageDto {
         tool_call_id: String,
         tool_name: String,
         content: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "margatroid_types::deserialize_user_images"
+        )]
+        images: Vec<UserImage>,
         #[serde(default)]
         failed: bool,
     },
@@ -370,14 +376,21 @@ impl AgentMessageDto {
                 tool_call_id,
                 tool_name,
                 content,
+                images,
                 failed,
-            } => AgentMessage::ToolCall {
-                resource_id: resource_id.map(|id| id.into_domain(())).transpose()?,
-                tool_call_id,
-                tool_name,
-                content,
-                failed,
-            },
+            } => {
+                validate_user_images(&images).map_err(|message| {
+                    ProtocolError::new(ProtocolErrorKind::InvalidRequest, message)
+                })?;
+                AgentMessage::ToolCall {
+                    resource_id: resource_id.map(|id| id.into_domain(())).transpose()?,
+                    tool_call_id,
+                    tool_name,
+                    content,
+                    images,
+                    failed,
+                }
+            }
             Self::Error { message } => AgentMessage::Error { message },
         })
     }
@@ -397,7 +410,7 @@ impl IntoDomain<AgentMessage> for AgentMessageDto {
         }
         fn image_bytes(message: &AgentMessage) -> usize {
             match message {
-                AgentMessage::User { images, .. } => {
+                AgentMessage::User { images, .. } | AgentMessage::ToolCall { images, .. } => {
                     images.iter().map(|image| image.data.len()).sum()
                 }
                 AgentMessage::Inject { messages } => messages.iter().map(image_bytes).sum(),
@@ -456,12 +469,14 @@ impl FromDomain<&AgentMessage> for AgentMessageDto {
                 tool_call_id,
                 tool_name,
                 content,
+                images,
                 failed,
             } => Self::ToolCall {
                 resource_id: resource_id.as_ref().map(|id| id.into_dto(())).transpose()?,
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_name.clone(),
                 content: content.clone(),
+                images: images.clone(),
                 failed: *failed,
             },
             AgentMessage::Error { message } => Self::Error {

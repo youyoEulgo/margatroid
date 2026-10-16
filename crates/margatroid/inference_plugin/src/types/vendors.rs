@@ -578,6 +578,7 @@ mod tests {
                 tool_call_id: "call-1".into(),
                 tool_name: "echo".into(),
                 content: "ok".into(),
+                images: vec![],
                 failed: false,
             });
             let http = adapter.unwrap().build_request(input).unwrap();

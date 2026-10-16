@@ -196,3 +196,22 @@ fn tool_calls_are_extracted_only_from_one_assistant() {
     )
     .is_ok());
 }
+
+#[test]
+fn manual_tool_result_images_round_trip_and_validate() {
+    let mut wire = json!([{"type":"tool_call","resource_id":null,"tool_call_id":"read","tool_name":"read_image","content":"loaded","failed":false,"images":[{"media_type":"image/png","data":"iVBORw0KGgo="}]}]);
+    let BlockInner::Message(messages) = decode_manual_array(&wire, InnerType::Message).unwrap()
+    else {
+        panic!("not messages")
+    };
+    assert_eq!(serde_json::to_value(messages).unwrap(), wire);
+    wire[0]["images"][0]["data"] = "secret_invalid".into();
+    let error = decode_manual_array(&wire, InnerType::Message).unwrap_err();
+    assert!(!format!("{error:?}").contains("secret_invalid"));
+    wire[0].as_object_mut().unwrap().remove("images");
+    let BlockInner::Message(messages) = decode_manual_array(&wire, InnerType::Message).unwrap()
+    else {
+        panic!("not messages")
+    };
+    assert_eq!(serde_json::to_value(messages).unwrap(), wire);
+}

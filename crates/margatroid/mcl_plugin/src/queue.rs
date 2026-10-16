@@ -795,6 +795,7 @@ fn failed_call(call: &ToolCall, resource_id: Option<ResourceID>, message: String
         tool_call_id: call.id.clone(),
         tool_name: call.tool_name.clone(),
         content: message,
+        images: vec![],
         failed: true,
     }
 }

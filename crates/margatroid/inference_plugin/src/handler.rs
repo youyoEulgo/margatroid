@@ -658,10 +658,12 @@ fn normalize_messages(messages: Vec<AgentMessage>) -> Result<Vec<ProviderMessage
                 AgentMessage::ToolCall {
                     tool_call_id,
                     content,
+                    images,
                     ..
                 } => ProviderMessage::Tool {
                     tool_call_id,
                     content,
+                    images,
                 },
                 AgentMessage::Inject { .. } => unreachable!(),
             });
@@ -1962,6 +1964,45 @@ mod tests {
     }
 
     #[test]
+    fn tool_image_preflight_preserves_projection_and_rejects_invalid_data() {
+        let images = vec![margatroid_types::message_types::UserImage {
+            media_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+        }];
+        let assistant = AgentMessage::Assistant {
+            reasoning: None,
+            replay: None,
+            content: None,
+            tool_calls: vec![margatroid_types::message_types::ToolCall {
+                id: "image".into(),
+                tool_name: "echo".into(),
+                arguments: "{}".into(),
+            }],
+            usage: None,
+            stop_reason: None,
+        };
+        let tool = AgentMessage::ToolCall {
+            resource_id: None,
+            tool_call_id: "image".into(),
+            tool_name: "echo".into(),
+            content: String::new(),
+            images: images.clone(),
+            failed: false,
+        };
+        let normalized = normalize_messages(vec![assistant.clone(), tool.clone()]).unwrap();
+        assert!(
+            matches!(&normalized[1], ProviderMessage::Tool { content, images: actual, .. } if content.is_empty() && actual == &images)
+        );
+        let mut invalid = tool;
+        if let AgentMessage::ToolCall { images, .. } = &mut invalid {
+            images[0].media_type = "image/jpeg".into();
+        }
+        let error = normalize_messages(vec![assistant, invalid]).unwrap_err();
+        assert_eq!(error.kind, InferenceErrorKind::InvalidMessages);
+        assert!(!error.to_string().contains(&images[0].data));
+    }
+
+    #[test]
     fn inject_expansion_checks_correlations_and_limits() {
         for message in [
             AgentMessage::aborted_assistant(),
@@ -1990,6 +2031,7 @@ mod tests {
             tool_call_id: "orphan".into(),
             tool_name: "echo".into(),
             content: "bad".into(),
+            images: vec![],
             failed: true
         }])
         .is_err());

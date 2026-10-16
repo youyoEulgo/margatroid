@@ -12,7 +12,7 @@ pub struct UserImage {
     pub data: String,
 }
 
-fn deserialize_user_images<'de, D: serde::Deserializer<'de>>(
+pub fn deserialize_user_images<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<UserImage>, D::Error> {
     let images = Vec::<UserImage>::deserialize(deserializer)?;
@@ -132,6 +132,12 @@ pub enum AgentMessage {
         tool_call_id: String,
         tool_name: String,
         content: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "deserialize_user_images"
+        )]
+        images: Vec<UserImage>,
         #[serde(default)]
         failed: bool,
     },
@@ -259,6 +265,7 @@ mod tests {
                     tool_call_id: "call-1".into(),
                     tool_name: "missing".into(),
                     content: "not visible".into(),
+                    images: vec![],
                     failed: true,
                 }],
             }],

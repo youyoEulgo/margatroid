@@ -354,7 +354,7 @@ MclCommandResult：命令结果，公开事件
 InferenceRequest：统一推理请求，公开事件
     tools: Vec<CallableResource>--替代resources:Vec<ResourceID>，定义于inference_events
     说明：其他关联、消息、取消与oneshot字段沿用领域契约，不由MCL复制完整结构。
-    推理分层（已实现）：MCL继续只提交领域消息与选定工具快照，不选择API格式或厂商，也不直接构造HTTP。InferencePlugin验证后构造共享纯值DomainRequest，再按模型路由provider与api_type转换；InferenceRequest仍为执行事件，不被DomainRequest替代。Driver无需因Chat Completions、Messages或无状态Responses切换而更换。Assistant可选replay随MESSAGE、显式history_append及结果保留；旧值缺字段为None，MCL不解释或伪造签名/加密API元数据。格式转换会拒绝跨格式replay和不可表达的参数，不通过丢失reasoning实现兼容；User支持独立images数组（media_type和原始base64 data），MESSAGE反序列化调用共享校验，MCL/Lua/持久上下文/显式历史保留图片；content仍单独保存文本，工具结果仍纯文本。MCL不生成data URL或厂商图片块，这些由后续API适配器负责。
+    推理分层（已实现）：MCL继续只提交领域消息与选定工具快照，不选择API格式或厂商，也不直接构造HTTP。InferencePlugin验证后构造共享纯值DomainRequest，再按模型路由provider与api_type转换；InferenceRequest仍为执行事件，不被DomainRequest替代。Driver无需因Chat Completions、Messages或无状态Responses切换而更换。Assistant可选replay随MESSAGE、显式history_append及结果保留；旧值缺字段为None，MCL不解释或伪造签名/加密API元数据。格式转换会拒绝跨格式replay和不可表达的参数，不通过丢失reasoning实现兼容；User支持独立images数组（media_type和原始base64 data），MESSAGE反序列化调用共享校验，MCL/Lua/持久上下文/显式历史保留图片；content仍单独保存文本；ToolCall结果也可含同形images，保持原tool_call_id及工具身份，MCL不将其转换为User。MCL不生成data URL或厂商图片块，这些由后续API适配器负责。
 
 ToolExecuteRequest：单调用执行请求，公开事件
     resource: CallableResource--选定共享快照，自含ResourceID，不另建重复resource_id字段

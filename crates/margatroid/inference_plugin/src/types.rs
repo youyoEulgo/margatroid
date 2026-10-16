@@ -22,6 +22,7 @@ pub enum ProviderMessage {
     Tool {
         tool_call_id: String,
         content: String,
+        images: Vec<UserImage>,
     },
     Error {
         message: String,
