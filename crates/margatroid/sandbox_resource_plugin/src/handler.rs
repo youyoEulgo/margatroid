@@ -1,4 +1,4 @@
-use crate::files::{checked_path, error, read_text};
+use crate::files::{checked_path, context, error, read_text};
 use crate::types::SandboxResourceLoadConfig;
 use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::WorldAsyncExt;
@@ -21,7 +21,10 @@ impl Drop for SubmissionGuard {
         if let Some(request) = self.request.take() {
             let result = Err(error(
                 Kind::TaskFailed,
-                "read submission dropped before I/O start",
+                format!(
+                    "request {}, resource {}: read submission dropped before I/O start",
+                    request.id, request.resource_id
+                ),
             ));
             if let Some(sender) = request
                 .reply
@@ -65,6 +68,12 @@ fn finish(
     result: Result<(), ResourceLoadError>,
     rollback: bool,
 ) {
+    let result = result.map_err(|e| {
+        context(
+            format!("request {}, resource {}", request.id, request.resource_id),
+            e,
+        )
+    });
     let sender = request
         .reply
         .lock()
@@ -228,6 +237,12 @@ pub(crate) fn handle_mount_sandbox_resource(world: &mut World, output: SandboxRe
             )
         })
     };
+    let result = result.map_err(|e| {
+        context(
+            format!("request {}, resource {}", request.id, request.resource_id),
+            e,
+        )
+    });
     let sender = reply.take().unwrap();
     drop(reply);
     let _ = sender.send(result.clone());
@@ -254,23 +269,42 @@ fn prepare(
         .join(request.resource_id.scope())
         .join(request.resource_id.name())
         .join(request.resource_id.tag());
-    checked_path(&directory, true)?;
-    let read = |name: &str, maximum| {
-        read_text(&directory.join(name), maximum, || {
-            request.cancel.is_cancelled()
+    let result = (|| {
+        checked_path(&directory, true)?;
+        let read = |name: &str, maximum| {
+            read_text(&directory.join(name), maximum, || {
+                request.cancel.is_cancelled()
+            })
+        };
+        let policy = read("policy.json", config.limits.max_policy_bytes)?;
+        let value: serde_json::Value = serde_json::from_str(&policy).map_err(|e| {
+            error(
+                Kind::InvalidDefinition,
+                format!("{}: {e}", directory.join("policy.json").display()),
+            )
+        })?;
+        if !value.is_object() {
+            return Err(error(
+                Kind::InvalidDefinition,
+                format!(
+                    "{}: policy must be a JSON object",
+                    directory.join("policy.json").display()
+                ),
+            ));
+        }
+        Ok(SandboxResource {
+            alias: request.alias.clone(),
+            policy: policy.into(),
         })
-    };
-    let policy = read("policy.json", config.limits.max_policy_bytes)?;
-    let value: serde_json::Value =
-        serde_json::from_str(&policy).map_err(|e| error(Kind::InvalidDefinition, e.to_string()))?;
-    if !value.is_object() {
-        return Err(error(
-            Kind::InvalidDefinition,
-            "policy must be a JSON object",
-        ));
-    }
-    Ok(SandboxResource {
-        alias: request.alias.clone(),
-        policy: policy.into(),
+    })();
+    result.map_err(|e| {
+        context(
+            format!(
+                "resource {}, directory {}",
+                request.resource_id,
+                directory.display()
+            ),
+            e,
+        )
     })
 }

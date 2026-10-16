@@ -35,10 +35,13 @@ run(command: Command) -> Result<(), Box<dyn Error + Send + Sync>>
 
 run_workspace_up(workspace_file: PathBuf, backend_url: String) -> Result<(), Box<dyn Error + Send + Sync>>
     启动Workspace：私有异步函数，编译文件、连接WebSocket、注册cli连接、发送启动请求、处理关闭信号并打印日志事件
-    行为：不读取stdin，不构造或发送LLM消息；ServerMessage::Log写入stdout；匹配启动请求ID的WorkspaceStartFailed立即返回错误
+    行为：不读取stdin，不构造或发送LLM消息；ServerMessage::Log写入stdout；启动回执到达前，匹配启动请求ID的WorkspaceStartFailed表示Workspace自身无法建立，返回错误
+    WorkspaceStarted表示工作区已建立，即使member_failures非空也保持连接；打印工作区成功与每个失败成员的agent/driver/error，不将成员失败当成退出条件
+    成功回执后不再用延迟或重复的启动失败回执终止已运行会话；运行期成员错误只显示诊断，首次关闭信号仍走workspace.stop和清理回执
 
-workspace_start_error(text: &str, request_id: &str) -> Option<String>
-    解析启动失败：私有函数，只把匹配当前workspace.start请求ID的WorkspaceStartFailed转换为错误文本
+handle_workspace_start_reply(text: &str, request_id: &str, started: &mut bool) -> Result<(), CliError>
+    处理匹配启动回执：私有函数，WorkspaceStarted打印工作区成功和成员失败，设置started且保持连接
+    只有started为false且匹配当前请求的WorkspaceStartFailed或RequestFailed（协议预检拒绝，尚未创建工作区）转换为终止错误；其他请求及已启动后的重复回执不终止会话
 
 print_backend_message(text: &str)
     打印日志：私有函数，反序列化ServerMessage并使用RFC 3339时间、等级、target、事件和结构化字段格式化LogRecordDto；未知事件直接忽略
@@ -82,12 +85,16 @@ run_workspace_up
     -> tokio_tungstenite连接backend_url
     -> 依次发送connection.register和workspace.start的Message::Text
     -> 循环接收WebSocket消息和关闭信号
-       -> 首次关闭信号：发送workspace.stop
+       -> 首次关闭信号：若启动结果未到达，记住停止意图并继续等待；成功后发送workspace.stop，失败则直接报错退出（无本次占位）
+       -> 等待启动期间重复关闭信号：保持停止意图，不向Starting发送会被拒绝的停止请求
+       -> 关闭信号future跨WebSocket消息保留，不因select取消重建而丢失SIGTERM；仅收到一次信号后重新注册下一次等待
        -> 等待同一请求ID的workspace.stopped
        -> 收到回执后关闭WebSocket并正常退出
        -> 再次信号、超时、停止失败或后端提前断开：关闭并报错退出
        -> Text：解析ServerMessage::Log并打印
-       -> Text或UTF-8 Binary中的同ID workspace.start_failed：立即报错并以非零状态退出
+       -> Text或UTF-8 Binary中的同ID workspace.started：记录已启动，打印成员失败详情并继续连接
+       -> 尚未收到成功回执时，同ID workspace.start_failed：报错并以非零状态退出；只用于Workspace自身创建失败
+       -> 成员失败及运行期成员日志：显示，不退出；成功回执后忽略重复或延迟的启动失败回执
        -> UTF-8 Binary：按文本解析ServerMessage::Log
        -> 非UTF-8 Binary：打印长度提示stderr
        -> Ping：发送Pong

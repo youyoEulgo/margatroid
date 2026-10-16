@@ -97,6 +97,7 @@ fn full_message() -> StoredBlockInner {
                 content: "system".into(),
             },
             AgentMessage::Assistant {
+                replay: None,
                 reasoning: Some("reason".into()),
                 content: None,
                 tool_calls: vec![ToolCall {

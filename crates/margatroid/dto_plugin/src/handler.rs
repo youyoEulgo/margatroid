@@ -27,7 +27,7 @@ use margatroid_types::{
     client_events::ClientRegistrationResult,
     mcl_events::MclCommandResult,
     workspace_components::WorldWorkspaceExt,
-    workspace_events::{StartWorkspaceResult, StopWorkspaceResult},
+    workspace_events::{StartWorkspaceResult, StopWorkspaceResult, WorkspaceMemberStartFailed},
 };
 use server_plugin::{
     ServerFailed, ServerStarted, ServerStopped, WebSocketConnected, WebSocketConnectionId,
@@ -65,6 +65,19 @@ pub(crate) fn handle_inbound_message(
             },
         );
     }
+}
+fn prepare_workspace_start(
+    message: margatroid_protocol::StartWorkspaceDto,
+    operation_id: String,
+) -> Result<margatroid_types::workspace_events::StartWorkspace, ProtocolError> {
+    let event = message.into_domain(operation_id)?;
+    WorkspaceInfoDto::from_domain(&event.definition, ()).map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorKind::InvalidRequest,
+            format!("workspace.start requires a declared manager member for the workspace snapshot; add a member whose name matches manager: {error}"),
+        )
+    })?;
+    Ok(event)
 }
 fn operation_id() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -123,7 +136,7 @@ fn route_request(
         ClientMessage::ConnectionRegister { .. } => unreachable!(),
         ClientMessage::WorkspaceStart { id, message } => {
             let operation_id = operation_id();
-            let event = message.into_domain(operation_id.clone())?;
+            let event = prepare_workspace_start(message, operation_id.clone())?;
             let reference = (&event.definition).into_dto(())?;
             world
                 .get_resource_mut::<PendingMclCommandResponses>()
@@ -385,6 +398,7 @@ pub(crate) fn handle_collect_external_events(world: &mut World) {
     report_server_events(world);
     report_client_registrations(world);
     report_workspace_results(world);
+    report_workspace_member_failures(world, targets.logs());
     if !world.event_reader::<MclCommandResult>().is_empty() {
         world
             .get_resource_mut::<BackendStateReportCache>()
@@ -422,6 +436,44 @@ fn report_client_registrations(world: &World) {
         send_to_connection(world, event.connection_id, &message);
     }
 }
+fn report_workspace_member_failures(world: &World, targets: &[WebSocketMessageTarget]) {
+    for event in world.event_reader::<WorkspaceMemberStartFailed>() {
+        let fields = [
+            ("workspace", event.workspace_id.to_string()),
+            ("workspace_entity", format!("{:?}", event.workspace)),
+            ("agent", event.agent.to_string()),
+            ("driver", event.driver.to_string()),
+            ("error", event.error.to_string()),
+        ]
+        .into_iter()
+        .map(|(name, value)| margatroid_protocol::LogFieldDto {
+            name: name.into(),
+            value,
+        })
+        .collect();
+        let record = LogRecordDto {
+            timestamp_millis: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            level: "ERROR".into(),
+            target: "dto_plugin::workspace".into(),
+            message: format!(
+                "workspace {} member {} failed to start with driver {}: {}",
+                event.workspace_id, event.agent, event.driver, event.error
+            ),
+            fields,
+            spans: Vec::new(),
+        };
+        let message = serde_json::to_value(ServerMessage::Log { record }).unwrap();
+        for target in targets {
+            world.send_event(WebSocketMessageSend {
+                target: target.clone(),
+                message: message.clone(),
+            });
+        }
+    }
+}
 fn report_workspace_results(world: &mut World) {
     let starts: Vec<_> = world
         .event_reader::<StartWorkspaceResult>()
@@ -457,15 +509,7 @@ fn report_workspace_results(world: &mut World) {
         }
         let id = pending.id;
         let message = match (stopping, result) {
-            (false, Ok(entity)) => {
-                match IntoDto::<WorkspaceInfoDto, _>::into_dto(entity, &*world) {
-                    Ok(workspace) => ServerMessage::WorkspaceStarted { id, workspace },
-                    Err(error) => ServerMessage::WorkspaceStartFailed {
-                        id,
-                        error: error.into(),
-                    },
-                }
-            }
+            (false, Ok(entity)) => workspace_started_message(world, id, entity),
             (false, Err(error)) => ServerMessage::WorkspaceStartFailed {
                 id,
                 error: ProtocolErrorDto::new("WorkspaceStartFailed", error.to_string()),
@@ -480,6 +524,19 @@ fn report_workspace_results(world: &mut World) {
             },
         };
         send_to_connection(world, pending.connection_id, &message);
+    }
+}
+fn workspace_started_message(
+    world: &World,
+    id: String,
+    entity: core_plugin::Entity,
+) -> ServerMessage {
+    match IntoDto::<WorkspaceInfoDto, _>::into_dto(entity, world) {
+        Ok(workspace) => ServerMessage::WorkspaceStarted { id, workspace },
+        Err(error) => ServerMessage::WorkspaceStartFailed {
+            id,
+            error: error.into(),
+        },
     }
 }
 fn send_to_connection(
@@ -888,6 +945,128 @@ pub(crate) async fn forward_logs(
 #[cfg(test)]
 mod response_tests {
     use super::{is_user_injection, response_is_live};
+
+    #[test]
+    fn workspace_start_rejects_unprojectable_definitions_before_domain_emission() {
+        use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
+        use core_plugin::App;
+        use margatroid_protocol::{ClientMessage, ProtocolErrorKind};
+        use margatroid_types::workspace_events::StartWorkspace;
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default());
+        for agents in [
+            serde_json::json!([]),
+            serde_json::json!([{
+                "id": "agent:test/worker:latest", "name": "worker", "driver": "driver:test/base:latest",
+                "home_root": "/tmp/home", "history_path": "/tmp/history"
+            }]),
+        ] {
+            let request: ClientMessage = serde_json::from_value(serde_json::json!({
+                "type": "workspace.start", "id": "empty-start", "message": { "definition": {
+                    "id": "workspace:test/empty:latest", "name": "empty", "project_root": "/tmp/empty",
+                    "manager": "manager", "agents": agents
+                }}
+            })).unwrap();
+            let ClientMessage::WorkspaceStart { message, .. } = request else {
+                panic!("expected workspace.start")
+            };
+            let error = super::prepare_workspace_start(message, "operation".into()).unwrap_err();
+            assert_eq!(error.kind(), ProtocolErrorKind::InvalidRequest);
+            assert!(error
+                .message()
+                .contains("requires a declared manager member"));
+            app.tick();
+            assert!(app.world().event_reader::<StartWorkspace>().is_empty());
+        }
+        let valid: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type": "workspace.start", "id": "valid-start", "message": { "definition": {
+                "id": "workspace:test/valid:latest", "name": "valid", "project_root": "/tmp/valid",
+                "manager": "manager", "agents": [{
+                    "id": "agent:test/manager:latest", "name": "manager", "driver": "driver:test/base:latest",
+                    "home_root": "/tmp/home", "history_path": "/tmp/history"
+                }]
+            }}
+        })).unwrap();
+        let ClientMessage::WorkspaceStart { message, .. } = valid else {
+            panic!("expected workspace.start")
+        };
+        let event = super::prepare_workspace_start(message, "operation".into()).unwrap();
+        app.world().send_event(event);
+        app.tick();
+        assert_eq!(
+            app.world()
+                .event_reader::<StartWorkspace>()
+                .into_iter()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_started_uses_actual_entity_failures_not_definition_projection() {
+        use margatroid_protocol::{IntoDto, ServerMessage, WorkspaceInfoDto};
+        use margatroid_types::{
+            workspace_components::{
+                Workspace, WorkspaceAgentDefinition, WorkspaceDefinition, WorkspaceError,
+                WorkspaceErrorKind, WorkspaceMemberFailure, WorkspaceState,
+            },
+            workspace_execution::spawn_workspace_execution,
+        };
+        use resource_id_plugin::ResourceID;
+        let id = |kind, name| ResourceID::new(kind, "test", name, None).unwrap();
+        let mut world = core_plugin::World::default();
+        let definition = WorkspaceDefinition {
+            id: id("workspace", "partial"),
+            name: "partial".into(),
+            manager: "manager".into(),
+            project_root: "/tmp/partial".into(),
+            agents: vec![WorkspaceAgentDefinition {
+                id: id("agent", "manager"),
+                name: "manager".into(),
+                driver: id("agent-driver", "broken"),
+                home_root: "/tmp/home".into(),
+                history_path: "/tmp/history".into(),
+            }],
+        };
+        let projected: WorkspaceInfoDto = (&definition).into_dto(()).unwrap();
+        assert!(projected.member_failures.is_empty());
+        let (entry, close) = spawn_workspace_execution().unwrap();
+        let mut workspace =
+            Workspace::new(definition, WorkspaceState::Running, entry, close.clone());
+        workspace.record_member_failure(
+            id("agent", "manager"),
+            WorkspaceMemberFailure {
+                driver: id("agent-driver", "broken"),
+                error: WorkspaceError::new(WorkspaceErrorKind::AgentStartFailed, "broken driver"),
+            },
+        );
+        let entity = world.spawn();
+        world.insert_component(entity, workspace);
+        let message = super::workspace_started_message(&world, "network-request".into(), entity);
+        let ServerMessage::WorkspaceStarted {
+            id: request,
+            workspace,
+        } = &message
+        else {
+            panic!("member failure must not become workspace.start_failed")
+        };
+        assert_eq!(request, "network-request");
+        assert_eq!(workspace.member_failures.len(), 1);
+        assert_eq!(
+            workspace.member_failures[0].error,
+            "AgentStartFailed:broken driver"
+        );
+        assert_eq!(
+            serde_json::to_value(message).unwrap()["type"],
+            "workspace.started"
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(close.close())
+            .unwrap();
+    }
 
     #[test]
     fn busy_user_injection_detection_handles_nested_messages_without_hiding_admin_arrays() {

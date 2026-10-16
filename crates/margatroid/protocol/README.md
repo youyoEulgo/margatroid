@@ -60,9 +60,13 @@ Workspace definition 字段为 `id, name, project_root, manager, agents`。成�
 
 Rust 构造 API：`ClientMessage::mcl_command(id, &workspace, agent, command, Vec<Value>)`，最后一项是 arguments，不是旧 binding。
 
+## reasoning replay
+
+Assistant的 `replay: Option<serde_json::Value>` 在AgentMessageDto与领域消息之间双向保留（包括Inject内嵌），缺字段默认None。它是不透明JSON信封 `{ "api_format": "messages" | "responses", "items": [...] }`：Messages保存thinking文本/signature及redacted_thinking.data，Responses保存reasoning item id、summary及可用content/encrypted_content。Protocol不解释、改写或伪造这些API字段；推理格式边界检查标签及内容并拒绝不兼容重放。结果与显式历史payload保留replay，显示reasoning和正文不代替它。Responses每次完整本地上下文，store=false并请求reasoning.encrypted_content；不依赖远端conversation。DTO支持纯JSON重放元数据不等于实现图像；当前User/ToolCall结果content仍为String。
+
 ## 消息、状态与历史
 
-`AgentMessageDto`（亦可用 `MessageDto` 名称）是 snake_case `type` 标签的递归消息值：`inject`、`user`、`assistant`、`tool_call`、`error`。Inject 可递归包含全部同类消息；转换限制深度 32、节点 4096、序列化大小 1 MiB，不采用旧内层白名单。Assistant 包含可选 stop_reason（旧消息缺失时为 None）和可选 usage；ToolCall 的 resource_id 可为 null。允许消息形状不表示网络入口有权伪造工具完成事实。
+`AgentMessageDto`（亦可用 `MessageDto` 名称）是 snake_case `type` 标签的递归消息值：`inject`、`system`、`user`、`assistant`、`tool_call`、`error`。Inject 可递归包含全部同类消息；转换限制深度 32、节点 4096、序列化大小 1 MiB，不采用旧内层白名单。Assistant 包含可选 replay（旧消息缺失为None）、可选 stop_reason（旧消息缺失时为 None）和可选 usage；ToolCall 的 resource_id 可为 null。允许消息形状不表示网络入口有权伪造工具完成事实。
 
 `state.sync { state }` 包含 `workspaces, agents, histories`。Agent 快照包含 `workspace, agent, agent_instance, status, turn, sandbox, queued_commands, pending_command`；status 为 creating/idle/working/stopping，与共享 AgentState 一致。历史来自 `Agent.history.list()`，不是旧实时 Memory/HistoryMessage 接口。
 
@@ -73,3 +77,11 @@ Rust 构造 API：`ClientMessage::mcl_command(id, &workspace, agent, command, Ve
 ## 已归档的旧协议
 
 旧 `agent.message` 邮箱、旧 `agent.turn.abort` 查表实现、visibility、Workflow 入口及 `binding` 均已移除。上文同名中止控制使用新的共享事件，不复活旧实现；Working 状态也不恢复旧生命周期。默认/动态可见性、AgentTokenUsage 副本与完整消息作为流完成标志的旧描述仍不适用。
+
+## Workspace 成员启动失败隔离契约
+
+Workspace 自身定义校验、创建或执行线程创建失败才返回 StartWorkspaceResult::Err；创建前失败不占用新地址，重复地址保留旧实例并报告其 ID、状态、成功成员数及失败成员数，不覆盖或自动附着。初始驱动和成员请求全部结束后，即使全部成员失败也进入 Running 并返回 Ok，成员失败不得关闭提交门。
+
+Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>；失败值包含 driver 与 error，工作区身份由所属组件提供。这是持久到该工作区停止的失败诊断，不是重复 Agent 生命周期表。每个失败成员产生 WorkspaceMemberStartFailed，携带 workspace Entity、workspace_id、agent、driver、error；共享驱动失败按成员展开，动态创建失败同样记录并通知，成功加入清除该成员旧失败。Stopping 中已受理动态创建失败只结束等待，不污染健康工作区的停止结果。
+
+WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。

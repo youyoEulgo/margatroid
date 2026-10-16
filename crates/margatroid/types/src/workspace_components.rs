@@ -90,12 +90,19 @@ pub enum WorkspaceState {
     Stopping(WorkspaceStopState),
     Failed { error: WorkspaceError },
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceMemberFailure {
+    pub driver: ResourceID,
+    pub error: WorkspaceError,
+}
 #[derive(Debug)]
 pub struct Workspace {
     resource_id: ResourceID,
     definition: Arc<WorkspaceDefinition>,
     project_root: Arc<PathBuf>,
     agents: BTreeMap<ResourceID, Entity>,
+    member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>,
+    pending_creation_drivers: BTreeMap<String, ResourceID>,
     state: WorkspaceState,
     execution_entry: WorkspaceExecutionEntry,
     execution_close: WorkspaceExecutionClose,
@@ -125,6 +132,8 @@ impl Workspace {
             project_root: Arc::new(definition.project_root.clone()),
             definition: Arc::new(definition),
             agents: BTreeMap::new(),
+            member_failures: BTreeMap::new(),
+            pending_creation_drivers: BTreeMap::new(),
             state,
             execution_entry,
             execution_close,
@@ -151,7 +160,17 @@ impl Workspace {
         self.state = state;
     }
     pub fn insert_agent(&mut self, id: ResourceID, entity: Entity) {
+        self.member_failures.remove(&id);
         self.agents.insert(id, entity);
+    }
+    pub fn member_failures(&self) -> &BTreeMap<ResourceID, WorkspaceMemberFailure> {
+        &self.member_failures
+    }
+    pub fn record_member_failure(&mut self, agent: ResourceID, failure: WorkspaceMemberFailure) {
+        self.member_failures.insert(agent, failure);
+    }
+    pub fn consume_creation_driver(&mut self, id: &str) -> Option<ResourceID> {
+        self.pending_creation_drivers.remove(id)
     }
     pub fn remove_agent(&mut self, id: &ResourceID) {
         self.agents.remove(id);
@@ -359,6 +378,9 @@ impl WorldWorkspaceExt for World {
                 "agent creation already accepted",
             ));
         }
+        component
+            .pending_creation_drivers
+            .insert(request.id.clone(), request.driver.clone());
         component
             .pending_creations
             .insert(request.id.clone(), request.resource_id.clone());

@@ -26,7 +26,7 @@ daemon不接受启动参数，固定使用 `~/.margatroid` 主目录。监听地
 
 `models.toml` 必须存在且符合 InferencePlugin 的模型路由格式；daemon 启动时会加载并校验它。
 
-已批准、待实现的推理分层会将该文件中的 `provider` 从可选提示元数据改为必需执行选择，`api_type` 收敛为 `chat_completions`、`messages`、`responses`。厂商与格式是两个独立维度，未知值或不支持组合在加载/重载时失败，不根据URL猜测；失败重载保留原完整路由。模型逻辑ID、上游model、provider与api_type各司其职，不把模型品牌当作代理供应商。`config.toml`不新增重复模型路由；主目录实际配置在实现迁移时再改。Responses首版仍使用本地完整上下文，不启用远端conversation或previous_response_id。
+推理分层已实现：provider必填，取openai/anthropic/deepseek/openrouter；api_type为chat_completions/messages/responses。显式七组合为OpenAI chat+responses、Anthropic messages、DeepSeek三种、OpenRouter chat（2+1+3+1）。逻辑ID、上游model、provider和api_type各自独立，未知值/组合/选项在加载或重载时失败；失败保留旧完整路由及安全catalog。没有工厂注册表或URL猜测。base_url是API前缀，只追加/chat/completions、/messages或/responses；DeepSeek兼容Messages如需/anthropic/v1/messages，前缀由用户显式设为/anthropic/v1。主目录两条路由已迁移api_type=chat_completions并保留各自provider、凭据；config.toml不新增重复模型配置。Responses每次提交完整本地上下文，store=false、include=["reasoning.encrypted_content"]，不使用conversation/previous_response_id。Assistant可选replay保存Messages签名/遮蔽thinking和Responses reasoning id/加密内容/summary；不兼容格式或无法表达的参数在HTTP前拒绝。图像未实现，内容仍纯文本。
 `config.toml` 保存全局 WebSocket 出站目标，暂定格式：
 
 ```toml
@@ -48,6 +48,9 @@ streaming_member_messages = ["type:webui"]
 失败或异常，都归入 `logs`；完整成员消息和流式成员消息分别使用后两个字段。模型路由文件不再保存
 WebSocket target。
 AgentDriver 由 `agent-drivers/` 提供，Workspace 文件仍由 CLI 编译，daemon 不读取 YAML。
+仓库 `resources/` 包含 coder 和 reviewer 两个 Driver 及其依赖；安装时保持目录结构复制到主目录。
+reviewer 使用独立 Lua 实例、会话和历史数据库，默认启用 read-only 沙箱，可见工具为 code-review、project-context 和 list-directory。
+双成员 Workspace 可用 coder 作为 manager，同时声明 `local/coder:latest` 和 `local/reviewer:latest`；离线集成测试覆盖两者同时就绪和独立运行。旧 `agent-images/` 目录不参与 Driver 加载。
 daemon 把主目录交给 ToolResourcePlugin 加载工具资源，ToolPlugin 只消费已选定的 Tool 快照，
 通过独立 Lua runner 执行。LLM 的 TOOL 数组只包含 `tool:*` 资源；prompt 和 sandbox 使用各自 typed array。
 命令统一由 Lua 工具的 `margatroid().shell` 经 runner 执行，shell 不是单独的可调用资源。
@@ -72,3 +75,5 @@ AgentPlugin 在消息处理或可见工具准备失败时发送 `agent.failure(k
 SQLite 的 `state` 表只保存 driver 声明的 state（含实时上下文快照），不发送给客户端。Web UI 必须以 `state.sync` 为业务状态的
 唯一权威来源，不自行持久化、乐观追加或从实时事件拼接对话。
 当前 CLI 仍只提交 Workspace 并打印日志，不负责 Agent 消息输入输出。
+
+Workspace 成员启动隔离：初始请求全部收口即 workspace.started，成员启动或驱动加载失败保存在 Workspace.member_failures 并投影到快照及逐成员 logs，不关闭健康工作区。全部失败也可正常停止并以同 ID 重启；真正定义/创建失败不占用新地址，重复地址保留原实例并返回含状态和成员计数的诊断。

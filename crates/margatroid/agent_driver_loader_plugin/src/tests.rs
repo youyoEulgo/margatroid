@@ -268,3 +268,45 @@ fn owned_symlink_is_rejected() {
     let target = app.world_mut().spawn();
     assert!(load(&mut app, "symlink", target).is_err());
 }
+
+#[test]
+fn missing_driver_directory_reports_resource_attempt_and_cause() {
+    let fixture = Fixture::new();
+    let mut app = app(&fixture.0);
+    let target = app.world_mut().spawn();
+    let mut missing = request("missing", target);
+    missing.resource_id = ResourceID::parse("driver:local/absent:latest").unwrap();
+    app.world().send_event(missing);
+    let error = wait(&mut app, &["missing"])
+        .pop()
+        .unwrap()
+        .result
+        .unwrap_err();
+    assert!(error.message.contains("driver:local/absent:latest"));
+    let path = fixture.0.join("local/absent/latest");
+    assert!(error.message.contains(path.to_str().unwrap()), "{error}");
+    let cause = fs::symlink_metadata(fixture.0.join("local/absent"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.message.contains(&cause), "{error}");
+}
+
+#[test]
+fn missing_driver_files_report_exact_absolute_path_and_cause() {
+    for filename in ["driver.toml", "base.lua"] {
+        let fixture = Fixture::new();
+        let path = fixture.driver().join(filename);
+        assert!(path.is_absolute() && path.parent() == Some(fixture.driver().as_path()));
+        fs::remove_file(&path).unwrap();
+        let mut app = app(&fixture.0);
+        let target = app.world_mut().spawn();
+        let error = load(&mut app, "missing-file", target).unwrap_err();
+        assert!(
+            error.message.contains("driver:local/coder:latest"),
+            "{error}"
+        );
+        assert!(error.message.contains(path.to_str().unwrap()), "{error}");
+        let cause = fs::symlink_metadata(&path).unwrap_err().to_string();
+        assert!(error.message.contains(&cause), "{error}");
+    }
+}

@@ -16,7 +16,7 @@ member_messages = ["type:webui"]
 streaming_member_messages = ["type:webui"]
 ```
 
-模型路由仍只在 `~/.margatroid/models.toml` 配置，不在 `config.toml` 复制一份。已批准、待实现的路由规则将使 `provider` 成为执行厂商选择，并与三种 `api_type`（`chat_completions`、`messages`、`responses`）共同决定分支；对应解析、兼容组合及重载校验均归 InferencePlugin。本 crate 的配置职责不变，本次未迁移实际配置文件。
+模型路由只在 `~/.margatroid/models.toml` 配置，不在 `config.toml` 复制。已实现的路由规则要求provider为openai/anthropic/deepseek/openrouter之一，并与api_type（chat_completions/messages/responses）共同选择七个明确组合：OpenAI两种（chat/responses）、Anthropic一种（messages）、DeepSeek三种、OpenRouter一种（chat）。未知值、矩阵外组合或不支持选项在InferencePlugin加载/重载时拒绝；本crate不依赖其实现类型。base_url是API前缀，不猜主机或DeepSeek路径。主目录既有两条路由已迁移为chat_completions并保留各自provider与凭据；配置不新增并行来源。
 
 `server.allow` 是入口策略，缺省为 `"localhost"`：只接受回环对端，并且带 `Origin` 的请求要求其
 authority 与 `Host` 一致。也可以写 `"all"`（需同时放宽 `bind`）或 IP/CIDR 数组。策略由

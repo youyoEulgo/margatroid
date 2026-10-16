@@ -1,4 +1,4 @@
-use crate::files::{checked_path, definition, error, field, read_text};
+use crate::files::{checked_path, context, definition, error, field, read_text};
 use crate::types::PromptResourceLoadConfig;
 use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::WorldAsyncExt;
@@ -21,7 +21,10 @@ impl Drop for SubmissionGuard {
         if let Some(request) = self.request.take() {
             let result = Err(error(
                 Kind::TaskFailed,
-                "read submission dropped before I/O start",
+                format!(
+                    "request {}, resource {}: read submission dropped before I/O start",
+                    request.id, request.resource_id
+                ),
             ));
             if let Some(sender) = request
                 .reply
@@ -62,6 +65,12 @@ fn finish(
     result: Result<(), ResourceLoadError>,
     rollback: bool,
 ) {
+    let result = result.map_err(|e| {
+        context(
+            format!("request {}, resource {}", request.id, request.resource_id),
+            e,
+        )
+    });
     let sender = request
         .reply
         .lock()
@@ -215,13 +224,19 @@ pub(crate) fn handle_mount_prompt_resource(world: &mut World, output: PromptReso
                             content: resource.content.to_string(),
                         },
                         "assistant" => margatroid_types::message_types::AgentMessage::Assistant {
+                            replay: None,
                             reasoning: None,
                             content: Some(resource.content.to_string()),
                             tool_calls: Vec::new(),
                             usage: None,
                             stop_reason: None,
                         },
-                        _ => return Err(error(Kind::InvalidDefinition, "invalid prompt role")),
+                        _ => {
+                            return Err(error(
+                                Kind::InvalidDefinition,
+                                "invalid prompt role in prompt.toml",
+                            ))
+                        }
                     }]),
                 })
             } else {
@@ -238,6 +253,12 @@ pub(crate) fn handle_mount_prompt_resource(world: &mut World, output: PromptReso
             )
         })
     };
+    let result = result.map_err(|e| {
+        context(
+            format!("request {}, resource {}", request.id, request.resource_id),
+            e,
+        )
+    });
     let sender = reply.take().unwrap();
     drop(reply);
     let _ = sender.send(result.clone());
@@ -264,21 +285,41 @@ fn prepare(
         .join(request.resource_id.scope())
         .join(request.resource_id.name())
         .join(request.resource_id.tag());
-    checked_path(&directory, true)?;
-    let read = |name: &str, maximum| {
-        read_text(&directory.join(name), maximum, || {
-            request.cancel.is_cancelled()
+    let result = (|| {
+        checked_path(&directory, true)?;
+        let read = |name: &str, maximum| {
+            read_text(&directory.join(name), maximum, || {
+                request.cancel.is_cancelled()
+            })
+        };
+        let metadata = definition(&read("prompt.toml", config.limits.max_definition_bytes)?)
+            .map_err(|e| context(directory.join("prompt.toml").display(), e))?;
+        let role = field(&metadata, "role")
+            .map_err(|e| context(directory.join("prompt.toml").display(), e))?;
+        if !matches!(role.as_str(), "system" | "user" | "assistant") {
+            return Err(error(
+                Kind::InvalidDefinition,
+                format!(
+                    "{}: invalid prompt role",
+                    directory.join("prompt.toml").display()
+                ),
+            ));
+        }
+        let content = read("content.md", config.limits.max_content_bytes)?.into();
+        Ok(PromptResource {
+            alias: request.alias.clone(),
+            role,
+            content,
         })
-    };
-    let metadata = definition(&read("prompt.toml", config.limits.max_definition_bytes)?)?;
-    let role = field(&metadata, "role")?;
-    if !matches!(role.as_str(), "system" | "user" | "assistant") {
-        return Err(error(Kind::InvalidDefinition, "invalid prompt role"));
-    }
-    let content = read("content.md", config.limits.max_content_bytes)?.into();
-    Ok(PromptResource {
-        alias: request.alias.clone(),
-        role,
-        content,
+    })();
+    result.map_err(|e| {
+        context(
+            format!(
+                "resource {}, directory {}",
+                request.resource_id,
+                directory.display()
+            ),
+            e,
+        )
     })
 }

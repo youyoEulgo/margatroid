@@ -104,7 +104,32 @@ fn start(world: &mut World, request: &StartWorkspace) -> Result<(), WorkspaceErr
     if !existing.is_empty() {
         return Err(error(
             WorkspaceErrorKind::DuplicateWorkspace,
-            "workspace address is already occupied",
+            format!(
+                "workspace {} is already occupied: {}",
+                request.definition.id,
+                existing
+                    .iter()
+                    .map(|entity| {
+                        match world.get_component::<Workspace>(*entity) {
+                            Some(workspace) => format!(
+                                "entity={entity:?} state={} members={} member_failures={}",
+                                match workspace.state() {
+                                    WorkspaceState::Starting(_) => "Starting",
+                                    WorkspaceState::Running => "Running",
+                                    WorkspaceState::Stopping(_) => "Stopping",
+                                    WorkspaceState::Failed { .. } => "Failed",
+                                },
+                                workspace.iter().count(),
+                                workspace.member_failures().len()
+                            ),
+                            None => format!(
+                                "entity={entity:?} state=non-workspace members=0 member_failures=0"
+                            ),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
         ));
     }
     let (entry, close) = spawn_workspace_execution()
@@ -180,12 +205,20 @@ pub(crate) fn handle_agent_driver_result(world: &mut World, event: LoadAgentDriv
         Ok(()) => None,
     };
     let mut starts = Vec::new();
+    let mut failures = Vec::new();
     let workspace = world.get_component_mut::<Workspace>(entity).unwrap();
     let definition = workspace.definition().clone();
     if let WorkspaceState::Starting(state) = workspace.state_mut() {
         state.pending_drivers.remove(&event.id);
         if let Some(value) = failure {
-            record(&mut state.error, value);
+            for member in state
+                .driver_members
+                .get(&event.resource_id)
+                .into_iter()
+                .flatten()
+            {
+                failures.push((member.clone(), value.clone()));
+            }
         } else {
             let members = state
                 .driver_members
@@ -215,6 +248,9 @@ pub(crate) fn handle_agent_driver_result(world: &mut World, event: LoadAgentDriv
             }
         }
     }
+    for (agent, failure) in failures {
+        record_member_failure(world, entity, agent, event.resource_id.clone(), failure);
+    }
     for request in starts {
         world.send_event(request);
     }
@@ -233,52 +269,80 @@ pub(crate) fn handle_start_agent_result(world: &mut World, event: StartAgentResu
     };
     let mut stop = None;
     let workspace = world.get_component_mut::<Workspace>(entity).unwrap();
-    match workspace.state_mut() {
-        WorkspaceState::Starting(state) => {
-            let resource_id = state.pending_agents.remove(&event.id).unwrap();
-            match event.result {
-                Ok(agent) => workspace.insert_agent(resource_id, agent),
-                Err(value) => {
-                    if let WorkspaceState::Starting(state) = workspace.state_mut() {
-                        record(
-                            &mut state.error,
-                            error(WorkspaceErrorKind::AgentStartFailed, value.to_string()),
-                        );
-                    }
-                }
-            }
-        }
-        WorkspaceState::Stopping(state) => {
-            let resource_id = state.pending_creations.remove(&event.id).unwrap();
-            match event.result {
-                Ok(agent) => {
-                    let id = request_id();
-                    state
-                        .pending_agents
-                        .insert(id.clone(), (resource_id.clone(), agent));
-                    stop = Some(StopAgent { id, agent });
-                    workspace.insert_agent(resource_id, agent);
-                }
-                Err(value) => record(
-                    &mut state.error,
-                    error(WorkspaceErrorKind::AgentStartFailed, value.to_string()),
-                ),
-            }
-        }
-        WorkspaceState::Running => {
-            let resource_id = workspace.consume_creation(&event.id).unwrap();
-            match event.result {
-                Ok(agent) => workspace.insert_agent(resource_id, agent),
-                Err(value) => tracing::warn!(error = %value, "dynamic member creation failed"),
-            }
-        }
+    let resource_id = match workspace.state_mut() {
+        WorkspaceState::Starting(state) => state.pending_agents.remove(&event.id).unwrap(),
+        WorkspaceState::Stopping(state) => state.pending_creations.remove(&event.id).unwrap(),
+        WorkspaceState::Running => workspace.consume_creation(&event.id).unwrap(),
         _ => return,
+    };
+    let driver = workspace
+        .consume_creation_driver(&event.id)
+        .or_else(|| {
+            workspace
+                .definition()
+                .agents
+                .iter()
+                .find(|member| member.id == resource_id)
+                .map(|member| member.driver.clone())
+        })
+        .expect("accepted member start retains driver context");
+    match event.result {
+        Ok(agent) => {
+            if let WorkspaceState::Stopping(state) = workspace.state_mut() {
+                let id = request_id();
+                state
+                    .pending_agents
+                    .insert(id.clone(), (resource_id.clone(), agent));
+                stop = Some(StopAgent { id, agent });
+            }
+            workspace.insert_agent(resource_id, agent);
+        }
+        Err(value) => record_member_failure(
+            world,
+            entity,
+            resource_id,
+            driver,
+            error(WorkspaceErrorKind::AgentStartFailed, value.to_string()),
+        ),
     }
     if let Some(request) = stop {
         world.send_event(request);
     }
     finish_workspace_start(world, entity);
     finish_workspace_stop(world, entity);
+}
+
+fn record_member_failure(
+    world: &mut World,
+    entity: Entity,
+    agent: resource_id_plugin::ResourceID,
+    driver: resource_id_plugin::ResourceID,
+    error: WorkspaceError,
+) {
+    let workspace = world.get_component_mut::<Workspace>(entity).unwrap();
+    let workspace_id = workspace.resource_id().clone();
+    let error = WorkspaceError::new(
+        error.kind(),
+        format!(
+            "workspace={workspace_id} agent={agent} driver={driver}: {}",
+            error.message()
+        ),
+    );
+    workspace.record_member_failure(
+        agent.clone(),
+        WorkspaceMemberFailure {
+            driver: driver.clone(),
+            error: error.clone(),
+        },
+    );
+    tracing::warn!(workspace = %workspace_id, %agent, %driver, %error, "workspace member startup failed");
+    world.send_event(WorkspaceMemberStartFailed {
+        workspace: entity,
+        workspace_id,
+        agent,
+        driver,
+        error,
+    });
 }
 
 fn finish_workspace_start(world: &mut World, entity: Entity) {
@@ -292,20 +356,11 @@ fn finish_workspace_start(world: &mut World, entity: Entity) {
         return;
     }
     let id = state.request_id.clone();
-    let result = match state.error.clone() {
-        Some(value) => {
-            workspace.close_admission();
-            workspace.set_state(WorkspaceState::Failed {
-                error: value.clone(),
-            });
-            Err(value)
-        }
-        None => {
-            workspace.set_state(WorkspaceState::Running);
-            Ok(entity)
-        }
-    };
-    world.send_event(StartWorkspaceResult { id, result });
+    workspace.set_state(WorkspaceState::Running);
+    world.send_event(StartWorkspaceResult {
+        id,
+        result: Ok(entity),
+    });
 }
 
 pub(crate) fn handle_stop_workspace(world: &mut World, request: StopWorkspace) {

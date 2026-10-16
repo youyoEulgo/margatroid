@@ -39,11 +39,11 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 无 `get_turn`。Agent状态为 Creating / Idle / Working / Stopping，对外同步为 `creating/idle/working/stopping`，同时发布 turn 与 status。启动成功进入 Idle、turn=None；start_turn仅允许Idle，原子创建唯一turn并置Working，不覆盖已有轮次。AbortAgentTurn控制系统在RuntimePlugin::PRE_UPDATE执行，先于UPDATE中的MCL实际动作及Inference/Tool受理；自定义调度必须保留该顺序。控制受理验证完整Agent实例、workspace、Driver实例及expected_turn_id，立即清空turn但保持Working，仅取消匹配活动的独立turn_cancel，不关闭根作用域。正常finish_turn核对当前Driver结果关联及真实清理完成后才置Idle；Working收口期间同一中止关联重复请求幂等，不能让迟到旧完成覆盖新轮次。用户轮次中止不等于根Agent shutdown、owner abort、timeout或receiver closed。
 
-## 领域推理请求分层（已批准，待实现）
+## 领域推理请求分层（已实现）
 
 ```text
 归属：
-    在共享types新增独立inference_request_types.rs，定义DomainRequest及其直接需要的纯值请求参数
+    共享types的独立inference_request_types.rs，定义DomainRequest及其直接需要的纯值请求参数
     不把API格式、厂商适配器、HTTP、URL、凭据、ECS实例、取消令牌或oneshot放入DomainRequest
     ApiFormat、ApiRequest、三种具体API请求、厂商处理器、能力配置与转换错误全部归inference_plugin::types
 
@@ -68,7 +68,7 @@ DomainRequestConfig：通用请求配置，公开纯值结构体
     Driver保持领域上下文与回合流程，不因API格式切换而更换；Responses初期同样采用本地完整无状态上下文
 ```
 
-该分层是待实现目标，当前ProviderInput等旧接口的源码归属在实现迁移前保持不变。
+该分层已经实现；旧ProviderInput借用接口和字符串协议工厂已移除，具体格式及VendorAdapter留在推理插件。
 
 # lib
 
@@ -154,12 +154,16 @@ AgentMessage：消息值，公开枚举--不是Event，不包含路由Entity
     Inject { messages: Vec<AgentMessage> }
     System { content: String }--系统消息，prompt导入及推理按实际role保留
     User { content: String }
-    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCall>, usage: Option<TokenUsage>, stop_reason: Option<StopReason> }
+    Assistant { replay: Option<serde_json::Value>, reasoning: Option<String>, content: Option<String>, tool_calls: Vec<ToolCall>, usage: Option<TokenUsage>, stop_reason: Option<StopReason> }
     ToolCall { resource_id: Option<ResourceID>, tool_call_id: String, tool_name: String, content: String, failed: bool }
     Error { message: String }
     impl Clone + PartialEq + Eq + Serialize + Deserialize for AgentMessage
     说明：JSON type为inject/system/user/assistant/tool_call/error；未知资源的可见性拒绝结果resource_id为None，不虚构builtin/invalid地址。
         inject递归包含同一消息值类型；history_append的允许范围独立校验，不能从消息枚举自动推导
+        replay缺字段serde默认为None，是不透明API标签信封{api_format,items}，共享层不依赖ApiFormat枚举
+        Messages replay保留thinking文本/signature及redacted_thinking.data；Responses保留reasoning.id/summary及可用content/encrypted_content
+        DTO和显式持久历史保留replay元数据，不与正文或显示reasoning混合；格式边界验证兼容性并拒绝不能表达的重放
+        当前User和工具结果仍为String纯文本，图像content blocks未实现
         Assistant可只有合法工具调用而无正文；usage与新增stop_reason保留于结果及显式历史元数据，不回传作为模型输入
         目标stop_reason覆盖全部推理原因，新增StopReason::Cancelled序列化cancelled；兼容InferenceResponse.stop_reason由同一权威映射生成且两处始终相同
         用户轮次中止且真实cleanup成功返回Ok assistant：content="Turn aborted."、reasoning=None、tool_calls=[]、usage=None、stop_reason=Cancelled；不伪造部分执行成功
@@ -381,3 +385,11 @@ HistoryRecord：历史记录，公开共享契约
 Cancelled、CleanupFailed、重复请求、alias冲突和幂等历史内容冲突必须有明确分类。
 From<AsyncTaskError>不能凭空取得请求ID，闭包提交包装必须保存关联，不能仅日志后丢失回执。
 ```
+
+## Workspace 成员启动失败隔离契约
+
+Workspace 自身定义校验、创建或执行线程创建失败才返回 StartWorkspaceResult::Err；创建前失败不占用新地址，重复地址保留旧实例并报告其 ID、状态、成功成员数及失败成员数，不覆盖或自动附着。初始驱动和成员请求全部结束后，即使全部成员失败也进入 Running 并返回 Ok，成员失败不得关闭提交门。
+
+Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>；失败值包含 driver 与 error，工作区身份由所属组件提供。这是持久到该工作区停止的失败诊断，不是重复 Agent 生命周期表。每个失败成员产生 WorkspaceMemberStartFailed，携带 workspace Entity、workspace_id、agent、driver、error；共享驱动失败按成员展开，动态创建失败同样记录并通知，成功加入清除该成员旧失败。Stopping 中已受理动态创建失败只结束等待，不污染健康工作区的停止结果。
+
+WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。

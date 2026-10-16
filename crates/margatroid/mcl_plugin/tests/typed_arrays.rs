@@ -133,6 +133,7 @@ fn checked_ranges_and_typed_empty() {
 #[test]
 fn tool_calls_are_extracted_only_from_one_assistant() {
     let assistant = AgentMessage::Assistant {
+        replay: None,
         reasoning: None,
         content: None,
         tool_calls: vec![],
@@ -162,6 +163,7 @@ fn tool_calls_are_extracted_only_from_one_assistant() {
         arguments: "{}".into(),
     };
     let message = AgentMessage::Assistant {
+        replay: None,
         reasoning: None,
         content: None,
         tool_calls: vec![duplicate.clone(), duplicate],

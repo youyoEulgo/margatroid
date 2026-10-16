@@ -662,6 +662,7 @@ fn pending_blocks_tail_stop_keeps_head_and_completion_is_correlated() {
         result: Ok(MclAsyncPhase::Completed(MclValue::Inference(
             InferenceResponse {
                 message: AgentMessage::Assistant {
+                    replay: None,
                     reasoning: None,
                     content: Some("done".into()),
                     tool_calls: vec![],
@@ -824,6 +825,7 @@ fn real_inference_reply_unblocks_fifo_and_keeps_submission_turn() {
         .unwrap()
         .send(Ok(InferenceResponse {
             message: AgentMessage::Assistant {
+                replay: None,
                 reasoning: None,
                 content: Some("actual".into()),
                 tool_calls: vec![],
@@ -1212,6 +1214,7 @@ fn message_store_failure_does_not_affect_inference_result_or_trigger_implicit_wr
             result: Ok(MclAsyncPhase::Completed(MclValue::Inference(
                 InferenceResponse {
                     message: AgentMessage::Assistant {
+                        replay: None,
                         reasoning: None,
                         content: Some("real".into()),
                         tool_calls: vec![],
@@ -2202,6 +2205,7 @@ fn effect_selectors_use_one_database_request_and_current_import_ids() {
         .unwrap()
         .send(Ok(InferenceResponse {
             message: AgentMessage::Assistant {
+                replay: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![],

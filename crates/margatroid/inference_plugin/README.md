@@ -1,27 +1,27 @@
 # InferencePlugin
 
-> 状态：格式/vendor分层重构已批准、待实现。本次只更新设计文档；下文标明“当前基线”的 `api_type`、可选provider、`with_api_type` 和ProviderAdapter接口仍是现有实现，不代表目标已落地。目标契约见“已批准目标”；其余执行、资源及cleanup说明保持现有实现边界。
+> 状态：格式/vendor分层重构已实现。共享拥有所有权的领域请求、三种格式转换与严格SSE累积器、必填vendor和显式七组合路由已落地；执行、资源及真实cleanup边界保持不变。当前内容仍为纯文本，不声明图像支持。
 
-## 已批准目标（待实现）
+## 已实现的请求分层
 
 - **共享纯领域请求**：专用 `types::inference_request_types` 中仅有单一 `DomainRequest { messages: Vec<AgentMessage>, tools: Vec<ToolDefinition>, config: DomainRequestConfig }`。`DomainRequestConfig` 包含上游 `model: String`、`temperature`、`max_output_tokens`、`top_p`、`stop` 公共语义参数；默认空model在执行前拒绝。请求拥有所有权，不含HTTP、URL、密钥、provider、执行状态、Entity或channel。它与插件 `InferenceConfig` Resource不同。资源归属检查及CallableResource快照准备仍先完成，再构造纯ToolDefinition。
 - **执行事件不混合领域值**：`InferenceRequest` 仍承担请求关联、Entity、turn、cancel和oneshot等执行职责；不是把其改名为DomainRequest。现有工具快照、客户端快照、独立supervisor、真实cleanup和显式历史边界不变。
 - **格式与厂商独立**：插件 `inference_plugin::types` 定义 `ApiFormat { ChatCompletions, Messages, Responses }`，稳定配置值分别为 `chat_completions/messages/responses`。provider从可选标签变为必填vendor执行选择器；model是独立上游模型名称，不推断格式或厂商。
-- **具体格式再执行**：插件拥有 `ChatCompletionsRequest`、`MessagesRequest`、`ResponsesRequest` 及包含它们的 `ApiRequest`，另有 `Vendor`、`ApiAdapter` 和具体vendor handler。使用 `TryFrom<DomainRequest>`（需要结构能力时使用插件内 `EncodeInput`）及 `.try_into()` 可失败转换，再交给如 `OpenAi<ChatCompletionsRequest>` 的具体handler；枚举变体不是Rust泛型类型参数。
-- **能力前置且无静默损失**：消息结构受vendor/model能力影响时，能力快照必须在格式转换前参与，而非编码丢失信息后才在vendor process补救。保留领域消息、resource IDs、工具调用ID、reasoning、参数、结果关联和完整语义；不支持的结构或参数在HTTP前显式拒绝。EncodeInput是编码辅助，不是第二个共享请求。
+- **具体格式再执行**：插件内部 formats 模块拥有 `ChatCompletionsRequest`、`MessagesRequest`、`ResponsesRequest` 及包含它们的 `ApiRequest`。`ApiFormat::build_request` 通过 `TryFrom<DomainRequest>` / `.try_into()?` 转换，vendors 模块的 `VendorAdapter` 接收具体格式的 `ApiRequest` 再处理厂商选项、鉴权、端点和HTTP。公开重新导出 `ApiFormat`、`Vendor`；不存在旧协议工厂注册表、`with_api_type`、`ApiAdapter` 或泛型vendor handler类型。
+- **可失败而非静默损失**：领域请求保留完整消息及资源关联；格式转换检查工具调用/结果配对及格式可表达性，厂商层补充已验证的选项约束。内部resource ID不作为API字段发送，本地结果/历史仍保留。Responses不支持stop序列，Messages缺少max_output_tokens时拒绝；跨格式replay或缺少必要reasoning元数据也在HTTP前失败。不宣称已实现独立vendor/model能力快照系统。
 - **响应逆向归一**：HTTP/SSE经vendor特有兼容及对应格式解码/累积，统一成 `InferenceResponse`。各格式使用自己的结束条件；不能都套用Chat Completions的choice/`[DONE]`。保留tool IDs、reasoning、usage及真实stop_reason；正常响应和用户轮次abort的统一构造helper保证内外stop_reason一致，且不改变既有真实cleanup条件。
 - **普通无状态Responses**：首期每次提交完整本地上下文，不依赖远端conversation或previous_response_id，不用远端状态替代本地历史。
 
-初始显式支持矩阵（已批准建议，待实现；不是当前能力声明）：
+当前显式支持矩阵（七组合，2 + 1 + 3 + 1；不保证每个远端模型都支持全部语义）：
 
 | provider | ApiFormat稳定配置值 |
 | --- | --- |
 | openai | chat_completions、responses |
 | anthropic | messages |
 | deepseek | chat_completions、messages、responses |
-| openrouter | chat_completions（显式generic-compatible handler） |
+| openrouter | chat_completions |
 
-未知provider、格式或未列出组合在加载/重载时拒绝；无URL猜测、无隐式openai兜底。具体vendor/model能力还可进一步限制输入。配置唯一来源仍为现有 `models.toml`，不是新增并行 `config.toml`；格式字段的迁移细节以配置契约为准，不能把旧 `api_type = "deepseek"` 当作目标格式值。全部路由与catalog编译成功才原子发布；重载失败同时保留旧配置和旧catalog，在途请求保留原快照。
+未知provider、格式或未列出组合在加载/重载时拒绝；无URL猜测、无隐式openai兜底。具体vendor/model能力还可进一步限制输入。配置唯一来源仍为现有 `models.toml`，不是新增并行 `config.toml`；旧 `api_type = "openai"` / `"deepseek"` 已拒绝，必须改为实际格式值并明确provider。全部路由与catalog编译成功才原子发布；重载失败同时保留旧配置和旧catalog，在途请求保留原快照。
 
 多模态仅为后续概念：User及工具结果ToolCall的content可扩展为有类型content blocks，当前不实现。图像base64不能当普通文本拼入来宣称vision支持；格式/vendor/model不支持时应可失败拒绝，不丢块、不伪装能力。
 
@@ -40,7 +40,7 @@ Assistant 新增 `stop_reason: Option<StopReason>`（旧文件缺字段默认为
 
 `InferencePlugin` 执行一次模型请求：共享 `AgentMessage` 快照和选定 `CallableResource` 工具定义快照进入，完整 `InferenceResponse` 经 oneshot 返回。它不创建 Agent、不写历史、不执行工具、不自动重试、续写或压缩；命令收口由 MCL 负责；assistant 是否保存由调用方显式发出 history_append 决定，推理成功不触发 message 写入。压缩等调用方也使用同一个入口，自行解释响应。
 
-全局只有一份 `InferenceConfig`，包含模型路由、配置路径、协议工厂、共享 HTTP client、调度计划及重载关联。没有项目路由覆盖、在途推理表、输出路由、固定异步 System 或业务结果转发 System。插件仅安装 `inference_system`，处理统一请求、重载请求和共享重载输出。
+全局只有一份 `InferenceConfig`，包含模型路由、配置路径、共享 HTTP client、调度计划及重载关联。没有项目路由覆盖、在途推理表、输出路由、固定异步 System 或业务结果转发 System。插件仅安装 `inference_system`，处理统一请求、重载请求和共享重载输出。
 
 ## 安装
 
@@ -62,11 +62,11 @@ app.add_plugin(RuntimePlugin::default())
         .with_config_path("/etc/margatroid/models.toml"));
 ```
 
-当前基线：安装时有界读取并完整编译配置，失败或重复安装拒绝。`with_schedule`、`with_config_path` 和旧 `with_api_type` 分别配置计划、唯一配置路径和额外协议工厂；空或重复协议名拒绝。安装时通过一次 no-op async closure 验证通用设施。目标扩展需显式登记格式编解码、vendor handler与支持矩阵，不把旧字符串工厂机制视为目标已完成。
+安装时有界读取并完整编译配置，失败或重复安装拒绝。`with_schedule` 和 `with_config_path` 分别配置计划和唯一配置路径；没有字符串协议工厂扩展入口。安装时通过一次 no-op async closure 验证通用设施。
 
-## 全局模型路由与协议（当前基线）
+## 全局模型路由与格式
 
-默认配置为 `~/.margatroid/models.toml`。以下是**当前实现的旧配置示例，不是待实现目标的配置范例**：旧 `api_type = "deepseek"` 选择DeepSeek适配器，即使provider标签写openrouter；目标必须改为独立格式及实际执行vendor，openrouter仅允许矩阵中的chat_completions，不能保留此写法声称支持其他格式。
+默认配置为 `~/.margatroid/models.toml`。provider必填，仅接受 `openai`、`anthropic`、`deepseek`、`openrouter`；api_type必填，仅接受上述三种格式。未知字段也拒绝。例如OpenRouter路由：
 
 ```toml
 [[models]]
@@ -75,27 +75,39 @@ model = "deepseek/deepseek-v4-flash-latest"
 provider = "openrouter"
 base_url = "https://openrouter.ai/api/v1"
 api_key = "replace-with-your-key"
-api_type = "deepseek"
+api_type = "chat_completions"
 thinking = "enabled"
 reasoning_effort = "high"
 context_window = "200k"
 ```
 
-当前基线：`id` 是 Agent.info.model.model 选择的逻辑键；`model` 是发送给 Provider 的模型值，两者不必相同。旧 `provider` 仅为可选元数据，旧 `api_type` 显式选择协议，不根据 URL 猜测。**这不是目标语义**：目标provider必填并决定vendor执行，ApiFormat单独选择格式，model不决定两者。配置必须非空、ID 唯一、必需字段非空、URL 使用 http/https，所有条目完整编译成功才能发布。
+`id` 是 Agent.info.model.model 选择的逻辑键；`model` 是发送给Provider的上游模型值；provider是实际执行厂商，不从模型品牌、URL或格式推断。配置必须非空、ID唯一、必需字段非空、URL使用http/https。全部路由与安全catalog完整编译成功才发布；catalog只包含canonical provider、格式、模型和窗口等非敏感元数据，不含URL、密钥或adapter。
+
+`base_url` 是用户指定的API前缀，去掉末尾斜杠后仅追加 `/chat/completions`、`/messages` 或 `/responses`。没有DeepSeek主机名或路径猜测；若兼容Messages端点要求 `/anthropic/v1/messages`，用户应将前缀设为 `https://example.test/anthropic/v1`。Messages使用x-api-key和anthropic-version，其他格式使用Bearer鉴权。
 
 `context_window` 使用不区分大小写的无符号整数后缀 `k/m/b/t`，分别乘以 1000、1000000、1000000000、1000000000000，必须大于零且不溢出；缺省为 `1m`。它是路由信息，不是假称精确 token 估算，也不是输出长度限制。采样参数直接复制已存在的 `Agent.info.model`，不会每次重新读取 AgentDriver。
 
-### OpenAI
+### Chat Completions
 
 使用 `chat/completions` 流式请求，工具名直接为资源 alias，开启 `stream_options.include_usage`。累积器支持 CRLF、SSE 多 data 行和跨 UTF-8 字节分片，分别累积正文、reasoning 及工具调用 index 对应的 ID/name/arguments 片段。工具 index、ID、名称及参数均有界；最终检查唯一 ID、非空名称、JSON object 参数，以及名称是否属于本次可见工具。
 
 usage 尾帧即使没有 choices 也处理；统一 input/output 与 prompt/completion 计数，支持缓存命中字段。必须观察 choice、真实停止原因及 `[DONE]` 才成功，半流或非法分片不能当正常截断。保留 `Length`、`ContentFilter` 和其他 Provider 停止原因，不因工具调用覆盖停止原因；完整工具响应没有正文也可成功。
 
-### DeepSeek
+### DeepSeek与OpenRouter选项
 
-`thinking = "disabled"` 会显式编码 `{type:"disabled"}`，不能省略后误启用模型默认思考。`enabled` 必须同时设置 `reasoning_effort = "high"` 或 `"max"`；其他组合在路由编译阶段拒绝。未指定 thinking 时不发送该配置字段，但历史 assistant 按思考协议回传 `reasoning_content`，缺失时补空串。显式 disabled 时，工具调用历史仍保留必要 reasoning 字段。
+DeepSeek的thinking/reasoning_effort仅允许chat_completions；messages/responses设置任一选项会在路由编译时拒绝。`thinking = "disabled"` 会显式编码 `{type:"disabled"}`，不能省略后误启用模型默认思考。`enabled` 必须同时设置 `reasoning_effort = "high"` 或 `"max"`；其他组合在路由编译阶段拒绝。未指定 thinking 时不发送该配置字段，但历史 assistant 按思考协议回传 `reasoning_content`，缺失时补空串。显式 disabled 时，工具调用历史仍保留必要 reasoning 字段。
+
+OpenRouter同样只在chat_completions允许这些选项：enabled必须搭配high（不支持max），映射为 `reasoning: { enabled: true, effort: "high" }`；disabled映射为 `reasoning: { enabled: false }`。不发送DeepSeek的thinking/reasoning_effort字段。OpenAI/Anthropic拒绝这两项选项。
 
 响应接受 `reasoning_content` 和兼容的 `reasoning`，正文与思考分别推送。原生 `prompt_cache_hit_tokens` 及兼容 cached-token details 都映射到共享 usage。
+
+### Messages、Responses与reasoning replay
+
+Messages将System提取为system文本块，工具调用/结果编码为tool_use/tool_result；必须提供max_output_tokens，不编造默认max_tokens。SSE验证message_start、索引块的start/delta/stop、message_delta真实停止原因和message_stop，拒绝错序、重复、未闭合或残缺事件。
+
+Responses每次发送完整本地上下文，`store: false` 且 `include: ["reasoning.encrypted_content"]`；不依赖conversation或previous_response_id。函数调用与输出以call_id关联；不支持stop序列时显式拒绝。SSE按output item/content part及格式自己的终态检查完成，不把[DONE]当作所有格式的结束条件。
+
+Assistant新增可选 `replay: Option<serde_json::Value>`，旧消息缺字段默认为None。它是领域层不解释的API-tagged JSON信封：`{ "api_format": "messages" | "responses", "items": [...] }`。Messages保留thinking的文本及signature、redacted_thinking的data；Responses保留reasoning item的id、summary及可用的content/encrypted_content。完整响应和显式历史/DTO往返保留它，显示reasoning不能代替它。不兼容格式、无效信封及缺少必要replay的历史reasoning在HTTP前拒绝；Chat Completions不接受外来replay，OpenAI chat也拒绝非空历史reasoning。当前User和工具结果仍为String纯文本，没有图像content blocks。
 
 ## 发起一次推理
 
@@ -114,20 +126,20 @@ world.send_event(InferenceRequest {
     agent,
     messages: vec![AgentMessage::User { content: "Review this patch.".into() }],
     tools: selected_callable_resources,
-    turn: Some("turn-1".into()), // 目标：当前活动轮次快照
+    turn: Some("turn-1".into()), // 当前活动轮次快照
     cancel: agent_scope.child_cancel(),
     reply: Arc::new(Mutex::new(Some(sender))),
 });
 // 异步调用方 await receiver，收到 Result<InferenceResponse, InferenceError>。
 ```
 
-主线程先认领原 Sender 并转入私有回复槽，重复克隆请求不会重复执行。校验完整 Agent Entity、请求 ID 和取消状态；从 `Agent.info.model` 获取模型与采样参数。目标在实际受理时再次核对当前 turn 与请求快照；None 或已中止旧轮次返回正常 cancelled 响应，不启动 HTTP；turn 不作为推理唯一 ID。请求取消令牌与活动作用域派生 child 同时监督，即使请求使用独立令牌也不能绕过 Agent 停止。
+主线程先认领原 Sender 并转入私有回复槽，重复克隆请求不会重复执行。校验完整 Agent Entity、请求 ID 和取消状态；从 `Agent.info.model` 获取模型与采样参数。实际受理时再次核对当前 turn 与请求快照；None 或已中止旧轮次返回正常 cancelled 响应，不启动 HTTP；turn 不作为推理唯一 ID。请求取消令牌与活动作用域派生 child 同时监督，即使请求使用独立令牌也不能绕过 Agent 停止。
 
 `tools: Vec<CallableResource>` 保存完整 ResourceID、选定 alias 及 `Arc<CallableDefinitionSnapshot>`。直接消费该快照的描述、schema 和资源种类，不按 ID 重取最新定义，也不重复 global alias query。归属校验要求目标 ResourceSet 中该 ID 存在、Agent.driver_dependencies 许可，以及 ImportBindings 中该 ID/TOOL kind 已导入；不要求旧 snapshot 与 reload 后的新 alias/定义一致。visible alias 必须唯一，不按重复 ID 静默去重。
 
 tool 使用选定 schema；仅 tool 资源可作为 TOOL。空 tools 就是无工具，不回退默认集合。非法 schema、外部 `$ref` 或归属失败在 HTTP 提交前拒绝。
 
-`Inject` 递归按序展开；System、user、assistant、工具结果及 error 转为公开 `ProviderMessage`，System 与 prompt 的真实 role 不降格为 user。保留 reasoning、工具 ID、参数和结果关联，历史 usage 与 stop_reason 不进入请求，cancelled assistant 拒绝作为上下文。检查工具调用/结果配对，空输入、孤立结果、重复调用和超限输入拒绝。history append 不接收 System 是独立约束，不缩窄 infer 输入。
+准备阶段仍调用旧 `normalize_messages` 作预检并丢弃其 `ProviderMessage` 投影，随后将原始拥有所有权的AgentMessage放入DomainRequest，由格式层再次规范化/编码，replay不会通过旧投影丢失。`Inject` 递归按序展开；System、user、assistant、工具结果及 error 保留真实角色，System 与 prompt 的真实 role 不降格为 user。保留 reasoning、工具 ID、参数和结果关联，历史 usage 与 stop_reason 不进入请求，cancelled assistant 拒绝作为上下文。检查工具调用/结果配对，空输入、孤立结果、重复调用和超限输入拒绝。history append 不接收 System 是独立约束，不缩窄 infer 输入。
 
 MCL `infer` 参数为 MESSAGE array + TOOL array；手工工具调用也先构造恰好一条 assistant MESSAGE，再传 visible TOOL array，calls 从 `assistant.tool_calls` 提取。`ToolCall` 仍为 assistant 的纯结构字段，没有 TOOL_CALL Block array。metadata reload 不改变已取出的 Block/请求；新 GET alias 取得新 snapshot。脚本仍按选定路径 late read，metadata snapshot 不保证磁盘文件内容版本隔离。
 
@@ -162,7 +174,7 @@ use inference_plugin::ReloadModelRoutes;
 world.send_event(ReloadModelRoutes { id: "reload-1".into() });
 ```
 
-一个重载在途时返回 `ConfigBusy`。后台有界读取并解析 TOML，共享 `InferenceReloadOutput { id, result: Result<String, InferenceError> }` 携带原始配置，不携带插件 Adapter。原始字符串包含凭据，只用于内部编译，不发客户端、不记日志。主线程核对关联并完整编译协议工厂，捕获工厂 panic，成功整体替换 routes；任一失败保持旧配置，清除标记并发送 `ReloadModelRoutesResult { id, result: Result<usize, InferenceError> }`。ReloadGuard 保证闭包丢弃仍投递带原 ID 的失败。
+一个重载在途时返回 `ConfigBusy`。后台有界读取并解析 TOML，共享 `InferenceReloadOutput { id, result: Result<String, InferenceError> }` 携带原始配置，不携带插件 Adapter。原始字符串包含凭据，只用于内部编译，不发客户端、不记日志。主线程核对关联并完整编译vendor/format适配器，捕获编译 panic，成功整体替换 routes；任一失败保持旧配置，清除标记并发送 `ReloadModelRoutesResult { id, result: Result<usize, InferenceError> }`。ReloadGuard 保证闭包丢弃仍投递带原 ID 的失败。
 
 重载期间新推理继续使用旧配置，已启动推理使用自己的协议快照。不监听文件变化，不接受项目路径覆盖。
 
@@ -172,6 +184,6 @@ world.send_event(ReloadModelRoutes { id: "reload-1".into() });
 
 错误共享 `kind/message`，文本按 UTF-8 边界限制到 512 字节；HTTP 状态由 `with_status` 写入 message，没有独立 status 字段。HTTP 错误正文优先提取常见 JSON 字段并单行化；传输错误只使用安全 URL origin 和分类，不复制可能带凭据的底层错误链，不记录 Authorization、请求正文或完整 prompt。
 
-当前旧扩展基线（并非目标扩展契约）：新协议通过 `with_api_type` 注册 `ProviderAdapterFactory`，工厂从借用的 `ProviderRouteInput` 构建 Adapter；Adapter 将借用的 `ProviderInput` 编码为拥有所有权的 `ProviderHttpRequest`，为每个响应创建 `ProviderResponseAccumulator`。累积器 `push` 返回有序增量，`finish` 返回完整响应和尾部增量，必须验证协议完成。公开 trait、路由和协议辅助值当前保留在插件 types 模块，共享消息、usage、StopReason 和错误不反向依赖插件。
+扩展格式时修改具体请求、ApiRequest分支及对应SSE编解码；扩展厂商时修改Vendor、显式支持矩阵及vendors处理。`ProviderAdapter::build_request` 消费拥有所有权的DomainRequest并返回ProviderHttpRequest；每个响应创建独立ProviderResponseAccumulator。push返回有序增量，finish验证该格式完整终止后返回完整响应与尾部增量。保留公开trait及ErasedProviderAdapter供调度，但没有注册工厂或旧ProviderInput借用接口。
 
 完整六板块契约见 [DESIGN.md](<DESIGN.md>)。回归覆盖协议 SSE/DeepSeek、资源可见性、半流、取消、receiver 关闭、panic、HTTP/终态 owner abort，以及重载忙碌与旧配置保留。

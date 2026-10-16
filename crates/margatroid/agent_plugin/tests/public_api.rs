@@ -35,7 +35,7 @@ fn test_catalog(
     ModelRuntimeCatalog::new([ModelRuntimeInfo {
         id: "model-one".into(),
         model: "upstream-model".into(),
-        api_type: "deepseek".into(),
+        api_type: "chat_completions".into(),
         provider: Some("test-provider".into()),
         context_window_tokens,
         thinking: Some("enabled".into()),
@@ -232,7 +232,10 @@ async fn model_environment_is_complete_private_and_an_admission_snapshot() {
             .context_window_tokens,
         128_000
     );
-    assert_eq!(model["api_type"], LuaValue::String("deepseek".into()));
+    assert_eq!(
+        model["api_type"],
+        LuaValue::String("chat_completions".into())
+    );
     assert_eq!(model["provider"], LuaValue::String("test-provider".into()));
     assert_eq!(model["thinking"], LuaValue::String("enabled".into()));
     assert_eq!(model["reasoning_effort"], LuaValue::String("high".into()));

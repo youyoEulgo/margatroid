@@ -14,7 +14,7 @@ use tempfile::tempdir;
 fn public_api_installs_reloads_and_replies_to_missing_agent() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("models.toml");
-    fs::write(&path, "[[models]]\nid='test'\nmodel='test-model'\nbase_url='https://example.test/v1'\napi_key='secret'\napi_type='openai'\n").unwrap();
+    fs::write(&path, "[[models]]\nid='test'\nmodel='test-model'\nbase_url='https://example.test/v1'\napi_key='secret'\nprovider='openai'\napi_type='chat_completions'\n").unwrap();
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(ClosurePlugin)
@@ -29,15 +29,15 @@ fn public_api_installs_reloads_and_replies_to_missing_agent() {
         .clone();
     let metadata = initial.get("test").unwrap();
     assert_eq!(metadata.model, "test-model");
-    assert_eq!(metadata.api_type, "openai");
+    assert_eq!(metadata.api_type, "chat_completions");
     assert_eq!(metadata.context_window_tokens, 1_000_000);
-    assert_eq!(metadata.provider, None);
+    assert_eq!(metadata.provider.as_deref(), Some("openai"));
     assert_eq!(metadata.thinking, None);
     assert_eq!(metadata.reasoning_effort, None);
     let debug = format!("{initial:?}");
     assert!(!debug.contains("secret"));
     assert!(!debug.contains("example.test"));
-    fs::write(&path, "[[models]]\nid='test'\nmodel='new-model'\nbase_url='https://example.test/v1'\napi_key='new-secret'\napi_type='deepseek'\nprovider='deepseek'\nthinking='enabled'\nreasoning_effort='max'\ncontext_window='256k'\n").unwrap();
+    fs::write(&path, "[[models]]\nid='test'\nmodel='new-model'\nbase_url='https://example.test/v1'\napi_key='new-secret'\napi_type='chat_completions'\nprovider='deepseek'\nthinking='enabled'\nreasoning_effort='max'\ncontext_window='256k'\n").unwrap();
     let agent = app.world_mut().spawn();
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     app.world().send_event(InferenceRequest {
@@ -81,7 +81,7 @@ fn public_api_installs_reloads_and_replies_to_missing_agent() {
         .clone();
     let metadata = reloaded.get("test").unwrap();
     assert_eq!(metadata.model, "new-model");
-    assert_eq!(metadata.api_type, "deepseek");
+    assert_eq!(metadata.api_type, "chat_completions");
     assert_eq!(metadata.context_window_tokens, 256_000);
     assert_eq!(metadata.provider.as_deref(), Some("deepseek"));
     assert_eq!(metadata.thinking.as_deref(), Some("enabled"));

@@ -15,6 +15,7 @@ use margatroid_types::execution_components::{
     ExecutionActivity, ExecutionActivityKind, ExecutionError,
 };
 use margatroid_types::inference_events::InferenceReply;
+use margatroid_types::inference_request_types::{DomainRequest, DomainRequestConfig};
 use margatroid_types::message_types::{AgentMessage, ToolDefinition};
 use margatroid_types::resource_components::{
     CallableDefinitionSnapshot, CallableResource, ToolResource,
@@ -76,10 +77,9 @@ pub(crate) fn default_config_path() -> PathBuf {
 
 pub(crate) fn load_model_routes(
     path: &Path,
-    factories: &HashMap<String, ErasedProviderAdapterFactory>,
 ) -> Result<HashMap<ModelId, ConfiguredModelRoute>, InferenceError> {
     let source = read_model_source(path)?;
-    compile_model_routes(&source, factories)
+    compile_model_routes(&source)
 }
 
 fn read_model_source(path: &Path) -> Result<String, InferenceError> {
@@ -112,7 +112,6 @@ fn read_model_source(path: &Path) -> Result<String, InferenceError> {
 
 fn compile_model_routes(
     source: &str,
-    factories: &HashMap<String, ErasedProviderAdapterFactory>,
 ) -> Result<HashMap<ModelId, ConfiguredModelRoute>, InferenceError> {
     let document = toml::from_str::<ModelRouteDocument>(source).map_err(|_| {
         InferenceError::new(
@@ -128,11 +127,7 @@ fn compile_model_routes(
     }
     let mut routes = HashMap::new();
     for config in document.models {
-        if config.model.is_empty()
-            || config.api_key.is_empty()
-            || config.api_type.is_empty()
-            || config.base_url.is_empty()
-        {
+        if config.model.is_empty() || config.api_key.is_empty() || config.base_url.is_empty() {
             return Err(InferenceError::new(
                 InferenceErrorKind::InvalidModelRoute,
                 "model route contains an empty required field",
@@ -157,25 +152,22 @@ fn compile_model_routes(
                 "model route base URL must use http or https",
             ));
         }
-        let factory = factories.get(&config.api_type).ok_or_else(|| {
-            InferenceError::new(
-                InferenceErrorKind::UnsupportedApiType,
-                "model route api type is not registered",
-            )
-        })?;
         let context_window_tokens = parse_context_window(config.context_window.as_deref())?;
-        let adapter = factory.build(ProviderRouteInput {
-            provider: config.provider.as_deref(),
-            base_url: &base_url,
-            api_key: &config.api_key,
-            thinking: config.thinking.as_deref(),
-            reasoning_effort: config.reasoning_effort.as_deref(),
-        })?;
+        let adapter = vendors::build_adapter(
+            config.provider,
+            config.api_type,
+            ProviderRouteInput {
+                base_url: &base_url,
+                api_key: &config.api_key,
+                thinking: config.thinking.as_deref(),
+                reasoning_effort: config.reasoning_effort.as_deref(),
+            },
+        )?;
         let runtime_info = margatroid_types::model_components::ModelRuntimeInfo {
             id: id.as_str().to_owned(),
             model: config.model.clone(),
-            api_type: config.api_type,
-            provider: config.provider,
+            api_type: config.api_type.as_str().to_owned(),
+            provider: Some(config.provider.as_str().to_owned()),
             context_window_tokens,
             thinking: config.thinking,
             reasoning_effort: config.reasoning_effort,
@@ -448,13 +440,18 @@ fn prepare_inference(
     );
     parameters.validate()?;
     let tools = collect_tool_definitions(world, request.agent, &request.tools)?;
-    let messages = normalize_messages(request.messages)?;
-    let encoded = route.adapter.build_request(ProviderInput::new(
-        route.model(),
-        &parameters,
-        &messages,
-        &tools,
-    ))?;
+    let _ = normalize_messages(request.messages.clone())?;
+    let encoded = route.adapter.build_request(DomainRequest {
+        messages: request.messages,
+        tools: tools.clone(),
+        config: DomainRequestConfig {
+            model: route.model().to_owned(),
+            temperature: parameters.temperature(),
+            max_output_tokens: parameters.max_output_tokens(),
+            top_p: parameters.top_p(),
+            stop: parameters.stop().to_vec(),
+        },
+    })?;
     let mut seen = HashSet::new();
     let senders = world
         .client_webui_senders()
@@ -920,6 +917,7 @@ async fn run_provider(
     }
     Ok(InferenceResponse {
         message: AgentMessage::Assistant {
+            replay: response.replay,
             reasoning: response.reasoning,
             content: response.content,
             tool_calls: response.tool_calls,
@@ -1130,7 +1128,7 @@ pub(crate) fn handle_model_routes_reloaded(world: &mut World, output: ReloadOutp
         .result
         .and_then(|source| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                compile_model_routes(&source, &config.factories)
+                compile_model_routes(&source)
             }))
             .unwrap_or_else(|_| {
                 Err(InferenceError::new(
@@ -1193,36 +1191,32 @@ mod tests {
         oneshot::Receiver<Result<InferenceResponse, InferenceError>>,
         AgentExecutionScope,
     ) {
-        let adapter = if deepseek {
-            DeepSeekAdapterFactory
-                .build(ProviderRouteInput {
-                    provider: None,
-                    base_url: url,
-                    api_key: "test",
-                    thinking: Some("disabled"),
-                    reasoning_effort: None,
-                })
-                .unwrap()
-        } else {
-            OpenAiAdapterFactory
-                .build(ProviderRouteInput {
-                    provider: None,
-                    base_url: url,
-                    api_key: "test",
-                    thinking: None,
-                    reasoning_effort: None,
-                })
-                .unwrap()
-        };
+        let adapter = vendors::build_adapter(
+            if deepseek {
+                Vendor::DeepSeek
+            } else {
+                Vendor::OpenAi
+            },
+            formats::ApiFormat::ChatCompletions,
+            ProviderRouteInput {
+                base_url: url,
+                api_key: "test",
+                thinking: deepseek.then_some("disabled"),
+                reasoning_effort: None,
+            },
+        )
+        .unwrap();
         let request = adapter
-            .build_request(ProviderInput::new(
-                "mock",
-                &InferenceParameters::default(),
-                &[ProviderMessage::User {
+            .build_request(DomainRequest {
+                messages: vec![AgentMessage::User {
                     content: "hi".into(),
                 }],
-                &[],
-            ))
+                tools: vec![],
+                config: DomainRequestConfig {
+                    model: "mock".into(),
+                    ..Default::default()
+                },
+            })
             .unwrap();
         let (tx, rx) = oneshot::channel();
         let reply = Arc::new(Mutex::new(Some(tx)));
@@ -1281,10 +1275,7 @@ mod tests {
 
     struct PanickingAdapter;
     impl ProviderAdapter for PanickingAdapter {
-        fn build_request(
-            &self,
-            _: ProviderInput<'_>,
-        ) -> Result<ProviderHttpRequest, InferenceError> {
+        fn build_request(&self, _: DomainRequest) -> Result<ProviderHttpRequest, InferenceError> {
             panic!("encode panic")
         }
         fn begin_response(
@@ -1635,22 +1626,33 @@ mod tests {
             matches!(&normalized[0], ProviderMessage::System { content } if content == "system prompt")
         );
         let url = Url::parse("http://127.0.0.1:1/v1").unwrap();
-        let adapter = OpenAiAdapterFactory
-            .build(ProviderRouteInput {
-                provider: None,
+        let adapter = vendors::build_adapter(
+            Vendor::OpenAi,
+            formats::ApiFormat::ChatCompletions,
+            ProviderRouteInput {
                 base_url: &url,
                 api_key: "mock",
                 thinking: None,
                 reasoning_effort: None,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let request = adapter
-            .build_request(ProviderInput::new(
-                "mock",
-                &InferenceParameters::default(),
-                &normalized,
-                &[],
-            ))
+            .build_request(DomainRequest {
+                messages: vec![
+                    AgentMessage::System {
+                        content: "system prompt".into(),
+                    },
+                    AgentMessage::User {
+                        content: "user prompt".into(),
+                    },
+                ],
+                tools: vec![],
+                config: DomainRequestConfig {
+                    model: "mock".into(),
+                    ..Default::default()
+                },
+            })
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["messages"][0]["role"], "system");
