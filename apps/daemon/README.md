@@ -25,6 +25,8 @@ daemon不接受启动参数，固定使用 `~/.margatroid` 主目录。监听地
 ```
 
 `models.toml` 必须存在且符合 InferencePlugin 的模型路由格式；daemon 启动时会加载并校验它。
+
+已批准、待实现的推理分层会将该文件中的 `provider` 从可选提示元数据改为必需执行选择，`api_type` 收敛为 `chat_completions`、`messages`、`responses`。厂商与格式是两个独立维度，未知值或不支持组合在加载/重载时失败，不根据URL猜测；失败重载保留原完整路由。模型逻辑ID、上游model、provider与api_type各司其职，不把模型品牌当作代理供应商。`config.toml`不新增重复模型路由；主目录实际配置在实现迁移时再改。Responses首版仍使用本地完整上下文，不启用远端conversation或previous_response_id。
 `config.toml` 保存全局 WebSocket 出站目标，暂定格式：
 
 ```toml
