@@ -1,7 +1,7 @@
 use core_plugin::{App, Entity};
 use margatroid_types::agent_components::{Agent, AgentInfo, AgentState};
 use margatroid_types::block_storage::AgentDatabaseHandle;
-use margatroid_types::resource_components::AgentImageModelConfig;
+use margatroid_types::resource_components::AgentDriverModelConfig;
 use memory_plugin::SqliteAgentDatabase;
 use resource_id_plugin::{ResourceID, WorldResourceExt};
 use std::sync::Arc;
@@ -28,7 +28,7 @@ pub fn agent(app: &mut App, dependencies: &[&str]) -> (Entity, ResourceID) {
     let agent = Agent {
         resourceid: id.clone(),
         info: AgentInfo {
-            model: AgentImageModelConfig {
+            model: AgentDriverModelConfig {
                 model: "test".into(),
                 temperature: None,
                 max_output_tokens: None,
@@ -37,8 +37,8 @@ pub fn agent(app: &mut App, dependencies: &[&str]) -> (Entity, ResourceID) {
             },
             project_root: "/tmp/project".into(),
             home_root: "/tmp/home".into(),
-            image: ResourceID::parse("image:local/test").unwrap(),
-            image_dependencies: Arc::from(
+            driver: ResourceID::parse("driver:local/test").unwrap(),
+            driver_dependencies: Arc::from(
                 dependencies
                     .iter()
                     .map(|id| ResourceID::parse(id).unwrap())

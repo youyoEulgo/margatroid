@@ -1,0 +1,27 @@
+{
+  "filesystem": {
+    "allowRead": [
+      "/"
+    ],
+    "denyRead": [
+      "/proc",
+      "~/.ssh",
+      "~/.gnupg",
+      "~/.aws",
+      "~/.netrc",
+      "~/.docker",
+      "~/.kube",
+      "~/.config/gh"
+    ],
+    "allowWrite": [
+      ".",
+      "/dev/null",
+      "/dev/ptmx",
+      "/dev/pts"
+    ]
+  },
+  "network": {
+    "allowNetwork": false,
+    "allowLocalBinding": false
+  }
+}

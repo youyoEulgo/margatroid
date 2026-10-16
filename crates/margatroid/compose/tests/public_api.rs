@@ -9,7 +9,7 @@ name: demo
 manager: manager
 agents:
   manager:
-    image: local/coder:latest
+    driver: local/coder:latest
 "#;
 
     let definition = compile_str(source, Path::new("/tmp/demo/margatroid-workspace.yaml")).unwrap();

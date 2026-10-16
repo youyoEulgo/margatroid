@@ -1,8 +1,8 @@
 use crate::handler;
 use crate::{StartWorkspace, StopWorkspace, WorkspaceException, WorkspaceExecutionCloseOutput};
 use core_plugin::World;
+use margatroid_types::agent_driver_events::LoadAgentDriverResult;
 use margatroid_types::agent_events::{AgentExceptionResult, StartAgentResult, StopAgentResult};
-use margatroid_types::agent_image_events::LoadAgentImageResult;
 
 pub(crate) fn start_workspace_system(world: &mut World) {
     let events: Vec<_> = world
@@ -14,12 +14,12 @@ pub(crate) fn start_workspace_system(world: &mut World) {
         handler::handle_start_workspace(world, event);
     }
     let events: Vec<_> = world
-        .event_reader::<LoadAgentImageResult>()
+        .event_reader::<LoadAgentDriverResult>()
         .into_iter()
         .cloned()
         .collect();
     for event in events {
-        handler::handle_agent_image_result(world, event);
+        handler::handle_agent_driver_result(world, event);
     }
     let events: Vec<_> = world
         .event_reader::<StartAgentResult>()

@@ -13,16 +13,16 @@ use margatroid_types::ResourceId;
 let tool = ResourceId::parse("tool:local/code-review")?;
 assert_eq!(tool.to_string(), "tool:local/code-review:latest");
 
-let image = ResourceId::parse("image:local/coder:latest")?;
-assert_eq!(image.resource_type(), "image");
+let driver = ResourceId::parse("driver:local/coder:latest")?;
+assert_eq!(driver.resource_type(), "driver");
 ```
 
-资源ID固定使用 `type:scope/name:tag`。省略tag时规范化为 `latest`。Agent、Workspace、AgentImage、
+资源ID固定使用 `type:scope/name:tag`。省略tag时规范化为 `latest`。Agent、Workspace、AgentDriver、
 Prompt、Sandbox和Tool都使用同一种身份格式。`ResourceId`是跨Plugin查找资源的统一地址；
 `core_plugin::Entity`只作为当前World内的运行时句柄，不进入协议、日志或Memory。
 
 Compose使用 `WorkspaceDefinition` 和 `WorkspaceAgentDefinition` 把配置文件编译成进程内静态业务
-输入。它们不包含运行时Entity，也不负责加载镜像、打开Memory或创建AgentInstance。
+输入。它们不包含运行时Entity，也不负责加载驱动、打开Memory或创建AgentInstance。
 
 ## 共享消息与执行边界
 

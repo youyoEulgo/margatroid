@@ -5,11 +5,11 @@ use crate::*;
 use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::WorldAsyncExt;
 use core_plugin::{Entity, World};
+use margatroid_types::agent_driver_events::{LoadAgentDriver, LoadAgentDriverResult};
 use margatroid_types::agent_events::{
     AgentStartDefinition, StartAgent, StartAgentResult, StopAgent, StopAgentResult,
 };
-use margatroid_types::agent_image_events::{LoadAgentImage, LoadAgentImageResult};
-use margatroid_types::resource_components::AgentImage;
+use margatroid_types::resource_components::AgentDriver;
 use margatroid_types::workspace_execution::spawn_workspace_execution;
 use resource_id_plugin::{LibraryComponent, ResourceSet, WorldResourceExt};
 
@@ -58,7 +58,7 @@ fn validate_definition(request: &StartWorkspace) -> Result<(), WorkspaceError> {
     let mut names = BTreeSet::new();
     for agent in &definition.agents {
         if agent.id.resource_type() != "agent"
-            || agent.image.resource_type() != "image"
+            || agent.driver.resource_type() != "driver"
             || agent.name.is_empty()
             || !ids.insert(&agent.id)
             || !names.insert(&agent.name)
@@ -111,23 +111,23 @@ fn start(world: &mut World, request: &StartWorkspace) -> Result<(), WorkspaceErr
         .map_err(|value| error(WorkspaceErrorKind::ExecutionStartFailed, value.to_string()))?;
     let mut state = WorkspaceStartState {
         request_id: request.id.clone(),
-        pending_images: BTreeMap::new(),
-        image_members: BTreeMap::new(),
+        pending_drivers: BTreeMap::new(),
+        driver_members: BTreeMap::new(),
         pending_agents: BTreeMap::new(),
         error: None,
     };
     for member in &request.definition.agents {
         state
-            .image_members
-            .entry(member.image.clone())
+            .driver_members
+            .entry(member.driver.clone())
             .or_default()
             .push(member.id.clone());
     }
     let mut loads = Vec::new();
-    for image in state.image_members.keys() {
+    for driver in state.driver_members.keys() {
         let id = request_id();
-        state.pending_images.insert(id.clone(), image.clone());
-        loads.push((id, image.clone()));
+        state.pending_drivers.insert(id.clone(), driver.clone());
+        loads.push((id, driver.clone()));
     }
     let entity = world.spawn();
     let component = Workspace::new(
@@ -147,7 +147,7 @@ fn start(world: &mut World, request: &StartWorkspace) -> Result<(), WorkspaceErr
         ));
     }
     for (id, resource_id) in loads {
-        world.send_event(LoadAgentImage {
+        world.send_event(LoadAgentDriver {
             id,
             target: entity,
             resource_id,
@@ -157,8 +157,8 @@ fn start(world: &mut World, request: &StartWorkspace) -> Result<(), WorkspaceErr
     Ok(())
 }
 
-pub(crate) fn handle_agent_image_result(world: &mut World, event: LoadAgentImageResult) {
-    let matching = world.query_with::<Workspace>().result().into_iter().find(|entity| world.get_component::<Workspace>(*entity).is_some_and(|workspace| matches!(workspace.state(), WorkspaceState::Starting(state) if state.pending_images.get(&event.id) == Some(&event.resource_id))));
+pub(crate) fn handle_agent_driver_result(world: &mut World, event: LoadAgentDriverResult) {
+    let matching = world.query_with::<Workspace>().result().into_iter().find(|entity| world.get_component::<Workspace>(*entity).is_some_and(|workspace| matches!(workspace.state(), WorkspaceState::Starting(state) if state.pending_drivers.get(&event.id) == Some(&event.resource_id))));
     let Some(entity) = matching else {
         return;
     };
@@ -166,16 +166,16 @@ pub(crate) fn handle_agent_image_result(world: &mut World, event: LoadAgentImage
         return;
     }
     let loaded = world
-        .get_component::<ResourceSet<AgentImage>>(entity)
-        .is_some_and(|images| images.get(&event.resource_id).is_some());
+        .get_component::<ResourceSet<AgentDriver>>(entity)
+        .is_some_and(|drivers| drivers.get(&event.resource_id).is_some());
     let failure = match &event.result {
         Err(value) => Some(error(
-            WorkspaceErrorKind::AgentImageLoadFailed,
+            WorkspaceErrorKind::AgentDriverLoadFailed,
             value.to_string(),
         )),
         Ok(()) if !loaded => Some(error(
             WorkspaceErrorKind::ResourceResolutionFailed,
-            "image success has no entry on target workspace",
+            "driver success has no entry on target workspace",
         )),
         Ok(()) => None,
     };
@@ -183,12 +183,12 @@ pub(crate) fn handle_agent_image_result(world: &mut World, event: LoadAgentImage
     let workspace = world.get_component_mut::<Workspace>(entity).unwrap();
     let definition = workspace.definition().clone();
     if let WorkspaceState::Starting(state) = workspace.state_mut() {
-        state.pending_images.remove(&event.id);
+        state.pending_drivers.remove(&event.id);
         if let Some(value) = failure {
             record(&mut state.error, value);
         } else {
             let members = state
-                .image_members
+                .driver_members
                 .get(&event.resource_id)
                 .cloned()
                 .unwrap_or_default();
@@ -204,7 +204,7 @@ pub(crate) fn handle_agent_image_result(world: &mut World, event: LoadAgentImage
                         id,
                         resource_id,
                         workspace: entity,
-                        image: event.resource_id.clone(),
+                        driver: event.resource_id.clone(),
                         definition: AgentStartDefinition {
                             project_root: definition.project_root.clone(),
                             home_root: member.home_root.clone(),
@@ -288,7 +288,7 @@ fn finish_workspace_start(world: &mut World, entity: Entity) {
     let WorkspaceState::Starting(state) = workspace.state() else {
         return;
     };
-    if !state.pending_images.is_empty() || !state.pending_agents.is_empty() {
+    if !state.pending_drivers.is_empty() || !state.pending_agents.is_empty() {
         return;
     }
     let id = state.request_id.clone();

@@ -25,7 +25,7 @@ impl ResourceInner for Tool {
         self.0
     }
 }
-struct Image;
+struct Driver;
 
 fn id(value: &str) -> ResourceID {
     ResourceID::parse(value).unwrap()
@@ -66,7 +66,7 @@ fn registration_is_bijective_idempotent_and_requires_installation() {
         Err(ResourceError::TypeRegistrationConflict { .. })
     ));
     assert!(matches!(
-        world.register_resources::<ResourceSet<Image>>("Image"),
+        world.register_resources::<ResourceSet<Driver>>("Driver"),
         Err(ResourceError::InvalidResourceType { .. })
     ));
     assert!(matches!(
@@ -74,9 +74,9 @@ fn registration_is_bijective_idempotent_and_requires_installation() {
         Err(ResourceError::TypeNotRegistered { .. })
     ));
     world
-        .register_resources::<ResourceSet<Image>>("image")
+        .register_resources::<ResourceSet<Driver>>("driver")
         .unwrap();
-    assert_eq!(id("image:local/a").find_entities(&world).unwrap(), vec![]);
+    assert_eq!(id("driver:local/a").find_entities(&world).unwrap(), vec![]);
 }
 
 #[test]
@@ -117,13 +117,13 @@ fn library_insertion_is_checked_atomic_and_queries_actual_world() {
 }
 
 #[test]
-fn sets_are_ordered_replace_locally_and_allow_alias_free_images() {
+fn sets_are_ordered_replace_locally_and_allow_alias_free_drivers() {
     let mut world = world();
     world
         .register_resources::<ResourceSet<Tool>>("tool")
         .unwrap();
     world
-        .register_resources::<ResourceSet<Image>>("image")
+        .register_resources::<ResourceSet<Driver>>("driver")
         .unwrap();
     let a = world.spawn();
     let b = world.spawn();
@@ -156,12 +156,12 @@ fn sets_are_ordered_replace_locally_and_allow_alias_free_images() {
         world.get_component::<ResourceSet<Tool>>(a).unwrap().len(),
         2
     );
-    let image_id = id("image:local/a");
-    let mut images = ResourceSet::new();
-    images.insert(image_id.clone(), Image);
-    assert!(images.get(&image_id).is_some());
-    world.insert_resources(a, images).unwrap();
-    assert_eq!(image_id.find_entities(&world).unwrap(), vec![a]);
+    let driver_id = id("driver:local/a");
+    let mut drivers = ResourceSet::new();
+    drivers.insert(driver_id.clone(), Driver);
+    assert!(drivers.get(&driver_id).is_some());
+    world.insert_resources(a, drivers).unwrap();
+    assert_eq!(driver_id.find_entities(&world).unwrap(), vec![a]);
     world
         .insert_resources(a, ResourceSet::<Tool>::default())
         .unwrap();
@@ -188,7 +188,7 @@ fn custom_collections_are_validated_and_unregistered_components_rejected() {
     let mut world = world();
     let entity = world.spawn();
     assert!(matches!(
-        world.insert_resources(entity, ResourceSet::<Image>::new()),
+        world.insert_resources(entity, ResourceSet::<Driver>::new()),
         Err(ResourceError::ComponentNotRegistered { .. })
     ));
     world.register_resources::<DuplicateSet>("tool").unwrap();

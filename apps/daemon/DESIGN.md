@@ -16,7 +16,7 @@ run() -> Result<(), Error>
         使用server.bind构造ServerPlugin，并把server.allow解析出的入口策略作为握手判定接缝注入
         使用log.level和可选的log.filter构造LogPlugin；filter存在时优先于level
         将全局只读WebSocket目标配置交给DtoPlugin和InferencePlugin
-        打开AgentImage、Workspace、ToolPlugin和LuaRuntimePlugin所需目录
+        打开AgentDriver、Workspace、ToolPlugin和LuaRuntimePlugin所需目录
         安装运行时、日志、Server和全部领域Plugin
         安装DtoPlugin和ClientPlugin
         记录启动信息并调用AppRunExt::run

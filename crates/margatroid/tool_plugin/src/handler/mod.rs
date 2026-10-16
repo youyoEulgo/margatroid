@@ -102,7 +102,7 @@ fn validate_owner(
     let owner = world
         .get_component::<Agent>(entity)
         .ok_or_else(|| ToolError::new(ToolErrorKind::ResourceMissing, "resource owner missing"))?;
-    if !owner.info.image_dependencies.contains(id)
+    if !owner.info.driver_dependencies.contains(id)
         || !owner
             .import_bindings
             .contains_resource(id, margatroid_types::block_types::InnerType::Tool)

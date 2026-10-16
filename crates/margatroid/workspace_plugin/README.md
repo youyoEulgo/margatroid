@@ -8,10 +8,10 @@ MCL 命令转发和停止收敛。每个 Workspace 与 Agent 都获得全局唯�
 
 ```text
 StartWorkspace             创建 Workspace Entity，登记 ResourceId 与 Workspace 组件
-                           为每个成员的 AgentImage 发送 LoadAgentImage
-LoadAgentImageResult       经 collect_agent_image_system 读取镜像、打开 Memory
+                           为每个成员的 AgentDriver 发送 LoadAgentDriver
+LoadAgentDriverResult       经 collect_agent_driver_system 读取驱动、打开 Memory
                            构造 AgentCreateRequest 并登记 pending_agents
-AgentCreateRequest 回执    经 collect_agent_image_system 消费，成功成员写入 Workspace.agents
+AgentCreateRequest 回执    经 collect_agent_driver_system 消费，成功成员写入 Workspace.agents
 AgentInitializationCompleted
                            经 collect_agent_initialization_system 标记 Ready
 ```

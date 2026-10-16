@@ -37,7 +37,7 @@
 
 `workspace` 为 `{ id, name, project_root }`，三者必须与当前 Workspace 一致。`agent: null` 选择成员定义中的 manager；其他值必须是该 Workspace 当前成员的规范化资源地址。入站不接受 Entity index；出站 `agent_instance` 是包含 generation 的不透明实例标识，不授予寻址能力。
 
-Workspace definition 字段为 `id, name, project_root, manager, agents`。成员字段为 `id, name, image, home_root, history_path`，不含旧资源可见性、Workflow 或 memory 配置。
+Workspace definition 字段为 `id, name, project_root, manager, agents`。成员字段为 `id, name, driver, home_root, history_path`，不含旧资源可见性、Workflow 或 memory 配置。
 
 ## MCL
 

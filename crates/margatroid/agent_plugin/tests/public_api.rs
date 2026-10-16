@@ -54,7 +54,7 @@ fn fixture() -> Fixture {
     ));
     world.register_library::<Workspace>("workspace").unwrap();
     world
-        .register_resources::<ResourceSet<AgentImage>>("image")
+        .register_resources::<ResourceSet<AgentDriver>>("driver")
         .unwrap();
     world
         .register_resources::<ResourceSet<ToolResource>>("tool")
@@ -71,7 +71,7 @@ fn fixture() -> Fixture {
         id: "original".into(),
         resource_id: id("agent", "one"),
         workspace,
-        image: id("image", "base"),
+        driver: id("driver", "base"),
         definition: AgentStartDefinition {
             project_root: temp.path().into(),
             home_root: temp.path().join("home"),
@@ -93,8 +93,8 @@ fn fixture() -> Fixture {
                 definition,
                 WorkspaceState::Starting(WorkspaceStartState {
                     request_id: "workspace-start".into(),
-                    pending_images: BTreeMap::new(),
-                    image_members: BTreeMap::new(),
+                    pending_drivers: BTreeMap::new(),
+                    driver_members: BTreeMap::new(),
                     pending_agents: BTreeMap::from([(
                         request.id.clone(),
                         request.resource_id.clone(),
@@ -106,14 +106,14 @@ fn fixture() -> Fixture {
             ),
         )
         .unwrap();
-    let mut images = ResourceSet::new();
-    images.insert(
-        request.image.clone(),
-        AgentImage {
+    let mut drivers = ResourceSet::new();
+    drivers.insert(
+        request.driver.clone(),
+        AgentDriver {
             base_driver: Arc::from("ready()"),
             origin: Arc::new(temp.path().join("driver.lua")),
             dependencies: Arc::from([id("tool", "not-preloaded")]),
-            model: AgentImageModelConfig {
+            model: AgentDriverModelConfig {
                 model: "model-one".into(),
                 temperature: Some(0.2),
                 max_output_tokens: None,
@@ -122,7 +122,7 @@ fn fixture() -> Fixture {
             },
         },
     );
-    world.insert_resources(workspace, images).unwrap();
+    world.insert_resources(workspace, drivers).unwrap();
     app.add_plugin(AgentPlugin::default());
     Fixture {
         app,
@@ -201,6 +201,18 @@ async fn model_environment_is_complete_private_and_an_admission_snapshot() {
     let LuaBindingValue::Value(LuaValue::Object(info)) = binding else {
         panic!("agent_info object missing")
     };
+    assert_eq!(
+        info["driver"],
+        LuaValue::String(f.request.driver.to_string())
+    );
+    assert_eq!(
+        info["driver_dependencies"],
+        LuaValue::Array(vec![LuaValue::String(
+            id("tool", "not-preloaded").to_string()
+        )])
+    );
+    assert!(!info.contains_key("image"));
+    assert!(!info.contains_key("image_dependencies"));
     let LuaValue::Object(model) = &info["model"] else {
         panic!("model object missing")
     };
@@ -287,7 +299,7 @@ async fn start_waits_for_ready_and_keeps_resources_empty() {
     let agent = world.get_component::<Agent>(entity).unwrap();
     assert!(matches!(agent.state, AgentState::Creating { .. }));
     assert_eq!(agent.info.model.model, "model-one");
-    assert_eq!(agent.info.image_dependencies.len(), 1);
+    assert_eq!(agent.info.driver_dependencies.len(), 1);
     assert!(agent.history.list().unwrap().is_empty());
     assert!(world
         .get_component::<ResourceSet<ToolResource>>(entity)
@@ -695,18 +707,18 @@ async fn driver_exception_preserves_failure_and_pending_stop_completion() {
 }
 
 #[tokio::test]
-async fn image_lookup_never_uses_another_entity() {
+async fn driver_lookup_never_uses_another_entity() {
     let mut f = fixture();
     f.app
         .world_mut()
-        .get_component_mut::<ResourceSet<AgentImage>>(f.request.workspace)
+        .get_component_mut::<ResourceSet<AgentDriver>>(f.request.workspace)
         .unwrap()
-        .remove(&f.request.image);
+        .remove(&f.request.driver);
     handle_start_agent(f.app.world_mut(), f.request.clone());
     let replies = events::<StartAgentResult>(f.app.world_mut());
     assert_eq!(
         replies[0].result.as_ref().unwrap_err().kind,
-        AgentErrorKind::ImageNotLoaded
+        AgentErrorKind::DriverNotLoaded
     );
     assert!(f.app.world().query_with::<Agent>().result().is_empty());
     f.close.close().await.unwrap();
@@ -954,14 +966,14 @@ async fn preparing_duplicate_is_guarded_and_workspace_close_never_spawns_agent()
 }
 
 #[tokio::test]
-async fn database_preparation_retains_image_snapshot_and_rejects_stale_association() {
+async fn database_preparation_retains_driver_snapshot_and_rejects_stale_association() {
     let mut f = fixture();
     handle_start_agent(f.app.world_mut(), f.request.clone());
     f.app
         .world_mut()
-        .get_component_mut::<ResourceSet<AgentImage>>(f.request.workspace)
+        .get_component_mut::<ResourceSet<AgentDriver>>(f.request.workspace)
         .unwrap()
-        .remove(&f.request.image);
+        .remove(&f.request.driver);
     let output = database_result(&mut f).await;
     let mut stale = output.clone().unwrap();
     stale.operation_id = "stale-database".into();
@@ -978,7 +990,7 @@ async fn database_preparation_retains_image_snapshot_and_rejects_stale_associati
         .get_component::<Agent>(requests[0].owner)
         .unwrap();
     assert_eq!(agent.info.model.model, "model-one");
-    assert_eq!(agent.info.image_dependencies.len(), 1);
+    assert_eq!(agent.info.driver_dependencies.len(), 1);
     assert!(agent.database.history().list().unwrap().is_empty());
     f.close.close().await.unwrap();
 }

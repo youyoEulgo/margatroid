@@ -168,7 +168,7 @@ begin_import(world: &mut World, request: &MclCommand, kind: InnerType, resource_
     发起明确类型导入：私有函数
     行为：
         TOOL仅允许tool，MESSAGE仅允许prompt，SANDBOX仅允许sandbox，不匹配立即拒绝
-        resource_id须精确属于目标Agent.info.image_dependencies，无builtin隐含例外
+        resource_id须精确属于目标Agent.info.driver_dependencies，无builtin隐含例外
         alias在一个Agent内跨所有类别唯一，已有绑定只能由同一ResourceID及同一声明类型重载；其他资源或类型占用则AliasConflict
         准备对应资源加载请求并移交Other活动，Sender槽和取消能力随请求，MCL等待唯一Receiver
         请求携带import_kind: Some(kind)，加载方主线程收口核对完整Entity、取消能力及导入许可，构造ImportedValue快照并原子挂载与发布绑定；MCL仅等待oneshot，不在后续帧二次绑定

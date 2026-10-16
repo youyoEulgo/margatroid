@@ -1,0 +1,3 @@
+schema_version = 1
+name = "code-review"
+description = "Optional code-review guidance for identifying correctness defects, regressions, and missing tests. Load for an explicit review or defect-analysis task, not for ordinary implementation or general conversation."

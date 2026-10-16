@@ -14,7 +14,7 @@ use std::sync::Arc;
 pub struct WorkspaceAgentDefinition {
     pub id: ResourceID,
     pub name: String,
-    pub image: ResourceID,
+    pub driver: ResourceID,
     pub home_root: PathBuf,
     pub history_path: PathBuf,
 }
@@ -34,7 +34,7 @@ pub enum WorkspaceErrorKind {
     WorkspaceNotAlive,
     WorkspaceBusy,
     ResourceResolutionFailed,
-    AgentImageLoadFailed,
+    AgentDriverLoadFailed,
     AgentStartFailed,
     AgentStopFailed,
     WorkspaceNotRunning,
@@ -70,8 +70,8 @@ impl std::error::Error for WorkspaceError {}
 #[derive(Clone, Debug)]
 pub struct WorkspaceStartState {
     pub request_id: String,
-    pub pending_images: BTreeMap<String, ResourceID>,
-    pub image_members: BTreeMap<ResourceID, Vec<ResourceID>>,
+    pub pending_drivers: BTreeMap<String, ResourceID>,
+    pub driver_members: BTreeMap<ResourceID, Vec<ResourceID>>,
     pub pending_agents: BTreeMap<String, ResourceID>,
     pub error: Option<WorkspaceError>,
 }
@@ -313,7 +313,7 @@ impl WorldWorkspaceExt for World {
                             || match component.state() {
                                 WorkspaceState::Starting(state) => {
                                     state.pending_agents.contains_key(&request.id)
-                                        || state.pending_images.contains_key(&request.id)
+                                        || state.pending_drivers.contains_key(&request.id)
                                 }
                                 WorkspaceState::Stopping(state) => {
                                     state.pending_creations.contains_key(&request.id)
@@ -340,7 +340,7 @@ impl WorldWorkspaceExt for World {
         if request.workspace != workspace
             || request.id.is_empty()
             || request.resource_id.resource_type() != "agent"
-            || request.image.resource_type() != "image"
+            || request.driver.resource_type() != "driver"
         {
             return Err(WorkspaceError::new(
                 WorkspaceErrorKind::InvalidRequest,

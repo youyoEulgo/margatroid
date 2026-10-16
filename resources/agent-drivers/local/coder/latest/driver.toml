@@ -1,0 +1,41 @@
+schema_version = 1
+
+[inference]
+model = "openrouter/deepseek-v4.1-flash"
+temperature = 0.2
+
+[[dependencies]]
+id = "prompt:local/coder-soul:latest"
+
+[[dependencies]]
+id = "prompt:local/compact:latest"
+
+[[dependencies]]
+id = "tool:local/list-directory:latest"
+
+[[dependencies]]
+id = "tool:local/read-file:latest"
+
+[[dependencies]]
+id = "tool:local/write-file:latest"
+
+[[dependencies]]
+id = "tool:local/edit:latest"
+
+[[dependencies]]
+id = "tool:local/grep:latest"
+
+[[dependencies]]
+id = "tool:local/glob:latest"
+
+[[dependencies]]
+id = "tool:local/bash:latest"
+
+[[dependencies]]
+id = "tool:local/code-review:latest"
+
+[[dependencies]]
+id = "sandbox:local/workspace-write:latest"
+
+[[dependencies]]
+id = "sandbox:local/read-only:latest"

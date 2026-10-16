@@ -1,6 +1,6 @@
 pub mod agent_components;
+pub mod agent_driver_events;
 pub mod agent_events;
-pub mod agent_image_events;
 pub mod block_storage;
 pub mod block_types;
 pub mod client_components;

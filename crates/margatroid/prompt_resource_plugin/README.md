@@ -13,9 +13,9 @@ app.add_plugin(RuntimePlugin::default())
     .add_plugin(PromptResourcePlugin::open(global_root)?);
 ```
 
-`open(global_root)` 接受固定全局根目录，资源位于 `global_root/prompts/scope/name/tag`，默认计划是 PRE_UPDATE。可用 `with_schedule` 与 `with_limits` 配置；自定义计划必须已安装 ClosureSystem。本插件不创建资源包、不提供项目或镜像内回退。
+`open(global_root)` 接受固定全局根目录，资源位于 `global_root/prompts/scope/name/tag`，默认计划是 PRE_UPDATE。可用 `with_schedule` 与 `with_limits` 配置；自定义计划必须已安装 ClosureSystem。本插件不创建资源包、不提供项目或Driver包内回退。
 
-**Image 根是另一种约定：** AgentImageLoaderPlugin 接受独立 agentimages 根，直接拼 `scope/name/tag`；不要将已经包含 `prompts` 的目录传给本插件，也不要把 Image 根解释为五类资源全局根。
+**Driver 根是另一种约定：** AgentDriverLoaderPlugin 接受独立 agent-drivers 根，直接拼 `scope/name/tag`；不要将已经包含 `prompts` 的目录传给本插件，也不要把 Driver 根解释为资源全局根。
 
 ## 共享 API
 
@@ -27,7 +27,7 @@ app.add_plugin(RuntimePlugin::default())
 
 ## 明确类型导入与普通加载
 
-`import_kind: None` 是普通加载，允许Agent或非Agent目标，只挂载集合、不发布binding；MCL IMPORT传 `Some(InnerType::Message)`。加载插件在提交和挂载前使用共享 `validate_resource_import` 校验声明与地址、完整Agent实例、精确image_dependencies许可及跨类别alias冲突。已有alias只能同ID同kind重载；同ID改名先查冲突，成功时移除旧名。
+`import_kind: None` 是普通加载，允许Agent或非Agent目标，只挂载集合、不发布binding；MCL IMPORT传 `Some(InnerType::Message)`。加载插件在提交和挂载前使用共享 `validate_resource_import` 校验声明与地址、完整Agent实例、精确driver_dependencies许可及跨类别alias冲突。已有alias只能同ID同kind重载；同ID改名先查冲突，成功时移除旧名。
 
 按PromptResource.role构造ImportedValue::Message的Arc<[AgentMessage]>；system对应System、user对应User、assistant对应无tool_calls的Assistant，正文来自已读取content，不能将System降级为User。
 

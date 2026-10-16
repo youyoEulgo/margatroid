@@ -23,7 +23,7 @@ ToolExecuteRequest {
 }
 ```
 
-`resource` 是唯一资源快照字段，没有重复 resource_id。准备阶段消费选定 Tool metadata 的 schema、脚本路径，不按 ID 重取 latest，也不再次 global alias query。`call.tool_name` 必须等于选定 alias。归属校验要求目标 ResourceSet 存在该 ID、Agent.image_dependencies 许可及 ImportBindings 已导入该 ID/TOOL kind；不要求旧 snapshot 与 reload 后的新 alias/定义一致。
+`resource` 是唯一资源快照字段，没有重复 resource_id。准备阶段消费选定 Tool metadata 的 schema、脚本路径，不按 ID 重取 latest，也不再次 global alias query。`call.tool_name` 必须等于选定 alias。归属校验要求目标 ResourceSet 存在该 ID、Agent.driver_dependencies 许可及 ImportBindings 已导入该 ID/TOOL kind；不要求旧 snapshot 与 reload 后的新 alias/定义一致。
 
 Tool 按选定 schema 校验 JSON 参数，统一通过独立 Lua runner 执行。CallableDefinitionSnapshot 只包含 Tool；其他资源类型不能作为可执行 TOOL。
 

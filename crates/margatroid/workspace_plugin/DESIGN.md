@@ -55,7 +55,7 @@ Workspace组件、状态与WorldWorkspaceExt已位于共享types的`workspace_co
 
 公开：
 ```text
-Workspace：工作区图书馆组件，公开Component--保存工作区自身身份，与镜像资源集合共同挂载到Workspace Entity
+Workspace：工作区图书馆组件，公开Component--保存工作区自身身份，与驱动资源集合共同挂载到Workspace Entity
     resourceid: ResourceID--工作区自身地址，由LibraryComponent提供查询
     definition: Arc<WorkspaceDefinition>--静态工作区定义
     project_root: Arc<PathBuf>--项目根目录
@@ -92,10 +92,10 @@ WorkspacePlugin：工作区生命周期插件，公开结构体
             行为：
                 要求运行计划和公共事件、统一ResourcePlugin可用
                 通过register_library::<Workspace>注册workspace地址类型
-                image地址类型由镜像领域注册为ResourceSet<AgentImage>，不在此重复注册
+                driver地址类型由驱动领域注册为ResourceSet<AgentDriver>，不在此重复注册
                 挂载start_workspace_system、stop_workspace_system和workspace_exception_system
                 不插入WorkspaceRegistry
-                不通过Agent、AgentImage、Memory、Tool、MCL或LuaRuntime的插件安装标记建立业务插件依赖
+                不通过Agent、AgentDriver、Memory、Tool、MCL或LuaRuntime的插件安装标记建立业务插件依赖
 ```
 
 ## 扩展 trait
@@ -132,9 +132,9 @@ WorldWorkspaceExt：工作区世界扩展，公开trait--声明与World实现均
     definition.id用于创建时初始化resourceid，挂载后自身身份以LibraryComponent::resource_id为准，不允许二者被独立修改
     agents使用ResourceID作键，不再维护按成员名称查询的索引或扩展方法
     成员名称可用于配置和展示，不作为运行时成员寻址键
-    镜像条目保存在同一Entity上的ResourceSet<AgentImage>中，Workspace内部不再保存agent_images
-    ResourceSet的键保存镜像ResourceID，条目是AgentImage内容，不是另一个镜像Entity
-    Workspace和ResourceSet<AgentImage>分别实现LibraryComponent与ResourcesComponent，允许共同挂载
+    驱动条目保存在同一Entity上的ResourceSet<AgentDriver>中，Workspace内部不再保存agent_drivers
+    ResourceSet的键保存驱动ResourceID，条目是AgentDriver内容，不是另一个驱动Entity
+    Workspace和ResourceSet<AgentDriver>分别实现LibraryComponent与ResourcesComponent，允许共同挂载
     state是整个工作区的一个状态，不按成员名称查询，也不需要Option返回值
     没有manager，没有成员运行状态表
     execution_entry和execution_close属于这个工作区实例，一条线程可运行多个Agent VM
@@ -150,7 +150,7 @@ WorldWorkspaceExt：工作区世界扩展，公开trait--声明与World实现均
     Workspace协调成员生命周期，不打开Memory、不组装Lua VM、不执行工具或推理
     Workspace不转发AgentControl、轮次中止或MCL业务命令
     成员运行状态由Agent负责，Workspace只接收本次启动和停止操作的结果
-    镜像路径解析、加载、更新由AgentImage插件负责，WorkspacePlugin不再接收agent_images_root或提供open(root)
+    驱动路径解析、加载、更新由AgentDriver插件负责，WorkspacePlugin不再接收agent_drivers_root或提供open(root)
 ```
 
 # system
@@ -161,11 +161,11 @@ crate公开：
 ```text
 start_workspace_system(world: &mut World)
     启动System：crate公开System
-    处理事件：StartWorkspace、LoadAgentImageResult、StartAgentResult
-    产出事件：LoadAgentImage、StartAgent、StartWorkspaceResult
+    处理事件：StartWorkspace、LoadAgentDriverResult、StartAgentResult
+    产出事件：LoadAgentDriver、StartAgent、StartWorkspaceResult
     行为：
         克隆本帧全部StartWorkspace，逐个调用handle_start_workspace
-        克隆本帧全部LoadAgentImageResult，逐个调用handle_agent_image_result
+        克隆本帧全部LoadAgentDriverResult，逐个调用handle_agent_driver_result
         克隆本帧全部StartAgentResult，逐个调用handle_start_agent_result
 
 stop_workspace_system(world: &mut World)
@@ -199,7 +199,7 @@ workspace_exception_system(world: &mut World)
 移除的System：
     begin_workspace_command_system
     reload_workspace_system
-    collect_agent_image_system
+    collect_agent_driver_system
     collect_agent_initialization_system及其曾计划的新名agent_status_system
     collect_workspace_stop_system
     route_agent_turn_abort_system
@@ -219,28 +219,28 @@ handle_start_workspace(world: &mut World, request: StartWorkspace)
         校验请求ID和工作区定义，失败发送StartWorkspaceResult的Err
         按definition.id调用find_entities检查已有工作区，已存在时发送DuplicateWorkspace错误，不覆盖旧实例
         创建Entity，通过受检图书馆挂载入口插入Workspace，resourceid取definition.id，agents为空，state为Starting
-        不再挂载独立ResourceId组件；镜像集合由镜像加载方在目标Workspace Entity上创建或更新
+        不再挂载独立ResourceId组件；驱动集合由驱动加载方在目标Workspace Entity上创建或更新
         在创建阶段启动工作区专属执行线程，保存execution_entry和execution_close，不等第一个Agent才创建线程
         线程启动失败且没有成员执行体时回收本次Entity并返回ExecutionStartFailed
-        在Starting中保存原始启动请求ID，并按镜像地址归并需要该镜像的成员Agent地址
-        为每个不同镜像生成唯一加载子请求ID，在状态中登记关联后发送LoadAgentImage，携带目标Workspace完整Entity和镜像ResourceID
+        在Starting中保存原始启动请求ID，并按驱动地址归并需要该驱动的成员Agent地址
+        为每个不同驱动生成唯一加载子请求ID，在状态中登记关联后发送LoadAgentDriver，携带目标Workspace完整Entity和驱动ResourceID
         确认线程提交入口可用后才继续初始成员创建；无成员时置Running并发送StartWorkspaceResult的Ok(workspace)
         有成员时不提前发送启动成功
 
-handle_agent_image_result(world: &mut World, event: LoadAgentImageResult)
-    处理镜像结果：crate公开函数
+handle_agent_driver_result(world: &mut World, event: LoadAgentDriverResult)
+    处理驱动结果：crate公开函数
     行为：
         通过结果的子请求ID查找Starting中等待该结果的Workspace，未匹配时忽略
-        核对目标Workspace完整Entity及镜像ResourceID，拒绝不匹配结果，不消费合法请求的等待记录
-        匹配后移除对应镜像等待记录，重复结果不再次处理
-        失败时记录工作区启动错误，不启动依赖该镜像的成员
-        成功时确认目标Workspace Entity上的ResourceSet<AgentImage>包含该镜像ID；缺失则记录ResourceResolutionFailed且不启动对应成员
-        LoadAgentImageResult只是挂载完成通知，挂载由AgentImage插件完成，Workspace不重复插入或替换镜像集合
-        不登记依赖者，不创建镜像实体，也不在Workspace组件内另存镜像映射
-        为等待该镜像的每个成员生成唯一StartAgent子请求ID，登记成员关联后发送StartAgent
-        StartAgent携带工作区Entity、成员定义和镜像ResourceID，以工作区Entity加镜像ID定位具体镜像条目
+        核对目标Workspace完整Entity及驱动ResourceID，拒绝不匹配结果，不消费合法请求的等待记录
+        匹配后移除对应驱动等待记录，重复结果不再次处理
+        失败时记录工作区启动错误，不启动依赖该驱动的成员
+        成功时确认目标Workspace Entity上的ResourceSet<AgentDriver>包含该驱动ID；缺失则记录ResourceResolutionFailed且不启动对应成员
+        LoadAgentDriverResult只是挂载完成通知，挂载由AgentDriver插件完成，Workspace不重复插入或替换驱动集合
+        不登记依赖者，不创建驱动实体，也不在Workspace组件内另存驱动映射
+        为等待该驱动的每个成员生成唯一StartAgent子请求ID，登记成员关联后发送StartAgent
+        StartAgent携带工作区Entity、成员定义和驱动ResourceID，以工作区Entity加驱动ID定位具体驱动条目
         初始成员只通过原Starting操作关联取得线程提交能力，不向外开放工作区入口；这条内部启动授权不等于允许任意调用者在Starting加入Agent
-        不由Workspace复制镜像内部的VM或模型数据，不以全局镜像查询的首个Entity代替指定工作区
+        不由Workspace复制驱动内部的VM或模型数据，不以全局驱动查询的首个Entity代替指定工作区
         调用finish_workspace_start检查本次启动是否已完成
 
 handle_start_agent_result(world: &mut World, event: StartAgentResult)
@@ -305,10 +305,10 @@ handle_workspace_exception(world: &mut World, event: WorkspaceException)
 finish_workspace_start(world: &mut World, workspace: Entity)
     完成启动判定：私有函数，只由启动事件Handler调用
     行为：
-        Starting中还有等待镜像或等待成员请求时返回，不扫描Agent状态
+        Starting中还有等待驱动或等待成员请求时返回，不扫描Agent状态
         全部请求结束且没有错误时将state置Running，发送原始id对应的StartWorkspaceResult::Ok(workspace)
         全部请求结束且有错误时将state置Failed，发送原始id对应的StartWorkspaceResult::Err(error)
-        失败时保留已创建成员、镜像集合及执行线程，不偷偷销毁仍有执行体的工作区
+        失败时保留已创建成员、驱动集合及执行线程，不偷偷销毁仍有执行体的工作区
         Failed不受理普通StopWorkspace，关闭提交门并保留成员及线程；异常结果只确认/记录失败，不隐式恢复Running或强制销毁
         转移状态后不再保留本次启动等待记录，原请求只回复一次
 
@@ -320,19 +320,19 @@ finish_workspace_stop(world: &mut World, workspace: Entity)
         不阻塞ECS主线程，不先销毁Workspace，不让线程在成员清理前退出
         线程退出结果由handle_workspace_execution_closed完成实体回收和回复
         成员停止失败时置Failed并保留线程及未清理成员，发送StopWorkspaceResult::Err，不强制关闭其执行线程
-        Workspace Entity销毁时，其Workspace组件与ResourceSet<AgentImage>一同释放
-        不调用release_resource_owner，不登记ResourceOwners，不等待GC，也不删除磁盘镜像包
+        Workspace Entity销毁时，其Workspace组件与ResourceSet<AgentDriver>一同释放
+        不调用release_resource_owner，不登记ResourceOwners，不等待GC，也不删除磁盘驱动包
 ```
 
 ## 逻辑
 
 ```text
 启动：
-    StartWorkspace -> Starting -> 创建工作区执行线程并保存入口和关闭能力 -> LoadAgentImage
-    LoadAgentImageResult -> 确认本Entity镜像集合已更新 -> StartAgent
+    StartWorkspace -> Starting -> 创建工作区执行线程并保存入口和关闭能力 -> LoadAgentDriver
+    LoadAgentDriverResult -> 确认本Entity驱动集合已更新 -> StartAgent
     StartAgentResult -> 更新agents -> 全部成功后Running -> StartWorkspaceResult
-    同一工作区的多个成员使用同一镜像时只提交一次加载，加载完成后分别启动成员
-    不同工作区可以各自保存同ID镜像条目，一方加载更新不会自动覆盖另一方集合
+    同一工作区的多个成员使用同一驱动时只提交一次加载，加载完成后分别启动成员
+    不同工作区可以各自保存同ID驱动条目，一方加载更新不会自动覆盖另一方集合
     StartWorkspaceResult成功意味着定义中的全部成员都取得StartAgentResult成功结果，不再是仅创建了Workspace Entity
     StartAgentResult成功的准确边界由Agent插件保证，Workspace不额外监听Agent初始化事件
 
@@ -415,24 +415,24 @@ WorkspaceExceptionResult：工作区异常处理结果，公开事件
 ```text
 事件归属：
     所有插件的事件统一在共享types crate定义，每个插件对应一个事件定义文件
-    Workspace使用workspace_events.rs，Agent和AgentImage的事件分别由其对应文件提供
+    Workspace使用workspace_events.rs，Agent和AgentDriver的事件分别由其对应文件提供
     本crate不定义事件，也不保留src/events.rs；从共享types直接使用事件
     删除ReloadWorkspace和ReloadWorkspaceResult，暂不提供reload
     删除StopWorkspaceByReference和对应结果，不保留第二套停止入口
 
 外部事件的最小约定：
-    LoadAgentImage与LoadAgentImageResult必须能关联唯一子请求、目标Workspace完整Entity和镜像ResourceID
-    AgentImage插件加载或更新指定Entity上的ResourceSet<AgentImage>，写入完成后才发成功结果
-    目标Entity已销毁时不得向复用其index的新实体写入；不存在独立镜像Entity返回值
+    LoadAgentDriver与LoadAgentDriverResult必须能关联唯一子请求、目标Workspace完整Entity和驱动ResourceID
+    AgentDriver插件加载或更新指定Entity上的ResourceSet<AgentDriver>，写入完成后才发成功结果
+    目标Entity已销毁时不得向复用其index的新实体写入；不存在独立驱动Entity返回值
     StartAgent与StartAgentResult必须能关联唯一子请求及成员
-    StartAgent至少能表达工作区Entity、成员定义与镜像ResourceID，结果成功返回Agent Entity
-    Agent插件从指定工作区的镜像集合取启动材料；若Agent需要长期持有镜像，则保存自身的资源集合条目或所需启动快照，不长期借用Workspace组件
+    StartAgent至少能表达工作区Entity、成员定义与驱动ResourceID，结果成功返回Agent Entity
+    Agent插件从指定工作区的驱动集合取启动材料；若Agent需要长期持有驱动，则保存自身的资源集合条目或所需启动快照，不长期借用Workspace组件
     StopAgent与StopAgentResult必须能关联唯一子请求及目标Agent，结果成功表示目标已完成清理
     AgentExceptionResult使用exception_id/agent/resource_id/workspace(ResourceID)/instance/error/result/execution_ended/cleanup_completed；不得沿用AgentException旧直达路由
     Driver异常到Agent结果、Agent结果到Workspace结果均单向上行，每层Exception输入由本层独占处理，Result不回投为Exception
 
 依赖方向：
-    workspace_plugin通过共享types使用事件，不从agent_plugin或agent_image_plugin导入事件
+    workspace_plugin通过共享types使用事件，不从agent_plugin或agent_driver_plugin导入事件
     共享事件涉及的WorkspaceDefinition、ResourceID和错误契约也必须可被共享层引用
     共享types不得反向依赖workspace_plugin来取得WorkspaceError，否则产生循环依赖
 ```
@@ -462,8 +462,8 @@ WorkspaceState：工作区状态机，公开枚举--只表示工作区生命周�
 
 WorkspaceStartState：工作区启动进度，公开类型--由Workspace.state持有，不是独立Resource
     request_id: String--原StartWorkspace请求ID
-    pending_images: BTreeMap<String, ResourceID>--镜像加载子请求ID到镜像地址
-    image_members: BTreeMap<ResourceID, Vec<ResourceID>>--镜像地址到依赖该镜像的成员Agent地址
+    pending_drivers: BTreeMap<String, ResourceID>--驱动加载子请求ID到驱动地址
+    driver_members: BTreeMap<ResourceID, Vec<ResourceID>>--驱动地址到依赖该驱动的成员Agent地址
     pending_agents: BTreeMap<String, ResourceID>--成员启动子请求ID到成员Agent地址
     error: Option<WorkspaceError>--本次启动首先记录的错误，其余错误记录日志
 
@@ -570,7 +570,7 @@ WorkspaceErrorKind：工作区错误分类，公开枚举
     WorkspaceNotAlive
     WorkspaceBusy
     ResourceResolutionFailed
-    AgentImageLoadFailed
+    AgentDriverLoadFailed
     AgentStartFailed
     AgentStopFailed
     WorkspaceNotRunning
@@ -598,7 +598,7 @@ WorkspaceError：工作区错误，公开结构体
 ```text
 错误边界：
     Workspace只包装自己协调的请求与结果错误，不保留VM、Memory、工具或推理初始化的专属错误分类
-    外部插件的失败经其结果事件到达，由Workspace映射为镜像加载、成员启动或成员停止失败
+    外部插件的失败经其结果事件到达，由Workspace映射为驱动加载、成员启动或成员停止失败
     不存在目标的停止记录warning；日志级别不代替结果事件
     src/error.rs如保留则重导出共享错误，不在本插件与共享types之间互相依赖
 ```
@@ -612,28 +612,28 @@ WorkspaceError：工作区错误，公开结构体
     Workspace Entity
         Workspace { resourceid, definition, project_root, agents, state, execution_entry, execution_close }
             实现Component和LibraryComponent，是本Entity唯一图书馆组件
-        ResourceSet<AgentImage>
-            实现Component和ResourcesComponent，以镜像ResourceID为键保存AgentImage条目
+        ResourceSet<AgentDriver>
+            实现Component和ResourcesComponent，以驱动ResourceID为键保存AgentDriver条目
     ResourceID只是地址值，不是独立组件
-    不存在独立镜像宿主Entity、依赖者集合或资源GC
+    不存在独立驱动宿主Entity、依赖者集合或资源GC
     已被克隆的执行入口也必须遵守同一提交门；Stopping不能只靠隐藏字段阻止旧句柄继续提交
 
 查询：
     workspace地址通过Workspace::resource_id匹配，受检挂载保证图书馆地址唯一
-    image地址通过ResourceSet<AgentImage>::resource_ids匹配，可能查出多个工作区或其他持有者Entity
-    已知目标Workspace时直接在该Entity的镜像集合按ID取值，不进行全局任选匹配
+    driver地址通过ResourceSet<AgentDriver>::resource_ids匹配，可能查出多个工作区或其他持有者Entity
+    已知目标Workspace时直接在该Entity的驱动集合按ID取值，不进行全局任选匹配
 
 生命周期：
     只有Running接受停止，先关闭外部入口，成员由Agent自己停止，随后关闭工作区线程并等待退出
-    最后销毁Workspace Entity，其镜像集合随之释放
-    其他Entity上的同ID镜像条目不受影响，磁盘镜像包保留
+    最后销毁Workspace Entity，其驱动集合随之释放
+    其他Entity上的同ID驱动条目不受影响，磁盘驱动包保留
     不调用release_resource_owner，不使用ResourceOwners，不引入GC System
-    Agent插件必须在StopAgentResult成功前完成成员清理，Workspace不能先销毁再让Agent继续借用其镜像集合
+    Agent插件必须在StopAgentResult成功前完成成员清理，Workspace不能先销毁再让Agent继续借用其驱动集合
 
 依赖方向：
-    Workspace通过共享事件契约请求镜像加载，不直接调用AgentImage插件的加载Handler
-    如需读取ResourceSet<AgentImage>，AgentImage数据类型必须是可共享的资源契约，而非迫使Workspace依赖镜像插件实现
-    AgentImage是共享资源契约，镜像加载事件在共享agent_image_events.rs；Agent从指定Workspace Entity按image ID取得启动快照
+    Workspace通过共享事件契约请求驱动加载，不直接调用AgentDriver插件的加载Handler
+    如需读取ResourceSet<AgentDriver>，AgentDriver数据类型必须是可共享的资源契约，而非迫使Workspace依赖驱动插件实现
+    AgentDriver是共享资源契约，驱动加载事件在共享agent_driver_events.rs；Agent从指定Workspace Entity按driver ID取得启动快照
     统一资源插件提供地址、组件trait和类型注册；Workspace不自行实现第二套身份索引
 
 实现边界：

@@ -1,0 +1,3 @@
+schema_version = 1
+name = "edit"
+description = "Edit an existing UTF-8 text file using an exact literal replacement. By default the old text must occur exactly once; set replace_all only when every occurrence should change. Read the file first so the replacement is based on current content."

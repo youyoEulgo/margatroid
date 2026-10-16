@@ -75,8 +75,8 @@ fn environment(
         LuaValue::String(agent.workspace.to_string()),
     );
     info.insert(
-        "image".into(),
-        LuaValue::String(agent.info.image.to_string()),
+        "driver".into(),
+        LuaValue::String(agent.info.driver.to_string()),
     );
     let mut model = BTreeMap::new();
     model.insert(
@@ -149,11 +149,11 @@ fn environment(
     }
     info.insert("model".into(), LuaValue::Object(model));
     info.insert(
-        "image_dependencies".into(),
+        "driver_dependencies".into(),
         LuaValue::Array(
             agent
                 .info
-                .image_dependencies
+                .driver_dependencies
                 .iter()
                 .map(|id| LuaValue::String(id.to_string()))
                 .collect(),
@@ -186,7 +186,7 @@ pub fn handle_start_agent(world: &mut World, request: StartAgent) {
     let prepared = (|| {
         if request.id.is_empty()
             || request.resource_id.resource_type() != "agent"
-            || request.image.resource_type() != "image"
+            || request.driver.resource_type() != "driver"
         {
             return Err(error(
                 AgentErrorKind::InvalidRequest,
@@ -242,24 +242,24 @@ pub fn handle_start_agent(world: &mut World, request: StartAgent) {
         let entry = world
             .workspace_start_entry(request.workspace, &request.id)
             .map_err(|e| error(AgentErrorKind::WorkspaceNotAlive, e.to_string()))?;
-        let image = world
-            .get_component::<ResourceSet<AgentImage>>(request.workspace)
-            .and_then(|set| set.get(&request.image))
+        let driver = world
+            .get_component::<ResourceSet<AgentDriver>>(request.workspace)
+            .and_then(|set| set.get(&request.driver))
             .cloned()
             .ok_or_else(|| {
                 error(
-                    AgentErrorKind::ImageNotLoaded,
-                    "image not loaded on requested workspace",
+                    AgentErrorKind::DriverNotLoaded,
+                    "driver not loaded on requested workspace",
                 )
             })?;
         let model_runtime = world
             .get_resource::<margatroid_types::model_components::ModelRuntimeCatalog>()
-            .and_then(|catalog| catalog.get(&image.model.model))
+            .and_then(|catalog| catalog.get(&driver.model.model))
             .cloned()
             .ok_or_else(|| {
                 error(
                     AgentErrorKind::ModelRouteNotFound,
-                    format!("model route `{}` is not configured", image.model.model),
+                    format!("model route `{}` is not configured", driver.model.model),
                 )
             })?;
         if model_runtime.context_window_tokens == 0
@@ -285,9 +285,9 @@ pub fn handle_start_agent(world: &mut World, request: StartAgent) {
                 "workspace admission closed",
             ));
         }
-        Ok((workspace_id, image, mcl_environment, model_runtime))
+        Ok((workspace_id, driver, mcl_environment, model_runtime))
     })();
-    let (workspace, image, mcl_environment, model_runtime) = match prepared {
+    let (workspace, driver, mcl_environment, model_runtime) = match prepared {
         Ok(value) => value,
         Err(error) => {
             world.send_event(StartAgentResult {
@@ -312,7 +312,7 @@ pub fn handle_start_agent(world: &mut World, request: StartAgent) {
             PendingDatabase {
                 request,
                 workspace,
-                image,
+                driver,
                 mcl_environment,
                 model_runtime,
             },
@@ -346,7 +346,7 @@ impl Resource for PendingDatabases {}
 struct PendingDatabase {
     request: StartAgent,
     workspace: resource_id_plugin::ResourceID,
-    image: AgentImage,
+    driver: AgentDriver,
     mcl_environment: LuaEnvironment,
     model_runtime: margatroid_types::model_components::ModelRuntimeInfo,
 }
@@ -378,7 +378,7 @@ pub fn handle_database_setup_result(
     let PendingDatabase {
         request,
         workspace,
-        image,
+        driver,
         mut mcl_environment,
         model_runtime,
     } = pending;
@@ -439,11 +439,11 @@ pub fn handle_database_setup_result(
         resourceid: request.resource_id,
         workspace,
         info: AgentInfo {
-            model: image.model.clone(),
+            model: driver.model.clone(),
             project_root: request.definition.project_root,
             home_root: request.definition.home_root,
-            image: request.image,
-            image_dependencies: image.dependencies.clone(),
+            driver: request.driver,
+            driver_dependencies: driver.dependencies.clone(),
         },
         sandbox: None,
         import_bindings: Default::default(),
@@ -482,8 +482,8 @@ pub fn handle_database_setup_result(
         id: vm_request_id,
         owner: entity,
         program: LuaProgram {
-            source: image.base_driver,
-            origin: image.origin,
+            source: driver.base_driver,
+            origin: driver.origin,
             libraries: LuaStandardLibraries::Safe,
         },
         environment,

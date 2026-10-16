@@ -13,7 +13,7 @@ pub enum AgentErrorKind {
     AgentBusy,
     AgentStopping,
     WorkspaceNotAlive,
-    ImageNotLoaded,
+    DriverNotLoaded,
     ModelRouteNotFound,
     ResourceSetupFailed,
     HistorySetupFailed,
@@ -68,7 +68,7 @@ pub struct StartAgent {
     pub id: String,
     pub resource_id: ResourceID,
     pub workspace: Entity,
-    pub image: ResourceID,
+    pub driver: ResourceID,
     pub definition: AgentStartDefinition,
 }
 impl Event for StartAgent {}

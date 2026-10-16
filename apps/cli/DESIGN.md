@@ -97,7 +97,7 @@ run_workspace_up
 边界：
     CLI只负责Compose编译、Workspace启动请求和日志显示
     clap只负责命令行语法、帮助、版本、默认值和参数错误，不进入业务调用链
-    CLI不启动daemon、不创建ECS、不读取AgentImage或资源正文
+    CLI不启动daemon、不创建ECS、不读取AgentDriver或资源正文
     CLI不读取stdin，不处理UserMessage、AssistantMessage、ToolCall或LLM流
     WebSocket传输只承载margatroid_protocol定义的请求和后端事件
     正常运行期间收到关闭信号时，CLI退出前必须先完成workspace.stop业务回执；启动失败已由后端清理Workspace，直接报错退出，不发送workspace.stop
