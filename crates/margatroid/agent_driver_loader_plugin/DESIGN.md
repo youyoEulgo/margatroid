@@ -234,10 +234,8 @@ AgentDriverLoadConfig：Clone + Resource，只保存配置，无pending表
 AgentDriverManifest：Deserialize
     schema_version: u32
     inference: AgentDriverModelConfig
-    dependencies: Vec<AgentDriverDependencyDocument>--默认空
-
-AgentDriverDependencyDocument：Deserialize，deny_unknown_fields
-    id: String
+    dependencies: Vec<String>--顶层字符串数组，默认空；在[inference]之前声明
+    每项解析完整ResourceID，保留顺序及重复项；不接受旧依赖表或内联对象，不自动导入/启用资源
 ```
 
 私有，定义于handler：
@@ -261,8 +259,8 @@ guard在闭包提交捕获阶段建立；取消或panic释放捕获内容时回�
 正常主线程回复后设置completed，guard正常释放不再次报告
 完成标记由唯一主线程挂载消费者使用；不将异步线程成功当成挂载成功
 无Prepared/Payload/Mutex<Option<Output>>层，无AgentDriverData和旧模型/源码/依赖薄包装
-16个测试覆盖实际target挂载/其他keys保留、多target、成功重载、失败保旧、generation复用、
-    无关文件/目录/symlink忽略、自有symlink拒绝、两文件UTF-8及边界、清单参数/依赖source校验、
+测试覆盖实际target挂载/其他keys保留、多target、成功重载、失败保旧、generation复用、
+    无关文件/目录/symlink忽略、自有symlink拒绝、两文件UTF-8及边界、清单参数/依赖字符串数组校验、缺省与空数组、顺序/重复项/tag规范化、
     open无mkdir/路径检查、guard取消/panic/输出丢弃/重复失败恰好一次回复
 ```
 

@@ -2,7 +2,7 @@
 
 ## 仓库资源
 
-仓库 `resources/` 保存可版本管理的资源包：`agent-drivers/local/coder/latest/driver.toml` 与 `base.lua` 为 coder Driver，`tools/`、`prompts/`、`sandboxes/` 保存现有全局资源。reviewer Driver 暂不纳入。Prompt 的 `content.md` 是运行时资源正文，不是额外说明文档。
+仓库 `resources/` 保存可版本管理的资源包：`agent-drivers/local/{coder,reviewer}/latest/driver.toml` 与 `base.lua` 为两个 Driver，`tools/`、`prompts/`、`sandboxes/` 保存现有全局资源。Prompt 的 `content.md` 是运行时资源正文，不是额外说明文档。
 
 这些包不是新的隐式加载来源：daemon 仍按全局根加载，使用前应将资源部署到对应的 `~/.margatroid/agent-drivers`、`tools`、`prompts`、`sandboxes` 目录。模型路由与凭据不包含在资源包内，仍由使用者独立配置。测试显式指定仓库资源路径，不依赖本机部署包。
 
@@ -45,25 +45,22 @@ Loader 不解释 Workspace 状态机，不启动 Agent，不查询推理路由�
 ```toml
 schema_version = 1
 
+dependencies = [
+    "tool:local/code-review:latest",
+    "tool:local/list-directory:latest",
+    "prompt:system/soul:latest",
+]
+
 [inference]
 model = "deepseek-v4-flash"
 temperature = 0.7
 max_output_tokens = 8192
 top_p = 0.9
 stop = ["DONE"]
-
-[[dependencies]]
-id = "tool:local/code-review:latest"
-
-[[dependencies]]
-id = "tool:local/list-directory:latest"
-
-[[dependencies]]
-id = "prompt:system/soul:latest"
 ```
 
 资源 ID 使用完整 `type:scope/name:tag` 地址，省略 tag 规范化为 `latest`。
-每项 dependency **只允许 id**，`source` 或其他未知依赖字段会被拒绝。
+`dependencies` 是顶层字符串数组，放在 `[inference]` 之前（TOML 表头后的字段属于该表）。省略或 `[]` 表示无依赖；每项必须是资源 ID 字符串，旧式依赖表和内联对象不再接受。保留原顺序及重复项，不改变导入、可见工具或沙箱选择语义。
 依赖仅保存为地址，不检查本地文件或资源存在性；prompt 不从驱动里的 Markdown 文件读取，
 不限制 prompt scope，不按 scope/name 去重。不从模型配置反向推断依赖。
 

@@ -23,7 +23,7 @@ impl Fixture {
         ));
         let driver = root.join("local/coder/latest");
         fs::create_dir_all(&driver).unwrap();
-        fs::write(driver.join("driver.toml"), "schema_version = 1\n[inference]\nmodel = 'test'\ntemperature = 0.7\nmax_output_tokens = 100\ntop_p = 0.9\nstop = ['DONE']\n[[dependencies]]\nid = 'prompt:system/test:v1'\n").unwrap();
+        fs::write(driver.join("driver.toml"), "schema_version = 1\ndependencies = ['prompt:system/test:v1']\n[inference]\nmodel = 'test'\ntemperature = 0.7\nmax_output_tokens = 100\ntop_p = 0.9\nstop = ['DONE']\n").unwrap();
         fs::write(driver.join("base.lua"), "return 'original'").unwrap();
         Self(root)
     }
@@ -200,8 +200,14 @@ fn ignores_unowned_files_and_directories() {
     load(&mut app, "ignore", target).unwrap();
 }
 #[test]
-fn rejects_dependency_source_and_invalid_model_parameters() {
-    for body in ["schema_version=1\n[inference]\nmodel='test'\n[[dependencies]]\nid='prompt:local/a'\nsource='body'", "schema_version=1\n[inference]\nmodel='test'\ntemperature=-1", "schema_version=1\n[inference]\nmodel='test'\n[[dependencies]]\nid='../escape'"] {
+fn rejects_non_string_dependencies_and_invalid_model_parameters() {
+    for body in [
+        "schema_version=1\ndependencies=[{id='prompt:local/a', source='body'}]\n[inference]\nmodel='test'",
+        "schema_version=1\ndependencies=[123]\n[inference]\nmodel='test'",
+        "schema_version=1\n[inference]\nmodel='test'\ntemperature=-1",
+        "schema_version=1\ndependencies=['../escape']\n[inference]\nmodel='test'",
+        "schema_version=1\n[inference]\nmodel='test'\n[[dependencies]]\nid='prompt:local/a'",
+    ] {
         let fixture = Fixture::new();
         fs::write(fixture.driver().join("driver.toml"), body).unwrap();
         let mut app = app(&fixture.0);
@@ -210,6 +216,25 @@ fn rejects_dependency_source_and_invalid_model_parameters() {
         assert!(app.world().get_component::<ResourceSet<AgentDriver>>(target).is_none());
     }
 }
+#[test]
+fn dependency_arrays_preserve_order_duplicates_and_default_to_empty() {
+    for (declaration, expected) in [
+        ("", vec![]),
+        ("dependencies = []\n", vec![]),
+        ("dependencies = ['tool:local/read-file', 'prompt:system/soul:v2', 'tool:local/read-file']\n",
+            vec!["tool:local/read-file:latest", "prompt:system/soul:v2", "tool:local/read-file:latest"]),
+    ] {
+        let fixture = Fixture::new();
+        fs::write(fixture.driver().join("driver.toml"), format!("schema_version=1\n{declaration}[inference]\nmodel='test'\n")).unwrap();
+        let mut app = app(&fixture.0);
+        let target = app.world_mut().spawn();
+        load(&mut app, "array", target).unwrap();
+        let dependencies = &app.world().get_component::<ResourceSet<AgentDriver>>(target).unwrap()
+            .get(&request("x", target).resource_id).unwrap().dependencies;
+        assert_eq!(dependencies.iter().map(ToString::to_string).collect::<Vec<_>>(), expected);
+    }
+}
+
 #[test]
 fn both_files_are_bounded() {
     for name in ["driver.toml", "base.lua"] {

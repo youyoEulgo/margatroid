@@ -54,10 +54,7 @@ fn id(value: &str) -> ResourceID {
 fn driver(root: &Path, name: &str, driver: &str, dependencies: &[&str]) {
     let directory = root.join("drivers/local").join(name).join("latest");
     fs::create_dir_all(&directory).unwrap();
-    let mut manifest = "schema_version = 1\n[inference]\nmodel = \"offline-test\"\n".to_owned();
-    for dependency in dependencies {
-        manifest.push_str(&format!("\n[[dependencies]]\nid = {dependency:?}\n"));
-    }
+    let manifest = format!("schema_version = 1\ndependencies = {dependencies:?}\n[inference]\nmodel = \"offline-test\"\n");
     fs::write(directory.join("driver.toml"), manifest).unwrap();
     fs::write(directory.join("base.lua"), driver).unwrap();
 }

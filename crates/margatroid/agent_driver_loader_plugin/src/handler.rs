@@ -237,8 +237,7 @@ async fn read_driver_files(
             .dependencies
             .into_iter()
             .map(|d| {
-                ResourceID::parse(&d.id)
-                    .map_err(|e| error(format!("invalid dependency id {}: {e}", d.id)))
+                ResourceID::parse(&d).map_err(|e| error(format!("invalid dependency id {d}: {e}")))
             })
             .collect::<Result<Arc<[_]>, _>>()?;
         Ok((manifest.inference, dependencies))
