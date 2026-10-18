@@ -1,27 +1,16 @@
 schema_version = 1
 
+dependencies = [
+    "prompt:local/reviewer-soul:latest",
+    "prompt:local/compact:latest",
+    "tool:local/code-review:latest",
+    "tool:local/project-context:latest",
+    "tool:local/list-directory:latest",
+    "sandbox:local/workspace-write:latest",
+    "sandbox:local/read-only:latest",
+]
+
 [inference]
 model = "openrouter/deepseek-v4.1-flash"
 temperature = 0.1
 top_p = 0.9
-
-[[dependencies]]
-id = "prompt:local/reviewer-soul:latest"
-
-[[dependencies]]
-id = "prompt:local/compact:latest"
-
-[[dependencies]]
-id = "tool:local/code-review:latest"
-
-[[dependencies]]
-id = "tool:local/project-context:latest"
-
-[[dependencies]]
-id = "tool:local/list-directory:latest"
-
-[[dependencies]]
-id = "sandbox:local/workspace-write:latest"
-
-[[dependencies]]
-id = "sandbox:local/read-only:latest"

@@ -34,10 +34,5 @@ pub(crate) struct AgentDriverManifest {
     pub schema_version: u32,
     pub inference: AgentDriverModelConfig,
     #[serde(default)]
-    pub dependencies: Vec<AgentDriverDependencyDocument>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct AgentDriverDependencyDocument {
-    pub id: String,
+    pub dependencies: Vec<String>,
 }
