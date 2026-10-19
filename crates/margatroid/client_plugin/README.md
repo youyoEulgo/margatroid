@@ -1,21 +1,17 @@
-# ClientPlugin
+# Client
 
-`ClientPlugin` 消费 ServerPlugin 的 `RegisterConnection`，校验客户端类型和唯一名称，更新连接元数据，再通过统一受检入口创建挂载 `Client` 的 Entity；连接断开时清除该 Entity。`Client` 是共享 `margatroid_types::client_components` 中的 `LibraryComponent`，自身保存 `resource_id: ResourceID`，不挂独立 `ResourceId` 组件。
+client_core定义Client组件、注册结果、错误和World查询扩展，只依赖mecs及通用基础库。client_plugin依赖client_core、address和mecs，负责注册与断开处理。其他领域使用client_core，不依赖client_plugin；client_core不依赖address或其他领域core。
 
-System 只收集注册与断开事件并路由到对应 Handler；业务校验、连接设施查询、失败日志和注册结果事件发送均由 Handler 负责。WorldClientExt 及实现位于本 crate 的 lib；Client 组件位于共享 types crate 的 client_components 模块，RegisteredClient 与 client_source 位于 client_types 模块，注册结果事件及错误位于 client_events 模块。私有 types 本地模块为空并保留声明；events、error 已归属共享 types crate，不保留本地空文件或模块声明。测试统一位于 tests 目录。
+## 注册与断开
 
-客户端类型只允许小写 ASCII 字母、数字、下划线和短横线。后端构成规范地址：
+Client保存连接ID、类型和名称，不保存资源地址，也不实现LibraryComponent。client_plugin注册时创建Entity，分别挂载Client与Address；地址为client:<client_type>/<name>:<connection_id>。名称缺省为连接ID文本，类型与名称是自报标签，不是认证凭据。
 
-```text
-client:<client_type>/<name>:<connection_id>
-```
+System只收集注册和断开事件并交给Handler。注册Handler校验连接、名称及地址占用，更新连接元数据，挂载组件并复检连接；成功后发送包含完整Entity的注册结果。失败清理本次实体并尝试恢复元数据。连接断开时销毁对应Client Entity，不取消已提交推理。
 
-`name` 可选，缺省为后端分配连接句柄的十进制文本。例如连接 `12`、类型 `webui`、名称 `console` 对应 `client:webui/console:12`。类型与名称是自报标签，用于可读地址和路由，不表示认证结果或权限。
+## 查询与对外身份
 
-每次注册通过 `ClientRegistrationResult` 携带请求 ID、连接 ID 与 `Result<RegisteredClient, ClientError>`。成功仅在 Entity 已可查询后报告；失败不得留下半注册实体。`WorldClientExt::client_by_connection` 返回 `Option<(Entity, &Client)>`，保留完整 Entity generation；`registered_client(world, connection_id)` 是返回 `Option<ResourceID>` 的便捷查询。
+WorldClientExt按连接ID查询Client，或取得已注册webui发送器快照。发送器按连接ID去重并排除已关闭连接；后续注册不扩展已有快照。
 
-网络入口必须从当前真实连接取得已注册 Client，并绑定其完整 Entity、ResourceID 及连接上下文；后续异步结果须核对这些上下文，不能发送给复用 index 的新 Entity 或新连接。未注册请求拒绝，客户端不能覆盖 source；直接调用也必须显式提供并校验注册身份，不能隐式选取第一个 Client、Agent 或 Workspace。Driver 宿主调用则绑定真实 Agent 实例，目标参数不是来源。
+网络入口通过真实连接取得Client Entity，内部传递完整Entity。DTO对外输出身份时读取Address组件；异步回执核对原Entity与连接，不重新按地址绑定新实例。未注册连接直接拒绝，不提供unregistered字符串回退，不保留client_source或返回资源地址的registered_client辅助函数。
 
-当前仍导出 `client_source(client_type, name, connection_id) -> String`，缺少元数据时会产生 `unregistered:<connection_id>`。这只是旧字符串辅助函数，不验证注册、Entity generation 或连接存活；不能作为请求 source 的权威构造或未注册回退。目标身份入口应使用已注册共享组件，当前 DTO 接线已使用真实注册身份，完整 generation/连接关联有对应回归验证。
-
-`client_webui_senders` 从已注册 webui Client 与 Server 连接表收集去重且未关闭的 Sender。推理提交前取得发送器快照，后来连接不补入；快照不按 Workspace 隔离，连接关闭不取消已提交推理，推流失败不改变权威 oneshot 结果。Server 拥有连接和 Sender 生命周期，ClientPlugin 只管理注册身份。
+Client不涉及磁盘资源或资源路径集合。core与plugin各自的测试放在其tests目录，不保留无内容的模块文件。

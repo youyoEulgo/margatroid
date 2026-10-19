@@ -1,31 +1,27 @@
-# AgentPlugin
+# Agent
 
-AgentPlugin负责Agent实例的启动、停止、异常关联与生命周期；共享Agent组件保存身份、Workspace关联、配置快照、Lua通知句柄、execution作用域、MCL队列、turn、导入绑定及数据库/历史句柄。Block在真实SQLite中，Agent不保存Block权威内存内容。消息历史只由显式MCL `history_append`追加，推理与工具仅返回结果，不自动保存消息。
+agent_core定义Agent自身组件、生命周期状态、事件和错误，只依赖mecs及通用库。agent_plugin依赖agent_core、address和所需领域core，负责跨领域生命周期编排，不依赖其他plugin。
 
-## 集中工作区成员契约（目标与实现边界）
+## 同步受理
 
-工作区定义统一持久化于主目录，数据库路径由工作区存储能力推导为 `~/.margatroid/workspaces/<workspace>/agents/<agent>/state.sqlite`。AgentPlugin 继续按类型化启动材料打开现有单库并管理真实执行清理，不扫描或写 workspace.yaml。成员加入/移除由 Workspace 生命周期协调持久化；普通 StopAgent 不等于从工作区定义移除，也不删除数据库。移除成员必须等待真实 StopAgent 清理完成，持久化失败仍需保留定义并报告实际已停止事实。manager 已从工作区契约删除，面向 Agent 的协议请求必须明确携带成员 ID。
+状态为Starting、Idle、Working、Restarting、Stopping。Handler在一次同步调用中检查状态白名单并切换状态，随后提交异步闭包。
 
+Idle允许开始回合、关闭和重启；Working允许结束回合、中止、关闭和重启。Starting、Restarting、Stopping只允许当前操作的步骤及结果，拒绝其他生命周期请求。重复关闭和重启不合并、不抢占在途流程。
 
-## 名称、驱动与重命名边界
+stop_agent_system、restart_agent_system、start_agent_system依次挂载于同一Schedule，直接使用mecs按添加顺序同步执行的机制。同帧关闭优先于重启；先受理者同步修改状态，后者按白名单拒绝。不增加统一生命周期事件、排序队列或手写优先级分发器。优先级不取消前一帧已受理的操作。
 
-目标定义位于 `~/.margatroid/workspaces/<workspace>/workspace.yaml`，状态位于同目录 `agents/<agent>/state.sqlite`；不使用项目级 `.margatroid` 或manager。Workspace/成员名称派生ResourceID，名称不变时稳定；重命名是显式迁移，不另引入稳定身份模型。用户及sidebar选择的驱动是现有AgentDriver包，New session增加成员，不是另一种Driver；可选ID应来自驱动目录的发现结果/DriverCatalog，不仅来自已挂载的运行中集合。
+## 异步流程
 
-Workspace重命名只在停止且所有相关DB句柄关闭后受理；运行中成员重命名先关闭新受理、drain/StopAgent并等待真实清理，然后关闭所有句柄。随后由Workspace编排共享类型化迁移能力：在SQLite备份副本迁移已知Block namespace、重建当前history.query身份/句柄投影元数据，保持原始历史正文、MCL文本/参数、来源、顺序、时间与工具事实不变，禁止盲目字符串替换。内部 `.operations/<operation>/` 日志、staging及备份排除于工作区catalog，阶段fsync；目录、manifest和SQLite各自提交，失败保留可恢复数据并报告部分完成，重启先恢复/标记不可用再开放受理。该迁移与恢复器已实现并有 scoped 与真实存储集成验证；机械SQLite细节见[Memory设计](<../memory_plugin/DESIGN.md>)。
+启动受理后先创建Entity并挂载基础组件，再由闭包顺序完成数据库准备、运行组件初始化及Driver启动。需要World或其他领域执行的步骤发送带oneshot的请求，回复后才执行下一步。闭包不跨await借用World。启停及重启闭包直接返回Result<对应Output, 对应Error>，由mecs异步结果机制交给对应System，不额外定义FlowResult或结果包装事件；公共Agent结果事件只用于最终回执。
 
-恢复已完成；存储迁移与领域路由已接通。下述行为按当前实现描述，验证范围不扩张为所有故障的保证。
+关闭受理时同步关闭新操作受理。关闭闭包请求Driver停止和执行取消，等待活动真实退出及MCL收口；结果Handler确认后销毁Entity。
 
-## 轮次中止
+重启闭包依次复用stop_flow和start_flow，全程保持Restarting。内部stop_flow不销毁协调Entity，不发送公开启停请求。重新启动时读取Driver文件，使用新的VM实例关联。
 
-Agent生命周期层已实现`Idle / Working`及独立`AbortAgentTurn`控制事件。控制系统注册在`RuntimePlugin::PRE_UPDATE`，必须先于MCL与领域受理；daemon 将 InferencePlugin 显式配置于 UPDATE，组合根仍须核对实际系统顺序，不能只凭插件默认计划名保证优先；自定义调度必须保留这个先后关系。只保留当前实例最近一次已中止turn的关联，重复请求仅在Working收口期间成功。详细契约与跨插件行为见[设计](<DESIGN.md>)。
+每个步骤和最终结果核对完整Entity及对应生命周期状态。oneshot关闭或闭包异常不是清理完成证明；无法确认清理时保留宿主，发送失败结果。启动或重启成功转Idle，关闭成功销毁Entity；启动或重启失败且清理完成时销毁Entity。
 
-- 目标状态为`Creating / Idle / Working / Stopping`。启动成功进入`Idle`、`turn=None`。`start_turn`仅允许Idle，原子创建turn并置Working，不覆盖已有轮次。
-- abort是独立控制事件，不进入MCL FIFO。控制System先于MCL继续动作及Inference/Tool受理执行；Working收到abort立即清空`agent.turn`，仍保持Working，直到Driver沿正常消息链调用`finish_turn`才进入Idle。Working且turn=None重复abort幂等pending。
-- 协议目标`agent.turn.abort {id, message:{workspace, agent, turn_id}}`要求非空turn_id；服务器内部核对实际Agent实例，不接受用户Entity。`agent.turn.abort_result`按id关联，Ok只表示控制受理，不代表清理完成或Idle；同一旧轮次重试使用保留取消关联，不建立平行旧pending权威。
-- 五种观察点（abort前Working且turn存在）均须覆盖：inference未受理、inference已受理、tool_call未受理、tool_call已受理、Driver消息处理/下个effect之间的间隙。未受理请求取消路径claim一次性reply恰好一次；已受理请求取消token并等待真实清理，之后返回正常形状取消结果；Driver间隙由下一effect实际动作的turn门覆盖。Working且turn=None的重复abort另按幂等pending处理。finish_turn须对应当前Driver结果链且本轮清理已完成，Idle重复完成幂等，不得以迟到旧完成覆盖新的Working轮次。
-- `inference/tool_call`在异步准备后的实际effect动作处要求turn。无turn返回Ok取消Assistant/工具结果，而非通用取消错误；不新增`get_turn`，Driver不检查turn。
-- Assistant消息携带`stop_reason=Cancelled`（序列化`cancelled`），保留已有正文和思考，无输出保持空值，`tool_calls=[]`、`usage=None`；工具取消保留调用ID与顺序，`failed=true`、正文`Tool call aborted.`。消息历史/Block/投影保留stop_reason。
-- Driver读取entry第一条并移除同一条，显式历史保留原值。Inject仅递归展开容器并追加非容器上下文（嵌套取消Assistant也跳过），不执行子消息控制分支；User追加上下文、start_turn、推理；取消Assistant仅入历史，正常Assistant入上下文，无调用Assistant是唯一finish_turn路径，否则发工具批次；全部工具结果入上下文，批次齐后即使turn=None仍推理，取得取消Assistant收尾。Error不得直接finish或伪造取消消息。
-- 前端仅Idle允许发送、Working允许abort；服务端用户消息受理也必须验证Idle，不能只依赖按钮。清理失败仍返回错误并保留未清理活动，不转Idle。
+## 数据归属
 
-轮次abort不是停止Agent，不关闭Driver或根execution作用域。Creating/Stopping、StopAgent根取消、全部活动真实完成、MCL回执drained与失败保留宿主的原清理语义不变。协议、Driver与前端支持由各自插件提供；本插件的成功回执仅证明中止控制已受理。
+Agent只保存名称、Workspace Entity、生命周期状态和当前turn。Address独立挂载，仅供边界寻址。Driver、执行作用域、MCL队列、数据库、历史和各资源路径表由各领域core定义，作为并列组件挂到Agent Entity。
+
+中止回合由调用方plugin同步调用agent_abort_turn检查并清除turn，再调用执行领域取消能力；不发送Agent中止事件，也不提交中止闭包。Agent保持Working，直到正常收尾后回Idle。turn已空或不匹配的重复中止直接拒绝，不保存上轮中止关联。成员重命名和持久配置变更归Workspace编排，不由Agent改磁盘定义。
