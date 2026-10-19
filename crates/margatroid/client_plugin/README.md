@@ -2,7 +2,7 @@
 
 `ClientPlugin` 消费 ServerPlugin 的 `RegisterConnection`，校验客户端类型和唯一名称，更新连接元数据，再通过统一受检入口创建挂载 `Client` 的 Entity；连接断开时清除该 Entity。`Client` 是共享 `margatroid_types::client_components` 中的 `LibraryComponent`，自身保存 `resource_id: ResourceID`，不挂独立 `ResourceId` 组件。
 
-catalog、注册启动和成员管理接线已恢复并完成对应验证；创建、重命名、删除及发现能力已接通。验证结论限于实际执行场景，不将 API 存在或历史测试等同于普遍可用性保证。
+System 只收集注册与断开事件并路由到对应 Handler；业务校验、连接设施查询、失败日志和注册结果事件发送均由 Handler 负责。WorldClientExt 及实现位于本 crate 的 lib；Client 组件位于共享 types crate 的 client_components 模块，RegisteredClient 与 client_source 位于 client_types 模块，注册结果事件及错误位于 client_events 模块。私有 types 本地模块为空并保留声明；events、error 已归属共享 types crate，不保留本地空文件或模块声明。测试统一位于 tests 目录。
 
 客户端类型只允许小写 ASCII 字母、数字、下划线和短横线。后端构成规范地址：
 

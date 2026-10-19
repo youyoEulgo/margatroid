@@ -3,16 +3,14 @@ mod system;
 mod types;
 
 use app_runtime_plugin::RuntimePlugin;
-use core_plugin::{App, Plugin, Resource};
+use core_plugin::{App, Entity, Plugin, Resource, World};
 use resource_id_plugin::{ResourcePluginInstalled, WorldResourceExt};
-use server_plugin::WebSocketConnections;
+use server_plugin::{WebSocketConnectionId, WebSocketConnections, WebSocketSender};
 
 pub use handler::registered_client;
-pub use margatroid_types::client_components::{Client, WorldClientExt};
-pub use margatroid_types::client_events::{
-    ClientError, ClientRegistrationResult, RegisteredClient,
-};
-pub use types::client_source;
+pub use margatroid_types::client_components::Client;
+pub use margatroid_types::client_events::{ClientError, ClientRegistrationResult};
+pub use margatroid_types::client_types::{client_source, RegisteredClient};
 
 use crate::system::{client_disconnect_system, client_registration_system};
 
@@ -64,5 +62,40 @@ impl Plugin for ClientPlugin {
         app.world_mut().insert_resource(ClientPluginInstalled);
         app.add_system(&self.schedule, client_registration_system)
             .add_system(&self.schedule, client_disconnect_system);
+    }
+}
+
+pub trait WorldClientExt {
+    fn client_by_connection(&self, connection: WebSocketConnectionId) -> Option<(Entity, &Client)>;
+    fn client_webui_senders(&self) -> Vec<WebSocketSender>;
+}
+impl WorldClientExt for World {
+    fn client_by_connection(&self, connection: WebSocketConnectionId) -> Option<(Entity, &Client)> {
+        self.query_with::<Client>()
+            .result()
+            .into_iter()
+            .find_map(|entity| {
+                let client = self.get_component::<Client>(entity)?;
+                (client.connection_id == connection).then_some((entity, client))
+            })
+    }
+    fn client_webui_senders(&self) -> Vec<WebSocketSender> {
+        let Some(connections) = self.get_resource::<WebSocketConnections>() else {
+            return Vec::new();
+        };
+        let mut ids = std::collections::HashSet::new();
+        self.query_with::<Client>()
+            .result()
+            .into_iter()
+            .filter_map(|entity| {
+                let client = self.get_component::<Client>(entity)?;
+                if client.client_type != "webui" || !ids.insert(client.connection_id) {
+                    return None;
+                }
+                connections
+                    .get(client.connection_id)
+                    .filter(|sender| !sender.is_closed())
+            })
+            .collect()
     }
 }

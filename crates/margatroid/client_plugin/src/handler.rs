@@ -1,11 +1,34 @@
-use crate::{Client, ClientError, RegisteredClient, WorldClientExt};
+use crate::{Client, ClientError, ClientRegistrationResult, RegisteredClient, WorldClientExt};
+use app_runtime_plugin::WorldEventExt;
 use core_plugin::World;
 use resource_id_plugin::{ResourceID, WorldResourceExt};
 use server_plugin::{
-    RegisterConnection, WebSocketConnectionId, WebSocketConnections, WebSocketNameError,
+    RegisterConnection, WebSocketConnectionId, WebSocketConnections, WebSocketDisconnected,
+    WebSocketNameError,
 };
 
-pub(crate) fn handle_client_registration(
+pub(crate) fn handle_client_registration(world: &mut World, request: &RegisterConnection) {
+    let connections = world.get_resource::<WebSocketConnections>().cloned();
+    let result = match connections {
+        Some(connections) => register_client(world, &connections, request),
+        None => Err(ClientError::ConnectionMissing),
+    };
+    if let Err(error) = &result {
+        tracing::warn!(
+            request_id = %request.id,
+            connection = request.connection_id.get(),
+            error = %error,
+            "client registration failed"
+        );
+    }
+    world.send_event(ClientRegistrationResult {
+        id: request.id.clone(),
+        connection_id: request.connection_id,
+        result,
+    });
+}
+
+fn register_client(
     world: &mut World,
     connections: &WebSocketConnections,
     request: &RegisterConnection,
@@ -97,7 +120,8 @@ pub fn registered_client(
         .client_by_connection(connection_id)
         .map(|(_, client)| client.resource_id.clone())
 }
-pub(crate) fn handle_client_disconnect(world: &mut World, connection_id: WebSocketConnectionId) {
+pub(crate) fn handle_client_disconnect(world: &mut World, event: &WebSocketDisconnected) {
+    let connection_id = event.connection_id;
     let entities = world
         .query_with::<Client>()
         .result()

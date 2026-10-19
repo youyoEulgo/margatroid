@@ -1,5 +1,5 @@
-use core_plugin::{Entity, Event};
-use resource_id_plugin::ResourceID;
+use crate::client_types::RegisteredClient;
+use core_plugin::Event;
 use server_plugin::WebSocketConnectionId;
 use std::fmt;
 
@@ -27,11 +27,6 @@ impl fmt::Display for ClientError {
     }
 }
 impl std::error::Error for ClientError {}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RegisteredClient {
-    pub client: Entity,
-    pub resource_id: ResourceID,
-}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientRegistrationResult {
     pub id: String,
