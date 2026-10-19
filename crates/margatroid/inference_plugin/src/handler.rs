@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::{AsyncTaskError, WorldAsyncExt};
+use client_plugin::WorldClientExt;
 use core_plugin::{Entity, World};
 use futures_util::StreamExt;
 use margatroid_types::agent_components::{Agent, AgentState};
-use margatroid_types::client_components::WorldClientExt;
 use margatroid_types::execution_components::{
     ExecutionActivity, ExecutionActivityKind, ExecutionError,
 };

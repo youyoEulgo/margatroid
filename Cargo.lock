@@ -1019,6 +1019,7 @@ version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "client_plugin",
  "closure_plugin",
  "core_plugin",
  "futures-util",

@@ -8,6 +8,7 @@ use crate::{
 };
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
 use async_runtime_plugin::WorldAsyncExt;
+use client_plugin::WorldClientExt;
 use config_plugin::{MargatroidConfig, WebSocketMessageTarget};
 use core_plugin::World;
 use log_plugin::{TracingStream, TracingStreamError};
@@ -28,11 +29,8 @@ use margatroid_types::{
     history_components::AgentHistoryHandle,
 };
 use margatroid_types::{
-    client_components::{Client, WorldClientExt},
-    client_events::ClientRegistrationResult,
-    mcl_events::MclCommandResult,
-    workspace_components::WorldWorkspaceExt,
-    workspace_events::*,
+    client_components::Client, client_events::ClientRegistrationResult,
+    mcl_events::MclCommandResult, workspace_components::WorldWorkspaceExt, workspace_events::*,
 };
 use server_plugin::{
     ServerFailed, ServerStarted, ServerStopped, WebSocketConnected, WebSocketConnectionId,

@@ -29,51 +29,109 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # 板块格式
 
-本文描述当前源码中的Client共享组件、注册握手和推流快照契约，并明确目标入口约束；不延续独立ResourceId组件。本次只读核对源码，未运行构建或测试；DTO Handler 重置后的整树恢复未验证，不把现有接口或测试源码当作端到端通过证据。
+```text
+# lib        src/lib.rs                                      Plugin、安装逻辑与 World 扩展
+# components types/src/client_components.rs                  Client 图书馆组件
+# events     types/src/client_events.rs                      注册结果事件
+# system     src/system.rs                                   注册与断开 System
+# handler    src/handler.rs                                  注册、断开与身份查询
+# types      src/types.rs                                    私有辅助定义
+# types pub  types/src/client_types.rs                       结果载荷与来源辅助函数
+# error      types/src/client_events.rs                      注册错误
+```
+
 
 # lib
 
 ## 类型
 
-公开，组件与World扩展声明和实现均位于共享client_components.rs：
+公开：
 ```text
-Client：已注册客户端，公开图书馆组件
-    resource_id: ResourceID--client:<type>/<name>:<connection_id>
-    connection_id: WebSocketConnectionId--服务端连接句柄
-    client_type: String--注册类型，webui用于推理发送器筛选
-    name: String--注册名称，缺省连接ID文本
-    impl Component for Client
-    impl LibraryComponent for Client
-        resource_id(&self) -> &ResourceID
-            读取身份：公开trait方法
-            行为：借用内部resource_id。
-
-WorldClientExt：客户端查询，公开trait
-    client_by_connection(&self, connection: WebSocketConnectionId) -> Option<(Entity, &Client)>
-        查询注册客户端：公开方法
-        行为：遍历Client匹配连接ID，返回完整Entity及Client借用，不存在返回None。
-    client_webui_senders(&self) -> Vec<WebSocketSender>
-        收集webui发送器：公开方法
-        行为：遍历已注册webui Client，通过Server共享连接接口取得Sender，按连接ID去重并克隆；缺失或断开忽略，无客户端为空。
-    impl WorldClientExt for World
-        World：公开trait实现，读取共享Client与Server连接契约，不依赖ClientPlugin Handler。
-
-ClientPlugin：注册生命周期插件，公开结构体
-    schedule: String
+ClientPlugin：客户端注册生命周期插件，公开结构体--管理注册与断开 System 的安装
+    schedule: String--私有，注册与断开 System 所属计划
+    new() -> Self
+        创建插件：公开关联函数
+        行为：schedule 使用 RuntimePlugin::UPDATE。
+    with_schedule(self, schedule: impl Into<String>) -> Self
+        指定计划：公开方法
+        行为：替换 schedule，返回修改后的插件。
+    impl Default for ClientPlugin
+        Default：公开trait实现
+        default() -> Self
+            行为：调用 Self::new()。
     impl Plugin for ClientPlugin
+        Plugin：公开trait实现
         build(self, app: &mut App)
-            安装插件：公开trait方法
-            行为：检查计划、连接查询设施及统一资源插件，注册LibraryComponent类型client，挂载注册与断开System，拒绝重复安装。
+            行为：
+                若 World 已持有 ClientPluginInstalled，则 panic，拒绝重复安装。
+                若指定 schedule 不存在，则 panic。
+                若 World 缺少 WebSocketConnections，则 panic，要求先安装 ServerPlugin。
+                若 World 缺少 ResourcePluginInstalled，则 panic，要求先安装 ResourcePlugin。
+                调用 register_library::<Client>("client")，失败则 panic。
+                向 World 插入 ClientPluginInstalled。
+                在指定计划依次添加 client_registration_system、client_disconnect_system。
+
+WorldClientExt：客户端查询扩展，公开trait--查询连接身份及 webui 发送器
+    client_by_connection(&self, connection: WebSocketConnectionId) -> Option<(Entity, &Client)>
+        查询连接身份：公开 trait 方法
+    client_webui_senders(&self) -> Vec<WebSocketSender>
+        查询已注册 webui 发送器：公开 trait 方法
+    impl WorldClientExt for World
+        WorldClientExt：公开trait实现
+        client_by_connection(&self, connection: WebSocketConnectionId) -> Option<(Entity, &Client)>
+            行为：
+                遍历挂有 Client 的 Entity，取得组件。
+                返回第一个 connection_id 匹配的完整 Entity 及 Client 借用；未找到返回 None。
+        client_webui_senders(&self) -> Vec<WebSocketSender>
+            行为：
+                若 World 不持有 WebSocketConnections，返回空列表。
+                创建连接 ID 去重集合。
+                遍历挂有 Client 的 Entity：
+                    忽略 client_type 不是 webui 的组件。
+                    忽略连接 ID 已进入去重集合的组件。
+                    将当前连接 ID 加入集合，取得对应 Server Sender。
+                    仅收集存在且尚未关闭的 Sender 句柄。
+                返回收集结果，不按 Workspace 隔离。
 ```
 
-## 逻辑
-
+私有：
 ```text
-Server拥有连接和发送器生命周期，Client只保存已注册身份与连接句柄
-Entity只挂Client图书馆组件，不挂独立ResourceId
-client_type及name是自报显示与路由数据，不是权限凭据；source由入口依据真实连接的已注册身份绑定
-推理在提交闭包前调用client_webui_senders取得全部快照，不按Workspace隔离，后来连接不补入
-发送器关闭或慢客户端由本次推流处理，无发送器不影响推理oneshot结果
+ClientPluginInstalled：插件安装标记，私有结构体--防止重复安装
+    impl Resource for ClientPluginInstalled
+        Resource：私有类型的资源标记实现
+```
+
+# components
+
+## 类型
+
+公开：
+```text
+Client：已注册客户端，公开图书馆组件--保存注册身份及连接关联
+    resource_id: ResourceID--公开，client:<client_type>/<name>:<connection_id>
+    connection_id: WebSocketConnectionId--公开，Server 连接句柄
+    client_type: String--公开，客户端自报类型
+    name: String--公开，客户端名称，缺省为连接 ID 文本
+    impl Component for Client
+        Component：公开组件标记实现
+    impl LibraryComponent for Client
+        LibraryComponent：公开trait实现
+        resource_id(&self) -> &ResourceID
+            行为：借用 self.resource_id。
+```
+
+# events
+
+## 类型
+
+公开：
+```text
+ClientRegistrationResult：客户端注册结果，公开事件--关联原注册请求与处理结果
+    id: String--公开，原注册请求 ID
+    connection_id: WebSocketConnectionId--公开，原注册连接 ID
+    result: Result<RegisteredClient, ClientError>--公开，注册成功载荷或分类错误
+    impl Event for ClientRegistrationResult
+        Event：公开事件标记实现
 ```
 
 # system
@@ -83,15 +141,20 @@ client_type及name是自报显示与路由数据，不是权限凭据；source�
 crate公开：
 ```text
 client_registration_system(world: &mut World)
-    注册System：crate公开System
+    处理注册事件：crate 公开函数
     处理事件：RegisterConnection
     产出事件：ClientRegistrationResult
-    行为：克隆本帧注册请求，逐个调用handle_client_registration，成功失败均发关联回执。
+    行为：
+        收集本帧 RegisterConnection 事件。
+        对每条事件调用 handle_client_registration。
 
 client_disconnect_system(world: &mut World)
-    断开System：crate公开System
+    处理断开事件：crate 公开函数
     处理事件：WebSocketDisconnected
-    行为：逐个处理断开连接，销毁对应Client，不替换已有推理闭包Sender快照。
+    产出事件：无
+    行为：
+        收集本帧 WebSocketDisconnected 事件。
+        对每条事件调用 handle_client_disconnect。
 ```
 
 # handler
@@ -100,74 +163,157 @@ client_disconnect_system(world: &mut World)
 
 crate公开：
 ```text
-handle_client_registration(world: &mut World, connections: &WebSocketConnections, request: &RegisterConnection) -> Result<RegisteredClient, ClientError>
-    处理注册握手：crate公开函数
+handle_client_registration(world: &mut World, request: &RegisterConnection)
+    处理注册请求：crate 公开函数
     行为：
-        校验请求ID、连接存在、client_type为非空小写ASCII字母数字及下划线或短横线
-        名称缺省连接ID文本，构造完整ResourceID并检查地址与名称冲突
-        更新连接元数据，通过统一受检图书馆入口创建并挂Client
-        准备失败不留下半注册实体；更新连接元数据失败返回关联错误
-        只有Client实体可查询后才返回注册成功，由System发回执，客户端随后才能发依赖身份的MCL请求
+        从 World 克隆 WebSocketConnections 句柄。
+        若连接设施存在，调用 register_client(world, &connections, request) 取得注册结果。
+        否则注册结果为 Err(ClientError::ConnectionMissing)。
+        若注册失败，记录 warning，包含请求 ID、连接 ID 及错误。
+        无论成功失败，发送 ClientRegistrationResult：
+            id、connection_id 来自原请求，result 使用注册结果。
 
-handle_client_disconnect(world: &mut World, connection: WebSocketConnectionId)
-    处理断开：crate公开函数
-    行为：销毁该连接Client，未注册连接无操作；连接关闭由Server处理，不取消已提交推理。
+handle_client_disconnect(world: &mut World, event: &WebSocketDisconnected)
+    处理断开事件：crate 公开函数
+    行为：
+        从 event.connection_id 取得断开的连接 ID。
+        查询全部 Client，收集 connection_id 与该连接 ID 匹配的 Entity。
+        销毁收集到的全部 Entity；没有匹配项则无操作。
+        不关闭 Server 连接，不取消已提交推理，也不修改已有 Sender 快照。
 ```
 
-# events
-
-## 类型
-
-公开，Client业务结果归共享client_events.rs；RegisterConnection及断开输入由server_plugin公开提供：
+私有：
 ```text
-ClientRegistrationResult：注册结果，公开事件
-    id: String
-    connection_id: WebSocketConnectionId
-    result: Result<RegisteredClient, ClientError>
-    impl Event for ClientRegistrationResult
+register_client(world: &mut World, connections: &WebSocketConnections,
+                request: &RegisterConnection) -> Result<RegisteredClient, ClientError>
+    注册客户端：私有函数
+    行为：
+        若 request.id 去除首尾空白后为空，返回 InvalidRequest。
+        若 valid_client_type(request.client_type) 为 false，返回 InvalidClientType。
+        若连接不存在或 Sender 已关闭，返回 ConnectionMissing。
+        若 client_by_connection 已找到该连接的 Client，返回 DuplicateClient。
+        将连接 ID 转为十进制字符串 fallback。
+        name 使用请求名称；未提供时使用 fallback。
+        构造 ResourceID("client", request.client_type, name, fallback)。
+        构造失败返回 InvalidResourceID。
+        查询该 ResourceID 的拥有实体，查询失败返回 ResourceSetupFailed。
+        若已存在拥有实体，返回 DuplicateClient。
+        遍历全部 Client，若任一 Client.name 等于 name，返回 DuplicateName。
+        保存连接原有 name 和 connection_type；缺省使用空字符串。
+        设置连接名称：
+            名称冲突返回 DuplicateName，其他设置失败返回 ConnectionMissing。
+        设置连接类型：
+            若失败，尝试恢复旧名称，返回 ConnectionMissing。
+        创建 Entity，构造 Client，保存 ResourceID、连接 ID、类型与名称。
+        通过 insert_library 将 Client 挂载到 Entity：
+            若失败，销毁 Entity，尝试恢复旧名称与旧类型，返回 ResourceSetupFailed。
+        再次检查连接是否存在且 Sender 未关闭：
+            若检查失败，销毁 Entity，尝试恢复旧名称与旧类型，返回 ConnectionMissing。
+        返回 RegisteredClient，包含已挂载 Client 的完整 Entity 与 ResourceID。
 
-RegisteredClient：注册成功载荷，公开共享结构体
-    client: Entity
-    resource_id: ResourceID
+```
+
+
+公开：
+```text
+registered_client(world: &World, connection_id: WebSocketConnectionId) -> Option<ResourceID>
+    查询注册身份：公开函数
+    行为：调用 client_by_connection，找到时克隆 Client.resource_id，否则返回 None。
+
+```
+
+私有：
+```text
+valid_client_type(value: &str) -> bool
+    校验客户端类型：私有函数
+    行为：仅当字符串非空，且所有字节都是 ASCII 小写字母、数字、下划线或短横线时返回 true。
 ```
 
 # types
 
-## 逻辑
-
 ```text
-MCL网络入口必须取得已注册Client ResourceID作为source；拒绝unregistered或客户端自行覆盖source
-直接请求也必须显式校验已注册Client、完整Entity generation及真实连接上下文，异步回执复检；不得隐式选择第一个Client/Agent/Workspace
-Driver宿主以真实Agent实例身份绑定source，不使用目标参数充当来源
-当前client_source仍导出且可产生unregistered字符串，只是旧格式辅助，不验证注册/连接/generation，不能作为入口source权威；相关端到端接线待恢复验证
-入口将text及arguments数组列表转换为MclInstruction，没有binding隐式单参数兼容
-WebSocket增量编码沿用客户端消息协议，关联请求ID与Agent，oneshot才是推理权威结果
+无私有辅助类型或函数，src/types.rs 保留为空。
+```
+
+# types pub
+
+## 类型
+
+公开：
+```text
+RegisteredClient：注册成功载荷，公开结构体--保存已注册实体及资源身份
+    client: Entity--公开，已挂载 Client 的完整实体句柄，包含 generation
+    resource_id: ResourceID--公开，该 Client 的规范身份
+```
+
+## 函数
+
+公开：
+```text
+client_source(client_type: Option<&str>, name: Option<&str>,
+              connection_id: WebSocketConnectionId) -> String
+    格式化来源文本：公开函数
+    行为：
+        若 client_type 与 name 均存在，返回 client:<client_type>/<name>:<connection_id>。
+        否则返回 unregistered:<connection_id>。
+        此函数仅拼接文本，不校验 ResourceID、注册状态、Entity generation 或连接存活，
+        不得用于替代真实注册身份查询。
 ```
 
 # error
 
 ## 类型
 
-公开共享契约：
+公开：
 ```text
-ClientError：注册错误，公开枚举
-    InvalidRequest
-    InvalidClientType
-    InvalidResourceID
-    DuplicateName
-    DuplicateClient
-    ConnectionMissing
-    ResourceSetupFailed
-    impl Clone + Debug + PartialEq + Eq for ClientError
+ClientError：客户端注册错误，公开枚举--不回显客户端敏感输入
+    InvalidRequest--注册请求 ID 为空
+    InvalidClientType--客户端类型不符合稳定标识符约束
+    InvalidResourceID--无法构造客户端资源地址
+    DuplicateName--客户端名称已占用
+    DuplicateClient--连接或资源地址已注册
+    ConnectionMissing--注册所需连接不存在或已关闭
+    ResourceSetupFailed--资源拥有者查询或图书馆挂载失败
     impl fmt::Display for ClientError
+        Display：公开trait实现
         fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
-            格式化错误：公开trait方法
-            行为：输出稳定错误分类，不回显敏感客户端输入。
+            行为：按变体向 formatter 写入固定文本，不包含客户端敏感输入：
+                InvalidRequest → "client registration request ID is empty"
+                InvalidClientType → "client type is not a stable identifier"
+                InvalidResourceID → "client resource id could not be built"
+                DuplicateName → "client name is already in use"
+                DuplicateClient → "client is already registered"
+                ConnectionMissing → "connection disappeared before registration"
+                ResourceSetupFailed → "client resource setup failed"
     impl std::error::Error for ClientError
+        Error：公开trait实现
 ```
 
-## 逻辑
+# 持有关系
 
 ```text
-注册失败必须有回执，不只写warning；Source绑定保证来源对应真实连接，不等同于身份认证或完整权限系统。
+App
+├── ClientPlugin（安装时消费）
+│   └── schedule: String
+└── World
+    ├── ClientPluginInstalled: Resource
+    ├── WebSocketConnections（共享连接设施句柄，连接生命周期由 Server 管理）
+    │   └── WebSocketSender（连接发送器句柄）
+    ├── Entity
+    │   └── Client: LibraryComponent
+    │       ├── resource_id: ResourceID
+    │       ├── connection_id: WebSocketConnectionId（关联连接，不拥有连接）
+    │       ├── client_type: String
+    │       └── name: String
+    └── ClientRegistrationResult: Event
+        ├── id: String
+        ├── connection_id: WebSocketConnectionId
+        └── result: Result<RegisteredClient, ClientError>
+            └── RegisteredClient
+                ├── client: Entity（完整句柄，不拥有实体）
+                └── resource_id: ResourceID
+
+调用方
+└── client_webui_senders() 返回的 Vec<WebSocketSender>
+    └── 调用时刻的发送器句柄快照（后续注册不补入，连接关闭可见）
 ```

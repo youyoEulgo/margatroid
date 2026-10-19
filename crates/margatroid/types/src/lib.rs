@@ -5,6 +5,7 @@ pub mod block_storage;
 pub mod block_types;
 pub mod client_components;
 pub mod client_events;
+pub mod client_types;
 pub mod discovery;
 pub mod dto_events;
 pub mod execution_components;
