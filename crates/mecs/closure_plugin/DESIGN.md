@@ -172,6 +172,9 @@ ClosureSystem：闭包System，私有结构体--只取得并执行目标为当�
     send_closure只能选择已挂载ClosureSystem的Schedule，绝不在运行时修改Schedule
     请求在发送后的下一次tick进入读取存储，再由目标ClosureSystem处理
     锁中毒属于不变量破坏，直接panic；已经被取得的闭包不会再次执行
+    同步闭包panic沿当前tick传播，不由ClosurePlugin捕获；本插件不提供排队闭包取消API
+    普通事件读取不消费事件；只有ClosureRequest内部的一次性闭包载荷通过take_for转移
+    单次Schedule执行后不再处理新请求；注册记录本身不会使阶段再次执行
 ```
 
 ## 职责

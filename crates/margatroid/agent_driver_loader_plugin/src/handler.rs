@@ -168,7 +168,7 @@ async fn read_text_bounded(path: &Path, maximum: u64) -> Result<String, DriverLo
         ))
     })
 }
-async fn read_driver_files(
+pub(crate) async fn read_driver_files(
     root: &Path,
     id: &ResourceID,
     limits: &AgentDriverLoadLimits,

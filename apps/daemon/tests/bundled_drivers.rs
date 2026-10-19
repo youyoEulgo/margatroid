@@ -160,7 +160,6 @@ fn start(app: &mut App, root: &Path, driver: &str) -> (Entity, Entity) {
         definition: WorkspaceDefinition {
             id: id("workspace:local/bundled-driver-test"),
             name: "bundled-driver-test".into(),
-            manager: "driver".into(),
             project_root: root.join("project"),
             agents: vec![WorkspaceAgentDefinition {
                 id: id("agent:local/driver"),
@@ -732,7 +731,6 @@ fn bundled_coder_and_reviewer_share_workspace_with_isolated_state() {
         definition: WorkspaceDefinition {
             id: id("workspace:local/bundled-pair"),
             name: "bundled-pair".into(),
-            manager: "coder".into(),
             project_root: root.join("project"),
             agents: ["coder", "reviewer"]
                 .into_iter()
@@ -1091,4 +1089,332 @@ fn bundled_driver_preserves_user_images_through_lua_history_and_restart() {
     );
     turn_done(&mut app, entity);
     stop(&mut app, workspace, entity);
+}
+
+#[test]
+fn registered_workspace_mutations_use_canonical_file_and_real_driver_lifecycle() {
+    use margatroid_types::workspace_catalog::{
+        WorkspaceCatalog, WorkspaceCatalogHandle, WorkspaceCatalogStore,
+    };
+    use margatroid_types::workspace_events::*;
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let directory = temp.path().join("workspaces/registered");
+    fs::create_dir_all(&directory).unwrap();
+    let document = directory.join("workspace.yaml");
+    fs::write(
+        &document,
+        format!(
+            "name: registered\nproject_root: {}\nagents: []\n",
+            project.display()
+        ),
+    )
+    .unwrap();
+    let store = std::sync::Arc::new(
+        compose::FileWorkspaceCatalogStore::new(temp.path().join("workspaces")).unwrap(),
+    );
+    let entry = store.list().unwrap().remove(0);
+    let mut app = app(&bundled_resources().join("agent-drivers"));
+    app.world_mut()
+        .insert_resource(WorkspaceCatalogHandle(store.clone()));
+    app.world().send_event(RefreshWorkspaceCatalog {
+        id: "catalog-refresh".into(),
+    });
+    tick_until(&mut app, "catalog refresh", |w| {
+        w.event_reader::<RefreshWorkspaceCatalogResult>()
+            .into_iter()
+            .find(|e| e.id == "catalog-refresh")
+            .map(|e| e.result.clone())
+    })
+    .unwrap();
+    tick_until(&mut app, "validated coder package", |w| {
+        w.get_resource::<margatroid_types::workspace_catalog::DriverCatalog>()
+            .filter(|catalog| catalog.contains(&id("driver:local/coder:latest")))
+            .map(|_| ())
+    });
+    app.world().send_event(AddWorkspaceMember {
+        id: "add-stopped".into(),
+        workspace_id: entry.id.clone(),
+        expected_revision: entry.revision,
+        member: WorkspaceMemberSpec {
+            name: "coder".into(),
+            driver: id("driver:local/coder:latest"),
+            home_root: Some(temp.path().join("home")),
+        },
+    });
+    let entry = tick_until(&mut app, "stopped member add", |w| {
+        w.event_reader::<AddWorkspaceMemberResult>()
+            .into_iter()
+            .find(|e| e.id == "add-stopped")
+            .map(|e| e.result.clone())
+    })
+    .unwrap();
+    assert!(app.world().query_with::<Agent>().result().is_empty());
+    let database = directory.join("agents/coder/state.sqlite");
+    assert_eq!(
+        entry.definition.as_ref().unwrap().agents[0].history_path,
+        database
+    );
+    assert!(!database.exists());
+    app.world().send_event(StartRegisteredWorkspace {
+        id: "start-registered".into(),
+        workspace_id: entry.id.clone(),
+        expected_revision: entry.revision.clone(),
+    });
+    let workspace = tick_until(&mut app, "registered start", |w| {
+        w.event_reader::<StartRegisteredWorkspaceResult>()
+            .into_iter()
+            .find(|e| e.id == "start-registered")
+            .map(|e| e.result.clone())
+    })
+    .unwrap();
+    let entity = app
+        .world()
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .iter()
+        .next()
+        .unwrap()
+        .1;
+    assert!(database.exists());
+    app.world().send_event(RemoveWorkspaceMember {
+        id: "remove-live".into(),
+        workspace_id: entry.id.clone(),
+        expected_revision: entry.revision,
+        member_id: id("agent:registered/coder:latest"),
+    });
+    let entry = tick_until(&mut app, "remove live member", |w| {
+        w.event_reader::<RemoveWorkspaceMemberResult>()
+            .into_iter()
+            .find(|e| e.id == "remove-live")
+            .map(|e| e.result.clone())
+    })
+    .unwrap();
+    assert!(!app.world().is_alive(entity));
+    assert!(entry.definition.as_ref().unwrap().agents.is_empty());
+    assert!(database.exists());
+    assert!(matches!(
+        app.world()
+            .get_component::<Workspace>(workspace)
+            .unwrap()
+            .state(),
+        margatroid_types::workspace_components::WorkspaceState::Running
+    ));
+    app.world().send_event(AddWorkspaceMember {
+        id: "readd-live".into(),
+        workspace_id: entry.id.clone(),
+        expected_revision: entry.revision,
+        member: WorkspaceMemberSpec {
+            name: "coder".into(),
+            driver: id("driver:local/coder:latest"),
+            home_root: Some(temp.path().join("home")),
+        },
+    });
+    let entry = tick_until(&mut app, "readd live member", |w| {
+        w.event_reader::<AddWorkspaceMemberResult>()
+            .into_iter()
+            .find(|e| e.id == "readd-live")
+            .map(|e| e.result.clone())
+    })
+    .unwrap();
+    let entity = tick_until(&mut app, "readded agent ready", |w| {
+        w.get_component::<Workspace>(workspace)
+            .unwrap()
+            .iter()
+            .next()
+            .and_then(|(_, e)| {
+                w.get_component::<Agent>(e)
+                    .filter(|a| matches!(a.state, AgentState::Idle))
+                    .map(|_| e)
+            })
+    });
+    assert_eq!(
+        entry.definition.as_ref().unwrap().agents[0].history_path,
+        database
+    );
+    stop(&mut app, workspace, entity);
+    assert_eq!(
+        app.world()
+            .get_resource::<WorkspaceCatalog>()
+            .unwrap()
+            .0
+            .len(),
+        1
+    );
+    assert!(!project.join(".margatroid").exists());
+    assert!(!fs::read_to_string(document).unwrap().contains("manager"));
+}
+
+#[test]
+fn real_member_and_workspace_rename_preserve_session_and_running_sibling() {
+    use margatroid_types::workspace_catalog::{WorkspaceCatalogHandle, WorkspaceCatalogStore};
+    use margatroid_types::workspace_events::*;
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let directory = temp.path().join("workspaces/renames");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("workspace.yaml"),format!("name: renames\nproject_root: {}\nagents:\n  coder:\n    driver: local/coder:latest\n  reviewer:\n    driver: local/reviewer:latest\n",project.display())).unwrap();
+    let store = std::sync::Arc::new(
+        compose::FileWorkspaceCatalogStore::new(temp.path().join("workspaces")).unwrap(),
+    );
+    let entry = store.list().unwrap().remove(0);
+    let mut app = app(&bundled_resources().join("agent-drivers"));
+    app.world_mut()
+        .insert_resource(WorkspaceCatalogHandle(store));
+    app.world().send_event(StartRegisteredWorkspace {
+        id: "rename-start".into(),
+        workspace_id: entry.id.clone(),
+        expected_revision: entry.revision.clone(),
+    });
+    let workspace = tick_until(&mut app, "rename workspace start", |w| {
+        w.event_reader::<StartRegisteredWorkspaceResult>()
+            .into_iter()
+            .find(|e| e.id == "rename-start")
+            .map(|e| e.result.clone())
+    })
+    .unwrap();
+    let members = app
+        .world()
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .iter()
+        .map(|(id, e)| (id.to_string(), e))
+        .collect::<Vec<_>>();
+    let coder = members
+        .iter()
+        .find(|(id, _)| id == "agent:renames/coder:latest")
+        .unwrap()
+        .1;
+    let reviewer = members
+        .iter()
+        .find(|(id, _)| id == "agent:renames/reviewer:latest")
+        .unwrap()
+        .1;
+    let sibling_instance = app
+        .world()
+        .get_component::<Agent>(reviewer)
+        .unwrap()
+        .lua
+        .instance
+        .clone();
+    command_to(
+        &mut app,
+        "agent:renames/coder:latest",
+        "seed-rename-context",
+        "INJECT ? TO session.conversation",
+        vec![serde_json::json!([{"type":"user","content":"persisted before rename"}])],
+    );
+    command_to(
+        &mut app,
+        "agent:renames/coder:latest",
+        "seed-rename-history",
+        "EMIT EFFECT history_append ?",
+        vec![serde_json::json!([{"type":"user","content":"persisted before rename"}])],
+    );
+    let original_history = history_messages(&app, coder);
+    assert_eq!(original_history.len(), 1);
+    app.world().send_event(RenameWorkspaceMember {
+        id: "rename-live-member".into(),
+        workspace_id: entry.id.clone(),
+        expected_revision: entry.revision,
+        member_id: id("agent:renames/coder:latest"),
+        new_name: "builder".into(),
+    });
+    let entry = tick_until(&mut app, "rename live member", |w| {
+        w.event_reader::<RenameWorkspaceMemberResult>()
+            .into_iter()
+            .find(|e| e.id == "rename-live-member")
+            .map(|e| e.result.clone())
+    })
+    .unwrap();
+    assert!(!app.world().is_alive(coder));
+    assert!(app.world().is_alive(reviewer));
+    assert_eq!(
+        app.world()
+            .get_component::<Agent>(reviewer)
+            .unwrap()
+            .lua
+            .instance,
+        sibling_instance
+    );
+    let builder = app
+        .world()
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .iter()
+        .find(|(id, _)| id.to_string() == "agent:renames/builder:latest")
+        .unwrap()
+        .1;
+    assert!(matches!(
+        app.world().get_component::<Agent>(builder).unwrap().state,
+        AgentState::Idle
+    ));
+    assert_eq!(history_messages(&app, builder), original_history);
+    let saved = messages(command_to(
+        &mut app,
+        "agent:renames/builder:latest",
+        "renamed-context",
+        "GET session.conversation",
+        vec![],
+    ));
+    assert!(
+        matches!(&saved[..],[AgentMessage::User{content,..}] if content=="persisted before rename")
+    );
+    stop_agents(&mut app, workspace, &[builder, reviewer]);
+    app.world().send_event(RenameWorkspace {
+        id: "rename-stopped-workspace".into(),
+        workspace_id: entry.id,
+        expected_revision: entry.revision,
+        new_name: "renamed-project".into(),
+    });
+    let entry = tick_until(&mut app, "rename stopped workspace", |w| {
+        w.event_reader::<RenameWorkspaceResult>()
+            .into_iter()
+            .find(|e| e.id == "rename-stopped-workspace")
+            .map(|e| e.result.clone())
+    })
+    .unwrap();
+    app.world().send_event(StartRegisteredWorkspace {
+        id: "start-renamed-project".into(),
+        workspace_id: entry.id.clone(),
+        expected_revision: entry.revision,
+    });
+    let workspace = tick_until(&mut app, "restart renamed workspace", |w| {
+        w.event_reader::<StartRegisteredWorkspaceResult>()
+            .into_iter()
+            .find(|e| e.id == "start-renamed-project")
+            .map(|e| e.result.clone())
+    })
+    .unwrap();
+    let members = app
+        .world()
+        .get_component::<Workspace>(workspace)
+        .unwrap()
+        .iter()
+        .map(|(id, e)| (id.to_string(), e))
+        .collect::<Vec<_>>();
+    let builder = members
+        .iter()
+        .find(|(id, _)| id == "agent:renamed-project/builder:latest")
+        .unwrap()
+        .1;
+    assert_eq!(history_messages(&app, builder), original_history);
+    let saved = messages(command_to(
+        &mut app,
+        "agent:renamed-project/builder:latest",
+        "workspace-renamed-context",
+        "GET session.conversation",
+        vec![],
+    ));
+    assert!(
+        matches!(&saved[..],[AgentMessage::User{content,..}] if content=="persisted before rename")
+    );
+    stop_agents(
+        &mut app,
+        workspace,
+        &members.into_iter().map(|(_, e)| e).collect::<Vec<_>>(),
+    );
+    assert!(!project.join(".margatroid").exists());
 }

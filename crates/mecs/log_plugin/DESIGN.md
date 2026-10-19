@@ -170,7 +170,7 @@ TracingRecord：tracing记录，公开结构体--TracingStream向外提供的结
     fields: Vec<TracingField>--字段，公开
     spans: Vec<String>--Span栈，公开
 
-TracingStream：诊断流，公开结构体--有界广播进程内tracing日志，可按target订阅SystemLog或EventLog
+TracingStream：诊断流，公开结构体--有界广播进程内tracing日志；subscribe接收全部通过Layer过滤的记录，订阅者可自行按target筛选
     sender: broadcast::Sender<TracingRecord>--发送端；私有
     new(capacity: usize) -> Self
         构造诊断流：crate公开关联函数，capacity指定广播通道容量
@@ -344,7 +344,10 @@ record_from_event<S>(event: &tracing::Event<'_>, context: Context<'_, S>) -> Tra
     默认配置只安装Console Layer，Console Layer同时处理SystemLog与EventLog
     用户显式配置的File Layer与TracingStream Layer也可按过滤规则处理EventLog
     非阻塞文件Writer的WorkerGuard由进程全局持有到进程结束
-    TracingStream有界且不反向阻塞tracing调用
+    显式filter完全覆盖level生成的指令，不叠加默认级别，不自动读取RUST_LOG
+    TracingStream有界且不反向阻塞tracing调用；新订阅无历史重放，无接收者直接丢弃，慢订阅者报告Lagged
+    诊断流不持久化、不保证可靠送达；文件输出需显式配置
+    应用守护进程的stderr加容量256诊断流是应用配置，不是框架默认配置
 ```
 
 # EventLog
@@ -412,11 +415,10 @@ event_log_system(world: &mut World)
     -> 使用固定EVENT_LOG_TARGET转换为tracing Event
     -> 已安装的tracing Layer按过滤规则输出
 
-HttpPlugin处理EventLog：
-    -> HttpPlugin向自己指定的Schedule添加http_event_log_system
-    -> http_event_log_system独立读取同一帧的EventLog
-    -> 按HttpPlugin的配置过滤并通过HTTP广播
-    -> 不修改tracing Subscriber，不影响event_log_system的读取
+业务转发EventLog：
+    -> 业务Plugin可向自己指定的Schedule添加System，独立读取同一帧EventLog并自行转发
+    -> 也可显式启用TracingStream并订阅投影后的tracing记录
+    -> ServerPlugin本身不自动订阅或广播日志，不修改tracing Subscriber
 
 约束：
     EventLog必须经过ECS事件队列，不能由System直接调用tracing宏替代

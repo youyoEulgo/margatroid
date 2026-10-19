@@ -9,6 +9,8 @@
 Axum 持有协议状态、连接和网络通道，ECS 持有同步状态并做业务编排。完整消息交给同步 System；
 需要等待的数据留在异步线程累积或转发。流分片不逐条进入事件队列，避免网络速率改变 ECS 帧语义。
 WebSocket 接收显式限制为每帧、每条消息 32 MiB，支持有界 base64 图片请求超过原默认单帧 16 MiB 的场景；媒体格式、数量及解码大小仍由业务层校验。
+当前 DTO 输入同样按 32 MiB 校验；HTTP 委托请求体默认上限仍为 8 MiB，可用
+`with_body_limit` 单独调整，不能把 WebSocket 上限当成 HTTP 上限。
 
 这里采用同步处理、异步累积：事件传递连接和流的状态，通道传递持续到达的数据。发送器可以
 复制给多个持有者，接收器只能转交；流 ID 确定支流，连接 ID 确定客户端。Axum 管理网络，
@@ -17,6 +19,8 @@ ECS 编排业务。
 `WebSocketMessageSender` 是不经过事件队列的直接发送终端。调用方先从 `WebSocketConnections`
 解析并固定一组 `WebSocketSender`，再与已经构造好的 `WebSocketMessage` 组成发送终端。同步 System
 使用 `try_send`，异步流式任务使用可等待的 `send`；该类型不解析业务 target，也不序列化业务协议。
+业务 target 的解释、应用管理器、工作区扫描、provider 路由与文件系统操作均由应用层负责；
+连接注册表只索引连接 ID、名称和类型，中央工作区或侧边栏设计不改变这一边界。
 
 ## 使用说明
 
@@ -243,7 +247,7 @@ fn name_new_connections(world: &mut World) {
 
 名称为空表示不具名；对已具名连接调用 `set_name(connection_id, "")` 会清除名称。
 命名时会在注册表写锁内查重。可以使用 `get(connection_id)` 按 ID 查找、使用
-`get_by_name(name)` 按唯一名称查找，或者使用 `unnamed()` 取得全部不具名发送器。
+`get_by_name(name)` 按唯一名称查找，或者使用 `get_unnamed()` 取得全部不具名发送器。
 连接可能在通知被处理前已经断开，此时查找返回 `None`，直接忽略即可。
 
 单次定向发送可以留在同步 System 中：
@@ -322,6 +326,7 @@ Plugin 仍可另外维护自己的索引。
 use core_plugin::World;
 use server_plugin::{HandshakeGuard, ServerOptions};
 
+#[derive(Debug)]
 struct LocalOnly;
 
 impl HandshakeGuard for LocalOnly {

@@ -41,17 +41,17 @@ types      src/types.rs      ResourceID、ResourceSet和类型注册表
 error      src/error.rs      解析、注册、挂载和查询错误
 ```
 
-**统一资源基础设施已实现。** 本crate继续使用resource_id_plugin名称，对外安装ResourcePlugin，合并旧resource_library_plugin和library_component_plugin职责；旧两个crate及其文档已移除，不再是workspace成员。ResourceID、集合、trait、注册与查询基础实现均在本crate，且仅依赖core_plugin和serde，可被共享types直接依赖而无业务反向依赖。
+**当前源码具有统一资源基础设施；catalog 与生命周期接线已恢复并完成对应验证。** 本crate继续使用resource_id_plugin名称，对外安装ResourcePlugin，合并旧resource_library_plugin和library_component_plugin职责；旧两个crate及其文档已移除，不再是workspace成员。ResourceID、集合、trait、注册与查询基础实现均在本crate，且仅依赖core_plugin和serde，可被共享types直接依赖而无业务反向依赖。
 
 # lib
 
 ## 组件定义位置
 
-领域图书馆组件和资源条目由共享types提供；五类条目目前组合在resource_components.rs，Agent、Workspace、Client分别有对应组件模块，本基础设施不依赖这些领域定义。
+领域图书馆组件和资源条目由共享types提供；Tool、Prompt、Sandbox和AgentDriver四类条目目前组合在resource_components.rs，Agent、Workspace、Client分别有对应组件模块，本基础设施不依赖这些领域定义。
 
 ResourceSet与组件trait实际位于本crate的components.rs；ResourceID在types.rs；ResourceTypeRegistry及受检注册、查询和WorldResourceExt在handler.rs。本crate作为纯基础层不依赖业务types，Plugin只安装资源和注册表，因此共享types使用这些契约不会形成循环。
 
-ResourceID等基础值与集合契约统一归共享基础类型层；共享types不能反向依赖资源插件实现。公开trait的关联类型及方法签名只能引用公开可见契约，不引用插件私有类型。
+ResourceID等基础值与集合契约归本基础crate；共享业务types直接依赖本crate的公开基础契约，不依赖业务插件实现。公开trait的关联类型及方法签名只能引用公开可见契约，不引用插件私有类型。
 
 ## 类型
 
@@ -135,20 +135,20 @@ MCL当前分类（不改变基础集合分类）：
     Skill与Hook资源类型、资源插件及专用执行入口已移除，指导正文也由普通Tool返回
     RESOURCE不再是目标Block字段类型，但ResourcesComponent和ResourceID基础概念不删除或改名
     Agent.import_bindings是alias命名权威，受检导入跨集合检查冲突；本插件不新增全局alias表
-    CallableResource与SandboxValue携带所属ID及不可变共享快照，旧Block值不因集合重载自动变更
+    CallableResource与SandboxValue携带所属ID及不可变共享快照；已返回typed值和已提交任务不因集合重载自动变更；持久SQLite Block存资源ID，后续GET按当前导入绑定解析
     snapshot的resource_id是来源关联，不要求资源条目T重复保存map key；二者职责不同
 
 trait的能力边界：
     LibraryComponent要求返回自身ID，但Rust trait不能强制某个具体字段名称
-    具体图书馆组件按约定包含resource_id: ResourceID字段
+    具体图书馆组件保存ResourceID；当前Agent字段名为resourceid，Workspace、Client使用resource_id，trait不强制字段名
     ResourcesComponent通过list_id列出集合内部ID，get_by_id按ID返回具体条目；resource_ids兼容基础查询
-    ResourceSet<T>通过map的键提供ID，五类资源条目T: ResourceInner通过get_alias返回alias；集合存储基本约束保持Send + Sync + 'static，不重复在T中存ID
+    ResourceSet<T>通过map的键提供ID，Tool、Prompt、Sandbox三类资源条目实现ResourceInner并通过get_alias返回alias；AgentDriver不实现ResourceInner；集合存储基本约束保持Send + Sync + 'static，不重复在T中存ID
     两个trait不是互斥机制，单个Entity只能有一个图书馆组件的检查由统一挂载入口完成
 
 ECS挂载边界：
     ResourceSet<ToolResource>与ResourceSet<AgentDriver>是不同具体组件类型，可以共存
     再次插入同一具体组件类型遵循ECS语义，替换整份旧组件，不自动合并集合
-    只更新一个资源条目时修改集合的对应键，不重新插入整份集合
+    只更新一个资源条目时，领域加载器克隆旧集合、替换对应键，再经受检insert_resources发布整份集合；保留其他键
     基础ECS的insert_component仍可能绕过检查；实现时所有领域图书馆挂载必须收口到受检入口
     本设计不声称trait本身能阻止底层任意插入，也不声称仅凭trait能强制每个裸Entity都有图书馆组件
 ```
@@ -175,10 +175,10 @@ ECS挂载边界：
 
 ## 函数
 
-crate公开：
+公开（由lib重导出）：
 ```text
 register_library_type<C>(world: &mut World, resource_type: &str) -> Result<(), ResourceError>
-    注册图书馆组件类型：crate公开函数
+    注册图书馆组件类型：公开函数
     约束：C: LibraryComponent
     行为：
         检查插件安装状态和resource_type格式
@@ -188,7 +188,7 @@ register_library_type<C>(world: &mut World, resource_type: &str) -> Result<(), R
         同一组件类型绑定不同地址类型或不同分类时也拒绝
 
 register_resources_type<C>(world: &mut World, resource_type: &str) -> Result<(), ResourceError>
-    注册资源集合组件类型：crate公开函数
+    注册资源集合组件类型：公开函数
     约束：C: ResourcesComponent
     行为：
         检查插件安装状态和resource_type格式
@@ -196,7 +196,7 @@ register_resources_type<C>(world: &mut World, resource_type: &str) -> Result<(),
         重复与冲突规则同register_library_type
 
 insert_library_component<C>(world: &mut World, entity: Entity, component: C) -> Result<(), ResourceError>
-    挂载图书馆组件：crate公开函数
+    挂载图书馆组件：公开函数
     约束：C: LibraryComponent
     行为：
         要求Entity存活、插件已安装、C已注册为Library分类
@@ -207,7 +207,7 @@ insert_library_component<C>(world: &mut World, entity: Entity, component: C) -> 
         失败时不改变原有组件
 
 insert_resources_component<C>(world: &mut World, entity: Entity, component: C) -> Result<(), ResourceError>
-    挂载资源集合：crate公开函数
+    挂载资源集合：公开函数
     约束：C: ResourcesComponent
     行为：
         要求Entity存活、插件已安装、C已注册为Resources分类
@@ -302,7 +302,7 @@ validate_tag(value: &str) -> Result<(), ResourceIDError>
 ```text
 组件注册、挂载与查询是同步API，不需要事件中转
 业务插件的加载、导入、启动和停止事件由共享types crate定义，本插件不代替它们制定流程
-ResourceID归共享基础类型层，资源插件实现依赖该共享契约；共享业务事件不反向依赖本插件或具体业务插件实现
+ResourceID归本基础crate；共享业务事件可依赖本crate公开契约，不依赖具体业务插件实现
 ```
 
 # types
@@ -386,7 +386,7 @@ ResourceSet<T>：同类资源集合，公开泛型结构体--作为一个组件�
             兼容基础查询：直接返回entries.keys()，不要求ResourceInner
 ```
 
-crate公开：
+公开：
 ```text
 ResourceTypeRegistry：资源类型注册表，公开共享Resource--定义于本基础crate的handler.rs--只保存类型关系和函数，不保存实例地址索引
     registrations: HashMap<String, ResourceTypeRegistration>--地址类型段到具体组件注册项
@@ -408,14 +408,14 @@ ResourceComponentKind：组件分类，公开共享枚举--定义于本基础cra
 ```text
 存储示例：
     Agent A Entity
-        Agent { resource_id: agent:demo/a:latest }
+        Agent { resourceid: agent:demo/a:latest }
         ResourceSet<ToolResource>
             tool:local/bash:latest -> ToolResource { alias, description, input_schema, script_path }
             tool:local/review:latest -> ToolResource
         ResourceSet<AgentDriver>
             driver:local/coder:latest -> AgentDriver
     Agent B Entity
-        Agent { resource_id: agent:demo/b:latest }
+        Agent { resourceid: agent:demo/b:latest }
         ResourceSet<ToolResource>
             tool:local/bash:latest -> ToolResource { alias, description, input_schema, script_path }
     查询tool:local/bash:latest返回Agent A和Agent B的Entity
@@ -428,7 +428,7 @@ ResourceComponentKind：组件分类，公开共享枚举--定义于本基础cra
     磁盘包可以仍位于全局路径，与每个Entity拥有自己的运行时条目不冲突
     重复IMPORT不因同ID已存在而跳过，仍重新加载；成功仅替换目标集合对应ID键，不自动覆盖其他Entity的条目
     合理安全补充：读取、校验或挂载失败保留原条目并返回失败，不能把旧条目当作本次加载成功
-    IMPORT的Agent许可由调用方按Agent.info.driver_dependencies完整ID精确匹配，无builtin例外；基础集合及加载插件不重复执行该领域许可检查
+    IMPORT许可按Agent.info.driver_dependencies完整ID精确匹配，无builtin例外；共享validate_resource_import在加载插件提交及挂载时调用Agent领域校验，基础集合自身不执行该许可检查
     alias属于所在Entity的本地使用名称，不属于全局ResourceID；消费方准备可见集合时不同ID的alias冲突必须失败，Inference与tool_call一致
     一份集合内一个ID对应一个条目；需要同一资源多个别名时须另行设计别名表，不用重复map键表示
 
@@ -507,3 +507,9 @@ ResourceError：资源管理错误，公开枚举
     Workspace等领域文档与本契约同步；基础设施不保留ResourceRef、独立驱动Entity或GC作为兼容目标
     本文不落实其他插件的字段迁移、事件改造、磁盘加载接口或执行快照实现
 ```
+
+## 名称派生地址与持久改名
+
+资源地址继续使用 `type:scope/name:tag`，Driver 使用 `driver:scope/name:tag`。Workspace 和 Agent 名称派生其地址；改名必须显式迁移已知的类型化持久命名空间、关联字段与历史查询元数据，不能只改显示名称或引入另一套稳定身份来规避迁移。迁移前 Workspace 必须停止，活动已收口，历史/数据库句柄已关闭；预检冲突与布局后再提交，失败保留可恢复的原数据。禁止对历史消息正文、脚本、提示、用户文件或未知字符串盲目替换。基础 ResourceID parser、集合及受检挂载不实现这项领域存储事务，迁移由 Workspace 与具体 catalog 存储实现承担，并有独立连续性与恢复测试。
+
+集中式 catalog 的主数据位于 `~/.margatroid/workspaces/<name>/workspace.yaml`，各成员独立使用 `agents/<agent-name>/state.sqlite`；项目路径是工作目录，不是另一份定义或数据库来源。manager 概念及 DTO manager 预检已移除，空成员工作区合法。

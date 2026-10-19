@@ -1,5 +1,7 @@
 # MCL Plugin
 
+> 审计边界：本次只读比对源码并修改文档，未运行测试/构建。下文“已实现”描述可见代码结构，不证明草稿、跨插件时序、平台行为或端到端接线已验收；未闭合能力必须按明确目标实现和验证。
+
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
 
@@ -7,7 +9,7 @@
 
 ## 轮次中止
 
-MCL已实现Idle/Working轮次effect、准备完成后的当前turn门、正常形状取消结果及finish清理校验。控制事件由AgentPlugin的PRE_UPDATE系统处理，不进入FIFO；自定义调度需确保控制先于本插件。完整跨插件规则及Driver分支见[设计](<DESIGN.md>)。客户端手工MESSAGE参数中的递归User INJECT在Working时拒绝；agent来源普通写入仍允许。别名/selector读取内容不作为用户消息入口，外部用户发送入口须使用受检手工参数。
+MCL已实现Idle/Working轮次effect、准备完成后的当前turn门、正常形状取消结果及finish清理校验。控制事件由AgentPlugin的PRE_UPDATE系统处理，不进入FIFO；MCL默认UPDATE，但Inference默认PRE_UPDATE，组合根必须实际保证控制先于MCL继续和所有领域受理，自定义调度亦然。完整跨插件规则及Driver分支见[设计](<DESIGN.md>)。客户端手工MESSAGE参数中的递归User INJECT在Working时拒绝；agent来源普通写入仍允许。别名/selector读取内容不作为用户消息入口，外部用户发送入口须使用受检手工参数。
 
 - Agent运行期由`Running`改为`Idle / Working`，保留Creating/Stopping。启动Idle；`start_turn`仅Idle生成turn并置Working，不覆盖；`finish_turn`在本轮真实清理完成后清turn并转Idle。重复Idle完成幂等，旧关联不能覆盖新Working。
 - abort为独立控制事件，先于MCL继续及推理/工具受理，不入FIFO。Working立即清turn但保持Working至Driver收尾；Working且turn=None重复abort幂等pending。协议目标`agent.turn.abort`要求非空turn_id，关联`agent.turn.abort_result`的Ok仅证明受理，不证明清理完成。前端及服务端用户消息受理均只允许Idle，Working只允许abort。
@@ -21,7 +23,7 @@ MCL已实现Idle/Working轮次effect、准备完成后的当前turn门、正常�
 
 运行时所有 Block 统一使用 Agent SQLite，不保留内存后端。`CREATE BLOCK` 创建或打开持久数据，`CREATE TEMP BLOCK` 使用完整启动实例隔离的数据；均异步返回 `BlockOpened { block_id, created, temporary }`，相同 schema 再次打开不清空数据。GET 多来源使用同一读事务，INJECT 全部来源与目标使用同一写事务。TOOL/SANDBOX 在数据库中只保存完整 ResourceID，读取后按命令开始时取得的 owned 导入快照解析当前定义；已提交领域任务保持自身快照。MESSAGE 保留原始 typed 消息及 Inject 容器。`history_append` 只写历史，不修改 Block。旧 effect `finish` 已拒绝，只接受 `finish_turn`。
 
-本轮 Driver 示例调整限于仓库根 Driver；驱动目录中的 Driver 未修改。详细设计仍按 lib、system、handler、events、types、error 六板块组织。
+Driver由现有AgentDriver包提供；示例不代替所有已发现驱动包的兼容性验收。详细设计仍按 lib、system、handler、events、types、error 六板块组织。
 
 ## 安装与执行
 
@@ -94,4 +96,4 @@ tool_call 第一参数必须恰好一条 Assistant，直接从其 tool_calls 提
 cargo test -p mcl_plugin
 ```
 
-当前 MCL 测试共 35 项通过（1 项单元、3 项解析、1 项宿主参数、26 项调度、4 项 typed 数组）。覆盖显式 typed IMPORT、alias/selector 拼接及混型空数组、同 ID 重命名与数据库 ID 读取当前定义、MESSAGE 原容器、创建/再次打开、TEMP bool、旧 finish 拒绝、typed 空数组、负索引及失败 INJECT 不修改保证；也覆盖 FIFO、真实推理/工具/IMPORT oneshot、ready 完整身份与回执/drained 时序、source/stop 取消、真实数据库 worker 阻塞期间保留 Other 活动、effect 全参数一次读取、审计不重复、无隐式 message 历史及未解决清理失败的 scope/drain 错误。
+本次仅审阅源码，未运行测试，不沿用旧测试数量或通过结论。既有测试目标包括显式 typed IMPORT、alias/selector 拼接及混型空数组、同 ID 重命名与数据库 ID 读取当前定义、MESSAGE 原容器、创建/再次打开、TEMP bool、旧 finish 拒绝、typed 空数组、负索引及失败 INJECT 不修改保证；也覆盖 FIFO、真实推理/工具/IMPORT oneshot、ready 完整身份与回执/drained 时序、source/stop 取消、真实数据库 worker 阻塞期间保留 Other 活动、effect 全参数一次读取、审计不重复、无隐式 message 历史及未解决清理失败的 scope/drain 错误。

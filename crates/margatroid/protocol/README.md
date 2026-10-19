@@ -1,91 +1,127 @@
 # Margatroid Protocol
 
-显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
+## 当前协议状态
 
+当前 catalog、注册启动、成员增删、工作区创建/改名/删除、成员改名、Driver 发现及后端目录浏览均已实现并完成恢复验证。验证仅覆盖已执行的 scoped、真实存储集成和隔离数据浏览器场景，不构成所有故障或环境的普遍保证。
 
-`margatroid_protocol` 定义 JSON DTO、纯转换以及只读、受检的 Workspace/Agent 逻辑寻址。领域组件、消息和指令来自共享 types，不依赖 Agent、MCL、Workspace 或 Memory 插件实现。
+## 信封、身份与关联
 
-## 用户轮次中止契约（已实现）
+客户端统一发送 `{type,id,message}`。id 必须非空且最多 512 UTF-8 字节；除 connection.register 外先完成连接注册。DtoPlugin 将 source 绑定到真实 Client ResourceID，不接受客户端提供 source、Entity、句柄、数据库路径或 Lua 源码。Client 的连接与完整 Entity generation 共同决定响应归属。
 
-独立控制协议已实现：DTO 入口解析当前 Workspace 成员和完整 VM 实例，发送共享 AbortAgentTurn；不恢复旧邮箱、中止查表或全局执行 pending。无 `get_turn`。
+资源地址使用 `ResourceIdDto` 字符串（兼容别名 ResourceIDDto），按共享 ResourceID 规范化；Driver 为 `driver:scope/name:tag`，没有 agent-driver 别名。Workspace/Agent 不存在 manager、默认首成员或 null 目标回退。
 
-- 请求：`{ "type":"agent.turn.abort", "id":"abort-1", "message":{ "workspace":{id,name,project_root}, "agent":null, "turn_id":"turn-1" } }`。`id` 为网络请求关联，`turn_id` 为必填非空的预期活动轮次；agent 为 null 时选择 manager，其余身份规则与 MCL 相同。
-- 回执：`agent.turn.abort_result { id, workspace, agent, turn_id, result }`；result 使用 `{"Ok":null}` / `{"Err":{kind,message}}`。Ok 仅确认中止已受理或该关联轮次已中止，不证明执行 cleanup 已结束；失败保留请求 id。仅回复发起连接，source 来自真实注册 Client。
-- 入口受检解析 Workspace 与当前成员的完整实例，实际处理再次核对 turn_id；旧/不匹配轮次不得取消新轮次。对同一已中止轮次（含 Working 且 turn=None）重复请求幂等成功，仅保留必要已中止关联，不恢复全局 pending 表；未识别轮次报关联错误。
-- 状态为 `creating/idle/working/stopping`。中止立即清空 turn，真实清理期间保持 Working，正常 finish 收口才 Idle；状态同步同时发布 turn 与 status。前端据 status 显示运行态、据 turn 关联中止，不能把回执或 turn=None 当作 Idle。
-- AgentPlugin 将 abort_agent_turn_system 固定安装到 RuntimePlugin::PRE_UPDATE，先于 UPDATE 中的 MCL 实际执行及 inference/tool admission。共享事件允许各消费者独立观察，不靠 take reply 独占中止通知；执行前再次核对请求轮次，turn=None 或已中止旧轮次不启动推理/工具而返回正常取消结果。
-- Assistant 新增 stop_reason，覆盖全部推理原因，新增 `StopReason::Cancelled` 序列化 `cancelled`。兼容保留 `InferenceResponse.stop_reason`，单一权威映射生成，两处始终相同。用户轮次中止且真实清理成功返回 Ok assistant：保留已接受的部分 `content` 与 `reasoning`（二者皆空则保持空值，不填充取消文案），`replay=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Cancelled`。
-- 取消工具且清理成功返回 Ok ToolCall：`failed=true`、`content="Tool call aborted."`，保留调用 ID、名称及已知 resource_id。批次保留已完成真实结果，其余每个调用（包括未启动项）各有一个原序结果；不虚构部分执行成功，不撤销已发生副作用。
-- `CleanupFailed` 仍为 Err，保留活动，不伪造取消或 Idle。用户轮次中止不同于根 Agent shutdown、owner abort、timeout、receiver closed，不统一转换这些原因。
-- 历史只经显式 history_append 保存；Assistant stop_reason 存入 payload 元数据而非 content。cancelled assistant 可入历史，不得进入 infer 上下文（包括 Inject 嵌套）。
+- 工作区注册操作使用 Workspace ResourceID。
+- MCL、历史、中止与停止的 workspace 使用 `{id,name,project_root}`，必须与当前实例相符。
+- MCL/history/abort 的 agent 必须是显式规范 Agent ID，且属于目标工作区；缺失或 null 返回可操作错误。
+- `agent_instance` 是当前完整 Entity generation 的不透明输出标识，只用于拒绝迟到结果，不授予入站寻址权。
 
-## 请求与身份
+除注册与既有 MCL 关联规则外，目录、变更、启动、停止、中止、目录浏览和 Driver 清单请求均使用独立内部 operation_id；网络 id 只在回执时还原。两个连接可复用同一网络 id，不能串回执；同一 Client 尚未完成的重复 id 拒绝。断连清除网络关联，不自动撤销已受理的领域操作，也不重建迟到关联。
 
-客户端信封为 `{ "type": "...", "id": "...", "message": {...} }`。支持：
+## 工作区目录与变更
 
-| type | message |
-| --- | --- |
-| `connection.register` | `{ client_type, name? }` |
-| `workspace.start` | `{ definition }` |
-| `workspace.stop` | `{ workspace }` |
-| `agent.turn.abort` | `{ workspace, agent?, turn_id }`，turn_id 必填非空 |
-| `mcl.command` | `{ workspace, agent?, command, arguments }` |
-| `state.query` | `{}` |
-| `history.query` | `{ workspace, agent? }` |
+| type | message | 成功回执 |
+| --- | --- | --- |
+| connection.register | `{client_type,name?}` | connection.registered |
+| workspace.catalog.query | `{}` | workspace.catalog |
+| workspace.catalog.refresh | `{}` | workspace.catalog |
+| workspace.start | `{workspace,expected_revision}` | workspace.started |
+| workspace.stop | `{workspace: WorkspaceReferenceDto}` | workspace.stopped |
+| workspace.member.add | `{workspace,expected_revision,agent:{name,driver,home_root?}}` | workspace.member.result |
+| workspace.member.remove | `{workspace,expected_revision,agent: ResourceIdDto}` | workspace.member.result |
+| workspace.create | `{name,project_root}` | workspace.member.result |
+| workspace.rename | `{workspace,expected_revision,new_name}` | workspace.member.result |
+| workspace.delete | `{workspace,expected_revision}` | workspace.member.result |
+| workspace.member.rename | `{workspace,expected_revision,agent: ResourceIdDto,new_name}` | workspace.member.result |
 
-除注册外必须已经注册。错误回执为 `request.failed { id, error: { kind, message } }`，错误正文最多 512 UTF-8 字节。注册成功为 `connection.registered { id, client: { resource_id, client_type, name } }`；失败为 `connection.register_failed { id, error }`。等待注册回执后再提交请求。
+所有 wire 字段使用上述 snake_case，特别是 `expected_revision`；不引入 expectedRevision。create 没有客户端修订号，服务端以“目标名称/目录不存在”为创建前提。其他定义修改核对最新源内容修订，冲突后刷新，不覆盖。变更及启动 DTO 拒绝未声明字段，不能在请求内附带 arbitrary definition/YAML/history_path。
 
-`workspace` 为 `{ id, name, project_root }`，三者必须与当前 Workspace 一致。`agent: null` 选择成员定义中的 manager；其他值必须是该 Workspace 当前成员的规范化资源地址。入站不接受 Entity index；出站 `agent_instance` 是包含 generation 的不透明实例标识，不授予寻址能力。
+`workspace.catalog {id,entries}` 返回全部注册项，包括 stopped、空成员及无效配置；query 读取最近目录快照，refresh 经存储服务重新扫描，不自动运行实例。
 
-Workspace definition 字段为 `id, name, project_root, manager, agents`。成员字段为 `id, name, driver, home_root, history_path`，不含旧资源可见性、Workflow 或 memory 配置。
+`WorkspaceCatalogEntryDto`：
 
-## MCL
-
-```json
-{
-  "type": "mcl.command",
-  "id": "mcl-1",
-  "message": {
-    "workspace": { "id": "workspace:local/demo:latest", "name": "demo", "project_root": "/project/demo" },
-    "agent": null,
-    "command": "GET msg.recent_conversation",
-    "arguments":[]
-  }
-}
+```text
+id: ResourceIdDto
+name: String
+path: String                         注册定义位置
+revision: String                     源内容版本；坏/缺失源不能伪造可用版本
+definition?: WorkspaceDefinitionDto
+error?: String
+lifecycle: stopped | starting | running | stopping | failed
 ```
 
-每个 `arguments` 项必须是数组，按顺序用于问号参数。一次请求仅一条 MCL 指令，不接受 Lua 源码。`source` 由 DTO 入口读取真实注册 Client 的资源地址，客户端不能提供。
+有效定义为 `{id,name,project_root,agents:[{id,name,driver,home_root}]}`，无 manager、history_path 或 memory_path。定义有效性与运行状态分开；配置失效或整个 home 消失时仍须保留尚存 live 实例的诊断。运行事实不能从 SQLite/历史是否存在推断。
 
-结果仅发送到发起连接：`mcl.command_result { id, source, target, result, history_error }`。`result` 保留 Rust Result 的 `{"Ok": ...}` / `{"Err": {kind,message}}` 形状及 MclValue 类型标签。Inference 结果保留 `stop_reason`、完整 assistant 和 usage；`history_error` 仅报告取消等指令审计附带失败；message 历史需要另发显式 history_append，失败通过该请求的 result 返回，不表示需要重做推理或工具。
+`workspace.member.result {id,entry,error?}` 是统一定义变更结果：
 
-Rust 构造 API：`ClientMessage::mcl_command(id, &workspace, agent, command, Vec<Value>)`，最后一项是 arguments，不是旧 binding。
+- 保存/重命名成功：entry 为更新的权威目录项，省略 error。
+- 失败：entry=null 且有结构化 error；错误需区分持久失败、停止失败及已停止但配置未提交的部分完成事实。
+- **删除工作区成功：entry=null，省略 error。** 不能把删除后查不到条目合成为失败。客户端随后以权威 catalog 确认移除。
+- 新成员定义已保存但启动失败不反转持久成功；运行失败由 member_failures、Agent 状态与日志表达。
 
-## reasoning replay
+共享 WorkspaceDeletion 是内部可恢复移除结果，不要求独立删除 wire，也不暴露内部回收文件位置。Workspace 重命名/删除要求无 live 实例；成员重命名/删除须先完成必要的 stop/drain。真正持久迁移与回收由生命周期和存储能力负责，不由 Protocol 转换执行。
 
-Assistant的 `replay: Option<serde_json::Value>` 在AgentMessageDto与领域消息之间双向保留（包括Inject内嵌），缺字段默认None。它是不透明JSON信封 `{ "api_format": "messages" | "responses", "items": [...] }`：Messages保存thinking文本/signature及redacted_thinking.data，Responses保存reasoning item id、summary及可用content/encrypted_content。Protocol不解释、改写或伪造这些API字段；推理格式边界检查标签及内容并拒绝不兼容重放。结果与显式历史payload保留replay，显示reasoning和正文不代替它。Responses每次完整本地上下文，store=false并请求reasoning.encrypted_content；不依赖远端conversation。User和ToolCall结果的content仍为String，图像单独保存在images。
+## 新建工作区的项目目录选择
 
-## 消息、状态与历史
+项目路径属于 daemon 所在机器，不能使用浏览器上传目录的名称推测主机绝对路径。
 
-`AgentMessageDto`（亦可用 `MessageDto` 名称）是 snake_case `type` 标签的递归消息值：`inject`、`system`、`user`、`assistant`、`tool_call`、`error`。Inject 可递归包含全部同类消息；转换限制深度 32、节点 4096、非图像序列化大小 1 MiB，不采用旧内层白名单。Assistant 包含可选 replay（旧消息缺失为None）、可选 stop_reason（旧消息缺失时为 None）和可选 usage；ToolCall 的 resource_id 可为 null。允许消息形状不表示网络入口有权伪造工具完成事实。
+```text
+workspace.paths.query
+    message: { path?: String, cursor?: String }
+workspace.paths
+    { id, path: String, parent: String|null,
+      directories: [{ name: String, path: String }], next_cursor?: String }
+```
 
-`state.sync { state }` 包含 `workspaces, agents, histories`。Agent 快照包含 `workspace, agent, agent_instance, status, turn, sandbox, queued_commands, pending_command`；status 为 creating/idle/working/stopping，与共享 AgentState 一致。历史来自 `Agent.history.list()`，不是旧实时 Memory/HistoryMessage 接口。
+path 省略时从 daemon HOME 开始；给定时必须为可读的绝对目录，后端返回规范化绝对 path、父目录及子目录。只列目录，不读文件内容、不创建目录；按名称稳定排序并有界分页（每页最多 200 项）。cursor 为不透明分页位置，绑定规范路径和目录页版本；路径变化/失效时返回错误，不能重用旧 cursor 拼接另一目录。子目录枚举跳过符号链接；手动指定的绝对路径通过 canonicalize，可解析符号链接并返回目标规范目录。每次最多检查 20,000 个目录项，超限返回错误。无法读取、目录消失、无效 cursor 均返回关联 request.failed。
 
-历史消息字段为 `key, sequence, turn, kind, content, payload, created_at_ms`，payload 保留结构化消息、usage、命令及参数；包含可选 stop_reason 元数据，不能混入 content。sequence 是 list 顺序的 1-based 投影，created_at_ms 保留共享 HistoryRecord 的真实创建时间；旧记录的 0 表示未知，前端不将其显示为 epoch。 `history.result { id, history }` 返回相同历史投影。
+入站由共享 QueryProjectDirectories 及结果关联，实际 I/O 由组合根注入的只读 ProjectDirectoryBrowser 能力在 blocking worker 执行。Protocol 只做 DTO 和纯转换。该接口不是认证机制；注册与入口策略不代替主机权限。选择后 workspace.create 仍重新校验现存项目根，不信任旧浏览结果。
 
-推理流使用 `agent.message.delta` / `agent.message.reasoning_delta`，字段为 `id, agent, agent_instance, sequence, content`。id 是推理请求 ID，不是 turn。`agent.message.finished { id, agent, agent_instance, error }` 标记流终态；流及终态仅供渲染，MCL Result/领域 oneshot 才是操作完成权威。
+## 可用 image / AgentDriver 清单
 
-## 已归档的旧协议
+image 是界面用词，对应现有 AgentDriver 包，不是模型路由或运行 Agent。
 
-旧 `agent.message` 邮箱、旧 `agent.turn.abort` 查表实现、visibility、Workflow 入口及 `binding` 均已移除。上文同名中止控制使用新的共享事件，不复活旧实现；Working 状态也不恢复旧生命周期。默认/动态可见性、AgentTokenUsage 副本与完整消息作为流完成标志的旧描述仍不适用。
+```text
+driver.catalog.query        message: {}
+driver.catalog.refresh      message: {}
+driver.catalog              { id, drivers: [ResourceIdDto], errors: [{path,message}] }
+```
 
-## Workspace 成员启动失败隔离契约
+query 返回最近已验证快照，refresh 通过 loader 的受检扫描重新检查安装包；启动时同样建立清单。包括从未挂载到任何 Workspace 的有效包，不以 ResourceSet 挂载历史充当安装目录。只对外公开规范 Driver ID 及包错误诊断，不公开源码、依赖、模型设置或凭据。无可用包返回空列表，不假造默认驱动。真正加载和新增成员时仍重新验证所选资源。
 
-Workspace 自身定义校验、创建或执行线程创建失败才返回 StartWorkspaceResult::Err；创建前失败不占用新地址，重复地址保留旧实例并报告其 ID、状态、成功成员数及失败成员数，不覆盖或自动附着。初始驱动和成员请求全部结束后，即使全部成员失败也进入 Running 并返回 Ok，成员失败不得关闭提交门。
+`state.sync.state.drivers` 同步有效地址数组，缺字段按 `[]`、空列表可省略；刷新失败保留最后确认快照并返回本次错误，不宣称已成功检查最新文件。
 
-Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>；失败值包含 driver 与 error，工作区身份由所属组件提供。这是持久到该工作区停止的失败诊断，不是重复 Agent 生命周期表。每个失败成员产生 WorkspaceMemberStartFailed，携带 workspace Entity、workspace_id、agent、driver、error；共享驱动失败按成员展开，动态创建失败同样记录并通知，成功加入清除该成员旧失败。Stopping 中已受理动态创建失败只结束等待，不污染健康工作区的停止结果。
+## 状态、历史与流
 
-WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。
+`state.sync {state}` 的 state 包含 `catalog,workspaces,agents,histories,drivers`。catalog 是全部注册项，workspaces/agents 是真实运行实例。WorkspaceInfoDto 为 `{id,name,project_root,agents,member_failures?}`；member_failures 各项 `{agent,driver,error}`，空列表可省略。一个或全部成员启动失败不使已经建立的 Workspace 伪报未启动。
 
-## 用户及工具结果图像契约
+AgentStateDto 包含 `workspace,agent,agent_instance,status,turn,sandbox,queued_commands,pending_command`，可含 context_window_tokens 和 error。status 为 creating/idle/working/stopping，不增加虚假的 failed Agent 生命周期。Driver/清理错误通过 error 表达，不能由 turn=null 推断 Idle。
 
-User与ToolCall执行结果保持 `content: String`，增加 `images: Vec<UserImage>`；缺少images反序列化为 `[]`，空数组序列化省略。`UserImage { media_type: String, data: String }` 中data是规范标准base64（含必要padding），不是data URL；允许image/png、image/jpeg、image/gif、image/webp。每条User或ToolCall结果最多8张，每张解码后最多5 MiB，总计最多20 MiB。共享公开函数 `validate_user_images(images: &[UserImage]) -> Result<(), String>` 在解码前检查数量、编码长度及解码长度上界，再严格验证base64及与MIME一致的PNG/JPEG/GIF/WebP魔数，不执行完整图像解码。错误只含索引、限制和原因，不回显base64。公开serde辅助函数 `deserialize_user_images` 供共享消息及边界复用；领域User和ToolCall结果反序列化也调用共享验证，覆盖直接MCL/Lua/持久化入站；Protocol入站递归转换调用共享验证，出站原样保留images；MESSAGE、Lua及历史payload保留图像，不将base64拼入正文。协议原有1 MiB非图像消息限制独立保留，图像编码单独按上述限制计量。
+`history.query {workspace,agent}` 返回 `history.result {id,history}`，历史当前从目标 live Agent 的 history 句柄读取，不承诺停止工作区的离线历史查询已存在。HistoryMessageDto 包含 key、1-based list 顺序 sequence、turn、kind、content、payload、created_at_ms。正文与元数据分开；旧时间 0 表示未知，不以迁移时间或当前时间回填。注册信息和历史存在不证明当前运行。
+
+流使用 agent.message.delta / agent.message.reasoning_delta，字段 `{id,agent,agent_instance,sequence,content}`；类别由 type 表达，无额外 kind 字段。id 是推理请求 ID，不是 turn。agent.message.finished `{id,agent,agent_instance,error}` 标记流终态；流和 finished 只服务显示，领域 oneshot/MCL 结果才是操作完成权威。
+
+## MCL 与消息值
+
+`mcl.command {workspace,agent,command,arguments}` 一次一条指令。每个 arguments 元素必须为数组，按顺序对应问号；无问号用空数组。id 在外层信封，不是 MclCommandDto 内层字段。source 来自真实注册 Client。
+
+`mcl.command_result {id,source,target,result,history_error}` 只回发起连接；result 保留 `{"Ok":...}` / `{"Err":{kind,message}}` 和 MclValue 标签。GET 出站 Message/Tool/Sandbox 为安全投影：TOOL 只有 resource_id/alias/description/input_schema，SANDBOX 只有 resource_id，不泄漏脚本路径或策略。出站对象不能绕过入站的导入绑定和类型检查。
+
+AgentMessageDto 是共享消息的递归投影：System、Inject、User、Assistant、ToolCall 结果、Error。Assistant 输入调用元素 ToolCall 与执行结果消息 ToolCall 不混同；允许序列化消息不代表外部请求可伪造执行完成。AgentMessageDto 转换限制深度 32、节点 4096、非图片序列化大小 1 MiB；这不等同于整个 MCL 信封的入口上限。DTO 入口另有总 32 MiB 限制，直接 MCL 手工消息仍要通过共享消息校验。
+
+User/ToolCall 保持 content:String，images 是独立 `{media_type,data}` 数组。data 为含必要 padding 的标准 base64，不是 data URL；允许 PNG/JPEG/GIF/WebP，每条最多 8 张、单张解码 5 MiB、合计 20 MiB。共享 validate_user_images/deserialize_user_images 在解码前检查预算，随后检查 base64 与 MIME 魔数，不完整解码图片；错误不回显数据。空 images 省略、旧消息缺字段为[]。历史与 Lua 保留 images，不把数据混入正文。真实工具结果来自执行 oneshot。
+
+replay 为 Assistant 可选不透明 JSON `{api_format,items}`，缺字段 None，往返与显式历史原样保留。Messages 保留签名/遮蔽 thinking，Responses 保留 reasoning ID、summary、content 和加密值；Protocol 不伪造、不解释。格式边界检查兼容性；Responses 每次本地完整上下文、store=false，不依赖远端会话。
+
+## 中止契约
+
+agent.turn.abort `{workspace,agent,turn_id}` 为独立控制请求，完整实例/预期 turn 校验后触发匹配 turn_cancel，不排在 MCL FIFO 中。abort_result 回显 id/workspace/agent/turn_id 及 Result；Ok 只证明受理，不证明清理结束。Working 中清 turn 后仍是 Working，直到真实清理及 Driver finish_turn 才 Idle。重复中止只按当前实例保留的关联幂等，不取消随后新轮次。
+
+组合根必须把 Agent 控制系统放在域操作 admission 之前：daemon 使用 PRE_UPDATE 中止、UPDATE 推理/MCL/工具；自定义调度不能假定各插件默认计划自动保证这一点。
+
+用户取消推理在本地 worker abort+join 后返回累计 reasoning/content 的 cancelled Assistant；无输出保持空值，无工具调用、replay 或伪造 usage。普通结束原因、根关闭、owner abort、timeout、receiver closed 和 CleanupFailed 仍须区分。工具取消保留调用 ID/顺序与已知资源，failed=true，正文 Tool call aborted.；已完成项保留真实结果。历史只由显式 history_append 写入；取消 Assistant 可入历史但不可入推理上下文（含嵌套 Inject），工具结果仍按规则入上下文。
+
+前端点击立即冻结显示只是本地显示屏障，不是清理事实；最终权威历史可补齐服务端断流前接受的部分输出。cancelled 不染红、不添加标签、不补 Turn aborted.。本地断连不保证供应商停止远端计算或计费。
+
+## 错误与验证边界
+
+ProtocolErrorDto `{kind,message}` 保留请求关联，message 最多 512 UTF-8 字节且不含凭据或图片正文。无效/未注册/目标不存在/重复/版本冲突等不能静默丢弃。结构错误有可用 id 则 request.failed；无法关联以协议关闭反馈。当前 scoped 验证覆盖对应路由与请求关联；持续回归边界包括：同网络 id 跨客户端隔离、重复在途拒绝、断连不串回执、空 managerless 工作区、显式 Agent、超过 1 MiB 的图片请求、目录/驱动/路径选择、所有变更结果及失败/未知提交语义。

@@ -32,7 +32,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 ## 源码归属与当前状态
 
-本文件描述已实现的加载、明确类型导入及主线程受检发布插件。源码按lib、system、handler、types组织，files为私有路径与读取辅助模块；所有业务及内部事件统一位于共享types，不存在插件events.rs。
+本文记录当前源码中的加载、明确类型导入及主线程受检发布契约；本次只读核对源码，未运行测试。DTO Handler 重置后的整树恢复尚未验证，源码或测试存在不代表端到端已恢复或当前测试通过。源码按lib、system、handler、types组织，files为私有路径与读取辅助模块；所有业务及内部事件统一位于共享types，不存在插件events.rs。
 
 组件实际归属共享`types/src/resource_components.rs`，模块路径为`margatroid_types::resource_components`；全部加载事件与错误实际归属`types/src/resource_events.rs`，模块路径为`margatroid_types::resource_events`。并非每类资源单独一个components或events文件。统一ResourceID、ResourceSet、LibraryComponent及注册入口归resource_id_plugin。
 
@@ -127,7 +127,7 @@ handle_mount_prompt_resource(world: &mut World, output: PromptResourceReadOutput
     借用既有ResourceTypeRegistry预检component_type、Resources分类及全部条目地址；不复制registry，ResourceSet按ID键存储，不添加重复ID
     核对ImportedValue身份和kind，保存原ImportBindings，再调用agent_bind_import；随后受检insert_resources发布集合
     insert_resources错误不修改集合，helper精确恢复本次主线程步骤前的ImportBindings；任何读取、声明、alias或挂载失败均保old set/binding
-    None仅受检发布集合，不构造或修改binding；成功重载后新GET读取新快照，已取出的Block保持旧快照
+    None仅受检发布集合，不构造或修改binding；成功重载后新GET读取新快照，已返回的typed值与已提交任务保持原快照；持久SQLite Block保存资源ID，后续GET按当前导入绑定解析
     插入完成后take一次Sender发送Ok，并发布LoadPromptResourceResult观察事件；随后mark_completed原activity
 
 handle_prompt_resource_task_failed(world: &mut World, task: PromptResourceTaskError)
@@ -137,7 +137,7 @@ handle_prompt_resource_task_failed(world: &mut World, task: PromptResourceTaskEr
 
 ## 共享公开辅助函数
 
-下列辅助实际定义在共享resource_events模块，由五类加载器复用，不是插件私有Handler，也不复制资源注册表。
+下列辅助实际定义在共享resource_events模块，由Tool、Prompt、Sandbox三类加载器复用，不是插件私有Handler，也不复制资源注册表。
 
 ```text
 validate_resource_import(world: &World, target: Entity, resource_id: &ResourceID, alias: &str, kind: Option<InnerType>) -> Result<(), ResourceLoadError>
@@ -247,9 +247,9 @@ read_text(path: &Path, maximum: u64, cancelled: impl Fn() -> bool) -> Result<Str
 边界与测试：
     忽略非必要目录项，拒绝必要路径及祖先symlink；不承诺对恶意并发目录替换的原子快照或TOCTOU防护
     不编译Lua、不创建runner、不改LibraryComponent、不管理激活或资源GC；Entity销毁时集合自然释放
-    测试覆盖加载成功、重复读取alias更新、失败保旧、取消前/挂载前取消、完整target复用、独立目标alias、其他key保留、reply幂等、监督错误、限长、UTF-8与symlink
-    Tool额外覆盖无效schema与外部ref；资源加载阶段不执行Lua
-    Tool、Prompt、Sandbox三插件联合导入回归覆盖typed GET、错误类型/alias冲突与依赖失败保旧、改名移除旧alias、旧Block快照、取消不绑定、普通加载不绑定；Prompt验证角色忠实，Sandbox验证活动忙时纯重载不改选中快照
+    既有测试源码描述加载成功、重复读取alias更新、失败保旧、取消前/挂载前取消、完整target复用、独立目标alias、其他key保留、reply幂等、监督错误、限长、UTF-8与symlink
+    Tool测试源码另描述无效schema与外部ref；资源加载阶段不执行Lua；这些测试本次均未运行
+    Tool、Prompt、Sandbox三插件联合导入回归源码描述typed GET、错误类型/alias冲突与依赖失败保旧、改名移除旧alias、已返回值/任务快照与持久Block后续GET解析当前绑定、取消不绑定、普通加载不绑定；Prompt验证角色忠实，Sandbox验证活动忙时纯重载不改选中快照
     CallableResource的Arc冻结元数据及文件路径，不冻结文件内容；不承诺以后按路径执行仍是导入时script版本或多文件原子快照
 ```
 
@@ -281,10 +281,10 @@ PromptResourceLoadError：兼容公开别名--等同ResourceLoadError
 PromptResourceLoadErrorKind：兼容公开别名--等同ResourceLoadErrorKind
 ```
 
-## 可操作的加载诊断
+## 可操作的加载诊断（目标与当前缺口）
 
 加载失败必须保留完整 ResourceID、实际尝试的绝对文件或目录路径，以及底层 I/O、UTF-8、清单解析或校验原因；不得用笼统的“读取失败”覆盖原因，也不得在添加上下文时截断路径或原因。逐祖先检查失败同时保留最终尝试路径和失败的祖先路径。
 
 依赖加载器在原有错误外添加资源上下文，保留上层调用方已经提供的依赖链（包括请求 id 中的关联链）；本插件不凭空推断驱动来源，也不递归加载依赖。调用方应将 `driver -> dependency` 链追加在本错误之外；Driver 清单声明的依赖仍只解析地址，不检查存在性。缺失依赖由对应 tool、prompt 或 sandbox 加载器报告其自身完整地址及实际绝对路径。
 
-错误在异步读取、主线程挂载及业务回执之间传播时保留原分类和原因；诊断文本不再受插件的旧 512 字节/字符截断限制，公共错误类型不变。回归测试覆盖缺失驱动目录、缺失 driver.toml/base.lua，以及缺失各类依赖文件。
+目标是错误在异步读取、主线程挂载及业务回执之间传播时完整保留原分类和原因。本插件files辅助直接构造错误并保留读取/路径/上下文全文；共享导入与挂载校验使用的 `ResourceLoadError::new` 仍截取前 512 个 Unicode 字符，经过该构造器的诊断可能丢失路径或底层原因，尚不满足完整诊断目标；不得宣称已取消截断。缺失驱动目录、driver.toml/base.lua 与各类依赖文件的完整诊断仍需恢复后分别验证，本次未运行回归。

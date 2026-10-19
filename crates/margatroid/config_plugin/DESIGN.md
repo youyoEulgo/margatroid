@@ -29,7 +29,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # 板块格式
 
-每个 crate 的 DESIGN.md 在伪代码格式之后使用六个一级标题，按 `lib`、`system`、`handler`、`events`、`types`、`error` 顺序组织。每个标题对应 `src/` 下的同名 Rust 文件：
+本文在伪代码格式之后使用六个一级标题，按 `lib`、`system`、`handler`、`events`、`types`、`error` 顺序组织。板块是职责划分；公开配置与解析在 types，共享出站目标类型定义在 margatroid_types::dto_events 后由本crate重导出：
 
 ```text
 # lib        src/lib.rs        图书馆组件与 Plugin
@@ -44,7 +44,9 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 lib 只放 Plugin 与安装逻辑。MargatroidConfig 是配置 Resource，放在 types。
 
-模型配置职责：config.toml继续只保存Server、日志与出站策略；模型路由唯一来源是InferencePlugin读取的models.toml。已实现provider与api_type共同选择执行分支：provider必填Vendor（openai/anthropic/deepseek/openrouter），api_type仅chat_completions/messages/responses。明确七组合为2+1+3+1；矩阵、凭据、API前缀和厂商选项校验均归InferencePlugin，失败重载保留旧routes和安全catalog。本crate不维护重复路由/adapter，不依赖其实现类型。主目录两条路由已迁移chat_completions，保留各自provider及凭据；不在此文档回显秘密。
+模型配置职责：config.toml只保存Server、日志与两类出站策略；模型路由唯一来源是InferencePlugin读取的models.toml。路由矩阵、凭据与执行分支校验属于InferencePlugin，本crate不维护重复路由或adapter。本文未检查或修改任何主目录私有配置，不宣称凭据或路由已迁移。
+
+catalog、注册启动和成员管理接线已恢复并完成对应验证；创建、重命名、删除及发现能力已接通。验证结论限于实际执行场景，不将 API 存在或历史测试等同于普遍可用性保证。
 
 ## 类型
 
@@ -71,8 +73,7 @@ daemon
     -> ConfigPlugin::open(<data_root>/config.toml)
     -> 读取server_bind构造ServerPlugin
     -> 安装MargatroidConfig Resource
-        -> DtoPlugin读取logs、backend_state和member_messages
-        -> InferencePlugin读取streaming_member_messages
+        -> DtoPlugin读取logs和backend_state
 ```
 
 空板块：
@@ -139,7 +140,7 @@ IngressPolicy：入口策略，公开枚举--Localhost | Any | Addresses(Vec<Cid
     impl HandshakeGuard for IngressPolicy
         实现：把evaluate交给server_plugin的握手接缝
 
-WebSocketMessageTarget：WebSocket消息目标，公开枚举--保存尚未解析为连接发送器的目标
+WebSocketMessageTarget：共享margatroid_types::dto_events定义并由本crate重导出的WebSocket消息目标，公开枚举--保存尚未解析为连接发送器的目标
     Broadcast--全部当前连接
     Type(String)--指定连接类型
     Name(String)--指定连接名称
@@ -159,10 +160,8 @@ MargatroidConfig：Margatroid全局配置，公开只读Resource--从主目录co
     log_filter: Option<String>--进程级tracing过滤表达式；非空时优先于log_level
     logs: Vec<WebSocketMessageTarget>--日志、Workspace启停结果及成员失败异常的目标
     backend_state: Vec<WebSocketMessageTarget>--完整后端状态目标
-    member_messages: Vec<WebSocketMessageTarget>--完整成员消息目标
-    streaming_member_messages: Vec<WebSocketMessageTarget>--流式成员消息目标
-    new(server_bind: SocketAddr, log_level: LogLevel, log_filter: Option<String>, logs: Vec<WebSocketMessageTarget>, backend_state: Vec<WebSocketMessageTarget>, member_messages: Vec<WebSocketMessageTarget>, streaming_member_messages: Vec<WebSocketMessageTarget>) -> Result<Self, ConfigError>
-        构造配置：公开关联函数，保存监听地址和日志配置并验证四组目标非空、合法且不重复，log_filter存在时要求其trim后非空
+    new(server_bind: SocketAddr, log_level: LogLevel, log_filter: Option<String>, logs: Vec<WebSocketMessageTarget>, backend_state: Vec<WebSocketMessageTarget>) -> Result<Self, ConfigError>
+        构造配置：公开关联函数，保存监听地址和日志配置并验证两组目标非空、合法且不重复，log_filter存在时要求其trim后非空
     server_bind(&self) -> SocketAddr
         读取监听地址：公开方法
     with_ingress(mut self, ingress: IngressPolicy) -> Self
@@ -177,10 +176,6 @@ MargatroidConfig：Margatroid全局配置，公开只读Resource--从主目录co
         读取日志目标：公开方法
     backend_state(&self) -> &[WebSocketMessageTarget]
         读取后端状态目标：公开方法
-    member_messages(&self) -> &[WebSocketMessageTarget]
-        读取成员消息目标：公开方法
-    streaming_member_messages(&self) -> &[WebSocketMessageTarget]
-        读取流式成员消息目标：公开方法
     impl Resource for MargatroidConfig
 ```
 
@@ -189,7 +184,7 @@ crate公开：
 ConfigDocument：全局配置文档，crate公开结构体--拒绝未知字段
     server: ServerDocument--Server启动配置
     log: Option<LogDocument>--可选的日志配置；缺省时级别取LogLevel默认值且不带过滤器
-    outbound: OutboundDocument--四类WebSocket出站目标
+    outbound: OutboundDocument--两类WebSocket出站目标
     impl TryFrom<ConfigDocument> for MargatroidConfig
         Error = ConfigError
         try_from(document: ConfigDocument) -> Result<MargatroidConfig, ConfigError>
@@ -197,6 +192,7 @@ ConfigDocument：全局配置文档，crate公开结构体--拒绝未知字段
 
 ServerDocument：Server配置文档，crate公开结构体--拒绝未知字段
     bind: String--必须可解析为SocketAddr
+    allow: Option<toml::Value>--可选入口策略，经decode_ingress验证
 
 LogDocument：日志配置文档，crate公开结构体--拒绝未知字段
     level: Option<String>--必须为off、error、warn、info、debug或trace
@@ -205,8 +201,7 @@ LogDocument：日志配置文档，crate公开结构体--拒绝未知字段
 OutboundDocument：出站配置文档，crate公开结构体--拒绝未知字段
     logs: Vec<String>--日志目标
     backend_state: Vec<String>--后端状态目标
-    member_messages: Vec<String>--成员消息目标
-    streaming_member_messages: Vec<String>--流式成员消息目标
+    仅这两个字段；member_messages与streaming_member_messages已删除，作为未知字段拒绝，不保留兼容别名
 ```
 
 ## 函数
@@ -254,6 +249,10 @@ ConfigError：配置错误，公开枚举--不回显配置正文
     EmptyTargets(&'static str)--指定出站类别没有目标
     InvalidTarget(&'static str)--指定出站类别包含非法目标
     DuplicateTarget(&'static str)--指定出站类别包含重复目标
+    InvalidIngressAllow--入口策略标量/类型非法
+    InvalidIngressEntry(usize)--入口数组对应项非法
+    IngressEntryCoversEverything(usize)--入口数组对应项覆盖全部或使用未指定主机
+    IngressWiderThanBind--回环监听不能配放行非回环的策略
     impl fmt::Display for ConfigError
         Display：公开trait实现，输出不含配置正文的稳定描述
     impl std::error::Error for ConfigError
@@ -263,8 +262,8 @@ ConfigError：配置错误，公开枚举--不回显配置正文
 ## 逻辑
 
 ```text
-ConfigError 的 &'static str 字段只用于标识配置字段名（logs、backend_state、member_messages、streaming_member_messages），不回显目标值或配置正文。
-log.filter 只校验非空；过滤表达式语法由 log_plugin 的 EnvFilter 在装配时校验。
+ConfigError 的 &'static str 字段只用于标识配置字段名（logs、backend_state），不回显目标值或配置正文。
+log.filter 只校验非空；过滤表达式语法由 log_plugin 的 EnvFilter 在装配时校验。存在filter时完整替代level指令，不与level叠加；例如level=debug且filter=warn时按warn过滤，无filter才使用level，缺省为info。
 ```
 
 ## 边界
@@ -273,6 +272,6 @@ log.filter 只校验非空；过滤表达式语法由 log_plugin 的 EnvFilter �
 ConfigPlugin负责：读取、解析、验证并安装Server、日志和出站全局配置。
 ConfigPlugin不负责：配置tracing Subscriber或校验过滤表达式语法（由log_plugin负责），也不查询WebSocket连接、序列化消息或发送消息。
 ServerPlugin负责：将WebSocketMessageTarget解析为具体连接发送器的基础能力。
-config.toml格式：监听地址位于[server]表，日志级别与过滤器位于可选的[log]表，四组目标位于[outbound]表；目标字符串只允许broadcast、type:<连接类型>和name:<连接名称>。
+config.toml格式：监听地址位于[server]表，日志级别与过滤器位于可选的[log]表，两组目标位于[outbound]表；目标字符串只允许broadcast、type:<连接类型>和name:<连接名称>。
 LogLevel与log_plugin的LogLevel是同词表的两个独立枚举：mecs基础设施不依赖业务配置，装配方（daemon）负责在两者之间转换。
 ```

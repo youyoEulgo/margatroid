@@ -81,13 +81,15 @@ use signal_plugin::SignalHandle;
 // SignalPlugin 在第一次 tick 的 STARTUP 阶段启动监听线程。
 app.tick();
 let handle = app.world().get_resource::<SignalHandle>().unwrap().clone();
-assert!(handle.is_running());
+// 启动失败时is_running为false，应由System读取SignalListenerFailed。
+let _running = handle.is_running();
 handle.shutdown();
 assert!(!handle.is_running());
 ```
 
-`shutdown` 可以重复调用。App 销毁时，最后一个 `SignalHandle` 自动关闭 signal-hook
-迭代器并回收监听线程。
+`shutdown` 可以重复调用。最后一个 `SignalHandle` 释放时自动关闭 signal-hook
+迭代器并回收监听线程；外部保留的克隆会延长监听生命周期。生产者应在对应 Runtime 销毁前
+停止，避免向已断开的唤醒通道发送。signal-hook 可能合并同类信号，事件不代表每次原始投递的可靠计数。
 
 ## 公开 API
 

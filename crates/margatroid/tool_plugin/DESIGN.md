@@ -1,5 +1,7 @@
 # 伪代码格式
 
+> 审计边界：本次只读比对源码并修改文档，未运行测试/构建。下文“已实现”描述可见代码结构，不证明草稿、跨插件时序、平台行为或端到端接线已验收；未闭合能力必须按明确目标实现和验证。
+
 ```text
 模块：使用一级标题，只写当前设计涉及的部分
 类型：使用二级标题，按私有、crate公开和公开分组
@@ -38,11 +40,11 @@ error      共享工具错误契约          执行、取消与清理错误
 
 **CallableResource snapshot请求及MCL typed arrays已实现；普通tool runner提供取消与真实cleanup；可信supervisor与受限worker分离，兼容既有工具Lua环境，长期任务协议仍为未来约束。** MCL选择不可变可调用资源快照并管理调用批次，ToolPlugin每个oneshot请求只执行一个匹配调用，独立runner基本协议不变。
 
-当前MCL只有MESSAGE、TOOL、SANDBOX三种typed arrays；TOOL是资源值，保存ResourceID、alias、description、schema与immutable shared snapshot，不是ToolCall请求数组。`IMPORT TOOL tool AS alias`与`GET alias`解析Agent ImportBindings，不新增插件注册表；`infer`接收MESSAGE array + TOOL array，不接受ResourceID array或重复global alias query。旧Block不会跟随reload暗变，新GET alias获取新快照。CallableDefinitionSnapshot 只有 Tool，其他资源类型不能导入 TOOL。
+当前MCL只有MESSAGE、TOOL、SANDBOX三种typed arrays；TOOL是资源值，保存ResourceID、alias、description、schema与immutable shared snapshot，不是ToolCall请求数组。`IMPORT TOOL tool AS alias`与`GET alias`解析Agent ImportBindings，不新增插件注册表；`infer`接收MESSAGE array + TOOL array，不接受ResourceID array或重复global alias query。持久Block只存ID，下次GET按当前导入绑定获取新快照；已返回typed值/请求不会跟随reload暗变。CallableDefinitionSnapshot 只有 Tool，其他资源类型不能导入 TOOL。
 
 ## 用户轮次中止契约（已实现）
 
-工具受理及独立turn_cancel监督已实现；活动登记原子保存turn与沙箱快照。无 `get_turn`；状态采用 `creating/idle/working/stopping`。中止立即清空 turn，清理期间仍为 Working，正常 finish 收口才 Idle；同步必须同时包含 turn 与 status。用户轮次中止与根 Agent shutdown、owner abort、timeout、receiver closed 不同，不统一归一为正常取消。
+工具受理及独立turn_cancel监督已实现；活动登记原子保存turn与沙箱快照。无 `get_turn`；状态采用 `creating/idle/working/stopping`。中止立即清空 turn，清理期间仍为 Working，正常 finish_turn 收口才 Idle；同步必须同时包含 turn 与 status。用户轮次中止与根 Agent shutdown、owner abort、timeout、receiver closed 不同，不统一归一为正常取消。
 
 用户轮次取消且真实cleanup成功，oneshot返回Ok ToolExecuteResponse，其ToolCall消息failed=true、content="Tool call aborted."，保留调用ID、名称和已知resource_id。未启动调用同用此规范正文；不伪造执行成功，不撤销已经发生的副作用。CleanupFailed仍返回Err并保留活动，不能伪造取消或空闲。
 
@@ -64,6 +66,8 @@ AbortSystem先于MCL实际执行与工具受理；每个消费者独立观察共
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
 ## 图片工具结果契约
+
+User和ToolCall图像使用同一共享UserImage（沿用名称，不限于User消息）：只接受png/jpeg/gif/webp原始标准base64，最多8张/消息、5MiB/张、20MiB解码总量，magic须匹配。Messages/Responses保留原生工具结果图像；Chat仅在同一批次所有工具结果齐备后生成格式层user图像消息，不改本地权威历史。
 
 runner继续返回String；仅含ok布尔及content字符串的JSON envelope被识别为结构化结果。可选images必须反序列化为共享UserImage并经validate_user_images校验，错误明确返回ToolError而非退回纯文本；普通字符串保持原样。成功ToolCall传递images，取消与失败不附图。错误诊断不得回显图片base64。
 
@@ -227,7 +231,7 @@ MCL tool_call effect（当前输入契约）：
     检查与配置修改在同一受检入口，活动启动也走同一受理机制，不依赖MCL FIFO消除所有竞态
     重复选择完全相同的当前配置可幂等成功；同ID但策略内容变化属于配置改变
     激活沙箱同ID重载也不能绕过此约束；新材料可先准备，发布改变前须检查活动，忙时保留原条目
-    其他资源重载不改变已有typed Block或已开始任务的不可变共享快照；新GET alias取得新版本，工具执行始终使用选定snapshot而非resource_id重取latest；任务查询结果不视为仍拥有执行资源
+    其他资源重载不改变已返回typed值或已开始任务的不可变共享快照；持久Block只存ID，后续GET按当前导入值解析；新GET alias取得新版本，工具执行始终使用选定snapshot而非resource_id重取latest；任务查询结果不视为仍拥有执行资源
 
 清理接口：
     agent_cleanup_tasks只清理该作用域的Sandbox活动，关闭新的Sandbox执行受理门，取消普通runner及长期进程并异步等待真实执行体退出和资源释放；不取消Inference或其他非沙箱活动
@@ -280,7 +284,7 @@ CallableResource：TOOL元素，公开共享纯值契约--归共享types，本�
     resource_id: ResourceID--选定导入资源身份，validate_owner只校验已导入及许可，不取新版本
     alias: String--模型可见及call匹配名称
     definition: Arc<CallableDefinitionSnapshot>--不可变共享description、input_schema与资源种类/执行材料引用
-    说明：已有Block和请求持有同一snapshot；Agent ImportBindings是alias权威，GET alias取得当前绑定快照。请求仅resource持有此值，不重复ID和snapshot字段。
+    说明：已返回typed值和请求持有同一snapshot；持久Block只存ID，下一次GET解析当前导入值；Agent ImportBindings是alias权威，GET alias取得当前绑定快照。请求仅resource持有此值，不重复ID和snapshot字段。
 
 ToolExecutionLimits：执行限额，公开结构体
     script_bytes: usize
@@ -293,7 +297,7 @@ ToolExecutionLimits：执行限额，公开结构体
     execution_timeout: Duration
     host_call_timeout: Duration
     cleanup_timeout: Duration
-    说明：所有上限非零，宿主子预算不得扩大执行总预算；具体默认值实施前确定。
+    说明：所有上限非零，宿主子预算不得扩大执行总预算；当前默认：script 1MiB、arguments 256KiB、output 1MiB、result 32MiB、diagnostic 256KiB、memory 64MiB、指令10,000,000、执行30秒、宿主10秒、清理3秒。
 ```
 
 私有：
@@ -317,7 +321,8 @@ RunnerRequest：runner输入，私有结构体
 
 RunnerResponse：runner输出，私有结构体
     protocol_version: u32
-    result: Result<String, RunnerErrorPayload>
+    result: Result<String, ToolError>
+    cleanup_proven: bool--runner提供的清理证明标志，父进程仍验证实际进程/管道清理
 
 任务领域占位：
     AgentExecutionScope、ExecutionActivity、SandboxPolicySnapshot由共享执行领域提供，不依赖工具插件私有类型
@@ -375,7 +380,7 @@ ToolError：工具错误，公开结构体
     验证infer使用MESSAGE + TOOL及已准备definition/validate_owner，不接受ResourceID array、不重复global alias query
     验证tool_call所有结构校验在submit前完成、空calls返回emptyMessage、不隐式记录输入assistant或结果、每匹配调用单oneshot及显式历史消息保留IDs
     验证System/prompt真实role、infer接收System，与history append不含System的独立范围
-    验证reload后旧Block/已选定snapshot不变，新GET获得新快照；ToolExecuteRequest.resource是唯一CallableResource持有字段，Agent.sandbox使用选定SandboxValue策略
+    验证reload后已返回typed值/已选定snapshot不变，持久Block仅存ID、新GET按当前导入值获得新快照；ToolExecuteRequest.resource是唯一CallableResource持有字段，Agent.sandbox使用选定SandboxValue策略
     脚本材料的磁盘版本隔离方案尚未闭合；现有路径late read不提供该保证，需要进一步选择Arc正文或版本化材料并验收
     平台沙箱边界及长期任务完整协议继续单独设计；保留取消后join进程、排读管道、后代回收、临时目录清理的真实证明要求
 ```

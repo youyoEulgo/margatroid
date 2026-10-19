@@ -1,12 +1,14 @@
 # InferencePlugin
 
-> 状态：格式/vendor分层重构已实现。共享拥有所有权的领域请求、三种格式转换与严格SSE累积器、必填vendor和显式七组合路由已落地；执行、资源及真实cleanup边界保持不变。用户图像通过共享校验后转换为三种格式的原生图像块。
+> 审计边界：本次只读比对源码并修改文档，未运行测试/构建。下文“已实现”描述可见代码结构，不证明草稿、跨插件时序、平台行为或端到端接线已验收；未闭合能力必须按明确目标实现和验证。
+
+> 状态：格式/vendor分层重构已实现。共享拥有所有权的领域请求、三种格式转换与严格SSE累积器、必填vendor和显式七组合路由已落地；执行、资源及真实cleanup边界保持不变。User和ToolCall图像通过共享校验；Messages/Responses原生编码，Chat工具图像在完整批次后合成user图像消息。
 
 ## 已实现的请求分层
 
 - **共享纯领域请求**：专用 `types::inference_request_types` 中仅有单一 `DomainRequest { messages: Vec<AgentMessage>, tools: Vec<ToolDefinition>, config: DomainRequestConfig }`。`DomainRequestConfig` 包含上游 `model: String`、`temperature`、`max_output_tokens`、`top_p`、`stop` 公共语义参数；默认空model在执行前拒绝。请求拥有所有权，不含HTTP、URL、密钥、provider、执行状态、Entity或channel。它与插件 `InferenceConfig` Resource不同。资源归属检查及CallableResource快照准备仍先完成，再构造纯ToolDefinition。
 - **执行事件不混合领域值**：`InferenceRequest` 仍承担请求关联、Entity、turn、cancel和oneshot等执行职责；不是把其改名为DomainRequest。现有工具快照、客户端快照、独立supervisor、真实cleanup和显式历史边界不变。
-- **格式与厂商独立**：插件 `inference_plugin::types` 定义 `ApiFormat { ChatCompletions, Messages, Responses }`，稳定配置值分别为 `chat_completions/messages/responses`。provider从可选标签变为必填vendor执行选择器；model是独立上游模型名称，不推断格式或厂商。
+- **格式与厂商独立**：插件 内部 `types` 模块定义（公开类型由插件根重新导出） `ApiFormat { ChatCompletions, Messages, Responses }`，稳定配置值分别为 `chat_completions/messages/responses`。provider从可选标签变为必填vendor执行选择器；model是独立上游模型名称，不推断格式或厂商。
 - **具体格式再执行**：插件内部 formats 模块拥有 `ChatCompletionsRequest`、`MessagesRequest`、`ResponsesRequest` 及包含它们的 `ApiRequest`。`ApiFormat::build_request` 通过 `TryFrom<DomainRequest>` / `.try_into()?` 转换，vendors 模块的 `VendorAdapter` 接收具体格式的 `ApiRequest` 再处理厂商选项、鉴权、端点和HTTP。公开重新导出 `ApiFormat`、`Vendor`；不存在旧协议工厂注册表、`with_api_type`、`ApiAdapter` 或泛型vendor handler类型。
 - **可失败而非静默损失**：领域请求保留完整消息及资源关联；格式转换检查工具调用/结果配对及格式可表达性，厂商层补充已验证的选项约束。内部resource ID不作为API字段发送，本地结果/历史仍保留。Responses不支持stop序列，Messages缺少max_output_tokens时拒绝；跨格式replay或缺少必要reasoning元数据也在HTTP前失败。不宣称已实现独立vendor/model能力快照系统。
 - **响应逆向归一**：HTTP/SSE经vendor特有兼容及对应格式解码/累积，统一成 `InferenceResponse`。各格式使用自己的结束条件；不能都套用Chat Completions的choice/`[DONE]`。保留tool IDs、reasoning、usage及真实stop_reason；正常响应和用户轮次abort的统一构造helper保证内外stop_reason一致，且不改变既有真实cleanup条件。
@@ -30,7 +32,7 @@
 
 ## 用户轮次中止（已实现）
 
-受理核对 Working 及非空匹配 turn，活动登记关联 turn 并监督独立 turn_cancel 令牌。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
+受理核对 Working 及非空匹配 turn，活动登记关联 turn 并监督独立 turn_cancel 令牌。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish_turn 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
 
 Assistant 新增 `stop_reason: Option<StopReason>`（旧文件缺字段默认为 None，prompt 非模型消息为 None，实际推理输出始终 Some），包括 `StopReason::Cancelled`（`cancelled`）；兼容保留外层 `InferenceResponse.stop_reason`，两处从单一权威映射构造且始终相同。仅用户轮次中止在真实 cleanup 成功后返回 Ok：先 abort 并 await 本地 HTTP/SSE worker，随后返回已接受的正文与 reasoning 部分快照，`tool_calls=[]`、`replay=None`、`usage=None`、`stop_reason=Cancelled`；没有任何正文或 reasoning 时，`content=None`、`reasoning=None`，保持空 assistant，不填充提示正文。快照在每批 ProviderStreamDelta 被接受后、任何 websocket await 之前更新，因此慢客户端不会丢失已接受文本，也不会在 worker join 后追加迟到字节。不调用 vendor abort API。`CleanupFailed` 仍为 Err，不能伪造取消或空闲；根 Agent shutdown、owner abort、timeout、receiver closed 保留独立原因。
 
@@ -141,7 +143,7 @@ tool 使用选定 schema；仅 tool 资源可作为 TOOL。空 tools 就是无�
 
 准备阶段仍调用旧 `normalize_messages` 作预检并丢弃其 `ProviderMessage` 投影，随后将原始拥有所有权的AgentMessage放入DomainRequest，由格式层再次规范化/编码，replay不会通过旧投影丢失。`Inject` 递归按序展开；System、user、assistant、工具结果及 error 保留真实角色，System 与 prompt 的真实 role 不降格为 user。保留 reasoning、工具 ID、参数和结果关联，历史 usage 与 stop_reason 不进入请求，cancelled assistant 拒绝作为上下文。检查工具调用/结果配对，空输入、孤立结果、重复调用和超限输入拒绝。history append 不接收 System 是独立约束，不缩窄 infer 输入。
 
-MCL `infer` 参数为 MESSAGE array + TOOL array；手工工具调用也先构造恰好一条 assistant MESSAGE，再传 visible TOOL array，calls 从 `assistant.tool_calls` 提取。`ToolCall` 仍为 assistant 的纯结构字段，没有 TOOL_CALL Block array。metadata reload 不改变已取出的 Block/请求；新 GET alias 取得新 snapshot。脚本仍按选定路径 late read，metadata snapshot 不保证磁盘文件内容版本隔离。
+MCL `infer` 参数为 MESSAGE array + TOOL array；手工工具调用也先构造恰好一条 assistant MESSAGE，再传 visible TOOL array，calls 从 `assistant.tool_calls` 提取。`ToolCall` 仍为 assistant 的纯结构字段，没有 TOOL_CALL Block array。metadata reload 不改变已返回的 typed 值/请求；持久 Block 仅存资源 ID，下一次 GET 按当前导入绑定取得新 snapshot。脚本仍按选定路径 late read，metadata snapshot 不保证磁盘文件内容版本隔离。
 
 
 ## 执行监督与真实 cleanup

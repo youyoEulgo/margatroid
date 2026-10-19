@@ -1,6 +1,7 @@
 use crate::{
     types::{
-        BackendStateReportCache, PendingAbortResponse, PendingMclCommandResponse,
+        BackendStateReportCache, CatalogOperation, DiscoveryOperation, PendingAbortResponse,
+        PendingCatalogResponse, PendingDiscoveryResponse, PendingMclCommandResponse,
         PendingMclCommandResponses, PendingSnapshot, PendingWorkspaceResponse,
     },
     WebSocketMessageSend,
@@ -19,6 +20,10 @@ use margatroid_protocol::{
 use margatroid_types::{
     agent_components::{Agent, AgentState},
     agent_events::{AbortAgentTurn, AbortAgentTurnResult},
+    discovery::{
+        AgentDriverCatalogResult, QueryAgentDriverCatalog, QueryProjectDirectoriesResult,
+        RefreshAgentDriverCatalog,
+    },
     dto_events::DtoHistorySnapshotCompleted,
     history_components::AgentHistoryHandle,
 };
@@ -27,7 +32,7 @@ use margatroid_types::{
     client_events::ClientRegistrationResult,
     mcl_events::MclCommandResult,
     workspace_components::WorldWorkspaceExt,
-    workspace_events::{StartWorkspaceResult, StopWorkspaceResult, WorkspaceMemberStartFailed},
+    workspace_events::*,
 };
 use server_plugin::{
     ServerFailed, ServerStarted, ServerStopped, WebSocketConnected, WebSocketConnectionId,
@@ -65,6 +70,7 @@ pub(crate) fn handle_inbound_message(
                 bytes = text.len(),
                 "invalid API request structure"
             );
+            let detail = invalid_request_detail(&text);
             let id = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
                 .and_then(|value| {
@@ -80,10 +86,7 @@ pub(crate) fn handle_inbound_message(
                     connection_id,
                     &ServerMessage::RequestFailed {
                         id,
-                        error: ProtocolErrorDto::new(
-                            "InvalidRequest",
-                            "invalid API request structure",
-                        ),
+                        error: ProtocolErrorDto::new("InvalidRequest", detail),
                     },
                 );
             } else {
@@ -105,6 +108,22 @@ pub(crate) fn handle_inbound_message(
         );
     }
 }
+fn invalid_request_detail(text: &str) -> &'static str {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        if matches!(
+            value.get("type").and_then(|v| v.as_str()),
+            Some("mcl.command" | "history.query" | "agent.turn.abort")
+        ) && value
+            .get("message")
+            .and_then(|m| m.get("agent"))
+            .is_none_or(|agent| agent.is_null())
+        {
+            return "an explicit agent ResourceID is required; select an agent and send message.agent";
+        }
+    }
+    "invalid API request structure"
+}
+
 fn close_invalid_request(
     world: &World,
     connection_id: WebSocketConnectionId,
@@ -125,19 +144,6 @@ fn close_invalid_request(
     });
 }
 
-fn prepare_workspace_start(
-    message: margatroid_protocol::StartWorkspaceDto,
-    operation_id: String,
-) -> Result<margatroid_types::workspace_events::StartWorkspace, ProtocolError> {
-    let event = message.into_domain(operation_id)?;
-    WorkspaceInfoDto::from_domain(&event.definition, ()).map_err(|error| {
-        ProtocolError::new(
-            ProtocolErrorKind::InvalidRequest,
-            format!("workspace.start requires a declared manager member for the workspace snapshot; add a member whose name matches manager: {error}"),
-        )
-    })?;
-    Ok(event)
-}
 fn operation_id() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     format!(
@@ -182,6 +188,14 @@ fn route_request(
             .iter()
             .any(|p| p.client == client && p.id == request.id())
         || pending
+            .discovery
+            .iter()
+            .any(|p| p.client == client && p.id == request.id())
+        || pending
+            .catalog
+            .iter()
+            .any(|p| p.client == client && p.id == request.id())
+        || pending
             .snapshots
             .iter()
             .any(|p| p.client == client && p.id == request.id())
@@ -193,10 +207,165 @@ fn route_request(
     }
     match request {
         ClientMessage::ConnectionRegister { .. } => unreachable!(),
+        ClientMessage::WorkspacePathsQuery { id, message } => {
+            let operation_id = operation_id();
+            let event = message.into_domain(operation_id.clone())?;
+            track_discovery(
+                world,
+                connection_id,
+                client,
+                id,
+                operation_id,
+                DiscoveryOperation::Paths,
+            );
+            world.send_event(event);
+        }
+        ClientMessage::DriverCatalogQuery { id, .. } => {
+            let operation_id = operation_id();
+            track_discovery(
+                world,
+                connection_id,
+                client,
+                id,
+                operation_id.clone(),
+                DiscoveryOperation::DriverQuery,
+            );
+            world.send_event(QueryAgentDriverCatalog { id: operation_id });
+        }
+        ClientMessage::DriverCatalogRefresh { id, .. } => {
+            let operation_id = operation_id();
+            track_discovery(
+                world,
+                connection_id,
+                client,
+                id,
+                operation_id.clone(),
+                DiscoveryOperation::DriverRefresh,
+            );
+            world.send_event(RefreshAgentDriverCatalog { id: operation_id });
+        }
+        ClientMessage::WorkspaceCatalogQuery { id, .. } => {
+            let operation_id =
+                queue_catalog(world, connection_id, client, id, CatalogOperation::Query);
+            world.send_event(QueryWorkspaceCatalog { id: operation_id });
+        }
+        ClientMessage::WorkspaceCatalogRefresh { id, .. } => {
+            let operation_id =
+                queue_catalog(world, connection_id, client, id, CatalogOperation::Refresh);
+            world.send_event(RefreshWorkspaceCatalog { id: operation_id });
+        }
+        ClientMessage::WorkspaceMemberAdd { id, message } => {
+            margatroid_protocol::valid_logical_name(&message.agent.name)?;
+            let event = AddWorkspaceMember {
+                id: operation_id(),
+                workspace_id: message.workspace.into_domain(())?,
+                expected_revision: message.expected_revision,
+                member: WorkspaceMemberSpec {
+                    name: message.agent.name,
+                    driver: message.agent.driver.into_domain(())?,
+                    home_root: message.agent.home_root.map(Into::into),
+                },
+            };
+            track_catalog(
+                world,
+                connection_id,
+                client,
+                id,
+                event.id.clone(),
+                CatalogOperation::MemberAdd,
+            );
+            world.send_event(event);
+        }
+        ClientMessage::WorkspaceMemberRemove { id, message } => {
+            let event = RemoveWorkspaceMember {
+                id: operation_id(),
+                workspace_id: message.workspace.into_domain(())?,
+                expected_revision: message.expected_revision,
+                member_id: message.agent.into_domain(())?,
+            };
+            track_catalog(
+                world,
+                connection_id,
+                client,
+                id,
+                event.id.clone(),
+                CatalogOperation::MemberRemove,
+            );
+            world.send_event(event);
+        }
+        ClientMessage::WorkspaceCreate { id, message } => {
+            margatroid_protocol::valid_logical_name(&message.name)?;
+            let event = CreateWorkspace {
+                id: operation_id(),
+                name: message.name,
+                project_root: message.project_root.into(),
+            };
+            track_catalog(
+                world,
+                connection_id,
+                client,
+                id,
+                event.id.clone(),
+                CatalogOperation::Create,
+            );
+            world.send_event(event);
+        }
+        ClientMessage::WorkspaceRename { id, message } => {
+            margatroid_protocol::valid_logical_name(&message.new_name)?;
+            let event = RenameWorkspace {
+                id: operation_id(),
+                workspace_id: message.workspace.into_domain(())?,
+                expected_revision: message.expected_revision,
+                new_name: message.new_name,
+            };
+            track_catalog(
+                world,
+                connection_id,
+                client,
+                id,
+                event.id.clone(),
+                CatalogOperation::Rename,
+            );
+            world.send_event(event);
+        }
+        ClientMessage::WorkspaceDelete { id, message } => {
+            let event = DeleteWorkspace {
+                id: operation_id(),
+                workspace_id: message.workspace.into_domain(())?,
+                expected_revision: message.expected_revision,
+            };
+            track_catalog(
+                world,
+                connection_id,
+                client,
+                id,
+                event.id.clone(),
+                CatalogOperation::Delete,
+            );
+            world.send_event(event);
+        }
+        ClientMessage::WorkspaceMemberRename { id, message } => {
+            margatroid_protocol::valid_logical_name(&message.new_name)?;
+            let event = RenameWorkspaceMember {
+                id: operation_id(),
+                workspace_id: message.workspace.into_domain(())?,
+                expected_revision: message.expected_revision,
+                member_id: message.agent.into_domain(())?,
+                new_name: message.new_name,
+            };
+            track_catalog(
+                world,
+                connection_id,
+                client,
+                id,
+                event.id.clone(),
+                CatalogOperation::MemberRename,
+            );
+            world.send_event(event);
+        }
         ClientMessage::WorkspaceStart { id, message } => {
             let operation_id = operation_id();
-            let event = prepare_workspace_start(message, operation_id.clone())?;
-            let reference = (&event.definition).into_dto(())?;
+            let event = message.into_domain(operation_id.clone())?;
             world
                 .get_resource_mut::<PendingMclCommandResponses>()
                 .unwrap()
@@ -207,7 +376,7 @@ fn route_request(
                     connection_id,
                     client,
                     stopping: false,
-                    reference,
+                    reference: None,
                 });
             world.send_event(event);
         }
@@ -229,7 +398,7 @@ fn route_request(
                     connection_id,
                     client,
                     stopping: true,
-                    reference: message.workspace,
+                    reference: Some(message.workspace),
                 });
         }
         ClientMessage::AgentTurnAbort { id, message } => {
@@ -239,8 +408,7 @@ fn route_request(
                     "invalid turn ID",
                 ));
             }
-            let (entity, resource_id) =
-                resolve_agent(world, &message.workspace, message.agent.as_ref())?;
+            let (entity, resource_id) = resolve_agent(world, &message.workspace, &message.agent)?;
             let agent = world.get_component::<Agent>(entity).unwrap();
             let instance = agent.lua.instance.clone().ok_or_else(|| {
                 ProtocolError::new(ProtocolErrorKind::InvalidRequest, "agent VM is not ready")
@@ -273,8 +441,7 @@ fn route_request(
             world.send_event(event);
         }
         ClientMessage::MclCommand { id, message } => {
-            let (entity, target) =
-                resolve_agent(world, &message.workspace, message.agent.as_ref())?;
+            let (entity, target) = resolve_agent(world, &message.workspace, &message.agent)?;
             if matches!(
                 world.get_component::<Agent>(entity).unwrap().state,
                 AgentState::Working
@@ -305,7 +472,7 @@ fn route_request(
             queue_snapshot(world, connection_id, client, id, false, state, histories);
         }
         ClientMessage::HistoryQuery { id, message } => {
-            let (entity, _) = resolve_agent(world, &message.workspace, message.agent.as_ref())?;
+            let (entity, _) = resolve_agent(world, &message.workspace, &message.agent)?;
             let histories = prepare_histories(world, Some(entity))?;
             let state = BackendStateDto {
                 agents: histories
@@ -375,6 +542,12 @@ fn purge_disconnected_responses(world: &mut World) {
         .retain(|pending| response_is_live(&live, pending.connection_id, pending.client));
     pending
         .workspaces
+        .retain(|pending| response_is_live(&live, pending.connection_id, pending.client));
+    pending
+        .discovery
+        .retain(|pending| response_is_live(&live, pending.connection_id, pending.client));
+    pending
+        .catalog
         .retain(|pending| response_is_live(&live, pending.connection_id, pending.client));
     pending
         .snapshots
@@ -457,6 +630,8 @@ pub(crate) fn handle_collect_external_events(world: &mut World) {
     report_server_events(world);
     report_client_registrations(world);
     report_workspace_results(world);
+    report_catalog_results(world);
+    report_discovery_results(world);
     report_workspace_member_failures(world, targets.logs());
     if !world.event_reader::<MclCommandResult>().is_empty() {
         world
@@ -533,9 +708,279 @@ fn report_workspace_member_failures(world: &World, targets: &[WebSocketMessageTa
         }
     }
 }
+fn track_discovery(
+    world: &mut World,
+    connection_id: WebSocketConnectionId,
+    client: core_plugin::Entity,
+    id: String,
+    operation_id: String,
+    kind: DiscoveryOperation,
+) {
+    world
+        .get_resource_mut::<PendingMclCommandResponses>()
+        .unwrap()
+        .discovery
+        .push(PendingDiscoveryResponse {
+            operation_id,
+            id,
+            connection_id,
+            client,
+            kind,
+        });
+}
+fn take_discovery_response(
+    world: &mut World,
+    id: &str,
+    kinds: &[DiscoveryOperation],
+) -> Option<PendingDiscoveryResponse> {
+    let pending = world
+        .get_resource_mut::<PendingMclCommandResponses>()
+        .unwrap();
+    let index = pending
+        .discovery
+        .iter()
+        .position(|p| p.operation_id == id && kinds.contains(&p.kind))?;
+    let pending = pending.discovery.remove(index);
+    world
+        .client_by_connection(pending.connection_id)
+        .is_some_and(|(entity, _)| entity == pending.client)
+        .then_some(pending)
+}
+fn report_discovery_results(world: &mut World) {
+    use margatroid_protocol::{DiscoveryErrorDto, ProjectDirectoryEntryDto};
+    let pages: Vec<_> = world
+        .event_reader::<QueryProjectDirectoriesResult>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for event in pages {
+        let Some(pending) = take_discovery_response(world, &event.id, &[DiscoveryOperation::Paths])
+        else {
+            continue;
+        };
+        let message = match event.result {
+            Ok(page) => ServerMessage::WorkspacePaths {
+                id: pending.id,
+                path: page.path.to_string_lossy().into_owned(),
+                parent: page.parent.map(|path| path.to_string_lossy().into_owned()),
+                directories: page
+                    .directories
+                    .into_iter()
+                    .map(|entry| ProjectDirectoryEntryDto {
+                        name: entry.name,
+                        path: entry.path.to_string_lossy().into_owned(),
+                    })
+                    .collect(),
+                next_cursor: page.next_cursor,
+            },
+            Err(error) => ServerMessage::RequestFailed {
+                id: pending.id,
+                error: ProtocolErrorDto::new("ProjectDirectoriesFailed", error),
+            },
+        };
+        send_to_connection(world, pending.connection_id, &message);
+    }
+    let catalogs: Vec<_> = world
+        .event_reader::<AgentDriverCatalogResult>()
+        .into_iter()
+        .cloned()
+        .collect();
+    for event in catalogs {
+        let Some(pending) = take_discovery_response(
+            world,
+            &event.id,
+            &[
+                DiscoveryOperation::DriverQuery,
+                DiscoveryOperation::DriverRefresh,
+            ],
+        ) else {
+            continue;
+        };
+        let message = match event.result {
+            Ok(snapshot) => ServerMessage::DriverCatalog {
+                id: pending.id,
+                drivers: snapshot
+                    .drivers
+                    .into_iter()
+                    .map(|id| margatroid_protocol::ResourceIdDto(id.to_string()))
+                    .collect(),
+                errors: snapshot
+                    .errors
+                    .into_iter()
+                    .map(|error| DiscoveryErrorDto {
+                        path: error.path.to_string_lossy().into_owned(),
+                        message: ProtocolErrorDto::new("DriverDiscoveryError", error.message)
+                            .message,
+                    })
+                    .collect(),
+            },
+            Err(error) => ServerMessage::RequestFailed {
+                id: pending.id,
+                error: ProtocolErrorDto::new("AgentDriverCatalogFailed", error),
+            },
+        };
+        send_to_connection(world, pending.connection_id, &message);
+    }
+}
+
+fn queue_catalog(
+    world: &mut World,
+    connection_id: WebSocketConnectionId,
+    client: core_plugin::Entity,
+    id: String,
+    kind: CatalogOperation,
+) -> String {
+    let operation_id = operation_id();
+    track_catalog(world, connection_id, client, id, operation_id.clone(), kind);
+    operation_id
+}
+fn track_catalog(
+    world: &mut World,
+    connection_id: WebSocketConnectionId,
+    client: core_plugin::Entity,
+    id: String,
+    operation_id: String,
+    kind: CatalogOperation,
+) {
+    world
+        .get_resource_mut::<PendingMclCommandResponses>()
+        .unwrap()
+        .catalog
+        .push(PendingCatalogResponse {
+            operation_id,
+            id,
+            connection_id,
+            client,
+            kind,
+        });
+}
+fn take_catalog_response(
+    world: &mut World,
+    id: &str,
+    kind: CatalogOperation,
+) -> Option<PendingCatalogResponse> {
+    let pending = world
+        .get_resource_mut::<PendingMclCommandResponses>()
+        .unwrap();
+    let index = pending
+        .catalog
+        .iter()
+        .position(|p| p.operation_id == id && p.kind == kind)?;
+    let pending = pending.catalog.remove(index);
+    world
+        .client_by_connection(pending.connection_id)
+        .is_some_and(|(entity, _)| entity == pending.client)
+        .then_some(pending)
+}
+fn report_catalog_results(world: &mut World) {
+    use margatroid_protocol::WorkspaceCatalogEntryDto;
+    use margatroid_types::workspace_catalog::WorkspaceCatalogEntry;
+    use margatroid_types::workspace_components::WorkspaceError;
+    let queries: Vec<_> = world
+        .event_reader::<QueryWorkspaceCatalogResult>()
+        .into_iter()
+        .map(|e| (e.id.clone(), CatalogOperation::Query, e.result.clone()))
+        .chain(
+            world
+                .event_reader::<RefreshWorkspaceCatalogResult>()
+                .into_iter()
+                .map(|e| (e.id.clone(), CatalogOperation::Refresh, e.result.clone())),
+        )
+        .collect();
+    for (id, kind, result) in queries {
+        let Some(pending) = take_catalog_response(world, &id, kind) else {
+            continue;
+        };
+        let result = result
+            .map_err(|error| ProtocolErrorDto::new(format!("{:?}", error.kind()), error.message()))
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry.into_dto(&*world))
+                    .collect::<Result<Vec<WorkspaceCatalogEntryDto>, _>>()
+                    .map_err(Into::into)
+            });
+        let message = match result {
+            Ok(mut entries) => {
+                entries.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+                ServerMessage::WorkspaceCatalog {
+                    id: pending.id,
+                    entries,
+                }
+            }
+            Err(error) => ServerMessage::RequestFailed {
+                id: pending.id,
+                error,
+            },
+        };
+        send_to_connection(world, pending.connection_id, &message);
+    }
+    let mut edits: Vec<(
+        String,
+        CatalogOperation,
+        Result<Option<WorkspaceCatalogEntry>, WorkspaceError>,
+    )> = Vec::new();
+    macro_rules! collect_edits {
+        ($event:ty, $kind:ident) => {
+            edits.extend(world.event_reader::<$event>().into_iter().map(|e| {
+                (
+                    e.id.clone(),
+                    CatalogOperation::$kind,
+                    e.result.clone().map(Some),
+                )
+            }));
+        };
+    }
+    collect_edits!(AddWorkspaceMemberResult, MemberAdd);
+    collect_edits!(RemoveWorkspaceMemberResult, MemberRemove);
+    collect_edits!(CreateWorkspaceResult, Create);
+    collect_edits!(RenameWorkspaceResult, Rename);
+    collect_edits!(RenameWorkspaceMemberResult, MemberRename);
+    edits.extend(
+        world
+            .event_reader::<DeleteWorkspaceResult>()
+            .into_iter()
+            .map(|e| {
+                (
+                    e.id.clone(),
+                    CatalogOperation::Delete,
+                    e.result.clone().map(|_| None),
+                )
+            }),
+    );
+    for (id, kind, result) in edits {
+        let Some(pending) = take_catalog_response(world, &id, kind) else {
+            continue;
+        };
+        debug_assert!(kind.entry_reply());
+        let result = result
+            .map_err(|error| ProtocolErrorDto::new(format!("{:?}", error.kind()), error.message()))
+            .and_then(|entry| {
+                entry
+                    .as_ref()
+                    .map(|entry| entry.into_dto(&*world))
+                    .transpose()
+                    .map_err(Into::into)
+            });
+        let (entry, error) = match result {
+            Ok(entry) => (entry, None),
+            Err(error) => (None, Some(error)),
+        };
+        send_to_connection(
+            world,
+            pending.connection_id,
+            &ServerMessage::WorkspaceMemberResult {
+                id: pending.id,
+                entry,
+                error,
+            },
+        );
+    }
+}
+
 fn report_workspace_results(world: &mut World) {
     let starts: Vec<_> = world
-        .event_reader::<StartWorkspaceResult>()
+        .event_reader::<StartRegisteredWorkspaceResult>()
         .into_iter()
         .cloned()
         .collect();
@@ -575,7 +1020,7 @@ fn report_workspace_results(world: &mut World) {
             },
             (true, Ok(_)) => ServerMessage::WorkspaceStopped {
                 id,
-                workspace: pending.reference,
+                workspace: pending.reference.expect("stop reference missing"),
             },
             (true, Err(error)) => ServerMessage::WorkspaceStopFailed {
                 id,
@@ -1006,62 +1451,6 @@ mod response_tests {
     use super::{is_user_injection, response_is_live};
 
     #[test]
-    fn workspace_start_rejects_unprojectable_definitions_before_domain_emission() {
-        use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
-        use core_plugin::App;
-        use margatroid_protocol::{ClientMessage, ProtocolErrorKind};
-        use margatroid_types::workspace_events::StartWorkspace;
-        let mut app = App::new();
-        app.add_plugin(RuntimePlugin::default());
-        for agents in [
-            serde_json::json!([]),
-            serde_json::json!([{
-                "id": "agent:test/worker:latest", "name": "worker", "driver": "driver:test/base:latest",
-                "home_root": "/tmp/home", "history_path": "/tmp/history"
-            }]),
-        ] {
-            let request: ClientMessage = serde_json::from_value(serde_json::json!({
-                "type": "workspace.start", "id": "empty-start", "message": { "definition": {
-                    "id": "workspace:test/empty:latest", "name": "empty", "project_root": "/tmp/empty",
-                    "manager": "manager", "agents": agents
-                }}
-            })).unwrap();
-            let ClientMessage::WorkspaceStart { message, .. } = request else {
-                panic!("expected workspace.start")
-            };
-            let error = super::prepare_workspace_start(message, "operation".into()).unwrap_err();
-            assert_eq!(error.kind(), ProtocolErrorKind::InvalidRequest);
-            assert!(error
-                .message()
-                .contains("requires a declared manager member"));
-            app.tick();
-            assert!(app.world().event_reader::<StartWorkspace>().is_empty());
-        }
-        let valid: ClientMessage = serde_json::from_value(serde_json::json!({
-            "type": "workspace.start", "id": "valid-start", "message": { "definition": {
-                "id": "workspace:test/valid:latest", "name": "valid", "project_root": "/tmp/valid",
-                "manager": "manager", "agents": [{
-                    "id": "agent:test/manager:latest", "name": "manager", "driver": "driver:test/base:latest",
-                    "home_root": "/tmp/home", "history_path": "/tmp/history"
-                }]
-            }}
-        })).unwrap();
-        let ClientMessage::WorkspaceStart { message, .. } = valid else {
-            panic!("expected workspace.start")
-        };
-        let event = super::prepare_workspace_start(message, "operation".into()).unwrap();
-        app.world().send_event(event);
-        app.tick();
-        assert_eq!(
-            app.world()
-                .event_reader::<StartWorkspace>()
-                .into_iter()
-                .count(),
-            1
-        );
-    }
-
-    #[test]
     fn workspace_started_uses_actual_entity_failures_not_definition_projection() {
         use margatroid_protocol::{IntoDto, ServerMessage, WorkspaceInfoDto};
         use margatroid_types::{
@@ -1077,14 +1466,13 @@ mod response_tests {
         let definition = WorkspaceDefinition {
             id: id("workspace", "partial"),
             name: "partial".into(),
-            manager: "manager".into(),
             project_root: "/tmp/partial".into(),
             agents: vec![WorkspaceAgentDefinition {
                 id: id("agent", "manager"),
                 name: "manager".into(),
-                driver: id("agent-driver", "broken"),
+                driver: id("driver", "broken"),
                 home_root: "/tmp/home".into(),
-                history_path: "/tmp/history".into(),
+                history_path: "/tmp/home/history.sqlite".into(),
             }],
         };
         let projected: WorkspaceInfoDto = (&definition).into_dto(()).unwrap();
@@ -1095,7 +1483,7 @@ mod response_tests {
         workspace.record_member_failure(
             id("agent", "manager"),
             WorkspaceMemberFailure {
-                driver: id("agent-driver", "broken"),
+                driver: id("driver", "broken"),
                 error: WorkspaceError::new(WorkspaceErrorKind::AgentStartFailed, "broken driver"),
             },
         );

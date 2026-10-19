@@ -94,7 +94,6 @@ fn definition(root: &Path, drivers: &[&str]) -> WorkspaceDefinition {
     WorkspaceDefinition {
         id: id("workspace:local/lifecycle"),
         name: "lifecycle".into(),
-        manager: "agent-0".into(),
         project_root: root.join("project"),
         agents: drivers
             .iter()

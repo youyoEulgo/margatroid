@@ -1,122 +1,46 @@
 # MargatroidCli
 
-## 类型
+## 目录选择
 
-私有：
-~~~text
-Cli：CLI参数根，私有结构体--使用clap::Parser派生解析顶层命令
-    command: Command
+catalog、注册启动和成员管理接线已恢复并完成对应验证；创建、重命名、删除及发现能力已接通。验证结论限于实际执行场景，不将 API 存在或历史测试等同于普遍可用性保证。
 
-Command：顶层命令，私有枚举--使用clap::Subcommand派生
-    Workspace {
-        command: WorkspaceCommand
-    }
+CLI 只负责已注册工作区发现、选择、启动/停止请求与日志显示；不再依赖 Compose，不读取或上传 YAML，不创建项目级配置、数据库或其它产物。
 
-WorkspaceCommand：Workspace子命令，私有枚举--使用clap::Subcommand派生
-    Up(WorkspaceUpArgs)
+```text
+Cli::parse
+-> run(WorkspaceCommand::Up { name: Option<String>, backend_url })
+-> WebSocket 连接
+-> connection.register(client_type=cli)，等待匹配回执
+-> workspace.catalog.query {id,message:{}}，等待匹配 workspace.catalog
+-> catalog_candidates(entries, name, canonical_cwd)
+-> choose_workspace(socket,candidates,stdin_is_terminal)
+-> workspace.start {workspace: ResourceIdDto, expected_revision: String}
+-> handle_workspace_start_reply + 日志/心跳/关闭信号
+-> workspace.stop -> wait_for_stop_ack -> 关闭连接
+```
 
-WorkspaceUpArgs：Workspace启动参数，私有结构体--使用clap::Args派生
-    workspace_file: PathBuf--可选位置参数，默认margatroid-workspace.yaml
-    backend_url: String--后端WebSocket URL，使用--backend指定，默认ws://127.0.0.1:3939/ws
-~~~
+### 选择
 
-## 函数
+显式名称按 catalog.name 精确匹配，可从任意目录调用。无名称时规范化现有 CWD，只比较 catalog.definition.project_root 规范路径是否完全相等；不向祖先目录搜索，不读取配置正文。远程路径无法在本地规范化时不能匹配，应指定名称。
 
-公开：
-~~~text
-main()
-    CLI入口：公开二进制入口，调用Cli::parse并执行命令；clap负责帮助、版本、参数错误和退出码
-~~~
+零匹配报错；一项直接选择；多项非 TTY 报错；多项 TTY 输出编号、名称、项目根与生命周期。`parse_choice` 接受有效编号，空输入或 q 返回取消，非法输入报错。只有成功选择一个有效定义才发送一次启动请求。
 
-私有：
-~~~text
-run(command: Command) -> Result<(), Box<dyn Error + Send + Sync>>
-    执行命令：私有异步函数，分派WorkspaceCommand::Up
+交互读取在独立的 detached thread 中等待，通过 oneshot 返回结果；异步选择循环继续处理 WebSocket Ping/Pong、日志和关闭信号，取消不会因阻塞 stdin 阻止进程结束。没有运行会话内的用户消息输入。
 
-run_workspace_up(workspace_file: PathBuf, backend_url: String) -> Result<(), Box<dyn Error + Send + Sync>>
-    启动Workspace：私有异步函数，编译文件、连接WebSocket、注册cli连接、发送启动请求、处理关闭信号并打印日志事件
-    行为：不读取stdin，不构造或发送LLM消息；ServerMessage::Log写入stdout；启动回执到达前，匹配启动请求ID的WorkspaceStartFailed表示Workspace自身无法建立，返回错误
-    WorkspaceStarted表示工作区已建立，即使member_failures非空也保持连接；打印工作区成功与每个失败成员的agent/driver/error，不将成员失败当成退出条件
-    成功回执后不再用延迟或重复的启动失败回执终止已运行会话；运行期成员错误只显示诊断，首次关闭信号仍走workspace.stop和清理回执
+### 请求与权威
 
-handle_workspace_start_reply(text: &str, request_id: &str, started: &mut bool) -> Result<(), CliError>
-    处理匹配启动回执：私有函数，WorkspaceStarted打印工作区成功和成员失败，设置started且保持连接
-    只有started为false且匹配当前请求的WorkspaceStartFailed或RequestFailed（协议预检拒绝，尚未创建工作区）转换为终止错误；其他请求及已启动后的重复回执不终止会话
+catalog 条目携带 id/name/path/revision/definition?/error?/lifecycle。CLI 不推断运行状态；无效定义报可操作错误。启动只提交条目 ID 和当前 revision，后端重新读取规范定义并处理并发修改；旧定义不会随客户端覆盖到服务端。
 
-print_backend_message(text: &str)
-    打印日志：私有函数，反序列化ServerMessage并使用RFC 3339时间、等级、target、事件和结构化字段格式化LogRecordDto；未知事件直接忽略
-    行为：stdout连接终端时启用ANSI等级色，并弱化时间和target；重定向时输出纯文本
+`wait_for_register_ack`、`wait_for_catalog`、`wait_for_stop_ack` 都匹配请求 ID、处理文本/二进制和心跳，具有 5 秒截止时间及关闭/断线错误。日志继续输出 RFC 3339 UTC、等级和目标，终端 ANSI/重定向纯文本。
 
-print_cli_event(level: &str, message: &str)
-    打印CLI事件：私有函数，使用当前RFC 3339时间、等级和margatroid_cli target写入stderr
-    行为：stderr连接终端时使用与后端日志相同的ANSI样式
+### 生命周期
 
-format_log_line(timestamp_millis: u64, level: &str, target: &str, message: &str, fields: &str, ansi: bool) -> String
-    格式化日志行：私有函数，按等级选择ANSI颜色并将时间和target设为灰色弱化；ansi为false时不产生控制符
+WorkspaceStarted 是工作区成功事实，member_failures 逐项显示但不终止会话。成功前匹配 WorkspaceStartFailed/RequestFailed 才作为启动失败；成功后重复或迟到失败不改变会话。
 
-format_timestamp(timestamp_millis: u64) -> String
-    格式化时间：私有函数，将Unix毫秒时间转换为RFC 3339 UTC文本
+关闭信号 future 跨消息保留；启动中首次信号保留停止意图，启动成功后发送停止。等待停止期间的重复信号、超时、断线或失败回执报错。CLI 不自行清理后端工作区，也不因成员失败断开。
 
-wait_for_stop_ack(socket, request_id: &str) -> Result<(), Box<dyn Error + Send + Sync>>
-    等待停止回执：私有异步函数，等待同一请求ID的workspace.stopped
-    行为：处理日志、心跳和停止失败；超时、断线或再次收到关闭信号时返回错误
+## 验证
 
-wait_for_shutdown_signal() -> Result<(), std::io::Error>
-    等待关闭信号：私有异步函数，Unix监听Ctrl+C和SIGTERM，其他平台监听Ctrl+C
+恢复后须以 `cargo test -p margatroid_cli` 验证精确规范路径、符号链接、名称/未知名、非终端歧义、选择取消/非法编号、注册/停止心跳和二进制回执、启动拒绝、成员失败后持续连接、启动中 SIGTERM 与已启动工作区停止回执。
 
-request_id() -> String
-    请求ID：私有函数，由进程ID和当前时间生成本次workspace.start的非空ID
-~~~
-
-## 逻辑
-
-~~~text
-main
-    -> Cli::parse()
-    -> run(command)
-    -> 错误写stderr并返回非零状态
-
-run_workspace_up
-    -> compose::compile(workspace_file)
-    -> request_id()
-    -> ClientMessage::register_connection("cli")
-    -> ClientMessage::start_workspace(id, &definition)
-    -> 分别序列化两个ClientMessage
-    -> tokio_tungstenite连接backend_url
-    -> 依次发送connection.register和workspace.start的Message::Text
-    -> 循环接收WebSocket消息和关闭信号
-       -> 首次关闭信号：若启动结果未到达，记住停止意图并继续等待；成功后发送workspace.stop，失败则直接报错退出（无本次占位）
-       -> 等待启动期间重复关闭信号：保持停止意图，不向Starting发送会被拒绝的停止请求
-       -> 关闭信号future跨WebSocket消息保留，不因select取消重建而丢失SIGTERM；仅收到一次信号后重新注册下一次等待
-       -> 等待同一请求ID的workspace.stopped
-       -> 收到回执后关闭WebSocket并正常退出
-       -> 再次信号、超时、停止失败或后端提前断开：关闭并报错退出
-       -> Text：解析ServerMessage::Log并打印
-       -> Text或UTF-8 Binary中的同ID workspace.started：记录已启动，打印成员失败详情并继续连接
-       -> 尚未收到成功回执时，同ID workspace.start_failed：报错并以非零状态退出；只用于Workspace自身创建失败
-       -> 成员失败及运行期成员日志：显示，不退出；成功回执后忽略重复或延迟的启动失败回执
-       -> UTF-8 Binary：按文本解析ServerMessage::Log
-       -> 非UTF-8 Binary：打印长度提示stderr
-       -> Ping：发送Pong
-       -> Close：打印关闭信息并结束
-       -> 网络错误：返回错误
-
-边界：
-    CLI只负责Compose编译、Workspace启动请求和日志显示
-    clap只负责命令行语法、帮助、版本、默认值和参数错误，不进入业务调用链
-    CLI不启动daemon、不创建ECS、不读取AgentDriver或资源正文
-    CLI不读取stdin，不处理UserMessage、AssistantMessage、ToolCall或LLM流
-    WebSocket传输只承载margatroid_protocol定义的请求和后端事件
-    正常运行期间收到关闭信号时，CLI退出前必须先完成workspace.stop业务回执；启动失败已由后端清理Workspace，直接报错退出，不发送workspace.stop
-~~~
-
-## 持有关系
-
-~~~text
-CLI进程
-├── Command
-├── WorkspaceDefinition（编译期间和请求构造期间持有）
-├── ClientMessage（序列化前持有）
-└── WebSocket连接
-    └── 接收后端文本/二进制消息
-~~~
+历史基线不提供当前通过数量；本次仅改文档，未运行测试或构建。

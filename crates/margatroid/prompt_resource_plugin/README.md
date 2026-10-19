@@ -1,6 +1,8 @@
 # prompt_resource_plugin
 
-已实现的提示资源加载与主线程挂载插件，不是资源执行器。
+当前源码中的提示资源加载与主线程挂载插件，不是资源执行器。
+
+本文只读核对源码，未运行测试；DTO Handler 重置后的整树恢复未验证，下述 API 与测试源码不构成端到端恢复或测试通过的证据。
 
 ## 安装与根目录
 
@@ -31,7 +33,7 @@ app.add_plugin(RuntimePlugin::default())
 
 按PromptResource.role构造ImportedValue::Message的Arc<[AgentMessage]>；system对应System、user对应User、assistant对应无tool_calls的Assistant，正文来自已读取content，不能将System降级为User。
 
-共享 `mount_resource_import` 在同一个受检主线程步骤内复检许可、准备按ID键替换的ResourceSet、借用原registry检查集合类型和全部地址，然后绑定并受检发布集合。发布失败不修改集合，并精确恢复旧ImportBindings。读取、校验或取消失败均保留旧条目和binding；None从不修改binding。成功重载后新GET取得新值，旧Block仍持有旧快照；IMPORT不自动注入、开放模型工具或激活沙箱。
+共享 `mount_resource_import` 在同一个受检主线程步骤内复检许可、准备按ID键替换的ResourceSet、借用原registry检查集合类型和全部地址，然后绑定并受检发布集合。发布失败不修改集合，并精确恢复旧ImportBindings。读取、校验或取消失败均保留旧条目和binding；None从不修改binding。成功重载后新GET取得新值，已返回的typed值和已提交任务仍持有原快照；持久SQLite Block保存资源ID，后续GET按当前导入绑定解析；IMPORT不自动注入、开放模型工具或激活沙箱。
 
 ## 读取、监督与发布
 
@@ -47,12 +49,12 @@ app.add_plugin(RuntimePlugin::default())
 
 ## 验证
 
-集成测试覆盖成功、失败保留、取消无挂载、generation复用、alias更新、目标隔离、其他key保持、重复结果、读取限长、UTF-8及symlink。五插件联合回归还覆盖错误类型与alias冲突保旧、typed GET、改名、旧Block快照、Prompt角色忠实及Sandbox纯重载不改激活。CallableResource只冻结元数据和文件路径，不承诺脚本/正文文件内容版本或多文件原子快照。完整字段、错误与生命周期边界见同目录 DESIGN。
+既有集成测试源码描述成功、失败保留、取消无挂载、generation复用、alias更新、目标隔离、其他key保持、重复结果、读取限长、UTF-8及symlink。Tool、Prompt、Sandbox三插件联合回归源码还描述错误类型与alias冲突保旧、typed GET、改名、已返回值/任务快照与持久Block后续GET解析当前绑定、Prompt角色忠实及Sandbox纯重载不改激活。CallableResource只冻结元数据和文件路径，不承诺脚本/正文文件内容版本或多文件原子快照。完整字段、错误与生命周期边界见同目录 DESIGN。
 
-## 可操作的加载诊断
+## 可操作的加载诊断（目标与当前缺口）
 
 加载失败必须保留完整 ResourceID、实际尝试的绝对文件或目录路径，以及底层 I/O、UTF-8、清单解析或校验原因；不得用笼统的“读取失败”覆盖原因，也不得在添加上下文时截断路径或原因。逐祖先检查失败同时保留最终尝试路径和失败的祖先路径。
 
 依赖加载器在原有错误外添加资源上下文，保留上层调用方已经提供的依赖链（包括请求 id 中的关联链）；本插件不凭空推断驱动来源，也不递归加载依赖。调用方应将 `driver -> dependency` 链追加在本错误之外；Driver 清单声明的依赖仍只解析地址，不检查存在性。缺失依赖由对应 tool、prompt 或 sandbox 加载器报告其自身完整地址及实际绝对路径。
 
-错误在异步读取、主线程挂载及业务回执之间传播时保留原分类和原因；诊断文本不再受插件的旧 512 字节/字符截断限制，公共错误类型不变。回归测试覆盖缺失驱动目录、缺失 driver.toml/base.lua，以及缺失各类依赖文件。
+目标是错误在异步读取、主线程挂载及业务回执之间传播时完整保留原分类和原因。本插件files辅助直接构造错误并保留读取/路径/上下文全文；共享导入与挂载校验使用的 `ResourceLoadError::new` 仍截取前 512 个 Unicode 字符，经过该构造器的诊断可能丢失路径或底层原因，尚不满足完整诊断目标；不得宣称已取消截断。缺失驱动目录、driver.toml/base.lua 与各类依赖文件的完整诊断仍需恢复后分别验证，本次未运行回归。

@@ -5,6 +5,7 @@ pub mod block_storage;
 pub mod block_types;
 pub mod client_components;
 pub mod client_events;
+pub mod discovery;
 pub mod dto_events;
 pub mod execution_components;
 pub mod history_components;
@@ -21,6 +22,7 @@ pub mod model_components;
 pub mod resource_components;
 pub mod resource_events;
 pub mod tool_events;
+pub mod workspace_catalog;
 pub mod workspace_components;
 pub mod workspace_events;
 pub mod workspace_execution;
@@ -50,6 +52,10 @@ pub use resource_components::{CallableDefinitionSnapshot, CallableResource, Sand
 pub use resource_id_plugin::{
     LibraryComponent, ResourceError, ResourceID, ResourceIDError, ResourceInner, ResourcePlugin,
     ResourcePluginInstalled, ResourceSet, ResourcesComponent, WorldResourceExt,
+};
+pub use workspace_catalog::{
+    workspace_resource_id, DriverCatalog, WorkspaceCatalog, WorkspaceCatalogEntry,
+    WorkspaceCatalogHandle, WorkspaceCatalogStore, WorkspaceDeletion,
 };
 pub use workspace_components::{
     Workspace, WorkspaceAgentDefinition, WorkspaceDefinition, WorldWorkspaceExt,

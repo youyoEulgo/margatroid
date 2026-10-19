@@ -1,4 +1,6 @@
 # 伪代码格式
+
+> 审计边界：本次只读比对源码并修改文档，未运行测试/构建。下文“已实现”描述可见代码结构，不证明草稿、跨插件时序、平台行为或端到端接线已验收；未闭合能力必须按明确目标实现和验证。
 ```text
 模块：使用一级标题，只写当前设计涉及的部分
 
@@ -37,7 +39,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # 实际动作受理与中止
 
-MCL已实现Creating / Idle / Working / Stopping轮次effect。start_turn要求Idle，生成turn并置Working，不覆盖；finish_turn核对准备阶段捕获的turn或当前实例最近中止关联，并要求该轮所有execution注册真实释放后才进入Idle。Idle完成幂等，Stopping不能被finish覆盖。inference/tool_call在异步准备后的实际动作核对当前turn；空turn或已失效捕获turn返回正常取消结果，不发领域请求。原StopAgent及Creating/Stopping真实清理契约不变。AgentPlugin控制System使用PRE_UPDATE，领域与MCL使用UPDATE；自定义schedule须保留控制优先。下列Driver/领域/协议跨插件规则需结合各自实现验证。
+MCL已实现Creating / Idle / Working / Stopping轮次effect。start_turn要求Idle，生成turn并置Working，不覆盖；finish_turn核对准备阶段捕获的turn或当前实例最近中止关联，并要求该轮所有execution注册真实释放后才进入Idle。Idle完成幂等，Stopping不能被finish覆盖。inference/tool_call在异步准备后的实际动作核对当前turn；空turn或已失效捕获turn返回正常取消结果，不发领域请求。原StopAgent及Creating/Stopping真实清理契约不变。AgentPlugin控制System使用PRE_UPDATE，MCL默认UPDATE，但InferencePlugin默认PRE_UPDATE；组合根及自定义schedule必须实际保证控制先于各领域受理，不可仅凭计划名推断。下列Driver/领域/协议跨插件规则需结合各自实现验证。
 
 ```text
 控制与受理：
@@ -150,7 +152,7 @@ parse_operation(instruction: &MclInstruction) -> Result<MclOperation, MclError>
 create_database_block(context: BlockExecutionContext, name: String, fields: Vec<FieldDeclaration>, temporary: bool) -> Result<MclValue, MclError>
     创建或打开数据库Block：私有异步函数
     行为：
-        普通Block以稳定AgentResourceID和block名称寻址，TEMP额外使用本次Driver启动实例命名空间
+        普通Block以名称派生的AgentResourceID（名称不变时稳定）和block名称寻址，TEMP额外使用本次Driver启动实例命名空间
         不存在则在事务中建立定义与typed空字段；已存在且完整字段声明相同则打开，不清空
         同名生命周期、字段数量/名称/类型不匹配返回SchemaMismatch，不静默迁移、合并或覆盖旧数据
         返回BlockOpened {created, temporary}，Driver只在created为true时填默认配置
@@ -354,7 +356,7 @@ MclCommandResult：命令结果，公开事件
 InferenceRequest：统一推理请求，公开事件
     tools: Vec<CallableResource>--替代resources:Vec<ResourceID>，定义于inference_events
     说明：其他关联、消息、取消与oneshot字段沿用领域契约，不由MCL复制完整结构。
-    推理分层（已实现）：MCL继续只提交领域消息与选定工具快照，不选择API格式或厂商，也不直接构造HTTP。InferencePlugin验证后构造共享纯值DomainRequest，再按模型路由provider与api_type转换；InferenceRequest仍为执行事件，不被DomainRequest替代。Driver无需因Chat Completions、Messages或无状态Responses切换而更换。Assistant可选replay随MESSAGE、显式history_append及结果保留；旧值缺字段为None，MCL不解释或伪造签名/加密API元数据。格式转换会拒绝跨格式replay和不可表达的参数，不通过丢失reasoning实现兼容；User支持独立images数组（media_type和原始base64 data），MESSAGE反序列化调用共享校验，MCL/Lua/持久上下文/显式历史保留图片；content仍单独保存文本；ToolCall结果也可含同形images，保持原tool_call_id及工具身份，MCL不将其转换为User。MCL不生成data URL或厂商图片块，这些由后续API适配器负责。
+    推理分层（当前源码结构，未在本次审计执行验证）：MCL继续只提交领域消息与选定工具快照，不选择API格式或厂商，也不直接构造HTTP。InferencePlugin验证后构造共享纯值DomainRequest，再按模型路由provider与api_type转换；InferenceRequest仍为执行事件，不被DomainRequest替代。Driver无需因Chat Completions、Messages或无状态Responses切换而更换。Assistant可选replay随MESSAGE、显式history_append及结果保留；旧值缺字段为None，MCL不解释或伪造签名/加密API元数据。格式转换会拒绝跨格式replay和不可表达的参数，不通过丢失reasoning实现兼容；User支持独立images数组（media_type和原始base64 data），MESSAGE反序列化调用共享校验，MCL/Lua/持久上下文/显式历史保留图片；content仍单独保存文本；ToolCall结果也可含同形images，保持原tool_call_id及工具身份，MCL不将其转换为User。MCL不生成data URL或厂商图片块，这些由后续API适配器负责。
 
 ToolExecuteRequest：单调用执行请求，公开事件
     resource: CallableResource--选定共享快照，自含ResourceID，不另建重复resource_id字段

@@ -31,8 +31,6 @@ pub struct MargatroidConfig {
     log_filter: Option<String>,
     logs: Vec<WebSocketMessageTarget>,
     backend_state: Vec<WebSocketMessageTarget>,
-    member_messages: Vec<WebSocketMessageTarget>,
-    streaming_member_messages: Vec<WebSocketMessageTarget>,
 }
 
 impl MargatroidConfig {
@@ -42,13 +40,9 @@ impl MargatroidConfig {
         log_filter: Option<String>,
         logs: Vec<WebSocketMessageTarget>,
         backend_state: Vec<WebSocketMessageTarget>,
-        member_messages: Vec<WebSocketMessageTarget>,
-        streaming_member_messages: Vec<WebSocketMessageTarget>,
     ) -> Result<Self, ConfigError> {
         validate_targets("logs", &logs)?;
         validate_targets("backend_state", &backend_state)?;
-        validate_targets("member_messages", &member_messages)?;
-        validate_targets("streaming_member_messages", &streaming_member_messages)?;
         if log_filter
             .as_deref()
             .is_some_and(|filter| filter.trim().is_empty())
@@ -62,8 +56,6 @@ impl MargatroidConfig {
             log_filter,
             logs,
             backend_state,
-            member_messages,
-            streaming_member_messages,
         })
     }
 
@@ -94,14 +86,6 @@ impl MargatroidConfig {
 
     pub fn backend_state(&self) -> &[WebSocketMessageTarget] {
         &self.backend_state
-    }
-
-    pub fn member_messages(&self) -> &[WebSocketMessageTarget] {
-        &self.member_messages
-    }
-
-    pub fn streaming_member_messages(&self) -> &[WebSocketMessageTarget] {
-        &self.streaming_member_messages
     }
 }
 
@@ -156,11 +140,6 @@ impl TryFrom<ConfigDocument> for MargatroidConfig {
             log_filter,
             decode_targets("logs", outbound.logs)?,
             decode_targets("backend_state", outbound.backend_state)?,
-            decode_targets("member_messages", outbound.member_messages)?,
-            decode_targets(
-                "streaming_member_messages",
-                outbound.streaming_member_messages,
-            )?,
         )?
         .with_ingress(ingress))
     }
@@ -425,8 +404,6 @@ fn decode_log_level(level: &str) -> Result<LogLevel, ConfigError> {
 pub(crate) struct OutboundDocument {
     pub(crate) logs: Vec<String>,
     pub(crate) backend_state: Vec<String>,
-    pub(crate) member_messages: Vec<String>,
-    pub(crate) streaming_member_messages: Vec<String>,
 }
 
 fn decode_targets(
@@ -508,9 +485,77 @@ mod tests {
             ]
         );
         assert_eq!(
-            plugin.config.streaming_member_messages(),
+            plugin.config.backend_state(),
             &[WebSocketMessageTarget::Type("webui".into())]
         );
+    }
+
+    #[test]
+    fn rejects_removed_outbound_fields_as_unknown() {
+        for field in ["member_messages", "streaming_member_messages"] {
+            let source = format!(
+                "[server]\nbind = \"127.0.0.1:3939\"\n[outbound]\nlogs = [\"broadcast\"]\nbackend_state = [\"broadcast\"]\n{field} = [\"broadcast\"]\n"
+            );
+            let error = match toml::from_str::<ConfigDocument>(&source) {
+                Ok(_) => panic!("removed field {field} was accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .message()
+                    .contains(&format!("unknown field `{field}`")),
+                "{error}"
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            std::fs::write(&path, source).unwrap();
+            assert_eq!(
+                ConfigPlugin::open(path).unwrap_err(),
+                ConfigError::DecodeFailed
+            );
+        }
+    }
+
+    #[test]
+    fn validates_both_remaining_target_groups() {
+        for field in ["logs", "backend_state"] {
+            for (targets, expected) in [
+                (Vec::new(), ConfigError::EmptyTargets(field)),
+                (
+                    vec![WebSocketMessageTarget::Type(String::new())],
+                    ConfigError::InvalidTarget(field),
+                ),
+                (
+                    vec![WebSocketMessageTarget::Name("bad\nname".into())],
+                    ConfigError::InvalidTarget(field),
+                ),
+                (
+                    vec![
+                        WebSocketMessageTarget::Broadcast,
+                        WebSocketMessageTarget::Broadcast,
+                    ],
+                    ConfigError::DuplicateTarget(field),
+                ),
+            ] {
+                let valid = vec![WebSocketMessageTarget::Broadcast];
+                let (logs, backend_state) = if field == "logs" {
+                    (targets, valid)
+                } else {
+                    (valid, targets)
+                };
+                assert_eq!(
+                    MargatroidConfig::new(
+                        "127.0.0.1:3939".parse().unwrap(),
+                        LogLevel::default(),
+                        None,
+                        logs,
+                        backend_state,
+                    )
+                    .unwrap_err(),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
@@ -543,8 +588,6 @@ mod tests {
             None,
             Vec::new(),
             vec![WebSocketMessageTarget::Broadcast],
-            vec![WebSocketMessageTarget::Broadcast],
-            vec![WebSocketMessageTarget::Broadcast],
         )
         .unwrap_err();
         assert_eq!(error, ConfigError::EmptyTargets("logs"));
@@ -556,8 +599,6 @@ mod tests {
             "127.0.0.1:3939".parse().unwrap(),
             LogLevel::default(),
             None,
-            vec![WebSocketMessageTarget::Broadcast],
-            vec![WebSocketMessageTarget::Broadcast],
             vec![WebSocketMessageTarget::Broadcast],
             vec![WebSocketMessageTarget::Broadcast],
         )
@@ -582,8 +623,6 @@ mod tests {
                 "[outbound]\n",
                 "logs = [\"broadcast\"]\n",
                 "backend_state = [\"broadcast\"]\n",
-                "member_messages = [\"broadcast\"]\n",
-                "streaming_member_messages = [\"broadcast\"]\n",
             ),
         )
         .unwrap();
@@ -631,8 +670,6 @@ mod tests {
             "127.0.0.1:3939".parse().unwrap(),
             LogLevel::default(),
             Some("  ".into()),
-            vec![WebSocketMessageTarget::Broadcast],
-            vec![WebSocketMessageTarget::Broadcast],
             vec![WebSocketMessageTarget::Broadcast],
             vec![WebSocketMessageTarget::Broadcast],
         )

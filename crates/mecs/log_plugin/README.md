@@ -29,4 +29,10 @@ app.tick();
 ```
 
 默认向 stderr 输出 `Info` 级 Compact 日志。可选 Layer 包括滚动文件和有界进程内
-`TracingStream`。
+`TracingStream`；默认不启用这两者。`with_filter` 的显式表达式完全覆盖
+`with_level` 生成的过滤指令，不与默认级别叠加，也不自动读取 `RUST_LOG`。
+
+`TracingStream` 是临时的有界广播：订阅只接收订阅后的记录，无接收者时直接丢弃，
+慢订阅者收到 `Lagged` 并累计丢失数。它不保存历史、不重放、不保证可靠送达或持久化；
+文件输出必须显式配置。应用守护进程采用的 stderr 加容量 256 诊断流是应用配置，
+不是 `LogPlugin::default()` 的框架默认值。

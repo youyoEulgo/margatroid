@@ -35,8 +35,6 @@ fn member_failure_events_publish_each_full_context_to_configured_logs_only() {
                 None,
                 targets.clone(),
                 vec![WebSocketMessageTarget::Type("state".into())],
-                vec![WebSocketMessageTarget::Broadcast],
-                vec![WebSocketMessageTarget::Broadcast],
             )
             .unwrap(),
         ))
@@ -53,7 +51,6 @@ fn member_failure_events_publish_each_full_context_to_configured_logs_only() {
         WorkspaceDefinition {
             id: workspace_id.clone(),
             name: "partial".into(),
-            manager: "manager".into(),
             project_root: "/tmp/partial".into(),
             agents: ["manager", "worker"]
                 .into_iter()
@@ -154,8 +151,6 @@ fn documented_public_api_publishes_state_for_the_configured_frontend_type() {
                 None,
                 vec![WebSocketMessageTarget::Broadcast],
                 vec![WebSocketMessageTarget::Type("browser".into())],
-                vec![WebSocketMessageTarget::Broadcast],
-                vec![WebSocketMessageTarget::Broadcast],
             )
             .unwrap(),
         ))

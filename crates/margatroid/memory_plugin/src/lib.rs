@@ -1,6 +1,8 @@
 mod blocks;
 mod database;
 mod history;
+mod migration;
+pub use migration::prepare_agent_identity_copy;
 
 use core_plugin::{App, Plugin, Resource};
 

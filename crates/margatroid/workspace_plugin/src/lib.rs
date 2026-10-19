@@ -1,3 +1,7 @@
+mod catalog;
+#[cfg(test)]
+mod catalog_tests;
+mod discovery;
 mod handler;
 mod system;
 #[cfg(test)]
@@ -38,7 +42,18 @@ impl Plugin for WorkspacePlugin {
         app.world_mut()
             .register_library::<Workspace>("workspace")
             .expect("WorkspacePlugin requires unified resource registry");
-        app.add_system(&self.schedule, system::start_workspace_system)
+        app.world_mut()
+            .insert_resource(catalog::Operations::default());
+        if !app
+            .world()
+            .contains_resource::<margatroid_types::workspace_catalog::WorkspaceCatalog>()
+        {
+            app.world_mut()
+                .insert_resource(margatroid_types::workspace_catalog::WorkspaceCatalog::default());
+        }
+        app.add_system(&self.schedule, discovery::system)
+            .add_system(&self.schedule, catalog::system)
+            .add_system(&self.schedule, system::start_workspace_system)
             .add_system(&self.schedule, system::stop_workspace_system)
             .add_system(&self.schedule, system::workspace_exception_system);
     }

@@ -8,6 +8,10 @@ margatroid_types = { path = "../types" }
 resource_id_plugin = { path = "../resource_id_plugin" }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+libc = "0.2"
+memory_plugin = { path = "../memory_plugin" }
 
 [dev-dependencies]
 tempfile = "3"
+rusqlite = { workspace = true }

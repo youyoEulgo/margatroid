@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 core_plugin = { path = "../../mecs/core_plugin" }
 margatroid_types = { path = "../types" }
-rusqlite = { workspace = true, features = ["hooks"] }
+rusqlite = { workspace = true, features = ["hooks", "backup"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]

@@ -19,6 +19,8 @@ pub(crate) struct PendingMclCommandResponses {
     pub(crate) commands: Vec<PendingMclCommandResponse>,
     pub(crate) workspaces: Vec<PendingWorkspaceResponse>,
     pub(crate) snapshots: Vec<PendingSnapshot>,
+    pub(crate) catalog: Vec<PendingCatalogResponse>,
+    pub(crate) discovery: Vec<PendingDiscoveryResponse>,
 }
 pub(crate) struct PendingSnapshot {
     pub(crate) operation_id: String,
@@ -41,7 +43,7 @@ pub(crate) struct PendingWorkspaceResponse {
     pub(crate) connection_id: WebSocketConnectionId,
     pub(crate) client: Entity,
     pub(crate) stopping: bool,
-    pub(crate) reference: WorkspaceReferenceDto,
+    pub(crate) reference: Option<WorkspaceReferenceDto>,
 }
 
 pub(crate) struct PendingAbortResponse {
@@ -54,4 +56,44 @@ pub(crate) struct PendingAbortResponse {
     pub(crate) workspace: WorkspaceReferenceDto,
     pub(crate) instance: margatroid_types::lua_runtime_components::DriverLuaVmInstance,
     pub(crate) turn_id: String,
+}
+
+pub(crate) struct PendingDiscoveryResponse {
+    pub(crate) operation_id: String,
+    pub(crate) id: String,
+    pub(crate) connection_id: WebSocketConnectionId,
+    pub(crate) client: Entity,
+    pub(crate) kind: DiscoveryOperation,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiscoveryOperation {
+    Paths,
+    DriverQuery,
+    DriverRefresh,
+}
+
+pub(crate) struct PendingCatalogResponse {
+    pub(crate) operation_id: String,
+    pub(crate) id: String,
+    pub(crate) connection_id: WebSocketConnectionId,
+    pub(crate) client: Entity,
+    pub(crate) kind: CatalogOperation,
+}
+/// Catalog-definition operation that replies with `workspace.member.result`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CatalogOperation {
+    Query,
+    Refresh,
+    MemberAdd,
+    MemberRemove,
+    Create,
+    Rename,
+    Delete,
+    MemberRename,
+}
+impl CatalogOperation {
+    /// Whole-catalog replies use `workspace.catalog`; definition edits use the entry reply.
+    pub(crate) fn entry_reply(self) -> bool {
+        !matches!(self, Self::Query | Self::Refresh)
+    }
 }

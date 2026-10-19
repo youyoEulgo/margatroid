@@ -191,7 +191,7 @@ raw_signal(signal: ProcessSignal) -> io::Result<i32>
 
 自动回收：
     App及其Schedule被销毁
-        -> World和STARTUP闭包持有的SignalHandle克隆被释放
+        -> World和STARTUP闭包持有的SignalHandle克隆被释放；外部克隆仍可能延长生命周期
         -> 最后一个Arc触发SignalInner::drop
         -> 关闭迭代器并join线程
 
@@ -199,7 +199,9 @@ raw_signal(signal: ProcessSignal) -> io::Result<i32>
     SignalPlugin只监听当前进程的操作系统信号
     SignalPlugin不监听键盘事件；Ctrl+C仅因为终端驱动通常将其转换为SIGINT
     SignalPlugin不决定信号对应的业务策略，也不直接关闭Runtime、Server或Workspace
-    SignalPlugin不缓冲、不限流信号事件；每次捕获都直接进入Core事件队列并唤醒Runtime
+    SignalPlugin不自行缓冲或限流信号事件；迭代器每次产出都直接进入Core事件队列并唤醒Runtime
+    signal-hook可能合并同类信号，不保证每次操作系统投递都对应独立事件
+    调用方应在对应Runtime销毁前shutdown并释放外部句柄，避免向失效通知通道发送
     SIGKILL与SIGSTOP无法被进程捕获，因此始终拒绝注册
     非Unix平台当前只保证Interrupt与Terminate
 ```

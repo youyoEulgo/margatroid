@@ -12,7 +12,7 @@ fn id(kind: &str, name: &str) -> ResourceID {
 fn workspace_member_failures_are_backward_compatible_and_lossless() {
     let legacy = serde_json::json!({
         "id": "workspace:test/demo:latest", "name": "demo", "project_root": "/tmp/demo",
-        "manager": "agent:test/manager:latest", "agents": ["agent:test/manager:latest"]
+        "agents": ["agent:test/manager:latest"]
     });
     let mut dto: WorkspaceInfoDto = serde_json::from_value(legacy.clone()).unwrap();
     assert!(dto.member_failures.is_empty());
@@ -53,7 +53,6 @@ fn workspace_entity_and_backend_project_failures_but_definition_does_not() {
     let definition = WorkspaceDefinition {
         id: id("workspace", "partial"),
         name: "partial".into(),
-        manager: "manager".into(),
         project_root: "/tmp/partial".into(),
         agents: vec![WorkspaceAgentDefinition {
             id: id("agent", "manager"),
@@ -91,13 +90,24 @@ fn workspace_entity_and_backend_project_failures_but_definition_does_not() {
     );
     let backend: BackendStateDto = ().into_dto(&*world).unwrap();
     assert_eq!(backend.workspaces, vec![actual.clone()]);
-    let missing = resolve_agent(world, &actual.reference(), None).unwrap_err();
+    let missing = resolve_agent(
+        world,
+        &actual.reference(),
+        &ResourceIdDto(id("agent", "manager").to_string()),
+    )
+    .unwrap_err();
     assert_eq!(missing.kind(), ProtocolErrorKind::AgentNotFound);
-    assert!(missing.message().contains("manager unavailable"));
+    assert!(missing.message().contains("agent unavailable"));
     assert!(missing.message().contains("missing module 原始错误"));
     let wrong = WorkspaceReferenceDto::new("wrong", "/tmp/wrong");
     assert_eq!(
-        resolve_agent(world, &wrong, None).unwrap_err().kind(),
+        resolve_agent(
+            world,
+            &wrong,
+            &ResourceIdDto(id("agent", "manager").to_string())
+        )
+        .unwrap_err()
+        .kind(),
         ProtocolErrorKind::WorkspaceNotFound
     );
     tokio_runtime_close(close);
@@ -278,7 +288,7 @@ fn command_uses_arguments_and_source_only_from_conversion_context() {
     let message = ClientMessage::mcl_command(
         "command",
         &WorkspaceReferenceDto::new("demo", "/tmp/demo"),
-        None,
+        ResourceIdDto(id("agent", "manager").to_string()),
         "INJECT ?",
         vec![serde_json::json!([{ "type": "user", "content": "hello" }])],
     );
@@ -425,7 +435,7 @@ fn import_projection_retains_kind_and_manual_array_arguments_are_not_decoded_as_
     assert_eq!(dto.result.unwrap()["ResourceImport"]["kind"], "Tool");
     let dto = MclCommandDto {
         workspace: WorkspaceReferenceDto::new("demo", "/tmp/demo"),
-        agent: None,
+        agent: ResourceIdDto(id("agent", "manager").to_string()),
         command: "SET TOOLS ?".into(),
         arguments: vec![serde_json::json!(["reader"])],
     };
@@ -524,7 +534,7 @@ fn message_conversion_enforces_depth_limit_without_a_type_whitelist() {
 }
 
 #[test]
-fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
+fn explicit_agent_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
     use core_plugin::App;
     use margatroid_types::{
         agent_components::{Agent, AgentInfo, AgentState},
@@ -570,7 +580,6 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
     let definition = WorkspaceDefinition {
         id: id("workspace", "one"),
         name: "one".into(),
-        manager: "manager".into(),
         project_root: "/tmp/one".into(),
         agents: vec![WorkspaceAgentDefinition {
             id: id("agent", "manager"),
@@ -643,7 +652,16 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
         .get_component_mut::<Workspace>(workspace)
         .unwrap()
         .insert_agent(id("agent", "manager"), old);
-    assert_eq!(resolve_agent(&world, &reference, None).unwrap().0, old);
+    assert_eq!(
+        resolve_agent(
+            &world,
+            &reference,
+            &ResourceIdDto(id("agent", "manager").to_string())
+        )
+        .unwrap()
+        .0,
+        old
+    );
     let old_state: AgentStateDto = old.into_dto(&*world).unwrap();
     assert_eq!(
         old_state.sandbox,
@@ -695,12 +713,26 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
     world.despawn(old);
     let new = world.spawn();
     world.insert_library(new, make_agent()).unwrap();
-    assert!(resolve_agent(&world, &reference, None).is_err());
+    assert!(resolve_agent(
+        &world,
+        &reference,
+        &ResourceIdDto(id("agent", "manager").to_string())
+    )
+    .is_err());
     world
         .get_component_mut::<Workspace>(workspace)
         .unwrap()
         .insert_agent(id("agent", "manager"), new);
-    assert_eq!(resolve_agent(&world, &reference, None).unwrap().0, new);
+    assert_eq!(
+        resolve_agent(
+            &world,
+            &reference,
+            &ResourceIdDto(id("agent", "manager").to_string())
+        )
+        .unwrap()
+        .0,
+        new
+    );
     let new_state: AgentStateDto = new.into_dto(&*world).unwrap();
     // A fresh entity cannot inherit metadata from the old generation or catalog.
     assert!(new_state.context_window_tokens.is_none());
@@ -711,7 +743,12 @@ fn manager_resolution_rejects_stale_entity_generation_and_wrong_workspace() {
     assert_ne!(old_state.agent_instance, new_state.agent_instance);
     let mut wrong = reference.clone();
     wrong.project_root = "/tmp/wrong".into();
-    assert!(resolve_agent(&world, &wrong, None).is_err());
+    assert!(resolve_agent(
+        &world,
+        &wrong,
+        &ResourceIdDto(id("agent", "manager").to_string())
+    )
+    .is_err());
     world
         .get_component_mut::<Workspace>(workspace)
         .unwrap()
@@ -731,13 +768,13 @@ fn tokio_runtime_close(close: margatroid_types::workspace_execution::WorkspaceEx
 
 #[test]
 fn abort_wire_requires_turn_and_never_accepts_entity_identity() {
-    let request = serde_json::json!({"type":"agent.turn.abort","id":"abort-1","message":{"workspace":{"id":"workspace:test/demo","name":"demo","project_root":"/tmp/demo"},"turn_id":"turn-1"}});
+    let request = serde_json::json!({"type":"agent.turn.abort","id":"abort-1","message":{"workspace":{"id":"workspace:test/demo","name":"demo","project_root":"/tmp/demo"},"turn_id":"turn-1","agent":"agent:test/demo"}});
     let parsed: ClientMessage = serde_json::from_value(request.clone()).unwrap();
     assert_eq!(parsed.id(), "abort-1");
     let ClientMessage::AgentTurnAbort { message, .. } = parsed else {
         panic!("wrong request")
     };
-    assert!(message.agent.is_none());
+    assert_eq!(message.agent.0, "agent:test/demo");
     assert_eq!(message.turn_id, "turn-1");
     let mut missing = request;
     missing["message"]
@@ -775,4 +812,165 @@ fn cancelled_assistant_round_trip_and_legacy_default() {
             ..
         }
     ));
+}
+
+#[test]
+fn catalog_preserves_empty_and_invalid_stopped_workspaces_without_database_paths() {
+    use margatroid_types::{
+        workspace_catalog::{WorkspaceCatalog, WorkspaceCatalogEntry},
+        workspace_components::WorkspaceDefinition,
+    };
+    let mut world = core_plugin::World::default();
+    let definition = WorkspaceDefinition {
+        id: id("workspace", "empty"),
+        name: "empty".into(),
+        project_root: "/tmp/empty".into(),
+        agents: vec![],
+    };
+    let dto: WorkspaceInfoDto = (&definition).into_dto(()).unwrap();
+    assert!(dto.agents.is_empty());
+    world.insert_resource(WorkspaceCatalog(vec![
+        WorkspaceCatalogEntry {
+            id: definition.id.clone(),
+            name: "empty".into(),
+            path: "/tmp/empty/workspace.yaml".into(),
+            revision: "rev-a".into(),
+            definition: Some(definition),
+            error: None,
+        },
+        WorkspaceCatalogEntry {
+            id: id("workspace", "broken"),
+            name: "broken".into(),
+            path: "/tmp/broken/workspace.yaml".into(),
+            revision: "rev-b".into(),
+            definition: None,
+            error: Some("invalid YAML".into()),
+        },
+    ]));
+    let state: BackendStateDto = ().into_dto(&world).unwrap();
+    assert_eq!(state.catalog.len(), 2);
+    assert!(state.workspaces.is_empty());
+    assert!(state.agents.is_empty());
+    assert!(state
+        .catalog
+        .iter()
+        .all(|entry| entry.lifecycle == "stopped"));
+    assert!(state.catalog[0].error.is_some());
+    let encoded = serde_json::to_value(&state).unwrap();
+    assert!(encoded["catalog"][1]["definition"].get("manager").is_none());
+    assert!(encoded["catalog"][1]["definition"]["agents"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let legacy: BackendStateDto =
+        serde_json::from_value(serde_json::json!({"workspaces":[],"agents":[],"histories":[]}))
+            .unwrap();
+    assert!(legacy.catalog.is_empty());
+}
+
+#[test]
+fn workspace_start_accepts_only_registered_identity_and_revision() {
+    let request = ClientMessage::start_workspace(
+        "start",
+        ResourceIdDto(id("workspace", "empty").to_string()),
+        "rev-a",
+    );
+    let json = serde_json::to_value(request).unwrap();
+    assert_eq!(
+        json["message"],
+        serde_json::json!({"workspace":"workspace:test/empty:latest","expected_revision":"rev-a"})
+    );
+    assert!(serde_json::from_value::<ClientMessage>(
+        serde_json::json!({"type":"workspace.start","id":"old","message":{"definition":{}}})
+    )
+    .is_err());
+    let mut arbitrary = json;
+    arbitrary["message"]["definition"] = serde_json::json!({"history_path":"/arbitrary"});
+    assert!(serde_json::from_value::<ClientMessage>(arbitrary).is_err());
+}
+
+#[test]
+fn discovery_wire_defaults_and_shapes_match_shared_contracts() {
+    for kind in [
+        "workspace.paths.query",
+        "driver.catalog.query",
+        "driver.catalog.refresh",
+    ] {
+        let request: ClientMessage =
+            serde_json::from_value(serde_json::json!({"type":kind,"id":"discovery","message":{}}))
+                .unwrap();
+        assert_eq!(request.id(), "discovery");
+        assert_eq!(serde_json::to_value(&request).unwrap()["type"], kind);
+        if let ClientMessage::WorkspacePathsQuery { message, .. } = request {
+            let event: margatroid_types::discovery::QueryProjectDirectories =
+                message.into_domain("internal-op".into()).unwrap();
+            assert_eq!(event.id, "internal-op");
+            assert!(event.path.is_none());
+            assert!(event.cursor.is_none());
+        }
+    }
+    let request: ClientMessage = serde_json::from_value(serde_json::json!({"type":"workspace.paths.query","id":"page","message":{"path":"/project","cursor":"opaque"}})).unwrap();
+    let ClientMessage::WorkspacePathsQuery { message, .. } = request else {
+        unreachable!()
+    };
+    let event: margatroid_types::discovery::QueryProjectDirectories =
+        message.into_domain("page-op".into()).unwrap();
+    assert_eq!(event.path.unwrap(), std::path::PathBuf::from("/project"));
+    assert_eq!(event.cursor.as_deref(), Some("opaque"));
+    assert!(serde_json::from_value::<ClientMessage>(serde_json::json!({"type":"workspace.paths.query","id":"page","message":{"history_path":"/private"}})).is_err());
+    let page = ServerMessage::WorkspacePaths {
+        id: "page".into(),
+        path: "/".into(),
+        parent: None,
+        directories: vec![ProjectDirectoryEntryDto {
+            name: "project".into(),
+            path: "/project".into(),
+        }],
+        next_cursor: None,
+    };
+    let value = serde_json::to_value(&page).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"type":"workspace.paths","id":"page","path":"/","parent":null,"directories":[{"name":"project","path":"/project"}]})
+    );
+    assert_eq!(
+        serde_json::from_value::<ServerMessage>(value).unwrap(),
+        page
+    );
+    let drivers = ServerMessage::DriverCatalog {
+        id: "drivers".into(),
+        drivers: vec![ResourceIdDto("driver:test/base:latest".into())],
+        errors: vec![DiscoveryErrorDto {
+            path: "/drivers/broken".into(),
+            message: "invalid package".into(),
+        }],
+    };
+    let value = serde_json::to_value(&drivers).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"type":"driver.catalog","id":"drivers","drivers":["driver:test/base:latest"],"errors":[{"path":"/drivers/broken","message":"invalid package"}]})
+    );
+    assert_eq!(
+        serde_json::from_value::<ServerMessage>(value).unwrap(),
+        drivers
+    );
+}
+
+#[test]
+fn all_agent_routes_reject_missing_or_null_agent() {
+    for kind in ["mcl.command", "history.query", "agent.turn.abort"] {
+        for explicit_null in [false, true] {
+            let mut message = serde_json::json!({"workspace":{"id":"workspace:test/demo:latest","name":"demo","project_root":"/tmp/demo"},"command":"GET context","turn_id":"turn"});
+            if explicit_null {
+                message["agent"] = serde_json::Value::Null;
+            }
+            assert!(
+                serde_json::from_value::<ClientMessage>(
+                    serde_json::json!({"type":kind,"id":"route","message":message})
+                )
+                .is_err(),
+                "{kind} must require explicit agent"
+            );
+        }
+    }
 }

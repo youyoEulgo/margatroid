@@ -100,11 +100,11 @@ ServerError：服务器错误，公开枚举--描述Plugin依赖、路由注册�
 
 ServerOptions：服务器配置，公开结构体--配置监听、HTTP、WebSocket和停止边界
     bind_address: SocketAddr--监听地址，crate公开，默认127.0.0.1:3939
-    body_limit: usize--请求体上限，crate公开
-    response_start_timeout: Duration--响应开始超时，crate公开
-    stream_buffer_capacity: usize--HTTP流缓冲容量，crate公开
-    websocket_buffer_capacity: usize--WebSocket通道容量，crate公开
-    shutdown_timeout: Duration--优雅停止超时，crate公开
+    body_limit: usize--HTTP委托请求体上限，crate公开，默认8 MiB，与WebSocket的32 MiB限制独立
+    response_start_timeout: Duration--响应开始超时，crate公开，默认30秒
+    stream_buffer_capacity: usize--HTTP流缓冲容量，crate公开，默认32条
+    websocket_buffer_capacity: usize--WebSocket通道容量，crate公开，默认64条
+    shutdown_timeout: Duration--优雅停止超时，crate公开，默认10秒
     handshake_guard: Arc<dyn HandshakeGuard>--握手判定接缝，crate公开，默认AllowAllHandshakes
     DEFAULT_PORT: u16--默认端口3939，公开关联常量
     bind(address: SocketAddr) -> Self
@@ -143,6 +143,8 @@ ServerOptions：服务器配置，公开结构体--配置监听、HTTP、WebSock
         获取WebSocket通道容量：公开方法，返回websocket_buffer_capacity
     shutdown_timeout(&self) -> Duration
         获取停止超时：公开方法，返回shutdown_timeout
+    handshake_guard(&self) -> Arc<dyn HandshakeGuard>
+        获取握手判定：公开方法，克隆并返回当前策略的Arc
     impl Default for ServerOptions
         Default：公开trait实现，构造安全默认配置
     impl Resource for ServerOptions
@@ -168,7 +170,7 @@ HttpResponseSession：HTTP响应会话，公开结构体--可在System、事件�
         行为：仅Streaming状态可用；设置正常结束标记并关闭通道
     abort(&self, error: HttpStreamError) -> Result<(), HttpResponseError>
         异常结束：公开异步方法，error作为Body终止错误
-        行为：仅Streaming状态可用；发送错误并将会话标记为异常关闭
+        行为：仅Streaming状态可用；先标记异常关闭，释放状态锁，再等待通道容量发送错误
     is_started(&self) -> bool
         检查已开始：公开方法，非Waiting状态返回true
     is_closed(&self) -> bool
@@ -259,6 +261,15 @@ WebSocketProtocolError：WebSocket协议错误，公开枚举
         Display：公开trait实现，输出信封或支流状态错误
     impl std::error::Error for WebSocketProtocolError
         Error：公开trait实现
+
+HandshakeGuard：握手判定，公开trait--由业务提供连接准入策略
+    继承：fmt::Debug + Send + Sync + 'static
+    guard(&self, peer: SocketAddr, origin: Option<&str>, host: Option<&str>) -> Result<(), String>
+        判定握手：公开方法，Ok允许升级，Err提供拒绝原因
+
+AllowAllHandshakes：默认握手判定，公开单元结构体
+    impl HandshakeGuard for AllowAllHandshakes
+        HandshakeGuard：公开trait实现，始终返回Ok(())
 
 WebSocketMessageClassifier：WebSocket消息分类器，公开trait--将一条原始消息分为普通消息或支流消息
     继承：Send + Sync + 'static
@@ -592,6 +603,7 @@ ServerBridgeState：服务器桥接状态，私有结构体--HTTP和WebSocket Ha
     response_start_timeout: Duration--响应开始超时
     stream_buffer_capacity: usize--HTTP流缓冲容量
     websocket_buffer_capacity: usize--WebSocket通道容量
+    handshake_guard: Arc<dyn HandshakeGuard>--握手判定策略
 
 WebSocketRouteState：WebSocket路由状态，私有结构体
     bridge: ServerBridgeState--服务器桥接状态
@@ -733,6 +745,9 @@ ServerPlugin边界：
     流分片不进入ECS事件队列，事件只传递连接、普通消息和支流打开等状态
     流式HTTP上传、原生Axum提取器和中间件使用原生路由
     文件存储与落盘、prompt、token、tool call和业务协议不属于ServerPlugin
+    WebSocketMessageSender只接收已解析的发送器集合和消息，不解释业务target，不充当应用管理器
+    工作区扫描、中央目录、provider路由和文件系统操作由应用层负责，工作区/侧边栏设计不改变基础设施职责
+    32 MiB接收边界与当前DTO输入大小校验一致；HTTP委托body_limit仍是独立的8 MiB默认值
 ```
 
 ## 持有关系

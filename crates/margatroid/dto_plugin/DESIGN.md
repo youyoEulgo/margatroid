@@ -1,334 +1,137 @@
-# 伪代码格式
-```text
-模块：使用一级标题，只写当前设计涉及的部分
+# DtoPlugin
 
-类型：使用二级标题，按私有、crate公开和公开分组
-TypeName：中文类型名，可见性类型--类型说明
-    field_name: RustType--中文字段名，字段说明
-    method_name<Generic>(self, parameter: ParameterType) -> ReturnType
-        中文方法名：可见性方法，解释参数和用途
-        约束：使用标准Rust where约束；单个约束写在同一行
-        行为：展开完整逻辑
-    impl TraitName for TypeName
-        TraitName：可见性trait实现
-        trait_method_name(&self, parameter: ParameterType) -> ReturnType
-            中文方法名：解释参数和用途
-            行为：标准库trait的简单行为用一句话说明
+## 当前状态与范围
 
-函数：使用二级标题，按私有和公开分组，只放置不属于某个类型的操作
-function_name<Generic>(parameter: ParameterType) -> ReturnType
-    中文函数名：可见性函数，解释参数和用途
-    约束：使用标准Rust where约束；单个约束写在同一行
-    行为：展开完整逻辑
+当前 catalog、注册启动、成员增删、工作区创建/改名/删除、成员改名、Driver 发现及后端目录浏览均已实现并完成恢复验证。验证仅覆盖已执行的 scoped、真实存储集成和隔离数据浏览器场景，不构成所有故障或环境的普遍保证。
 
-逻辑：使用二级标题，按执行顺序描述对象之间的调用关系
-注释：字段注释使用--，类型、方法和函数的说明直接写在标题中
-属性：不写Rust Attribute，实现时自行判断
-边界：对外使用泛型和具体类型，内部使用类型擦除
-```
-
-# 板块格式
-
-每个 crate 的 DESIGN.md 在伪代码格式之后使用六个一级标题，按 `lib`、`system`、`handler`、`events`、`types`、`error` 顺序组织。每个标题对应 `src/` 下的同名 Rust 文件：
-
-```text
-# lib        src/lib.rs        图书馆组件与 Plugin
-# system     src/system.rs     System 函数
-# handler    src/handler.rs    处理函数
-# events     src/events.rs     事件类型
-# types      src/types.rs      其余类型
-# error      src/error.rs      Error 与公开错误分类
-```
-
-# 当前实现与旧设计归档
-
-当前实现以README及protocol当前wire为准。下文六板块保留为迁移前设计档案（已实现的中止契约节除外），不再要求恢复其中旧Mailbox、AgentFailure、资源visibility、Memory和oneshot pending轮询接口。
-
-当前入站为connection.register、workspace.start/stop、agent.turn.abort、mcl.command、state.query、history.query；source绑定共享Client.resource_id。共享WebSocketMessageSend为target+serde_json::Value，事件定义在types::dto_events，插件仅re-export。MCL结果按id/source/target关联并核对完整Client Entity；Workspace结果使用内部唯一operation_id还原网络id。断连清理MCL/start/stop/abort/snapshot网络pending，不取消已提交领域操作，迟到结果不重建网络关联。
-
-状态来自共享Agent.state/turn/sandbox/mcl和history.list；快照及接收连接集合未变化时不发送，避免event-driven自循环。投影sequence为list顺序1-based，created_at_ms保留HistoryRecord创建时间，旧记录0表示未知。旧实时Memory、消息广播与AgentTokenUsage聚合不保留。
-
-## 用户轮次中止契约（已实现）
-
-独立控制请求转换为共享 AbortAgentTurn；网络层仅保存发起连接与完整领域关联，不恢复旧邮箱或执行 pending 轮询。无 `get_turn`。
-
-- 请求：`{ "type":"agent.turn.abort", "id":"abort-1", "message":{ "workspace":{id,name,project_root}, "agent":null, "turn_id":"turn-1" } }`。`id` 为网络请求关联，`turn_id` 为必填非空的预期活动轮次；agent 为 null 时选择 manager，其余身份规则与 MCL 相同。
-- 回执：`agent.turn.abort_result { id, workspace, agent, turn_id, result }`；result 使用 `{"Ok":null}` / `{"Err":{kind,message}}`。Ok 仅确认中止已受理或该关联轮次已中止，不证明执行 cleanup 已结束；失败保留请求 id。仅回复发起连接，source 来自真实注册 Client。
-- 入口受检解析 Workspace 与当前成员的完整实例，实际处理再次核对 turn_id；旧/不匹配轮次不得取消新轮次。对同一已中止轮次（含 Working 且 turn=None）重复请求幂等成功，仅保留必要已中止关联，不恢复全局 pending 表；未识别轮次报关联错误。
-- 状态为 `creating/idle/working/stopping`。中止立即清空 turn，真实清理期间保持 Working，正常 finish 收口才 Idle；状态同步同时发布 turn 与 status。前端据 status 显示运行态、据 turn 关联中止，不能把回执或 turn=None 当作 Idle。
-- AgentPlugin 将 abort_agent_turn_system 固定安装到 RuntimePlugin::PRE_UPDATE，先于 UPDATE 中的 MCL 实际执行及 inference/tool admission。共享事件允许各消费者独立观察，不靠 take reply 独占中止通知；执行前再次核对请求轮次，turn=None 或已中止旧轮次不启动推理/工具而返回正常取消结果。
-- Assistant 新增 stop_reason，覆盖全部推理原因，新增 `StopReason::Cancelled` 序列化 `cancelled`。兼容保留 `InferenceResponse.stop_reason`，单一权威映射生成，两处始终相同。用户轮次中止且真实清理成功返回 Ok assistant：保留已接受的部分 `content` 与 `reasoning`（二者皆空则保持空值，不填充取消文案），`replay=None`、`tool_calls=[]`、`usage=None`、`stop_reason=Cancelled`。
-- 取消工具且清理成功返回 Ok ToolCall：`failed=true`、`content="Tool call aborted."`，保留调用 ID、名称及已知 resource_id。批次保留已完成真实结果，其余每个调用（包括未启动项）各有一个原序结果；不虚构部分执行成功，不撤销已发生副作用。
-- `CleanupFailed` 仍为 Err，保留活动，不伪造取消或 Idle。用户轮次中止不同于根 Agent shutdown、owner abort、timeout、receiver closed，不统一转换这些原因。
-- 历史只经显式 history_append 保存；Assistant stop_reason 存入 payload 元数据而非 content。cancelled assistant 可入历史，不得进入 infer 上下文（包括 Inject 嵌套）。
+DtoPlugin 是 WebSocket 与共享领域事件之间的边界，不执行 MCL、SQLite、YAML、磁盘扫描或数据库迁移，不依赖业务插件实现。Protocol 定义传输值及纯转换，共享 types 定义领域事件与能力，组合根安装真实实现。
 
 # lib
 
-以下为归档设计：lib 放 Plugin、安装标记 Resource 和公开 re-export。
-
-## 类型
-
-公开：
-```text
-WebSocketMessageTarget：发送目标，公开枚举--由config_plugin重新导出
-    Broadcast--全部连接
-    Type(String)--指定connection_type的连接
-    Name(String)--指定唯一连接名称
-
-DtoPlugin：WebSocket DTO转换插件，公开结构体--注册WebSocket路由并在协议DTO与领域事件之间转换
-    websocket_path: String--WebSocket路由路径，私有
-    schedule: String--dto_route_system所属Runtime schedule，私有
-    new() -> Self
-        构造插件：公开关联函数，使用默认路径/ws和RuntimePlugin::UPDATE
-    with_websocket_path(mut self, path: impl Into<String>) -> Self
-        设置路径：公开构建方法
-    with_schedule(mut self, schedule: impl Into<String>) -> Self
-        设置Schedule：公开构建方法
-    impl Default for DtoPlugin
-        Default：公开trait实现，调用new
-    impl Plugin for DtoPlugin
-        Plugin：公开trait实现
-        build(self, app: &mut App)
-            安装插件：公开trait方法
-            行为：
-                重复安装时panic
-                Schedule不存在时panic
-                ServerPlugin未安装WebSocketConnections时panic
-                读取MargatroidConfig和TracingStream，启动forward_logs异步日志转发
-                插入DtoPluginInstalled、BackendStateReportCache和PendingMclCommandResponses
-                注册WebSocket事件路由，并在schedule挂载collect_external_events_system和dto_route_system
-```
-
-私有：
-```text
-DtoPluginInstalled：DtoPlugin安装标记，私有单元Resource--阻止同一App重复安装
-    impl Resource for DtoPluginInstalled
-```
+安装 /ws 事件路由、结果收集与普通出站投影，持有网络响应映射及 BackendStateReportCache，订阅 TracingStream。要求 Runtime/AsyncRuntime、ServerPlugin、ConfigPlugin 和日志流已由组合根安装；不在本插件启动另一个服务器或构建工作区目录。
 
 # system
 
-system 放 System 函数。System 只读取本帧事件并克隆，然后调用 handler。
-
-## 函数
-
-crate公开：
 ```text
-dto_route_system(world: &mut World)
-    路由WebSocket API：crate公开System
-    处理事件：WebSocketMessageReceived、WebSocketMessageSend
-    行为：
-        克隆本帧全部WebSocketMessageReceived，逐个调用handle_inbound_message
-        调用handle_pending_mcl_responses处理已完成的MCL命令
-        克隆本帧全部WebSocketMessageSend，调用handle_outbound_messages
-
-collect_external_events_system(world: &mut World)
-    收集外部事件：crate公开System
-    行为：调用handle_collect_external_events
+dto_route_system
+    克隆本帧WebSocketMessageReceived，逐项handle_inbound_message
+    清理断连/旧Client generation的网络pending
+    消费中止与MCL完成结果并匹配原请求
+    发送已准备好的WebSocketMessageSend
+collect_external_events_system
+    处理server/注册/目录/变更/工作区/路径/Driver清单结果
+    发布实际成员失败日志
+    根据元数据/目录/接收者变化及必要dirty信号准备权威状态
 ```
+
+这些路由和收口系统当前已实现。事件读取非独占、通常下一帧可见；关联结果只由本插件自有pending一次收口，不能把共享event_reader当消费队列。
 
 # handler
 
-handler 放处理函数。入站解包、出站序列化、外部事件投影和日志转发都在此展开。
+## 入站保护
 
-## 函数
+Text总上限32MiB，与WebSocket接收一致。超限记录字节数、不含载荷，关闭1009；解析/结构错误有非空有界id则关联request.failed，无法关联则关闭1007。显式Agent缺失/null给出修复提示，不回显图片/私有字段。没有无反馈的1MiB早退。
 
-crate公开：
+验证信封id、真实注册Client；除注册外未注册返回关联错误，不延后重试。Source绑定当前Client.resource_id。重复检测覆盖aborts/commands/workspaces/snapshots/catalog及新路径/Driver查询关联，同一Client在途id冲突拒绝；不同Client同网络id允许且不能串回执。
+
+## 路由表
+
+| 请求 | 领域动作 | 回执 |
+| --- | --- | --- |
+| connection.register | RegisterConnection | connection.registered / register_failed |
+| workspace.catalog.query / refresh | QueryWorkspaceCatalog / RefreshWorkspaceCatalog | workspace.catalog |
+| workspace.start | StartRegisteredWorkspace，仅ID+expected_revision | workspace.started / start_failed |
+| workspace.stop | 受检实例StopWorkspace | workspace.stopped / stop_failed |
+| workspace.member.add | AddWorkspaceMember，WorkspaceMemberSpec | workspace.member.result |
+| workspace.member.remove | RemoveWorkspaceMember | workspace.member.result |
+| workspace.create | CreateWorkspace `{name,project_root}` | workspace.member.result |
+| workspace.rename | RenameWorkspace `{workspace,expected_revision,new_name}` | workspace.member.result |
+| workspace.delete | DeleteWorkspace `{workspace,expected_revision}` | workspace.member.result |
+| workspace.member.rename | RenameWorkspaceMember `{workspace,expected_revision,agent,new_name}` | workspace.member.result |
+| workspace.paths.query | QueryProjectDirectories `{path?,cursor?}` | workspace.paths |
+| driver.catalog.query / refresh | QueryAgentDriverCatalog / RefreshAgentDriverCatalog | driver.catalog |
+| mcl.command | 受检显式成员MclCommand | mcl.command_result |
+| agent.turn.abort | 完整实例+预期turn的AbortAgentTurn | agent.turn.abort_result |
+| state.query | 只读元数据+异步历史快照 | state.sync |
+| history.query | 受检live Agent句柄异步读取 | history.result |
+
+路径/Driver查询与四个变更均已接通。精确wire以Protocol为唯一字段契约，统一expected_revision而非camelCase；create不接收revision，服务端执行目标不存在的创建检查。不得恢复manager预检、任意定义上传、数据库路径入站或null成员默认路由。
+
+## 关联与结果收口
+
 ```text
-handle_inbound_message(world: &mut World, connection_id: WebSocketConnectionId, message: WebSocketMessage)
-    处理入站消息：crate公开函数
-    行为：
-        要求消息为Text；DTO入口总字节上限32 MiB与WebSocket一致，不再以旧1 MiB限制静默丢弃图片请求
-        超出上限记录不含载荷的长度诊断并发送1009关闭，客户端立即失败而非等待MCL超时
-        有界反序列化统一{type,id,message}信封为ClientMessage；结构错误但存在非空有界id时返回关联request.failed，无可用id时发送1007关闭，禁止只丢弃
-        注册检查：connection.register以外的请求要求连接已注册，未注册时返回关联request.failed，不延后受理
-        按type调用对应DTO::into_domain并发送领域事件
-        MCL命令先用mcl_source算出客户端来源标识并随转换上下文传入
-        MCL命令转换成功后把响应接收器写入PendingMclCommandResponses
-        路由或转换失败时返回关联request.failed；诊断不包含原始图片数据
-
-注册检查的边界：只看处理该请求这一帧的状态——连接此时已注册就服务，否则丢弃；不做延后、不重试。
-            回执在Client实体创建之后发出，等待回执再发后续请求的客户端必然满足该条件；
-            不等待回执的客户端落在契约之外，其请求服务与否取决于注册与请求两帧是否落在同一帧，daemon不作保证
-
-handle_pending_mcl_responses(world: &mut World)
-    处理MCL响应：crate公开函数
-    行为：
-        读取WebSocketConnections
-        逐个尝试接收PendingMclCommandResponses
-        已完成的响应序列化为MclCommandResult并发送到原连接
-        Empty保留，Disconnected移除
-
-handle_outbound_messages(world: &mut World, outgoing: Vec<WebSocketMessageSend>)
-    处理出站消息：crate公开函数
-    行为：
-        读取WebSocketConnections
-        逐条序列化ServerMessage为Text
-        按Broadcast、Type或Name解析发送器集合
-        调用WebSocketMessageSender::try_send；Log消息发送失败不写warn
-
-handle_collect_external_events(world: &mut World)
-    收集外部事件：crate公开函数
-    行为：
-        读取MargatroidConfig目标
-        依次调用report_server_events、report_client_registrations、report_workspace_events、report_workspace_stop_events、report_agent_messages、report_agent_failures和report_backend_state
-
-forward_logs(stream: TracingStream, events: RuntimeEventSender, targets: Vec<WebSocketMessageTarget>)
-    转发结构化日志：crate公开异步函数
-    行为：
-        订阅TracingStream
-        把TracingRecord转换为LogRecordDto并按logs目标发送WebSocketMessageSend
-        Lagged时继续，Closed时结束
+非注册业务请求
+    分配内部唯一operation_id（MCL保留现有id/source/target关联）
+    记录网络id/connection_id/完整Client Entity/操作种类
+    校验完成后保存网络关联，再发送共享领域事件
+结果到达
+    按内部operation_id及操作种类找到唯一pending
+    只移除该pending；错误或无关结果不能释放其他请求
+    再核对Client Entity generation和连接归属
+    还原网络id，投影真实结果，然后只回复发起连接
 ```
 
-私有：
-```text
-mcl_source(world: &World, connection_id: WebSocketConnectionId) -> String
-    计算MCL来源标识：私有函数，从WebSocketConnections读取该连接的类型与名称
-    行为：两者都存在时调用client_plugin::client_source得到client:<type>/<name>:<connection_id>；
-          任一缺失（连接未注册或注册未完成）时得到unregistered:<connection_id>
+- catalog query/refresh 使用结果携带的权威entries，叠加当前运行生命周期，不从旧缓存伪造成功。
+- member.add/remove/create/rename/member.rename 成功带entry，error省略；持久失败entry=null且有error。
+- **delete成功entry=null且无error**，不因目录查无该项制造错误，也不暴露内部回收路径；共享WorkspaceDeletion仅为领域内部事实。
+- 新增或改名的持久提交成功后，运行成员启动失败由member_failures/Agent错误和日志表达，不反转为“配置没保存”。停止成功但保存失败保留真实已停止/仍配置/需恢复等信息。
+- registered start只消费StartRegisteredWorkspaceResult，成功从实际Entity投影WorkspaceInfoDto保留member_failures；stop回执保留原WorkspaceReference，不能把可空的start reference当成功stop对象。
+- 断连只清网络关联，不撤回已提交领域操作；迟到结果忽略，不能投递到复用连接或新Client generation。
 
-report_server_events(world: &World)
-    报告Server事件：私有函数，将Server启停、WebSocket连接、断开和协议失败投影为结构化日志
+## 路径与Driver服务边界
 
-report_client_registrations(world: &World)
-    报告客户端注册：私有函数，把ClientRegistrationResult投影为ServerMessage
-    行为：成功时构造ConnectionRegistered（含ClientInfoDto），失败时构造ConnectionRegisterFailed；两者都按result.connection_id直达该连接
-    边界：回执属于请求-响应，与mcl.command_result同样绕过WebSocketMessageSend的目标分类，直接向发起请求的连接发送
+ProjectDirectoryBrowser由daemon注入：blocking worker对已存在目录执行规范化、权限检查、子目录排序/每页200/cursor校验，不读取文件正文、不mkdir。DTO只构造QueryProjectDirectories及ProjectDirectoryPage投影，默认路径由服务端HOME决定。具体request/reply字段见Protocol；选择旧结果不替代create时重新校验。
 
-send_to_connection(world: &World, connection_id: WebSocketConnectionId, message: &ServerMessage)
-    按连接发送：私有函数，从WebSocketConnections取WebSocketSender并try_send序列化文本；连接不存在或序列化失败时静默返回
+Driver清单由loader验证安装包后发布DriverCatalog，包含尚未挂载包，canonical driver:*地址。query读快照，refresh在worker重验并返回有效列表/错误；state.sync.drivers同步快照。DTO不能从ResourceSet挂载记录拼出完整可用目录，不在主线程扫描。只输出安全ID和包诊断，无源码/密钥/模型配置。
 
-report_workspace_events(world: &World, targets: &[WebSocketMessageTarget])
-    报告Workspace启动：私有函数，成功时发送WorkspaceStarted，失败时写error日志并发送WorkspaceStartFailed
+## 中止与成员定向
 
-report_workspace_stop_events(world: &World, targets: &[WebSocketMessageTarget])
-    报告Workspace停止：私有函数，发送WorkspaceStopped或WorkspaceStopFailed并记录日志
+MCL/history/abort必须显式Agent ID。resolve_workspace/resolve_agent核对资源、项目根、归属和完整实例。Working期间手工INJECT递归包含User的参数拒绝，非用户资源数组不误拦；别名/selector不是开放用户发送接口。
 
-report_agent_messages(world: &World, targets: &[WebSocketMessageTarget])
-    报告Agent消息：私有函数，将外部可见User和Assistant转换为AgentMessage协议事件；跳过System、Tool和Error；Error只通过历史状态同步渲染
+中止保存完整Agent/Workspace/DriverLuaVmInstance/expected_turn_id与内部op关联；匹配原结果后发abort_result，Ok仅表示受理。Token取消、真实HTTP/SSE或工具清理由对应业务执行层负责。不能以回执、空turn或前端显示屏障证明Idle。
 
-report_agent_failures(world: &World, targets: &[WebSocketMessageTarget])
-    报告Agent失败：私有函数，将AgentFailure转换为协议事件并记录warn
+## 状态与历史
 
-report_backend_state(world: &mut World, targets: &[WebSocketMessageTarget])
-    报告后端状态：私有函数
-    行为：
-        构造BackendStateDto
-        转换失败时相同错误只记录一次
-        解析backend_state接收连接并排序去重
-        仅在首次运行、快照变化或接收连接集合变化时发送StateSync
+主线程只捕获WorkspaceCatalog缓存、DriverCatalog、真实Workspace/Agent元数据及History句柄。历史从blocking worker读，具名DtoHistorySnapshotCompleted唤醒收口；Protocol只消费提供的记录。historical query当前依赖live Agent，不偷偷增加离线数据库访问。
 
-send_to_targets(world: &World, targets: &[WebSocketMessageTarget], message: ServerMessage)
-    按目标发事件：私有函数，为每个目标克隆ServerMessage并发送一个WebSocketMessageSend
+准备state包含catalog/workspaces/agents/histories/drivers。注册定义有效性与运行状态独立；无效源和消失home仍保留live实例诊断。停机/DB文件存在/历史非空不能伪造运行状态。空成员Workspace可投影，不做manager存在性预检。
 
-target_recipients(connections: &WebSocketConnections, targets: &[WebSocketMessageTarget]) -> Vec<u64>
-    解析接收连接：私有函数，按目标查询发送器并返回连接ID；排序和去重由调用方完成
-```
+BackendStateReportCache追踪prepared_state、实际state、pending、dirty和接收者。元数据/目录/Driver目录变化、已提交MCL可能改变历史或新连接需同步时准备；完全相同内容和接收者不重复发送，不由自己发出的state.sync触发无限循环。异步读取期间实例被替换则拒绝旧结果并重排，而不是把旧历史绑定新generation。不能只检查agents而忽略catalog或drivers变化。
+
+历史content是文本，payload保留类型、images、replay、usage、stop_reason、工具关联和审计；不将base64展示成日志。sequence按返回list顺序1-based，created_at_ms用原记录值、旧0表示未知。显式history_append是消息历史唯一入口，推理/工具完成不自动追加。
+
+## 日志与出站
+
+只剩outbound.logs与outbound.backend_state。logs控制tracing转发及领域诊断，backend_state控制主动state.sync；请求回执直达原连接，不受广播配置拦截。推理增量当前由推理层固定选择webui快照，不虚称已按被删除配置字段路由。
+
+TracingStream是有界临时广播，无持久历史/断线补发承诺；lagged跳过，日志发送失败不再生成日志以免递归。普通WebSocketMessageSend根据broadcast/type/name解析连接并构造发送终端，不解析业务或操作数据库。
 
 # events
 
-events 放事件类型。
-
-## 类型
-
-公开：
-```text
-WebSocketMessageSend：发送事件，公开结构体--承载ServerMessage和连接筛选目标
-    target: WebSocketMessageTarget--发送范围
-    message: ServerMessage--待序列化协议事件
-    impl Event for WebSocketMessageSend
-```
+WebSocketMessageSend重新导出共享dto_events，只含target+JSON Value。目录、生命周期、Driver和路径服务的共享事件由types承载；DTO不重复定义领域执行状态机。异步历史完成用共享具名事件，不靠pending轮询判断领域操作完成。
 
 # types
 
-types 放除事件和错误外的其余类型。
-
-## 类型
-
-crate公开：
 ```text
-BackendStateReportCache：后端状态报告缓存，crate公开Resource--阻止未变化快照在事件驱动Runtime中形成自唤醒循环
-    state: Option<BackendStateDto>--上次同步的完整状态
-    recipients: Vec<u64>--上次报告时匹配backend_state目标的连接ID
-    last_error: Option<String>--最近一次转换错误，用于相同错误只记录一次
-    impl Resource for BackendStateReportCache
-
-PendingMclCommandResponses：MCL命令响应等待表，crate公开Resource--保存已发送MCL命令的一次性响应接收器
-    commands: Vec<PendingMclCommandResponse>--等待中的MCL命令响应
-    impl Resource for PendingMclCommandResponses
-
-PendingMclCommandResponse：单条MCL命令响应，crate公开结构体
-    id: String--请求ID
-    connection_id: WebSocketConnectionId--来源连接
-    response: Mutex<mpsc::Receiver<Result<serde_json::Value, String>>>--命令响应接收器
+PendingMclCommandResponses
+    aborts/commands/workspaces/snapshots/catalog
+    discovery 表保存路径页与 Driver 查询/刷新关联，并按操作种类检查
+PendingCatalogResponse
+    operation_id/id/connection_id/client/kind
+    kind精确区分Query/Refresh/MemberAdd/MemberRemove/Create/Rename/Delete/MemberRename
+    不能将Delete结果错误解释成有entry的查询
+PendingWorkspaceResponse
+    start关联内部ID；stop保留Some(reference)，start可为None
+BackendStateReportCache
+    state/prepared_state/pending/dirty/recipients/last_error
 ```
 
-空板块：
-    某个板块在本 crate 中没有内容时，对应的源文件保持为空并仍然保留模块声明
-    空文件不是遗漏，而是"该板块在此 crate 中确实没有定义"的表示
-    保留文件与模块声明是为了让六个板块的位置固定，新增内容时不必再改结构
+网络pending不是Agent执行pending，也不是持久目录权威。操作失败不能让错误pending覆盖已受理操作，完整Client generation为所有回复的必要条件。
 
 # error
 
-```text
-DtoPlugin 不定义错误类型；入站转换失败和出站发送失败只记录warn日志。
-```
+可关联失败保留原id，错误有界且无凭据/载荷。目录单项错误留entry.error，不隐去其他条目；目录全量/路径/Driver查询失败用request.failed。变更错误用member.result.error，运行失败另投影。提交未知和清理失败不伪造成功/回滚/Idle。
 
-## 逻辑
+## 验证与范围
 
-```text
-入站：
-    WebSocketMessageReceived
-        -> dto_route_system
-        -> handle_inbound_message
-        -> ClientMessage { type, id, message }
-        -> message DTO::into_domain
-        -> 直接发送领域事件
-
-MCL响应：
-    MclPlugin完成命令
-        -> dto_route_system
-        -> handle_pending_mcl_responses
-        -> MclCommandResult发回原连接
-
-出站：
-    外部可见领域事件
-        -> collect_external_events_system
-        -> handle_collect_external_events构造ServerMessage
-        -> 包装WebSocketMessageSend
-    Workspace、Agent和Memory当前状态
-        -> report_backend_state构造BackendStateDto并与缓存比较
-        -> 内容或接收连接集合未变化时结束
-        -> StateSync发送给backend_state目标
-    LogPlugin::TracingStream
-        -> forward_logs异步订阅
-        -> LogRecordDto转换
-        -> 按logs目标发送WebSocketMessageSend
-    其他Plugin也可直接发送WebSocketMessageSend
-        -> dto_route_system序列化ServerMessage
-        -> WebSocketConnections按target筛选
-        -> 构造WebSocketMessageSender并发送Text
-```
-
-## 边界
-
-```text
-DtoPlugin负责：WebSocket帧、JSON信封、DTO转换调用、入站领域事件发送、外部可见领域事件投影、完整状态快照、普通出站消息的发送终端构造、结构化日志转发、ServerMessage序列化和连接筛选。
-DtoPlugin不负责：manager路由、Agent Entity创建、Memory、Tool、Inference和资源权限。
-Protocol负责：XxxDto及其IntoDomain/FromDomain转换，包括使用World进行只读身份投影。
-LogPlugin负责：生成TracingStream，不感知DTO、WebSocket或连接目标。
-WorkspacePlugin负责：消费Workspace领域命令、解析Workspace和Agent逻辑身份。
-AgentPlugin负责：处理已经携带Entity的AgentMessage。
-```
-
-中止网络关联使用内部唯一 operation_id，并核对 agent Entity、resource_id、workspace、完整 VM instance 与 expected_turn_id；只回复原 Client 实例与连接，断连清除关联但不撤回已受理中止。Working 期间拒绝 INJECT ? 中递归包含 user 的消息参数；工具可见性、sandbox 等非用户数组不被此守卫误拦截。
-
-## Workspace 成员启动失败隔离契约
-
-外部 workspace.start 在转换出 StartWorkspace 后、保存 pending 和发送领域事件前，先调用 WorkspaceInfoDto::from_domain(&definition) 验证可投影性。必填 manager wire 字段要求成员定义包含具名 manager；空成员或 manager 缺失转换为带操作提示的 InvalidRequest，在创建前拒绝，不占用资源地址。不修改内部领域空 Workspace 支持、不伪造 manager 地址、不改变 wire 类型。全部已定义成员失败不影响 manager 定义投影，仍返回 workspace.started。
-
-Workspace 自身定义校验、创建或执行线程创建失败才返回 StartWorkspaceResult::Err；创建前失败不占用新地址，重复地址保留旧实例并报告其 ID、状态、成功成员数及失败成员数，不覆盖或自动附着。初始驱动和成员请求全部结束后，即使全部成员失败也进入 Running 并返回 Ok，成员失败不得关闭提交门。
-
-Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>；失败值包含 driver 与 error，工作区身份由所属组件提供。这是持久到该工作区停止的失败诊断，不是重复 Agent 生命周期表。每个失败成员产生 WorkspaceMemberStartFailed，携带 workspace Entity、workspace_id、agent、driver、error；共享驱动失败按成员展开，动态创建失败同样记录并通知，成功加入清除该成员旧失败。Stopping 中已受理动态创建失败只结束等待，不污染健康工作区的停止结果。
-
-WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。
+当前 DTO/Protocol scoped 验证合计 34 passed，覆盖恢复的 catalog、registered-start、成员与 CRUD/discovery 路由、精确网络 ID、generation 和错误关联。领域存储迁移与真实浏览器交互另有独立验证，不能由 DTO 测试替代。
