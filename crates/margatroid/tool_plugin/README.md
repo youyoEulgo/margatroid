@@ -1,8 +1,10 @@
 # ToolPlugin
 
+> 审计边界：本次只读比对源码并修改文档，未运行测试/构建。下文“已实现”描述可见代码结构，不证明草稿、跨插件时序、平台行为或端到端接线已验收；未闭合能力必须按明确目标实现和验证。
+
 ## 用户轮次中止（已实现）
 
-工具受理及独立 turn_cancel 监督已实现，登记原子保存 turn 与沙箱快照。无 `get_turn`；状态采用 `creating/idle/working/stopping`。中止立即清空 turn，清理期间仍为 Working，正常 finish 收口才 Idle；同步必须同时包含 turn 与 status。用户轮次中止与根 Agent shutdown、owner abort、timeout、receiver closed 不同，不统一归一为正常取消。
+工具受理及独立 turn_cancel 监督已实现，登记原子保存 turn 与沙箱快照。无 `get_turn`；状态采用 `creating/idle/working/stopping`。中止立即清空 turn，清理期间仍为 Working，正常 finish_turn 收口才 Idle；同步必须同时包含 turn 与 status。用户轮次中止与根 Agent shutdown、owner abort、timeout、receiver closed 不同，不统一归一为正常取消。
 
 用户轮次中止且真实清理成功返回 `Ok(ToolExecuteResponse)`：ToolCall `failed=true`、`content="Tool call aborted."`，保留调用 ID、名称及已知 resource_id；未启动调用同用该正文。已完成结果保留；每个批次调用（含未启动项）按原顺序恰有一个结果。不伪造部分执行成功，取消不撤销已发生副作用。`CleanupFailed` 仍是 Err，保留活动，不宣称取消成功或空闲。
 
@@ -46,7 +48,7 @@ runner 默认在当前可执行文件同目录，可由 `MARGATROID_TOOL_RUNNER`
 
 Agent.sandbox 为选定 `SandboxValue { resource_id, policy: Arc<str> }`。执行登记与策略快照获取在共享作用域同一互斥门内，直接复制选定 policy，不按沙箱 ID 重取最新 ResourceSet。Tool 登记 Sandbox 活动。
 
-有策略时通过 landstrip CLI `run -p policy -- tool_runner` 启动；后端缺失或不可用失败关闭，不退化为无沙箱。无策略的独立进程不等于安全沙箱。后端定位使用 `MARGATROID_SANDBOX_BACKEND`、PATH 或当前可执行文件同目录；继承环境过滤凭据及宿主注入变量。
+有策略时父进程启动可信 tool_runner supervisor（在工具沙箱外），由其通过 landstrip CLI `run -p policy -- tool_runner --margatroid-tool-worker` 启动受限 worker；只有执行Lua的worker及其子进程进入该策略。后端缺失或不可用失败关闭，不退化为无沙箱。无策略的独立进程不等于安全沙箱。后端定位使用 `MARGATROID_SANDBOX_BACKEND`、PATH 或当前可执行文件同目录；继承环境过滤凭据及宿主注入变量。
 
 入口 Future 丢弃只发出取消，独立 supervisor 保留执行所有权。Linux runner 启用 child subreaper，终止并 waitpid 回收后代（包括新 session）；可选 `MARGATROID_TOOL_CGROUP_ROOT` 使用已委派、可写且具备 cgroup.kill 的真实 cgroup。没有配置时不声称具备 cgroup 隔离。
 
@@ -56,9 +58,11 @@ Agent.sandbox 为选定 `SandboxValue { resource_id, policy: Arc<str> }`。执�
 
 工具 VM 在脚本顶层执行前准备 arguments 和只读 context，提供 JSON 编解码与 shell，不注入 MCL、ready、wake 或 Driver 能力。context 保留 agent/resource/call ID、turn、project_root 及 temp_dir。
 
-普通 shell 并行使用有界 stdout/stderr 管道；Linux 显式 `{pty=true}` 使用非阻塞 PTY，建立 session 和控制终端，输出合并在 stdout、stderr 为空，返回 code。非 Linux 明确拒绝 PTY，不自动降级。单次宿主超时和输出限额不得扩大总执行预算；取消、超时和后代回收沿用同一执行边界。handoff 当前固定返回 `UnsupportedHandoff`，未实现长期任务池或任务转交协议。
+普通 shell 并行使用有界 stdout/stderr 管道；Linux 显式 `{pty=true}` 使用非阻塞 PTY，建立 session 和控制终端，输出合并在 stdout、stderr 为空，返回 exit_code 及兼容 code，并包含 truncated。非 Linux 明确拒绝 PTY，不自动降级。单次宿主超时和输出限额不得扩大总执行预算；取消、超时和后代回收沿用同一执行边界。handoff 当前固定返回 `UnsupportedHandoff`，未实现长期任务池或任务转交协议。
 
 ## 图片结果
+
+User和ToolCall图像使用同一共享UserImage（沿用名称，不限于User消息）：只接受png/jpeg/gif/webp原始标准base64，最多8张/消息、5MiB/张、20MiB解码总量，magic须匹配。Messages/Responses保留原生工具结果图像；Chat仅在同一批次所有工具结果齐备后生成格式层user图像消息，不改本地权威历史。
 
 runner结果仍为String。含`ok: boolean`与`content: string`的JSON envelope可携带`images: [{media_type, data}]`（raw base64）；共享图片校验失败明确返回ToolError，不将坏图片当作普通文本，也不在诊断中回显base64。旧纯文本输出不变。
 
@@ -68,6 +72,6 @@ runner结果仍为String。含`ok: boolean`与`content: string`的JSON envelope�
 
 ## snapshot 限制与回归
 
-metadata snapshot 保留选定 alias、描述、schema 和材料路径；资源 reload 不暗改已有 Block 或请求，新 GET alias 取得新快照。脚本仍按选定路径 late read：路径对应磁盘文件可能被修改，因此本轮不承诺正文内容版本隔离，也没有 content hash 体系。
+metadata snapshot 保留选定 alias、描述、schema 和材料路径；资源 reload 不暗改已返回 typed 值或请求；持久 Block 只存 ID，下一次 GET 按当前导入绑定取得新快照。脚本仍按选定路径 late read：路径对应磁盘文件可能被修改，因此本轮不承诺正文内容版本隔离，也没有 content hash 体系。
 
 本地回归保留 worker/supervisor 取消、重复认领、真实 cleanup、subreaper、新 session 后代、并行大输出、PTY、作用域停止及输出/协议限制，并覆盖选定 metadata 在 collection reload 后仍生效、许可拒绝、alias 匹配、空对象 schema 参数校验及不支持的资源类型拒绝。完整契约和未闭合项见 [DESIGN.md](<DESIGN.md>)。

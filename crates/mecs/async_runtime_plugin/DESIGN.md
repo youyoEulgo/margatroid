@@ -296,7 +296,7 @@ submit_event_task<Request, T, E, Handler, Args>(world: &mut World, request: Requ
         调用World::emit_pending创建EventHandle<Result<T, E>>
         mode为Await时调用RuntimeHandle::close_gate
         使用RuntimeEventSender构造AsyncContext
-        构造在异步线程中调用handler.run(request, context)的Future
+        在当前ECS线程调用handler.run(request, context)构造Future；Future随后在异步线程被poll
         调用submit_supervised提交Future、pending句柄、mode和RuntimeHandle
 
 dispatch_closure_task<T, E, Task, Args>(world: &mut World, task: Task, mode: AsyncMode)
@@ -310,7 +310,7 @@ dispatch_closure_task<T, E, Task, Args>(world: &mut World, task: Task, mode: Asy
         调用World::emit_pending创建EventHandle<Result<T, E>>
         mode为Await时调用RuntimeHandle::close_gate
         使用RuntimeEventSender构造AsyncContext
-        构造在异步线程中调用task.run(context)的Future
+        在当前ECS线程调用task.run(context)构造Future；Future随后在异步线程被poll
         调用submit_supervised提交Future、pending句柄、mode和RuntimeHandle
 
 submit_supervised<T, E, TaskFuture>(executor: &AsyncRuntimeHandle, runtime: RuntimeHandle, handle: EventHandle<Result<T, E>>, mode: AsyncMode, future: TaskFuture)
@@ -343,7 +343,7 @@ ensure_async_system_registered<Request: Event>(world: &World)
 
 run_executor(mut task_receiver: UnboundedReceiver<ErasedExecutionTask>, startup_sender: SyncSender<Result<(), io::Error>>)
     运行异步线程：私有函数，task_receiver接收监督Future，startup_sender报告初始化结果
-    行为：创建Tokio current-thread Runtime；报告结果；持续接收任务并逐个tokio::spawn
+    行为：创建Tokio current-thread Runtime；报告结果；持续接收任务并逐个tokio::spawn；提交通道关闭后退出接收循环并销毁Runtime，不等待所有业务Future自然完成
 
 panic_message(payload: Box<dyn Any + Send + 'static>) -> String
     提取panic信息：私有函数，payload是类型擦除panic载荷
@@ -448,9 +448,14 @@ panic_message(payload: Box<dyn Any + Send + 'static>) -> String
     每个任务在内层tokio::spawn独立执行
     业务Ok或Err保持原样完成pending
     panic或取消转换为AsyncTaskError，再转换为业务E
-    监督Future始终持有pending句柄和RuntimeHandle
+    监督Future在其存活期间持有pending句柄和RuntimeHandle
     mode为Async时完成后唤醒Runtime
     mode为Await时完成后开阀
+    handler或task构造Future前的同步panic不在内层tokio::spawn监督范围内
+    没有公开的任务取消句柄；取消请求、子任务所有权和abort后await清理由业务自行实现
+    丢弃业务JoinHandle不等于取消；业务需确保子任务真正结束后才返回监督Future的结果
+    执行器Drop关闭提交通道并join专用线程；Tokio Runtime销毁会丢弃尚未完成的任务
+    整体关闭不保证监督Future完成pending或释放Await阀，不能作为业务取消完成协议
 
 异步任务发送中间事件：
     AsyncRuntime注入AsyncContext

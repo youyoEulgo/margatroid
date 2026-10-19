@@ -26,8 +26,6 @@ fn real_websocket_invalid_requests_fail_promptly_without_exposing_payloads() {
                 None,
                 vec![WebSocketMessageTarget::Broadcast],
                 vec![WebSocketMessageTarget::Broadcast],
-                vec![WebSocketMessageTarget::Broadcast],
-                vec![WebSocketMessageTarget::Broadcast],
             )
             .unwrap(),
         ))
@@ -56,6 +54,42 @@ fn real_websocket_invalid_requests_fail_promptly_without_exposing_payloads() {
                         .await
                         .unwrap();
                 let secret = "private-image-payload-not-for-errors";
+                for kind in ["mcl.command", "history.query", "agent.turn.abort"] {
+                    for explicit_null in [false, true] {
+                        let mut message = json!({"workspace":{}, "private":secret});
+                        if explicit_null {
+                            message["agent"] = serde_json::Value::Null;
+                        }
+                        socket
+                            .send(Message::Text(
+                                json!({"type":kind,"id":"missing-agent","message":message})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            loop {
+                                if let Message::Text(text) = socket.next().await.unwrap().unwrap() {
+                                    assert!(!text.contains(secret));
+                                    let value: serde_json::Value =
+                                        serde_json::from_str(&text).unwrap();
+                                    if value["id"] == "missing-agent" {
+                                        assert_eq!(value["type"], "request.failed");
+                                        assert_eq!(value["error"]["kind"], "InvalidRequest");
+                                        assert!(value["error"]["message"]
+                                            .as_str()
+                                            .unwrap()
+                                            .contains("message.agent"));
+                                        break;
+                                    }
+                                }
+                            }
+                        })
+                        .await
+                        .expect("missing/null agent must receive an actionable failure");
+                    }
+                }
                 socket
                     .send(Message::Text(
                         json!({"type":secret,"id":"malformed-correlated"})

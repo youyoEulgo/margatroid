@@ -192,7 +192,7 @@ EntitySlot：实体槽位，私有结构体--记录一个Entity索引的当前�
 公开：
 ```text
 Entity：实体标识，公开元组结构体--带代数的实体标识，避免索引复用后旧标识指向新实体
-    0: u64--标识，私有，高32位为代数，低32位为索引
+    0: u64--标识，私有，高32位为代数，低32位为索引；仅在所属World内使用，不是持久化业务ID
     new(index: u32, generation: u32) -> Self
         构造：crate公开方法
         行为：将代数和索引组合为实体标识
@@ -247,14 +247,14 @@ EntityAllocator：实体分配器，crate公开结构体--分配和回收Entity�
 ## 类型
 公开：
 ```text
-Resource：资源，公开trait--World持有的全局单例数据类型
+Resource：资源，公开trait--当前World按类型持有的单例数据类型，不代表进程全局单例
     继承：Send + Sync + 'static
-    实现：由开发者为World全局单例类型显式实现
+    实现：由开发者为World内单例类型显式实现
 ```
 
 crate公开：
 ```text
-ResourceRegistry：资源注册表，crate公开结构体--按R持有全局单例
+ResourceRegistry：资源注册表，crate公开结构体--在当前World内按R持有单例
     resources: HashMap<TypeId, Box<dyn Any + Send + Sync>>--资源
     new() -> Self
         构造：crate公开方法
@@ -290,6 +290,7 @@ EventState：事件状态，私有枚举
 EventNode：事件节点，私有类型别名--等于Arc<Mutex<EventState>>
 
 ErasedEvent：擦除事件，私有trait--跨线程排队时擦除具体类型，到期后在主线程恢复对应存储操作
+    继承：Send + Sync + 'static
     push_into(self: Box<Self>, registry: &mut EventReadStorageRegistry)
         装填读取存储：私有方法
         行为：由具体事件类型E实现，调用registry.push转移事件所有权
@@ -316,11 +317,12 @@ EventReadStorage<E: Event>：事件读取存储，私有结构体--持有单一�
             转换为Any可变引用：返回自身的&mut dyn Any
 
 ErasedEventReadStorage：擦除事件读取存储，私有trait
-    clear()
+    继承：Any + Send + Sync + 'static
+    clear(&mut self)
         清空：私有方法
-    as_any() -> &dyn Any
+    as_any(&self) -> &dyn Any
         转换为Any只读引用：私有方法
-    as_any_mut() -> &mut dyn Any
+    as_any_mut(&mut self) -> &mut dyn Any
         转换为Any可变引用：私有方法
 ```
 
@@ -497,9 +499,10 @@ EventReader<'a, E: Event>：事件读取器，公开结构体--System临时持�
     事件句柄.complete_after(result, frames) -> 下一次tick之后再等待frames次tick
 
 读取事件：
-    读取器 = World::获取事件读取器<E>()--只访问本次更新事件
+    读取器 = World::event_reader<E>()--只访问本次更新事件
     --该类型从未发送过时读取器为空，不需要预先注册
-    for 事件 in 读取器
+    for 事件 in 读取器--取得&E，不消费事件，同帧其他System仍可读取
+    Core不提供通用事件take；包装类型的内部一次性载荷转移不改变普通事件读取语义
 
 每次tick开始：
     调用事件读取存储注册表::clear--只清空事件，保留存储
@@ -759,14 +762,14 @@ SchedulePlan：计划表，crate公开结构体--由App持有，组织单次Sche
     add_schedule(&mut self, name: String) -> bool
         添加阶段：crate公开方法
         行为：
-            如果已经启动或check返回真，返回假
+            如果已经启动或contains返回真，返回假
             将是否单次执行设为假，以每帧执行长度作为Schedule下标，推入首帧计划
             创建Schedule，与阶段名封装成元组，推入每帧执行
             返回真
     add_once_schedule(&mut self, name: String) -> bool
         添加单次阶段：crate公开方法
         行为：
-            如果已经启动或check返回真，返回假
+            如果已经启动或contains返回真，返回假
             将是否单次执行设为真，以首帧执行长度作为Schedule下标，推入首帧计划
             创建Schedule，与阶段名封装成元组，推入首帧执行
             返回真

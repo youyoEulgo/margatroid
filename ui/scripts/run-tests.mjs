@@ -24,7 +24,8 @@ try {
   await build({
     root,
     build: {
-      ssr: join(root, 'src/stores/workbench.test.ts'),
+      lib: { entry: join(root, 'src/stores/workbench.test.ts'), formats: ['es'] },
+      minify: false,
       outDir: resolvedOutput,
       emptyOutDir: false,
       rollupOptions: {

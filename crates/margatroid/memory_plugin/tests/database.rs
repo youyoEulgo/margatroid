@@ -463,3 +463,60 @@ fn concurrent_multi_get_keeps_one_snapshot_even_across_connections() {
     }
     join.join().unwrap();
 }
+
+#[test]
+fn identity_backup_reopens_original_typed_blocks_and_fact_history_under_new_agent() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.sqlite");
+    let staged = temp.path().join("staged.sqlite");
+    let old = context("old-instance");
+    let db = SqliteAgentDatabase::open(&source).unwrap();
+    create(&db, &old, "conversation", false).unwrap();
+    let message = full_message();
+    inject(
+        &db,
+        &old,
+        selector("conversation", "messages"),
+        message.clone(),
+    );
+    let record = margatroid_types::history_components::HistoryRecord {
+        key: "original-key".into(),
+        source: old.agent.to_string(),
+        turn: Some("original-turn".into()),
+        kind: "audit".into(),
+        content: "unaltered old identity".into(),
+        payload: serde_json::json!({"target": old.agent.to_string(), "original": true}),
+        created_at_ms: 12345,
+    };
+    db.append_batch(vec![record.clone()]).unwrap();
+    drop(db);
+    let original = std::fs::read(&source).unwrap();
+    let mut new = context("new-instance");
+    new.agent = ResourceID::parse("agent:new/name:latest").unwrap();
+    memory_plugin::prepare_agent_identity_copy(
+        &source,
+        &staged,
+        &old.agent.to_string(),
+        &new.agent.to_string(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    let migrated = SqliteAgentDatabase::open(&staged).unwrap();
+    assert_eq!(
+        get(&migrated, &new, selector("conversation", "messages")),
+        message
+    );
+    assert_eq!(migrated.list().unwrap(), vec![record]);
+    assert!(matches!(
+        run(
+            &migrated,
+            &old,
+            BlockStorageOperation::Get {
+                expressions: vec![BlockExpression::Sources(vec![BlockSource::Selector(
+                    selector("conversation", "messages")
+                )])],
+            }
+        ),
+        Err(BlockStorageError::BlockMissing(_))
+    ));
+}

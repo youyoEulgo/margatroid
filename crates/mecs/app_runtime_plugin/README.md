@@ -28,6 +28,9 @@ app.add_plugin(RuntimePlugin::default()).run();
 
 事件驱动模式进入等待循环前会无条件执行第一个 tick，因此即使初始事件队列为空，`STARTUP` 和
 第一帧循环 Schedule 也一定会运行。后续帧才由事件快照和阀状态驱动。
+同一 Schedule 内按 System 注册顺序串行执行；`PRE_UPDATE` 的同步状态修改在本帧 `UPDATE` 前生效，
+但在 `PRE_UPDATE` 新发送的事件仍须下一帧才可读。应用需要提前处理取消等控制请求时，必须显式
+把相应处理 System 挂到 `PRE_UPDATE`，Runtime 不自动解释或取消业务任务。
 
 ## 公开 API
 
@@ -53,5 +56,8 @@ app.add_plugin(RuntimePlugin::default()).run();
 Core 的 `World::emit_event` 只将事件写入队列；Runtime 提供的
 `WorldEventExt::send_event` 和 `send_event_after` 会在写入后额外唤醒运行循环。
 `event_sender()` 返回的 `RuntimeEventSender` 可以克隆并交给其他线程，行为相同。
+这些句柄绑定创建它们的 World 事件队列与 Runtime 通知通道；调用方应在对应 Runtime 销毁前停止
+生产者并释放克隆，不能将旧句柄用于另一个 App。通知接收端销毁后调用 `wake` 会报告通道断开。
+`RuntimeState::Closed` 当前是占位状态，没有公开的 Runtime 关闭或退出循环 API。
 安装 Runtime 后应优先使用 `send_event`；`emit_event` 只保留为不依赖 Runtime 的底层能力。
 事件类型由 Core 在首次到期时自动建立读取存储，不需要预先注册。

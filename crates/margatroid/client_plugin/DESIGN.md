@@ -29,7 +29,7 @@ function_name<Generic>(parameter: ParameterType) -> ReturnType
 
 # 板块格式
 
-本文为目标设计，尚未实现。统一Client共享组件、注册握手和推流快照契约，不延续独立ResourceId组件。
+本文描述当前源码中的Client共享组件、注册握手和推流快照契约，并明确目标入口约束；不延续独立ResourceId组件。本次只读核对源码，未运行构建或测试；DTO Handler 重置后的整树恢复未验证，不把现有接口或测试源码当作端到端通过证据。
 
 # lib
 
@@ -49,9 +49,9 @@ Client：已注册客户端，公开图书馆组件
             行为：借用内部resource_id。
 
 WorldClientExt：客户端查询，公开trait
-    client_by_connection(&self, connection: WebSocketConnectionId) -> Option<&Client>
+    client_by_connection(&self, connection: WebSocketConnectionId) -> Option<(Entity, &Client)>
         查询注册客户端：公开方法
-        行为：遍历Client匹配连接ID，不存在返回None。
+        行为：遍历Client匹配连接ID，返回完整Entity及Client借用，不存在返回None。
     client_webui_senders(&self) -> Vec<WebSocketSender>
         收集webui发送器：公开方法
         行为：遍历已注册webui Client，通过Server共享连接接口取得Sender，按连接ID去重并克隆；缺失或断开忽略，无客户端为空。
@@ -100,14 +100,14 @@ client_disconnect_system(world: &mut World)
 
 crate公开：
 ```text
-handle_client_registration(world: &mut World, request: RegisterConnection)
+handle_client_registration(world: &mut World, connections: &WebSocketConnections, request: &RegisterConnection) -> Result<RegisteredClient, ClientError>
     处理注册握手：crate公开函数
     行为：
         校验请求ID、连接存在、client_type为非空小写ASCII字母数字及下划线或短横线
         名称缺省连接ID文本，构造完整ResourceID并检查地址与名称冲突
         更新连接元数据，通过统一受检图书馆入口创建并挂Client
         准备失败不留下半注册实体；更新连接元数据失败返回关联错误
-        只有Client实体可查询后才发送注册成功，客户端随后才能发依赖身份的MCL请求
+        只有Client实体可查询后才返回注册成功，由System发回执，客户端随后才能发依赖身份的MCL请求
 
 handle_client_disconnect(world: &mut World, connection: WebSocketConnectionId)
     处理断开：crate公开函数
@@ -118,7 +118,7 @@ handle_client_disconnect(world: &mut World, connection: WebSocketConnectionId)
 
 ## 类型
 
-公开，全部事件归共享client_events.rs，Server输入归共享server_events.rs：
+公开，Client业务结果归共享client_events.rs；RegisterConnection及断开输入由server_plugin公开提供：
 ```text
 ClientRegistrationResult：注册结果，公开事件
     id: String
@@ -137,7 +137,9 @@ RegisteredClient：注册成功载荷，公开共享结构体
 
 ```text
 MCL网络入口必须取得已注册Client ResourceID作为source；拒绝unregistered或客户端自行覆盖source
-Driver宿主以真实Agent身份绑定source，不使用目标参数充当来源
+直接请求也必须显式校验已注册Client、完整Entity generation及真实连接上下文，异步回执复检；不得隐式选择第一个Client/Agent/Workspace
+Driver宿主以真实Agent实例身份绑定source，不使用目标参数充当来源
+当前client_source仍导出且可产生unregistered字符串，只是旧格式辅助，不验证注册/连接/generation，不能作为入口source权威；相关端到端接线待恢复验证
 入口将text及arguments数组列表转换为MclInstruction，没有binding隐式单参数兼容
 WebSocket增量编码沿用客户端消息协议，关联请求ID与Agent，oneshot才是推理权威结果
 ```

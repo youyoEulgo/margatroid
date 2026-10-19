@@ -4,9 +4,14 @@ export interface WorkspaceRef {
   project_root: string;
 }
 export interface WorkspaceInfo extends WorkspaceRef {
-  manager: string;
+  member_failures?: { agent: string; driver: string; error: string }[];
   agents: string[];
 }
+export interface AgentDefinition { id: string; name: string; driver: string; home_root?: string }
+export interface WorkspaceDefinition extends WorkspaceRef { agents: AgentDefinition[] }
+export interface CatalogEntry { id: string; name: string; path: string; revision: string; definition?: WorkspaceDefinition; error?: string; lifecycle: string }
+export interface DriverCatalog { id: string; drivers: string[]; errors: { path: string; message: string }[] }
+export interface WorkspacePaths { id: string; path: string; parent: string | null; directories: { name: string; path: string }[]; next_cursor?: string | null }
 export interface ClientInfo {
   resource_id: string;
   client_type: string;
@@ -85,10 +90,29 @@ export interface AgentHistory {
   messages: HistoryMessage[];
 }
 export interface BackendState {
+  catalog: CatalogEntry[];
   workspaces: WorkspaceInfo[];
   agents: AgentState[];
   histories: AgentHistory[];
+  /**
+   * Available agent driver resource IDs. Optional until the daemon ships the
+   * driver listing; the UI falls back to the drivers already in the catalog.
+   */
+  drivers?: string[];
 }
+
+/**
+ * Pending catalog wire. The request names are centralized here so the UI and
+ * store share one definition; they are flipped on only after the daemon
+ * confirms each request (see `SUPPORTED_CATALOG_REQUESTS`).
+ */
+export const CATALOG_REQUESTS = {
+  createWorkspace: 'workspace.create',
+  renameWorkspace: 'workspace.rename',
+  deleteWorkspace: 'workspace.delete',
+  renameMember: 'workspace.member.rename',
+} as const;
+export type CatalogRequestType = (typeof CATALOG_REQUESTS)[keyof typeof CATALOG_REQUESTS];
 export interface LogRecord {
   timestamp_millis: number;
   level: string;
@@ -126,29 +150,53 @@ export type MclValueProjection =
   | { Text: string };
 export type MclCommandResult = { Ok: MclValueProjection } | { Err: ProtocolError };
 export type ClientMessage =
+  | { type: 'driver.catalog.query' | 'driver.catalog.refresh'; id: string; message: Record<string, never> }
+  | { type: 'workspace.paths.query'; id: string; message: { path?: string; cursor?: string } }
+  | { type: 'workspace.catalog.query' | 'workspace.catalog.refresh'; id: string; message: Record<string, never> }
+  | { type: 'workspace.start'; id: string; message: { workspace: string; expected_revision: string } }
+  | { type: 'workspace.stop'; id: string; message: { workspace: WorkspaceRef } }
+  | { type: 'workspace.member.add'; id: string; message: { workspace: string; expected_revision: string; agent: { name: string; driver: string; home_root?: string } } }
+  | { type: 'workspace.member.remove'; id: string; message: { workspace: string; expected_revision: string; agent: string } }
+  // Catalog mutations confirmed with the parent wire; every response reuses `workspace.member.result`.
+  | { type: 'workspace.create'; id: string; message: { name: string; project_root: string } }
+  | {
+      type: 'workspace.rename';
+      id: string;
+      message: { workspace: string; expected_revision: string; new_name: string };
+    }
+  | { type: 'workspace.delete'; id: string; message: { workspace: string; expected_revision: string } }
+  | {
+      type: 'workspace.member.rename';
+      id: string;
+      message: { workspace: string; expected_revision: string; agent: string; new_name: string };
+    }
   | {
       type: 'agent.turn.abort';
       id: string;
-      message: { workspace: WorkspaceRef; agent?: string | null; turn_id: string };
+      message: { workspace: WorkspaceRef; agent: string; turn_id: string };
     }
   | { type: 'connection.register'; id: string; message: { client_type: string } }
   | { type: 'state.query'; id: string; message: Record<string, never> }
   | {
       type: 'history.query';
       id: string;
-      message: { workspace: WorkspaceRef; agent: string | null };
+      message: { workspace: WorkspaceRef; agent: string };
     }
   | {
       type: 'mcl.command';
       id: string;
       message: {
         workspace: WorkspaceRef;
-        agent: string | null;
+        agent: string;
         command: string;
         arguments: unknown[][];
       };
     };
 export type ServerMessage =
+  | ({ type: 'driver.catalog' } & DriverCatalog)
+  | ({ type: 'workspace.paths' } & WorkspacePaths)
+  | { type: 'workspace.catalog'; id: string; entries: CatalogEntry[] }
+  | { type: 'workspace.member.result'; id: string; entry?: CatalogEntry | null; error?: ProtocolError | null }
   | {
       type: 'agent.turn.abort_result';
       id: string;
@@ -230,6 +278,18 @@ export function parseServerMessage(raw: string): ServerMessage | null {
     const value: unknown = JSON.parse(raw);
     if (!isRecord(value) || typeof value.type !== 'string') return null;
     switch (value.type) {
+      case 'driver.catalog':
+        return typeof value.id === 'string' && Array.isArray(value.drivers) && value.drivers.every((driver) => typeof driver === 'string') &&
+          Array.isArray(value.errors) && value.errors.every((error) => isRecord(error) && typeof error.path === 'string' && typeof error.message === 'string')
+          ? value as unknown as ServerMessage : null;
+      case 'workspace.paths':
+        return typeof value.id === 'string' && typeof value.path === 'string' && (value.parent === null || typeof value.parent === 'string') &&
+          Array.isArray(value.directories) && value.directories.every((directory) => isRecord(directory) && typeof directory.name === 'string' && typeof directory.path === 'string') &&
+          (value.next_cursor == null || typeof value.next_cursor === 'string') ? value as unknown as ServerMessage : null;
+      case 'workspace.catalog':
+        return typeof value.id === 'string' && Array.isArray(value.entries) ? value as unknown as ServerMessage : null;
+      case 'workspace.member.result':
+        return typeof value.id === 'string' && (value.entry == null || isRecord(value.entry)) ? value as unknown as ServerMessage : null;
       case 'state.sync':
         return isRecord(value.state) &&
           Array.isArray(value.state.workspaces) &&

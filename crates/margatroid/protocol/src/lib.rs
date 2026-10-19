@@ -7,10 +7,13 @@ use margatroid_types::{
     mcl_events::{MclCommand, MclCommandResult, MclInstruction, MclValue},
     message_types::{validate_user_images, AgentMessage, StopReason, TokenUsage, ToolCall},
     resource_components::{CallableDefinitionSnapshot, CallableResource, SandboxValue},
+    workspace_catalog::{
+        DriverCatalog, WorkspaceCatalog, WorkspaceCatalogEntry, WorkspaceDeletion,
+    },
     workspace_components::{
         Workspace, WorkspaceAgentDefinition, WorkspaceDefinition, WorldWorkspaceExt,
     },
-    workspace_events::StartWorkspace,
+    workspace_events::StartRegisteredWorkspace,
 };
 use resource_id_plugin::ResourceID;
 use serde::{Deserialize, Serialize};
@@ -56,6 +59,66 @@ pub enum ClientMessage {
         id: String,
         message: RegisterConnectionDto,
     },
+    #[serde(rename = "workspace.paths.query")]
+    WorkspacePathsQuery {
+        id: String,
+        #[serde(default)]
+        message: ProjectDirectoriesQueryDto,
+    },
+    #[serde(rename = "driver.catalog.query")]
+    DriverCatalogQuery {
+        id: String,
+        #[serde(default)]
+        message: EmptyQueryDto,
+    },
+    #[serde(rename = "driver.catalog.refresh")]
+    DriverCatalogRefresh {
+        id: String,
+        #[serde(default)]
+        message: EmptyQueryDto,
+    },
+    #[serde(rename = "workspace.catalog.query")]
+    WorkspaceCatalogQuery {
+        id: String,
+        #[serde(default)]
+        message: EmptyQueryDto,
+    },
+    #[serde(rename = "workspace.catalog.refresh")]
+    WorkspaceCatalogRefresh {
+        id: String,
+        #[serde(default)]
+        message: EmptyQueryDto,
+    },
+    #[serde(rename = "workspace.member.add")]
+    WorkspaceMemberAdd {
+        id: String,
+        message: WorkspaceMemberAddDto,
+    },
+    #[serde(rename = "workspace.member.remove")]
+    WorkspaceMemberRemove {
+        id: String,
+        message: WorkspaceMemberRemoveDto,
+    },
+    #[serde(rename = "workspace.create")]
+    WorkspaceCreate {
+        id: String,
+        message: WorkspaceCreateDto,
+    },
+    #[serde(rename = "workspace.rename")]
+    WorkspaceRename {
+        id: String,
+        message: WorkspaceRenameDto,
+    },
+    #[serde(rename = "workspace.delete")]
+    WorkspaceDelete {
+        id: String,
+        message: WorkspaceDeleteDto,
+    },
+    #[serde(rename = "workspace.member.rename")]
+    WorkspaceMemberRename {
+        id: String,
+        message: WorkspaceMemberRenameDto,
+    },
     #[serde(rename = "workspace.start")]
     WorkspaceStart {
         id: String,
@@ -88,7 +151,18 @@ pub enum ClientMessage {
 impl ClientMessage {
     pub fn id(&self) -> &str {
         match self {
-            Self::ConnectionRegister { id, .. }
+            Self::WorkspacePathsQuery { id, .. }
+            | Self::DriverCatalogQuery { id, .. }
+            | Self::DriverCatalogRefresh { id, .. }
+            | Self::WorkspaceCatalogQuery { id, .. }
+            | Self::WorkspaceCatalogRefresh { id, .. }
+            | Self::WorkspaceMemberAdd { id, .. }
+            | Self::WorkspaceMemberRemove { id, .. }
+            | Self::WorkspaceCreate { id, .. }
+            | Self::WorkspaceRename { id, .. }
+            | Self::WorkspaceDelete { id, .. }
+            | Self::WorkspaceMemberRename { id, .. }
+            | Self::ConnectionRegister { id, .. }
             | Self::WorkspaceStart { id, .. }
             | Self::WorkspaceStop { id, .. }
             | Self::AgentTurnAbort { id, .. }
@@ -119,11 +193,16 @@ impl ClientMessage {
             },
         }
     }
-    pub fn start_workspace(id: impl Into<String>, definition: &WorkspaceDefinition) -> Self {
+    pub fn start_workspace(
+        id: impl Into<String>,
+        workspace: ResourceIdDto,
+        expected_revision: impl Into<String>,
+    ) -> Self {
         Self::WorkspaceStart {
             id: id.into(),
             message: StartWorkspaceDto {
-                definition: definition.into_dto(()).expect("valid workspace definition"),
+                workspace,
+                expected_revision: expected_revision.into(),
             },
         }
     }
@@ -135,10 +214,68 @@ impl ClientMessage {
             },
         }
     }
+    pub fn create_workspace(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        project_root: impl Into<String>,
+    ) -> Self {
+        Self::WorkspaceCreate {
+            id: id.into(),
+            message: WorkspaceCreateDto {
+                name: name.into(),
+                project_root: project_root.into(),
+            },
+        }
+    }
+    pub fn rename_workspace(
+        id: impl Into<String>,
+        workspace: ResourceIdDto,
+        expected_revision: impl Into<String>,
+        new_name: impl Into<String>,
+    ) -> Self {
+        Self::WorkspaceRename {
+            id: id.into(),
+            message: WorkspaceRenameDto {
+                workspace,
+                expected_revision: expected_revision.into(),
+                new_name: new_name.into(),
+            },
+        }
+    }
+    pub fn delete_workspace(
+        id: impl Into<String>,
+        workspace: ResourceIdDto,
+        expected_revision: impl Into<String>,
+    ) -> Self {
+        Self::WorkspaceDelete {
+            id: id.into(),
+            message: WorkspaceDeleteDto {
+                workspace,
+                expected_revision: expected_revision.into(),
+            },
+        }
+    }
+    pub fn rename_workspace_member(
+        id: impl Into<String>,
+        workspace: ResourceIdDto,
+        expected_revision: impl Into<String>,
+        agent: ResourceIdDto,
+        new_name: impl Into<String>,
+    ) -> Self {
+        Self::WorkspaceMemberRename {
+            id: id.into(),
+            message: WorkspaceMemberRenameDto {
+                workspace,
+                expected_revision: expected_revision.into(),
+                agent,
+                new_name: new_name.into(),
+            },
+        }
+    }
     pub fn mcl_command(
         id: impl Into<String>,
         workspace: &WorkspaceReferenceDto,
-        agent: Option<ResourceIdDto>,
+        agent: ResourceIdDto,
         command: impl Into<String>,
         arguments: Vec<serde_json::Value>,
     ) -> Self {
@@ -156,6 +293,40 @@ impl ClientMessage {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmptyQueryDto {}
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectDirectoriesQueryDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+impl IntoDomain<margatroid_types::discovery::QueryProjectDirectories, String>
+    for ProjectDirectoriesQueryDto
+{
+    fn into_domain(
+        self,
+        id: String,
+    ) -> Result<margatroid_types::discovery::QueryProjectDirectories, ProtocolError> {
+        valid_id(&id)?;
+        Ok(margatroid_types::discovery::QueryProjectDirectories {
+            id,
+            path: self.path.map(Into::into),
+            cursor: self.cursor,
+        })
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectDirectoryEntryDto {
+    pub name: String,
+    pub path: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryErrorDto {
+    pub path: String,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
@@ -167,6 +338,33 @@ pub enum ServerMessage {
     ConnectionRegistered { id: String, client: ClientInfoDto },
     #[serde(rename = "connection.register_failed")]
     ConnectionRegisterFailed { id: String, error: ProtocolErrorDto },
+    #[serde(rename = "workspace.paths")]
+    WorkspacePaths {
+        id: String,
+        path: String,
+        parent: Option<String>,
+        directories: Vec<ProjectDirectoryEntryDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
+    },
+    #[serde(rename = "driver.catalog")]
+    DriverCatalog {
+        id: String,
+        drivers: Vec<ResourceIdDto>,
+        errors: Vec<DiscoveryErrorDto>,
+    },
+    #[serde(rename = "workspace.catalog")]
+    WorkspaceCatalog {
+        id: String,
+        entries: Vec<WorkspaceCatalogEntryDto>,
+    },
+    #[serde(rename = "workspace.member.result")]
+    WorkspaceMemberResult {
+        id: String,
+        entry: Option<WorkspaceCatalogEntryDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ProtocolErrorDto>,
+    },
     #[serde(rename = "workspace.started")]
     WorkspaceStarted {
         id: String,
@@ -534,17 +732,72 @@ impl IntoDomain<RegisterConnection, (String, WebSocketConnectionId)> for Registe
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartWorkspaceDto {
-    pub definition: WorkspaceDefinitionDto,
+    pub workspace: ResourceIdDto,
+    pub expected_revision: String,
 }
-impl IntoDomain<StartWorkspace, String> for StartWorkspaceDto {
-    fn into_domain(self, id: String) -> Result<StartWorkspace, ProtocolError> {
+impl IntoDomain<StartRegisteredWorkspace, String> for StartWorkspaceDto {
+    fn into_domain(self, id: String) -> Result<StartRegisteredWorkspace, ProtocolError> {
         valid_id(&id)?;
-        Ok(StartWorkspace {
+        Ok(StartRegisteredWorkspace {
             id,
-            definition: self.definition.into_domain(())?,
+            workspace_id: self.workspace.into_domain(())?,
+            expected_revision: self.expected_revision,
         })
     }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewWorkspaceAgentDto {
+    pub name: String,
+    pub driver: ResourceIdDto,
+    #[serde(default)]
+    pub home_root: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceMemberAddDto {
+    pub workspace: ResourceIdDto,
+    pub expected_revision: String,
+    pub agent: NewWorkspaceAgentDto,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceMemberRemoveDto {
+    pub workspace: ResourceIdDto,
+    pub expected_revision: String,
+    pub agent: ResourceIdDto,
+}
+/// Creates a registered workspace; the address, definition location and member defaults are
+/// derived by the lifecycle from `name`, and `project_root` must be an existing directory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceCreateDto {
+    pub name: String,
+    pub project_root: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRenameDto {
+    pub workspace: ResourceIdDto,
+    pub expected_revision: String,
+    pub new_name: String,
+}
+/// Removes the registered workspace definition; the lifecycle keeps the directory recoverable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDeleteDto {
+    pub workspace: ResourceIdDto,
+    pub expected_revision: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceMemberRenameDto {
+    pub workspace: ResourceIdDto,
+    pub expected_revision: String,
+    pub agent: ResourceIdDto,
+    pub new_name: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StopWorkspaceDto {
@@ -553,18 +806,18 @@ pub struct StopWorkspaceDto {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbortAgentTurnDto {
     pub workspace: WorkspaceReferenceDto,
-    pub agent: Option<ResourceIdDto>,
+    pub agent: ResourceIdDto,
     pub turn_id: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteAgentTargetDto {
     pub workspace: WorkspaceReferenceDto,
-    pub agent: Option<ResourceIdDto>,
+    pub agent: ResourceIdDto,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MclCommandDto {
     pub workspace: WorkspaceReferenceDto,
-    pub agent: Option<ResourceIdDto>,
+    pub agent: ResourceIdDto,
     pub command: String,
     #[serde(default)]
     pub arguments: Vec<serde_json::Value>,
@@ -745,7 +998,6 @@ pub struct WorkspaceDefinitionDto {
     pub id: ResourceIdDto,
     pub name: String,
     pub project_root: String,
-    pub manager: String,
     pub agents: Vec<WorkspaceAgentDefinitionDto>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -754,7 +1006,6 @@ pub struct WorkspaceAgentDefinitionDto {
     pub id: ResourceIdDto,
     pub driver: ResourceIdDto,
     pub home_root: String,
-    pub history_path: String,
 }
 impl FromDomain<&WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto {
     fn from_domain(agent: &WorkspaceAgentDefinition, (): ()) -> Result<Self, ProtocolError> {
@@ -763,30 +1014,6 @@ impl FromDomain<&WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto {
             id: (&agent.id).into_dto(())?,
             driver: (&agent.driver).into_dto(())?,
             home_root: agent.home_root.to_string_lossy().into(),
-            history_path: agent.history_path.to_string_lossy().into(),
-        })
-    }
-}
-impl IntoDomain<WorkspaceAgentDefinition> for WorkspaceAgentDefinitionDto {
-    fn into_domain(self, (): ()) -> Result<WorkspaceAgentDefinition, ProtocolError> {
-        let id: ResourceID = self.id.into_domain(())?;
-        let driver: ResourceID = self.driver.into_domain(())?;
-        if id.resource_type() != "agent"
-            || driver.resource_type() != "driver"
-            || self.home_root.is_empty()
-            || self.history_path.is_empty()
-        {
-            return Err(ProtocolError::new(
-                ProtocolErrorKind::InvalidRequest,
-                "invalid agent definition",
-            ));
-        }
-        Ok(WorkspaceAgentDefinition {
-            name: self.name,
-            id,
-            driver,
-            home_root: self.home_root.into(),
-            history_path: self.history_path.into(),
         })
     }
 }
@@ -796,33 +1023,10 @@ impl FromDomain<&WorkspaceDefinition> for WorkspaceDefinitionDto {
             id: (&definition.id).into_dto(())?,
             name: definition.name.clone(),
             project_root: definition.project_root.to_string_lossy().into(),
-            manager: definition.manager.clone(),
             agents: definition
                 .agents
                 .iter()
                 .map(|agent| agent.into_dto(()))
-                .collect::<Result<_, _>>()?,
-        })
-    }
-}
-impl IntoDomain<WorkspaceDefinition> for WorkspaceDefinitionDto {
-    fn into_domain(self, (): ()) -> Result<WorkspaceDefinition, ProtocolError> {
-        let id: ResourceID = self.id.into_domain(())?;
-        if id.resource_type() != "workspace" || self.project_root.is_empty() {
-            return Err(ProtocolError::new(
-                ProtocolErrorKind::InvalidRequest,
-                "invalid workspace definition",
-            ));
-        }
-        Ok(WorkspaceDefinition {
-            id,
-            name: self.name,
-            project_root: self.project_root.into(),
-            manager: self.manager,
-            agents: self
-                .agents
-                .into_iter()
-                .map(|agent| agent.into_domain(()))
                 .collect::<Result<_, _>>()?,
         })
     }
@@ -832,7 +1036,6 @@ pub struct WorkspaceInfoDto {
     pub id: ResourceIdDto,
     pub name: String,
     pub project_root: String,
-    pub manager: ResourceIdDto,
     pub agents: Vec<ResourceIdDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_failures: Vec<WorkspaceMemberFailureDto>,
@@ -850,21 +1053,10 @@ impl WorkspaceInfoDto {
 }
 impl FromDomain<&WorkspaceDefinition> for WorkspaceInfoDto {
     fn from_domain(definition: &WorkspaceDefinition, (): ()) -> Result<Self, ProtocolError> {
-        let manager = definition
-            .agents
-            .iter()
-            .find(|agent| agent.name == definition.manager)
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorKind::AgentNotFound,
-                    "manager definition missing",
-                )
-            })?;
         Ok(Self {
             id: (&definition.id).into_dto(())?,
             name: definition.name.clone(),
             project_root: definition.project_root.to_string_lossy().into(),
-            manager: (&manager.id).into_dto(())?,
             agents: definition
                 .agents
                 .iter()
@@ -892,6 +1084,25 @@ impl FromDomain<Entity, &World> for WorkspaceInfoDto {
             })
             .collect::<Result<_, ProtocolError>>()?;
         Ok(dto)
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceDeletionDto {
+    pub id: ResourceIdDto,
+    pub name: String,
+    /// Registered definition path that no longer exists.
+    pub path: String,
+    /// Recoverable directory the definition was moved to.
+    pub removed_path: String,
+}
+impl FromDomain<&WorkspaceDeletion> for WorkspaceDeletionDto {
+    fn from_domain(deletion: &WorkspaceDeletion, (): ()) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            id: (&deletion.id).into_dto(())?,
+            name: deletion.id.name().to_owned(),
+            path: deletion.path.to_string_lossy().into(),
+            removed_path: deletion.removed_path.to_string_lossy().into(),
+        })
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1013,9 +1224,17 @@ impl FromDomain<(AgentStateDto, Vec<HistoryRecord>)> for AgentHistoryDto {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendStateDto {
+    #[serde(default)]
+    pub catalog: Vec<WorkspaceCatalogEntryDto>,
+    #[serde(default)]
     pub workspaces: Vec<WorkspaceInfoDto>,
+    #[serde(default)]
     pub agents: Vec<AgentStateDto>,
+    #[serde(default)]
     pub histories: Vec<AgentHistoryDto>,
+    /// Canonical, non-sensitive driver addresses available for member creation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drivers: Vec<ResourceIdDto>,
 }
 impl FromDomain<(), &World> for BackendStateDto {
     fn from_domain((): (), world: &World) -> Result<Self, ProtocolError> {
@@ -1034,12 +1253,14 @@ impl FromDomain<(), &World> for BackendStateDto {
                 .to_string()
         });
         Ok(Self {
+            catalog: catalog_entries(world)?,
             workspaces,
             agents: entities
                 .iter()
                 .map(|entity| (*entity).into_dto(world))
                 .collect::<Result<_, _>>()?,
             histories: Vec::new(),
+            drivers: driver_ids(world)?,
         })
     }
 }
@@ -1069,27 +1290,12 @@ pub fn resolve_workspace(
 pub fn resolve_agent(
     world: &World,
     reference: &WorkspaceReferenceDto,
-    requested: Option<&ResourceIdDto>,
+    requested: &ResourceIdDto,
 ) -> Result<(Entity, ResourceID), ProtocolError> {
     let workspace = resolve_workspace(world, reference)?;
     let component = world.get_component::<Workspace>(workspace).unwrap();
-    let id = match requested {
-        Some(id) => id.clone().into_domain(())?,
-        None => component
-            .definition()
-            .agents
-            .iter()
-            .find(|agent| agent.name == component.definition().manager)
-            .ok_or_else(|| ProtocolError::new(ProtocolErrorKind::AgentNotFound, "manager missing"))?
-            .id
-            .clone(),
-    };
+    let id = requested.clone().into_domain(())?;
     let unavailable = || {
-        let role = if requested.is_none() {
-            "manager"
-        } else {
-            "agent"
-        };
         let detail = component
             .member_failures()
             .get(&id)
@@ -1098,7 +1304,7 @@ pub fn resolve_agent(
         ProtocolError::new(
             ProtocolErrorKind::AgentNotFound,
             format!(
-                "{role} unavailable: {id} in workspace {}{detail}",
+                "agent unavailable: {id} in workspace {}{detail}",
                 component.definition().id
             ),
         )
@@ -1170,3 +1376,102 @@ impl fmt::Display for ProtocolError {
     }
 }
 impl std::error::Error for ProtocolError {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceCatalogEntryDto {
+    pub id: ResourceIdDto,
+    pub name: String,
+    pub path: String,
+    pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<WorkspaceDefinitionDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub lifecycle: String,
+}
+impl FromDomain<&WorkspaceCatalogEntry, &World> for WorkspaceCatalogEntryDto {
+    fn from_domain(entry: &WorkspaceCatalogEntry, world: &World) -> Result<Self, ProtocolError> {
+        let lifecycle = world
+            .workspace_by_id(&entry.id)
+            .ok()
+            .and_then(|entity| world.get_component::<Workspace>(entity))
+            .map(|workspace| {
+                use margatroid_types::workspace_components::WorkspaceState;
+                match workspace.state() {
+                    WorkspaceState::Starting(_) => "starting",
+                    WorkspaceState::Running => "running",
+                    WorkspaceState::Stopping(_) => "stopping",
+                    WorkspaceState::Failed { .. } => "failed",
+                }
+            })
+            .unwrap_or("stopped");
+        Ok(Self {
+            id: (&entry.id).into_dto(())?,
+            name: entry.name.clone(),
+            path: entry.path.to_string_lossy().into(),
+            revision: entry.revision.clone(),
+            definition: entry
+                .definition
+                .as_ref()
+                .map(|definition| definition.into_dto(()))
+                .transpose()?,
+            error: entry.error.clone(),
+            lifecycle: lifecycle.into(),
+        })
+    }
+}
+pub fn catalog_entries(world: &World) -> Result<Vec<WorkspaceCatalogEntryDto>, ProtocolError> {
+    let mut entries: Vec<WorkspaceCatalogEntryDto> = world
+        .get_resource::<WorkspaceCatalog>()
+        .map(|catalog| {
+            catalog
+                .0
+                .iter()
+                .map(|entry| entry.into_dto(world))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    entries.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+    Ok(entries)
+}
+/// Canonical driver addresses published by the driver loader through [`DriverCatalog`].
+///
+/// Only addresses are exposed; driver sources, origins, dependencies and model settings stay
+/// private. A missing resource yields an empty list so installations without a driver scan
+/// keep working.
+pub fn driver_ids(world: &World) -> Result<Vec<ResourceIdDto>, ProtocolError> {
+    let mut drivers: Vec<ResourceIdDto> = world
+        .get_resource::<DriverCatalog>()
+        .map(|catalog| {
+            catalog
+                .0
+                .iter()
+                .map(|id| id.into_dto(()))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    drivers.sort_by(|a, b| a.0.cmp(&b.0));
+    drivers.dedup();
+    Ok(drivers)
+}
+/// Logical workspace or member name accepted by catalog operations.
+///
+/// The same shape the lifecycle derives addresses from: non-empty, at most 128 bytes, not a
+/// path segment (`/`, `\`, `.`, `..`) and free of control characters.
+pub fn valid_logical_name(name: &str) -> Result<(), ProtocolError> {
+    if name.is_empty()
+        || name.len() > 128
+        || matches!(name, "." | "..")
+        || name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\'))
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorKind::InvalidRequest,
+            "name must be non-empty, at most 128 bytes, and contain no path separators, control characters, '.' or '..'",
+        ));
+    }
+    Ok(())
+}

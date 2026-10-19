@@ -1,4 +1,6 @@
 # 伪代码格式
+
+> 审计边界：本次只读比对源码并修改文档，未运行测试/构建。下文“已实现”描述可见代码结构，不证明草稿、跨插件时序、平台行为或端到端接线已验收；未闭合能力必须按明确目标实现和验证。
 ```text
 模块：使用一级标题，只写当前设计涉及的部分
 
@@ -38,19 +40,19 @@ types      src/types.rs及共享纯值契约       Provider协议与配置辅助
 error      共享推理错误契约               校验、执行及协议错误
 ```
 
-**状态：格式/vendor分层重构已实现。本文六板块描述当前源码：共享DomainRequest、三个具体格式转换及严格SSE累积、必填Vendor与七组合矩阵；用户图像采用共享UserImage值及三种原生格式转换。**
+**状态：格式/vendor分层重构已实现。本文六板块描述当前源码：共享DomainRequest、三个具体格式转换及严格SSE累积、必填Vendor与七组合矩阵；User与ToolCall图像采用共享UserImage值；Messages/Responses原生转换，Chat工具图像在完整批次后合成user。**
 
 共享types的独立inference_request_types模块定义拥有所有权的DomainRequest和DomainRequestConfig；InferenceRequest仍是执行事件。正向为DomainRequest -> 具体格式请求/ApiRequest -> VendorAdapter -> HTTP，响应经对应格式累积器归一。provider与api_type独立且必填，不由URL/model推断；唯一配置仍为models.toml。
 
 **当前已实现的typed snapshot请求：InferenceRequest.tools为Vec<CallableResource>，System消息保留真实Provider role。** 既有单推理入口、准备System、通用异步闭包及独立supervisor/HTTP worker、oneshot与真实cleanup边界保持不变；现消费MCL选定的不可变typed snapshots。全局仍只有一份模型配置；提交前取得全部已注册webui客户端发送器快照，闭包直接推流，后来连接不加入本次推理。
 
-当前输入边界：MCL只有MESSAGE、TOOL、SANDBOX三种typed arrays。TOOL保存可调用资源值（ResourceID、alias、description、schema及不可变共享执行材料快照），不是ToolCall请求数组。`IMPORT TOOL tool AS alias`绑定资源，`GET alias`解析并取得typed snapshot；`infer`参数依次为MESSAGE array、TOOL array，不接受ResourceID array，不再次执行global alias query。旧Block不随reload暗变，新GET alias取得新快照。TOOL仅允许tool资源，旧skill/hook导入明确拒绝。
+当前输入边界：MCL只有MESSAGE、TOOL、SANDBOX三种typed arrays。TOOL保存可调用资源值（ResourceID、alias、description、schema及不可变共享执行材料快照），不是ToolCall请求数组。`IMPORT TOOL tool AS alias`绑定资源，`GET alias`解析并取得typed snapshot；`infer`参数依次为MESSAGE array、TOOL array，不接受ResourceID array，不再次执行global alias query。持久Block仅保存资源ID，下一次GET按当前导入绑定取得新快照；已返回的typed值与在途请求不随reload暗变。TOOL仅允许tool资源，旧skill/hook导入明确拒绝。
 
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
 ## 用户轮次中止契约（已实现）
 
-本节描述用户轮次中止契约；受理核对Working及非空匹配turn，活动登记保存turn并监督独立turn_cancel令牌。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
+本节描述用户轮次中止契约；受理核对Working及非空匹配turn，活动登记保存turn并监督独立turn_cancel令牌。无 `get_turn`。状态为 `creating/idle/working/stopping`；中止立即清空 turn，清理期间保持 Working，正常 finish_turn 收口后才 Idle；状态同步同时发布 turn 与 status。用户轮次中止不等于根 Agent shutdown、owner abort、timeout 或 receiver closed。
 
 # lib
 
@@ -167,7 +169,7 @@ handle_inference(world: &mut World, request: InferenceRequest)
         先take共享原回复Sender并转入私有回复槽，克隆重复请求不再执行；捕获准备panic；校验请求ID（非空、至多256字节、无控制字符）、完整Agent Entity及取消状态；已失效直接完成oneshot错误；用户轮次取消按正常cancelled响应完成，不能统一归为错误
         复制Agent地址、info.model中的模型与采样参数，从全局配置查唯一模型路由
         从request.tools的CallableResource不可变共享快照准备typed tool definitions；对各snapshot自带ResourceID使用validate_owner验证目标Agent ResourceSet存在、driver_dependencies许可及ImportBindings的ID/TOOL kind已导入归属，不按ID重取latest、不再次global alias query
-        完整校验alias唯一、定义与schema后规范化消息，验证参数与输入上限；旧Block在资源reload后仍使用选定的旧定义快照
+        完整校验alias唯一、定义与schema后规范化消息，验证参数与输入上限；已选定的typed值及请求在资源reload后仍使用旧定义快照；持久Block下次GET按当前导入值解析
         收集全部当前webui发送器快照，复制HTTP客户端、路由及协议适配器
         保存拥有所有权的PreparedInference，不携带World、组件借用或Workspace配置
         通过Agent.execution共享AgentExecutionScope受检入口登记Inference活动，令牌从该作用域派生；登记与沙箱更新复用同一互斥门，但Inference活动不阻止沙箱改变
@@ -200,7 +202,7 @@ collect_tool_definitions(world: &World, agent: Entity, tools: &[CallableResource
         tool保存已加载输入schema；准备阶段不执行脚本
         仅tool可作为TOOL，其他资源类别不能冒充工具
         归属无效、缺乏模型工具定义、重复alias、非法工具名或不合法schema均在HTTP提交前拒绝，不悄悄忽略；空tools表示无工具，不回退默认集合
-        CallableResource共享快照不可变；资源reload只影响后续GET alias，不能改变已有Block或在途推理定义
+        CallableResource共享快照不可变；资源reload只影响后续GET alias，不能改变已返回的typed值或在途推理定义；持久Block只存ID，下次GET解析当前导入值
 
 normalize_messages(messages: Vec<AgentMessage>) -> Result<Vec<ProviderMessage>, InferenceError>
     规范化输入消息：私有函数
@@ -440,7 +442,7 @@ CallableResource：TOOL元素，公开共享纯值契约--定义归共享types�
     resource_id: ResourceID--导入资源完整身份，validate_owner仅校验已导入及许可，不取得新版本
     alias: String--导入绑定的模型可见alias
     definition: Arc<CallableDefinitionSnapshot>--不可变共享定义与执行材料，包含description、input_schema及tool种类材料；clone不复制或刷新版本
-    说明：Agent ImportBindings为权威alias绑定；不新增插件资源注册表。GET alias得到当前绑定的新快照，已有Block保留旧snapshot。
+    说明：Agent ImportBindings为权威alias绑定；不新增插件资源注册表。GET alias得到当前绑定的新快照，已返回的typed值保留旧snapshot；持久Block只存ID，下次GET解析当前导入值。
 
 ToolDefinition：模型工具定义，公开共享值类型
     name: String--选定CallableResource.alias
@@ -673,8 +675,8 @@ InferenceError：推理错误，公开结构体
 当前实现与验收边界：
     InferenceRequest.tools为Vec<CallableResource>，消费选定typed definition与resource_id validate_owner，不接受ResourceID array或重复global alias query
     System消息及prompt真实role可完整规范化，infer范围不被history append不含System的独立限制缩窄；输入与历史既有resource IDs保留
-    重复alias、无效归属或定义失败发生于HTTP提交前；reload不暗改旧Block/在途定义，新GET alias得到新snapshot
+    重复alias、无效归属或定义失败发生于HTTP提交前；reload不暗改已返回typed值/在途定义；持久Block只存ID，新GET按当前导入值得到新snapshot
     tool_call effect以单assistant MESSAGE array + TOOL visible array取assistant.tool_calls，空calls返回emptyMessage、不再次记录assistant；alias冲突/重复call ID/多条或非assistant先失败且不部分submit
     工具脚本磁盘材料版本隔离仍需另行闭合，不以metadata snapshot保证冒充该能力
-    现有测试验证HTTP worker abort并join、终态future释放后mark_completed的真实cleanup，而非仅oneshot关闭
+    源码中的测试针对HTTP worker abort并join、终态future释放后mark_completed的真实cleanup，而非仅oneshot关闭
 ```

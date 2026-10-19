@@ -41,7 +41,110 @@ types      共享components    Workspace状态机、操作进度与执行能力
 error      共享错误契约       错误定义归属见error板块
 ```
 
-**Workspace生命周期、共享组件与工作区执行线程已实现。本文保留六板块契约格式；当前源码归属与实现边界见下文，不将规划接口或外部运行能力当作已完成证明。**
+**恢复状态：catalog 与成员增删基线，以及新建、停止工作区重命名/删除、成员重命名的生命周期协调已恢复并通过本 crate 单元测试。持久迁移由 typed store 完成；SQLite 连续性、journal/recover、驱动扫描、目录选择与 UI 另有独立 scoped/集成验证，不能由生命周期测试单独证明。本文目标契约不代表所有层级全部验收。**
+
+2026-10-18 恢复验证：`cargo test -p workspace_plugin --lib` 为 19 passed（原 15 项与新增 4 项 CRUD 回归）。新增验证 StopAgent 真实结果确认后移除旧运行引用，才调用 rename_member；持久成功后仅为原活成员且父 Running 经 LoadAgentDriver/StartAgent 重启，lease 覆盖结果收口；启动失败保留已提交新身份，停止后持久失败不伪称仍在运行。CRUD 使用替身存储，不验证存储迁移实现。
+
+## 持久工作区与可变成员定义（生命周期基线已恢复验证）
+
+具体事件：RefreshWorkspaceCatalog / QueryWorkspaceCatalog / StartRegisteredWorkspace / AddWorkspaceMember / RemoveWorkspaceMember，均有同名Result。StartRegisteredWorkspace引用workspace_id与expected_revision；AddWorkspaceMember.member为WorkspaceMemberSpec（name、driver、可选home_root），不接受任意数据库路径。成员ID由工作区名和成员名推导，history_path由规范文档父目录下agents/<member>/state.sqlite推导。
+
+WorkspaceCatalogHandle注入blocking list/load/save/rename_workspace/delete_workspace/rename_member能力；WorkspaceCatalog保存查询快照。catalog::system通过spawn_async_service + spawn_blocking执行存储调用，再以私有StorageOutput事件收口。Operations只保存当前操作的lease与阶段，不镜像Agent生命周期。lease覆盖完整异步变更，和StartWorkspace、StopWorkspace、refresh统一互斥。与未完成动态创建重叠的成员编辑返回WorkspaceBusy，待收口后显式重试。
+
+已注册启动使用私有运行请求ID关联StartWorkspaceResult，避免重用外部请求ID的拒绝结果误释放操作。存储提交成功后才替换运行definition；添加的Ok代表配置已提交，运行失败另由WorkspaceMemberStartFailed投影。移除停止成功但保存失败时保留旧definition、保持成员实际停止并返回明确错误，不隐式停止根工作区或自动重启成员。refresh标注运行定义与磁盘定义冲突，编辑拒绝采纳冲突，必须先显式停止。
+
+catalog-backed世界的workspace_accept_agent_start仅接受已持久化且驱动及路径完全匹配的成员，并检查完整操作的受理lease。没有catalog backend的可信内部运行测试继续支持已编译StartWorkspace和原动态受理链。
+
+```text
+目录与权威来源：
+    daemon组合根提供用户数据根（默认~/.margatroid）及typed工作区catalog存储能力
+    ~/.margatroid/workspaces/<name>/workspace.yaml是可变、规范的成员定义，不是只读启动快照
+    ~/.margatroid/workspaces/<name>/agents/<agent>/state.sqlite保存该成员的单个数据库
+    state.sqlite沿用已有blocks和history同库/同连接管理器的设计，不拆成第二个history数据库
+    不在项目目录建立.margatroid；project_root是业务工作路径，不是持久状态根
+    稳定成员名映射到同一数据库；默认移除只移除定义，保留数据库
+    同名重新加入打开原库并恢复持久blocks/history，不清空已有数据；TEMP按新实例隔离、turn不恢复，其他沿用已有持久化规则
+    工作区和成员名须校验为安全目录段，拒绝路径穿越、越出数据根及名称别名冲突
+    manager概念、字段、特殊必需成员、隐式路由和manager unavailable错误在目标中全部移除
+    普通成员可有任意合法名称，不因名称得到管理特权；members为空是合法工作区
+
+catalog与运行实例分离：
+    catalog query/refresh只枚举固定workspaces根下一级条目，包括Stopped和配置无效的条目
+    无效条目携带解析/校验诊断，不静默漏掉；不递归扫描项目目录
+    catalog身份、定义revision和有效性与运行Workspace Entity分开；Stopped/Invalid不是存活Entity状态
+    启停只改变运行实例，不移除catalog记录或成员数据库
+    Workspace.state、agents、member_failures、等待表、Entity、线程、turn和活动状态只在RAM/运行期投影中
+    不写入workspace.yaml；成员启动失败诊断不成为定义字段，失败成员仍保留在规范定义中
+    workspace_list只列存活Entity；独立WorkspaceCatalog提供持久定义快照，不混为同一接口
+    当前删除WorkspaceRegistry指旧全局运行态/等待表，不禁止规划的持久catalog索引；不恢复旧生命周期镜像表
+    远程启动以workspaceID和expected_revision引用规范定义，由daemon解析；不接受客户端任意数据库路径
+    领域启动仍可接收服务端校验编译的WorkspaceDefinition；CLI同机操作必须定位相同规范数据根
+
+成员添加（Workspace生命周期协调）：
+    在每工作区串行变更通道中校验当前定义、成员名与expected_revision，拒绝冲突/重复
+    先经共享typed catalog能力持久化新成员定义，确认新revision已提交，再尝试驱动加载及StartAgent
+    持久化失败显式返回错误，不启动成员、不宣称添加成功，定义以最后确认提交版本为准
+    启动失败后保留已提交的成员定义和数据库，返回已配置但启动失败的事实及原始错误
+    添加结果区分定义提交与运行启动；停止的工作区仅修改配置，不自动启动工作区或成员
+    现有启动失败隔离机制仍适用：健康成员和工作区线程不因单个成员失败而回滚
+
+成员移除（不是普通StopAgent，也不是StopWorkspace）：
+    串行受理后阻止该成员的新创建/提交，并关联完整实例及已受理任务
+    活成员先通过Agent正常drain/stop链确认活动、MCL和Driver真实清理完成，然后才持久化移除定义
+    drain/stop失败保留定义及未清理引用，明确报告失败，不删除数据库或假称已移除
+    已停止或启动失败且无存活执行体时无需虚构停止，但仍须确认不存在未收口创建任务
+    停止成功而文件持久化失败时保留规范定义，报告“已停止、仍配置/持久化失败”的降级事实
+    不自动重启来伪装回滚；后续显式重试/协调按当前revision执行，不误报运行或移除成功
+    默认保留state.sqlite；同名再添加恢复同一持久数据，显式purge及迁移策略另行设计
+
+提交与故障边界：
+    backend在workspace.yaml同目录写完整临时文件，完成写入/必要flush后原子rename替换
+    每工作区串行化完整成员变更过程（含移除的停止等待），并以revision/expected_revision防止陈旧写覆盖
+    rename前再次核对受保护revision；仅rename或无互斥的revision检查不足以避免丢失更新
+    多写者须经过同一串行协调能力或等效锁及revision协议，不支持不受控编辑器并发覆写
+    结果携带已确认revision、配置提交事实、运行结果和必要降级诊断；提交不明须显式报告未知并重读协调
+    不宣称YAML、SQLite和ECS分布式原子提交；DB事务只保证自身既有事务边界
+    文件失败、停止失败、启动失败分开返回，不吞错误，不把部分完成包装成整个操作成功
+    异步结果按操作ID、revision及完整实例关联；停止和成员变更在同一工作区协调，迟到结果不覆盖新操作
+
+归属与依赖方向：
+    daemon注入数据根和catalog backend，不以daemon业务Handler代替Workspace成员生命周期协调
+    共享types定义快照/revision、catalog条目、存储能力、请求/结果和错误等typed契约
+    Workspace Plugin经能力协调读写与生命周期，不在System硬编码~路径、扫描文件系统或解析/生成YAML
+    Compose拥有纯parser/file codec；backend调用它并负责目录枚举、文件I/O及原子替换；共享types不依赖具体实现
+    System仍只读事件并调用Handler；磁盘工作在异步/阻塞设施执行，结果回ECS收口，不阻塞主线程
+    具体Rust接口见本节基线事件和共享workspace_catalog契约；生命周期接线及行为已由本 crate 单元测试恢复验证，存储实现须独立验收
+```
+
+## Sidebar 与重命名安全
+
+Sidebar 新建工作区输入名称与已存在的绝对项目目录，校验规范路径后提交空成员定义，不创建项目目录、不自动启动。新建会话即新增普通成员，输入名称并从已有 AgentDriver 中显式选择 `driver:scope/name:tag`；不使用 `agent-driver:`，没有默认驱动或隐式加载。可用驱动清单在启动时扫描有效的已安装包，包括尚未挂载到任何 Workspace 的包；当前扫描校验路径、普通文件、有界 UTF-8 及清单，不编译或执行 Lua。
+
+工作区与会话提供重命名、删除菜单。会话删除沿用持久成员移除：先真实 drain/stop，再提交定义移除，保留数据库。工作区删除只接受已停止且无存活实例、无未收口任务的工作区，将完整 home 移至内部 `workspaces/.trash/<unique>` 并从 catalog 排除；保留数据库，不做不可逆删除。`.trash` 及内部暂存项不应作为无效工作区显示。
+
+重命名必须保留既有持久 blocks 和 history 的可访问性、内容与关联。当前工作区名及成员名参与 ResourceID，ResourceID 又参与数据库命名空间：改 YAML/目录/ID 或仅保留 SQLite 文件均不证明数据连续。工作区重命名必须已停止且无存活实例；运行成员重命名必须先关闭新受理、等待创建收口并完成真实 drain/stop。所有数据库句柄及同连接管理器的 blocks/history 视图均关闭后，才能迁移路径和身份；不得让旧句柄继续写旧命名空间。
+
+**已确定的目标：** 保留现有按名称派生的公开 ResourceID；本范围不引入新的稳定身份模型。重命名必须在上述全部句柄关闭后，显式将旧 ResourceID 对应的已知 typed 持久命名空间与当前 history 查询关联迁移到新 ResourceID；保留原始事实性 history/audit 内容，不盲目字符串替换。成员与工作区改名通过 typed store 委托持久迁移；本 crate 测试不验证数据库目录/命名空间连续性，不能以生命周期测试宣布完整迁移契约完成。
+
+所有写操作持有完整生命周期 lease 与 expected revision；新建使用存储层“目标不存在”的创建前置条件（create 请求不带 revision），工作区改名还须保护源、目标名称。名称冲突或陈旧 revision 在更改前拒绝，旧工作区/成员及数据保持原样。迁移要有可恢复阶段记录、重新读取协调与明确的部分完成/提交未知结果；单个 SQLite 事务或单次文件 rename 不能提供多个数据库、YAML、目录及 ECS 的整体原子性。不得用新 ID 下空数据或重启新实例掩盖迁移失败。
+
+当前网络 payload（外层请求 id 仅作关联）：`workspace.create {name, project_root}`；`workspace.rename {workspace, expected_revision, new_name}`；`workspace.delete {workspace, expected_revision}`；`workspace.member.rename {workspace, agent, expected_revision, new_name}`。workspace/agent 均为规范 ResourceID，成员改名同时核对归属；wire 统一使用 snake_case expected_revision；内部事件的 workspace_id 与 wire workspace 由 DTO 显式转换。create 不接收 revision，存储层以目标不存在为前置条件，不能覆盖已有或保留数据的 home。字段与当前 Protocol/DTO 接线一致；验证结论限于实际执行过的 scoped 与集成场景。
+
+侧栏新建工作区必须使用 backend 目录选择能力取得 daemon 文件系统中的项目目录，再由创建操作重新验证其已存在、绝对且规范；不能以浏览器本地文件选择结果充当 backend 路径。新会话从 `state.sync.drivers` 选择所有已安装且完整验证的规范 Driver ID，包括尚未挂载的包；文件存在或当前已挂载实例列表不足以证明有效。扫描、目录选择、协议投影及持久新增已接通，并有 scoped 与隔离数据浏览器验证；未执行真实模型推理。
+
+当前端点：`workspace.paths.query {path?: String, cursor?: String}` 返回 `workspace.paths {id, path: String, parent: String|null, directories: [{name, path}], next_cursor?: String}`。省略 path 使用 daemon HOME；响应路径均为后端规范目录，只列目录、不列文件、不 mkdir；必须有上限和分页，错误经匹配请求 id 的 `request.failed` 返回。共享 `QueryProjectDirectories`/Result 经注入的 `ProjectDirectoryBrowser` 阻塞能力在异步服务的 blocking worker 执行，DTO 只转换和关联，不做文件 IO。
+
+当前 `driver.catalog.query`/`driver.catalog.refresh` 返回 `driver.catalog {id, drivers: [规范 Driver ID], errors: [{path, message}]}`；启动扫描发布共享 `DriverCatalog`，保留 `state.sync.drivers`。驱动领域校验完整包并报告逐包诊断，不把文件存在视为有效。这些端点及共享浏览能力已实现；驱动有效性限于路径、普通文件、有界 UTF-8、清单 schema/model/dependencies 校验，不编译或执行 Lua。
+
+迁移实施顺序：持有完整生命周期 lease，并按确定顺序同时锁源/目标名称；核对磁盘 revision、目标不存在及全部路径在受控 home 内。工作区改名必须已停止；成员活实例先关闭受理、收口已受理创建并真实 drain/stop，随后关闭同一连接管理器的所有 blocks/history 句柄并处理 WAL/SHM。
+
+Compose 文件存储内部按准备、提交、恢复协调迁移（没有独立注入的公开迁移服务）。内部 `workspaces/.operations/<operation-id>/` 保存 journal、staging 和提交时保留的 backup，不是 registry/index；journal 记录操作类型、源/目标名称、来源 revision、旧→新身份映射及源/暂存校验和，并同步文件和目录。Memory 从关闭句柄的原库通过 SQLite backup 生成一致副本，只在副本事务内更新 `block_definitions.agent`；定义 id、TEMP instance、schema、fields 和 history 的全部列/顺序原样校验保留。当前查询身份由重建的新 Agent/history 句柄投影，不改 history/audit 原始事实。工作区改名覆盖整个 home 的已知成员库，包括已移除但保留的库；成员改名不覆盖保留的同名目标库。未知 schema 或外来 namespace 明确拒绝，提交前保留可恢复原配置/数据。
+
+commit 只发布校验通过的副本，持久写入 `committed` 决策后按 journal 安装目录/成员库与 YAML，保留 backup 并同步目录，以校验和确认安装后写入 `complete`。多 DB、文件、目录与 ECS 不具整体原子性；中断由 recovery 按已确认阶段协调，失败可返回含 `commit_unknown` / `recovery_required` 的诊断，不开空库或自动重启假装回滚。对新身份持久上下文和历史可访问性的验证另由真实 FileStore+Driver 集成测试覆盖。
+
+成员改名的运行策略：若父 Workspace 为 Running 且目标成员有活实例，先真实 drain/stop 并关闭全部数据库视图，再 prepare/commit typed 身份迁移；只有持久改名确认成功且父 Workspace 仍为 Running，才按新名称/新 ID 尝试启动该成员。完整操作 lease 覆盖这次启动结果收口；持久成功后启动失败仍返回新 catalog 条目及已提交 revision，保留改名结果，通过新 ID 的 member_failures、日志和侧栏红点报告运行失败，不回滚名称。原本已停止或无活实例的成员只改持久身份，不自动启动；工作区自身改名始终仅允许停止状态。持久失败不启动新身份，也不能声称旧成员仍在运行；停止成功后失败须报告已停止、当前确认配置/身份及必要 recovery_required 状态。不得在 durable commit 前重启。
+
+文件存储构造及后续受理检查执行内部 recovery；`.operations`、`.trash` 与内部暂存项不参与 catalog 枚举。journal 使用 `preparing`、`prepared`、`committed`、`complete`、`rolled_back` 阶段：未提交且源校验通过时回滚准备阶段，已提交时幂等完成安装。未知、损坏或无法安全恢复的 journal 会设置存储级 `recovery_required`，保守阻止所有 catalog-backed 加载、启动和变更，而非仅封锁源/目标；诊断目录仍可列出。不能静默打开部分新身份或按任意 journal 路径写入。已有阶段中断及重复恢复测试不等于穷举磁盘故障。
 
 # lib
 
@@ -56,16 +159,16 @@ Workspace组件、状态与WorldWorkspaceExt已位于共享types的`workspace_co
 公开：
 ```text
 Workspace：工作区图书馆组件，公开Component--保存工作区自身身份，与驱动资源集合共同挂载到Workspace Entity
-    resourceid: ResourceID--工作区自身地址，由LibraryComponent提供查询
-    definition: Arc<WorkspaceDefinition>--静态工作区定义
+    resource_id: ResourceID--工作区自身地址，由LibraryComponent提供查询
+    definition: Arc<WorkspaceDefinition>--当前运行实例的定义快照；规划目标按catalog已提交revision更新，不是不可变的初始成员上限
     project_root: Arc<PathBuf>--项目根目录
     agents: BTreeMap<ResourceID, Entity>--已成功启动的成员Agent地址到Entity
     member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>--成员启动失败诊断，含驱动和原错误，不是生命周期表
     state: WorkspaceState--工作区状态机，包含当前启动或停止过程
-    execution_entry: Option<WorkspaceExecutionEntry>--工作区专属线程的任务提交入口，私有，不直接向外暴露
-    execution_close: Option<WorkspaceExecutionClose>--关闭该线程并等待退出的能力，私有
+    execution_entry: WorkspaceExecutionEntry--工作区专属线程的任务提交入口，私有，不直接向外暴露
+    execution_close: WorkspaceExecutionClose--关闭该线程并等待退出的能力，私有
     definition(&self) -> &WorkspaceDefinition
-        读取定义：公开方法，返回静态定义
+        读取定义：公开方法，返回当前已确认提交的定义快照
     project_root(&self) -> &Path
         读取项目根：公开方法，返回项目路径
     state(&self) -> &WorkspaceState
@@ -76,7 +179,7 @@ Workspace：工作区图书馆组件，公开Component--保存工作区自身身
     impl LibraryComponent for Workspace
         LibraryComponent：公开trait实现
         resource_id(&self) -> &ResourceID
-            读取自身地址：返回resourceid字段
+            读取自身地址：返回resource_id字段
 
 WorkspacePlugin：工作区生命周期插件，公开结构体
     schedule: String--运行计划名称
@@ -129,8 +232,8 @@ WorldWorkspaceExt：工作区世界扩展，公开trait--声明与World实现均
 
 ```text
 数据归属：
-    Workspace保存自己的resourceid、定义、成员引用和工作区状态
-    definition.id用于创建时初始化resourceid，挂载后自身身份以LibraryComponent::resource_id为准，不允许二者被独立修改
+    Workspace保存自己的resource_id、定义、成员引用和工作区状态
+    definition.id用于创建时初始化resource_id，挂载后自身身份以LibraryComponent::resource_id为准，不允许二者被独立修改
     agents使用ResourceID作键，不再维护按成员名称查询的索引或扩展方法
     成员名称可用于配置和展示，不作为运行时成员寻址键
     驱动条目保存在同一Entity上的ResourceSet<AgentDriver>中，Workspace内部不再保存agent_drivers
@@ -139,7 +242,7 @@ WorldWorkspaceExt：工作区世界扩展，公开trait--声明与World实现均
     state是整个工作区的一个状态，不按成员名称查询，也不需要Option返回值
     没有manager，没有成员运行状态表
     execution_entry和execution_close属于这个工作区实例，一条线程可运行多个Agent VM
-    definition只描述初始成员，不是动态成员的上限；空工作区仍保留执行线程
+    definition描述当前已确认提交的成员，catalog-backed动态启动不能绕过持久成员定义；空工作区仍保留执行线程
     Running开放外部提交与动态成员启动，Starting仅允许原启动链内部提交，Stopping和Failed不开放新任务
     workspace_of由Agent侧提供，不属于本trait
     World扩展方法统一使用所属领域前缀，Agent为agent_xxx，Workspace为workspace_xxx
@@ -219,7 +322,7 @@ handle_start_workspace(world: &mut World, request: StartWorkspace)
     行为：
         校验请求ID和工作区定义，失败发送StartWorkspaceResult的Err
         按definition.id调用find_entities检查已有工作区，已存在时发送DuplicateWorkspace错误，不覆盖旧实例
-        创建Entity，通过受检图书馆挂载入口插入Workspace，resourceid取definition.id，agents为空，state为Starting
+        创建Entity，通过受检图书馆挂载入口插入Workspace，resource_id取definition.id，agents为空，state为Starting
         不再挂载独立ResourceId组件；驱动集合由驱动加载方在目标Workspace Entity上创建或更新
         在创建阶段启动工作区专属执行线程，保存execution_entry和execution_close，不等第一个Agent才创建线程
         线程启动失败且没有成员执行体时回收本次Entity并返回ExecutionStartFailed
@@ -610,7 +713,7 @@ WorkspaceError：工作区错误，公开结构体
 ```text
 实体组成：
     Workspace Entity
-        Workspace { resourceid, definition, project_root, agents, state, execution_entry, execution_close }
+        Workspace { resource_id, definition, project_root, agents, state, execution_entry, execution_close }
             实现Component和LibraryComponent，是本Entity唯一图书馆组件
         ResourceSet<AgentDriver>
             实现Component和ResourcesComponent，以驱动ResourceID为键保存AgentDriver条目
@@ -648,4 +751,4 @@ Workspace 自身定义校验、创建或执行线程创建失败才返回 StartW
 
 Workspace 保存 member_failures: BTreeMap<ResourceID, WorkspaceMemberFailure>；失败值包含 driver 与 error，工作区身份由所属组件提供。这是持久到该工作区停止的失败诊断，不是重复 Agent 生命周期表。每个失败成员产生 WorkspaceMemberStartFailed，携带 workspace Entity、workspace_id、agent、driver、error；共享驱动失败按成员展开，动态创建失败同样记录并通知，成功加入清除该成员旧失败。Stopping 中已受理动态创建失败只结束等待，不污染健康工作区的停止结果。
 
-WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。manager 不可用时路由返回明确 manager unavailable 诊断，不暗中切换成员。客户端收到带失败的 workspace.started 仍保持连接。
+WorkspaceInfoDto 新增 member_failures: Vec<WorkspaceMemberFailureDto>，各项 agent、driver 为 ResourceIDDto，error 为 String；serde 缺省为空、空列表省略。workspace.started、state.sync、state.query 均投影该唯一失败源。DTO 按配置 logs 目标逐成员发送包含工作区、成员、驱动和原始错误的日志。目标移除manager专属路由及manager unavailable错误；请求应显式定位普通成员，无隐式切换。客户端收到带失败的 workspace.started 仍保持连接。

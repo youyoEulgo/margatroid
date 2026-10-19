@@ -41,7 +41,7 @@ RuntimeState：运行状态，公开枚举
     Working--工作
     Waiting--等待
     Sleeping--休眠
-    Closed--关闭，暂时占位，触发条件以后再定义
+    Closed--保留占位；当前没有公开转换或退出入口，不得用它作为业务停止完成的判据
 
 RuntimeError：Runtime错误，公开枚举--描述Runtime公开API能够识别的配置错误与运行错误
     InvalidFrameRate {
@@ -93,7 +93,7 @@ RuntimePlugin：Runtime插件，公开结构体
 
 RuntimeHandle：Runtime句柄，公开结构体--可克隆并交给其他Plugin、System或异步线程
     blocker_count: Arc<AtomicUsize>--阻塞计数，私有，0表示开阀，非0表示仍有任务阻止下一帧开始
-    wake_sender: SyncSender<()>--通知发送端，私有
+    wake_sender: SyncSender<()>--通知发送端，私有；绑定当前Runtime，接收端销毁后wake会报告断开
     new(wake_sender: SyncSender<()>) -> Self
         构造Runtime句柄：crate公开关联函数，wake_sender发送运行时唤醒通知
         行为：使用wake_sender和初始值0构造共享blocker_count
@@ -223,6 +223,8 @@ Runtime的配置错误与可识别运行错误使用RuntimeError统一描述
     -> 调用AppRunExt::run
     -> 从World移出RuntimeControl，避免同时借用World内部Resource与整个App
     -> RuntimeControl独占驱动App并进入运行循环
+    -> 同一Schedule按System注册顺序执行；PRE_UPDATE同步状态修改先于UPDATE生效
+    -> PRE_UPDATE内发送的新事件仍在下一帧可读；取消等控制System由应用显式挂载，不由Runtime解释
 
 固定帧运行循环：
     循环：

@@ -1,3 +1,5 @@
+mod project_directories;
+
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
@@ -52,6 +54,10 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let agent_drivers = AgentDriverLoaderPlugin::open(&agent_drivers_root)
         .map_err(|error| format!("cannot open agent driver root: {error}"))?;
+    let workspace_store = compose::FileWorkspaceCatalogStore::new(data_root.join("workspaces"))?;
+    let workspace_catalog = margatroid_types::workspace_catalog::WorkspaceCatalogHandle(
+        std::sync::Arc::new(workspace_store),
+    );
     let workspace = WorkspacePlugin::default();
     let global_config = ConfigPlugin::open(&config_path)
         .map_err(|error| format!("cannot open global configuration: {error}"))?;
@@ -66,6 +72,13 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     let mut app = App::new();
+    app.world_mut().insert_resource(workspace_catalog);
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    let browser = project_directories::LocalProjectDirectoryBrowser::new(home.into())?;
+    app.world_mut()
+        .insert_resource(margatroid_types::discovery::ProjectDirectoryBrowserHandle(
+            std::sync::Arc::new(browser),
+        ));
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(ClosurePlugin)
@@ -97,6 +110,12 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .add_plugin(UiPlugin::default());
 
     app.add_http_routes(UiPlugin::router());
+    use app_runtime_plugin::WorldEventExt;
+    app.world().send_event(
+        margatroid_types::workspace_events::RefreshWorkspaceCatalog {
+            id: "daemon-startup-catalog".into(),
+        },
+    );
 
     info!(address = %bind, allow = %ingress, data_root = %data_root.display(), config = %config_path.display(), models = %models_path.display(), "margatroid daemon starting");
     app.run();

@@ -2,12 +2,11 @@ mod error;
 
 use error::CliError;
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::path::Path;
 use std::process;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
-use compose::compile;
 use futures_util::{SinkExt, StreamExt};
 use margatroid_protocol::{ClientInfoDto, ClientMessage, ServerMessage};
 use time::format_description::well_known::Rfc3339;
@@ -15,7 +14,6 @@ use time::OffsetDateTime;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-const DEFAULT_WORKSPACE_FILE: &str = "margatroid-workspace.yaml";
 const DEFAULT_BACKEND_URL: &str = "ws://127.0.0.1:3939/ws";
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_DIM: &str = "\x1b[2m";
@@ -24,7 +22,7 @@ const ANSI_DIM: &str = "\x1b[2m";
 #[command(
     name = "margatroid",
     version,
-    about = "Compile Margatroid workspaces and connect them to the backend"
+    about = "Start registered Margatroid workspaces"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,7 +31,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum Command {
-    /// Compile, start, and manage a Workspace.
+    /// Start and manage registered workspaces.
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
@@ -42,15 +40,15 @@ enum Command {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum WorkspaceCommand {
-    /// Compile a Workspace file and start it on the backend.
+    /// Select a registered workspace and start it on the backend.
     Up(WorkspaceUpArgs),
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
 struct WorkspaceUpArgs {
-    /// Workspace definition to compile.
-    #[arg(value_name = "WORKSPACE_FILE", default_value = DEFAULT_WORKSPACE_FILE)]
-    workspace_file: PathBuf,
+    /// Registered workspace name (otherwise match the exact current project root).
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
     /// Backend WebSocket endpoint.
     #[arg(long = "backend", value_name = "WS_URL", default_value = DEFAULT_BACKEND_URL)]
     backend_url: String,
@@ -69,34 +67,17 @@ async fn run(command: Command) -> Result<(), CliError> {
     match command {
         Command::Workspace {
             command: WorkspaceCommand::Up(arguments),
-        } => run_workspace_up(arguments.workspace_file, arguments.backend_url).await,
+        } => run_workspace_up(arguments.name, arguments.backend_url).await,
     }
 }
 
-async fn run_workspace_up(workspace_file: PathBuf, backend_url: String) -> Result<(), CliError> {
-    let definition = compile(&workspace_file)?;
+async fn run_workspace_up(name: Option<String>, backend_url: String) -> Result<(), CliError> {
     let start_request_id = request_id();
     let register_request_id = format!("{start_request_id}-register");
     let registration = serde_json::to_string(&ClientMessage::register_connection(
         register_request_id.as_str(),
         "cli",
     ))?;
-    let request = ClientMessage::start_workspace(&start_request_id, &definition);
-    let encoded = serde_json::to_string(&request)?;
-    let workspace = margatroid_protocol::WorkspaceReferenceDto::with_id(
-        margatroid_protocol::ResourceIdDto(definition.id.to_string()),
-        definition.name.clone(),
-        definition.project_root.to_string_lossy(),
-    );
-
-    print_cli_event(
-        "INFO",
-        &format!(
-            "workspace compiled (file={}, workspace={})",
-            workspace_file.display(),
-            definition.name
-        ),
-    );
     print_cli_event(
         "INFO",
         &format!("connecting to backend (url={backend_url})"),
@@ -113,6 +94,41 @@ async fn run_workspace_up(workspace_file: PathBuf, backend_url: String) -> Resul
             registered.resource_id, registered.client_type, registered.name
         ),
     );
+    let catalog_id = format!("{start_request_id}-catalog");
+    socket
+        .send(Message::Text(
+            serde_json::json!({"type":"workspace.catalog.query", "id":catalog_id, "message":{}})
+                .to_string()
+                .into(),
+        ))
+        .await?;
+    let entries = wait_for_catalog(&mut socket, &catalog_id).await?;
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let candidates = catalog_candidates(&entries, name.as_deref(), &cwd);
+    let Some(entry) = choose_workspace(&mut socket, candidates, io::stdin().is_terminal()).await?
+    else {
+        socket.close(None).await?;
+        return Ok(());
+    };
+    if let Some(error) = &entry.error {
+        return Err(CliError::Remote(format!(
+            "Invalid workspace {}: {error}; fix its registered definition and refresh the catalog",
+            entry.name
+        )));
+    }
+    let definition = entry.definition.as_ref().ok_or_else(|| {
+        CliError::Remote("Workspace has no valid definition; refresh the catalog".into())
+    })?;
+    let workspace = margatroid_protocol::WorkspaceReferenceDto::with_id(
+        entry.id.clone(),
+        entry.name.clone(),
+        definition.project_root.clone(),
+    );
+    let encoded = serde_json::to_string(&ClientMessage::start_workspace(
+        &start_request_id,
+        entry.id.clone(),
+        &entry.revision,
+    ))?;
     socket.send(Message::Text(encoded.into())).await?;
     print_cli_event(
         "INFO",
@@ -173,6 +189,124 @@ async fn run_workspace_up(workspace_file: PathBuf, backend_url: String) -> Resul
                         return Ok(());
                     }
                     Message::Frame(_) => {},
+                }
+            }
+        }
+    }
+}
+
+fn catalog_candidates<'a>(
+    entries: &'a [margatroid_protocol::WorkspaceCatalogEntryDto],
+    name: Option<&str>,
+    cwd: &Path,
+) -> Vec<&'a margatroid_protocol::WorkspaceCatalogEntryDto> {
+    entries
+        .iter()
+        .filter(|entry| match name {
+            Some(name) => entry.name == name,
+            None => {
+                entry
+                    .definition
+                    .as_ref()
+                    .and_then(|definition| Path::new(&definition.project_root).canonicalize().ok())
+                    .as_deref()
+                    == Some(cwd)
+            }
+        })
+        .collect()
+}
+async fn choose_workspace<'a>(
+    socket: &mut (impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+              + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+              + Unpin),
+    candidates: Vec<&'a margatroid_protocol::WorkspaceCatalogEntryDto>,
+    tty: bool,
+) -> Result<Option<&'a margatroid_protocol::WorkspaceCatalogEntryDto>, CliError> {
+    match candidates.len() {
+        0 => return Err(CliError::Remote("No registered workspace matches; use an explicit registered NAME or run from its exact project root".into())),
+        1 => return Ok(Some(candidates[0])),
+        _ if !tty => return Err(CliError::Remote("Multiple registered workspaces match; specify NAME or use an interactive terminal".into())),
+        _ => {}
+    }
+    for (index, entry) in candidates.iter().enumerate() {
+        eprintln!(
+            "{}: {} | {} | {}",
+            index + 1,
+            entry.name,
+            entry
+                .definition
+                .as_ref()
+                .map(|d| d.project_root.as_str())
+                .unwrap_or(&entry.path),
+            entry.lifecycle
+        );
+    }
+    eprintln!("Select a number (blank or q cancels):");
+    let (sender, mut input) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = io::stdin().read_line(&mut line).map(|_| line);
+        let _ = sender.send(result);
+    });
+    loop {
+        tokio::select! {
+            line = &mut input => {
+                let line = line.map_err(|_| CliError::Interrupted("workspace chooser closed"))??;
+                return parse_choice(line.trim(), &candidates);
+            }
+            signal = wait_for_shutdown_signal() => { signal?; return Ok(None); }
+            message = socket.next() => match message {
+                Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await?,
+                Some(Ok(Message::Text(text))) => print_backend_message(&text),
+                Some(Ok(Message::Binary(bytes))) => if let Ok(text) = String::from_utf8(bytes.to_vec()) { print_backend_message(&text); },
+                Some(Ok(Message::Close(_))) | None => return Err(CliError::Disconnected("backend disconnected during selection")),
+                Some(Err(error)) => return Err(error.into()),
+                _ => {},
+            }
+        }
+    }
+}
+fn parse_choice<'a>(
+    input: &str,
+    candidates: &[&'a margatroid_protocol::WorkspaceCatalogEntryDto],
+) -> Result<Option<&'a margatroid_protocol::WorkspaceCatalogEntryDto>, CliError> {
+    if input.is_empty() || input.eq_ignore_ascii_case("q") {
+        return Ok(None);
+    }
+    input
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|n| candidates.get(n).copied())
+        .map(Some)
+        .ok_or_else(|| CliError::Remote("Invalid workspace selection; nothing started".into()))
+}
+async fn wait_for_catalog(
+    socket: &mut (impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+              + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+              + Unpin),
+    request_id: &str,
+) -> Result<Vec<margatroid_protocol::WorkspaceCatalogEntryDto>, CliError> {
+    let deadline = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return Err(CliError::Timeout("timed out waiting for workspace.catalog")),
+            signal = wait_for_shutdown_signal() => { signal?; return Err(CliError::Interrupted("shutdown requested before selection")); },
+            message = socket.next() => {
+                let text = match message {
+                    Some(Ok(Message::Text(text))) => text.to_string(),
+                    Some(Ok(Message::Binary(bytes))) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Some(Ok(Message::Ping(payload))) => { socket.send(Message::Pong(payload)).await?; continue; },
+                    Some(Ok(Message::Close(_))) | None => return Err(CliError::Disconnected("backend disconnected before catalog reply")),
+                    Some(Err(error)) => return Err(error.into()),
+                    _ => continue,
+                };
+                print_backend_message(&text);
+                match serde_json::from_str::<ServerMessage>(&text) {
+                    Ok(ServerMessage::WorkspaceCatalog { id, entries }) if id == request_id => return Ok(entries),
+                    Ok(ServerMessage::RequestFailed { id, error }) if id == request_id => return Err(CliError::Remote(error.message)),
+                    _ => {},
                 }
             }
         }
@@ -435,6 +569,86 @@ fn request_id() -> String {
 mod tests {
     use super::*;
 
+    fn catalog_entry(name: &str, root: &Path) -> margatroid_protocol::WorkspaceCatalogEntryDto {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("workspace:local/{name}:latest"), "name": name,
+            "path": format!("/catalog/{name}/workspace.yaml"), "revision": "revision-1", "lifecycle": "stopped",
+            "definition": {"id": format!("workspace:local/{name}:latest"), "name":name, "project_root":root, "agents":[]}
+        })).unwrap()
+    }
+
+    #[test]
+    fn catalog_selection_is_exact_canonical_root_or_explicit_name() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let entries = vec![
+            catalog_entry("one", root.path()),
+            catalog_entry("two", root.path()),
+        ];
+        assert_eq!(
+            catalog_candidates(&entries, None, &root.path().canonicalize().unwrap()).len(),
+            2
+        );
+        assert!(catalog_candidates(&entries, None, &nested.canonicalize().unwrap()).is_empty());
+        assert_eq!(catalog_candidates(&entries, Some("two"), &nested).len(), 1);
+        assert!(
+            catalog_candidates(&entries, Some("/arbitrary/workspace.yaml"), root.path()).is_empty()
+        );
+        assert!(catalog_candidates(&entries, Some("unknown"), root.path()).is_empty());
+        #[cfg(unix)]
+        {
+            let link = root.path().join("alias");
+            std::os::unix::fs::symlink(root.path(), &link).unwrap();
+            let alias_entries = vec![catalog_entry("alias", &link)];
+            assert_eq!(
+                catalog_candidates(&alias_entries, None, &root.path().canonicalize().unwrap())
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn chooser_number_cancel_and_invalid_input_never_guess() {
+        let root = tempfile::tempdir().unwrap();
+        let entries = [
+            catalog_entry("one", root.path()),
+            catalog_entry("two", root.path()),
+        ];
+        let choices = entries.iter().collect::<Vec<_>>();
+        assert_eq!(parse_choice("2", &choices).unwrap().unwrap().name, "two");
+        for cancel in ["", "q", "Q"] {
+            assert!(parse_choice(cancel, &choices).unwrap().is_none());
+        }
+        for invalid in ["0", "3", "one", "-1"] {
+            assert!(parse_choice(invalid, &choices).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn nonterminal_ambiguous_or_missing_selection_does_not_send_start() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+        let (mut socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        let _peer = server.await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let entries = [
+            catalog_entry("one", root.path()),
+            catalog_entry("two", root.path()),
+        ];
+        assert!(
+            choose_workspace(&mut socket, entries.iter().collect(), false)
+                .await
+                .is_err()
+        );
+        assert!(choose_workspace(&mut socket, vec![], false).await.is_err());
+    }
+
     #[tokio::test]
     async fn stop_wait_handles_ping_unrelated_text_and_matching_binary_ack() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -532,14 +746,14 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_workspace_file_and_local_backend() {
+    fn defaults_to_exact_cwd_selection_and_local_backend() {
         assert_eq!(
             Cli::try_parse_from(["margatroid", "workspace", "up"])
                 .unwrap()
                 .command,
             Command::Workspace {
                 command: WorkspaceCommand::Up(WorkspaceUpArgs {
-                    workspace_file: PathBuf::from(DEFAULT_WORKSPACE_FILE),
+                    name: None,
                     backend_url: DEFAULT_BACKEND_URL.into(),
                 }),
             }
@@ -547,13 +761,13 @@ mod tests {
     }
 
     #[test]
-    fn accepts_file_and_backend_options() {
+    fn accepts_name_and_backend_options() {
         assert_eq!(
             Cli::try_parse_from([
                 "margatroid",
                 "workspace",
                 "up",
-                "project/workspace.yaml",
+                "registered-project",
                 "--backend",
                 "ws://localhost:4000/events",
             ])
@@ -561,7 +775,7 @@ mod tests {
             .command,
             Command::Workspace {
                 command: WorkspaceCommand::Up(WorkspaceUpArgs {
-                    workspace_file: PathBuf::from("project/workspace.yaml"),
+                    name: Some("registered-project".into()),
                     backend_url: "ws://localhost:4000/events".into(),
                 }),
             }
@@ -604,7 +818,7 @@ mod tests {
             let text = serde_json::json!({
                 "type":"workspace.started", "id":"start",
                 "workspace":{"id":"workspace:local/test:latest", "name":"test", "project_root":"/project",
-                    "manager":"agent:test/coder:latest", "agents":[], "member_failures":failures}
+                    "agents":[], "member_failures":failures}
             }).to_string();
             let mut started = false;
             handle_workspace_start_reply(&text, "other", &mut started).unwrap();
@@ -623,7 +837,7 @@ mod tests {
             id: "start".into(),
             error: margatroid_protocol::ProtocolErrorDto::new(
                 "InvalidRequest",
-                "manager definition missing before creation",
+                "workspace definition missing before creation",
             ),
         })
         .unwrap();

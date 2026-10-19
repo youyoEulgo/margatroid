@@ -2,8 +2,11 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { createPinia, setActivePinia } from 'pinia';
+import { createRenderer, h, markRaw, nextTick } from 'vue';
+import SidebarTree from '../components/SidebarTree.vue';
 import {
   contextInjection,
+  buildSidebarModel,
   parseArguments,
   historyEntries,
   latestContextTokens,
@@ -38,15 +41,15 @@ const workspace = {
   id: 'workspace:local/test:latest',
   name: 'test',
   project_root: '/test',
-  manager: 'agent:local/manager:latest',
-  agents: ['agent:local/manager:latest'],
+  agents: ['agent:local/coder:latest'],
 };
 const state: BackendState = {
+  catalog: [{ id: workspace.id, name: workspace.name, path: '/catalog/test.yaml', revision: 'rev-1', lifecycle: 'running', definition: { ...workspace, agents: [{ id: workspace.agents[0]!, name: 'coder', driver: 'driver:local/coder:latest' }] } }],
   workspaces: [workspace],
   agents: [
     {
       workspace,
-      agent: workspace.manager,
+      agent: workspace.agents[0]!,
       agent_instance: 'Entity(1, 2)',
       status: 'idle',
       turn: null,
@@ -81,7 +84,7 @@ test('protocol accepts new structured error and terminal, rejects old transport 
       JSON.stringify({
         type: 'agent.message.delta',
         id: 'x',
-        agent: workspace.manager,
+        agent: workspace.agents[0]!,
         content: 'old',
       }),
     ),
@@ -92,7 +95,7 @@ test('protocol accepts new structured error and terminal, rejects old transport 
       JSON.stringify({
         type: 'agent.message.finished',
         id: 'x',
-        agent: workspace.manager,
+        agent: workspace.agents[0]!,
         agent_instance: 'Entity(1, 2)',
         error: null,
       }),
@@ -107,7 +110,7 @@ test('protocol accepts new structured error and terminal, rejects old transport 
       type: 'mcl.command_result',
       id: 'block',
       source: 'client:local/a',
-      target: workspace.manager,
+      target: workspace.agents[0]!,
       result: { Ok: opened },
       history_error: null,
     }),
@@ -120,7 +123,7 @@ test('protocol accepts new structured error and terminal, rejects old transport 
         type: 'mcl.command_result',
         id: 'x',
         source: 'client:local/a',
-        target: workspace.manager,
+        target: workspace.agents[0]!,
         result: { Err: { kind: 'MclError', message: 'failure' } },
         history_error: null,
       }),
@@ -131,7 +134,7 @@ test('protocol accepts new structured error and terminal, rejects old transport 
 test('history recursively projects lower-case messages and retains record payload', () => {
   const history: AgentHistory = {
     workspace,
-    agent: workspace.manager,
+    agent: workspace.agents[0]!,
     messages: [
       {
         key: 'one',
@@ -184,7 +187,7 @@ test('system context messages retain their role through recursive history projec
   assert.equal(isAgentMessage({ type: 'system', content: 1 }), false);
   const history: AgentHistory = {
     workspace,
-    agent: workspace.manager,
+    agent: workspace.agents[0]!,
     messages: [
       {
         key: 'system',
@@ -210,7 +213,7 @@ test('streams reject stale instances and duplicate sequence, terminal blocks lat
   const delta = {
     type: 'agent.message.delta' as const,
     id: 'inference',
-    agent: workspace.manager,
+    agent: workspace.agents[0]!,
     agent_instance: 'Entity(1, 2)',
     sequence: 1,
     content: 'hello',
@@ -230,7 +233,7 @@ test('streams reject stale instances and duplicate sequence, terminal blocks lat
   store.handleServerMessage({
     type: 'history.result',
     id: 'history',
-    history: { workspace, agent: workspace.manager, messages: [] },
+    history: { workspace, agent: workspace.agents[0]!, messages: [] },
   });
   store.handleServerMessage({ ...delta, sequence: 2, content: 'late' });
   assert.equal(store.visibleMessages.length, 0);
@@ -261,22 +264,22 @@ test('compatibility failures and abort remain truthful without legacy protocol',
   store.handleServerMessage({
     type: 'agent.message.finished',
     id: 'failed',
-    agent: workspace.manager,
+    agent: workspace.agents[0]!,
     agent_instance: 'Entity(1, 2)',
     error: { kind: 'InferenceFailed', message: 'real failure' },
   });
-  assert.deepEqual(store.lastFailures.get(`${workspace.id}:${workspace.manager}`), {
+  assert.deepEqual(store.lastFailures.get(`${workspace.id}:${workspace.agents[0]!}`), {
     message: 'real failure',
   });
   store.handleServerMessage({
     type: 'agent.message.finished',
     id: 'stale',
-    agent: workspace.manager,
+    agent: workspace.agents[0]!,
     agent_instance: 'old',
     error: { kind: 'InferenceFailed', message: 'stale failure' },
   });
   assert.equal(
-    store.lastFailures.get(`${workspace.id}:${workspace.manager}`)?.message,
+    store.lastFailures.get(`${workspace.id}:${workspace.agents[0]!}`)?.message,
     'real failure',
   );
 });
@@ -331,7 +334,7 @@ test('current typed GET restores resource controls and composer uses array argum
           type: 'mcl.command_result',
           id: request.id,
           source: 'client:test',
-          target: workspace.manager,
+          target: workspace.agents[0]!,
           result: { Ok: result } as never,
           history_error: null,
         }),
@@ -347,7 +350,7 @@ test('current typed GET restores resource controls and composer uses array argum
         histories: [
           {
             workspace,
-            agent: workspace.manager,
+            agent: workspace.agents[0]!,
             messages: [
               'IMPORT TOOL tool:local/review AS review',
               'IMPORT SANDBOX sandbox:local/write AS write',
@@ -386,7 +389,7 @@ test('current typed GET restores resource controls and composer uses array argum
     const commands = sent.filter((request) => request.type === 'mcl.command');
     assert.deepEqual(commands.at(-2)?.message, {
       workspace: { id: workspace.id, name: workspace.name, project_root: workspace.project_root },
-      agent: workspace.manager,
+      agent: workspace.agents[0]!,
       command: 'INJECT ? TO entry.pending[-1]',
       arguments: [[{ type: 'user', content: 'hello' }]],
     });
@@ -416,7 +419,7 @@ test('ended Driver failure remains visible in state snapshots', () => {
   assert.equal(store.selectedAgentReady, false);
   assert.equal(store.selectedAgentWorking, false);
   assert.equal(
-    store.lastFailures.get(`${workspace.id}:${workspace.manager}`)?.message,
+    store.lastFailures.get(`${workspace.id}:${workspace.agents[0]!}`)?.message,
     'tool calls lack results',
   );
 });
@@ -435,7 +438,7 @@ test('split message records reconstruct text and use only latest assistant conte
   });
   const history: AgentHistory = {
     workspace,
-    agent: workspace.manager,
+    agent: workspace.agents[0]!,
     messages: [
       row('user', 'actual user text', { type: 'user' }),
       row('old', 'legacy assistant', {
@@ -501,7 +504,7 @@ test('usage comes from persisted history, not state token counters', () => {
       histories: [
         {
           workspace,
-          agent: workspace.manager,
+          agent: workspace.agents[0]!,
           messages: [
             {
               key: 'usage',
@@ -560,7 +563,7 @@ test('composer gates on status not turn or generic MCL pending', async () => {
 test('cancelled assistant history preserves split metadata without content inference', () => {
   const history: AgentHistory = {
     workspace,
-    agent: workspace.manager,
+    agent: workspace.agents[0]!,
     messages: [
       {
         key: 'cancel',
@@ -638,7 +641,7 @@ test('abort uses independent API and ignores mismatched correlation', async () =
     const delta = {
       type: 'agent.message.delta' as const,
       id: 'aborted-inference',
-      agent: workspace.manager,
+      agent: workspace.agents[0]!,
       agent_instance: state.agents[0]!.agent_instance,
       sequence: 1,
       content: 'partial',
@@ -662,7 +665,7 @@ test('abort uses independent API and ignores mismatched correlation', async () =
       type: 'agent.turn.abort_result',
       id: request.id,
       workspace,
-      agent: workspace.manager,
+      agent: workspace.agents[0]!,
       turn_id: 'wrong',
       result: { Ok: null },
     });
@@ -671,7 +674,7 @@ test('abort uses independent API and ignores mismatched correlation', async () =
       type: 'agent.turn.abort_result',
       id: request.id,
       workspace,
-      agent: workspace.manager,
+      agent: workspace.agents[0]!,
       turn_id: 'turn-1',
       result: { Ok: null },
     });
@@ -707,7 +710,7 @@ test('abort uses independent API and ignores mismatched correlation', async () =
     });
     store.handleServerMessage({
       type: 'history.result', id: 'history',
-      history: { workspace, agent: workspace.manager, messages: [{
+      history: { workspace, agent: workspace.agents[0]!, messages: [{
         key: 'persisted-partial', sequence: 1, turn: 'turn-1', kind: 'message',
         content: 'partial', created_at_ms: 0,
         payload: { type: 'assistant', content: 'partial', reasoning: 'thought', tool_calls: [], usage: null, stop_reason: 'cancelled' },
@@ -731,7 +734,7 @@ test('image contract strips UI names and reconstructs backend image-only history
   assert.deepEqual(images, [{ media_type: 'image/png', data: 'iVBORw0KGgo=' }]);
   assert.deepEqual(contextInjection('', 'entry.pending[-1]', [image]).arguments,
     [[{ type: 'user', content: '', images }]]);
-  const entries = historyEntries({ workspace, agent: workspace.manager, messages: [{
+  const entries = historyEntries({ workspace, agent: workspace.agents[0]!, messages: [{
     key: 'image', sequence: 1, turn: null, kind: 'message', content: '', created_at_ms: 1,
     payload: { type: 'user', images },
   }] });
@@ -774,7 +777,7 @@ test('image-only send uses MCL and route switching prevents late wake even after
     }
   }
   function reply(id: string) {
-    store.handleServerMessage({ type: 'mcl.command_result', id, source: 'client:test', target: workspace.manager, result: { Ok: 'Unit' }, history_error: null });
+    store.handleServerMessage({ type: 'mcl.command_result', id, source: 'client:test', target: workspace.agents[0]!, result: { Ok: 'Unit' }, history_error: null });
   }
   globalThis.WebSocket = Socket as unknown as typeof WebSocket;
   try {
@@ -784,7 +787,7 @@ test('image-only send uses MCL and route switching prevents late wake even after
     const image = { media_type: 'image/png', data: 'iVBORw0KGgo=' };
     const sending = store.sendMessage('', [image]);
     const injected = sent.find((request) => request.message.command?.startsWith('INJECT'))!;
-    assert.equal(injected.message.agent, workspace.manager);
+    assert.equal(injected.message.agent, workspace.agents[0]!);
     assert.deepEqual(injected.message.arguments, [[{ type: 'user', content: '', images: [image] }]]);
     assert.equal(store.visibleMessages.length, 0);
     store.selectAgent('agent:other');
@@ -820,7 +823,7 @@ test('multi-MiB serialized images wait for parsed acknowledgements and recover a
       }
       function receive(event: unknown) { sockets.at(-1)?.onmessage?.({ data: JSON.stringify(event) }); }
       function acknowledge(id: string) {
-        receive({ type: 'mcl.command_result', id, source: 'client:test', target: workspace.manager,
+        receive({ type: 'mcl.command_result', id, source: 'client:test', target: workspace.agents[0]!,
           result: { Ok: 'Unit' }, history_error: null });
       }
       globalThis.WebSocket = Socket as unknown as typeof WebSocket;
@@ -839,7 +842,7 @@ test('multi-MiB serialized images wait for parsed acknowledgements and recover a
           receive({ type: 'request.failed', id: injected.id, error: { kind: 'MessageTooLarge', message: 'Message exceeds transport budget' } });
           await assert.rejects(sending, /transport budget/);
           assert.ok(!sent.some((request) => request.message.command === 'EMIT EFFECT wake'));
-          assert.match(store.lastFailures.get(`${workspace.id}:${workspace.manager}`)!.message, /transport budget/);
+          assert.match(store.lastFailures.get(`${workspace.id}:${workspace.agents[0]!}`)!.message, /transport budget/);
           const retry = store.sendMessage('retry');
           acknowledge(sent.filter((request) => request.message.command?.startsWith('INJECT')).at(-1)!.id);
           await Promise.resolve();
@@ -851,7 +854,7 @@ test('multi-MiB serialized images wait for parsed acknowledgements and recover a
           assert.deepEqual(stages, ['injecting', 'waking']);
           acknowledge(sent.find((request) => request.message.command === 'EMIT EFFECT wake')!.id);
           await sending;
-          receive({ type: 'history.result', id: 'h', history: { workspace, agent: workspace.manager, messages: [{
+          receive({ type: 'history.result', id: 'h', history: { workspace, agent: workspace.agents[0]!, messages: [{
             key: 'image', sequence: 1, turn: null, kind: 'message', content: '', created_at_ms: 1,
             payload: { type: 'user', images: [image] },
           }] } });
@@ -890,7 +893,7 @@ test('correlated abort rejection releases only the still-current turn suppressio
       store.connect();
       store.handleServerMessage({ type: 'connection.registered', id: 'r',
         client: { resource_id: 'client:test', client_type: 'webui', name: 'test' } });
-      const delta = { type: 'agent.message.delta' as const, id: 'known', agent: workspace.manager,
+      const delta = { type: 'agent.message.delta' as const, id: 'known', agent: workspace.agents[0]!,
         agent_instance: state.agents[0]!.agent_instance, sequence: 1, content: 'partial' };
       store.handleServerMessage(delta);
       const promise = store.abortTurn();
@@ -903,7 +906,7 @@ test('correlated abort rejection releases only the still-current turn suppressio
         store.handleServerMessage({ type: 'request.failed', id: request.id, error: { kind: 'abort_rejected', message: 'denied' } });
       } else {
         store.handleServerMessage({ type: 'agent.turn.abort_result', id: request.id, workspace,
-          agent: workspace.manager, turn_id: 'turn-1', result: { Err: { kind: 'abort_rejected', message: 'denied' } } });
+          agent: workspace.agents[0]!, turn_id: 'turn-1', result: { Err: { kind: 'abort_rejected', message: 'denied' } } });
       }
       await rejection;
       assert.equal(store.abortPending, false);
@@ -927,7 +930,7 @@ test('correlated abort rejection releases only the still-current turn suppressio
 
 test('tool image history retains tool identity and image metadata', () => {
   const image = {media_type:'image/png',data:'iVBORw0KGgo='};
-  const entry = historyEntries({workspace,agent:workspace.manager,messages:[{
+  const entry = historyEntries({workspace,agent:workspace.agents[0]!,messages:[{
     key:'read-image',sequence:1,turn:'turn-image',kind:'message',content:'Read image screenshot.png',
     payload:{type:'tool_call',tool_call_id:'read-1',tool_name:'read_image',resource_id:'tool:local/read-image:latest',failed:false,images:[image]},created_at_ms:123,
   }]})[0]!;
@@ -936,4 +939,278 @@ test('tool image history retains tool identity and image metadata', () => {
   assert.deepEqual(entry.images,[image]);
   assert.equal((entry.payload as {tool_call_id:string}).tool_call_id,'read-1');
   assert.equal(entry.failed,false);
+});
+
+
+test('catalog keeps stopped invalid and live entries with zero sole and multiple explicit routing', async () => {
+  setActivePinia(createPinia());
+  const store = useWorkbenchStore();
+  const sole = state.catalog[0]!;
+  const empty = { ...sole, id: 'workspace:local/empty:latest', name: 'empty', lifecycle: 'stopped', definition: { ...sole.definition!, id: 'workspace:local/empty:latest', agents: [] } };
+  const invalid = { id: 'workspace:local/bad:latest', name: 'bad', path: '/catalog/bad/workspace.yaml', revision: 'broken', lifecycle: 'stopped', error: 'Invalid YAML' };
+  const multi = { ...sole, id: 'workspace:local/multi:latest', name: 'multi', lifecycle: 'stopped', definition: { ...sole.definition!, id: 'workspace:local/multi:latest', agents: [...sole.definition!.agents, { id: 'agent:local/reviewer:latest', name: 'reviewer', driver: 'driver:local/review:latest' }] } };
+  store.handleServerMessage({ type: 'state.sync', state: { ...state, catalog: [empty, invalid, sole, multi] } });
+  assert.equal(store.workspaces.length, 4);
+  assert.equal(store.selectedAgent, null);
+  assert.equal(store.selectedAgentReady, false);
+  await assert.rejects(store.executeMclCommand('GET session.visible'));
+  store.selectWorkspace(invalid.id);
+  assert.equal(store.selectedCatalogEntry?.error, 'Invalid YAML');
+  await assert.rejects(store.startWorkspace(), /Fix/);
+  store.selectWorkspace(sole.id);
+  assert.equal(store.selectedAgent, sole.definition!.agents[0]!.id);
+  store.selectWorkspace(multi.id);
+  assert.equal(store.selectedAgent, null);
+  store.selectAgent('agent:local/reviewer:latest');
+  store.handleServerMessage({ type: 'state.sync', state: { ...state, catalog: [empty, invalid, sole, multi] } });
+  assert.equal(store.selectedWorkspace?.id, multi.id);
+  assert.equal(store.selectedAgent, 'agent:local/reviewer:latest');
+  store.handleServerMessage({ type: 'workspace.catalog', id: 'refresh', entries: [empty, invalid, sole, { ...multi, definition: { ...multi.definition, agents: [] } }] });
+  assert.equal(store.selectedAgent, null);
+});
+
+test('catalog mutations use revisions and wait for authoritative results without optimistic members', async () => {
+  setActivePinia(createPinia());
+  const store = useWorkbenchStore();
+  const oldSocket = globalThis.WebSocket;
+  const sent: Array<{ type: string; id: string; message: Record<string, unknown> }> = [];
+  class Socket {
+    static OPEN = 1; readyState = 1; onopen = null; onclose = null; onmessage = null; onerror = null;
+    close() {}
+    send(raw: string) { sent.push(JSON.parse(raw)); }
+  }
+  globalThis.WebSocket = Socket as unknown as typeof WebSocket;
+  try {
+    const entry = { ...state.catalog[0]!, lifecycle: 'stopped', definition: { ...state.catalog[0]!.definition!, agents: [] } };
+    store.handleServerMessage({ type: 'state.sync', state: { catalog: [entry], drivers: ['driver:local/coder:latest'], workspaces: [], agents: [], histories: [] } });
+    store.connect();
+    store.handleServerMessage({ type: 'connection.registered', id: 'register', client: { resource_id: 'client:test', name: 'test', client_type: 'webui' } });
+    assert.ok(sent.some((request) => request.type === 'workspace.catalog.query'));
+    const adding = store.addMember('coder', 'driver:local/coder:latest');
+    const add = sent.at(-1)!;
+    assert.equal(add.type, 'workspace.member.add');
+    assert.deepEqual(add.message, { workspace: entry.id, expected_revision: entry.revision, agent: { name: 'coder', driver: 'driver:local/coder:latest' } });
+    assert.equal(store.selectedWorkspace?.agents.length, 0);
+    const saved = { ...entry, revision: 'rev-2', definition: { ...entry.definition, agents: state.catalog[0]!.definition!.agents } };
+    store.handleServerMessage({ type: 'workspace.member.result', id: add.id, entry: saved });
+    await adding;
+    assert.equal(store.selectedAgent, saved.definition.agents[0]!.id);
+    assert.match(store.workspaceNotice, /persist|saved/i);
+    const removing = store.removeMember(store.selectedAgent!);
+    const remove = sent.at(-1)!;
+    assert.equal(remove.message.expected_revision, 'rev-2');
+    assert.equal(store.selectedWorkspace?.agents.length, 1);
+    store.handleServerMessage({ type: 'workspace.member.result', id: remove.id, entry: null, error: { kind: 'RevisionConflict', message: 'Definition changed; refresh and retry' } });
+    await assert.rejects(removing, /Definition changed/);
+    assert.equal(store.selectedWorkspace?.agents.length, 1);
+    assert.equal(sent.at(-1)?.type, 'workspace.catalog.query');
+    const starting = store.startWorkspace();
+    const start = sent.at(-1)!;
+    assert.deepEqual(start.message, { workspace: entry.id, expected_revision: 'rev-2' });
+    assert.equal(store.selectedCatalogEntry?.lifecycle, 'stopped');
+    store.handleServerMessage({ type: 'workspace.start_failed', id: start.id, error: { kind: 'StartFailed', message: 'Could not start' } });
+    await assert.rejects(starting, /Could not start/);
+  } finally { store.disconnect(); globalThis.WebSocket = oldSocket; }
+});
+
+
+test('sidebar dots distinguish transitions, healthy empty runtimes, current failures and recovery', () => {
+  const entry = state.catalog[0]!;
+  const model = (lifecycle: string, status: typeof state.agents[number]['status'], error?: {kind: string; message: string}) => buildSidebarModel(
+    [{ ...entry, lifecycle }], state.workspaces, [{ ...state.agents[0]!, status, error }], new Map(), new Set([entry.id]), entry.id, null).workspaces[0]!;
+  assert.equal(model('running', 'idle').status, 'running');
+  assert.equal(model('running', 'working').agents[0]!.status, 'running');
+  for (const status of ['creating', 'stopping'] as const) {
+    assert.equal(model('running', status).agents[0]!.status, 'stopped');
+    assert.equal(model('running', status).status, 'stopped');
+  }
+  assert.equal(model('starting', 'creating').status, 'stopped');
+  assert.equal(model('stopping', 'stopping').status, 'stopped');
+  assert.equal(model('running', 'idle', {kind: 'DriverFailed', message: 'failed'}).status, 'error');
+  const empty = { ...entry, definition: { ...entry.definition!, agents: [] } };
+  assert.equal(buildSidebarModel([empty], state.workspaces, [], new Map(), new Set(), '', null).workspaces[0]!.status, 'running');
+  setActivePinia(createPinia());
+  const store = useWorkbenchStore();
+  store.handleServerMessage({ type: 'state.sync', state: { ...state, agents: [{ ...state.agents[0]!, error: { kind: 'Error', message: 'failed' } }] } });
+  assert.equal(store.sidebarTree.workspaces[0]!.status, 'error');
+  store.handleServerMessage({ type: 'state.sync', state });
+  assert.equal(store.sidebarTree.workspaces[0]!.status, 'running');
+  store.toggleWorkspace(entry.id);
+  assert.equal(store.isWorkspaceExpanded(entry.id), false);
+  store.handleServerMessage({ type: 'state.sync', state });
+  assert.equal(store.isWorkspaceExpanded(entry.id), false);
+});
+
+test('driver and folder replies parse and reject malformed fields', () => {
+  for (const message of [
+    { type: 'driver.catalog', id: 'drivers', drivers: ['driver:local/unmounted:latest'], errors: [{path: '/invalid', message: 'Bad package'}] },
+    { type: 'workspace.paths', id: 'paths', path: '/home/me', parent: '/home', directories: [{name: 'project', path: '/home/me/project'}], next_cursor: 'page2' },
+    { type: 'workspace.paths', id: 'root', path: '/', parent: null, directories: [] },
+  ]) assert.deepEqual(parseServerMessage(JSON.stringify(message)), message);
+  assert.equal(parseServerMessage(JSON.stringify({type: 'driver.catalog', id: 'x', drivers: [1], errors: []})), null);
+  assert.equal(parseServerMessage(JSON.stringify({type: 'workspace.paths', id: 'x', path: '/', parent: null, directories: [{name: 'x'}]})), null);
+  assert.equal(parseServerMessage(JSON.stringify({type: 'workspace.paths', id: 'x', path: '/', parent: null, directories: [], next_cursor: 1})), null);
+  assert.equal(parseServerMessage(JSON.stringify({type: 'workspace.member.result', id: 'delete', entry: null}))?.type, 'workspace.member.result');
+});
+
+test('catalog operations capture nested targets, preserve other selections and rebind renamed IDs', async () => {
+  setActivePinia(createPinia());
+  const store = useWorkbenchStore();
+  const previousSocket = globalThis.WebSocket;
+  const sent: Array<{ type: string; id: string; message: Record<string, unknown> }> = [];
+  class Socket {
+    static OPEN = 1; readyState = 1; onopen = null; onclose = null; onmessage = null; onerror = null;
+    close() {} send(raw: string) { sent.push(JSON.parse(raw)); }
+  }
+  globalThis.WebSocket = Socket as unknown as typeof WebSocket;
+  const original = { ...state.catalog[0]!, lifecycle: 'stopped' };
+  const other = { ...original, id: 'workspace:local/other:latest', name: 'other', definition: { ...original.definition!, id: 'workspace:local/other:latest', agents: [] } };
+  try {
+    store.handleServerMessage({type: 'state.sync', state: {catalog: [original, other], drivers: ['driver:local/coder:latest'], workspaces: [], agents: [], histories: []}});
+    store.connect();
+    store.handleServerMessage({type: 'connection.registered', id: 'registered', client: {resource_id: 'client:test', name: 'test', client_type: 'webui'}});
+    const target = {key: original.id, revision: original.revision};
+    store.selectWorkspace(other.id);
+    const adding = store.addMember('new', 'driver:local/coder:latest', target);
+    const add = sent.at(-1)!;
+    assert.equal(add.message.workspace, original.id);
+    const added = {...original, revision: 'rev2', definition: {...original.definition!, agents: [...original.definition!.agents, {id: 'agent:local/new:latest', name: 'new', driver: 'driver:local/coder:latest'}]}};
+    store.handleServerMessage({type: 'workspace.member.result', id: add.id, entry: added});
+    await adding;
+    assert.equal(store.selectedWorkspaceKey, other.id);
+    assert.equal(store.selectedAgent, null);
+    assert.equal(sent.at(-1)!.type, 'workspace.catalog.query');
+    store.selectAgent('agent:local/new:latest', original.id);
+    const deletingSelected = store.removeMember('agent:local/new:latest', target);
+    const selectedDelete = sent.at(-1)!;
+    store.handleServerMessage({type: 'workspace.member.result', id: selectedDelete.id, entry: original}); await deletingSelected;
+    store.handleServerMessage({type: 'workspace.catalog', id: 'after-member-delete', entries: [original, other]});
+    assert.equal(store.selectedAgent, null, 'deleting a selection must not select its remaining sibling');
+    store.selectWorkspace(other.id);
+    const removing = store.removeMember('agent:local/new:latest', {key: original.id, revision: 'captured-revision'});
+    const remove = sent.at(-1)!;
+    assert.deepEqual(remove.message, {workspace: original.id, expected_revision: 'captured-revision', agent: 'agent:local/new:latest'});
+    store.handleServerMessage({type: 'workspace.member.result', id: remove.id, entry: original}); await removing;
+    store.selectWorkspace(original.id);
+    const renaming = store.renameMember(original.definition!.agents[0]!.id, 'renamed', target);
+    const rename = sent.at(-1)!;
+    const renamed = {...original, revision: 'rev3', definition: {...original.definition!, agents: [{...original.definition!.agents[0]!, id: 'agent:local/renamed:latest', name: 'renamed'}]}};
+    assert.equal(store.selectedAgent, original.definition!.agents[0]!.id);
+    store.handleServerMessage({type: 'state.sync', state: {catalog: [renamed, other], workspaces: [], agents: [], histories: []}});
+    store.handleServerMessage({type: 'workspace.member.result', id: rename.id, entry: renamed}); await renaming;
+    assert.equal(store.selectedAgent, 'agent:local/renamed:latest');
+    const workspaceRenaming = store.renameWorkspace(original.id, 'renamed-workspace', 'rev3');
+    const renameWorkspace = sent.at(-1)!;
+    const newWorkspace = {...renamed, id: 'workspace:local/renamed-workspace:latest', name: 'renamed-workspace', definition: {...renamed.definition, id: 'workspace:local/renamed-workspace:latest'}};
+    store.handleServerMessage({type: 'state.sync', state: {catalog: [newWorkspace, other], workspaces: [], agents: [], histories: []}});
+    store.handleServerMessage({type: 'workspace.member.result', id: renameWorkspace.id, entry: newWorkspace}); await workspaceRenaming;
+    assert.equal(store.selectedWorkspaceKey, newWorkspace.id);
+    assert.equal(store.catalog.some((entry) => entry.id === original.id), false);
+    assert.equal(store.isWorkspaceExpanded(original.id), false);
+    const deleting = store.deleteWorkspace(newWorkspace.id);
+    const deletion = sent.at(-1)!;
+    store.handleServerMessage({type: 'workspace.member.result', id: deletion.id, entry: null}); await deleting;
+    assert.equal(store.selectedWorkspaceKey, '');
+    assert.equal(store.selectedAgent, null);
+    store.handleServerMessage({type: 'workspace.catalog', id: 'authoritative', entries: [other]});
+    assert.equal(store.selectedWorkspaceKey, '');
+    await assert.rejects(store.addMember('bad', 'driver:local/unvalidated:latest', {key: other.id, revision: other.revision}), /validated/);
+    const drivers = store.queryDrivers(); const driverRequest = sent.at(-1)!;
+    assert.equal(driverRequest.type, 'driver.catalog.query');
+    store.handleServerMessage({type: 'driver.catalog', id: driverRequest.id, drivers: ['driver:local/unmounted:latest', 'garbage'], errors: [{path: '/bad', message: 'Invalid manifest'}]}); await drivers;
+    assert.deepEqual(store.drivers, ['driver:local/unmounted:latest']);
+    assert.equal(store.driverCatalogErrors[0]!.message, 'Invalid manifest');
+    const refreshing = store.queryDrivers(true); const refresh = sent.at(-1)!;
+    assert.equal(refresh.type, 'driver.catalog.refresh');
+    store.handleServerMessage({type: 'driver.catalog', id: refresh.id, drivers: [], errors: []}); await refreshing;
+    assert.deepEqual(store.drivers, []);
+    const folders = store.queryPaths({path: '/home', cursor: 'next'}); const paths = sent.at(-1)!;
+    assert.deepEqual(paths.message, {path: '/home', cursor: 'next'});
+    store.handleServerMessage({type: 'workspace.paths', id: paths.id, path: '/home', parent: '/', directories: [{name: 'project', path: '/home/project'}], next_cursor: 'last'});
+    assert.equal((await folders).directories[0]!.path, '/home/project');
+  } finally { store.disconnect(); globalThis.WebSocket = previousSocket; }
+});
+
+
+test('nested row menus contain only Rename/Delete, capture targets and close with keyboard or outside clicks', async () => {
+  class Host {
+    parent: Host | null = null; children: Host[] = []; props: Record<string, unknown> = {}; text = '';
+    constructor(public type: string) { markRaw(this); }
+    focus() { documentMock.activeElement = this; }
+    contains(target: Host): boolean { return this === target || this.children.some((child) => child.contains(target)); }
+    querySelectorAll(): Host[] { return descendants(this).filter((node) => node.props.role === 'menuitem'); }
+    querySelector(): Host | null { return this.querySelectorAll()[0] ?? null; }
+    closest(): Host | null { return this.props.role === 'menu' ? this : this.parent?.closest() ?? null; }
+  }
+  const descendants = (node: Host): Host[] => node.children.flatMap((child) => [child, ...descendants(child)]);
+  const listeners = new Map<string, (event: unknown) => void>();
+  const documentMock = {
+    activeElement: null as Host | null,
+    addEventListener: (name: string, listener: (event: unknown) => void) => listeners.set(name, listener),
+    removeEventListener: (name: string) => listeners.delete(name),
+  };
+  const globals = ['document', 'HTMLElement', 'Element', 'Node', 'CSS'] as const;
+  const descriptors = globals.map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+  Object.defineProperties(globalThis, Object.fromEntries([
+    ['document', { value: documentMock, configurable: true }],
+    ...['HTMLElement', 'Element', 'Node'].map((key) => [key, { value: Host, configurable: true }]),
+    ['CSS', { value: { escape: (text: string) => text }, configurable: true }],
+  ]));
+  const renderer = createRenderer<Host, Host>({
+    createElement: (type) => new Host(type), createText: (text) => Object.assign(new Host('text'), {text}),
+    createComment: (text) => Object.assign(new Host('comment'), {text}),
+    setText: (node, text) => { node.text = text; }, setElementText: (node, text) => { node.text = text; node.children = []; },
+    parentNode: (node) => node.parent, nextSibling: (node) => node.parent?.children[node.parent.children.indexOf(node) + 1] ?? null,
+    patchProp: (node, key, _previous, value) => { node.props[key] = value; },
+    insert: (node, parent, anchor) => {
+      if (node.parent) node.parent.children.splice(node.parent.children.indexOf(node), 1);
+      node.parent = parent;
+      const index = anchor ? parent.children.indexOf(anchor) : -1;
+      if (index < 0) parent.children.push(node); else parent.children.splice(index, 0, node);
+    },
+    remove: (node) => { if (node.parent) node.parent.children.splice(node.parent.children.indexOf(node), 1); node.parent = null; },
+  });
+  const root = new Host('root');
+  const events: unknown[][] = [];
+  const entry = state.catalog[0]!;
+  const other = {...entry, id: 'workspace:local/other:latest', name: 'other'};
+  const model = buildSidebarModel([entry, other], state.workspaces, state.agents, new Map(), new Set([entry.id, other.id]), other.id, null);
+  const app = renderer.createApp({render: () => h(SidebarTree, {model, pending: false, offline: false,
+    onRenameAgent: (...target: unknown[]) => events.push(['rename-agent', ...target]),
+    onDeleteWorkspace: (...target: unknown[]) => events.push(['delete-workspace', ...target]),
+    onSelectAgent: (...target: unknown[]) => events.push(['select-agent', ...target]),
+    onToggleWorkspace: (...target: unknown[]) => events.push(['toggle-workspace', ...target]),
+  })});
+  try {
+    app.mount(root); await nextTick();
+    const nodes = () => descendants(root);
+    const click = async (node: Host) => { (node.props.onClick as (event: unknown) => void)({currentTarget: node}); await nextTick(); };
+    const agentMenu = nodes().find((node) => node.props['aria-label'] === 'Agent actions for coder')!;
+    await click(agentMenu);
+    let items = nodes().filter((node) => node.props.role === 'menuitem');
+    const text = (node: Host): string => node.text + node.children.map(text).join('');
+    assert.deepEqual(items.map((item) => text(item).trim()), ['Rename', 'Delete']);
+    assert.equal(documentMock.activeElement, items[0]);
+    await click(items[0]!);
+    assert.deepEqual(events, [['rename-agent', entry.id, entry.definition!.agents[0]!.id]]);
+    assert.equal(documentMock.activeElement, agentMenu);
+    await click(agentMenu);
+    listeners.get('keydown')!({key: 'Escape', stopPropagation() {}}); await nextTick();
+    assert.equal(nodes().some((node) => node.props.role === 'menu'), false);
+    await click(agentMenu);
+    listeners.get('pointerdown')!({target: new Host('outside')}); await nextTick();
+    assert.equal(nodes().some((node) => node.props.role === 'menu'), false);
+    const workspaceMenu = nodes().find((node) => node.props['aria-label'] === 'Workspace actions for other')!;
+    await click(workspaceMenu); items = nodes().filter((node) => node.props.role === 'menuitem');
+    await click(items[1]!);
+    assert.deepEqual(events.at(-1), ['delete-workspace', other.id]);
+    const agentRow = nodes().find((node) => node.type === 'button' && String(node.props.class).includes('tree-main--agent'))!;
+    await click(agentRow);
+    assert.deepEqual(events.at(-1), ['select-agent', entry.definition!.agents[0]!.id, entry.id]);
+  } finally {
+    app.unmount();
+    for (const [key, descriptor] of descriptors) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key);
+    }
+  }
 });

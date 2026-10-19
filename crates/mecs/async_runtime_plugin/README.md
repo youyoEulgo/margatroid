@@ -100,7 +100,7 @@ fn main() {
 - `send_async_event(request)` 必须与 `add_async_system` 配合使用。普通 `send_event(request)`
   不会触发异步 handler，因为异步入口读取的是内部包装类型 `AsyncEventRequest<Request>`。
 - 读取事件时持有 `World` 的不可变借用，示例先提取结果，再修改 `Answers`，避免借用冲突。
-- `app.run()` 是持续运行的事件循环，不会因为这一批任务完成就自动退出。需要退出时由应用自行控制。
+- `app.run()` 是持续运行的事件循环，不会因为这一批任务完成就自动退出。当前 Runtime 没有公开的优雅退出循环 API，`Closed` 仍是占位状态。
 
 ## 异步闭包：提交、接收
 
@@ -220,8 +220,15 @@ Await 不是在发送调用处同步等待，也不直接返回计算结果。�
 使用 `app.run()` 时运行阀由 Runtime 处理。直接调用 `app.tick()` 只推进一次 ECS 更新，不能把它当作
 验证 Await 门控行为的完整 Runtime 事件循环。
 
-任务 panic 或内层任务取消会由监督逻辑转换为 `AsyncTaskError`，再通过 `E::from` 产生错误结果。
-应用或异步执行器整体关闭时，不保证接收 System 还能继续运行并处理结果。
+业务 Future 被 poll 时的 panic 或受监督内层任务的取消会通过 `JoinError` 转换为
+`AsyncTaskError`，再通过 `E::from` 产生错误结果。handler 或 task 闭包本身在 ECS 线程同步
+构造 Future，这一步的 panic 不在该监督范围内；应把需要监督的工作放入返回的 `async` Future。
+
+插件没有公开的逐任务取消句柄。业务若启动子任务并支持取消，应持有其取消信号或
+`JoinHandle`，请求停止后真正等待子任务结束（例如 `abort()` 后再 `.await`），完成清理后
+再返回结果。丢弃 `JoinHandle` 不能证明任务已停止，也不能提前宣告 Await 清理完成。
+执行器整体销毁会关闭提交通道、回收线程并丢弃未完成的 Tokio 任务；此时不保证监督逻辑
+完成 pending 响应或释放 Await 阀，不能把它当成业务取消完成事件。
 
 ## AsyncContext：发送进度与额外事件
 

@@ -35,8 +35,6 @@ fn app() -> App {
                 None,
                 vec![WebSocketMessageTarget::Broadcast],
                 vec![WebSocketMessageTarget::Broadcast],
-                vec![WebSocketMessageTarget::Broadcast],
-                vec![WebSocketMessageTarget::Broadcast],
             )
             .unwrap(),
         ))
@@ -92,7 +90,7 @@ async fn missing_workspace_image(socket: &mut Socket, id: &str, image_bytes: usi
     let request = ClientMessage::mcl_command(
         id,
         &WorkspaceReferenceDto::new("absent-image-workspace", "/not-created-by-this-test"),
-        None,
+        margatroid_protocol::ResourceIdDto("agent:test/image:latest".into()),
         "INJECT ? TO context",
         vec![json!([user])],
     );

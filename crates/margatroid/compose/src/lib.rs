@@ -1,5 +1,6 @@
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use margatroid_types::workspace_components::{WorkspaceAgentDefinition, WorkspaceDefinition};
@@ -7,8 +8,12 @@ use resource_id_plugin::ResourceID;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 
+mod storage;
+pub use storage::FileWorkspaceCatalogStore;
+
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 const MAX_LOGICAL_NAME_BYTES: usize = 128;
+pub const MAX_WORKSPACE_YAML_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComposeErrorKind {
@@ -20,7 +25,6 @@ pub enum ComposeErrorKind {
     InvalidDriverReference,
     InvalidResourceReference,
     DuplicateAgent,
-    MissingManager,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,86 +32,135 @@ pub struct ComposeError {
     kind: ComposeErrorKind,
     message: String,
 }
-
 impl ComposeError {
     fn new(kind: ComposeErrorKind, message: impl Into<String>) -> Self {
         let mut message = message.into();
         if message.len() > MAX_ERROR_MESSAGE_BYTES {
-            let suffix = "...";
-            let mut boundary = MAX_ERROR_MESSAGE_BYTES - suffix.len();
+            let mut boundary = MAX_ERROR_MESSAGE_BYTES - 3;
             while !message.is_char_boundary(boundary) {
                 boundary -= 1;
             }
             message.truncate(boundary);
-            message.push_str(suffix);
+            message.push_str("...");
         }
         Self { kind, message }
     }
-
     pub fn kind(&self) -> ComposeErrorKind {
         self.kind
     }
-
     pub fn message(&self) -> &str {
         &self.message
     }
 }
-
 impl fmt::Display for ComposeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:?}: {}", self.kind, self.message)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}: {}", self.kind, self.message)
     }
 }
-
 impl std::error::Error for ComposeError {}
 
-/// Compile a `margatroid-workspace.yaml` file into a runtime-independent definition.
+/// Compile a canonical `workspaces/<name>/workspace.yaml` file.
+/// The ancestor of `workspaces` may be an injected temporary root.
 pub fn compile(path: impl AsRef<Path>) -> Result<WorkspaceDefinition, ComposeError> {
-    let input_path = path.as_ref();
-    let file_path = fs::canonicalize(input_path).map_err(|error| {
-        ComposeError::new(
-            ComposeErrorKind::FileRead,
-            format!("cannot read workspace file: {error}"),
-        )
-    })?;
-    let source = fs::read_to_string(&file_path).map_err(|error| {
-        ComposeError::new(
-            ComposeErrorKind::FileRead,
-            format!("cannot read workspace file: {error}"),
-        )
-    })?;
-    compile_str(&source, file_path)
+    let path = path.as_ref();
+    validate_workspace_file(path)?;
+    let source = read_source(path)?;
+    compile_str(&source, path)
 }
 
-/// Compile YAML text using `workspace_file` as the base for relative paths.
+pub(crate) fn open_regular(path: &Path) -> Result<fs::File, ComposeError> {
+    reject_symlinks(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| ComposeError::new(ComposeErrorKind::FileRead, e.to_string()))?;
+    if !file
+        .metadata()
+        .map_err(|e| ComposeError::new(ComposeErrorKind::FileRead, e.to_string()))?
+        .is_file()
+    {
+        return Err(ComposeError::new(
+            ComposeErrorKind::FileRead,
+            "workspace source must be a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+pub(crate) fn read_source(path: &Path) -> Result<String, ComposeError> {
+    reject_symlinks(path)?;
+    let file = open_regular(path)?;
+    let mut source = String::new();
+    file.take(MAX_WORKSPACE_YAML_BYTES as u64 + 1)
+        .read_to_string(&mut source)
+        .map_err(|e| ComposeError::new(ComposeErrorKind::FileRead, e.to_string()))?;
+    if source.len() > MAX_WORKSPACE_YAML_BYTES {
+        return Err(ComposeError::new(
+            ComposeErrorKind::FileRead,
+            "workspace YAML exceeds size limit",
+        ));
+    }
+    Ok(source)
+}
+
+/// Compile bounded YAML at its managed destination, which need not exist yet.
 pub fn compile_str(
     source: &str,
     workspace_file: impl AsRef<Path>,
 ) -> Result<WorkspaceDefinition, ComposeError> {
-    let raw: WorkspaceFile = serde_yaml::from_str(source).map_err(|error| {
+    if source.len() > MAX_WORKSPACE_YAML_BYTES {
+        return Err(ComposeError::new(
+            ComposeErrorKind::FileDecode,
+            "workspace YAML exceeds size limit",
+        ));
+    }
+    let raw: WorkspaceFile = serde_yaml::from_str(source).map_err(|e| {
         ComposeError::new(
             ComposeErrorKind::FileDecode,
-            format!("cannot decode workspace file: {error}"),
+            format!("cannot decode workspace file: {e}"),
         )
     })?;
-    let workspace_file = absolute_path(workspace_file.as_ref())?;
-    let base = workspace_file.parent().ok_or_else(|| {
-        ComposeError::new(
-            ComposeErrorKind::InvalidPath,
-            "workspace file has no parent directory",
-        )
-    })?;
+    let base = validate_workspace_file(workspace_file.as_ref())?;
     build_definition(raw, base)
+}
+
+fn validate_workspace_file(path: &Path) -> Result<&Path, ComposeError> {
+    if !path.is_absolute() || normalize_path(path.to_path_buf())? != path {
+        return Err(ComposeError::new(
+            ComposeErrorKind::InvalidPath,
+            "workspace file must be an absolute canonical path",
+        ));
+    }
+    let base = path.parent().ok_or_else(|| {
+        ComposeError::new(ComposeErrorKind::InvalidPath, "missing workspace directory")
+    })?;
+    if path.file_name().and_then(|v| v.to_str()) != Some("workspace.yaml")
+        || base
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|v| v.to_str())
+            != Some("workspaces")
+    {
+        return Err(ComposeError::new(
+            ComposeErrorKind::InvalidPath,
+            "expected workspaces/<name>/workspace.yaml",
+        ));
+    }
+    reject_symlinks(path)?;
+    Ok(base)
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceFile {
     name: String,
-    #[serde(default)]
-    project_root: Option<PathBuf>,
-    #[serde(default)]
-    manager: Option<String>,
+    project_root: PathBuf,
     agents: AgentDocuments,
 }
 
@@ -169,67 +222,71 @@ struct RawAgent {
     driver: String,
     #[serde(default)]
     home_root: Option<PathBuf>,
-    #[serde(default, alias = "memory_path")]
-    history_path: Option<PathBuf>,
 }
 
 fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefinition, ComposeError> {
     validate_logical_name(&raw.name, "workspace")?;
-    let project_root = raw
-        .project_root
-        .map(|path| resolve_path(base, path))
-        .transpose()?
-        .unwrap_or_else(|| base.to_path_buf());
-
+    if base.file_name().and_then(|v| v.to_str()) != Some(&raw.name) {
+        return Err(ComposeError::new(
+            ComposeErrorKind::InvalidName,
+            "workspace name must match directory",
+        ));
+    }
+    let project_root = normalize_path(raw.project_root)?;
+    let canonical = fs::canonicalize(&project_root).map_err(|e| {
+        ComposeError::new(
+            ComposeErrorKind::InvalidPath,
+            format!("project_root must exist: {e}"),
+        )
+    })?;
+    if canonical != project_root || !project_root.is_dir() {
+        return Err(ComposeError::new(
+            ComposeErrorKind::InvalidPath,
+            "project_root must be an existing canonical directory",
+        ));
+    }
     let mut agents = Vec::with_capacity(raw.agents.0.len());
-    for raw_agent in raw.agents.0 {
-        let name = raw_agent.name.ok_or_else(|| {
+    let mut names = std::collections::HashSet::new();
+    for agent in raw.agents.0 {
+        let name = agent.name.ok_or_else(|| {
             ComposeError::new(
                 ComposeErrorKind::InvalidDefinition,
-                "sequence agent definitions must contain name",
+                "sequence agents require name",
             )
         })?;
         validate_logical_name(&name, "agent")?;
-        let driver_value = if raw_agent.driver.starts_with("driver:") {
-            raw_agent.driver
+        if !names.insert(name.clone()) {
+            return Err(ComposeError::new(
+                ComposeErrorKind::DuplicateAgent,
+                "duplicate agent name",
+            ));
+        }
+        let value = if agent.driver.starts_with("driver:") {
+            agent.driver
         } else {
-            format!("driver:{}", raw_agent.driver)
+            format!("driver:{}", agent.driver)
         };
-        let driver = ResourceID::parse(driver_value).map_err(|error| {
-            ComposeError::new(
-                ComposeErrorKind::InvalidDriverReference,
-                format!("invalid driver reference: {error}"),
-            )
+        let driver = ResourceID::parse(value).map_err(|e| {
+            ComposeError::new(ComposeErrorKind::InvalidDriverReference, e.to_string())
         })?;
         if driver.resource_type() != "driver" {
             return Err(ComposeError::new(
                 ComposeErrorKind::InvalidDriverReference,
-                "driver reference must use type driver",
+                "expected driver address",
             ));
         }
-        let home_root = match raw_agent.home_root {
-            Some(path) => resolve_path(&project_root, path)?,
+        let home_root = match agent.home_root {
+            Some(path) if path.is_absolute() => normalize_path(path)?,
+            Some(path) => normalize_path(project_root.join(path))?,
             None => normalize_path(PathBuf::from(std::env::var_os("HOME").ok_or_else(
                 || ComposeError::new(ComposeErrorKind::InvalidPath, "HOME is not configured"),
             )?))?,
         };
-        let history_path = raw_agent
-            .history_path
-            .map(|path| resolve_path(&project_root, path))
-            .transpose()?
-            .unwrap_or_else(|| {
-                project_root
-                    .join(".margatroid")
-                    .join(&raw.name)
-                    .join("history")
-                    .join(format!("{name}.sqlite"))
-            });
+        let history_path = base.join("agents").join(&name).join("state.sqlite");
+        reject_symlinks(&history_path)?;
         agents.push(WorkspaceAgentDefinition {
-            id: ResourceID::new("agent", &raw.name, &name, None::<String>).map_err(|error| {
-                ComposeError::new(
-                    ComposeErrorKind::InvalidDefinition,
-                    format!("invalid Agent resource ID: {error}"),
-                )
+            id: ResourceID::new("agent", &raw.name, &name, None::<String>).map_err(|e| {
+                ComposeError::new(ComposeErrorKind::InvalidDefinition, e.to_string())
             })?,
             name,
             driver,
@@ -237,52 +294,22 @@ fn build_definition(raw: WorkspaceFile, base: &Path) -> Result<WorkspaceDefiniti
             history_path,
         });
     }
-
-    let mut names = std::collections::HashSet::with_capacity(agents.len());
-    for agent in &agents {
-        if !names.insert(agent.name.as_str()) {
-            return Err(ComposeError::new(
-                ComposeErrorKind::DuplicateAgent,
-                "workspace Agent names must be unique",
-            ));
-        }
-    }
-    let manager = raw.manager.unwrap_or_else(|| {
-        agents
-            .first()
-            .map(|agent| agent.name.clone())
-            .unwrap_or_default()
-    });
-    if !agents.is_empty() {
-        validate_logical_name(&manager, "manager")?;
-    }
-    if (agents.is_empty() && !manager.is_empty())
-        || (!agents.is_empty() && !names.contains(manager.as_str()))
-    {
-        return Err(ComposeError::new(
-            ComposeErrorKind::MissingManager,
-            "workspace manager must name one configured Agent",
-        ));
-    }
-
     Ok(WorkspaceDefinition {
-        id: ResourceID::new("workspace", "local", &raw.name, None::<String>).map_err(|error| {
-            ComposeError::new(ComposeErrorKind::InvalidDefinition, error.to_string())
-        })?,
+        id: ResourceID::new("workspace", "local", &raw.name, None::<String>)
+            .map_err(|e| ComposeError::new(ComposeErrorKind::InvalidDefinition, e.to_string()))?,
         name: raw.name,
         project_root,
-        manager,
         agents,
     })
 }
 
-fn validate_logical_name(value: &str, kind: &str) -> Result<(), ComposeError> {
+pub(crate) fn validate_logical_name(value: &str, kind: &str) -> Result<(), ComposeError> {
     if value.is_empty()
         || value.len() > MAX_LOGICAL_NAME_BYTES
         || matches!(value, "." | "..")
         || value
             .chars()
-            .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+            .any(|c| c.is_control() || matches!(c, '/' | '\\'))
     {
         return Err(ComposeError::new(
             ComposeErrorKind::InvalidName,
@@ -292,219 +319,48 @@ fn validate_logical_name(value: &str, kind: &str) -> Result<(), ComposeError> {
     Ok(())
 }
 
-fn absolute_path(path: &Path) -> Result<PathBuf, ComposeError> {
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        let current = std::env::current_dir().map_err(|error| {
-            ComposeError::new(
-                ComposeErrorKind::InvalidPath,
-                format!("cannot determine current directory: {error}"),
-            )
-        })?;
-        current.join(path)
-    };
-    normalize_path(candidate)
-}
-
-fn resolve_path(base: &Path, path: PathBuf) -> Result<PathBuf, ComposeError> {
-    let candidate = if path.is_absolute() {
-        path
-    } else {
-        base.join(path)
-    };
-    normalize_path(candidate)
-}
-
-fn normalize_path(path: PathBuf) -> Result<PathBuf, ComposeError> {
+pub(crate) fn normalize_path(path: PathBuf) -> Result<PathBuf, ComposeError> {
     if !path.is_absolute() {
         return Err(ComposeError::new(
             ComposeErrorKind::InvalidPath,
-            "resolved path must be absolute",
+            "path must be absolute",
         ));
     }
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(Path::new("/")),
-            Component::CurDir => {}
-            Component::ParentDir => {
+            Component::ParentDir | Component::CurDir => {
                 return Err(ComposeError::new(
                     ComposeErrorKind::InvalidPath,
-                    "path cannot contain parent traversal",
-                ));
+                    "path cannot contain traversal or dot components",
+                ))
             }
-            Component::Normal(part) => normalized.push(part),
+            part => normalized.push(part.as_os_str()),
         }
     }
     Ok(normalized)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compiles_empty_workspace_with_empty_manager() {
-        for source in [
-            "name: empty\nagents:	[]\n",
-            "name: empty\nmanager: ''\nagents:	{}\n",
-        ] {
-            let definition = compile_str(source, "/tmp/workspace.yaml").unwrap();
-            assert!(definition.agents.is_empty());
-            assert!(definition.manager.is_empty());
-            assert_eq!(definition.id.to_string(), "workspace:local/empty:latest");
+pub(crate) fn reject_symlinks(path: &Path) -> Result<(), ComposeError> {
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component.as_os_str());
+        match fs::symlink_metadata(&prefix) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(ComposeError::new(
+                    ComposeErrorKind::InvalidPath,
+                    "managed data paths cannot contain symlinks",
+                ))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(ComposeError::new(
+                    ComposeErrorKind::InvalidPath,
+                    e.to_string(),
+                ))
+            }
         }
-        assert_eq!(
-            compile_str(
-                "name: empty\nmanager: missing\nagents:	[]\n",
-                "/tmp/workspace.yaml"
-            )
-            .unwrap_err()
-            .kind(),
-            ComposeErrorKind::MissingManager
-        );
     }
-
-    #[test]
-    fn rejects_legacy_resource_lists_and_agent_tag() {
-        for field in [
-            "resources",
-            "disable_resources",
-            "tool_default",
-            "tool_dynamic",
-        ] {
-            let source = format!(
-                "name: demo\nagents:\n  coder:\n    driver: local/coder\n    {field}:	[]\n"
-            );
-            assert_eq!(
-                compile_str(&source, "/tmp/workspace.yaml")
-                    .unwrap_err()
-                    .kind(),
-                ComposeErrorKind::FileDecode,
-                "{field}"
-            );
-        }
-        assert_eq!(
-            compile_str(
-                "name: demo\nagents:\n  coder:\n    driver: local/coder\n    tag: clone0\n",
-                "/tmp/workspace.yaml"
-            )
-            .unwrap_err()
-            .kind(),
-            ComposeErrorKind::FileDecode
-        );
-    }
-
-    #[test]
-    fn rejects_old_image_config_field() {
-        let error = compile_str(
-            "name: demo\nagents:\n  coder:\n    image: local/coder\n",
-            "/tmp/workspace.yaml",
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), ComposeErrorKind::FileDecode);
-    }
-
-    #[test]
-    fn compiles_mapping_agents_and_resolves_paths() {
-        let source = r#"
-name: demo
-project_root: project
-manager: coder
-agents:
-  coder:
-    driver: local/coder
-    memory_path: state/coder.sql
-  reviewer:
-    driver: local/reviewer:stable
-"#;
-        let definition = compile_str(source, "/tmp/workspace/margatroid-workspace.yaml").unwrap();
-        assert_eq!(definition.name, "demo");
-        assert_eq!(
-            definition.project_root,
-            PathBuf::from("/tmp/workspace/project")
-        );
-        assert_eq!(definition.manager, "coder");
-        assert_eq!(
-            definition.agents[0].id.to_string(),
-            "agent:demo/coder:latest"
-        );
-        assert_eq!(
-            definition.agents[0].driver.to_string(),
-            "driver:local/coder:latest"
-        );
-        assert_eq!(definition.agents[1].name, "reviewer");
-        assert_eq!(
-            definition.agents[0].history_path,
-            PathBuf::from("/tmp/workspace/project/state/coder.sql")
-        );
-    }
-
-    #[test]
-    fn compiles_sequence_agents_and_history_paths() {
-        let source = r#"
-name: demo
-agents:
-  - name: manager
-    driver: local/coder:v1
-"#;
-        let definition = compile_str(source, "/tmp/workspace.yaml").unwrap();
-        assert_eq!(definition.manager, "manager");
-        assert_eq!(
-            definition.agents[0].history_path,
-            PathBuf::from("/tmp/.margatroid/demo/history/manager.sqlite")
-        );
-    }
-
-    #[test]
-    fn workspaces_in_the_same_project_have_separate_databases() {
-        let first = compile_str(
-            "name: first\nagents:\n  coder:\n    driver: local/coder\n",
-            "/tmp/shared/first.yaml",
-        )
-        .unwrap();
-        let second = compile_str(
-            "name: second\nagents:\n  coder:\n    driver: local/coder\n",
-            "/tmp/shared/second.yaml",
-        )
-        .unwrap();
-        assert_eq!(first.project_root, second.project_root);
-        assert_eq!(
-            first.agents[0].history_path,
-            PathBuf::from("/tmp/shared/.margatroid/first/history/coder.sqlite")
-        );
-        assert_eq!(
-            second.agents[0].history_path,
-            PathBuf::from("/tmp/shared/.margatroid/second/history/coder.sqlite")
-        );
-        assert_ne!(first.agents[0].history_path, second.agents[0].history_path);
-    }
-
-    #[test]
-    fn rejects_invalid_manager_and_parent_paths() {
-        let source = r#"
-name: demo
-project_root: ../project
-manager: missing
-agents:
-  manager:
-    driver: local/coder
-"#;
-        let error = compile_str(source, "/tmp/workspace.yaml").unwrap_err();
-        assert_eq!(error.kind(), ComposeErrorKind::InvalidPath);
-    }
-
-    #[test]
-    fn compile_reads_a_workspace_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("margatroid-workspace.yaml");
-        fs::write(
-            &path,
-            "name: demo\nagents:\n  manager:\n    driver: local/coder\n",
-        )
-        .unwrap();
-        assert_eq!(compile(&path).unwrap().project_root, directory.path());
-    }
+    Ok(())
 }

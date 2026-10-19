@@ -13,7 +13,7 @@ use margatroid_types::resource_components::AgentDriver;
 use margatroid_types::workspace_execution::spawn_workspace_execution;
 use resource_id_plugin::{LibraryComponent, ResourceSet, WorldResourceExt};
 
-fn request_id() -> String {
+pub(crate) fn request_id() -> String {
     static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let session = SESSION.get_or_init(|| {
@@ -71,16 +71,25 @@ fn validate_definition(request: &StartWorkspace) -> Result<(), WorkspaceError> {
             ));
         }
     }
-    if !definition.agents.is_empty() && !names.contains(&definition.manager) {
-        return Err(error(
-            WorkspaceErrorKind::InvalidDefinition,
-            "manager is not an initial member",
-        ));
-    }
     Ok(())
 }
 
 pub(crate) fn handle_start_workspace(world: &mut World, request: StartWorkspace) {
+    let name = Some(request.definition.name.clone());
+    let accepted = crate::catalog::acquire(world, &request.definition.id, name, &request.id);
+    let owned = accepted.is_ok();
+    let result = accepted.and_then(|_| start(world, &request));
+    if let Err(error) = result {
+        if owned {
+            crate::catalog::release(world, &request.id);
+        }
+        world.send_event(StartWorkspaceResult {
+            id: request.id,
+            result: Err(error),
+        });
+    }
+}
+pub(crate) fn handle_registered_start(world: &mut World, request: StartWorkspace) {
     let result = start(world, &request);
     if let Err(error) = result {
         world.send_event(StartWorkspaceResult {
@@ -312,7 +321,7 @@ pub(crate) fn handle_start_agent_result(world: &mut World, event: StartAgentResu
     finish_workspace_stop(world, entity);
 }
 
-fn record_member_failure(
+pub(crate) fn record_member_failure(
     world: &mut World,
     entity: Entity,
     agent: resource_id_plugin::ResourceID,
@@ -357,6 +366,7 @@ fn finish_workspace_start(world: &mut World, entity: Entity) {
     }
     let id = state.request_id.clone();
     workspace.set_state(WorkspaceState::Running);
+    crate::catalog::release(world, &id);
     world.send_event(StartWorkspaceResult {
         id,
         result: Ok(entity),
@@ -364,6 +374,17 @@ fn finish_workspace_start(world: &mut World, entity: Entity) {
 }
 
 pub(crate) fn handle_stop_workspace(world: &mut World, request: StopWorkspace) {
+    if let Some(workspace) = world.get_component::<Workspace>(request.workspace) {
+        let workspace_id = workspace.resource_id().clone();
+        let name = Some(workspace.definition().name.clone());
+        if let Err(error) = crate::catalog::acquire(world, &workspace_id, name, &request.id) {
+            world.send_event(StopWorkspaceResult {
+                id: request.id,
+                result: Err(error),
+            });
+            return;
+        }
+    }
     let Some(workspace) = world.get_component_mut::<Workspace>(request.workspace) else {
         world.send_event(StopWorkspaceResult {
             id: request.id,
@@ -375,6 +396,7 @@ pub(crate) fn handle_stop_workspace(world: &mut World, request: StopWorkspace) {
         return;
     };
     if request.id.is_empty() || !matches!(workspace.state(), WorkspaceState::Running) {
+        crate::catalog::release(world, &request.id);
         world.send_event(StopWorkspaceResult {
             id: request.id,
             result: Err(error(
@@ -448,6 +470,7 @@ fn finish_workspace_stop(world: &mut World, entity: Entity) {
         workspace.set_state(WorkspaceState::Failed {
             error: value.clone(),
         });
+        crate::catalog::release(world, &request_id);
         world.send_event(StopWorkspaceResult {
             id: request_id,
             result: Err(value),
@@ -493,6 +516,7 @@ pub(crate) fn handle_workspace_execution_closed(
             Err(value)
         }
     };
+    crate::catalog::release(world, &output.request_id);
     world.send_event(StopWorkspaceResult {
         id: output.request_id,
         result,

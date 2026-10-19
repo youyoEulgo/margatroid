@@ -4,13 +4,10 @@ import { storeToRefs } from 'pinia';
 import {
   Activity,
   Bot,
-  Check,
-  ChevronDown,
   CircleAlert,
   ChevronRight,
   CloudOff,
   Command,
-  FolderKanban,
   Eye,
   EyeOff,
   LockKeyhole,
@@ -39,6 +36,8 @@ import {
   workspaceKey,
   type ConversationEntry,
 } from '@/stores/workbench';
+import SidebarTree from '@/components/SidebarTree.vue';
+import CatalogDialog, { type DialogRequest, type DialogValue } from '@/components/CatalogDialog.vue';
 import { renderMarkdown } from '@/lib/markdown';
 import { formatRecordTime } from '@/lib/time';
 import { IMAGE_ACCEPT, importImage, imageSource, validateImageBudget, wireImages, metadataText, type DraftImage } from '@/lib/images';
@@ -53,6 +52,9 @@ const {
   connectionStatus,
   connectionError,
   workspaces,
+  selectedCatalogEntry,
+  workspaceOperationPending,
+  workspaceNotice,
   selectedWorkspace,
   selectedAgent,
   selectedAgentName,
@@ -61,6 +63,8 @@ const {
   selectedAgentIdle,
   abortPending,
   selectedAgentWorking,
+  sidebarTree,
+  drivers,
   resourceVisibility,
   sandboxOptions,
   visibleMessages,
@@ -130,14 +134,92 @@ let composerObserver: ResizeObserver | undefined;
 const toolManager = ref<HTMLElement | null>(null);
 const sidebarOpen = ref(false);
 const activityOpen = ref(false);
+const activityTab = ref<'activity' | 'mcl'>('activity');
 const toolsOpen = ref(false);
 const settingsOpen = ref(false);
 const logFilter = ref<'all' | 'errors'>('all');
-const panelTab = ref<'activity' | 'mcl'>('activity');
 const endpointDraft = ref(endpoint.value);
 const contextPathDraft = ref(driverContextPath.value);
 const formError = ref('');
+const catalogDialog = ref<DialogRequest | null>(null);
+const catalogDialogEl = ref<InstanceType<typeof CatalogDialog> | null>(null);
+const catalogDialogBusy = ref(false);
 
+function openCatalogDialog(request: DialogRequest) {
+  if (catalogDialogBusy.value || workspaceOperationPending.value) return;
+  if (connectionStatus.value !== 'online') {
+    connectionError.value = 'Connect to the daemon before changing definitions';
+    return;
+  }
+  catalogDialog.value = request;
+  const activeDialog = catalogDialog.value;
+  if (request.kind === 'new-session') void store.queryDrivers().catch((error) => {
+    if (catalogDialog.value === activeDialog) catalogDialogEl.value?.showError(String(error.message ?? error));
+  });
+}
+const sidebarWorkspace = (key: string) => sidebarTree.value.workspaces.find((workspace) => workspace.key === key);
+
+function requestNewSession(key: string) {
+  const workspace = sidebarWorkspace(key);
+  if (!workspace) return;
+  openCatalogDialog({ kind: 'new-session', workspace: { key, revision: workspace.revision, name: workspace.name, invalid: workspace.invalid } });
+}
+function requestRenameWorkspace(key: string) {
+  const workspace = sidebarWorkspace(key);
+  if (workspace) openCatalogDialog({ kind: 'rename-workspace', workspace: { key, revision: workspace.revision, name: workspace.name } });
+}
+function requestDeleteWorkspace(key: string) {
+  const workspace = sidebarWorkspace(key);
+  if (workspace)
+    openCatalogDialog({
+      kind: 'delete-workspace',
+      workspace: { key, revision: workspace.revision, name: workspace.name, lifecycle: workspace.lifecycle },
+    });
+}
+function requestRenameAgent(workspaceKeyValue: string, agentId: string) {
+  const workspace = sidebarWorkspace(workspaceKeyValue);
+  const agent = workspace?.agents.find((item) => item.id === agentId);
+  if (workspace && agent)
+    openCatalogDialog({
+      kind: 'rename-agent',
+      workspace: { key: workspace.key, revision: workspace.revision, name: workspace.name },
+      agent: { id: agent.id, name: agent.name },
+    });
+}
+function requestDeleteAgent(workspaceKeyValue: string, agentId: string) {
+  const workspace = sidebarWorkspace(workspaceKeyValue);
+  const agent = workspace?.agents.find((item) => item.id === agentId);
+  if (workspace && agent)
+    openCatalogDialog({
+      kind: 'delete-agent',
+      workspace: { key: workspace.key, revision: workspace.revision, name: workspace.name },
+      agent: { id: agent.id, name: agent.name },
+    });
+}
+/** The dialog never shows optimistic success; a daemon rejection stays in the dialog. */
+async function submitCatalogDialog(value: DialogValue) {
+  catalogDialogBusy.value = true;
+  try {
+    if (value.kind === 'new-workspace') {
+      await store.createWorkspace({ name: value.name, projectRoot: value.projectRoot });
+    } else if (value.kind === 'new-session') {
+      await store.addMember(value.name.trim(), value.driver.trim(), { key: value.key, revision: value.revision });
+    } else if (value.kind === 'rename-workspace') {
+      await store.renameWorkspace(value.key, value.name, value.revision);
+    } else if (value.kind === 'rename-agent') {
+      await store.renameMember(value.agent, value.name, { key: value.key, revision: value.revision });
+    } else if (value.kind === 'delete-workspace') {
+      await store.deleteWorkspace(value.key, value.revision);
+    } else if (value.kind === 'delete-agent') {
+      await store.deleteMember(value.agent, { key: value.key, revision: value.revision });
+    }
+    catalogDialog.value = null;
+  } catch (error) {
+    catalogDialogEl.value?.showError(error instanceof Error ? error.message : String(error));
+  } finally {
+    catalogDialogBusy.value = false;
+  }
+}
 const displayedLogs = computed(() => {
   if (logFilter.value === 'errors') {
     return logs.value.filter((entry) => entry.level === 'ERROR' || entry.level === 'WARN');
@@ -145,15 +227,9 @@ const displayedLogs = computed(() => {
   return logs.value;
 });
 
-const memberList = computed(() => {
-  const workspace = selectedWorkspace.value;
-  if (!workspace) return [];
-  return workspace.agents.filter((agent) => agent !== workspace.manager);
-});
-
 const selectedAgentFailure = computed(() => {
   const workspace = selectedWorkspace.value;
-  const agent = selectedAgent.value || workspace?.manager;
+  const agent = selectedAgent.value;
   if (!workspace || !agent) return null;
   return lastFailures.value.get(`${workspaceKey(workspace)}:${agent}`) ?? null;
 });
@@ -236,7 +312,7 @@ const currentChannelLabel = computed(() => {
   const workspace = selectedWorkspace.value;
   if (!workspace) return 'Select a workspace';
   if (selectedAgent.value) return resourceName(selectedAgent.value);
-  return workspace.manager ? `${resourceName(workspace.manager)} · manager route` : 'Manager route';
+  return workspace.agents.length ? 'Choose an agent' : 'No agents defined';
 });
 
 const NEAR_BOTTOM_PX = 80;
@@ -270,11 +346,6 @@ function autosizeDraft() {
 }
 
 watch(draft, () => nextTick(autosizeDraft));
-
-function followMcL() {
-  panelTab.value = 'mcl';
-  activityOpen.value = true;
-}
 
 function toolArguments(value: string) {
   return value;
@@ -379,8 +450,8 @@ function selectWorkspace(key: string) {
   nextTick(scrollMessages);
 }
 
-function selectMember(agent: string | null) {
-  store.selectAgent(agent);
+function selectMember(agent: string | null, key?: string) {
+  store.selectAgent(agent, key);
   sidebarOpen.value = false;
   nextTick(scrollMessages);
 }
@@ -446,46 +517,10 @@ function isMcLRecord(message: ConversationEntry) {
   return message.role === 'record' && message.kind === 'mcl';
 }
 
+const mclRecords = computed(() => visibleMessages.value.filter(isMcLRecord));
 const conversationMessages = computed(() =>
   visibleMessages.value.filter((message) => !isMcLRecord(message)),
 );
-
-const mclRecords = computed(() => visibleMessages.value.filter(isMcLRecord));
-
-function parseRecordPayload(payload: unknown): Record<string, unknown> | null {
-  if (payload && typeof payload === 'object' && !Array.isArray(payload))
-    return payload as Record<string, unknown>;
-  if (typeof payload !== 'string') return null;
-  try {
-    const value: unknown = JSON.parse(payload);
-    return value && typeof value === 'object' && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function mclRecordCommand(message: ConversationEntry): string {
-  for (const source of [message.payload, message.content]) {
-    const value = parseRecordPayload(source);
-    for (const key of ['cmd', 'command']) {
-      const candidate = value?.[key];
-      if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
-    }
-  }
-  return '';
-}
-
-function mclEntryCommand(message: ConversationEntry) {
-  return mclRecordCommand(message);
-}
-
-function mclEntryResult(message: ConversationEntry) {
-  const result = parseRecordPayload(message.payload)?.result;
-  if (result === undefined || result === null) return '';
-  return typeof result === 'string' ? result : metadataText(result);
-}
 </script>
 
 <template>
@@ -494,11 +529,11 @@ function mclEntryResult(message: ConversationEntry) {
     <aside :class="['workspace-sidebar', { 'workspace-sidebar--open': sidebarOpen }]">
       <div class="brand-row">
         <div class="brand-mark">
-          <Command :size="17" :stroke-width="2.4" />
+          <Command :size="16" :stroke-width="2.4" />
         </div>
-        <div>
+        <div class="brand-copy">
           <strong>margatroid</strong>
-          <span>agent workspace</span>
+          <span>{{ connectionLabel }}</span>
         </div>
         <button class="icon-button sidebar-close" title="Close navigation" @click="sidebarOpen = false">
           <X :size="17" />
@@ -506,79 +541,54 @@ function mclEntryResult(message: ConversationEntry) {
       </div>
 
       <button class="connection-strip" title="Open connection settings" @click="openSettings">
-        <span :class="['status-dot', `status-dot--${connectionStatus}`]"></span>
+        <span :class="['status-dot', `status-dot--${connectionStatus}`]" aria-hidden="true"></span>
         <span class="connection-copy">
           <strong>{{ connectionLabel }}</strong>
           <small>{{ endpoint.replace(/^wss?:\/\//, '') }}</small>
         </span>
-        <Settings2 :size="16" />
+        <Settings2 :size="15" />
       </button>
 
       <div class="sidebar-heading">
         <span>Workspaces</span>
+        <button
+          class="heading-action"
+          type="button"
+          :disabled="workspaceOperationPending || connectionStatus !== 'online'"
+          title="Rescan the workspace catalog"
+          @click="runAgentAction(() => store.refreshCatalog())"
+        >
+          Refresh
+        </button>
       </div>
 
-      <nav class="workspace-list" aria-label="Workspaces">
-        <button v-for="workspace in workspaces" :key="workspaceKey(workspace)" :class="[
-          'workspace-item',
-          {
-            'workspace-item--active':
-              selectedWorkspace && workspaceKey(selectedWorkspace) === workspaceKey(workspace),
-          },
-        ]" @click="selectWorkspace(workspaceKey(workspace))">
-          <FolderKanban :size="17" />
-          <span class="workspace-item__copy">
-            <strong>{{ workspace.name }}</strong>
-            <small>{{ workspace.project_root }}</small>
-          </span>
-          <ChevronDown v-if="selectedWorkspace && workspaceKey(selectedWorkspace) === workspaceKey(workspace)"
-            :size="15" />
-        </button>
-        <div v-if="!workspaces.length" class="sidebar-empty">
-          <span>No workspace running</span>
-        </div>
+      <nav class="sidebar-scroll" aria-label="Workspaces">
+        <SidebarTree
+          :model="sidebarTree"
+          :pending="workspaceOperationPending"
+          :offline="connectionStatus !== 'online'"
+          @select-workspace="selectWorkspace"
+          @toggle-workspace="store.toggleWorkspace"
+          @select-agent="selectMember"
+          @new-workspace="openCatalogDialog({ kind: 'new-workspace' })"
+          @new-session="requestNewSession"
+          @rename-workspace="requestRenameWorkspace"
+          @delete-workspace="requestDeleteWorkspace"
+          @rename-agent="requestRenameAgent"
+          @delete-agent="requestDeleteAgent"
+        />
       </nav>
 
-      <template v-if="selectedWorkspace">
-        <div class="sidebar-heading sidebar-heading--members">
-          <span>Members</span>
-          <span class="count-badge">{{ selectedWorkspace.agents.length }}</span>
-        </div>
-        <div class="member-list">
-          <button :class="['member-item', { 'member-item--active': selectedAgent === null }]"
-            @click="selectMember(null)">
-            <span class="member-avatar member-avatar--manager">
-              <Zap :size="15" />
-            </span>
-            <span class="member-item__copy">
-              <strong>{{ resourceName(selectedWorkspace.manager) || 'Manager' }}</strong>
-              <small>default route</small>
-            </span>
-            <Check v-if="selectedAgent === null" :size="15" />
-          </button>
-          <button v-for="agent in memberList" :key="agent"
-            :class="['member-item', { 'member-item--active': selectedAgent === agent }]" @click="selectMember(agent)">
-            <span class="member-avatar">
-              <Bot :size="15" />
-            </span>
-            <span class="member-item__copy">
-              <strong>{{ resourceName(agent) }}</strong>
-              <small>{{ agent === selectedWorkspace.manager ? 'manager' : 'agent' }}</small>
-            </span>
-            <Check v-if="selectedAgent === agent" :size="15" />
-          </button>
-        </div>
-      </template>
-
-      <div class="sidebar-footer">
-        <button class="footer-action" title="Open connection settings" @click="openSettings">
-          <Settings2 :size="16" />
-          <span>Connection</span>
-        </button>
-        <button class="footer-action" title="Open MCL panel" @click="followMcL">
-          <Command :size="16" />
-          <span>MCL</span>
-        </button>
+      <div v-if="selectedCatalogEntry" class="workspace-controls" aria-label="Selected workspace controls">
+        <span class="tree-name" :title="selectedCatalogEntry.name">{{ selectedCatalogEntry.name }}</span>
+        <button type="button" :disabled="workspaceOperationPending || connectionStatus !== 'online' || !!selectedCatalogEntry.error || selectedCatalogEntry.lifecycle !== 'stopped'" @click="runAgentAction(() => store.startWorkspace())">Start</button>
+        <button type="button" :disabled="workspaceOperationPending || connectionStatus !== 'online' || selectedCatalogEntry.lifecycle === 'stopped'" @click="runAgentAction(() => store.stopWorkspace())">Stop</button>
+      </div>
+      <div v-if="selectedCatalogEntry || workspaceNotice" class="sidebar-footnote" role="status">
+        <template v-if="selectedCatalogEntry?.error">
+          Invalid definition at {{ selectedCatalogEntry.path }}. Fix it, then Refresh.
+        </template>
+        <template v-else-if="workspaceNotice">{{ workspaceNotice }}</template>
       </div>
     </aside>
 
@@ -621,6 +631,9 @@ function mclEntryResult(message: ConversationEntry) {
           </div>
           <strong>{{ selectedAgentName }}</strong>
           <span v-if="selectedAgentState?.status === 'creating'">Agent is starting.</span>
+          <span v-else-if="!selectedWorkspace.agents.length">No agents defined. Add an agent to begin.</span>
+          <span v-else-if="!selectedAgent">Choose an agent from Members.</span>
+          <span v-else-if="!selectedAgentReady">Agent is not running. Start the workspace or inspect runtime errors.</span>
           <span v-else>Conversation is ready.</span>
           <span v-if="selectedAgentFailure" class="agent-failure">
             Last error: {{ selectedAgentFailure.message }}
@@ -814,30 +827,32 @@ function mclEntryResult(message: ConversationEntry) {
       <div class="activity-header">
         <div>
           <span class="eyebrow">Runtime</span>
-          <h2>{{ panelTab === 'mcl' ? 'MCL' : 'Activity' }}</h2>
+          <h2>Activity</h2>
         </div>
         <button class="icon-button" title="Close panel" @click="activityOpen = false">
           <X :size="17" />
         </button>
       </div>
-      <div class="activity-tabs" role="tablist">
-        <button :class="{ active: panelTab === 'activity' }" @click="panelTab = 'activity'">
-          Activity <span>{{ logs.length }}</span>
+      <div class="activity-tabs" role="tablist" aria-label="Audit panel">
+        <button type="button" role="tab" :aria-selected="activityTab === 'activity'" :class="{ active: activityTab === 'activity' }" @click="activityTab = 'activity'">Activity</button>
+        <button type="button" role="tab" :aria-selected="activityTab === 'mcl'" :class="{ active: activityTab === 'mcl' }" @click="activityTab = 'mcl'">MCL <span>{{ mclRecords.length }}</span></button>
+      </div>
+      <div v-if="activityTab === 'mcl'" class="activity-list" role="tabpanel" aria-label="MCL audit">
+        <p v-if="!mclRecords.length" class="activity-empty">No MCL records for the selected agent</p>
+        <details v-for="record in mclRecords" :key="record.key" class="mcl-audit-entry">
+          <summary>{{ record.content || 'MCL command' }} · {{ formatTime(record.timestamp) }}</summary>
+          <pre>{{ metadataText(record.payload) }}</pre>
+        </details>
+      </div>
+      <div v-if="activityTab === 'activity'" class="activity-filter" role="group" aria-label="Filter activity">
+        <button type="button" :class="{ active: logFilter === 'all' }" @click="logFilter = 'all'">
+          All <span>{{ logs.length }}</span>
         </button>
-        <button :class="{ active: panelTab === 'mcl' }" @click="panelTab = 'mcl'">
-          MCL <span>{{ mclRecords.length }}</span>
+        <button type="button" :class="{ active: logFilter === 'errors' }" @click="logFilter = 'errors'">
+          Errors <span>{{ logs.filter((log) => log.level === 'ERROR' || log.level === 'WARN').length }}</span>
         </button>
       </div>
-      <div v-if="panelTab === 'activity'" class="activity-filter">
-        <button :class="{ active: logFilter === 'all' }" @click="logFilter = 'all'">All</button>
-        <button :class="{ active: logFilter === 'errors' }" @click="logFilter = 'errors'">
-          Errors
-          <span>{{
-            logs.filter((log) => log.level === 'ERROR' || log.level === 'WARN').length
-            }}</span>
-        </button>
-      </div>
-      <div v-if="panelTab === 'activity'" class="activity-list">
+      <div v-if="activityTab === 'activity'" class="activity-list">
         <div v-if="!displayedLogs.length" class="activity-empty">
           <Activity :size="18" />
           <span>No runtime events</span>
@@ -851,24 +866,22 @@ function mclEntryResult(message: ConversationEntry) {
           </div>
         </div>
       </div>
-      <div v-else class="activity-list">
-        <div v-if="!mclRecords.length" class="activity-empty">
-          <Command :size="18" />
-          <span>No MCL commands yet</span>
-        </div>
-        <div v-for="record in mclRecords" :key="record.key" class="mcl-entry" :title="record.content">
-          <code>{{ mclEntryCommand(record) || record.content }}</code>
-          <small>{{ formatLogTime(record.timestamp) }}</small>
-          <code v-if="mclEntryResult(record)" class="mcl-entry-result">{{
-            mclEntryResult(record)
-          }}</code>
-        </div>
-      </div>
-      <button v-if="panelTab === 'activity'" class="activity-clear" @click="store.clearLogs">
-        Clear activity
-      </button>
+      <button v-if="activityTab === 'activity'" class="activity-clear" type="button" @click="store.clearLogs">Clear activity</button>
     </aside>
 
+    <CatalogDialog
+      v-if="catalogDialog"
+      ref="catalogDialogEl"
+      :request="catalogDialog"
+      :drivers="drivers"
+      :driver-errors="store.driverCatalogErrors"
+      :query-paths="store.queryPaths"
+      :refresh-drivers="() => store.queryDrivers(true)"
+      :busy="catalogDialogBusy || workspaceOperationPending"
+      :offline="connectionStatus !== 'online'"
+      @close="!catalogDialogBusy && (catalogDialog = null)"
+      @submit="submitCatalogDialog"
+    />
     <div v-if="settingsOpen" class="dialog-backdrop" @click.self="settingsOpen = false">
       <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <div class="dialog-header">

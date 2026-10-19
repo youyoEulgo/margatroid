@@ -46,16 +46,25 @@ Agent生命周期及此前共享组件迁移已实现。本文保留六板块契
 
 显式message历史策略已实现：推理和工具调用只返回结果，所有message历史仅由显式MCL history_append控制。MCL指令审计仍自动记录，审计payload中的消息不作为独立message记录。示例Driver对需要保留的结果另发显式追加指令。
 
+
+## 名称、驱动与重命名边界
+
+目标定义位于 `~/.margatroid/workspaces/<workspace>/workspace.yaml`，状态位于同目录 `agents/<agent>/state.sqlite`；不使用项目级 `.margatroid` 或manager。Workspace/成员名称派生ResourceID，名称不变时稳定；重命名是显式迁移，不另引入稳定身份模型。用户及sidebar选择的驱动是现有AgentDriver包，New session增加成员，不是另一种Driver；可选ID应来自驱动目录的发现结果/DriverCatalog，不仅来自已挂载的运行中集合。
+
+Workspace重命名只在停止且所有相关DB句柄关闭后受理；运行中成员重命名先关闭新受理、drain/StopAgent并等待真实清理，然后关闭所有句柄。随后由Workspace编排共享类型化迁移能力：在SQLite备份副本迁移已知Block namespace、重建当前history.query身份/句柄投影元数据，保持原始历史正文、MCL文本/参数、来源、顺序、时间与工具事实不变，禁止盲目字符串替换。内部 `.operations/<operation>/` 日志、staging及备份排除于工作区catalog，阶段fsync；目录、manifest和SQLite各自提交，失败保留可恢复数据并报告部分完成，重启先恢复/标记不可用再开放受理。该迁移与恢复器已实现并有独立 scoped/真实存储集成验证；机械SQLite细节见[Memory设计](<../memory_plugin/DESIGN.md>)。
+
+catalog、注册启动和成员管理接线已恢复并完成对应验证；创建、重命名、删除及发现能力已接通。验证结论限于实际执行场景，不将 API 存在或历史测试等同于普遍可用性保证。
+
 # 轮次与中止
 
-生命周期状态已采用 Creating / Idle / Working / Stopping；启动成功进入 Idle，turn=None。`AbortAgentTurn`验证Entity、完整资源ID、workspace、Driver实例及expected_turn_id；仅保留最近已受理中止关联用于Working期间幂等。控制System注册在PRE_UPDATE，UPDATE中的MCL及领域受理在其后；自定义调度需保留该顺序。中止仅触发匹配turn的独立turn_cancel，不关闭根cancel，也不取消无关存储/导入。Creating/Stopping原有真实清理契约保持。下列跨插件规则仍需结合各插件实现与测试阅读。
+生命周期状态已采用 Creating / Idle / Working / Stopping；启动成功进入 Idle，turn=None。`AbortAgentTurn`验证Entity、完整资源ID、workspace、Driver实例及expected_turn_id；仅保留最近已受理中止关联用于Working期间幂等。控制System注册在PRE_UPDATE，控制必须先于MCL及领域受理；InferencePlugin默认仍在PRE_UPDATE，不能仅凭计划名断言其在后；自定义调度需保留该顺序。中止仅触发匹配turn的独立turn_cancel，不关闭根cancel，也不取消无关存储/导入。Creating/Stopping原有真实清理契约保持。下列跨插件规则仍需结合各插件实现与测试阅读。
 
 ```text
 目标轮次状态：
     start_turn仅允许Idle，在同一次受理中生成唯一turn并置Working；拒绝覆盖现有轮次
     finish_turn由Driver的无工具调用Assistant分支唯一发出，清空turn并将Working置Idle
     abort是独立控制事件，不是MCL effect，也不排入目标Agent FIFO
-    协议目标agent.turn.abort {id, message:{workspace, agent?, turn_id}}要求非空turn_id；服务端内部校验实际Agent实例，不接收用户Entity
+    协议目标agent.turn.abort {id, message:{workspace, agent, turn_id}}要求非空turn_id；服务端内部校验实际Agent实例，不接收用户Entity
     agent.turn.abort_result按id关联，Ok仅证明控制已受理，不证明执行清理或回Idle；旧轮次重试用保留的取消关联幂等，不建立平行旧pending权威
     控制System先于MCL推进、PreparedEffect继续以及Inference/Tool受理运行
     Working收到abort立即取走/清空agent.turn，但state仍为Working
@@ -215,7 +224,7 @@ WorldAgentExt：Agent受检访问扩展，公开trait--调用方只依赖共享�
     wake为常驻共享槽位，Driver宿主wait与MCL wake共享同一对象，不跨线程借用Agent组件
     ready暂存Sender，Receiver移入启动闭包；关闭句柄由LuaRuntime安装和使用，Agent仅保存
     database是唯一数据库句柄，不保存AgentBlock/BlockAssembly权威内存内容；所有普通Block都用同一真实SQLite backend，取消RefBlock/RefMerge，持久ID不是动态引用Block
-    默认CREATE BLOCK按稳定Agent ResourceID及block名持久open/validate不清空；CREATE TEMP BLOCK按完整Driver instance隔离，同instance重复CREATE检查schema且不清空，TEMP entry不恢复
+    默认CREATE BLOCK按名称派生的Agent ResourceID（名称不变时稳定）及block名持久open/validate不清空；CREATE TEMP BLOCK按完整Driver instance隔离，同instance重复CREATE检查schema且不清空，TEMP entry不恢复
     同一可见block名不能以不同lifecycle重复声明，持久/TEMP冲突显式拒绝；BlockOpened.created仅标初建，工具配置及prompt/conversation仅初建填充，不覆盖恢复的conversation
     alias/import bindings启动保持RAM空表并显式IMPORT；active sandbox初始None，恢复必须GET后显式sandbox_use；turn及MCL pending不恢复
     mcl保存目标Agent的指令队列，不复制Block或资源内容；不同来源的请求进入同一FIFO
@@ -467,7 +476,7 @@ StopDriverLuaVmResult成功失败都必须保留子请求ID与完整Agent Entity
 
 公开：
 ```text
-AgentLua：Driver访问存储，公开类型--随Agent组件保存在共享types的agent_components.rs
+AgentLua：Driver访问存储，公开类型--定义在共享types的lua_runtime_components.rs，由Agent组件持有
     instance: Option<DriverLuaVmInstance>--本次启动关联，供旧结果核对，不是VM状态
     wake: Arc<Mutex<DriverWakeSlot>>--常驻共享通知槽位，Agent创建时即存在
     ready: Option<DriverReadySlot>--本次启动oneshot发送端的暂存，启动结束后清除
@@ -527,7 +536,7 @@ AgentStartDefinition：成员启动参数，公开共享契约
     home_root: PathBuf--主目录
     history_path: PathBuf--沿用现有参数名，为一个Agent SQLite文件，含历史及Block分表；参数重命名不属于本轮docs
 
-AgentMclQueue：目标Agent指令队列，公开类型--随Agent定义于共享agent_components.rs，不是独立Component或Resource
+AgentMclQueue：目标Agent指令队列，公开类型--定义于共享mcl_events.rs，由Agent持有，不是独立Component或Resource
     commands: VecDeque<MclCommand>--受理顺序排列，异步在途指令仍保留在队首
     pending: Option<MclPending>--当前异步队首关联，空值表示可继续推进
     drained: AgentMclDrainHandle--线程安全收口通知，入队时置未收口，队列与pending均空且回执完成时通知；Driver可捕获并异步等待
@@ -536,7 +545,7 @@ AgentMclQueue：目标Agent指令队列，公开类型--随Agent定义于共享a
         只有匹配本次目标完整Entity、操作关联和队首的异步结果才能释放pending并移除队首
         不保存第二份全局pending表，不负责执行命令或解释语法
 
-MclPending：异步队首关联，公开类型--随队列定义于共享agent_components.rs
+MclPending：异步队首关联，公开类型--随队列定义于共享mcl_events.rs
     command_id: String--在途队首请求ID
     target_entity: Entity--提交时的完整目标Entity，包含代数
     operation_id: String--本次异步操作唯一关联，防止迟到或重复结果命中另一操作
@@ -564,7 +573,7 @@ AgentBlockStorageHandle：共享异步Block存储视图，公开类型
 BlockStorageRequest与StoredBlockResult：共享类型化存储操作及结果
     说明：CREATE返回BlockOpened { created, temporary }，其余按共享Block契约返回typed stored数组，TOOL/SANDBOX ID在GET时resolve当前导入绑定；不把任意JSON当作机械操作。
 
-AgentExecutionScope：Agent执行作用域，公开可克隆共享句柄--定义及实现位于共享agent_components.rs
+AgentExecutionScope：Agent执行作用域，公开可克隆共享句柄--定义及实现位于共享execution_components.rs
     inner: Arc<Mutex<AgentExecutionData>>--短锁维护受理门、根cancel、活动登记和完成等待通知，不跨await
     request_close(&self)
         关闭作用域：短锁关闭全部受理门并请求root_cancel，Stopping及Driver最终清理调用，幂等且不可重新打开
@@ -615,7 +624,7 @@ ExecutionActivity：活动登记句柄，公开共享类型
         标记清理失败：公开方法
         行为：短锁保留活动登记与错误事实并通知等待者，使wait_all返回关联Err而非永久等待；不得作为mark_completed调用。
 
-AgentMclDrainHandle：队列收口等待共享句柄，公开类型--定义及实现位于agent_components.rs
+AgentMclDrainHandle：队列收口等待共享句柄，公开类型--定义及实现位于execution_components.rs
     说明：短锁维护MCL受理门、停止请求及收口等待，不跨await；通知只证明commands和pending清空且所有已受理请求回执完成
     close(&self)
         关闭MCL受理：短锁关门并请求pending关联取消，幂等；不跨线程直接修改VecDeque
@@ -634,6 +643,7 @@ AgentHistoryStore：历史追加接口，公开trait
         批量追加：公开trait方法，一次事务全部提交或全部回滚；按HistoryRecord.key幂等去重，同键不同内容报冲突，不保存实时Block状态
 
 HistoryRecord：历史增量记录，公开共享类型
+    created_at_ms: i64--真实Unix毫秒；新记录0由存储首次写入时赋时，旧行0表示未知；负值拒绝，重试保留首次持久时间
     key: String--编码完整Entity、command_id、kind及call_id/index的稳定幂等键，异步结果沿用提交关联
     source: String--记录来源
     kind: String--记录类别
@@ -661,7 +671,7 @@ HistoryRecord：历史增量记录，公开共享类型
     IMPORT MESSAGE prompt:... AS alias按实际role生成消息，infer支持System；不能将所有prompt强制转为System或User
     IMPORT TOOL tool:... AS alias与IMPORT SANDBOX sandbox:...使用同一Agent全域alias受检入口；旧skill/hook导入明确拒绝
     tool_call effect第一MESSAGE数组恰好包含一个Assistant，第二参数为TOOL数组，从Assistant.tool_calls执行并返回MESSAGE结果；empty calls返回MESSAGE空数组
-    重复调用id、多个Assistant及工具alias冲突在任何submit前失败；tool_call effect不重复记输入Assistant，按call id/index记执行结果
+    重复调用id、多个Assistant及工具alias冲突在任何submit前失败；tool_call effect不隐式记录输入Assistant或执行结果；需要保留时由Driver显式history_append按call id/index关联
     tool_call结果消息的resource_id为Option<ResourceID>，无匹配工具为None，不虚构资源地址；其余正文、usage及错误字段遵循共享消息值契约
     history_append允许范围独立保持inject/user/assistant/tool_call/error（包含inject递归内容校验），System不通过此effect追加；保留assistant usage和tool_call关联/失败详情，旧同名AgentMessage路由事件不继续
     Agent仅保存database句柄及history视图，不保存Block内存内容、不定义MCL转发和字段业务用途；历史与Block不同指令不保证跨事务原子性

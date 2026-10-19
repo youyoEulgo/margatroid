@@ -130,7 +130,6 @@ fn definition(members: usize) -> WorkspaceDefinition {
     WorkspaceDefinition {
         id: id("workspace:local/test"),
         name: "test".into(),
-        manager: if members > 0 { "a0".into() } else { "".into() },
         project_root: "/project".into(),
         agents: (0..members)
             .map(|n| WorkspaceAgentDefinition {

@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceAgentDefinition {
     pub id: ResourceID,
     pub name: String,
@@ -18,11 +18,10 @@ pub struct WorkspaceAgentDefinition {
     pub home_root: PathBuf,
     pub history_path: PathBuf,
 }
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceDefinition {
     pub id: ResourceID,
     pub name: String,
-    pub manager: String,
     pub project_root: PathBuf,
     pub agents: Vec<WorkspaceAgentDefinition>,
 }
@@ -108,6 +107,7 @@ pub struct Workspace {
     execution_close: WorkspaceExecutionClose,
     pending_creations: BTreeMap<String, ResourceID>,
     exceptions: BTreeSet<String>,
+    mutation_request: Option<String>,
 }
 impl Drop for Workspace {
     fn drop(&mut self) {
@@ -139,10 +139,25 @@ impl Workspace {
             execution_close,
             pending_creations: BTreeMap::new(),
             exceptions: BTreeSet::new(),
+            mutation_request: None,
+        }
+    }
+    pub fn set_mutation_request(&mut self, request: Option<String>) {
+        self.mutation_request = request;
+    }
+    pub fn release_mutation_request(&mut self, request: &str) {
+        if self.mutation_request.as_deref() == Some(request) {
+            self.mutation_request = None;
         }
     }
     pub fn definition(&self) -> &WorkspaceDefinition {
         &self.definition
+    }
+    pub fn replace_definition(&mut self, definition: WorkspaceDefinition) {
+        self.member_failures
+            .retain(|id, _| definition.agents.iter().any(|member| &member.id == id));
+        self.project_root = Arc::new(definition.project_root.clone());
+        self.definition = Arc::new(definition);
     }
     pub fn project_root(&self) -> &Path {
         &self.project_root
@@ -183,6 +198,9 @@ impl Workspace {
     }
     pub fn take_pending_creations(&mut self) -> BTreeMap<String, ResourceID> {
         std::mem::take(&mut self.pending_creations)
+    }
+    pub fn has_pending_creations(&self) -> bool {
+        !self.pending_creations.is_empty()
     }
     pub fn has_pending_creation(&self, id: &str) -> bool {
         self.pending_creations.contains_key(id)
@@ -348,9 +366,35 @@ impl WorldWorkspaceExt for World {
                 "request ID is already accepted",
             ));
         }
+        let catalog_backed =
+            self.contains_resource::<crate::workspace_catalog::WorkspaceCatalogHandle>();
         let component = self
             .get_component_mut::<Workspace>(workspace)
             .ok_or_else(absent)?;
+        if component
+            .mutation_request
+            .as_ref()
+            .is_some_and(|owner| owner != &request.id)
+        {
+            return Err(WorkspaceError::new(
+                WorkspaceErrorKind::WorkspaceBusy,
+                "workspace mutation in progress",
+            ));
+        }
+        if catalog_backed
+            && !component.definition.agents.iter().any(|member| {
+                member.id == request.resource_id
+                    && member.driver == request.driver
+                    && member.home_root == request.definition.home_root
+                    && member.history_path == request.definition.history_path
+                    && component.definition.project_root == request.definition.project_root
+            })
+        {
+            return Err(WorkspaceError::new(
+                WorkspaceErrorKind::InvalidRequest,
+                "dynamic member must be persisted before runtime start",
+            ));
+        }
         if !matches!(component.state, WorkspaceState::Running)
             || component.execution_entry.is_closed()
         {

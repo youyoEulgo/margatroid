@@ -27,13 +27,10 @@ async fn shutdown_during_startup_waits_for_result_before_stopping() {
 }
 
 async fn exercise_member_failure(shutdown_during_startup: bool) {
-    let temp = tempfile::tempdir().unwrap();
-    let config = temp.path().join("workspace.yaml");
-    std::fs::write(&config, "name: cli-test\nmanager: coder\nagents:\n  coder:\n    driver: local/coder:latest\n  reviewer:\n    driver: local/reviewer:latest\n").unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_margatroid"))
         .args(["workspace", "up"])
-        .arg(&config)
+        .arg("cli-test")
         .args([
             "--backend",
             &format!("ws://{}", listener.local_addr().unwrap()),
@@ -47,8 +44,13 @@ async fn exercise_member_failure(shutdown_during_startup: bool) {
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
         let register = receive(&mut socket).await;
         socket.send(Message::Text(json!({"type":"connection.registered","id":register["id"],"client":{"resource_id":"client:cli/test:1","client_type":"cli","name":"test"}}).to_string().into())).await.unwrap();
+        let query = socket.next().await.unwrap().unwrap();
+        let query: Value = serde_json::from_str(query.to_text().unwrap()).unwrap();
+        assert_eq!(query["type"], "workspace.catalog.query");
+        socket.send(Message::Text(json!({"type":"workspace.catalog","id":query["id"],"entries":[{"id":"workspace:local/cli-test:latest","name":"cli-test","path":"/catalog/cli-test.yaml","revision":"rev-1","lifecycle":"stopped","definition":{"id":"workspace:local/cli-test:latest","name":"cli-test","project_root":"/project","agents":[]}}]}).to_string().into())).await.unwrap();
         let start = receive(&mut socket).await;
-        let definition = &start["message"]["definition"];
+        assert_eq!(start["message"]["expected_revision"], "rev-1");
+        let definition = json!({"id":"workspace:local/cli-test:latest","name":"cli-test","project_root":"/project"});
         let workspace = json!({"id":definition["id"],"name":definition["name"],"project_root":definition["project_root"]});
         if shutdown_during_startup {
             assert!(Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap().success());
@@ -58,7 +60,7 @@ async fn exercise_member_failure(shutdown_during_startup: bool) {
         }
         socket.send(Message::Text(json!({"type":"workspace.started","id":start["id"],"workspace":{
             "id":definition["id"],"name":definition["name"],"project_root":definition["project_root"],
-            "manager":"agent:cli-test/coder:latest","agents":["agent:cli-test/coder:latest","agent:cli-test/reviewer:latest"],
+            "agents":["agent:cli-test/coder:latest","agent:cli-test/reviewer:latest"],
             "member_failures":[{"agent":"agent:cli-test/reviewer:latest","driver":"driver:local/reviewer:latest","error":"cannot inspect driver path /missing/agent-drivers/local/reviewer/latest: No such file or directory"}]
         }}).to_string().into())).await.unwrap();
         socket.send(Message::Text(json!({"type":"workspace.start_failed","id":start["id"],"error":{"kind":"Stale","message":"late duplicate result"}}).to_string().into())).await.unwrap();

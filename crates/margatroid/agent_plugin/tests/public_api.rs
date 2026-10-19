@@ -82,7 +82,6 @@ fn fixture() -> Fixture {
     let definition = WorkspaceDefinition {
         id: id("workspace", "one"),
         name: "one".into(),
-        manager: "one".into(),
         project_root: temp.path().into(),
         agents: vec![],
     };

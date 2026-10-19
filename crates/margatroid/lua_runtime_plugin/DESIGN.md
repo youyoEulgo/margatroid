@@ -1,4 +1,6 @@
 # 伪代码格式
+
+> 审计边界：本次只读比对源码并修改文档，未运行测试/构建。下文“已实现”描述可见代码结构，不证明草稿、跨插件时序、平台行为或端到端接线已验收；未闭合能力必须按明确目标实现和验证。
 ```text
 模块：使用一级标题，只写当前设计涉及的部分
 
@@ -49,6 +51,10 @@ Agent只提供存储并发送生命周期请求，MCL使用通知槽位，LuaRun
 
 默认限制为源码1 MiB、Lua内存64 MiB、每1000条Lua指令检查协作取消，startup_timeout默认None；with_config拒绝零限制或零超时。Full库不是隔离沙箱；模块require只解析本次注入模块。wait与mcl_wait捕获共享wake槽位并异步等待；没有reserve/claim/yield或宿主block_on桥接。
 
+# 图片与宿主边界
+
+User及ToolCall结果的images复用共享UserImage（名称沿用历史命名，不表示仅User可用），元素为media_type及原始标准base64 data；png/jpeg/gif/webp、每消息8张、单张5MiB、总解码20MiB且magic匹配。Lua值桥接保留这些字段及空数组，不创建data URL；格式编码归Inference。通用margatroid().base64_encode是工具runner安装的runtime helper（输入最多5MiB），不据此承诺Driver VM自动具备同一能力。
+
 # lib
 
 ## 类型
@@ -83,8 +89,8 @@ LuaRuntimePlugin：Driver执行插件，公开结构体
     Workspace创建并拥有执行线程，LuaRuntime向指定工作区提交Driver本地任务，不为每个VM开线程
     LuaRuntime创建Lua、安装环境、执行和清理Driver，不管理Agent生命周期
     主线程可读取Agent.lua并克隆execution、mcl.drained及线程安全通知句柄；执行任务只使用捕获的共享对象，不借用World
-    Agent的Creating/Running/Stopping仍由Agent插件处理，LuaRuntime不改变它们
-    Agent.lua的通知与关闭存储由共享types定义，源码目标为agent_components.rs及其引用的VM共享契约
+    Agent的Creating/Idle/Working/Stopping仍由Agent插件处理，LuaRuntime不改变它们
+    Agent.lua的通知与关闭存储由共享types的lua_runtime_components.rs定义，agent_components.rs持有Agent.lua
     真正Lua状态与本地Future仅存在于工作区线程，不进入共享组件
 ```
 

@@ -9,6 +9,7 @@ async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
 core_plugin = { path = "../../mecs/core_plugin" }
 margatroid_types = { path = "../types" }
 resource_id_plugin = { path = "../resource_id_plugin" }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

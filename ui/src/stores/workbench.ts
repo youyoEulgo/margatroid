@@ -5,6 +5,11 @@ import {
   isRecord,
   isAgentMessage,
   errorMessage,
+  CATALOG_REQUESTS,
+  type CatalogEntry,
+  type DriverCatalog,
+  type WorkspacePaths,
+  type CatalogRequestType,
   type AgentHistory,
   type AgentMessage,
   type AgentState,
@@ -202,6 +207,124 @@ function decodeMessage(
       ];
   }
 }
+/** Sidebar status dot: gray stopped, green healthy running, red needs attention. */
+export type TreeStatus = 'stopped' | 'running' | 'error';
+export interface SidebarAgent {
+  id: string;
+  name: string;
+  driver: string;
+  status: TreeStatus;
+  reason: string;
+  active: boolean;
+}
+export interface SidebarWorkspace {
+  key: string;
+  name: string;
+  path: string;
+  revision: string;
+  projectRoot: string;
+  status: TreeStatus;
+  lifecycle: string;
+  reason: string;
+  /** Definition cannot be read or is invalid; creation controls stay disabled. */
+  invalid: boolean;
+  active: boolean;
+  expanded: boolean;
+  agents: SidebarAgent[];
+}
+export interface SidebarModel {
+  workspaces: SidebarWorkspace[];
+  /** No expandable workspace exists; the model still renders the workspace list. */
+  selectedKey: string;
+}
+/**
+ * Pending catalog wire. Each entry flips to `true` only after the daemon
+ * implements it; until then the matching UI action reports the gap instead of
+ * sending an unknown request or mutating the catalog optimistically.
+ */
+export const SUPPORTED_CATALOG_REQUESTS: Record<CatalogRequestType, boolean> = {
+  [CATALOG_REQUESTS.createWorkspace]: true,
+  [CATALOG_REQUESTS.renameWorkspace]: true,
+  [CATALOG_REQUESTS.deleteWorkspace]: true,
+  [CATALOG_REQUESTS.renameMember]: true,
+};
+const LIVE_MEMBER_STATUSES = ['creating', 'idle', 'working', 'stopping'];
+function liveAgentStatus(state: AgentState | undefined): 'stopped' | 'starting' | 'live' | 'failing' {
+  if (!state) return 'stopped';
+  if (state.error) return 'failing';
+  if (!LIVE_MEMBER_STATUSES.includes(state.status)) return 'stopped';
+  return state.status === 'creating' || state.status === 'stopping' ? 'starting' : 'live';
+}
+/**
+ * Derives the expandable sidebar. Runtime health never invents success: a
+ * running workspace is green only when every defined member has a live,
+ * error-free runtime state and no member failure was reported.
+ */
+export function buildSidebarModel(
+  catalog: CatalogEntry[],
+  runtime: WorkspaceInfo[],
+  states: AgentState[],
+  failures: Map<string, { message: string }>,
+  expanded: Set<string>,
+  selectedKey: string,
+  selectedAgent: string | null,
+): SidebarModel {
+  return {
+    selectedKey,
+    workspaces: catalog.map((entry) => {
+      const instance = runtime.find((workspace) => workspace.id === entry.id);
+      const members = entry.definition?.agents ?? [];
+      const memberFailures = instance?.member_failures ?? [];
+      const failureFor = (agent: string) =>
+        memberFailures.find((failure) => failure.agent === agent)?.error ??
+        failures.get(`${entry.id}:${agent}`)?.message ??
+        '';
+      const agents: SidebarAgent[] = members.map((agent) => {
+        const state = states.find((candidate) => candidate.workspace.id === entry.id && candidate.agent === agent.id);
+        const failure = failureFor(agent.id);
+        const live = liveAgentStatus(state);
+        const reason = failure || (state?.error ? errorMessage(state.error) : '');
+        const status: TreeStatus =
+          failure || live === 'failing' ? 'error' : live === 'live' ? 'running' : 'stopped';
+        return {
+          id: agent.id,
+          name: agent.name || resourceName(agent.id),
+          driver: agent.driver,
+          status,
+          reason,
+          active: entry.id === selectedKey && agent.id === selectedAgent,
+        };
+      });
+      let status: TreeStatus = 'stopped';
+      let reason = entry.error ?? '';
+      if (entry.error) status = 'error';
+      else if (entry.lifecycle === 'failed') {
+        status = 'error';
+        reason = 'Workspace runtime failed';
+      } else {
+        const unhealthy = agents.find((agent) => agent.status === 'error');
+        if (unhealthy) { status = 'error'; reason = unhealthy.reason; }
+        else if (entry.lifecycle === 'running' && instance && agents.every((agent) => agent.status === 'running')) status = 'running';
+      }
+
+      return {
+        key: entry.id,
+        name: entry.name,
+        path: entry.path,
+        revision: entry.revision,
+        projectRoot: entry.definition?.project_root ?? '',
+        status,
+        lifecycle: entry.lifecycle,
+        reason,
+        invalid: !!entry.error || !entry.definition,
+        active: entry.id === selectedKey,
+        expanded: expanded.has(entry.id),
+        agents,
+      };
+    }),
+  };
+}
+
 export const useWorkbenchStore = defineStore('workbench', () => {
   const endpoint = ref(defaultEndpoint());
   const driverContextPath = ref('entry.pending[-1]');
@@ -223,14 +346,44 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const connectionStatus = ref<ConnectionStatus>('offline');
   const connectionError = ref('');
   const registeredClient = ref<ClientInfo | null>(null);
-  const workspaces = ref<WorkspaceInfo[]>([]);
+  const runtimeWorkspaces = ref<WorkspaceInfo[]>([]);
+  const catalog = ref<CatalogEntry[]>([]);
+  /** Driver listing from `state.sync`; undefined until the daemon ships it. */
+  const advertisedDrivers = ref<string[] | null>(null);
+  const queriedDrivers = ref<string[] | null>(null);
+  const driverCatalogErrors = ref<DriverCatalog['errors']>([]);
+  const expandedWorkspaceKeys = ref(new Set<string>());
+  const workspaces = computed(() => catalog.value.map((entry) => ({
+    id: entry.id, name: entry.name, project_root: entry.definition?.project_root ?? entry.path,
+    agents: entry.definition?.agents.map((agent) => agent.id) ?? runtimeWorkspaces.value.find((workspace) => workspace.id === entry.id)?.agents ?? [],
+  })));
+  const selectedCatalogEntry = computed(() => catalog.value.find((entry) => entry.id === selectedWorkspaceKey.value));
+  const workspaceOperationPending = ref(false);
+  const workspaceNotice = ref('');
   const agentStates = ref<AgentState[]>([]);
   const histories = ref<AgentHistory[]>([]);
   const selectedWorkspaceKey = ref('');
   const selectedAgent = ref<string | null>(null);
+  let selectionInitialized = false;
+  let autoSelectSoleAgent = true;
+  const drivers = computed(() => [...new Set(queriedDrivers.value ?? advertisedDrivers.value ?? [])]
+    .filter((driver) => /^driver:[^/\s]+\/[^:\s]+:[^\s]+$/.test(driver)).sort());
+  const sidebarTree = computed<SidebarModel>(() =>
+    buildSidebarModel(
+      catalog.value,
+      runtimeWorkspaces.value,
+      agentStates.value,
+      lastFailures.value,
+      expandedWorkspaceKeys.value,
+      selectedWorkspaceKey.value,
+      selectedAgent.value,
+    ),
+  );
   const logs = ref<RuntimeLog[]>([]);
   const streams = ref(new Map<string, StreamEntry>());
   const pending = new Map<string, PendingCommand>();
+  const renamingWorkspaces = new Set<string>();
+  const renamingMembers = new Set<string>();
   const completedStreams = new Set<string>();
   // Keep abort suppression separate from completion: finished/history still reconcile partial output.
   const abortedStreams = new Set<string>();
@@ -244,9 +397,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     () => workspaces.value.find((w) => workspaceKey(w) === selectedWorkspaceKey.value) ?? null,
   );
   const selectedAgentId = computed(
-    () => selectedAgent.value || selectedWorkspace.value?.manager || '',
+    () => selectedAgent.value || '',
   );
-  const selectedAgentName = computed(() => resourceName(selectedAgentId.value) || 'Manager');
+  const selectedAgentName = computed(() => resourceName(selectedAgentId.value) || 'Choose an agent');
   const selectedAgentState = computed(
     () =>
       agentStates.value.find(
@@ -370,6 +523,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       socket = null;
     }
     registeredClient.value = null;
+    queriedDrivers.value = null;
+    driverCatalogErrors.value = [];
     streams.value = new Map();
     rejectPending('Backend WebSocket closed');
   }
@@ -429,7 +584,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
   function queryHistory() {
     const workspace = selectedWorkspace.value;
-    if (workspace && socket?.readyState === WebSocket.OPEN && registeredClient.value) {
+    if (workspace && selectedAgent.value && selectedAgentReady.value && socket?.readyState === WebSocket.OPEN && registeredClient.value) {
       const request: ClientMessage = {
         type: 'history.query',
         id: crypto.randomUUID(),
@@ -439,17 +594,38 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
   }
   function selectWorkspace(key: string) {
+    selectionInitialized = true;
+    autoSelectSoleAgent = true;
     routeRevision++;
     selectedWorkspaceKey.value = key;
-    selectedAgent.value = null;
+    if (key) expandWorkspace(key);
+    selectedAgent.value = selectedWorkspace.value?.agents.length === 1 ? selectedWorkspace.value.agents[0]! : null;
     queryHistory();
     void refreshDriverResources();
   }
-  function selectAgent(agent: string | null) {
+  function selectAgent(agent: string | null, key = selectedWorkspaceKey.value) {
+    if (key !== selectedWorkspaceKey.value) selectWorkspace(key);
     routeRevision++;
     selectedAgent.value = agent;
+    autoSelectSoleAgent = agent !== null;
     queryHistory();
     void refreshDriverResources();
+  }
+  function isWorkspaceExpanded(key: string) {
+    return expandedWorkspaceKeys.value.has(key);
+  }
+  function toggleWorkspace(key: string) {
+    const wasExpanded = expandedWorkspaceKeys.value.has(key);
+    if (key !== selectedWorkspaceKey.value) selectWorkspace(key);
+    const next = new Set(expandedWorkspaceKeys.value);
+    if (wasExpanded) next.delete(key); else next.add(key);
+    expandedWorkspaceKeys.value = next;
+  }
+  function expandWorkspace(key: string) {
+    if (expandedWorkspaceKeys.value.has(key)) return;
+    const next = new Set(expandedWorkspaceKeys.value);
+    next.add(key);
+    expandedWorkspaceKeys.value = next;
   }
   function executeMclCommand(
     command: string,
@@ -769,6 +945,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
             message: {},
           } satisfies ClientMessage),
         );
+        socket?.send(JSON.stringify({ type: 'workspace.catalog.query', id: crypto.randomUUID(), message: {} } satisfies ClientMessage));
         break;
       case 'connection.register_failed':
         connectionError.value = errorMessage(event.error);
@@ -776,7 +953,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         socket?.close();
         break;
       case 'state.sync': {
-        workspaces.value = event.state.workspaces;
+        runtimeWorkspaces.value = event.state.workspaces;
+        catalog.value = event.state.catalog ?? [];
+        if (Array.isArray(event.state.drivers)) advertisedDrivers.value = event.state.drivers;
         agentStates.value = event.state.agents;
         for (const [id, guard] of abortGuards) {
           if (!agentStates.value.some((state) =>
@@ -800,6 +979,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
             abortRequests.value.delete(id);
         }
         for (const state of agentStates.value) {
+          if (!state.error && ['idle', 'working'].includes(state.status)) lastFailures.value.delete(`${state.workspace.id}:${state.agent}`);
           if (state.error) {
             lastFailures.value.set(`${state.workspace.id}:${state.agent}`, {
               message: errorMessage(state.error),
@@ -807,10 +987,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           }
         }
         histories.value = event.state.histories;
-        if (!workspaces.value.some((w) => w.id === selectedWorkspaceKey.value))
-          selectWorkspace(workspaces.value[0]?.id ?? '');
-        if (selectedAgent.value && !selectedWorkspace.value?.agents.includes(selectedAgent.value))
-          selectedAgent.value = null;
+        reconcileSelection();
         void refreshDriverResources();
         const allHistory = histories.value.flatMap(historyEntries);
         streams.value = new Map(
@@ -826,18 +1003,45 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         );
         break;
       }
+      case 'driver.catalog':
+        queriedDrivers.value = event.drivers;
+        driverCatalogErrors.value = event.errors;
+        settleOperation(event.id, event);
+        break;
+      case 'workspace.paths':
+        settleOperation(event.id, event);
+        break;
+      case 'workspace.catalog':
+        catalog.value = event.entries;
+        reconcileSelection();
+        settleOperation(event.id, event);
+        break;
+      case 'workspace.member.result':
+        if (!pending.has(event.id)) break;
+        if (event.entry) catalog.value = [...catalog.value.filter((entry) => entry.id !== event.entry!.id), event.entry];
+        settleOperation(event.id, event.entry, event.error ? errorMessage(event.error) : undefined);
+        break;
       case 'workspace.started':
-        workspaces.value = [
-          ...workspaces.value.filter((w) => w.id !== event.workspace.id),
+        settleOperation(event.id, event.workspace);
+        queryCatalog();
+        for (const failure of event.workspace.member_failures ?? []) {
+          lastFailures.value.set(`${event.workspace.id}:${failure.agent}`, { message: failure.error });
+          addLog('ERROR', `Agent ${failure.agent} (${failure.driver}) failed to start: ${failure.error}`);
+        }
+        runtimeWorkspaces.value = [
+          ...runtimeWorkspaces.value.filter((w) => w.id !== event.workspace.id),
           event.workspace,
         ];
         if (!selectedWorkspaceKey.value) selectWorkspace(event.workspace.id);
         break;
       case 'workspace.stopped':
-        workspaces.value = workspaces.value.filter((w) => w.id !== event.workspace.id);
+        settleOperation(event.id, event.workspace);
+        queryCatalog();
+        runtimeWorkspaces.value = runtimeWorkspaces.value.filter((w) => w.id !== event.workspace.id);
         break;
       case 'workspace.start_failed':
       case 'workspace.stop_failed':
+        settleOperation(event.id, null, errorMessage(event.error));
         addLog('ERROR', errorMessage(event.error));
         break;
       case 'agent.turn.abort_result': {
@@ -960,6 +1164,211 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         break;
     }
   }
+  function reconcileSelection() {
+    const validKeys = new Set(workspaces.value.map((workspace) => workspace.id));
+    expandedWorkspaceKeys.value = new Set([...expandedWorkspaceKeys.value].filter((key) => validKeys.has(key) || renamingWorkspaces.has(key)));
+    if (!selectionInitialized && workspaces.value.length) selectWorkspace(workspaces.value[0]!.id);
+    else if (selectedWorkspaceKey.value && !validKeys.has(selectedWorkspaceKey.value) && !renamingWorkspaces.has(selectedWorkspaceKey.value)) selectWorkspace('');
+    if (selectedAgent.value && !selectedWorkspace.value?.agents.includes(selectedAgent.value) && !renamingWorkspaces.has(selectedWorkspaceKey.value) && !renamingMembers.has(`${selectedWorkspaceKey.value}:${selectedAgent.value}`)) selectAgent(null);
+    if (autoSelectSoleAgent && !selectedAgent.value && selectedWorkspace.value?.agents.length === 1) selectAgent(selectedWorkspace.value.agents[0]!);
+  }
+  function settleOperation(id: string, result: unknown, error?: string) {
+    const operation = pending.get(id);
+    if (!operation) return;
+    clearTimeout(operation.timeout);
+    pending.delete(id);
+    if (error) operation.reject(new Error(error)); else operation.resolve(result);
+  }
+  async function workspaceRequest(request: ClientMessage) {
+    if (!socket || socket.readyState !== WebSocket.OPEN || !registeredClient.value) throw new Error('Connect to the daemon first');
+    workspaceOperationPending.value = true;
+    workspaceNotice.value = '';
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => { pending.delete(request.id); reject(new Error('Request timed out; refresh before retrying')); }, 30000);
+        pending.set(request.id, { resolve, reject, timeout });
+        socket!.send(JSON.stringify(request));
+      });
+      if (['workspace.create', 'workspace.rename', 'workspace.delete', 'workspace.member.add', 'workspace.member.remove', 'workspace.member.rename'].includes(request.type)) queryCatalog();
+      return result;
+    } catch (error) {
+      workspaceNotice.value = error instanceof Error ? error.message : String(error);
+      socket?.send(JSON.stringify({ type: 'workspace.catalog.query', id: crypto.randomUUID(), message: {} } satisfies ClientMessage));
+      throw error;
+    } finally { workspaceOperationPending.value = false; }
+  }
+  function queryCatalog() {
+    socket?.send(JSON.stringify({ type: 'workspace.catalog.query', id: crypto.randomUUID(), message: {} } satisfies ClientMessage));
+  }
+  function refreshCatalog(refresh = true) {
+    return workspaceRequest({ type: refresh ? 'workspace.catalog.refresh' : 'workspace.catalog.query', id: crypto.randomUUID(), message: {} });
+  }
+  async function startWorkspace() {
+    if (workspaceOperationPending.value) throw new Error('Wait for the current workspace operation');
+    const entry = selectedCatalogEntry.value;
+    if (!entry?.definition || entry.error) throw new Error('Fix the registered workspace definition and refresh first');
+    await workspaceRequest({ type: 'workspace.start', id: crypto.randomUUID(), message: { workspace: entry.id, expected_revision: entry.revision } });
+    workspaceNotice.value = 'Workspace started.';
+  }
+  async function stopWorkspace() {
+    if (workspaceOperationPending.value) throw new Error('Wait for the current workspace operation');
+    const workspace = selectedWorkspace.value;
+    if (!workspace) return;
+    await workspaceRequest({ type: 'workspace.stop', id: crypto.randomUUID(), message: { workspace } });
+    workspaceNotice.value = 'Workspace stopped.';
+  }
+  function targetEntry(target?: { key: string; revision: string }) {
+    const entry = catalogEntry(target?.key ?? selectedWorkspaceKey.value);
+    return { ...entry, revision: target?.revision ?? entry.revision };
+  }
+  async function queryDrivers(refresh = false) {
+    return await workspaceRequest({ type: refresh ? 'driver.catalog.refresh' : 'driver.catalog.query', id: crypto.randomUUID(), message: {} }) as DriverCatalog;
+  }
+  async function queryPaths(message: { path?: string; cursor?: string } = {}) {
+    return await workspaceRequest({ type: 'workspace.paths.query', id: crypto.randomUUID(), message }) as WorkspacePaths;
+  }
+  async function addMember(name: string, driver: string, target?: { key: string; revision: string }) {
+    if (workspaceOperationPending.value) throw new Error('Wait for the current workspace operation');
+    const entry = targetEntry(target);
+    name = validName(name, 'Agent');
+    if (!drivers.value.includes(driver)) throw new Error('Select a validated installed driver');
+    const result = await workspaceRequest({ type: 'workspace.member.add', id: crypto.randomUUID(), message: { workspace: entry.id, expected_revision: entry.revision, agent: { name, driver } } });
+    reconcileSelection();
+    workspaceNotice.value = 'Agent saved.';
+    return result;
+  }
+  async function removeMember(agent: string, target?: { key: string; revision: string }) {
+    if (workspaceOperationPending.value) throw new Error('Wait for the current workspace operation');
+    const entry = targetEntry(target);
+    const result = await workspaceRequest({ type: 'workspace.member.remove', id: crypto.randomUUID(), message: { workspace: entry.id, expected_revision: entry.revision, agent } });
+    if (selectedWorkspaceKey.value === entry.id && selectedAgent.value === agent) selectAgent(null);
+    workspaceNotice.value = 'Agent removed. History retained.';
+    return result;
+  }
+  /**
+   * Sends one catalog mutation. The catalog is never mutated optimistically:
+   * every response reuses `workspace.member.result` with the authoritative
+   * entry (or a structured error that is surfaced verbatim).
+   */
+  async function catalogRequest<T extends Extract<ClientMessage, { type: CatalogRequestType }>>(
+    request: Omit<T, 'id'>,
+  ) {
+    if (!SUPPORTED_CATALOG_REQUESTS[request.type])
+      throw new Error(`The daemon does not support ${request.type} yet; no definition was changed`);
+    const wire = { ...request, id: crypto.randomUUID() } as unknown as ClientMessage;
+    const workspace = wire.type === 'workspace.rename' ? wire.message.workspace : null;
+    const member = wire.type === 'workspace.member.rename' ? `${wire.message.workspace}:${wire.message.agent}` : null;
+    if (workspace) renamingWorkspaces.add(workspace);
+    if (member) renamingMembers.add(member);
+    try { return await workspaceRequest(wire); }
+    finally {
+      if (workspace) renamingWorkspaces.delete(workspace);
+      if (member) renamingMembers.delete(member);
+    }
+  }
+  function catalogEntry(key: string) {
+    const entry = catalog.value.find((item) => item.id === key);
+    if (!entry) throw new Error('Workspace is not registered');
+    return entry;
+  }
+  function validName(name: string, label: string) {
+    const value = name.trim();
+    if (!value) throw new Error(`${label} name is required`);
+    if (
+      value === '.' ||
+      value === '..' ||
+      value.length > 128 ||
+      value.includes('/') ||
+      value.includes('\\') ||
+      [...value].some((character) => character.charCodeAt(0) < 32)
+    )
+      throw new Error(`${label} name cannot contain slashes or control characters (max 128)`);
+    return value;
+  }
+  async function createWorkspace(input: { name: string; projectRoot: string }) {
+    if (workspaceOperationPending.value) throw new Error('Wait for the current workspace operation');
+    const name = validName(input.name, 'Workspace');
+    const projectRoot = input.projectRoot.trim();
+    if (!projectRoot.startsWith('/'))
+      throw new Error('Project path must be an absolute path starting with "/"');
+    const entry = await catalogRequest({ type: CATALOG_REQUESTS.createWorkspace, message: { name, project_root: projectRoot } });
+    workspaceNotice.value = 'Workspace created.';
+    if (isRecord(entry) && typeof entry.id === 'string') {
+      expandWorkspace(entry.id);
+      selectWorkspace(entry.id);
+    }
+    return entry;
+  }
+  async function renameWorkspace(key: string, name: string, revision?: string) {
+    if (workspaceOperationPending.value) throw new Error('Wait for the current workspace operation');
+    const entry = catalogEntry(key);
+    const newName = validName(name, 'Workspace');
+    if (newName === entry.name) return entry;
+    const result = await catalogRequest({
+      type: CATALOG_REQUESTS.renameWorkspace,
+      message: { workspace: entry.id, expected_revision: revision ?? entry.revision, new_name: newName },
+    });
+    if (isRecord(result) && typeof result.id === 'string') {
+      catalog.value = catalog.value.filter((item) => item.id !== key || item.id === result.id);
+      const wasExpanded = expandedWorkspaceKeys.value.delete(key);
+      if (wasExpanded) expandWorkspace(result.id);
+      if (selectedWorkspaceKey.value === key) {
+        const agentName = entry.definition?.agents.find((agent) => agent.id === selectedAgent.value)?.name;
+        selectWorkspace(result.id);
+        const renamed = (result as unknown as CatalogEntry).definition?.agents.find((agent) => agent.name === agentName);
+        if (renamed) selectAgent(renamed.id);
+      }
+    }
+    workspaceNotice.value = 'Workspace renamed.';
+    return result;
+  }
+  async function deleteWorkspace(key: string, revision?: string) {
+    if (workspaceOperationPending.value) throw new Error('Wait for the current workspace operation');
+    const entry = catalogEntry(key);
+    const result = await catalogRequest({
+      type: CATALOG_REQUESTS.deleteWorkspace,
+      message: { workspace: entry.id, expected_revision: revision ?? entry.revision },
+    });
+    catalog.value = catalog.value.filter((item) => item.id !== entry.id);
+    if (selectedWorkspaceKey.value === entry.id) selectWorkspace('');
+    const next = new Set(expandedWorkspaceKeys.value);
+    next.delete(entry.id);
+    expandedWorkspaceKeys.value = next;
+    workspaceNotice.value = 'Workspace moved to trash.';
+    return result;
+  }
+  /**
+   * Renaming never stops the runtime locally. A daemon that refuses while the
+   * agent is running returns an error that the dialog shows as-is.
+   */
+  async function renameMember(agent: string, name: string, target?: { key: string; revision: string }) {
+    if (workspaceOperationPending.value) throw new Error('Wait for the current workspace operation');
+    const entry = targetEntry(target);
+    const newName = validName(name, 'Agent');
+    const current = entry.definition?.agents.find((member) => member.id === agent);
+    if (current && newName === current.name) return current;
+    const result = await catalogRequest({
+      type: CATALOG_REQUESTS.renameMember,
+      message: { workspace: entry.id, expected_revision: entry.revision, agent, new_name: newName },
+    });
+    if (selectedWorkspaceKey.value === entry.id && selectedAgent.value === agent && isRecord(result)) {
+      const renamed = (result as unknown as CatalogEntry).definition?.agents.find((member) => member.name === newName);
+      selectAgent(renamed?.id ?? null);
+    }
+    lastFailures.value.delete(`${entry.id}:${agent}`);
+    workspaceNotice.value = 'Agent renamed.';
+    return result;
+  }
+  async function deleteMember(agent: string, target?: { key: string; revision: string }) {
+    return removeMember(agent, target);
+  }
+  function newSessionDefaults() {
+    return {
+      drivers: drivers.value,
+      workspace: selectedCatalogEntry.value,
+      usable: !!selectedCatalogEntry.value?.definition && !selectedCatalogEntry.value?.error,
+    };
+  }
   function clearLogs() {
     logs.value = [];
   }
@@ -970,6 +1379,30 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     connectionError,
     registeredClient,
     workspaces,
+    catalog,
+    selectedCatalogEntry,
+    workspaceOperationPending,
+    workspaceNotice,
+    refreshCatalog,
+    startWorkspace,
+    stopWorkspace,
+    addMember,
+    removeMember,
+    deleteMember,
+    drivers,
+    advertisedDrivers,
+    driverCatalogErrors,
+    queryDrivers,
+    queryPaths,
+    sidebarTree,
+    isWorkspaceExpanded,
+    toggleWorkspace,
+    expandWorkspace,
+    createWorkspace,
+    renameWorkspace,
+    deleteWorkspace,
+    renameMember,
+    newSessionDefaults,
     agentStates,
     selectedWorkspaceKey,
     selectedWorkspace,

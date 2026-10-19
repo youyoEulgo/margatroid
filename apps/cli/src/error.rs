@@ -2,7 +2,6 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum CliError {
-    Compose(compose::ComposeError),
     Io(std::io::Error),
     Json(serde_json::Error),
     Transport(tokio_tungstenite::tungstenite::Error),
@@ -14,7 +13,6 @@ pub enum CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Compose(error) => write!(f, "{error}"),
             Self::Io(error) => write!(f, "{error}"),
             Self::Json(error) => write!(f, "{error}"),
             Self::Transport(error) => write!(f, "{error}"),
@@ -28,17 +26,11 @@ impl fmt::Display for CliError {
 impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Compose(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Transport(error) => Some(error),
             _ => None,
         }
-    }
-}
-impl From<compose::ComposeError> for CliError {
-    fn from(error: compose::ComposeError) -> Self {
-        Self::Compose(error)
     }
 }
 impl From<std::io::Error> for CliError {
