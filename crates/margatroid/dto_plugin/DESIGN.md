@@ -4,7 +4,7 @@
 板块：一级标题，一行注明实际文件，不创建空模块。
 类型、函数：二级标题，区分公开、crate公开与私有。
 类型列出字段及用途；函数列出参数、结果和直接行为。
-System明确处理事件、产出事件，只收集事件并路由至Handler。
+System分别列出处理事件、接收闭包结果、提交闭包及产出事件，使用Rust类型和函数名；空项使用None。
 属性不写Rust Attribute；持有关系使用树形图。
 ```
 
@@ -26,7 +26,7 @@ System明确处理事件、产出事件，只收集事件并路由至Handler。
 DtoPlugin：网络边界插件，公开类型
     impl Plugin for DtoPlugin
         build(self, app: &mut App)
-            行为：检查运行、连接和出站配置设施；初始化关联表与投影缓存；安装System及网络事件路由。
+            行为：检查运行、连接和出站配置设施；初始化关联表与投影缓存；在PRE_UPDATE安装abort_control_system，在UPDATE安装请求及结果System；接入现有网络事件路由。
 ```
 
 # system
@@ -36,14 +36,28 @@ DtoPlugin：网络边界插件，公开类型
 crate公开：
 ```text
 dto_route_system(world: &mut World)
-    处理事件：WebSocketMessage、WebSocketDisconnected、MclCommandResult及待发送消息
-    产出事件：注册、MCL、Workspace启停与重启、历史查询、Driver查询和目录浏览的领域请求
-    行为：收集事件，分别路由到入站、结果、断开及出站Handler。
+    处理事件：WebSocketMessageReceived、WebSocketDisconnected、WebSocketMessageSend
+    接收闭包结果：None
+    提交闭包：wait_mcl_reply(MclReplyContext) -> Future<Output = Result<MclReplyOutput, MclReplyError>>
+    产出事件：RegisterConnection、MclCommand、StartWorkspace、StopWorkspace、RestartWorkspace、AbortTurnControl
+    行为：WebSocketMessageReceived -> handle_inbound_message；WebSocketDisconnected -> handle_disconnect；WebSocketMessageSend -> handle_outbound_message。
 
 collect_external_events_system(world: &mut World)
-    处理事件：Server生命周期、Client注册结果、Workspace结果、历史结果、Driver清单、目录浏览结果及状态变化
-    产出事件：无新增领域请求；准备协议回执和主动出站消息
-    行为：收集事件，分别路由到结果和状态投影Handler。
+    处理事件：ServerStarted、ServerFailed、ServerStopped、WebSocketConnected、WebSocketProtocolFailed、ClientRegistrationResult、StartWorkspaceResult、StopWorkspaceResult、RestartWorkspaceResult
+    接收闭包结果：Result<HistoryOutput, HistoryError>、Result<MclReplyOutput, MclReplyError>
+    提交闭包：read_history(HistoryContext) -> Future<Output = Result<HistoryOutput, HistoryError>>
+    产出事件：WebSocketMessageSend
+    行为：ClientRegistrationResult、StartWorkspaceResult、StopWorkspaceResult、RestartWorkspaceResult -> handle_domain_result；Result<HistoryOutput, HistoryError> -> handle_history_result；Result<MclReplyOutput, MclReplyError> -> handle_mcl_reply；ServerStarted、ServerFailed、ServerStopped、WebSocketConnected、WebSocketProtocolFailed -> handle_transport_event。
+
+
+abort_control_system(world: &mut World)
+    处理事件：AbortTurnControl
+    接收闭包结果：None
+    提交闭包：None
+    产出事件：WebSocketMessageSend
+    oneshot回复：None
+    行为：AbortTurnControl -> handle_abort_control。
+
 ```
 
 # handler
@@ -57,10 +71,22 @@ handle_inbound_message(world: &mut World, connection: WebSocketConnectionId, mes
         检查消息上限并按protocol解析信封。
         除注册外，从真实连接查询Client Entity；拒绝未注册连接及重复在途网络ID。
         运行目标经address解析为Entity，核对组件、Workspace归属及实例。
-        Workspace配置项同步从启动时加载的内存配置读取；文件资源使用定位字符串，不创建占位Entity。
+        Workspace列表同步投影路径与展示缓存；启动和重启只传path，后端重读定义；文件资源不创建占位Entity。
         列出Workspace直接投影内存配置并回复，不发领域事件或提交异步任务。
-        回合中止同步调用Agent回合扩展及执行取消能力，直接返回协议受理结果，不发送Agent中止事件。
+        回合中止发送AbortTurnControl，下一帧控制Handler同步裁决，不在网络解析Handler直接取消。
         其他异步请求生成operation_id，保存网络关联，转换为领域请求并发送；失败返回关联协议错误。
+
+handle_abort_control(world: &mut World, request: AbortTurnControl)
+    行为：复检Client、Agent完整Entity、VM实例和turn；同步agent_abort_turn并请求取消对应回合的任务；发送匹配网络id的受理或失败回执。
+
+handle_mcl_reply(world: &mut World, result: Result<MclReplyOutput, MclReplyError>)
+    行为：复检请求关联并将MclValue或错误转换为mcl.command_result，不读取MclCommandResult事件。
+
+handle_history_result(world: &mut World, result: Result<HistoryOutput, HistoryError>)
+    行为：按原请求关联核对Client和目标实例，转换history.result或request.failed，发送WebSocketMessageSend。
+
+handle_transport_event(world: &mut World, event: TransportEvent)
+    行为：处理连接和Server通知，准备状态或错误投影并发送WebSocketMessageSend。
 
 handle_domain_result(world: &mut World, result: DomainResult)
     行为：
@@ -80,6 +106,12 @@ handle_outbound_message(world: &mut World, message: PreparedMessage)
 
 私有：
 ```text
+wait_mcl_reply(context: MclReplyContext) -> Future<Output = Result<MclReplyOutput, MclReplyError>>
+    行为：等待MclCommand原oneshot，不新增领域结果事件。
+
+read_history(context: HistoryContext) -> Future<Output = Result<HistoryOutput, HistoryError>>
+    行为：异步读取历史，返回携带原请求上下文的成功或失败载荷。
+
 resolve_live_target(world: &World, address: &str) -> Result<Entity, ProtocolErrorDto>
     行为：通过address解析唯一Entity；检查所需领域组件、归属和实例。
 
@@ -114,6 +146,26 @@ PendingRequests：在途关联表
         行为：检查同一Client尚未结束的网络ID。
     remove_connection(&mut self, connection: WebSocketConnectionId)
         行为：删除连接关联，不触发业务取消。
+
+AbortTurnControl：DTO私有控制事件
+    context: RequestContext
+    agent: Entity
+    instance: String
+    turn: String
+    impl Event for AbortTurnControl
+
+MclReplyContext：等待材料--RequestContext及MCL oneshot接收端
+MclReplyOutput / MclReplyError：等待结果--原上下文及MclValue或协议错误
+
+HistoryContext：历史读取上下文--RequestContext及owned历史读取句柄
+HistoryOutput：历史成功载荷--HistoryContext及历史记录
+HistoryError：历史失败载荷--HistoryContext及ProtocolErrorDto
+TransportEvent：网络通知，私有枚举
+    Started(ServerStarted)
+    Failed(ServerFailed)
+    Stopped(ServerStopped)
+    Connected(WebSocketConnected)
+    ProtocolFailed(WebSocketProtocolFailed)
 
 DomainRequest：领域请求，私有枚举--包装对应core的注册、生命周期、MCL及查询请求
 DomainResult：领域结果，私有枚举--包装对应core结果；各结果保留operation_id

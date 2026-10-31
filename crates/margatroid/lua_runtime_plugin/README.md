@@ -1,0 +1,29 @@
+# Lua Runtime
+
+lua_runtime_core定义VM组件、程序、环境、通知能力和启停契约，只依赖mecs及通用库。lua_runtime_plugin依赖自己的core、workspace_core和mcl_core，通过Workspace的执行入口运行Driver，不依赖Agent或MCL的plugin。
+
+## 执行与组件
+
+DriverLuaVm独立挂载到Agent Entity，保存本次实例、wake、ready、ended及取消能力，不嵌入Agent组件。真正Lua状态和非Send Future只存在于Workspace专属线程；Lua Runtime不创建独立Driver线程，也不关闭Workspace线程。
+
+每次启动使用新的start_id，所有请求和结果核对完整owner Entity及本次实例。不得让同Entity重启后的VM接收旧实例结果。
+
+## 启动与停止
+
+Agent启动闭包发送StartDriverLuaVm，携带程序、环境、Workspace Entity及oneshot回复端。Handler先安装通知组件，再向Workspace线程提交任务。启动等待闭包收到ready后返回，结果Handler通过原reply确认初始化完成；不会额外发送StartDriverLuaVmResult事件。
+
+启动前错误、超时或未ready即退出都会请求取消并等待VM退出，回复错误及清理事实。停止请求取走启动时建立的ended接收端；不为重复停止重建通道。取消或通道关闭不等于VM退出，无法证明退出则返回错误并保留控制组件。
+
+StopDriverLuaVm成功只证明VM退出及Lua释放，不证明工具、推理或MCL已经收口。Agent生命周期闭包负责关闭各领域受理、请求取消并分别等待VM、执行活动和MCL；Workspace随后才退出专属线程。
+
+run_driver结束后完成ended并发送DriverLuaVmExited，用于报告自然退出或运行错误。该通知不替代请求的oneshot回复，不修改Agent生命周期，不另设异常结果事件。
+
+## 宿主环境
+
+Agent启动流程将本次agent_info等数据通过LuaEnvironment传入。Lua Runtime plugin自行安装mcl和wait函数，不从MCL plugin或Compose取得宿主函数，不需要环境工厂。Lua core只定义通用值、函数接口及通知槽位，不依赖mcl_core或workspace_core。
+
+启动Handler在ECS线程创建wake槽位，将Arc存入DriverLuaVm并克隆到本次VM任务。wait捕获这个Arc，调用时直接操作同一槽位，不访问World、不发送等待事件。提前wake锁存一次，重复通知合并；锁不跨await，关闭或取消能结束等待。重启使用新槽位，旧任务不能碰到新VM。
+
+mcl宿主由lua_runtime_plugin根据mcl_core::MclCommand直接构造：绑定本次source Entity及VM实例，发送事件，等待原oneshot并转换结果；它不解析执行MCL，不依赖mcl_plugin。MCL plugin只处理请求，EFFECT ready/wake通过lua_runtime_core核对实例并操作槽位。不使用block_on桥接。
+
+数组与对象分别转换，嵌套空数组保留数组身份；拒绝无法表示的混合键和稀疏数组。require只解析注入模块。标准库选择及内存、源码、指令检查预算由LuaRuntimeConfig指定；Full和Safe均不表示进程沙箱。

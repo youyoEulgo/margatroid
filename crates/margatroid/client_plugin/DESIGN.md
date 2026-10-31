@@ -95,12 +95,16 @@ crate公开：
 ```text
 client_registration_system(world: &mut World)
     处理事件：RegisterConnection
+    接收闭包结果：None
+    提交闭包：None
     产出事件：ClientRegistrationResult
     行为：收集事件，逐条调用handle_client_registration。
 
 client_disconnect_system(world: &mut World)
     处理事件：WebSocketDisconnected
-    产出事件：无
+    接收闭包结果：None
+    提交闭包：None
+    产出事件：None
     行为：收集事件，逐条调用handle_client_disconnect。
 ```
 
