@@ -1,9 +1,0 @@
-# 领域类型归属
-
-独立领域core拥有自身组件、事件、值、错误和基本操作，不设置总margatroid_types公共仓库，也不保留跨领域重导出门面。定义归属以本目录DESIGN中的映射和各领域设计为准。
-
-core之间不依赖，也不依赖plugin；plugin可依赖自己及其他core，不能依赖其他plugin。daemon和Compose位于装配层，可以依赖多个plugin。内部对象关联使用完整Entity，对外地址由address独立组件及边界转换提供。
-
-跨领域调用由plugin构造请求、等待oneshot及转换结果。一个core的公开签名不得直接引用另一个core的消息、配置或能力类型；相似数据按所属契约定义，plugin在边界转换，不通过通用大枚举恢复总共享仓库。
-
-VM、MCL、存储及各资源路径集合作为并列组件挂到Agent Entity。已加载资源不携带通用身份，Driver只有本次启动临时材料。网络DTO归protocol，不进入领域core。

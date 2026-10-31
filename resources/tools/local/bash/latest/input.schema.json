@@ -1,14 +1,1 @@
-{
-  "type": "object",
-  "properties": {
-    "cmd": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Bash command to execute."
-    }
-  },
-  "required": [
-    "cmd"
-  ],
-  "additionalProperties": false
-}
+{"type":"object","properties":{},"additionalProperties":false}

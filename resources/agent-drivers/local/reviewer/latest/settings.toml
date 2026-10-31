@@ -1,0 +1,6 @@
+visible_tools = ["review", "project_context", "list_dir"]
+sandbox = ["read_only"]
+
+[compaction]
+threshold = 0.8
+keep_messages = 16

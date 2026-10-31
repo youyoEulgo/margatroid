@@ -5,23 +5,15 @@ import {
   Activity,
   Bot,
   CircleAlert,
-  ChevronRight,
   CloudOff,
   Command,
-  Eye,
-  EyeOff,
-  LockKeyhole,
   Menu,
   MessageSquare,
   PanelRight,
   Plus,
   Send,
   Square,
-  Circle,
-  CircleDot,
   Settings2,
-  ShieldCheck,
-  ShieldOff,
   UserRound,
   UsersRound,
   Wifi,
@@ -37,10 +29,17 @@ import {
   type ConversationEntry,
 } from '@/stores/workbench';
 import SidebarTree from '@/components/SidebarTree.vue';
-import CatalogDialog, { type DialogRequest, type DialogValue } from '@/components/CatalogDialog.vue';
 import { renderMarkdown } from '@/lib/markdown';
 import { formatRecordTime } from '@/lib/time';
-import { IMAGE_ACCEPT, importImage, imageSource, validateImageBudget, wireImages, metadataText, type DraftImage } from '@/lib/images';
+import {
+  IMAGE_ACCEPT,
+  importImage,
+  imageSource,
+  validateImageBudget,
+  wireImages,
+  metadataText,
+  type DraftImage,
+} from '@/lib/images';
 
 const store = useWorkbenchStore();
 const {
@@ -52,7 +51,8 @@ const {
   connectionStatus,
   connectionError,
   workspaces,
-  selectedCatalogEntry,
+  selectedDefinition,
+  selectedRuntimeWorkspace,
   workspaceOperationPending,
   workspaceNotice,
   selectedWorkspace,
@@ -64,9 +64,6 @@ const {
   abortPending,
   selectedAgentWorking,
   sidebarTree,
-  drivers,
-  resourceVisibility,
-  sandboxOptions,
   visibleMessages,
   logs,
   lastFailures,
@@ -86,31 +83,48 @@ function openImagePicker() {
   pickerGeneration = draftGeneration;
   imagePicker.value?.click();
 }
-const composerRoute = computed(() => `${endpoint.value}:${selectedWorkspace.value?.id}:${selectedAgent.value}:${selectedAgentState.value?.agent_instance}`);
-watch(composerRoute, () => {
-  draftGeneration++;
-  draft.value = '';
-  draftImages.value = [];
-  composerError.value = '';
-  importingImages.value = false;
-  submittingMessage.value = false;
-  sendStage.value = null;
-  uploadMenuOpen.value = false;
-  if (imagePicker.value) imagePicker.value.value = '';
-}, { flush: 'sync' });
-const canEditComposer = computed(() => !!selectedWorkspace.value && connectionStatus.value === 'online' && selectedAgentIdle.value && !submittingMessage.value);
+const composerRoute = computed(
+  () =>
+    `${endpoint.value}:${selectedWorkspace.value?.path}:${selectedAgent.value}:${selectedAgentState.value?.agent_instance}`,
+);
+watch(
+  composerRoute,
+  () => {
+    draftGeneration++;
+    draft.value = '';
+    draftImages.value = [];
+    composerError.value = '';
+    importingImages.value = false;
+    submittingMessage.value = false;
+    sendStage.value = null;
+    uploadMenuOpen.value = false;
+    if (imagePicker.value) imagePicker.value.value = '';
+  },
+  { flush: 'sync' },
+);
+const canEditComposer = computed(
+  () =>
+    !!selectedWorkspace.value &&
+    connectionStatus.value === 'online' &&
+    selectedAgentIdle.value &&
+    !submittingMessage.value,
+);
 async function importFiles(files: File[]) {
   if (!canEditComposer.value || importingImages.value || !files.length) return;
   const generation = draftGeneration;
   importingImages.value = true;
   composerError.value = '';
   try {
-    validateImageBudget([...draftImages.value.map((image) => image.size), ...files.map((file) => file.size)]);
+    validateImageBudget([
+      ...draftImages.value.map((image) => image.size),
+      ...files.map((file) => file.size),
+    ]);
     const imported: DraftImage[] = [];
     for (const file of files) imported.push(await importImage(file));
     if (generation === draftGeneration) draftImages.value.push(...imported);
   } catch (error) {
-    if (generation === draftGeneration) composerError.value = error instanceof Error ? error.message : 'Image import failed';
+    if (generation === draftGeneration)
+      composerError.value = error instanceof Error ? error.message : 'Image import failed';
   } finally {
     if (generation === draftGeneration) importingImages.value = false;
   }
@@ -131,95 +145,14 @@ const messageList = ref<HTMLElement | null>(null);
 const conversationPane = ref<HTMLElement | null>(null);
 const composerFooter = ref<HTMLElement | null>(null);
 let composerObserver: ResizeObserver | undefined;
-const toolManager = ref<HTMLElement | null>(null);
 const sidebarOpen = ref(false);
 const activityOpen = ref(false);
 const activityTab = ref<'activity' | 'mcl'>('activity');
-const toolsOpen = ref(false);
 const settingsOpen = ref(false);
 const logFilter = ref<'all' | 'errors'>('all');
 const endpointDraft = ref(endpoint.value);
 const contextPathDraft = ref(driverContextPath.value);
 const formError = ref('');
-const catalogDialog = ref<DialogRequest | null>(null);
-const catalogDialogEl = ref<InstanceType<typeof CatalogDialog> | null>(null);
-const catalogDialogBusy = ref(false);
-
-function openCatalogDialog(request: DialogRequest) {
-  if (catalogDialogBusy.value || workspaceOperationPending.value) return;
-  if (connectionStatus.value !== 'online') {
-    connectionError.value = 'Connect to the daemon before changing definitions';
-    return;
-  }
-  catalogDialog.value = request;
-  const activeDialog = catalogDialog.value;
-  if (request.kind === 'new-session') void store.queryDrivers().catch((error) => {
-    if (catalogDialog.value === activeDialog) catalogDialogEl.value?.showError(String(error.message ?? error));
-  });
-}
-const sidebarWorkspace = (key: string) => sidebarTree.value.workspaces.find((workspace) => workspace.key === key);
-
-function requestNewSession(key: string) {
-  const workspace = sidebarWorkspace(key);
-  if (!workspace) return;
-  openCatalogDialog({ kind: 'new-session', workspace: { key, revision: workspace.revision, name: workspace.name, invalid: workspace.invalid } });
-}
-function requestRenameWorkspace(key: string) {
-  const workspace = sidebarWorkspace(key);
-  if (workspace) openCatalogDialog({ kind: 'rename-workspace', workspace: { key, revision: workspace.revision, name: workspace.name } });
-}
-function requestDeleteWorkspace(key: string) {
-  const workspace = sidebarWorkspace(key);
-  if (workspace)
-    openCatalogDialog({
-      kind: 'delete-workspace',
-      workspace: { key, revision: workspace.revision, name: workspace.name, lifecycle: workspace.lifecycle },
-    });
-}
-function requestRenameAgent(workspaceKeyValue: string, agentId: string) {
-  const workspace = sidebarWorkspace(workspaceKeyValue);
-  const agent = workspace?.agents.find((item) => item.id === agentId);
-  if (workspace && agent)
-    openCatalogDialog({
-      kind: 'rename-agent',
-      workspace: { key: workspace.key, revision: workspace.revision, name: workspace.name },
-      agent: { id: agent.id, name: agent.name },
-    });
-}
-function requestDeleteAgent(workspaceKeyValue: string, agentId: string) {
-  const workspace = sidebarWorkspace(workspaceKeyValue);
-  const agent = workspace?.agents.find((item) => item.id === agentId);
-  if (workspace && agent)
-    openCatalogDialog({
-      kind: 'delete-agent',
-      workspace: { key: workspace.key, revision: workspace.revision, name: workspace.name },
-      agent: { id: agent.id, name: agent.name },
-    });
-}
-/** The dialog never shows optimistic success; a daemon rejection stays in the dialog. */
-async function submitCatalogDialog(value: DialogValue) {
-  catalogDialogBusy.value = true;
-  try {
-    if (value.kind === 'new-workspace') {
-      await store.createWorkspace({ name: value.name, projectRoot: value.projectRoot });
-    } else if (value.kind === 'new-session') {
-      await store.addMember(value.name.trim(), value.driver.trim(), { key: value.key, revision: value.revision });
-    } else if (value.kind === 'rename-workspace') {
-      await store.renameWorkspace(value.key, value.name, value.revision);
-    } else if (value.kind === 'rename-agent') {
-      await store.renameMember(value.agent, value.name, { key: value.key, revision: value.revision });
-    } else if (value.kind === 'delete-workspace') {
-      await store.deleteWorkspace(value.key, value.revision);
-    } else if (value.kind === 'delete-agent') {
-      await store.deleteMember(value.agent, { key: value.key, revision: value.revision });
-    }
-    catalogDialog.value = null;
-  } catch (error) {
-    catalogDialogEl.value?.showError(error instanceof Error ? error.message : String(error));
-  } finally {
-    catalogDialogBusy.value = false;
-  }
-}
 const displayedLogs = computed(() => {
   if (logFilter.value === 'errors') {
     return logs.value.filter((entry) => entry.level === 'ERROR' || entry.level === 'WARN');
@@ -239,10 +172,6 @@ const connectionLabel = computed(() => {
   if (connectionStatus.value === 'connecting') return 'Connecting';
   return 'Offline';
 });
-
-const toolResources = computed(() =>
-  resourceVisibility.value.filter((entry) => entry.resource.startsWith('tool:')),
-);
 
 function compactTokenNumber(value: number) {
   const units = [
@@ -312,7 +241,9 @@ const currentChannelLabel = computed(() => {
   const workspace = selectedWorkspace.value;
   if (!workspace) return 'Select a workspace';
   if (selectedAgent.value) return resourceName(selectedAgent.value);
-  return workspace.agents.length ? 'Choose an agent' : 'No agents defined';
+  return selectedDefinition.value?.cache.agents.length
+    ? 'Choose an agent'
+    : 'No members configured';
 });
 
 const NEAR_BOTTOM_PX = 80;
@@ -347,28 +278,19 @@ function autosizeDraft() {
 
 watch(draft, () => nextTick(autosizeDraft));
 
-function toolArguments(value: string) {
-  return value;
+function toolArguments(value: unknown) {
+  return typeof value === 'string' ? value : JSON.stringify(value ?? {});
 }
 
 function logLevelClass(log: { level: string }) {
   return `log-level--${log.level.toLowerCase()}`;
 }
 
-function closeToolsOnOutsideClick(event: MouseEvent) {
-  const target = event.target;
-  if (!toolsOpen.value) return;
-  if (target instanceof Node && toolManager.value && !toolManager.value.contains(target)) {
-    toolsOpen.value = false;
-  }
-}
-
 onMounted(() => {
   if (!selectedWorkspace.value && workspaces.value[0]) {
-    store.selectWorkspace(workspaceKey(workspaces.value[0]));
+    store.selectWorkspace(workspaces.value[0].path);
   }
   store.connect();
-  document.addEventListener('click', closeToolsOnOutsideClick);
 
   composerObserver = new ResizeObserver(() => {
     const pane = conversationPane.value;
@@ -380,14 +302,14 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  document.removeEventListener('click', closeToolsOnOutsideClick);
   composerObserver?.disconnect();
   store.disconnect();
 });
 
 async function submitMessage() {
   const text = draft.value.trim();
-  if ((!text && !draftImages.value.length) || !canEditComposer.value || importingImages.value) return;
+  if ((!text && !draftImages.value.length) || !canEditComposer.value || importingImages.value)
+    return;
   const generation = draftGeneration;
   submittingMessage.value = true;
   composerError.value = '';
@@ -400,7 +322,8 @@ async function submitMessage() {
     draftImages.value = [];
     nextTick(scrollMessages);
   } catch (error) {
-    if (generation === draftGeneration) composerError.value = error instanceof Error ? error.message : 'Send failed';
+    if (generation === draftGeneration)
+      composerError.value = error instanceof Error ? error.message : 'Send failed';
   } finally {
     if (generation === draftGeneration) {
       submittingMessage.value = false;
@@ -417,31 +340,8 @@ async function runAgentAction(action: () => Promise<unknown>) {
   }
 }
 
-function toggleResourceVisibility(resource: string, visible: boolean) {
-  void runAgentAction(() => store.setResourceVisibility(resource, visible));
-}
-
 function abortTurn() {
   void runAgentAction(() => store.abortTurn());
-}
-
-const NO_SANDBOX = '';
-const sandboxChoices = computed(() => [
-  {
-    value: NO_SANDBOX,
-    label: 'None',
-    hint: 'No sandbox: tools run with the daemon user permissions',
-  },
-  ...sandboxOptions.value.options.map((resource) => ({
-    value: resource,
-    label: resourceName(resource),
-    hint: resource,
-  })),
-]);
-const sandboxSelection = computed(() => sandboxOptions.value.activated[0] ?? NO_SANDBOX);
-
-function selectSandbox(value: string) {
-  void runAgentAction(() => store.setSandbox(value === NO_SANDBOX ? null : value));
 }
 
 function selectWorkspace(key: string) {
@@ -535,7 +435,11 @@ const conversationMessages = computed(() =>
           <strong>margatroid</strong>
           <span>{{ connectionLabel }}</span>
         </div>
-        <button class="icon-button sidebar-close" title="Close navigation" @click="sidebarOpen = false">
+        <button
+          class="icon-button sidebar-close"
+          title="Close navigation"
+          @click="sidebarOpen = false"
+        >
           <X :size="17" />
         </button>
       </div>
@@ -549,18 +453,7 @@ const conversationMessages = computed(() =>
         <Settings2 :size="15" />
       </button>
 
-      <div class="sidebar-heading">
-        <span>Workspaces</span>
-        <button
-          class="heading-action"
-          type="button"
-          :disabled="workspaceOperationPending || connectionStatus !== 'online'"
-          title="Rescan the workspace catalog"
-          @click="runAgentAction(() => store.refreshCatalog())"
-        >
-          Refresh
-        </button>
-      </div>
+      <div class="sidebar-heading"><span>Workspaces</span></div>
 
       <nav class="sidebar-scroll" aria-label="Workspaces">
         <SidebarTree
@@ -570,26 +463,50 @@ const conversationMessages = computed(() =>
           @select-workspace="selectWorkspace"
           @toggle-workspace="store.toggleWorkspace"
           @select-agent="selectMember"
-          @new-workspace="openCatalogDialog({ kind: 'new-workspace' })"
-          @new-session="requestNewSession"
-          @rename-workspace="requestRenameWorkspace"
-          @delete-workspace="requestDeleteWorkspace"
-          @rename-agent="requestRenameAgent"
-          @delete-agent="requestDeleteAgent"
         />
       </nav>
 
-      <div v-if="selectedCatalogEntry" class="workspace-controls" aria-label="Selected workspace controls">
-        <span class="tree-name" :title="selectedCatalogEntry.name">{{ selectedCatalogEntry.name }}</span>
-        <button type="button" :disabled="workspaceOperationPending || connectionStatus !== 'online' || !!selectedCatalogEntry.error || selectedCatalogEntry.lifecycle !== 'stopped'" @click="runAgentAction(() => store.startWorkspace())">Start</button>
-        <button type="button" :disabled="workspaceOperationPending || connectionStatus !== 'online' || selectedCatalogEntry.lifecycle === 'stopped'" @click="runAgentAction(() => store.stopWorkspace())">Stop</button>
+      <div
+        v-if="selectedDefinition"
+        class="workspace-controls"
+        aria-label="Selected workspace controls"
+      >
+        <span class="tree-name" :title="selectedDefinition.path">{{
+          selectedDefinition.cache.name
+        }}</span>
+        <button
+          type="button"
+          :disabled="
+            workspaceOperationPending || connectionStatus !== 'online' || !!selectedRuntimeWorkspace
+          "
+          @click="runAgentAction(() => store.startWorkspace(selectedDefinition!.path))"
+        >
+          Start
+        </button>
+        <button
+          type="button"
+          :disabled="
+            workspaceOperationPending ||
+            connectionStatus !== 'online' ||
+            selectedRuntimeWorkspace?.status !== 'running'
+          "
+          @click="runAgentAction(() => store.restartWorkspace(selectedDefinition!.path))"
+        >
+          Restart
+        </button>
+        <button
+          type="button"
+          :disabled="
+            workspaceOperationPending ||
+            connectionStatus !== 'online' ||
+            selectedRuntimeWorkspace?.status !== 'running'
+          "
+          @click="runAgentAction(() => store.stopWorkspace(selectedRuntimeWorkspace!.id))"
+        >
+          Stop
+        </button>
       </div>
-      <div v-if="selectedCatalogEntry || workspaceNotice" class="sidebar-footnote" role="status">
-        <template v-if="selectedCatalogEntry?.error">
-          Invalid definition at {{ selectedCatalogEntry.path }}. Fix it, then Refresh.
-        </template>
-        <template v-else-if="workspaceNotice">{{ workspaceNotice }}</template>
-      </div>
+      <div v-if="workspaceNotice" class="sidebar-footnote" role="status">{{ workspaceNotice }}</div>
     </aside>
 
     <main ref="conversationPane" class="conversation-pane">
@@ -611,8 +528,12 @@ const conversationMessages = computed(() =>
           </div>
         </div>
         <div class="header-actions">
-          <button class="icon-button" :class="{ 'icon-button--active': activityOpen }" title="Toggle activity"
-            @click="activityOpen = !activityOpen">
+          <button
+            class="icon-button"
+            :class="{ 'icon-button--active': activityOpen }"
+            title="Toggle activity"
+            @click="activityOpen = !activityOpen"
+          >
             <PanelRight :size="18" />
           </button>
         </div>
@@ -630,10 +551,15 @@ const conversationMessages = computed(() =>
             <MessageSquare :size="22" />
           </div>
           <strong>{{ selectedAgentName }}</strong>
-          <span v-if="selectedAgentState?.status === 'creating'">Agent is starting.</span>
-          <span v-else-if="!selectedWorkspace.agents.length">No agents defined. Add an agent to begin.</span>
+          <span v-if="selectedAgentState?.status === 'starting'">Agent is starting.</span>
+          <span v-else-if="!selectedRuntimeWorkspace"
+            >Workspace is stopped. Start it to run its configured members.</span
+          >
+          <span v-else-if="!selectedDefinition?.cache.agents.length">No members configured.</span>
           <span v-else-if="!selectedAgent">Choose an agent from Members.</span>
-          <span v-else-if="!selectedAgentReady">Agent is not running. Start the workspace or inspect runtime errors.</span>
+          <span v-else-if="!selectedAgentReady"
+            >Agent is not running. Start the workspace or inspect runtime errors.</span
+          >
           <span v-else>Conversation is ready.</span>
           <span v-if="selectedAgentFailure" class="agent-failure">
             Last error: {{ selectedAgentFailure.message }}
@@ -641,11 +567,13 @@ const conversationMessages = computed(() =>
         </div>
 
         <template v-for="message in conversationMessages" :key="message.key">
-          <article :class="[
-            'message-row',
-            `message-row--${message.role}`,
-            { 'message-row--failed': message.failed },
-          ]">
+          <article
+            :class="[
+              'message-row',
+              `message-row--${message.role}`,
+              { 'message-row--failed': message.failed },
+            ]"
+          >
             <div class="message-avatar">
               <UserRound v-if="message.role === 'user'" :size="16" />
               <Bot v-else-if="message.role === 'assistant'" :size="16" />
@@ -657,9 +585,27 @@ const conversationMessages = computed(() =>
               <div class="message-meta">
                 <strong>{{ roleLabel(message) }}</strong>
                 <span>{{ formatTime(message.timestamp) }}</span>
+                <span v-if="message.sequence !== null">#{{ message.sequence }}</span>
+                <code
+                  v-if="message.historyKey"
+                  class="message-record-key"
+                  :title="message.historyKey"
+                  >{{ message.historyKey }}</code
+                >
+                <span v-else>Live</span>
               </div>
-              <div v-if="message.images?.length" class="image-row history-image-row" aria-label="Message images">
-                <img v-for="(image, index) in message.images" :key="index" :src="imageSource(image)" :alt="`Image ${index + 1}`" loading="lazy" />
+              <div
+                v-if="message.images?.length"
+                class="image-row history-image-row"
+                aria-label="Message images"
+              >
+                <img
+                  v-for="(image, index) in message.images"
+                  :key="index"
+                  :src="imageSource(image)"
+                  :alt="`Image ${index + 1}`"
+                  loading="lazy"
+                />
               </div>
               <details v-if="message.thinking" class="message-thinking">
                 <summary>Thinking</summary>
@@ -672,7 +618,18 @@ const conversationMessages = computed(() =>
                 </summary>
                 <pre class="tool-response-detail">{{ message.content }}</pre>
               </details>
-              <div v-else-if="message.content" class="message-content" v-html="renderMarkdown(message.content)"></div>
+              <div
+                v-else-if="message.content"
+                class="message-content"
+                v-html="renderMarkdown(message.content)"
+              ></div>
+              <details
+                v-if="message.role === 'record' && message.payload !== null"
+                class="tool-response"
+              >
+                <summary>Record data</summary>
+                <pre class="tool-response-detail">{{ metadataText(message.payload) }}</pre>
+              </details>
               <div v-if="message.toolCalls.length" class="tool-call-list">
                 <details v-for="tool in message.toolCalls" :key="tool.id" class="tool-call-row">
                   <summary>
@@ -697,127 +654,151 @@ const conversationMessages = computed(() =>
       </section>
 
       <footer ref="composerFooter" class="composer" @wheel="handleComposerWheel">
-        <form class="composer-box" @submit.prevent="submitMessage" @dragover.prevent @drop.prevent="dropImages">
-          <input ref="imagePicker" class="image-picker" type="file" :accept="IMAGE_ACCEPT" multiple @change="pickImages" />
-          <div v-if="draftImages.length" class="image-row draft-image-row" aria-label="Attached images">
+        <form
+          class="composer-box"
+          @submit.prevent="submitMessage"
+          @dragover.prevent
+          @drop.prevent="dropImages"
+        >
+          <input
+            ref="imagePicker"
+            class="image-picker"
+            type="file"
+            :accept="IMAGE_ACCEPT"
+            multiple
+            @change="pickImages"
+          />
+          <div
+            v-if="draftImages.length"
+            class="image-row draft-image-row"
+            aria-label="Attached images"
+          >
             <div v-for="image in draftImages" :key="image.id" class="draft-image">
               <img :src="imageSource(image)" :alt="image.name" :title="image.name" />
-              <button type="button" :disabled="submittingMessage" :aria-label="`Remove ${image.name}`" @click="draftImages = draftImages.filter((item) => item.id !== image.id)"><X :size="14" /></button>
+              <button
+                type="button"
+                :disabled="submittingMessage"
+                :aria-label="`Remove ${image.name}`"
+                @click="draftImages = draftImages.filter((item) => item.id !== image.id)"
+              >
+                <X :size="14" />
+              </button>
             </div>
           </div>
           <div class="composer-input-row">
-            <textarea ref="draftInput" v-model="draft"
-              :disabled="!canEditComposer" rows="1"
-              :placeholder="!selectedWorkspace
+            <textarea
+              ref="draftInput"
+              v-model="draft"
+              :disabled="!canEditComposer"
+              rows="1"
+              :placeholder="
+                !selectedWorkspace
                   ? 'Select a workspace...'
                   : selectedAgentReady
                     ? selectedAgentWorking
                       ? `${selectedAgentName} is working...`
                       : `Message ${selectedAgentName}...`
                     : 'Agent is not ready...'
-                " @keydown.enter.exact.prevent="submitMessage"></textarea>
+              "
+              @keydown.enter.exact.prevent="submitMessage"
+            ></textarea>
           </div>
           <div v-if="composerError" class="composer-error" role="alert">{{ composerError }}</div>
           <div class="composer-actions">
             <div class="upload-control">
-              <button class="icon-button" type="button" title="Add image" aria-label="Add image" :aria-expanded="uploadMenuOpen" :disabled="!canEditComposer || importingImages" @click="uploadMenuOpen = !uploadMenuOpen"><Plus :size="19" /></button>
+              <button
+                class="icon-button"
+                type="button"
+                title="Add image"
+                aria-label="Add image"
+                :aria-expanded="uploadMenuOpen"
+                :disabled="!canEditComposer || importingImages"
+                @click="uploadMenuOpen = !uploadMenuOpen"
+              >
+                <Plus :size="19" />
+              </button>
               <div v-if="uploadMenuOpen" class="upload-menu">
                 <button type="button" @click="openImagePicker">上传图片 / Upload image</button>
               </div>
             </div>
             <span v-if="importingImages" class="image-import-label">Importing images…</span>
-            <span v-if="submittingMessage" class="image-import-label" role="status">{{ sendStage === 'waking' ? 'Message injected; waiting for wake acknowledgement…' : 'Sending; waiting for daemon acknowledgement…' }}</span>
+            <span v-if="submittingMessage" class="image-import-label" role="status">{{
+              sendStage === 'waking'
+                ? 'Message injected; waiting for wake acknowledgement…'
+                : 'Sending; waiting for daemon acknowledgement…'
+            }}</span>
             <span v-if="abortPending" class="abort-pending-label">Abort pending</span>
-            <button v-if="selectedAgentWorking" class="send-button send-button--stop" type="button" :title="canAbortTurn
-                ? 'Stop current turn'
-                : abortPending ? 'Abort pending' : 'No abortable turn'
-              " :disabled="!canAbortTurn ||
+            <button
+              v-if="selectedAgentWorking"
+              class="send-button send-button--stop"
+              type="button"
+              :title="
+                canAbortTurn
+                  ? 'Stop current turn'
+                  : abortPending
+                    ? 'Abort pending'
+                    : 'No abortable turn'
+              "
+              :disabled="
+                !canAbortTurn ||
                 !selectedWorkspace ||
                 connectionStatus !== 'online' ||
                 !selectedAgentReady
-                " @click="abortTurn">
+              "
+              @click="abortTurn"
+            >
               <Square :size="14" :stroke-width="0" fill="currentColor" />
             </button>
-            <button v-else class="send-button" type="submit" title="Send message" :disabled="(!draft.trim() && !draftImages.length) ||
-              importingImages || submittingMessage ||
-              !selectedWorkspace ||
-              connectionStatus !== 'online' ||
-              !selectedAgentIdle
-              ">
+            <button
+              v-else
+              class="send-button"
+              type="submit"
+              title="Send message"
+              :disabled="
+                (!draft.trim() && !draftImages.length) ||
+                importingImages ||
+                submittingMessage ||
+                !selectedWorkspace ||
+                connectionStatus !== 'online' ||
+                !selectedAgentIdle
+              "
+            >
               <Send :size="18" />
             </button>
           </div>
         </form>
-        <div v-if="selectedWorkspace" ref="toolManager" class="tool-manager">
-          <button class="tool-manager-trigger" type="button" :aria-expanded="toolsOpen"
-            aria-controls="tool-manager-panel" title="Manage agent tools" @click="toolsOpen = !toolsOpen">
-            <ChevronRight :class="['tool-manager-chevron', { 'is-open': toolsOpen }]" :size="13" />
-            <span class="tool-manager-empty">Resources Panel</span>
-          </button>
-
+        <div v-if="selectedWorkspace" class="tool-manager">
+          <span class="tool-manager-empty"
+            >Sandbox: {{ selectedAgentState?.sandbox || 'None' }}</span
+          >
           <div class="token-usage" aria-label="Agent token usage">
-            <span v-for="item in tokenUsageItems" :key="item.label" class="token-usage-item" :title="item.title">
+            <span
+              v-for="item in tokenUsageItems"
+              :key="item.label"
+              class="token-usage-item"
+              :title="item.title"
+            >
               <span>{{ item.label }}</span>
               <strong>{{ item.value }}</strong>
             </span>
-            <span class="context-window-usage" role="img" :aria-label="contextWindowUsage.title"
-              :title="contextWindowUsage.title">
+            <span
+              class="context-window-usage"
+              role="img"
+              :aria-label="contextWindowUsage.title"
+              :title="contextWindowUsage.title"
+            >
               <svg viewBox="0 0 18 18" aria-hidden="true">
                 <circle class="context-window-track" cx="9" cy="9" r="7" />
-                <circle class="context-window-value" cx="9" cy="9" r="7"
-                  :style="{ strokeDashoffset: contextWindowUsage.dashOffset }" />
+                <circle
+                  class="context-window-value"
+                  cx="9"
+                  cy="9"
+                  r="7"
+                  :style="{ strokeDashoffset: contextWindowUsage.dashOffset }"
+                />
               </svg>
               <span class="context-window-percentage">{{ contextWindowUsage.label }}</span>
             </span>
-          </div>
-
-          <div v-if="toolsOpen" id="tool-manager-panel" class="tool-manager-panel">
-            <section class="tool-resource-group">
-              <div class="tool-resource-heading">
-                <span>Sandbox</span>
-                <span>{{ sandboxOptions.options.length }}</span>
-              </div>
-              <div class="tool-resource-list">
-                <div v-for="choice in sandboxChoices" :key="choice.value || 'none'" class="tool-resource-row"
-                  :title="choice.hint">
-                  <ShieldCheck v-if="choice.value" :size="14" />
-                  <ShieldOff v-else :size="14" />
-                  <code :title="choice.hint">{{ choice.label }}</code>
-                  <button class="tool-row-action" type="button" :title="sandboxSelection === choice.value ? 'Active sandbox' : 'Use this sandbox'
-                    " :aria-label="sandboxSelection === choice.value ? 'Active sandbox' : 'Use this sandbox'
-                      " :disabled="connectionStatus !== 'online' || !selectedAgentReady"
-                    @click="selectSandbox(choice.value)">
-                    <CircleDot v-if="sandboxSelection === choice.value" :size="14" />
-                    <Circle v-else :size="14" />
-                  </button>
-                </div>
-              </div>
-            </section>
-
-            <section class="tool-resource-group">
-              <div class="tool-resource-heading">
-                <span>Tools</span>
-                <span>{{ toolResources.length }}</span>
-              </div>
-              <div v-if="toolResources.length" class="tool-resource-list">
-                <div v-for="entry in toolResources" :key="entry.resource" class="tool-resource-row">
-                  <span :class="['resource-state-dot', { 'is-active': entry.visible }]" />
-                  <code :title="entry.resource">{{ resourceName(entry.resource) }}</code>
-                  <button v-if="entry.default" class="tool-row-action" type="button"
-                    :title="entry.visible ? 'Remove visibility' : 'Inject visibility'"
-                    :aria-label="entry.visible ? 'Remove visibility' : 'Inject visibility'"
-                    :disabled="connectionStatus !== 'online' || !selectedAgentReady"
-                    @click="toggleResourceVisibility(entry.resource, !entry.visible)">
-                    <Eye v-if="entry.visible" :size="14" />
-                    <EyeOff v-else :size="14" />
-                  </button>
-                  <span v-else class="tool-row-action is-readonly" title="Runtime-managed resource">
-                    <LockKeyhole :size="14" />
-                  </span>
-                </div>
-              </div>
-              <span v-else class="tool-resource-empty">None</span>
-            </section>
           </div>
         </div>
       </footer>
@@ -834,22 +815,60 @@ const conversationMessages = computed(() =>
         </button>
       </div>
       <div class="activity-tabs" role="tablist" aria-label="Audit panel">
-        <button type="button" role="tab" :aria-selected="activityTab === 'activity'" :class="{ active: activityTab === 'activity' }" @click="activityTab = 'activity'">Activity</button>
-        <button type="button" role="tab" :aria-selected="activityTab === 'mcl'" :class="{ active: activityTab === 'mcl' }" @click="activityTab = 'mcl'">MCL <span>{{ mclRecords.length }}</span></button>
+        <button
+          type="button"
+          role="tab"
+          :aria-selected="activityTab === 'activity'"
+          :class="{ active: activityTab === 'activity' }"
+          @click="activityTab = 'activity'"
+        >
+          Activity
+        </button>
+        <button
+          type="button"
+          role="tab"
+          :aria-selected="activityTab === 'mcl'"
+          :class="{ active: activityTab === 'mcl' }"
+          @click="activityTab = 'mcl'"
+        >
+          MCL <span>{{ mclRecords.length }}</span>
+        </button>
       </div>
-      <div v-if="activityTab === 'mcl'" class="activity-list" role="tabpanel" aria-label="MCL audit">
-        <p v-if="!mclRecords.length" class="activity-empty">No MCL records for the selected agent</p>
+      <div
+        v-if="activityTab === 'mcl'"
+        class="activity-list"
+        role="tabpanel"
+        aria-label="MCL audit"
+      >
+        <p v-if="!mclRecords.length" class="activity-empty">
+          No MCL records for the selected agent
+        </p>
         <details v-for="record in mclRecords" :key="record.key" class="mcl-audit-entry">
-          <summary>{{ record.content || 'MCL command' }} · {{ formatTime(record.timestamp) }}</summary>
+          <summary>
+            #{{ record.sequence }} · {{ record.content || 'MCL command' }} ·
+            {{ formatTime(record.timestamp) }}
+          </summary>
           <pre>{{ metadataText(record.payload) }}</pre>
         </details>
       </div>
-      <div v-if="activityTab === 'activity'" class="activity-filter" role="group" aria-label="Filter activity">
+      <div
+        v-if="activityTab === 'activity'"
+        class="activity-filter"
+        role="group"
+        aria-label="Filter activity"
+      >
         <button type="button" :class="{ active: logFilter === 'all' }" @click="logFilter = 'all'">
           All <span>{{ logs.length }}</span>
         </button>
-        <button type="button" :class="{ active: logFilter === 'errors' }" @click="logFilter = 'errors'">
-          Errors <span>{{ logs.filter((log) => log.level === 'ERROR' || log.level === 'WARN').length }}</span>
+        <button
+          type="button"
+          :class="{ active: logFilter === 'errors' }"
+          @click="logFilter = 'errors'"
+        >
+          Errors
+          <span>{{
+            logs.filter((log) => log.level === 'ERROR' || log.level === 'WARN').length
+          }}</span>
         </button>
       </div>
       <div v-if="activityTab === 'activity'" class="activity-list">
@@ -862,26 +881,22 @@ const conversationMessages = computed(() =>
           <div class="log-copy">
             <p>{{ log.message }}</p>
             <small>{{ log.target }} · {{ formatLogTime(log.timestamp) }}</small>
-            <code v-for="field in log.fields" :key="field.name">{{ field.name }}={{ field.value }}</code>
+            <code v-for="field in log.fields" :key="field.name"
+              >{{ field.name }}={{ field.value }}</code
+            >
           </div>
         </div>
       </div>
-      <button v-if="activityTab === 'activity'" class="activity-clear" type="button" @click="store.clearLogs">Clear activity</button>
+      <button
+        v-if="activityTab === 'activity'"
+        class="activity-clear"
+        type="button"
+        @click="store.clearLogs"
+      >
+        Clear activity
+      </button>
     </aside>
 
-    <CatalogDialog
-      v-if="catalogDialog"
-      ref="catalogDialogEl"
-      :request="catalogDialog"
-      :drivers="drivers"
-      :driver-errors="store.driverCatalogErrors"
-      :query-paths="store.queryPaths"
-      :refresh-drivers="() => store.queryDrivers(true)"
-      :busy="catalogDialogBusy || workspaceOperationPending"
-      :offline="connectionStatus !== 'online'"
-      @close="!catalogDialogBusy && (catalogDialog = null)"
-      @submit="submitCatalogDialog"
-    />
     <div v-if="settingsOpen" class="dialog-backdrop" @click.self="settingsOpen = false">
       <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <div class="dialog-header">
@@ -894,20 +909,28 @@ const conversationMessages = computed(() =>
           </button>
         </div>
         <label class="field-label" for="endpoint">WebSocket endpoint</label>
-        <input id="endpoint" v-model="endpointDraft" class="field-input" placeholder="ws://127.0.0.1:3939/ws"
-          @keydown.enter="saveSettings" />
+        <input
+          id="endpoint"
+          v-model="endpointDraft"
+          class="field-input"
+          placeholder="ws://127.0.0.1:3939/ws"
+          @keydown.enter="saveSettings"
+        />
         <label class="field-label" for="context-path">Driver context path</label>
-        <input id="context-path" v-model="contextPathDraft" class="field-input"
-          placeholder="Path defined by your driver" @keydown.enter="saveSettings" />
+        <input
+          id="context-path"
+          v-model="contextPathDraft"
+          class="field-input"
+          placeholder="Path defined by your driver"
+          @keydown.enter="saveSettings"
+        />
         <p class="field-label">
           Driver-defined destination for messages. Change only if your driver uses a different path.
         </p>
         <p v-if="formError" class="form-error">{{ formError }}</p>
         <div class="dialog-actions">
           <button class="secondary-button" @click="settingsOpen = false">Cancel</button>
-          <button class="primary-button" @click="saveSettings">
-            <Wifi :size="16" /> Connect
-          </button>
+          <button class="primary-button" @click="saveSettings"><Wifi :size="16" /> Connect</button>
         </div>
       </section>
     </div>

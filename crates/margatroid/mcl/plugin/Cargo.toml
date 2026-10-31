@@ -1,0 +1,31 @@
+[package]
+name = "mcl_plugin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mcl_core = { path = "../core" }
+agent_core = { path = "../../agent/core" }
+lua_runtime_core = { path = "../../lua_runtime/core" }
+storage_core = { path = "../../storage/core" }
+prompt_resource_core = { path = "../../prompt_resource/core" }
+tool_resource_core = { path = "../../tool_resource/core" }
+sandbox_resource_core = { path = "../../sandbox_resource/core" }
+tool_core = { path = "../../tool/core" }
+inference_core = { path = "../../inference/core" }
+address = { path = "../../address" }
+app_runtime_plugin = { path = "../../../mecs/app_runtime_plugin" }
+async_runtime_plugin = { path = "../../../mecs/async_runtime_plugin" }
+closure_plugin = { path = "../../../mecs/closure_plugin" }
+core_plugin = { path = "../../../mecs/core_plugin" }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["time", "rt-multi-thread"] }

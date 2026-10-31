@@ -1,0 +1,21 @@
+[package]
+name = "workspace_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+workspace_core = { path = "../core" }
+agent_core = { path = "../../agent/core" }
+tool_core = { path = "../../tool/core" }
+address = { path = "../../address" }
+core_plugin = { path = "../../../mecs/core_plugin" }
+app_runtime_plugin = { path = "../../../mecs/app_runtime_plugin" }
+async_runtime_plugin = { path = "../../../mecs/async_runtime_plugin" }
+closure_plugin = { path = "../../../mecs/closure_plugin" }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+closure_plugin = { path = "../../../mecs/closure_plugin" }
+tempfile = "3"
+serde_yaml = "0.9"

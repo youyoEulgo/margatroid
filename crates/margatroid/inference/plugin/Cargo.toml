@@ -1,0 +1,33 @@
+[package]
+name = "inference_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+inference_core = { path = "../core" }
+agent_core = { path = "../../agent/core" }
+lua_runtime_core = { path = "../../lua_runtime/core" }
+client_core = { path = "../../client/core" }
+address = { path = "../../address" }
+tool_resource_core = { path = "../../tool_resource/core" }
+core_plugin = { path = "../../../mecs/core_plugin" }
+app_runtime_plugin = { path = "../../../mecs/app_runtime_plugin" }
+async_runtime_plugin = { path = "../../../mecs/async_runtime_plugin" }
+server_plugin = { path = "../../../mecs/server_plugin" }
+base64 = "0.22"
+futures-util = "0.3"
+jsonschema = { version = "0.33", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+config_core = { path = "../../config/core" }
+workspace_core = { path = "../../workspace/core" }
+margatroid_protocol = { path = "../../protocol" }
+tokio-tungstenite = "0.29"

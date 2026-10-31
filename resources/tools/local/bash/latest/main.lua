@@ -1,30 +1,28 @@
-local MAX_OUTPUT_BYTES = 16 * 1024 * 1024
-
--- The command's output goes to the model as-is, so the model reads the text
--- rather than a JSON envelope. `ok` carries the one thing the text cannot say:
--- whether the runtime, the interface and the history should treat this call as
--- a failure. A non-zero exit code is a failure here, the way a shell reports it.
 function execute(arguments, context)
-    local result = margatroid().shell(arguments.cmd, {
-        max_output_bytes = MAX_OUTPUT_BYTES,
-    })
-
-    -- A tool that can answer at all must answer with something the model can act
-    -- on. A silent success is fine; a silent failure is not, because the model
-    -- would have nothing to reason about and would have to guess why it failed.
-    local content = result.stdout
-    if content == "" then
-        if result.exit_code == 0 then
-            content = "command completed with no output"
+    local terminal = terminal_open()
+    task_return({ task_id = context.task_id })
+    while true do
+        local source, value = await_any({
+            output = function() return terminal:read() end,
+            input = function() return task_receive() end,
+        })
+        if source == "output" then
+            if value.eof then
+                task_write({ exit_code = value.exit_code })
+                break
+            end
+            if value.replace then
+                task_replace(value.text)
+            elseif value.text ~= "" then
+                task_write(value.text)
+            end
         else
-            content = string.format("command exited with code %s and no output", tostring(result.exit_code))
+            if type(value) ~= "table" or type(value.text) ~= "string" then
+                task_write({ error = "input must be an object with text and optional enter" })
+            else
+                terminal:write(value.text .. (value.enter and "\r" or ""))
+            end
         end
-    elseif result.truncated then
-        content = content .. "\n[output truncated at the size limit]"
     end
-
-    return margatroid().json.encode({
-        ok = result.exit_code == 0,
-        content = content,
-    })
+    task_finish(context.task_id)
 end

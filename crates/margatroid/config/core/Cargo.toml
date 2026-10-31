@@ -1,0 +1,8 @@
+[package]
+name = "config_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+core_plugin = { path = "../../../mecs/core_plugin" }
+server_plugin = { path = "../../../mecs/server_plugin" }

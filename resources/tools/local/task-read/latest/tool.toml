@@ -1,0 +1,3 @@
+schema_version = 1
+name = "task_read"
+description = "Read new cached output and completion state from a tool task."

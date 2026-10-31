@@ -1,0 +1,6 @@
+visible_tools = ["review", "list_dir", "read_file", "read_image", "write_file", "edit", "grep", "glob", "bash", "task_read", "task_send", "task_finish"]
+sandbox = ["workspace_write"]
+
+[compaction]
+threshold = 0.8
+keep_messages = 16

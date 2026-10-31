@@ -1,17 +1,9 @@
 [package]
 name = "margatroid_protocol"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-core_plugin = { path = "../../mecs/core_plugin" }
-log_plugin = { path = "../../mecs/log_plugin" }
-margatroid_types = { path = "../types" }
-resource_id_plugin = { path = "../resource_id_plugin" }
-server_plugin = { path = "../../mecs/server_plugin" }
+base64 = "0.22"
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true }
-app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }

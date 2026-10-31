@@ -1,0 +1,31 @@
+[package]
+name = "agent_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+agent_core = { path = "../core" }
+workspace_core = { path = "../../workspace/core" }
+tool_core = { path = "../../tool/core" }
+inference_core = { path = "../../inference/core" }
+lua_runtime_core = { path = "../../lua_runtime/core" }
+mcl_core = { path = "../../mcl/core" }
+storage_core = { path = "../../storage/core" }
+agent_driver_core = { path = "../../agent_driver/core" }
+tool_resource_core = { path = "../../tool_resource/core" }
+prompt_resource_core = { path = "../../prompt_resource/core" }
+sandbox_resource_core = { path = "../../sandbox_resource/core" }
+address = { path = "../../address" }
+core_plugin = { path = "../../../mecs/core_plugin" }
+app_runtime_plugin = { path = "../../../mecs/app_runtime_plugin" }
+async_runtime_plugin = { path = "../../../mecs/async_runtime_plugin" }
+closure_plugin = { path = "../../../mecs/closure_plugin" }
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+futures-util = "0.3"
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+toml = "0.8"
+tokio-util = "0.7"

@@ -1,0 +1,1151 @@
+use agent_core::{Agent, AgentState, WorldAgentExt};
+use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
+use async_runtime_plugin::AsyncRuntimePlugin;
+use closure_plugin::{AppClosureExt, ClosurePlugin};
+use core_plugin::{App, Entity, World};
+use inference_core::*;
+use lua_runtime_core::*;
+use mcl_core::*;
+use mcl_plugin::{MclImportConfig, MclPlugin};
+use prompt_resource_core::{ImportPrompt, Prompts};
+use sandbox_resource_core::{ImportSandbox, Sandboxes, SelectedSandbox};
+use serde_json::{Value, json};
+use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use storage_core::{AgentStorage, StorageOperation, StorageValue, execute_storage, open_storage};
+use storage_plugin::StoragePlugin;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+use tool_core::{
+    ToolExecuteRequest, ToolExecuteResponse, ToolExecutionLimits, ToolTaskHandle, ToolTasks,
+};
+use tool_resource_core::{ImportTool, Tools};
+
+struct Fixture {
+    app: App,
+    owner: Entity,
+    client: Entity,
+    root: tempfile::TempDir,
+    next: usize,
+    inference: Arc<Mutex<Vec<InferenceRequest>>>,
+    auto_inference: Arc<AtomicBool>,
+    tools: Arc<Mutex<Vec<ToolExecuteRequest>>>,
+    imports: Arc<Mutex<Vec<String>>>,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let roots = MclImportConfig {
+            prompt_root: root.path().join("prompts"),
+            tool_root: root.path().join("tools"),
+            sandbox_root: root.path().join("sandboxes"),
+        };
+        for path in [&roots.prompt_root, &roots.tool_root, &roots.sandbox_root] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default())
+            .add_plugin(ClosurePlugin)
+            .add_closure_system(RuntimePlugin::UPDATE)
+            .add_plugin(AsyncRuntimePlugin)
+            .add_plugin(StoragePlugin::new())
+            .add_plugin(MclPlugin::new().with_import_config(roots));
+        let workspace = app.world_mut().spawn();
+        let owner = app.world_mut().spawn();
+        let client = app.world_mut().spawn();
+        let storage = open_storage(
+            &root.path().join("agent.sqlite"),
+            &root.path().join("settings.toml"),
+            "[compaction]\nthreshold = 0.8\n",
+        )
+        .unwrap();
+        app.world_mut().insert_component(owner, storage);
+        app.world_mut().insert_component(
+            owner,
+            Agent {
+                name: "test".into(),
+                workspace,
+                state: AgentState::Idle,
+                turn: None,
+            },
+        );
+        app.world_mut().insert_component(owner, MclQueue::default());
+        app.world_mut().insert_component(
+            owner,
+            AgentInferenceConfig {
+                parameters: InferenceParameters {
+                    model: "test/model".into(),
+                    temperature: Some(0.1),
+                    max_output_tokens: None,
+                    top_p: None,
+                    stop: vec![],
+                },
+            },
+        );
+        app.world_mut()
+            .insert_component(owner, ActiveInference::default());
+        app.world_mut().insert_component(owner, ToolTasks::new());
+        let inference = Arc::new(Mutex::new(Vec::new()));
+        let recorded = inference.clone();
+        let auto_inference = Arc::new(AtomicBool::new(true));
+        let automatic = auto_inference.clone();
+        app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
+            let requests = world
+                .event_reader::<InferenceRequest>()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            for request in requests {
+                recorded.lock().unwrap().push(request.clone());
+                if automatic.load(Ordering::Acquire)
+                    && let Some(sender) = request.reply.lock().unwrap().take()
+                {
+                    let _ = sender.send(Ok(response()));
+                }
+            }
+        });
+        let tools = Arc::new(Mutex::new(Vec::new()));
+        let recorded = tools.clone();
+        app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
+            let requests = world
+                .event_reader::<ToolExecuteRequest>()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            for request in requests {
+                recorded.lock().unwrap().push(request.clone());
+                let (handle, _input) =
+                    ToolTaskHandle::new(&ToolExecutionLimits::default()).unwrap();
+                handle.claim_return().unwrap();
+                world
+                    .get_component::<ToolTasks>(request.agent)
+                    .unwrap()
+                    .register(request.id.clone(), handle)
+                    .unwrap();
+                if let Some(sender) = request.reply.lock().unwrap().take() {
+                    let _ = sender.send(Ok(ToolExecuteResponse {
+                        call_id: request.call_id,
+                        alias: request.alias,
+                        content: request.arguments.to_string(),
+                        images: vec![],
+                        failed: false,
+                    }));
+                }
+            }
+        });
+        let imports = Arc::new(Mutex::new(Vec::new()));
+        let recorded = imports.clone();
+        app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
+            for request in world
+                .event_reader::<ImportPrompt>()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(format!("prompt:{}", request.alias));
+                if !world.contains_component::<Prompts>(request.owner) {
+                    world.insert_component(request.owner, Prompts::new());
+                }
+                world
+                    .get_component_mut::<Prompts>(request.owner)
+                    .unwrap()
+                    .insert(request.alias, request.path);
+                if let Some(sender) = request.reply.lock().unwrap().take() {
+                    let _ = sender.send(Ok(()));
+                }
+            }
+            for request in world
+                .event_reader::<ImportTool>()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(format!("tool:{}", request.alias));
+                if !world.contains_component::<Tools>(request.owner) {
+                    world.insert_component(request.owner, Tools::new());
+                }
+                world
+                    .get_component_mut::<Tools>(request.owner)
+                    .unwrap()
+                    .insert(request.alias, request.path);
+                if let Some(sender) = request.reply.lock().unwrap().take() {
+                    let _ = sender.send(Ok(()));
+                }
+            }
+            for request in world
+                .event_reader::<ImportSandbox>()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(format!("sandbox:{}", request.alias));
+                if !world.contains_component::<Sandboxes>(request.owner) {
+                    world.insert_component(request.owner, Sandboxes::new());
+                }
+                world
+                    .get_component_mut::<Sandboxes>(request.owner)
+                    .unwrap()
+                    .insert(request.alias, request.path);
+                if let Some(sender) = request.reply.lock().unwrap().take() {
+                    let _ = sender.send(Ok(()));
+                }
+            }
+        });
+        Self {
+            app,
+            owner,
+            client,
+            root,
+            next: 0,
+            inference,
+            auto_inference,
+            tools,
+            imports,
+        }
+    }
+
+    fn enqueue(
+        &mut self,
+        text: &str,
+        arguments: Vec<Value>,
+    ) -> oneshot::Receiver<Result<MclValue, MclError>> {
+        self.next += 1;
+        self.enqueue_as(
+            format!("command-{}", self.next),
+            self.client,
+            None,
+            self.owner,
+            text,
+            arguments,
+        )
+    }
+
+    fn enqueue_as(
+        &self,
+        id: String,
+        source: Entity,
+        source_instance: Option<String>,
+        target: Entity,
+        text: &str,
+        arguments: Vec<Value>,
+    ) -> oneshot::Receiver<Result<MclValue, MclError>> {
+        let (sender, receiver) = oneshot::channel();
+        self.app.world().send_event(MclCommand {
+            id,
+            source,
+            source_instance,
+            target,
+            instruction: MclInstruction {
+                text: text.into(),
+                arguments,
+            },
+            cancel: CancellationToken::new(),
+            reply: Arc::new(Mutex::new(Some(sender))),
+        });
+        receiver
+    }
+
+    async fn command(&mut self, text: &str, arguments: Vec<Value>) -> Result<MclValue, MclError> {
+        let mut receiver = self.enqueue(text, arguments);
+        drive(&mut self.app, &mut receiver).await
+    }
+
+    fn vm(&mut self, id: &str) -> oneshot::Receiver<Result<(), LuaRuntimeError>> {
+        let (sender, ready) = oneshot::channel();
+        let (_sender, ended) = oneshot::channel();
+        self.app.world_mut().insert_component(
+            self.owner,
+            DriverLuaVm {
+                instance: DriverLuaVmInstance {
+                    owner: self.owner,
+                    start_id: id.into(),
+                },
+                wake: DriverWakeSlot::shared(),
+                ready: Arc::new(Mutex::new(Some(sender))),
+                ended: Some(ended),
+                cancel: CancellationToken::new(),
+            },
+        );
+        ready
+    }
+
+    fn add_tool(&mut self, alias: &str) {
+        if !self.app.world().contains_component::<Tools>(self.owner) {
+            self.app
+                .world_mut()
+                .insert_component(self.owner, Tools::new());
+        }
+        self.app
+            .world_mut()
+            .get_component_mut::<Tools>(self.owner)
+            .unwrap()
+            .insert(alias.into(), self.root.path().join("unused-tool.toml"));
+    }
+
+    fn history(&self) -> Vec<storage_core::HistoryRecord> {
+        match execute_storage(
+            self.app
+                .world()
+                .get_component::<AgentStorage>(self.owner)
+                .unwrap(),
+            StorageOperation::ReadHistory,
+        )
+        .unwrap()
+        {
+            StorageValue::History(records) => records,
+            _ => panic!("history"),
+        }
+    }
+}
+
+async fn drive<T>(app: &mut App, receiver: &mut oneshot::Receiver<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.tick();
+        match receiver.try_recv() {
+            Ok(value) => return value,
+            Err(oneshot::error::TryRecvError::Closed) => panic!("request reply was lost"),
+            Err(oneshot::error::TryRecvError::Empty) => (),
+        }
+        assert!(Instant::now() < deadline, "request did not settle");
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn tick_until(app: &mut App, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        app.tick();
+        assert!(Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+}
+
+fn response() -> InferenceResponse {
+    InferenceResponse {
+        reasoning: Some("reason".into()),
+        content: Some("response".into()),
+        tool_calls: vec![],
+        replay: None,
+        usage: None,
+        stop_reason: InferenceStopReason::Completed,
+    }
+}
+
+fn messages(value: MclValue) -> Vec<Value> {
+    match value {
+        MclValue::Array(MessageArray::Message(messages)) => messages,
+        _ => panic!("message array"),
+    }
+}
+
+fn user(text: &str) -> Value {
+    json!({"type": "user", "content": text})
+}
+
+#[tokio::test]
+async fn message_blocks_reopen_without_clearing_and_self_inject_is_transactional() {
+    let mut fixture = Fixture::new();
+    fixture
+        .command("CREATE BLOCK session (conversation)", vec![])
+        .await
+        .unwrap();
+    fixture
+        .command(
+            "INJECT ? TO session.conversation",
+            vec![json!([user("first"), user("second")])],
+        )
+        .await
+        .unwrap();
+    fixture
+        .command("CREATE BLOCK session (conversation)", vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        messages(
+            fixture
+                .command("GET session.conversation[-1]", vec![])
+                .await
+                .unwrap()
+        ),
+        [user("second")]
+    );
+    fixture
+        .command(
+            "INJECT session.conversation[0] TO session.conversation[-1]",
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        messages(
+            fixture
+                .command("GET session.conversation", vec![])
+                .await
+                .unwrap()
+        ),
+        [user("first"), user("second"), user("first")]
+    );
+    assert_eq!(
+        fixture
+            .command(
+                "INJECT session.conversation[0] TO session.conversation[99]",
+                vec![]
+            )
+            .await
+            .unwrap_err()
+            .kind,
+        MclErrorKind::InvalidRange
+    );
+    assert_eq!(
+        messages(
+            fixture
+                .command("GET session.conversation", vec![])
+                .await
+                .unwrap()
+        )
+        .len(),
+        3
+    );
+    fixture
+        .command("INJECT [] TO session.conversation[0,2]", vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        messages(
+            fixture
+                .command("GET session.conversation", vec![])
+                .await
+                .unwrap()
+        ),
+        [user("first")]
+    );
+    assert!(fixture.history().iter().all(|record| record.kind == "mcl"));
+}
+
+#[tokio::test]
+async fn temporary_blocks_are_vm_scoped_and_permanent_blocks_are_fallbacks() {
+    let mut fixture = Fixture::new();
+    let _ready = fixture.vm("first");
+    fixture
+        .command("CREATE TEMP BLOCK entry (pending)", vec![])
+        .await
+        .unwrap();
+    fixture
+        .command("CREATE BLOCK session (conversation)", vec![])
+        .await
+        .unwrap();
+    fixture
+        .command(
+            "INJECT ? TO entry.pending",
+            vec![json!([user("temporary")])],
+        )
+        .await
+        .unwrap();
+    fixture
+        .command(
+            "INJECT ? TO session.conversation",
+            vec![json!([user("persistent")])],
+        )
+        .await
+        .unwrap();
+    let _ready = fixture.vm("second");
+    assert_eq!(
+        fixture
+            .command("GET entry.pending", vec![])
+            .await
+            .unwrap_err()
+            .kind,
+        MclErrorKind::StorageFailed
+    );
+    fixture
+        .command("CREATE TEMP BLOCK entry (pending)", vec![])
+        .await
+        .unwrap();
+    assert!(messages(fixture.command("GET entry.pending", vec![]).await.unwrap()).is_empty());
+    assert_eq!(
+        messages(
+            fixture
+                .command("GET session.conversation", vec![])
+                .await
+                .unwrap()
+        ),
+        [user("persistent")]
+    );
+}
+
+#[tokio::test]
+async fn config_preserves_typed_values_and_failed_writes_leave_previous_file() {
+    let mut fixture = Fixture::new();
+    for (path, value) in [
+        ("visible_tools", json!(["bash", "read_file"])),
+        ("limits.tokens", json!(2048)),
+        ("limits.enabled", json!(true)),
+        ("limits.ratio", json!(0.5)),
+    ] {
+        fixture
+            .command("CONFIG SET ? ?", vec![json!(path), value])
+            .await
+            .unwrap();
+    }
+    fixture
+        .command(
+            "CONFIG SET ? ?",
+            vec![json!("literal_date"), json!("1979-05-27")],
+        )
+        .await
+        .unwrap();
+    let datetime = toml::Value::Datetime("1979-05-27T07:32:00Z".parse().unwrap());
+    fixture
+        .command(
+            "CONFIG SET ? ?",
+            vec![
+                json!("typed_datetime"),
+                serde_json::to_value(&datetime).unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+    let MclValue::Config(config) = fixture.command("CONFIG GET", vec![]).await.unwrap() else {
+        panic!("config");
+    };
+    assert_eq!(config["typed_datetime"], datetime);
+    assert_eq!(config["limits"]["tokens"].as_integer(), Some(2048));
+    assert_eq!(config["literal_date"].as_str(), Some("1979-05-27"));
+    assert_eq!(
+        fixture
+            .command(
+                "CONFIG SET ? ?",
+                vec![json!("limits.tokens.child"), json!(1)]
+            )
+            .await
+            .unwrap_err()
+            .kind,
+        MclErrorKind::ConfigTypeMismatch
+    );
+    assert_eq!(
+        fixture
+            .command("CONFIG SET ? ?", vec![json!("null"), Value::Null])
+            .await
+            .unwrap_err()
+            .kind,
+        MclErrorKind::ConfigTypeMismatch
+    );
+    fixture
+        .command("CONFIG DELETE ?", vec![json!("limits.tokens")])
+        .await
+        .unwrap();
+    fixture
+        .command("CONFIG DELETE ?", vec![json!("missing.key")])
+        .await
+        .unwrap();
+    let MclValue::Config(config) = fixture.command("CONFIG GET", vec![]).await.unwrap() else {
+        panic!("config");
+    };
+    assert!(config["limits"].as_table().unwrap().get("tokens").is_none());
+    assert_eq!(config["limits"]["enabled"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+async fn imports_validate_dependencies_kind_and_cross_category_aliases_and_reread_prompts() {
+    let mut fixture = Fixture::new();
+    let prompt = fixture.root.path().join("prompts/local/soul/latest");
+    fs::create_dir_all(&prompt).unwrap();
+    fs::write(prompt.join("prompt.toml"), "role = 'system'\n").unwrap();
+    fs::write(prompt.join("content.md"), "original prompt").unwrap();
+    let tool = fixture.root.path().join("tools/local/bash/latest");
+    fs::create_dir_all(&tool).unwrap();
+    fs::write(tool.join("tool.toml"), "schema_version = 1\n").unwrap();
+    let sandbox = fixture.root.path().join("sandboxes/local/policy/latest");
+    fs::create_dir_all(&sandbox).unwrap();
+    fs::write(sandbox.join("policy.json"), "{}").unwrap();
+    fixture
+        .app
+        .world_mut()
+        .get_component_mut::<MclQueue>(fixture.owner)
+        .unwrap()
+        .allowed_imports = vec![
+        "prompt:local/soul".into(),
+        "tool:local/bash:latest".into(),
+        "sandbox:local/policy".into(),
+    ];
+    fixture
+        .command("IMPORT MESSAGE prompt:local/soul:latest AS soul", vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .command("IMPORT TOOL tool:local/bash AS soul", vec![])
+            .await
+            .unwrap_err()
+            .kind,
+        MclErrorKind::AliasConflict
+    );
+    assert_eq!(
+        fixture
+            .command("IMPORT TOOL prompt:local/soul AS other", vec![])
+            .await
+            .unwrap_err()
+            .kind,
+        MclErrorKind::ImportDenied
+    );
+    assert_eq!(
+        fixture
+            .command("IMPORT TOOL tool:local/undeclared AS other", vec![])
+            .await
+            .unwrap_err()
+            .kind,
+        MclErrorKind::ImportDenied
+    );
+    fixture
+        .command("IMPORT TOOL tool:local/bash AS bash", vec![])
+        .await
+        .unwrap();
+    fixture
+        .command("IMPORT SANDBOX sandbox:local/policy AS safe", vec![])
+        .await
+        .unwrap();
+    fixture
+        .command("EFFECT sandbox_use ?", vec![json!(["safe"])])
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get_component::<SelectedSandbox>(fixture.owner)
+            .unwrap()
+            .alias
+            .as_deref(),
+        Some("safe")
+    );
+    fixture
+        .command("EFFECT sandbox_use ?", vec![json!([])])
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .app
+            .world()
+            .get_component::<SelectedSandbox>(fixture.owner)
+            .unwrap()
+            .alias
+            .is_none()
+    );
+    fixture
+        .command("CREATE BLOCK session (conversation)", vec![])
+        .await
+        .unwrap();
+    fixture
+        .command(
+            "INJECT ? TO session.conversation",
+            vec![json!([user("stored")])],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        messages(
+            fixture
+                .command(
+                    "GET session.conversation, soul, session.conversation",
+                    vec![]
+                )
+                .await
+                .unwrap()
+        ),
+        [
+            user("stored"),
+            json!({"type": "system", "content": "original prompt"}),
+            user("stored")
+        ]
+    );
+    fs::write(prompt.join("content.md"), "updated prompt").unwrap();
+    assert_eq!(
+        messages(fixture.command("GET soul", vec![]).await.unwrap())[0]["content"],
+        "updated prompt"
+    );
+    assert_eq!(fixture.imports.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn inference_converts_legacy_message_shapes_and_excludes_cancelled_assistants() {
+    let mut fixture = Fixture::new();
+    fixture.add_tool("bash");
+    fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    let input = json!([user("question"), {"type": "assistant", "content": null, "tool_calls": [{"id": "call", "tool_name": "bash", "arguments": "{\"x\":1}"}]}, {"type": "tool_call", "tool_call_id": "call", "tool_name": "bash", "content": "done", "failed": false}, {"type": "assistant", "content": "cancelled fragment", "stop_reason": "cancelled"}]);
+    let result = fixture
+        .command("EFFECT inference ? ?", vec![input, json!(["bash"])])
+        .await
+        .unwrap();
+    let MclValue::Inference {
+        message,
+        stop_reason,
+    } = result
+    else {
+        panic!("inference");
+    };
+    assert_eq!(message["content"], "response");
+    assert_eq!(stop_reason, "completed");
+    let records = fixture.inference.lock().unwrap().clone();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].messages.len(), 3);
+    assert!(
+        matches!(&records[0].messages[1], InferenceMessage::Assistant { tool_calls, .. } if tool_calls[0].name == "bash" && tool_calls[0].arguments == json!({"x": 1}))
+    );
+    assert!(
+        matches!(&records[0].messages[2], InferenceMessage::Tool { call_id, .. } if call_id == "call")
+    );
+    drop(records);
+    fixture.command("EFFECT finish_turn", vec![]).await.unwrap();
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get_component::<Agent>(fixture.owner)
+            .unwrap()
+            .state,
+        AgentState::Idle
+    );
+}
+
+#[tokio::test]
+async fn no_turn_returns_normal_cancelled_results_without_submitting_domains() {
+    let mut fixture = Fixture::new();
+    let result = fixture
+        .command(
+            "EFFECT inference ? ?",
+            vec![json!([user("question")]), json!([])],
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, MclValue::Inference { stop_reason, .. } if stop_reason == "cancelled")
+    );
+    let calls = json!([{"type": "assistant", "content": null, "tool_calls": [{"id": "call", "tool_name": "bash", "arguments": "{}"}]}]);
+    let result = messages(
+        fixture
+            .command("EFFECT tool_call ? ?", vec![calls, json!(["bash"])])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result[0]["content"], "Tool call aborted.");
+    assert_eq!(result[0]["tool_call_id"], "call");
+    assert!(fixture.inference.lock().unwrap().is_empty());
+    assert!(fixture.tools.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tool_results_preserve_order_and_return_without_waiting_for_tool_vm_end() {
+    let mut fixture = Fixture::new();
+    fixture.add_tool("bash");
+    fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    let calls = json!([{"type": "assistant", "content": null, "tool_calls": [{"id": "first", "tool_name": "bash", "arguments": "{\"n\":1}"}, {"id": "hidden", "tool_name": "private", "arguments": "{}"}, {"id": "last", "tool_name": "bash", "arguments": "{\"n\":2}"}]}]);
+    let results = messages(
+        fixture
+            .command("EFFECT tool_call ? ?", vec![calls, json!(["bash"])])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|value| value["tool_call_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["first", "hidden", "last"]
+    );
+    assert_eq!(results[1]["content"], "tool not visible");
+    assert_eq!(results[1]["failed"], true);
+    let tasks = fixture
+        .app
+        .world()
+        .get_component::<ToolTasks>(fixture.owner)
+        .unwrap();
+    assert_eq!(tasks.list().len(), 2);
+    assert!(tasks.list().iter().all(|(_, task)| !task.is_completed()));
+    fixture.command("EFFECT finish_turn", vec![]).await.unwrap();
+    assert!(
+        fixture
+            .app
+            .world()
+            .get_component::<ToolTasks>(fixture.owner)
+            .unwrap()
+            .list()
+            .iter()
+            .all(|(_, task)| !task.cancel_token().is_cancelled())
+    );
+}
+
+#[tokio::test]
+async fn fifo_waits_for_domain_reply_while_other_agents_keep_progressing() {
+    let mut fixture = Fixture::new();
+    fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    fixture.auto_inference.store(false, Ordering::Release);
+    let mut first = fixture.enqueue(
+        "EFFECT inference ? ?",
+        vec![json!([user("question")]), json!([])],
+    );
+    let mut queued = fixture.enqueue("CONFIG SET ? ?", vec![json!("ordered"), json!(true)]);
+    let recorded = fixture.inference.clone();
+    tick_until(&mut fixture.app, || !recorded.lock().unwrap().is_empty()).await;
+    assert!(queued.try_recv().is_err());
+    let workspace = fixture
+        .app
+        .world()
+        .get_component::<Agent>(fixture.owner)
+        .unwrap()
+        .workspace;
+    let other = fixture.app.world_mut().spawn();
+    fixture.app.world_mut().insert_component(
+        other,
+        Agent {
+            name: "other".into(),
+            workspace,
+            state: AgentState::Idle,
+            turn: None,
+        },
+    );
+    let shared_storage = fixture
+        .app
+        .world()
+        .get_component::<AgentStorage>(fixture.owner)
+        .unwrap()
+        .clone();
+    fixture
+        .app
+        .world_mut()
+        .insert_component(other, shared_storage);
+    let mut other_reply = fixture.enqueue_as(
+        "other-read".into(),
+        fixture.client,
+        None,
+        other,
+        "CONFIG GET",
+        vec![],
+    );
+    assert!(matches!(
+        drive(&mut fixture.app, &mut other_reply).await.unwrap(),
+        MclValue::Config(_)
+    ));
+    let request = fixture.inference.lock().unwrap()[0].clone();
+    request
+        .reply
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .send(Ok(response()))
+        .unwrap();
+    drive(&mut fixture.app, &mut first).await.unwrap();
+    drive(&mut fixture.app, &mut queued).await.unwrap();
+}
+
+#[tokio::test]
+async fn closing_queue_cancels_domain_and_waits_for_reply_before_drain() {
+    let mut fixture = Fixture::new();
+    fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    fixture.auto_inference.store(false, Ordering::Release);
+    let mut first = fixture.enqueue(
+        "EFFECT inference ? ?",
+        vec![json!([user("question")]), json!([])],
+    );
+    let mut queued = fixture.enqueue("CONFIG SET ? ?", vec![json!("must_not_exist"), json!(true)]);
+    let recorded = fixture.inference.clone();
+    tick_until(&mut fixture.app, || !recorded.lock().unwrap().is_empty()).await;
+    let drain = fixture.app.world().mcl_drain(fixture.owner).unwrap();
+    fixture.app.world_mut().mcl_close(fixture.owner).unwrap();
+    let request = fixture.inference.lock().unwrap()[0].clone();
+    assert!(request.cancel.is_cancelled());
+    let mut waiting = Box::pin(drain.wait());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(5), &mut waiting)
+            .await
+            .is_err()
+    );
+    request
+        .reply
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .send(Ok(InferenceResponse::cancelled()))
+        .unwrap();
+    drive(&mut fixture.app, &mut first).await.unwrap();
+    assert_eq!(
+        drive(&mut fixture.app, &mut queued).await.unwrap_err().kind,
+        MclErrorKind::Cancelled
+    );
+    waiting.await.unwrap();
+    let storage = fixture
+        .app
+        .world()
+        .get_component::<AgentStorage>(fixture.owner)
+        .unwrap();
+    let StorageValue::Config(config) =
+        execute_storage(storage, StorageOperation::ReadConfig).unwrap()
+    else {
+        panic!("config");
+    };
+    assert!(!config.contains_key("must_not_exist"));
+    assert_eq!(
+        fixture
+            .command("CONFIG GET", vec![])
+            .await
+            .unwrap_err()
+            .kind,
+        MclErrorKind::Closed
+    );
+}
+
+#[tokio::test]
+async fn ready_requires_current_self_vm_and_wake_uses_current_slot() {
+    let mut fixture = Fixture::new();
+    let ready = fixture.vm("current");
+    fixture
+        .app
+        .world_mut()
+        .get_component_mut::<Agent>(fixture.owner)
+        .unwrap()
+        .state = AgentState::Starting;
+    assert_eq!(
+        fixture
+            .command("EFFECT ready", vec![])
+            .await
+            .unwrap_err()
+            .kind,
+        MclErrorKind::SourceInvalid
+    );
+    let mut stale = fixture.enqueue_as(
+        "stale".into(),
+        fixture.owner,
+        Some("old".into()),
+        fixture.owner,
+        "EFFECT ready",
+        vec![],
+    );
+    assert_eq!(
+        drive(&mut fixture.app, &mut stale).await.unwrap_err().kind,
+        MclErrorKind::SourceInvalid
+    );
+    let mut valid = fixture.enqueue_as(
+        "ready".into(),
+        fixture.owner,
+        Some("current".into()),
+        fixture.owner,
+        "EFFECT ready",
+        vec![],
+    );
+    drive(&mut fixture.app, &mut valid).await.unwrap();
+    ready.await.unwrap().unwrap();
+    fixture
+        .app
+        .world_mut()
+        .get_component_mut::<Agent>(fixture.owner)
+        .unwrap()
+        .state = AgentState::Idle;
+    fixture.command("EFFECT wake", vec![]).await.unwrap();
+    let slot = fixture
+        .app
+        .world()
+        .get_component::<DriverLuaVm>(fixture.owner)
+        .unwrap()
+        .wake
+        .clone();
+    DriverWakeSlot::wait(slot).await.unwrap();
+}
+
+#[tokio::test]
+async fn finish_turn_waits_for_real_inference_task_and_keeps_abort_control() {
+    let mut fixture = Fixture::new();
+    fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    let turn = fixture
+        .app
+        .world()
+        .get_component::<Agent>(fixture.owner)
+        .unwrap()
+        .turn
+        .clone()
+        .unwrap();
+    let (release, waiting) = oneshot::channel();
+    let cancel = CancellationToken::new();
+    fixture
+        .app
+        .world_mut()
+        .get_component_mut::<ActiveInference>(fixture.owner)
+        .unwrap()
+        .current = Some(InferenceHandle {
+        request_id: "active".into(),
+        turn: turn.clone(),
+        cancel: cancel.clone(),
+        stop_stream: Arc::new(|| {}),
+        task: tokio::spawn(async move {
+            waiting.await.unwrap();
+        }),
+    });
+    let mut reply = fixture.enqueue("EFFECT finish_turn", vec![]);
+    for _ in 0..20 {
+        fixture.app.tick();
+        tokio::task::yield_now().await;
+    }
+    assert!(reply.try_recv().is_err());
+    fixture
+        .app
+        .world()
+        .get_component::<ActiveInference>(fixture.owner)
+        .unwrap()
+        .current
+        .as_ref()
+        .unwrap()
+        .cancel();
+    assert!(cancel.is_cancelled());
+    fixture
+        .app
+        .world_mut()
+        .agent_abort_turn(fixture.owner, &turn)
+        .unwrap();
+    release.send(()).unwrap();
+    drive(&mut fixture.app, &mut reply).await.unwrap();
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get_component::<Agent>(fixture.owner)
+            .unwrap()
+            .state,
+        AgentState::Idle
+    );
+    assert!(
+        fixture
+            .app
+            .world()
+            .get_component::<ActiveInference>(fixture.owner)
+            .unwrap()
+            .current
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn history_append_records_messages_once_and_keeps_command_audits_separate() {
+    let mut fixture = Fixture::new();
+    fixture
+        .command(
+            "EFFECT history_append ?",
+            vec![json!([user("one"), user("two")])],
+        )
+        .await
+        .unwrap();
+    let records = fixture.history();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.kind == "message")
+            .count(),
+        2
+    );
+    assert_eq!(
+        records.iter().filter(|record| record.kind == "mcl").count(),
+        1
+    );
+    let payloads = records
+        .iter()
+        .filter(|record| record.kind == "message")
+        .map(|record| record.payload.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(payloads, [user("one"), user("two")]);
+    assert_eq!(
+        fixture
+            .command(
+                "EFFECT history_append ?",
+                vec![json!([{"type": "unknown"}])]
+            )
+            .await
+            .unwrap_err()
+            .kind,
+        MclErrorKind::InvalidMessage
+    );
+    assert_eq!(
+        fixture
+            .history()
+            .iter()
+            .filter(|record| record.kind == "message")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn rejects_duplicate_inflight_ids_and_allows_same_id_after_completion() {
+    let mut fixture = Fixture::new();
+    let mut first = fixture.enqueue_as(
+        "same".into(),
+        fixture.client,
+        None,
+        fixture.owner,
+        "CONFIG GET",
+        vec![],
+    );
+    let mut duplicate = fixture.enqueue_as(
+        "same".into(),
+        fixture.client,
+        None,
+        fixture.owner,
+        "CONFIG GET",
+        vec![],
+    );
+    assert_eq!(
+        drive(&mut fixture.app, &mut duplicate)
+            .await
+            .unwrap_err()
+            .kind,
+        MclErrorKind::ParseFailed
+    );
+    drive(&mut fixture.app, &mut first).await.unwrap();
+    let mut next = fixture.enqueue_as(
+        "same".into(),
+        fixture.client,
+        None,
+        fixture.owner,
+        "CONFIG SET ? ?",
+        vec![json!("repeat"), json!(true)],
+    );
+    drive(&mut fixture.app, &mut next).await.unwrap();
+}
+
+#[tokio::test]
+async fn reusing_a_completed_request_id_creates_distinct_background_task_addresses() {
+    let mut fixture = Fixture::new();
+    fixture.add_tool("bash");
+    fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    for _ in 0..2 {
+        let calls = json!([{"type":"assistant","tool_calls":[{"id":"call","tool_name":"bash","arguments":"{}"}]}]);
+        let mut receiver = fixture.enqueue_as(
+            "reused".into(),
+            fixture.client,
+            None,
+            fixture.owner,
+            "EFFECT tool_call ? ?",
+            vec![calls, json!(["bash"])],
+        );
+        drive(&mut fixture.app, &mut receiver).await.unwrap();
+    }
+    let tasks = fixture
+        .app
+        .world()
+        .get_component::<ToolTasks>(fixture.owner)
+        .unwrap()
+        .list();
+    assert_eq!(tasks.len(), 2);
+    assert_ne!(tasks[0].0, tasks[1].0);
+}
