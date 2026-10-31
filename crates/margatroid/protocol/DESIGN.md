@@ -44,34 +44,32 @@ WorkspaceReferenceDto
     name: String
     project_root: String
 WorkspaceDefinitionDto
-    id/name/project_root
+    name/project_root
     agents: Vec<WorkspaceAgentDefinitionDto>
 WorkspaceAgentDefinitionDto
-    id/name/driver/home_root
+    name/driver/home_root
     不包含manager、数据库路径或运行状态
+WorkspaceConfigDto
+    path: String
+    cache: WorkspaceDefinitionDto
 WorkspaceInfoDto
     id/name/project_root
     agents: Vec<AddressDto>
     member_failures: Vec<{agent,driver,error}>，空省略
 BackendStateDto
-    workspace_definitions: Vec<WorkspaceDefinitionDto>--启动时加载的内存配置
+    workspace_definitions: Vec<WorkspaceConfigDto>--路径和展示缓存，不能用于启动
     workspaces: Vec<WorkspaceInfoDto>，真实运行实例
     agents: Vec<AgentStateDto>
     histories: Vec<AgentHistoryDto>
-    drivers: Vec<AddressDto>，缺字段默认[]，空可省略
 AgentStateDto
     workspace/agent/agent_instance
-    status: creating|idle|working|stopping
+    status: starting|idle|working|restarting|stopping
     turn: Option<String>
-    sandbox: Option<AddressDto>
+    sandbox: Option<String>--选中的沙箱alias
     queued_commands/pending_command
     context_window_tokens: Option<u64>
     error: Option<ProtocolErrorDto>
-ProjectDirectoryPageDto
-    path: 规范绝对目录
-    parent: Option<规范绝对目录>
-    directories: Vec<{name,path}>
-    next_cursor: Option<String>
+
 ```
 
 ```text
@@ -82,7 +80,7 @@ AgentMessageDto
     Assistant {reasoning:Option<String>,content:Option<String>,
                replay:Option<Value>,tool_calls:Vec<ToolCallDto>,
                usage:Option<TokenUsageDto>,stop_reason:Option<StopReasonDto>}
-    ToolCall {resource_id:Option<AddressDto>,tool_call_id,tool_name,
+    ToolCall {tool_call_id,tool_name,
               content:String,images:Vec<UserImageDto>,failed:bool}
     Error {message:String}
 MclCommandDto
@@ -94,6 +92,25 @@ HistoryMessageDto
 StreamDelta（wire契约，无需虚构同名Rust结构体）
     type为agent.message.delta或agent.message.reasoning_delta
     id/agent/agent_instance/sequence/content，无kind字段
+```
+
+```text
+WorkspaceStartDto / WorkspaceRestartDto
+    path: String--后端定义文件路径，启动和重启都重新读取
+WorkspaceStopDto
+    workspace: AddressDto
+AgentStartDto / AgentRestartDto
+    workspace: AddressDto
+    name: String
+    parameters: AgentStartParametersDto--新Driver定位字符串与启动参数，不能从旧实例回填
+AgentStartParametersDto
+    driver: String
+    home_root: String
+AgentTurnAbortDto
+    workspace: AddressDto
+    agent: AddressDto
+    agent_instance: String
+    turn_id: String
 ```
 
 # error

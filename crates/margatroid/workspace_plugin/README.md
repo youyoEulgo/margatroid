@@ -6,19 +6,19 @@ workspace_core定义Workspace组件、状态、事件、定义和专属线程能
 
 Margatroid启动时传入配置根目录，调用WorkspacePlugin::open读取并校验全部工作区定义，再安装插件。文件读取在安装前同步完成，失败直接返回启动入口；build只安装已加载的WorkspaceDefinitions Resource和System，不隐藏文件IO。
 
-WorkspaceDefinitions由workspace_core定义，以BTreeMap保存名称到WorkspaceDefinition的映射；workspace_plugin负责加载和安装。列出Workspace同步读取该Resource，不发事件、不提交异步任务、不扫描磁盘。Resource只保存配置，不包含运行Entity、生命周期、revision或错误缓存。
+WorkspaceDefinitions保存定义文件路径和展示用解析缓存，启动Margatroid时加载一次。前端列表和详情同步读取缓存，不为展示查询发送领域事件或扫描磁盘。
 
-磁盘配置变化通过Margatroid统一重载，由Workspace加载入口重新读取并完整校验后替换Resource；Workspace不提供独立刷新或配置修改流程。
+StartWorkspace与RestartWorkspace使用相同字段：id、path。每次启动或重启都重新读取path指向的文件并解析；解析成功后更新展示缓存，同时将本次解析值直接用于生命周期流程。不得从缓存启动，读取失败不得用旧缓存兜底；原展示缓存可以保留。
 
-启动使用已加载的内存定义，不重新读取workspace.yaml。Workspace保存名称、项目路径、状态和成员Entity集合；Address及WorkspaceExecutor独立挂载，内部关联使用完整Entity。尚未启动的配置项不创建占位Entity。
+重启先读取、校验新定义，再关闭旧实例并用本次定义启动。定义解析由异步闭包完成，Handler克隆缓存的Arc句柄给闭包，解析成功后短写锁更新；锁不跨await，不借用World。运行Workspace仅保存定义文件路径作为运行关联，不保存另一份定义缓存；Address及执行器独立挂载。
 
 ## 生命周期
 
-状态为Starting、Running、Restarting、Stopping。关闭和重启仅在Running时受理，同步修改状态并关闭新任务与成员创建受理；其他状态拒绝新操作。
+状态为Starting、Running、Restarting、Stopping。关闭和重启仅在Running时受理，同步修改状态并关闭新任务与成员创建受理；其他状态拒绝新操作。Workspace重启还检查全部成员的工具任务，存在未完成任务直接拒绝，不自动取消它们。
 
 同一Schedule依次挂载停止、重启、启动System，直接使用mecs添加顺序。System只收集事件并路由，闭包直接返回Result，不增加结果包装事件。
 
-启动创建Workspace实体及专属线程，再启动配置中的成员。成员失败不抹除成功成员；线程建立且成员请求收口后进入Running，并返回成员诊断。
+启动创建Workspace实体及专属线程，再按本次文件解析结果逐成员发送带oneshot回复端的StartAgent；闭包等待Agent完整启动回复后继续。成员失败不抹除成功成员；线程建立且成员请求收口后进入Running，并返回成员诊断。
 
 关闭等待已受理成员创建收口，停止全部Agent并等待活动及MCL清理，最后退出并join专属线程。全部完成后销毁Workspace；清理未确认时保留宿主并报告失败。重启复用关闭和启动流程，全程Restarting，旧线程退出后才创建新线程。
 

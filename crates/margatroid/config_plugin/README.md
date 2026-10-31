@@ -1,41 +1,22 @@
-# ConfigPlugin
+# Config
 
-`ConfigPlugin` 读取 Margatroid 主目录的 `config.toml`，校验Server监听地址、入口策略以及日志、后端状态
-两类 WebSocket 目标，并把不可变 `MargatroidConfig` 插入 World。组合根使用
-监听地址与入口策略构造ServerPlugin；DtoPlugin只读取该Resource，不自行读取配置文件。
+config_core定义MargatroidConfig和配置值，只依赖mecs及通用库。config_plugin读取并校验config.toml，安装Resource，不依赖其他领域core或plugin，不创建System、查询事件或文件监听。
 
 ```toml
 [server]
 bind = "127.0.0.1:3939"
 allow = "localhost"
 
+[log]
+level = "info"
+
 [outbound]
 logs = ["type:cli", "type:webui"]
 backend_state = ["type:webui"]
 ```
 
-模型路由只在 `~/.margatroid/models.toml` 配置，加载/重载、provider/api_type组合、凭据与API前缀校验归InferencePlugin。本crate不复制路由配置或依赖其执行实现；本次没有检查或修改主目录私有配置，不宣称已有路由已迁移。
+ConfigPlugin::open在启动阶段读取，build只发布已校验值。filter若提供须非空，完整替代level；tracing表达式由应用装配日志设施时校验。日志目标决定已产生记录的投递，不改变过滤条件。
 
-可选日志配置为：
+allow缺省localhost，支持all或IP/CIDR数组；回环bind不能搭配放行非回环的策略。带Origin的请求要求Host同源。目标支持broadcast、type和name，两组均非空且各自不重复。入口策略不等于客户端身份认证。
 
-```toml
-[log]
-level = "info"
-# filter = "warn,margatroid=debug"
-```
-
-`level` 接受 `off/error/warn/info/debug/trace`，缺省为 `info`；`filter` 若提供须非空，语法由log_plugin的EnvFilter在装配时校验。filter完整替代level指令，例如level为debug而filter为warn时按warn过滤，不叠加debug。日志流仍受实际tracing过滤器控制，出站目标只决定已产生记录的去向。
-
-`[outbound]` 仅接受 `logs` 与 `backend_state`；旧 `member_messages`、`streaming_member_messages` 已删除，会作为未知字段拒绝。推理增量与命令关联回执由运行时身份和请求上下文路由，不新增出站配置类别。
-
-本文只读核对源码，未运行构建或测试；DTO Handler 重置后的整树恢复未验证，不能据此认定catalog或生命周期端到端已恢复。
-
-`server.allow` 是入口策略，缺省为 `"localhost"`：只接受回环对端，并且带 `Origin` 的请求要求其
-authority 与 `Host` 一致。也可以写 `"all"`（需同时放宽 `bind`）或 IP/CIDR 数组。策略由
-`IngressPolicy` 实现 ServerPlugin 的 `HandshakeGuard` 接缝，因此业务词表留在本 crate，
-基础设施只接收判定结果。`allow` 放宽而 `bind` 仍为回环、数组里出现 `0.0.0.0/0` 或裸 `0.0.0.0`、
-未知标量都会在加载期失败，不会静默放宽。
-
-`server.bind` 必须是完整的Socket地址。目标支持 `broadcast`、`type:<连接类型>` 和
-`name:<连接名称>`。两个字段都必须至少包含一个目标，同一字段不能重复目标，未知字段和未知目标
-前缀会导致配置加载失败。
+模型路由归Inference，Workspace路径与展示缓存归Workspace，Agent settings.toml归Storage。Config不复制这些定义或充当万能配置表。各plugin在边界转换OutboundTarget，不让config_core引用DTO契约。整体重载不在此定义独立流程。

@@ -6,22 +6,32 @@ agent_core定义Agent自身组件、生命周期状态、事件和错误，只�
 
 状态为Starting、Idle、Working、Restarting、Stopping。Handler在一次同步调用中检查状态白名单并切换状态，随后提交异步闭包。
 
-Idle允许开始回合、关闭和重启；Working允许结束回合、中止、关闭和重启。Starting、Restarting、Stopping只允许当前操作的步骤及结果，拒绝其他生命周期请求。重复关闭和重启不合并、不抢占在途流程。
+Idle允许开始回合、关闭和重启；Working允许结束回合、中止、关闭和重启。Starting、Restarting、Stopping只允许当前操作的步骤及结果，拒绝其他生命周期请求。重复关闭和重启不合并、不抢占在途流程。有未完成工具任务时同步拒绝重启，不自动结束任务后重启。
 
 stop_agent_system、restart_agent_system、start_agent_system依次挂载于同一Schedule，直接使用mecs按添加顺序同步执行的机制。同帧关闭优先于重启；先受理者同步修改状态，后者按白名单拒绝。不增加统一生命周期事件、排序队列或手写优先级分发器。优先级不取消前一帧已受理的操作。
 
+## 请求
+
+StartAgent和RestartAgent使用相同字段：id、workspace Entity、name、AgentStartParameters、oneshot reply。启动创建Entity；重启在指定Workspace内按名称定位成员，随后固定使用完整Entity。两者均使用请求中的新启动参数，完整结束后通过原reply返回，不另发启动或重启结果事件。
+
 ## 异步流程
 
-启动受理后先创建Entity并挂载基础组件，再由闭包顺序完成数据库准备、运行组件初始化及Driver启动。需要World或其他领域执行的步骤发送带oneshot的请求，回复后才执行下一步。闭包不跨await借用World。启停及重启闭包直接返回Result<对应Output, 对应Error>，由mecs异步结果机制交给对应System，不额外定义FlowResult或结果包装事件；公共Agent结果事件只用于最终回执。
+启动受理后先创建Entity并挂载基础组件，再由闭包使用请求携带的Driver定位字符串调用address文件定位，直接调用agent_driver_core读取文件，然后完成数据库、设置、运行组件初始化及VM启动。Driver不登记路径或正文缓存。Agent只准备agent_info等启动数据，不构造mcl或wait函数；Lua Runtime安装本次宿主绑定。需要World或其他领域执行的步骤发送带oneshot的请求，回复后才执行下一步。闭包不跨await借用World。启停及重启闭包直接返回Result<对应Output, 对应Error>，由mecs异步结果机制交给对应System，不额外定义FlowResult或结果包装事件；启动结果Handler通过原StartAgent.reply回复Workspace闭包，启停和重启均使用原reply，不增加公共结果中转事件。
 
 关闭受理时同步关闭新操作受理。关闭闭包请求Driver停止和执行取消，等待活动真实退出及MCL收口；结果Handler确认后销毁Entity。
 
-重启闭包依次复用stop_flow和start_flow，全程保持Restarting。内部stop_flow不销毁协调Entity，不发送公开启停请求。重新启动时读取Driver文件，使用新的VM实例关联。
+重启闭包依次复用stop_flow和start_flow，全程保持Restarting。内部stop_flow不销毁协调Entity，不发送公开启停请求。重新启动时使用请求提供的parameters重新定位并读取Driver文件，使用新的VM实例关联。
 
 每个步骤和最终结果核对完整Entity及对应生命周期状态。oneshot关闭或闭包异常不是清理完成证明；无法确认清理时保留宿主，发送失败结果。启动或重启成功转Idle，关闭成功销毁Entity；启动或重启失败且清理完成时销毁Entity。
 
+## 运行组件初始化
+
+Agent启动闭包在原有运行组件准备阶段同一轮发送InitToolTasks和InitInference，再用tokio::join!等待两个oneshot；与原有资源初始化一起完成，全部成功后才启动Driver。任何一项失败也先收齐另一项结果，再统一处理启动失败。重启复用同一启动流程。
+
+InitToolTasks由tool_plugin挂载空ToolTasks，InitInference由inference_plugin挂载current=None的ActiveInference。Agent只依赖这两个领域core中的事件契约，不直接创建对应组件，不新增统一execution组件或System。
+
 ## 数据归属
 
-Agent只保存名称、Workspace Entity、生命周期状态和当前turn。Address独立挂载，仅供边界寻址。Driver、执行作用域、MCL队列、数据库、历史和各资源路径表由各领域core定义，作为并列组件挂到Agent Entity。
+Agent只保存名称、Workspace Entity、生命周期状态和当前turn。Address独立挂载，仅供边界寻址。Driver运行组件、MCL队列、数据库、历史和各资源路径表由各领域core定义，作为并列组件挂到Agent Entity。
 
-中止回合由调用方plugin同步调用agent_abort_turn检查并清除turn，再调用执行领域取消能力；不发送Agent中止事件，也不提交中止闭包。Agent保持Working，直到正常收尾后回Idle。turn已空或不匹配的重复中止直接拒绝，不保存上轮中止关联。成员重命名和持久配置变更归Workspace编排，不由Agent改磁盘定义。
+中止控制事件被受理后，调用方plugin同步调用agent_abort_turn检查并清除turn，只取消当前推理，工具任务不绑定turn，不受回合变化影响；保留DTO网络事件到专属控制事件的两帧路径；agent_core不额外提供中止结果事件或中止闭包。Agent保持Working，直到正常收尾后回Idle。turn已空或不匹配的重复中止直接拒绝，不保存上轮中止关联。Agent不修改Workspace配置文件；配置编辑和整体重载不由生命周期流程执行。
