@@ -51,7 +51,7 @@ local function read_text(path)
     return content
 end
 
-function execute(arguments, context)
+local function perform(arguments, context)
     local path = resolve_path(arguments.path, context.project_root)
     local offset = arguments.offset or 1
     local limit = arguments.limit or 2000
@@ -87,4 +87,16 @@ function execute(arguments, context)
         return margatroid().json.encode({ ok = true, content = header .. "\n(end of file)" })
     end
     return margatroid().json.encode({ ok = true, content = header .. "\n" .. table.concat(output, "\n") })
+end
+
+function execute(arguments, context)
+    local result = perform(arguments, context)
+    if type(result) == "string" then
+        local ok, value = pcall(margatroid().json.decode, result)
+        if ok and type(value) == "table" and type(value.ok) == "boolean" then
+            result = value
+        end
+    end
+    task_return(result)
+    task_finish(context.task_id)
 end

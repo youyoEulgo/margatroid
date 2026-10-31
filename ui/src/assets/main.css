@@ -853,6 +853,16 @@ textarea:focus-visible {
   line-height: 20px;
 }
 
+.message-record-key {
+  color: var(--mg-text-tertiary);
+  font-family: var(--mg-font-mono);
+  font-size: 10px;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .message-meta > span {
   color: var(--mg-text-tertiary);
   font-family: var(--mg-font-mono);

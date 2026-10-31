@@ -33,7 +33,7 @@ local function report(content, failure)
     return margatroid().json.encode({ ok = true, content = content })
 end
 
-function execute(arguments, context)
+local function perform(arguments, context)
     local args = { "--json", "--no-config", "--color", "never" }
     if arguments.include then
         if arguments.include:sub(1, 1) == "!" or arguments.include:find(",", 1, true) then
@@ -77,4 +77,16 @@ function execute(arguments, context)
         matches[#matches + 1] = string.format("[... %d additional matches omitted; narrow the search ...]", total - #matches)
     end
     return report(table.concat(matches, "\n"))
+end
+
+function execute(arguments, context)
+    local result = perform(arguments, context)
+    if type(result) == "string" then
+        local ok, value = pcall(margatroid().json.decode, result)
+        if ok and type(value) == "table" and type(value.ok) == "boolean" then
+            result = value
+        end
+    end
+    task_return(result)
+    task_finish(context.task_id)
 end

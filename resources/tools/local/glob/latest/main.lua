@@ -32,7 +32,7 @@ local function report(content, failure)
     return margatroid().json.encode({ ok = true, content = content })
 end
 
-function execute(arguments, context)
+local function perform(arguments, context)
     local args = {
         "--files", "--no-config", "--hidden", "--no-ignore", "--sort", "modified",
         "--glob", arguments.pattern,
@@ -59,4 +59,16 @@ function execute(arguments, context)
         paths[#paths + 1] = string.format("[... %d additional files omitted; narrow the search ...]", total - #paths)
     end
     return report(table.concat(paths, "\n"))
+end
+
+function execute(arguments, context)
+    local result = perform(arguments, context)
+    if type(result) == "string" then
+        local ok, value = pcall(margatroid().json.decode, result)
+        if ok and type(value) == "table" and type(value.ok) == "boolean" then
+            result = value
+        end
+    end
+    task_return(result)
+    task_finish(context.task_id)
 end

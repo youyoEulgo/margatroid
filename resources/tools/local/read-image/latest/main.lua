@@ -18,7 +18,7 @@ local function media_type(bytes)
     if bytes:sub(1, 4) == "RIFF" and bytes:sub(9, 12) == "WEBP" then return "image/webp" end
 end
 
-function execute(arguments, context)
+local function perform(arguments, context)
     local runtime = margatroid()
     local function failure(message)
         return runtime.json.encode({ok = false, content = message})
@@ -37,4 +37,16 @@ function execute(arguments, context)
         content = string.format("Image %s (%s, %d bytes)", arguments.path, media, #bytes),
         images = {{media_type = media, data = runtime.base64_encode(bytes)}}
     })
+end
+
+function execute(arguments, context)
+    local result = perform(arguments, context)
+    if type(result) == "string" then
+        local ok, value = pcall(margatroid().json.decode, result)
+        if ok and type(value) == "table" and type(value.ok) == "boolean" then
+            result = value
+        end
+    end
+    task_return(result)
+    task_finish(context.task_id)
 end

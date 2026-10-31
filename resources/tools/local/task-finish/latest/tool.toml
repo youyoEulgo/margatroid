@@ -1,0 +1,3 @@
+schema_version = 1
+name = "task_finish"
+description = "Stop a tool task and wait for cleanup; retain its cached output."

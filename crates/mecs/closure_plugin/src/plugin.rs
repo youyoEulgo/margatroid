@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use app_runtime_plugin::{RuntimeHandle, WorldEventExt};
+use app_runtime_plugin::{RuntimeEventSender, RuntimeHandle, WorldEventExt};
 use core_plugin::{App, Event, Plugin, Resource, System, World};
 
 use crate::ClosureError;
@@ -115,13 +115,48 @@ impl AppClosureExt for App {
     }
 }
 
+#[derive(Clone)]
+pub struct WorldClosureSender {
+    schedule: String,
+    events: RuntimeEventSender,
+}
+
+impl WorldClosureSender {
+    pub fn send<Closure>(&self, closure: Closure)
+    where
+        Closure: FnOnce(&mut World) + Send + 'static,
+    {
+        self.events.send_event(ClosureRequest::new(
+            self.schedule.clone(),
+            Box::new(closure),
+        ));
+    }
+}
+
 pub trait WorldClosureExt {
+    fn closure_sender(&self, schedule: &str) -> WorldClosureSender;
     fn send_closure<Closure>(&self, schedule: &str, closure: Closure)
     where
         Closure: FnOnce(&mut World) + Send + 'static;
 }
 
 impl WorldClosureExt for World {
+    fn closure_sender(&self, schedule: &str) -> WorldClosureSender {
+        let registry = self
+            .get_resource::<ClosureRegistry>()
+            .unwrap_or_else(|| ClosureError::ClosurePluginMissing.panic());
+        if !registry.contains(schedule) {
+            ClosureError::ClosureSystemNotRegistered {
+                schedule: schedule.into(),
+            }
+            .panic();
+        }
+        WorldClosureSender {
+            schedule: schedule.into(),
+            events: self.event_sender(),
+        }
+    }
+
     fn send_closure<Closure>(&self, schedule: &str, closure: Closure)
     where
         Closure: FnOnce(&mut World) + Send + 'static,

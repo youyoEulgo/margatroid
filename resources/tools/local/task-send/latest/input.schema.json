@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "task_id": {
+      "type": "string"
+    },
+    "value": {}
+  },
+  "required": [
+    "task_id",
+    "value"
+  ],
+  "additionalProperties": false
+}

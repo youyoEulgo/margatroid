@@ -26,10 +26,11 @@ async fn workspace_own_start_failure_exits_cli_without_stop_request() {
         socket.send(Message::Text(json!({"type":"connection.registered","id":register["id"],"client":{"resource_id":"client:cli/test:1","client_type":"cli","name":"test"}}).to_string().into())).await.unwrap();
         let query = socket.next().await.unwrap().unwrap();
         let query: Value = serde_json::from_str(query.to_text().unwrap()).unwrap();
-        assert_eq!(query["type"], "workspace.catalog.query");
-        socket.send(Message::Text(json!({"type":"workspace.catalog","id":query["id"],"entries":[{"id":"workspace:local/cli-test:latest","name":"cli-test","path":"/catalog/cli-test.yaml","revision":"rev-1","lifecycle":"stopped","definition":{"id":"workspace:local/cli-test:latest","name":"cli-test","project_root":"/project","agents":[]}}]}).to_string().into())).await.unwrap();
+        assert_eq!(query["type"], "state.query");
+        socket.send(Message::Text(json!({"type":"state.sync","state":{"workspace_definitions":[{"path":"/registered/cli-test/workspace.yaml","cache":{"name":"cli-test","project_root":"/project","agents":[]}}],"workspaces":[],"agents":[],"histories":[]}}).to_string().into())).await.unwrap();
         let start = socket.next().await.unwrap().unwrap();
         let start: Value = serde_json::from_str(start.to_text().unwrap()).unwrap();
+        assert_eq!(start["message"],json!({"path":"/registered/cli-test/workspace.yaml"}));
         socket.send(Message::Text(json!({"type":"workspace.start_failed","id":start["id"],"error":{"kind":"ExecutionStartFailed","message":"cannot create workspace execution thread"}}).to_string().into())).await.unwrap();
         while let Some(Ok(message)) = socket.next().await {
             if let Message::Text(text) = message {

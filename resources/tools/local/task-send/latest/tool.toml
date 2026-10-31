@@ -1,0 +1,3 @@
+schema_version = 1
+name = "task_send"
+description = "Send a structured input message to a running tool task; successful delivery does not mean it was processed."

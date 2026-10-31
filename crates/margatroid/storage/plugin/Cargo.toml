@@ -1,0 +1,19 @@
+[package]
+name = "storage_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+storage_core = { path = "../core" }
+core_plugin = { path = "../../../mecs/core_plugin" }
+app_runtime_plugin = { path = "../../../mecs/app_runtime_plugin" }
+async_runtime_plugin = { path = "../../../mecs/async_runtime_plugin" }
+closure_plugin = { path = "../../../mecs/closure_plugin" }
+tokio = { version = "1", features = ["rt", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+libc = "0.2"
+tempfile = "3"
+toml = "0.8"
+serde_json = "1"
