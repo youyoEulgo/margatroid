@@ -10,7 +10,6 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) struct CommandContext {
     pub request: MclCommand,
-    pub history_key: String,
     pub operation: MclOperation,
     pub cancel: CancellationToken,
     pub events: RuntimeEventSender,

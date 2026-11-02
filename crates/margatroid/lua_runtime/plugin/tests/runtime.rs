@@ -41,6 +41,10 @@ impl Fixture {
             .add_plugin(AsyncRuntimePlugin)
             .add_plugin(LuaRuntimePlugin::new().with_config(config).unwrap());
         let owner = app.world_mut().spawn();
+        app.world_mut().insert_component(
+            owner,
+            address::Address::new("agent:local/runtime-test:latest").unwrap(),
+        );
         let workspace = app.world_mut().spawn();
         let executor = spawn_workspace_executor().unwrap();
         let close = executor.close.clone();
@@ -54,8 +58,10 @@ impl Fixture {
                 .cloned()
                 .collect::<Vec<_>>();
             for command in commands {
+                assert_eq!(command.source_address, "agent:local/runtime-test:latest");
                 recorded.lock().unwrap().push(CommandRecord {
                     source: command.source,
+
                     instance: command.source_instance.clone(),
                     target: command.target,
                     text: command.instruction.text.clone(),

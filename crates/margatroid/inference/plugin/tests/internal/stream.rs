@@ -109,7 +109,6 @@ async fn real_http_backlog_is_discarded_without_entering_a_frozen_gate() {
     let worker = tokio::spawn(read_provider(
         reqwest::Client::new(),
         outbound,
-        ApiFormat::ChatCompletions,
         cancel.clone(),
         fragments,
     ));
@@ -320,10 +319,10 @@ fn messages_signed_reasoning_survives_byte_boundaries_and_replays_as_messages() 
     assert_eq!(body["messages"][1]["content"][0]["signature"], "signed");
     selected.provider = "openai".into();
     selected.api_type = "responses".into();
-    assert_eq!(
-        build_request(input, &selected).err().unwrap().kind,
-        Kind::InvalidParameters
-    );
+    let converted = build_request(input, &selected).unwrap();
+    let converted: Value = serde_json::from_slice(&converted.body).unwrap();
+    assert!(converted.to_string().contains("answer"));
+    assert!(!converted.to_string().contains("signed"));
     let mut unsigned = events;
     unsigned.remove(3);
     assert_eq!(
@@ -425,4 +424,181 @@ fn format_terminals_and_event_buffers_have_strict_bounds() {
         decoder.push(&oversized).err().unwrap().kind,
         Kind::ResponseTooLarge
     );
+}
+
+#[test]
+fn chat_accepts_usage_with_repeated_empty_finished_choice_but_rejects_late_content() {
+    let first = format!(
+        "{}data: {}\n\n",
+        chat("accepted"),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+    );
+    let usage = json!({"choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}});
+    let mut decoder = FormatDecoder::new(ApiFormat::ChatCompletions);
+    let mut fragments = decoder.push(first.as_bytes()).unwrap();
+    fragments.extend(
+        decoder
+            .push(format!("data: {usage}\n\ndata: [DONE]\n\n").as_bytes())
+            .unwrap(),
+    );
+    fragments.extend(decoder.finish().unwrap());
+    assert!(fragments.iter().any(|fragment| matches!(fragment, ProviderFragment::Usage(value) if value.input_tokens == 7 && value.output_tokens == 3)));
+    assert_eq!(
+        fragments
+            .iter()
+            .filter(|fragment| matches!(fragment, ProviderFragment::Content(_)))
+            .count(),
+        1
+    );
+    for choice in [
+        json!({"index":0,"delta":{"content":"late"},"finish_reason":"stop"}),
+        json!({"index":0,"delta":{},"finish_reason":"length"}),
+        json!({"index":0,"delta":{"tool_calls":[{"index":0}]},"finish_reason":"stop"}),
+    ] {
+        let mut decoder = FormatDecoder::new(ApiFormat::ChatCompletions);
+        decoder.push(first.as_bytes()).unwrap();
+        assert_eq!(
+            decoder
+                .push(format!("data: {}\n\n", json!({"choices":[choice]})).as_bytes())
+                .err()
+                .unwrap()
+                .kind,
+            Kind::ResponseInvalid
+        );
+    }
+}
+
+#[tokio::test]
+async fn gateway_that_accepts_but_sends_nothing_returns_timeout_and_releases_worker() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (release, wait) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; 8192];
+        let _ = socket.read(&mut request).await;
+        let _ = wait.await;
+    });
+    let client = reqwest::Client::new();
+    let outbound = build_request(
+        DomainRequest {
+            messages: request().messages,
+            tools: vec![],
+            config: request().config,
+        },
+        &route(url),
+    )
+    .unwrap();
+    let (sender, _receiver) = mpsc::channel(2);
+    let failed = tokio::time::timeout(
+        Duration::from_secs(1),
+        read_provider_with_timeouts(
+            client,
+            outbound,
+            CancellationToken::new(),
+            sender,
+            (Duration::from_millis(40), Duration::from_millis(40)),
+        ),
+    )
+    .await
+    .unwrap()
+    .err()
+    .unwrap();
+    assert_eq!(failed.kind, Kind::Timeout);
+    let _ = release.send(());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn stalled_provider_body_is_a_timeout_instead_of_an_endless_receive() {
+    let (url, chunks, server) = http_server().await;
+    let client = reqwest::Client::new();
+    let outbound = build_request(
+        DomainRequest {
+            messages: request().messages,
+            tools: vec![],
+            config: request().config,
+        },
+        &route(url),
+    )
+    .unwrap();
+    let (sender, _receiver) = mpsc::channel(2);
+    let failed = tokio::time::timeout(
+        Duration::from_secs(1),
+        read_provider_with_timeouts(
+            client,
+            outbound,
+            CancellationToken::new(),
+            sender,
+            (Duration::from_millis(40), Duration::from_millis(40)),
+        ),
+    )
+    .await
+    .unwrap()
+    .err()
+    .unwrap();
+    assert_eq!(failed.kind, Kind::Timeout);
+    drop(chunks);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn response_header_deadline_is_independent_of_stream_idle_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut header = Vec::new();
+        let mut byte = [0];
+        while !header.ends_with(b"\r\n\r\n") {
+            socket.read_exact(&mut byte).await.unwrap();
+            header.push(byte[0]);
+        }
+        let header = String::from_utf8(header).unwrap().to_ascii_lowercase();
+        let length = header
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        socket.read_exact(&mut vec![0; length]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let body = format!(
+            "{}data: {}\n\ndata: [DONE]\n\n",
+            chat("delayed"),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+        );
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+    });
+    let outbound = build_request(
+        DomainRequest {
+            messages: request().messages,
+            tools: vec![],
+            config: request().config,
+        },
+        &route(url),
+    )
+    .unwrap();
+    let (sender, mut receiver) = mpsc::channel(8);
+    read_provider_with_timeouts(
+        reqwest::Client::new(),
+        outbound,
+        CancellationToken::new(),
+        sender,
+        (Duration::from_secs(1), Duration::from_millis(40)),
+    )
+    .await
+    .unwrap();
+    let mut fragments = vec![];
+    while let Some(fragment) = receiver.recv().await {
+        fragments.push(fragment);
+    }
+    assert!(fragments
+        .iter()
+        .any(|f| matches!(f,ProviderFragment::Content(text) if text=="delayed")));
+    assert!(fragments
+        .iter()
+        .any(|f| matches!(f, ProviderFragment::Finished(_))));
+    server.await.unwrap();
 }

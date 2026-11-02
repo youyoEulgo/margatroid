@@ -1,3 +1,3 @@
 schema_version = 1
 name = "task_send"
-description = "Send a structured input message to a running tool task; successful delivery does not mean it was processed."
+description = "Queue any JSON value, including null, for a running tool task. The target Lua interprets the value; it is not restricted to terminal input. Successful delivery means queued, not processed. For bash, send {text: string, enter?: boolean}."

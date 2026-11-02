@@ -193,3 +193,50 @@ fn duplicate_installation_is_rejected() {
 fn missing_async_facilities_are_rejected() {
     App::new().add_plugin(StoragePlugin::new().with_schedule("update"));
 }
+
+#[test]
+fn worker_appends_duplicate_payloads_with_distinct_sequences_and_original_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = open_storage(&dir.path().join("db"), &dir.path().join("cfg"), "").unwrap();
+    let mut app = app();
+    let owner = app.world_mut().spawn();
+    app.world_mut().insert_component(owner, storage);
+    let record = HistoryRecord {
+        source: "agent:caller/原始地址".into(),
+        turn: Some("turn".into()),
+        kind: "message".into(),
+        content: "caller supplied content".into(),
+        payload: serde_json::json!({"type":"assistant", "content":"different payload content"}),
+        created_at_ms: Some(0),
+    };
+    for _ in 0..2 {
+        let mut rx = request(
+            &app,
+            owner,
+            StorageOperation::AppendHistory {
+                records: vec![record.clone()],
+            },
+            CancellationToken::new(),
+        );
+        assert_eq!(wait(&mut app, &mut rx).unwrap(), StorageValue::Unit);
+    }
+    let mut rx = request(
+        &app,
+        owner,
+        StorageOperation::ReadHistoryEntries,
+        CancellationToken::new(),
+    );
+    assert_eq!(
+        wait(&mut app, &mut rx).unwrap(),
+        StorageValue::HistoryEntries(vec![
+            StoredHistoryRecord {
+                sequence: 1,
+                record: record.clone()
+            },
+            StoredHistoryRecord {
+                sequence: 2,
+                record
+            },
+        ])
+    );
+}

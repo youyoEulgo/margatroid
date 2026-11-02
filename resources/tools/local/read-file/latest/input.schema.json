@@ -6,7 +6,7 @@
     "path": {
       "type": "string",
       "minLength": 1,
-      "description": "Absolute path or project-root-relative path of the UTF-8 text file to read."
+      "description": "Absolute path or project-root-relative path of the UTF-8 text file to read. Maximum file size: 16 MiB."
     },
     "offset": {
       "type": "integer",
@@ -19,7 +19,7 @@
       "minimum": 1,
       "maximum": 10000,
       "default": 2000,
-      "description": "Maximum number of lines to return. Defaults to 2000."
+      "description": "Maximum number of lines to return. Defaults to 2000. Selected numbered output must fit within 256 KiB."
     }
   },
   "required": [

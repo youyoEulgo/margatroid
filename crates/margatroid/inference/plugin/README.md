@@ -17,7 +17,9 @@ InitInference 在存活 Agent 上同步初始化 ActiveInference，不覆盖已�
 
 每次推理通过 blocking worker 从工具 alias 路径重新读取定义。删除或格式失败不会回退旧定义，不保留 ResourceID 或工具快照。输入使用 inference_core 的独立消息类型，校验角色、工具调用配对、参数、图片以及请求总预算。
 
-Chat、Messages 和 Responses 各有明确编码；Messages 要求 max_output_tokens，Responses 拒绝 stop，提交完整本地上下文且 store=false。保留 Messages thinking 签名及遮蔽内容、Responses encrypted_content；不兼容或缺少必要 replay 时失败。用户及工具图片验证标准 base64、数量、解码字节和 magic。Chat 在工具结果整批齐备后追加 user 图片投影，Messages/Responses 使用原生布局。
+DomainRequest通过TryFrom转换为ChatCompletionsRequest、MessagesRequest或ResponsesRequest；EncodeInput只在插件内提供目标能力。ApiAdapter按七个明确组合分派至OpenAi<T>、Anthropic<T>、DeepSeek<T>或OpenRouter<T>的具体process；T必须是具体请求类型，各支持组合分别实现process，不存在通用VendorAdapter对JSON做厂商修补。公共传输辅助只负责端点、头和有类型请求序列化。响应解码器随构造出的HTTP请求携带，HTTP worker不再根据路由字符串另选格式。
+
+Messages要求max_output_tokens，Responses拒绝stop，提交完整本地上下文且store=false。同格式合法的Messages thinking签名、遮蔽内容和Responses encrypted_content完整回放；缺少replay或属于其它已知格式的历史，只转换正文与工具关联，不伪造专用思考块，也不修改本地历史。损坏或未知格式的已提供replay仍失败；本次响应缺失必要元数据仍严格报协议错误。用户及工具图片验证标准base64、数量、解码字节和magic。Chat在工具结果整批齐备后追加user图片投影，Messages/Responses使用原生布局。
 
 HTTP/SSE worker 只输出到容量 32 的 ProviderFragment 通道，不向前端发送。解码器维护字节缓冲、协议索引、usage 计数及 Responses 完整性摘要，不保留另一份最终正文或工具参数。Content、Reasoning、ToolCallDelta、Replay、Usage、Finished 全部经同一个接收出口进入唯一 ResponseAccumulator。
 
@@ -27,6 +29,6 @@ HTTP/SSE worker 只输出到容量 32 的 ProviderFragment 通道，不向前端
 
 监督任务请求 HTTP worker 退出并等待真实 join 后才完成原 oneshot，不以冻结代替清理。清理超过预算仍等待真实结束并报告 CleanupFailed；Timeout、ReplyClosed、协议错误等保留各自分类。HTTP worker 退出后不能用独立正文补写结果。不改网络中止事件路径，不写历史，不执行工具或自动重试。
 
-预算包括配置 1MiB、请求/响应各 32MiB、SSE 单事件 4MiB、正文与工具参数及图片上限。单消息图片最多 8 张，每张解码 5MiB，合计 20MiB。整体执行默认 180 秒，工具定义准备计入期限。
+预算包括配置 1MiB、请求/响应各 32MiB、SSE 单事件 4MiB、正文与工具参数及图片上限。单消息图片最多 8 张，每张解码 5MiB，合计 20MiB。整体执行默认 180 秒，工具定义准备计入期限。连接超时为 30 秒；等待响应头受整体剩余期限约束，流开始后每次读取的空闲上限为 60 秒，不把该空闲上限用于首响应等待。
 
 装配层集成验证通过本地 HTTP 检查七种组合、鉴权、端点、图片、fresh 工具及 Entity generation，并通过真实 DTO/WebSocket 注册、state.sync 广告和推理流核对 VM 重启前后的 agent_instance。内部并发测试物理上位于 tests/internal：使用真实 HTTP 填满有界通道，验证未接受 backlog 不进入冻结累积器，并通过测试专用清理门验证同步冻结先于 worker join、oneshot 等待真实 join。另覆盖严格终态、UTF-8 跨字节、签名和加密 replay、完整工具调用及 SSE 预算。

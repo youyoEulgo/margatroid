@@ -58,6 +58,8 @@ const state: BackendState = {
       status: 'idle',
       turn: null,
       sandbox: null,
+      tools: ['bash', 'read_file'],
+      sandboxes: ['safe'],
       queued_commands: 0,
       pending_command: null,
       context_window_tokens: 8192,
@@ -73,7 +75,7 @@ interface Wire {
   id: string;
   message: Record<string, unknown>;
 }
-function setup(snapshot: BackendState = state) {
+function setup(snapshot: BackendState = state, autoSettings = true) {
   setActivePinia(createPinia());
   const store = useWorkbenchStore();
   const original = globalThis.WebSocket;
@@ -91,7 +93,16 @@ function setup(snapshot: BackendState = state) {
     }
     close() {}
     send(raw: string) {
-      sent.push(JSON.parse(raw) as Wire);
+      const wire = JSON.parse(raw) as Wire;
+      sent.push(wire);
+      if (autoSettings && wire.message.command === 'CONFIG GET')
+        store.handleServerMessage({
+          type: 'mcl.command_result',
+          id: wire.id,
+          source: 'client:local/ui:latest',
+          target: String(wire.message.agent),
+          result: { Ok: { Config: { visible_tools: ['bash'] } } },
+        });
     }
   }
   globalThis.WebSocket = Socket as unknown as typeof WebSocket;
@@ -169,7 +180,7 @@ test('wire accepts path/cache state and rejects removed catalog and malformed hi
         id: 'h',
         history: history([
           {
-            key: 'x',
+            source: 'agent:demo/coder:latest',
             sequence: -1,
             turn: null,
             kind: 'message',
@@ -215,7 +226,11 @@ test('definition paths remain selection keys and cached member names never creat
       env.store.executeMclCommand('GET entry.pending'),
       /running agent explicitly/,
     );
-    assert.ok(!env.sent.some((request) => request.type === 'mcl.command'));
+    assert.ok(
+      !env.sent.some(
+        (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
+      ),
+    );
     assert.deepEqual(
       env.sent.map((request) => request.type),
       ['connection.register', 'state.query'],
@@ -306,7 +321,9 @@ test('multiple agents require an actual explicit target and late selection chang
     env.store.selectAgent(workspace.agents[0]!);
     const sending = env.store.sendMessage('hello');
     const rejection = assert.rejects(sending, /changed/);
-    const inject = env.sent.find((request) => request.type === 'mcl.command')!;
+    const inject = env.sent.find(
+      (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
+    )!;
     assert.equal(inject.message.agent, workspace.agents[0]);
     assert.equal(inject.message.workspace, workspace.id);
     env.store.selectAgent(reviewer);
@@ -325,7 +342,9 @@ test('composer waits for injection then sends new EFFECT wake syntax to the same
   try {
     const stages: string[] = [];
     const sending = env.store.sendMessage(' hello ', [], (stage) => stages.push(stage));
-    const inject = env.sent.find((request) => request.type === 'mcl.command')!;
+    const inject = env.sent.find(
+      (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
+    )!;
     assert.deepEqual(inject.message, {
       workspace: workspace.id,
       agent: workspace.agents[0],
@@ -351,7 +370,9 @@ test('failed injection does not wake and retry keeps backend acknowledgement ord
   try {
     const sending = env.store.sendMessage('keep draft');
     const rejection = assert.rejects(sending, /not written/);
-    const inject = env.sent.find((request) => request.type === 'mcl.command')!;
+    const inject = env.sent.find(
+      (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
+    )!;
     env.receive({
       type: 'request.failed',
       id: inject.id,
@@ -361,7 +382,11 @@ test('failed injection does not wake and retry keeps backend acknowledgement ord
     assert.ok(!env.sent.some((request) => request.message.command === 'EFFECT wake'));
     assert.equal(env.store.visibleMessages.length, 0);
     const retry = env.store.sendMessage('retry');
-    const latest = env.sent.filter((request) => request.type === 'mcl.command').at(-1)!;
+    const latest = env.sent
+      .filter(
+        (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
+      )
+      .at(-1)!;
     env.reply(latest.id);
     await Promise.resolve();
     await Promise.resolve();
@@ -517,7 +542,7 @@ test('late abort receipt can finish original promise after new VM sync without c
     env.cleanup();
   }
 });
-test('real history keys, sequence gaps and unknown timestamps survive nested message projection', () => {
+test('history sequence identity, source and unknown timestamps survive nested message projection', () => {
   const payload = {
     type: 'inject',
     messages: [
@@ -534,7 +559,7 @@ test('real history keys, sequence gaps and unknown timestamps survive nested mes
   const entries = historyEntries(
     history([
       {
-        key: 'real-db-key',
+        source: 'client:webui/browser:latest',
         sequence: 41,
         turn: null,
         kind: 'message',
@@ -549,11 +574,43 @@ test('real history keys, sequence gaps and unknown timestamps survive nested mes
     ['system', 'tool'],
   );
   for (const entry of entries) {
-    assert.equal(entry.historyKey, 'real-db-key');
+    assert.equal(entry.source, 'client:webui/browser:latest');
     assert.equal(entry.sequence, 41);
     assert.equal(entry.timestamp, 0);
     assert.deepEqual(entry.payload, payload);
   }
+  assert.equal(new Set(entries.map((entry) => entry.key)).size, 2);
+  const saved = history([
+    {
+      source: 'client:webui/browser:latest',
+      sequence: 41,
+      turn: null,
+      kind: 'message',
+      content: '',
+      payload,
+      created_at_ms: 0,
+    },
+  ]);
+  assert.deepEqual(
+    historyEntries(saved).map((entry) => entry.key),
+    entries.map((entry) => entry.key),
+  );
+  const otherAgent = historyEntries({ ...saved, agent: 'agent:demo/reviewer:latest' });
+  assert.ok(otherAgent.every((entry) => !entries.some((original) => original.key === entry.key)));
+  const nextSequence = historyEntries({
+    ...saved,
+    messages: saved.messages.map((entry) => ({ ...entry, sequence: 43 })),
+  });
+  assert.ok(nextSequence.every((entry) => !entries.some((original) => original.key === entry.key)));
+  const wire = { type: 'history.result', id: 'history', history: saved };
+  assert.ok(parseServerMessage(JSON.stringify(wire)));
+  const { source: _source, ...withoutSource } = saved.messages[0]!;
+  assert.equal(
+    parseServerMessage(
+      JSON.stringify({ ...wire, history: { ...saved, messages: [withoutSource] } }),
+    ),
+    null,
+  );
   assert.equal(formatRecordTime(entries[0]!.timestamp), 'Time unavailable');
 });
 test('history reconciles a stream by explicit request_id, never by matching text', () => {
@@ -561,7 +618,7 @@ test('history reconciles a stream by explicit request_id, never by matching text
   try {
     env.receive(delta('request-id'));
     const row = {
-      key: 'db-key',
+      source: 'agent:demo/coder:latest',
       sequence: 79,
       turn: 'turn',
       kind: 'message',
@@ -584,7 +641,7 @@ test('history reconciles a stream by explicit request_id, never by matching text
     });
     assert.equal(env.store.visibleMessages.length, 1);
     assert.equal(env.store.visibleMessages[0]!.sequence, 79);
-    assert.equal(env.store.visibleMessages[0]!.historyKey, 'db-key');
+    assert.equal(env.store.visibleMessages[0]!.source, 'agent:demo/coder:latest');
   } finally {
     env.cleanup();
   }
@@ -593,7 +650,7 @@ test('history keeps unknown records and background task identifiers as plain tex
   const entry = historyEntries(
     history([
       {
-        key: 'task',
+        source: 'agent:demo/coder:latest',
         sequence: 90,
         turn: null,
         kind: 'tool_task',
@@ -608,8 +665,8 @@ test('history keeps unknown records and background task identifiers as plain tex
   assert.match(metadataText(entry.payload), /task-42/);
 });
 test('token totals and latest context usage come only from persisted assistant history', () => {
-  const assistant = (key: string, sequence: number, input: number, output: number) => ({
-    key,
+  const assistant = (sequence: number, input: number, output: number) => ({
+    source: 'agent:demo/coder:latest',
     sequence,
     turn: null,
     kind: 'message',
@@ -622,7 +679,7 @@ test('token totals and latest context usage come only from persisted assistant h
       usage: { input_tokens: input, output_tokens: output, cache_hit_tokens: 3 },
     },
   });
-  const saved = history([assistant('second', 42, 60, 4), assistant('first', 41, 10, 2)]);
+  const saved = history([assistant(42, 60, 4), assistant(41, 10, 2)]);
   assert.equal(latestContextTokens(saved), 64);
   const env = setup({ ...state, histories: [saved] });
   try {
@@ -660,7 +717,9 @@ test('multi-MiB image send waits for parsed receipts and diagnostics do not expo
   try {
     const image = { media_type: 'image/png', data: 'A'.repeat(2 * 1024 * 1024) };
     const sending = env.store.sendMessage('', [image]);
-    const inject = env.sent.find((request) => request.type === 'mcl.command')!;
+    const inject = env.sent.find(
+      (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
+    )!;
     assert.ok(JSON.stringify(inject).length > 1024 * 1024);
     assert.deepEqual(inject.message.arguments, [[{ type: 'user', content: '', images: [image] }]]);
     env.reply(inject.id);
@@ -776,5 +835,126 @@ test('sidebar renders configured members without mutation menus and emits explic
     assert.ok(!/New workspace|New session|Rename|Delete|Refresh/.test(text(root)));
   } finally {
     app.unmount();
+  }
+});
+
+async function loadResources(env: ReturnType<typeof setup>, aliases = ['bash']) {
+  const read = env.sent.filter((wire) => wire.message.command === 'CONFIG GET').at(-1)!;
+  assert.ok(read);
+  env.reply(read.id, { Config: { visible_tools: aliases } }, String(read.message.agent));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+test('resources read CONFIG once per snapshot and change visibility only after matching acknowledgement', async () => {
+  const env = setup(state, false);
+  try {
+    assert.equal(env.store.resourceSettingsReady, false);
+    assert.deepEqual(
+      env.store.resourceVisibility.map((entry) => entry.resource),
+      ['bash', 'read_file'],
+    );
+    await loadResources(env);
+    assert.equal(env.store.resourceSettingsReady, true);
+    const count = env.sent.length;
+    env.receive({ type: 'state.sync', state });
+    assert.equal(env.sent.length, count);
+    const updating = env.store.setResourceVisibility('read_file', true);
+    const write = env.sent.at(-1)!;
+    assert.deepEqual(write.message, {
+      workspace: workspace.id,
+      agent: workspace.agents[0],
+      command: 'CONFIG SET ? ?',
+      arguments: ['visible_tools', ['bash', 'read_file']],
+    });
+    assert.equal(env.store.resourceVisibility[1]!.visible, false);
+    assert.equal(env.store.resourceSettingsPending, true);
+    env.reply(write.id, 'Unit', 'agent:wrong');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(env.store.resourceVisibility[1]!.visible, false);
+    env.reply(write.id);
+    await updating;
+    assert.equal(env.store.resourceVisibility[1]!.visible, true);
+    const failed = env.store.setResourceVisibility('bash', false);
+    const rejected = assert.rejects(failed, /denied/);
+    env.receive({
+      type: 'mcl.command_result',
+      id: env.sent.at(-1)!.id,
+      source: 'client:local/ui:latest',
+      target: workspace.agents[0],
+      result: { Err: { kind: 'Denied', message: 'denied' } },
+    });
+    await rejected;
+    assert.equal(env.store.resourceVisibility[0]!.visible, true);
+    assert.equal(
+      env.store.lastFailures.get(`${workspace.id}:${workspace.agents[0]}`)?.message,
+      'denied',
+    );
+  } finally {
+    env.cleanup();
+  }
+});
+test('sandbox CONFIG then EFFECT retain original target and radio follows actual runtime', async () => {
+  const env = setup(working(), false);
+  try {
+    await loadResources(env);
+    const updating = env.store.setSandbox('safe');
+    const write = env.sent.at(-1)!;
+    assert.deepEqual(write.message.arguments, ['sandbox', ['safe']]);
+    assert.deepEqual(env.store.sandboxOptions.activated, []);
+    env.reply(write.id);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const effect = env.sent
+      .filter((wire) => wire.message.command === 'EFFECT sandbox_use ?')
+      .at(-1)!;
+    assert.deepEqual(effect.message, {
+      workspace: workspace.id,
+      agent: workspace.agents[0],
+      command: 'EFFECT sandbox_use ?',
+      arguments: [['safe']],
+    });
+    env.reply(effect.id);
+    await updating;
+    assert.deepEqual(env.store.sandboxOptions.activated, []);
+    env.receive({
+      type: 'state.sync',
+      state: { ...state, agents: [{ ...state.agents[0]!, sandbox: 'safe' }] },
+    });
+    assert.deepEqual(env.store.sandboxOptions.activated, ['safe']);
+    const clearing = env.store.setSandbox(null);
+    env.reply(env.sent.at(-1)!.id);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const clearEffect = env.sent
+      .filter((wire) => wire.message.command === 'EFFECT sandbox_use ?')
+      .at(-1)!;
+    assert.deepEqual(clearEffect.message.arguments, [[]]);
+    env.reply(clearEffect.id);
+    await clearing;
+  } finally {
+    env.cleanup();
+  }
+});
+test('stale resource receipts cannot update replacement VM or dispatch sandbox effect after route changes', async () => {
+  const env = setup(state, false);
+  try {
+    const oldRead = env.sent.at(-1)!;
+    env.receive({
+      type: 'state.sync',
+      state: { ...state, agents: [{ ...state.agents[0]!, agent_instance: 'replacement' }] },
+    });
+    env.reply(oldRead.id, { Config: { visible_tools: ['read_file'] } });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(env.store.resourceSettingsReady, false);
+    await loadResources(env);
+    const updating = env.store.setSandbox('safe');
+    const rejected = assert.rejects(updating, /changed/);
+    const write = env.sent.at(-1)!;
+    env.store.selectAgent(null);
+    env.store.selectAgent(workspace.agents[0]!);
+    env.reply(write.id);
+    await rejected;
+    assert.ok(!env.sent.some((wire) => wire.message.command === 'EFFECT sandbox_use ?'));
+    assert.equal(env.store.resourceSettingsReady, false);
+  } finally {
+    env.cleanup();
   }
 });

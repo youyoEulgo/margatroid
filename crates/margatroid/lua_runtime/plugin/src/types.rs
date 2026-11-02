@@ -13,6 +13,7 @@ pub(crate) struct InstalledRuntime {
 impl Resource for InstalledRuntime {}
 
 pub(crate) struct RunContext {
+    pub source_address: String,
     pub instance: DriverLuaVmInstance,
     pub program: LuaProgram,
     pub environment: LuaEnvironment,

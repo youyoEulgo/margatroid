@@ -14,7 +14,7 @@ state.sync包含workspace_definitions、workspaces、agents和histories。agent_
 
 网络消息独立定义System、Inject、User、Assistant、ToolCall结果和Error。图片放入独立images数组，元素为media_type与标准base64 data；支持PNG/JPEG/GIF/WebP，每条最多8张、每张解码后5MiB、合计20MiB。replay作为可选不透明JSON传输。
 
-历史保留正文、元数据、顺序和created_at_ms；时间0表示未知。流分片关联请求ID、Agent、实例及sequence；finished表示显示流终态，不表示领域操作或清理完成。
+历史记录包含必需source地址、sequence、turn、kind、content、payload和created_at_ms。sequence在单个Agent内稳定标识与排序记录，前端结合Workspace和Agent上下文构造展示标识；不传输历史key。source保存真实调用方地址，不使用Entity编号；content与payload独立保留，content按调用方原值传输，不从payload派生。时间0表示未知。流分片关联请求ID、Agent、实例及sequence；finished表示显示流终态，不表示领域操作或清理完成。
 
 ## 校验
 

@@ -717,3 +717,238 @@ fn an_unlimited_background_task_can_wait_for_input_beyond_host_call_timeout() {
     );
     assert!(ToolExecutionLimits::default().execution_timeout.is_none());
 }
+
+fn with_daemon_controlling_terminal(name: &str, test: impl FnOnce()) {
+    const CHILD: &str = "MARGATROID_CONTROLLING_TERMINAL_TEST";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        let tty = std::fs::File::open("/dev/tty").expect("daemon must have a controlling terminal");
+        assert_eq!(
+            nix::unistd::tcgetpgrp(&tty).unwrap(),
+            nix::unistd::getpgrp()
+        );
+        assert_eq!(nix::unistd::getsid(None).unwrap(), nix::unistd::getpid());
+        test();
+        return;
+    }
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(r#"
+import ctypes, fcntl, os, pty, signal, subprocess, sys, tempfile, termios, time
+assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
+master, slave = pty.openpty()
+
+def controlling_terminal():
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    os.tcsetpgrp(slave, os.getpgrp())
+    signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+    signal.signal(signal.SIGTTIN, signal.SIG_DFL)
+
+def descendants():
+    processes = {}
+    for entry in os.scandir('/proc'):
+        if not entry.name.isdigit():
+            continue
+        try:
+            with open(entry.path + '/stat') as source:
+                fields = source.read().rsplit(')', 1)[1].split()
+            processes[int(entry.name)] = (int(fields[1]), fields[0], fields[2], fields[3])
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    found = {os.getpid()}
+    while True:
+        added = {pid for pid, value in processes.items() if value[0] in found} - found
+        if not added:
+            break
+        found.update(added)
+    return {pid: processes[pid] for pid in found if pid != os.getpid()}
+
+status = 1
+with tempfile.TemporaryFile() as log:
+    child = subprocess.Popen([sys.argv[1], '--exact', sys.argv[2], '--nocapture', '--test-threads=1'],
+        stdin=slave, stdout=log, stderr=log, preexec_fn=controlling_terminal)
+    os.close(slave)
+    try:
+        deadline = time.monotonic() + 15
+        observed_stops = set()
+        while child.poll() is None:
+            stopped = {pid: value for pid, value in descendants().items() if value[1] in ('T', 't')}
+            if stopped.keys() - observed_stops:
+                print('observed stopped test processes (pid: ppid,state,pgrp,session):', stopped, file=sys.stderr)
+                observed_stops.update(stopped)
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(child.args, 15)
+            time.sleep(0.01)
+        status = child.returncode
+    except subprocess.TimeoutExpired:
+        print('controlling-terminal regression timed out; descendants:', descendants(), file=sys.stderr)
+    finally:
+        remaining = descendants()
+        if remaining:
+            print('test-owned process cleanup (pid: ppid,state,pgrp,session):', remaining, file=sys.stderr)
+        for pid in remaining:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        child.wait()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if pid == 0:
+                time.sleep(0.01)
+        os.close(master)
+    log.seek(0)
+    sys.stdout.buffer.write(log.read())
+sys.exit(status if status >= 0 else 1)
+"#)
+        .arg(std::env::current_exe().unwrap())
+        .arg(name)
+        .env(CHILD, name)
+        .output()
+        .expect("python3 is required for the controlling-terminal regression");
+    assert!(
+        output.status.success(),
+        "PTY child failed: {}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn runner_does_not_inherit_daemon_controlling_terminal() {
+    with_daemon_controlling_terminal(
+        "runner_does_not_inherit_daemon_controlling_terminal",
+        || {
+            let mut fixture = Fixture::new();
+            fixture.tool(
+                "raw-mode",
+                r#"function execute(args, context)
+                local result = shell([=[python3 - <<'PY'
+import errno, os, signal, termios
+signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+try:
+    fd = os.open('/dev/tty', os.O_RDWR)
+except OSError as error:
+    assert error.errno == errno.ENXIO, error
+    print('NO_CONTROLLING_TERMINAL:ENXIO')
+else:
+    attrs = termios.tcgetattr(fd)
+    attrs[3] &= ~(termios.ICANON | termios.ECHO)
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    raise AssertionError('runner inherited daemon controlling terminal')
+PY]=])
+                task_return(result)
+                task_finish(context.task_id)
+            end"#,
+            );
+            let reply = fixture.execute("raw-mode", "raw-mode", json!({}));
+            let response = fixture.response(reply).unwrap();
+            let result: Value = serde_json::from_str(&response.content).unwrap();
+            assert_eq!(result["exit_code"], 0, "{result}");
+            assert_eq!(result["stdout"], "NO_CONTROLLING_TERMINAL:ENXIO\n");
+            fixture.completed("raw-mode");
+            assert!(fixture.tasks().read("raw-mode").unwrap().error.is_none());
+        },
+    );
+}
+
+#[test]
+fn cancelling_stopped_runner_group_under_controlling_terminal_reaps_children() {
+    with_daemon_controlling_terminal(
+        "cancelling_stopped_runner_group_under_controlling_terminal_reaps_children",
+        || {
+            use nix::sys::signal::{kill, killpg, Signal};
+            use nix::unistd::Pid;
+
+            let mut fixture = Fixture::new();
+            fixture.tool(
+                "stopped",
+                r#"function execute(args, context)
+                local result = shell([=[python3 - <<'PY'
+import json, os
+worker = os.getpid()
+while True:
+    with open('/proc/%d/stat' % worker) as source:
+        parent = int(source.read().rsplit(')', 1)[1].split()[1])
+    if parent == os.getpgrp():
+        break
+    worker = parent
+print(json.dumps(dict(group=os.getpgrp(), worker=worker)))
+PY]=])
+                task_return(result.stdout)
+                task_receive()
+                task_finish(context.task_id)
+            end"#,
+            );
+            let reply = fixture.execute("stopped", "stopped", json!({}));
+            let response = fixture.response(reply).unwrap();
+            let pids: Value = serde_json::from_str(&response.content).unwrap();
+            let group = Pid::from_raw(pids["group"].as_i64().unwrap() as i32);
+            let worker = Pid::from_raw(pids["worker"].as_i64().unwrap() as i32);
+            assert_ne!(group, nix::unistd::getpgrp());
+            assert_eq!(nix::unistd::getsid(Some(group)).unwrap(), group);
+            killpg(group, Signal::SIGSTOP).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let stat = std::fs::read_to_string(format!("/proc/{group}/stat")).unwrap();
+                if stat.rsplit_once(") ").unwrap().1.starts_with("T ") {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "supervisor did not stop: {stat}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let started = Instant::now();
+            fixture.tasks().cancel("stopped").unwrap();
+            fixture.completed("stopped");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert_eq!(
+                fixture.tasks().read("stopped").unwrap().error.unwrap().kind,
+                Kind::Cancelled
+            );
+            assert_eq!(kill(group, None), Err(nix::errno::Errno::ESRCH));
+            assert_eq!(kill(worker, None), Err(nix::errno::Errno::ESRCH));
+            assert_eq!(killpg(group, None), Err(nix::errno::Errno::ESRCH));
+        },
+    );
+}
+
+#[test]
+fn interactive_bash_gets_its_own_controlling_terminal_under_tty_daemon() {
+    with_daemon_controlling_terminal(
+        "interactive_bash_gets_its_own_controlling_terminal_under_tty_daemon",
+        || {
+            let mut fixture = Fixture::new();
+            fixture.tool(
+                "bash",
+                include_str!("../../../../../resources/tools/local/bash/latest/main.lua"),
+            );
+            let reply = fixture.execute("own-pty", "bash", json!({}));
+            fixture.response(reply).unwrap();
+            fixture.tasks().send("own-pty", json!({"text": "python3 -c 'import os,termios; fd=os.open(\"/dev/tty\",os.O_RDWR); assert os.isatty(0); assert os.tcgetpgrp(fd)==os.getpgrp(); attrs=termios.tcgetattr(fd); termios.tcsetattr(fd,termios.TCSANOW,attrs); print(\"OWN_\"+\"PTY_OK\")'", "enter": true})).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut output = String::new();
+            while !output.contains("OWN_PTY_OK") {
+                let result = fixture.tasks().read("own-pty").unwrap();
+                assert!(result.error.is_none(), "{:?}", result.error);
+                for value in result.output {
+                    if let Some(text) = value.as_str() {
+                        output.push_str(text);
+                    }
+                }
+                assert!(Instant::now() < deadline, "terminal output: {output}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            fixture
+                .tasks()
+                .send("own-pty", json!({"text": "exit 0", "enter": true}))
+                .unwrap();
+            fixture.completed("own-pty");
+            assert!(fixture.tasks().read("own-pty").unwrap().error.is_none());
+        },
+    );
+}

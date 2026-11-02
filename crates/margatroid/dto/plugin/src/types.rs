@@ -120,7 +120,7 @@ impl Event for WebSocketMessageSend {}
 #[derive(Clone, Debug)]
 pub(crate) enum TransportEvent {
     Started(std::net::SocketAddr),
-    Failed,
+    Failed(String),
     Stopped,
     Connected(WebSocketConnectionId),
     ProtocolFailed(WebSocketConnectionId),

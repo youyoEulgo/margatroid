@@ -622,12 +622,11 @@ fn restart_uses_new_driver_same_entity_and_preserves_completed_tools_database_se
         &storage,
         StorageOperation::AppendHistory {
             records: vec![HistoryRecord {
-                key: "fact".into(),
-                source: "original".into(),
+                source: "agent:demo/coder:latest".into(),
                 turn: None,
-                kind: "test".into(),
+                kind: "message".into(),
                 content: "preserved".into(),
-                payload: serde_json::json!({"keep":true}),
+                payload: serde_json::json!({"type":"user","content":"preserved"}),
                 created_at_ms: Some(0),
             }],
         },

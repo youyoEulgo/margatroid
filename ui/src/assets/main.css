@@ -853,7 +853,7 @@ textarea:focus-visible {
   line-height: 20px;
 }
 
-.message-record-key {
+.message-record-source {
   color: var(--mg-text-tertiary);
   font-family: var(--mg-font-mono);
   font-size: 10px;

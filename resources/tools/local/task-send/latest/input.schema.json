@@ -2,9 +2,13 @@
   "type": "object",
   "properties": {
     "task_id": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1,
+      "description": "Nonempty id of the target tool task."
     },
-    "value": {}
+    "value": {
+      "description": "Any JSON value, including null. The target task Lua decides how to interpret it."
+    }
   },
   "required": [
     "task_id",

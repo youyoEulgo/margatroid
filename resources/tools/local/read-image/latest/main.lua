@@ -21,32 +21,26 @@ end
 local function perform(arguments, context)
     local runtime = margatroid()
     local function failure(message)
-        return runtime.json.encode({ok = false, content = message})
+        return {ok = false, content = message}
     end
     local path = resolve_path(arguments.path, context.project_root)
-    local file = io.open(path, "rb")
-    if not file then return failure("Cannot open image: " .. arguments.path) end
+    local file, open_error = io.open(path, "rb")
+    if not file then return failure("Cannot open image: " .. arguments.path .. ": " .. tostring(open_error)) end
     local bytes = file:read(MAX_BYTES + 1)
     file:close()
-    if not bytes then return failure("Cannot read image: " .. arguments.path) end
+    if not bytes then return failure("Image is empty or unreadable: " .. arguments.path) end
     if #bytes > MAX_BYTES then return failure("Image exceeds 5 MiB limit: " .. arguments.path) end
     local media = media_type(bytes)
     if not media then return failure("Not a supported PNG, JPEG, GIF or WebP image: " .. arguments.path) end
-    return runtime.json.encode({
+    return {
         ok = true,
         content = string.format("Image %s (%s, %d bytes)", arguments.path, media, #bytes),
         images = {{media_type = media, data = runtime.base64_encode(bytes)}}
-    })
+    }
 end
 
 function execute(arguments, context)
     local result = perform(arguments, context)
-    if type(result) == "string" then
-        local ok, value = pcall(margatroid().json.decode, result)
-        if ok and type(value) == "table" and type(value.ok) == "boolean" then
-            result = value
-        end
-    end
     task_return(result)
     task_finish(context.task_id)
 end

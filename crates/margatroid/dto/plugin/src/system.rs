@@ -119,7 +119,7 @@ pub(crate) fn collect_external_events_system(world: &mut World) {
         world
             .event_reader::<ServerFailed>()
             .into_iter()
-            .map(|_| TransportEvent::Failed),
+            .map(|event| TransportEvent::Failed(event.message.clone())),
     );
     transport.extend(
         world

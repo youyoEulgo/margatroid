@@ -1,6 +1,6 @@
 use crate::types::*;
 use crate::{InstalledMcl, MclImportConfig};
-use address::{ParsedAddress, resolve_file};
+use address::{Address, ParsedAddress, resolve_file};
 use agent_core::{Agent, AgentState, WorldAgentExt};
 use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::WorldAsyncExt;
@@ -41,6 +41,15 @@ fn respond(request: &MclCommand, result: Result<MclValue, MclError>) {
 fn validate_source(world: &World, request: &MclCommand) -> Result<(), MclError> {
     if !world.is_alive(request.source) {
         return Err(error(MclErrorKind::SourceInvalid, "MCL source is missing"));
+    }
+    if !world
+        .get_component::<Address>(request.source)
+        .is_some_and(|address| address.as_str() == request.source_address)
+    {
+        return Err(error(
+            MclErrorKind::SourceInvalid,
+            "MCL source address does not match its caller",
+        ));
     }
     let agent = world
         .get_component::<Agent>(request.target)
@@ -149,18 +158,7 @@ pub(crate) fn handle_queue(world: &mut World, target: Entity) {
     queue.pending = Some(request.id.clone());
     let cancel = queue.cancel.child_token();
     let allowed_imports = queue.allowed_imports.clone();
-    static NEXT_HISTORY_KEY: AtomicU64 = AtomicU64::new(1);
-    let history_key = format!(
-        "{}:{}:{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-        NEXT_HISTORY_KEY.fetch_add(1, Ordering::Relaxed)
-    );
     let context = CommandContext {
-        history_key,
         request,
         operation,
         cancel,
@@ -248,7 +246,7 @@ async fn execute_command(context: CommandContext) -> Result<CommandOutput, Comma
             result = &mut operation => result,
         };
         let audit = storage(&context, StorageOperation::AppendHistory { records: vec![storage_core::HistoryRecord {
-            key: format!("mcl:{}", context.history_key), source: format!("entity:{}:{}", request.source.index(), request.source.generation()),
+            source: request.source_address.clone(),
             turn: context.turn.clone(), kind: "mcl".into(), content: request.instruction.text.clone(),
             payload: json!({"id": request.id, "source_instance": request.source_instance, "text": request.instruction.text, "arguments": request.instruction.arguments, "succeeded": result.is_ok(), "error": result.as_ref().err()}), created_at_ms: None,
         }] }, CancellationToken::new()).await;
@@ -722,18 +720,13 @@ async fn execute_effect(
             let messages = effect_messages(context, arguments.next().unwrap()).await?;
             let records = messages
                 .into_iter()
-                .enumerate()
-                .map(|(index, message)| storage_core::HistoryRecord {
-                    key: format!("message:{}:{index}", context.history_key),
-                    source: format!(
-                        "entity:{}:{}",
-                        context.request.source.index(),
-                        context.request.source.generation()
-                    ),
+                .map(|message| storage_core::HistoryRecord {
+                    source: context.request.source_address.clone(),
                     turn: context.turn.clone(),
                     kind: "message".into(),
                     content: message
                         .get("content")
+                        .or_else(|| message.get("message"))
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
@@ -926,17 +919,22 @@ async fn execute_inference(
     .await?;
     let response = match receiver {
         None => InferenceResponse::cancelled(),
-        Some(receiver) => receiver
+        Some(receiver) => match receiver
             .await
             .map_err(|_| error(MclErrorKind::CleanupFailed, "inference reply was lost"))?
-            .map_err(|failed| {
-                let kind = if failed.kind == inference_core::InferenceErrorKind::CleanupFailed {
-                    MclErrorKind::CleanupFailed
-                } else {
-                    MclErrorKind::EffectFailed
-                };
-                error(kind, failed.to_string())
-            })?,
+        {
+            Ok(response) => response,
+            Err(failed) => {
+                return Ok(MclValue::Inference {
+                    message: json!({
+                        "type": "error",
+                        "message": failed.to_string(),
+                        "request_id": context.request.id,
+                    }),
+                    stop_reason: "error".into(),
+                });
+            }
+        },
     };
     inference_result(response, &context.request.id)
 }
@@ -978,7 +976,12 @@ async fn execute_tools(
     let request = context.request.clone();
     let cancel = context.cancel.clone();
     let expected_turn = context.turn.clone();
-    let task_prefix = context.history_key.clone();
+    static NEXT_TOOL_BATCH: AtomicU64 = AtomicU64::new(1);
+    let task_prefix = format!(
+        "{}:{}",
+        std::process::id(),
+        NEXT_TOOL_BATCH.fetch_add(1, Ordering::Relaxed)
+    );
     let pending = in_world(&context.world, move |world| {
         check_action(world, &request, &cancel)?;
         let agent = world.get_component::<Agent>(request.target).unwrap();
@@ -1178,6 +1181,13 @@ fn validate_messages(messages: &[Value]) -> Result<(), MclError> {
                     )
                 })?;
             validate_messages(nested)?;
+        } else if message.get("type").and_then(Value::as_str) == Some("error") {
+            if message.get("message").and_then(Value::as_str).is_none() {
+                return Err(error(
+                    MclErrorKind::InvalidMessage,
+                    "error message must contain a message string",
+                ));
+            }
         } else {
             inference_message(message.clone())?;
         }

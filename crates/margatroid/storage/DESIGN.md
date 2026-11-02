@@ -31,6 +31,13 @@ open_storage(database_path: &Path, settings_path: &Path, default_settings: &str)
 
 execute_storage(storage: &AgentStorage, operation: StorageOperation) -> Result<StorageValue, StorageError>
     行为：串行执行对应SQLite事务或设置文件操作；写入确认完成后返回。
+
+数据库结构
+    main.agent_messages：sequence、source、turn、content、payload、created_at_ms
+    main.mcl_records：sequence、source、turn、content、payload、created_at_ms
+    main.blocks：name、fields_json--对象的每个键对应一个消息数组
+    行为：只保留三张表，不使用AUTOINCREMENT或metadata表；PRAGMA user_version保存版本。只支持当前结构；空库创建，不匹配则明确报错，不自动迁移或备份。
+    TEMP：使用连接内存表按VM实例隔离；VM及MCL真实退出后DropTemporaryBlocks，关闭连接自动丢弃。
 ```
 
 ## 类型
@@ -131,12 +138,17 @@ StorageDatabase：不透明SQLite连接能力
 StorageOperation：机械存储操作，公开枚举
     CreateBlock { name: String, fields: Vec<String>, instance: Option<String> }
     ReadMessages { selectors: Vec<MessageSelector> }
+    ReadMessageSources { sources: Vec<MessageSource> }
+    DropTemporaryBlocks { instance: String }--仅删除该VM实例的内存TEMP
     ReplaceMessages { sources: Vec<MessageSource>, target: MessageSelector }
     ReadConfig
     SetConfig { path: String, value: toml::Value }
     DeleteConfig { path: String }
     AppendHistory { records: Vec<HistoryRecord> }
     ReadHistory
+    ReadHistoryEntries
+    ReadAgentMessages--仅AgentMessage表
+    ReadMclRecords--仅MCL表
 
 MessageSelector：消息选择器
     block: String
@@ -152,11 +164,10 @@ MessageSource：写事务内的消息来源，公开枚举
     Literal(Vec<serde_json::Value>)
 
 HistoryRecord：只追加历史记录
-    key: String--幂等键
-    source: String--历史来源文本，不用于运行寻址
+    source: String--调用方显式提供的真实来源地址，不保存Entity编号
     turn: Option<String>
-    kind: String
-    content: String
+    kind: String--时间线记录类型，决定写入message或mcl表，不存为混合kind列
+    content: String--调用方提供的原始正文，独立于payload原样保存与读取
     payload: serde_json::Value
     created_at_ms: Option<u64>--新记录缺省时取真实写入时间
 
@@ -165,6 +176,11 @@ StorageValue：存储成功值，公开枚举
     Messages(Vec<serde_json::Value>)
     Config(toml::Table)
     History(Vec<HistoryRecord>)
+    HistoryEntries(Vec<StoredHistoryRecord>)
+
+StoredHistoryRecord：持久记录读取值
+    sequence: u64--Agent内跨消息与MCL表的稳定顺序及记录标识
+    record: HistoryRecord
 ```
 
 # error
@@ -179,7 +195,7 @@ StorageError：存储错误，公开类型
     impl Display + std::error::Error
 
 StorageErrorKind：错误类别，公开枚举
-    OwnerMissing | Closed | InvalidRequest | InvalidRecord | KeyConflict
+    OwnerMissing | Closed | InvalidRequest | InvalidRecord
     SchemaMismatch | LifecycleMismatch | BlockMissing | FieldMissing | InvalidRange
     ConfigInvalid | ConfigPathInvalid | ConfigTypeMismatch
     ReadFailed | WriteFailed | Cancelled | CommitUnknown | CleanupFailed | WorkerFailed
@@ -192,8 +208,10 @@ Agent Entity
 └── AgentStorage
     ├── StorageDatabase
     │   └── SQLite连接管理器
-    │       ├── 消息Block表
-    │       └── 历史表
+    │       ├── main.agent_messages--纯AgentMessage payload及历史关联
+    │       ├── main.mcl_records--纯MCL审计payload及历史关联
+    │       ├── main.blocks--name到fields_json对象，每个持久Block一行
+    │       └── temp.blocks--连接内存中的VM实例临时Block，不写数据库文件
     ├── settings_path
     └── settings_lock
 

@@ -12,7 +12,9 @@ storage_core只认识路径和存储操作，不读取Workspace配置、定位Dr
 
 ## 消息Block
 
-普通Block和历史保存在同一Agent SQLite文件中，不使用ResourceID作为运行索引或持久Block命名空间。持久Block按库内名称识别；TEMP额外使用跨进程唯一的VM实例标识隔离，重启不恢复旧TEMP。
+数据库文件只含三张业务表：agent_messages保存纯AgentMessage payload及content、序号、来源地址、turn、时间；mcl_records保存纯MCL审计payload及同样的关联字段；blocks按名称一行保存一个持久Block，其fields_json是字段名到消息数组的对象。不另建Block定义、字段值或metadata表，不使用AUTOINCREMENT；结构版本使用PRAGMA user_version。
+
+TEMP保存在连接内存中的SQLite临时表，不写入数据库文件。各VM按实例标识隔离，Agent关闭或重启确认VM与MCL退出后删除该实例TEMP；连接关闭会自动丢弃全部TEMP，异常退出不留下磁盘段。只初始化或打开当前三表结构；不识别、转换或迁移旧版结构，不自动备份。
 
 Block字段只保存结构化消息数组，不保存TOOL、SANDBOX、资源地址或alias绑定。消息结构由调用方按消息领域契约校验，存储层保留结构化值，不依赖消息core，也不根据字段名推测用途。
 
@@ -22,7 +24,7 @@ CREATE字段名不带类型，不存在则创建，存在且字段及生命周�
 
 ## 历史
 
-历史只追加，按数据库序号读取。key不能为空；同key同事实重试不重复追加，不覆盖第一次写入时间；内容冲突使整批回滚。记录保存正文、来源、turn、元数据和真实时间；旧记录未知时间保留0，不猜测或回填。
+消息和MCL分别追加到agent_messages与mcl_records，payload分别是AgentMessage与MCL审计对象，读取时间线时从所属表确定kind。source必需，由调用方显式传入真实来源地址，不保存Entity编号；content与payload独立保存，content按调用方提供的值原样读写，不从payload派生。每次追加均产生记录，使用Agent内跨两表的sequence作为稳定顺序与记录标识，不设历史key或兼容回退。完整时间线在同一事务内按sequence合并；未知时间保留0，不猜测或回填。
 
 消息历史由显式history_append写入，指令审计由MCL另行发起。存储不自动记录推理、工具或Block操作结果。Block修改和历史追加是独立事务，共用文件不代表共同提交。
 

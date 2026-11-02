@@ -1,6 +1,6 @@
 # Lua Runtime
 
-lua_runtime_core定义VM组件、程序、环境、通知能力和启停契约，只依赖mecs及通用库。lua_runtime_plugin依赖自己的core、workspace_core和mcl_core，通过Workspace的执行入口运行Driver，不依赖Agent或MCL的plugin。
+lua_runtime_core定义VM组件、程序、环境、通知能力和启停契约，只依赖mecs及通用库。lua_runtime_plugin依赖自己的core、workspace_core、mcl_core及通用身份address，通过Workspace的执行入口运行Driver，不依赖Agent或MCL的plugin。
 
 ## 执行与组件
 
@@ -24,6 +24,6 @@ Agent启动流程将本次agent_info等数据通过LuaEnvironment传入。Lua Ru
 
 启动Handler在ECS线程创建wake槽位，将Arc存入DriverLuaVm并克隆到本次VM任务。wait捕获这个Arc，调用时直接操作同一槽位，不访问World、不发送等待事件。提前wake锁存一次，重复通知合并；锁不跨await，关闭或取消能结束等待。重启使用新槽位，旧任务不能碰到新VM。
 
-mcl宿主由lua_runtime_plugin根据mcl_core::MclCommand直接构造：绑定本次source Entity及VM实例，发送事件，等待原oneshot并转换结果；它不解析执行MCL，不依赖mcl_plugin。MCL plugin只处理请求，EFFECT ready/wake通过lua_runtime_core核对实例并操作槽位。不使用block_on桥接。
+mcl宿主由lua_runtime_plugin根据mcl_core::MclCommand直接构造：启动时取得owner真实Address，缺失则拒绝启动；绑定本次source Entity、source_address及VM实例，每次调用显式传入，发送事件并等待原oneshot。它不解析执行MCL，不依赖mcl_plugin；来源地址不由Lua脚本填写，也不从Entity编号生成。MCL plugin只处理请求并核对来源，EFFECT ready/wake通过lua_runtime_core核对实例并操作槽位。不使用block_on桥接。
 
 数组与对象分别转换，嵌套空数组保留数组身份；拒绝无法表示的混合键和稀疏数组。require只解析注入模块。标准库选择及内存、源码、指令检查预算由LuaRuntimeConfig指定；Full和Safe均不表示进程沙箱。

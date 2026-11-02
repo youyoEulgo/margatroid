@@ -5,6 +5,13 @@ import {
   Activity,
   Bot,
   CircleAlert,
+  ChevronRight,
+  Eye,
+  EyeOff,
+  Circle,
+  CircleDot,
+  ShieldCheck,
+  ShieldOff,
   CloudOff,
   Command,
   Menu,
@@ -64,6 +71,10 @@ const {
   abortPending,
   selectedAgentWorking,
   sidebarTree,
+  resourceVisibility,
+  sandboxOptions,
+  resourceSettingsPending,
+  resourceSettingsReady,
   visibleMessages,
   logs,
   lastFailures,
@@ -145,6 +156,9 @@ const messageList = ref<HTMLElement | null>(null);
 const conversationPane = ref<HTMLElement | null>(null);
 const composerFooter = ref<HTMLElement | null>(null);
 let composerObserver: ResizeObserver | undefined;
+const toolManager = ref<HTMLElement | null>(null);
+const toolsOpen = ref(false);
+const toolResources = computed(() => resourceVisibility.value);
 const sidebarOpen = ref(false);
 const activityOpen = ref(false);
 const activityTab = ref<'activity' | 'mcl'>('activity');
@@ -286,11 +300,20 @@ function logLevelClass(log: { level: string }) {
   return `log-level--${log.level.toLowerCase()}`;
 }
 
+function closeToolsOnOutsideClick(event: MouseEvent) {
+  const target = event.target;
+  if (!toolsOpen.value) return;
+  if (target instanceof Node && toolManager.value && !toolManager.value.contains(target)) {
+    toolsOpen.value = false;
+  }
+}
+
 onMounted(() => {
   if (!selectedWorkspace.value && workspaces.value[0]) {
     store.selectWorkspace(workspaces.value[0].path);
   }
   store.connect();
+  document.addEventListener('click', closeToolsOnOutsideClick);
 
   composerObserver = new ResizeObserver(() => {
     const pane = conversationPane.value;
@@ -302,6 +325,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  document.removeEventListener('click', closeToolsOnOutsideClick);
   composerObserver?.disconnect();
   store.disconnect();
 });
@@ -340,8 +364,31 @@ async function runAgentAction(action: () => Promise<unknown>) {
   }
 }
 
+function toggleResourceVisibility(resource: string, visible: boolean) {
+  void runAgentAction(() => store.setResourceVisibility(resource, visible));
+}
+
 function abortTurn() {
   void runAgentAction(() => store.abortTurn());
+}
+
+const NO_SANDBOX = '';
+const sandboxChoices = computed(() => [
+  {
+    value: NO_SANDBOX,
+    label: 'None',
+    hint: 'No sandbox: tools run with the daemon user permissions',
+  },
+  ...sandboxOptions.value.options.map((resource) => ({
+    value: resource,
+    label: resource,
+    hint: resource,
+  })),
+]);
+const sandboxSelection = computed(() => sandboxOptions.value.activated[0] ?? NO_SANDBOX);
+
+function selectSandbox(value: string) {
+  void runAgentAction(() => store.setSandbox(value === NO_SANDBOX ? null : value));
 }
 
 function selectWorkspace(key: string) {
@@ -587,10 +634,10 @@ const conversationMessages = computed(() =>
                 <span>{{ formatTime(message.timestamp) }}</span>
                 <span v-if="message.sequence !== null">#{{ message.sequence }}</span>
                 <code
-                  v-if="message.historyKey"
-                  class="message-record-key"
-                  :title="message.historyKey"
-                  >{{ message.historyKey }}</code
+                  v-if="message.source"
+                  class="message-record-source"
+                  :title="message.source"
+                  >{{ message.source }}</code
                 >
                 <span v-else>Live</span>
               </div>
@@ -767,10 +814,18 @@ const conversationMessages = computed(() =>
             </button>
           </div>
         </form>
-        <div v-if="selectedWorkspace" class="tool-manager">
-          <span class="tool-manager-empty"
-            >Sandbox: {{ selectedAgentState?.sandbox || 'None' }}</span
+        <div v-if="selectedWorkspace" ref="toolManager" class="tool-manager">
+          <button
+            class="tool-manager-trigger"
+            type="button"
+            :aria-expanded="toolsOpen"
+            aria-controls="tool-manager-panel"
+            title="Manage agent tools"
+            @click="toolsOpen = !toolsOpen"
           >
+            <ChevronRight :class="['tool-manager-chevron', { 'is-open': toolsOpen }]" :size="13" />
+            <span class="tool-manager-empty">Resources Panel</span>
+          </button>
           <div class="token-usage" aria-label="Agent token usage">
             <span
               v-for="item in tokenUsageItems"
@@ -799,6 +854,77 @@ const conversationMessages = computed(() =>
               </svg>
               <span class="context-window-percentage">{{ contextWindowUsage.label }}</span>
             </span>
+          </div>
+
+          <div v-if="toolsOpen" id="tool-manager-panel" class="tool-manager-panel">
+            <section class="tool-resource-group">
+              <div class="tool-resource-heading">
+                <span>Sandbox</span>
+                <span>{{ sandboxOptions.options.length }}</span>
+              </div>
+              <div class="tool-resource-list">
+                <div
+                  v-for="choice in sandboxChoices"
+                  :key="choice.value || 'none'"
+                  class="tool-resource-row"
+                  :title="choice.hint"
+                >
+                  <ShieldCheck v-if="choice.value" :size="14" />
+                  <ShieldOff v-else :size="14" />
+                  <code :title="choice.hint">{{ choice.label }}</code>
+                  <button
+                    class="tool-row-action"
+                    type="button"
+                    :title="
+                      sandboxSelection === choice.value ? 'Active sandbox' : 'Use this sandbox'
+                    "
+                    :aria-label="
+                      sandboxSelection === choice.value ? 'Active sandbox' : 'Use this sandbox'
+                    "
+                    :disabled="
+                      connectionStatus !== 'online' ||
+                      !selectedAgentReady ||
+                      resourceSettingsPending ||
+                      !resourceSettingsReady
+                    "
+                    @click="selectSandbox(choice.value)"
+                  >
+                    <CircleDot v-if="sandboxSelection === choice.value" :size="14" />
+                    <Circle v-else :size="14" />
+                  </button>
+                </div>
+              </div>
+            </section>
+
+            <section class="tool-resource-group">
+              <div class="tool-resource-heading">
+                <span>Tools</span>
+                <span>{{ toolResources.length }}</span>
+              </div>
+              <div v-if="toolResources.length" class="tool-resource-list">
+                <div v-for="entry in toolResources" :key="entry.resource" class="tool-resource-row">
+                  <span :class="['resource-state-dot', { 'is-active': entry.visible }]" />
+                  <code :title="entry.resource">{{ entry.resource }}</code>
+                  <button
+                    class="tool-row-action"
+                    type="button"
+                    :title="entry.visible ? 'Remove visibility' : 'Inject visibility'"
+                    :aria-label="entry.visible ? 'Remove visibility' : 'Inject visibility'"
+                    :disabled="
+                      connectionStatus !== 'online' ||
+                      !selectedAgentReady ||
+                      resourceSettingsPending ||
+                      !resourceSettingsReady
+                    "
+                    @click="toggleResourceVisibility(entry.resource, !entry.visible)"
+                  >
+                    <Eye v-if="entry.visible" :size="14" />
+                    <EyeOff v-else :size="14" />
+                  </button>
+                </div>
+              </div>
+              <span v-else class="tool-resource-empty">None</span>
+            </section>
           </div>
         </div>
       </footer>

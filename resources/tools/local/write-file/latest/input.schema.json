@@ -6,11 +6,11 @@
     "path": {
       "type": "string",
       "minLength": 1,
-      "description": "Absolute path or project-root-relative path of the UTF-8 text file to replace."
+      "description": "Absolute path or project-root-relative path of the UTF-8 text file to replace. Maximum file size: 16 MiB."
     },
     "content": {
       "type": "string",
-      "description": "Complete UTF-8 text to write to the file."
+      "description": "Complete UTF-8 text to write to the file. Empty text is allowed. Maximum UTF-8 byte length: 16 MiB."
     },
     "create_parent_directories": {
       "type": "boolean",

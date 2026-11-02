@@ -6,7 +6,6 @@ pub enum StorageErrorKind {
     Closed,
     InvalidRequest,
     InvalidRecord,
-    KeyConflict,
     SchemaMismatch,
     LifecycleMismatch,
     BlockMissing,

@@ -10,7 +10,7 @@ use inference_core::{ActiveInference, AgentInferenceConfig, ModelRoutes};
 use lua_runtime_core::DriverLuaVm;
 use margatroid_protocol::*;
 use mcl_core::{MclCommand, MclInstruction, MclQueue};
-use sandbox_resource_core::SelectedSandbox;
+use sandbox_resource_core::{Sandboxes, SelectedSandbox};
 use serde_json::{Value, json};
 use server_plugin::{
     RegisterConnection, WebSocketCloseReason, WebSocketConnectionId, WebSocketConnections,
@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use storage_core::{AgentStorage, StorageOperation, StorageValue};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use tool_resource_core::Tools;
 use workspace_core::{
     RestartWorkspace, StartWorkspace, StopWorkspace, Workspace, WorkspaceDefinitions,
     WorkspaceError, WorkspaceOperationOutput,
@@ -422,7 +423,7 @@ fn route(
                 id,
                 Some(live.clone()),
                 OperationKind::Mcl {
-                    source,
+                    source: source.clone(),
                     target: live.address.clone(),
                 },
             )?;
@@ -430,6 +431,7 @@ fn route(
             world.send_event(MclCommand {
                 id: operation.clone(),
                 source: client,
+                source_address: source,
                 source_instance: None,
                 target: live.entity,
                 instruction: MclInstruction {
@@ -1060,6 +1062,14 @@ fn metadata(world: &World) -> BackendStateDto {
                 sandbox: world
                     .get_component::<SelectedSandbox>(entity)
                     .and_then(|selected| selected.alias.clone()),
+                tools: world
+                    .get_component::<Tools>(entity)
+                    .map(|tools| tools.iter().map(|(alias, _)| alias.clone()).collect())
+                    .unwrap_or_default(),
+                sandboxes: world
+                    .get_component::<Sandboxes>(entity)
+                    .map(|sandboxes| sandboxes.iter().map(|(alias, _)| alias.clone()).collect())
+                    .unwrap_or_default(),
                 queued_commands: queue.map(|queue| queue.commands.len()).unwrap_or(0),
                 pending_command: queue.and_then(|queue| queue.pending.clone()),
                 context_window_tokens,
@@ -1105,7 +1115,7 @@ fn history_sync(
         .map(|entry| {
             let record = entry.record;
             Ok(HistoryMessageDto {
-                key: record.key,
+                source: record.source,
                 sequence: entry.sequence,
                 turn: record.turn,
                 kind: record.kind,
@@ -1257,11 +1267,13 @@ pub(crate) fn publish_state(world: &mut World) {
         if cache.metadata.as_ref() != Some(&current) {
             cache.metadata = Some(current);
             cache.dirty = true;
+            cache.retry_after = None;
         }
         cache.pending.is_none()
-            && cache
-                .retry_after
-                .is_none_or(|retry| Instant::now() >= retry)
+            && (!cache.state_waiters.is_empty()
+                || cache
+                    .retry_after
+                    .is_none_or(|retry| Instant::now() >= retry))
             && (cache.dirty
                 || cache.state.is_none()
                 || cache
@@ -1415,7 +1427,7 @@ pub(crate) fn handle_log(world: &World, event: LogReady) {
 pub(crate) fn handle_transport(_world: &mut World, event: TransportEvent) {
     match event {
         TransportEvent::Started(address) => tracing::info!(%address, "WebSocket server started"),
-        TransportEvent::Failed => tracing::error!("WebSocket server failed"),
+        TransportEvent::Failed(reason) => tracing::error!(%reason, "WebSocket server failed"),
         TransportEvent::Stopped => tracing::info!("WebSocket server stopped"),
         TransportEvent::Connected(connection) => {
             tracing::info!(connection = connection.get(), "WebSocket connected")

@@ -85,13 +85,15 @@ export interface AgentState {
   status: 'starting' | 'idle' | 'working' | 'restarting' | 'stopping';
   turn: string | null;
   sandbox: string | null;
+  tools: string[];
+  sandboxes: string[];
   queued_commands: number;
   pending_command: string | null;
   context_window_tokens?: number | null;
   error?: ProtocolError | null;
 }
 export interface HistoryMessage {
-  key: string;
+  source: string;
   sequence: number;
   turn: string | null;
   kind: string;
@@ -274,6 +276,8 @@ function agentState(value: unknown): boolean {
     ['starting', 'idle', 'working', 'restarting', 'stopping'].includes(String(value.status)) &&
     nullableString(value.turn) &&
     nullableString(value.sandbox) &&
+    strings(value.tools) &&
+    strings(value.sandboxes) &&
     integer(value.queued_commands) &&
     nullableString(value.pending_command) &&
     (value.context_window_tokens == null || integer(value.context_window_tokens)) &&
@@ -289,7 +293,7 @@ function history(value: unknown): boolean {
     value.messages.every(
       (entry) =>
         isRecord(entry) &&
-        string(entry.key) &&
+        string(entry.source) &&
         integer(entry.sequence) &&
         nullableString(entry.turn) &&
         string(entry.kind) &&

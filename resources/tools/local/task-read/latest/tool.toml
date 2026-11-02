@@ -1,3 +1,3 @@
 schema_version = 1
 name = "task_read"
-description = "Read new cached output and completion state from a tool task."
+description = "Read the target tool task cache and completion/error state. Reading advances its shared cache cursor, so later reads return only new output. If replaced is true, discard earlier displayed output and apply the returned output as its replacement. Cache remains readable after completion; task_return results are separate from cached output."

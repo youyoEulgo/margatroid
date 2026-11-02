@@ -1,3 +1,3 @@
 schema_version = 1
 name = "bash"
-description = "Open a persistent interactive Bash terminal. Returns task_id; use task_send with {text, enter} and task_read for subsequent interaction. Screen updates may replace earlier output. Close with task_finish."
+description = "Open a persistent interactive Bash PTY with no arguments. task_return returns task_id while the terminal task keeps running. Send {text: string, enter?: boolean} with task_send; enter=true appends a carriage return. Read cached screen updates with task_read: append output normally, or discard the previous display when replaced=true. Reading advances the shared cache cursor. Shell exit finishes the task; task_finish stops it and cleans up processes."

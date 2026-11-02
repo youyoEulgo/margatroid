@@ -10,6 +10,7 @@ pub type MclReply = Arc<Mutex<Option<oneshot::Sender<Result<MclValue, MclError>>
 pub struct MclCommand {
     pub id: String,
     pub source: Entity,
+    pub source_address: String,
     pub source_instance: Option<String>,
     pub target: Entity,
     pub instruction: MclInstruction,
