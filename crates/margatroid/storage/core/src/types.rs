@@ -41,6 +41,11 @@ pub enum StorageOperation {
     },
     ReadHistory,
     ReadHistoryEntries,
+    ReadAgentMessages,
+    ReadMclRecords,
+    DropTemporaryBlocks {
+        instance: String,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageSelector {
@@ -62,7 +67,6 @@ pub enum MessageSource {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryRecord {
-    pub key: String,
     pub source: String,
     pub turn: Option<String>,
     pub kind: String,

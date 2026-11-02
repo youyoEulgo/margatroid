@@ -1,4 +1,4 @@
-visible_tools = ["review", "list_dir", "read_file", "read_image", "write_file", "edit", "grep", "glob", "bash", "task_read", "task_send", "task_finish"]
+visible_tools = ["review", "list_dir", "read_file", "read_image", "write_file", "edit", "grep", "glob", "bash", "bash_exec", "task_read", "task_send", "task_finish", "project_context"]
 sandbox = ["workspace_write"]
 
 [compaction]

@@ -154,14 +154,22 @@ pub(crate) struct ProviderHttpRequest {
     pub url: Url,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
+    pub decoder: FormatDecoder,
 }
 impl ProviderHttpRequest {
-    fn new(method: Method, url: Url, headers: HeaderMap, body: Vec<u8>) -> Self {
+    fn new(
+        method: Method,
+        url: Url,
+        headers: HeaderMap,
+        body: Vec<u8>,
+        decoder: FormatDecoder,
+    ) -> Self {
         Self {
             method,
             url,
             headers,
             body,
+            decoder,
         }
     }
 }
@@ -198,14 +206,6 @@ impl ApiFormat {
             Self::ChatCompletions => "chat_completions",
             Self::Messages => "messages",
             Self::Responses => "responses",
-        }
-    }
-
-    pub(crate) fn build_request(self, request: DomainRequest) -> Result<ApiRequest> {
-        match self {
-            Self::ChatCompletions => Ok(ApiRequest::ChatCompletions(request.try_into()?)),
-            Self::Messages => Ok(ApiRequest::Messages(request.try_into()?)),
-            Self::Responses => Ok(ApiRequest::Responses(request.try_into()?)),
         }
     }
 }
@@ -316,19 +316,22 @@ fn user_content(content: String, images: Vec<InferenceImage>, format: ApiFormat)
     json!(parts)
 }
 
-fn replay_items(
-    replay: Option<Value>,
-    format: ApiFormat,
-    reasoning: Option<&str>,
-) -> Result<Vec<Value>> {
+fn replay_items(replay: Option<Value>, format: ApiFormat) -> Result<Vec<Value>> {
     let Some(replay) = replay else {
-        if reasoning.is_some_and(|text| !text.is_empty()) {
-            return Err(invalid("historical reasoning requires API replay metadata"));
-        }
         return Ok(Vec::new());
     };
+    let source: ApiFormat = serde_json::from_value(replay["api_format"].clone())
+        .map_err(|_| invalid("unknown historical reasoning replay API format"))?;
+    let items = strict_replay_items(&replay, source)?;
+    if source != format {
+        return Ok(Vec::new());
+    }
+    Ok(items)
+}
+
+fn strict_replay_items(replay: &Value, format: ApiFormat) -> Result<Vec<Value>> {
     if replay["api_format"] != format.as_str() {
-        return Err(invalid("historical reasoning replay API format mismatch"));
+        return Err(invalid("reasoning replay API format mismatch"));
     }
     let items = replay["items"]
         .as_array()
@@ -362,23 +365,37 @@ fn replay_items(
     Ok(items.clone())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ChatReasoning {
+    Omit,
+    Preserve,
+    DeepSeek { disabled: bool },
+}
+
+pub(crate) struct EncodeInput {
+    pub request: DomainRequest,
+    pub chat_reasoning: ChatReasoning,
+}
+
 impl TryFrom<DomainRequest> for ChatCompletionsRequest {
     type Error = InferenceError;
-    fn try_from(mut request: DomainRequest) -> Result<Self> {
-        normalize(&mut request)?;
-        if request.messages.iter().any(|message| {
-            matches!(
-                message,
-                InferenceMessage::Assistant {
-                    replay: Some(_),
-                    ..
-                }
-            )
-        }) {
-            return Err(invalid(
-                "Chat Completions cannot replay foreign reasoning metadata",
-            ));
+    fn try_from(request: DomainRequest) -> Result<Self> {
+        EncodeInput {
+            request,
+            chat_reasoning: ChatReasoning::Preserve,
         }
+        .try_into()
+    }
+}
+
+impl TryFrom<EncodeInput> for ChatCompletionsRequest {
+    type Error = InferenceError;
+    fn try_from(input: EncodeInput) -> Result<Self> {
+        let EncodeInput {
+            mut request,
+            chat_reasoning,
+        } = input;
+        normalize(&mut request)?;
         let mut messages = Vec::new();
         let mut pending = HashSet::new();
         let mut image_blocks = Vec::new();
@@ -390,14 +407,32 @@ impl TryFrom<DomainRequest> for ChatCompletionsRequest {
                 }
                 InferenceMessage::Assistant {
                     reasoning,
+                    replay,
                     content,
                     tool_calls,
                     ..
                 } => {
+                    replay_items(replay, ApiFormat::ChatCompletions)?;
+                    if matches!(chat_reasoning, ChatReasoning::Omit)
+                        && content.as_ref().is_none_or(String::is_empty)
+                        && tool_calls.is_empty()
+                    {
+                        continue;
+                    }
                     pending.extend(tool_calls.iter().map(|call| call.id.clone()));
                     let mut value = json!({"role":"assistant","content":content});
-                    if let Some(reasoning) = reasoning {
-                        value["reasoning_content"] = json!(reasoning);
+                    match chat_reasoning {
+                        ChatReasoning::Omit => {}
+                        ChatReasoning::Preserve => {
+                            if let Some(reasoning) = reasoning {
+                                value["reasoning_content"] = json!(reasoning);
+                            }
+                        }
+                        ChatReasoning::DeepSeek { disabled } => {
+                            if !disabled || !tool_calls.is_empty() {
+                                value["reasoning_content"] = json!(reasoning.unwrap_or_default());
+                            }
+                        }
                     }
                     if !tool_calls.is_empty() {
                         value["tool_calls"] = json!(tool_calls.into_iter().map(|call| json!({"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments.to_string()}})).collect::<Vec<_>>());
@@ -474,14 +509,12 @@ impl TryFrom<DomainRequest> for MessagesRequest {
                         .clone(),
                 ),
                 InferenceMessage::Assistant {
-                    reasoning,
                     replay,
                     content,
                     tool_calls,
                     ..
                 } => {
-                    let mut blocks =
-                        replay_items(replay, ApiFormat::Messages, reasoning.as_deref())?;
+                    let mut blocks = replay_items(replay, ApiFormat::Messages)?;
                     if let Some(content) = content {
                         blocks.push(json!({"type":"text","text":content}));
                     }
@@ -489,7 +522,7 @@ impl TryFrom<DomainRequest> for MessagesRequest {
                         blocks.push(json!({"type":"tool_use","id":call.id,"name":call.name,"input":call.arguments}));
                     }
                     if blocks.is_empty() {
-                        return Err(invalid("Messages assistant has no encodable content"));
+                        continue;
                     }
                     merge_message(&mut messages, "assistant", blocks);
                 }
@@ -529,17 +562,12 @@ impl TryFrom<DomainRequest> for ResponsesRequest {
                     input.push(json!({"role":"user","content":user_content(content, images, ApiFormat::Responses)}))
                 }
                 InferenceMessage::Assistant {
-                    reasoning,
                     replay,
                     content,
                     tool_calls,
                     ..
                 } => {
-                    input.extend(replay_items(
-                        replay,
-                        ApiFormat::Responses,
-                        reasoning.as_deref(),
-                    )?);
+                    input.extend(replay_items(replay, ApiFormat::Responses)?);
                     if let Some(content) = content {
                         input.push(json!({"role":"assistant","content":[{"type":"output_text","text":content}]}));
                     }
@@ -617,20 +645,82 @@ impl Vendor {
     }
 }
 
-pub(crate) struct VendorAdapter {
-    vendor: Vendor,
-    format: ApiFormat,
+pub(crate) struct Transport {
     base_url: Url,
     api_key: String,
-    thinking: Option<ThinkingMode>,
+}
+
+#[derive(Default, Serialize)]
+struct DeepSeekOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingOption>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ThinkingOption {
+    r#type: &'static str,
+}
+
+#[derive(Default, Serialize)]
+struct OpenRouterOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<RouterReasoning>,
+}
+
+#[derive(Serialize)]
+struct RouterReasoning {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+}
+
+#[derive(Serialize)]
+struct VendorRequest<'a, T, O> {
+    #[serde(flatten)]
+    request: &'a T,
+    #[serde(flatten)]
+    options: &'a O,
+}
+
+pub(crate) struct OpenAi<T> {
+    transport: Transport,
+    request: std::marker::PhantomData<T>,
+}
+
+pub(crate) struct Anthropic<T> {
+    transport: Transport,
+    request: std::marker::PhantomData<T>,
+}
+
+pub(crate) struct DeepSeek<T> {
+    transport: Transport,
+    options: DeepSeekOptions,
+    request: std::marker::PhantomData<T>,
+}
+
+pub(crate) struct OpenRouter<T> {
+    transport: Transport,
+    options: OpenRouterOptions,
+    request: std::marker::PhantomData<T>,
+}
+
+pub(crate) enum ApiAdapter {
+    OpenAiChat(OpenAi<ChatCompletionsRequest>),
+    OpenAiResponses(OpenAi<ResponsesRequest>),
+    AnthropicMessages(Anthropic<MessagesRequest>),
+    DeepSeekChat(DeepSeek<ChatCompletionsRequest>),
+    DeepSeekMessages(DeepSeek<MessagesRequest>),
+    DeepSeekResponses(DeepSeek<ResponsesRequest>),
+    OpenRouterChat(OpenRouter<ChatCompletionsRequest>),
 }
 
 pub(crate) fn build_adapter(
     vendor: Vendor,
     format: ApiFormat,
     route: ProviderRouteInput<'_>,
-) -> Result<VendorAdapter> {
+) -> Result<ApiAdapter> {
     let invalid = |message| InferenceError::new(InferenceErrorKind::InvalidModelRoute, message);
     if !vendor.supports(format) {
         return Err(invalid("provider does not support the selected API format"));
@@ -644,9 +734,7 @@ pub(crate) fn build_adapter(
         && format == ApiFormat::ChatCompletions)
         && (route.thinking.is_some() || route.reasoning_effort.is_some())
     {
-        return Err(invalid(
-            "thinking/reasoning_effort options are supported only for DeepSeek/OpenRouter chat_completions",
-        ));
+        return Err(invalid("thinking/reasoning_effort options are supported only for DeepSeek/OpenRouter chat_completions"));
     }
     let thinking = route
         .thinking
@@ -658,99 +746,207 @@ pub(crate) fn build_adapter(
     let reasoning_effort = match (thinking, route.reasoning_effort) {
         (Some(ThinkingMode::Enabled), Some("high")) => Some("high".to_owned()),
         (Some(ThinkingMode::Enabled), Some("max")) if vendor == Vendor::DeepSeek => Some("max".to_owned()),
-        (Some(ThinkingMode::Enabled), None) => {
-            return Err(invalid(
-                "enabled thinking requires reasoning_effort",
-            ))
-        }
+        (Some(ThinkingMode::Enabled), None) => return Err(invalid("enabled thinking requires reasoning_effort")),
         (_, None) => None,
-        _ => {
-            return Err(invalid(
-                "reasoning_effort requires enabled thinking: DeepSeek supports high/max; OpenRouter supports high",
-            ))
-        }
+        _ => return Err(invalid("reasoning_effort requires enabled thinking: DeepSeek supports high/max; OpenRouter supports high")),
     };
-    Ok(VendorAdapter {
-        vendor,
-        format,
+    let transport = Transport {
         base_url: route.base_url.clone(),
         api_key: route.api_key.to_owned(),
-        thinking,
-        reasoning_effort,
+    };
+    let request = std::marker::PhantomData;
+    Ok(match (vendor, format) {
+        (Vendor::OpenAi, ApiFormat::ChatCompletions) => {
+            ApiAdapter::OpenAiChat(OpenAi { transport, request })
+        }
+        (Vendor::OpenAi, ApiFormat::Responses) => ApiAdapter::OpenAiResponses(OpenAi {
+            transport,
+            request: std::marker::PhantomData,
+        }),
+        (Vendor::Anthropic, ApiFormat::Messages) => ApiAdapter::AnthropicMessages(Anthropic {
+            transport,
+            request: std::marker::PhantomData,
+        }),
+        (Vendor::DeepSeek, ApiFormat::ChatCompletions) => ApiAdapter::DeepSeekChat(DeepSeek {
+            transport,
+            options: DeepSeekOptions {
+                thinking: thinking.map(|mode| ThinkingOption {
+                    r#type: mode.as_str(),
+                }),
+                reasoning_effort,
+            },
+            request,
+        }),
+        (Vendor::DeepSeek, ApiFormat::Messages) => ApiAdapter::DeepSeekMessages(DeepSeek {
+            transport,
+            options: DeepSeekOptions::default(),
+            request: std::marker::PhantomData,
+        }),
+        (Vendor::DeepSeek, ApiFormat::Responses) => ApiAdapter::DeepSeekResponses(DeepSeek {
+            transport,
+            options: DeepSeekOptions::default(),
+            request: std::marker::PhantomData,
+        }),
+        (Vendor::OpenRouter, ApiFormat::ChatCompletions) => {
+            ApiAdapter::OpenRouterChat(OpenRouter {
+                transport,
+                options: OpenRouterOptions {
+                    reasoning: thinking.map(|mode| RouterReasoning {
+                        enabled: mode == ThinkingMode::Enabled,
+                        effort: reasoning_effort,
+                    }),
+                },
+                request,
+            })
+        }
+        _ => return Err(invalid("provider does not support the selected API format")),
     })
 }
 
-impl VendorAdapter {
-    fn process_request(&self, request: ApiRequest) -> Result<ProviderHttpRequest> {
-        let mut body = match request {
-            ApiRequest::ChatCompletions(request) => serde_json::to_value(request),
-            ApiRequest::Messages(request) => serde_json::to_value(request),
-            ApiRequest::Responses(request) => serde_json::to_value(request),
-        }
-        .map_err(|_| {
-            InferenceError::new(
-                InferenceErrorKind::InvalidRequest,
-                "provider request could not be encoded",
-            )
-        })?;
-        if self.vendor == Vendor::DeepSeek {
-            if let Some(thinking) = self.thinking {
-                body["thinking"] = serde_json::json!({"type": thinking.as_str()});
-            }
-            if let Some(effort) = &self.reasoning_effort {
-                body["reasoning_effort"] = serde_json::json!(effort);
-            }
-            if self.format == ApiFormat::ChatCompletions {
-                if let Some(messages) = body["messages"].as_array_mut() {
-                    for message in messages {
-                        if message["role"] != "assistant" {
-                            continue;
-                        }
-                        let preserve = self.thinking != Some(ThinkingMode::Disabled)
-                            || message.get("tool_calls").is_some();
-                        if preserve {
-                            message
-                                .as_object_mut()
-                                .unwrap()
-                                .entry("reasoning_content")
-                                .or_insert_with(|| serde_json::json!(""));
-                        } else {
-                            message.as_object_mut().unwrap().remove("reasoning_content");
-                        }
-                    }
+impl ApiAdapter {
+    pub(crate) fn encode(&self, request: DomainRequest) -> Result<ApiRequest> {
+        match self {
+            Self::OpenAiChat(_) => Ok(ApiRequest::ChatCompletions(
+                EncodeInput {
+                    request,
+                    chat_reasoning: ChatReasoning::Omit,
                 }
-            }
-        } else if self.vendor == Vendor::OpenRouter {
-            if let Some(thinking) = self.thinking {
-                body["reasoning"] =
-                    serde_json::json!({"enabled": thinking == ThinkingMode::Enabled});
-                if let Some(effort) = &self.reasoning_effort {
-                    body["reasoning"]["effort"] = serde_json::json!(effort);
+                .try_into()?,
+            )),
+            Self::DeepSeekChat(handler) => Ok(ApiRequest::ChatCompletions(
+                EncodeInput {
+                    request,
+                    chat_reasoning: ChatReasoning::DeepSeek {
+                        disabled: handler
+                            .options
+                            .thinking
+                            .as_ref()
+                            .is_some_and(|option| option.r#type == "disabled"),
+                    },
                 }
-            }
-        } else if self.format == ApiFormat::ChatCompletions {
-            if let Some(messages) = body["messages"].as_array_mut() {
-                for message in messages {
-                    if message["reasoning_content"]
-                        .as_str()
-                        .is_some_and(|text| !text.is_empty())
-                    {
-                        return Err(InferenceError::new(
-                            InferenceErrorKind::InvalidParameters,
-                            "OpenAI chat_completions cannot replay historical reasoning",
-                        ));
-                    }
-                    message
-                        .as_object_mut()
-                        .map(|object| object.remove("reasoning_content"));
+                .try_into()?,
+            )),
+            Self::OpenRouterChat(_) => Ok(ApiRequest::ChatCompletions(
+                EncodeInput {
+                    request,
+                    chat_reasoning: ChatReasoning::Preserve,
                 }
+                .try_into()?,
+            )),
+            Self::AnthropicMessages(_) | Self::DeepSeekMessages(_) => {
+                Ok(ApiRequest::Messages(request.try_into()?))
+            }
+            Self::OpenAiResponses(_) | Self::DeepSeekResponses(_) => {
+                Ok(ApiRequest::Responses(request.try_into()?))
             }
         }
-        let suffix = match (self.vendor, self.format) {
-            (_, ApiFormat::ChatCompletions) => "/chat/completions",
-            (_, ApiFormat::Messages) => "/messages",
-            (_, ApiFormat::Responses) => "/responses",
-        };
+    }
+
+    pub(crate) fn process_request(&self, request: ApiRequest) -> Result<ProviderHttpRequest> {
+        match (self, request) {
+            (Self::OpenAiChat(handler), ApiRequest::ChatCompletions(request)) => {
+                handler.process(request)
+            }
+            (Self::OpenAiResponses(handler), ApiRequest::Responses(request)) => {
+                handler.process(request)
+            }
+            (Self::AnthropicMessages(handler), ApiRequest::Messages(request)) => {
+                handler.process(request)
+            }
+            (Self::DeepSeekChat(handler), ApiRequest::ChatCompletions(request)) => {
+                handler.process(request)
+            }
+            (Self::DeepSeekMessages(handler), ApiRequest::Messages(request)) => {
+                handler.process(request)
+            }
+            (Self::DeepSeekResponses(handler), ApiRequest::Responses(request)) => {
+                handler.process(request)
+            }
+            (Self::OpenRouterChat(handler), ApiRequest::ChatCompletions(request)) => {
+                handler.process(request)
+            }
+            _ => Err(invalid(
+                "request format does not match the selected API adapter",
+            )),
+        }
+    }
+}
+
+impl OpenAi<ChatCompletionsRequest> {
+    fn process(&self, request: ChatCompletionsRequest) -> Result<ProviderHttpRequest> {
+        self.transport.prepare(
+            &request,
+            "/chat/completions",
+            false,
+            ApiFormat::ChatCompletions,
+        )
+    }
+}
+
+impl OpenAi<ResponsesRequest> {
+    fn process(&self, request: ResponsesRequest) -> Result<ProviderHttpRequest> {
+        self.transport
+            .prepare(&request, "/responses", false, ApiFormat::Responses)
+    }
+}
+
+impl Anthropic<MessagesRequest> {
+    fn process(&self, request: MessagesRequest) -> Result<ProviderHttpRequest> {
+        self.transport
+            .prepare(&request, "/messages", true, ApiFormat::Messages)
+    }
+}
+
+impl DeepSeek<ChatCompletionsRequest> {
+    fn process(&self, request: ChatCompletionsRequest) -> Result<ProviderHttpRequest> {
+        self.transport.prepare(
+            &VendorRequest {
+                request: &request,
+                options: &self.options,
+            },
+            "/chat/completions",
+            false,
+            ApiFormat::ChatCompletions,
+        )
+    }
+}
+
+impl DeepSeek<MessagesRequest> {
+    fn process(&self, request: MessagesRequest) -> Result<ProviderHttpRequest> {
+        self.transport
+            .prepare(&request, "/messages", true, ApiFormat::Messages)
+    }
+}
+
+impl DeepSeek<ResponsesRequest> {
+    fn process(&self, request: ResponsesRequest) -> Result<ProviderHttpRequest> {
+        self.transport
+            .prepare(&request, "/responses", false, ApiFormat::Responses)
+    }
+}
+
+impl OpenRouter<ChatCompletionsRequest> {
+    fn process(&self, request: ChatCompletionsRequest) -> Result<ProviderHttpRequest> {
+        self.transport.prepare(
+            &VendorRequest {
+                request: &request,
+                options: &self.options,
+            },
+            "/chat/completions",
+            false,
+            ApiFormat::ChatCompletions,
+        )
+    }
+}
+
+impl Transport {
+    fn prepare<T: Serialize>(
+        &self,
+        request: &T,
+        suffix: &str,
+        messages_auth: bool,
+        format: ApiFormat,
+    ) -> Result<ProviderHttpRequest> {
         let url = Url::parse(&format!(
             "{}{}",
             self.base_url.as_str().trim_end_matches('/'),
@@ -769,7 +965,7 @@ impl VendorAdapter {
                 "provider authorization header is invalid",
             )
         };
-        if self.format == ApiFormat::Messages {
+        if messages_auth {
             headers.insert(
                 "x-api-key",
                 HeaderValue::from_str(&self.api_key).map_err(header_error)?,
@@ -783,7 +979,7 @@ impl VendorAdapter {
         }
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        let body = serde_json::to_vec(&body).map_err(|_| {
+        let body = serde_json::to_vec(request).map_err(|_| {
             InferenceError::new(
                 InferenceErrorKind::InvalidRequest,
                 "provider request could not be encoded",
@@ -795,7 +991,13 @@ impl VendorAdapter {
                 "encoded provider request exceeds 32 MiB",
             ));
         }
-        Ok(ProviderHttpRequest::new(Method::POST, url, headers, body))
+        Ok(ProviderHttpRequest::new(
+            Method::POST,
+            url,
+            headers,
+            body,
+            FormatDecoder::new(format),
+        ))
     }
 }
 
@@ -1001,7 +1203,7 @@ pub(crate) fn build_request(
             reasoning_effort: route.reasoning_effort.as_deref(),
         },
     )?;
-    adapter.process_request(format.build_request(input)?)
+    adapter.process_request(adapter.encode(input)?)
 }
 
 impl ResponseAccumulator {
@@ -1173,8 +1375,13 @@ impl ResponseAccumulator {
                 "responses" => ApiFormat::Responses,
                 _ => return Err(decode("invalid replay format")),
             };
-            replay_items(replay.clone(), format, Some(&self.reasoning))
-                .map_err(|_| decode("response reasoning replay is incomplete"))?;
+            strict_replay_items(
+                replay
+                    .as_ref()
+                    .ok_or_else(|| decode("response reasoning replay is missing"))?,
+                format,
+            )
+            .map_err(|_| decode("response reasoning replay is incomplete"))?;
         }
         Ok(InferenceResponse {
             content: (!self.content.is_empty()).then(|| self.content.clone()),
@@ -1384,8 +1591,36 @@ impl FormatDecoder {
                 return Err(decode("unexpected Chat choice index"));
             }
             self.started = true;
-            if self.reason.is_some() {
-                return Err(decode("Chat choice after finish_reason"));
+            if let Some(previous) = &self.reason {
+                let delta = choice.get("delta").or_else(|| choice.get("message"));
+                let empty_delta = delta.is_some_and(|delta| {
+                    delta.as_object().is_some_and(|fields| {
+                        fields.iter().all(|(key, value)| match key.as_str() {
+                            "content" | "reasoning" | "reasoning_content" => {
+                                value.is_null() || value.as_str() == Some("")
+                            }
+                            "role" => value.is_null() || value.as_str() == Some("assistant"),
+                            "tool_calls" => {
+                                value.is_null() || value.as_array().is_some_and(Vec::is_empty)
+                            }
+                            _ => value.is_null(),
+                        })
+                    })
+                });
+                let repeated_reason = choice
+                    .get("finish_reason")
+                    .filter(|value| !value.is_null())
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(stop_reason)
+                            .ok_or_else(|| decode("invalid finish_reason"))
+                    })
+                    .transpose()?;
+                if !empty_delta || repeated_reason.is_some_and(|reason| reason != *previous) {
+                    return Err(decode("Chat choice after finish_reason"));
+                }
+                continue;
             }
             let delta = choice
                 .get("delta")
@@ -1899,3 +2134,7 @@ impl FormatDecoder {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/internal/adapters.rs"]
+mod adapter_tests;

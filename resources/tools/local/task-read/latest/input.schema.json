@@ -2,7 +2,9 @@
   "type": "object",
   "properties": {
     "task_id": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1,
+      "description": "Nonempty id of the target tool task."
     }
   },
   "required": [

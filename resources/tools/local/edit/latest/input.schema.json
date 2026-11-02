@@ -5,7 +5,7 @@
     "path": {
       "type": "string",
       "minLength": 1,
-      "description": "Absolute path or project-root-relative path of the UTF-8 text file to edit."
+      "description": "Absolute path or project-root-relative path of the UTF-8 text file to edit. Maximum file size: 16 MiB."
     },
     "old_string": {
       "type": "string",
@@ -19,9 +19,13 @@
     "replace_all": {
       "type": "boolean",
       "default": false,
-      "description": "Replace every occurrence. Defaults to false, which requires exactly one match."
+      "description": "Replace every occurrence. Defaults to false, which requires exactly one match. Matches do not overlap; resulting file must fit within 16 MiB."
     }
   },
-  "required": ["path", "old_string", "new_string"],
+  "required": [
+    "path",
+    "old_string",
+    "new_string"
+  ],
   "additionalProperties": false
 }

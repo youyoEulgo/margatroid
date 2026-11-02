@@ -67,8 +67,8 @@ fn mixed_literal_and_stored_sources_use_one_snapshot_during_external_writes() {
         for n in 1..100 {
             writer
                 .execute(
-                    "UPDATE storage_messages SET value_json=?1",
-                    [json!([n]).to_string()],
+                    "UPDATE blocks SET fields_json=?1",
+                    [json!({"messages":[n]}).to_string()],
                 )
                 .unwrap();
         }
@@ -80,7 +80,7 @@ fn mixed_literal_and_stored_sources_use_one_snapshot_during_external_writes() {
                 sources: vec![
                     MessageSource::Stored(selector("a", Some("current"))),
                     MessageSource::Literal(vec![json!("prompt")]),
-                    MessageSource::Stored(selector("b", Some("current"))),
+                    MessageSource::Stored(selector("a", Some("current"))),
                 ],
             },
         )
@@ -241,8 +241,8 @@ fn persistent_and_current_temp_selectors_share_one_snapshot_during_external_upda
         for n in 1..100 {
             writer
                 .execute(
-                    "UPDATE storage_messages SET value_json=?1",
-                    [json!([n]).to_string()],
+                    "UPDATE blocks SET fields_json=?1",
+                    [json!({"messages":[n]}).to_string()],
                 )
                 .unwrap();
         }
@@ -253,6 +253,7 @@ fn persistent_and_current_temp_selectors_share_one_snapshot_during_external_upda
             StorageOperation::ReadMessages {
                 selectors: vec![
                     selector("persistent", Some("current-vm")),
+                    selector("persistent", Some("current-vm")),
                     selector("temp", Some("current-vm")),
                 ],
             },
@@ -260,8 +261,9 @@ fn persistent_and_current_temp_selectors_share_one_snapshot_during_external_upda
         .unwrap() else {
             panic!()
         };
-        assert_eq!(values.len(), 2);
+        assert_eq!(values.len(), 3);
         assert_eq!(values[0], values[1]);
+        assert_eq!(values[2], json!(0));
     }
     worker.join().unwrap();
 }

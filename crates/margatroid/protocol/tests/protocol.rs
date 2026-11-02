@@ -123,7 +123,7 @@ fn stream_and_history_wire_preserve_existing_fields_without_internal_domain_type
             workspace: reference,
             agent: "agent:demo/coder".into(),
             messages: vec![HistoryMessageDto {
-                key: "persisted".into(),
+                source: "client:webui/browser:latest".into(),
                 sequence: 73,
                 turn: None,
                 kind: "message".into(),
@@ -139,7 +139,13 @@ fn stream_and_history_wire_preserve_existing_fields_without_internal_domain_type
         value["history"]["workspace"]["id"],
         "workspace:local/demo:latest"
     );
-    assert_eq!(value["history"]["messages"][0]["sequence"], 73);
+    let record = &value["history"]["messages"][0];
+    assert_eq!(record["sequence"], 73);
+    assert_eq!(record["source"], "client:webui/browser:latest");
+    assert!(record.get("key").is_none());
+    let mut missing_source = record.clone();
+    missing_source.as_object_mut().unwrap().remove("source");
+    assert!(serde_json::from_value::<HistoryMessageDto>(missing_source).is_err());
     assert_eq!(
         value["history"]["messages"][0]["created_at_ms"],
         1_700_000_000_123_u64

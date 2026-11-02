@@ -304,7 +304,7 @@ impl Harness {
             std::thread::yield_now();
         }
     }
-    fn append(&self, key: &str, timestamp: u64) {
+    fn append(&self, content: &str, timestamp: u64) {
         let storage = self
             .app
             .world()
@@ -314,12 +314,11 @@ impl Harness {
             storage,
             StorageOperation::AppendHistory {
                 records: vec![HistoryRecord {
-                    key: key.into(),
-                    source: "fixture".into(),
+                    source: "agent:demo/coder:latest".into(),
                     turn: None,
                     kind: "message".into(),
-                    content: key.into(),
-                    payload: json!({"type": "user", "content": key}),
+                    content: content.into(),
+                    payload: json!({"type": "user", "content": content}),
                     created_at_ms: Some(timestamp),
                 }],
             },
@@ -374,7 +373,9 @@ fn websocket_registration_mcl_reply_and_audit_use_original_network_identity() {
             .iter()
             .any(|entry| entry["kind"] == "mcl"
                 && entry["payload"]["id"].as_str().unwrap().starts_with("dto:")
-                && entry["payload"]["id"] != "network-id")
+                && entry["payload"]["id"] != "network-id"
+                && entry["source"] == registered["client"]["resource_id"]
+                && entry.get("key").is_none())
     );
 }
 
@@ -527,7 +528,7 @@ fn persisted_history_sequences_timestamps_and_state_histories_are_not_reinvented
     harness.append("second", 5678);
     let connection = rusqlite::Connection::open(harness.root.path().join("state.sqlite")).unwrap();
     connection
-        .execute("DELETE FROM history_records WHERE key='first'", [])
+        .execute("DELETE FROM agent_messages WHERE sequence=1", [])
         .unwrap();
     let (mut socket, _) = harness.connect();
     harness.register(&mut socket, "webui", "browser");
@@ -539,6 +540,11 @@ fn persisted_history_sequences_timestamps_and_state_histories_are_not_reinvented
     );
     let history = harness.next(&mut socket, |value| value["type"] == "history.result");
     assert_eq!(history["history"]["messages"][0]["sequence"], 2);
+    assert_eq!(
+        history["history"]["messages"][0]["source"],
+        "agent:demo/coder:latest"
+    );
+    assert!(history["history"]["messages"][0].get("key").is_none());
     assert_eq!(history["history"]["messages"][0]["created_at_ms"], 5678);
     harness.request(&mut socket, "state.query", "state", json!({}));
     let state = harness.next(&mut socket, |value| {
@@ -547,10 +553,7 @@ fn persisted_history_sequences_timestamps_and_state_histories_are_not_reinvented
                 .as_array()
                 .is_some_and(|histories| !histories.is_empty())
     });
-    assert_eq!(
-        state["state"]["histories"][0]["messages"][0]["key"],
-        "second"
-    );
+    assert_eq!(state["state"]["histories"][0]["messages"][0]["sequence"], 2);
     harness
         .app
         .world_mut()
@@ -560,13 +563,8 @@ fn persisted_history_sequences_timestamps_and_state_histories_are_not_reinvented
     let state = harness.next(&mut socket, |value| {
         value["type"] == "state.sync" && value["state"]["agents"][0]["status"] == "working"
     });
-    assert_eq!(
-        state["state"]["histories"][0]["messages"][0]["key"],
-        "second"
-    );
-    connection
-        .execute("DROP TABLE history_records", [])
-        .unwrap();
+    assert_eq!(state["state"]["histories"][0]["messages"][0]["sequence"], 2);
+    connection.execute("DROP TABLE agent_messages", []).unwrap();
     harness.request(
         &mut socket,
         "history.query",
@@ -576,7 +574,7 @@ fn persisted_history_sequences_timestamps_and_state_histories_are_not_reinvented
     let failure = harness.next(&mut socket, |value| value["id"] == "broken");
     assert_eq!(failure["type"], "request.failed");
     assert_eq!(failure["error"]["kind"], "HistoryReadFailed");
-    assert!(!failure.to_string().contains("history_records"));
+    assert!(!failure.to_string().contains("agent_messages"));
 }
 
 #[test]
@@ -844,12 +842,11 @@ fn oversized_history_and_state_queries_return_correlated_failures() {
         storage,
         StorageOperation::AppendHistory {
             records: vec![HistoryRecord {
-                key: "large".into(),
-                source: "fixture".into(),
+                source: "agent:demo/coder:latest".into(),
                 turn: None,
                 kind: "message".into(),
                 content: "x".repeat(margatroid_protocol::MAX_MESSAGE_BYTES),
-                payload: json!({}),
+                payload: json!({"type": "user", "content": "x".repeat(margatroid_protocol::MAX_MESSAGE_BYTES)}),
                 created_at_ms: Some(123),
             }],
         },
@@ -954,4 +951,50 @@ fn stale_vm_mcl_results_do_not_bind_to_new_instance_and_invalid_input_never_echo
         }
         assert!(Instant::now() < deadline);
     }
+}
+
+#[test]
+fn resource_panel_snapshot_advertises_imported_aliases_without_file_paths() {
+    use sandbox_resource_core::{Sandboxes, SelectedSandbox};
+    use tool_resource_core::Tools;
+    let mut harness = Harness::new();
+    let mut tools = Tools::default();
+    tools.insert(
+        "bash".into(),
+        harness.root.path().join("private/bash/tool.toml"),
+    );
+    tools.insert(
+        "read_file".into(),
+        harness.root.path().join("private/read-file/tool.toml"),
+    );
+    let mut sandboxes = Sandboxes::default();
+    sandboxes.insert(
+        "read_only".into(),
+        harness.root.path().join("private/read-only/policy.json"),
+    );
+    harness
+        .app
+        .world_mut()
+        .insert_component(harness.agent, tools);
+    harness
+        .app
+        .world_mut()
+        .insert_component(harness.agent, sandboxes);
+    harness.app.world_mut().insert_component(
+        harness.agent,
+        SelectedSandbox {
+            alias: Some("read_only".into()),
+        },
+    );
+    let (mut socket, _) = harness.connect();
+    harness.register(&mut socket, "webui", "resource-panel");
+    harness.request(&mut socket, "state.query", "resources", json!({}));
+    let state = harness.next(&mut socket, |value| {
+        value["type"] == "state.sync"
+            && value["state"]["agents"][0]["tools"] == json!(["bash", "read_file"])
+    });
+    let agent = &state["state"]["agents"][0];
+    assert_eq!(agent["sandboxes"], json!(["read_only"]));
+    assert_eq!(agent["sandbox"], "read_only");
+    assert!(!agent.to_string().contains("private/"));
 }

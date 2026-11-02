@@ -234,6 +234,12 @@ fn mcl(
     app.world().emit_event(MclCommand {
         id: id.into(),
         source,
+        source_address: app
+            .world()
+            .get_component::<address::Address>(source)
+            .unwrap()
+            .as_str()
+            .to_owned(),
         target,
         source_instance,
         instruction: MclInstruction {
@@ -297,6 +303,10 @@ fn real_agent_restart_allows_current_driver_initialization_but_refuses_external_
                 .is_some_and(|vm| vm.instance != old)
     });
     let external = fixture.app.world_mut().spawn();
+    fixture.app.world_mut().insert_component(
+        external,
+        address::Address::new("client:local/external:latest").unwrap(),
+    );
     let mut external_reply = mcl(
         &fixture.app,
         external,

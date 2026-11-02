@@ -88,7 +88,8 @@ MclCommandDto
 MclCommandResultDto
     id/source/target/result/history_error
 HistoryMessageDto
-    key/sequence/turn/kind/content/payload/created_at_ms
+    source:String（必需真实来源地址）/sequence/turn/kind/content/payload/created_at_ms
+    sequence结合Workspace与Agent标识记录；content按调用方原值保留，独立于payload，不派生或兼容旧历史key
 StreamDelta（wire契约，无需虚构同名Rust结构体）
     type为agent.message.delta或agent.message.reasoning_delta
     id/agent/agent_instance/sequence/content，无kind字段

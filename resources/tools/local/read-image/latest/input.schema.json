@@ -3,9 +3,13 @@
   "properties": {
     "path": {
       "type": "string",
-      "description": "Image file path, absolute or relative to the current project root."
+      "description": "Image file path, absolute or relative to the current project root.",
+      "minLength": 1
     }
   },
-  "required": ["path"],
-  "additionalProperties": false
+  "required": [
+    "path"
+  ],
+  "additionalProperties": false,
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
 }

@@ -1,4 +1,5 @@
 use crate::types::*;
+use address::Address;
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
 use async_runtime_plugin::WorldAsyncExt;
 use core_plugin::World;
@@ -68,7 +69,17 @@ pub(crate) fn handle_start_driver_lua_vm(world: &mut World, request: StartDriver
             ));
         }
         validate_environment(&request.environment)?;
-        world
+        let source_address = world
+            .get_component::<Address>(request.owner)
+            .ok_or_else(|| {
+                failure(
+                    LuaRuntimeErrorKind::InvalidRequest,
+                    "VM owner address is missing",
+                )
+            })?
+            .as_str()
+            .to_owned();
+        let entry = world
             .get_component::<WorkspaceExecutor>(request.workspace)
             .map(|executor| executor.entry.clone())
             .ok_or_else(|| {
@@ -76,9 +87,10 @@ pub(crate) fn handle_start_driver_lua_vm(world: &mut World, request: StartDriver
                     LuaRuntimeErrorKind::InstanceNotFound,
                     "Workspace executor is missing",
                 )
-            })
+            })?;
+        Ok((entry, source_address))
     })();
-    let entry = match entry {
+    let (entry, source_address) = match entry {
         Ok(entry) => entry,
         Err(error) => {
             reply_start(&reply, Err(error));
@@ -106,6 +118,7 @@ pub(crate) fn handle_start_driver_lua_vm(world: &mut World, request: StartDriver
     );
     let events = world.event_sender();
     let run = RunContext {
+        source_address,
         instance: instance.clone(),
         program: request.program,
         environment: request.environment,
@@ -360,6 +373,7 @@ async fn stop_vm(context: StopContext) -> Result<StopOutput, StopError> {
 
 async fn run_driver(context: RunContext) {
     let RunContext {
+        source_address,
         instance,
         program,
         environment,
@@ -373,10 +387,14 @@ async fn run_driver(context: RunContext) {
     let result = AssertUnwindSafe(execute_lua(
         program,
         environment,
-        instance.clone(),
+        MclHost {
+            instance: instance.clone(),
+            source_address,
+            events: events.clone(),
+            cancel: cancel.clone(),
+        },
         wake.clone(),
         cancel.clone(),
-        events.clone(),
         config,
     ))
     .catch_unwind()
@@ -447,6 +465,7 @@ impl LuaHostFunction for WaitHost {
 }
 
 struct MclHost {
+    source_address: String,
     instance: DriverLuaVmInstance,
     events: RuntimeEventSender,
     cancel: CancellationToken,
@@ -454,6 +473,7 @@ struct MclHost {
 impl LuaHostFunction for MclHost {
     fn call(&self, arguments: Vec<LuaValue>, cancel: CancellationToken) -> HostFuture {
         let instance = self.instance.clone();
+        let source_address = self.source_address.clone();
         let events = self.events.clone();
         let vm_cancel = self.cancel.clone();
         Box::pin(async move {
@@ -469,6 +489,7 @@ impl LuaHostFunction for MclHost {
             events.send_event(MclCommand {
                 id: next_id("lua-mcl"),
                 source: instance.owner,
+                source_address,
                 source_instance: Some(instance.start_id),
                 target: instance.owner,
                 instruction: MclInstruction {
@@ -545,10 +566,9 @@ fn mcl_arguments(
 async fn execute_lua(
     program: LuaProgram,
     environment: LuaEnvironment,
-    instance: DriverLuaVmInstance,
+    mcl_host: MclHost,
     wake: Arc<Mutex<DriverWakeSlot>>,
     cancel: CancellationToken,
-    events: RuntimeEventSender,
     config: LuaRuntimeConfig,
 ) -> Result<(), LuaRuntimeError> {
     if cancel.is_cancelled() {
@@ -625,11 +645,7 @@ async fn execute_lua(
             .map_err(lua_error)?,
         )
         .map_err(lua_error)?;
-    let mcl: Arc<dyn LuaHostFunction> = Arc::new(MclHost {
-        instance,
-        events,
-        cancel: cancel.clone(),
-    });
+    let mcl: Arc<dyn LuaHostFunction> = Arc::new(mcl_host);
     let wait: Arc<dyn LuaHostFunction> = Arc::new(WaitHost { slot: wake });
     lua.globals()
         .set(

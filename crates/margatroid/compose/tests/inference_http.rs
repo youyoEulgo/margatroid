@@ -713,3 +713,247 @@ fn missing_or_mismatched_driver_vm_is_rejected_before_http_submission() {
             .is_none()
     );
 }
+
+fn historical_reasoning_fixture(replay: Option<Value>) -> Vec<InferenceMessage> {
+    vec![
+        InferenceMessage::User {
+            content: "previous question".into(),
+            images: vec![],
+        },
+        InferenceMessage::Assistant {
+            reasoning: Some("local historical reasoning stays intact".into()),
+            content: Some("previous answer".into()),
+            tool_calls: vec![InferenceToolCall {
+                id: "prior-call".into(),
+                name: "visible".into(),
+                arguments: json!({}),
+            }],
+            replay,
+        },
+        InferenceMessage::Tool {
+            call_id: "prior-call".into(),
+            content: "previous tool result".into(),
+            images: vec![],
+            failed: false,
+        },
+        InferenceMessage::User {
+            content: "continue".into(),
+            images: vec![],
+        },
+    ]
+}
+
+#[test]
+fn historical_reasoning_is_format_adapted_without_rewriting_local_messages() {
+    let messages_replay = json!({"api_format":"messages","items":[{"type":"thinking","thinking":"signed historical text","signature":"saved-signature"}]});
+    let responses_replay = json!({"api_format":"responses","items":[{"type":"reasoning","id":"saved-reasoning","summary":[],"encrypted_content":"saved-encrypted"}]});
+    for (provider, format) in [
+        ("openai", "chat_completions"),
+        ("openai", "responses"),
+        ("anthropic", "messages"),
+        ("deepseek", "chat_completions"),
+        ("deepseek", "messages"),
+        ("deepseek", "responses"),
+        ("openrouter", "chat_completions"),
+    ] {
+        let server = HttpServer::new(trace(format));
+        let mut fixture = Fixture::new(&server.url, provider, format);
+        fixture.tool("historical visible tool");
+        for (index, replay) in [
+            None,
+            Some(messages_replay.clone()),
+            Some(responses_replay.clone()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let messages = historical_reasoning_fixture(replay.clone());
+            let snapshot = messages.clone();
+            let (mut request, reply) = fixture.request(&format!("history-{index}"));
+            request.messages = messages.clone();
+            request.tools = vec!["visible".into()];
+            let response = fixture
+                .run(request, reply)
+                .unwrap_or_else(|e| panic!("{provider}/{format} {replay:?}: {e}"));
+            assert_eq!(response.content.as_deref(), Some("ok"));
+            fixture.idle();
+            let (_, _, body) = server
+                .received
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            let encoded = body.to_string();
+            assert!(encoded.contains("previous answer"), "{body}");
+            assert!(encoded.contains("previous tool result"), "{body}");
+            assert!(encoded.contains("prior-call"), "{body}");
+            assert!(encoded.contains("continue"), "{body}");
+            assert_eq!(messages, snapshot);
+            if format == "messages" && index == 1 {
+                assert!(encoded.contains("saved-signature"));
+                assert!(encoded.contains("signed historical text"));
+            } else {
+                assert!(!encoded.contains("saved-signature"));
+            }
+            if format == "responses" && index == 2 {
+                assert!(encoded.contains("saved-encrypted"));
+                assert!(encoded.contains("saved-reasoning"));
+            } else {
+                assert!(!encoded.contains("saved-encrypted"));
+            }
+            if format != "chat_completions" || provider == "openai" {
+                assert!(!encoded.contains("local historical reasoning stays intact"));
+            } else {
+                assert!(encoded.contains("local historical reasoning stays intact"));
+            }
+        }
+    }
+}
+
+#[test]
+fn malformed_reasoning_replay_fails_before_http_instead_of_silently_disappearing() {
+    for (format, replay) in [
+        (
+            "messages",
+            json!({"api_format":"messages","items":[{"type":"thinking","thinking":"missing signature"}]}),
+        ),
+        (
+            "responses",
+            json!({"api_format":"responses","items":[{"type":"reasoning","summary":[]}]}),
+        ),
+        ("responses", json!({"api_format":"unknown","items":[]})),
+    ] {
+        let server = HttpServer::new(trace(format));
+        let mut fixture = Fixture::new(&server.url, "deepseek", format);
+        fixture.tool("visible");
+        let (mut request, reply) = fixture.request("invalid-replay");
+        request.messages = historical_reasoning_fixture(Some(replay));
+        request.tools = vec!["visible".into()];
+        assert_eq!(
+            fixture.run(request, reply).unwrap_err().kind,
+            Kind::InvalidParameters
+        );
+        assert!(server.received.try_recv().is_err());
+    }
+}
+
+#[test]
+fn new_response_reasoning_metadata_survives_a_complete_second_http_round() {
+    for (provider, format, events, marker) in [
+        (
+            "anthropic",
+            "messages",
+            vec![
+                json!({"type":"message_start","message":{"role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"thought"}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"roundtrip-signature"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":"answer"}}),
+                json!({"type":"content_block_stop","index":1}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+                json!({"type":"message_stop"}),
+            ],
+            "roundtrip-signature",
+        ),
+        (
+            "deepseek",
+            "responses",
+            vec![
+                json!({"type":"response.created"}),
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"roundtrip-reason","summary":[],"encrypted_content":"roundtrip-encrypted"}}),
+                json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"thought"}),
+                json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"roundtrip-reason","summary":[{"type":"summary_text","text":"thought"}]}}),
+                json!({"type":"response.output_item.added","output_index":1,"item":{"type":"message","content":[]}}),
+                json!({"type":"response.output_text.delta","output_index":1,"delta":"answer"}),
+                json!({"type":"response.output_item.done","output_index":1,"item":{"type":"message","content":[{"type":"output_text","text":"answer"}]}}),
+                json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":2}}}),
+            ],
+            "roundtrip-encrypted",
+        ),
+    ] {
+        let response_trace = events
+            .into_iter()
+            .map(|v| format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap()))
+            .collect();
+        let first_server = HttpServer::new(response_trace);
+        let mut first = Fixture::new(&first_server.url, provider, format);
+        let (request, reply) = first.request("first-round");
+        let result = first.run(request, reply).unwrap();
+        first.idle();
+        assert_eq!(result.reasoning.as_deref(), Some("thought"));
+        assert!(result.replay.as_ref().unwrap().to_string().contains(marker));
+        let original = InferenceMessage::Assistant {
+            reasoning: result.reasoning,
+            content: result.content,
+            tool_calls: result.tool_calls,
+            replay: result.replay,
+        };
+        let serialized = serde_json::to_string(&original).unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let storage = storage_core::open_storage(
+            &storage_root.path().join("replay.sqlite"),
+            &storage_root.path().join("settings.toml"),
+            "",
+        )
+        .unwrap();
+        storage_core::execute_storage(
+            &storage,
+            storage_core::StorageOperation::CreateBlock {
+                name: "session".into(),
+                fields: vec!["conversation".into()],
+                instance: None,
+            },
+        )
+        .unwrap();
+        let selector = storage_core::MessageSelector {
+            block: "session".into(),
+            field: "conversation".into(),
+            instance: None,
+            selection: storage_core::MessageSelection::All,
+        };
+        storage_core::execute_storage(
+            &storage,
+            storage_core::StorageOperation::ReplaceMessages {
+                sources: vec![storage_core::MessageSource::Literal(vec![
+                    serde_json::to_value(&original).unwrap(),
+                ])],
+                target: selector.clone(),
+            },
+        )
+        .unwrap();
+        let storage_core::StorageValue::Messages(stored) = storage_core::execute_storage(
+            &storage,
+            storage_core::StorageOperation::ReadMessages {
+                selectors: vec![selector],
+            },
+        )
+        .unwrap() else {
+            panic!("stored replay")
+        };
+        let restored: InferenceMessage = serde_json::from_value(stored[0].clone()).unwrap();
+        assert_eq!(original, restored);
+        for target in [
+            format,
+            if format == "messages" {
+                "responses"
+            } else {
+                "messages"
+            },
+        ] {
+            let server = HttpServer::new(trace(target));
+            let mut second = Fixture::new(&server.url, "deepseek", target);
+            let (mut request, reply) = second.request("second-round");
+            request.messages.push(restored.clone());
+            request.messages.push(InferenceMessage::User {
+                content: "next".into(),
+                images: vec![],
+            });
+            second.run(request, reply).unwrap();
+            let (_, _, body) = server
+                .received
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            assert!(body.to_string().contains("answer"));
+            assert_eq!(body.to_string().contains(marker), target == format);
+            assert_eq!(serde_json::to_string(&original).unwrap(), serialized);
+        }
+    }
+}

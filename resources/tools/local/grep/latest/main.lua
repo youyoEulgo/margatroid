@@ -13,31 +13,30 @@ local function shell_quote(value)
     return "'" .. value:gsub("'", "'\\''") .. "'"
 end
 
--- The command runs through the shell the runner provides, which gives it a
--- terminal, a process group that is reclaimed on timeout, and an execution
--- budget. io.popen would give none of those.
+-- The host shell owns timeout and output budgets.
 local function run(command)
     local result = margatroid().shell(command, { max_output_bytes = MAX_OUTPUT_BYTES })
     if result.truncated then
         return nil, "grep output exceeded the size limit; narrow the pattern or path"
     end
-    return result.stdout, result.exit_code
+    if result.exit_code ~= 0 and result.exit_code ~= 1 then
+        return nil, "ripgrep failed (exit " .. tostring(result.exit_code) .. "): " .. result.stderr
+    end
+    return result.stdout
 end
 
--- One envelope for every outcome: `content` is what the model reads, `ok` is
--- what tells the runtime and the interface whether the call failed.
 local function report(content, failure)
     if failure then
-        return margatroid().json.encode({ ok = false, content = failure })
+        return { ok = false, content = failure }
     end
-    return margatroid().json.encode({ ok = true, content = content })
+    return { ok = true, content = content }
 end
 
 local function perform(arguments, context)
     local args = { "--json", "--no-config", "--color", "never" }
     if arguments.include then
-        if arguments.include:sub(1, 1) == "!" or arguments.include:find(",", 1, true) then
-            error("include must be one positive glob")
+        if arguments.include:sub(1, 1) == "!" then
+            return report(nil, "include must be one positive glob")
         end
         args[#args + 1] = "--glob"
         args[#args + 1] = arguments.include
@@ -50,10 +49,8 @@ local function perform(arguments, context)
     for _, arg in ipairs(args) do
         parts[#parts + 1] = shell_quote(arg)
     end
-    local stdout, code = run(table.concat(parts, " "))
-    if code ~= 0 and code ~= 1 then
-        return report(nil, "ripgrep failed")
-    end
+    local stdout, failure = run(table.concat(parts, " "))
+    if not stdout then return report(nil, failure) end
 
     local json = margatroid().json
     local matches = {}
@@ -63,12 +60,14 @@ local function perform(arguments, context)
         if event.type == "match" then
             total = total + 1
             if #matches < MAX_MATCHES then
-                local path = event.data.path.text or "(unknown path)"
-                local preview = trim_newline(event.data.lines.text or "")
+                local path = event.data.path.text or ("[base64 path: " .. tostring(event.data.path.bytes) .. "]")
+                local preview = trim_newline(event.data.lines.text or ("[base64 bytes: " .. tostring(event.data.lines.bytes) .. "]"))
                 if #preview > MAX_LINE_BYTES then
-                    preview = preview:sub(1, MAX_LINE_BYTES) .. " (line truncated)"
+                    local cut = MAX_LINE_BYTES
+                    while cut > 0 and not utf8.len(preview:sub(1, cut)) do cut = cut - 1 end
+                    preview = preview:sub(1, cut) .. " (line truncated)"
                 end
-                matches[#matches + 1] = string.format("%s:%d:%s", path, event.data.line_number, preview)
+                matches[#matches + 1] = string.format("%s:%d:%s", path:gsub("\r", "\\r"):gsub("\n", "\\n"), event.data.line_number, preview)
             end
         end
     end
@@ -81,12 +80,6 @@ end
 
 function execute(arguments, context)
     local result = perform(arguments, context)
-    if type(result) == "string" then
-        local ok, value = pcall(margatroid().json.decode, result)
-        if ok and type(value) == "table" and type(value.ok) == "boolean" then
-            result = value
-        end
-    end
     task_return(result)
     task_finish(context.task_id)
 end

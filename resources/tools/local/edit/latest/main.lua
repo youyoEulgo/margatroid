@@ -30,14 +30,16 @@ local function read_text(path)
     if not file then
         return nil, "cannot read " .. path .. ": " .. tostring(message)
     end
-    local content = file:read("*a")
+    local content, read_error = file:read(MAX_FILE_BYTES + 1)
     file:close()
     if content == nil then
-        return nil, "cannot read " .. path
+        if read_error then return nil, "cannot read " .. path .. ": " .. tostring(read_error) end
+        content = ""
     end
     if #content > MAX_FILE_BYTES then
         return nil, "file exceeds the size limit"
     end
+    if not utf8.len(content) then return nil, "file is not valid UTF-8" end
     return content
 end
 
@@ -46,78 +48,55 @@ local function write_text(path, content)
     if not file then
         return nil, "cannot write " .. path .. ": " .. tostring(message)
     end
-    file:write(content)
-    file:close()
+    local written, write_error = file:write(content)
+    local closed, close_error = file:close()
+    if not written then return nil, "cannot write " .. path .. ": " .. tostring(write_error) end
+    if not closed then return nil, "cannot close " .. path .. ": " .. tostring(close_error) end
     return true
-end
-
-local function find_matches(content, needle)
-    local positions = {}
-    local start = 1
-    while true do
-        local first, last = content:find(needle, start, true)
-        if not first then break end
-        positions[#positions + 1] = { first = first, last = last }
-        start = last + 1
-    end
-    return positions
 end
 
 local function perform(arguments, context)
     local path = resolve_path(arguments.path, context.project_root)
     local content, failure = read_text(path)
     if not content then
-        return margatroid().json.encode({ ok = false, content = failure })
+        return { ok = false, content = failure }
     end
-    local matches = find_matches(content, arguments.old_string)
-    if #matches == 0 then
-        return margatroid().json.encode({ ok = false, content = "old_string was not found in the file" })
+    if arguments.old_string == "" then
+        return { ok = false, content = "old_string must not be empty" }
     end
-    if not arguments.replace_all and #matches ~= 1 then
-        return margatroid().json.encode({
-            ok = false,
-            content = "old_string matched " .. #matches .. " locations; provide more context or set replace_all",
-        })
+    if not utf8.len(arguments.old_string) or not utf8.len(arguments.new_string) then
+        return { ok = false, content = "replacement strings must be valid UTF-8" }
     end
-
-    local replacement
-    local count
-    if arguments.replace_all then
-        local pieces = {}
-        local start = 1
-        for _, match in ipairs(matches) do
-            pieces[#pieces + 1] = content:sub(start, match.first - 1)
-            pieces[#pieces + 1] = arguments.new_string
-            start = match.last + 1
+    local count, start = 0, 1
+    while true do
+        local first, last = content:find(arguments.old_string, start, true)
+        if not first then break end
+        count = count + 1
+        if #content + count * (#arguments.new_string - #arguments.old_string) > MAX_FILE_BYTES then
+            return { ok = false, content = "replacement exceeds the 16 MiB size limit" }
         end
-        pieces[#pieces + 1] = content:sub(start)
-        replacement = table.concat(pieces)
-        count = #matches
-    else
-        local match = matches[1]
-        replacement = content:sub(1, match.first - 1)
-            .. arguments.new_string
-            .. content:sub(match.last + 1)
-        count = 1
+        start = last + 1
+        if count > 1 and not arguments.replace_all then
+            return { ok = false, content = "old_string matched multiple locations; provide more context or set replace_all" }
+        end
     end
+    if count == 0 then return { ok = false, content = "old_string was not found in the file" } end
+    local size = #content + count * (#arguments.new_string - #arguments.old_string)
+    if size > MAX_FILE_BYTES then return { ok = false, content = "replacement exceeds the 16 MiB size limit" } end
+    local literal_pattern = arguments.old_string:gsub("(%W)", "%%%1")
+    local replacement = content:gsub(literal_pattern, function() return arguments.new_string end)
     local written, write_failure = write_text(path, replacement)
     if not written then
-        return margatroid().json.encode({ ok = false, content = write_failure })
+        return { ok = false, content = write_failure }
     end
-    return margatroid().json.encode({
+    return {
         ok = true,
         content = string.format("Updated %s (%d replacement%s).", arguments.path, count, count == 1 and "" or "s"),
-    })
+    }
 end
 
 function execute(arguments, context)
     local result = perform(arguments, context)
-    if type(result) == "string" then
-        local ok, value = pcall(margatroid().json.decode, result)
-        if ok and type(value) == "table" and type(value.ok) == "boolean" then
-            result = value
-        end
-    end
     task_return(result)
     task_finish(context.task_id)
 end

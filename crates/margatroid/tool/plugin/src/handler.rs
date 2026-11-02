@@ -462,10 +462,11 @@ async fn diagnostic_drain<R: AsyncRead + Unpin>(
 
 fn signal_runner(pid: u32) {
     #[cfg(unix)]
-    let _ = nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    );
+    {
+        let target = nix::unistd::Pid::from_raw(pid as i32);
+        let _ = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGTERM);
+        let _ = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGCONT);
+    }
 }
 
 fn record_cleanup_failure(context: &mut ToolExecutionContext, message: &str) {
@@ -583,7 +584,14 @@ async fn run_runner(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
-    command.process_group(0);
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let boundary = CgroupBoundary::create().await?;
     if let Some(boundary) = &boundary {
         command.env("MARGATROID_RUNNER_CGROUP", &boundary.path);

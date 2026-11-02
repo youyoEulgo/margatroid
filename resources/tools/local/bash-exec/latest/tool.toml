@@ -1,0 +1,3 @@
+schema_version = 1
+name = "bash_exec"
+description = "Execute one Bash command in the project directory and return stdout, stderr and exit status after it finishes. Each output stream is capped at 64 KiB with an explicit truncation marker. This does not open a persistent terminal; use bash for an interactive session."

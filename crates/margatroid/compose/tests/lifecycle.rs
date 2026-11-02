@@ -44,6 +44,12 @@ fn command(
     app.world().emit_event(MclCommand {
         id: format!("test:{text}"),
         source: agent,
+        source_address: app
+            .world()
+            .get_component::<address::Address>(agent)
+            .unwrap()
+            .as_str()
+            .to_owned(),
         source_instance: Some(instance),
         target: agent,
         instruction: MclInstruction {

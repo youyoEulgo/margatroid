@@ -29,7 +29,7 @@ EFFECT ready
 EFFECT wake
 ```
 
-Lua调用为mcl(target_entity, text, arguments)，arguments按顺序对应问号。来源及本次VM实例由lua_runtime_plugin中的mcl宿主绑定，不接受调用者伪造source。宿主只依赖mcl_core发送MclCommand并等待reply；mcl_plugin不定义Lua函数。消息参数要求完整消息数组，工具参数为已导入alias数组；配置路径和值分别占一个参数。
+Lua调用为mcl(target_entity, text, arguments)，arguments按顺序对应问号。来源及本次VM实例由lua_runtime_plugin中的mcl宿主绑定，不接受调用者伪造source。宿主只依赖mcl_core发送MclCommand并等待reply；唯一执行入口MclCommand要求调用方显式提供source_address，网络入口及Lua宿主传入自身真实地址，与source实体身份核对，历史source保存该地址而非Entity编号；mcl_plugin不定义Lua函数。消息参数要求完整消息数组，工具参数为已导入alias数组；配置路径和值分别占一个参数。
 
 ## 消息Block
 
@@ -62,7 +62,7 @@ IMPORT校验种类、依赖和alias后，在对应资源领域登记alias到路�
 | ready | 无 | Unit |
 | wake | 无 | Unit |
 
-inference和tool_call将请求交给所属领域并等待oneshot。tool_call保留原调用ID及顺序，不可见工具返回对应失败结果。sandbox_use选择alias，不保存长期策略正文；实际执行读取选定路径的策略。history_append显式保存消息；其他操作不自动追加消息历史。指令审计与消息历史分别记录，不把审计参数投影成重复消息。
+inference和tool_call将请求交给所属领域并等待oneshot。tool_call保留原调用ID及顺序，不可见工具返回对应失败结果。sandbox_use选择alias，不保存长期策略正文；实际执行读取选定路径的策略。history_append显式保存消息；其他操作不自动追加消息历史。指令审计与消息历史分别记录，不把审计参数投影成重复消息。两类历史以Agent内sequence标识并排序，不设历史key；content由调用方提供并与payload独立原样存取。
 
 start_turn和finish_turn调用agent_core同步扩展；ready和wake调用lua_runtime_core扩展。ready只允许当前Driver对本人调用。wait是Lua宿主函数，不是MCL指令。上述调用由plugin组合，不让core之间互相依赖。
 

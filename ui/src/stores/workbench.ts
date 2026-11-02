@@ -37,7 +37,7 @@ export interface ConversationEntry {
   timestamp: number;
   kind: string;
   payload: unknown;
-  historyKey: string | null;
+  source: string | null;
   sequence: number | null;
 }
 export interface RuntimeLog {
@@ -167,7 +167,7 @@ function payloadRequestId(entry: HistoryMessage): string {
     if (typeof payload.request_id === 'string') return payload.request_id;
     if (typeof payload.id === 'string') return payload.id;
   }
-  return entry.key;
+  return '';
 }
 function decodeMessage(
   message: AgentMessage,
@@ -219,12 +219,12 @@ export function historyEntries(history: AgentHistory): ConversationEntry[] {
     .sort((a, b) => a.sequence - b.sequence)
     .flatMap((entry) => {
       const base = {
-        key: `${workspaceKey(history.workspace)}:${history.agent}:${entry.key}`,
+        key: `${workspaceKey(history.workspace)}:${history.agent}:${entry.sequence}`,
         id: payloadRequestId(entry),
         workspaceKey: workspaceKey(history.workspace),
         agent: history.agent,
         timestamp: entry.created_at_ms,
-        historyKey: entry.key,
+        source: entry.source,
         sequence: entry.sequence,
         kind: entry.kind,
         payload: entry.payload,
@@ -388,6 +388,26 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const completedStreams = new Set<string>();
   const abortedStreams = new Set<string>();
   const sendingTargets = new Set<string>();
+  const resourceSettings = ref<{ snapshot: string; visibleTools: string[] } | null>(null);
+  const resourceReadPending = ref('');
+  const resourceWritePending = ref('');
+  const resourceSnapshot = ref('');
+  const resourceSettingsReady = computed(
+    () => !!resourceSettings.value && resourceSettings.value.snapshot === resourceSnapshot.value,
+  );
+  const resourceSettingsPending = computed(
+    () => !!resourceReadPending.value || !!resourceWritePending.value,
+  );
+  const resourceVisibility = computed(() =>
+    (selectedAgentState.value?.tools ?? []).map((alias) => ({
+      resource: alias,
+      visible: resourceSettingsReady.value && resourceSettings.value!.visibleTools.includes(alias),
+    })),
+  );
+  const sandboxOptions = computed(() => ({
+    options: selectedAgentState.value?.sandboxes ?? [],
+    activated: selectedAgentState.value?.sandbox ? [selectedAgentState.value.sandbox] : [],
+  }));
   let socket: WebSocket | null = null;
   let routeRevision = 0;
   let initializedSelection = false;
@@ -563,6 +583,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       socket = null;
     }
     registeredClient.value = null;
+    resourceSnapshot.value = '';
+    resourceSettings.value = null;
+    resourceReadPending.value = '';
+    resourceWritePending.value = '';
     streams.value = new Map();
     rejectPending('Backend WebSocket closed');
   }
@@ -634,6 +658,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedAgent.value = agents.length === 1 ? agents[0]! : null;
     if (selectedWorkspaceKey.value) expandWorkspace(selectedWorkspaceKey.value);
     queryHistory();
+    refreshResourceSettings();
   }
   function selectAgent(agent: string | null, path = selectedWorkspaceKey.value) {
     if (path !== selectedWorkspaceKey.value) selectWorkspace(path);
@@ -642,6 +667,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedAgent.value = accepted;
     autoSelectSingle = accepted !== null;
     queryHistory();
+    refreshResourceSettings();
   }
   function expandWorkspace(path: string) {
     expandedWorkspaceKeys.value = new Set(expandedWorkspaceKeys.value).add(path);
@@ -729,7 +755,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         },
       },
       target,
-      command.trim().startsWith('GET '),
+      command.trim().startsWith('GET ') || command.trim() === 'CONFIG GET',
     ).catch((error: Error) => {
       lastFailures.value.set(`${target.workspace}:${target.agent}`, { message: error.message });
       throw error;
@@ -741,6 +767,96 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     } catch (error) {
       return Promise.reject(error);
     }
+  }
+  function resourceTargetSnapshot(target: Target | null): string {
+    if (!target || !connected()) return '';
+    return JSON.stringify([
+      endpoint.value,
+      routeRevision,
+      target.workspace,
+      target.agent,
+      target.instance,
+      selectedAgentState.value?.tools,
+      selectedAgentState.value?.sandboxes,
+    ]);
+  }
+  function assertResourceTarget(target: Target, snapshot: string) {
+    if (
+      resourceTargetSnapshot(currentTarget(false)) !== snapshot ||
+      resourceSnapshot.value !== snapshot
+    )
+      throw new Error('Selected agent changed during resource settings update');
+    const state = selectedAgentState.value;
+    if (state?.agent_instance !== target.instance)
+      throw new Error('Selected agent instance changed during resource settings update');
+  }
+  function refreshResourceSettings() {
+    const target = currentTarget(false);
+    const snapshot = resourceTargetSnapshot(target);
+    if (snapshot === resourceSnapshot.value) return;
+    resourceSnapshot.value = snapshot;
+    resourceSettings.value = null;
+    resourceReadPending.value = snapshot;
+    if (!target || !snapshot) return;
+    void executeFor(target, 'CONFIG GET')
+      .then((result) => {
+        assertResourceTarget(target, snapshot);
+        if (!isRecord(result) || !isRecord(result.Config))
+          throw new Error('Daemon returned invalid resource settings');
+        const aliases = result.Config.visible_tools;
+        if (!Array.isArray(aliases) || !aliases.every((alias) => typeof alias === 'string'))
+          throw new Error('Daemon returned invalid visible_tools settings');
+        resourceSettings.value = { snapshot, visibleTools: aliases };
+      })
+      .catch((error: unknown) => {
+        if (resourceSnapshot.value === snapshot)
+          connectionError.value = error instanceof Error ? error.message : String(error);
+      })
+      .finally(() => {
+        if (resourceReadPending.value === snapshot) resourceReadPending.value = '';
+      });
+  }
+  async function writeResourceSetting(alias: string | null, visible?: boolean): Promise<void> {
+    if (resourceSettingsPending.value)
+      throw new Error('Wait for the current resource settings request');
+    if (!resourceSettingsReady.value) throw new Error('Wait for resource settings to load');
+    const target = currentTarget()!;
+    const snapshot = resourceSnapshot.value;
+    assertResourceTarget(target, snapshot);
+    const tools = visible !== undefined;
+    const choices = tools ? selectedAgentState.value!.tools : selectedAgentState.value!.sandboxes;
+    if (alias !== null && !choices.includes(alias))
+      throw new Error('Choose an imported resource alias');
+    const aliases = tools
+      ? [
+          ...new Set(
+            visible
+              ? [...resourceSettings.value!.visibleTools, alias!]
+              : resourceSettings.value!.visibleTools.filter((entry) => entry !== alias),
+          ),
+        ]
+      : alias === null
+        ? []
+        : [alias];
+    resourceWritePending.value = snapshot;
+    try {
+      await executeFor(target, 'CONFIG SET ? ?', [tools ? 'visible_tools' : 'sandbox', aliases]);
+      assertResourceTarget(target, snapshot);
+      if (tools) resourceSettings.value = { snapshot, visibleTools: aliases };
+      else {
+        await executeFor(target, 'EFFECT sandbox_use ?', [aliases]);
+        assertResourceTarget(target, snapshot);
+        queryState();
+      }
+    } finally {
+      if (resourceWritePending.value === snapshot) resourceWritePending.value = '';
+    }
+  }
+  function setResourceVisibility(alias: string, visible: boolean) {
+    return writeResourceSetting(alias, visible);
+  }
+  function setSandbox(alias: string | null) {
+    return writeResourceSetting(alias);
   }
   async function sendMessage(
     content: string,
@@ -899,7 +1015,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           timestamp: Date.now(),
           kind: 'stream',
           payload: null,
-          historyKey: null,
+          source: null,
           sequence: null,
           instance: event.agent_instance,
           lastSequence: -1,
@@ -948,6 +1064,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         connectionError.value = '';
         reconnectAttempt = 0;
         queryState();
+        refreshResourceSettings();
         break;
       case 'connection.register_failed':
         connectionError.value = errorMessage(event.error);
@@ -967,6 +1084,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         }
         reconcileSelection();
         reconcileStreams();
+        refreshResourceSettings();
         break;
       case 'workspace.definitions':
         definitions.value = event.definitions;
@@ -1195,6 +1313,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectAgent,
     sendMessage,
     executeMclCommand,
+    resourceVisibility,
+    sandboxOptions,
+    resourceSettingsPending,
+    resourceSettingsReady,
+    setResourceVisibility,
+    setSandbox,
     clearLogs,
     handleServerMessage,
   };

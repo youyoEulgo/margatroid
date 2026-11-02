@@ -189,7 +189,25 @@ ApiRequest：具体格式请求，私有枚举
     ChatCompletions(ChatCompletionsRequest)
     Messages(MessagesRequest)
     Responses(ResponsesRequest)
-ProviderHttpRequest：HTTP请求--method、url、headers、body
+ChatCompletionsRequest / MessagesRequest / ResponsesRequest：具体格式请求
+    impl TryFrom<DomainRequest>或TryFrom<EncodeInput>
+        行为：转换消息、工具及参数；在HTTP前校验目标格式与厂商能力，不经过有损通用JSON中间请求。
+EncodeInput：插件内格式编码材料--DomainRequest及本次只读能力，不进入领域core。
+OpenAi<T> / Anthropic<T> / DeepSeek<T> / OpenRouter<T>：具体厂商handler
+    T：具体ChatCompletionsRequest、MessagesRequest或ResponsesRequest，不是ApiRequest枚举变体。
+    process(request: T) -> Result<ProviderHttpRequest, InferenceError>
+        行为：只有支持矩阵中的具体组合实现process；以有类型字段处理厂商选项、鉴权和端点，附上同一组合选择的响应解码器。
+ApiAdapter：显式组合分派，私有枚举
+    OpenAiChat(OpenAi<ChatCompletionsRequest>)
+    OpenAiResponses(OpenAi<ResponsesRequest>)
+    AnthropicMessages(Anthropic<MessagesRequest>)
+    DeepSeekChat(DeepSeek<ChatCompletionsRequest>)
+    DeepSeekMessages(DeepSeek<MessagesRequest>)
+    DeepSeekResponses(DeepSeek<ResponsesRequest>)
+    OpenRouterChat(OpenRouter<ChatCompletionsRequest>)
+    行为：只接受已登记的vendor与format组合，转换具体请求并调用对应process；不以通用VendorAdapter在JSON对象上修补差异。
+ProviderHttpRequest：HTTP请求--method、url、headers、body及格式响应解码器
+    行为：响应沿请求所选组合逆向归一，不再单独按配置猜解码器；分片仍进入唯一累积器。
 ```
 
 # types pub

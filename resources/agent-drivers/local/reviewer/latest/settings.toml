@@ -1,4 +1,4 @@
-visible_tools = ["review", "project_context", "list_dir"]
+visible_tools = ["review", "project_context", "list_dir", "read_file", "read_image", "grep", "glob", "task_read", "task_send", "task_finish"]
 sandbox = ["read_only"]
 
 [compaction]

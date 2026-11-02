@@ -7,10 +7,6 @@
 
 local MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 
-local function trim_newline(value)
-    return value:gsub("[\r\n]+$", "")
-end
-
 local function shell_quote(value)
     if package.config:sub(1, 1) == "\\" then
         return '"' .. value:gsub('"', '\\"') .. '"'
@@ -52,22 +48,21 @@ local function list_entries(path)
     local separator = package.config:sub(1, 1)
     local command = table.concat({
         "find", shell_quote(path), "-maxdepth", "1", "-mindepth", "1",
-        "-printf", shell_quote("%y\t%f\n"),
+        "-printf", shell_quote("%y\t%f\\0"),
     }, " ")
 
-    -- The listing runs through the shell the runner provides, so it gets a
-    -- process group that is reclaimed on timeout and an execution budget.
+    -- The host shell owns timeout and output budgets.
     local result = margatroid().shell(command, { max_output_bytes = MAX_OUTPUT_BYTES })
     if result.truncated then
         return nil, "directory listing exceeded the size limit"
     end
     if result.exit_code ~= 0 then
-        return nil, "cannot list " .. path
+        return nil, "cannot list " .. path .. ": " .. result.stderr
     end
     local stdout = result.stdout
 
     local entries = {}
-    for kind, name in stdout:gmatch("([^\t])\t([^\n]*)\n") do
+    for kind, name in stdout:gmatch("([^\t])\t([^%z]*)%z") do
         local mapped = "other"
         if kind == "f" then mapped = "file"
         elseif kind == "d" then mapped = "directory"
@@ -83,13 +78,11 @@ local function list_entries(path)
     return entries
 end
 
--- One envelope for every outcome: `content` is what the model reads, `ok` is
--- what tells the runtime and the interface whether the call failed.
 local function report(content, failure)
     if failure then
-        return margatroid().json.encode({ ok = false, content = failure })
+        return { ok = false, content = failure }
     end
-    return margatroid().json.encode({ ok = true, content = content })
+    return { ok = true, content = content }
 end
 
 local function perform(arguments, context)
@@ -99,17 +92,11 @@ local function perform(arguments, context)
     if not entries then
         return report(nil, failure)
     end
-    return report(margatroid().json.encode(entries))
+    return report(#entries == 0 and "[]" or margatroid().json.encode(entries))
 end
 
 function execute(arguments, context)
     local result = perform(arguments, context)
-    if type(result) == "string" then
-        local ok, value = pcall(margatroid().json.decode, result)
-        if ok and type(value) == "table" and type(value.ok) == "boolean" then
-            result = value
-        end
-    end
     task_return(result)
     task_finish(context.task_id)
 end

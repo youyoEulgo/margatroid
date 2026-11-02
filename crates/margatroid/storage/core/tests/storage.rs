@@ -21,8 +21,8 @@ fn multi_selector_read_has_one_snapshot_during_external_writes() {
         for n in 1..100 {
             writer
                 .execute(
-                    "UPDATE storage_messages SET value_json=?1",
-                    [json!([n]).to_string()],
+                    "UPDATE blocks SET fields_json=?1",
+                    [json!({"messages":[n]}).to_string()],
                 )
                 .unwrap();
         }
@@ -88,14 +88,13 @@ fn read(storage: &AgentStorage, block: &str) -> Vec<Value> {
         _ => panic!(),
     }
 }
-fn record(key: &str) -> HistoryRecord {
+fn record(_label: &str) -> HistoryRecord {
     HistoryRecord {
-        key: key.into(),
         source: "agent:old/identity:latest".into(),
         turn: Some("turn".into()),
         kind: "message".into(),
         content: "正文".into(),
-        payload: json!({"nested":[1,true,null]}),
+        payload: json!({"type":"assistant","content":"正文","nested":[1,true,null]}),
         created_at_ms: None,
     }
 }
@@ -300,7 +299,7 @@ fn self_reference_sources_snapshot_range_and_sql_failure_preserve_messages() {
         .kind,
         StorageErrorKind::BlockMissing
     );
-    Connection::open(&db).unwrap().execute_batch("CREATE TRIGGER fail_update BEFORE UPDATE ON storage_messages BEGIN SELECT RAISE(ABORT,'failure'); END;").unwrap();
+    Connection::open(&db).unwrap().execute_batch("CREATE TRIGGER fail_update BEFORE UPDATE ON blocks BEGIN SELECT RAISE(ABORT,'failure'); END;").unwrap();
     assert_eq!(
         execute_storage(
             &storage,
@@ -403,51 +402,31 @@ fn temporary_namespaces_isolate_and_conflicting_lifecycle_does_not_recreate() {
     );
 }
 #[test]
-fn history_batches_are_idempotent_preserve_first_timestamp_and_rollback_conflicts() {
+fn history_batches_append_duplicates_and_rollback_invalid_records() {
     let dir = tempfile::tempdir().unwrap();
     let storage = open_storage(&dir.path().join("db"), &dir.path().join("cfg"), "").unwrap();
     let before = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    execute_storage(
-        &storage,
-        StorageOperation::AppendHistory {
-            records: vec![record("a"), record("a")],
-        },
-    )
-    .unwrap();
+    for _ in 0..2 {
+        execute_storage(
+            &storage,
+            StorageOperation::AppendHistory {
+                records: vec![record("same")],
+            },
+        )
+        .unwrap();
+    }
     let after = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
     let saved = history(&storage);
-    assert_eq!(saved.len(), 1);
-    assert!((before..=after).contains(&saved[0].created_at_ms.unwrap()));
-    let mut retry = record("a");
-    retry.created_at_ms = Some(7);
-    execute_storage(
-        &storage,
-        StorageOperation::AppendHistory {
-            records: vec![retry],
-        },
-    )
-    .unwrap();
-    assert_eq!(history(&storage), saved);
-    let mut conflict = record("a");
-    conflict.content = "changed".into();
-    assert_eq!(
-        execute_storage(
-            &storage,
-            StorageOperation::AppendHistory {
-                records: vec![record("new"), conflict]
-            }
-        )
-        .unwrap_err()
-        .kind,
-        StorageErrorKind::KeyConflict
-    );
-    assert_eq!(history(&storage), saved);
+    assert_eq!(saved.len(), 2);
+    assert!(saved
+        .iter()
+        .all(|r| (before..=after).contains(&r.created_at_ms.unwrap())));
     let mut invalid = record("bad");
     invalid.created_at_ms = Some(u64::MAX);
     assert_eq!(
@@ -462,14 +441,164 @@ fn history_batches_are_idempotent_preserve_first_timestamp_and_rollback_conflict
         StorageErrorKind::InvalidRecord
     );
     assert_eq!(history(&storage), saved);
-    let mut unknown = record("unknown");
-    unknown.created_at_ms = Some(0);
+    let mut epoch = record("epoch");
+    epoch.created_at_ms = Some(0);
     execute_storage(
         &storage,
         StorageOperation::AppendHistory {
-            records: vec![unknown.clone()],
+            records: vec![epoch.clone()],
         },
     )
     .unwrap();
-    assert_eq!(history(&storage)[1], unknown);
+    assert_eq!(history(&storage)[2], epoch);
+}
+
+#[test]
+fn temporary_blocks_drop_per_instance_and_never_grow_persistent_database_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let cfg = dir.path().join("cfg");
+    let storage = open_storage(&path, &cfg, "").unwrap();
+    create(&storage, "persistent");
+    replace(&storage, "persistent", vec![json!({"keep":[1,null]})]);
+    let database = Connection::open(&path).unwrap();
+    let pages: i64 = database
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    let size = fs::metadata(&path).unwrap().len();
+    let mut old = selector("temporary");
+    for n in 0..100 {
+        let instance = format!("vm-{n}");
+        execute_storage(
+            &storage,
+            StorageOperation::CreateBlock {
+                name: "temporary".into(),
+                fields: vec!["messages".into()],
+                instance: Some(instance.clone()),
+            },
+        )
+        .unwrap();
+        let mut current = selector("temporary");
+        current.instance = Some(instance.clone());
+        execute_storage(
+            &storage,
+            StorageOperation::ReplaceMessages {
+                sources: vec![MessageSource::Literal(vec![json!(n)])],
+                target: current.clone(),
+            },
+        )
+        .unwrap();
+        if n > 0 {
+            assert_eq!(
+                execute_storage(
+                    &storage,
+                    StorageOperation::ReadMessages {
+                        selectors: vec![old]
+                    }
+                )
+                .unwrap_err()
+                .kind,
+                StorageErrorKind::BlockMissing
+            );
+        }
+        execute_storage(&storage, StorageOperation::DropTemporaryBlocks { instance }).unwrap();
+        old = current;
+        assert_eq!(
+            database
+                .query_row("SELECT count(*) FROM blocks", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            database
+                .query_row("PRAGMA page_count", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            pages
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), size);
+    }
+    assert_eq!(read(&storage, "persistent"), vec![json!({"keep":[1,null]})]);
+    execute_storage(
+        &storage,
+        StorageOperation::CreateBlock {
+            name: "orphan".into(),
+            fields: vec!["messages".into()],
+            instance: Some("crashed".into()),
+        },
+    )
+    .unwrap();
+    let mut orphan = selector("orphan");
+    orphan.instance = Some("crashed".into());
+    drop(storage);
+    let storage = open_storage(&path, &cfg, "").unwrap();
+    assert_eq!(
+        execute_storage(
+            &storage,
+            StorageOperation::ReadMessages {
+                selectors: vec![orphan]
+            }
+        )
+        .unwrap_err()
+        .kind,
+        StorageErrorKind::BlockMissing
+    );
+}
+
+#[test]
+fn dropping_one_temp_instance_preserves_other_instances_and_persistent_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = open_storage(&dir.path().join("db"), &dir.path().join("cfg"), "").unwrap();
+    create(&storage, "persistent");
+    for instance in ["a", "b"] {
+        execute_storage(
+            &storage,
+            StorageOperation::CreateBlock {
+                name: "temporary".into(),
+                fields: vec!["messages".into()],
+                instance: Some(instance.into()),
+            },
+        )
+        .unwrap();
+    }
+    execute_storage(
+        &storage,
+        StorageOperation::DropTemporaryBlocks {
+            instance: "a".into(),
+        },
+    )
+    .unwrap();
+    let mut a = selector("temporary");
+    a.instance = Some("a".into());
+    assert_eq!(
+        execute_storage(
+            &storage,
+            StorageOperation::ReadMessages { selectors: vec![a] }
+        )
+        .unwrap_err()
+        .kind,
+        StorageErrorKind::BlockMissing
+    );
+    let mut b = selector("temporary");
+    b.instance = Some("b".into());
+    assert_eq!(
+        execute_storage(
+            &storage,
+            StorageOperation::ReadMessages {
+                selectors: vec![b, selector("persistent")]
+            }
+        )
+        .unwrap(),
+        StorageValue::Messages(vec![])
+    );
+    assert_eq!(
+        execute_storage(
+            &storage,
+            StorageOperation::DropTemporaryBlocks {
+                instance: "".into()
+            }
+        )
+        .unwrap_err()
+        .kind,
+        StorageErrorKind::InvalidRequest
+    );
 }

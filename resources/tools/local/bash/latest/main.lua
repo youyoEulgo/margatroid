@@ -17,8 +17,9 @@ function execute(arguments, context)
                 task_write(value.text)
             end
         else
-            if type(value) ~= "table" or type(value.text) ~= "string" then
-                task_write({ error = "input must be an object with text and optional enter" })
+            if type(value) ~= "table" or type(value.text) ~= "string"
+                or (value.enter ~= nil and type(value.enter) ~= "boolean") then
+                task_write({ error = "input must be an object with string text and optional boolean enter" })
             else
                 terminal:write(value.text .. (value.enter and "\r" or ""))
             end

@@ -369,10 +369,9 @@ async fn supervise_inference(mut context: InferenceContext) {
         if tokio::time::Instant::now() >= deadline { return Err(error(Kind::Timeout, "inference preparation exhausted deadline")); }
         let names = domain.tools.iter().map(|tool| tool.name.clone()).collect::<HashSet<_>>();
         let request = build_request(domain, &context.route)?;
-        let format = serde_json::from_value::<ApiFormat>(json!(context.route.api_type)).map_err(|_| error(Kind::UnsupportedFormat, "unsupported API format"))?;
         let upstream = CancellationToken::new();
         let (sender, receiver) = mpsc::channel(FRAGMENT_CAPACITY);
-        let provider = read_provider(context.client.clone(), request, format, upstream.clone(), sender);
+        let provider = read_provider(context.client.clone(), request, upstream.clone(), sender);
         #[cfg(test)]
         let cleanup_gate = context.cleanup_gate.clone();
         let mut worker = tokio::spawn(async move {
@@ -468,9 +467,25 @@ async fn receive_stream(
 async fn read_provider(
     client: reqwest::Client,
     request: ProviderHttpRequest,
-    format: ApiFormat,
     cancel: CancellationToken,
     sender: mpsc::Sender<ProviderFragment>,
+) -> Result<(), InferenceError> {
+    read_provider_with_timeouts(
+        client,
+        request,
+        cancel,
+        sender,
+        (Duration::from_secs(180), Duration::from_secs(60)),
+    )
+    .await
+}
+
+async fn read_provider_with_timeouts(
+    client: reqwest::Client,
+    request: ProviderHttpRequest,
+    cancel: CancellationToken,
+    sender: mpsc::Sender<ProviderFragment>,
+    deadlines: (Duration, Duration),
 ) -> Result<(), InferenceError> {
     let mut outbound = reqwest::Request::new(request.method, request.url);
     *outbound.headers_mut() = request.headers;
@@ -478,7 +493,9 @@ async fn read_provider(
     let response = tokio::select! {
         biased;
         () = cancel.cancelled() => return Err(error(Kind::Cancelled, "upstream cancelled")),
-        result = client.execute(outbound) => result.map_err(|failure| error(if failure.is_timeout() { Kind::Timeout } else { Kind::RequestFailed }, "inference HTTP request failed"))?,
+        result = tokio::time::timeout(deadlines.0, client.execute(outbound)) =>
+            result.map_err(|_| error(Kind::Timeout, "provider response headers timed out"))?
+                .map_err(http_request_error)?,
     };
     if !response.status().is_success() {
         return Err(error(
@@ -486,15 +503,20 @@ async fn read_provider(
             format!("inference HTTP status {}", response.status().as_u16()),
         ));
     }
-    let mut decoder = FormatDecoder::new(format);
+    let mut decoder = request.decoder;
     let mut body = response.bytes_stream();
     loop {
-        let chunk = tokio::select! { biased; () = cancel.cancelled() => return Err(error(Kind::Cancelled, "upstream cancelled")), chunk = body.next() => chunk };
+        let chunk = tokio::select! { biased; () = cancel.cancelled() => return Err(error(Kind::Cancelled, "upstream cancelled")), chunk = tokio::time::timeout(deadlines.1, body.next()) => chunk.map_err(|_| error(Kind::Timeout, "provider stream idle timeout"))? };
         let Some(chunk) = chunk else {
             break;
         };
-        let chunk =
-            chunk.map_err(|_| error(Kind::ResponseIncomplete, "provider stream disconnected"))?;
+        let chunk = chunk.map_err(|failure| {
+            if failure.is_timeout() {
+                error(Kind::Timeout, "provider stream idle timeout")
+            } else {
+                error(Kind::ResponseIncomplete, "provider stream disconnected")
+            }
+        })?;
         for fragment in decoder.push(&chunk)? {
             tokio::select! { biased; () = cancel.cancelled() => return Err(error(Kind::Cancelled, "upstream cancelled")), result = sender.send(fragment) => if result.is_err() { return Err(error(Kind::Cancelled, "fragment receiver closed")); } }
         }
@@ -532,3 +554,27 @@ fn push_finished(delivery: &mut StreamDelivery, failure: Option<&InferenceError>
 #[cfg(test)]
 #[path = "../tests/internal/stream.rs"]
 mod tests;
+
+fn http_request_error(failure: reqwest::Error) -> InferenceError {
+    if failure.is_timeout() {
+        return error(
+            Kind::Timeout,
+            "provider did not respond before the HTTP deadline",
+        );
+    }
+    let mut source = std::error::Error::source(&failure);
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            let description = match io.kind() {
+                std::io::ErrorKind::ConnectionRefused => "provider connection refused",
+                std::io::ErrorKind::ConnectionReset => "provider connection reset",
+                std::io::ErrorKind::ConnectionAborted => "provider connection aborted",
+                std::io::ErrorKind::TimedOut => "provider connection timed out",
+                _ => "provider connection failed",
+            };
+            return error(Kind::RequestFailed, description);
+        }
+        source = cause.source();
+    }
+    error(Kind::RequestFailed, "inference HTTP request failed")
+}

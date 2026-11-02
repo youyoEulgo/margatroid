@@ -21,7 +21,7 @@ use std::{
     path::{Component, Path},
     sync::{Arc, Mutex},
 };
-use storage_core::{open_storage, AgentStorage};
+use storage_core::{execute_storage, open_storage, AgentStorage, StorageOperation};
 use tokio::sync::oneshot;
 use tool_core::{InitToolTasks, ToolTaskHandle, ToolTasks};
 use tool_resource_core::Tools;
@@ -853,6 +853,7 @@ async fn start_steps(context: &FlowContext) -> Result<(), StartFailure> {
 }
 struct StopSnapshot {
     instance: Option<DriverLuaVmInstance>,
+    storage: Option<AgentStorage>,
     inference: Option<InferenceHandle>,
     tasks: Vec<ToolTaskHandle>,
     drain: Option<MclDrain>,
@@ -883,8 +884,10 @@ async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), Age
         let drain = world
             .get_component::<MclQueue>(agent)
             .map(|queue| queue.drain.clone());
+        let storage = world.get_component::<AgentStorage>(agent).cloned();
         Ok(StopSnapshot {
             instance,
+            storage,
             inference,
             tasks,
             drain,
@@ -893,10 +896,12 @@ async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), Age
     .await?;
     let StopSnapshot {
         instance,
+        storage,
         inference,
         tasks,
         drain,
     } = snapshot;
+    let cleanup_instance = instance.as_ref().map(|instance| instance.start_id.clone());
     let vm = async {
         if let Some(instance) = instance {
             let (sender, receiver) = oneshot::channel();
@@ -954,6 +959,14 @@ async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), Age
     }
     if !failures.is_empty() {
         return Err(error(AgentErrorKind::CleanupFailed, failures.join("; ")));
+    }
+    if let (Some(storage), Some(instance)) = (storage, cleanup_instance) {
+        tokio::task::spawn_blocking(move || {
+            execute_storage(&storage, StorageOperation::DropTemporaryBlocks { instance })
+        })
+        .await
+        .map_err(|failure| error(AgentErrorKind::CleanupFailed, failure))?
+        .map_err(|failure| error(AgentErrorKind::CleanupFailed, failure))?;
     }
     with_world(context, move |world| {
         check_agent(world, agent, workspace, state)?;

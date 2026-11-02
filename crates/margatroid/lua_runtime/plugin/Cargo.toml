@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+address = { path = "../../address" }
 lua_runtime_core = { path = "../core" }
 workspace_core = { path = "../../workspace/core" }
 mcl_core = { path = "../../mcl/core" }

@@ -40,14 +40,16 @@ local function read_text(path)
     if not file then
         return nil, "cannot read " .. path .. ": " .. tostring(message)
     end
-    local content = file:read("*a")
+    local content, read_error = file:read(MAX_FILE_BYTES + 1)
     file:close()
     if content == nil then
-        return nil, "cannot read " .. path
+        if read_error then return nil, "cannot read " .. path .. ": " .. tostring(read_error) end
+        content = ""
     end
     if #content > MAX_FILE_BYTES then
         return nil, "file exceeds the size limit"
     end
+    if not utf8.len(content) then return nil, "file is not valid UTF-8" end
     return content
 end
 
@@ -57,46 +59,38 @@ local function perform(arguments, context)
     local limit = arguments.limit or 2000
     local content, failure = read_text(path)
     if not content then
-        return margatroid().json.encode({ ok = false, content = failure })
-    end
-
-    local lines = {}
-    local start = 1
-    while true do
-        local newline = content:find("\n", start, true)
-        if newline then
-            lines[#lines + 1] = content:sub(start, newline - 1)
-            start = newline + 1
-        else
-            if start <= #content then
-                lines[#lines + 1] = content:sub(start)
-            elseif #content == 0 then
-                lines[1] = ""
-            end
-            break
-        end
+        return { ok = false, content = failure }
     end
 
     local output = {}
-    local last = math.min(#lines, offset + limit - 1)
-    for line_number = offset, last do
-        output[#output + 1] = string.format("%6d\t%s", line_number, lines[line_number])
+    local total, start, output_bytes = 0, 1, 0
+    while start <= #content do
+        local newline = content:find("\n", start, true)
+        local last = newline and newline - 1 or #content
+        total = total + 1
+        if total >= offset and total - offset < limit then
+            local line = content:sub(start, last):gsub("\r$", "")
+            local numbered = string.format("%6d\t%s", total, line)
+            output_bytes = output_bytes + #numbered + 1
+            if output_bytes > 256 * 1024 then
+                return { ok = false, content = "requested lines exceed the 256 KiB output limit; reduce limit or select shorter lines" }
+            end
+            output[#output + 1] = numbered
+        end
+        if not newline then break end
+        start = newline + 1
     end
-    local header = string.format("%s (lines %d-%d of %d)", arguments.path, offset, last, #lines)
-    if offset > #lines then
-        return margatroid().json.encode({ ok = true, content = header .. "\n(end of file)" })
+    if offset > total then
+        return { ok = true, content = string.format("%s (%d lines)\n(end of file)", arguments.path, total) }
     end
-    return margatroid().json.encode({ ok = true, content = header .. "\n" .. table.concat(output, "\n") })
+    local last = offset + #output - 1
+    local header = string.format("%s (lines %d-%d of %d)", arguments.path, offset, last, total)
+    return { ok = true, content = header .. "\n" .. table.concat(output, "\n") }
+
 end
 
 function execute(arguments, context)
     local result = perform(arguments, context)
-    if type(result) == "string" then
-        local ok, value = pcall(margatroid().json.decode, result)
-        if ok and type(value) == "table" and type(value.ok) == "boolean" then
-            result = value
-        end
-    end
     task_return(result)
     task_finish(context.task_id)
 end

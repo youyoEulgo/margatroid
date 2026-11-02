@@ -1,3 +1,3 @@
 schema_version = 1
 name = "glob"
-description = "Find files whose paths match a glob pattern. Returns files only, including hidden and ignored files while excluding version-control metadata directories."
+description = "Find files matching a glob, including hidden and ignored files while excluding version-control metadata directories. Returns up to 100 paths ordered by modification time, newest first, with an omitted-file count. Paths containing CR or LF show escaped characters. Narrow the search if shell output exceeds its budget."

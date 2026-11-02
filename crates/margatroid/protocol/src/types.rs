@@ -320,6 +320,10 @@ pub struct AgentStateDto {
     pub status: String,
     pub turn: Option<String>,
     pub sandbox: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub sandboxes: Vec<String>,
     pub queued_commands: usize,
     pub pending_command: Option<String>,
     pub context_window_tokens: Option<u64>,
@@ -334,7 +338,7 @@ pub struct AgentHistoryDto {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryMessageDto {
-    pub key: String,
+    pub source: String,
     pub sequence: u64,
     pub turn: Option<String>,
     pub kind: String,

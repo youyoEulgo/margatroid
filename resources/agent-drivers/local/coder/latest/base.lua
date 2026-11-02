@@ -72,6 +72,7 @@ command("IMPORT MESSAGE prompt:local/coder-soul:latest AS soul")
 command("IMPORT MESSAGE prompt:local/compact:latest AS compact")
 command("IMPORT TOOL tool:local/code-review:latest AS review")
 command("IMPORT TOOL tool:local/list-directory:latest AS list_dir")
+command("IMPORT TOOL tool:local/project-context:latest AS project_context")
 command("IMPORT TOOL tool:local/read-file:latest AS read_file")
 command("IMPORT TOOL tool:local/read-image:latest AS read_image")
 command("IMPORT TOOL tool:local/write-file:latest AS write_file")
@@ -79,6 +80,7 @@ command("IMPORT TOOL tool:local/edit:latest AS edit")
 command("IMPORT TOOL tool:local/grep:latest AS grep")
 command("IMPORT TOOL tool:local/glob:latest AS glob")
 command("IMPORT TOOL tool:local/bash:latest AS bash")
+command("IMPORT TOOL tool:local/bash-exec:latest AS bash_exec")
 command("IMPORT TOOL tool:local/task-finish:latest AS task_finish")
 command("IMPORT TOOL tool:local/task-send:latest AS task_send")
 command("IMPORT TOOL tool:local/task-read:latest AS task_read")
@@ -134,6 +136,9 @@ while true do
                 command("INJECT ? TO entry.pending[-1]", {results})
                 maybe_compact_context(message)
             end
+        elseif message.type == "error" then
+            pending_tool_results = 0
+            command("EFFECT finish_turn")
         elseif message.type == "tool_call" then
             command("INJECT ? TO session.conversation[-1]", {{message}})
             pending_tool_results = pending_tool_results - 1

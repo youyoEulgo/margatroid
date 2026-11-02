@@ -620,6 +620,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tool_core",
+ "tool_resource_core",
  "tracing",
  "workspace_core",
 ]
@@ -1288,6 +1289,7 @@ dependencies = [
 name = "lua_runtime_plugin"
 version = "0.1.0"
 dependencies = [
+ "address",
  "app_runtime_plugin",
  "async_runtime_plugin",
  "closure_plugin",

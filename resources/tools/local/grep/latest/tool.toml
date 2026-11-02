@@ -1,3 +1,3 @@
 schema_version = 1
 name = "grep"
-description = "Search file contents with a ripgrep regular expression. Returns matching paths, line numbers, and line previews. Use read-file on a match when surrounding context is needed."
+description = "Search file contents with a ripgrep regular expression, respecting default ignore and hidden-file rules. Returns up to 250 matching lines as path:line:preview and an omitted-line count. Previews are limited to 2000 UTF-8 bytes. A single include glob may use brace alternatives. Use read-file for surrounding context. Narrow the search if shell output exceeds its budget."

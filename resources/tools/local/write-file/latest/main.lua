@@ -1,3 +1,5 @@
+local MAX_FILE_BYTES = 16 * 1024 * 1024
+
 -- write-file
 --
 -- Replaces one text file. Absolute paths are used unchanged; relative paths are
@@ -48,9 +50,9 @@ local function parent_path(path)
 end
 
 local function create_directories(path)
-    local ok, _, code = os.execute("mkdir -p " .. shell_quote(path))
-    if ok ~= true and ok ~= 0 then
-        return nil, "could not create " .. path .. " (exit " .. tostring(code) .. ")"
+    local result = margatroid().shell("mkdir -p -- " .. shell_quote(path), { max_output_bytes = 4096 })
+    if result.exit_code ~= 0 then
+        return nil, "could not create " .. path .. ": " .. result.stderr
     end
     return true
 end
@@ -60,44 +62,42 @@ local function write_text(path, content)
     if not file then
         return nil, "cannot write " .. path .. ": " .. tostring(message)
     end
-    file:write(content)
-    file:close()
+    local written, write_error = file:write(content)
+    local closed, close_error = file:close()
+    if not written then return nil, "cannot write " .. path .. ": " .. tostring(write_error) end
+    if not closed then return nil, "cannot close " .. path .. ": " .. tostring(close_error) end
     return true
 end
 
 local function perform(arguments, context)
+    if #arguments.content > MAX_FILE_BYTES then return { ok = false, content = "content exceeds the 16 MiB size limit" } end
+    if not utf8.len(arguments.content) then return { ok = false, content = "content is not valid UTF-8" } end
     local path = resolve_path(arguments.path, context.project_root)
     if arguments.create_parent_directories then
         local parent = parent_path(path)
         if parent and parent ~= "" then
             local created, failure = create_directories(parent)
             if not created then
-                return margatroid().json.encode({ ok = false, content = failure })
+                return { ok = false, content = failure }
             end
         end
     end
     local written, failure = write_text(path, arguments.content)
     if not written then
-        return margatroid().json.encode({ ok = false, content = failure })
+        return { ok = false, content = failure }
     end
-    return margatroid().json.encode({
+    return {
         ok = true,
         content = margatroid().json.encode({
             path = path,
             bytes = #arguments.content,
             replaced = true,
         }),
-    })
+    }
 end
 
 function execute(arguments, context)
     local result = perform(arguments, context)
-    if type(result) == "string" then
-        local ok, value = pcall(margatroid().json.decode, result)
-        if ok and type(value) == "table" and type(value.ok) == "boolean" then
-            result = value
-        end
-    end
     task_return(result)
     task_finish(context.task_id)
 end
