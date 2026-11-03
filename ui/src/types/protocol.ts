@@ -53,30 +53,23 @@ export type AgentMessage =
   | { type: 'user'; content: string; images?: UserImage[] }
   | {
       type: 'assistant';
-      reasoning: string | null;
-      content: string | null;
-      tool_calls: ToolCall[];
+      request_id?: string;
+      content?: string | null;
+      reasoning?: string | null;
+      tool_calls?: ToolCall[];
       usage?: TokenUsage | null;
       replay?: unknown;
-      stop_reason?:
-        | 'completed'
-        | 'tool_calls'
-        | 'length'
-        | 'content_filter'
-        | 'cancelled'
-        | { other: string }
-        | null;
+      stop_reason?: string | null;
     }
   | {
       type: 'tool_call';
       images?: UserImage[];
-      resource_id?: string | null;
       tool_call_id: string;
       tool_name: string;
       content: string;
       failed: boolean;
     }
-  | { type: 'error'; message: string }
+  | { type: 'error'; message: string; request_id?: string }
   | { type: 'inject'; messages: AgentMessage[] };
 export interface AgentState {
   workspace: WorkspaceRef;
@@ -93,9 +86,10 @@ export interface AgentState {
   error?: ProtocolError | null;
 }
 export interface HistoryMessage {
-  source: string;
   sequence: number;
   turn: string | null;
+  type?: string;
+  source?: string;
   kind: string;
   content: string;
   payload: unknown;
@@ -127,7 +121,20 @@ export interface StreamDelta {
   sequence: number;
   content: string;
 }
-export type MclCommandResult = { Ok: unknown } | { Err: ProtocolError };
+export interface MclError {
+  type: 'error';
+  message: string;
+  request_id: string;
+}
+export type MclValue =
+  | 'Unit'
+  | { Array: { Message: AgentMessage[] } }
+  | { Config: Record<string, unknown> }
+  | { Inference: { message: AgentMessage; stop_reason: string } }
+  | { Import: { kind: 'Message' | 'Tool' | 'Sandbox'; alias: string } }
+  | { Error: MclError };
+export type MclCommandResult = { Ok: MclValue };
+export type AbortResult = { Ok: null } | { Err: ProtocolError };
 export type ClientMessage =
   | {
       type: 'connection.register';
@@ -203,7 +210,7 @@ export type ServerMessage =
       workspace: WorkspaceReference;
       agent: string;
       turn_id: string;
-      result: { Ok: null } | { Err: ProtocolError };
+      result: AbortResult;
     }
   | ({ type: 'agent.message.delta' | 'agent.message.reasoning_delta' } & StreamDelta)
   | {
@@ -227,6 +234,8 @@ export function errorMessage(value: unknown): string {
 }
 const string = (value: unknown): value is string => typeof value === 'string';
 const nullableString = (value: unknown): boolean => value === null || string(value);
+const optionalNullableString = (value: unknown): boolean =>
+  value === undefined || nullableString(value);
 const integer = (value: unknown): boolean =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(string);
@@ -293,7 +302,15 @@ function history(value: unknown): boolean {
     value.messages.every(
       (entry) =>
         isRecord(entry) &&
-        string(entry.source) &&
+        (entry.kind === 'message'
+          ? (entry.type === undefined ||
+              (string(entry.type) && entry.type.length > 0)) &&
+            entry.source === undefined
+          : entry.kind === 'mcl'
+            ? (entry.source === undefined ||
+                (string(entry.source) && entry.source.length > 0)) &&
+              entry.type === undefined
+            : true) &&
         integer(entry.sequence) &&
         nullableString(entry.turn) &&
         string(entry.kind) &&
@@ -316,11 +333,22 @@ function backendState(value: unknown): boolean {
     value.histories.every(history)
   );
 }
+function mclResult(value: unknown): boolean {
+  return isRecord(value) && 'Ok' in value && !('Err' in value);
+}
 function result(value: unknown): boolean {
   return (
     isRecord(value) &&
     (('Ok' in value && !('Err' in value)) ||
       ('Err' in value && !('Ok' in value) && protocolError(value.Err)))
+  );
+}
+export function isMclError(value: unknown): value is MclError {
+  return (
+    isRecord(value) &&
+    value.type === 'error' &&
+    string(value.message) &&
+    string(value.request_id)
   );
 }
 function images(value: unknown): boolean {
@@ -347,13 +375,14 @@ export function isAgentMessage(value: unknown): value is AgentMessage {
       return string(value.content) && images(value.images);
     case 'assistant':
       return (
-        nullableString(value.content) &&
-        nullableString(value.reasoning) &&
-        Array.isArray(value.tool_calls) &&
-        value.tool_calls.every(
-          (call) =>
-            isRecord(call) && string(call.id) && string(call.tool_name) && 'arguments' in call,
-        )
+        optionalNullableString(value.content) &&
+        optionalNullableString(value.reasoning) &&
+        (value.tool_calls === undefined ||
+          (Array.isArray(value.tool_calls) &&
+            value.tool_calls.every(
+              (call) =>
+                isRecord(call) && string(call.id) && string(call.tool_name) && 'arguments' in call,
+            )))
       );
     case 'tool_call':
       return (
@@ -420,7 +449,7 @@ export function parseServerMessage(raw: string): ServerMessage | null {
           string(value.id) &&
           string(value.source) &&
           string(value.target) &&
-          result(value.result) &&
+          mclResult(value.result) &&
           (value.history_error == null || protocolError(value.history_error));
         break;
       case 'agent.turn.abort_result':

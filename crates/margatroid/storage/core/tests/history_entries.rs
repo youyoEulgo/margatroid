@@ -5,7 +5,7 @@ use storage_core::*;
 
 fn record(key: &str) -> HistoryRecord {
     HistoryRecord {
-        source: "original-source".into(),
+        source: None,
         turn: Some("turn".into()),
         kind: "message".into(),
         content: key.into(),
@@ -50,7 +50,7 @@ fn actual_sequences_and_timestamps_survive_duplicate_appends_and_reopen() {
         vec![41, 42, 43]
     );
     assert_eq!(saved[0].record.created_at_ms, Some(0));
-    assert_eq!(saved[0].record.source, "original-source");
+    assert_eq!(saved[0].record.source.as_deref(), Some("original-source"));
     assert_eq!(saved[0].record.content, "stored separately");
     assert!((before..=after).contains(&saved[1].record.created_at_ms.unwrap()));
     let mut retry = fresh;
@@ -99,6 +99,7 @@ fn mixed_history_streams_share_sequences_and_atomic_batch_rollback() {
     let storage = open_storage(&path, &dir.path().join("cfg"), "").unwrap();
     let mut audit = record("audit");
     audit.kind = "mcl".into();
+    audit.source = Some("original-source".into());
     audit.content = "run".into();
     audit.payload =
         json!({"text":"run","arguments":{"nested":[1,null]},"error":null,"id":"request"});
@@ -164,7 +165,30 @@ fn mixed_history_streams_share_sequences_and_atomic_batch_rollback() {
     assert_eq!(saved[3].record.content, "error");
     assert_eq!(saved[4].record.content, "");
     let database = Connection::open(path).unwrap();
-    for table in ["agent_messages", "mcl_records"] {
+    for (table, expected) in [
+        (
+            "agent_messages",
+            [
+                "sequence",
+                "turn",
+                "type",
+                "content",
+                "payload",
+                "created_at_ms",
+            ],
+        ),
+        (
+            "mcl_records",
+            [
+                "sequence",
+                "source",
+                "turn",
+                "content",
+                "payload",
+                "created_at_ms",
+            ],
+        ),
+    ] {
         let columns = database
             .prepare(&format!("PRAGMA table_info({table})"))
             .unwrap()
@@ -172,17 +196,7 @@ fn mixed_history_streams_share_sequences_and_atomic_batch_rollback() {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(
-            columns,
-            [
-                "sequence",
-                "source",
-                "turn",
-                "content",
-                "payload",
-                "created_at_ms"
-            ]
-        );
+        assert_eq!(columns, expected);
     }
 }
 
@@ -193,13 +207,14 @@ fn content_payload_and_source_are_independent_and_preserved_verbatim() {
     let storage = open_storage(&path, &dir.path().join("cfg"), "").unwrap();
     let source = " agent:原始 地址/<caller>?x=1 ";
     let mut message = record("payload content");
-    message.source = source.into();
+    message.source = None;
     message.content = "调用方正文\n原样".into();
     message.payload["key"] = json!("preserved application key");
     message.payload["idempotency"] = json!("preserved payload data");
     message.created_at_ms = Some(3);
     let mut mcl = message.clone();
     mcl.kind = "mcl".into();
+    mcl.source = Some(source.into());
     mcl.content = "原始命令显示".into();
     mcl.payload = json!({"text":"different command", "extra":{"keep":true}});
     for _ in 0..2 {
@@ -223,12 +238,13 @@ fn content_payload_and_source_are_independent_and_preserved_verbatim() {
     let db = Connection::open(path).unwrap();
     let raw: (String, String, String) = db
         .query_row(
-            "SELECT source,content,payload FROM agent_messages WHERE sequence=1",
+            "SELECT type,content,payload FROM agent_messages WHERE sequence=1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
-    assert_eq!(raw.0, source);
+    assert_eq!(raw.0, "user");
+    assert_eq!(saved[1].record.source.as_deref(), Some(source));
     assert_eq!(raw.1, "调用方正文\n原样");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&raw.2).unwrap(),
@@ -249,7 +265,9 @@ fn invalid_sources_and_sql_failures_rollback_whole_mixed_batch() {
         "bad\u{85}source",
     ] {
         let mut invalid = record("bad");
-        invalid.source = source.into();
+        invalid.kind = "mcl".into();
+        invalid.payload = json!({"text":"bad"});
+        invalid.source = Some(source.into());
         assert_eq!(
             execute_storage(
                 &storage,
@@ -266,6 +284,7 @@ fn invalid_sources_and_sql_failures_rollback_whole_mixed_batch() {
     Connection::open(path).unwrap().execute_batch("CREATE TRIGGER fail_mcl BEFORE INSERT ON mcl_records BEGIN SELECT RAISE(ABORT,'failure'); END;").unwrap();
     let mut mcl = record("mcl");
     mcl.kind = "mcl".into();
+    mcl.source = Some("caller".into());
     mcl.payload = json!({"text":"run"});
     assert_eq!(
         execute_storage(
@@ -287,4 +306,45 @@ fn invalid_sources_and_sql_failures_rollback_whole_mixed_batch() {
     )
     .unwrap();
     assert_eq!(entries(&storage)[0].sequence, 1);
+}
+
+#[test]
+fn message_types_are_stored_from_payload_and_mismatch_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let storage = open_storage(&path, &dir.path().join("cfg"), "").unwrap();
+    for message_type in ["user", "assistant", "error"] {
+        let mut message = record("independent content");
+        message.payload = json!({"type": message_type, "content": "payload content"});
+        execute_storage(
+            &storage,
+            StorageOperation::AppendHistory {
+                records: vec![message],
+            },
+        )
+        .unwrap();
+    }
+    let db = Connection::open(path).unwrap();
+    let types = db
+        .prepare("SELECT type FROM agent_messages ORDER BY sequence")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(types, ["user", "assistant", "error"]);
+    assert!(entries(&storage)
+        .iter()
+        .all(|entry| entry.record.source.is_none()));
+    db.execute(
+        "UPDATE agent_messages SET type='error' WHERE sequence=1",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        execute_storage(&storage, StorageOperation::ReadHistoryEntries)
+            .unwrap_err()
+            .kind,
+        StorageErrorKind::SchemaMismatch
+    );
 }

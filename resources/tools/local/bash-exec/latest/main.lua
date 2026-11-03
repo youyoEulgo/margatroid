@@ -1,3 +1,7 @@
+function configure(arguments, context)
+    return { timeout_ms = 120000 }
+end
+
 function execute(arguments, context)
     local quote = "'" .. arguments.cmd:gsub("'", "'\\''") .. "'"
     local result = shell("bash --noprofile --norc -c " .. quote, { max_output_bytes = 64 * 1024 })

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use address::Address;
 use agent_core::{Agent, AgentState};
+use app_runtime_plugin::WorldEventExt;
 use client_core::WorldClientExt;
 use core_plugin::World;
 use futures_util::{FutureExt, StreamExt};
@@ -221,7 +222,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
                     "Driver VM instance is missing or does not match Agent",
                 )
             })?;
-        let agent_instance = vm.instance.start_id.clone();
+        let agent_instance = vm.instance.clone();
         let mut seen = HashSet::new();
         let senders = world
             .client_webui_senders()
@@ -261,14 +262,22 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
     let turn = request.turn.clone();
     let cancel = request.cancel.clone();
     let context = InferenceContext {
+        cleanup_notification: Some((
+            world.event_sender(),
+            InferenceCleanupFinished {
+                agent,
+                request_id: request_id.clone(),
+                instance: agent_instance.clone(),
+            },
+        )),
         delivery: StreamDelivery {
             id: request_id.clone(),
             agent: agent_address,
-            instance: agent_instance,
+            instance: agent_instance.start_id,
             senders,
         },
         request,
-        reply,
+        reply: Some(reply),
         route,
         tools: paths,
         client,
@@ -308,10 +317,12 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
                 .unwrap_or_else(|error| error.into_inner())
                 .take()
             {
-                let _ = context.reply.send(Err(error(
-                    Kind::TaskPanicked,
-                    "inference submission failed",
-                )));
+                if let Some(reply) = context.reply {
+                    let _ = reply.send(Err(error(
+                        Kind::TaskPanicked,
+                        "inference submission failed",
+                    )));
+                }
             }
         }
     }
@@ -365,7 +376,7 @@ async fn supervise_inference(mut context: InferenceContext) {
         if context.request.cancel.is_cancelled() || context.gate.lock().unwrap_or_else(|error| error.into_inner()).closed {
             return Ok(frozen_response(&context.gate));
         }
-        if context.reply.is_closed() { return Err(error(Kind::ReplyClosed, "inference reply receiver closed")); }
+        if context.reply.as_ref().is_some_and(|reply| reply.is_closed()) { return Err(error(Kind::ReplyClosed, "inference reply receiver closed")); }
         if tokio::time::Instant::now() >= deadline { return Err(error(Kind::Timeout, "inference preparation exhausted deadline")); }
         let names = domain.tools.iter().map(|tool| tool.name.clone()).collect::<HashSet<_>>();
         let request = build_request(domain, &context.route)?;
@@ -374,8 +385,10 @@ async fn supervise_inference(mut context: InferenceContext) {
         let provider = read_provider(context.client.clone(), request, upstream.clone(), sender);
         #[cfg(test)]
         let cleanup_gate = context.cleanup_gate.clone();
+        let (completed, mut completion) = tokio::sync::oneshot::channel();
         let mut worker = tokio::spawn(async move {
             let result = provider.await;
+            let _ = completed.send(result.clone());
             #[cfg(test)]
             if let Some((entered, release)) = cleanup_gate {
                 entered.notify_one();
@@ -389,17 +402,34 @@ async fn supervise_inference(mut context: InferenceContext) {
             tokio::select! {
                 biased;
                 () = context.request.cancel.cancelled() => Err(error(Kind::Cancelled, "inference cancelled")),
-                () = context.reply.closed() => Err(error(Kind::ReplyClosed, "inference reply receiver closed")),
+                () = context.reply.as_mut().expect("inference reply remains pending").closed() => Err(error(Kind::ReplyClosed, "inference reply receiver closed")),
                 () = tokio::time::sleep_until(deadline) => Err(error(Kind::Timeout, "inference execution deadline exceeded")),
                 result = &mut stream => result,
             }
         };
         context.gate.lock().unwrap_or_else(|error| error.into_inner()).close();
         upstream.cancel();
+        // Failure delivery must not depend on cleanup. The supervisor remains the
+        // active handle until the real worker joins, preventing overlapping work.
+        let known_failure = received.as_ref().err().cloned().or_else(|| {
+            completion.try_recv().ok().and_then(Result::err)
+        });
+        if let Some(failure) = known_failure.filter(|failure| failure.kind != Kind::Cancelled) {
+            finish_inference(&mut context, Err(failure));
+        }
         let joined = tokio::time::timeout(Duration::from_secs(3), &mut worker).await;
         let provider = match joined {
             Ok(result) => result.map_err(|_| error(Kind::TaskPanicked, "inference HTTP worker panicked"))?,
-            Err(_) => { let _ = worker.await; return Err(error(Kind::CleanupFailed, "inference HTTP worker cleanup exceeded budget")); }
+            Err(_) => {
+                let failure = error(Kind::CleanupFailed, "inference HTTP worker cleanup exceeded budget");
+                if context.reply.is_some() {
+                    finish_inference(&mut context, Err(failure.clone()));
+                } else {
+                    push_finished(&mut context.delivery, Some(&failure));
+                }
+                let _ = worker.await;
+                return Err(failure);
+            }
         };
         if received.as_ref().is_err_and(|failure| failure.kind == Kind::Cancelled) || context.request.cancel.is_cancelled() { return Ok(frozen_response(&context.gate)); }
         received?;
@@ -407,13 +437,25 @@ async fn supervise_inference(mut context: InferenceContext) {
         let result = context.gate.lock().unwrap_or_else(|error| error.into_inner()).accumulator.response(&names)?;
         Ok(result)
     }).catch_unwind().await.unwrap_or_else(|_| Err(error(Kind::CleanupFailed, "inference supervisor panicked before cleanup confirmation")));
+    finish_inference(&mut context, result);
+    if let Some((events, notification)) = context.cleanup_notification.take() {
+        events.send_event(notification);
+    }
+}
+
+fn finish_inference(
+    context: &mut InferenceContext,
+    result: Result<InferenceResponse, InferenceError>,
+) {
     context
         .gate
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .close();
-    push_finished(&mut context.delivery, result.as_ref().err());
-    let _ = context.reply.send(result);
+    if let Some(reply) = context.reply.take() {
+        push_finished(&mut context.delivery, result.as_ref().err());
+        let _ = reply.send(result);
+    }
 }
 
 fn frozen_response(gate: &Arc<Mutex<StreamGate>>) -> InferenceResponse {
@@ -487,6 +529,7 @@ async fn read_provider_with_timeouts(
     sender: mpsc::Sender<ProviderFragment>,
     deadlines: (Duration, Duration),
 ) -> Result<(), InferenceError> {
+    let secrets = provider_error_secrets(&request.headers);
     let mut outbound = reqwest::Request::new(request.method, request.url);
     *outbound.headers_mut() = request.headers;
     *outbound.body_mut() = Some(reqwest::Body::from(request.body));
@@ -498,10 +541,7 @@ async fn read_provider_with_timeouts(
                 .map_err(http_request_error)?,
     };
     if !response.status().is_success() {
-        return Err(error(
-            Kind::ResponseStatus,
-            format!("inference HTTP status {}", response.status().as_u16()),
-        ));
+        return Err(read_provider_status_error(response, &cancel, deadlines.1, &secrets).await);
     }
     let mut decoder = request.decoder;
     let mut body = response.bytes_stream();
@@ -525,6 +565,203 @@ async fn read_provider_with_timeouts(
         tokio::select! { biased; () = cancel.cancelled() => return Err(error(Kind::Cancelled, "upstream cancelled")), result = sender.send(fragment) => if result.is_err() { return Err(error(Kind::Cancelled, "fragment receiver closed")); } }
     }
     Ok(())
+}
+
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_STATUS_ERROR_BYTES: usize = 4096;
+
+fn provider_error_secrets(headers: &reqwest::header::HeaderMap) -> Vec<String> {
+    let mut secrets = Vec::new();
+    for name in ["authorization", "x-api-key"] {
+        for value in headers.get_all(name) {
+            if let Ok(value) = value.to_str() {
+                if !value.is_empty() {
+                    secrets.push(value.to_owned());
+                    if name == "authorization" {
+                        if let Some((_, credential)) = value.split_once(char::is_whitespace) {
+                            if !credential.trim().is_empty() {
+                                secrets.push(credential.trim().to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.dedup();
+    secrets
+}
+
+fn safe_error_field(value: &str, secrets: &[String], limit: usize) -> String {
+    // Redact before truncation so a credential crossing the budget is never exposed.
+    let mut value = value.to_owned();
+    for secret in secrets {
+        value = value.replace(secret, "[REDACTED]");
+    }
+    let mut safe = String::new();
+    for word in value.split_whitespace() {
+        if !safe.is_empty() {
+            safe.push(' ');
+        }
+        let lower = word.to_ascii_lowercase();
+        if lower.contains("http://") || lower.contains("https://") {
+            safe.push_str("[URL REDACTED]");
+        } else {
+            safe.extend(word.chars().filter(|ch| !ch.is_control()));
+        }
+    }
+    if safe.chars().count() > limit {
+        safe = safe.chars().take(limit.saturating_sub(1)).collect();
+        safe.push('…');
+    }
+    safe
+}
+
+async fn read_provider_status_error(
+    response: reqwest::Response,
+    cancel: &CancellationToken,
+    read_deadline: Duration,
+    secrets: &[String],
+) -> InferenceError {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    let read = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(_) => return Some("error body disconnected"),
+            };
+            let remaining = MAX_ERROR_BODY_BYTES - body.len();
+            body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            if body.len() == MAX_ERROR_BODY_BYTES {
+                return Some("error body truncated");
+            }
+        }
+        None
+    };
+    // Use the existing read budget for the entire error read, including trickles.
+    let diagnostic = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return error(Kind::Cancelled, "upstream cancelled"),
+        result = tokio::time::timeout(read_deadline, read) => match result {
+            Ok(diagnostic) => diagnostic,
+            Err(_) => Some("error body read timed out"),
+        },
+    };
+    format_provider_status_error(status, &headers, &body, diagnostic, secrets)
+}
+
+fn format_provider_status_error(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &[u8],
+    diagnostic: Option<&str>,
+    secrets: &[String],
+) -> InferenceError {
+    let mut output = format!(
+        "HTTP {} {}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("Unknown Status")
+    );
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let upstream = parsed.as_ref().and_then(|value| value.get("error"));
+    let field = |name: &str| {
+        upstream
+            .and_then(|value| value.get(name))
+            .and_then(|value| match value {
+                serde_json::Value::String(value) => Some(value.clone()),
+                serde_json::Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            })
+    };
+    let request_id = field("request_id")
+        .or_else(|| {
+            parsed
+                .as_ref()?
+                .get("request_id")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            ["x-request-id", "request-id"].into_iter().find_map(|name| {
+                headers
+                    .get(name)?
+                    .to_str()
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            })
+        });
+    let message = field("message").or_else(|| upstream?.as_str().map(str::to_owned));
+    let request_id = request_id.or_else(|| {
+        let message = message.as_deref()?;
+        let (_, tail) = message.split_once("(request_id:")?;
+        let (id, _) = tail.split_once(')')?;
+        (!id.trim().is_empty()).then(|| id.trim().to_owned())
+    });
+    let content_type = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let text = String::from_utf8_lossy(body);
+    let looks_structured = matches!(text.trim_start().chars().next(), Some('{' | '[' | '<'));
+    let message = message.or_else(|| {
+        (parsed.is_none()
+            && !body.is_empty()
+            && !looks_structured
+            && (content_type.is_empty() || content_type.starts_with("text/plain")))
+        .then(|| safe_error_field(&text, secrets, 512))
+    });
+    // Reserve most of the budget for request correlation and message detail.
+    for (name, value, limit) in [
+        ("type", field("type"), 48),
+        ("code", field("code"), 48),
+        ("request_id", request_id, 96),
+    ] {
+        if let Some(value) = value {
+            let value = safe_error_field(&value, secrets, limit);
+            if !value.is_empty() {
+                output.push_str(&format!("; {name}={value}"));
+            }
+        }
+    }
+    let detail = message.unwrap_or_else(|| {
+        if body.is_empty() {
+            "empty error response".to_owned()
+        } else {
+            "non-JSON error response".to_owned()
+        }
+    });
+    let suffix = diagnostic
+        .map(|value| format!("; {value}"))
+        .unwrap_or_default();
+    let media_type = content_type.split(';').next().unwrap_or("");
+    let suffix = if parsed.is_none() && looks_structured && !media_type.is_empty() {
+        format!(
+            "; content_type={}{}",
+            safe_error_field(media_type, secrets, 48),
+            suffix
+        )
+    } else {
+        suffix
+    };
+    let budget = MAX_STATUS_ERROR_BYTES.saturating_sub(output.len() + 10 + suffix.len());
+    let mut detail = safe_error_field(&detail, secrets, MAX_STATUS_ERROR_BYTES);
+    if detail.len() > budget {
+        let mut end = budget.saturating_sub('…'.len_utf8());
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+        detail.push('…');
+    }
+    output.push_str("; message=");
+    output.push_str(&detail);
+    output.push_str(&suffix);
+    error(Kind::ResponseStatus, output)
 }
 
 fn push_stream(delivery: &mut StreamDelivery, sequence: u64, reasoning: bool, content: String) {

@@ -116,7 +116,7 @@ fn cloned_import_requests_share_a_single_reply() {
 
 fn valid_tool(fixture: &Fixture) -> PathBuf {
     fixture.write("input.schema.json", r#"{"type":"object"}"#);
-    fixture.write("main.lua", "return { value = 1 }");
+    fixture.write("main.lua", "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() task_return({ value = 1 }) end");
     fixture.write("tool.toml", "schema_version = 1\ndescription = 'sample'\n")
 }
 

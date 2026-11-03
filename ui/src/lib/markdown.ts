@@ -90,9 +90,19 @@ markdown.use({
   ],
 });
 
+const cache = new Map<string, string>();
+const CACHE_LIMIT = 400;
+
 export function renderMarkdown(content: string): string {
+  const cached = cache.get(content);
+  if (cached !== undefined) return cached;
   const rendered = markdown.parse(content) as string;
   // Marked keeps the trailing newline as a text node after the last block,
   // which creates a second, empty line inside the inline-block user bubble.
-  return DOMPurify.sanitize(rendered).trim();
+  const html = DOMPurify.sanitize(rendered).trim();
+  // Follow-up renders of unchanged messages are common while another message
+  // is streaming, so keep recent results and bound the map.
+  cache.set(content, html);
+  if (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value!);
+  return html;
 }

@@ -33,7 +33,7 @@ execute_storage(storage: &AgentStorage, operation: StorageOperation) -> Result<S
     行为：串行执行对应SQLite事务或设置文件操作；写入确认完成后返回。
 
 数据库结构
-    main.agent_messages：sequence、source、turn、content、payload、created_at_ms
+    main.agent_messages：sequence、turn、type、content、payload、created_at_ms--type从payload.type提取，读取时校验一致
     main.mcl_records：sequence、source、turn、content、payload、created_at_ms
     main.blocks：name、fields_json--对象的每个键对应一个消息数组
     行为：只保留三张表，不使用AUTOINCREMENT或metadata表；PRAGMA user_version保存版本。只支持当前结构；空库创建，不匹配则明确报错，不自动迁移或备份。
@@ -164,7 +164,7 @@ MessageSource：写事务内的消息来源，公开枚举
     Literal(Vec<serde_json::Value>)
 
 HistoryRecord：只追加历史记录
-    source: String--调用方显式提供的真实来源地址，不保存Entity编号
+    source: Option<String>--仅MCL必需真实来源地址；消息为None，不保存Entity编号
     turn: Option<String>
     kind: String--时间线记录类型，决定写入message或mcl表，不存为混合kind列
     content: String--调用方提供的原始正文，独立于payload原样保存与读取

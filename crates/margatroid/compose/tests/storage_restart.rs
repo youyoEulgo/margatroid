@@ -119,6 +119,30 @@ fn assert_disk_schema_and_messages(path: &Path, message: &Value) {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(tables, ["agent_messages", "blocks", "mcl_records"]);
+    let columns = db
+        .prepare("PRAGMA table_info(agent_messages)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        columns,
+        [
+            "sequence",
+            "turn",
+            "type",
+            "content",
+            "payload",
+            "created_at_ms"
+        ]
+    );
+    let message_type: String = db
+        .query_row("SELECT type FROM agent_messages LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(message_type, message["type"].as_str().unwrap());
     assert_eq!(
         db.query_row("SELECT count(*) FROM main.blocks", [], |row| row
             .get::<_, i64>(0))

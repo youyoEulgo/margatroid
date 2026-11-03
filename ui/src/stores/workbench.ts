@@ -4,6 +4,7 @@ import {
   parseServerMessage,
   isRecord,
   isAgentMessage,
+  isMclError,
   errorMessage,
   type AgentHistory,
   type AgentMessage,
@@ -16,13 +17,18 @@ import {
   type ToolCall,
   type WorkspaceConfig,
   type WorkspaceInfo,
-  type WorkspaceRef,
   type WorkspaceReference,
   type UserImage,
 } from '@/types/protocol';
+import { randomId } from '@/lib/id';
 
 export type ConnectionStatus = 'offline' | 'connecting' | 'online';
 export type MessageRole = 'system' | 'user' | 'assistant' | 'tool' | 'error' | 'record';
+export interface ToolResult {
+  content: string;
+  failed: boolean;
+  images?: UserImage[];
+}
 export interface ConversationEntry {
   key: string;
   id: string;
@@ -38,7 +44,11 @@ export interface ConversationEntry {
   kind: string;
   payload: unknown;
   source: string | null;
+  messageType: string | null;
   sequence: number | null;
+  toolCallId: string | null;
+  toolName: string | null;
+  toolResults?: Map<string, ToolResult>;
 }
 export interface RuntimeLog {
   key: string;
@@ -66,6 +76,10 @@ interface PendingCommand {
   target?: Target;
   read?: boolean;
   turn?: string;
+}
+interface MclCommandFailure extends Error {
+  requestId?: string;
+  agentMessage?: unknown;
 }
 interface AbortGuard extends Target {
   id: string;
@@ -139,6 +153,15 @@ export function parseArguments(raw: string): unknown[] {
     throw new Error('Arguments must be a JSON array, with one value per ? placeholder');
   return value;
 }
+function sameImages(left: UserImage[], right: UserImage[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (image, index) =>
+        image.media_type === right[index]!.media_type && image.data === right[index]!.data,
+    )
+  );
+}
 export function historyMessage(entry: HistoryMessage): AgentMessage | null {
   const payload =
     isRecord(entry.payload) && isRecord(entry.payload.message)
@@ -171,7 +194,10 @@ function payloadRequestId(entry: HistoryMessage): string {
 }
 function decodeMessage(
   message: AgentMessage,
-): Pick<ConversationEntry, 'role' | 'thinking' | 'content' | 'toolCalls' | 'failed' | 'images'>[] {
+): Pick<
+  ConversationEntry,
+  'role' | 'thinking' | 'content' | 'toolCalls' | 'failed' | 'images' | 'toolCallId' | 'toolName'
+>[] {
   switch (message.type) {
     case 'inject':
       return message.messages.flatMap(decodeMessage);
@@ -185,6 +211,8 @@ function decodeMessage(
           toolCalls: [],
           failed: false,
           images: message.type === 'user' ? message.images : undefined,
+          toolCallId: null,
+          toolName: null,
         },
       ];
     case 'assistant':
@@ -193,8 +221,10 @@ function decodeMessage(
           role: 'assistant',
           thinking: message.reasoning ?? '',
           content: message.content ?? '',
-          toolCalls: message.tool_calls,
+          toolCalls: message.tool_calls ?? [],
           failed: false,
+          toolCallId: null,
+          toolName: null,
         },
       ];
     case 'tool_call':
@@ -206,16 +236,26 @@ function decodeMessage(
           toolCalls: [],
           failed: message.failed,
           images: message.images,
+          toolCallId: message.tool_call_id,
+          toolName: message.tool_name,
         },
       ];
     case 'error':
       return [
-        { role: 'error', thinking: '', content: message.message, toolCalls: [], failed: true },
+        {
+          role: 'error',
+          thinking: '',
+          content: message.message,
+          toolCalls: [],
+          failed: true,
+          toolCallId: null,
+          toolName: null,
+        },
       ];
   }
 }
 export function historyEntries(history: AgentHistory): ConversationEntry[] {
-  return [...history.messages]
+  const entries: ConversationEntry[] = [...history.messages]
     .sort((a, b) => a.sequence - b.sequence)
     .flatMap((entry) => {
       const base = {
@@ -224,7 +264,8 @@ export function historyEntries(history: AgentHistory): ConversationEntry[] {
         workspaceKey: workspaceKey(history.workspace),
         agent: history.agent,
         timestamp: entry.created_at_ms,
-        source: entry.source,
+        source: entry.kind === 'mcl' ? (entry.source ?? null) : null,
+        messageType: entry.type ?? null,
         sequence: entry.sequence,
         kind: entry.kind,
         payload: entry.payload,
@@ -244,9 +285,34 @@ export function historyEntries(history: AgentHistory): ConversationEntry[] {
               content: entry.content,
               toolCalls: [],
               failed: false,
+              toolCallId: null,
+              toolName: null,
             },
           ];
     });
+  const results = new Map<string, ToolResult>();
+  for (const entry of entries)
+    if (entry.role === 'tool' && entry.toolCallId)
+      results.set(entry.toolCallId, {
+        content: entry.content,
+        failed: entry.failed,
+        images: entry.images,
+      });
+  const callIds = new Set<string>();
+  for (const entry of entries) {
+    if (entry.role !== 'assistant' || !entry.toolCalls.length) continue;
+    const attached = new Map<string, ToolResult>();
+    for (const call of entry.toolCalls) {
+      callIds.add(call.id);
+      const result = results.get(call.id);
+      if (result) attached.set(call.id, result);
+    }
+    if (attached.size) entry.toolResults = attached;
+  }
+  // A tool result belongs to its call row; only unpaired results stay standalone.
+  return entries.filter(
+    (entry) => !(entry.role === 'tool' && entry.toolCallId && callIds.has(entry.toolCallId)),
+  );
 }
 export function latestContextTokens(history: AgentHistory | undefined): number | null {
   let latest: number | null = null;
@@ -369,6 +435,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const endpoint = ref(defaultEndpoint());
   const driverContextPath = ref('entry.pending[-1]');
   const connectionStatus = ref<ConnectionStatus>('offline');
+  const stateReady = ref(false);
   const connectionError = ref('');
   const registeredClient = ref<ClientInfo | null>(null);
   const definitions = ref<WorkspaceConfig[]>([]);
@@ -388,16 +455,22 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const completedStreams = new Set<string>();
   const abortedStreams = new Set<string>();
   const sendingTargets = new Set<string>();
+  const pendingWakes = new Map<
+    string,
+    { workspace: string; agent: string; instance: string; content: string; images: UserImage[] }
+  >();
   const resourceSettings = ref<{ snapshot: string; visibleTools: string[] } | null>(null);
   const resourceReadPending = ref('');
   const resourceWritePending = ref('');
   const resourceSnapshot = ref('');
+  const resourceError = ref('');
   const resourceSettingsReady = computed(
     () => !!resourceSettings.value && resourceSettings.value.snapshot === resourceSnapshot.value,
   );
   const resourceSettingsPending = computed(
     () => !!resourceReadPending.value || !!resourceWritePending.value,
   );
+  const resourceWriteInFlight = computed(() => !!resourceWritePending.value);
   const resourceVisibility = computed(() =>
     (selectedAgentState.value?.tools ?? []).map((alias) => ({
       resource: alias,
@@ -497,13 +570,24 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         history.agent === selectedAgent.value,
     ),
   );
+  const selectedHistoryEntries = computed(() =>
+    selectedHistory.value ? historyEntries(selectedHistory.value) : [],
+  );
+  const historyMessageIds = computed(
+    () =>
+      new Set(
+        selectedHistoryEntries.value
+          .filter((entry) => entry.role === 'assistant')
+          .map((entry) => entry.id),
+      ),
+  );
   const visibleMessages = computed(() => {
-    const history = selectedHistory.value ? historyEntries(selectedHistory.value) : [];
+    const history = selectedHistoryEntries.value;
     const live = [...streams.value.values()].filter(
       (entry) =>
         entry.workspaceKey === selectedRuntimeWorkspace.value?.id &&
         entry.agent === selectedAgent.value &&
-        !history.some((row) => row.id === entry.id && row.role === 'assistant'),
+        !historyMessageIds.value.has(entry.id),
     );
     return [...history, ...live];
   });
@@ -533,7 +617,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     fields: RuntimeLog['fields'] = [],
   ) {
     logs.value.push({
-      key: crypto.randomUUID(),
+      key: randomId(),
       timestamp: Date.now(),
       level,
       message,
@@ -550,7 +634,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       socket!.send(
         JSON.stringify({
           type: 'state.query',
-          id: crypto.randomUUID(),
+          id: randomId(),
           message: {},
         } satisfies ClientMessage),
       );
@@ -560,7 +644,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       socket!.send(
         JSON.stringify({
           type: 'history.query',
-          id: crypto.randomUUID(),
+          id: randomId(),
           message: { workspace: target.workspace, agent: target.agent },
         } satisfies ClientMessage),
       );
@@ -576,6 +660,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
     pending.clear();
   }
+  function resourcesReset() {
+    resourceSnapshot.value = '';
+    resourceSettings.value = null;
+    resourceReadPending.value = '';
+    resourceWritePending.value = '';
+    resourceError.value = '';
+  }
   function closeSocket() {
     if (socket) {
       socket.onclose = null;
@@ -583,10 +674,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       socket = null;
     }
     registeredClient.value = null;
-    resourceSnapshot.value = '';
-    resourceSettings.value = null;
-    resourceReadPending.value = '';
-    resourceWritePending.value = '';
+    stateReady.value = false;
+    resourcesReset();
+    pendingWakes.clear();
     streams.value = new Map();
     rejectPending('Backend WebSocket closed');
   }
@@ -611,7 +701,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         next.send(
           JSON.stringify({
             type: 'connection.register',
-            id: crypto.randomUUID(),
+            id: randomId(),
             message: { client_type: 'webui' },
           } satisfies ClientMessage),
         );
@@ -629,8 +719,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       if (socket !== next) return;
       socket = null;
       registeredClient.value = null;
+      stateReady.value = false;
       connectionStatus.value = 'offline';
       streams.value = new Map();
+      pendingWakes.clear();
+      resourcesReset();
       rejectPending('Backend WebSocket disconnected');
       if (shouldReconnect)
         reconnectTimer = setTimeout(
@@ -671,9 +764,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
   function expandWorkspace(path: string) {
     expandedWorkspaceKeys.value = new Set(expandedWorkspaceKeys.value).add(path);
-  }
-  function isWorkspaceExpanded(path: string) {
-    return expandedWorkspaceKeys.value.has(path);
   }
   function toggleWorkspace(path: string) {
     const expanded = expandedWorkspaceKeys.value.has(path);
@@ -746,7 +836,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     return request(
       {
         type: 'mcl.command',
-        id: crypto.randomUUID(),
+        id: randomId(),
         message: {
           workspace: target.workspace,
           agent: target.agent,
@@ -756,10 +846,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       },
       target,
       command.trim().startsWith('GET ') || command.trim() === 'CONFIG GET',
-    ).catch((error: Error) => {
-      lastFailures.value.set(`${target.workspace}:${target.agent}`, { message: error.message });
-      throw error;
-    });
+    );
   }
   function executeMclCommand(command: string, argumentsValue: unknown[] = []): Promise<unknown> {
     try {
@@ -780,83 +867,104 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       selectedAgentState.value?.sandboxes,
     ]);
   }
-  function assertResourceTarget(target: Target, snapshot: string) {
-    if (
-      resourceTargetSnapshot(currentTarget(false)) !== snapshot ||
-      resourceSnapshot.value !== snapshot
-    )
+  function assertTarget(target: Target, snapshot: string) {
+    if (resourceTargetSnapshot(currentTarget(false)) !== snapshot)
       throw new Error('Selected agent changed during resource settings update');
-    const state = selectedAgentState.value;
-    if (state?.agent_instance !== target.instance)
+    if (selectedAgentState.value?.agent_instance !== target.instance)
       throw new Error('Selected agent instance changed during resource settings update');
   }
-  function refreshResourceSettings() {
+  function refreshResourceSettings(force = false) {
     const target = currentTarget(false);
     const snapshot = resourceTargetSnapshot(target);
-    if (snapshot === resourceSnapshot.value) return;
+    if (!force && snapshot === resourceSnapshot.value) return;
     resourceSnapshot.value = snapshot;
     resourceSettings.value = null;
     resourceReadPending.value = snapshot;
+    resourceError.value = '';
     if (!target || !snapshot) return;
     void executeFor(target, 'CONFIG GET')
       .then((result) => {
-        assertResourceTarget(target, snapshot);
+        if (resourceSnapshot.value !== snapshot) return;
+        assertTarget(target, snapshot);
         if (!isRecord(result) || !isRecord(result.Config))
           throw new Error('Daemon returned invalid resource settings');
-        const aliases = result.Config.visible_tools;
+        const aliases = result.Config.visible_tools ?? [];
         if (!Array.isArray(aliases) || !aliases.every((alias) => typeof alias === 'string'))
           throw new Error('Daemon returned invalid visible_tools settings');
         resourceSettings.value = { snapshot, visibleTools: aliases };
       })
       .catch((error: unknown) => {
-        if (resourceSnapshot.value === snapshot)
-          connectionError.value = error instanceof Error ? error.message : String(error);
+        if (resourceSnapshot.value !== snapshot) return;
+        // Drop the cached snapshot so a later refresh can retry instead of
+        // leaving the panel permanently disabled after one failed read.
+        resourceSnapshot.value = '';
+        resourceError.value = error instanceof Error ? error.message : String(error);
       })
       .finally(() => {
         if (resourceReadPending.value === snapshot) resourceReadPending.value = '';
       });
   }
-  async function writeResourceSetting(alias: string | null, visible?: boolean): Promise<void> {
+  function retryResourceSettings() {
+    refreshResourceSettings(true);
+  }
+  async function setResourceVisibility(alias: string, visible: boolean): Promise<void> {
     if (resourceSettingsPending.value)
       throw new Error('Wait for the current resource settings request');
     if (!resourceSettingsReady.value) throw new Error('Wait for resource settings to load');
     const target = currentTarget()!;
-    const snapshot = resourceSnapshot.value;
-    assertResourceTarget(target, snapshot);
-    const tools = visible !== undefined;
-    const choices = tools ? selectedAgentState.value!.tools : selectedAgentState.value!.sandboxes;
-    if (alias !== null && !choices.includes(alias))
-      throw new Error('Choose an imported resource alias');
-    const aliases = tools
-      ? [
-          ...new Set(
-            visible
-              ? [...resourceSettings.value!.visibleTools, alias!]
-              : resourceSettings.value!.visibleTools.filter((entry) => entry !== alias),
-          ),
-        ]
-      : alias === null
-        ? []
-        : [alias];
+    const snapshot = resourceTargetSnapshot(target);
+    assertTarget(target, snapshot);
+    if (!selectedAgentState.value!.tools.includes(alias))
+      throw new Error('Choose an imported tool alias');
+    const settings = resourceSettings.value!;
+    const aliases = [
+      ...new Set(
+        visible
+          ? [...settings.visibleTools, alias]
+          : settings.visibleTools.filter((entry) => entry !== alias),
+      ),
+    ];
     resourceWritePending.value = snapshot;
     try {
-      await executeFor(target, 'CONFIG SET ? ?', [tools ? 'visible_tools' : 'sandbox', aliases]);
-      assertResourceTarget(target, snapshot);
-      if (tools) resourceSettings.value = { snapshot, visibleTools: aliases };
-      else {
-        await executeFor(target, 'EFFECT sandbox_use ?', [aliases]);
-        assertResourceTarget(target, snapshot);
-        queryState();
-      }
+      const saved = await executeFor(target, 'CONFIG SET ? ?', ['visible_tools', aliases]);
+      requireUnit(saved, 'CONFIG SET visible_tools');
+      assertTarget(target, snapshot);
+      resourceSettings.value = { snapshot: settings.snapshot, visibleTools: aliases };
     } finally {
       if (resourceWritePending.value === snapshot) resourceWritePending.value = '';
     }
   }
-  function setResourceVisibility(alias: string, visible: boolean) {
-    return writeResourceSetting(alias, visible);
-  }
-  function setSandbox(alias: string | null) {
-    return writeResourceSetting(alias);
+  async function setSandbox(alias: string | null): Promise<void> {
+    if (resourceWritePending.value) throw new Error('Wait for the current sandbox request');
+    const target = currentTarget()!;
+    const snapshot = resourceTargetSnapshot(target);
+    assertTarget(target, snapshot);
+    if (alias !== null && !selectedAgentState.value!.sandboxes.includes(alias))
+      throw new Error('Choose an imported sandbox alias');
+    const aliases = alias === null ? [] : [alias];
+    resourceWritePending.value = snapshot;
+    let saved = false;
+    try {
+      const persisted = await executeFor(target, 'CONFIG SET ? ?', ['sandbox', aliases]);
+      requireUnit(persisted, 'CONFIG SET sandbox');
+      saved = true;
+      assertTarget(target, snapshot);
+      const applied = await executeFor(target, 'EFFECT sandbox_use ?', [aliases]);
+      requireUnit(applied, 'EFFECT sandbox_use');
+      assertTarget(target, snapshot);
+      queryState();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // Saved and applied are separate steps: re-read both so the panel shows
+      // the actual persisted value and the actual running sandbox.
+      queryState();
+      refreshResourceSettings(true);
+      throw new Error(
+        saved ? `Sandbox saved but not activated: ${message}` : `Sandbox was not saved: ${message}`,
+      );
+    } finally {
+      if (resourceWritePending.value === snapshot) resourceWritePending.value = '';
+    }
   }
   async function sendMessage(
     content: string,
@@ -870,29 +978,54 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     const targetKey = `${target.workspace}:${target.agent}:${target.instance}`;
     if (sendingTargets.has(targetKey))
       throw new Error('A message is already awaiting acknowledgement for this agent');
-    const instruction = contextInjection(content.trim(), driverContextPath.value, images);
+    const text = content.trim();
+    const instruction = contextInjection(text, driverContextPath.value, images);
+    const queued = pendingWakes.get(targetKey);
+    const alreadyInjected =
+      !!queued && queued.content === text && sameImages(queued.images, images);
     sendingTargets.add(targetKey);
-    lastFailures.value.delete(`${target.workspace}:${target.agent}`);
-    let stage: 'injecting' | 'waking' = 'injecting';
+    let stage: 'injecting' | 'waking' = alreadyInjected ? 'waking' : 'injecting';
     onStage?.(stage);
-    addLog('INFO', 'Sending message; waiting for daemon injection acknowledgement', 'ui.send', [
-      { name: 'images', value: String(images.length) },
-    ]);
     try {
-      await executeFor(target, instruction.command, instruction.arguments);
-      const current = currentTarget(false);
-      if (
-        revision !== routeRevision ||
-        !current ||
-        current.workspace !== target.workspace ||
-        current.agent !== target.agent ||
-        current.instance !== target.instance
-      )
-        throw new Error('Selected agent changed during send');
-      stage = 'waking';
-      onStage?.(stage);
-      addLog('INFO', 'Message injected; waiting for daemon wake acknowledgement', 'ui.send');
+      if (alreadyInjected) {
+        // The daemon already accepted this message into entry.pending; a wake
+        // failure must not inject the same text a second time.
+        addLog('INFO', 'Message was already injected; retrying wake only', 'ui.send');
+      } else {
+        if (queued)
+          addLog(
+            'WARN',
+            'A previously injected message is still queued; it will be consumed by this wake',
+            'ui.send',
+          );
+        addLog('INFO', 'Sending message; waiting for daemon injection acknowledgement', 'ui.send', [
+          { name: 'images', value: String(images.length) },
+        ]);
+        const injected = await executeFor(target, instruction.command, instruction.arguments);
+        requireUnit(injected, 'INJECT ? TO entry.pending[-1]');
+        const current = currentTarget(false);
+        if (
+          revision !== routeRevision ||
+          !current ||
+          current.workspace !== target.workspace ||
+          current.agent !== target.agent ||
+          current.instance !== target.instance
+        )
+          throw new Error('Selected agent changed during send');
+        pendingWakes.set(targetKey, {
+          workspace: target.workspace,
+          agent: target.agent,
+          instance: target.instance,
+          content: text,
+          images: images.map(({ media_type, data }) => ({ media_type, data })),
+        });
+        stage = 'waking';
+        onStage?.(stage);
+        addLog('INFO', 'Message injected; waiting for daemon wake acknowledgement', 'ui.send');
+      }
       const result = await executeFor(target, 'EFFECT wake');
+      requireUnit(result, 'EFFECT wake');
+      pendingWakes.delete(targetKey);
       addLog('INFO', 'Daemon acknowledged message and wake', 'ui.send');
       return result;
     } catch (error) {
@@ -916,7 +1049,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (!target || !state?.turn || !canAbortTurn.value)
       return Promise.reject(new Error('No abortable turn is active'));
     if (!connected()) return Promise.reject(new Error('Register a daemon connection first'));
-    const id = crypto.randomUUID();
+    const id = randomId();
     const guard: AbortGuard = {
       ...target,
       id,
@@ -985,7 +1118,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         candidate.agent === event.agent && candidate.agent_instance === event.agent_instance,
     );
     if (!state) return;
-    const key = `${event.agent_instance}:${event.id}`;
+    const key = `${event.agent}:${event.agent_instance}:${event.id}`;
     if (completedStreams.has(key) || abortedStreams.has(key)) return;
     const guard = [...abortGuards.value.values()].find(
       (candidate) =>
@@ -1016,7 +1149,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           kind: 'stream',
           payload: null,
           source: null,
+          messageType: null,
           sequence: null,
+          toolCallId: null,
+          toolName: null,
           instance: event.agent_instance,
           lastSequence: -1,
           completed: false,
@@ -1027,16 +1163,36 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     message.lastSequence = event.sequence;
     streams.value = new Map(streams.value).set(key, message);
   }
-  function settle(id: string, result: unknown, failure?: string) {
+  function settle(id: string, result: unknown, failure?: string | Error) {
     const command = pending.get(id);
     if (!command) return;
     clearTimeout(command.timeout);
     pending.delete(id);
-    if (failure) command.reject(new Error(failure));
+    if (failure) command.reject(typeof failure === 'string' ? new Error(failure) : failure);
     else command.resolve(result);
   }
+  function requireUnit(value: unknown, operation: string): void {
+    if (value !== 'Unit')
+      throw new Error(
+        `${operation} did not acknowledge Unit; the outcome is unknown, inspect state before retrying`,
+      );
+  }
   function reconcileStreams() {
-    const allHistory = histories.value.flatMap(historyEntries);
+    if (!streams.value.size) return;
+    const tracked = new Set<string>();
+    for (const stream of streams.value.values())
+      tracked.add(`${stream.workspaceKey}:${stream.agent}`);
+    const assistantIds = new Set<string>();
+    for (const history of histories.value) {
+      const workspace = workspaceKey(history.workspace);
+      if (!tracked.has(`${workspace}:${history.agent}`)) continue;
+      for (const entry of history.messages) {
+        if (entry.kind !== 'message') continue;
+        const message = historyMessage(entry);
+        if (message?.type !== 'assistant') continue;
+        assistantIds.add(`${workspace}:${history.agent}:${payloadRequestId(entry)}`);
+      }
+    }
     streams.value = new Map(
       [...streams.value].filter(
         ([, stream]) =>
@@ -1045,14 +1201,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
               state.agent === stream.agent &&
               workspaceKey(state.workspace) === stream.workspaceKey &&
               state.agent_instance === stream.instance,
-          ) &&
-          !allHistory.some(
-            (row) =>
-              row.id === stream.id &&
-              row.agent === stream.agent &&
-              row.workspaceKey === stream.workspaceKey &&
-              row.role === 'assistant',
-          ),
+          ) && !assistantIds.has(`${stream.workspaceKey}:${stream.agent}:${stream.id}`),
       ),
     );
   }
@@ -1076,7 +1225,19 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         runtimeWorkspaces.value = event.state.workspaces;
         agentStates.value = event.state.agents;
         histories.value = event.state.histories;
+        stateReady.value = true;
         reconcileAbortGuards();
+        for (const [key, wake] of pendingWakes)
+          if (
+            !agentStates.value.some(
+              (state) =>
+                workspaceKey(state.workspace) === wake.workspace &&
+                state.agent === wake.agent &&
+                state.agent_instance === wake.instance &&
+                state.status === 'idle',
+            )
+          )
+            pendingWakes.delete(key);
         for (const state of agentStates.value) {
           const key = `${workspaceKey(state.workspace)}:${state.agent}`;
           if (state.error) lastFailures.value.set(key, { message: state.error.message });
@@ -1105,10 +1266,29 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         settle(event.id, event.workspace);
         queryState();
         break;
-      case 'workspace.stopped':
+      case 'workspace.stopped': {
+        const stopped = workspaceKey(event.workspace);
+        const wasSelected =
+          !!selectedRuntimeWorkspace.value && selectedRuntimeWorkspace.value.id === stopped;
         settle(event.id, event.workspace);
+        // The receipt closes the operation; the runtime list still follows the
+        // next authoritative snapshot, but this instance's selection, streams
+        // and pending routes are no longer usable.
+        streams.value = new Map(
+          [...streams.value].filter(([, stream]) => stream.workspaceKey !== stopped),
+        );
+        for (const [key, guard] of abortGuards.value)
+          if (guard.workspace === stopped) abortGuards.value.delete(key);
+        for (const [key, wake] of pendingWakes)
+          if (wake.workspace === stopped) pendingWakes.delete(key);
+        if (wasSelected) {
+          routeRevision++;
+          selectedAgent.value = null;
+          resourcesReset();
+        }
         queryState();
         break;
+      }
       case 'workspace.start_failed':
       case 'workspace.restart_failed':
       case 'workspace.stop_failed':
@@ -1137,16 +1317,23 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       }
       case 'mcl.command_result': {
         const command = pending.get(event.id);
-        if (!command || command.target?.agent !== event.target) break;
-        settle(
-          event.id,
-          'Ok' in event.result ? event.result.Ok : null,
-          'Err' in event.result ? event.result.Err.message : undefined,
-        );
-        if (command.target && !command.read) queryHistoryFor(command.target);
+        if (!command) break;
+        if (command.target?.agent !== event.target) {
+          settle(event.id, null, 'MCL result target does not match the request');
+          break;
+        }
+        const value = event.result.Ok;
+        let failure: MclCommandFailure | undefined;
+        if (isRecord(value) && 'Error' in value && isMclError(value.Error)) {
+          failure = new Error(value.Error.message);
+          failure.requestId = value.Error.request_id;
+          failure.agentMessage = value.Error;
+        }
+        settle(event.id, value, failure);
+        if (!command.read) queryHistoryFor(command.target);
         if (event.history_error)
           addLog(
-            'WARN',
+            'ERROR',
             `Command completed but history persistence failed: ${event.history_error.message}`,
           );
         break;
@@ -1171,7 +1358,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
             candidate.agent === event.agent && candidate.agent_instance === event.agent_instance,
         );
         if (!state) break;
-        const key = `${event.agent_instance}:${event.id}`;
+        const key = `${event.agent}:${event.agent_instance}:${event.id}`;
         if (completedStreams.has(key)) break;
         remember(completedStreams, key);
         const old = streams.value.get(key);
@@ -1203,7 +1390,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         break;
       case 'log':
         logs.value.push({
-          key: crypto.randomUUID(),
+          key: randomId(),
           timestamp: event.record.timestamp_millis,
           level: event.record.level,
           target: event.record.target,
@@ -1233,7 +1420,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       throw new Error('Choose a configured workspace definition');
     if (runtimeWorkspaces.value.some((workspace) => workspace.definition_path === path))
       throw new Error('Workspace is already active');
-    await workspaceRequest({ type: 'workspace.start', id: crypto.randomUUID(), message: { path } });
+    await workspaceRequest({ type: 'workspace.start', id: randomId(), message: { path } });
     workspaceNotice.value = 'Workspace started.';
   }
   async function restartWorkspace(path = selectedDefinition.value?.path): Promise<void> {
@@ -1246,7 +1433,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       throw new Error('Choose a Running workspace');
     await workspaceRequest({
       type: 'workspace.restart',
-      id: crypto.randomUUID(),
+      id: randomId(),
       message: { path },
     });
     workspaceNotice.value = 'Workspace restarted.';
@@ -1261,7 +1448,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       throw new Error('Choose a Running workspace');
     await workspaceRequest({
       type: 'workspace.stop',
-      id: crypto.randomUUID(),
+      id: randomId(),
       message: { workspace: address },
     });
     workspaceNotice.value = 'Workspace stopped.';
@@ -1273,8 +1460,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     endpoint,
     driverContextPath,
     connectionStatus,
+    stateReady,
     connectionError,
-    registeredClient,
     definitions,
     runtimeWorkspaces,
     workspaces,
@@ -1286,10 +1473,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     restartWorkspace,
     stopWorkspace,
     sidebarTree,
-    isWorkspaceExpanded,
     toggleWorkspace,
-    expandWorkspace,
-    agentStates,
     selectedWorkspaceKey,
     selectedWorkspace,
     selectedAgent,
@@ -1316,7 +1500,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     resourceVisibility,
     sandboxOptions,
     resourceSettingsPending,
+    resourceWriteInFlight,
     resourceSettingsReady,
+    resourceError,
+    retryResourceSettings,
     setResourceVisibility,
     setSandbox,
     clearLogs,

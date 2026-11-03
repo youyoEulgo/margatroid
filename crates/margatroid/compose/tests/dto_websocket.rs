@@ -314,7 +314,7 @@ impl Harness {
             storage,
             StorageOperation::AppendHistory {
                 records: vec![HistoryRecord {
-                    source: "agent:demo/coder:latest".into(),
+                    source: None,
                     turn: None,
                     kind: "message".into(),
                     content: content.into(),
@@ -540,10 +540,8 @@ fn persisted_history_sequences_timestamps_and_state_histories_are_not_reinvented
     );
     let history = harness.next(&mut socket, |value| value["type"] == "history.result");
     assert_eq!(history["history"]["messages"][0]["sequence"], 2);
-    assert_eq!(
-        history["history"]["messages"][0]["source"],
-        "agent:demo/coder:latest"
-    );
+    assert_eq!(history["history"]["messages"][0]["type"], "user");
+    assert!(history["history"]["messages"][0].get("source").is_none());
     assert!(history["history"]["messages"][0].get("key").is_none());
     assert_eq!(history["history"]["messages"][0]["created_at_ms"], 5678);
     harness.request(&mut socket, "state.query", "state", json!({}));
@@ -842,7 +840,7 @@ fn oversized_history_and_state_queries_return_correlated_failures() {
         storage,
         StorageOperation::AppendHistory {
             records: vec![HistoryRecord {
-                source: "agent:demo/coder:latest".into(),
+                source: None,
                 turn: None,
                 kind: "message".into(),
                 content: "x".repeat(margatroid_protocol::MAX_MESSAGE_BYTES),

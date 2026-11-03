@@ -622,7 +622,7 @@ fn restart_uses_new_driver_same_entity_and_preserves_completed_tools_database_se
         &storage,
         StorageOperation::AppendHistory {
             records: vec![HistoryRecord {
-                source: "agent:demo/coder:latest".into(),
+                source: None,
                 turn: None,
                 kind: "message".into(),
                 content: "preserved".into(),

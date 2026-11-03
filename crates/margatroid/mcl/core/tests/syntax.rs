@@ -71,4 +71,14 @@ fn values_preserve_driver_result_shape() {
         serde_json::to_value(MclValue::Array(MessageArray::Message(vec![]))).unwrap(),
         json!({"Array":{"Message":[]}})
     );
+    let message = json!({"type":"error","message":"ParseFailed: invalid instruction","request_id":"request-1"});
+    let value = MclValue::Error(message.clone());
+    assert_eq!(
+        serde_json::to_value(&value).unwrap(),
+        json!({"Error": message})
+    );
+    assert_eq!(
+        serde_json::from_value::<MclValue>(json!({"Error": message})).unwrap(),
+        value
+    );
 }

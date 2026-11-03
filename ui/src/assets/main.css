@@ -59,7 +59,10 @@
   --mg-sidebar-width: 280px;
   --mg-panel-width: 360px;
   --mg-chat-width: 748px;
-  --mg-composer-width: 780px;
+
+  /* Every vertical gap in the transcript uses this one value: between
+     messages and between blocks inside a single message. */
+  --mg-message-gap: 4px;
 
   --mg-shadow-card: 0 2px 12px rgba(15, 17, 21, 0.06);
   --mg-shadow-dialog: 0 24px 70px rgba(15, 17, 21, 0.2);
@@ -611,6 +614,12 @@ textarea:focus-visible {
   margin-left: auto;
 }
 
+.message-flow {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mg-message-gap);
+}
+
 /* Message scrollport. Sides mirror DSH: composer clearance + 16px. */
 .message-list {
   min-height: 0;
@@ -706,14 +715,11 @@ textarea:focus-visible {
 
 .message-row {
   display: flex;
+  width: 100%;
   max-width: var(--mg-chat-width);
   gap: 0;
   margin: 0 auto;
   animation: mg-message-in 160ms var(--mg-ease);
-}
-
-.message-row + .message-row {
-  margin-top: 16px;
 }
 
 @keyframes mg-message-in {
@@ -732,44 +738,11 @@ textarea:focus-visible {
   display: none;
 }
 
-.message-row--assistant .message-body {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-}
-
-.message-row--assistant .message-meta {
-  order: 3;
-  min-height: 20px;
-  margin-top: 12px;
-}
-
 .message-row--error {
   align-items: flex-start;
 }
 
 .message-row--error .message-avatar {
-  display: none;
-}
-
-.message-row--error .message-body {
-  display: flex;
-  min-width: 0;
-  flex: 1 1 auto;
-  flex-direction: column;
-}
-
-.message-row--error .message-content {
-  order: 1;
-}
-
-.message-row--error .message-meta {
-  order: 2;
-  min-height: 20px;
-  margin-top: 6px;
-}
-
-.message-row--error .message-meta strong {
   display: none;
 }
 
@@ -780,33 +753,6 @@ textarea:focus-visible {
 .message-row--error .message-content a {
   color: inherit;
   text-decoration: none;
-}
-
-/* Assistant turns don't repeat the agent id after the content. */
-.message-row--assistant .message-meta strong {
-  display: none;
-}
-
-/* Only turns with an actual content block keep the trailing timestamp;
-   tool-call-only and thinking-only turns stay clean. */
-.message-row--assistant:not(:has(.message-content)) .message-meta {
-  display: none;
-}
-
-.message-row--assistant .message-thinking {
-  order: 1;
-}
-
-.message-row--assistant .message-content {
-  order: 2;
-}
-
-.message-row--assistant .tool-call-list {
-  order: 4;
-}
-
-.message-row--assistant .tool-response-label {
-  order: 5;
 }
 
 .message-row--user {
@@ -841,50 +787,47 @@ textarea:focus-visible {
 
 .message-meta {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
-  min-height: 21px;
+  align-items: center;
+  gap: var(--mg-message-gap);
+  min-height: 22px;
 }
 
-.message-meta strong {
-  color: var(--mg-text-primary);
-  font-size: 13px;
-  font-weight: 550;
-  line-height: 20px;
-}
-
-.message-record-source {
-  color: var(--mg-text-tertiary);
-  font-family: var(--mg-font-mono);
-  font-size: 10px;
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.message-meta > span {
+.message-time {
   color: var(--mg-text-tertiary);
   font-family: var(--mg-font-mono);
   font-size: 11px;
+  line-height: 22px;
 }
 
-@media (hover: hover) {
-  .message-row--user .message-meta,
-  .message-row--assistant .message-meta > span,
-  .message-row--error .message-meta > span {
-    opacity: 0;
-    transition: opacity 80ms var(--mg-ease);
-  }
+.message-copy {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--mg-text-quaternary);
+  cursor: pointer;
+  transition:
+    color 120ms var(--mg-ease),
+    background-color 120ms var(--mg-ease);
+}
 
-  .message-row--user:hover .message-meta,
-  .message-row--user:focus-within .message-meta,
-  .message-row--assistant:hover .message-meta > span,
-  .message-row--assistant:focus-within .message-meta > span,
-  .message-row--error:hover .message-meta > span,
-  .message-row--error:focus-within .message-meta > span {
-    opacity: 1;
-  }
+.message-copy:hover:not(:disabled) {
+  color: var(--mg-text-primary);
+  background: var(--mg-bg-hover);
+}
+
+.message-copy:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+
+.message-body > .image-row,
+.tool-call-row .image-row {
+  padding: 0;
 }
 
 .message-content {
@@ -895,8 +838,9 @@ textarea:focus-visible {
   overflow-wrap: anywhere;
 }
 
-.message-row--assistant .message-content {
-  margin-top: 2px;
+/* Backend error text is displayed verbatim, never as HTML. */
+.message-content--plain {
+  white-space: pre-wrap;
 }
 
 /* Rendered markdown (assistant and user body text). */
@@ -1083,61 +1027,59 @@ textarea:focus-visible {
 }
 
 .message-row--user .message-meta {
-  order: 2;
-  min-height: 20px;
-  margin-top: 6px;
   padding-right: 4px;
 }
 
-.message-row--user .message-meta strong {
-  display: none;
+/* Collapsible transcript rows (thinking, tool calls, record data) share one
+   summary style: same caret, size, weight and colour everywhere. */
+.message-disclosure {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--mg-message-gap);
+  color: var(--mg-text-secondary);
+  font-size: 14px;
+  line-height: 24px;
 }
 
-/* Thinking = DSH Think row: gray, 14/24, indented body. */
-.message-thinking {
-  margin: 0;
-  padding: 0;
-  border: 0;
-  color: var(--mg-text-tertiary);
-  background: transparent;
-}
-
-.message-thinking summary {
-  width: fit-content;
+.message-disclosure > summary {
+  display: flex;
   max-width: 100%;
-  padding: 1px 0;
-  cursor: pointer;
-  color: var(--mg-text-tertiary);
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+  padding: 0;
+  color: var(--mg-text-secondary);
   font-size: 14px;
   font-weight: 500;
   line-height: 24px;
   list-style: none;
+  cursor: pointer;
   user-select: none;
 }
 
-.message-thinking summary::-webkit-details-marker {
+.message-disclosure > summary::-webkit-details-marker {
   display: none;
 }
 
-.message-thinking summary::before {
+.message-disclosure > summary::before {
   content: '›';
   display: inline-block;
-  margin-right: 8px;
+  flex: 0 0 auto;
+  color: var(--mg-text-quaternary);
   font-size: 15px;
+  line-height: 24px;
   transition: transform 140ms var(--mg-ease);
 }
 
-.message-thinking[open] summary::before {
+.message-disclosure[open] > summary::before {
   transform: rotate(90deg);
 }
 
-.message-thinking[open] summary {
-  margin-bottom: 2px;
-}
-
-.message-thinking p {
+/* Thinking body: same type scale as the tool rows. */
+.message-thinking > p {
   margin: 0;
-  padding: 2px 0 2px 22px;
+  padding: 0 0 0 22px;
   color: var(--mg-text-tertiary);
   font-size: 14px;
   line-height: 24px;
@@ -1145,106 +1087,27 @@ textarea:focus-visible {
   white-space: pre-wrap;
 }
 
-/* Tool call rows = DSH ToolRow: one 24px collapsed line with a
-   thinking-style triangle; the full arguments live in the expanded body. */
-.tool-call-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin: 8px 0 0;
-}
-
-.tool-call-row {
-  display: block;
-  min-width: 0;
-  border: 0;
-  border-radius: 6px;
-  color: var(--mg-text-secondary);
-  background: transparent;
-  font-size: 14px;
-  line-height: 24px;
-}
-
-.tool-call-row summary {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-  gap: 6px;
-  padding: 0;
-  list-style: none;
-  cursor: pointer;
-  user-select: none;
-}
-
-.tool-call-row summary::-webkit-details-marker {
-  display: none;
-}
-
-.tool-call-row summary::before {
-  content: '›';
-  display: inline-block;
-  flex: 0 0 auto;
-  margin-right: 2px;
-  color: var(--mg-text-quaternary);
-  font-size: 15px;
-  line-height: 24px;
-  transition: transform 140ms var(--mg-ease);
-}
-
-.tool-call-row[open] summary::before {
-  transform: rotate(90deg);
-}
-
-.tool-call-row summary > svg {
+.tool-call-row > summary > svg {
   flex: none;
   color: var(--mg-brand);
 }
 
-.tool-call-row span {
-  flex: none;
-  color: var(--mg-text-primary);
-  font-size: 14px;
-  font-weight: 500;
-  line-height: 24px;
-}
-
-/* [wrench] Call <tool-name> · <arguments> */
-.tool-call-row span::before {
-  content: 'Call';
-  display: inline-block;
-  margin-right: 8px;
-  padding: 1px 6px;
-  border-radius: 6px;
-  background: var(--mg-brand-soft);
-  color: var(--mg-brand);
-  font-family: var(--mg-font-sans);
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 18px;
-  vertical-align: 1px;
-}
-
-.tool-call-row span::after {
-  content: '·';
-  display: inline-block;
-  margin-left: 8px;
-  color: var(--mg-text-quaternary);
-}
-
-.tool-call-row code {
+.tool-call-row > summary > span {
   min-width: 0;
   flex: 1;
   overflow: hidden;
-  color: var(--mg-text-tertiary);
-  font-family: var(--mg-font-mono);
-  font-size: 12px;
+  color: inherit;
+  font: inherit;
   line-height: 24px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.tool-call-detail {
-  margin: 4px 0 0 24px;
+/* Every expanded body in the transcript uses the same code block. */
+.message-pre {
+  margin: 0 0 0 24px;
+  max-height: 360px;
+  overflow: auto;
   padding: 8px 10px;
   border: 1px solid var(--mg-border-l1);
   border-radius: 8px;
@@ -1257,143 +1120,27 @@ textarea:focus-visible {
   word-break: break-word;
 }
 
-/* Tool response mirrors the request row grammar:
-   small wrench + Response badge + truncated text, expandable like thinking. */
-.message-row--tool {
-  display: flex;
-  align-items: flex-start;
-  /* Match the request row prefix: triangle + 6px + wrench + 6px. */
-  gap: 6px;
-}
-
-/* Triangle sits before the wrench, mirroring the call row order. */
-.message-row--tool::before {
-  content: '›';
-  display: inline-flex;
-  height: 20px;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 auto;
-  margin-top: 2px;
-  color: var(--mg-text-quaternary);
-  font-size: 15px;
-  line-height: 20px;
-  transition: transform 140ms var(--mg-ease);
-}
-
-.message-row--tool:has(.tool-response[open])::before {
-  transform: rotate(90deg);
-}
-
-.message-row--tool .message-avatar {
-  display: grid;
-  width: 14px;
-  height: 14px;
-  flex: 0 0 14px;
-  margin-top: 5px;
-  place-items: center;
-  border-radius: 0;
+.tool-call-row--done summary > svg {
   color: var(--mg-success);
-  background: transparent;
 }
 
-.message-row--tool .message-avatar svg {
-  width: 14px;
-  height: 14px;
+.tool-call-row--failed > summary::before,
+.tool-call-row--failed > summary > svg,
+.tool-call-row--failed > summary > span,
+.tool-call-row--failed .message-pre {
+  color: var(--mg-error);
 }
 
-.message-row--tool .message-body {
-  display: block;
-  flex: 1 1 auto;
-  min-width: 0;
+.tool-call-row--failed .message-pre {
+  border-color: var(--mg-error-soft);
+  background: var(--mg-error-soft);
 }
 
-.tool-response {
-  min-width: 0;
-}
-
-.tool-response summary {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-  gap: 8px;
-  list-style: none;
-  cursor: pointer;
-  user-select: none;
-}
-
-.tool-response summary::-webkit-details-marker {
-  display: none;
-}
-
-/* The DOM label becomes the distinguishing badge. Hide its long text and
-   render the compact Response label, symmetric with the Call badge. */
-.message-row--tool .tool-response-label {
-  display: inline-flex;
-  width: fit-content;
-  flex: 0 0 auto;
-  margin: 0 0 0 2px;
-  padding: 1px 6px;
-  border-radius: 6px;
-  background: var(--mg-success-soft);
-  color: var(--mg-success);
-  font-family: var(--mg-font-sans);
-  font-size: 0;
-  font-weight: 600;
-  line-height: 18px;
-  text-transform: none;
-}
-
-.message-row--tool .tool-response-label::before {
-  content: 'Response';
-  font-size: 11px;
-  line-height: 18px;
-}
-
-/* Collapsed response: one line, clipped with ellipsis. */
-.tool-response-summary {
-  min-width: 0;
-  flex: 1 1 auto;
-  overflow: hidden;
-  color: var(--mg-text-secondary);
-  font-size: 14px;
-  line-height: 24px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.tool-response-detail {
-  /* Align with the call detail: the response body starts after the triangle,
-     wrench and gaps, so pull the card back to the shared 24px inset. */
-  margin: 4px 0 0 -7px;
-  padding: 10px 12px;
-  border: 1px solid var(--mg-border-l1);
-  border-radius: 8px;
-  background: var(--mg-bg-subtle);
-  color: var(--mg-text-secondary);
-  font-family: var(--mg-font-mono);
-  font-size: 12px;
-  line-height: 20px;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.message-row--tool .message-meta {
-  display: none;
-}
-
+/* Unpaired tool results reuse the call row; the row itself carries no chrome. */
 .message-row--system .message-content {
   color: var(--mg-text-tertiary);
   font-size: 13px;
   line-height: 20px;
-}
-
-.tool-response-label {
-  margin-top: 4px;
-  color: var(--mg-text-quaternary);
-  font-family: var(--mg-font-mono);
-  font-size: 10px;
-  text-transform: uppercase;
 }
 
 .inline-error {
@@ -1416,7 +1163,7 @@ textarea:focus-visible {
 .composer {
   /* DSH: the card is chat-width + 32px and keeps a 16px clearance
      on each side when the center column is narrower. */
-  width: min(calc(var(--mg-composer-width) + 32px), 100%);
+  width: min(calc(var(--mg-chat-width) + 32px), 100%);
   margin: 0 auto;
   padding: 0 16px 8px;
 }
@@ -1754,6 +1501,42 @@ textarea:focus-visible {
   color: var(--mg-text-quaternary);
   font-size: 11px;
   line-height: 20px;
+}
+
+.tool-resource-error {
+  display: flex;
+  grid-column: 1 / -1;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--mg-error-soft);
+  color: var(--mg-error);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.tool-resource-error span {
+  min-width: 0;
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.tool-resource-error button {
+  flex: none;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tool-resource-error button:hover {
+  background: var(--mg-bg-hover);
 }
 
 /* The card itself: textarea on top, send control bottom-right. */
@@ -2341,20 +2124,6 @@ textarea:focus-visible {
   color: var(--mg-error);
 }
 
-.message-row--tool.message-row--failed .tool-response-label {
-  background: var(--mg-error-soft);
-  color: var(--mg-error);
-}
-
-.message-row--failed .tool-response-summary,
-.message-row--failed .tool-response-detail {
-  color: var(--mg-error);
-}
-
-.message-row--failed .tool-response-detail {
-  border-color: var(--mg-error-soft);
-}
-
 /* A history record is a note on the timeline, not a message: one short line of
    muted prose with the same column width as the chat flow. */
 .record-note {
@@ -2395,7 +2164,7 @@ textarea:focus-visible {
 .image-picker { display: none; }
 .image-row { display: flex; flex-flow: row nowrap; gap: 10px; overflow-x: auto; max-width: 100%; min-width: 0; padding: 6px 0; }
 .image-row img { display: block; width: 104px; height: 88px; object-fit: contain; border-radius: 8px; background: var(--mg-bg-subtle); flex: 0 0 auto; }
-.history-image-row { margin-bottom: 8px; }
+.history-image-row { margin-bottom: 0; }
 .history-image-row img { width: 160px; height: 128px; }
 .draft-image-row { width: 100%; }
 .draft-image { position: relative; flex: 0 0 auto; }
@@ -2408,27 +2177,6 @@ textarea:focus-visible {
 .image-import-label { font-size: 12px; color: var(--mg-text-secondary); }
 
 
-/* Catalog controls distinguish persisted definitions from live instances. */
-.workspace-controls {
-  padding: 10px 16px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--mg-text-secondary);
-}
-.workspace-controls p { flex-basis: 100%; margin: 0; }
-.workspace-controls button, .sidebar-heading button {
-  border: 1px solid var(--mg-border);
-  border-radius: 7px;
-  padding: 5px 8px;
-  background: var(--mg-bg-elevated);
-  color: var(--mg-text-primary);
-  cursor: pointer;
-}
-.workspace-controls button:disabled, .sidebar-heading button:disabled { opacity: .45; cursor: not-allowed; }
-
 /* Workspace tree shares one compact row grammar at both levels. */
 .tree-list, .tree-children { list-style: none; padding: 0; margin: 0; }
 .sidebar-tree { padding: 0 10px 12px; }
@@ -2437,6 +2185,12 @@ textarea:focus-visible {
 .tree-row--active { background: var(--mg-bg-active); }
 .tree-main { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; height: 34px; padding: 0 4px; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
 .tree-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-row--workspace { padding-right: 4px; }
+.tree-row--workspace .tree-name { font-weight: 550; }
+.tree-actions { display: flex; flex: none; align-items: center; gap: 2px; }
+.tree-action { display: grid; width: 24px; height: 24px; place-items: center; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--mg-text-tertiary); cursor: pointer; transition: color 120ms var(--mg-ease), background-color 120ms var(--mg-ease); }
+.tree-action:hover:not(:disabled) { color: var(--mg-text-primary); background: var(--mg-bg-active); }
+.tree-action:disabled { opacity: .35; cursor: default; }
 .tree-disclosure { width: 20px; flex: 0 0 20px; height: 30px; border: 0; background: transparent; color: var(--mg-text-tertiary); cursor: pointer; display: grid; place-items: center; padding: 0; }
 .tree-caret { transition: transform 120ms; }
 .tree-caret.is-open { transform: rotate(90deg); }

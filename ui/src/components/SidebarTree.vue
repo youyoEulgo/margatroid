@@ -1,13 +1,20 @@
 <script setup lang="ts">
-import { Bot, ChevronRight, FolderKanban } from 'lucide-vue-next';
-import type { SidebarModel } from '@/stores/workbench';
+import { Bot, ChevronRight, FolderKanban, Pause, Play, RotateCw } from 'lucide-vue-next';
+import type { SidebarModel, SidebarWorkspace } from '@/stores/workbench';
 
 defineProps<{ model: SidebarModel; pending: boolean; offline: boolean }>();
 const emit = defineEmits<{
   selectWorkspace: [path: string];
   toggleWorkspace: [path: string];
   selectAgent: [agent: string, path: string];
+  startWorkspace: [path: string];
+  restartWorkspace: [path: string];
+  stopWorkspace: [address: string];
 }>();
+
+function stopWorkspace(workspace: SidebarWorkspace) {
+  if (workspace.address) emit('stopWorkspace', workspace.address);
+}
 </script>
 
 <template>
@@ -21,7 +28,7 @@ const emit = defineEmits<{
         :aria-expanded="workspace.expanded"
         :aria-selected="workspace.active"
       >
-        <div :class="['tree-row', 'tree-row--workspace', { 'tree-row--active': workspace.active }]">
+        <div class="tree-row tree-row--workspace">
           <button
             class="tree-disclosure"
             type="button"
@@ -36,13 +43,41 @@ const emit = defineEmits<{
             :title="`${workspace.path} · ${workspace.lifecycle}${workspace.reason ? `: ${workspace.reason}` : ''}`"
             @click="emit('toggleWorkspace', workspace.path)"
           >
-            <span
-              :class="['status-dot', `status-dot--${workspace.status}`]"
-              aria-hidden="true"
-            ></span>
             <FolderKanban class="tree-icon" :size="15" />
             <span class="tree-name">{{ workspace.name }}</span>
           </button>
+          <div class="tree-actions">
+            <template v-if="workspace.lifecycle === 'running'">
+              <button
+                class="tree-action"
+                type="button"
+                title="Restart workspace"
+                :disabled="pending || offline"
+                @click.stop="emit('restartWorkspace', workspace.path)"
+              >
+                <RotateCw :size="14" />
+              </button>
+              <button
+                class="tree-action"
+                type="button"
+                title="Stop workspace"
+                :disabled="pending || offline"
+                @click.stop="stopWorkspace(workspace)"
+              >
+                <Pause :size="14" />
+              </button>
+            </template>
+            <button
+              v-else-if="workspace.lifecycle === 'stopped'"
+              class="tree-action"
+              type="button"
+              title="Start workspace"
+              :disabled="pending || offline"
+              @click.stop="emit('startWorkspace', workspace.path)"
+            >
+              <Play :size="14" />
+            </button>
+          </div>
         </div>
         <ul v-if="workspace.expanded" class="tree-children" role="group">
           <li

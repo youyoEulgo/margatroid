@@ -1,3 +1,7 @@
+function configure(arguments, context)
+    return { timeout_ms = 30000 }
+end
+
 -- edit
 --
 -- Replaces one exact string (or every occurrence of it) in one text file.

@@ -202,7 +202,7 @@ fn worker_appends_duplicate_payloads_with_distinct_sequences_and_original_conten
     let owner = app.world_mut().spawn();
     app.world_mut().insert_component(owner, storage);
     let record = HistoryRecord {
-        source: "agent:caller/原始地址".into(),
+        source: None,
         turn: Some("turn".into()),
         kind: "message".into(),
         content: "caller supplied content".into(),

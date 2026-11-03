@@ -171,7 +171,7 @@ MclHost：MCL事件发送适配，私有类型
     cancel: CancellationToken
     impl LuaHostFunction for MclHost
         call(&self, arguments: Vec<LuaValue>, cancel: CancellationToken) -> HostFuture
-            行为：将Lua参数转换为MclInstruction；绑定source为instance.owner及本次start_id，发送MclCommand并等待reply；将MclValue或MclError转换为Lua返回值，不执行指令。
+            行为：将Lua参数转换为MclInstruction；绑定source为instance.owner及本次start_id，发送MclCommand并等待reply；MclValue序列化为Lua值，参数校验、reply丢失及fallback MclError统一返回MclValue::Error({type:error,message,request_id})；单次MCL取消不退出VM，只有VM取消保留Err；不执行或解析指令推断返回形状。
 
 WaitHost：等待适配，私有类型
     slot: Arc<Mutex<DriverWakeSlot>>

@@ -22,7 +22,7 @@ use std::{
 };
 use StorageErrorKind as K;
 
-const HISTORY: &str = "CREATE TABLE agent_messages(sequence INTEGER PRIMARY KEY,source TEXT NOT NULL CHECK(length(source)>0),turn TEXT,content TEXT NOT NULL,payload TEXT NOT NULL,created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0));CREATE TABLE mcl_records(sequence INTEGER PRIMARY KEY,source TEXT NOT NULL CHECK(length(source)>0),turn TEXT,content TEXT NOT NULL,payload TEXT NOT NULL,created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0));";
+const HISTORY: &str = "CREATE TABLE agent_messages(sequence INTEGER PRIMARY KEY,turn TEXT,type TEXT NOT NULL CHECK(length(type)>0),content TEXT NOT NULL,payload TEXT NOT NULL,created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0));CREATE TABLE mcl_records(sequence INTEGER PRIMARY KEY,source TEXT NOT NULL CHECK(length(source)>0),turn TEXT,content TEXT NOT NULL,payload TEXT NOT NULL,created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0));";
 const BLOCKS: &str = "CREATE TABLE blocks(name TEXT PRIMARY KEY NOT NULL CHECK(length(name)>0),fields_json TEXT NOT NULL CHECK(json_valid(fields_json) AND json_type(fields_json)='object'));";
 const TEMP_BLOCKS: &str = "CREATE TEMP TABLE blocks(name TEXT NOT NULL CHECK(length(name)>0),instance TEXT NOT NULL CHECK(length(instance)>0),fields_json TEXT NOT NULL CHECK(json_valid(fields_json) AND json_type(fields_json)='object'),PRIMARY KEY(name,instance));";
 
@@ -505,10 +505,14 @@ fn database_operation(
             for record in records {
                 let table = history_table(&record.kind)?;
                 validate_payload(&record.kind, &record.payload)?;
-                if record.source.is_empty() || record.source.chars().any(char::is_control) {
+                if record.kind == "mcl"
+                    && record.source.as_deref().is_none_or(|source| {
+                        source.is_empty() || source.chars().any(char::is_control)
+                    })
+                {
                     return Err(err(
                         K::InvalidRecord,
-                        "source must be nonempty and contain no control characters",
+                        "MCL source must be nonempty and contain no control characters",
                     ));
                 }
                 if record.created_at_ms.is_some_and(|t| t > i64::MAX as u64) {
@@ -527,12 +531,23 @@ fn database_operation(
                 let sequence = sequence
                     .checked_add(1)
                     .ok_or_else(|| err(K::InvalidRecord, "history sequence exhausted"))?;
+                let (columns, source_or_type) = if record.kind == "message" {
+                    (
+                        "sequence,turn,type,content,payload,created_at_ms",
+                        record.payload["type"].as_str(),
+                    )
+                } else {
+                    (
+                        "sequence,turn,source,content,payload,created_at_ms",
+                        record.source.as_deref(),
+                    )
+                };
                 db.execute(
-                    &format!("INSERT INTO {table} VALUES(?1,?2,?3,?4,?5,?6)"),
+                    &format!("INSERT INTO {table}({columns}) VALUES(?1,?2,?3,?4,?5,?6)"),
                     params![
                         sequence,
-                        record.source,
                         record.turn,
+                        source_or_type,
                         record.content,
                         serde_json::to_string(&record.payload).map_err(write_err)?,
                         timestamp
@@ -591,7 +606,14 @@ fn read_entries(
     kind: Option<&str>,
 ) -> Result<Vec<StoredHistoryRecord>, StorageError> {
     let select = |kind: &str, table: &str| {
-        format!("SELECT sequence,source,turn,'{kind}' AS kind,content,payload,created_at_ms FROM {table}")
+        let (source, message_type) = if kind == "message" {
+            ("NULL", "type")
+        } else {
+            ("source", "NULL")
+        };
+        format!(
+            "SELECT sequence,{source},turn,'{kind}' AS kind,content,payload,created_at_ms,{message_type} FROM {table}"
+        )
     };
     let sql = match kind {
         Some(kind) => select(kind, history_table(kind)?),
@@ -607,32 +629,39 @@ fn read_entries(
         .query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
                 r.get::<_, i64>(6)?,
+                r.get::<_, Option<String>>(7)?,
             ))
         })
         .map_err(read_err)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(read_err)?;
     rows.into_iter()
-        .map(|(sequence, source, turn, kind, content, json, time)| {
-            let payload = serde_json::from_str(&json).map_err(schema_err)?;
-            Ok(StoredHistoryRecord {
-                sequence: u64::try_from(sequence).map_err(schema_err)?,
-                record: HistoryRecord {
-                    source,
-                    turn,
-                    content,
-                    kind,
-                    payload,
-                    created_at_ms: Some(u64::try_from(time).map_err(schema_err)?),
-                },
-            })
-        })
+        .map(
+            |(sequence, source, turn, kind, content, json, time, message_type)| {
+                let payload: serde_json::Value = serde_json::from_str(&json).map_err(schema_err)?;
+                validate_payload(&kind, &payload).map_err(schema_err)?;
+                if kind == "message" && message_type.as_deref() != payload["type"].as_str() {
+                    return Err(schema_err("stored message type does not match payload"));
+                }
+                Ok(StoredHistoryRecord {
+                    sequence: u64::try_from(sequence).map_err(schema_err)?,
+                    record: HistoryRecord {
+                        source,
+                        turn,
+                        content,
+                        kind,
+                        payload,
+                        created_at_ms: Some(u64::try_from(time).map_err(schema_err)?),
+                    },
+                })
+            },
+        )
         .collect()
 }
 

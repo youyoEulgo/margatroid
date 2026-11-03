@@ -44,9 +44,6 @@ pub struct ToolExecutionLimits {
     pub diagnostic_bytes: usize,
     pub memory_bytes: usize,
     pub instruction_budget: u64,
-    pub execution_timeout: Option<Duration>,
-    pub host_call_timeout: Duration,
-    pub cleanup_timeout: Duration,
     pub cache_bytes: usize,
     pub input_capacity: usize,
 }
@@ -61,9 +58,6 @@ impl Default for ToolExecutionLimits {
             diagnostic_bytes: 256 * 1024,
             memory_bytes: 64 * 1024 * 1024,
             instruction_budget: 10_000_000,
-            execution_timeout: None,
-            host_call_timeout: Duration::from_secs(10),
-            cleanup_timeout: Duration::from_secs(3),
             cache_bytes: 4 * 1024 * 1024,
             input_capacity: 32,
         }
@@ -85,14 +79,6 @@ impl ToolExecutionLimits {
         .contains(&0)
             || self.input_capacity > tokio::sync::Semaphore::MAX_PERMITS
             || self.instruction_budget == 0
-            || self.execution_timeout.is_some_and(|timeout| {
-                timeout.is_zero() || std::time::Instant::now().checked_add(timeout).is_none()
-            })
-            || self.host_call_timeout.is_zero()
-            || self.cleanup_timeout.is_zero()
-            || self
-                .execution_timeout
-                .is_some_and(|timeout| self.host_call_timeout > timeout)
         {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidRequest,
@@ -103,8 +89,36 @@ impl ToolExecutionLimits {
     }
 }
 
+/// Per-invocation lifetime returned by Lua configure; zero means unlimited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolConfiguration {
+    pub timeout_ms: u64,
+}
+
+impl ToolConfiguration {
+    pub fn validate(&self) -> Result<(), ToolError> {
+        if self.timeout_ms != 0
+            && std::time::Instant::now()
+                .checked_add(Duration::from_millis(self.timeout_ms))
+                .is_none()
+        {
+            return Err(ToolError::new(
+                ToolErrorKind::InvalidDefinition,
+                "tool timeout_ms must be representable integer milliseconds",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn timeout(&self) -> Option<Duration> {
+        (self.timeout_ms != 0).then(|| Duration::from_millis(self.timeout_ms))
+    }
+}
+
 #[derive(Debug)]
 struct ToolTaskData {
+    lifetime: Option<Option<tokio::time::Instant>>,
     output: Vec<Value>,
     bytes: usize,
     cursor: usize,
@@ -145,6 +159,7 @@ impl ToolTaskHandle {
                     supervisor_ended: AtomicBool::new(false),
                     returned: AtomicBool::new(false),
                     shared: Mutex::new(ToolTaskData {
+                        lifetime: None,
                         output: Vec::new(),
                         bytes: 0,
                         cursor: 0,
@@ -160,6 +175,56 @@ impl ToolTaskHandle {
             },
             receiver,
         ))
+    }
+
+    /// Confirm the lifetime once, beginning at configuration acceptance.
+    pub fn configure_lifetime(&self, timeout_ms: u64) -> Result<(), ToolError> {
+        let configuration = ToolConfiguration { timeout_ms };
+        configuration.validate()?;
+        let mut state = lock(&self.inner.shared);
+        ensure_open(&state)?;
+        if state.lifetime.is_some() {
+            return Err(ToolError::new(
+                ToolErrorKind::InvalidRequest,
+                "tool task lifetime already configured",
+            ));
+        }
+        let deadline = configuration
+            .timeout()
+            .map(|duration| {
+                tokio::time::Instant::now()
+                    .checked_add(duration)
+                    .ok_or_else(|| {
+                        ToolError::new(
+                            ToolErrorKind::InvalidDefinition,
+                            "tool task lifetime is unrepresentable",
+                        )
+                    })
+            })
+            .transpose()?;
+        state.lifetime = Some(deadline);
+        drop(state);
+        self.inner.changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Wait for the configured deadline; configuration and unlimited tasks have no default clock.
+    pub async fn lifetime_expired(&self) {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let deadline = lock(&self.inner.shared).lifetime.flatten();
+            tokio::select! {
+                () = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => return,
+                () = &mut changed => {},
+            }
+        }
     }
 
     pub fn cancel_token(&self) -> CancellationToken {
@@ -233,9 +298,16 @@ impl ToolTaskHandle {
 
     pub fn read(&self) -> TaskReadResult {
         let mut state = lock(&self.inner.shared);
+        let mut output = Vec::new();
+        for value in &state.output[state.cursor..] {
+            match (output.last_mut(), value) {
+                (Some(Value::String(text)), Value::String(fragment)) => text.push_str(fragment),
+                _ => output.push(value.clone()),
+            }
+        }
         let result = TaskReadResult {
             replaced: state.replaced,
-            output: state.output[state.cursor..].to_vec(),
+            output,
             completed: state.completed,
             error: state.error.clone(),
         };

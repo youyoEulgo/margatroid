@@ -1,3 +1,7 @@
+function configure(arguments, context)
+    return { timeout_ms = 0 }
+end
+
 function execute(arguments, context)
     local terminal = terminal_open()
     task_return({ task_id = context.task_id })

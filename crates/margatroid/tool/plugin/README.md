@@ -6,7 +6,7 @@
 
 InitToolTasks 仅在存活 Agent 上初始化空 ToolTasks，已有集合保留。执行请求只在受理时核对完整 Agent Entity 与 Idle/Working 状态，不要求 turn。工具入口、选中沙箱入口及 Workspace project_root 均固定为 owned 数据后提交监督任务，不跨 await 借用 World。
 
-每次执行通过资源 core 在 blocking worker 重新读取清单、schema、Lua 和选中策略；按本次 schema 校验参数。准备时间计入执行预算。任务持有独立取消 token，ToolTasks 与监督任务克隆同一个共享句柄。原 oneshot 被释放、Return 完成以及 Agent turn 改变都不会终止任务。
+每次执行通过资源 core 在 blocking worker 重新读取清单、schema、Lua 和选中策略；按本次 schema 校验参数。worker先加载脚本并调用必需的configure(arguments, context)，通过Configured帧往返确认唯一timeout_ms存活配置（0不限时）后才开放执行能力并调用execute；总执行时间从配置确认开始，不给准备及配置阶段设置默认wallclock限时。配置阶段仍受内存、指令预算与取消约束，只允许纯计算，脚本只加载一次。ToolExecutionLimits仅提供非时间资源预算，ToolTask持有Lua配置确定的唯一存活deadline，不另设RPC或清理限时。任务持有独立取消 token，ToolTasks 与监督任务克隆同一个共享句柄。原 oneshot 被释放、Return 完成以及 Agent turn 改变都不会终止任务。
 
 worker 在独立进程中运行 Lua。全局 instruction hook 覆盖异步 coroutine；Lua 内存、指令、执行时间、host-call 时间、参数、结果、诊断、缓存和输入队列分别受预算约束。task_return 校验文本/图片结果并回复一次，VM 继续执行；重复 Return 记录 AlreadyReturned。task_finish 自身通过外层执行选择器退出，即使放在 pcall 内也不会继续后续 Lua 语句。自然退出而未 Return 返回 MissingReturn。
 

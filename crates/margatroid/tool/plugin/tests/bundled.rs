@@ -11,8 +11,8 @@ use core_plugin::{App, Entity};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use tool_core::{
-    InitToolTasks, ToolError, ToolErrorKind as Kind, ToolExecuteRequest, ToolExecuteResponse,
-    ToolExecutionLimits, ToolTasks,
+    InitToolTasks, ToolConfiguration, ToolError, ToolErrorKind as Kind, ToolExecuteRequest,
+    ToolExecuteResponse, ToolExecutionLimits, ToolTasks,
 };
 use tool_plugin::ToolPlugin;
 use tool_resource_core::Tools;
@@ -22,16 +22,12 @@ struct Fixture {
     app: App,
     agent: Entity,
     root: tempfile::TempDir,
+    configuration: ToolConfiguration,
 }
 
 impl Fixture {
     fn new() -> Self {
-        Self::with_limits(ToolExecutionLimits {
-            execution_timeout: Some(Duration::from_secs(5)),
-            host_call_timeout: Duration::from_secs(2),
-            cleanup_timeout: Duration::from_secs(1),
-            ..Default::default()
-        })
+        Self::with_limits(ToolExecutionLimits::default())
     }
 
     fn with_limits(limits: ToolExecutionLimits) -> Self {
@@ -72,10 +68,25 @@ impl Fixture {
         });
         app.tick();
         assert!(reply.try_recv().unwrap().is_ok());
-        Self { app, agent, root }
+        Self {
+            app,
+            agent,
+            root,
+            configuration: ToolConfiguration { timeout_ms: 30_000 },
+        }
     }
 
     fn tool(&mut self, alias: &str, program: &str) {
+        // Test programs declare their own lifetimes; bundled programs keep their
+        // author-supplied configure function and are never overridden here.
+        let program = if program.contains("function configure(") {
+            program.to_owned()
+        } else {
+            format!(
+                "function configure(arguments, context) return {{timeout_ms={}}} end\n{program}",
+                self.configuration.timeout_ms,
+            )
+        };
         let directory = self.root.path().join(alias);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
@@ -663,7 +674,7 @@ fn directory_and_search_boundaries_handle_unusual_names_and_limit_results() {
 fn a_real_png_is_returned_unchanged_and_does_not_depend_on_extension() {
     use base64::Engine;
     let mut f = Fixture::new();
-    let encoded="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6l8AAAAASUVORK5CYII=";
+    let encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6l8AAAAASUVORK5CYII=";
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .unwrap();

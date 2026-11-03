@@ -3,9 +3,9 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia';
 import {
   Activity,
-  Bot,
-  CircleAlert,
+  Check,
   ChevronRight,
+  Copy,
   Eye,
   EyeOff,
   Circle,
@@ -26,7 +26,6 @@ import {
   Wifi,
   Wrench,
   X,
-  Zap,
 } from 'lucide-vue-next';
 
 import {
@@ -36,6 +35,7 @@ import {
   type ConversationEntry,
 } from '@/stores/workbench';
 import SidebarTree from '@/components/SidebarTree.vue';
+import { formatToolPayload, inlineToolPayload } from '@/lib/format';
 import { renderMarkdown } from '@/lib/markdown';
 import { formatRecordTime } from '@/lib/time';
 import {
@@ -56,6 +56,7 @@ const {
   contextTokens,
   contextWindowTokens,
   connectionStatus,
+  stateReady,
   connectionError,
   workspaces,
   selectedDefinition,
@@ -74,7 +75,9 @@ const {
   resourceVisibility,
   sandboxOptions,
   resourceSettingsPending,
+  resourceWriteInFlight,
   resourceSettingsReady,
+  resourceError,
   visibleMessages,
   logs,
   lastFailures,
@@ -117,6 +120,7 @@ const canEditComposer = computed(
   () =>
     !!selectedWorkspace.value &&
     connectionStatus.value === 'online' &&
+    stateReady.value &&
     selectedAgentIdle.value &&
     !submittingMessage.value,
 );
@@ -157,6 +161,7 @@ const conversationPane = ref<HTMLElement | null>(null);
 const composerFooter = ref<HTMLElement | null>(null);
 let composerObserver: ResizeObserver | undefined;
 const toolManager = ref<HTMLElement | null>(null);
+const uploadControl = ref<HTMLElement | null>(null);
 const toolsOpen = ref(false);
 const toolResources = computed(() => resourceVisibility.value);
 const sidebarOpen = ref(false);
@@ -292,20 +297,37 @@ function autosizeDraft() {
 
 watch(draft, () => nextTick(autosizeDraft));
 
-function toolArguments(value: unknown) {
-  return typeof value === 'string' ? value : JSON.stringify(value ?? {});
-}
-
 function logLevelClass(log: { level: string }) {
   return `log-level--${log.level.toLowerCase()}`;
 }
 
-function closeToolsOnOutsideClick(event: MouseEvent) {
+function closeFloatingOnOutsideClick(event: MouseEvent) {
   const target = event.target;
-  if (!toolsOpen.value) return;
-  if (target instanceof Node && toolManager.value && !toolManager.value.contains(target)) {
+  if (!(target instanceof Node)) return;
+  if (toolsOpen.value && toolManager.value && !toolManager.value.contains(target))
     toolsOpen.value = false;
-  }
+  if (uploadMenuOpen.value && uploadControl.value && !uploadControl.value.contains(target))
+    uploadMenuOpen.value = false;
+}
+
+function closeOverlaysOnEscape(event: KeyboardEvent) {
+  if (event.key !== 'Escape') return;
+  settingsOpen.value = false;
+  activityOpen.value = false;
+  toolsOpen.value = false;
+  uploadMenuOpen.value = false;
+  sidebarOpen.value = false;
+}
+
+function onComposerEnter(event: KeyboardEvent) {
+  // Enter confirms an IME candidate instead of sending while composing.
+  if (event.isComposing || event.keyCode === 229) return;
+  event.preventDefault();
+  void submitMessage();
+}
+
+function retryResourceSettings() {
+  store.retryResourceSettings();
 }
 
 onMounted(() => {
@@ -313,7 +335,8 @@ onMounted(() => {
     store.selectWorkspace(workspaces.value[0].path);
   }
   store.connect();
-  document.addEventListener('click', closeToolsOnOutsideClick);
+  document.addEventListener('click', closeFloatingOnOutsideClick);
+  document.addEventListener('keydown', closeOverlaysOnEscape);
 
   composerObserver = new ResizeObserver(() => {
     const pane = conversationPane.value;
@@ -325,7 +348,9 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  document.removeEventListener('click', closeToolsOnOutsideClick);
+  document.removeEventListener('click', closeFloatingOnOutsideClick);
+  document.removeEventListener('keydown', closeOverlaysOnEscape);
+  clearTimeout(copiedTimer);
   composerObserver?.disconnect();
   store.disconnect();
 });
@@ -360,8 +385,31 @@ async function runAgentAction(action: () => Promise<unknown>) {
   try {
     await action();
   } catch (error) {
-    connectionError.value = error instanceof Error ? error.message : String(error);
+    const message = error instanceof Error ? error.message : String(error);
+    if (connectionStatus.value === 'online') composerError.value = message;
+    else connectionError.value = message;
   }
+}
+
+async function runWorkspaceAction(action: () => Promise<unknown>) {
+  try {
+    await action();
+    workspaceNotice.value = '';
+  } catch (error) {
+    workspaceNotice.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+function startWorkspace(path: string) {
+  void runWorkspaceAction(() => store.startWorkspace(path));
+}
+
+function restartWorkspace(path: string) {
+  void runWorkspaceAction(() => store.restartWorkspace(path));
+}
+
+function stopWorkspace(address: string) {
+  void runWorkspaceAction(() => store.stopWorkspace(address));
 }
 
 function toggleResourceVisibility(resource: string, visible: boolean) {
@@ -451,13 +499,55 @@ function formatLogTime(timestamp: number) {
   return formatRecordTime(timestamp, true);
 }
 
-function roleLabel(message: ConversationEntry) {
-  if (message.role === 'user') return 'You';
-  if (message.role === 'assistant') return resourceName(message.agent);
-  if (message.role === 'tool') return 'Tool response';
-  if (message.role === 'error') return 'Agent error';
-  if (message.role === 'record') return 'Note';
-  return 'System';
+const copiedKey = ref('');
+let copiedTimer: ReturnType<typeof setTimeout> | undefined;
+
+async function copyText(value: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch {
+    // Clipboard API needs a secure context; keep a legacy fallback.
+    const area = document.createElement('textarea');
+    area.value = value;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    const copied = document.execCommand('copy');
+    area.remove();
+    return copied;
+  }
+}
+
+async function copyMessage(message: ConversationEntry) {
+  if (!message.content) return;
+  if (!(await copyText(message.content))) {
+    composerError.value = 'Could not copy the message';
+    return;
+  }
+  copiedKey.value = message.key;
+  clearTimeout(copiedTimer);
+  copiedTimer = setTimeout(() => {
+    if (copiedKey.value === message.key) copiedKey.value = '';
+  }, 1200);
+}
+
+function toolResult(message: ConversationEntry, id: string) {
+  return message.toolResults?.get(id) ?? null;
+}
+
+function toolState(message: ConversationEntry, id: string): 'pending' | 'done' | 'failed' {
+  const result = toolResult(message, id);
+  if (!result) return 'pending';
+  return result.failed ? 'failed' : 'done';
+}
+
+// Tool name and arguments share one text run: same font, colour, size and
+// baseline, separated by two spaces, a dot and two spaces.
+function toolCallLabel(tool: { tool_name: string; arguments: unknown }): string {
+  return `${tool.tool_name}\u00a0\u00a0·\u00a0\u00a0${inlineToolPayload(tool.arguments ?? {})}`;
 }
 
 function isMcLRecord(message: ConversationEntry) {
@@ -468,6 +558,79 @@ const mclRecords = computed(() => visibleMessages.value.filter(isMcLRecord));
 const conversationMessages = computed(() =>
   visibleMessages.value.filter((message) => !isMcLRecord(message)),
 );
+
+// Timestamps mark turn boundaries: the user message and the assistant reply
+// that immediately precedes it. Everything else stays clean.
+function showsMeta(index: number): boolean {
+  const messages = conversationMessages.value;
+  const message = messages[index];
+  if (!message) return false;
+  if (message.role === 'user') return true;
+  if (message.role !== 'assistant') return false;
+  for (let next = index + 1; next < messages.length; next++) {
+    const role = messages[next]!.role;
+    if (role === 'record') continue;
+    return role === 'user';
+  }
+  return false;
+}
+
+// The transcript is one flat block flow. A message is not one visual box: its
+// thinking, text and tool calls each become sibling blocks, so the gap between
+// them never depends on which message they came from.
+type RowKind =
+  | 'images'
+  | 'thinking'
+  | 'content'
+  | 'error'
+  | 'tool'
+  | 'toolResult'
+  | 'recordData'
+  | 'meta';
+interface ConversationRow {
+  key: string;
+  role: ConversationEntry['role'];
+  kind: RowKind;
+  message: ConversationEntry;
+  tool?: ConversationEntry['toolCalls'][number];
+}
+const conversationRows = computed<ConversationRow[]>(() => {
+  const rows: ConversationRow[] = [];
+  conversationMessages.value.forEach((message, index) => {
+    const push = (kind: RowKind, tool?: ConversationEntry['toolCalls'][number]) =>
+      rows.push({
+        key: `${message.key}:${kind}${tool ? `:${tool.id}` : ''}`,
+        role: message.role,
+        kind,
+        message,
+        tool,
+      });
+    if (message.role === 'user') {
+      if (message.images?.length) push('images');
+      if (message.content) push('content');
+      if (showsMeta(index)) push('meta');
+      return;
+    }
+    if (message.role === 'assistant') {
+      if (message.thinking) push('thinking');
+      if (message.content) push('content');
+      for (const tool of message.toolCalls) push('tool', tool);
+      if (showsMeta(index)) push('meta');
+      return;
+    }
+    if (message.role === 'tool') {
+      push('toolResult');
+      return;
+    }
+    if (message.role === 'record') {
+      if (message.content) push('content');
+      if (message.payload !== null) push('recordData');
+      return;
+    }
+    if (message.content) push(message.role === 'error' ? 'error' : 'content');
+  });
+  return rows;
+});
 </script>
 
 <template>
@@ -510,49 +673,12 @@ const conversationMessages = computed(() =>
           @select-workspace="selectWorkspace"
           @toggle-workspace="store.toggleWorkspace"
           @select-agent="selectMember"
+          @start-workspace="startWorkspace"
+          @restart-workspace="restartWorkspace"
+          @stop-workspace="stopWorkspace"
         />
       </nav>
 
-      <div
-        v-if="selectedDefinition"
-        class="workspace-controls"
-        aria-label="Selected workspace controls"
-      >
-        <span class="tree-name" :title="selectedDefinition.path">{{
-          selectedDefinition.cache.name
-        }}</span>
-        <button
-          type="button"
-          :disabled="
-            workspaceOperationPending || connectionStatus !== 'online' || !!selectedRuntimeWorkspace
-          "
-          @click="runAgentAction(() => store.startWorkspace(selectedDefinition!.path))"
-        >
-          Start
-        </button>
-        <button
-          type="button"
-          :disabled="
-            workspaceOperationPending ||
-            connectionStatus !== 'online' ||
-            selectedRuntimeWorkspace?.status !== 'running'
-          "
-          @click="runAgentAction(() => store.restartWorkspace(selectedDefinition!.path))"
-        >
-          Restart
-        </button>
-        <button
-          type="button"
-          :disabled="
-            workspaceOperationPending ||
-            connectionStatus !== 'online' ||
-            selectedRuntimeWorkspace?.status !== 'running'
-          "
-          @click="runAgentAction(() => store.stopWorkspace(selectedRuntimeWorkspace!.id))"
-        >
-          Stop
-        </button>
-      </div>
       <div v-if="workspaceNotice" class="sidebar-footnote" role="status">{{ workspaceNotice }}</div>
     </aside>
 
@@ -603,7 +729,7 @@ const conversationMessages = computed(() =>
             >Workspace is stopped. Start it to run its configured members.</span
           >
           <span v-else-if="!selectedDefinition?.cache.agents.length">No members configured.</span>
-          <span v-else-if="!selectedAgent">Choose an agent from Members.</span>
+          <span v-else-if="!selectedAgent">Choose an agent in the sidebar.</span>
           <span v-else-if="!selectedAgentReady"
             >Agent is not running. Start the workspace or inspect runtime errors.</span
           >
@@ -613,85 +739,129 @@ const conversationMessages = computed(() =>
           </span>
         </div>
 
-        <template v-for="message in conversationMessages" :key="message.key">
-          <article
-            :class="[
-              'message-row',
-              `message-row--${message.role}`,
-              { 'message-row--failed': message.failed },
-            ]"
-          >
-            <div class="message-avatar">
-              <UserRound v-if="message.role === 'user'" :size="16" />
-              <Bot v-else-if="message.role === 'assistant'" :size="16" />
-              <Wrench v-else-if="message.role === 'tool'" :size="15" />
-              <CircleAlert v-else-if="message.role === 'error'" :size="15" />
-              <Zap v-else :size="15" />
-            </div>
-            <div class="message-body">
-              <div class="message-meta">
-                <strong>{{ roleLabel(message) }}</strong>
-                <span>{{ formatTime(message.timestamp) }}</span>
-                <span v-if="message.sequence !== null">#{{ message.sequence }}</span>
-                <code
-                  v-if="message.source"
-                  class="message-record-source"
-                  :title="message.source"
-                  >{{ message.source }}</code
+        <div v-if="conversationRows.length" class="message-flow">
+          <template v-for="row in conversationRows" :key="row.key">
+            <article
+              :class="['message-row', `message-row--${row.role}`, `message-kind--${row.kind}`]"
+            >
+              <div class="message-body">
+                <div
+                  v-if="row.kind === 'images'"
+                  class="image-row history-image-row"
+                  aria-label="Message images"
                 >
-                <span v-else>Live</span>
-              </div>
-              <div
-                v-if="message.images?.length"
-                class="image-row history-image-row"
-                aria-label="Message images"
-              >
-                <img
-                  v-for="(image, index) in message.images"
-                  :key="index"
-                  :src="imageSource(image)"
-                  :alt="`Image ${index + 1}`"
-                  loading="lazy"
-                />
-              </div>
-              <details v-if="message.thinking" class="message-thinking">
-                <summary>Thinking</summary>
-                <p>{{ message.thinking }}</p>
-              </details>
-              <details v-if="message.role === 'tool' && message.content" class="tool-response">
-                <summary>
-                  <span class="tool-response-label">Tool response</span>
-                  <span class="tool-response-summary">{{ message.content }}</span>
-                </summary>
-                <pre class="tool-response-detail">{{ message.content }}</pre>
-              </details>
-              <div
-                v-else-if="message.content"
-                class="message-content"
-                v-html="renderMarkdown(message.content)"
-              ></div>
-              <details
-                v-if="message.role === 'record' && message.payload !== null"
-                class="tool-response"
-              >
-                <summary>Record data</summary>
-                <pre class="tool-response-detail">{{ metadataText(message.payload) }}</pre>
-              </details>
-              <div v-if="message.toolCalls.length" class="tool-call-list">
-                <details v-for="tool in message.toolCalls" :key="tool.id" class="tool-call-row">
+                  <img
+                    v-for="(image, index) in row.message.images ?? []"
+                    :key="index"
+                    :src="imageSource(image)"
+                    :alt="`Image ${index + 1}`"
+                    loading="lazy"
+                  />
+                </div>
+                <details v-else-if="row.kind === 'thinking'" class="message-disclosure message-thinking">
+                  <summary>Thinking</summary>
+                  <p>{{ row.message.thinking }}</p>
+                </details>
+                <div
+                  v-else-if="row.kind === 'error'"
+                  class="message-content message-content--plain"
+                >
+                  {{ row.message.content }}
+                </div>
+                <div
+                  v-else-if="row.kind === 'content'"
+                  class="message-content"
+                  v-html="renderMarkdown(row.message.content)"
+                ></div>
+                <details v-else-if="row.kind === 'recordData'" class="message-disclosure">
+                  <summary>Record data</summary>
+                  <pre class="message-pre">{{ metadataText(row.message.payload) }}</pre>
+                </details>
+                <details
+                  v-else-if="row.kind === 'toolResult'"
+                  :class="[
+                    'message-disclosure',
+                    'tool-call-row',
+                    row.message.failed ? 'tool-call-row--failed' : 'tool-call-row--done',
+                  ]"
+                >
                   <summary>
                     <Wrench :size="14" />
-                    <span>{{ tool.tool_name }}</span>
-                    <code v-if="tool.arguments">{{ toolArguments(tool.arguments) }}</code>
+                    <span>{{ row.message.toolName || 'tool' }}</span>
                   </summary>
-                  <pre class="tool-call-detail">{{
-                    tool.arguments ? toolArguments(tool.arguments) : '{}'
+                  <pre v-if="row.message.content" class="message-pre">{{
+                    formatToolPayload(row.message.content)
                   }}</pre>
+                  <div
+                    v-if="row.message.images?.length"
+                    class="image-row history-image-row"
+                    aria-label="Tool result images"
+                  >
+                    <img
+                      v-for="(image, index) in row.message.images"
+                      :key="index"
+                      :src="imageSource(image)"
+                      :alt="`Tool image ${index + 1}`"
+                      loading="lazy"
+                    />
+                  </div>
                 </details>
+                <details
+                  v-else-if="row.kind === 'tool' && row.tool"
+                  :class="[
+                    'message-disclosure',
+                    'tool-call-row',
+                    `tool-call-row--${toolState(row.message, row.tool.id)}`,
+                  ]"
+                >
+                  <summary>
+                    <Wrench :size="14" />
+                    <span>{{ toolCallLabel(row.tool) }}</span>
+                  </summary>
+                  <pre class="message-pre">{{
+                    formatToolPayload(row.tool.arguments ?? {})
+                  }}</pre>
+                  <template v-if="toolResult(row.message, row.tool.id)">
+                    <pre
+                      v-if="toolResult(row.message, row.tool.id)?.content"
+                      class="message-pre"
+                      >{{
+                        formatToolPayload(toolResult(row.message, row.tool.id)?.content)
+                      }}</pre
+                    >
+                    <div
+                      v-if="toolResult(row.message, row.tool.id)?.images?.length"
+                      class="image-row history-image-row"
+                      aria-label="Tool result images"
+                    >
+                      <img
+                        v-for="(image, index) in toolResult(row.message, row.tool.id)?.images ?? []"
+                        :key="index"
+                        :src="imageSource(image)"
+                        :alt="`Tool image ${index + 1}`"
+                        loading="lazy"
+                      />
+                    </div>
+                  </template>
+                </details>
+                <div v-else-if="row.kind === 'meta'" class="message-meta">
+                  <span class="message-time">{{ formatTime(row.message.timestamp) }}</span>
+                  <button
+                    class="message-copy"
+                    type="button"
+                    :title="row.message.content ? 'Copy message' : 'Nothing to copy'"
+                    :aria-label="row.message.content ? 'Copy message' : 'Nothing to copy'"
+                    :disabled="!row.message.content"
+                    @click="copyMessage(row.message)"
+                  >
+                    <Check v-if="copiedKey === row.message.key" :size="13" />
+                    <Copy v-else :size="13" />
+                  </button>
+                </div>
               </div>
-            </div>
-          </article>
-        </template>
+            </article>
+          </template>
+        </div>
 
         <div v-if="connectionError" class="inline-error">
           <CloudOff :size="16" />
@@ -741,18 +911,20 @@ const conversationMessages = computed(() =>
               :placeholder="
                 !selectedWorkspace
                   ? 'Select a workspace...'
-                  : selectedAgentReady
-                    ? selectedAgentWorking
-                      ? `${selectedAgentName} is working...`
-                      : `Message ${selectedAgentName}...`
-                    : 'Agent is not ready...'
+                  : !stateReady
+                    ? 'Waiting for daemon state...'
+                    : selectedAgentReady
+                      ? selectedAgentWorking
+                        ? `${selectedAgentName} is working...`
+                        : `Message ${selectedAgentName}...`
+                      : 'Agent is not ready...'
               "
-              @keydown.enter.exact.prevent="submitMessage"
+              @keydown.enter.exact="onComposerEnter"
             ></textarea>
           </div>
           <div v-if="composerError" class="composer-error" role="alert">{{ composerError }}</div>
           <div class="composer-actions">
-            <div class="upload-control">
+            <div ref="uploadControl" class="upload-control">
               <button
                 class="icon-button"
                 type="button"
@@ -765,7 +937,7 @@ const conversationMessages = computed(() =>
                 <Plus :size="19" />
               </button>
               <div v-if="uploadMenuOpen" class="upload-menu">
-                <button type="button" @click="openImagePicker">上传图片 / Upload image</button>
+                <button type="button" @click="openImagePicker">Upload image</button>
               </div>
             </div>
             <span v-if="importingImages" class="image-import-label">Importing images…</span>
@@ -790,6 +962,7 @@ const conversationMessages = computed(() =>
                 !canAbortTurn ||
                 !selectedWorkspace ||
                 connectionStatus !== 'online' ||
+                !stateReady ||
                 !selectedAgentReady
               "
               @click="abortTurn"
@@ -807,6 +980,7 @@ const conversationMessages = computed(() =>
                 submittingMessage ||
                 !selectedWorkspace ||
                 connectionStatus !== 'online' ||
+                !stateReady ||
                 !selectedAgentIdle
               "
             >
@@ -857,6 +1031,10 @@ const conversationMessages = computed(() =>
           </div>
 
           <div v-if="toolsOpen" id="tool-manager-panel" class="tool-manager-panel">
+            <div v-if="resourceError" class="tool-resource-error" role="alert">
+              <span>{{ resourceError }}</span>
+              <button type="button" @click="retryResourceSettings">Retry</button>
+            </div>
             <section class="tool-resource-group">
               <div class="tool-resource-heading">
                 <span>Sandbox</span>
@@ -883,9 +1061,9 @@ const conversationMessages = computed(() =>
                     "
                     :disabled="
                       connectionStatus !== 'online' ||
+                      !stateReady ||
                       !selectedAgentReady ||
-                      resourceSettingsPending ||
-                      !resourceSettingsReady
+                      resourceWriteInFlight
                     "
                     @click="selectSandbox(choice.value)"
                   >
@@ -912,6 +1090,7 @@ const conversationMessages = computed(() =>
                     :aria-label="entry.visible ? 'Remove visibility' : 'Inject visibility'"
                     :disabled="
                       connectionStatus !== 'online' ||
+                      !stateReady ||
                       !selectedAgentReady ||
                       resourceSettingsPending ||
                       !resourceSettingsReady
@@ -924,6 +1103,12 @@ const conversationMessages = computed(() =>
                 </div>
               </div>
               <span v-else class="tool-resource-empty">None</span>
+              <span
+                v-if="toolResources.length && !resourceSettingsReady"
+                class="tool-resource-empty"
+              >
+                {{ resourceSettingsPending ? 'Loading settings…' : 'Visibility unavailable' }}
+              </span>
             </section>
           </div>
         </div>
@@ -942,18 +1127,22 @@ const conversationMessages = computed(() =>
       </div>
       <div class="activity-tabs" role="tablist" aria-label="Audit panel">
         <button
+          id="activity-tab"
           type="button"
           role="tab"
           :aria-selected="activityTab === 'activity'"
+          aria-controls="activity-tabpanel"
           :class="{ active: activityTab === 'activity' }"
           @click="activityTab = 'activity'"
         >
           Activity
         </button>
         <button
+          id="mcl-tab"
           type="button"
           role="tab"
           :aria-selected="activityTab === 'mcl'"
+          aria-controls="mcl-tabpanel"
           :class="{ active: activityTab === 'mcl' }"
           @click="activityTab = 'mcl'"
         >
@@ -962,9 +1151,10 @@ const conversationMessages = computed(() =>
       </div>
       <div
         v-if="activityTab === 'mcl'"
+        id="mcl-tabpanel"
         class="activity-list"
         role="tabpanel"
-        aria-label="MCL audit"
+        aria-labelledby="mcl-tab"
       >
         <p v-if="!mclRecords.length" class="activity-empty">
           No MCL records for the selected agent
@@ -997,7 +1187,13 @@ const conversationMessages = computed(() =>
           }}</span>
         </button>
       </div>
-      <div v-if="activityTab === 'activity'" class="activity-list">
+      <div
+        v-if="activityTab === 'activity'"
+        id="activity-tabpanel"
+        class="activity-list"
+        role="tabpanel"
+        aria-labelledby="activity-tab"
+      >
         <div v-if="!displayedLogs.length" class="activity-empty">
           <Activity :size="18" />
           <span>No runtime events</span>

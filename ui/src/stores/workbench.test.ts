@@ -20,6 +20,7 @@ import {
   type ServerMessage,
   type WorkspaceInfo,
 } from '../types/protocol';
+import { formatToolPayload, inlineToolPayload } from '../lib/format';
 import { formatRecordTime } from '../lib/time';
 import {
   imageMediaType,
@@ -542,7 +543,7 @@ test('late abort receipt can finish original promise after new VM sync without c
     env.cleanup();
   }
 });
-test('history sequence identity, source and unknown timestamps survive nested message projection', () => {
+test('history sequence identity, type and unknown timestamps survive nested message projection', () => {
   const payload = {
     type: 'inject',
     messages: [
@@ -559,7 +560,7 @@ test('history sequence identity, source and unknown timestamps survive nested me
   const entries = historyEntries(
     history([
       {
-        source: 'client:webui/browser:latest',
+        type: 'inject',
         sequence: 41,
         turn: null,
         kind: 'message',
@@ -574,7 +575,8 @@ test('history sequence identity, source and unknown timestamps survive nested me
     ['system', 'tool'],
   );
   for (const entry of entries) {
-    assert.equal(entry.source, 'client:webui/browser:latest');
+    assert.equal(entry.source, null);
+    assert.equal(entry.messageType, 'inject');
     assert.equal(entry.sequence, 41);
     assert.equal(entry.timestamp, 0);
     assert.deepEqual(entry.payload, payload);
@@ -582,7 +584,7 @@ test('history sequence identity, source and unknown timestamps survive nested me
   assert.equal(new Set(entries.map((entry) => entry.key)).size, 2);
   const saved = history([
     {
-      source: 'client:webui/browser:latest',
+      type: 'inject',
       sequence: 41,
       turn: null,
       kind: 'message',
@@ -604,11 +606,13 @@ test('history sequence identity, source and unknown timestamps survive nested me
   assert.ok(nextSequence.every((entry) => !entries.some((original) => original.key === entry.key)));
   const wire = { type: 'history.result', id: 'history', history: saved };
   assert.ok(parseServerMessage(JSON.stringify(wire)));
-  const { source: _source, ...withoutSource } = saved.messages[0]!;
+  const { type: _type, ...withoutType } = saved.messages[0]!;
+  // `type` is optional on message rows; the record still renders by payload.
+  assert.ok(
+    parseServerMessage(JSON.stringify({ ...wire, history: { ...saved, messages: [withoutType] } })),
+  );
   assert.equal(
-    parseServerMessage(
-      JSON.stringify({ ...wire, history: { ...saved, messages: [withoutSource] } }),
-    ),
+    historyEntries({ ...saved, messages: [withoutType] })[0]!.messageType,
     null,
   );
   assert.equal(formatRecordTime(entries[0]!.timestamp), 'Time unavailable');
@@ -618,7 +622,7 @@ test('history reconciles a stream by explicit request_id, never by matching text
   try {
     env.receive(delta('request-id'));
     const row = {
-      source: 'agent:demo/coder:latest',
+      type: 'assistant',
       sequence: 79,
       turn: 'turn',
       kind: 'message',
@@ -641,7 +645,8 @@ test('history reconciles a stream by explicit request_id, never by matching text
     });
     assert.equal(env.store.visibleMessages.length, 1);
     assert.equal(env.store.visibleMessages[0]!.sequence, 79);
-    assert.equal(env.store.visibleMessages[0]!.source, 'agent:demo/coder:latest');
+    assert.equal(env.store.visibleMessages[0]!.source, null);
+    assert.equal(env.store.visibleMessages[0]!.messageType, 'assistant');
   } finally {
     env.cleanup();
   }
@@ -666,7 +671,7 @@ test('history keeps unknown records and background task identifiers as plain tex
 });
 test('token totals and latest context usage come only from persisted assistant history', () => {
   const assistant = (sequence: number, input: number, output: number) => ({
-    source: 'agent:demo/coder:latest',
+    type: 'assistant',
     sequence,
     turn: null,
     kind: 'message',
@@ -819,6 +824,9 @@ test('sidebar renders configured members without mutation menus and emits explic
         pending: false,
         offline: false,
         onSelectAgent: (...args: unknown[]) => events.push(args),
+        onStartWorkspace: (...args: unknown[]) => events.push(args),
+        onRestartWorkspace: (...args: unknown[]) => events.push(args),
+        onStopWorkspace: (...args: unknown[]) => events.push(args),
       }),
   });
   try {
@@ -831,6 +839,18 @@ test('sidebar renders configured members without mutation menus and emits explic
     )!;
     (button.props.onClick as () => void)();
     assert.deepEqual(events, [[workspace.agents[0], path]]);
+    // A running workspace exposes restart + stop, not start.
+    const actions = nodes.filter(
+      (node) => node.type === 'button' && String(node.props.class).includes('tree-action'),
+    );
+    assert.deepEqual(
+      actions.map((action) => action.props.title),
+      ['Restart workspace', 'Stop workspace'],
+    );
+    const event = { stopPropagation() {} };
+    (actions[0]!.props.onClick as (value: unknown) => void)(event);
+    (actions[1]!.props.onClick as (value: unknown) => void)(event);
+    assert.deepEqual(events.slice(1), [[path], [workspace.id]]);
     const text = (node: Host): string => node.text + node.children.map(text).join('');
     assert.ok(!/New workspace|New session|Rename|Delete|Refresh/.test(text(root)));
   } finally {
@@ -868,11 +888,14 @@ test('resources read CONFIG once per snapshot and change visibility only after m
     });
     assert.equal(env.store.resourceVisibility[1]!.visible, false);
     assert.equal(env.store.resourceSettingsPending, true);
+    const stale = assert.rejects(updating, /does not match/);
     env.reply(write.id, 'Unit', 'agent:wrong');
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await stale;
     assert.equal(env.store.resourceVisibility[1]!.visible, false);
-    env.reply(write.id);
-    await updating;
+    assert.equal(env.store.resourceSettingsPending, false);
+    const retrying = env.store.setResourceVisibility('read_file', true);
+    env.reply(env.sent.at(-1)!.id);
+    await retrying;
     assert.equal(env.store.resourceVisibility[1]!.visible, true);
     const failed = env.store.setResourceVisibility('bash', false);
     const rejected = assert.rejects(failed, /denied/);
@@ -881,14 +904,16 @@ test('resources read CONFIG once per snapshot and change visibility only after m
       id: env.sent.at(-1)!.id,
       source: 'client:local/ui:latest',
       target: workspace.agents[0],
-      result: { Err: { kind: 'Denied', message: 'denied' } },
+      result: {
+        Ok: {
+          Error: { type: 'error', message: 'denied', request_id: 'internal-denied' },
+        },
+      },
     });
     await rejected;
     assert.equal(env.store.resourceVisibility[0]!.visible, true);
-    assert.equal(
-      env.store.lastFailures.get(`${workspace.id}:${workspace.agents[0]}`)?.message,
-      'denied',
-    );
+    // A failed command is reported to its caller, not recorded as an Agent fault.
+    assert.equal(env.store.lastFailures.size, 0);
   } finally {
     env.cleanup();
   }
@@ -957,4 +982,386 @@ test('stale resource receipts cannot update replacement VM or dispatch sandbox e
   } finally {
     env.cleanup();
   }
+});
+test('a failed wake retries only the wake for the same message', async () => {
+  const env = setup();
+  try {
+    const injects = () =>
+      env.sent.filter((wire) => wire.message.command === 'INJECT ? TO entry.pending[-1]').length;
+    const sending = env.store.sendMessage('hello');
+    env.reply(
+      env.sent.find((wire) => wire.message.command === 'INJECT ? TO entry.pending[-1]')!.id,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const wake = env.sent.filter((wire) => wire.message.command === 'EFFECT wake').at(-1)!;
+    env.receive({
+      type: 'request.failed',
+      id: wake.id,
+      error: { kind: 'WriteFailed', message: 'wake not written' },
+    });
+    await assert.rejects(sending, /wake not written/);
+    assert.equal(injects(), 1);
+    const retrying = env.store.sendMessage('hello');
+    assert.equal(injects(), 1);
+    const secondWake = env.sent.filter((wire) => wire.message.command === 'EFFECT wake').at(-1)!;
+    assert.notEqual(secondWake.id, wake.id);
+    env.reply(secondWake.id);
+    await retrying;
+    assert.equal(injects(), 1);
+  } finally {
+    env.cleanup();
+  }
+});
+test('a failed CONFIG GET stays retryable and missing visible_tools means no tool is visible', async () => {
+  const env = setup(state, false);
+  try {
+    const read = env.sent.filter((wire) => wire.message.command === 'CONFIG GET').at(-1)!;
+    env.receive({
+      type: 'request.failed',
+      id: read.id,
+      error: { kind: 'Timeout', message: 'read timed out' },
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(env.store.resourceSettingsReady, false);
+    assert.match(env.store.resourceError, /timed out/);
+    assert.equal(env.store.connectionError, '');
+    env.store.retryResourceSettings();
+    const retry = env.sent.filter((wire) => wire.message.command === 'CONFIG GET').at(-1)!;
+    assert.notEqual(retry.id, read.id);
+    env.reply(retry.id, { Config: {} });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(env.store.resourceSettingsReady, true);
+    assert.equal(env.store.resourceError, '');
+    assert.deepEqual(
+      env.store.resourceVisibility.map((entry) => entry.visible),
+      [false, false],
+    );
+  } finally {
+    env.cleanup();
+  }
+});
+test('a failed sandbox effect re-reads CONFIG and reports saved-but-not-applied', async () => {
+  const env = setup(working(), false);
+  try {
+    await loadResources(env);
+    const reads = env.sent.filter((wire) => wire.message.command === 'CONFIG GET').length;
+    const updating = env.store.setSandbox('safe');
+    env.reply(env.sent.at(-1)!.id);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const effect = env.sent
+      .filter((wire) => wire.message.command === 'EFFECT sandbox_use ?')
+      .at(-1)!;
+    env.receive({
+      type: 'request.failed',
+      id: effect.id,
+      error: { kind: 'Denied', message: 'effect denied' },
+    });
+    await assert.rejects(updating, /Sandbox saved but not activated: effect denied/);
+    assert.ok(env.sent.filter((wire) => wire.message.command === 'CONFIG GET').length > reads);
+  } finally {
+    env.cleanup();
+  }
+});
+test('workspace.stopped clears the selected runtime route immediately', () => {
+  const env = setup();
+  try {
+    env.receive(delta());
+    assert.equal(env.store.visibleMessages.length, 1);
+    env.receive({
+      type: 'workspace.stopped',
+      id: 'stop-1',
+      workspace: { id: workspace.id, name: 'Runtime', project_root: '/test' },
+    });
+    assert.equal(env.store.runtimeWorkspaces.length, 1);
+    assert.equal(env.store.selectedAgent, null);
+    assert.equal(env.store.visibleMessages.length, 0);
+    assert.equal(env.store.sandboxOptions.options.length, 0);
+    assert.equal(env.store.resourceSettingsReady, false);
+    env.receive({ type: 'state.sync', state: { ...state, workspaces: [], agents: [] } });
+    assert.equal(env.store.runtimeWorkspaces.length, 0);
+  } finally {
+    env.cleanup();
+  }
+});
+test('stateReady requires a fresh snapshot after connecting', () => {
+  const env = setup();
+  try {
+    assert.equal(env.store.stateReady, false);
+    env.receive({ type: 'state.sync', state });
+    assert.equal(env.store.stateReady, true);
+    assert.equal(env.store.connect(), true);
+    assert.equal(env.store.stateReady, false);
+  } finally {
+    env.cleanup();
+  }
+});
+test('a delivered message is injected again after its turn completes', async () => {
+  const env = setup();
+  try {
+    const injects = () =>
+      env.sent.filter((wire) => wire.message.command === 'INJECT ? TO entry.pending[-1]').length;
+    const first = env.store.sendMessage('hello');
+    env.reply(
+      env.sent.find((wire) => wire.message.command === 'INJECT ? TO entry.pending[-1]')!.id,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    env.receive({
+      type: 'request.failed',
+      id: env.sent.filter((wire) => wire.message.command === 'EFFECT wake').at(-1)!.id,
+      error: { kind: 'WriteFailed', message: 'wake not written' },
+    });
+    await assert.rejects(first, /wake not written/);
+    const retrying = env.store.sendMessage('hello');
+    assert.equal(injects(), 1);
+    env.reply(env.sent.filter((wire) => wire.message.command === 'EFFECT wake').at(-1)!.id);
+    await retrying;
+    env.receive({ type: 'state.sync', state: working() });
+    env.receive({ type: 'state.sync', state });
+    const again = env.store.sendMessage('hello');
+    assert.equal(injects(), 2);
+    env.reply(
+      env.sent.filter((wire) => wire.message.command === 'INJECT ? TO entry.pending[-1]').at(-1)!
+        .id,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    env.reply(env.sent.filter((wire) => wire.message.command === 'EFFECT wake').at(-1)!.id);
+    await again;
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('MCL history retains source while message history requires type without source', () => {
+  const saved = history([
+    {
+      sequence: 1,
+      turn: null,
+      source: 'client:local/ui:latest',
+      kind: 'mcl',
+      content: 'CONFIG GET',
+      payload: { text: 'CONFIG GET' },
+      created_at_ms: 0,
+    },
+  ]);
+  const wire = { type: 'history.result', id: 'h', history: saved };
+  assert.ok(parseServerMessage(JSON.stringify(wire)));
+  const entry = historyEntries(saved)[0]!;
+  assert.equal(entry.source, 'client:local/ui:latest');
+  assert.equal(entry.messageType, null);
+  const message = { ...saved.messages[0]!, kind: 'message', type: 'user' };
+  assert.equal(
+    parseServerMessage(JSON.stringify({ ...wire, history: { ...saved, messages: [message] } })),
+    null,
+  );
+  const { source: _source, ...withoutSource } = message;
+  assert.ok(
+    parseServerMessage(
+      JSON.stringify({ ...wire, history: { ...saved, messages: [withoutSource] } }),
+    ),
+  );
+  // `source` is optional on MCL rows; the audit record still renders.
+  const { source: _mclSource, ...mclWithoutSource } = saved.messages[0]!;
+  assert.ok(
+    parseServerMessage(
+      JSON.stringify({ ...wire, history: { ...saved, messages: [mclWithoutSource] } }),
+    ),
+  );
+  assert.equal(
+    historyEntries({ ...saved, messages: [mclWithoutSource] })[0]!.source,
+    null,
+  );
+});
+
+test('MCL error message results reject pending writes without waking the Driver', async () => {
+  const env = setup();
+  try {
+    const sending = env.store.sendMessage('keep draft');
+    const rejection = assert.rejects(
+      sending,
+      (error: Error & { requestId?: string }) =>
+        /storage unavailable/.test(error.message) && error.requestId === 'internal-request',
+    );
+    const inject = env.sent.find(
+      (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
+    )!;
+    env.receive({
+      type: 'mcl.command_result',
+      id: inject.id,
+      source: 'client:webui/browser:1',
+      target: workspace.agents[0]!,
+      result: {
+        Ok: {
+          Error: {
+            type: 'error',
+            message: 'StorageFailed: storage unavailable',
+            request_id: 'internal-request',
+          },
+        },
+      },
+    });
+    await rejection;
+    assert.ok(!env.sent.some((request) => request.message.command === 'EFFECT wake'));
+  } finally {
+    env.cleanup();
+  }
+});
+test('assistant messages may omit content, reasoning and tool_calls', () => {
+  assert.equal(isAgentMessage({ type: 'assistant' }), true);
+  assert.equal(
+    isAgentMessage({
+      type: 'assistant',
+      tool_calls: [{ id: 'call', tool_name: 'read_file', arguments: '{}' }],
+    }),
+    true,
+  );
+  const entries = historyEntries(
+    history([
+      {
+        type: 'assistant',
+        sequence: 5,
+        turn: null,
+        kind: 'message',
+        content: '',
+        payload: {
+          type: 'assistant',
+          tool_calls: [{ id: 'call', tool_name: 'read_file', arguments: '{}' }],
+        },
+        created_at_ms: 1,
+      },
+    ]),
+  );
+  assert.equal(entries[0]!.role, 'assistant');
+  assert.equal(entries[0]!.content, '');
+  assert.equal(entries[0]!.thinking, '');
+  assert.equal(entries[0]!.toolCalls.length, 1);
+});
+test('a non-Unit INJECT acknowledgement is treated as an unknown outcome', async () => {
+  const env = setup();
+  try {
+    const sending = env.store.sendMessage('hello');
+    const inject = env.sent.find(
+      (wire) => wire.message.command === 'INJECT ? TO entry.pending[-1]',
+    )!;
+    env.reply(inject.id, 'NotUnit');
+    await assert.rejects(sending, /did not acknowledge Unit/);
+    assert.ok(!env.sent.some((wire) => wire.message.command === 'EFFECT wake'));
+  } finally {
+    env.cleanup();
+  }
+});
+test('a non-Unit CONFIG SET is not treated as saved', async () => {
+  const env = setup(state, false);
+  try {
+    await loadResources(env);
+    const updating = env.store.setResourceVisibility('read_file', true);
+    env.reply(env.sent.at(-1)!.id, 'Config');
+    await assert.rejects(updating, /did not acknowledge Unit/);
+    assert.equal(env.store.resourceVisibility[1]!.visible, false);
+  } finally {
+    env.cleanup();
+  }
+});
+test('tool results merge into the assistant call row', () => {
+  const entries = historyEntries(
+    history([
+      {
+        type: 'assistant',
+        turn: null,
+        sequence: 1,
+        kind: 'message',
+        content: '',
+        payload: {
+          type: 'assistant',
+          tool_calls: [
+            { id: 'call-a', tool_name: 'read_file', arguments: '{"path":"a"}' },
+            { id: 'call-b', tool_name: 'grep', arguments: '{"q":"b"}' },
+          ],
+        },
+        created_at_ms: 1,
+      },
+      {
+        type: 'tool_call',
+        turn: null,
+        sequence: 2,
+        kind: 'message',
+        content: 'ok',
+        payload: {
+          type: 'tool_call',
+          tool_call_id: 'call-a',
+          tool_name: 'read_file',
+          content: 'ok',
+          failed: false,
+        },
+        created_at_ms: 2,
+      },
+      {
+        type: 'tool_call',
+        turn: null,
+        sequence: 3,
+        kind: 'message',
+        content: 'failed',
+        payload: {
+          type: 'tool_call',
+          tool_call_id: 'call-b',
+          tool_name: 'grep',
+          content: 'failed',
+          failed: true,
+        },
+        created_at_ms: 3,
+      },
+    ]),
+  );
+  assert.equal(entries.length, 1);
+  const call = entries[0]!;
+  assert.equal(call.role, 'assistant');
+  assert.deepEqual(
+    call.toolCalls.map((tool) => tool.id),
+    ['call-a', 'call-b'],
+  );
+  assert.deepEqual(call.toolResults?.get('call-a'), { content: 'ok', failed: false, images: undefined });
+  assert.deepEqual(call.toolResults?.get('call-b'), {
+    content: 'failed',
+    failed: true,
+    images: undefined,
+  });
+});
+test('an unpaired tool result stays as a standalone tool row', () => {
+  const entries = historyEntries(
+    history([
+      {
+        type: 'tool_call',
+        turn: null,
+        sequence: 1,
+        kind: 'message',
+        content: 'orphan',
+        payload: {
+          type: 'tool_call',
+          tool_call_id: 'call-orphan',
+          tool_name: 'read_file',
+          content: 'orphan',
+          failed: true,
+        },
+        created_at_ms: 1,
+      },
+    ]),
+  );
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0]!.role, 'tool');
+  assert.equal(entries[0]!.toolCallId, 'call-orphan');
+  assert.equal(entries[0]!.toolName, 'read_file');
+  assert.equal(entries[0]!.failed, true);
+});
+test('tool payloads render as readable TOML-like text', () => {
+  const value = { cmd: 'time sleep 9; echo "9 秒结束"', nested: { retry: 2 } };
+  const text = formatToolPayload(value);
+  assert.ok(text.includes(`cmd = 'time sleep 9; echo "9 秒结束"'`));
+  assert.ok(text.includes('[nested]'));
+  assert.ok(text.includes('retry = 2'));
+  assert.equal(formatToolPayload(JSON.stringify(value)), text);
+  assert.equal(inlineToolPayload(value).includes('\n'), false);
+  assert.equal(formatToolPayload('hello world'), 'hello world');
+  const result = formatToolPayload(JSON.stringify({ output: ['a\nb'], failed: false }));
+  assert.ok(result.includes('output = ['));
+  assert.ok(result.includes("'''a\nb'''"));
+  assert.ok(result.includes('failed = false'));
 });

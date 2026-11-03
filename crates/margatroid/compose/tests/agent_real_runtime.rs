@@ -328,20 +328,18 @@ fn real_agent_restart_allows_current_driver_initialization_but_refuses_external_
         None,
         "unbound-self-during-restart",
     );
-    assert_eq!(
-        wait(&mut fixture.app, &mut external_reply)
-            .unwrap_err()
-            .kind,
-        mcl_core::MclErrorKind::SourceInvalid
-    );
-    assert_eq!(
-        wait(&mut fixture.app, &mut stale_reply).unwrap_err().kind,
-        mcl_core::MclErrorKind::SourceInvalid
-    );
-    assert_eq!(
-        wait(&mut fixture.app, &mut unbound_reply).unwrap_err().kind,
-        mcl_core::MclErrorKind::SourceInvalid
-    );
+    for reply in [&mut external_reply, &mut stale_reply, &mut unbound_reply] {
+        let mcl_core::MclValue::Error(message) = wait(&mut fixture.app, reply).unwrap() else {
+            panic!("error message")
+        };
+        assert_eq!(message["type"], "error");
+        assert!(
+            message["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("SourceInvalid:")
+        );
+    }
     assert_eq!(wait(&mut fixture.app, &mut restarted).unwrap(), agent);
     assert_eq!(
         fixture

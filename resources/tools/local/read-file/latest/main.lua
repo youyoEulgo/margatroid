@@ -1,3 +1,7 @@
+function configure(arguments, context)
+    return { timeout_ms = 30000 }
+end
+
 -- read-file
 --
 -- Reads a numbered window from one text file. Absolute paths are used unchanged;
