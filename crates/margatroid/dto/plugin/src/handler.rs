@@ -731,7 +731,11 @@ pub(crate) fn handle_response(world: &mut World, ready: ResponseReady) {
             mark_dirty(world);
             let result = match result {
                 Ok(value) => json!({"Ok": value}),
-                Err(error) => json!({"Err": error}),
+                Err(error) => json!({"Ok": {"Error": {
+                    "type": "error",
+                    "message": format!("{}: {}", error.kind, error.message),
+                    "request_id": context.network_id,
+                }}}),
             };
             ServerMessage::MclCommandResult {
                 id: context.network_id,
@@ -1115,9 +1119,12 @@ fn history_sync(
         .map(|entry| {
             let record = entry.record;
             Ok(HistoryMessageDto {
-                source: record.source,
                 sequence: entry.sequence,
                 turn: record.turn,
+                message_type: (record.kind == "message")
+                    .then(|| record.payload["type"].as_str().map(str::to_owned))
+                    .flatten(),
+                source: record.source,
                 kind: record.kind,
                 content: record.content,
                 payload: record.payload,

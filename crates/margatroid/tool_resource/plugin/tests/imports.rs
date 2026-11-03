@@ -36,7 +36,7 @@ impl Fixture {
         )
         .unwrap();
         fs::write(directory.join("input.schema.json"), "{}").unwrap();
-        fs::write(directory.join("main.lua"), "return 1").unwrap();
+        fs::write(directory.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() task_return(1) end").unwrap();
         directory.join("tool.toml")
     }
 }

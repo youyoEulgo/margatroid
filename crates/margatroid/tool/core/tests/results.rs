@@ -1,7 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::sync::oneshot;
 use tool_core::{
     InitToolTasks, ToolError, ToolErrorKind, ToolExecuteRequest, ToolExecutionLimits,
@@ -265,23 +264,6 @@ fn execution_limits_validate_and_round_trip() {
     invalids.extend([
         ToolExecutionLimits {
             instruction_budget: 0,
-            ..defaults.clone()
-        },
-        ToolExecutionLimits {
-            execution_timeout: Some(Duration::ZERO),
-            ..defaults.clone()
-        },
-        ToolExecutionLimits {
-            host_call_timeout: Duration::ZERO,
-            ..defaults.clone()
-        },
-        ToolExecutionLimits {
-            cleanup_timeout: Duration::ZERO,
-            ..defaults.clone()
-        },
-        ToolExecutionLimits {
-            execution_timeout: Some(Duration::from_secs(30)),
-            host_call_timeout: Duration::from_secs(31),
             ..defaults.clone()
         },
         ToolExecutionLimits {

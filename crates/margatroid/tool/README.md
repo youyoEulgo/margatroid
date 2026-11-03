@@ -24,11 +24,28 @@ task_finish(context.task_id)
 
 任务自然退出也进入清理并记录完成；未task_return就退出，原调用返回MissingReturn。重复task_return报错，不产生第二个工具结果。已回复任务后续异常写入可查询error，不能重复完成原tool_call。
 
+每个工具脚本必须定义configure(arguments, context)，返回本次显式配置；配置函数成功返回并经后端确认后，才调用execute(arguments, context)。不在工具清单或模型参数中强制添加timeout，限时由脚本作者决定，可根据本次arguments计算。缺失配置、缺少字段、未知字段、负数、非整数或无法表示的限时直接拒绝，后端不提供默认限时。
+
+```lua
+function configure(arguments, context)
+    return { timeout_ms = 30000 } -- 0 表示不限存活时长
+end
+
+function execute(arguments, context)
+    task_return({ ok = true, content = "done" })
+    task_finish(context.task_id)
+end
+```
+
+唯一配置timeout_ms由ToolTask保存，正整数为任务允许存活的毫秒数，0明确表示不限时。存活预算从配置确认后开始；task_return不解除预算，持久任务也按作者声明到期。配置阶段使用同一个Lua状态，只允许纯计算，尚未安装IO、OS、shell、terminal、task、json等宿主能力；不得在脚本顶层捕获这些能力。内存和指令预算覆盖顶层加载与配置阶段，防止配置本身无限执行；这些是资源预算，不是后端默认时间限制。
+
+shell、宿主请求和输入等待均服从同一ToolTask存活预算，不接受独立shell timeout_ms，不另设宿主或清理限时。到期请求取消，等待进程真实清理后才完成，不因到期丢弃监督。内置普通工具声明30秒，bash_exec声明120秒，持久bash声明0不限时；这些值写在各工具Lua配置函数中，后端没有对应默认常量。
+
 ## 缓存与输入
 
 宿主创建任务时将共享句柄存入集合，克隆一份交给工作任务；工作任务还持有集合的Arc句柄，可查询同Agent的其他条目，不借用World。独立worker经既有双向宿主协议访问这些共享句柄，不跨进程传递Arc。
 
-ToolTasks按任务id保存控制句柄、输出缓存、cursor、completed及error，不混入推理或存储任务。缓存是结构化值序列，不是强制拼接的字符串。
+ToolTasks按任务id保存控制句柄、输出缓存、cursor、completed及error，不混入推理或存储任务。缓存保留结构化值序列；task_read返回前将本次未读值中的相邻字符串直接拼接为一项，不添加分隔符，非字符串值原样保留并维持顺序。
 
 | Lua函数 | 行为 |
 | --- | --- |
@@ -52,7 +69,7 @@ task_read同时返回replaced标记：上次读取后发生覆盖为true，否�
 
 ## bash与交互终端
 
-bash工具无调用参数，打开终端后返回task_id，收到的task_send消息由Lua转发，输出由Lua选择task_write或task_replace。进程、PTY、终端模拟器和追加或覆盖的判断属于工具自身设计，不作为Margatroid任务机制的接口要求。
+bash工具无调用参数，打开终端后返回task_id，收到的task_send消息由Lua转发，输出由Lua选择task_write或task_replace。普通终端滚屏保留滚走的行并继续追加，不把窗口移动当覆盖；光标改写及alternate screen仍使用替换语义。终端历史受output_bytes与cache_bytes中的较小预算限制，超出明确报OutputTooLarge，不静默丢弃旧行。进程、PTY、终端模拟器和追加或覆盖的判断属于工具自身设计，不作为Margatroid任务机制的接口要求。
 
 ## 执行与清理
 

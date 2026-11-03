@@ -1,3 +1,4 @@
+import { randomId } from '@/lib/id';
 import type { UserImage } from '@/types/protocol';
 
 export const MAX_IMAGES = 8;
@@ -36,7 +37,7 @@ export async function importImage(file: File): Promise<DraftImage> {
     image.onerror = () => { cleanup(); reject(new Error('Image could not be decoded')); };
     image.src = imageSource({ media_type, data });
   });
-  return { id: crypto.randomUUID(), name: file.name, size: bytes.length, media_type, data };
+  return { id: randomId(), name: file.name, size: bytes.length, media_type, data };
 }
 export function imageSource(image: UserImage): string {
   return `data:${image.media_type};base64,${image.data}`;

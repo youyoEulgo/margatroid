@@ -1,3 +1,7 @@
+function configure(arguments, context)
+    return { timeout_ms = 30000 }
+end
+
 local MAX_RESULTS = 100
 local MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 

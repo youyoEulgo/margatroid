@@ -1,3 +1,7 @@
+function configure(arguments, context)
+    return { timeout_ms = 30000 }
+end
+
 -- list-directory
 --
 -- Lists the immediate children of one directory, sorted by name. Absolute paths

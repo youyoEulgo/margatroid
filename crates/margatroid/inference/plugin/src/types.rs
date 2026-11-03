@@ -2,12 +2,14 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use core_plugin::Resource;
+use app_runtime_plugin::RuntimeEventSender;
+use core_plugin::{Entity, Event, Resource};
 use inference_core::{
     DomainRequest, InferenceError, InferenceErrorKind, InferenceImage, InferenceMessage,
     InferenceRequest, InferenceResponse, InferenceStopReason, InferenceToolCall, InferenceUsage,
     ModelRoute,
 };
+use lua_runtime_core::DriverLuaVmInstance;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize};
@@ -30,14 +32,23 @@ pub(crate) struct HttpRuntime {
 }
 impl Resource for HttpRuntime {}
 
+#[derive(Clone)]
+pub(crate) struct InferenceCleanupFinished {
+    pub agent: Entity,
+    pub request_id: String,
+    pub instance: DriverLuaVmInstance,
+}
+impl Event for InferenceCleanupFinished {}
+
 pub(crate) struct InferenceContext {
     pub request: InferenceRequest,
-    pub reply: oneshot::Sender<Result<InferenceResponse>>,
+    pub reply: Option<oneshot::Sender<Result<InferenceResponse>>>,
     pub route: ModelRoute,
     pub tools: Vec<(String, PathBuf)>,
     pub client: reqwest::Client,
     pub gate: Arc<Mutex<StreamGate>>,
     pub delivery: StreamDelivery,
+    pub cleanup_notification: Option<(RuntimeEventSender, InferenceCleanupFinished)>,
     #[cfg(test)]
     pub cleanup_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }

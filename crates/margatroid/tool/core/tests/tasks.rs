@@ -341,3 +341,50 @@ fn completion_preserves_error_and_is_idempotent() {
     assert_eq!(task.read().error, Some(error));
     assert!(task.read().completed);
 }
+
+#[test]
+fn reads_join_unread_text_without_changing_structured_output_or_cursor() {
+    let (task, _) = handle();
+    for value in [
+        json!("你好"),
+        json!("\n"),
+        json!("world"),
+        json!({"exit_code":0}),
+        json!("after"),
+        json!(" status"),
+        json!([1, 2]),
+    ] {
+        task.write(value).unwrap();
+    }
+    assert_eq!(
+        task.read().output,
+        [
+            json!("你好\nworld"),
+            json!({"exit_code":0}),
+            json!("after status"),
+            json!([1, 2])
+        ]
+    );
+    assert!(task.read().output.is_empty());
+    task.write(json!("new")).unwrap();
+    task.write(json!(" output")).unwrap();
+    assert_eq!(task.read().output, [json!("new output")]);
+}
+
+#[test]
+fn replacement_and_completion_keep_their_semantics_with_joined_text() {
+    let (task, _) = handle();
+    task.write(json!("discarded")).unwrap();
+    task.replace(json!("screen")).unwrap();
+    task.write(json!(" tail")).unwrap();
+    task.complete(None);
+    let read = task.read();
+    assert_eq!(read.output, [json!("screen tail")]);
+    assert!(read.replaced);
+    assert!(read.completed);
+    assert!(read.error.is_none());
+    let next = task.read();
+    assert!(next.output.is_empty());
+    assert!(!next.replaced);
+    assert!(next.completed);
+}

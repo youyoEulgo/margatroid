@@ -13,7 +13,7 @@ InferencePlugin::open读取models.toml并完整校验模型路由，build安装M
 | deepseek | chat_completions、messages、responses |
 | openrouter | chat_completions |
 
-未知组合或不支持参数在HTTP前失败。base_url是API前缀，仅追加对应端点；Messages使用x-api-key及anthropic-version，其他格式使用Bearer。凭据、完整请求及敏感错误URL不进入日志或前端投影。
+未知组合或不支持参数在HTTP前失败。base_url是API前缀，仅追加对应端点；Messages使用x-api-key及anthropic-version，其他格式使用Bearer。凭据、完整请求及敏感错误URL不进入日志或前端投影。非2xx响应有界读取错误正文，保留HTTP状态、上游message、type、code与request_id等诊断字段；剔除当前凭据，不转储完整响应。读取超时、断流、正文过大或无法解析时仍保留HTTP状态和读取情况，不将已知上游错误覆盖成笼统网络失败。
 
 ## 推理句柄初始化
 
@@ -57,7 +57,7 @@ HTTP/SSE读取任务只向一个有界ProviderFragment通道写入，不直接�
 
 正常或用户中止的内容结果始终取自通道出口的ResponseAccumulator。上游任务退出后不能用另一份正文补写结果。中止冻结已接受的正文及思考，返回Cancelled，tool_calls为空，replay和usage为空；无内容保持空值，不填充取消文案。
 
-文本冻结与任务清理分开。监督任务请求关闭HTTP/SSE并等待真实join，释放发送任务后才回复oneshot。清理失败返回CleanupFailed，不能因为文本已冻结就假称推理已经退出；超时、根关闭和reply丢失保留各自错误分类，不都转成正常用户取消。
+文本冻结与任务清理分开。已确认的provider或流错误立即经oneshot交给MCL转换为error消息，不等待后台join；正常取消在清理预算内仍保留Cancelled语义，超预算及时返回CleanupFailed。原监督任务始终保留并等待真实join，ActiveInference不提前释放，下一次重叠推理返回可见错误。清理完成后发送绑定原Agent、VM实例和request_id的内部通知，确认任务真正结束才唤醒Driver重试finish_turn；迟到通知不能唤醒替换实例。不因错误已交付就假称推理退出，超时、根关闭和reply丢失保留各自分类。
 
 结果经oneshot交回MCL，再由Driver显式history_append；累积器不直接写历史。finished仅表示显示流终态，不替代oneshot或真实退出证明。
 

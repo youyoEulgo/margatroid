@@ -67,7 +67,7 @@ pub enum MessageSource {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryRecord {
-    pub source: String,
+    pub source: Option<String>,
     pub turn: Option<String>,
     pub kind: String,
     pub content: String,

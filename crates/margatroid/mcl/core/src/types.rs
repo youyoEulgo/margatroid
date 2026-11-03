@@ -81,8 +81,16 @@ pub enum MclValue {
     Unit,
     Array(MessageArray),
     Config(toml::Table),
-    Inference { message: Value, stop_reason: String },
-    Import { kind: ImportKind, alias: String },
+    Inference {
+        message: Value,
+        stop_reason: String,
+    },
+    Import {
+        kind: ImportKind,
+        alias: String,
+    },
+    /// A recoverable MCL failure represented as an AgentMessage of type `error`.
+    Error(Value),
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum MessageArray {

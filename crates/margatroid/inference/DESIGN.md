@@ -128,9 +128,10 @@ supervise_inference(context: InferenceContext) -> Future<Output = ()>
         编码HTTP请求，建立有界mpsc::channel<ProviderFragment>并启动read_provider。
         运行receive_stream，以其累积器作为唯一内容结果来源。
         正常结束校验协议终态；取消时冻结接受门、关闭接收端并请求worker退出。
-        等待worker真实join，释放HTTP及推流任务；清理失败返回CleanupFailed。
-        用户中止且清理成功返回冻结的Cancelled结果；其他失败返回真实错误。
-        通过原reply完成一次回复，不写历史、不执行工具、不重试。
+        已确认的provider或流错误立即通过原reply交付一次；后台继续等待worker真实join，不提前释放ActiveInference。
+        用户中止且清理成功返回冻结的Cancelled结果；清理预算耗尽及时返回CleanupFailed，原监督继续真实清理。
+        全部真实清理结束发送绑定Agent、VM实例和request_id的私有完成事件；确认监督任务已结束后才唤醒当前Driver，未结束则下一帧复查，过期事件丢弃，不自动finish_turn。
+        不写历史、不执行工具、不重试推理。
 
 read_provider(context: ProviderContext, sender: mpsc::Sender<ProviderFragment>) -> Future<Output = Result<(), InferenceError>>
     行为：执行HTTP并有界解析SSE，按顺序发送ProviderFragment；不向前端发送，不维护另一份最终正文；发送失败或取消后退出并释放连接。

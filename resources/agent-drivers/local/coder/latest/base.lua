@@ -1,8 +1,16 @@
 local function command(text, arguments)
+    local result
     if arguments == nil then
-        return mcl(agent_info.entity, text)
+        result = mcl(agent_info.entity, text)
+    else
+        result = mcl(agent_info.entity, text, arguments)
     end
-    return mcl(agent_info.entity, text, arguments)
+    if type(result) == "table" and result.Error then
+        local failure = result.Error
+        failure.command = text
+        error(failure, 0)
+    end
+    return result
 end
 
 local function settings()
@@ -68,31 +76,40 @@ local function maybe_compact_context(message)
     end
 end
 
-command("IMPORT MESSAGE prompt:local/coder-soul:latest AS soul")
-command("IMPORT MESSAGE prompt:local/compact:latest AS compact")
-command("IMPORT TOOL tool:local/code-review:latest AS review")
-command("IMPORT TOOL tool:local/list-directory:latest AS list_dir")
-command("IMPORT TOOL tool:local/project-context:latest AS project_context")
-command("IMPORT TOOL tool:local/read-file:latest AS read_file")
-command("IMPORT TOOL tool:local/read-image:latest AS read_image")
-command("IMPORT TOOL tool:local/write-file:latest AS write_file")
-command("IMPORT TOOL tool:local/edit:latest AS edit")
-command("IMPORT TOOL tool:local/grep:latest AS grep")
-command("IMPORT TOOL tool:local/glob:latest AS glob")
-command("IMPORT TOOL tool:local/bash:latest AS bash")
-command("IMPORT TOOL tool:local/bash-exec:latest AS bash_exec")
-command("IMPORT TOOL tool:local/task-finish:latest AS task_finish")
-command("IMPORT TOOL tool:local/task-send:latest AS task_send")
-command("IMPORT TOOL tool:local/task-read:latest AS task_read")
-command("IMPORT SANDBOX sandbox:local/workspace-write:latest AS workspace_write")
-command("IMPORT SANDBOX sandbox:local/read-only:latest AS read_only")
+local initialized, initialization_error = pcall(function()
+    command("IMPORT MESSAGE prompt:local/coder-soul:latest AS soul")
+    command("IMPORT MESSAGE prompt:local/compact:latest AS compact")
+    command("IMPORT TOOL tool:local/code-review:latest AS review")
+    command("IMPORT TOOL tool:local/list-directory:latest AS list_dir")
+    command("IMPORT TOOL tool:local/project-context:latest AS project_context")
+    command("IMPORT TOOL tool:local/read-file:latest AS read_file")
+    command("IMPORT TOOL tool:local/read-image:latest AS read_image")
+    command("IMPORT TOOL tool:local/write-file:latest AS write_file")
+    command("IMPORT TOOL tool:local/edit:latest AS edit")
+    command("IMPORT TOOL tool:local/grep:latest AS grep")
+    command("IMPORT TOOL tool:local/glob:latest AS glob")
+    command("IMPORT TOOL tool:local/bash:latest AS bash")
+    command("IMPORT TOOL tool:local/bash-exec:latest AS bash_exec")
+    command("IMPORT TOOL tool:local/task-finish:latest AS task_finish")
+    command("IMPORT TOOL tool:local/task-send:latest AS task_send")
+    command("IMPORT TOOL tool:local/task-read:latest AS task_read")
+    command("IMPORT SANDBOX sandbox:local/workspace-write:latest AS workspace_write")
+    command("IMPORT SANDBOX sandbox:local/read-only:latest AS read_only")
 
-command("CREATE TEMP BLOCK msg (instructions, compact_prompt, compact_context)")
-command("CREATE TEMP BLOCK entry (pending)")
-command("CREATE BLOCK session (conversation)")
-command("INJECT soul TO msg.instructions")
-command("INJECT compact TO msg.compact_prompt")
-command("EFFECT sandbox_use ?", {settings().sandbox})
+    command("CREATE TEMP BLOCK msg (instructions, compact_prompt, compact_context)")
+    command("CREATE TEMP BLOCK entry (pending)")
+    command("CREATE BLOCK session (conversation)")
+    command("INJECT soul TO msg.instructions")
+    command("INJECT compact TO msg.compact_prompt")
+    command("EFFECT sandbox_use ?", {settings().sandbox})
+    command("EFFECT ready")
+end)
+if not initialized then
+    if type(initialization_error) == "table" and initialization_error.type == "error" then
+        error(initialization_error.message, 0)
+    end
+    error(initialization_error, 0)
+end
 
 local function inject_context(message)
     for _, item in ipairs(message.messages or {}) do
@@ -105,10 +122,15 @@ local function inject_context(message)
 end
 
 local pending_tool_results = 0
+local cleanup_pending = false
 
-command("EFFECT ready")
-
-while true do
+local function process_next()
+    -- A prior finish may have replied before background cleanup completed.
+    -- Retry only after a wake, before accepting another turn.
+    if cleanup_pending then
+        command("EFFECT finish_turn")
+        cleanup_pending = false
+    end
     local message = command("GET entry.pending[0]").Array.Message[1]
     if message then
         command("INJECT [] TO entry.pending[0,1]")
@@ -149,5 +171,33 @@ while true do
         end
     else
         wait()
+    end
+end
+
+-- Recovery commands are bounded: storage/finish failures must never recursively
+-- report themselves or bypass the host's real turn cleanup state.
+local function recover(failure)
+    pending_tool_results = 0
+    if failure.command ~= "EFFECT history_append ?" then
+        pcall(command, "EFFECT history_append ?", {{
+            {type = "error", message = failure.message, request_id = failure.request_id}
+        }})
+    end
+    if failure.command == "EFFECT finish_turn" then
+        cleanup_pending = true
+    else
+        local finished = pcall(command, "EFFECT finish_turn")
+        cleanup_pending = not finished
+    end
+    wait()
+end
+
+while true do
+    local ok, failure = pcall(process_next)
+    if not ok then
+        if type(failure) ~= "table" or failure.type ~= "error" then
+            failure = {type = "error", message = tostring(failure)}
+        end
+        recover(failure)
     end
 end

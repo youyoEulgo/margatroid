@@ -477,7 +477,11 @@ impl LuaHostFunction for MclHost {
         let events = self.events.clone();
         let vm_cancel = self.cancel.clone();
         Box::pin(async move {
-            let (text, parameters) = mcl_arguments(&instance, arguments)?;
+            let request_id = next_id("lua-mcl");
+            let (text, parameters) = match mcl_arguments(&instance, arguments) {
+                Ok(arguments) => arguments,
+                Err(error) => return mcl_error_value(&request_id, error),
+            };
             if vm_cancel.is_cancelled() || cancel.is_cancelled() {
                 return Err(failure(
                     LuaRuntimeErrorKind::Cancelled,
@@ -487,7 +491,7 @@ impl LuaHostFunction for MclHost {
             let command_cancel = vm_cancel.child_token();
             let (sender, receiver) = oneshot::channel();
             events.send_event(MclCommand {
-                id: next_id("lua-mcl"),
+                id: request_id.clone(),
                 source: instance.owner,
                 source_address,
                 source_instance: Some(instance.start_id),
@@ -503,8 +507,11 @@ impl LuaHostFunction for MclHost {
                 biased;
                 () = vm_cancel.cancelled() => { command_cancel.cancel(); return Err(failure(LuaRuntimeErrorKind::Cancelled, "MCL host cancelled")); },
                 () = cancel.cancelled() => { command_cancel.cancel(); return Err(failure(LuaRuntimeErrorKind::Cancelled, "MCL call cancelled")); },
-                result = receiver => result.map_err(|_| failure(LuaRuntimeErrorKind::Closed, "MCL reply was lost"))?
-                    .map_err(|error| failure(LuaRuntimeErrorKind::ExecutionFailed, error.to_string()))?,
+                result = receiver => match result {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => return mcl_error_value(&request_id, error),
+                    Err(_) => return mcl_error_value(&request_id, failure(LuaRuntimeErrorKind::Closed, "MCL reply was lost")),
+                },
             };
             if matches!(value, MclValue::Unit) {
                 return Ok(LuaValue::Nil);
@@ -515,6 +522,19 @@ impl LuaHostFunction for MclHost {
             LuaValue::from_json(value)
         })
     }
+}
+
+fn mcl_error_value(
+    request_id: &str,
+    error: impl std::fmt::Display,
+) -> Result<LuaValue, LuaRuntimeError> {
+    let value = MclValue::Error(serde_json::json!({
+        "type": "error", "message": error.to_string(), "request_id": request_id,
+    }));
+    LuaValue::from_json(
+        serde_json::to_value(value)
+            .map_err(|error| failure(LuaRuntimeErrorKind::ExecutionFailed, error.to_string()))?,
+    )
 }
 
 fn mcl_arguments(
@@ -648,10 +668,7 @@ async fn execute_lua(
     let mcl: Arc<dyn LuaHostFunction> = Arc::new(mcl_host);
     let wait: Arc<dyn LuaHostFunction> = Arc::new(WaitHost { slot: wake });
     lua.globals()
-        .set(
-            "mcl",
-            binding_value(&lua, LuaBinding::Function(mcl), &cancel)?,
-        )
+        .set("mcl", host_function_value(&lua, mcl, &cancel, true)?)
         .map_err(lua_error)?;
     lua.globals()
         .set(
@@ -685,25 +702,42 @@ fn binding_value(
 ) -> Result<MlValue, LuaRuntimeError> {
     match binding {
         LuaBinding::Value(value) => to_ml_value(lua, value),
-        LuaBinding::Function(function) => {
-            let cancel = cancel.clone();
-            let callback = lua.create_async_function(move |lua, arguments: mlua::MultiValue| {
-                let function = function.clone();
-                let cancel = cancel.clone();
-                async move {
-                    let mut seen = HashSet::new();
-                    let arguments = arguments.into_iter().map(|value| from_ml_value(value, &mut seen, 0)).collect::<Result<_, _>>().map_err(mlua::Error::external)?;
-                    let value = tokio::select! {
-                        biased;
-                        () = cancel.cancelled() => return Err(mlua::Error::external(failure(LuaRuntimeErrorKind::Cancelled, "Lua host cancelled"))),
-                        result = function.call(arguments, cancel.clone()) => result.map_err(mlua::Error::external)?,
-                    };
-                    to_ml_value(&lua, value).map_err(mlua::Error::external)
-                }
-            }).map_err(lua_error)?;
-            Ok(MlValue::Function(callback))
-        }
+        LuaBinding::Function(function) => host_function_value(lua, function, cancel, false),
     }
+}
+
+fn host_function_value(
+    lua: &Lua,
+    function: Arc<dyn LuaHostFunction>,
+    cancel: &CancellationToken,
+    error_values: bool,
+) -> Result<MlValue, LuaRuntimeError> {
+    let cancel = cancel.clone();
+    let callback = lua.create_async_function(move |lua, arguments: mlua::MultiValue| {
+        let function = function.clone();
+        let cancel = cancel.clone();
+        async move {
+            let mut seen = HashSet::new();
+            let arguments = arguments.into_iter().map(|value| from_ml_value(value, &mut seen, 0)).collect::<Result<_, _>>();
+            let result = match arguments {
+                Ok(arguments) => tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => Err(failure(LuaRuntimeErrorKind::Cancelled, "Lua host cancelled")),
+                    result = function.call(arguments, cancel.clone()) => result,
+                },
+                Err(error) => Err(error),
+            };
+            let value = match result {
+                Ok(value) => value,
+                Err(error) if error_values && error.kind != LuaRuntimeErrorKind::Cancelled => {
+                    mcl_error_value(&next_id("lua-mcl"), error).map_err(mlua::Error::external)?
+                }
+                Err(error) => return Err(mlua::Error::external(error)),
+            };
+            to_ml_value(&lua, value).map_err(mlua::Error::external)
+        }
+    }).map_err(lua_error)?;
+    Ok(MlValue::Function(callback))
 }
 
 fn to_ml_value(lua: &Lua, value: LuaValue) -> Result<MlValue, LuaRuntimeError> {

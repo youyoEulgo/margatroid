@@ -25,7 +25,7 @@ use storage_core::{
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use tool_core::{ToolErrorKind, ToolExecuteRequest};
+use tool_core::ToolExecuteRequest;
 use tool_resource_core::{ImportTool, Tools};
 
 fn error(kind: MclErrorKind, message: impl Into<String>) -> MclError {
@@ -34,7 +34,14 @@ fn error(kind: MclErrorKind, message: impl Into<String>) -> MclError {
 
 fn respond(request: &MclCommand, result: Result<MclValue, MclError>) {
     if let Some(sender) = lock(&request.reply).take() {
-        let _ = sender.send(result);
+        let result = result.unwrap_or_else(|failed| {
+            MclValue::Error(json!({
+                "type": "error",
+                "message": failed.to_string(),
+                "request_id": request.id,
+            }))
+        });
+        let _ = sender.send(Ok(result));
     }
 }
 
@@ -246,11 +253,20 @@ async fn execute_command(context: CommandContext) -> Result<CommandOutput, Comma
             result = &mut operation => result,
         };
         let audit = storage(&context, StorageOperation::AppendHistory { records: vec![storage_core::HistoryRecord {
-            source: request.source_address.clone(),
+            source: Some(request.source_address.clone()),
             turn: context.turn.clone(), kind: "mcl".into(), content: request.instruction.text.clone(),
             payload: json!({"id": request.id, "source_instance": request.source_instance, "text": request.instruction.text, "arguments": request.instruction.arguments, "succeeded": result.is_ok(), "error": result.as_ref().err()}), created_at_ms: None,
         }] }, CancellationToken::new()).await;
-        match audit { Ok(_) => result, Err(audit) => Err(audit) }
+        match audit {
+            Ok(_) => result,
+            Err(audit) => Err(error(audit.kind, format!(
+                "MCL audit persistence failed after execution; side effects may already have occurred; execution outcome: {}; audit error: {audit}",
+                match &result {
+                    Ok(_) => "succeeded".to_owned(),
+                    Err(failed) => format!("failed ({failed})"),
+                }
+            ))),
+        }
     }).catch_unwind().await.unwrap_or_else(|_| Err(error(MclErrorKind::CleanupFailed, "MCL execution panicked; cleanup could not be confirmed")));
     match outcome {
         Ok(value) => Ok(CommandOutput { request, value }),
@@ -493,6 +509,45 @@ async fn effect_messages(
     }
 }
 
+// Tool execution validates identities and arguments per call in executable_calls.
+// Reading and alias failures remain ordinary MCL errors at this stage.
+async fn tool_effect_messages(
+    context: &CommandContext,
+    parameter: EffectParameter,
+) -> Result<Vec<Value>, MclError> {
+    match parameter {
+        EffectParameter::Manual(index) => context
+            .request
+            .instruction
+            .arguments
+            .get(index)
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                error(
+                    MclErrorKind::InvalidMessage,
+                    "message parameter must be a complete message array",
+                )
+            }),
+        EffectParameter::Expression(expression) => {
+            let sources = prepare_sources(context, expression).await?;
+            match storage(
+                context,
+                StorageOperation::ReadMessageSources { sources },
+                context.cancel.clone(),
+            )
+            .await?
+            {
+                StorageValue::Messages(messages) => Ok(messages),
+                _ => Err(error(
+                    MclErrorKind::StorageFailed,
+                    "storage did not return messages",
+                )),
+            }
+        }
+    }
+}
+
 fn alias_parameter(
     context: &CommandContext,
     parameter: EffectParameter,
@@ -712,7 +767,7 @@ async fn execute_effect(
             execute_inference(context, messages, tools).await
         }
         "tool_call" => {
-            let messages = effect_messages(context, arguments.next().unwrap()).await?;
+            let messages = tool_effect_messages(context, arguments.next().unwrap()).await?;
             let tools = alias_parameter(context, arguments.next().unwrap())?;
             execute_tools(context, messages, tools).await
         }
@@ -721,7 +776,7 @@ async fn execute_effect(
             let records = messages
                 .into_iter()
                 .map(|message| storage_core::HistoryRecord {
-                    source: context.request.source_address.clone(),
+                    source: None,
                     turn: context.turn.clone(),
                     kind: "message".into(),
                     content: message
@@ -814,47 +869,31 @@ async fn execute_effect(
 }
 
 async fn finish_turn(context: &CommandContext) -> Result<MclValue, MclError> {
-    loop {
-        let request = context.request.clone();
-        let cancel = context.cancel.clone();
-        let expected_turn = context.turn.clone();
-        let finished = in_world(&context.world, move |world| {
-            check_action(world, &request, &cancel)?;
-            let agent = world.get_component::<Agent>(request.target).unwrap();
-            if agent.state != AgentState::Working
-                || agent
-                    .turn
-                    .as_ref()
-                    .is_some_and(|turn| Some(turn) != expected_turn.as_ref())
-            {
-                return Err(error(
-                    MclErrorKind::EffectFailed,
-                    "turn changed before finish_turn",
-                ));
-            }
-            if world
-                .get_component::<ActiveInference>(request.target)
-                .and_then(|active| active.current.as_ref())
-                .is_some_and(|handle| !handle.is_finished())
-            {
-                return Ok(false);
-            }
-            if let Some(active) = world.get_component_mut::<ActiveInference>(request.target) {
-                active.current.take();
-            }
-            world
-                .agent_finish_turn(
-                    request.target,
-                    expected_turn.as_deref().unwrap_or(request.id.as_str()),
-                )
-                .map_err(|failed| error(MclErrorKind::EffectFailed, failed.to_string()))?;
-            Ok(true)
-        })
-        .await?;
-        if finished {
-            return Ok(MclValue::Unit);
+    let request = context.request.clone();
+    let cancel = context.cancel.clone();
+    let expected_turn = context.turn.clone();
+    in_world(&context.world, move |world| {
+        check_action(world, &request, &cancel)?;
+        let agent = world.get_component::<Agent>(request.target).unwrap();
+        if agent.state != AgentState::Working
+            || agent.turn.as_ref().is_some_and(|turn| Some(turn) != expected_turn.as_ref())
+        {
+            return Err(error(MclErrorKind::EffectFailed, "turn changed before finish_turn"));
         }
-    }
+        if world.get_component::<ActiveInference>(request.target)
+            .and_then(|active| active.current.as_ref())
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return Err(error(MclErrorKind::EffectFailed,
+                "inference task is still running; finish_turn may be retried after cleanup completes"));
+        }
+        if let Some(active) = world.get_component_mut::<ActiveInference>(request.target) {
+            active.current.take();
+        }
+        world.agent_finish_turn(request.target, expected_turn.as_deref().unwrap_or(request.id.as_str()))
+            .map_err(|failed| error(MclErrorKind::EffectFailed, failed.to_string()))?;
+        Ok(MclValue::Unit)
+    }).await
 }
 
 async fn execute_inference(
@@ -924,16 +963,7 @@ async fn execute_inference(
             .map_err(|_| error(MclErrorKind::CleanupFailed, "inference reply was lost"))?
         {
             Ok(response) => response,
-            Err(failed) => {
-                return Ok(MclValue::Inference {
-                    message: json!({
-                        "type": "error",
-                        "message": failed.to_string(),
-                        "request_id": context.request.id,
-                    }),
-                    stop_reason: "error".into(),
-                });
-            }
+            Err(failed) => return Err(error(MclErrorKind::EffectFailed, failed.to_string())),
         },
     };
     inference_result(response, &context.request.id)
@@ -972,7 +1002,7 @@ async fn execute_tools(
             "tool_call expects an Assistant message",
         ));
     }
-    let calls = assistant_calls(message)?;
+    let calls = executable_calls(message)?;
     let request = context.request.clone();
     let cancel = context.cancel.clone();
     let expected_turn = context.turn.clone();
@@ -990,7 +1020,11 @@ async fn execute_tools(
             && agent.turn == expected_turn;
         let visible = tools.into_iter().collect::<BTreeSet<_>>();
         let mut pending = Vec::new();
-        for (index, call) in calls.into_iter().enumerate() {
+        for (index, (call, failed)) in calls.into_iter().enumerate() {
+            if let Some(failed) = failed {
+                pending.push((call, None, Some(failed)));
+                continue;
+            }
             if !active_turn {
                 pending.push((call, None, Some("Tool call aborted.".to_owned())));
                 continue;
@@ -1019,55 +1053,32 @@ async fn execute_tools(
     })
     .await?;
     let mut results = Vec::new();
-    let mut failure = None;
     for (call, receiver, fallback) in pending {
         if let Some(content) = fallback {
             results.push(tool_message(&call, content, Vec::new(), true));
             continue;
         }
-        match receiver.unwrap().await {
+        let message = match receiver.unwrap().await {
             Ok(Ok(response)) => {
                 if (!response.call_id.is_empty() && response.call_id != call.id)
                     || (!response.alias.is_empty() && response.alias != call.name)
                 {
-                    failure.get_or_insert_with(|| {
-                        error(
-                            MclErrorKind::EffectFailed,
-                            "tool response association does not match request",
-                        )
-                    });
-                } else {
-                    results.push(tool_message(
+                    tool_message(
                         &call,
-                        response.content,
-                        response.images,
-                        response.failed,
-                    ));
+                        "tool response association does not match request".into(),
+                        Vec::new(),
+                        true,
+                    )
+                } else {
+                    tool_message(&call, response.content, response.images, response.failed)
                 }
             }
-            Ok(Err(failed)) => {
-                let kind = if matches!(
-                    failed.kind,
-                    ToolErrorKind::CleanupFailed | ToolErrorKind::TaskPanicked
-                ) {
-                    MclErrorKind::CleanupFailed
-                } else {
-                    MclErrorKind::EffectFailed
-                };
-                failure.get_or_insert_with(|| error(kind, failed.to_string()));
-            }
-            Err(_) => {
-                failure.get_or_insert_with(|| {
-                    error(MclErrorKind::CleanupFailed, "tool call reply was lost")
-                });
-            }
-        }
+            Ok(Err(failed)) => tool_message(&call, failed.to_string(), Vec::new(), true),
+            Err(_) => tool_message(&call, "tool call reply was lost".into(), Vec::new(), true),
+        };
+        results.push(message);
     }
-    if let Some(error) = failure {
-        Err(error)
-    } else {
-        Ok(MclValue::Array(MessageArray::Message(results)))
-    }
+    Ok(MclValue::Array(MessageArray::Message(results)))
 }
 
 fn tool_message(
@@ -1077,6 +1088,54 @@ fn tool_message(
     failed: bool,
 ) -> Value {
     json!({"type": "tool_call", "tool_call_id": call.id, "tool_name": call.name, "content": content, "images": images, "failed": failed})
+}
+
+// Validate the entire batch's identities before dispatching any side effects.
+// Once a call is identifiable, malformed arguments belong to its failed tool reply.
+fn executable_calls(message: &Value) -> Result<Vec<(InferenceToolCall, Option<String>)>, MclError> {
+    let calls = match message.get("tool_calls") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(calls)) => calls,
+        _ => {
+            return Err(error(
+                MclErrorKind::InvalidMessage,
+                "Assistant tool_calls must be an array",
+            ));
+        }
+    };
+    let mut unique = BTreeSet::new();
+    let mut parsed = Vec::new();
+    for call in calls {
+        let id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| error(MclErrorKind::InvalidMessage, "tool call id is missing"))?;
+        if !unique.insert(id) {
+            return Err(error(
+                MclErrorKind::InvalidMessage,
+                "duplicate tool call id",
+            ));
+        }
+        let name = call
+            .get("tool_name")
+            .or_else(|| call.get("name"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| error(MclErrorKind::InvalidMessage, "tool call name is missing"))?;
+        match assistant_calls(&json!({"tool_calls": [call]})) {
+            Ok(mut calls) => parsed.push((calls.remove(0), None)),
+            Err(failed) => parsed.push((
+                InferenceToolCall {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    arguments: Value::Null,
+                },
+                Some(failed.to_string()),
+            )),
+        }
+    }
+    Ok(parsed)
 }
 
 fn assistant_calls(message: &Value) -> Result<Vec<InferenceToolCall>, MclError> {

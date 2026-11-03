@@ -4,7 +4,7 @@ use closure_plugin::{AppClosureExt, ClosurePlugin};
 use core_plugin::{App, Entity, World};
 use lua_runtime_core::*;
 use lua_runtime_plugin::LuaRuntimePlugin;
-use mcl_core::{MclCommand, MclValue, MessageArray};
+use mcl_core::{MclCommand, MclError, MclErrorKind, MclValue, MessageArray};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -70,6 +70,21 @@ impl Fixture {
                 if command.instruction.text == "HOLD" {
                     continue;
                 }
+                if command.instruction.text == "LOST_REPLY" {
+                    drop(command.reply.lock().unwrap().take());
+                    continue;
+                }
+                if matches!(command.instruction.text.as_str(), "REJECT" | "CANCEL_CALL") {
+                    if let Some(sender) = command.reply.lock().unwrap().take() {
+                        let kind = if command.instruction.text == "CANCEL_CALL" {
+                            MclErrorKind::Cancelled
+                        } else {
+                            MclErrorKind::EffectFailed
+                        };
+                        let _ = sender.send(Err(MclError::new(kind, "business failure")));
+                    }
+                    continue;
+                }
                 if command.instruction.text == "EFFECT ready" {
                     world
                         .driver_ready(&DriverLuaVmInstance {
@@ -78,7 +93,9 @@ impl Fixture {
                         })
                         .unwrap();
                 }
-                let value = if command.instruction.text == "ECHO" {
+                let value = if command.instruction.text == "ERROR_VALUE" {
+                    MclValue::Error(json!({"type": "error", "message": "normalized failure", "request_id": command.id}))
+                } else if command.instruction.text == "ECHO" {
                     MclValue::Array(MessageArray::Message(command.instruction.arguments))
                 } else {
                     MclValue::Unit
@@ -501,7 +518,7 @@ async fn host_bridge_preserves_empty_arrays_nulls_and_rejects_mixed_sparse_cycli
 #[tokio::test]
 async fn mcl_host_passes_json_parameters_and_rejects_foreign_entity_targets() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
-    let instance = fixture.start("local result = mcl(agent_info.entity, 'ECHO', {{value=42}, {}}); assert(result.Array.Message[1].value == 42); assert(not pcall(mcl, {index=999,generation=0}, 'ECHO')); mcl('EFFECT ready'); wait()").await.unwrap();
+    let instance = fixture.start("local result = mcl(agent_info.entity, 'ECHO', {{value=42}, {}}); assert(result.Array.Message[1].value == 42); assert(mcl({index=999,generation=0}, 'ECHO').Error.type == 'error'); mcl('EFFECT ready'); wait()").await.unwrap();
     let records = fixture.commands.lock().unwrap().clone();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].arguments, [json!({"value": 42}), json!({})]);
@@ -581,6 +598,40 @@ async fn duplicate_start_is_rejected_and_original_instance_remains() {
         fixture.start("return").await.unwrap_err().kind,
         LuaRuntimeErrorKind::InvalidRequest
     );
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get_component::<DriverLuaVm>(fixture.owner)
+            .unwrap()
+            .instance,
+        instance
+    );
+    fixture.stop(instance).await.unwrap();
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn mcl_failures_are_values_and_same_vm_continues_until_explicit_stop() {
+    let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    let instance = fixture.start(r#"
+        for _, instruction in ipairs({'REJECT', 'CANCEL_CALL', 'LOST_REPLY', 'ERROR_VALUE'}) do
+            local ok, result = pcall(mcl, instruction)
+            assert(ok and result.Error.type == 'error')
+            assert(type(result.Error.request_id) == 'string')
+            assert(type(result.Error.message) == 'string')
+        end
+        for _, arguments in ipairs({{}, {''}, {true}, {'ECHO', {[2]=true}}, {'ECHO', function() end}}) do
+            local ok, result = pcall(mcl, arguments[1], arguments[2])
+            assert(ok and result.Error.type == 'error')
+        end
+        local cycle = {}; cycle.self = cycle
+        assert(mcl('ECHO', cycle).Error.type == 'error')
+        assert(mcl('ECHO', {{after_error=true}}).Array.Message[1].after_error)
+        mcl('EFFECT ready')
+        while true do wait() end
+    "#).await.unwrap();
+    assert!(fixture.exits.lock().unwrap().is_empty());
     assert_eq!(
         fixture
             .app

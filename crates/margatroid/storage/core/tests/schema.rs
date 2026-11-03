@@ -20,7 +20,20 @@ fn new_database_contains_only_current_three_tables_and_reopens() {
             .unwrap(),
         2
     );
-    for table in ["agent_messages", "mcl_records"] {
+    for (table, identity_columns, insert_columns, identity_values) in [
+        (
+            "agent_messages",
+            [("turn", 0, 0), ("type", 1, 0)],
+            "turn,type",
+            "NULL,'user'",
+        ),
+        (
+            "mcl_records",
+            [("source", 1, 0), ("turn", 0, 0)],
+            "source,turn",
+            "'source',NULL",
+        ),
+    ] {
         let columns: Vec<(String, i64, i64)> = db
             .prepare(&format!("PRAGMA table_info({table})"))
             .unwrap()
@@ -32,22 +45,36 @@ fn new_database_contains_only_current_three_tables_and_reopens() {
             columns,
             vec![
                 ("sequence".into(), 0, 1),
-                ("source".into(), 1, 0),
-                ("turn".into(), 0, 0),
+                (
+                    identity_columns[0].0.into(),
+                    identity_columns[0].1,
+                    identity_columns[0].2
+                ),
+                (
+                    identity_columns[1].0.into(),
+                    identity_columns[1].1,
+                    identity_columns[1].2
+                ),
                 ("content".into(), 1, 0),
                 ("payload".into(), 1, 0),
                 ("created_at_ms".into(), 1, 0),
             ]
         );
-        for values in [
-            "NULL,NULL,'body','{}',0",
-            "'',NULL,'body','{}',0",
-            "'source',NULL,NULL,'{}',0",
-            "'source',NULL,'body',NULL,0",
-            "'source',NULL,'body','{}',NULL",
-            "'source',NULL,'body','{}',-1",
+        for body in [
+            "NULL,'{}',0",
+            "'body',NULL,0",
+            "'body','{}',NULL",
+            "'body','{}',-1",
         ] {
-            assert!(db.execute(&format!("INSERT INTO {table}(source,turn,content,payload,created_at_ms) VALUES({values})"), []).is_err());
+            assert!(db.execute(&format!("INSERT INTO {table}({insert_columns},content,payload,created_at_ms) VALUES({identity_values},{body})"), []).is_err());
+        }
+        let identity = if table == "agent_messages" {
+            "type"
+        } else {
+            "source"
+        };
+        for value in ["NULL", "''"] {
+            assert!(db.execute(&format!("INSERT INTO {table}({identity},content,payload,created_at_ms) VALUES({value},'body','{{}}',0)"), []).is_err());
         }
     }
     drop(db);

@@ -74,7 +74,7 @@ MclQueue：目标Entity的命令队列，公开组件
 MclCommand：命令请求，公开事件
     id: String
     source: Entity--由网络或Driver宿主绑定的真实来源
-    source_address: String--调用入口必需显式提供自身真实地址；校验与source一致，历史source不记录Entity编号
+    source_address: String--调用入口必需显式提供自身真实地址；校验与source一致，MCL审计source不记录Entity编号；history_append消息无source
     source_instance: Option<String>--Driver来源为本次start_id，客户端为None；不引用Lua core类型
     target: Entity
     instruction: MclInstruction
@@ -198,8 +198,9 @@ EffectParameter：效果参数，公开枚举
     Expression(MessageExpression)
     Manual(usize)
 
-MclValue：命令成功值，公开枚举
+MclValue：命令返回值，公开枚举
     Unit
+    Error(serde_json::Value)--type=error、message及request_id；唯一回复出口将非工具错误转换为此值
     Array { Message: Vec<serde_json::Value> }
     Config(toml::Table)
     Inference { message: serde_json::Value, stop_reason: String }

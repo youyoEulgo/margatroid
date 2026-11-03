@@ -338,9 +338,12 @@ pub struct AgentHistoryDto {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryMessageDto {
-    pub source: String,
     pub sequence: u64,
     pub turn: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub message_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub kind: String,
     pub content: String,
     pub payload: Value,

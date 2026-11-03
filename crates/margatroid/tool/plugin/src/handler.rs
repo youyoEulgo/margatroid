@@ -20,8 +20,8 @@ use tokio::io::{
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tool_core::{
-    parse_tool_result, InitToolTasks, ToolError, ToolErrorKind as Kind, ToolExecuteRequest,
-    ToolExecutionLimits, ToolTaskHandle, ToolTasks,
+    parse_tool_result, InitToolTasks, ToolConfiguration, ToolError, ToolErrorKind as Kind,
+    ToolExecuteRequest, ToolExecutionLimits, ToolTaskHandle, ToolTasks,
 };
 use tool_resource_core::{read_tool, ToolReadLimits, Tools};
 use workspace_core::Workspace;
@@ -153,6 +153,7 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         project_root,
         runner_path: config.runner_path,
         limits: config.limits,
+        configuration: None,
         handle: handle.clone(),
         tasks,
         input,
@@ -199,7 +200,6 @@ fn complete_reply(
 
 async fn supervise_tool(mut context: ToolExecutionContext) {
     let handle = context.handle.clone();
-    let started = tokio::time::Instant::now();
     let result = std::panic::AssertUnwindSafe(async {
         let tool_path = context.tool_path.clone();
         let sandbox_path = context.sandbox_path.clone();
@@ -250,18 +250,6 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
                     "tool temporary directory creation failed",
                 )
             })?;
-        let mut limits = context.limits.clone();
-        if let Some(timeout) = limits.execution_timeout {
-            let remaining = timeout.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                return Err(error(
-                    Kind::Timeout,
-                    "tool preparation exhausted execution deadline",
-                ));
-            }
-            limits.execution_timeout = Some(remaining);
-            limits.host_call_timeout = limits.host_call_timeout.min(remaining);
-        }
         let request = RunnerRequest {
             protocol_version: 1,
             program: tool.program,
@@ -273,9 +261,13 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
                 project_root: context.project_root.clone(),
                 temp_dir: temporary.path().to_owned(),
             },
-            limits,
+            limits: context.limits.clone(),
         };
         let result = run_runner(&mut context, request, policy).await;
+        if let Err(failure) = &result {
+            complete_reply(&mut context, Err(failure.clone()));
+            context.handle.set_error(failure.clone());
+        }
         let temporary_path = temporary.path().to_owned();
         if temporary.close().is_err() {
             loop {
@@ -527,21 +519,14 @@ async fn host_frame(
                     "self finish must remain worker-local",
                 ));
             }
-            let result = tokio::time::timeout(
-                context.limits.host_call_timeout,
-                context.tasks.finish(&task_id),
-            )
-            .await
-            .map_err(|_| error(Kind::Timeout, "task finish host call timed out"))
-            .and_then(|result| result)
-            .map(|()| Value::Null);
+            let result = context.tasks.finish(&task_id).await.map(|()| Value::Null);
             (request_id, result)
         }
         _ => {
             return Err(error(
                 Kind::RunnerProtocolFailed,
                 "invalid worker host request",
-            ))
+            ));
         }
     };
     Ok(HostFrame::Response { request_id, result })
@@ -553,7 +538,6 @@ async fn run_runner(
     policy: Option<Value>,
 ) -> Result<(), ToolError> {
     let maximum = wire_limit(&request.limits);
-    let execution_timeout = request.limits.execution_timeout;
     let cancel = context.handle.cancel_token();
     let mut command = tokio::process::Command::new(&context.runner_path);
     command.arg("--margatroid-tool-supervisor");
@@ -600,7 +584,7 @@ async fn run_runner(
         Ok(child) => child,
         Err(_) => {
             if let Some(boundary) = boundary {
-                boundary.cleanup(request.limits.cleanup_timeout).await?;
+                boundary.cleanup().await?;
             }
             return Err(error(
                 Kind::RunnerStartFailed,
@@ -638,6 +622,7 @@ async fn run_runner(
             .await
             .map_err(|_| error(Kind::RunnerProtocolFailed, "runner stdin shutdown failed"))
     });
+    let lifetime = context.handle.clone();
     let mut proven = false;
     let mut result = {
         let exchange = async {
@@ -647,16 +632,28 @@ async fn run_runner(
                     frame = read_json::<RunnerWire, _>(&mut stdout, maximum) => {
                         let frame = frame?.ok_or_else(|| error(Kind::RunnerProtocolFailed, "runner exited without cleanup proof"))?;
                         if frame.protocol_version != 1 { return Err(error(Kind::RunnerProtocolFailed, "runner protocol version mismatch")); }
+                        if let RunnerFrame::Configured { configuration } = frame.frame {
+                            if context.configuration.is_some() { return Err(error(Kind::RunnerProtocolFailed, "duplicate tool configuration")); }
+                            context.handle.configure_lifetime(configuration.timeout_ms)?;
+                            context.configuration = Some(configuration);
+                            host.send(HostFrame::Configured).await.map_err(|_| error(Kind::RunnerProtocolFailed, "configuration acknowledgement failed"))?;
+                            continue;
+                        }
                         if matches!(frame.frame, RunnerFrame::InputConsumed) { input_ready = true; continue; }
                         if let RunnerFrame::Stopped { result, cleanup_proven } = frame.frame {
                             if cleanup_proven { proven = true; return result; }
+                            if let Err(failure) = result {
+                                complete_reply(context, Err(failure.clone()));
+                                context.handle.set_error(failure);
+                            }
                             record_cleanup_failure(context, "supervisor descendant cleanup incomplete");
                             continue;
                         }
+                        if context.configuration.is_none() { return Err(error(Kind::RunnerProtocolFailed, "worker request before configuration")); }
                         let response = host_frame(context, frame.frame).await?;
                         host.send(response).await.map_err(|_| error(Kind::RunnerProtocolFailed, "runner input closed"))?;
                     }
-                    value = context.input.recv(), if input_ready => {
+                    value = context.input.recv(), if input_ready && context.configuration.is_some() => {
                         let Some(value) = value else { return Err(error(Kind::InputClosed, "task input channel closed")); };
                         host.send(HostFrame::Input { value }).await.map_err(|_| error(Kind::RunnerProtocolFailed, "runner input closed"))?;
                         input_ready = false;
@@ -667,24 +664,39 @@ async fn run_runner(
         tokio::pin!(exchange);
         tokio::select! {
             biased;
+            () = lifetime.lifetime_expired() => {
+                lifetime.cancel();
+                Err(error(Kind::Timeout, "tool task lifetime exceeded"))
+            },
             () = cancel.cancelled() => Err(error(Kind::Cancelled, "tool task cancellation requested")),
             () = overflow.cancelled() => Err(error(Kind::OutputTooLarge, "runner diagnostic budget exceeded")),
-            () = wait_execution_timeout(execution_timeout) => Err(error(Kind::Timeout, "tool task execution deadline exceeded")),
             result = &mut exchange => result,
         }
     };
+    if let Err(failure) = &result {
+        complete_reply(context, Err(failure.clone()));
+        context.handle.set_error(failure.clone());
+    }
     if !proven {
         signal_runner(pid);
+        if result
+            .as_ref()
+            .is_err_and(|failure| failure.kind != Kind::Cancelled)
+        {
+            record_cleanup_failure(context, "runner cleanup pending; supervision retained");
+        }
         loop {
             let cleanup = async {
                 while let Some(frame) = read_json::<RunnerWire, _>(&mut stdout, maximum).await? {
                     if frame.protocol_version == 1 {
-                        if let RunnerFrame::Stopped {
-                            cleanup_proven: true,
-                            ..
-                        } = frame.frame
-                        {
-                            return Ok::<_, ToolError>(());
+                        if let RunnerFrame::Stopped { cleanup_proven, .. } = frame.frame {
+                            if cleanup_proven {
+                                return Ok::<_, ToolError>(());
+                            }
+                            record_cleanup_failure(
+                                context,
+                                "supervisor descendant cleanup incomplete",
+                            );
                         }
                     }
                 }
@@ -693,8 +705,8 @@ async fn run_runner(
                     "runner did not prove descendant cleanup",
                 ))
             };
-            match tokio::time::timeout(context.limits.cleanup_timeout, cleanup).await {
-                Ok(Ok(())) => {
+            match cleanup.await {
+                Ok(()) => {
                     proven = true;
                     break;
                 }
@@ -705,11 +717,7 @@ async fn run_runner(
                     );
                     signal_runner(pid);
                     if let Some(boundary) = &boundary {
-                        if boundary
-                            .cleanup(context.limits.cleanup_timeout)
-                            .await
-                            .is_ok()
-                        {
+                        if boundary.cleanup().await.is_ok() {
                             proven = true;
                             break;
                         }
@@ -720,12 +728,10 @@ async fn run_runner(
         }
     }
     drop(host);
-    while tokio::time::timeout(context.limits.cleanup_timeout, child.wait())
-        .await
-        .is_err()
-    {
+    while child.wait().await.is_err() {
         record_cleanup_failure(context, "runner has not exited; supervision retained");
         signal_runner(pid);
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let writer_result = writer
         .await
@@ -736,11 +742,7 @@ async fn run_runner(
     writer_result?;
     diagnostic_result?;
     if let Some(boundary) = &boundary {
-        while boundary
-            .cleanup(context.limits.cleanup_timeout)
-            .await
-            .is_err()
-        {
+        while boundary.cleanup().await.is_err() {
             record_cleanup_failure(context, "cgroup cleanup incomplete; supervision retained");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -774,14 +776,13 @@ impl CgroupBoundary {
             .map_err(|_| error(Kind::SandboxUnavailable, "cgroup creation failed"))?;
         Ok(Some(Self { path }))
     }
-    pub(crate) async fn cleanup(&self, timeout: Duration) -> Result<(), ToolError> {
+    pub(crate) async fn cleanup(&self) -> Result<(), ToolError> {
         if !self.path.exists() {
             return Ok(());
         }
         tokio::fs::write(self.path.join("cgroup.kill"), "1")
             .await
             .map_err(|_| error(Kind::CleanupFailed, "cgroup kill failed"))?;
-        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let events = tokio::fs::read_to_string(self.path.join("cgroup.events"))
                 .await
@@ -790,9 +791,6 @@ impl CgroupBoundary {
                 return tokio::fs::remove_dir(&self.path)
                     .await
                     .map_err(|_| error(Kind::CleanupFailed, "cgroup removal failed"));
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(error(Kind::CleanupFailed, "cgroup remains populated"));
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -817,7 +815,7 @@ fn descendants() -> std::io::Result<Vec<i32>> {
                 if error.kind() == std::io::ErrorKind::NotFound
                     || error.raw_os_error() == Some(nix::libc::ESRCH) =>
             {
-                continue
+                continue;
             }
             Err(error) => return Err(error),
         };
@@ -854,8 +852,7 @@ fn descendants() -> std::io::Result<Vec<i32>> {
         .collect())
 }
 #[cfg(target_os = "linux")]
-async fn cleanup_descendants(timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
+async fn cleanup_descendants() -> bool {
     loop {
         let children = match descendants() {
             Ok(children) => children,
@@ -881,9 +878,6 @@ async fn cleanup_descendants(timeout: Duration) -> bool {
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(_) => return false,
             }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -962,6 +956,7 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
     let mut output = tokio::io::stdout();
+    let mut configuration: Option<ToolConfiguration> = None;
     let result = match command.spawn() {
         Err(_) => Err(error(
             Kind::RunnerStartFailed,
@@ -973,20 +968,33 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
                 BufReader::new(worker.stdout.take().expect("worker stdout piped"));
             let exchange = async {
                 write_json(&mut worker_input, &request, maximum).await?;
+                let mut acknowledged = false;
                 loop {
                     tokio::select! {
                         frame = read_json::<RunnerWire, _>(&mut worker_output, maximum) => {
                             let frame = frame?.ok_or_else(|| error(Kind::ExecutionFailed, "worker exited without terminal frame"))?;
                             if frame.protocol_version != 1 { return Err(error(Kind::RunnerProtocolFailed, "worker protocol version mismatch")); }
                             match frame.frame {
+                                RunnerFrame::Configured { configuration: value } => {
+                                    if configuration.is_some() { return Err(error(Kind::RunnerProtocolFailed, "duplicate worker configuration")); }
+                                    value.validate()?;
+                                    configuration = Some(value);
+                                    write_json(&mut output, &frame, maximum).await?;
+                                }
                                 RunnerFrame::Done { result } => return result,
                                 RunnerFrame::Stopped { .. } => return Err(error(Kind::RunnerProtocolFailed, "worker cannot claim descendant cleanup")),
-                                _ => write_json(&mut output, &frame, maximum).await?,
+                                _ if acknowledged => write_json(&mut output, &frame, maximum).await?,
+                                _ => return Err(error(Kind::RunnerProtocolFailed, "worker request before configuration acknowledgement")),
                             }
                         }
                         frame = read_json::<HostWire, _>(&mut input, maximum) => {
                             let frame = frame?.ok_or_else(|| error(Kind::Cancelled, "supervisor host input closed"))?;
                             if frame.protocol_version != 1 { return Err(error(Kind::RunnerProtocolFailed, "host protocol version mismatch")); }
+                            if matches!(frame.frame, HostFrame::Configured) {
+                                if acknowledged { return Err(error(Kind::RunnerProtocolFailed, "duplicate configuration acknowledgement")); }
+                                configuration.ok_or_else(|| error(Kind::RunnerProtocolFailed, "configuration acknowledgement before configuration"))?;
+                                acknowledged = true;
+                            } else if !acknowledged { return Err(error(Kind::RunnerProtocolFailed, "host frame before configuration acknowledgement")); }
                             write_json(&mut worker_input, &frame, maximum).await?;
                         }
                     }
@@ -997,11 +1005,10 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
                 tokio::select! {
                     result = &mut exchange => result,
                     _ = &mut shutdown => Err(error(Kind::Cancelled, "supervisor shutdown requested")),
-                    _ = wait_execution_timeout(request.limits.execution_timeout) => Err(error(Kind::Timeout, "worker execution deadline exceeded")),
                 }
             };
             drop(worker_input);
-            while !cleanup_descendants(request.limits.cleanup_timeout).await {
+            while !cleanup_descendants().await {
                 let frame = RunnerWire {
                     protocol_version: 1,
                     frame: RunnerFrame::Stopped {
@@ -1012,15 +1019,11 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
                 let _ = write_json(&mut output, &frame, maximum).await;
             }
             let _ = worker.wait().await;
-            let _ = tokio::time::timeout(
-                request.limits.cleanup_timeout,
-                tokio::io::copy(&mut worker_output, &mut tokio::io::sink()),
-            )
-            .await;
+            let _ = tokio::io::copy(&mut worker_output, &mut tokio::io::sink()).await;
             result
         }
     };
-    while !cleanup_descendants(request.limits.cleanup_timeout).await {
+    while !cleanup_descendants().await {
         let frame = RunnerWire {
             protocol_version: 1,
             frame: RunnerFrame::Stopped {
@@ -1097,12 +1100,9 @@ impl WorkerBridge {
         .await;
         let result = match sent {
             Err(error) => Err(error),
-            Ok(()) => tokio::time::timeout(self.deadline, receiver)
+            Ok(()) => receiver
                 .await
-                .map_err(|_| error(Kind::Timeout, "task host call timed out"))
-                .and_then(|result| {
-                    result.map_err(|_| error(Kind::InputClosed, "task host connection closed"))
-                })
+                .map_err(|_| error(Kind::InputClosed, "task host connection closed"))
                 .and_then(|result| result),
         };
         self.pending
@@ -1124,6 +1124,12 @@ async fn worker_host_input<R: AsyncBufRead + Unpin>(
                 return Err(error(Kind::RunnerProtocolFailed, "host version mismatch"));
             }
             match frame.frame {
+                HostFrame::Configured => {
+                    return Err(error(
+                        Kind::RunnerProtocolFailed,
+                        "duplicate configuration acknowledgement",
+                    ));
+                }
                 HostFrame::Input { value } => input
                     .try_send(value)
                     .map_err(|_| error(Kind::RunnerProtocolFailed, "Lua input credit exceeded"))?,
@@ -1180,41 +1186,25 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     {
         return Err(error(Kind::OutputTooLarge, "runner request exceeds budget"));
     }
-    let (sender, receiver) = mpsc::channel(request.limits.input_capacity);
-    let finish = CancellationToken::new();
-    let bridge = Arc::new(WorkerBridge {
-        output: tokio::sync::Mutex::new(tokio::io::stdout()),
-        pending: Mutex::new(BTreeMap::new()),
-        input: tokio::sync::Mutex::new(receiver),
-        sequence: AtomicU64::new(1),
-        deadline: request.limits.host_call_timeout,
-        frame_limit: wire_limit(&request.limits),
-        finish: finish.clone(),
-    });
-    let host_reader = tokio::spawn(worker_host_input(input, bridge.clone(), sender));
     let lua = Lua::new_with(
-        StdLib::TABLE
-            | StdLib::STRING
-            | StdLib::MATH
-            | StdLib::UTF8
-            | StdLib::COROUTINE
-            | StdLib::IO
-            | StdLib::OS,
+        StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
         LuaOptions::default(),
     )
     .map_err(lua_failure)?;
     lua.set_memory_limit(request.limits.memory_bytes)
         .map_err(lua_failure)?;
-    let deadline = request
-        .limits
-        .execution_timeout
-        .map(|timeout| Instant::now() + timeout);
+    let deadline = Arc::new(Mutex::new(None::<Instant>));
+    let hook_deadline = deadline.clone();
     let instructions = AtomicU64::new(0);
     let budget = request.limits.instruction_budget;
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(1000),
         move |_, _| {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if hook_deadline
+                .lock()
+                .unwrap_or_else(|failure| failure.into_inner())
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
                 return Err(mlua::Error::external(error(
                     Kind::Timeout,
                     "Lua execution deadline exceeded",
@@ -1235,6 +1225,95 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     )
     .map_err(lua_failure)?;
     let globals = lua.globals();
+    // Error-catching functions and coroutines could swallow instruction-hook
+    // failures and run configuration forever. Install them only after validation.
+    let mut execution_globals = Vec::new();
+    for name in [
+        "pcall",
+        "xpcall",
+        "load",
+        "setmetatable",
+        "dofile",
+        "loadfile",
+        "warn",
+    ] {
+        execution_globals.push((name, globals.get::<LuaValue>(name).map_err(lua_failure)?));
+        globals.set(name, LuaValue::Nil).map_err(lua_failure)?;
+    }
+    for name in ["io", "os", "print"] {
+        globals.set(name, LuaValue::Nil).map_err(lua_failure)?;
+    }
+    let arguments = lua.to_value(&request.arguments).map_err(lua_failure)?;
+    let context = lua.to_value(&request.context).map_err(lua_failure)?;
+    lua.load(&request.program)
+        .set_name("tool")
+        .exec()
+        .map_err(|failure| {
+            error(
+                Kind::InvalidDefinition,
+                format!("tool configuration load failed: {failure}"),
+            )
+        })?;
+    let configure = globals.get::<mlua::Function>("configure").map_err(|_| {
+        error(
+            Kind::InvalidDefinition,
+            "tool must define configure(arguments, context)",
+        )
+    })?;
+    let configured: LuaValue = configure
+        .call((arguments.clone(), context.clone()))
+        .map_err(|failure| {
+            error(
+                Kind::InvalidDefinition,
+                format!("tool configure failed: {failure}"),
+            )
+        })?;
+    let configuration = parse_configuration(&lua, configured)?;
+    let mut input = input;
+    write_json(
+        &mut tokio::io::stdout(),
+        &RunnerWire {
+            protocol_version: 1,
+            frame: RunnerFrame::Configured { configuration },
+        },
+        wire_limit(&request.limits),
+    )
+    .await?;
+    let acknowledgement = read_json::<HostWire, _>(&mut input, wire_limit(&request.limits)).await?;
+    if !matches!(
+        acknowledgement,
+        Some(HostWire {
+            protocol_version: 1,
+            frame: HostFrame::Configured
+        })
+    ) {
+        return Err(error(
+            Kind::RunnerProtocolFailed,
+            "expected tool configuration acknowledgement",
+        ));
+    }
+    let execution_deadline = configuration
+        .timeout()
+        .map(|timeout| Instant::now() + timeout);
+    *deadline
+        .lock()
+        .unwrap_or_else(|failure| failure.into_inner()) = execution_deadline;
+    lua.load_std_libs(StdLib::IO | StdLib::OS | StdLib::COROUTINE)
+        .map_err(lua_failure)?;
+    for (name, value) in execution_globals {
+        globals.set(name, value).map_err(lua_failure)?;
+    }
+    let (sender, receiver) = mpsc::channel(request.limits.input_capacity);
+    let finish = CancellationToken::new();
+    let bridge = Arc::new(WorkerBridge {
+        output: tokio::sync::Mutex::new(tokio::io::stdout()),
+        pending: Mutex::new(BTreeMap::new()),
+        input: tokio::sync::Mutex::new(receiver),
+        sequence: AtomicU64::new(1),
+        frame_limit: wire_limit(&request.limits),
+        finish: finish.clone(),
+    });
+    let host_reader = tokio::spawn(worker_host_input(input, bridge.clone(), sender));
     globals
         .set(
             "print",
@@ -1521,10 +1600,6 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         )
         .map_err(lua_failure)?;
     let execution = async {
-        lua.load(&request.program)
-            .set_name("tool")
-            .exec_async()
-            .await?;
         if let Some(execute) = globals.get::<Option<mlua::Function>>("execute")? {
             execute.call_async::<LuaValue>((arguments, context)).await?;
         }
@@ -1534,7 +1609,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         biased;
         () = finish.cancelled() => Ok(()),
         result = execution => result.map_err(lua_failure),
-        _ = wait_execution_timeout(request.limits.execution_timeout) => Err(error(Kind::Timeout, "Lua execution deadline exceeded")),
+        _ = wait_deadline(execution_deadline.map(tokio::time::Instant::from_std)) => Err(error(Kind::Timeout, "Lua execution deadline exceeded")),
     };
     host_reader.abort();
     let _ = host_reader.await;
@@ -1545,17 +1620,14 @@ fn install_shell(lua: &Lua, request: &RunnerRequest) -> Result<(), ToolError> {
     let project_root = request.context.project_root.clone();
     let output_bytes = request.limits.output_bytes;
     let diagnostic_bytes = request.limits.diagnostic_bytes;
-    let host_timeout = request.limits.host_call_timeout;
-    let deadline = request
-        .limits
-        .execution_timeout
-        .map(|timeout| Instant::now() + timeout);
     let shell = lua.create_async_function(move |lua, (script, options): (String, Option<mlua::Table>)| {
         let project_root = project_root.clone();
         async move {
             if script.trim().is_empty() { return Err(mlua::Error::external(error(Kind::InvalidArguments, "shell command is empty"))); }
             let requested_limit = options.as_ref().map(|options| options.get::<Option<usize>>("max_output_bytes")).transpose()?.flatten().unwrap_or(output_bytes).min(output_bytes);
-            let timeout = options.as_ref().map(|options| options.get::<Option<u64>>("timeout_ms")).transpose()?.flatten().map(Duration::from_millis).unwrap_or(host_timeout).min(host_timeout).min(deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())).unwrap_or(host_timeout));
+            if options.as_ref().map(|options| options.contains_key("timeout_ms")).transpose()?.unwrap_or(false) {
+                return Err(mlua::Error::external(error(Kind::InvalidArguments, "shell timeout_ms is unsupported; configure the task lifetime")));
+            }
             let use_pty = options.as_ref().map(|options| options.get::<Option<bool>>("pty")).transpose()?.flatten().unwrap_or(false);
             let mut command = tokio::process::Command::new("/bin/sh");
             command.arg("-c").arg(script).current_dir(project_root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
@@ -1593,7 +1665,7 @@ fn install_shell(lua: &Lua, request: &RunnerRequest) -> Result<(), ToolError> {
                 result.set("terminal", use_pty)?;
                 Ok::<_, mlua::Error>(result)
             };
-            let result = tokio::time::timeout(timeout, work).await.unwrap_or_else(|_| Err(mlua::Error::external(error(Kind::Timeout, "shell deadline exceeded"))));
+            let result = work.await;
             if result.is_err() { let _ = child.start_kill(); let _ = child.wait().await; }
             result
         }
@@ -1726,6 +1798,7 @@ async fn pty_drain(
 
 fn install_terminal(lua: &mlua::Lua, request: &RunnerRequest) -> Result<(), ToolError> {
     let root = request.context.project_root.clone();
+    let output_limit = request.limits.output_bytes.min(request.limits.cache_bytes);
     lua.globals()
         .set(
             "terminal_open",
@@ -1746,8 +1819,9 @@ fn install_terminal(lua: &mlua::Lua, request: &RunnerRequest) -> Result<(), Tool
                             inner: std::sync::Arc::new(crate::types::TerminalInner {
                                 master,
                                 child: tokio::sync::Mutex::new(child),
-                                parser: std::sync::Mutex::new(vt100::Parser::new(24, 80, 0)),
-                                previous: std::sync::Mutex::new((String::new(), false)),
+                                output: std::sync::Mutex::new(crate::types::TerminalOutput::new(
+                                    output_limit,
+                                )),
                             }),
                         };
                         lua.create_userdata(terminal)
@@ -1786,6 +1860,82 @@ fn install_terminal(lua: &mlua::Lua, request: &RunnerRequest) -> Result<(), Tool
 }
 
 #[cfg(target_os = "linux")]
+impl crate::types::TerminalOutput {
+    fn new(limit: usize) -> Self {
+        Self {
+            // One byte can complete a CSI scroll of up to 24 rows. An extra
+            // retained row lets scrollback offset 1 act as a scroll observer.
+            parser: vt100::Parser::new(24, 80, 25),
+            history: String::new(),
+            previous: (String::new(), false),
+            limit,
+        }
+    }
+
+    fn process(&mut self, bytes: &[u8]) -> Result<(String, bool), ToolError> {
+        for byte in bytes {
+            let screen = self.parser.screen_mut();
+            let alternate = screen.alternate_screen();
+            screen.set_scrollback(1);
+            let before = screen.scrollback();
+            self.parser.process(std::slice::from_ref(byte));
+            let screen = self.parser.screen_mut();
+            if !alternate && !screen.alternate_screen() {
+                // With no history the offset is zero and doesn't advance on
+                // scroll. Query the clamped maximum to observe the first rows.
+                if before == 0 {
+                    screen.set_scrollback(usize::MAX);
+                }
+                let count = screen.scrollback().saturating_sub(before);
+                for offset in (1..=count).rev() {
+                    screen.set_scrollback(offset);
+                    let row = screen.rows(0, 80).next().unwrap_or_default();
+                    let separator = if screen.row_wrapped(0) { "" } else { "\n" };
+                    if self
+                        .history
+                        .len()
+                        .saturating_add(row.len())
+                        .saturating_add(separator.len())
+                        > self.limit
+                    {
+                        return Err(error(
+                            Kind::OutputTooLarge,
+                            "terminal transcript exceeds output/cache budget",
+                        ));
+                    }
+                    self.history.push_str(&row);
+                    self.history.push_str(separator);
+                }
+            }
+            screen.set_scrollback(0);
+        }
+        let screen = self.parser.screen();
+        let alternate = screen.alternate_screen();
+        let mut text = if alternate {
+            String::new()
+        } else {
+            self.history.clone()
+        };
+        text.push_str(&screen.contents());
+        if text.len() > self.limit {
+            return Err(error(
+                Kind::OutputTooLarge,
+                "terminal transcript exceeds output/cache budget",
+            ));
+        }
+        let replace =
+            alternate || alternate != self.previous.1 || !text.starts_with(&self.previous.0);
+        let value = if replace {
+            text.clone()
+        } else {
+            text[self.previous.0.len()..].to_string()
+        };
+        self.previous = (text, alternate);
+        Ok((value, replace))
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl mlua::UserData for crate::types::TerminalSession {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
         methods.add_async_method("read", |lua, terminal, ()| async move {
@@ -1812,15 +1962,8 @@ impl mlua::UserData for crate::types::TerminalSession {
                 let status = terminal.inner.child.lock().await.wait().await.map_err(mlua::Error::external)?;
                 return lua.to_value(&serde_json::json!({"eof": true, "exit_code": status.code()}));
             }
-            let mut parser = terminal.inner.parser.lock().map_err(|_| mlua::Error::external("terminal screen poisoned"))?;
-            parser.process(&chunk[..count]);
-            let screen = parser.screen();
-            let text = screen.contents();
-            let alternate = screen.alternate_screen();
-            let mut previous = terminal.inner.previous.lock().map_err(|_| mlua::Error::external("terminal output poisoned"))?;
-            let replace = alternate || alternate != previous.1 || !text.starts_with(&previous.0);
-            let value = if replace { text.clone() } else { text[previous.0.len()..].to_string() };
-            *previous = (text, alternate);
+            let (value, replace) = terminal.inner.output.lock().map_err(|_| mlua::Error::external("terminal output poisoned"))?
+                .process(&chunk[..count]).map_err(mlua::Error::external)?;
             lua.to_value(&serde_json::json!({"eof": false, "replace": replace, "text": value}))
         });
         methods.add_async_method("write", |_, terminal, text: mlua::String| async move {
@@ -1852,9 +1995,53 @@ impl mlua::UserData for crate::types::TerminalSession {
     }
 }
 
-async fn wait_execution_timeout(timeout: Option<Duration>) {
-    match timeout {
-        Some(timeout) => tokio::time::sleep(timeout).await,
-        None => std::future::pending::<()>().await,
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/support/terminal_output.rs"]
+mod terminal_output_tests;
+
+async fn wait_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
+}
+
+fn parse_configuration(lua: &Lua, value: LuaValue) -> Result<ToolConfiguration, ToolError> {
+    let LuaValue::Table(table) = value else {
+        return Err(error(
+            Kind::InvalidDefinition,
+            "configure must return a table",
+        ));
+    };
+    for pair in table.clone().pairs::<LuaValue, LuaValue>() {
+        let (key, value) = pair.map_err(lua_failure)?;
+        let LuaValue::String(key) = key else {
+            return Err(error(
+                Kind::InvalidDefinition,
+                "unknown tool configuration field",
+            ));
+        };
+        let key = key.to_str().map_err(lua_failure)?;
+        if !matches!(key.as_ref(), "timeout_ms") {
+            return Err(error(
+                Kind::InvalidDefinition,
+                "unknown tool configuration field",
+            ));
+        }
+        if !matches!(value, LuaValue::Integer(value) if value >= 0) {
+            return Err(error(
+                Kind::InvalidDefinition,
+                "configure timeout_ms must be a nonnegative integer",
+            ));
+        }
+    }
+    let configuration: ToolConfiguration =
+        lua.from_value(LuaValue::Table(table)).map_err(|failure| {
+            error(
+                Kind::InvalidDefinition,
+                format!("invalid tool configuration: {failure}"),
+            )
+        })?;
+    configuration.validate()?;
+    Ok(configuration)
 }

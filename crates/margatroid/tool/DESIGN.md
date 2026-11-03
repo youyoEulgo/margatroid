@@ -58,7 +58,7 @@ ToolTasks：该Agent的工具任务句柄集合，公开组件
     list(&self) -> Vec<(String, ToolTaskHandle)>
         行为：克隆工具任务句柄列表，不包括推理、存储或VM。
     read(&self, id: &str) -> Result<TaskReadResult, ToolError>
-        行为：同一短锁读取output[cursor..]、completed及error，再将cursor推进至当前末尾，返回并清除replaced标记。
+        行为：同一短锁读取output[cursor..]并将相邻字符串无分隔符拼成一项，非字符串原样保留顺序；读取completed及error，将cursor推进至当前末尾，返回并清除replaced标记。
     send(&self, id: &str, value: serde_json::Value) -> Result<(), ToolError>
         行为：向目标Lua输入通道投递一个值；任务已结束或通道满返回错误，不宣称接收方已处理。
     finish(&self, id: &str) -> Future<Output = Result<(), ToolError>>
@@ -144,7 +144,7 @@ run_runner(context: RunnerContext) -> Future<Output = Result<(), ToolError>>
     行为：启动可信supervisor及受限worker；并行投递stdin、读取有界stdout/stderr和等待退出；取消或超时终止执行并等待清理；处理双向协议帧；Return不是进程终态，真实退出清理后返回。
 
 run_tool_worker(request: RunnerRequest) -> Result<(), ToolError>
-    行为：创建Lua并安装任务宿主；运行execute(arguments, context)，自然退出也进入清理；task_finish自身以控制退出终止后续Lua语句，不等待自身JoinHandle。
+    行为：在受沙箱限制的worker内创建Lua，先以纯计算环境加载脚本并运行configure(arguments, context)，内存及指令预算始终生效；配置经Configured帧往返确认后安装IO/OS和任务宿主，再运行execute(arguments, context)，不重新加载脚本。自然退出也进入清理；task_finish自身以控制退出终止后续Lua语句，不等待自身JoinHandle。
 ```
 
 ## Lua宿主函数
@@ -263,11 +263,12 @@ ToolExecutionLimits：单次执行预算
     diagnostic_bytes: usize
     memory_bytes: usize
     instruction_budget: u64
-    execution_timeout: Option<Duration>--默认None，任务不因等待输入自动到期
-    host_call_timeout: Duration
-    cleanup_timeout: Duration
     cache_bytes: usize
     input_capacity: usize
+
+ToolConfiguration：Lua配置函数返回的本次时间预算
+    timeout_ms: u64
+    行为：仅此一个必填字段，正整数为ToolTask存活毫秒数，0不限时；未知字段、负数及不可表示时间拒绝，无后端默认值。ToolTask保存配置确认时确定的deadline，到期取消并等待真实清理后完成，不另设宿主、shell或清理限时。只有configure确认后才安装执行能力并调用execute。
 ```
 
 # error

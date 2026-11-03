@@ -26,4 +26,6 @@ Agent启动流程将本次agent_info等数据通过LuaEnvironment传入。Lua Ru
 
 mcl宿主由lua_runtime_plugin根据mcl_core::MclCommand直接构造：启动时取得owner真实Address，缺失则拒绝启动；绑定本次source Entity、source_address及VM实例，每次调用显式传入，发送事件并等待原oneshot。它不解析执行MCL，不依赖mcl_plugin；来源地址不由Lua脚本填写，也不从Entity编号生成。MCL plugin只处理请求并核对来源，EFFECT ready/wake通过lua_runtime_core核对实例并操作槽位。不使用block_on桥接。
 
+mcl调用的参数校验、reply丢失和非VM取消错误作为MclValue::Error返回Lua，形状为`{Error={type="error", message=..., request_id=...}}`；MCL返回的Error原样序列化，单次MCL调用取消也不终止VM。只有VM取消/停止仍抛出Lua错误以结束执行。通用LuaBinding宿主函数保留原错误契约，runtime不解析MCL文本推断返回形状。内置driver在轮边界捕获Error及其他Lua运行错误，最多尝试一次错误history和finish；history失败不重复写，finish失败等待下次wake先重试清理，再接收新轮，不自动ready或伪造清理完成。初始化失败不发送ready。
+
 数组与对象分别转换，嵌套空数组保留数组身份；拒绝无法表示的混合键和稀疏数组。require只解析注入模块。标准库选择及内存、源码、指令检查预算由LuaRuntimeConfig指定；Full和Safe均不表示进程沙箱。

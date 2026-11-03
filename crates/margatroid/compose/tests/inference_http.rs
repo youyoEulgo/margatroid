@@ -298,7 +298,7 @@ impl Fixture {
         )
         .unwrap();
         std::fs::write(directory.join("input.schema.json"), "{\"type\":\"object\"}").unwrap();
-        std::fs::write(directory.join("main.lua"), "function execute() end").unwrap();
+        std::fs::write(directory.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() end").unwrap();
         let mut tools = Tools::default();
         tools.insert("visible".into(), directory.join("tool.toml"));
         self.app.world_mut().insert_component(self.agent, tools);

@@ -29,7 +29,7 @@ EFFECT ready
 EFFECT wake
 ```
 
-Lua调用为mcl(target_entity, text, arguments)，arguments按顺序对应问号。来源及本次VM实例由lua_runtime_plugin中的mcl宿主绑定，不接受调用者伪造source。宿主只依赖mcl_core发送MclCommand并等待reply；唯一执行入口MclCommand要求调用方显式提供source_address，网络入口及Lua宿主传入自身真实地址，与source实体身份核对，历史source保存该地址而非Entity编号；mcl_plugin不定义Lua函数。消息参数要求完整消息数组，工具参数为已导入alias数组；配置路径和值分别占一个参数。
+Lua调用为mcl(target_entity, text, arguments)，arguments按顺序对应问号。来源及本次VM实例由lua_runtime_plugin中的mcl宿主绑定，不接受调用者伪造source。宿主只依赖mcl_core发送MclCommand并等待reply；唯一执行入口MclCommand要求调用方显式提供source_address，网络入口及Lua宿主传入自身真实地址，与source实体身份核对，MCL审计source保存该地址而非Entity编号；history_append消息按payload.type保存type，不保存调用来源；mcl_plugin不定义Lua函数。消息参数要求完整消息数组，工具参数为已导入alias数组；配置路径和值分别占一个参数。
 
 ## 消息Block
 
@@ -62,7 +62,7 @@ IMPORT校验种类、依赖和alias后，在对应资源领域登记alias到路�
 | ready | 无 | Unit |
 | wake | 无 | Unit |
 
-inference和tool_call将请求交给所属领域并等待oneshot。tool_call保留原调用ID及顺序，不可见工具返回对应失败结果。sandbox_use选择alias，不保存长期策略正文；实际执行读取选定路径的策略。history_append显式保存消息；其他操作不自动追加消息历史。指令审计与消息历史分别记录，不把审计参数投影成重复消息。两类历史以Agent内sequence标识并排序，不设历史key；content由调用方提供并与payload独立原样存取。
+inference和tool_call将请求交给所属领域并等待oneshot。tool_call保留原调用ID及顺序，每个工具调用错误均转换为failed工具消息，包括配置、参数、执行、超时、清理、任务panic、回复丢失和关联错误；不因单个失败丢失整批结果。无法解析出有效工具调用的命令错误与其他非工具错误，通过唯一回复出口转换为Error值，形状为{"Error":{"type":"error","message":"错误种类: 说明","request_id":"本次命令id"}}，不抛Lua宿主异常终止Driver。原始执行失败仍在MCL审计中记录succeeded=false。清理尚未证明时及时返回错误并保留后台监督，不将任务伪报completed或安全退出。sandbox_use选择alias，不保存长期策略正文；实际执行读取选定路径的策略。history_append显式保存消息；其他操作不自动追加消息历史。指令审计与消息历史分别记录，不把审计参数投影成重复消息。两类历史以Agent内sequence标识并排序，不设历史key；content由调用方提供并与payload独立原样存取。
 
 start_turn和finish_turn调用agent_core同步扩展；ready和wake调用lua_runtime_core扩展。ready只允许当前Driver对本人调用。wait是Lua宿主函数，不是MCL指令。上述调用由plugin组合，不让core之间互相依赖。
 
@@ -70,6 +70,6 @@ start_turn和finish_turn调用agent_core同步扩展；ready和wake调用lua_run
 
 每个目标一个FIFO，一次只推进一个队首，异步等待不阻塞其他目标。System只路由，Handler完成校验和推进；闭包不跨await借用World。完成后通过原oneshot回复，不额外建立MclCommandResult中转事件。
 
-回合中止是同步控制，不进入FIFO，也不关闭整个队列。inference/tool_call在实际受理时复查turn；无turn返回正常形状的取消消息，真实失败仍返回错误。取消Assistant不进入推理上下文，Driver可显式保留历史；finish_turn须等本轮真实执行收口，不能让旧完成覆盖新回合。
+回合中止是同步控制，不进入FIFO，也不关闭整个队列。inference/tool_call在实际受理时复查turn；无turn返回正常形状的取消消息，真实失败规范为工具失败结果或error消息。取消Assistant不进入推理上下文，Driver可显式保留历史；finish_turn只有本轮真实执行已收口才结束回合，尚未收口时立即返回error并保留句柄和状态，不循环等待；Driver在清理完成唤醒后重试，不能让旧完成覆盖新回合。
 
 关闭队列拒绝新命令、取消排队和在途操作，仍等待文件worker、领域任务和回执真实收口。drain成功不只表示发出了取消；清理失败保持错误，不以丢弃Future代替退出证明。

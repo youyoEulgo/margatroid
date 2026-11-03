@@ -11,8 +11,8 @@ use core_plugin::{App, Entity};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use tool_core::{
-    InitToolTasks, ToolError, ToolErrorKind as Kind, ToolExecuteRequest, ToolExecuteResponse,
-    ToolExecutionLimits, ToolTasks,
+    InitToolTasks, ToolConfiguration, ToolError, ToolErrorKind as Kind, ToolExecuteRequest,
+    ToolExecuteResponse, ToolExecutionLimits, ToolTasks,
 };
 use tool_plugin::ToolPlugin;
 use tool_resource_core::Tools;
@@ -22,26 +22,29 @@ struct Fixture {
     app: App,
     agent: Entity,
     root: tempfile::TempDir,
+    configuration: ToolConfiguration,
 }
 
 impl Fixture {
     fn new() -> Self {
-        Self::with_limits(ToolExecutionLimits {
-            execution_timeout: Some(Duration::from_secs(5)),
-            host_call_timeout: Duration::from_secs(2),
-            cleanup_timeout: Duration::from_secs(1),
-            ..Default::default()
-        })
+        Self::with_limits(ToolExecutionLimits::default())
     }
 
     fn with_limits(limits: ToolExecutionLimits) -> Self {
+        Self::with_runner(
+            limits,
+            std::path::Path::new(env!("CARGO_BIN_EXE_tool_runner")),
+        )
+    }
+
+    fn with_runner(limits: ToolExecutionLimits, runner: &std::path::Path) -> Self {
         let root = tempfile::tempdir().unwrap();
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
             .add_plugin(AsyncRuntimePlugin)
             .add_plugin(
                 ToolPlugin::new()
-                    .with_runner_path(env!("CARGO_BIN_EXE_tool_runner"))
+                    .with_runner_path(runner)
                     .with_limits(limits),
             );
         let workspace = app.world_mut().spawn();
@@ -72,10 +75,33 @@ impl Fixture {
         });
         app.tick();
         assert!(reply.try_recv().unwrap().is_ok());
-        Self { app, agent, root }
+        Self {
+            app,
+            agent,
+            root,
+            configuration: ToolConfiguration { timeout_ms: 30_000 },
+        }
+    }
+
+    fn with_configuration(configuration: ToolConfiguration) -> Self {
+        configuration.validate().unwrap();
+        Self {
+            configuration,
+            ..Self::new()
+        }
     }
 
     fn tool(&mut self, alias: &str, program: &str) {
+        // Test programs declare their own lifetimes; bundled programs keep their
+        // author-supplied configure function and are never overridden here.
+        let program = if program.contains("function configure(") {
+            program.to_owned()
+        } else {
+            format!(
+                "function configure(arguments, context) return {{timeout_ms={}}} end\n{program}",
+                self.configuration.timeout_ms,
+            )
+        };
         let directory = self.root.path().join(alias);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
@@ -118,9 +144,17 @@ impl Fixture {
 
     fn response(
         &mut self,
-        mut reply: oneshot::Receiver<Result<ToolExecuteResponse, ToolError>>,
+        reply: oneshot::Receiver<Result<ToolExecuteResponse, ToolError>>,
     ) -> Result<ToolExecuteResponse, ToolError> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        self.response_with_timeout(reply, Duration::from_secs(10))
+    }
+
+    fn response_with_timeout(
+        &mut self,
+        mut reply: oneshot::Receiver<Result<ToolExecuteResponse, ToolError>>,
+        timeout: Duration,
+    ) -> Result<ToolExecuteResponse, ToolError> {
+        let deadline = Instant::now() + timeout;
         loop {
             self.app.tick();
             match reply.try_recv() {
@@ -168,6 +202,95 @@ impl Fixture {
             );
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+}
+
+struct ReleaseFakeSupervisor(std::path::PathBuf);
+
+impl Drop for ReleaseFakeSupervisor {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, "release");
+    }
+}
+
+#[test]
+fn failed_calls_reply_while_uncooperative_supervisor_retains_cleanup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (mode, expected) in [
+        ("timeout", Kind::Timeout),
+        ("protocol", Kind::RunnerProtocolFailed),
+        ("cancel", Kind::Cancelled),
+        ("stopped", Kind::RunnerProtocolFailed),
+        ("cleanup", Kind::CleanupFailed),
+    ] {
+        let scripts = tempfile::tempdir().unwrap();
+        let runner = scripts.path().join("fake-supervisor");
+        std::fs::write(
+            &runner,
+            r#"#!/usr/bin/python3
+import json, pathlib, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+request = json.loads(sys.stdin.readline())
+mode = request['arguments']['mode']
+def frame(value):
+    print(json.dumps({'protocol_version': 1, 'frame': value}), flush=True)
+frame({'type': 'configured', 'configuration': {'timeout_ms': 30 if mode == 'timeout' else 0}})
+sys.stdin.readline()
+pathlib.Path('ready').touch()
+if mode == 'protocol':
+    print('invalid protocol', flush=True)
+elif mode in ('stopped', 'cleanup'):
+    result = {'Ok': None} if mode == 'cleanup' else {'Err': {'kind': 'RunnerProtocolFailed', 'message': 'original stopped error'}}
+    frame({'type': 'stopped', 'result': result, 'cleanup_proven': False})
+while not pathlib.Path('release').exists():
+    time.sleep(0.002)
+frame({'type': 'stopped', 'result': {'Ok': None}, 'cleanup_proven': True})
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut fixture = Fixture::with_runner(ToolExecutionLimits::default(), &runner);
+        let release = ReleaseFakeSupervisor(fixture.root.path().join("release"));
+        fixture.tool("fake", "function execute() end");
+        let reply = fixture.execute("pending-cleanup", "fake", json!({"mode": mode}));
+        let handle = fixture.tasks().get("pending-cleanup").unwrap();
+        if mode == "cancel" {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !fixture.root.path().join("ready").exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "fake supervisor failed to configure"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            handle.cancel();
+        }
+        let failure = fixture
+            .response_with_timeout(reply, Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(failure.kind, expected, "{mode}: {failure:?}");
+        if mode == "stopped" {
+            assert_eq!(failure.message, "original stopped error");
+        }
+        assert!(!handle.is_completed(), "{mode}: unproven cleanup completed");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        if mode != "cancel" {
+            let finish = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), handle.finish()).await
+            });
+            assert_eq!(finish.unwrap().unwrap_err().kind, Kind::CleanupFailed);
+        } else {
+            assert_eq!(handle.read().error.unwrap().kind, Kind::Cancelled);
+        }
+        assert!(!handle.is_completed(), "{mode}: finish dropped supervision");
+        assert!(fixture.tasks().get("pending-cleanup").is_ok());
+        drop(release);
+        fixture.completed("pending-cleanup");
+        runtime.block_on(handle.finish()).unwrap();
     }
 }
 
@@ -369,7 +492,7 @@ fn fresh_schema_program_and_deleted_files_are_checked_for_each_execution() {
 fn independent_supervisor_reaps_setsid_descendants_after_return_and_finish() {
     let mut fixture = Fixture::new();
     fixture.tool("escape", r#"function execute(args,context)
-        shell("setsid /bin/sh -c 'echo $$ > escaped.pid; exec sleep 60' </dev/null >/dev/null 2>&1 &")
+        shell("setsid /bin/sh -c 'echo $$ > escaped.pid; exec sleep 15' </dev/null >/dev/null 2>&1 &")
         shell("while [ ! -s escaped.pid ]; do sleep 0.01; done")
         task_return('spawned')
         task_finish(context.task_id)
@@ -436,10 +559,9 @@ fn cache_text_and_instruction_budgets_fail_explicitly() {
         cache_bytes: 8,
         output_bytes: 8,
         instruction_budget: 10000,
-        execution_timeout: Some(Duration::from_secs(3)),
-        host_call_timeout: Duration::from_secs(1),
         ..Default::default()
     });
+    fixture.configuration = ToolConfiguration { timeout_ms: 3_000 };
     fixture.tool(
         "cache",
         "function execute() task_return('ready'); task_write('value-larger-than-cache') end",
@@ -488,13 +610,144 @@ fn result_images_are_validated_by_the_core_across_the_runner_protocol() {
 }
 
 #[test]
+fn bundled_bash_exec_sleep_eleven_seconds_succeeds_with_author_configured_budget() {
+    let limits = ToolExecutionLimits::default();
+    let mut fixture = Fixture::with_limits(limits);
+    fixture.tool(
+        "bash-exec",
+        include_str!("../../../../../resources/tools/local/bash-exec/latest/main.lua"),
+    );
+    let reply = fixture.execute(
+        "sleep-eleven",
+        "bash-exec",
+        json!({"cmd": "sleep 11; printf sleep-eleven-completed"}),
+    );
+    let response = fixture
+        .response_with_timeout(reply, Duration::from_secs(20))
+        .unwrap();
+    assert!(!response.failed, "{response:?}");
+    assert_eq!(response.content, "sleep-eleven-completed\n[exit code: 0]");
+    fixture.completed("sleep-eleven");
+    assert!(fixture
+        .tasks()
+        .read("sleep-eleven")
+        .unwrap()
+        .error
+        .is_none());
+}
+
+#[test]
+fn shell_obeys_only_the_task_lifetime_including_unlimited() {
+    for timeout_ms in [0, 3_000] {
+        let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms });
+        fixture.tool("slow-shell", "function execute(args, context) local result=shell('sleep 0.25; printf done'); task_return(result.stdout); task_finish(context.task_id) end");
+        let reply = fixture.execute("slow-shell", "slow-shell", json!({}));
+        assert_eq!(fixture.response(reply).unwrap().content, "done");
+        fixture.completed("slow-shell");
+        assert!(fixture.tasks().read("slow-shell").unwrap().error.is_none());
+    }
+}
+
+#[test]
+fn task_lifetime_reports_timeout_after_real_descendant_cleanup() {
+    let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms: 250 });
+    fixture.tool(
+        "shell-timeout",
+        r#"function execute()
+        shell("echo $$ > shell.pid; sleep 15 & echo $! > child.pid; wait")
+        task_return('unexpected success')
+    end"#,
+    );
+    let reply = fixture.execute("shell-timeout", "shell-timeout", json!({}));
+    let error = fixture.response(reply).unwrap_err();
+    assert_eq!(error.kind, Kind::Timeout);
+    fixture.completed("shell-timeout");
+    assert_eq!(
+        fixture
+            .tasks()
+            .read("shell-timeout")
+            .unwrap()
+            .error
+            .unwrap()
+            .kind,
+        Kind::Timeout
+    );
+    for name in ["shell.pid", "child.pid"] {
+        let pid = std::fs::read_to_string(fixture.root.path().join(name))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "{name} survived the timeout response"
+        );
+    }
+}
+
+#[test]
+fn total_execution_deadline_still_bounds_shell_work() {
+    let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms: 500 });
+    fixture.tool(
+        "total-timeout",
+        r#"function execute()
+        shell("echo $$ > total-shell.pid; exec sleep 15")
+        task_return('unexpected success')
+    end"#,
+    );
+    let reply = fixture.execute("total-timeout", "total-timeout", json!({}));
+    assert_eq!(fixture.response(reply).unwrap_err().kind, Kind::Timeout);
+    fixture.completed("total-timeout");
+    assert_eq!(
+        fixture
+            .tasks()
+            .read("total-timeout")
+            .unwrap()
+            .error
+            .unwrap()
+            .kind,
+        Kind::Timeout
+    );
+    let pid = std::fs::read_to_string(fixture.root.path().join("total-shell.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+        Err(nix::errno::Errno::ESRCH)
+    );
+}
+
+#[test]
+fn invalid_shell_timeouts_are_rejected_before_spawning_a_child() {
+    let mut fixture = Fixture::new();
+    for (index, timeout) in ["0", "250", "-1", "0.5", "math.huge", "'250'", "true"]
+        .iter()
+        .enumerate()
+    {
+        let id = format!("invalid-timeout-{index}");
+        fixture.tool(
+            &id,
+            &format!(
+                "function execute() shell('touch unexpected-child', {{timeout_ms={timeout}}}) end"
+            ),
+        );
+        let reply = fixture.execute(&id, &id, json!({}));
+        assert_eq!(
+            fixture.response(reply).unwrap_err().kind,
+            Kind::InvalidArguments,
+            "{timeout}"
+        );
+        fixture.completed(&id);
+        assert!(!fixture.root.path().join("unexpected-child").exists());
+    }
+}
+
+#[test]
 fn execution_timeout_still_reaps_a_background_vm_after_return() {
-    let mut fixture = Fixture::with_limits(ToolExecutionLimits {
-        execution_timeout: Some(Duration::from_millis(200)),
-        host_call_timeout: Duration::from_millis(100),
-        cleanup_timeout: Duration::from_secs(1),
-        ..Default::default()
-    });
+    let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms: 200 });
     fixture.tool(
         "timeout",
         "function execute() task_return('started'); task_receive() end",
@@ -583,6 +836,65 @@ fn bundled_bash_stays_alive_after_reply_and_preserves_shell_state() {
         .unwrap();
     fixture.completed("terminal");
     assert!(fixture.tasks().read("terminal").unwrap().completed);
+}
+
+#[test]
+fn terminal_slow_reader_receives_all_eighty_scrolled_lines_once() {
+    for repeated in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.tool(
+            "bash",
+            include_str!("../../../../../resources/tools/local/bash/latest/main.lua"),
+        );
+        let reply = fixture.execute("history", "bash", json!({}));
+        fixture.response(reply).unwrap();
+        let format = if repeated { "[same]" } else { "[%03d]" };
+        fixture.tasks().send("history", json!({"text":format!("for i in {{1..80}}; do printf '{format}\\n' $i; sleep 0.002; done; touch finished"),"enter":true})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !fixture.root.path().join("finished").exists() {
+            fixture.app.tick();
+            assert!(Instant::now() < deadline, "terminal did not finish output");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // The terminal reader has been running throughout, but the consumer
+        // deliberately waits until every line has scrolled through the PTY.
+        let result = fixture.tasks().read("history").unwrap();
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(
+            !result.replaced,
+            "ordinary terminal scrolling replaced the cache"
+        );
+        let output = result
+            .output
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<String>();
+        let lines = output
+            .lines()
+            .filter(|line| line.starts_with('['))
+            .collect::<Vec<_>>();
+        let expected = (1..=80)
+            .map(|index| {
+                if repeated {
+                    "[same]".to_string()
+                } else {
+                    format!("[{index:03}]")
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lines, expected, "terminal output: {output}");
+        let next = fixture.tasks().read("history").unwrap();
+        assert!(!next
+            .output
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|text| text.contains("[001]") || text.contains("[same]")));
+        fixture
+            .tasks()
+            .send("history", json!({"text":"exit 0","enter":true}))
+            .unwrap();
+        fixture.completed("history");
+    }
 }
 
 #[test]
@@ -680,7 +992,7 @@ fn bash_exit_finishes_task_even_if_a_background_process_keeps_the_pty_open() {
         .tasks()
         .send(
             "background-child",
-            json!({"text":"sleep 60 & disown; exit 0", "enter":true}),
+            json!({"text":"sleep 15 & disown; exit 0", "enter":true}),
         )
         .unwrap();
     let started = Instant::now();
@@ -695,13 +1007,9 @@ fn bash_exit_finishes_task_even_if_a_background_process_keeps_the_pty_open() {
 }
 
 #[test]
-fn an_unlimited_background_task_can_wait_for_input_beyond_host_call_timeout() {
-    let mut fixture = Fixture::with_limits(ToolExecutionLimits {
-        execution_timeout: None,
-        host_call_timeout: Duration::from_millis(200),
-        ..Default::default()
-    });
-    fixture.tool("waiting", "function execute(arguments, context) task_return(context.task_id); local value=task_receive(); task_write(value); task_finish(context.task_id) end");
+fn unlimited_task_waits_for_input_and_other_task_finish_proves_cleanup() {
+    let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms: 0 });
+    fixture.tool("waiting", "function execute(arguments, context) task_return(context.task_id); local value=task_receive(); task_write(value); task_receive() end");
     let reply = fixture.execute("waiting", "waiting", json!({}));
     fixture.response(reply).unwrap();
     std::thread::sleep(Duration::from_millis(300));
@@ -710,12 +1018,18 @@ fn an_unlimited_background_task_can_wait_for_input_beyond_host_call_timeout() {
         .tasks()
         .send("waiting", json!({"continued":true}))
         .unwrap();
-    fixture.completed("waiting");
     assert_eq!(
-        fixture.tasks().read("waiting").unwrap().output,
+        fixture.output("waiting").output,
         vec![json!({"continued":true})]
     );
-    assert!(ToolExecutionLimits::default().execution_timeout.is_none());
+    fixture.tool(
+        "closer-unlimited",
+        "function execute() task_finish('waiting'); task_return('closed') end",
+    );
+    let reply = fixture.execute("closer-unlimited", "closer-unlimited", json!({}));
+    assert_eq!(fixture.response(reply).unwrap().content, "closed");
+    fixture.completed("waiting");
+    assert!(fixture.tasks().read("waiting").unwrap().completed);
 }
 
 fn with_daemon_controlling_terminal(name: &str, test: impl FnOnce()) {

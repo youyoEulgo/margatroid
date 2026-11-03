@@ -152,12 +152,13 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
     let release = Arc::new(Notify::new());
     let context = InferenceContext {
         request,
-        reply,
+        reply: Some(reply),
         route: route(url),
         tools: vec![],
         client: reqwest::Client::new(),
         gate: gate.clone(),
         delivery: delivery(),
+        cleanup_notification: None,
         cleanup_gate: Some((entered.clone(), release.clone())),
     };
     let task = tokio::spawn(supervise_inference(context));
@@ -201,6 +202,364 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
     assert_eq!(response.usage, None);
     drop(sender);
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn provider_error_replies_before_stalled_cleanup_and_retains_active_handle() {
+    let (url, sender, server) = http_server().await;
+    let input = request();
+    let cancel = input.cancel.clone();
+    let gate = Arc::new(Mutex::new(StreamGate::default()));
+    let frozen = gate.clone();
+    let (reply, received) = oneshot::channel();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let task = tokio::spawn(supervise_inference(InferenceContext {
+        request: input,
+        reply: Some(reply),
+        route: route(url),
+        tools: vec![],
+        client: reqwest::Client::new(),
+        gate: gate.clone(),
+        delivery: delivery(),
+        cleanup_notification: None,
+        cleanup_gate: Some((entered.clone(), release.clone())),
+    }));
+    let handle = InferenceHandle {
+        request_id: "request".into(),
+        turn: "turn".into(),
+        cancel,
+        stop_stream: Arc::new(move || frozen.lock().unwrap().close()),
+        task,
+    };
+    sender.send("data: invalid-json\n\n".into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    let failed = tokio::time::timeout(Duration::from_secs(1), received)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(failed.kind, Kind::ResponseInvalid);
+    assert!(gate.lock().unwrap().closed);
+    assert!(
+        !handle.is_finished(),
+        "reply must retain actual cleanup supervision"
+    );
+    let mut world = World::new();
+    let entity = world.spawn();
+    world.insert_component(
+        entity,
+        Agent {
+            name: "test".into(),
+            workspace: entity,
+            state: AgentState::Working,
+            turn: Some("turn".into()),
+        },
+    );
+    world.insert_component(
+        entity,
+        ActiveInference {
+            current: Some(handle),
+        },
+    );
+    let mut next = request();
+    next.agent = entity;
+    let (reply, rejected) = oneshot::channel();
+    next.reply = Arc::new(Mutex::new(Some(reply)));
+    handle_inference(&mut world, next);
+    assert_eq!(
+        rejected.await.unwrap().unwrap_err().kind,
+        Kind::InferenceBusy
+    );
+    let handle = world
+        .get_component_mut::<ActiveInference>(entity)
+        .unwrap()
+        .current
+        .take()
+        .unwrap();
+    assert!(!handle.is_finished());
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), handle.task)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(sender);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_cleanup_budget_replies_error_and_keeps_real_join_active() {
+    let (url, sender, server) = http_server().await;
+    let input = request();
+    let cancel = input.cancel.clone();
+    let gate = Arc::new(Mutex::new(StreamGate::default()));
+    let frozen = gate.clone();
+    let (reply, received) = oneshot::channel();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let task = tokio::spawn(supervise_inference(InferenceContext {
+        request: input,
+        reply: Some(reply),
+        route: route(url),
+        tools: vec![],
+        client: reqwest::Client::new(),
+        gate: gate.clone(),
+        delivery: delivery(),
+        cleanup_notification: None,
+        cleanup_gate: Some((entered.clone(), release.clone())),
+    }));
+    let handle = InferenceHandle {
+        request_id: "request".into(),
+        turn: "turn".into(),
+        cancel,
+        stop_stream: Arc::new(move || frozen.lock().unwrap().close()),
+        task,
+    };
+    sender.send(chat("accepted")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while gate.lock().unwrap().accumulator.content != "accepted" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.cancel();
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    let failed = tokio::time::timeout(Duration::from_secs(4), received)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(failed.kind, Kind::CleanupFailed);
+    assert!(
+        !handle.is_finished(),
+        "cleanup timeout must not pretend the worker joined"
+    );
+    assert!(gate.lock().unwrap().closed);
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), handle.task)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(sender);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn real_cleanup_wakes_matching_driver_only_after_supervisor_finishes() {
+    use app_runtime_plugin::RuntimePlugin;
+    use core_plugin::App;
+    use lua_runtime_core::{DriverLuaVmInstance, DriverWakeSlot};
+
+    let mut app = App::new();
+    app.add_plugin(RuntimePlugin::default());
+    app.add_system(RuntimePlugin::UPDATE, crate::system::inference_system);
+    let agent = app.world_mut().spawn();
+    let instance = DriverLuaVmInstance {
+        owner: agent,
+        start_id: "current-instance".into(),
+    };
+    let wake = DriverWakeSlot::shared();
+    app.world_mut().insert_component(
+        agent,
+        DriverLuaVm {
+            instance: instance.clone(),
+            wake: wake.clone(),
+            ready: Arc::new(Mutex::new(None)),
+            ended: None,
+            cancel: CancellationToken::new(),
+        },
+    );
+    let cleanup = InferenceCleanupFinished {
+        agent,
+        request_id: "request".into(),
+        instance,
+    };
+    let (url, sender, server) = http_server().await;
+    let mut input = request();
+    input.agent = agent;
+    let cancel = input.cancel.clone();
+    let (reply, received) = oneshot::channel();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let task = tokio::spawn(supervise_inference(InferenceContext {
+        request: input,
+        reply: Some(reply),
+        route: route(url),
+        tools: vec![],
+        client: reqwest::Client::new(),
+        gate: Arc::new(Mutex::new(StreamGate::default())),
+        delivery: delivery(),
+        cleanup_notification: Some((app.world().event_sender(), cleanup.clone())),
+        cleanup_gate: Some((entered.clone(), release.clone())),
+    }));
+    app.world_mut().insert_component(
+        agent,
+        ActiveInference {
+            current: Some(InferenceHandle {
+                request_id: "request".into(),
+                turn: "turn".into(),
+                cancel,
+                stop_stream: Arc::new(|| {}),
+                task,
+            }),
+        },
+    );
+    sender.send("data: invalid-json\n\n".into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), received)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .kind,
+        Kind::ResponseInvalid
+    );
+    assert_eq!(app.world().event_snapshot().normal_event_count, 0);
+    let mut waiting = Box::pin(DriverWakeSlot::wait(wake.clone()));
+    assert!(waiting.as_mut().now_or_never().is_none());
+
+    // The actual supervisor must not emit its completion event while cleanup
+    // remains blocked, even though the inference error has already replied.
+    app.tick();
+    assert!(waiting.as_mut().now_or_never().is_none());
+    assert!(!app
+        .world()
+        .get_component::<ActiveInference>(agent)
+        .unwrap()
+        .current
+        .as_ref()
+        .unwrap()
+        .is_finished());
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !app
+            .world()
+            .get_component::<ActiveInference>(agent)
+            .unwrap()
+            .current
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    app.tick();
+    tokio::time::timeout(Duration::from_secs(1), &mut waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        app.world()
+            .get_component::<ActiveInference>(agent)
+            .unwrap()
+            .current
+            .is_some(),
+        "wake must retain the handle for finish_turn"
+    );
+
+    // Stale request and VM notifications must not wake the current Driver.
+    app.tick();
+    let mut stale_request = cleanup.clone();
+    stale_request.request_id = "old-request".into();
+    let mut stale_instance = cleanup.clone();
+    stale_instance.instance.start_id = "old-instance".into();
+    app.world().send_event(stale_request);
+    app.world().send_event(stale_instance);
+    app.tick();
+    let mut next_wait = Box::pin(DriverWakeSlot::wait(wake));
+    assert!(next_wait.as_mut().now_or_never().is_none());
+    app.world().send_event(cleanup);
+    app.tick();
+    tokio::time::timeout(Duration::from_secs(1), &mut next_wait)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(sender);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_event_retries_next_frame_until_actual_handle_finishes() {
+    use app_runtime_plugin::RuntimePlugin;
+    use core_plugin::App;
+    use lua_runtime_core::{DriverLuaVmInstance, DriverWakeSlot};
+
+    let mut app = App::new();
+    app.add_plugin(RuntimePlugin::default());
+    app.add_system(RuntimePlugin::UPDATE, crate::system::inference_system);
+    let agent = app.world_mut().spawn();
+    let instance = DriverLuaVmInstance {
+        owner: agent,
+        start_id: "current-instance".into(),
+    };
+    let wake = DriverWakeSlot::shared();
+    app.world_mut().insert_component(
+        agent,
+        DriverLuaVm {
+            instance: instance.clone(),
+            wake: wake.clone(),
+            ready: Arc::new(Mutex::new(None)),
+            ended: None,
+            cancel: CancellationToken::new(),
+        },
+    );
+    let (release, joined) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = joined.await;
+    });
+    app.world_mut().insert_component(
+        agent,
+        ActiveInference {
+            current: Some(InferenceHandle {
+                request_id: "request".into(),
+                turn: "turn".into(),
+                cancel: CancellationToken::new(),
+                stop_stream: Arc::new(|| {}),
+                task,
+            }),
+        },
+    );
+    app.world().send_event(InferenceCleanupFinished {
+        agent,
+        request_id: "request".into(),
+        instance,
+    });
+    let mut waiting = Box::pin(DriverWakeSlot::wait(wake));
+    assert!(waiting.as_mut().now_or_never().is_none());
+    app.tick();
+    assert!(waiting.as_mut().now_or_never().is_none());
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !app
+            .world()
+            .get_component::<ActiveInference>(agent)
+            .unwrap()
+            .current
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    app.fast_forward_tick();
+    tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[test]
@@ -600,5 +959,302 @@ async fn response_header_deadline_is_independent_of_stream_idle_deadline() {
     assert!(fragments
         .iter()
         .any(|f| matches!(f, ProviderFragment::Finished(_))));
+    server.await.unwrap();
+}
+
+fn status_error(body: &[u8], headers: &[(&str, &str)]) -> InferenceError {
+    let mut response_headers = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        response_headers.insert(
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse().unwrap(),
+        );
+    }
+    format_provider_status_error(
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        &response_headers,
+        body,
+        None,
+        &[],
+    )
+}
+
+#[test]
+fn status_error_json_allowlists_fields_even_when_message_contains_request_id() {
+    let failed = status_error(br#"{"error":{"type":"service_unavailable_error","code":"overloaded","request_id":"nested-id","message":"Service is too busy (request_id: embedded-id)","api_key":"unknown-secret","url":"https://private.invalid"},"request_id":"root-id","unknown":"ignored"}"#, &[("x-request-id", "header-id")]);
+    assert_eq!(failed.kind, Kind::ResponseStatus);
+    assert_eq!(failed.message, "HTTP 503 Service Unavailable; type=service_unavailable_error; code=overloaded; request_id=nested-id; message=Service is too busy (request_id: embedded-id)");
+}
+
+#[test]
+fn status_error_captured_yakumo_503_preserves_busy_detail_and_embedded_request_id() {
+    let captured = br#"{"error":{"message":"Service is too busy. We advise users to temporarily switch to alternative LLM API service providers. (request_id: 57b431fb-e5fd-43b9-94ce-785f607bcfd7)","type":"service_unavailable_error","param":null,"code":"service_unavailable_error"}}"#;
+    let failed = status_error(captured, &[]);
+    assert_eq!(failed.message, "HTTP 503 Service Unavailable; type=service_unavailable_error; code=service_unavailable_error; request_id=57b431fb-e5fd-43b9-94ce-785f607bcfd7; message=Service is too busy. We advise users to temporarily switch to alternative LLM API service providers. (request_id: 57b431fb-e5fd-43b9-94ce-785f607bcfd7)");
+    println!("{}", failed);
+}
+
+#[test]
+fn status_error_supports_string_anthropic_and_request_id_fallbacks() {
+    assert_eq!(
+        status_error(br#"{"error":"busy","request_id":"root-id"}"#, &[]).message,
+        "HTTP 503 Service Unavailable; request_id=root-id; message=busy"
+    );
+    assert_eq!(status_error(br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#, &[("x-request-id", "anthropic-id")]).message, "HTTP 503 Service Unavailable; type=overloaded_error; request_id=anthropic-id; message=Overloaded");
+    assert!(status_error(b"", &[("request-id", "fallback-id")])
+        .message
+        .contains("request_id=fallback-id"));
+    assert!(status_error(
+        br#"{"error":{"message":"busy"}}"#,
+        &[("x-request-id", "preferred"), ("request-id", "other")]
+    )
+    .message
+    .contains("request_id=preferred"));
+}
+
+#[test]
+fn status_error_redacts_actual_credentials_before_truncating_fields() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "authorization",
+        "Bearer actual-private-bearer".parse().unwrap(),
+    );
+    headers.insert("x-api-key", "actual-private-api-key".parse().unwrap());
+    let secrets = provider_error_secrets(&headers);
+    let body = json!({"error":{"type":"actual-private-api-key","code":"Bearer actual-private-bearer","request_id":"id-actual-private-bearer","message":"Echo actual-private-api-key and actual-private-bearer and Bearer actual-private-bearer https://user:password@host.invalid/key?api_key=other-secret","unknown":"unknown-secret"}});
+    let failed = format_provider_status_error(
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        &headers,
+        body.to_string().as_bytes(),
+        None,
+        &secrets,
+    );
+    for forbidden in [
+        "actual-private",
+        "user:password",
+        "host.invalid",
+        "other-secret",
+        "unknown-secret",
+    ] {
+        assert!(!failed.message.contains(forbidden), "{}", failed.message);
+    }
+    assert!(failed.message.contains("[REDACTED]"));
+    assert!(failed.message.contains("[URL REDACTED]"));
+    let boundary = format!("{}actual-private-api-key", "界".repeat(500));
+    assert!(!safe_error_field(&boundary, &secrets, 510).contains("actual-private"));
+}
+
+#[test]
+fn status_error_bounds_unicode_and_handles_empty_malformed_html_and_plain_text() {
+    for body in [b"".as_slice(), b"{broken json", b"[]"] {
+        let failed = status_error(body, &[]);
+        assert!(failed.message.starts_with("HTTP 503 Service Unavailable;"));
+        assert!(!failed.message.contains("broken json"));
+    }
+    assert_eq!(
+        status_error(
+            b"<html>private diagnostic</html>",
+            &[("content-type", "text/html; charset=utf-8")]
+        )
+        .message,
+        "HTTP 503 Service Unavailable; message=non-JSON error response; content_type=text/html"
+    );
+    assert_eq!(
+        status_error(b"  busy\n retry later  ", &[("content-type", "text/plain")]).message,
+        "HTTP 503 Service Unavailable; message=busy retry later"
+    );
+    let body = json!({"error":{"type":"t".repeat(300),"code":"c".repeat(300),"message":"界".repeat(10000)},"request_id":"important-id"}).to_string();
+    let failed = status_error(body.as_bytes(), &[]);
+    assert!(failed.message.len() <= MAX_STATUS_ERROR_BYTES);
+    assert!(failed.message.contains("request_id=important-id"));
+    assert!(failed.message.contains("message=界"));
+}
+
+async fn error_http_server(
+    response: String,
+) -> (String, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (release, wait) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut header = Vec::new();
+        let mut byte = [0];
+        while !header.ends_with(b"\r\n\r\n") {
+            socket.read_exact(&mut byte).await.unwrap();
+            header.push(byte[0]);
+        }
+        let length = String::from_utf8_lossy(&header)
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
+            .unwrap_or(0);
+        socket.read_exact(&mut vec![0; length]).await.unwrap();
+        let _ = socket.write_all(response.as_bytes()).await;
+        let _ = wait.await;
+    });
+    (url, release, task)
+}
+
+fn outbound_to(url: String) -> ProviderHttpRequest {
+    build_request(
+        DomainRequest {
+            messages: request().messages,
+            tools: vec![],
+            config: request().config,
+        },
+        &route(url),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn status_error_real_json_redacts_the_actual_outbound_key() {
+    let body = r#"{"error":{"type":"service_unavailable_error","code":"busy","message":"Service is too busy; echoed test"}}"#;
+    let (url, release, server) = error_http_server(format!("HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nX-Request-Id: real-header-id\r\n\r\n{body}", body.len())).await;
+    let (sender, _receiver) = mpsc::channel(2);
+    let failed = read_provider_with_timeouts(
+        reqwest::Client::new(),
+        outbound_to(url),
+        CancellationToken::new(),
+        sender,
+        (Duration::from_secs(1), Duration::from_secs(1)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(failed.message, "HTTP 503 Service Unavailable; type=service_unavailable_error; code=busy; request_id=real-header-id; message=Service is too busy; echoed [REDACTED]");
+    let _ = release.send(());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn status_error_oversize_prefix_stops_without_waiting_for_stream_end() {
+    let prefix = "x".repeat(MAX_ERROR_BODY_BYTES);
+    let (url, release, server) = error_http_server(format!("HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{prefix}", MAX_ERROR_BODY_BYTES * 2)).await;
+    let (sender, _receiver) = mpsc::channel(2);
+    let failed = tokio::time::timeout(
+        Duration::from_secs(1),
+        read_provider_with_timeouts(
+            reqwest::Client::new(),
+            outbound_to(url),
+            CancellationToken::new(),
+            sender,
+            (Duration::from_secs(1), Duration::from_secs(10)),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(failed.kind, Kind::ResponseStatus);
+    assert!(failed.message.starts_with("HTTP 503 Service Unavailable"));
+    assert!(failed.message.ends_with("error body truncated"));
+    assert!(failed.message.len() <= MAX_STATUS_ERROR_BYTES);
+    let _ = release.send(());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn status_error_body_timeout_and_disconnect_preserve_http_status() {
+    for disconnect in [false, true] {
+        let (url, release, server) = error_http_server(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 100\r\n\r\npartial".into(),
+        )
+        .await;
+        let mut release = Some(release);
+        if disconnect {
+            let _ = release.take().unwrap().send(());
+        }
+        let (sender, _receiver) = mpsc::channel(2);
+        let failed = read_provider_with_timeouts(
+            reqwest::Client::new(),
+            outbound_to(url),
+            CancellationToken::new(),
+            sender,
+            (Duration::from_secs(1), Duration::from_millis(40)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failed.kind, Kind::ResponseStatus);
+        assert!(failed.message.starts_with("HTTP 503 Service Unavailable"));
+        assert!(failed.message.ends_with(if disconnect {
+            "error body disconnected"
+        } else {
+            "error body read timed out"
+        }));
+        if let Some(release) = release {
+            let _ = release.send(());
+        }
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn status_error_trickling_body_does_not_reset_read_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut header = Vec::new();
+        let mut byte = [0];
+        while !header.ends_with(b"\r\n\r\n") {
+            socket.read_exact(&mut byte).await.unwrap();
+            header.push(byte[0]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 1000\r\n\r\n")
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if socket.write_all(b"x").await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let response = reqwest::Client::new().get(url).send().await.unwrap();
+    let failed = tokio::time::timeout(
+        Duration::from_millis(300),
+        read_provider_status_error(
+            response,
+            &CancellationToken::new(),
+            Duration::from_millis(60),
+            &[],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(failed.kind, Kind::ResponseStatus);
+    assert!(failed.message.ends_with("error body read timed out"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn status_error_body_cancellation_remains_immediate() {
+    let (url, release, server) = error_http_server(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 100\r\n\r\npartial".into(),
+    )
+    .await;
+    let response = reqwest::Client::new().get(url).send().await.unwrap();
+    let cancel = CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let worker = tokio::spawn(async move {
+        read_provider_status_error(response, &worker_cancel, Duration::from_secs(60), &[]).await
+    });
+    tokio::task::yield_now().await;
+    cancel.cancel();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .kind,
+        Kind::Cancelled
+    );
+    let _ = release.send(());
     server.await.unwrap();
 }

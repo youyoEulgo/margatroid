@@ -2,15 +2,14 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tool_core::{
-    ToolError, ToolExecuteRequest, ToolExecuteResponse, ToolExecutionLimits, ToolTaskHandle,
-    ToolTasks,
+    ToolConfiguration, ToolError, ToolExecuteRequest, ToolExecuteResponse, ToolExecutionLimits,
+    ToolTaskHandle, ToolTasks,
 };
 
 pub(crate) struct ToolExecutionContext {
@@ -21,6 +20,7 @@ pub(crate) struct ToolExecutionContext {
     pub project_root: PathBuf,
     pub runner_path: PathBuf,
     pub limits: ToolExecutionLimits,
+    pub configuration: Option<ToolConfiguration>,
     pub handle: ToolTaskHandle,
     pub tasks: ToolTasks,
     pub input: mpsc::Receiver<Value>,
@@ -53,6 +53,9 @@ pub(crate) struct RunnerWire {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum RunnerFrame {
+    Configured {
+        configuration: ToolConfiguration,
+    },
     Return {
         request_id: String,
         value: Value,
@@ -97,6 +100,7 @@ pub(crate) struct HostWire {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum HostFrame {
+    Configured,
     Input {
         value: Value,
     },
@@ -113,7 +117,6 @@ pub(crate) struct WorkerBridge {
     pub pending: Mutex<BTreeMap<String, PendingResponse>>,
     pub input: tokio::sync::Mutex<mpsc::Receiver<Value>>,
     pub sequence: AtomicU64,
-    pub deadline: Duration,
     pub frame_limit: usize,
     pub finish: CancellationToken,
 }
@@ -135,6 +138,13 @@ pub(crate) struct TerminalSession {
 pub(crate) struct TerminalInner {
     pub(crate) master: tokio::io::unix::AsyncFd<std::fs::File>,
     pub(crate) child: tokio::sync::Mutex<tokio::process::Child>,
-    pub(crate) parser: std::sync::Mutex<vt100::Parser>,
-    pub(crate) previous: std::sync::Mutex<(String, bool)>,
+    pub(crate) output: std::sync::Mutex<TerminalOutput>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct TerminalOutput {
+    pub(crate) parser: vt100::Parser,
+    pub(crate) history: String,
+    pub(crate) previous: (String, bool),
+    pub(crate) limit: usize,
 }

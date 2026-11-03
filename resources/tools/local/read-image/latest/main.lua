@@ -1,3 +1,7 @@
+function configure(arguments, context)
+    return { timeout_ms = 30000 }
+end
+
 local MAX_BYTES = 5 * 1024 * 1024
 
 local function resolve_path(path, root)

@@ -90,7 +90,7 @@ fn read(storage: &AgentStorage, block: &str) -> Vec<Value> {
 }
 fn record(_label: &str) -> HistoryRecord {
     HistoryRecord {
-        source: "agent:old/identity:latest".into(),
+        source: None,
         turn: Some("turn".into()),
         kind: "message".into(),
         content: "正文".into(),

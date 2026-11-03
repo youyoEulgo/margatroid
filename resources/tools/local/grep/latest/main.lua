@@ -1,3 +1,7 @@
+function configure(arguments, context)
+    return { timeout_ms = 30000 }
+end
+
 local MAX_MATCHES = 250
 local MAX_LINE_BYTES = 2000
 local MAX_OUTPUT_BYTES = 16 * 1024 * 1024

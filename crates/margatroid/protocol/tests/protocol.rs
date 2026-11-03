@@ -123,7 +123,8 @@ fn stream_and_history_wire_preserve_existing_fields_without_internal_domain_type
             workspace: reference,
             agent: "agent:demo/coder".into(),
             messages: vec![HistoryMessageDto {
-                source: "client:webui/browser:latest".into(),
+                source: None,
+                message_type: Some("user".into()),
                 sequence: 73,
                 turn: None,
                 kind: "message".into(),
@@ -141,11 +142,22 @@ fn stream_and_history_wire_preserve_existing_fields_without_internal_domain_type
     );
     let record = &value["history"]["messages"][0];
     assert_eq!(record["sequence"], 73);
-    assert_eq!(record["source"], "client:webui/browser:latest");
+    assert_eq!(record["type"], "user");
+    assert!(record.get("source").is_none());
     assert!(record.get("key").is_none());
-    let mut missing_source = record.clone();
-    missing_source.as_object_mut().unwrap().remove("source");
-    assert!(serde_json::from_value::<HistoryMessageDto>(missing_source).is_err());
+    let mcl = HistoryMessageDto {
+        sequence: 74,
+        turn: None,
+        message_type: None,
+        source: Some("client:webui/browser:latest".into()),
+        kind: "mcl".into(),
+        content: "run".into(),
+        payload: json!({"text":"run"}),
+        created_at_ms: 0,
+    };
+    let mcl = serde_json::to_value(mcl).unwrap();
+    assert_eq!(mcl["source"], "client:webui/browser:latest");
+    assert!(mcl.get("type").is_none());
     assert_eq!(
         value["history"]["messages"][0]["created_at_ms"],
         1_700_000_000_123_u64
