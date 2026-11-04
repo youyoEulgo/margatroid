@@ -825,8 +825,14 @@ textarea:focus-visible {
   opacity: 0.35;
 }
 
-.message-body > .image-row,
-.tool-call-row .image-row {
+/* Images inside a tool block line up with its request/response blocks. */
+.message-body > .image-row {
+  padding: 0;
+}
+
+.message-disclosure > .image-row {
+  max-width: calc(100% - 24px);
+  margin-left: 24px;
   padding: 0;
 }
 
