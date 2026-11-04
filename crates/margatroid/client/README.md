@@ -4,9 +4,11 @@ client_core定义Client组件、注册结果、错误和World查询扩展，只�
 
 ## 注册与断开
 
-Client保存连接ID、类型和名称，不保存资源地址，也不实现LibraryComponent。client_plugin注册时创建Entity，分别挂载Client与Address；地址为client:<client_type>/<name>:<connection_id>。名称缺省为连接ID文本，类型与名称是自报标签，不是认证凭据。
+Client保存自有ConnectionId、类型、名称和ClientSender出站能力，不保存实际socket或资源地址，也不实现LibraryComponent。client_plugin注册时创建Entity，分别挂载Client与Address；地址为client:<client_type>/<name>:<connection_id>。名称缺省为连接ID文本，类型与名称是自报标签，不是认证凭据。
 
-System只收集注册和断开事件并交给Handler。注册Handler校验连接、名称及地址占用，更新连接元数据，挂载组件并复检连接；成功后发送包含完整Entity的注册结果。失败清理本次实体并尝试恢复元数据。连接断开时销毁对应Client Entity，不取消已提交推理。
+System收集RegisterClient和ClientDisconnected专用领域事件并交给Handler。注册Handler校验发送能力、名称及地址占用，挂载Client和Address并复检队列是否关闭；成功后发送包含完整Entity的注册结果。失败清理本次实体，不修改网络元数据。实际连接由DTO拥有，断开时关闭队列并发送ClientDisconnected，ClientPlugin销毁身份，不取消已提交推理。
+
+client_core提供ConnectionId、ClientFrame和有界ClientSender；Frame只有Text、Binary及Close，不依赖Axum或mecs server_plugin。DTO把帧映射到实际socket，inference等领域只使用发送器快照，ClientPlugin无需服务器设施。
 
 ## 查询与对外身份
 

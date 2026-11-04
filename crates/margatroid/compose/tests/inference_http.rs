@@ -10,6 +10,7 @@ use address::Address;
 use agent_core::{Agent, AgentState};
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
+use closure_plugin::{AppClosureExt, ClosurePlugin};
 use core_plugin::{App, Entity};
 use inference_core::{
     ActiveInference, InferenceError, InferenceErrorKind as Kind, InferenceImage, InferenceMessage,
@@ -145,6 +146,7 @@ struct Fixture {
     app: App,
     agent: Entity,
     root: tempfile::TempDir,
+    frames: tokio::sync::mpsc::Receiver<client_core::ClientFrame>,
 }
 
 impl Fixture {
@@ -162,10 +164,14 @@ impl Fixture {
         std::fs::write(&config, format!("[[models]]\nid='route'\nmodel='upstream-model'\nprovider='{provider}'\napi_type='{api_type}'\nbase_url='{url}'\napi_key='private-test-key'\ncontext_window='128k'\n")).unwrap();
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
+            .add_plugin(ClosurePlugin)
+            .add_closure_system(RuntimePlugin::UPDATE)
             .add_plugin(AsyncRuntimePlugin)
             .add_plugin(InferencePlugin::open(&config).unwrap());
         if dto {
-            app.add_plugin(server_plugin::ServerPlugin::bind("127.0.0.1:0"));
+            app.add_plugin(axum_plugin::AxumPlugin::bind(
+                "127.0.0.1:0".parse().unwrap(),
+            ));
             app.add_plugin(client_plugin::ClientPlugin::new());
             app.world_mut().insert_resource(
                 config_core::MargatroidConfig::new(
@@ -178,6 +184,19 @@ impl Fixture {
                 .unwrap(),
             );
             app.add_plugin(dto_plugin::DtoPlugin::new());
+        }
+        let (frames_sender, frames) = tokio::sync::mpsc::channel(256);
+        if !dto {
+            let client = app.world_mut().spawn();
+            app.world_mut().insert_component(
+                client,
+                client_core::Client {
+                    connection_id: client_core::ConnectionId::new(1),
+                    client_type: "webui".into(),
+                    name: "inference-fixture".into(),
+                    sender: client_core::ClientSender::new(frames_sender),
+                },
+            );
         }
         let workspace = app.world_mut().spawn();
         app.world_mut()
@@ -212,7 +231,12 @@ impl Fixture {
         });
         app.tick();
         assert!(reply.try_recv().unwrap().is_ok());
-        Self { app, agent, root }
+        Self {
+            app,
+            agent,
+            root,
+            frames,
+        }
     }
 
     fn request(
@@ -327,6 +351,24 @@ fn all_seven_provider_api_combinations_use_explicit_auth_endpoints_and_strict_st
         );
         assert_eq!(response.stop_reason, InferenceStopReason::Completed);
         assert_eq!(response.usage.unwrap().output_tokens, 2);
+        let mut frames = Vec::new();
+        while let Ok(frame) = fixture.frames.try_recv() {
+            let client_core::ClientFrame::Text(text) = frame else {
+                panic!("inference must emit text frames")
+            };
+            frames.push(serde_json::from_str::<Value>(&text).unwrap());
+        }
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["type"] == "agent.message.delta" && frame["content"] == "ok")
+        );
+        assert_eq!(frames.last().unwrap()["type"], "agent.message.finished");
+        assert!(
+            frames.iter().all(
+                |frame| frame["id"] == "request" && frame["agent_instance"] == "driver-fixture"
+            )
+        );
         let (path, headers, body) = server
             .received
             .recv_timeout(Duration::from_secs(1))
@@ -588,8 +630,8 @@ fn dto_advertised_vm_instance_matches_real_inference_delta_and_finished_frames()
         if let Some(address) = fixture
             .app
             .world()
-            .get_resource::<server_plugin::ServerHandle>()
-            .and_then(server_plugin::ServerHandle::local_address)
+            .get_resource::<axum_plugin::AxumHandle>()
+            .and_then(axum_plugin::AxumHandle::local_address)
         {
             break address;
         }

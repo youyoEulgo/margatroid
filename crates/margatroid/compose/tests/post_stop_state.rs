@@ -1,8 +1,8 @@
 use app_runtime_plugin::AppRunExt;
+use axum_plugin::AxumHandle;
 use compose::{ApplicationOptions, build_app};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use server_plugin::ServerHandle;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -71,10 +71,11 @@ fn original_websocket_can_query_empty_state_after_stopping_the_last_workspace() 
         app.tick();
         let deadline = Instant::now() + Duration::from_secs(5);
         let address = loop {
+            app.tick();
             if let Some(address) = app
                 .world()
-                .get_resource::<ServerHandle>()
-                .and_then(ServerHandle::local_address)
+                .get_resource::<AxumHandle>()
+                .and_then(AxumHandle::local_address)
             {
                 break address;
             }

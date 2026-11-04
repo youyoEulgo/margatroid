@@ -1,11 +1,11 @@
+use client_core::{ClientDisconnected, RegisterClient};
 use core_plugin::World;
-use server_plugin::{RegisterConnection, WebSocketDisconnected};
 
 use crate::handler::{handle_client_disconnect, handle_client_registration};
 
 pub(crate) fn client_registration_system(world: &mut World) {
     let requests = world
-        .event_reader::<RegisterConnection>()
+        .event_reader::<RegisterClient>()
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
@@ -16,11 +16,10 @@ pub(crate) fn client_registration_system(world: &mut World) {
 
 pub(crate) fn client_disconnect_system(world: &mut World) {
     let events = world
-        .event_reader::<WebSocketDisconnected>()
+        .event_reader::<ClientDisconnected>()
         .into_iter()
-        .map(|event| WebSocketDisconnected {
+        .map(|event| ClientDisconnected {
             connection_id: event.connection_id,
-            reason: event.reason.clone(),
         })
         .collect::<Vec<_>>();
     for event in events {

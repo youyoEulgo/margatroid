@@ -7,6 +7,10 @@ System分别列出事件、闭包结果、提交闭包和oneshot回复，使用R
 不写独立逻辑段；持有关系使用树形图。
 ```
 
+# 设计范围
+
+Margatroid领域使用原生Axum装配及普通异步闭包，已退出mecs通用网络桥和spawn_async_service依赖。mecs现有接口、文档及源码暂时保留，后续另行清理，不提供旧入口回退或兼容实现。
+
 # 板块格式
 
 ```text
@@ -105,8 +109,8 @@ init_tool_tasks_system(world: &mut World)
 
 tool_execute_system(world: &mut World)
     处理事件：ToolExecuteRequest
-    接收闭包结果：None
-    提交闭包：supervise_tool(ToolExecutionContext) -> Future<Output = ()>
+    接收闭包结果：Result<ToolLaunchOutput, ToolLaunchError>
+    提交闭包：launch_tool(ToolExecutionContext) -> Future<Output = Result<ToolLaunchOutput, ToolLaunchError>>
     产出事件：None
     oneshot回复：Result<ToolExecuteResponse, ToolError>
     行为：ToolExecuteRequest -> handle_tool_execute。
@@ -125,12 +129,15 @@ handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
     行为：
         认领reply，核对Agent完整Entity及是否允许新工具调用，不检查turn。
         从Tools取得alias路径，从SelectedSandbox及Sandboxes取得可选策略路径。
-        固定本次工具、策略路径和目录参数，准备owned执行材料。
-        创建共享ToolTaskHandle，一份登记ToolTasks，克隆一份及共享集合句柄交给工作任务；提交supervise_tool，失败通过原reply回复错误。
+        固定本次工具、策略路径和目录参数，准备owned执行材料，不跨await借用World。
+        创建共享ToolTaskHandle，一份登记ToolTasks，克隆一份及共享集合句柄交给工作任务；通过send_async_closure提交launch_tool，失败通过原reply回复错误；不使用spawn_async_service，不缓存执行器Handle。
 ```
 
 私有：
 ```text
+launch_tool(context: ToolExecutionContext) -> Future<Output = Result<ToolLaunchOutput, ToolLaunchError>>
+    行为：在普通异步闭包内部创建本领域监督任务，立即把真实JoinHandle交给已登记的ToolTaskHandle，再返回启动结果。该闭包结果只证明启动交接，不表示工具完成；supervise_tool才负责业务reply和真实清理。启动异常记录于原ToolTask并完成原reply，System只收口启动事实，不反向控制其他领域。
+
 supervise_tool(context: ToolExecutionContext) -> Future<Output = ()>
     行为：
         blocking worker调用tool_resource_core::read_tool和sandbox_resource_core::read_sandbox，读取本次程序、schema和策略。
@@ -172,6 +179,9 @@ task_receive()
 
 私有：
 ```text
+ToolLaunchOutput：监督任务已交给ToolTaskHandle的启动事实，不是工具执行结果
+ToolLaunchError：ToolError及原请求回复/共享句柄关联，实现From<AsyncTaskError>
+
 ToolExecutionContext：单次执行材料
     request: ToolExecuteRequest
     reply: oneshot::Sender<Result<ToolExecuteResponse, ToolError>>

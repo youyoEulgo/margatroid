@@ -12,8 +12,8 @@ use storage_core::{
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use workspace_core::{
-    RestartWorkspace, RestartWorkspaceResult, StartWorkspace, StartWorkspaceResult, StopWorkspace,
-    StopWorkspaceResult, WorkspaceOperationOutput,
+    RestartWorkspace, RestartWorkspaceResult, StartWorkspace, StartWorkspaceResult,
+    WorkspaceOperationOutput,
 };
 
 fn copy_tree(source: &Path, target: &Path) {
@@ -270,24 +270,33 @@ fn workspace_restarts_keep_three_disk_tables_persistent_context_and_history_with
             output = wait_workspace(&mut app, &id, true);
         }
     }
-    app.world().emit_event(StopWorkspace {
-        id: "final-stop".into(),
-        workspace: output.workspace,
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), compose::shutdown_app(&mut app))
+            .await
+            .expect("application shutdown timed out")
+            .unwrap();
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        app.tick();
-        if let Some(event) = app
-            .world()
-            .event_reader::<StopWorkspaceResult>()
-            .into_iter()
-            .find(|event| event.id == "final-stop")
-        {
-            event.result.clone().unwrap();
-            break;
-        }
-        assert!(Instant::now() < deadline, "workspace stop timed out");
-        std::thread::yield_now();
-    }
+    assert!(
+        app.world()
+            .query_with::<workspace_core::Workspace>()
+            .result()
+            .is_empty()
+    );
+    assert!(
+        app.world()
+            .query_with::<agent_core::Agent>()
+            .result()
+            .is_empty()
+    );
+    assert!(
+        app.world()
+            .get_resource::<axum_plugin::AxumHandle>()
+            .unwrap()
+            .is_stopped()
+    );
     assert_disk_schema_and_messages(&database_path, &message);
 }

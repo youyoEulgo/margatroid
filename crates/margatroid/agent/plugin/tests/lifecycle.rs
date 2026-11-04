@@ -720,20 +720,22 @@ fn stop_closes_admission_then_waits_for_vm_inference_tools_and_mcl_drain() {
         worker_cancel.cancelled().await;
         inference_wait.await.unwrap();
     });
-    fixture
-        .app
-        .world_mut()
-        .get_component_mut::<ActiveInference>(agent)
-        .unwrap()
-        .current = Some(InferenceHandle {
+    let inference_handle = InferenceHandle {
         request_id: "inference".into(),
         turn: "turn".into(),
         cancel: cancel.clone(),
         stop_stream: Arc::new(move || {
             gate_copy.fetch_add(1, Ordering::SeqCst);
         }),
-        task: inference_task,
-    });
+        task: Arc::new(inference_core::InferenceTaskState::default()),
+    };
+    inference_handle.attach_task(inference_task).unwrap();
+    fixture
+        .app
+        .world_mut()
+        .get_component_mut::<ActiveInference>(agent)
+        .unwrap()
+        .current = Some(inference_handle);
     let (tool, _input) = ToolTaskHandle::new(&ToolExecutionLimits::default()).unwrap();
     let finished = tool.clone();
     let (tool_release, tool_wait) = oneshot::channel();

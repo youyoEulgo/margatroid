@@ -225,6 +225,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum_plugin"
+version = "0.1.0"
+dependencies = [
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "axum",
+ "closure_plugin",
+ "core_plugin",
+ "futures-util",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -370,7 +386,7 @@ name = "client_core"
 version = "0.1.0"
 dependencies = [
  "core_plugin",
- "server_plugin",
+ "tokio",
 ]
 
 [[package]]
@@ -379,12 +395,9 @@ version = "0.1.0"
 dependencies = [
  "address",
  "app_runtime_plugin",
- "async_runtime_plugin",
  "client_core",
  "core_plugin",
- "server_plugin",
  "tokio",
- "tokio-tungstenite",
  "tracing",
 ]
 
@@ -412,6 +425,7 @@ dependencies = [
  "agent_plugin",
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "axum_plugin",
  "client_core",
  "client_plugin",
  "closure_plugin",
@@ -434,7 +448,6 @@ dependencies = [
  "sandbox_resource_core",
  "sandbox_resource_plugin",
  "serde_json",
- "server_plugin",
  "storage_core",
  "storage_plugin",
  "tempfile",
@@ -456,7 +469,6 @@ name = "config_core"
 version = "0.1.0"
 dependencies = [
  "core_plugin",
- "server_plugin",
 ]
 
 [[package]]
@@ -600,6 +612,8 @@ dependencies = [
  "agent_core",
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "axum",
+ "axum_plugin",
  "client_core",
  "closure_plugin",
  "config_core",
@@ -613,7 +627,6 @@ dependencies = [
  "rusqlite",
  "sandbox_resource_core",
  "serde_json",
- "server_plugin",
  "storage_core",
  "tempfile",
  "tokio",
@@ -622,6 +635,7 @@ dependencies = [
  "tool_core",
  "tool_resource_core",
  "tracing",
+ "tungstenite",
  "workspace_core",
 ]
 
@@ -1120,6 +1134,7 @@ dependencies = [
  "async_runtime_plugin",
  "base64",
  "client_core",
+ "closure_plugin",
  "config_core",
  "core_plugin",
  "futures-util",
@@ -1130,7 +1145,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "server_plugin",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
@@ -1706,6 +1720,7 @@ version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "closure_plugin",
  "core_plugin",
  "prompt_resource_core",
  "tokio",
@@ -2091,6 +2106,7 @@ version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "closure_plugin",
  "core_plugin",
  "sandbox_resource_core",
  "tokio",
@@ -2683,6 +2699,7 @@ dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
  "base64",
+ "closure_plugin",
  "core_plugin",
  "futures-util",
  "jsonschema",
@@ -2718,6 +2735,7 @@ version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "closure_plugin",
  "core_plugin",
  "tokio",
  "tokio-util",
@@ -2885,6 +2903,7 @@ version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
  "axum",
+ "axum_plugin",
  "core_plugin",
  "rust-embed",
 ]

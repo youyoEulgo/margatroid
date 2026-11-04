@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+#[cfg(test)]
 use app_runtime_plugin::RuntimeEventSender;
+use client_core::ClientSender;
 use core_plugin::{Entity, Event, Resource};
 use inference_core::{
     DomainRequest, InferenceError, InferenceErrorKind, InferenceImage, InferenceMessage,
@@ -14,7 +16,6 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYP
 use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use server_plugin::WebSocketSender;
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
@@ -28,7 +29,7 @@ pub(crate) const FRAGMENT_CAPACITY: usize = 32;
 
 pub(crate) struct HttpRuntime {
     pub client: reqwest::Client,
-    pub executor: tokio::runtime::Handle,
+    pub schedule: String,
 }
 impl Resource for HttpRuntime {}
 
@@ -48,7 +49,7 @@ pub(crate) struct InferenceContext {
     pub client: reqwest::Client,
     pub gate: Arc<Mutex<StreamGate>>,
     pub delivery: StreamDelivery,
-    pub cleanup_notification: Option<(RuntimeEventSender, InferenceCleanupFinished)>,
+    pub cleanup_notification: Option<(InferenceCleanupSender, InferenceCleanupFinished)>,
     #[cfg(test)]
     pub cleanup_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
@@ -58,7 +59,7 @@ pub(crate) struct StreamDelivery {
     pub id: String,
     pub agent: String,
     pub instance: String,
-    pub senders: Vec<WebSocketSender>,
+    pub senders: Vec<ClientSender>,
 }
 
 #[derive(Default)]
@@ -2149,3 +2150,35 @@ impl FormatDecoder {
 #[cfg(test)]
 #[path = "../tests/internal/adapters.rs"]
 mod adapter_tests;
+
+#[derive(Clone)]
+pub(crate) struct InferenceLaunchOutput;
+#[derive(Clone)]
+pub(crate) struct InferenceLaunchError {
+    pub fallback: Option<crate::handler::InferenceLaunchFallback>,
+    pub error: InferenceError,
+}
+impl From<async_runtime_plugin::AsyncTaskError> for InferenceLaunchError {
+    fn from(error: async_runtime_plugin::AsyncTaskError) -> Self {
+        Self {
+            fallback: None,
+            error: InferenceError::new(InferenceErrorKind::TaskPanicked, error.to_string()),
+        }
+    }
+}
+
+/// Constructed only when the queued launch is dispatched, never while queued.
+pub(crate) enum InferenceCleanupSender {
+    Async(async_runtime_plugin::AsyncContext),
+    #[cfg(test)]
+    Runtime(RuntimeEventSender),
+}
+impl InferenceCleanupSender {
+    pub fn send_event(&self, event: InferenceCleanupFinished) {
+        match self {
+            Self::Async(context) => context.send_event(event),
+            #[cfg(test)]
+            Self::Runtime(events) => events.send_event(event),
+        }
+    }
+}

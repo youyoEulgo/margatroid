@@ -19,7 +19,10 @@ margatroid_protocol = { path = "../../protocol" }
 core_plugin = { path = "../../../mecs/core_plugin" }
 app_runtime_plugin = { path = "../../../mecs/app_runtime_plugin" }
 async_runtime_plugin = { path = "../../../mecs/async_runtime_plugin" }
-server_plugin = { path = "../../../mecs/server_plugin" }
+axum_plugin = { path = "../../axum_plugin" }
+axum = { version = "0.8", features = ["ws"] }
+tungstenite = "0.29"
+futures-util = "0.3"
 log_plugin = { path = "../../../mecs/log_plugin" }
 tracing = "0.1"
 serde_json = { workspace = true }
@@ -30,6 +33,5 @@ tokio-util = { workspace = true }
 tool_core = { path = "../../tool/core" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 closure_plugin = { path = "../../../mecs/closure_plugin" }
-futures-util = "0.3"
 tempfile = "3"
 tokio-tungstenite = "0.29"

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use agent_core::{Agent, AgentState};
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
+use closure_plugin::{AppClosureExt, ClosurePlugin};
 use core_plugin::{App, Entity};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
@@ -35,6 +36,8 @@ impl Fixture {
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
             .add_plugin(AsyncRuntimePlugin)
+            .add_plugin(ClosurePlugin)
+            .add_closure_system(RuntimePlugin::UPDATE)
             .add_plugin(
                 ToolPlugin::new()
                     .with_runner_path(env!("CARGO_BIN_EXE_tool_runner"))

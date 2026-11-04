@@ -1,3 +1,5 @@
+Margatroid领域实现契约；本领域已切换，mecs现有实现保持不动，后续另行清理。
+
 # 伪代码格式
 
 ```text
@@ -53,6 +55,8 @@ ConfigPlugin：全局配置安装插件
 ```text
 read_config(path: &Path) -> Result<MargatroidConfig, ConfigError>
     行为：有界读取UTF-8 TOML；拒绝未知字段；校验监听地址、入口策略、日志及两组非空且不重复的出站目标。
+    行为：文件schema和取值不变：server.bind、server.allow、log.level、log.filter、outbound.logs、outbound.backend_state；入口仍解析localhost/all及原地址别名或CIDR数组。
+    行为：只产出config_core自有数据，不实现server_plugin::HandshakeGuard；DTO在自己的/ws handler调用IngressPolicy::evaluate。
 ```
 
 # types pub
@@ -65,8 +69,15 @@ IngressPolicy：入口策略，公开枚举
     Localhost
     Any
     Addresses(Vec<CidrBlock>)
-    evaluate(&self, peer: SocketAddr, origin: Option<&str>, host: Option<&str>) -> Result<(), String>
-        行为：检查对端；无Origin时按非浏览器请求处理，有Origin时核对Host同源，拒绝null或非法authority。
+    evaluate(&self, request: &IngressRequest) -> Result<(), String>
+        行为：检查request.peer；无Origin时按非浏览器请求处理，有Origin时核对Host同源，拒绝null或非法authority。
+        行为：只接收自有owned数据，由DTO握手handler直接调用；不依赖Axum或服务器trait。
+
+IngressRequest：入口检查输入，公开结构体
+    peer: SocketAddr--真实对端地址
+    origin: Option<String>--owned Origin值
+    host: Option<String>--owned Host值
+    行为：DTO从原生请求提取并构造，不持有Request、HeaderMap或框架引用。
 
 CidrBlock：网络地址段
     network: IpAddr

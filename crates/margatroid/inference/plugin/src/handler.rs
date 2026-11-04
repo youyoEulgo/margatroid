@@ -6,8 +6,10 @@ use std::time::Duration;
 
 use address::Address;
 use agent_core::{Agent, AgentState};
+#[cfg(test)]
 use app_runtime_plugin::WorldEventExt;
-use client_core::WorldClientExt;
+use async_runtime_plugin::WorldAsyncExt;
+use client_core::{ClientFrame, WorldClientExt};
 use core_plugin::World;
 use futures_util::{FutureExt, StreamExt};
 use inference_core::{
@@ -17,7 +19,6 @@ use inference_core::{
 };
 use lua_runtime_core::DriverLuaVm;
 use serde_json::json;
-use server_plugin::WebSocketMessage;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tool_resource_core::{read_tool, ToolReadLimits, Tools};
@@ -223,12 +224,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
                 )
             })?;
         let agent_instance = vm.instance.clone();
-        let mut seen = HashSet::new();
-        let senders = world
-            .client_webui_senders()
-            .into_iter()
-            .filter(|sender| !sender.is_closed() && seen.insert(sender.connection_id()))
-            .collect();
+        let senders = world.client_webui_senders();
         let runtime = world
             .get_resource::<HttpRuntime>()
             .expect("inference HTTP runtime missing");
@@ -239,10 +235,10 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             agent_instance,
             senders,
             runtime.client.clone(),
-            runtime.executor.clone(),
+            runtime.schedule.clone(),
         ))
     })();
-    let (route, paths, agent_address, agent_instance, senders, client, executor) = match prepared {
+    let (route, paths, agent_address, agent_instance, senders, client, schedule) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = reply.send(Err(error));
@@ -261,15 +257,13 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
     let request_id = request.id.clone();
     let turn = request.turn.clone();
     let cancel = request.cancel.clone();
+    let cleanup = InferenceCleanupFinished {
+        agent,
+        request_id: request_id.clone(),
+        instance: agent_instance.clone(),
+    };
     let context = InferenceContext {
-        cleanup_notification: Some((
-            world.event_sender(),
-            InferenceCleanupFinished {
-                agent,
-                request_id: request_id.clone(),
-                instance: agent_instance.clone(),
-            },
-        )),
+        cleanup_notification: None,
         delivery: StreamDelivery {
             id: request_id.clone(),
             agent: agent_address,
@@ -285,47 +279,111 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
         #[cfg(test)]
         cleanup_gate: None,
     };
-    let slot = Arc::new(Mutex::new(Some(context)));
-    let transferred = slot.clone();
-    let submitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        executor.spawn(async move {
-            let context = transferred
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
-            if let Some(context) = context {
-                supervise_inference(context).await;
-            }
-        })
-    }));
-    match submitted {
-        Ok(task) => {
-            world
-                .get_component_mut::<ActiveInference>(agent)
-                .expect("ActiveInference remains present")
-                .current = Some(InferenceHandle {
-                request_id,
-                turn,
-                cancel,
-                stop_stream,
-                task,
-            });
-        }
-        Err(_) => {
-            if let Some(context) = slot
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-            {
-                if let Some(reply) = context.reply {
-                    let _ = reply.send(Err(error(
-                        Kind::TaskPanicked,
-                        "inference submission failed",
-                    )));
+    let handle = InferenceHandle {
+        request_id,
+        turn,
+        cancel,
+        stop_stream,
+        task: Arc::new(inference_core::InferenceTaskState::default()),
+    };
+    world
+        .get_component_mut::<ActiveInference>(agent)
+        .expect("ActiveInference remains present")
+        .current = Some(handle.clone());
+    let launch = InferenceLaunchGuard {
+        fallback: InferenceLaunchFallback {
+            slot: Arc::new(Mutex::new(Some(context))),
+            handle,
+        },
+        armed: true,
+    };
+    // The owned guard survives submission, dispatch, and future cancellation.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        world.send_async_closure(
+            &schedule,
+            move |runtime: async_runtime_plugin::AsyncContext| {
+                // The event queue must not own a sender back into itself while queued.
+                if let Some(context) = launch
+                    .fallback
+                    .slot
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_mut()
+                {
+                    context.cleanup_notification =
+                        Some((InferenceCleanupSender::Async(runtime), cleanup));
                 }
+                launch_inference(launch)
+            },
+        );
+    }));
+}
+
+#[derive(Clone)]
+pub(crate) struct InferenceLaunchFallback {
+    slot: Arc<Mutex<Option<InferenceContext>>>,
+    handle: InferenceHandle,
+}
+impl InferenceLaunchFallback {
+    pub(crate) fn fail(&self, failure: InferenceError) {
+        self.handle.fail_launch(failure.clone());
+        if let Some(mut context) = self
+            .slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            finish_inference(&mut context, Err(failure));
+            if let Some((events, notification)) = context.cleanup_notification.take() {
+                events.send_event(notification);
             }
         }
     }
+}
+struct InferenceLaunchGuard {
+    fallback: InferenceLaunchFallback,
+    armed: bool,
+}
+impl Drop for InferenceLaunchGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.fallback.fail(error(
+                Kind::TaskPanicked,
+                "inference launch failed before supervisor handoff",
+            ));
+        }
+    }
+}
+async fn launch_inference(
+    mut launch: InferenceLaunchGuard,
+) -> Result<InferenceLaunchOutput, InferenceLaunchError> {
+    let slot = launch.fallback.slot.clone();
+    // Do not let the supervisor claim its context until the registered handle
+    // owns the real task, including on a failed attach.
+    let (start, started) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        if started.await.is_err() {
+            return;
+        }
+        let context = slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(context) = context {
+            supervise_inference(context).await;
+        }
+    });
+    launch
+        .fallback
+        .handle
+        .attach_task(task)
+        .map_err(|error| InferenceLaunchError {
+            error,
+            fallback: Some(launch.fallback.clone()),
+        })?;
+    let _ = start.send(());
+    launch.armed = false;
+    Ok(InferenceLaunchOutput)
 }
 
 async fn prepare_domain(context: &InferenceContext) -> Result<DomainRequest, InferenceError> {
@@ -768,10 +826,7 @@ fn push_stream(delivery: &mut StreamDelivery, sequence: u64, reasoning: bool, co
     let frame = json!({"type":if reasoning { "agent.message.reasoning_delta" } else { "agent.message.delta" },"id":delivery.id,"agent":delivery.agent,"agent_instance":delivery.instance,"sequence":sequence,"content":content});
     if let Ok(encoded) = serde_json::to_string(&frame) {
         delivery.senders.retain(|sender| {
-            !sender.is_closed()
-                && sender
-                    .try_send(WebSocketMessage::Text(encoded.clone().into()))
-                    .is_ok()
+            !sender.is_closed() && sender.try_send(ClientFrame::Text(encoded.clone())).is_ok()
         });
     }
 }
@@ -780,10 +835,7 @@ fn push_finished(delivery: &mut StreamDelivery, failure: Option<&InferenceError>
     let frame = json!({"type":"agent.message.finished","id":delivery.id,"agent":delivery.agent,"agent_instance":delivery.instance,"error":failure.map(|failure| json!({"kind":format!("{:?}",failure.kind),"message":failure.message}))});
     if let Ok(encoded) = serde_json::to_string(&frame) {
         delivery.senders.retain(|sender| {
-            !sender.is_closed()
-                && sender
-                    .try_send(WebSocketMessage::Text(encoded.clone().into()))
-                    .is_ok()
+            !sender.is_closed() && sender.try_send(ClientFrame::Text(encoded.clone())).is_ok()
         });
     }
 }

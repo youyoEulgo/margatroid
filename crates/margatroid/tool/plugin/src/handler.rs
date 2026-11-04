@@ -28,7 +28,8 @@ use workspace_core::Workspace;
 
 use crate::types::{
     CgroupBoundary, HostFrame, HostWire, NoExternalSchema, RunnerFrame, RunnerRequest, RunnerWire,
-    SharedBridge, ToolContext, ToolExecutionContext, WorkerBridge,
+    SharedBridge, ToolContext, ToolExecutionContext, ToolLaunchError, ToolLaunchOutput,
+    WorkerBridge,
 };
 use crate::ToolPlugin;
 
@@ -145,6 +146,7 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
             return;
         }
     };
+    let schedule = config.schedule.clone();
     let context = ToolExecutionContext {
         request,
         reply: Some(reply),
@@ -158,35 +160,81 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         tasks,
         input,
     };
-    let slot = Arc::new(Mutex::new(Some(context)));
-    let transferred = slot.clone();
-    let supervisor_handle = handle.clone();
-    let submission = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        world.spawn_async_service(async move {
-            let context = transferred
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
-            if let Some(context) = context {
-                let task = tokio::spawn(supervise_tool(context));
-                if let Err(error) = supervisor_handle.attach_task(task) {
-                    supervisor_handle.set_error(error);
-                    supervisor_handle.cancel();
-                }
-            }
-        });
+    let launch = ToolLaunchGuard {
+        fallback: ToolLaunchFallback {
+            slot: Arc::new(Mutex::new(Some(context))),
+            handle,
+        },
+        armed: true,
+    };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        world.send_async_closure(&schedule, move || launch_tool(launch));
     }));
-    if submission.is_err() {
-        if let Some(mut context) = slot
+}
+
+#[derive(Clone)]
+pub(crate) struct ToolLaunchFallback {
+    slot: Arc<Mutex<Option<ToolExecutionContext>>>,
+    handle: ToolTaskHandle,
+}
+impl ToolLaunchFallback {
+    pub(crate) fn fail(&self, failure: ToolError) {
+        if let Some(mut context) = self
+            .slot
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take()
         {
-            let failure = error(Kind::SubmitFailed, "tool supervisor submission failed");
             complete_reply(&mut context, Err(failure.clone()));
             context.handle.complete(Some(failure));
+        } else {
+            self.handle.set_error(failure);
+            self.handle.cancel();
         }
     }
+}
+struct ToolLaunchGuard {
+    fallback: ToolLaunchFallback,
+    armed: bool,
+}
+impl Drop for ToolLaunchGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.fallback.fail(error(
+                Kind::SubmitFailed,
+                "tool launch failed before supervisor handoff",
+            ));
+        }
+    }
+}
+async fn launch_tool(mut launch: ToolLaunchGuard) -> Result<ToolLaunchOutput, ToolLaunchError> {
+    let slot = launch.fallback.slot.clone();
+    // Do not let the supervisor claim its context until the registered handle
+    // owns the real task, including on a failed attach.
+    let (start, started) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        if started.await.is_err() {
+            return;
+        }
+        let context = slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(context) = context {
+            supervise_tool(context).await;
+        }
+    });
+    launch
+        .fallback
+        .handle
+        .attach_task(task)
+        .map_err(|error| ToolLaunchError {
+            error,
+            fallback: Some(launch.fallback.clone()),
+        })?;
+    let _ = start.send(());
+    launch.armed = false;
+    Ok(ToolLaunchOutput)
 }
 
 fn complete_reply(

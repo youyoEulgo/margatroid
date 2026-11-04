@@ -1,17 +1,11 @@
 use crate::{Client, ClientError, ClientRegistrationResult, RegisteredClient, WorldClientExt};
 use address::{Address, WorldAddressExt};
 use app_runtime_plugin::WorldEventExt;
+use client_core::{ClientDisconnected, RegisterClient};
 use core_plugin::World;
-use server_plugin::{
-    RegisterConnection, WebSocketConnections, WebSocketDisconnected, WebSocketNameError,
-};
 
-pub(crate) fn handle_client_registration(world: &mut World, request: &RegisterConnection) {
-    let connections = world.get_resource::<WebSocketConnections>().cloned();
-    let result = match connections {
-        Some(connections) => register_client(world, &connections, request),
-        None => Err(ClientError::ConnectionMissing),
-    };
+pub(crate) fn handle_client_registration(world: &mut World, request: &RegisterClient) {
+    let result = register_client(world, request);
     if let Err(error) = &result {
         tracing::warn!(
             request_id = %request.id,
@@ -29,8 +23,7 @@ pub(crate) fn handle_client_registration(world: &mut World, request: &RegisterCo
 
 fn register_client(
     world: &mut World,
-    connections: &WebSocketConnections,
-    request: &RegisterConnection,
+    request: &RegisterClient,
 ) -> Result<RegisteredClient, ClientError> {
     if request.id.trim().is_empty() {
         return Err(ClientError::InvalidRequest);
@@ -38,10 +31,7 @@ fn register_client(
     if !valid_client_type(&request.client_type) {
         return Err(ClientError::InvalidClientType);
     }
-    if connections
-        .get(request.connection_id)
-        .is_none_or(|sender| sender.is_closed())
-    {
+    if request.sender.is_closed() {
         return Err(ClientError::ConnectionMissing);
     }
     if world.client_by_connection(request.connection_id).is_some() {
@@ -72,41 +62,23 @@ fn register_client(
     {
         return Err(ClientError::DuplicateName);
     }
-    let old_name = connections.name(request.connection_id).unwrap_or_default();
-    let old_type = connections
-        .connection_type(request.connection_id)
-        .unwrap_or_default();
-    connections
-        .set_name(request.connection_id, name)
-        .map_err(|error| match error {
-            WebSocketNameError::NameAlreadyExists { .. } => ClientError::DuplicateName,
-            _ => ClientError::ConnectionMissing,
-        })?;
-    if !connections.set_connection_type(request.connection_id, &request.client_type) {
-        let _ = connections.set_name(request.connection_id, old_name);
-        return Err(ClientError::ConnectionMissing);
-    }
     let entity = world.spawn();
     let client = Client {
         connection_id: request.connection_id,
         client_type: request.client_type.clone(),
         name: name.into(),
+        sender: request.sender.clone(),
     };
     world.insert_component(entity, client);
     world.insert_component(entity, address);
-    if connections
-        .get(request.connection_id)
-        .is_none_or(|sender| sender.is_closed())
-    {
+    if request.sender.is_closed() {
         world.despawn(entity);
-        let _ = connections.set_name(request.connection_id, old_name);
-        connections.set_connection_type(request.connection_id, old_type);
         return Err(ClientError::ConnectionMissing);
     }
     Ok(RegisteredClient { client: entity })
 }
 
-pub(crate) fn handle_client_disconnect(world: &mut World, event: &WebSocketDisconnected) {
+pub(crate) fn handle_client_disconnect(world: &mut World, event: &ClientDisconnected) {
     let connection_id = event.connection_id;
     let entities = world
         .query_with::<Client>()

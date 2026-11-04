@@ -4,20 +4,136 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+/// Shared launch and join state. An empty launch slot is still active.
+#[derive(Default)]
+pub struct InferenceTaskState {
+    state: std::sync::Mutex<InferenceTaskStatus>,
+    changed: tokio::sync::Notify,
+}
+// Tokio JoinHandle stores a single waker. Broadcast its completion to every
+// registered waiter so dropping the last waiter cannot strand the others.
+struct InferenceTaskWake(std::sync::Weak<InferenceTaskState>);
+impl std::task::Wake for InferenceTaskWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        if let Some(state) = self.0.upgrade() {
+            state.changed.notify_waiters();
+        }
+    }
+}
+#[derive(Default)]
+enum InferenceTaskStatus {
+    #[default]
+    Pending,
+    Running(JoinHandle<()>),
+    Finished(Result<(), crate::InferenceError>),
+}
+#[derive(Clone)]
 pub struct InferenceHandle {
     pub request_id: String,
     pub turn: String,
     pub cancel: CancellationToken,
     pub stop_stream: Arc<dyn Fn() + Send + Sync>,
-    pub task: JoinHandle<()>,
+    pub task: Arc<InferenceTaskState>,
 }
 impl InferenceHandle {
+    pub fn attach_task(&self, task: JoinHandle<()>) -> Result<(), crate::InferenceError> {
+        let mut state = self
+            .task
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !matches!(*state, InferenceTaskStatus::Pending) {
+            return Err(crate::InferenceError::new(
+                crate::InferenceErrorKind::TaskPanicked,
+                "inference task already attached or launch failed",
+            ));
+        }
+        *state = InferenceTaskStatus::Running(task);
+        drop(state);
+        self.task.changed.notify_waiters();
+        Ok(())
+    }
+    pub fn fail_launch(&self, error: crate::InferenceError) {
+        let mut state = self
+            .task
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if matches!(*state, InferenceTaskStatus::Pending) {
+            *state = InferenceTaskStatus::Finished(Err(error));
+        }
+        drop(state);
+        self.task.changed.notify_waiters();
+    }
     pub fn cancel(&self) {
         (self.stop_stream)();
         self.cancel.cancel();
     }
     pub fn is_finished(&self) -> bool {
-        self.task.is_finished()
+        match &*self
+            .task
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+        {
+            InferenceTaskStatus::Pending => false,
+            InferenceTaskStatus::Running(task) => task.is_finished(),
+            InferenceTaskStatus::Finished(_) => true,
+        }
+    }
+    pub async fn wait_finished(&self) -> Result<(), crate::InferenceError> {
+        use std::future::Future;
+        use std::task::Poll;
+        loop {
+            let changed = self.task.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let result = std::future::poll_fn(|cx| {
+                let mut state = self
+                    .task
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                match &mut *state {
+                    InferenceTaskStatus::Pending => {}
+                    InferenceTaskStatus::Running(task) => {
+                        let waker = std::task::Waker::from(Arc::new(InferenceTaskWake(
+                            Arc::downgrade(&self.task),
+                        )));
+                        let mut task_context = std::task::Context::from_waker(&waker);
+                        if let Poll::Ready(result) =
+                            std::pin::Pin::new(task).poll(&mut task_context)
+                        {
+                            let result = result.map_err(|_| {
+                                crate::InferenceError::new(
+                                    crate::InferenceErrorKind::TaskPanicked,
+                                    "inference supervisor failed",
+                                )
+                            });
+                            *state = InferenceTaskStatus::Finished(result.clone());
+                            drop(state);
+                            self.task.changed.notify_waiters();
+                            return Poll::Ready(Some(result));
+                        }
+                    }
+                    InferenceTaskStatus::Finished(result) => {
+                        return Poll::Ready(Some(result.clone()))
+                    }
+                }
+                if changed.as_mut().poll(cx).is_ready() {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            if let Some(result) = result {
+                return result;
+            }
+        }
     }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

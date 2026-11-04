@@ -72,7 +72,10 @@ fn domain_cores_are_independent_and_plugins_only_depend_on_cores() {
                     assert!(
                         target.ends_with("core")
                             || target.ends_with("address")
-                            || target.ends_with("protocol"),
+                            || target.ends_with("protocol")
+                            || (domain == "dto"
+                                && name == "axum_plugin"
+                                && target.ends_with("axum_plugin")),
                         "{domain}/plugin has a domain plugin dependency: {name}"
                     );
                 }

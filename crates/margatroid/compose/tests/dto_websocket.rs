@@ -2,7 +2,8 @@ use address::Address;
 use agent_core::{Agent, AgentState, RestartAgent, StartAgent, WorldAgentExt};
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
-use client_core::{Client, WorldClientExt};
+use axum_plugin::{AxumHandle, AxumPlugin};
+use client_core::{Client, ConnectionId, WorldClientExt};
 use client_plugin::ClientPlugin;
 use closure_plugin::{AppClosureExt, ClosurePlugin};
 use config_core::{LogLevel, MargatroidConfig, OutboundTarget};
@@ -16,10 +17,6 @@ use lua_runtime_core::{DriverLuaVm, DriverLuaVmInstance, DriverWakeSlot};
 use mcl_core::MclQueue;
 use mcl_plugin::MclPlugin;
 use serde_json::{Value, json};
-use server_plugin::{
-    ServerHandle, ServerPlugin, WebSocketConnectionId, WebSocketConnections,
-    WebSocketMessageReceived,
-};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -75,7 +72,7 @@ impl Harness {
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE)
             .add_plugin(AsyncRuntimePlugin)
-            .add_plugin(ServerPlugin::bind("127.0.0.1:0"))
+            .add_plugin(AxumPlugin::bind("127.0.0.1:0".parse().unwrap()))
             .add_plugin(ClientPlugin::new())
             .add_plugin(StoragePlugin::new())
             .add_plugin(MclPlugin::new());
@@ -187,10 +184,11 @@ impl Harness {
         app.tick();
         let deadline = Instant::now() + Duration::from_secs(5);
         let server = loop {
+            app.tick();
             if let Some(address) = app
                 .world()
-                .get_resource::<ServerHandle>()
-                .and_then(ServerHandle::local_address)
+                .get_resource::<AxumHandle>()
+                .and_then(AxumHandle::local_address)
             {
                 break address;
             }
@@ -215,40 +213,64 @@ impl Harness {
         }
     }
 
-    fn connect(&mut self) -> (Socket, WebSocketConnectionId) {
-        let before = self
-            .app
-            .world()
-            .get_resource::<WebSocketConnections>()
-            .unwrap()
-            .get_all()
-            .into_iter()
-            .map(|sender| sender.connection_id())
-            .collect::<Vec<_>>();
-        let (socket, _) = self
-            .runtime
+    fn connect(&mut self) -> Socket {
+        self.runtime
             .block_on(tokio_tungstenite::connect_async(format!(
                 "ws://{}/ws",
                 self.server
             )))
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            self.app.tick();
-            if let Some(sender) = self
-                .app
-                .world()
-                .get_resource::<WebSocketConnections>()
-                .unwrap()
-                .get_all()
-                .into_iter()
-                .find(|sender| !before.contains(&sender.connection_id()))
-            {
-                return (socket, sender.connection_id());
-            }
-            assert!(Instant::now() < deadline);
-            std::thread::yield_now();
-        }
+            .unwrap()
+            .0
+    }
+
+    fn registered_connection(&self, registration: &Value) -> ConnectionId {
+        let address = registration["client"]["resource_id"].as_str().unwrap();
+        self.app
+            .world()
+            .query_with::<Client>()
+            .result()
+            .into_iter()
+            .find_map(|entity| {
+                (self
+                    .app
+                    .world()
+                    .get_component::<Address>(entity)
+                    .unwrap()
+                    .as_str()
+                    == address)
+                    .then(|| {
+                        self.app
+                            .world()
+                            .get_component::<Client>(entity)
+                            .unwrap()
+                            .connection_id
+                    })
+            })
+            .expect("registration must create a Client with the original connection")
+    }
+
+    // The native transport replies to Ping only after consuming the preceding
+    // request. No World tick runs here: the DTO ingress is queued for UPDATE.
+    fn ingress_barrier(&self, socket: &mut Socket) {
+        self.runtime.block_on(async {
+            socket
+                .send(Message::Ping(b"ingress-barrier".to_vec().into()))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match socket.next().await.unwrap().unwrap() {
+                        Message::Pong(payload) if payload.as_ref() == b"ingress-barrier" => break,
+                        Message::Close(frame) => {
+                            panic!("socket closed before ingress barrier: {frame:?}")
+                        }
+                        _ => (),
+                    }
+                }
+            })
+            .await
+            .expect("native websocket did not acknowledge ingress");
+        });
     }
 
     fn send(&self, socket: &mut Socket, value: Value) {
@@ -330,8 +352,9 @@ impl Harness {
 #[test]
 fn websocket_registration_mcl_reply_and_audit_use_original_network_identity() {
     let mut harness = Harness::new();
-    let (mut socket, connection) = harness.connect();
+    let mut socket = harness.connect();
     let registered = harness.register(&mut socket, "webui", "browser");
+    let connection = harness.registered_connection(&registered);
     assert_eq!(registered["id"], "register");
     assert!(
         registered["client"]["resource_id"]
@@ -382,7 +405,7 @@ fn websocket_registration_mcl_reply_and_audit_use_original_network_identity() {
 #[test]
 fn agent_start_and_restart_follow_request_kind_and_return_live_addresses() {
     let mut harness = Harness::new();
-    let (mut socket, _) = harness.connect();
+    let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "browser");
     let message = json!({"workspace": "workspace:local/demo", "name": "coder", "parameters": {"driver": "driver:local/new", "home_root": "new-home"}});
     harness.request(&mut socket, "agent.start", "start", message.clone());
@@ -444,7 +467,7 @@ fn workspace_paths_and_definition_cache_are_direct_and_stop_preserves_public_ref
                 members: vec![],
             },
         );
-    let (mut socket, _) = harness.connect();
+    let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "browser");
     harness.request(
         &mut socket,
@@ -530,7 +553,7 @@ fn persisted_history_sequences_timestamps_and_state_histories_are_not_reinvented
     connection
         .execute("DELETE FROM agent_messages WHERE sequence=1", [])
         .unwrap();
-    let (mut socket, _) = harness.connect();
+    let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "browser");
     harness.request(
         &mut socket,
@@ -578,7 +601,7 @@ fn persisted_history_sequences_timestamps_and_state_histories_are_not_reinvented
 #[test]
 fn configured_state_and_logs_deduplicate_targets_and_never_leak_to_other_clients() {
     let mut harness = Harness::new();
-    let (mut browser, _) = harness.connect();
+    let mut browser = harness.connect();
     harness.register(&mut browser, "webui", "browser");
     harness.next(&mut browser, |value| value["type"] == "state.sync");
     assert!(
@@ -587,14 +610,8 @@ fn configured_state_and_logs_deduplicate_targets_and_never_leak_to_other_clients
             .iter()
             .all(|value| value["type"] != "state.sync")
     );
-    let (mut terminal, terminal_id) = harness.connect();
+    let mut terminal = harness.connect();
     harness.register(&mut terminal, "cli", "terminal");
-    harness
-        .app
-        .world()
-        .get_resource::<WebSocketConnections>()
-        .unwrap()
-        .set_connection_type(terminal_id, "webui");
     assert!(
         harness
             .collect(&mut terminal, 10)
@@ -639,7 +656,7 @@ fn configured_state_and_logs_deduplicate_targets_and_never_leak_to_other_clients
             .iter()
             .all(|value| value["type"] != "log")
     );
-    let (mut second, _) = harness.connect();
+    let mut second = harness.connect();
     harness.register(&mut second, "webui", "second-browser");
     harness.next(&mut second, |value| value["type"] == "state.sync");
     assert!(
@@ -653,7 +670,7 @@ fn configured_state_and_logs_deduplicate_targets_and_never_leak_to_other_clients
 #[test]
 fn abort_control_runs_next_frame_rechecks_instance_and_freezes_before_cancel_without_tools() {
     let mut harness = Harness::new();
-    let (mut socket, _) = harness.connect();
+    let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "browser");
     let turn = harness
         .app
@@ -681,23 +698,23 @@ fn abort_control_runs_next_frame_rechecks_instance_and_freezes_before_cancel_wit
         .world_mut()
         .get_component_mut::<ActiveInference>(harness.agent)
         .unwrap()
-        .current = Some(InferenceHandle {
-        request_id: "inference".into(),
-        turn: turn.clone(),
-        cancel: cancel.clone(),
-        stop_stream: Arc::new(move || {
-            assert!(!observed.is_cancelled());
-            marked.store(true, std::sync::atomic::Ordering::Release);
-        }),
-        task: handle,
+        .current = Some({
+        let inference = InferenceHandle {
+            request_id: "inference".into(),
+            turn: turn.clone(),
+            cancel: cancel.clone(),
+            stop_stream: Arc::new(move || {
+                assert!(!observed.is_cancelled());
+                marked.store(true, std::sync::atomic::Ordering::Release);
+            }),
+            task: Default::default(),
+        };
+        inference.attach_task(handle).unwrap();
+        inference
     });
     harness.request(&mut socket, "agent.turn.abort", "abort", json!({"workspace": "workspace:local/demo", "agent": "agent:demo/coder", "agent_instance": "driver-first", "turn_id": turn}));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        harness.app.tick();
-        if harness.app.world().event_reader::<WebSocketMessageReceived>().into_iter().any(|event| matches!(&event.message, server_plugin::WebSocketMessage::Text(text) if text.contains("\"abort\""))) { break; }
-        assert!(Instant::now() < deadline);
-    }
+    harness.ingress_barrier(&mut socket);
+    harness.app.tick();
     assert!(!cancel.is_cancelled());
     assert!(
         harness
@@ -723,7 +740,7 @@ fn abort_control_runs_next_frame_rechecks_instance_and_freezes_before_cancel_wit
         .current
         .take()
         .unwrap();
-    harness.runtime.block_on(active.task).unwrap();
+    harness.runtime.block_on(active.wait_finished()).unwrap();
     let next_turn = harness
         .app
         .world()
@@ -744,12 +761,8 @@ fn abort_control_runs_next_frame_rechecks_instance_and_freezes_before_cancel_wit
         .agent_start_turn(harness.agent)
         .unwrap();
     harness.request(&mut socket, "agent.turn.abort", "stale", json!({"workspace": "workspace:local/demo", "agent": "agent:demo/coder", "agent_instance": "driver-first", "turn_id": turn}));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        harness.app.tick();
-        if harness.app.world().event_reader::<WebSocketMessageReceived>().into_iter().any(|event| matches!(&event.message, server_plugin::WebSocketMessage::Text(text) if text.contains("\"stale\""))) { break; }
-        assert!(Instant::now() < deadline);
-    }
+    harness.ingress_barrier(&mut socket);
+    harness.app.tick();
     vm(harness.app.world_mut(), harness.agent, "driver-new");
     let reply = harness.next(&mut socket, |value| value["id"] == "stale");
     assert_eq!(reply["result"]["Err"]["kind"], "InstanceMismatch");
@@ -767,9 +780,10 @@ fn abort_control_runs_next_frame_rechecks_instance_and_freezes_before_cancel_wit
 #[test]
 fn same_network_id_on_two_connections_and_disconnected_late_results_stay_isolated() {
     let mut harness = Harness::new();
-    let (mut first, first_id) = harness.connect();
-    harness.register(&mut first, "webui", "first");
-    let (mut second, _) = harness.connect();
+    let mut first = harness.connect();
+    let registered = harness.register(&mut first, "webui", "first");
+    let first_id = harness.registered_connection(&registered);
+    let mut second = harness.connect();
     harness.register(&mut second, "webui", "second");
     for (socket, path) in [(&mut first, "/first.yaml"), (&mut second, "/second.yaml")] {
         harness.request(socket, "workspace.start", "same-id", json!({"path": path}));
@@ -817,7 +831,7 @@ fn same_network_id_on_two_connections_and_disconnected_late_results_stay_isolate
             member_errors: vec![],
         }),
     });
-    let (mut replacement, _) = harness.connect();
+    let mut replacement = harness.connect();
     harness.register(&mut replacement, "webui", "second");
     assert!(
         harness
@@ -850,7 +864,7 @@ fn oversized_history_and_state_queries_return_correlated_failures() {
         },
     )
     .unwrap();
-    let (mut socket, _) = harness.connect();
+    let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "browser");
     harness.request(
         &mut socket,
@@ -870,7 +884,7 @@ fn oversized_history_and_state_queries_return_correlated_failures() {
 #[test]
 fn stale_vm_mcl_results_do_not_bind_to_new_instance_and_invalid_input_never_echoes_secrets() {
     let mut harness = Harness::new();
-    let (mut socket, _) = harness.connect();
+    let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "browser");
     harness
         .app
@@ -984,7 +998,7 @@ fn resource_panel_snapshot_advertises_imported_aliases_without_file_paths() {
             alias: Some("read_only".into()),
         },
     );
-    let (mut socket, _) = harness.connect();
+    let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "resource-panel");
     harness.request(&mut socket, "state.query", "resources", json!({}));
     let state = harness.next(&mut socket, |value| {
@@ -995,4 +1009,48 @@ fn resource_panel_snapshot_advertises_imported_aliases_without_file_paths() {
     assert_eq!(agent["sandboxes"], json!(["read_only"]));
     assert_eq!(agent["sandbox"], "read_only");
     assert!(!agent.to_string().contains("private/"));
+}
+
+#[test]
+fn native_service_shutdown_closes_registered_and_unregistered_connections() {
+    let mut harness = Harness::new();
+    let mut registered = harness.connect();
+    harness.register(&mut registered, "webui", "shutdown-browser");
+    let _unregistered = harness.connect();
+    let handle = harness
+        .app
+        .world()
+        .get_resource::<AxumHandle>()
+        .unwrap()
+        .clone();
+    handle.request_shutdown();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !handle.is_stopped()
+        || !harness
+            .app
+            .world()
+            .query_with::<client_core::Client>()
+            .result()
+            .is_empty()
+    {
+        harness.app.tick();
+        assert!(
+            Instant::now() < deadline,
+            "native service did not close connections and registered identities"
+        );
+        std::thread::yield_now();
+    }
+    assert!(handle.result().unwrap().is_ok());
+    harness.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match registered.next().await {
+                    None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await
+        .expect("registered socket did not close after pending frames");
+    });
 }

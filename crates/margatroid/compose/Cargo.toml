@@ -9,7 +9,7 @@ app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
 closure_plugin = { path = "../../mecs/closure_plugin" }
 log_plugin = { path = "../../mecs/log_plugin" }
-server_plugin = { path = "../../mecs/server_plugin" }
+axum_plugin = { path = "../axum_plugin" }
 config_core = { path = "../config/core" }
 workspace_core = { path = "../workspace/core" }
 config_plugin = { path = "../config/plugin" }
@@ -26,6 +26,7 @@ lua_runtime_plugin = { path = "../lua_runtime/plugin" }
 mcl_plugin = { path = "../mcl/plugin" }
 dto_plugin = { path = "../dto/plugin" }
 ui_plugin = { path = "../ui_plugin" }
+tokio = { workspace = true }
 
 [dev-dependencies]
 address = { path = "../address" }

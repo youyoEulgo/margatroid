@@ -5,4 +5,4 @@ edition = "2021"
 
 [dependencies]
 core_plugin = { path = "../../../mecs/core_plugin" }
-server_plugin = { path = "../../../mecs/server_plugin" }
+tokio = { workspace = true }

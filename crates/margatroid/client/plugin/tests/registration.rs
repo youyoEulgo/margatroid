@@ -1,147 +1,70 @@
 use address::{Address, WorldAddressExt};
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
-use async_runtime_plugin::AsyncRuntimePlugin;
 use client_plugin::{
-    Client, ClientError, ClientPlugin, ClientRegistrationResult, RegisteredClient, WorldClientExt,
+    Client, ClientDisconnected, ClientError, ClientFrame, ClientPlugin, ClientRegistrationResult,
+    ClientSender, ConnectionId, RegisterClient, RegisteredClient, WorldClientExt,
 };
 use core_plugin::App;
-use server_plugin::{
-    AppServerExt, RegisterConnection, ServerHandle, ServerPlugin, WebSocketConnectionId,
-    WebSocketConnections,
-};
-use std::net::SocketAddr;
-use std::thread;
-use std::time::{Duration, Instant};
-
-type Socket =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+use std::collections::BTreeMap;
 struct Harness {
     app: App,
-    runtime: tokio::runtime::Runtime,
-    address: SocketAddr,
+    next: u64,
+    senders: BTreeMap<ConnectionId, ClientSender>,
 }
 impl Harness {
     fn new() -> Self {
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
-            .add_plugin(AsyncRuntimePlugin)
-            .add_plugin(ServerPlugin::bind("127.0.0.1:0"))
-            .add_websocket_event_route("/ws")
             .add_plugin(ClientPlugin::default());
-        app.tick();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let address = loop {
-            if let Some(address) = app
-                .world()
-                .get_resource::<ServerHandle>()
-                .and_then(ServerHandle::local_address)
-            {
-                break address;
-            }
-            assert!(Instant::now() < deadline, "server startup timed out");
-            thread::yield_now();
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
         Self {
             app,
-            runtime,
-            address,
+            next: 0,
+            senders: BTreeMap::new(),
         }
     }
-    fn connect(&mut self) -> (Socket, WebSocketConnectionId) {
-        let existing = self
-            .app
-            .world()
-            .get_resource::<WebSocketConnections>()
-            .unwrap()
-            .get_all()
-            .into_iter()
-            .map(|sender| sender.connection_id())
-            .collect::<Vec<_>>();
-        let (socket, _) = self
-            .runtime
-            .block_on(tokio_tungstenite::connect_async(format!(
-                "ws://{}/ws",
-                self.address
-            )))
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let connection = loop {
-            self.app.tick();
-            if let Some(sender) = self
-                .app
-                .world()
-                .get_resource::<WebSocketConnections>()
-                .unwrap()
-                .get_all()
-                .into_iter()
-                .find(|sender| !existing.contains(&sender.connection_id()))
-            {
-                break sender.connection_id();
-            }
-            assert!(
-                Instant::now() < deadline,
-                "connection registration timed out"
-            );
-            thread::yield_now();
-        };
-        (socket, connection)
+    fn connect(&mut self) -> (tokio::sync::mpsc::Receiver<ClientFrame>, ConnectionId) {
+        self.next += 1;
+        let id = ConnectionId::new(self.next);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        self.senders.insert(id, ClientSender::new(tx));
+        (rx, id)
     }
     fn register(
         &mut self,
-        connection: WebSocketConnectionId,
+        connection: ConnectionId,
         id: &str,
         kind: &str,
         name: Option<&str>,
     ) -> Result<RegisteredClient, ClientError> {
-        self.app.world().send_event(RegisterConnection {
+        self.app.world().send_event(RegisterClient {
             id: id.into(),
             connection_id: connection,
             client_type: kind.into(),
             name: name.map(str::to_owned),
+            sender: self.senders[&connection].clone(),
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            self.app.tick();
-            if let Some(result) = self
-                .app
-                .world()
-                .event_reader::<ClientRegistrationResult>()
-                .into_iter()
-                .find(|event| event.id == id)
-            {
-                return result.result.clone();
-            }
-            assert!(
-                Instant::now() < deadline,
-                "client registration reply timed out"
-            );
-            thread::yield_now();
-        }
+        self.app.tick();
+        self.app.tick();
+        self.app
+            .world()
+            .event_reader::<ClientRegistrationResult>()
+            .into_iter()
+            .find(|event| event.id == id)
+            .unwrap()
+            .result
+            .clone()
     }
-    fn disconnect(&mut self, mut socket: Socket, connection: WebSocketConnectionId) {
-        self.runtime.block_on(socket.close(None)).unwrap();
-        drop(socket);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            self.app.tick();
-            if self
-                .app
-                .world()
-                .get_resource::<WebSocketConnections>()
-                .unwrap()
-                .get(connection)
-                .is_none()
-                && self.app.world().client_by_connection(connection).is_none()
-            {
-                break;
-            }
-            assert!(Instant::now() < deadline, "disconnect cleanup timed out");
-            thread::yield_now();
-        }
+    fn disconnect(
+        &mut self,
+        receiver: tokio::sync::mpsc::Receiver<ClientFrame>,
+        connection: ConnectionId,
+    ) {
+        drop(receiver);
+        self.app.world().send_event(ClientDisconnected {
+            connection_id: connection,
+        });
+        self.app.tick();
+        self.app.tick();
     }
 }
 
@@ -170,7 +93,7 @@ fn registration_has_an_independent_address_and_disconnect_destroys_both() {
 }
 
 #[test]
-fn failed_registration_never_updates_metadata_or_spawns_a_client() {
+fn failed_registration_never_spawns_a_client() {
     let mut harness = Harness::new();
     let (socket, connection) = harness.connect();
     for (id, kind, name, error) in [
@@ -194,7 +117,7 @@ fn failed_registration_never_updates_metadata_or_spawns_a_client() {
 }
 
 #[test]
-fn occupied_address_is_rejected_without_overwriting_connection_or_owner() {
+fn occupied_address_is_rejected_without_overwriting_owner() {
     let mut harness = Harness::new();
     let (socket, connection) = harness.connect();
     let blocker = harness.app.world_mut().spawn();
@@ -220,19 +143,12 @@ fn occupied_address_is_rejected_without_overwriting_connection_or_owner() {
 }
 
 #[test]
-fn source_identity_uses_component_instead_of_mutable_connection_labels() {
+fn source_identity_and_sender_snapshot_use_registered_components() {
     let mut harness = Harness::new();
     let (socket, connection) = harness.connect();
     let registered = harness
         .register(connection, "register", "webui", Some("original"))
         .unwrap();
-    let connections = harness
-        .app
-        .world()
-        .get_resource::<WebSocketConnections>()
-        .unwrap();
-    connections.set_name(connection, "spoofed").unwrap();
-    connections.set_connection_type(connection, "spoofed");
     let world = harness.app.world();
     let (entity, client) = world.client_by_connection(connection).unwrap();
     assert_eq!(entity, registered.client);
@@ -263,4 +179,82 @@ fn default_name_and_duplicate_registration_use_current_connection() {
         Err(ClientError::DuplicateClient)
     );
     harness.disconnect(socket, connection);
+}
+
+#[test]
+fn closed_receiver_rejects_registration_and_sender_reports_capacity() {
+    let mut harness = Harness::new();
+    let (mut receiver, id) = harness.connect();
+    let sender = harness.senders[&id].clone();
+    for _ in 0..8 {
+        sender.try_send(ClientFrame::Text("test".into())).unwrap();
+    }
+    assert_eq!(
+        sender.try_send(ClientFrame::Binary(vec![])),
+        Err(client_plugin::ClientSendError::Full)
+    );
+    assert!(receiver.try_recv().is_ok());
+    sender
+        .try_send(ClientFrame::Close {
+            code: 1000,
+            reason: String::new(),
+        })
+        .unwrap();
+    drop(receiver);
+    assert!(sender.is_closed());
+    assert_eq!(
+        sender.try_send(ClientFrame::Text(String::new())),
+        Err(client_plugin::ClientSendError::Closed)
+    );
+    assert_eq!(
+        harness.register(id, "closed", "webui", None),
+        Err(ClientError::ConnectionMissing)
+    );
+}
+
+#[test]
+fn duplicate_names_are_rejected_and_disconnect_is_idempotent() {
+    let mut harness = Harness::new();
+    let (first_rx, first) = harness.connect();
+    let (second_rx, second) = harness.connect();
+    let registered = harness
+        .register(first, "first", "webui", Some("shared"))
+        .unwrap();
+    assert_eq!(
+        harness.register(second, "second", "cli", Some("shared")),
+        Err(ClientError::DuplicateName)
+    );
+    harness.disconnect(first_rx, first);
+    harness.app.world().send_event(ClientDisconnected {
+        connection_id: first,
+    });
+    harness.app.tick();
+    harness.app.tick();
+    assert!(!harness.app.world().is_alive(registered.client));
+    assert!(harness
+        .register(second, "retry", "webui", Some("shared"))
+        .is_ok());
+    harness.disconnect(second_rx, second);
+}
+
+#[test]
+fn webui_sender_snapshots_deduplicate_connection_ids_and_skip_closed_capabilities() {
+    let mut harness = Harness::new();
+    let (receiver, connection) = harness.connect();
+    let registered = harness
+        .register(connection, "register", "webui", None)
+        .unwrap();
+    let client = harness
+        .app
+        .world()
+        .get_component::<Client>(registered.client)
+        .unwrap()
+        .clone();
+    let duplicate = harness.app.world_mut().spawn();
+    harness.app.world_mut().insert_component(duplicate, client);
+    let snapshot = harness.app.world().client_webui_senders();
+    assert_eq!(snapshot.len(), 1);
+    drop(receiver);
+    assert!(snapshot[0].is_closed());
+    assert!(harness.app.world().client_webui_senders().is_empty());
 }

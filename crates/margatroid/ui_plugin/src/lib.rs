@@ -5,6 +5,7 @@ use axum::http::{header, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
+use axum_plugin::AppAxumExt;
 use core_plugin::{App, Plugin, Resource};
 use rust_embed::RustEmbed;
 
@@ -51,6 +52,7 @@ impl Plugin for UiPlugin {
             panic!("UiPlugin is already installed");
         }
         app.world_mut().insert_resource(UiPluginInstalled);
+        app.add_axum_routes(Self::router());
     }
 }
 

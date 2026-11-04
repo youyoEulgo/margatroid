@@ -49,7 +49,7 @@ HTTP/SSE读取任务只向一个有界ProviderFragment通道写入，不直接�
 
 ## 中止与结果
 
-本轮保留原网络路径：Axum收到消息后发送通用网络事件，DTO处理后发送专属中止事件，下一帧处理控制。不改变Axum、mecs事件可见性或新增网络快速通道。
+DTO原生WebSocket读循环解析协议后投递自有DtoRequest，UPDATE转换为专属中止事件，下一帧控制处理。保留两帧业务语义，不依赖通用网络事件或新增直接取消通道。
 
 后端受理中止时同步关闭本次StreamGate，再触发任务取消。接受分片与关闭门共用同一短锁；门关闭后不再累积或准备发送任何新分片。receiver直接关闭并丢弃剩余队列，不继续排空，不等HTTP退出后才冻结。
 
@@ -64,3 +64,5 @@ HTTP/SSE读取任务只向一个有界ProviderFragment通道写入，不直接�
 ## 预算
 
 配置、请求体、SSE缓冲、响应、工具参数和发送队列均有上限。单消息图片最多8张、每张解码5MiB、合计20MiB；请求和响应总量各不超过32MiB，单SSE事件不超过4MiB。整体推理默认180秒，单连接发送等待最多100ms。预算错误不自动重试、续写或压缩。
+
+推理通过普通异步闭包进行短启动交接，监督任务由共享InferenceHandle持有；未交接的Pending句柄仍算活动，wait_finished等待真实join，支持多个等待者和等待者取消。HTTP客户端不缓存Tokio执行器Handle、不使用临时服务握手；前端出口使用client_core::ClientSender和ClientFrame，不依赖mecs服务器类型。

@@ -4,14 +4,13 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Component;
 use std::sync::{Arc, Mutex};
 
-use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::WorldAsyncExt;
 use core_plugin::World;
 use prompt_resource_core::{
     read_prompt, ImportPrompt, PromptResourceError, PromptResourceErrorKind as Kind, Prompts,
 };
 
-use crate::types::{ImportConfig, ImportContext, ImportError, ImportOutput};
+use crate::types::{ImportConfig, ImportContext, ImportError, ImportOutput, ImportTaskError};
 
 pub(crate) fn handle_import(world: &mut World, request: ImportPrompt) {
     let Some(reply) = request
@@ -53,10 +52,20 @@ pub(crate) fn handle_import(world: &mut World, request: ImportPrompt) {
         reply: Arc::new(Mutex::new(Some(reply))),
     };
     let fallback = context.clone();
-    let events = world.event_sender();
+    let schedule = world
+        .get_resource::<ImportConfig>()
+        .expect("import configuration")
+        .schedule
+        .clone();
+    let guard = ImportReplyGuard(Some(context.clone()));
     let submission = catch_unwind(AssertUnwindSafe(|| {
-        world.spawn_async_service(async move {
-            events.send_event(validate_import(context).await);
+        world.send_async_closure(&schedule, move || async move {
+            let mut guard = guard;
+            let result = validate_import(context)
+                .await
+                .map_err(ImportTaskError::Validation);
+            guard.0 = None;
+            result
         });
     }));
     if submission.is_err() {
@@ -170,5 +179,21 @@ fn respond(context: &ImportContext, result: Result<(), PromptResourceError>) {
         .take()
     {
         let _ = reply.send(result);
+    }
+}
+
+struct ImportReplyGuard(Option<ImportContext>);
+impl Drop for ImportReplyGuard {
+    fn drop(&mut self) {
+        if let Some(context) = self.0.take() {
+            respond(
+                &context,
+                Err(PromptResourceError::new(
+                    Kind::WorkerFailed,
+                    "resource validation task failed before returning its result",
+                )
+                .with_path(&context.path)),
+            );
+        }
     }
 }

@@ -1,3 +1,5 @@
+Margatroid领域实现契约；本领域已切换，mecs现有实现保持不动，后续另行清理。
+
 # 伪代码格式
 
 ```text
@@ -23,11 +25,13 @@
 公开：
 ```text
 UiPlugin：静态资源插件
-    router() -> Router
-        行为：提供index与嵌入资源路由，挂到已有Server，不另开端口。
+    router() -> axum::Router
+        行为：提供根路径与嵌入资源路由，handler直接返回原生Response，完成自有State装配后返回Router<()>。
     impl Plugin for UiPlugin
         build(self, app: &mut App)
-            行为：拒绝重复安装，写入安装标记；不注册业务System。
+            行为：检查AxumHandle，拒绝重复安装，写安装标记；自行调用AppAxumExt::add_axum_routes(Self::router())，共用AxumPlugin监听端口；不注册业务System。
+            行为：Compose只安装UiPlugin，无需手工注册router；不经过通用HTTP请求事件。
+            行为：axum_plugin是Margatroid基础设施依赖例外，不允许依赖DTO等业务plugin；本轮不实现Driver WebUI。
 
 UiAssets：编译期嵌入资源
     get(path: &str) -> Option<EmbeddedFile>
@@ -78,8 +82,9 @@ ComposerState：草稿--目标、文本、图片及等待回执状态
 # 持有关系
 
 ```text
-已有HTTP Server
-└── UiPlugin静态路由
+AxumPlugin（Margatroid基础设施）
+└── UiPlugin::build注册的原生Router
+    └── 嵌入资源handler -> Response
 
 浏览器Workbench
 ├── WebSocket连接

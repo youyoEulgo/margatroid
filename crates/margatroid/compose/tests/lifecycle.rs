@@ -27,6 +27,29 @@ fn copy_tree(source: &Path, target: &Path) {
     }
 }
 
+fn get_static(address: std::net::SocketAddr, path: &str) -> (String, Vec<u8>) {
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let split = response
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    (
+        String::from_utf8(response[..split].to_vec()).unwrap(),
+        response[split..].to_vec(),
+    )
+}
+
 fn command(
     app: &mut App,
     agent: Entity,
@@ -157,6 +180,36 @@ fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
         assert!(Instant::now() < deadline, "workspace did not start");
         std::thread::sleep(Duration::from_millis(2));
     };
+    let address = app
+        .world()
+        .get_resource::<axum_plugin::AxumHandle>()
+        .unwrap()
+        .local_address()
+        .unwrap();
+    let (headers, index) = get_static(address, "/");
+    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: text/html")
+    );
+    let index = String::from_utf8(index).unwrap();
+    assert!(index.contains("<div id=\"app\"></div>"));
+    let script = index
+        .split("src=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let (headers, script) = get_static(address, script);
+    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: text/javascript")
+    );
+    assert!(!script.is_empty());
     let agent = *app
         .world()
         .get_component::<Workspace>(workspace)

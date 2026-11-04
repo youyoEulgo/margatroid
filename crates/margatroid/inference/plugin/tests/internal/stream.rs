@@ -168,8 +168,9 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
         turn: "turn".into(),
         cancel,
         stop_stream: Arc::new(move || frozen.lock().unwrap().close()),
-        task,
+        task: Arc::new(inference_core::InferenceTaskState::default()),
     };
+    handle.attach_task(task).unwrap();
     sender.send(chat("accepted")).await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         while gate.lock().unwrap().accumulator.content != "accepted" {
@@ -190,7 +191,7 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
     let _ = sender.send(chat("must-not-appear")).await;
     assert_eq!(gate.lock().unwrap().accumulator.content, "accepted");
     release.notify_one();
-    tokio::time::timeout(Duration::from_secs(2), handle.task)
+    tokio::time::timeout(Duration::from_secs(2), handle.wait_finished())
         .await
         .unwrap()
         .unwrap();
@@ -230,8 +231,9 @@ async fn provider_error_replies_before_stalled_cleanup_and_retains_active_handle
         turn: "turn".into(),
         cancel,
         stop_stream: Arc::new(move || frozen.lock().unwrap().close()),
-        task,
+        task: Arc::new(inference_core::InferenceTaskState::default()),
     };
+    handle.attach_task(task).unwrap();
     sender.send("data: invalid-json\n\n".into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(1), entered.notified())
         .await
@@ -281,7 +283,7 @@ async fn provider_error_replies_before_stalled_cleanup_and_retains_active_handle
         .unwrap();
     assert!(!handle.is_finished());
     release.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), handle.task)
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_finished())
         .await
         .unwrap()
         .unwrap();
@@ -315,8 +317,9 @@ async fn cancellation_cleanup_budget_replies_error_and_keeps_real_join_active() 
         turn: "turn".into(),
         cancel,
         stop_stream: Arc::new(move || frozen.lock().unwrap().close()),
-        task,
+        task: Arc::new(inference_core::InferenceTaskState::default()),
     };
+    handle.attach_task(task).unwrap();
     sender.send(chat("accepted")).await.unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         while gate.lock().unwrap().accumulator.content != "accepted" {
@@ -341,7 +344,7 @@ async fn cancellation_cleanup_budget_replies_error_and_keeps_real_join_active() 
     );
     assert!(gate.lock().unwrap().closed);
     release.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), handle.task)
+    tokio::time::timeout(Duration::from_secs(1), handle.wait_finished())
         .await
         .unwrap()
         .unwrap();
@@ -394,19 +397,25 @@ async fn real_cleanup_wakes_matching_driver_only_after_supervisor_finishes() {
         client: reqwest::Client::new(),
         gate: Arc::new(Mutex::new(StreamGate::default())),
         delivery: delivery(),
-        cleanup_notification: Some((app.world().event_sender(), cleanup.clone())),
+        cleanup_notification: Some((
+            InferenceCleanupSender::Runtime(app.world().event_sender()),
+            cleanup.clone(),
+        )),
         cleanup_gate: Some((entered.clone(), release.clone())),
     }));
     app.world_mut().insert_component(
         agent,
         ActiveInference {
-            current: Some(InferenceHandle {
-                request_id: "request".into(),
-                turn: "turn".into(),
-                cancel,
-                stop_stream: Arc::new(|| {}),
+            current: Some(attach_handle(
+                InferenceHandle {
+                    request_id: "request".into(),
+                    turn: "turn".into(),
+                    cancel,
+                    stop_stream: Arc::new(|| {}),
+                    task: Arc::new(inference_core::InferenceTaskState::default()),
+                },
                 task,
-            }),
+            )),
         },
     );
     sender.send("data: invalid-json\n\n".into()).await.unwrap();
@@ -521,13 +530,16 @@ async fn cleanup_event_retries_next_frame_until_actual_handle_finishes() {
     app.world_mut().insert_component(
         agent,
         ActiveInference {
-            current: Some(InferenceHandle {
-                request_id: "request".into(),
-                turn: "turn".into(),
-                cancel: CancellationToken::new(),
-                stop_stream: Arc::new(|| {}),
+            current: Some(attach_handle(
+                InferenceHandle {
+                    request_id: "request".into(),
+                    turn: "turn".into(),
+                    cancel: CancellationToken::new(),
+                    stop_stream: Arc::new(|| {}),
+                    task: Arc::new(inference_core::InferenceTaskState::default()),
+                },
                 task,
-            }),
+            )),
         },
     );
     app.world().send_event(InferenceCleanupFinished {
@@ -1257,4 +1269,222 @@ async fn status_error_body_cancellation_remains_immediate() {
     );
     let _ = release.send(());
     server.await.unwrap();
+}
+
+fn attach_handle(handle: InferenceHandle, task: tokio::task::JoinHandle<()>) -> InferenceHandle {
+    handle.attach_task(task).unwrap();
+    handle
+}
+
+fn pending_handle() -> InferenceHandle {
+    InferenceHandle {
+        request_id: "request".into(),
+        turn: "turn".into(),
+        cancel: CancellationToken::new(),
+        stop_stream: Arc::new(|| {}),
+        task: Arc::new(inference_core::InferenceTaskState::default()),
+    }
+}
+
+#[tokio::test]
+async fn shared_handle_waiters_cover_pending_launch_and_real_join() {
+    let handle = pending_handle();
+    let clone = handle.clone();
+    let first = handle.wait_finished();
+    let second = clone.wait_finished();
+    tokio::pin!(first, second);
+    assert!(!handle.is_finished());
+    assert!(first.as_mut().now_or_never().is_none());
+    assert!(second.as_mut().now_or_never().is_none());
+    let (release, blocked) = oneshot::channel();
+    handle
+        .attach_task(tokio::spawn(async move {
+            blocked.await.unwrap();
+        }))
+        .unwrap();
+    assert!(!clone.is_finished());
+    // Both futures observed the launch transition before the actual join.
+    assert!(first.as_mut().now_or_never().is_none());
+    assert!(second.as_mut().now_or_never().is_none());
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (first, second) = tokio::join!(first, second);
+        first.unwrap();
+        second.unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(handle.is_finished());
+    assert!(clone.is_finished());
+    handle.wait_finished().await.unwrap();
+}
+
+#[tokio::test]
+async fn launch_guard_preserves_original_reply_and_finishes_pending_handle() {
+    let handle = pending_handle();
+    let (reply, received) = oneshot::channel();
+    let guard = InferenceLaunchGuard {
+        fallback: InferenceLaunchFallback {
+            handle: handle.clone(),
+            slot: Arc::new(Mutex::new(Some(InferenceContext {
+                request: request(),
+                reply: Some(reply),
+                route: route("http://127.0.0.1:1".into()),
+                tools: vec![],
+                client: reqwest::Client::new(),
+                gate: Arc::new(Mutex::new(StreamGate::default())),
+                delivery: delivery(),
+                cleanup_notification: None,
+                cleanup_gate: None,
+            }))),
+        },
+        armed: true,
+    };
+    assert!(!handle.is_finished());
+    drop(guard);
+    assert_eq!(
+        received.await.unwrap().unwrap_err().kind,
+        Kind::TaskPanicked
+    );
+    assert!(handle.is_finished());
+    assert_eq!(
+        handle.wait_finished().await.unwrap_err().kind,
+        Kind::TaskPanicked
+    );
+}
+
+#[tokio::test]
+async fn ordinary_launch_hands_supervisor_to_registered_shared_handle() {
+    let handle = pending_handle();
+    let (reply, received) = oneshot::channel();
+    let input = request();
+    input.cancel.cancel();
+    let guard = InferenceLaunchGuard {
+        fallback: InferenceLaunchFallback {
+            handle: handle.clone(),
+            slot: Arc::new(Mutex::new(Some(InferenceContext {
+                request: input,
+                reply: Some(reply),
+                route: route("http://127.0.0.1:1".into()),
+                tools: vec![],
+                client: reqwest::Client::new(),
+                gate: Arc::new(Mutex::new(StreamGate::default())),
+                delivery: delivery(),
+                cleanup_notification: None,
+                cleanup_gate: None,
+            }))),
+        },
+        armed: true,
+    };
+    assert!(launch_inference(guard).await.is_ok());
+    handle.wait_finished().await.unwrap();
+    assert_eq!(
+        received.await.unwrap().unwrap().stop_reason,
+        InferenceStopReason::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn dropping_app_with_queued_launch_releases_context_and_original_reply() {
+    use app_runtime_plugin::RuntimePlugin;
+    use async_runtime_plugin::{AsyncContext, AsyncRuntimePlugin};
+    use closure_plugin::{AppClosureExt, ClosurePlugin};
+    use core_plugin::App;
+    let mut app = App::new();
+    app.add_plugin(RuntimePlugin::default())
+        .add_plugin(AsyncRuntimePlugin)
+        .add_plugin(ClosurePlugin)
+        .add_closure_system(RuntimePlugin::UPDATE);
+    let handle = pending_handle();
+    let (reply, received) = oneshot::channel();
+    let launch = InferenceLaunchGuard {
+        fallback: InferenceLaunchFallback {
+            handle: handle.clone(),
+            slot: Arc::new(Mutex::new(Some(InferenceContext {
+                request: request(),
+                reply: Some(reply),
+                route: route("http://127.0.0.1:1".into()),
+                tools: vec![],
+                client: reqwest::Client::new(),
+                gate: Arc::new(Mutex::new(StreamGate::default())),
+                delivery: delivery(),
+                cleanup_notification: None,
+                cleanup_gate: None,
+            }))),
+        },
+        armed: true,
+    };
+    let context = Arc::downgrade(&launch.fallback.slot);
+    app.world()
+        .send_async_closure(RuntimePlugin::UPDATE, move |_: AsyncContext| {
+            launch_inference(launch)
+        });
+    assert!(!handle.is_finished());
+    drop(app);
+    assert!(
+        context.upgrade().is_none(),
+        "queued context must not keep its World event queue alive"
+    );
+    assert_eq!(
+        received.await.unwrap().unwrap_err().kind,
+        Kind::TaskPanicked
+    );
+    assert_eq!(
+        handle.wait_finished().await.unwrap_err().kind,
+        Kind::TaskPanicked
+    );
+}
+
+#[tokio::test]
+async fn dropping_last_polled_waiter_does_not_strand_another_shared_waiter() {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+    struct CountWake(AtomicUsize);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let handle = pending_handle();
+    let clone = handle.clone();
+    let (release, blocked) = oneshot::channel();
+    handle
+        .attach_task(tokio::spawn(async move {
+            blocked.await.unwrap();
+        }))
+        .unwrap();
+    let first_wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+    let second_wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+    let first_waker = Waker::from(first_wakes.clone());
+    let second_waker = Waker::from(second_wakes);
+    let mut first = Box::pin(handle.wait_finished());
+    let mut second = Box::pin(clone.wait_finished());
+    assert!(matches!(
+        first.as_mut().poll(&mut Context::from_waker(&first_waker)),
+        Poll::Pending
+    ));
+    assert!(matches!(
+        second
+            .as_mut()
+            .poll(&mut Context::from_waker(&second_waker)),
+        Poll::Pending
+    ));
+    drop(second);
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        first_wakes.0.load(Ordering::SeqCst) > 0,
+        "supervisor completion must wake the surviving waiter"
+    );
+    first.await.unwrap();
 }
