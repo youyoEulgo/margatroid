@@ -1,8 +1,8 @@
+use config_core::IngressRequest;
 use config_core::{
     CidrBlock, ConfigError, IngressPolicy, LogLevel, MargatroidConfig, OutboundTarget,
 };
 use core_plugin::Resource;
-use server_plugin::HandshakeGuard;
 use std::net::{IpAddr, SocketAddr};
 
 fn config(bind: &str) -> MargatroidConfig {
@@ -210,14 +210,27 @@ fn ingress_cannot_be_wider_than_loopback_bind() {
 }
 
 #[test]
-fn nonbrowser_requests_only_check_peer_and_guard_uses_same_policy() {
+fn owned_nonbrowser_requests_only_check_peer() {
     let policy = IngressPolicy::Localhost;
-    let guard: &dyn HandshakeGuard = &policy;
     for peer in ["127.0.0.1:50000", "[::1]:50000"] {
-        assert!(guard.guard(peer.parse().unwrap(), None, None).is_ok());
+        assert!(
+            policy
+                .evaluate(&IngressRequest {
+                    peer: peer.parse().unwrap(),
+                    origin: None,
+                    host: None
+                })
+                .is_ok()
+        );
     }
     let peer: SocketAddr = "10.0.0.5:50000".parse().unwrap();
-    let error = guard.guard(peer, None, None).unwrap_err();
+    let error = policy
+        .evaluate(&IngressRequest {
+            peer,
+            origin: None,
+            host: None,
+        })
+        .unwrap_err();
     assert!(error.contains("10.0.0.5:50000"));
     assert!(error.contains("localhost"));
     assert!(!IngressPolicy::Addresses(vec![]).allows_peer("127.0.0.1".parse().unwrap()));

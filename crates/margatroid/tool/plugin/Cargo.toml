@@ -12,6 +12,7 @@ sandbox_resource_core = { path = "../../sandbox_resource/core" }
 core_plugin = { path = "../../../mecs/core_plugin" }
 app_runtime_plugin = { path = "../../../mecs/app_runtime_plugin" }
 async_runtime_plugin = { path = "../../../mecs/async_runtime_plugin" }
+closure_plugin = { path = "../../../mecs/closure_plugin" }
 base64 = "0.22"
 futures-util = "0.3"
 jsonschema = { version = "0.33", default-features = false }

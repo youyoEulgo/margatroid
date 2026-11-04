@@ -716,7 +716,7 @@ async fn install_runtime(
     })
     .await?;
     if let Some(finished) = finished {
-        finished.task.await.map_err(|e| {
+        finished.wait_finished().await.map_err(|e| {
             error(
                 AgentErrorKind::CleanupFailed,
                 format!("previous inference task ended with error: {e}"),
@@ -923,7 +923,7 @@ async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), Age
     };
     let inference = async move {
         if let Some(handle) = inference {
-            handle.task.await.map_err(|e| {
+            handle.wait_finished().await.map_err(|e| {
                 error(
                     AgentErrorKind::CleanupFailed,
                     format!("inference join failed: {e}"),

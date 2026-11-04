@@ -1,4 +1,3 @@
-use server_plugin::HandshakeGuard;
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
@@ -135,16 +134,11 @@ impl IngressPolicy {
         self.evaluate_origin(origin, host).is_ok()
     }
 
-    pub fn evaluate(
-        &self,
-        peer: SocketAddr,
-        origin: Option<&str>,
-        host: Option<&str>,
-    ) -> Result<(), String> {
-        if !self.allows_peer(peer.ip()) {
-            return Err(format!("peer {peer} is not allowed by {self}"));
+    pub fn evaluate(&self, request: &IngressRequest) -> Result<(), String> {
+        if !self.allows_peer(request.peer.ip()) {
+            return Err(format!("peer {} is not allowed by {self}", request.peer));
         }
-        self.evaluate_origin(origin, host)
+        self.evaluate_origin(request.origin.as_deref(), request.host.as_deref())
     }
 
     fn evaluate_origin(&self, origin: Option<&str>, host: Option<&str>) -> Result<(), String> {
@@ -175,15 +169,11 @@ impl IngressPolicy {
     }
 }
 
-impl HandshakeGuard for IngressPolicy {
-    fn guard(
-        &self,
-        peer: SocketAddr,
-        origin: Option<&str>,
-        host: Option<&str>,
-    ) -> Result<(), String> {
-        self.evaluate(peer, origin, host)
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IngressRequest {
+    pub peer: SocketAddr,
+    pub origin: Option<String>,
+    pub host: Option<String>,
 }
 
 impl fmt::Display for IngressPolicy {

@@ -1,10 +1,10 @@
 # DtoPlugin
 
-DtoPlugin适配WebSocket协议与领域事件。它依赖protocol、address、各领域core和mecs，不依赖其他plugin，不单独提供dto_core。
+DtoPlugin适配WebSocket协议与领域事件。它依赖protocol、address、各领域core、mecs及Margatroid axum_plugin基础设施，不依赖其他业务plugin，不单独提供dto_core。
 
 ## 入站
 
-接收消息后按protocol解析信封。除连接注册外，先从真实连接取得Client Entity，拒绝未注册连接和同一Client重复的在途请求ID。运行目标通过address解析为完整Entity，再检查组件、Workspace归属和实例。未运行的Workspace直接从启动时加载的内存配置选择，不创建占位Entity。
+DtoPlugin自行注册原生/ws Router并拥有全部连接（包括未注册连接）、读写Future及有界出站队列；握手handler直接检查IngressPolicy，读循环按protocol解析信封。无效帧直接响应或关闭，只有已解析DtoRequest进入World，不使用mecs通用网络事件。除连接注册外，先从真实连接取得Client Entity，拒绝未注册连接和同一Client重复的在途请求ID。运行目标通过address解析为完整Entity，再检查组件、Workspace归属和实例。未运行的Workspace直接从启动时加载的内存配置选择，不创建占位Entity。
 
 列出Workspace同步读取内存配置并回复，不发送领域事件或提交异步任务；启动或重启携带path，Workspace重新读文件后更新展示缓存；整体重载不在此定义。异步请求生成独立operation_id，记录原网络ID、Client Entity、连接及目标实例，再转换成领域请求。不同连接可以使用相同网络ID；内部事件不传播外部实体地址。
 
@@ -22,6 +22,8 @@ DtoPlugin不执行MCL、模型推理、资源加载、数据库操作、目录�
 
 入站消息总上限32MiB，请求ID非空且最多512个UTF-8字节。有可用ID的非法请求返回request.failed；无法关联的非法消息关闭连接，格式错误使用1007，超大消息使用1009。错误不回显凭据、图片或请求正文。
 
-回合中止保留两帧处理：Server发送WebSocketMessageReceived，DTO在UPDATE解析并发送私有AbortTurnControl，下一帧PRE_UPDATE控制Handler核对身份、回合并调用agent_core取消能力。Axum不持有业务句柄，不新增直接取消通道。控制回执仅表示受理，不代表流读取任务已经退出。
+回合中止保留两帧业务处理：DTO原生读循环解析后发送DtoRequest，UPDATE领域转换并发送私有AbortTurnControl，下一帧PRE_UPDATE控制Handler核对身份、回合并调用agent_core取消能力。Axum不持有业务句柄，不新增直接取消通道。控制回执仅表示受理，不代表流读取任务已经退出。
 
 MCL以原oneshot返回，DTO等待闭包将其转换为网络mcl.command_result，不要求MCL另发结果观察事件。展示缓存不能作为启动配置或运行实例身份来源。
+
+升级前取得AxumLifetime退出登记，完整连接Future退出后才释放；读写监听共享停止信号。发送器Full/Closed立即取消对应连接，断开恰好一次通知ClientDisconnected。日志订阅、等待oneshot和历史快照使用普通异步闭包，均不使用spawn_async_service；排队前不捕获事件发送器，dispatch时取得AsyncContext，避免队列循环持有。

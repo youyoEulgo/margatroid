@@ -4,6 +4,7 @@ mod types;
 
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimeHandle;
+use closure_plugin::WorldClosureExt;
 use core_plugin::{App, Plugin};
 use sandbox_resource_core::SandboxReadLimits;
 
@@ -62,7 +63,9 @@ impl Plugin for SandboxResourcePlugin {
             self.schedule != RuntimePlugin::STARTUP,
             "SandboxResourcePlugin requires a recurring schedule"
         );
+        app.world().send_closure(&self.schedule, |_| {});
         app.world_mut().insert_resource(ImportConfig {
+            schedule: self.schedule.clone(),
             limits: self.limits,
         });
         app.add_system(&self.schedule, system::sandbox_resource_system);

@@ -148,3 +148,19 @@ pub(crate) struct TerminalOutput {
     pub(crate) previous: (String, bool),
     pub(crate) limit: usize,
 }
+
+#[derive(Clone)]
+pub(crate) struct ToolLaunchOutput;
+#[derive(Clone)]
+pub(crate) struct ToolLaunchError {
+    pub fallback: Option<crate::handler::ToolLaunchFallback>,
+    pub error: ToolError,
+}
+impl From<async_runtime_plugin::AsyncTaskError> for ToolLaunchError {
+    fn from(error: async_runtime_plugin::AsyncTaskError) -> Self {
+        Self {
+            fallback: None,
+            error: ToolError::new(tool_core::ToolErrorKind::SubmitFailed, error.to_string()),
+        }
+    }
+}

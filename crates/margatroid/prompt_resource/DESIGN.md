@@ -7,6 +7,10 @@ System区分事件、闭包结果、提交闭包与oneshot回复，使用Rust名
 不写独立逻辑段；持有关系使用树形图。
 ```
 
+# 设计范围
+
+Margatroid领域使用原生Axum装配及普通异步闭包，已退出mecs通用网络桥和spawn_async_service依赖。mecs现有接口、文档及源码暂时保留，后续另行清理，不提供旧入口回退或兼容实现。
+
 # 板块格式
 
 ```text
@@ -106,7 +110,7 @@ prompt_resource_system(world: &mut World)
 crate公开：
 ```text
 handle_import(world: &mut World, request: ImportPrompt)
-    行为：认领reply；校验完整owner、alias和取消状态，提交validate_import；失败直接回复。
+    行为：认领reply；校验完整owner、alias和取消状态，通过send_async_closure提交validate_import；该闭包返回本插件的Result<ImportOutput, ImportError>，由对应System收口，禁止spawn_async_service包装后再手工发送结果事件；失败直接回复。
 
 handle_import_result(world: &mut World, result: Result<ImportOutput, ImportError>)
     行为：复检owner和cancel；成功时创建或更新Prompts对应alias路径，再回复Ok(())；失败保持旧路径并回复错误。

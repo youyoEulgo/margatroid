@@ -1,11 +1,12 @@
+use crate::{ClientSender, ConnectionId};
 use core_plugin::Component;
-use server_plugin::WebSocketConnectionId;
 
 #[derive(Clone, Debug)]
 pub struct Client {
-    pub connection_id: WebSocketConnectionId,
+    pub connection_id: ConnectionId,
     pub client_type: String,
     pub name: String,
+    pub sender: ClientSender,
 }
 
 impl Component for Client {}

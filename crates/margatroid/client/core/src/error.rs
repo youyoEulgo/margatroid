@@ -26,3 +26,18 @@ impl fmt::Display for ClientError {
 }
 
 impl std::error::Error for ClientError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientSendError {
+    Full,
+    Closed,
+}
+impl fmt::Display for ClientSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Full => "client outbound queue is full",
+            Self::Closed => "client outbound queue is closed",
+        })
+    }
+}
+impl std::error::Error for ClientSendError {}

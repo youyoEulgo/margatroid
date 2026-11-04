@@ -3,7 +3,7 @@ use core_plugin::World;
 use inference_core::{ActiveInference, InferenceRequest, InitInference};
 use lua_runtime_core::{DriverLuaVm, WorldLuaRuntimeExt};
 
-use crate::types::InferenceCleanupFinished;
+use crate::types::{InferenceCleanupFinished, InferenceLaunchError, InferenceLaunchOutput};
 
 pub(crate) fn init_inference_system(world: &mut World) {
     let requests = world
@@ -17,6 +17,14 @@ pub(crate) fn init_inference_system(world: &mut World) {
 }
 
 pub(crate) fn inference_system(world: &mut World) {
+    // A launch result only closes the handoff; ActiveInference follows the real task.
+    for result in world.event_reader::<Result<InferenceLaunchOutput, InferenceLaunchError>>() {
+        if let Err(failure) = result {
+            if let Some(fallback) = &failure.fallback {
+                fallback.fail(failure.error.clone());
+            }
+        }
+    }
     let cleanups = world
         .event_reader::<InferenceCleanupFinished>()
         .into_iter()

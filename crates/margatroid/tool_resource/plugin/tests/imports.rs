@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
+use closure_plugin::{AppClosureExt, ClosurePlugin};
 use core_plugin::{App, Entity};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -60,6 +61,8 @@ fn app() -> App {
     let mut app = App::new();
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
+        .add_plugin(ClosurePlugin)
+        .add_closure_system(RuntimePlugin::UPDATE)
         .add_plugin(ToolResourcePlugin::default());
     app
 }
@@ -99,7 +102,9 @@ fn finish(
     }
 }
 
-fn await_validation(app: &App) {
+fn await_validation(app: &mut App) {
+    // Dispatch the ordinary validation closure before waiting for its typed result.
+    app.tick();
     let deadline = Instant::now() + Duration::from_secs(5);
     while app.world().event_snapshot().normal_event_count == 0 {
         assert!(Instant::now() < deadline, "validation timed out");
@@ -177,7 +182,7 @@ fn cancellation_after_validation_prevents_publication_and_preserves_old_path() {
     let cancel = request.cancel.clone();
     app.world().emit_event(request);
     app.tick();
-    await_validation(&app);
+    await_validation(&mut app);
     assert!(matches!(
         reply.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)
@@ -205,7 +210,7 @@ fn completed_validation_cannot_write_into_reused_entity_index() {
     let (request, mut reply) = import_request(owner, "sample", path);
     app.world().emit_event(request);
     app.tick();
-    await_validation(&app);
+    await_validation(&mut app);
     app.world_mut().despawn(owner);
     let replacement = app.world_mut().spawn();
     assert_eq!(owner.index(), replacement.index());
@@ -309,7 +314,10 @@ fn configured_budget_is_enforced_on_the_configured_schedule() {
         ..tool_resource_core::ToolReadLimits::default()
     };
     app.add_plugin(RuntimePlugin::default())
-        .add_plugin(AsyncRuntimePlugin);
+        .add_plugin(AsyncRuntimePlugin)
+        .add_plugin(ClosurePlugin)
+        .add_closure_system(RuntimePlugin::UPDATE);
+    app.add_closure_system(RuntimePlugin::POST_UPDATE);
     app.add_plugin(
         ToolResourcePlugin::new()
             .with_schedule(RuntimePlugin::POST_UPDATE)

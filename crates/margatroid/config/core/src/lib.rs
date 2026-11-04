@@ -2,7 +2,7 @@ mod error;
 pub mod types;
 
 pub use error::ConfigError;
-pub use types::{CidrBlock, IngressPolicy, LogLevel, OutboundTarget};
+pub use types::{CidrBlock, IngressPolicy, IngressRequest, LogLevel, OutboundTarget};
 
 use core_plugin::Resource;
 use std::collections::HashSet;

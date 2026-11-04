@@ -5,6 +5,7 @@ use prompt_resource_core::{ImportPromptReply, PromptReadLimits, PromptResourceEr
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct ImportConfig {
+    pub schedule: String,
     pub limits: PromptReadLimits,
 }
 
@@ -30,4 +31,16 @@ pub(crate) struct ImportOutput {
 pub(crate) struct ImportError {
     pub context: ImportContext,
     pub error: PromptResourceError,
+}
+
+/// Infrastructure failures are covered by the closure's owned reply guard.
+#[derive(Clone)]
+pub(crate) enum ImportTaskError {
+    Validation(ImportError),
+    Runtime,
+}
+impl From<async_runtime_plugin::AsyncTaskError> for ImportTaskError {
+    fn from(_: async_runtime_plugin::AsyncTaskError) -> Self {
+        Self::Runtime
+    }
 }

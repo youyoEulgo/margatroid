@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimeHandle;
+use closure_plugin::WorldClosureExt;
 use core_plugin::{App, Plugin, Resource};
 use tool_core::ToolExecutionLimits;
 
@@ -77,6 +78,7 @@ impl Plugin for ToolPlugin {
             self.schedule != RuntimePlugin::STARTUP,
             "ToolPlugin requires recurring schedule"
         );
+        app.world().send_closure(&self.schedule, |_| {});
         self.limits.validate().expect("ToolPlugin limits invalid");
         let schedule = self.schedule.clone();
         app.world_mut().insert_resource(self);

@@ -10,6 +10,7 @@ members = [
     "crates/mecs/log_plugin",
     "crates/mecs/server_plugin",
     "crates/margatroid/address",
+    "crates/margatroid/axum_plugin",
     "crates/margatroid/agent_driver/core",
     "crates/margatroid/client/core",
     "crates/margatroid/client/plugin",

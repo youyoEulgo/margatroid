@@ -1058,15 +1058,18 @@ async fn finish_turn_reports_running_inference_and_keeps_abort_control() {
         .world_mut()
         .get_component_mut::<ActiveInference>(fixture.owner)
         .unwrap()
-        .current = Some(InferenceHandle {
-        request_id: "active".into(),
-        turn: turn.clone(),
-        cancel: cancel.clone(),
-        stop_stream: Arc::new(|| {}),
-        task: tokio::spawn(async move {
+        .current = Some(attached_inference(
+        InferenceHandle {
+            request_id: "active".into(),
+            turn: turn.clone(),
+            cancel: cancel.clone(),
+            stop_stream: Arc::new(|| {}),
+            task: Arc::new(InferenceTaskState::default()),
+        },
+        tokio::spawn(async move {
             waiting.await.unwrap();
         }),
-    });
+    ));
     let mut reply = fixture.enqueue("EFFECT finish_turn", vec![]);
     assert_eq!(
         drive(&mut fixture.app, &mut reply).await.error_kind(),
@@ -1257,15 +1260,18 @@ async fn inference_error_and_finish_turn_return_values_before_cleanup_completes(
             .world_mut()
             .get_component_mut::<ActiveInference>(fixture.owner)
             .unwrap()
-            .current = Some(InferenceHandle {
-            request_id: request.id.clone(),
-            turn: request.turn.clone(),
-            cancel: cancel.clone(),
-            stop_stream: Arc::new(|| {}),
-            task: tokio::spawn(async move {
+            .current = Some(attached_inference(
+            InferenceHandle {
+                request_id: request.id.clone(),
+                turn: request.turn.clone(),
+                cancel: cancel.clone(),
+                stop_stream: Arc::new(|| {}),
+                task: Arc::new(InferenceTaskState::default()),
+            },
+            tokio::spawn(async move {
                 waiting.await.unwrap();
             }),
-        });
+        ));
         request
             .reply
             .lock()
@@ -1518,15 +1524,18 @@ async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_
                 .world_mut()
                 .get_component_mut::<ActiveInference>(fixture.owner)
                 .unwrap()
-                .current = Some(InferenceHandle {
-                request_id: request.id.clone(),
-                turn: request.turn.clone(),
-                cancel: cancel.clone(),
-                stop_stream: Arc::new(|| {}),
-                task: tokio::spawn(async move {
+                .current = Some(attached_inference(
+                InferenceHandle {
+                    request_id: request.id.clone(),
+                    turn: request.turn.clone(),
+                    cancel: cancel.clone(),
+                    stop_stream: Arc::new(|| {}),
+                    task: Arc::new(InferenceTaskState::default()),
+                },
+                tokio::spawn(async move {
                     waiting.await.unwrap();
                 }),
-            });
+            ));
             let failure = kind.map(|kind| InferenceError::new(kind, "safe inference failure"));
             request
                 .reply
@@ -2082,4 +2091,12 @@ async fn malformed_identifiable_tool_arguments_fail_locally_and_other_calls_run(
         2,
         "identity rejection must precede dispatch"
     );
+}
+
+fn attached_inference(
+    handle: InferenceHandle,
+    task: tokio::task::JoinHandle<()>,
+) -> InferenceHandle {
+    handle.attach_task(task).unwrap();
+    handle
 }

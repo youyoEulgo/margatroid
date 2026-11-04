@@ -1,28 +1,25 @@
 use crate::{handler, types::*};
+use client_core::ClientDisconnected;
 use client_core::ClientRegistrationResult;
 use core_plugin::World;
-use server_plugin::{
-    ServerFailed, ServerStarted, ServerStopped, WebSocketConnected, WebSocketDisconnected,
-    WebSocketMessageReceived, WebSocketProtocolFailed,
-};
 use workspace_core::{RestartWorkspaceResult, StartWorkspaceResult, StopWorkspaceResult};
 
 pub(crate) fn dto_route_system(world: &mut World) {
     let disconnected = world
-        .event_reader::<WebSocketDisconnected>()
+        .event_reader::<ClientDisconnected>()
         .into_iter()
         .map(|event| event.connection_id)
         .collect::<Vec<_>>();
     for connection in disconnected {
         handler::handle_disconnect(world, connection);
     }
-    let messages = world
-        .event_reader::<WebSocketMessageReceived>()
+    let requests = world
+        .event_reader::<DtoRequest>()
         .into_iter()
-        .map(|event| (event.connection_id, event.message.clone()))
+        .cloned()
         .collect::<Vec<_>>();
-    for (connection, message) in messages {
-        handler::handle_inbound_message(world, connection, message);
+    for request in requests {
+        handler::handle_dto_request(world, request);
     }
     let outgoing = world
         .event_reader::<WebSocketMessageSend>()
@@ -78,18 +75,36 @@ pub(crate) fn collect_external_events_system(world: &mut World) {
     for event in restarted {
         handler::handle_workspace_result(world, event.id, event.result, "restart");
     }
-    let responses = world
-        .event_reader::<ResponseReady>()
+    for failure in world
+        .event_reader::<Result<ResponseReady, DtoAsyncError>>()
         .into_iter()
-        .cloned()
+        .filter_map(|result| result.as_ref().err())
+    {
+        tracing::error!(reason=%failure.0, "DTO response task failed");
+    }
+    let snapshot_failed = world
+        .event_reader::<Result<SnapshotReady, DtoAsyncError>>()
+        .into_iter()
+        .any(Result::is_err);
+    if snapshot_failed {
+        let cache = world.get_resource_mut::<BackendStateReportCache>().unwrap();
+        cache.pending = None;
+        cache.dirty = true;
+        cache.retry_after = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        tracing::warn!("DTO state snapshot task failed");
+    }
+    let responses = world
+        .event_reader::<Result<ResponseReady, DtoAsyncError>>()
+        .into_iter()
+        .filter_map(|result| result.as_ref().ok().cloned())
         .collect::<Vec<_>>();
     for event in responses {
         handler::handle_response(world, event);
     }
     let snapshots = world
-        .event_reader::<SnapshotReady>()
+        .event_reader::<Result<SnapshotReady, DtoAsyncError>>()
         .into_iter()
-        .cloned()
+        .filter_map(|result| result.as_ref().ok().cloned())
         .collect::<Vec<_>>();
     for event in snapshots {
         handler::handle_snapshot(world, event);
@@ -110,37 +125,31 @@ pub(crate) fn collect_external_events_system(world: &mut World) {
     for event in errors {
         handler::handle_agent_exception(world, event);
     }
-    let mut transport = world
-        .event_reader::<ServerStarted>()
+    for failure in world
+        .event_reader::<Result<(), DtoAsyncError>>()
         .into_iter()
-        .map(|event| TransportEvent::Started(event.address))
-        .collect::<Vec<_>>();
-    transport.extend(
-        world
-            .event_reader::<ServerFailed>()
-            .into_iter()
-            .map(|event| TransportEvent::Failed(event.message.clone())),
-    );
-    transport.extend(
-        world
-            .event_reader::<ServerStopped>()
-            .into_iter()
-            .map(|_| TransportEvent::Stopped),
-    );
-    transport.extend(
-        world
-            .event_reader::<WebSocketConnected>()
-            .into_iter()
-            .map(|event| TransportEvent::Connected(event.connection_id)),
-    );
-    transport.extend(
-        world
-            .event_reader::<WebSocketProtocolFailed>()
-            .into_iter()
-            .map(|event| TransportEvent::ProtocolFailed(event.connection_id)),
-    );
-    for event in transport {
-        handler::handle_transport(world, event);
+        .filter_map(|result| result.as_ref().err())
+    {
+        tracing::warn!(reason = %failure.0, "DTO log subscription failed");
+    }
+    if let Some(handle) = world.get_resource::<axum_plugin::AxumHandle>() {
+        let address = handle.local_address();
+        let stopped = handle.is_stopped();
+        let result = handle.result();
+        let status = world.get_resource_mut::<TransportStatus>().unwrap();
+        if address != status.address {
+            if let Some(address) = address {
+                tracing::info!(%address, "WebSocket server started");
+            }
+            status.address = address;
+        }
+        if stopped && !status.stopped {
+            match result {
+                Some(Err(failure)) => tracing::error!(%failure,"WebSocket server failed"),
+                _ => tracing::info!("WebSocket server stopped"),
+            };
+            status.stopped = true;
+        }
     }
     handler::publish_state(world);
 }

@@ -7,6 +7,10 @@ System分别列出事件、闭包结果、提交闭包及oneshot回复，使用R
 不写独立逻辑段；持有关系使用树形图。
 ```
 
+# 设计范围
+
+Margatroid领域使用原生Axum装配及普通异步闭包，已退出mecs通用网络桥和spawn_async_service依赖。mecs现有接口、文档及源码暂时保留，后续另行清理，不提供旧入口回退或兼容实现。
+
 # 板块格式
 
 ```text
@@ -42,7 +46,7 @@ InferencePlugin：单次推理执行插件
         行为：有界读取models.toml，完整校验provider、api_type及路由选项；失败不构造插件。
     impl Plugin for InferencePlugin
         build(self, app: &mut App)
-            行为：检查运行设施，拒绝重复安装；安装ModelRoutes及共享HTTP客户端，挂载init_inference_system和inference_system。
+            行为：检查运行设施，拒绝重复安装；安装ModelRoutes及共享reqwest HTTP客户端，挂载init_inference_system和inference_system。不通过spawn_async_service临时握手取得Tokio Handle，不在Resource保存执行器Handle；推理启动进入普通异步闭包。
 ```
 
 # components
@@ -95,11 +99,11 @@ init_inference_system(world: &mut World)
 
 inference_system(world: &mut World)
     处理事件：InferenceRequest
-    接收闭包结果：None
-    提交闭包：supervise_inference(InferenceContext) -> Future<Output = ()>
+    接收闭包结果：Result<InferenceLaunchOutput, InferenceLaunchError>
+    提交闭包：launch_inference(InferenceContext) -> Future<Output = Result<InferenceLaunchOutput, InferenceLaunchError>>
     产出事件：None
     oneshot回复：Result<InferenceResponse, InferenceError>
-    行为：InferenceRequest -> handle_inference。
+    行为：InferenceRequest -> handle_inference；闭包启动结果只收口启动交接，InferenceCleanupFinished仍核对真实完成后才唤醒Driver。
 ```
 
 # handler
@@ -116,12 +120,16 @@ handle_inference(world: &mut World, request: InferenceRequest)
         认领reply，检查完整Agent Entity、Working、当前turn及ActiveInference；已有未结束推理则拒绝。
         无有效turn返回Cancelled响应，不创建HTTP任务。
         从ModelRoutes选定路由，从Tools取得各alias路径；拒绝重复或不存在的alias。
-        固定本次已注册webui发送器和对外身份投影，提交supervise_inference并将InferenceHandle存入ActiveInference。
+        从client_core取得本次已注册webui的ClientSender快照，固定对外身份；同步登记尚未启动的共享InferenceHandle，防止异步提交窗口受理重叠请求；通过send_async_closure提交launch_inference。
+        launch_inference在闭包内部创建监督任务并把JoinHandle交给同一共享句柄，不依赖全局执行器。ClientFrame::Text只携带已编码分片，不导入Axum消息、DTO插件或mecs server_plugin发送器。
         提交失败回复错误。
 ```
 
 私有：
 ```text
+launch_inference(context: InferenceContext) -> Future<Output = Result<InferenceLaunchOutput, InferenceLaunchError>>
+    行为：在普通异步闭包内启动supervise_inference，将真实JoinHandle写入已登记共享句柄；返回仅表示启动交接，不能解除ActiveInference并发限制。启动失败记录错误、完成原reply及启动失败通知，不保留一个永远未启动的句柄。
+
 supervise_inference(context: InferenceContext) -> Future<Output = ()>
     行为：
         blocking worker读取本次工具定义，校验消息及参数，构造DomainRequest。
@@ -160,7 +168,9 @@ build_request(input: DomainRequest, route: ModelRoute) -> Result<ProviderHttpReq
 InferenceContext：请求执行材料--原请求及reply、路由、工具路径、HTTP客户端、取消能力和推流投影
 ProviderContext：上游材料--HTTP请求、格式解码器、取消能力及读取预算
 StreamContext：接收材料--Arc<Mutex<StreamGate>>、取消能力及StreamDelivery
-StreamDelivery：前端出口--固定发送器快照、请求ID、对外地址和不透明实例标识
+StreamDelivery：前端出口--Vec<client_core::ClientSender>固定快照、请求ID、对外地址和不透明实例标识；只发送ClientFrame，不持有WebSocket或访问DTO连接表。
+InferenceLaunchOutput：已将监督任务交给共享句柄的启动事实
+InferenceLaunchError：InferenceError及原回复、共享句柄关联，实现From<AsyncTaskError>
 
 StreamGate：本次流接受门
     closed: bool
@@ -222,7 +232,13 @@ InferenceHandle：本次推理句柄，公开类型
     turn: String
     cancel: CancellationToken
     stop_stream: Arc<dyn Fn() + Send + Sync>--本次StreamGate关闭函数，由inference_plugin构造
-    task: JoinHandle<()>--supervise_inference任务句柄
+    task: Arc<InferenceTaskState>--共享启动状态、Mutex<Option<JoinHandle<()>>>及完成通知
+    attach_task(&self, task: JoinHandle<()>) -> Result<(), InferenceError>
+        行为：只允许启动交接一次，未交接前is_finished始终为false；启动失败显式记录失败完成，不能误当真实运行任务退出。
+    is_finished(&self) -> bool
+        行为：区分未启动、运行中、启动失败和真实join完成，不以slot为None推断完成。
+    wait_finished(&self) -> Future<Output = Result<(), InferenceError>>
+        行为：Agent退出流程等待真实监督任务结束或明确启动失败，不跨await持锁，不通过取走句柄使其他读者误判完成。
     cancel(&self)
         行为：同步调用stop_stream冻结接受门，再触发cancel，不直接abort监督任务。
 

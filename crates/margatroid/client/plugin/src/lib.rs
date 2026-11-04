@@ -2,12 +2,12 @@ mod handler;
 mod system;
 
 pub use client_core::{
-    Client, ClientError, ClientRegistrationResult, RegisteredClient, WorldClientExt,
+    Client, ClientDisconnected, ClientError, ClientFrame, ClientRegistrationResult,
+    ClientSendError, ClientSender, ConnectionId, RegisterClient, RegisteredClient, WorldClientExt,
 };
 
 use app_runtime_plugin::RuntimePlugin;
 use core_plugin::{App, Plugin, Resource};
-use server_plugin::WebSocketConnections;
 
 #[derive(Clone, Debug)]
 pub struct ClientPlugin {
@@ -46,10 +46,6 @@ impl Plugin for ClientPlugin {
             app.contains_schedule(&self.schedule),
             "ClientPlugin schedule does not exist: {}",
             self.schedule
-        );
-        assert!(
-            app.world().contains_resource::<WebSocketConnections>(),
-            "ServerPlugin must be installed before ClientPlugin"
         );
         app.world_mut().insert_resource(ClientPluginInstalled);
         app.add_system(&self.schedule, system::client_registration_system)

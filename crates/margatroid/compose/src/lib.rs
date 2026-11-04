@@ -10,3 +10,7 @@ pub fn build_app(options: ApplicationOptions) -> Result<App, ComposeError> {
     handler::install(&mut app, parts)?;
     Ok(app)
 }
+
+pub async fn shutdown_app(app: &mut App) -> Result<(), ComposeError> {
+    handler::shutdown_application(app).await
+}

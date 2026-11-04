@@ -1,11 +1,11 @@
 use crate::{ApplicationOptions, ComposeError, types::ApplicationParts};
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
+use axum_plugin::AxumPlugin;
 use closure_plugin::{AppClosureExt, ClosurePlugin};
 use config_core::LogLevel as ConfigLogLevel;
 use core_plugin::App;
 use log_plugin::{LogLevel, LogPlugin};
-use server_plugin::{AppServerExt, ServerOptions, ServerPlugin};
 
 pub(crate) fn prepare(options: &ApplicationOptions) -> Result<ApplicationParts, ComposeError> {
     let data_root = std::fs::canonicalize(&options.data_root)
@@ -46,7 +46,6 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
         workspace,
     } = parts;
     let bind = config.config().server_bind();
-    let ingress = config.config().server_ingress().clone();
     let level = match config.config().log_level() {
         ConfigLogLevel::Off => LogLevel::Off,
         ConfigLogLevel::Error => LogLevel::Error,
@@ -70,9 +69,7 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
         .add_closure_system(RuntimePlugin::PRE_UPDATE)
         .add_closure_system(RuntimePlugin::UPDATE)
         .add_plugin(log)
-        .add_plugin(ServerPlugin::with_options(
-            ServerOptions::bind(bind).with_handshake_guard(ingress),
-        ))
+        .add_plugin(AxumPlugin::bind(bind))
         .add_plugin(config)
         .add_plugin(client_plugin::ClientPlugin::new())
         .add_plugin(tool_resource_plugin::ToolResourcePlugin::new())
@@ -87,6 +84,52 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
         .add_plugin(workspace)
         .add_plugin(dto_plugin::DtoPlugin::new())
         .add_plugin(ui_plugin::UiPlugin::default());
-    app.add_http_routes(ui_plugin::UiPlugin::router());
     Ok(())
+}
+
+pub(crate) async fn shutdown_application(app: &mut App) -> Result<(), ComposeError> {
+    use app_runtime_plugin::WorldEventExt;
+    use std::collections::BTreeMap;
+    use workspace_core::{StopWorkspace, StopWorkspaceResult, Workspace, WorkspaceState};
+
+    let server = app
+        .world()
+        .get_resource::<axum_plugin::AxumHandle>()
+        .ok_or_else(|| ComposeError::new("axum", "", "Axum service is missing"))?
+        .clone();
+    server.request_shutdown();
+    let mut pending: BTreeMap<String, (core_plugin::Entity, std::path::PathBuf)> = BTreeMap::new();
+    let mut next = 0u64;
+    loop {
+        app.tick();
+        for response in app.world().event_reader::<StopWorkspaceResult>() {
+            if let Some(path) = pending.remove(&response.id)
+                && let Err(error) = &response.result
+            {
+                return Err(ComposeError::new("workspace", path.1, error.to_string()));
+            }
+        }
+        let workspaces = app.world().query_with::<Workspace>().result();
+        for entity in &workspaces {
+            let workspace = app.world().get_component::<Workspace>(*entity).unwrap();
+            if workspace.state == WorkspaceState::Running
+                && !pending.values().any(|(current, _)| current == entity)
+            {
+                next += 1;
+                let id = format!("application-shutdown-{next}");
+                pending.insert(id.clone(), (*entity, workspace.definition_path.clone()));
+                app.world().send_event(StopWorkspace {
+                    id,
+                    workspace: *entity,
+                });
+            }
+        }
+        if workspaces.is_empty() && pending.is_empty() && server.is_stopped() {
+            return server
+                .result()
+                .unwrap_or(Ok(()))
+                .map_err(|error| ComposeError::new("axum", "", error.to_string()));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
 }
