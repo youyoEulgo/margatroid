@@ -19,3 +19,11 @@ MCL对同一目标的IMPORT串行受理，跨类别alias唯一性由MCL入口协
 本领域只登记路径、解析工具文件；进程、Lua运行、沙箱和工具调用结果归tool执行领域。集合只保存BTreeMap<String, PathBuf>，不使用ResourceID、LibraryComponent或通用ResourceSet；加载后的临时值不再携带资源身份。路径用于打开文件，不代替沙箱与文件访问检查。
 
 异步校验直接返回Result<ImportOutput, ImportError>，System只路由，Handler负责发布及oneshot回复。所有结果保留原owner Entity，迟到结果不写入复用index的新实体。文件读取失败报告alias、实际路径和底层原因，不回显文件正文。
+
+## 已确认的后续设计
+
+Tools完整工具记录及动态注入仍是待实现目标，当前源码保存alias到路径的映射，并在使用时读取定义。下面描述目标，不表示当前实现或部署已切换。
+
+目标中，IMPORT校验资源后只向Agent.Tools增加一条记录，保存description、input_schema及path；每次推理直接遍历这些记录构造schema，工具调用按名称查询并使用记录中的schema，程序按path读取。普通导入和动态注入使用同一结构，没有第二份工具集合或选择清单。
+
+动态注入由tool_plugin通过现有宿主帧和World闭包调用Tools.insert_batch；入口路径与owner_task_id由宿主固定，binding作为工具自己的不透明数据传入执行context。整批alias冲突则失败；任务A清理时移除属于它的入口。ToolResource不增加注入System或事件，进程通信和任务清理仍属Tool领域。

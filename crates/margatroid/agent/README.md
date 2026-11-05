@@ -2,6 +2,8 @@
 
 agent_core定义Agent自身组件、生命周期状态、事件和错误，只依赖mecs及通用库。agent_plugin依赖agent_core、address和所需领域core，负责跨领域生命周期编排，不依赖其他plugin。
 
+下文记录已有实现；DESIGN中的完整Tools记录及动态工具生命周期为已批准、待实现目标，当前src仍保留旧API。本轮只整理文档，不表示运行中的daemon已更新。目标中动态定义仅归当前Agent完整Entity及Driver实例所有，随实例结束释放；数据库和settings继续承担原有持久化业务。MCP协议由工具侧处理。
+
 ## 同步受理
 
 状态为Starting、Idle、Working、Restarting、Stopping。Handler在一次同步调用中检查状态白名单并切换状态，随后提交异步闭包。

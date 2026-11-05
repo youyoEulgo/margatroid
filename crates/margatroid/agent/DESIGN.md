@@ -1,5 +1,3 @@
-本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
-
 # 伪代码格式
 
 ```text
@@ -10,11 +8,7 @@ System分别列出处理事件、接收闭包结果、提交闭包与产出事�
 属性不写Rust Attribute；持有关系使用树形图。
 ```
 
-# 动态工具生命周期目标
-
-本轮动态工具归属条款为待实现设计，只改文档。动态定义属于当前Agent完整Entity及Driver实例，不写数据库或settings，不恢复旧实例定义；MCP协议不进入Agent领域。
-
-# 板块格式
+# 板块定义
 
 ```text
 # lib        agent/core/src/lib.rs；agent/plugin/src/lib.rs  Agent自身扩展；Plugin安装
@@ -31,42 +25,41 @@ System分别列出处理事件、接收闭包结果、提交闭包与产出事�
 
 ## 类型
 
-公开，定义于agent_core：
 ```text
+-- 公开，定义于agent_core
 WorldAgentExt：Agent访问扩展，公开trait
     agent_state(&self, agent: Entity) -> Result<&AgentState, AgentError>
-        行为：读取Agent状态，目标不存在返回错误。
+        -- 读取Agent状态，目标不存在返回错误。
     agent_start_turn(&mut self, agent: Entity) -> Result<String, AgentError>
-        行为：仅Idle允许；同步生成turn并转Working。
+        -- 仅Idle允许；同步生成turn并转Working。
     agent_finish_turn(&mut self, agent: Entity, turn: &str) -> Result<(), AgentError>
-        行为：仅Working且本次推理调用链已收口时转Idle，不等待已return未finish的后台工具任务；未return工具的中止结果先交付，不以其自然结束作为Driver收尾条件；并清空turn；有活动turn时核对匹配，中止后turn为空由当前Driver调用链完成；调用方plugin核对VM实例，拒绝旧实例完成。
+        -- 仅Working且本次推理调用链已收口时转Idle，不等待已return未finish的后台工具任务；未return工具的中止结果先交付，不以其自然结束作为Driver收尾条件；并清空turn；有活动turn时核对匹配，中止后turn为空由当前Driver调用链完成；调用方plugin核对VM实例，拒绝旧实例完成。
     agent_abort_turn(&mut self, agent: Entity, turn: &str) -> Result<(), AgentError>
-        行为：仅Working且turn匹配时同步清空turn，保持Working；否则返回错误。此操作必须先于同帧MCL、推理和工具调用受理；不在agent_core跨域取消任务，调用方随后通过各领域core执行推理取消和ToolTasks未return任务的原子强制return及清理。
+        -- 仅Working且turn匹配时同步清空turn，保持Working；否则返回错误。此操作必须先于同帧MCL、推理和工具调用受理；不在agent_core跨域取消任务，调用方随后通过各领域core执行推理取消和ToolTasks未return任务的原子强制return及清理。
     impl WorldAgentExt for World
-        行为：只访问Agent自身组件，不操作其他领域。
+        -- 只访问Agent自身组件，不操作其他领域。
 ```
 
-公开，定义于agent_plugin：
 ```text
+-- 公开，定义于agent_plugin
 AgentPlugin：生命周期插件，公开类型
     schedule: String--启停System所属计划
     impl Default for AgentPlugin
-        行为：使用RuntimePlugin::UPDATE。
+        -- 使用RuntimePlugin::UPDATE。
     impl Plugin for AgentPlugin
         build(self, app: &mut App)
-            行为：
-                检查运行设施和计划，拒绝重复安装。
-                在同一schedule依次add_system：stop_agent_system、restart_agent_system、start_agent_system。
-                安装异常System；各启停System收集自己的闭包结果。
-                使用mecs按挂载顺序同步执行的机制，不增加生命周期排序器或统一请求枚举。
+            -- 检查运行设施和计划，拒绝重复安装。
+            -- 在同一schedule依次add_system：stop_agent_system、restart_agent_system、start_agent_system。
+            -- 安装异常System；各启停System收集自己的闭包结果。
+            -- 使用mecs按挂载顺序同步执行的机制，不增加生命周期排序器或统一请求枚举。
 ```
 
 # components
 
 ## 类型
 
-公开：
 ```text
+-- 公开
 Agent：Agent领域组件，公开结构体
     name: String
     workspace: Entity
@@ -80,8 +73,8 @@ Agent：Agent领域组件，公开结构体
 
 ## 类型
 
-公开：
 ```text
+-- 公开
 StartAgent：启动请求，公开事件
     id: String
     workspace: Entity
@@ -115,15 +108,15 @@ AgentException：异常输入，公开事件
 
 ## 函数
 
-crate公开：
 ```text
+-- crate公开
 stop_agent_system(world: &mut World)
     处理事件：StopAgent
     接收闭包结果：Result<StopOutput, StopError>
     提交闭包：stop_flow(FlowContext) -> Future<Output = Result<StopOutput, StopError>>
     产出事件：None
     oneshot回复：Result<Entity, AgentError>
-    行为：StopAgent -> handle_stop_agent；Result<StopOutput, StopError> -> handle_stop_result。
+    -- StopAgent -> handle_stop_agent；Result<StopOutput, StopError> -> handle_stop_result。
 
 restart_agent_system(world: &mut World)
     处理事件：RestartAgent
@@ -132,7 +125,7 @@ restart_agent_system(world: &mut World)
     闭包产出事件：InitToolTasks、InitInference、StartDriverLuaVm、StopDriverLuaVm
     产出事件：None
     oneshot回复：Result<Entity, AgentError>
-    行为：RestartAgent -> handle_restart_agent；Result<RestartOutput, RestartError> -> handle_restart_result。
+    -- RestartAgent -> handle_restart_agent；Result<RestartOutput, RestartError> -> handle_restart_result。
 
 start_agent_system(world: &mut World)
     处理事件：StartAgent
@@ -141,69 +134,67 @@ start_agent_system(world: &mut World)
     闭包产出事件：InitToolTasks、InitInference、StartDriverLuaVm
     产出事件：None
     oneshot回复：Result<Entity, AgentError>
-    行为：StartAgent -> handle_start_agent；Result<StartOutput, StartError> -> handle_start_result。
+    -- StartAgent -> handle_start_agent；Result<StartOutput, StartError> -> handle_start_result。
 
 agent_exception_system(world: &mut World)
     处理事件：AgentException
     接收闭包结果：None
     提交闭包：None
     产出事件：None
-    行为：AgentException -> handle_agent_exception。
+    -- AgentException -> handle_agent_exception。
 ```
 
 # handler
 
 ## 函数
 
-crate公开：
 ```text
+-- crate公开
 handle_start_agent(world: &mut World, request: StartAgent)
-    行为：校验Workspace和成员创建请求；同步创建Agent Entity并挂Agent等基础组件，置Starting，再提交start_flow；拒绝时发送启动错误。
+    -- 校验Workspace和成员创建请求；同步创建Agent Entity并挂Agent等基础组件，置Starting，再提交start_flow；拒绝时发送启动错误。
 
 handle_stop_agent(world: &mut World, request: StopAgent)
-    行为：按白名单同步转Stopping；关闭新请求受理，再提交stop_flow；拒绝时发送关闭错误。
+    -- 按白名单同步转Stopping；关闭新请求受理，再提交stop_flow；拒绝时发送关闭错误。
 
 handle_restart_agent(world: &mut World, request: RestartAgent)
-    行为：在request.workspace内按name定位成员Entity，先检查ToolTasks，存在尚未finish的活任务条目直接拒绝；通过白名单后同步转Restarting，关闭新请求受理；使用request.parameters提交restart_flow；失败通过原reply回复。
+    -- 在request.workspace内按name定位成员Entity，先检查ToolTasks，存在尚未finish的活任务条目直接拒绝；通过白名单后同步转Restarting，关闭新请求受理；使用request.parameters提交restart_flow；失败通过原reply回复。
 
 handle_agent_exception(world: &mut World, event: AgentException)
-    行为：核对Entity，关闭新受理并报告event.error，不发送额外异常结果事件。
+    -- 核对Entity，关闭新受理并报告event.error，不发送额外异常结果事件。
 
 handle_start_result(world: &mut World, result: Result<StartOutput, StartError>)
 handle_stop_result(world: &mut World, result: Result<StopOutput, StopError>)
 handle_restart_result(world: &mut World, result: Result<RestartOutput, RestartError>)
-    行为：
-        核对Entity及对应生命周期状态；忽略失效结果。
-        启动成功：转Idle，通过原StartAgent.reply回复Entity。
-        重启成功：转Idle，通过原RestartAgent.reply回复Entity。
-        关闭成功：销毁Entity，通过原StopAgent.reply回复原Entity。
-        失败：有完整清理证明则销毁Entity，否则保留宿主及当前生命周期状态；启停和重启失败均通过原reply回复错误。
+    -- 核对Entity及对应生命周期状态；忽略失效结果。
+    -- 启动成功：转Idle，通过原StartAgent.reply回复Entity。
+    -- 重启成功：转Idle，通过原RestartAgent.reply回复Entity。
+    -- 关闭成功：销毁Entity，通过原StopAgent.reply回复原Entity。
+    -- 失败：有完整清理证明则销毁Entity，否则保留宿主及当前生命周期状态；启停和重启失败均通过原reply回复错误。
 
 ```
 
-私有：
 ```text
+-- 私有
 start_flow(context: FlowContext) -> Future<Output = Result<StartOutput, StartError>>
-    行为：
-        调用address::resolve_file及agent_driver_core::read_driver取得本次Driver材料，准备数据库与设置。
-        运行组件初始化阶段先发送InitToolTasks和InitInference，各携带agent及独立oneshot发送端，不先等待其中一个再发另一个。
-        使用tokio::join!等待两个接收端，与原有资源初始化一起完成；收齐全部结果后处理错误，不提前丢弃另一项。
-        新实例从空Tools开始，普通导入和动态注入均向此同一集合登记，不另建动态工具集合。全部初始化成功后准备agent_info并发送StartDriverLuaVm，等待原reply；mcl和wait由Lua Runtime构造。
-        失败清理本次已创建内容并返回，成功返回；core不引用其他core的组件类型。
+    -- 调用address::resolve_file及agent_driver_core::read_driver取得本次Driver材料，准备数据库与设置。
+    -- 运行组件初始化阶段先发送InitToolTasks和InitInference，各携带agent及独立oneshot发送端，不先等待其中一个再发另一个。
+    -- 使用tokio::join!等待两个接收端，与原有资源初始化一起完成；收齐全部结果后处理错误，不提前丢弃另一项。
+    -- 新实例使用空Tools，接收普通导入和动态注入。全部初始化成功后准备agent_info并发送StartDriverLuaVm，等待原reply；mcl和wait由Lua Runtime构造。
+    -- 失败清理本次已创建内容并返回，成功返回；core不引用其他core的组件类型。
 
 stop_flow(context: FlowContext) -> Future<Output = Result<StopOutput, StopError>>
-    行为：请求Driver停止和执行取消；沿现有流程停止任务；任务监督移除所属Tools记录并向等待它的任务返回工具错误，再等待任务、子进程及MCL真实收口。返回清理结果，不销毁协调Entity；不读取或解释MCP连接、远端工具名或binding。
+    -- 请求Driver停止和执行取消；沿现有流程停止任务；任务监督移除所属Tools记录并向等待它的任务返回工具错误，再等待任务、子进程及MCL真实收口。返回清理结果，不销毁协调Entity。
 
 restart_flow(context: FlowContext) -> Future<Output = Result<RestartOutput, RestartError>>
-    行为：await stop_flow，成功后使用重启请求提供的parameters执行start_flow；全程Restarting，不发公开StopAgent或StartAgent事件。
+    -- await stop_flow，成功后使用重启请求提供的parameters执行start_flow；全程Restarting，不发公开StopAgent或StartAgent事件。
 ```
 
 # types
 
 ## 类型
 
-私有：
 ```text
+-- 私有
 FlowContext：闭包上下文
     id: String--原请求ID
     agent: Entity
@@ -227,8 +218,8 @@ StartError / StopError / RestartError：对应闭包的失败载荷
 
 ## 类型
 
-公开：
 ```text
+-- 公开
 AgentStartParameters：启动参数，公开类型
     driver: String--Driver文件定位字符串
     project_root: PathBuf
@@ -249,8 +240,8 @@ AgentState：生命周期状态，公开枚举
 
 ## 类型
 
-公开：
 ```text
+-- 公开
 AgentError：生命周期错误，公开类型
     kind: AgentErrorKind
     message: String

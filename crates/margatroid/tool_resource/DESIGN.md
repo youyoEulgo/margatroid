@@ -1,5 +1,4 @@
 # 伪代码格式
-
 ```text
 板块使用一级标题，一行注明core与plugin文件，无内容不建空模块。
 类型、函数使用二级标题，列出字段、签名及直接行为。
@@ -7,12 +6,7 @@ System区分事件、闭包结果、提交闭包与oneshot回复，使用Rust名
 不写独立逻辑段；持有关系使用树形图。
 ```
 
-# 设计范围
-
-Margatroid领域使用原生Axum装配及普通异步闭包。网络服务属于本应用基础设施；mecs仅提供通用运行与异步事件、闭包能力，不提供服务器封装或长期任务专用接口。
-
-# 板块格式
-
+# 板块定义
 ```text
 # lib        tool_resource/core/src/lib.rs；tool_resource/plugin/src/lib.rs  路径扩展及文件读取；Plugin安装
 # components tool_resource/core/src/components.rs                         Tools统一入口集合
@@ -53,8 +47,9 @@ ToolResourcePlugin：工具路径登记插件
 公开，定义于tool_resource_core：
 ```text
 read_tool(path: &Path, limits: &ToolReadLimits) -> Result<ToolInput, ToolResourceError>
-    行为：有界读取tool.toml、input.schema.json和main.lua；校验清单版本、非空描述、JSON对象schema及Lua文件UTF-8；schema拒绝外部引用；不执行Lua。返回导入材料；导入时把description、input_schema和path存入Tools。推理不调用本文件读取函数。
-
+    有界读取tool.toml、input.schema.json、main.lua
+    validate 清单版本、非空描述、JSON对象schema、无外部引用、Lua UTF-8
+    return ToolInput -- 仅读取，不执行程序
 ```
 
 # components
@@ -66,15 +61,17 @@ read_tool(path: &Path, limits: &ToolReadLimits) -> Result<ToolInput, ToolResourc
 Tools：Agent唯一工具集合，公开组件
     entries: BTreeMap<String, ToolEntry>--alias到记录
     get(&self, alias: &str) -> Option<&ToolEntry>
-        行为：工具调用按名称查找，存在则交执行器，不存在返回工具错误。
+        return entries.get(alias)
     insert(&mut self, alias: String, entry: ToolEntry) -> Result<(), ToolResourceError>
-        行为：增加一条记录，alias冲突报错，不附加启用步骤。
+        require alias未占用
+        entries.insert(alias, entry)
     insert_batch(&mut self, entries: Vec<(String, ToolEntry)>) -> Result<(), ToolResourceError>
-        行为：动态注入先校验整批，冲突整批失败；成功即所有记录出现在Tools。
+        validate 整批记录及alias冲突
+        原子写入entries -- 失败不修改集合
     remove_owner(&mut self, owner_task_id: &str)
-        行为：移除标记属于该任务的记录；任务关闭时由宿主执行。
+        entries.retain(entry.owner_task_id != owner_task_id)
     iter(&self) -> impl Iterator<Item = (&String, &ToolEntry)>
-        行为：每次推理遍历全部记录构造schema，不接受另外的工具选择列表。
+        return entries.iter()
     impl Component for Tools
 ```
 
@@ -91,7 +88,6 @@ ImportTool：路径登记请求，公开事件
     cancel: CancellationToken
     reply: Arc<Mutex<Option<oneshot::Sender<Result<(), ToolResourceError>>>>>
     impl Event for ImportTool
-
 ```
 
 # system
@@ -106,7 +102,8 @@ tool_resource_system(world: &mut World)
     提交闭包：validate_import(ImportContext) -> Future<Output = Result<ImportOutput, ImportError>>
     产出事件：None
     oneshot回复：Result<(), ToolResourceError>
-    行为：ImportTool进入handle_import，校验结果进入handle_import_result；最终只向Tools增加记录。core只定义数据和集合，不依赖工具执行领域。
+    ImportTool -> handle_import
+    Result<ImportOutput, ImportError> -> handle_import_result
 ```
 
 # handler
@@ -116,18 +113,22 @@ tool_resource_system(world: &mut World)
 crate公开：
 ```text
 handle_import(world: &mut World, request: ImportTool)
-    行为：认领reply；校验完整owner、alias和取消状态，通过send_async_closure提交validate_import；该闭包返回本插件的Result<ImportOutput, ImportError>，由对应System收口，不再手工发送重复结果事件；失败直接回复。
+    认领reply
+    validate owner、alias、cancel
+    send_async_closure(validate_import)
+    failure: reply Err(error)
 
 handle_import_result(world: &mut World, result: Result<ImportOutput, ImportError>)
-    行为：复检owner和cancel；成功时往Tools增加alias、description、input_schema、path记录，再回复Ok(())；冲突报错。
-
+    require owner有效且未cancel
+    success: Tools.insert(alias, ToolEntry{description, input_schema, path, owner_task_id=None, binding=None})
+    reply 登记结果
 ```
 
 私有：
 ```text
 validate_import(context: ImportContext) -> Future<Output = Result<ImportOutput, ImportError>>
-    行为：spawn_blocking验证规范路径、必要文件及读取格式，调用read_tool后保留要登记的description和input_schema，丢弃此次读取的程序正文；等待真实join，保留原请求关联并返回。
-
+    await spawn_blocking(验证规范路径和文件; read_tool)
+    return ImportOutput(context, path, description, input_schema) -- 丢弃此次程序正文
 ```
 
 # types
@@ -147,20 +148,19 @@ ImportError：校验失败载荷--ImportContext及ToolResourceError
 
 公开：
 ```text
-ToolEntry：统一工具记录；普通导入与动态注入使用相同结构
+ToolEntry：工具记录
     path: PathBuf--工具执行资源入口；MCP注入的记录都指向mcp_register
     description: String
     input_schema: serde_json::Value
     owner_task_id: Option<String>--动态入口标记注册任务A；普通入口None
     binding: Option<serde_json::Value>--工具自己的不透明路由数据，例如远端工具名
-    行为：推理只遍历alias/description/input_schema；执行时按alias取记录，再使用path执行。不区分普通和动态的定义读取方式。
 
 InjectedToolDefinition：注入项
     alias: String
     description: String
     input_schema: serde_json::Value
     binding: Option<serde_json::Value>
-    行为：path和owner_task_id由宿主填当前资源和任务，不在模型schema/arguments中出现。
+    -- 宿主填path和owner_task_id
 
 ToolInput：本次工具材料
     description: String
@@ -192,22 +192,14 @@ ToolResourceErrorKind：错误类别，公开枚举
 ```
 
 # 持有关系
-
 ```text
 Agent Entity
-└── Tools：唯一工具集合
+└── Tools
     └── BTreeMap<alias, ToolEntry>
         ├── description、input_schema、path
-        └── owner_task_id、binding（注入入口的可选任务标记）
+        └── owner_task_id、binding
 
-普通IMPORT
-└── 读取资源、校验后向Tools增加记录
-
-动态tool_inject
-└── tool_plugin通过World闭包直接调用同一Tools的insert_batch
-    └── 不另建注入事件、校验服务、提交状态或第二份定义
-
-推理：每次遍历Tools构造schema
-工具调用：按请求alias查Tools并按path执行
-所有者A清理：工具监督移除Tools中owner_task_id=A的记录
+导入闭包
+└── ImportContext
+    └── 原请求oneshot发送端
 ```

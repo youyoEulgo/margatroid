@@ -2,6 +2,10 @@
 
 inference_core定义推理请求、消息、结果、模型配置Resource及错误，只依赖mecs与通用库。inference_plugin组合Agent、Client、工具路径能力，执行模型请求；不依赖其他plugin。MCL负责消息转换、批次工具调用和显式历史，Inference不维护上下文、不执行工具、不写历史。
 
+下文记录已有实现；DESIGN中的工具来源调整为已批准、待实现目标，当前src仍使用工具alias参数及路径读取API。本轮只整理文档，不表示运行中的daemon已更新。目标中InferenceRequest的tools参数删除，每次推理直接遍历Agent的Tools，以每条记录的alias、description、input_schema构造模型工具定义；Tools为空时工具定义为空。本次异步请求持有owned定义，工具执行侧按请求名称查询当前Tools并调用，缺失时返回工具错误。
+
+Margatroid领域使用原生Axum装配及普通异步闭包。网络服务归本应用基础设施，mecs提供通用运行、异步事件和闭包能力。
+
 ## 配置与参数
 
 InferencePlugin::open读取models.toml并完整校验模型路由，build安装ModelRoutes及HTTP客户端。provider与api_type分别明确指定，不从URL或模型名推断。请求携带路由选择键及采样参数；受理时取得本次路由快照，后续配置变化不修改在途请求。配置重载归Margatroid整体机制，不增加独立推理重载事件。
