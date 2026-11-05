@@ -189,7 +189,7 @@ AppAsyncExt：App异步扩展，公开trait--挂载持有固定异步处理闭�
         add_async_system<Request, T, E, Handler, Args>(&mut self, schedule: &str, handler: Handler) -> &mut Self
             添加事件模式System：按trait定义注册类型并挂载System
 
-WorldAsyncExt：World异步扩展，公开trait--发送事件模式请求、提交闭包模式请求或启动长期服务
+WorldAsyncExt：World异步扩展，公开trait--发送事件模式请求及提交闭包模式请求
     send_async_event<Request>(&self, event: Request)
         发送Async事件模式请求：公开泛型方法，event是交给固定异步System的数据
         约束：Request: Event
@@ -212,10 +212,6 @@ WorldAsyncExt：World异步扩展，公开trait--发送事件模式请求、提�
             E: From<AsyncTaskError> + Send + Sync + 'static
             Task: AsyncTask<T, E, Args>
         行为：构造捕获task的同步分发闭包，闭包调用dispatch_closure_task并使用Await模式；调用WorldClosureExt::send_closure发送到schedule；发送时不创建pending且不操作阀
-    spawn_async_service<Service>(&self, service: Service)
-        启动长期异步服务：公开泛型方法，service由所属Plugin自行管理生命周期
-        约束：Service: Future<Output = ()> + Send + 'static
-        行为：从World取得AsyncRuntimeHandle并直接提交擦除后的Future；不创建请求、pending事件或响应
     impl WorldAsyncExt for World
         WorldAsyncExt for World：公开trait实现
         send_async_event<Request>(&self, event: Request)
@@ -226,8 +222,6 @@ WorldAsyncExt：World异步扩展，公开trait--发送事件模式请求、提�
             提交Async闭包模式请求：按trait定义执行
         send_await_closure<T, E, Task, Args>(&self, schedule: &str, task: Task)
             提交Await闭包模式请求：按trait定义执行
-        spawn_async_service<Service>(&self, service: Service)
-            启动长期异步服务：按trait定义直接提交service
 ```
 
 crate公开：

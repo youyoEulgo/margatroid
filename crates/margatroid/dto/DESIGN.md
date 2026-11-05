@@ -1,4 +1,4 @@
-Margatroid领域实现契约；本领域已切换，mecs现有实现保持不动，后续另行清理。
+Margatroid领域实现契约；网络由领域原生handler处理，mecs仅提供通用运行设施。
 
 本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
 
@@ -38,7 +38,7 @@ DtoPlugin：网络协议边界插件
                 构造Router::new().route("/ws", get(ws_handler)).with_state(state)。
                 调用AppAxumExt::add_axum_routes(Router)，不要求Compose手工添加路由。
                 在PRE_UPDATE安装abort_control_system，在UPDATE安装DTO请求及结果System；中止固定使用RuntimePlugin::PRE_UPDATE；MCL、Inference和Tool仅允许UPDATE或POST_UPDATE，拒绝无法证明先后顺序的自定义schedule，不增加调度metadata，不修改mecs。
-                日志订阅通过send_async_closure提交DTO自有owned读取闭包，产生LogReady并监听退出，完成载荷交DTO System收口，不调用spawn_async_service。
+                日志订阅通过send_async_closure提交DTO自有owned读取闭包，产生LogReady并监听退出，完成载荷交DTO System收口，使用普通异步闭包。
 ```
 
 # system

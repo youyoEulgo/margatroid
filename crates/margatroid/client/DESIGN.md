@@ -1,4 +1,4 @@
-Margatroid领域实现契约；本领域已切换，mecs现有实现保持不动，后续另行清理。
+Margatroid领域实现契约；网络由领域原生handler处理，mecs仅提供通用运行设施。
 
 # 伪代码格式
 
@@ -215,5 +215,5 @@ inference
 
 client_core
 ├── core组件与事件
-└── tokio mpsc（无DTO、axum_plugin或server_plugin依赖）
+└── tokio mpsc（无DTO或服务器插件依赖）
 ```

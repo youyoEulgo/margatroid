@@ -26,4 +26,4 @@ DtoPlugin不执行MCL、模型推理、资源加载、数据库操作、目录�
 
 MCL以原oneshot返回，DTO等待闭包将其转换为网络mcl.command_result，不要求MCL另发结果观察事件。展示缓存不能作为启动配置或运行实例身份来源。
 
-升级前取得AxumLifetime退出登记，完整连接Future退出后才释放；读写监听共享停止信号。发送器Full/Closed立即取消对应连接，断开恰好一次通知ClientDisconnected。日志订阅、等待oneshot和历史快照使用普通异步闭包，均不使用spawn_async_service；排队前不捕获事件发送器，dispatch时取得AsyncContext，避免队列循环持有。
+升级前取得AxumLifetime退出登记，完整连接Future退出后才释放；读写监听共享停止信号。发送器Full/Closed立即取消对应连接，断开恰好一次通知ClientDisconnected。日志订阅、等待oneshot和历史快照使用普通异步闭包，统一走普通异步闭包结果收口；排队前不捕获事件发送器，dispatch时取得AsyncContext，避免队列循环持有。

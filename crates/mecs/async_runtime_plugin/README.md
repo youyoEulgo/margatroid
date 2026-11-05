@@ -350,18 +350,12 @@ fn main() {
 }
 ```
 
-## 长期服务
-
-`spawn_async_service` 直接提交 `Future<Output = ()>`，供调用方自行管理服务生命周期。
-它不创建请求事件、Pending 响应或自动完成事件，也不操作运行阀。若服务需要通知应用，必须自行发送事件。
-
 ## 公开 API
 
 - `AsyncRuntimePlugin`：启动并管理专用异步执行线程。
 - `AppAsyncExt::add_async_system`：绑定请求类型、固定异步 handler 与 Schedule。
 - `WorldAsyncExt::send_async_event`、`send_await_event`：发送事件模式请求。
 - `WorldAsyncExt::send_async_closure`、`send_await_closure`：提交闭包模式任务。
-- `WorldAsyncExt::spawn_async_service`：提交调用方自行管理的长期 Future。
 - `AsyncEventHandler`：适配有或没有 `AsyncContext` 的可复用 handler。
 - `AsyncTask`：适配有或没有 `AsyncContext` 的一次性任务。
 - `AsyncContext`：在异步任务中发送普通事件或带帧延迟的事件。

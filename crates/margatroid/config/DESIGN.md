@@ -1,4 +1,4 @@
-Margatroid领域实现契约；本领域已切换，mecs现有实现保持不动，后续另行清理。
+Margatroid领域实现契约；网络由领域原生handler处理，mecs仅提供通用运行设施。
 
 # 伪代码格式
 
@@ -56,7 +56,7 @@ ConfigPlugin：全局配置安装插件
 read_config(path: &Path) -> Result<MargatroidConfig, ConfigError>
     行为：有界读取UTF-8 TOML；拒绝未知字段；校验监听地址、入口策略、日志及两组非空且不重复的出站目标。
     行为：文件schema和取值不变：server.bind、server.allow、log.level、log.filter、outbound.logs、outbound.backend_state；入口仍解析localhost/all及原地址别名或CIDR数组。
-    行为：只产出config_core自有数据，不实现server_plugin::HandshakeGuard；DTO在自己的/ws handler调用IngressPolicy::evaluate。
+    行为：只产出config_core自有数据，不实现服务器框架的握手trait；DTO在自己的/ws handler调用IngressPolicy::evaluate。
 ```
 
 # types pub

@@ -8,7 +8,6 @@ members = [
     "crates/mecs/signal_plugin",
     "crates/mecs/async_runtime_plugin",
     "crates/mecs/log_plugin",
-    "crates/mecs/server_plugin",
     "crates/margatroid/address",
     "crates/margatroid/axum_plugin",
     "crates/margatroid/agent_driver/core",

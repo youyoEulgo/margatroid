@@ -9,7 +9,7 @@ System分别列出事件、闭包结果、提交闭包和oneshot回复，使用R
 
 # 设计范围
 
-Margatroid领域使用原生Axum装配及普通异步闭包，已退出mecs通用网络桥和spawn_async_service依赖。mecs现有接口、文档及源码暂时保留，后续另行清理，不提供旧入口回退或兼容实现。
+Margatroid领域使用原生Axum装配及普通异步闭包。网络服务属于本应用基础设施；mecs仅提供通用运行与异步事件、闭包能力，不提供服务器封装或长期任务专用接口。
 
 # 中止与任务生命周期契约
 
@@ -149,7 +149,7 @@ handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
         认领reply，核对Agent完整Entity、Working及当前非空turn与request.turn匹配；无turn或不匹配直接返回保留call_id/alias的中止工具结果，不注册任务、不启动闭包或进程。
         从Tools取得alias路径，从SelectedSandbox及Sandboxes取得可选策略路径。
         固定本次工具、策略路径和目录参数，准备owned执行材料，不跨await借用World。
-        创建共享ToolTaskHandle，一份登记ToolTasks，克隆一份及共享集合句柄交给工作任务；通过send_async_closure提交launch_tool，失败通过原reply回复错误；不使用spawn_async_service，不缓存执行器Handle。
+        创建共享ToolTaskHandle，一份登记ToolTasks，克隆一份及共享集合句柄交给工作任务；通过send_async_closure提交launch_tool，失败通过原reply回复错误；不缓存执行器Handle。
 ```
 
 私有：

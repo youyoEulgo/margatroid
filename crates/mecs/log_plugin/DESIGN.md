@@ -418,7 +418,7 @@ event_log_system(world: &mut World)
 业务转发EventLog：
     -> 业务Plugin可向自己指定的Schedule添加System，独立读取同一帧EventLog并自行转发
     -> 也可显式启用TracingStream并订阅投影后的tracing记录
-    -> ServerPlugin本身不自动订阅或广播日志，不修改tracing Subscriber
+    -> 日志是否转发由订阅方决定；LogPlugin不建立网络服务，不自动广播，不因订阅修改tracing Subscriber
 
 约束：
     EventLog必须经过ECS事件队列，不能由System直接调用tracing宏替代

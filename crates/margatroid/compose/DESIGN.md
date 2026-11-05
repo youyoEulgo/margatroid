@@ -11,7 +11,7 @@ Resource写在lib板块；持有关系在文末使用树形图。
 
 # 设计范围
 
-Margatroid领域使用原生Axum装配及普通异步闭包，已退出mecs通用网络桥和spawn_async_service依赖。mecs现有接口、文档及源码暂时保留，后续另行清理，不提供旧入口回退或兼容实现。
+Margatroid领域使用原生Axum装配及普通异步闭包。网络服务属于本应用基础设施；mecs仅提供通用运行与异步事件、闭包能力，不提供服务器封装或长期任务专用接口。
 
 # 板块格式
 
@@ -43,8 +43,8 @@ prepare(options: &ApplicationOptions) -> Result<ApplicationParts, ComposeError>
 
 install(app: &mut App, parts: ApplicationParts) -> Result<(), ComposeError>
     行为：先安装既有mecs Runtime、AsyncRuntime、Closure和日志设施，再安装Margatroid axum_plugin及各业务插件。
-        不安装mecs ServerPlugin或注册其通用HTTP/WebSocket事件路由；bind参数交AxumPlugin，ingress由config_core拥有并由DTO handler直接校验。
-        Client先提供ConnectionId、ClientFrame及ClientSender，DTO/Inference只依赖client_core的发送能力，不依赖server_plugin类型。
+        不注册统一通用HTTP/WebSocket事件路由；bind参数交AxumPlugin，ingress由config_core拥有并由DTO handler直接校验。
+        Client先提供ConnectionId、ClientFrame及ClientSender，DTO/Inference只依赖client_core的发送能力，不依赖服务器框架类型。
         DtoPlugin在build中自行注册/ws原生Router及自有State，UiPlugin自行注册静态Router；Compose不再手工调用UiPlugin::router后add_http_routes。
         各插件使用AppAxumExt::add_axum_routes提交已完成with_state的Router；所有插件build完成后STARTUP由普通send_async_closure运行整个Axum服务，ECS继续推进。
         handler可直接返回Response、使用专用channel/oneshot或发送自己的事件，不要求统一通用网络事件。

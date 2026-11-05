@@ -8,7 +8,7 @@ Client保存自有ConnectionId、类型、名称和ClientSender出站能力，�
 
 System收集RegisterClient和ClientDisconnected专用领域事件并交给Handler。注册Handler校验发送能力、名称及地址占用，挂载Client和Address并复检队列是否关闭；成功后发送包含完整Entity的注册结果。失败清理本次实体，不修改网络元数据。实际连接由DTO拥有，断开时关闭队列并发送ClientDisconnected，ClientPlugin销毁身份，不取消已提交推理。
 
-client_core提供ConnectionId、ClientFrame和有界ClientSender；Frame只有Text、Binary及Close，不依赖Axum或mecs server_plugin。DTO把帧映射到实际socket，inference等领域只使用发送器快照，ClientPlugin无需服务器设施。
+client_core提供ConnectionId、ClientFrame和有界ClientSender；Frame只有Text、Binary及Close，不依赖Axum或服务器插件。DTO把帧映射到实际socket，inference等领域只使用发送器快照，ClientPlugin无需服务器设施。
 
 ## 查询与对外身份
 
