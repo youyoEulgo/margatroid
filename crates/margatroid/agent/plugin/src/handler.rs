@@ -361,12 +361,7 @@ pub(crate) fn handle_restart_agent(world: &mut World, request: RestartAgent) {
         };
         if world
             .get_component::<ToolTasks>(agent)
-            .is_some_and(|tasks| {
-                tasks
-                    .list()
-                    .iter()
-                    .any(|(_, handle)| !handle.is_completed())
-            })
+            .is_some_and(|tasks| !tasks.list().is_empty())
         {
             return Err(error(
                 AgentErrorKind::UnfinishedTasks,
@@ -991,12 +986,7 @@ async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), Age
         }
         if world
             .get_component::<ToolTasks>(agent)
-            .is_some_and(|tasks| {
-                tasks
-                    .list()
-                    .iter()
-                    .any(|(_, handle)| !handle.is_completed())
-            })
+            .is_some_and(|tasks| !tasks.list().is_empty())
         {
             return Err(error(
                 AgentErrorKind::CleanupFailed,

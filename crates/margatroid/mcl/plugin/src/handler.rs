@@ -1042,6 +1042,9 @@ async fn execute_tools(
             world.send_event(ToolExecuteRequest {
                 id: format!("tool:{task_prefix}:{index}"),
                 agent: request.target,
+                turn: expected_turn
+                    .clone()
+                    .expect("active tool call requires a turn"),
                 alias: call.name.clone(),
                 call_id: call.id.clone(),
                 arguments: call.arguments.clone(),
@@ -1052,32 +1055,32 @@ async fn execute_tools(
         Ok(pending)
     })
     .await?;
-    let mut results = Vec::new();
-    for (call, receiver, fallback) in pending {
-        if let Some(content) = fallback {
-            results.push(tool_message(&call, content, Vec::new(), true));
-            continue;
-        }
-        let message = match receiver.unwrap().await {
-            Ok(Ok(response)) => {
-                if (!response.call_id.is_empty() && response.call_id != call.id)
-                    || (!response.alias.is_empty() && response.alias != call.name)
-                {
-                    tool_message(
-                        &call,
-                        "tool response association does not match request".into(),
-                        Vec::new(),
-                        true,
-                    )
-                } else {
-                    tool_message(&call, response.content, response.images, response.failed)
-                }
+    let results = futures_util::future::join_all(pending.into_iter().map(
+        |(call, receiver, fallback)| async move {
+            if let Some(content) = fallback {
+                return tool_message(&call, content, Vec::new(), true);
             }
-            Ok(Err(failed)) => tool_message(&call, failed.to_string(), Vec::new(), true),
-            Err(_) => tool_message(&call, "tool call reply was lost".into(), Vec::new(), true),
-        };
-        results.push(message);
-    }
+            match receiver.unwrap().await {
+                Ok(Ok(response)) => {
+                    if (!response.call_id.is_empty() && response.call_id != call.id)
+                        || (!response.alias.is_empty() && response.alias != call.name)
+                    {
+                        tool_message(
+                            &call,
+                            "tool response association does not match request".into(),
+                            Vec::new(),
+                            true,
+                        )
+                    } else {
+                        tool_message(&call, response.content, response.images, response.failed)
+                    }
+                }
+                Ok(Err(failed)) => tool_message(&call, failed.to_string(), Vec::new(), true),
+                Err(_) => tool_message(&call, "tool call reply was lost".into(), Vec::new(), true),
+            }
+        },
+    ))
+    .await;
     Ok(MclValue::Array(MessageArray::Message(results)))
 }
 

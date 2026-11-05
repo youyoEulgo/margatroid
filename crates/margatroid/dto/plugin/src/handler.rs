@@ -816,6 +816,9 @@ pub(crate) fn handle_abort_control(world: &mut World, request: AbortTurnControl)
                 {
                     current.cancel();
                 }
+                if let Some(tasks) = world.get_component::<tool_core::ToolTasks>(request.agent) {
+                    tasks.abort_unreturned();
+                }
             })
     } else {
         Err(error(

@@ -62,7 +62,7 @@ IMPORT校验种类、依赖和alias后，在对应资源领域登记alias到路�
 | ready | 无 | Unit |
 | wake | 无 | Unit |
 
-inference和tool_call将请求交给所属领域并等待oneshot。tool_call保留原调用ID及顺序，每个工具调用错误均转换为failed工具消息，包括配置、参数、执行、超时、清理、任务panic、回复丢失和关联错误；不因单个失败丢失整批结果。无法解析出有效工具调用的命令错误与其他非工具错误，通过唯一回复出口转换为Error值，形状为{"Error":{"type":"error","message":"错误种类: 说明","request_id":"本次命令id"}}，不抛Lua宿主异常终止Driver。原始执行失败仍在MCL审计中记录succeeded=false。清理尚未证明时及时返回错误并保留后台监督，不将任务伪报completed或安全退出。sandbox_use选择alias，不保存长期策略正文；实际执行读取选定路径的策略。history_append显式保存消息；其他操作不自动追加消息历史。指令审计与消息历史分别记录，不把审计参数投影成重复消息。两类历史以Agent内sequence标识并排序，不设历史key；content由调用方提供并与payload独立原样存取。
+inference和tool_call将请求交给所属领域并等待oneshot。tool_call先发出整批带独立oneshot的请求，再通过join_all收齐并保持输入顺序；保留原调用ID，每个工具调用错误均转换为failed工具消息，包括配置、参数、执行、超时、清理、任务panic、回复丢失和关联错误；不因单个失败丢失整批结果。无法解析出有效工具调用的命令错误与其他非工具错误，通过唯一回复出口转换为Error值，形状为{"Error":{"type":"error","message":"错误种类: 说明","request_id":"本次命令id"}}，不抛Lua宿主异常终止Driver。原始执行失败仍在MCL审计中记录succeeded=false。清理尚未证明时及时返回错误并保留后台监督，不将任务伪报completed或安全退出。sandbox_use选择alias，不保存长期策略正文；实际执行读取选定路径的策略。history_append显式保存消息；其他操作不自动追加消息历史。指令审计与消息历史分别记录，不把审计参数投影成重复消息。两类历史以Agent内sequence标识并排序，不设历史key；content由调用方提供并与payload独立原样存取。
 
 start_turn和finish_turn调用agent_core同步扩展；ready和wake调用lua_runtime_core扩展。ready只允许当前Driver对本人调用。wait是Lua宿主函数，不是MCL指令。上述调用由plugin组合，不让core之间互相依赖。
 
@@ -70,6 +70,6 @@ start_turn和finish_turn调用agent_core同步扩展；ready和wake调用lua_run
 
 每个目标一个FIFO，一次只推进一个队首，异步等待不阻塞其他目标。System只路由，Handler完成校验和推进；闭包不跨await借用World。完成后通过原oneshot回复，不额外建立MclCommandResult中转事件。
 
-回合中止是同步控制，不进入FIFO，也不关闭整个队列。inference/tool_call在实际受理时复查turn；无turn返回正常形状的取消消息，真实失败规范为工具失败结果或error消息。取消Assistant不进入推理上下文，Driver可显式保留历史；finish_turn只有本轮真实执行已收口才结束回合，尚未收口时立即返回error并保留句柄和状态，不循环等待；Driver在清理完成唤醒后重试，不能让旧完成覆盖新回合。
+插件仅允许UPDATE或POST_UPDATE，拒绝无法证明中止先行的自定义schedule。回合中止固定PRE_UPDATE同步控制，不进入FIFO，也不关闭整个队列。先清turn，再取消当前推理并原子强制return、终止清理未return工具；已return后台任务保留。inference/tool_call在实际受理时复查turn；无turn或请求turn不匹配时，Inference返回空assistant的Cancelled响应，Tool返回保留call_id/alias的failed中止结果且不创建任务，真实失败规范为工具失败结果或error消息。取消Assistant不进入推理上下文，Driver可显式保留历史；finish_turn只有本轮真实执行已收口才结束回合，尚未收口时立即返回error并保留句柄和状态，不循环等待；Driver在清理完成唤醒后重试，不能让旧完成覆盖新回合。
 
 关闭队列拒绝新命令、取消排队和在途操作，仍等待文件worker、领域任务和回执真实收口。drain成功不只表示发出了取消；清理失败保持错误，不以丢弃Future代替退出证明。

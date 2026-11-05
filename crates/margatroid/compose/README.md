@@ -8,4 +8,6 @@ Compose不维护Catalog、文件存储接口、持久资源注册表或数据库
 
 mcl和wait由lua_runtime_plugin自行构造，分别使用mcl_core事件契约和lua_runtime_core共享槽位；Compose不构造宿主或注入环境工厂。安装顺序保证基础设施先存在，生命周期System按同一Schedule的挂载顺序裁决；领域使用Margatroid AxumPlugin合并原生Router，DTO和UI安装时各自注册handler；不安装mecs ServerPlugin、不使用通用网络事件，mecs代码暂时保留。
 
+中止控制固定PRE_UPDATE；MCL、Inference和Tool仅允许UPDATE或POST_UPDATE，拒绝无法证明顺序的自定义schedule，不新增调度metadata或修改mecs。控制先同步清turn，再取消当前推理并原子强制return、终止清理未return工具；已return后台任务保留。
+
 shutdown_app(&mut App)在请求Axum停止后继续推进World，按原领域流程关闭Workspace/Agent，等待Axum普通请求及升级工作退出后返回；清理失败返回诊断，调用方必须保留App监督，不能将错误返回解释为全部已清理。

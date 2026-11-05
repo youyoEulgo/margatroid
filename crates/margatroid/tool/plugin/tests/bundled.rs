@@ -61,7 +61,7 @@ impl Fixture {
                 name: "test".into(),
                 workspace,
                 state: AgentState::Working,
-                turn: None,
+                turn: Some("test-turn".into()),
             },
         );
         let (sender, mut reply) = oneshot::channel();
@@ -121,6 +121,7 @@ impl Fixture {
         self.app.world().emit_event(ToolExecuteRequest {
             id: id.into(),
             agent: self.agent,
+            turn: "test-turn".into(),
             alias: alias.into(),
             call_id: format!("call-{id}"),
             arguments,
@@ -155,17 +156,36 @@ impl Fixture {
             .clone()
     }
 
-    fn completed(&self, id: &str) {
-        let handle = self.tasks().get(id).unwrap();
+    fn removed(&self, id: &str) {
+        let tasks = self.tasks();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !handle.is_completed() {
-            assert!(
-                Instant::now() < deadline,
-                "task {id} not completed: {:?}",
-                handle.read().error
-            );
+        loop {
+            match tasks.read(id) {
+                Err(error) => {
+                    assert_eq!(error.kind, Kind::TaskMissing, "{id}: {error:?}");
+                    break;
+                }
+                Ok(result) => assert!(
+                    Instant::now() < deadline,
+                    "task {id} still retained: {:?}",
+                    result.error
+                ),
+            }
             std::thread::sleep(Duration::from_millis(2));
         }
+        assert!(!tasks.list().iter().any(|(task_id, _)| task_id == id));
+        assert_eq!(
+            tasks.send(id, Value::Null).unwrap_err().kind,
+            Kind::TaskMissing
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(
+            runtime.block_on(tasks.finish(id)).unwrap_err().kind,
+            Kind::TaskMissing
+        );
     }
 
     fn bundle(&mut self, alias: &str) {
@@ -192,8 +212,8 @@ impl Fixture {
         let id = format!("{alias}-{}", self.tasks().list().len());
         let reply = self.execute(&id, alias, arguments);
         let result = self.response(reply).unwrap();
-        self.completed(&id);
-        assert!(self.tasks().read(&id).unwrap().error.is_none());
+        self.removed(&id);
+
         result
     }
 
@@ -414,7 +434,7 @@ fn guidance_tools_and_actual_resource_schemas_use_explicit_task_completion() {
         let id = format!("invalid-{alias}");
         let reply = f.execute(&id, alias, json!({}));
         assert_eq!(f.response(reply).unwrap_err().kind, Kind::InvalidArguments);
-        f.completed(&id);
+        f.removed(&id);
     }
 }
 
@@ -452,7 +472,7 @@ fn task_control_tools_pass_structured_messages_null_and_shared_cache_cursors() {
     while received.len() < 2 {
         let response = f.call("task-read", json!({"task_id":"worker"}));
         let value: Value = serde_json::from_str(&response.content).unwrap();
-        assert_eq!(value["completed"], false);
+        assert!(value.get("completed").is_none());
         received.extend(value["output"].as_array().unwrap().clone());
         assert!(Instant::now() < deadline);
     }
@@ -477,13 +497,10 @@ fn task_control_tools_pass_structured_messages_null_and_shared_cache_cursors() {
         assert!(Instant::now() < deadline);
     }
     assert!(!f.call("task-finish", json!({"task_id":"worker"})).failed);
-    assert!(f.tasks().get("worker").unwrap().is_completed());
+    f.removed("worker");
     let read = f.call("task-read", json!({"task_id":"worker"}));
-    assert_eq!(
-        serde_json::from_str::<Value>(&read.content).unwrap()["completed"],
-        true
-    );
-    assert!(!f.call("task-finish", json!({"task_id":"worker"})).failed);
+    assert!(read.failed);
+    assert!(f.call("task-finish", json!({"task_id":"worker"})).failed);
     assert!(
         f.call("task-send", json!({"task_id":"worker","value":"late"}))
             .failed
@@ -519,7 +536,7 @@ fn actual_bash_resource_interacts_through_actual_task_control_tools() {
         assert!(Instant::now() < deadline, "{output}");
     }
     assert!(!f.call("task-finish", json!({"task_id":"bash-live"})).failed);
-    assert!(f.tasks().get("bash-live").unwrap().is_completed());
+    f.removed("bash-live");
 }
 
 #[test]
@@ -602,7 +619,7 @@ fn text_boundaries_and_literal_replacements_preserve_bytes_on_failure() {
         json!({"path":"literal.txt","old_string":"","new_string":"bad"}),
     );
     assert_eq!(f.response(reply).unwrap_err().kind, Kind::InvalidArguments);
-    f.completed("empty-needle");
+    f.removed("empty-needle");
     assert_eq!(
         std::fs::read(f.root.path().join("literal.txt")).unwrap(),
         before
@@ -737,7 +754,7 @@ fn workspace_sandbox_bash_handles_input_errors_and_tui_updates_then_closes() {
         !f.call("task-finish", json!({"task_id":"sandbox-bash"}))
             .failed
     );
-    assert!(f.tasks().get("sandbox-bash").unwrap().is_completed());
+    f.removed("sandbox-bash");
 }
 
 #[test]
@@ -776,7 +793,7 @@ fn one_shot_bash_supports_bash_syntax_stderr_failures_and_does_not_persist_state
         .contains(&format!("DIR={}", f.root.path().display())));
     let result = f.call("bash-exec", json!({"cmd":"true"}));
     assert!(result.content.contains("command completed with no output"));
-    assert!(f.tasks().list().iter().all(|(_, task)| task.is_completed()));
+    assert!(f.tasks().list().is_empty());
 }
 
 #[test]

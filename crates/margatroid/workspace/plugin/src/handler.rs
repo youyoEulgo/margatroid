@@ -224,12 +224,7 @@ pub(crate) fn handle_restart_workspace(world: &mut World, request: RestartWorksp
         for member in members(world, workspace)? {
             if world
                 .get_component::<ToolTasks>(member)
-                .is_some_and(|tasks| {
-                    tasks
-                        .list()
-                        .iter()
-                        .any(|(_, handle)| !handle.is_completed())
-                })
+                .is_some_and(|tasks| !tasks.list().is_empty())
             {
                 return Err(error(
                     WorkspaceErrorKind::Busy,

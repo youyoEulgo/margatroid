@@ -51,8 +51,11 @@ impl Plugin for InferencePlugin {
             "InferencePlugin schedule missing"
         );
         assert!(
-            self.schedule != RuntimePlugin::STARTUP,
-            "InferencePlugin requires a recurring schedule"
+            matches!(
+                self.schedule.as_str(),
+                RuntimePlugin::UPDATE | RuntimePlugin::POST_UPDATE
+            ),
+            "InferencePlugin must run in UPDATE or POST_UPDATE after abort control"
         );
         app.world().send_closure(&self.schedule, |_| {});
         let client = reqwest::Client::builder()

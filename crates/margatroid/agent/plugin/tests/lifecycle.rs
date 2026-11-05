@@ -554,7 +554,7 @@ fn stop_vm_error_retains_stopping_host_and_runtime_components() {
 fn restart_with_unfinished_tools_rejects_without_cancellation_or_vm_stop() {
     let mut fixture = Fixture::new();
     let agent = fixture.start();
-    let (task, _input) = ToolTaskHandle::new(&ToolExecutionLimits::default()).unwrap();
+    let (task, _input) = new_tool_task();
     fixture
         .app
         .world()
@@ -596,12 +596,17 @@ fn restart_with_unfinished_tools_rejects_without_cancellation_or_vm_stop() {
         .unwrap()
         .vm_stops
         .is_empty());
-    task.complete(None);
+    fixture
+        .app
+        .world()
+        .get_component::<ToolTasks>(agent)
+        .unwrap()
+        .complete_cleanup("unfinished", &task, None);
     let mut stop = fixture.request_stop(agent, "stop");
     wait(&mut fixture.app, &mut stop).unwrap();
 }
 #[test]
-fn restart_uses_new_driver_same_entity_and_preserves_completed_tools_database_settings() {
+fn restart_uses_new_driver_same_entity_and_preserves_database_settings_without_finished_tasks() {
     let mut fixture = Fixture::new();
     let agent = fixture.start();
     let storage = fixture
@@ -632,15 +637,20 @@ fn restart_uses_new_driver_same_entity_and_preserves_completed_tools_database_se
         },
     )
     .unwrap();
-    let (completed, _input) = ToolTaskHandle::new(&ToolExecutionLimits::default()).unwrap();
-    completed.complete(None);
+    let (completed, _input) = new_tool_task();
     fixture
         .app
         .world()
         .get_component::<ToolTasks>(agent)
         .unwrap()
-        .register("completed".into(), completed)
+        .register("completed".into(), completed.clone())
         .unwrap();
+    fixture
+        .app
+        .world()
+        .get_component::<ToolTasks>(agent)
+        .unwrap()
+        .complete_cleanup("completed", &completed, None);
     let old = fixture
         .app
         .world()
@@ -671,7 +681,7 @@ fn restart_uses_new_driver_same_entity_and_preserves_completed_tools_database_se
         .get_component::<ToolTasks>(agent)
         .unwrap()
         .get("completed")
-        .is_ok());
+        .is_err());
     assert_eq!(
         fixture
             .app
@@ -736,12 +746,18 @@ fn stop_closes_admission_then_waits_for_vm_inference_tools_and_mcl_drain() {
         .get_component_mut::<ActiveInference>(agent)
         .unwrap()
         .current = Some(inference_handle);
-    let (tool, _input) = ToolTaskHandle::new(&ToolExecutionLimits::default()).unwrap();
+    let (tool, _input) = new_tool_task();
     let finished = tool.clone();
+    let cleanup_tasks = fixture
+        .app
+        .world()
+        .get_component::<ToolTasks>(agent)
+        .unwrap()
+        .clone();
     let (tool_release, tool_wait) = oneshot::channel();
     tool.attach_task(runtime.spawn(async move {
         tool_wait.await.unwrap();
-        finished.complete(None);
+        cleanup_tasks.complete_cleanup("running", &finished, None);
     }))
     .unwrap();
     fixture
@@ -938,4 +954,18 @@ fn exception_closes_admission_and_retains_host_without_faking_cleanup() {
         .unwrap()
         .vm_stops
         .is_empty());
+}
+
+fn new_tool_task() -> (
+    ToolTaskHandle,
+    tokio::sync::mpsc::Receiver<serde_json::Value>,
+) {
+    let (reply, _result) = oneshot::channel();
+    ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        "call".into(),
+        "tool".into(),
+        reply,
+    )
+    .unwrap()
 }

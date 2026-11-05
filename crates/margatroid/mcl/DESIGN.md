@@ -1,3 +1,5 @@
+本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
+
 # 伪代码格式
 
 ```text
@@ -48,7 +50,7 @@ MclPlugin：MCL执行插件
     schedule: String
     impl Plugin for MclPlugin
         build(self, app: &mut App)
-            行为：检查运行设施，安装mcl_command_system，不提供Lua宿主函数。
+            行为：检查运行设施，schedule仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule，安装mcl_command_system，不提供Lua宿主函数。
 ```
 
 # components
@@ -132,7 +134,12 @@ execute_config(context: CommandContext, operation: ConfigOperation)
     行为：只访问当前Agent设置文件；GET读取整份TOML；SET按点分路径赋值；DELETE删除键；写入完整成功才返回。
 
 execute_effect(context: CommandContext, name: String, arguments: Vec<EffectParameter>)
-    行为：按effect参数约束求值，通过对应领域core能力执行或发送带oneshot的具体领域请求；保留本次请求与回合关联。
+    行为：按effect参数约束求值，通过对应领域core能力执行或发送带oneshot的具体领域请求；保留本次请求与回合关联。中止不进入MCL FIFO，不关闭队列；工具调用不能只在MCL发出时检查turn，最终受理还要由工具System复检。
+
+execute_tools(context: CommandContext, messages: Vec<Value>, aliases: Vec<String>) -> Future<Output = Result<MclValue, MclError>>
+    行为：先验证整批调用身份，一次性发出多个ToolExecuteRequest，各自携带Agent、原turn、call_id及独立oneshot，所有请求均先发出，再使用join_all等待独立oneshot并按输入顺序返回；等待顺序不串行化执行。
+    中止前未被工具System受理的请求直接回中止结果；已经受理且未return的任务由ToolTasks强制return并清理，使本闭包立即获得各调用的中止结果，不再等工具自然return。中止获胜后迟到Return无法再次交付，正常return先获胜的结果保留且后台任务不被杀。
+    可识别工具调用错误始终返回对应failed工具消息；整批收齐关联后交Driver，Driver显式结束回合。不得通过关闭整条MCL队列或杀Driver来中止。
 ```
 
 # types

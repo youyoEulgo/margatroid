@@ -20,6 +20,7 @@ impl Event for InitToolTasks {}
 pub struct ToolExecuteRequest {
     pub id: String,
     pub agent: Entity,
+    pub turn: String,
     pub alias: String,
     pub call_id: String,
     pub arguments: Value,

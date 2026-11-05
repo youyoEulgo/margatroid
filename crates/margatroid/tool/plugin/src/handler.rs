@@ -67,13 +67,25 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
     else {
         return;
     };
+    let accepted = world
+        .get_component::<Agent>(request.agent)
+        .is_some_and(|agent| {
+            world.is_alive(request.agent)
+                && agent.state == AgentState::Working
+                && !request.turn.is_empty()
+                && agent.turn.as_deref() == Some(request.turn.as_str())
+        });
+    if !accepted {
+        let _ = reply.send(Ok(tool_core::ToolExecuteResponse::aborted(
+            request.call_id.clone(),
+            request.alias.clone(),
+        )));
+        return;
+    }
     let prepared = (|| {
         let agent = world
             .get_component::<Agent>(request.agent)
             .ok_or_else(|| error(Kind::AgentMissing, "Agent entity missing"))?;
-        if !matches!(agent.state, AgentState::Idle | AgentState::Working) {
-            return Err(error(Kind::Closed, "Agent is not accepting new tool tasks"));
-        }
         if request.id.trim().is_empty()
             || request.call_id.trim().is_empty()
             || request.alias.trim().is_empty()
@@ -127,29 +139,31 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
             .get_component::<ToolTasks>(request.agent)
             .ok_or_else(|| error(Kind::TaskMissing, "ToolTasks not initialized"))?
             .clone();
-        let (handle, input) = ToolTaskHandle::new(&config.limits)?;
-        tasks.register(request.id.clone(), handle.clone())?;
-        Ok((
-            config,
-            tool_path,
-            sandbox_path,
-            project_root,
-            tasks,
-            handle,
-            input,
-        ))
+        Ok((config, tool_path, sandbox_path, project_root, tasks))
     })();
-    let (config, tool_path, sandbox_path, project_root, tasks, handle, input) = match prepared {
+    let (config, tool_path, sandbox_path, project_root, tasks) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = reply.send(Err(error));
             return;
         }
     };
+    let Ok((handle, input)) = ToolTaskHandle::new(
+        &config.limits,
+        request.call_id.clone(),
+        request.alias.clone(),
+        reply,
+    ) else {
+        // Handle construction delivers its validation failure to the original reply.
+        return;
+    };
+    if let Err(failure) = tasks.register(request.id.clone(), handle.clone()) {
+        let _ = handle.return_result(Err(failure));
+        return;
+    }
     let schedule = config.schedule.clone();
     let context = ToolExecutionContext {
         request,
-        reply: Some(reply),
         tool_path,
         sandbox_path,
         project_root,
@@ -186,8 +200,11 @@ impl ToolLaunchFallback {
             .take()
         {
             complete_reply(&mut context, Err(failure.clone()));
-            context.handle.complete(Some(failure));
+            context
+                .tasks
+                .complete_cleanup(&context.request.id, &context.handle, Some(failure));
         } else {
+            let _ = self.handle.return_result(Err(failure.clone()));
             self.handle.set_error(failure);
             self.handle.cancel();
         }
@@ -241,9 +258,7 @@ fn complete_reply(
     context: &mut ToolExecutionContext,
     result: Result<tool_core::ToolExecuteResponse, ToolError>,
 ) {
-    if let Some(reply) = context.reply.take() {
-        let _ = reply.send(result);
-    }
+    let _ = context.handle.return_result(result);
 }
 
 async fn supervise_tool(mut context: ToolExecutionContext) {
@@ -334,6 +349,9 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
     })
     .catch_unwind()
     .await;
+    // A normal return from the supervised future confirms all cleanup paths,
+    // even when the original execution error itself was CleanupFailed.
+    let cleanup_confirmed = result.is_ok();
     let outcome = result.unwrap_or_else(|_| {
         Err(error(
             Kind::CleanupFailed,
@@ -349,13 +367,12 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
     if let Err(failure) = &outcome {
         complete_reply(&mut context, Err(failure.clone()));
     }
-    if outcome
-        .as_ref()
-        .is_err_and(|failure| failure.kind == Kind::CleanupFailed)
-    {
-        handle.set_error(outcome.unwrap_err());
+    if cleanup_confirmed {
+        context
+            .tasks
+            .complete_cleanup(&context.request.id, &handle, outcome.err());
     } else {
-        handle.complete(outcome.err());
+        handle.set_error(outcome.unwrap_err());
     }
 }
 
@@ -521,11 +538,8 @@ async fn host_frame(
 ) -> Result<HostFrame, ToolError> {
     let (request_id, result) = match frame {
         RunnerFrame::Return { request_id, value } => {
-            let result = parse_tool_result(&value, &context.limits).and_then(|mut response| {
-                context.handle.claim_return()?;
-                response.call_id = context.request.call_id.clone();
-                response.alias = context.request.alias.clone();
-                complete_reply(context, Ok(response));
+            let result = parse_tool_result(&value, &context.limits).and_then(|response| {
+                context.handle.return_result(Ok(response))?;
                 Ok(Value::Null)
             });
             (request_id, result)
@@ -632,7 +646,13 @@ async fn run_runner(
         Ok(child) => child,
         Err(_) => {
             if let Some(boundary) = boundary {
-                boundary.cleanup().await?;
+                while boundary.cleanup().await.is_err() {
+                    record_cleanup_failure(
+                        context,
+                        "failed runner start cleanup pending; supervision retained",
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
             }
             return Err(error(
                 Kind::RunnerStartFailed,
@@ -781,20 +801,21 @@ async fn run_runner(
         signal_runner(pid);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // Reap both pipe tasks and the boundary before propagating any pipe error.
     let writer_result = writer
         .await
-        .map_err(|_| error(Kind::RunnerProtocolFailed, "runner input task failed"))?;
+        .map_err(|_| error(Kind::RunnerProtocolFailed, "runner input task failed"));
     let diagnostic_result = diagnostics
         .await
-        .map_err(|_| error(Kind::RunnerProtocolFailed, "runner diagnostic task failed"))?;
-    writer_result?;
-    diagnostic_result?;
+        .map_err(|_| error(Kind::RunnerProtocolFailed, "runner diagnostic task failed"));
     if let Some(boundary) = &boundary {
         while boundary.cleanup().await.is_err() {
             record_cleanup_failure(context, "cgroup cleanup incomplete; supervision retained");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+    writer_result??;
+    diagnostic_result??;
     if !proven {
         result = Err(error(Kind::CleanupFailed, "runner cleanup unproven"));
     }

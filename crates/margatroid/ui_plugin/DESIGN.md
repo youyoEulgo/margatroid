@@ -1,5 +1,7 @@
 Margatroid领域实现契约；本领域已切换，mecs现有实现保持不动，后续另行清理。
 
+本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
+
 # 伪代码格式
 
 ```text
@@ -61,7 +63,7 @@ stopWorkspace(address: string): Promise<void>
     行为：发送workspace.stop，等待权威状态，不乐观删除实例。
 
 abortTurn(): Promise<void>
-    行为：立即冻结当前request/instance的流，发送agent.turn.abort；保持Working直到权威sync确认Idle。
+    行为：立即冻结当前request/instance的流，发送agent.turn.abort；后端先清turn，再取消推理、强制return并清理未return工具，已return后台任务保留。受理ack不表示清理完成；保持Working直到权威sync确认Idle，不以长任务自然结束作为中止响应条件。
 
 sendUserMessage(): Promise<void>
     行为：固定当前目标；按INJECT及EFFECT wake契约发送，回执失败保留草稿，切换目标隔离迟到结果。

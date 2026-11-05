@@ -1,4 +1,7 @@
 mod handler;
+#[cfg(test)]
+#[path = "../tests/internal/lifecycle.rs"]
+mod lifecycle_tests;
 mod system;
 mod types;
 
@@ -75,8 +78,11 @@ impl Plugin for ToolPlugin {
             "ToolPlugin schedule missing"
         );
         assert!(
-            self.schedule != RuntimePlugin::STARTUP,
-            "ToolPlugin requires recurring schedule"
+            matches!(
+                self.schedule.as_str(),
+                RuntimePlugin::UPDATE | RuntimePlugin::POST_UPDATE
+            ),
+            "ToolPlugin requires UPDATE or POST_UPDATE after turn abort handling"
         );
         app.world().send_closure(&self.schedule, |_| {});
         self.limits.validate().expect("ToolPlugin limits invalid");

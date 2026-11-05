@@ -14,6 +14,7 @@ inference_core = { path = "../../inference/core" }
 mcl_core = { path = "../../mcl/core" }
 storage_core = { path = "../../storage/core" }
 sandbox_resource_core = { path = "../../sandbox_resource/core" }
+tool_core = { path = "../../tool/core" }
 tool_resource_core = { path = "../../tool_resource/core" }
 margatroid_protocol = { path = "../../protocol" }
 core_plugin = { path = "../../../mecs/core_plugin" }
@@ -30,7 +31,6 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
-tool_core = { path = "../../tool/core" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 closure_plugin = { path = "../../../mecs/closure_plugin" }
 tempfile = "3"

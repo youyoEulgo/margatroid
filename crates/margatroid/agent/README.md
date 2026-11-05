@@ -6,7 +6,7 @@ agent_core定义Agent自身组件、生命周期状态、事件和错误，只�
 
 状态为Starting、Idle、Working、Restarting、Stopping。Handler在一次同步调用中检查状态白名单并切换状态，随后提交异步闭包。
 
-Idle允许开始回合、关闭和重启；Working允许结束回合、中止、关闭和重启。Starting、Restarting、Stopping只允许当前操作的步骤及结果，拒绝其他生命周期请求。重复关闭和重启不合并、不抢占在途流程。有未完成工具任务时同步拒绝重启，不自动结束任务后重启。
+Idle允许开始回合、关闭和重启；Working允许结束回合、中止、关闭和重启。Starting、Restarting、Stopping只允许当前操作的步骤及结果，拒绝其他生命周期请求。重复关闭和重启不合并、不抢占在途流程。ToolTasks存在尚未finish的活任务时同步拒绝重启，不自动结束任务后重启。
 
 stop_agent_system、restart_agent_system、start_agent_system依次挂载于同一Schedule，直接使用mecs按添加顺序同步执行的机制。同帧关闭优先于重启；先受理者同步修改状态，后者按白名单拒绝。不增加统一生命周期事件、排序队列或手写优先级分发器。优先级不取消前一帧已受理的操作。
 
@@ -34,4 +34,4 @@ InitToolTasks由tool_plugin挂载空ToolTasks，InitInference由inference_plugin
 
 Agent只保存名称、Workspace Entity、生命周期状态和当前turn。Address独立挂载，仅供边界寻址。Driver运行组件、MCL队列、数据库、历史和各资源路径表由各领域core定义，作为并列组件挂到Agent Entity。
 
-中止控制事件被受理后，调用方plugin同步调用agent_abort_turn检查并清除turn，只取消当前推理，工具任务不绑定turn，不受回合变化影响；保留DTO网络事件到专属控制事件的两帧路径；agent_core不额外提供中止结果事件或中止闭包。Agent保持Working，直到正常收尾后回Idle。turn已空或不匹配的重复中止直接拒绝，不保存上轮中止关联。Agent不修改Workspace配置文件；配置编辑和整体重载不由生命周期流程执行。
+中止控制事件被受理后，调用方plugin同步调用agent_abort_turn检查并清除turn，随后取消ActiveInference.current句柄，并由ToolTasks::abort_unreturned原子强制交付未return任务的原调用中止结果、请求终止清理；已return未finish后台任务保留；保留DTO网络事件到专属控制事件的两帧路径；agent_core不额外提供中止结果事件或中止闭包。Agent保持Working，直到正常收尾后回Idle。turn已空或不匹配的重复中止直接拒绝，不保存上轮中止关联。Agent不修改Workspace配置文件；配置编辑和整体重载不由生命周期流程执行。

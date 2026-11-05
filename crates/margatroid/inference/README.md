@@ -23,7 +23,7 @@ ActiveInference归inference_core，单独保存当前InferenceHandle。受理推
 
 ## 输入与工具
 
-InferenceRequest携带完整Agent Entity、turn、消息、工具alias和oneshot。Handler认领唯一回复端，检查Working及当前turn，准备本次请求。无有效turn返回正常Cancelled响应，不启动HTTP。
+InferenceRequest携带完整Agent Entity、turn、消息、工具alias和oneshot。Handler认领唯一回复端，检查Working及当前turn，准备本次请求。System实际受理时当前turn为空或与request.turn不匹配，直接返回空assistant的Cancelled响应（正文、reasoning、tool_calls、replay、usage均空），不启动HTTP或监督任务。插件仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule。
 
 推理消息由本领域独立定义，MCL在plugin层转换并展开Inject；core不引用消息、工具或Agent core。System保留原角色，取消Assistant不进入模型上下文，工具调用与结果必须正确配对。
 
@@ -51,7 +51,7 @@ HTTP/SSE读取任务只向一个有界ProviderFragment通道写入，不直接�
 
 DTO原生WebSocket读循环解析协议后投递自有DtoRequest，UPDATE转换为专属中止事件，下一帧控制处理。保留两帧业务语义，不依赖通用网络事件或新增直接取消通道。
 
-后端受理中止时同步关闭本次StreamGate，再触发任务取消。接受分片与关闭门共用同一短锁；门关闭后不再累积或准备发送任何新分片。receiver直接关闭并丢弃剩余队列，不继续排空，不等HTTP退出后才冻结。
+后端固定在PRE_UPDATE受理中止，先同步清turn，再调用ActiveInference.current取消句柄关闭本次StreamGate并触发取消；随后ToolTasks仅对未return任务原子强制回复并终止清理，已return后台任务保留。接受分片与关闭门共用同一短锁；门关闭后不再累积或准备发送任何新分片。receiver直接关闭并丢弃剩余队列，不继续排空，不等HTTP退出后才冻结。
 
 前端点击中止立即拒绝本次request及实例的后续流，等待权威sync。后端受理存在网络及两帧延迟，因此sync仍可能校正少量内容；清理期间不再增加后端正文。
 
