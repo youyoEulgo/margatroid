@@ -7,39 +7,7 @@ System分别列出事件、闭包结果、提交闭包和oneshot回复，使用R
 不写独立逻辑段；持有关系使用树形图。
 ```
 
-# 设计范围
-
-Margatroid领域使用原生Axum装配及普通异步闭包。网络服务属于本应用基础设施；mecs仅提供通用运行与异步事件、闭包能力，不提供服务器封装或长期任务专用接口。
-
-# 中止与任务生命周期契约
-
-本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
-
-```text
-ToolTask只有两种对外存活状态：未return；已return且未finish。
-return只表示已向LLM交付本次工具调用结果，最多一次，不结束任务。
-finish即清理：终止Lua/进程及后代，回收管道和临时资源，并从ToolTasks移除；不建立已finish条目，不保留完成任务或完成缓存。
-请求finish不是已finish。清理仍在进行或失败时，任务仍属未finish，由原监督者持有清理责任；不得先置finished再异步清理。
-中止先清turn。未受理请求在工具System检查turn后直接返回中止工具结果，不创建任务；已受理任务由ToolTasks原子裁决return。
-未return任务：强制交付原call_id/alias对应的中止结果，随即请求终止并清理，不等工具自然return才释放LLM等待。
-已return未finish任务：保留原任务、进程、缓存与输入通道；回合中止不影响它们，例如持久Bash或MCP常驻工具。
-正常return与中止强制return共享同一状态和reply所有权，只有一方成功；中止获胜后迟到Return不得交付第二个结果。
-清理完成即移除。后续read/send/finish查询不到任务并返回TaskMissing；不存在已finish但仍可查询的第三种状态。
-```
-
-# 动态入口与通用子进程设计
-
-本节及tool_inject、process_open、owner_task_id/binding相关条款为已确认、待实现目标；本轮只改设计文档，现有源码和运行部署尚未具备这些能力。宿主不认识MCP，MCP协议由Lua资源及同目录独立client bin实现。不新增MCP领域、MCP传输handler或MCP连接注册表。
-
-```text
-同一份Lua按可信入口context分流，而非猜arguments形状。
-注册入口无owner_task_id：任务A启动子进程、建立连接、发现并原子注入工具；注册成功task_return，不finish；继续同时等待任务输入和进程响应。
-动态入口带owner_task_id=A及不透明binding：每次调用新任务B，在自身schema下校验arguments，发送带自身任务ID的请求给A，等待反馈后task_return并立即task_finish自身。
-A可以在前一个请求尚未完成时继续向子进程发送下一个请求，使用请求ID路由乱序响应；单个stdout读取者不等于单请求串行执行。
-B未return时中止会按既有规则强制return并清理B；A已return则继续存活。A的迟到响应遇TaskMissing只清理对应关联，不杀其它调用。
-```
-
-# 板块格式
+# 板块定义
 
 ```text
 # lib       tool/core/src/lib.rs；tool/plugin/src/lib.rs  结果校验入口；Plugin安装
@@ -72,7 +40,9 @@ ToolPlugin：工具执行插件
     limits: ToolExecutionLimits
     impl Plugin for ToolPlugin
         build(self, app: &mut App)
-            行为：检查执行设施和预算，拒绝重复安装；仅允许RuntimePlugin::UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明先后顺序的自定义schedule；安装init_tool_tasks_system和tool_execute_system，不新增调度metadata或修改mecs。
+            require 执行设施可用、预算有效、未安装
+            require schedule in [RuntimePlugin::UPDATE, RuntimePlugin::POST_UPDATE]
+            install init_tool_tasks_system, tool_execute_system
 ```
 
 # components
@@ -84,19 +54,27 @@ ToolPlugin：工具执行插件
 ToolTasks：该Agent的工具任务句柄集合，公开组件
     entries: Arc<Mutex<BTreeMap<String, ToolTaskHandle>>>--私有，宿主与任务共享的句柄集合
     register(&self, id: String, handle: ToolTaskHandle) -> Result<(), ToolError>
-        行为：登记存活任务及空缓存、cursor=0、returned=false和唯一结果回复端；重复id返回错误，不覆盖已有条目。
+        require id未登记
+        entries[id] = handle -- 空缓存，cursor=0，returned=false，唯一reply
     cancel(&self, id: &str) -> Result<(), ToolError>
         行为：向对应句柄请求取消，不直接中断监督任务或删除句柄。
     list(&self) -> Vec<(String, ToolTaskHandle)>
-        行为：只克隆未finish的活任务句柄，不包括已清理任务、推理、存储或VM。
+        return entries中的活任务句柄克隆
     read(&self, id: &str) -> Result<TaskReadResult, ToolError>
         行为：从集合取得仍存活任务后，同一短锁读取output[cursor..]并将相邻字符串无分隔符拼成一项，非字符串原样保留顺序；读取活任务error，将cursor推进至当前末尾，返回并清除replaced标记。
     send(&self, id: &str, value: serde_json::Value) -> Result<(), ToolError>
         行为：向目标Lua输入通道投递一个值；目标已finish返回TaskMissing；通道关闭或满返回错误，不宣称接收方已处理。
     finish(&self, id: &str) -> Future<Output = Result<(), ToolError>>
-        行为：终止目标并等待Lua、进程及后代、管道、临时资源真实清理，从集合移除并释放缓存后返回成功；错误及时返回并保留未完成清理的监督责任，不伪造finish。
+        request cancel(id)
+        await Lua、进程及后代、管道、临时资源真实清理
+        success: entries.remove(id); release cache; return Ok(())
+        failure: return error; retain supervision
     abort_unreturned(&self) -> 工具中止交接结果
-        行为：对集合中的活任务逐一原子竞争return；只对未return任务交付原调用关联的中止结果并触发终止清理；已return任务不变。同步完成return裁决和取消触发，不在控制System阻塞等待进程清理。
+        for handle in entries:
+            atomic if !handle.returned:
+                reply 原call_id/alias的中止结果
+                handle.returned = true
+                handle.cancel() -- 同步触发，不等待清理
     impl Clone for ToolTasks
         行为：共享同一集合，不借用World。
     impl Component for ToolTasks
@@ -159,8 +137,11 @@ handle_init_tool_tasks(world: &mut World, request: InitToolTasks)
 handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
     行为：
         认领reply，核对Agent完整Entity、Working及当前非空turn与request.turn匹配；无turn或不匹配直接返回保留call_id/alias的中止工具结果，不注册任务、不启动闭包或进程。
-        从Tools按请求alias取得ToolEntry，使用记录中的schema、path、owner_task_id和binding；普通与注入记录相同，不重新读取定义或套用注册工具schema。从SelectedSandbox及Sandboxes取得可选策略路径。
-        工具System按请求alias查当前Agent的Tools，找到记录就使用其schema校验并按path执行，找不到就返回对应工具错误；不区分模型生成或手工请求，不查询历史广告快照。动态记录的owner_task_id和binding由宿主放入执行context，模型参数不能改写标记。A关闭时移除所属记录，并使已在等待它的B及时失败。
+        entry = Tools.get(request.alias) or return 对应工具错误
+        使用entry.input_schema校验arguments
+        按entry.path执行；owner_task_id与binding放入context
+        从SelectedSandbox及Sandboxes取得可选策略路径
+        -- 模型参数不能覆盖宿主context标记
         固定本次工具、策略路径和目录参数，准备owned执行材料，不跨await借用World。
         创建共享ToolTaskHandle，一份登记ToolTasks，克隆一份及共享集合句柄交给工作任务；通过send_async_closure提交launch_tool，失败通过原reply回复错误；不缓存执行器Handle。
 ```
@@ -175,7 +156,13 @@ supervise_tool(context: ToolExecutionContext) -> Future<Output = ()>
         blocking worker按ToolEntry.path读取要执行的程序，schema直接使用Tools记录；sandbox_resource_core::read_sandbox读取策略，不重新读取工具定义。
         校验arguments与本入口的有效schema、具体后端策略；检查取消及所有者存活后启动run_runner，动态入口不读取注册schema作回退。配置及execute收到相同可信owner_task_id/binding/resource_dir，不接受arguments覆盖。
         接收runner的Return时通过共享句柄的原子return裁决交付结果，不结束runner；中止、错误与正常Return共用唯一回复端，不能在context另持独立可回复状态；持续处理缓存写入、覆盖及任务输入。
-        自然退出、显式finish、到期或中止均进入同一清理出口：先将该任务标记为不再接受动态调用，撤销其owner_task_id匹配的入口并通知依赖调用；尚未return时先及时交付对应失败结果，再等待VM、runner、后代、管道和临时文件真实清理，完成finish并从ToolTasks移除，释放缓存；不保留completed条目。
+        自然退出/finish/到期/中止:
+            World闭包: Tools.remove_owner(task_id)
+            for B in ToolTasks where B.owner_task_id == task_id and !B.returned:
+                原子回复B对应工具错误; request B.cancel
+            未return则交付对应失败结果
+            await VM、runner、后代、管道、临时文件真实清理
+            ToolTasks移除本任务; release cache
         已回复调用不得重复回复；后台异常记录于对应任务error，未回复调用按实际错误完成。
         清理失败及时交付CleanupFailed；保持未finish并保留本次runner管理能力继续清理，不标记已finish。
 
@@ -205,28 +192,36 @@ task_receive()
     行为：异步接收当前Lua的一条输入，不持锁等待；输入含义及转发位置由工具代码决定。动态调用等待同时受B自身Task生命周期与所有者依赖通知控制，A关闭时返回错误而非无限等待。
 
 tool_inject(definitions: Vec<InjectedToolDefinition>) -> 注册入口结果
-    行为：只在configure确认后的执行阶段可用。Lua提供alias、description、input_schema和可选binding；宿主固定path为当前工具资源、owner_task_id为当前任务，仅修改当前Agent的Tools。Lua不能传其它任务ID或任意脚本路径来冒用归属。
-    行为：经已有worker双向帧到宿主，tool_plugin通过World闭包检查任务仍存在、未关闭及整批定义有效，然后向该Agent的Tools一次增加记录；Tools内alias冲突整批报错。没有另设的注入事件、异步校验服务、跨集合协调器或提交状态。宿主只解释一般工具定义与生命周期，不解释binding内的远端协议字段。
-    行为：注入成功就是Tools增加记录，下一次推理遍历时直接可见，没有Driver选择或额外启用步骤，不写配置或数据库。注册A若随后失败/被中止，清理出口移除本A所注入定义，不删除别人的入口。
+    require configure已确认
+    通过既有worker帧提交definitions
+    宿主填path=当前工具资源，owner_task_id=当前任务
+    World闭包:
+        require 当前任务仍存在且未取消
+        validate definitions
+        Tools.insert_batch(definitions) -- alias冲突整批报错
+    return 登记结果 -- 清理出口移除本任务所属记录
 
 process_open(options) -> ProcessSession
     options.program: String--明确的可执行文件路径
     options.arguments: Vec<String>--argv数组，禁止隐式shell拼接
-    行为：在当前受沙箱worker内启动子进程，工作目录沿工具context.project_root，stdin/stdout/stderr均为管道，不使用PTY。可通过context.resource_dir定位随工具交付的bin；不自动安装、下载或编译。
-    行为：返回通用字节通信对象，宿主不知道JSON/MCP或请求边界；进程及后代归当前ToolTask，受其唯一timeout_ms、取消和finish清理约束，不另设进程时限。
+    在当前沙箱worker内spawn(program, arguments, cwd=context.project_root)
+    stdin/stdout/stderr = pipes
+    return ProcessSession -- 子进程归当前ToolTask
+    -- 沿用ToolTask的timeout_ms、取消及finish清理
 
 ProcessSession：Lua userdata，实际进程和管道仅由worker持有，不作为JSON帧传回宿主
     write(bytes: LuaString) -> Future<Output = ()>
-        行为：写完整字节串，支持背压；进程输入有单一写入顺序，不能交错不同消息字节。由Lua决定一行或长度前缀等边界，不自动追加回车或解析控制字符。
+        await 按写入顺序将完整bytes写入stdin -- 保持原始字节、支持背压
     read() -> Future<Output = {data: LuaString, eof: bool}>
-        行为：异步读取有界stdout字节块；无回显、换行改写或屏幕模拟，允许分片UTF-8/多条消息，Lua必须自己累积完整帧后解析；stdout只允许一个消费循环。
+        return await stdout有界字节块及EOF -- 单一读取者；消息边界由工具解析
     read_stderr() -> Future<Output = {data: LuaString, eof: bool}>
-        行为：独立有界诊断读取，不混入stdout协议；Lua必须持续消费或明确舍弃，超预算报错，不让满管道无限阻塞进程。
+        return await stderr有界字节块及EOF -- 独立消费，超预算报错
     wait() -> Future<Output = {exit_code: Option<i32>, signal: Option<i32>}>
-        行为：等待并回收该进程，EOF与进程退出分别表达；不用读取EOF冒充整个ToolTask已finish。
+        await 进程退出并回收
+        return exit_code, signal
     close() -> Future<Output = ()>
-        行为：终止并回收该子进程及其管道，真实完成后返回；不自动finish拥有它的Lua任务，工具finish出口仍兜底清理全部子进程。
-    行为：管道错误、进程退出、超时和所有者消失按既有工具错误结果规则交付，不为MCP增加特殊错误出口。
+        await 终止并回收子进程及管道 -- 不自动finish当前ToolTask
+    -- 错误沿ToolError交付
 ```
 
 # types
@@ -386,13 +381,4 @@ mecs全局异步设施
         ├── 可信supervisor
         ├── 受限worker及后代
         └── 管道和临时文件
-```
-
-# 所有者清理
-
-```text
-A开始清理时，通过World闭包删除Tools里owner_task_id=A的记录；之后按名称查询自然找不到，不另设可见性或受理门。
-同一Agent的ToolTasks中owner_task_id=A且尚未return的B，返回原调用对应的工具错误并清理。使用现有任务记录即可，不另建所有者注册表或依赖管理器。
-正在提交tool_inject时，World闭包检查当前任务仍可用；A已取消则拒绝，已提交的记录由A清理移除。不能出现清理后又加入入口。
-A真实资源清理完成后从ToolTasks移除，finish语义不变。B先结束时，A迟到task_send遇TaskMissing，只清掉Lua自己的pending关联。
 ```

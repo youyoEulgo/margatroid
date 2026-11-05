@@ -2,6 +2,8 @@
 
 mcl_core定义语法树、队列、请求和结果，只依赖mecs及通用库。消息在MCL契约中使用结构化值，执行时由mcl_plugin转换并校验所属领域消息类型；core不引用其他领域core。mcl_plugin依赖address和所需领域core，不依赖其他plugin。
 
+下文记录已有实现；DESIGN中的完整Tools记录、动态入口及MCP资源分流为已批准、待实现目标，当前src仍保留下文的alias参数与路径登记API。本轮只整理文档，不表示运行中的daemon已更新。目标中IMPORT TOOL向Agent的Tools登记alias、description、input_schema和path，inference与tool_call使用当前Tools；inference接收消息及推理参数，tool_call接收调用消息。tool_inject、原始进程通信和MCP协议由通用工具宿主及工具侧处理，MCL使用现有指令执行领域调用。
+
 ## 指令
 
 ```text

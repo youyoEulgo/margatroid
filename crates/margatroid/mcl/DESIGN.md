@@ -1,5 +1,3 @@
-本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
-
 # 伪代码格式
 
 ```text
@@ -9,11 +7,7 @@ System区分事件、闭包结果、提交闭包和oneshot回复，使用Rust名
 不写独立逻辑段；持有关系使用树形图。
 ```
 
-# 动态工具目标范围
-
-动态入口及MCP资源分流为已确认、待实现设计，本轮仅修改文档。MCL不实现MCP，不新增MCP指令；tool_inject和原始进程通信由通用工具宿主提供。
-
-# 板块格式
+# 板块定义
 
 ```text
 # lib        mcl/core/src/lib.rs；mcl/plugin/src/lib.rs  解析入口与队列扩展；Plugin安装
@@ -30,39 +24,39 @@ System区分事件、闭包结果、提交闭包和oneshot回复，使用Rust名
 
 ## 函数
 
-公开，定义于mcl_core：
 ```text
+-- 公开，定义于mcl_core
 parse_instruction(instruction: &MclInstruction) -> Result<MclOperation, MclError>
-    行为：按IMPORT、CREATE、GET、INJECT、CONFIG、EFFECT分流；检查语法和问号参数数量，不访问World或文件。
+    -- 按IMPORT、CREATE、GET、INJECT、CONFIG、EFFECT分流；检查语法和问号参数数量，不访问World或文件。
 ```
 
 ## 类型
 
-公开，定义于mcl_core：
 ```text
+-- 公开，定义于mcl_core
 WorldMclExt：队列访问扩展，公开trait
     mcl_close(&mut self, target: Entity) -> Result<(), MclError>
-        行为：关闭入队门，取消在途命令，排队项转入取消收口。
+        -- 关闭入队门，取消在途命令，排队项转入取消收口。
     mcl_drain(&self, target: Entity) -> Result<MclDrain, MclError>
-        行为：取得共享收口等待能力。
+        -- 取得共享收口等待能力。
     impl WorldMclExt for World
 ```
 
-公开，定义于mcl_plugin：
 ```text
+-- 公开，定义于mcl_plugin
 MclPlugin：MCL执行插件
     schedule: String
     impl Plugin for MclPlugin
         build(self, app: &mut App)
-            行为：检查运行设施，schedule仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule，安装mcl_command_system，不提供Lua宿主函数。
+            -- 检查运行设施，schedule仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule，安装mcl_command_system，不提供Lua宿主函数。
 ```
 
 # components
 
 ## 类型
 
-公开：
 ```text
+-- 公开
 MclQueue：目标Entity的命令队列，公开组件
     commands: VecDeque<MclCommand>
     pending: Option<String>--当前队首id
@@ -75,8 +69,8 @@ MclQueue：目标Entity的命令队列，公开组件
 
 ## 类型
 
-公开：
 ```text
+-- 公开
 MclCommand：命令请求，公开事件
     id: String
     source: Entity--由网络或Driver宿主绑定的真实来源
@@ -93,66 +87,66 @@ MclCommand：命令请求，公开事件
 
 ## 函数
 
-crate公开：
 ```text
+-- crate公开
 mcl_command_system(world: &mut World)
     处理事件：MclCommand
     接收闭包结果：Result<CommandOutput, CommandError>
     提交闭包：execute_command(CommandContext) -> Future<Output = Result<CommandOutput, CommandError>>
     产出事件：None
     oneshot回复：Result<MclValue, MclError>
-    行为：MclCommand -> handle_command；Result<CommandOutput, CommandError> -> handle_command_result；MclQueue -> handle_queue。
+    -- MclCommand -> handle_command；Result<CommandOutput, CommandError> -> handle_command_result；MclQueue -> handle_queue。
 ```
 
 # handler
 
 ## 函数
 
-crate公开：
 ```text
+-- crate公开
 handle_command(world: &mut World, request: MclCommand)
-    行为：核对来源和目标完整Entity、Driver来源实例、入队门及重复id；入目标FIFO；拒绝通过reply返回错误。
+    -- 核对来源和目标完整Entity、Driver来源实例、入队门及重复id；入目标FIFO；拒绝通过reply返回错误。
 
 handle_queue(world: &mut World, target: Entity)
-    行为：队首无pending时解析一次，取得owned执行能力，设置pending并提交execute_command；关闭的排队项完成取消收口，不提交业务动作。
+    -- 队首无pending时解析一次，取得owned执行能力，设置pending并提交execute_command；关闭的排队项完成取消收口，不提交业务动作。
 
 handle_command_result(world: &mut World, result: Result<CommandOutput, CommandError>)
-    行为：核对目标、pending和队首id，回复原oneshot并移除队首；异步任务及回执全部收口后通知drain。
+    -- 核对目标、pending和队首id，回复原oneshot并移除队首；异步任务及回执全部收口后通知drain。
 ```
 
-私有：
 ```text
+-- 私有
 execute_command(context: CommandContext) -> Future<Output = Result<CommandOutput, CommandError>>
-    行为：按语法树执行一次操作，等待存储或领域oneshot结果；不跨await借用World，不重复解析或审计。
+    -- 按语法树执行一次操作，等待存储或领域oneshot结果；不跨await借用World，不重复解析或审计。
 
 execute_import(context: CommandContext, kind: ImportKind, locator: String, alias: String)
-    行为：IMPORT TOOL校验资源后只向Agent的Tools增加一条含alias、description、input_schema和path的记录，没有额外启用、可见性配置或清单登记步骤。其余IMPORT按各资源类别登记，不激活沙箱。
+    -- IMPORT TOOL校验资源后向Agent的Tools登记alias、description、input_schema和path；其余IMPORT按资源类别登记，沙箱使用由对应effect处理。
 
 execute_get(context: CommandContext, expression: MessageExpression)
-    行为：按顺序拼接消息来源；选择器统一读事务；Prompt alias按路径读取并保留消息角色；返回.Array.Message。
+    -- 按顺序拼接消息来源；选择器统一读事务；Prompt alias按路径读取并保留消息角色；返回.Array.Message。
 
 execute_inject(context: CommandContext, source: MessageParameter, target: Selector)
-    行为：准备消息来源，在一次数据库写事务中读取目标、校验范围并替换；自引用先读后写；失败不修改字段。
+    -- 准备消息来源，在一次数据库写事务中读取目标、校验范围并替换；自引用先读后写；失败不修改字段。
 
 execute_config(context: CommandContext, operation: ConfigOperation)
-    行为：只访问当前Agent设置文件；GET读取整份TOML；SET按点分路径赋值；DELETE删除键；写入完整成功才返回。
+    -- 只访问当前Agent设置文件；GET读取整份TOML；SET按点分路径赋值；DELETE删除键；写入完整成功才返回。
 
 execute_effect(context: CommandContext, name: String, arguments: Vec<EffectParameter>)
-    行为：按effect参数约束求值，通过对应领域core能力执行或发送带oneshot的具体领域请求；保留本次请求与回合关联。inference不带工具选择参数，工具调用不带可见alias列表；工具定义和查找唯一来自目标Agent的Tools。中止不进入MCL FIFO，不关闭队列，最终受理由各System复检turn。
+    -- 按effect参数约束求值，通过对应领域core能力执行或发送带oneshot的具体领域请求；保留请求与回合关联。inference使用消息及推理参数，工具调用使用调用消息；工具定义与查找来自目标Agent的Tools。中止由队列外的控制流程受理，各System复检turn。
 
 execute_tools(context: CommandContext, messages: Vec<Value>) -> Future<Output = Result<MclValue, MclError>>
-    行为：验证调用身份后，一次性发出多个ToolExecuteRequest，各自携带Agent、原turn、call_id及独立oneshot；工具System按请求名称查当前Tools，存在则调用，不存在则返回对应工具错误。所有请求先发出，再用join_all收齐并按输入顺序返回，不串行化执行，不维护广告快照或第二份准入名单。
-    中止前未被工具System受理的请求直接回中止结果；已经受理且未return的任务由ToolTasks强制return并清理，使本闭包立即获得各调用的中止结果，不再等工具自然return。中止获胜后迟到Return无法再次交付，正常return先获胜的结果保留且后台任务不被杀。
-    同一Lua资源不同alias仍各自创建独立任务，MCL不按path或owner将它们串行化；A/B之间的请求路由属于Lua工具内部协议。所有者失效导致的依赖调用错误保留各自call_id，及时返回failed，不堵整批。
-    可识别工具调用错误始终返回对应failed工具消息；整批收齐关联后交Driver，Driver显式结束回合。不得通过关闭整条MCL队列或杀Driver来中止。
+    -- 验证调用身份后，一次性发出多个ToolExecuteRequest，各自携带Agent、原turn、call_id及独立oneshot；工具System按请求名称查当前Tools，存在则调用，不存在则返回对应工具错误。所有请求先发出，再用join_all收齐并按输入顺序返回。
+    -- 中止前未被工具System受理的请求直接回中止结果；已经受理且未return的任务由ToolTasks强制return并清理，使本闭包立即获得各调用的中止结果，不再等工具自然return。中止获胜后迟到Return无法再次交付，正常return先获胜的结果保留且后台任务不被杀。
+    -- 同一Lua资源不同alias仍各自创建独立任务，MCL不按path或owner将它们串行化；A/B之间的请求路由属于Lua工具内部协议。所有者失效导致的依赖调用错误保留各自call_id，及时返回failed，不堵整批。
+    -- 可识别工具调用错误始终返回对应failed工具消息；整批收齐关联后交Driver，Driver显式结束回合。不得通过关闭整条MCL队列或杀Driver来中止。
 ```
 
 # types
 
 ## 类型
 
-私有：
 ```text
+-- 私有
 CommandContext：执行材料--原MclCommand、MclOperation、owned存储与执行能力、路径和取消能力
 CommandOutput：完成载荷--原请求关联、MclValue
 CommandError：失败载荷--原请求关联、MclError
@@ -162,8 +156,8 @@ CommandError：失败载荷--原请求关联、MclError
 
 ## 类型
 
-公开：
 ```text
+-- 公开
 MclInstruction：输入指令
     text: String
     arguments: Vec<serde_json::Value>--按问号位置传入，配置参数不强制数组
@@ -220,15 +214,15 @@ MclValue：命令返回值，公开枚举
 
 MclDrain：线程安全收口能力
     wait(&self) -> Future<Output = Result<(), MclError>>
-        行为：等待队列、在途操作及回执全部完成，未解决清理失败返回错误。
+        -- 等待队列、在途操作及回执全部完成，未解决清理失败返回错误。
 ```
 
 # error
 
 ## 类型
 
-公开：
 ```text
+-- 公开
 MclError：命令错误
     kind: MclErrorKind
     message: String
