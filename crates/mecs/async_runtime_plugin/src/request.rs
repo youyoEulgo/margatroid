@@ -119,10 +119,6 @@ pub trait WorldAsyncExt {
         T: Send + Sync + 'static,
         E: From<AsyncTaskError> + Send + Sync + 'static,
         Task: AsyncTask<T, E, Args>;
-
-    fn spawn_async_service<Service>(&self, service: Service)
-    where
-        Service: Future<Output = ()> + Send + 'static;
 }
 
 impl WorldAsyncExt for World {
@@ -156,15 +152,6 @@ impl WorldAsyncExt for World {
         WorldClosureExt::send_closure(self, schedule, move |world| {
             dispatch_closure_task::<T, E, Task, Args>(world, task, AsyncMode::Await);
         });
-    }
-
-    fn spawn_async_service<Service>(&self, service: Service)
-    where
-        Service: Future<Output = ()> + Send + 'static,
-    {
-        self.get_resource::<crate::AsyncRuntimeHandle>()
-            .unwrap_or_else(|| AsyncRuntimeError::AsyncRuntimePluginMissing.panic())
-            .spawn(Box::pin(service));
     }
 }
 

@@ -9,7 +9,7 @@ Resource写在lib板块；持有关系在文末使用树形图。
 
 # 设计范围
 
-Margatroid装配使用独立Axum服务；mecs现有接口与实现保持不动，领域已退出其通用网络桥依赖。
+Margatroid装配使用独立Axum服务；mecs只提供通用运行与异步事件、闭包设施。
 
 # 板块格式
 
@@ -35,7 +35,7 @@ main()
 私有：
 ```text
 run() -> Result<(), Error>
-    行为：定位用户数据根，构造ApplicationOptions；调用compose::build_app并启动App运行循环。监听及原生路由由Margatroid AxumPlugin负责，不安装mecs ServerPlugin。显式受控退出由compose::shutdown_app提供，保持ECS处理能力直到领域及Axum退出；外部强制终止进程不构成真实清理证明。
+    行为：定位用户数据根，构造ApplicationOptions；调用compose::build_app并启动App运行循环。监听及原生路由由Margatroid AxumPlugin负责，显式受控退出由compose::shutdown_app提供，保持ECS处理能力直到领域及Axum退出；外部强制终止进程不构成真实清理证明。
 
 data_root() -> Result<PathBuf, Error>
     行为：取得HOME下.margatroid，不把项目目录用作状态目录。

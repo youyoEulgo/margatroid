@@ -8,7 +8,7 @@ Resource在lib板块；System区分事件、闭包结果、提交闭包及回复
 
 # 设计范围
 
-本文定义Margatroid的Axum基础设施实现。各领域使用原生Router及普通异步闭包，不再依赖mecs server_plugin和spawn_async_service；mecs本身暂不修改，后续另行清理。不增加旧网络桥兼容层，不改变现有外部业务协议，不实现Driver WebUI。
+本文定义Margatroid的Axum基础设施实现。各领域使用原生Router及普通异步闭包；mecs仅提供通用运行设施，不提供服务器和长期任务专用接口。不增加旧网络桥兼容层，不改变现有外部业务协议，不实现Driver WebUI。
 
 # 板块格式
 
@@ -30,7 +30,7 @@ AxumPlugin：Margatroid的Axum服务装配基础设施，不属于业务领域pl
     bind: SocketAddr
     impl Plugin
         build(self, app: &mut App)
-            行为：检查既有Runtime、AsyncRuntime与Closure设施；注册空AxumRoutes、AxumHandle及启动System；不安装mecs ServerPlugin，不注册任何业务路由、协议分类器或通用请求事件。
+            行为：检查既有Runtime、AsyncRuntime与Closure设施；注册空AxumRoutes、AxumHandle及启动System；不注册任何业务路由、协议分类器或通用请求事件。
 
 AppAxumExt：原生路由装配入口
     add_axum_routes(&mut self, router: axum::Router) -> &mut Self
@@ -85,7 +85,7 @@ start_axum_system(world: &mut World)
     接收闭包结果：None
     提交闭包：run_axum(AxumContext) -> Future<Output = Result<AxumStopped, AxumTaskError>>
     产出事件：None
-    行为：STARTUP取走Router；取得owned监听参数、AxumHandle和运行通知能力，通过send_async_closure提交整个Axum服务。不得使用send_await_closure关闭ECS运行门，不使用spawn_async_service或获取Tokio Handle的临时握手。
+    行为：STARTUP取走Router；取得owned监听参数、AxumHandle和运行通知能力，通过send_async_closure提交整个Axum服务。不得使用send_await_closure关闭ECS运行门，不通过临时握手获取Tokio Handle。
 
 axum_result_system(world: &mut World)
     处理事件：AxumStarted--本封装自己的监听生命周期通知

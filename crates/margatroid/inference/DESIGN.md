@@ -11,7 +11,7 @@ System分别列出事件、闭包结果、提交闭包及oneshot回复，使用R
 
 # 设计范围
 
-Margatroid领域使用原生Axum装配及普通异步闭包，已退出mecs通用网络桥和spawn_async_service依赖。mecs现有接口、文档及源码暂时保留，后续另行清理，不提供旧入口回退或兼容实现。
+Margatroid领域使用原生Axum装配及普通异步闭包。网络服务属于本应用基础设施；mecs仅提供通用运行与异步事件、闭包能力，不提供服务器封装或长期任务专用接口。
 
 # 板块格式
 
@@ -48,7 +48,7 @@ InferencePlugin：单次推理执行插件
         行为：有界读取models.toml，完整校验provider、api_type及路由选项；失败不构造插件。
     impl Plugin for InferencePlugin
         build(self, app: &mut App)
-            行为：检查运行设施，拒绝重复安装；schedule仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule；安装ModelRoutes及共享reqwest HTTP客户端，挂载init_inference_system和inference_system。不通过spawn_async_service临时握手取得Tokio Handle，不在Resource保存执行器Handle；推理启动进入普通异步闭包。
+            行为：检查运行设施，拒绝重复安装；schedule仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule；安装ModelRoutes及共享reqwest HTTP客户端，挂载init_inference_system和inference_system。不通过临时握手取得Tokio Handle，不在Resource保存执行器Handle；推理启动进入普通异步闭包。
 ```
 
 # components
@@ -123,7 +123,7 @@ handle_inference(world: &mut World, request: InferenceRequest)
         在System实际受理时检查Agent当前turn；已被中止清空或与request.turn不匹配，直接返回空assistant的Cancelled响应（正文、reasoning、tool_calls、replay及usage均空），不创建HTTP或监督任务。
         从ModelRoutes选定路由，从Tools取得各alias路径；拒绝重复或不存在的alias。
         从client_core取得本次已注册webui的ClientSender快照，固定对外身份；同步登记尚未启动的共享InferenceHandle，防止异步提交窗口受理重叠请求；通过send_async_closure提交launch_inference。
-        launch_inference在闭包内部创建监督任务并把JoinHandle交给同一共享句柄，不依赖全局执行器。ClientFrame::Text只携带已编码分片，不导入Axum消息、DTO插件或mecs server_plugin发送器。
+        launch_inference在闭包内部创建监督任务并把JoinHandle交给同一共享句柄，不依赖全局执行器。ClientFrame::Text只携带已编码分片，不导入Axum消息、DTO插件或服务器框架发送器。
         提交失败回复错误。
 ```
 

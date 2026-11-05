@@ -1,4 +1,4 @@
-Margatroid领域实现契约；本领域已切换，mecs现有实现保持不动，后续另行清理。
+Margatroid领域实现契约；网络由领域原生handler处理，mecs仅提供通用运行设施。
 
 本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
 

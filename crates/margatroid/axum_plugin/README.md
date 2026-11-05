@@ -10,4 +10,4 @@ WebSocket等升级工作不属于普通HTTP请求的退出范围。handler必须
 
 App释放时独立资源只请求停止，不同步阻塞join。需要证明领域和服务安全退出时，调用`compose::shutdown_app`并保持World推进；仅drop App或强制终止进程不构成清理证明。排队闭包不预先捕获事件发送器，调度时使用AsyncContext取得通知能力，防止队列自持。
 
-此crate不管理Client身份、连接名称、WS帧分类、协议Envelope或业务请求。DTO拥有/ws连接和协议，UI直接返回静态资源；业务领域通过client_core的发送能力出站。mecs原实现暂时保留，供后续独立清理。
+此crate不管理Client身份、连接名称、WS帧分类、协议Envelope或业务请求。DTO拥有/ws连接和协议，UI直接返回静态资源；业务领域通过client_core的发送能力出站。mecs不提供服务器封装和长期任务专用接口。
