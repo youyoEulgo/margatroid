@@ -1,5 +1,5 @@
 use std::time::Duration;
-use tool_core::{ToolConfiguration, ToolExecutionLimits, ToolTaskHandle};
+use tool_core::{ToolConfiguration, ToolExecutionLimits, ToolTaskHandle, ToolTasks};
 
 #[test]
 fn configuration_has_one_lifetime_and_zero_means_unlimited() {
@@ -43,7 +43,13 @@ fn serialized_configuration_rejects_missing_unknown_and_noninteger_fields() {
 
 #[tokio::test]
 async fn task_lifetime_is_configured_once_and_does_not_complete_before_cleanup() {
-    let (task, _input) = ToolTaskHandle::new(&ToolExecutionLimits::default()).unwrap();
+    let (task, _input) = ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        "call".into(),
+        "tool".into(),
+        tokio::sync::oneshot::channel().0,
+    )
+    .unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(20), task.lifetime_expired())
             .await
@@ -56,28 +62,34 @@ async fn task_lifetime_is_configured_once_and_does_not_complete_before_cleanup()
         .unwrap();
     task.cancel();
     assert!(task.cancel_token().is_cancelled());
-    assert!(!task.is_completed());
-    task.complete(None);
-    assert!(task.is_completed());
+    assert!(!task.is_cleanup_complete());
+    ToolTasks::new().complete_cleanup("task", &task, None);
+    assert!(task.is_cleanup_complete());
 }
 
 #[tokio::test]
 async fn unlimited_task_has_no_lifetime_timer_and_can_finish() {
-    let (task, _input) = ToolTaskHandle::new(&ToolExecutionLimits::default()).unwrap();
+    let (task, _input) = ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        "call".into(),
+        "tool".into(),
+        tokio::sync::oneshot::channel().0,
+    )
+    .unwrap();
     task.configure_lifetime(0).unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(60), task.lifetime_expired())
             .await
             .is_err()
     );
-    assert!(!task.is_completed());
+    assert!(!task.is_cleanup_complete());
     let supervised = task.clone();
     task.attach_task(tokio::spawn(async move {
         supervised.cancel_token().cancelled().await;
         tokio::task::yield_now().await;
-        supervised.complete(None);
+        ToolTasks::new().complete_cleanup("task", &supervised, None);
     }))
     .unwrap();
     task.finish().await.unwrap();
-    assert!(task.is_completed());
+    assert!(task.is_cleanup_complete());
 }

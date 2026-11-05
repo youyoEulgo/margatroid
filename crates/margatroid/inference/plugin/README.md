@@ -1,6 +1,6 @@
 # inference_plugin
 
-独立单次推理 plugin，组合 inference_core、Agent、Client、工具路径与 address core，使用 mecs 运行设施。入口是 `InferencePlugin::open(&Path)`，有界读取并完整校验既有 models.toml；`with_schedule` 设置循环 schedule，默认 update。安装前需要 RuntimePlugin 与 AsyncRuntimePlugin，拒绝重复安装，不要求领域 plugin 或 ClosurePlugin。
+独立单次推理 plugin，组合 inference_core、Agent、Client、工具路径与 address core，使用 mecs 运行设施。入口是 `InferencePlugin::open(&Path)`，有界读取并完整校验既有 models.toml；`with_schedule` 设置循环 schedule，默认 update，仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明中止先行的自定义schedule。安装前需要 RuntimePlugin 与 AsyncRuntimePlugin，拒绝重复安装，不要求领域 plugin 或 ClosurePlugin。
 
 配置保留 `[[models]]` 的 id、model、provider、api_type、base_url、api_key、context_window、thinking、reasoning_effort 字段。provider 与 api_type 明确匹配以下七种组合，不猜测 URL 或模型类型：
 
@@ -13,7 +13,7 @@
 
 context_window 接受 k/m/b/t 后缀，默认 1m。未知字段、重复路由、不兼容选项、非法 URL 或鉴权字段直接失败。凭据不写日志或前端错误，HTTP 错误不暴露完整请求、鉴权头或敏感 URL。
 
-InitInference 在存活 Agent 上同步初始化 ActiveInference，不覆盖已有句柄。请求受理验证完整 Entity、Working、当前 turn 和并发推理句柄，无有效 turn 返回正常 Cancelled。模型路由、工具路径、已注册 webui 发送器、Address 和 DriverLuaVm.instance.start_id 均取本次快照，不跨 await 借用 World。受理时要求 Driver VM 的 owner 匹配完整 Agent Entity 且 start_id 非空；缺失或不匹配返回 AgentMissing。该 start_id 与 DTO 对外公布的 agent_instance 一致，后续 VM 重启不改写在途推理的身份。当前句柄真实结束后可被下一次受理替换。
+InitInference 在存活 Agent 上同步初始化 ActiveInference，不覆盖已有句柄。请求受理验证完整 Entity、Working、当前 turn 和并发推理句柄，当前turn为空或与请求turn不匹配时返回空assistant的Cancelled，不创建HTTP或监督任务。模型路由、工具路径、已注册 webui 发送器、Address 和 DriverLuaVm.instance.start_id 均取本次快照，不跨 await 借用 World。受理时要求 Driver VM 的 owner 匹配完整 Agent Entity 且 start_id 非空；缺失或不匹配返回 AgentMissing。该 start_id 与 DTO 对外公布的 agent_instance 一致，后续 VM 重启不改写在途推理的身份。当前句柄真实结束后可被下一次受理替换。
 
 每次推理通过 blocking worker 从工具 alias 路径重新读取定义。删除或格式失败不会回退旧定义，不保留 ResourceID 或工具快照。输入使用 inference_core 的独立消息类型，校验角色、工具调用配对、参数、图片以及请求总预算。
 

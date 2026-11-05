@@ -1,3 +1,5 @@
+本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
+
 # 伪代码格式
 
 ```text
@@ -33,9 +35,9 @@ WorldAgentExt：Agent访问扩展，公开trait
     agent_start_turn(&mut self, agent: Entity) -> Result<String, AgentError>
         行为：仅Idle允许；同步生成turn并转Working。
     agent_finish_turn(&mut self, agent: Entity, turn: &str) -> Result<(), AgentError>
-        行为：仅Working且本次推理调用链已收口时转Idle，不等待后台工具任务；并清空turn；有活动turn时核对匹配，中止后turn为空由当前Driver调用链完成；调用方plugin核对VM实例，拒绝旧实例完成。
+        行为：仅Working且本次推理调用链已收口时转Idle，不等待已return未finish的后台工具任务；未return工具的中止结果先交付，不以其自然结束作为Driver收尾条件；并清空turn；有活动turn时核对匹配，中止后turn为空由当前Driver调用链完成；调用方plugin核对VM实例，拒绝旧实例完成。
     agent_abort_turn(&mut self, agent: Entity, turn: &str) -> Result<(), AgentError>
-        行为：仅Working且turn匹配时同步清空turn，保持Working；否则返回错误。
+        行为：仅Working且turn匹配时同步清空turn，保持Working；否则返回错误。此操作必须先于同帧MCL、推理和工具调用受理；不在agent_core跨域取消任务，调用方随后通过各领域core执行推理取消和ToolTasks未return任务的原子强制return及清理。
     impl WorldAgentExt for World
         行为：只访问Agent自身组件，不操作其他领域。
 ```
@@ -158,7 +160,7 @@ handle_stop_agent(world: &mut World, request: StopAgent)
     行为：按白名单同步转Stopping；关闭新请求受理，再提交stop_flow；拒绝时发送关闭错误。
 
 handle_restart_agent(world: &mut World, request: RestartAgent)
-    行为：在request.workspace内按name定位成员Entity，先检查ToolTasks，存在completed=false条目直接拒绝；通过白名单后同步转Restarting，关闭新请求受理；使用request.parameters提交restart_flow；失败通过原reply回复。
+    行为：在request.workspace内按name定位成员Entity，先检查ToolTasks，存在尚未finish的活任务条目直接拒绝；通过白名单后同步转Restarting，关闭新请求受理；使用request.parameters提交restart_flow；失败通过原reply回复。
 
 handle_agent_exception(world: &mut World, event: AgentException)
     行为：核对Entity，关闭新受理并报告event.error，不发送额外异常结果事件。

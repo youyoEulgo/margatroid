@@ -1,5 +1,7 @@
 Margatroid领域实现契约；本领域已切换，mecs现有实现保持不动，后续另行清理。
 
+本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
+
 # 伪代码格式
 
 ```text
@@ -35,7 +37,7 @@ DtoPlugin：网络协议边界插件
                 从AxumHandle.lifetime()取得共享AxumLifetime；DTO只使用其退出信号及升级Future跟踪。
                 构造Router::new().route("/ws", get(ws_handler)).with_state(state)。
                 调用AppAxumExt::add_axum_routes(Router)，不要求Compose手工添加路由。
-                在PRE_UPDATE安装abort_control_system，在UPDATE安装DTO请求及结果System。
+                在PRE_UPDATE安装abort_control_system，在UPDATE安装DTO请求及结果System；中止固定使用RuntimePlugin::PRE_UPDATE；MCL、Inference和Tool仅允许UPDATE或POST_UPDATE，拒绝无法证明先后顺序的自定义schedule，不增加调度metadata，不修改mecs。
                 日志订阅通过send_async_closure提交DTO自有owned读取闭包，产生LogReady并监听退出，完成载荷交DTO System收口，不调用spawn_async_service。
 ```
 
@@ -107,7 +109,12 @@ handle_dto_request(world: &mut World, request: DtoRequest)
         其他异步请求生成operation_id并保存网络关联，转换为既有领域请求；失败发送原关联协议错误。
 
 handle_abort_control(world: &mut World, request: AbortTurnControl)
-    行为：复检Client、Agent完整Entity、VM实例和turn；同步agent_abort_turn并请求取消对应回合任务；发送匹配网络id的受理或失败回执。
+    行为：复检Client、Agent完整Entity、VM实例和turn；失败不触碰任务。
+        第一步同步agent_abort_turn清空turn，阻止本帧后续尚未受理的MCL发出调用、InferenceRequest和ToolExecuteRequest继续受理；Agent仍Working。
+        第二步触发ActiveInference内当前推理取消句柄，同步关闭流接受门，取消分片接收/累积/推送闭包并请求上游退出。
+        第三步调用ToolTasks::abort_unreturned，在同一任务return裁决下，只对未return任务强制回复中止结果并触发终止清理；已return未finish任务保持不变。
+        控制System只同步清turn、完成return裁决和触发取消，不等待长任务、FIFO或进程退出；各监督任务负责真实清理，finish即完成清理并移除任务。
+        发送匹配网络id受理回执；Driver收到中止结果后显式收尾，不自动ready，不伪造推理已退出。
 
 handle_mcl_reply(world: &mut World, result: Result<MclReplyOutput, MclReplyError>)
     行为：复检关联，将MclValue或错误转换为mcl.command_result；继续等待MclCommand原oneshot，不新增领域结果事件。

@@ -668,7 +668,7 @@ fn configured_state_and_logs_deduplicate_targets_and_never_leak_to_other_clients
 }
 
 #[test]
-fn abort_control_runs_next_frame_rechecks_instance_and_freezes_before_cancel_without_tools() {
+fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_tools() {
     let mut harness = Harness::new();
     let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "browser");
@@ -677,13 +677,42 @@ fn abort_control_runs_next_frame_rechecks_instance_and_freezes_before_cancel_wit
         .world_mut()
         .agent_start_turn(harness.agent)
         .unwrap();
-    let (task, _input) = ToolTaskHandle::new(&ToolExecutionLimits::default()).unwrap();
-    harness
+    let (reply, mut returned_reply) = oneshot::channel();
+    let (task, _input) = ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        "background-call".into(),
+        "bash".into(),
+        reply,
+    )
+    .unwrap();
+    task.return_result(Ok(tool_core::ToolExecuteResponse {
+        call_id: "background-call".into(),
+        alias: "bash".into(),
+        content: "started".into(),
+        images: vec![],
+        failed: false,
+    }))
+    .unwrap();
+    assert_eq!(
+        returned_reply.try_recv().unwrap().unwrap().content,
+        "started"
+    );
+    let (reply, mut pending_reply) = oneshot::channel();
+    let (pending_task, _pending_input) = ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        "pending-call".into(),
+        "bash".into(),
+        reply,
+    )
+    .unwrap();
+    let tasks = harness
         .app
         .world()
         .get_component::<ToolTasks>(harness.agent)
-        .unwrap()
-        .register("background".into(), task.clone())
+        .unwrap();
+    tasks.register("background".into(), task.clone()).unwrap();
+    tasks
+        .register("pending".into(), pending_task.clone())
         .unwrap();
     let cancel = CancellationToken::new();
     let observed = cancel.clone();
@@ -729,6 +758,12 @@ fn abort_control_runs_next_frame_rechecks_instance_and_freezes_before_cancel_wit
     assert!(frozen.load(std::sync::atomic::Ordering::Acquire));
     assert!(cancel.is_cancelled());
     assert!(!task.cancel_token().is_cancelled());
+    assert!(pending_task.cancel_token().is_cancelled());
+    let aborted = pending_reply.try_recv().unwrap().unwrap();
+    assert_eq!(aborted.call_id, "pending-call");
+    assert_eq!(aborted.alias, "bash");
+    assert_eq!(aborted.content, "Tool call aborted.");
+    assert!(aborted.failed);
     let reply = harness.next(&mut socket, |value| value["id"] == "abort");
     assert_eq!(reply["result"], json!({"Ok": null}));
     release.send(()).unwrap();

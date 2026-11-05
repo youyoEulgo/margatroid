@@ -1,3 +1,5 @@
+本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
+
 # 伪代码格式
 
 ```text
@@ -46,7 +48,7 @@ InferencePlugin：单次推理执行插件
         行为：有界读取models.toml，完整校验provider、api_type及路由选项；失败不构造插件。
     impl Plugin for InferencePlugin
         build(self, app: &mut App)
-            行为：检查运行设施，拒绝重复安装；安装ModelRoutes及共享reqwest HTTP客户端，挂载init_inference_system和inference_system。不通过spawn_async_service临时握手取得Tokio Handle，不在Resource保存执行器Handle；推理启动进入普通异步闭包。
+            行为：检查运行设施，拒绝重复安装；schedule仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule；安装ModelRoutes及共享reqwest HTTP客户端，挂载init_inference_system和inference_system。不通过spawn_async_service临时握手取得Tokio Handle，不在Resource保存执行器Handle；推理启动进入普通异步闭包。
 ```
 
 # components
@@ -103,7 +105,7 @@ inference_system(world: &mut World)
     提交闭包：launch_inference(InferenceContext) -> Future<Output = Result<InferenceLaunchOutput, InferenceLaunchError>>
     产出事件：None
     oneshot回复：Result<InferenceResponse, InferenceError>
-    行为：InferenceRequest -> handle_inference；闭包启动结果只收口启动交接，InferenceCleanupFinished仍核对真实完成后才唤醒Driver。
+    行为：所在schedule严格晚于中止System所在schedule；InferenceRequest -> handle_inference；闭包启动结果只收口启动交接，InferenceCleanupFinished仍核对真实完成后才唤醒Driver。
 ```
 
 # handler
@@ -117,8 +119,8 @@ handle_init_inference(world: &mut World, request: InitInference)
 
 handle_inference(world: &mut World, request: InferenceRequest)
     行为：
-        认领reply，检查完整Agent Entity、Working、当前turn及ActiveInference；已有未结束推理则拒绝。
-        无有效turn返回Cancelled响应，不创建HTTP任务。
+        认领reply，检查完整Agent Entity及Working；先检查当前turn，再检查ActiveInference及重叠推理。
+        在System实际受理时检查Agent当前turn；已被中止清空或与request.turn不匹配，直接返回空assistant的Cancelled响应（正文、reasoning、tool_calls、replay及usage均空），不创建HTTP或监督任务。
         从ModelRoutes选定路由，从Tools取得各alias路径；拒绝重复或不存在的alias。
         从client_core取得本次已注册webui的ClientSender快照，固定对外身份；同步登记尚未启动的共享InferenceHandle，防止异步提交窗口受理重叠请求；通过send_async_closure提交launch_inference。
         launch_inference在闭包内部创建监督任务并把JoinHandle交给同一共享句柄，不依赖全局执行器。ClientFrame::Text只携带已编码分片，不导入Axum消息、DTO插件或mecs server_plugin发送器。
@@ -135,7 +137,7 @@ supervise_inference(context: InferenceContext) -> Future<Output = ()>
         blocking worker读取本次工具定义，校验消息及参数，构造DomainRequest。
         编码HTTP请求，建立有界mpsc::channel<ProviderFragment>并启动read_provider。
         运行receive_stream，以其累积器作为唯一内容结果来源。
-        正常结束校验协议终态；取消时冻结接受门、关闭接收端并请求worker退出。
+        正常结束校验协议终态；中止直接使用Agent上ActiveInference保存的当前取消句柄，控制本次分片接收闭包，先冻结接受门、关闭接收端并请求worker退出；不等工具或推理自然完成才取消。
         已确认的provider或流错误立即通过原reply交付一次；后台继续等待worker真实join，不提前释放ActiveInference。
         用户中止且清理成功返回冻结的Cancelled结果；清理预算耗尽及时返回CleanupFailed，原监督继续真实清理。
         全部真实清理结束发送绑定Agent、VM实例和request_id的私有完成事件；确认监督任务已结束后才唤醒当前Driver，未结束则下一帧复查，过期事件丢弃，不自动finish_turn。

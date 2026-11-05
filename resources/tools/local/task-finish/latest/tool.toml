@@ -1,3 +1,3 @@
 schema_version = 1
 name = "task_finish"
-description = "Stop the target tool task and wait for process cleanup. Cached output is retained and task_read can read any unread output and completion/error state afterward. This call then returns and finishes its own short task."
+description = "Stop the target tool task, wait for real process and resource cleanup, and remove it. Cache is released; subsequent task_read, task_send or task_finish fails with TaskMissing. This call then returns and finishes its own short task."

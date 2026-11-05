@@ -277,14 +277,16 @@ fn execution_limits_validate_and_round_trip() {
             ToolErrorKind::InvalidRequest
         );
         assert_eq!(
-            ToolTaskHandle::new(&invalid).unwrap_err().kind,
+            ToolTaskHandle::new(&invalid, "call".into(), "tool".into(), oneshot::channel().0)
+                .unwrap_err()
+                .kind,
             ToolErrorKind::InvalidRequest
         );
     }
 }
 
 #[tokio::test]
-async fn events_share_single_claimable_oneshot_without_turn_fields() {
+async fn events_share_single_claimable_oneshot_with_turn_identity() {
     fn event<T: core_plugin::Event>() {}
     event::<InitToolTasks>();
     event::<ToolExecuteRequest>();
@@ -309,6 +311,7 @@ async fn events_share_single_claimable_oneshot_without_turn_fields() {
     let request = ToolExecuteRequest {
         id: "task".into(),
         agent,
+        turn: "turn".into(),
         alias: "tool".into(),
         call_id: "model-call".into(),
         arguments: json!({"value": 1}),

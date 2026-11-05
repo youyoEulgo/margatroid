@@ -1,3 +1,5 @@
+本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
+
 # 伪代码格式
 
 ```text
@@ -47,6 +49,8 @@ install(app: &mut App, parts: ApplicationParts) -> Result<(), ComposeError>
         各插件使用AppAxumExt::add_axum_routes提交已完成with_state的Router；所有插件build完成后STARTUP由普通send_async_closure运行整个Axum服务，ECS继续推进。
         handler可直接返回Response、使用专用channel/oneshot或发送自己的事件，不要求统一通用网络事件。
         AxumPlugin仅作为领域基础设施允许DTO/UI依赖；业务plugin之间仍不得互相依赖。
+        安装时固定abort_control_system于RuntimePlugin::PRE_UPDATE；mcl_command_system、inference_system和tool_execute_system只允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule；不新增调度metadata，不修改mecs调度实现。
+        同帧中止先清turn，再取消已受理推理及尚未return工具；之后到达业务System的旧turn事件必须拒绝，不能先执行再回查。
         各生命周期按Stop、Restart、Start顺序挂载；外部/ws信封、请求ID、状态及历史数据契约保持原义，不在本次实现Driver WebUI。
 
 shutdown_application(app: &mut App) -> Future<Output = Result<(), ComposeError>>

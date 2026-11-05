@@ -28,4 +28,4 @@ workspace.start与workspace.restart的message同形为{path}，id位于信封。
 
 Agent启动与重启的message同形为{workspace,name,parameters}，DTO转换为内部AgentStartParameters并通过oneshot等待结果；内部Entity、服务端派生的数据库及设置路径不由网络直接提供。Agent重启接口与前端是否显示按钮分别处理。
 
-agent.turn.abort携带workspace、agent、agent_instance和turn_id。协议只是网络类型，仍由DTO经下一帧专属控制事件完成受理，不在Axum中直接取消。状态使用starting/idle/working/restarting/stopping；沙箱选择和工具结果只带alias或调用关联，不恢复资源ID。
+agent.turn.abort携带workspace、agent、agent_instance和turn_id。协议只是网络类型，仍由DTO经下一帧专属控制事件完成受理，不在Axum中直接取消。控制先同步清turn，再取消当前推理、原子强制return并终止未return工具；已return后台任务保留。TaskReadResult仅含replaced/output/error，finish真实清理后移除，后续read/send/finish返回TaskMissing，无完成缓存。状态使用starting/idle/working/restarting/stopping；沙箱选择和工具结果只带alias或调用关联，不恢复资源ID。

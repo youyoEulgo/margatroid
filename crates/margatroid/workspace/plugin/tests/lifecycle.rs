@@ -373,7 +373,14 @@ fn restart_refuses_unfinished_tasks_on_every_member_without_cancelling_them() {
     write(&path, "demo", &["one", "two"], "project");
     let mut app = app(WorkspacePlugin::open(root.path()).unwrap());
     let output = start(&mut app, &path, "start");
-    let (task, _input) = ToolTaskHandle::new(&ToolExecutionLimits::default()).unwrap();
+    let (reply, _result) = tokio::sync::oneshot::channel();
+    let (task, _input) = ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        "call".into(),
+        "tool".into(),
+        reply,
+    )
+    .unwrap();
     let tasks = app
         .world()
         .get_component::<ToolTasks>(output.members[1])
@@ -400,7 +407,10 @@ fn restart_refuses_unfinished_tasks_on_every_member_without_cancelling_them() {
     );
     assert!(!task.cancel_token().is_cancelled());
     assert_eq!(app.world().get_resource::<FakeAgents>().unwrap().stops, 0);
-    task.complete(None);
+    app.world()
+        .get_component::<ToolTasks>(output.members[1])
+        .unwrap()
+        .complete_cleanup("unfinished", &task, None);
     write(&path, "new definition", &[], "next-project");
     let old = app
         .world()

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -26,11 +26,22 @@ pub struct ToolExecuteResponse {
     pub failed: bool,
 }
 
+impl ToolExecuteResponse {
+    pub fn aborted(call_id: String, alias: String) -> Self {
+        Self {
+            call_id,
+            alias,
+            content: "Tool call aborted.".into(),
+            images: Vec::new(),
+            failed: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskReadResult {
     pub replaced: bool,
     pub output: Vec<Value>,
-    pub completed: bool,
     pub error: Option<ToolError>,
 }
 
@@ -123,7 +134,11 @@ struct ToolTaskData {
     bytes: usize,
     cursor: usize,
     replaced: bool,
-    completed: bool,
+    cleanup_complete: bool,
+    returned: bool,
+    call_id: String,
+    alias: String,
+    reply: Option<oneshot::Sender<Result<ToolExecuteResponse, ToolError>>>,
     error: Option<ToolError>,
 }
 
@@ -133,7 +148,6 @@ struct ToolTaskShared {
     task: Mutex<Option<JoinHandle<()>>>,
     task_attached: AtomicBool,
     supervisor_ended: AtomicBool,
-    returned: AtomicBool,
     shared: Mutex<ToolTaskData>,
     input: mpsc::Sender<Value>,
     changed: Notify,
@@ -147,8 +161,16 @@ pub struct ToolTaskHandle {
 }
 
 impl ToolTaskHandle {
-    pub fn new(limits: &ToolExecutionLimits) -> Result<(Self, mpsc::Receiver<Value>), ToolError> {
-        limits.validate()?;
+    pub fn new(
+        limits: &ToolExecutionLimits,
+        call_id: String,
+        alias: String,
+        reply: oneshot::Sender<Result<ToolExecuteResponse, ToolError>>,
+    ) -> Result<(Self, mpsc::Receiver<Value>), ToolError> {
+        if let Err(error) = limits.validate() {
+            let _ = reply.send(Err(error.clone()));
+            return Err(error);
+        }
         let (input, receiver) = mpsc::channel(limits.input_capacity);
         Ok((
             Self {
@@ -157,14 +179,17 @@ impl ToolTaskHandle {
                     task: Mutex::new(None),
                     task_attached: AtomicBool::new(false),
                     supervisor_ended: AtomicBool::new(false),
-                    returned: AtomicBool::new(false),
                     shared: Mutex::new(ToolTaskData {
                         lifetime: None,
                         output: Vec::new(),
                         bytes: 0,
                         cursor: 0,
                         replaced: false,
-                        completed: false,
+                        cleanup_complete: false,
+                        returned: false,
+                        call_id,
+                        alias,
+                        reply: Some(reply),
                         error: None,
                     }),
                     input,
@@ -248,25 +273,40 @@ impl ToolTaskHandle {
         Ok(())
     }
 
-    pub fn claim_return(&self) -> Result<(), ToolError> {
-        let state = lock(&self.inner.shared);
-        if state.completed {
-            return Err(ToolError::new(
-                ToolErrorKind::Closed,
-                "tool task has completed",
-            ));
-        }
-        if self.inner.returned.swap(true, Ordering::AcqRel) {
+    /// Atomically claim and deliver the invocation's sole reply.
+    pub fn return_result(
+        &self,
+        result: Result<ToolExecuteResponse, ToolError>,
+    ) -> Result<(), ToolError> {
+        let mut state = lock(&self.inner.shared);
+        ensure_open(&state)?;
+        if state.returned {
             return Err(ToolError::new(
                 ToolErrorKind::AlreadyReturned,
                 "tool call already returned",
             ));
         }
+        deliver_reply(&mut state, result);
         Ok(())
     }
 
+    pub(crate) fn abort_unreturned(&self) -> bool {
+        let mut state = lock(&self.inner.shared);
+        if state.cleanup_complete || state.returned {
+            return false;
+        }
+        let response = ToolExecuteResponse::aborted(state.call_id.clone(), state.alias.clone());
+        deliver_reply(&mut state, Ok(response));
+        self.inner.cancel.cancel();
+        true
+    }
+
     pub fn has_returned(&self) -> bool {
-        self.inner.returned.load(Ordering::Acquire)
+        lock(&self.inner.shared).returned
+    }
+
+    pub(crate) fn same_task(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     pub fn write(&self, value: Value) -> Result<(), ToolError> {
@@ -296,8 +336,9 @@ impl ToolTaskHandle {
         Ok(())
     }
 
-    pub fn read(&self) -> TaskReadResult {
+    pub fn read(&self) -> Result<TaskReadResult, ToolError> {
         let mut state = lock(&self.inner.shared);
+        ensure_open(&state)?;
         let mut output = Vec::new();
         for value in &state.output[state.cursor..] {
             match (output.last_mut(), value) {
@@ -308,22 +349,16 @@ impl ToolTaskHandle {
         let result = TaskReadResult {
             replaced: state.replaced,
             output,
-            completed: state.completed,
             error: state.error.clone(),
         };
         state.cursor = state.output.len();
         state.replaced = false;
-        result
+        Ok(result)
     }
 
     pub fn send(&self, value: Value) -> Result<(), ToolError> {
         let state = lock(&self.inner.shared);
-        if state.completed {
-            return Err(ToolError::new(
-                ToolErrorKind::InputClosed,
-                "tool task has completed",
-            ));
-        }
+        ensure_open(&state)?;
         encoded_len(&value, self.inner.input_bytes)?;
         self.inner
             .input
@@ -343,30 +378,46 @@ impl ToolTaskHandle {
         self.inner.changed.notify_waiters();
     }
 
-    pub fn complete(&self, error: Option<ToolError>) {
+    pub(crate) fn complete_cleanup(&self, error: Option<ToolError>) {
         let mut state = lock(&self.inner.shared);
-        if state.completed {
+        if state.cleanup_complete {
             return;
         }
         if let Some(error) = error {
             state.error = Some(error);
         }
-        state.completed = true;
+        state.output.clear();
+        state.output.shrink_to_fit();
+        state.bytes = 0;
+        state.cursor = 0;
+        state.replaced = false;
+        state.cleanup_complete = true;
         drop(state);
         self.inner.changed.notify_waiters();
     }
 
-    pub fn is_completed(&self) -> bool {
-        lock(&self.inner.shared).completed
+    pub fn is_cleanup_complete(&self) -> bool {
+        lock(&self.inner.shared).cleanup_complete
     }
 
     pub async fn finish(&self) -> Result<(), ToolError> {
+        // A supervisor must exit through its cleanup path, never join itself.
+        if let Some(current) = tokio::task::try_id()
+            && lock(&self.inner.task)
+                .as_ref()
+                .is_some_and(|task| task.id() == current)
+        {
+            return Err(ToolError::new(
+                ToolErrorKind::InvalidRequest,
+                "supervisor cannot finish itself",
+            ));
+        }
         self.cancel();
         loop {
             let changed = self.inner.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.is_completed() {
+            if self.is_cleanup_complete() {
                 return Ok(());
             }
             if let Some(error) = lock(&self.inner.shared)
@@ -421,11 +472,24 @@ impl ToolTaskHandle {
     }
 }
 
+/// All replies for a registered task pass through this shared-lock operation.
+fn deliver_reply(state: &mut ToolTaskData, result: Result<ToolExecuteResponse, ToolError>) {
+    let result = result.map(|mut response| {
+        response.call_id = state.call_id.clone();
+        response.alias = state.alias.clone();
+        response
+    });
+    state.returned = true;
+    if let Some(reply) = state.reply.take() {
+        let _ = reply.send(result);
+    }
+}
+
 fn ensure_open(state: &ToolTaskData) -> Result<(), ToolError> {
-    if state.completed {
+    if state.cleanup_complete {
         Err(ToolError::new(
-            ToolErrorKind::Closed,
-            "tool task has completed",
+            ToolErrorKind::TaskMissing,
+            "tool task has been cleaned up",
         ))
     } else {
         Ok(())

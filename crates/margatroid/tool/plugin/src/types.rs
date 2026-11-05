@@ -8,13 +8,12 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tool_core::{
-    ToolConfiguration, ToolError, ToolExecuteRequest, ToolExecuteResponse, ToolExecutionLimits,
-    ToolTaskHandle, ToolTasks,
+    ToolConfiguration, ToolError, ToolExecuteRequest, ToolExecutionLimits, ToolTaskHandle,
+    ToolTasks,
 };
 
 pub(crate) struct ToolExecutionContext {
     pub request: ToolExecuteRequest,
-    pub reply: Option<oneshot::Sender<Result<ToolExecuteResponse, ToolError>>>,
     pub tool_path: PathBuf,
     pub sandbox_path: Option<PathBuf>,
     pub project_root: PathBuf,

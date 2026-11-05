@@ -22,7 +22,7 @@ DtoPlugin不执行MCL、模型推理、资源加载、数据库操作、目录�
 
 入站消息总上限32MiB，请求ID非空且最多512个UTF-8字节。有可用ID的非法请求返回request.failed；无法关联的非法消息关闭连接，格式错误使用1007，超大消息使用1009。错误不回显凭据、图片或请求正文。
 
-回合中止保留两帧业务处理：DTO原生读循环解析后发送DtoRequest，UPDATE领域转换并发送私有AbortTurnControl，下一帧PRE_UPDATE控制Handler核对身份、回合并调用agent_core取消能力。Axum不持有业务句柄，不新增直接取消通道。控制回执仅表示受理，不代表流读取任务已经退出。
+回合中止保留两帧业务处理：DTO原生读循环解析后发送DtoRequest，UPDATE领域转换并发送私有AbortTurnControl，下一帧PRE_UPDATE控制Handler核对身份、回合同步清turn，再取消当前推理句柄，调用ToolTasks::abort_unreturned原子强制回复并终止未return任务；已return后台任务保留。控制System固定PRE_UPDATE，MCL/Inference/Tool仅允许UPDATE或POST_UPDATE；不能证明顺序的自定义schedule拒绝安装，不新增metadata或修改mecs。Axum不持有业务句柄，不新增直接取消通道。控制回执仅表示受理，不代表流读取任务已经退出。
 
 MCL以原oneshot返回，DTO等待闭包将其转换为网络mcl.command_result，不要求MCL另发结果观察事件。展示缓存不能作为启动配置或运行实例身份来源。
 

@@ -68,7 +68,7 @@ impl Fixture {
                 name: "test".into(),
                 workspace,
                 state: AgentState::Working,
-                turn: None,
+                turn: Some("test-turn".into()),
             },
         );
         let (sender, mut reply) = oneshot::channel();
@@ -136,6 +136,7 @@ impl Fixture {
         self.app.world().emit_event(ToolExecuteRequest {
             id: id.into(),
             agent: self.agent,
+            turn: "test-turn".into(),
             alias: alias.into(),
             call_id: format!("call-{id}"),
             arguments,
@@ -180,17 +181,36 @@ impl Fixture {
             .clone()
     }
 
-    fn completed(&self, id: &str) {
-        let handle = self.tasks().get(id).unwrap();
+    fn removed(&self, id: &str) {
+        let tasks = self.tasks();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !handle.is_completed() {
-            assert!(
-                Instant::now() < deadline,
-                "task {id} not completed: {:?}",
-                handle.read().error
-            );
+        loop {
+            match tasks.read(id) {
+                Err(error) => {
+                    assert_eq!(error.kind, Kind::TaskMissing, "{id}: {error:?}");
+                    break;
+                }
+                Ok(result) => assert!(
+                    Instant::now() < deadline,
+                    "task {id} still retained: {:?}",
+                    result.error
+                ),
+            }
             std::thread::sleep(Duration::from_millis(2));
         }
+        assert!(!tasks.list().iter().any(|(task_id, _)| task_id == id));
+        assert_eq!(
+            tasks.send(id, Value::Null).unwrap_err().kind,
+            Kind::TaskMissing
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(
+            runtime.block_on(tasks.finish(id)).unwrap_err().kind,
+            Kind::TaskMissing
+        );
     }
 
     fn output(&self, id: &str) -> tool_core::TaskReadResult {
@@ -278,7 +298,17 @@ frame({'type': 'stopped', 'result': {'Ok': None}, 'cleanup_proven': True})
         if mode == "stopped" {
             assert_eq!(failure.message, "original stopped error");
         }
-        assert!(!handle.is_completed(), "{mode}: unproven cleanup completed");
+        assert!(
+            !handle.is_cleanup_complete(),
+            "{mode}: unproven cleanup completed"
+        );
+        let retained = fixture.tasks().read("pending-cleanup").unwrap();
+        let retained_error = retained.error.unwrap();
+        assert!(
+            retained_error.kind == expected || retained_error.kind == Kind::CleanupFailed,
+            "{mode}: live task lost failure: {retained_error:?}"
+        );
+        assert_eq!(fixture.tasks().list().len(), 1);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -289,12 +319,15 @@ frame({'type': 'stopped', 'result': {'Ok': None}, 'cleanup_proven': True})
             });
             assert_eq!(finish.unwrap().unwrap_err().kind, Kind::CleanupFailed);
         } else {
-            assert_eq!(handle.read().error.unwrap().kind, Kind::Cancelled);
+            assert_eq!(handle.read().unwrap().error.unwrap().kind, Kind::Cancelled);
         }
-        assert!(!handle.is_completed(), "{mode}: finish dropped supervision");
+        assert!(
+            !handle.is_cleanup_complete(),
+            "{mode}: finish dropped supervision"
+        );
         assert!(fixture.tasks().get("pending-cleanup").is_ok());
         drop(release);
-        fixture.completed("pending-cleanup");
+        fixture.removed("pending-cleanup");
         runtime.block_on(handle.finish()).unwrap();
     }
 }
@@ -302,17 +335,18 @@ frame({'type': 'stopped', 'result': {'Ok': None}, 'cleanup_proven': True})
 #[test]
 fn short_return_then_self_finish_stops_even_caught_finish_control() {
     let mut fixture = Fixture::new();
-    fixture.tool("short", "function execute(args, context) task_return('hello'); pcall(function() task_finish(context.task_id) end); task_write('unreachable') end");
+    fixture.tool("short", "function execute(args, context) task_return('hello'); pcall(function() task_finish(context.task_id) end); shell('touch unreachable-after-finish'); task_write('unreachable') end");
     let reply = fixture.execute("short-task", "short", json!({}));
     let response = fixture.response(reply).unwrap();
     assert_eq!(response.content, "hello");
     assert_eq!(response.call_id, "call-short-task");
     assert_eq!(response.alias, "short");
-    fixture.completed("short-task");
-    let result = fixture.tasks().read("short-task").unwrap();
-    assert!(result.completed);
-    assert!(result.output.is_empty());
-    assert_eq!(result.error, None);
+    fixture.removed("short-task");
+    assert!(!fixture
+        .root
+        .path()
+        .join("unreachable-after-finish")
+        .exists());
 }
 
 #[test]
@@ -339,7 +373,7 @@ fn return_keeps_vm_alive_across_turn_changes_and_supports_json_cache_replacement
         .tasks()
         .get("background-task")
         .unwrap()
-        .is_completed());
+        .is_cleanup_complete());
     let agent = fixture
         .app
         .world_mut()
@@ -355,7 +389,7 @@ fn return_keeps_vm_alive_across_turn_changes_and_supports_json_cache_replacement
     let first = fixture.output("background-task");
     assert_eq!(first.output, vec![value]);
     assert!(!first.replaced);
-    assert!(!first.completed);
+
     assert!(fixture
         .tasks()
         .read("background-task")
@@ -377,11 +411,11 @@ fn return_keeps_vm_alive_across_turn_changes_and_supports_json_cache_replacement
         .tasks()
         .send("background-task", json!({"finish":true}))
         .unwrap();
-    fixture.completed("background-task");
+    fixture.removed("background-task");
 }
 
 #[test]
-fn finish_other_task_waits_for_real_cleanup_and_retains_both_entries() {
+fn finish_other_task_waits_for_real_cleanup_and_removes_both_entries() {
     let mut fixture = Fixture::new();
     fixture.tool("background", "function execute(args, context) task_return('started'); task_receive(); task_write('unexpected') end");
     let reply = fixture.execute("target", "background", json!({}));
@@ -389,10 +423,9 @@ fn finish_other_task_waits_for_real_cleanup_and_retains_both_entries() {
     fixture.tool("closer", "function execute(args, context) task_finish(args.target); task_return('closed'); task_finish(context.task_id) end");
     let reply = fixture.execute("closer", "closer", json!({"target":"target"}));
     assert_eq!(fixture.response(reply).unwrap().content, "closed");
-    assert!(fixture.tasks().get("target").unwrap().is_completed());
-    fixture.completed("closer");
-    assert_eq!(fixture.tasks().list().len(), 2);
-    assert!(fixture.tasks().read("target").unwrap().output.is_empty());
+    fixture.removed("target");
+    fixture.removed("closer");
+    assert!(fixture.tasks().list().is_empty());
 }
 
 #[test]
@@ -425,14 +458,13 @@ fn lua_can_send_receive_and_read_another_same_agent_task() {
     let response = fixture.response(reply).unwrap();
     let result: Value = serde_json::from_str(&response.content).unwrap();
     assert_eq!(result["output"], json!([[1, true, null]]));
-    assert_eq!(result["completed"], false);
-    fixture.completed("reader-task");
-    fixture.completed("echo-task");
-    assert!(fixture.tasks().read("echo-task").unwrap().output.is_empty());
+    assert!(result.get("completed").is_none());
+    fixture.removed("reader-task");
+    fixture.removed("echo-task");
 }
 
 #[test]
-fn natural_exit_without_return_reports_missing_return_and_late_errors_are_queryable() {
+fn natural_exit_without_return_reports_missing_return_and_late_errors_are_removed() {
     let mut fixture = Fixture::new();
     fixture.tool("missing", "function execute() return 'not task_return' end");
     let reply = fixture.execute("missing", "missing", json!({}));
@@ -440,18 +472,20 @@ fn natural_exit_without_return_reports_missing_return_and_late_errors_are_querya
         fixture.response(reply).unwrap_err().kind,
         Kind::MissingReturn
     );
-    fixture.completed("missing");
+    fixture.removed("missing");
     fixture.tool(
         "late",
-        "function execute() task_return('once'); task_return('twice') end",
+        "function execute() task_return('once'); local ok, err=pcall(function() task_return('twice') end); task_write({ok=ok,error=tostring(err)}); task_receive() end",
     );
     let reply = fixture.execute("late", "late", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "once");
-    fixture.completed("late");
-    assert_eq!(
-        fixture.tasks().read("late").unwrap().error.unwrap().kind,
-        Kind::AlreadyReturned
-    );
+    let result = fixture.output("late");
+    assert_eq!(result.output[0]["ok"], false);
+    assert!(result.output[0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("already"));
+    finish_task(&fixture, "late");
 }
 
 #[test]
@@ -463,14 +497,14 @@ fn fresh_schema_program_and_deleted_files_are_checked_for_each_execution() {
     );
     let reply = fixture.execute("first", "fresh", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "first");
-    fixture.completed("first");
+    fixture.removed("first");
     fixture.tool(
         "fresh",
         "function execute(args,context) task_return('changed'); task_finish(context.task_id) end",
     );
     let reply = fixture.execute("second", "fresh", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "changed");
-    fixture.completed("second");
+    fixture.removed("second");
     std::fs::write(
         fixture.root.path().join("fresh/input.schema.json"),
         r#"{"type":"object","required":["required"]}"#,
@@ -481,7 +515,7 @@ fn fresh_schema_program_and_deleted_files_are_checked_for_each_execution() {
         fixture.response(reply).unwrap_err().kind,
         Kind::InvalidArguments
     );
-    fixture.completed("bad-args");
+    fixture.removed("bad-args");
     let path = fixture.root.path().join("fresh/main.lua");
     assert_eq!(
         path.parent(),
@@ -490,7 +524,7 @@ fn fresh_schema_program_and_deleted_files_are_checked_for_each_execution() {
     std::fs::remove_file(path).unwrap();
     let reply = fixture.execute("missing-file", "fresh", json!({}));
     assert_eq!(fixture.response(reply).unwrap_err().kind, Kind::ReadFailed);
-    fixture.completed("missing-file");
+    fixture.removed("missing-file");
 }
 
 #[test]
@@ -504,7 +538,7 @@ fn independent_supervisor_reaps_setsid_descendants_after_return_and_finish() {
     end"#);
     let reply = fixture.execute("escape", "escape", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "spawned");
-    fixture.completed("escape");
+    fixture.removed("escape");
     let pid: i32 = std::fs::read_to_string(fixture.root.path().join("escaped.pid"))
         .unwrap()
         .trim()
@@ -540,10 +574,23 @@ fn init_preserves_existing_tasks_and_closed_agent_rejects_new_calls() {
         .unwrap()
         .state = AgentState::Stopping;
     let reply = fixture.execute("new", "background", json!({}));
-    assert_eq!(fixture.response(reply).unwrap_err().kind, Kind::Closed);
-    assert!(!fixture.tasks().get("background").unwrap().is_completed());
+    let rejected = fixture.response(reply).unwrap();
+    assert!(rejected.failed);
+    assert_eq!(rejected.call_id, "call-new");
+    assert_eq!(rejected.alias, "background");
+    assert_eq!(rejected.content, "Tool call aborted.");
+    assert_eq!(
+        fixture.tasks().read("new").unwrap_err().kind,
+        Kind::TaskMissing
+    );
+    assert_eq!(fixture.tasks().list().len(), 1);
+    assert!(!fixture
+        .tasks()
+        .get("background")
+        .unwrap()
+        .is_cleanup_complete());
     fixture.tasks().cancel("background").unwrap();
-    fixture.completed("background");
+    fixture.removed("background");
 }
 
 #[test]
@@ -553,9 +600,13 @@ fn reply_receiver_drop_does_not_cancel_a_registered_task() {
     let reply = fixture.execute("detached", "detached", json!({}));
     drop(reply);
     assert_eq!(fixture.output("detached").output, vec![json!("alive")]);
-    assert!(!fixture.tasks().get("detached").unwrap().is_completed());
+    assert!(!fixture
+        .tasks()
+        .get("detached")
+        .unwrap()
+        .is_cleanup_complete());
     fixture.tasks().send("detached", json!(null)).unwrap();
-    fixture.completed("detached");
+    fixture.removed("detached");
 }
 
 #[test]
@@ -569,14 +620,14 @@ fn cache_text_and_instruction_budgets_fail_explicitly() {
     fixture.configuration = ToolConfiguration { timeout_ms: 3_000 };
     fixture.tool(
         "cache",
-        "function execute() task_return('ready'); task_write('value-larger-than-cache') end",
+        "function execute() task_write('value-larger-than-cache'); task_return('unexpected') end",
     );
     let reply = fixture.execute("cache", "cache", json!({}));
-    assert_eq!(fixture.response(reply).unwrap().content, "ready");
-    fixture.completed("cache");
-    let result = fixture.tasks().read("cache").unwrap();
-    assert_eq!(result.error.unwrap().kind, Kind::OutputTooLarge);
-    assert!(result.output.is_empty());
+    assert_eq!(
+        fixture.response(reply).unwrap_err().kind,
+        Kind::OutputTooLarge
+    );
+    fixture.removed("cache");
     fixture.tool(
         "text",
         "function execute() task_return('text-larger-than-budget') end",
@@ -586,14 +637,14 @@ fn cache_text_and_instruction_budgets_fail_explicitly() {
         fixture.response(reply).unwrap_err().kind,
         Kind::OutputTooLarge
     );
-    fixture.completed("text");
+    fixture.removed("text");
     fixture.tool("instructions", "function execute() while true do end end");
     let reply = fixture.execute("instructions", "instructions", json!({}));
     assert_eq!(
         fixture.response(reply).unwrap_err().kind,
         Kind::ExecutionFailed
     );
-    fixture.completed("instructions");
+    fixture.removed("instructions");
 }
 
 #[test]
@@ -604,14 +655,14 @@ fn result_images_are_validated_by_the_core_across_the_runner_protocol() {
     let result = fixture.response(reply).unwrap();
     assert_eq!(result.images.len(), 1);
     assert_eq!(result.images[0].media_type, "image/png");
-    fixture.completed("image");
+    fixture.removed("image");
     fixture.tool("invalid-image", "function execute() task_return({ok=true,content='image',images={{media_type='image/png',data='eA=='}}}) end");
     let reply = fixture.execute("invalid-image", "invalid-image", json!({}));
     assert_eq!(
         fixture.response(reply).unwrap_err().kind,
         Kind::RunnerProtocolFailed
     );
-    fixture.completed("invalid-image");
+    fixture.removed("invalid-image");
 }
 
 #[test]
@@ -632,13 +683,7 @@ fn bundled_bash_exec_sleep_eleven_seconds_succeeds_with_author_configured_budget
         .unwrap();
     assert!(!response.failed, "{response:?}");
     assert_eq!(response.content, "sleep-eleven-completed\n[exit code: 0]");
-    fixture.completed("sleep-eleven");
-    assert!(fixture
-        .tasks()
-        .read("sleep-eleven")
-        .unwrap()
-        .error
-        .is_none());
+    fixture.removed("sleep-eleven");
 }
 
 #[test]
@@ -648,8 +693,7 @@ fn shell_obeys_only_the_task_lifetime_including_unlimited() {
         fixture.tool("slow-shell", "function execute(args, context) local result=shell('sleep 0.25; printf done'); task_return(result.stdout); task_finish(context.task_id) end");
         let reply = fixture.execute("slow-shell", "slow-shell", json!({}));
         assert_eq!(fixture.response(reply).unwrap().content, "done");
-        fixture.completed("slow-shell");
-        assert!(fixture.tasks().read("slow-shell").unwrap().error.is_none());
+        fixture.removed("slow-shell");
     }
 }
 
@@ -666,17 +710,8 @@ fn task_lifetime_reports_timeout_after_real_descendant_cleanup() {
     let reply = fixture.execute("shell-timeout", "shell-timeout", json!({}));
     let error = fixture.response(reply).unwrap_err();
     assert_eq!(error.kind, Kind::Timeout);
-    fixture.completed("shell-timeout");
-    assert_eq!(
-        fixture
-            .tasks()
-            .read("shell-timeout")
-            .unwrap()
-            .error
-            .unwrap()
-            .kind,
-        Kind::Timeout
-    );
+    fixture.removed("shell-timeout");
+
     for name in ["shell.pid", "child.pid"] {
         let pid = std::fs::read_to_string(fixture.root.path().join(name))
             .unwrap()
@@ -703,17 +738,8 @@ fn total_execution_deadline_still_bounds_shell_work() {
     );
     let reply = fixture.execute("total-timeout", "total-timeout", json!({}));
     assert_eq!(fixture.response(reply).unwrap_err().kind, Kind::Timeout);
-    fixture.completed("total-timeout");
-    assert_eq!(
-        fixture
-            .tasks()
-            .read("total-timeout")
-            .unwrap()
-            .error
-            .unwrap()
-            .kind,
-        Kind::Timeout
-    );
+    fixture.removed("total-timeout");
+
     let pid = std::fs::read_to_string(fixture.root.path().join("total-shell.pid"))
         .unwrap()
         .trim()
@@ -745,7 +771,7 @@ fn invalid_shell_timeouts_are_rejected_before_spawning_a_child() {
             Kind::InvalidArguments,
             "{timeout}"
         );
-        fixture.completed(&id);
+        fixture.removed(&id);
         assert!(!fixture.root.path().join("unexpected-child").exists());
     }
 }
@@ -759,11 +785,7 @@ fn execution_timeout_still_reaps_a_background_vm_after_return() {
     );
     let reply = fixture.execute("timeout", "timeout", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "started");
-    fixture.completed("timeout");
-    assert_eq!(
-        fixture.tasks().read("timeout").unwrap().error.unwrap().kind,
-        Kind::Timeout
-    );
+    fixture.removed("timeout");
 }
 
 #[test]
@@ -786,8 +808,7 @@ fn selected_sandbox_is_read_fresh_and_invalid_policy_never_starts_tool() {
     );
     let reply = fixture.execute("safe", "safe", json!({}));
     assert_eq!(fixture.response(reply).unwrap_err().kind, Kind::ReadFailed);
-    fixture.completed("safe");
-    assert!(fixture.tasks().read("safe").unwrap().output.is_empty());
+    fixture.removed("safe");
 }
 
 #[test]
@@ -803,7 +824,7 @@ fn duplicate_task_id_does_not_replace_the_existing_shared_handle() {
     );
     assert_eq!(fixture.tasks().list().len(), 1);
     fixture.tasks().send("same", json!({})).unwrap();
-    fixture.completed("same");
+    fixture.removed("same");
 }
 
 #[test]
@@ -819,7 +840,11 @@ fn bundled_bash_stays_alive_after_reply_and_preserves_shell_state() {
         serde_json::from_str::<Value>(&response.content).unwrap()["task_id"],
         "terminal"
     );
-    assert!(!fixture.tasks().get("terminal").unwrap().is_completed());
+    assert!(!fixture
+        .tasks()
+        .get("terminal")
+        .unwrap()
+        .is_cleanup_complete());
     fixture.tasks().send("terminal", json!({"text":"export MARGATROID_TEST_VALUE=persistent; mkdir -p child; cd child", "enter":true})).unwrap();
     fixture.tasks().send("terminal", json!({"text":"printf '\\nRESULT=%s DIRECTORY=%s\\n' \"$MARGATROID_TEST_VALUE\" \"${PWD##*/}\"", "enter":true})).unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -839,8 +864,7 @@ fn bundled_bash_stays_alive_after_reply_and_preserves_shell_state() {
         .tasks()
         .send("terminal", json!({"text":"exit 0", "enter":true}))
         .unwrap();
-    fixture.completed("terminal");
-    assert!(fixture.tasks().read("terminal").unwrap().completed);
+    fixture.removed("terminal");
 }
 
 #[test]
@@ -898,7 +922,7 @@ fn terminal_slow_reader_receives_all_eighty_scrolled_lines_once() {
             .tasks()
             .send("history", json!({"text":"exit 0","enter":true}))
             .unwrap();
-        fixture.completed("history");
+        fixture.removed("history");
     }
 }
 
@@ -939,7 +963,7 @@ fn terminal_alternate_screen_updates_replace_cache_without_escape_sequences() {
             json!({"text":"printf '\\033[?1049l'; exit 0", "enter":true}),
         )
         .unwrap();
-    fixture.completed("screen");
+    fixture.removed("screen");
 }
 
 #[test]
@@ -969,6 +993,13 @@ fn a_full_task_mailbox_does_not_block_the_original_call_reply() {
     assert!(accepted > 0 && accepted < 1000);
     assert_eq!(fixture.response(reply).unwrap().content, "{\"ready\":true}");
     let deadline = Instant::now() + Duration::from_secs(3);
+    let mut received = 0;
+    while received < accepted {
+        received += fixture.tasks().read("mailbox").unwrap().output.len();
+        assert!(Instant::now() < deadline, "mailbox lost accepted output");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(received, accepted);
     loop {
         match fixture.tasks().send("mailbox", json!("stop")) {
             Ok(()) => break,
@@ -977,11 +1008,7 @@ fn a_full_task_mailbox_does_not_block_the_original_call_reply() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(2));
     }
-    fixture.completed("mailbox");
-    assert_eq!(
-        fixture.tasks().read("mailbox").unwrap().output.len(),
-        accepted
-    );
+    fixture.removed("mailbox");
 }
 
 #[test]
@@ -1001,14 +1028,8 @@ fn bash_exit_finishes_task_even_if_a_background_process_keeps_the_pty_open() {
         )
         .unwrap();
     let started = Instant::now();
-    fixture.completed("background-child");
+    fixture.removed("background-child");
     assert!(started.elapsed() < Duration::from_secs(3));
-    assert!(fixture
-        .tasks()
-        .read("background-child")
-        .unwrap()
-        .error
-        .is_none());
 }
 
 #[test]
@@ -1018,7 +1039,11 @@ fn unlimited_task_waits_for_input_and_other_task_finish_proves_cleanup() {
     let reply = fixture.execute("waiting", "waiting", json!({}));
     fixture.response(reply).unwrap();
     std::thread::sleep(Duration::from_millis(300));
-    assert!(!fixture.tasks().get("waiting").unwrap().is_completed());
+    assert!(!fixture
+        .tasks()
+        .get("waiting")
+        .unwrap()
+        .is_cleanup_complete());
     fixture
         .tasks()
         .send("waiting", json!({"continued":true}))
@@ -1033,8 +1058,7 @@ fn unlimited_task_waits_for_input_and_other_task_finish_proves_cleanup() {
     );
     let reply = fixture.execute("closer-unlimited", "closer-unlimited", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "closed");
-    fixture.completed("waiting");
-    assert!(fixture.tasks().read("waiting").unwrap().completed);
+    fixture.removed("waiting");
 }
 
 fn with_daemon_controlling_terminal(name: &str, test: impl FnOnce()) {
@@ -1170,8 +1194,7 @@ PY]=])
             let result: Value = serde_json::from_str(&response.content).unwrap();
             assert_eq!(result["exit_code"], 0, "{result}");
             assert_eq!(result["stdout"], "NO_CONTROLLING_TERMINAL:ENXIO\n");
-            fixture.completed("raw-mode");
-            assert!(fixture.tasks().read("raw-mode").unwrap().error.is_none());
+            fixture.removed("raw-mode");
         },
     );
 }
@@ -1223,12 +1246,9 @@ PY]=])
             }
             let started = Instant::now();
             fixture.tasks().cancel("stopped").unwrap();
-            fixture.completed("stopped");
+            fixture.removed("stopped");
             assert!(started.elapsed() < Duration::from_secs(3));
-            assert_eq!(
-                fixture.tasks().read("stopped").unwrap().error.unwrap().kind,
-                Kind::Cancelled
-            );
+
             assert_eq!(kill(group, None), Err(nix::errno::Errno::ESRCH));
             assert_eq!(kill(worker, None), Err(nix::errno::Errno::ESRCH));
             assert_eq!(killpg(group, None), Err(nix::errno::Errno::ESRCH));
@@ -1266,8 +1286,103 @@ fn interactive_bash_gets_its_own_controlling_terminal_under_tty_daemon() {
                 .tasks()
                 .send("own-pty", json!({"text": "exit 0", "enter": true}))
                 .unwrap();
-            fixture.completed("own-pty");
-            assert!(fixture.tasks().read("own-pty").unwrap().error.is_none());
+            fixture.removed("own-pty");
         },
     );
+}
+
+fn finish_task(fixture: &Fixture, id: &str) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(fixture.tasks().finish(id)).unwrap();
+    fixture.removed(id);
+}
+
+#[test]
+fn accepted_batch_abort_returns_long_call_immediately_and_preserves_returned_background() {
+    let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms: 0 });
+    fixture.tool(
+        "echo-abort",
+        r#"function execute(args, context)
+        task_return('background-ready')
+        while true do task_write(task_receive()) end
+    end"#,
+    );
+    fixture.tool(
+        "long-abort",
+        r#"function execute(args, context)
+        shell("sleep 60 & echo $! > abort-child.pid; wait")
+        task_return('unexpected natural result')
+    end"#,
+    );
+    // Emit the entire batch before any system gets to accept either request.
+    let mut replies = Vec::new();
+    for (id, alias) in [
+        ("returned-abort", "echo-abort"),
+        ("unreturned-abort", "long-abort"),
+    ] {
+        let (sender, receiver) = oneshot::channel();
+        fixture.app.world().emit_event(ToolExecuteRequest {
+            id: id.into(),
+            agent: fixture.agent,
+            turn: "test-turn".into(),
+            alias: alias.into(),
+            call_id: format!("original-{id}"),
+            arguments: json!({}),
+            reply: Arc::new(Mutex::new(Some(sender))),
+        });
+        replies.push(receiver);
+    }
+    fixture.app.tick();
+    let long_reply = replies.pop().unwrap();
+    assert_eq!(
+        fixture.response(replies.pop().unwrap()).unwrap().content,
+        "background-ready"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !fixture.root.path().join("abort-child.pid").exists() {
+        fixture.app.tick();
+        assert!(Instant::now() < deadline, "long shell never started");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let pid: i32 = std::fs::read_to_string(fixture.root.path().join("abort-child.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(fixture.tasks().list().len(), 2);
+    fixture
+        .app
+        .world_mut()
+        .get_component_mut::<Agent>(fixture.agent)
+        .unwrap()
+        .turn = None;
+    let started = Instant::now();
+    assert_eq!(fixture.tasks().abort_unreturned(), 1);
+    let response = fixture
+        .response_with_timeout(long_reply, Duration::from_secs(1))
+        .unwrap();
+    assert!(started.elapsed() <= Duration::from_secs(1));
+    assert!(response.failed);
+    assert_eq!(response.call_id, "original-unreturned-abort");
+    assert_eq!(response.alias, "long-abort");
+    assert_eq!(response.content, "Tool call aborted.");
+    assert_eq!(fixture.tasks().abort_unreturned(), 0);
+    fixture.removed("unreturned-abort");
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+        Err(nix::errno::Errno::ESRCH)
+    );
+    fixture
+        .tasks()
+        .send("returned-abort", json!({"echo":"after abort"}))
+        .unwrap();
+    assert_eq!(
+        fixture.output("returned-abort").output,
+        vec![json!({"echo":"after abort"})]
+    );
+    finish_task(&fixture, "returned-abort");
+    assert!(fixture.tasks().list().is_empty());
 }

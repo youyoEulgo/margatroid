@@ -185,6 +185,20 @@ impl Fixture {
                                 "cleanup not proven",
                             )));
                         }
+                        5 => {
+                            let (handle, _input) = ToolTaskHandle::new(
+                                &ToolExecutionLimits::default(),
+                                request.call_id.clone(),
+                                request.alias.clone(),
+                                sender,
+                            )
+                            .unwrap();
+                            world
+                                .get_component::<ToolTasks>(request.agent)
+                                .unwrap()
+                                .register(request.id.clone(), handle)
+                                .unwrap();
+                        }
                         _ => unreachable!(),
                     }
                     continue;
@@ -195,23 +209,28 @@ impl Fixture {
                     }
                     continue;
                 }
-                let (handle, _input) =
-                    ToolTaskHandle::new(&ToolExecutionLimits::default()).unwrap();
-                handle.claim_return().unwrap();
-                world
-                    .get_component::<ToolTasks>(request.agent)
-                    .unwrap()
-                    .register(request.id.clone(), handle)
-                    .unwrap();
-                if let Some(sender) = request.reply.lock().unwrap().take() {
-                    let _ = sender.send(Ok(ToolExecuteResponse {
+                let sender = request.reply.lock().unwrap().take().unwrap();
+                let (handle, _input) = ToolTaskHandle::new(
+                    &ToolExecutionLimits::default(),
+                    request.call_id.clone(),
+                    request.alias.clone(),
+                    sender,
+                )
+                .unwrap();
+                handle
+                    .return_result(Ok(ToolExecuteResponse {
                         call_id: request.call_id,
                         alias: request.alias,
                         content: request.arguments.to_string(),
                         images: vec![],
                         failed: false,
-                    }));
-                }
+                    }))
+                    .unwrap();
+                world
+                    .get_component::<ToolTasks>(request.agent)
+                    .unwrap()
+                    .register(request.id.clone(), handle)
+                    .unwrap();
             }
         });
         let imports = Arc::new(Mutex::new(Vec::new()));
@@ -833,6 +852,14 @@ async fn tool_results_preserve_order_and_return_without_waiting_for_tool_vm_end(
     let mut fixture = Fixture::new();
     fixture.add_tool("bash");
     fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    let expected_turn = fixture
+        .app
+        .world()
+        .get_component::<Agent>(fixture.owner)
+        .unwrap()
+        .turn
+        .clone()
+        .unwrap();
     let calls = json!([{"type": "assistant", "content": null, "tool_calls": [{"id": "first", "tool_name": "bash", "arguments": "{\"n\":1}"}, {"id": "hidden", "tool_name": "private", "arguments": "{}"}, {"id": "last", "tool_name": "bash", "arguments": "{\"n\":2}"}]}]);
     let results = messages(
         fixture
@@ -849,13 +876,26 @@ async fn tool_results_preserve_order_and_return_without_waiting_for_tool_vm_end(
     );
     assert_eq!(results[1]["content"], "tool not visible");
     assert_eq!(results[1]["failed"], true);
+    assert!(
+        fixture
+            .tools
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.turn == expected_turn)
+    );
     let tasks = fixture
         .app
         .world()
         .get_component::<ToolTasks>(fixture.owner)
         .unwrap();
     assert_eq!(tasks.list().len(), 2);
-    assert!(tasks.list().iter().all(|(_, task)| !task.is_completed()));
+    assert!(
+        tasks
+            .list()
+            .iter()
+            .all(|(_, task)| !task.is_cleanup_complete())
+    );
     fixture.command("EFFECT finish_turn", vec![]).await.unwrap();
     assert!(
         fixture
@@ -866,6 +906,87 @@ async fn tool_results_preserve_order_and_return_without_waiting_for_tool_vm_end(
             .list()
             .iter()
             .all(|(_, task)| !task.cancel_token().is_cancelled())
+    );
+}
+
+#[tokio::test]
+async fn batch_collects_forced_abort_and_returned_background_replies_without_losing_bindings() {
+    // This exercises MCL event transport and real task reply gates; tool execution is a fixture.
+    let mut fixture = Fixture::new();
+    fixture.add_tool("bash");
+    fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    fixture
+        .tool_modes
+        .lock()
+        .unwrap()
+        .insert("pending".into(), 5);
+    let mut receiver = fixture.enqueue(
+        "EFFECT tool_call ? ?",
+        vec![
+            json!([{"type":"assistant","tool_calls":[
+                {"id":"pending","tool_name":"bash","arguments":"{}"},
+                {"id":"background","tool_name":"bash","arguments":"{\"background\":true}"}
+            ]}]),
+            json!(["bash"]),
+        ],
+    );
+    let recorded = fixture.tools.clone();
+    tick_until(&mut fixture.app, || recorded.lock().unwrap().len() == 2).await;
+    assert!(receiver.try_recv().is_err());
+    let requests = recorded.lock().unwrap().clone();
+    let tasks = fixture
+        .app
+        .world()
+        .get_component::<ToolTasks>(fixture.owner)
+        .unwrap()
+        .clone();
+    let pending = tasks.get(&requests[0].id).unwrap();
+    let background = tasks.get(&requests[1].id).unwrap();
+    assert!(!pending.has_returned());
+    assert!(background.has_returned());
+    let turn = fixture
+        .app
+        .world()
+        .get_component::<Agent>(fixture.owner)
+        .unwrap()
+        .turn
+        .clone()
+        .unwrap();
+    fixture
+        .app
+        .world_mut()
+        .agent_abort_turn(fixture.owner, &turn)
+        .unwrap();
+    assert_eq!(tasks.abort_unreturned(), 1);
+    let results = messages(drive(&mut fixture.app, &mut receiver).await.unwrap());
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["tool_call_id"], "pending");
+    assert_eq!(results[0]["content"], "Tool call aborted.");
+    assert_eq!(results[0]["failed"], true);
+    assert_eq!(results[1]["tool_call_id"], "background");
+    assert_eq!(results[1]["failed"], false);
+    assert!(pending.cancel_token().is_cancelled());
+    assert!(!background.cancel_token().is_cancelled());
+    fixture.command("EFFECT finish_turn", vec![]).await.unwrap();
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get_component::<Agent>(fixture.owner)
+            .unwrap()
+            .state,
+        AgentState::Idle
+    );
+    assert!(!pending.is_cleanup_complete());
+    assert!(tasks.get(&requests[1].id).is_ok());
+    assert!(
+        fixture
+            .app
+            .world()
+            .get_component::<MclQueue>(fixture.owner)
+            .unwrap()
+            .pending
+            .is_none()
     );
 }
 

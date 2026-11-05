@@ -1,3 +1,5 @@
+本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
+
 # 伪代码格式
 
 ```text
@@ -137,4 +139,14 @@ ClientMessage / ServerMessage
 
 protocol
 └── 标准库与serde等通用库
+```
+
+# 中止与任务查询契约
+
+```text
+agent.turn.abort仍携带workspace、agent、agent_instance和turn_id，原网络信封不变。
+受理先清turn，再取消当前推理，原子强制return并终止尚未return的工具；已return未finish后台任务保留。
+控制受理回执不等待工具自然结束，不代表清理已完成；所有可关联的中止工具结果保留原调用ID，failed=true。
+finish即真实清理及任务移除，没有completed=true条目或可读的完成缓存；TaskReadResult不再提供completed字段，已finish任务的read/send/finish返回TaskMissing。
+TaskReadResult仅含replaced、output和error；TaskMissing是领域错误，不是未知Lua宿主函数。网络信封及MCL的Ok.Error规范保持原义。
 ```

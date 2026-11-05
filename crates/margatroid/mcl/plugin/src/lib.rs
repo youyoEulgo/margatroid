@@ -47,6 +47,8 @@ impl MclPlugin {
         Self::default()
     }
 
+    /// Runs after DTO abort control, which executes in PRE_UPDATE.
+    /// Only the runtime's UPDATE and POST_UPDATE schedules preserve that ordering.
     pub fn with_schedule(mut self, schedule: impl Into<String>) -> Self {
         self.schedule = schedule.into();
         self
@@ -79,8 +81,11 @@ impl Plugin for MclPlugin {
             "MclPlugin schedule does not exist"
         );
         assert!(
-            self.schedule != RuntimePlugin::STARTUP,
-            "MclPlugin requires a recurring schedule"
+            matches!(
+                self.schedule.as_str(),
+                RuntimePlugin::UPDATE | RuntimePlugin::POST_UPDATE
+            ),
+            "MclPlugin requires UPDATE or POST_UPDATE so PRE_UPDATE abort control runs first"
         );
         let _ = app.world().closure_sender(&self.schedule);
         app.world_mut().insert_resource(self.imports);
@@ -88,5 +93,39 @@ impl Plugin for MclPlugin {
             schedule: self.schedule.clone(),
         });
         app.add_system(&self.schedule, system::mcl_command_system);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_runtime_plugin::AsyncRuntimePlugin;
+    use closure_plugin::{AppClosureExt, ClosurePlugin};
+
+    #[test]
+    fn mcl_installation_requires_a_known_schedule_after_abort_control() {
+        for schedule in [
+            RuntimePlugin::UPDATE,
+            RuntimePlugin::POST_UPDATE,
+            RuntimePlugin::PRE_UPDATE,
+            "custom",
+        ] {
+            let mut app = App::new();
+            app.add_plugin(RuntimePlugin::default())
+                .add_plugin(AsyncRuntimePlugin)
+                .add_plugin(ClosurePlugin);
+            if schedule == "custom" {
+                app.add_schedule(schedule.into());
+            }
+            app.add_closure_system(schedule);
+            let installed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                app.add_plugin(MclPlugin::new().with_schedule(schedule));
+            }));
+            assert_eq!(
+                installed.is_ok(),
+                matches!(schedule, RuntimePlugin::UPDATE | RuntimePlugin::POST_UPDATE),
+                "schedule: {schedule}"
+            );
+        }
     }
 }

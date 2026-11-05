@@ -11,6 +11,22 @@ System分别列出事件、闭包结果、提交闭包和oneshot回复，使用R
 
 Margatroid领域使用原生Axum装配及普通异步闭包，已退出mecs通用网络桥和spawn_async_service依赖。mecs现有接口、文档及源码暂时保留，后续另行清理，不提供旧入口回退或兼容实现。
 
+# 中止与任务生命周期契约
+
+本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
+
+```text
+ToolTask只有两种对外存活状态：未return；已return且未finish。
+return只表示已向LLM交付本次工具调用结果，最多一次，不结束任务。
+finish即清理：终止Lua/进程及后代，回收管道和临时资源，并从ToolTasks移除；不建立已finish条目，不保留完成任务或完成缓存。
+请求finish不是已finish。清理仍在进行或失败时，任务仍属未finish，由原监督者持有清理责任；不得先置finished再异步清理。
+中止先清turn。未受理请求在工具System检查turn后直接返回中止工具结果，不创建任务；已受理任务由ToolTasks原子裁决return。
+未return任务：强制交付原call_id/alias对应的中止结果，随即请求终止并清理，不等工具自然return才释放LLM等待。
+已return未finish任务：保留原任务、进程、缓存与输入通道；回合中止不影响它们，例如持久Bash或MCP常驻工具。
+正常return与中止强制return共享同一状态和reply所有权，只有一方成功；中止获胜后迟到Return不得交付第二个结果。
+清理完成即移除。后续read/send/finish查询不到任务并返回TaskMissing；不存在已finish但仍可查询的第三种状态。
+```
+
 # 板块格式
 
 ```text
@@ -44,7 +60,7 @@ ToolPlugin：工具执行插件
     limits: ToolExecutionLimits
     impl Plugin for ToolPlugin
         build(self, app: &mut App)
-            行为：检查执行设施和预算，拒绝重复安装；安装init_tool_tasks_system和tool_execute_system。
+            行为：检查执行设施和预算，拒绝重复安装；仅允许RuntimePlugin::UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明先后顺序的自定义schedule；安装init_tool_tasks_system和tool_execute_system，不新增调度metadata或修改mecs。
 ```
 
 # components
@@ -56,17 +72,19 @@ ToolPlugin：工具执行插件
 ToolTasks：该Agent的工具任务句柄集合，公开组件
     entries: Arc<Mutex<BTreeMap<String, ToolTaskHandle>>>--私有，宿主与任务共享的句柄集合
     register(&self, id: String, handle: ToolTaskHandle) -> Result<(), ToolError>
-        行为：登记本次任务及空缓存、cursor=0、completed=false，重复id返回错误，不覆盖已有条目。
+        行为：登记存活任务及空缓存、cursor=0、returned=false和唯一结果回复端；重复id返回错误，不覆盖已有条目。
     cancel(&self, id: &str) -> Result<(), ToolError>
         行为：向对应句柄请求取消，不直接中断监督任务或删除句柄。
     list(&self) -> Vec<(String, ToolTaskHandle)>
-        行为：克隆工具任务句柄列表，不包括推理、存储或VM。
+        行为：只克隆未finish的活任务句柄，不包括已清理任务、推理、存储或VM。
     read(&self, id: &str) -> Result<TaskReadResult, ToolError>
-        行为：同一短锁读取output[cursor..]并将相邻字符串无分隔符拼成一项，非字符串原样保留顺序；读取completed及error，将cursor推进至当前末尾，返回并清除replaced标记。
+        行为：从集合取得仍存活任务后，同一短锁读取output[cursor..]并将相邻字符串无分隔符拼成一项，非字符串原样保留顺序；读取活任务error，将cursor推进至当前末尾，返回并清除replaced标记。
     send(&self, id: &str, value: serde_json::Value) -> Result<(), ToolError>
-        行为：向目标Lua输入通道投递一个值；任务已结束或通道满返回错误，不宣称接收方已处理。
+        行为：向目标Lua输入通道投递一个值；目标已finish返回TaskMissing；通道关闭或满返回错误，不宣称接收方已处理。
     finish(&self, id: &str) -> Future<Output = Result<(), ToolError>>
-        行为：请求目标退出并等待监督任务清理；保留任务条目和缓存。
+        行为：终止目标并等待Lua、进程及后代、管道、临时资源真实清理，从集合移除并释放缓存后返回成功；错误及时返回并保留未完成清理的监督责任，不伪造finish。
+    abort_unreturned(&self) -> 工具中止交接结果
+        行为：对集合中的活任务逐一原子竞争return；只对未return任务交付原调用关联的中止结果并触发终止清理；已return任务不变。同步完成return裁决和取消触发，不在控制System阻塞等待进程清理。
     impl Clone for ToolTasks
         行为：共享同一集合，不借用World。
     impl Component for ToolTasks
@@ -86,6 +104,7 @@ InitToolTasks：工具任务组件初始化请求，公开事件
 ToolExecuteRequest：单次工具请求，公开事件
     id: String
     agent: Entity
+    turn: String--发出请求时的回合标识，System受理必须与Agent当前turn匹配
     alias: String--工具路径集合的键
     call_id: String--模型调用关联
     arguments: serde_json::Value
@@ -113,7 +132,7 @@ tool_execute_system(world: &mut World)
     提交闭包：launch_tool(ToolExecutionContext) -> Future<Output = Result<ToolLaunchOutput, ToolLaunchError>>
     产出事件：None
     oneshot回复：Result<ToolExecuteResponse, ToolError>
-    行为：ToolExecuteRequest -> handle_tool_execute。
+    行为：在中止schedule之后执行；ToolExecuteRequest -> handle_tool_execute，逐请求复检当前turn，不使用发出时状态代替受理检查。
 ```
 
 # handler
@@ -127,7 +146,7 @@ handle_init_tool_tasks(world: &mut World, request: InitToolTasks)
 
 handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
     行为：
-        认领reply，核对Agent完整Entity及是否允许新工具调用，不检查turn。
+        认领reply，核对Agent完整Entity、Working及当前非空turn与request.turn匹配；无turn或不匹配直接返回保留call_id/alias的中止工具结果，不注册任务、不启动闭包或进程。
         从Tools取得alias路径，从SelectedSandbox及Sandboxes取得可选策略路径。
         固定本次工具、策略路径和目录参数，准备owned执行材料，不跨await借用World。
         创建共享ToolTaskHandle，一份登记ToolTasks，克隆一份及共享集合句柄交给工作任务；通过send_async_closure提交launch_tool，失败通过原reply回复错误；不使用spawn_async_service，不缓存执行器Handle。
@@ -142,10 +161,10 @@ supervise_tool(context: ToolExecutionContext) -> Future<Output = ()>
     行为：
         blocking worker调用tool_resource_core::read_tool和sandbox_resource_core::read_sandbox，读取本次程序、schema和策略。
         校验arguments与本次schema、具体后端策略；检查取消后启动run_runner。
-        接收runner的Return时完成原reply一次，不结束runner；持续处理缓存写入、覆盖及跨任务读取输入请求。
-        等待VM、runner、后代、管道和临时文件真实清理后设置completed=true并保留条目；若尚未回复则返回未回复结束错误。
+        接收runner的Return时通过共享句柄的原子return裁决交付结果，不结束runner；中止、错误与正常Return共用唯一回复端，不能在context另持独立可回复状态；持续处理缓存写入、覆盖及任务输入。
+        自然退出、显式finish、到期或中止均进入同一清理出口：尚未return时先及时交付对应失败结果，再等待VM、runner、后代、管道和临时文件真实清理，完成finish并从ToolTasks移除，释放缓存；不保留completed条目。
         已回复调用不得重复回复；后台异常记录于对应任务error，未回复调用按实际错误完成。
-        清理失败返回CleanupFailed并保留本次runner管理能力，不假称完成。
+        清理失败及时交付CleanupFailed；保持未finish并保留本次runner管理能力继续清理，不标记已finish。
 
 run_runner(context: RunnerContext) -> Future<Output = Result<(), ToolError>>
     行为：启动可信supervisor及受限worker；并行投递stdin、读取有界stdout/stderr和等待退出；取消或超时终止执行并等待清理；处理双向协议帧；Return不是进程终态，真实退出清理后返回。
@@ -162,11 +181,11 @@ task_write(value)
 task_replace(value)
     行为：将缓存整体替换为[value]并置cursor=0、replaced=true；覆盖与读取使用同一短锁。
 task_return(value)
-    行为：校验并转换为ToolExecuteResponse，通过原调用reply回复一次；不释放VM、不关闭任务输入。
+    行为：校验并转换为ToolExecuteResponse，原子竞争共享return状态及reply并交付一次；不释放VM、不关闭任务输入。中止已强制return后不得再次回复。
 task_finish(task_id)
-    行为：仅操作当前Agent任务；自身为控制退出，其他任务请求结束并等待真实清理；完成前不得置completed=true。
+    行为：仅操作当前Agent任务；自身通过控制退出结束Lua，由监督者完成清理和集合移除；其他任务调用在真实清理并移除后才成功。不能先声明finished再清理；已finish目标不存在。
 task_read(task_id)
-    行为：读取同Agent目标缓存的新增值、完成标记和错误，并推进cursor。
+    行为：读取同Agent活任务缓存的新增值和错误，并推进cursor；不返回completed状态，已finish目标返回TaskMissing。
 task_send(task_id, value)
     行为：向同Agent目标任务的Lua输入通道投递任意结构化值。
 task_receive()
@@ -184,7 +203,7 @@ ToolLaunchError：ToolError及原请求回复/共享句柄关联，实现From<As
 
 ToolExecutionContext：单次执行材料
     request: ToolExecuteRequest
-    reply: oneshot::Sender<Result<ToolExecuteResponse, ToolError>>
+    reply：唯一回复端由ToolTaskShared持有，context仅通过同一共享句柄交付
     tool_path: PathBuf
     sandbox_path: Option<PathBuf>
     project_root: PathBuf
@@ -232,27 +251,30 @@ ToolContext：worker上下文
 ```text
 ToolTaskHandle：可克隆的任务共享句柄，公开类型
     inner: Arc<ToolTaskShared>
+    is_cleanup_complete(&self) -> bool--仅内部清理等待者使用，不是对外completed状态或完成缓存
     impl Clone
         行为：共享同一任务状态、输入与取消能力，不复制任务。
 
 ToolTaskShared：任务持有数据
-    cancel: CancellationToken--任务独立取消信号，与turn及原reply生命周期无关
+    cancel: CancellationToken--存活任务取消能力；回合中止只触发原子裁决仍未return的任务，不取消已return后台任务
     task: Mutex<Option<JoinHandle<()>>>--监督任务句柄，取消时不直接abort
-    shared: Mutex<ToolTaskData>
+    shared: Mutex<ToolTaskData>--returned状态与唯一reply在同一锁内裁决
     input: mpsc::Sender<serde_json::Value>
 
 ToolTaskData：任务查询数据
     output: Vec<serde_json::Value>
     cursor: usize
     replaced: bool--上次查询后是否发生整体替换，初始false
-    completed: bool
+    call_id: String--正常及强制return使用相同调用关联
+    alias: String--正常及强制return使用相同工具入口
+    returned: bool--LLM结果是否已交付；finish不是可存储的任务状态
+    reply: Option<oneshot::Sender<Result<ToolExecuteResponse, ToolError>>>--仅ToolTaskData持有
     error: Option<ToolError>
 
 TaskReadResult：增量查询结果
     replaced: bool--true表示本次内容替换此前展示，false表示追加
     output: Vec<serde_json::Value>
-    completed: bool
-    error: Option<ToolError>
+    error: Option<ToolError>--仅活任务；finish后查询TaskMissing
 
 ToolExecuteResponse：调用结果，公开类型
     call_id: String
@@ -307,14 +329,14 @@ Agent Entity
 ├── Tools（tool_resource_core）
 ├── ToolTasks（tool_core）
 │   └── BTreeMap<task_id, ToolTaskHandle>
-│       ├── 输出缓存、cursor与完成状态
+│       ├── 输出缓存、cursor、return状态与唯一结果回复端
 │       └── Lua输入通道
 └── Sandboxes与SelectedSandbox（sandbox_resource_core）
 
 mecs全局异步设施
 └── supervise_tool
     ├── ToolExecutionContext
-    │   └── 原reply
+    │   └── 与ToolTasks同一原子return及清理能力
     ├── 本次工具及策略材料
     └── runner监督能力
         ├── 可信supervisor
