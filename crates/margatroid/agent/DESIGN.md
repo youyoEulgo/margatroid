@@ -10,6 +10,10 @@ System分别列出处理事件、接收闭包结果、提交闭包与产出事�
 属性不写Rust Attribute；持有关系使用树形图。
 ```
 
+# 动态工具生命周期目标
+
+本轮动态工具归属条款为待实现设计，只改文档。动态定义属于当前Agent完整Entity及Driver实例，不写数据库或settings，不恢复旧实例定义；MCP协议不进入Agent领域。
+
 # 板块格式
 
 ```text
@@ -184,11 +188,11 @@ start_flow(context: FlowContext) -> Future<Output = Result<StartOutput, StartErr
         调用address::resolve_file及agent_driver_core::read_driver取得本次Driver材料，准备数据库与设置。
         运行组件初始化阶段先发送InitToolTasks和InitInference，各携带agent及独立oneshot发送端，不先等待其中一个再发另一个。
         使用tokio::join!等待两个接收端，与原有资源初始化一起完成；收齐全部结果后处理错误，不提前丢弃另一项。
-        全部初始化成功后准备agent_info并发送StartDriverLuaVm，等待原reply；mcl和wait由Lua Runtime构造。
+        新实例从空Tools开始，普通导入和动态注入均向此同一集合登记，不另建动态工具集合。全部初始化成功后准备agent_info并发送StartDriverLuaVm，等待原reply；mcl和wait由Lua Runtime构造。
         失败清理本次已创建内容并返回，成功返回；core不引用其他core的组件类型。
 
 stop_flow(context: FlowContext) -> Future<Output = Result<StopOutput, StopError>>
-    行为：请求Driver停止和执行取消；等待各任务自身的退出结果及MCL收口；返回清理结果，不销毁协调Entity。
+    行为：请求Driver停止和执行取消；沿现有流程停止任务；任务监督移除所属Tools记录并向等待它的任务返回工具错误，再等待任务、子进程及MCL真实收口。返回清理结果，不销毁协调Entity；不读取或解释MCP连接、远端工具名或binding。
 
 restart_flow(context: FlowContext) -> Future<Output = Result<RestartOutput, RestartError>>
     行为：await stop_flow，成功后使用重启请求提供的parameters执行start_flow；全程Restarting，不发公开StopAgent或StartAgent事件。
