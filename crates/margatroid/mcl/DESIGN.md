@@ -9,6 +9,10 @@ System区分事件、闭包结果、提交闭包和oneshot回复，使用Rust名
 不写独立逻辑段；持有关系使用树形图。
 ```
 
+# 动态工具目标范围
+
+动态入口及MCP资源分流为已确认、待实现设计，本轮仅修改文档。MCL不实现MCP，不新增MCP指令；tool_inject和原始进程通信由通用工具宿主提供。
+
 # 板块格式
 
 ```text
@@ -122,7 +126,7 @@ execute_command(context: CommandContext) -> Future<Output = Result<CommandOutput
     行为：按语法树执行一次操作，等待存储或领域oneshot结果；不跨await借用World，不重复解析或审计。
 
 execute_import(context: CommandContext, kind: ImportKind, locator: String, alias: String)
-    行为：校验声明类型和Driver依赖；通过address定位文件；在所属领域路径集合登记alias，不保存来源ID或正文，不自动注入、开放工具或激活沙箱。
+    行为：IMPORT TOOL校验资源后只向Agent的Tools增加一条含alias、description、input_schema和path的记录，没有额外启用、可见性配置或清单登记步骤。其余IMPORT按各资源类别登记，不激活沙箱。
 
 execute_get(context: CommandContext, expression: MessageExpression)
     行为：按顺序拼接消息来源；选择器统一读事务；Prompt alias按路径读取并保留消息角色；返回.Array.Message。
@@ -134,11 +138,12 @@ execute_config(context: CommandContext, operation: ConfigOperation)
     行为：只访问当前Agent设置文件；GET读取整份TOML；SET按点分路径赋值；DELETE删除键；写入完整成功才返回。
 
 execute_effect(context: CommandContext, name: String, arguments: Vec<EffectParameter>)
-    行为：按effect参数约束求值，通过对应领域core能力执行或发送带oneshot的具体领域请求；保留本次请求与回合关联。中止不进入MCL FIFO，不关闭队列；工具调用不能只在MCL发出时检查turn，最终受理还要由工具System复检。
+    行为：按effect参数约束求值，通过对应领域core能力执行或发送带oneshot的具体领域请求；保留本次请求与回合关联。inference不带工具选择参数，工具调用不带可见alias列表；工具定义和查找唯一来自目标Agent的Tools。中止不进入MCL FIFO，不关闭队列，最终受理由各System复检turn。
 
-execute_tools(context: CommandContext, messages: Vec<Value>, aliases: Vec<String>) -> Future<Output = Result<MclValue, MclError>>
-    行为：先验证整批调用身份，一次性发出多个ToolExecuteRequest，各自携带Agent、原turn、call_id及独立oneshot，所有请求均先发出，再使用join_all等待独立oneshot并按输入顺序返回；等待顺序不串行化执行。
+execute_tools(context: CommandContext, messages: Vec<Value>) -> Future<Output = Result<MclValue, MclError>>
+    行为：验证调用身份后，一次性发出多个ToolExecuteRequest，各自携带Agent、原turn、call_id及独立oneshot；工具System按请求名称查当前Tools，存在则调用，不存在则返回对应工具错误。所有请求先发出，再用join_all收齐并按输入顺序返回，不串行化执行，不维护广告快照或第二份准入名单。
     中止前未被工具System受理的请求直接回中止结果；已经受理且未return的任务由ToolTasks强制return并清理，使本闭包立即获得各调用的中止结果，不再等工具自然return。中止获胜后迟到Return无法再次交付，正常return先获胜的结果保留且后台任务不被杀。
+    同一Lua资源不同alias仍各自创建独立任务，MCL不按path或owner将它们串行化；A/B之间的请求路由属于Lua工具内部协议。所有者失效导致的依赖调用错误保留各自call_id，及时返回failed，不堵整批。
     可识别工具调用错误始终返回对应failed工具消息；整批收齐关联后交Driver，Driver显式结束回合。不得通过关闭整条MCL队列或杀Driver来中止。
 ```
 

@@ -13,6 +13,16 @@ System分别列出事件、闭包结果、提交闭包及oneshot回复，使用R
 
 Margatroid领域使用原生Axum装配及普通异步闭包。网络服务属于本应用基础设施；mecs仅提供通用运行与异步事件、闭包能力，不提供服务器封装或长期任务专用接口。
 
+## 工具定义来源
+
+```text
+本节为本轮确认的目标设计，尚未改动源码。
+每次推理直接遍历该Agent的Tools，为每条记录构造模型工具schema；Tools为空则没有工具。
+InferenceRequest不接收工具alias列表，不存在额外选择清单、visible过滤、配置并集或广告授权快照。
+Inference只使用Tools中的alias、description、input_schema，不读取工具资源文件来选择定义，不执行或依赖工具脚本，不获取工具路由标记。
+工具调用由工具执行侧按请求名称查当前Agent的Tools，存在则调用，不存在则返回工具错误。Inference不维护第二份工具准入集合。
+```
+
 # 板块格式
 
 ```text
@@ -78,7 +88,6 @@ InferenceRequest：推理请求，公开事件
     agent: Entity
     turn: String
     messages: Vec<InferenceMessage>
-    tools: Vec<String>--已导入工具alias，空数组表示无工具
     config: InferenceParameters
     cancel: CancellationToken
     reply: Arc<Mutex<Option<oneshot::Sender<Result<InferenceResponse, InferenceError>>>>>
@@ -121,7 +130,8 @@ handle_inference(world: &mut World, request: InferenceRequest)
     行为：
         认领reply，检查完整Agent Entity及Working；先检查当前turn，再检查ActiveInference及重叠推理。
         在System实际受理时检查Agent当前turn；已被中止清空或与request.turn不匹配，直接返回空assistant的Cancelled响应（正文、reasoning、tool_calls、replay及usage均空），不创建HTTP或监督任务。
-        从ModelRoutes选定路由，从Tools取得各alias路径；拒绝重复或不存在的alias。
+        从ModelRoutes选定路由；直接遍历当前Agent的Tools，将每条记录的alias、description及input_schema构造成此次请求的工具定义；不增加其他工具选择或过滤步骤。
+        复制定义只为本次异步请求持有owned数据，不建立长期缓存或调用授权快照；后续工具调用独立查询当前Tools。
         从client_core取得本次已注册webui的ClientSender快照，固定对外身份；同步登记尚未启动的共享InferenceHandle，防止异步提交窗口受理重叠请求；通过send_async_closure提交launch_inference。
         launch_inference在闭包内部创建监督任务并把JoinHandle交给同一共享句柄，不依赖全局执行器。ClientFrame::Text只携带已编码分片，不导入Axum消息、DTO插件或服务器框架发送器。
         提交失败回复错误。
@@ -134,7 +144,8 @@ launch_inference(context: InferenceContext) -> Future<Output = Result<InferenceL
 
 supervise_inference(context: InferenceContext) -> Future<Output = ()>
     行为：
-        blocking worker读取本次工具定义，校验消息及参数，构造DomainRequest。
+        校验消息及参数，用受理时从Tools构造的工具定义组成DomainRequest；不读取工具清单、脚本或Agent配置文件。
+        将通用定义适配为所选模型API格式；不解释工具实现、owner_task_id或binding，不在返回后维护额外的工具选择清单。
         编码HTTP请求，建立有界mpsc::channel<ProviderFragment>并启动read_provider。
         运行receive_stream，以其累积器作为唯一内容结果来源。
         正常结束校验协议终态；中止直接使用Agent上ActiveInference保存的当前取消句柄，控制本次分片接收闭包，先冻结接受门、关闭接收端并请求worker退出；不等工具或推理自然完成才取消。
@@ -167,7 +178,7 @@ build_request(input: DomainRequest, route: ModelRoute) -> Result<ProviderHttpReq
 
 私有：
 ```text
-InferenceContext：请求执行材料--原请求及reply、路由、工具路径、HTTP客户端、取消能力和推流投影
+InferenceContext：请求执行材料--原请求及reply、路由、本次遍历Tools构造的owned工具定义、HTTP客户端、取消能力和推流投影；仅通用alias/description/input_schema进入DomainRequest，工具实现及私有标记不进入模型协议
 ProviderContext：上游材料--HTTP请求、格式解码器、取消能力及读取预算
 StreamContext：接收材料--Arc<Mutex<StreamGate>>、取消能力及StreamDelivery
 StreamDelivery：前端出口--Vec<client_core::ClientSender>固定快照、请求ID、对外地址和不透明实例标识；只发送ClientFrame，不持有WebSocket或访问DTO连接表。
