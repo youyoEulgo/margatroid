@@ -76,7 +76,7 @@ interface Wire {
   id: string;
   message: Record<string, unknown>;
 }
-function setup(snapshot: BackendState = state, autoSettings = true) {
+function setup(snapshot: BackendState = state) {
   setActivePinia(createPinia());
   const store = useWorkbenchStore();
   const original = globalThis.WebSocket;
@@ -94,16 +94,7 @@ function setup(snapshot: BackendState = state, autoSettings = true) {
     }
     close() {}
     send(raw: string) {
-      const wire = JSON.parse(raw) as Wire;
-      sent.push(wire);
-      if (autoSettings && wire.message.command === 'CONFIG GET')
-        store.handleServerMessage({
-          type: 'mcl.command_result',
-          id: wire.id,
-          source: 'client:local/ui:latest',
-          target: String(wire.message.agent),
-          result: { Ok: { Config: { visible_tools: ['bash'] } } },
-        });
+      sent.push(JSON.parse(raw) as Wire);
     }
   }
   globalThis.WebSocket = Socket as unknown as typeof WebSocket;
@@ -858,70 +849,9 @@ test('sidebar renders configured members without mutation menus and emits explic
   }
 });
 
-async function loadResources(env: ReturnType<typeof setup>, aliases = ['bash']) {
-  const read = env.sent.filter((wire) => wire.message.command === 'CONFIG GET').at(-1)!;
-  assert.ok(read);
-  env.reply(read.id, { Config: { visible_tools: aliases } }, String(read.message.agent));
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  await new Promise<void>((resolve) => setImmediate(resolve));
-}
-test('resources read CONFIG once per snapshot and change visibility only after matching acknowledgement', async () => {
-  const env = setup(state, false);
-  try {
-    assert.equal(env.store.resourceSettingsReady, false);
-    assert.deepEqual(
-      env.store.resourceVisibility.map((entry) => entry.resource),
-      ['bash', 'read_file'],
-    );
-    await loadResources(env);
-    assert.equal(env.store.resourceSettingsReady, true);
-    const count = env.sent.length;
-    env.receive({ type: 'state.sync', state });
-    assert.equal(env.sent.length, count);
-    const updating = env.store.setResourceVisibility('read_file', true);
-    const write = env.sent.at(-1)!;
-    assert.deepEqual(write.message, {
-      workspace: workspace.id,
-      agent: workspace.agents[0],
-      command: 'CONFIG SET ? ?',
-      arguments: ['visible_tools', ['bash', 'read_file']],
-    });
-    assert.equal(env.store.resourceVisibility[1]!.visible, false);
-    assert.equal(env.store.resourceSettingsPending, true);
-    const stale = assert.rejects(updating, /does not match/);
-    env.reply(write.id, 'Unit', 'agent:wrong');
-    await stale;
-    assert.equal(env.store.resourceVisibility[1]!.visible, false);
-    assert.equal(env.store.resourceSettingsPending, false);
-    const retrying = env.store.setResourceVisibility('read_file', true);
-    env.reply(env.sent.at(-1)!.id);
-    await retrying;
-    assert.equal(env.store.resourceVisibility[1]!.visible, true);
-    const failed = env.store.setResourceVisibility('bash', false);
-    const rejected = assert.rejects(failed, /denied/);
-    env.receive({
-      type: 'mcl.command_result',
-      id: env.sent.at(-1)!.id,
-      source: 'client:local/ui:latest',
-      target: workspace.agents[0],
-      result: {
-        Ok: {
-          Error: { type: 'error', message: 'denied', request_id: 'internal-denied' },
-        },
-      },
-    });
-    await rejected;
-    assert.equal(env.store.resourceVisibility[0]!.visible, true);
-    // A failed command is reported to its caller, not recorded as an Agent fault.
-    assert.equal(env.store.lastFailures.size, 0);
-  } finally {
-    env.cleanup();
-  }
-});
 test('sandbox CONFIG then EFFECT retain original target and radio follows actual runtime', async () => {
-  const env = setup(working(), false);
+  const env = setup(working());
   try {
-    await loadResources(env);
     const updating = env.store.setSandbox('safe');
     const write = env.sent.at(-1)!;
     assert.deepEqual(write.message.arguments, ['sandbox', ['safe']]);
@@ -958,18 +888,9 @@ test('sandbox CONFIG then EFFECT retain original target and radio follows actual
     env.cleanup();
   }
 });
-test('stale resource receipts cannot update replacement VM or dispatch sandbox effect after route changes', async () => {
-  const env = setup(state, false);
+test('a sandbox write is rejected when the route changes before its acknowledgement', async () => {
+  const env = setup();
   try {
-    const oldRead = env.sent.at(-1)!;
-    env.receive({
-      type: 'state.sync',
-      state: { ...state, agents: [{ ...state.agents[0]!, agent_instance: 'replacement' }] },
-    });
-    env.reply(oldRead.id, { Config: { visible_tools: ['read_file'] } });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(env.store.resourceSettingsReady, false);
-    await loadResources(env);
     const updating = env.store.setSandbox('safe');
     const rejected = assert.rejects(updating, /changed/);
     const write = env.sent.at(-1)!;
@@ -978,7 +899,6 @@ test('stale resource receipts cannot update replacement VM or dispatch sandbox e
     env.reply(write.id);
     await rejected;
     assert.ok(!env.sent.some((wire) => wire.message.command === 'EFFECT sandbox_use ?'));
-    assert.equal(env.store.resourceSettingsReady, false);
   } finally {
     env.cleanup();
   }
@@ -1012,39 +932,9 @@ test('a failed wake retries only the wake for the same message', async () => {
     env.cleanup();
   }
 });
-test('a failed CONFIG GET stays retryable and missing visible_tools means no tool is visible', async () => {
-  const env = setup(state, false);
-  try {
-    const read = env.sent.filter((wire) => wire.message.command === 'CONFIG GET').at(-1)!;
-    env.receive({
-      type: 'request.failed',
-      id: read.id,
-      error: { kind: 'Timeout', message: 'read timed out' },
-    });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(env.store.resourceSettingsReady, false);
-    assert.match(env.store.resourceError, /timed out/);
-    assert.equal(env.store.connectionError, '');
-    env.store.retryResourceSettings();
-    const retry = env.sent.filter((wire) => wire.message.command === 'CONFIG GET').at(-1)!;
-    assert.notEqual(retry.id, read.id);
-    env.reply(retry.id, { Config: {} });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(env.store.resourceSettingsReady, true);
-    assert.equal(env.store.resourceError, '');
-    assert.deepEqual(
-      env.store.resourceVisibility.map((entry) => entry.visible),
-      [false, false],
-    );
-  } finally {
-    env.cleanup();
-  }
-});
 test('a failed sandbox effect re-reads CONFIG and reports saved-but-not-applied', async () => {
-  const env = setup(working(), false);
+  const env = setup(working());
   try {
-    await loadResources(env);
-    const reads = env.sent.filter((wire) => wire.message.command === 'CONFIG GET').length;
     const updating = env.store.setSandbox('safe');
     env.reply(env.sent.at(-1)!.id);
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1057,7 +947,6 @@ test('a failed sandbox effect re-reads CONFIG and reports saved-but-not-applied'
       error: { kind: 'Denied', message: 'effect denied' },
     });
     await assert.rejects(updating, /Sandbox saved but not activated: effect denied/);
-    assert.ok(env.sent.filter((wire) => wire.message.command === 'CONFIG GET').length > reads);
   } finally {
     env.cleanup();
   }
@@ -1076,7 +965,6 @@ test('workspace.stopped clears the selected runtime route immediately', () => {
     assert.equal(env.store.selectedAgent, null);
     assert.equal(env.store.visibleMessages.length, 0);
     assert.equal(env.store.sandboxOptions.options.length, 0);
-    assert.equal(env.store.resourceSettingsReady, false);
     env.receive({ type: 'state.sync', state: { ...state, workspaces: [], agents: [] } });
     assert.equal(env.store.runtimeWorkspaces.length, 0);
   } finally {
@@ -1249,14 +1137,13 @@ test('a non-Unit INJECT acknowledgement is treated as an unknown outcome', async
     env.cleanup();
   }
 });
-test('a non-Unit CONFIG SET is not treated as saved', async () => {
-  const env = setup(state, false);
+test('a non-Unit sandbox CONFIG SET is not treated as saved', async () => {
+  const env = setup(state);
   try {
-    await loadResources(env);
-    const updating = env.store.setResourceVisibility('read_file', true);
+    const updating = env.store.setSandbox('safe');
     env.reply(env.sent.at(-1)!.id, 'Config');
     await assert.rejects(updating, /did not acknowledge Unit/);
-    assert.equal(env.store.resourceVisibility[1]!.visible, false);
+    assert.ok(!env.sent.some((wire) => wire.message.command === 'EFFECT sandbox_use ?'));
   } finally {
     env.cleanup();
   }

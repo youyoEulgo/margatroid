@@ -6,8 +6,6 @@ import {
   Check,
   ChevronRight,
   Copy,
-  Eye,
-  EyeOff,
   Circle,
   CircleDot,
   ShieldCheck,
@@ -72,12 +70,9 @@ const {
   abortPending,
   selectedAgentWorking,
   sidebarTree,
-  resourceVisibility,
+  toolOptions,
   sandboxOptions,
-  resourceSettingsPending,
   resourceWriteInFlight,
-  resourceSettingsReady,
-  resourceError,
   visibleMessages,
   logs,
   lastFailures,
@@ -163,7 +158,6 @@ let composerObserver: ResizeObserver | undefined;
 const toolManager = ref<HTMLElement | null>(null);
 const uploadControl = ref<HTMLElement | null>(null);
 const toolsOpen = ref(false);
-const toolResources = computed(() => resourceVisibility.value);
 const sidebarOpen = ref(false);
 const activityOpen = ref(false);
 const activityTab = ref<'activity' | 'mcl'>('activity');
@@ -326,10 +320,6 @@ function onComposerEnter(event: KeyboardEvent) {
   void submitMessage();
 }
 
-function retryResourceSettings() {
-  store.retryResourceSettings();
-}
-
 onMounted(() => {
   if (!selectedWorkspace.value && workspaces.value[0]) {
     store.selectWorkspace(workspaces.value[0].path);
@@ -410,10 +400,6 @@ function restartWorkspace(path: string) {
 
 function stopWorkspace(address: string) {
   void runWorkspaceAction(() => store.stopWorkspace(address));
-}
-
-function toggleResourceVisibility(resource: string, visible: boolean) {
-  void runAgentAction(() => store.setResourceVisibility(resource, visible));
 }
 
 function abortTurn() {
@@ -1031,10 +1017,6 @@ const conversationRows = computed<ConversationRow[]>(() => {
           </div>
 
           <div v-if="toolsOpen" id="tool-manager-panel" class="tool-manager-panel">
-            <div v-if="resourceError" class="tool-resource-error" role="alert">
-              <span>{{ resourceError }}</span>
-              <button type="button" @click="retryResourceSettings">Retry</button>
-            </div>
             <section class="tool-resource-group">
               <div class="tool-resource-heading">
                 <span>Sandbox</span>
@@ -1077,38 +1059,15 @@ const conversationRows = computed<ConversationRow[]>(() => {
             <section class="tool-resource-group">
               <div class="tool-resource-heading">
                 <span>Tools</span>
-                <span>{{ toolResources.length }}</span>
+                <span>{{ toolOptions.length }}</span>
               </div>
-              <div v-if="toolResources.length" class="tool-resource-list">
-                <div v-for="entry in toolResources" :key="entry.resource" class="tool-resource-row">
-                  <span :class="['resource-state-dot', { 'is-active': entry.visible }]" />
-                  <code :title="entry.resource">{{ entry.resource }}</code>
-                  <button
-                    class="tool-row-action"
-                    type="button"
-                    :title="entry.visible ? 'Remove visibility' : 'Inject visibility'"
-                    :aria-label="entry.visible ? 'Remove visibility' : 'Inject visibility'"
-                    :disabled="
-                      connectionStatus !== 'online' ||
-                      !stateReady ||
-                      !selectedAgentReady ||
-                      resourceSettingsPending ||
-                      !resourceSettingsReady
-                    "
-                    @click="toggleResourceVisibility(entry.resource, !entry.visible)"
-                  >
-                    <Eye v-if="entry.visible" :size="14" />
-                    <EyeOff v-else :size="14" />
-                  </button>
+              <div v-if="toolOptions.length" class="tool-resource-list">
+                <div v-for="alias in toolOptions" :key="alias" class="tool-resource-row">
+                  <Wrench :size="14" />
+                  <code :title="alias">{{ alias }}</code>
                 </div>
               </div>
               <span v-else class="tool-resource-empty">None</span>
-              <span
-                v-if="toolResources.length && !resourceSettingsReady"
-                class="tool-resource-empty"
-              >
-                {{ resourceSettingsPending ? 'Loading settings…' : 'Visibility unavailable' }}
-              </span>
             </section>
           </div>
         </div>

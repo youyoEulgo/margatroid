@@ -459,24 +459,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     string,
     { workspace: string; agent: string; instance: string; content: string; images: UserImage[] }
   >();
-  const resourceSettings = ref<{ snapshot: string; visibleTools: string[] } | null>(null);
-  const resourceReadPending = ref('');
   const resourceWritePending = ref('');
-  const resourceSnapshot = ref('');
-  const resourceError = ref('');
-  const resourceSettingsReady = computed(
-    () => !!resourceSettings.value && resourceSettings.value.snapshot === resourceSnapshot.value,
-  );
-  const resourceSettingsPending = computed(
-    () => !!resourceReadPending.value || !!resourceWritePending.value,
-  );
   const resourceWriteInFlight = computed(() => !!resourceWritePending.value);
-  const resourceVisibility = computed(() =>
-    (selectedAgentState.value?.tools ?? []).map((alias) => ({
-      resource: alias,
-      visible: resourceSettingsReady.value && resourceSettings.value!.visibleTools.includes(alias),
-    })),
-  );
+  // Tools are advertised by the Agent state and are read-only in this panel.
+  const toolOptions = computed(() => selectedAgentState.value?.tools ?? []);
   const sandboxOptions = computed(() => ({
     options: selectedAgentState.value?.sandboxes ?? [],
     activated: selectedAgentState.value?.sandbox ? [selectedAgentState.value.sandbox] : [],
@@ -661,11 +647,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     pending.clear();
   }
   function resourcesReset() {
-    resourceSnapshot.value = '';
-    resourceSettings.value = null;
-    resourceReadPending.value = '';
     resourceWritePending.value = '';
-    resourceError.value = '';
   }
   function closeSocket() {
     if (socket) {
@@ -751,7 +733,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedAgent.value = agents.length === 1 ? agents[0]! : null;
     if (selectedWorkspaceKey.value) expandWorkspace(selectedWorkspaceKey.value);
     queryHistory();
-    refreshResourceSettings();
   }
   function selectAgent(agent: string | null, path = selectedWorkspaceKey.value) {
     if (path !== selectedWorkspaceKey.value) selectWorkspace(path);
@@ -760,7 +741,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedAgent.value = accepted;
     autoSelectSingle = accepted !== null;
     queryHistory();
-    refreshResourceSettings();
   }
   function expandWorkspace(path: string) {
     expandedWorkspaceKeys.value = new Set(expandedWorkspaceKeys.value).add(path);
@@ -873,67 +853,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (selectedAgentState.value?.agent_instance !== target.instance)
       throw new Error('Selected agent instance changed during resource settings update');
   }
-  function refreshResourceSettings(force = false) {
-    const target = currentTarget(false);
-    const snapshot = resourceTargetSnapshot(target);
-    if (!force && snapshot === resourceSnapshot.value) return;
-    resourceSnapshot.value = snapshot;
-    resourceSettings.value = null;
-    resourceReadPending.value = snapshot;
-    resourceError.value = '';
-    if (!target || !snapshot) return;
-    void executeFor(target, 'CONFIG GET')
-      .then((result) => {
-        if (resourceSnapshot.value !== snapshot) return;
-        assertTarget(target, snapshot);
-        if (!isRecord(result) || !isRecord(result.Config))
-          throw new Error('Daemon returned invalid resource settings');
-        const aliases = result.Config.visible_tools ?? [];
-        if (!Array.isArray(aliases) || !aliases.every((alias) => typeof alias === 'string'))
-          throw new Error('Daemon returned invalid visible_tools settings');
-        resourceSettings.value = { snapshot, visibleTools: aliases };
-      })
-      .catch((error: unknown) => {
-        if (resourceSnapshot.value !== snapshot) return;
-        // Drop the cached snapshot so a later refresh can retry instead of
-        // leaving the panel permanently disabled after one failed read.
-        resourceSnapshot.value = '';
-        resourceError.value = error instanceof Error ? error.message : String(error);
-      })
-      .finally(() => {
-        if (resourceReadPending.value === snapshot) resourceReadPending.value = '';
-      });
-  }
-  function retryResourceSettings() {
-    refreshResourceSettings(true);
-  }
-  async function setResourceVisibility(alias: string, visible: boolean): Promise<void> {
-    if (resourceSettingsPending.value)
-      throw new Error('Wait for the current resource settings request');
-    if (!resourceSettingsReady.value) throw new Error('Wait for resource settings to load');
-    const target = currentTarget()!;
-    const snapshot = resourceTargetSnapshot(target);
-    assertTarget(target, snapshot);
-    if (!selectedAgentState.value!.tools.includes(alias))
-      throw new Error('Choose an imported tool alias');
-    const settings = resourceSettings.value!;
-    const aliases = [
-      ...new Set(
-        visible
-          ? [...settings.visibleTools, alias]
-          : settings.visibleTools.filter((entry) => entry !== alias),
-      ),
-    ];
-    resourceWritePending.value = snapshot;
-    try {
-      const saved = await executeFor(target, 'CONFIG SET ? ?', ['visible_tools', aliases]);
-      requireUnit(saved, 'CONFIG SET visible_tools');
-      assertTarget(target, snapshot);
-      resourceSettings.value = { snapshot: settings.snapshot, visibleTools: aliases };
-    } finally {
-      if (resourceWritePending.value === snapshot) resourceWritePending.value = '';
-    }
-  }
   async function setSandbox(alias: string | null): Promise<void> {
     if (resourceWritePending.value) throw new Error('Wait for the current sandbox request');
     const target = currentTarget()!;
@@ -958,7 +877,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       // Saved and applied are separate steps: re-read both so the panel shows
       // the actual persisted value and the actual running sandbox.
       queryState();
-      refreshResourceSettings(true);
       throw new Error(
         saved ? `Sandbox saved but not activated: ${message}` : `Sandbox was not saved: ${message}`,
       );
@@ -1213,7 +1131,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         connectionError.value = '';
         reconnectAttempt = 0;
         queryState();
-        refreshResourceSettings();
         break;
       case 'connection.register_failed':
         connectionError.value = errorMessage(event.error);
@@ -1245,7 +1162,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         }
         reconcileSelection();
         reconcileStreams();
-        refreshResourceSettings();
         break;
       case 'workspace.definitions':
         definitions.value = event.definitions;
@@ -1497,14 +1413,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectAgent,
     sendMessage,
     executeMclCommand,
-    resourceVisibility,
+    toolOptions,
     sandboxOptions,
-    resourceSettingsPending,
     resourceWriteInFlight,
-    resourceSettingsReady,
-    resourceError,
-    retryResourceSettings,
-    setResourceVisibility,
     setSandbox,
     clearLogs,
     handleServerMessage,
