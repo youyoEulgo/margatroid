@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "../../../crates/margatroid/tool/plugin/tests/support/shell_client.rs"]
+mod shell_client;
+
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -162,8 +165,15 @@ function configure() return {timeout_ms=0} end
 function execute(arguments, context)
     local child
     if arguments.kind == 'terminal' then
-        child = terminal_open()
+        local client = dofile(context.resource_dir..'/shell.lua')(context)
+        child = client.terminal()
         child:write('/bin/bash ./children.sh terminal\r')
+        local output = ''
+        while not string.find(output, 'CHILDREN_READY', 1, true) do
+            local chunk = child:read()
+            assert(not chunk.eof, 'fixture terminal exited')
+            output = output .. chunk.text
+        end
     else
         child = process_open({program='/bin/bash', arguments={'./children.sh','process'}})
         local output = ''
@@ -179,6 +189,7 @@ function execute(arguments, context)
 end
 "#,
     );
+    shell_client::install_shell(&root.join("tools/local/shutdown/latest"));
     let project = home.join("project");
     write(
         &project,

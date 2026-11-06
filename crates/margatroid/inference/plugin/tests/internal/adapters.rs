@@ -147,7 +147,7 @@ fn historical_replay_is_optional_but_current_response_replay_is_strict() {
         ..Default::default()
     };
     assert_eq!(
-        accumulator.response(&HashSet::new()).unwrap_err().kind,
+        accumulator.response().unwrap_err().kind,
         InferenceErrorKind::ResponseInvalid
     );
 }

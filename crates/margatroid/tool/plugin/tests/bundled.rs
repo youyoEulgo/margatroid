@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/shell_client.rs"]
+mod shell_client;
+
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -103,6 +106,7 @@ impl Fixture {
         };
         let directory = self.root.path().join(alias);
         std::fs::create_dir_all(&directory).unwrap();
+        shell_client::install_shell(&directory);
         std::fs::write(
             directory.join("tool.toml"),
             "schema_version=1\ndescription='test'\n",
@@ -216,6 +220,9 @@ impl Fixture {
             .join("latest/tool.toml")
             .canonicalize()
             .unwrap();
+        let directory = self.root.path().join("resources").join(alias);
+        shell_client::copy_resource(path.parent().unwrap(), &directory);
+        let path = directory.join("tool.toml");
         if !self.app.world().contains_component::<Tools>(self.agent) {
             self.app
                 .world_mut()
@@ -520,14 +527,24 @@ fn task_control_tools_pass_structured_messages_null_and_shared_cache_cursors() {
     }
     assert!(!f.call("task-finish", json!({"task_id":"worker"})).failed);
     f.removed("worker");
-    let read = f.call("task-read", json!({"task_id":"worker"}));
-    assert!(read.failed);
-    assert!(f.call("task-finish", json!({"task_id":"worker"})).failed);
-    assert!(
-        f.call("task-send", json!({"task_id":"worker","value":"late"}))
-            .failed
-    );
-    assert!(f.call("task-read", json!({"task_id":"unknown"})).failed);
+    for (index, (alias, arguments)) in [
+        ("task-read", json!({"task_id":"worker"})),
+        ("task-finish", json!({"task_id":"worker"})),
+        ("task-send", json!({"task_id":"worker","value":"late"})),
+        ("task-read", json!({"task_id":"unknown"})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        f.bundle(alias);
+        let id = format!("missing-{index}");
+        let reply = f.execute(&id, alias, arguments);
+        let failure = f.response(reply).unwrap_err();
+        assert_eq!(failure.kind, tool_core::ToolErrorKind::TaskMissing);
+        assert_eq!(failure.to_string(), "TaskMissing: tool task not found");
+        assert!(!failure.message.contains("stack traceback"));
+        f.removed(&id);
+    }
 }
 
 #[test]
@@ -828,4 +845,34 @@ fn one_shot_graphics_output_is_bounded_without_exceeding_result_encoding_budget(
         .contains("[output truncated at the size limit]"));
     assert!(result.content.contains("[exit code: 0]"));
     assert!(result.content.len() < 140000);
+}
+
+#[test]
+fn failed_tool_replies_omit_lua_traces_but_success_output_is_unchanged() {
+    let mut f = Fixture::new();
+    let text = "TaskMissing: example\nstack traceback:\n\t[C]: in function 'task_read'";
+    for (alias, ok) in [("reported-failure", false), ("reported-success", true)] {
+        let literal = serde_json::to_string(text).unwrap();
+        f.tool(alias, &format!("function execute() task_return({{ok={ok},content={literal}}}); task_finish(context.task_id) end"));
+        let reply = f.execute(alias, alias, json!({}));
+        let response = f.response(reply).unwrap();
+        assert_eq!(response.call_id, format!("call-{alias}"));
+        assert_eq!(response.alias, alias);
+        assert_eq!(response.failed, !ok);
+        assert_eq!(
+            response.content,
+            if ok { text } else { "TaskMissing: example" }
+        );
+        f.removed(alias);
+    }
+    f.tool(
+        "lua-error",
+        "function execute() error('operator failure') end",
+    );
+    let reply = f.execute("lua-error", "lua-error", json!({}));
+    let failure = f.response(reply).unwrap_err();
+    assert_eq!(failure.kind, tool_core::ToolErrorKind::ExecutionFailed);
+    assert!(failure.message.contains("operator failure"));
+    assert!(!failure.message.contains("stack traceback:"));
+    f.removed("lua-error");
 }

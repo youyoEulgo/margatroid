@@ -565,7 +565,7 @@ fn invalid_turn_and_stale_entity_never_find_a_replacement_by_address() {
     request.turn = "old".into();
     assert_eq!(
         fixture.run(request, reply).unwrap().stop_reason,
-        InferenceStopReason::Cancelled
+        InferenceStopReason::Completed
     );
     assert!(
         fixture

@@ -17,13 +17,12 @@ base64 = "0.22"
 futures-util = "0.3"
 jsonschema = { version = "0.33", default-features = false }
 mlua = { version = "0.11", features = ["lua54", "vendored", "async", "serialize", "send"] }
-nix = { version = "0.31.2", features = ["process", "signal", "term", "fs"] }
+nix = { version = "0.31.2", features = ["process", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tempfile = "3"
-vt100 = "0.16"
 
 [[bin]]
 name = "tool_runner"

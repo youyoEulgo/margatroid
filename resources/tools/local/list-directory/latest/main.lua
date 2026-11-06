@@ -48,15 +48,16 @@ local function resolve_path(path, project_root)
     return project_root .. separator .. path
 end
 
-local function list_entries(path)
+local function list_entries(path, context)
     local separator = package.config:sub(1, 1)
     local command = table.concat({
         "find", shell_quote(path), "-maxdepth", "1", "-mindepth", "1",
         "-printf", shell_quote("%y\t%f\\0"),
     }, " ")
 
-    -- The host shell owns timeout and output budgets.
-    local result = margatroid().shell(command, { max_output_bytes = MAX_OUTPUT_BYTES })
+    -- Task configuration owns timeout; the private client bounds command output.
+    local client = dofile(context.resource_dir .. "/shell.lua")(context)
+    local result = client.exec(command, { max_output_bytes = MAX_OUTPUT_BYTES })
     if result.truncated then
         return nil, "directory listing exceeded the size limit"
     end
@@ -92,11 +93,11 @@ end
 local function perform(arguments, context)
     local requested_path = arguments.path or "."
     local path = resolve_path(requested_path, context.project_root)
-    local entries, failure = list_entries(path)
+    local entries, failure = list_entries(path, context)
     if not entries then
         return report(nil, failure)
     end
-    return report(#entries == 0 and "[]" or margatroid().json.encode(entries))
+    return report(#entries == 0 and "[]" or json.encode(entries))
 end
 
 function execute(arguments, context)

@@ -798,7 +798,7 @@ async fn imports_validate_dependencies_kind_and_cross_category_aliases_and_rerea
 }
 
 #[tokio::test]
-async fn inference_converts_legacy_message_shapes_and_excludes_cancelled_assistants() {
+async fn inference_converts_legacy_message_shapes_and_preserves_unknown_stop_reason_history() {
     let mut fixture = Fixture::new();
     fixture.add_tool("bash");
     fixture.command("EFFECT start_turn", vec![]).await.unwrap();
@@ -818,7 +818,10 @@ async fn inference_converts_legacy_message_shapes_and_excludes_cancelled_assista
     assert_eq!(stop_reason, "completed");
     let records = fixture.inference.lock().unwrap().clone();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].messages.len(), 3);
+    assert_eq!(records[0].messages.len(), 4);
+    assert!(
+        matches!(&records[0].messages[3], InferenceMessage::Assistant { content, .. } if content.as_deref() == Some("cancelled fragment"))
+    );
     assert!(
         matches!(&records[0].messages[1], InferenceMessage::Assistant { tool_calls, .. } if tool_calls[0].name == "bash" && tool_calls[0].arguments == json!({"x": 1}))
     );
@@ -839,14 +842,92 @@ async fn inference_converts_legacy_message_shapes_and_excludes_cancelled_assista
 }
 
 #[tokio::test]
-async fn no_turn_returns_normal_cancelled_results_without_submitting_domains() {
+async fn real_http_unknown_tool_is_preserved_then_fails_current_tool_admission() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut header = Vec::new();
+        let mut byte = [0];
+        while !header.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            header.push(byte[0]);
+        }
+        let length = String::from_utf8(header)
+            .unwrap()
+            .to_ascii_lowercase()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("content-length:")
+                    .map(|value| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["tools"][0]["function"]["name"], "bash");
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        let trace = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"unknown-call","function":{"name":"unadvertised_tool","arguments":"{\"value\":\"kept\"}"}}]},"finish_reason":"tool_calls"}]})
+        );
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{trace}", trace.len()).as_bytes()).await.unwrap();
+    });
+    let mut fixture = Fixture::new();
+    fixture.add_tool("bash");
+    fixture.auto_inference.store(false, Ordering::Release);
+    let config = fixture.root.path().join("http-models.toml");
+    fs::write(&config, format!("[[models]]\nid='test/model'\nmodel='upstream'\nprovider='openai'\napi_type='chat_completions'\nbase_url='{url}'\napi_key='fixture'\ncontext_window='128k'\n")).unwrap();
+    fixture
+        .app
+        .add_plugin(inference_plugin::InferencePlugin::open(&config).unwrap());
+    let _ready = fixture.vm("http-driver");
+    fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    let MclValue::Inference {
+        message,
+        stop_reason,
+    } = fixture
+        .command("EFFECT inference ?", vec![json!([user("call the tool")])])
+        .await
+        .unwrap()
+    else {
+        panic!("inference must accept a structurally valid unknown tool")
+    };
+    assert_eq!(stop_reason, "tool_calls");
+    assert_eq!(message["type"], "assistant");
+    assert_eq!(message["tool_calls"][0]["id"], "unknown-call");
+    assert_eq!(message["tool_calls"][0]["tool_name"], "unadvertised_tool");
+    assert_eq!(
+        serde_json::from_str::<Value>(message["tool_calls"][0]["arguments"].as_str().unwrap())
+            .unwrap(),
+        json!({"value":"kept"})
+    );
+    let results = messages(
+        fixture
+            .command("EFFECT tool_call ?", vec![json!([message])])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["tool_call_id"], "unknown-call");
+    assert_eq!(results[0]["tool_name"], "unadvertised_tool");
+    assert_eq!(results[0]["failed"], true);
+    assert_eq!(results[0]["content"], "tool is not imported");
+    assert!(fixture.tools.lock().unwrap().is_empty());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn no_turn_returns_normal_completed_results_without_submitting_domains() {
     let mut fixture = Fixture::new();
     let result = fixture
         .command("EFFECT inference ?", vec![json!([user("question")])])
         .await
         .unwrap();
     assert!(
-        matches!(result, MclValue::Inference { stop_reason, .. } if stop_reason == "cancelled")
+        matches!(result, MclValue::Inference { stop_reason, .. } if stop_reason == "completed")
     );
     let calls = json!([{"type": "assistant", "content": null, "tool_calls": [{"id": "call", "tool_name": "bash", "arguments": "{}"}]}]);
     let result = messages(
@@ -888,7 +969,7 @@ async fn tool_results_preserve_order_and_return_without_waiting_for_tool_vm_end(
             .collect::<Vec<_>>(),
         ["first", "hidden", "last"]
     );
-    assert_eq!(results[1]["content"], "tool alias is not imported");
+    assert_eq!(results[1]["content"], "tool is not imported");
     assert_eq!(results[1]["failed"], true);
     assert!(
         fixture
@@ -1087,7 +1168,7 @@ async fn closing_queue_cancels_domain_and_waits_for_reply_before_drain() {
         .unwrap()
         .take()
         .unwrap()
-        .send(Ok(InferenceResponse::cancelled()))
+        .send(Ok(InferenceResponse::empty_completed()))
         .unwrap();
     drive(&mut fixture.app, &mut first).await.unwrap();
     assert_eq!(

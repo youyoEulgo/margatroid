@@ -180,24 +180,7 @@ async fn cancelled_partial_write_resumes_same_frame_and_rejects_different_bytes(
 #[tokio::test]
 async fn lua_await_any_concurrently_reads_stderr_waits_and_writes_one_session() {
     let (lua, registry) = setup(ToolExecutionLimits::default());
-    let root = std::env::current_dir().unwrap();
-    let request = crate::types::RunnerRequest {
-        protocol_version: 1,
-        program: String::new(),
-        arguments: serde_json::json!({}),
-        context: crate::types::ToolContext {
-            task_id: "process-test".into(),
-            call_id: "call".into(),
-            alias: "process".into(),
-            owner_task_id: None,
-            binding: None,
-            resource_dir: root.clone(),
-            project_root: root.clone(),
-            temp_dir: root,
-        },
-        limits: ToolExecutionLimits::default(),
-    };
-    crate::handler::install_terminal(&lua, &request).unwrap();
+    crate::handler::install_await_any(&lua).unwrap();
     let result = tokio::time::timeout(Duration::from_secs(5), lua.load(r#"
         local p=process_open({program='/usr/bin/python3', arguments={'-u','-c',
             'import sys; b=sys.stdin.buffer.read(4); sys.stdout.buffer.write(b); sys.stderr.buffer.write(b)'}})

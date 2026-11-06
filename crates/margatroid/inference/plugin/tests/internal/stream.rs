@@ -166,8 +166,8 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
     let context = InferenceContext {
         request,
         reply: Some(reply),
-        route: route(url),
-        tools: vec![],
+        http_request: Some(outbound_to(url)),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(180),
         client: reqwest::Client::new(),
         gate: gate.clone(),
         delivery: delivery(),
@@ -209,7 +209,7 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
         .unwrap()
         .unwrap();
     let response = received.await.unwrap().unwrap();
-    assert_eq!(response.stop_reason, InferenceStopReason::Cancelled);
+    assert_eq!(response.stop_reason, InferenceStopReason::Completed);
     assert_eq!(response.content.as_deref(), Some("accepted"));
     assert!(response.tool_calls.is_empty());
     assert_eq!(response.replay, None);
@@ -231,8 +231,8 @@ async fn provider_error_replies_before_stalled_cleanup_and_retains_active_handle
     let task = tokio::spawn(supervise_inference(InferenceContext {
         request: input,
         reply: Some(reply),
-        route: route(url),
-        tools: vec![],
+        http_request: Some(outbound_to(url)),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(180),
         client: reqwest::Client::new(),
         gate: gate.clone(),
         delivery: delivery(),
@@ -317,8 +317,8 @@ async fn cancellation_cleanup_budget_replies_error_and_keeps_real_join_active() 
     let task = tokio::spawn(supervise_inference(InferenceContext {
         request: input,
         reply: Some(reply),
-        route: route(url),
-        tools: vec![],
+        http_request: Some(outbound_to(url)),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(180),
         client: reqwest::Client::new(),
         gate: gate.clone(),
         delivery: delivery(),
@@ -405,8 +405,8 @@ async fn real_cleanup_wakes_matching_driver_only_after_supervisor_finishes() {
     let task = tokio::spawn(supervise_inference(InferenceContext {
         request: input,
         reply: Some(reply),
-        route: route(url),
-        tools: vec![],
+        http_request: Some(outbound_to(url)),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(180),
         client: reqwest::Client::new(),
         gate: Arc::new(Mutex::new(StreamGate::default())),
         delivery: delivery(),
@@ -634,11 +634,7 @@ fn responses_completion_cannot_replace_the_streamed_text() {
     );
 }
 
-fn decode_events(
-    format: ApiFormat,
-    events: &[Value],
-    tools: &[&str],
-) -> Result<InferenceResponse, InferenceError> {
+fn decode_events(format: ApiFormat, events: &[Value]) -> Result<InferenceResponse, InferenceError> {
     let trace = events
         .iter()
         .map(|event| {
@@ -658,7 +654,7 @@ fn decode_events(
     for fragment in decoder.finish()? {
         accumulator.accept(fragment)?;
     }
-    accumulator.response(&tools.iter().map(|name| name.to_string()).collect())
+    accumulator.response()
 }
 
 #[test]
@@ -674,7 +670,7 @@ fn messages_signed_reasoning_survives_byte_boundaries_and_replays_as_messages() 
         json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}),
         json!({"type":"message_stop"}),
     ];
-    let result = decode_events(ApiFormat::Messages, &events, &[]).unwrap();
+    let result = decode_events(ApiFormat::Messages, &events).unwrap();
     assert_eq!(result.reasoning.as_deref(), Some("思考"));
     assert_eq!(
         result.replay.as_ref().unwrap()["items"][0]["signature"],
@@ -710,7 +706,7 @@ fn messages_signed_reasoning_survives_byte_boundaries_and_replays_as_messages() 
     let mut unsigned = events;
     unsigned.remove(3);
     assert_eq!(
-        decode_events(ApiFormat::Messages, &unsigned, &[])
+        decode_events(ApiFormat::Messages, &unsigned)
             .unwrap_err()
             .kind,
         Kind::ResponseInvalid
@@ -729,7 +725,7 @@ fn responses_encrypted_reasoning_replay_preserves_full_local_context() {
         json!({"type":"response.output_item.done","output_index":1,"item":{"type":"message","content":[{"type":"output_text","text":"answer"}]}}),
         json!({"type":"response.completed","response":{"status":"completed"}}),
     ];
-    let result = decode_events(ApiFormat::Responses, &events, &[]).unwrap();
+    let result = decode_events(ApiFormat::Responses, &events).unwrap();
     assert_eq!(result.reasoning.as_deref(), Some("thought"));
     assert_eq!(
         result.replay.as_ref().unwrap()["items"][0]["encrypted_content"],
@@ -759,9 +755,9 @@ fn responses_encrypted_reasoning_replay_preserves_full_local_context() {
 }
 
 #[test]
-fn chat_tool_call_deltas_require_complete_arguments_and_visible_alias() {
+fn chat_tool_call_deltas_preserve_unknown_names_with_complete_arguments() {
     let trace = [
-        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call","function":{"name":"visible","arguments":"{\"x\":"}}]},"finish_reason":null}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call","function":{"name":"unknown_tool","arguments":"{\"x\":"}}]},"finish_reason":null}]}),
         json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":"tool_calls"}]}),
     ];
     let mut decoder = FormatDecoder::new(ApiFormat::ChatCompletions);
@@ -778,15 +774,50 @@ fn chat_tool_call_deltas_require_complete_arguments_and_visible_alias() {
         accumulator.accept(fragment).unwrap();
     }
     decoder.finish().unwrap();
-    let result = accumulator
-        .response(&HashSet::from(["visible".into()]))
-        .unwrap();
+    let result = accumulator.response().unwrap();
+    assert_eq!(result.tool_calls[0].name, "unknown_tool");
     assert_eq!(result.tool_calls[0].arguments, json!({"x":1}));
     assert_eq!(result.stop_reason, InferenceStopReason::ToolCalls);
-    assert_eq!(
-        accumulator.response(&HashSet::new()).unwrap_err().kind,
-        Kind::ResponseIncomplete
-    );
+}
+
+#[test]
+fn complete_chat_tool_streams_still_reject_malformed_call_structure() {
+    for (calls, expected) in [
+        (
+            json!([{"index":0,"id":"call","function":{"name":"","arguments":"{}"}}]),
+            "tool call has empty name",
+        ),
+        (
+            json!([{"index":0,"id":"same","function":{"name":"unknown","arguments":"{}"}}, {"index":1,"id":"same","function":{"name":"other_unknown","arguments":"{}"}}]),
+            "duplicate tool call id=\"same\"",
+        ),
+        (
+            json!([{"index":0,"id":"call","function":{"name":"unknown","arguments":"[]"}}]),
+            "tool call arguments must be an object",
+        ),
+        (
+            json!([{"index":0,"id":"call","function":{"name":"unknown","arguments":"{\"x\":"}}]),
+            "incomplete tool arguments",
+        ),
+    ] {
+        let trace = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]})
+        );
+        let mut decoder = FormatDecoder::new(ApiFormat::ChatCompletions);
+        let mut accumulator = ResponseAccumulator::default();
+        for fragment in decoder
+            .push(trace.as_bytes())
+            .unwrap()
+            .into_iter()
+            .chain(decoder.finish().unwrap())
+        {
+            accumulator.accept(fragment).unwrap();
+        }
+        let error = accumulator.response().unwrap_err();
+        assert_eq!(error.kind, Kind::ResponseIncomplete);
+        assert_eq!(error.message, expected);
+    }
 }
 
 #[test]
@@ -797,7 +828,7 @@ fn format_terminals_and_event_buffers_have_strict_bounds() {
         json!({"type":"message_stop"}),
     ];
     assert_eq!(
-        decode_events(ApiFormat::Messages, &events, &[])
+        decode_events(ApiFormat::Messages, &events)
             .unwrap_err()
             .kind,
         Kind::ResponseIncomplete
@@ -1342,8 +1373,8 @@ async fn launch_guard_preserves_original_reply_and_finishes_pending_handle() {
             slot: Arc::new(Mutex::new(Some(InferenceContext {
                 request: request(),
                 reply: Some(reply),
-                route: route("http://127.0.0.1:1".into()),
-                tools: vec![],
+                http_request: Some(outbound_to("http://127.0.0.1:1".into())),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(180),
                 client: reqwest::Client::new(),
                 gate: Arc::new(Mutex::new(StreamGate::default())),
                 delivery: delivery(),
@@ -1378,8 +1409,8 @@ async fn ordinary_launch_hands_supervisor_to_registered_shared_handle() {
             slot: Arc::new(Mutex::new(Some(InferenceContext {
                 request: input,
                 reply: Some(reply),
-                route: route("http://127.0.0.1:1".into()),
-                tools: vec![],
+                http_request: Some(outbound_to("http://127.0.0.1:1".into())),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(180),
                 client: reqwest::Client::new(),
                 gate: Arc::new(Mutex::new(StreamGate::default())),
                 delivery: delivery(),
@@ -1391,10 +1422,14 @@ async fn ordinary_launch_hands_supervisor_to_registered_shared_handle() {
     };
     assert!(launch_inference(guard).await.is_ok());
     handle.wait_finished().await.unwrap();
-    assert_eq!(
-        received.await.unwrap().unwrap().stop_reason,
-        InferenceStopReason::Cancelled
-    );
+    let result = received.await.unwrap().unwrap();
+    assert_eq!(result.stop_reason, InferenceStopReason::Completed);
+    assert_eq!(result.content, None);
+    assert_eq!(result.reasoning, None);
+    assert!(result.tool_calls.is_empty());
+    assert_eq!(result.replay, None);
+    assert_eq!(result.usage, None);
+    assert!(handle.is_finished());
 }
 
 #[tokio::test]
@@ -1416,8 +1451,8 @@ async fn dropping_app_with_queued_launch_releases_context_and_original_reply() {
             slot: Arc::new(Mutex::new(Some(InferenceContext {
                 request: request(),
                 reply: Some(reply),
-                route: route("http://127.0.0.1:1".into()),
-                tools: vec![],
+                http_request: Some(outbound_to("http://127.0.0.1:1".into())),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(180),
                 client: reqwest::Client::new(),
                 gate: Arc::new(Mutex::new(StreamGate::default())),
                 delivery: delivery(),
