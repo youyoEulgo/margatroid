@@ -166,6 +166,22 @@ call_remote(arguments, context) -> ()
         远端取消时：
             工具可定义带id的cancel消息，由A/bin处理
             本地中止不保证撤销远端副作用
+
+format_result(response) -> ToolResult
+    行为：
+        协议error返回原错误的工具失败结果
+        遍历content并保留非镜像文本及其他内容
+        存在structuredContent时，尝试将文本块解析为JSON
+        若json_equal(文本JSON, structuredContent)，跳过该镜像文本
+        最后仅追加一次structuredContent
+        图片、音频、资源及isError沿原转换规则保留
+
+json_equal(left, right) -> bool
+    行为：
+        类型不同返回false；非table值直接比较
+        table逐键递归比较，要求键集合和值相同
+        数组保留顺序，对象忽略字段排列顺序
+        空table按JSON对象或数组类型区分
 ```
 
 # 工具内部协议

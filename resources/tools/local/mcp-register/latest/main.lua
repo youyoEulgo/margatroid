@@ -29,6 +29,22 @@ local function object(value)
     return type(value) == "table" and json.encode(value):sub(1, 1) == "{"
 end
 
+local function json_equal(left, right)
+    if type(left) ~= type(right) then return false end
+    if type(left) ~= "table" then return left == right end
+    local count = 0
+    for key, value in pairs(left) do
+        if not json_equal(value, right[key]) then return false end
+        count = count + 1
+    end
+    local remaining = count
+    for _ in pairs(right) do remaining = remaining - 1 end
+    if remaining ~= 0 then return false end
+    -- Nonempty arrays have numeric keys; JSON objects have string keys.
+    -- Empty tables require the preserved JSON kind to distinguish [] from {}.
+    return count ~= 0 or object(left) == object(right)
+end
+
 local function format_result(response)
     if response.error ~= nil then
         return failure(json.encode(response.error))
@@ -41,7 +57,12 @@ local function format_result(response)
     for _, item in ipairs(result.content) do
         if type(item) ~= "table" then error("invalid MCP content item") end
         if item.type == "text" and type(item.text) == "string" then
-            text[#text + 1] = item.text
+            local mirrored = false
+            if result.structuredContent ~= nil then
+                local decoded, value = pcall(json.decode, item.text)
+                mirrored = decoded and json_equal(value, result.structuredContent)
+            end
+            if not mirrored then text[#text + 1] = item.text end
         elseif item.type == "image" and type(item.data) == "string"
             and type(item.mimeType) == "string" and result.isError ~= true then
             images[#images + 1] = { media_type = item.mimeType, data = item.data }

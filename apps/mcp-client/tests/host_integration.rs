@@ -330,6 +330,101 @@ mod linux {
             "host_integration large_catalog: tools=1024 host_records=1025 catalog_json_bytes={catalog_bytes} definition_json_bytes={definition_bytes}; full descriptions/schemas, reverse concurrent calls, all aliases/tasks/processes cleanup passed"
         );
     }
+    pub fn result_formatting() {
+        let mut f = Fixture::new();
+        let server = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/server.py");
+        let registration = f.execute(
+            "format-owner",
+            "mcp_register",
+            json!({
+                "alias_prefix":"format_", "server": {
+                    "transport":"stdio", "command":"python3", "args":[server],
+                }
+            }),
+        );
+        assert!(!f.response(registration).unwrap().failed);
+        let structured = json!({"result":{"items":[{"value":1,"empty":{},"array":[],"missing":null}],"total":1}});
+        let mirror = r#"{ "result": { "total": 1, "items": [{ "missing": null, "array": [], "empty": {}, "value": 1 }] } }"#;
+        for (index, texts) in [vec![mirror], vec![mirror, mirror]].into_iter().enumerate() {
+            let blocks: Vec<_> = texts
+                .into_iter()
+                .map(|text| json!({"type":"text","text":text}))
+                .collect();
+            let reply = f.execute(
+                &format!("mirror-{index}"),
+                "format_echo",
+                json!({"result_case":{"content":blocks,"structuredContent":structured}}),
+            );
+            let response = f.response(reply).unwrap();
+            assert!(!response.failed);
+            assert_eq!(
+                serde_json::from_str::<Value>(&response.content).unwrap(),
+                structured
+            );
+            assert_eq!(response.content.lines().count(), 1);
+        }
+        let original = "unchanged text\nwith newlines";
+        let reply = f.execute(
+            "text-only",
+            "format_echo",
+            json!({"result_case":{"content":[{"type":"text","text":original}]}}),
+        );
+        assert_eq!(f.response(reply).unwrap().content, original);
+        // These pairs must remain distinct: array order, scalar type, null,
+        // absent keys, and empty object/array kinds all matter.
+        for (index, (text, value)) in [
+            ("query completed", json!({"value":1})),
+            (r#"{"value":2}"#, json!({"value":1})),
+            (r#"{"value":"1"}"#, json!({"value":1})),
+            (r#"{"value":false}"#, json!({"value":0})),
+            (r#"{"value":[2,1]}"#, json!({"value":[1,2]})),
+            (r#"{"value":[]}"#, json!({"value":{}})),
+            (r#"{}"#, json!({"value":null})),
+            ("not valid JSON {", json!({"value":1})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let reply = f.execute(&format!("different-{index}"), "format_echo", json!({"result_case":{"content":[{"type":"text","text":text}],"structuredContent":value}}));
+            let response = f.response(reply).unwrap();
+            let (first, second) = response.content.split_once('\n').unwrap();
+            assert_eq!(first, text);
+            assert_eq!(serde_json::from_str::<Value>(second).unwrap(), value);
+        }
+        let image = json!({"type":"image","mimeType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jWZkAAAAASUVORK5CYII="});
+        let audio = json!({"type":"audio","mimeType":"audio/wav","data":"YXVkaW8="});
+        let resource = json!({"type":"resource_link","uri":"example://resource","name":"extra"});
+        let reply = f.execute("mixed-content", "format_echo", json!({"result_case":{
+            "content":[{"type":"text","text":"independent explanation"},{"type":"text","text":mirror},image,audio,resource],
+            "structuredContent":structured
+        }}));
+        let response = f.response(reply).unwrap();
+        assert!(!response.failed);
+        let lines: Vec<_> = response.content.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "independent explanation");
+        assert_eq!(serde_json::from_str::<Value>(lines[1]).unwrap(), audio);
+        assert_eq!(serde_json::from_str::<Value>(lines[2]).unwrap(), resource);
+        assert_eq!(serde_json::from_str::<Value>(lines[3]).unwrap(), structured);
+        assert_eq!(response.images.len(), 1);
+        assert_eq!(response.images[0].media_type, "image/png");
+        assert_eq!(response.images[0].data, image["data"]);
+        let reply = f.execute("failed-mirror", "format_echo", json!({"result_case":{
+            "content":[{"type":"text","text":mirror}],"structuredContent":structured,"isError":true
+        }}));
+        let response = f.response(reply).unwrap();
+        assert!(response.failed);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.content).unwrap(),
+            structured
+        );
+        f.finish("format-owner");
+        f.until(|f| f.tasks().list().is_empty());
+        println!(
+            "host_integration formatting: semantic mirrors emitted once; distinct text, JSON kinds, mixed media and failures preserved"
+        );
+    }
+
     pub fn run() {
         let mut f = Fixture::new();
         let server = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/server.py");
@@ -447,6 +542,7 @@ fn main() {
     {
         linux::run();
         linux::large_catalog();
+        linux::result_formatting();
     }
     #[cfg(not(target_os = "linux"))]
     println!("host_integration: Linux supervisor test skipped on this platform");
