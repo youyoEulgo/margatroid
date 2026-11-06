@@ -54,6 +54,8 @@ def dispatch(request):
     if method == "tools/call":
         args = request["params"]["arguments"]
         trace({"received": request["params"]["name"], "arguments": args})
+        if "result_case" in args:
+            return result(request, args["result_case"])
         if args.get("error"):
             return {"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "fixture failure", "data": {"detail": 42}}}
         if args.get("exit"):

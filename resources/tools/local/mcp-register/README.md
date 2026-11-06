@@ -43,6 +43,6 @@ A 使用有界 FIFO 写队列、`pending[id]=reply_to` 和 `await_any` 同时推
 
 ## 结果与结束
 
-MCP text 内容按顺序连接为工具文本；成功 MCP image 内容映射为现有 `{media_type,data}` 图像，不解码或改写 base64。其他内容和 structuredContent 通过 JSON 文本保留。`isError=true` 转成 `{ok:false,content:...}`，由既有宿主结果解析器设置 `failed=true`；由于宿主禁止失败结果包含图像，失败中的 image 块保留为 JSON 文本。图像格式、数量和字节限制继续由宿主结果解析器校验。
+MCP text 内容按顺序连接为工具文本；存在structuredContent时，能解析为JSON且与之结构相等的文本块不再重复输出，最终只附加一份structuredContent。对象字段顺序不影响相等性，数组顺序、类型、null与缺失字段、空对象与空数组均严格区分。普通说明、不同JSON和无法解析的文本原样保留；独立client bin仍完整透传原MCP响应。成功 MCP image 内容映射为现有 `{media_type,data}` 图像，不解码或改写 base64。其他内容通过 JSON 文本保留。`isError=true` 转成 `{ok:false,content:...}`，由既有宿主结果解析器设置 `failed=true`；由于宿主禁止失败结果包含图像，失败中的 image 块保留为 JSON 文本。图像格式、数量和字节限制继续由宿主结果解析器校验。
 
 注册或注入失败不返回成功；A 结束时 self `task_finish` 位于 `pcall` 外，因为宿主 self finish 永不返回。子进程、管道、VM、动态 alias 和 owner 依赖 B 的释放由现有宿主生命周期负责。B 超时、取消或消失不会主动取消远端副作用；迟到响应只移除对应 pending。资源不新增宿主函数、System/Event、持久化记录或隐藏工具集合。
