@@ -7,8 +7,8 @@ use client_core::ClientSender;
 use core_plugin::{Entity, Event, Resource};
 use inference_core::{
     DomainRequest, InferenceError, InferenceErrorKind, InferenceImage, InferenceMessage,
-    InferenceRequest, InferenceResponse, InferenceStopReason, InferenceToolCall,
-    InferenceToolDefinition, InferenceUsage, ModelRoute,
+    InferenceRequest, InferenceResponse, InferenceStopReason, InferenceToolCall, InferenceUsage,
+    ModelRoute,
 };
 use lua_runtime_core::DriverLuaVmInstance;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -43,8 +43,8 @@ impl Event for InferenceCleanupFinished {}
 pub(crate) struct InferenceContext {
     pub request: InferenceRequest,
     pub reply: Option<oneshot::Sender<Result<InferenceResponse>>>,
-    pub route: ModelRoute,
-    pub tools: Vec<InferenceToolDefinition>,
+    pub http_request: Option<ProviderHttpRequest>,
+    pub deadline: tokio::time::Instant,
     pub client: reqwest::Client,
     pub gate: Arc<Mutex<StreamGate>>,
     pub delivery: StreamDelivery,
@@ -1330,7 +1330,7 @@ impl ResponseAccumulator {
         }
     }
 
-    pub fn response(&self, tools: &HashSet<String>) -> Result<InferenceResponse> {
+    pub fn response(&self) -> Result<InferenceResponse> {
         let reason = self
             .reason
             .clone()
@@ -1342,13 +1342,20 @@ impl ResponseAccumulator {
             .map(|call| {
                 let arguments = serde_json::from_str::<Value>(&call.arguments)
                     .map_err(|_| incomplete("incomplete tool arguments"))?;
-                if call.id.is_empty()
-                    || call.name.is_empty()
-                    || !tools.contains(&call.name)
-                    || !seen.insert(call.id.clone())
-                    || !arguments.is_object()
-                {
-                    return Err(incomplete("invalid, duplicate or unknown tool call"));
+                if call.id.is_empty() {
+                    return Err(incomplete("tool call has empty id"));
+                }
+                if call.name.is_empty() {
+                    return Err(incomplete("tool call has empty name"));
+                }
+                if !seen.insert(call.id.clone()) {
+                    return Err(InferenceError::new(
+                        InferenceErrorKind::ResponseIncomplete,
+                        format!("duplicate tool call id={}", tool_call_diagnostic(&call.id)),
+                    ));
+                }
+                if !arguments.is_object() {
+                    return Err(incomplete("tool call arguments must be an object"));
                 }
                 Ok(InferenceToolCall {
                     id: call.id.clone(),
@@ -1400,6 +1407,25 @@ impl ResponseAccumulator {
         })
     }
 }
+
+fn tool_call_diagnostic(value: &str) -> String {
+    const MAX_ESCAPED_BYTES: usize = 128;
+    let mut escaped = String::from("\"");
+    for character in value.chars() {
+        let part = character.escape_debug().to_string();
+        if escaped.len() + part.len() > MAX_ESCAPED_BYTES - 4 {
+            escaped.push_str("...");
+            break;
+        }
+        escaped.push_str(&part);
+    }
+    escaped.push('"');
+    escaped
+}
+
+#[cfg(test)]
+#[path = "../tests/internal/call_validation.rs"]
+mod call_validation_tests;
 
 fn event_string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key]

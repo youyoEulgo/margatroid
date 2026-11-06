@@ -3,7 +3,8 @@ function configure(arguments, context)
 end
 
 function execute(arguments, context)
-    local terminal = terminal_open()
+    local client = dofile(context.resource_dir .. "/shell.lua")(context)
+    local terminal = client.terminal()
     task_return({ task_id = context.task_id })
     while true do
         local source, value = await_any({

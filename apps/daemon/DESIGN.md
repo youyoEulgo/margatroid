@@ -2,7 +2,10 @@
 
 ```text
 板块使用一级标题，一行注明文件，无内容不建空模块。
-类型、函数使用二级标题，列出字段、签名及直接行为。
+类型、函数使用二级标题；方法签名下写行为块。
+method(arguments) -> ReturnType
+    行为：
+        执行逻辑
 Resource写在lib板块；持有关系在文末使用树形图。
 不写独立逻辑段、进度、计划或验证记录。
 ```
@@ -21,7 +24,8 @@ Resource写在lib板块；持有关系在文末使用树形图。
 私有：
 ```text
 main()
-    行为：调用run，报告错误并设置进程退出码。
+    行为：
+        调用run，报告错误并设置进程退出码。
 ```
 
 # handler
@@ -31,24 +35,28 @@ main()
 私有：
 ```text
 run() -> Result<(), Error>
-    从HOME定位.margatroid，构造ApplicationOptions
-    app = compose::build_app(options)
-    创建信号监听运行时，安装listen_for_shutdown
-    app.run_until(stopping.load)
-    await compose::shutdown_app(&mut app) -- 持续推进ECS及真实清理
-    清理未确认: 报错并继续监督
-    清理完成: 结束信号监听，释放App，返回退出码
+    行为：
+        从HOME定位.margatroid，构造ApplicationOptions
+        app = compose::build_app(options)
+        创建信号监听运行时，安装listen_for_shutdown
+        app.run_until(stopping.load)
+        await compose::shutdown_app(&mut app)，持续推进ECS及真实清理
+        清理未确认: 报错并继续监督
+        清理完成: 结束信号监听，释放App，返回退出码
 
 listen_for_shutdown(stopping: Arc<AtomicBool>, handle: RuntimeHandle) -> Result<JoinHandle<()>, IoError>
-    监听SIGINT、SIGTERM -- 非Unix监听Ctrl+C
-    每次收到信号调用request_shutdown；监听保留至清理完成
+    行为：
+        Unix监听SIGINT、SIGTERM；非Unix监听Ctrl+C
+        每次收到信号调用request_shutdown；监听保留至清理完成
 
 request_shutdown(stopping: &AtomicBool, handle: &RuntimeHandle)
-    首次信号: stopping = true; handle.wake()
-    重复信号: 输出清理仍在进行 -- 不跳过清理
+    行为：
+        首次信号: stopping = true; handle.wake()
+        重复信号: 输出清理仍在进行，继续等待清理
 
 data_root() -> Result<PathBuf, Error>
-    行为：取得HOME下.margatroid，不把项目目录用作状态目录。
+    行为：
+        取得HOME下.margatroid，不把项目目录用作状态目录。
 ```
 
 # 持有关系

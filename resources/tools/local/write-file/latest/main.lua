@@ -53,8 +53,9 @@ local function parent_path(path)
     return path:sub(1, index - 1)
 end
 
-local function create_directories(path)
-    local result = margatroid().shell("mkdir -p -- " .. shell_quote(path), { max_output_bytes = 4096 })
+local function create_directories(path, context)
+    local client = dofile(context.resource_dir .. "/shell.lua")(context)
+    local result = client.exec("mkdir -p -- " .. shell_quote(path), { max_output_bytes = 4096 })
     if result.exit_code ~= 0 then
         return nil, "could not create " .. path .. ": " .. result.stderr
     end
@@ -80,7 +81,7 @@ local function perform(arguments, context)
     if arguments.create_parent_directories then
         local parent = parent_path(path)
         if parent and parent ~= "" then
-            local created, failure = create_directories(parent)
+            local created, failure = create_directories(parent, context)
             if not created then
                 return { ok = false, content = failure }
             end
@@ -92,7 +93,7 @@ local function perform(arguments, context)
     end
     return {
         ok = true,
-        content = margatroid().json.encode({
+        content = json.encode({
             path = path,
             bytes = #arguments.content,
             replaced = true,

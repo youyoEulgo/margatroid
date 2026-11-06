@@ -37,7 +37,7 @@ function execute(arguments, context)
 end
 ```
 
-唯一配置timeout_ms由ToolTask保存，正整数为任务允许存活的毫秒数，0明确表示不限时。存活预算从配置确认后开始；task_return不解除预算，持久任务也按作者声明到期。配置阶段使用同一个Lua状态，只允许纯计算，尚未安装IO、OS、shell、terminal、task、json等宿主能力；不得在脚本顶层捕获这些能力。内存和指令预算覆盖顶层加载与配置阶段，防止配置本身无限执行；这些是资源预算，不是后端默认时间限制。
+唯一配置timeout_ms由ToolTask保存，正整数为任务允许存活的毫秒数，0明确表示不限时。存活预算从配置确认后开始；task_return不解除预算，持久任务也按作者声明到期。配置阶段使用同一个Lua状态，只允许纯计算，尚未安装IO、OS、process_open、task、json等宿主能力；不得在脚本顶层捕获这些能力。内存和指令预算覆盖顶层加载与配置阶段，防止配置本身无限执行；这些是资源预算，不是后端默认时间限制。
 
 shell、宿主请求和输入等待均服从同一ToolTask存活预算，不接受独立shell timeout_ms，不另设宿主或清理限时。到期请求取消，等待进程真实清理后才完成，不因到期丢弃监督。内置普通工具声明30秒，bash_exec声明120秒，持久bash声明0不限时；这些值写在各工具Lua配置函数中，后端没有对应默认常量。
 
@@ -69,7 +69,9 @@ task_read同时返回replaced标记：上次读取后发生覆盖为true，否�
 
 ## bash与交互终端
 
-bash工具无调用参数，打开终端后返回task_id，收到的task_send消息由Lua转发，输出由Lua选择task_write或task_replace。普通终端滚屏保留滚走的行并继续追加，不把窗口移动当覆盖；光标改写及alternate screen仍使用替换语义。终端历史受output_bytes与cache_bytes中的较小预算限制，超出明确报OutputTooLarge，不静默丢弃旧行。进程、PTY、终端模拟器和追加或覆盖的判断属于工具自身设计，不作为Margatroid任务机制的接口要求。
+执行阶段宿主安装通用package.config路径配置和await_any异步原语；os.execute、io.popen明确报错并提示使用process_open。宿主全局和margatroid入口均不提供shell、terminal_open。bash工具通过资源Lua调用process_open启动独立shell-client bin，shell IPC协议、PTY及VT100渲染由工具与bin负责，与MCP client使用相同的通用进程边界。
+
+bash工具无调用参数，打开终端后返回task_id，收到的task_send消息由Lua转发，输出由Lua选择task_write或task_replace。普通终端滚屏保留滚走的行并继续追加，不把窗口移动当覆盖；光标改写及alternate screen仍使用替换语义。终端历史上限由工具传给独立bin，默认128MiB；宿主另按通用规则限制累计原始管道字节和任务缓存，协议转义开销计入管道预算，超出明确报错，不静默丢弃旧行。进程、PTY、终端模拟器和追加或覆盖的判断属于工具自身设计，不作为Margatroid任务机制的接口要求。
 
 ## 执行与清理
 
@@ -80,6 +82,8 @@ Lua在独立runner执行。可信supervisor在工具沙箱外，worker及其后�
 原调用回复后监督任务继续持有进程、连接及清理责任。取消不撤销已发生副作用，不直接abort监督任务。VM、进程、后代、管道和临时文件真实收口后即完成finish并移除任务；清理失败保留控制能力及error。Agent关闭时请求结束仍存活工具任务并等待；Agent重启时若有未完成工具任务直接拒绝，不代替调用方取消它们。
 
 工具结果由MCL转换为消息；Tool不追加历史、不调用推理、不结束Agent回合。不新增长短任务分类，回合中止依据return状态决定是否终止。
+
+LLM可见的工具失败保留原调用ID、工具名、failed标记、错误类别及说明，剥离Lua stack traceback；成功工具输出保持原样。task_read、task_send、task_finish资源直接调用通用任务能力，宿主错误经原执行监督回复，不在Lua里pcall后把整个错误堆栈拼成工具内容。TaskMissing仍是正常可处理的失败结果，不转换为成功，也不恢复已finish的任务。
 
 ## 动态入口与原始进程
 

@@ -26,7 +26,7 @@ async fn unavailable_selected_backend_never_falls_back_to_unrestricted_worker() 
         .unwrap();
     let request = json!({
         "protocol_version":1,
-        "program":"function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() shell('touch unsafe'); task_return('unsafe') end",
+        "program":"function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() process_open({program='/bin/touch',arguments={'unsafe'}}):wait(); task_return('unsafe') end",
         "arguments":{},
         "context":{"task_id":"sandbox-test","call_id":"call","alias":"tool","owner_task_id":null,"binding":null,"resource_dir":root.path(),"project_root":root.path(),"temp_dir":root.path()},
         "limits":ToolExecutionLimits::default()

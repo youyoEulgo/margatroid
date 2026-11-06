@@ -140,26 +140,6 @@ pub(crate) struct NoExternalSchema;
 
 pub(crate) type SharedBridge = Arc<WorkerBridge>;
 
-#[cfg(target_os = "linux")]
-#[derive(Clone)]
-pub(crate) struct TerminalSession {
-    pub(crate) inner: std::sync::Arc<TerminalInner>,
-}
-#[cfg(target_os = "linux")]
-pub(crate) struct TerminalInner {
-    pub(crate) master: tokio::io::unix::AsyncFd<std::fs::File>,
-    pub(crate) child: tokio::sync::Mutex<tokio::process::Child>,
-    pub(crate) output: std::sync::Mutex<TerminalOutput>,
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) struct TerminalOutput {
-    pub(crate) parser: vt100::Parser,
-    pub(crate) history: String,
-    pub(crate) previous: (String, bool),
-    pub(crate) limit: usize,
-}
-
 #[derive(Clone)]
 pub(crate) struct ToolLaunchOutput;
 #[derive(Clone)]

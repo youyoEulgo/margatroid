@@ -280,6 +280,10 @@ fn complete_reply(
     context: &mut ToolExecutionContext,
     result: Result<tool_core::ToolExecuteResponse, ToolError>,
 ) {
+    let result = result.map_err(|mut failure| {
+        failure.message = without_lua_traceback(&failure.message).to_owned();
+        failure
+    });
     let _ = context.handle.return_result(result);
 }
 
@@ -676,7 +680,10 @@ async fn host_frame(
 ) -> Result<HostFrame, ToolError> {
     let (request_id, result) = match frame {
         RunnerFrame::Return { request_id, value } => {
-            let result = parse_tool_result(&value, &context.limits).and_then(|response| {
+            let result = parse_tool_result(&value, &context.limits).and_then(|mut response| {
+                if response.failed {
+                    response.content = without_lua_traceback(&response.content).to_owned();
+                }
                 context.handle.return_result(Ok(response))?;
                 Ok(Value::Null)
             });
@@ -1379,15 +1386,23 @@ async fn worker_host_input<R: AsyncBufRead + Unpin>(
     }
 }
 
+fn without_lua_traceback(message: &str) -> &str {
+    message
+        .split_once("\nstack traceback:")
+        .map_or(message, |(summary, _)| summary.trim_end())
+}
+
 fn lua_failure(failure: mlua::Error) -> ToolError {
-    match &failure {
+    let mut result = match &failure {
         mlua::Error::ExternalError(source) => source
             .downcast_ref::<ToolError>()
             .cloned()
             .unwrap_or_else(|| error(Kind::ExecutionFailed, failure.to_string())),
         mlua::Error::CallbackError { cause, .. } => lua_failure((**cause).clone()),
         _ => error(Kind::ExecutionFailed, failure.to_string()),
-    }
+    };
+    result.message = without_lua_traceback(&result.message).to_owned();
+    result
 }
 
 async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
@@ -1520,6 +1535,14 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     for (name, value) in execution_globals {
         globals.set(name, value).map_err(lua_failure)?;
     }
+    let package = lua.create_table().map_err(lua_failure)?;
+    package
+        .set(
+            "config",
+            format!("{}\n;\n?\n!\n-\n", std::path::MAIN_SEPARATOR),
+        )
+        .map_err(lua_failure)?;
+    globals.set("package", package).map_err(lua_failure)?;
     let (sender, receiver) = mpsc::channel(request.limits.input_capacity);
     let finish = CancellationToken::new();
     let bridge = Arc::new(WorkerBridge {
@@ -1563,13 +1586,24 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         lua.create_function(|_, _: mlua::MultiValue| {
             Err::<(), _>(mlua::Error::external(error(
                 Kind::InvalidRequest,
-                "use shell for subprocesses",
+                "use process_open for subprocesses",
             )))
         })
         .map_err(lua_failure)?,
     )
     .map_err(lua_failure)?;
     let os: mlua::Table = globals.get("os").map_err(lua_failure)?;
+    os.set(
+        "execute",
+        lua.create_function(|_, _: mlua::MultiValue| {
+            Err::<(), _>(mlua::Error::external(error(
+                Kind::InvalidRequest,
+                "use process_open for subprocesses",
+            )))
+        })
+        .map_err(lua_failure)?,
+    )
+    .map_err(lua_failure)?;
     os.set(
         "exit",
         lua.create_function(|_, _: mlua::MultiValue| {
@@ -1776,8 +1810,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
             .map_err(lua_failure)?,
         )
         .map_err(lua_failure)?;
-    install_shell(&lua, &request)?;
-    install_terminal(&lua, &request)?;
+    install_await_any(&lua)?;
     let processes = process::install_process(
         &lua,
         request.context.project_root.clone(),
@@ -1799,8 +1832,6 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         .set("arguments", arguments.clone())
         .map_err(lua_failure)?;
     for name in [
-        "shell",
-        "terminal_open",
         "process_open",
         "tool_inject",
         "await_any",
@@ -1862,223 +1893,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     result
 }
 
-fn install_shell(lua: &Lua, request: &RunnerRequest) -> Result<(), ToolError> {
-    let project_root = request.context.project_root.clone();
-    let output_bytes = request.limits.output_bytes;
-    let diagnostic_bytes = request.limits.diagnostic_bytes;
-    let shell = lua.create_async_function(move |lua, (script, options): (String, Option<mlua::Table>)| {
-        let project_root = project_root.clone();
-        async move {
-            if script.trim().is_empty() { return Err(mlua::Error::external(error(Kind::InvalidArguments, "shell command is empty"))); }
-            let requested_limit = options.as_ref().map(|options| options.get::<Option<usize>>("max_output_bytes")).transpose()?.flatten().unwrap_or(output_bytes).min(output_bytes);
-            if options.as_ref().map(|options| options.contains_key("timeout_ms")).transpose()?.unwrap_or(false) {
-                return Err(mlua::Error::external(error(Kind::InvalidArguments, "shell timeout_ms is unsupported; configure the task lifetime")));
-            }
-            let use_pty = options.as_ref().map(|options| options.get::<Option<bool>>("pty")).transpose()?.flatten().unwrap_or(false);
-            let mut command = tokio::process::Command::new("/bin/sh");
-            command.arg("-c").arg(script).current_dir(project_root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-            filtered_environment(&mut command);
-            #[cfg(target_os = "linux")]
-            let terminal = if use_pty { Some(pty_configure(&mut command).map_err(mlua::Error::external)?) } else { None };
-            #[cfg(not(target_os = "linux"))]
-            if use_pty { return Err(mlua::Error::external(error(Kind::InvalidRequest, "PTY requires Linux"))); }
-            let mut child = command.spawn().map_err(mlua::Error::external)?;
-            drop(command);
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
-            let work = async {
-                let output = async {
-                    #[cfg(target_os = "linux")]
-                    if let Some(terminal) = terminal {
-                        let (stdout, truncated) = pty_drain(terminal, requested_limit).await?;
-                        return Ok::<_, mlua::Error>((stdout, String::new(), truncated));
-                    }
-                    let ((stdout, out_truncated), (stderr, err_truncated)) = tokio::try_join!(capture_pipe(stdout.expect("shell stdout piped"), requested_limit), capture_pipe(stderr.expect("shell stderr piped"), diagnostic_bytes.min(requested_limit)))?;
-                    Ok((stdout, stderr, out_truncated || err_truncated))
-                };
-                let (status, (stdout, stderr, truncated)) = tokio::try_join!(async { child.wait().await.map_err(mlua::Error::external) }, output)?;
-                let result = lua.create_table()?;
-                result.set("stdout", stdout)?;
-                result.set("stderr", stderr)?;
-                result.set("code", status.code().unwrap_or(-1))?;
-                result.set("exit_code", status.code().unwrap_or(-1))?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt;
-                    result.set("signal", status.signal())?;
-                }
-                result.set("truncated", truncated)?;
-                result.set("terminal", use_pty)?;
-                Ok::<_, mlua::Error>(result)
-            };
-            let result = work.await;
-            if result.is_err() { let _ = child.start_kill(); let _ = child.wait().await; }
-            result
-        }
-    }).map_err(lua_failure)?;
-    let globals = lua.globals();
-    globals.set("shell", shell.clone()).map_err(lua_failure)?;
-    let os: mlua::Table = globals.get("os").map_err(lua_failure)?;
-    os.set(
-        "execute",
-        lua.create_async_function(move |_, command: Option<String>| {
-            let shell = shell.clone();
-            async move {
-                let Some(command) = command else {
-                    return Ok((Some(true), None::<String>, None::<i32>));
-                };
-                let result: mlua::Table = shell.call_async(command).await?;
-                if let Some(signal) = result.get::<Option<i32>>("signal")? {
-                    return Ok((None, Some("signal".into()), Some(signal)));
-                }
-                let code = result.get::<i32>("exit_code")?;
-                Ok((
-                    if code == 0 { Some(true) } else { None },
-                    Some("exit".into()),
-                    Some(code),
-                ))
-            }
-        })
-        .map_err(lua_failure)?,
-    )
-    .map_err(lua_failure)?;
-    let package = lua.create_table().map_err(lua_failure)?;
-    package
-        .set(
-            "config",
-            format!("{}\n;\n?\n!\n-\n", std::path::MAIN_SEPARATOR),
-        )
-        .map_err(lua_failure)?;
-    globals.set("package", package).map_err(lua_failure)?;
-    Ok(())
-}
-
-async fn capture_pipe<R: AsyncRead + Unpin>(
-    mut pipe: R,
-    maximum: usize,
-) -> mlua::Result<(String, bool)> {
-    let mut bytes = Vec::new();
-    let mut truncated = false;
-    let mut chunk = [0u8; 8192];
-    loop {
-        let count = pipe.read(&mut chunk).await.map_err(mlua::Error::external)?;
-        if count == 0 {
-            break;
-        }
-        let retained = maximum.saturating_sub(bytes.len()).min(count);
-        bytes.extend_from_slice(&chunk[..retained]);
-        truncated |= retained < count;
-    }
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
-}
-
-#[cfg(target_os = "linux")]
-#[allow(deprecated)]
-fn pty_configure(
-    command: &mut tokio::process::Command,
-) -> std::io::Result<tokio::io::unix::AsyncFd<std::fs::File>> {
-    let terminal = nix::pty::openpty(
-        Some(&nix::pty::Winsize {
-            ws_row: 24,
-            ws_col: 80,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        }),
-        None,
-    )?;
-    let master = std::fs::File::from(terminal.master);
-    let slave = std::fs::File::from(terminal.slave);
-    let flags = nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_GETFL)?;
-    nix::fcntl::fcntl(
-        &master,
-        nix::fcntl::FcntlArg::F_SETFL(
-            nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK,
-        ),
-    )?;
-    command
-        .stdin(Stdio::from(slave.try_clone()?))
-        .stdout(Stdio::from(slave.try_clone()?))
-        .stderr(Stdio::from(slave));
-    unsafe {
-        command.pre_exec(|| {
-            if nix::libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    tokio::io::unix::AsyncFd::new(master)
-}
-
-#[cfg(target_os = "linux")]
-async fn pty_drain(
-    master: tokio::io::unix::AsyncFd<std::fs::File>,
-    limit: usize,
-) -> mlua::Result<(String, bool)> {
-    let mut bytes = Vec::new();
-    let mut truncated = false;
-    let mut chunk = [0u8; 8192];
-    loop {
-        let mut ready = master.readable().await.map_err(mlua::Error::external)?;
-        match ready.try_io(|fd| {
-            let mut file = fd.get_ref();
-            std::io::Read::read(&mut file, &mut chunk)
-        }) {
-            Ok(Ok(0)) => break,
-            Ok(Ok(count)) => {
-                let retained = limit.saturating_sub(bytes.len()).min(count);
-                bytes.extend_from_slice(&chunk[..retained]);
-                truncated |= retained < count;
-            }
-            Ok(Err(error)) if error.raw_os_error() == Some(nix::libc::EIO) => break,
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Ok(Err(error)) => return Err(mlua::Error::external(error)),
-            Err(_) => continue,
-        }
-    }
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
-}
-
-fn install_terminal(lua: &mlua::Lua, request: &RunnerRequest) -> Result<(), ToolError> {
-    let root = request.context.project_root.clone();
-    let output_limit = request.limits.output_bytes.min(request.limits.cache_bytes);
-    lua.globals()
-        .set(
-            "terminal_open",
-            lua.create_async_function(move |lua, ()| {
-                let root = root.clone();
-                async move {
-                    #[cfg(target_os = "linux")]
-                    {
-                        let mut command = tokio::process::Command::new("bash");
-                        command
-                            .args(["--noprofile", "--norc", "-i"])
-                            .current_dir(root)
-                            .env("TERM", "xterm-256color")
-                            .kill_on_drop(true);
-                        let master = pty_configure(&mut command).map_err(mlua::Error::external)?;
-                        let child = command.spawn().map_err(mlua::Error::external)?;
-                        let terminal = crate::types::TerminalSession {
-                            inner: std::sync::Arc::new(crate::types::TerminalInner {
-                                master,
-                                child: tokio::sync::Mutex::new(child),
-                                output: std::sync::Mutex::new(crate::types::TerminalOutput::new(
-                                    output_limit,
-                                )),
-                            }),
-                        };
-                        lua.create_userdata(terminal)
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    Err::<mlua::AnyUserData, _>(mlua::Error::external("PTY requires Linux"))
-                }
-            })
-            .map_err(lua_failure)?,
-        )
-        .map_err(lua_failure)?;
+fn install_await_any(lua: &Lua) -> Result<(), ToolError> {
     lua.globals()
         .set(
             "await_any",
@@ -2104,146 +1919,6 @@ fn install_terminal(lua: &mlua::Lua, request: &RunnerRequest) -> Result<(), Tool
         .map_err(lua_failure)?;
     Ok(())
 }
-
-#[cfg(target_os = "linux")]
-impl crate::types::TerminalOutput {
-    fn new(limit: usize) -> Self {
-        Self {
-            // One byte can complete a CSI scroll of up to 24 rows. An extra
-            // retained row lets scrollback offset 1 act as a scroll observer.
-            parser: vt100::Parser::new(24, 80, 25),
-            history: String::new(),
-            previous: (String::new(), false),
-            limit,
-        }
-    }
-
-    fn process(&mut self, bytes: &[u8]) -> Result<(String, bool), ToolError> {
-        for byte in bytes {
-            let screen = self.parser.screen_mut();
-            let alternate = screen.alternate_screen();
-            screen.set_scrollback(1);
-            let before = screen.scrollback();
-            self.parser.process(std::slice::from_ref(byte));
-            let screen = self.parser.screen_mut();
-            if !alternate && !screen.alternate_screen() {
-                // With no history the offset is zero and doesn't advance on
-                // scroll. Query the clamped maximum to observe the first rows.
-                if before == 0 {
-                    screen.set_scrollback(usize::MAX);
-                }
-                let count = screen.scrollback().saturating_sub(before);
-                for offset in (1..=count).rev() {
-                    screen.set_scrollback(offset);
-                    let row = screen.rows(0, 80).next().unwrap_or_default();
-                    let separator = if screen.row_wrapped(0) { "" } else { "\n" };
-                    if self
-                        .history
-                        .len()
-                        .saturating_add(row.len())
-                        .saturating_add(separator.len())
-                        > self.limit
-                    {
-                        return Err(error(
-                            Kind::OutputTooLarge,
-                            "terminal transcript exceeds output/cache budget",
-                        ));
-                    }
-                    self.history.push_str(&row);
-                    self.history.push_str(separator);
-                }
-            }
-            screen.set_scrollback(0);
-        }
-        let screen = self.parser.screen();
-        let alternate = screen.alternate_screen();
-        let mut text = if alternate {
-            String::new()
-        } else {
-            self.history.clone()
-        };
-        text.push_str(&screen.contents());
-        if text.len() > self.limit {
-            return Err(error(
-                Kind::OutputTooLarge,
-                "terminal transcript exceeds output/cache budget",
-            ));
-        }
-        let replace =
-            alternate || alternate != self.previous.1 || !text.starts_with(&self.previous.0);
-        let value = if replace {
-            text.clone()
-        } else {
-            text[self.previous.0.len()..].to_string()
-        };
-        self.previous = (text, alternate);
-        Ok((value, replace))
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl mlua::UserData for crate::types::TerminalSession {
-    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_async_method("read", |lua, terminal, ()| async move {
-            use mlua::LuaSerdeExt;
-            let mut chunk = [0u8; 8192];
-            let count = loop {
-                let mut ready = tokio::select! {
-                    biased;
-                    ready = terminal.inner.master.readable() => ready.map_err(mlua::Error::external)?,
-                    status = async { terminal.inner.child.lock().await.wait().await } => {
-                        let status = status.map_err(mlua::Error::external)?;
-                        return lua.to_value(&serde_json::json!({"eof": true, "exit_code": status.code()}));
-                    }
-                };
-                match ready.try_io(|fd| std::io::Read::read(&mut fd.get_ref(), &mut chunk)) {
-                    Ok(Ok(count)) => break count,
-                    Ok(Err(error)) if error.raw_os_error() == Some(nix::libc::EIO) => break 0,
-                    Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Ok(Err(error)) => return Err(mlua::Error::external(error)),
-                    Err(_) => continue,
-                }
-            };
-            if count == 0 {
-                let status = terminal.inner.child.lock().await.wait().await.map_err(mlua::Error::external)?;
-                return lua.to_value(&serde_json::json!({"eof": true, "exit_code": status.code()}));
-            }
-            let (value, replace) = terminal.inner.output.lock().map_err(|_| mlua::Error::external("terminal output poisoned"))?
-                .process(&chunk[..count]).map_err(mlua::Error::external)?;
-            lua.to_value(&serde_json::json!({"eof": false, "replace": replace, "text": value}))
-        });
-        methods.add_async_method("write", |_, terminal, text: mlua::String| async move {
-            let bytes = text.as_bytes().to_vec();
-            let mut position = 0;
-            while position < bytes.len() {
-                let mut ready = terminal
-                    .inner
-                    .master
-                    .writable()
-                    .await
-                    .map_err(mlua::Error::external)?;
-                match ready
-                    .try_io(|fd| std::io::Write::write(&mut fd.get_ref(), &bytes[position..]))
-                {
-                    Ok(Ok(0)) => return Err(mlua::Error::external("terminal input closed")),
-                    Ok(Ok(count)) => position += count,
-                    Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Ok(Err(error)) => return Err(mlua::Error::external(error)),
-                    Err(_) => continue,
-                }
-            }
-            Ok(())
-        });
-        methods.add_async_method("close", |_, terminal, ()| async move {
-            let mut child = terminal.inner.child.lock().await;
-            child.kill().await.map_err(mlua::Error::external)
-        });
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-#[path = "../tests/support/terminal_output.rs"]
-mod terminal_output_tests;
 
 async fn wait_deadline(deadline: Option<tokio::time::Instant>) {
     match deadline {

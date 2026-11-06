@@ -64,7 +64,7 @@ async fn invalid_or_missing_configuration_never_executes() {
         "function configure() return {timeout_ms=0,host_call_timeout_ms=10,cleanup_timeout_ms=10} end",
         "function configure() return {timeout_ms=20,host_call_timeout_ms=1.5,cleanup_timeout_ms=10} end",
         "function configure() return {timeout_ms=20,host_call_timeout_ms=10,cleanup_timeout_ms=10,other=1} end",
-        "function configure() shell('touch unsafe') end",
+        "function configure() process_open({program='/bin/touch',arguments={'unsafe'}}) end",
         "function configure() while true do end end",
         "while true do end",
         "while true do pcall(function() while true do end end) end",
@@ -72,7 +72,7 @@ async fn invalid_or_missing_configuration_never_executes() {
         "io.open('unsafe', 'w')",
         "dofile('unsafe')",
     ] {
-        let program = format!("{configure}\nfunction execute() shell('touch unsafe') end");
+        let program = format!("{configure}\nfunction execute() process_open({{program='/bin/touch',arguments={{'unsafe'}}}}):wait() end");
         let (root, mut child, _input, mut output) = runner(&program, json!({})).await;
         let frame = receive(&mut output).await;
         assert_eq!(frame["frame"]["type"], "stopped", "{configure}: {frame}");
@@ -90,14 +90,14 @@ async fn invalid_or_missing_configuration_never_executes() {
 async fn configuration_uses_arguments_and_execution_waits_for_host_acknowledgement() {
     let program = r#"
         loads = (loads or 0) + 1
-        assert(io == nil and os == nil and shell == nil and task_return == nil and print == nil and pcall == nil and coroutine == nil)
+        assert(io == nil and os == nil and process_open == nil and task_return == nil and print == nil and pcall == nil and coroutine == nil)
         function configure(arguments, context)
             assert(context.task_id == 'configure-test')
             return {timeout_ms=arguments.budget}
         end
         function execute()
             assert(loads == 1)
-            shell('touch executed')
+            process_open({program='/bin/touch',arguments={'executed'}}):wait()
             task_return('done')
         end
     "#;
@@ -127,9 +127,9 @@ async fn configuration_uses_arguments_and_execution_waits_for_host_acknowledgeme
 }
 
 #[tokio::test]
-async fn explicit_execution_budget_stops_a_sleeping_shell_and_proves_cleanup() {
+async fn explicit_execution_budget_stops_a_sleeping_process_and_proves_cleanup() {
     let program =
-        "function configure() return {timeout_ms=30} end function execute() shell('sleep 30') end";
+        "function configure() return {timeout_ms=30} end function execute() process_open({program='/bin/sh',arguments={'-c','sleep 30'}}):wait() end";
     let (_root, mut child, mut input, mut output) = runner(program, json!({})).await;
     assert_eq!(receive(&mut output).await["frame"]["type"], "configured");
     send(

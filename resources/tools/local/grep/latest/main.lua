@@ -17,9 +17,10 @@ local function shell_quote(value)
     return "'" .. value:gsub("'", "'\\''") .. "'"
 end
 
--- The host shell owns timeout and output budgets.
-local function run(command)
-    local result = margatroid().shell(command, { max_output_bytes = MAX_OUTPUT_BYTES })
+-- Task configuration owns timeout; the private client bounds command output.
+local function run(command, context)
+    local client = dofile(context.resource_dir .. "/shell.lua")(context)
+    local result = client.exec(command, { max_output_bytes = MAX_OUTPUT_BYTES })
     if result.truncated then
         return nil, "grep output exceeded the size limit; narrow the pattern or path"
     end
@@ -53,10 +54,9 @@ local function perform(arguments, context)
     for _, arg in ipairs(args) do
         parts[#parts + 1] = shell_quote(arg)
     end
-    local stdout, failure = run(table.concat(parts, " "))
+    local stdout, failure = run(table.concat(parts, " "), context)
     if not stdout then return report(nil, failure) end
 
-    local json = margatroid().json
     local matches = {}
     local total = 0
     for line in stdout:gmatch("[^\n]+") do

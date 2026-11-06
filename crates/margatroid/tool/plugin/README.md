@@ -14,6 +14,6 @@ worker 在独立进程中运行 Lua。全局 instruction hook 覆盖异步 corou
 
 可信 Linux supervisor 在沙箱外充当 child subreaper；被选中时通过 landstrip run -p 启动受限 worker，后端失败不会改为无限制运行。未选中策略则直接启动 worker。MARGATROID_SANDBOX_BACKEND 可指定后端，否则从 PATH 查找 landstrip。具体策略 schema 由后端校验。
 
-supervisor 扫描并回收包括 setsid 后代在内的进程，完成后才发送真实清理证明。宿主同时等待 supervisor、管道和临时目录清理，才完成finish并从ToolTasks移除、释放缓存，不保存finished条目或完成缓存。TaskReadResult仅含replaced/output/error；finish后read/send/finish均返回TaskMissing，这是领域错误，不是未知宿主函数。需在finish前读完输出；is_cleanup_complete仅供内部清理等待者使用，不对外暴露completed。取消只请求退出，不 abort 监督任务。清理失败记录 CleanupFailed、完成尚未回复的调用，并保留监督能力继续清理，不先标记finished再异步清理；中止时原LLM回复仍及时交付。可选 MARGATROID_TOOL_CGROUP_ROOT 使用已委派 cgroup v2 根目录加强回收。进程/PTY/shell 底层功能从旧实现迁移并集中在 handler；本 crate 不提供具体 bash 资源。
+supervisor 扫描并回收包括 setsid 后代在内的进程，完成后才发送真实清理证明。宿主同时等待 supervisor、管道和临时目录清理，才完成finish并从ToolTasks移除、释放缓存，不保存finished条目或完成缓存。TaskReadResult仅含replaced/output/error；finish后read/send/finish均返回TaskMissing，这是领域错误，不是未知宿主函数。需在finish前读完输出；is_cleanup_complete仅供内部清理等待者使用，不对外暴露completed。取消只请求退出，不 abort 监督任务。清理失败记录 CleanupFailed、完成尚未回复的调用，并保留监督能力继续清理，不先标记finished再异步清理；中止时原LLM回复仍及时交付。可选 MARGATROID_TOOL_CGROUP_ROOT 使用已委派 cgroup v2 根目录加强回收。本 crate 保留通用process_open原始管道、独立await_any和任务API；package.config在执行环境初始化，os.execute/io.popen明确报错并提示process_open。shell、PTY和VT100由资源Lua及独立shell-client bin提供，宿主全局和margatroid入口不安装shell/terminal_open，不解码shell IPC。
 
 测试位于 tests，使用真实 runner 进程和资源文件，覆盖 Return 后交互、Finish、自身控制退出、跨任务访问、turn受理、唯一reply裁决、程序按次读取、Tools缓存schema、预算、图片、超时、setsid 后代清理和后端失败关闭。

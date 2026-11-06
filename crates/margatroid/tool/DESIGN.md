@@ -5,6 +5,10 @@
 类型、函数使用二级标题，列出字段、签名及直接行为。
 System分别列出事件、闭包结果、提交闭包和oneshot回复，使用Rust名称，空项为None。
 不写独立逻辑段；持有关系使用树形图。
+方法使用下列层级；--仅承载简短说明，执行逻辑写入行为。
+method(args) -> xxx
+    行为：
+        xxx
 ```
 
 # 板块定义
@@ -27,7 +31,10 @@ System分别列出事件、闭包结果、提交闭包和oneshot回复，使用R
 公开，定义于tool_core：
 ```text
 parse_tool_result(value: &serde_json::Value, limits: &ToolExecutionLimits) -> Result<ToolExecuteResponse, ToolError>
-    行为：字符串原样作为文本，其他值序列化为content；识别ok/content/images结果信封；检查文本、图片及整体预算，不创建消息领域类型。
+    行为：
+        字符串原样作为文本，其他值序列化为content；
+        识别ok/content/images结果信封；
+        检查文本、图片及整体预算，不创建消息领域类型。
 ```
 
 ## 类型
@@ -40,9 +47,10 @@ ToolPlugin：工具执行插件
     limits: ToolExecutionLimits
     impl Plugin for ToolPlugin
         build(self, app: &mut App)
-            require 执行设施可用、预算有效、未安装
-            require schedule in [RuntimePlugin::UPDATE, RuntimePlugin::POST_UPDATE]
-            install init_tool_tasks_system, tool_execute_system
+            行为：
+                require 执行设施可用、预算有效、未安装
+                require schedule in [RuntimePlugin::UPDATE, RuntimePlugin::POST_UPDATE]
+                install init_tool_tasks_system, tool_execute_system
 ```
 
 # components
@@ -54,29 +62,42 @@ ToolPlugin：工具执行插件
 ToolTasks：该Agent的工具任务句柄集合，公开组件
     entries: Arc<Mutex<BTreeMap<String, ToolTaskHandle>>>--私有，宿主与任务共享的句柄集合
     register(&self, id: String, handle: ToolTaskHandle) -> Result<(), ToolError>
-        require id未登记
-        entries[id] = handle -- 空缓存，cursor=0，returned=false，唯一reply
+        行为：
+            require id未登记
+            entries[id] = handle
+            空缓存，cursor=0，returned=false，唯一reply
     cancel(&self, id: &str) -> Result<(), ToolError>
-        行为：向对应句柄请求取消，不直接中断监督任务或删除句柄。
+        行为：
+            向对应句柄请求取消，不直接中断监督任务或删除句柄。
     list(&self) -> Vec<(String, ToolTaskHandle)>
-        return entries中的活任务句柄克隆
+        行为：
+            return entries中的活任务句柄克隆
     read(&self, id: &str) -> Result<TaskReadResult, ToolError>
-        行为：从集合取得仍存活任务后，同一短锁读取output[cursor..]并将相邻字符串无分隔符拼成一项，非字符串原样保留顺序；读取活任务error，将cursor推进至当前末尾，返回并清除replaced标记。
+        行为：
+            从集合取得仍存活任务后，同一短锁读取output[cursor..]并将相邻字符串无分隔符拼成一项，非字符串原样保留顺序；
+            读取活任务error，将cursor推进至当前末尾，返回并清除replaced标记。
     send(&self, id: &str, value: serde_json::Value) -> Result<(), ToolError>
-        行为：向目标Lua输入通道投递一个值；目标已finish返回TaskMissing；通道关闭或满返回错误，不宣称接收方已处理。
+        行为：
+            向目标Lua输入通道投递一个值；
+            目标已finish返回TaskMissing；
+            通道关闭或满返回错误，不宣称接收方已处理。
     finish(&self, id: &str) -> Future<Output = Result<(), ToolError>>
-        request cancel(id)
-        await Lua、进程及后代、管道、临时资源真实清理
-        success: entries.remove(id); release cache; return Ok(())
-        failure: return error; retain supervision
+        行为：
+            request cancel(id)
+            await Lua、进程及后代、管道、临时资源真实清理
+            success: entries.remove(id); release cache; return Ok(())
+            failure: return error; retain supervision
     abort_unreturned(&self) -> 工具中止交接结果
-        for handle in entries:
-            atomic if !handle.returned:
-                reply 原call_id/alias的中止结果
-                handle.returned = true
-                handle.cancel() -- 同步触发，不等待清理
+        行为：
+            for handle in entries:
+                atomic if !handle.returned:
+                    reply 原call_id/alias的中止结果
+                    handle.returned = true
+                    handle.cancel()
+                    同步触发，不等待清理
     impl Clone for ToolTasks
-        行为：共享同一集合，不借用World。
+        行为：
+            共享同一集合，不借用World。
     impl Component for ToolTasks
 ```
 
@@ -114,7 +135,8 @@ init_tool_tasks_system(world: &mut World)
     提交闭包：None
     产出事件：None
     oneshot回复：Result<(), ToolError>
-    行为：InitToolTasks -> handle_init_tool_tasks。
+    行为：
+        InitToolTasks -> handle_init_tool_tasks。
 
 tool_execute_system(world: &mut World)
     处理事件：ToolExecuteRequest
@@ -122,7 +144,9 @@ tool_execute_system(world: &mut World)
     提交闭包：launch_tool(ToolExecutionContext) -> Future<Output = Result<ToolLaunchOutput, ToolLaunchError>>
     产出事件：None
     oneshot回复：Result<ToolExecuteResponse, ToolError>
-    行为：在中止schedule之后执行；ToolExecuteRequest -> handle_tool_execute，逐请求复检当前turn，不使用发出时状态代替受理检查。
+    行为：
+        在中止schedule之后执行；
+        ToolExecuteRequest -> handle_tool_execute，逐请求复检当前turn，不使用发出时状态代替受理检查。
 ```
 
 # handler
@@ -132,30 +156,43 @@ tool_execute_system(world: &mut World)
 crate公开：
 ```text
 handle_init_tool_tasks(world: &mut World, request: InitToolTasks)
-    行为：认领reply，检查agent实体；不存在ToolTasks则挂载空集合，已存在不覆盖；组件可查询后回复Ok(())，失败回复ToolError。
+    行为：
+        认领reply，检查agent实体；
+        不存在ToolTasks则挂载空集合，已存在不覆盖；
+        组件可查询后回复Ok(())，失败回复ToolError。
 
 handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
     行为：
-        认领reply，核对Agent完整Entity、Working及当前非空turn与request.turn匹配；无turn或不匹配直接返回保留call_id/alias的中止工具结果，不注册任务、不启动闭包或进程。
+        认领reply，核对Agent完整Entity、Working及当前非空turn与request.turn匹配；
+        无turn或不匹配直接返回保留call_id/alias的中止工具结果，不注册任务、不启动闭包或进程。
         entry = Tools.get(request.alias) or return 对应工具错误
         使用entry.input_schema校验arguments
-        按entry.path执行；owner_task_id与binding放入context
+        按entry.path执行；
+        owner_task_id与binding放入context
         从SelectedSandbox及Sandboxes取得可选策略路径
-        -- 模型参数不能覆盖宿主context标记
+        模型参数不能覆盖宿主context标记
         固定本次工具、策略路径和目录参数，准备owned执行材料，不跨await借用World。
-        创建共享ToolTaskHandle，一份登记ToolTasks，克隆一份及共享集合句柄交给工作任务；通过send_async_closure提交launch_tool，失败通过原reply回复错误；不缓存执行器Handle。
+        创建共享ToolTaskHandle，一份登记ToolTasks，克隆一份及共享集合句柄交给工作任务；
+        通过send_async_closure提交launch_tool，失败通过原reply回复错误；
+        不缓存执行器Handle。
 ```
 
 私有：
 ```text
 launch_tool(context: ToolExecutionContext) -> Future<Output = Result<ToolLaunchOutput, ToolLaunchError>>
-    行为：在普通异步闭包内部创建本领域监督任务，立即把真实JoinHandle交给已登记的ToolTaskHandle，再返回启动结果。该闭包结果只证明启动交接，不表示工具完成；supervise_tool才负责业务reply和真实清理。启动异常记录于原ToolTask并完成原reply，System只收口启动事实，不反向控制其他领域。
+    行为：
+        在普通异步闭包内部创建本领域监督任务，立即把真实JoinHandle交给已登记的ToolTaskHandle，再返回启动结果。该闭包结果只证明启动交接，不表示工具完成；
+        supervise_tool才负责业务reply和真实清理。启动异常记录于原ToolTask并完成原reply，System只收口启动事实，不反向控制其他领域。
 
 supervise_tool(context: ToolExecutionContext) -> Future<Output = ()>
     行为：
-        blocking worker按ToolEntry.path读取要执行的程序，schema直接使用Tools记录；sandbox_resource_core::read_sandbox读取策略，不重新读取工具定义。
-        校验arguments与本入口的有效schema、具体后端策略；检查取消及所有者存活后启动run_runner，动态入口不读取注册schema作回退。配置及execute收到相同可信owner_task_id/binding/resource_dir，不接受arguments覆盖。
-        接收runner的Return时通过共享句柄的原子return裁决交付结果，不结束runner；中止、错误与正常Return共用唯一回复端，不能在context另持独立可回复状态；持续处理缓存写入、覆盖及任务输入。
+        blocking worker按ToolEntry.path读取要执行的程序，schema直接使用Tools记录；
+        sandbox_resource_core::read_sandbox读取策略，不重新读取工具定义。
+        校验arguments与本入口的有效schema、具体后端策略；
+        检查取消及所有者存活后启动run_runner，动态入口不读取注册schema作回退。配置及execute收到相同可信owner_task_id/binding/resource_dir，不接受arguments覆盖。
+        接收runner的Return时通过共享句柄的原子return裁决交付结果，不结束runner；
+        中止、错误与正常Return共用唯一回复端，不能在context另持独立可回复状态；
+        持续处理缓存写入、覆盖及任务输入。
         自然退出/finish/到期/中止:
             World闭包: Tools.remove_owner(task_id)
             for B in ToolTasks where B.owner_task_id == task_id and !B.returned:
@@ -163,64 +200,110 @@ supervise_tool(context: ToolExecutionContext) -> Future<Output = ()>
             未return则交付对应失败结果
             await VM、runner、后代、管道、临时文件真实清理
             ToolTasks移除本任务; release cache
-        已回复调用不得重复回复；后台异常记录于对应任务error，未回复调用按实际错误完成。
-        清理失败及时交付CleanupFailed；保持未finish并保留本次runner管理能力继续清理，不标记已finish。
+        已回复调用不得重复回复；
+        后台异常记录于对应任务error，未回复调用按实际错误完成。
+        清理失败及时交付CleanupFailed；
+        保持未finish并保留本次runner管理能力继续清理，不标记已finish。
 
 run_runner(context: RunnerContext) -> Future<Output = Result<(), ToolError>>
-    行为：启动可信supervisor及受限worker；并行投递stdin、读取有界stdout/stderr和等待退出；取消或超时终止执行并等待清理；处理双向协议帧；Return不是进程终态，真实退出清理后返回。
+    行为：
+        启动可信supervisor及受限worker；
+        并行投递stdin、读取有界stdout/stderr和等待退出；
+        取消或超时终止执行并等待清理；
+        处理双向协议帧；
+        Return不是进程终态，真实退出清理后返回。
 
 run_tool_worker(request: RunnerRequest) -> Result<(), ToolError>
-    行为：在受沙箱限制的worker内创建Lua，先以纯计算环境加载脚本并运行configure(arguments, context)，内存及指令预算始终生效；配置经Configured帧往返确认后安装IO/OS和任务宿主，再运行execute(arguments, context)，不重新加载脚本。自然退出也进入清理；task_finish自身以控制退出终止后续Lua语句，不等待自身JoinHandle。
+    行为：
+        在受沙箱限制的worker内创建Lua，先以纯计算环境加载脚本并运行configure(arguments, context)，内存及指令预算始终生效；
+        配置经Configured帧往返确认后安装IO/OS、package.config通用路径配置和任务宿主，再运行execute(arguments, context)，不重新加载脚本。执行阶段os.execute和io.popen报错并提示使用process_open。自然退出也进入清理；
+        task_finish自身以控制退出终止后续Lua语句，不等待自身JoinHandle。
+        Lua执行错误及failed回复只交付错误类别与说明，剥离stack traceback；成功输出保持原样。
 ```
 
 ## Lua宿主函数
 
 ```text
 task_write(value)
-    行为：向当前任务缓存追加一个完整结构化值，不移动cursor；超预算明确报错，不静默丢未读内容。
+    行为：
+        向当前任务缓存追加一个完整结构化值，不移动cursor；
+        超预算明确报错，不静默丢未读内容。
 task_replace(value)
-    行为：将缓存整体替换为[value]并置cursor=0、replaced=true；覆盖与读取使用同一短锁。
+    行为：
+        将缓存整体替换为[value]并置cursor=0、replaced=true；
+        覆盖与读取使用同一短锁。
 task_return(value)
-    行为：校验并转换为ToolExecuteResponse，原子竞争共享return状态及reply并交付一次；不释放VM、不关闭任务输入。中止已强制return后不得再次回复。
+    行为：
+        校验并转换为ToolExecuteResponse，原子竞争共享return状态及reply并交付一次；
+        不释放VM、不关闭任务输入。中止已强制return后不得再次回复。
 task_finish(task_id)
-    行为：仅操作当前Agent任务；自身通过控制退出结束Lua，由监督者完成清理和集合移除；其他任务调用在真实清理并移除后才成功。不能先声明finished再清理；已finish目标不存在。
+    行为：
+        仅操作当前Agent任务；
+        自身通过控制退出结束Lua，由监督者完成清理和集合移除；
+        其他任务调用在真实清理并移除后才成功。不能先声明finished再清理；
+        已finish目标不存在。
 task_read(task_id)
-    行为：读取同Agent活任务缓存的新增值和错误，并推进cursor；不返回completed状态，已finish目标返回TaskMissing。
+    行为：
+        读取同Agent活任务缓存的新增值和错误，并推进cursor；
+        不返回completed状态，已finish目标返回TaskMissing。
 task_send(task_id, value)
-    行为：向同Agent目标任务的Lua输入通道投递任意结构化值。
+    行为：
+        向同Agent目标任务的Lua输入通道投递任意结构化值。
 task_receive()
-    行为：异步接收当前Lua的一条输入，不持锁等待；输入含义及转发位置由工具代码决定。动态调用等待同时受B自身Task生命周期与所有者依赖通知控制，A关闭时返回错误而非无限等待。
+    行为：
+        异步接收当前Lua的一条输入，不持锁等待；
+        输入含义及转发位置由工具代码决定。动态调用等待同时受B自身Task生命周期与所有者依赖通知控制，A关闭时返回错误而非无限等待。
 
 tool_inject(definitions: Vec<InjectedToolDefinition>) -> 注册入口结果
-    require configure已确认
-    通过既有worker帧提交definitions
-    宿主填path=当前工具资源，owner_task_id=当前任务
-    World闭包:
-        require 当前任务仍存在且未取消
-        validate definitions
-        Tools.insert_batch(definitions) -- alias冲突整批报错
-    return 登记结果 -- 清理出口移除本任务所属记录
+    行为：
+        require configure已确认
+        通过既有worker帧提交definitions
+        宿主填path=当前工具资源，owner_task_id=当前任务
+        World闭包:
+            require 当前任务仍存在且未取消
+            validate definitions
+            Tools.insert_batch(definitions)
+            alias冲突整批报错
+        本任务清理时移除其所属记录
+        return 登记结果
+
+await_any(operations: Table<String, Function>) -> Future<Output = (String, LuaValue)>
+    行为：
+        并发等待命名操作，返回首个完成操作的名称及值；
+        该操作失败则传播错误，剩余等待随本次调用释放。空表报错，不增加任务、协议或管理器。
+        通用异步原语，独立安装，不依赖终端。
 
 process_open(options) -> ProcessSession
     options.program: String--明确的可执行文件路径
     options.arguments: Vec<String>--argv数组，禁止隐式shell拼接
-    在当前沙箱worker内spawn(program, arguments, cwd=context.project_root)
-    stdin/stdout/stderr = pipes
-    return ProcessSession -- 子进程归当前ToolTask
-    -- 沿用ToolTask的timeout_ms、取消及finish清理
+    行为：
+        在当前沙箱worker内spawn(program, arguments, cwd=context.project_root)
+        stdin/stdout/stderr = pipes
+        子进程归当前ToolTask
+        沿用ToolTask的timeout_ms、取消及finish清理
+        return ProcessSession
 
 ProcessSession：Lua userdata，实际进程和管道仅由worker持有，不作为JSON帧传回宿主
     write(bytes: LuaString) -> Future<Output = ()>
-        await 按写入顺序将完整bytes写入stdin -- 保持原始字节、支持背压
+        行为：
+            await 按写入顺序将完整bytes写入stdin
+            保持原始字节、支持背压
     read() -> Future<Output = {data: LuaString, eof: bool}>
-        return await stdout有界字节块及EOF -- 单一读取者；消息边界由工具解析
+        行为：
+            return await stdout有界字节块及EOF
+            单一读取者；消息边界由工具解析
     read_stderr() -> Future<Output = {data: LuaString, eof: bool}>
-        return await stderr有界字节块及EOF -- 独立消费，超预算报错
+        行为：
+            return await stderr有界字节块及EOF
+            独立消费，超预算报错
     wait() -> Future<Output = {exit_code: Option<i32>, signal: Option<i32>}>
-        await 进程退出并回收
-        return exit_code, signal
+        行为：
+            await 进程退出并回收
+            return exit_code, signal
     close() -> Future<Output = ()>
-        await 终止并回收子进程及管道 -- 不自动finish当前ToolTask
+        行为：
+            await 终止并回收子进程及管道
+            不自动finish当前ToolTask
     -- 错误沿ToolError交付
 ```
 
@@ -287,9 +370,12 @@ ToolContext：worker上下文
 ```text
 ToolTaskHandle：可克隆的任务共享句柄，公开类型
     inner: Arc<ToolTaskShared>
-    is_cleanup_complete(&self) -> bool--仅内部清理等待者使用，不是对外completed状态或完成缓存
+    is_cleanup_complete(&self) -> bool
+        行为：
+            仅内部清理等待者查询清理是否完成，不提供对外completed状态或完成缓存。
     impl Clone
-        行为：共享同一任务状态、输入与取消能力，不复制任务。
+        行为：
+            共享同一任务状态、输入与取消能力，不复制任务。
 
 ToolTaskShared：任务持有数据
     cancel: CancellationToken--存活任务取消能力；回合中止只触发原子裁决仍未return的任务，不取消已return后台任务
@@ -337,7 +423,11 @@ ToolExecutionLimits：单次执行预算
 
 ToolConfiguration：Lua配置函数返回的本次时间预算
     timeout_ms: u64
-    行为：仅此一个必填字段，正整数为ToolTask存活毫秒数，0不限时；未知字段、负数及不可表示时间拒绝，无后端默认值。ToolTask保存配置确认时确定的deadline，到期取消并等待真实清理后完成，不另设宿主、shell或清理限时。只有configure确认后才安装执行能力并调用execute。
+    行为：
+        timeout_ms为唯一必填字段；正整数为ToolTask存活毫秒数，0不限时。
+        拒绝未知字段、负数及不可表示时间，不使用后端默认值。
+        ToolTask保存配置确认时确定的deadline；到期取消，等待真实清理后完成。
+        不另设宿主、shell或清理限时；仅configure确认后安装执行能力并调用execute。
 ```
 
 # error

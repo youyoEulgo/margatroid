@@ -388,7 +388,6 @@ pub enum StopReasonDto {
     ToolCalls,
     Length,
     ContentFilter,
-    Cancelled,
     Other(String),
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -4,6 +4,10 @@
 类型、函数使用二级标题，列出字段、签名及直接行为。
 System区分事件、闭包结果、提交闭包与oneshot回复，使用Rust名称，空项为None。
 不写独立逻辑段；持有关系使用树形图。
+方法使用下列层级；--仅承载简短说明，执行逻辑写入行为。
+method(args) -> xxx
+    行为：
+        xxx
 ```
 
 # 板块定义
@@ -26,9 +30,11 @@ System区分事件、闭包结果、提交闭包与oneshot回复，使用Rust名
 ```text
 WorldToolResourceExt：工具入口扩展，公开trait
     tool_entry(&self, owner: Entity, alias: &str) -> Result<&ToolEntry, ToolResourceError>
-        行为：从该Agent的Tools按alias借用记录，不跨Agent查询。
+        行为：
+            从该Agent的Tools按alias借用记录，不跨Agent查询。
     tool_path(&self, owner: Entity, alias: &str) -> Result<&Path, ToolResourceError>
-        行为：借用同一ToolEntry.path。
+        行为：
+            借用同一ToolEntry.path。
     impl WorldToolResourceExt for World
 ```
 
@@ -39,7 +45,9 @@ ToolResourcePlugin：工具路径登记插件
     limits: ToolReadLimits
     impl Plugin for ToolResourcePlugin
         build(self, app: &mut App)
-            行为：检查异步设施，拒绝重复安装；安装tool_resource_system。
+            行为：
+                检查异步设施，拒绝重复安装；
+                安装tool_resource_system。
 ```
 
 ## 函数
@@ -47,9 +55,11 @@ ToolResourcePlugin：工具路径登记插件
 公开，定义于tool_resource_core：
 ```text
 read_tool(path: &Path, limits: &ToolReadLimits) -> Result<ToolInput, ToolResourceError>
-    有界读取tool.toml、input.schema.json、main.lua
-    validate 清单版本、非空描述、JSON对象schema、无外部引用、Lua UTF-8
-    return ToolInput -- 仅读取，不执行程序
+    行为：
+        有界读取tool.toml、input.schema.json、main.lua
+        validate 清单版本、非空描述、JSON对象schema、无外部引用、Lua UTF-8
+        return ToolInput
+        仅读取，不执行程序
 ```
 
 # components
@@ -61,17 +71,23 @@ read_tool(path: &Path, limits: &ToolReadLimits) -> Result<ToolInput, ToolResourc
 Tools：Agent唯一工具集合，公开组件
     entries: BTreeMap<String, ToolEntry>--alias到记录
     get(&self, alias: &str) -> Option<&ToolEntry>
-        return entries.get(alias)
+        行为：
+            return entries.get(alias)
     insert(&mut self, alias: String, entry: ToolEntry) -> Result<(), ToolResourceError>
-        require alias未占用
-        entries.insert(alias, entry)
+        行为：
+            require alias未占用
+            entries.insert(alias, entry)
     insert_batch(&mut self, entries: Vec<(String, ToolEntry)>) -> Result<(), ToolResourceError>
-        validate 整批记录及alias冲突
-        原子写入entries -- 失败不修改集合
+        行为：
+            validate 整批记录及alias冲突
+            原子写入entries
+            失败不修改集合
     remove_owner(&mut self, owner_task_id: &str)
-        entries.retain(entry.owner_task_id != owner_task_id)
+        行为：
+            entries.retain(entry.owner_task_id != owner_task_id)
     iter(&self) -> impl Iterator<Item = (&String, &ToolEntry)>
-        return entries.iter()
+        行为：
+            return entries.iter()
     impl Component for Tools
 ```
 
@@ -102,8 +118,9 @@ tool_resource_system(world: &mut World)
     提交闭包：validate_import(ImportContext) -> Future<Output = Result<ImportOutput, ImportError>>
     产出事件：None
     oneshot回复：Result<(), ToolResourceError>
-    ImportTool -> handle_import
-    Result<ImportOutput, ImportError> -> handle_import_result
+    行为：
+        ImportTool -> handle_import
+        Result<ImportOutput, ImportError> -> handle_import_result
 ```
 
 # handler
@@ -113,22 +130,26 @@ tool_resource_system(world: &mut World)
 crate公开：
 ```text
 handle_import(world: &mut World, request: ImportTool)
-    认领reply
-    validate owner、alias、cancel
-    send_async_closure(validate_import)
-    failure: reply Err(error)
+    行为：
+        认领reply
+        validate owner、alias、cancel
+        send_async_closure(validate_import)
+        failure: reply Err(error)
 
 handle_import_result(world: &mut World, result: Result<ImportOutput, ImportError>)
-    require owner有效且未cancel
-    success: Tools.insert(alias, ToolEntry{description, input_schema, path, owner_task_id=None, binding=None})
-    reply 登记结果
+    行为：
+        require owner有效且未cancel
+        success: Tools.insert(alias, ToolEntry{description, input_schema, path, owner_task_id=None, binding=None})
+        reply 登记结果
 ```
 
 私有：
 ```text
 validate_import(context: ImportContext) -> Future<Output = Result<ImportOutput, ImportError>>
-    await spawn_blocking(验证规范路径和文件; read_tool)
-    return ImportOutput(context, path, description, input_schema) -- 丢弃此次程序正文
+    行为：
+        await spawn_blocking(验证规范路径和文件; read_tool)
+        丢弃此次程序正文
+        return ImportOutput(context, path, description, input_schema)
 ```
 
 # types
@@ -160,7 +181,8 @@ InjectedToolDefinition：注入项
     description: String
     input_schema: serde_json::Value
     binding: Option<serde_json::Value>
-    -- 宿主填path和owner_task_id
+    行为：
+        宿主填path和owner_task_id
 
 ToolInput：本次工具材料
     description: String

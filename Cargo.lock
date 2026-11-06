@@ -2316,6 +2316,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell-client"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "serde",
+ "serde_json",
+ "tokio",
+ "vt100",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2706,7 +2717,6 @@ dependencies = [
  "tokio-util",
  "tool_core",
  "tool_resource_core",
- "vt100",
  "workspace_core",
 ]
 

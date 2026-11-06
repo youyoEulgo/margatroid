@@ -8,18 +8,21 @@ TypeName：中文类型名，可见性类型--类型说明
     method_name<Generic>(self, parameter: ParameterType) -> ReturnType
         中文方法名：可见性方法，解释参数和用途
         约束：使用标准Rust where约束；单个约束写在同一行
-        行为：展开完整逻辑
+        行为：
+            展开完整逻辑
     impl TraitName for TypeName
         TraitName：可见性trait实现
         trait_method_name(&self, parameter: ParameterType) -> ReturnType
             中文方法名：解释参数和用途
-            行为：标准库trait的简单行为用一句话说明
+            行为：
+                标准库trait的简单行为用一句话说明
 
 函数：使用二级标题，按私有、crate公开和公开分组，只放置不属于某个类型的操作
 function_name<Generic>(parameter: ParameterType) -> ReturnType
     中文函数名：可见性函数，解释参数和用途
     约束：使用标准Rust where约束；单个约束写在同一行
-    行为：展开完整逻辑
+    行为：
+        展开完整逻辑
 
 逻辑：使用二级标题，按执行顺序描述对象之间的调用关系
 注释：字段注释使用--，类型、方法和函数的说明直接写在标题中
@@ -54,12 +57,14 @@ RuntimeError：Runtime错误，公开枚举--描述Runtime公开API能够识别�
     GateOperationUnbalanced
     panic(self) -> !
         终止：crate公开方法，消费当前RuntimeError并使用Display文本终止执行
-        行为：使用自身Display描述触发panic
+        行为：
+            使用自身Display描述触发panic
     impl fmt::Display for RuntimeError
         Display：公开trait实现
         fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result
             格式化错误：formatter接收稳定的错误描述
-            行为：输出包含错误类型与上下文的稳定错误描述
+            行为：
+                输出包含错误类型与上下文的稳定错误描述
     impl std::error::Error for RuntimeError
         Error：公开trait实现
 
@@ -72,12 +77,14 @@ RuntimePlugin：Runtime插件，公开结构体
     POST_UPDATE: &'static str--公开关联常量，等于"post_update"，每帧最后执行
     fixed(frame_rate: u64) -> Self
         构造固定帧Runtime：公开关联函数，frame_rate指定每秒执行帧数
-        行为：frame_rate为0时终止并报告RuntimeError::InvalidFrameRate，否则构造固定帧模式
+        行为：
+            frame_rate为0时终止并报告RuntimeError::InvalidFrameRate，否则构造固定帧模式
     impl Default for RuntimePlugin
         Default：公开trait实现
         default() -> Self
             构造默认Runtime：构造事件驱动模式
-            行为：返回mode为EventDriven且frame_rate为None的RuntimePlugin
+            行为：
+                返回mode为EventDriven且frame_rate为None的RuntimePlugin
     impl Plugin for RuntimePlugin
         Plugin：公开trait实现
         build(self, app: &mut App)
@@ -96,19 +103,24 @@ RuntimeHandle：Runtime句柄，公开结构体--可克隆并交给其他Plugin�
     wake_sender: SyncSender<()>--通知发送端，私有；绑定当前Runtime，接收端销毁后wake会报告断开
     new(wake_sender: SyncSender<()>) -> Self
         构造Runtime句柄：crate公开关联函数，wake_sender发送运行时唤醒通知
-        行为：使用wake_sender和初始值0构造共享blocker_count
+        行为：
+            使用wake_sender和初始值0构造共享blocker_count
     wake(&self)
         唤醒：公开方法，向Runtime发送一次非阻塞唤醒通知
-        行为：通道已有通知时直接返回，通道断开时终止并报告RuntimeError::WakeChannelDisconnected
+        行为：
+            通道已有通知时直接返回，通道断开时终止并报告RuntimeError::WakeChannelDisconnected
     open_gate(&self)
         开阀：公开方法，解除一层下一帧阻塞
-        行为：原子检查blocker_count并在非0时减1；原值为0时报告GateOperationUnbalanced；变为0时调用wake
+        行为：
+            原子检查blocker_count并在非0时减1；原值为0时报告GateOperationUnbalanced；变为0时调用wake
     close_gate(&self)
         关阀：公开方法，增加一层下一帧阻塞
-        行为：blocker_count加1，当前帧继续完成，下一帧开始前进入等待
+        行为：
+            blocker_count加1，当前帧继续完成，下一帧开始前进入等待
     is_gate_open(&self) -> bool
         检查阀：crate公开方法，查询是否不存在下一帧阻塞
-        行为：blocker_count为0时返回true
+        行为：
+            blocker_count为0时返回true
     impl Resource for RuntimeHandle
         Resource：公开trait实现
 
@@ -117,57 +129,70 @@ RuntimeEventSender：Runtime事件发送器，公开结构体--可克隆并跨�
     runtime: RuntimeHandle--Runtime句柄，私有
     new(emitter: EventEmitter, runtime: RuntimeHandle) -> Self
         构造发送器：crate公开关联函数，组合Core事件发射器与Runtime句柄
-        行为：持有emitter与runtime
+        行为：
+            持有emitter与runtime
     send_event<E>(&self, event: E)
         发送事件：公开泛型方法，event是立即发送的事件
         约束：E: Event
-        行为：调用EventEmitter::emit_event后调用RuntimeHandle::wake
+        行为：
+            调用EventEmitter::emit_event后调用RuntimeHandle::wake
     send_event_after<E>(&self, event: E, delay: u64)
         延迟发送事件：公开泛型方法，delay指定额外延迟帧数
         约束：E: Event
-        行为：调用EventEmitter::emit_event_after后调用RuntimeHandle::wake
+        行为：
+            调用EventEmitter::emit_event_after后调用RuntimeHandle::wake
 
 AppRunExt：App运行扩展，公开trait--由RuntimePlugin为App提供运行入口
     run(&mut self)
         运行：公开方法，由当前App进入Runtime循环
-        行为：调用run_until(|| false)，保持持续运行
+        行为：
+            调用run_until(|| false)，保持持续运行
     run_until(&mut self, should_stop: impl Fn() -> bool)
         按条件运行：公开方法，should_stop提供外部停止条件
-        行为：从World移出RuntimeControl；缺少Runtime时报告RuntimePluginMissing，已被移出时报告RuntimeAlreadyRunning；调用RuntimeControl::run_until，正常返回后将RuntimeControl重新插入World
+        行为：
+            从World移出RuntimeControl；缺少Runtime时报告RuntimePluginMissing，已被移出时报告RuntimeAlreadyRunning；调用RuntimeControl::run_until，正常返回后将RuntimeControl重新插入World
     impl AppRunExt for App
         AppRunExt for App：公开trait实现
         run(&mut self)
             运行：由当前App持续运行
-            行为：按trait定义执行
+            行为：
+                按trait定义执行
         run_until(&mut self, should_stop: impl Fn() -> bool)
             按条件运行：由should_stop决定是否退出循环
-            行为：按trait定义执行
+            行为：
+                按trait定义执行
 
 WorldEventExt：World事件扩展，公开trait--提供会唤醒Runtime的事件发送入口，不替换Core原有事件方法
     event_sender(&self) -> RuntimeEventSender
         获取Runtime事件发送器：公开方法
-        行为：获取RuntimeHandle和World的EventEmitter并构造发送器；RuntimeHandle不存在时报告RuntimePluginMissing
+        行为：
+            获取RuntimeHandle和World的EventEmitter并构造发送器；RuntimeHandle不存在时报告RuntimePluginMissing
     send_event<E>(&self, event: E)
         发送事件：公开泛型方法，event是立即发送的事件
         约束：E: Event
-        行为：调用event_sender().send_event(event)
+        行为：
+            调用event_sender().send_event(event)
     send_event_after<E>(&self, event: E, delay: u64)
         延迟发送事件：公开泛型方法，delay指定额外延迟帧数
         约束：E: Event
-        行为：调用event_sender().send_event_after(event, delay)
+        行为：
+            调用event_sender().send_event_after(event, delay)
     impl WorldEventExt for World
         WorldEventExt for World：公开trait实现
         event_sender(&self) -> RuntimeEventSender
             获取Runtime事件发送器：使用World资源和Core事件发射器构造发送器
-            行为：按trait定义执行
+            行为：
+                按trait定义执行
         send_event<E>(&self, event: E)
             发送事件：event是立即发送的事件
             约束：E: Event
-            行为：按trait定义执行
+            行为：
+                按trait定义执行
         send_event_after<E>(&self, event: E, delay: u64)
             延迟发送事件：delay指定额外延迟帧数
             约束：E: Event
-            行为：按trait定义执行
+            行为：
+                按trait定义执行
 ```
 
 crate公开：
@@ -180,10 +205,12 @@ RuntimeControl：Runtime控制器，crate公开结构体--配置阶段由World�
     event_snapshot: EventSnapshot--事件快照，每次判断下一帧前重新同步
     new(mode: RuntimeMode, frame_rate: Option<u64>, handle: RuntimeHandle, wake_receiver: Receiver<()>, event_snapshot: EventSnapshot) -> Self
         构造控制器：crate公开关联函数，接收运行配置、通知端与初始事件快照
-        行为：使用全部参数构造RuntimeControl
+        行为：
+            使用全部参数构造RuntimeControl
     sync_event_snapshot(&mut self, app: &App)
         同步事件快照：私有方法，app提供最新World状态
-        行为：调用World::event_snapshot覆盖event_snapshot
+        行为：
+            调用World::event_snapshot覆盖event_snapshot
     status(&self) -> RuntimeState
         获取运行状态：私有方法
         行为：
@@ -195,19 +222,24 @@ RuntimeControl：Runtime控制器，crate公开结构体--配置阶段由World�
             Closed暂不参与判断
     wait(wake_receiver: &Receiver<()>)
         等待唤醒：私有关联函数，wake_receiver接收唤醒通知
-        行为：阻塞读取已从Resource取出的接收端；已有通知时立即返回，断开时报告WakeChannelDisconnected
+        行为：
+            阻塞读取已从Resource取出的接收端；已有通知时立即返回，断开时报告WakeChannelDisconnected
     run_until(&mut self, app: &mut App, should_stop: impl Fn() -> bool)
         按条件运行：crate公开方法，app是被当前控制器独占驱动的应用
-        行为：首先检查should_stop，为true时直接返回；否则短暂锁定wake_receiver并取出所有权，释放锁后按mode进入对应循环；循环正常返回后重新锁定并存回接收端，不修改阀计数
+        行为：
+            首先检查should_stop，为true时直接返回；否则短暂锁定wake_receiver并取出所有权，释放锁后按mode进入对应循环；循环正常返回后重新锁定并存回接收端，不修改阀计数
     run_fixed_frame(&mut self, app: &mut App, wake_receiver: &Receiver<()>, should_stop: &impl Fn() -> bool)
         固定帧运行：私有方法，按frame_rate驱动app
-        行为：每轮循环开始检查should_stop，为true时返回；否则执行固定帧循环，保留原帧间sleep；等待唤醒后先回到停止检查再决定是否推进帧
+        行为：
+            每轮循环开始检查should_stop，为true时返回；否则执行固定帧循环，保留原帧间sleep；等待唤醒后先回到停止检查再决定是否推进帧
     run_event_driven(&mut self, app: &mut App, wake_receiver: &Receiver<()>, should_stop: &impl Fn() -> bool)
         事件驱动运行：私有方法，按事件快照驱动app
-        行为：每轮循环开始检查should_stop，为true时返回；初始帧尚未执行且开阀时执行初始帧，然后进入下一轮；关阀时阻塞等待，开阀后的后续帧按事件快照驱动；等待唤醒后先回到停止检查
+        行为：
+            每轮循环开始检查should_stop，为true时返回；初始帧尚未执行且开阀时执行初始帧，然后进入下一轮；关阀时阻塞等待，开阀后的后续帧按事件快照驱动；等待唤醒后先回到停止检查
     run_initial_frame(&mut self, app: &mut App)
         执行初始帧：私有方法，在事件驱动循环开始前调用app.tick并同步EventSnapshot
-        行为：保证空事件队列下也会执行STARTUP和第一帧循环Schedule
+        行为：
+            保证空事件队列下也会执行STARTUP和第一帧循环Schedule
     impl Resource for RuntimeControl
         Resource：crate公开trait实现
 ```

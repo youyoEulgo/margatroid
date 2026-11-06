@@ -113,7 +113,7 @@ local function inject_context(message)
     for _, item in ipairs(message.messages or {}) do
         if item.type == "inject" then
             inject_context(item)
-        elseif item.type ~= "assistant" or item.stop_reason ~= "cancelled" then
+        else
             command("INJECT ? TO session.conversation[-1]", {{item}})
         end
     end
@@ -142,13 +142,13 @@ local function process_next()
             local result = inference()
             command("INJECT ? TO entry.pending[-1]", {{result}})
         elseif message.type == "assistant" then
-            if message.stop_reason ~= "cancelled" then
+            if (message.content and message.content ~= "")
+                or (message.reasoning and message.reasoning ~= "")
+                or #(message.tool_calls or {}) > 0 or message.replay then
                 command("INJECT ? TO session.conversation[-1]", {{message}})
             end
             if #(message.tool_calls or {}) == 0 then
-                if message.stop_reason ~= "cancelled" then
-                    maybe_compact_context(message)
-                end
+                maybe_compact_context(message)
                 command("EFFECT finish_turn")
             else
                 local results = tool_call()

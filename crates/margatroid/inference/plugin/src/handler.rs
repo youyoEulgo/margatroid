@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -156,6 +156,7 @@ pub(crate) fn handle_init_inference(world: &mut World, request: InitInference) {
 }
 
 pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
     let Some(reply) = request
         .reply
         .lock()
@@ -172,7 +173,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
         || request.turn.is_empty()
         || agent.turn.as_deref() != Some(request.turn.as_str())
     {
-        let _ = reply.send(Ok(InferenceResponse::cancelled()));
+        let _ = reply.send(Ok(InferenceResponse::empty_completed()));
         return;
     }
     let prepared = (|| {
@@ -207,6 +208,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
                 input_schema: entry.input_schema.clone(),
             })
             .collect();
+        let http_request = build_request(prepare_domain(&request, &route, tools)?, &route)?;
         let agent_address = world
             .get_component::<Address>(request.agent)
             .ok_or_else(|| error(Kind::InvalidRequest, "Agent address missing"))?
@@ -227,8 +229,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             .get_resource::<HttpRuntime>()
             .expect("inference HTTP runtime missing");
         Ok((
-            route,
-            tools,
+            http_request,
             agent_address,
             agent_instance,
             senders,
@@ -236,7 +237,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             runtime.schedule.clone(),
         ))
     })();
-    let (route, tools, agent_address, agent_instance, senders, client, schedule) = match prepared {
+    let (http_request, agent_address, agent_instance, senders, client, schedule) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = reply.send(Err(error));
@@ -270,8 +271,8 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
         },
         request,
         reply: Some(reply),
-        route,
-        tools,
+        http_request: Some(http_request),
+        deadline,
         client,
         gate,
         #[cfg(test)]
@@ -384,12 +385,16 @@ async fn launch_inference(
     Ok(InferenceLaunchOutput)
 }
 
-async fn prepare_domain(context: &InferenceContext) -> Result<DomainRequest, InferenceError> {
-    let mut config = context.request.config.clone();
-    config.model = context.route.model.clone();
+fn prepare_domain(
+    request: &InferenceRequest,
+    route: &ModelRoute,
+    tools: Vec<InferenceToolDefinition>,
+) -> Result<DomainRequest, InferenceError> {
+    let mut config = request.config.clone();
+    config.model = route.model.clone();
     let mut request = DomainRequest {
-        messages: context.request.messages.clone(),
-        tools: context.tools.clone(),
+        messages: request.messages.clone(),
+        tools,
         config,
     };
     normalize(&mut request)?;
@@ -398,18 +403,13 @@ async fn prepare_domain(context: &InferenceContext) -> Result<DomainRequest, Inf
 
 async fn supervise_inference(mut context: InferenceContext) {
     let result = std::panic::AssertUnwindSafe(async {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-        if context.request.cancel.is_cancelled() || context.gate.lock().unwrap_or_else(|error| error.into_inner()).closed {
-            return Ok(frozen_response(&context.gate));
-        }
-        let domain = prepare_domain(&context).await?;
+        let deadline = context.deadline;
         if context.request.cancel.is_cancelled() || context.gate.lock().unwrap_or_else(|error| error.into_inner()).closed {
             return Ok(frozen_response(&context.gate));
         }
         if context.reply.as_ref().is_some_and(|reply| reply.is_closed()) { return Err(error(Kind::ReplyClosed, "inference reply receiver closed")); }
         if tokio::time::Instant::now() >= deadline { return Err(error(Kind::Timeout, "inference preparation exhausted deadline")); }
-        let names = domain.tools.iter().map(|tool| tool.name.clone()).collect::<HashSet<_>>();
-        let request = build_request(domain, &context.route)?;
+        let request = context.http_request.take().expect("inference HTTP request prepared before launch");
         let upstream = CancellationToken::new();
         let (sender, receiver) = mpsc::channel(FRAGMENT_CAPACITY);
         let provider = read_provider(context.client.clone(), request, upstream.clone(), sender);
@@ -464,7 +464,7 @@ async fn supervise_inference(mut context: InferenceContext) {
         if received.as_ref().is_err_and(|failure| failure.kind == Kind::Cancelled) || context.request.cancel.is_cancelled() { return Ok(frozen_response(&context.gate)); }
         received?;
         provider?;
-        let result = context.gate.lock().unwrap_or_else(|error| error.into_inner()).accumulator.response(&names)?;
+        let result = context.gate.lock().unwrap_or_else(|error| error.into_inner()).accumulator.response()?;
         Ok(result)
     }).catch_unwind().await.unwrap_or_else(|_| Err(error(Kind::CleanupFailed, "inference supervisor panicked before cleanup confirmation")));
     finish_inference(&mut context, result);
@@ -498,7 +498,7 @@ fn frozen_response(gate: &Arc<Mutex<StreamGate>>) -> InferenceResponse {
         tool_calls: vec![],
         replay: None,
         usage: None,
-        stop_reason: InferenceStopReason::Cancelled,
+        stop_reason: InferenceStopReason::Completed,
     }
 }
 

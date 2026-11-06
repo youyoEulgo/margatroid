@@ -900,11 +900,6 @@ async fn execute_inference(
 ) -> Result<MclValue, MclError> {
     let mut typed = Vec::new();
     for message in messages {
-        if message.get("type").and_then(Value::as_str) == Some("assistant")
-            && message.get("stop_reason").and_then(Value::as_str) == Some("cancelled")
-        {
-            continue;
-        }
         typed.push(inference_message(message)?);
     }
     let request = context.request.clone();
@@ -941,7 +936,7 @@ async fn execute_inference(
     })
     .await?;
     let response = match receiver {
-        None => InferenceResponse::cancelled(),
+        None => InferenceResponse::empty_completed(),
         Some(receiver) => match receiver
             .await
             .map_err(|_| error(MclErrorKind::CleanupFailed, "inference reply was lost"))?
@@ -1016,7 +1011,7 @@ async fn execute_tools(
                 .and_then(|entries| entries.get(&call.name))
                 .is_none()
             {
-                pending.push((call, None, Some("tool alias is not imported".to_owned())));
+                pending.push((call, None, Some("tool is not imported".to_owned())));
                 continue;
             }
             let (sender, receiver) = oneshot::channel();

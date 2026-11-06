@@ -232,14 +232,14 @@ pub struct InferenceResponse {
     pub stop_reason: InferenceStopReason,
 }
 impl InferenceResponse {
-    pub fn cancelled() -> Self {
+    pub fn empty_completed() -> Self {
         Self {
             reasoning: None,
             content: None,
             tool_calls: vec![],
             replay: None,
             usage: None,
-            stop_reason: InferenceStopReason::Cancelled,
+            stop_reason: InferenceStopReason::Completed,
         }
     }
 }
@@ -250,7 +250,6 @@ pub enum InferenceStopReason {
     ToolCalls,
     Length,
     ContentFilter,
-    Cancelled,
     Other(String),
 }
 impl InferenceStopReason {
@@ -260,7 +259,6 @@ impl InferenceStopReason {
             Self::ToolCalls => "tool_calls",
             Self::Length => "length",
             Self::ContentFilter => "content_filter",
-            Self::Cancelled => "cancelled",
             Self::Other(v) => v,
         }
     }

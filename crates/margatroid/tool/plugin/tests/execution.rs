@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/shell_client.rs"]
+mod shell_client;
+
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -118,6 +121,7 @@ impl Fixture {
         };
         let directory = self.root.path().join(alias);
         std::fs::create_dir_all(&directory).unwrap();
+        shell_client::install_shell(&directory);
         std::fs::write(
             directory.join("tool.toml"),
             "schema_version=1\ndescription='test'\n",
@@ -376,7 +380,7 @@ frame({'type': 'stopped', 'result': {'Ok': None}, 'cleanup_proven': True})
 #[test]
 fn short_return_then_self_finish_stops_even_caught_finish_control() {
     let mut fixture = Fixture::new();
-    fixture.tool("short", "function execute(args, context) task_return('hello'); pcall(function() task_finish(context.task_id) end); shell('touch unreachable-after-finish'); task_write('unreachable') end");
+    fixture.tool("short", "function execute(args, context) task_return('hello'); pcall(function() task_finish(context.task_id) end); process_open({program='/bin/sh',arguments={'-c','touch unreachable-after-finish'}}):wait(); task_write('unreachable') end");
     let reply = fixture.execute("short-task", "short", json!({}));
     let response = fixture.response(reply).unwrap();
     assert_eq!(response.content, "hello");
@@ -568,9 +572,9 @@ fn recorded_schema_is_authoritative_while_program_is_read_for_each_execution() {
 #[test]
 fn independent_supervisor_reaps_setsid_descendants_after_return_and_finish() {
     let mut fixture = Fixture::new();
-    fixture.tool("escape", r#"function execute(args,context)
-        shell("setsid /bin/sh -c 'echo $$ > escaped.pid; exec sleep 15' </dev/null >/dev/null 2>&1 &")
-        shell("while [ ! -s escaped.pid ]; do sleep 0.01; done")
+    fixture.tool("escape", r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+        client.exec("setsid /bin/sh -c 'echo $$ > escaped.pid; exec sleep 15' </dev/null >/dev/null 2>&1 &")
+        client.exec("while [ ! -s escaped.pid ]; do sleep 0.01; done")
         task_return('spawned')
         task_finish(context.task_id)
     end"#);
@@ -728,7 +732,7 @@ fn bundled_bash_exec_sleep_eleven_seconds_succeeds_with_author_configured_budget
 fn shell_obeys_only_the_task_lifetime_including_unlimited() {
     for timeout_ms in [0, 3_000] {
         let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms });
-        fixture.tool("slow-shell", "function execute(args, context) local result=shell('sleep 0.25; printf done'); task_return(result.stdout); task_finish(context.task_id) end");
+        fixture.tool("slow-shell", "function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context); local result=client.exec('sleep 0.25; printf done'); task_return(result.stdout); task_finish(context.task_id) end");
         let reply = fixture.execute("slow-shell", "slow-shell", json!({}));
         assert_eq!(fixture.response(reply).unwrap().content, "done");
         fixture.removed("slow-shell");
@@ -740,8 +744,8 @@ fn task_lifetime_reports_timeout_after_real_descendant_cleanup() {
     let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms: 250 });
     fixture.tool(
         "shell-timeout",
-        r#"function execute()
-        shell("echo $$ > shell.pid; sleep 15 & echo $! > child.pid; wait")
+        r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+        client.exec("echo $$ > shell.pid; sleep 15 & echo $! > child.pid; wait")
         task_return('unexpected success')
     end"#,
     );
@@ -769,8 +773,8 @@ fn total_execution_deadline_still_bounds_shell_work() {
     let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms: 500 });
     fixture.tool(
         "total-timeout",
-        r#"function execute()
-        shell("echo $$ > total-shell.pid; exec sleep 15")
+        r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+        client.exec("echo $$ > total-shell.pid; exec sleep 15")
         task_return('unexpected success')
     end"#,
     );
@@ -790,7 +794,7 @@ fn total_execution_deadline_still_bounds_shell_work() {
 }
 
 #[test]
-fn invalid_shell_timeouts_are_rejected_before_spawning_a_child() {
+fn tool_local_shell_timeouts_are_rejected_before_spawning_a_child() {
     let mut fixture = Fixture::new();
     for (index, timeout) in ["0", "250", "-1", "0.5", "math.huge", "'250'", "true"]
         .iter()
@@ -800,14 +804,15 @@ fn invalid_shell_timeouts_are_rejected_before_spawning_a_child() {
         fixture.tool(
             &id,
             &format!(
-                "function execute() shell('touch unexpected-child', {{timeout_ms={timeout}}}) end"
+                "function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context); client.exec('touch unexpected-child', {{timeout_ms={timeout}}}) end"
             ),
         );
         let reply = fixture.execute(&id, &id, json!({}));
-        assert_eq!(
-            fixture.response(reply).unwrap_err().kind,
-            Kind::InvalidArguments,
-            "{timeout}"
+        let error = fixture.response(reply).unwrap_err();
+        assert_eq!(error.kind, Kind::ExecutionFailed, "{timeout}: {error:?}");
+        assert!(
+            error.message.contains("timeout_ms belongs in configure()"),
+            "{error:?}"
         );
         fixture.removed(&id);
         assert!(!fixture.root.path().join("unexpected-child").exists());
@@ -1009,8 +1014,8 @@ fn a_full_task_mailbox_does_not_block_the_original_call_reply() {
     let mut fixture = Fixture::new();
     fixture.tool(
         "mailbox",
-        r#"function execute(arguments, context)
-        shell("sleep 0.1")
+        r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+        client.exec("sleep 0.1")
         task_return({ ready = true })
         while true do
             local value = task_receive()
@@ -1104,14 +1109,16 @@ fn with_daemon_controlling_terminal(name: &str, test: impl FnOnce()) {
     const CHILD: &str = "MARGATROID_CONTROLLING_TERMINAL_TEST";
     if std::env::var(CHILD).as_deref() == Ok(name) {
         let tty = std::fs::File::open("/dev/tty").expect("daemon must have a controlling terminal");
+        use std::os::fd::AsRawFd;
         assert_eq!(
-            nix::unistd::tcgetpgrp(&tty).unwrap(),
-            nix::unistd::getpgrp()
+            unsafe { nix::libc::tcgetpgrp(tty.as_raw_fd()) },
+            nix::unistd::getpgrp().as_raw()
         );
         assert_eq!(nix::unistd::getsid(None).unwrap(), nix::unistd::getpid());
         test();
         return;
     }
+    shell_client::shell_client();
     let output = std::process::Command::new("python3")
         .arg("-c")
         .arg(r#"
@@ -1209,8 +1216,8 @@ fn runner_does_not_inherit_daemon_controlling_terminal() {
             let mut fixture = Fixture::new();
             fixture.tool(
                 "raw-mode",
-                r#"function execute(args, context)
-                local result = shell([=[python3 - <<'PY'
+                r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+                local result = client.exec([=[python3 - <<'PY'
 import errno, os, signal, termios
 signal.signal(signal.SIGTTOU, signal.SIG_DFL)
 try:
@@ -1249,17 +1256,19 @@ fn cancelling_stopped_runner_group_under_controlling_terminal_reaps_children() {
             let mut fixture = Fixture::new();
             fixture.tool(
                 "stopped",
-                r#"function execute(args, context)
-                local result = shell([=[python3 - <<'PY'
+                r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+                local result = client.exec([=[python3 - <<'PY'
 import json, os
 worker = os.getpid()
 while True:
-    with open('/proc/%d/stat' % worker) as source:
-        parent = int(source.read().rsplit(')', 1)[1].split()[1])
-    if parent == os.getpgrp():
+    with open('/proc/%d/cmdline' % worker, 'rb') as source:
+        command = source.read().split(b'\0')
+    if b'--margatroid-tool-worker' in command:
         break
-    worker = parent
-print(json.dumps(dict(group=os.getpgrp(), worker=worker)))
+    with open('/proc/%d/stat' % worker) as source:
+        worker = int(source.read().rsplit(')', 1)[1].split()[1])
+    assert worker > 1, 'supervised worker missing from process ancestry'
+print(json.dumps(dict(group=os.getpgid(worker), worker=worker)))
 PY]=])
                 task_return(result.stdout)
                 task_receive()
@@ -1351,8 +1360,8 @@ fn accepted_batch_abort_returns_long_call_immediately_and_preserves_returned_bac
     );
     fixture.tool(
         "long-abort",
-        r#"function execute(args, context)
-        shell("sleep 60 & echo $! > abort-child.pid; wait")
+        r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+        client.exec("sleep 60 & echo $! > abort-child.pid; wait")
         task_return('unexpected natural result')
     end"#,
     );
