@@ -142,25 +142,40 @@ impl RuntimeControl {
             .unwrap_or_else(|_| RuntimeError::WakeChannelDisconnected.panic());
     }
 
-    pub(crate) fn run(&mut self, app: &mut App) {
+    pub(crate) fn run_until(&mut self, app: &mut App, should_stop: impl Fn() -> bool) {
+        if should_stop() {
+            return;
+        }
         let wake_receiver = self
             .wake_receiver
             .lock()
             .expect("runtime wake receiver lock poisoned")
             .take()
-            .expect("runtime wake receiver must only be taken once");
+            .expect("runtime wake receiver must be available before running");
         match self.mode {
-            RuntimeMode::FixedFrame => self.run_fixed_frame(app, &wake_receiver),
-            RuntimeMode::EventDriven => self.run_event_driven(app, &wake_receiver),
+            RuntimeMode::FixedFrame => self.run_fixed_frame(app, &wake_receiver, &should_stop),
+            RuntimeMode::EventDriven => self.run_event_driven(app, &wake_receiver, &should_stop),
         }
+        *self
+            .wake_receiver
+            .lock()
+            .expect("runtime wake receiver lock poisoned") = Some(wake_receiver);
     }
 
-    fn run_fixed_frame(&mut self, app: &mut App, wake_receiver: &Receiver<()>) {
+    fn run_fixed_frame(
+        &mut self,
+        app: &mut App,
+        wake_receiver: &Receiver<()>,
+        should_stop: &impl Fn() -> bool,
+    ) {
         let frame_rate = self
             .frame_rate
             .expect("fixed-frame runtime must have a frame rate");
         let frame_duration = Duration::from_secs_f64(1.0 / frame_rate as f64);
         loop {
+            if should_stop() {
+                return;
+            }
             self.sync_event_snapshot(app);
             match self.status() {
                 RuntimeState::Working => {
@@ -173,9 +188,22 @@ impl RuntimeControl {
         }
     }
 
-    fn run_event_driven(&mut self, app: &mut App, wake_receiver: &Receiver<()>) {
-        self.run_initial_frame(app);
+    fn run_event_driven(
+        &mut self,
+        app: &mut App,
+        wake_receiver: &Receiver<()>,
+        should_stop: &impl Fn() -> bool,
+    ) {
+        let mut initial_frame_pending = true;
         loop {
+            if should_stop() {
+                return;
+            }
+            if initial_frame_pending && self.handle.is_gate_open() {
+                self.run_initial_frame(app);
+                initial_frame_pending = false;
+                continue;
+            }
             self.sync_event_snapshot(app);
             match self.status() {
                 RuntimeState::Working => app.fast_forward_tick(),

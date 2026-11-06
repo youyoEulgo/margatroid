@@ -6,6 +6,7 @@ pub enum ToolResourceErrorKind {
     OwnerMissing,
     InvalidAlias,
     AliasMissing,
+    AliasConflict,
     InvalidPath,
     FileMissing,
     TooLarge,

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use async_runtime_plugin::WorldAsyncExt;
 use core_plugin::World;
 use tool_resource_core::{
-    read_tool, ImportTool, ToolResourceError, ToolResourceErrorKind as Kind, Tools,
+    read_tool, ImportTool, ToolEntry, ToolResourceError, ToolResourceErrorKind as Kind, Tools,
 };
 
 use crate::types::{ImportConfig, ImportContext, ImportError, ImportOutput, ImportTaskError};
@@ -75,7 +75,16 @@ pub(crate) fn handle_import(world: &mut World, request: ImportTool) {
 
 pub(crate) fn handle_import_result(world: &mut World, result: Result<ImportOutput, ImportError>) {
     let (context, validated) = match result {
-        Ok(output) => (output.context, Ok(output.path)),
+        Ok(output) => (
+            output.context,
+            Ok(ToolEntry {
+                path: output.path,
+                description: output.description,
+                input_schema: output.input_schema,
+                owner_task_id: None,
+                binding: None,
+            }),
+        ),
         Err(error) => (error.context, Err(error.error)),
     };
     let Some(reply) = context
@@ -97,14 +106,14 @@ pub(crate) fn handle_import_result(world: &mut World, result: Result<ImportOutpu
             "import cancelled before publication",
         ))
     } else {
-        validated.map(|path| {
+        validated.and_then(|entry| {
             if !world.contains_component::<Tools>(context.owner) {
                 world.insert_component(context.owner, Tools::default());
             }
             world
                 .get_component_mut::<Tools>(context.owner)
                 .expect("owner collection must exist")
-                .insert(context.alias.clone(), path);
+                .insert(context.alias.clone(), entry)
         })
     };
     let result = result.map_err(|mut error| {
@@ -143,8 +152,8 @@ async fn validate_import(context: ImportContext) -> Result<ImportOutput, ImportE
             };
             ToolResourceError::new(kind, error.to_string()).with_path(&path)
         })?;
-        read_tool(&canonical, &limits)?;
-        Ok(canonical)
+        let input = read_tool(&canonical, &limits)?;
+        Ok((canonical, input.description, input.input_schema))
     });
     let result = match worker.await {
         Ok(result) => result,
@@ -155,7 +164,12 @@ async fn validate_import(context: ImportContext) -> Result<ImportOutput, ImportE
         .with_path(&context.path)),
     };
     match result {
-        Ok(path) => Ok(ImportOutput { context, path }),
+        Ok((path, description, input_schema)) => Ok(ImportOutput {
+            context,
+            path,
+            description,
+            input_schema,
+        }),
         Err(error) => Err(ImportError { context, error }),
     }
 }

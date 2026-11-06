@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
+use closure_plugin::WorldClosureSender;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -11,10 +12,12 @@ use tool_core::{
     ToolConfiguration, ToolError, ToolExecuteRequest, ToolExecutionLimits, ToolTaskHandle,
     ToolTasks,
 };
+use tool_resource_core::{InjectedToolDefinition, ToolEntry};
 
 pub(crate) struct ToolExecutionContext {
     pub request: ToolExecuteRequest,
-    pub tool_path: PathBuf,
+    pub tool_entry: ToolEntry,
+    pub world: std::sync::Weak<WorldClosureSender>,
     pub sandbox_path: Option<PathBuf>,
     pub project_root: PathBuf,
     pub runner_path: PathBuf,
@@ -39,6 +42,11 @@ pub(crate) struct ToolContext {
     pub task_id: String,
     pub call_id: String,
     pub alias: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<Value>,
+    pub resource_dir: PathBuf,
     pub project_root: PathBuf,
     pub temp_dir: PathBuf,
 }
@@ -79,6 +87,10 @@ pub(crate) enum RunnerFrame {
     Finish {
         request_id: String,
         task_id: String,
+    },
+    Inject {
+        request_id: String,
+        definitions: Vec<InjectedToolDefinition>,
     },
     InputConsumed,
     Done {

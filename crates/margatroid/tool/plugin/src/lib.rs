@@ -6,10 +6,11 @@ mod system;
 mod types;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimeHandle;
-use closure_plugin::WorldClosureExt;
+use closure_plugin::{WorldClosureExt, WorldClosureSender};
 use core_plugin::{App, Plugin, Resource};
 use tool_core::ToolExecutionLimits;
 
@@ -59,6 +60,9 @@ impl Default for ToolPlugin {
 
 impl Resource for ToolPlugin {}
 
+struct ToolRuntime(Arc<WorldClosureSender>);
+impl Resource for ToolRuntime {}
+
 impl Plugin for ToolPlugin {
     fn build(self, app: &mut App) {
         assert!(
@@ -84,7 +88,8 @@ impl Plugin for ToolPlugin {
             ),
             "ToolPlugin requires UPDATE or POST_UPDATE after turn abort handling"
         );
-        app.world().send_closure(&self.schedule, |_| {});
+        let sender = Arc::new(app.world().closure_sender(&self.schedule));
+        app.world_mut().insert_resource(ToolRuntime(sender));
         self.limits.validate().expect("ToolPlugin limits invalid");
         let schedule = self.schedule.clone();
         app.world_mut().insert_resource(self);

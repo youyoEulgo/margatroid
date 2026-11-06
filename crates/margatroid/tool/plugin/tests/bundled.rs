@@ -16,8 +16,19 @@ use tool_core::{
     ToolExecuteResponse, ToolExecutionLimits, ToolTasks,
 };
 use tool_plugin::ToolPlugin;
-use tool_resource_core::Tools;
+use tool_resource_core::{read_tool, ToolEntry, ToolReadLimits, Tools};
 use workspace_core::{Workspace, WorkspaceState};
+
+fn imported_entry(path: &std::path::Path) -> ToolEntry {
+    let tool = read_tool(path, &ToolReadLimits::default()).unwrap();
+    ToolEntry {
+        path: tool.origin,
+        description: tool.description,
+        input_schema: tool.input_schema,
+        owner_task_id: None,
+        binding: None,
+    }
+}
 
 struct Fixture {
     app: App,
@@ -108,7 +119,8 @@ impl Fixture {
             .world_mut()
             .get_component_mut::<Tools>(self.agent)
             .unwrap()
-            .insert(alias.into(), directory.join("tool.toml"));
+            .insert(alias.into(), imported_entry(&directory.join("tool.toml")))
+            .unwrap();
     }
 
     fn execute(
@@ -156,10 +168,11 @@ impl Fixture {
             .clone()
     }
 
-    fn removed(&self, id: &str) {
+    fn removed(&mut self, id: &str) {
         let tasks = self.tasks();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            self.app.tick();
             match tasks.read(id) {
                 Err(error) => {
                     assert_eq!(error.kind, Kind::TaskMissing, "{id}: {error:?}");
@@ -189,6 +202,14 @@ impl Fixture {
     }
 
     fn bundle(&mut self, alias: &str) {
+        if self
+            .app
+            .world()
+            .get_component::<Tools>(self.agent)
+            .is_some_and(|tools| tools.get(alias).is_some())
+        {
+            return;
+        }
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../../resources/tools/local")
             .join(alias)
@@ -204,7 +225,8 @@ impl Fixture {
             .world_mut()
             .get_component_mut::<Tools>(self.agent)
             .unwrap()
-            .insert(alias.into(), path);
+            .insert(alias.into(), imported_entry(&path))
+            .unwrap();
     }
 
     fn call(&mut self, alias: &str, arguments: Value) -> ToolExecuteResponse {

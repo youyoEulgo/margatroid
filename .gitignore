@@ -1,4 +1,5 @@
 /target
+/resources/tools/local/mcp-register/latest/bin/mcp-client
 .margatroid
 compose.toml
 .DS_Store

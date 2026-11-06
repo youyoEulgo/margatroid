@@ -2,6 +2,7 @@
 members = [
     "apps/cli",
     "apps/daemon",
+    "apps/mcp-client",
     "crates/mecs/core_plugin",
     "crates/mecs/app_runtime_plugin",
     "crates/mecs/closure_plugin",

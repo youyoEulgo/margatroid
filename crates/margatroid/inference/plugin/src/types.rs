@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
@@ -8,8 +7,8 @@ use client_core::ClientSender;
 use core_plugin::{Entity, Event, Resource};
 use inference_core::{
     DomainRequest, InferenceError, InferenceErrorKind, InferenceImage, InferenceMessage,
-    InferenceRequest, InferenceResponse, InferenceStopReason, InferenceToolCall, InferenceUsage,
-    ModelRoute,
+    InferenceRequest, InferenceResponse, InferenceStopReason, InferenceToolCall,
+    InferenceToolDefinition, InferenceUsage, ModelRoute,
 };
 use lua_runtime_core::DriverLuaVmInstance;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -21,7 +20,7 @@ use tokio::sync::oneshot;
 
 type Result<T> = std::result::Result<T, InferenceError>;
 
-pub(crate) const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_MESSAGES_BYTES: usize = 16 * 1024 * 1024;
@@ -45,7 +44,7 @@ pub(crate) struct InferenceContext {
     pub request: InferenceRequest,
     pub reply: Option<oneshot::Sender<Result<InferenceResponse>>>,
     pub route: ModelRoute,
-    pub tools: Vec<(String, PathBuf)>,
+    pub tools: Vec<InferenceToolDefinition>,
     pub client: reqwest::Client,
     pub gate: Arc<Mutex<StreamGate>>,
     pub delivery: StreamDelivery,
@@ -1036,9 +1035,6 @@ pub(crate) fn normalize(request: &mut DomainRequest) -> Result<()> {
     if request.messages.is_empty() || request.messages.len() > 4096 {
         return Err(invalid("message count outside limits"));
     }
-    if request.tools.len() > 256 {
-        return Err(invalid("too many tools"));
-    }
     let mut names = HashSet::new();
     for tool in &request.tools {
         if tool.name.is_empty()
@@ -1050,7 +1046,6 @@ pub(crate) fn normalize(request: &mut DomainRequest) -> Result<()> {
             || !names.insert(&tool.name)
             || !tool.input_schema.is_object()
             || tool.description.trim().is_empty()
-            || tool.description.len() > 8192
         {
             return Err(InferenceError::new(
                 InferenceErrorKind::InvalidToolDefinition,

@@ -16,7 +16,6 @@ pub struct InferenceRequest {
     pub agent: Entity,
     pub turn: String,
     pub messages: Vec<InferenceMessage>,
-    pub tools: Vec<String>,
     pub config: InferenceParameters,
     pub cancel: CancellationToken,
     pub reply: InferenceReply<InferenceResponse>,

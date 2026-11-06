@@ -79,7 +79,7 @@ impl Fixture {
                         state.malformed_config = false;
                         MclValue::Unit
                     } else {
-                        MclValue::Config(toml::from_str("visible_tools=[]\nsandbox='read_only'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n").unwrap())
+                        MclValue::Config(toml::from_str("sandbox='read_only'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n").unwrap())
                     }
                 } else if text == "GET entry.pending[0]" {
                     MclValue::Array(MessageArray::Message(state.pending.front().cloned().into_iter().collect()))
@@ -196,7 +196,7 @@ async fn shipped_drivers_recover_each_command_stage_and_continue_in_same_vm() {
             "INJECT ? TO session.conversation[-1]",
             "EFFECT start_turn",
             "CONFIG GET",
-            "EFFECT inference (msg.instructions, session.conversation) ?",
+            "EFFECT inference (msg.instructions, session.conversation)",
             "INJECT ? TO entry.pending[-1]",
             "EFFECT finish_turn",
         ] {

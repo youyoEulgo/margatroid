@@ -1351,12 +1351,14 @@ dependencies = [
  "agent_driver_core",
  "app_runtime_plugin",
  "compose",
+ "futures-util",
  "mlua",
  "prompt_resource_core",
  "sandbox_resource_core",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tool_plugin",
  "tool_resource_core",
 ]
@@ -1423,6 +1425,28 @@ dependencies = [
  "tool_core",
  "tool_resource_core",
  "tracing",
+]
+
+[[package]]
+name = "mcp-client"
+version = "0.1.0"
+dependencies = [
+ "agent_core",
+ "app_runtime_plugin",
+ "async_runtime_plugin",
+ "closure_plugin",
+ "core_plugin",
+ "futures-util",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tool_core",
+ "tool_plugin",
+ "tool_resource_core",
+ "workspace_core",
 ]
 
 [[package]]
@@ -2692,6 +2716,7 @@ version = "0.1.0"
 dependencies = [
  "core_plugin",
  "jsonschema",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -2706,6 +2731,7 @@ dependencies = [
  "async_runtime_plugin",
  "closure_plugin",
  "core_plugin",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tool_resource_core",

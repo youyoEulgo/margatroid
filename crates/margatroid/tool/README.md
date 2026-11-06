@@ -73,7 +73,7 @@ bash工具无调用参数，打开终端后返回task_id，收到的task_send消
 
 ## 执行与清理
 
-工具执行前按alias重新读取清单、schema和程序，按当前选择路径读取沙箱策略；实际参数按本次schema校验。材料仅用于本次运行，不恢复ResourceID快照或长期正文缓存。
+工具执行按alias查询当前Tools完整记录，使用记录中的input_schema校验参数，按记录path读取main.lua程序，并按当前选择路径读取沙箱策略。描述与schema由Tools缓存，导入后文件metadata变化不会隐式改变记录；不重新加载清单或schema覆盖记录。
 
 Lua在独立runner执行。可信supervisor在工具沙箱外，worker及其后代受策略限制；有选择而后端不可用时失败，不退化为无沙箱。双向版本化协议区分Return、Write、Replace和宿主请求，stdout只承载协议帧，诊断写有界stderr。
 
@@ -81,14 +81,14 @@ Lua在独立runner执行。可信supervisor在工具沙箱外，worker及其后�
 
 工具结果由MCL转换为消息；Tool不追加历史、不调用推理、不结束Agent回合。不新增长短任务分类，回合中止依据return状态决定是否终止。
 
-## 已确认的后续设计
+## 动态入口与原始进程
 
-动态工具注入、原始子进程管道及Tools完整记录仍是待实现目标，当前源码尚未提供tool_inject和process_open；现有任务中止与finish清理已实现。设计文档定义目标接口，不表示运行中的daemon已经更新。
+本轮实现包含tool_inject、原始子进程管道和Tools完整记录；本文不表示运行中的daemon已经更新。
 
-目标中，普通导入与动态注入都向Agent.Tools增加包含描述、schema、path的记录；推理每次遍历Tools，工具调用按名称查询。Tool执行侧从记录取得schema，按path读取程序。宿主只提供通用工具和进程能力，MCP连接与协议由工具资源及同目录client bin负责。
+普通导入与动态注入都向Agent.Tools增加包含描述、schema、path的记录；推理每次遍历Tools，工具调用按名称查询。Tool执行侧从记录取得schema，按path读取程序。宿主只提供通用工具和进程能力，MCP连接与协议由工具资源及同目录client bin负责；bin并发推进输入写入、stdout/stderr读取和带ID响应路由。
 
-tool_inject由宿主固定当前资源路径和任务ID，整批登记，alias冲突整批失败。调用入口的owner_task_id、binding通过context传给同一脚本，模型参数不能改写它们；不额外增加工具清单或可见性步骤。
+tool_inject由宿主固定当前资源路径和任务ID，整批登记，任一定义无效或alias冲突整批失败，不增加System或专用事件。调用入口的owner_task_id、binding通过context传给同一脚本，模型参数不能改写它们；不额外增加工具清单或可见性步骤。
 
-MCP注册任务A连接成功、注入入口后return但不finish；使用入口的任务B把请求发送给A，得到结果后return并finish。A连续转发带ID的请求并路由乱序响应。A清理时移除Tools中属于它的记录，并通过现有ToolTasks找到仍等待它的B，交付工具错误。B先结束时，A的迟到回复遇TaskMissing仅清除该请求关联。
+MCP注册任务A连接成功、注入入口后return但不finish；使用入口的任务B从私有context取得owner_task_id和binding，运行同一Lua脚本，把带request ID的调用发送给A，得到结果后return并finish。A连续转发带ID的请求并路由乱序响应。A清理时移除Tools中属于它的记录，并通过现有ToolTasks找到仍等待它的B，交付保留原call_id/alias的failed中止结果并结束等待。B先结束时，A的迟到回复遇TaskMissing仅清除该请求关联。
 
 process_open使用原始stdin/stdout/stderr管道，不经过PTY；write/read保持字节，工具自己处理消息边界、UTF-8分片和多条消息。输入写入、stdout与stderr读取需并行推进，避免双向背压互相阻塞。子进程和后代受ToolTask唯一存活预算、取消及finish清理约束。

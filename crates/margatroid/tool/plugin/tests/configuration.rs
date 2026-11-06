@@ -44,7 +44,7 @@ async fn runner(
     let output = BufReader::new(child.stdout.take().unwrap());
     send(&mut input, json!({
         "protocol_version": 1, "program": program, "arguments": arguments,
-        "context": {"task_id":"configure-test", "call_id":"call", "alias":"tool", "project_root":root.path(), "temp_dir":root.path()},
+        "context": {"task_id":"configure-test", "call_id":"call", "alias":"tool", "owner_task_id":null,"binding":null,"resource_dir":root.path(),"project_root":root.path(), "temp_dir":root.path()},
         "limits": ToolExecutionLimits::default()
     })).await;
     (root, child, input, output)

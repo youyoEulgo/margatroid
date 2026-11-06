@@ -2,9 +2,9 @@
 
 独立领域 core，只依赖 `core_plugin` 和通用库；不依赖 address、其他领域 core 或 plugin。
 
-`Tools` 以私有 `BTreeMap<String, PathBuf>` 保存 alias 到真实入口文件路径，提供 Default、new、get、insert、remove、iter。路径读取扩展 `WorldToolResourceExt::tool_path` 仅借用集合条目，校验完整 Entity 和 alias，不访问文件系统。各领域只检查自身 alias；跨类别冲突由调用入口协调。
+`Tools` 以私有 `BTreeMap<String, ToolEntry>` 保存 alias 到完整工具记录，提供 Default、new、get、insert、insert_batch、remove_owner、iter。ToolEntry公开path、description、input_schema、owner_task_id和binding；InjectedToolDefinition公开alias、description、input_schema和binding，供宿主填入路径和任务归属。insert拒绝重复alias；insert_batch预先校验全部alias、路径、描述及schema，失败不修改集合；remove_owner仅移除指定任务拥有的条目。`WorldToolResourceExt::tool_entry` 借用完整记录，`tool_path` 借用同一记录的path，校验完整 Entity 和 alias，不访问文件系统。各领域只检查自身 alias；跨类别冲突由调用入口协调。
 
-`read_tool(path, limits)` 是同步有界读取函数，供使用方在 blocking worker 调用。每次调用重新读取和解析；不缓存正文，已返回的临时材料不受之后文件变化影响。读取入口 TOML、同目录 `input.schema.json` 与 `main.lua`，要求 `schema_version = 1`、非空 description、合法 JSON 对象 schema 和 UTF-8 Lua 文本。允许内部 schema 引用，禁止外部引用；只返回程序文本，不执行 Lua。
+`read_tool(path, limits)` 是同步有界读取函数，供使用方在 blocking worker 调用。该函数用于导入校验，返回描述及schema后由Tools保存；已返回的临时材料不受之后文件变化影响。读取入口 TOML、同目录 `input.schema.json` 与 `main.lua`，要求 `schema_version = 1`、非空 description、合法 JSON 对象 schema 和 UTF-8 Lua 文本。允许内部 schema 引用，禁止外部引用；返回校验后的工具定义及程序文本，不执行 Lua。执行方按记录path只读取main.lua，不重读清单或schema；文件metadata变化不会隐式改写Tools记录。
 
 读取入口通过 canonicalize 定位真实普通文件。相邻依赖的真实路径必须仍在入口父目录内。文件大小在打开后及读取过程中检查；分别返回 FileMissing、InvalidPath、TooLarge、InvalidUtf8、InvalidDefinition、ReadFailed，错误携带实际路径，解析失败不回显文件正文。调用方负责文件使用权限及使用时路径策略。
 

@@ -25,6 +25,8 @@ pub(crate) struct ImportContext {
 pub(crate) struct ImportOutput {
     pub context: ImportContext,
     pub path: PathBuf,
+    pub description: String,
+    pub input_schema: serde_json::Value,
 }
 
 #[derive(Clone)]

@@ -1,6 +1,12 @@
-use app_runtime_plugin::AppRunExt;
+use app_runtime_plugin::{AppRunExt, RuntimeHandle};
 use compose::{build_app, ApplicationOptions};
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 fn main() {
     if std::env::args().nth(1).is_some_and(|arg| {
         matches!(
@@ -26,6 +32,84 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         runner_path: std::env::current_exe()?,
     };
     let mut app = build_app(options)?;
-    app.run();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    let stopping = Arc::new(AtomicBool::new(false));
+    let handle = app
+        .world()
+        .get_resource::<RuntimeHandle>()
+        .expect("application runtime installed")
+        .clone();
+    let listener = {
+        let _entered = runtime.enter();
+        listen_for_shutdown(stopping.clone(), handle)?
+    };
+    app.run_until(|| stopping.load(Ordering::Acquire));
+    let shutdown = runtime.block_on(async {
+        let result = loop {
+            match compose::shutdown_app(&mut app).await {
+                Ok(()) => break Ok(()),
+                // The installed Axum service reports its final error after domain drain.
+                Err(error) if error.domain == "axum" => break Err(error),
+                Err(error) => {
+                    eprintln!("margatroid-daemon: cleanup is not complete: {error}; continuing to supervise");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        };
+        listener.abort();
+        let _ = listener.await;
+        result
+    });
+    drop(app);
+    shutdown?;
+    eprintln!("margatroid-daemon: shutdown complete");
     Ok(())
+}
+
+fn request_shutdown(stopping: &AtomicBool, handle: &RuntimeHandle) {
+    if !stopping.swap(true, Ordering::AcqRel) {
+        eprintln!("margatroid-daemon: shutdown requested; waiting for tasks and child processes to finish cleanup");
+        handle.wake();
+    } else {
+        eprintln!("margatroid-daemon: cleanup is still in progress");
+    }
+}
+
+#[cfg(unix)]
+fn listen_for_shutdown(
+    stopping: Arc<AtomicBool>,
+    handle: RuntimeHandle,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    Ok(tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                value = interrupt.recv() => if value.is_none() { break; },
+                value = terminate.recv() => if value.is_none() { break; },
+            }
+            request_shutdown(&stopping, &handle);
+        }
+    }))
+}
+
+#[cfg(not(unix))]
+fn listen_for_shutdown(
+    stopping: Arc<AtomicBool>,
+    handle: RuntimeHandle,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    Ok(tokio::spawn(async move {
+        loop {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                eprintln!("margatroid-daemon: signal listener failed: {error}");
+                request_shutdown(&stopping, &handle);
+                break;
+            }
+            request_shutdown(&stopping, &handle);
+        }
+    }))
 }

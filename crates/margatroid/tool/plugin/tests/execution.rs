@@ -16,8 +16,19 @@ use tool_core::{
     ToolExecuteResponse, ToolExecutionLimits, ToolTasks,
 };
 use tool_plugin::ToolPlugin;
-use tool_resource_core::Tools;
+use tool_resource_core::{read_tool, ToolEntry, ToolReadLimits, Tools};
 use workspace_core::{Workspace, WorkspaceState};
+
+fn imported_entry(path: &std::path::Path) -> ToolEntry {
+    let tool = read_tool(path, &ToolReadLimits::default()).unwrap();
+    ToolEntry {
+        path: tool.origin,
+        description: tool.description,
+        input_schema: tool.input_schema,
+        owner_task_id: None,
+        binding: None,
+    }
+}
 
 struct Fixture {
     app: App,
@@ -123,7 +134,8 @@ impl Fixture {
             .world_mut()
             .get_component_mut::<Tools>(self.agent)
             .unwrap()
-            .insert(alias.into(), directory.join("tool.toml"));
+            .insert(alias.into(), imported_entry(&directory.join("tool.toml")))
+            .unwrap();
     }
 
     fn execute(
@@ -173,6 +185,32 @@ impl Fixture {
         }
     }
 
+    fn drive<T: Send + 'static>(
+        &mut self,
+        future: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> T {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            let _ = sender.send(future.await);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            self.app.tick();
+            match receiver.try_recv() {
+                Ok(value) => return value,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(error) => panic!("async helper closed: {error}"),
+            }
+            assert!(Instant::now() < deadline, "async helper timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     fn tasks(&self) -> ToolTasks {
         self.app
             .world()
@@ -181,10 +219,11 @@ impl Fixture {
             .clone()
     }
 
-    fn removed(&self, id: &str) {
+    fn removed(&mut self, id: &str) {
         let tasks = self.tasks();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            self.app.tick();
             match tasks.read(id) {
                 Err(error) => {
                     assert_eq!(error.kind, Kind::TaskMissing, "{id}: {error:?}");
@@ -213,9 +252,10 @@ impl Fixture {
         );
     }
 
-    fn output(&self, id: &str) -> tool_core::TaskReadResult {
+    fn output(&mut self, id: &str) -> tool_core::TaskReadResult {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
+            self.app.tick();
             let result = self.tasks().read(id).unwrap();
             if !result.output.is_empty() {
                 return result;
@@ -314,8 +354,9 @@ frame({'type': 'stopped', 'result': {'Ok': None}, 'cleanup_proven': True})
             .build()
             .unwrap();
         if mode != "cancel" {
-            let finish = runtime.block_on(async {
-                tokio::time::timeout(Duration::from_secs(5), handle.finish()).await
+            let finishing = handle.clone();
+            let finish = fixture.drive(async move {
+                tokio::time::timeout(Duration::from_secs(5), finishing.finish()).await
             });
             assert_eq!(finish.unwrap().unwrap_err().kind, Kind::CleanupFailed);
         } else {
@@ -485,11 +526,11 @@ fn natural_exit_without_return_reports_missing_return_and_late_errors_are_remove
         .as_str()
         .unwrap()
         .contains("already"));
-    finish_task(&fixture, "late");
+    finish_task(&mut fixture, "late");
 }
 
 #[test]
-fn fresh_schema_program_and_deleted_files_are_checked_for_each_execution() {
+fn recorded_schema_is_authoritative_while_program_is_read_for_each_execution() {
     let mut fixture = Fixture::new();
     fixture.tool(
         "fresh",
@@ -498,10 +539,10 @@ fn fresh_schema_program_and_deleted_files_are_checked_for_each_execution() {
     let reply = fixture.execute("first", "fresh", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "first");
     fixture.removed("first");
-    fixture.tool(
-        "fresh",
-        "function execute(args,context) task_return('changed'); task_finish(context.task_id) end",
-    );
+    std::fs::write(
+        fixture.root.path().join("fresh/main.lua"),
+        "function configure() return {timeout_ms=30000} end function execute(args,context) task_return('changed'); task_finish(context.task_id) end",
+    ).unwrap();
     let reply = fixture.execute("second", "fresh", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "changed");
     fixture.removed("second");
@@ -510,12 +551,9 @@ fn fresh_schema_program_and_deleted_files_are_checked_for_each_execution() {
         r#"{"type":"object","required":["required"]}"#,
     )
     .unwrap();
-    let reply = fixture.execute("bad-args", "fresh", json!({}));
-    assert_eq!(
-        fixture.response(reply).unwrap_err().kind,
-        Kind::InvalidArguments
-    );
-    fixture.removed("bad-args");
+    let reply = fixture.execute("recorded-schema", "fresh", json!({}));
+    assert_eq!(fixture.response(reply).unwrap().content, "changed");
+    fixture.removed("recorded-schema");
     let path = fixture.root.path().join("fresh/main.lua");
     assert_eq!(
         path.parent(),
@@ -984,13 +1022,14 @@ fn a_full_task_mailbox_does_not_block_the_original_call_reply() {
     );
     let reply = fixture.execute("mailbox", "mailbox", json!({}));
     let mut accepted = 0;
-    for index in 0..1000 {
+    let attempts = ToolExecutionLimits::default().input_capacity * 2;
+    for index in 0..attempts {
         match fixture.tasks().send("mailbox", json!(index)) {
             Ok(()) => accepted += 1,
             Err(error) => assert_eq!(error.kind, Kind::InputFull),
         }
     }
-    assert!(accepted > 0 && accepted < 1000);
+    assert!(accepted > 0 && accepted < attempts);
     assert_eq!(fixture.response(reply).unwrap().content, "{\"ready\":true}");
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut received = 0;
@@ -1291,12 +1330,12 @@ fn interactive_bash_gets_its_own_controlling_terminal_under_tty_daemon() {
     );
 }
 
-fn finish_task(fixture: &Fixture, id: &str) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+fn finish_task(fixture: &mut Fixture, id: &str) {
+    let tasks = fixture.tasks();
+    let task_id = id.to_owned();
+    fixture
+        .drive(async move { tasks.finish(&task_id).await })
         .unwrap();
-    runtime.block_on(fixture.tasks().finish(id)).unwrap();
     fixture.removed(id);
 }
 
@@ -1383,6 +1422,204 @@ fn accepted_batch_abort_returns_long_call_immediately_and_preserves_returned_bac
         fixture.output("returned-abort").output,
         vec![json!({"echo":"after abort"})]
     );
-    finish_task(&fixture, "returned-abort");
+    finish_task(&mut fixture, "returned-abort");
     assert!(fixture.tasks().list().is_empty());
+}
+
+const DYNAMIC_PROGRAM: &str = r#"
+function configure(args, context)
+    if context.owner_task_id ~= nil then
+        assert(context.owner_task_id == 'owner')
+        assert(context.binding.operation == context.alias)
+    end
+    return {timeout_ms=0}
+end
+function execute(args, context)
+    if context.owner_task_id == nil then
+        tool_inject({
+            {alias='dynamic_text', description='text operation', input_schema={type='object',required={'text'},properties={text={type='string'}}},binding={operation='dynamic_text'}},
+            {alias='dynamic_number', description='number operation', input_schema={type='object',required={'number'},properties={number={type='integer'}}},binding={operation='dynamic_number'}}
+        })
+        task_return(context.task_id)
+        local pending={}
+        while true do
+            local request=task_receive()
+            task_write({request_id=request.request_id,alias=request.alias})
+            if not request.hold then
+                pending[#pending+1]=request
+                if #pending == 2 then
+                    for i=2,1,-1 do
+                        local item=pending[i]
+                        task_send(item.reply_to,{request_id=item.request_id,value=item.value,alias=item.alias,resource_dir=context.resource_dir})
+                        task_write({responded=item.request_id})
+                    end
+                    pending={}
+                end
+            end
+        end
+    else
+        if args.returned then
+            task_return({alive=context.task_id})
+            while true do task_write(task_receive()) end
+        end
+        task_send(context.owner_task_id,{reply_to=context.task_id,request_id=context.call_id,value=args.text or args.number,alias=context.alias,hold=args.hold})
+        local response=task_receive()
+        assert(response.request_id == context.call_id)
+        assert(response.resource_dir == context.resource_dir)
+        task_return(response)
+        task_finish(context.task_id)
+    end
+end
+"#;
+
+#[test]
+fn dynamic_aliases_use_distinct_recorded_schemas_and_reverse_concurrent_responses() {
+    let mut f = Fixture::new();
+    f.tool("factory", DYNAMIC_PROGRAM);
+    let reply = f.execute("owner", "factory", json!({}));
+    assert_eq!(f.response(reply).unwrap().content, "owner");
+    let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
+    let text = tools.get("dynamic_text").unwrap();
+    let number = tools.get("dynamic_number").unwrap();
+    assert_eq!(text.path, number.path);
+    assert_ne!(text.input_schema, number.input_schema);
+    assert_eq!(text.owner_task_id.as_deref(), Some("owner"));
+    assert_eq!(text.binding, Some(json!({"operation":"dynamic_text"})));
+    let bad = f.execute("wrong-schema", "dynamic_number", json!({"text":"wrong"}));
+    assert_eq!(f.response(bad).unwrap_err().kind, Kind::InvalidArguments);
+    f.removed("wrong-schema");
+    let first = f.execute(
+        "text-call",
+        "dynamic_text",
+        json!({"text":"hello","owner_task_id":"spoof","binding":{"operation":"spoof"}}),
+    );
+    let forwarded = f.output("owner");
+    assert_eq!(forwarded.output[0]["request_id"], "call-text-call");
+    let second = f.execute("number-call", "dynamic_number", json!({"number":42}));
+    let second = serde_json::from_str::<Value>(&f.response(second).unwrap().content).unwrap();
+    let first = serde_json::from_str::<Value>(&f.response(first).unwrap().content).unwrap();
+    assert_eq!(first["request_id"], "call-text-call");
+    assert_eq!(first["value"], "hello");
+    assert_eq!(second["request_id"], "call-number-call");
+    assert_eq!(second["value"], 42);
+    assert_eq!(first["resource_dir"], json!(f.root.path().join("factory")));
+    f.removed("text-call");
+    f.removed("number-call");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut responses = Vec::new();
+    while responses.len() < 2 {
+        f.app.tick();
+        responses.extend(
+            f.tasks()
+                .read("owner")
+                .unwrap()
+                .output
+                .into_iter()
+                .filter_map(|value| value.get("responded").cloned()),
+        );
+        assert!(Instant::now() < deadline, "owner response log timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        responses,
+        vec![json!("call-number-call"), json!("call-text-call")]
+    );
+    finish_task(&mut f, "owner");
+    let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
+    assert!(tools.get("factory").is_some());
+    assert!(tools.get("dynamic_text").is_none());
+    assert!(tools.get("dynamic_number").is_none());
+}
+
+#[test]
+fn owner_finish_fails_unreturned_dependents_and_preserves_returned_tasks_and_other_entries() {
+    let mut f = Fixture::new();
+    f.tool("factory", DYNAMIC_PROGRAM);
+    f.tool("other_factory", "function execute(args,context) tool_inject({{alias='other_dynamic',description='other',input_schema={type='object'}}}); task_return('ready'); task_receive() end");
+    let other = f.execute("other-owner", "other_factory", json!({}));
+    f.response(other).unwrap();
+    let owner = f.execute("owner", "factory", json!({}));
+    f.response(owner).unwrap();
+    let returned = f.execute(
+        "returned-dependent",
+        "dynamic_text",
+        json!({"text":"kept","returned":true}),
+    );
+    f.response(returned).unwrap();
+    let waiting = f.execute(
+        "waiting-dependent",
+        "dynamic_number",
+        json!({"number":5,"hold":true}),
+    );
+    let received = f.output("owner");
+    assert_eq!(received.output[0]["request_id"], "call-waiting-dependent");
+    finish_task(&mut f, "owner");
+    let error = f.response(waiting).unwrap_err();
+    assert_eq!(error.kind, Kind::OwnerGone);
+    f.removed("waiting-dependent");
+    let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
+    assert!(tools.get("dynamic_text").is_none());
+    assert!(tools.get("dynamic_number").is_none());
+    assert!(tools.get("other_dynamic").is_some());
+    assert!(tools.get("factory").is_some());
+    f.tasks()
+        .send("returned-dependent", json!({"after_owner":true}))
+        .unwrap();
+    assert_eq!(
+        f.output("returned-dependent").output,
+        vec![json!({"after_owner":true})]
+    );
+    finish_task(&mut f, "returned-dependent");
+    finish_task(&mut f, "other-owner");
+    assert!(f.tasks().list().is_empty());
+}
+
+#[test]
+fn injection_alias_conflict_rejects_the_whole_batch() {
+    let mut f = Fixture::new();
+    f.tool(
+        "factory",
+        r#"function execute(args,context)
+        local ok,err=pcall(function() tool_inject({
+            {alias='fresh_alias',description='fresh',input_schema={type='object'}},
+            {alias='factory',description='conflict',input_schema={type='object'}}
+        }) end)
+        task_return({accepted=ok,error=tostring(err)})
+        task_receive()
+    end"#,
+    );
+    let reply = f.execute("conflicting-owner", "factory", json!({}));
+    let result = serde_json::from_str::<Value>(&f.response(reply).unwrap().content).unwrap();
+    assert_eq!(result["accepted"], false);
+    let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
+    assert!(tools.get("fresh_alias").is_none());
+    assert_eq!(tools.iter().count(), 1);
+    finish_task(&mut f, "conflicting-owner");
+}
+
+#[test]
+fn cancellation_between_injection_dispatch_and_world_commit_leaves_no_aliases() {
+    let mut f = Fixture::new();
+    f.tool("factory", "function execute() task_write('inject-dispatching'); tool_inject({{alias='cancelled_alias',description='cancelled',input_schema={type='object'}}}); task_return('unexpected'); task_receive() end");
+    let reply = f.execute("cancelled-owner", "factory", json!({}));
+    // Observe the worker without ticking World, leaving its injection uncommitted.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while f.tasks().read("cancelled-owner").unwrap().output.is_empty() {
+        assert!(Instant::now() < deadline, "worker never reached injection");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(f
+        .app
+        .world()
+        .get_component::<Tools>(f.agent)
+        .unwrap()
+        .get("cancelled_alias")
+        .is_none());
+    f.tasks().cancel("cancelled-owner").unwrap();
+    assert_eq!(f.response(reply).unwrap_err().kind, Kind::Cancelled);
+    f.removed("cancelled-owner");
+    let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
+    assert!(tools.get("cancelled_alias").is_none());
+    assert_eq!(tools.iter().count(), 1);
 }

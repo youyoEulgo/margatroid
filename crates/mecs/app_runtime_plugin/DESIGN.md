@@ -41,7 +41,7 @@ RuntimeState：运行状态，公开枚举
     Working--工作
     Waiting--等待
     Sleeping--休眠
-    Closed--保留占位；当前没有公开转换或退出入口，不得用它作为业务停止完成的判据
+    Closed--保留占位；当前没有公开转换入口，不得用它作为业务停止完成的判据
 
 RuntimeError：Runtime错误，公开枚举--描述Runtime公开API能够识别的配置错误与运行错误
     InvalidFrameRate {
@@ -130,11 +130,17 @@ RuntimeEventSender：Runtime事件发送器，公开结构体--可克隆并跨�
 AppRunExt：App运行扩展，公开trait--由RuntimePlugin为App提供运行入口
     run(&mut self)
         运行：公开方法，由当前App进入Runtime循环
-        行为：从World移出RuntimeControl；缺少Runtime时报告RuntimePluginMissing，已被移出时报告RuntimeAlreadyRunning；最后调用RuntimeControl::run
+        行为：调用run_until(|| false)，保持持续运行
+    run_until(&mut self, should_stop: impl Fn() -> bool)
+        按条件运行：公开方法，should_stop提供外部停止条件
+        行为：从World移出RuntimeControl；缺少Runtime时报告RuntimePluginMissing，已被移出时报告RuntimeAlreadyRunning；调用RuntimeControl::run_until，正常返回后将RuntimeControl重新插入World
     impl AppRunExt for App
         AppRunExt for App：公开trait实现
         run(&mut self)
-            运行：从当前App的World取得RuntimeControl
+            运行：由当前App持续运行
+            行为：按trait定义执行
+        run_until(&mut self, should_stop: impl Fn() -> bool)
+            按条件运行：由should_stop决定是否退出循环
             行为：按trait定义执行
 
 WorldEventExt：World事件扩展，公开trait--提供会唤醒Runtime的事件发送入口，不替换Core原有事件方法
@@ -166,11 +172,11 @@ WorldEventExt：World事件扩展，公开trait--提供会唤醒Runtime的事件
 
 crate公开：
 ```text
-RuntimeControl：Runtime控制器，crate公开结构体--配置阶段由World暂存，运行期间由AppRunExt::run移出并独占持有
+RuntimeControl：Runtime控制器，crate公开结构体--配置阶段由World暂存，运行期间由AppRunExt::run_until移出并独占持有，正常返回时归还World
     mode: RuntimeMode--运行模式
     frame_rate: Option<u64>--帧率，仅FixedFrame模式使用
     handle: RuntimeHandle--Runtime句柄
-    wake_receiver: Mutex<Option<Receiver<()>>>--通知接收端，运行开始时取出
+    wake_receiver: Mutex<Option<Receiver<()>>>--通知接收端，运行开始时取出，正常返回前存回
     event_snapshot: EventSnapshot--事件快照，每次判断下一帧前重新同步
     new(mode: RuntimeMode, frame_rate: Option<u64>, handle: RuntimeHandle, wake_receiver: Receiver<()>, event_snapshot: EventSnapshot) -> Self
         构造控制器：crate公开关联函数，接收运行配置、通知端与初始事件快照
@@ -190,15 +196,15 @@ RuntimeControl：Runtime控制器，crate公开结构体--配置阶段由World�
     wait(wake_receiver: &Receiver<()>)
         等待唤醒：私有关联函数，wake_receiver接收唤醒通知
         行为：阻塞读取已从Resource取出的接收端；已有通知时立即返回，断开时报告WakeChannelDisconnected
-    run(&mut self, app: &mut App)
-        运行：crate公开方法，app是被当前控制器独占驱动的应用
-        行为：短暂锁定wake_receiver并取出所有权，释放锁后按mode进入对应循环
-    run_fixed_frame(&mut self, app: &mut App, wake_receiver: &Receiver<()>)
+    run_until(&mut self, app: &mut App, should_stop: impl Fn() -> bool)
+        按条件运行：crate公开方法，app是被当前控制器独占驱动的应用
+        行为：首先检查should_stop，为true时直接返回；否则短暂锁定wake_receiver并取出所有权，释放锁后按mode进入对应循环；循环正常返回后重新锁定并存回接收端，不修改阀计数
+    run_fixed_frame(&mut self, app: &mut App, wake_receiver: &Receiver<()>, should_stop: &impl Fn() -> bool)
         固定帧运行：私有方法，按frame_rate驱动app
-        行为：执行固定帧运行循环
-    run_event_driven(&mut self, app: &mut App, wake_receiver: &Receiver<()>)
+        行为：每轮循环开始检查should_stop，为true时返回；否则执行固定帧循环，保留原帧间sleep；等待唤醒后先回到停止检查再决定是否推进帧
+    run_event_driven(&mut self, app: &mut App, wake_receiver: &Receiver<()>, should_stop: &impl Fn() -> bool)
         事件驱动运行：私有方法，按事件快照驱动app
-        行为：无条件执行初始帧后进入事件驱动运行循环
+        行为：每轮循环开始检查should_stop，为true时返回；初始帧尚未执行且开阀时执行初始帧，然后进入下一轮；关阀时阻塞等待，开阀后的后续帧按事件快照驱动；等待唤醒后先回到停止检查
     run_initial_frame(&mut self, app: &mut App)
         执行初始帧：私有方法，在事件驱动循环开始前调用app.tick并同步EventSnapshot
         行为：保证空事件队列下也会执行STARTUP和第一帧循环Schedule
@@ -228,6 +234,7 @@ Runtime的配置错误与可识别运行错误使用RuntimeError统一描述
 
 固定帧运行循环：
     循环：
+        should_stop为true时返回
         同步EventSnapshot
         分流：RuntimeState
             Working：
@@ -239,8 +246,10 @@ Runtime的配置错误与可识别运行错误使用RuntimeError统一描述
                 返回
 
 事件驱动运行循环：
-    调用run_initial_frame无条件执行一次app.tick
+    初始帧标记为尚未执行
     循环：
+        should_stop为true时返回
+        初始帧尚未执行且开阀时，调用run_initial_frame、清除标记并进入下一轮
         同步EventSnapshot
         分流：RuntimeState
             Working：
@@ -261,7 +270,7 @@ App
     │   └── RuntimeHandle
     └── RuntimeHandle Resource
 
-调用AppRunExt::run之后：
+调用AppRunExt::run或run_until期间：
 当前线程栈
 └── RuntimeControl--从World移出所有权，独占驱动App
     └── RuntimeHandle
@@ -269,4 +278,7 @@ App
 App
 └── World
     └── RuntimeHandle Resource
+
+run_until正常返回后：
+    接收端归还RuntimeControl，RuntimeControl归还World，恢复配置阶段持有关系
 ```

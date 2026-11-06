@@ -2,7 +2,7 @@
 
 agent_core定义Agent自身组件、生命周期状态、事件和错误，只依赖mecs及通用库。agent_plugin依赖agent_core、address和所需领域core，负责跨领域生命周期编排，不依赖其他plugin。
 
-下文记录已有实现；DESIGN中的完整Tools记录及动态工具生命周期为已批准、待实现目标，当前src仍保留旧API。本轮只整理文档，不表示运行中的daemon已更新。目标中动态定义仅归当前Agent完整Entity及Driver实例所有，随实例结束释放；数据库和settings继续承担原有持久化业务。MCP协议由工具侧处理。
+本文同步本轮实现契约，不表示运行中的daemon已更新。Tools是当前Agent唯一工具记录集合，保存alias、path、description、input_schema及私有执行归属owner_task_id和binding；后两者仅经执行context提供，不进入模型schema或公开wire。动态定义仅归当前Agent完整Entity及Driver实例所有，随所属任务清理或实例结束释放；数据库和settings继续承担原有持久化业务。MCP协议由工具侧处理。
 
 ## 同步受理
 
@@ -34,6 +34,6 @@ InitToolTasks由tool_plugin挂载空ToolTasks，InitInference由inference_plugin
 
 ## 数据归属
 
-Agent只保存名称、Workspace Entity、生命周期状态和当前turn。Address独立挂载，仅供边界寻址。Driver运行组件、MCL队列、数据库、历史和各资源路径表由各领域core定义，作为并列组件挂到Agent Entity。
+Agent只保存名称、Workspace Entity、生命周期状态和当前turn。Address独立挂载，仅供边界寻址。Driver运行组件、MCL队列、数据库、历史和各资源集合由各领域core定义，作为并列组件挂到Agent Entity。
 
 中止控制事件被受理后，调用方plugin同步调用agent_abort_turn检查并清除turn，随后取消ActiveInference.current句柄，并由ToolTasks::abort_unreturned原子强制交付未return任务的原调用中止结果、请求终止清理；已return未finish后台任务保留；保留DTO网络事件到专属控制事件的两帧路径；agent_core不额外提供中止结果事件或中止闭包。Agent保持Working，直到正常收尾后回Idle。turn已空或不匹配的重复中止直接拒绝，不保存上轮中止关联。Agent不修改Workspace配置文件；配置编辑和整体重载不由生命周期流程执行。

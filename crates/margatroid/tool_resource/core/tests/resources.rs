@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tool_resource_core::{
-    read_tool, ImportTool, ToolReadLimits, ToolResourceErrorKind as Kind, Tools,
+    read_tool, ImportTool, ToolEntry, ToolReadLimits, ToolResourceErrorKind as Kind, Tools,
     WorldToolResourceExt,
 };
 
@@ -47,14 +47,28 @@ impl Drop for Fixture {
     }
 }
 
+fn entry(path: &str, owner: Option<&str>) -> ToolEntry {
+    ToolEntry {
+        path: PathBuf::from(path),
+        description: "sample".into(),
+        input_schema: serde_json::json!({"type":"object"}),
+        owner_task_id: owner.map(str::to_owned),
+        binding: Some(serde_json::json!({"remote_name":"sample"})),
+    }
+}
+
 #[test]
-fn path_collections_replace_only_the_named_alias_and_borrow_without_io() {
+fn records_reject_conflicts_and_borrow_without_io() {
     let mut entries = Tools::new();
-    let alpha = PathBuf::from("/missing/alpha");
-    let beta = PathBuf::from("/missing/beta");
-    assert_eq!(entries.insert("z".into(), alpha.clone()), None);
-    entries.insert("a".into(), beta.clone());
-    assert_eq!(entries.insert("z".into(), beta.clone()), Some(alpha));
+    let alpha = entry("/missing/alpha", None);
+    let beta = entry("/missing/beta", Some("task-a"));
+    entries.insert("z".into(), alpha.clone()).unwrap();
+    entries.insert("a".into(), beta.clone()).unwrap();
+    assert_eq!(
+        entries.insert("z".into(), beta).unwrap_err().kind,
+        Kind::AliasConflict
+    );
+    assert_eq!(entries.get("z"), Some(&alpha));
     assert_eq!(
         entries
             .iter()
@@ -62,17 +76,19 @@ fn path_collections_replace_only_the_named_alias_and_borrow_without_io() {
             .collect::<Vec<_>>(),
         ["a", "z"]
     );
-    assert_eq!(entries.remove("a"), Some(beta.clone()));
+    entries.remove_owner("task-a");
+    assert!(entries.get("a").is_none());
     let mut world = World::new();
     let owner = world.spawn();
     world.insert_component(owner, entries);
-    assert_eq!(world.tool_path(owner, "z").unwrap(), beta.as_path());
+    assert_eq!(world.tool_entry(owner, "z").unwrap(), &alpha);
+    assert_eq!(world.tool_path(owner, "z").unwrap(), alpha.path.as_path());
     assert_eq!(
-        world.tool_path(owner, "missing").unwrap_err().kind,
+        world.tool_entry(owner, "missing").unwrap_err().kind,
         Kind::AliasMissing
     );
     assert_eq!(
-        world.tool_path(owner, "").unwrap_err().kind,
+        world.tool_entry(owner, "").unwrap_err().kind,
         Kind::InvalidAlias
     );
     world.despawn(owner);
@@ -80,13 +96,77 @@ fn path_collections_replace_only_the_named_alias_and_borrow_without_io() {
     assert_eq!(owner.index(), replacement.index());
     assert_ne!(owner.generation(), replacement.generation());
     assert_eq!(
-        world.tool_path(owner, "z").unwrap_err().kind,
+        world.tool_entry(owner, "z").unwrap_err().kind,
         Kind::OwnerMissing
     );
     assert_eq!(
-        world.tool_path(replacement, "z").unwrap_err().kind,
+        world.tool_entry(replacement, "z").unwrap_err().kind,
         Kind::AliasMissing
     );
+}
+
+#[test]
+fn batches_validate_every_record_before_atomic_publication() {
+    let mut entries = Tools::new();
+    entries
+        .insert("existing".into(), entry("/missing/existing", None))
+        .unwrap();
+    let original = entries.clone();
+    for aliases in [["new", "existing"], ["new", "new"]] {
+        assert_eq!(
+            entries
+                .insert_batch(
+                    aliases
+                        .into_iter()
+                        .map(|alias| (alias.into(), entry("/missing/tool", Some("task-a"))))
+                        .collect()
+                )
+                .unwrap_err()
+                .kind,
+            Kind::AliasConflict
+        );
+        assert_eq!(entries, original);
+    }
+    let mut invalid = Vec::new();
+    let mut item = entry("relative", None);
+    invalid.push(("valid", item.clone(), Kind::InvalidPath));
+    item.path = PathBuf::from("/missing/tool");
+    item.description.clear();
+    invalid.push(("valid", item.clone(), Kind::InvalidDefinition));
+    item.description = "sample".into();
+    for schema in [
+        serde_json::json!([]),
+        serde_json::json!({"type":"invalid"}),
+        serde_json::json!({"$ref":"https://example.invalid"}),
+    ] {
+        item.input_schema = schema;
+        invalid.push(("valid", item.clone(), Kind::InvalidDefinition));
+    }
+    invalid.push(("1invalid", entry("/missing/tool", None), Kind::InvalidAlias));
+    for (alias, item, kind) in invalid {
+        assert_eq!(
+            entries
+                .insert_batch(vec![
+                    ("new".into(), entry("/missing/new", None)),
+                    (alias.into(), item)
+                ])
+                .unwrap_err()
+                .kind,
+            kind
+        );
+        assert_eq!(entries, original);
+    }
+    entries
+        .insert_batch(vec![
+            ("dynamic".into(), entry("/missing/tool", Some("task-a"))),
+            ("other".into(), entry("/missing/tool", Some("task-b"))),
+        ])
+        .unwrap();
+    entries.remove_owner("task-a");
+    assert!(entries.get("dynamic").is_none());
+    assert!(entries.get("other").is_some());
+    assert!(entries.get("existing").is_some());
+    entries.insert_batch(Vec::new()).unwrap();
 }
 
 #[test]

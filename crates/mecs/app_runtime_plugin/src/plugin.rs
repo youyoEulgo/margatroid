@@ -65,17 +65,23 @@ impl Plugin for RuntimePlugin {
 
 pub trait AppRunExt {
     fn run(&mut self);
+    fn run_until(&mut self, should_stop: impl Fn() -> bool);
 }
 
 impl AppRunExt for App {
     fn run(&mut self) {
+        self.run_until(|| false);
+    }
+
+    fn run_until(&mut self, should_stop: impl Fn() -> bool) {
         let Some(mut runtime) = self.world_mut().remove_resource::<RuntimeControl>() else {
             if self.world().contains_resource::<RuntimeHandle>() {
                 RuntimeError::RuntimeAlreadyRunning.panic();
             }
             RuntimeError::RuntimePluginMissing.panic();
         };
-        runtime.run(self);
+        runtime.run_until(self, should_stop);
+        self.world_mut().insert_resource(runtime);
     }
 }
 
@@ -105,6 +111,7 @@ impl WorldEventExt for World {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use core_plugin::Event;
@@ -113,6 +120,26 @@ mod tests {
 
     struct Notice;
     impl Event for Notice {}
+
+    #[test]
+    fn run_until_restores_control_and_receiver_even_when_initially_stopped() {
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default());
+
+        app.run_until(|| true);
+
+        assert!(app.world().contains_resource::<RuntimeControl>());
+        app.world().get_resource::<RuntimeHandle>().unwrap().wake();
+        let calls = Arc::new(AtomicBool::new(false));
+        let startup_calls = Arc::clone(&calls);
+        app.add_system(RuntimePlugin::STARTUP, move |_world: &mut World| {
+            startup_calls.store(true, Ordering::Release);
+        });
+        app.run_until(|| calls.load(Ordering::Acquire));
+        assert!(app.world().contains_resource::<RuntimeControl>());
+        app.world().get_resource::<RuntimeHandle>().unwrap().wake();
+        app.run_until(|| true);
+    }
 
     #[test]
     fn default_runtime_is_event_driven() {

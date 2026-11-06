@@ -941,8 +941,8 @@ fn stale_vm_mcl_results_do_not_bind_to_new_instance_and_invalid_input_never_echo
     harness.command(
         &mut socket,
         "pending",
-        "EFFECT inference ? ?",
-        json!([[{"type": "user", "content": "question"}], []]),
+        "EFFECT inference ?",
+        json!([[{"type": "user", "content": "question"}]]),
     );
     harness.wait(|harness| !harness.inference.lock().unwrap().is_empty());
     vm(harness.app.world_mut(), harness.agent, "new-instance");
@@ -1003,17 +1003,33 @@ fn stale_vm_mcl_results_do_not_bind_to_new_instance_and_invalid_input_never_echo
 #[test]
 fn resource_panel_snapshot_advertises_imported_aliases_without_file_paths() {
     use sandbox_resource_core::{Sandboxes, SelectedSandbox};
-    use tool_resource_core::Tools;
+    use tool_resource_core::{ToolEntry, Tools};
     let mut harness = Harness::new();
     let mut tools = Tools::default();
-    tools.insert(
-        "bash".into(),
-        harness.root.path().join("private/bash/tool.toml"),
-    );
-    tools.insert(
-        "read_file".into(),
-        harness.root.path().join("private/read-file/tool.toml"),
-    );
+    tools
+        .insert(
+            "bash".into(),
+            ToolEntry {
+                path: harness.root.path().join("private/bash/tool.toml"),
+                description: "bash".into(),
+                input_schema: json!({"type":"object"}),
+                owner_task_id: None,
+                binding: None,
+            },
+        )
+        .unwrap();
+    tools
+        .insert(
+            "read_file".into(),
+            ToolEntry {
+                path: harness.root.path().join("private/read-file/tool.toml"),
+                description: "read file".into(),
+                input_schema: json!({"type":"object"}),
+                owner_task_id: None,
+                binding: None,
+            },
+        )
+        .unwrap();
     let mut sandboxes = Sandboxes::default();
     sandboxes.insert(
         "read_only".into(),
