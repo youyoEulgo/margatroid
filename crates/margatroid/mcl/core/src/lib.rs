@@ -239,8 +239,7 @@ pub fn parse_instruction(input: &MclInstruction) -> Result<MclOperation, MclErro
         "EFFECT" => {
             let (name, mut rest) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
             let arity = match name {
-                "inference" | "tool_call" => 2,
-                "sandbox_use" | "history_append" => 1,
+                "inference" | "tool_call" | "sandbox_use" | "history_append" => 1,
                 "start_turn" | "finish_turn" | "ready" | "wake" => 0,
                 _ => return Err(invalid("unknown effect")),
             };

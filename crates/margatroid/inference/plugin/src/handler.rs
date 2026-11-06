@@ -21,7 +21,7 @@ use lua_runtime_core::DriverLuaVm;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tool_resource_core::{read_tool, ToolReadLimits, Tools};
+use tool_resource_core::Tools;
 
 use crate::types::*;
 
@@ -197,18 +197,16 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             .and_then(|routes| routes.get(&request.config.model))
             .ok_or_else(|| error(Kind::ModelRouteMissing, "model route not found"))?
             .clone();
-        let mut seen = HashSet::new();
-        let mut paths = Vec::new();
-        for alias in &request.tools {
-            if !seen.insert(alias) {
-                return Err(error(Kind::InvalidToolDefinition, "duplicate tool alias"));
-            }
-            let path = world
-                .get_component::<Tools>(request.agent)
-                .and_then(|tools| tools.get(alias))
-                .ok_or_else(|| error(Kind::ToolMissing, "tool alias not registered"))?;
-            paths.push((alias.clone(), path.to_owned()));
-        }
+        let tools = world
+            .get_component::<Tools>(request.agent)
+            .into_iter()
+            .flat_map(Tools::iter)
+            .map(|(alias, entry)| InferenceToolDefinition {
+                name: alias.clone(),
+                description: entry.description.clone(),
+                input_schema: entry.input_schema.clone(),
+            })
+            .collect();
         let agent_address = world
             .get_component::<Address>(request.agent)
             .ok_or_else(|| error(Kind::InvalidRequest, "Agent address missing"))?
@@ -230,7 +228,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             .expect("inference HTTP runtime missing");
         Ok((
             route,
-            paths,
+            tools,
             agent_address,
             agent_instance,
             senders,
@@ -238,7 +236,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             runtime.schedule.clone(),
         ))
     })();
-    let (route, paths, agent_address, agent_instance, senders, client, schedule) = match prepared {
+    let (route, tools, agent_address, agent_instance, senders, client, schedule) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = reply.send(Err(error));
@@ -273,7 +271,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
         request,
         reply: Some(reply),
         route,
-        tools: paths,
+        tools,
         client,
         gate,
         #[cfg(test)]
@@ -387,37 +385,11 @@ async fn launch_inference(
 }
 
 async fn prepare_domain(context: &InferenceContext) -> Result<DomainRequest, InferenceError> {
-    let paths = context.tools.clone();
-    let tools = tokio::task::spawn_blocking(move || {
-        paths
-            .into_iter()
-            .map(|(name, path)| {
-                read_tool(&path, &ToolReadLimits::default())
-                    .map(|input| InferenceToolDefinition {
-                        name,
-                        description: input.description,
-                        input_schema: input.input_schema,
-                    })
-                    .map_err(|failure| {
-                        error(
-                            Kind::InvalidToolDefinition,
-                            format!(
-                                "tool definition read failed at {}: {:?}",
-                                path.display(),
-                                failure.kind
-                            ),
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()
-    })
-    .await
-    .map_err(|_| error(Kind::TaskPanicked, "tool definition reader panicked"))??;
     let mut config = context.request.config.clone();
     config.model = context.route.model.clone();
     let mut request = DomainRequest {
         messages: context.request.messages.clone(),
-        tools,
+        tools: context.tools.clone(),
         config,
     };
     normalize(&mut request)?;

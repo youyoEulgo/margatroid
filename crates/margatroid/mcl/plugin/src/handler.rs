@@ -763,13 +763,11 @@ async fn execute_effect(
     match name {
         "inference" => {
             let messages = effect_messages(context, arguments.next().unwrap()).await?;
-            let tools = alias_parameter(context, arguments.next().unwrap())?;
-            execute_inference(context, messages, tools).await
+            execute_inference(context, messages).await
         }
         "tool_call" => {
             let messages = tool_effect_messages(context, arguments.next().unwrap()).await?;
-            let tools = alias_parameter(context, arguments.next().unwrap())?;
-            execute_tools(context, messages, tools).await
+            execute_tools(context, messages).await
         }
         "history_append" => {
             let messages = effect_messages(context, arguments.next().unwrap()).await?;
@@ -899,7 +897,6 @@ async fn finish_turn(context: &CommandContext) -> Result<MclValue, MclError> {
 async fn execute_inference(
     context: &CommandContext,
     messages: Vec<Value>,
-    tools: Vec<String>,
 ) -> Result<MclValue, MclError> {
     let mut typed = Vec::new();
     for message in messages {
@@ -920,18 +917,6 @@ async fn execute_inference(
         {
             return Ok(None);
         }
-        for alias in &tools {
-            if world
-                .get_component::<Tools>(request.target)
-                .and_then(|entries| entries.get(alias))
-                .is_none()
-            {
-                return Err(error(
-                    MclErrorKind::AliasMissing,
-                    format!("tool alias {alias} is not imported"),
-                ));
-            }
-        }
         let config = world
             .get_component::<AgentInferenceConfig>(request.target)
             .ok_or_else(|| {
@@ -948,7 +933,6 @@ async fn execute_inference(
             agent: request.target,
             turn: agent.turn.clone().unwrap(),
             messages: typed,
-            tools,
             config,
             cancel,
             reply: Arc::new(Mutex::new(Some(sender))),
@@ -988,7 +972,6 @@ fn inference_result(response: InferenceResponse, request_id: &str) -> Result<Mcl
 async fn execute_tools(
     context: &CommandContext,
     messages: Vec<Value>,
-    tools: Vec<String>,
 ) -> Result<MclValue, MclError> {
     let [message] = messages.as_slice() else {
         return Err(error(
@@ -1018,7 +1001,6 @@ async fn execute_tools(
         let active_turn = agent.state == AgentState::Working
             && agent.turn.is_some()
             && agent.turn == expected_turn;
-        let visible = tools.into_iter().collect::<BTreeSet<_>>();
         let mut pending = Vec::new();
         for (index, (call, failed)) in calls.into_iter().enumerate() {
             if let Some(failed) = failed {
@@ -1029,13 +1011,12 @@ async fn execute_tools(
                 pending.push((call, None, Some("Tool call aborted.".to_owned())));
                 continue;
             }
-            if !visible.contains(&call.name)
-                || world
-                    .get_component::<Tools>(request.target)
-                    .and_then(|entries| entries.get(&call.name))
-                    .is_none()
+            if world
+                .get_component::<Tools>(request.target)
+                .and_then(|entries| entries.get(&call.name))
+                .is_none()
             {
-                pending.push((call, None, Some("tool not visible".to_owned())));
+                pending.push((call, None, Some("tool alias is not imported".to_owned())));
                 continue;
             }
             let (sender, receiver) = oneshot::channel();

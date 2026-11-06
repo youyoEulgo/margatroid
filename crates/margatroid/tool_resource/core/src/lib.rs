@@ -12,16 +12,21 @@ use core_plugin::{Entity, World};
 pub use components::Tools;
 pub use error::{ToolResourceError, ToolResourceErrorKind};
 pub use events::{ImportTool, ImportToolReply};
-pub use types::{ToolInput, ToolReadLimits};
+pub use types::{InjectedToolDefinition, ToolEntry, ToolInput, ToolReadLimits};
 
 use ToolResourceErrorKind as Kind;
 
 pub trait WorldToolResourceExt {
+    fn tool_entry(&self, owner: Entity, alias: &str) -> Result<&ToolEntry, ToolResourceError>;
     fn tool_path(&self, owner: Entity, alias: &str) -> Result<&Path, ToolResourceError>;
 }
 
 impl WorldToolResourceExt for World {
     fn tool_path(&self, owner: Entity, alias: &str) -> Result<&Path, ToolResourceError> {
+        Ok(self.tool_entry(owner, alias)?.path.as_path())
+    }
+
+    fn tool_entry(&self, owner: Entity, alias: &str) -> Result<&ToolEntry, ToolResourceError> {
         if !self.is_alive(owner) {
             return Err(ToolResourceError::new(
                 Kind::OwnerMissing,
@@ -38,11 +43,11 @@ impl WorldToolResourceExt for World {
 }
 
 fn validate_alias(alias: &str) -> Result<(), ToolResourceError> {
-    if alias.trim().is_empty()
-        || matches!(alias, "." | "..")
-        || alias
-            .chars()
-            .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':'))
+    let mut bytes = alias.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
         return Err(ToolResourceError::new(Kind::InvalidAlias, "invalid alias"));
     }
@@ -153,30 +158,7 @@ pub fn read_tool(path: &Path, limits: &ToolReadLimits) -> Result<ToolInput, Tool
             ToolResourceError::new(Kind::InvalidDefinition, error.to_string())
                 .with_path(&schema_path)
         })?;
-    if !input_schema.is_object() {
-        return Err(ToolResourceError::new(
-            Kind::InvalidDefinition,
-            "schema must be a JSON object",
-        )
-        .with_path(&schema_path));
-    }
-    if has_external_reference(&input_schema) {
-        return Err(ToolResourceError::new(
-            Kind::InvalidDefinition,
-            "external schema references are not allowed",
-        )
-        .with_path(&schema_path));
-    }
-    jsonschema::options()
-        .with_retriever(NoExternalSchema)
-        .build(&input_schema)
-        .map_err(|_| {
-            ToolResourceError::new(
-                Kind::InvalidDefinition,
-                "invalid schema or external schema reference",
-            )
-            .with_path(&schema_path)
-        })?;
+    validate_schema(&input_schema).map_err(|error| error.with_path(&schema_path))?;
     let program = read_text(&sibling(&origin, "main.lua")?, limits.program_bytes)?;
     Ok(ToolInput {
         description,
@@ -184,6 +166,31 @@ pub fn read_tool(path: &Path, limits: &ToolReadLimits) -> Result<ToolInput, Tool
         program,
         origin,
     })
+}
+
+fn validate_schema(input_schema: &serde_json::Value) -> Result<(), ToolResourceError> {
+    if !input_schema.is_object() {
+        return Err(ToolResourceError::new(
+            Kind::InvalidDefinition,
+            "schema must be a JSON object",
+        ));
+    }
+    if has_external_reference(input_schema) {
+        return Err(ToolResourceError::new(
+            Kind::InvalidDefinition,
+            "external schema references are not allowed",
+        ));
+    }
+    jsonschema::options()
+        .with_retriever(NoExternalSchema)
+        .build(input_schema)
+        .map_err(|_| {
+            ToolResourceError::new(
+                Kind::InvalidDefinition,
+                "invalid schema or external schema reference",
+            )
+        })?;
+    Ok(())
 }
 
 fn has_external_reference(value: &serde_json::Value) -> bool {

@@ -110,3 +110,89 @@ fn installation_accepts_only_schedules_after_abort_processing() {
         );
     }
 }
+
+#[test]
+fn dynamic_admission_checks_recorded_schema_and_live_owner_before_registering() {
+    use std::collections::BTreeSet;
+    use tool_core::{ToolErrorKind, ToolExecutionLimits, ToolTaskHandle};
+    use tool_resource_core::{ToolEntry, Tools};
+    use workspace_core::{Workspace, WorkspaceState};
+
+    for (arguments, cancelled_owner, expected) in [
+        (json!({}), false, ToolErrorKind::InvalidArguments),
+        (json!({"value": 1}), false, ToolErrorKind::OwnerGone),
+        (json!({"value": 1}), true, ToolErrorKind::OwnerGone),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default())
+            .add_plugin(AsyncRuntimePlugin)
+            .add_plugin(ClosurePlugin)
+            .add_closure_system(RuntimePlugin::UPDATE)
+            .add_plugin(ToolPlugin::new());
+        let agent = app.world_mut().spawn();
+        app.world_mut().insert_component(
+            agent,
+            Agent {
+                name: "agent".into(),
+                workspace: agent,
+                state: AgentState::Working,
+                turn: Some("turn".into()),
+            },
+        );
+        app.world_mut().insert_component(
+            agent,
+            Workspace {
+                name: "workspace".into(),
+                definition_path: root.path().join("workspace.yaml"),
+                project_root: root.path().to_owned(),
+                state: WorkspaceState::Running,
+                agents: BTreeSet::new(),
+            },
+        );
+        let tasks = ToolTasks::new();
+        if cancelled_owner {
+            let (reply, _receiver) = oneshot::channel();
+            let (owner, _input) = ToolTaskHandle::new(
+                &ToolExecutionLimits::default(),
+                "owner-call".into(),
+                "factory".into(),
+                reply,
+            )
+            .unwrap();
+            owner.cancel();
+            tasks.register("owner".into(), owner).unwrap();
+        }
+        app.world_mut().insert_component(agent, tasks.clone());
+        let mut tools = Tools::new();
+        tools
+            .insert(
+                "dynamic".into(),
+                ToolEntry {
+                    path: root.path().join("tool.toml"),
+                    description: "dynamic tool".into(),
+                    input_schema: json!({"type":"object","required":["value"]}),
+                    owner_task_id: Some("owner".into()),
+                    binding: Some(json!({"operation":"call"})),
+                },
+            )
+            .unwrap();
+        app.world_mut().insert_component(agent, tools);
+        let (reply, mut result) = oneshot::channel();
+        handler::handle_tool_execute(
+            app.world_mut(),
+            ToolExecuteRequest {
+                id: "dependent".into(),
+                agent,
+                turn: "turn".into(),
+                alias: "dynamic".into(),
+                call_id: "call".into(),
+                arguments,
+                reply: Arc::new(Mutex::new(Some(reply))),
+            },
+        );
+        assert_eq!(result.try_recv().unwrap().unwrap_err().kind, expected);
+        assert!(tasks.get("dependent").is_err());
+        assert_eq!(tasks.list().len(), usize::from(cancelled_owner));
+    }
+}

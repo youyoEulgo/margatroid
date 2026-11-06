@@ -1,0 +1,30 @@
+[package]
+name = "mcp-client"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
+futures-util = "0.3"
+libc = "0.2"
+
+[dev-dependencies]
+agent_core = { path = "../../crates/margatroid/agent/core" }
+workspace_core = { path = "../../crates/margatroid/workspace/core" }
+tool_core = { path = "../../crates/margatroid/tool/core" }
+tool_resource_core = { path = "../../crates/margatroid/tool_resource/core" }
+tool_plugin = { path = "../../crates/margatroid/tool/plugin" }
+core_plugin = { path = "../../crates/mecs/core_plugin" }
+app_runtime_plugin = { path = "../../crates/mecs/app_runtime_plugin" }
+async_runtime_plugin = { path = "../../crates/mecs/async_runtime_plugin" }
+closure_plugin = { path = "../../crates/mecs/closure_plugin" }
+tempfile = "3"
+
+[[test]]
+name = "host_integration"
+path = "tests/host_integration.rs"
+harness = false

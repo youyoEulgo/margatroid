@@ -26,6 +26,7 @@ pub enum ToolErrorKind {
     MissingReturn,
     InputClosed,
     InputFull,
+    OwnerGone,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,3 +1,5 @@
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -256,7 +258,6 @@ impl Fixture {
                     content: "hello".into(),
                     images: vec![],
                 }],
-                tools: vec![],
                 config: InferenceParameters {
                     model: "route".into(),
                     temperature: None,
@@ -324,7 +325,9 @@ impl Fixture {
         std::fs::write(directory.join("input.schema.json"), "{\"type\":\"object\"}").unwrap();
         std::fs::write(directory.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() end").unwrap();
         let mut tools = Tools::default();
-        tools.insert("visible".into(), directory.join("tool.toml"));
+        tools
+            .insert("visible".into(), common::tool(directory.join("tool.toml")))
+            .unwrap();
         self.app.world_mut().insert_component(self.agent, tools);
     }
 }
@@ -412,7 +415,7 @@ fn all_seven_provider_api_combinations_use_explicit_auth_endpoints_and_strict_st
 }
 
 #[test]
-fn tool_aliases_are_read_fresh_and_failed_reads_do_not_use_old_definitions() {
+fn tool_entries_are_read_fresh_and_inference_uses_cached_definitions() {
     let server = HttpServer::new(trace("chat_completions"));
     let mut fixture = Fixture::new(&server.url, "openai", "chat_completions");
     for (id, description) in [
@@ -420,8 +423,8 @@ fn tool_aliases_are_read_fresh_and_failed_reads_do_not_use_old_definitions() {
         ("second", "changed-description"),
     ] {
         fixture.tool(description);
-        let (mut request, reply) = fixture.request(id);
-        request.tools = vec!["visible".into()];
+        let (request, reply) = fixture.request(id);
+
         fixture.run(request, reply).unwrap();
         let (_, _, body) = server
             .received
@@ -437,13 +440,66 @@ fn tool_aliases_are_read_fresh_and_failed_reads_do_not_use_old_definitions() {
         Some(fixture.root.path().join("tool").as_path())
     );
     std::fs::remove_file(path).unwrap();
-    let (mut request, reply) = fixture.request("deleted");
-    request.tools = vec!["visible".into()];
+    let (request, reply) = fixture.request("deleted");
+
+    fixture.run(request, reply).unwrap();
+    let (_, _, body) = server
+        .received
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(body["tools"][0]["function"]["name"], "visible");
     assert_eq!(
-        fixture.run(request, reply).unwrap_err().kind,
-        Kind::InvalidToolDefinition
+        body["tools"][0]["function"]["description"],
+        "changed-description"
     );
-    assert!(server.received.try_recv().is_err());
+}
+
+#[test]
+fn every_inference_uses_all_current_tool_entries() {
+    let server = HttpServer::new(trace("chat_completions"));
+    let mut fixture = Fixture::new(&server.url, "openai", "chat_completions");
+    let (request, reply) = fixture.request("registered-after-request");
+    fixture.tool("first tool");
+    let tools = fixture
+        .app
+        .world_mut()
+        .get_component_mut::<Tools>(fixture.agent)
+        .unwrap();
+    let mut second = tools.get("visible").unwrap().clone();
+    second.description = "second tool".into();
+    second.owner_task_id = Some("dynamic-owner".into());
+    tools.insert("second".into(), second.clone()).unwrap();
+    assert_eq!(
+        tools.insert("second".into(), second).unwrap_err().kind,
+        tool_resource_core::ToolResourceErrorKind::AliasConflict
+    );
+    fixture.run(request, reply).unwrap();
+    let (_, _, body) = server
+        .received
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let definitions = body["tools"].as_array().unwrap();
+    assert_eq!(definitions.len(), 2);
+    assert_eq!(definitions[0]["function"]["name"], "second");
+    assert_eq!(definitions[0]["function"]["description"], "second tool");
+    assert_eq!(definitions[1]["function"]["name"], "visible");
+    fixture.idle();
+
+    let (request, reply) = fixture.request("removed-after-request");
+    fixture
+        .app
+        .world_mut()
+        .get_component_mut::<Tools>(fixture.agent)
+        .unwrap()
+        .remove_owner("dynamic-owner");
+    fixture.run(request, reply).unwrap();
+    let (_, _, body) = server
+        .received
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let definitions = body["tools"].as_array().unwrap();
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0]["function"]["name"], "visible");
 }
 
 #[test]
@@ -813,7 +869,7 @@ fn historical_reasoning_is_format_adapted_without_rewriting_local_messages() {
             let snapshot = messages.clone();
             let (mut request, reply) = fixture.request(&format!("history-{index}"));
             request.messages = messages.clone();
-            request.tools = vec!["visible".into()];
+
             let response = fixture
                 .run(request, reply)
                 .unwrap_or_else(|e| panic!("{provider}/{format} {replay:?}: {e}"));
@@ -868,7 +924,7 @@ fn malformed_reasoning_replay_fails_before_http_instead_of_silently_disappearing
         fixture.tool("visible");
         let (mut request, reply) = fixture.request("invalid-replay");
         request.messages = historical_reasoning_fixture(Some(replay));
-        request.tools = vec!["visible".into()];
+
         assert_eq!(
             fixture.run(request, reply).unwrap_err().kind,
             Kind::InvalidParameters

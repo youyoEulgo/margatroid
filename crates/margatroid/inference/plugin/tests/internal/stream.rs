@@ -1,13 +1,26 @@
 use super::*;
+#[path = "tool_contract.rs"]
+mod tool_contract;
 use inference_core::InferenceParameters;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, Notify};
 
 async fn http_server() -> (String, mpsc::Sender<String>, tokio::task::JoinHandle<()>) {
+    let (url, sender, task, _) = http_server_with_request().await;
+    (url, sender, task)
+}
+
+async fn http_server_with_request() -> (
+    String,
+    mpsc::Sender<String>,
+    tokio::task::JoinHandle<()>,
+    oneshot::Receiver<Value>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (sender, mut receiver) = mpsc::channel::<String>(8);
+    let (captured, request_body) = oneshot::channel();
     let task = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = Vec::new();
@@ -30,6 +43,7 @@ async fn http_server() -> (String, mpsc::Sender<String>, tokio::task::JoinHandle
         if stream.read_exact(&mut body).await.is_err() {
             return;
         }
+        let _ = captured.send(serde_json::from_slice(&body).unwrap());
         if stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.is_err() { return; }
         while let Some(chunk) = receiver.recv().await {
             let frame = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
@@ -39,7 +53,7 @@ async fn http_server() -> (String, mpsc::Sender<String>, tokio::task::JoinHandle
         }
         let _ = stream.write_all(b"0\r\n\r\n").await;
     });
-    (url, sender, task)
+    (url, sender, task, request_body)
 }
 
 fn chat(text: &str) -> String {
@@ -72,7 +86,6 @@ fn request() -> InferenceRequest {
             content: "hello".into(),
             images: vec![],
         }],
-        tools: vec![],
         config: InferenceParameters {
             model: "route".into(),
             temperature: None,

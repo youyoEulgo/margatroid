@@ -1,8 +1,8 @@
 # Inference
 
-inference_core定义推理请求、消息、结果、模型配置Resource及错误，只依赖mecs与通用库。inference_plugin组合Agent、Client、工具路径能力，执行模型请求；不依赖其他plugin。MCL负责消息转换、批次工具调用和显式历史，Inference不维护上下文、不执行工具、不写历史。
+inference_core定义推理请求、消息、结果、模型配置Resource及错误，只依赖mecs与通用库。inference_plugin组合Agent、Client、Tools记录，执行模型请求；不依赖其他plugin。MCL负责消息转换、批次工具调用和显式历史，Inference不维护上下文、不执行工具、不写历史。
 
-下文记录已有实现；DESIGN中的工具来源调整为已批准、待实现目标，当前src仍使用工具alias参数及路径读取API。本轮只整理文档，不表示运行中的daemon已更新。目标中InferenceRequest的tools参数删除，每次推理直接遍历Agent的Tools，以每条记录的alias、description、input_schema构造模型工具定义；Tools为空时工具定义为空。本次异步请求持有owned定义，工具执行侧按请求名称查询当前Tools并调用，缺失时返回工具错误。
+本文同步本轮实现契约，不表示运行中的daemon已更新。InferenceRequest不再携带tools参数，每次推理直接遍历Agent的Tools，以每条记录的alias、description、input_schema构造模型工具定义；Tools为空时工具定义为空。本次异步请求持有为本次HTTP构造的owned定义，工具执行侧按请求名称查询当前Tools并调用，缺失时返回工具错误。
 
 Margatroid领域使用原生Axum装配及普通异步闭包。网络服务归本应用基础设施，mecs提供通用运行、异步事件和闭包能力。
 
@@ -27,11 +27,11 @@ ActiveInference归inference_core，单独保存当前InferenceHandle。受理推
 
 ## 输入与工具
 
-InferenceRequest携带完整Agent Entity、turn、消息、工具alias和oneshot。Handler认领唯一回复端，检查Working及当前turn，准备本次请求。System实际受理时当前turn为空或与request.turn不匹配，直接返回空assistant的Cancelled响应（正文、reasoning、tool_calls、replay、usage均空），不启动HTTP或监督任务。插件仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule。
+InferenceRequest携带完整Agent Entity、turn、消息和oneshot。Handler认领唯一回复端，检查Working及当前turn，准备本次请求。System实际受理时当前turn为空或与request.turn不匹配，直接返回空assistant的Cancelled响应（正文、reasoning、tool_calls、replay、usage均空），不启动HTTP或监督任务。插件仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule。
 
 推理消息由本领域独立定义，MCL在plugin层转换并展开Inject；core不引用消息、工具或Agent core。System保留原角色，取消Assistant不进入模型上下文，工具调用与结果必须正确配对。
 
-工具参数是已导入alias数组，空数组代表无工具。准备本次请求时从Tools取得路径，读取最新描述与schema，拒绝重复alias或非法定义；不读取ResourceID快照、不缓存工具正文、不执行脚本。
+工具来源只有当前Tools的全量记录，不经Driver、settings或visible_tools过滤，也不接收alias选择列表。准备本次请求时使用记录中的描述与schema，不读取工具文件；导入后文件metadata变化不会隐式更新记录。Tools为空时模型工具定义为空；不执行脚本。
 
 ## 请求适配
 
@@ -67,6 +67,8 @@ DTO原生WebSocket读循环解析协议后投递自有DtoRequest，UPDATE转换�
 
 ## 预算
 
-配置、请求体、SSE缓冲、响应、工具参数和发送队列均有上限。单消息图片最多8张、每张解码5MiB、合计20MiB；请求和响应总量各不超过32MiB，单SSE事件不超过4MiB。整体推理默认180秒，单连接发送等待最多100ms。预算错误不自动重试、续写或压缩。
+配置、请求体、SSE缓冲、响应、工具参数和发送队列均有上限。单消息图片最多8张、每张解码5MiB、合计20MiB；请求和响应总量各不超过128MiB，单SSE事件不超过4MiB。整体推理默认180秒，单连接发送等待最多100ms。预算错误不自动重试、续写或压缩。
 
 推理通过普通异步闭包进行短启动交接，监督任务由共享InferenceHandle持有；未交接的Pending句柄仍算活动，wait_finished等待真实join，支持多个等待者和等待者取消。HTTP客户端不缓存Tokio执行器Handle、不使用临时服务握手；前端出口使用client_core::ClientSender和ClientFrame，不依赖mecs服务器类型。
+
+工具目录不按条目数或单条描述长度截断，统一受HTTP请求总字节预算约束。真实HTTP回归覆盖1024个工具、每条16KiB描述，在三种模型格式中逐条核对完整名称、描述及schema。

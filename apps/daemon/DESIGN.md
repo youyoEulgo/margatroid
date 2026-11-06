@@ -7,11 +7,7 @@ Resource写在lib板块；持有关系在文末使用树形图。
 不写独立逻辑段、进度、计划或验证记录。
 ```
 
-# 设计范围
-
-Margatroid装配使用独立Axum服务；mecs只提供通用运行与异步事件、闭包设施。
-
-# 板块格式
+# 板块定义
 
 ```text
 # lib     src/main.rs  进程入口与退出码
@@ -35,7 +31,21 @@ main()
 私有：
 ```text
 run() -> Result<(), Error>
-    行为：定位用户数据根，构造ApplicationOptions；调用compose::build_app并启动App运行循环。监听及原生路由由Margatroid AxumPlugin负责，显式受控退出由compose::shutdown_app提供，保持ECS处理能力直到领域及Axum退出；外部强制终止进程不构成真实清理证明。
+    从HOME定位.margatroid，构造ApplicationOptions
+    app = compose::build_app(options)
+    创建信号监听运行时，安装listen_for_shutdown
+    app.run_until(stopping.load)
+    await compose::shutdown_app(&mut app) -- 持续推进ECS及真实清理
+    清理未确认: 报错并继续监督
+    清理完成: 结束信号监听，释放App，返回退出码
+
+listen_for_shutdown(stopping: Arc<AtomicBool>, handle: RuntimeHandle) -> Result<JoinHandle<()>, IoError>
+    监听SIGINT、SIGTERM -- 非Unix监听Ctrl+C
+    每次收到信号调用request_shutdown；监听保留至清理完成
+
+request_shutdown(stopping: &AtomicBool, handle: &RuntimeHandle)
+    首次信号: stopping = true; handle.wake()
+    重复信号: 输出清理仍在进行 -- 不跳过清理
 
 data_root() -> Result<PathBuf, Error>
     行为：取得HOME下.margatroid，不把项目目录用作状态目录。
@@ -45,8 +55,9 @@ data_root() -> Result<PathBuf, Error>
 
 ```text
 进程main
+├── 信号监听任务与stopping标记
 └── App
-    ├── mecs Runtime/AsyncRuntime/Closure设施（本轮保持）
+    ├── mecs Runtime/AsyncRuntime/Closure设施
     ├── Margatroid AxumHandle（监听、退出及升级工作跟踪）
     ├── MargatroidConfig
     ├── WorkspaceDefinitions（路径和展示缓存）

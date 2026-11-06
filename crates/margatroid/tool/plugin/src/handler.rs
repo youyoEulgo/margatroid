@@ -1,3 +1,5 @@
+pub(crate) mod process;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -7,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use agent_core::{Agent, AgentState};
 use async_runtime_plugin::WorldAsyncExt;
+use closure_plugin::WorldClosureSender;
 use core_plugin::World;
 use futures_util::FutureExt;
 use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value as LuaValue, VmState};
@@ -23,7 +26,7 @@ use tool_core::{
     parse_tool_result, InitToolTasks, ToolConfiguration, ToolError, ToolErrorKind as Kind,
     ToolExecuteRequest, ToolExecutionLimits, ToolTaskHandle, ToolTasks,
 };
-use tool_resource_core::{read_tool, ToolReadLimits, Tools};
+use tool_resource_core::{InjectedToolDefinition, ToolEntry, Tools};
 use workspace_core::Workspace;
 
 use crate::types::{
@@ -109,11 +112,11 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
                 "arguments exceed byte budget",
             ));
         }
-        let tool_path = world
+        let tool_entry = world
             .get_component::<Tools>(request.agent)
             .and_then(|tools| tools.get(&request.alias))
             .ok_or_else(|| error(Kind::AliasMissing, "tool alias is not registered"))?
-            .to_owned();
+            .clone();
         let sandbox_path = world
             .get_component::<SelectedSandbox>(request.agent)
             .and_then(|selected| selected.alias.as_deref())
@@ -139,9 +142,21 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
             .get_component::<ToolTasks>(request.agent)
             .ok_or_else(|| error(Kind::TaskMissing, "ToolTasks not initialized"))?
             .clone();
-        Ok((config, tool_path, sandbox_path, project_root, tasks))
+        validate_arguments(&tool_entry.input_schema, &request.arguments)?;
+        if let Some(owner) = &tool_entry.owner_task_id {
+            let owner = tasks
+                .get(owner)
+                .map_err(|_| error(Kind::OwnerGone, "tool owner is missing"))?;
+            if owner.cancel_token().is_cancelled() || owner.is_cleanup_complete() {
+                return Err(error(
+                    Kind::OwnerGone,
+                    "tool owner is no longer accepting calls",
+                ));
+            }
+        }
+        Ok((config, tool_entry, sandbox_path, project_root, tasks))
     })();
-    let (config, tool_path, sandbox_path, project_root, tasks) = match prepared {
+    let (config, tool_entry, sandbox_path, project_root, tasks) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = reply.send(Err(error));
@@ -157,6 +172,7 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         // Handle construction delivers its validation failure to the original reply.
         return;
     };
+    handle.set_owner_task_id(tool_entry.owner_task_id.clone());
     if let Err(failure) = tasks.register(request.id.clone(), handle.clone()) {
         let _ = handle.return_result(Err(failure));
         return;
@@ -164,7 +180,13 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
     let schedule = config.schedule.clone();
     let context = ToolExecutionContext {
         request,
-        tool_path,
+        tool_entry,
+        world: Arc::downgrade(
+            &world
+                .get_resource::<crate::ToolRuntime>()
+                .expect("Tool runtime missing")
+                .0,
+        ),
         sandbox_path,
         project_root,
         runner_path: config.runner_path,
@@ -264,18 +286,11 @@ fn complete_reply(
 async fn supervise_tool(mut context: ToolExecutionContext) {
     let handle = context.handle.clone();
     let result = std::panic::AssertUnwindSafe(async {
-        let tool_path = context.tool_path.clone();
+        let tool_path = context.tool_entry.path.clone();
         let sandbox_path = context.sandbox_path.clone();
         let script_bytes = context.limits.script_bytes;
         let read = tokio::task::spawn_blocking(move || {
-            let tool = read_tool(
-                &tool_path,
-                &ToolReadLimits {
-                    program_bytes: script_bytes,
-                    ..ToolReadLimits::default()
-                },
-            )
-            .map_err(|failure| error(Kind::ReadFailed, failure.to_string()))?;
+            let program = read_program(&tool_path, script_bytes)?;
             let policy = sandbox_path
                 .map(|path| {
                     read_sandbox(&path, &SandboxReadLimits::default())
@@ -283,21 +298,12 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
                         .map_err(|failure| error(Kind::ReadFailed, failure.to_string()))
                 })
                 .transpose()?;
-            Ok::<_, ToolError>((tool, policy))
+            Ok::<_, ToolError>((program, policy))
         });
-        let (tool, policy) = read
+        let (program, policy) = read
             .await
             .map_err(|_| error(Kind::TaskPanicked, "tool resource reader failed"))??;
-        let validator = jsonschema::options()
-            .with_retriever(NoExternalSchema)
-            .build(&tool.input_schema)
-            .map_err(|_| error(Kind::InvalidDefinition, "tool input schema is invalid"))?;
-        if !validator.is_valid(&context.request.arguments) {
-            return Err(error(
-                Kind::InvalidArguments,
-                "arguments do not match current tool schema",
-            ));
-        }
+        validate_arguments(&context.tool_entry.input_schema, &context.request.arguments)?;
         if context.handle.cancel_token().is_cancelled() {
             return Err(error(
                 Kind::Cancelled,
@@ -315,12 +321,15 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
             })?;
         let request = RunnerRequest {
             protocol_version: 1,
-            program: tool.program,
+            program,
             arguments: context.request.arguments.clone(),
             context: ToolContext {
                 task_id: context.request.id.clone(),
                 call_id: context.request.call_id.clone(),
                 alias: context.request.alias.clone(),
+                owner_task_id: context.tool_entry.owner_task_id.clone(),
+                binding: context.tool_entry.binding.clone(),
+                resource_dir: resource_dir(&context.tool_entry.path)?.to_owned(),
                 project_root: context.project_root.clone(),
                 temp_dir: temporary.path().to_owned(),
             },
@@ -367,6 +376,11 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
     if let Err(failure) = &outcome {
         complete_reply(&mut context, Err(failure.clone()));
     }
+    if let Err(failure) = cleanup_owner(&context).await {
+        handle.set_error(failure.clone());
+        complete_reply(&mut context, Err(failure));
+        return;
+    }
     if cleanup_confirmed {
         context
             .tasks
@@ -374,6 +388,130 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
     } else {
         handle.set_error(outcome.unwrap_err());
     }
+}
+
+fn validate_arguments(schema: &Value, arguments: &Value) -> Result<(), ToolError> {
+    let validator = jsonschema::options()
+        .with_retriever(NoExternalSchema)
+        .build(schema)
+        .map_err(|_| error(Kind::InvalidDefinition, "tool input schema is invalid"))?;
+    if !validator.is_valid(arguments) {
+        return Err(error(
+            Kind::InvalidArguments,
+            "arguments do not match tool schema",
+        ));
+    }
+    Ok(())
+}
+
+fn resource_dir(path: &Path) -> Result<&Path, ToolError> {
+    path.parent()
+        .ok_or_else(|| error(Kind::ReadFailed, "tool manifest has no resource directory"))
+}
+
+fn read_program(path: &Path, maximum: usize) -> Result<String, ToolError> {
+    use std::io::Read;
+    let file = std::fs::File::open(resource_dir(path)?.join("main.lua"))
+        .map_err(|failure| error(Kind::ReadFailed, failure.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take((maximum as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|failure| error(Kind::ReadFailed, failure.to_string()))?;
+    if bytes.len() > maximum {
+        return Err(error(
+            Kind::OutputTooLarge,
+            "tool program exceeds byte budget",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| error(Kind::ReadFailed, "tool program is not UTF-8"))
+}
+
+async fn in_world<T: Send + 'static>(
+    sender: &std::sync::Weak<WorldClosureSender>,
+    work: impl FnOnce(&mut World) -> Result<T, ToolError> + Send + 'static,
+) -> Result<T, ToolError> {
+    let sender = sender
+        .upgrade()
+        .ok_or_else(|| error(Kind::CleanupFailed, "tool World is no longer available"))?;
+    let (reply, receiver) = oneshot::channel();
+    sender.send(move |world| {
+        let _ = reply.send(work(world));
+    });
+    drop(sender);
+    receiver
+        .await
+        .map_err(|_| error(Kind::CleanupFailed, "tool World action reply lost"))?
+}
+
+async fn inject_tools(
+    context: &ToolExecutionContext,
+    definitions: Vec<InjectedToolDefinition>,
+) -> Result<(), ToolError> {
+    if context.configuration.is_none() {
+        return Err(error(
+            Kind::InvalidRequest,
+            "tool configuration not confirmed",
+        ));
+    }
+    let bytes = serde_json::to_vec(&definitions)
+        .map_err(|_| error(Kind::InvalidDefinition, "invalid tool definitions"))?;
+    if bytes.len() > context.limits.argument_bytes {
+        return Err(error(
+            Kind::OutputTooLarge,
+            "tool definitions exceed byte budget",
+        ));
+    }
+    let agent = context.request.agent;
+    let task_id = context.request.id.clone();
+    let path = context.tool_entry.path.clone();
+    in_world(&context.world, move |world| {
+        let tasks = world
+            .get_component::<ToolTasks>(agent)
+            .ok_or_else(|| error(Kind::TaskMissing, "Agent tool tasks missing"))?;
+        let handle = tasks.get(&task_id)?;
+        if handle.cancel_token().is_cancelled() || handle.is_cleanup_complete() {
+            return Err(error(
+                Kind::Cancelled,
+                "tool task cancelled before injection",
+            ));
+        }
+        let entries = definitions
+            .into_iter()
+            .map(|definition| {
+                (
+                    definition.alias,
+                    ToolEntry {
+                        path: path.clone(),
+                        description: definition.description,
+                        input_schema: definition.input_schema,
+                        owner_task_id: Some(task_id.clone()),
+                        binding: definition.binding,
+                    },
+                )
+            })
+            .collect();
+        world
+            .get_component_mut::<Tools>(agent)
+            .ok_or_else(|| error(Kind::AgentMissing, "Agent tools missing"))?
+            .insert_batch(entries)
+            .map_err(|failure| error(Kind::InvalidDefinition, failure.to_string()))
+    })
+    .await
+}
+
+async fn cleanup_owner(context: &ToolExecutionContext) -> Result<(), ToolError> {
+    context.handle.cancel();
+    let agent = context.request.agent;
+    let task_id = context.request.id.clone();
+    let tasks = context.tasks.clone();
+    in_world(&context.world, move |world| {
+        if let Some(tools) = world.get_component_mut::<Tools>(agent) {
+            tools.remove_owner(&task_id);
+        }
+        tasks.abort_owner_unreturned(&task_id);
+        Ok(())
+    })
+    .await
 }
 
 impl jsonschema::Retrieve for NoExternalSchema {
@@ -571,6 +709,15 @@ async fn host_frame(
             request_id,
             context.tasks.send(&task_id, value).map(|()| Value::Null),
         ),
+        RunnerFrame::Inject {
+            request_id,
+            definitions,
+        } => {
+            let result = inject_tools(context, definitions)
+                .await
+                .map(|()| Value::Null);
+            (request_id, result)
+        }
         RunnerFrame::Finish {
             request_id,
             task_id,
@@ -745,6 +892,7 @@ async fn run_runner(
         complete_reply(context, Err(failure.clone()));
         context.handle.set_error(failure.clone());
     }
+    cleanup_owner(context).await?;
     if !proven {
         signal_runner(pid);
         if result
@@ -1489,6 +1637,27 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
             .map_err(lua_failure)?,
         )
         .map_err(lua_failure)?;
+    let inject_bridge = bridge.clone();
+    globals
+        .set(
+            "tool_inject",
+            lua.create_async_function(move |lua, value: LuaValue| {
+                let bridge = inject_bridge.clone();
+                async move {
+                    let definitions = lua.from_value::<Vec<InjectedToolDefinition>>(value)?;
+                    bridge
+                        .call(|request_id| RunnerFrame::Inject {
+                            request_id,
+                            definitions,
+                        })
+                        .await
+                        .map_err(mlua::Error::external)?;
+                    Ok(())
+                }
+            })
+            .map_err(lua_failure)?,
+        )
+        .map_err(lua_failure)?;
     let task_bridge = bridge.clone();
     let limits = request.limits.clone();
     globals
@@ -1609,6 +1778,11 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         .map_err(lua_failure)?;
     install_shell(&lua, &request)?;
     install_terminal(&lua, &request)?;
+    let processes = process::install_process(
+        &lua,
+        request.context.project_root.clone(),
+        request.limits.clone(),
+    )?;
     let arguments = lua.to_value(&request.arguments).map_err(lua_failure)?;
     let context = lua.to_value(&request.context).map_err(lua_failure)?;
     globals
@@ -1627,6 +1801,8 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     for name in [
         "shell",
         "terminal_open",
+        "process_open",
+        "tool_inject",
         "await_any",
         "task_write",
         "task_replace",
@@ -1682,6 +1858,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     };
     host_reader.abort();
     let _ = host_reader.await;
+    processes.cleanup().await?;
     result
 }
 
@@ -2113,4 +2290,141 @@ fn parse_configuration(lua: &Lua, value: LuaValue) -> Result<ToolConfiguration, 
         })?;
     configuration.validate()?;
     Ok(configuration)
+}
+
+#[cfg(test)]
+mod world_sender_tests {
+    use super::*;
+    use app_runtime_plugin::RuntimePlugin;
+    use async_runtime_plugin::AsyncRuntimePlugin;
+    use closure_plugin::{AppClosureExt, ClosurePlugin};
+    use core_plugin::App;
+    use workspace_core::WorkspaceState;
+
+    #[test]
+    fn app_drop_releases_queued_tool_launch_and_its_reply() {
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default())
+            .add_plugin(AsyncRuntimePlugin)
+            .add_plugin(ClosurePlugin)
+            .add_closure_system(RuntimePlugin::UPDATE)
+            .add_plugin(ToolPlugin::new());
+        let root = tempfile::tempdir().unwrap();
+        let agent = app.world_mut().spawn();
+        app.world_mut().insert_component(
+            agent,
+            Agent {
+                name: "test".into(),
+                workspace: agent,
+                state: AgentState::Working,
+                turn: Some("turn".into()),
+            },
+        );
+        app.world_mut().insert_component(
+            agent,
+            Workspace {
+                name: "test".into(),
+                definition_path: root.path().join("workspace.yaml"),
+                project_root: root.path().to_owned(),
+                state: WorkspaceState::Running,
+                agents: Default::default(),
+            },
+        );
+        let mut tools = Tools::new();
+        tools
+            .insert(
+                "test".into(),
+                ToolEntry {
+                    path: root.path().join("tool.toml"),
+                    description: "test".into(),
+                    input_schema: serde_json::json!({}),
+                    owner_task_id: None,
+                    binding: None,
+                },
+            )
+            .unwrap();
+        app.world_mut().insert_component(agent, tools);
+        let tasks = ToolTasks::new();
+        app.world_mut().insert_component(agent, tasks.clone());
+        let sender = Arc::downgrade(&app.world().get_resource::<crate::ToolRuntime>().unwrap().0);
+        let (reply, mut receiver) = oneshot::channel();
+        handle_tool_execute(
+            app.world_mut(),
+            ToolExecuteRequest {
+                id: "queued".into(),
+                agent,
+                turn: "turn".into(),
+                alias: "test".into(),
+                call_id: "call".into(),
+                arguments: serde_json::json!({}),
+                reply: Arc::new(Mutex::new(Some(reply))),
+            },
+        );
+        assert_eq!(tasks.list().len(), 1);
+        drop(app);
+        assert!(sender.upgrade().is_none());
+        assert_eq!(
+            receiver.try_recv().unwrap().unwrap_err().kind,
+            Kind::SubmitFailed
+        );
+        assert!(tasks.list().is_empty());
+    }
+
+    #[test]
+    fn optional_context_markers_are_lua_nil_and_present_markers_survive_the_wire() {
+        let lua = Lua::new();
+        let mut context = ToolContext {
+            task_id: "task".into(),
+            call_id: "call".into(),
+            alias: "alias".into(),
+            owner_task_id: None,
+            binding: None,
+            resource_dir: PathBuf::from("/resource"),
+            project_root: PathBuf::from("/project"),
+            temp_dir: PathBuf::from("/temp"),
+        };
+        let wire = serde_json::to_vec(&context).unwrap();
+        let received: ToolContext = serde_json::from_slice(&wire).unwrap();
+        let LuaValue::Table(table) = lua.to_value(&received).unwrap() else {
+            panic!("context table");
+        };
+        assert!(matches!(
+            table.get::<LuaValue>("owner_task_id").unwrap(),
+            LuaValue::Nil
+        ));
+        assert!(matches!(
+            table.get::<LuaValue>("binding").unwrap(),
+            LuaValue::Nil
+        ));
+        context.owner_task_id = Some("owner".into());
+        context.binding = Some(serde_json::json!({"method": "echo"}));
+        let wire = serde_json::to_vec(&context).unwrap();
+        let received: ToolContext = serde_json::from_slice(&wire).unwrap();
+        let LuaValue::Table(table) = lua.to_value(&received).unwrap() else {
+            panic!("context table");
+        };
+        assert_eq!(table.get::<String>("owner_task_id").unwrap(), "owner");
+        assert_eq!(
+            table
+                .get::<mlua::Table>("binding")
+                .unwrap()
+                .get::<String>("method")
+                .unwrap(),
+            "echo"
+        );
+    }
+
+    #[test]
+    fn program_reads_only_main_lua_beside_the_manifest_with_a_byte_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root.path().join("tool.toml");
+        // Neither a manifest nor a registration schema is needed at execution time.
+        std::fs::write(root.path().join("main.lua"), "return 1").unwrap();
+        assert_eq!(resource_dir(&manifest).unwrap(), root.path());
+        assert_eq!(read_program(&manifest, 8).unwrap(), "return 1");
+        assert_eq!(
+            read_program(&manifest, 7).unwrap_err().kind,
+            Kind::OutputTooLarge
+        );
+    }
 }

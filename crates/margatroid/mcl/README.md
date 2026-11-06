@@ -2,7 +2,7 @@
 
 mcl_core定义语法树、队列、请求和结果，只依赖mecs及通用库。消息在MCL契约中使用结构化值，执行时由mcl_plugin转换并校验所属领域消息类型；core不引用其他领域core。mcl_plugin依赖address和所需领域core，不依赖其他plugin。
 
-下文记录已有实现；DESIGN中的完整Tools记录、动态入口及MCP资源分流为已批准、待实现目标，当前src仍保留下文的alias参数与路径登记API。本轮只整理文档，不表示运行中的daemon已更新。目标中IMPORT TOOL向Agent的Tools登记alias、description、input_schema和path，inference与tool_call使用当前Tools；inference接收消息及推理参数，tool_call接收调用消息。tool_inject、原始进程通信和MCP协议由通用工具宿主及工具侧处理，MCL使用现有指令执行领域调用。
+本文同步本轮实现契约，不表示运行中的daemon已更新。IMPORT TOOL只向Agent的唯一Tools集合增加alias、description、input_schema和path记录，不维护选择名单。inference与tool_call使用当前Tools，各只接收一个消息数组输入；tool_call要求数组恰含一条Assistant。tool_inject、原始进程通信和MCP协议由通用工具宿主及工具侧处理，MCL使用现有指令执行领域调用。
 
 ## 指令
 
@@ -21,8 +21,8 @@ INJECT [] TO entry.pending[0,1]
 CONFIG GET
 CONFIG SET ? ?
 CONFIG DELETE ?
-EFFECT inference (msg.instructions, session.conversation) ?
-EFFECT tool_call (session.conversation[-1]) ?
+EFFECT inference (msg.instructions, session.conversation)
+EFFECT tool_call (session.conversation[-1])
 EFFECT sandbox_use ?
 EFFECT history_append ?
 EFFECT start_turn
@@ -31,7 +31,7 @@ EFFECT ready
 EFFECT wake
 ```
 
-Lua调用为mcl(target_entity, text, arguments)，arguments按顺序对应问号。来源及本次VM实例由lua_runtime_plugin中的mcl宿主绑定，不接受调用者伪造source。宿主只依赖mcl_core发送MclCommand并等待reply；唯一执行入口MclCommand要求调用方显式提供source_address，网络入口及Lua宿主传入自身真实地址，与source实体身份核对，MCL审计source保存该地址而非Entity编号；history_append消息按payload.type保存type，不保存调用来源；mcl_plugin不定义Lua函数。消息参数要求完整消息数组，工具参数为已导入alias数组；配置路径和值分别占一个参数。
+Lua调用为mcl(target_entity, text, arguments)，arguments按顺序对应问号。来源及本次VM实例由lua_runtime_plugin中的mcl宿主绑定，不接受调用者伪造source。宿主只依赖mcl_core发送MclCommand并等待reply；唯一执行入口MclCommand要求调用方显式提供source_address，网络入口及Lua宿主传入自身真实地址，与source实体身份核对，MCL审计source保存该地址而非Entity编号；history_append消息按payload.type保存type，不保存调用来源；mcl_plugin不定义Lua函数。消息参数要求完整消息数组；marker形式分别为EFFECT inference ?和EFFECT tool_call ?，只占一个参数，不接受第二个工具alias数组。配置路径和值分别占一个参数。
 
 ## 消息Block
 
@@ -51,12 +51,12 @@ SET创建缺失的中间table；中间节点是非table时返回错误。DELETE�
 
 ## 导入与效果
 
-IMPORT校验种类、依赖和alias后，在对应资源领域登记alias到路径。alias在同Agent内跨类别唯一；冲突不覆盖旧登记。资源正文随使用读取，执行期间的临时材料不随文件变化修改。MCL不保存通用ImportBindings、ResourceID或工具/沙箱正文仓库。
+IMPORT校验种类、依赖和alias后，在对应资源领域登记；TOOL保存路径、描述及schema的完整记录，只增加工具，不另设可见名单。alias在同Agent内跨类别唯一；冲突不覆盖旧登记。工具描述及schema在导入时缓存于Tools，文件metadata变化不会隐式更新记录；执行按记录path读取程序，按记录schema校验参数。MCL不保存通用ImportBindings、ResourceID或工具/沙箱正文仓库。
 
 | EFFECT | 参数 | 返回值 |
 | --- | --- | --- |
-| inference | 消息数组、工具alias数组 | .Inference.message、.Inference.stop_reason |
-| tool_call | 单条Assistant组成的消息数组、工具alias数组 | .Array.Message |
+| inference | 消息数组（单输入） | .Inference.message、.Inference.stop_reason |
+| tool_call | 单条Assistant组成的消息数组（单输入） | .Array.Message |
 | sandbox_use | 零或一个沙箱alias组成的数组 | Unit |
 | history_append | 消息数组 | Unit |
 | start_turn | 无 | Unit |

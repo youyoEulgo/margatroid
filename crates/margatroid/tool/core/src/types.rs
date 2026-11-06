@@ -63,14 +63,14 @@ impl Default for ToolExecutionLimits {
     fn default() -> Self {
         Self {
             script_bytes: 1024 * 1024,
-            argument_bytes: 256 * 1024,
-            output_bytes: 1024 * 1024,
+            argument_bytes: 128 * 1024 * 1024,
+            output_bytes: 256 * 1024 * 1024,
             result_bytes: 32 * 1024 * 1024,
-            diagnostic_bytes: 256 * 1024,
-            memory_bytes: 64 * 1024 * 1024,
-            instruction_budget: 10_000_000,
-            cache_bytes: 4 * 1024 * 1024,
-            input_capacity: 32,
+            diagnostic_bytes: 16 * 1024 * 1024,
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            instruction_budget: 640_000_000,
+            cache_bytes: 128 * 1024 * 1024,
+            input_capacity: 1024,
         }
     }
 }
@@ -138,6 +138,7 @@ struct ToolTaskData {
     returned: bool,
     call_id: String,
     alias: String,
+    owner_task_id: Option<String>,
     reply: Option<oneshot::Sender<Result<ToolExecuteResponse, ToolError>>>,
     error: Option<ToolError>,
 }
@@ -189,6 +190,7 @@ impl ToolTaskHandle {
                         returned: false,
                         call_id,
                         alias,
+                        owner_task_id: None,
                         reply: Some(reply),
                         error: None,
                     }),
@@ -297,6 +299,31 @@ impl ToolTaskHandle {
         }
         let response = ToolExecuteResponse::aborted(state.call_id.clone(), state.alias.clone());
         deliver_reply(&mut state, Ok(response));
+        self.inner.cancel.cancel();
+        true
+    }
+
+    /// Set the trusted owner before registering this handle in the Agent collection.
+    pub fn set_owner_task_id(&self, owner_task_id: Option<String>) {
+        lock(&self.inner.shared).owner_task_id = owner_task_id;
+    }
+
+    pub fn owner_task_id(&self) -> Option<String> {
+        lock(&self.inner.shared).owner_task_id.clone()
+    }
+
+    pub(crate) fn abort_owner_unreturned(&self, owner: &str) -> bool {
+        let mut state = lock(&self.inner.shared);
+        if state.cleanup_complete || state.returned || state.owner_task_id.as_deref() != Some(owner)
+        {
+            return false;
+        }
+        let failure = ToolError::new(
+            ToolErrorKind::OwnerGone,
+            "tool owner is no longer available",
+        );
+        state.error = Some(failure.clone());
+        deliver_reply(&mut state, Err(failure));
         self.inner.cancel.cancel();
         true
     }

@@ -42,12 +42,21 @@ fn message_only_fields_and_effect_arity_are_explicit() {
     assert!(parse("CREATE BLOCK b (a, a)", vec![]).is_err());
     assert!(parse("EMIT EFFECT ready", vec![]).is_err());
     assert!(parse("EFFECT ready", vec![]).is_ok());
-    assert!(parse(
-        "EFFECT inference (msg.instructions, session.conversation) ?",
-        vec![json!(["bash"])]
-    )
-    .is_ok());
-    assert!(parse("EFFECT inference ?", vec![json!([])]).is_err());
+    for effect in ["inference", "tool_call"] {
+        assert!(parse(
+            &format!("EFFECT {effect} (msg.instructions, session.conversation)"),
+            vec![]
+        )
+        .is_ok());
+        assert!(parse(&format!("EFFECT {effect} ?"), vec![json!([])]).is_ok());
+        assert!(parse(
+            &format!("EFFECT {effect} ? ?"),
+            vec![json!([]), json!(["bash"])]
+        )
+        .is_err());
+        assert!(parse(&format!("EFFECT {effect}"), vec![]).is_err());
+        assert!(parse(&format!("EFFECT {effect} ?"), vec![]).is_err());
+    }
 }
 #[test]
 fn selectors_keep_range_commas_and_reject_mixed_sign() {

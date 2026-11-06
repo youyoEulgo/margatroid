@@ -18,13 +18,11 @@ local function settings()
 end
 
 local function inference()
-    local config = settings()
-    return command("EFFECT inference (msg.instructions, session.conversation) ?", {config.visible_tools}).Inference.message
+    return command("EFFECT inference (msg.instructions, session.conversation)").Inference.message
 end
 
 local function tool_call()
-    local config = settings()
-    return command("EFFECT tool_call (session.conversation[-1]) ?", {config.visible_tools}).Array.Message
+    return command("EFFECT tool_call (session.conversation[-1])").Array.Message
 end
 
 local function maybe_compact_context(message)
@@ -61,7 +59,7 @@ local function maybe_compact_context(message)
         end
     end
     command("INJECT ? TO msg.compact_context", {earlier})
-    local result = command("EFFECT inference (msg.instructions, msg.compact_context, msg.compact_prompt) ?", {{}})
+    local result = command("EFFECT inference (msg.instructions, msg.compact_context, msg.compact_prompt)")
     local summary = result.Inference
     command("EFFECT history_append ?", {{summary.message}})
     if summary.stop_reason == "completed" and summary.message.type == "assistant"

@@ -1,29 +1,27 @@
 # Tool Resource
 
-tool_resource_core定义工具路径集合、文件读取方法、导入事件和错误，只依赖mecs及通用库。tool_resource_plugin负责异步校验和路径登记，不依赖其他领域plugin，也不让core依赖address或其他领域core。
+tool_resource_core定义工具记录集合、文件读取方法、导入事件和错误，只依赖mecs及通用库。tool_resource_plugin负责异步校验和记录登记，不依赖其他领域plugin，也不让core依赖address或其他领域core。
 
 ## 导入与路径
 
-调用方plugin校验资源种类、Driver依赖和跨类别alias冲突，通过address定位tool.toml后发送ImportTool。本插件校验文件，成功只登记Tools中的alias与规范路径，不保存来源定位字符串或正文。
+调用方plugin校验资源种类、Driver依赖和跨类别alias冲突，通过address定位tool.toml后发送ImportTool。本插件校验文件，成功在Tools中登记alias对应的完整ToolEntry，保存规范路径、description及input_schema，owner_task_id与binding为None；不保存来源定位字符串或程序正文。
 
-MCL对同一目标的IMPORT串行受理，跨类别alias唯一性由MCL入口协调；各资源core只管理自己的集合，不新增通用绑定表或资源注册表。取消、目标失效或校验失败保留旧路径；发布成功后才通过原oneshot回复，不发送导入结果观察事件。
+MCL对同一目标的IMPORT串行受理，跨类别alias唯一性由MCL入口协调；各资源core只管理自己的集合，不新增通用绑定表或资源注册表。重复alias返回AliasConflict，不覆盖原记录；取消、目标失效或校验失败保留旧记录；发布成功后才通过原oneshot回复，不发送导入结果观察事件。
 
-## 按次读取
+## 导入定义与执行程序
 
-每次使用从登记路径读取tool.toml、input.schema.json和main.lua。校验清单版本、非空描述、JSON对象schema及Lua文件UTF-8；schema拒绝外部引用；不执行Lua。读取发生在blocking worker，使用方等待真实完成，不阻塞ECS线程。导入时校验不保证日后文件仍存在或合法；使用时重新校验，失败不退回旧副本。
+read_tool在导入校验时从入口路径读取tool.toml、input.schema.json和main.lua；推理直接使用已登记的定义。执行时按已登记path只读取main.lua。校验清单版本、非空描述、JSON对象schema及Lua文件UTF-8；schema拒绝外部引用；不执行Lua。读取发生在blocking worker，使用方等待真实完成，不阻塞ECS线程。导入时校验不保证日后程序仍存在或合法；执行时重新读取程序，失败明确报错。文件metadata变化不会隐式改写已登记描述或schema。
 
-工具描述和schema在准备推理请求时读取；程序在实际执行调用时重新读取。本次推理定义与之后磁盘内容不保证相同版本。工具执行方重新校验实际参数，不把早先模型看到的schema当作当前执行依据。
+工具描述和schema在导入时读取并登记，供推理直接遍历Tools记录；程序在实际执行调用时重新读取。文件后续变化不改变Tools中的描述及schema。工具执行方用当前Tools记录的schema校验实际参数。
 
 ## 职责
 
-本领域只登记路径、解析工具文件；进程、Lua运行、沙箱和工具调用结果归tool执行领域。集合只保存BTreeMap<String, PathBuf>，不使用ResourceID、LibraryComponent或通用ResourceSet；加载后的临时值不再携带资源身份。路径用于打开文件，不代替沙箱与文件访问检查。
+本领域登记工具记录、解析工具文件；进程、Lua运行、沙箱和工具调用结果归tool执行领域。集合保存BTreeMap<String, ToolEntry>，不使用ResourceID、LibraryComponent或通用ResourceSet；加载后的临时值不再携带资源身份。路径用于打开文件，不代替沙箱与文件访问检查。
 
-异步校验直接返回Result<ImportOutput, ImportError>，System只路由，Handler负责发布及oneshot回复。所有结果保留原owner Entity，迟到结果不写入复用index的新实体。文件读取失败报告alias、实际路径和底层原因，不回显文件正文。
+异步校验返回Result<ImportOutput, ImportError>，既有异步闭包通过ImportTaskError承载校验与运行设施错误；System只路由，Handler负责发布及oneshot回复。所有结果保留原owner Entity，迟到结果不写入复用index的新实体。文件读取失败报告alias、实际路径和底层原因，不回显文件正文。
 
-## 已确认的后续设计
+## 统一工具记录
 
-Tools完整工具记录及动态注入仍是待实现目标，当前源码保存alias到路径的映射，并在使用时读取定义。下面描述目标，不表示当前实现或部署已切换。
+IMPORT校验资源后只向Agent.Tools增加一条记录，保存description、input_schema及path；每次推理直接遍历这些记录构造schema，工具调用按名称查询并使用记录中的schema，程序按path读取。普通导入和动态注入使用同一结构，没有第二份工具集合或选择清单。
 
-目标中，IMPORT校验资源后只向Agent.Tools增加一条记录，保存description、input_schema及path；每次推理直接遍历这些记录构造schema，工具调用按名称查询并使用记录中的schema，程序按path读取。普通导入和动态注入使用同一结构，没有第二份工具集合或选择清单。
-
-动态注入由tool_plugin通过现有宿主帧和World闭包调用Tools.insert_batch；入口路径与owner_task_id由宿主固定，binding作为工具自己的不透明数据传入执行context。整批alias冲突则失败；任务A清理时移除属于它的入口。ToolResource不增加注入System或事件，进程通信和任务清理仍属Tool领域。
+动态注入由tool_plugin通过现有宿主帧和World闭包调用Tools.insert_batch；入口路径与owner_task_id由宿主固定，binding作为工具自己的不透明数据传入执行context。Tools.insert与insert_batch校验alias、绝对路径、非空描述和schema；整批出现无效定义或alias冲突则原子失败；任务A清理时移除属于它的入口。ToolResource不增加注入System或事件，进程通信和任务清理仍属Tool领域。

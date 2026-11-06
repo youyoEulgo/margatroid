@@ -1,0 +1,3 @@
+schema_version = 1
+name = "mcp-register"
+description = "Connect an MCP server over stdio or HTTP and register its discovered tools for this agent. Returns the owner task_id and tool aliases; keep the owner task running while calling those tools. Requires the separately built bin/mcp-client in this resource. Optional alias_prefix defaults to mcp_; invalid bytes in remote names become underscores and alias collisions fail atomically."

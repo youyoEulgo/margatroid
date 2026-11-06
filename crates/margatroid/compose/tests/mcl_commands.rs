@@ -1,3 +1,5 @@
+mod common;
+
 use agent_core::{Agent, AgentState, WorldAgentExt};
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
@@ -273,7 +275,8 @@ impl Fixture {
                 world
                     .get_component_mut::<Tools>(request.owner)
                     .unwrap()
-                    .insert(request.alias, request.path);
+                    .insert(request.alias, common::tool(request.path))
+                    .unwrap();
                 if let Some(sender) = request.reply.lock().unwrap().take() {
                     let _ = sender.send(Ok(()));
                 }
@@ -393,11 +396,21 @@ impl Fixture {
                 .world_mut()
                 .insert_component(self.owner, Tools::new());
         }
+        let directory = self.root.path().join("fixture-tool").join(alias);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("tool.toml"),
+            "schema_version=1\ndescription='fixture tool'\n",
+        )
+        .unwrap();
+        fs::write(directory.join("input.schema.json"), "{\"type\":\"object\"}").unwrap();
+        fs::write(directory.join("main.lua"), "function execute() end").unwrap();
         self.app
             .world_mut()
             .get_component_mut::<Tools>(self.owner)
             .unwrap()
-            .insert(alias.into(), self.root.path().join("unused-tool.toml"));
+            .insert(alias.into(), common::tool(directory.join("tool.toml")))
+            .unwrap();
     }
 
     fn history(&self) -> Vec<storage_core::HistoryRecord> {
@@ -669,7 +682,11 @@ async fn imports_validate_dependencies_kind_and_cross_category_aliases_and_rerea
     fs::write(prompt.join("content.md"), "original prompt").unwrap();
     let tool = fixture.root.path().join("tools/local/bash/latest");
     fs::create_dir_all(&tool).unwrap();
-    fs::write(tool.join("tool.toml"), "schema_version = 1\n").unwrap();
+    fs::write(
+        tool.join("tool.toml"),
+        "schema_version = 1\ndescription = 'test tool'\n",
+    )
+    .unwrap();
     fs::write(tool.join("input.schema.json"), "{}").unwrap();
     fs::write(tool.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() task_return('test') end").unwrap();
     let sandbox = fixture.root.path().join("sandboxes/local/policy/latest");
@@ -787,7 +804,7 @@ async fn inference_converts_legacy_message_shapes_and_excludes_cancelled_assista
     fixture.command("EFFECT start_turn", vec![]).await.unwrap();
     let input = json!([user("question"), {"type": "assistant", "content": null, "tool_calls": [{"id": "call", "tool_name": "bash", "arguments": "{\"x\":1}"}]}, {"type": "tool_call", "tool_call_id": "call", "tool_name": "bash", "content": "done", "failed": false}, {"type": "assistant", "content": "cancelled fragment", "stop_reason": "cancelled"}]);
     let result = fixture
-        .command("EFFECT inference ? ?", vec![input, json!(["bash"])])
+        .command("EFFECT inference ?", vec![input])
         .await
         .unwrap();
     let MclValue::Inference {
@@ -825,10 +842,7 @@ async fn inference_converts_legacy_message_shapes_and_excludes_cancelled_assista
 async fn no_turn_returns_normal_cancelled_results_without_submitting_domains() {
     let mut fixture = Fixture::new();
     let result = fixture
-        .command(
-            "EFFECT inference ? ?",
-            vec![json!([user("question")]), json!([])],
-        )
+        .command("EFFECT inference ?", vec![json!([user("question")])])
         .await
         .unwrap();
     assert!(
@@ -837,7 +851,7 @@ async fn no_turn_returns_normal_cancelled_results_without_submitting_domains() {
     let calls = json!([{"type": "assistant", "content": null, "tool_calls": [{"id": "call", "tool_name": "bash", "arguments": "{}"}]}]);
     let result = messages(
         fixture
-            .command("EFFECT tool_call ? ?", vec![calls, json!(["bash"])])
+            .command("EFFECT tool_call ?", vec![calls])
             .await
             .unwrap(),
     );
@@ -863,7 +877,7 @@ async fn tool_results_preserve_order_and_return_without_waiting_for_tool_vm_end(
     let calls = json!([{"type": "assistant", "content": null, "tool_calls": [{"id": "first", "tool_name": "bash", "arguments": "{\"n\":1}"}, {"id": "hidden", "tool_name": "private", "arguments": "{}"}, {"id": "last", "tool_name": "bash", "arguments": "{\"n\":2}"}]}]);
     let results = messages(
         fixture
-            .command("EFFECT tool_call ? ?", vec![calls, json!(["bash"])])
+            .command("EFFECT tool_call ?", vec![calls])
             .await
             .unwrap(),
     );
@@ -874,7 +888,7 @@ async fn tool_results_preserve_order_and_return_without_waiting_for_tool_vm_end(
             .collect::<Vec<_>>(),
         ["first", "hidden", "last"]
     );
-    assert_eq!(results[1]["content"], "tool not visible");
+    assert_eq!(results[1]["content"], "tool alias is not imported");
     assert_eq!(results[1]["failed"], true);
     assert!(
         fixture
@@ -921,14 +935,11 @@ async fn batch_collects_forced_abort_and_returned_background_replies_without_los
         .unwrap()
         .insert("pending".into(), 5);
     let mut receiver = fixture.enqueue(
-        "EFFECT tool_call ? ?",
-        vec![
-            json!([{"type":"assistant","tool_calls":[
-                {"id":"pending","tool_name":"bash","arguments":"{}"},
-                {"id":"background","tool_name":"bash","arguments":"{\"background\":true}"}
-            ]}]),
-            json!(["bash"]),
-        ],
+        "EFFECT tool_call ?",
+        vec![json!([{"type":"assistant","tool_calls":[
+            {"id":"pending","tool_name":"bash","arguments":"{}"},
+            {"id":"background","tool_name":"bash","arguments":"{\"background\":true}"}
+        ]}])],
     );
     let recorded = fixture.tools.clone();
     tick_until(&mut fixture.app, || recorded.lock().unwrap().len() == 2).await;
@@ -995,10 +1006,7 @@ async fn fifo_waits_for_domain_reply_while_other_agents_keep_progressing() {
     let mut fixture = Fixture::new();
     fixture.command("EFFECT start_turn", vec![]).await.unwrap();
     fixture.auto_inference.store(false, Ordering::Release);
-    let mut first = fixture.enqueue(
-        "EFFECT inference ? ?",
-        vec![json!([user("question")]), json!([])],
-    );
+    let mut first = fixture.enqueue("EFFECT inference ?", vec![json!([user("question")])]);
     let mut queued = fixture.enqueue("CONFIG SET ? ?", vec![json!("ordered"), json!(true)]);
     let recorded = fixture.inference.clone();
     tick_until(&mut fixture.app, || !recorded.lock().unwrap().is_empty()).await;
@@ -1059,10 +1067,7 @@ async fn closing_queue_cancels_domain_and_waits_for_reply_before_drain() {
     let mut fixture = Fixture::new();
     fixture.command("EFFECT start_turn", vec![]).await.unwrap();
     fixture.auto_inference.store(false, Ordering::Release);
-    let mut first = fixture.enqueue(
-        "EFFECT inference ? ?",
-        vec![json!([user("question")]), json!([])],
-    );
+    let mut first = fixture.enqueue("EFFECT inference ?", vec![json!([user("question")])]);
     let mut queued = fixture.enqueue("CONFIG SET ? ?", vec![json!("must_not_exist"), json!(true)]);
     let recorded = fixture.inference.clone();
     tick_until(&mut fixture.app, || !recorded.lock().unwrap().is_empty()).await;
@@ -1341,8 +1346,8 @@ async fn reusing_a_completed_request_id_creates_distinct_background_task_address
             fixture.client,
             None,
             fixture.owner,
-            "EFFECT tool_call ? ?",
-            vec![calls, json!(["bash"])],
+            "EFFECT tool_call ?",
+            vec![calls],
         );
         drive(&mut fixture.app, &mut receiver).await.unwrap();
     }
@@ -1367,10 +1372,7 @@ async fn inference_error_and_finish_turn_return_values_before_cleanup_completes(
         let mut fixture = Fixture::new();
         fixture.auto_inference.store(false, Ordering::Release);
         fixture.command("EFFECT start_turn", vec![]).await.unwrap();
-        let mut reply = fixture.enqueue(
-            "EFFECT inference ? ?",
-            vec![json!([user("hello")]), json!([])],
-        );
+        let mut reply = fixture.enqueue("EFFECT inference ?", vec![json!([user("hello")])]);
         let requests = fixture.inference.clone();
         tick_until(&mut fixture.app, || !requests.lock().unwrap().is_empty()).await;
         let request = requests.lock().unwrap()[0].clone();
@@ -1472,10 +1474,7 @@ async fn inference_error_does_not_finish_a_replacement_turn() {
     let mut fixture = Fixture::new();
     fixture.auto_inference.store(false, Ordering::Release);
     fixture.command("EFFECT start_turn", vec![]).await.unwrap();
-    let mut reply = fixture.enqueue(
-        "EFFECT inference ? ?",
-        vec![json!([user("hello")]), json!([])],
-    );
+    let mut reply = fixture.enqueue("EFFECT inference ?", vec![json!([user("hello")])]);
     let requests = fixture.inference.clone();
     tick_until(&mut fixture.app, || !requests.lock().unwrap().is_empty()).await;
     let request = requests.lock().unwrap()[0].clone();
@@ -1563,7 +1562,11 @@ async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_
                     fs::write(directory.join("content.md"), "test instructions").unwrap();
                 }
                 "tool" => {
-                    fs::write(directory.join("tool.toml"), "schema_version=1\n").unwrap();
+                    fs::write(
+                        directory.join("tool.toml"),
+                        "schema_version=1\ndescription='test tool'\n",
+                    )
+                    .unwrap();
                     fs::write(directory.join("input.schema.json"), "{}").unwrap();
                     fs::write(directory.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() task_return('test') end").unwrap();
                 }
@@ -1577,7 +1580,7 @@ async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_
             .get_component_mut::<MclQueue>(fixture.owner)
             .unwrap()
             .allowed_imports = allowed;
-        for key in ["visible_tools", "sandbox"] {
+        for key in ["sandbox"] {
             fixture
                 .command("CONFIG SET ? ?", vec![json!(key), json!([])])
                 .await
@@ -1876,7 +1879,7 @@ async fn all_tool_errors_return_failed_results_and_leave_turn_completion_to_driv
         ));
         let calls = json!([{"type":"assistant","tool_calls":[{"id":"sleep-call","tool_name":"bash_exec","arguments":"{\"cmd\":\"sleep 11\"}"}]}]);
         let MclValue::Array(MessageArray::Message(results)) = fixture
-            .command("EFFECT tool_call ? ?", vec![calls, json!(["bash_exec"])])
+            .command("EFFECT tool_call ?", vec![calls])
             .await
             .unwrap()
         else {
@@ -1947,7 +1950,7 @@ async fn tool_cleanup_failures_return_failed_messages_and_preserve_the_turn() {
         let calls = json!([{"type":"assistant","tool_calls":[{"id":"call","tool_name":"bash_exec","arguments":"{}"}]}]);
         let results = messages(
             fixture
-                .command("EFFECT tool_call ? ?", vec![calls, json!(["bash_exec"])])
+                .command("EFFECT tool_call ?", vec![calls])
                 .await
                 .unwrap(),
         );
@@ -2011,11 +2014,8 @@ async fn mixed_tool_batch_keeps_all_calls_after_backend_and_association_failures
     let results = messages(
         fixture
             .command(
-                "EFFECT tool_call ? ?",
-                vec![
-                    json!([{"type":"assistant","tool_calls":calls}]),
-                    json!(["bash"]),
-                ],
+                "EFFECT tool_call ?",
+                vec![json!([{"type":"assistant","tool_calls":calls}])],
             )
             .await
             .unwrap(),
@@ -2081,22 +2081,21 @@ async fn parse_and_effect_preconditions_return_errors_without_fabricated_tool_id
     for (text, arguments, kind) in [
         ("NOT AN INSTRUCTION", vec![], MclErrorKind::ParseFailed),
         (
-            "EFFECT tool_call ? ?",
+            "EFFECT tool_call ?",
             vec![
                 json!([{"type":"assistant","tool_calls":[{"tool_name":"bash","arguments":"{}"}]}]),
-                json!(["bash"]),
             ],
             MclErrorKind::InvalidMessage,
         ),
         (
-            "EFFECT tool_call (missing) ?",
-            vec![json!(["bash"])],
+            "EFFECT tool_call (missing)",
+            vec![],
             MclErrorKind::AliasMissing,
         ),
         (
-            "EFFECT tool_call ? ?",
-            vec![json!([{"type":"assistant"}]), json!(["bash", "bash"])],
-            MclErrorKind::AliasConflict,
+            "EFFECT tool_call ?",
+            vec![json!("not a message array")],
+            MclErrorKind::InvalidMessage,
         ),
     ] {
         assert_eq!(fixture.command(text, arguments).await.error_kind(), kind);
@@ -2176,7 +2175,7 @@ async fn malformed_identifiable_tool_arguments_fail_locally_and_other_calls_run(
     ]}]);
     let results = messages(
         fixture
-            .command("EFFECT tool_call ? ?", vec![input, json!(["bash"])])
+            .command("EFFECT tool_call ?", vec![input])
             .await
             .unwrap(),
     );
@@ -2202,7 +2201,7 @@ async fn malformed_identifiable_tool_arguments_fail_locally_and_other_calls_run(
     ]}]);
     assert_eq!(
         fixture
-            .command("EFFECT tool_call ? ?", vec![invalid_batch, json!(["bash"])])
+            .command("EFFECT tool_call ?", vec![invalid_batch])
             .await
             .error_kind(),
         MclErrorKind::InvalidMessage
