@@ -22,10 +22,11 @@ pub(crate) struct ToolExecutionContext {
     pub project_root: PathBuf,
     pub runner_path: PathBuf,
     pub limits: ToolExecutionLimits,
+    pub memory_pool: Arc<crate::handler::memory::MemoryPool>,
     pub configuration: Option<ToolConfiguration>,
     pub handle: ToolTaskHandle,
     pub tasks: ToolTasks,
-    pub input: mpsc::Receiver<Value>,
+    pub input: mpsc::UnboundedReceiver<Value>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -126,14 +127,9 @@ pub(crate) type PendingResponse = oneshot::Sender<Result<Value, ToolError>>;
 pub(crate) struct WorkerBridge {
     pub output: tokio::sync::Mutex<tokio::io::Stdout>,
     pub pending: Mutex<BTreeMap<String, PendingResponse>>,
-    pub input: tokio::sync::Mutex<mpsc::Receiver<Value>>,
+    pub input: tokio::sync::Mutex<mpsc::UnboundedReceiver<Value>>,
     pub sequence: AtomicU64,
-    pub frame_limit: usize,
     pub finish: CancellationToken,
-}
-
-pub(crate) struct CgroupBoundary {
-    pub path: PathBuf,
 }
 
 pub(crate) struct NoExternalSchema;

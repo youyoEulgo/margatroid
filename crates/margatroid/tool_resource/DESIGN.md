@@ -18,7 +18,7 @@ method(args) -> xxx
 # system     tool_resource/plugin/src/system.rs                           导入请求与闭包结果路由
 # handler    tool_resource/plugin/src/handler.rs                          导入校验及记录登记
 # types      tool_resource/plugin/src/types.rs                            导入上下文与异步载荷
-# types pub  tool_resource/core/src/types.rs                              临时读取材料及预算
+# types pub  tool_resource/core/src/types.rs                              临时读取材料
 # error      tool_resource/core/src/error.rs                              ToolResourceError
 ```
 
@@ -42,7 +42,6 @@ WorldToolResourceExt：工具入口扩展，公开trait
 ```text
 ToolResourcePlugin：工具路径登记插件
     schedule: String
-    limits: ToolReadLimits
     impl Plugin for ToolResourcePlugin
         build(self, app: &mut App)
             行为：
@@ -54,9 +53,9 @@ ToolResourcePlugin：工具路径登记插件
 
 公开，定义于tool_resource_core：
 ```text
-read_tool(path: &Path, limits: &ToolReadLimits) -> Result<ToolInput, ToolResourceError>
+read_tool(path: &Path) -> Result<ToolInput, ToolResourceError>
     行为：
-        有界读取tool.toml、input.schema.json、main.lua
+        完整读取tool.toml、input.schema.json、main.lua，不额外限制文件字节数
         validate 清单版本、非空描述、JSON对象schema、无外部引用、Lua UTF-8
         return ToolInput
         仅读取，不执行程序
@@ -85,6 +84,7 @@ Tools：Agent唯一工具集合，公开组件
     remove_owner(&mut self, owner_task_id: &str)
         行为：
             entries.retain(entry.owner_task_id != owner_task_id)
+            只删除工具记录；不查询调用任务状态，不等待或取消已受理任务
     iter(&self) -> impl Iterator<Item = (&String, &ToolEntry)>
         行为：
             return entries.iter()
@@ -158,7 +158,7 @@ validate_import(context: ImportContext) -> Future<Output = Result<ImportOutput, 
 
 私有：
 ```text
-ImportContext：导入上下文--owner、alias、path、cancel、读取预算和原reply
+ImportContext：导入上下文--owner、alias、path、cancel和原reply
 ImportOutput：校验成功载荷--ImportContext、规范入口路径、description及input_schema；不保存程序正文
 ImportError：校验失败载荷--ImportContext及ToolResourceError
 ```
@@ -173,27 +173,23 @@ ToolEntry：工具记录
     path: PathBuf--工具执行资源入口；MCP注入的记录都指向mcp_register
     description: String
     input_schema: serde_json::Value
-    owner_task_id: Option<String>--动态入口标记注册任务A；普通入口None
+    owner_task_id: Option<String>--None为静态工具；Some(id)随指定任务存活，任务结束删除记录
     binding: Option<serde_json::Value>--工具自己的不透明路由数据，例如远端工具名
 
 InjectedToolDefinition：注入项
     alias: String
     description: String
     input_schema: serde_json::Value
+    owner_task_id: Option<String>--注入时显式选择；省略为None，不默认绑定注入者
     binding: Option<serde_json::Value>
     行为：
-        宿主填path和owner_task_id
+        宿主填path为当前工具资源，owner_task_id按注入参数登记
 
 ToolInput：本次工具材料
     description: String
     input_schema: serde_json::Value
     program: String
     origin: PathBuf
-
-ToolReadLimits：读取预算
-    manifest_bytes: usize
-    schema_bytes: usize
-    program_bytes: usize
 ```
 
 # error
@@ -210,7 +206,7 @@ ToolResourceError：工具资源错误
 
 ToolResourceErrorKind：错误类别，公开枚举
     OwnerMissing | InvalidAlias | AliasMissing | AliasConflict | InvalidPath | FileMissing
-    TooLarge | InvalidUtf8 | InvalidDefinition | ReadFailed | Cancelled | WorkerFailed
+    InvalidUtf8 | InvalidDefinition | ReadFailed | Cancelled | WorkerFailed
 ```
 
 # 持有关系

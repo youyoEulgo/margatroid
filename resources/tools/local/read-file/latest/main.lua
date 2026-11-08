@@ -95,6 +95,6 @@ end
 
 function execute(arguments, context)
     local result = perform(arguments, context)
-    task_return(result)
-    task_finish(context.task_id)
+    margatroid:task_return(result)
+    margatroid:task_finish(context.task_id)
 end

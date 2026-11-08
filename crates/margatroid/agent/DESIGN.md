@@ -245,7 +245,8 @@ stop_flow(context: FlowContext) -> Future<Output = Result<StopOutput, StopError>
     行为：
         请求Driver停止和执行取消；
         沿现有流程停止任务；
-        任务监督移除所属Tools记录并向等待它的任务返回工具错误，再等待任务、子进程及MCL真实收口。返回清理结果，不销毁协调Entity。
+        任务监督移除所属Tools记录；其他任务按Agent关闭的既有停止流程清理，不按工具owner关系级联。
+        等待任务、子进程及MCL真实收口。返回清理结果，不销毁协调Entity。
 
 restart_flow(context: FlowContext) -> Future<Output = Result<RestartOutput, RestartError>>
     行为：

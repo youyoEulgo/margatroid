@@ -16,6 +16,6 @@ function execute(arguments, context)
     end
     if result.truncated then content = content .. "\n[output truncated at the size limit]" end
     content = content .. "\n[exit code: " .. tostring(result.exit_code) .. "]"
-    task_return({ ok = result.exit_code == 0, content = content })
-    task_finish(context.task_id)
+    margatroid:task_return({ ok = result.exit_code == 0, content = content })
+    margatroid:task_finish(context.task_id)
 end

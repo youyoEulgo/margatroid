@@ -46,51 +46,26 @@ pub struct TaskReadResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ToolExecutionLimits {
-    pub script_bytes: usize,
-    pub argument_bytes: usize,
-    pub output_bytes: usize,
-    pub result_bytes: usize,
-    pub diagnostic_bytes: usize,
+    pub total_memory_bytes: usize,
     pub memory_bytes: usize,
-    pub instruction_budget: u64,
     pub cache_bytes: usize,
-    pub input_capacity: usize,
 }
 
 impl Default for ToolExecutionLimits {
     fn default() -> Self {
         Self {
-            script_bytes: 1024 * 1024,
-            argument_bytes: 128 * 1024 * 1024,
-            output_bytes: 256 * 1024 * 1024,
-            result_bytes: 32 * 1024 * 1024,
-            diagnostic_bytes: 16 * 1024 * 1024,
+            total_memory_bytes: 8 * 1024 * 1024 * 1024,
             memory_bytes: 2 * 1024 * 1024 * 1024,
-            instruction_budget: 640_000_000,
             cache_bytes: 128 * 1024 * 1024,
-            input_capacity: 1024,
         }
     }
 }
 
 impl ToolExecutionLimits {
     pub fn validate(&self) -> Result<(), ToolError> {
-        if [
-            self.script_bytes,
-            self.argument_bytes,
-            self.output_bytes,
-            self.result_bytes,
-            self.diagnostic_bytes,
-            self.memory_bytes,
-            self.cache_bytes,
-            self.input_capacity,
-        ]
-        .contains(&0)
-            || self.input_capacity > tokio::sync::Semaphore::MAX_PERMITS
-            || self.instruction_budget == 0
-        {
+        if self.total_memory_bytes == 0 || self.memory_bytes == 0 || self.cache_bytes == 0 {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidRequest,
                 "invalid tool execution limits",
@@ -138,7 +113,6 @@ struct ToolTaskData {
     returned: bool,
     call_id: String,
     alias: String,
-    owner_task_id: Option<String>,
     reply: Option<oneshot::Sender<Result<ToolExecuteResponse, ToolError>>>,
     error: Option<ToolError>,
 }
@@ -150,10 +124,9 @@ struct ToolTaskShared {
     task_attached: AtomicBool,
     supervisor_ended: AtomicBool,
     shared: Mutex<ToolTaskData>,
-    input: mpsc::Sender<Value>,
+    input: mpsc::UnboundedSender<Value>,
     changed: Notify,
     cache_bytes: usize,
-    input_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -167,12 +140,12 @@ impl ToolTaskHandle {
         call_id: String,
         alias: String,
         reply: oneshot::Sender<Result<ToolExecuteResponse, ToolError>>,
-    ) -> Result<(Self, mpsc::Receiver<Value>), ToolError> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), ToolError> {
         if let Err(error) = limits.validate() {
             let _ = reply.send(Err(error.clone()));
             return Err(error);
         }
-        let (input, receiver) = mpsc::channel(limits.input_capacity);
+        let (input, receiver) = mpsc::unbounded_channel();
         Ok((
             Self {
                 inner: Arc::new(ToolTaskShared {
@@ -190,14 +163,12 @@ impl ToolTaskHandle {
                         returned: false,
                         call_id,
                         alias,
-                        owner_task_id: None,
                         reply: Some(reply),
                         error: None,
                     }),
                     input,
                     changed: Notify::new(),
                     cache_bytes: limits.cache_bytes,
-                    input_bytes: limits.argument_bytes,
                 }),
             },
             receiver,
@@ -303,31 +274,6 @@ impl ToolTaskHandle {
         true
     }
 
-    /// Set the trusted owner before registering this handle in the Agent collection.
-    pub fn set_owner_task_id(&self, owner_task_id: Option<String>) {
-        lock(&self.inner.shared).owner_task_id = owner_task_id;
-    }
-
-    pub fn owner_task_id(&self) -> Option<String> {
-        lock(&self.inner.shared).owner_task_id.clone()
-    }
-
-    pub(crate) fn abort_owner_unreturned(&self, owner: &str) -> bool {
-        let mut state = lock(&self.inner.shared);
-        if state.cleanup_complete || state.returned || state.owner_task_id.as_deref() != Some(owner)
-        {
-            return false;
-        }
-        let failure = ToolError::new(
-            ToolErrorKind::OwnerGone,
-            "tool owner is no longer available",
-        );
-        state.error = Some(failure.clone());
-        deliver_reply(&mut state, Err(failure));
-        self.inner.cancel.cancel();
-        true
-    }
-
     pub fn has_returned(&self) -> bool {
         lock(&self.inner.shared).returned
     }
@@ -337,29 +283,20 @@ impl ToolTaskHandle {
     }
 
     pub fn write(&self, value: Value) -> Result<(), ToolError> {
-        let bytes = encoded_len(&value, self.inner.cache_bytes)?;
         let mut state = lock(&self.inner.shared);
         ensure_open(&state)?;
-        let total = state
-            .bytes
-            .checked_add(bytes)
-            .filter(|&total| total <= self.inner.cache_bytes)
-            .ok_or_else(|| {
-                ToolError::new(ToolErrorKind::OutputTooLarge, "tool cache exceeds limit")
-            })?;
-        state.output.push(value);
-        state.bytes = total;
+        append_cache(&mut state, value, self.inner.cache_bytes);
         Ok(())
     }
 
     pub fn replace(&self, value: Value) -> Result<(), ToolError> {
-        let bytes = encoded_len(&value, self.inner.cache_bytes)?;
         let mut state = lock(&self.inner.shared);
         ensure_open(&state)?;
-        state.output = vec![value];
-        state.bytes = bytes;
+        state.output.clear();
+        state.bytes = 0;
         state.cursor = 0;
         state.replaced = true;
+        append_cache(&mut state, value, self.inner.cache_bytes);
         Ok(())
     }
 
@@ -386,18 +323,10 @@ impl ToolTaskHandle {
     pub fn send(&self, value: Value) -> Result<(), ToolError> {
         let state = lock(&self.inner.shared);
         ensure_open(&state)?;
-        encoded_len(&value, self.inner.input_bytes)?;
         self.inner
             .input
-            .try_send(value)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => {
-                    ToolError::new(ToolErrorKind::InputFull, "tool input queue is full")
-                }
-                mpsc::error::TrySendError::Closed(_) => {
-                    ToolError::new(ToolErrorKind::InputClosed, "tool input is closed")
-                }
-            })
+            .send(value)
+            .map_err(|_| ToolError::new(ToolErrorKind::InputClosed, "tool input is closed"))
     }
 
     pub fn set_error(&self, error: ToolError) {
@@ -497,6 +426,50 @@ impl ToolTaskHandle {
             )
         })
     }
+}
+
+/// Keep a serialized byte window without changing explicit replacement semantics.
+fn append_cache(state: &mut ToolTaskData, mut value: Value, limit: usize) {
+    let bytes = match encoded_len(&value, limit) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let Value::String(text) = &value else {
+                return;
+            };
+            if limit < 2 {
+                return;
+            }
+            // JSON strings include two quotes and escape control characters.
+            let mut start = text.len();
+            let mut used = 2;
+            for (index, character) in text.char_indices().rev() {
+                let cost = match character {
+                    '"' | '\\' | '\x08' | '\t' | '\n' | '\x0c' | '\r' => 2,
+                    '\x00'..='\x1f' => 6,
+                    character => character.len_utf8(),
+                };
+                if cost > limit - used {
+                    break;
+                }
+                used += cost;
+                start = index;
+            }
+            value = Value::String(text[start..].to_owned());
+            encoded_len(&value, limit).expect("fitting cache suffix")
+        }
+    };
+    let mut removed = 0;
+    while state.bytes > limit - bytes {
+        state.bytes -=
+            encoded_len(&state.output[removed], limit).expect("cached value fits window");
+        removed += 1;
+    }
+    if removed != 0 {
+        state.output.drain(..removed);
+        state.cursor = state.cursor.saturating_sub(removed);
+    }
+    state.bytes += bytes;
+    state.output.push(value);
 }
 
 /// All replies for a registered task pass through this shared-lock operation.

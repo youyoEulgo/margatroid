@@ -18,6 +18,7 @@ workspace_plugin = { path = "../workspace/plugin" }
 agent_plugin = { path = "../agent/plugin" }
 inference_plugin = { path = "../inference/plugin" }
 tool_plugin = { path = "../tool/plugin" }
+tool_core = { path = "../tool/core" }
 tool_resource_plugin = { path = "../tool_resource/plugin" }
 prompt_resource_plugin = { path = "../prompt_resource/plugin" }
 sandbox_resource_plugin = { path = "../sandbox_resource/plugin" }

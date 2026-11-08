@@ -1,9 +1,34 @@
 use super::*;
 use std::time::Duration;
 
-fn setup(limits: ToolExecutionLimits) -> (Lua, ProcessRegistry) {
+fn setup() -> (Lua, ProcessRegistry) {
+    setup_at(std::env::current_dir().unwrap())
+}
+
+fn setup_at(root: std::path::PathBuf) -> (Lua, ProcessRegistry) {
     let lua = Lua::new();
-    let registry = install_process(&lua, std::env::current_dir().unwrap(), limits).unwrap();
+    let (registry, process_open) = install_process(&lua, root.clone()).unwrap();
+    let context = crate::types::ToolContext {
+        task_id: "process-test".into(),
+        call_id: "process-call".into(),
+        alias: "process".into(),
+        owner_task_id: None,
+        binding: None,
+        resource_dir: root.clone(),
+        project_root: root.clone(),
+        temp_dir: root,
+    };
+    let object =
+        super::super::host::Margatroid::install(&lua, context, serde_json::json!({})).unwrap();
+    let callbacks = lua.create_table().unwrap();
+    callbacks.set("process_open", process_open).unwrap();
+    callbacks
+        .set(
+            "await_any",
+            crate::handler::install_await_any(&lua).unwrap(),
+        )
+        .unwrap();
+    super::super::host::Margatroid::enable(&object, callbacks).unwrap();
     (lua, registry)
 }
 
@@ -11,19 +36,21 @@ async fn python(lua: &Lua, code: &str) -> ProcessSession {
     let options = lua.create_table().unwrap();
     options.set("program", "/usr/bin/python3").unwrap();
     options.set("arguments", vec!["-u", "-c", code]).unwrap();
-    let constructor: mlua::Function = lua.globals().get("process_open").unwrap();
+    let constructor: mlua::Function = lua
+        .load("return function(options) return margatroid:process_open(options) end")
+        .eval()
+        .unwrap();
     let userdata: mlua::AnyUserData = constructor.call_async(options).await.unwrap();
     userdata.borrow::<ProcessSession>().unwrap().clone()
 }
 
 async fn drain<R: AsyncRead + Unpin>(
     pipe: &AsyncMutex<Option<R>>,
-    budget: &Budget,
     close: &CancellationToken,
 ) -> Vec<u8> {
     let mut output = Vec::new();
     loop {
-        let (bytes, eof) = read_pipe(pipe, budget, close).await.unwrap();
+        let (bytes, eof) = read_pipe(pipe, close).await.unwrap();
         output.extend(bytes);
         if eof {
             return output;
@@ -33,10 +60,10 @@ async fn drain<R: AsyncRead + Unpin>(
 
 #[tokio::test]
 async fn real_echo_output_survives_wait_before_read() {
-    let (lua, registry) = setup(ToolExecutionLimits::default());
+    let (lua, registry) = setup();
     lua.load(
         r#"
-        local p=process_open({program='/bin/echo', arguments={'hello process'}})
+        local p=margatroid:process_open({program='/bin/echo', arguments={'hello process'}})
         assert(p:wait().exit_code==0)
         local out=''
         while true do local r=p:read(); out=out..r.data; if r.eof then break end end
@@ -53,22 +80,14 @@ async fn real_echo_output_survives_wait_before_read() {
 
 #[tokio::test]
 async fn binary_echo_and_stderr_are_independent_and_wait_is_concurrent() {
-    let (lua, registry) = setup(ToolExecutionLimits::default());
+    let (lua, registry) = setup();
     let session = python(&lua, "import sys\nn=65536\ndata=sys.stdin.buffer.read(n)\nsys.stdout.buffer.write(data)\nsys.stdout.buffer.flush()\nsys.stderr.buffer.write(bytes(range(256))*256)\nsys.stderr.buffer.flush()\nsys.exit(7)").await;
     let bytes: Vec<u8> = (0..65536).map(|n| n as u8).collect();
     let (written, stdout, stderr, status) = tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(
             session.write(&bytes),
-            drain(
-                &session.inner.stdout,
-                &session.inner.stdout_budget,
-                &session.inner.close
-            ),
-            drain(
-                &session.inner.stderr,
-                &session.inner.stderr_budget,
-                &session.inner.close
-            ),
+            drain(&session.inner.stdout, &session.inner.close),
+            drain(&session.inner.stderr, &session.inner.close),
             session.wait(),
         )
     })
@@ -84,9 +103,9 @@ async fn binary_echo_and_stderr_are_independent_and_wait_is_concurrent() {
 
 #[tokio::test]
 async fn lua_userdata_preserves_invalid_utf8_nuls_eof_and_status() {
-    let (lua, registry) = setup(ToolExecutionLimits::default());
+    let (lua, registry) = setup();
     tokio::time::timeout(Duration::from_secs(5), lua.load(r#"
-        local p = process_open({program='/usr/bin/python3', arguments={'-u','-c',
+        local p = margatroid:process_open({program='/usr/bin/python3', arguments={'-u','-c',
             'import sys; b=sys.stdin.buffer.read(4); sys.stdout.buffer.write(b); sys.stderr.buffer.write(b)'}})
         local expected = string.char(0,255,128,10)
         p:write(expected)
@@ -105,7 +124,7 @@ async fn lua_userdata_preserves_invalid_utf8_nuls_eof_and_status() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn cancelled_partial_write_resumes_same_frame_and_rejects_different_bytes() {
-    let (lua, registry) = setup(ToolExecutionLimits::default());
+    let (lua, registry) = setup();
     let directory = tempfile::tempdir().unwrap();
     let gate = directory.path().join("read-enabled");
     let code = format!(
@@ -113,13 +132,9 @@ async fn cancelled_partial_write_resumes_same_frame_and_rejects_different_bytes(
         gate.to_str().unwrap()
     );
     let session = python(&lua, &code).await;
-    let (ready, eof) = read_pipe(
-        &session.inner.stdout,
-        &session.inner.stdout_budget,
-        &session.inner.close,
-    )
-    .await
-    .unwrap();
+    let (ready, eof) = read_pipe(&session.inner.stdout, &session.inner.close)
+        .await
+        .unwrap();
     assert_eq!(ready, b"ready");
     assert!(!eof);
     let bytes: Vec<u8> = (0..65536u32)
@@ -160,11 +175,7 @@ async fn cancelled_partial_write_resumes_same_frame_and_rejects_different_bytes(
                 // A new, identical complete call is a second frame, not a retry.
                 session.write(&bytes).await
             },
-            drain(
-                &session.inner.stdout,
-                &session.inner.stdout_budget,
-                &session.inner.close
-            ),
+            drain(&session.inner.stdout, &session.inner.close),
             session.wait(),
         )
     })
@@ -179,10 +190,9 @@ async fn cancelled_partial_write_resumes_same_frame_and_rejects_different_bytes(
 
 #[tokio::test]
 async fn lua_await_any_concurrently_reads_stderr_waits_and_writes_one_session() {
-    let (lua, registry) = setup(ToolExecutionLimits::default());
-    crate::handler::install_await_any(&lua).unwrap();
+    let (lua, registry) = setup();
     let result = tokio::time::timeout(Duration::from_secs(5), lua.load(r#"
-        local p=process_open({program='/usr/bin/python3', arguments={'-u','-c',
+        local p=margatroid:process_open({program='/usr/bin/python3', arguments={'-u','-c',
             'import sys; b=sys.stdin.buffer.read(4); sys.stdout.buffer.write(b); sys.stderr.buffer.write(b)'}})
         local bytes=string.char(0,255,128,10)
         local operations={
@@ -193,7 +203,7 @@ async fn lua_await_any_concurrently_reads_stderr_waits_and_writes_one_session() 
         }
         local got={}
         while next(operations) do
-            local name, value=await_any(operations)
+            local name, value=margatroid:await_any(operations)
             got[name]=value
             operations[name]=nil
         end
@@ -207,16 +217,12 @@ async fn lua_await_any_concurrently_reads_stderr_waits_and_writes_one_session() 
 
 #[tokio::test]
 async fn close_interrupts_concurrent_wait_read_and_backpressured_write() {
-    let (lua, registry) = setup(ToolExecutionLimits::default());
+    let (lua, registry) = setup();
     let session = python(&lua, "import time; time.sleep(60)").await;
-    let bytes = vec![0; ToolExecutionLimits::default().argument_bytes];
+    let bytes = vec![0; 1024 * 1024];
     let (read, write, status, closed) = tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(
-            read_pipe(
-                &session.inner.stdout,
-                &session.inner.stdout_budget,
-                &session.inner.close
-            ),
+            read_pipe(&session.inner.stdout, &session.inner.close),
             session.write(&bytes),
             session.wait(),
             async {
@@ -240,7 +246,7 @@ async fn close_interrupts_concurrent_wait_read_and_backpressured_write() {
 
 #[tokio::test]
 async fn worker_cleanup_after_cancelled_lua_reaps_every_session_and_closes_admission() {
-    let (lua, registry) = setup(ToolExecutionLimits::default());
+    let (lua, registry) = setup();
     let first = python(&lua, "import time; time.sleep(60)").await;
     let second = python(&lua, "import time; time.sleep(60)").await;
     lua.globals()
@@ -263,7 +269,7 @@ async fn worker_cleanup_after_cancelled_lua_reaps_every_session_and_closes_admis
     drop(input);
     assert!(second.inner.stdout.lock().await.is_none());
     assert!(lua
-        .load("process_open({program='/bin/true'})")
+        .load("margatroid:process_open({program='/bin/true'})")
         .exec_async()
         .await
         .is_err());
@@ -271,67 +277,27 @@ async fn worker_cleanup_after_cancelled_lua_reaps_every_session_and_closes_admis
 }
 
 #[tokio::test]
-async fn budgets_are_shared_across_sessions_and_stderr_is_separate() {
-    let limits = ToolExecutionLimits {
-        output_bytes: 3,
-        diagnostic_bytes: 2,
-        ..ToolExecutionLimits::default()
-    };
-    let (lua, registry) = setup(limits);
+async fn output_is_preserved_across_sessions_and_delayed_reads() {
+    let (lua, registry) = setup();
     let first = python(
         &lua,
-        "import sys; sys.stdout.write('abc'); sys.stderr.write('xyz')",
+        "import sys; sys.stdout.write('a'*256); sys.stderr.write('b'*256)",
     )
     .await;
+    let second = python(&lua, "print('second', end='')").await;
+    assert_eq!(first.wait().await.unwrap().code(), Some(0));
+    assert_eq!(second.wait().await.unwrap().code(), Some(0));
     assert_eq!(
-        drain(
-            &first.inner.stdout,
-            &first.inner.stdout_budget,
-            &first.inner.close
-        )
-        .await,
-        b"abc"
+        drain(&first.inner.stdout, &first.inner.close).await,
+        vec![b'a'; 256]
     );
-    let error = read_pipe(
-        &first.inner.stderr,
-        &first.inner.stderr_budget,
-        &first.inner.close,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.kind, Kind::OutputTooLarge);
-    let second = python(&lua, "print('x', end='')").await;
-    let error = read_pipe(
-        &second.inner.stdout,
-        &second.inner.stdout_budget,
-        &second.inner.close,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.kind, Kind::OutputTooLarge);
-    registry.cleanup().await.unwrap();
-}
-
-#[tokio::test]
-async fn lua_budget_errors_preserve_tool_error_category() {
-    let limits = ToolExecutionLimits {
-        output_bytes: 1,
-        ..ToolExecutionLimits::default()
-    };
-    let (lua, registry) = setup(limits);
-    let error = lua
-        .load(
-            r#"
-        local p=process_open({program='/bin/echo', arguments={'overflow'}})
-        p:read()
-    "#,
-        )
-        .exec_async()
-        .await
-        .unwrap_err();
     assert_eq!(
-        crate::handler::lua_failure(error).kind,
-        Kind::OutputTooLarge
+        drain(&first.inner.stderr, &first.inner.close).await,
+        vec![b'b'; 256]
+    );
+    assert_eq!(
+        drain(&second.inner.stdout, &second.inner.close).await,
+        b"second"
     );
     registry.cleanup().await.unwrap();
 }
@@ -339,25 +305,19 @@ async fn lua_budget_errors_preserve_tool_error_category() {
 #[tokio::test]
 async fn program_path_and_argv_are_literal_and_cwd_is_project_root() {
     let directory = tempfile::tempdir().unwrap();
-    let lua = Lua::new();
-    let registry = install_process(
-        &lua,
-        directory.path().to_owned(),
-        ToolExecutionLimits::default(),
-    )
-    .unwrap();
+    let (lua, registry) = setup_at(directory.path().to_owned());
     lua.globals()
         .set("expected", directory.path().to_str().unwrap())
         .unwrap();
     lua.load(
         r#"
-        local p=process_open({program='/usr/bin/python3', arguments={'-c',
+        local p=margatroid:process_open({program='/usr/bin/python3', arguments={'-c',
             'import os,sys; print(os.getcwd()); print(sys.argv[1])', '$(echo unsafe); *'}})
         local out=''
         while true do local r=p:read(); out=out..r.data; if r.eof then break end end
         assert(out==expected..'\n$(echo unsafe); *\n')
         assert(p:wait().exit_code==0)
-        assert(not pcall(process_open,{program='python3'}))
+        assert(not pcall(function() margatroid:process_open({program='python3'}) end))
     "#,
     )
     .exec_async()

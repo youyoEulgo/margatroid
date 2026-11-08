@@ -15,15 +15,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::Value;
 use std::io::{self, Write};
 
-pub const MAX_TOOL_IMAGES: usize = 8;
-pub const MAX_TOOL_IMAGE_BYTES: usize = 5 * 1024 * 1024;
-pub const MAX_TOOL_IMAGES_BYTES: usize = 20 * 1024 * 1024;
-
-pub fn parse_tool_result(
-    value: &Value,
-    limits: &ToolExecutionLimits,
-) -> Result<ToolExecuteResponse, ToolError> {
-    encoded_len(value, limits.result_bytes)?;
+pub fn parse_tool_result(value: &Value) -> Result<ToolExecuteResponse, ToolError> {
     let mut response = ToolExecuteResponse {
         call_id: String::new(),
         alias: String::new(),
@@ -46,14 +38,6 @@ pub fn parse_tool_result(
             if !ok && !response.images.is_empty() {
                 return Err(protocol_error("failed tool result must not contain images"));
             }
-            let textual = Value::Object(
-                fields
-                    .iter()
-                    .filter(|(key, _)| key.as_str() != "images")
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            );
-            encoded_len(&textual, limits.output_bytes)?;
             return Ok(response);
         }
         if fields.contains_key("images") {
@@ -63,14 +47,8 @@ pub fn parse_tool_result(
         }
     }
     response.content = match value {
-        Value::String(text) => {
-            if text.len() > limits.output_bytes {
-                return Err(oversized());
-            }
-            text.clone()
-        }
+        Value::String(text) => text.clone(),
         _ => {
-            encoded_len(value, limits.output_bytes)?;
             serde_json::to_string(value).map_err(|_| protocol_error("cannot encode tool result"))?
         }
     };
@@ -78,19 +56,12 @@ pub fn parse_tool_result(
 }
 
 fn validate_images(images: &[ToolImage]) -> Result<(), ToolError> {
-    if images.len() > MAX_TOOL_IMAGES {
-        return Err(protocol_error("too many tool images"));
-    }
-    let mut total = 0usize;
     for image in images {
         if !matches!(
             image.media_type.as_str(),
             "image/png" | "image/jpeg" | "image/gif" | "image/webp"
         ) {
             return Err(protocol_error("unsupported tool image media type"));
-        }
-        if image.data.len() > MAX_TOOL_IMAGE_BYTES.div_ceil(3) * 4 {
-            return Err(oversized());
         }
         if image.data.is_empty() || !image.data.len().is_multiple_of(4) {
             return Err(protocol_error(
@@ -105,11 +76,6 @@ fn validate_images(images: &[ToolImage]) -> Result<(), ToolError> {
             .count();
         if padding > 2 {
             return Err(protocol_error("invalid tool image base64 padding"));
-        }
-        let decoded_len = image.data.len() / 4 * 3 - padding;
-        total = total.checked_add(decoded_len).ok_or_else(oversized)?;
-        if decoded_len > MAX_TOOL_IMAGE_BYTES || total > MAX_TOOL_IMAGES_BYTES {
-            return Err(oversized());
         }
     }
     for image in images {

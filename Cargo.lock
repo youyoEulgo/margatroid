@@ -469,6 +469,7 @@ name = "config_core"
 version = "0.1.0"
 dependencies = [
  "core_plugin",
+ "serde",
 ]
 
 [[package]]
@@ -2712,9 +2713,11 @@ dependencies = [
  "sandbox_resource_core",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
  "tool_core",
  "tool_resource_core",
  "workspace_core",

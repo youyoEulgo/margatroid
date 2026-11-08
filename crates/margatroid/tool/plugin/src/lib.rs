@@ -60,7 +60,7 @@ impl Default for ToolPlugin {
 
 impl Resource for ToolPlugin {}
 
-struct ToolRuntime(Arc<WorldClosureSender>);
+struct ToolRuntime(Arc<WorldClosureSender>, Arc<handler::memory::MemoryPool>);
 impl Resource for ToolRuntime {}
 
 impl Plugin for ToolPlugin {
@@ -89,7 +89,8 @@ impl Plugin for ToolPlugin {
             "ToolPlugin requires UPDATE or POST_UPDATE after turn abort handling"
         );
         let sender = Arc::new(app.world().closure_sender(&self.schedule));
-        app.world_mut().insert_resource(ToolRuntime(sender));
+        app.world_mut()
+            .insert_resource(ToolRuntime(sender, Arc::default()));
         self.limits.validate().expect("ToolPlugin limits invalid");
         let schedule = self.schedule.clone();
         app.world_mut().insert_resource(self);

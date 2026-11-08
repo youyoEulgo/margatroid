@@ -3,10 +3,9 @@ use std::sync::{Arc, Barrier};
 use tokio::sync::oneshot;
 use tool_core::{ToolErrorKind, ToolExecutionLimits, ToolTaskHandle, ToolTasks};
 
-fn owned(
+fn task(
     tasks: &ToolTasks,
     id: &str,
-    owner: Option<&str>,
 ) -> (
     ToolTaskHandle,
     oneshot::Receiver<Result<tool_core::ToolExecuteResponse, tool_core::ToolError>>,
@@ -19,77 +18,60 @@ fn owned(
         reply,
     )
     .unwrap();
-    handle.set_owner_task_id(owner.map(str::to_owned));
     tasks.register(id.into(), handle.clone()).unwrap();
     (handle, receiver)
 }
 
 #[tokio::test]
-async fn owner_cleanup_only_fails_pending_dependents_and_retains_live_handles() {
+async fn cleaning_up_one_task_leaves_other_pending_and_returned_tasks_independent() {
     let tasks = ToolTasks::new();
-    let (pending, result) = owned(&tasks, "pending", Some("owner"));
-    let (returned, completed) = owned(&tasks, "returned", Some("owner"));
+    let (owner, _) = task(&tasks, "owner");
+    let (pending, mut result) = task(&tasks, "pending");
+    let (returned, completed) = task(&tasks, "returned");
     returned
-        .return_result(Ok(tool_core::parse_tool_result(
-            &json!("done"),
-            &ToolExecutionLimits::default(),
-        )
-        .unwrap()))
+        .return_result(Ok(tool_core::parse_tool_result(&json!("done")).unwrap()))
         .unwrap();
-    let (unrelated, _) = owned(&tasks, "unrelated", Some("other"));
-    let (ordinary, _) = owned(&tasks, "ordinary", None);
-    assert_eq!(tasks.abort_owner_unreturned("owner"), 1);
-    assert_eq!(
-        result.await.unwrap().unwrap_err().kind,
-        ToolErrorKind::OwnerGone
-    );
+    owner.cancel();
+    assert!(tasks.complete_cleanup("owner", &owner, None));
+    assert!(matches!(
+        result.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
     assert_eq!(completed.await.unwrap().unwrap().call_id, "call-returned");
-    assert!(pending.cancel_token().is_cancelled());
+    assert!(!pending.cancel_token().is_cancelled());
     assert!(!returned.cancel_token().is_cancelled());
-    assert!(!unrelated.cancel_token().is_cancelled());
-    assert!(!ordinary.cancel_token().is_cancelled());
-    assert_eq!(tasks.list().len(), 4);
-    assert_eq!(
-        tasks.read("pending").unwrap().error.unwrap().kind,
-        ToolErrorKind::OwnerGone
-    );
-    assert_eq!(tasks.abort_owner_unreturned("owner"), 0);
+    assert_eq!(tasks.list().len(), 2);
+    assert!(tasks.read("pending").unwrap().error.is_none());
 }
 
 #[test]
-fn owner_cleanup_and_return_share_one_atomic_reply() {
+fn abort_and_return_share_one_atomic_reply() {
     for _ in 0..64 {
         let tasks = ToolTasks::new();
-        let (handle, mut receiver) = owned(&tasks, "dependent", Some("owner"));
+        let (handle, mut receiver) = task(&tasks, "pending");
         let barrier = Arc::new(Barrier::new(2));
         let race = barrier.clone();
         let returning = handle.clone();
         let worker = std::thread::spawn(move || {
             race.wait();
-            returning.return_result(Ok(tool_core::parse_tool_result(
-                &json!("result"),
-                &ToolExecutionLimits::default(),
-            )
-            .unwrap()))
+            returning.return_result(Ok(tool_core::parse_tool_result(&json!("result")).unwrap()))
         });
         barrier.wait();
-        let cancelled = tasks.abort_owner_unreturned("owner");
+        let cancelled = tasks.abort_unreturned();
         let returned = worker.join().unwrap();
-        let reply = receiver.try_recv().unwrap();
-        match reply {
-            Ok(response) => {
-                assert_eq!(response.call_id, "call-dependent");
-                assert!(returned.is_ok());
-                assert_eq!(cancelled, 0);
-                assert!(!handle.cancel_token().is_cancelled());
-            }
-            Err(error) => {
-                assert_eq!(error.kind, ToolErrorKind::OwnerGone);
-                assert_eq!(returned.unwrap_err().kind, ToolErrorKind::AlreadyReturned);
-                assert_eq!(cancelled, 1);
-                assert!(handle.cancel_token().is_cancelled());
-            }
+        let response = receiver.try_recv().unwrap().unwrap();
+        assert_eq!(response.call_id, "call-pending");
+        if response.failed {
+            assert_eq!(response.content, "Tool call aborted.");
+            assert_eq!(returned.unwrap_err().kind, ToolErrorKind::AlreadyReturned);
+            assert_eq!(cancelled, 1);
+            assert!(handle.cancel_token().is_cancelled());
+        } else {
+            assert!(returned.is_ok());
+            assert_eq!(cancelled, 0);
+            assert!(!handle.cancel_token().is_cancelled());
         }
         assert!(handle.has_returned());
+        assert_eq!(tasks.abort_unreturned(), 0);
     }
 }

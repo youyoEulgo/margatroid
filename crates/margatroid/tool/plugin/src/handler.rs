@@ -1,3 +1,7 @@
+mod data;
+pub(crate) mod memory;
+use memory::MemoryBoundary;
+pub(crate) mod host;
 pub(crate) mod process;
 
 use std::collections::BTreeMap;
@@ -24,15 +28,14 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tool_core::{
     parse_tool_result, InitToolTasks, ToolConfiguration, ToolError, ToolErrorKind as Kind,
-    ToolExecuteRequest, ToolExecutionLimits, ToolTaskHandle, ToolTasks,
+    ToolExecuteRequest, ToolTaskHandle, ToolTasks,
 };
 use tool_resource_core::{InjectedToolDefinition, ToolEntry, Tools};
 use workspace_core::Workspace;
 
 use crate::types::{
-    CgroupBoundary, HostFrame, HostWire, NoExternalSchema, RunnerFrame, RunnerRequest, RunnerWire,
-    SharedBridge, ToolContext, ToolExecutionContext, ToolLaunchError, ToolLaunchOutput,
-    WorkerBridge,
+    HostFrame, HostWire, NoExternalSchema, RunnerFrame, RunnerRequest, RunnerWire, SharedBridge,
+    ToolContext, ToolExecutionContext, ToolLaunchError, ToolLaunchOutput, WorkerBridge,
 };
 use crate::ToolPlugin;
 
@@ -102,16 +105,6 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
             .get_resource::<ToolPlugin>()
             .expect("ToolPlugin configuration missing")
             .clone();
-        if serde_json::to_vec(&request.arguments)
-            .map_err(|_| error(Kind::InvalidArguments, "arguments are not serializable"))?
-            .len()
-            > config.limits.argument_bytes
-        {
-            return Err(error(
-                Kind::InvalidArguments,
-                "arguments exceed byte budget",
-            ));
-        }
         let tool_entry = world
             .get_component::<Tools>(request.agent)
             .and_then(|tools| tools.get(&request.alias))
@@ -143,17 +136,6 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
             .ok_or_else(|| error(Kind::TaskMissing, "ToolTasks not initialized"))?
             .clone();
         validate_arguments(&tool_entry.input_schema, &request.arguments)?;
-        if let Some(owner) = &tool_entry.owner_task_id {
-            let owner = tasks
-                .get(owner)
-                .map_err(|_| error(Kind::OwnerGone, "tool owner is missing"))?;
-            if owner.cancel_token().is_cancelled() || owner.is_cleanup_complete() {
-                return Err(error(
-                    Kind::OwnerGone,
-                    "tool owner is no longer accepting calls",
-                ));
-            }
-        }
         Ok((config, tool_entry, sandbox_path, project_root, tasks))
     })();
     let (config, tool_entry, sandbox_path, project_root, tasks) = match prepared {
@@ -172,7 +154,6 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         // Handle construction delivers its validation failure to the original reply.
         return;
     };
-    handle.set_owner_task_id(tool_entry.owner_task_id.clone());
     if let Err(failure) = tasks.register(request.id.clone(), handle.clone()) {
         let _ = handle.return_result(Err(failure));
         return;
@@ -192,6 +173,11 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         runner_path: config.runner_path,
         limits: config.limits,
         configuration: None,
+        memory_pool: world
+            .get_resource::<crate::ToolRuntime>()
+            .expect("Tool runtime missing")
+            .1
+            .clone(),
         handle: handle.clone(),
         tasks,
         input,
@@ -292,9 +278,8 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
     let result = std::panic::AssertUnwindSafe(async {
         let tool_path = context.tool_entry.path.clone();
         let sandbox_path = context.sandbox_path.clone();
-        let script_bytes = context.limits.script_bytes;
         let read = tokio::task::spawn_blocking(move || {
-            let program = read_program(&tool_path, script_bytes)?;
+            let program = read_program(&tool_path)?;
             let policy = sandbox_path
                 .map(|path| {
                     read_sandbox(&path, &SandboxReadLimits::default())
@@ -413,20 +398,13 @@ fn resource_dir(path: &Path) -> Result<&Path, ToolError> {
         .ok_or_else(|| error(Kind::ReadFailed, "tool manifest has no resource directory"))
 }
 
-fn read_program(path: &Path, maximum: usize) -> Result<String, ToolError> {
+fn read_program(path: &Path) -> Result<String, ToolError> {
     use std::io::Read;
-    let file = std::fs::File::open(resource_dir(path)?.join("main.lua"))
+    let mut file = std::fs::File::open(resource_dir(path)?.join("main.lua"))
         .map_err(|failure| error(Kind::ReadFailed, failure.to_string()))?;
     let mut bytes = Vec::new();
-    file.take((maximum as u64).saturating_add(1))
-        .read_to_end(&mut bytes)
+    file.read_to_end(&mut bytes)
         .map_err(|failure| error(Kind::ReadFailed, failure.to_string()))?;
-    if bytes.len() > maximum {
-        return Err(error(
-            Kind::OutputTooLarge,
-            "tool program exceeds byte budget",
-        ));
-    }
     String::from_utf8(bytes).map_err(|_| error(Kind::ReadFailed, "tool program is not UTF-8"))
 }
 
@@ -457,14 +435,6 @@ async fn inject_tools(
             "tool configuration not confirmed",
         ));
     }
-    let bytes = serde_json::to_vec(&definitions)
-        .map_err(|_| error(Kind::InvalidDefinition, "invalid tool definitions"))?;
-    if bytes.len() > context.limits.argument_bytes {
-        return Err(error(
-            Kind::OutputTooLarge,
-            "tool definitions exceed byte budget",
-        ));
-    }
     let agent = context.request.agent;
     let task_id = context.request.id.clone();
     let path = context.tool_entry.path.clone();
@@ -479,6 +449,17 @@ async fn inject_tools(
                 "tool task cancelled before injection",
             ));
         }
+        for definition in &definitions {
+            if let Some(owner) = &definition.owner_task_id {
+                let owner = tasks.get(owner)?;
+                if owner.cancel_token().is_cancelled() || owner.is_cleanup_complete() {
+                    return Err(error(
+                        Kind::InvalidRequest,
+                        "tool owner is no longer available for injection",
+                    ));
+                }
+            }
+        }
         let entries = definitions
             .into_iter()
             .map(|definition| {
@@ -488,7 +469,7 @@ async fn inject_tools(
                         path: path.clone(),
                         description: definition.description,
                         input_schema: definition.input_schema,
-                        owner_task_id: Some(task_id.clone()),
+                        owner_task_id: definition.owner_task_id,
                         binding: definition.binding,
                     },
                 )
@@ -507,12 +488,10 @@ async fn cleanup_owner(context: &ToolExecutionContext) -> Result<(), ToolError> 
     context.handle.cancel();
     let agent = context.request.agent;
     let task_id = context.request.id.clone();
-    let tasks = context.tasks.clone();
     in_world(&context.world, move |world| {
         if let Some(tools) = world.get_component_mut::<Tools>(agent) {
             tools.remove_owner(&task_id);
         }
-        tasks.abort_owner_unreturned(&task_id);
         Ok(())
     })
     .await
@@ -527,32 +506,19 @@ impl jsonschema::Retrieve for NoExternalSchema {
     }
 }
 
-fn wire_limit(limits: &ToolExecutionLimits) -> usize {
-    limits
-        .result_bytes
-        .max(limits.cache_bytes)
-        .max(limits.argument_bytes)
-        .saturating_mul(6)
-        .saturating_add(65536)
-}
-
-async fn read_line<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    maximum: usize,
-) -> Result<Option<Vec<u8>>, ToolError> {
+async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<Vec<u8>>, ToolError> {
     let mut bytes = Vec::new();
     let count = reader
-        .take((maximum as u64).saturating_add(1))
         .read_until(b'\n', &mut bytes)
         .await
         .map_err(|_| error(Kind::RunnerProtocolFailed, "runner pipe read failed"))?;
     if count == 0 {
         return Ok(None);
     }
-    if count > maximum || bytes.last() != Some(&b'\n') {
+    if bytes.last() != Some(&b'\n') {
         return Err(error(
-            Kind::OutputTooLarge,
-            "runner frame exceeds limit or lacks delimiter",
+            Kind::RunnerProtocolFailed,
+            "runner frame lacks delimiter",
         ));
     }
     Ok(Some(bytes))
@@ -560,9 +526,8 @@ async fn read_line<R: AsyncBufRead + Unpin>(
 
 async fn read_json<T: DeserializeOwned, R: AsyncBufRead + Unpin>(
     reader: &mut R,
-    maximum: usize,
 ) -> Result<Option<T>, ToolError> {
-    read_line(reader, maximum)
+    read_line(reader)
         .await?
         .map(|line| {
             serde_json::from_slice(&line)
@@ -574,17 +539,10 @@ async fn read_json<T: DeserializeOwned, R: AsyncBufRead + Unpin>(
 async fn write_json<T: Serialize, W: AsyncWrite + Unpin>(
     writer: &mut W,
     value: &T,
-    maximum: usize,
 ) -> Result<(), ToolError> {
     let mut bytes = serde_json::to_vec(value)
         .map_err(|_| error(Kind::RunnerProtocolFailed, "protocol serialization failed"))?;
     bytes.push(b'\n');
-    if bytes.len() > maximum {
-        return Err(error(
-            Kind::OutputTooLarge,
-            "protocol frame exceeds byte budget",
-        ));
-    }
     writer
         .write_all(&bytes)
         .await
@@ -623,6 +581,10 @@ fn filtered_environment(command: &mut tokio::process::Command) {
                 "BASH_ENV",
                 "ENV",
                 "MARGATROID_RUNNER_CGROUP",
+                "MARGATROID_RUNNER_SCOPE",
+                "MARGATROID_RUNNER_GLOBAL_CGROUP",
+                "MARGATROID_RUNNER_GLOBAL_SLICE",
+                "MARGATROID_RUNNER_TOTAL_MEMORY_BYTES",
             ]
             .contains(&upper.as_str())
         {
@@ -637,12 +599,7 @@ fn filtered_environment(command: &mut tokio::process::Command) {
         .env("GIT_PAGER", "cat");
 }
 
-async fn diagnostic_drain<R: AsyncRead + Unpin>(
-    mut pipe: R,
-    maximum: usize,
-    overflow: CancellationToken,
-) -> Result<(), ToolError> {
-    let mut total = 0usize;
+async fn diagnostic_drain<R: AsyncRead + Unpin>(mut pipe: R) -> Result<(), ToolError> {
     let mut chunk = [0u8; 8192];
     loop {
         let count = pipe
@@ -651,10 +608,6 @@ async fn diagnostic_drain<R: AsyncRead + Unpin>(
             .map_err(|_| error(Kind::RunnerProtocolFailed, "runner diagnostics read failed"))?;
         if count == 0 {
             return Ok(());
-        }
-        total = total.saturating_add(count);
-        if total > maximum {
-            overflow.cancel();
         }
     }
 }
@@ -680,7 +633,7 @@ async fn host_frame(
 ) -> Result<HostFrame, ToolError> {
     let (request_id, result) = match frame {
         RunnerFrame::Return { request_id, value } => {
-            let result = parse_tool_result(&value, &context.limits).and_then(|mut response| {
+            let result = parse_tool_result(&value).and_then(|mut response| {
                 if response.failed {
                     response.content = without_lua_traceback(&response.content).to_owned();
                 }
@@ -753,7 +706,6 @@ async fn run_runner(
     request: RunnerRequest,
     policy: Option<Value>,
 ) -> Result<(), ToolError> {
-    let maximum = wire_limit(&request.limits);
     let cancel = context.handle.cancel_token();
     let mut command = tokio::process::Command::new(&context.runner_path);
     command.arg("--margatroid-tool-supervisor");
@@ -792,10 +744,18 @@ async fn run_runner(
             Ok(())
         });
     }
-    let boundary = CgroupBoundary::create().await?;
-    if let Some(boundary) = &boundary {
-        command.env("MARGATROID_RUNNER_CGROUP", &boundary.path);
-    }
+    let boundary = Some(
+        MemoryBoundary::create(
+            &context.memory_pool,
+            request.limits.memory_bytes,
+            request.limits.total_memory_bytes,
+        )
+        .await?,
+    );
+    boundary
+        .as_ref()
+        .expect("memory boundary required")
+        .export(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
@@ -818,16 +778,10 @@ async fn run_runner(
     let mut stdin = child.stdin.take().expect("runner stdin piped");
     let mut stdout = BufReader::new(child.stdout.take().expect("runner stdout piped"));
     let stderr = child.stderr.take().expect("runner stderr piped");
-    let overflow = CancellationToken::new();
-    let diagnostics = tokio::spawn(diagnostic_drain(
-        stderr,
-        request.limits.diagnostic_bytes,
-        overflow.clone(),
-    ));
-    let (host, mut outgoing) =
-        mpsc::channel::<HostFrame>(request.limits.input_capacity.saturating_add(1));
+    let diagnostics = tokio::spawn(diagnostic_drain(stderr));
+    let (host, mut outgoing) = mpsc::unbounded_channel::<HostFrame>();
     let writer = tokio::spawn(async move {
-        write_json(&mut stdin, &request, maximum).await?;
+        write_json(&mut stdin, &request).await?;
         while let Some(frame) = outgoing.recv().await {
             write_json(
                 &mut stdin,
@@ -835,7 +789,6 @@ async fn run_runner(
                     protocol_version: 1,
                     frame,
                 },
-                maximum,
             )
             .await?;
         }
@@ -851,14 +804,14 @@ async fn run_runner(
             let mut input_ready = true;
             loop {
                 tokio::select! {
-                    frame = read_json::<RunnerWire, _>(&mut stdout, maximum) => {
+                    frame = read_json::<RunnerWire, _>(&mut stdout) => {
                         let frame = frame?.ok_or_else(|| error(Kind::RunnerProtocolFailed, "runner exited without cleanup proof"))?;
                         if frame.protocol_version != 1 { return Err(error(Kind::RunnerProtocolFailed, "runner protocol version mismatch")); }
                         if let RunnerFrame::Configured { configuration } = frame.frame {
                             if context.configuration.is_some() { return Err(error(Kind::RunnerProtocolFailed, "duplicate tool configuration")); }
                             context.handle.configure_lifetime(configuration.timeout_ms)?;
                             context.configuration = Some(configuration);
-                            host.send(HostFrame::Configured).await.map_err(|_| error(Kind::RunnerProtocolFailed, "configuration acknowledgement failed"))?;
+                            host.send(HostFrame::Configured).map_err(|_| error(Kind::RunnerProtocolFailed, "configuration acknowledgement failed"))?;
                             continue;
                         }
                         if matches!(frame.frame, RunnerFrame::InputConsumed) { input_ready = true; continue; }
@@ -873,11 +826,11 @@ async fn run_runner(
                         }
                         if context.configuration.is_none() { return Err(error(Kind::RunnerProtocolFailed, "worker request before configuration")); }
                         let response = host_frame(context, frame.frame).await?;
-                        host.send(response).await.map_err(|_| error(Kind::RunnerProtocolFailed, "runner input closed"))?;
+                        host.send(response).map_err(|_| error(Kind::RunnerProtocolFailed, "runner input closed"))?;
                     }
                     value = context.input.recv(), if input_ready && context.configuration.is_some() => {
                         let Some(value) = value else { return Err(error(Kind::InputClosed, "task input channel closed")); };
-                        host.send(HostFrame::Input { value }).await.map_err(|_| error(Kind::RunnerProtocolFailed, "runner input closed"))?;
+                        host.send(HostFrame::Input { value }).map_err(|_| error(Kind::RunnerProtocolFailed, "runner input closed"))?;
                         input_ready = false;
                     }
                 }
@@ -891,7 +844,6 @@ async fn run_runner(
                 Err(error(Kind::Timeout, "tool task lifetime exceeded"))
             },
             () = cancel.cancelled() => Err(error(Kind::Cancelled, "tool task cancellation requested")),
-            () = overflow.cancelled() => Err(error(Kind::OutputTooLarge, "runner diagnostic budget exceeded")),
             result = &mut exchange => result,
         }
     };
@@ -899,7 +851,9 @@ async fn run_runner(
         complete_reply(context, Err(failure.clone()));
         context.handle.set_error(failure.clone());
     }
-    cleanup_owner(context).await?;
+    if let Err(failure) = cleanup_owner(context).await {
+        result = Err(failure);
+    }
     if !proven {
         signal_runner(pid);
         if result
@@ -910,7 +864,7 @@ async fn run_runner(
         }
         loop {
             let cleanup = async {
-                while let Some(frame) = read_json::<RunnerWire, _>(&mut stdout, maximum).await? {
+                while let Some(frame) = read_json::<RunnerWire, _>(&mut stdout).await? {
                     if frame.protocol_version == 1 {
                         if let RunnerFrame::Stopped { cleanup_proven, .. } = frame.frame {
                             if cleanup_proven {
@@ -975,50 +929,6 @@ async fn run_runner(
         result = Err(error(Kind::CleanupFailed, "runner cleanup unproven"));
     }
     result
-}
-
-impl CgroupBoundary {
-    pub(crate) async fn create() -> Result<Option<Self>, ToolError> {
-        let Some(root) = std::env::var_os("MARGATROID_TOOL_CGROUP_ROOT") else {
-            return Ok(None);
-        };
-        let root = PathBuf::from(root);
-        if !root.is_absolute() || !root.join("cgroup.controllers").is_file() {
-            return Err(error(
-                Kind::SandboxUnavailable,
-                "configured cgroup v2 root unavailable",
-            ));
-        }
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let path = root.join(format!(
-            "margatroid-tool-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        tokio::fs::create_dir(&path)
-            .await
-            .map_err(|_| error(Kind::SandboxUnavailable, "cgroup creation failed"))?;
-        Ok(Some(Self { path }))
-    }
-    pub(crate) async fn cleanup(&self) -> Result<(), ToolError> {
-        if !self.path.exists() {
-            return Ok(());
-        }
-        tokio::fs::write(self.path.join("cgroup.kill"), "1")
-            .await
-            .map_err(|_| error(Kind::CleanupFailed, "cgroup kill failed"))?;
-        loop {
-            let events = tokio::fs::read_to_string(self.path.join("cgroup.events"))
-                .await
-                .map_err(|_| error(Kind::CleanupFailed, "cgroup status unavailable"))?;
-            if events.lines().any(|line| line == "populated 0") {
-                return tokio::fs::remove_dir(&self.path)
-                    .await
-                    .map_err(|_| error(Kind::CleanupFailed, "cgroup removal failed"));
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1132,22 +1042,11 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
     if nix::sys::prctl::set_child_subreaper(true).is_err() {
         return 3;
     }
-    if let Some(path) = std::env::var_os("MARGATROID_RUNNER_CGROUP") {
-        if tokio::fs::write(
-            PathBuf::from(path).join("cgroup.procs"),
-            std::process::id().to_string(),
-        )
-        .await
-        .is_err()
-        {
-            return 3;
-        }
-    }
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let mut input = BufReader::new(tokio::io::stdin());
     let request = tokio::select! {
-        request = read_json::<RunnerRequest, _>(&mut input, 64 * 1024 * 1024) => request,
+        request = read_json::<RunnerRequest, _>(&mut input) => request,
         _ = &mut shutdown => return 3,
     };
     let Ok(Some(request)) = request else {
@@ -1156,32 +1055,64 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
     if request.protocol_version != 1 || request.limits.validate().is_err() {
         return 2;
     }
-    let maximum = wire_limit(&request.limits);
+
     let Ok(executable) = std::env::current_exe() else {
         return 3;
     };
-    let mut command = if let Some((backend, policy)) = sandbox {
-        let mut command = tokio::process::Command::new(backend);
-        command
-            .arg("run")
-            .arg("-p")
-            .arg(policy)
-            .arg("--")
-            .arg(executable);
-        command
-    } else {
-        tokio::process::Command::new(executable)
+    if sandbox.is_some_and(|(backend, _)| !Path::new(backend).is_file()) {
+        let frame = RunnerWire {
+            protocol_version: 1,
+            frame: RunnerFrame::Stopped {
+                result: Err(error(
+                    Kind::RunnerStartFailed,
+                    "restricted worker could not start",
+                )),
+                cleanup_proven: true,
+            },
+        };
+        let _ = write_json(&mut tokio::io::stdout(), &frame).await;
+        return 0;
+    }
+    let boundary = match MemoryBoundary::inherited() {
+        Ok(Some(boundary)) => boundary
+            .validate(
+                request.limits.memory_bytes,
+                request.limits.total_memory_bytes,
+            )
+            .map(|()| boundary),
+        Ok(None) => {
+            MemoryBoundary::create(
+                &Arc::default(),
+                request.limits.memory_bytes,
+                request.limits.total_memory_bytes,
+            )
+            .await
+        }
+        Err(failure) => Err(failure),
     };
+    let boundary = match boundary {
+        Ok(boundary) => boundary,
+        Err(failure) => {
+            let frame = RunnerWire {
+                protocol_version: 1,
+                frame: RunnerFrame::Stopped {
+                    result: Err(failure),
+                    cleanup_proven: true,
+                },
+            };
+            let _ = write_json(&mut tokio::io::stdout(), &frame).await;
+            return 3;
+        }
+    };
+    let mut command = boundary.command(request.limits.memory_bytes, &executable, sandbox);
     command
-        .arg("--margatroid-tool-worker")
-        .env_remove("MARGATROID_RUNNER_CGROUP")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
     let mut output = tokio::io::stdout();
     let mut configuration: Option<ToolConfiguration> = None;
-    let result = match command.spawn() {
+    let mut result = match command.spawn() {
         Err(_) => Err(error(
             Kind::RunnerStartFailed,
             "restricted worker could not start",
@@ -1191,11 +1122,11 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
             let mut worker_output =
                 BufReader::new(worker.stdout.take().expect("worker stdout piped"));
             let exchange = async {
-                write_json(&mut worker_input, &request, maximum).await?;
+                write_json(&mut worker_input, &request).await?;
                 let mut acknowledged = false;
                 loop {
                     tokio::select! {
-                        frame = read_json::<RunnerWire, _>(&mut worker_output, maximum) => {
+                        frame = read_json::<RunnerWire, _>(&mut worker_output) => {
                             let frame = frame?.ok_or_else(|| error(Kind::ExecutionFailed, "worker exited without terminal frame"))?;
                             if frame.protocol_version != 1 { return Err(error(Kind::RunnerProtocolFailed, "worker protocol version mismatch")); }
                             match frame.frame {
@@ -1203,15 +1134,15 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
                                     if configuration.is_some() { return Err(error(Kind::RunnerProtocolFailed, "duplicate worker configuration")); }
                                     value.validate()?;
                                     configuration = Some(value);
-                                    write_json(&mut output, &frame, maximum).await?;
+                                    write_json(&mut output, &frame).await?;
                                 }
                                 RunnerFrame::Done { result } => return result,
                                 RunnerFrame::Stopped { .. } => return Err(error(Kind::RunnerProtocolFailed, "worker cannot claim descendant cleanup")),
-                                _ if acknowledged => write_json(&mut output, &frame, maximum).await?,
+                                _ if acknowledged => write_json(&mut output, &frame).await?,
                                 _ => return Err(error(Kind::RunnerProtocolFailed, "worker request before configuration acknowledgement")),
                             }
                         }
-                        frame = read_json::<HostWire, _>(&mut input, maximum) => {
+                        frame = read_json::<HostWire, _>(&mut input) => {
                             let frame = frame?.ok_or_else(|| error(Kind::Cancelled, "supervisor host input closed"))?;
                             if frame.protocol_version != 1 { return Err(error(Kind::RunnerProtocolFailed, "host protocol version mismatch")); }
                             if matches!(frame.frame, HostFrame::Configured) {
@@ -1219,7 +1150,7 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
                                 configuration.ok_or_else(|| error(Kind::RunnerProtocolFailed, "configuration acknowledgement before configuration"))?;
                                 acknowledged = true;
                             } else if !acknowledged { return Err(error(Kind::RunnerProtocolFailed, "host frame before configuration acknowledgement")); }
-                            write_json(&mut worker_input, &frame, maximum).await?;
+                            write_json(&mut worker_input, &frame).await?;
                         }
                     }
                 }
@@ -1232,6 +1163,10 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
                 }
             };
             drop(worker_input);
+            let oom = boundary.oom_killed().await;
+            while boundary.kill().await.is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             while !cleanup_descendants().await {
                 let frame = RunnerWire {
                     protocol_version: 1,
@@ -1240,11 +1175,24 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
                         cleanup_proven: false,
                     },
                 };
-                let _ = write_json(&mut output, &frame, maximum).await;
+                let _ = write_json(&mut output, &frame).await;
             }
             let _ = worker.wait().await;
             let _ = tokio::io::copy(&mut worker_output, &mut tokio::io::sink()).await;
-            result
+            if oom || boundary.oom_killed().await {
+                Err(error(
+                    Kind::ExecutionFailed,
+                    "task aggregate memory limit exceeded",
+                ))
+            } else if configuration.is_none()
+                && result
+                    .as_ref()
+                    .is_err_and(|failure| failure.kind == Kind::ExecutionFailed)
+            {
+                Err(error(Kind::SandboxUnavailable, "memory-enforced worker could not configure; ensure a delegated cgroup v2 memory controller or systemd user scope is available"))
+            } else {
+                result
+            }
         }
     };
     while !cleanup_descendants().await {
@@ -1255,7 +1203,19 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
                 cleanup_proven: false,
             },
         };
-        let _ = write_json(&mut output, &frame, maximum).await;
+        let _ = write_json(&mut output, &frame).await;
+    }
+    while let Err(failure) = boundary.cleanup().await {
+        result = Err(failure.clone());
+        let frame = RunnerWire {
+            protocol_version: 1,
+            frame: RunnerFrame::Stopped {
+                result: Err(failure),
+                cleanup_proven: false,
+            },
+        };
+        let _ = write_json(&mut output, &frame).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let frame = RunnerWire {
         protocol_version: 1,
@@ -1264,7 +1224,7 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
             cleanup_proven: true,
         },
     };
-    if write_json(&mut output, &frame, maximum).await.is_ok() {
+    if write_json(&mut output, &frame).await.is_ok() {
         0
     } else {
         3
@@ -1278,27 +1238,30 @@ async fn supervisor_main(_: Vec<std::ffi::OsString>) -> i32 {
 
 pub async fn runner_main() -> i32 {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    #[cfg(target_os = "linux")]
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--margatroid-tool-memory-entry")
+    {
+        return memory::enter_scope(&args[1..]);
+    }
     if args != [std::ffi::OsString::from("--margatroid-tool-worker")] {
         return supervisor_main(args).await;
     }
     let mut input = BufReader::new(tokio::io::stdin());
-    let Ok(Some(request)) = read_json::<RunnerRequest, _>(&mut input, 64 * 1024 * 1024).await
-    else {
+    let Ok(Some(request)) = read_json::<RunnerRequest, _>(&mut input).await else {
         return 2;
     };
     if request.protocol_version != 1 || request.limits.validate().is_err() {
         return 2;
     }
-    let maximum = wire_limit(&request.limits);
+
     let result = run_tool_worker(request, input).await;
     let frame = RunnerWire {
         protocol_version: 1,
         frame: RunnerFrame::Done { result },
     };
-    if write_json(&mut tokio::io::stdout(), &frame, maximum)
-        .await
-        .is_ok()
-    {
+    if write_json(&mut tokio::io::stdout(), &frame).await.is_ok() {
         0
     } else {
         3
@@ -1319,7 +1282,6 @@ impl WorkerBridge {
                 protocol_version: 1,
                 frame: frame(request_id.clone()),
             },
-            self.frame_limit,
         )
         .await;
         let result = match sent {
@@ -1340,10 +1302,10 @@ impl WorkerBridge {
 async fn worker_host_input<R: AsyncBufRead + Unpin>(
     mut reader: R,
     bridge: SharedBridge,
-    input: mpsc::Sender<Value>,
+    input: mpsc::UnboundedSender<Value>,
 ) {
     let result = async {
-        while let Some(frame) = read_json::<HostWire, _>(&mut reader, bridge.frame_limit).await? {
+        while let Some(frame) = read_json::<HostWire, _>(&mut reader).await? {
             if frame.protocol_version != 1 {
                 return Err(error(Kind::RunnerProtocolFailed, "host version mismatch"));
             }
@@ -1355,8 +1317,8 @@ async fn worker_host_input<R: AsyncBufRead + Unpin>(
                     ));
                 }
                 HostFrame::Input { value } => input
-                    .try_send(value)
-                    .map_err(|_| error(Kind::RunnerProtocolFailed, "Lua input credit exceeded"))?,
+                    .send(value)
+                    .map_err(|_| error(Kind::RunnerProtocolFailed, "Lua input closed"))?,
                 HostFrame::Response { request_id, result } => {
                     if let Some(reply) = bridge
                         .pending
@@ -1410,14 +1372,6 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     input: R,
 ) -> Result<(), ToolError> {
     request.limits.validate()?;
-    if request.program.len() > request.limits.script_bytes
-        || serde_json::to_vec(&request.arguments)
-            .map_err(|_| error(Kind::InvalidArguments, "invalid arguments"))?
-            .len()
-            > request.limits.argument_bytes
-    {
-        return Err(error(Kind::OutputTooLarge, "runner request exceeds budget"));
-    }
     let lua = Lua::new_with(
         StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
         LuaOptions::default(),
@@ -1427,8 +1381,6 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         .map_err(lua_failure)?;
     let deadline = Arc::new(Mutex::new(None::<Instant>));
     let hook_deadline = deadline.clone();
-    let instructions = AtomicU64::new(0);
-    let budget = request.limits.instruction_budget;
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(1000),
         move |_, _| {
@@ -1442,23 +1394,13 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
                     "Lua execution deadline exceeded",
                 )));
             }
-            if instructions
-                .fetch_add(1000, Ordering::Relaxed)
-                .saturating_add(1000)
-                > budget
-            {
-                return Err(mlua::Error::external(error(
-                    Kind::ExecutionFailed,
-                    "Lua instruction budget exceeded",
-                )));
-            }
             Ok(VmState::Continue)
         },
     )
     .map_err(lua_failure)?;
     let globals = lua.globals();
-    // Error-catching functions and coroutines could swallow instruction-hook
-    // failures and run configuration forever. Install them only after validation.
+    // Configuration runs with only the metadata API; execution capabilities are
+    // installed after the host accepts the configuration.
     let mut execution_globals = Vec::new();
     for name in [
         "pcall",
@@ -1475,8 +1417,19 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     for name in ["io", "os", "print"] {
         globals.set(name, LuaValue::Nil).map_err(lua_failure)?;
     }
-    let arguments = lua.to_value(&request.arguments).map_err(lua_failure)?;
-    let context = lua.to_value(&request.context).map_err(lua_failure)?;
+    let arguments = data::to_lua(&lua, request.arguments.clone()).map_err(lua_failure)?;
+    let context = data::to_lua(
+        &lua,
+        serde_json::to_value(&request.context)
+            .map_err(|failure| error(Kind::InvalidArguments, failure.to_string()))?,
+    )
+    .map_err(lua_failure)?;
+    let host = host::Margatroid::install(&lua, request.context.clone(), request.arguments.clone())
+        .map_err(lua_failure)?;
+    // Registering async userdata methods may load the coroutine library in mlua.
+    globals
+        .set("coroutine", LuaValue::Nil)
+        .map_err(lua_failure)?;
     lua.load(&request.program)
         .set_name("tool")
         .exec()
@@ -1508,10 +1461,9 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
             protocol_version: 1,
             frame: RunnerFrame::Configured { configuration },
         },
-        wire_limit(&request.limits),
     )
     .await?;
-    let acknowledgement = read_json::<HostWire, _>(&mut input, wire_limit(&request.limits)).await?;
+    let acknowledgement = read_json::<HostWire, _>(&mut input).await?;
     if !matches!(
         acknowledgement,
         Some(HostWire {
@@ -1543,14 +1495,13 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         )
         .map_err(lua_failure)?;
     globals.set("package", package).map_err(lua_failure)?;
-    let (sender, receiver) = mpsc::channel(request.limits.input_capacity);
+    let (sender, receiver) = mpsc::unbounded_channel();
     let finish = CancellationToken::new();
     let bridge = Arc::new(WorkerBridge {
         output: tokio::sync::Mutex::new(tokio::io::stdout()),
         pending: Mutex::new(BTreeMap::new()),
         input: tokio::sync::Mutex::new(receiver),
         sequence: AtomicU64::new(1),
-        frame_limit: wire_limit(&request.limits),
         finish: finish.clone(),
     });
     let host_reader = tokio::spawn(worker_host_input(input, bridge.clone(), sender));
@@ -1586,7 +1537,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         lua.create_function(|_, _: mlua::MultiValue| {
             Err::<(), _>(mlua::Error::external(error(
                 Kind::InvalidRequest,
-                "use process_open for subprocesses",
+                "use margatroid:process_open for subprocesses",
             )))
         })
         .map_err(lua_failure)?,
@@ -1598,7 +1549,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         lua.create_function(|_, _: mlua::MultiValue| {
             Err::<(), _>(mlua::Error::external(error(
                 Kind::InvalidRequest,
-                "use process_open for subprocesses",
+                "use margatroid:process_open for subprocesses",
             )))
         })
         .map_err(lua_failure)?,
@@ -1609,34 +1560,15 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         lua.create_function(|_, _: mlua::MultiValue| {
             Err::<(), _>(mlua::Error::external(error(
                 Kind::InvalidRequest,
-                "use task_finish for task exit",
+                "use margatroid:task_finish for task exit",
             )))
         })
         .map_err(lua_failure)?,
     )
     .map_err(lua_failure)?;
-    let json = lua.create_table().map_err(lua_failure)?;
-    json.set("null", lua.null()).map_err(lua_failure)?;
-    json.set(
-        "encode",
-        lua.create_function(|lua, value: LuaValue| {
-            serde_json::to_string(&lua.from_value::<Value>(value)?).map_err(mlua::Error::external)
-        })
-        .map_err(lua_failure)?,
-    )
-    .map_err(lua_failure)?;
-    json.set(
-        "decode",
-        lua.create_function(|lua, value: String| {
-            let value: Value = serde_json::from_str(&value).map_err(mlua::Error::external)?;
-            lua.to_value(&value)
-        })
-        .map_err(lua_failure)?,
-    )
-    .map_err(lua_failure)?;
-    globals.set("json", json.clone()).map_err(lua_failure)?;
+    let callbacks = lua.create_table().map_err(lua_failure)?;
     let task_bridge = bridge.clone();
-    globals
+    callbacks
         .set(
             "task_write",
             lua.create_async_function(move |lua, value: LuaValue| {
@@ -1654,7 +1586,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         )
         .map_err(lua_failure)?;
     let task_bridge = bridge.clone();
-    globals
+    callbacks
         .set(
             "task_replace",
             lua.create_async_function(move |lua, value: LuaValue| {
@@ -1672,7 +1604,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         )
         .map_err(lua_failure)?;
     let inject_bridge = bridge.clone();
-    globals
+    callbacks
         .set(
             "tool_inject",
             lua.create_async_function(move |lua, value: LuaValue| {
@@ -1693,16 +1625,14 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         )
         .map_err(lua_failure)?;
     let task_bridge = bridge.clone();
-    let limits = request.limits.clone();
-    globals
+    callbacks
         .set(
             "task_return",
             lua.create_async_function(move |lua, value: LuaValue| {
                 let bridge = task_bridge.clone();
-                let limits = limits.clone();
                 async move {
                     let value = lua.from_value::<Value>(value)?;
-                    parse_tool_result(&value, &limits).map_err(mlua::Error::external)?;
+                    parse_tool_result(&value).map_err(mlua::Error::external)?;
                     bridge
                         .call(|request_id| RunnerFrame::Return { request_id, value })
                         .await
@@ -1714,7 +1644,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         )
         .map_err(lua_failure)?;
     let task_bridge = bridge.clone();
-    globals
+    callbacks
         .set(
             "task_read",
             lua.create_async_function(move |lua, task_id: String| {
@@ -1727,14 +1657,14 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
                         })
                         .await
                         .map_err(mlua::Error::external)?;
-                    lua.to_value(&value)
+                    data::to_lua(&lua, value)
                 }
             })
             .map_err(lua_failure)?,
         )
         .map_err(lua_failure)?;
     let task_bridge = bridge.clone();
-    globals
+    callbacks
         .set(
             "task_send",
             lua.create_async_function(move |lua, (task_id, value): (String, LuaValue)| {
@@ -1757,7 +1687,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         .map_err(lua_failure)?;
     let task_bridge = bridge.clone();
     let own_id = request.context.task_id.clone();
-    globals
+    callbacks
         .set(
             "task_finish",
             lua.create_async_function(move |_, task_id: String| {
@@ -1782,7 +1712,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         )
         .map_err(lua_failure)?;
     let task_bridge = bridge.clone();
-    globals
+    callbacks
         .set(
             "task_receive",
             lua.create_async_function(move |lua, ()| {
@@ -1800,81 +1730,32 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
                                 protocol_version: 1,
                                 frame: RunnerFrame::InputConsumed,
                             },
-                            consumed.frame_limit,
                         )
                         .await;
                     });
-                    lua.to_value(&value)
+                    data::to_lua(&lua, value)
                 }
             })
             .map_err(lua_failure)?,
         )
         .map_err(lua_failure)?;
-    install_await_any(&lua)?;
-    let processes = process::install_process(
+    callbacks
+        .set("await_any", install_await_any(&lua)?)
+        .map_err(lua_failure)?;
+    let (processes, process_open) =
+        process::install_process(&lua, request.context.project_root.clone())?;
+    callbacks
+        .set("process_open", process_open)
+        .map_err(lua_failure)?;
+    data::install(&lua, &callbacks, request.context.project_root.clone())?;
+    host::Margatroid::enable(&host, callbacks).map_err(lua_failure)?;
+    let arguments = data::to_lua(&lua, request.arguments.clone()).map_err(lua_failure)?;
+    let context = data::to_lua(
         &lua,
-        request.context.project_root.clone(),
-        request.limits.clone(),
-    )?;
-    let arguments = lua.to_value(&request.arguments).map_err(lua_failure)?;
-    let context = lua.to_value(&request.context).map_err(lua_failure)?;
-    globals
-        .set("args", arguments.clone())
-        .map_err(lua_failure)?;
-    globals
-        .set("context", context.clone())
-        .map_err(lua_failure)?;
-    let entry = lua.create_table().map_err(lua_failure)?;
-    entry.set("version", 1).map_err(lua_failure)?;
-    entry.set("json", json).map_err(lua_failure)?;
-    entry.set("context", context.clone()).map_err(lua_failure)?;
-    entry
-        .set("arguments", arguments.clone())
-        .map_err(lua_failure)?;
-    for name in [
-        "process_open",
-        "tool_inject",
-        "await_any",
-        "task_write",
-        "task_replace",
-        "task_return",
-        "task_finish",
-        "task_read",
-        "task_send",
-        "task_receive",
-    ] {
-        entry
-            .set(name, globals.get::<LuaValue>(name).map_err(lua_failure)?)
-            .map_err(lua_failure)?;
-    }
-    let maximum = request.limits.result_bytes;
-    entry
-        .set(
-            "base64_encode",
-            lua.create_function(move |_, bytes: mlua::String| {
-                use base64::Engine;
-                if bytes.as_bytes().len() > maximum {
-                    return Err(mlua::Error::external(error(
-                        Kind::OutputTooLarge,
-                        "base64 input exceeds budget",
-                    )));
-                }
-                Ok(base64::engine::general_purpose::STANDARD.encode(bytes.as_bytes()))
-            })
-            .map_err(lua_failure)?,
-        )
-        .map_err(lua_failure)?;
-    lua.set_named_registry_value("margatroid_entry", entry)
-        .map_err(lua_failure)?;
-    globals
-        .set(
-            "margatroid",
-            lua.create_function(|lua, ()| {
-                lua.named_registry_value::<mlua::Table>("margatroid_entry")
-            })
-            .map_err(lua_failure)?,
-        )
-        .map_err(lua_failure)?;
+        serde_json::to_value(&request.context)
+            .map_err(|failure| error(Kind::InvalidArguments, failure.to_string()))?,
+    )
+    .map_err(lua_failure)?;
     let execution = async {
         if let Some(execute) = globals.get::<Option<mlua::Function>>("execute")? {
             execute.call_async::<LuaValue>((arguments, context)).await?;
@@ -1893,31 +1774,25 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     result
 }
 
-fn install_await_any(lua: &Lua) -> Result<(), ToolError> {
-    lua.globals()
-        .set(
-            "await_any",
-            lua.create_async_function(|_, operations: mlua::Table| async move {
-                use futures_util::{stream::FuturesUnordered, StreamExt};
-                let mut pending = FuturesUnordered::new();
-                for pair in operations.pairs::<String, mlua::Function>() {
-                    let (name, function) = pair?;
-                    pending.push(async move {
-                        function
-                            .call_async::<mlua::Value>(())
-                            .await
-                            .map(|value| (name, value))
-                    });
-                }
-                pending
-                    .next()
+fn install_await_any(lua: &Lua) -> Result<mlua::Function, ToolError> {
+    lua.create_async_function(|_, operations: mlua::Table| async move {
+        use futures_util::{stream::FuturesUnordered, StreamExt};
+        let mut pending = FuturesUnordered::new();
+        for pair in operations.pairs::<String, mlua::Function>() {
+            let (name, function) = pair?;
+            pending.push(async move {
+                function
+                    .call_async::<mlua::Value>(())
                     .await
-                    .ok_or_else(|| mlua::Error::external("await_any requires an operation"))?
-            })
-            .map_err(lua_failure)?,
-        )
-        .map_err(lua_failure)?;
-    Ok(())
+                    .map(|value| (name, value))
+            });
+        }
+        pending
+            .next()
+            .await
+            .ok_or_else(|| mlua::Error::external("await_any requires an operation"))?
+    })
+    .map_err(lua_failure)
 }
 
 async fn wait_deadline(deadline: Option<tokio::time::Instant>) {
@@ -1974,7 +1849,253 @@ mod world_sender_tests {
     use async_runtime_plugin::AsyncRuntimePlugin;
     use closure_plugin::{AppClosureExt, ClosurePlugin};
     use core_plugin::App;
+    use tool_core::ToolExecutionLimits;
     use workspace_core::WorkspaceState;
+
+    fn injection_fixture() -> (App, Arc<WorldClosureSender>, ToolExecutionContext) {
+        use closure_plugin::WorldClosureExt;
+
+        let mut app = App::new();
+        app.add_plugin(RuntimePlugin::default())
+            .add_plugin(ClosurePlugin)
+            .add_closure_system(RuntimePlugin::UPDATE);
+        let agent = app.world_mut().spawn();
+        let tasks = ToolTasks::new();
+        let (reply, _) = oneshot::channel();
+        let (handle, input) = ToolTaskHandle::new(
+            &ToolExecutionLimits::default(),
+            "call".into(),
+            "source".into(),
+            reply,
+        )
+        .unwrap();
+        tasks.register("caller".into(), handle.clone()).unwrap();
+        app.world_mut().insert_component(agent, tasks.clone());
+        app.world_mut().insert_component(agent, Tools::new());
+        let sender = Arc::new(app.world().closure_sender(RuntimePlugin::UPDATE));
+        let context = ToolExecutionContext {
+            request: ToolExecuteRequest {
+                id: "caller".into(),
+                agent,
+                turn: "turn".into(),
+                alias: "source".into(),
+                call_id: "call".into(),
+                arguments: serde_json::json!({}),
+                reply: Arc::new(Mutex::new(None)),
+            },
+            tool_entry: ToolEntry {
+                path: PathBuf::from("/resource/tool.toml"),
+                description: "source".into(),
+                input_schema: serde_json::json!({}),
+                owner_task_id: None,
+                binding: None,
+            },
+            world: Arc::downgrade(&sender),
+            sandbox_path: None,
+            project_root: PathBuf::from("/project"),
+            runner_path: PathBuf::from("/runner"),
+            limits: ToolExecutionLimits::default(),
+            memory_pool: Arc::default(),
+            configuration: Some(ToolConfiguration { timeout_ms: 0 }),
+            handle,
+            tasks,
+            input,
+        };
+        (app, sender, context)
+    }
+
+    async fn world_action<T>(app: &mut App, action: impl std::future::Future<Output = T>) -> T {
+        tokio::pin!(action);
+        if let Some(result) = action.as_mut().now_or_never() {
+            return result;
+        }
+        app.tick();
+        action.await
+    }
+
+    fn definition(alias: &str, owner: Option<&str>) -> InjectedToolDefinition {
+        InjectedToolDefinition {
+            alias: alias.into(),
+            description: "injected".into(),
+            input_schema: serde_json::json!({}),
+            owner_task_id: owner.map(str::to_owned),
+            binding: Some(serde_json::json!({"method": "echo"})),
+        }
+    }
+
+    #[tokio::test]
+    async fn static_injection_survives_caller_cleanup() {
+        let (mut app, _sender, context) = injection_fixture();
+        let omitted: InjectedToolDefinition = serde_json::from_value(serde_json::json!({
+            "alias": "static", "description": "static", "input_schema": {},
+            "binding": {"method": "echo"}
+        }))
+        .unwrap();
+        assert_eq!(omitted.owner_task_id, None);
+        world_action(&mut app, inject_tools(&context, vec![omitted]))
+            .await
+            .unwrap();
+        world_action(&mut app, cleanup_owner(&context))
+            .await
+            .unwrap();
+        let entry = app
+            .world()
+            .get_component::<Tools>(context.request.agent)
+            .unwrap()
+            .get("static")
+            .unwrap();
+        assert_eq!(entry.owner_task_id, None);
+        assert_eq!(entry.path, context.tool_entry.path);
+        assert_eq!(entry.binding, Some(serde_json::json!({"method": "echo"})));
+        assert!(context.handle.cancel_token().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn explicit_other_owner_controls_record_cleanup_without_cancelling_calls() {
+        let (mut app, _sender, mut context) = injection_fixture();
+        let caller = context.handle.clone();
+        let (reply, _) = oneshot::channel();
+        let (owner, _) = ToolTaskHandle::new(
+            &context.limits,
+            "owner-call".into(),
+            "owner-alias".into(),
+            reply,
+        )
+        .unwrap();
+        context
+            .tasks
+            .register("other".into(), owner.clone())
+            .unwrap();
+        world_action(
+            &mut app,
+            inject_tools(&context, vec![definition("owned", Some("other"))]),
+        )
+        .await
+        .unwrap();
+        world_action(&mut app, cleanup_owner(&context))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.world()
+                .get_component::<Tools>(context.request.agent)
+                .unwrap()
+                .get("owned")
+                .unwrap()
+                .owner_task_id
+                .as_deref(),
+            Some("other")
+        );
+        // The accepted caller is an independent task even if its tool record is owned.
+        let (reply, _) = oneshot::channel();
+        let (accepted, _) = ToolTaskHandle::new(
+            &context.limits,
+            "accepted-call".into(),
+            "owned".into(),
+            reply,
+        )
+        .unwrap();
+        context
+            .tasks
+            .register("accepted".into(), accepted.clone())
+            .unwrap();
+        context.request.id = "other".into();
+        context.handle = owner.clone();
+        world_action(&mut app, cleanup_owner(&context))
+            .await
+            .unwrap();
+        assert!(app
+            .world()
+            .get_component::<Tools>(context.request.agent)
+            .unwrap()
+            .get("owned")
+            .is_none());
+        assert!(owner.cancel_token().is_cancelled());
+        assert!(caller.cancel_token().is_cancelled());
+        assert!(!accepted.cancel_token().is_cancelled());
+        assert!(!accepted.has_returned());
+    }
+
+    #[tokio::test]
+    async fn invalid_owner_or_alias_collision_rejects_the_whole_batch() {
+        let (mut app, _sender, context) = injection_fixture();
+        world_action(
+            &mut app,
+            inject_tools(&context, vec![definition("existing", None)]),
+        )
+        .await
+        .unwrap();
+        let original = app
+            .world()
+            .get_component::<Tools>(context.request.agent)
+            .unwrap()
+            .clone();
+        for (bad, kind) in [
+            (
+                definition("missing", Some("missing-owner")),
+                Kind::TaskMissing,
+            ),
+            (
+                definition("existing", Some("caller")),
+                Kind::InvalidDefinition,
+            ),
+        ] {
+            let failure = world_action(
+                &mut app,
+                inject_tools(&context, vec![definition("new", None), bad]),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failure.kind, kind);
+            assert_eq!(
+                app.world()
+                    .get_component::<Tools>(context.request.agent)
+                    .unwrap(),
+                &original
+            );
+        }
+        let (reply, _) = oneshot::channel();
+        let (cancelled_owner, _) =
+            ToolTaskHandle::new(&context.limits, "cancelled".into(), "owner".into(), reply)
+                .unwrap();
+        context
+            .tasks
+            .register("cancelled".into(), cancelled_owner.clone())
+            .unwrap();
+        cancelled_owner.cancel();
+        let failure = world_action(
+            &mut app,
+            inject_tools(
+                &context,
+                vec![
+                    definition("new", None),
+                    definition("cancelled-owned", Some("cancelled")),
+                ],
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.kind, Kind::InvalidRequest);
+        assert_eq!(
+            app.world()
+                .get_component::<Tools>(context.request.agent)
+                .unwrap(),
+            &original
+        );
+        context.handle.cancel();
+        let failure = world_action(
+            &mut app,
+            inject_tools(&context, vec![definition("new", None)]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.kind, Kind::Cancelled);
+        assert_eq!(
+            app.world()
+                .get_component::<Tools>(context.request.agent)
+                .unwrap(),
+            &original
+        );
+    }
 
     #[test]
     fn app_drop_releases_queued_tool_launch_and_its_reply() {
@@ -2090,16 +2211,21 @@ mod world_sender_tests {
     }
 
     #[test]
-    fn program_reads_only_main_lua_beside_the_manifest_with_a_byte_limit() {
+    fn program_reads_main_lua_beside_the_manifest_without_a_byte_limit() {
         let root = tempfile::tempdir().unwrap();
         let manifest = root.path().join("tool.toml");
         // Neither a manifest nor a registration schema is needed at execution time.
-        std::fs::write(root.path().join("main.lua"), "return 1").unwrap();
+        let program = format!("-- {}\nreturn 1", "x".repeat(1024 * 1024));
+        std::fs::write(root.path().join("main.lua"), &program).unwrap();
         assert_eq!(resource_dir(&manifest).unwrap(), root.path());
-        assert_eq!(read_program(&manifest, 8).unwrap(), "return 1");
+        assert_eq!(read_program(&manifest).unwrap(), program);
+        std::fs::write(root.path().join("main.lua"), [0xff]).unwrap();
+        assert_eq!(read_program(&manifest).unwrap_err().kind, Kind::ReadFailed);
         assert_eq!(
-            read_program(&manifest, 7).unwrap_err().kind,
-            Kind::OutputTooLarge
+            read_program(&root.path().join("missing/tool.toml"))
+                .unwrap_err()
+                .kind,
+            Kind::ReadFailed
         );
     }
 }

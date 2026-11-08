@@ -19,11 +19,11 @@ use tool_core::{
     ToolExecuteResponse, ToolExecutionLimits, ToolTasks,
 };
 use tool_plugin::ToolPlugin;
-use tool_resource_core::{read_tool, ToolEntry, ToolReadLimits, Tools};
+use tool_resource_core::{read_tool, ToolEntry, Tools};
 use workspace_core::{Workspace, WorkspaceState};
 
 fn imported_entry(path: &std::path::Path) -> ToolEntry {
-    let tool = read_tool(path, &ToolReadLimits::default()).unwrap();
+    let tool = read_tool(path).unwrap();
     ToolEntry {
         path: tool.origin,
         description: tool.description,
@@ -380,7 +380,7 @@ frame({'type': 'stopped', 'result': {'Ok': None}, 'cleanup_proven': True})
 #[test]
 fn short_return_then_self_finish_stops_even_caught_finish_control() {
     let mut fixture = Fixture::new();
-    fixture.tool("short", "function execute(args, context) task_return('hello'); pcall(function() task_finish(context.task_id) end); process_open({program='/bin/sh',arguments={'-c','touch unreachable-after-finish'}}):wait(); task_write('unreachable') end");
+    fixture.tool("short", "function execute(args, context) margatroid:task_return('hello'); pcall(function() margatroid:task_finish(margatroid.context.task_id) end); margatroid:process_open({program='/bin/sh',arguments={'-c','touch unreachable-after-finish'}}):wait(); margatroid:task_write('unreachable') end");
     let reply = fixture.execute("short-task", "short", json!({}));
     let response = fixture.response(reply).unwrap();
     assert_eq!(response.content, "hello");
@@ -400,11 +400,11 @@ fn return_keeps_vm_alive_across_turn_changes_and_supports_json_cache_replacement
     fixture.tool(
         "background",
         r#"function execute(args, context)
-        task_return({task_id=context.task_id})
+        margatroid:task_return({task_id=margatroid.context.task_id})
         while true do
-            local input = task_receive()
-            if input.finish then task_finish(context.task_id) end
-            if input.replace then task_replace(input.value) else task_write(input) end
+            local input = margatroid:task_receive()
+            if input.finish then margatroid:task_finish(margatroid.context.task_id) end
+            if input.replace then margatroid:task_replace(input.value) else margatroid:task_write(input) end
         end
     end"#,
     );
@@ -462,10 +462,10 @@ fn return_keeps_vm_alive_across_turn_changes_and_supports_json_cache_replacement
 #[test]
 fn finish_other_task_waits_for_real_cleanup_and_removes_both_entries() {
     let mut fixture = Fixture::new();
-    fixture.tool("background", "function execute(args, context) task_return('started'); task_receive(); task_write('unexpected') end");
+    fixture.tool("background", "function execute(args, context) margatroid:task_return('started'); margatroid:task_receive(); margatroid:task_write('unexpected') end");
     let reply = fixture.execute("target", "background", json!({}));
     fixture.response(reply).unwrap();
-    fixture.tool("closer", "function execute(args, context) task_finish(args.target); task_return('closed'); task_finish(context.task_id) end");
+    fixture.tool("closer", "function execute(args, context) margatroid:task_finish(margatroid.arguments.target); margatroid:task_return('closed'); margatroid:task_finish(margatroid.context.task_id) end");
     let reply = fixture.execute("closer", "closer", json!({"target":"target"}));
     assert_eq!(fixture.response(reply).unwrap().content, "closed");
     fixture.removed("target");
@@ -479,11 +479,11 @@ fn lua_can_send_receive_and_read_another_same_agent_task() {
     fixture.tool(
         "echo",
         r#"function execute(args, context)
-        task_return('ready')
-        local input=task_receive()
-        task_write(input.value)
-        task_send(input.reply_to, {ready=true})
-        task_receive()
+        margatroid:task_return('ready')
+        local input=margatroid:task_receive()
+        margatroid:task_write(input.value)
+        margatroid:task_send(input.reply_to, {ready=true})
+        margatroid:task_receive()
     end"#,
     );
     let reply = fixture.execute("echo-task", "echo", json!({}));
@@ -491,12 +491,12 @@ fn lua_can_send_receive_and_read_another_same_agent_task() {
     fixture.tool(
         "reader",
         r#"function execute(args, context)
-        task_send(args.target, {value={1,true,json.null}, reply_to=context.task_id})
-        task_receive()
-        local result=task_read(args.target)
-        task_finish(args.target)
-        task_return(result)
-        task_finish(context.task_id)
+        margatroid:task_send(margatroid.arguments.target, {value={1,true,margatroid.null}, reply_to=margatroid.context.task_id})
+        margatroid:task_receive()
+        local result=margatroid:task_read(margatroid.arguments.target)
+        margatroid:task_finish(margatroid.arguments.target)
+        margatroid:task_return(result)
+        margatroid:task_finish(margatroid.context.task_id)
     end"#,
     );
     let reply = fixture.execute("reader-task", "reader", json!({"target":"echo-task"}));
@@ -520,7 +520,7 @@ fn natural_exit_without_return_reports_missing_return_and_late_errors_are_remove
     fixture.removed("missing");
     fixture.tool(
         "late",
-        "function execute() task_return('once'); local ok, err=pcall(function() task_return('twice') end); task_write({ok=ok,error=tostring(err)}); task_receive() end",
+        "function execute() margatroid:task_return('once'); local ok, err=pcall(function() margatroid:task_return('twice') end); margatroid:task_write({ok=ok,error=tostring(err)}); margatroid:task_receive() end",
     );
     let reply = fixture.execute("late", "late", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "once");
@@ -538,14 +538,14 @@ fn recorded_schema_is_authoritative_while_program_is_read_for_each_execution() {
     let mut fixture = Fixture::new();
     fixture.tool(
         "fresh",
-        "function execute(args,context) task_return('first'); task_finish(context.task_id) end",
+        "function execute(args,context) margatroid:task_return('first'); margatroid:task_finish(margatroid.context.task_id) end",
     );
     let reply = fixture.execute("first", "fresh", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "first");
     fixture.removed("first");
     std::fs::write(
         fixture.root.path().join("fresh/main.lua"),
-        "function configure() return {timeout_ms=30000} end function execute(args,context) task_return('changed'); task_finish(context.task_id) end",
+        "function configure() return {timeout_ms=30000} end function execute(args,context) margatroid:task_return('changed'); margatroid:task_finish(margatroid.context.task_id) end",
     ).unwrap();
     let reply = fixture.execute("second", "fresh", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "changed");
@@ -572,11 +572,11 @@ fn recorded_schema_is_authoritative_while_program_is_read_for_each_execution() {
 #[test]
 fn independent_supervisor_reaps_setsid_descendants_after_return_and_finish() {
     let mut fixture = Fixture::new();
-    fixture.tool("escape", r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+    fixture.tool("escape", r#"function execute(args, context) local client=dofile(margatroid.context.resource_dir..'/shell.lua')(margatroid.context);
         client.exec("setsid /bin/sh -c 'echo $$ > escaped.pid; exec sleep 15' </dev/null >/dev/null 2>&1 &")
         client.exec("while [ ! -s escaped.pid ]; do sleep 0.01; done")
-        task_return('spawned')
-        task_finish(context.task_id)
+        margatroid:task_return('spawned')
+        margatroid:task_finish(margatroid.context.task_id)
     end"#);
     let reply = fixture.execute("escape", "escape", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "spawned");
@@ -597,7 +597,7 @@ fn init_preserves_existing_tasks_and_closed_agent_rejects_new_calls() {
     let mut fixture = Fixture::new();
     fixture.tool(
         "background",
-        "function execute() task_return('started'); task_receive() end",
+        "function execute() margatroid:task_return('started'); margatroid:task_receive() end",
     );
     let reply = fixture.execute("background", "background", json!({}));
     fixture.response(reply).unwrap();
@@ -638,7 +638,7 @@ fn init_preserves_existing_tasks_and_closed_agent_rejects_new_calls() {
 #[test]
 fn reply_receiver_drop_does_not_cancel_a_registered_task() {
     let mut fixture = Fixture::new();
-    fixture.tool("detached", "function execute(args,context) task_return('ignored'); task_write('alive'); task_receive(); task_finish(context.task_id) end");
+    fixture.tool("detached", "function execute(args,context) margatroid:task_return('ignored'); margatroid:task_write('alive'); margatroid:task_receive(); margatroid:task_finish(margatroid.context.task_id) end");
     let reply = fixture.execute("detached", "detached", json!({}));
     drop(reply);
     assert_eq!(fixture.output("detached").output, vec![json!("alive")]);
@@ -652,53 +652,83 @@ fn reply_receiver_drop_does_not_cancel_a_registered_task() {
 }
 
 #[test]
-fn cache_text_and_instruction_budgets_fail_explicitly() {
+fn small_task_cache_rolls_over_without_rejecting_the_result() {
     let mut fixture = Fixture::with_limits(ToolExecutionLimits {
         cache_bytes: 8,
-        output_bytes: 8,
-        instruction_budget: 10000,
         ..Default::default()
     });
-    fixture.configuration = ToolConfiguration { timeout_ms: 3_000 };
     fixture.tool(
         "cache",
-        "function execute() task_write('value-larger-than-cache'); task_return('unexpected') end",
+        r#"function execute()
+        margatroid:task_write('old')
+        margatroid:task_write('discard你好世界')
+        margatroid:task_return('text-larger-than-cache')
+        margatroid:task_receive()
+    end"#,
     );
     let reply = fixture.execute("cache", "cache", json!({}));
     assert_eq!(
-        fixture.response(reply).unwrap_err().kind,
-        Kind::OutputTooLarge
+        fixture.response(reply).unwrap().content,
+        "text-larger-than-cache"
     );
+    let read = fixture.tasks().read("cache").unwrap();
+    assert!(read.error.is_none());
+    let text = read.output[0].as_str().unwrap();
+    assert!("discard你好世界".ends_with(text));
+    assert!(text.ends_with('界'));
+    assert!(!text.contains("old"));
+    fixture.tasks().cancel("cache").unwrap();
     fixture.removed("cache");
-    fixture.tool(
-        "text",
-        "function execute() task_return('text-larger-than-budget') end",
-    );
-    let reply = fixture.execute("text", "text", json!({}));
-    assert_eq!(
-        fixture.response(reply).unwrap_err().kind,
-        Kind::OutputTooLarge
-    );
-    fixture.removed("text");
-    fixture.tool("instructions", "function execute() while true do end end");
-    let reply = fixture.execute("instructions", "instructions", json!({}));
+}
+
+#[test]
+fn lua_vm_allocation_still_obeys_the_memory_budget() {
+    let mut fixture = Fixture::with_limits(ToolExecutionLimits {
+        memory_bytes: 2 * 1024 * 1024,
+        ..Default::default()
+    });
+    fixture.tool("memory", "function execute() local values={} for i=1,10000 do values[i]=string.rep(tostring(i),4096) end margatroid:task_return('unexpected') end");
+    let reply = fixture.execute("memory", "memory", json!({}));
     assert_eq!(
         fixture.response(reply).unwrap_err().kind,
         Kind::ExecutionFailed
     );
-    fixture.removed("instructions");
+    fixture.removed("memory");
+}
+
+#[test]
+fn infinite_execution_stops_at_the_explicit_task_timeout() {
+    let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms: 100 });
+    fixture.tool("loop", "function execute() while true do end end");
+    let reply = fixture.execute("loop", "loop", json!({}));
+    assert_eq!(fixture.response(reply).unwrap_err().kind, Kind::Timeout);
+    fixture.removed("loop");
+}
+
+#[test]
+fn unlimited_infinite_execution_is_explicitly_cancellable() {
+    let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms: 0 });
+    fixture.tool(
+        "loop",
+        "function execute() margatroid:task_write('running'); while true do end end",
+    );
+    let reply = fixture.execute("loop", "loop", json!({}));
+    assert_eq!(fixture.output("loop").output, [json!("running")]);
+    fixture.tasks().cancel("loop").unwrap();
+    assert_eq!(fixture.response(reply).unwrap_err().kind, Kind::Cancelled);
+    fixture.removed("loop");
 }
 
 #[test]
 fn result_images_are_validated_by_the_core_across_the_runner_protocol() {
     let mut fixture = Fixture::new();
-    fixture.tool("image", "function execute(args, context) task_return({ok=true,content='image',images={{media_type='image/png',data='iVBORw0KGgo='}}}); task_finish(context.task_id) end");
+    fixture.tool("image", "function execute(args, context) margatroid:task_return({ok=true,content='image',images={{media_type='image/png',data='iVBORw0KGgo='}}}); margatroid:task_finish(margatroid.context.task_id) end");
     let reply = fixture.execute("image", "image", json!({}));
     let result = fixture.response(reply).unwrap();
     assert_eq!(result.images.len(), 1);
     assert_eq!(result.images[0].media_type, "image/png");
     fixture.removed("image");
-    fixture.tool("invalid-image", "function execute() task_return({ok=true,content='image',images={{media_type='image/png',data='eA=='}}}) end");
+    fixture.tool("invalid-image", "function execute() margatroid:task_return({ok=true,content='image',images={{media_type='image/png',data='eA=='}}}) end");
     let reply = fixture.execute("invalid-image", "invalid-image", json!({}));
     assert_eq!(
         fixture.response(reply).unwrap_err().kind,
@@ -732,7 +762,7 @@ fn bundled_bash_exec_sleep_eleven_seconds_succeeds_with_author_configured_budget
 fn shell_obeys_only_the_task_lifetime_including_unlimited() {
     for timeout_ms in [0, 3_000] {
         let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms });
-        fixture.tool("slow-shell", "function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context); local result=client.exec('sleep 0.25; printf done'); task_return(result.stdout); task_finish(context.task_id) end");
+        fixture.tool("slow-shell", "function execute(args, context) local client=dofile(margatroid.context.resource_dir..'/shell.lua')(margatroid.context); local result=client.exec('sleep 0.25; printf done'); margatroid:task_return(result.stdout); margatroid:task_finish(margatroid.context.task_id) end");
         let reply = fixture.execute("slow-shell", "slow-shell", json!({}));
         assert_eq!(fixture.response(reply).unwrap().content, "done");
         fixture.removed("slow-shell");
@@ -744,9 +774,9 @@ fn task_lifetime_reports_timeout_after_real_descendant_cleanup() {
     let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms: 250 });
     fixture.tool(
         "shell-timeout",
-        r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+        r#"function execute(args, context) local client=dofile(margatroid.context.resource_dir..'/shell.lua')(margatroid.context);
         client.exec("echo $$ > shell.pid; sleep 15 & echo $! > child.pid; wait")
-        task_return('unexpected success')
+        margatroid:task_return('unexpected success')
     end"#,
     );
     let reply = fixture.execute("shell-timeout", "shell-timeout", json!({}));
@@ -773,9 +803,9 @@ fn total_execution_deadline_still_bounds_shell_work() {
     let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms: 500 });
     fixture.tool(
         "total-timeout",
-        r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+        r#"function execute(args, context) local client=dofile(margatroid.context.resource_dir..'/shell.lua')(margatroid.context);
         client.exec("echo $$ > total-shell.pid; exec sleep 15")
-        task_return('unexpected success')
+        margatroid:task_return('unexpected success')
     end"#,
     );
     let reply = fixture.execute("total-timeout", "total-timeout", json!({}));
@@ -804,7 +834,7 @@ fn tool_local_shell_timeouts_are_rejected_before_spawning_a_child() {
         fixture.tool(
             &id,
             &format!(
-                "function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context); client.exec('touch unexpected-child', {{timeout_ms={timeout}}}) end"
+                "function execute(args, context) local client=dofile(margatroid.context.resource_dir..'/shell.lua')(margatroid.context); client.exec('touch unexpected-child', {{timeout_ms={timeout}}}) end"
             ),
         );
         let reply = fixture.execute(&id, &id, json!({}));
@@ -824,7 +854,7 @@ fn execution_timeout_still_reaps_a_background_vm_after_return() {
     let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms: 200 });
     fixture.tool(
         "timeout",
-        "function execute() task_return('started'); task_receive() end",
+        "function execute() margatroid:task_return('started'); margatroid:task_receive() end",
     );
     let reply = fixture.execute("timeout", "timeout", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "started");
@@ -834,7 +864,7 @@ fn execution_timeout_still_reaps_a_background_vm_after_return() {
 #[test]
 fn selected_sandbox_is_read_fresh_and_invalid_policy_never_starts_tool() {
     let mut fixture = Fixture::new();
-    fixture.tool("safe", "function execute(args,context) task_write('must-not-run'); task_return('unsafe'); task_finish(context.task_id) end");
+    fixture.tool("safe", "function execute(args,context) margatroid:task_write('must-not-run'); margatroid:task_return('unsafe'); margatroid:task_finish(margatroid.context.task_id) end");
     let policy = fixture.root.path().join("policy.json");
     std::fs::write(&policy, "[]").unwrap();
     let mut sandboxes = sandbox_resource_core::Sandboxes::default();
@@ -857,7 +887,7 @@ fn selected_sandbox_is_read_fresh_and_invalid_policy_never_starts_tool() {
 #[test]
 fn duplicate_task_id_does_not_replace_the_existing_shared_handle() {
     let mut fixture = Fixture::new();
-    fixture.tool("background", "function execute(args,context) task_return('first'); task_receive(); task_finish(context.task_id) end");
+    fixture.tool("background", "function execute(args,context) margatroid:task_return('first'); margatroid:task_receive(); margatroid:task_finish(margatroid.context.task_id) end");
     let reply = fixture.execute("same", "background", json!({}));
     fixture.response(reply).unwrap();
     let reply = fixture.execute("same", "background", json!({}));
@@ -1010,31 +1040,26 @@ fn terminal_alternate_screen_updates_replace_cache_without_escape_sequences() {
 }
 
 #[test]
-fn a_full_task_mailbox_does_not_block_the_original_call_reply() {
+fn pending_task_mailbox_preserves_all_values_without_blocking_the_original_reply() {
     let mut fixture = Fixture::new();
     fixture.tool(
         "mailbox",
-        r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+        r#"function execute(args, context) local client=dofile(margatroid.context.resource_dir..'/shell.lua')(margatroid.context);
         client.exec("sleep 0.1")
-        task_return({ ready = true })
+        margatroid:task_return({ ready = true })
         while true do
-            local value = task_receive()
+            local value = margatroid:task_receive()
             if value == "stop" then break end
-            task_write(value)
+            margatroid:task_write(value)
         end
-        task_finish(context.task_id)
+        margatroid:task_finish(margatroid.context.task_id)
     end"#,
     );
     let reply = fixture.execute("mailbox", "mailbox", json!({}));
-    let mut accepted = 0;
-    let attempts = ToolExecutionLimits::default().input_capacity * 2;
-    for index in 0..attempts {
-        match fixture.tasks().send("mailbox", json!(index)) {
-            Ok(()) => accepted += 1,
-            Err(error) => assert_eq!(error.kind, Kind::InputFull),
-        }
+    let accepted = 256;
+    for index in 0..accepted {
+        fixture.tasks().send("mailbox", json!(index)).unwrap();
     }
-    assert!(accepted > 0 && accepted < attempts);
     assert_eq!(fixture.response(reply).unwrap().content, "{\"ready\":true}");
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut received = 0;
@@ -1044,14 +1069,7 @@ fn a_full_task_mailbox_does_not_block_the_original_call_reply() {
         std::thread::sleep(Duration::from_millis(2));
     }
     assert_eq!(received, accepted);
-    loop {
-        match fixture.tasks().send("mailbox", json!("stop")) {
-            Ok(()) => break,
-            Err(error) => assert_eq!(error.kind, Kind::InputFull),
-        }
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    fixture.tasks().send("mailbox", json!("stop")).unwrap();
     fixture.removed("mailbox");
 }
 
@@ -1079,7 +1097,7 @@ fn bash_exit_finishes_task_even_if_a_background_process_keeps_the_pty_open() {
 #[test]
 fn unlimited_task_waits_for_input_and_other_task_finish_proves_cleanup() {
     let mut fixture = Fixture::with_configuration(ToolConfiguration { timeout_ms: 0 });
-    fixture.tool("waiting", "function execute(arguments, context) task_return(context.task_id); local value=task_receive(); task_write(value); task_receive() end");
+    fixture.tool("waiting", "function execute(arguments, context) margatroid:task_return(margatroid.context.task_id); local value=margatroid:task_receive(); margatroid:task_write(value); margatroid:task_receive() end");
     let reply = fixture.execute("waiting", "waiting", json!({}));
     fixture.response(reply).unwrap();
     std::thread::sleep(Duration::from_millis(300));
@@ -1098,7 +1116,7 @@ fn unlimited_task_waits_for_input_and_other_task_finish_proves_cleanup() {
     );
     fixture.tool(
         "closer-unlimited",
-        "function execute() task_finish('waiting'); task_return('closed') end",
+        "function execute() margatroid:task_finish('waiting'); margatroid:task_return('closed') end",
     );
     let reply = fixture.execute("closer-unlimited", "closer-unlimited", json!({}));
     assert_eq!(fixture.response(reply).unwrap().content, "closed");
@@ -1216,7 +1234,7 @@ fn runner_does_not_inherit_daemon_controlling_terminal() {
             let mut fixture = Fixture::new();
             fixture.tool(
                 "raw-mode",
-                r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+                r#"function execute(args, context) local client=dofile(margatroid.context.resource_dir..'/shell.lua')(margatroid.context);
                 local result = client.exec([=[python3 - <<'PY'
 import errno, os, signal, termios
 signal.signal(signal.SIGTTOU, signal.SIG_DFL)
@@ -1231,8 +1249,8 @@ else:
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
     raise AssertionError('runner inherited daemon controlling terminal')
 PY]=])
-                task_return(result)
-                task_finish(context.task_id)
+                margatroid:task_return(result)
+                margatroid:task_finish(margatroid.context.task_id)
             end"#,
             );
             let reply = fixture.execute("raw-mode", "raw-mode", json!({}));
@@ -1256,7 +1274,7 @@ fn cancelling_stopped_runner_group_under_controlling_terminal_reaps_children() {
             let mut fixture = Fixture::new();
             fixture.tool(
                 "stopped",
-                r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+                r#"function execute(args, context) local client=dofile(margatroid.context.resource_dir..'/shell.lua')(margatroid.context);
                 local result = client.exec([=[python3 - <<'PY'
 import json, os
 worker = os.getpid()
@@ -1270,9 +1288,9 @@ while True:
     assert worker > 1, 'supervised worker missing from process ancestry'
 print(json.dumps(dict(group=os.getpgid(worker), worker=worker)))
 PY]=])
-                task_return(result.stdout)
-                task_receive()
-                task_finish(context.task_id)
+                margatroid:task_return(result.stdout)
+                margatroid:task_receive()
+                margatroid:task_finish(margatroid.context.task_id)
             end"#,
             );
             let reply = fixture.execute("stopped", "stopped", json!({}));
@@ -1354,15 +1372,15 @@ fn accepted_batch_abort_returns_long_call_immediately_and_preserves_returned_bac
     fixture.tool(
         "echo-abort",
         r#"function execute(args, context)
-        task_return('background-ready')
-        while true do task_write(task_receive()) end
+        margatroid:task_return('background-ready')
+        while true do margatroid:task_write(margatroid:task_receive()) end
     end"#,
     );
     fixture.tool(
         "long-abort",
-        r#"function execute(args, context) local client=dofile(context.resource_dir..'/shell.lua')(context);
+        r#"function execute(args, context) local client=dofile(margatroid.context.resource_dir..'/shell.lua')(margatroid.context);
         client.exec("sleep 60 & echo $! > abort-child.pid; wait")
-        task_return('unexpected natural result')
+        margatroid:task_return('unexpected natural result')
     end"#,
     );
     // Emit the entire batch before any system gets to accept either request.
@@ -1437,46 +1455,46 @@ fn accepted_batch_abort_returns_long_call_immediately_and_preserves_returned_bac
 
 const DYNAMIC_PROGRAM: &str = r#"
 function configure(args, context)
-    if context.owner_task_id ~= nil then
-        assert(context.owner_task_id == 'owner')
-        assert(context.binding.operation == context.alias)
+    if margatroid.context.owner_task_id ~= nil then
+        assert(margatroid.context.owner_task_id == 'owner')
+        assert(margatroid.context.binding.operation == margatroid.context.alias)
     end
     return {timeout_ms=0}
 end
 function execute(args, context)
-    if context.owner_task_id == nil then
-        tool_inject({
-            {alias='dynamic_text', description='text operation', input_schema={type='object',required={'text'},properties={text={type='string'}}},binding={operation='dynamic_text'}},
-            {alias='dynamic_number', description='number operation', input_schema={type='object',required={'number'},properties={number={type='integer'}}},binding={operation='dynamic_number'}}
+    if margatroid.context.owner_task_id == nil then
+        margatroid:tool_inject({
+            {owner_task_id=margatroid.context.task_id, alias='dynamic_text', description='text operation', input_schema={type='object',required={'text'},properties={text={type='string'}}},binding={operation='dynamic_text'}},
+            {owner_task_id=margatroid.context.task_id, alias='dynamic_number', description='number operation', input_schema={type='object',required={'number'},properties={number={type='integer'}}},binding={operation='dynamic_number'}}
         })
-        task_return(context.task_id)
+        margatroid:task_return(margatroid.context.task_id)
         local pending={}
         while true do
-            local request=task_receive()
-            task_write({request_id=request.request_id,alias=request.alias})
+            local request=margatroid:task_receive()
+            margatroid:task_write({request_id=request.request_id,alias=request.alias})
             if not request.hold then
                 pending[#pending+1]=request
                 if #pending == 2 then
                     for i=2,1,-1 do
                         local item=pending[i]
-                        task_send(item.reply_to,{request_id=item.request_id,value=item.value,alias=item.alias,resource_dir=context.resource_dir})
-                        task_write({responded=item.request_id})
+                        margatroid:task_send(item.reply_to,{request_id=item.request_id,value=item.value,alias=item.alias,resource_dir=margatroid.context.resource_dir})
+                        margatroid:task_write({responded=item.request_id})
                     end
                     pending={}
                 end
             end
         end
     else
-        if args.returned then
-            task_return({alive=context.task_id})
-            while true do task_write(task_receive()) end
+        if margatroid.arguments.returned then
+            margatroid:task_return({alive=margatroid.context.task_id})
+            while true do margatroid:task_write(margatroid:task_receive()) end
         end
-        task_send(context.owner_task_id,{reply_to=context.task_id,request_id=context.call_id,value=args.text or args.number,alias=context.alias,hold=args.hold})
-        local response=task_receive()
-        assert(response.request_id == context.call_id)
-        assert(response.resource_dir == context.resource_dir)
-        task_return(response)
-        task_finish(context.task_id)
+        margatroid:task_send(margatroid.context.owner_task_id,{reply_to=margatroid.context.task_id,request_id=margatroid.context.call_id,value=margatroid.arguments.text or margatroid.arguments.number,alias=margatroid.context.alias,hold=margatroid.arguments.hold})
+        local response=margatroid:task_receive()
+        assert(response.request_id == margatroid.context.call_id)
+        assert(response.resource_dir == margatroid.context.resource_dir)
+        margatroid:task_return(response)
+        margatroid:task_finish(margatroid.context.task_id)
     end
 end
 "#;
@@ -1541,10 +1559,10 @@ fn dynamic_aliases_use_distinct_recorded_schemas_and_reverse_concurrent_response
 }
 
 #[test]
-fn owner_finish_fails_unreturned_dependents_and_preserves_returned_tasks_and_other_entries() {
+fn owner_finish_removes_aliases_without_cancelling_pending_or_returned_tasks() {
     let mut f = Fixture::new();
     f.tool("factory", DYNAMIC_PROGRAM);
-    f.tool("other_factory", "function execute(args,context) tool_inject({{alias='other_dynamic',description='other',input_schema={type='object'}}}); task_return('ready'); task_receive() end");
+    f.tool("other_factory", "function execute(args,context) margatroid:tool_inject({{owner_task_id=margatroid.context.task_id,alias='other_dynamic',description='other',input_schema={type='object'}}}); margatroid:task_return('ready'); margatroid:task_receive() end");
     let other = f.execute("other-owner", "other_factory", json!({}));
     f.response(other).unwrap();
     let owner = f.execute("owner", "factory", json!({}));
@@ -1555,7 +1573,7 @@ fn owner_finish_fails_unreturned_dependents_and_preserves_returned_tasks_and_oth
         json!({"text":"kept","returned":true}),
     );
     f.response(returned).unwrap();
-    let waiting = f.execute(
+    let mut waiting = f.execute(
         "waiting-dependent",
         "dynamic_number",
         json!({"number":5,"hold":true}),
@@ -1563,9 +1581,11 @@ fn owner_finish_fails_unreturned_dependents_and_preserves_returned_tasks_and_oth
     let received = f.output("owner");
     assert_eq!(received.output[0]["request_id"], "call-waiting-dependent");
     finish_task(&mut f, "owner");
-    let error = f.response(waiting).unwrap_err();
-    assert_eq!(error.kind, Kind::OwnerGone);
-    f.removed("waiting-dependent");
+    assert!(f.tasks().get("waiting-dependent").is_ok());
+    assert!(matches!(
+        waiting.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
     let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
     assert!(tools.get("dynamic_text").is_none());
     assert!(tools.get("dynamic_number").is_none());
@@ -1578,8 +1598,103 @@ fn owner_finish_fails_unreturned_dependents_and_preserves_returned_tasks_and_oth
         f.output("returned-dependent").output,
         vec![json!({"after_owner":true})]
     );
+    f.tasks().cancel("waiting-dependent").unwrap();
+    assert_eq!(f.response(waiting).unwrap_err().kind, Kind::Cancelled);
+    f.removed("waiting-dependent");
     finish_task(&mut f, "returned-dependent");
     finish_task(&mut f, "other-owner");
+    assert!(f.tasks().list().is_empty());
+}
+
+#[test]
+fn explicit_noncaller_owner_and_static_aliases_have_independent_lifetimes() {
+    let mut f = Fixture::new();
+    f.tool(
+        "factory",
+        r#"function configure() return {timeout_ms=0} end
+        function execute(args,context)
+            if margatroid.context.binding ~= nil then
+                assert(margatroid.context.owner_task_id == nil)
+                margatroid:task_return('static survived')
+                margatroid:task_finish(margatroid.context.task_id)
+            elseif margatroid.arguments.owner ~= nil then
+                margatroid:tool_inject({
+                    {alias='bound_alias',description='bound',input_schema={type='object'},owner_task_id=margatroid.arguments.owner},
+                    {alias='static_alias',description='static',input_schema={type='object'},binding={static=true}}
+                })
+                margatroid:task_return('injected')
+                margatroid:task_finish(margatroid.context.task_id)
+            else
+                margatroid:task_return('owner ready')
+                margatroid:task_receive()
+            end
+        end"#,
+    );
+    let owner = f.execute("A", "factory", json!({}));
+    assert_eq!(f.response(owner).unwrap().content, "owner ready");
+    let caller = f.execute("C", "factory", json!({"owner":"A"}));
+    assert_eq!(f.response(caller).unwrap().content, "injected");
+    f.removed("C");
+    assert!(f.tasks().get("A").is_ok());
+    let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
+    assert_eq!(
+        tools.get("bound_alias").unwrap().owner_task_id.as_deref(),
+        Some("A")
+    );
+    assert_eq!(tools.get("static_alias").unwrap().owner_task_id, None);
+
+    finish_task(&mut f, "A");
+    let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
+    assert!(tools.get("bound_alias").is_none());
+    assert!(tools.get("static_alias").is_some());
+    let static_call = f.execute("static-call", "static_alias", json!({}));
+    assert_eq!(f.response(static_call).unwrap().content, "static survived");
+    f.removed("static-call");
+    assert!(f
+        .app
+        .world()
+        .get_component::<Tools>(f.agent)
+        .unwrap()
+        .get("static_alias")
+        .is_some());
+    assert!(f.tasks().list().is_empty());
+}
+
+#[test]
+fn invalid_explicit_owner_rejects_static_and_bound_entries_as_one_batch() {
+    let mut f = Fixture::new();
+    f.tool(
+        "keepalive",
+        "function execute() margatroid:task_return('ready'); margatroid:task_receive() end",
+    );
+    let owner = f.execute("finished-owner", "keepalive", json!({}));
+    f.response(owner).unwrap();
+    finish_task(&mut f, "finished-owner");
+    f.tool(
+        "factory",
+        r#"function execute(args,context)
+            local ok,err=pcall(function() margatroid:tool_inject({
+                {alias='static_alias',description='static',input_schema={type='object'}},
+                {alias='bound_alias',description='bound',input_schema={type='object'},owner_task_id=margatroid.arguments.owner}
+            }) end)
+            margatroid:task_return({accepted=ok,error=tostring(err)})
+            margatroid:task_finish(margatroid.context.task_id)
+        end"#,
+    );
+    for (index, owner) in ["", "missing-owner", "finished-owner"]
+        .into_iter()
+        .enumerate()
+    {
+        let caller = format!("invalid-injector-{index}");
+        let reply = f.execute(&caller, "factory", json!({"owner":owner}));
+        let result: Value = serde_json::from_str(&f.response(reply).unwrap().content).unwrap();
+        assert_eq!(result["accepted"], false, "owner {owner:?}");
+        f.removed(&caller);
+        let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
+        assert!(tools.get("static_alias").is_none());
+        assert!(tools.get("bound_alias").is_none());
+        assert_eq!(tools.iter().count(), 2);
+    }
     assert!(f.tasks().list().is_empty());
 }
 
@@ -1589,12 +1704,12 @@ fn injection_alias_conflict_rejects_the_whole_batch() {
     f.tool(
         "factory",
         r#"function execute(args,context)
-        local ok,err=pcall(function() tool_inject({
+        local ok,err=pcall(function() margatroid:tool_inject({
             {alias='fresh_alias',description='fresh',input_schema={type='object'}},
             {alias='factory',description='conflict',input_schema={type='object'}}
         }) end)
-        task_return({accepted=ok,error=tostring(err)})
-        task_receive()
+        margatroid:task_return({accepted=ok,error=tostring(err)})
+        margatroid:task_receive()
     end"#,
     );
     let reply = f.execute("conflicting-owner", "factory", json!({}));
@@ -1609,7 +1724,7 @@ fn injection_alias_conflict_rejects_the_whole_batch() {
 #[test]
 fn cancellation_between_injection_dispatch_and_world_commit_leaves_no_aliases() {
     let mut f = Fixture::new();
-    f.tool("factory", "function execute() task_write('inject-dispatching'); tool_inject({{alias='cancelled_alias',description='cancelled',input_schema={type='object'}}}); task_return('unexpected'); task_receive() end");
+    f.tool("factory", "function execute(args,context) margatroid:task_write('inject-dispatching'); margatroid:tool_inject({{owner_task_id=margatroid.context.task_id,alias='cancelled_alias',description='cancelled',input_schema={type='object'}}}); margatroid:task_return('unexpected'); margatroid:task_receive() end");
     let reply = f.execute("cancelled-owner", "factory", json!({}));
     // Observe the worker without ticking World, leaving its injection uncommitted.
     let deadline = Instant::now() + Duration::from_secs(5);

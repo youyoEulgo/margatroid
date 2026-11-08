@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 core_plugin = { path = "../../../mecs/core_plugin" }
+serde = { workspace = true }

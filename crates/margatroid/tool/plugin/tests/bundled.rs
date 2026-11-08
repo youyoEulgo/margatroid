@@ -19,11 +19,11 @@ use tool_core::{
     ToolExecuteResponse, ToolExecutionLimits, ToolTasks,
 };
 use tool_plugin::ToolPlugin;
-use tool_resource_core::{read_tool, ToolEntry, ToolReadLimits, Tools};
+use tool_resource_core::{read_tool, ToolEntry, Tools};
 use workspace_core::{Workspace, WorkspaceState};
 
 fn imported_entry(path: &std::path::Path) -> ToolEntry {
-    let tool = read_tool(path, &ToolReadLimits::default()).unwrap();
+    let tool = read_tool(path).unwrap();
     ToolEntry {
         path: tool.origin,
         description: tool.description,
@@ -443,12 +443,15 @@ fn all_supported_image_formats_return_actual_binary_images_and_reject_bad_inputs
 }
 
 #[test]
-fn guidance_tools_and_actual_resource_schemas_use_explicit_task_completion() {
+fn standard_guidance_skills_and_actual_resource_schemas_are_available() {
     let mut f = Fixture::new();
-    for alias in ["code-review", "project-context"] {
-        let result = f.call(alias, json!({}));
-        assert!(!result.failed, "{}", result.content);
-        assert!(result.content.contains("Guidance"));
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../resources");
+    for name in ["code-review", "project-context"] {
+        let content =
+            std::fs::read_to_string(root.join("skills/local").join(name).join("SKILL.md")).unwrap();
+        assert!(content.starts_with(&format!("---\nname: {name}\n")));
+        assert!(content.contains("Guidance"));
+        assert!(!root.join("tools/local").join(name).exists());
     }
     for alias in [
         "read-file",
@@ -473,14 +476,14 @@ fn task_control_tools_pass_structured_messages_null_and_shared_cache_cursors() {
     f.tool(
         "worker",
         r#"function execute(arguments, context)
-        task_return(context.task_id)
+        margatroid:task_return(margatroid.context.task_id)
         while true do
-            local value = task_receive()
+            local value = margatroid:task_receive()
             if type(value) == 'table' and value.finish then break end
-            if type(value) == 'table' and value.replace then task_replace(value.value)
-            else task_write(value) end
+            if type(value) == 'table' and value.replace then margatroid:task_replace(value.value)
+            else margatroid:task_write(value) end
         end
-        task_finish(context.task_id)
+        margatroid:task_finish(margatroid.context.task_id)
     end"#,
     );
     let reply = f.execute("worker", "worker", json!({}));
@@ -853,7 +856,7 @@ fn failed_tool_replies_omit_lua_traces_but_success_output_is_unchanged() {
     let text = "TaskMissing: example\nstack traceback:\n\t[C]: in function 'task_read'";
     for (alias, ok) in [("reported-failure", false), ("reported-success", true)] {
         let literal = serde_json::to_string(text).unwrap();
-        f.tool(alias, &format!("function execute() task_return({{ok={ok},content={literal}}}); task_finish(context.task_id) end"));
+        f.tool(alias, &format!("function execute() margatroid:task_return({{ok={ok},content={literal}}}); margatroid:task_finish(margatroid.context.task_id) end"));
         let reply = f.execute(alias, alias, json!({}));
         let response = f.response(reply).unwrap();
         assert_eq!(response.call_id, format!("call-{alias}"));

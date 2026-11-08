@@ -179,7 +179,7 @@ execute_tools(context: CommandContext, messages: Vec<Value>) -> Future<Output = 
         中止前未被工具System受理的请求直接回中止结果；
         已经受理且未return的任务由ToolTasks强制return并清理，使本闭包立即获得各调用的中止结果，不再等工具自然return。中止获胜后迟到Return无法再次交付，正常return先获胜的结果保留且后台任务不被杀。
         同一Lua资源不同alias仍各自创建独立任务，MCL不按path或owner将它们串行化；
-        A/B之间的请求路由属于Lua工具内部协议。所有者失效导致的依赖调用错误保留各自call_id，及时返回failed，不堵整批。
+        A/B之间的请求路由及通信失败处理属于Lua工具内部协议；Tools记录删除不取消已进入ToolTasks的调用。
         可识别工具调用错误始终返回对应failed工具消息；
         整批收齐关联后交Driver，Driver显式结束回合。不得通过关闭整条MCL队列或杀Driver来中止。
 ```

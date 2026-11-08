@@ -112,16 +112,16 @@ fn installation_accepts_only_schedules_after_abort_processing() {
 }
 
 #[test]
-fn dynamic_admission_checks_recorded_schema_and_live_owner_before_registering() {
+fn dynamic_admission_checks_schema_without_rechecking_recorded_owner() {
     use std::collections::BTreeSet;
     use tool_core::{ToolErrorKind, ToolExecutionLimits, ToolTaskHandle};
     use tool_resource_core::{ToolEntry, Tools};
     use workspace_core::{Workspace, WorkspaceState};
 
     for (arguments, cancelled_owner, expected) in [
-        (json!({}), false, ToolErrorKind::InvalidArguments),
-        (json!({"value": 1}), false, ToolErrorKind::OwnerGone),
-        (json!({"value": 1}), true, ToolErrorKind::OwnerGone),
+        (json!({}), false, Some(ToolErrorKind::InvalidArguments)),
+        (json!({"value": 1}), false, None),
+        (json!({"value": 1}), true, None),
     ] {
         let root = tempfile::tempdir().unwrap();
         let mut app = App::new();
@@ -191,8 +191,22 @@ fn dynamic_admission_checks_recorded_schema_and_live_owner_before_registering() 
                 reply: Arc::new(Mutex::new(Some(reply))),
             },
         );
-        assert_eq!(result.try_recv().unwrap().unwrap_err().kind, expected);
-        assert!(tasks.get("dependent").is_err());
-        assert_eq!(tasks.list().len(), usize::from(cancelled_owner));
+        if let Some(expected) = expected {
+            assert_eq!(result.try_recv().unwrap().unwrap_err().kind, expected);
+            assert!(tasks.get("dependent").is_err());
+            assert_eq!(tasks.list().len(), usize::from(cancelled_owner));
+        } else {
+            assert!(matches!(
+                result.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(tasks.get("dependent").is_ok());
+            assert_eq!(tasks.list().len(), 1 + usize::from(cancelled_owner));
+            tasks.cancel("dependent").unwrap();
+            let handle = tasks.get("dependent").unwrap();
+            // Admission only queued launch; no worker or child exists yet.
+            assert!(tasks.complete_cleanup("dependent", &handle, None));
+            assert!(tasks.get("dependent").is_err());
+        }
     }
 }

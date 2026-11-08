@@ -242,3 +242,157 @@ fn parse_authority(value: &str) -> Option<(String, Option<u16>)> {
     };
     Some((host, port))
 }
+
+/// Optional tool budgets; omitted values use the tool runtime's defaults at composition.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileToolConfig {
+    #[serde(
+        deserialize_with = "capacity::deserialize_option",
+        serialize_with = "capacity::serialize_option"
+    )]
+    pub total_task_memory_limit: Option<usize>,
+    #[serde(
+        deserialize_with = "capacity::deserialize_option",
+        serialize_with = "capacity::serialize_option"
+    )]
+    pub task_memory_limit: Option<usize>,
+    #[serde(
+        deserialize_with = "capacity::deserialize_option",
+        serialize_with = "capacity::serialize_option"
+    )]
+    pub task_output_buffer_window: Option<usize>,
+}
+
+impl FileToolConfig {
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        for (field, value) in [
+            (
+                "tools.total_task_memory_limit",
+                self.total_task_memory_limit,
+            ),
+            ("tools.task_memory_limit", self.task_memory_limit),
+            (
+                "tools.task_output_buffer_window",
+                self.task_output_buffer_window,
+            ),
+        ] {
+            if value == Some(0) {
+                return Err(crate::ConfigError::InvalidToolLimit {
+                    field,
+                    reason: "must be greater than zero".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+mod capacity {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn deserialize_option<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<String>::deserialize(deserializer)?;
+        value
+            .map(|value| parse(&value).map_err(D::Error::custom))
+            .transpose()
+    }
+
+    pub fn serialize_option<S>(value: &Option<usize>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => serializer.serialize_some(&format(*value)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Result<usize, String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("must be a positive whole number with unit B, K, M, G or T".into());
+        }
+        let split = value
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(value.len());
+        let digits = &value[..split];
+        let unit = &value[split..];
+        if digits.is_empty() || !unit_valid(unit) {
+            return Err("must be a positive whole number with unit B, K, M, G or T".into());
+        }
+        let number: usize = digits
+            .parse()
+            .map_err(|_| "numeric value overflows usize".to_string())?;
+        if number == 0 {
+            return Err("must be greater than zero".into());
+        }
+        let multiplier = match unit.to_ascii_lowercase().as_str() {
+            "" | "b" => 1,
+            "k" | "kb" | "kib" => 1024,
+            "m" | "mb" | "mib" => 1024usize.pow(2),
+            "g" | "gb" | "gib" => 1024usize.pow(3),
+            "t" | "tb" | "tib" => 1024usize.pow(4),
+            _ => unreachable!(),
+        };
+        number
+            .checked_mul(multiplier)
+            .ok_or_else(|| "capacity overflows usize".into())
+    }
+
+    fn unit_valid(unit: &str) -> bool {
+        matches!(
+            unit.to_ascii_lowercase().as_str(),
+            "" | "b"
+                | "k"
+                | "kb"
+                | "kib"
+                | "m"
+                | "mb"
+                | "mib"
+                | "g"
+                | "gb"
+                | "gib"
+                | "t"
+                | "tb"
+                | "tib"
+        )
+    }
+
+    fn format(value: usize) -> String {
+        for (suffix, multiplier) in [
+            ("T", 1024usize.pow(4)),
+            ("G", 1024usize.pow(3)),
+            ("M", 1024usize.pow(2)),
+            ("K", 1024usize),
+        ] {
+            if value >= multiplier && value.is_multiple_of(multiplier) {
+                return format!("{}{}", value / multiplier, suffix);
+            }
+        }
+        format!("{value}B")
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::capacity::parse;
+
+    #[test]
+    fn parses_binary_units_case_insensitively() {
+        assert_eq!(parse("2G"), Ok(2 * 1024usize.pow(3)));
+        assert_eq!(parse("128m"), Ok(128 * 1024usize.pow(2)));
+        assert_eq!(parse("4KiB"), Ok(4096));
+        assert_eq!(parse("17"), Ok(17));
+    }
+
+    #[test]
+    fn rejects_invalid_capacity_values() {
+        for value in ["0", "-1G", "1.5G", "1X", "", " G"] {
+            assert!(parse(value).is_err(), "{value}");
+        }
+    }
+}

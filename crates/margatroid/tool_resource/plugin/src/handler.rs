@@ -42,10 +42,6 @@ pub(crate) fn handle_import(world: &mut World, request: ImportTool) {
         alias: request.alias,
         path: request.path,
         cancel: request.cancel,
-        limits: world
-            .get_resource::<ImportConfig>()
-            .expect("resource import configuration must exist")
-            .limits,
         reply: Arc::new(Mutex::new(Some(reply))),
     };
     let fallback = context.clone();
@@ -126,7 +122,6 @@ pub(crate) fn handle_import_result(world: &mut World, result: Result<ImportOutpu
 async fn validate_import(context: ImportContext) -> Result<ImportOutput, ImportError> {
     let path = context.path.clone();
     let cancel = context.cancel.clone();
-    let limits = context.limits;
     let worker = tokio::task::spawn_blocking(move || {
         if cancel.is_cancelled() {
             return Err(
@@ -152,7 +147,7 @@ async fn validate_import(context: ImportContext) -> Result<ImportOutput, ImportE
             };
             ToolResourceError::new(kind, error.to_string()).with_path(&path)
         })?;
-        let input = read_tool(&canonical, &limits)?;
+        let input = read_tool(&canonical)?;
         Ok((canonical, input.description, input.input_schema))
     });
     let result = match worker.await {

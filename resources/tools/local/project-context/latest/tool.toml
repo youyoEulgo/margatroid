@@ -1,3 +1,0 @@
-schema_version = 1
-name = "project-context"
-description = "Optional project-context reference for tasks that depend on repository structure or local design conventions. Load only when that context is needed; it is unnecessary for general conversation or unrelated work."

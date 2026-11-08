@@ -6,31 +6,23 @@ use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimeHandle;
 use closure_plugin::WorldClosureExt;
 use core_plugin::{App, Plugin};
-use tool_resource_core::ToolReadLimits;
 
 use types::ImportConfig;
 
 #[derive(Clone, Debug)]
 pub struct ToolResourcePlugin {
     schedule: String,
-    limits: ToolReadLimits,
 }
 
 impl ToolResourcePlugin {
     pub fn new() -> Self {
         Self {
             schedule: RuntimePlugin::UPDATE.into(),
-            limits: ToolReadLimits::default(),
         }
     }
 
     pub fn with_schedule(mut self, schedule: impl Into<String>) -> Self {
         self.schedule = schedule.into();
-        self
-    }
-
-    pub fn with_limits(mut self, limits: ToolReadLimits) -> Self {
-        self.limits = limits;
         self
     }
 }
@@ -66,7 +58,6 @@ impl Plugin for ToolResourcePlugin {
         app.world().send_closure(&self.schedule, |_| {});
         app.world_mut().insert_resource(ImportConfig {
             schedule: self.schedule.clone(),
-            limits: self.limits,
         });
         app.add_system(&self.schedule, system::tool_resource_system);
     }

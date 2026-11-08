@@ -15,7 +15,7 @@ local function failure(message)
 end
 
 local function send_reply(task_id, response)
-    local ok, err = pcall(task_send, task_id, response)
+    local ok, err = pcall(function() return margatroid:task_send(task_id, response) end)
     -- Only an already removed B may be forgotten; all other errors are fatal.
     if not ok and not tostring(err):find("TaskMissing:", 1, true) then error(err) end
 end
@@ -25,11 +25,12 @@ local function rpc_error(code, message)
 end
 
 local function object(value)
-    -- json.decode preserves the JSON object/array distinction when re-encoded.
-    return type(value) == "table" and json.encode(value):sub(1, 1) == "{"
+    -- json_decode preserves the JSON object/array distinction when re-encoded.
+    return type(value) == "table" and margatroid:json_encode(value):sub(1, 1) == "{"
 end
 
 local function json_equal(left, right)
+    if left == margatroid.null or right == margatroid.null then return left == right end
     if type(left) ~= type(right) then return false end
     if type(left) ~= "table" then return left == right end
     local count = 0
@@ -47,7 +48,7 @@ end
 
 local function format_result(response)
     if response.error ~= nil then
-        return failure(json.encode(response.error))
+        return failure(margatroid:json_encode(response.error))
     end
     local result = response.result
     if not object(result) or type(result.content) ~= "table" then
@@ -59,7 +60,7 @@ local function format_result(response)
         if item.type == "text" and type(item.text) == "string" then
             local mirrored = false
             if result.structuredContent ~= nil then
-                local decoded, value = pcall(json.decode, item.text)
+                local decoded, value = pcall(function() return margatroid:json_decode(item.text) end)
                 mirrored = decoded and json_equal(value, result.structuredContent)
             end
             if not mirrored then text[#text + 1] = item.text end
@@ -69,11 +70,11 @@ local function format_result(response)
         else
             -- Preserve resource/audio/unknown content, and images on failed calls,
             -- in text: the host rejects images on failed result envelopes.
-            text[#text + 1] = json.encode(item)
+            text[#text + 1] = margatroid:json_encode(item)
         end
     end
     if result.structuredContent ~= nil then
-        text[#text + 1] = json.encode(result.structuredContent)
+        text[#text + 1] = margatroid:json_encode(result.structuredContent)
     end
     local envelope = { ok = result.isError ~= true, content = table.concat(text, "\n") }
     if #images > 0 then envelope.images = images end
@@ -84,21 +85,21 @@ local function call_remote(arguments, context)
     if type(context.binding) ~= "table" or type(context.binding.remote_tool) ~= "string" then
         error("missing remote_tool binding")
     end
-    task_send(context.owner_task_id, {
+    margatroid:task_send(context.owner_task_id, {
         operation = "call", id = context.task_id, reply_to = context.task_id,
         tool = context.binding.remote_tool, arguments = arguments,
     })
     while true do
-        local response = task_receive()
+        local response = margatroid:task_receive()
         if type(response) == "table" and response.id == context.task_id then
-            task_return(format_result(response))
+            margatroid:task_return(format_result(response))
             return
         end
     end
 end
 
 local function register_server(arguments, context, state)
-    local process = process_open({
+    local process = margatroid:process_open({
         program = context.resource_dir .. "/bin/mcp-client", arguments = {},
     })
     state.process = process
@@ -113,16 +114,16 @@ local function register_server(arguments, context, state)
     -- defaults explicitly, so args is [] while env/headers remain {}.
     local server = arguments.server
     if server.transport == "stdio" then
-        register_frame = '{"id":' .. json.encode(register_id)
+        register_frame = '{"id":' .. margatroid:json_encode(register_id)
             .. ',"operation":"register","server":{"transport":"stdio","command":'
-            .. json.encode(server.command) .. ',"args":'
-            .. (server.args and json.encode(server.args) or "[]") .. ',"env":'
-            .. (server.env and json.encode(server.env) or "{}") .. '}}\n'
+            .. margatroid:json_encode(server.command) .. ',"args":'
+            .. (server.args and margatroid:json_encode(server.args) or "[]") .. ',"env":'
+            .. (server.env and margatroid:json_encode(server.env) or "{}") .. '}}\n'
     else
-        register_frame = '{"id":' .. json.encode(register_id)
+        register_frame = '{"id":' .. margatroid:json_encode(register_id)
             .. ',"operation":"register","server":{"transport":"http","url":'
-            .. json.encode(server.url) .. ',"headers":'
-            .. (server.headers and json.encode(server.headers) or "{}") .. '}}\n'
+            .. margatroid:json_encode(server.url) .. ',"headers":'
+            .. (server.headers and margatroid:json_encode(server.headers) or "{}") .. '}}\n'
     end
 
     local function enqueue(frame)
@@ -165,7 +166,7 @@ local function register_server(arguments, context, state)
             pending_count = pending_count - 1
             send_reply(reply_to, response)
         else
-            task_write({ diagnostic = "ignored unknown or duplicate MCP response id", id = response.id })
+            margatroid:task_write({ diagnostic = "ignored unknown or duplicate MCP response id", id = response.id })
         end
     end
 
@@ -180,7 +181,7 @@ local function register_server(arguments, context, state)
             local line = buffer:sub(1, newline - 1)
             buffer = buffer:sub(newline + 1)
             if line == "" then error("empty response frame") end
-            local ok, response = pcall(json.decode, line)
+            local ok, response = pcall(function() return margatroid:json_decode(line) end)
             if not ok then error("invalid JSON response frame: " .. tostring(response)) end
             handle_response(response)
         end
@@ -192,10 +193,10 @@ local function register_server(arguments, context, state)
     end
 
     local function inject_discovery()
-        if discovery.error ~= nil then error(json.encode(discovery.error)) end
+        if discovery.error ~= nil then error(margatroid:json_encode(discovery.error)) end
         local result = discovery.result
         if not object(result) or type(result.tools) ~= "table"
-            or json.encode(result.tools):sub(1, 1) ~= "[" then
+            or margatroid:json_encode(result.tools):sub(1, 1) ~= "[" then
             error("invalid discovery result: expected tools array")
         end
         local prefix = arguments.alias_prefix or "mcp_"
@@ -216,15 +217,16 @@ local function register_server(arguments, context, state)
             end
             definitions[#definitions + 1] = {
                 alias = alias, description = description,
-                input_schema = tool.inputSchema, binding = { remote_tool = tool.name },
+                input_schema = tool.inputSchema, owner_task_id = context.task_id,
+                binding = { remote_tool = tool.name },
             }
         end
         -- The host validates and commits the entire batch to its existing Tools.
-        tool_inject(definitions)
+        margatroid:tool_inject(definitions)
         registered = true
         -- Encode explicitly so an empty aliases list remains [] in the result.
-        task_return('{"task_id":' .. json.encode(context.task_id) .. ',"aliases":'
-            .. (#aliases == 0 and "[]" or json.encode(aliases)) .. '}')
+        margatroid:task_return('{"task_id":' .. margatroid:json_encode(context.task_id) .. ',"aliases":'
+            .. (#aliases == 0 and "[]" or margatroid:json_encode(aliases)) .. '}')
         state.returned = true
     end
 
@@ -235,15 +237,15 @@ local function register_server(arguments, context, state)
         }
         if stderr_open then operations.stderr = function() return process:read_stderr() end end
         if #queue > 0 then operations.write = write_next end
-        if registered then operations.input = function() return task_receive() end end
-        local source, value = await_any(operations)
+        if registered then operations.input = function() return margatroid:task_receive() end end
+        local source, value = margatroid:await_any(operations)
         if source == "stdout" then
             consume_stdout(value)
         elseif source == "stderr" then
             -- Diagnostics are intentionally discarded, but always drained.
             stderr_open = not value.eof
         elseif source == "exited" then
-            error("MCP client exited: " .. json.encode(value))
+            error("MCP client exited: " .. margatroid:json_encode(value))
         elseif source == "input" then
             if type(value) ~= "table" or value.operation ~= "call"
                 or type(value.id) ~= "string" or type(value.reply_to) ~= "string"
@@ -251,7 +253,7 @@ local function register_server(arguments, context, state)
                 error("invalid owner call message")
             end
             if pending[value.id] then error("duplicate pending call id") end
-            local frame = json.encode({ id = value.id, operation = "call",
+            local frame = margatroid:json_encode({ id = value.id, operation = "call",
                 tool = value.tool, arguments = value.arguments }) .. "\n"
             local accepted, reason = false, "in-flight requests exceed budget"
             if pending_count < MAX_PENDING then accepted, reason = enqueue(frame) end
@@ -284,12 +286,12 @@ function execute(arguments, context)
             local sent, send_error = pcall(send_reply, reply_to,
                 { id = id, error = rpc_error("disconnected", err) })
             state.pending[id] = nil
-            if not sent then task_write({ error = tostring(send_error) }) end
+            if not sent then margatroid:task_write({ error = tostring(send_error) }) end
         end
-        if not state.returned then task_return(failure(err))
-        else task_write({ error = "MCP session ended: " .. tostring(err) }) end
+        if not state.returned then margatroid:task_return(failure(err))
+        else margatroid:task_write({ error = "MCP session ended: " .. tostring(err) }) end
     end
     -- Self finish never returns. Keep it outside pcall; host worker cleanup owns
     -- process termination and releases all dynamic aliases and dependent tasks.
-    task_finish(context.task_id)
+    margatroid:task_finish(context.task_id)
 end

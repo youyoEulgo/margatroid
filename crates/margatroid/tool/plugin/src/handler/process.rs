@@ -1,7 +1,6 @@
 //! Raw subprocess pipes owned by one sandboxed Lua worker.
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use mlua::{Lua, UserData, UserDataMethods};
@@ -9,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{watch, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
-use tool_core::{ToolError, ToolErrorKind as Kind, ToolExecutionLimits};
+use tool_core::{ToolError, ToolErrorKind as Kind};
 
 const READ_BYTES: usize = 8192;
 
@@ -77,9 +76,6 @@ struct ProcessInner {
     stderr: AsyncMutex<Option<ChildStderr>>,
     close: CancellationToken,
     status: watch::Receiver<Option<Result<ExitStatus, ToolError>>>,
-    stdout_budget: Arc<Budget>,
-    stderr_budget: Arc<Budget>,
-    write_limit: usize,
 }
 struct WritePipe {
     stdin: Option<ChildStdin>,
@@ -89,27 +85,6 @@ struct PendingWrite {
     bytes: Vec<u8>,
     offset: usize,
 }
-struct Budget {
-    used: AtomicUsize,
-    limit: usize,
-}
-impl Budget {
-    fn new(limit: usize) -> Self {
-        Self {
-            used: AtomicUsize::new(0),
-            limit,
-        }
-    }
-    fn consume(&self, count: usize) -> Result<(), ToolError> {
-        self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(count).filter(|total| *total <= self.limit)
-            })
-            .map(|_| ())
-            .map_err(|_| failure(Kind::OutputTooLarge, "process pipe exceeds byte budget"))
-    }
-}
-
 impl ProcessSession {
     async fn wait(&self) -> Result<ExitStatus, ToolError> {
         let mut status = self.inner.status.clone();
@@ -140,12 +115,6 @@ impl ProcessSession {
     }
 
     async fn write(&self, bytes: &[u8]) -> Result<(), ToolError> {
-        if bytes.len() > self.inner.write_limit {
-            return Err(failure(
-                Kind::OutputTooLarge,
-                "process write exceeds byte budget",
-            ));
-        }
         tokio::select! {
             biased;
             _ = self.inner.close.cancelled() => Err(closed()),
@@ -188,7 +157,6 @@ impl ProcessSession {
 
 async fn read_pipe<R: AsyncRead + Unpin>(
     pipe: &AsyncMutex<Option<R>>,
-    budget: &Budget,
     close: &CancellationToken,
 ) -> Result<(Vec<u8>, bool), ToolError> {
     tokio::select! {
@@ -199,7 +167,6 @@ async fn read_pipe<R: AsyncRead + Unpin>(
             let pipe = pipe.as_mut().ok_or_else(closed)?;
             let mut data = vec![0; READ_BYTES];
             let count = pipe.read(&mut data).await.map_err(|error| io_failure("read", error))?;
-            budget.consume(count)?;
             data.truncate(count);
             Ok((data, count == 0))
         } => result,
@@ -228,13 +195,9 @@ impl UserData for ProcessSession {
                 .map(|session| session.clone());
             async move {
                 let session = session?;
-                let (data, eof) = read_pipe(
-                    &session.inner.stdout,
-                    &session.inner.stdout_budget,
-                    &session.inner.close,
-                )
-                .await
-                .map_err(mlua::Error::external)?;
+                let (data, eof) = read_pipe(&session.inner.stdout, &session.inner.close)
+                    .await
+                    .map_err(mlua::Error::external)?;
                 let result = lua.create_table()?;
                 result.set("data", lua.create_string(data)?)?;
                 result.set("eof", eof)?;
@@ -247,13 +210,9 @@ impl UserData for ProcessSession {
                 .map(|session| session.clone());
             async move {
                 let session = session?;
-                let (data, eof) = read_pipe(
-                    &session.inner.stderr,
-                    &session.inner.stderr_budget,
-                    &session.inner.close,
-                )
-                .await
-                .map_err(mlua::Error::external)?;
+                let (data, eof) = read_pipe(&session.inner.stderr, &session.inner.close)
+                    .await
+                    .map_err(mlua::Error::external)?;
                 let result = lua.create_table()?;
                 result.set("data", lua.create_string(data)?)?;
                 result.set("eof", eof)?;
@@ -290,27 +249,21 @@ impl UserData for ProcessSession {
 pub(crate) fn install_process(
     lua: &Lua,
     project_root: PathBuf,
-    limits: ToolExecutionLimits,
-) -> Result<ProcessRegistry, ToolError> {
-    limits.validate()?;
+) -> Result<(ProcessRegistry, mlua::Function), ToolError> {
     let registry = ProcessRegistry::default();
     let sessions = registry.clone();
-    let stdout_budget = Arc::new(Budget::new(limits.output_bytes));
-    let stderr_budget = Arc::new(Budget::new(limits.diagnostic_bytes));
+
     let constructor = lua.create_async_function(move |lua, options: mlua::Table| {
         let sessions = sessions.clone();
         let root = project_root.clone();
-        let stdout_budget = stdout_budget.clone();
-        let stderr_budget = stderr_budget.clone();
+
+
         async move {
             let program: String = options.get("program")?;
             let arguments: Option<Vec<String>> = options.get("arguments")?;
             let arguments = arguments.unwrap_or_default();
             if program.is_empty() || program.contains('\0') || arguments.iter().any(|arg| arg.contains('\0')) {
                 return Err(mlua::Error::external(failure(Kind::InvalidArguments, "invalid process program or arguments")));
-            }
-            if program.len().saturating_add(arguments.iter().map(String::len).sum::<usize>()) > limits.argument_bytes {
-                return Err(mlua::Error::external(failure(Kind::OutputTooLarge, "process arguments exceed byte budget")));
             }
             let program = Path::new(&program);
             let executable = if program.is_absolute() { program.to_owned() } else { root.join(program) };
@@ -330,8 +283,6 @@ pub(crate) fn install_process(
                 stdout: AsyncMutex::new(child.stdout.take()),
                 stderr: AsyncMutex::new(child.stderr.take()),
                 close: close.clone(), status,
-                stdout_budget, stderr_budget,
-                write_limit: limits.argument_bytes,
             }) };
             tokio::spawn(async move {
                 let result = tokio::select! {
@@ -354,10 +305,7 @@ pub(crate) fn install_process(
             lua.create_userdata(session)
         }
     }).map_err(|error| failure(Kind::ExecutionFailed, error.to_string()))?;
-    lua.globals()
-        .set("process_open", constructor)
-        .map_err(|error| failure(Kind::ExecutionFailed, error.to_string()))?;
-    Ok(registry)
+    Ok((registry, constructor))
 }
 
 #[cfg(test)]

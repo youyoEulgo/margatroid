@@ -1,5 +1,6 @@
 use config_core::{
-    CidrBlock, ConfigError, IngressPolicy, LogLevel, MargatroidConfig, OutboundTarget,
+    CidrBlock, ConfigError, FileToolConfig, IngressPolicy, LogLevel, MargatroidConfig,
+    OutboundTarget,
 };
 use serde::Deserialize;
 use std::fs::File;
@@ -58,7 +59,8 @@ pub(crate) fn read_config(path: &Path) -> Result<MargatroidConfig, ConfigError> 
         decode_targets(document.outbound.logs)?,
         decode_targets(document.outbound.backend_state)?,
     )?
-    .with_ingress(ingress)
+    .with_ingress(ingress)?
+    .with_tools(document.tools)
 }
 
 #[derive(Deserialize)]
@@ -67,6 +69,8 @@ struct ConfigDocument {
     server: ServerDocument,
     log: Option<LogDocument>,
     outbound: OutboundDocument,
+    #[serde(default)]
+    tools: FileToolConfig,
 }
 
 #[derive(Deserialize)]

@@ -3,8 +3,8 @@ mod error;
 mod events;
 pub mod types;
 
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use core_plugin::{Entity, World};
@@ -12,7 +12,7 @@ use core_plugin::{Entity, World};
 pub use components::Tools;
 pub use error::{ToolResourceError, ToolResourceErrorKind};
 pub use events::{ImportTool, ImportToolReply};
-pub use types::{InjectedToolDefinition, ToolEntry, ToolInput, ToolReadLimits};
+pub use types::{InjectedToolDefinition, ToolEntry, ToolInput};
 
 use ToolResourceErrorKind as Kind;
 
@@ -76,36 +76,9 @@ fn canonical_file(path: &Path) -> Result<PathBuf, ToolResourceError> {
     Ok(canonical)
 }
 
-fn read_text(path: &Path, maximum: usize) -> Result<String, ToolResourceError> {
+fn read_text(path: &Path) -> Result<String, ToolResourceError> {
     let canonical = canonical_file(path)?;
-    let mut file = File::open(&canonical).map_err(|error| io_error(path, error))?;
-    let metadata = file.metadata().map_err(|error| io_error(path, error))?;
-    if !metadata.is_file() {
-        return Err(
-            ToolResourceError::new(Kind::InvalidPath, "expected a regular file").with_path(path),
-        );
-    }
-    if metadata.len() > maximum as u64 {
-        return Err(
-            ToolResourceError::new(Kind::TooLarge, "file exceeds byte limit").with_path(path),
-        );
-    }
-    let mut bytes = Vec::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .map_err(|error| io_error(path, error))?;
-        if count == 0 {
-            break;
-        }
-        if count > maximum.saturating_sub(bytes.len()) {
-            return Err(
-                ToolResourceError::new(Kind::TooLarge, "file exceeds byte limit").with_path(path),
-            );
-        }
-        bytes.extend_from_slice(&buffer[..count]);
-    }
+    let bytes = fs::read(&canonical).map_err(|error| io_error(path, error))?;
     String::from_utf8(bytes)
         .map_err(|_| ToolResourceError::new(Kind::InvalidUtf8, "file is not UTF-8").with_path(path))
 }
@@ -125,9 +98,9 @@ fn sibling(entry: &Path, name: &str) -> Result<PathBuf, ToolResourceError> {
     Ok(candidate)
 }
 
-pub fn read_tool(path: &Path, limits: &ToolReadLimits) -> Result<ToolInput, ToolResourceError> {
+pub fn read_tool(path: &Path) -> Result<ToolInput, ToolResourceError> {
     let origin = canonical_file(path)?;
-    let manifest = read_text(&origin, limits.manifest_bytes)?;
+    let manifest = read_text(&origin)?;
     let definition: toml::Value = toml::from_str(&manifest).map_err(|_| {
         ToolResourceError::new(Kind::InvalidDefinition, "invalid tool TOML manifest")
             .with_path(&origin)
@@ -152,14 +125,14 @@ pub fn read_tool(path: &Path, limits: &ToolReadLimits) -> Result<ToolInput, Tool
         })?
         .to_owned();
     let schema_path = sibling(&origin, "input.schema.json")?;
-    let schema_source = read_text(&schema_path, limits.schema_bytes)?;
+    let schema_source = read_text(&schema_path)?;
     let input_schema: serde_json::Value =
         serde_json::from_str(&schema_source).map_err(|error| {
             ToolResourceError::new(Kind::InvalidDefinition, error.to_string())
                 .with_path(&schema_path)
         })?;
     validate_schema(&input_schema).map_err(|error| error.with_path(&schema_path))?;
-    let program = read_text(&sibling(&origin, "main.lua")?, limits.program_bytes)?;
+    let program = read_text(&sibling(&origin, "main.lua")?)?;
     Ok(ToolInput {
         description,
         input_schema,

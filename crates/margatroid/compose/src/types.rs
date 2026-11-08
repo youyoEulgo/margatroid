@@ -10,6 +10,7 @@ pub struct ApplicationOptions {
 pub(crate) struct ApplicationParts {
     pub options: ApplicationOptions,
     pub config: ConfigPlugin,
+    pub tool_limits: tool_core::ToolExecutionLimits,
     pub inference: InferencePlugin,
     pub workspace: WorkspacePlugin,
 }
