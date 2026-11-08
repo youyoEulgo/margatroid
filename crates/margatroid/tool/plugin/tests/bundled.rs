@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/storage.rs"]
+mod storage_fixture;
+
 #[path = "support/shell_client.rs"]
 mod shell_client;
 
@@ -69,6 +72,7 @@ impl Fixture {
             },
         );
         let agent = app.world_mut().spawn();
+        storage_fixture::mount(app.world_mut(), agent, root.path());
         app.world_mut().insert_component(
             agent,
             Agent {
@@ -106,7 +110,9 @@ impl Fixture {
         };
         let directory = self.root.path().join(alias);
         std::fs::create_dir_all(&directory).unwrap();
-        shell_client::install_shell(&directory);
+        if alias == "bash" || alias == "bash-exec" || program.contains("/shell.lua") {
+            shell_client::install_shell(&directory);
+        }
         std::fs::write(
             directory.join("tool.toml"),
             "schema_version=1\ndescription='test'\n",
@@ -246,6 +252,27 @@ impl Fixture {
         result
     }
 
+    fn fails(&mut self, alias: &str, arguments: Value) -> bool {
+        self.bundle(alias);
+        let id = format!("{alias}-failure-{}", self.tasks().list().len());
+        let reply = self.execute(&id, alias, arguments);
+        let result = self.response(reply);
+        self.removed(&id);
+        match result {
+            Ok(response) => {
+                assert_eq!(response.call_id, format!("call-{id}"));
+                assert_eq!(response.alias, alias);
+                assert!(response.images.is_empty());
+                response.failed
+            }
+            Err(error) => {
+                assert!(!error.message.contains("stack traceback"), "{error}");
+                assert!(!error.message.contains("main.lua:"), "{error}");
+                true
+            }
+        }
+    }
+
     fn sandbox(&mut self, name: &str) {
         use sandbox_resource_core::{Sandboxes, SelectedSandbox};
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -294,9 +321,7 @@ fn file_tools_write_read_edit_and_report_failures_without_losing_data() {
         std::fs::read(f.root.path().join("nested folder/notes.txt")).unwrap(),
         before
     );
-    let missing = f.call("read-file", json!({"path":"missing.txt"}));
-    assert!(missing.failed);
-    assert!(missing.images.is_empty());
+    assert!(f.fails("read-file", json!({"path":"missing.txt"})));
 }
 
 #[test]
@@ -344,29 +369,22 @@ fn files_are_bounded_and_failed_writes_do_not_report_success() {
     let mut f = Fixture::new();
     let file = std::fs::File::create(f.root.path().join("large.txt")).unwrap();
     file.set_len(16 * 1024 * 1024 + 1).unwrap();
-    assert!(f.call("read-file", json!({"path":"large.txt"})).failed);
-    assert!(
-        f.call(
-            "edit",
-            json!({"path":"large.txt","old_string":"a","new_string":"b"})
-        )
-        .failed
-    );
-    assert!(
-        f.call(
-            "write-file",
-            json!({"path":"absent/child.txt","content":"value"})
-        )
-        .failed
-    );
+    assert!(f.fails("read-file", json!({"path":"large.txt"})));
+    assert!(f.fails(
+        "edit",
+        json!({"path":"large.txt","old_string":"a","new_string":"b"})
+    ));
+    assert!(f.fails(
+        "write-file",
+        json!({"path":"absent/child.txt","content":"value"})
+    ));
     assert!(!f.root.path().join("absent").exists());
     #[cfg(target_os = "linux")]
     {
-        let result = f.call(
+        assert!(f.fails(
             "write-file",
             json!({"path":"/dev/full","content":"a failed buffered write"}),
-        );
-        assert!(result.failed, "{}", result.content);
+        ));
     }
 }
 
@@ -398,11 +416,11 @@ fn search_and_directory_tools_handle_spaces_hidden_files_and_brace_globs() {
         !f.call("glob", json!({"pattern":"*.absent","path":"."}))
             .failed
     );
-    assert!(f.call("grep", json!({"pattern":"[","path":"."})).failed);
+    assert!(f.fails("grep", json!({"pattern":"[","path":"."})));
     let listed = f.call("list-directory", json!({"path":"src folder"}));
     assert!(!listed.failed, "{}", listed.content);
     assert!(listed.content.contains("a.ts"));
-    assert!(f.call("list-directory", json!({"path":"absent"})).failed);
+    assert!(f.fails("list-directory", json!({"path":"absent"})));
     std::fs::create_dir(f.root.path().join("empty")).unwrap();
     assert_eq!(
         f.call("list-directory", json!({"path":"empty"})).content,
@@ -434,12 +452,12 @@ fn all_supported_image_formats_return_actual_binary_images_and_reject_bad_inputs
         );
     }
     std::fs::write(f.root.path().join("text.png"), "not an image").unwrap();
-    assert!(f.call("read-image", json!({"path":"text.png"})).failed);
+    assert!(f.fails("read-image", json!({"path":"text.png"})));
     std::fs::write(f.root.path().join("empty.png"), []).unwrap();
-    assert!(f.call("read-image", json!({"path":"empty.png"})).failed);
+    assert!(f.fails("read-image", json!({"path":"empty.png"})));
     let file = std::fs::File::create(f.root.path().join("huge.png")).unwrap();
     file.set_len(5 * 1024 * 1024 + 1).unwrap();
-    assert!(f.call("read-image", json!({"path":"huge.png"})).failed);
+    assert!(f.fails("read-image", json!({"path":"huge.png"})));
 }
 
 #[test]
@@ -476,14 +494,14 @@ fn task_control_tools_pass_structured_messages_null_and_shared_cache_cursors() {
     f.tool(
         "worker",
         r#"function execute(arguments, context)
-        margatroid:task_return(margatroid.context.task_id)
+        margatroid.task:return_result(margatroid.context.task_id)
         while true do
-            local value = margatroid:task_receive()
+            local value = margatroid.task:receive()
             if type(value) == 'table' and value.finish then break end
-            if type(value) == 'table' and value.replace then margatroid:task_replace(value.value)
-            else margatroid:task_write(value) end
+            if type(value) == 'table' and value.replace then margatroid.task:replace_output(value.value)
+            else margatroid.task:append_output(value) end
         end
-        margatroid:task_finish(margatroid.context.task_id)
+        margatroid.task:finish(margatroid.context.task_id)
     end"#,
     );
     let reply = f.execute("worker", "worker", json!({}));
@@ -601,23 +619,17 @@ fn real_workspace_write_and_read_only_sandboxes_enforce_file_access() {
     let outside = tempfile::tempdir().unwrap();
     let outside_file = outside.path().join("outside.txt");
     std::fs::write(&outside_file, "untouched").unwrap();
-    assert!(
-        f.call(
-            "write-file",
-            json!({"path": outside_file, "content":"forbidden"})
-        )
-        .failed
-    );
+    assert!(f.fails(
+        "write-file",
+        json!({"path": outside_file, "content":"forbidden"})
+    ));
     assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "untouched");
     f.sandbox("read-only");
     assert!(!f.call("read-file", json!({"path":"original.txt"})).failed);
-    assert!(
-        f.call(
-            "write-file",
-            json!({"path":"original.txt","content":"forbidden"})
-        )
-        .failed
-    );
+    assert!(f.fails(
+        "write-file",
+        json!({"path":"original.txt","content":"forbidden"})
+    ));
     assert_eq!(
         std::fs::read_to_string(f.root.path().join("original.txt")).unwrap(),
         "original"
@@ -637,16 +649,13 @@ fn text_boundaries_and_literal_replacements_preserve_bytes_on_failure() {
         .content
         .contains("(end of file)"));
     std::fs::write(f.root.path().join("bad.txt"), b"\xff\xfe").unwrap();
-    assert!(f.call("read-file", json!({"path":"bad.txt"})).failed);
-    assert!(
-        f.call(
-            "edit",
-            json!({"path":"bad.txt","old_string":"a","new_string":"b"})
-        )
-        .failed
-    );
+    assert!(f.fails("read-file", json!({"path":"bad.txt"})));
+    assert!(f.fails(
+        "edit",
+        json!({"path":"bad.txt","old_string":"a","new_string":"b"})
+    ));
     std::fs::write(f.root.path().join("long.txt"), "x".repeat(256 * 1024 + 1)).unwrap();
-    assert!(f.call("read-file", json!({"path":"long.txt"})).failed);
+    assert!(f.fails("read-file", json!({"path":"long.txt"})));
     std::fs::write(f.root.path().join("literal.txt"), "a.b a.b").unwrap();
     assert!(!f.call("edit",json!({"path":"literal.txt","old_string":"a.b","new_string":"%1 literal","replace_all":true})).failed);
     assert_eq!(
@@ -851,21 +860,18 @@ fn one_shot_graphics_output_is_bounded_without_exceeding_result_encoding_budget(
 }
 
 #[test]
-fn failed_tool_replies_omit_lua_traces_but_success_output_is_unchanged() {
+fn explicit_tool_content_is_preserved_and_unexpected_lua_errors_are_brief() {
     let mut f = Fixture::new();
     let text = "TaskMissing: example\nstack traceback:\n\t[C]: in function 'task_read'";
     for (alias, ok) in [("reported-failure", false), ("reported-success", true)] {
         let literal = serde_json::to_string(text).unwrap();
-        f.tool(alias, &format!("function execute() margatroid:task_return({{ok={ok},content={literal}}}); margatroid:task_finish(margatroid.context.task_id) end"));
+        f.tool(alias, &format!("function execute() margatroid.task:return_result({{ok={ok},content={literal}}}); margatroid.task:finish(margatroid.context.task_id) end"));
         let reply = f.execute(alias, alias, json!({}));
         let response = f.response(reply).unwrap();
         assert_eq!(response.call_id, format!("call-{alias}"));
         assert_eq!(response.alias, alias);
         assert_eq!(response.failed, !ok);
-        assert_eq!(
-            response.content,
-            if ok { text } else { "TaskMissing: example" }
-        );
+        assert_eq!(response.content, text);
         f.removed(alias);
     }
     f.tool(
@@ -878,4 +884,297 @@ fn failed_tool_replies_omit_lua_traces_but_success_output_is_unchanged() {
     assert!(failure.message.contains("operator failure"));
     assert!(!failure.message.contains("stack traceback:"));
     f.removed("lua-error");
+}
+
+#[test]
+fn bundled_file_tools_execute_without_shell_helpers_or_packaged_binaries() {
+    let mut f = Fixture::new();
+    for alias in [
+        "read-file",
+        "write-file",
+        "edit",
+        "read-image",
+        "list-directory",
+        "glob",
+        "grep",
+    ] {
+        f.bundle(alias);
+        let resource = f.root.path().join("resources").join(alias);
+        assert!(
+            !resource.join("shell.lua").exists(),
+            "{alias} retains a shell helper"
+        );
+        assert!(
+            !resource.join("bin").exists(),
+            "{alias} fixture installed a binary"
+        );
+        // Remove an obsolete installation before invoking the actual bundled script.
+        let bin = resource.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("obsolete"), "unused").unwrap();
+        assert_eq!(bin.parent(), Some(resource.as_path()));
+        std::fs::remove_dir_all(&bin).unwrap();
+    }
+    assert!(
+        !f.call(
+            "write-file",
+            json!({"path":"plain.txt","content":"needle α\n"})
+        )
+        .failed
+    );
+    assert!(!f.call("read-file", json!({"path":"plain.txt"})).failed);
+    assert!(
+        !f.call(
+            "edit",
+            json!({"path":"plain.txt","old_string":"α","new_string":"β"})
+        )
+        .failed
+    );
+    assert!(!f.call("list-directory", json!({"path":"."})).failed);
+    assert!(f
+        .call("glob", json!({"pattern":"*.txt"}))
+        .content
+        .contains("plain.txt"));
+    assert!(f
+        .call("grep", json!({"pattern":"needle β","path":"plain.txt"}))
+        .content
+        .contains("plain.txt:1:needle β"));
+    std::fs::write(f.root.path().join("tiny.png"), b"\x89PNG\r\n\x1a\nfixture").unwrap();
+    assert_eq!(
+        f.call("read-image", json!({"path":"tiny.png"}))
+            .images
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn bundled_grep_preserves_nested_ignore_negations_binary_lines_unicode_and_include() {
+    let mut f = Fixture::new();
+    std::fs::create_dir_all(f.root.path().join("nested/deeper")).unwrap();
+    std::fs::write(
+        f.root.path().join(".ignore"),
+        "*.skip\n*.log\n/root-only.txt\n",
+    )
+    .unwrap();
+    std::fs::write(
+        f.root.path().join("nested/.ignore"),
+        "!keep.log\nprivate.txt\n",
+    )
+    .unwrap();
+    for (path, text) in [
+        ("ignored.skip", "needle ignored"),
+        ("nested/discard.log", "needle ignored"),
+        ("nested/keep.log", "needle 保留"),
+        ("nested/private.txt", "needle ignored"),
+        ("nested/deeper/keep.log", "needle inherited negation"),
+        ("visible.rs", "header\r\nneedle α needle β\r\n尾行\n"),
+        ("other.txt", "needle other"),
+        ("root-only.txt", "needle root ignored"),
+        ("nested/root-only.txt", "needle nested included"),
+        (".hidden.txt", "needle hidden"),
+    ] {
+        std::fs::write(f.root.path().join(path), text).unwrap();
+    }
+    std::fs::write(f.root.path().join("binary.txt"), b"\0needle binary\n").unwrap();
+    std::fs::write(f.root.path().join("nonutf8.txt"), b"needle \xff\n").unwrap();
+    let found = f.call("grep", json!({"pattern":"needle","path":"."}));
+    assert!(!found.failed, "{}", found.content);
+    assert!(
+        found.content.contains("nested/keep.log:1:needle 保留"),
+        "{}",
+        found.content
+    );
+    assert!(
+        found
+            .content
+            .contains("nested/deeper/keep.log:1:needle inherited negation"),
+        "{}",
+        found.content
+    );
+    assert!(
+        found.content.contains("visible.rs:2:needle α needle β"),
+        "{}",
+        found.content
+    );
+    assert!(
+        found.content.contains("nested/root-only.txt:1:"),
+        "{}",
+        found.content
+    );
+    assert!(
+        !found
+            .content
+            .lines()
+            .any(|line| line.starts_with("root-only.txt:") || line.starts_with("./root-only.txt:")),
+        "{}",
+        found.content
+    );
+    assert_eq!(
+        found
+            .content
+            .lines()
+            .filter(|line| line.contains("visible.rs:"))
+            .count(),
+        1
+    );
+    // rg --json emits matching binary lines; non-UTF-8 previews retain base64 bytes.
+    assert!(
+        found.content.contains("binary.txt:1:\0needle binary"),
+        "{}",
+        found.content
+    );
+    assert!(
+        found
+            .content
+            .contains("nonutf8.txt:1:[base64 bytes: bmVlZGxlIP8K]"),
+        "{}",
+        found.content
+    );
+    for excluded in ["ignored.skip", "discard.log", "private.txt", ".hidden.txt"] {
+        assert!(
+            !found.content.contains(excluded),
+            "{excluded}: {}",
+            found.content
+        );
+    }
+    let included = f.call(
+        "grep",
+        json!({"pattern":"(?i)NEEDLE\\s[αβ]","include":"*.{rs,ts}"}),
+    );
+    assert!(!included.failed, "{}", included.content);
+    assert!(
+        included.content.contains("visible.rs:2:"),
+        "{}",
+        included.content
+    );
+    assert!(!included.content.contains("other.txt"));
+    assert!(f.fails("grep", json!({"pattern":"needle","include":"!*.rs"})));
+}
+
+#[test]
+fn bundled_glob_includes_ignored_files_excludes_vcs_directories_and_sorts_nanoseconds() {
+    let mut f = Fixture::new();
+    std::fs::create_dir_all(f.root.path().join("nested/.git")).unwrap();
+    std::fs::create_dir_all(f.root.path().join("nested/sub")).unwrap();
+    std::fs::write(f.root.path().join(".ignore"), "*.txt\n").unwrap();
+    for name in [
+        "z-new.txt",
+        "a-old.txt",
+        "nested/.hidden.txt",
+        "nested/.git/internal.txt",
+    ] {
+        std::fs::write(f.root.path().join(name), "file").unwrap();
+    }
+    // Both mtimes have the same second and differ below floating-point precision.
+    let second = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    for (name, nanos) in [("z-new.txt", 200), ("a-old.txt", 100)] {
+        std::fs::File::open(f.root.path().join(name))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(second + Duration::from_nanos(nanos)))
+            .unwrap();
+    }
+    let found = f.call("glob", json!({"pattern":"*.txt"}));
+    assert!(!found.failed, "{}", found.content);
+    assert!(
+        found.content.contains("nested/.hidden.txt"),
+        "{}",
+        found.content
+    );
+    assert!(!found.content.contains("internal.txt"));
+    let paths: Vec<_> = found.content.lines().collect();
+    let new = paths
+        .iter()
+        .position(|path| path.ends_with("z-new.txt"))
+        .unwrap();
+    let old = paths
+        .iter()
+        .position(|path| path.ends_with("a-old.txt"))
+        .unwrap();
+    assert!(new < old, "{}", found.content);
+    let anchored = f.call("glob", json!({"pattern":"nested/*.txt"}));
+    assert!(anchored.content.contains("nested/.hidden.txt"));
+    assert!(!anchored.content.contains("z-new.txt"));
+    assert!(f.fails("glob", json!({"pattern":"["})));
+}
+
+#[test]
+fn explicit_file_roots_override_grep_include_and_glob_patterns() {
+    let mut f = Fixture::new();
+    std::fs::write(f.root.path().join(".ignore"), "note.md\n").unwrap();
+    std::fs::write(f.root.path().join("note.md"), "needle explicit\n").unwrap();
+    let direct = f.call(
+        "grep",
+        json!({"pattern":"needle","path":"note.md","include":"*.txt"}),
+    );
+    assert!(!direct.failed, "{}", direct.content);
+    assert!(
+        direct.content.contains("note.md:1:needle explicit"),
+        "{}",
+        direct.content
+    );
+    let directory = f.call(
+        "grep",
+        json!({"pattern":"needle","path":".","include":"*.txt"}),
+    );
+    assert!(!directory.failed, "{}", directory.content);
+    assert_eq!(directory.content, "No matches found.");
+    let direct = f.call("glob", json!({"pattern":"*.txt","path":"note.md"}));
+    assert!(!direct.failed, "{}", direct.content);
+    assert!(direct.content.contains("note.md"), "{}", direct.content);
+    let directory = f.call("glob", json!({"pattern":"*.txt","path":"."}));
+    assert!(!directory.failed, "{}", directory.content);
+    assert_eq!(directory.content, "No files found.");
+}
+
+#[test]
+fn bundled_search_host_failures_keep_tracebacks_in_storage_and_brief_call_errors() {
+    for (alias, arguments) in [
+        ("grep", json!({"pattern":"[","path":"."})),
+        (
+            "grep",
+            json!({"pattern":"needle","path":"missing-search-root"}),
+        ),
+        ("glob", json!({"pattern":"[","path":"."})),
+    ] {
+        let mut f = Fixture::new();
+        f.bundle(alias);
+        let reply = f.execute("search-failure", alias, arguments);
+        let error = f.response(reply).unwrap_err();
+        f.removed("search-failure");
+        assert!(!error.message.contains("stack traceback"), "{error}");
+        assert!(!error.message.contains("main.lua:"), "{error}");
+        assert!(!error.message.contains("[string"), "{error}");
+        let storage = f
+            .app
+            .world()
+            .get_component::<storage_core::AgentStorage>(f.agent)
+            .unwrap();
+        let logs = storage_core::read_agent_logs(storage, None, 100).unwrap();
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        let record = &logs[0].record;
+        assert_eq!(record.source, storage_core::AgentLogSource::Tool);
+        assert_eq!(record.stage, "execute");
+        assert!(record.origin.as_deref().unwrap().ends_with("main.lua"));
+        assert!(
+            record
+                .raw_error
+                .as_deref()
+                .unwrap()
+                .contains("stack traceback:"),
+            "{record:?}"
+        );
+        assert!(
+            record
+                .traceback
+                .as_deref()
+                .unwrap()
+                .contains("stack traceback:"),
+            "{record:?}"
+        );
+        let context = record.context_json.as_ref().unwrap();
+        assert_eq!(context["task_id"], "search-failure");
+        assert_eq!(context["call_id"], "call-search-failure");
+        assert_eq!(context["alias"], alias);
+    }
 }

@@ -24,6 +24,7 @@ struct CommandRecord {
 }
 
 struct Fixture {
+    _directory: tempfile::TempDir,
     app: App,
     owner: Entity,
     workspace: Entity,
@@ -45,7 +46,25 @@ impl Fixture {
             owner,
             address::Address::new("agent:local/runtime-test:latest").unwrap(),
         );
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage_core::open_storage(
+            &directory.path().join("agent.sqlite"),
+            &directory.path().join("settings.toml"),
+            "",
+        )
+        .unwrap();
+        app.world_mut().insert_component(owner, storage);
         let workspace = app.world_mut().spawn();
+        app.world_mut().insert_component(
+            workspace,
+            workspace_core::Workspace {
+                name: "test".into(),
+                definition_path: directory.path().join("workspace.yaml"),
+                project_root: directory.path().to_owned(),
+                agents: Default::default(),
+                state: workspace_core::WorkspaceState::Running,
+            },
+        );
         let executor = spawn_workspace_executor().unwrap();
         let close = executor.close.clone();
         app.world_mut().insert_component(workspace, executor);
@@ -116,6 +135,7 @@ impl Fixture {
             );
         });
         Self {
+            _directory: directory,
             app,
             owner,
             workspace,
@@ -203,7 +223,7 @@ async fn starts_on_workspace_thread_binds_source_and_stops_without_closing_works
         "record".into(),
         LuaBinding::Function(Arc::new(RecordThread(threads.clone()))),
     );
-    let mut receiver = fixture.start_request("assert(io == nil and os == nil and package == nil); assert(load == nil and loadfile == nil and dofile == nil); record(); mcl(agent_info.entity, 'EFFECT ready'); wait()", environment);
+    let mut receiver = fixture.start_request("assert(io == nil and os == nil and package == nil); assert(load == nil and loadfile == nil and dofile == nil); record(); margatroid.driver:mcl(margatroid.context.agent_info.entity, 'EFFECT ready'); margatroid.driver:wait()", environment);
     let instance = drive(&mut fixture.app, &mut receiver).await.unwrap();
     assert_ne!(threads.lock().unwrap()[0], std::thread::current().id());
     let (sender, receiver) = oneshot::channel();
@@ -265,7 +285,7 @@ async fn startup_timeout_cancels_and_waits_for_vm_cleanup() {
         startup_timeout: Some(Duration::from_millis(20)),
         ..LuaRuntimeConfig::default()
     });
-    let error = fixture.start("wait()").await.unwrap_err();
+    let error = fixture.start("margatroid.driver:wait()").await.unwrap_err();
     assert_eq!(error.kind, LuaRuntimeErrorKind::StartupTimeout);
     assert!(
         fixture
@@ -306,7 +326,10 @@ async fn compile_error_early_exit_and_host_panic_settle_start_after_cleanup() {
                 .get_component::<DriverLuaVm>(fixture.owner)
                 .is_none()
         );
-        let instance = fixture.start("mcl('EFFECT ready'); wait()").await.unwrap();
+        let instance = fixture
+            .start("margatroid.driver:mcl('EFFECT ready'); margatroid.driver:wait()")
+            .await
+            .unwrap();
         fixture.stop(instance).await.unwrap();
         fixture.close().await;
     }
@@ -324,9 +347,15 @@ impl LuaHostFunction for PanicHost {
 #[tokio::test]
 async fn old_instances_cannot_ready_wake_or_stop_a_restarted_vm() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
-    let old = fixture.start("mcl('EFFECT ready'); wait()").await.unwrap();
+    let old = fixture
+        .start("margatroid.driver:mcl('EFFECT ready'); margatroid.driver:wait()")
+        .await
+        .unwrap();
     fixture.stop(old.clone()).await.unwrap();
-    let current = fixture.start("mcl('EFFECT ready'); wait()").await.unwrap();
+    let current = fixture
+        .start("margatroid.driver:mcl('EFFECT ready'); margatroid.driver:wait()")
+        .await
+        .unwrap();
     assert_ne!(old.start_id, current.start_id);
     assert_eq!(
         fixture.app.world().driver_ready(&old).unwrap_err().kind,
@@ -356,7 +385,10 @@ async fn old_instances_cannot_ready_wake_or_stop_a_restarted_vm() {
 #[tokio::test]
 async fn duplicate_stop_consumes_original_ended_receiver_only_once() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
-    let instance = fixture.start("mcl('EFFECT ready'); wait()").await.unwrap();
+    let instance = fixture
+        .start("margatroid.driver:mcl('EFFECT ready'); margatroid.driver:wait()")
+        .await
+        .unwrap();
     let mut first = fixture.stop_request(instance.clone());
     let mut duplicate = fixture.stop_request(instance);
     assert_eq!(
@@ -429,7 +461,7 @@ async fn source_and_environment_validation_leave_no_vm_installed() {
             .is_none()
     );
     fixture.close().await;
-    for name in ["", "mcl", "wait", "require", "bad\nname"] {
+    for name in ["", "mcl", "wait", "require", "margatroid", "bad\nname"] {
         let mut fixture = Fixture::new(LuaRuntimeConfig::default());
         let environment = LuaEnvironment {
             globals: BTreeMap::from([(name.into(), LuaBinding::Value(LuaValue::Nil))]),
@@ -503,7 +535,7 @@ async fn host_bridge_preserves_empty_arrays_nulls_and_rejects_mixed_sparse_cycli
         "bridge".into(),
         LuaBinding::Function(Arc::new(Bridge(calls.clone()))),
     );
-    let mut receiver = fixture.start_request("local value = bridge(); bridge(value); assert(not pcall(bridge, {[1]=true,x=true})); assert(not pcall(bridge, {[2]=true})); local cycle = {}; cycle.self=cycle; assert(not pcall(bridge, cycle)); mcl('EFFECT ready'); wait()", environment);
+    let mut receiver = fixture.start_request("local value = bridge(); bridge(value); assert(not pcall(bridge, {[1]=true,x=true})); assert(not pcall(bridge, {[2]=true})); local cycle = {}; cycle.self=cycle; assert(not pcall(bridge, cycle)); margatroid.driver:mcl('EFFECT ready'); margatroid.driver:wait()", environment);
     let instance = drive(&mut fixture.app, &mut receiver).await.unwrap();
     let values = calls.lock().unwrap().clone();
     assert_eq!(values.len(), 1);
@@ -518,7 +550,7 @@ async fn host_bridge_preserves_empty_arrays_nulls_and_rejects_mixed_sparse_cycli
 #[tokio::test]
 async fn mcl_host_passes_json_parameters_and_rejects_foreign_entity_targets() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
-    let instance = fixture.start("local result = mcl(agent_info.entity, 'ECHO', {{value=42}, {}}); assert(result.Array.Message[1].value == 42); assert(mcl({index=999,generation=0}, 'ECHO').Error.type == 'error'); mcl('EFFECT ready'); wait()").await.unwrap();
+    let instance = fixture.start("local result = margatroid.driver:mcl(margatroid.context.agent_info.entity, 'ECHO', {{value=42}, {}}); assert(result.Array.Message[1].value == 42); assert(margatroid.driver:mcl({index=999,generation=0}, 'ECHO').Error.type == 'error'); margatroid.driver:mcl('EFFECT ready'); margatroid.driver:wait()").await.unwrap();
     let records = fixture.commands.lock().unwrap().clone();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].arguments, [json!({"value": 42}), json!({})]);
@@ -541,7 +573,7 @@ async fn require_only_resolves_injected_modules() {
             LuaValue::Integer(42),
         )]))),
     );
-    let mut receiver = fixture.start_request("assert(require('provided').value == 42); assert(not pcall(require, 'os')); mcl('EFFECT ready'); wait()", environment);
+    let mut receiver = fixture.start_request("assert(require('provided').value == 42); assert(not pcall(require, 'os')); margatroid.driver:mcl('EFFECT ready'); margatroid.driver:wait()", environment);
     let instance = drive(&mut fixture.app, &mut receiver).await.unwrap();
     fixture.stop(instance).await.unwrap();
     fixture.close().await;
@@ -551,7 +583,7 @@ async fn require_only_resolves_injected_modules() {
 async fn instruction_hook_cancels_running_lua_without_wait_or_host_calls() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
     let instance = fixture
-        .start("mcl('EFFECT ready'); while true do end")
+        .start("margatroid.driver:mcl('EFFECT ready'); while true do end")
         .await
         .unwrap();
     fixture.stop(instance).await.unwrap();
@@ -562,7 +594,7 @@ async fn instruction_hook_cancels_running_lua_without_wait_or_host_calls() {
 async fn natural_exit_is_reported_without_consuming_stop_receiver() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
     let instance = fixture
-        .start("mcl('EFFECT ready'); error('after-ready')")
+        .start("margatroid.driver:mcl('EFFECT ready'); error('after-ready')")
         .await
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -593,7 +625,10 @@ async fn natural_exit_is_reported_without_consuming_stop_receiver() {
 #[tokio::test]
 async fn duplicate_start_is_rejected_and_original_instance_remains() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
-    let instance = fixture.start("mcl('EFFECT ready'); wait()").await.unwrap();
+    let instance = fixture
+        .start("margatroid.driver:mcl('EFFECT ready'); margatroid.driver:wait()")
+        .await
+        .unwrap();
     assert_eq!(
         fixture.start("return").await.unwrap_err().kind,
         LuaRuntimeErrorKind::InvalidRequest
@@ -616,20 +651,20 @@ async fn mcl_failures_are_values_and_same_vm_continues_until_explicit_stop() {
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
     let instance = fixture.start(r#"
         for _, instruction in ipairs({'REJECT', 'CANCEL_CALL', 'LOST_REPLY', 'ERROR_VALUE'}) do
-            local ok, result = pcall(mcl, instruction)
+            local ok, result = pcall(function(...) return margatroid.driver:mcl(...) end, instruction)
             assert(ok and result.Error.type == 'error')
             assert(type(result.Error.request_id) == 'string')
             assert(type(result.Error.message) == 'string')
         end
         for _, arguments in ipairs({{}, {''}, {true}, {'ECHO', {[2]=true}}, {'ECHO', function() end}}) do
-            local ok, result = pcall(mcl, arguments[1], arguments[2])
+            local ok, result = pcall(function(...) return margatroid.driver:mcl(...) end, arguments[1], arguments[2])
             assert(ok and result.Error.type == 'error')
         end
         local cycle = {}; cycle.self = cycle
-        assert(mcl('ECHO', cycle).Error.type == 'error')
-        assert(mcl('ECHO', {{after_error=true}}).Array.Message[1].after_error)
-        mcl('EFFECT ready')
-        while true do wait() end
+        assert(margatroid.driver:mcl('ECHO', cycle).Error.type == 'error')
+        assert(margatroid.driver:mcl('ECHO', {{after_error=true}}).Array.Message[1].after_error)
+        margatroid.driver:mcl('EFFECT ready')
+        while true do margatroid.driver:wait() end
     "#).await.unwrap();
     assert!(fixture.exits.lock().unwrap().is_empty());
     assert_eq!(
@@ -641,6 +676,307 @@ async fn mcl_failures_are_values_and_same_vm_continues_until_explicit_stop() {
             .instance,
         instance
     );
+    fixture.stop(instance).await.unwrap();
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn shared_host_logs_use_current_turn_and_do_not_log_caught_faults_or_cancellation() {
+    let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    fixture.app.world_mut().insert_component(
+        fixture.owner,
+        agent_core::Agent {
+            name: "trusted-agent".into(),
+            workspace: fixture.workspace,
+            state: agent_core::AgentState::Working,
+            turn: Some("first-turn".into()),
+        },
+    );
+    let instance = fixture
+        .start(
+            r#"
+        assert(mcl == nil and wait == nil and agent_info == nil)
+        assert(margatroid.context.kind == 'driver')
+        assert(not pcall(function() margatroid.task:finish() end))
+        assert(not pcall(function() error('handled') end))
+        assert(not pcall(function() margatroid:log('trace', 'bad level') end))
+        assert(not pcall(function() margatroid:log('info', 'bad details', {1}) end))
+        assert(not pcall(function() margatroid:log('info', 'decoded array', margatroid.data:decode('json', '[]')) end))
+        assert(not pcall(function() margatroid:log('info', 'explicit null', margatroid.data.null) end))
+        margatroid:log('info', 'first', {answer=42})
+        margatroid:log('debug', 'empty details', {})
+        margatroid.driver:mcl('EFFECT ready')
+        margatroid.driver:wait()
+        margatroid:log('warn', 'second')
+        margatroid.driver:mcl('SECOND')
+        margatroid.driver:wait()
+    "#,
+        )
+        .await
+        .unwrap();
+    fixture
+        .app
+        .world_mut()
+        .get_component_mut::<agent_core::Agent>(fixture.owner)
+        .unwrap()
+        .turn = Some("second-turn".into());
+    fixture.app.world().driver_wake(&instance).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !fixture
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|record| record.text == "SECOND")
+    {
+        fixture.app.tick();
+        assert!(Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    fixture.stop(instance.clone()).await.unwrap();
+    let storage = fixture
+        .app
+        .world()
+        .get_component::<storage_core::AgentStorage>(fixture.owner)
+        .unwrap();
+    let logs = storage_core::read_agent_logs(storage, None, 100).unwrap();
+    assert_eq!(logs.len(), 3);
+    assert_eq!(
+        logs[0].record.context_json.as_ref().unwrap()["turn"],
+        "first-turn"
+    );
+    assert_eq!(logs[1].record.details_json, Some(json!({})));
+    assert_eq!(logs[1].record.level, storage_core::AgentLogLevel::Debug);
+    assert_eq!(
+        logs[2].record.context_json.as_ref().unwrap()["turn"],
+        "second-turn"
+    );
+    assert_eq!(logs[0].record.details_json, Some(json!({"answer": 42})));
+    assert_eq!(logs[2].record.level, storage_core::AgentLogLevel::Warn);
+    assert!(logs.iter().all(|log| log.record.raw_error.is_none()));
+    assert_eq!(
+        logs[0].record.context_json.as_ref().unwrap()["instance"],
+        instance.start_id
+    );
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn uncaught_compile_and_runtime_faults_persist_before_start_reply_with_brief_errors() {
+    for (source, stage, trace) in [
+        ("local =", "compile", false),
+        (
+            "local function nested() error('specific failure') end; nested()",
+            "execute",
+            true,
+        ),
+    ] {
+        let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+        let error = fixture.start(source).await.unwrap_err();
+        let storage = fixture
+            .app
+            .world()
+            .get_component::<storage_core::AgentStorage>(fixture.owner)
+            .unwrap();
+        let logs = storage_core::read_agent_logs(storage, None, 100).unwrap();
+        assert_eq!(logs.len(), 1);
+        let record = &logs[0].record;
+        assert_eq!(record.stage, stage);
+        assert_eq!(record.source, storage_core::AgentLogSource::Driver);
+        assert_eq!(record.origin.as_deref(), Some("test-driver.lua"));
+        assert!(
+            record
+                .raw_error
+                .as_ref()
+                .unwrap()
+                .contains("test-driver.lua")
+        );
+        assert_eq!(record.traceback.is_some(), trace);
+        assert!(!error.description.contains("stack traceback:"));
+        if trace {
+            assert_eq!(error.description, "specific failure");
+        }
+        fixture.close().await;
+    }
+}
+
+#[tokio::test]
+async fn missing_agent_storage_is_a_real_start_error() {
+    let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    fixture
+        .app
+        .world_mut()
+        .remove_component::<storage_core::AgentStorage>(fixture.owner);
+    assert_eq!(
+        fixture.start("return").await.unwrap_err().kind,
+        LuaRuntimeErrorKind::EnvironmentFailed
+    );
+    assert!(
+        fixture
+            .app
+            .world()
+            .get_component::<DriverLuaVm>(fixture.owner)
+            .is_none()
+    );
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn driver_can_use_shared_data_files_processes_and_wait_any() {
+    let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    let instance = fixture.start(r#"
+        local value = margatroid.data:decode('json', '{"hello":"world"}')
+        assert(value.hello == 'world')
+        assert(margatroid.data:decode('base64', margatroid.data:encode('base64', 'payload')) == 'payload')
+        margatroid.files:write('driver.txt', 'content')
+        assert(margatroid.files:read('driver.txt') == 'content')
+        local process = margatroid.process:start('/usr/bin/printf', {'process works'})
+        local winner, output = margatroid:wait_any({stdout=function() return process:read() end})
+        assert(winner == 'stdout' and output.data == 'process works')
+        assert(process:wait().exit_code == 0)
+        local running = margatroid.process:start('/bin/cat', {})
+        running:write('still running')
+        assert(running:read().data == 'still running')
+        margatroid.driver:mcl('EFFECT ready')
+        margatroid.driver:wait()
+    "#).await.unwrap();
+    fixture.stop(instance).await.unwrap();
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn uncaught_host_callback_keeps_typed_message_and_full_traceback() {
+    let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    let mut environment = fixture.environment();
+    environment.globals.insert(
+        "bridge".into(),
+        LuaBinding::Function(Arc::new(Bridge(Arc::new(Mutex::new(Vec::new()))))),
+    );
+    let mut receiver = fixture.start_request(
+        "local cycle = {}; cycle.self = cycle; bridge(cycle)",
+        environment,
+    );
+    let error = drive(&mut fixture.app, &mut receiver).await.unwrap_err();
+    assert_eq!(error.description, "cyclic Lua table cannot be a host value");
+    let storage = fixture
+        .app
+        .world()
+        .get_component::<storage_core::AgentStorage>(fixture.owner)
+        .unwrap();
+    let logs = storage_core::read_agent_logs(storage, None, 100).unwrap();
+    assert_eq!(logs.len(), 1);
+    assert!(
+        logs[0]
+            .record
+            .raw_error
+            .as_ref()
+            .unwrap()
+            .contains("stack traceback:")
+    );
+    assert!(
+        logs[0]
+            .record
+            .traceback
+            .as_ref()
+            .unwrap()
+            .contains("test-driver.lua")
+    );
+    fixture.close().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn stop_reaps_driver_process_before_ended_acknowledgement() {
+    let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut environment = fixture.environment();
+    environment.globals.insert(
+        "record_process".into(),
+        LuaBinding::Function(Arc::new(Bridge(calls.clone()))),
+    );
+    let mut receiver = fixture.start_request(
+        r#"
+        local process = margatroid.process:start('/bin/sh', {'-c', 'echo $$; exec cat'})
+        record_process(process:read().data)
+        margatroid.driver:mcl('EFFECT ready')
+        margatroid.driver:wait()
+    "#,
+        environment,
+    );
+    let instance = drive(&mut fixture.app, &mut receiver).await.unwrap();
+    let pid = match &calls.lock().unwrap()[0][0] {
+        LuaValue::String(pid) => pid.trim().parse::<u32>().unwrap(),
+        _ => panic!("process did not return its pid"),
+    };
+    assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+    fixture.stop(instance).await.unwrap();
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn uncaught_invalid_log_details_persist_one_fault_without_recursive_logging() {
+    let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    let error = fixture
+        .start("margatroid:log('info', 'bad details', margatroid.data:decode('json', '[]'))")
+        .await
+        .unwrap_err();
+    assert_eq!(error.description, "expected an object");
+    let storage = fixture
+        .app
+        .world()
+        .get_component::<storage_core::AgentStorage>(fixture.owner)
+        .unwrap();
+    let logs = storage_core::read_agent_logs(storage, None, 100).unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].record.stage, "execute");
+    assert_eq!(logs[0].record.level, storage_core::AgentLogLevel::Error);
+    assert_eq!(logs[0].record.message, "expected an object");
+    assert!(logs[0].record.details_json.is_none());
+    assert!(logs[0].record.raw_error.is_some());
+    assert!(logs[0].record.traceback.is_some());
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn driver_host_denies_tools_and_tasks_and_keeps_context_and_namespaces_readonly() {
+    let mut fixture = Fixture::new(LuaRuntimeConfig::default());
+    let instance = fixture
+        .start(
+            r#"
+        assert(margatroid.context.kind == 'driver')
+        assert(margatroid.version == nil and margatroid.arguments == nil and margatroid.null == nil)
+        assert(margatroid.tool == nil)
+        for _, name in ipairs({'read_file','write_file','path_info','path_resolve','directory_list',
+            'json_encode','json_decode','yaml_encode','yaml_decode','toml_encode','toml_decode',
+            'base64_encode','base64_decode','process_open','await_any','task_return','task_finish',
+            'task_write','task_replace','task_read','task_send','task_receive','tool_inject'}) do
+            assert(margatroid[name] == nil, 'legacy method remains: '..name)
+        end
+        for _, operation in ipairs({
+            function() margatroid.tools:register({}) end,
+            function() margatroid.task:return_result('forbidden') end,
+            function() margatroid.task:finish('forbidden') end,
+            function() margatroid.task:append_output('forbidden') end,
+            function() margatroid.task:replace_output('forbidden') end,
+            function() margatroid.task:read_output('forbidden') end,
+            function() margatroid.task:send('forbidden', {}) end,
+            function() margatroid.task:receive() end,
+            function() margatroid.context={} end,
+            function() margatroid.data.null={} end,
+            function() margatroid.files={} end,
+            function() margatroid.driver.mcl={} end,
+        }) do assert(not pcall(operation)) end
+        local context=margatroid.context
+        context.kind='tool'
+        assert(margatroid.context.kind == 'driver')
+        assert(margatroid.data.null ~= nil)
+        margatroid.driver:mcl('EFFECT ready')
+        margatroid.driver:wait()
+    "#,
+        )
+        .await
+        .unwrap();
     fixture.stop(instance).await.unwrap();
     fixture.close().await;
 }

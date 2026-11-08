@@ -27,23 +27,24 @@ local function perform(arguments, context)
         return {ok = false, content = message}
     end
     local path = resolve_path(arguments.path, context.project_root)
-    local file, open_error = io.open(path, "rb")
-    if not file then return failure("Cannot open image: " .. arguments.path .. ": " .. tostring(open_error)) end
-    local bytes = file:read(MAX_BYTES + 1)
-    file:close()
-    if not bytes then return failure("Image is empty or unreadable: " .. arguments.path) end
+    local info = margatroid.files:info(path)
+    if info.kind == "symlink" and info.resolved_path then info = margatroid.files:info(info.resolved_path) end
+    if info.kind == "file" and info.size > MAX_BYTES then return failure("Image exceeds 5 MiB limit: " .. arguments.path) end
+    local bytes = margatroid.files:read(path)
+    if #bytes == 0 then return failure("Image is empty or unreadable: " .. arguments.path) end
     if #bytes > MAX_BYTES then return failure("Image exceeds 5 MiB limit: " .. arguments.path) end
     local media = media_type(bytes)
     if not media then return failure("Not a supported PNG, JPEG, GIF or WebP image: " .. arguments.path) end
     return {
         ok = true,
         content = string.format("Image %s (%s, %d bytes)", arguments.path, media, #bytes),
-        images = {{media_type = media, data = margatroid:base64_encode(bytes)}}
+        images = {{media_type = media, data = margatroid.data:encode("base64", bytes)}}
     }
 end
 
 function execute(arguments, context)
+    arguments = context.arguments
     local result = perform(arguments, context)
-    margatroid:task_return(result)
-    margatroid:task_finish(context.task_id)
+    margatroid.task:return_result(result)
+    margatroid.task:finish(context.task_id)
 end

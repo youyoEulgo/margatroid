@@ -1,5 +1,8 @@
 //! This test executable also serves as its own tool runner. Cargo's libtest
 //! harness is disabled so supervisor/worker protocol stdout stays untouched.
+#[path = "../../../crates/margatroid/tool/plugin/tests/support/storage.rs"]
+mod storage_fixture;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use agent_core::{Agent, AgentState};
@@ -38,8 +41,19 @@ mod linux {
             std::fs::create_dir_all(resource.join("bin")).unwrap();
             let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../resources/tools/local/mcp-register/latest");
-            for name in ["tool.toml", "input.schema.json", "main.lua"] {
-                std::fs::copy(bundled.join(name), resource.join(name)).unwrap();
+            for entry in std::fs::read_dir(&bundled).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                if entry.file_type().unwrap().is_file()
+                    && (name == "tool.toml"
+                        || name == "input.schema.json"
+                        || entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "lua"))
+                {
+                    std::fs::copy(entry.path(), resource.join(name)).unwrap();
+                }
             }
             std::fs::copy(
                 env!("CARGO_BIN_EXE_mcp-client"),
@@ -78,6 +92,7 @@ mod linux {
                 },
             );
             let agent = app.world_mut().spawn();
+            super::storage_fixture::mount(app.world_mut(), agent, root.path());
             app.world_mut().insert_component(
                 agent,
                 Agent {

@@ -127,12 +127,12 @@ function configure() return {{timeout_ms=5000}} end
 function execute()
     local code={code}
     local function spawn(name)
-        return margatroid:process_open({{program='/usr/bin/python3', arguments={{'-u','-c',{launcher},code,margatroid.context.project_root..'/'..name..'.json'}}}})
+        return margatroid.process:start('/usr/bin/python3', {{'-u','-c',{launcher},code,margatroid.context.project_root..'/'..name..'.json'}})
     end
     local first=spawn('first')
     assert(first:read().data:find('ready',1,true))
-    margatroid:task_return('boundary-ready')
-    assert(margatroid:task_receive()=='allocate')
+    margatroid.task:return_result('boundary-ready')
+    assert(margatroid.task:receive()=='allocate')
     first:write('allocate\n')
     assert(first:read().data:find('allocated',1,true))
     local second=spawn('second')
@@ -171,7 +171,7 @@ async fn run(allocation: usize, cap: usize, grandchild: bool) -> (tempfile::Temp
         &mut input,
         json!({
             "protocol_version":1,"program":program(allocation,grandchild),"arguments":{},
-            "context":{"task_id":"memory-test","call_id":"memory-call","alias":"memory",
+            "context":{"agent_name":"protocol-fixture","turn":"test-turn","source_origin":"protocol-fixture.lua","task_id":"memory-test","call_id":"memory-call","alias":"memory",
                 "resource_dir":root.path(),"project_root":root.path(),"temp_dir":root.path()},
             "limits":ToolExecutionLimits {memory_bytes:cap,..Default::default()}
         }),

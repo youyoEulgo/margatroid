@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 tool_core = { path = "../core" }
+lua_runtime_core = { path = "../../lua_runtime/core" }
+storage_core = { path = "../../storage/core" }
 agent_core = { path = "../../agent/core" }
 workspace_core = { path = "../../workspace/core" }
 tool_resource_core = { path = "../../tool_resource/core" }
@@ -13,18 +15,18 @@ core_plugin = { path = "../../../mecs/core_plugin" }
 app_runtime_plugin = { path = "../../../mecs/app_runtime_plugin" }
 async_runtime_plugin = { path = "../../../mecs/async_runtime_plugin" }
 closure_plugin = { path = "../../../mecs/closure_plugin" }
-base64 = "0.22"
 futures-util = "0.3"
 jsonschema = { version = "0.33", default-features = false }
 mlua = { version = "0.11", features = ["lua54", "vendored", "async", "serialize", "send"] }
 nix = { version = "0.31.2", features = ["process", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = { workspace = true }
-toml = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tempfile = "3"
+
+[dev-dependencies]
+base64 = "0.22"
 
 [[bin]]
 name = "tool_runner"

@@ -13,6 +13,7 @@ futures-util = "0.3"
 libc = "0.2"
 
 [dev-dependencies]
+storage_core = { path = "../../crates/margatroid/storage/core" }
 agent_core = { path = "../../crates/margatroid/agent/core" }
 workspace_core = { path = "../../crates/margatroid/workspace/core" }
 tool_core = { path = "../../crates/margatroid/tool/core" }

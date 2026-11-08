@@ -26,9 +26,9 @@ async fn unavailable_selected_backend_never_falls_back_to_unrestricted_worker() 
         .unwrap();
     let request = json!({
         "protocol_version":1,
-        "program":"function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() margatroid:process_open({program='/bin/touch',arguments={'unsafe'}}):wait(); margatroid:task_return('unsafe') end",
+        "program":"function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() margatroid.process:start('/bin/touch', {'unsafe'}):wait(); margatroid.task:return_result('unsafe') end",
         "arguments":{},
-        "context":{"task_id":"sandbox-test","call_id":"call","alias":"tool","owner_task_id":null,"binding":null,"resource_dir":root.path(),"project_root":root.path(),"temp_dir":root.path()},
+        "context":{"agent_name":"protocol-fixture","turn":"test-turn","source_origin":"protocol-fixture.lua","task_id":"sandbox-test","call_id":"call","alias":"tool","owner_task_id":null,"binding":null,"resource_dir":root.path(),"project_root":root.path(),"temp_dir":root.path()},
         "limits":ToolExecutionLimits::default()
     });
     let mut stdin = child.stdin.take().unwrap();

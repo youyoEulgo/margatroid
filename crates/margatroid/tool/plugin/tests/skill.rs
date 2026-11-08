@@ -1,4 +1,7 @@
 //! Pure Lua skill resource integration through the actual tool host.
+#[path = "support/storage.rs"]
+mod storage_fixture;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use agent_core::{Agent, AgentState};
@@ -42,8 +45,19 @@ mod linux {
             std::fs::create_dir_all(&resource).unwrap();
             let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../../resources/tools/local/skill-register/latest");
-            for name in ["tool.toml", "input.schema.json", "main.lua"] {
-                std::fs::copy(bundled.join(name), resource.join(name)).unwrap();
+            for entry in std::fs::read_dir(&bundled).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                if entry.file_type().unwrap().is_file()
+                    && (name == "tool.toml"
+                        || name == "input.schema.json"
+                        || entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "lua"))
+                {
+                    std::fs::copy(entry.path(), resource.join(name)).unwrap();
+                }
             }
             let imported = read_tool(&resource.join("tool.toml")).unwrap();
             let mut tools = Tools::default();
@@ -77,6 +91,7 @@ mod linux {
                 },
             );
             let agent = app.world_mut().spawn();
+            super::storage_fixture::mount(app.world_mut(), agent, root.path());
             app.world_mut().insert_component(
                 agent,
                 Agent {
@@ -164,7 +179,19 @@ mod linux {
             self.drained();
             response.content
         }
+        fn logs(&self) -> Vec<storage_core::StoredAgentLog> {
+            storage_core::read_agent_logs(
+                self.app
+                    .world()
+                    .get_component::<storage_core::AgentStorage>(self.agent)
+                    .unwrap(),
+                None,
+                100,
+            )
+            .unwrap()
+        }
         fn failure(&mut self, id: &str, alias: &str, arguments: Value) -> String {
+            let logs_before = self.logs();
             let reply = self.execute(id, alias, arguments);
             let response = self.response(reply).unwrap();
             assert!(
@@ -173,8 +200,112 @@ mod linux {
                 response.content
             );
             self.drained();
+            assert!(
+                response.content.starts_with("Skill: "),
+                "{id}: {}",
+                response.content
+            );
+            assert!(!response.content.contains("stack traceback"));
+            assert!(!response.content.contains("main.lua:"));
+            assert_eq!(
+                self.logs(),
+                logs_before,
+                "validation must not be auto-logged"
+            );
             response.content
         }
+    }
+
+    #[test]
+    fn unexpected_skill_exception_is_rethrown_to_host_and_logged_once() {
+        let mut f = Fixture::new();
+        let skill = f.root.path().join("unexpected-skill");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: unexpected-skill\ndescription: valid\n---\nInstructions\n",
+        )
+        .unwrap();
+        let program_path = f.resource.join("main.lua");
+        let program = std::fs::read_to_string(&program_path).unwrap();
+        let program = program.replace(
+            "local files = inventory(root)",
+            "error('unexpected-skill-marker')\n    local files = inventory(root)",
+        );
+        std::fs::write(program_path, program).unwrap();
+        let reply = f.execute(
+            "unexpected",
+            "skill_register",
+            json!({"path":skill.join("SKILL.md")}),
+        );
+        let failure = f.response(reply).unwrap_err();
+        assert_eq!(failure.kind, ToolErrorKind::ExecutionFailed);
+        assert!(!failure.message.contains("main.lua:"));
+        assert!(!failure.message.contains("stack traceback"));
+        f.drained();
+        let logs = f.logs();
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0]
+            .record
+            .raw_error
+            .as_deref()
+            .unwrap()
+            .contains("unexpected-skill-marker"));
+        assert_eq!(logs[0].record.source, storage_core::AgentLogSource::Tool);
+    }
+
+    #[test]
+    fn skill_symlinks_use_canonical_targets_for_registration_inventory_and_reads() {
+        use std::os::unix::fs::symlink;
+        let mut f = Fixture::new();
+        let skill = f.root.path().join("canonical-skill");
+        std::fs::create_dir_all(skill.join("references")).unwrap();
+        let instructions =
+            "---\nname: canonical-skill\ndescription: Canonical skill paths.\n---\nInstructions\n";
+        std::fs::write(skill.join("SKILL.md"), instructions).unwrap();
+        std::fs::write(skill.join("references/guide.md"), REFERENCE).unwrap();
+        symlink("references/guide.md", skill.join("linked.md")).unwrap();
+        let query = f.root.path().join("query-skill");
+        symlink(&skill, &query).unwrap();
+        let registration = f.success(
+            "symlink-register",
+            "skill_register",
+            json!({"path":query.join("SKILL.md")}),
+        );
+        let registered: Value = serde_json::from_str(&registration).unwrap();
+        assert_eq!(
+            registered["skill_md"],
+            json!(skill.join("SKILL.md").canonicalize().unwrap())
+        );
+        let linked = registered["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "linked.md")
+            .unwrap();
+        assert_eq!(linked["kind"], "file");
+        assert_eq!(linked["size_bytes"], REFERENCE.len());
+        assert_eq!(
+            f.success(
+                "linked-read",
+                "canonical-skill",
+                json!({"path":"linked.md"})
+            ),
+            REFERENCE
+        );
+        // A link retargeted after registration is rechecked against the original root.
+        let outside = f.root.path().join("outside.md");
+        std::fs::write(&outside, "outside").unwrap();
+        let link = skill.join("linked.md");
+        assert_eq!(link.parent(), Some(skill.as_path()));
+        std::fs::remove_file(&link).unwrap();
+        symlink(&outside, &link).unwrap();
+        let failure = f.failure(
+            "escaped-link",
+            "canonical-skill",
+            json!({"path":"linked.md"}),
+        );
+        assert!(failure.contains("outside skill root"), "{failure}");
     }
 
     #[test]
@@ -340,12 +471,15 @@ mod linux {
             instructions.replace(DESCRIPTION, "Conflicting replacement description"),
         )
         .unwrap();
-        let conflict_error = f.failure(
+        let reply = f.execute(
             "conflict",
             "skill_register",
             json!({"path":conflict.join("SKILL.md")}),
         );
-        assert!(conflict_error.contains(ALIAS), "{conflict_error}");
+        let conflict_error = f.response(reply).unwrap_err();
+        assert!(conflict_error.message.contains(ALIAS), "{conflict_error}");
+        assert!(!conflict_error.message.contains("stack traceback"));
+        f.drained();
         assert_eq!(f.tools(), definitions);
         assert_eq!(f.success("after-conflict", ALIAS, json!({})), instructions);
 

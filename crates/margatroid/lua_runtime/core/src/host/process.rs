@@ -3,25 +3,25 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 
+use super::{SharedHostError, SharedHostErrorKind as Kind};
 use mlua::{Lua, UserData, UserDataMethods};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{watch, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio_util::sync::CancellationToken;
-use tool_core::{ToolError, ToolErrorKind as Kind};
 
 const READ_BYTES: usize = 8192;
 
-fn failure(kind: Kind, message: impl Into<String>) -> ToolError {
-    ToolError::new(kind, message)
+fn failure(kind: Kind, message: impl Into<String>) -> SharedHostError {
+    SharedHostError::new(kind, message)
 }
-fn io_failure(operation: &str, error: std::io::Error) -> ToolError {
+fn io_failure(operation: &str, error: std::io::Error) -> SharedHostError {
     failure(
         Kind::ExecutionFailed,
         format!("process {operation}: {error}"),
     )
 }
-fn closed() -> ToolError {
+fn closed() -> SharedHostError {
     failure(Kind::Closed, "process session closed")
 }
 
@@ -33,12 +33,12 @@ struct Sessions {
 
 /// Only this worker's sessions; no process data crosses the runner protocol.
 #[derive(Clone, Default)]
-pub(crate) struct ProcessRegistry(Arc<Mutex<Sessions>>);
+pub struct ProcessRegistry(Arc<Mutex<Sessions>>);
 
 impl ProcessRegistry {
     /// Call on every worker exit, after dropping the active Lua execution future.
-    pub(crate) async fn cleanup(&self) -> Result<(), ToolError> {
-        use futures_util::{stream::FuturesUnordered, StreamExt};
+    pub async fn cleanup(&self) -> Result<(), SharedHostError> {
+        use futures_util::{StreamExt, stream::FuturesUnordered};
         let sessions = {
             let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
             state.closed = true;
@@ -75,7 +75,7 @@ struct ProcessInner {
     stdout: AsyncMutex<Option<ChildStdout>>,
     stderr: AsyncMutex<Option<ChildStderr>>,
     close: CancellationToken,
-    status: watch::Receiver<Option<Result<ExitStatus, ToolError>>>,
+    status: watch::Receiver<Option<Result<ExitStatus, SharedHostError>>>,
 }
 struct WritePipe {
     stdin: Option<ChildStdin>,
@@ -86,7 +86,7 @@ struct PendingWrite {
     offset: usize,
 }
 impl ProcessSession {
-    async fn wait(&self) -> Result<ExitStatus, ToolError> {
+    async fn wait(&self) -> Result<ExitStatus, SharedHostError> {
         let mut status = self.inner.status.clone();
         loop {
             if let Some(result) = status.borrow_and_update().clone() {
@@ -101,7 +101,7 @@ impl ProcessSession {
         }
     }
 
-    async fn close(&self) -> Result<(), ToolError> {
+    async fn close(&self) -> Result<(), SharedHostError> {
         self.inner.close.cancel();
         let result = self.wait().await;
         {
@@ -114,7 +114,7 @@ impl ProcessSession {
         result.map(|_| ())
     }
 
-    async fn write(&self, bytes: &[u8]) -> Result<(), ToolError> {
+    async fn write(&self, bytes: &[u8]) -> Result<(), SharedHostError> {
         tokio::select! {
             biased;
             _ = self.inner.close.cancelled() => Err(closed()),
@@ -158,7 +158,7 @@ impl ProcessSession {
 async fn read_pipe<R: AsyncRead + Unpin>(
     pipe: &AsyncMutex<Option<R>>,
     close: &CancellationToken,
-) -> Result<(Vec<u8>, bool), ToolError> {
+) -> Result<(Vec<u8>, bool), SharedHostError> {
     tokio::select! {
         biased;
         _ = close.cancelled() => Err(closed()),
@@ -245,23 +245,20 @@ impl UserData for ProcessSession {
 }
 
 /// Install only after configuration acknowledgement, inside the sandbox worker.
+/// Returns the registry and the plain `process_start(program, arguments)` callback.
 /// Relative executable paths resolve against project_root; PATH lookup is forbidden.
-pub(crate) fn install_process(
+pub fn install_process(
     lua: &Lua,
     project_root: PathBuf,
-) -> Result<(ProcessRegistry, mlua::Function), ToolError> {
+) -> mlua::Result<(ProcessRegistry, mlua::Function)> {
     let registry = ProcessRegistry::default();
     let sessions = registry.clone();
 
-    let constructor = lua.create_async_function(move |lua, options: mlua::Table| {
+    let constructor = lua.create_async_function(move |lua, (program, arguments): (String, Vec<String>)| {
         let sessions = sessions.clone();
         let root = project_root.clone();
 
-
         async move {
-            let program: String = options.get("program")?;
-            let arguments: Option<Vec<String>> = options.get("arguments")?;
-            let arguments = arguments.unwrap_or_default();
             if program.is_empty() || program.contains('\0') || arguments.iter().any(|arg| arg.contains('\0')) {
                 return Err(mlua::Error::external(failure(Kind::InvalidArguments, "invalid process program or arguments")));
             }
@@ -304,7 +301,7 @@ pub(crate) fn install_process(
             drop(state);
             lua.create_userdata(session)
         }
-    }).map_err(|error| failure(Kind::ExecutionFailed, error.to_string()))?;
+    })?;
     Ok((registry, constructor))
 }
 

@@ -11,6 +11,43 @@ pub(crate) struct DatabaseState {
     pub(crate) retired: AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentLogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentLogSource {
+    Driver,
+    Tool,
+    Host,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentLogRecord {
+    pub created_at_ms: Option<u64>,
+    pub level: AgentLogLevel,
+    pub source: AgentLogSource,
+    pub stage: String,
+    pub message: String,
+    pub details_json: Option<serde_json::Value>,
+    pub context_json: Option<serde_json::Value>,
+    pub origin: Option<String>,
+    pub raw_error: Option<String>,
+    pub traceback: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredAgentLog {
+    pub sequence: u64,
+    pub record: AgentLogRecord,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum StorageOperation {
     CreateBlock {

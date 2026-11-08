@@ -237,7 +237,8 @@ start_flow(context: FlowContext) -> Future<Output = Result<StartOutput, StartErr
         使用tokio::join!等待两个接收端，与原有资源初始化一起完成；
         收齐全部结果后处理错误，不提前丢弃另一项。
         新实例使用空Tools，接收普通导入和动态注入。全部初始化成功后准备agent_info并发送StartDriverLuaVm，等待原reply；
-        mcl和wait由Lua Runtime构造。
+        agent_info作为共享margatroid.context的只读材料，driver:mcl和driver:wait由Lua Runtime构造
+        Driver及工具宿主克隆已初始化的AgentStorage作为日志能力，不增加启动事件字段
         失败清理本次已创建内容并返回，成功返回；
         core不引用其他core的组件类型。
 
@@ -246,7 +247,8 @@ stop_flow(context: FlowContext) -> Future<Output = Result<StopOutput, StopError>
         请求Driver停止和执行取消；
         沿现有流程停止任务；
         任务监督移除所属Tools记录；其他任务按Agent关闭的既有停止流程清理，不按工具owner关系级联。
-        等待任务、子进程及MCL真实收口。返回清理结果，不销毁协调Entity。
+        等待任务、子进程及MCL真实收口，并等待本次已提交的日志写入完成后再释放存储句柄
+        返回清理结果，不销毁协调Entity。
 
 restart_flow(context: FlowContext) -> Future<Output = Result<RestartOutput, RestartError>>
     行为：

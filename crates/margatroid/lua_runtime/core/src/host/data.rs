@@ -1,25 +1,26 @@
 //! Data conversion and filesystem callbacks local to the sandboxed worker.
-use base64::{engine::general_purpose::STANDARD, Engine};
+use super::{SharedHostError, SharedHostErrorKind as Kind};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use mlua::{Lua, LuaSerdeExt, Value as LuaValue};
 use serde_json::Value;
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tool_core::{ToolError, ToolErrorKind as Kind};
+use std::{collections::HashSet, path::PathBuf};
+
+#[path = "files.rs"]
+mod files;
+#[path = "text.rs"]
+mod text;
 
 const KIND: &str = "__margatroid_data_kind";
 fn error(message: impl Into<String>) -> mlua::Error {
-    mlua::Error::external(ToolError::new(Kind::InvalidArguments, message))
+    mlua::Error::external(SharedHostError::new(Kind::InvalidArguments, message))
 }
 fn io_error(operation: &str, err: std::io::Error) -> mlua::Error {
-    mlua::Error::external(ToolError::new(
+    mlua::Error::external(SharedHostError::new(
         Kind::ExecutionFailed,
         format!("{operation}: {err}"),
     ))
 }
-fn from_lua(lua: &Lua, value: LuaValue) -> mlua::Result<Value> {
+pub fn from_lua(lua: &Lua, value: LuaValue) -> mlua::Result<Value> {
     fn walk(lua: &Lua, value: LuaValue, seen: &mut HashSet<usize>) -> mlua::Result<Value> {
         match value {
             LuaValue::Nil => Ok(Value::Null),
@@ -84,7 +85,34 @@ fn from_lua(lua: &Lua, value: LuaValue) -> mlua::Result<Value> {
     }
     walk(lua, value, &mut HashSet::new())
 }
-pub(super) fn to_lua(lua: &Lua, value: Value) -> mlua::Result<LuaValue> {
+/// Convert object-only inputs such as log details, treating an unmarked `{}` as
+/// an empty object while respecting explicitly encoded array/object identity.
+pub fn from_lua_object(lua: &Lua, value: LuaValue) -> mlua::Result<Value> {
+    if let LuaValue::Table(table) = &value {
+        let metatable = table.metatable();
+        let marker = metatable
+            .as_ref()
+            .and_then(|meta| meta.raw_get::<String>(KIND).ok());
+        let marked_array = marker.as_deref() == Some("array")
+            || metatable
+                .as_ref()
+                .is_some_and(|meta| meta.to_pointer() == lua.array_metatable().to_pointer());
+        if marked_array {
+            return Err(error("expected an object"));
+        }
+        if marker.is_none() && table.clone().pairs::<LuaValue, LuaValue>().next().is_none() {
+            return Ok(Value::Object(serde_json::Map::new()));
+        }
+    }
+    let value = from_lua(lua, value)?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(error("expected an object"))
+    }
+}
+
+pub fn to_lua(lua: &Lua, value: Value) -> mlua::Result<LuaValue> {
     match value {
         Value::Array(values) => {
             let table = lua.create_table_with_capacity(values.len(), 0)?;
@@ -202,195 +230,72 @@ fn toml_value(value: toml::Value) -> mlua::Result<Value> {
         value => serde_json::to_value(value).map_err(mlua::Error::external)?,
     })
 }
-fn path(root: &Path, value: &str) -> mlua::Result<PathBuf> {
-    Ok(root.join(value))
-}
-fn path_text(value: &Path) -> mlua::Result<String> {
-    value
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| error("filesystem path is not valid UTF-8"))
-}
-fn kind(value: std::fs::FileType) -> &'static str {
-    if value.is_symlink() {
-        "symlink"
-    } else if value.is_file() {
-        "file"
-    } else if value.is_dir() {
-        "directory"
-    } else {
-        "other"
-    }
-}
 /// Callbacks are plain functions; the host userdata dispatch removes `self`.
-pub(super) fn install(
-    lua: &Lua,
-    callbacks: &mlua::Table,
-    project_root: PathBuf,
-) -> Result<(), ToolError> {
-    install_inner(lua, callbacks, project_root)
-        .map_err(|e| ToolError::new(Kind::ExecutionFailed, e.to_string()))
-}
-fn install_inner(lua: &Lua, callbacks: &mlua::Table, root: PathBuf) -> mlua::Result<()> {
-    for format in ["json", "yaml", "toml"] {
-        callbacks.set(
-            format!("{format}_encode"),
-            lua.create_function(move |lua, value: LuaValue| {
-                let value = from_lua(lua, value)?;
-                let bytes = match format {
-                    "json" => serde_json::to_vec(&value).map_err(mlua::Error::external)?,
-                    "yaml" => {
-                        let mut bytes = Vec::new();
-                        serde_yaml::to_writer(&mut bytes, &value).map_err(mlua::Error::external)?;
-                        bytes
-                    }
-                    _ => {
-                        if !value.is_object() {
-                            return Err(error("TOML root must be an object"));
-                        }
-                        toml::to_string(&value)
-                            .map_err(mlua::Error::external)?
-                            .into_bytes()
-                    }
-                };
-
-                lua.create_string(bytes)
-            })?,
-        )?;
-        callbacks.set(
-            format!("{format}_decode"),
-            lua.create_function(move |lua, text: mlua::String| {
-                let text = text.to_str()?;
-                let value = match format {
-                    "json" => serde_json::from_str(&text).map_err(mlua::Error::external)?,
-                    "yaml" => yaml_decode(&text)?,
-                    _ => toml_value(
-                        toml::from_str::<toml::Table>(&text)
-                            .map(toml::Value::Table)
-                            .map_err(mlua::Error::external)?,
-                    )?,
-                };
-
-                to_lua(lua, value)
-            })?,
-        )?;
-    }
+pub fn install(lua: &Lua, callbacks: &mlua::Table, root: PathBuf) -> mlua::Result<()> {
     callbacks.set(
-        "base64_encode",
-        lua.create_function(move |lua, bytes: mlua::String| {
-            lua.create_string(STANDARD.encode(bytes.as_bytes()))
-        })?,
-    )?;
-    callbacks.set(
-        "base64_decode",
-        lua.create_function(move |lua, text: mlua::String| {
-            let bytes = STANDARD
-                .decode(text.as_bytes())
-                .map_err(mlua::Error::external)?;
+        "data_encode",
+        lua.create_function(|lua, (format, value): (String, LuaValue)| {
+            if format == "base64" {
+                let LuaValue::String(bytes) = value else {
+                    return Err(error("base64 encoding requires a byte string"));
+                };
+                return lua.create_string(STANDARD.encode(bytes.as_bytes()));
+            }
+            if !matches!(format.as_str(), "json" | "yaml" | "toml") {
+                return Err(error("unsupported data format"));
+            }
+            let value = from_lua(lua, value)?;
+            let bytes = match format.as_str() {
+                "json" => serde_json::to_vec(&value).map_err(mlua::Error::external)?,
+                "yaml" => {
+                    let mut bytes = Vec::new();
+                    serde_yaml::to_writer(&mut bytes, &value).map_err(mlua::Error::external)?;
+                    bytes
+                }
+                _ => {
+                    if !value.is_object() {
+                        return Err(error("TOML root must be an object"));
+                    }
+                    toml::to_string(&value)
+                        .map_err(mlua::Error::external)?
+                        .into_bytes()
+                }
+            };
             lua.create_string(bytes)
         })?,
     )?;
-    let project = root.clone();
     callbacks.set(
-        "read_file",
-        lua.create_async_function(move |lua, name: String| {
-            let path = path(&project, &name);
-            async move {
-                let mut file = tokio::fs::File::open(path?)
-                    .await
-                    .map_err(|e| io_error("read_file", e))?;
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)
-                    .await
-                    .map_err(|e| io_error("read_file", e))?;
-
-                lua.create_string(bytes)
+        "data_decode",
+        lua.create_function(|lua, (format, content): (String, mlua::String)| {
+            if format == "base64" {
+                let bytes = STANDARD
+                    .decode(content.as_bytes())
+                    .map_err(mlua::Error::external)?;
+                return Ok(LuaValue::String(lua.create_string(bytes)?));
             }
+            if !matches!(format.as_str(), "json" | "yaml" | "toml") {
+                return Err(error("unsupported data format"));
+            }
+            let text = content.to_str()?;
+            let value = match format.as_str() {
+                "json" => serde_json::from_str(&text).map_err(mlua::Error::external)?,
+                "yaml" => yaml_decode(&text)?,
+                _ => toml_value(
+                    toml::from_str::<toml::Table>(&text)
+                        .map(toml::Value::Table)
+                        .map_err(mlua::Error::external)?,
+                )?,
+            };
+            to_lua(lua, value)
         })?,
     )?;
-    let project = root.clone();
-    callbacks.set(
-        "write_file",
-        lua.create_async_function(move |_, (name, bytes): (String, mlua::String)| {
-            let path = path(&project, &name);
-            async move {
-                let mut file = tokio::fs::File::create(path?)
-                    .await
-                    .map_err(|e| io_error("write_file", e))?;
-                file.write_all(&bytes.as_bytes())
-                    .await
-                    .map_err(|e| io_error("write_file", e))?;
-                file.flush().await.map_err(|e| io_error("write_file", e))
-            }
-        })?,
-    )?;
-    let project = root.clone();
-    callbacks.set(
-        "read_dir",
-        lua.create_async_function(move |lua, name: String| {
-            let path = path(&project, &name);
-            async move {
-                let mut dir = tokio::fs::read_dir(path?)
-                    .await
-                    .map_err(|e| io_error("read_dir", e))?;
-                let mut values = Vec::new();
-                while let Some(entry) = dir
-                    .next_entry()
-                    .await
-                    .map_err(|e| io_error("read_dir", e))?
-                {
-                    let name = entry
-                        .file_name()
-                        .into_string()
-                        .map_err(|_| error("directory name is not valid UTF-8"))?;
-                    let path = path_text(&entry.path())?;
-                    let kind = kind(
-                        entry
-                            .file_type()
-                            .await
-                            .map_err(|e| io_error("read_dir", e))?,
-                    );
-                    let value = serde_json::json!({"name":name,"path":path,"kind":kind});
-                    values.push(value);
-                }
-                values.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-                to_lua(&lua, Value::Array(values))
-            }
-        })?,
-    )?;
-    let project = root.clone();
-    callbacks.set(
-        "metadata",
-        lua.create_async_function(move |lua, name: String| {
-            let path = path(&project, &name);
-            async move {
-                let meta = tokio::fs::symlink_metadata(path?)
-                    .await
-                    .map_err(|e| io_error("metadata", e))?;
-                let value =
-                    serde_json::json!({"kind":kind(meta.file_type()),"size_bytes":meta.len()});
-
-                to_lua(&lua, value)
-            }
-        })?,
-    )?;
-    callbacks.set(
-        "canonicalize",
-        lua.create_async_function(move |lua, name: String| {
-            let path = path(&root, &name);
-            async move {
-                let value = path_text(
-                    &tokio::fs::canonicalize(path?)
-                        .await
-                        .map_err(|e| io_error("canonicalize", e))?,
-                )?;
-
-                lua.create_string(value)
-            }
-        })?,
-    )?;
-    Ok(())
+    files::install(lua, callbacks, root)?;
+    text::install(lua, callbacks)
 }
+
+#[cfg(test)]
+#[path = "../../tests/internal/matches.rs"]
+mod match_tests;
 #[cfg(test)]
 #[path = "../../tests/internal/data.rs"]
 mod tests;

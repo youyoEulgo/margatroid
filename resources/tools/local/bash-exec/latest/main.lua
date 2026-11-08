@@ -3,6 +3,7 @@ function configure(arguments, context)
 end
 
 function execute(arguments, context)
+    arguments = context.arguments
     local quote = "'" .. arguments.cmd:gsub("'", "'\\''") .. "'"
     local client = dofile(context.resource_dir .. "/shell.lua")(context)
     local result = client.exec("bash --noprofile --norc -c " .. quote, { max_output_bytes = 64 * 1024 })
@@ -16,6 +17,6 @@ function execute(arguments, context)
     end
     if result.truncated then content = content .. "\n[output truncated at the size limit]" end
     content = content .. "\n[exit code: " .. tostring(result.exit_code) .. "]"
-    margatroid:task_return({ ok = result.exit_code == 0, content = content })
-    margatroid:task_finish(context.task_id)
+    margatroid.task:return_result({ ok = result.exit_code == 0, content = content })
+    margatroid.task:finish(context.task_id)
 end

@@ -10,7 +10,7 @@ System区分事件、闭包结果、提交闭包和oneshot回复，使用Rust名
 # 板块格式
 
 ```text
-# lib        lua_runtime/core/src/lib.rs；lua_runtime/plugin/src/lib.rs  VM通知扩展；Plugin安装
+# lib        lua_runtime/core/src/lib.rs；lua_runtime/plugin/src/lib.rs  VM通知扩展；共享宿主绑定；Plugin安装
 # components lua_runtime/core/src/components.rs                        DriverLuaVm组件
 # events     lua_runtime/core/src/events.rs                            VM启停请求及退出通知
 # system     lua_runtime/plugin/src/system.rs                          请求及闭包结果路由
@@ -126,7 +126,12 @@ driver_lua_vm_exit_system(world: &mut World)
 crate公开：
 ```text
 handle_start_driver_lua_vm(world: &mut World, request: StartDriverLuaVm)
-    行为：认领reply，检查owner、workspace及预算；拒绝已有VM；安装新实例和通知组件；克隆本次wake的Arc及实例关联；从workspace_core取得提交入口，提交run_driver工厂及start_vm闭包；提交失败撤销本次安装并回复错误。
+    行为：
+        认领reply，检查owner、workspace及预算，拒绝已有VM
+        克隆当前AgentStorage供日志写入，固定Agent与本次Driver实例关联
+        安装新实例和通知组件，克隆本次wake的Arc及实例关联
+        从workspace_core取得提交入口，提交run_driver工厂及start_vm闭包
+        提交失败撤销本次安装并回复错误，不修改启动事件字段
 
 handle_start_result(world: &mut World, result: Result<StartOutput, StartError>)
     行为：核对实例，通过原reply回复；失败且无退出证明时保留组件。
@@ -138,7 +143,10 @@ handle_stop_result(world: &mut World, result: Result<StopOutput, StopError>)
     行为：核对实例；成功移除本次VM组件；通过原reply回复；失败保留控制能力；不销毁owner或Workspace。
 
 handle_driver_lua_vm_exited(world: &mut World, event: DriverLuaVmExited)
-    行为：核对实例并报告执行错误，不修改Agent状态，不消费ended，不替代启停回复。
+    行为：
+        核对实例并报告已完成原始诊断记录的简洁执行错误
+        不重复记录入口已捕获的同一Lua异常
+        不修改Agent状态，不消费ended，不替代启停回复
 ```
 
 私有：
@@ -156,7 +164,18 @@ stop_vm(context: StopContext) -> Future<Output = Result<StopOutput, StopError>>
     行为：等待原ended；VM退出且Lua释放后返回成功，通道丢失返回EndNotificationLost。
 
 run_driver(context: RunContext) -> LocalFuture
-    行为：在Workspace线程创建Lua、设置预算、安装请求中的agent_info等环境；在Lua Runtime内构造mcl和wait宿主绑定并exec_async；捕获返回、错误、panic及取消；释放Lua后完成ended并发送DriverLuaVmExited；未ready即退出则通过剩余ready发送端回复启动失败；关闭wake，不关闭Workspace线程。
+    行为：
+        在Workspace线程创建Lua、设置预算，按共享宿主定义安装margatroid对象
+        context.kind固定driver，agent_info放入只读context，不再注入独立agent_info、mcl、wait全局
+        公共能力复用同一绑定实现；margatroid.driver绑定本plugin构造的MclHost与WaitHost
+        margatroid.tools与margatroid.task保留拒绝入口，不持有ToolTask能力，不伪造工具任务
+        在宿主边界捕获脚本编译、加载及Driver主入口的Lua异常，保留原始错误、来源、行号和traceback
+        异常通过append_agent_log写入当前Agent独立日志表；等待记录完成后沿原失败及退出流程处理
+        同一异常只在入口边界记录一次；主动取消与正常退出不记录为Lua脚本故障
+        日志写入失败使用现有诊断通道，不覆盖原错误，不递归log
+        对外LuaRuntimeError只提供分类与简洁说明，原始诊断不自动进入会话
+        释放Lua及其执行资源后完成ended并发送既有DriverLuaVmExited
+        未ready即退出则通过剩余ready发送端回复启动失败；关闭wake，不关闭Workspace线程
 ```
 
 # types
@@ -181,7 +200,7 @@ WaitHost：等待适配，私有类型
 
 StartContext：启动等待上下文--instance、ready接收端、cancel、RuntimeEventSender、原reply
 StopContext：停止等待上下文--instance、ended接收端、原reply
-RunContext：执行上下文--instance、program、environment、wake、ready发送端存储、ended发送端、cancel、RuntimeEventSender
+RunContext：执行上下文--instance、program、environment、wake、ready发送端存储、ended发送端、cancel、RuntimeEventSender、AgentStorage日志能力及宿主固定关联
 StartOutput：启动成功载荷--instance、原reply
 StartError：启动失败载荷--instance、原reply、LuaRuntimeError、cleanup_completed
 StopOutput：停止成功载荷--instance、原reply
@@ -221,6 +240,106 @@ LuaValue：宿主值，公开枚举
 LuaHostFunction：异步宿主接口，公开trait
     call(&self, arguments: Vec<LuaValue>, cancel: CancellationToken) -> HostFuture
         行为：返回异步结果，不借用World。
+
+Margatroid：共享Lua userdata
+    context: serde_json::Value--只读执行身份、调用关联及arguments
+    files: 文件操作子对象--read、write、list、info、create_directory、matches
+    data: 数据转换子对象--encode、decode及null标记
+    text: 文本搜索子对象--search
+    process: 子进程子对象--start
+    driver: Driver协调子对象--mcl、wait
+    tools: 工具定义子对象--register
+    task: 运行任务子对象--return_result、finish、append_output、replace_output、read_output、send、receive
+
+HostNamespace：只读子对象
+    namespace: Files | Data | Text | Process | Driver | Tools | Task
+    identity: Driver | Tool--宿主固定
+    phase: Configure | Execute
+    methods: 已裁剪的能力回调，不向Lua暴露可修改回调表
+
+HostDefinition：两种执行环境共用的宿主定义
+    kind: HostKind
+    context: serde_json::Value--真实宿主上下文
+    arguments: serde_json::Value--安装时合入context.arguments，不作为Lua根对象字段
+
+HostKind：执行身份
+    Driver | Tool
+
+LuaHostContext字段约定：JSON对象保存真实执行元数据
+    kind: Driver | Tool
+    arguments: LuaValue--工具调用参数，Driver为data.null
+    agent_info: LuaValue--当前Agent真实信息
+    project_root: Option<PathBuf>--只在当前环境确实提供时存在
+    driver_instance: Option<String>
+    task_id, call_id, alias: Option<String>--仅工具提供，不虚构Driver任务
+    owner_task_id: Option<String>
+    binding: Option<LuaValue>
+    resource_dir, temp_dir: Option<PathBuf>
+
+LuaFailureDiagnostic：从类型化Lua错误提取的诊断
+    class: LuaFailureClass
+    message: String--经过分类的可展示说明
+    traceback: Option<String>
+    capture(error: &LuaError) -> Self
+        行为：
+            递归解开Callback、WithContext和嵌套External错误，保存可用traceback
+            仅对Lua Runtime或Syntax来源位置进行清理，不改写任意业务或成功文本
+    capture_with(error: &LuaError, external_message: Fn(&dyn Error) -> Option<String>) -> Self
+        行为：
+            允许领域适配器从真实类型化ExternalError取得简洁说明
+            调用方在提取前保存error.to_string()作为raw_error，stage和origin由执行上下文补齐
+
+LuaFailureClass：错误分类
+    Syntax | Runtime | Callback | External | Memory | Other
+
+Margatroid::install(lua: &Lua, definition: HostDefinition) -> Result<AnyUserData, LuaError>
+    行为：
+        两种运行时复用同一userdata、字段getter和值转换，不在plugin间互相调用
+        强制context.kind匹配宿主身份，context及其arguments返回独立副本
+        files、data、text、process、driver、tools、task均为不可替换子对象，未enable时方法均明确拒绝
+        data.null保留空值身份，根对象不再提供version、arguments或null字段
+        不保留旧全局mcl、wait、agent_info、顶层文件编解码方法或tool命名空间作为兼容入口
+
+Margatroid::enable(object: &AnyUserData, callbacks: Table) -> Result<(), LuaError>
+    行为：
+        只选取公共方法及当前身份的专用能力，冻结为不向Lua公开的私有回调集合
+        公共方法按files、data、text、process绑定，log与wait_any保留在根对象
+        Driver协调能力只绑定driver；工具定义与任务能力分别绑定tools和task
+        tools只登记定义，task只控制运行任务，不能因owner字段或命名重叠隐式联动
+        拒绝重复enable；错误身份的命名空间不持有真实回调
+        每次调用均核对固定身份，不从Lua可写字段推断权限
+        无能力或错误身份时返回明确宿主调用错误，不返回nil索引错误
+        异步方法先克隆执行句柄并释放userdata借用，再await
+
+margatroid:log(level: String, message: String, details: Option<LuaValue>) -> Future<Output = ()>
+    行为：
+        校验等级和可表达的附加数据；通过日志回调补齐当前Agent、执行身份、来源、实例和可用关联
+        Driver回合关联在调用时由宿主取得，空闲时为None，不把启动时的turn缓存为全VM关联
+        Tool回合与调用关联取已受理请求的固定材料
+        Driver回调使用owned AgentStorage并spawn_blocking调用append_agent_log，等待真实写入完成
+        Tool回调通过私有worker协议请求宿主写入同一张agent_logs并等待确认
+        共享绑定只调用传入回调，不引用storage_core或私有工具协议类型
+        脚本不能指定或覆盖可信关联；不追加历史、不触发推理、不结束回合
+        失败返回写入错误，不递归log；工具configure阶段不开放该IO方法
+
+margatroid.driver:mcl(arguments: Vec<LuaValue>) -> HostFuture
+    行为：
+        require identity == Driver
+        使用现有MclHost参数及错误契约；source绑定真实Agent地址和本次Driver实例
+        Tool中调用明确返回执行身份错误，不发送MCL事件
+
+margatroid.driver:wait() -> HostFuture
+    行为：
+        require identity == Driver
+        复用当前DriverWakeSlot等待及取消语义；Tool中调用明确失败
+        Driver主入口捕获与日志不改变既有wake/ready/ended契约
+
+HostNamespace::callback(name: &str) -> Result<Function, LuaError>
+    行为：
+        根据命名空间和固定执行身份查找冻结的回调，具体共享方法签名见Tool设计
+        driver仅允许Driver身份，tools及task仅允许Tool身份且已确认execute阶段
+        文件、数据、文本、进程和日志沿真实执行环境的权限和阶段启用
+        错误身份明确失败，不创建工具任务、不伪造回复端、不扩大宿主权限
 
 HostFuture：公开类型别名
     Pin<Box<dyn Future<Output = Result<LuaValue, LuaRuntimeError>> + Send>>
@@ -276,7 +395,12 @@ Agent Entity
 Workspace专属线程
 └── run_driver
     ├── Lua与LocalFuture
-    ├── MclHost（只发送mcl_core::MclCommand）
+    ├── Margatroid共享宿主对象
+    │   ├── 公共能力、日志与只读context
+    │   ├── driver -> MclHost及WaitHost
+    │   └── tools/task -> 无能力的拒绝入口
+    ├── AgentStorage克隆句柄 -> agent_logs
+    ├── MclHost（只发送既有mcl_core::MclCommand）
     ├── WaitHost（捕获与组件相同的wake Arc）
     └── ended发送端
 

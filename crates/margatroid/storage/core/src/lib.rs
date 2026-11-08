@@ -1,3 +1,6 @@
+mod logs;
+
+pub use logs::{append_agent_log, read_agent_logs};
 pub mod components;
 pub mod error;
 pub mod events;
@@ -22,6 +25,8 @@ use std::{
 };
 use StorageErrorKind as K;
 
+pub const SCHEMA_VERSION: i64 = 3;
+const AGENT_LOGS: &str = "CREATE TABLE agent_logs(sequence INTEGER PRIMARY KEY CHECK(sequence>0),created_at_ms INTEGER NOT NULL CHECK(typeof(created_at_ms)='integer' AND created_at_ms>=0),level TEXT NOT NULL CHECK(typeof(level)='text' AND level IN ('debug','info','warn','error')),source TEXT NOT NULL CHECK(typeof(source)='text' AND source IN ('driver','tool','host')),stage TEXT NOT NULL CHECK(typeof(stage)='text'),message TEXT NOT NULL CHECK(typeof(message)='text'),details_json TEXT CHECK(details_json IS NULL OR (typeof(details_json)='text' AND json_valid(details_json) AND json_type(details_json)='object')),context_json TEXT CHECK(context_json IS NULL OR (typeof(context_json)='text' AND json_valid(context_json) AND json_type(context_json)='object')),origin TEXT CHECK(origin IS NULL OR typeof(origin)='text'),raw_error TEXT CHECK(raw_error IS NULL OR typeof(raw_error)='text'),traceback TEXT CHECK(traceback IS NULL OR typeof(traceback)='text'));";
 const HISTORY: &str = "CREATE TABLE agent_messages(sequence INTEGER PRIMARY KEY,turn TEXT,type TEXT NOT NULL CHECK(length(type)>0),content TEXT NOT NULL,payload TEXT NOT NULL,created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0));CREATE TABLE mcl_records(sequence INTEGER PRIMARY KEY,source TEXT NOT NULL CHECK(length(source)>0),turn TEXT,content TEXT NOT NULL,payload TEXT NOT NULL,created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0));";
 const BLOCKS: &str = "CREATE TABLE blocks(name TEXT PRIMARY KEY NOT NULL CHECK(length(name)>0),fields_json TEXT NOT NULL CHECK(json_valid(fields_json) AND json_type(fields_json)='object'));";
 const TEMP_BLOCKS: &str = "CREATE TEMP TABLE blocks(name TEXT NOT NULL CHECK(length(name)>0),instance TEXT NOT NULL CHECK(length(instance)>0),fields_json TEXT NOT NULL CHECK(json_valid(fields_json) AND json_type(fields_json)='object'),PRIMARY KEY(name,instance));";
@@ -166,11 +171,15 @@ fn initialize(db: &mut Connection) -> Result<(), StorageError> {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(schema_err)?;
         if actual.is_empty() && version == 0 {
-            db.execute_batch(&format!("{HISTORY}{BLOCKS}PRAGMA user_version=2;"))
-                .map_err(write_err)?;
-        } else if version != 2 || actual != expected(&format!("{HISTORY}{BLOCKS}"))? {
+            db.execute_batch(&format!(
+                "{HISTORY}{BLOCKS}{AGENT_LOGS}PRAGMA user_version={SCHEMA_VERSION};"
+            ))
+            .map_err(write_err)?;
+        } else if version != SCHEMA_VERSION
+            || actual != expected(&format!("{HISTORY}{BLOCKS}{AGENT_LOGS}"))?
+        {
             return Err(schema_err(
-                "database does not match the current three-table schema",
+                "database does not match the current four-table schema (version 3)",
             ));
         }
         Ok(())

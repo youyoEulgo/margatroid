@@ -1,3 +1,6 @@
+#[path = "../support/storage.rs"]
+mod storage_fixture;
+
 use std::sync::{Arc, Mutex};
 
 use agent_core::{Agent, AgentState};
@@ -131,6 +134,7 @@ fn dynamic_admission_checks_schema_without_rechecking_recorded_owner() {
             .add_closure_system(RuntimePlugin::UPDATE)
             .add_plugin(ToolPlugin::new());
         let agent = app.world_mut().spawn();
+        storage_fixture::mount(app.world_mut(), agent, root.path());
         app.world_mut().insert_component(
             agent,
             Agent {

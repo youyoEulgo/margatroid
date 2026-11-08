@@ -30,16 +30,10 @@ local function resolve_path(path, root)
 end
 
 local function read_text(path)
-    local file, message = io.open(path, "rb")
-    if not file then
-        return nil, "cannot read " .. path .. ": " .. tostring(message)
-    end
-    local content, read_error = file:read(MAX_FILE_BYTES + 1)
-    file:close()
-    if content == nil then
-        if read_error then return nil, "cannot read " .. path .. ": " .. tostring(read_error) end
-        content = ""
-    end
+    local info = margatroid.files:info(path)
+    if info.kind == "symlink" and info.resolved_path then info = margatroid.files:info(info.resolved_path) end
+    if info.kind == "file" and info.size > MAX_FILE_BYTES then return nil, "file exceeds the size limit" end
+    local content = margatroid.files:read(path)
     if #content > MAX_FILE_BYTES then
         return nil, "file exceeds the size limit"
     end
@@ -48,14 +42,7 @@ local function read_text(path)
 end
 
 local function write_text(path, content)
-    local file, message = io.open(path, "wb")
-    if not file then
-        return nil, "cannot write " .. path .. ": " .. tostring(message)
-    end
-    local written, write_error = file:write(content)
-    local closed, close_error = file:close()
-    if not written then return nil, "cannot write " .. path .. ": " .. tostring(write_error) end
-    if not closed then return nil, "cannot close " .. path .. ": " .. tostring(close_error) end
+    margatroid.files:write(path, content)
     return true
 end
 
@@ -100,7 +87,8 @@ local function perform(arguments, context)
 end
 
 function execute(arguments, context)
+    arguments = context.arguments
     local result = perform(arguments, context)
-    margatroid:task_return(result)
-    margatroid:task_finish(context.task_id)
+    margatroid.task:return_result(result)
+    margatroid.task:finish(context.task_id)
 end

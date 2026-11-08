@@ -12,7 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
-use workspace_core::{WorkspaceExecutionClose, spawn_workspace_executor};
+use workspace_core::{
+    Workspace, WorkspaceExecutionClose, WorkspaceState, spawn_workspace_executor,
+};
 
 const CODER: &str = include_str!("../../../../resources/agent-drivers/local/coder/latest/base.lua");
 const REVIEWER: &str =
@@ -35,6 +37,7 @@ struct Commands {
 // deliberately controlled so every boundary can fail independently of storage.
 struct Fixture {
     app: App,
+    _root: tempfile::TempDir,
     owner: core_plugin::Entity,
     workspace: core_plugin::Entity,
     close: WorkspaceExecutionClose,
@@ -43,6 +46,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
             .add_plugin(ClosurePlugin)
@@ -54,7 +58,24 @@ impl Fixture {
             owner,
             address::Address::new("agent:local/driver-errors:latest").unwrap(),
         );
+        let storage = storage_core::open_storage(
+            &root.path().join("agent.sqlite"),
+            &root.path().join("settings.toml"),
+            "[compaction]\nthreshold = 0.8\n",
+        )
+        .unwrap();
+        app.world_mut().insert_component(owner, storage);
         let workspace = app.world_mut().spawn();
+        app.world_mut().insert_component(
+            workspace,
+            Workspace {
+                name: "driver-errors".into(),
+                definition_path: root.path().join("workspace.yaml"),
+                project_root: root.path().to_owned(),
+                state: WorkspaceState::Running,
+                agents: Default::default(),
+            },
+        );
         let executor = spawn_workspace_executor().unwrap();
         let close = executor.close.clone();
         app.world_mut().insert_component(workspace, executor);
@@ -125,6 +146,7 @@ impl Fixture {
         });
         Self {
             app,
+            _root: root,
             owner,
             workspace,
             close,
@@ -308,6 +330,35 @@ async fn unknown_runtime_errors_become_history_errors_and_next_message_recovers(
             })
             .await;
         fixture.settle().await;
+        {
+            let state = fixture.commands.lock().unwrap();
+            let error = state
+                .history
+                .iter()
+                .find(|message| message["type"] == "error")
+                .unwrap();
+            assert_eq!(error["message"], "Driver execution failed; see Agent logs");
+        }
+        let logs = storage_core::read_agent_logs(
+            fixture
+                .app
+                .world()
+                .get_component::<storage_core::AgentStorage>(fixture.owner)
+                .unwrap(),
+            None,
+            100,
+        )
+        .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].record.source, storage_core::AgentLogSource::Driver);
+        let details = logs[0].record.details_json.as_ref().unwrap();
+        assert_eq!(details["stage"], "turn");
+        assert!(
+            details["raw_error"]
+                .as_str()
+                .unwrap()
+                .contains("shipped-driver.lua")
+        );
         let before = fixture.commands.lock().unwrap().finished;
         fixture.wake(&instance);
         let state = fixture.commands.clone();
@@ -330,6 +381,26 @@ async fn initialization_failure_is_an_error_and_never_signals_ready() {
         fixture.commands.lock().unwrap().fail = Some("CONFIG GET".into());
         let error = fixture.start(source).await.unwrap_err();
         assert!(error.to_string().contains("injected CONFIG GET"));
+        assert!(!error.to_string().contains("stack traceback"));
+        let logs = storage_core::read_agent_logs(
+            fixture
+                .app
+                .world()
+                .get_component::<storage_core::AgentStorage>(fixture.owner)
+                .unwrap(),
+            None,
+            100,
+        )
+        .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(
+            logs[0]
+                .record
+                .raw_error
+                .as_deref()
+                .unwrap()
+                .contains("injected CONFIG GET")
+        );
         assert!(
             !fixture
                 .commands

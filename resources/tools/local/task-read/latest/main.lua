@@ -3,6 +3,7 @@ function configure(arguments, context)
 end
 
 function execute(arguments, context)
-    margatroid:task_return(margatroid:task_read(arguments.task_id))
-    margatroid:task_finish(context.task_id)
+    arguments = context.arguments
+    margatroid.task:return_result(margatroid.task:read_output(arguments.task_id))
+    margatroid.task:finish(context.task_id)
 end

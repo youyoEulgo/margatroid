@@ -2,27 +2,44 @@
 
 tool_core定义ToolTasks、工具请求、结果和错误，只依赖mecs及通用库。tool_plugin组合Agent、工具资源及沙箱core，不依赖其他plugin。Agent同一轮发送InitToolTasks和InitInference，等待两者回复后继续启动；InitToolTasks只挂载空集合，不执行工具。
 
-## 统一宿主对象
+## 分组宿主接口
 
-工具宿主API已统一为以下对象；本文不表示主目录部署或正在运行的daemon已经更新。
+分组宿主API已实现，工具只使用新接口，不保留旧方法别名。主目录资源可同步使用；正在运行的旧daemon与旧数据库不会自动重启或迁移。
 
-工具Lua只注入一个Rust userdata对象`margatroid`。上下文读取`margatroid.context`，参数读取`margatroid.arguments`，方法使用冒号，例如`margatroid:task_read(id)`。不再保留`margatroid()`、同名全局宿主函数或第二份json入口。标准Lua库保持原有命名；configure仅能读取元数据，配置确认后才启用执行能力。现有configure/execute参数签名保持不变。
+```text
+margatroid
+├── context（包含arguments）
+├── log(level, message, details?)
+├── wait_any(operations)
+├── files：read、write、list、info、create_directory、matches
+├── data：encode、decode、null
+├── text：search
+├── process：start
+├── driver：mcl、wait
+├── tools：register
+└── task：return_result、finish、append_output、replace_output、read_output、send、receive
+```
 
-JSON、YAML、TOML编解码使用`margatroid:json_decode/encode`、`yaml_decode/encode`、`toml_decode/encode`，Base64用`base64_encode/decode`。null使用`margatroid.null`，解码保留数组与对象（包括空容器）的种类，编码遵循该标记。YAML仅返回通用数据，不能表达的键或标签报错；TOML日期时间返回标准文本，编码不猜测字符串是否为日期。非法输入明确失败，不隐式删除或字符串化数据。
+上下文只有一个入口margatroid.context；arguments收进其中，version不再向脚本公开，null归data。公共方法按操作对象分组；Driver协调、工具定义与执行任务分别使用driver、tools、task。子对象只读，错误身份调用明确失败，不持有另一方实际回调。configure只读元数据，执行确认前不开放IO或其他方法，不保留旧名称别名。
 
-文件能力为`read_file`、`write_file`、`read_dir`、`metadata`及`canonicalize`，都在当前worker和已有沙箱中执行。文件IO异步且支持任务取消，宿主不附加读写字节配额；目录只列直接子项，不在宿主定义递归、Skill目录规则或shell命令。路径检查和读取不是自动组合成原子的目录权限能力，工具不能把canonicalize当成沙箱替代。
+files:read返回完整原始字节，write仅写指定路径，不创建父目录。create_directory(path,recursive)显式负责目录创建。info合并原属性查询和规范路径解析，返回path、resolved_path、kind、size及modified_at_ns；path是查询项的绝对路径，kind描述其自身，resolved_path才是链接目标，失效链接可为空。list只列直接子项，返回name及同样信息，不递归或隐式过滤。所有操作服从当前执行环境权限；路径解析不代替沙箱，查询再读取也不承诺无竞态。
 
-Skill注册工具用上述方法读取文件、解析YAML并收集目录；Skill元数据校验、schema生成、静态注入及按binding读取均由Lua完成。已清理Skill专用客户端crate、workspace成员、专用JSONL协议及资源bin；实现为工具本地Lua逻辑和README，不添加Skill专用宿主方法或System/事件。MCP与shell独立bin继续承担各自协议和终端行为。
+data:encode/decode(format,value)只接受json、yaml、toml、base64，不猜格式。结构化数据保留对象/数组、空容器和null，Base64处理字节。标准不支持的值、循环表或非法输入明确失败，不隐式删除或字符串化。
 
-异步userdata方法先克隆内部句柄、释放userdata借用后再等待，同一对象的不同方法可以并发。错误沿现有失败回复路径处理，成功输出不改变。
+files:matches(path,pattern)仅匹配路径字符串，使用真正glob语义；text:search(pattern,content)提供通用Rust正则匹配及字节偏移，不替代工具的文件选择、逐行搜索或展示格式。修改时间字段使glob保留原排序；原regex、忽略文件、隐藏文件、二进制及include选择规则由Lua工具和随资源交付的公共脚本实现，以现有ripgrep行为为验收基线，不能用Lua pattern近似替代。
+
+list-directory、glob、grep、write-file不再携带shell.lua/shell-client或调用rg、mkdir等外部进程。read-file、edit、read-image、skill-register也统一走files/data。只有提供shell和交互终端语义的bash、bash-exec继续使用shell-client；不新建Skill或文件工具bin。
 
 ```lua
 local context = margatroid.context
-local text = margatroid:read_file(context.resource_dir .. "/data.yaml")
-local value = margatroid:yaml_decode(text)
-margatroid:task_return(value)
-margatroid:task_finish(context.task_id)
+local content = margatroid.files:read(context.arguments.path)
+local value = margatroid.data:decode("yaml", content)
+margatroid:log("info", "文件已解析", {path = context.arguments.path})
+margatroid.task:return_result(value)
+margatroid.task:finish(context.task_id)
 ```
+
+日志和自动故障捕获保持上一版语义：主动日志及未捕获Lua异常写独立agent_logs，原始错误及traceback只入诊断记录，LLM获得分类后的失败。工具return后异常不重复回复，取消、timeout和finish控制退出不冒充Lua故障。Skill等预期业务失败直接返回说明，脚本自己pcall处理的异常需主动log，不用统一正则改写任意文本。
 
 ## 宿主预算配置
 
@@ -39,15 +56,15 @@ margatroid:task_finish(context.task_id)
 ```lua
 -- 立即完成的工具
 local result = do_work()
-margatroid:task_return(result)
-margatroid:task_finish(context.task_id)
+margatroid.task:return_result(result)
+margatroid.task:finish(context.task_id)
 
 -- 后台工具
-margatroid:task_return({ task_id = context.task_id })
+margatroid.task:return_result({ task_id = context.task_id })
 for _, item in ipairs(items) do
-    margatroid:task_write(process(item))
+    margatroid.task:append_output(process(item))
 end
-margatroid:task_finish(context.task_id)
+margatroid.task:finish(context.task_id)
 ```
 
 工具请求在System受理时必须匹配当前非空turn；无turn直接返回中止工具结果而不创建任务。回合中止先清turn，再取消推理，并原子强制return所有尚未return的工具、触发终止清理；已return未finish后台任务保留。正常return与强制return竞争同一共享回复端，只交付一次。return不会结束任务，finish才清理并移除。
@@ -62,8 +79,8 @@ function configure(arguments, context)
 end
 
 function execute(arguments, context)
-    margatroid:task_return({ ok = true, content = "done" })
-    margatroid:task_finish(context.task_id)
+    margatroid.task:return_result({ ok = true, content = "done" })
+    margatroid.task:finish(context.task_id)
 end
 ```
 
@@ -99,7 +116,7 @@ task_read同时返回replaced标记：上次读取后发生覆盖为true，否�
 
 ## bash与交互终端
 
-执行阶段宿主安装通用package.config路径配置和await_any异步原语；os.execute、io.popen明确报错并提示使用process_open。margatroid对象不提供shell、terminal_open。bash工具通过资源Lua调用process_open启动独立shell-client bin，shell IPC协议、PTY及VT100渲染由工具与bin负责，与MCP client使用相同的通用进程边界。
+执行阶段保留标准库路径信息，宿主并发等待使用margatroid:wait_any；os.execute、io.popen拒绝并提示使用margatroid.process:start。margatroid对象不提供shell、terminal_open。bash工具通过资源Lua调用process_open启动独立shell-client bin，shell IPC协议、PTY及VT100渲染由工具与bin负责，与MCP client使用相同的通用进程边界。
 
 bash工具无调用参数，打开终端后返回task_id，收到的task_send消息由Lua转发，输出由Lua选择task_write或task_replace。普通终端滚屏保留滚走的行并继续追加，不把窗口移动当覆盖；光标改写及alternate screen仍使用替换语义。终端历史上限由工具传给独立bin，默认128MiB；宿主不附加原始管道配额；任务缓存按配置窗口自动滚出旧内容。进程、PTY、终端模拟器和追加或覆盖的判断属于工具自身设计，不作为Margatroid任务机制的接口要求。
 
@@ -117,9 +134,9 @@ LLM可见的工具失败保留原调用ID、工具名、failed标记、错误类
 
 ## 动态入口与原始进程
 
-本轮实现包含tool_inject、原始子进程管道和Tools完整记录；本文不表示运行中的daemon已经更新。
+工具注册接口目标为margatroid.tools:register；底层仍为Tools完整记录与原始子进程管道，本轮文档不表示运行中的daemon已经更新。
 
-普通导入与动态注入都向Agent.Tools增加包含描述、schema、path的记录；推理每次遍历Tools，工具调用按名称查询。Tool执行侧从记录取得schema，按path读取程序。宿主只提供通用工具和进程能力，MCP连接与协议由工具资源及同目录client bin负责；bin并发推进输入写入、stdout/stderr读取和带ID响应路由。
+普通导入与动态注入都向Agent.Tools增加包含描述、schema、path的记录；推理每次遍历Tools，工具调用按名称查询。Tool执行侧从记录取得schema，按path读取程序。宿主提供通用文件、文本、数据与进程能力，MCP连接与协议由工具资源及同目录client bin负责；bin并发推进输入写入、stdout/stderr读取和带ID响应路由。
 
 tool_inject由宿主固定当前资源路径，owner_task_id由注入参数显式选择，省略为静态工具，整批登记，任一定义无效或alias冲突整批失败，不增加System或专用事件。调用入口的owner_task_id、binding通过context传给同一脚本，模型参数不能改写它们；不额外增加工具清单或可见性步骤。
 

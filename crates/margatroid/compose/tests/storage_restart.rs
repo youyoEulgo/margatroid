@@ -73,7 +73,7 @@ fn command(app: &mut App, agent: Entity, text: &str, arguments: Vec<Value>) -> M
         .clone();
     let (sender, mut receiver) = oneshot::channel();
     app.world().emit_event(MclCommand {
-        id: format!("three-table:{text}"),
+        id: format!("four-table:{text}"),
         source: agent,
         source_address: app
             .world()
@@ -109,7 +109,7 @@ fn entries(app: &App, agent: Entity, operation: StorageOperation) -> Vec<StoredH
     entries
 }
 
-fn assert_disk_schema_and_messages(path: &Path, message: &Value) {
+fn assert_disk_schema_and_messages(path: &Path, message: &Value, log_count: usize) {
     let db = rusqlite::Connection::open(path).unwrap();
     let tables = db
         .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -118,7 +118,21 @@ fn assert_disk_schema_and_messages(path: &Path, message: &Value) {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(tables, ["agent_messages", "blocks", "mcl_records"]);
+    assert_eq!(
+        tables,
+        ["agent_logs", "agent_messages", "blocks", "mcl_records"]
+    );
+    assert_eq!(
+        db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM agent_logs", [], |row| row
+            .get::<_, usize>(0))
+            .unwrap(),
+        log_count
+    );
     let columns = db
         .prepare("PRAGMA table_info(agent_messages)")
         .unwrap()
@@ -160,8 +174,8 @@ fn assert_disk_schema_and_messages(path: &Path, message: &Value) {
 }
 
 #[test]
-fn workspace_restarts_keep_three_disk_tables_persistent_context_and_history_without_temp_row_growth()
- {
+fn workspace_restarts_keep_four_disk_tables_persistent_context_and_history_without_temp_row_growth()
+{
     let root = tempfile::tempdir().unwrap();
     copy_tree(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../resources"),
@@ -169,11 +183,11 @@ fn workspace_restarts_keep_three_disk_tables_persistent_context_and_history_with
     );
     let project = root.path().join("project");
     std::fs::create_dir(&project).unwrap();
-    let directory = root.path().join("workspaces/three-table");
+    let directory = root.path().join("workspaces/four-table");
     std::fs::create_dir_all(&directory).unwrap();
     let definition = directory.join("workspace.yaml");
     std::fs::write(&definition, format!(
-        "name: three-table\nproject_root: {}\nmembers:\n  - name: coder\n    driver: driver:local/coder:latest\n    home_root: {}\n",
+        "name: four-table\nproject_root: {}\nmembers:\n  - name: coder\n    driver: driver:local/coder:latest\n    home_root: {}\n",
         project.display(), root.path().display())).unwrap();
     std::fs::write(root.path().join("config.toml"),
         "[server]\nbind='127.0.0.1:0'\n[outbound]\nlogs=['type:unmatched']\nbackend_state=['type:unmatched']\n").unwrap();
@@ -208,6 +222,7 @@ fn workspace_restarts_keep_three_disk_tables_persistent_context_and_history_with
     let mut previous_history = entries(&app, agent, StorageOperation::ReadHistoryEntries);
     let database_path = directory.join("agents/coder/state.sqlite");
     let mut instances = std::collections::BTreeSet::new();
+    let mut expected_logs = Vec::new();
     for cycle in 0..4 {
         let agent = output.members[0];
         let instance = app
@@ -244,7 +259,35 @@ fn workspace_restarts_keep_three_disk_tables_persistent_context_and_history_with
             command(&mut app, agent, "GET scratch.messages", vec![]),
             MclValue::Array(MessageArray::Message(vec![temporary]))
         );
-        assert_disk_schema_and_messages(&database_path, &message);
+        let storage = app.world().get_component::<AgentStorage>(agent).unwrap();
+        assert_eq!(
+            storage_core::read_agent_logs(storage, None, 100).unwrap(),
+            expected_logs
+        );
+        let history_before_log = entries(&app, agent, StorageOperation::ReadHistoryEntries);
+        let saved = storage_core::append_agent_log(
+            storage,
+            storage_core::AgentLogRecord {
+                created_at_ms: None,
+                level: storage_core::AgentLogLevel::Info,
+                source: storage_core::AgentLogSource::Host,
+                stage: "restart-fixture".into(),
+                message: format!("diagnostic from cycle {cycle}"),
+                details_json: Some(json!({"cycle":cycle})),
+                context_json: None,
+                origin: None,
+                raw_error: None,
+                traceback: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(saved.sequence, cycle + 1, "logs use their own sequence");
+        expected_logs.push(saved);
+        assert_eq!(
+            entries(&app, agent, StorageOperation::ReadHistoryEntries),
+            history_before_log
+        );
+        assert_disk_schema_and_messages(&database_path, &message, expected_logs.len());
         assert_eq!(
             entries(&app, agent, StorageOperation::ReadAgentMessages),
             expected_messages
@@ -298,5 +341,5 @@ fn workspace_restarts_keep_three_disk_tables_persistent_context_and_history_with
             .unwrap()
             .is_stopped()
     );
-    assert_disk_schema_and_messages(&database_path, &message);
+    assert_disk_schema_and_messages(&database_path, &message, expected_logs.len());
 }

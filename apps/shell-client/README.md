@@ -29,3 +29,6 @@ Linux 创建 24×80 PTY 并启动 `bash --noprofile --norc -i`，TERM 为 xterm-
 错误输出 `{"type":"error","message":"..."}` 后以非零状态退出。PTY 在非 Linux 平台明确返回 unsupported；普通 exec 支持 Unix。单个 writer 顺序写出所有协议帧，使用有界队列传递输出；PTY 读写并发，不在 child 锁内等待。
 
 验证：`cargo test -p shell-client --offline`。
+
+
+当前依赖边界：list-directory、glob、grep、write-file改用通用files、text和data能力，不再携带shell.lua或本bin。Bash和Bash Exec继续使用本程序承担实际shell、PTY及终端行为。文件工具不再打包本bin，Shell协议和终端行为保持原有语义。

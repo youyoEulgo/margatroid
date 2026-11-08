@@ -16,7 +16,7 @@ System分别列出事件、闭包结果、提交闭包及oneshot回复，使用R
 # system     storage/plugin/src/system.rs                       请求和闭包结果路由
 # handler    storage/plugin/src/handler.rs                      句柄取得、worker提交与回复
 # types      storage/plugin/src/types.rs                        异步上下文和输出
-# types pub  storage/core/src/types.rs                          Block、设置及历史操作
+# types pub  storage/core/src/types.rs                          Block、设置、历史及Agent日志类型
 # error      storage/core/src/error.rs                          StorageError
 ```
 
@@ -32,11 +32,29 @@ open_storage(database_path: &Path, settings_path: &Path, default_settings: &str)
 execute_storage(storage: &AgentStorage, operation: StorageOperation) -> Result<StorageValue, StorageError>
     行为：串行执行对应SQLite事务或设置文件操作；写入确认完成后返回。
 
+append_agent_log(storage: &AgentStorage, record: AgentLogRecord) -> Result<StoredAgentLog, StorageError>
+    行为：
+        同步执行独立日志写事务，与execute_storage共用连接管理器和串行锁
+        校验level、source及JSON对象，缺省created_at_ms取真实写入时间
+        以agent_logs自身MAX(sequence)+1分配序号，空表从1开始；超过SQLite整数范围返回错误
+        SQLite INTEGER PRIMARY KEY不使用AUTOINCREMENT；提交成功后返回已落库记录
+        不写历史、不触发推理，不派发StorageRequest或System事件
+        异步调用方克隆AgentStorage，在spawn_blocking中调用并等待真实join，不将排队视为成功
+
+read_agent_logs(storage: &AgentStorage, after_sequence: Option<u64>, limit: usize) -> Result<Vec<StoredAgentLog>, StorageError>
+    行为：
+        同步取得独立日志读事务快照，与其他同库操作共用连接及串行锁
+        None从首条读取，Some仅取sequence严格大于给定值的记录
+        按sequence升序至多返回limit条，limit为0返回空数组
+        不合并历史、不派发事件；异步调用方使用spawn_blocking并等待真实join
+        仅提供core诊断读取能力，不自动向LLM暴露，不新增DTO或GUI接口
+
 数据库结构
     main.agent_messages：sequence、turn、type、content、payload、created_at_ms--type从payload.type提取，读取时校验一致
     main.mcl_records：sequence、source、turn、content、payload、created_at_ms
     main.blocks：name、fields_json--对象的每个键对应一个消息数组
-    行为：只保留三张表，不使用AUTOINCREMENT或metadata表；PRAGMA user_version保存版本。只支持当前结构；空库创建，不匹配则明确报错，不自动迁移或备份。
+    main.agent_logs：sequence INTEGER PRIMARY KEY、created_at_ms、level、source、stage、message、details_json、context_json、origin、raw_error、traceback--独立Agent日志，不参与消息与MCL历史序号
+    行为：只保留四张表，不使用AUTOINCREMENT或metadata表；PRAGMA user_version保存版本。只支持当前四表目标结构，严格校验agent_logs列及约束；空库创建，已有三表或其他不匹配结构返回SchemaMismatch，不自动迁移或备份，不增兼容路径。
     TEMP：使用连接内存表按VM实例隔离；VM及MCL真实退出后DropTemporaryBlocks，关闭连接自动丢弃。
 ```
 
@@ -63,7 +81,7 @@ AgentStorage：Agent持久存储，公开组件
     settings_lock: Arc<Mutex<()>>--私有，协调该文件读写
     impl Component for AgentStorage
     impl Clone for AgentStorage
-        行为：共享连接及设置锁，不复制数据。
+        行为：共享连接及设置锁，不复制数据；Driver与工具的host持有owned克隆作为日志能力，仅依赖storage_core；生命周期覆盖Driver及工具清理和最后一次日志写入的真实join，再释放句柄。
 ```
 
 # events
@@ -134,6 +152,28 @@ StorageTaskError：执行失败载荷--owner、原reply、StorageError
 StorageDatabase：不透明SQLite连接能力
     impl Clone
         行为：共享连接及不可用标记，不公开Connection。
+
+AgentLogLevel：日志级别，公开枚举
+    Debug | Info | Warn | Error--数据库分别保存debug、info、warn、error
+
+AgentLogSource：可信运行身份，公开枚举
+    Driver | Tool | Host--数据库分别保存driver、tool、host
+
+AgentLogRecord：独立Agent日志写入值，公开类型
+    created_at_ms: Option<u64>--宿主时间；None由写事务填入真实写入时间
+    level: AgentLogLevel
+    source: AgentLogSource--宿主按原始可信运行身份填入，跨host转发不改成host
+    stage: String--描述性阶段，如load、configure、execute、driver、hostlog，不承担操作路由
+    message: String
+    details_json: Option<serde_json::Value>--可选JSON对象，调用方结构化详情
+    context_json: Option<serde_json::Value>--可选宿主关联JSON对象；turn、task、call、alias、driver_instance均可缺省，不另建关联列或标识注册表
+    origin: Option<String>--宿主确定的程序来源地址，不接受脚本指定来源
+    raw_error: Option<String>--自动故障格式化前的完整原始错误
+    traceback: Option<String>--自动故障格式化前的完整Lua traceback，可用时保存
+
+StoredAgentLog：持久日志返回值，公开类型
+    sequence: u64--agent_logs独立序号，不占用消息与MCL历史sequence
+    record: AgentLogRecord--成功写入或读取时created_at_ms为Some真实存储值
 
 StorageOperation：机械存储操作，公开枚举
     CreateBlock { name: String, fields: Vec<String>, instance: Option<String> }
@@ -211,6 +251,7 @@ Agent Entity
     │       ├── main.agent_messages--纯AgentMessage payload及历史关联
     │       ├── main.mcl_records--纯MCL审计payload及历史关联
     │       ├── main.blocks--name到fields_json对象，每个持久Block一行
+    │       ├── main.agent_logs--独立日志及可选关联JSON，不参与历史或推理
     │       └── temp.blocks--连接内存中的VM实例临时Block，不写数据库文件
     ├── settings_path
     └── settings_lock

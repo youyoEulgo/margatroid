@@ -1,8 +1,9 @@
-mod data;
 pub(crate) mod memory;
 use memory::MemoryBoundary;
-pub(crate) mod host;
-pub(crate) mod process;
+mod diagnostics;
+use diagnostics::*;
+use lua_runtime_core::host::{self, data, process};
+use storage_core::{AgentLogLevel, AgentLogRecord, AgentLogSource, AgentStorage};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -135,16 +136,35 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
             .get_component::<ToolTasks>(request.agent)
             .ok_or_else(|| error(Kind::TaskMissing, "ToolTasks not initialized"))?
             .clone();
+        let storage = world
+            .get_component::<AgentStorage>(request.agent)
+            .ok_or_else(|| {
+                error(
+                    Kind::InvalidRequest,
+                    "AgentStorage is required for tool execution",
+                )
+            })?
+            .clone();
+        let agent_name = agent.name.clone();
         validate_arguments(&tool_entry.input_schema, &request.arguments)?;
-        Ok((config, tool_entry, sandbox_path, project_root, tasks))
+        Ok((
+            config,
+            tool_entry,
+            sandbox_path,
+            project_root,
+            tasks,
+            storage,
+            agent_name,
+        ))
     })();
-    let (config, tool_entry, sandbox_path, project_root, tasks) = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            let _ = reply.send(Err(error));
-            return;
-        }
-    };
+    let (config, tool_entry, sandbox_path, project_root, tasks, storage, agent_name) =
+        match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
     let Ok((handle, input)) = ToolTaskHandle::new(
         &config.limits,
         request.call_id.clone(),
@@ -160,6 +180,9 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
     }
     let schedule = config.schedule.clone();
     let context = ToolExecutionContext {
+        storage,
+        agent_name,
+        diagnostic_received: false,
         request,
         tool_entry,
         world: Arc::downgrade(
@@ -266,10 +289,6 @@ fn complete_reply(
     context: &mut ToolExecutionContext,
     result: Result<tool_core::ToolExecuteResponse, ToolError>,
 ) {
-    let result = result.map_err(|mut failure| {
-        failure.message = without_lua_traceback(&failure.message).to_owned();
-        failure
-    });
     let _ = context.handle.return_result(result);
 }
 
@@ -313,6 +332,12 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
             program,
             arguments: context.request.arguments.clone(),
             context: ToolContext {
+                agent_name: context.agent_name.clone(),
+                turn: context.request.turn.clone(),
+                source_origin: resource_dir(&context.tool_entry.path)?
+                    .join("main.lua")
+                    .to_string_lossy()
+                    .into_owned(),
                 task_id: context.request.id.clone(),
                 call_id: context.request.call_id.clone(),
                 alias: context.request.alias.clone(),
@@ -326,6 +351,7 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
         };
         let result = run_runner(&mut context, request, policy).await;
         if let Err(failure) = &result {
+            report_host_failure(&mut context, failure).await;
             complete_reply(&mut context, Err(failure.clone()));
             context.handle.set_error(failure.clone());
         }
@@ -363,6 +389,7 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
         other => other,
     };
     if let Err(failure) = &outcome {
+        report_host_failure(&mut context, failure).await;
         complete_reply(&mut context, Err(failure.clone()));
     }
     if let Err(failure) = cleanup_owner(&context).await {
@@ -632,11 +659,31 @@ async fn host_frame(
     frame: RunnerFrame,
 ) -> Result<HostFrame, ToolError> {
     let (request_id, result) = match frame {
+        RunnerFrame::Log {
+            request_id,
+            mut record,
+        } => {
+            record.source = AgentLogSource::Tool;
+            let result = persist_log(context, record).await.map(|()| Value::Null);
+            (request_id, result)
+        }
+        RunnerFrame::LuaDiagnostic {
+            request_id,
+            mut record,
+        } => {
+            context.diagnostic_received = true;
+            record.source = AgentLogSource::Tool;
+            let original = record.raw_error.clone();
+            if let Err(failure) = persist_log(context, record).await {
+                eprintln!(
+                    "tool automatic diagnostic persistence failed: {failure}; original: {}",
+                    original.as_deref().unwrap_or("unavailable")
+                );
+            }
+            (request_id, Ok(Value::Null))
+        }
         RunnerFrame::Return { request_id, value } => {
-            let result = parse_tool_result(&value).and_then(|mut response| {
-                if response.failed {
-                    response.content = without_lua_traceback(&response.content).to_owned();
-                }
+            let result = parse_tool_result(&value).and_then(|response| {
                 context.handle.return_result(Ok(response))?;
                 Ok(Value::Null)
             });
@@ -804,6 +851,12 @@ async fn run_runner(
             let mut input_ready = true;
             loop {
                 tokio::select! {
+                    biased;
+                    () = lifetime.lifetime_expired() => {
+                        lifetime.cancel();
+                        return Err(error(Kind::Timeout, "tool task lifetime exceeded"));
+                    },
+                    () = cancel.cancelled() => return Err(error(Kind::Cancelled, "tool task cancellation requested")),
                     frame = read_json::<RunnerWire, _>(&mut stdout) => {
                         let frame = frame?.ok_or_else(|| error(Kind::RunnerProtocolFailed, "runner exited without cleanup proof"))?;
                         if frame.protocol_version != 1 { return Err(error(Kind::RunnerProtocolFailed, "runner protocol version mismatch")); }
@@ -824,7 +877,7 @@ async fn run_runner(
                             record_cleanup_failure(context, "supervisor descendant cleanup incomplete");
                             continue;
                         }
-                        if context.configuration.is_none() { return Err(error(Kind::RunnerProtocolFailed, "worker request before configuration")); }
+                        if context.configuration.is_none() && !matches!(frame.frame, RunnerFrame::LuaDiagnostic { .. }) { return Err(error(Kind::RunnerProtocolFailed, "worker request before configuration")); }
                         let response = host_frame(context, frame.frame).await?;
                         host.send(response).map_err(|_| error(Kind::RunnerProtocolFailed, "runner input closed"))?;
                     }
@@ -836,18 +889,10 @@ async fn run_runner(
                 }
             }
         };
-        tokio::pin!(exchange);
-        tokio::select! {
-            biased;
-            () = lifetime.lifetime_expired() => {
-                lifetime.cancel();
-                Err(error(Kind::Timeout, "tool task lifetime exceeded"))
-            },
-            () = cancel.cancelled() => Err(error(Kind::Cancelled, "tool task cancellation requested")),
-            result = &mut exchange => result,
-        }
+        exchange.await
     };
     if let Err(failure) = &result {
+        report_host_failure(context, failure).await;
         complete_reply(context, Err(failure.clone()));
         context.handle.set_error(failure.clone());
     }
@@ -1138,6 +1183,7 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
                                 }
                                 RunnerFrame::Done { result } => return result,
                                 RunnerFrame::Stopped { .. } => return Err(error(Kind::RunnerProtocolFailed, "worker cannot claim descendant cleanup")),
+                                RunnerFrame::LuaDiagnostic { .. } => write_json(&mut output, &frame).await?,
                                 _ if acknowledged => write_json(&mut output, &frame).await?,
                                 _ => return Err(error(Kind::RunnerProtocolFailed, "worker request before configuration acknowledgement")),
                             }
@@ -1149,7 +1195,7 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
                                 if acknowledged { return Err(error(Kind::RunnerProtocolFailed, "duplicate configuration acknowledgement")); }
                                 configuration.ok_or_else(|| error(Kind::RunnerProtocolFailed, "configuration acknowledgement before configuration"))?;
                                 acknowledged = true;
-                            } else if !acknowledged { return Err(error(Kind::RunnerProtocolFailed, "host frame before configuration acknowledgement")); }
+                            } else if !acknowledged && !matches!(frame.frame, HostFrame::Response { .. }) { return Err(error(Kind::RunnerProtocolFailed, "host frame before configuration acknowledgement")); }
                             write_json(&mut worker_input, &frame).await?;
                         }
                     }
@@ -1348,30 +1394,12 @@ async fn worker_host_input<R: AsyncBufRead + Unpin>(
     }
 }
 
-fn without_lua_traceback(message: &str) -> &str {
-    message
-        .split_once("\nstack traceback:")
-        .map_or(message, |(summary, _)| summary.trim_end())
-}
-
-fn lua_failure(failure: mlua::Error) -> ToolError {
-    let mut result = match &failure {
-        mlua::Error::ExternalError(source) => source
-            .downcast_ref::<ToolError>()
-            .cloned()
-            .unwrap_or_else(|| error(Kind::ExecutionFailed, failure.to_string())),
-        mlua::Error::CallbackError { cause, .. } => lua_failure((**cause).clone()),
-        _ => error(Kind::ExecutionFailed, failure.to_string()),
-    };
-    result.message = without_lua_traceback(&result.message).to_owned();
-    result
-}
-
 async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     request: RunnerRequest,
     input: R,
 ) -> Result<(), ToolError> {
     request.limits.validate()?;
+    let mut input = input;
     let lua = Lua::new_with(
         StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
         LuaOptions::default(),
@@ -1420,41 +1448,81 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     let arguments = data::to_lua(&lua, request.arguments.clone()).map_err(lua_failure)?;
     let context = data::to_lua(
         &lua,
-        serde_json::to_value(&request.context)
+        request
+            .context
+            .public_value(&request.arguments)
             .map_err(|failure| error(Kind::InvalidArguments, failure.to_string()))?,
     )
     .map_err(lua_failure)?;
-    let host = host::Margatroid::install(&lua, request.context.clone(), request.arguments.clone())
-        .map_err(lua_failure)?;
+    let host = host::Margatroid::install(
+        &lua,
+        host::HostDefinition {
+            kind: host::HostKind::Tool,
+            context: request
+                .context
+                .public_value(&request.arguments)
+                .map_err(|_| error(Kind::InvalidRequest, "invalid tool context"))?,
+            arguments: request.arguments.clone(),
+        },
+    )
+    .map_err(lua_failure)?;
     // Registering async userdata methods may load the coroutine library in mlua.
     globals
         .set("coroutine", LuaValue::Nil)
         .map_err(lua_failure)?;
-    lua.load(&request.program)
-        .set_name("tool")
-        .exec()
-        .map_err(|failure| {
-            error(
-                Kind::InvalidDefinition,
-                format!("tool configuration load failed: {failure}"),
-            )
-        })?;
-    let configure = globals.get::<mlua::Function>("configure").map_err(|_| {
-        error(
+    let loaded = lua
+        .load(&request.program)
+        .set_name(format!("@{}", request.context.source_origin))
+        .exec();
+    if let Err(failure) = loaded {
+        return Err(report_startup_failure(
+            &request,
+            &mut input,
+            "load",
+            failure,
             Kind::InvalidDefinition,
-            "tool must define configure(arguments, context)",
         )
-    })?;
-    let configured: LuaValue = configure
-        .call((arguments.clone(), context.clone()))
-        .map_err(|failure| {
-            error(
+        .await);
+    }
+    let configure = match globals.get::<mlua::Function>("configure") {
+        Ok(configure) => configure,
+        Err(failure) => {
+            return Err(report_startup_failure(
+                &request,
+                &mut input,
+                "configure",
+                failure,
                 Kind::InvalidDefinition,
-                format!("tool configure failed: {failure}"),
             )
-        })?;
-    let configuration = parse_configuration(&lua, configured)?;
-    let mut input = input;
+            .await)
+        }
+    };
+    let configured: LuaValue = match configure.call((arguments.clone(), context.clone())) {
+        Ok(value) => value,
+        Err(failure) => {
+            return Err(report_startup_failure(
+                &request,
+                &mut input,
+                "configure",
+                failure,
+                Kind::InvalidDefinition,
+            )
+            .await)
+        }
+    };
+    let configuration = match parse_configuration(&lua, configured) {
+        Ok(value) => value,
+        Err(failure) => {
+            return Err(report_startup_failure(
+                &request,
+                &mut input,
+                "configure",
+                mlua::Error::external(failure),
+                Kind::InvalidDefinition,
+            )
+            .await)
+        }
+    };
     write_json(
         &mut tokio::io::stdout(),
         &RunnerWire {
@@ -1537,7 +1605,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         lua.create_function(|_, _: mlua::MultiValue| {
             Err::<(), _>(mlua::Error::external(error(
                 Kind::InvalidRequest,
-                "use margatroid:process_open for subprocesses",
+                "use margatroid.process:start for subprocesses",
             )))
         })
         .map_err(lua_failure)?,
@@ -1549,7 +1617,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         lua.create_function(|_, _: mlua::MultiValue| {
             Err::<(), _>(mlua::Error::external(error(
                 Kind::InvalidRequest,
-                "use margatroid:process_open for subprocesses",
+                "use margatroid.process:start for subprocesses",
             )))
         })
         .map_err(lua_failure)?,
@@ -1560,17 +1628,19 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         lua.create_function(|_, _: mlua::MultiValue| {
             Err::<(), _>(mlua::Error::external(error(
                 Kind::InvalidRequest,
-                "use margatroid:task_finish for task exit",
+                "use margatroid.task:finish for task exit",
             )))
         })
         .map_err(lua_failure)?,
     )
     .map_err(lua_failure)?;
     let callbacks = lua.create_table().map_err(lua_failure)?;
+    install_log_callback(&lua, &callbacks, bridge.clone(), request.context.clone())
+        .map_err(lua_failure)?;
     let task_bridge = bridge.clone();
     callbacks
         .set(
-            "task_write",
+            "task_append_output",
             lua.create_async_function(move |lua, value: LuaValue| {
                 let bridge = task_bridge.clone();
                 async move {
@@ -1588,7 +1658,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     let task_bridge = bridge.clone();
     callbacks
         .set(
-            "task_replace",
+            "task_replace_output",
             lua.create_async_function(move |lua, value: LuaValue| {
                 let bridge = task_bridge.clone();
                 async move {
@@ -1606,7 +1676,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     let inject_bridge = bridge.clone();
     callbacks
         .set(
-            "tool_inject",
+            "tools_register",
             lua.create_async_function(move |lua, value: LuaValue| {
                 let bridge = inject_bridge.clone();
                 async move {
@@ -1627,7 +1697,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     let task_bridge = bridge.clone();
     callbacks
         .set(
-            "task_return",
+            "task_return_result",
             lua.create_async_function(move |lua, value: LuaValue| {
                 let bridge = task_bridge.clone();
                 async move {
@@ -1646,7 +1716,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     let task_bridge = bridge.clone();
     callbacks
         .set(
-            "task_read",
+            "task_read_output",
             lua.create_async_function(move |lua, task_id: String| {
                 let bridge = task_bridge.clone();
                 async move {
@@ -1740,19 +1810,25 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         )
         .map_err(lua_failure)?;
     callbacks
-        .set("await_any", install_await_any(&lua)?)
+        .set(
+            "wait_any",
+            host::install_wait_any(&lua).map_err(lua_failure)?,
+        )
         .map_err(lua_failure)?;
-    let (processes, process_open) =
-        process::install_process(&lua, request.context.project_root.clone())?;
+    let (processes, process_start) =
+        process::install_process(&lua, request.context.project_root.clone())
+            .map_err(lua_failure)?;
     callbacks
-        .set("process_open", process_open)
+        .set("process_start", process_start)
         .map_err(lua_failure)?;
-    data::install(&lua, &callbacks, request.context.project_root.clone())?;
+    data::install(&lua, &callbacks, request.context.project_root.clone()).map_err(lua_failure)?;
     host::Margatroid::enable(&host, callbacks).map_err(lua_failure)?;
     let arguments = data::to_lua(&lua, request.arguments.clone()).map_err(lua_failure)?;
     let context = data::to_lua(
         &lua,
-        serde_json::to_value(&request.context)
+        request
+            .context
+            .public_value(&request.arguments)
             .map_err(|failure| error(Kind::InvalidArguments, failure.to_string()))?,
     )
     .map_err(lua_failure)?;
@@ -1765,34 +1841,28 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     let result = tokio::select! {
         biased;
         () = finish.cancelled() => Ok(()),
-        result = execution => result.map_err(lua_failure),
+        result = execution => match result {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                let brief = lua_failure(failure.clone());
+                if should_diagnose(&brief) {
+                    let record = diagnostic_record(&request.context, "execute", &failure, &brief);
+                    if let Err(log_failure) = bridge.call(|request_id| RunnerFrame::LuaDiagnostic { request_id, record }).await {
+                        eprintln!("tool diagnostic transport failed: {log_failure}; original: {failure}");
+                    }
+                }
+                Err(brief)
+            }
+        },
         _ = wait_deadline(execution_deadline.map(tokio::time::Instant::from_std)) => Err(error(Kind::Timeout, "Lua execution deadline exceeded")),
     };
     host_reader.abort();
     let _ = host_reader.await;
-    processes.cleanup().await?;
+    processes
+        .cleanup()
+        .await
+        .map_err(|failure| error(Kind::CleanupFailed, failure.to_string()))?;
     result
-}
-
-fn install_await_any(lua: &Lua) -> Result<mlua::Function, ToolError> {
-    lua.create_async_function(|_, operations: mlua::Table| async move {
-        use futures_util::{stream::FuturesUnordered, StreamExt};
-        let mut pending = FuturesUnordered::new();
-        for pair in operations.pairs::<String, mlua::Function>() {
-            let (name, function) = pair?;
-            pending.push(async move {
-                function
-                    .call_async::<mlua::Value>(())
-                    .await
-                    .map(|value| (name, value))
-            });
-        }
-        pending
-            .next()
-            .await
-            .ok_or_else(|| mlua::Error::external("await_any requires an operation"))?
-    })
-    .map_err(lua_failure)
 }
 
 async fn wait_deadline(deadline: Option<tokio::time::Instant>) {
@@ -1852,6 +1922,11 @@ mod world_sender_tests {
     use tool_core::ToolExecutionLimits;
     use workspace_core::WorkspaceState;
 
+    struct TestStorageDirectory {
+        _directory: tempfile::TempDir,
+    }
+    impl core_plugin::Resource for TestStorageDirectory {}
+
     fn injection_fixture() -> (App, Arc<WorldClosureSender>, ToolExecutionContext) {
         use closure_plugin::WorldClosureExt;
 
@@ -1873,7 +1948,20 @@ mod world_sender_tests {
         app.world_mut().insert_component(agent, tasks.clone());
         app.world_mut().insert_component(agent, Tools::new());
         let sender = Arc::new(app.world().closure_sender(RuntimePlugin::UPDATE));
+        let storage_root = tempfile::tempdir().unwrap();
+        let storage = storage_core::open_storage(
+            &storage_root.path().join("agent.sqlite"),
+            &storage_root.path().join("agent.toml"),
+            "",
+        )
+        .unwrap();
+        app.world_mut().insert_resource(TestStorageDirectory {
+            _directory: storage_root,
+        });
         let context = ToolExecutionContext {
+            storage,
+            agent_name: "test".into(),
+            diagnostic_received: false,
             request: ToolExecuteRequest {
                 id: "caller".into(),
                 agent,
@@ -2107,6 +2195,13 @@ mod world_sender_tests {
             .add_plugin(ToolPlugin::new());
         let root = tempfile::tempdir().unwrap();
         let agent = app.world_mut().spawn();
+        let storage = storage_core::open_storage(
+            &root.path().join("agent.sqlite"),
+            &root.path().join("agent.toml"),
+            "",
+        )
+        .unwrap();
+        app.world_mut().insert_component(agent, storage);
         app.world_mut().insert_component(
             agent,
             Agent {
@@ -2170,6 +2265,9 @@ mod world_sender_tests {
     fn optional_context_markers_are_lua_nil_and_present_markers_survive_the_wire() {
         let lua = Lua::new();
         let mut context = ToolContext {
+            agent_name: "test".into(),
+            turn: "turn".into(),
+            source_origin: "/resource/main.lua".into(),
             task_id: "task".into(),
             call_id: "call".into(),
             alias: "alias".into(),
@@ -2181,7 +2279,9 @@ mod world_sender_tests {
         };
         let wire = serde_json::to_vec(&context).unwrap();
         let received: ToolContext = serde_json::from_slice(&wire).unwrap();
-        let LuaValue::Table(table) = lua.to_value(&received).unwrap() else {
+        let arguments = serde_json::json!({"message": "hello"});
+        let public_context = received.public_value(&arguments).unwrap();
+        let LuaValue::Table(table) = data::to_lua(&lua, public_context.clone()).unwrap() else {
             panic!("context table");
         };
         assert!(matches!(
@@ -2196,9 +2296,46 @@ mod world_sender_tests {
         context.binding = Some(serde_json::json!({"method": "echo"}));
         let wire = serde_json::to_vec(&context).unwrap();
         let received: ToolContext = serde_json::from_slice(&wire).unwrap();
-        let LuaValue::Table(table) = lua.to_value(&received).unwrap() else {
+        let arguments = serde_json::json!({"message": "hello"});
+        let public_context = received.public_value(&arguments).unwrap();
+        let LuaValue::Table(table) = data::to_lua(&lua, public_context.clone()).unwrap() else {
             panic!("context table");
         };
+        assert_eq!(
+            table
+                .get::<mlua::Table>("arguments")
+                .unwrap()
+                .get::<String>("message")
+                .unwrap(),
+            "hello"
+        );
+        assert_eq!(table.get::<String>("project_root").unwrap(), "/project");
+        host::Margatroid::install(
+            &lua,
+            host::HostDefinition {
+                kind: host::HostKind::Tool,
+                context: public_context,
+                arguments: serde_json::json!({"message": "host arguments"}),
+            },
+        )
+        .unwrap();
+        lua.load(
+            r#"
+            assert(margatroid.context.kind == "tool")
+            assert(margatroid.context.agent_info.name == "test")
+            assert(margatroid.context.project_root == "/project")
+            assert(margatroid.context.arguments.message == "host arguments")
+            assert(not pcall(function() margatroid.context = {} end))
+            local context = margatroid.context
+            context.arguments.message = "changed"
+            assert(margatroid.context.arguments.message == "host arguments")
+            assert(margatroid.arguments == nil)
+            assert(margatroid.version == nil)
+            assert(margatroid.null == nil)
+            "#,
+        )
+        .exec()
+        .unwrap();
         assert_eq!(table.get::<String>("owner_task_id").unwrap(), "owner");
         assert_eq!(
             table
