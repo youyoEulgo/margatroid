@@ -60,7 +60,7 @@ local function perform(arguments, context)
     local matches = {}
     local total = 0
     for line in stdout:gmatch("[^\n]+") do
-        local event = json.decode(line)
+        local event = margatroid:json_decode(line)
         if event.type == "match" then
             total = total + 1
             if #matches < MAX_MATCHES then
@@ -84,6 +84,6 @@ end
 
 function execute(arguments, context)
     local result = perform(arguments, context)
-    task_return(result)
-    task_finish(context.task_id)
+    margatroid:task_return(result)
+    margatroid:task_finish(context.task_id)
 end

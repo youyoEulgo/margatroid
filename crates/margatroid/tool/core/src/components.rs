@@ -78,14 +78,6 @@ impl ToolTasks {
             .count()
     }
 
-    /// Atomically fail and cancel dependent calls that have not returned.
-    pub fn abort_owner_unreturned(&self, owner: &str) -> usize {
-        lock(&self.entries)
-            .values()
-            .filter(|handle| handle.abort_owner_unreturned(owner))
-            .count()
-    }
-
     /// Called by the supervisor only after all owned resources have been reclaimed.
     /// Keep the collection lock through removal and completion so new queries cannot
     /// observe a completed entry, and never remove a newer task reusing the id.

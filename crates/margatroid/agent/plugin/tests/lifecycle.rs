@@ -958,7 +958,7 @@ fn exception_closes_admission_and_retains_host_without_faking_cleanup() {
 
 fn new_tool_task() -> (
     ToolTaskHandle,
-    tokio::sync::mpsc::Receiver<serde_json::Value>,
+    tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
 ) {
     let (reply, _result) = oneshot::channel();
     ToolTaskHandle::new(

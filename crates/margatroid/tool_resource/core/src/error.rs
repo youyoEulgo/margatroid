@@ -9,7 +9,6 @@ pub enum ToolResourceErrorKind {
     AliasConflict,
     InvalidPath,
     FileMissing,
-    TooLarge,
     InvalidUtf8,
     InvalidDefinition,
     ReadFailed,

@@ -97,11 +97,11 @@ local function perform(arguments, context)
     if not entries then
         return report(nil, failure)
     end
-    return report(#entries == 0 and "[]" or json.encode(entries))
+    return report(#entries == 0 and "[]" or margatroid:json_encode(entries))
 end
 
 function execute(arguments, context)
     local result = perform(arguments, context)
-    task_return(result)
-    task_finish(context.task_id)
+    margatroid:task_return(result)
+    margatroid:task_finish(context.task_id)
 end

@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Local SKILL.md path, absolute or relative to the agent project root."
+    }
+  },
+  "required": ["path"],
+  "additionalProperties": false
+}

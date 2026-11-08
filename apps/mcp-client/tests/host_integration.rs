@@ -19,7 +19,7 @@ mod linux {
         InitToolTasks, ToolError, ToolErrorKind, ToolExecuteRequest, ToolExecuteResponse, ToolTasks,
     };
     use tool_plugin::ToolPlugin;
-    use tool_resource_core::{ToolEntry, ToolReadLimits, Tools, read_tool};
+    use tool_resource_core::{ToolEntry, Tools, read_tool};
     use workspace_core::{Workspace, WorkspaceState};
 
     type Reply = oneshot::Receiver<Result<ToolExecuteResponse, ToolError>>;
@@ -46,8 +46,7 @@ mod linux {
                 resource.join("bin/mcp-client"),
             )
             .unwrap();
-            let imported =
-                read_tool(&resource.join("tool.toml"), &ToolReadLimits::default()).unwrap();
+            let imported = read_tool(&resource.join("tool.toml")).unwrap();
             let mut tools = Tools::default();
             tools
                 .insert(
@@ -301,24 +300,32 @@ mod linux {
         let response = f.response(pids).unwrap();
         assert!(!response.failed, "{}", response.content);
         let pids: Value = serde_json::from_str(&response.content).unwrap();
-        let waiting = f.execute(
+        let mut waiting = f.execute(
             "catalog-waiting",
             "large_catalog_1023",
             json!({"hang":true}),
         );
         f.until(|f| f.trace().iter().any(|v| v["arguments"]["hang"] == true));
         f.finish("catalog-owner");
-        assert_eq!(
-            f.response(waiting).unwrap_err().kind,
-            ToolErrorKind::OwnerGone
-        );
-        f.until(|f| f.tasks().list().is_empty());
         let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
         assert_eq!(tools.iter().count(), 1);
         assert!(tools.get("mcp_register").is_some());
         for index in 0..1024 {
             assert!(tools.get(&format!("large_catalog_{index:04}")).is_none());
         }
+        // Direct owner finish kills its worker before Lua can send a protocol
+        // error to this pending call. Host cleanup only removes the aliases.
+        assert!(f.tasks().get("catalog-waiting").is_ok());
+        assert!(matches!(
+            waiting.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        f.tasks().cancel("catalog-waiting").unwrap();
+        assert_eq!(
+            f.response(waiting).unwrap_err().kind,
+            ToolErrorKind::Cancelled
+        );
+        f.until(|f| f.tasks().list().is_empty());
         for key in ["host", "pid", "child"] {
             let pid = pids[key].as_u64().unwrap();
             assert!(
@@ -501,17 +508,23 @@ mod linux {
         assert!(!response.failed, "{}", response.content);
         let pids: Value = serde_json::from_str(&response.content).unwrap();
         assert_eq!(pids["env"], "end-to-end");
-        let waiting = f.execute("waiting", "e2e_other", json!({"hang":true}));
+        let mut waiting = f.execute("waiting", "e2e_other", json!({"hang":true}));
         f.until(|f| f.trace().iter().any(|v| v["arguments"]["hang"] == true));
         f.finish("owner");
-        assert_eq!(
-            f.response(waiting).unwrap_err().kind,
-            ToolErrorKind::OwnerGone
-        );
-        f.until(|f| f.tasks().list().is_empty());
         let tools = f.app.world().get_component::<Tools>(f.agent).unwrap();
         assert!(tools.get("mcp_register").is_some());
         assert!(tools.get("e2e_echo").is_none() && tools.get("e2e_other").is_none());
+        assert!(f.tasks().get("waiting").is_ok());
+        assert!(matches!(
+            waiting.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        f.tasks().cancel("waiting").unwrap();
+        assert_eq!(
+            f.response(waiting).unwrap_err().kind,
+            ToolErrorKind::Cancelled
+        );
+        f.until(|f| f.tasks().list().is_empty());
         // The supervisor is a subreaper: final cleanup must reap, not leave zombies.
         for key in ["host", "pid", "child"] {
             let pid = pids[key].as_u64().unwrap();

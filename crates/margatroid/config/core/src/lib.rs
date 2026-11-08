@@ -2,7 +2,9 @@ mod error;
 pub mod types;
 
 pub use error::ConfigError;
-pub use types::{CidrBlock, IngressPolicy, IngressRequest, LogLevel, OutboundTarget};
+pub use types::{
+    CidrBlock, FileToolConfig, IngressPolicy, IngressRequest, LogLevel, OutboundTarget,
+};
 
 use core_plugin::Resource;
 use std::collections::HashSet;
@@ -16,6 +18,7 @@ pub struct MargatroidConfig {
     log_filter: Option<String>,
     logs: Vec<OutboundTarget>,
     backend_state: Vec<OutboundTarget>,
+    tools: FileToolConfig,
 }
 
 impl MargatroidConfig {
@@ -41,6 +44,7 @@ impl MargatroidConfig {
             log_filter,
             logs,
             backend_state,
+            tools: FileToolConfig::default(),
         })
     }
 
@@ -57,6 +61,16 @@ impl MargatroidConfig {
         }
         self.ingress = ingress;
         Ok(self)
+    }
+
+    pub fn with_tools(mut self, tools: FileToolConfig) -> Result<Self, ConfigError> {
+        tools.validate()?;
+        self.tools = tools;
+        Ok(self)
+    }
+
+    pub fn tools(&self) -> &FileToolConfig {
+        &self.tools
     }
 
     pub fn server_bind(&self) -> SocketAddr {

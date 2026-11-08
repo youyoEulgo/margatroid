@@ -39,7 +39,7 @@ impl Fixture {
         )
         .unwrap();
         fs::write(directory.join("input.schema.json"), "{}").unwrap();
-        fs::write(directory.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() task_return(1) end").unwrap();
+        fs::write(directory.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() margatroid:task_return(1) end").unwrap();
         directory.join("tool.toml")
     }
 }
@@ -340,32 +340,28 @@ fn duplicate_installation_is_rejected() {
 }
 
 #[test]
-fn configured_budget_is_enforced_on_the_configured_schedule() {
+fn imports_complete_materials_on_the_configured_schedule() {
     let fixture = Fixture::new();
     let path = fixture.entry("sample");
     let mut app = App::new();
-    let limits = tool_resource_core::ToolReadLimits {
-        manifest_bytes: 1,
-        ..tool_resource_core::ToolReadLimits::default()
-    };
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(AsyncRuntimePlugin)
         .add_plugin(ClosurePlugin)
         .add_closure_system(RuntimePlugin::UPDATE);
     app.add_closure_system(RuntimePlugin::POST_UPDATE);
-    app.add_plugin(
-        ToolResourcePlugin::new()
-            .with_schedule(RuntimePlugin::POST_UPDATE)
-            .with_limits(limits),
-    );
+    app.add_plugin(ToolResourcePlugin::new().with_schedule(RuntimePlugin::POST_UPDATE));
     let owner = app.world_mut().spawn();
     let (request, mut reply) = import_request(owner, "sample", path);
     app.world().emit_event(request);
-    assert_eq!(
-        finish(&mut app, &mut reply).unwrap_err().kind,
-        Kind::TooLarge
-    );
-    assert!(!app.world().contains_component::<Tools>(owner));
+    finish(&mut app, &mut reply).unwrap();
+    let recorded = app
+        .world()
+        .get_component::<Tools>(owner)
+        .unwrap()
+        .get("sample")
+        .unwrap();
+    assert_eq!(recorded.description, "sample");
+    assert_eq!(recorded.input_schema, serde_json::json!({}));
 }
 
 #[cfg(unix)]

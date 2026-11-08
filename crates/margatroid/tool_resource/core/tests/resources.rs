@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tool_resource_core::{
-    read_tool, ImportTool, ToolEntry, ToolReadLimits, ToolResourceErrorKind as Kind, Tools,
-    WorldToolResourceExt,
+    read_tool, ImportTool, ToolEntry, ToolResourceErrorKind as Kind, Tools, WorldToolResourceExt,
 };
 
 use core_plugin::World;
@@ -196,7 +195,7 @@ fn cloned_import_requests_share_a_single_reply() {
 
 fn valid_tool(fixture: &Fixture) -> PathBuf {
     fixture.write("input.schema.json", r#"{"type":"object"}"#);
-    fixture.write("main.lua", "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() task_return({ value = 1 }) end");
+    fixture.write("main.lua", "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() margatroid:task_return({ value = 1 }) end");
     fixture.write("tool.toml", "schema_version = 1\ndescription = 'sample'\n")
 }
 
@@ -204,19 +203,19 @@ fn valid_tool(fixture: &Fixture) -> PathBuf {
 fn reads_current_materials_without_lua_execution_or_identity_fields() {
     let fixture = Fixture::new();
     let path = valid_tool(&fixture);
-    let first = read_tool(&path, &ToolReadLimits::default()).unwrap();
+    let first = read_tool(&path).unwrap();
     assert_eq!(first.description, "sample");
     assert_eq!(first.origin, path.canonicalize().unwrap());
     fixture.write("main.lua", "invalid Lua is still UTF-8");
     fixture.write("tool.toml", "schema_version = 1\ndescription = 'changed'\n");
-    let second = read_tool(&path, &ToolReadLimits::default()).unwrap();
+    let second = read_tool(&path).unwrap();
     assert_eq!(second.description, "changed");
     assert_eq!(second.program, "invalid Lua is still UTF-8");
     assert_eq!(first.description, "sample");
     let program = fixture.path("main.lua");
     assert_eq!(program, path.parent().unwrap().join("main.lua"));
     fs::remove_file(program).unwrap();
-    let error = read_tool(&path, &ToolReadLimits::default()).unwrap_err();
+    let error = read_tool(&path).unwrap_err();
     assert_eq!(error.kind, Kind::FileMissing);
     assert!(error.path.is_some());
 }
@@ -231,7 +230,7 @@ fn validates_manifest_and_json_schema_without_external_resolution() {
         "SECRET-CONTENT [",
     ] {
         fixture.write("tool.toml", source);
-        let error = read_tool(&path, &ToolReadLimits::default()).unwrap_err();
+        let error = read_tool(&path).unwrap_err();
         assert_eq!(error.kind, Kind::InvalidDefinition);
         assert!(!error.to_string().contains("SECRET-CONTENT"));
     }
@@ -244,54 +243,45 @@ fn validates_manifest_and_json_schema_without_external_resolution() {
     ] {
         fixture.write("input.schema.json", source);
         assert_eq!(
-            read_tool(&path, &ToolReadLimits::default())
-                .unwrap_err()
-                .kind,
+            read_tool(&path).unwrap_err().kind,
             Kind::InvalidDefinition,
             "{source}"
         );
     }
     fixture.write("input.schema.json", r##"{"$defs":{"text":{"type":"string"}},"type":"object","properties":{"x":{"$ref":"#/$defs/text"}}}"##);
-    assert!(read_tool(&path, &ToolReadLimits::default()).is_ok());
+    assert!(read_tool(&path).is_ok());
 }
 
 #[test]
-fn each_file_has_its_own_exact_byte_budget_and_utf8_check() {
+fn reads_complete_materials_without_an_additional_byte_budget() {
     let fixture = Fixture::new();
     let path = valid_tool(&fixture);
-    let exact = ToolReadLimits {
-        manifest_bytes: fs::metadata(&path).unwrap().len() as usize,
-        schema_bytes: fs::metadata(fixture.path("input.schema.json"))
-            .unwrap()
-            .len() as usize,
-        program_bytes: fs::metadata(fixture.path("main.lua")).unwrap().len() as usize,
-    };
-    assert!(read_tool(&path, &exact).is_ok());
-    for limits in [
-        ToolReadLimits {
-            manifest_bytes: exact.manifest_bytes - 1,
-            ..exact
-        },
-        ToolReadLimits {
-            schema_bytes: exact.schema_bytes - 1,
-            ..exact
-        },
-        ToolReadLimits {
-            program_bytes: exact.program_bytes - 1,
-            ..exact
-        },
-    ] {
-        assert_eq!(read_tool(&path, &limits).unwrap_err().kind, Kind::TooLarge);
-    }
+    let description = "x".repeat(1024 * 1024 + 1);
+    fixture.write(
+        "tool.toml",
+        format!("schema_version = 1\ndescription = '{description}'\n"),
+    );
+    let schema_source = fs::read_to_string(fixture.path("input.schema.json")).unwrap();
+    let program = fs::read_to_string(fixture.path("main.lua")).unwrap();
+    let input = read_tool(&path).unwrap();
+    assert_eq!(input.description, description);
+    assert_eq!(
+        input.input_schema,
+        serde_json::from_str::<serde_json::Value>(&schema_source).unwrap()
+    );
+    assert_eq!(input.program, program);
+}
+
+#[test]
+fn invalid_utf8_in_each_file_reports_its_source_path() {
+    let fixture = Fixture::new();
+    let path = valid_tool(&fixture);
     for name in ["tool.toml", "input.schema.json", "main.lua"] {
         valid_tool(&fixture);
-        fixture.write(name, [0xff]);
-        assert_eq!(
-            read_tool(&path, &ToolReadLimits::default())
-                .unwrap_err()
-                .kind,
-            Kind::InvalidUtf8
-        );
+        let source = fixture.write(name, [0xff]);
+        let error = read_tool(&path).unwrap_err();
+        assert_eq!(error.kind, Kind::InvalidUtf8);
+        assert_eq!(error.path, Some(source.canonicalize().unwrap()));
     }
 }
 
@@ -308,12 +298,7 @@ fn required_files_cannot_follow_symlinks_outside_entry_directory() {
         assert_eq!(candidate.parent(), path.parent());
         fs::remove_file(&candidate).unwrap();
         symlink(target, &candidate).unwrap();
-        assert_eq!(
-            read_tool(&path, &ToolReadLimits::default())
-                .unwrap_err()
-                .kind,
-            Kind::InvalidPath
-        );
+        assert_eq!(read_tool(&path).unwrap_err().kind, Kind::InvalidPath);
         fs::remove_file(&candidate).unwrap();
         valid_tool(&fixture);
     }

@@ -14,6 +14,8 @@ pub struct InjectedToolDefinition {
     pub alias: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    #[serde(default)]
+    pub owner_task_id: Option<String>,
     pub binding: Option<serde_json::Value>,
 }
 
@@ -23,21 +25,4 @@ pub struct ToolInput {
     pub input_schema: serde_json::Value,
     pub program: String,
     pub origin: PathBuf,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ToolReadLimits {
-    pub manifest_bytes: usize,
-    pub schema_bytes: usize,
-    pub program_bytes: usize,
-}
-
-impl Default for ToolReadLimits {
-    fn default() -> Self {
-        Self {
-            manifest_bytes: 1024 * 1024,
-            schema_bytes: 1024 * 1024,
-            program_bytes: 8 * 1024 * 1024,
-        }
-    }
 }

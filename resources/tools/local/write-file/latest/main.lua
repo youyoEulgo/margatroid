@@ -93,7 +93,7 @@ local function perform(arguments, context)
     end
     return {
         ok = true,
-        content = json.encode({
+        content = margatroid:json_encode({
             path = path,
             bytes = #arguments.content,
             replaced = true,
@@ -103,6 +103,6 @@ end
 
 function execute(arguments, context)
     local result = perform(arguments, context)
-    task_return(result)
-    task_finish(context.task_id)
+    margatroid:task_return(result)
+    margatroid:task_finish(context.task_id)
 end

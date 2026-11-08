@@ -164,8 +164,8 @@ while true do wait() end
 function configure() return {timeout_ms=0} end
 function execute(arguments, context)
     local child
-    if arguments.kind == 'terminal' then
-        local client = dofile(context.resource_dir..'/shell.lua')(context)
+    if margatroid.arguments.kind == 'terminal' then
+        local client = dofile(margatroid.context.resource_dir..'/shell.lua')(margatroid.context)
         child = client.terminal()
         child:write('/bin/bash ./children.sh terminal\r')
         local output = ''
@@ -175,7 +175,7 @@ function execute(arguments, context)
             output = output .. chunk.text
         end
     else
-        child = process_open({program='/bin/bash', arguments={'./children.sh','process'}})
+        child = margatroid:process_open({program='/bin/bash', arguments={'./children.sh','process'}})
         local output = ''
         while not string.find(output, 'CHILDREN_READY', 1, true) do
             local chunk = child:read()
@@ -183,9 +183,9 @@ function execute(arguments, context)
             output = output .. chunk.data
         end
     end
-    task_return({ready=true, kind=arguments.kind})
+    margatroid:task_return({ready=true, kind=margatroid.arguments.kind})
     -- Returning a result leaves both the Lua task and the subprocess alive.
-    while true do task_receive() end
+    while true do margatroid:task_receive() end
 end
 "#,
     );

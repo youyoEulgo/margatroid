@@ -23,7 +23,6 @@ local function media_type(bytes)
 end
 
 local function perform(arguments, context)
-    local runtime = margatroid()
     local function failure(message)
         return {ok = false, content = message}
     end
@@ -39,12 +38,12 @@ local function perform(arguments, context)
     return {
         ok = true,
         content = string.format("Image %s (%s, %d bytes)", arguments.path, media, #bytes),
-        images = {{media_type = media, data = runtime.base64_encode(bytes)}}
+        images = {{media_type = media, data = margatroid:base64_encode(bytes)}}
     }
 end
 
 function execute(arguments, context)
     local result = perform(arguments, context)
-    task_return(result)
-    task_finish(context.task_id)
+    margatroid:task_return(result)
+    margatroid:task_finish(context.task_id)
 end

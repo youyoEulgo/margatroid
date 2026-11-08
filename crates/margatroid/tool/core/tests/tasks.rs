@@ -4,13 +4,13 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tool_core::{ToolError, ToolErrorKind, ToolExecutionLimits, ToolTaskHandle, ToolTasks};
 
-fn handle() -> (ToolTaskHandle, tokio::sync::mpsc::Receiver<Value>) {
+fn handle() -> (ToolTaskHandle, tokio::sync::mpsc::UnboundedReceiver<Value>) {
     with_limits(&ToolExecutionLimits::default())
 }
 
 fn with_limits(
     limits: &ToolExecutionLimits,
-) -> (ToolTaskHandle, tokio::sync::mpsc::Receiver<Value>) {
+) -> (ToolTaskHandle, tokio::sync::mpsc::UnboundedReceiver<Value>) {
     let (reply, _) = oneshot::channel();
     ToolTaskHandle::new(limits, "call".into(), "tool".into(), reply).unwrap()
 }
@@ -92,31 +92,84 @@ fn replacements_reset_cursor_and_replaced_flag_is_consumed_once() {
 }
 
 #[test]
-fn cache_budget_errors_preserve_unread_values_and_replace_recovers_space() {
+fn rolling_cache_evicts_old_entries_and_preserves_the_shared_cursor() {
     let limits = ToolExecutionLimits {
         cache_bytes: 8,
-        ..ToolExecutionLimits::default()
+        ..Default::default()
     };
     let (task, _) = with_limits(&limits);
-    task.write(json!("abc")).unwrap();
-    assert_eq!(
-        task.write(json!("de")).unwrap_err().kind,
-        ToolErrorKind::OutputTooLarge
-    );
-    assert_eq!(
-        task.replace(json!("too large")).unwrap_err().kind,
-        ToolErrorKind::OutputTooLarge
-    );
-    let first = task.read().unwrap();
-    assert_eq!(first.output, [json!("abc")]);
-    assert!(!first.replaced);
-    assert_eq!(
-        task.write(json!("de")).unwrap_err().kind,
-        ToolErrorKind::OutputTooLarge
-    );
+    let (other, _) = with_limits(&limits);
+    other.write(json!("safe")).unwrap();
+    task.write(json!(11)).unwrap();
+    task.write(json!(22)).unwrap();
+    assert_eq!(task.read().unwrap().output, [json!(11), json!(22)]);
+    task.write(json!(3333)).unwrap();
+    task.write(json!(4444)).unwrap();
+    let read = task.read().unwrap();
+    assert_eq!(read.output, [json!(3333), json!(4444)]);
+    assert!(read.error.is_none());
+    assert!(!read.replaced);
+    assert!(task.read().unwrap().output.is_empty());
+    task.write(json!(5555)).unwrap();
+    assert_eq!(task.read().unwrap().output, [json!(5555)]);
+    assert_eq!(other.read().unwrap().output, [json!("safe")]);
+}
+
+#[test]
+fn unread_cache_entries_roll_out_and_oversized_structured_values_do_not_break_the_task() {
+    let limits = ToolExecutionLimits {
+        cache_bytes: 8,
+        ..Default::default()
+    };
+    let (task, _) = with_limits(&limits);
+    task.write(json!(1111)).unwrap();
+    task.write(json!(2222)).unwrap();
+    task.write(json!(3333)).unwrap();
+    assert_eq!(task.read().unwrap().output, [json!(2222), json!(3333)]);
+    task.write(json!({"larger": [1, 2, 3]})).unwrap();
+    let read = task.read().unwrap();
+    assert!(read.output.is_empty());
+    assert!(read.error.is_none());
+    task.write(json!(42)).unwrap();
+    assert_eq!(task.read().unwrap().output, [json!(42)]);
+}
+
+#[test]
+fn escaped_cache_text_fits_the_serialized_window_and_keeps_its_tail() {
+    let limits = ToolExecutionLimits {
+        cache_bytes: 16,
+        ..Default::default()
+    };
+    let (task, _) = with_limits(&limits);
+    let source = "old\n\u{0}\"\\你好\n界";
+    task.write(json!(source)).unwrap();
+    let read = task.read().unwrap();
+    let text = read.output[0].as_str().unwrap();
+    assert!(source.ends_with(text));
+    assert!(text.ends_with('界'));
+    assert!(serde_json::to_vec(&read.output[0]).unwrap().len() <= limits.cache_bytes);
+    assert!(read.error.is_none());
+}
+
+#[test]
+fn overlong_cache_text_retains_a_valid_utf8_tail_and_can_be_replaced() {
+    let limits = ToolExecutionLimits {
+        cache_bytes: 8,
+        ..Default::default()
+    };
+    let (task, _) = with_limits(&limits);
+    task.write(json!("discard你好世界")).unwrap();
+    let read = task.read().unwrap();
+    let text = read.output[0].as_str().unwrap();
+    assert!("discard你好世界".ends_with(text));
+    assert!(text.ends_with('界'));
+    assert!(text.len() <= 8);
+    assert!(read.error.is_none());
     task.replace(json!(null)).unwrap();
     task.write(json!(true)).unwrap();
-    assert_eq!(task.read().unwrap().output, [json!(null), json!(true)]);
+    let read = task.read().unwrap();
+    assert_eq!(read.output, [json!(null), json!(true)]);
+    assert!(read.replaced);
 }
 
 #[test]
@@ -148,25 +201,17 @@ fn concurrent_reads_deliver_every_value_once_across_shared_cursor() {
 }
 
 #[tokio::test]
-async fn input_queue_reports_full_closed_and_oversized_without_dropping_values() {
-    let limits = ToolExecutionLimits {
-        input_capacity: 1,
-        argument_bytes: 8,
-        ..ToolExecutionLimits::default()
-    };
-    let (task, mut input) = with_limits(&limits);
-    task.send(json!({"x": 1})).unwrap();
-    assert_eq!(
-        task.send(json!(2)).unwrap_err().kind,
-        ToolErrorKind::InputFull
-    );
-    assert_eq!(input.recv().await, Some(json!({"x": 1})));
-    assert_eq!(
-        task.send(json!("oversized")).unwrap_err().kind,
-        ToolErrorKind::OutputTooLarge
-    );
-    task.send(json!(2)).unwrap();
-    assert_eq!(input.recv().await, Some(json!(2)));
+async fn input_queue_preserves_all_pending_values_and_reports_closed() {
+    let (task, mut input) = handle();
+    let values = (0..256)
+        .map(|index| json!({"index": index, "text": "payload".repeat(32)}))
+        .collect::<Vec<_>>();
+    for value in &values {
+        task.send(value.clone()).unwrap();
+    }
+    for value in values {
+        assert_eq!(input.recv().await, Some(value));
+    }
     drop(input);
     assert_eq!(
         task.send(json!(3)).unwrap_err().kind,

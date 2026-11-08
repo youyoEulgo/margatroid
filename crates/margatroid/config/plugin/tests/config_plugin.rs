@@ -294,3 +294,179 @@ fn reopening_observes_disk_changes_while_existing_plugin_keeps_snapshot() {
     assert_eq!(original.config().server_bind().port(), 3939);
     assert_eq!(latest.config().server_bind().port(), 4000);
 }
+
+const TOOL_FIELDS: [&str; 3] = [
+    "total_task_memory_limit",
+    "task_memory_limit",
+    "task_output_buffer_window",
+];
+
+#[test]
+fn omitted_tool_configuration_preserves_unspecified_limits() {
+    for source in [BASE.to_owned(), format!("{BASE}[tools]\n")] {
+        let plugin = File::new(source).open().unwrap();
+        assert_eq!(
+            plugin.config().tools(),
+            &config_core::FileToolConfig::default()
+        );
+    }
+    for field in TOOL_FIELDS {
+        let plugin = File::new(format!("{BASE}[tools]\n{field} = '321B'\n"))
+            .open()
+            .unwrap();
+        let tools = plugin.config().tools();
+        assert_eq!(
+            tools.total_task_memory_limit,
+            (field == TOOL_FIELDS[0]).then_some(321)
+        );
+        assert_eq!(
+            tools.task_memory_limit,
+            (field == TOOL_FIELDS[1]).then_some(321)
+        );
+        assert_eq!(
+            tools.task_output_buffer_window,
+            (field == TOOL_FIELDS[2]).then_some(321)
+        );
+    }
+}
+
+#[test]
+fn custom_tool_configuration_parses_all_three_capacities() {
+    let plugin = File::new(format!("{BASE}[tools]\ntotal_task_memory_limit = '8G'\ntask_memory_limit = '2GiB'\ntask_output_buffer_window = '128M'\n")).open().unwrap();
+    assert_eq!(
+        plugin.config().tools(),
+        &config_core::FileToolConfig {
+            total_task_memory_limit: Some(8 * 1024usize.pow(3)),
+            task_memory_limit: Some(2 * 1024usize.pow(3)),
+            task_output_buffer_window: Some(128 * 1024usize.pow(2)),
+        }
+    );
+}
+
+#[test]
+fn tool_limits_reject_invalid_capacity_values() {
+    for field in TOOL_FIELDS {
+        for value in [
+            "'0'",
+            "'-1G'",
+            "'1.5G'",
+            "'1X'",
+            "''",
+            "'1 G'",
+            "'18446744073709551616T'",
+            "'18446744073709551615T'",
+            "true",
+            "1",
+        ] {
+            assert_eq!(
+                error(&format!("{BASE}[tools]\n{field} = {value}\n")),
+                ConfigError::DecodeFailed,
+                "{field} = {value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_tool_capacity_accepts_all_binary_units() {
+    for field in TOOL_FIELDS {
+        for (unit, exponent) in [
+            ("", 0),
+            ("B", 0),
+            ("K", 1),
+            ("kB", 1),
+            ("KiB", 1),
+            ("m", 2),
+            ("MB", 2),
+            ("mib", 2),
+            ("G", 3),
+            ("gB", 3),
+            ("GiB", 3),
+            ("t", 4),
+            ("TB", 4),
+            ("tIb", 4),
+        ] {
+            let plugin = File::new(format!("{BASE}[tools]\n{field} = ' 1{unit} ' \n"))
+                .open()
+                .unwrap();
+            let tools = plugin.config().tools();
+            let actual = match field {
+                "total_task_memory_limit" => tools.total_task_memory_limit,
+                "task_memory_limit" => tools.task_memory_limit,
+                _ => tools.task_output_buffer_window,
+            };
+            assert_eq!(actual, Some(1024usize.pow(exponent)), "{field} {unit}");
+        }
+    }
+}
+
+#[test]
+fn tool_configuration_serializes_readable_capacities_and_round_trips() {
+    for (bytes, rendered) in [
+        (17, "17B"),
+        (1024, "1K"),
+        (1024usize.pow(2), "1M"),
+        (1024usize.pow(3), "1G"),
+        (1024usize.pow(4), "1T"),
+    ] {
+        let tools = config_core::FileToolConfig {
+            total_task_memory_limit: Some(bytes),
+            task_memory_limit: Some(bytes),
+            task_output_buffer_window: Some(bytes),
+        };
+        let source = toml::to_string(&tools).unwrap();
+        for field in TOOL_FIELDS {
+            assert!(
+                source.contains(&format!("{field} = \"{rendered}\"")),
+                "{source}"
+            );
+        }
+        assert_eq!(
+            toml::from_str::<config_core::FileToolConfig>(&source).unwrap(),
+            tools
+        );
+    }
+    let empty = config_core::FileToolConfig::default();
+    assert_eq!(
+        toml::from_str::<config_core::FileToolConfig>(&toml::to_string(&empty).unwrap()).unwrap(),
+        empty
+    );
+}
+
+#[test]
+fn old_tool_sections_and_fields_are_unknown() {
+    for suffix in [
+        "[tools.limits]\n",
+        "[tools.limits]\nmemory = '2G'\ncache = '128M'\n",
+        "[tools.memory]\n",
+        "[tools.cache]\n",
+    ] {
+        assert_eq!(error(&format!("{BASE}{suffix}")), ConfigError::DecodeFailed);
+    }
+    for field in [
+        "unknown",
+        "limits",
+        "memory",
+        "cache",
+        "total_memory_bytes",
+        "memory_bytes",
+        "cache_bytes",
+        "script_bytes",
+        "argument_bytes",
+        "output_bytes",
+        "result_bytes",
+        "diagnostic_bytes",
+        "instruction_budget",
+        "input_capacity",
+        "data_depth",
+        "image_count",
+        "image_bytes",
+        "images_bytes",
+    ] {
+        assert_eq!(
+            error(&format!("{BASE}[tools]\n{field} = '1B'\n")),
+            ConfigError::DecodeFailed,
+            "{field}"
+        );
+    }
+}

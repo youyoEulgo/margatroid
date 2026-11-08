@@ -75,11 +75,10 @@ local function maybe_compact_context(message)
 end
 
 local initialized, initialization_error = pcall(function()
+    command("IMPORT TOOL tool:local/skill-register:latest AS skill_register")
     command("IMPORT MESSAGE prompt:local/coder-soul:latest AS soul")
     command("IMPORT MESSAGE prompt:local/compact:latest AS compact")
-    command("IMPORT TOOL tool:local/code-review:latest AS review")
     command("IMPORT TOOL tool:local/list-directory:latest AS list_dir")
-    command("IMPORT TOOL tool:local/project-context:latest AS project_context")
     command("IMPORT TOOL tool:local/read-file:latest AS read_file")
     command("IMPORT TOOL tool:local/read-image:latest AS read_image")
     command("IMPORT TOOL tool:local/write-file:latest AS write_file")

@@ -16,11 +16,11 @@ return function(context)
     end
 
     local function open(request, limit)
-        local process = process_open({
+        local process = margatroid:process_open({
             program = context.resource_dir .. "/bin/shell-client", arguments = {},
         })
         local state = {
-            buffer = "", frames = {}, writes = { json.encode(request) .. "\n" },
+            buffer = "", frames = {}, writes = { margatroid:json_encode(request) .. "\n" },
             stdout_open = true, stderr_open = true, finished = false,
         }
         local session = {}
@@ -36,7 +36,7 @@ return function(context)
                 if newline > frame_limit then error("shell-client frame exceeds byte budget") end
                 local line = state.buffer:sub(1, newline - 1)
                 state.buffer = state.buffer:sub(newline + 1)
-                local frame = json.decode(line)
+                local frame = margatroid:json_decode(line)
                 if type(frame) ~= "table" or type(frame.type) ~= "string" then
                     error("invalid shell-client frame")
                 end
@@ -62,7 +62,7 @@ return function(context)
                 end
             end
             if next(operations) == nil then return false end
-            local source, chunk = await_any(operations)
+            local source, chunk = margatroid:await_any(operations)
             if source == "stdout" then consume(chunk)
             elseif source == "stderr" then
                 -- Diagnostics are private, but drain them independently to EOF.
@@ -92,13 +92,13 @@ return function(context)
 
         function session:write(text)
             if type(text) ~= "string" then error("terminal input must be a string") end
-            state.writes[#state.writes + 1] = json.encode({ operation = "write", text = text }) .. "\n"
+            state.writes[#state.writes + 1] = margatroid:json_encode({ operation = "write", text = text }) .. "\n"
         end
 
         function session:close()
             if state.finished then return end
             if not state.close_requested then
-                state.writes[#state.writes + 1] = json.encode({ operation = "close" }) .. "\n"
+                state.writes[#state.writes + 1] = margatroid:json_encode({ operation = "close" }) .. "\n"
                 state.close_requested = true
             end
             while #state.writes > 0 do pump(true) end

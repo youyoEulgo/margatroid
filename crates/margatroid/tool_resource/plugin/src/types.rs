@@ -2,11 +2,10 @@ use std::path::PathBuf;
 
 use core_plugin::{Entity, Resource};
 use tokio_util::sync::CancellationToken;
-use tool_resource_core::{ImportToolReply, ToolReadLimits, ToolResourceError};
+use tool_resource_core::{ImportToolReply, ToolResourceError};
 
 pub(crate) struct ImportConfig {
     pub schedule: String,
-    pub limits: ToolReadLimits,
 }
 
 impl Resource for ImportConfig {}
@@ -17,7 +16,6 @@ pub(crate) struct ImportContext {
     pub alias: String,
     pub path: PathBuf,
     pub cancel: CancellationToken,
-    pub limits: ToolReadLimits,
     pub reply: ImportToolReply,
 }
 

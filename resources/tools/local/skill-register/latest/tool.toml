@@ -1,0 +1,3 @@
+schema_version = 1
+name = "skill-register"
+description = "Register one local standard SKILL.md as a static skill reading tool for this agent. Accepts only path, relative to the project root. Validates YAML metadata and inventories the skill directory; the injected alias uses the skill name and description. Calling that alias without arguments reads SKILL.md; path selects an inventoried file. Scripts are text only; binary resources return path metadata."

@@ -24,6 +24,8 @@ pub(crate) fn prepare(options: &ApplicationOptions) -> Result<ApplicationParts, 
     let workspace_path = data_root.join("workspaces");
     let config = config_plugin::ConfigPlugin::open(&config_path)
         .map_err(|e| ComposeError::new("config", &config_path, e.to_string()))?;
+    let tool_limits = resolve_tool_limits(config.config().tools())
+        .map_err(|e| ComposeError::new("config", &config_path, e.to_string()))?;
     let inference = inference_plugin::InferencePlugin::open(&models_path)
         .map_err(|e| ComposeError::new("inference", &models_path, e.to_string()))?;
     let workspace = workspace_plugin::WorkspacePlugin::open(&workspace_path)
@@ -34,6 +36,7 @@ pub(crate) fn prepare(options: &ApplicationOptions) -> Result<ApplicationParts, 
             runner_path,
         },
         config,
+        tool_limits,
         inference,
         workspace,
     })
@@ -42,6 +45,7 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
     let ApplicationParts {
         options,
         config,
+        tool_limits,
         inference,
         workspace,
     } = parts;
@@ -76,7 +80,11 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
         .add_plugin(prompt_resource_plugin::PromptResourcePlugin::new())
         .add_plugin(sandbox_resource_plugin::SandboxResourcePlugin::new())
         .add_plugin(inference)
-        .add_plugin(tool_plugin::ToolPlugin::new().with_runner_path(options.runner_path))
+        .add_plugin(
+            tool_plugin::ToolPlugin::new()
+                .with_runner_path(options.runner_path)
+                .with_limits(tool_limits),
+        )
         .add_plugin(storage_plugin::StoragePlugin::new())
         .add_plugin(lua_runtime_plugin::LuaRuntimePlugin::new())
         .add_plugin(mcl_plugin::MclPlugin::new().with_import_config(imports))
@@ -131,5 +139,145 @@ pub(crate) async fn shutdown_application(app: &mut App) -> Result<(), ComposeErr
                 .map_err(|error| ComposeError::new("axum", "", error.to_string()));
         }
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
+fn resolve_tool_limits(
+    config: &config_core::FileToolConfig,
+) -> Result<tool_core::ToolExecutionLimits, config_core::ConfigError> {
+    config.validate()?;
+    let defaults = tool_core::ToolExecutionLimits::default();
+    let limits = tool_core::ToolExecutionLimits {
+        total_memory_bytes: config
+            .total_task_memory_limit
+            .unwrap_or(defaults.total_memory_bytes),
+        memory_bytes: config.task_memory_limit.unwrap_or(defaults.memory_bytes),
+        cache_bytes: config
+            .task_output_buffer_window
+            .unwrap_or(defaults.cache_bytes),
+    };
+    limits
+        .validate()
+        .map_err(|error| config_core::ConfigError::InvalidToolLimit {
+            field: "tools",
+            reason: error.to_string(),
+        })?;
+    Ok(limits)
+}
+
+#[cfg(test)]
+mod tool_limit_tests {
+    use super::*;
+
+    #[test]
+    fn omitted_tool_limits_use_runtime_defaults() {
+        assert_eq!(
+            resolve_tool_limits(&config_core::FileToolConfig::default()).unwrap(),
+            tool_core::ToolExecutionLimits::default()
+        );
+    }
+
+    #[test]
+    fn partial_tool_configuration_overrides_only_the_selected_limit() {
+        let defaults = tool_core::ToolExecutionLimits::default();
+        for (config, expected) in [
+            (
+                config_core::FileToolConfig {
+                    total_task_memory_limit: Some(17),
+                    ..Default::default()
+                },
+                tool_core::ToolExecutionLimits {
+                    total_memory_bytes: 17,
+                    ..defaults
+                },
+            ),
+            (
+                config_core::FileToolConfig {
+                    task_memory_limit: Some(19),
+                    ..Default::default()
+                },
+                tool_core::ToolExecutionLimits {
+                    memory_bytes: 19,
+                    ..defaults
+                },
+            ),
+            (
+                config_core::FileToolConfig {
+                    task_output_buffer_window: Some(23),
+                    ..Default::default()
+                },
+                tool_core::ToolExecutionLimits {
+                    cache_bytes: 23,
+                    ..defaults
+                },
+            ),
+        ] {
+            assert_eq!(resolve_tool_limits(&config).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn file_budget_overrides_reach_effective_tool_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let source = "[server]\nbind = '127.0.0.1:0'\n[outbound]\nlogs = ['broadcast']\nbackend_state = ['broadcast']\n[tools]\ntotal_task_memory_limit = '100B'\ntask_memory_limit = '106B'\ntask_output_buffer_window = '108B'\n";
+        let path = root.path().join("config.toml");
+        std::fs::write(&path, source).unwrap();
+        let config = config_plugin::ConfigPlugin::open(path).unwrap();
+        let effective = resolve_tool_limits(config.config().tools()).unwrap();
+        assert_eq!(effective.total_memory_bytes, 100);
+        assert_eq!(effective.memory_bytes, 106);
+        assert_eq!(effective.cache_bytes, 108);
+    }
+
+    #[test]
+    fn zero_budget_is_configuration_error_before_app_installation() {
+        for field in [
+            "total_task_memory_limit",
+            "task_memory_limit",
+            "task_output_buffer_window",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("config.toml");
+            std::fs::write(&path, format!("[server]\nbind = '127.0.0.1:0'\n[outbound]\nlogs = ['broadcast']\nbackend_state = ['broadcast']\n[tools]\n{field} = '0'\n")).unwrap();
+            let error = crate::build_app(ApplicationOptions {
+                data_root: root.path().to_owned(),
+                runner_path: std::env::current_exe().unwrap(),
+            })
+            .err()
+            .expect("must reject invalid budget before creating app");
+            assert_eq!(error.domain, "config");
+            assert_eq!(error.path, path);
+        }
+    }
+
+    #[test]
+    fn programmatic_zero_budget_reports_the_configuration_field() {
+        for (config, field) in [
+            (
+                config_core::FileToolConfig {
+                    total_task_memory_limit: Some(0),
+                    ..Default::default()
+                },
+                "tools.total_task_memory_limit",
+            ),
+            (
+                config_core::FileToolConfig {
+                    task_memory_limit: Some(0),
+                    ..Default::default()
+                },
+                "tools.task_memory_limit",
+            ),
+            (
+                config_core::FileToolConfig {
+                    task_output_buffer_window: Some(0),
+                    ..Default::default()
+                },
+                "tools.task_output_buffer_window",
+            ),
+        ] {
+            assert!(
+                matches!(resolve_tool_limits(&config), Err(config_core::ConfigError::InvalidToolLimit { field: actual, .. }) if actual == field)
+            );
+        }
     }
 }

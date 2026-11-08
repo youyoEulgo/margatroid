@@ -688,7 +688,7 @@ async fn imports_validate_dependencies_kind_and_cross_category_aliases_and_rerea
     )
     .unwrap();
     fs::write(tool.join("input.schema.json"), "{}").unwrap();
-    fs::write(tool.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() task_return('test') end").unwrap();
+    fs::write(tool.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() margatroid:task_return('test') end").unwrap();
     let sandbox = fixture.root.path().join("sandboxes/local/policy/latest");
     fs::create_dir_all(&sandbox).unwrap();
     fs::write(sandbox.join("policy.json"), "{}").unwrap();
@@ -1649,7 +1649,7 @@ async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_
                     )
                     .unwrap();
                     fs::write(directory.join("input.schema.json"), "{}").unwrap();
-                    fs::write(directory.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() task_return('test') end").unwrap();
+                    fs::write(directory.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() margatroid:task_return('test') end").unwrap();
                 }
                 "sandbox" => fs::write(directory.join("policy.json"), "{}").unwrap(),
                 _ => unreachable!(),

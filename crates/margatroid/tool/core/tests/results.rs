@@ -8,7 +8,7 @@ use tool_core::{
 };
 
 fn parse(value: &Value) -> tool_core::ToolExecuteResponse {
-    parse_tool_result(value, &ToolExecutionLimits::default()).unwrap()
+    parse_tool_result(value).unwrap()
 }
 
 #[test]
@@ -74,11 +74,8 @@ fn images_require_typed_envelopes_canonical_base64_and_matching_signatures() {
         json!([{"media_type": "image/png", "data": "aGVsbG8="}]),
         json!([{"media_type": "text/plain", "data": "aGVsbG8="}]),
     ] {
-        let error = parse_tool_result(
-            &json!({"ok": true, "content": "image", "images": images}),
-            &ToolExecutionLimits::default(),
-        )
-        .unwrap_err();
+        let error = parse_tool_result(&json!({"ok": true, "content": "image", "images": images}))
+            .unwrap_err();
         assert_eq!(error.kind, ToolErrorKind::RunnerProtocolFailed);
         assert!(!error.message.contains("SECRET_NOT_BASE64"));
     }
@@ -88,190 +85,72 @@ fn images_require_typed_envelopes_canonical_base64_and_matching_signatures() {
         json!({"ok": false, "content": "failed", "images": [{"media_type": "image/png", "data": STANDARD.encode(b"\x89PNG\r\n\x1a\n")} ]}),
     ] {
         assert_eq!(
-            parse_tool_result(&invalid, &ToolExecutionLimits::default())
-                .unwrap_err()
-                .kind,
+            parse_tool_result(&invalid).unwrap_err().kind,
             ToolErrorKind::RunnerProtocolFailed
         );
     }
 }
 
 #[test]
-fn text_and_total_result_limits_enforce_exact_encoded_boundaries() {
-    let plain = json!("界");
-    let exact = ToolExecutionLimits {
-        output_bytes: 3,
-        result_bytes: 5,
-        ..ToolExecutionLimits::default()
-    };
-    assert_eq!(parse_tool_result(&plain, &exact).unwrap().content, "界");
-    assert_eq!(
-        parse_tool_result(
-            &plain,
-            &ToolExecutionLimits {
-                output_bytes: 2,
-                ..exact.clone()
-            }
-        )
-        .unwrap_err()
-        .kind,
-        ToolErrorKind::OutputTooLarge
-    );
-    assert_eq!(
-        parse_tool_result(
-            &plain,
-            &ToolExecutionLimits {
-                result_bytes: 4,
-                ..exact
-            }
-        )
-        .unwrap_err()
-        .kind,
-        ToolErrorKind::OutputTooLarge
-    );
-    let envelope = json!({"ok": true, "content": "abc"});
-    let length = envelope.to_string().len();
-    let limits = ToolExecutionLimits {
-        output_bytes: length,
-        result_bytes: length,
-        ..ToolExecutionLimits::default()
-    };
-    assert!(parse_tool_result(&envelope, &limits).is_ok());
-    assert_eq!(
-        parse_tool_result(
-            &envelope,
-            &ToolExecutionLimits {
-                output_bytes: length - 1,
-                ..limits.clone()
-            }
-        )
-        .unwrap_err()
-        .kind,
-        ToolErrorKind::OutputTooLarge
-    );
-    assert_eq!(
-        parse_tool_result(
-            &envelope,
-            &ToolExecutionLimits {
-                result_bytes: length - 1,
-                ..limits
-            }
-        )
-        .unwrap_err()
-        .kind,
-        ToolErrorKind::OutputTooLarge
-    );
+fn result_text_is_preserved_in_plain_values_and_envelopes() {
+    let text = "你好\n".repeat(1024);
+    assert_eq!(parse_tool_result(&json!(text)).unwrap().content, text);
+    let envelope = json!({"ok": true, "content": text});
+    assert_eq!(parse_tool_result(&envelope).unwrap().content, text);
 }
 
 #[test]
-fn image_count_and_decoded_byte_budgets_are_enforced() {
-    let image = json!({"media_type": "image/png", "data": STANDARD.encode(b"\x89PNG\r\n\x1a\n")});
-    assert_eq!(
-        parse(&json!({"ok": true, "content": "", "images": vec![image.clone(); 8]}))
-            .images
-            .len(),
-        8
-    );
-    assert_eq!(
-        parse_tool_result(
-            &json!({"ok": true, "content": "", "images": vec![image; 9]}),
-            &ToolExecutionLimits::default()
-        )
-        .unwrap_err()
-        .kind,
-        ToolErrorKind::RunnerProtocolFailed
-    );
-    let mut bytes = vec![0; tool_core::MAX_TOOL_IMAGE_BYTES + 1];
+fn host_accepts_nine_images_with_complete_payloads() {
+    let mut bytes = vec![0; 1024];
     bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
-    let oversized = json!({"ok": true, "content": "", "images": [{"media_type": "image/png", "data": STANDARD.encode(&bytes)}]});
-    assert_eq!(
-        parse_tool_result(&oversized, &ToolExecutionLimits::default())
-            .unwrap_err()
-            .kind,
-        ToolErrorKind::OutputTooLarge
-    );
-    bytes.pop();
-    let image = json!({"media_type": "image/png", "data": STANDARD.encode(&bytes)});
-    let limits = ToolExecutionLimits {
-        result_bytes: 40 * 1024 * 1024,
-        ..ToolExecutionLimits::default()
-    };
-    assert!(
-        parse_tool_result(
-            &json!({"ok": true, "content": "", "images": vec![image.clone(); 4]}),
-            &limits
-        )
-        .is_ok()
-    );
-    assert_eq!(
-        parse_tool_result(
-            &json!({"ok": true, "content": "", "images": vec![image; 5]}),
-            &limits
-        )
-        .unwrap_err()
-        .kind,
-        ToolErrorKind::OutputTooLarge
-    );
+    let data = STANDARD.encode(&bytes);
+    let image = json!({"media_type": "image/png", "data": data});
+    let value = json!({"ok": true, "content": "summary", "images": vec![image; 9]});
+    let response = parse_tool_result(&value).unwrap();
+    assert_eq!(response.content, "summary");
+    assert_eq!(response.images.len(), 9);
+    assert!(response.images.iter().all(|image| image.data == data));
 }
 
 #[test]
-fn image_payload_does_not_consume_text_budget_but_counts_towards_total() {
-    let value = json!({"ok": true, "content": "summary", "images": [{"media_type": "image/png", "data": STANDARD.encode(b"\x89PNG\r\n\x1a\n")} ]});
-    let limits = ToolExecutionLimits {
-        output_bytes: json!({"ok": true, "content": "summary"}).to_string().len(),
-        result_bytes: value.to_string().len(),
-        ..ToolExecutionLimits::default()
-    };
-    assert!(parse_tool_result(&value, &limits).is_ok());
-    assert_eq!(
-        parse_tool_result(
-            &value,
-            &ToolExecutionLimits {
-                result_bytes: value.to_string().len() - 1,
-                ..limits
-            }
-        )
-        .unwrap_err()
-        .kind,
-        ToolErrorKind::OutputTooLarge
-    );
+fn host_accepts_large_images_and_aggregate_image_payloads() {
+    let mut bytes = vec![0; 4 * 1024 * 1024 + 1];
+    bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    let data = STANDARD.encode(&bytes);
+    let image = json!({"media_type": "image/png", "data": data});
+    let value = json!({"ok": true, "content": "large images", "images": vec![image; 5]});
+    let response = parse_tool_result(&value).unwrap();
+    assert_eq!(response.images.len(), 5);
+    assert!(response.images.iter().all(|image| image.data == data));
 }
 
 #[test]
-fn execution_limits_validate_and_round_trip() {
+fn execution_limits_have_total_and_task_memory_and_buffer_budgets_and_round_trip() {
     let defaults = ToolExecutionLimits::default();
     defaults.validate().unwrap();
+    let value = serde_json::to_value(&defaults).unwrap();
+    assert_eq!(value.as_object().unwrap().len(), 3);
+    assert_eq!(value["total_memory_bytes"], defaults.total_memory_bytes);
+    assert_eq!(value["memory_bytes"], defaults.memory_bytes);
+    assert_eq!(value["cache_bytes"], defaults.cache_bytes);
     assert_eq!(
-        serde_json::from_value::<ToolExecutionLimits>(serde_json::to_value(&defaults).unwrap())
-            .unwrap(),
+        serde_json::from_value::<ToolExecutionLimits>(value).unwrap(),
         defaults
     );
-    let mut invalids = Vec::new();
-    for field in 0..8 {
-        let mut invalid = defaults.clone();
-        match field {
-            0 => invalid.script_bytes = 0,
-            1 => invalid.argument_bytes = 0,
-            2 => invalid.output_bytes = 0,
-            3 => invalid.result_bytes = 0,
-            4 => invalid.diagnostic_bytes = 0,
-            5 => invalid.memory_bytes = 0,
-            6 => invalid.cache_bytes = 0,
-            _ => invalid.input_capacity = 0,
-        }
-        invalids.push(invalid);
-    }
-    invalids.extend([
+    for invalid in [
         ToolExecutionLimits {
-            instruction_budget: 0,
+            total_memory_bytes: 0,
             ..defaults.clone()
         },
         ToolExecutionLimits {
-            input_capacity: usize::MAX,
-            ..defaults
+            memory_bytes: 0,
+            ..defaults.clone()
         },
-    ]);
-    for invalid in invalids {
+        ToolExecutionLimits {
+            cache_bytes: 0,
+            ..defaults.clone()
+        },
+    ] {
         assert_eq!(
             invalid.validate().unwrap_err().kind,
             ToolErrorKind::InvalidRequest

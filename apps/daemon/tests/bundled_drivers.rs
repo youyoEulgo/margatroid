@@ -17,7 +17,7 @@ fn all_bundled_drivers_and_declared_resource_files_are_readable_with_the_new_con
             match parsed.kind.as_str() {
                 "tool" => {
                     let path = address::resolve_file(&root.join("tools"), &locator).unwrap();
-                    let tool = tool_resource_core::read_tool(&path, &Default::default()).unwrap();
+                    let tool = tool_resource_core::read_tool(&path).unwrap();
                     mlua::Lua::new()
                         .load(&tool.program)
                         .into_function()
