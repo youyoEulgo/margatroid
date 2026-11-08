@@ -2,65 +2,47 @@ function configure(arguments, context)
     return { timeout_ms = 30000 }
 end
 
-local MAX_RESULTS = 100
-local MAX_OUTPUT_BYTES = 16 * 1024 * 1024
-
-local function shell_quote(value)
-    if package.config:sub(1, 1) == "\\" then
-        return '"' .. value:gsub('"', '\\"') .. '"'
-    end
-    return "'" .. value:gsub("'", "'\\''") .. "'"
+local function expected(message)
+    error({ file_failure = true, message = message }, 0)
 end
-
--- Task configuration owns timeout; the private client bounds command output.
-local function run(command, context)
-    local client = dofile(context.resource_dir .. "/shell.lua")(context)
-    local result = client.exec(command, { max_output_bytes = MAX_OUTPUT_BYTES })
-    if result.truncated then
-        return nil, "glob output exceeded the size limit; narrow the pattern or path"
-    end
-    if result.exit_code ~= 0 and result.exit_code ~= 1 then
-        return nil, "ripgrep failed (exit " .. tostring(result.exit_code) .. "): " .. result.stderr
-    end
-    return result.stdout
-end
-
-local function report(content, failure)
-    if failure then
-        return { ok = false, content = failure }
-    end
-    return { ok = true, content = content }
-end
-
 local function perform(arguments, context)
-    local args = {
-        "--files", "--null", "--no-config", "--hidden", "--no-ignore", "--sortr", "modified",
-        "--glob", arguments.pattern,
-        "--glob", "!**/.git/**", "--glob", "!**/.hg/**", "--glob", "!**/.svn/**",
-        "--glob", "!**/.jj/**", "--", arguments.path or ".",
-    }
-    local parts = { "rg" }
-    for _, arg in ipairs(args) do
-        parts[#parts + 1] = shell_quote(arg)
+    local helper = assert(load(margatroid.files:read(context.resource_dir .. "/filewalk.lua"), "@filewalk.lua"))()
+    local pattern = arguments.pattern
+    local negate = pattern:sub(1, 1) == "!"
+    if negate then pattern = pattern:sub(2) end
+    margatroid.files:matches("", pattern)
+    local paths, bytes = {}, 0
+    local vcs = { [".git"] = true, [".hg"] = true, [".svn"] = true, [".jj"] = true }
+    helper.walk(arguments.path or ".", { exclude = negate and pattern or nil }, function(info, path, explicit)
+        if not explicit then
+            for part in path:gmatch("([^/]+)/") do if vcs[part] then return end end
+        end
+        if explicit or (negate and pattern:sub(-1) == "/") or margatroid.files:matches(path:gsub("^%./", ""), pattern) ~= negate then
+            if info.modified_at_ns == nil then expected("cannot obtain modification time for " .. path) end
+            bytes = bytes + #path + 1
+            if bytes > 16 * 1024 * 1024 then expected("glob output exceeded the size limit; narrow the pattern or path") end
+            paths[#paths + 1] = { path = path, modified = info.modified_at_ns }
+        end
+    end)
+    table.sort(paths, function(a, b)
+        if a.modified ~= b.modified then return a.modified > b.modified end
+        return a.path < b.path
+    end)
+    if #paths == 0 then return { ok = true, content = "No files found." } end
+    local output = {}
+    for index = 1, math.min(100, #paths) do
+        output[#output + 1] = paths[index].path:gsub("\r", "\\r"):gsub("\n", "\\n")
     end
-    local stdout, failure = run(table.concat(parts, " "), context)
-    if not stdout then return report(nil, failure) end
-
-    local paths = {}
-    local total = 0
-    for path in stdout:gmatch("([^%z]+)%z") do
-        total = total + 1
-        if #paths < MAX_RESULTS then paths[#paths + 1] = path:gsub("\r", "\\r"):gsub("\n", "\\n") end
-    end
-    if total == 0 then return report("No files found.") end
-    if total > #paths then
-        paths[#paths + 1] = string.format("[... %d additional files omitted; narrow the search ...]", total - #paths)
-    end
-    return report(table.concat(paths, "\n"))
+    if #paths > 100 then output[#output + 1] = string.format("[... %d additional files omitted; narrow the search ...]", #paths - 100) end
+    return { ok = true, content = table.concat(output, "\n") }
 end
 
 function execute(arguments, context)
-    local result = perform(arguments, context)
-    margatroid:task_return(result)
-    margatroid:task_finish(context.task_id)
+    arguments = context.arguments
+    local ok, result = pcall(perform, arguments, context)
+    if ok then margatroid.task:return_result(result)
+    elseif type(result) == "table" and result.file_failure then
+        margatroid.task:return_result({ ok = false, content = result.message })
+    else error(result, 0) end
+    margatroid.task:finish(context.task_id)
 end

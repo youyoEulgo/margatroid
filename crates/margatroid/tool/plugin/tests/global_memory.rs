@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "support/storage.rs"]
+mod storage_fixture;
+
 use agent_core::{Agent, AgentState};
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
@@ -31,7 +34,7 @@ type Reply = oneshot::Receiver<Result<ToolExecuteResponse, ToolError>>;
 const PROGRAM: &str = r#"
 function configure() return {timeout_ms=10000} end
 function execute(args, context)
-    local function read(path) return margatroid:read_file(path):match('^%s*(.-)%s*$') end
+    local function read(path) return margatroid.files:read(path):match('^%s*(.-)%s*$') end
     local relative=read('/proc/self/cgroup'):match('0::([^\n]+)')
     local group='/sys/fs/cgroup'..relative
     local stat=read('/proc/self/stat')
@@ -47,12 +50,12 @@ function execute(args, context)
     end
     local proof={pid=pid,ppid=ppid,group=group,max=read(group..'/memory.max'),
         swap=read(group..'/memory.swap.max'),oom_group=read(group..'/memory.oom.group'),ancestors=ancestors}
-    margatroid:write_file(args.proof,margatroid:json_encode(proof))
-    margatroid:task_return('ready')
-    local command=margatroid:task_receive()
+    margatroid.files:write(args.proof,margatroid.data:encode('json', proof))
+    margatroid.task:return_result('ready')
+    local command=margatroid.task:receive()
     if args.thin then
-        margatroid:task_write(command)
-        margatroid:task_receive()
+        margatroid.task:append_output(command)
+        margatroid.task:receive()
         return
     end
     assert(command=='allocate')
@@ -64,11 +67,11 @@ for offset in range(0,len(data),4096): data[offset]=1
 print('allocated',flush=True)
 sys.stdin.readline()
 ]]
-    local child=margatroid:process_open({program='/usr/bin/python3',arguments={'-u','-c',python,args.child_proof,tostring(args.bytes)}})
+    local child=margatroid.process:start('/usr/bin/python3', {'-u','-c',python,args.child_proof,tostring(args.bytes)})
     local frame=child:read()
     assert(frame.data:find('allocated',1,true),'allocator exited before acknowledgement')
-    margatroid:task_write({allocated=args.bytes})
-    margatroid:task_receive()
+    margatroid.task:append_output({allocated=args.bytes})
+    margatroid.task:receive()
     child:close()
 end
 "#;
@@ -135,6 +138,7 @@ impl Fixture {
         );
         let agents = std::array::from_fn(|index| {
             let agent = app.world_mut().spawn();
+            storage_fixture::mount(app.world_mut(), agent, root.path());
             app.world_mut().insert_component(
                 agent,
                 Agent {
@@ -323,7 +327,9 @@ impl Fixture {
         let complete = self.handles.iter().all(ToolTaskHandle::is_cleanup_complete);
         if std::thread::panicking() {
             if !surviving.is_empty() || !complete {
-                eprintln!("cleanup failed during unwinding: live PIDs {surviving:?}; all tasks complete: {complete}");
+                eprintln!(
+                    "cleanup failed during unwinding: live PIDs {surviving:?}; all tasks complete: {complete}"
+                );
             }
         } else {
             assert!(

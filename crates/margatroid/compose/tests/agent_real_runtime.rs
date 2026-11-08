@@ -27,13 +27,13 @@ use tool_core::{InitToolTasks, ToolTasks};
 use workspace_core::{Workspace, WorkspaceExecutor, WorkspaceState, spawn_workspace_executor};
 
 const PROGRAM: &str = r#"
-mcl("CREATE BLOCK conversation (messages)")
-mcl("CREATE TEMP BLOCK private (messages)")
-local previous = mcl("GET private.messages").Array.Message
+margatroid.driver:mcl("CREATE BLOCK conversation (messages)")
+margatroid.driver:mcl("CREATE TEMP BLOCK private (messages)")
+local previous = margatroid.driver:mcl("GET private.messages").Array.Message
 if #previous ~= 0 then error("TEMP messages restored from a previous VM") end
-mcl("INJECT ? TO private.messages", {{{type="user", content="this VM only"}}})
-mcl("EFFECT ready")
-wait()
+margatroid.driver:mcl("INJECT ? TO private.messages", {{{type="user", content="this VM only"}}})
+margatroid.driver:mcl("EFFECT ready")
+margatroid.driver:wait()
 "#;
 fn seed(root: &Path) {
     let driver = root.join("agent-drivers/local/test/latest");

@@ -1,9 +1,9 @@
 local function command(text, arguments)
     local result
     if arguments == nil then
-        result = mcl(agent_info.entity, text)
+        result = margatroid.driver:mcl(margatroid.context.agent_info.entity, text)
     else
-        result = mcl(agent_info.entity, text, arguments)
+        result = margatroid.driver:mcl(margatroid.context.agent_info.entity, text, arguments)
     end
     if type(result) == "table" and result.Error then
         local failure = result.Error
@@ -27,7 +27,7 @@ end
 
 local function maybe_compact_context(message)
     local config = settings()
-    local threshold = agent_info.model.context_window_tokens * config.compaction.threshold
+    local threshold = margatroid.context.agent_info.model.context_window_tokens * config.compaction.threshold
     if not message.usage
         or message.usage.input_tokens + message.usage.output_tokens < threshold then
         return
@@ -167,7 +167,7 @@ local function process_next()
             end
         end
     else
-        wait()
+        margatroid.driver:wait()
     end
 end
 
@@ -186,14 +186,16 @@ local function recover(failure)
         local finished = pcall(command, "EFFECT finish_turn")
         cleanup_pending = not finished
     end
-    wait()
+    margatroid.driver:wait()
 end
 
 while true do
     local ok, failure = pcall(process_next)
     if not ok then
         if type(failure) ~= "table" or failure.type ~= "error" then
-            failure = {type = "error", message = tostring(failure)}
+            local message = "Driver execution failed; see Agent logs"
+            margatroid:log("error", message, {raw_error = tostring(failure), stage = "turn"})
+            failure = {type = "error", message = message}
         end
         recover(failure)
     end

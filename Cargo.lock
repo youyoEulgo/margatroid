@@ -1294,10 +1294,19 @@ dependencies = [
 name = "lua_runtime_core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "core_plugin",
+ "futures-util",
+ "globset",
+ "mlua",
+ "regex",
+ "serde",
  "serde_json",
+ "serde_yaml",
+ "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
 ]
 
 [[package]]
@@ -1305,6 +1314,7 @@ name = "lua_runtime_plugin"
 version = "0.1.0"
 dependencies = [
  "address",
+ "agent_core",
  "app_runtime_plugin",
  "async_runtime_plugin",
  "closure_plugin",
@@ -1314,6 +1324,8 @@ dependencies = [
  "mcl_core",
  "mlua",
  "serde_json",
+ "storage_core",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1442,6 +1454,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "storage_core",
  "tempfile",
  "tokio",
  "tool_core",
@@ -2708,16 +2721,16 @@ dependencies = [
  "core_plugin",
  "futures-util",
  "jsonschema",
+ "lua_runtime_core",
  "mlua",
  "nix",
  "sandbox_resource_core",
  "serde",
  "serde_json",
- "serde_yaml",
+ "storage_core",
  "tempfile",
  "tokio",
  "tokio-util",
- "toml",
  "tool_core",
  "tool_resource_core",
  "workspace_core",

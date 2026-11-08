@@ -16,6 +16,9 @@ use tool_resource_core::{InjectedToolDefinition, ToolEntry};
 
 pub(crate) struct ToolExecutionContext {
     pub request: ToolExecuteRequest,
+    pub storage: storage_core::AgentStorage,
+    pub agent_name: String,
+    pub diagnostic_received: bool,
     pub tool_entry: ToolEntry,
     pub world: std::sync::Weak<WorldClosureSender>,
     pub sandbox_path: Option<PathBuf>,
@@ -40,6 +43,9 @@ pub(crate) struct RunnerRequest {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ToolContext {
+    pub agent_name: String,
+    pub turn: String,
+    pub source_origin: String,
     pub task_id: String,
     pub call_id: String,
     pub alias: String,
@@ -52,6 +58,23 @@ pub(crate) struct ToolContext {
     pub temp_dir: PathBuf,
 }
 
+impl ToolContext {
+    pub(crate) fn public_value(&self, arguments: &Value) -> Result<Value, serde_json::Error> {
+        let mut value = serde_json::to_value(self)?;
+        if let Some(context) = value.as_object_mut() {
+            context.insert("arguments".into(), arguments.clone());
+            context.remove("source_origin");
+            context.remove("agent_name");
+            context.insert("kind".into(), Value::String("tool".into()));
+            context.insert(
+                "agent_info".into(),
+                serde_json::json!({"name": self.agent_name}),
+            );
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct RunnerWire {
     pub protocol_version: u32,
@@ -61,6 +84,14 @@ pub(crate) struct RunnerWire {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum RunnerFrame {
+    Log {
+        request_id: String,
+        record: storage_core::AgentLogRecord,
+    },
+    LuaDiagnostic {
+        request_id: String,
+        record: storage_core::AgentLogRecord,
+    },
     Configured {
         configuration: ToolConfiguration,
     },

@@ -125,10 +125,23 @@ fn write(root: &Path, relative: &str, contents: &str) {
 
 fn fixture(home: &Path, address: std::net::SocketAddr) -> PathBuf {
     let root = home.join(".margatroid");
-    write(&root, "config.toml", &format!(
-        "[server]\nbind='{address}'\n[outbound]\nlogs=['type:unmatched']\nbackend_state=['type:webui']\n"));
-    write(&root, "models.toml", "[[models]]\nid='offline'\nmodel='unused'\nbase_url='http://127.0.0.1:9/v1'\napi_key='test-only'\nprovider='openai'\napi_type='chat_completions'\ncontext_window='128k'\n");
-    write(&root, "agent-drivers/local/shutdown/latest/driver.toml", "schema_version=1\ndependencies=['tool:local/shutdown:latest']\n[inference]\nmodel='offline'\n");
+    write(
+        &root,
+        "config.toml",
+        &format!(
+            "[server]\nbind='{address}'\n[outbound]\nlogs=['type:unmatched']\nbackend_state=['type:webui']\n"
+        ),
+    );
+    write(
+        &root,
+        "models.toml",
+        "[[models]]\nid='offline'\nmodel='unused'\nbase_url='http://127.0.0.1:9/v1'\napi_key='test-only'\nprovider='openai'\napi_type='chat_completions'\ncontext_window='128k'\n",
+    );
+    write(
+        &root,
+        "agent-drivers/local/shutdown/latest/driver.toml",
+        "schema_version=1\ndependencies=['tool:local/shutdown:latest']\n[inference]\nmodel='offline'\n",
+    );
     write(
         &root,
         "agent-drivers/local/shutdown/latest/settings.toml",
@@ -139,12 +152,12 @@ fn fixture(home: &Path, address: std::net::SocketAddr) -> PathBuf {
         "agent-drivers/local/shutdown/latest/base.lua",
         r#"
 local function command(text)
-    local result = mcl(agent_info.entity, text)
+    local result = margatroid.driver:mcl(margatroid.context.agent_info.entity, text)
     assert(not result.Error, 'shutdown fixture MCL failed')
 end
 command('IMPORT TOOL tool:local/shutdown:latest AS shutdown')
 command('EFFECT ready')
-while true do wait() end
+while true do margatroid.driver:wait() end
 "#,
     );
     write(
@@ -164,7 +177,7 @@ while true do wait() end
 function configure() return {timeout_ms=0} end
 function execute(arguments, context)
     local child
-    if margatroid.arguments.kind == 'terminal' then
+    if margatroid.context.arguments.kind == 'terminal' then
         local client = dofile(margatroid.context.resource_dir..'/shell.lua')(margatroid.context)
         child = client.terminal()
         child:write('/bin/bash ./children.sh terminal\r')
@@ -175,7 +188,7 @@ function execute(arguments, context)
             output = output .. chunk.text
         end
     else
-        child = margatroid:process_open({program='/bin/bash', arguments={'./children.sh','process'}})
+        child = margatroid.process:start('/bin/bash', {'./children.sh','process'})
         local output = ''
         while not string.find(output, 'CHILDREN_READY', 1, true) do
             local chunk = child:read()
@@ -183,9 +196,9 @@ function execute(arguments, context)
             output = output .. chunk.data
         end
     end
-    margatroid:task_return({ready=true, kind=margatroid.arguments.kind})
+    margatroid.task:return_result({ready=true, kind=margatroid.context.arguments.kind})
     -- Returning a result leaves both the Lua task and the subprocess alive.
-    while true do margatroid:task_receive() end
+    while true do margatroid.task:receive() end
 end
 "#,
     );
@@ -206,8 +219,15 @@ printf 'CHILDREN_READY\n'
 wait
 "#,
     );
-    write(&root, "workspaces/shutdown/workspace.yaml", &format!(
-        "name: shutdown\nproject_root: {}\nmembers:\n  - name: fixture\n    driver: driver:local/shutdown:latest\n    home_root: {}\n", project.display(), home.display()));
+    write(
+        &root,
+        "workspaces/shutdown/workspace.yaml",
+        &format!(
+            "name: shutdown\nproject_root: {}\nmembers:\n  - name: fixture\n    driver: driver:local/shutdown:latest\n    home_root: {}\n",
+            project.display(),
+            home.display()
+        ),
+    );
     root.join("workspaces/shutdown/workspace.yaml")
 }
 

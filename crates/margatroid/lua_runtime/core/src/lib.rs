@@ -1,6 +1,7 @@
 pub mod components;
 mod error;
 pub mod events;
+pub mod host;
 pub mod types;
 
 pub use components::{DriverLuaVm, DriverReadySender};

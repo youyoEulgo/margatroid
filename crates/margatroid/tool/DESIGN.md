@@ -227,177 +227,190 @@ run_tool_worker(request: RunnerRequest) -> Result<(), ToolError>
         在受沙箱限制的worker内创建Lua，先以纯计算环境加载脚本并运行configure(arguments, context)，Lua VM内存上限始终生效，执行hook只处理取消及工具声明的deadline；
         创建只读元数据对象margatroid，context与arguments字段对应本次调用；configure阶段仅提供元数据访问。
         Lua全局只注入margatroid对象，不安装同名全局宿主函数、json表、args或context，也不保留margatroid()函数入口。
+        公共实现不依赖Tool、MCL或Storage领域；本plugin通过其core契约构造能力回调并填入共享定义
         字段getter返回独立数据，Lua修改取得的表不改变宿主调用标记。
         异步方法同步取得内部共享句柄并释放userdata借用，再执行等待，支持同一对象并发调用。
-        配置经Configured帧往返确认后为margatroid启用通用宿主方法，并安装执行阶段标准库，再运行execute(arguments, context)，不重新加载脚本。
-        执行阶段os.execute和io.popen报错并提示使用margatroid:process_open。自然退出也进入清理；
+        安装共享Margatroid对象定义，按tool身份、configure阶段和当前执行边界绑定允许的能力
+        配置经Configured帧往返确认后启用公共执行方法与margatroid.tools与margatroid.task方法，再运行execute(arguments, context)，不重新加载脚本
+        margatroid.driver方法始终拒绝，执行身份在宿主绑定时固定，不接受arguments或可写Lua表覆盖
+        执行阶段os.execute和io.popen报错并提示使用margatroid.process:start。自然退出也进入清理；
         task_finish自身以控制退出终止后续Lua语句，不等待自身JoinHandle。
-        Lua执行错误及failed回复只交付错误类别与说明，剥离stack traceback；成功输出保持原样。
+        在宿主入口边界捕获加载、configure与execute的Lua异常，先保留原始错误、程序来源、行号与traceback
+        脚本加载前建立内部诊断发送能力，不向configure脚本开放日志或其他IO方法
+        supervisor允许配置确认前的私有LuaDiagnostic帧，主动Log仍只允许execute阶段
+        自动日志通过扩展的私有worker协议交给宿主，宿主补齐Agent、回合、任务和调用关联后写入agent_logs
+        等待原始诊断写入处理完成，再交付简洁失败或释放本次执行存储能力
+        原始诊断只写日志；返回给LLM的工具失败使用分类后的简洁说明，成功输出保持原样
+        task_finish控制退出、主动取消和工具超时沿原控制流程处理，不冒充Lua脚本故障
+        已task_return后发生异常仍记录诊断，但不得再次回复；后台任务error只保存可对外展示的说明
+        自动诊断只由该入口捕获边界记录一次，不在上层重复记录同一异常
+        诊断写入失败走现有stderr通道，保留原执行错误，不递归记录日志失败
 ```
 
 ## Lua宿主对象
 
 ```text
-Margatroid：Rust userdata，Lua全局对象名margatroid
-    version: u32--只读接口版本
-    context: ToolContext--只读调用上下文
-    arguments: LuaValue--只读调用参数
-    null: LuaValue--只读空值标记
+Margatroid：共享Rust userdata，Lua全局对象名margatroid
+    context: serde_json::Value--只读身份、路径、调用关联及arguments，返回独立副本
+    files: 文件操作子对象
+    data: 数据格式转换子对象，含null空值标记
+    text: 通用文本搜索子对象
+    process: 子进程启动子对象
+    driver: Driver协调子对象
+    tools: 工具定义注册子对象
+    task: ToolTask执行及交互子对象
 
-margatroid:task_write(value) -> ()
+margatroid:log(level: String, message: String, details: Option<LuaValue>) -> Future<Output = ()>
     行为：
-        向当前任务缓存追加一个完整结构化值，不移动cursor；
-        超出缓存窗口自动滚出旧项并调整cursor；超长字符串保留UTF-8尾部，放不下的结构化项整项滚出。
-margatroid:task_replace(value) -> ()
-    行为：
-        将缓存整体替换为[value]并置cursor=0、replaced=true；
-        覆盖与读取使用同一短锁。
-margatroid:task_return(value) -> ()
-    行为：
-        校验并转换为ToolExecuteResponse，原子竞争共享return状态及reply并交付一次；
-        不释放VM、不关闭任务输入。中止已强制return后不得再次回复。
-margatroid:task_finish(task_id) -> ()
-    行为：
-        仅操作当前Agent任务；
-        自身通过控制退出结束Lua，由监督者完成清理和集合移除；
-        其他任务调用在真实清理并移除后才成功。不能先声明finished再清理；
-        已finish目标不存在。
-margatroid:task_read(task_id) -> TaskReadResult
-    行为：
-        读取同Agent活任务缓存的新增值和错误，并推进cursor；
-        不返回completed状态，已finish目标返回TaskMissing。
-margatroid:task_send(task_id, value) -> ()
-    行为：
-        向同Agent目标任务的Lua输入通道投递任意结构化值。
-margatroid:task_receive() -> LuaValue
-    行为：
-        异步接收当前Lua的一条输入，不持锁等待；
-        输入含义及转发位置由工具代码决定；等待受本任务自身生命周期控制。
+        仅允许debug、info、warn、error；details必须为对象或省略
+        经私有Log帧交宿主写入agent_logs，关联与来源由宿主固定
+        等待SQLite写入确认后返回；失败明确报错，不递归日志、不追加会话或触发推理
+        configure阶段不开放日志IO，阶段异常仍由入口自动记录
 
-margatroid:tool_inject(definitions: Vec<InjectedToolDefinition>) -> 注册入口结果
+margatroid:wait_any(operations: Table<String, Function>) -> Future<Output = (String, LuaValue)>
     行为：
-        require configure已确认
-        通过既有worker帧提交definitions
-        宿主填path=当前工具资源
-        每项owner_task_id按调用方显式配置处理，不默认填当前任务
-        World闭包:
-            require 当前调用任务仍存在且未取消
-            validate definitions
-            owner_task_id省略或None：登记静态工具，不绑定任务生命周期
-            owner_task_id=Some(id)：require 指定任务在当前Agent中存活且未进入清理
-            Tools.insert_batch(definitions)
-            alias冲突或任一owner无效时整批报错，不写入部分记录
-        指定owner任务结束时移除绑定到它的工具记录
-        静态工具不因注入者或其他任务结束而移除，随Agent的Tools存在
-        已受理ToolTask不受工具记录移除影响
-        return 登记结果
+        并发等待命名操作，返回首个完成操作的名称与结果；操作失败则传播错误
+        返回后释放剩余等待，空表报错；不取消对应Task或进程本身
+        异步方法先克隆内部句柄并释放userdata借用，再await
 
-margatroid:await_any(operations: Table<String, Function>) -> Future<Output = (String, LuaValue)>
+margatroid.files:read(path: LuaString) -> Future<Output = LuaString>
     行为：
-        并发等待命名操作，返回首个完成操作的名称及值；
-        该操作失败则传播错误，剩余等待随本次调用释放。空表报错，不增加任务、协议或管理器。
-        返回后释放未完成等待；异步方法先克隆内部执行材料并释放userdata借用，再await。
+        相对路径基于当前执行环境的项目根，在既有沙箱和权限内读取原始字节
+        返回完整内容，不加行号或结果包装；不存在、不可读或取消时返回实际错误
 
-margatroid:process_open(options) -> ProcessSession
-    options.program: String--明确的可执行文件路径
-    options.arguments: Vec<String>--argv数组，禁止隐式shell拼接
+margatroid.files:write(path: LuaString, content: LuaString) -> Future<Output = ()>
     行为：
-        在当前沙箱worker内spawn(program, arguments, cwd=context.project_root)
-        stdin/stdout/stderr = pipes
-        子进程归当前ToolTask
-        沿用ToolTask的timeout_ms、取消及finish清理
-        return ProcessSession
+        写入指定路径的原始字节，不隐式创建父目录、不生成备份
+        相对路径基于项目根；写入失败或取消如实返回错误，不伪造成功
 
-margatroid:json_decode(text: String) -> LuaValue
+margatroid.files:create_directory(path: LuaString, recursive: bool) -> Future<Output = ()>
     行为：
-        解析单个完整JSON值，错误返回格式及解析位置
-        保留对象、数组、null、布尔、字符串和数字的区别
+        recursive=false时只创建指定目录，父目录不存在则报错
+        recursive=true时显式创建缺失的父目录；目标已是目录时成功，目标为文件时报错
+        在当前执行环境权限内操作，不启动shell或外部mkdir进程
 
-margatroid:json_encode(value: LuaValue) -> String
+margatroid.files:info(path: LuaString) -> Future<Output = FileInfo>
     行为：
-        按数据类型编码JSON，不附加输入输出字节配额
-        不支持的值或非有限数值报错，不静默转成字符串
+        合并文件属性与路径解析，path为本次查询项的绝对路径
+        kind、size、modified_at_ns描述查询项自身，符号链接不冒充目标文件
+        resolved_path为解析链接后的真实目标；失效链接目标不可解析时为None
+        查询项不存在或属性不可访问时返回错误；路径和名称保留原始字节，不以替换字符损坏非UTF-8路径
+        不把路径解析当作额外沙箱
 
-margatroid:yaml_decode(text: String) -> LuaValue
+margatroid.files:list(path: LuaString) -> Future<Output = Vec<DirectoryEntry>>
     行为：
-        使用标准YAML解析器解析单个文档
-        映射键要求为字符串，保留序列、映射、标量与null类型
-        重复键、无法表达的值及不支持的标签返回明确错误
-        不解释Skill字段或执行YAML内容
+        列出目录直接子项，按name排列，返回name及与info相同的文件信息
+        不隐式忽略隐藏文件，不递归或跟随目录符号链接遍历
+        工具负责递归、忽略规则、排序及结果格式；不可读或取消时返回错误
 
-margatroid:yaml_encode(value: LuaValue) -> String
+margatroid.files:matches(path: LuaString, pattern: String) -> bool
     行为：
-        将可表达的Lua数据编码为单个YAML文档
-        不支持的数据类型报错，不附加输出字节配额
+        对路径字符串进行真正的glob匹配，不要求文件存在，不访问或遍历文件系统
+        保留现有工具使用的分隔符、通配符、**、字符组及组合模式语义
+        无斜杠模式的文件名匹配与含斜杠的相对路径匹配遵循现有ripgrep glob契约
+        非法模式返回明确错误，不使用Lua pattern近似替代
 
-margatroid:toml_decode(text: String) -> LuaValue
+margatroid.data:decode(format: String, content: LuaString) -> LuaValue
     行为：
-        使用标准TOML解析器解析完整文档，返回对象及其数组和标量
-        日期时间转为对应标准文本；保留整数、浮点、布尔及字符串区别
-        语法、重复键及不可表达的值返回明确错误
+        format仅接受json、yaml、toml、base64，不猜测格式，不保留旧方法别名
+        JSON返回完整结构值，保留对象、数组、空容器、数字及null区别
+        YAML解析单个文档，映射键须为字符串；重复键、不支持的标签及非有限数字报错
+        TOML返回对象，日期时间转标准文本，不把任意字符串推断成日期
+        Base64校验标准编码并返回原始字节；非法编码报错
+        空值通过margatroid.data.null表示，不转为缺失字段
 
-margatroid:toml_encode(value: LuaValue) -> String
+margatroid.data:encode(format: String, value: LuaValue) -> LuaString
     行为：
-        要求根值为对象，编码为TOML文档
-        null及不能表达的值明确报错，不默默删除字段或推断字符串类型
+        format仅接受json、yaml、toml、base64，保留各标准支持的数据语义
+        JSON与YAML编码可表达的结构化值；不支持的类型、循环表及非有限数报错
+        TOML要求对象根值，null或不可表达的值报错，不删除字段或隐式字符串化
+        Base64只接受字节字符串并输出标准编码
 
-margatroid:base64_encode(bytes: LuaString) -> String
+margatroid.text:search(pattern: String, content: LuaString) -> Vec<TextMatch>
     行为：
-        将原始字节编码为标准Base64，不附加字节配额
+        用通用Rust正则引擎查找内容中的非重叠匹配，保留ripgrep默认正则及内联flags语义
+        返回原始内容中的零基字节偏移半开区间[start,end)，不按Unicode字符数计偏移
+        零宽匹配按引擎规则前进，确保搜索终止；非法表达式返回明确错误
+        不遍历文件、不处理忽略规则、不生成grep输出，也不以Lua pattern代替正则
+        行号、逐行搜索、二进制处理与结果截断由具体Lua工具决定
 
-margatroid:base64_decode(text: String) -> LuaString
+margatroid.process:start(program: String, arguments: Vec<String>) -> Future<Output = ProcessSession>
     行为：
-        校验并解码标准Base64，返回原始字节；非法输入报错
+        program必须为明确可执行路径，arguments为argv，不隐式拼接shell
+        在当前执行环境的项目根及既有沙箱内启动原始stdin/stdout/stderr管道
+        子进程归当前VM或ToolTask，随所属执行环境的取消、超时及真实清理回收
+        只有Bash或终端工具显式启动shell-client，文件类工具不依赖该bin
 
-margatroid:read_file(path: String) -> Future<Output = LuaString>
+margatroid.driver:mcl(target, instruction, arguments?) -> HostFuture
     行为：
-        相对路径基于margatroid.context.project_root
-        在当前worker沙箱内读取文件，返回原始字节
-        不可读或取消时报错，不附加读取字节配额，不截断
+        仅Driver身份可用，工具中调用明确返回身份错误
+        沿用原MCL参数、身份绑定及结果契约，不建立工具任务
 
-margatroid:write_file(path: String, bytes: LuaString) -> Future<Output = ()>
+margatroid.driver:wait() -> HostFuture
     行为：
-        相对路径基于margatroid.context.project_root，在当前worker沙箱内写入文件
-        写入失败或取消返回实际错误，不伪造成功，不自动备份或创建父目录
+        仅Driver身份可用，等待原DriverWakeSlot；工具中调用明确失败
 
-margatroid:read_dir(path: String) -> Future<Output = Vec<DirectoryEntry>>
+margatroid.tools:register(definitions: Vec<InjectedToolDefinition>) -> Future<Output = ()>
     行为：
-        只列出指定目录的直接子项，返回name、path及kind，按名称排列
-        不递归、不隐藏或过滤文件；递归策略由Lua工具决定
-        不执行shell，不跟随符号链接遍历；不可读或取消时报错
+        仅工具execute阶段可用，Driver中明确失败；操作Tools记录，不操作运行任务
+        宿主固定程序path为当前资源，每项owner_task_id由调用方显式配置
+        World闭包核对当前任务仍存在且未取消，再校验整批定义和alias冲突
+        省略owner为静态工具；指定owner要求同Agent对应任务存活且未进入清理
+        整批登记，任一错误则全批不写入；不覆盖已有记录
+        指定owner结束仅移除其工具记录，不等待或取消已经受理的ToolTask
 
-margatroid:metadata(path: String) -> Future<Output = FileMetadata>
+margatroid.task:append_output(value: LuaValue) -> Future<Output = ()>
     行为：
-        返回指定项自身的kind和size_bytes；符号链接返回symlink类型
-        相对路径基于项目根，不可访问或取消时报错
+        仅工具execute阶段可用，向当前任务缓冲追加值
+        窗口超限滚出旧项并调整cursor；超长字符串保留UTF-8尾部，放不下的结构项整项滚出
 
-margatroid:canonicalize(path: String) -> Future<Output = String>
+margatroid.task:replace_output(value: LuaValue) -> Future<Output = ()>
     行为：
-        按当前文件系统解析绝对规范路径，存在符号链接时解析其目标
-        路径不存在、不可访问或取消时报错；不改变宿主沙箱权限
+        仅工具execute阶段可用，替换当前输出缓冲，cursor=0且replaced=true
+        替换与读取共用短锁，不改变任务存活状态
 
-ProcessSession：Lua userdata，实际进程和管道仅由worker持有，不作为JSON帧传回宿主
+margatroid.task:read_output(task_id: String) -> Future<Output = TaskReadResult>
+    行为：
+        仅工具execute阶段可用，读取同Agent任务增量缓冲并推进cursor
+        不返回completed字段，已经finish的目标返回TaskMissing
+
+margatroid.task:return_result(value: LuaValue) -> Future<Output = ()>
+    行为：
+        仅工具execute阶段可用，原子交付原调用一次结果，不结束VM或关闭输入
+        与中止共用原reply裁决，重复回复报错，成功交付后异常仍只记录日志
+
+margatroid.task:finish(task_id: String) -> Future<Output = ()>
+    行为：
+        仅工具execute阶段可用，只操作同Agent任务；Driver中调用明确失败
+        自身以控制退出结束Lua，由监督者真实清理；不等待自己的JoinHandle
+        其他任务在真实清理并移除后才返回成功，已finish目标返回TaskMissing
+
+margatroid.task:send(task_id: String, value: LuaValue) -> Future<Output = ()>
+    行为：
+        仅工具execute阶段可用，向同Agent任务输入通道投递结构化值
+        成功仅表示已入队，不表示目标已经处理
+
+margatroid.task:receive() -> Future<Output = LuaValue>
+    行为：
+        仅工具execute阶段可用，等待当前任务的一条输入，不持缓存锁
+        消息协议由Lua工具解释，等待服从当前任务取消及timeout
+
+ProcessSession：原始子进程userdata
     write(bytes: LuaString) -> Future<Output = ()>
         行为：
-            await 按写入顺序将完整bytes写入stdin
-            保持原始字节、支持背压
+            按写入顺序写入完整stdin字节，保持取消后同帧续写及背压语义
     read() -> Future<Output = {data: LuaString, eof: bool}>
         行为：
-            return await stdout字节块及EOF
-            单一读取者；消息边界由工具解析
+            读取stdout字节块及EOF，消息边界由工具解释
     read_stderr() -> Future<Output = {data: LuaString, eof: bool}>
         行为：
-            return await stderr有界字节块及EOF
-            独立消费，不附加累计字节配额
+            独立读取stderr字节块及EOF
     wait() -> Future<Output = {exit_code: Option<i32>, signal: Option<i32>}>
         行为：
-            await 进程退出并回收
-            return exit_code, signal
+            等待子进程退出并回收，返回真实退出状态
     close() -> Future<Output = ()>
         行为：
-            await 终止并回收子进程及管道
-            不自动finish当前ToolTask
-    -- 错误沿ToolError交付
+            终止并回收进程及管道，不自动finish当前ToolTask
 ```
 
 # types
@@ -419,6 +432,9 @@ ToolExecutionContext：单次执行材料
     limits: ToolExecutionLimits
     handle: ToolTaskHandle--与集合条目指向同一任务
     tasks: ToolTasks--共享集合句柄，处理task_read/task_send/task_finish不借用World
+    storage: AgentStorage--当前Agent的owned日志写入能力，不传入worker
+    agent_name: String--宿主固定真实名称及调用关联
+    diagnostic_received: bool--仅本次调用，用于避免同一worker故障重复记录
 
 RunnerContext：进程执行材料--本次读取的程序、校验后的参数、策略及执行预算
 
@@ -437,6 +453,8 @@ RunnerFrame：worker到supervisor的有序协议帧，私有枚举
     Send { request_id: String, task_id: String, value: serde_json::Value }
     Finish { request_id: String, task_id: String }
     Inject { request_id: String, definitions: Vec<InjectedToolDefinition> }--通用工具定义登记请求，不含MCP协议
+    Log { request_id: String, record: AgentLogRecord }--主动日志，宿主固定可信关联并在写入完成后确认
+    LuaDiagnostic { request_id: String, record: AgentLogRecord }--含原始错误、来源和traceback，只在宿主日志路径消费并确认
     InputConsumed--Lua取走输入后允许转发下一条；宿主响应读取不等待输入邮箱腾位。
 
 HostFrame：supervisor到worker的协议帧，私有枚举
@@ -444,16 +462,25 @@ HostFrame：supervisor到worker的协议帧，私有枚举
     Response { request_id: String, result: Result<serde_json::Value, ToolError> }
 
 
-DirectoryEntry：目录项
-    name: String
-    path: String
-    kind: file | directory | symlink | other
+FileInfo：文件信息
+    path: LuaString--本次查询项的绝对路径，保留系统路径原始字节
+    resolved_path: Option<LuaString>--解析符号链接后的目标路径，不做有损转码
+    kind: file | directory | symlink | other--本次查询项自身种类
+    size: u64--本次查询项大小，单位为字节
+    modified_at_ns: Option<i64>--Unix纳秒修改时间，保留文件系统排序精度；不可取得时None
 
-FileMetadata：文件信息
-    kind: file | directory | symlink | other
-    size_bytes: u64
+DirectoryEntry：目录直接子项
+    name: LuaString
+    FileInfo的全部字段
 
-ToolContext：worker上下文
+TextMatch：正则匹配位置
+    start: usize--零基字节偏移，包含
+    end: usize--字节偏移，不包含
+
+ToolContext：worker私有上下文
+    agent_name: String
+    turn: String
+    source_origin: String--内部Lua程序来源，public_value不暴露该键
     task_id: String
     call_id: String
     alias: String--本次被调用的入口alias，不一定是原注册入口
@@ -462,6 +489,10 @@ ToolContext：worker上下文
     resource_dir: PathBuf--当前工具资源目录，供定位同目录bin；不从arguments派生
     project_root: PathBuf
     temp_dir: PathBuf
+    public_value(&self, arguments: &serde_json::Value) -> Result<serde_json::Value, Error>
+        行为：
+            生成只读公共上下文，kind=tool、agent_info.name为真实名称，arguments来自本次调用
+            隐藏内部agent_name与source_origin平铺键，保留调用参数与真实路径材料
 ```
 
 # types pub
@@ -546,7 +577,7 @@ ToolErrorKind：错误类别，公开枚举
     InvalidRequest | AgentMissing | TaskMissing | DuplicateTask | AliasMissing | InvalidArguments | InvalidDefinition
     ReadFailed | Closed | SubmitFailed | SandboxUnavailable | RunnerStartFailed
     RunnerProtocolFailed | ExecutionFailed | OutputTooLarge | Timeout | Cancelled
-    TaskPanicked | CleanupFailed | AlreadyReturned | MissingReturn | InputClosed | InputFull
+    TaskPanicked | CleanupFailed | AlreadyReturned | MissingReturn | InputClosed | InputFull | LogFailed
 ```
 
 # 持有关系

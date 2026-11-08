@@ -13,6 +13,9 @@ pub(crate) struct InstalledRuntime {
 impl Resource for InstalledRuntime {}
 
 pub(crate) struct RunContext {
+    pub storage: storage_core::AgentStorage,
+    pub closures: closure_plugin::WorldClosureSender,
+    pub root: std::path::PathBuf,
     pub source_address: String,
     pub instance: DriverLuaVmInstance,
     pub program: LuaProgram,

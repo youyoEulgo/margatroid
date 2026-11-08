@@ -7,40 +7,35 @@ fn setup() -> (Lua, ProcessRegistry) {
 
 fn setup_at(root: std::path::PathBuf) -> (Lua, ProcessRegistry) {
     let lua = Lua::new();
-    let (registry, process_open) = install_process(&lua, root.clone()).unwrap();
-    let context = crate::types::ToolContext {
-        task_id: "process-test".into(),
-        call_id: "process-call".into(),
-        alias: "process".into(),
-        owner_task_id: None,
-        binding: None,
-        resource_dir: root.clone(),
-        project_root: root.clone(),
-        temp_dir: root,
-    };
-    let object =
-        super::super::host::Margatroid::install(&lua, context, serde_json::json!({})).unwrap();
+    let (registry, process_start) = install_process(&lua, root.clone()).unwrap();
+    let object = crate::host::Margatroid::install(
+        &lua,
+        crate::host::HostDefinition {
+            kind: crate::host::HostKind::Tool,
+            context: serde_json::json!({"project_root": root}),
+            arguments: serde_json::json!({}),
+        },
+    )
+    .unwrap();
     let callbacks = lua.create_table().unwrap();
-    callbacks.set("process_open", process_open).unwrap();
+    callbacks.set("process_start", process_start).unwrap();
     callbacks
-        .set(
-            "await_any",
-            crate::handler::install_await_any(&lua).unwrap(),
-        )
+        .set("wait_any", crate::host::install_wait_any(&lua).unwrap())
         .unwrap();
-    super::super::host::Margatroid::enable(&object, callbacks).unwrap();
+    crate::host::Margatroid::enable(&object, callbacks).unwrap();
     (lua, registry)
 }
 
 async fn python(lua: &Lua, code: &str) -> ProcessSession {
-    let options = lua.create_table().unwrap();
-    options.set("program", "/usr/bin/python3").unwrap();
-    options.set("arguments", vec!["-u", "-c", code]).unwrap();
+    let arguments = vec!["-u", "-c", code];
     let constructor: mlua::Function = lua
-        .load("return function(options) return margatroid:process_open(options) end")
+        .load("return function(program, args) return margatroid.process:start(program, args) end")
         .eval()
         .unwrap();
-    let userdata: mlua::AnyUserData = constructor.call_async(options).await.unwrap();
+    let userdata: mlua::AnyUserData = constructor
+        .call_async(("/usr/bin/python3", arguments))
+        .await
+        .unwrap();
     userdata.borrow::<ProcessSession>().unwrap().clone()
 }
 
@@ -59,11 +54,29 @@ async fn drain<R: AsyncRead + Unpin>(
 }
 
 #[tokio::test]
+async fn constructor_requires_program_and_argument_vector() {
+    let (lua, registry) = setup();
+    for expression in [
+        "margatroid.process:start({program='/bin/true', arguments={}})",
+        "margatroid.process:start('/bin/true')",
+        "margatroid.process:start('', {})",
+        "margatroid.process:start('/bin/true' .. string.char(0), {})",
+        "margatroid.process:start('/bin/true', {string.char(0)})",
+    ] {
+        assert!(
+            lua.load(expression).exec_async().await.is_err(),
+            "{expression}"
+        );
+    }
+    registry.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn real_echo_output_survives_wait_before_read() {
     let (lua, registry) = setup();
     lua.load(
         r#"
-        local p=margatroid:process_open({program='/bin/echo', arguments={'hello process'}})
+        local p=margatroid.process:start('/bin/echo', {'hello process'})
         assert(p:wait().exit_code==0)
         local out=''
         while true do local r=p:read(); out=out..r.data; if r.eof then break end end
@@ -105,8 +118,8 @@ async fn binary_echo_and_stderr_are_independent_and_wait_is_concurrent() {
 async fn lua_userdata_preserves_invalid_utf8_nuls_eof_and_status() {
     let (lua, registry) = setup();
     tokio::time::timeout(Duration::from_secs(5), lua.load(r#"
-        local p = margatroid:process_open({program='/usr/bin/python3', arguments={'-u','-c',
-            'import sys; b=sys.stdin.buffer.read(4); sys.stdout.buffer.write(b); sys.stderr.buffer.write(b)'}})
+        local p = margatroid.process:start('/usr/bin/python3', {'-u','-c',
+            'import sys; b=sys.stdin.buffer.read(4); sys.stdout.buffer.write(b); sys.stderr.buffer.write(b)'})
         local expected = string.char(0,255,128,10)
         p:write(expected)
         local out, err = '', ''
@@ -189,11 +202,11 @@ async fn cancelled_partial_write_resumes_same_frame_and_rejects_different_bytes(
 }
 
 #[tokio::test]
-async fn lua_await_any_concurrently_reads_stderr_waits_and_writes_one_session() {
+async fn lua_wait_any_concurrently_reads_stderr_waits_and_writes_one_session() {
     let (lua, registry) = setup();
     let result = tokio::time::timeout(Duration::from_secs(5), lua.load(r#"
-        local p=margatroid:process_open({program='/usr/bin/python3', arguments={'-u','-c',
-            'import sys; b=sys.stdin.buffer.read(4); sys.stdout.buffer.write(b); sys.stderr.buffer.write(b)'}})
+        local p=margatroid.process:start('/usr/bin/python3', {'-u','-c',
+            'import sys; b=sys.stdin.buffer.read(4); sys.stdout.buffer.write(b); sys.stderr.buffer.write(b)'})
         local bytes=string.char(0,255,128,10)
         local operations={
             stdout=function() return p:read() end,
@@ -203,7 +216,7 @@ async fn lua_await_any_concurrently_reads_stderr_waits_and_writes_one_session() 
         }
         local got={}
         while next(operations) do
-            local name, value=margatroid:await_any(operations)
+            local name, value=margatroid:wait_any(operations)
             got[name]=value
             operations[name]=nil
         end
@@ -268,11 +281,12 @@ async fn worker_cleanup_after_cancelled_lua_reaps_every_session_and_closes_admis
     assert!(input.pending.is_none());
     drop(input);
     assert!(second.inner.stdout.lock().await.is_none());
-    assert!(lua
-        .load("margatroid:process_open({program='/bin/true'})")
-        .exec_async()
-        .await
-        .is_err());
+    assert!(
+        lua.load("margatroid.process:start('/bin/true', {})")
+            .exec_async()
+            .await
+            .is_err()
+    );
     registry.cleanup().await.unwrap();
 }
 
@@ -311,13 +325,13 @@ async fn program_path_and_argv_are_literal_and_cwd_is_project_root() {
         .unwrap();
     lua.load(
         r#"
-        local p=margatroid:process_open({program='/usr/bin/python3', arguments={'-c',
-            'import os,sys; print(os.getcwd()); print(sys.argv[1])', '$(echo unsafe); *'}})
+        local p=margatroid.process:start('/usr/bin/python3', {'-c',
+            'import os,sys; print(os.getcwd()); print(sys.argv[1])', '$(echo unsafe); *'})
         local out=''
         while true do local r=p:read(); out=out..r.data; if r.eof then break end end
         assert(out==expected..'\n$(echo unsafe); *\n')
         assert(p:wait().exit_code==0)
-        assert(not pcall(function() margatroid:process_open({program='python3'}) end))
+        assert(not pcall(function() margatroid.process:start('python3', {}) end))
     "#,
     )
     .exec_async()

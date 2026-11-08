@@ -2,8 +2,10 @@ use crate::types::*;
 use address::Address;
 use app_runtime_plugin::{RuntimeEventSender, WorldEventExt};
 use async_runtime_plugin::WorldAsyncExt;
+use closure_plugin::{WorldClosureExt, WorldClosureSender};
 use core_plugin::World;
 use futures_util::FutureExt;
+use lua_runtime_core::host::{self, HostDefinition, HostKind, Margatroid};
 use lua_runtime_core::*;
 use mcl_core::{MclCommand, MclInstruction, MclValue};
 use mlua::{Lua, LuaOptions, StdLib, Value as MlValue};
@@ -11,6 +13,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use storage_core::{AgentLogLevel, AgentLogRecord, AgentLogSource, AgentStorage, append_agent_log};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use workspace_core::WorkspaceExecutor;
@@ -88,9 +91,27 @@ pub(crate) fn handle_start_driver_lua_vm(world: &mut World, request: StartDriver
                     "Workspace executor is missing",
                 )
             })?;
-        Ok((entry, source_address))
+        let storage = world
+            .get_component::<AgentStorage>(request.owner)
+            .cloned()
+            .ok_or_else(|| {
+                failure(
+                    LuaRuntimeErrorKind::EnvironmentFailed,
+                    "AgentStorage is missing",
+                )
+            })?;
+        let root = world
+            .get_component::<workspace_core::Workspace>(request.workspace)
+            .map(|workspace| workspace.project_root.clone())
+            .ok_or_else(|| {
+                failure(
+                    LuaRuntimeErrorKind::EnvironmentFailed,
+                    "Workspace is missing",
+                )
+            })?;
+        Ok((entry, source_address, storage, root))
     })();
-    let (entry, source_address) = match entry {
+    let (entry, source_address, storage, root) = match entry {
         Ok(entry) => entry,
         Err(error) => {
             reply_start(&reply, Err(error));
@@ -118,6 +139,9 @@ pub(crate) fn handle_start_driver_lua_vm(world: &mut World, request: StartDriver
     );
     let events = world.event_sender();
     let run = RunContext {
+        storage,
+        closures: world.closure_sender(&schedule),
+        root,
         source_address,
         instance: instance.clone(),
         program: request.program,
@@ -371,31 +395,22 @@ async fn stop_vm(context: StopContext) -> Result<StopOutput, StopError> {
     }
 }
 
-async fn run_driver(context: RunContext) {
-    let RunContext {
-        source_address,
-        instance,
-        program,
+async fn run_driver(mut context: RunContext) {
+    let logger = DriverLogger {
+        storage: context.storage.clone(),
+        closures: context.closures.clone(),
+        instance: context.instance.clone(),
+        source_address: context.source_address.clone(),
+        origin: context.program.origin.to_string_lossy().into_owned(),
+        diagnostic: Arc::new(Mutex::new(None)),
+    };
+    let processes = Arc::new(Mutex::new(None::<host::process::ProcessRegistry>));
+    let environment = std::mem::take(&mut context.environment);
+    let mut result = AssertUnwindSafe(execute_lua(
+        &context,
         environment,
-        wake,
-        ready,
-        ended,
-        cancel,
-        events,
-        config,
-    } = context;
-    let result = AssertUnwindSafe(execute_lua(
-        program,
-        environment,
-        MclHost {
-            instance: instance.clone(),
-            source_address,
-            events: events.clone(),
-            cancel: cancel.clone(),
-        },
-        wake.clone(),
-        cancel.clone(),
-        config,
+        logger.clone(),
+        processes.clone(),
     ))
     .catch_unwind()
     .await
@@ -405,6 +420,73 @@ async fn run_driver(context: RunContext) {
             "Driver Lua task panicked",
         ))
     });
+    if let Err(error) = &result
+        && error.kind != LuaRuntimeErrorKind::Cancelled
+    {
+        let raw = error.description.clone();
+        let diagnostic = lock(&logger.diagnostic).take();
+        let brief = diagnostic
+            .as_ref()
+            .map(|d| d.message.clone())
+            .unwrap_or_else(|| raw.lines().next().unwrap_or("Lua failure").to_owned());
+        let traceback = diagnostic.and_then(|d| d.traceback);
+        let stage = match error.kind {
+            LuaRuntimeErrorKind::CompileFailed => "compile",
+            LuaRuntimeErrorKind::CleanupFailed => "cleanup",
+            _ => "execute",
+        };
+        if let Err(log_error) = logger
+            .append(
+                AgentLogLevel::Error,
+                stage,
+                brief.clone(),
+                None,
+                Some(raw),
+                traceback,
+            )
+            .await
+        {
+            result = Err(failure(
+                LuaRuntimeErrorKind::ExecutionFailed,
+                format!("{error}; log persistence failed: {log_error}"),
+            ));
+        } else {
+            result = Err(failure(error.kind, brief));
+        }
+    }
+    let mut cleanup_result = Ok(());
+    let registry = lock(&processes).take();
+    if let Some(registry) = registry
+        && let Err(error) = registry.cleanup().await
+    {
+        let raw = error.to_string();
+        let mut error = failure(LuaRuntimeErrorKind::CleanupFailed, raw.clone());
+        if let Err(log_error) = logger
+            .append(
+                AgentLogLevel::Error,
+                "cleanup",
+                raw.clone(),
+                None,
+                Some(raw),
+                None,
+            )
+            .await
+        {
+            error
+                .description
+                .push_str(&format!("; log persistence failed: {log_error}"));
+        }
+        cleanup_result = Err(error.clone());
+        result = Err(error);
+    }
+    let RunContext {
+        instance,
+        wake,
+        ready,
+        ended,
+        events,
+        ..
+    } = context;
     lock(&wake).close();
     if let Some(sender) = lock(&ready).take() {
         let error = result.as_ref().err().cloned().unwrap_or_else(|| {
@@ -415,15 +497,80 @@ async fn run_driver(context: RunContext) {
         });
         let _ = sender.send(Err(error));
     }
-    let _ = ended.send(Ok(()));
+    let _ = ended.send(cleanup_result);
     events.send_event(DriverLuaVmExited { instance, result });
+}
+
+#[derive(Clone)]
+struct DriverLogger {
+    storage: AgentStorage,
+    closures: WorldClosureSender,
+    instance: DriverLuaVmInstance,
+    source_address: String,
+    origin: String,
+    diagnostic: Arc<Mutex<Option<host::LuaFailureDiagnostic>>>,
+}
+impl DriverLogger {
+    fn capture(&self, error: mlua::Error, kind: LuaRuntimeErrorKind) -> LuaRuntimeError {
+        *lock(&self.diagnostic) = Some(host::LuaFailureDiagnostic::capture_with(&error, |cause| {
+            cause
+                .downcast_ref::<LuaRuntimeError>()
+                .map(|error| error.description.clone())
+        }));
+        failure(kind, error.to_string())
+    }
+    async fn append(
+        &self,
+        level: AgentLogLevel,
+        stage: &str,
+        message: String,
+        details_json: Option<serde_json::Value>,
+        raw_error: Option<String>,
+        traceback: Option<String>,
+    ) -> Result<(), LuaRuntimeError> {
+        let (sender, receiver) = oneshot::channel();
+        let instance = self.instance.clone();
+        self.closures.send(move |world| {
+            let turn = if current_instance(world, &instance) {
+                world
+                    .get_component::<agent_core::Agent>(instance.owner)
+                    .and_then(|agent| agent.turn.clone())
+            } else {
+                None
+            };
+            let _ = sender.send(turn);
+        });
+        let turn = receiver
+            .await
+            .map_err(|_| failure(LuaRuntimeErrorKind::Closed, "log context unavailable"))?;
+        let record = AgentLogRecord {
+            created_at_ms: None,
+            level,
+            source: AgentLogSource::Driver,
+            stage: stage.into(),
+            message,
+            details_json,
+            context_json: Some(
+                serde_json::json!({"instance": self.instance.start_id, "source_address": self.source_address, "turn": turn}),
+            ),
+            origin: Some(self.origin.clone()),
+            raw_error,
+            traceback,
+        };
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || append_agent_log(&storage, record))
+            .await
+            .map_err(|error| failure(LuaRuntimeErrorKind::ExecutionFailed, error.to_string()))?
+            .map_err(|error| failure(LuaRuntimeErrorKind::ExecutionFailed, error.to_string()))?;
+        Ok(())
+    }
 }
 
 fn validate_environment(environment: &LuaEnvironment) -> Result<(), LuaRuntimeError> {
     for name in environment.globals.keys() {
         if name.is_empty()
             || name.chars().any(char::is_control)
-            || matches!(name.as_str(), "mcl" | "wait" | "require")
+            || matches!(name.as_str(), "mcl" | "wait" | "require" | "margatroid")
         {
             return Err(failure(
                 LuaRuntimeErrorKind::EnvironmentFailed,
@@ -584,13 +731,22 @@ fn mcl_arguments(
 }
 
 async fn execute_lua(
-    program: LuaProgram,
-    environment: LuaEnvironment,
-    mcl_host: MclHost,
-    wake: Arc<Mutex<DriverWakeSlot>>,
-    cancel: CancellationToken,
-    config: LuaRuntimeConfig,
+    context: &RunContext,
+    mut environment: LuaEnvironment,
+    logger: DriverLogger,
+    processes: Arc<Mutex<Option<host::process::ProcessRegistry>>>,
 ) -> Result<(), LuaRuntimeError> {
+    let program = &context.program;
+    let root = context.root.clone();
+    let mcl_host = MclHost {
+        instance: context.instance.clone(),
+        source_address: context.source_address.clone(),
+        events: context.events.clone(),
+        cancel: context.cancel.clone(),
+    };
+    let wake = context.wake.clone();
+    let cancel = context.cancel.clone();
+    let config = &context.config;
     if cancel.is_cancelled() {
         return Err(failure(
             LuaRuntimeErrorKind::Cancelled,
@@ -638,6 +794,21 @@ async fn execute_lua(
         },
     )
     .map_err(lua_error)?;
+    let agent_info = match environment.globals.remove("agent_info") {
+        Some(LuaBinding::Value(value)) => value.to_json()?,
+        None => serde_json::Value::Null,
+        Some(LuaBinding::Function(_)) => {
+            return Err(failure(
+                LuaRuntimeErrorKind::EnvironmentFailed,
+                "agent_info must be data",
+            ));
+        }
+    };
+    let object = Margatroid::install(&lua, HostDefinition {
+        kind: HostKind::Driver,
+        context: serde_json::json!({"agent_info": agent_info, "instance": logger.instance.start_id, "origin": logger.origin, "project_root": root}),
+        arguments: serde_json::Value::Null,
+    }).map_err(lua_error)?;
     for (name, binding) in environment.globals {
         lua.globals()
             .set(name, binding_value(&lua, binding, &cancel)?)
@@ -667,26 +838,93 @@ async fn execute_lua(
         .map_err(lua_error)?;
     let mcl: Arc<dyn LuaHostFunction> = Arc::new(mcl_host);
     let wait: Arc<dyn LuaHostFunction> = Arc::new(WaitHost { slot: wake });
-    lua.globals()
-        .set("mcl", host_function_value(&lua, mcl, &cancel, true)?)
+    let callbacks = lua.create_table().map_err(lua_error)?;
+    callbacks
+        .set("driver_mcl", host_function_value(&lua, mcl, &cancel, true)?)
         .map_err(lua_error)?;
-    lua.globals()
+    callbacks
         .set(
-            "wait",
-            binding_value(&lua, LuaBinding::Function(wait), &cancel)?,
+            "driver_wait",
+            host_function_value(&lua, wait, &cancel, false)?,
         )
         .map_err(lua_error)?;
+    host::data::install(&lua, &callbacks, root.clone()).map_err(lua_error)?;
+    let (registry, constructor) = host::process::install_process(&lua, root).map_err(lua_error)?;
+    *lock(&processes) = Some(registry);
+    callbacks
+        .set("process_start", constructor)
+        .map_err(lua_error)?;
+    callbacks
+        .set("wait_any", host::install_wait_any(&lua).map_err(lua_error)?)
+        .map_err(lua_error)?;
+    let log_callback = logger.clone();
+    callbacks
+        .set(
+            "log",
+            lua.create_async_function(move |lua, args: mlua::MultiValue| {
+                let logger = log_callback.clone();
+                async move {
+                    if !(2..=3).contains(&args.len()) {
+                        return Err(mlua::Error::external(failure(
+                            LuaRuntimeErrorKind::InvalidRequest,
+                            "log expects level, message and optional details",
+                        )));
+                    }
+                    let mut args = args.into_iter();
+                    let level = match args.next() {
+                        Some(MlValue::String(level)) => match level.to_str()?.as_ref() {
+                            "debug" => AgentLogLevel::Debug,
+                            "info" => AgentLogLevel::Info,
+                            "warn" => AgentLogLevel::Warn,
+                            "error" => AgentLogLevel::Error,
+                            _ => {
+                                return Err(mlua::Error::external(failure(
+                                    LuaRuntimeErrorKind::InvalidRequest,
+                                    "invalid log level",
+                                )));
+                            }
+                        },
+                        _ => {
+                            return Err(mlua::Error::external(failure(
+                                LuaRuntimeErrorKind::InvalidRequest,
+                                "log level must be a string",
+                            )));
+                        }
+                    };
+                    let message = match args.next() {
+                        Some(MlValue::String(message)) => message.to_str()?.to_owned(),
+                        _ => {
+                            return Err(mlua::Error::external(failure(
+                                LuaRuntimeErrorKind::InvalidRequest,
+                                "log message must be a string",
+                            )));
+                        }
+                    };
+                    let details = match args.next() {
+                        None | Some(MlValue::Nil) => None,
+                        Some(value) => Some(host::data::from_lua_object(&lua, value)?),
+                    };
+                    logger
+                        .append(level, "script", message, details, None, None)
+                        .await
+                        .map_err(mlua::Error::external)
+                }
+            })
+            .map_err(lua_error)?,
+        )
+        .map_err(lua_error)?;
+    Margatroid::enable(&object, callbacks).map_err(lua_error)?;
     let function = lua
         .load(&program.source)
         .set_name(program.origin.to_string_lossy())
         .into_function()
-        .map_err(|error| failure(LuaRuntimeErrorKind::CompileFailed, error.to_string()))?;
+        .map_err(|error| logger.capture(error, LuaRuntimeErrorKind::CompileFailed))?;
     tokio::select! {
         biased;
         () = cancel.cancelled() => Err(failure(LuaRuntimeErrorKind::Cancelled, "Driver cancelled")),
         result = function.call_async::<()>(()) => {
             if cancel.is_cancelled() { Err(failure(LuaRuntimeErrorKind::Cancelled, "Driver cancelled")) }
-            else { result.map_err(lua_error) }
+            else { result.map_err(|error| logger.capture(error, LuaRuntimeErrorKind::ExecutionFailed)) }
         }
     }
 }

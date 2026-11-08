@@ -74,12 +74,20 @@ pub fn copy_resource(source: &Path, destination: &Path) {
         let entry = entry.unwrap();
         let target = destination.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
-            copy_resource(&entry.path(), &target);
+            // Packaged executables are installed only for resources that own them.
+            if entry.file_name() != "bin" {
+                copy_resource(&entry.path(), &target);
+            }
         } else {
             std::fs::copy(entry.path(), target).unwrap();
         }
     }
-    if source.join("shell.lua").is_file() {
+    if source.join("bin").is_dir()
+        && source
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|alias| alias == "bash" || alias == "bash-exec")
+    {
         install_shell(destination);
     }
 }

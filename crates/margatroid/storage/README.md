@@ -1,20 +1,22 @@
 # Storage
 
-storage_core定义AgentStorage、Block、历史和设置操作及其文件实现，只依赖mecs、SQLite、TOML等通用库，不依赖其他领域core。storage_plugin取得组件句柄并调度blocking worker，通过原请求oneshot回复，不提供额外结果事件。
+storage_core定义AgentStorage、Block、历史、Agent日志和设置操作及其文件实现，只依赖mecs、SQLite、TOML等通用库，不依赖其他领域core。storage_plugin取得组件句柄并调度blocking worker，通过原请求oneshot回复，不提供额外结果事件。Agent日志另由storage_core公开函数直接读写，不进入StorageOperation或StorageRequest。
+
+Agent日志已实现为独立表。当前schema版本为3，空库创建四表；已有三表或其他不匹配数据库明确返回SchemaMismatch，文件保持不变。不提供自动迁移、备份、兼容读取或旧结构修补；本次未操作主目录数据库。
 
 ## 初始化与生命周期
 
 Agent启动闭包在blocking worker调用open_storage。数据库不存在则创建，已有数据库保留内容并校验schema。Agent settings.toml不存在才使用Driver默认模板创建；数据库与设置分别判断。模板可为空，已有设置不覆盖、不合并，格式损坏直接报错。
 
-AgentStorage独立挂载到Agent Entity，持有数据库句柄及设置路径，不嵌入Agent。克隆共享连接和文件锁，不缓存Block或设置正文。所有需要协调的同库操作共享连接管理器；停止关闭新受理并等待真实worker退出后再释放句柄，不因丢弃Future认定操作已结束。
+AgentStorage独立挂载到Agent Entity，持有数据库句柄及设置路径，不嵌入Agent。克隆共享连接和文件锁，不缓存Block或设置正文。所有需要协调的同库操作共享连接管理器；停止关闭新受理并等待真实worker退出后再释放句柄，不因丢弃Future认定操作已结束。Driver和工具的host各自持有owned AgentStorage克隆作为日志能力，覆盖Driver、工具及Lua worker清理期间的故障捕获和最终日志写入；完成这些写入的真实join后才drop句柄，不新建日志任务、身份注册表或System生命周期事件。
 
 storage_core只认识路径和存储操作，不读取Workspace配置、定位Driver、加载工具或管理VM。文件路径由Agent启动参数明确提供，配置指令不允许改成任意文件路径。
 
 ## 消息Block
 
-数据库文件只含三张业务表：agent_messages按sequence、turn、type、content、payload、created_at_ms保存消息，type从AgentMessage payload.type提取；mcl_records保存纯MCL审计payload、content、序号、真实来源地址、turn和时间；blocks按名称一行保存一个持久Block，其fields_json是字段名到消息数组的对象。不另建Block定义、字段值或metadata表，不使用AUTOINCREMENT；结构版本使用PRAGMA user_version。
+当前数据库文件只含四张业务表：agent_messages按sequence、turn、type、content、payload、created_at_ms保存消息，type从AgentMessage payload.type提取；mcl_records保存纯MCL审计payload、content、序号、真实来源地址、turn和时间；blocks按名称一行保存一个持久Block，其fields_json是字段名到消息数组的对象；agent_logs独立保存Agent日志。不另建Block定义、字段值或metadata表，不使用AUTOINCREMENT；结构版本使用PRAGMA user_version。
 
-TEMP保存在连接内存中的SQLite临时表，不写入数据库文件。各VM按实例标识隔离，Agent关闭或重启确认VM与MCL退出后删除该实例TEMP；连接关闭会自动丢弃全部TEMP，异常退出不留下磁盘段。只初始化或打开当前三表结构；不识别、转换或迁移旧版结构，不自动备份。
+TEMP保存在连接内存中的SQLite临时表，不写入数据库文件。各VM按实例标识隔离，Agent关闭或重启确认VM与MCL退出后删除该实例TEMP；连接关闭会自动丢弃全部TEMP，异常退出不留下磁盘段。实现只初始化或打开严格匹配的当前四表结构，包含日志列及约束校验；不识别、转换或迁移旧版结构，不自动备份。
 
 Block字段只保存结构化消息数组，不保存TOOL、SANDBOX、资源地址或alias绑定。消息结构由调用方按消息领域契约校验，存储层保留结构化值，不依赖消息core，也不根据字段名推测用途。
 
@@ -27,6 +29,18 @@ CREATE字段名不带类型，不存在则创建，存在且字段及生命周�
 消息和MCL分别追加到agent_messages与mcl_records，payload分别是AgentMessage与MCL审计对象，读取时间线时从所属表确定kind。消息表不保存source，type由传入payload.type提取，不增加调用参数；仅MCL记录必需source，由调用方显式传入真实来源地址，不保存Entity编号；content与payload独立保存，content按调用方提供的值原样读写，不从payload派生。每次追加均产生记录，使用Agent内跨两表的sequence作为稳定顺序与记录标识，不设历史key或兼容回退。完整时间线在同一事务内按sequence合并；未知时间保留0，不猜测或回填。
 
 消息历史由显式history_append写入，指令审计由MCL另行发起。存储不自动记录推理、工具或Block操作结果。Block修改和历史追加是独立事务，共用文件不代表共同提交。
+
+## Agent日志
+
+agent_logs是独立的第四张表，仅保留sequence、created_at_ms、level、source、stage、message、details_json、context_json、origin、raw_error、traceback。sequence使用SQLite INTEGER PRIMARY KEY，由同一写事务内该表自身MAX(sequence)+1生成，空表从1开始，不使用AUTOINCREMENT，不共享历史序号。level仅debug、info、warn、error；source仅driver、tool、host；stage是load、configure、execute、driver、hostlog等阶段描述，不建立阶段枚举或调度语义。details_json可选且为对象；context_json同样可选，其turn、task、call、alias、driver_instance关联均可缺省，避免为每种运行上下文增加列。origin保存可确定的程序来源地址，raw_error和traceback可空。
+
+公开的append_agent_log(storage: &AgentStorage, record: AgentLogRecord) -> Result<StoredAgentLog, StorageError>与read_agent_logs(storage: &AgentStorage, after_sequence: Option<u64>, limit: usize) -> Result<Vec<StoredAgentLog>, StorageError>均为同步core函数。写入在现有共享连接串行锁内完成独立事务；读取同样共锁，按sequence升序读取严格大于after_sequence的记录，None从开头、limit为0返回空数组。不借出或并行使用raw Connection。异步host克隆AgentStorage后spawn_blocking并await真实join；日志方法成功表示已确认落库，不能仅发送IPC或提交worker就回复成功。读函数是供core调用方使用的诊断能力，当前不新增DTO、GUI API或LLM自动可见的读工具，GUI读取留待未来单独设计。
+
+DomainToolPlugin和LuaRuntimePlugin只依赖storage_core取得日志能力，不依赖storage_plugin或借用ECS World。Driver与工具使用统一host，再按可信运行身份裁剪可用能力；日志入口复用该host，脚本主动调用margatroid:log()只提交级别、消息和可选结构化详情。source始终由host保留原始运行身份：Driver日志为driver，工具日志为tool，宿主自身诊断才为host；转交统一host不能把Driver或工具日志改标host。stage、origin及context_json中的关联由host补齐，脚本无权声明或覆盖这些可信字段。
+
+Lua加载、配置、执行、Driver回调及清理等边界的自动故障捕获，在格式化业务错误前取得完整raw_error与可用的traceback，并由host附带来源和已知关联写入日志。自动故障与主动日志共享写入能力；worker跨IPC仅使用私有Log frame及对应完成确认，不改变StorageRequest的operation载荷、不增加StorageOperation variant或SystemEvent，不在事件路由内加入日志行为。自动日志写入失败回落现有诊断通道，保留并继续交付原业务错误，不递归自动记日志；主动日志写入失败如实返回调用方。日志写入不触发history_append，不进入历史时间线或推理消息。
+
+独立日志表用于保留运行诊断及完整故障信息，既不改变消息和MCL审计的业务语义，也不要求所有日志具备任务关联。最少列与可选JSON关联允许Driver、工具和host共用同一存储契约；现有AgentStorage生命周期覆盖清理写入即可，不增加工作任务或身份注册机制。
 
 ## TOML设置
 

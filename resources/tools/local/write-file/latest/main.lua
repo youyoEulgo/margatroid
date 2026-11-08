@@ -10,13 +10,6 @@ local MAX_FILE_BYTES = 16 * 1024 * 1024
 -- resolved against the current agent's project root. Parent directories are only
 -- created when the caller asks for it.
 
-local function shell_quote(value)
-    if package.config:sub(1, 1) == "\\" then
-        return '"' .. value:gsub('"', '\\"') .. '"'
-    end
-    return "'" .. value:gsub("'", "'\\''") .. "'"
-end
-
 local function is_absolute(path)
     local separator = package.config:sub(1, 1)
 
@@ -54,23 +47,12 @@ local function parent_path(path)
 end
 
 local function create_directories(path, context)
-    local client = dofile(context.resource_dir .. "/shell.lua")(context)
-    local result = client.exec("mkdir -p -- " .. shell_quote(path), { max_output_bytes = 4096 })
-    if result.exit_code ~= 0 then
-        return nil, "could not create " .. path .. ": " .. result.stderr
-    end
+    margatroid.files:create_directory(path, true)
     return true
 end
 
 local function write_text(path, content)
-    local file, message = io.open(path, "wb")
-    if not file then
-        return nil, "cannot write " .. path .. ": " .. tostring(message)
-    end
-    local written, write_error = file:write(content)
-    local closed, close_error = file:close()
-    if not written then return nil, "cannot write " .. path .. ": " .. tostring(write_error) end
-    if not closed then return nil, "cannot close " .. path .. ": " .. tostring(close_error) end
+    margatroid.files:write(path, content)
     return true
 end
 
@@ -93,7 +75,7 @@ local function perform(arguments, context)
     end
     return {
         ok = true,
-        content = margatroid:json_encode({
+        content = margatroid.data:encode("json", {
             path = path,
             bytes = #arguments.content,
             replaced = true,
@@ -102,7 +84,8 @@ local function perform(arguments, context)
 end
 
 function execute(arguments, context)
+    arguments = context.arguments
     local result = perform(arguments, context)
-    margatroid:task_return(result)
-    margatroid:task_finish(context.task_id)
+    margatroid.task:return_result(result)
+    margatroid.task:finish(context.task_id)
 end
