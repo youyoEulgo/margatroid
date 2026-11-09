@@ -4,6 +4,26 @@ storage_core定义AgentStorage、Block、历史、Agent日志和设置操作及�
 
 Agent日志已实现为独立表。当前schema版本为3，空库创建四表；已有三表或其他不匹配数据库明确返回SchemaMismatch，文件保持不变。不提供自动迁移、备份、兼容读取或旧结构修补；本次未操作主目录数据库。
 
+## 设计变更与实施顺序
+
+先完成Block文件化、快照及回档，再处理API更新。本轮只更新目标设计，源码目前仍是version 3单库JSON Block；后文旧布局描述当前实现，新目标以本节及[DESIGN.md](DESIGN.md)为准。
+
+每个Block固定一个timeline工作数据库，每个子项一张表，每条消息为position/payload一行。普通快照从工作库一致性复制一个只读文件，不切换工作文件名，不更换Block身份。Driver后续仍使用原GET/INJECT，不传代数或物理路径。
+
+Agent管理库以block_snapshots替换旧blocks表，记录block归属、命名空间、timeline/snapshot类型、快照ID、文件、子项表映射、上游和必要的在途回档计划。每Block只在创建时登记一条timeline；其余记录都是不可变快照。snapshot的上游复制timeline的旧上游，然后timeline上游指向新snapshot，不能让快照指向自身。
+
+示例：初始session.sqlite的上游为空。快照1创建session_1.sqlite且上游为空，timeline上游改为1。快照2仍复制session.sqlite，创建session_2.sqlite且上游为1，timeline上游改为2。回档1时，先将session.sqlite改名为session_3.sqlite且上游为2，再复制快照1的内容恢复同名session.sqlite，timeline上游改为1。下一张快照4的上游为1；旧分支2和3保留，不按数字顺序推断分支。
+
+SQLite复制必须取得含WAL提交内容的一致状态，不能直接复制活动主文件。普通快照持久化副本后，以管理库事务登记快照并更新timeline上游，工作库不变。回档先checkpoint并关闭工作连接，持久登记restore_intent，然后将timeline改名归档，再完整复制目标snapshot到原工作路径，最终以管理库事务登记归档、更新上游及清除intent。对MCL这是一项完整原子操作，中间态不开放；跨文件收口由持久intent保证，不能声称单个SQL事务覆盖文件操作。崩溃后继续完成同一次intent，不重复归档或分配ID；不能收口则封闭Block并明确报错。
+
+同Agent的Block对外操作全部走MCL FIFO，快照/回档等待真实worker完成才推进下一条，不另外增加回合空闲等限制。映射虽然集中保存，snapshot_id、文件编号及上游都按Block和命名空间独立，不影响其他Block。整库文件复制自然保留全部子项表，不逐项重建。read_block_snapshots按Block查询timeline及已提交快照的完整映射，供查询effect使用。
+
+归档快照和回档前快照是用户要求的业务数据，不是额外兜底备份，不自动删除。恢复保留固定工作文件名但会重建其连接；目标快照本身始终不修改。快照只保存显式时点的Block状态，回档不撤销工具副作用、设置、消息历史、MCL记录、会话日志或VM执行栈。
+
+TEMP按VM实例隔离，同样拥有固定工作文件及只读快照，但全部文件寿命仍属于该VM，真实退出后沿原DropTemporaryBlocks核验清理，不变成持久档案。新布局使用新schema，旧version 3结构明确拒绝，不迁移、不提供兼容或额外备份；不操作用户数据库。
+
+分库后GET在共享受理门固定工作视图；INJECT先读完来源，再在目标文件单事务替换，不能承诺跨Block SQL事务。snapshot/restore由现有MCL执行闭包调用storage_core能力，不新增StorageOperation、System、公开事件字段或调度。
+
 ## 初始化与生命周期
 
 Agent启动闭包在blocking worker调用open_storage。数据库不存在则创建，已有数据库保留内容并校验schema。Agent settings.toml不存在才使用Driver默认模板创建；数据库与设置分别判断。模板可为空，已有设置不覆盖、不合并，格式损坏直接报错。
