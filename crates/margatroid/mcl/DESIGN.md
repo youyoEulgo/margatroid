@@ -137,7 +137,10 @@ handle_command_result(world: &mut World, result: Result<CommandOutput, CommandEr
 -- 私有
 execute_command(context: CommandContext) -> Future<Output = Result<CommandOutput, CommandError>>
     行为：
-        按语法树执行一次操作，等待存储或领域oneshot结果；
+        执行execute_operation并等待真实收口，取消时通知执行能力后继续等待，不以丢弃Future结束操作；
+        执行完成后独立追加一次MCL审计，记录来源、实例、指令、参数及真实执行结果；
+        审计失败返回说明执行可能已提交的错误，不能伪称执行未发生；
+        包装CommandOutput或CommandError供handle_command_result回复，不在此直接发送原reply；
         不跨await借用World，不重复解析或审计。
 
 execute_import(context: CommandContext, kind: ImportKind, locator: String, alias: String)
@@ -148,15 +151,14 @@ execute_import(context: CommandContext, kind: ImportKind, locator: String, alias
 execute_get(context: CommandContext, expression: MessageExpression)
     行为：
         按顺序拼接消息来源；
-        选择器统一读事务；
+        将选择器交给存储领域读取；
         Prompt alias按路径读取并保留消息角色；
         返回.Array.Message。
 
 execute_inject(context: CommandContext, source: MessageParameter, target: Selector)
     行为：
-        准备消息来源，在一次数据库写事务中读取目标、校验范围并替换；
-        自引用先读后写；
-        失败不修改字段。
+        准备消息来源和目标选择器，交给存储领域完成范围校验及替换；
+        不在MCL闭包内改写存储数据；等待存储结果并转换为Unit或MCL错误。
 
 execute_config(context: CommandContext, operation: ConfigOperation)
     行为：
@@ -171,6 +173,8 @@ execute_effect(context: CommandContext, name: String, arguments: Vec<EffectParam
         按effect参数约束求值，通过对应领域core能力执行或发送带oneshot的具体领域请求；
         保留请求与回合关联。inference使用消息及推理参数，工具调用使用调用消息；
         工具定义与查找来自目标Agent的Tools。中止由队列外的控制流程受理，各System复检turn。
+        按name分派领域调用并将参数求值为该领域输入，等待结果后返回MclValue或MclError；
+        同步存储能力在blocking worker执行并等待真实join；不在此函数发送原请求reply或写入统一命令审计。
 
 execute_tools(context: CommandContext, messages: Vec<Value>) -> Future<Output = Result<MclValue, MclError>>
     行为：
@@ -252,6 +256,7 @@ MclValue：命令返回值，公开枚举
     Error(serde_json::Value)--type=error、message及request_id；唯一回复出口将非工具错误转换为此值
     Array { Message: Vec<serde_json::Value> }
     Config(toml::Table)
+    BlockSnapshots(serde_json::Value)--指定Block的timeline与已提交快照映射，不含其他Block
     Inference { message: serde_json::Value, stop_reason: String }
     Import { kind: ImportKind, alias: String }
 

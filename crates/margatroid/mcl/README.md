@@ -4,6 +4,21 @@ mcl_core定义语法树、队列、请求和结果，只依赖mecs及通用库�
 
 本文同步本轮实现契约，不表示运行中的daemon已更新。IMPORT TOOL只向Agent的唯一Tools集合增加alias、description、input_schema和path记录，不维护选择名单。inference与tool_call使用当前Tools，各只接收一个消息数组输入；tool_call要求数组恰含一条Assistant。tool_inject、原始进程通信和MCP协议由通用工具宿主及工具侧处理，MCL使用现有指令执行领域调用。
 
+## Block快照指令（待实现）
+
+```text
+EFFECT block_snapshot ?
+arguments: ["session"]
+
+EFFECT block_snapshots ?
+arguments: ["session"]
+
+EFFECT block_restore ? ?
+arguments: ["session", 1]
+```
+
+block_snapshot和block_restore成功返回Unit；block_snapshots返回BlockSnapshots，包含指定Block的timeline与快照映射。参数复用现有问号参数；指令沿MCL FIFO等待存储调用完成，通过既有回复及审计出口收口。文件、映射、复制及原子恢复规则由[Storage设计](../storage/DESIGN.md)定义。
+
 ## 指令
 
 ```text

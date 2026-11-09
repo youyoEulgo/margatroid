@@ -27,10 +27,17 @@ System分别列出事件、闭包结果、提交闭包及oneshot回复，使用R
 公开，定义于storage_core：
 ```text
 open_storage(database_path: &Path, settings_path: &Path, default_settings: &str) -> Result<AgentStorage, StorageError>
-    行为：打开或创建SQLite并验证schema；settings不存在时以不覆盖方式写入默认模板，存在则读取并校验；返回句柄及路径，不缓存设置正文。
+    行为：打开Agent管理库及Block工作文件及快照管理器，验证管理库和已登记Block文件的目标schema与映射；settings不存在时以不覆盖方式写入默认模板，存在则读取并校验；返回共享句柄，不缓存消息正文。
 
 execute_storage(storage: &AgentStorage, operation: StorageOperation) -> Result<StorageValue, StorageError>
-    行为：串行执行对应SQLite事务或设置文件操作；写入确认完成后返回。
+    行为：
+        按StorageOperation分派；Block操作通过共享受理门解析timeline，管理库操作使用管理库事务，设置操作使用设置文件锁
+        CreateBlock不存在时创建工作库和子项表并登记唯一timeline；已存在且字段及生命周期一致则打开，不清空
+        ReadMessages/ReadMessageSources固定各来源工作文件视图，读取期间阻止内部写入及回档穿过操作边界
+        ReplaceMessages先读取全部来源，再在目标Block文件单个事务中读取目标、校验范围及替换，自引用先读后写
+        跨文件来源不修改，失败不改目标，不宣称跨文件SQL写事务；普通写入不访问snapshot文件
+        DropTemporaryBlocks仅清理指定VM命名空间的映射及文件；其余变体保持历史、日志和设置各自契约
+        等待写入及必要清理确认后返回，不让旧工作连接绕过回档受理门；raw Connection不外借。
 
 append_agent_log(storage: &AgentStorage, record: AgentLogRecord) -> Result<StoredAgentLog, StorageError>
     行为：
@@ -49,13 +56,82 @@ read_agent_logs(storage: &AgentStorage, after_sequence: Option<u64>, limit: usiz
         不合并历史、不派发事件；异步调用方使用spawn_blocking并等待真实join
         仅提供core诊断读取能力，不自动向LLM暴露，不新增DTO或GUI接口
 
+snapshot_block(storage: &AgentStorage, name: &str, instance: Option<&str>) -> Result<(), StorageError>
+    行为：
+        storage_core公开同步函数，阻塞执行到结果确认，不派发事件；异步调用者负责blocking worker及真实join
+        None访问持久命名空间，Some仅访问绑定VM的TEMP；拒绝文件路径、子项路径和其他实例
+        取得共享受理门并等待该Block在途读写收口，读取其唯一timeline记录及upstream_id
+        分配本Block未使用的新snapshot_id及快照文件名；身份单调分配但不表示当前启用代，不覆盖或复用旧文件
+        使用SQLite一致性复制完整工作库，取得所有子项表、消息、顺序及索引，不清空、压缩或重构业务内容
+        处理已提交WAL内容，不能fs::copy活动主文件；SQLite复制API只实现显式快照，不额外生成兜底备份
+        完成副本校验与文件、目录持久化，再在管理库单个事务登记snapshot记录
+        snapshot记录复制timeline的block归属、子项映射及原upstream_id，file_name指向新快照
+        timeline的file_name不变，仅将upstream_id更新为新snapshot_id；snapshot记录自身不指向自身
+        提交后快照永久只读，普通读写继续原工作文件，无须重连、换文件名或携带快照ID
+        提交前失败工作文件和timeline上游不变；只回收可证明由本次创建且未发布的副本，不删除已登记快照
+        提交事实不明返回CommitUnknown并阻止不确定写入，核实管理库事实，不再次执行请求或重复分配快照
+        快照仅操作指定Block工作库与映射，保留显式创建时刻内容；不写入其他存储数据
+
+read_block_snapshots(storage: &AgentStorage, name: &str, instance: Option<&str>) -> Result<serde_json::Value, StorageError>
+    行为：
+        读取指定Block命名空间的timeline和全部已提交snapshot映射，返回结构化对象
+        timeline包含固定file_name、子项映射、当前upstream_id；snapshots包含snapshot_id、file_name、子项映射、upstream_id
+        snapshots按本Block的snapshot_id升序排列，根上游为null；不以文件编号大小推断父子关系
+        只列本Block，不读取或修改其他Block，不枚举任意目录，不返回未提交的回档中间态
+        不执行快照、不消费记录；与快照和回档共用受理门，不派发新事件
+
+restore_block(storage: &AgentStorage, name: &str, instance: Option<&str>, snapshot_id: u64) -> Result<(), StorageError>
+    行为：
+        对调用者是完整原子操作：回档前归档、恢复目标、提交timeline映射全部收口才返回成功，中间态不对正常读写开放
+        验证目标属于同Block同命名空间的已登记只读快照，拒绝跨Block/VM引用及任意路径
+        取得存储受理门，固定timeline旧上游、子项映射及目标快照；分配仅属于该Block的新snapshot_id
+        收口工作库读写，完成checkpoint并关闭全部工作连接，确保工作主文件包含已提交WAL内容并妥善处理WAL/SHM
+        管理库事务登记持久restore_intent，包含原工作路径、新归档路径及ID、旧上游与子项映射、目标快照与受控暂存路径
+        在intent持久化后，将原timeline工作文件改名为新的snapshot文件，确认目录持久化；不复制当前工作内容来保存归档
+        新snapshot保留timeline原上游，记录被离开的分支；目标快照本身始终只读不移动
+        将目标snapshot完整复制为受控暂存工作库，验证schema和全部子项，持久化后发布到原timeline路径并同步目录
+        管理库单事务登记改名产生的snapshot，timeline.upstream_id改为目标ID，子项映射改为目标映射，工作文件名保持原名，清除intent
+        重新建立工作连接，释放受理门并返回成功；普通GET/INJECT用法不变
+        SQLite映射事务和文件改名/复制不是天然跨文件事务；intent负责完成同一次操作，不能仅凭rename原子就宣称整体原子
+        intent提交前失败不改变工作内容及上游；提交后直至最终提交不能开放该Block或取消后直接推进普通读写
+        崩溃恢复先按intent识别旧工作文件是否已改名，再完成固定目标复制和最终映射提交，不再次分配ID或再次归档
+        无法证明文件所处阶段、目标损坏或IO失败不能完成时返回CommitUnknown/CleanupFailed并保持Block封闭，不伪报成功或旧状态未变
+        不覆盖任何已登记快照；恢复只能发布到已核验的固定工作路径，回收暂存文件前核对归属
+        仅恢复指定Block的数据库及子项映射，不修改其他Block、历史、会话日志或设置
+
 数据库结构
-    main.agent_messages：sequence、turn、type、content、payload、created_at_ms--type从payload.type提取，读取时校验一致
-    main.mcl_records：sequence、source、turn、content、payload、created_at_ms
-    main.blocks：name、fields_json--对象的每个键对应一个消息数组
-    main.agent_logs：sequence INTEGER PRIMARY KEY、created_at_ms、level、source、stage、message、details_json、context_json、origin、raw_error、traceback--独立Agent日志，不参与消息与MCL历史序号
-    行为：只保留四张表，不使用AUTOINCREMENT或metadata表；PRAGMA user_version保存版本。只支持当前四表目标结构，严格校验agent_logs列及约束；空库创建，已有三表或其他不匹配结构返回SchemaMismatch，不自动迁移或备份，不增兼容路径。
-    TEMP：使用连接内存表按VM实例隔离；VM及MCL真实退出后DropTemporaryBlocks，关闭连接自动丢弃。
+    Agent管理库：保留原数据库路径
+        main.agent_messages：sequence、turn、type、content、payload、created_at_ms--纯消息历史
+        main.mcl_records：sequence、source、turn、content、payload、created_at_ms--纯指令记录
+        main.agent_logs：sequence、created_at_ms、level、source、stage、message、details_json、context_json、origin、raw_error、traceback
+        main.block_snapshots：record_id、block_name、instance、kind、snapshot_id、file_name、fields_json、upstream_id、restore_intent
+            snapshot_id、文件编号和upstream引用均以block_name及instance为作用域，各Block独立分配互不影响；record_id仅内部行标识
+            kind为timeline或snapshot；每个逻辑Block恰有一条timeline，创建后不因快照更换该行或工作文件
+            timeline初始snapshot_id及upstream_id为空；file_name指向固定工作库，fields_json记录子项到表的映射
+            snapshot每条记录对应一张不可变副本，snapshot_id标识它，upstream_id记录创建时timeline的原上游
+            upstream_id同Block同命名空间引用另一条snapshot，根为空；不指向timeline、不形成自环
+            普通快照：新记录upstream=timeline旧上游，timeline上游=新记录；timeline工作文件保持不动
+            回档：先记intent，将工作文件改名归档，复制目标恢复原工作路径；最终同事务登记归档及timeline目标上游
+            fields_json仅保存子项名到物理表名，不保存消息数组；恢复时与目标文件同步切换
+            restore_intent仅timeline允许非空，保存持久回档计划，不新增管理事件或额外备份机制
+    Block文件：blocks/<宿主生成的Block标识>/session.sqlite及session_<snapshot_id>.sqlite--session为示意
+        一个Block固定一个可写timeline数据库；每次快照从当前工作库完整复制一个只读数据库，不轮换工作文件
+        一张子项表对应一个Block子项，每条消息为position INTEGER PRIMARY KEY、payload TEXT NOT NULL
+        快照及恢复均按完整数据库文件操作，所有子项表与库内状态自然一起保留，不逐子项重建或按当前定义补表
+        position表达当前数组顺序，不充当跨快照稳定消息ID；负索引和范围仍按既有数组语义计算
+        物理目录、文件名及表名由宿主规范生成，不以未验证业务名拼接SQL或任意路径；空子项也建空表
+        普通快照、回档前快照及目标快照均不被后续普通写入修改，不因切换分支自动删除
+    TEMP文件：VM实例隔离的运行时临时目录
+        同样一个固定timeline工作文件及若干只读快照；本实例全部文件寿命仍属于该VM，不变成永久归档
+        VM、MCL及worker真实退出后沿DropTemporaryBlocks清理对应映射及本实例全部工作文件/快照
+        不清理持久快照目录；异常退出遗留临时目录核验后清理，不恢复成持久Block
+    行为：
+        PRAGMA user_version标记管理库及Block文件目标版本，不冒用现有version 3四表schema
+        空目录创建新布局；旧main.blocks布局、缺失文件、schema或映射不一致明确报错，不迁移、不备份、不兼容
+        初始化核对timeline、snapshot及其上游，先完成明确restore_intent，才允许一般读写；不猜测生成丢失快照
+        未登记副本只在可证明属于未完成发布的内部文件时回收，不触碰已登记快照或外部文件
+        不承诺多个Block文件的统一SQL事务，Block内容和管理库中的历史/日志仍是独立提交
+
 ```
 
 ## 类型
@@ -76,7 +152,7 @@ StoragePlugin：存储执行插件
 公开：
 ```text
 AgentStorage：Agent持久存储，公开组件
-    database: StorageDatabase--私有，共享连接管理器
+    database: StorageDatabase--私有，共享管理库、Block映射及当前文件连接能力
     settings_path: PathBuf--私有，当前Agent设置文件
     settings_lock: Arc<Mutex<()>>--私有，协调该文件读写
     impl Component for AgentStorage
@@ -151,7 +227,7 @@ StorageTaskError：执行失败载荷--owner、原reply、StorageError
 ```text
 StorageDatabase：不透明SQLite连接能力
     impl Clone
-        行为：共享连接及不可用标记，不公开Connection。
+        行为：共享管理库连接、Block工作文件及快照管理器、串行受理门及不可用标记，不公开Connection，不让调用方绕过timeline及回档受理门。
 
 AgentLogLevel：日志级别，公开枚举
     Debug | Info | Warn | Error--数据库分别保存debug、info、warn、error
@@ -179,7 +255,7 @@ StorageOperation：机械存储操作，公开枚举
     CreateBlock { name: String, fields: Vec<String>, instance: Option<String> }
     ReadMessages { selectors: Vec<MessageSelector> }
     ReadMessageSources { sources: Vec<MessageSource> }
-    DropTemporaryBlocks { instance: String }--仅删除该VM实例的内存TEMP
+    DropTemporaryBlocks { instance: String }--沿原事件与变体清理该VM实例TEMP映射和全部工作/快照文件；不动持久归档
     ReplaceMessages { sources: Vec<MessageSource>, target: MessageSelector }
     ReadConfig
     SetConfig { path: String, value: toml::Value }
@@ -199,7 +275,7 @@ MessageSelector：消息选择器
 MessageSelection：选择范围，公开枚举
     All | Index(i64) | Range(i64, i64)
 
-MessageSource：写事务内的消息来源，公开枚举
+MessageSource：固定工作文件视图后读取的消息来源，公开枚举
     Stored(MessageSelector)
     Literal(Vec<serde_json::Value>)
 
@@ -247,12 +323,17 @@ StorageErrorKind：错误类别，公开枚举
 Agent Entity
 └── AgentStorage
     ├── StorageDatabase
-    │   └── SQLite连接管理器
-    │       ├── main.agent_messages--纯AgentMessage payload及历史关联
-    │       ├── main.mcl_records--纯MCL审计payload及历史关联
-    │       ├── main.blocks--name到fields_json对象，每个持久Block一行
-    │       ├── main.agent_logs--独立日志及可选关联JSON，不参与历史或推理
-    │       └── temp.blocks--连接内存中的VM实例临时Block，不写数据库文件
+    │   ├── 共享串行受理门及不可用标记
+    │   ├── Agent管理库连接
+    │   │   ├── main.agent_messages--纯消息历史
+    │   │   ├── main.mcl_records--纯MCL审计
+    │   │   ├── main.agent_logs--独立会话日志
+    │   │   └── main.block_snapshots--timeline/snapshot文件、子项映射、上游与在途回档
+    │   ├── 持久Block文件
+    │   │   ├── 每Block固定timeline工作库--普通快照不切换
+    │   │   └── 不可变snapshot文件--每子项一表，每消息一行
+    │   └── 按VM实例隔离的TEMP工作文件及快照
+    │       └── 生命周期结束后核验清理本实例全部文件，不永久归档
     ├── settings_path
     └── settings_lock
 
