@@ -14,7 +14,11 @@ Daemon是应用入口，定位~/.margatroid，调用Compose装配并运行App。
     ├── workspace.yaml
     └── agents/<agent>/
         ├── state.sqlite
-        └── settings.toml
+        ├── setting.toml
+        └── state.sqlite.blocks/
+            └── <block>/
+                ├── timeline.sqlite
+                └── snapshot_<id>.sqlite
 ```
 
 启动读取全局配置、模型路由及Workspace定义展示缓存，不自动启动所有Workspace。每次Workspace启动或重启请求携带path，后端重读文件、更新展示缓存并直接使用本次解析结果；禁止缓存兜底启动。

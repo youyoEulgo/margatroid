@@ -47,7 +47,7 @@ fn logs_preserve_full_record_and_context_without_entering_history() {
                 turn: Some("turn-1".into()),
                 kind: "message".into(),
                 content: "user".into(),
-                payload: json!({"type":"user"}),
+                payload: json!({"type":"user","content":"history"}),
                 created_at_ms: Some(0),
             }],
         },

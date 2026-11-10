@@ -48,9 +48,9 @@ export interface UserImage {
   media_type: string;
   data: string;
 }
-export type AgentMessage =
+export type AgentMessage = { sequence?: number } & (
   | { type: 'system'; content: string }
-  | { type: 'user'; content: string; images?: UserImage[] }
+  | { type: 'user'; content: string; data?: UserImage[] }
   | {
       type: 'assistant';
       request_id?: string;
@@ -58,19 +58,19 @@ export type AgentMessage =
       reasoning?: string | null;
       tool_calls?: ToolCall[];
       usage?: TokenUsage | null;
-      replay?: unknown;
       stop_reason?: string | null;
     }
   | {
       type: 'tool_call';
-      images?: UserImage[];
+      data?: UserImage[];
       tool_call_id: string;
       tool_name: string;
       content: string;
       failed: boolean;
     }
   | { type: 'error'; message: string; request_id?: string }
-  | { type: 'inject'; messages: AgentMessage[] };
+  | { type: 'inject'; messages: AgentMessage[] }
+);
 export interface AgentState {
   workspace: WorkspaceRef;
   agent: string;
@@ -303,12 +303,10 @@ function history(value: unknown): boolean {
       (entry) =>
         isRecord(entry) &&
         (entry.kind === 'message'
-          ? (entry.type === undefined ||
-              (string(entry.type) && entry.type.length > 0)) &&
+          ? (entry.type === undefined || (string(entry.type) && entry.type.length > 0)) &&
             entry.source === undefined
           : entry.kind === 'mcl'
-            ? (entry.source === undefined ||
-                (string(entry.source) && entry.source.length > 0)) &&
+            ? (entry.source === undefined || (string(entry.source) && entry.source.length > 0)) &&
               entry.type === undefined
             : true) &&
         integer(entry.sequence) &&
@@ -316,7 +314,8 @@ function history(value: unknown): boolean {
         string(entry.kind) &&
         string(entry.content) &&
         integer(entry.created_at_ms) &&
-        'payload' in entry,
+        'payload' in entry &&
+        (entry.kind !== 'message' || isAgentMessage(entry.payload)),
     )
   );
 }
@@ -334,7 +333,18 @@ function backendState(value: unknown): boolean {
   );
 }
 function mclResult(value: unknown): boolean {
-  return isRecord(value) && 'Ok' in value && !('Err' in value);
+  if (!isRecord(value) || !('Ok' in value) || 'Err' in value) return false;
+  const result = value.Ok;
+  if (!isRecord(result)) return true;
+  if ('Array' in result)
+    return (
+      isRecord(result.Array) &&
+      Array.isArray(result.Array.Message) &&
+      result.Array.Message.every(isAgentMessage)
+    );
+  if ('Inference' in result)
+    return isRecord(result.Inference) && isAgentMessage(result.Inference.message);
+  return true;
 }
 function result(value: unknown): boolean {
   return (
@@ -345,10 +355,7 @@ function result(value: unknown): boolean {
 }
 export function isMclError(value: unknown): value is MclError {
   return (
-    isRecord(value) &&
-    value.type === 'error' &&
-    string(value.message) &&
-    string(value.request_id)
+    isRecord(value) && value.type === 'error' && string(value.message) && string(value.request_id)
   );
 }
 function images(value: unknown): boolean {
@@ -367,12 +374,18 @@ function images(value: unknown): boolean {
   );
 }
 export function isAgentMessage(value: unknown): value is AgentMessage {
-  if (!isRecord(value)) return false;
+  if (
+    !isRecord(value) ||
+    'replay' in value ||
+    'images' in value ||
+    (value.sequence !== undefined && !integer(value.sequence))
+  )
+    return false;
   switch (value.type) {
     case 'system':
       return string(value.content);
     case 'user':
-      return string(value.content) && images(value.images);
+      return string(value.content) && images(value.data);
     case 'assistant':
       return (
         optionalNullableString(value.content) &&
@@ -390,7 +403,7 @@ export function isAgentMessage(value: unknown): value is AgentMessage {
         string(value.tool_call_id) &&
         string(value.tool_name) &&
         typeof value.failed === 'boolean' &&
-        images(value.images)
+        images(value.data)
       );
     case 'error':
       return string(value.message);

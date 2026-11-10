@@ -133,7 +133,7 @@ handle_inference(world: &mut World, request: InferenceRequest)
         认领reply，检查完整Agent Entity及Working；
         先检查当前turn，再检查ActiveInference及重叠推理。
         在System实际受理时检查Agent当前turn；
-        已被中止清空或与request.turn不匹配，直接返回空assistant的Completed响应（正文、reasoning、tool_calls、replay及usage均空），不创建HTTP或监督任务。
+        已被中止清空或与request.turn不匹配，直接返回空assistant的Completed响应（正文、reasoning、tool_calls及usage均空），不创建HTTP或监督任务。
         从ModelRoutes选定路由；
         直接遍历当前Agent的Tools，以每条记录的alias、description及input_schema构造本次工具定义。
         在受理阶段校验消息及参数，构造DomainRequest并调用build_request完成HTTP编码。
@@ -223,13 +223,12 @@ ProviderFragment：格式归一后的分片，私有枚举
     Content(String)
     Reasoning(String)
     ToolCallDelta { index: usize, id: Option<String>, name: Option<String>, arguments: String }
-    Replay(serde_json::Value)
     Usage(InferenceUsage)
     Finished(InferenceStopReason)
 
 AcceptedDelta：已接受的显示分片--sequence及Content或Reasoning
 AcceptedResponse：接收器结果--累积消息和已接受协议终态
-ResponseAccumulator：唯一响应累积器--正文、思考、工具调用、replay、usage及停止原因
+ResponseAccumulator：唯一响应累积器--正文、思考、工具调用、usage及停止原因
 FormatDecoder：SSE解析状态--跨字节缓冲、协议索引及完整结束校验，不另存最终正文
 
 ApiFormat：格式，私有枚举
@@ -244,7 +243,9 @@ ChatCompletionsRequest / MessagesRequest / ResponsesRequest：具体格式请求
     impl TryFrom<DomainRequest>或TryFrom<EncodeInput>
         行为：
             转换消息、工具及参数；
-            在HTTP前校验目标格式与厂商能力，不经过有损通用JSON中间请求。
+            在HTTP前校验目标格式与厂商能力，不经过通用JSON中间请求；
+            Chat按EncodeInput能力映射reasoning_content，Messages/Responses仅编码其支持的独立字段，不把历史思考混入正文或构造签名块；
+            只有reasoning且无正文/工具的历史若目标无法表达则明确失败，有正文或工具时保持它们原样转换。
 EncodeInput：插件内格式编码材料--DomainRequest及本次只读能力，不进入领域core。
 OpenAi<T> / Anthropic<T> / DeepSeek<T> / OpenRouter<T>：具体厂商handler
     T：具体ChatCompletionsRequest、MessagesRequest或ResponsesRequest，不是ApiRequest枚举变体。
@@ -319,9 +320,9 @@ DomainRequest：拥有所有权的协议输入
 
 InferenceMessage：推理自身的消息契约，公开枚举
     System { content: String }
-    User { content: String, images: Vec<InferenceImage> }
-    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<InferenceToolCall>, replay: Option<serde_json::Value> }
-    Tool { call_id: String, content: String, images: Vec<InferenceImage>, failed: bool }
+    User { content: String, images: Vec<InferenceImage> }--JSON字段名为data，无images别名
+    Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<InferenceToolCall> }
+    Tool { call_id: String, content: String, images: Vec<InferenceImage>, failed: bool }--JSON字段名为data
 
 InferenceToolDefinition：本次工具定义--name、description、input_schema
 InferenceToolCall：模型调用--id、name、arguments
@@ -332,7 +333,6 @@ InferenceResponse：成功响应
     reasoning: Option<String>
     content: Option<String>
     tool_calls: Vec<InferenceToolCall>
-    replay: Option<serde_json::Value>
     usage: Option<InferenceUsage>
     stop_reason: InferenceStopReason
 

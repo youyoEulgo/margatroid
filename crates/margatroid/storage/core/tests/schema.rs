@@ -16,69 +16,46 @@ fn new_database_contains_only_current_four_tables_and_reopens() {
         .unwrap();
     assert_eq!(
         tables,
-        ["agent_logs", "agent_messages", "blocks", "mcl_records"]
+        [
+            "agent_logs",
+            "agent_messages",
+            "block_snapshots",
+            "mcl_records"
+        ]
     );
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
         SCHEMA_VERSION
     );
-    for (table, identity_columns, insert_columns, identity_values) in [
-        (
-            "agent_messages",
-            [("turn", 0, 0), ("type", 1, 0)],
-            "turn,type",
-            "NULL,'user'",
-        ),
-        (
-            "mcl_records",
-            [("source", 1, 0), ("turn", 0, 0)],
-            "source,turn",
-            "'source',NULL",
-        ),
+    let columns: Vec<String> = db
+        .prepare("PRAGMA table_info(agent_messages)")
+        .unwrap()
+        .query_map([], |r| r.get(1))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        columns,
+        [
+            "sequence",
+            "turn",
+            "role",
+            "content",
+            "data",
+            "tool_call",
+            "payload",
+            "created_at_ms"
+        ]
+    );
+    for values in [
+        "1,'user',NULL,'{}',0",
+        "1,'user','text',NULL,0",
+        "1,'','text','{}',0",
+        "1,NULL,'text','{}',0",
+        "1,'user','text','{}',-1",
     ] {
-        let columns: Vec<(String, i64, i64)> = db
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .unwrap()
-            .query_map([], |r| Ok((r.get(1)?, r.get(3)?, r.get(5)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(
-            columns,
-            vec![
-                ("sequence".into(), 0, 1),
-                (
-                    identity_columns[0].0.into(),
-                    identity_columns[0].1,
-                    identity_columns[0].2
-                ),
-                (
-                    identity_columns[1].0.into(),
-                    identity_columns[1].1,
-                    identity_columns[1].2
-                ),
-                ("content".into(), 1, 0),
-                ("payload".into(), 1, 0),
-                ("created_at_ms".into(), 1, 0),
-            ]
-        );
-        for body in [
-            "NULL,'{}',0",
-            "'body',NULL,0",
-            "'body','{}',NULL",
-            "'body','{}',-1",
-        ] {
-            assert!(db.execute(&format!("INSERT INTO {table}({insert_columns},content,payload,created_at_ms) VALUES({identity_values},{body})"), []).is_err());
-        }
-        let identity = if table == "agent_messages" {
-            "type"
-        } else {
-            "source"
-        };
-        for value in ["NULL", "''"] {
-            assert!(db.execute(&format!("INSERT INTO {table}({identity},content,payload,created_at_ms) VALUES({value},'body','{{}}',0)"), []).is_err());
-        }
+        assert!(db.execute(&format!("INSERT INTO agent_messages(sequence,role,content,payload,created_at_ms) VALUES({values})"),[]).is_err());
     }
     drop(db);
     drop(open_storage(&path, &directory.path().join("settings.toml"), "").unwrap());
@@ -158,4 +135,22 @@ fn unsupported_schema_version_is_rejected_without_rewriting() {
         StorageErrorKind::SchemaMismatch
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn version_three_json_block_database_is_rejected_unchanged() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let settings = directory.path().join("settings.toml");
+    drop(open_storage(&path, &settings, "").unwrap());
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("DROP TABLE block_snapshots;CREATE TABLE blocks(name TEXT PRIMARY KEY NOT NULL,fields_json TEXT NOT NULL);INSERT INTO blocks VALUES('session','{\"conversation\":[]}');PRAGMA user_version=3;").unwrap();
+    drop(db);
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(
+        open_storage(&path, &settings, "").err().unwrap().kind,
+        StorageErrorKind::SchemaMismatch
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!directory.path().join("state.sqlite.blocks").exists());
 }

@@ -212,7 +212,7 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
     assert_eq!(response.stop_reason, InferenceStopReason::Completed);
     assert_eq!(response.content.as_deref(), Some("accepted"));
     assert!(response.tool_calls.is_empty());
-    assert_eq!(response.replay, None);
+
     assert_eq!(response.usage, None);
     drop(sender);
     server.await.unwrap();
@@ -658,7 +658,7 @@ fn decode_events(format: ApiFormat, events: &[Value]) -> Result<InferenceRespons
 }
 
 #[test]
-fn messages_signed_reasoning_survives_byte_boundaries_and_replays_as_messages() {
+fn messages_reasoning_survives_bytes_without_persisting_signatures() {
     let events = vec![
         json!({"type":"message_start","message":{"role":"assistant","content":[],"usage":{"input_tokens":2,"output_tokens":0,"cache_read_input_tokens":3}}}),
         json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
@@ -672,10 +672,9 @@ fn messages_signed_reasoning_survives_byte_boundaries_and_replays_as_messages() 
     ];
     let result = decode_events(ApiFormat::Messages, &events).unwrap();
     assert_eq!(result.reasoning.as_deref(), Some("思考"));
-    assert_eq!(
-        result.replay.as_ref().unwrap()["items"][0]["signature"],
-        "signed"
-    );
+    let internal = serde_json::to_value(&result).unwrap();
+    assert!(internal.get("replay").is_none());
+    assert!(!internal.to_string().contains("signed"));
     assert_eq!(result.usage.as_ref().unwrap().input_tokens, 5);
     let mut input = DomainRequest {
         messages: request().messages,
@@ -688,15 +687,15 @@ fn messages_signed_reasoning_survives_byte_boundaries_and_replays_as_messages() 
             reasoning: result.reasoning,
             content: result.content,
             tool_calls: result.tool_calls,
-            replay: result.replay,
         });
     let mut selected = route("http://example.invalid/v1".into());
     selected.provider = "anthropic".into();
     selected.api_type = "messages".into();
     let encoded = build_request(input.clone(), &selected).unwrap();
     let body: Value = serde_json::from_slice(&encoded.body).unwrap();
-    assert_eq!(body["messages"][1]["content"][0]["type"], "thinking");
-    assert_eq!(body["messages"][1]["content"][0]["signature"], "signed");
+    assert_eq!(body["messages"][1]["content"][0]["type"], "text");
+    assert_eq!(body["messages"][1]["content"][0]["text"], "answer");
+    assert!(!body.to_string().contains("signed"));
     selected.provider = "openai".into();
     selected.api_type = "responses".into();
     let converted = build_request(input, &selected).unwrap();
@@ -707,14 +706,15 @@ fn messages_signed_reasoning_survives_byte_boundaries_and_replays_as_messages() 
     unsigned.remove(3);
     assert_eq!(
         decode_events(ApiFormat::Messages, &unsigned)
-            .unwrap_err()
-            .kind,
-        Kind::ResponseInvalid
+            .unwrap()
+            .reasoning
+            .as_deref(),
+        Some("思考")
     );
 }
 
 #[test]
-fn responses_encrypted_reasoning_replay_preserves_full_local_context() {
+fn responses_reasoning_is_generic_and_encrypted_items_do_not_escape_adapter() {
     let events = vec![
         json!({"type":"response.created"}),
         json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"reason","summary":[],"encrypted_content":"encrypted"}}),
@@ -727,10 +727,9 @@ fn responses_encrypted_reasoning_replay_preserves_full_local_context() {
     ];
     let result = decode_events(ApiFormat::Responses, &events).unwrap();
     assert_eq!(result.reasoning.as_deref(), Some("thought"));
-    assert_eq!(
-        result.replay.as_ref().unwrap()["items"][0]["encrypted_content"],
-        "encrypted"
-    );
+    let internal = serde_json::to_value(&result).unwrap();
+    assert!(internal.get("replay").is_none());
+    assert!(!internal.to_string().contains("encrypted"));
     let mut input = DomainRequest {
         messages: request().messages,
         tools: vec![],
@@ -742,14 +741,14 @@ fn responses_encrypted_reasoning_replay_preserves_full_local_context() {
             reasoning: result.reasoning,
             content: result.content,
             tool_calls: result.tool_calls,
-            replay: result.replay,
         });
     let mut selected = route("http://example.invalid/v1".into());
     selected.api_type = "responses".into();
     let body: Value =
         serde_json::from_slice(&build_request(input, &selected).unwrap().body).unwrap();
     assert_eq!(body["input"][0]["role"], "user");
-    assert_eq!(body["input"][1]["encrypted_content"], "encrypted");
+    assert_eq!(body["input"][1]["content"][0]["text"], "answer");
+    assert!(!body.to_string().contains("encrypted"));
     assert_eq!(body["store"], false);
     assert!(body.get("previous_response_id").is_none());
 }
@@ -1427,7 +1426,7 @@ async fn ordinary_launch_hands_supervisor_to_registered_shared_handle() {
     assert_eq!(result.content, None);
     assert_eq!(result.reasoning, None);
     assert!(result.tool_calls.is_empty());
-    assert_eq!(result.replay, None);
+
     assert_eq!(result.usage, None);
     assert!(handle.is_finished());
 }

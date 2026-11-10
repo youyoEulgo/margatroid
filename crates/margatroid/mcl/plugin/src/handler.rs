@@ -769,32 +769,36 @@ async fn execute_effect(
             let messages = tool_effect_messages(context, arguments.next().unwrap()).await?;
             execute_tools(context, messages).await
         }
+        "block_snapshot" | "block_snapshots" | "block_restore" => {
+            execute_block_effect(context, name, arguments.collect()).await
+        }
         "history_append" => {
             let messages = effect_messages(context, arguments.next().unwrap()).await?;
-            let records = messages
-                .into_iter()
-                .map(|message| storage_core::HistoryRecord {
-                    source: None,
-                    turn: context.turn.clone(),
-                    kind: "message".into(),
-                    content: message
-                        .get("content")
-                        .or_else(|| message.get("message"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    payload: message,
-                    created_at_ms: None,
-                })
-                .collect();
-            expect_unit(
-                storage(
-                    context,
-                    StorageOperation::AppendHistory { records },
-                    context.cancel.clone(),
-                )
-                .await?,
-            )
+            let request = context.request.clone();
+            let cancel = context.cancel.clone();
+            let storage = in_world(&context.world, move |world| {
+                check_action(world, &request, &cancel)?;
+                world
+                    .get_component::<storage_core::AgentStorage>(request.target)
+                    .cloned()
+                    .ok_or_else(|| error(MclErrorKind::StorageFailed, "Agent storage is missing"))
+            })
+            .await?;
+            let turn = context.turn.clone();
+            let cancel = context.cancel.clone();
+            let recorded = tokio::task::spawn_blocking(move || {
+                if cancel.is_cancelled() {
+                    return Err(error(
+                        MclErrorKind::Cancelled,
+                        "history append cancelled before execution",
+                    ));
+                }
+                storage_core::append_message_history(&storage, &messages, turn.as_deref())
+                    .map_err(storage_error)
+            })
+            .await
+            .map_err(|failed| error(MclErrorKind::CleanupFailed, failed.to_string()))??;
+            Ok(MclValue::Array(MessageArray::Message(recorded)))
         }
         "sandbox_use" => {
             let mut aliases = alias_parameter(context, arguments.next().unwrap())?;
@@ -864,6 +868,103 @@ async fn execute_effect(
         }
         _ => Err(error(MclErrorKind::ParseFailed, "unsupported effect")),
     }
+}
+
+fn block_effect_argument<'a>(
+    context: &'a CommandContext,
+    parameter: &EffectParameter,
+) -> Result<&'a Value, MclError> {
+    let EffectParameter::Manual(index) = parameter else {
+        return Err(error(
+            MclErrorKind::ArgumentMismatch,
+            "block parameter requires ?",
+        ));
+    };
+    context
+        .request
+        .instruction
+        .arguments
+        .get(*index)
+        .ok_or_else(|| error(MclErrorKind::ArgumentMismatch, "missing block parameter"))
+}
+
+async fn execute_block_effect(
+    context: &CommandContext,
+    name: &str,
+    parameters: Vec<EffectParameter>,
+) -> Result<MclValue, MclError> {
+    let block = block_effect_argument(context, &parameters[0])?
+        .as_str()
+        .ok_or_else(|| {
+            error(
+                MclErrorKind::ArgumentMismatch,
+                "block name must be a logical identifier",
+            )
+        })?
+        .to_owned();
+    validate_identifier(&block).map_err(|_| {
+        error(
+            MclErrorKind::ArgumentMismatch,
+            "block name must be a logical identifier",
+        )
+    })?;
+    let snapshot_id = if name == "block_restore" {
+        Some(
+            block_effect_argument(context, &parameters[1])?
+                .as_u64()
+                .filter(|id| *id > 0 && *id <= i64::MAX as u64)
+                .ok_or_else(|| {
+                    error(
+                        MclErrorKind::ArgumentMismatch,
+                        "snapshot id must be a positive SQLite integer",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let request = context.request.clone();
+    let cancel = context.cancel.clone();
+    let storage = in_world(&context.world, move |world| {
+        check_action(world, &request, &cancel)?;
+        world
+            .get_component::<storage_core::AgentStorage>(request.target)
+            .cloned()
+            .ok_or_else(|| error(MclErrorKind::StorageFailed, "Agent storage is missing"))
+    })
+    .await?;
+    let instance = context.instance.clone();
+    let name = name.to_owned();
+    let cancel = context.cancel.clone();
+    tokio::task::spawn_blocking(move || {
+        if cancel.is_cancelled() {
+            return Err(error(
+                MclErrorKind::Cancelled,
+                "block operation cancelled before execution",
+            ));
+        }
+        match name.as_str() {
+            "block_snapshot" => storage_core::snapshot_block(&storage, &block, instance.as_deref())
+                .map(|()| MclValue::Unit)
+                .map_err(storage_error),
+            "block_snapshots" => {
+                storage_core::read_block_snapshots(&storage, &block, instance.as_deref())
+                    .map(MclValue::BlockSnapshots)
+                    .map_err(storage_error)
+            }
+            "block_restore" => storage_core::restore_block(
+                &storage,
+                &block,
+                instance.as_deref(),
+                snapshot_id.unwrap(),
+            )
+            .map(|()| MclValue::Unit)
+            .map_err(storage_error),
+            _ => unreachable!("block effect dispatch"),
+        }
+    })
+    .await
+    .map_err(|failed| error(MclErrorKind::CleanupFailed, failed.to_string()))?
 }
 
 async fn finish_turn(context: &CommandContext) -> Result<MclValue, MclError> {
@@ -953,7 +1054,7 @@ fn inference_result(response: InferenceResponse, request_id: &str) -> Result<Mcl
     let calls = response.tool_calls.into_iter().map(|call| {
         Ok(json!({"id": call.id, "tool_name": call.name, "arguments": serde_json::to_string(&call.arguments).map_err(|failed| error(MclErrorKind::EffectFailed, failed.to_string()))?}))
     }).collect::<Result<Vec<_>, MclError>>()?;
-    let mut message = json!({"request_id": request_id, "type": "assistant", "reasoning": response.reasoning, "content": response.content, "tool_calls": calls, "replay": response.replay, "usage": response.usage, "stop_reason": stop_reason});
+    let mut message = json!({"request_id": request_id, "type": "assistant", "reasoning": response.reasoning, "content": response.content, "tool_calls": calls, "usage": response.usage, "stop_reason": stop_reason});
     message
         .as_object_mut()
         .unwrap()
@@ -1066,7 +1167,7 @@ fn tool_message(
     images: Vec<tool_core::ToolImage>,
     failed: bool,
 ) -> Value {
-    json!({"type": "tool_call", "tool_call_id": call.id, "tool_name": call.name, "content": content, "images": images, "failed": failed})
+    json!({"type": "tool_call", "tool_call_id": call.id, "tool_name": call.name, "content": content, "data": images, "failed": failed})
 }
 
 // Validate the entire batch's identities before dispatching any side effects.
@@ -1174,6 +1275,12 @@ fn assistant_calls(message: &Value) -> Result<Vec<InferenceToolCall>, MclError> 
 }
 
 fn inference_message(mut message: Value) -> Result<InferenceMessage, MclError> {
+    if message.get("replay").is_some() || message.get("images").is_some() {
+        return Err(error(
+            MclErrorKind::InvalidMessage,
+            "message contains removed replay or images fields",
+        ));
+    }
     let kind = message
         .get("type")
         .and_then(Value::as_str)

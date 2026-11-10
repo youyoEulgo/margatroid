@@ -957,7 +957,6 @@ fn stale_vm_mcl_results_do_not_bind_to_new_instance_and_invalid_input_never_echo
             reasoning: None,
             content: Some("old-private-result".into()),
             tool_calls: vec![],
-            replay: None,
             usage: None,
             stop_reason: InferenceStopReason::Completed,
         }))

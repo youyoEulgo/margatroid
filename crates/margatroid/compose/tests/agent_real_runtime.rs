@@ -44,7 +44,7 @@ fn seed(root: &Path) {
     )
     .unwrap();
     std::fs::write(driver.join("base.lua"), PROGRAM).unwrap();
-    std::fs::write(driver.join("settings.toml"), "").unwrap();
+    std::fs::write(driver.join("setting.toml"), "").unwrap();
     for directory in [
         root.join("workspaces/demo"),
         root.join("project"),
@@ -142,7 +142,7 @@ impl Fixture {
                 project_root: root.join("project"),
                 home_root: root.join("home"),
                 database_path: directory.join("agents/coder/state.sqlite"),
-                settings_path: directory.join("agents/coder/settings.toml"),
+                settings_path: directory.join("agents/coder/setting.toml"),
             },
         }
     }

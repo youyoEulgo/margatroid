@@ -7,24 +7,16 @@ use std::{
 use storage_core::*;
 
 #[test]
-fn multi_selector_read_has_one_snapshot_during_external_writes() {
+fn multi_selector_read_has_one_snapshot_during_concurrent_storage_writes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let storage = open_storage(&path, &dir.path().join("cfg"), "").unwrap();
     create(&storage, "b");
-    replace(&storage, "b", vec![json!(0)]);
-    let writer = Connection::open(path).unwrap();
-    writer
-        .busy_timeout(std::time::Duration::from_secs(5))
-        .unwrap();
+    replace(&storage, "b", vec![message(json!(0))]);
+    let writer = storage.clone();
     let thread = std::thread::spawn(move || {
         for n in 1..100 {
-            writer
-                .execute(
-                    "UPDATE blocks SET fields_json=?1",
-                    [json!({"messages":[n]}).to_string()],
-                )
-                .unwrap();
+            replace(&writer, "b", vec![message(json!(n))]);
         }
     });
     for _ in 0..100 {
@@ -110,7 +102,7 @@ fn persistent_reopen_retains_messages_and_history_and_create_only_opens() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("agent/db.sqlite");
     let settings = dir.path().join("agent/settings.toml");
-    let message = json!({"role":"assistant","tool_calls":[{"id":"x","arguments":{"a":1}}],"content":[null,"你好"]});
+    let message = json!({"type":"assistant","tool_calls":[{"id":"x","arguments":{"a":1}}],"content":"你好","data":[null,"你好"]});
     {
         let storage = open_storage(&db, &settings, "model='initial'\n").unwrap();
         create(&storage, "conversation");
@@ -137,11 +129,11 @@ fn database_and_settings_initialization_are_independent_and_existing_config_is_n
     fs::write(&cfg, "existing=7\n").unwrap();
     let storage = open_storage(&db, &cfg, "invalid = [").unwrap();
     create(&storage, "b");
-    replace(&storage, "b", vec![json!(7)]);
+    replace(&storage, "b", vec![message(json!(7))]);
     drop(storage);
     fs::remove_file(&cfg).unwrap();
     let storage = open_storage(&db, &cfg, "fresh=true\n").unwrap();
-    assert_eq!(read(&storage, "b"), vec![json!(7)]);
+    assert_eq!(read(&storage, "b"), vec![message(json!(7))]);
     assert_eq!(fs::read_to_string(&cfg).unwrap(), "fresh=true\n");
     fs::write(&cfg, "broken=[").unwrap();
     assert_eq!(
@@ -248,7 +240,7 @@ fn self_reference_sources_snapshot_range_and_sql_failure_preserve_messages() {
     let db = dir.path().join("db");
     let storage = open_storage(&db, &dir.path().join("cfg"), "").unwrap();
     create(&storage, "b");
-    replace(&storage, "b", vec![json!(1), json!(2)]);
+    replace(&storage, "b", vec![message(json!(1)), message(json!(2))]);
     execute_storage(
         &storage,
         StorageOperation::ReplaceMessages {
@@ -261,7 +253,15 @@ fn self_reference_sources_snapshot_range_and_sql_failure_preserve_messages() {
     )
     .unwrap();
     let before = read(&storage, "b");
-    assert_eq!(before, vec![json!(1), json!(2), json!(1), json!(2)]);
+    assert_eq!(
+        before,
+        vec![
+            message(json!(1)),
+            message(json!(2)),
+            message(json!(1)),
+            message(json!(2))
+        ]
+    );
     for selection in [
         MessageSelection::Index(i64::MAX),
         MessageSelection::Index(i64::MIN),
@@ -289,7 +289,7 @@ fn self_reference_sources_snapshot_range_and_sql_failure_preserve_messages() {
             &storage,
             StorageOperation::ReplaceMessages {
                 sources: vec![
-                    MessageSource::Literal(vec![json!(99)]),
+                    MessageSource::Literal(vec![message(json!(99))]),
                     MessageSource::Stored(selector("missing"))
                 ],
                 target: selector("b")
@@ -299,7 +299,10 @@ fn self_reference_sources_snapshot_range_and_sql_failure_preserve_messages() {
         .kind,
         StorageErrorKind::BlockMissing
     );
-    Connection::open(&db).unwrap().execute_batch("CREATE TRIGGER fail_update BEFORE UPDATE ON blocks BEGIN SELECT RAISE(ABORT,'failure'); END;").unwrap();
+    let mapping = read_block_snapshots(&storage, "b", None).unwrap();
+    let file = std::path::PathBuf::from(format!("{}.blocks", db.display()))
+        .join(mapping["timeline"]["file_name"].as_str().unwrap());
+    Connection::open(file).unwrap().execute_batch("CREATE TRIGGER fail_update BEFORE DELETE ON f0 BEGIN SELECT RAISE(ABORT,'failure'); END;").unwrap();
     assert_eq!(
         execute_storage(
             &storage,
@@ -319,7 +322,7 @@ fn negative_indices_and_insertion_boundaries_have_explicit_semantics() {
     let dir = tempfile::tempdir().unwrap();
     let storage = open_storage(&dir.path().join("db"), &dir.path().join("cfg"), "").unwrap();
     create(&storage, "b");
-    replace(&storage, "b", vec![json!(1), json!(2)]);
+    replace(&storage, "b", vec![message(json!(1)), message(json!(2))]);
     let mut s = selector("b");
     s.selection = MessageSelection::Index(-1);
     assert_eq!(
@@ -330,17 +333,20 @@ fn negative_indices_and_insertion_boundaries_have_explicit_semantics() {
             }
         )
         .unwrap(),
-        StorageValue::Messages(vec![json!(2)])
+        StorageValue::Messages(vec![message(json!(2))])
     );
     execute_storage(
         &storage,
         StorageOperation::ReplaceMessages {
-            sources: vec![MessageSource::Literal(vec![json!(3)])],
+            sources: vec![MessageSource::Literal(vec![message(json!(3))])],
             target: s,
         },
     )
     .unwrap();
-    assert_eq!(read(&storage, "b"), vec![json!(1), json!(2), json!(3)]);
+    assert_eq!(
+        read(&storage, "b"),
+        vec![message(json!(1)), message(json!(2)), message(json!(3))]
+    );
     let mut s = selector("b");
     s.selection = MessageSelection::Range(-3, -1);
     assert_eq!(
@@ -349,7 +355,7 @@ fn negative_indices_and_insertion_boundaries_have_explicit_semantics() {
             StorageOperation::ReadMessages { selectors: vec![s] }
         )
         .unwrap(),
-        StorageValue::Messages(vec![json!(2), json!(3)])
+        StorageValue::Messages(vec![message(json!(2)), message(json!(3))])
     );
 }
 #[test]
@@ -372,7 +378,7 @@ fn temporary_namespaces_isolate_and_conflicting_lifecycle_does_not_recreate() {
     execute_storage(
         &storage,
         StorageOperation::ReplaceMessages {
-            sources: vec![MessageSource::Literal(vec![json!(1)])],
+            sources: vec![MessageSource::Literal(vec![message(json!(1))])],
             target: a.clone(),
         },
     )
@@ -450,6 +456,8 @@ fn history_batches_append_duplicates_and_rollback_invalid_records() {
         },
     )
     .unwrap();
+    epoch.content = r#"{"content":"正文"}"#.into();
+    epoch.payload["sequence"] = json!(3);
     assert_eq!(history(&storage)[2], epoch);
 }
 
@@ -460,7 +468,11 @@ fn temporary_blocks_drop_per_instance_and_never_grow_persistent_database_across_
     let cfg = dir.path().join("cfg");
     let storage = open_storage(&path, &cfg, "").unwrap();
     create(&storage, "persistent");
-    replace(&storage, "persistent", vec![json!({"keep":[1,null]})]);
+    replace(
+        &storage,
+        "persistent",
+        vec![json!({"type":"user","content":"keep","data":[1,null]})],
+    );
     let database = Connection::open(&path).unwrap();
     let pages: i64 = database
         .query_row("PRAGMA page_count", [], |r| r.get(0))
@@ -483,7 +495,7 @@ fn temporary_blocks_drop_per_instance_and_never_grow_persistent_database_across_
         execute_storage(
             &storage,
             StorageOperation::ReplaceMessages {
-                sources: vec![MessageSource::Literal(vec![json!(n)])],
+                sources: vec![MessageSource::Literal(vec![message(json!(n))])],
                 target: current.clone(),
             },
         )
@@ -505,7 +517,8 @@ fn temporary_blocks_drop_per_instance_and_never_grow_persistent_database_across_
         old = current;
         assert_eq!(
             database
-                .query_row("SELECT count(*) FROM blocks", [], |r| r.get::<_, i64>(0))
+                .query_row("SELECT count(*) FROM block_snapshots", [], |r| r
+                    .get::<_, i64>(0))
                 .unwrap(),
             1
         );
@@ -517,7 +530,10 @@ fn temporary_blocks_drop_per_instance_and_never_grow_persistent_database_across_
         );
         assert_eq!(fs::metadata(&path).unwrap().len(), size);
     }
-    assert_eq!(read(&storage, "persistent"), vec![json!({"keep":[1,null]})]);
+    assert_eq!(
+        read(&storage, "persistent"),
+        vec![json!({"type":"user","content":"keep","data":[1,null]})]
+    );
     execute_storage(
         &storage,
         StorageOperation::CreateBlock {
@@ -601,4 +617,8 @@ fn dropping_one_temp_instance_preserves_other_instances_and_persistent_blocks() 
         .kind,
         StorageErrorKind::InvalidRequest
     );
+}
+
+fn message(value: Value) -> Value {
+    json!({"type":"user","content":value.to_string()})
 }

@@ -10,7 +10,7 @@ fn domain() -> DomainRequest {
             },
             InferenceMessage::Assistant {
                 reasoning: Some("local thought".into()),
-                replay: None,
+
                 content: Some("answer".into()),
                 tool_calls: vec![],
             },
@@ -119,37 +119,17 @@ fn chat_reasoning_is_decided_during_format_conversion() {
 }
 
 #[test]
-fn historical_replay_is_optional_but_current_response_replay_is_strict() {
-    assert!(replay_items(None, ApiFormat::Messages).unwrap().is_empty());
-    let replay = json!({"api_format":"messages","items":[{"type":"thinking","thinking":"thought","signature":"signed","extra":"preserved"}]});
-    assert_eq!(
-        replay_items(Some(replay.clone()), ApiFormat::Messages).unwrap(),
-        replay["items"].as_array().unwrap().clone()
-    );
-    assert!(replay_items(Some(replay), ApiFormat::Responses)
-        .unwrap()
-        .is_empty());
-    assert!(replay_items(
-        Some(json!({"api_format":"messages","items":[{"type":"thinking","thinking":"unsigned"}]})),
-        ApiFormat::Responses
-    )
-    .is_err());
-    assert!(replay_items(
-        Some(json!({"api_format":"unknown","items":[]})),
-        ApiFormat::Responses
-    )
-    .is_err());
+fn internal_response_has_no_format_specific_metadata() {
     let accumulator = ResponseAccumulator {
         content: "answer".into(),
         reasoning: "thought".into(),
-        replay_format: Some("messages".into()),
         reason: Some(InferenceStopReason::Completed),
         ..Default::default()
     };
-    assert_eq!(
-        accumulator.response().unwrap_err().kind,
-        InferenceErrorKind::ResponseInvalid
-    );
+    let encoded = serde_json::to_value(accumulator.response().unwrap()).unwrap();
+    assert_eq!(encoded["reasoning"], "thought");
+    assert!(encoded.get("replay").is_none());
+    assert!(encoded.get("api_format").is_none());
 }
 
 #[test]
@@ -165,9 +145,34 @@ fn reasoning_only_history_does_not_require_fabricated_thinking() {
         (Vendor::OpenAi, ApiFormat::ChatCompletions),
     ] {
         let adapter = adapter(vendor, format);
-        let encoded = adapter.encode(input.clone()).unwrap();
-        let body = adapter.process_request(encoded).unwrap().body;
-        let body: Value = serde_json::from_slice(&body).unwrap();
-        assert!(!body.to_string().contains("local thought"));
+        assert!(adapter.encode(input.clone()).is_err());
+    }
+}
+
+#[test]
+fn domain_media_serializes_once_under_data_without_provider_fields() {
+    let image = inference_core::InferenceImage {
+        media_type: "image/png".into(),
+        data: "bytes".into(),
+    };
+    for message in [
+        InferenceMessage::User {
+            content: "user".into(),
+            images: vec![image.clone()],
+        },
+        InferenceMessage::Tool {
+            call_id: "call".into(),
+            content: "result".into(),
+            images: vec![image],
+            failed: false,
+        },
+    ] {
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["data"].as_array().unwrap().len(), 1);
+        assert!(json.get("images").is_none());
+        assert_eq!(
+            serde_json::from_value::<InferenceMessage>(json).unwrap(),
+            message
+        );
     }
 }

@@ -26,7 +26,7 @@ impl Driver {
         let driver = Self { directory };
         driver.manifest("schema_version = 1\n[inference]\nmodel = 'test/model'\n");
         driver.write("base.lua", "return '你好'\n");
-        driver.write("settings.toml", "");
+        driver.write("setting.toml", "");
         driver
     }
 
@@ -70,7 +70,7 @@ fn reads_complete_materials_without_resolving_dependencies() {
     driver.manifest(
         "schema_version = 1\ndependencies = ['prompt:local/missing', 'tool:local/工具:v1.2', 'sandbox:local/workspace:latest']\n[inference]\nmodel = 'provider/model'\ntemperature = 0.5\ntop_p = 0.9\nmax_output_tokens = 2048\nstop = ['END', '停止']\n",
     );
-    driver.write("settings.toml", "[agent]\nname = '示例'\n");
+    driver.write("setting.toml", "[agent]\nname = '示例'\n");
     let input = driver.read().unwrap();
     assert_eq!(input.manifest.schema_version, 1);
     assert_eq!(
@@ -105,7 +105,7 @@ fn empty_settings_and_optional_model_parameters_are_valid() {
 
 #[test]
 fn every_file_is_required() {
-    for name in ["driver.toml", "base.lua", "settings.toml"] {
+    for name in ["driver.toml", "base.lua", "setting.toml"] {
         let driver = Driver::new();
         let target = driver.directory.join(name);
         assert_eq!(target.parent(), Some(driver.directory.as_path()));
@@ -117,13 +117,13 @@ fn every_file_is_required() {
 #[test]
 fn each_limit_accepts_exact_size_and_rejects_one_byte_less() {
     let driver = Driver::new();
-    driver.write("settings.toml", "title = '界'\n");
+    driver.write("setting.toml", "title = '界'\n");
     let exact = AgentDriverReadLimits {
         manifest_bytes: fs::metadata(driver.path()).unwrap().len() as usize,
         program_bytes: fs::metadata(driver.directory.join("base.lua"))
             .unwrap()
             .len() as usize,
-        settings_bytes: fs::metadata(driver.directory.join("settings.toml"))
+        settings_bytes: fs::metadata(driver.directory.join("setting.toml"))
             .unwrap()
             .len() as usize,
     };
@@ -151,12 +151,12 @@ fn zero_and_maximum_limits_do_not_overflow() {
         settings_bytes: 0,
     };
     assert!(read_driver(&driver.path(), &limits).is_ok());
-    driver.write("settings.toml", "\n");
+    driver.write("setting.toml", "\n");
     assert_eq!(
         read_driver(&driver.path(), &limits),
         Err(AgentDriverError::TooLarge)
     );
-    driver.write("settings.toml", "");
+    driver.write("setting.toml", "");
     driver.write("base.lua", "");
     assert!(
         read_driver(
@@ -172,7 +172,7 @@ fn zero_and_maximum_limits_do_not_overflow() {
 
 #[test]
 fn rejects_invalid_utf8_in_every_file() {
-    for name in ["driver.toml", "base.lua", "settings.toml"] {
+    for name in ["driver.toml", "base.lua", "setting.toml"] {
         let driver = Driver::new();
         driver.write(name, [0xff, 0xfe]);
         assert_eq!(driver.read(), Err(AgentDriverError::InvalidUtf8), "{name}");
@@ -327,11 +327,11 @@ fn validates_dependency_syntax_without_normalizing_or_resolving() {
 fn validates_settings_without_changing_original_text() {
     let driver = Driver::new();
     for source in ["broken = [", "key = 1\nkey = 2", "[bad"] {
-        driver.write("settings.toml", source);
+        driver.write("setting.toml", source);
         assert_eq!(driver.read(), Err(AgentDriverError::InvalidDefaultSettings));
     }
     let source = "# retained user-facing template\n[agent]\nname = 'test'\n\n";
-    driver.write("settings.toml", source);
+    driver.write("setting.toml", source);
     assert_eq!(driver.read().unwrap().default_settings, source);
 }
 
@@ -346,7 +346,7 @@ fn rejects_empty_paths_and_directories_in_place_of_files() {
         read_driver(&driver.directory, &AgentDriverReadLimits::default()),
         Err(AgentDriverError::InvalidPath)
     );
-    let target = driver.directory.join("settings.toml");
+    let target = driver.directory.join("setting.toml");
     assert_eq!(target.parent(), Some(driver.directory.as_path()));
     fs::remove_file(&target).unwrap();
     fs::create_dir(target).unwrap();
@@ -358,7 +358,7 @@ fn rereads_materials_without_cache_and_does_not_modify_them() {
     let driver = Driver::new();
     let first = driver.read().unwrap();
     driver.write("base.lua", "return 'updated'\n");
-    driver.write("settings.toml", "enabled = true\n");
+    driver.write("setting.toml", "enabled = true\n");
     let second = driver.read().unwrap();
     assert_eq!(first.program, "return '你好'\n");
     assert_eq!(second.program, "return 'updated'\n");
@@ -368,7 +368,7 @@ fn rereads_materials_without_cache_and_does_not_modify_them() {
         second.program
     );
     assert_eq!(
-        fs::read_to_string(driver.directory.join("settings.toml")).unwrap(),
+        fs::read_to_string(driver.directory.join("setting.toml")).unwrap(),
         second.default_settings
     );
     assert_eq!(fs::read_dir(&driver.directory).unwrap().count(), 3);
@@ -390,4 +390,18 @@ fn public_errors_implement_display_and_standard_error() {
     ] {
         check(&error);
     }
+}
+
+#[test]
+fn plural_settings_filename_is_not_a_template_fallback() {
+    let driver = Driver::new();
+    let current = driver.directory.join("setting.toml");
+    let obsolete = driver.directory.join("settings.toml");
+    assert_eq!(current.parent(), Some(driver.directory.as_path()));
+    assert_eq!(obsolete.parent(), Some(driver.directory.as_path()));
+    assert_eq!(current.file_name().unwrap(), "setting.toml");
+    assert_eq!(obsolete.file_name().unwrap(), "settings.toml");
+    assert!(!obsolete.exists());
+    fs::rename(current, obsolete).unwrap();
+    assert_eq!(driver.read(), Err(AgentDriverError::FileMissing));
 }

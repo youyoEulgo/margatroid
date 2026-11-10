@@ -232,7 +232,7 @@ handle_restart_result(world: &mut World, result: Result<RestartOutput, RestartEr
 -- 私有
 start_flow(context: FlowContext) -> Future<Output = Result<StartOutput, StartError>>
     行为：
-        调用address::resolve_file及agent_driver_core::read_driver取得本次Driver材料，准备数据库与设置。
+        调用address::resolve_file及agent_driver_core::read_driver取得本次Driver材料，准备成员目录中的state.sqlite与setting.toml；仅接受这两个固定文件名，不读取旧名。
         运行组件初始化阶段先发送InitToolTasks和InitInference，各携带agent及独立oneshot发送端，不先等待其中一个再发另一个。
         使用tokio::join!等待两个接收端，与原有资源初始化一起完成；
         收齐全部结果后处理错误，不提前丢弃另一项。

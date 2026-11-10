@@ -239,7 +239,9 @@ pub fn parse_instruction(input: &MclInstruction) -> Result<MclOperation, MclErro
         "EFFECT" => {
             let (name, mut rest) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
             let arity = match name {
-                "inference" | "tool_call" | "sandbox_use" | "history_append" => 1,
+                "inference" | "tool_call" | "sandbox_use" | "history_append" | "block_snapshot"
+                | "block_snapshots" => 1,
+                "block_restore" => 2,
                 "start_turn" | "finish_turn" | "ready" | "wake" => 0,
                 _ => return Err(invalid("unknown effect")),
             };
@@ -262,6 +264,13 @@ pub fn parse_instruction(input: &MclInstruction) -> Result<MclOperation, MclErro
             }
             if arguments.len() != arity {
                 return Err(invalid("effect parameter count mismatch"));
+            }
+            if matches!(name, "block_snapshot" | "block_snapshots" | "block_restore")
+                && arguments
+                    .iter()
+                    .any(|value| !matches!(value, EffectParameter::Manual(_)))
+            {
+                return Err(invalid("block snapshot parameters must be passed with ?"));
             }
             MclOperation::Effect {
                 name: name.into(),

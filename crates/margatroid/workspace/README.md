@@ -18,7 +18,7 @@ StartWorkspace与RestartWorkspace使用相同字段：id、path。每次启动�
 
 同一Schedule依次挂载停止、重启、启动System，直接使用mecs添加顺序。System只收集事件并路由，闭包直接返回Result，不增加结果包装事件。
 
-启动创建Workspace实体及专属线程，再按本次文件解析结果逐成员发送带oneshot回复端的StartAgent；闭包等待Agent完整启动回复后继续。成员失败不抹除成功成员；线程建立且成员请求收口后进入Running，并返回成员诊断。
+启动创建Workspace实体及专属线程，再按本次文件解析结果逐成员发送带oneshot回复端的StartAgent；成员文件固定为定义所在目录agents/<成员名>/state.sqlite与setting.toml，不回退到其他设置文件名；闭包等待Agent完整启动回复后继续。成员失败不抹除成功成员；线程建立且成员请求收口后进入Running，并返回成员诊断。
 
 关闭等待已受理成员创建收口，停止全部Agent并等待活动及MCL清理，最后退出并join专属线程。全部完成后销毁Workspace；清理未确认时保留宿主并报告失败。重启复用关闭和启动流程，全程Restarting，旧线程退出后才创建新线程。
 

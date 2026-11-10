@@ -140,7 +140,7 @@ export function contextInjection(
           type: 'user',
           content,
           ...(images.length
-            ? { images: images.map(({ media_type, data }) => ({ media_type, data })) }
+            ? { data: images.map(({ media_type, data }) => ({ media_type, data })) }
             : {}),
         },
       ],
@@ -210,7 +210,7 @@ function decodeMessage(
           content: message.content,
           toolCalls: [],
           failed: false,
-          images: message.type === 'user' ? message.images : undefined,
+          images: message.type === 'user' ? message.data : undefined,
           toolCallId: null,
           toolName: null,
         },
@@ -235,7 +235,7 @@ function decodeMessage(
           content: message.content,
           toolCalls: [],
           failed: message.failed,
-          images: message.images,
+          images: message.data,
           toolCallId: message.tool_call_id,
           toolName: message.tool_name,
         },

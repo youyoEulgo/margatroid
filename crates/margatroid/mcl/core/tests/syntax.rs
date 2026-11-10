@@ -91,3 +91,27 @@ fn values_preserve_driver_result_shape() {
         value
     );
 }
+
+#[test]
+fn snapshot_effects_use_scalar_markers_and_exact_arity() {
+    for effect in ["block_snapshot", "block_snapshots"] {
+        assert!(parse(&format!("EFFECT {effect} ?"), vec![json!("session")]).is_ok());
+        assert!(parse(&format!("EFFECT {effect}"), vec![]).is_err());
+        assert!(parse(&format!("EFFECT {effect} (session.messages)"), vec![]).is_err());
+        assert!(parse(
+            &format!("EFFECT {effect} ? ?"),
+            vec![json!("session"), json!(1)]
+        )
+        .is_err());
+    }
+    assert!(parse("EFFECT block_restore ? ?", vec![json!("session"), json!(1)]).is_ok());
+    assert!(parse("EFFECT block_restore ?", vec![json!("session")]).is_err());
+    assert!(parse("EFFECT block_restore (session.messages) ?", vec![json!(1)]).is_err());
+    let value = MclValue::BlockSnapshots(json!({"timeline":{},"snapshots":[]}));
+    let encoded = serde_json::to_value(&value).unwrap();
+    assert_eq!(
+        encoded,
+        json!({"BlockSnapshots":{"timeline":{},"snapshots":[]}})
+    );
+    assert_eq!(serde_json::from_value::<MclValue>(encoded).unwrap(), value);
+}

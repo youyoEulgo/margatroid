@@ -81,6 +81,7 @@ pub enum MclValue {
     Unit,
     Array(MessageArray),
     Config(toml::Table),
+    BlockSnapshots(Value),
     Inference {
         message: Value,
         stop_reason: String,

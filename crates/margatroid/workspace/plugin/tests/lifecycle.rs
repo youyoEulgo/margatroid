@@ -19,7 +19,7 @@ use workspace_plugin::WorkspacePlugin;
 fn legacy_agents_map_starts_with_original_state_paths_and_ignores_hidden_backups() {
     let root = tempfile::tempdir().unwrap();
     let path = file(root.path(), "demo");
-    let source="name: demo\nproject_root: /projects/demo\nagents:\n  coder:\n    driver: local/coder:latest\n  reviewer:\n    driver: local/reviewer:latest\n";
+    let source = "name: demo\nproject_root: /projects/demo\nagents:\n  coder:\n    driver: local/coder:latest\n  reviewer:\n    driver: local/reviewer:latest\n";
     std::fs::write(&path, source).unwrap();
     for hidden in [".operations", ".trash", ".backup"] {
         let directory = root.path().join(hidden);
@@ -39,7 +39,7 @@ fn legacy_agents_map_starts_with_original_state_paths_and_ignores_hidden_backups
     assert_eq!(starts[0].1.database_path, database);
     assert_eq!(
         starts[0].1.settings_path,
-        database.parent().unwrap().join("settings.toml")
+        database.parent().unwrap().join("setting.toml")
     );
     assert_eq!(
         std::fs::read(&database).unwrap(),
@@ -72,7 +72,7 @@ fn legacy_file_is_read_fresh_and_mutually_exclusive_forms_never_start_from_cache
     )
     .unwrap();
     let mut app = app(WorkspacePlugin::open(root.path()).unwrap());
-    let invalid="name: demo\nproject_root: /project\nagents: {coder: {driver: local/coder:latest}}\nmembers: []\n";
+    let invalid = "name: demo\nproject_root: /project\nagents: {coder: {driver: local/coder:latest}}\nmembers: []\n";
     std::fs::write(&path, invalid).unwrap();
     app.world().emit_event(StartWorkspace {
         id: "changed".into(),
@@ -322,7 +322,7 @@ fn start_uses_fresh_file_updates_shared_cache_and_preserves_existing_state_paths
     assert_eq!(starts[0].1.database_path, database);
     assert_eq!(
         starts[0].1.settings_path,
-        database.parent().unwrap().join("settings.toml")
+        database.parent().unwrap().join("setting.toml")
     );
     assert_eq!(
         starts[0].1.project_root,

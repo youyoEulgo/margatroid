@@ -9,6 +9,9 @@ pub struct StorageDatabase {
 pub(crate) struct DatabaseState {
     pub(crate) connection: Mutex<Connection>,
     pub(crate) retired: AtomicBool,
+    pub(crate) block_root: std::path::PathBuf,
+    pub(crate) temporary:
+        Mutex<std::collections::BTreeMap<(String, String), crate::blocks::MemoryBlock>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

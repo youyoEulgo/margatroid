@@ -206,13 +206,13 @@ pub(crate) fn handle_restart_workspace(world: &mut World, request: RestartWorksp
                 return Err(error(
                     WorkspaceErrorKind::Missing,
                     "workspace path is not running",
-                ))
+                ));
             }
             _ => {
                 return Err(error(
                     WorkspaceErrorKind::Duplicate,
                     "workspace path has multiple runtime entities",
-                ))
+                ));
             }
         };
         if world.get_component::<Workspace>(workspace).unwrap().state != WorkspaceState::Running {
@@ -410,7 +410,7 @@ fn prepare_definition(
         std::fs::create_dir_all(&directory).map_err(invalid)?;
         reject_symlinks(&directory)?;
         let database_path = directory.join("state.sqlite");
-        let settings_path = directory.join("settings.toml");
+        let settings_path = directory.join("setting.toml");
         for path in [&database_path, &settings_path] {
             reject_symlinks(path)?;
             if path.exists() && !path.is_file() {

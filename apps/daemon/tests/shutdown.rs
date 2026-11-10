@@ -144,7 +144,7 @@ fn fixture(home: &Path, address: std::net::SocketAddr) -> PathBuf {
     );
     write(
         &root,
-        "agent-drivers/local/shutdown/latest/settings.toml",
+        "agent-drivers/local/shutdown/latest/setting.toml",
         "",
     );
     write(

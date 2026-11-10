@@ -515,7 +515,6 @@ fn tool_result_images_keep_each_formats_native_or_deferred_layout() {
         request.messages.push(InferenceMessage::Assistant {
             content: None,
             reasoning: None,
-            replay: None,
             tool_calls: vec![InferenceToolCall {
                 id: "call".into(),
                 name: "echo".into(),
@@ -812,7 +811,7 @@ fn missing_or_mismatched_driver_vm_is_rejected_before_http_submission() {
     );
 }
 
-fn historical_reasoning_fixture(replay: Option<Value>) -> Vec<InferenceMessage> {
+fn historical_reasoning_fixture() -> Vec<InferenceMessage> {
     vec![
         InferenceMessage::User {
             content: "previous question".into(),
@@ -826,7 +825,6 @@ fn historical_reasoning_fixture(replay: Option<Value>) -> Vec<InferenceMessage> 
                 name: "visible".into(),
                 arguments: json!({}),
             }],
-            replay,
         },
         InferenceMessage::Tool {
             call_id: "prior-call".into(),
@@ -843,8 +841,6 @@ fn historical_reasoning_fixture(replay: Option<Value>) -> Vec<InferenceMessage> 
 
 #[test]
 fn historical_reasoning_is_format_adapted_without_rewriting_local_messages() {
-    let messages_replay = json!({"api_format":"messages","items":[{"type":"thinking","thinking":"signed historical text","signature":"saved-signature"}]});
-    let responses_replay = json!({"api_format":"responses","items":[{"type":"reasoning","id":"saved-reasoning","summary":[],"encrypted_content":"saved-encrypted"}]});
     for (provider, format) in [
         ("openai", "chat_completions"),
         ("openai", "responses"),
@@ -857,22 +853,15 @@ fn historical_reasoning_is_format_adapted_without_rewriting_local_messages() {
         let server = HttpServer::new(trace(format));
         let mut fixture = Fixture::new(&server.url, provider, format);
         fixture.tool("historical visible tool");
-        for (index, replay) in [
-            None,
-            Some(messages_replay.clone()),
-            Some(responses_replay.clone()),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let messages = historical_reasoning_fixture(replay.clone());
+        for index in 0..3 {
+            let messages = historical_reasoning_fixture();
             let snapshot = messages.clone();
             let (mut request, reply) = fixture.request(&format!("history-{index}"));
             request.messages = messages.clone();
 
             let response = fixture
                 .run(request, reply)
-                .unwrap_or_else(|e| panic!("{provider}/{format} {replay:?}: {e}"));
+                .unwrap_or_else(|e| panic!("{provider}/{format}: {e}"));
             assert_eq!(response.content.as_deref(), Some("ok"));
             fixture.idle();
             let (_, _, body) = server
@@ -885,18 +874,8 @@ fn historical_reasoning_is_format_adapted_without_rewriting_local_messages() {
             assert!(encoded.contains("prior-call"), "{body}");
             assert!(encoded.contains("continue"), "{body}");
             assert_eq!(messages, snapshot);
-            if format == "messages" && index == 1 {
-                assert!(encoded.contains("saved-signature"));
-                assert!(encoded.contains("signed historical text"));
-            } else {
-                assert!(!encoded.contains("saved-signature"));
-            }
-            if format == "responses" && index == 2 {
-                assert!(encoded.contains("saved-encrypted"));
-                assert!(encoded.contains("saved-reasoning"));
-            } else {
-                assert!(!encoded.contains("saved-encrypted"));
-            }
+            assert!(!encoded.contains("signature"));
+            assert!(!encoded.contains("encrypted_content"));
             if format != "chat_completions" || provider == "openai" {
                 assert!(!encoded.contains("local historical reasoning stays intact"));
             } else {
@@ -907,34 +886,7 @@ fn historical_reasoning_is_format_adapted_without_rewriting_local_messages() {
 }
 
 #[test]
-fn malformed_reasoning_replay_fails_before_http_instead_of_silently_disappearing() {
-    for (format, replay) in [
-        (
-            "messages",
-            json!({"api_format":"messages","items":[{"type":"thinking","thinking":"missing signature"}]}),
-        ),
-        (
-            "responses",
-            json!({"api_format":"responses","items":[{"type":"reasoning","summary":[]}]}),
-        ),
-        ("responses", json!({"api_format":"unknown","items":[]})),
-    ] {
-        let server = HttpServer::new(trace(format));
-        let mut fixture = Fixture::new(&server.url, "deepseek", format);
-        fixture.tool("visible");
-        let (mut request, reply) = fixture.request("invalid-replay");
-        request.messages = historical_reasoning_fixture(Some(replay));
-
-        assert_eq!(
-            fixture.run(request, reply).unwrap_err().kind,
-            Kind::InvalidParameters
-        );
-        assert!(server.received.try_recv().is_err());
-    }
-}
-
-#[test]
-fn new_response_reasoning_metadata_survives_a_complete_second_http_round() {
+fn new_response_reasoning_remains_generic_across_storage_and_api_switches() {
     for (provider, format, events, marker) in [
         (
             "anthropic",
@@ -977,17 +929,16 @@ fn new_response_reasoning_metadata_survives_a_complete_second_http_round() {
         let result = first.run(request, reply).unwrap();
         first.idle();
         assert_eq!(result.reasoning.as_deref(), Some("thought"));
-        assert!(result.replay.as_ref().unwrap().to_string().contains(marker));
+        assert!(!serde_json::to_string(&result).unwrap().contains(marker));
         let original = InferenceMessage::Assistant {
             reasoning: result.reasoning,
             content: result.content,
             tool_calls: result.tool_calls,
-            replay: result.replay,
         };
         let serialized = serde_json::to_string(&original).unwrap();
         let storage_root = tempfile::tempdir().unwrap();
         let storage = storage_core::open_storage(
-            &storage_root.path().join("replay.sqlite"),
+            &storage_root.path().join("messages.sqlite"),
             &storage_root.path().join("settings.toml"),
             "",
         )
@@ -1024,7 +975,7 @@ fn new_response_reasoning_metadata_survives_a_complete_second_http_round() {
             },
         )
         .unwrap() else {
-            panic!("stored replay")
+            panic!("stored message")
         };
         let restored: InferenceMessage = serde_json::from_value(stored[0].clone()).unwrap();
         assert_eq!(original, restored);
@@ -1050,7 +1001,8 @@ fn new_response_reasoning_metadata_survives_a_complete_second_http_round() {
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap();
             assert!(body.to_string().contains("answer"));
-            assert_eq!(body.to_string().contains(marker), target == format);
+            assert!(!body.to_string().contains(marker));
+            assert!(!body.to_string().contains("thought"));
             assert_eq!(serde_json::to_string(&original).unwrap(), serialized);
         }
     }

@@ -76,15 +76,17 @@ AgentStateDto
 
 ```text
 AgentMessageDto
+    所有variant包含sequence:Option<u64>--已落历史为真实序号；未落历史缺省不序列化，不伪造或按下标生成
     System {content:String}
     Inject {messages:Vec<AgentMessageDto>}
-    User {content:String,images:Vec<UserImageDto>}
-    Assistant {reasoning:Option<String>,content:Option<String>,
-               replay:Option<Value>,tool_calls:Vec<ToolCallDto>,
-               usage:Option<TokenUsageDto>,stop_reason:Option<StopReasonDto>}
-    ToolCall {tool_call_id,tool_name,
-              content:String,images:Vec<UserImageDto>,failed:bool}
+    User {content:String,images:Vec<UserImageDto>}--images序列化字段名为data
+    Assistant {request_id:Option<String>,reasoning:Option<String>,content:Option<String>,
+               tool_calls:Vec<ToolCallDto>,usage:Option<TokenUsageDto>,stop_reason:Option<StopReasonDto>}
+    ToolCall {tool_call_id,tool_name,content:String,images:Vec<UserImageDto>,failed:bool}--images序列化字段名为data
     Error {message:String}
+UserImageDto
+    media_type: String
+    data: String--标准base64媒体内容；消息data数组包含这些对象
 MclCommandDto
     workspace/agent/command/arguments；id只在外层信封
 MclCommandResultDto

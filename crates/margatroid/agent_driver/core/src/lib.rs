@@ -26,7 +26,7 @@ pub fn read_driver(
     validate_manifest(&manifest)?;
     let origin = directory.join("base.lua");
     let program = read_text(&origin, limits.program_bytes)?;
-    let default_settings = read_text(&directory.join("settings.toml"), limits.settings_bytes)?;
+    let default_settings = read_text(&directory.join("setting.toml"), limits.settings_bytes)?;
     toml::from_str::<toml::Table>(&default_settings)
         .map_err(|_| AgentDriverError::InvalidDefaultSettings)?;
     Ok(AgentDriverInput {

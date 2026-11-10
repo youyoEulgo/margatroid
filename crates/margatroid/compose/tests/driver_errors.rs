@@ -31,6 +31,8 @@ struct Commands {
     working: bool,
     finished: usize,
     malformed_config: bool,
+    conversation: Vec<Value>,
+    snapshots: Vec<Vec<Value>>,
 }
 
 // Run the shipped drivers in a real Workspace Lua VM. The command responder is
@@ -102,6 +104,16 @@ impl Fixture {
                     } else {
                         MclValue::Config(toml::from_str("sandbox='read_only'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n").unwrap())
                     }
+                } else if text == "GET session.conversation" {
+                    MclValue::Array(MessageArray::Message(state.conversation.clone()))
+                } else if text == "EFFECT block_snapshot ?" {
+                    assert_eq!(request.instruction.arguments, vec![json!("session")]);
+                    let saved = state.conversation.clone();
+                    state.snapshots.push(saved);
+                    MclValue::Unit
+                } else if text == "INJECT ? TO session.conversation" {
+                    state.conversation = request.instruction.arguments[0].as_array().unwrap().clone();
+                    MclValue::Unit
                 } else if text == "GET entry.pending[0]" {
                     MclValue::Array(MessageArray::Message(state.pending.front().cloned().into_iter().collect()))
                 } else if text == "INJECT [] TO entry.pending[0,1]" {
@@ -111,8 +123,15 @@ impl Fixture {
                     state.pending.extend(request.instruction.arguments[0].as_array().unwrap().iter().cloned());
                     MclValue::Unit
                 } else if text == "EFFECT history_append ?" {
-                    state.history.extend(request.instruction.arguments[0].as_array().unwrap().iter().cloned());
-                    MclValue::Unit
+                    let mut recorded = Vec::new();
+                    for mut message in request.instruction.arguments[0].as_array().unwrap().iter().cloned() {
+                        if message.get("sequence").is_none() {
+                            message["sequence"] = json!(state.history.len() + 1);
+                            state.history.push(message.clone());
+                        }
+                        recorded.push(message);
+                    }
+                    MclValue::Array(MessageArray::Message(recorded))
                 } else if text.starts_with("EFFECT inference ") {
                     MclValue::Inference {message:json!({"type":"assistant", "content":"done", "stop_reason":"completed"}), stop_reason:"completed".into()}
                 } else if text == "EFFECT start_turn" {
@@ -463,6 +482,81 @@ async fn recovery_command_failures_are_bounded_and_cleanup_retries_on_next_wake(
                 })
                 .await;
             assert!(fixture.exits.lock().unwrap().is_empty());
+            fixture.close(Some(instance)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn compaction_snapshots_before_replacement_and_preserves_context_on_snapshot_failure() {
+    for source in [CODER, REVIEWER] {
+        for (tokens, fail_snapshot) in [(4000, false), (4000, true), (0, false)] {
+            let mut fixture = Fixture::new();
+            let original = vec![
+                json!({"type":"user","content":"old question"}),
+                json!({"type":"assistant","content":"old answer"}),
+                json!({"type":"user","content":"recent question"}),
+                json!({"type":"assistant","content":"recent answer"}),
+            ];
+            {
+                let mut state = fixture.commands.lock().unwrap();
+                state.conversation = original.clone();
+                if fail_snapshot {
+                    state.fail = Some("EFFECT block_snapshot ?".into());
+                }
+            }
+            let prefix = source
+                .split("local initialized, initialization_error")
+                .next()
+                .unwrap();
+            let program = format!(
+                r#"{prefix}
+local ok = pcall(maybe_compact_context, {{usage = {{input_tokens = {tokens}, output_tokens = 0}}}})
+local marker = {{type = "user", content = ok and "probe-ok" or "probe-failed"}}
+command("EFFECT history_append ?", {{{{marker}}}})
+command("EFFECT ready")
+margatroid.driver:wait()
+"#
+            );
+            let instance = fixture.start(&program).await.unwrap();
+            {
+                let state = fixture.commands.lock().unwrap();
+                let expected = if fail_snapshot {
+                    "probe-failed"
+                } else {
+                    "probe-ok"
+                };
+                assert_eq!(state.history.last().unwrap()["content"], expected);
+                if tokens == 0 || fail_snapshot {
+                    assert_eq!(state.conversation, original);
+                    assert!(state.snapshots.is_empty());
+                    assert!(
+                        !state
+                            .calls
+                            .iter()
+                            .any(|c| c == "INJECT ? TO session.conversation")
+                    );
+                } else {
+                    assert_eq!(state.snapshots, vec![original.clone()]);
+                    assert_eq!(state.conversation.len(), 3);
+                    assert_eq!(
+                        state.conversation[0]["content"],
+                        "Conversation checkpoint:\ndone"
+                    );
+                    assert_eq!(state.conversation[1..], original[2..]);
+                    let snap = state
+                        .calls
+                        .iter()
+                        .position(|c| c == "EFFECT block_snapshot ?")
+                        .unwrap();
+                    let replace = state
+                        .calls
+                        .iter()
+                        .position(|c| c == "INJECT ? TO session.conversation")
+                        .unwrap();
+                    assert!(snap < replace);
+                }
+            }
             fixture.close(Some(instance)).await;
         }
     }
