@@ -82,7 +82,6 @@ pub(crate) enum ProviderFragment {
         name: Option<String>,
         arguments: String,
     },
-    Replay(Value),
     Usage(InferenceUsage),
     Finished(InferenceStopReason),
 }
@@ -92,8 +91,6 @@ pub(crate) struct ResponseAccumulator {
     pub content: String,
     pub reasoning: String,
     pub calls: BTreeMap<usize, CallBuilder>,
-    pub replay: BTreeMap<usize, Value>,
-    pub replay_format: Option<String>,
     pub usage: Option<InferenceUsage>,
     pub reason: Option<InferenceStopReason>,
     pub bytes: usize,
@@ -130,7 +127,6 @@ pub(crate) struct BlockState {
     pub reasoning: Sha256,
     pub arguments: Sha256,
     pub has_arguments: bool,
-    pub encrypted: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -327,55 +323,6 @@ fn user_content(content: String, images: Vec<InferenceImage>, format: ApiFormat)
     json!(parts)
 }
 
-fn replay_items(replay: Option<Value>, format: ApiFormat) -> Result<Vec<Value>> {
-    let Some(replay) = replay else {
-        return Ok(Vec::new());
-    };
-    let source: ApiFormat = serde_json::from_value(replay["api_format"].clone())
-        .map_err(|_| invalid("unknown historical reasoning replay API format"))?;
-    let items = strict_replay_items(&replay, source)?;
-    if source != format {
-        return Ok(Vec::new());
-    }
-    Ok(items)
-}
-
-fn strict_replay_items(replay: &Value, format: ApiFormat) -> Result<Vec<Value>> {
-    if replay["api_format"] != format.as_str() {
-        return Err(invalid("reasoning replay API format mismatch"));
-    }
-    let items = replay["items"]
-        .as_array()
-        .filter(|items| !items.is_empty())
-        .ok_or_else(|| invalid("invalid reasoning replay items"))?;
-    for item in items {
-        let valid = match format {
-            ApiFormat::Messages => match item["type"].as_str() {
-                Some("thinking") => {
-                    item["thinking"].is_string()
-                        && item["signature"].as_str().is_some_and(|s| !s.is_empty())
-                }
-                Some("redacted_thinking") => item["data"].as_str().is_some_and(|s| !s.is_empty()),
-                _ => false,
-            },
-            ApiFormat::Responses => {
-                item["type"] == "reasoning"
-                    && item["id"].as_str().is_some_and(|s| !s.is_empty())
-                    && item["summary"].is_array()
-                    && item.get("content").is_none_or(Value::is_array)
-                    && item
-                        .get("encrypted_content")
-                        .is_none_or(|v| v.is_null() || v.is_string())
-            }
-            ApiFormat::ChatCompletions => false,
-        };
-        if !valid {
-            return Err(invalid("invalid reasoning replay item"));
-        }
-    }
-    Ok(items.clone())
-}
-
 #[derive(Clone, Copy)]
 pub(crate) enum ChatReasoning {
     Omit,
@@ -418,17 +365,17 @@ impl TryFrom<EncodeInput> for ChatCompletionsRequest {
                 }
                 InferenceMessage::Assistant {
                     reasoning,
-                    replay,
                     content,
                     tool_calls,
                     ..
                 } => {
-                    replay_items(replay, ApiFormat::ChatCompletions)?;
                     if matches!(chat_reasoning, ChatReasoning::Omit)
                         && content.as_ref().is_none_or(String::is_empty)
                         && tool_calls.is_empty()
                     {
-                        continue;
+                        return Err(invalid(
+                            "Chat Completions cannot encode reasoning-only assistant history",
+                        ));
                     }
                     pending.extend(tool_calls.iter().map(|call| call.id.clone()));
                     let mut value = json!({"role":"assistant","content":content});
@@ -520,12 +467,11 @@ impl TryFrom<DomainRequest> for MessagesRequest {
                         .clone(),
                 ),
                 InferenceMessage::Assistant {
-                    replay,
                     content,
                     tool_calls,
                     ..
                 } => {
-                    let mut blocks = replay_items(replay, ApiFormat::Messages)?;
+                    let mut blocks = Vec::new();
                     if let Some(content) = content {
                         blocks.push(json!({"type":"text","text":content}));
                     }
@@ -533,7 +479,7 @@ impl TryFrom<DomainRequest> for MessagesRequest {
                         blocks.push(json!({"type":"tool_use","id":call.id,"name":call.name,"input":call.arguments}));
                     }
                     if blocks.is_empty() {
-                        continue;
+                        return Err(invalid("Messages cannot encode reasoning-only assistant history without fabricating signed thinking"));
                     }
                     merge_message(&mut messages, "assistant", blocks);
                 }
@@ -573,12 +519,13 @@ impl TryFrom<DomainRequest> for ResponsesRequest {
                     input.push(json!({"role":"user","content":user_content(content, images, ApiFormat::Responses)}))
                 }
                 InferenceMessage::Assistant {
-                    replay,
                     content,
                     tool_calls,
                     ..
                 } => {
-                    input.extend(replay_items(replay, ApiFormat::Responses)?);
+                    if content.as_ref().is_none_or(String::is_empty) && tool_calls.is_empty() {
+                        return Err(invalid("Responses cannot encode reasoning-only assistant history without opaque reasoning items"));
+                    }
                     if let Some(content) = content {
                         input.push(json!({"role":"assistant","content":[{"type":"output_text","text":content}]}));
                     }
@@ -596,7 +543,7 @@ impl TryFrom<DomainRequest> for ResponsesRequest {
                 ),
             }
         }
-        Ok(Self { model:request.config.model,input,tools:request.tools.into_iter().map(|tool| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.input_schema,"strict":false})).collect(),stream:true,store:false,include:vec!["reasoning.encrypted_content".into()],temperature:request.config.temperature,max_output_tokens:request.config.max_output_tokens,top_p:request.config.top_p })
+        Ok(Self { model:request.config.model,input,tools:request.tools.into_iter().map(|tool| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.input_schema,"strict":false})).collect(),stream:true,store:false,include:vec![],temperature:request.config.temperature,max_output_tokens:request.config.max_output_tokens,top_p:request.config.top_p })
     }
 }
 
@@ -1075,13 +1022,11 @@ pub(crate) fn normalize(request: &mut DomainRequest) -> Result<()> {
                 content,
                 reasoning,
                 tool_calls,
-                replay,
             } => {
                 if !pending.is_empty()
                     || (content.as_ref().is_none_or(String::is_empty)
                         && reasoning.as_ref().is_none_or(String::is_empty)
-                        && tool_calls.is_empty()
-                        && replay.is_none())
+                        && tool_calls.is_empty())
                 {
                     return Err(InferenceError::new(
                         InferenceErrorKind::InvalidMessages,
@@ -1227,9 +1172,6 @@ impl ResponseAccumulator {
                 .map_or(0, String::len)
                 .saturating_add(name.as_ref().map_or(0, String::len))
                 .saturating_add(arguments.len()),
-            ProviderFragment::Replay(value) => serde_json::to_vec(value)
-                .map_err(|_| decode("invalid replay value"))?
-                .len(),
             _ => 0,
         };
         self.bytes = self
@@ -1276,44 +1218,6 @@ impl ResponseAccumulator {
                         InferenceErrorKind::ResponseTooLarge,
                         "tool call exceeds budget",
                     ));
-                }
-                Ok(None)
-            }
-            ProviderFragment::Replay(value) => {
-                let format = value["api_format"]
-                    .as_str()
-                    .ok_or_else(|| decode("replay format missing"))?;
-                if self
-                    .replay_format
-                    .as_deref()
-                    .is_some_and(|current| current != format)
-                {
-                    return Err(decode("replay format changed"));
-                }
-                self.replay_format = Some(format.to_owned());
-                let index = event_index(&value, "index")?;
-                match value["op"].as_str() {
-                    Some("start") | Some("replace") => {
-                        self.replay.insert(index, value["item"].clone());
-                    }
-                    Some("thinking_delta") | Some("signature_delta") => {
-                        let field = if value["op"] == "thinking_delta" {
-                            "thinking"
-                        } else {
-                            "signature"
-                        };
-                        let item = self
-                            .replay
-                            .get_mut(&index)
-                            .ok_or_else(|| decode("replay delta before start"))?;
-                        let mut text = item[field]
-                            .as_str()
-                            .ok_or_else(|| decode("invalid replay text"))?
-                            .to_owned();
-                        text.push_str(event_string(&value, "value")?);
-                        item[field] = json!(text);
-                    }
-                    _ => return Err(decode("unknown replay operation")),
                 }
                 Ok(None)
             }
@@ -1376,32 +1280,10 @@ impl ResponseAccumulator {
         {
             return Err(incomplete("response has no content or tool calls"));
         }
-        let replay = if self.replay.is_empty() {
-            None
-        } else {
-            Some(
-                json!({"api_format":self.replay_format,"items":self.replay.values().collect::<Vec<_>>()}),
-            )
-        };
-        if let Some(format) = &self.replay_format {
-            let format = match format.as_str() {
-                "messages" => ApiFormat::Messages,
-                "responses" => ApiFormat::Responses,
-                _ => return Err(decode("invalid replay format")),
-            };
-            strict_replay_items(
-                replay
-                    .as_ref()
-                    .ok_or_else(|| decode("response reasoning replay is missing"))?,
-                format,
-            )
-            .map_err(|_| decode("response reasoning replay is incomplete"))?;
-        }
         Ok(InferenceResponse {
             content: (!self.content.is_empty()).then(|| self.content.clone()),
             reasoning: (!self.reasoning.is_empty()).then(|| self.reasoning.clone()),
             tool_calls: calls,
-            replay,
             usage: self.usage.clone(),
             stop_reason: reason,
         })
@@ -1807,19 +1689,34 @@ impl FormatDecoder {
                 };
                 let mut output = Vec::new();
                 match kind.as_str() {
-                    "text" => output.push(ProviderFragment::Content(event_string(block, "text")?.to_owned())),
+                    "text" => output.push(ProviderFragment::Content(
+                        event_string(block, "text")?.to_owned(),
+                    )),
                     "thinking" => {
                         let thinking = event_string(block, "thinking")?;
                         output.push(ProviderFragment::Reasoning(thinking.to_owned()));
-                        output.push(ProviderFragment::Replay(json!({"api_format":"messages","index":index,"op":"start","item":{"type":"thinking","thinking":thinking,"signature":block.get("signature").and_then(Value::as_str).unwrap_or("")}})));
                     }
-                    "redacted_thinking" => output.push(ProviderFragment::Replay(json!({"api_format":"messages","index":index,"op":"start","item":{"type":"redacted_thinking","data":event_string(block,"data")?}}))),
+                    "redacted_thinking" => {
+                        event_string(block, "data")?;
+                    }
                     "tool_use" => {
                         state.id = event_string(block, "id")?.to_owned();
                         state.name = event_string(block, "name")?.to_owned();
-                        if !block["input"].is_object() { return Err(decode("invalid Messages tool input")); }
-                        let arguments = if block["input"] == json!({}) { String::new() } else { state.has_arguments = true; block["input"].to_string() };
-                        output.push(ProviderFragment::ToolCallDelta { index, id: Some(state.id.clone()), name: Some(state.name.clone()), arguments });
+                        if !block["input"].is_object() {
+                            return Err(decode("invalid Messages tool input"));
+                        }
+                        let arguments = if block["input"] == json!({}) {
+                            String::new()
+                        } else {
+                            state.has_arguments = true;
+                            block["input"].to_string()
+                        };
+                        output.push(ProviderFragment::ToolCallDelta {
+                            index,
+                            id: Some(state.id.clone()),
+                            name: Some(state.name.clone()),
+                            arguments,
+                        });
                     }
                     _ => return Err(decode("unsupported Messages block")),
                 }
@@ -1844,16 +1741,12 @@ impl FormatDecoder {
                     )]),
                     ("thinking_delta", "thinking") => {
                         let text = event_string(delta, "thinking")?;
-                        Ok(vec![
-                            ProviderFragment::Reasoning(text.to_owned()),
-                            ProviderFragment::Replay(
-                                json!({"api_format":"messages","index":index,"op":"thinking_delta","value":text}),
-                            ),
-                        ])
+                        Ok(vec![ProviderFragment::Reasoning(text.to_owned())])
                     }
-                    ("signature_delta", "thinking") => Ok(vec![ProviderFragment::Replay(
-                        json!({"api_format":"messages","index":index,"op":"signature_delta","value":event_string(delta,"signature")?}),
-                    )]),
+                    ("signature_delta", "thinking") => {
+                        event_string(delta, "signature")?;
+                        Ok(vec![])
+                    }
                     ("input_json_delta", "tool_use") => {
                         state.has_arguments = true;
                         Ok(vec![ProviderFragment::ToolCallDelta {
@@ -1944,7 +1837,6 @@ impl FormatDecoder {
                 let mut output = Vec::new();
                 if kind == "reasoning" {
                     state.id = event_string(item, "id")?.to_owned();
-                    state.encrypted = item.get("encrypted_content").cloned();
                 }
                 if kind == "function_call" {
                     state.id = event_string(item, "call_id")?.to_owned();
@@ -2075,22 +1967,8 @@ impl FormatDecoder {
                     }
                 }
                 block.closed = true;
-                if block.kind == "reasoning" {
-                    if item["id"] != block.id {
-                        return Err(decode("reasoning item identity changed"));
-                    }
-                    let mut replay = json!({"type":"reasoning","id":block.id,"summary":item.get("summary").cloned().unwrap_or_else(|| json!([]))});
-                    if let Some(content) = item.get("content") {
-                        replay["content"] = content.clone();
-                    }
-                    if let Some(encrypted) =
-                        item.get("encrypted_content").or(block.encrypted.as_ref())
-                    {
-                        replay["encrypted_content"] = encrypted.clone();
-                    }
-                    return Ok(vec![ProviderFragment::Replay(
-                        json!({"api_format":"responses","index":index,"op":"replace","item":replay}),
-                    )]);
+                if block.kind == "reasoning" && item["id"] != block.id {
+                    return Err(decode("reasoning item identity changed"));
                 }
                 Ok(vec![])
             }

@@ -180,7 +180,7 @@ pub enum InferenceMessage {
     },
     User {
         content: String,
-        #[serde(default)]
+        #[serde(default, rename = "data")]
         images: Vec<InferenceImage>,
     },
     Assistant {
@@ -188,12 +188,11 @@ pub enum InferenceMessage {
         content: Option<String>,
         #[serde(default)]
         tool_calls: Vec<InferenceToolCall>,
-        replay: Option<Value>,
     },
     Tool {
         call_id: String,
         content: String,
-        #[serde(default)]
+        #[serde(default, rename = "data")]
         images: Vec<InferenceImage>,
         #[serde(default)]
         failed: bool,
@@ -227,7 +226,6 @@ pub struct InferenceResponse {
     pub reasoning: Option<String>,
     pub content: Option<String>,
     pub tool_calls: Vec<InferenceToolCall>,
-    pub replay: Option<Value>,
     pub usage: Option<InferenceUsage>,
     pub stop_reason: InferenceStopReason,
 }
@@ -237,7 +235,6 @@ impl InferenceResponse {
             reasoning: None,
             content: None,
             tool_calls: vec![],
-            replay: None,
             usage: None,
             stop_reason: InferenceStopReason::Completed,
         }

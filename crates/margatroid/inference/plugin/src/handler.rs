@@ -496,7 +496,6 @@ fn frozen_response(gate: &Arc<Mutex<StreamGate>>) -> InferenceResponse {
         reasoning: (!gate.accumulator.reasoning.is_empty())
             .then(|| gate.accumulator.reasoning.clone()),
         tool_calls: vec![],
-        replay: None,
         usage: None,
         stop_reason: InferenceStopReason::Completed,
     }

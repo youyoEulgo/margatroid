@@ -4,7 +4,7 @@ mcl_core定义语法树、队列、请求和结果，只依赖mecs及通用库�
 
 本文同步本轮实现契约，不表示运行中的daemon已更新。IMPORT TOOL只向Agent的唯一Tools集合增加alias、description、input_schema和path记录，不维护选择名单。inference与tool_call使用当前Tools，各只接收一个消息数组输入；tool_call要求数组恰含一条Assistant。tool_inject、原始进程通信和MCP协议由通用工具宿主及工具侧处理，MCL使用现有指令执行领域调用。
 
-## Block快照指令（待实现）
+## Block快照指令
 
 ```text
 EFFECT block_snapshot ?
@@ -46,19 +46,19 @@ EFFECT ready
 EFFECT wake
 ```
 
-Lua调用为mcl(target_entity, text, arguments)，arguments按顺序对应问号。来源及本次VM实例由lua_runtime_plugin中的mcl宿主绑定，不接受调用者伪造source。宿主只依赖mcl_core发送MclCommand并等待reply；唯一执行入口MclCommand要求调用方显式提供source_address，网络入口及Lua宿主传入自身真实地址，与source实体身份核对，MCL审计source保存该地址而非Entity编号；history_append消息按payload.type保存type，不保存调用来源；mcl_plugin不定义Lua函数。消息参数要求完整消息数组；marker形式分别为EFFECT inference ?和EFFECT tool_call ?，只占一个参数，不接受第二个工具alias数组。配置路径和值分别占一个参数。
+Lua调用为mcl(target_entity, text, arguments)，arguments按顺序对应问号。来源及本次VM实例由lua_runtime_plugin中的mcl宿主绑定，不接受调用者伪造source。宿主只依赖mcl_core发送MclCommand并等待reply；唯一执行入口MclCommand要求调用方显式提供source_address，网络入口及Lua宿主传入自身真实地址，与source实体身份核对，MCL审计source保存该地址而非Entity编号；history_append按消息type映射role及规范内容列，不保存调用来源，返回带真实sequence的完整消息；mcl_plugin不定义Lua函数。消息参数要求完整消息数组；marker形式分别为EFFECT inference ?和EFFECT tool_call ?，只占一个参数，不接受第二个工具alias数组。配置路径和值分别占一个参数。
 
 ## 消息Block
 
-Block字段只保存消息数组，创建时不写类型。普通Block存于Agent SQLite，TEMP按VM实例隔离。CREATE不存在则创建，存在且字段一致则打开，不清空内容；不返回created标志。
+Block字段只保存消息数组，创建时不写类型。普通Block存于固定timeline SQLite文件，TEMP及其快照只在内存中按VM实例隔离；持久子项各占一张表，消息按sequence/role/content/data/tool_call/payload逐行保存。CREATE不存在则创建，存在且字段一致则打开，不清空内容；不返回created标志。
 
 GET返回.Array.Message，单索引也返回数组。索引从0开始，-1为末项；非负范围左闭右开，负范围左开右闭，端点同号。多来源按书写顺序拼接，Prompt alias每次按路径读取。工具和沙箱alias不作为消息GET来源。
 
-INJECT无目标索引时整体替换；单索引插入，非负插到元素前、负索引插到元素后；范围执行替换。空数组清空字段或删除选定范围。所有数据库来源和目标在同一事务中读取、校验并修改，失败保留原值。已提交操作不因稍后取消而伪称回滚。
+INJECT无目标索引时整体替换；单索引插入，非负插到元素前、负索引插到元素后；范围执行替换。空数组清空字段或删除选定范围。存储层固定来源视图后读取全部来源，再在目标Block文件单事务中校验及修改；跨Block不承诺单个SQL事务，失败保留目标原值。已提交操作不因稍后取消而伪称回滚。
 
 ## 设置
 
-CONFIG GET返回.Config，读取当前Agent完整settings.toml。CONFIG SET ? ?传入点分路径及TOML值，没有键则新增，存在则整体替换，不追加或合并。CONFIG DELETE ?传入点分路径，删除指定键，不自动删除空父table。
+CONFIG GET返回.Config，读取当前Agent完整setting.toml。CONFIG SET ? ?传入点分路径及TOML值，没有键则新增，存在则整体替换，不追加或合并。CONFIG DELETE ?传入点分路径，删除指定键，不自动删除空父table。
 
 SET创建缺失的中间table；中间节点是非table时返回错误。DELETE目标不存在视为无修改成功。键路径不支持数组索引，不用nil或空数组表示删除；TOML不支持的值报错。日期时间等TOML值由宿主桥接明确转换，不把普通字符串猜成日期。
 
@@ -73,13 +73,16 @@ IMPORT校验种类、依赖和alias后，在对应资源领域登记；TOOL保�
 | inference | 消息数组（单输入） | .Inference.message、.Inference.stop_reason |
 | tool_call | 单条Assistant组成的消息数组（单输入） | .Array.Message |
 | sandbox_use | 零或一个沙箱alias组成的数组 | Unit |
-| history_append | 消息数组 | Unit |
+| history_append | 消息数组 | .Array.Message（带真实sequence） |
+| block_snapshot | Block逻辑名字符串 | Unit |
+| block_snapshots | Block逻辑名字符串 | .BlockSnapshots |
+| block_restore | Block逻辑名字符串、正整数快照ID | Unit |
 | start_turn | 无 | Unit |
 | finish_turn | 无 | Unit |
 | ready | 无 | Unit |
 | wake | 无 | Unit |
 
-inference和tool_call将请求交给所属领域并等待oneshot。tool_call先发出整批带独立oneshot的请求，再通过join_all收齐并保持输入顺序；保留原调用ID，每个工具调用错误均转换为failed工具消息，包括配置、参数、执行、超时、清理、任务panic、回复丢失和关联错误；不因单个失败丢失整批结果。无法解析出有效工具调用的命令错误与其他非工具错误，通过唯一回复出口转换为Error值，形状为{"Error":{"type":"error","message":"错误种类: 说明","request_id":"本次命令id"}}，不抛Lua宿主异常终止Driver。原始执行失败仍在MCL审计中记录succeeded=false。清理尚未证明时及时返回错误并保留后台监督，不将任务伪报completed或安全退出。sandbox_use选择alias，不保存长期策略正文；实际执行读取选定路径的策略。history_append显式保存消息；其他操作不自动追加消息历史。指令审计与消息历史分别记录，不把审计参数投影成重复消息。两类历史以Agent内sequence标识并排序，不设历史key；content由调用方提供并与payload独立原样存取。
+inference和tool_call将请求交给所属领域并等待oneshot。tool_call先发出整批带独立oneshot的请求，再通过join_all收齐并保持输入顺序；保留原调用ID，每个工具调用错误均转换为failed工具消息，包括配置、参数、执行、超时、清理、任务panic、回复丢失和关联错误；不因单个失败丢失整批结果。无法解析出有效工具调用的命令错误与其他非工具错误，通过唯一回复出口转换为Error值，形状为{"Error":{"type":"error","message":"错误种类: 说明","request_id":"本次命令id"}}，不抛Lua宿主异常终止Driver。原始执行失败仍在MCL审计中记录succeeded=false。清理尚未证明时及时返回错误并保留后台监督，不将任务伪报completed或安全退出。sandbox_use选择alias，不保存长期策略正文；实际执行读取选定路径的策略。history_append显式保存消息；其他操作不自动追加消息历史。指令审计与消息历史分别记录，不把审计参数投影成重复消息。两类历史以Agent内sequence标识并排序，不设历史key；消息按规范列拆装，payload仅保存剩余字段；带sequence的消息必须与实际历史记录一致，重复记录复用该序号。
 
 start_turn和finish_turn调用agent_core同步扩展；ready和wake调用lua_runtime_core扩展。ready只允许当前Driver对本人调用。wait是Lua宿主函数，不是MCL指令。上述调用由plugin组合，不让core之间互相依赖。
 

@@ -226,17 +226,15 @@ fn worker_appends_duplicate_payloads_with_distinct_sequences_and_original_conten
         StorageOperation::ReadHistoryEntries,
         CancellationToken::new(),
     );
-    assert_eq!(
-        wait(&mut app, &mut rx).unwrap(),
-        StorageValue::HistoryEntries(vec![
-            StoredHistoryRecord {
-                sequence: 1,
-                record: record.clone()
-            },
-            StoredHistoryRecord {
-                sequence: 2,
-                record
-            },
-        ])
-    );
+    let StorageValue::HistoryEntries(entries) = wait(&mut app, &mut rx).unwrap() else {
+        panic!()
+    };
+    assert_eq!(entries.len(), 2);
+    for (i, entry) in entries.iter().enumerate() {
+        let mut expected = record.clone();
+        expected.content = r#"{"content":"different payload content"}"#.into();
+        expected.payload["sequence"] = serde_json::json!(i + 1);
+        assert_eq!(entry.sequence, (i + 1) as u64);
+        assert_eq!(entry.record, expected);
+    }
 }

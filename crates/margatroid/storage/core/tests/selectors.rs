@@ -1,4 +1,3 @@
-use rusqlite::Connection;
 use serde_json::json;
 use storage_core::*;
 
@@ -10,7 +9,7 @@ fn mixed_message_sources_keep_literal_and_stored_order_without_losing_structure(
     create(&storage, "b", Some("current"));
     set(&storage, selector("a", None), 1);
     set(&storage, selector("b", Some("current")), 2);
-    let literal = json!({"role":"system","content":["prompt",{"metadata":[null,true]}]});
+    let literal = json!({"type":"system","content":"prompt","metadata":[null,true]});
     assert_eq!(
         execute_storage(
             &storage,
@@ -25,14 +24,19 @@ fn mixed_message_sources_keep_literal_and_stored_order_without_losing_structure(
             }
         )
         .unwrap(),
-        StorageValue::Messages(vec![json!(1), literal, json!(2), json!(1)])
+        StorageValue::Messages(vec![
+            message(json!(1)),
+            literal,
+            message(json!(2)),
+            message(json!(1))
+        ])
     );
     assert_eq!(
         execute_storage(
             &storage,
             StorageOperation::ReadMessageSources {
                 sources: vec![
-                    MessageSource::Literal(vec![json!("prefix")]),
+                    MessageSource::Literal(vec![message(json!("prefix"))]),
                     MessageSource::Stored(selector("missing", Some("current")))
                 ]
             }
@@ -51,7 +55,7 @@ fn mixed_message_sources_keep_literal_and_stored_order_without_losing_structure(
     );
 }
 #[test]
-fn mixed_literal_and_stored_sources_use_one_snapshot_during_external_writes() {
+fn mixed_literal_and_stored_sources_use_one_snapshot_during_concurrent_storage_writes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let storage = open_storage(&path, &dir.path().join("cfg"), "").unwrap();
@@ -59,18 +63,10 @@ fn mixed_literal_and_stored_sources_use_one_snapshot_during_external_writes() {
     create(&storage, "b", Some("current"));
     set(&storage, selector("a", None), 0);
     set(&storage, selector("b", Some("current")), 0);
-    let writer = Connection::open(path).unwrap();
-    writer
-        .busy_timeout(std::time::Duration::from_secs(5))
-        .unwrap();
+    let writer = storage.clone();
     let worker = std::thread::spawn(move || {
         for n in 1..100 {
-            writer
-                .execute(
-                    "UPDATE blocks SET fields_json=?1",
-                    [json!({"messages":[n]}).to_string()],
-                )
-                .unwrap();
+            set(&writer, selector("a", None), n);
         }
     });
     for _ in 0..100 {
@@ -79,7 +75,7 @@ fn mixed_literal_and_stored_sources_use_one_snapshot_during_external_writes() {
             StorageOperation::ReadMessageSources {
                 sources: vec![
                     MessageSource::Stored(selector("a", Some("current"))),
-                    MessageSource::Literal(vec![json!("prompt")]),
+                    MessageSource::Literal(vec![message(json!("prompt"))]),
                     MessageSource::Stored(selector("a", Some("current"))),
                 ],
             },
@@ -89,7 +85,7 @@ fn mixed_literal_and_stored_sources_use_one_snapshot_during_external_writes() {
         };
         assert_eq!(values.len(), 3);
         assert_eq!(values[0], values[2]);
-        assert_eq!(values[1], json!("prompt"));
+        assert_eq!(values[1], message(json!("prompt")));
     }
     worker.join().unwrap();
 }
@@ -117,7 +113,7 @@ fn set(storage: &AgentStorage, target: MessageSelector, value: i64) {
     execute_storage(
         storage,
         StorageOperation::ReplaceMessages {
-            sources: vec![MessageSource::Literal(vec![json!(value)])],
+            sources: vec![MessageSource::Literal(vec![message(json!(value))])],
             target,
         },
     )
@@ -146,7 +142,7 @@ fn current_vm_selector_falls_back_to_persistent_without_exposing_other_vm_tempor
             }
         )
         .unwrap(),
-        StorageValue::Messages(vec![json!(1), json!(2)])
+        StorageValue::Messages(vec![message(json!(1)), message(json!(2))])
     );
     assert_eq!(
         execute_storage(
@@ -189,7 +185,7 @@ fn current_vm_selector_falls_back_to_persistent_without_exposing_other_vm_tempor
             }
         )
         .unwrap(),
-        StorageValue::Messages(vec![json!(1), json!(2)])
+        StorageValue::Messages(vec![message(json!(1)), message(json!(2))])
     );
     let before = execute_storage(
         &storage,
@@ -225,7 +221,7 @@ fn current_vm_selector_falls_back_to_persistent_without_exposing_other_vm_tempor
     );
 }
 #[test]
-fn persistent_and_current_temp_selectors_share_one_snapshot_during_external_updates() {
+fn persistent_and_current_temp_selectors_share_one_snapshot_during_concurrent_storage_updates() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let storage = open_storage(&path, &dir.path().join("cfg"), "").unwrap();
@@ -233,18 +229,10 @@ fn persistent_and_current_temp_selectors_share_one_snapshot_during_external_upda
     create(&storage, "temp", Some("current-vm"));
     set(&storage, selector("persistent", None), 0);
     set(&storage, selector("temp", Some("current-vm")), 0);
-    let writer = Connection::open(path).unwrap();
-    writer
-        .busy_timeout(std::time::Duration::from_secs(5))
-        .unwrap();
+    let writer = storage.clone();
     let worker = std::thread::spawn(move || {
         for n in 1..100 {
-            writer
-                .execute(
-                    "UPDATE blocks SET fields_json=?1",
-                    [json!({"messages":[n]}).to_string()],
-                )
-                .unwrap();
+            set(&writer, selector("persistent", None), n);
         }
     });
     for _ in 0..100 {
@@ -263,7 +251,11 @@ fn persistent_and_current_temp_selectors_share_one_snapshot_during_external_upda
         };
         assert_eq!(values.len(), 3);
         assert_eq!(values[0], values[1]);
-        assert_eq!(values[2], json!(0));
+        assert_eq!(values[2], message(json!(0)));
     }
     worker.join().unwrap();
+}
+
+fn message(value: serde_json::Value) -> serde_json::Value {
+    json!({"type":"user","content":value.to_string()})
 }

@@ -212,7 +212,7 @@ fn validate_value(
             if inspect_images && values.contains_key("media_type") && values.contains_key("data") {
                 validate_image(value)?;
             }
-            if inspect_images && let Some(Value::Array(images)) = values.get("images") {
+            if inspect_images && let Some(Value::Array(images)) = values.get("data") {
                 if images.len() > 8 {
                     return Err(invalid("message has too many images"));
                 }

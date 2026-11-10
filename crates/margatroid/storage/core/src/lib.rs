@@ -1,6 +1,10 @@
+mod blocks;
 mod logs;
+mod messages;
 
+pub use blocks::{read_block_snapshots, restore_block, snapshot_block};
 pub use logs::{append_agent_log, read_agent_logs};
+pub use messages::append_message_history;
 pub mod components;
 pub mod error;
 pub mod events;
@@ -11,9 +15,9 @@ pub use error::{StorageError, StorageErrorKind};
 pub use events::{StorageReply, StorageRequest};
 pub use types::*;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -25,11 +29,9 @@ use std::{
 };
 use StorageErrorKind as K;
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 5;
 const AGENT_LOGS: &str = "CREATE TABLE agent_logs(sequence INTEGER PRIMARY KEY CHECK(sequence>0),created_at_ms INTEGER NOT NULL CHECK(typeof(created_at_ms)='integer' AND created_at_ms>=0),level TEXT NOT NULL CHECK(typeof(level)='text' AND level IN ('debug','info','warn','error')),source TEXT NOT NULL CHECK(typeof(source)='text' AND source IN ('driver','tool','host')),stage TEXT NOT NULL CHECK(typeof(stage)='text'),message TEXT NOT NULL CHECK(typeof(message)='text'),details_json TEXT CHECK(details_json IS NULL OR (typeof(details_json)='text' AND json_valid(details_json) AND json_type(details_json)='object')),context_json TEXT CHECK(context_json IS NULL OR (typeof(context_json)='text' AND json_valid(context_json) AND json_type(context_json)='object')),origin TEXT CHECK(origin IS NULL OR typeof(origin)='text'),raw_error TEXT CHECK(raw_error IS NULL OR typeof(raw_error)='text'),traceback TEXT CHECK(traceback IS NULL OR typeof(traceback)='text'));";
-const HISTORY: &str = "CREATE TABLE agent_messages(sequence INTEGER PRIMARY KEY,turn TEXT,type TEXT NOT NULL CHECK(length(type)>0),content TEXT NOT NULL,payload TEXT NOT NULL,created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0));CREATE TABLE mcl_records(sequence INTEGER PRIMARY KEY,source TEXT NOT NULL CHECK(length(source)>0),turn TEXT,content TEXT NOT NULL,payload TEXT NOT NULL,created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0));";
-const BLOCKS: &str = "CREATE TABLE blocks(name TEXT PRIMARY KEY NOT NULL CHECK(length(name)>0),fields_json TEXT NOT NULL CHECK(json_valid(fields_json) AND json_type(fields_json)='object'));";
-const TEMP_BLOCKS: &str = "CREATE TEMP TABLE blocks(name TEXT NOT NULL CHECK(length(name)>0),instance TEXT NOT NULL CHECK(length(instance)>0),fields_json TEXT NOT NULL CHECK(json_valid(fields_json) AND json_type(fields_json)='object'),PRIMARY KEY(name,instance));";
+const HISTORY: &str = "CREATE TABLE agent_messages(sequence INTEGER PRIMARY KEY CHECK(sequence>0),turn TEXT,role TEXT NOT NULL CHECK(length(role)>0),content TEXT NOT NULL,data TEXT,tool_call TEXT,payload TEXT NOT NULL CHECK(json_valid(payload) AND json_type(payload)='object'),created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0));CREATE TABLE mcl_records(sequence INTEGER PRIMARY KEY,source TEXT NOT NULL CHECK(length(source)>0),turn TEXT,content TEXT NOT NULL,payload TEXT NOT NULL,created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0));";
 
 fn err(kind: K, message: impl std::fmt::Display) -> StorageError {
     StorageError::new(kind, message)
@@ -125,9 +127,22 @@ pub fn open_storage(
             .map_err(write_err)?;
         initialize(&mut connection)?;
         let shared = Arc::new(types::DatabaseState {
+            block_root: {
+                let mut path = db_path.as_os_str().to_os_string();
+                path.push(".blocks");
+                PathBuf::from(path)
+            },
             connection: Mutex::new(connection),
             retired: AtomicBool::new(false),
+            temporary: Mutex::new(BTreeMap::new()),
         });
+        {
+            let db = shared
+                .connection
+                .lock()
+                .map_err(|_| err(K::Closed, "database lock poisoned"))?;
+            blocks::initialize(&db, &shared.block_root, &shared.retired)?;
+        }
         registry.insert(db_path, Arc::downgrade(&shared));
         shared
     };
@@ -164,6 +179,7 @@ pub fn open_storage(
 }
 
 fn initialize(db: &mut Connection) -> Result<(), StorageError> {
+    let mapping = blocks::SCHEMA;
     db.execute_batch("BEGIN IMMEDIATE").map_err(write_err)?;
     let outcome = (|| {
         let actual = schema(db)?;
@@ -172,22 +188,20 @@ fn initialize(db: &mut Connection) -> Result<(), StorageError> {
             .map_err(schema_err)?;
         if actual.is_empty() && version == 0 {
             db.execute_batch(&format!(
-                "{HISTORY}{BLOCKS}{AGENT_LOGS}PRAGMA user_version={SCHEMA_VERSION};"
+                "{HISTORY}{mapping}{AGENT_LOGS}PRAGMA user_version={SCHEMA_VERSION};"
             ))
             .map_err(write_err)?;
         } else if version != SCHEMA_VERSION
-            || actual != expected(&format!("{HISTORY}{BLOCKS}{AGENT_LOGS}"))?
+            || actual != expected(&format!("{HISTORY}{mapping}{AGENT_LOGS}"))?
         {
             return Err(schema_err(
-                "database does not match the current four-table schema (version 3)",
+                "database does not match the current four-table schema (version 5)",
             ));
         }
         Ok(())
     })();
     finish_transaction(db, &AtomicBool::new(false), outcome)?;
-    db.execute_batch("PRAGMA temp_store=MEMORY;")
-        .map_err(write_err)?;
-    db.execute_batch(TEMP_BLOCKS).map_err(write_err)?;
+
     Ok(())
 }
 
@@ -253,6 +267,20 @@ pub fn execute_storage(
     if storage.database.shared.retired.load(Ordering::Acquire) {
         return Err(err(K::CleanupFailed, "database connection retired"));
     }
+    if blocks::is_operation(&operation) {
+        return blocks::execute(
+            &connection,
+            &storage.database.shared.block_root,
+            &storage.database.shared.retired,
+            &mut *storage
+                .database
+                .shared
+                .temporary
+                .lock()
+                .map_err(|_| err(K::Closed, "TEMP lock poisoned"))?,
+            operation,
+        );
+    }
     let read_only = matches!(
         operation,
         StorageOperation::ReadMessages { .. }
@@ -271,63 +299,6 @@ pub fn execute_storage(
         .map_err(write_err)?;
     let outcome = database_operation(&connection, operation);
     finish_transaction(&connection, &storage.database.shared.retired, outcome)
-}
-fn namespace(instance: &Option<String>) -> Result<&str, StorageError> {
-    match instance {
-        Some(s) if s.is_empty() => Err(err(
-            K::InvalidRequest,
-            "temporary instance must not be empty",
-        )),
-        Some(s) => Ok(s),
-        None => Ok(""),
-    }
-}
-type BlockFields = BTreeMap<String, Vec<serde_json::Value>>;
-type ResolvedBlock = (bool, String, BlockFields);
-type BlockMessages = (ResolvedBlock, Vec<serde_json::Value>);
-fn block(
-    db: &Connection,
-    name: &str,
-    instance: &Option<String>,
-) -> Result<ResolvedBlock, StorageError> {
-    let ns = namespace(instance)?;
-    for (temporary, table, key) in [(true, "temp.blocks", ns), (false, "main.blocks", "")] {
-        if temporary && ns.is_empty() {
-            continue;
-        }
-        let json: Option<String> = db
-            .query_row(
-                &format!(
-                    "SELECT fields_json FROM {table} WHERE name=?1{}",
-                    if temporary {
-                        " AND instance=?2"
-                    } else {
-                        " AND ?2=''"
-                    }
-                ),
-                params![name, key],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(read_err)?;
-        if let Some(json) = json {
-            return Ok((
-                temporary,
-                key.to_owned(),
-                serde_json::from_str(&json).map_err(schema_err)?,
-            ));
-        }
-    }
-    Err(err(K::BlockMissing, name))
-}
-fn messages(db: &Connection, s: &MessageSelector) -> Result<BlockMessages, StorageError> {
-    let block = block(db, &s.block, &s.instance)?;
-    let values = block
-        .2
-        .get(&s.field)
-        .cloned()
-        .ok_or_else(|| err(K::FieldMissing, &s.field))?;
-    Ok((block, values))
 }
 fn range(
     selection: MessageSelection,
@@ -371,148 +342,14 @@ fn range(
     }
     Ok((start as usize, end as usize))
 }
-fn selected(db: &Connection, s: &MessageSelector) -> Result<Vec<serde_json::Value>, StorageError> {
-    let (_, values) = messages(db, s)?;
-    let (a, b) = range(s.selection, values.len(), false)?;
-    Ok(values[a..b].to_vec())
-}
 fn database_operation(
     db: &Connection,
     operation: StorageOperation,
 ) -> Result<StorageValue, StorageError> {
     match operation {
-        StorageOperation::CreateBlock {
-            name,
-            fields,
-            instance,
-        } => {
-            let ns = namespace(&instance)?;
-            let unique: BTreeSet<_> = fields.iter().cloned().collect();
-            if name.is_empty()
-                || unique.len() != fields.len()
-                || fields.iter().any(String::is_empty)
-            {
-                return Err(err(
-                    K::InvalidRequest,
-                    "empty or duplicate block/field name",
-                ));
-            }
-            let fields: BlockFields = unique.into_iter().map(|f| (f, Vec::new())).collect();
-            let table = if instance.is_some() {
-                "temp.blocks"
-            } else {
-                "main.blocks"
-            };
-            let other = if instance.is_some() {
-                "main.blocks"
-            } else {
-                "temp.blocks"
-            };
-            let conflict: bool = db
-                .query_row(
-                    &format!("SELECT EXISTS(SELECT 1 FROM {other} WHERE name=?1)"),
-                    [&name],
-                    |r| r.get(0),
-                )
-                .map_err(read_err)?;
-            if conflict {
-                return Err(err(K::LifecycleMismatch, &name));
-            }
-            let existing: Option<String> = db
-                .query_row(
-                    &format!(
-                        "SELECT fields_json FROM {table} WHERE name=?1{}",
-                        if instance.is_some() {
-                            " AND instance=?2"
-                        } else {
-                            " AND ?2=''"
-                        }
-                    ),
-                    params![name, ns],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(read_err)?;
-            if let Some(json) = existing {
-                let stored: BlockFields = serde_json::from_str(&json).map_err(schema_err)?;
-                if stored.keys().ne(fields.keys()) {
-                    return Err(schema_err(&name));
-                }
-            } else {
-                let sql = if instance.is_some() {
-                    "INSERT INTO temp.blocks VALUES(?1,?2,?3)"
-                } else {
-                    "INSERT INTO main.blocks(name,fields_json) SELECT ?1,?3 WHERE ?2=''"
-                };
-                db.execute(
-                    sql,
-                    params![name, ns, serde_json::to_string(&fields).map_err(write_err)?],
-                )
-                .map_err(write_err)?;
-            }
-            Ok(StorageValue::Unit)
-        }
-        StorageOperation::ReadMessages { selectors } => {
-            let mut values = Vec::new();
-            for s in selectors {
-                values.extend(selected(db, &s)?);
-            }
-            Ok(StorageValue::Messages(values))
-        }
-        StorageOperation::ReadMessageSources { sources } => {
-            let mut values = Vec::new();
-            for source in sources {
-                values.extend(match source {
-                    MessageSource::Stored(selector) => selected(db, &selector)?,
-                    MessageSource::Literal(literal) => literal,
-                });
-            }
-            Ok(StorageValue::Messages(values))
-        }
-        StorageOperation::ReplaceMessages { sources, target } => {
-            let ((temporary, ns, mut fields), mut values) = messages(db, &target)?;
-            let mut replacement = Vec::new();
-            for source in sources {
-                replacement.extend(match source {
-                    MessageSource::Literal(v) => v,
-                    MessageSource::Stored(s) => selected(db, &s)?,
-                });
-            }
-            let (a, b) = range(target.selection, values.len(), true)?;
-            values.splice(a..b, replacement);
-            fields.insert(target.field, values);
-            let table = if temporary {
-                "temp.blocks"
-            } else {
-                "main.blocks"
-            };
-            db.execute(
-                &format!(
-                    "UPDATE {table} SET fields_json=?1 WHERE name=?2{}",
-                    if temporary {
-                        " AND instance=?3"
-                    } else {
-                        " AND ?3=''"
-                    }
-                ),
-                params![
-                    serde_json::to_string(&fields).map_err(write_err)?,
-                    target.block,
-                    ns
-                ],
-            )
-            .map_err(write_err)?;
-            Ok(StorageValue::Unit)
-        }
-        StorageOperation::DropTemporaryBlocks { instance } => {
-            namespace(&Some(instance.clone()))?;
-            db.execute("DELETE FROM temp.blocks WHERE instance=?1", [instance])
-                .map_err(write_err)?;
-            Ok(StorageValue::Unit)
-        }
         StorageOperation::AppendHistory { records } => {
             for record in records {
-                let table = history_table(&record.kind)?;
+                history_table(&record.kind)?;
                 validate_payload(&record.kind, &record.payload)?;
                 if record.kind == "mcl"
                     && record.source.as_deref().is_none_or(|source| {
@@ -536,33 +373,12 @@ fn database_operation(
                         .map_err(write_err)?,
                 );
                 let timestamp = i64::try_from(timestamp).map_err(|e| err(K::InvalidRecord, e))?;
-                let sequence: i64 = db.query_row("SELECT max(sequence) FROM (SELECT coalesce(max(sequence),0) AS sequence FROM agent_messages UNION ALL SELECT coalesce(max(sequence),0) FROM mcl_records)",[],|r| r.get(0)).map_err(read_err)?;
-                let sequence = sequence
-                    .checked_add(1)
-                    .ok_or_else(|| err(K::InvalidRecord, "history sequence exhausted"))?;
-                let (columns, source_or_type) = if record.kind == "message" {
-                    (
-                        "sequence,turn,type,content,payload,created_at_ms",
-                        record.payload["type"].as_str(),
-                    )
+                if record.kind == "message" {
+                    messages::append(db, &record.payload, record.turn.as_deref(), timestamp)?;
                 } else {
-                    (
-                        "sequence,turn,source,content,payload,created_at_ms",
-                        record.source.as_deref(),
-                    )
-                };
-                db.execute(
-                    &format!("INSERT INTO {table}({columns}) VALUES(?1,?2,?3,?4,?5,?6)"),
-                    params![
-                        sequence,
-                        record.turn,
-                        source_or_type,
-                        record.content,
-                        serde_json::to_string(&record.payload).map_err(write_err)?,
-                        timestamp
-                    ],
-                )
-                .map_err(write_err)?;
+                    let sequence = messages::next_sequence(db)?;
+                    db.execute("INSERT INTO mcl_records(sequence,turn,source,content,payload,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![sequence,record.turn,record.source,record.content,serde_json::to_string(&record.payload).map_err(write_err)?,timestamp]).map_err(write_err)?;
+                }
             }
             Ok(StorageValue::Unit)
         }
@@ -614,64 +430,77 @@ fn read_entries(
     db: &Connection,
     kind: Option<&str>,
 ) -> Result<Vec<StoredHistoryRecord>, StorageError> {
-    let select = |kind: &str, table: &str| {
-        let (source, message_type) = if kind == "message" {
-            ("NULL", "type")
-        } else {
-            ("source", "NULL")
-        };
-        format!(
-            "SELECT sequence,{source},turn,'{kind}' AS kind,content,payload,created_at_ms,{message_type} FROM {table}"
-        )
-    };
-    let sql = match kind {
-        Some(kind) => select(kind, history_table(kind)?),
-        None => format!(
-            "{} UNION ALL {}",
-            select("message", "agent_messages"),
-            select("mcl", "mcl_records")
-        ),
-    };
-    let rows = db
-        .prepare(&format!("{sql} ORDER BY sequence"))
-        .map_err(read_err)?
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, Option<String>>(7)?,
+    let mut result = Vec::new();
+    if kind.is_none() || kind == Some("message") {
+        let mut query = db
+            .prepare(&format!(
+                "SELECT {},turn,created_at_ms FROM agent_messages ORDER BY sequence",
+                messages::COLUMNS
             ))
-        })
-        .map_err(read_err)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(read_err)?;
-    rows.into_iter()
-        .map(
-            |(sequence, source, turn, kind, content, json, time, message_type)| {
-                let payload: serde_json::Value = serde_json::from_str(&json).map_err(schema_err)?;
-                validate_payload(&kind, &payload).map_err(schema_err)?;
-                if kind == "message" && message_type.as_deref() != payload["type"].as_str() {
-                    return Err(schema_err("stored message type does not match payload"));
-                }
-                Ok(StoredHistoryRecord {
-                    sequence: u64::try_from(sequence).map_err(schema_err)?,
-                    record: HistoryRecord {
-                        source,
-                        turn,
-                        content,
-                        kind,
-                        payload,
-                        created_at_ms: Some(u64::try_from(time).map_err(schema_err)?),
-                    },
-                })
-            },
-        )
-        .collect()
+            .map_err(read_err)?;
+        let rows = query
+            .query_map([], |r| {
+                Ok((
+                    messages::from_row(r, 0)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, i64>(7)?,
+                ))
+            })
+            .map_err(read_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(read_err)?;
+        for (row, turn, timestamp) in rows {
+            let sequence =
+                row.sequence
+                    .ok_or_else(|| schema_err("missing history sequence"))? as u64;
+            let content = row.content.clone().unwrap_or_default();
+            result.push(StoredHistoryRecord {
+                sequence,
+                record: HistoryRecord {
+                    source: None,
+                    turn,
+                    kind: "message".into(),
+                    content,
+                    payload: messages::join(row, true)?,
+                    created_at_ms: Some(timestamp as u64),
+                },
+            });
+        }
+    }
+    if kind.is_none() || kind == Some("mcl") {
+        let mut query=db.prepare("SELECT sequence,source,turn,content,payload,created_at_ms FROM mcl_records ORDER BY sequence").map_err(read_err)?;
+        let rows = query
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(read_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(read_err)?;
+        for (sequence, source, turn, content, payload, timestamp) in rows {
+            let payload = serde_json::from_str(&payload).map_err(schema_err)?;
+            validate_payload("mcl", &payload).map_err(schema_err)?;
+            result.push(StoredHistoryRecord {
+                sequence: sequence as u64,
+                record: HistoryRecord {
+                    source: Some(source),
+                    turn,
+                    kind: "mcl".into(),
+                    content,
+                    payload,
+                    created_at_ms: Some(timestamp as u64),
+                },
+            });
+        }
+    }
+    result.sort_by_key(|r| r.sequence);
+    Ok(result)
 }
 
 fn parse_config(text: &str) -> Result<toml::Table, StorageError> {

@@ -394,36 +394,47 @@ pub enum StopReasonDto {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentMessageDto {
     System {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
         content: String,
     },
     Inject {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
         messages: Vec<AgentMessageDto>,
     },
     User {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
         content: String,
-        #[serde(default)]
+        #[serde(default, rename = "data")]
         images: Vec<UserImageDto>,
     },
     Assistant {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
         reasoning: Option<String>,
         content: Option<String>,
-        replay: Option<Value>,
         #[serde(default)]
         tool_calls: Vec<ToolCallDto>,
         usage: Option<TokenUsageDto>,
         stop_reason: Option<StopReasonDto>,
     },
     ToolCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
         tool_call_id: String,
         tool_name: String,
         content: String,
-        #[serde(default)]
+        #[serde(default, rename = "data")]
         images: Vec<UserImageDto>,
         failed: bool,
     },
     Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
         message: String,
     },
 }

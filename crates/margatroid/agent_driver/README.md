@@ -8,10 +8,10 @@ agent_driver_core提供Driver文件格式、读取函数及错误，只依赖标
 Driver目录
 ├── driver.toml
 ├── base.lua
-└── settings.toml
+└── setting.toml
 ```
 
-三个文件均必需，默认settings.toml允许为空。清单声明schema_version、dependencies字符串数组及inference模型参数，使用Driver自己的类型，不依赖其他领域core。
+三个文件均必需，默认setting.toml允许为空。清单声明schema_version、dependencies字符串数组及inference模型参数，使用Driver自己的类型，不依赖其他领域core。
 
 ## 启动读取
 
@@ -21,7 +21,7 @@ Workspace将请求定义中的成员启动参数交给StartAgent。Agent启动�
 
 ## 设置与消息
 
-Agent数据库不存在就创建；Agent settings.toml不存在就从Driver默认模板创建，已有文件不覆盖、不合并，格式损坏直接报错。初始化由Agent启动流程协调，不由Driver读取函数写Agent数据。
+Agent数据库不存在就创建；Agent setting.toml不存在就从Driver默认模板创建，已有文件不覆盖、不合并，格式损坏直接报错。初始化由Agent启动流程协调，不由Driver读取函数写Agent数据。
 
 Block只保存消息数组，CREATE BLOCK不写MESSAGE类型，存在则打开且不清空；设置使用CONFIG GET、CONFIG SET ? ?、CONFIG DELETE ?。运行指令使用EFFECT，无EMIT前缀。
 

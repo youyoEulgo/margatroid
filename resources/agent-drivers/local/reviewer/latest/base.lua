@@ -61,7 +61,7 @@ local function maybe_compact_context(message)
     command("INJECT ? TO msg.compact_context", {earlier})
     local result = command("EFFECT inference (msg.instructions, msg.compact_context, msg.compact_prompt)")
     local summary = result.Inference
-    command("EFFECT history_append ?", {{summary.message}})
+    summary.message = command("EFFECT history_append ?", {{summary.message}}).Array.Message[1]
     if summary.stop_reason == "completed" and summary.message.type == "assistant"
         and summary.message.content and summary.message.content ~= "" then
         local replacement = {
@@ -70,6 +70,7 @@ local function maybe_compact_context(message)
         for _, item in ipairs(recent) do
             replacement[#replacement + 1] = item
         end
+        command("EFFECT block_snapshot ?", {"session"})
         command("INJECT ? TO session.conversation", {replacement})
     end
 end
@@ -109,6 +110,7 @@ local function inject_context(message)
         if item.type == "inject" then
             inject_context(item)
         else
+            item = command("EFFECT history_append ?", {{item}}).Array.Message[1]
             command("INJECT ? TO session.conversation[-1]", {{item}})
         end
     end
@@ -127,7 +129,9 @@ local function process_next()
     local message = command("GET entry.pending[0]").Array.Message[1]
     if message then
         command("INJECT [] TO entry.pending[0,1]")
-        command("EFFECT history_append ?", {{message}})
+        if message.type ~= "inject" then
+            message = command("EFFECT history_append ?", {{message}}).Array.Message[1]
+        end
 
         if message.type == "inject" then
             inject_context(message)
@@ -139,7 +143,7 @@ local function process_next()
         elseif message.type == "assistant" then
             if (message.content and message.content ~= "")
                 or (message.reasoning and message.reasoning ~= "")
-                or #(message.tool_calls or {}) > 0 or message.replay then
+                or #(message.tool_calls or {}) > 0 then
                 command("INJECT ? TO session.conversation[-1]", {{message}})
             end
             if #(message.tool_calls or {}) == 0 then

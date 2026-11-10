@@ -239,7 +239,7 @@ fn driver(root: &Path, name: &str, program: &str, settings: &str) {
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("driver.toml"),"schema_version=1\ndependencies=['tool:local/bash:latest','prompt:local/system:latest']\n[inference]\nmodel='test-model'\ntemperature=0.5\nmax_output_tokens=1024\n").unwrap();
     std::fs::write(directory.join("base.lua"), program).unwrap();
-    std::fs::write(directory.join("settings.toml"), settings).unwrap();
+    std::fs::write(directory.join("setting.toml"), settings).unwrap();
 }
 struct Fixture {
     app: App,
@@ -301,7 +301,7 @@ impl Fixture {
             project_root: root.path().join("project"),
             home_root: root.path().join("home"),
             database_path: home.join("state.sqlite"),
-            settings_path: home.join("settings.toml"),
+            settings_path: home.join("setting.toml"),
         };
         Self {
             app,

@@ -163,23 +163,28 @@ fn mixed_history_streams_share_sequences_and_atomic_batch_rollback() {
     let saved = entries(&storage);
     assert_eq!(saved[3].sequence, 4);
     assert_eq!(saved[3].record.content, "error");
-    assert_eq!(saved[4].record.content, "");
+    assert_eq!(
+        saved[4].record.content,
+        r#"[{"content":"nested","type":"user"}]"#
+    );
     let database = Connection::open(path).unwrap();
     for (table, expected) in [
         (
             "agent_messages",
-            [
+            vec![
                 "sequence",
                 "turn",
-                "type",
+                "role",
                 "content",
+                "data",
+                "tool_call",
                 "payload",
                 "created_at_ms",
             ],
         ),
         (
             "mcl_records",
-            [
+            vec![
                 "sequence",
                 "source",
                 "turn",
@@ -201,7 +206,7 @@ fn mixed_history_streams_share_sequences_and_atomic_batch_rollback() {
 }
 
 #[test]
-fn content_payload_and_source_are_independent_and_preserved_verbatim() {
+fn normalized_message_content_and_remaining_payload_preserve_source_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let storage = open_storage(&path, &dir.path().join("cfg"), "").unwrap();
@@ -231,24 +236,30 @@ fn content_payload_and_source_are_independent_and_preserved_verbatim() {
         saved.iter().map(|r| r.sequence).collect::<Vec<_>>(),
         [1, 2, 3, 4]
     );
-    assert_eq!(
-        saved.iter().map(|r| r.record.clone()).collect::<Vec<_>>(),
-        [message.clone(), mcl.clone(), message, mcl]
-    );
+    for (index, entry) in saved.iter().enumerate() {
+        if index % 2 == 0 {
+            let mut expected = message.clone();
+            expected.content = "payload content".into();
+            expected.payload["sequence"] = json!(entry.sequence);
+            assert_eq!(entry.record, expected);
+        } else {
+            assert_eq!(entry.record, mcl);
+        }
+    }
     let db = Connection::open(path).unwrap();
     let raw: (String, String, String) = db
         .query_row(
-            "SELECT type,content,payload FROM agent_messages WHERE sequence=1",
+            "SELECT role,content,payload FROM agent_messages WHERE sequence=1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
     assert_eq!(raw.0, "user");
     assert_eq!(saved[1].record.source.as_deref(), Some(source));
-    assert_eq!(raw.1, "调用方正文\n原样");
+    assert_eq!(raw.1, "payload content");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&raw.2).unwrap(),
-        saved[0].record.payload
+        json!({"key":"preserved application key","idempotency":"preserved payload data"})
     );
 }
 
@@ -309,13 +320,17 @@ fn invalid_sources_and_sql_failures_rollback_whole_mixed_batch() {
 }
 
 #[test]
-fn message_types_are_stored_from_payload_and_mismatch_is_rejected() {
+fn message_roles_are_stored_in_role_column_and_invalid_roles_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let storage = open_storage(&path, &dir.path().join("cfg"), "").unwrap();
     for message_type in ["user", "assistant", "error"] {
         let mut message = record("independent content");
-        message.payload = json!({"type": message_type, "content": "payload content"});
+        message.payload = if message_type == "error" {
+            json!({"type":"error","message":"payload content"})
+        } else {
+            json!({"type": message_type, "content": "payload content"})
+        };
         execute_storage(
             &storage,
             StorageOperation::AppendHistory {
@@ -326,7 +341,7 @@ fn message_types_are_stored_from_payload_and_mismatch_is_rejected() {
     }
     let db = Connection::open(path).unwrap();
     let types = db
-        .prepare("SELECT type FROM agent_messages ORDER BY sequence")
+        .prepare("SELECT role FROM agent_messages ORDER BY sequence")
         .unwrap()
         .query_map([], |r| r.get::<_, String>(0))
         .unwrap()
@@ -337,7 +352,7 @@ fn message_types_are_stored_from_payload_and_mismatch_is_rejected() {
         .iter()
         .all(|entry| entry.record.source.is_none()));
     db.execute(
-        "UPDATE agent_messages SET type='error' WHERE sequence=1",
+        "UPDATE agent_messages SET role='unknown' WHERE sequence=1",
         [],
     )
     .unwrap();

@@ -18,6 +18,8 @@ StartAgent和RestartAgent使用相同字段：id、workspace Entity、name、Age
 
 ## 异步流程
 
+启动参数的文件路径固定为Workspace定义所在目录的agents/<成员名>/state.sqlite及setting.toml；不接受旧设置文件名或兼容读取。setting.toml缺失时仅从Driver同名默认模板创建，已有文件不覆盖。持久Block由存储领域放在state.sqlite.blocks/<Block逻辑名>/，TEMP Block与其快照仅保留内存。
+
 启动受理后先创建Entity并挂载基础组件，再由闭包使用请求携带的Driver定位字符串调用address文件定位，直接调用agent_driver_core读取文件，然后完成数据库、设置、运行组件初始化及VM启动。Driver不登记路径或正文缓存。Agent只准备agent_info等启动数据，不构造mcl或wait函数；Lua Runtime安装本次宿主绑定。需要World或其他领域执行的步骤发送带oneshot的请求，回复后才执行下一步。闭包不跨await借用World。启停及重启闭包直接返回Result<对应Output, 对应Error>，由mecs异步结果机制交给对应System，不额外定义FlowResult或结果包装事件；启动结果Handler通过原StartAgent.reply回复Workspace闭包，启停和重启均使用原reply，不增加公共结果中转事件。
 
 关闭受理时同步关闭新操作受理。关闭闭包请求Driver停止和执行取消，等待活动真实退出及MCL收口；结果Handler确认后销毁Entity。

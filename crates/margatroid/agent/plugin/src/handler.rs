@@ -112,7 +112,7 @@ fn validate_parameters(
         })?;
     let directory = home.join("agents").join(name);
     if parameters.database_path != directory.join("state.sqlite")
-        || parameters.settings_path != directory.join("settings.toml")
+        || parameters.settings_path != directory.join("setting.toml")
     {
         return Err(error(
             AgentErrorKind::InvalidRequest,
@@ -350,13 +350,13 @@ pub(crate) fn handle_restart_agent(world: &mut World, request: RestartAgent) {
                 return Err(error(
                     AgentErrorKind::AgentMissing,
                     "Agent member is missing",
-                ))
+                ));
             }
             _ => {
                 return Err(error(
                     AgentErrorKind::InvalidRequest,
                     "Agent member name is ambiguous",
-                ))
+                ));
             }
         };
         if world
@@ -529,7 +529,7 @@ fn reject_symlinks(path: &Path) -> Result<(), AgentError> {
                 return Err(error(
                     AgentErrorKind::StartFailed,
                     "managed Agent state paths cannot contain symbolic links",
-                ))
+                ));
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -822,7 +822,7 @@ async fn start_steps(context: &FlowContext) -> Result<(), StartFailure> {
                     format!("VM start reply closed: {e}"),
                 ),
                 uncertain: true,
-            })
+            });
         }
     };
     with_world(context, move |world| {

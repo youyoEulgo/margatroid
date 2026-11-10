@@ -73,7 +73,7 @@ fn command(app: &mut App, agent: Entity, text: &str, arguments: Vec<Value>) -> M
         .clone();
     let (sender, mut receiver) = oneshot::channel();
     app.world().emit_event(MclCommand {
-        id: format!("four-table:{text}"),
+        id: format!("block-files:{text}"),
         source: agent,
         source_address: app
             .world()
@@ -120,12 +120,17 @@ fn assert_disk_schema_and_messages(path: &Path, message: &Value, log_count: usiz
         .unwrap();
     assert_eq!(
         tables,
-        ["agent_logs", "agent_messages", "blocks", "mcl_records"]
+        [
+            "agent_logs",
+            "agent_messages",
+            "block_snapshots",
+            "mcl_records"
+        ]
     );
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        5
     );
     assert_eq!(
         db.query_row("SELECT count(*) FROM agent_logs", [], |row| row
@@ -145,37 +150,106 @@ fn assert_disk_schema_and_messages(path: &Path, message: &Value, log_count: usiz
         [
             "sequence",
             "turn",
-            "type",
+            "role",
             "content",
+            "data",
+            "tool_call",
             "payload",
             "created_at_ms"
         ]
     );
-    let message_type: String = db
-        .query_row("SELECT type FROM agent_messages LIMIT 1", [], |row| {
-            row.get(0)
-        })
+    let (role, content): (String, String) = db
+        .query_row(
+            "SELECT role,content FROM agent_messages LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .unwrap();
-    assert_eq!(message_type, message["type"].as_str().unwrap());
+    assert_eq!(role, message["type"].as_str().unwrap());
+    assert_eq!(content, message["content"].as_str().unwrap());
+    let mappings = db.prepare("SELECT block_name,instance,kind,snapshot_id,file_name,fields_json,upstream_id,restore_intent FROM block_snapshots")
+        .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, i64>(3)?,row.get::<_, String>(4)?,row.get::<_, String>(5)?,row.get::<_, Option<i64>>(6)?,row.get::<_, Option<String>>(7)?)))
+        .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(
-        db.query_row("SELECT count(*) FROM main.blocks", [], |row| row
-            .get::<_, i64>(0))
-            .unwrap(),
-        1
+        mappings.len(),
+        1,
+        "TEMP Blocks must never have disk mappings"
     );
-    let payloads = db
-        .prepare("SELECT payload FROM agent_messages ORDER BY sequence")
+    let (name, instance, kind, snapshot_id, file_name, fields_json, upstream, intent) =
+        &mappings[0];
+    assert_eq!(name, "session");
+    assert!(instance.is_empty());
+    assert_eq!(kind, "timeline");
+    assert_eq!(*snapshot_id, 0);
+    assert_eq!(file_name, "session/timeline.sqlite");
+    assert!(upstream.is_none() && intent.is_none());
+    let block_root = std::path::PathBuf::from(format!("{}.blocks", path.display()));
+    let directories = std::fs::read_dir(&block_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        directories,
+        [std::ffi::OsString::from("session")],
+        "TEMP Block files or namespaces must not exist"
+    );
+    let block = rusqlite::Connection::open(block_root.join(file_name)).unwrap();
+    assert_eq!(
+        block
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    let fields: Value = serde_json::from_str(fields_json).unwrap();
+    assert_eq!(fields.as_object().unwrap().len(), 1);
+    let table = fields["conversation"].as_str().unwrap();
+    assert!(
+        table
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    );
+    let tables = block
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()
-        .map(|payload| serde_json::from_str::<Value>(&payload.unwrap()).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(payloads.as_slice(), std::slice::from_ref(message));
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(tables, [table]);
+    let columns = block
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        columns,
+        [
+            "position",
+            "sequence",
+            "role",
+            "content",
+            "data",
+            "tool_call",
+            "payload"
+        ]
+    );
+    let stored: (String, String) = block
+        .query_row(
+            &format!("SELECT role,content FROM {table} ORDER BY position"),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored.0, message["type"].as_str().unwrap());
+    assert_eq!(stored.1, message["content"].as_str().unwrap());
+    assert!(path.parent().unwrap().join("setting.toml").is_file());
+    assert!(!path.parent().unwrap().join("settings.toml").exists());
 }
 
 #[test]
-fn workspace_restarts_keep_four_disk_tables_persistent_context_and_history_without_temp_row_growth()
-{
+fn workspace_restarts_keep_block_files_persistent_context_and_history_without_temp_file_growth() {
     let root = tempfile::tempdir().unwrap();
     copy_tree(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../resources"),
@@ -232,7 +306,7 @@ fn workspace_restarts_keep_four_disk_tables_persistent_context_and_history_witho
             .instance
             .start_id
             .clone();
-        assert!(instances.insert(instance));
+        assert!(instances.insert(instance.clone()));
         assert_eq!(
             command(&mut app, agent, "GET session.conversation", vec![]),
             MclValue::Array(MessageArray::Message(vec![message.clone()]))

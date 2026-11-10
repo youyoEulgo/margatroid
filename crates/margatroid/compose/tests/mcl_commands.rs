@@ -457,7 +457,6 @@ fn response() -> InferenceResponse {
         reasoning: Some("reason".into()),
         content: Some("response".into()),
         tool_calls: vec![],
-        replay: None,
         usage: None,
         stop_reason: InferenceStopReason::Completed,
     }
@@ -1359,7 +1358,14 @@ async fn history_append_records_messages_once_and_keeps_command_audits_separate(
         .filter(|record| record.kind == "message")
         .map(|record| record.payload.clone())
         .collect::<Vec<_>>();
-    assert_eq!(payloads, [user("one"), user("two")]);
+    assert_eq!(
+        payloads
+            .iter()
+            .map(|v| v["content"].clone())
+            .collect::<Vec<_>>(),
+        [json!("one"), json!("two")]
+    );
+    assert!(payloads.iter().all(|v| v["sequence"].as_u64().is_some()));
     assert_eq!(
         fixture
             .command(
@@ -1767,10 +1773,21 @@ async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_
             loop {
                 fixture.app.tick();
                 let persisted = fixture.history().iter().any(|record| {
-                    record.kind == "message" && match &failure {
-                        Some(failure) => record.payload == json!({"type":"error", "message":format!("EffectFailed: {failure}"), "request_id":request.id}),
-                        None => record.payload["type"] == "assistant" && record.payload["request_id"] == request.id && record.payload["content"] == "response",
-                    }
+                    record.kind == "message"
+                        && match &failure {
+                            Some(failure) => {
+                                record.payload["type"] == "error"
+                                    && record.payload["message"]
+                                        == format!("EffectFailed: {failure}")
+                                    && record.payload["request_id"] == request.id
+                                    && record.payload["sequence"].as_u64().is_some()
+                            }
+                            None => {
+                                record.payload["type"] == "assistant"
+                                    && record.payload["request_id"] == request.id
+                                    && record.payload["content"] == "response"
+                            }
+                        }
                 });
                 if persisted {
                     break;
@@ -1922,7 +1939,10 @@ async fn one_executor_records_mcl_caller_addresses_and_message_types_with_conten
             .find(|row| row.kind == "message" && row.content == text)
             .unwrap();
         assert!(record.source.is_none());
-        assert_eq!(record.payload, payload);
+        let mut expected = payload.clone();
+        expected["sequence"] = record.payload["sequence"].clone();
+        assert!(expected["sequence"].as_u64().is_some());
+        assert_eq!(record.payload, expected);
         let audit = history
             .iter()
             .find(|row| row.kind == "mcl" && row.payload["id"] == format!("append-{text}"))
@@ -2310,4 +2330,435 @@ fn attached_inference(
 ) -> InferenceHandle {
     handle.attach_task(task).unwrap();
     handle
+}
+
+async fn snapshot_command_unit(fixture: &mut Fixture, text: &str, arguments: Vec<Value>) {
+    assert!(
+        matches!(
+            fixture.command(text, arguments).await.unwrap(),
+            MclValue::Unit
+        ),
+        "{text} must confirm a completed operation"
+    );
+}
+
+async fn snapshot_map(fixture: &mut Fixture, block: &str) -> Value {
+    let MclValue::BlockSnapshots(value) = fixture
+        .command("EFFECT block_snapshots ?", vec![json!(block)])
+        .await
+        .unwrap()
+    else {
+        panic!("snapshot query must return BlockSnapshots")
+    };
+    value
+}
+
+async fn snapshot_write(fixture: &mut Fixture, target: &str, contents: &str) {
+    snapshot_command_unit(
+        fixture,
+        &format!("INJECT ? TO {target}"),
+        vec![json!([user(contents)])],
+    )
+    .await;
+}
+
+async fn snapshot_assert_message(fixture: &mut Fixture, target: &str, contents: &str) {
+    assert_eq!(
+        messages(
+            fixture
+                .command(&format!("GET {target}"), vec![])
+                .await
+                .unwrap()
+        ),
+        [user(contents)]
+    );
+}
+
+#[tokio::test]
+async fn block_snapshot_restore_preserves_all_children_and_branch_ancestry() {
+    let mut fixture = Fixture::new();
+    snapshot_command_unit(
+        &mut fixture,
+        "CREATE BLOCK session (conversation, summary)",
+        vec![],
+    )
+    .await;
+    let initial = snapshot_map(&mut fixture, "session").await;
+    assert_eq!(initial["snapshots"], json!([]));
+    assert!(initial["timeline"]["upstream_id"].is_null());
+    let timeline_file = initial["timeline"]["file_name"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        initial["timeline"]["fields_json"]
+            .as_object()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    for (index, label) in [(1, "original"), (2, "second")] {
+        snapshot_write(
+            &mut fixture,
+            "session.conversation",
+            &format!("{label} conversation"),
+        )
+        .await;
+        snapshot_write(&mut fixture, "session.summary", &format!("{label} summary")).await;
+        snapshot_command_unit(
+            &mut fixture,
+            "EFFECT block_snapshot ?",
+            vec![json!("session")],
+        )
+        .await;
+        let map = snapshot_map(&mut fixture, "session").await;
+        assert_eq!(map["timeline"]["file_name"], timeline_file);
+        assert_eq!(map["timeline"]["upstream_id"], index);
+        assert_eq!(map["snapshots"].as_array().unwrap().len(), index as usize);
+        assert_eq!(map["snapshots"][index as usize - 1]["snapshot_id"], index);
+    }
+    snapshot_write(
+        &mut fixture,
+        "session.conversation",
+        "departing conversation",
+    )
+    .await;
+    snapshot_write(&mut fixture, "session.summary", "departing summary").await;
+    snapshot_command_unit(
+        &mut fixture,
+        "EFFECT block_restore ? ?",
+        vec![json!("session"), json!(1)],
+    )
+    .await;
+    snapshot_assert_message(
+        &mut fixture,
+        "session.conversation",
+        "original conversation",
+    )
+    .await;
+    snapshot_assert_message(&mut fixture, "session.summary", "original summary").await;
+    let restored = snapshot_map(&mut fixture, "session").await;
+    assert_eq!(restored["timeline"]["file_name"], timeline_file);
+    assert_eq!(restored["timeline"]["upstream_id"], 1);
+    let snapshots = restored["snapshots"].as_array().unwrap();
+    assert_eq!(snapshots.len(), 3);
+    assert!(snapshots[0]["upstream_id"].is_null());
+    assert_eq!(snapshots[1]["upstream_id"], 1);
+    assert_eq!(snapshots[2]["snapshot_id"], 3);
+    assert_eq!(snapshots[2]["upstream_id"], 2);
+    assert!(
+        snapshots
+            .iter()
+            .all(|item| item["fields_json"] == initial["timeline"]["fields_json"])
+    );
+    let files = snapshots
+        .iter()
+        .map(|item| item["file_name"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(files.len(), 3);
+    assert!(!files.contains(timeline_file.as_str()));
+
+    snapshot_command_unit(
+        &mut fixture,
+        "EFFECT block_snapshot ?",
+        vec![json!("session")],
+    )
+    .await;
+    let branched = snapshot_map(&mut fixture, "session").await;
+    assert_eq!(branched["snapshots"][3]["snapshot_id"], 4);
+    assert_eq!(branched["snapshots"][3]["upstream_id"], 1);
+    assert_eq!(branched["timeline"]["upstream_id"], 4);
+    assert_eq!(
+        &branched["snapshots"].as_array().unwrap()[..3],
+        snapshots.as_slice()
+    );
+
+    // Restoring the departure snapshot proves it saved both live tables, not the target.
+    snapshot_command_unit(
+        &mut fixture,
+        "EFFECT block_restore ? ?",
+        vec![json!("session"), json!(3)],
+    )
+    .await;
+    snapshot_assert_message(
+        &mut fixture,
+        "session.conversation",
+        "departing conversation",
+    )
+    .await;
+    snapshot_assert_message(&mut fixture, "session.summary", "departing summary").await;
+    assert_eq!(
+        snapshot_map(&mut fixture, "session").await["timeline"]["file_name"],
+        timeline_file
+    );
+}
+
+#[tokio::test]
+async fn block_snapshot_identifiers_and_restore_targets_are_block_local() {
+    let mut fixture = Fixture::new();
+    for block in ["session", "notes"] {
+        snapshot_command_unit(
+            &mut fixture,
+            &format!("CREATE BLOCK {block} (messages)"),
+            vec![],
+        )
+        .await;
+        snapshot_write(&mut fixture, &format!("{block}.messages"), block).await;
+        snapshot_command_unit(&mut fixture, "EFFECT block_snapshot ?", vec![json!(block)]).await;
+    }
+    snapshot_command_unit(
+        &mut fixture,
+        "EFFECT block_snapshot ?",
+        vec![json!("session")],
+    )
+    .await;
+    let session = snapshot_map(&mut fixture, "session").await;
+    let notes = snapshot_map(&mut fixture, "notes").await;
+    assert_eq!(session["timeline"]["upstream_id"], 2);
+    assert_eq!(notes["timeline"]["upstream_id"], 1);
+    assert_eq!(notes["snapshots"].as_array().unwrap().len(), 1);
+    assert_eq!(notes["snapshots"][0]["snapshot_id"], 1);
+    assert_ne!(
+        session["snapshots"][0]["file_name"],
+        notes["snapshots"][0]["file_name"]
+    );
+
+    // ID 2 exists for session, but must not resolve while restoring notes.
+    assert!(matches!(
+        fixture
+            .command("EFFECT block_restore ? ?", vec![json!("notes"), json!(2)])
+            .await
+            .unwrap(),
+        MclValue::Error(_)
+    ));
+    assert_eq!(snapshot_map(&mut fixture, "notes").await, notes);
+    assert_eq!(snapshot_map(&mut fixture, "session").await, session);
+    snapshot_assert_message(&mut fixture, "notes.messages", "notes").await;
+    snapshot_assert_message(&mut fixture, "session.messages", "session").await;
+}
+
+#[tokio::test]
+async fn block_snapshot_invalid_arguments_leave_content_and_snapshot_maps_unchanged() {
+    let mut fixture = Fixture::new();
+    snapshot_command_unit(
+        &mut fixture,
+        "CREATE BLOCK session (conversation, summary)",
+        vec![],
+    )
+    .await;
+    snapshot_write(&mut fixture, "session.conversation", "keep conversation").await;
+    snapshot_write(&mut fixture, "session.summary", "keep summary").await;
+    snapshot_command_unit(
+        &mut fixture,
+        "EFFECT block_snapshot ?",
+        vec![json!("session")],
+    )
+    .await;
+    let before = snapshot_map(&mut fixture, "session").await;
+    for (text, arguments) in [
+        ("EFFECT block_snapshot ?", vec![json!(7)]),
+        (
+            "EFFECT block_snapshot ?",
+            vec![json!("session.conversation")],
+        ),
+        ("EFFECT block_snapshot ?", vec![json!("../session")]),
+        ("EFFECT block_snapshot ?", vec![json!("missing")]),
+        ("EFFECT block_snapshots ?", vec![json!(false)]),
+        ("EFFECT block_restore ? ?", vec![json!("session"), json!(0)]),
+        (
+            "EFFECT block_restore ? ?",
+            vec![json!("session"), json!(-1)],
+        ),
+        (
+            "EFFECT block_restore ? ?",
+            vec![json!("session"), json!(1.5)],
+        ),
+        (
+            "EFFECT block_restore ? ?",
+            vec![json!("session"), json!("1")],
+        ),
+        (
+            "EFFECT block_restore ? ?",
+            vec![json!("session"), json!(999)],
+        ),
+        ("EFFECT block_restore ?", vec![json!("session")]),
+        (
+            "EFFECT block_snapshot ? ?",
+            vec![json!("session"), json!(1)],
+        ),
+    ] {
+        assert!(
+            matches!(
+                fixture.command(text, arguments.clone()).await.unwrap(),
+                MclValue::Error(_)
+            ),
+            "{text} {arguments:?}"
+        );
+        assert_eq!(
+            snapshot_map(&mut fixture, "session").await,
+            before,
+            "failed operation changed snapshot ancestry: {text} {arguments:?}"
+        );
+        snapshot_assert_message(&mut fixture, "session.conversation", "keep conversation").await;
+        snapshot_assert_message(&mut fixture, "session.summary", "keep summary").await;
+    }
+}
+
+#[tokio::test]
+async fn block_snapshot_temporary_namespaces_isolate_vm_snapshots_and_permanent_fallback() {
+    let mut fixture = Fixture::new();
+    snapshot_command_unit(&mut fixture, "CREATE BLOCK session (conversation)", vec![]).await;
+    snapshot_write(&mut fixture, "session.conversation", "permanent").await;
+    snapshot_command_unit(
+        &mut fixture,
+        "EFFECT block_snapshot ?",
+        vec![json!("session")],
+    )
+    .await;
+    let permanent = snapshot_map(&mut fixture, "session").await;
+
+    let _ready_first = fixture.vm("snapshot-vm-first");
+    snapshot_command_unit(
+        &mut fixture,
+        "CREATE TEMP BLOCK entry (conversation)",
+        vec![],
+    )
+    .await;
+    snapshot_write(&mut fixture, "entry.conversation", "first VM snapshot").await;
+    snapshot_command_unit(
+        &mut fixture,
+        "EFFECT block_snapshot ?",
+        vec![json!("entry")],
+    )
+    .await;
+    let first = snapshot_map(&mut fixture, "entry").await;
+    assert_eq!(first["snapshots"][0]["snapshot_id"], 1);
+    assert_ne!(
+        first["timeline"]["file_name"],
+        permanent["timeline"]["file_name"]
+    );
+    snapshot_write(&mut fixture, "entry.conversation", "first VM departure").await;
+
+    let _ready_second = fixture.vm("snapshot-vm-second");
+    assert_eq!(snapshot_map(&mut fixture, "session").await, permanent);
+    snapshot_assert_message(&mut fixture, "session.conversation", "permanent").await;
+    assert!(matches!(
+        fixture
+            .command("EFFECT block_snapshots ?", vec![json!("entry")])
+            .await
+            .unwrap(),
+        MclValue::Error(_)
+    ));
+    snapshot_command_unit(
+        &mut fixture,
+        "CREATE TEMP BLOCK entry (conversation)",
+        vec![],
+    )
+    .await;
+    snapshot_write(&mut fixture, "entry.conversation", "second VM snapshot").await;
+    // The first VM's ID 1 must not resolve in the new TEMP Block.
+    assert!(matches!(
+        fixture
+            .command("EFFECT block_restore ? ?", vec![json!("entry"), json!(1)])
+            .await
+            .unwrap(),
+        MclValue::Error(_)
+    ));
+    snapshot_assert_message(&mut fixture, "entry.conversation", "second VM snapshot").await;
+    snapshot_command_unit(
+        &mut fixture,
+        "EFFECT block_snapshot ?",
+        vec![json!("entry")],
+    )
+    .await;
+    let second = snapshot_map(&mut fixture, "entry").await;
+    assert_eq!(second["snapshots"][0]["snapshot_id"], 1);
+    assert!(first["timeline"]["file_name"].is_null());
+    assert!(second["timeline"]["file_name"].is_null());
+    assert!(second["snapshots"][0]["file_name"].is_null());
+
+    let _ready_first_again = fixture.vm("snapshot-vm-first");
+    assert_eq!(snapshot_map(&mut fixture, "entry").await, first);
+    snapshot_command_unit(
+        &mut fixture,
+        "EFFECT block_restore ? ?",
+        vec![json!("entry"), json!(1)],
+    )
+    .await;
+    snapshot_assert_message(&mut fixture, "entry.conversation", "first VM snapshot").await;
+    let _ready_second_again = fixture.vm("snapshot-vm-second");
+    assert_eq!(snapshot_map(&mut fixture, "entry").await, second);
+    snapshot_assert_message(&mut fixture, "entry.conversation", "second VM snapshot").await;
+}
+
+#[tokio::test]
+async fn recorded_message_sequence_survives_context_snapshot_and_restore() {
+    let mut fixture = Fixture::new();
+    snapshot_command_unit(&mut fixture, "CREATE BLOCK session (conversation)", vec![]).await;
+    let recorded = messages(
+        fixture
+            .command("EFFECT history_append ?", vec![json!([user("original")])])
+            .await
+            .unwrap(),
+    );
+    let sequence = recorded[0]["sequence"].as_u64().unwrap();
+    snapshot_command_unit(
+        &mut fixture,
+        "INJECT ? TO session.conversation",
+        vec![json!(recorded)],
+    )
+    .await;
+    snapshot_command_unit(
+        &mut fixture,
+        "EFFECT block_snapshot ?",
+        vec![json!("session")],
+    )
+    .await;
+    snapshot_write(&mut fixture, "session.conversation", "changed").await;
+    snapshot_command_unit(
+        &mut fixture,
+        "EFFECT block_restore ? ?",
+        vec![json!("session"), json!(1)],
+    )
+    .await;
+    let restored = messages(
+        fixture
+            .command("GET session.conversation", vec![])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(restored[0]["sequence"], sequence);
+    assert_eq!(restored[0]["content"], "original");
+    let again = messages(
+        fixture
+            .command("EFFECT history_append ?", vec![json!(restored)])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(again[0]["sequence"], sequence);
+    assert_eq!(
+        fixture
+            .history()
+            .iter()
+            .filter(|v| v.kind == "message")
+            .count(),
+        1
+    );
+    let mut forged = again[0].clone();
+    forged["content"] = json!("forged");
+    assert!(matches!(
+        fixture
+            .command("INJECT ? TO session.conversation", vec![json!([forged])])
+            .await
+            .unwrap(),
+        MclValue::Error(_)
+    ));
+    let current = messages(
+        fixture
+            .command("GET session.conversation", vec![])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(current, again);
 }

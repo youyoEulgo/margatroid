@@ -89,7 +89,7 @@ fn request_size_and_image_encoding_limits_are_enforced_without_payload_echo() {
         "MessageTooLarge"
     );
     let image = json!({"media_type": "image/png", "data": "iVBORw0KGgo="});
-    let message = |image| json!({"type": "mcl.command", "id": "image", "message": {"workspace": workspace(), "agent": "agent:demo/coder", "command": "INJECT ? TO entry.pending[-1]", "arguments": [[{"type": "user", "content": "image", "images": [image]}]]}});
+    let message = |image| json!({"type": "mcl.command", "id": "image", "message": {"workspace": workspace(), "agent": "agent:demo/coder", "command": "INJECT ? TO entry.pending[-1]", "arguments": [[{"type": "user", "content": "image", "data": [image]}]]}});
     assert!(parse(message(image)).is_ok());
     let secret = "PRIVATE-NOT-BASE64";
     let error = parse(message(json!({"media_type": "image/png", "data": secret}))).unwrap_err();

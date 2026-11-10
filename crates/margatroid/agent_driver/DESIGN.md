@@ -21,7 +21,7 @@
 公开：
 ```text
 read_driver(manifest_path: &Path, limits: &AgentDriverReadLimits) -> Result<AgentDriverInput, AgentDriverError>
-    行为：有界读取driver.toml、同目录base.lua和settings.toml；校验清单、UTF-8和默认TOML；返回本次材料，不缓存内容。
+    行为：有界读取driver.toml、同目录base.lua和setting.toml；校验清单、UTF-8和默认TOML；返回本次材料，不缓存内容。
 ```
 
 # types pub

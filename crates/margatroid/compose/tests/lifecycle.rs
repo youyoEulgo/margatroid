@@ -294,5 +294,5 @@ fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
     assert!(!app.world().is_alive(agent));
     assert!(!app.world().is_alive(workspace));
     assert!(directory.join("agents/coder/state.sqlite").is_file());
-    assert!(directory.join("agents/coder/settings.toml").is_file());
+    assert!(directory.join("agents/coder/setting.toml").is_file());
 }

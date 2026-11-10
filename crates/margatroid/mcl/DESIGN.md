@@ -148,33 +148,44 @@ execute_import(context: CommandContext, kind: ImportKind, locator: String, alias
         IMPORT TOOL校验资源后向Agent的Tools登记alias、description、input_schema和path；
         其余IMPORT按资源类别登记，沙箱使用由对应effect处理。
 
-execute_get(context: CommandContext, expression: MessageExpression)
+read_expression(context: &CommandContext, expression: MessageExpression) -> Future<Output = Result<Vec<serde_json::Value>, MclError>>
     行为：
-        按顺序拼接消息来源；
-        将选择器交给存储领域读取；
-        Prompt alias按路径读取并保留消息角色；
-        返回.Array.Message。
+        调用prepare_sources取得有序消息来源，发送ReadMessageSources并等待回复；
+        校验返回的消息数组，非Messages结果返回StorageFailed。
 
-execute_inject(context: CommandContext, source: MessageParameter, target: Selector)
+prepare_sources(context: &CommandContext, expression: MessageExpression) -> Future<Output = Result<Vec<storage_core::MessageSource>, MclError>>
     行为：
-        准备消息来源和目标选择器，交给存储领域完成范围校验及替换；
-        不在MCL闭包内改写存储数据；等待存储结果并转换为Unit或MCL错误。
+        Selector转换为存储选择器，携带当前目标VM实例；
+        PromptAlias按已导入路径在blocking worker读取，按资源角色构造Literal来源；
+        保留来源书写顺序，不在此改写目标Block。
 
-execute_config(context: CommandContext, operation: ConfigOperation)
+execute_operation(context: &CommandContext) -> Future<Output = Result<MclValue, MclError>>
     行为：
-        只访问当前Agent设置文件；
-        GET读取整份TOML；
-        SET按点分路径赋值；
-        DELETE删除键；
-        写入完整成功才返回。
+        执行前检查命令及执行取消标记，按MclOperation分派；
+        Create转换CreateBlock，TEMP绑定当前VM；Get调用read_expression并返回Array.Message；
+        Inject将手工数组、空数组或表达式转换为消息来源，交存储ReplaceMessages完成替换，等待结果返回Unit；
+        Config转换ReadConfig、SetConfig或DeleteConfig，仅访问当前Agent设置，读取返回Config，修改确认后返回Unit；
+        Import及Effect分别调用execute_import和execute_effect，不在本函数回复原请求或写命令审计。
 
-execute_effect(context: CommandContext, name: String, arguments: Vec<EffectParameter>)
+execute_effect(context: &CommandContext, name: &str, arguments: Vec<EffectParameter>) -> Future<Output = Result<MclValue, MclError>>
     行为：
         按effect参数约束求值，通过对应领域core能力执行或发送带oneshot的具体领域请求；
         保留请求与回合关联。inference使用消息及推理参数，工具调用使用调用消息；
         工具定义与查找来自目标Agent的Tools。中止由队列外的控制流程受理，各System复检turn。
         按name分派领域调用并将参数求值为该领域输入，等待结果后返回MclValue或MclError；
-        同步存储能力在blocking worker执行并等待真实join；不在此函数发送原请求reply或写入统一命令审计。
+        同步存储能力在blocking worker执行并等待真实join；不在此函数发送原请求reply或写入统一命令审计；
+        history_append取得目标owned AgentStorage，复检命令及取消，在worker调用append_message_history并返回Array.Message。
+
+block_effect_argument(context: &CommandContext, parameter: &EffectParameter) -> Result<&serde_json::Value, MclError>
+    行为：取得Manual指定的原始JSON参数，缺失或非Manual返回ArgumentMismatch，不作为消息数组解释。
+
+execute_block_effect(context: &CommandContext, name: &str, parameters: Vec<EffectParameter>) -> Future<Output = Result<MclValue, MclError>>
+    行为：
+        按既有标识符规则校验Block名，恢复参数校验为SQLite范围内正整数；不接收物理路径
+        通过World闭包check_action复检命令、来源及取消，克隆目标AgentStorage，不跨await借用World
+        owned句柄及当前VM命名空间交给blocking worker，提交前复检取消，执行对应存储能力并await真实join
+        将存储结果转换为Unit或BlockSnapshots，错误沿storage_error转换，worker失败为CleanupFailed
+        不在本函数写审计或发送原请求reply，不自动重试
 
 execute_tools(context: CommandContext, messages: Vec<Value>) -> Future<Output = Result<MclValue, MclError>>
     行为：

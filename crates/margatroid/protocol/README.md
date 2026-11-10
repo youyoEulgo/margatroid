@@ -12,7 +12,9 @@ Protocol定义JSON信封、请求、回执、状态、历史和流分片。只�
 
 state.sync包含workspace_definitions、workspaces、agents和histories。agent_instance是拒绝迟到消息的不透明输出标识，不用于入站寻址。
 
-网络消息独立定义System、Inject、User、Assistant、ToolCall结果和Error。MCL命令执行失败通过result.Ok.Error携带type=error、message及request_id；外层Ok表示错误消息已经交付，不表示命令成功。工具调用失败通过Array.Message中的tool_call.failed=true返回，保留原调用ID。网络信封、注册及目标受理错误仍使用对应协议失败回执，前端须同时检查消息内错误，不能只检查外层Result。图片放入独立images数组，元素为media_type与标准base64 data；支持PNG/JPEG/GIF/WebP，每条最多8张、每张解码后5MiB、合计20MiB。replay作为可选不透明JSON传输。
+网络消息独立定义System、Inject、User、Assistant、ToolCall结果和Error。MCL命令执行失败通过result.Ok.Error携带type=error、message及request_id；外层Ok表示错误消息已经交付，不表示命令成功。工具调用失败通过Array.Message中的tool_call.failed=true返回，保留原调用ID。网络信封、注册及目标受理错误仍使用对应协议失败回执，前端须同时检查消息内错误，不能只检查外层Result。媒体放入独立data数组，当前元素为media_type与标准base64 data；支持PNG/JPEG/GIF/WebP，每条最多8张、每张解码后5MiB、合计20MiB。Rust DTO字段images通过serde重命名为data，线上不使用images或厂商replay字段。正文与reasoning各保留一份，厂商与API格式转换只在推理适配边界处理。
+
+每种AgentMessage均可携带sequence，值为真实持久历史序号。尚未写入历史的消息不提供该字段，不生成替代ID；历史读取与已持久消息的Block读取保留同一序号。它不等于流分片的sequence，也不随数组位置变化。
 
 历史记录按sequence、turn、type、source、kind、content、payload和created_at_ms排列；type仅消息携带，表示AgentMessage类型（如user、assistant、error），source仅MCL携带。kind区分message与mcl，不代替消息type。sequence在单个Agent内稳定标识与排序记录，前端结合Workspace和Agent上下文构造展示标识；不传输历史key。MCL的source保存真实调用方地址，不使用Entity编号；消息不输出source。content与payload独立保留，content按调用方原值传输，不从payload派生。时间0表示未知。流分片关联请求ID、Agent、实例及sequence；finished表示显示流终态，不表示领域操作或清理完成。
 

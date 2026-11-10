@@ -202,7 +202,7 @@ test('placeholder arguments accept JSON values and message injection preserves i
   const image = { media_type: 'image/png', data: 'iVBORw0KGgo=' };
   assert.deepEqual(contextInjection('', 'entry.pending[-1]', [image]), {
     command: 'INJECT ? TO entry.pending[-1]',
-    arguments: [[{ type: 'user', content: '', images: [image] }]],
+    arguments: [[{ type: 'user', content: '', data: [image] }]],
   });
   for (const destination of ['', 'x\nEFFECT wake', 'field', 'x.y;EFFECT wake'])
     assert.throws(() => contextInjection('text', destination));
@@ -602,10 +602,7 @@ test('history sequence identity, type and unknown timestamps survive nested mess
   assert.ok(
     parseServerMessage(JSON.stringify({ ...wire, history: { ...saved, messages: [withoutType] } })),
   );
-  assert.equal(
-    historyEntries({ ...saved, messages: [withoutType] })[0]!.messageType,
-    null,
-  );
+  assert.equal(historyEntries({ ...saved, messages: [withoutType] })[0]!.messageType, null);
   assert.equal(formatRecordTime(entries[0]!.timestamp), 'Time unavailable');
 });
 test('history reconciles a stream by explicit request_id, never by matching text', () => {
@@ -689,7 +686,7 @@ test('token totals and latest context usage come only from persisted assistant h
 test('images keep wire-only metadata and reject unsupported formats or excessive budgets', async () => {
   const image = { media_type: 'image/png', data: 'iVBORw0KGgo=', name: 'private.png', size: 8 };
   assert.deepEqual(wireImages([image]), [{ media_type: image.media_type, data: image.data }]);
-  assert.ok(!metadataText({ images: [image] }).includes(image.data));
+  assert.ok(!metadataText({ data: [image] }).includes(image.data));
   assert.equal(imageMediaType(new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])), 'image/png');
   assert.equal(imageMediaType(new TextEncoder().encode('<svg/>')), null);
   validateImageBudget(Array(8).fill(2 * 1024 * 1024));
@@ -703,7 +700,7 @@ test('images keep wire-only metadata and reject unsupported formats or excessive
     isAgentMessage({
       type: 'user',
       content: '',
-      images: [{ media_type: 'image/svg+xml', data: 'abcd' }],
+      data: [{ media_type: 'image/svg+xml', data: 'abcd' }],
     }),
     false,
   );
@@ -717,7 +714,7 @@ test('multi-MiB image send waits for parsed receipts and diagnostics do not expo
       (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
     )!;
     assert.ok(JSON.stringify(inject).length > 1024 * 1024);
-    assert.deepEqual(inject.message.arguments, [[{ type: 'user', content: '', images: [image] }]]);
+    assert.deepEqual(inject.message.arguments, [[{ type: 'user', content: '', data: [image] }]]);
     env.reply(inject.id);
     await Promise.resolve();
     await Promise.resolve();
@@ -1036,7 +1033,12 @@ test('MCL history retains source while message history requires type without sou
   const entry = historyEntries(saved)[0]!;
   assert.equal(entry.source, 'client:local/ui:latest');
   assert.equal(entry.messageType, null);
-  const message = { ...saved.messages[0]!, kind: 'message', type: 'user' };
+  const message = {
+    ...saved.messages[0]!,
+    kind: 'message',
+    type: 'user',
+    payload: { type: 'user', content: 'hello', sequence: 1 },
+  };
   assert.equal(
     parseServerMessage(JSON.stringify({ ...wire, history: { ...saved, messages: [message] } })),
     null,
@@ -1054,10 +1056,7 @@ test('MCL history retains source while message history requires type without sou
       JSON.stringify({ ...wire, history: { ...saved, messages: [mclWithoutSource] } }),
     ),
   );
-  assert.equal(
-    historyEntries({ ...saved, messages: [mclWithoutSource] })[0]!.source,
-    null,
-  );
+  assert.equal(historyEntries({ ...saved, messages: [mclWithoutSource] })[0]!.source, null);
 });
 
 test('MCL error message results reject pending writes without waking the Driver', async () => {
@@ -1205,7 +1204,11 @@ test('tool results merge into the assistant call row', () => {
     call.toolCalls.map((tool) => tool.id),
     ['call-a', 'call-b'],
   );
-  assert.deepEqual(call.toolResults?.get('call-a'), { content: 'ok', failed: false, images: undefined });
+  assert.deepEqual(call.toolResults?.get('call-a'), {
+    content: 'ok',
+    failed: false,
+    images: undefined,
+  });
   assert.deepEqual(call.toolResults?.get('call-b'), {
     content: 'failed',
     failed: true,
@@ -1251,4 +1254,79 @@ test('tool payloads render as readable TOML-like text', () => {
   assert.ok(result.includes('output = ['));
   assert.ok(result.includes("'''a\nb'''"));
   assert.ok(result.includes('failed = false'));
+});
+
+test('internal messages use data, preserve sequence and reject obsolete wire fields', () => {
+  const image = { media_type: 'image/png', data: 'iVBORw0KGgo=' };
+  const user = { type: 'user', content: 'picture', data: [image], sequence: 17 };
+  const tool = {
+    type: 'tool_call',
+    tool_call_id: 'call',
+    tool_name: 'read_image',
+    content: '',
+    data: [image],
+    failed: false,
+    sequence: 18,
+  };
+  assert.equal(isAgentMessage(user), true);
+  assert.equal(isAgentMessage(tool), true);
+  for (const message of [user, tool, { type: 'assistant', reasoning: 'thought' }]) {
+    assert.equal(isAgentMessage({ ...message, replay: null }), false);
+    assert.equal(isAgentMessage({ ...message, images: [] }), false);
+  }
+  for (const sequence of [-1, 1.5, '17', null]) {
+    assert.equal(isAgentMessage({ ...user, sequence }), false);
+  }
+  assert.equal(isAgentMessage({ type: 'inject', messages: [{ ...user, images: [] }] }), false);
+  const rows = historyEntries(
+    history([
+      {
+        sequence: 17,
+        turn: null,
+        kind: 'message',
+        content: 'picture',
+        payload: user,
+        created_at_ms: 1,
+      },
+      { sequence: 18, turn: null, kind: 'message', content: '', payload: tool, created_at_ms: 2 },
+    ]),
+  );
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows[0]!.images, [image]);
+  assert.deepEqual(rows[1]!.images, [image]);
+  assert.equal((rows[0]!.payload as { sequence: number }).sequence, 17);
+  for (const obsolete of [{ replay: {} }, { images: [image] }]) {
+    const invalid = { ...user, ...obsolete };
+    assert.equal(
+      parseServerMessage(
+        JSON.stringify({
+          type: 'history.result',
+          id: 'h',
+          history: history([
+            {
+              sequence: 17,
+              turn: null,
+              kind: 'message',
+              content: 'picture',
+              payload: invalid,
+              created_at_ms: 1,
+            },
+          ]),
+        }),
+      ),
+      null,
+    );
+    assert.equal(
+      parseServerMessage(
+        JSON.stringify({
+          type: 'mcl.command_result',
+          id: 'm',
+          source: 'client:local/ui:latest',
+          target: workspace.agents[0],
+          result: { Ok: { Array: { Message: [invalid] } } },
+        }),
+      ),
+      null,
+    );
+  }
 });

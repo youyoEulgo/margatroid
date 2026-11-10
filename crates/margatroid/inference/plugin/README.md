@@ -19,11 +19,11 @@ InferenceRequest没有tools参数。每次推理遍历当前Agent.Tools，以ali
 
 DomainRequest通过TryFrom转换为ChatCompletionsRequest、MessagesRequest或ResponsesRequest；EncodeInput只在插件内提供目标能力。ApiAdapter按七个明确组合分派至OpenAi<T>、Anthropic<T>、DeepSeek<T>或OpenRouter<T>的具体process；T必须是具体请求类型，各支持组合分别实现process，不存在通用VendorAdapter对JSON做厂商修补。公共传输辅助只负责端点、头和有类型请求序列化。响应解码器随构造出的HTTP请求携带，HTTP worker不再根据路由字符串另选格式。
 
-Messages要求max_output_tokens，Responses拒绝stop，提交完整本地上下文且store=false。同格式合法的Messages thinking签名、遮蔽内容和Responses encrypted_content完整回放；缺少replay或属于其它已知格式的历史，只转换正文与工具关联，不伪造专用思考块，也不修改本地历史。损坏或未知格式的已提供replay仍失败；本次响应缺失必要元数据仍严格报协议错误。用户及工具图片验证标准base64、数量、解码字节和magic。Chat在工具结果整批齐备后追加user图片投影，Messages/Responses使用原生布局。
+Messages要求max_output_tokens，Responses拒绝stop，提交完整本地上下文且store=false。内部消息只保留一份reasoning、正文和工具关联，没有api_format、签名原生块或加密重放字段。目标支持独立历史reasoning字段时在格式转换中映射；不支持时保留正文与工具，不把思考塞入正文或伪造签名。只有reasoning而无正文或工具、目标又无法表达时明确拒绝转换。响应可读思考归一为reasoning，签名和加密协议材料不进入共享结果或累积器。内部用户及工具消息图片集合键为data，图片项使用media_type与base64 data；验证标准base64、数量、解码字节和magic。Chat在工具结果整批齐备后追加user图片投影，Messages/Responses使用原生布局。
 
-HTTP/SSE worker 只输出到容量 32 的 ProviderFragment 通道，不向前端发送。解码器维护字节缓冲、协议索引、usage 计数及 Responses 完整性摘要，不保留另一份最终正文或工具参数。Content、Reasoning、ToolCallDelta、Replay、Usage、Finished 全部经同一个接收出口进入唯一 ResponseAccumulator。
+HTTP/SSE worker 只输出到容量 32 的 ProviderFragment 通道，不向前端发送。解码器维护字节缓冲、协议索引、usage 计数及 Responses 完整性摘要，不保留另一份最终正文或工具参数。Content、Reasoning、ToolCallDelta、Usage、Finished 全部经同一个接收出口进入唯一 ResponseAccumulator。
 
-接收循环使用 biased select 优先取消，每轮只取一个分片，进入 StreamGate 短锁后复检关闭状态。只有接受的片段才能更新正文并获得 sequence。stop_stream 同步关闭门，InferenceHandle.cancel 先冻结再发取消；receiver 随即关闭并丢弃未接受 backlog。中止回复使用completed，只保留已接受正文和思考，清除工具调用、replay、usage，不填充取消文案。
+接收循环使用 biased select 优先取消，每轮只取一个分片，进入 StreamGate 短锁后复检关闭状态。只有接受的片段才能更新正文并获得 sequence。stop_stream 同步关闭门，InferenceHandle.cancel 先冻结再发取消；receiver 随即关闭并丢弃未接受 backlog。中止回复使用completed，只保留已接受正文和思考，清除工具调用、usage，不填充取消文案。
 
 前端维持 agent.message.delta、agent.message.reasoning_delta、agent.message.finished，均携带 request id、Address 和 agent_instance。两种 delta 使用 content 文本字段及递增 sequence；finished 携带 error，不要求 sequence。发送在接受门锁外使用 mecs 连接已有的有界队列，满或关闭的连接从本次出口剔除，不阻塞接收循环，不改变后端结果。后续新连接不加入本次快照。
 
@@ -31,7 +31,7 @@ HTTP/SSE worker 只输出到容量 32 的 ProviderFragment 通道，不向前端
 
 预算包括配置 1MiB、请求/响应各 128MiB、SSE 单事件 4MiB、正文与工具参数及图片上限。单消息图片最多 8 张，每张解码 5MiB，合计 20MiB。整体执行默认 180 秒，工具定义准备计入期限。连接超时为 30 秒；等待响应头受整体剩余期限约束，流开始后每次读取的空闲上限为 60 秒，不把该空闲上限用于首响应等待。
 
-装配层集成验证通过本地 HTTP 检查七种组合、鉴权、端点、图片、已登记工具定义及 Entity generation，并通过真实 DTO/WebSocket 注册、state.sync 广告和推理流核对 VM 重启前后的 agent_instance。内部并发测试物理上位于 tests/internal：使用真实 HTTP 填满有界通道，验证未接受 backlog 不进入冻结累积器，并通过测试专用清理门验证同步冻结先于 worker join、oneshot 等待真实 join。另覆盖严格终态、UTF-8 跨字节、签名和加密 replay、完整工具调用及 SSE 预算。
+装配层集成验证通过本地 HTTP 检查七种组合、鉴权、端点、图片、已登记工具定义及 Entity generation，并通过真实 DTO/WebSocket 注册、state.sync 广告和推理流核对 VM 重启前后的 agent_instance。内部并发测试物理上位于 tests/internal：使用真实 HTTP 填满有界通道，验证未接受 backlog 不进入冻结累积器，并通过测试专用清理门验证同步冻结先于 worker join、oneshot 等待真实 join。另覆盖严格终态、UTF-8 跨字节、签名及加密材料不进入内部消息、跨API保留正文与工具、完整工具调用及 SSE 预算。
 
 工具目录不按条目数或单条描述长度截断，统一受HTTP请求总字节预算约束。真实HTTP回归覆盖1024个工具、每条16KiB描述，在三种模型格式中逐条核对完整名称、描述及schema。
 

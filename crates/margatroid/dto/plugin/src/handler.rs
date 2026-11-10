@@ -485,7 +485,7 @@ fn agent_operation(
         project_root: component.project_root.clone(),
         home_root: home.clone(),
         database_path: home.join("state.sqlite"),
-        settings_path: home.join("settings.toml"),
+        settings_path: home.join("setting.toml"),
     };
     let kind = if restarting {
         OperationKind::AgentRestart {
