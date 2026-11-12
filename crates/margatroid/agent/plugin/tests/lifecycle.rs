@@ -395,6 +395,18 @@ fn startup_parallel_init_same_frame_vm_ready_and_safe_agent_info() {
         AgentState::Starting
     );
     assert!(reply.try_recv().is_err());
+    let source = fixture
+        .app
+        .world()
+        .get_component::<agent_core::AgentDriverSource>(agent)
+        .unwrap();
+    assert_eq!(source.address, fixture.parameters.driver);
+    assert!(source.manifest_path.starts_with(fixture.root.path()));
+    assert_eq!(
+        source.manifest_path.canonicalize().unwrap(),
+        source.manifest_path
+    );
+    assert_eq!(source.manifest_path.file_name().unwrap(), "driver.toml");
     let state = fixture.app.world().get_resource::<FakeDomains>().unwrap();
     assert_eq!(state.tool_frames, state.inference_frames);
     let request = &state.vm_starts[0];

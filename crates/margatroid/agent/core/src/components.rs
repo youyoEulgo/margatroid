@@ -10,3 +10,10 @@ pub struct Agent {
 }
 
 impl Component for Agent {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentDriverSource {
+    pub address: String,
+    pub manifest_path: std::path::PathBuf,
+}
+impl Component for AgentDriverSource {}

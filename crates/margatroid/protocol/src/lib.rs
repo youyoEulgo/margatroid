@@ -69,7 +69,8 @@ pub fn parse_client_message(text: &str) -> Result<ClientMessage, ProtocolError> 
         ClientMessage::AgentStop { message, .. }
         | ClientMessage::AgentRestart { message, .. }
         | ClientMessage::AgentTurnReq { message, .. }
-        | ClientMessage::AgentTaskReq { message, .. } => validate_target(&message.address)?,
+        | ClientMessage::AgentTaskReq { message, .. }
+        | ClientMessage::AgentUiReq { message, .. } => validate_target(&message.address)?,
         ClientMessage::AgentTurnAbort { message, .. } => {
             validate_target(&message.address)?;
             if !valid_request_id(&message.turn) {
@@ -275,6 +276,7 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
         kind,
         "workspace.sync"
             | "agent.sync"
+            | "agent.ui.sync"
             | "agent.turn.sync"
             | "agent.task.sync"
             | "agent.log.sync"
@@ -292,6 +294,7 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                 | "workspace.restart.result"
                 | "workspace.reload.result"
                 | "agent.res"
+                | "agent.ui.res"
                 | "agent.start.result"
                 | "agent.stop.result"
                 | "agent.restart.result"
@@ -330,13 +333,14 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
             "connection.register.result" => Some("client"),
             "workspace.res" => Some("workspaces"),
             "agent.res" => Some("agents"),
+            "agent.ui.res" => Some("ui"),
             "agent.turn.res" => Some("state"),
             "agent.task.res" => Some("tasks"),
             "agent.history.res" | "agent.log.res" | "agent.mcl.res" => Some("records"),
             _ => None,
         };
         if let Some(key) = payload
-            && (success && value.get(key).is_none_or(Value::is_null)
+            && (success && (value.get(key).is_none() || key != "ui" && value[key].is_null())
                 || !success && value.get(key).is_some())
         {
             return Err(invalid("response payload does not match success"));
@@ -365,6 +369,19 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                 }
             }
         }
+    }
+    if kind == "agent.ui.sync" {
+        require_fields(value, &["ui", "error"])?;
+        if !value["error"].is_null() && !value["ui"].is_null() {
+            return Err(invalid("failed UI sync must have null ui"));
+        }
+    }
+    if matches!(kind, "agent.ui.res" | "agent.ui.sync")
+        && let Some(ui) = value.get("ui").filter(|v| !v.is_null())
+    {
+        let bundle: AgentUiBundleDto =
+            serde_json::from_value(ui.clone()).map_err(|_| invalid("invalid Driver UI bundle"))?;
+        validate_ui_bundle(&bundle)?;
     }
     if let Some(error) = value.get("error").filter(|v| !v.is_null()) {
         let code = error
@@ -605,6 +622,44 @@ fn require_fields(value: &Value, keys: &[&str]) -> Result<(), ProtocolError> {
         if value.get(*key).is_none() {
             return Err(invalid("required nullable field is missing"));
         }
+    }
+    Ok(())
+}
+
+pub fn validate_ui_bundle(bundle: &AgentUiBundleDto) -> Result<(), ProtocolError> {
+    let Some(hash) = bundle.revision.strip_prefix("sha256:") else {
+        return Err(invalid("invalid UI revision"));
+    };
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(invalid("invalid UI revision"));
+    }
+    if bundle.entry != "index.html" || !bundle.files.iter().any(|file| file.path == bundle.entry) {
+        return Err(invalid("missing UI entry"));
+    }
+    let mut previous: Option<&str> = None;
+    for file in &bundle.files {
+        if file.path.starts_with('/')
+            || file.path.contains('\\')
+            || file.path.chars().any(char::is_control)
+            || file
+                .path
+                .split('/')
+                .any(|p| p.is_empty() || matches!(p, "." | ".."))
+            || previous.is_some_and(|old| old >= file.path.as_str())
+        {
+            return Err(invalid("UI paths must be unique sorted relative paths"));
+        }
+        if file.media_type.trim().is_empty()
+            || file.media_type.chars().any(char::is_control)
+            || STANDARD.decode(&file.data).is_err()
+        {
+            return Err(invalid("invalid UI file encoding or media type"));
+        }
+        previous = Some(&file.path);
     }
     Ok(())
 }

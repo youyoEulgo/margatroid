@@ -21,6 +21,7 @@ import {
   type TaskSnapshot,
 } from '../types/protocol';
 import { formatToolPayload, inlineToolPayload } from '../lib/format';
+import { buildDriverDocument } from '../lib/driverUi';
 import {
   validateImageBudget,
   wireImages,
@@ -219,6 +220,98 @@ test('registration independently queries Workspace and active Agents without glo
       'Read a file',
     );
     assert.ok(!e.sent.some((x) => x.type.includes('state')));
+  } finally {
+    e.cleanup();
+  }
+});
+test('Driver UI documents inline entry assets and inject the selected agent', () => {
+  const document = buildDriverDocument(
+    {
+      revision: `sha256:${'c'.repeat(64)}`,
+      entry: 'index.html',
+      files: [
+        {
+          path: 'index.html',
+          media_type: 'text/html; charset=utf-8',
+          data: Buffer.from(
+            '<html><head><link rel="stylesheet" href="app.css"><script src="app.js"></script></head><body></body></html>',
+          ).toString('base64'),
+        },
+        {
+          path: 'app.css',
+          media_type: 'text/css; charset=utf-8',
+          data: Buffer.from('body{color:red}').toString('base64'),
+        },
+        {
+          path: 'app.js',
+          media_type: 'text/javascript; charset=utf-8',
+          data: Buffer.from('window.loaded = true').toString('base64'),
+        },
+      ],
+    },
+    { endpoint: 'ws://127.0.0.1:3939/ws', address },
+  );
+  assert.ok(document.includes('<style>body{color:red}</style>'));
+  assert.ok(document.includes('window.loaded = true'));
+  assert.ok(document.includes('__MARGATROID_DRIVER__'));
+  assert.ok(document.includes(address));
+  assert.ok(!document.includes('src="app.js"'));
+});
+test('older history follows the paging cursor and stops at the oldest page', () => {
+  const e = setup();
+  try {
+    const first = e.sent.find((wire) => wire.type === 'agent.history.req')!;
+    e.receive({ ...page(first.id, [historyRecord(10, 'new')]), next_before_sequence: 5 });
+    e.store.loadOlderHistory();
+    const older = e.sent.filter((wire) => wire.type === 'agent.history.req').at(-1)!;
+    assert.equal(older.message.before_sequence, 10);
+    e.store.loadOlderHistory();
+    assert.equal(
+      e.sent.filter((wire) => wire.type === 'agent.history.req').length,
+      2,
+    );
+    e.receive({ ...page(older.id, [historyRecord(1, 'old')]), next_before_sequence: null });
+    e.store.loadOlderHistory();
+    assert.equal(
+      e.sent.filter((wire) => wire.type === 'agent.history.req').length,
+      2,
+    );
+  } finally {
+    e.cleanup();
+  }
+});
+test('agent.ui request, response and sync keep the last loaded Driver UI', () => {
+  const e = setup();
+  try {
+    const request = e.sent.find((wire) => wire.type === 'agent.ui.req');
+    assert.ok(request);
+    assert.deepEqual(request.message, { address });
+    const revision = `sha256:${'a'.repeat(64)}`;
+    const ui = {
+      revision,
+      entry: 'index.html',
+      files: [{ path: 'index.html', media_type: 'text/html; charset=utf-8', data: 'PGgxPkRyaXZlcjwvaDE+' }],
+    };
+    e.receive({
+      type: 'agent.ui.res',
+      id: request.id,
+      address,
+      success: true,
+      ui,
+    });
+    assert.equal(e.store.agentUiBundle?.revision, revision);
+    e.receive({
+      type: 'agent.ui.sync',
+      address,
+      ui: null,
+      error: { code: 'DriverUiReadFailed', message: 'read failed' },
+    });
+    assert.equal(e.store.agentUiError, 'read failed');
+    assert.equal(e.store.agentUiBundle?.revision, revision);
+    const next = { ...ui, revision: `sha256:${'b'.repeat(64)}` };
+    e.receive({ type: 'agent.ui.sync', address, ui: next, error: null });
+    assert.equal(e.store.agentUiBundle?.revision, next.revision);
+    assert.equal(e.store.agentUiError, '');
   } finally {
     e.cleanup();
   }

@@ -1,6 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+
+interface DriverBootstrap {
+  endpoint: string;
+  address: string;
+  contextPath?: string;
+}
+const driverBoot: DriverBootstrap | undefined = (
+  window as unknown as { __MARGATROID_DRIVER__?: DriverBootstrap }
+).__MARGATROID_DRIVER__;
+const driverMode = !!driverBoot;
 import { storeToRefs } from 'pinia';
+import { isRecord } from '@/types/protocol';
 import {
   Activity,
   Check,
@@ -330,8 +341,26 @@ function onComposerEnter(event: KeyboardEvent) {
   void submitMessage();
 }
 
+let driverSelectionWatch: (() => void) | undefined;
+function selectDriverAgent() {
+  if (!driverBoot) return;
+  const workspace = store.sidebarTree.workspaces.find((entry) =>
+    entry.agents.some((agent) => agent.id === driverBoot.address),
+  );
+  if (!workspace) return;
+  if (store.selectedAgent !== driverBoot.address || store.selectedWorkspaceKey !== workspace.path)
+    store.selectAgent(driverBoot.address, workspace.path);
+}
 onMounted(() => {
-  if (!selectedWorkspace.value && workspaces.value[0]) {
+  if (driverBoot) {
+    store.endpoint = driverBoot.endpoint;
+    endpointDraft.value = driverBoot.endpoint;
+    if (driverBoot.contextPath) store.driverContextPath = driverBoot.contextPath;
+    driverSelectionWatch = watch(() => store.sidebarTree, selectDriverAgent, {
+      deep: true,
+      immediate: true,
+    });
+  } else if (!selectedWorkspace.value && workspaces.value[0]) {
     store.selectWorkspace(workspaces.value[0].path);
   }
   store.connect();
@@ -348,9 +377,11 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  driverSelectionWatch?.();
   document.removeEventListener('click', closeFloatingOnOutsideClick);
   document.removeEventListener('keydown', closeOverlaysOnEscape);
   clearTimeout(copiedTimer);
+  clearTimeout(olderTimer);
   composerObserver?.disconnect();
   store.disconnect();
 });
@@ -468,6 +499,42 @@ function scrollMessages() {
   messageList.value?.scrollTo({ top: messageList.value.scrollHeight, behavior: 'instant' });
 }
 
+const olderPending = ref(false);
+let olderAnchor: { height: number; top: number } | null = null;
+let olderTimer: ReturnType<typeof setTimeout> | undefined;
+
+function loadEarlierMessages() {
+  const list = messageList.value;
+  if (!list || olderPending.value) return;
+  olderAnchor = { height: list.scrollHeight, top: list.scrollTop };
+  olderPending.value = true;
+  store.loadOlderHistory();
+  clearTimeout(olderTimer);
+  olderTimer = setTimeout(() => {
+    olderPending.value = false;
+    olderAnchor = null;
+  }, 1500);
+}
+
+function onMessageScroll() {
+  const list = messageList.value;
+  if (!list || olderPending.value || list.scrollTop > 96) return;
+  loadEarlierMessages();
+}
+
+watch(
+  () => conversationMessages.value.length,
+  async (next, previous) => {
+    if (!olderAnchor || next <= previous) return;
+    await nextTick();
+    const list = messageList.value;
+    if (list) list.scrollTop = list.scrollHeight - olderAnchor.height + olderAnchor.top;
+    olderPending.value = false;
+    olderAnchor = null;
+    clearTimeout(olderTimer);
+  },
+);
+
 /** Let the wheel roll through the composer into the message list. */
 function handleComposerWheel(event: WheelEvent) {
   const list = messageList.value;
@@ -555,20 +622,21 @@ const conversationMessages = computed(() =>
   visibleMessages.value.filter((message) => !isMcLRecord(message)),
 );
 
-// Timestamps mark turn boundaries: the user message and the assistant reply
-// that immediately precedes it. Everything else stays clean.
+function stopReason(message: ConversationEntry): string | null {
+  const payload = message.payload;
+  if (!isRecord(payload)) return null;
+  if (typeof payload.stop_reason === 'string') return payload.stop_reason;
+  if (isRecord(payload.message) && typeof payload.message.stop_reason === 'string')
+    return payload.message.stop_reason;
+  return null;
+}
+
+// Only a user message and a completed assistant reply carry timestamp and copy.
 function showsMeta(index: number): boolean {
-  const messages = conversationMessages.value;
-  const message = messages[index];
+  const message = conversationMessages.value[index];
   if (!message) return false;
   if (message.role === 'user') return true;
-  if (message.role !== 'assistant') return false;
-  for (let next = index + 1; next < messages.length; next++) {
-    const role = messages[next]!.role;
-    if (role === 'record') continue;
-    return role === 'user';
-  }
-  return false;
+  return message.role === 'assistant' && stopReason(message) === 'completed';
 }
 
 // The transcript is one flat block flow. A message is not one visual box: its
@@ -623,7 +691,7 @@ const conversationRows = computed<ConversationRow[]>(() => {
 </script>
 
 <template>
-  <div class="app-shell">
+  <div :class="['app-shell', { 'driver-mode': driverMode }]">
     <div v-if="sidebarOpen" class="mobile-scrim" @click="sidebarOpen = false"></div>
     <aside :class="['workspace-sidebar', { 'workspace-sidebar--open': sidebarOpen }]">
       <div class="brand-row">
@@ -701,7 +769,12 @@ const conversationRows = computed<ConversationRow[]>(() => {
         </div>
       </header>
 
-      <section ref="messageList" class="message-list" aria-live="polite">
+      <section
+        ref="messageList"
+        class="message-list"
+        aria-live="polite"
+        @scroll="onMessageScroll"
+      >
         <div v-if="!selectedWorkspace" class="empty-state">
           <div class="empty-icon">
             <UsersRound :size="23" />

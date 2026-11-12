@@ -12,7 +12,7 @@ fn error() -> Value {
 }
 
 #[test]
-fn all_seventeen_client_types_round_trip_and_keep_request_ids() {
+fn all_eighteen_client_types_round_trip_and_keep_request_ids() {
     let cases = vec![
         (
             "connection.register",
@@ -27,6 +27,7 @@ fn all_seventeen_client_types_round_trip_and_keep_request_ids() {
             json!({"path":"/project/workspace.yaml"}),
         ),
         ("agent.req", json!({})),
+        ("agent.ui.req", target()),
         (
             "agent.start",
             json!({"workspace":"workspace:local/demo:latest","name":"coder"}),
@@ -47,7 +48,7 @@ fn all_seventeen_client_types_round_trip_and_keep_request_ids() {
             json!({"address":"agent:demo/coder:latest","command":"CONFIG GET"}),
         ),
     ];
-    assert_eq!(cases.len(), 17);
+    assert_eq!(cases.len(), 18);
     for (kind, payload) in cases {
         let request = parse(kind, payload).unwrap();
         assert_eq!(request.id(), "request-1");
@@ -131,7 +132,7 @@ fn record_queries_use_exclusive_bounds_and_positive_limits() {
 }
 
 #[test]
-fn all_twenty_five_server_types_round_trip_and_distinguish_sync_ids() {
+fn all_twenty_seven_server_types_round_trip_and_distinguish_sync_ids() {
     let mut cases = Vec::new();
     for kind in [
         "workspace.start.result",
@@ -152,6 +153,8 @@ fn all_twenty_five_server_types_round_trip_and_distinguish_sync_ids() {
         json!({"type":"workspace.sync","workspaces":[]}),
         json!({"type":"agent.res","id":"request-1","success":true,"agents":[]}),
         json!({"type":"agent.sync","agents":[]}),
+        json!({"type":"agent.ui.res","id":"request-1","address":"agent:demo/coder","success":true,"ui":null}),
+        json!({"type":"agent.ui.sync","address":"agent:demo/coder","ui":null,"error":null}),
         json!({"type":"agent.turn.res","id":"request-1","success":true,"state":{"address":"agent:demo/coder","turn":null}}),
         json!({"type":"agent.turn.sync","address":"agent:demo/coder","turn":null}),
         json!({"type":"agent.task.res","id":"request-1","success":true,"address":"agent:demo/coder","tasks":[]}),
@@ -164,7 +167,7 @@ fn all_twenty_five_server_types_round_trip_and_distinguish_sync_ids() {
     }
     cases.push(json!({"type":"agent.log.sync","address":"agent:demo/coder","records":[{"sequence":1,"created_at_ms":0,"level":"info","source":"driver","stage":"execute","message":"ready","details_json":null,"context_json":null,"origin":null,"raw_error":null,"traceback":null}]}));
     cases.push(json!({"type":"agent.mcl.sync","address":"agent:demo/coder","records":[{"sequence":2,"created_at_ms":0,"source":"client:webui/browser:1","turn":null,"content":"CONFIG GET","payload":{"text":"CONFIG GET"}}]}));
-    assert_eq!(cases.len(), 25);
+    assert_eq!(cases.len(), 27);
     for raw in cases {
         let message: ServerMessage =
             serde_json::from_value(raw.clone()).unwrap_or_else(|e| panic!("{}: {e}", raw["type"]));
@@ -383,4 +386,60 @@ fn agent_resources_and_public_model_fields_are_strict_and_nullable() {
     value["agents"][0]["model"] = Value::Null;
     value["agents"][0]["sandboxes"] = json!([]);
     assert!(serde_json::from_value::<ServerMessage>(value).is_ok());
+}
+
+#[test]
+fn driver_ui_messages_enforce_complete_resource_and_nullable_contracts() {
+    let bundle = json!({"revision":format!("sha256:{}","0".repeat(64)),"entry":"index.html","files":[{"path":"index.html","media_type":"text/html; charset=utf-8","data":"aGk="}]});
+    let value = json!({"type":"agent.ui.res","id":"ui","address":"agent:demo/coder","success":true,"ui":bundle});
+    let message: ServerMessage = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(message).unwrap(), value);
+    let absent = ServerMessage::AgentUiRes {
+        id: "missing".into(),
+        success: true,
+        address: "agent:demo/coder".into(),
+        ui: None,
+        error: None,
+    };
+    assert!(
+        serde_json::to_value(absent)
+            .unwrap()
+            .get("ui")
+            .unwrap()
+            .is_null()
+    );
+    for patch in [
+        json!({"entry":"other.html"}),
+        json!({"revision":"wrong"}),
+        json!({"files":[]}),
+        json!({"files":[{"path":"../index.html","media_type":"text/html","data":"aGk="}]}),
+        json!({"files":[{"path":"index.html","media_type":"text/html","data":"%%%"}]}),
+    ] {
+        let mut invalid = value.clone();
+        invalid["ui"]
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        assert!(serde_json::from_value::<ServerMessage>(invalid).is_err());
+    }
+    let mut duplicate = value.clone();
+    duplicate["ui"]["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(bundle["files"][0].clone());
+    assert!(serde_json::from_value::<ServerMessage>(duplicate).is_err());
+    for value in [
+        json!({"type":"agent.ui.res","id":"ui","address":"agent:demo/coder","success":true}),
+        json!({"type":"agent.ui.res","id":"ui","address":"agent:demo/coder","success":false,"ui":null,"error":error()}),
+        json!({"type":"agent.ui.sync","address":"agent:demo/coder","ui":bundle,"error":error()}),
+        json!({"type":"agent.ui.sync","address":"agent:demo/coder","ui":null}),
+    ] {
+        assert!(serde_json::from_value::<ServerMessage>(value).is_err());
+    }
+    assert!(
+        serde_json::from_value::<ServerMessage>(
+            json!({"type":"agent.ui.sync","address":"agent:demo/coder","ui":null,"error":error()})
+        )
+        .is_ok()
+    );
 }

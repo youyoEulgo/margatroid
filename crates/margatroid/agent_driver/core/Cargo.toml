@@ -6,3 +6,11 @@ edition = "2024"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+notify = "8"
+sha2 = "0.10"
+mime_guess = "2"
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

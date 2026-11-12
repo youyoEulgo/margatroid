@@ -11,7 +11,7 @@ System列出处理事件、闭包结果、产出事件及回复。
 ```text
 # lib      dto/plugin/src/lib.rs
 # system   dto/plugin/src/system.rs
-# handler  dto/plugin/src/handler.rs、projection.rs
+# handler  dto/plugin/src/handler.rs、projection.rs、ui.rs
 # types    dto/plugin/src/types.rs
 ```
 
@@ -28,7 +28,7 @@ DtoPlugin
         build(self, app: &mut App)
             行为：
                 检查RuntimeHandle、AsyncRuntimeHandle、AxumHandle及MargatroidConfig。
-                初始化DtoState、ConnState及SyncState。
+                初始化DtoState、ConnState及SyncState；SyncState包含按Agent持有的UI观察及发送版本。
                 通过AsyncContext初始化网络事件发送能力。
                 注册GET /ws到ws_handler。
                 PRE_UPDATE安装abort_control_system。
@@ -60,7 +60,8 @@ dto_sync_system(world: &mut World)
     接收闭包结果：Result<(), DtoAsyncError>
     产出事件：None
     回复：None
-    行为：处理出站及异常，记录worker错误，调用publish_state。
+    提交闭包：run_ui_watch(UiMonitorContext)
+    行为：处理出站及异常，记录worker错误，调用publish_state；调用reconcile_ui_watches维护实际Driver来源的观察，再调用publish_ui。
 ```
 
 # handler
@@ -73,13 +74,13 @@ ws_handler(State(state): State<DtoState>, ConnectInfo(peer): ConnectInfo<SocketA
     行为：评估入口策略，检查退出与事件能力，分配真实连接；取得跟踪guard并升级，完整连接退出后释放。
 
 handle_dto_request(world: &mut World, request: DtoRequest)
-    行为：取出object，按route选择具体转换类型或查询函数；转换后直接发送领域事件。
+    行为：取出object，按route选择具体转换类型或查询函数；转换后直接发送领域事件。agent.ui.req调用query_agent_ui，只读取当前UI观察结果。
 
 handle_abort_control(world: &mut World, event: AbortTurnControl)
     行为：取出原请求，校验真实Client、Agent地址及turn；同步清turn，冻结并取消推理，裁决未return工具，通过原reply回复。
 
 handle_disconnect(world: &mut World, connection: ConnectionId)
-    行为：释放该连接的同步投影；Client领域独立清理连接身份。
+    行为：释放该连接的同步投影及UI发送版本；Client领域独立清理连接身份。Agent UI观察跟随Agent来源独立运行。
 
 handle_agent_exception(world: &mut World, event: AgentException)
     行为：检查完整Entity并保存该Agent的故障投影。
@@ -96,6 +97,23 @@ publish_state(world: &mut World)
         worker向本次发送器快照直接投递新增记录，拥塞连接被取消；失败释放在途标记以便后续重试。
         已结束Agent取消其记录读取能力并释放对应观察位置。
         req保持领域状态及同步接收条件不变。
+
+reconcile_ui_watches(world: &mut World)
+    行为：
+        每帧查询Agent及AgentDriverSource，以完整Entity和实际manifest_path维护SyncState.ui。
+        AxumLifetime已进入退出时取消已有watch并停止建立新watch。
+        新来源建立DriverUiWatch及UiWatchSlot，on_change捕获该slot的delivery、地址及现有UPDATE的WorldClosureSender。
+        初始delivery为AgentUiNotReady；通过普通异步闭包提交run_ui_watch，持有AxumWorkGuard直到完整监控退出。
+        来源移除、替换或Agent消失时取消旧watch并移出索引；旧回调只持有旧slot，发送时仅使用当前索引中的slot。
+        监控的创建和取消由该帧观察负责，查询只读取。
+
+publish_ui(world: &mut World)
+    行为：
+        每帧按既定条件取得实际ClientSender，检查当前slot的Agent及来源仍匹配。
+        读取UiDelivery的轻量key和已编码frame，与该连接该Agent上次成功发送key比较。
+        新接收者及key变化时使用ClientSender发送ClientFrame::Text，成功入队后保存key；Full/Closed按连接规则取消。
+        清理已离线连接、已移除Agent及来源替换前的发送版本。
+        此函数只读取已编码资料并发送，资源扫描、base64及大JSON编码在监控worker内完成。
 
 projection::address(world: &World, entity: Entity) -> Option<String>
     行为：读取Address组件。
@@ -129,6 +147,7 @@ prepare_request(state: &DtoState, connection: ConnectionId, message: ClientMessa
         取得route及原id，为具体请求创建对应领域Result类型的原oneshot。
         发送端装入Prepared，原接收端与纯值投影函数组成ReplyFuture。
         单独Agent启动重启在worker执行全量reload，将本次不可变快照放入预处理对象。
+        agent.ui.req创建原oneshot，结果为Result<Option<Arc<DriverUiBundle>>, ProtocolErrorDto>；网络等待结束后调用project_agent_ui并编码AgentUiRes。
         预处理Future独立推进，socket继续接收其他请求。
 
 request<T, R, E>(ticket: Arc<Ticket>, route: &str, input: T, response: &str, project: impl FnOnce(R) -> Result<Value, ProtocolErrorDto> + Send + 'static) -> (DtoRequest, ReplyFuture)
@@ -145,6 +164,36 @@ records(world: &World, route: &str, object: Box<dyn Any + Send>)
 
 reload(world: &World, object: Box<dyn Any + Send>)
     行为：校验Client，克隆WorkspaceDefinitions；worker全量reload并通过原reply回复。
+
+query_agent_ui(world: &World, object: Box<dyn Any + Send>)
+    行为：
+        取出Prepared<AgentTargetDto, Option<Arc<DriverUiBundle>>>，校验真实Client及Agent地址。
+        读取AgentDriverSource，核对SyncState.ui中的实际来源，再调用DriverUiWatch::state。
+        Initializing或来源尚未进入观察时通过原reply返回AgentUiNotReady。
+        Ready结果通过原reply返回；Failed映射DriverUi错误码；目标失效返回AgentMissing。
+        不创建监控、不扫描文件、不改变发送关系。
+
+wake_ui_frame(pending: Arc<AtomicBool>, world: &mut World)
+    行为：由已安装的UPDATE ClosureSystem执行，清除轻量通知在途标记；同帧dto_sync_system读取最新delivery并筛选发送器。既有ClosureRequest入队本身保证事件驱动模式有帧工作。
+
+project_agent_ui(value: Option<Arc<DriverUiBundle>>) -> Result<Option<AgentUiBundleDto>, ProtocolErrorDto>
+    行为：将每个文件的原始字节编码为标准base64，保留规范相对路径、媒体类型、entry和revision。
+
+check_ui_budget(address: &str, ui: &Option<AgentUiBundleDto>) -> Result<(), ProtocolErrorDto>
+    行为：用最大可用请求id检查完整res信封预算，超出映射DriverUiTooLarge；网络查询和监控编码共同调用。
+
+build_ui_delivery(address: &str, state: DriverUiState) -> UiDelivery
+    行为：
+        在监控worker内转换状态并构造AgentUiSync，资源正常时调用project_agent_ui。
+        按sync及带最大请求id的res信封预算检查完整集合，超出转为DriverUiTooLarge错误状态。
+        正常缺失UI编码ui=null/error=null，错误编码ui=null/error对象。
+        保存轻量UiDeliveryKey及完整已编码frame，供帧循环读取；错误恢复也形成key变化。
+
+run_ui_watch(context: UiMonitorContext) -> Future<Output = Result<(), DtoAsyncError>>
+    行为：
+        驱动agent_driver_core::run_driver_ui_monitor，on_change在blocking发布阶段调用build_ui_delivery，短锁替换delivery；使用frame_pending合并通知，通过WorldClosureSender::send提交wake_ui_frame。
+        AxumLifetime退出时触发watch.cancel，继续等待monitor及正在执行的blocking读取真实返回。
+        捕获监控异常并发布失败delivery后退出。完整Future退出后释放AxumWorkGuard，终结错误映射DtoAsyncError。
 
 parameters(world: &World, input: &AgentInput) -> Result<(Entity, String, AgentStartParameters), ProtocolErrorDto>
     行为：按Workspace地址解析完整Entity，从本次快照选择定义及成员，构造单Agent启动参数。
@@ -272,7 +321,30 @@ SyncState
     sent: BTreeMap<(u64, String), Value>
     errors: BTreeMap<Entity, ProtocolErrorDto>
     records: BTreeMap<Entity, Arc<Mutex<RecordPosition>>>
+    ui: BTreeMap<Entity, UiWatchSlot>
+    ui_sent: BTreeMap<(ConnectionId, Entity), UiDeliveryKey>
     impl Resource + Default
+
+UiWatchSlot
+    manifest_path: PathBuf
+    address: String
+    watch: DriverUiWatch
+    delivery: Arc<RwLock<UiDelivery>>
+    frame_pending: Arc<AtomicBool>
+UiMonitorContext
+    monitor: DriverUiMonitor
+    watch: DriverUiWatch
+    lifetime: AxumLifetime
+    guard: AxumWorkGuard
+UiDelivery
+    key: UiDeliveryKey
+    frame: Arc<str>
+UiDeliveryKey
+    Initializing
+    Missing
+    Ready(String)
+    Failed { code: String, message: String }
+    impl Clone + PartialEq + Eq
 
 RecordPosition
     cancel: CancellationToken
@@ -300,7 +372,10 @@ World
 └── SyncState
     ├── 分类已发送投影
     ├── Agent故障投影
-    └── 记录观察进度
+    ├── 记录观察进度
+    └── 每Agent的UiWatchSlot及每连接发送版本
+        ├── DriverUiWatch
+        └── 已编码UiDelivery
 
 serve_connection
 ├── WebSocket读写端

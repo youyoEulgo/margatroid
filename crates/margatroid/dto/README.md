@@ -1,6 +1,6 @@
 # DTO
 
-本文与DESIGN描述确认后的新API接入设计。DTO、领域回复、Protocol、CLI及前端已按该链路接通，运行产物需使用相应构建版本。
+本文与DESIGN描述确认后的新API接入设计。DTO、领域回复、Protocol、CLI及前端已按该链路接通，运行产物需使用相应构建版本。agent.ui.req/res/sync及持续监控已在当前后端工作树实现。
 
 ## 请求与响应
 
@@ -46,10 +46,26 @@ MclCommand、StorageRequest、InitInference、InitToolTasks及Driver VM控制继
 
 ## 验证范围
 
-42种消息逐一验证。req保持业务状态与发送筛选条件，result在无变化和失败时都完成本次等待。中止直接进入控制System，原oneshot只被完成一次。
+45种消息逐一验证。req保持业务状态与发送筛选条件，result在无变化和失败时都完成本次等待。中止直接进入控制System，原oneshot只被完成一次。
 
 验证全部定义重载、目标移除只允许停止、TEMP纯内存、规范消息列与真实序号、任务查询不消费脚本游标。断线、重连及换实例验证身份隔离，范围查询与新增记录验证游标稳定。完成源码集成后运行全仓回归、严格Clippy及前端测试，不以文档变更或局部通过声明整套API可用。
 
 外部请求和同步使用Agent Address。完整Entity及取消能力用于后端生命周期管理；响应投影只输出API规定的业务字段。审计payload与日志context_json中的内部VM标识在网络边界过滤。
 
 Agent查询及每帧sync当次遍历该Entity的Sandboxes，返回全部alias/path与SelectedSandbox.alias。模型投影从AgentInferenceConfig及ModelRoutes读取当次安全字段：id、模型名称、provider、api_type、context_window_tokens、thinking及reasoning_effort。两条路径共用projection::agents，资源或路由变化在下次查询及sync中体现。
+
+## Driver UI查询与持续同步
+
+当前共45种消息，包含agent.ui.req/res/sync。req使用普通DtoRequest字符串路由，在DTO帧校验目标、读取当前DriverUiWatch状态并通过网络创建的原oneshot回复。完整文件的base64及响应编码留在网络任务；query不创建watch，不读磁盘，不改变接收关系。
+
+AgentDriverSource保留运行Agent实际加载的清单位置。dto_sync_system保持当前数量和UPDATE调度，增加对这些来源的观察：新来源创建watch，来源替换或移除时取消原watch。每个Agent独立持有UiWatchSlot，以完整Entity及实际清单路径确认归属；旧monitor回调只更新旧slot，当前帧只发送当前索引中的delivery。
+
+monitor在普通异步执行设施中驱动notify及blocking文件读取，稳定结果在worker中完成协议投影、base64及JSON编码。状态发布后通过已安装UPDATE的WorldClosureSender提交wake_ui_frame轻量通知，既有ClosureRequest使事件驱动循环推进，并在该帧按当前符合条件的ClientSender发送UI变化。文件连续写入使用100ms安静窗口，失败和恢复均形成可识别状态。纯查询和文件系统观察均保持业务数据只读。
+
+UI目录删除时发送ui=null/error=null；读取错误发送ui=null及error，前端保留最后成功页面。完整集合超过32MiB网络预算时交付DriverUiTooLarge。初始化未就绪返回AgentUiNotReady。类型转换、错误码及网络字段由Protocol设计与WS_API共同定义。
+
+监控Future持有现有AxumWorkGuard。来源移除或daemon退出触发取消，异步任务仍等待实际文件worker返回后释放guard。文件监控不会占住World帧或引入一次性结果回到DTO的额外帧。
+
+实现保持现有三个DTO System及领域事件集合；扩展dto_route_system的UI查询分支及dto_sync_system的观察职责，相关支持类型已列入原有设计板块。验证应覆盖首次读取、目录缺失/出现/删除、文件增删改、编译写入合并、错误恢复、来源替换、断连与重新符合发送条件、预算错误、路径越界及关停真实退出。
+
+UI帧通知复用现有ClosureRequest及ClosureSystem，合并标记只记录通知是否在途；它不是查询结果中转，UI查询仍沿原oneshot直接返回。DTO使用closure_plugin的生产依赖，不修改mecs运行机制。

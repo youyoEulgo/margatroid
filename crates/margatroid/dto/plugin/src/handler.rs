@@ -82,7 +82,7 @@ impl BoundaryError for client_core::ClientError {
         error(&format!("{self:?}"), &self.to_string())
     }
 }
-fn deliver<R, E>(reply: &PreparedReply<R, E>, result: Result<R, E>) {
+pub(crate) fn deliver<R, E>(reply: &PreparedReply<R, E>, result: Result<R, E>) {
     if let Some(sender) = reply.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = sender.send(result);
     }
@@ -90,7 +90,7 @@ fn deliver<R, E>(reply: &PreparedReply<R, E>, result: Result<R, E>) {
 fn reject<T, R, E: BoundaryError>(request: Prepared<T, R, E>, failure: ProtocolErrorDto) {
     deliver(&request.reply, Err(E::boundary(failure)));
 }
-fn client(world: &World, connection: ConnectionId) -> Result<Entity, ProtocolErrorDto> {
+pub(crate) fn client(world: &World, connection: ConnectionId) -> Result<Entity, ProtocolErrorDto> {
     world
         .client_by_connection(connection)
         .filter(|(_, c)| !c.sender.is_closed())
@@ -103,7 +103,7 @@ fn target(world: &World, address: &str) -> Result<Entity, ProtocolErrorDto> {
         .map_err(|_| error("TargetMissing", "address is not active"))?;
     Ok(entity)
 }
-fn agent(world: &World, address: &str) -> Result<Entity, ProtocolErrorDto> {
+pub(crate) fn agent(world: &World, address: &str) -> Result<Entity, ProtocolErrorDto> {
     let entity = target(world, address)?;
     if world.get_component::<Agent>(entity).is_none() {
         return Err(error("AgentMissing", "Agent is not active"));
@@ -160,7 +160,11 @@ fn request<T: Send + 'static, R: Send + 'static, E: BoundaryError>(
         let mut value = frame(&response, &ticket.id, result);
         if matches!(
             response.as_str(),
-            "agent.history.res" | "agent.log.res" | "agent.mcl.res" | "agent.task.res"
+            "agent.history.res"
+                | "agent.log.res"
+                | "agent.mcl.res"
+                | "agent.task.res"
+                | "agent.ui.res"
         ) && let Some(address) = address
         {
             value["address"] = json!(address);
@@ -244,6 +248,7 @@ pub(crate) fn handle_dto_request(world: &mut World, request: DtoRequest) {
         "agent.stop" => dispatch::<StopAgentDto>(world, object),
         "agent.restart" => dispatch::<RestartAgentDto>(world, object),
         "mcl.execute" => dispatch::<MclCommandDto>(world, object),
+        "agent.ui.req" => crate::ui::query_agent_ui(world, object),
         "workspace.req" => query::<(), Vec<WorkspaceInfoDto>>(world, object, |w, _, _| {
             Ok(projection::workspaces(w))
         }),
@@ -734,6 +739,19 @@ async fn prepare_request(
                 json!({"workspaces":v})
             ))
         }
+        ClientMessage::AgentUiReq { message, .. } => {
+            let address = message.address.clone();
+            build!(
+                message,
+                Option<Arc<agent_driver_core::DriverUiBundle>>,
+                ProtocolErrorDto,
+                move |value| {
+                    let ui = crate::ui::project_agent_ui(value)?;
+                    crate::ui::check_ui_budget(&address, &ui)?;
+                    Ok(json!({"address":address,"ui":ui}))
+                }
+            )
+        }
         ClientMessage::AgentReq { .. } => build!((), Vec<AgentStateDto>, ProtocolErrorDto, |v| Ok(
             json!({"agents":v})
         )),
@@ -884,7 +902,7 @@ fn enqueue(
         false
     }
 }
-fn recipients(
+pub(crate) fn recipients(
     world: &World,
     targets: &[OutboundTarget],
 ) -> Vec<(ConnectionId, client_core::ClientSender)> {
@@ -1133,6 +1151,7 @@ fn invalid_reply(text: &str) -> Option<Value> {
             | "workspace.restart"
             | "workspace.reload"
             | "agent.req"
+            | "agent.ui.req"
             | "agent.start"
             | "agent.stop"
             | "agent.restart"
@@ -1158,7 +1177,7 @@ fn invalid_reply(text: &str) -> Option<Value> {
     );
     if matches!(
         response.as_str(),
-        "agent.task.res" | "agent.history.res" | "agent.log.res" | "agent.mcl.res"
+        "agent.task.res" | "agent.history.res" | "agent.log.res" | "agent.mcl.res" | "agent.ui.res"
     ) {
         result["address"] = json!(raw["message"]["address"].as_str().unwrap_or_default());
     }
