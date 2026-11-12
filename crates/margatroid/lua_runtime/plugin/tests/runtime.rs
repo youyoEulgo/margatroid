@@ -58,6 +58,7 @@ impl Fixture {
         app.world_mut().insert_component(
             workspace,
             workspace_core::Workspace {
+                definition: None,
                 name: "test".into(),
                 definition_path: directory.path().join("workspace.yaml"),
                 project_root: directory.path().to_owned(),

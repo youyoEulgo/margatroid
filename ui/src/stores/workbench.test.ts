@@ -7,76 +7,65 @@ import SidebarTree from '../components/SidebarTree.vue';
 import {
   buildSidebarModel,
   contextInjection,
+  parseArguments,
   historyEntries,
   latestContextTokens,
-  parseArguments,
   useWorkbenchStore,
 } from './workbench';
 import {
   isAgentMessage,
   parseServerMessage,
   type AgentHistory,
-  type BackendState,
-  type ServerMessage,
-  type WorkspaceInfo,
+  type WorkspaceSnapshot,
+  type AgentSnapshot,
+  type TaskSnapshot,
 } from '../types/protocol';
 import { formatToolPayload, inlineToolPayload } from '../lib/format';
-import { formatRecordTime } from '../lib/time';
 import {
-  imageMediaType,
-  importImage,
-  metadataText,
   validateImageBudget,
   wireImages,
+  metadataText,
+  imageMediaType,
+  importImage,
 } from '../lib/images';
 
 const path = '/definitions/test/workspace.yaml';
-const workspace: WorkspaceInfo = {
-  id: 'workspace:local/runtime:latest',
-  name: 'Runtime',
-  project_root: '/test',
-  definition_path: path,
+const address = 'agent:demo/coder:latest';
+const workspace = 'workspace:local/demo:latest';
+const ws: WorkspaceSnapshot = {
+  path,
+  definition: {
+    name: 'Demo',
+    project_root: '/project',
+    agents: [{ name: 'coder', driver: 'driver:local/coder:latest', home_root: '/home/coder' }],
+  },
   status: 'running',
-  agents: ['agent:runtime/coder:latest'],
+  address: workspace,
+  error: null,
 };
-const state: BackendState = {
-  workspace_definitions: [
+const agent: AgentSnapshot = {
+  address,
+  workspace,
+
+  status: 'ready',
+  tools: [
     {
-      path,
-      cache: {
-        name: 'Display test',
-        project_root: '/test',
-        agents: [{ name: 'coder', driver: 'driver:local/coder:latest', home_root: '/home/coder' }],
-      },
+      alias: 'read_file',
+      path: '/tools/read_file/tool.toml',
+      description: 'Read a file',
+      input_schema: { type: 'object' },
+      owner_task_id: null,
+      binding: null,
     },
   ],
-  workspaces: [workspace],
-  agents: [
-    {
-      workspace,
-      agent: workspace.agents[0]!,
-      agent_instance: 'vm-current',
-      status: 'idle',
-      turn: null,
-      sandbox: null,
-      tools: ['bash', 'read_file'],
-      sandboxes: ['safe'],
-      queued_commands: 0,
-      pending_command: null,
-      context_window_tokens: 8192,
-    },
-  ],
-  histories: [],
+  error: null,
 };
-function working(turn: string | null = 'turn-1'): BackendState {
-  return { ...state, agents: [{ ...state.agents[0]!, status: 'working', turn }] };
-}
 interface Wire {
   type: string;
   id: string;
   message: Record<string, unknown>;
 }
-function setup(snapshot: BackendState = state) {
+function setup(workspaces: WorkspaceSnapshot[] = [ws], agents: AgentSnapshot[] = [agent]) {
   setActivePinia(createPinia());
   const store = useWorkbenchStore();
   const original = globalThis.WebSocket;
@@ -88,36 +77,48 @@ function setup(snapshot: BackendState = state) {
     onopen: (() => void) | null = null;
     onclose: (() => void) | null = null;
     onmessage: ((event: { data: string }) => void) | null = null;
-    onerror = null;
+    onerror: (() => void) | null = null;
     constructor() {
       sockets.push(this);
     }
     close() {}
     send(raw: string) {
-      sent.push(JSON.parse(raw) as Wire);
+      sent.push(JSON.parse(raw));
     }
   }
   globalThis.WebSocket = Socket as unknown as typeof WebSocket;
-  store.handleServerMessage({ type: 'state.sync', state: snapshot });
+  const receive = (event: unknown) => sockets.at(-1)!.onmessage?.({ data: JSON.stringify(event) });
   store.connect();
   sockets[0]!.onopen?.();
-  store.handleServerMessage({
-    type: 'connection.registered',
+  receive({
+    type: 'connection.register.result',
     id: sent[0]!.id,
-    client: { resource_id: 'client:local/ui:latest', name: 'test', client_type: 'webui' },
+    success: true,
+    client: { address: 'client:webui/test:1', client_type: 'webui' },
   });
-  const receive = (event: unknown) => sockets.at(-1)!.onmessage?.({ data: JSON.stringify(event) });
-  const reply = (id: string, result: unknown = 'Unit', agent = workspace.agents[0]!) =>
+  receive({
+    type: 'workspace.res',
+    id: sent.find((x) => x.type === 'workspace.req')!.id,
+    success: true,
+    workspaces,
+  });
+  receive({
+    type: 'agent.res',
+    id: sent.find((x) => x.type === 'agent.req')!.id,
+    success: true,
+    agents,
+  });
+  const reply = (id: string, value?: unknown) =>
     receive({
-      type: 'mcl.command_result',
+      type: 'mcl.execute.result',
       id,
-      source: 'client:local/ui:latest',
-      target: agent,
-      result: { Ok: result },
+      success: true,
+      ...(value === undefined ? {} : { data: value }),
     });
   return {
     store,
     sent,
+    sockets,
     receive,
     reply,
     cleanup() {
@@ -126,519 +127,610 @@ function setup(snapshot: BackendState = state) {
     },
   };
 }
-function delta(
-  id = 'inference',
-  sequence = 1,
-  content = 'partial',
-): Extract<ServerMessage, { type: 'agent.message.delta' | 'agent.message.reasoning_delta' }> {
+function full(
+  sequence: number | null = 42,
+  generation: string | null = 'generation-1',
+  content = 'complete',
+) {
   return {
-    type: 'agent.message.delta',
-    id,
-    agent: workspace.agents[0]!,
-    agent_instance: 'vm-current',
-    sequence,
-    content,
+    type: 'agent.message.full.sync',
+    address,
+
+    turn: 'turn-1',
+    generation,
+    history_sequence: sequence,
+    message: {
+      type: 'assistant',
+      ...(sequence === null ? {} : { sequence }),
+      request_id: generation,
+      content,
+      reasoning: 'thought',
+      tool_calls: [],
+    },
+    error: null,
   };
 }
-function history(messages: AgentHistory['messages']): AgentHistory {
-  return { workspace, agent: workspace.agents[0]!, messages };
+function chunk(sequence = 1, delta: Record<string, string> = { content: 'part' }) {
+  return {
+    type: 'agent.message.chunk.sync',
+    address,
+
+    turn: 'turn-1',
+    generation: 'generation-1',
+    sequence,
+    delta,
+  };
+}
+function historyRecord(sequence: number, content: string) {
+  return {
+    sequence,
+    turn: null,
+    kind: 'message',
+    content,
+    payload: { type: 'user', sequence, content },
+    created_at_ms: 1000 + sequence,
+  };
+}
+function page(id: string, records: unknown[]) {
+  return {
+    type: 'agent.history.res',
+    id,
+    success: true,
+    address,
+
+    records,
+    next_before_sequence: records.length ? 10 : null,
+    next_after_sequence: null,
+  };
 }
 
-test('wire accepts path/cache state and rejects removed catalog and malformed history', () => {
-  assert.equal(
-    parseServerMessage(JSON.stringify({ type: 'state.sync', state }))?.type,
-    'state.sync',
-  );
-  for (const type of [
-    'workspace.catalog',
-    'workspace.member.result',
-    'driver.catalog',
-    'workspace.paths',
-  ])
-    assert.equal(parseServerMessage(JSON.stringify({ type, id: 'old', entries: [] })), null);
-  assert.equal(
-    parseServerMessage(
-      JSON.stringify({
-        type: 'state.sync',
-        state: { catalog: [], workspaces: [], agents: [], histories: [] },
-      }),
-    ),
-    null,
-  );
-  assert.equal(
-    parseServerMessage(
-      JSON.stringify({
-        type: 'history.result',
-        id: 'h',
-        history: history([
-          {
-            source: 'agent:demo/coder:latest',
-            sequence: -1,
-            turn: null,
-            kind: 'message',
-            content: '',
-            payload: {},
-            created_at_ms: 0,
-          },
-        ]),
-      }),
-    ),
-    null,
-  );
-  assert.equal(parseServerMessage(JSON.stringify({ ...delta(), sequence: 0.5 })), null);
-  assert.equal(
-    parseServerMessage(JSON.stringify({ type: 'workspace.restarted', id: 'r', workspace }))?.type,
-    'workspace.restarted',
-  );
-});
-test('placeholder arguments accept JSON values and message injection preserves images', () => {
-  assert.deepEqual(parseArguments('["alias", {"key":1}, [2], null]'), [
-    'alias',
-    { key: 1 },
-    [2],
-    null,
-  ]);
-  assert.throws(() => parseArguments('{"not":"array"}'));
-  const image = { media_type: 'image/png', data: 'iVBORw0KGgo=' };
-  assert.deepEqual(contextInjection('', 'entry.pending[-1]', [image]), {
-    command: 'INJECT ? TO entry.pending[-1]',
-    arguments: [[{ type: 'user', content: '', data: [image] }]],
-  });
-  for (const destination of ['', 'x\nEFFECT wake', 'field', 'x.y;EFFECT wake'])
-    assert.throws(() => contextInjection('text', destination));
-});
-test('definition paths remain selection keys and cached member names never create network addresses', async () => {
-  const stopped: BackendState = { ...state, workspaces: [], agents: [] };
-  const env = setup(stopped);
+test('registration independently queries Workspace and active Agents without global state', () => {
+  const e = setup();
   try {
-    assert.equal(env.store.selectedWorkspaceKey, path);
-    assert.equal(env.store.selectedAgent, null);
-    assert.equal(env.store.sidebarTree.workspaces[0]!.agents[0]!.id, null);
-    await assert.rejects(
-      env.store.executeMclCommand('GET entry.pending'),
-      /running agent explicitly/,
-    );
-    assert.ok(
-      !env.sent.some(
-        (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
-      ),
-    );
     assert.deepEqual(
-      env.sent.map((request) => request.type),
-      ['connection.register', 'state.query'],
+      e.sent.slice(0, 3).map((x) => x.type),
+      ['connection.register', 'workspace.req', 'agent.req'],
     );
-    for (const removed of [
-      'catalog',
-      'refreshCatalog',
-      'createWorkspace',
-      'renameWorkspace',
-      'deleteWorkspace',
-      'addMember',
-      'removeMember',
-      'queryDrivers',
-      'queryPaths',
-    ])
-      assert.equal(removed in env.store, false);
+    assert.equal(e.store.registeredClient?.address, 'client:webui/test:1');
+    assert.equal(e.store.selectedAgent, address);
+    assert.deepEqual(e.store.toolOptions, ['read_file']);
+    assert.equal(
+      e.store.toolDefinitions.get(`${address}`)?.[0]?.description,
+      'Read a file',
+    );
+    assert.ok(!e.sent.some((x) => x.type.includes('state')));
   } finally {
-    env.cleanup();
+    e.cleanup();
   }
 });
-test('start/restart use path and stop uses authoritative runtime address without optimistic removal', async () => {
-  const env = setup({ ...state, workspaces: [], agents: [] });
+test('wire rejects removed aliases and legacy result envelopes', () => {
+  for (const type of [
+    'state.sync',
+    'state.query',
+    'workspace.definitions',
+    'workspace.started',
+    'connection.registered',
+    'agent.message.delta',
+    'agent.message.finished',
+    'mcl.command_result',
+    'history.result',
+    'log',
+  ])
+    assert.equal(
+      parseServerMessage(JSON.stringify({ type, id: 'old', state: {}, result: { Ok: 'Unit' } })),
+      null,
+    );
+  assert.equal(
+    parseServerMessage(
+      JSON.stringify({ type: 'mcl.execute.result', id: 'x', result: { Ok: 'Unit' } }),
+    ),
+    null,
+  );
+});
+test('Workspace sync includes inactive definitions and own status only', () => {
+  const e = setup();
   try {
-    const starting = env.store.startWorkspace(path);
-    const start = env.sent.at(-1)!;
-    assert.equal(start.type, 'workspace.start');
-    assert.deepEqual(start.message, { path });
-    assert.equal(env.store.runtimeWorkspaces.length, 0);
-    env.receive({ type: 'workspace.started', id: start.id, workspace });
-    await starting;
-    assert.equal(env.store.runtimeWorkspaces[0]!.id, workspace.id);
-    const restarting = env.store.restartWorkspace(path);
-    const restart = env.sent.at(-1)!;
-    assert.deepEqual(restart.message, { path });
-    env.receive({ type: 'workspace.restarted', id: restart.id, workspace });
-    await restarting;
-    const stopping = env.store.stopWorkspace(workspace.id);
-    const stop = env.sent.at(-1)!;
-    assert.deepEqual(stop.message, { workspace: workspace.id });
-    assert.equal(env.store.runtimeWorkspaces.length, 1);
-    env.receive({ type: 'workspace.stopped', id: stop.id, workspace });
-    await stopping;
-    assert.equal(env.store.runtimeWorkspaces.length, 1);
-    env.receive({ type: 'state.sync', state: { ...state, workspaces: [], agents: [] } });
-    assert.equal(env.store.runtimeWorkspaces.length, 0);
-    assert.equal(env.store.selectedWorkspaceKey, path);
+    e.receive({
+      type: 'workspace.sync',
+      workspaces: [{ ...ws, status: 'inactive', address: null }],
+    });
+    assert.equal(e.store.definitions.length, 1);
+    assert.equal(e.store.runtimeWorkspaces.length, 0);
+    assert.equal(e.store.sidebarTree.workspaces[0]?.name, 'Demo');
+    assert.equal(e.store.selectedAgent, null);
   } finally {
-    env.cleanup();
+    e.cleanup();
   }
 });
-test('workspace failure waits for matching receipt and preserves authoritative runtime data', async () => {
-  const env = setup();
+test('Agent sync replaces full active collection and keeps full tool properties', () => {
+  const e = setup();
   try {
-    const stopping = env.store.stopWorkspace();
-    const rejection = assert.rejects(stopping, /cleanup pending/);
-    const request = env.sent.at(-1)!;
-    env.receive({
-      type: 'workspace.stop_failed',
-      id: 'other',
-      error: { kind: 'CleanupFailed', message: 'wrong' },
+    const dynamic = {
+      ...agent.tools[0]!,
+      alias: 'dynamic',
+      owner_task_id: 'owner',
+      binding: { server: 'test' },
+    };
+    e.receive({ type: 'agent.sync', agents: [{ ...agent, tools: [dynamic] }] });
+    assert.deepEqual(e.store.toolOptions, ['dynamic']);
+    assert.deepEqual(e.store.toolDefinitions.get(`${address}`)?.[0]?.binding, {
+      server: 'test',
     });
-    assert.equal(env.store.workspaceOperationPending, true);
-    env.receive({
-      type: 'workspace.stop_failed',
-      id: request.id,
-      error: { kind: 'CleanupFailed', message: 'cleanup pending' },
-    });
-    await rejection;
-    assert.equal(env.store.runtimeWorkspaces[0]!.id, workspace.id);
+    e.receive({ type: 'agent.sync', agents: [] });
+    assert.equal(e.store.selectedAgent, null);
   } finally {
-    env.cleanup();
+    e.cleanup();
   }
 });
-test('multiple agents require an actual explicit target and late selection changes do not wake another agent', async () => {
-  const reviewer = 'agent:runtime/reviewer:latest';
-  const snapshot: BackendState = {
-    ...state,
-    workspaces: [{ ...workspace, agents: [...workspace.agents, reviewer] }],
-    agents: [
-      ...state.agents,
-      { ...state.agents[0]!, agent: reviewer, agent_instance: 'reviewer-vm' },
-    ],
-  };
-  const env = setup(snapshot);
+test('turn state is independent of Agent state and uses Agent Address', () => {
+  const e = setup();
   try {
-    assert.equal(env.store.selectedAgent, null);
-    await assert.rejects(env.store.executeMclCommand('GET entry.pending'), /explicitly/);
-    env.store.selectAgent(workspace.agents[0]!);
-    const sending = env.store.sendMessage('hello');
-    const rejection = assert.rejects(sending, /changed/);
-    const inject = env.sent.find(
-      (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
-    )!;
-    assert.equal(inject.message.agent, workspace.agents[0]);
-    assert.equal(inject.message.workspace, workspace.id);
-    env.store.selectAgent(reviewer);
-    env.store.selectAgent(workspace.agents[0]!);
-    env.reply(inject.id);
-    await rejection;
-    assert.ok(!env.sent.some((request) => request.message.command === 'EFFECT wake'));
-    env.store.selectAgent('agent:unadvertised/guessed:latest');
-    assert.equal(env.store.selectedAgent, null);
+    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'working' }] });
+    assert.equal(e.store.canAbortTurn, false);
+    e.receive({ type: 'agent.turn.sync', address, turn: 'turn-1' });
+    assert.equal(e.store.canAbortTurn, true);
+    e.receive({ type: 'agent.turn.sync', address: 'agent:demo/other:latest', turn: null });
+    assert.equal(e.store.canAbortTurn, true);
   } finally {
-    env.cleanup();
+    e.cleanup();
   }
 });
-test('composer waits for injection then sends new EFFECT wake syntax to the same explicit target', async () => {
-  const env = setup();
+test('MCL executes against explicit address and unwraps business data', async () => {
+  const e = setup();
   try {
-    const stages: string[] = [];
-    const sending = env.store.sendMessage(' hello ', [], (stage) => stages.push(stage));
-    const inject = env.sent.find(
-      (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
-    )!;
-    assert.deepEqual(inject.message, {
-      workspace: workspace.id,
-      agent: workspace.agents[0],
-      command: 'INJECT ? TO entry.pending[-1]',
-      arguments: [[{ type: 'user', content: 'hello' }]],
+    const value = e.store.executeMclCommand('GET session.conversation');
+    const wire = e.sent.at(-1)!;
+    assert.equal(wire.type, 'mcl.execute');
+    assert.deepEqual(wire.message, {
+      address,
+
+      command: 'GET session.conversation',
+      arguments: [],
     });
-    assert.deepEqual(stages, ['injecting']);
-    env.reply(inject.id);
-    await Promise.resolve();
-    await Promise.resolve();
-    const wake = env.sent.find((request) => request.message.command === 'EFFECT wake')!;
-    assert.ok(wake);
-    assert.deepEqual(stages, ['injecting', 'waking']);
-    env.reply(wake.id);
-    await sending;
-    assert.ok(!env.sent.some((request) => String(request.message.command).startsWith('EMIT ')));
+    e.reply(wire.id, {
+      kind: 'messages',
+      value: [{ type: 'user', content: 'hello', sequence: 2 }],
+    });
+    assert.deepEqual(await value, {
+      Array: { Message: [{ type: 'user', content: 'hello', sequence: 2 }] },
+    });
   } finally {
-    env.cleanup();
+    e.cleanup();
   }
 });
-test('failed injection does not wake and retry keeps backend acknowledgement ordering', async () => {
-  const env = setup();
+test('MCL Unit success and failure resolve or reject without waiting for sync', async () => {
+  const e = setup();
   try {
-    const sending = env.store.sendMessage('keep draft');
-    const rejection = assert.rejects(sending, /not written/);
-    const inject = env.sent.find(
-      (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
-    )!;
-    env.receive({
-      type: 'request.failed',
-      id: inject.id,
-      error: { kind: 'WriteFailed', message: 'not written' },
+    const ok = e.store.executeMclCommand('EFFECT wake');
+    e.reply(e.sent.at(-1)!.id);
+    assert.equal(await ok, 'Unit');
+    const failed = e.store.executeMclCommand('BAD');
+    e.receive({
+      type: 'mcl.execute.result',
+      id: e.sent.at(-1)!.id,
+      success: false,
+      error: { code: 'ParseFailed', message: 'bad command' },
     });
-    await rejection;
-    assert.ok(!env.sent.some((request) => request.message.command === 'EFFECT wake'));
-    assert.equal(env.store.visibleMessages.length, 0);
-    const retry = env.store.sendMessage('retry');
-    const latest = env.sent
-      .filter(
-        (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
-      )
-      .at(-1)!;
-    env.reply(latest.id);
-    await Promise.resolve();
-    await Promise.resolve();
-    env.reply(env.sent.find((request) => request.message.command === 'EFFECT wake')!.id);
-    await retry;
+    await assert.rejects(failed, /bad command/);
   } finally {
-    env.cleanup();
+    e.cleanup();
   }
 });
-test('stream instance, request, sequence and terminal checks reject stale or duplicate deltas', () => {
-  const env = setup();
+test('MCL config and snapshot query results preserve existing Driver-aware caller shape', async () => {
+  const e = setup();
   try {
-    env.receive({ ...delta(), agent_instance: 'old-vm' });
-    assert.equal(env.store.visibleMessages.length, 0);
-    env.receive(delta());
-    env.receive(delta());
-    env.receive({ ...delta('inference', 2, 'thinking'), type: 'agent.message.reasoning_delta' });
-    assert.equal(env.store.visibleMessages[0]!.content, 'partial');
-    assert.equal(env.store.visibleMessages[0]!.thinking, 'thinking');
-    env.receive({
-      type: 'agent.message.finished',
-      id: 'inference',
-      agent: workspace.agents[0],
-      agent_instance: 'vm-current',
-      error: null,
-    });
-    env.receive(delta('inference', 3, 'late'));
-    assert.equal(env.store.visibleMessages[0]!.content, 'partial');
-    env.receive({
-      type: 'state.sync',
-      state: { ...state, agents: [{ ...state.agents[0]!, agent_instance: 'new-vm' }] },
-    });
-    assert.equal(env.store.visibleMessages.length, 0);
-    env.receive(delta('unknown-old'));
-    assert.equal(env.store.visibleMessages.length, 0);
-  } finally {
-    env.cleanup();
-  }
-});
-test('abort freezes click-time known and unseen request streams until authoritative sync', async () => {
-  const env = setup(working());
-  try {
-    env.receive(delta());
-    env.receive({ ...delta('inference', 2, 'thought'), type: 'agent.message.reasoning_delta' });
-    const promise = env.store.abortTurn();
-    const request = env.sent.find((event) => event.type === 'agent.turn.abort')!;
-    assert.deepEqual(request.message, {
-      workspace: workspace.id,
-      agent: workspace.agents[0],
-      agent_instance: 'vm-current',
-      turn_id: 'turn-1',
-    });
-    assert.equal(env.store.abortPending, true);
-    env.receive(delta('inference', 3, 'late'));
-    env.receive(delta('unseen'));
-    assert.equal(env.store.visibleMessages.length, 1);
-    assert.equal(env.store.visibleMessages[0]!.content, 'partial');
-    env.receive({
-      type: 'agent.turn.abort_result',
-      id: request.id,
-      workspace,
-      agent: workspace.agents[0],
-      turn_id: 'wrong',
-      result: { Ok: null },
-    });
-    assert.equal(env.store.abortPending, true);
-    env.receive({
-      type: 'agent.turn.abort_result',
-      id: request.id,
-      workspace,
-      agent: workspace.agents[0],
-      turn_id: 'turn-1',
-      result: { Ok: null },
-    });
-    await promise;
-    assert.equal(env.store.selectedAgentIdle, false);
-    env.receive({ type: 'state.sync', state: working(null) });
-    assert.equal(env.store.abortPending, true);
-    env.receive(delta('unseen', 2, 'late unseen'));
-    assert.equal(env.store.visibleMessages.length, 1);
-    env.receive({ type: 'state.sync', state });
-    assert.equal(env.store.selectedAgentIdle, true);
-    assert.equal(env.store.abortPending, false);
-    env.receive({ type: 'state.sync', state: working('turn-2') });
-    env.receive(delta('inference', 4, 'stale'));
-    env.receive(delta('unseen', 3, 'stale'));
-    env.receive(delta('fresh'));
-    assert.equal(env.store.visibleMessages.length, 2);
-    assert.equal(env.store.visibleMessages[0]!.content, 'partial');
-  } finally {
-    env.cleanup();
-  }
-});
-test('abort rejection stays frozen through its receipt and releases only on matching state sync', async () => {
-  for (const generic of [false, true]) {
-    const env = setup(working());
-    try {
-      env.receive(delta());
-      const promise = env.store.abortTurn();
-      const rejection = assert.rejects(promise, /denied/);
-      const request = env.sent.find((event) => event.type === 'agent.turn.abort')!;
-      env.receive(
-        generic
-          ? {
-              type: 'request.failed',
-              id: request.id,
-              error: { kind: 'StateRejected', message: 'denied' },
-            }
-          : {
-              type: 'agent.turn.abort_result',
-              id: request.id,
-              workspace,
-              agent: workspace.agents[0],
-              turn_id: 'turn-1',
-              result: { Err: { kind: 'StateRejected', message: 'denied' } },
-            },
-      );
-      await rejection;
-      env.receive(delta('inference', 2, 'blocked'));
-      assert.equal(env.store.visibleMessages[0]!.content, 'partial');
-      assert.equal(env.store.abortPending, true);
-      env.receive({ type: 'state.sync', state: working() });
-      assert.equal(env.store.abortPending, false);
-      env.receive(delta('inference', 2, ' resumed'));
-      assert.equal(env.store.visibleMessages[0]!.content, 'partial resumed');
-      assert.equal(env.store.selectedAgentIdle, false);
-    } finally {
-      env.cleanup();
+    for (const [kind, value, expected] of [
+      ['config', { sandbox: [] }, { Config: { sandbox: [] } }],
+      [
+        'block_snapshots',
+        { timeline: {}, snapshots: [] },
+        { BlockSnapshots: { timeline: {}, snapshots: [] } },
+      ],
+    ] as const) {
+      const p = e.store.executeMclCommand('CONFIG GET');
+      e.reply(e.sent.at(-1)!.id, { kind, value });
+      assert.deepEqual(await p, expected);
     }
-  }
-});
-test('late abort receipt can finish original promise after new VM sync without changing new VM state', async () => {
-  const env = setup(working());
-  try {
-    const promise = env.store.abortTurn();
-    const request = env.sent.find((event) => event.type === 'agent.turn.abort')!;
-    env.receive({
-      type: 'state.sync',
-      state: { ...state, agents: [{ ...state.agents[0]!, agent_instance: 'new-vm' }] },
-    });
-    env.receive({
-      type: 'agent.turn.abort_result',
-      id: request.id,
-      workspace,
-      agent: workspace.agents[0],
-      turn_id: 'turn-1',
-      result: { Ok: null },
-    });
-    await promise;
-    assert.equal(env.store.selectedAgentState!.agent_instance, 'new-vm');
-    assert.equal(env.store.selectedAgentIdle, true);
   } finally {
-    env.cleanup();
+    e.cleanup();
   }
 });
-test('history sequence identity, type and unknown timestamps survive nested message projection', () => {
-  const payload = {
-    type: 'inject',
-    messages: [
-      { type: 'system', content: 'system' },
+test('command results for a removed Agent cannot complete as success', async () => {
+  const e = setup();
+  try {
+    const p = e.store.executeMclCommand('GET session.conversation');
+    const id = e.sent.at(-1)!.id;
+    e.receive({ type: 'agent.sync', agents: [] });
+    e.reply(id, { kind: 'messages', value: [] });
+    await assert.rejects(p, /instance changed/);
+  } finally {
+    e.cleanup();
+  }
+});
+test('Workspace result settles operation but cannot invent runtime state', async () => {
+  const e = setup([{ ...ws, address: null, status: 'inactive' }], []);
+  try {
+    const p = e.store.startWorkspace(path);
+    const request = e.sent.at(-1)!;
+    assert.equal(request.type, 'workspace.start');
+    e.receive({ type: 'workspace.start.result', id: request.id, success: true });
+    await p;
+    assert.equal(e.store.runtimeWorkspaces.length, 0);
+    e.receive({ type: 'workspace.sync', workspaces: [ws] });
+    assert.equal(e.store.runtimeWorkspaces[0]?.id, workspace);
+  } finally {
+    e.cleanup();
+  }
+});
+test('Workspace stop uses definition path and result does not optimistically delete instance', async () => {
+  const e = setup();
+  try {
+    const p = e.store.stopWorkspace();
+    const request = e.sent.at(-1)!;
+    assert.deepEqual(request.message, { path });
+    e.receive({ type: 'workspace.stop.result', id: request.id, success: true });
+    await p;
+    assert.equal(e.store.runtimeWorkspaces.length, 1);
+  } finally {
+    e.cleanup();
+  }
+});
+test('chunk accepts shared sequence once for both reasoning and content', () => {
+  const e = setup();
+  try {
+    e.receive(chunk(1, { reasoning: 'think', content: 'answer' }));
+    e.receive(chunk(1, { reasoning: 'think', content: 'answer' }));
+    assert.equal(e.store.visibleMessages[0]?.thinking, 'think');
+    assert.equal(e.store.visibleMessages[0]?.content, 'answer');
+    e.receive(chunk(2, { content: ' more' }));
+    assert.equal(e.store.visibleMessages[0]?.content, 'answer more');
+  } finally {
+    e.cleanup();
+  }
+});
+test('full replaces the matching generation and deduplicates persisted messages', () => {
+  const e = setup();
+  try {
+    e.receive(chunk());
+    e.receive(full());
+    e.receive(full());
+    assert.equal(e.store.visibleMessages.length, 1);
+    assert.equal(e.store.visibleMessages[0]?.content, 'complete');
+    assert.equal(e.store.visibleMessages[0]?.sequence, 42);
+    e.receive(chunk(3, { content: 'late' }));
+    assert.equal(e.store.visibleMessages.length, 1);
+    assert.equal(e.store.visibleMessages[0]?.content, 'complete');
+  } finally {
+    e.cleanup();
+  }
+});
+test('full without persistence remains a complete render item and has no fake sequence', () => {
+  const e = setup();
+  try {
+    e.receive(chunk());
+    e.receive(full(null));
+    assert.equal(e.store.visibleMessages.length, 1);
+    assert.equal(e.store.visibleMessages[0]?.content, 'complete');
+    assert.equal(e.store.visibleMessages[0]?.sequence, null);
+  } finally {
+    e.cleanup();
+  }
+});
+test('non-generation full appends without overwriting a different streaming message', () => {
+  const e = setup();
+  try {
+    e.receive(chunk());
+    e.receive({
+      ...full(40, null),
+      message: { type: 'user', sequence: 40, content: 'interruption' },
+    });
+    assert.equal(e.store.visibleMessages.length, 2);
+    assert.ok(e.store.visibleMessages.some((x) => x.content === 'part'));
+    assert.ok(e.store.visibleMessages.some((x) => x.content === 'interruption'));
+  } finally {
+    e.cleanup();
+  }
+});
+test('history uses oldest persistent sequence as an exclusive cursor despite live arrivals', () => {
+  const e = setup();
+  try {
+    const initial = e.sent.find((x) => x.type === 'agent.history.req')!;
+    assert.equal(initial.message.limit, 50);
+    e.receive(page(initial.id, [historyRecord(201, 'oldest'), historyRecord(300, 'newest')]));
+    e.receive({ ...full(320, null), message: { type: 'user', sequence: 320, content: 'live' } });
+    e.store.loadOlderHistory();
+    const older = e.sent.at(-1)!;
+    assert.equal(older.type, 'agent.history.req');
+    assert.equal(older.message.before_sequence, 201);
+    assert.equal(older.message.limit, 50);
+    assert.equal('offset' in older.message, false);
+    e.receive(page(older.id, [historyRecord(150, 'older'), historyRecord(201, 'oldest')]));
+    assert.deepEqual(
+      e.store.visibleMessages.map((x) => x.sequence),
+      [150, 201, 300, 320],
+    );
+  } finally {
+    e.cleanup();
+  }
+});
+test('late history for a removed Agent is ignored', () => {
+  const e = setup();
+  try {
+    const initial = e.sent.find((x) => x.type === 'agent.history.req')!;
+    e.receive({ type: 'agent.sync', agents: [] });
+    e.receive(page(initial.id, [historyRecord(201, 'stale')]));
+    assert.equal(e.store.visibleMessages.length, 0);
+  } finally {
+    e.cleanup();
+  }
+});
+test('task snapshots replace the entire collection and retain structured windows', () => {
+  const e = setup();
+  try {
+    const tasks: TaskSnapshot[] = [
       {
-        type: 'tool_call',
-        tool_call_id: 'call',
-        tool_name: 'run',
-        content: 'background task task-42',
-        failed: false,
+        task_id: 'task-1',
+        call_id: 'call-1',
+        alias: 'bash',
+        returned: true,
+        output: ['first', { event: 'progress' }],
+        error: null,
       },
-    ],
-  };
-  const entries = historyEntries(
-    history([
+    ];
+    e.receive({ type: 'agent.task.sync', address, tasks });
+    assert.deepEqual(e.store.taskStates.get(`${address}`), tasks);
+    e.receive({ type: 'agent.task.sync', address, tasks: [] });
+    assert.deepEqual(e.store.taskStates.get(`${address}`), []);
+  } finally {
+    e.cleanup();
+  }
+});
+test('Agent logs and MCL records are separate incremental sets and range requests are explicit', () => {
+  const e = setup();
+  try {
+    e.store.queryRecords('log', { before_sequence: 100, after_sequence: 10, limit: 20 });
+    assert.equal(e.sent.at(-1)?.type, 'agent.log.req');
+    assert.deepEqual(e.sent.at(-1)?.message, {
+      address,
+
+      limit: 20,
+      before_sequence: 100,
+      after_sequence: 10,
+    });
+    const row = {
+      sequence: 5,
+      created_at_ms: 10,
+      level: 'info',
+      source: 'driver',
+      stage: 'execute',
+      message: 'hello',
+      details_json: null,
+      context_json: null,
+      origin: null,
+      raw_error: null,
+      traceback: null,
+    };
+    e.receive({ type: 'agent.log.sync', address, records: [row] });
+    e.receive({ type: 'agent.log.sync', address, records: [row] });
+    assert.equal(e.store.agentLogs.get(`${address}`)?.length, 1);
+    const audit = {
+      sequence: 5,
+      created_at_ms: 10,
+      source: 'client:webui/test:1',
+      turn: null,
+      content: 'CONFIG GET',
+      payload: { text: 'CONFIG GET' },
+    };
+    e.receive({ type: 'agent.mcl.sync', address, records: [audit] });
+    assert.equal(e.store.mclRecords.get(`${address}`)?.length, 1);
+    assert.equal(e.store.visibleMessages.length, 0);
+  } finally {
+    e.cleanup();
+  }
+});
+test('abort uses original target instance and turn and cannot accept unrelated receipts', async () => {
+  const e = setup();
+  try {
+    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'working' }] });
+    e.receive({ type: 'agent.turn.sync', address, turn: 'turn-1' });
+    e.receive(chunk());
+    const p = e.store.abortTurn();
+    const wire = e.sent.at(-1)!;
+    assert.equal(wire.type, 'agent.turn.abort');
+    assert.deepEqual(wire.message, { address, turn: 'turn-1' });
+    e.receive({ type: 'agent.turn.abort.result', id: wire.id, success: true });
+    await p;
+    e.receive(chunk(2, { content: 'late' }));
+    assert.equal(e.store.visibleMessages[0]?.content, 'part');
+    e.receive({ type: 'agent.turn.sync', address, turn: null });
+    assert.equal(e.store.canAbortTurn, false);
+  } finally {
+    e.cleanup();
+  }
+});
+test('send user input remains explicit MCL injection followed by wake', async () => {
+  const e = setup();
+  try {
+    const p = e.store.sendMessage(' hello ');
+    const inject = e.sent.at(-1)!;
+    assert.equal(inject.type, 'mcl.execute');
+    assert.equal(inject.message.command, 'INJECT ? TO entry.pending[-1]');
+    assert.deepEqual(inject.message.arguments, [[{ type: 'user', content: 'hello' }]]);
+    e.reply(inject.id);
+    await Promise.resolve();
+    await Promise.resolve();
+    const wake = e.sent.at(-1)!;
+    assert.equal(wake.message.command, 'EFFECT wake');
+    e.reply(wake.id);
+    await p;
+  } finally {
+    e.cleanup();
+  }
+});
+test('failed injection does not wake and errors preserve the callers draft', async () => {
+  const e = setup();
+  try {
+    const p = e.store.sendMessage('keep');
+    e.receive({
+      type: 'mcl.execute.result',
+      id: e.sent.at(-1)!.id,
+      success: false,
+      error: { code: 'Rejected', message: 'injection rejected' },
+    });
+    await assert.rejects(p, /injection rejected/);
+    assert.ok(!e.sent.some((x) => x.message.command === 'EFFECT wake'));
+  } finally {
+    e.cleanup();
+  }
+});
+test('strict message parser rejects replay and images in nested and returned payloads', () => {
+  for (const bad of [
+    { type: 'assistant', content: 'bad', replay: null },
+    { type: 'user', content: 'bad', images: [] },
+    { type: 'inject', messages: [{ type: 'user', content: 'bad', images: [] }] },
+  ]) {
+    assert.equal(isAgentMessage(bad), false);
+    assert.equal(
+      parseServerMessage(
+        JSON.stringify({
+          type: 'mcl.execute.result',
+          id: 'x',
+          success: true,
+          data: { kind: 'messages', value: [bad] },
+        }),
+      ),
+      null,
+    );
+  }
+});
+test('history and full require a matching real persistence sequence', () => {
+  assert.equal(
+    parseServerMessage(
+      JSON.stringify({ ...full(), message: { type: 'assistant', sequence: 43, content: 'bad' } }),
+    ),
+    null,
+  );
+  assert.equal(
+    parseServerMessage(
+      JSON.stringify(
+        page('x', [{ ...historyRecord(5, 'bad'), payload: { type: 'user', content: 'bad' } }]),
+      ),
+    ),
+    null,
+  );
+  assert.ok(parseServerMessage(JSON.stringify(full())));
+});
+test('failed query cannot disguise failure as an empty page', () => {
+  assert.equal(
+    parseServerMessage(
+      JSON.stringify({
+        type: 'agent.history.res',
+        id: 'x',
+        address,
+
+        success: false,
+        error: { code: 'ReadFailed', message: 'failed' },
+        records: [],
+        next_before_sequence: null,
+        next_after_sequence: null,
+      }),
+    ),
+    null,
+  );
+});
+test('registration result is matched to the current connection request', () => {
+  const e = setup();
+  try {
+    e.receive({
+      type: 'connection.register.result',
+      id: 'unknown',
+      success: true,
+      client: { address: 'client:wrong/x:1', client_type: 'webui' },
+    });
+    assert.equal(e.store.registeredClient?.address, 'client:webui/test:1');
+  } finally {
+    e.cleanup();
+  }
+});
+test('context selectors and JSON argument parsing do not create command injection', () => {
+  assert.deepEqual(parseArguments('["alias", {"x":1}, null]'), ['alias', { x: 1 }, null]);
+  assert.throws(() => parseArguments('{}'), /array/);
+  const image = { media_type: 'image/png', data: 'YWJj' };
+  assert.deepEqual(contextInjection('', 'entry.pending[-1]', [image]).arguments, [
+    [{ type: 'user', content: '', data: [image] }],
+  ]);
+  for (const selector of ['', 'field', 'x.y;EFFECT wake', 'x\nEFFECT wake'])
+    assert.throws(() => contextInjection('hi', selector));
+});
+test('media and tool formatting retain structured data', () => {
+  const image = { media_type: 'image/png', data: 'YWJj', local: 'not wire' };
+  assert.deepEqual(wireImages([image]), [{ media_type: 'image/png', data: 'YWJj' }]);
+  assert.throws(() => validateImageBudget(Array(9).fill(1)), /8/);
+  assert.ok(formatToolPayload({ hello: 'world' }).includes('hello'));
+});
+test('history helper renders data and usage without exposing metadata as text', () => {
+  const entry: AgentHistory = {
+    workspace: { id: workspace, name: 'Demo', project_root: '/project' },
+    agent: address,
+    messages: [
       {
-        type: 'inject',
-        sequence: 41,
+        sequence: 7,
         turn: null,
         kind: 'message',
         content: '',
-        payload,
-        created_at_ms: 0,
+        payload: {
+          type: 'assistant',
+          sequence: 7,
+          content: 'answer',
+          reasoning: 'thought',
+          usage: { input_tokens: 100, output_tokens: 10 },
+          tool_calls: [],
+        },
+        created_at_ms: 10,
       },
-    ]),
-  );
-  assert.deepEqual(
-    entries.map((entry) => entry.role),
-    ['system', 'tool'],
-  );
-  for (const entry of entries) {
-    assert.equal(entry.source, null);
-    assert.equal(entry.messageType, 'inject');
-    assert.equal(entry.sequence, 41);
-    assert.equal(entry.timestamp, 0);
-    assert.deepEqual(entry.payload, payload);
-  }
-  assert.equal(new Set(entries.map((entry) => entry.key)).size, 2);
-  const saved = history([
+    ],
+  };
+  assert.equal(historyEntries(entry)[0]?.content, 'answer');
+  assert.equal(historyEntries(entry)[0]?.thinking, 'thought');
+  assert.equal(latestContextTokens(entry), 110);
+});
+
+function history(messages: AgentHistory['messages']): AgentHistory {
+  return {
+    workspace: { id: workspace, name: 'Demo', project_root: '/project' },
+    agent: address,
+    messages,
+  };
+}
+const state = {
+  workspace_definitions: [{ path, cache: ws.definition }],
+  workspaces: [
     {
-      type: 'inject',
-      sequence: 41,
-      turn: null,
-      kind: 'message',
-      content: '',
-      payload,
-      created_at_ms: 0,
+      id: workspace,
+      name: 'Demo',
+      project_root: '/project',
+      definition_path: path,
+      status: 'running' as const,
+      agents: [address],
     },
-  ]);
-  assert.deepEqual(
-    historyEntries(saved).map((entry) => entry.key),
-    entries.map((entry) => entry.key),
-  );
-  const otherAgent = historyEntries({ ...saved, agent: 'agent:demo/reviewer:latest' });
-  assert.ok(otherAgent.every((entry) => !entries.some((original) => original.key === entry.key)));
-  const nextSequence = historyEntries({
-    ...saved,
-    messages: saved.messages.map((entry) => ({ ...entry, sequence: 43 })),
-  });
-  assert.ok(nextSequence.every((entry) => !entries.some((original) => original.key === entry.key)));
-  const wire = { type: 'history.result', id: 'history', history: saved };
-  assert.ok(parseServerMessage(JSON.stringify(wire)));
-  const { type: _type, ...withoutType } = saved.messages[0]!;
-  // `type` is optional on message rows; the record still renders by payload.
-  assert.ok(
-    parseServerMessage(JSON.stringify({ ...wire, history: { ...saved, messages: [withoutType] } })),
-  );
-  assert.equal(historyEntries({ ...saved, messages: [withoutType] })[0]!.messageType, null);
-  assert.equal(formatRecordTime(entries[0]!.timestamp), 'Time unavailable');
-});
-test('history reconciles a stream by explicit request_id, never by matching text', () => {
-  const env = setup();
-  try {
-    env.receive(delta('request-id'));
-    const row = {
-      type: 'assistant',
-      sequence: 79,
-      turn: 'turn',
-      kind: 'message',
-      content: 'partial',
-      payload: {
-        type: 'assistant',
-        request_id: 'other-request',
-        reasoning: null,
-        content: 'partial',
-        tool_calls: [],
-      },
-      created_at_ms: 123,
-    };
-    env.receive({ type: 'history.result', id: 'h', history: history([row]) });
-    assert.equal(env.store.visibleMessages.length, 2);
-    env.receive({
-      type: 'history.result',
-      id: 'h2',
-      history: history([{ ...row, payload: { ...row.payload, request_id: 'request-id' } }]),
-    });
-    assert.equal(env.store.visibleMessages.length, 1);
-    assert.equal(env.store.visibleMessages[0]!.sequence, 79);
-    assert.equal(env.store.visibleMessages[0]!.source, null);
-    assert.equal(env.store.visibleMessages[0]!.messageType, 'assistant');
-  } finally {
-    env.cleanup();
-  }
-});
+  ],
+  agents: [
+    {
+      workspace: { id: workspace, name: 'Demo', project_root: '/project' },
+      agent: address,
+
+      status: 'idle' as const,
+      turn: null,
+      sandbox: null,
+      tools: ['read_file'],
+      sandboxes: [],
+      queued_commands: 0,
+      pending_command: null,
+    },
+  ],
+  histories: [],
+};
+
 test('history keeps unknown records and background task identifiers as plain text and metadata', () => {
   const entry = historyEntries(
     history([
@@ -657,32 +749,7 @@ test('history keeps unknown records and background task identifiers as plain tex
   assert.match(entry.content, /task-42/);
   assert.match(metadataText(entry.payload), /task-42/);
 });
-test('token totals and latest context usage come only from persisted assistant history', () => {
-  const assistant = (sequence: number, input: number, output: number) => ({
-    type: 'assistant',
-    sequence,
-    turn: null,
-    kind: 'message',
-    content: 'answer',
-    created_at_ms: 123,
-    payload: {
-      type: 'assistant',
-      reasoning: null,
-      tool_calls: [],
-      usage: { input_tokens: input, output_tokens: output, cache_hit_tokens: 3 },
-    },
-  });
-  const saved = history([assistant(42, 60, 4), assistant(41, 10, 2)]);
-  assert.equal(latestContextTokens(saved), 64);
-  const env = setup({ ...state, histories: [saved] });
-  try {
-    assert.deepEqual(env.store.tokenUsage, { input: 70, output: 6, cached: 6 });
-    assert.equal(env.store.contextWindowTokens, 8192);
-    assert.equal(env.store.contextTokens, 64);
-  } finally {
-    env.cleanup();
-  }
-});
+
 test('images keep wire-only metadata and reject unsupported formats or excessive budgets', async () => {
   const image = { media_type: 'image/png', data: 'iVBORw0KGgo=', name: 'private.png', size: 8 };
   assert.deepEqual(wireImages([image]), [{ media_type: image.media_type, data: image.data }]);
@@ -705,31 +772,7 @@ test('images keep wire-only metadata and reject unsupported formats or excessive
     false,
   );
 });
-test('multi-MiB image send waits for parsed receipts and diagnostics do not expose image data', async () => {
-  const env = setup();
-  try {
-    const image = { media_type: 'image/png', data: 'A'.repeat(2 * 1024 * 1024) };
-    const sending = env.store.sendMessage('', [image]);
-    const inject = env.sent.find(
-      (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
-    )!;
-    assert.ok(JSON.stringify(inject).length > 1024 * 1024);
-    assert.deepEqual(inject.message.arguments, [[{ type: 'user', content: '', data: [image] }]]);
-    env.reply(inject.id);
-    await Promise.resolve();
-    await Promise.resolve();
-    const wake = env.sent.find((request) => request.message.command === 'EFFECT wake')!;
-    env.reply(wake.id);
-    await sending;
-    assert.ok(
-      !JSON.stringify(env.store.logs.filter((log) => log.target === 'ui.send')).includes(
-        image.data,
-      ),
-    );
-  } finally {
-    env.cleanup();
-  }
-});
+
 test('sidebar status uses runtime state and errors while preserving configured path identity', () => {
   const model = buildSidebarModel(
     state.workspace_definitions,
@@ -738,15 +781,15 @@ test('sidebar status uses runtime state and errors while preserving configured p
     new Map(),
     new Set([path]),
     path,
-    workspace.agents[0]!,
+    address,
   );
   assert.equal(model.workspaces[0]!.key, path);
-  assert.equal(model.workspaces[0]!.address, workspace.id);
+  assert.equal(model.workspaces[0]!.address, workspace);
   assert.equal(model.workspaces[0]!.status, 'running');
   const failed = buildSidebarModel(
     state.workspace_definitions,
     state.workspaces,
-    [{ ...state.agents[0]!, error: { kind: 'Failure', message: 'actual failure' } }],
+    [{ ...state.agents[0]!, error: { code: 'Failure', message: 'actual failure' } }],
     new Map(),
     new Set(),
     path,
@@ -754,6 +797,7 @@ test('sidebar status uses runtime state and errors while preserving configured p
   );
   assert.equal(failed.workspaces[0]!.status, 'error');
 });
+
 test('sidebar renders configured members without mutation menus and emits explicit runtime targets', async () => {
   class Host {
     parent: Host | null = null;
@@ -826,7 +870,7 @@ test('sidebar renders configured members without mutation menus and emits explic
       (node) => node.type === 'button' && String(node.props.class).includes('tree-main--agent'),
     )!;
     (button.props.onClick as () => void)();
-    assert.deepEqual(events, [[workspace.agents[0], path]]);
+    assert.deepEqual(events, [[address, path]]);
     // A running workspace exposes restart + stop, not start.
     const actions = nodes.filter(
       (node) => node.type === 'button' && String(node.props.class).includes('tree-action'),
@@ -838,7 +882,7 @@ test('sidebar renders configured members without mutation menus and emits explic
     const event = { stopPropagation() {} };
     (actions[0]!.props.onClick as (value: unknown) => void)(event);
     (actions[1]!.props.onClick as (value: unknown) => void)(event);
-    assert.deepEqual(events.slice(1), [[path], [workspace.id]]);
+    assert.deepEqual(events.slice(1), [[path], [workspace]]);
     const text = (node: Host): string => node.text + node.children.map(text).join('');
     assert.ok(!/New workspace|New session|Rename|Delete|Refresh/.test(text(root)));
   } finally {
@@ -846,252 +890,6 @@ test('sidebar renders configured members without mutation menus and emits explic
   }
 });
 
-test('sandbox CONFIG then EFFECT retain original target and radio follows actual runtime', async () => {
-  const env = setup(working());
-  try {
-    const updating = env.store.setSandbox('safe');
-    const write = env.sent.at(-1)!;
-    assert.deepEqual(write.message.arguments, ['sandbox', ['safe']]);
-    assert.deepEqual(env.store.sandboxOptions.activated, []);
-    env.reply(write.id);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    const effect = env.sent
-      .filter((wire) => wire.message.command === 'EFFECT sandbox_use ?')
-      .at(-1)!;
-    assert.deepEqual(effect.message, {
-      workspace: workspace.id,
-      agent: workspace.agents[0],
-      command: 'EFFECT sandbox_use ?',
-      arguments: [['safe']],
-    });
-    env.reply(effect.id);
-    await updating;
-    assert.deepEqual(env.store.sandboxOptions.activated, []);
-    env.receive({
-      type: 'state.sync',
-      state: { ...state, agents: [{ ...state.agents[0]!, sandbox: 'safe' }] },
-    });
-    assert.deepEqual(env.store.sandboxOptions.activated, ['safe']);
-    const clearing = env.store.setSandbox(null);
-    env.reply(env.sent.at(-1)!.id);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    const clearEffect = env.sent
-      .filter((wire) => wire.message.command === 'EFFECT sandbox_use ?')
-      .at(-1)!;
-    assert.deepEqual(clearEffect.message.arguments, [[]]);
-    env.reply(clearEffect.id);
-    await clearing;
-  } finally {
-    env.cleanup();
-  }
-});
-test('a sandbox write is rejected when the route changes before its acknowledgement', async () => {
-  const env = setup();
-  try {
-    const updating = env.store.setSandbox('safe');
-    const rejected = assert.rejects(updating, /changed/);
-    const write = env.sent.at(-1)!;
-    env.store.selectAgent(null);
-    env.store.selectAgent(workspace.agents[0]!);
-    env.reply(write.id);
-    await rejected;
-    assert.ok(!env.sent.some((wire) => wire.message.command === 'EFFECT sandbox_use ?'));
-  } finally {
-    env.cleanup();
-  }
-});
-test('a failed wake retries only the wake for the same message', async () => {
-  const env = setup();
-  try {
-    const injects = () =>
-      env.sent.filter((wire) => wire.message.command === 'INJECT ? TO entry.pending[-1]').length;
-    const sending = env.store.sendMessage('hello');
-    env.reply(
-      env.sent.find((wire) => wire.message.command === 'INJECT ? TO entry.pending[-1]')!.id,
-    );
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    const wake = env.sent.filter((wire) => wire.message.command === 'EFFECT wake').at(-1)!;
-    env.receive({
-      type: 'request.failed',
-      id: wake.id,
-      error: { kind: 'WriteFailed', message: 'wake not written' },
-    });
-    await assert.rejects(sending, /wake not written/);
-    assert.equal(injects(), 1);
-    const retrying = env.store.sendMessage('hello');
-    assert.equal(injects(), 1);
-    const secondWake = env.sent.filter((wire) => wire.message.command === 'EFFECT wake').at(-1)!;
-    assert.notEqual(secondWake.id, wake.id);
-    env.reply(secondWake.id);
-    await retrying;
-    assert.equal(injects(), 1);
-  } finally {
-    env.cleanup();
-  }
-});
-test('a failed sandbox effect re-reads CONFIG and reports saved-but-not-applied', async () => {
-  const env = setup(working());
-  try {
-    const updating = env.store.setSandbox('safe');
-    env.reply(env.sent.at(-1)!.id);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    const effect = env.sent
-      .filter((wire) => wire.message.command === 'EFFECT sandbox_use ?')
-      .at(-1)!;
-    env.receive({
-      type: 'request.failed',
-      id: effect.id,
-      error: { kind: 'Denied', message: 'effect denied' },
-    });
-    await assert.rejects(updating, /Sandbox saved but not activated: effect denied/);
-  } finally {
-    env.cleanup();
-  }
-});
-test('workspace.stopped clears the selected runtime route immediately', () => {
-  const env = setup();
-  try {
-    env.receive(delta());
-    assert.equal(env.store.visibleMessages.length, 1);
-    env.receive({
-      type: 'workspace.stopped',
-      id: 'stop-1',
-      workspace: { id: workspace.id, name: 'Runtime', project_root: '/test' },
-    });
-    assert.equal(env.store.runtimeWorkspaces.length, 1);
-    assert.equal(env.store.selectedAgent, null);
-    assert.equal(env.store.visibleMessages.length, 0);
-    assert.equal(env.store.sandboxOptions.options.length, 0);
-    env.receive({ type: 'state.sync', state: { ...state, workspaces: [], agents: [] } });
-    assert.equal(env.store.runtimeWorkspaces.length, 0);
-  } finally {
-    env.cleanup();
-  }
-});
-test('stateReady requires a fresh snapshot after connecting', () => {
-  const env = setup();
-  try {
-    assert.equal(env.store.stateReady, false);
-    env.receive({ type: 'state.sync', state });
-    assert.equal(env.store.stateReady, true);
-    assert.equal(env.store.connect(), true);
-    assert.equal(env.store.stateReady, false);
-  } finally {
-    env.cleanup();
-  }
-});
-test('a delivered message is injected again after its turn completes', async () => {
-  const env = setup();
-  try {
-    const injects = () =>
-      env.sent.filter((wire) => wire.message.command === 'INJECT ? TO entry.pending[-1]').length;
-    const first = env.store.sendMessage('hello');
-    env.reply(
-      env.sent.find((wire) => wire.message.command === 'INJECT ? TO entry.pending[-1]')!.id,
-    );
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    env.receive({
-      type: 'request.failed',
-      id: env.sent.filter((wire) => wire.message.command === 'EFFECT wake').at(-1)!.id,
-      error: { kind: 'WriteFailed', message: 'wake not written' },
-    });
-    await assert.rejects(first, /wake not written/);
-    const retrying = env.store.sendMessage('hello');
-    assert.equal(injects(), 1);
-    env.reply(env.sent.filter((wire) => wire.message.command === 'EFFECT wake').at(-1)!.id);
-    await retrying;
-    env.receive({ type: 'state.sync', state: working() });
-    env.receive({ type: 'state.sync', state });
-    const again = env.store.sendMessage('hello');
-    assert.equal(injects(), 2);
-    env.reply(
-      env.sent.filter((wire) => wire.message.command === 'INJECT ? TO entry.pending[-1]').at(-1)!
-        .id,
-    );
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    env.reply(env.sent.filter((wire) => wire.message.command === 'EFFECT wake').at(-1)!.id);
-    await again;
-  } finally {
-    env.cleanup();
-  }
-});
-
-test('MCL history retains source while message history requires type without source', () => {
-  const saved = history([
-    {
-      sequence: 1,
-      turn: null,
-      source: 'client:local/ui:latest',
-      kind: 'mcl',
-      content: 'CONFIG GET',
-      payload: { text: 'CONFIG GET' },
-      created_at_ms: 0,
-    },
-  ]);
-  const wire = { type: 'history.result', id: 'h', history: saved };
-  assert.ok(parseServerMessage(JSON.stringify(wire)));
-  const entry = historyEntries(saved)[0]!;
-  assert.equal(entry.source, 'client:local/ui:latest');
-  assert.equal(entry.messageType, null);
-  const message = {
-    ...saved.messages[0]!,
-    kind: 'message',
-    type: 'user',
-    payload: { type: 'user', content: 'hello', sequence: 1 },
-  };
-  assert.equal(
-    parseServerMessage(JSON.stringify({ ...wire, history: { ...saved, messages: [message] } })),
-    null,
-  );
-  const { source: _source, ...withoutSource } = message;
-  assert.ok(
-    parseServerMessage(
-      JSON.stringify({ ...wire, history: { ...saved, messages: [withoutSource] } }),
-    ),
-  );
-  // `source` is optional on MCL rows; the audit record still renders.
-  const { source: _mclSource, ...mclWithoutSource } = saved.messages[0]!;
-  assert.ok(
-    parseServerMessage(
-      JSON.stringify({ ...wire, history: { ...saved, messages: [mclWithoutSource] } }),
-    ),
-  );
-  assert.equal(historyEntries({ ...saved, messages: [mclWithoutSource] })[0]!.source, null);
-});
-
-test('MCL error message results reject pending writes without waking the Driver', async () => {
-  const env = setup();
-  try {
-    const sending = env.store.sendMessage('keep draft');
-    const rejection = assert.rejects(
-      sending,
-      (error: Error & { requestId?: string }) =>
-        /storage unavailable/.test(error.message) && error.requestId === 'internal-request',
-    );
-    const inject = env.sent.find(
-      (request) => request.type === 'mcl.command' && request.message.command !== 'CONFIG GET',
-    )!;
-    env.receive({
-      type: 'mcl.command_result',
-      id: inject.id,
-      source: 'client:webui/browser:1',
-      target: workspace.agents[0]!,
-      result: {
-        Ok: {
-          Error: {
-            type: 'error',
-            message: 'StorageFailed: storage unavailable',
-            request_id: 'internal-request',
-          },
-        },
-      },
-    });
-    await rejection;
-    assert.ok(!env.sent.some((request) => request.message.command === 'EFFECT wake'));
-  } finally {
-    env.cleanup();
-  }
-});
 test('assistant messages may omit content, reasoning and tool_calls', () => {
   assert.equal(isAgentMessage({ type: 'assistant' }), true);
   assert.equal(
@@ -1122,31 +920,7 @@ test('assistant messages may omit content, reasoning and tool_calls', () => {
   assert.equal(entries[0]!.thinking, '');
   assert.equal(entries[0]!.toolCalls.length, 1);
 });
-test('a non-Unit INJECT acknowledgement is treated as an unknown outcome', async () => {
-  const env = setup();
-  try {
-    const sending = env.store.sendMessage('hello');
-    const inject = env.sent.find(
-      (wire) => wire.message.command === 'INJECT ? TO entry.pending[-1]',
-    )!;
-    env.reply(inject.id, 'NotUnit');
-    await assert.rejects(sending, /did not acknowledge Unit/);
-    assert.ok(!env.sent.some((wire) => wire.message.command === 'EFFECT wake'));
-  } finally {
-    env.cleanup();
-  }
-});
-test('a non-Unit sandbox CONFIG SET is not treated as saved', async () => {
-  const env = setup(state);
-  try {
-    const updating = env.store.setSandbox('safe');
-    env.reply(env.sent.at(-1)!.id, 'Config');
-    await assert.rejects(updating, /did not acknowledge Unit/);
-    assert.ok(!env.sent.some((wire) => wire.message.command === 'EFFECT sandbox_use ?'));
-  } finally {
-    env.cleanup();
-  }
-});
+
 test('tool results merge into the assistant call row', () => {
   const entries = historyEntries(
     history([
@@ -1215,6 +989,7 @@ test('tool results merge into the assistant call row', () => {
     images: undefined,
   });
 });
+
 test('an unpaired tool result stays as a standalone tool row', () => {
   const entries = historyEntries(
     history([
@@ -1241,6 +1016,7 @@ test('an unpaired tool result stays as a standalone tool row', () => {
   assert.equal(entries[0]!.toolName, 'read_file');
   assert.equal(entries[0]!.failed, true);
 });
+
 test('tool payloads render as readable TOML-like text', () => {
   const value = { cmd: 'time sleep 9; echo "9 秒结束"', nested: { retry: 2 } };
   const text = formatToolPayload(value);
@@ -1256,77 +1032,240 @@ test('tool payloads render as readable TOML-like text', () => {
   assert.ok(result.includes('failed = false'));
 });
 
-test('internal messages use data, preserve sequence and reject obsolete wire fields', () => {
-  const image = { media_type: 'image/png', data: 'iVBORw0KGgo=' };
-  const user = { type: 'user', content: 'picture', data: [image], sequence: 17 };
-  const tool = {
-    type: 'tool_call',
-    tool_call_id: 'call',
-    tool_name: 'read_image',
-    content: '',
-    data: [image],
-    failed: false,
-    sequence: 18,
-  };
-  assert.equal(isAgentMessage(user), true);
-  assert.equal(isAgentMessage(tool), true);
-  for (const message of [user, tool, { type: 'assistant', reasoning: 'thought' }]) {
-    assert.equal(isAgentMessage({ ...message, replay: null }), false);
-    assert.equal(isAgentMessage({ ...message, images: [] }), false);
-  }
-  for (const sequence of [-1, 1.5, '17', null]) {
-    assert.equal(isAgentMessage({ ...user, sequence }), false);
-  }
-  assert.equal(isAgentMessage({ type: 'inject', messages: [{ ...user, images: [] }] }), false);
-  const rows = historyEntries(
-    history([
+test('multiple activated Agents require an explicit choice and route changes never wake another Agent', async () => {
+  const other = { ...agent, address: 'agent:demo/reviewer:latest' };
+  const e = setup(
+    [
       {
-        sequence: 17,
-        turn: null,
-        kind: 'message',
-        content: 'picture',
-        payload: user,
-        created_at_ms: 1,
+        ...ws,
+        definition: {
+          ...ws.definition,
+          agents: [
+            ...ws.definition.agents,
+            { name: 'reviewer', driver: 'driver:local/reviewer:latest', home_root: '/reviewer' },
+          ],
+        },
       },
-      { sequence: 18, turn: null, kind: 'message', content: '', payload: tool, created_at_ms: 2 },
-    ]),
+    ],
+    [agent, other],
   );
-  assert.equal(rows.length, 2);
-  assert.deepEqual(rows[0]!.images, [image]);
-  assert.deepEqual(rows[1]!.images, [image]);
-  assert.equal((rows[0]!.payload as { sequence: number }).sequence, 17);
-  for (const obsolete of [{ replay: {} }, { images: [image] }]) {
-    const invalid = { ...user, ...obsolete };
+  try {
+    assert.equal(e.store.selectedAgent, null);
+    await assert.rejects(e.store.executeMclCommand('GET session.conversation'), /explicitly/);
+    e.store.selectAgent(address);
+    const sending = e.store.sendMessage('keep draft');
+    const inject = e.sent.at(-1)!;
+    e.store.selectAgent(other.address);
+    e.reply(inject.id);
+    await assert.rejects(sending, /changed during send/);
+    assert.ok(!e.sent.some((w) => w.message.command === 'EFFECT wake'));
+  } finally {
+    e.cleanup();
+  }
+});
+test('failed wake retries only the wake, without duplicate input injection', async () => {
+  const e = setup();
+  try {
+    const first = e.store.sendMessage('same');
+    e.reply(e.sent.at(-1)!.id);
+    await Promise.resolve();
+    await Promise.resolve();
+    const wake = e.sent.at(-1)!;
+    assert.equal(wake.message.command, 'EFFECT wake');
+    e.receive({
+      type: 'mcl.execute.result',
+      id: wake.id,
+      success: false,
+      error: { code: 'Rejected', message: 'wake rejected' },
+    });
+    await assert.rejects(first, /wake rejected/);
+    const retry = e.store.sendMessage('same');
+    assert.equal(e.sent.at(-1)!.message.command, 'EFFECT wake');
+    e.reply(e.sent.at(-1)!.id);
+    await retry;
     assert.equal(
-      parseServerMessage(
-        JSON.stringify({
-          type: 'history.result',
-          id: 'h',
-          history: history([
-            {
-              sequence: 17,
-              turn: null,
-              kind: 'message',
-              content: 'picture',
-              payload: invalid,
-              created_at_ms: 1,
-            },
-          ]),
-        }),
-      ),
-      null,
+      e.sent.filter((w) => w.message.command === 'INJECT ? TO entry.pending[-1]').length,
+      1,
     );
+  } finally {
+    e.cleanup();
+  }
+});
+test('a non-Unit injection value is an unknown outcome and never wakes the Driver', async () => {
+  const e = setup();
+  try {
+    const p = e.store.sendMessage('draft');
+    e.reply(e.sent.at(-1)!.id, { kind: 'config', value: {} });
+    await assert.rejects(p, /did not acknowledge Unit/);
+    assert.ok(!e.sent.some((w) => w.message.command === 'EFFECT wake'));
+  } finally {
+    e.cleanup();
+  }
+});
+test('multi-MiB media sends await receipts and diagnostics do not contain media bytes', async () => {
+  const e = setup();
+  try {
+    const image = { media_type: 'image/png', data: 'A'.repeat(2 * 1024 * 1024) };
+    const p = e.store.sendMessage('', [image]);
+    const inject = e.sent.at(-1)!;
+    assert.ok(JSON.stringify(inject).length > 1024 * 1024);
+    assert.deepEqual(inject.message.arguments, [[{ type: 'user', content: '', data: [image] }]]);
+    e.reply(inject.id);
+    await Promise.resolve();
+    await Promise.resolve();
+    e.reply(e.sent.at(-1)!.id);
+    await p;
+    assert.ok(!JSON.stringify(e.store.logs).includes(image.data));
+  } finally {
+    e.cleanup();
+  }
+});
+test('abort failure stays frozen until current matching turn sync releases it', async () => {
+  const e = setup();
+  try {
+    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'working' }] });
+    e.receive({ type: 'agent.turn.sync', address, turn: 'turn-1' });
+    e.receive(chunk());
+    const p = e.store.abortTurn();
+    const abort = e.sent.at(-1)!;
+    e.receive({
+      type: 'agent.turn.abort.result',
+      id: abort.id,
+      success: false,
+      error: { code: 'Rejected', message: 'abort rejected' },
+    });
+    await assert.rejects(p, /abort rejected/);
+    e.receive(chunk(2, { content: 'blocked' }));
+    assert.equal(e.store.visibleMessages[0]?.content, 'part');
+    e.receive({ type: 'agent.turn.sync', address, turn: 'turn-1' });
+    e.receive(chunk(3, { content: ' resumed' }));
+    assert.equal(e.store.visibleMessages[0]?.content, 'part resumed');
+  } finally {
+    e.cleanup();
+  }
+});
+test('late abort receipt completes original Promise without mutating new VM turn', async () => {
+  const e = setup();
+  try {
+    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'working' }] });
+    e.receive({ type: 'agent.turn.sync', address, turn: 'turn-1' });
+    const p = e.store.abortTurn();
+    const abort = e.sent.at(-1)!;
+    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'working' }] });
+    e.receive({ type: 'agent.turn.sync', address, turn: 'turn-new' });
+    e.receive({ type: 'agent.turn.abort.result', id: abort.id, success: true });
+    await p;
+    assert.equal(e.store.selectedAgentState?.turn, 'turn-new');
+  } finally {
+    e.cleanup();
+  }
+});
+test('history and full reconcile streams by explicit generation association, never equal text', () => {
+  const e = setup();
+  try {
+    e.receive(chunk());
+    const first = e.sent.find((w) => w.type === 'agent.history.req')!;
+    e.receive(
+      page(first.id, [
+        {
+          ...historyRecord(79, 'part'),
+          payload: {
+            type: 'assistant',
+            sequence: 79,
+            request_id: 'other-generation',
+            content: 'part',
+          },
+        },
+      ]),
+    );
+    assert.equal(e.store.visibleMessages.length, 2);
+    e.receive({
+      ...full(80, 'generation-1', 'part'),
+      message: { type: 'assistant', sequence: 80, request_id: 'generation-1', content: 'part' },
+    });
+    assert.equal(e.store.visibleMessages.length, 2);
+    assert.deepEqual(
+      e.store.visibleMessages.map((v) => v.sequence),
+      [79, 80],
+    );
+  } finally {
+    e.cleanup();
+  }
+});
+test('history token totals use persisted assistant usage and latest sequence', () => {
+  const e = setup();
+  try {
+    const id = e.sent.find((w) => w.type === 'agent.history.req')!.id;
+    const rows = [
+      {
+        ...historyRecord(42, 'answer'),
+        payload: {
+          type: 'assistant',
+          sequence: 42,
+          content: 'answer',
+          usage: { input_tokens: 60, output_tokens: 4, cache_hit_tokens: 3 },
+        },
+      },
+      {
+        ...historyRecord(41, 'answer'),
+        payload: {
+          type: 'assistant',
+          sequence: 41,
+          content: 'answer',
+          usage: { input_tokens: 10, output_tokens: 2, cache_hit_tokens: 3 },
+        },
+      },
+    ];
+    e.receive(page(id, rows));
+    assert.deepEqual(e.store.tokenUsage, { input: 70, output: 6, cached: 6 });
+    assert.equal(e.store.contextTokens, 64);
+    assert.equal(e.store.contextWindowTokens, null);
+  } finally {
+    e.cleanup();
+  }
+});
+test('unsupported sandbox runtime state is explicit and saved selection is read through MCL', async () => {
+  const e = setup();
+  try {
+    assert.equal(e.store.sandboxOptions.available, false);
+    await assert.rejects(e.store.setSandbox(null), /unavailable/);
+    const p = e.store.readSandboxSettings();
+    const request = e.sent.at(-1)!;
+    assert.equal(request.message.command, 'CONFIG GET');
+    e.reply(request.id, { kind: 'config', value: { sandbox: ['safe'] } });
+    await p;
+    assert.deepEqual(e.store.sandboxOptions.configured, ['safe']);
+    assert.deepEqual(e.store.sandboxOptions.activated, []);
+  } finally {
+    e.cleanup();
+  }
+});
+test('connecting again clears state readiness until new category snapshots arrive', () => {
+  const e = setup();
+  try {
+    assert.equal(e.store.stateReady, true);
+    e.store.connect();
+    assert.equal(e.store.stateReady, false);
+  } finally {
+    e.cleanup();
+  }
+});
+test('a completed send can submit identical content again after a later turn', async () => {
+  const e = setup();
+  try {
+    for (let i = 0; i < 2; i++) {
+      const p = e.store.sendMessage('repeat');
+      e.reply(e.sent.at(-1)!.id);
+      await Promise.resolve();
+      await Promise.resolve();
+      e.reply(e.sent.at(-1)!.id);
+      await p;
+    }
     assert.equal(
-      parseServerMessage(
-        JSON.stringify({
-          type: 'mcl.command_result',
-          id: 'm',
-          source: 'client:local/ui:latest',
-          target: workspace.agents[0],
-          result: { Ok: { Array: { Message: [invalid] } } },
-        }),
-      ),
-      null,
+      e.sent.filter((w) => w.message.command === 'INJECT ? TO entry.pending[-1]').length,
+      2,
     );
+  } finally {
+    e.cleanup();
   }
 });

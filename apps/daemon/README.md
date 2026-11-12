@@ -21,7 +21,7 @@ Daemon是应用入口，定位~/.margatroid，调用Compose装配并运行App。
                 └── snapshot_<id>.sqlite
 ```
 
-启动读取全局配置、模型路由及Workspace定义展示缓存，不自动启动所有Workspace。每次Workspace启动或重启请求携带path，后端重读文件、更新展示缓存并直接使用本次解析结果；禁止缓存兜底启动。
+定义加载目标统一为全量重载并发布缓存，不自动启动所有Workspace。Workspace及Agent启动/重启前先完成同一全量重载，再从本次缓存快照选择定义及成员参数；重载失败不启动，不以旧缓存兜底，也不单独回源某个Workspace。
 
 Workspace拥有专属线程，Agent和Lua分别管理生命周期和VM退出；停止遵守活动真实收口、VM退出、线程join的顺序。进程退出或连接断开不自动等价于业务清理完成。
 

@@ -8,7 +8,7 @@ pub use error::{ToolError, ToolErrorKind};
 pub use events::{InitToolTasks, InitToolTasksReply, ToolExecuteReply, ToolExecuteRequest};
 pub use types::{
     TaskReadResult, ToolConfiguration, ToolExecuteResponse, ToolExecutionLimits, ToolImage,
-    ToolTaskHandle,
+    ToolTaskHandle, ToolTaskSnapshot,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};

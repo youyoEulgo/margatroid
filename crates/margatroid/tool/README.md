@@ -143,3 +143,6 @@ tool_inject由宿主固定当前资源路径，owner_task_id由注入参数显�
 MCP注册任务A连接成功、注入入口后return但不finish；使用入口的任务B从私有context取得owner_task_id和binding，运行同一Lua脚本，把带request ID的调用发送给A，得到结果后return并finish。A连续转发带ID的请求并路由乱序响应。A清理时只移除Tools中属于它的记录，不等待或取消已受理的B；B按自身超时、取消与工具内部通信结果处理。B先结束时，A的迟到回复遇TaskMissing仅清除该请求关联。
 
 process_open使用原始stdin/stdout/stderr管道，不经过PTY；write/read保持字节，工具自己处理消息边界、UTF-8分片和多条消息。输入写入、stdout与stderr读取需并行推进，避免双向背压互相阻塞。子进程和后代受ToolTask唯一存活预算、取消及finish清理约束。
+
+
+agent.task使用ToolTasks::snapshot与ToolTaskHandle::snapshot返回ToolTaskSnapshot纯值，不复用具有消费语义的read。每项包含task_id、call_id、alias、returned、完整保留output窗口及error；已清理项不返回，无完成缓存。读取不推进cursor、不清除replaced、不触发取消或finish，不借出内部句柄。查询和主动同步均为完整任务集合，非分块；并发任务逐项取一致状态，不宣称整个集合是同时冻结的全局事务。read/finish语义保持原样，System及事件不改。

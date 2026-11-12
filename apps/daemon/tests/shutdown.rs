@@ -257,7 +257,6 @@ async fn request(socket: &mut Socket, kind: &str, id: &str, message: Value) -> V
 
 async fn mcl(
     socket: &mut Socket,
-    workspace: &Value,
     agent: &Value,
     id: &str,
     command: &str,
@@ -265,14 +264,14 @@ async fn mcl(
 ) -> Value {
     let reply = request(
         socket,
-        "mcl.command",
+        "mcl.execute",
         id,
-        json!({"workspace":workspace,"agent":agent,"command":command,"arguments":arguments}),
+        json!({"address":agent["address"],"command":command,"arguments":arguments}),
     )
     .await;
-    assert_eq!(reply["type"], "mcl.command_result", "{reply}");
-    assert!(reply["result"].get("Err").is_none(), "{reply}");
-    reply["result"]["Ok"].clone()
+    assert_eq!(reply["type"], "mcl.execute.result", "{reply}");
+    assert_eq!(reply["success"], true, "{reply}");
+    reply["data"].clone()
 }
 
 async fn shutdown_case(name: &str, repeat: bool) {
@@ -322,7 +321,10 @@ async fn shutdown_case(name: &str, repeat: bool) {
         json!({"client_type":"cli","name":"shutdown-test"}),
     )
     .await;
-    assert_eq!(registered["type"], "connection.registered", "{registered}");
+    assert_eq!(
+        registered["type"], "connection.register.result",
+        "{registered}"
+    );
     let started = request(
         &mut socket,
         "workspace.start",
@@ -330,35 +332,26 @@ async fn shutdown_case(name: &str, repeat: bool) {
         json!({"path":definition}),
     )
     .await;
-    assert_eq!(started["type"], "workspace.started", "{started}");
-    assert!(
-        started["workspace"]["member_failures"]
-            .as_array()
-            .is_none_or(|failures| failures.is_empty()),
-        "{started}"
-    );
-    let workspace = &started["workspace"]["id"];
-    let agent = &started["workspace"]["agents"][0];
-    mcl(
-        &mut socket,
-        workspace,
-        agent,
-        "turn",
-        "EFFECT start_turn",
-        json!([]),
-    )
-    .await;
+    assert_eq!(started["type"], "workspace.start.result", "{started}");
+    assert_eq!(started["success"], true, "{started}");
+    assert!(started.get("workspace").is_none());
+    let states = request(&mut socket, "agent.req", "agents", json!({})).await;
+    assert_eq!(states["type"], "agent.res", "{states}");
+    assert_eq!(states["success"], true, "{states}");
+    assert_eq!(states["agents"].as_array().unwrap().len(), 1, "{states}");
+    let agent = &states["agents"][0];
+    mcl(&mut socket, agent, "turn", "EFFECT start_turn", json!([])).await;
     let calls: Vec<_> = ["terminal", "process"].into_iter().map(|kind| json!({"id":kind,"tool_name":"shutdown","arguments":json!({"kind":kind}).to_string()})).collect();
     let returned = mcl(
         &mut socket,
-        workspace,
         agent,
         "tools",
         "EFFECT tool_call ?",
         json!([[{"type":"assistant","tool_calls":calls}]]),
     )
     .await;
-    let results = returned["Array"]["Message"]
+    assert_eq!(returned["kind"], "messages", "{returned}");
+    let results = returned["value"]
         .as_array()
         .unwrap_or_else(|| panic!("tool results: {returned}"));
     assert_eq!(results.len(), 2, "{returned}");

@@ -266,7 +266,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
         delivery: StreamDelivery {
             id: request_id.clone(),
             agent: agent_address,
-            instance: agent_instance.start_id,
+            turn: turn.clone(),
             senders,
         },
         request,
@@ -455,7 +455,7 @@ async fn supervise_inference(mut context: InferenceContext) {
                 if context.reply.is_some() {
                     finish_inference(&mut context, Err(failure.clone()));
                 } else {
-                    push_finished(&mut context.delivery, Some(&failure));
+                    push_full(&mut context.delivery, Err(&failure));
                 }
                 let _ = worker.await;
                 return Err(failure);
@@ -483,7 +483,7 @@ fn finish_inference(
         .unwrap_or_else(|error| error.into_inner())
         .close();
     if let Some(reply) = context.reply.take() {
-        push_finished(&mut context.delivery, result.as_ref().err());
+        push_full(&mut context.delivery, result.as_ref());
         let _ = reply.send(result);
     }
 }
@@ -794,16 +794,38 @@ fn format_provider_status_error(
 }
 
 fn push_stream(delivery: &mut StreamDelivery, sequence: u64, reasoning: bool, content: String) {
-    let frame = json!({"type":if reasoning { "agent.message.reasoning_delta" } else { "agent.message.delta" },"id":delivery.id,"agent":delivery.agent,"agent_instance":delivery.instance,"sequence":sequence,"content":content});
-    if let Ok(encoded) = serde_json::to_string(&frame) {
-        delivery.senders.retain(|sender| {
-            !sender.is_closed() && sender.try_send(ClientFrame::Text(encoded.clone())).is_ok()
-        });
-    }
+    let delta = if reasoning {
+        json!({"reasoning":content})
+    } else {
+        json!({"content":content})
+    };
+    let frame = json!({"type":"agent.message.chunk.sync","address":delivery.agent,"turn":delivery.turn,"generation":delivery.id,"sequence":sequence,"delta":delta});
+    push_frame(delivery, frame);
 }
 
-fn push_finished(delivery: &mut StreamDelivery, failure: Option<&InferenceError>) {
-    let frame = json!({"type":"agent.message.finished","id":delivery.id,"agent":delivery.agent,"agent_instance":delivery.instance,"error":failure.map(|failure| json!({"kind":format!("{:?}",failure.kind),"message":failure.message}))});
+fn push_full(delivery: &mut StreamDelivery, result: Result<&InferenceResponse, &InferenceError>) {
+    let (message, failure) = match result {
+        Ok(response) => {
+            let calls = response.tool_calls.iter().map(|call| {
+                json!({"id":call.id,"tool_name":call.name,"arguments":call.arguments.to_string()})
+            }).collect::<Vec<_>>();
+            let mut message = json!({"type":"assistant","request_id":delivery.id,"reasoning":response.reasoning,"content":response.content,"tool_calls":calls,"usage":response.usage,"stop_reason":response.stop_reason.as_str()});
+            message
+                .as_object_mut()
+                .expect("message object")
+                .retain(|_, value| !value.is_null());
+            (message, None)
+        }
+        Err(failure) => (
+            json!({"type":"error","message":failure.to_string(),"request_id":delivery.id}),
+            Some(json!({"code":format!("{:?}",failure.kind),"message":failure.message})),
+        ),
+    };
+    let frame = json!({"type":"agent.message.full.sync","address":delivery.agent,"turn":delivery.turn,"generation":delivery.id,"history_sequence":null,"message":message,"error":failure});
+    push_frame(delivery, frame);
+}
+
+fn push_frame(delivery: &mut StreamDelivery, frame: serde_json::Value) {
     if let Ok(encoded) = serde_json::to_string(&frame) {
         delivery.senders.retain(|sender| {
             !sender.is_closed() && sender.try_send(ClientFrame::Text(encoded.clone())).is_ok()

@@ -147,6 +147,7 @@ fn dynamic_admission_checks_schema_without_rechecking_recorded_owner() {
         app.world_mut().insert_component(
             agent,
             Workspace {
+                definition: None,
                 name: "workspace".into(),
                 definition_path: root.path().join("workspace.yaml"),
                 project_root: root.path().to_owned(),

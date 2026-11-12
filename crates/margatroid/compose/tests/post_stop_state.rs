@@ -60,7 +60,7 @@ async fn next(socket: &mut Socket, matches: impl Fn(&Value) -> bool) -> Value {
 /// The child uses the production event-driven runner. A manual app.tick loop
 /// would hide retries that depend on a wall-clock backoff but schedule no wake.
 #[test]
-fn original_websocket_can_query_empty_state_after_stopping_the_last_workspace() {
+fn original_websocket_can_query_inactive_workspaces_and_no_agents_after_last_stop() {
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
         let root = std::path::PathBuf::from(root);
         let mut app = build_app(ApplicationOptions {
@@ -109,7 +109,7 @@ fn original_websocket_can_query_empty_state_after_stopping_the_last_workspace() 
         Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "original_websocket_can_query_empty_state_after_stopping_the_last_workspace",
+                "original_websocket_can_query_inactive_workspaces_and_no_agents_after_last_stop",
                 "--nocapture",
             ])
             .env(CHILD_ROOT, root.path())
@@ -144,7 +144,7 @@ fn original_websocket_can_query_empty_state_after_stopping_the_last_workspace() 
             json!({"client_type":"webui","name":"post-stop-regression"}),
         )
         .await;
-        next(&mut socket, |v| v["type"] == "connection.registered").await;
+        next(&mut socket, |v| v["type"] == "connection.register.result").await;
         for cycle in 0..3 {
             let start_id = format!("start-{cycle}");
             send(
@@ -155,35 +155,45 @@ fn original_websocket_can_query_empty_state_after_stopping_the_last_workspace() 
             )
             .await;
             let started = next(&mut socket, |v| v["id"] == start_id).await;
-            assert_eq!(started["type"], "workspace.started", "{started}");
-            assert!(
-                started["workspace"]["member_failures"]
-                    .as_array()
-                    .is_none_or(|v| v.is_empty())
-            );
-            let workspace = started["workspace"]["id"].as_str().unwrap();
+            assert_eq!(started["type"], "workspace.start.result", "{started}");
+            assert_eq!(started["success"], true, "{started}");
+            assert!(started.get("workspace").is_none());
+            let agents_id = format!("live-{cycle}");
+            send(&mut socket, "agent.req", &agents_id, json!({})).await;
+            let agents = next(&mut socket, |v| v["id"] == agents_id).await;
+            assert_eq!(agents["type"], "agent.res");
+            assert_eq!(agents["agents"].as_array().unwrap().len(), 1);
             let stop_id = format!("stop-{cycle}");
             send(
                 &mut socket,
                 "workspace.stop",
                 &stop_id,
-                json!({"workspace":workspace}),
+                json!({"path":definition}),
             )
             .await;
             let stopped = next(&mut socket, |v| v["id"] == stop_id).await;
-            assert_eq!(stopped["type"], "workspace.stopped", "{stopped}");
+            assert_eq!(stopped["type"], "workspace.stop.result", "{stopped}");
+            assert_eq!(stopped["success"], true, "{stopped}");
             // No second client, periodic tick, or extra wake is allowed to
             // rescue this query during the snapshot failure retry backoff.
             for query in 0..2 {
-                let id = format!("state-{cycle}-{query}");
-                send(&mut socket, "state.query", &id, json!({})).await;
-                let state = next(&mut socket, |v| {
-                    v["type"] == "state.sync"
-                        && v["state"]["workspaces"] == json!([])
-                        && v["state"]["agents"] == json!([])
-                })
-                .await;
-                assert_eq!(state["state"]["histories"], json!([]));
+                let id = format!("workspaces-{cycle}-{query}");
+                send(&mut socket, "workspace.req", &id, json!({})).await;
+                let state = next(&mut socket, |v| v["id"] == id).await;
+                assert_eq!(state["type"], "workspace.res");
+                assert_eq!(state["success"], true);
+                let entries = state["workspaces"].as_array().unwrap();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0]["path"], definition.to_string_lossy().as_ref());
+                assert_eq!(entries[0]["status"], "inactive");
+                assert!(entries[0]["address"].is_null());
+                assert!(state.get("histories").is_none());
+                let id = format!("agents-{cycle}-{query}");
+                send(&mut socket, "agent.req", &id, json!({})).await;
+                let state = next(&mut socket, |v| v["id"] == id).await;
+                assert_eq!(state["type"], "agent.res");
+                assert_eq!(state["success"], true);
+                assert_eq!(state["agents"], json!([]));
             }
         }
         socket.close(None).await.unwrap();

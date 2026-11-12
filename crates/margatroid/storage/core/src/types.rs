@@ -127,3 +127,24 @@ pub enum StorageValue {
     History(Vec<HistoryRecord>),
     HistoryEntries(Vec<StoredHistoryRecord>),
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordRange {
+    pub before_sequence: Option<u64>,
+    pub after_sequence: Option<u64>,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordPage<T> {
+    pub records: Vec<T>,
+    pub next_before_sequence: Option<u64>,
+    pub next_after_sequence: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordWatermarks {
+    pub message: u64,
+    pub mcl: u64,
+    pub agent_log: u64,
+}

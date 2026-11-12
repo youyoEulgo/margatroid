@@ -1,8 +1,8 @@
 use address::{Address, WorldAddressExt};
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use client_plugin::{
-    Client, ClientDisconnected, ClientError, ClientFrame, ClientPlugin, ClientRegistrationResult,
-    ClientSender, ConnectionId, RegisterClient, RegisteredClient, WorldClientExt,
+    Client, ClientDisconnected, ClientError, ClientFrame, ClientPlugin, ClientSender, ConnectionId,
+    RegisterClient, RegisteredClient, WorldClientExt,
 };
 use core_plugin::App;
 use std::collections::BTreeMap;
@@ -36,23 +36,18 @@ impl Harness {
         kind: &str,
         name: Option<&str>,
     ) -> Result<RegisteredClient, ClientError> {
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
         self.app.world().send_event(RegisterClient {
             id: id.into(),
             connection_id: connection,
             client_type: kind.into(),
             name: name.map(str::to_owned),
             sender: self.senders[&connection].clone(),
+            reply: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
         });
         self.app.tick();
         self.app.tick();
-        self.app
-            .world()
-            .event_reader::<ClientRegistrationResult>()
-            .into_iter()
-            .find(|event| event.id == id)
-            .unwrap()
-            .result
-            .clone()
+        receiver.try_recv().unwrap()
     }
     fn disconnect(
         &mut self,

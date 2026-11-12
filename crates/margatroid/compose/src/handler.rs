@@ -98,7 +98,7 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
 pub(crate) async fn shutdown_application(app: &mut App) -> Result<(), ComposeError> {
     use app_runtime_plugin::WorldEventExt;
     use std::collections::BTreeMap;
-    use workspace_core::{StopWorkspace, StopWorkspaceResult, Workspace, WorkspaceState};
+    use workspace_core::{StopWorkspace, Workspace, WorkspaceState};
 
     let server = app
         .world()
@@ -106,29 +106,54 @@ pub(crate) async fn shutdown_application(app: &mut App) -> Result<(), ComposeErr
         .ok_or_else(|| ComposeError::new("axum", "", "Axum service is missing"))?
         .clone();
     server.request_shutdown();
-    let mut pending: BTreeMap<String, (core_plugin::Entity, std::path::PathBuf)> = BTreeMap::new();
+    let mut pending: BTreeMap<
+        core_plugin::Entity,
+        (
+            std::path::PathBuf,
+            tokio::sync::oneshot::Receiver<
+                Result<workspace_core::WorkspaceOperationOutput, workspace_core::WorkspaceError>,
+            >,
+        ),
+    > = BTreeMap::new();
     let mut next = 0u64;
     loop {
         app.tick();
-        for response in app.world().event_reader::<StopWorkspaceResult>() {
-            if let Some(path) = pending.remove(&response.id)
-                && let Err(error) = &response.result
-            {
-                return Err(ComposeError::new("workspace", path.1, error.to_string()));
+        let mut finished = Vec::new();
+        for (entity, (path, receiver)) in &mut pending {
+            match receiver.try_recv() {
+                Ok(Ok(_)) => finished.push(*entity),
+                Ok(Err(error)) => {
+                    return Err(ComposeError::new(
+                        "workspace",
+                        path.clone(),
+                        error.to_string(),
+                    ));
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    return Err(ComposeError::new(
+                        "workspace",
+                        path.clone(),
+                        "stop reply lost",
+                    ));
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => (),
             }
+        }
+        for entity in finished {
+            pending.remove(&entity);
         }
         let workspaces = app.world().query_with::<Workspace>().result();
         for entity in &workspaces {
             let workspace = app.world().get_component::<Workspace>(*entity).unwrap();
-            if workspace.state == WorkspaceState::Running
-                && !pending.values().any(|(current, _)| current == entity)
-            {
+            if workspace.state == WorkspaceState::Running && !pending.contains_key(entity) {
                 next += 1;
                 let id = format!("application-shutdown-{next}");
-                pending.insert(id.clone(), (*entity, workspace.definition_path.clone()));
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                pending.insert(*entity, (workspace.definition_path.clone(), receiver));
                 app.world().send_event(StopWorkspace {
                     id,
                     workspace: *entity,
+                    reply: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
                 });
             }
         }

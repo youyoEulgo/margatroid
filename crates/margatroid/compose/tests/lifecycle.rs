@@ -11,9 +11,7 @@ use std::time::{Duration, Instant};
 use storage_core::{AgentStorage, StorageOperation, StorageValue};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use workspace_core::{
-    StartWorkspace, StartWorkspaceResult, StopWorkspace, StopWorkspaceResult, Workspace,
-};
+use workspace_core::{StartWorkspace, StopWorkspace, Workspace};
 
 fn copy_tree(source: &Path, target: &Path) {
     std::fs::create_dir_all(target).unwrap();
@@ -156,20 +154,17 @@ fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
     })
     .unwrap();
     assert!(app.world().query_with::<Workspace>().result().is_empty());
+    let (start_sender, mut start_receiver) = oneshot::channel();
     app.world().emit_event(StartWorkspace {
         id: "start".into(),
+        reply: Arc::new(Mutex::new(Some(start_sender))),
         path: definition,
     });
     let deadline = Instant::now() + Duration::from_secs(10);
     let workspace = loop {
         app.tick();
-        if let Some(event) = app
-            .world()
-            .event_reader::<StartWorkspaceResult>()
-            .into_iter()
-            .find(|e| e.id == "start")
-        {
-            let result = event.result.clone().unwrap();
+        if let Ok(result) = start_receiver.try_recv() {
+            let result = result.unwrap();
             assert!(
                 result.member_errors.is_empty(),
                 "{:?}",
@@ -272,20 +267,17 @@ fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
             .any(|v| v["function"]["name"] == "task_read")
     );
     provider.join().unwrap();
+    let (stop_sender, mut stop_receiver) = oneshot::channel();
     app.world().emit_event(StopWorkspace {
         id: "stop".into(),
+        reply: Arc::new(Mutex::new(Some(stop_sender))),
         workspace,
     });
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         app.tick();
-        if let Some(event) = app
-            .world()
-            .event_reader::<StopWorkspaceResult>()
-            .into_iter()
-            .find(|e| e.id == "stop")
-        {
-            event.result.clone().unwrap();
+        if let Ok(result) = stop_receiver.try_recv() {
+            result.unwrap();
             break;
         }
         assert!(Instant::now() < deadline, "workspace did not stop");

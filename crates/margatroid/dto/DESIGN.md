@@ -1,25 +1,18 @@
-Margatroid领域实现契约；网络由领域原生handler处理，mecs仅提供通用运行设施。
-
-本文描述本轮源码实现的中止与ToolTask生命周期契约；不表示用户已部署或正在运行的daemon已更新。
-
 # 伪代码格式
 
 ```text
-板块：一级标题，一行注明实际文件，不创建空模块。
-类型、函数：二级标题，区分公开、crate公开与私有。
-类型列字段及用途；函数列参数、结果和直接行为。
-System列处理事件、接收闭包结果、提交闭包及产出事件；空项使用None。
-属性不写Rust Attribute；持有关系使用树形图。
-DTO可依赖Margatroid基础设施axum_plugin注册Router；业务plugin之间仍不建立依赖。
+板块使用一级标题，类型及函数使用二级标题。
+类型列出实际Rust字段和持有关系，函数列出签名及直接行为。
+System列出处理事件、闭包结果、产出事件及回复。
 ```
 
 # 板块格式
 
 ```text
-# lib     dto/plugin/src/lib.rs      安装、自有Router及连接入口
-# system  dto/plugin/src/system.rs   已解析DTO、领域结果及出站路由
-# handler dto/plugin/src/handler.rs  原生handler、连接读写、领域转换
-# types   dto/plugin/src/types.rs    连接状态、请求关联与投影缓存
+# lib      dto/plugin/src/lib.rs
+# system   dto/plugin/src/system.rs
+# handler  dto/plugin/src/handler.rs、projection.rs
+# types    dto/plugin/src/types.rs
 ```
 
 # lib
@@ -28,17 +21,18 @@ DTO可依赖Margatroid基础设施axum_plugin注册Router；业务plugin之间�
 
 公开：
 ```text
-DtoPlugin：网络协议边界插件
-    impl Plugin for DtoPlugin
+DtoPlugin
+    new() -> Self
+    impl Default
+    impl Plugin
         build(self, app: &mut App)
             行为：
-                检查运行设施、AxumHandle及MargatroidConfig，拒绝重复安装。
-                创建DtoState、DTO owned ConnState、请求关联表和投影缓存。
-                从AxumHandle.lifetime()取得共享AxumLifetime；DTO只使用其退出信号及升级Future跟踪。
-                构造Router::new().route("/ws", get(ws_handler)).with_state(state)。
-                调用AppAxumExt::add_axum_routes(Router)，不要求Compose手工添加路由。
-                在PRE_UPDATE安装abort_control_system，在UPDATE安装DTO请求及结果System；中止固定使用RuntimePlugin::PRE_UPDATE；MCL、Inference和Tool仅允许UPDATE或POST_UPDATE，拒绝无法证明先后顺序的自定义schedule，不增加调度metadata，不修改mecs。
-                日志订阅通过send_async_closure提交DTO自有owned读取闭包，产生LogReady并监听退出，完成载荷交DTO System收口，使用普通异步闭包。
+                检查RuntimeHandle、AsyncRuntimeHandle、AxumHandle及MargatroidConfig。
+                初始化DtoState、ConnState及SyncState。
+                通过AsyncContext初始化网络事件发送能力。
+                注册GET /ws到ws_handler。
+                PRE_UPDATE安装abort_control_system。
+                UPDATE安装dto_route_system及dto_sync_system。
 ```
 
 # system
@@ -48,114 +42,139 @@ DtoPlugin：网络协议边界插件
 crate公开：
 ```text
 dto_route_system(world: &mut World)
-    处理事件：DtoRequest、ClientDisconnected、WebSocketMessageSend
+    处理事件：DtoRequest、ClientDisconnected
     接收闭包结果：None
-    提交闭包：wait_mcl_reply(MclReplyContext) -> Future<Output = Result<MclReplyOutput, MclReplyError>>
-    产出事件：RegisterClient、MclCommand、StartWorkspace、StopWorkspace、RestartWorkspace、AbortTurnControl
-    行为：DtoRequest -> handle_dto_request；ClientDisconnected -> handle_disconnect；WebSocketMessageSend -> handle_outbound_message。
-
-collect_external_events_system(world: &mut World)
-    处理事件：ClientRegistrationResult、StartWorkspaceResult、StopWorkspaceResult、RestartWorkspaceResult、LogReady、AgentException
-    接收闭包结果：Result<HistoryOutput, HistoryError>、Result<MclReplyOutput, MclReplyError>、SnapshotReady
-    提交闭包：read_history(HistoryContext) -> Future<Output = Result<HistoryOutput, HistoryError>>；读取状态所需历史快照
-    产出事件：WebSocketMessageSend
-    行为：注册和生命周期结果 -> handle_domain_result；历史及MCL结果 -> 对应Handler；状态快照、日志与异常沿现有业务边界投影和发送。
+    产出事件：RegisterClient、StartWorkspace、StopWorkspace、RestartWorkspace、StartAgent、StopAgent、RestartAgent、MclCommand
+    回复：各请求原oneshot
+    行为：先处理断连，再逐条调用handle_dto_request。
 
 abort_control_system(world: &mut World)
     处理事件：AbortTurnControl
     接收闭包结果：None
-    提交闭包：None
-    产出事件：WebSocketMessageSend
-    oneshot回复：None
-    行为：AbortTurnControl -> handle_abort_control。
+    产出事件：None
+    回复：Result<(), ProtocolErrorDto>
+    行为：调用handle_abort_control，在本次PRE_UPDATE校验目标及中止回合。
+
+dto_sync_system(world: &mut World)
+    处理事件：WebSocketMessageSend、AgentException
+    接收闭包结果：Result<(), DtoAsyncError>
+    产出事件：None
+    回复：None
+    行为：处理出站及异常，记录worker错误，调用publish_state。
 ```
 
 # handler
 
 ## 函数
 
-私有，原生Axum入口：
-```text
-ws_handler(State(state): State<DtoState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Future<Output = Response>
-    行为：
-        提取owned IngressRequest，直接调用state.ingress.evaluate(&request)；失败直接返回HTTP拒绝响应。
-        检查退出状态并配置现有协议消息上限；握手失败直接返回Response，不投递World事件。
-        分配ConnectionId和有界mpsc<ClientFrame>队列，在ConnState保留真实连接与ClientSender。
-        在on_upgrade前通过lifetime.track()取得AxumWorkGuard，再将guard和State移动到升级回调；回调收到socket后才构造serve_connection，guard持有到完整连接Future退出。
-        只返回原生升级Response；升级失败清理预留条目、关闭接收端并发送一次ClientDisconnected。
-
-serve_connection(state: DtoState, connection: ConnectionId, socket: WebSocket, outbound: mpsc::Receiver<ClientFrame>) -> Future<Output = ()>
-    行为：
-        DTO拥有socket拆分后的读写端，读循环解析wire，写循环消费有界出站队列。
-        合法消息解析为ClientMessage；只对需要World的请求发送DtoRequest，不发送原始帧或统一网络事件。
-        无效JSON、非法信封、类型或大小错误直接沿当前协议错误响应/关闭规则处理；保留1007/1009等关闭码，不经过ECS。
-        不合成默认流事件；inference发送的JSON文本帧原样写入，不新增wire envelope。
-        写端将ClientFrame::Text/Binary/Close映射为Axum帧；Ping/Pong及协议控制由DTO处理，不进入Client core。
-        读写均监听lifetime.cancelled()；任一结束则停止另一端，执行有界关闭并释放socket和接收端。
-        终结时从ConnState移除条目并恰好一次发送ClientDisconnected，发送能力随接收端关闭失效。
-        应用退出由AxumLifetime跟踪此完整Future；HTTP graceful结束之外还等待所有升级连接Future退出。
-```
-
 crate公开：
 ```text
+ws_handler(State(state): State<DtoState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Future<Output = Response>
+    行为：评估入口策略，检查退出与事件能力，分配真实连接；取得跟踪guard并升级，完整连接退出后释放。
+
 handle_dto_request(world: &mut World, request: DtoRequest)
+    行为：取出object，按route选择具体转换类型或查询函数；转换后直接发送领域事件。
+
+handle_abort_control(world: &mut World, event: AbortTurnControl)
+    行为：取出原请求，校验真实Client、Agent地址及turn；同步清turn，冻结并取消推理，裁决未return工具，通过原reply回复。
+
+handle_disconnect(world: &mut World, connection: ConnectionId)
+    行为：释放该连接的同步投影；Client领域独立清理连接身份。
+
+handle_agent_exception(world: &mut World, event: AgentException)
+    行为：检查完整Entity并保存该Agent的故障投影。
+
+handle_outbound(world: &World, event: WebSocketMessageSend)
+    行为：按target查询实际ClientSender并发送已编码帧。
+
+publish_state(world: &mut World)
     行为：
-        仅处理已解析协议值；先复检ConnState中的原连接仍存活，未注册连接只能注册。
-        注册从ConnState取得可信ClientSender，生成RegisterClient；不接受wire注入连接身份或发送能力。
-        其他请求从ConnectionId查询Client Entity，拒绝未注册连接及重复在途网络ID。
-        运行目标经address解析为Entity，核对组件、Workspace归属及实例。
-        Workspace列表同步投影内存配置及路径展示缓存；启动和重启只传path，后端重读定义；文件资源不创建占位Entity。
-        回合中止发送AbortTurnControl，由下一帧控制Handler同步裁决，不在网络解析处直接取消。
-        其他异步请求生成operation_id并保存网络关联，转换为既有领域请求；失败发送原关联协议错误。
+        每帧按配置查询并去重符合条件的ClientSender。
+        读取Workspace、Agent、Turn、Task当前投影，变化时发送相应sync。
+        按完整Agent Entity提交独立记录读取worker，各类别维护自己的真实sequence观察位置。
+        数据库IO在blocking worker执行，World仅短锁取得进度。
+        worker向本次发送器快照直接投递新增记录，拥塞连接被取消；失败释放在途标记以便后续重试。
+        已结束Agent取消其记录读取能力并释放对应观察位置。
+        req保持领域状态及同步接收条件不变。
 
-handle_abort_control(world: &mut World, request: AbortTurnControl)
-    行为：复检Client、Agent完整Entity、VM实例和turn；失败不触碰任务。
-        第一步同步agent_abort_turn清空turn，阻止本帧后续尚未受理的MCL发出调用、InferenceRequest和ToolExecuteRequest继续受理；Agent仍Working。
-        第二步触发ActiveInference内当前推理取消句柄，同步关闭流接受门，取消分片接收/累积/推送闭包并请求上游退出。
-        第三步调用ToolTasks::abort_unreturned，在同一任务return裁决下，只对未return任务强制回复中止结果并触发终止清理；已return未finish任务保持不变。
-        控制System只同步清turn、完成return裁决和触发取消，不等待长任务、FIFO或进程退出；各监督任务负责真实清理，finish即完成清理并移除任务。
-        发送匹配网络id受理回执；Driver收到中止结果后显式收尾，不自动ready，不伪造推理已退出。
+projection::address(world: &World, entity: Entity) -> Option<String>
+    行为：读取Address组件。
 
-handle_mcl_reply(world: &mut World, result: Result<MclReplyOutput, MclReplyError>)
-    行为：复检关联，将MclValue或错误转换为mcl.command_result；继续等待MclCommand原oneshot，不新增领域结果事件。
+projection::workspaces(world: &World) -> Vec<WorkspaceInfoDto>
+    行为：合并已发布定义与运行组件；来源移除项使用Workspace.definition，WorkspaceFailure投影为error。
 
-handle_history_result(world: &mut World, result: Result<HistoryOutput, HistoryError>)
-    行为：核对原Client和目标实例，转换history.result或request.failed；保留既有历史查询、快照合并和状态发布边界。
+projection::agents(world: &World) -> Vec<AgentStateDto>
+    行为：读取激活Agent、完整Tools和故障投影，仅输出Agent Address及业务字段。
 
-handle_domain_result(world: &mut World, result: DomainResult)
-    行为：
-        按operation_id取关联，核对操作类型、原目标Entity及实例。
-        复检原Client Entity和连接，转换既有protocol响应并只发原连接。
-        注册结果在原连接仍存活时应答；已结束连接的迟到成功按ClientDisconnected契约清理，不产生遗留Client。
-        完成后释放关联；重复、迟到或已断连结果不重新绑定目标。
+projection::turn(world: &World, entity: Entity) -> Option<AgentTurnStateDto>
+    行为：读取Agent地址与当前turn。
 
-handle_disconnect(world: &mut World, event: &ClientDisconnected)
-    行为：清理连接的请求关联和投影接收状态；ClientPlugin独立处理同一事件销毁身份；不撤销已受理领域操作。
-
-prepare_backend_state(world: &World) -> Result<BackendStateDto, ProtocolErrorDto>
-    行为：读取领域core组件与已加载内存配置，从Address取得对外地址；保留状态、历史及异常的既有协议字段，不输出凭据、源码或内部句柄。
-
-handle_outbound_message(world: &mut World, message: WebSocketMessageSend)
-    行为：按出站配置从已注册Client组件筛选目标，序列化ServerMessage或既有JSON值为ClientFrame::Text，通过ClientSender::try_send发送；原连接注册回执可使用ConnState中的sender。
-    行为：Full/Closed立即处理，不为每次发送启动任务；拥塞关闭由DTO取消该连接任务，保持有界内存及既有失败语义。
+projection::tasks(world: &World, entity: Entity) -> Option<AgentTaskStateDto>
+    行为：调用ToolTasks::snapshot取得完整窗口，保留脚本读取位置及replaced。
 ```
 
 私有：
 ```text
-wait_mcl_reply(context: MclReplyContext) -> Future<Output = Result<MclReplyOutput, MclReplyError>>
-    行为：等待原oneshot，携带原上下文返回，不使用通用后台服务注册。
+serve_connection(state: DtoState, connection: ConnectionId, socket: WebSocket, pushes: mpsc::Receiver<ClientFrame>, cancel: CancellationToken) -> Future<Output = ()>
+    行为：
+        持有socket读写端及FuturesUnordered<ReplyFuture>。
+        接收合法请求后将预处理及原接收端等待放入本连接并发集合。
+        普通请求发送DtoRequest，中止请求直接发送AbortTurnControl。
+        等待原oneshot结果后编码，socket写端统一发送响应、主动同步及协议控制帧。
+        每连接最多128个在途请求，同一连接在途id唯一。
+        退出关闭推送接收端、结束网络等待并由连接保留guard发送一次ClientDisconnected。
 
-read_history(context: HistoryContext) -> Future<Output = Result<HistoryOutput, HistoryError>>
-    行为：异步读取历史，返回原请求上下文及成功或失败载荷。
+prepare_request(state: &DtoState, connection: ConnectionId, message: ClientMessage) -> Future<Output = Result<(Option<DtoRequest>, Option<AbortTurnControl>, ReplyFuture), Value>>
+    行为：
+        取得route及原id，为具体请求创建对应领域Result类型的原oneshot。
+        发送端装入Prepared，原接收端与纯值投影函数组成ReplyFuture。
+        单独Agent启动重启在worker执行全量reload，将本次不可变快照放入预处理对象。
+        预处理Future独立推进，socket继续接收其他请求。
 
-resolve_live_target(world: &World, address: &str) -> Result<Entity, ProtocolErrorDto>
-    行为：解析唯一Entity，检查领域组件、归属和实例。
+request<T, R, E>(ticket: Arc<Ticket>, route: &str, input: T, response: &str, project: impl FnOnce(R) -> Result<Value, ProtocolErrorDto> + Send + 'static) -> (DtoRequest, ReplyFuture)
+    行为：创建原oneshot，保存具体输入与原发送端，接收端等待结束后映射领域错误及业务结果。
 
-convert_request(message: ClientMessage, context: RequestContext) -> Result<DomainRequest, ProtocolErrorDto>
-    行为：将纯协议值转换为领域core事件，内存对象关联只使用Entity。
+dispatch<T: IntoEvent>(world: &mut World, object: Box<dyn Any + Send>)
+    行为：T::try_from取得具体边界类型，调用into_event，再world.send_event。
 
-convert_result(result: DomainResult, context: RequestContext) -> Result<ServerMessage, ProtocolErrorDto>
-    行为：映射既有领域结果、错误和关联信息，需要对外地址时读取Address。
+query<T, R>(world: &World, object: Box<dyn Any + Send>, read: impl FnOnce(&World, Entity, &T) -> Result<R, ProtocolErrorDto>)
+    行为：校验Client后执行只读查询并通过原reply回复。
+
+records(world: &World, route: &str, object: Box<dyn Any + Send>)
+    行为：校验Agent，克隆AgentStorage；worker按RecordRange调用对应core分页函数，通过原reply回复。
+
+reload(world: &World, object: Box<dyn Any + Send>)
+    行为：校验Client，克隆WorkspaceDefinitions；worker全量reload并通过原reply回复。
+
+parameters(world: &World, input: &AgentInput) -> Result<(Entity, String, AgentStartParameters), ProtocolErrorDto>
+    行为：按Workspace地址解析完整Entity，从本次快照选择定义及成员，构造单Agent启动参数。
+
+client(world: &World, connection: ConnectionId) -> Result<Entity, ProtocolErrorDto>
+target(world: &World, address: &str) -> Result<Entity, ProtocolErrorDto>
+agent(world: &World, address: &str) -> Result<Entity, ProtocolErrorDto>
+    行为：查询真实连接身份、按地址定位完整Entity并校验目标组件。
+
+deliver<R, E>(reply: &PreparedReply<R, E>, result: Result<R, E>)
+reject<T, R, E: BoundaryError>(request: Prepared<T, R, E>, failure: ProtocolErrorDto)
+    行为：认领原发送端一次并回复结果。
+
+encode_response(value: Value) -> Option<String>
+invalid_reply(text: &str) -> Option<Value>
+frame(kind: &str, id: &str, result: Result<Value, ProtocolErrorDto>) -> Value
+    行为：生成专属result或res，保持原id；过大响应返回预算错误，非法可关联请求返回专属失败。
+
+mcl_result(value: MclValue) -> Result<Value, ProtocolErrorDto>
+    行为：Unit确认成功，Error返回失败，其余值投影kind/value。
+
+history_record(value: StoredHistoryRecord) -> Value
+mcl_record(value: StoredHistoryRecord) -> Value
+log_record(value: StoredAgentLog) -> Value
+clean_internal(value: &mut Value)
+    行为：投影规范持久记录及真实sequence，审计和日志中的VM标识留在后端。
+
+recipients(world: &World, targets: &[OutboundTarget]) -> Vec<(ConnectionId, ClientSender)>
+enqueue(world: &World, connection: ConnectionId, sender: &ClientSender, value: Value) -> bool
+    行为：按实际Client组件筛选发送能力并有界发送，失败取消对应连接。
 ```
 
 # types
@@ -164,92 +183,137 @@ convert_result(result: DomainResult, context: RequestContext) -> Result<ServerMe
 
 公开：
 ```text
-WebSocketMessageSend：DTO出站协议事件
+WebSocketMessageSend
     target: OutboundTarget
-    message: serde_json::Value--保持既有出站JSON形状
+    message: Value
     impl Event + Clone + Debug
-    行为：只表达DTO协议出站请求，不是通用传输事件；发送能力本身由client_core提供。
 ```
 
 私有：
 ```text
-DtoState：原生handler共享状态，Clone
-    ingress: IngressPolicy--配置快照
-    events: RuntimeEventSender--只投递DTO已解析事件及Client领域事件
-    connections: Arc<ConnState>--DTO连接状态，同时供World侧DTO Handler查询
-    lifetime: AxumLifetime--基础设施退出信号及升级Future跟踪
+DtoState
+    ingress: IngressPolicy
+    events: Arc<OnceLock<AsyncContext>>
+    connections: ConnState
+    lifetime: AxumLifetime
+    definitions: WorkspaceDefinitions
+    impl Resource + Clone
 
-ConnState：DTO owned连接索引
-    entries: Mutex<BTreeMap<ConnectionId, ConnectionEntry>>--包含未注册连接
-    next_id: AtomicU64--进程内不复用，溢出拒绝新连接
-    行为：有界分配出站队列、查询sender、取消拥塞连接及幂等移除；只DTO维护，不放进Client core。
-
-ConnectionEntry：真实连接的边界材料
-    sender: ClientSender
-    cancel: CancellationToken--单连接退出信号
-    行为：不保存第二份注册身份；Client实体拥有client_type/name。
-
-DtoRequest：已解析入站请求，DTO私有事件
-    connection: ConnectionId--handler绑定，不信任wire
-    message: ClientMessage--已完成协议解析，不含Axum帧
-    impl Event + Clone + Debug
-
-RequestContext：边界请求上下文
-    network_id: String
-    operation_id: String
-    client: Option<Entity>--注册前为None，其余为原完整实例
+Ticket
+    id: String
     connection: ConnectionId
-    target: OperationTarget
+    active: Arc<Mutex<BTreeSet<String>>>
+    impl Drop
+        行为：释放本连接在途网络id。
 
-OperationTarget：操作关联，枚举
-    Live { workspace: Option<Entity>, target: Entity, instance: Option<String> }
-    Discovery
-    Registration
+PreparedReply<R, E> = Arc<Mutex<Option<oneshot::Sender<Result<R, E>>>>>
 
-PendingRequests：在途关联表，Resource
-    entries: BTreeMap<String, RequestContext>--operation_id为键
-    duplicate(&self, client: Entity, network_id: &str) -> bool
-    remove_connection(&mut self, connection: ConnectionId)
-        行为：删除连接关联，不触发业务取消。
+Prepared<T, R, E = ProtocolErrorDto>
+    ticket: Arc<Ticket>
+    input: T
+    reply: PreparedReply<R, E>
 
-AbortTurnControl：DTO控制事件
-    context: RequestContext
-    agent: Entity
-    instance: String
-    turn: String
-    impl Event
+DtoRequest
+    route: String
+    object: Arc<Mutex<Option<Box<dyn Any + Send>>>>
+    impl Event + Clone
 
-MclReplyContext：RequestContext及MCL oneshot接收端
-MclReplyOutput / MclReplyError：原上下文及MclValue或协议错误
-HistoryContext：RequestContext及owned历史读取句柄
-HistoryOutput / HistoryError：原上下文及历史记录或协议错误
-SnapshotReady：既有状态历史快照完成载荷，保留token关联与合并规则
-LogReady：已转换的日志协议记录，DTO私有事件
-DomainRequest / DomainResult：对应领域core请求和结果，保留operation_id
-BackendStateReportCache：投影缓存，Resource；保存投影、接收者及刷新关联，不保存第二份领域运行状态
+AbortTurnControl
+    request: Arc<Mutex<Option<Prepared<AgentTurnAbortDto, ()>>>>
+    impl Event + Clone
+
+ReplyFuture = Pin<Box<dyn Future<Output = Value> + Send>>
+
+IntoEvent
+    type Event: core_plugin::Event
+    impl TryFrom<Box<dyn Any + Send>, Error = Box<dyn Any + Send>>
+    into_event(self, world: &World) -> Result<Self::Event, ()>
+
+RegisterClientDto(Prepared<RegisterConnectionDto, RegisteredClient, ClientError>)
+StartWorkspaceDto(Prepared<WorkspacePathDto, WorkspaceOperationOutput, WorkspaceError>)
+StopWorkspaceDto(Prepared<WorkspacePathDto, WorkspaceOperationOutput, WorkspaceError>)
+RestartWorkspaceDto(Prepared<WorkspacePathDto, WorkspaceOperationOutput, WorkspaceError>)
+StartAgentDto(Prepared<AgentInput, Entity, AgentError>)
+StopAgentDto(Prepared<AgentTargetDto, Entity, AgentError>)
+RestartAgentDto(Prepared<RestartInput, Entity, AgentError>)
+MclCommandDto(Prepared<MclExecuteDto, MclValue, MclError>)
+    impl TryFrom<Box<dyn Any + Send>>
+    impl IntoEvent
+        行为：World校验及领域转换，原reply随事件传递；失败交付该请求自己的领域错误。
+
+AgentInput
+    start: AgentStartDto
+    snapshot: WorkspaceDefinitionSnapshot
+
+RestartInput
+    target: AgentTargetDto
+    snapshot: WorkspaceDefinitionSnapshot
+
+BoundaryError
+    boundary(value: ProtocolErrorDto) -> Self
+    external(self) -> ProtocolErrorDto
+    行为：实现于ProtocolErrorDto、ClientError、WorkspaceError、AgentError、MclError、StorageError。
+
+ConnState
+    entries: Arc<Mutex<BTreeMap<ConnectionId, ConnectionEntry>>>
+    allocate(&self) -> Option<(ConnectionId, mpsc::Receiver<ClientFrame>, CancellationToken)>
+    get(&self, id: ConnectionId) -> Option<ClientSender>
+    claim(&self, id: ConnectionId, request: &str) -> Option<Arc<Ticket>>
+    cancel(&self, id: ConnectionId)
+    remove(&self, id: ConnectionId) -> bool
+    impl Resource + Clone + Default
+
+ConnectionEntry
+    sender: ClientSender
+    cancel: CancellationToken
+    active: Arc<Mutex<BTreeSet<String>>>
+
+SyncState
+    sent: BTreeMap<(u64, String), Value>
+    errors: BTreeMap<Entity, ProtocolErrorDto>
+    records: BTreeMap<Entity, Arc<Mutex<RecordPosition>>>
+    impl Resource + Default
+
+RecordPosition
+    cancel: CancellationToken
+    initialized: bool
+    running: bool
+    message: u64
+    mcl: u64
+    log: u64
+
+DtoInitialized
+DtoAsyncError(String)
+    impl From<AsyncTaskError>
 ```
 
 # 持有关系
 
 ```text
-App
-├── axum_plugin（Margatroid基础设施）
-│   ├── 合并各plugin的原生Router
-│   └── AxumLifetime（退出信号、连接Future退出跟踪）
-└── World
-    ├── DtoState -> Arc<ConnState>
-    │   └── ConnectionId -> ConnectionEntry（含未注册连接）
-    ├── PendingRequests -> RequestContext
-    ├── BackendStateReportCache
-    └── 已注册Client -> ClientSender
+World
+├── DtoState
+├── ConnState
+│   └── ConnectionEntry
+│       ├── ClientSender
+│       ├── CancellationToken
+│       └── 在途id集合
+└── SyncState
+    ├── 分类已发送投影
+    ├── Agent故障投影
+    └── 记录观察进度
 
-DTO升级连接Future（由AxumLifetime跟踪）
-├── socket读写端
-├── 有界mpsc<ClientFrame>接收端
-└── 终结 -> 关闭能力、删除连接条目、ClientDisconnected
+serve_connection
+├── WebSocket读写端
+├── 推送mpsc接收端
+└── FuturesUnordered<ReplyFuture>
+    ├── Ticket
+    └── 原oneshot接收端
 
-DtoPlugin
-├── axum_plugin（仅基础设施依赖例外）及原生Axum
-├── protocol、address、config_core
-└── 各领域core（ClientSender、组件、请求、结果）
+DtoRequest
+└── 具体Prepared对象
+    ├── 协议输入
+    ├── Ticket
+    └── 原oneshot发送端
+        └── 领域事件
+            └── 领域执行结果
 ```

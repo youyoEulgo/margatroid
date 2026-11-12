@@ -26,19 +26,34 @@ System分别列出处理事件、接收闭包结果、提交闭包与产出事�
 
 公开，定义于workspace_core：
 ```text
-WorkspaceDefinitions：展示配置Resource
-    entries: Arc<RwLock<BTreeMap<PathBuf, WorkspaceDefinition>>>--路径到展示缓存，共享给启动闭包
+WorkspaceDefinitions：定义目录与启动数据Resource
+    entries: Arc<RwLock<BTreeMap<PathBuf, WorkspaceDefinition>>>
+    source: Option<PathBuf>
+    reload_lock: Arc<Mutex<()>>
+    open(source: impl Into<PathBuf>) -> Result<Self, WorkspaceError>
+        行为：规范来源并拒绝symlink，记录source后调用同一reload完成首轮全量加载。
+    source(&self) -> Option<&Path>
+        行为：借用已配置来源，供安装校验路径边界，不触发IO。
     get(&self, path: &Path) -> Option<WorkspaceDefinition>
-        行为：短读锁克隆展示值，不供启动使用。
+        行为：从已发布缓存克隆定义；启动必须先reload成功并使用其返回快照。
     list(&self) -> Vec<(PathBuf, WorkspaceDefinition)>
-        行为：短读锁克隆路径和展示缓存列表。
+        行为：短读锁克隆全部已发布定义列表，不隐式执行IO。
+    reload(&self) -> Result<WorkspaceDefinitionSnapshot, WorkspaceError>
+        行为：同步持有reload_lock调用load_workspace_definitions，读取source的全部Workspace定义并完整校验；异步调用方用blocking worker等待真实join。
+            成功后在短写锁内整体发布entries，并返回同一次发布的不可变缓存快照；失败保留旧缓存但返回错误，启动不得继续使用旧值。
+            不提供按某个Workspace单独重载的入口；显式reload与启动/重启共享本方法，不改运行Entity或重启成员。
     impl Clone for WorkspaceDefinitions
         行为：共享同一Arc，不复制缓存仓库。
     impl Resource for WorkspaceDefinitions
 
+load_workspace_definitions(source: &Path) -> Result<BTreeMap<PathBuf, WorkspaceDefinition>, WorkspaceError>
+    行为：拒绝symlink，扫描配置根下非隐藏子目录的workspace.yaml；单文件配置来源包含该文件全部定义，排序后完整解析并验证名称；任一失败不发布。
+reject_definition_symlinks(path: &Path) -> Result<(), WorkspaceError>
+    行为：逐路径分量拒绝symlink及metadata错误，允许尚未存在的目标由后续打开步骤报告。
+
 WorldWorkspaceExt：工作区访问扩展，公开trait
     workspace_definitions(&self) -> Result<&WorkspaceDefinitions, WorkspaceError>
-        行为：同步读取路径及展示缓存，不执行文件IO。
+        行为：同步取得定义缓存能力，不执行文件IO。
     workspace_state(&self, workspace: Entity) -> Result<&WorkspaceState, WorkspaceError>
         行为：读取目标Workspace状态。
     workspace_agents(&self, workspace: Entity) -> Result<Vec<Entity>, WorkspaceError>
@@ -54,7 +69,7 @@ WorldWorkspaceExt：工作区访问扩展，公开trait
 ```text
 WorkspacePlugin：工作区编排插件，公开类型
     schedule: String
-    definitions: WorkspaceDefinitions--私有，安装前加载的路径及展示缓存
+    definitions: WorkspaceDefinitions
     open(root: impl Into<PathBuf>) -> Result<Self, WorkspaceError>
         行为：同步读取并校验root内全部Workspace定义；失败返回错误，成功构造插件，不创建运行Entity。
     impl Plugin for WorkspacePlugin
@@ -70,15 +85,19 @@ WorkspacePlugin：工作区编排插件，公开类型
 ```text
 Workspace：工作区运行实例，公开组件
     name: String
-    definition_path: PathBuf--运行实例对应的定义文件，不从展示缓存解析身份
+    definition_path: PathBuf
     project_root: PathBuf
     state: WorkspaceState
     agents: BTreeSet<Entity>
+    definition: Option<WorkspaceDefinition>
     impl Component for Workspace
 
+WorkspaceFailure(WorkspaceError)
+    impl Component
+
 WorkspaceExecutor：工作区专属线程控制，公开组件
-    entry: WorkspaceExecutionEntry--可克隆提交入口
-    close: WorkspaceExecutionClose--关闭及join能力
+    entry: WorkspaceExecutionEntry
+    close: WorkspaceExecutionClose
     impl Component for WorkspaceExecutor
 ```
 
@@ -88,25 +107,26 @@ WorkspaceExecutor：工作区专属线程控制，公开组件
 
 公开：
 ```text
-StartWorkspace：启动请求，公开事件
-    id: String
-    path: PathBuf--本次必须重新读取的定义文件
-    impl Event for StartWorkspace
+WorkspaceOperationReply
+    Arc<Mutex<Option<oneshot::Sender<Result<WorkspaceOperationOutput, WorkspaceError>>>>>
 
-StopWorkspace：关闭请求，公开事件
+StartWorkspace
+    id: String
+    path: PathBuf
+    reply: WorkspaceOperationReply
+    impl Event + Clone + Debug
+
+StopWorkspace
     id: String
     workspace: Entity
-    impl Event
+    reply: WorkspaceOperationReply
+    impl Event + Clone + Debug
 
-RestartWorkspace：重启请求，公开事件
+RestartWorkspace
     id: String
-    path: PathBuf--与StartWorkspace相同
-    impl Event for RestartWorkspace
-
-StartWorkspaceResult / StopWorkspaceResult / RestartWorkspaceResult：操作结果，公开事件
-    id: String
-    result: Result<WorkspaceOperationOutput, WorkspaceError>
-    impl Event
+    path: PathBuf
+    reply: WorkspaceOperationReply
+    impl Event + Clone + Debug
 
 ```
 
@@ -120,21 +140,24 @@ stop_workspace_system(world: &mut World)
     处理事件：StopWorkspace
     接收闭包结果：Result<StopOutput, StopError>
     提交闭包：stop_flow(WorkspaceFlowContext) -> Future<Output = Result<StopOutput, StopError>>
-    产出事件：StopWorkspaceResult
+    产出事件：None
+    oneshot回复：Result<WorkspaceOperationOutput, WorkspaceError>
     行为：StopWorkspace -> handle_stop_workspace；Result<StopOutput, StopError> -> handle_stop_result。
 
 restart_workspace_system(world: &mut World)
     处理事件：RestartWorkspace
     接收闭包结果：Result<RestartOutput, RestartError>
     提交闭包：restart_flow(WorkspaceFlowContext) -> Future<Output = Result<RestartOutput, RestartError>>
-    产出事件：RestartWorkspaceResult
+    产出事件：None
+    oneshot回复：Result<WorkspaceOperationOutput, WorkspaceError>
     行为：RestartWorkspace -> handle_restart_workspace；Result<RestartOutput, RestartError> -> handle_restart_result。
 
 start_workspace_system(world: &mut World)
     处理事件：StartWorkspace
     接收闭包结果：Result<StartOutput, StartError>
     提交闭包：start_flow(WorkspaceFlowContext) -> Future<Output = Result<StartOutput, StartError>>
-    产出事件：StartWorkspaceResult
+    产出事件：None
+    oneshot回复：Result<WorkspaceOperationOutput, WorkspaceError>
     行为：StartWorkspace -> handle_start_workspace；Result<StartOutput, StartError> -> handle_start_result。
 
 ```
@@ -146,7 +169,7 @@ start_workspace_system(world: &mut World)
 crate公开：
 ```text
 handle_start_workspace(world: &mut World, request: StartWorkspace)
-    行为：校验request.path并检查重复启动；创建Starting实体和基础组件，提交启动闭包；不读取展示缓存作为启动材料。
+    行为：保留原reply，校验request.path及重复启动，创建Starting实体并提交启动闭包；全量reload后目标必须存在，本次定义用于初始化Workspace.definition。
 
 handle_stop_workspace(world: &mut World, request: StopWorkspace)
     行为：仅Running时同步转Stopping；关闭新任务及成员创建受理，提交关闭闭包；否则拒绝。
@@ -157,20 +180,31 @@ handle_restart_workspace(world: &mut World, request: RestartWorkspace)
 handle_start_result(world: &mut World, result: Result<StartOutput, StartError>)
 handle_stop_result(world: &mut World, result: Result<StopOutput, StopError>)
 handle_restart_result(world: &mut World, result: Result<RestartOutput, RestartError>)
-    行为：核对完整Entity和对应状态；启动或重启成功转Running，关闭成功销毁Entity；失败清理完整时销毁，否则保留宿主；回复原请求。
+    行为：核对完整Entity和对应状态；启动或重启成功转Running，关闭成功销毁Entity；失败清理完整时销毁，否则保留宿主；mount_executor将本次定义保存到Workspace.definition；失败时保存WorkspaceFailure，成功时清除故障，通过原oneshot回复领域结果。
 
 ```
 
 私有：
 ```text
 start_flow(context: WorkspaceFlowContext) -> Future<Output = Result<StartOutput, StartError>>
-    行为：按context.path重新读取并解析定义，更新展示缓存并将同一本次解析值直接用于启动；创建专属执行线程；逐成员发送StartAgent并等待reply；收集成功Entity及成员失败。
+    行为：调用fresh_definition取得本次全量重载缓存中的定义及成员参数；失败不启动。mount_executor后start_members，不再单独读取目标文件。
+
+fresh_definition(context: &WorkspaceFlowContext) -> Future<Output = Result<(WorkspaceDefinition, Vec<AgentStartParameters>), WorkspaceError>>
+    行为：owned definitions及path交blocking worker，调用reload并从返回缓存快照get目标定义；缺失明确失败，再调用prepare_definition。
+
+prepare_definition(path: &Path, definition: WorkspaceDefinition) -> Result<(WorkspaceDefinition, Vec<AgentStartParameters>), WorkspaceError>
+    行为：仅使用已从缓存取得的定义，核验成员目录和固定state.sqlite/setting.toml路径，构造原AgentStartParameters；不读取Workspace定义文件。
+
+mount_executor(context, definition, state) / start_members(context, definition, parameters)
+    行为：将本次定义保存到Workspace.definition，创建并挂载专属执行线程。
+        为每个成员分别创建独立oneshot及StartAgent，逐条发送全部事件后使用join_all并发等待所有reply。
+        一个StartAgent只携带一个成员及其参数，结果按原成员顺序收齐；任一成员失败仍等待其他成员收口。
 
 stop_flow(context: WorkspaceFlowContext) -> Future<Output = Result<StopOutput, StopError>>
     行为：等待已受理成员创建收口；逐成员发送StopAgent并等待reply，确认真实清理；通知执行线程退出并在线程外join；不销毁协调Entity。
 
 restart_flow(context: WorkspaceFlowContext) -> Future<Output = Result<RestartOutput, RestartError>>
-    行为：先按context.path读取并校验定义，更新展示缓存；失败不关闭旧实例；成功后await stop_flow，再使用本次解析值执行启动步骤；全程Restarting，不二次从缓存取值。
+    行为：先fresh_definition全量重载并取本次缓存定义/参数，失败不关闭旧实例；成功后stop_members_and_join，mount_executor并start_members，全程Restarting；目标从新缓存移除时通过原reply失败，原实例保持。
 
 ```
 
@@ -184,22 +218,25 @@ WorkspaceFlowContext：生命周期闭包材料
     id: String
     workspace: Entity
     events: RuntimeEventSender
-    path: PathBuf--请求携带的定义文件路径
-    definitions: WorkspaceDefinitions--克隆的Arc缓存句柄，不借用World
+    path: PathBuf
+    definitions: WorkspaceDefinitions
+    reply: WorkspaceOperationReply
+    world: WorldClosureSender
 
 StartOutput / StopOutput / RestartOutput：成功载荷
-    id: String
     workspace: Entity
     members: Vec<Entity>
     member_errors: Vec<MemberDiagnostic>
+    reply: WorkspaceOperationReply
 
-StartError / StopError / RestartError：失败载荷
-    id: String
-    workspace: Entity
+StartError / StopError / RestartError = FlowError
+    workspace: Option<Entity>
     error: WorkspaceError
     cleanup_completed: bool
+    restore_running: bool
+    reply: WorkspaceOperationReply
 
-MemberDiagnostic：成员诊断--成员名称和转换后的WorkspaceError
+MemberDiagnostic：成员诊断
 ```
 
 # types pub
@@ -215,6 +252,13 @@ WorkspaceState：生命周期状态，公开枚举
     Restarting
     Stopping
 
+WorkspaceDefinitionSnapshot：全量重载成功后的不可变缓存快照，公开纯值类型
+    entries: Arc<BTreeMap<PathBuf, WorkspaceDefinition>>
+    get(&self, path: &Path) -> Option<&WorkspaceDefinition>
+        行为：按规范路径借用本次已发布定义，不回源文件，不借用可变目录锁。
+    list(&self) -> Vec<(PathBuf, WorkspaceDefinition)>
+        行为：按路径顺序克隆本次快照全部条目。
+
 WorkspaceDefinition：持久定义，公开类型
     name: String
     project_root: PathBuf
@@ -222,10 +266,13 @@ WorkspaceDefinition：持久定义，公开类型
 
 WorkspaceMemberDefinition：成员定义，公开类型
     name: String
-    driver: String--未加载的文件定位输入
+    driver: String
     home_root: PathBuf
 
-WorkspaceOperationOutput：生命周期输出，公开类型--Workspace Entity、成员Entity及成员诊断
+WorkspaceOperationOutput
+    workspace: Entity
+    members: Vec<Entity>
+    member_errors: Vec<MemberDiagnostic>
 
 WorkspaceExecutionEntry：线程任务提交能力，公开可克隆类型
     submit(&self, task: impl FnOnce() -> LocalFuture + Send + 'static) -> Result<(), WorkspaceError>

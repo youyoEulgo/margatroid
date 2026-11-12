@@ -133,7 +133,7 @@ fn completed_trace(format: &str) -> String {
             return format!(
                 "data: {}\n\ndata: [DONE]\n\n",
                 json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]})
-            )
+            );
         }
     };
     events

@@ -4,8 +4,8 @@ use clap::{Args, Parser, Subcommand};
 use error::CliError;
 use futures_util::{SinkExt, StreamExt};
 use margatroid_protocol::{
-    ClientInfoDto, ClientMessage, EmptyDto, RegisterConnectionDto, ServerMessage,
-    WorkspaceConfigDto, WorkspacePathDto, WorkspaceReferenceDto, WorkspaceStopDto,
+    ClientInfoDto, ClientMessage, EmptyDto, RegisterConnectionDto, ServerMessage, WorkspaceInfoDto,
+    WorkspacePathDto,
 };
 use std::{
     io::{self, IsTerminal},
@@ -56,7 +56,7 @@ struct WorkspaceUpArgs {
 struct CliSession {
     pending_id: Option<String>,
     workspace_path: Option<PathBuf>,
-    workspace_address: Option<String>,
+    workspace_started: bool,
     stop_requested: bool,
 }
 #[tokio::main]
@@ -118,17 +118,17 @@ async fn run_workspace_up(name: Option<String>, backend_url: String) -> Result<(
     print_cli_event(
         "INFO",
         &format!(
-            "connection registered (client={}, type={}, name={})",
-            registered.resource_id, registered.client_type, registered.name
+            "connection registered (client={}, type={})",
+            registered.address, registered.client_type
         ),
     );
     let state_id = format!("{start_id}-state");
     session.pending_id = Some(state_id.clone());
     send(
         &mut socket,
-        ClientMessage::StateQuery {
+        ClientMessage::WorkspaceReq {
             id: state_id.clone(),
-            message: EmptyDto::default(),
+            message: EmptyDto {},
         },
     )
     .await?;
@@ -162,47 +162,49 @@ async fn run_workspace_up(name: Option<String>, backend_url: String) -> Result<(
     );
     let mut shutdown = Box::pin(wait_for_shutdown_signal());
     loop {
-        if session.stop_requested {
-            if let Some(address) = &session.workspace_address {
-                let stop_id = request_id();
-                session.pending_id = Some(stop_id.clone());
-                send(
-                    &mut socket,
-                    ClientMessage::WorkspaceStop {
-                        id: stop_id.clone(),
-                        message: WorkspaceStopDto {
-                            workspace: WorkspaceReferenceDto::Address(address.clone()),
-                        },
-                    },
-                )
-                .await?;
-                print_cli_event(
-                    "INFO",
-                    &format!("workspace.stop sent (workspace={address}, request_id={stop_id})"),
-                );
-                wait_for_stop_ack(&mut socket, &stop_id).await?;
-                print_cli_event("INFO", &format!("workspace stopped (request_id={stop_id})"));
-                socket.close(None).await?;
-                return Ok(());
-            }
+        if session.stop_requested && session.workspace_started {
+            let path = session
+                .workspace_path
+                .as_ref()
+                .expect("selected workspace")
+                .to_string_lossy()
+                .into_owned();
+            let stop_id = request_id();
+            session.pending_id = Some(stop_id.clone());
+            send(
+                &mut socket,
+                ClientMessage::WorkspaceStop {
+                    id: stop_id.clone(),
+                    message: WorkspacePathDto { path: path.clone() },
+                },
+            )
+            .await?;
+            print_cli_event(
+                "INFO",
+                &format!("workspace.stop sent (path={path}, request_id={stop_id})"),
+            );
+            wait_for_stop_ack(&mut socket, &stop_id).await?;
+            print_cli_event("INFO", &format!("workspace stopped (request_id={stop_id})"));
+            socket.close(None).await?;
+            return Ok(());
         }
         tokio::select! {
-            signal=&mut shutdown=>{signal?;shutdown=Box::pin(wait_for_shutdown_signal());session.stop_requested=true;if session.workspace_address.is_none(){print_cli_event("INFO","shutdown requested; waiting for workspace startup result before stopping");}},
+            signal=&mut shutdown=>{signal?;shutdown=Box::pin(wait_for_shutdown_signal());session.stop_requested=true;if !session.workspace_started{print_cli_event("INFO","shutdown requested; waiting for workspace startup result before stopping");}},
             text=next_text(&mut socket,"backend disconnected before confirmed workspace shutdown")=>{let text=text?;print_backend_message(&text);handle_workspace_start_reply(&text,&start_id,&mut session)?;}
         }
     }
 }
 fn definition_candidates<'a>(
-    definitions: &'a [WorkspaceConfigDto],
+    definitions: &'a [WorkspaceInfoDto],
     name: Option<&str>,
     cwd: &Path,
-) -> Vec<&'a WorkspaceConfigDto> {
+) -> Vec<&'a WorkspaceInfoDto> {
     definitions
         .iter()
         .filter(|definition| match name {
-            Some(name) => definition.cache.name == name,
+            Some(name) => definition.definition.name == name,
             None => {
-                Path::new(&definition.cache.project_root)
+                Path::new(&definition.definition.project_root)
                     .canonicalize()
                     .ok()
                     .as_deref()
@@ -213,16 +215,16 @@ fn definition_candidates<'a>(
 }
 async fn choose_workspace<'a>(
     socket: &mut Socket,
-    candidates: Vec<&'a WorkspaceConfigDto>,
+    candidates: Vec<&'a WorkspaceInfoDto>,
     tty: bool,
-) -> Result<Option<&'a WorkspaceConfigDto>, CliError> {
+) -> Result<Option<&'a WorkspaceInfoDto>, CliError> {
     match candidates.len(){0=>return Err(CliError::Remote("No configured workspace matches; specify its exact NAME or run from its exact project root".into())),1=>return Ok(Some(candidates[0])),_ if !tty=>return Err(CliError::Remote("Multiple configured workspaces match; specify NAME or use an interactive terminal".into())),_=>{}}
     for (index, definition) in candidates.iter().enumerate() {
         eprintln!(
             "{}: {} | {} | {}",
             index + 1,
-            definition.cache.name,
-            definition.cache.project_root,
+            definition.definition.name,
+            definition.definition.project_root,
             definition.path
         );
     }
@@ -243,8 +245,8 @@ async fn choose_workspace<'a>(
 }
 fn parse_choice<'a>(
     input: &str,
-    candidates: &[&'a WorkspaceConfigDto],
-) -> Result<Option<&'a WorkspaceConfigDto>, CliError> {
+    candidates: &[&'a WorkspaceInfoDto],
+) -> Result<Option<&'a WorkspaceInfoDto>, CliError> {
     if input.is_empty() || input.eq_ignore_ascii_case("q") {
         return Ok(None);
     }
@@ -259,55 +261,60 @@ fn parse_choice<'a>(
 async fn wait_for_state(
     socket: &mut Socket,
     request_id: &str,
-) -> Result<Vec<WorkspaceConfigDto>, CliError> {
-    let deadline = tokio::time::sleep(Duration::from_secs(5));
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            _=&mut deadline=>return Err(CliError::Timeout("timed out waiting for state.sync")),
-            signal=wait_for_shutdown_signal()=>{signal?;return Err(CliError::Interrupted("shutdown requested before selection"));},
-            text=next_text(socket,"backend disconnected before state.sync")=>{
-                let text=text?;print_backend_message(&text);match serde_json::from_str::<ServerMessage>(&text){Ok(ServerMessage::StateSync{state})=>return Ok(state.workspace_definitions),Ok(ServerMessage::RequestFailed{id,error})if id==request_id=>return Err(CliError::Remote(error.message)),_=>{}}
+) -> Result<Vec<WorkspaceInfoDto>, CliError> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let text = next_text(socket, "backend disconnected before workspace.res").await?;
+            if let Ok(ServerMessage::WorkspaceRes {
+                id,
+                success,
+                workspaces,
+                error,
+            }) = serde_json::from_str(&text)
+            {
+                if id == request_id {
+                    return if success {
+                        Ok(workspaces.unwrap_or_default())
+                    } else {
+                        Err(CliError::Remote(
+                            error
+                                .map(|e| e.message)
+                                .unwrap_or_else(|| "workspace query failed".into()),
+                        ))
+                    };
+                }
             }
         }
-    }
+    })
+    .await
+    .map_err(|_| CliError::Timeout("timed out waiting for workspace.res"))?
 }
 fn handle_workspace_start_reply(
     text: &str,
     request_id: &str,
     session: &mut CliSession,
 ) -> Result<(), CliError> {
-    if session.workspace_address.is_some() {
+    if session.workspace_started {
         return Ok(());
     }
-    match serde_json::from_str::<ServerMessage>(text) {
-        Ok(ServerMessage::WorkspaceStarted { id, workspace }) if id == request_id => {
-            session.workspace_address = Some(workspace.id.clone());
-            session.pending_id = None;
-            print_cli_event(
-                "INFO",
-                &format!(
-                    "workspace started (workspace={}, member_failures={})",
-                    workspace.id,
-                    workspace.member_failures.len()
-                ),
-            );
-            for failure in workspace.member_failures {
-                print_cli_event("ERROR",&format!("workspace member failed to start (workspace={}, agent={}, driver={}, cause={})",workspace.id,failure.agent,failure.driver,failure.error));
+    if let Ok(ServerMessage::WorkspaceStartResult { id, success, error }) =
+        serde_json::from_str(text)
+    {
+        if id == request_id {
+            if let Some(e) = error {
+                return Err(CliError::Remote(format!(
+                    "workspace start failed: {}: {}",
+                    e.code, e.message
+                )));
             }
-            Ok(())
+            if success {
+                session.workspace_started = true;
+                session.pending_id = None;
+                print_cli_event("INFO", "workspace started");
+            }
         }
-        Ok(ServerMessage::WorkspaceStartFailed { id, error })
-        | Ok(ServerMessage::RequestFailed { id, error })
-            if id == request_id =>
-        {
-            Err(CliError::Remote(format!(
-                "workspace start failed: {}: {}",
-                error.kind, error.message
-            )))
-        }
-        _ => Ok(()),
     }
+    Ok(())
 }
 async fn wait_for_register_ack(
     socket: &mut Socket,
@@ -317,7 +324,7 @@ async fn wait_for_register_ack(
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            _=&mut deadline=>return Err(CliError::Timeout("timed out waiting for connection.registered")),
+            _=&mut deadline=>return Err(CliError::Timeout("timed out waiting for connection.register.result")),
             signal=wait_for_shutdown_signal()=>{signal?;socket.close(None).await?;return Err(CliError::Interrupted("shutdown requested before registration completed"));},
             text=next_text(socket,"backend disconnected before registration completed")=>{let text=text?;print_backend_message(&text);if let Some(result)=registration_reply(&text,request_id){return result;}}
         }
@@ -325,32 +332,35 @@ async fn wait_for_register_ack(
 }
 fn registration_reply(text: &str, request_id: &str) -> Option<Result<ClientInfoDto, CliError>> {
     match serde_json::from_str::<ServerMessage>(text) {
-        Ok(ServerMessage::ConnectionRegistered { id, client }) if id == request_id => {
-            Some(Ok(client))
-        }
-        Ok(ServerMessage::ConnectionRegisterFailed { id, error })
-        | Ok(ServerMessage::RequestFailed { id, error })
-            if id == request_id =>
-        {
-            Some(Err(CliError::Remote(format!(
-                "connection registration failed: {}: {}",
-                error.kind, error.message
-            ))))
-        }
+        Ok(ServerMessage::ConnectionRegisterResult {
+            id,
+            success,
+            client,
+            error,
+        }) if id == request_id => Some(if success {
+            client.ok_or_else(|| CliError::Remote("registration identity missing".into()))
+        } else {
+            Err(CliError::Remote(
+                error
+                    .map(|e| format!("{}: {}", e.code, e.message))
+                    .unwrap_or_else(|| "registration failed".into()),
+            ))
+        }),
         _ => None,
     }
 }
 fn stop_reply(text: &str, request_id: &str) -> Option<Result<(), CliError>> {
     match serde_json::from_str::<ServerMessage>(text) {
-        Ok(ServerMessage::WorkspaceStopped { id, .. }) if id == request_id => Some(Ok(())),
-        Ok(ServerMessage::WorkspaceStopFailed { id, error })
-        | Ok(ServerMessage::RequestFailed { id, error })
-            if id == request_id =>
-        {
-            Some(Err(CliError::Remote(format!(
-                "workspace stop failed: {}: {}",
-                error.kind, error.message
-            ))))
+        Ok(ServerMessage::WorkspaceStopResult { id, success, error }) if id == request_id => {
+            Some(if success {
+                Ok(())
+            } else {
+                Err(CliError::Remote(
+                    error
+                        .map(|e| format!("{}: {}", e.code, e.message))
+                        .unwrap_or_else(|| "stop failed".into()),
+                ))
+            })
         }
         _ => None,
     }
@@ -360,7 +370,7 @@ async fn wait_for_stop_ack(socket: &mut Socket, request_id: &str) -> Result<(), 
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            _=&mut deadline=>return Err(CliError::Timeout("timed out waiting for workspace.stopped")),
+            _=&mut deadline=>return Err(CliError::Timeout("timed out waiting for workspace.stop.result")),
             signal=wait_for_shutdown_signal()=>{signal?;socket.close(None).await?;return Err(CliError::Interrupted("shutdown requested again before workspace stopped"));},
             text=next_text(socket,"backend disconnected before workspace stopped")=>{let text=text?;print_backend_message(&text);if let Some(result)=stop_reply(&text,request_id){return result;}}
         }
@@ -379,31 +389,34 @@ async fn wait_for_shutdown_signal() -> Result<(), std::io::Error> {
     }
 }
 fn print_backend_message(text: &str) {
-    let Ok(ServerMessage::Log { record }) = serde_json::from_str(text) else {
-        return;
-    };
-    let fields = record
-        .fields
-        .iter()
-        .filter(|field| field.name != "message")
-        .map(|field| format!("{}={}", field.name, field.value))
-        .collect::<Vec<_>>();
-    let fields = if fields.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", fields.join(", "))
-    };
-    println!(
-        "{}",
-        format_log_line(
-            record.timestamp_millis,
-            &record.level,
-            &record.target,
-            &record.message,
-            &fields,
-            io::stdout().is_terminal()
-        )
-    );
+    match serde_json::from_str::<ServerMessage>(text) {
+        Ok(ServerMessage::AgentLogSync { address, records }) => {
+            for record in records {
+                println!(
+                    "{}",
+                    format_log_line(
+                        record.created_at_ms,
+                        &record.level,
+                        &address,
+                        &record.message,
+                        "",
+                        io::stdout().is_terminal()
+                    )
+                );
+            }
+        }
+        Ok(ServerMessage::AgentSync { agents }) => {
+            for agent in agents {
+                if let Some(error) = agent.error {
+                    print_cli_event(
+                        "ERROR",
+                        &format!("{}: {}: {}", agent.address, error.code, error.message),
+                    );
+                }
+            }
+        }
+        _ => (),
+    }
 }
 fn print_cli_event(level: &str, message: &str) {
     let timestamp = SystemTime::now()

@@ -1,10 +1,20 @@
-use crate::{Client, ClientError, ClientRegistrationResult, RegisteredClient, WorldClientExt};
+use crate::{Client, ClientError, RegisteredClient, WorldClientExt};
 use address::{Address, WorldAddressExt};
-use app_runtime_plugin::WorldEventExt;
 use client_core::{ClientDisconnected, RegisterClient};
 use core_plugin::World;
 
 pub(crate) fn handle_client_registration(world: &mut World, request: &RegisterClient) {
+    let Some(sender) = request
+        .reply
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    else {
+        return;
+    };
+    if sender.is_closed() {
+        return;
+    }
     let result = register_client(world, request);
     if let Err(error) = &result {
         tracing::warn!(
@@ -14,11 +24,14 @@ pub(crate) fn handle_client_registration(world: &mut World, request: &RegisterCl
             "client registration failed"
         );
     }
-    world.send_event(ClientRegistrationResult {
-        id: request.id.clone(),
-        connection_id: request.connection_id,
-        result,
-    });
+    if let Err(Ok(registered)) = sender.send(result) {
+        if world
+            .client_by_connection(request.connection_id)
+            .is_some_and(|(entity, _)| entity == registered.client)
+        {
+            world.despawn(registered.client);
+        }
+    }
 }
 
 fn register_client(
@@ -70,12 +83,17 @@ fn register_client(
         sender: request.sender.clone(),
     };
     world.insert_component(entity, client);
+    let public_address = address.as_str().to_owned();
     world.insert_component(entity, address);
     if request.sender.is_closed() {
         world.despawn(entity);
         return Err(ClientError::ConnectionMissing);
     }
-    Ok(RegisteredClient { client: entity })
+    Ok(RegisteredClient {
+        client: entity,
+        address: public_address,
+        client_type: request.client_type.clone(),
+    })
 }
 
 pub(crate) fn handle_client_disconnect(world: &mut World, event: &ClientDisconnected) {

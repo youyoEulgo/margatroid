@@ -11,10 +11,7 @@ use storage_core::{
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use workspace_core::{
-    RestartWorkspace, RestartWorkspaceResult, StartWorkspace, StartWorkspaceResult,
-    WorkspaceOperationOutput,
-};
+use workspace_core::{RestartWorkspace, StartWorkspace, WorkspaceOperationOutput};
 
 fn copy_tree(source: &Path, target: &Path) {
     std::fs::create_dir_all(target).unwrap();
@@ -28,23 +25,11 @@ fn copy_tree(source: &Path, target: &Path) {
     }
 }
 
-fn wait_workspace(app: &mut App, id: &str, restart: bool) -> WorkspaceOperationOutput {
+fn wait_workspace(app: &mut App, id: &str, _restart: bool) -> WorkspaceOperationOutput {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         app.tick();
-        let result = if restart {
-            app.world()
-                .event_reader::<RestartWorkspaceResult>()
-                .into_iter()
-                .find(|event| event.id == id)
-                .map(|event| event.result.clone())
-        } else {
-            app.world()
-                .event_reader::<StartWorkspaceResult>()
-                .into_iter()
-                .find(|event| event.id == id)
-                .map(|event| event.result.clone())
-        };
+        let result = poll_reply(id);
         if let Some(result) = result {
             let output = result.unwrap();
             assert!(
@@ -274,6 +259,7 @@ fn workspace_restarts_keep_block_files_persistent_context_and_history_without_te
     .unwrap();
     app.world().emit_event(StartWorkspace {
         id: "initial".into(),
+        reply: request_reply("initial"),
         path: definition.clone(),
     });
     let mut output = wait_workspace(&mut app, "initial", false);
@@ -382,6 +368,7 @@ fn workspace_restarts_keep_block_files_persistent_context_and_history_without_te
             let id = format!("restart-{cycle}");
             app.world().emit_event(RestartWorkspace {
                 id: id.clone(),
+                reply: request_reply(&(id.clone())),
                 path: definition.clone(),
             });
             output = wait_workspace(&mut app, &id, true);
@@ -416,4 +403,19 @@ fn workspace_restarts_keep_block_files_persistent_context_and_history_without_te
             .is_stopped()
     );
     assert_disk_schema_and_messages(&database_path, &message, expected_logs.len());
+}
+
+type OperationResult = Result<WorkspaceOperationOutput, workspace_core::WorkspaceError>;
+thread_local! {static REPLIES:std::cell::RefCell<std::collections::BTreeMap<String,tokio::sync::oneshot::Receiver<OperationResult>>>=Default::default();}
+fn request_reply(id: &str) -> workspace_core::WorkspaceOperationReply {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    REPLIES.with(|rows| rows.borrow_mut().insert(id.to_owned(), receiver));
+    std::sync::Arc::new(std::sync::Mutex::new(Some(sender)))
+}
+fn poll_reply(id: &str) -> Option<OperationResult> {
+    REPLIES.with(|rows| {
+        rows.borrow_mut()
+            .get_mut(id)
+            .and_then(|receiver| receiver.try_recv().ok())
+    })
 }

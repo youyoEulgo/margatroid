@@ -2,14 +2,9 @@ use crate::{ClientError, RegisteredClient};
 use crate::{ClientSender, ConnectionId};
 use core_plugin::Event;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClientRegistrationResult {
-    pub id: String,
-    pub connection_id: ConnectionId,
-    pub result: Result<RegisteredClient, ClientError>,
-}
-
-impl Event for ClientRegistrationResult {}
+pub type ClientRegistrationReply = std::sync::Arc<
+    std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<RegisteredClient, ClientError>>>>,
+>;
 
 #[derive(Clone, Debug)]
 pub struct RegisterClient {
@@ -18,6 +13,7 @@ pub struct RegisterClient {
     pub client_type: String,
     pub name: Option<String>,
     pub sender: ClientSender,
+    pub reply: ClientRegistrationReply,
 }
 impl Event for RegisterClient {}
 #[derive(Clone, Debug)]

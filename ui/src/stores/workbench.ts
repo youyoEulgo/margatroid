@@ -19,6 +19,14 @@ import {
   type WorkspaceInfo,
   type WorkspaceReference,
   type UserImage,
+  type WorkspaceSnapshot,
+  type AgentSnapshot,
+  type TaskSnapshot,
+  type AgentTool,
+  type AgentLogRecord,
+  type AgentMclRecord,
+  type RangeQuery,
+  type MclData,
 } from '@/types/protocol';
 import { randomId } from '@/lib/id';
 
@@ -59,7 +67,7 @@ export interface RuntimeLog {
   fields: { name: string; value: string }[];
 }
 interface StreamEntry extends ConversationEntry {
-  instance: string;
+
   lastSequence: number;
   completed: boolean;
   frozen: boolean;
@@ -67,7 +75,7 @@ interface StreamEntry extends ConversationEntry {
 interface Target {
   workspace: string;
   agent: string;
-  instance: string;
+
 }
 interface PendingCommand {
   resolve: (value: unknown) => void;
@@ -438,6 +446,16 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const stateReady = ref(false);
   const connectionError = ref('');
   const registeredClient = ref<ClientInfo | null>(null);
+  const workspaceSnapshots = ref<WorkspaceSnapshot[]>([]);
+  const activeAgentSnapshots = ref<AgentSnapshot[]>([]);
+  const turnStates = ref(new Map<string, string | null>());
+  const taskStates = ref(new Map<string, TaskSnapshot[]>());
+  const toolDefinitions = ref(new Map<string, AgentTool[]>());
+  const agentLogs = ref(new Map<string, AgentLogRecord[]>());
+  const mclRecords = ref(new Map<string, AgentMclRecord[]>());
+  const historyCursors = ref(new Map<string, { before: number | null; after: number | null }>());
+  const recordQueries = new Map<string, Target>();
+  const historyQueries = new Map<string, Target>();
   const definitions = ref<WorkspaceConfig[]>([]);
   const runtimeWorkspaces = ref<WorkspaceInfo[]>([]);
   const agentStates = ref<AgentState[]>([]);
@@ -457,17 +475,26 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const sendingTargets = new Set<string>();
   const pendingWakes = new Map<
     string,
-    { workspace: string; agent: string; instance: string; content: string; images: UserImage[] }
+    { workspace: string; agent: string; content: string; images: UserImage[] }
   >();
   const resourceWritePending = ref('');
+  const savedSandboxSettings = ref(new Map<string, string[]>());
   const resourceWriteInFlight = computed(() => !!resourceWritePending.value);
   // Tools are advertised by the Agent state and are read-only in this panel.
   const toolOptions = computed(() => selectedAgentState.value?.tools ?? []);
   const sandboxOptions = computed(() => ({
     options: selectedAgentState.value?.sandboxes ?? [],
-    activated: selectedAgentState.value?.sandbox ? [selectedAgentState.value.sandbox] : [],
+    activated: [],
+    available: false,
+    configured: selectedAgentState.value
+      ? (savedSandboxSettings.value.get(
+          `${selectedAgentState.value.agent}`,
+        ) ?? null)
+      : null,
   }));
   let socket: WebSocket | null = null;
+  let registrationId = '';
+  const listQueries = new Map<string, 'workspace.req' | 'agent.req'>();
   let routeRevision = 0;
   let initializedSelection = false;
   let autoSelectSingle = true;
@@ -516,7 +543,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   );
   const selectedAgentReady = computed(
     () =>
-      !!selectedAgentState.value?.agent_instance &&
       ['idle', 'working'].includes(selectedAgentState.value?.status ?? ''),
   );
   const selectedAgentIdle = computed(
@@ -527,8 +553,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     [...abortGuards.value.values()].find(
       (guard) =>
         guard.workspace === selectedRuntimeWorkspace.value?.id &&
-        guard.agent === selectedAgent.value &&
-        guard.instance === selectedAgentState.value?.agent_instance,
+        guard.agent === selectedAgent.value,
     ),
   );
   const abortPending = computed(
@@ -577,6 +602,28 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     );
     return [...history, ...live];
   });
+  const selectedMclEntries = computed(() => {
+    const target = currentTarget(false);
+    if (!target) return [];
+    const workspace = selectedAgentState.value!.workspace;
+    return historyEntries({
+      workspace,
+      agent: target.agent,
+      messages: (mclRecords.value.get(targetKey(target)) ?? []).map((r) => ({ ...r, kind: 'mcl' })),
+    });
+  });
+  const selectedSessionLogs = computed<RuntimeLog[]>(() => {
+    const target = currentTarget(false);
+    if (!target) return [];
+    return (agentLogs.value.get(targetKey(target)) ?? []).map((r) => ({
+      key: `${target.agent}:log:${r.sequence}`,
+      timestamp: r.created_at_ms,
+      level: r.level.toUpperCase(),
+      target: r.source,
+      message: r.message,
+      fields: [{ name: 'stage', value: r.stage }],
+    }));
+  });
   const contextTokens = computed(() => latestContextTokens(selectedHistory.value));
   const contextWindowTokens = computed(
     () => selectedAgentState.value?.context_window_tokens ?? null,
@@ -615,29 +662,88 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   function connected(): boolean {
     return socket?.readyState === WebSocket.OPEN && registeredClient.value !== null;
   }
-  function queryState() {
-    if (connected())
-      socket!.send(
-        JSON.stringify({
-          type: 'state.query',
-          id: randomId(),
-          message: {},
-        } satisfies ClientMessage),
-      );
+  function sendQuery(type: 'workspace.req' | 'agent.req') {
+    if (connected()) {
+      const id = randomId();
+      listQueries.set(id, type);
+      socket!.send(JSON.stringify({ type, id, message: {} } satisfies ClientMessage));
+    }
   }
-  function queryHistoryFor(target: Pick<Target, 'workspace' | 'agent'>) {
-    if (connected())
+  function queryState() {
+    sendQuery('workspace.req');
+    sendQuery('agent.req');
+    const target = currentTarget(false);
+    if (target) queryAgentDetails(target);
+  }
+  function targetKey(target: Pick<Target, 'agent'>): string {
+    return `${target.agent}`;
+  }
+  function matchesTarget(target: Pick<Target, 'agent'>): boolean {
+    return agentStates.value.some(
+      (s) => s.agent === target.agent,
+    );
+  }
+  function queryAgentDetails(target: Target) {
+    if (!connected()) return;
+    for (const type of ['agent.turn.req', 'agent.task.req'] as const) {
+      const id = randomId();
+      recordQueries.set(id, target);
       socket!.send(
         JSON.stringify({
-          type: 'history.query',
-          id: randomId(),
-          message: { workspace: target.workspace, agent: target.agent },
+          type,
+          id,
+          message: { address: target.agent },
         } satisfies ClientMessage),
       );
+    }
+  }
+  function queryHistoryFor(target: Target, range: RangeQuery = {}) {
+    if (!connected() || !matchesTarget(target)) return;
+    const id = randomId();
+    recordQueries.set(id, target);
+    historyQueries.set(id,target);
+    socket!.send(
+      JSON.stringify({
+        type: 'agent.history.req',
+        id,
+        message: { address: target.agent, limit: 50, ...range },
+      } satisfies ClientMessage),
+    );
+  }
+  function queryRecords(kind: 'log' | 'mcl', range: RangeQuery = {}) {
+    const target = currentTarget(false);
+    if (!target || !connected()) return;
+    const id = randomId();
+    recordQueries.set(id, target);
+    socket!.send(
+      JSON.stringify({
+        type: kind === 'log' ? 'agent.log.req' : 'agent.mcl.req',
+        id,
+        message: { address: target.agent, limit: 50, ...range },
+      } satisfies ClientMessage),
+    );
   }
   function queryHistory() {
     const target = currentTarget(false);
-    if (target) queryHistoryFor(target);
+    if (target) {
+      queryAgentDetails(target);
+      queryHistoryFor(target);
+    }
+  }
+  function loadOlderHistory() {
+    const target = currentTarget(false);
+    if (!target) return;
+    const sequence = selectedHistory.value?.messages.reduce<number | null>(
+      (oldest, row) => (oldest === null ? row.sequence : Math.min(oldest, row.sequence)),
+      null,
+    );
+    if (
+      sequence != null &&
+      ![...historyQueries.values()].some(
+        (q) => q.agent === target.agent,
+      )
+    )
+      queryHistoryFor(target, { before_sequence: sequence });
   }
   function rejectPending(message: string) {
     for (const command of pending.values()) {
@@ -658,6 +764,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     registeredClient.value = null;
     stateReady.value = false;
     resourcesReset();
+    recordQueries.clear();
+    historyQueries.clear();
+    listQueries.clear();
+    registrationId = '';
     pendingWakes.clear();
     streams.value = new Map();
     rejectPending('Backend WebSocket closed');
@@ -679,14 +789,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     const next = new WebSocket(endpoint.value);
     socket = next;
     next.onopen = () => {
-      if (socket === next)
-        next.send(
-          JSON.stringify({
-            type: 'connection.register',
-            id: randomId(),
-            message: { client_type: 'webui' },
-          } satisfies ClientMessage),
-        );
+      if (socket !== next) return;
+      registrationId = randomId();
+      next.send(
+        JSON.stringify({
+          type: 'connection.register',
+          id: registrationId,
+          message: { client_type: 'webui' },
+        } satisfies ClientMessage),
+      );
     };
     next.onmessage = (event) => {
       if (socket !== next || typeof event.data !== 'string') return;
@@ -780,7 +891,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       if (required) throw new Error('Select a running agent explicitly');
       return null;
     }
-    return { workspace: workspace.id, agent: selectedAgent.value, instance: state.agent_instance };
+    return { workspace: workspace.id, agent: selectedAgent.value };
   }
   function request(request: ClientMessage, target?: Target, read = false): Promise<unknown> {
     if (!connected()) return Promise.reject(new Error('Register a daemon connection first'));
@@ -795,7 +906,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         timeout,
         target,
         read,
-        turn: request.type === 'agent.turn.abort' ? request.message.turn_id : undefined,
+        turn: request.type === 'agent.turn.abort' ? request.message.turn : undefined,
       });
       try {
         socket!.send(JSON.stringify(request));
@@ -815,11 +926,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       return Promise.reject(new Error('Enter an MCL command and a JSON argument array'));
     return request(
       {
-        type: 'mcl.command',
+        type: 'mcl.execute',
         id: randomId(),
         message: {
-          workspace: target.workspace,
-          agent: target.agent,
+          address: target.agent,
+
           command: command.trim(),
           arguments: argumentsValue,
         },
@@ -842,7 +953,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       routeRevision,
       target.workspace,
       target.agent,
-      target.instance,
       selectedAgentState.value?.tools,
       selectedAgentState.value?.sandboxes,
     ]);
@@ -850,10 +960,25 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   function assertTarget(target: Target, snapshot: string) {
     if (resourceTargetSnapshot(currentTarget(false)) !== snapshot)
       throw new Error('Selected agent changed during resource settings update');
-    if (selectedAgentState.value?.agent_instance !== target.instance)
-      throw new Error('Selected agent instance changed during resource settings update');
+  }
+  async function readSandboxSettings(): Promise<void> {
+    const target = currentTarget()!;
+    const result = await executeFor(target, 'CONFIG GET');
+    if (!matchesTarget(target)) throw new Error('Agent instance changed before settings were read');
+    if (!isRecord(result) || !isRecord(result.Config))
+      throw new Error('CONFIG GET did not return settings');
+    const values = result.Config.sandbox;
+    if (Array.isArray(values) && values.every((v) => typeof v === 'string'))
+      savedSandboxSettings.value = new Map(savedSandboxSettings.value).set(
+        targetKey(target),
+        values,
+      );
   }
   async function setSandbox(alias: string | null): Promise<void> {
+    if (!sandboxOptions.value.available)
+      throw new Error(
+        'Sandbox runtime selection is unavailable in this API; use Driver MCL controls',
+      );
     if (resourceWritePending.value) throw new Error('Wait for the current sandbox request');
     const target = currentTarget()!;
     const snapshot = resourceTargetSnapshot(target);
@@ -893,7 +1018,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (!selectedAgentIdle.value) throw new Error('The selected agent is not idle');
     const target = currentTarget()!;
     const revision = routeRevision;
-    const targetKey = `${target.workspace}:${target.agent}:${target.instance}`;
+    const targetKey = `${target.workspace}:${target.agent}`;
     if (sendingTargets.has(targetKey))
       throw new Error('A message is already awaiting acknowledgement for this agent');
     const text = content.trim();
@@ -926,14 +1051,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           revision !== routeRevision ||
           !current ||
           current.workspace !== target.workspace ||
-          current.agent !== target.agent ||
-          current.instance !== target.instance
+          current.agent !== target.agent
         )
           throw new Error('Selected agent changed during send');
         pendingWakes.set(targetKey, {
           workspace: target.workspace,
           agent: target.agent,
-          instance: target.instance,
+
           content: text,
           images: images.map(({ media_type, data }) => ({ media_type, data })),
         });
@@ -979,7 +1103,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       if (
         stream.workspaceKey === target.workspace &&
         stream.agent === target.agent &&
-        stream.instance === target.instance &&
         !stream.completed
       ) {
         guard.streamKeys.add(key);
@@ -992,10 +1115,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         type: 'agent.turn.abort',
         id,
         message: {
-          workspace: target.workspace,
-          agent: target.agent,
-          agent_instance: target.instance,
-          turn_id: state.turn,
+          address: target.agent,
+
+          turn: state.turn,
         },
       },
       target,
@@ -1011,8 +1133,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       const state = agentStates.value.find(
         (candidate) =>
           workspaceKey(candidate.workspace) === guard.workspace &&
-          candidate.agent === guard.agent &&
-          candidate.agent_instance === guard.instance,
+          candidate.agent === guard.agent,
       );
       const sameTurn = state?.status === 'working' && state.turn === guard.turn;
       if (guard.failed && sameTurn) {
@@ -1033,16 +1154,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   function handleDelta(event: StreamDelta, reasoning: boolean) {
     const state = agentStates.value.find(
       (candidate) =>
-        candidate.agent === event.agent && candidate.agent_instance === event.agent_instance,
+        candidate.agent === event.agent,
     );
     if (!state) return;
-    const key = `${event.agent}:${event.agent_instance}:${event.id}`;
+    const key = `${event.agent}:${event.id}`;
     if (completedStreams.has(key) || abortedStreams.has(key)) return;
     const guard = [...abortGuards.value.values()].find(
       (candidate) =>
         candidate.workspace === workspaceKey(state.workspace) &&
-        candidate.agent === event.agent &&
-        candidate.instance === event.agent_instance,
+        candidate.agent === event.agent,
     );
     if (guard) {
       guard.streamKeys.add(key);
@@ -1071,7 +1191,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           sequence: null,
           toolCallId: null,
           toolName: null,
-          instance: event.agent_instance,
+
           lastSequence: -1,
           completed: false,
           frozen: false,
@@ -1117,205 +1237,390 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           agentStates.value.some(
             (state) =>
               state.agent === stream.agent &&
-              workspaceKey(state.workspace) === stream.workspaceKey &&
-              state.agent_instance === stream.instance,
+              workspaceKey(state.workspace) === stream.workspaceKey,
           ) && !assistantIds.has(`${stream.workspaceKey}:${stream.agent}:${stream.id}`),
       ),
     );
   }
+  function projectSnapshots() {
+    definitions.value = workspaceSnapshots.value.map((w) => ({
+      path: w.path,
+      cache: w.definition,
+    }));
+    runtimeWorkspaces.value = workspaceSnapshots.value
+      .filter((w) => w.address !== null)
+      .map((w) => ({
+        id: w.address!,
+        name: w.definition.name,
+        project_root: w.definition.project_root,
+        definition_path: w.path,
+        status: w.status as WorkspaceInfo['status'],
+        agents: activeAgentSnapshots.value
+          .filter((a) => a.workspace === w.address)
+          .map((a) => a.address),
+      }));
+    agentStates.value = activeAgentSnapshots.value.map((a) => ({
+      workspace: runtimeWorkspaces.value.find((w) => w.id === a.workspace) ?? {
+        id: a.workspace,
+        name: resourceName(a.workspace),
+        project_root: '',
+      },
+      agent: a.address,
+
+      status: (a.status === 'ready' ? 'idle' : a.status) as AgentState['status'],
+      turn: turnStates.value.get(`${a.address}`) ?? null,
+      tools: a.tools.map((t) => t.alias),
+      sandbox: null,
+      sandboxes: [],
+      queued_commands: 0,
+      pending_command: null,
+      error: a.error,
+    }));
+    toolDefinitions.value = new Map(
+      activeAgentSnapshots.value.map((a) => [`${a.address}`, a.tools]),
+    );
+    for (const state of agentStates.value) {
+      const key = `${workspaceKey(state.workspace)}:${state.agent}`;
+      if (state.error) lastFailures.value.set(key, { message: state.error.message });
+      else if (['idle', 'working'].includes(state.status)) lastFailures.value.delete(key);
+    }
+    reconcileAbortGuards();
+    reconcileSelection();
+    reconcileStreams();
+  }
+  function mergeHistory(target: Target, records: HistoryMessage[]) {
+    const previous = histories.value.find(
+      (h) => h.agent === target.agent && workspaceKey(h.workspace) === target.workspace,
+    );
+    const rows = new Map((previous?.messages ?? []).map((row) => [row.sequence, row]));
+    for (const row of records) {
+      const old = rows.get(row.sequence);
+      rows.set(
+        row.sequence,
+        row.created_at_ms === 0 && old ? { ...row, created_at_ms: old.created_at_ms } : row,
+      );
+    }
+    const workspace = agentStates.value.find((a) => a.agent === target.agent)?.workspace;
+    if (!workspace) return;
+    histories.value = [
+      ...histories.value.filter((h) => h !== previous),
+      {
+        workspace,
+        agent: target.agent,
+        messages: [...rows.values()].sort((a, b) => a.sequence - b.sequence),
+      },
+    ];
+    reconcileStreams();
+  }
+  function queryTarget(id: string, address?: string): Target | null {
+    const query = recordQueries.get(id);
+    recordQueries.delete(id);
+    historyQueries.delete(id);
+    if (
+      !query ||
+      !matchesTarget(query) ||
+      (address !== undefined && query.agent !== address)
+    )
+      return null;
+    return query;
+  }
+  function mclValue(data: MclData | undefined): unknown {
+    if (!data) return 'Unit';
+    switch (data.kind) {
+      case 'messages':
+        return { Array: { Message: data.value } };
+      case 'config':
+        return { Config: data.value };
+      case 'import':
+        return { Import: data.value };
+      case 'inference':
+        return { Inference: data.value };
+      case 'block_snapshots':
+        return { BlockSnapshots: data.value };
+    }
+  }
+  function handleFull(event: Extract<ServerMessage, { type: 'agent.message.full.sync' }>) {
+    const state = agentStates.value.find(
+      (a) => a.agent === event.address,
+    );
+    if (!state) return;
+    const target = {
+      workspace: workspaceKey(state.workspace),
+      agent: event.address,
+
+    };
+    if (event.history_sequence !== null) {
+      const message = event.message;
+      mergeHistory(target, [
+        {
+          sequence: event.history_sequence,
+          turn: event.turn,
+          kind: 'message',
+          content:
+            'content' in message
+              ? (message.content ?? '')
+              : message.type === 'error'
+                ? message.message
+                : '',
+          payload: message,
+          created_at_ms: 0,
+        },
+      ]);
+    }
+    if (event.generation) {
+      const key = `${event.address}:${event.generation}`;
+      remember(completedStreams, key);
+      if (event.history_sequence !== null) {
+        streams.value.delete(key);
+        streams.value = new Map(streams.value);
+      } else {
+        const row = decodeMessage(event.message)[0];
+        if (row) {
+          const old = streams.value.get(key);
+          streams.value = new Map(streams.value).set(key, {
+            key,
+            id: event.generation,
+            workspaceKey: target.workspace,
+            agent: target.agent,
+            role: row.role,
+            thinking: row.thinking,
+            content: row.content,
+            toolCalls: row.toolCalls,
+            failed: row.failed || !!event.error,
+            images: row.images,
+            timestamp: old?.timestamp ?? 0,
+            kind: 'stream',
+            payload: event.message,
+            source: null,
+            messageType: event.message.type,
+            sequence: null,
+            toolCallId: row.toolCallId,
+            toolName: row.toolName,
+
+            lastSequence: old?.lastSequence ?? -1,
+            completed: true,
+            frozen: old?.frozen ?? false,
+          });
+        }
+      }
+    }
+    if (event.error) addLog('ERROR', event.error.message, event.address);
+  }
   function handleServerMessage(event: ServerMessage) {
     switch (event.type) {
-      case 'connection.registered':
+      case 'connection.register.result':
+        if (event.id !== registrationId) break;
+        if (!event.success) {
+          connectionError.value = event.error.message;
+          shouldReconnect = false;
+          socket?.close();
+          break;
+        }
         registeredClient.value = event.client;
         connectionStatus.value = 'online';
         connectionError.value = '';
         reconnectAttempt = 0;
         queryState();
         break;
-      case 'connection.register_failed':
-        connectionError.value = errorMessage(event.error);
-        shouldReconnect = false;
-        socket?.close();
-        break;
-      case 'state.sync':
-        definitions.value = event.state.workspace_definitions;
-        runtimeWorkspaces.value = event.state.workspaces;
-        agentStates.value = event.state.agents;
-        histories.value = event.state.histories;
-        stateReady.value = true;
-        reconcileAbortGuards();
-        for (const [key, wake] of pendingWakes)
-          if (
-            !agentStates.value.some(
-              (state) =>
-                workspaceKey(state.workspace) === wake.workspace &&
-                state.agent === wake.agent &&
-                state.agent_instance === wake.instance &&
-                state.status === 'idle',
-            )
-          )
-            pendingWakes.delete(key);
-        for (const state of agentStates.value) {
-          const key = `${workspaceKey(state.workspace)}:${state.agent}`;
-          if (state.error) lastFailures.value.set(key, { message: state.error.message });
-          else if (['idle', 'working'].includes(state.status)) lastFailures.value.delete(key);
-        }
-        reconcileSelection();
-        reconcileStreams();
-        break;
-      case 'workspace.definitions':
-        definitions.value = event.definitions;
-        reconcileSelection();
-        settle(event.id, event.definitions);
-        break;
-      case 'workspace.started':
-      case 'workspace.restarted':
-        runtimeWorkspaces.value = [
-          ...runtimeWorkspaces.value.filter((workspace) => workspace.id !== event.workspace.id),
-          event.workspace,
-        ];
-        for (const failure of event.workspace.member_failures ?? [])
-          addLog(
-            'ERROR',
-            `Agent ${failure.agent} (${failure.driver}) failed to start: ${failure.error}`,
-          );
-        settle(event.id, event.workspace);
-        queryState();
-        break;
-      case 'workspace.stopped': {
-        const stopped = workspaceKey(event.workspace);
-        const wasSelected =
-          !!selectedRuntimeWorkspace.value && selectedRuntimeWorkspace.value.id === stopped;
-        settle(event.id, event.workspace);
-        // The receipt closes the operation; the runtime list still follows the
-        // next authoritative snapshot, but this instance's selection, streams
-        // and pending routes are no longer usable.
-        streams.value = new Map(
-          [...streams.value].filter(([, stream]) => stream.workspaceKey !== stopped),
-        );
-        for (const [key, guard] of abortGuards.value)
-          if (guard.workspace === stopped) abortGuards.value.delete(key);
-        for (const [key, wake] of pendingWakes)
-          if (wake.workspace === stopped) pendingWakes.delete(key);
-        if (wasSelected) {
-          routeRevision++;
-          selectedAgent.value = null;
-          resourcesReset();
-        }
-        queryState();
-        break;
-      }
-      case 'workspace.start_failed':
-      case 'workspace.restart_failed':
-      case 'workspace.stop_failed':
-        settle(event.id, null, event.error.message);
-        queryState();
-        break;
-      case 'agent.started':
-      case 'agent.restarted':
-        settle(event.id, event.agent);
-        queryState();
-        break;
-      case 'agent.turn.abort_result': {
-        const command = pending.get(event.id);
-        const guard = abortGuards.value.get(event.id);
-        if (
-          !command?.target ||
-          command.target.workspace !== workspaceKey(event.workspace) ||
-          command.target.agent !== event.agent ||
-          command.turn !== event.turn_id
-        )
+      case 'workspace.res':
+        if (listQueries.get(event.id) !== 'workspace.req') break;
+        listQueries.delete(event.id);
+        if (!event.success) {
+          settle(event.id, null, event.error.message);
           break;
-        if ('Err' in event.result && guard) guard.failed = true;
-        settle(event.id, null, 'Err' in event.result ? event.result.Err.message : undefined);
-        queryState();
+        }
+        workspaceSnapshots.value = event.workspaces;
+        stateReady.value = true;
+        projectSnapshots();
+        settle(event.id, event.workspaces);
+        break;
+      case 'workspace.sync':
+        workspaceSnapshots.value = event.workspaces;
+        stateReady.value = true;
+        projectSnapshots();
+        break;
+      case 'agent.res':
+        if (listQueries.get(event.id) !== 'agent.req') break;
+        listQueries.delete(event.id);
+        if (!event.success) {
+          settle(event.id, null, event.error.message);
+          break;
+        }
+        activeAgentSnapshots.value = event.agents;
+        projectSnapshots();
+        settle(event.id, event.agents);
+        break;
+      case 'agent.sync':
+        activeAgentSnapshots.value = event.agents;
+        projectSnapshots();
+        break;
+      case 'workspace.start.result':
+      case 'workspace.stop.result':
+      case 'workspace.restart.result':
+      case 'workspace.reload.result':
+      case 'agent.start.result':
+      case 'agent.stop.result':
+      case 'agent.restart.result':
+        settle(event.id, null, event.success ? undefined : event.error.message);
+        break;
+      case 'agent.turn.abort.result': {
+        if (!pending.has(event.id)) break;
+        const guard = abortGuards.value.get(event.id);
+        if (!event.success && guard) guard.failed = true;
+        settle(event.id, null, event.success ? undefined : event.error.message);
+        if (!event.success) queryState();
         break;
       }
-      case 'mcl.command_result': {
+      case 'agent.turn.res': {
+        const query = queryTarget(event.id);
+        if (!query) break;
+        if (!event.success) {
+          addLog('ERROR', event.error.message);
+          break;
+        }
+        if (query.agent !== event.state.address) break;
+        turnStates.value.set(targetKey(query), event.state.turn);
+        projectSnapshots();
+        break;
+      }
+      case 'agent.turn.sync':
+        if (matchesTarget({ agent: event.address })) {
+          turnStates.value.set(`${event.address}`, event.turn);
+          projectSnapshots();
+        }
+        break;
+      case 'agent.task.res': {
+        if (!queryTarget(event.id, event.address)) break;
+        if (event.success)
+          taskStates.value = new Map(taskStates.value).set(
+            `${event.address}`,
+            event.tasks,
+          );
+        else addLog('ERROR', event.error.message);
+        break;
+      }
+      case 'agent.task.sync':
+        if (matchesTarget({ agent: event.address }))
+          taskStates.value = new Map(taskStates.value).set(
+            `${event.address}`,
+            event.tasks,
+          );
+        break;
+      case 'mcl.execute.result': {
         const command = pending.get(event.id);
         if (!command) break;
-        if (command.target?.agent !== event.target) {
-          settle(event.id, null, 'MCL result target does not match the request');
+        if (command.target && !matchesTarget(command.target)) {
+          settle(event.id, null, 'Agent instance changed before the command result');
           break;
         }
-        const value = event.result.Ok;
-        let failure: MclCommandFailure | undefined;
-        if (isRecord(value) && 'Error' in value && isMclError(value.Error)) {
-          failure = new Error(value.Error.message);
-          failure.requestId = value.Error.request_id;
-          failure.agentMessage = value.Error;
-        }
-        settle(event.id, value, failure);
-        if (!command.read) queryHistoryFor(command.target);
-        if (event.history_error)
-          addLog(
-            'ERROR',
-            `Command completed but history persistence failed: ${event.history_error.message}`,
-          );
-        break;
-      }
-      case 'request.failed': {
-        const guard = abortGuards.value.get(event.id);
-        if (guard) guard.failed = true;
-        if (pending.has(event.id)) settle(event.id, null, event.error.message);
-        else addLog('ERROR', event.error.message);
-        queryState();
-        break;
-      }
-      case 'agent.message.delta':
-        handleDelta(event, false);
-        break;
-      case 'agent.message.reasoning_delta':
-        handleDelta(event, true);
-        break;
-      case 'agent.message.finished': {
-        const state = agentStates.value.find(
-          (candidate) =>
-            candidate.agent === event.agent && candidate.agent_instance === event.agent_instance,
+        settle(
+          event.id,
+          event.success ? mclValue(event.data) : null,
+          event.success ? undefined : event.error.message,
         );
-        if (!state) break;
-        const key = `${event.agent}:${event.agent_instance}:${event.id}`;
-        if (completedStreams.has(key)) break;
-        remember(completedStreams, key);
-        const old = streams.value.get(key);
-        if (old)
-          streams.value = new Map(streams.value).set(key, {
-            ...old,
-            completed: true,
-            failed: !!event.error,
-          });
-        if (event.error) {
-          lastFailures.value.set(`${workspaceKey(state.workspace)}:${event.agent}`, {
-            message: event.error.message,
-          });
-          addLog('ERROR', event.error.message, event.agent);
-        }
-        queryHistoryFor({ workspace: workspaceKey(state.workspace), agent: state.agent });
         break;
       }
-      case 'history.result':
-        histories.value = [
-          ...histories.value.filter(
-            (history) =>
-              history.agent !== event.history.agent ||
-              workspaceKey(history.workspace) !== workspaceKey(event.history.workspace),
-          ),
-          event.history,
-        ];
-        reconcileStreams();
-        break;
-      case 'log':
-        logs.value.push({
-          key: randomId(),
-          timestamp: event.record.timestamp_millis,
-          level: event.record.level,
-          target: event.record.target,
-          message: event.record.message,
-          fields: event.record.fields,
+      case 'agent.history.res': {
+        const query = queryTarget(event.id, event.address);
+        if (!query) break;
+        if (!event.success) {
+          addLog('ERROR', event.error.message);
+          break;
+        }
+        mergeHistory(query, event.records);
+        historyCursors.value = new Map(historyCursors.value).set(targetKey(query), {
+          before: event.next_before_sequence,
+          after: event.next_after_sequence,
         });
-        if (logs.value.length > MAX_LOGS) logs.value.splice(0, logs.value.length - MAX_LOGS);
+        break;
+      }
+      case 'agent.log.res':
+      case 'agent.mcl.res': {
+        const query = queryTarget(event.id, event.address);
+        if (!query) break;
+        if (!event.success) {
+          addLog('ERROR', event.error.message);
+          break;
+        }
+        if (event.type === 'agent.log.res') mergeLogs(query, event.records);
+        else mergeAudits(query, event.records);
+        break;
+      }
+      case 'agent.log.sync':
+        if (matchesTarget({ agent: event.address }))
+          mergeLogs({ agent: event.address }, event.records);
+        break;
+      case 'agent.mcl.sync':
+        if (matchesTarget({ agent: event.address }))
+          mergeAudits({ agent: event.address }, event.records);
+        break;
+      case 'agent.message.chunk.sync':
+        if (
+          (streams.value.get(`${event.address}:${event.generation}`)
+            ?.lastSequence ?? -1) >= event.sequence
+        )
+          break;
+        if (event.delta.reasoning !== undefined)
+          handleDelta(
+            {
+              id: event.generation,
+              agent: event.address,
+
+              sequence: event.sequence,
+              content: event.delta.reasoning,
+            },
+            true,
+          );
+        if (event.delta.content !== undefined) {
+          // A single chunk may contain both fields; append content within the same accepted sequence.
+          const key = `${event.address}:${event.generation}`;
+          if (event.delta.reasoning !== undefined) {
+            const stream = streams.value.get(key);
+            if (
+              stream &&
+              stream.lastSequence === event.sequence &&
+              !stream.frozen &&
+              !stream.completed
+            )
+              streams.value = new Map(streams.value).set(key, {
+                ...stream,
+                content: stream.content + event.delta.content,
+              });
+          } else
+            handleDelta(
+              {
+                id: event.generation,
+                agent: event.address,
+
+                sequence: event.sequence,
+                content: event.delta.content,
+              },
+              false,
+            );
+        }
+        break;
+      case 'agent.message.full.sync':
+        handleFull(event);
         break;
     }
+  }
+  function mergeLogs(target: Pick<Target, 'agent'>, records: AgentLogRecord[]) {
+    const key = targetKey(target);
+    const rows = new Map((agentLogs.value.get(key) ?? []).map((r) => [r.sequence, r]));
+    for (const row of records) rows.set(row.sequence, row);
+    agentLogs.value = new Map(agentLogs.value).set(
+      key,
+      [...rows.values()].sort((a, b) => a.sequence - b.sequence),
+    );
+  }
+  function mergeAudits(target: Pick<Target, 'agent'>, records: AgentMclRecord[]) {
+    const key = targetKey(target);
+    const rows = new Map((mclRecords.value.get(key) ?? []).map((r) => [r.sequence, r]));
+    for (const row of records) rows.set(row.sequence, row);
+    mclRecords.value = new Map(mclRecords.value).set(
+      key,
+      [...rows.values()].sort((a, b) => a.sequence - b.sequence),
+    );
   }
   async function workspaceRequest(message: ClientMessage) {
     if (workspaceOperationPending.value)
@@ -1365,7 +1670,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     await workspaceRequest({
       type: 'workspace.stop',
       id: randomId(),
-      message: { workspace: address },
+      message: { path: runtimeWorkspaces.value.find((w) => w.id === address)!.definition_path },
     });
     workspaceNotice.value = 'Workspace stopped.';
   }
@@ -1373,9 +1678,22 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     logs.value = [];
   }
   return {
+    workspaceSnapshots,
+    activeAgentSnapshots,
+    taskStates,
+    toolDefinitions,
+    agentLogs,
+    mclRecords,
+    historyCursors,
+    selectedMclEntries,
+    selectedSessionLogs,
+    loadOlderHistory,
+    readSandboxSettings,
+    queryRecords,
     endpoint,
     driverContextPath,
     connectionStatus,
+    registeredClient,
     stateReady,
     connectionError,
     definitions,

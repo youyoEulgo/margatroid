@@ -552,3 +552,31 @@ fn reads_join_unread_text_without_changing_structured_output_or_cursor() {
     task.write(json!(" output")).unwrap();
     assert_eq!(task.read().unwrap().output, [json!("new output")]);
 }
+
+#[test]
+fn snapshots_preserve_script_cursor_replaced_and_skip_cleanup() {
+    let tasks = ToolTasks::new();
+    let (task, _input) = handle();
+    tasks.register("z".into(), task.clone()).unwrap();
+    task.write(json!("first")).unwrap();
+    task.read().unwrap();
+    task.write(json!({"later":true})).unwrap();
+    let snap = tasks.snapshot();
+    assert_eq!(snap[0].task_id, "z");
+    assert_eq!(snap[0].call_id, "call");
+    assert_eq!(snap[0].alias, "tool");
+    assert!(!snap[0].returned);
+    assert_eq!(snap[0].output, vec![json!("first"), json!({"later":true})]);
+    assert_eq!(task.read().unwrap().output, vec![json!({"later":true})]);
+    task.replace(json!("replacement")).unwrap();
+    assert_eq!(
+        task.snapshot("z").unwrap().output,
+        vec![json!("replacement")]
+    );
+    assert!(task.read().unwrap().replaced);
+    task.set_error(ToolError::new(ToolErrorKind::ExecutionFailed, "failure"));
+    assert!(tasks.snapshot()[0].error.is_some());
+    tasks.complete_cleanup("z", &task, None);
+    assert!(tasks.snapshot().is_empty());
+    assert!(task.snapshot("z").is_none());
+}

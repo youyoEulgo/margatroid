@@ -71,6 +71,7 @@ impl Fixture {
         app.world_mut().insert_component(
             workspace,
             Workspace {
+                definition: None,
                 name: "driver-errors".into(),
                 definition_path: root.path().join("workspace.yaml"),
                 project_root: root.path().to_owned(),

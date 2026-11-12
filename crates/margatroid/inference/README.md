@@ -35,6 +35,64 @@ InferenceRequest携带完整Agent Entity、turn、消息和oneshot。Handler认�
 
 ## 请求适配
 
+这里的代码结构是项目所有者明确规定的契约，不能以“效果相同”改成通用JSON修补器。
+
+```rust
+// 共享纯领域输入，不能承载厂商或API格式状态。
+DomainRequest
+
+// 插件内可失败的具体格式转换。
+impl TryFrom<DomainRequest> for ChatCompletionsRequest
+impl TryFrom<EncodeInput> for ChatCompletionsRequest
+impl TryFrom<DomainRequest> for MessagesRequest
+impl TryFrom<DomainRequest> for ResponsesRequest
+
+// 格式枚举只用于分派，不是泛型类型参数。
+enum ApiRequest {
+    ChatCompletions(ChatCompletionsRequest),
+    Messages(MessagesRequest),
+    Responses(ResponsesRequest),
+}
+
+// 每个组合具有对应具体process实现。
+OpenAi<ChatCompletionsRequest>
+OpenAi<ResponsesRequest>
+Anthropic<MessagesRequest>
+DeepSeek<ChatCompletionsRequest>
+DeepSeek<MessagesRequest>
+DeepSeek<ResponsesRequest>
+OpenRouter<ChatCompletionsRequest>
+```
+
+上述片段是类型与impl签名索引，字段和方法以设计及Rust定义为准。调用链固定为：
+
+```text
+厂商无关内部消息
+    → DomainRequest
+    → ApiAdapter::encode / TryFrom / try_into()
+    → 具体ChatCompletionsRequest、MessagesRequest或ResponsesRequest
+    → ApiAdapter::process_request
+    → Vendor<具体请求类型>::process
+    → ProviderHttpRequest / HTTP
+
+上游响应
+    → 同一组合选择的FormatDecoder
+    → 厂商无关ProviderFragment
+    → 唯一ResponseAccumulator
+    → InferenceResponse
+    → MCL生成内部消息，由Driver显式记录
+```
+
+DomainRequest只携带消息、纯工具定义及公共采样语义；不含provider/api_type、URL、密钥、HTTP、Agent/turn执行身份、取消令牌或通道。EncodeInput是插件局部的编码能力输入，不得反向成为第二套共享请求或持久消息。
+
+禁止绕过这些边界：不能把三种具体Request合成一个任意JSON壳，不能用通用VendorAdapter按厂商补字段，不能将ApiRequest::Responses等枚举变体当作Rust泛型类型，不能从URL/模型名称猜格式，也不能用兼容handler兜底未知组合。JSON序列化是具体格式编码的输出，不是内部通用消息的替代品。
+
+内部消息、共享响应、累积器、Block和历史不得加入replay、api_format、厂商thinking块、签名或encrypted_content。协议解码可以读取这些字段以识别上游事件，但不得将原生结构透传至领域消息，也不得为重放而再存一份reasoning。厂商选项与格式字段只在上述推理边界处理。
+
+切换模型或API格式时，重新从原有内部消息构造目标请求。不能要求历史消息预先带有目标格式元数据，不能为适配目标而改写、清空数据库或替换角色。目标支持独立reasoning输入时映射该字段；目标不支持无签名历史reasoning时不发送此独立字段，但不改正文和工具。仅有reasoning、无正文/工具且目标无法表达时明确失败。禁止伪造签名、制造thinking块、插入标签把reasoning伪装成正文，或丢弃正文、工具ID及媒体来强行通过转换。
+
+这些不变量由具体格式转换、跨格式真实HTTP和存储往返测试验证：同一份内部消息可重新选择已支持组合；切换后正文与工具关联不变；内部reasoning只出现一次；返回值和落库消息不包含厂商重放字段。新增组合必须补充显式handler及对应编解码验证，不能只增加配置枚举。
+
 DomainRequest先通过TryFrom转换为ChatCompletionsRequest、MessagesRequest或ResponsesRequest；需要厂商能力时使用插件内EncodeInput。ApiAdapter只分派明确支持的组合，调用OpenAi<T>、Anthropic<T>、DeepSeek<T>或OpenRouter<T>对应的具体process实现，T是具体格式请求类型。参数处理使用有类型字段，不能先编码成通用JSON再按厂商分支补救。响应解码器由同一组合选定，逆向输出统一分片。Messages要求max_output_tokens，Responses不接受stop序列；不通过静默丢弃参数完成兼容。
 
 Responses提交完整本地上下文，store=false，不依赖远端conversation或previous_response_id。内部消息只保存一份reasoning、正文和结构化工具关联，不包含api_format、签名块、加密reasoning或replay。响应解码器将可读思考统一为reasoning，厂商协议签名及加密内容不进入共享结果、累积器、Block或历史。
@@ -65,7 +123,11 @@ DTO原生WebSocket读循环解析协议后投递自有DtoRequest，UPDATE转换�
 
 文本冻结与任务清理分开。已确认的provider或流错误立即经oneshot交给MCL转换为error消息，不等待后台join；正常取消在清理预算内按completed普通结束，超预算及时返回CleanupFailed。原监督任务始终保留并等待真实join，ActiveInference不提前释放，下一次重叠推理返回可见错误。清理完成后发送绑定原Agent、VM实例和request_id的内部通知，确认任务真正结束才唤醒Driver重试finish_turn；迟到通知不能唤醒替换实例。不因错误已交付就假称推理退出，超时、根关闭和reply丢失保留各自分类。
 
-结果经oneshot交回MCL，再由Driver显式history_append；累积器不直接写历史。finished仅表示显示流终态，不替代oneshot或真实退出证明。
+结果经oneshot交回MCL，再由Driver显式history_append；累积器不直接写历史。生成分片使用agent.message.chunk.sync，字段为address、turn、generation、sequence和delta；delta含新增content或reasoning，两种内容共用同一次生成的sequence。
+
+生成终态使用agent.message.full.sync，带完整内部消息、同一generation、history_sequence=null及nullable error。成功消息包含完整正文、思考、工具调用、用量和停止原因；tool_calls使用tool_name及JSON文本arguments，与MCL内部AgentMessage一致。失败消息为type=error、message及request_id，外层error使用code/message。Inference不确认落库，因此message不带持久sequence、不填history_sequence，不另发旧finished消息。
+
+full不替代oneshot或真实退出证明。流/协议错误及时交付后仍等待worker真实清理；清理超预算若原reply已交付，再向同generation补发CleanupFailed完整error同步纠正状态，不重新回复或创建新生成。中止成功的full只保留接受门关闭前冻结的正文与思考，不能混入晚到分片。
 
 ## 预算
 

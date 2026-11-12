@@ -1621,6 +1621,7 @@ async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_
         fixture.app.world_mut().insert_component(
             workspace,
             workspace_core::Workspace {
+                definition: None,
                 name: "bundled-driver".into(),
                 definition_path: fixture.root.path().join("workspace.yaml"),
                 project_root: fixture.root.path().to_owned(),

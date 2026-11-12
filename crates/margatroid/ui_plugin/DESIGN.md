@@ -54,7 +54,7 @@ asset_handler(path: String) -> Future<Output = Response>
 前端，TypeScript伪代码：
 ```text
 handleServerMessage(message: ServerMessage): void
-    行为：校验网络形状并更新权威配置、实例及历史；delta先检查实例、request、sequence和冻结标记。
+    行为：校验网络形状并更新权威配置、实例及历史；delta按address、generation、sequence及冻结标记处理。
 
 startWorkspace(path: string): Promise<void>
     行为：发送workspace.start {path}，等待匹配回执，不上传展示缓存。
@@ -63,7 +63,7 @@ stopWorkspace(address: string): Promise<void>
     行为：发送workspace.stop，等待权威状态，不乐观删除实例。
 
 abortTurn(): Promise<void>
-    行为：立即冻结当前request/instance的流，发送agent.turn.abort；后端先清turn，再取消推理、强制return并清理未return工具，已return后台任务保留。受理ack不表示清理完成；保持Working直到权威sync确认Idle，不以长任务自然结束作为中止响应条件。
+    行为：立即冻结当前address/generation的流，发送agent.turn.abort；后端先清turn，再取消推理、强制return并清理未return工具，已return后台任务保留。受理ack不表示清理完成；保持Working直到权威sync确认Idle，不以长任务自然结束作为中止响应条件。
 
 sendUserMessage(): Promise<void>
     行为：固定当前目标；按INJECT及EFFECT wake契约发送，回执失败保留草稿，切换目标隔离迟到结果。
@@ -77,7 +77,7 @@ sendUserMessage(): Promise<void>
 ```text
 WorkspaceConfigDto：展示条目--path、cache
 WorkbenchState：权威快照--workspace_definitions、workspaces、agents、histories
-StreamState：显示累积--request、instance、sequence、content、reasoning、frozen
+StreamState：显示累积--address、generation、sequence、content、reasoning、frozen
 ComposerState：草稿--目标、文本、图片及等待回执状态
 ```
 
