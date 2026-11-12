@@ -103,8 +103,18 @@ fn original_websocket_can_query_inactive_workspaces_and_no_agents_after_last_sto
         "[server]\nbind='127.0.0.1:0'\n[outbound]\nlogs=['type:unmatched']\nbackend_state=['type:webui']\n").unwrap();
     // The route is configuration only. No user messages or inference effects
     // are submitted, and this test does not need a provider or external network.
+    let driver_model = agent_driver_core::read_driver(
+        &root
+            .path()
+            .join("agent-drivers/local/coder/latest/driver.toml"),
+        &Default::default(),
+    )
+    .unwrap()
+    .manifest
+    .inference
+    .model;
     std::fs::write(root.path().join("models.toml"),
-        "[[models]]\nid='openrouter/deepseek-v4.1-flash'\nmodel='unused'\nbase_url='http://127.0.0.1:1/v1'\napi_key='unused-local-test'\nprovider='openai'\napi_type='chat_completions'\ncontext_window='128k'\n").unwrap();
+        format!("[[models]]\nid={driver_model:?}\nmodel='unused'\nbase_url='http://127.0.0.1:1/v1'\napi_key='unused-local-test'\nprovider='openai'\napi_type='chat_completions'\ncontext_window='128k'\n")).unwrap();
     let mut daemon = Daemon(
         Command::new(std::env::current_exe().unwrap())
             .args([

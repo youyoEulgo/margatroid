@@ -3,21 +3,37 @@ pub(crate) struct TerminalOutput {
     history: String,
     previous: (String, bool),
     limit: usize,
+    resized: bool,
 }
 
 impl TerminalOutput {
-    pub(crate) fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize, rows: u16, cols: u16) -> Self {
         Self {
-            // One byte can complete a CSI scroll of up to 24 rows. An extra
-            // retained row lets scrollback offset 1 act as a scroll observer.
-            parser: vt100::Parser::new(24, 80, 25),
+            parser: vt100::Parser::new(rows, cols, usize::from(u16::MAX) + 1),
             history: String::new(),
             previous: (String::new(), false),
             limit,
+            resized: false,
         }
     }
 
+    pub(crate) fn resize(&mut self, rows: u16, cols: u16) -> std::io::Result<()> {
+        if rows == 0 || cols == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "terminal size must be nonzero",
+            ));
+        }
+        if self.parser.screen().size() != (rows, cols) {
+            self.parser.screen_mut().set_scrollback(0);
+            self.parser.screen_mut().set_size(rows, cols);
+            self.resized = true;
+        }
+        Ok(())
+    }
+
     pub(crate) fn process(&mut self, bytes: &[u8]) -> Result<(String, bool), std::io::Error> {
+        let (_, cols) = self.parser.screen().size();
         for byte in bytes {
             let screen = self.parser.screen_mut();
             let alternate = screen.alternate_screen();
@@ -34,7 +50,7 @@ impl TerminalOutput {
                 let count = screen.scrollback().saturating_sub(before);
                 for offset in (1..=count).rev() {
                     screen.set_scrollback(offset);
-                    let row = screen.rows(0, 80).next().unwrap_or_default();
+                    let row = screen.rows(0, cols).next().unwrap_or_default();
                     let separator = if screen.row_wrapped(0) { "" } else { "\n" };
                     if self
                         .history
@@ -61,21 +77,32 @@ impl TerminalOutput {
         } else {
             self.history.clone()
         };
-        text.push_str(&screen.contents());
+        if alternate {
+            let mut rows = screen.rows(0, cols).collect::<Vec<_>>();
+            while rows.last().is_some_and(String::is_empty) {
+                rows.pop();
+            }
+            text.push_str(&rows.join("\n"));
+        } else {
+            text.push_str(&screen.contents());
+        }
         if text.len() > self.limit {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "terminal transcript exceeds output/cache budget",
             ));
         }
-        let replace =
-            alternate || alternate != self.previous.1 || !text.starts_with(&self.previous.0);
+        let replace = self.resized
+            || alternate
+            || alternate != self.previous.1
+            || !text.starts_with(&self.previous.0);
         let value = if replace {
             text.clone()
         } else {
             text[self.previous.0.len()..].to_string()
         };
         self.previous = (text, alternate);
+        self.resized = false;
         Ok((value, replace))
     }
 }
@@ -86,7 +113,7 @@ mod tests {
 
     #[test]
     fn ordinary_scrolling_is_append_only_across_chunks() {
-        let mut terminal = TerminalOutput::new(8192);
+        let mut terminal = TerminalOutput::new(8192, 24, 80);
         let mut result = String::new();
         let mut expected = String::new();
         for index in 1..=80 {
@@ -111,7 +138,7 @@ mod tests {
                     }
                 })
                 .collect::<String>();
-            let mut terminal = TerminalOutput::new(8192);
+            let mut terminal = TerminalOutput::new(8192, 24, 80);
             let (text, replace) = terminal.process(input.as_bytes()).unwrap();
             assert!(!replace);
             assert_eq!(text, input.replace('\r', "").trim_end_matches('\n'));
@@ -123,7 +150,7 @@ mod tests {
     #[test]
     fn ansi_and_fragmented_utf8_are_rendered_without_escape_codes() {
         let input = "\x1b[31m你好\x1b[0m\r\n".repeat(80);
-        let mut terminal = TerminalOutput::new(8192);
+        let mut terminal = TerminalOutput::new(8192, 24, 80);
         let mut result = String::new();
         for byte in input.as_bytes() {
             let (text, replace) = terminal.process(&[*byte]).unwrap();
@@ -135,10 +162,10 @@ mod tests {
 
     #[test]
     fn wrapped_rows_and_multirow_scroll_keep_exact_content() {
-        let mut terminal = TerminalOutput::new(8192);
+        let mut terminal = TerminalOutput::new(8192, 24, 80);
         let long = "x".repeat(80 * 30 + 7);
         assert_eq!(terminal.process(long.as_bytes()).unwrap(), (long, false));
-        let mut terminal = TerminalOutput::new(8192);
+        let mut terminal = TerminalOutput::new(8192, 24, 80);
         let input = (1..=24)
             .map(|index| format!("line{index}\r\n"))
             .collect::<String>();
@@ -156,7 +183,7 @@ mod tests {
 
     #[test]
     fn real_overwrites_and_alternate_screen_still_replace() {
-        let mut terminal = TerminalOutput::new(8192);
+        let mut terminal = TerminalOutput::new(8192, 24, 80);
         assert_eq!(
             terminal.process(b"progress 1").unwrap(),
             ("progress 1".into(), false)
@@ -184,12 +211,80 @@ mod tests {
 
     #[test]
     fn history_budget_fails_explicitly_instead_of_dropping_rows() {
-        let mut terminal = TerminalOutput::new(128);
+        let mut terminal = TerminalOutput::new(128, 24, 80);
         let error = terminal
             .process("row\r\n".repeat(80).as_bytes())
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("budget"));
         assert!(terminal.history.len() <= 128);
+    }
+    #[test]
+    fn resized_tui_keeps_physical_rows_and_forces_complete_replacement() {
+        let mut terminal = TerminalOutput::new(32768, 24, 80);
+        terminal.process(b"initial").unwrap();
+        terminal.resize(40, 120).unwrap();
+        let border = "─".repeat(118);
+        let frame =
+            format!("\x1b[?1049h\x1b[2J\x1b[H┌{border}┐\x1b[39;1H└{border}┘\x1b[40;1HNow Playing");
+        let (text, replace) = terminal.process(frame.as_bytes()).unwrap();
+        assert!(replace);
+        let rows = text.split('\n').collect::<Vec<_>>();
+        assert_eq!(rows.len(), 40);
+        assert_eq!(rows[0], format!("┌{border}┐"));
+        assert_eq!(rows[38], format!("└{border}┘"));
+        assert_eq!(rows[39], "Now Playing");
+        terminal.resize(10, 30).unwrap();
+        let (text, replace) = terminal
+            .process(b"\x1b[2J\x1b[Hsmall\x1b[10;1Hbottom")
+            .unwrap();
+        assert!(replace);
+        let rows = text.split('\n').collect::<Vec<_>>();
+        assert_eq!(rows.len(), 10);
+        assert_eq!(rows[0], "small");
+        assert_eq!(rows[9], "bottom");
+    }
+
+    #[test]
+    fn alternate_screen_wraps_are_rows_while_plain_transcripts_remain_logical_lines() {
+        let mut terminal = TerminalOutput::new(8192, 24, 80);
+        let (text, replace) = terminal
+            .process(format!("\x1b[?1049h{}END", "x".repeat(80)).as_bytes())
+            .unwrap();
+        assert!(replace);
+        assert_eq!(text, format!("{}\nEND", "x".repeat(80)));
+        terminal.process(b"\x1b[?1049l").unwrap();
+        terminal.resize(40, 120).unwrap();
+        let line = "a".repeat(120);
+        let (text, replace) = terminal
+            .process(format!("\x1b[2J\x1b[H{line}tail").as_bytes())
+            .unwrap();
+        assert!(replace);
+        assert_eq!(text, format!("{line}tail"));
+        let (text, replace) = terminal.process(b"more").unwrap();
+        assert!(!replace);
+        assert_eq!(text, "more");
+    }
+
+    #[test]
+    fn tall_terminal_multirow_scrolling_preserves_all_lines() {
+        let mut terminal = TerminalOutput::new(32768, 24, 80);
+        terminal.resize(40, 120).unwrap();
+        let input = (1..=40)
+            .map(|index| format!("row{index:02}\r\n"))
+            .collect::<String>();
+        let (first, _) = terminal.process(input.as_bytes()).unwrap();
+        let (next, replace) = terminal.process(b"\x1b[40S").unwrap();
+        assert!(!replace);
+        let text = format!("{first}{next}");
+        for index in 1..=40 {
+            assert_eq!(
+                text.lines()
+                    .filter(|row| *row == format!("row{index:02}"))
+                    .count(),
+                1
+            );
+        }
+        assert!(terminal.resize(0, 120).is_err());
     }
 }

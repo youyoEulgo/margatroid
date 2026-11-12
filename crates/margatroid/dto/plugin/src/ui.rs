@@ -3,11 +3,10 @@ use agent_core::{Agent, AgentDriverSource};
 use agent_driver_core::{
     DriverUiBundle, DriverUiError, DriverUiState, open_driver_ui_watch, run_driver_ui_monitor,
 };
-use app_runtime_plugin::RuntimePlugin;
+use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::WorldAsyncExt;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use client_core::ClientFrame;
-use closure_plugin::WorldClosureExt;
 use core_plugin::World;
 use futures_util::FutureExt;
 use margatroid_protocol::*;
@@ -15,10 +14,7 @@ use std::{
     any::Any,
     collections::BTreeMap,
     panic::AssertUnwindSafe,
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, RwLock},
 };
 
 fn ui_error(value: DriverUiError) -> ProtocolErrorDto {
@@ -150,9 +146,6 @@ pub(crate) fn query_agent_ui(world: &World, object: Box<dyn Any + Send>) {
     })();
     handler::deliver(&request.reply, result);
 }
-fn wake_ui_frame(pending: Arc<AtomicBool>, _: &mut World) {
-    pending.store(false, Ordering::Release);
-}
 pub(crate) fn reconcile_ui_watches(world: &mut World) {
     let state = world
         .get_resource::<DtoState>()
@@ -189,8 +182,7 @@ pub(crate) fn reconcile_ui_watches(world: &mut World) {
                 let current = desired.get(entity);
                 if current.is_none_or(|(path, address)| {
                     path != &slot.manifest_path || address != &slot.address
-                }) || slot.watch.is_cancelled()
-                {
+                }) {
                     Some(*entity)
                 } else {
                     None
@@ -215,11 +207,9 @@ pub(crate) fn reconcile_ui_watches(world: &mut World) {
             &address,
             DriverUiState::Initializing,
         )));
-        let frame_pending = Arc::new(AtomicBool::new(false));
         let output = delivery.clone();
-        let pending = frame_pending.clone();
         let target = address.clone();
-        let frames = world.closure_sender(RuntimePlugin::UPDATE);
+        let events = world.event_sender();
         let lifetime = state.lifetime.clone();
         let (watch, monitor) = open_driver_ui_watch(
             manifest_path.clone(),
@@ -228,10 +218,20 @@ pub(crate) fn reconcile_ui_watches(world: &mut World) {
                     return;
                 }
                 let value = build_ui_delivery(&target, value);
-                *output.write().unwrap_or_else(|e| e.into_inner()) = value;
-                if !pending.swap(true, Ordering::AcqRel) {
-                    let pending = pending.clone();
-                    frames.send(move |world| wake_ui_frame(pending, world));
+                {
+                    let mut previous = output.write().unwrap_or_else(|e| e.into_inner());
+                    if previous.key == value.key {
+                        return;
+                    }
+                    *previous = value.clone();
+                }
+                if let Ok(message) = serde_json::from_str(value.frame.as_ref())
+                    && !lifetime.is_cancelled()
+                {
+                    events.send_event(WebSocketMessageSend {
+                        target: config_core::OutboundTarget::Broadcast,
+                        message,
+                    });
                 }
             }),
         );
@@ -248,7 +248,6 @@ pub(crate) fn reconcile_ui_watches(world: &mut World) {
                 address,
                 watch,
                 delivery,
-                frame_pending,
             },
         );
         world.send_async_closure(RuntimePlugin::UPDATE, move || run_ui_watch(context));

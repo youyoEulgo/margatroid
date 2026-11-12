@@ -230,9 +230,12 @@ pub fn append_message_history(
         .try_into()
         .map_err(write_err)?;
     db.execute_batch("BEGIN IMMEDIATE").map_err(write_err)?;
-    let result = messages
+    let result: Result<Vec<Value>, StorageError> = messages
         .iter()
         .map(|m| append(&db, m, turn, timestamp))
         .collect();
-    finish_transaction(&db, &state.retired, result)
+    let result = result.and_then(|value| Ok((value, pages::record_watermarks(&db)?)));
+    let (value, committed) = finish_transaction(&db, &state.retired, result)?;
+    publish_record_changes(state, committed);
+    Ok(value)
 }

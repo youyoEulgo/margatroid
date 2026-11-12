@@ -27,7 +27,7 @@ System分别列出事件、闭包结果、提交闭包及oneshot回复，使用R
 公开，定义于storage_core：
 ```text
 open_storage(database_path: &Path, settings_path: &Path, default_settings: &str) -> Result<AgentStorage, StorageError>
-    行为：打开Agent管理库及Block工作文件及快照管理器，验证管理库和已登记Block文件的目标schema与映射；settings不存在时以不覆盖方式写入默认模板，存在则读取并校验；返回共享句柄，不缓存消息正文。
+    行为：打开Agent管理库及Block工作文件及快照管理器，验证管理库和已登记Block文件的目标schema与映射；settings不存在时以不覆盖方式写入默认模板，存在则读取并校验；返回共享句柄，不缓存消息正文；用已有持久记录的真实最大sequence初始化record_changes通知值。
 
 execute_storage(storage: &AgentStorage, operation: StorageOperation) -> Result<StorageValue, StorageError>
     行为：
@@ -38,13 +38,14 @@ execute_storage(storage: &AgentStorage, operation: StorageOperation) -> Result<S
         跨文件来源不修改，失败不改目标，不宣称跨文件SQL写事务；普通写入不访问snapshot文件
         DropTemporaryBlocks仅移除temporary中指定VM的Block及内存快照，不读写管理库或文件；其余变体保持历史、日志和设置各自契约
         等待写入及必要清理确认后返回，不让旧工作连接绕过回档受理门；raw Connection不外借。
+        AppendHistory确认提交新增消息或MCL后调用publish_record_changes，使用本次实际提交的sequence；其余操作不触发记录更新通知。
 
 append_agent_log(storage: &AgentStorage, record: AgentLogRecord) -> Result<StoredAgentLog, StorageError>
     行为：
         同步执行独立日志写事务，与execute_storage共用连接管理器和串行锁
         校验level、source及JSON对象，缺省created_at_ms取真实写入时间
         以agent_logs自身MAX(sequence)+1分配序号，空表从1开始；超过SQLite整数范围返回错误
-        SQLite INTEGER PRIMARY KEY不使用AUTOINCREMENT；提交成功后返回已落库记录
+        SQLite INTEGER PRIMARY KEY不使用AUTOINCREMENT；提交成功后用新增日志真实sequence调用publish_record_changes，再返回已落库记录
         不写历史、不触发推理，不派发StorageRequest或System事件
         异步调用方克隆AgentStorage，在spawn_blocking中调用并等待真实join，不将排队视为成功
 
@@ -68,6 +69,9 @@ read_agent_log_page(storage: &AgentStorage, query: RecordRange) -> Result<Record
 read_record_watermarks(storage: &AgentStorage) -> Result<RecordWatermarks, StorageError>
     行为：在同一管理库读事务取得消息、MCL和Agent日志各表已提交最大sequence，空表为0；只返回事实，不创建记录、不增加本地序号。
 
+subscribe_record_changes(storage: &AgentStorage) -> RecordChanges
+    行为：取得共享管理库record_changes的独立watch接收端，当前值为已提交的三个真实高水位；只登记进程内观察者，不修改业务数据或发ECS事件。
+
 snapshot_block(storage: &AgentStorage, name: &str, instance: Option<&str>) -> Result<(), StorageError>
     行为：
         storage_core公开同步函数，阻塞执行到结果确认，不派发事件；异步调用者负责blocking worker及真实join
@@ -89,6 +93,7 @@ append_message_history(storage: &AgentStorage, messages: &[serde_json::Value], t
         取得管理连接锁并检查retired，BEGIN IMMEDIATE后逐条调用messages::append，全部完成才提交
         未带sequence按消息/MCL共享历史MAX分配真实序号；已有sequence校验实际消息记录一致则复用，不再追加
         返回带真实sequence的完整内部消息，错误回滚整个批次，不修改Block或MCL审计
+        仅在事务提交且实际新增消息时调用publish_record_changes；复用已有sequence的读取结果不产生更新通知。
 
 read_block_snapshots(storage: &AgentStorage, name: &str, instance: Option<&str>) -> Result<serde_json::Value, StorageError>
     行为：
@@ -117,6 +122,23 @@ restore_block(storage: &AgentStorage, name: &str, instance: Option<&str>, snapsh
         不覆盖任何已登记快照；恢复只能发布到已核验的固定工作路径，回收暂存文件前核对归属
         仅恢复指定Block的数据库及子项映射，不修改其他Block、历史、会话日志或设置
 
+
+私有，定义于storage_core：
+```text
+publish_record_changes(database: &DatabaseState, committed: RecordWatermarks)
+    行为：
+        在待提交事务内取得各表真实最大sequence，事务确认提交后才发布；仍持有同库串行锁，通知顺序与提交顺序一致。
+        用watch::Sender::send_if_modified在值实际变化时通知观察者；空批次、重复引用、读取、失败及回滚不通知。
+        单次通知可合并多次提交，持久sequence仍是数据读取依据。
+        本函数不读取记录页、不投递World事件、不访问ClientSender。
+
+page<T>(db: &Connection, table: &str, query: RecordRange, decode: impl Fn(&Connection, i64) -> Result<T, StorageError>) -> Result<RecordPage<T>, StorageError>
+    行为：
+        实际SQL统一为sequence > lower AND sequence upper_op upper；无after时lower=0，有before时upper_op为<，无before时upper为SQLite最大整数且upper_op为<=。
+        有after按ASC限量读取，无after按DESC取最近页，最终输出始终升序。
+        继续游标的EXISTS查询使用相同排他范围和主键边界；表名来自内部固定类别。
+        不使用可空OR谓词；范围条件由INTEGER PRIMARY KEY索引定位，空增量范围不扫描整表。
+```
 
 私有，定义于storage_core::blocks：
     initialize(db, root, retired)
@@ -238,6 +260,8 @@ AgentStorage：Agent持久存储，公开组件
     settings_lock: Arc<Mutex<()>>--私有，协调该文件读写
     impl Component for AgentStorage
     impl Clone for AgentStorage
+    same_database(&self, other: &Self) -> bool
+        行为：比较管理库共享状态Arc身份，供来源生命周期核对。
         行为：共享连接及设置锁，不复制数据；Driver与工具的host持有owned克隆作为日志能力，仅依赖storage_core；生命周期覆盖Driver及工具清理和最后一次日志写入的真实join，再释放句柄。
 ```
 
@@ -309,6 +333,7 @@ StorageTaskError：执行失败载荷--owner、原reply、StorageError
 DatabaseState：私有，定义于storage/core/src/types.rs
     connection: Mutex<Connection>--管理库连接同时作为Block串行受理门
     retired: AtomicBool
+    record_changes: tokio::sync::watch::Sender<RecordWatermarks>
     block_root: PathBuf--管理库完整路径追加.blocks
     temporary: Mutex<BTreeMap<(String,String),MemoryBlock>>--只保存实例内存内容与快照
 Mapping：私有，定义于storage/core/src/blocks.rs
@@ -345,7 +370,7 @@ MessageRow：私有，定义于storage/core/src/messages.rs
 
 StorageDatabase：不透明SQLite连接能力
     impl Clone
-        行为：共享管理库连接、Block工作文件及快照管理器、串行受理门及不可用标记，不公开Connection，不让调用方绕过timeline及回档受理门。
+        行为：共享管理库连接、Block工作文件及快照管理器、串行受理门、记录watch及不可用标记，不公开Connection，不让调用方绕过timeline及回档受理门。
 
 AgentLogLevel：日志级别，公开枚举
     Debug | Info | Warn | Error--数据库分别保存debug、info、warn、error
@@ -415,10 +440,12 @@ RecordPage<T>：有界读取结果，公开纯值类型
     next_before_sequence: Option<u64>--当前范围内仍有更早记录时为本页最小sequence
     next_after_sequence: Option<u64>--当前范围内仍有更新记录时为本页最大sequence
     行为：记录与游标由同一读事务确定；无对应方向剩余记录为None，空页不是查询失败。
+RecordChanges = tokio::sync::watch::Receiver<RecordWatermarks>
 RecordWatermarks：独立持久记录水位
     message: u64
     mcl: u64
     agent_log: u64
+    impl Clone + Copy + Debug + PartialEq + Eq
 
 StorageValue：存储成功值，公开枚举
     Unit

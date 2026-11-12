@@ -1302,6 +1302,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       tools: a.tools.map((t) => t.alias),
       sandbox: a.sandbox,
       sandboxes: a.sandboxes.map((sandbox) => sandbox.alias),
+      model: a.model,
       queued_commands: 0,
       pending_command: null,
       context_window_tokens: a.model?.context_window_tokens ?? null,
@@ -1402,7 +1403,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
                 ? message.message
                 : '',
           payload: message,
-          created_at_ms: 0,
+          created_at_ms: Date.now(),
         },
       ]);
     }
@@ -1763,6 +1764,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     historyCursors,
     selectedMclEntries,
     selectedSessionLogs,
+    selectedHistory,
+    selectedHistoryEntries,
     loadOlderHistory,
     queryRecords,
     endpoint,

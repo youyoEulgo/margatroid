@@ -128,7 +128,10 @@ pub fn open_storage(
             .execute_batch("PRAGMA foreign_keys=ON;")
             .map_err(write_err)?;
         initialize(&mut connection)?;
+        let (record_changes, _) =
+            tokio::sync::watch::channel(pages::record_watermarks(&connection)?);
         let shared = Arc::new(types::DatabaseState {
+            record_changes,
             block_root: {
                 let mut path = db_path.as_os_str().to_os_string();
                 path.push(".blocks");
@@ -299,8 +302,23 @@ pub fn execute_storage(
             "BEGIN IMMEDIATE"
         })
         .map_err(write_err)?;
-    let outcome = database_operation(&connection, operation);
-    finish_transaction(&connection, &storage.database.shared.retired, outcome)
+    let records = matches!(operation, StorageOperation::AppendHistory { .. });
+    let outcome = database_operation(&connection, operation).and_then(|value| {
+        Ok((
+            value,
+            if records {
+                Some(pages::record_watermarks(&connection)?)
+            } else {
+                None
+            },
+        ))
+    });
+    let (value, committed) =
+        finish_transaction(&connection, &storage.database.shared.retired, outcome)?;
+    if let Some(committed) = committed {
+        publish_record_changes(&storage.database.shared, committed);
+    }
+    Ok(value)
 }
 fn range(
     selection: MessageSelection,
@@ -598,4 +616,18 @@ fn atomic_write(path: &Path, bytes: &[u8], replace: bool) -> Result<(), StorageE
             .map_err(|e| err(K::CleanupFailed, format!("temporary cleanup failed: {e}")))?;
     }
     outcome
+}
+
+pub fn subscribe_record_changes(storage: &AgentStorage) -> RecordChanges {
+    storage.database.shared.record_changes.subscribe()
+}
+fn publish_record_changes(database: &types::DatabaseState, committed: RecordWatermarks) {
+    database.record_changes.send_if_modified(|current| {
+        if *current == committed {
+            false
+        } else {
+            *current = committed;
+            true
+        }
+    });
 }

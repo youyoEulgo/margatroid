@@ -215,16 +215,16 @@ fn clean_internal(value: &mut Value) {
         }
     }
 }
-fn history_record(v: storage_core::StoredHistoryRecord) -> Value {
+pub(crate) fn history_record(v: storage_core::StoredHistoryRecord) -> Value {
     let row = v.record;
     json!({"sequence":v.sequence,"turn":row.turn,"kind":"message","content":row.content,"payload":row.payload,"created_at_ms":row.created_at_ms.unwrap_or(0)})
 }
-fn mcl_record(v: storage_core::StoredHistoryRecord) -> Value {
+pub(crate) fn mcl_record(v: storage_core::StoredHistoryRecord) -> Value {
     let mut row = json!({"sequence":v.sequence,"turn":v.record.turn,"source":v.record.source.unwrap_or_default(),"content":v.record.content,"payload":v.record.payload,"created_at_ms":v.record.created_at_ms.unwrap_or(0)});
     clean_internal(&mut row["payload"]);
     row
 }
-fn log_record(v: storage_core::StoredAgentLog) -> Value {
+pub(crate) fn log_record(v: storage_core::StoredAgentLog) -> Value {
     let mut row = serde_json::to_value(v.record).unwrap();
     row["sequence"] = json!(v.sequence);
     clean_internal(&mut row["context_json"]);
@@ -922,9 +922,35 @@ pub(crate) fn recipients(
     }
     rows.into_iter().collect()
 }
-pub(crate) fn handle_outbound(world: &World, event: WebSocketMessageSend) {
-    for (c, s) in recipients(world, &[event.target]) {
-        enqueue(world, c, &s, event.message.clone());
+pub(crate) fn handle_outbound(world: &mut World, event: WebSocketMessageSend) {
+    if event.message["type"] == "agent.ui.sync" {
+        crate::ui::publish_ui(world);
+        return;
+    }
+    let sync_targets = world
+        .get_resource::<MargatroidConfig>()
+        .map(|config| config.backend_state().to_vec())
+        .unwrap_or_default();
+    let allowed = recipients(world, &sync_targets)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let Ok(message) = serde_json::from_value::<ServerMessage>(event.message) else {
+        return;
+    };
+    let Ok(text) = encode_server_message(&message) else {
+        return;
+    };
+    for (connection, sender) in recipients(world, &[event.target]) {
+        if !allowed.contains(&connection) {
+            continue;
+        }
+        if sender.try_send(ClientFrame::Text(text.clone())).is_err() {
+            world
+                .get_resource::<ConnState>()
+                .unwrap()
+                .cancel(connection);
+        }
     }
 }
 pub(crate) fn publish_state(world: &mut World) {
@@ -986,71 +1012,6 @@ pub(crate) fn publish_state(world: &mut World) {
                     .insert((connection.get(), key.clone()), value.clone());
             }
         }
-    }
-    world
-        .get_resource_mut::<SyncState>()
-        .unwrap()
-        .records
-        .retain(|entity, state| {
-            let keep = entities.contains(entity);
-            if !keep {
-                state.lock().unwrap().cancel.cancel();
-            }
-            keep
-        });
-    for entity in entities {
-        let Some(storage) = world.get_component::<AgentStorage>(entity).cloned() else {
-            continue;
-        };
-        let Some(address) = projection::address(world, entity) else {
-            continue;
-        };
-        let position = world
-            .get_resource_mut::<SyncState>()
-            .unwrap()
-            .records
-            .entry(entity)
-            .or_default()
-            .clone();
-        {
-            let mut state = position.lock().unwrap();
-            if state.running {
-                continue;
-            }
-            state.running = true;
-        }
-        let senders = senders.clone();
-        let connections = world.get_resource::<ConnState>().unwrap().clone();
-        world.send_async_closure(app_runtime_plugin::RuntimePlugin::UPDATE,move ||async move {
-            let result=tokio::task::spawn_blocking(move|| {
-                struct RunningGuard(Arc<Mutex<RecordPosition>>);
-                impl Drop for RunningGuard {fn drop(&mut self){self.0.lock().unwrap_or_else(|e|e.into_inner()).running=false;}}
-                let _guard=RunningGuard(position.clone());
-                let current=storage_core::read_record_watermarks(&storage).map_err(|e|DtoAsyncError(e.to_string()))?;
-                let (message_position,mcl_position,log_position,cancel)={
-                    let mut pos=position.lock().unwrap();
-                    if !pos.initialized {pos.message=current.message;pos.mcl=current.mcl;pos.log=current.agent_log;pos.initialized=true;return Ok(());}
-                    (pos.message,pos.mcl,pos.log,pos.cancel.clone())
-                };
-                if cancel.is_cancelled() || senders.is_empty(){return Ok(());}
-                let messages=storage_core::read_message_page(&storage,RecordRange{after_sequence:Some(message_position),before_sequence:None,limit:50}).map_err(|e|DtoAsyncError(e.to_string()))?;
-                let mcl=storage_core::read_mcl_page(&storage,RecordRange{after_sequence:Some(mcl_position),before_sequence:None,limit:50}).map_err(|e|DtoAsyncError(e.to_string()))?;
-                let logs=storage_core::read_agent_log_page(&storage,RecordRange{after_sequence:Some(log_position),before_sequence:None,limit:50}).map_err(|e|DtoAsyncError(e.to_string()))?;
-                let mut frames=Vec::new();
-                for row in &messages.records {frames.push(json!({"type":"agent.message.full.sync","address":address,"turn":row.record.turn,"generation":row.record.payload.get("request_id").and_then(Value::as_str),"history_sequence":row.sequence,"message":row.record.payload,"error":null}));}
-                if !mcl.records.is_empty(){frames.push(json!({"type":"agent.mcl.sync","address":address,"records":mcl.records.iter().cloned().map(mcl_record).collect::<Vec<_>>()}));}
-                if !logs.records.is_empty(){frames.push(json!({"type":"agent.log.sync","address":address,"records":logs.records.iter().cloned().map(log_record).collect::<Vec<_>>()}));}
-                for value in frames {if cancel.is_cancelled(){return Ok(());}let message:ServerMessage=serde_json::from_value(value).map_err(|e|DtoAsyncError(e.to_string()))?;let text=encode_server_message(&message).map_err(|e|DtoAsyncError(e.to_string()))?;
-                    for(connection,sender)in &senders {if sender.try_send(ClientFrame::Text(text.clone())).is_err(){connections.cancel(*connection);}}
-                }
-                let mut pos=position.lock().unwrap();
-                if let Some(row)=messages.records.last(){pos.message=row.sequence;}
-                if let Some(row)=mcl.records.last(){pos.mcl=row.sequence;}
-                if let Some(row)=logs.records.last(){pos.log=row.sequence;}
-                pos.running=false;Ok::<_,DtoAsyncError>(())
-            }).await;
-            result.map_err(|e|DtoAsyncError(e.to_string()))?
-        });
     }
 }
 pub(crate) async fn ws_handler(

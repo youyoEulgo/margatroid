@@ -2,6 +2,7 @@ schema_version = 1
 
 dependencies = [
     "tool:local/skill-register:latest",
+    "tool:local/mcp-register:latest",
     "prompt:local/reviewer-soul:latest",
     "prompt:local/compact:latest",
     "tool:local/list-directory:latest",

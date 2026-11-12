@@ -326,3 +326,51 @@ async fn normal_completion_preserves_detached_child() -> io::Result<()> {
     assert!(alive, "normal exec killed a detached descendant");
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn terminal_tracks_real_stty_resizes_and_preserves_tui_rows() {
+    let mut client = Client::new();
+    client
+        .send(json!({"operation":"terminal","max_output_bytes":32768}))
+        .await;
+    assert_eq!(client.recv().await["type"], "ready");
+    client.send(json!({"operation":"write","text":concat!(r"stty -echo; PS1=''; stty rows 40 cols 120; printf '\033[?1049h\033[2J\033[HWIDE\033[39;1HLOWER\033[40;120HZ'; read -r resize_continue; stty rows 10 cols 30; printf '\033[2J\033[HSMALL\033[10;30HQ'; read -r exit_continue; printf '\033[?1049l'; exit", "\r")})).await;
+    loop {
+        let value = client.recv().await;
+        assert_eq!(value["type"], "output", "{value}");
+        let text = value["text"].as_str().unwrap();
+        if text.starts_with("WIDE") && text.ends_with('Z') {
+            assert_eq!(value["replace"], true);
+            let rows = text.split('\n').collect::<Vec<_>>();
+            assert_eq!(rows.len(), 40);
+            assert_eq!(rows[38], "LOWER");
+            assert_eq!(rows[39], format!("{}Z", " ".repeat(119)));
+            break;
+        }
+    }
+    client
+        .send(json!({"operation":"write","text":"continue\r"}))
+        .await;
+    loop {
+        let value = client.recv().await;
+        assert_eq!(value["type"], "output", "{value}");
+        let text = value["text"].as_str().unwrap();
+        if text.starts_with("SMALL") && text.ends_with('Q') {
+            assert_eq!(value["replace"], true);
+            let rows = text.split('\n').collect::<Vec<_>>();
+            assert_eq!(rows.len(), 10);
+            assert_eq!(rows[9], format!("{}Q", " ".repeat(29)));
+            break;
+        }
+    }
+    client
+        .send(json!({"operation":"write","text":"exit\r"}))
+        .await;
+    loop {
+        if client.recv().await["type"] == "exit" {
+            break;
+        }
+    }
+    client.success().await;
+}

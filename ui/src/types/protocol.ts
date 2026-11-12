@@ -80,6 +80,7 @@ export interface AgentState {
   sandbox: string | null;
   tools: string[];
   sandboxes: string[];
+  model?: AgentModel | null;
   queued_commands: number;
   pending_command: string | null;
   context_window_tokens?: number | null;

@@ -54,18 +54,27 @@ exec(input: &mut Input, tx: &Frames, script: String, maximum: usize, terminal: b
 # pty
 
 ```text
+INITIAL_ROWS: u16 = 24
+INITIAL_COLS: u16 = 80
+
+dimensions(master: &Master) -> io::Result<(u16, u16)>
+    行为：TIOCGWINSZ读取实际PTY的行列数，失败或零尺寸明确报错。
+
+render(master: &Master, output: &mut TerminalOutput, bytes: &[u8]) -> io::Result<(String, bool)>
+    行为：读取实际尺寸，调用output.resize，再output.process。
+
 terminal(input: &mut Input, tx: &Frames, maximum: usize) -> Result<()>
     行为：
         持有child、共享PTY master和TerminalOutput
         child = bash --noprofile --norc -i
         并发推进：
             stdin Write：写入master
-            master读取：TerminalOutput.process，产生Output
+            master读取：render读取实际尺寸并同步解析器，产生Output
             child.wait：等待直接子进程退出
         child退出：
             取得master当前可读字节数
             将尚未提交的Output送入帧队列
-            排出这部分已有尾部字节并输出Output
+            排出这部分已有尾部字节，每次调用render同步实际尺寸并输出Output
             输出Exit
         EOF、close、信号或失败：终止进程组，等待child回收
 ```
@@ -78,11 +87,19 @@ TerminalOutput
     history: String
     previous: (text, alternate)
     limit: usize
+    resized: bool
+
+    new(limit: usize, rows: u16, cols: u16) -> Self
+        行为：以实际行列数初始化VT100解析器；滚动观察队列延迟分配，容量支持u16最大行数的一次多行滚动。
+
+    resize(&mut self, rows: u16, cols: u16) -> io::Result<()>
+        行为：校验非零尺寸，尺寸变化时调整parser.screen并记录resized。
 
     process(bytes) -> Result<(text, replace)>
         行为：
-            逐字节解析，观察滚动并追加history，渲染screen
-            alternate或覆写：返回replace
+            按当前列宽逐字节解析，观察滚动并追加history，渲染screen
+            alternate使用逐物理行画面，普通屏幕保留逻辑文本行
+            尺寸变化、alternate或覆写返回完整replace，交付后清resized
             前缀扩展：返回新增文本
             保留的完整转录超出limit：返回Error
 ```

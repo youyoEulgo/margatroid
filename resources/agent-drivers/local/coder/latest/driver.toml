@@ -2,6 +2,7 @@ schema_version = 1
 
 dependencies = [
     "tool:local/skill-register:latest",
+    "tool:local/mcp-register:latest",
     "prompt:local/coder-soul:latest",
     "prompt:local/compact:latest",
     "tool:local/list-directory:latest",
@@ -21,5 +22,5 @@ dependencies = [
 ]
 
 [inference]
-model = "openrouter/deepseek-v4.1-flash"
+model = "deepseek-v4.1-flash"
 temperature = 0.2

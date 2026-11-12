@@ -250,6 +250,19 @@ const tokenUsageItems = computed(() => {
   ];
 });
 
+const selectedModel = computed(() => selectedAgentState.value?.model ?? null);
+const modelTitle = computed(() => {
+  const model = selectedModel.value;
+  if (!model) return '';
+  const details = [
+    `${model.model} · ${model.provider}/${model.api_type}`,
+    `Context window: ${model.context_window_tokens.toLocaleString()} tokens`,
+    model.thinking ? `Thinking: ${model.thinking}` : '',
+    model.reasoning_effort ? `Reasoning effort: ${model.reasoning_effort}` : '',
+  ].filter(Boolean);
+  return details.join('\n');
+});
+
 const contextWindowUsage = computed(() => {
   const used = contextTokens.value;
   const maximum = contextWindowTokens.value;
@@ -1006,6 +1019,12 @@ const conversationRows = computed<ConversationRow[]>(() => {
                 : 'Sending; waiting for daemon acknowledgement…'
             }}</span>
             <span v-if="abortPending" class="abort-pending-label">Abort pending</span>
+            <span v-if="selectedModel" class="composer-model" :title="modelTitle">
+              <span class="composer-model-name">{{ selectedModel.model }}</span>
+              <span class="composer-model-context">{{
+                compactTokenNumber(selectedModel.context_window_tokens)
+              }}</span>
+            </span>
             <button
               v-if="selectedAgentWorking"
               class="send-button send-button--stop"

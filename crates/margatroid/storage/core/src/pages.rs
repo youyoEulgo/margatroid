@@ -39,6 +39,10 @@ fn bounds(query: RecordRange) -> Result<(Option<i64>, Option<i64>, i64), Storage
     ))
 }
 
+fn page_sql(table: &str, order: &str, upper_op: &str) -> String {
+    format!("SELECT sequence FROM {table} WHERE sequence>?1 AND sequence{upper_op}?2 ORDER BY sequence {order} LIMIT ?3")
+}
+
 fn page<T>(
     db: &Connection,
     table: &str,
@@ -47,19 +51,37 @@ fn page<T>(
 ) -> Result<RecordPage<T>, StorageError> {
     let (before, after, limit) = bounds(query)?;
     let order = if after.is_some() { "ASC" } else { "DESC" };
-    let mut ids = db.prepare(&format!("SELECT sequence FROM {table} WHERE (?1 IS NULL OR sequence<?1) AND (?2 IS NULL OR sequence>?2) ORDER BY sequence {order} LIMIT ?3")).map_err(read_err)?
-        .query_map(params![before,after,limit], |r|r.get::<_,i64>(0)).map_err(read_err)?
-        .collect::<rusqlite::Result<Vec<_>>>().map_err(read_err)?;
+    let lower = after.unwrap_or(0);
+    let upper = before.unwrap_or(i64::MAX);
+    let upper_op = if before.is_some() { "<" } else { "<=" };
+    let mut ids = db
+        .prepare(&page_sql(table, order, upper_op))
+        .map_err(read_err)?
+        .query_map(params![lower, upper, limit], |r| r.get::<_, i64>(0))
+        .map_err(read_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(read_err)?;
     ids.sort_unstable();
-    let exists = |id: i64, direction: &str| {
-        db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE sequence{direction}?1 AND (?2 IS NULL OR sequence<?2) AND (?3 IS NULL OR sequence>?3))"),params![id,before,after],|r|r.get::<_,bool>(0)).map_err(read_err)
+    let exists = |id: i64, earlier: bool| {
+        let (low, high, include_max) = if earlier {
+            (lower, id, false)
+        } else {
+            (id, upper, before.is_none())
+        };
+        let op = if include_max { "<=" } else { "<" };
+        db.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE sequence>?1 AND sequence{op}?2)"),
+            params![low, high],
+            |r| r.get::<_, bool>(0),
+        )
+        .map_err(read_err)
     };
     let next_before_sequence = match ids.first() {
-        Some(id) if exists(*id, "<")? => Some(*id as u64),
+        Some(id) if exists(*id, true)? => Some(*id as u64),
         _ => None,
     };
     let next_after_sequence = match ids.last() {
-        Some(id) if exists(*id, ">")? => Some(*id as u64),
+        Some(id) if exists(*id, false)? => Some(*id as u64),
         _ => None,
     };
     let records = ids
@@ -157,21 +179,47 @@ pub fn read_agent_log_page(
     })
 }
 
-pub fn read_record_watermarks(storage: &AgentStorage) -> Result<RecordWatermarks, StorageError> {
-    read(storage, |db| {
-        let max = |table: &str| {
-            db.query_row(
-                &format!("SELECT coalesce(max(sequence),0) FROM {table}"),
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(read_err)
-            .and_then(|n| u64::try_from(n).map_err(schema_err))
-        };
-        Ok(RecordWatermarks {
-            message: max("agent_messages")?,
-            mcl: max("mcl_records")?,
-            agent_log: max("agent_logs")?,
-        })
+pub(crate) fn record_watermarks(db: &Connection) -> Result<RecordWatermarks, StorageError> {
+    let max = |table: &str| {
+        db.query_row(
+            &format!("SELECT coalesce(max(sequence),0) FROM {table}"),
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(read_err)
+        .and_then(|n| u64::try_from(n).map_err(schema_err))
+    };
+    Ok(RecordWatermarks {
+        message: max("agent_messages")?,
+        mcl: max("mcl_records")?,
+        agent_log: max("agent_logs")?,
     })
+}
+pub fn read_record_watermarks(storage: &AgentStorage) -> Result<RecordWatermarks, StorageError> {
+    read(storage, record_watermarks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn actual_range_queries_use_primary_key_search_for_all_directions() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE agent_messages(sequence INTEGER PRIMARY KEY)")
+            .unwrap();
+        for order in ["ASC", "DESC"] {
+            for upper in ["<", "<="] {
+                let sql = page_sql("agent_messages", order, upper);
+                let plan = db
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap()
+                    .query_map(params![100, 200, 50], |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert!(plan.iter().any(|line|line.contains("SEARCH") && line.contains("INTEGER PRIMARY KEY")),"{plan:?}");
+                assert!(plan.iter().all(|line| !line.contains("SCAN")), "{plan:?}");
+            }
+        }
+    }
 }

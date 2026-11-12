@@ -1,6 +1,6 @@
 # DTO
 
-本文与DESIGN描述确认后的新API接入设计。DTO、领域回复、Protocol、CLI及前端已按该链路接通，运行产物需使用相应构建版本。agent.ui.req/res/sync及持续监控已在当前后端工作树实现。
+本文与DESIGN描述确认后的新API接入设计。DTO、领域回复、Protocol、CLI及前端已按该链路接通，运行产物需使用相应构建版本。agent.ui.req/res/sync及文件监控已有实现。本轮将同步调度改为“活动帧查询组件、持续异步监控按真实更新发事件”，本轮改造已落实到源码，当前运行进程仍需使用新构建。
 
 ## 请求与响应
 
@@ -16,11 +16,11 @@ DTO校验失败、同步查询完成或owned读取worker结束时，同样使用
 
 agent.turn.abort由网络Handler直接构造AbortTurnControl，abort_control_system在PRE_UPDATE完成连接、地址、实例、回合的校验及中止裁决，通过原oneshot返回。普通请求保持一帧DTO受理、一帧领域受理；业务IO及实际生命周期收口时间按操作本身计算。
 
-dto_sync_system每帧从实际Client组件按既定条件筛选并去重ClientSender。req/res和sync均是纯查询；command/result承担业务副作用。查询不建立接收关系，也不改变同步对象或发送条件。
+dto_sync_system同时处理WebSocketMessageSend、AgentException及监控退出诊断，并在每个活动帧执行同步领域查询。异步监控持有RuntimeEventSender，收到实际更新后发送WebSocketMessageSend；World侧按当次Client组件及同步投递条件筛选并去重ClientSender。req/res与sync保持业务数据只读，查询与接收关系独立。
 
-Workspace、Agent、Turn和Task读取当前投影并发送变化；Task取完整保留窗口，保留脚本cursor和replaced状态。消息、Agent日志与MCL按各表真实sequence识别新增条目；sync内部的读取位置仅服务观察进度，不修改持久记录。每帧接收者由当次筛选决定，查询页与sync读取位置独立。
+Workspace、Agent、Turn和Task读取当前投影并发送变化；Task取完整保留窗口，保留脚本cursor和replaced状态。消息、Agent日志与MCL按各表真实sequence识别新增条目；sync内部的读取位置仅服务观察进度，不修改持久记录。每帧或每次更新事件的接收者由当次筛选决定，查询页与sync读取位置独立。
 
-Worker在有界批次中读取记录，codec重建完整消息后直接编码并发送。读完且完成发送的部分才推进观察位置，失败保留实际进度。目标实例的取消能力由System逐帧核对后维护，退出实例的owned worker会停止继续投递。
+每个Agent实际存储建立一个持续记录监控。初始化从watch取得已提交基线一次，之后等待Storage的真实提交watch通知；有新增sequence才在有界批次中读取记录，非空页才发送WebSocketMessageSend。监控任务读完回到等待，不返回每批完成事件。异步监控不持有ClientSender快照；发送器只在World收到更新事件或活动帧发送组件变化时取得。
 
 ## 生命周期与定义
 
@@ -58,9 +58,9 @@ Agent查询及每帧sync当次遍历该Entity的Sandboxes，返回全部alias/pa
 
 当前共45种消息，包含agent.ui.req/res/sync。req使用普通DtoRequest字符串路由，在DTO帧校验目标、读取当前DriverUiWatch状态并通过网络创建的原oneshot回复。完整文件的base64及响应编码留在网络任务；query不创建watch，不读磁盘，不改变接收关系。
 
-AgentDriverSource保留运行Agent实际加载的清单位置。dto_sync_system保持当前数量和UPDATE调度，增加对这些来源的观察：新来源创建watch，来源替换或移除时取消原watch。每个Agent独立持有UiWatchSlot，以完整Entity及实际清单路径确认归属；旧monitor回调只更新旧slot，当前帧只发送当前索引中的delivery。
+AgentDriverSource保留运行Agent实际加载的清单位置。dto_sync_system保持当前数量和UPDATE调度，在活动帧中核对这些来源：新来源才创建watch，来源替换或移除时取消原watch。每个Agent独立持有UiWatchSlot，以完整Entity及实际清单路径确认归属；World收到更新后复核当前来源及缓存，迟到旧来源不能替换当前UI。
 
-monitor在普通异步执行设施中驱动notify及blocking文件读取，稳定结果在worker中完成协议投影、base64及JSON编码。状态发布后通过已安装UPDATE的WorldClosureSender提交wake_ui_frame轻量通知，既有ClosureRequest使事件驱动循环推进，并在该帧按当前符合条件的ClientSender发送UI变化。文件连续写入使用100ms安静窗口，失败和恢复均形成可识别状态。纯查询和文件系统观察均保持业务数据只读。
+monitor在普通异步执行设施中驱动notify及blocking文件读取，稳定结果在worker中完成协议投影、base64及JSON编码。稳定初始状态或UI内容、错误状态实际变化后发送WebSocketMessageSend，事件自然唤醒帧，接收System按当前符合条件的ClientSender发送；活动帧同时读取UI缓存服务新接收者，并按已交付版本去重。文件连续写入使用100ms安静窗口，失败和恢复均形成可识别状态。纯查询和文件系统观察均保持业务数据只读。
 
 UI目录删除时发送ui=null/error=null；读取错误发送ui=null及error，前端保留最后成功页面。完整集合超过32MiB网络预算时交付DriverUiTooLarge。初始化未就绪返回AgentUiNotReady。类型转换、错误码及网络字段由Protocol设计与WS_API共同定义。
 
@@ -68,4 +68,16 @@ UI目录删除时发送ui=null/error=null；读取错误发送ui=null及error，
 
 实现保持现有三个DTO System及领域事件集合；扩展dto_route_system的UI查询分支及dto_sync_system的观察职责，相关支持类型已列入原有设计板块。验证应覆盖首次读取、目录缺失/出现/删除、文件增删改、编译写入合并、错误恢复、来源替换、断连与重新符合发送条件、预算错误、路径越界及关停真实退出。
 
-UI帧通知复用现有ClosureRequest及ClosureSystem，合并标记只记录通知是否在途；它不是查询结果中转，UI查询仍沿原oneshot直接返回。DTO使用closure_plugin的生产依赖，不修改mecs运行机制。
+UI监控直接复用WebSocketMessageSend；UI查询继续沿原oneshot直接返回。启动监控使用现有异步设施，启动条件是出现新的来源，不是每帧或上一批读取结束。
+
+## 同步事件约束
+
+禁止无条件事件：某个System没有输入事件触发，也没有实际更新或新来源等条件，却每次运行都必然产生事件。事件处理分支收到输入本身已有条件，活动帧观察分支则必须依据实际变化决定是否有产出。
+
+禁止事件循环：处理A产生A而持续驱动自身，以及“每帧调查→完成事件→再次调查”的间接反馈。监控等待的是新的持久提交或文件变化，不是自己的读取完成。
+
+WebSocketMessageSend保留target和message字段，异步监控更新使用Broadcast作为候选目标，World侧与当前同步配置取交集并按连接去重。handle_outbound直接编码及发送，不回发相同事件。组件投影的比较与直接网络发送也不派生新的ECS工作。
+
+自然活动帧与真实异步变化事件可以推动同步。初始化只建立一次观察状态；相同错误的内部重试只等待/读取，不重复制造状态事件。监控退出结果只用于生命周期和诊断，不因其到达而再启动监控。
+
+验收需验证：两个ready Agent且无新增记录时线程、SQL读取及事件计数停止增长；一次提交只推动有限帧；重复内容和空页不产生事件；UI实际变化仍能从空闲自然唤醒；发送使用当次World接收者；取消等待真实worker结束。范围SQL已验证主键SEARCH，覆盖空增量、单界、双界及双向分页。

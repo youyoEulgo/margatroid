@@ -20,7 +20,7 @@ stdout、stderr 分别保留最多 max_output_bytes 原始字节，超出后继�
 {"operation":"terminal","max_output_bytes":65536}
 ```
 
-Linux 创建 24×80 PTY 并启动 `bash --noprofile --norc -i`，TERM 为 xterm-256color。先输出 `{"type":"ready"}`，随后连续输出 `{"type":"output","text":"...","replace":false}`。调用方按 replace 决定替换或追加整个当前转录。普通屏幕保留滚动历史，alternate screen 使用当前屏幕。屏幕或历史超预算输出 error，不丢弃旧行。
+Linux以24行×80列初始化PTY并启动 `bash --noprofile --norc -i`，TERM 为 xterm-256color。先输出 `{"type":"ready"}`，随后连续输出 `{"type":"output","text":"...","replace":false}`。调用方按 replace 决定替换或追加整个当前转录。每次读取输出及排出退出尾部数据时，先用TIOCGWINSZ取得实际PTY行列数，再同步VT100解析器；stty改变尺寸后首个输出完整替换。普通屏幕保留滚动历史及逻辑文本行，alternate screen按实际列宽逐物理行导出当前画面，保留行间边界。屏幕或历史超预算输出 error，不丢弃旧行。
 
 后续 stdin 接受 `{"operation":"write","text":"ls\r"}` 或 `{"operation":"close"}`。write 原样发送，不添加回车。直接 shell 退出后，仅排出当时 PTY 缓冲区已有的尾部字节，不等待持有 slave 的后台进程关闭。结束帧为 `{"type":"exit","eof":true,"exit_code":0}`，信号终止时 exit_code 为 null，exit 是最后一帧。
 
@@ -32,3 +32,5 @@ Linux 创建 24×80 PTY 并启动 `bash --noprofile --norc -i`，TERM 为 xterm-
 
 
 当前依赖边界：list-directory、glob、grep、write-file改用通用files、text和data能力，不再携带shell.lua或本bin。Bash和Bash Exec继续使用本程序承担实际shell、PTY及终端行为。文件工具不再打包本bin，Shell协议和终端行为保持原有语义。
+
+终端尺寸同步只跟随PTY的实际值，不引入新的网络resize接口。已运行shell-client进程继续执行原版本；修复在新构建的helper进程中生效。浏览器面板宽高仍由前端独立处理。
