@@ -103,6 +103,37 @@ pub(crate) fn agents(world: &World) -> Vec<AgentStateDto> {
                             .collect()
                     })
                     .unwrap_or_default(),
+                sandboxes: world
+                    .get_component::<sandbox_resource_core::Sandboxes>(entity)
+                    .map(|sandboxes| {
+                        sandboxes
+                            .iter()
+                            .map(|(alias, path)| AgentSandboxDto {
+                                alias: alias.clone(),
+                                path: path.to_string_lossy().into_owned(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                sandbox: world
+                    .get_component::<sandbox_resource_core::SelectedSandbox>(entity)
+                    .and_then(|sandbox| sandbox.alias.clone()),
+                model: world
+                    .get_component::<inference_core::AgentInferenceConfig>(entity)
+                    .and_then(|config| {
+                        let route = world
+                            .get_resource::<inference_core::ModelRoutes>()?
+                            .get(&config.parameters.model)?;
+                        Some(AgentModelDto {
+                            id: config.parameters.model.clone(),
+                            model: route.model.clone(),
+                            provider: route.provider.clone(),
+                            api_type: route.api_type.clone(),
+                            context_window_tokens: route.context_window_tokens,
+                            thinking: route.thinking.clone(),
+                            reasoning_effort: route.reasoning_effort.clone(),
+                        })
+                    }),
                 error: world
                     .get_resource::<crate::types::SyncState>()
                     .and_then(|state| state.errors.get(&entity))

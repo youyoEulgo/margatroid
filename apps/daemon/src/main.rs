@@ -33,7 +33,17 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         data_root: PathBuf::from(home).join(".margatroid"),
         runner_path: std::env::current_exe()?,
     };
+    eprintln!(
+        "margatroid-daemon: starting (data directory: {})",
+        options.data_root.display()
+    );
     let mut app = build_app(options)?;
+    let server = app
+        .world()
+        .get_resource::<axum_plugin::AxumHandle>()
+        .expect("Axum service installed")
+        .clone();
+    let reported = std::cell::Cell::new(false);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -48,7 +58,27 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _entered = runtime.enter();
         listen_for_shutdown(stopping.clone(), handle)?
     };
-    app.run_until(|| stopping.load(Ordering::Acquire));
+    app.run_until(|| {
+        if stopping.load(Ordering::Acquire) || server.is_stopped() {
+            return true;
+        }
+        if let Some(address) = server.local_address().filter(|_| !reported.get()) {
+            let browser_address = match address.ip() {
+                std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+                    std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, address.port()))
+                }
+                std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+                    std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, address.port()))
+                }
+                _ => address,
+            };
+            eprintln!("margatroid-daemon: started successfully (listening on {address})");
+            eprintln!("Webui:  http://{browser_address}/");
+            eprintln!("WebSocket: ws://{browser_address}/ws");
+            reported.set(true);
+        }
+        false
+    });
     let shutdown = runtime.block_on(async {
         let result = loop {
             match compose::shutdown_app(&mut app).await {

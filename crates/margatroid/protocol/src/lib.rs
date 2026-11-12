@@ -394,7 +394,7 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                     if expected == "workspace" {
                         &["address", "error"]
                     } else {
-                        &["error"]
+                        &["sandboxes", "sandbox", "model", "error"]
                     },
                 )?;
                 if expected == "workspace" {
@@ -438,6 +438,9 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                         )
                     ) {
                         return Err(invalid("invalid active agent status"));
+                    }
+                    if let Some(model) = item.get("model").filter(|value| !value.is_null()) {
+                        require_fields(model, &["thinking", "reasoning_effort"])?;
                     }
                     if let Some(tools) = item.get("tools").and_then(Value::as_array) {
                         for tool in tools {

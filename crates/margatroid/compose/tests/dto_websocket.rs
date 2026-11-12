@@ -1047,7 +1047,7 @@ fn original_mcl_reply_keeps_request_identity_and_invalid_input_never_echoes_secr
 }
 
 #[test]
-fn agent_projection_preserves_all_tool_attributes_and_excludes_other_domains() {
+fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
     use sandbox_resource_core::{Sandboxes, SelectedSandbox};
     use tool_resource_core::{ToolEntry, Tools};
     let mut harness = Harness::new();
@@ -1095,6 +1095,36 @@ fn agent_projection_preserves_all_tool_attributes_and_excludes_other_domains() {
             alias: Some("read_only".into()),
         },
     );
+    harness.app.world_mut().insert_component(
+        harness.agent,
+        inference_core::AgentInferenceConfig {
+            parameters: inference_core::InferenceParameters {
+                model: "display-route".into(),
+                temperature: None,
+                max_output_tokens: None,
+                top_p: None,
+                stop: vec![],
+            },
+        },
+    );
+    harness
+        .app
+        .world_mut()
+        .insert_resource(inference_core::ModelRoutes {
+            entries: std::collections::BTreeMap::from([(
+                "display-route".into(),
+                inference_core::ModelRoute {
+                    model: "display-model".into(),
+                    provider: "openai".into(),
+                    api_type: "responses".into(),
+                    base_url: "https://private-endpoint.invalid".into(),
+                    api_key: "private-model-key".into(),
+                    context_window_tokens: 8192,
+                    thinking: Some("enabled".into()),
+                    reasoning_effort: Some("high".into()),
+                },
+            )]),
+        });
     let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "resource-panel");
     harness.request(&mut socket, "agent.req", "resources", json!({}));
@@ -1125,12 +1155,75 @@ fn agent_projection_preserves_all_tool_attributes_and_excludes_other_domains() {
         assert!(tool["owner_task_id"].is_null());
         assert!(tool["binding"].is_null());
     }
-    assert!(agent.get("sandboxes").is_none() && agent.get("sandbox").is_none());
+    assert_eq!(
+        agent["sandboxes"],
+        json!([{"alias":"read_only","path":harness.root.path().join("private/read-only/policy.json")} ])
+    );
+    assert_eq!(agent["sandbox"], "read_only");
+    assert_eq!(
+        agent["model"],
+        json!({"id":"display-route","model":"display-model","provider":"openai","api_type":"responses","context_window_tokens":8192,"thinking":"enabled","reasoning_effort":"high"})
+    );
+    assert!(!state.to_string().contains("private-model-key"));
+    assert!(!state.to_string().contains("private-endpoint"));
     assert!(
         agent.get("turn").is_none()
             && agent.get("tasks").is_none()
             && agent.get("histories").is_none()
     );
+    harness.collect(&mut socket, 5);
+    let changed_path = harness.root.path().join("changed/read-only.toml");
+    let added_path = harness.root.path().join("changed/write.toml");
+    let sandboxes = harness
+        .app
+        .world_mut()
+        .get_component_mut::<Sandboxes>(harness.agent)
+        .unwrap();
+    sandboxes.insert("read_only".into(), changed_path.clone());
+    sandboxes.insert("write".into(), added_path.clone());
+    harness
+        .app
+        .world_mut()
+        .get_component_mut::<SelectedSandbox>(harness.agent)
+        .unwrap()
+        .alias = None;
+    harness
+        .app
+        .world_mut()
+        .get_resource_mut::<inference_core::ModelRoutes>()
+        .unwrap()
+        .entries
+        .get_mut("display-route")
+        .unwrap()
+        .context_window_tokens = 16384;
+    let sync = harness.next(&mut socket, |value| {
+        value["type"] == "agent.sync"
+            && value["agents"][0]["model"]["context_window_tokens"] == 16384
+    });
+    assert_eq!(
+        sync["agents"][0]["sandboxes"],
+        json!([{"alias":"read_only","path":changed_path},{"alias":"write","path":added_path}])
+    );
+    assert!(sync["agents"][0]["sandbox"].is_null());
+    assert!(!sync.to_string().contains("private-model-key"));
+    harness.request(&mut socket, "agent.req", "updated-resources", json!({}));
+    let updated = harness.next(&mut socket, |value| value["id"] == "updated-resources");
+    assert_eq!(updated["agents"], sync["agents"]);
+    harness
+        .app
+        .world_mut()
+        .remove_component::<Sandboxes>(harness.agent);
+    harness
+        .app
+        .world_mut()
+        .remove_component::<inference_core::AgentInferenceConfig>(harness.agent);
+    let cleared = harness.next(&mut socket, |value| {
+        value["type"] == "agent.sync" && value["agents"][0]["sandboxes"] == json!([])
+    });
+    assert!(cleared["agents"][0]["model"].is_null());
+    harness.request(&mut socket, "agent.req", "cleared-resources", json!({}));
+    let query = harness.next(&mut socket, |value| value["id"] == "cleared-resources");
+    assert_eq!(query["agents"], cleared["agents"]);
 }
 
 #[test]

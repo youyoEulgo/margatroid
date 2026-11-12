@@ -43,7 +43,7 @@ req/res与sync是无业务副作用的纯查询；command/result承载有副作�
 
 workspace.req/res/sync反映全部已扫描Workspace，包括未激活项。每项统一包含path、definition、status、nullable address及自身error。definition中的name、project_root、agents是结构化文件定义，不重复平铺字段；定义成员只含name/driver/home_root，不附带成员状态或member_failures。当前扫描定义可能不同于运行实例启动时使用的定义，reload不会重启实例。
 
-agent.req/res/sync只反映实际已激活实例，包含address、workspace、status、完整tools及error，不为未激活定义成员生成占位项。后端通过Agent地址解析完整Entity并读取组件，VM生命周期标识只供内部使用。tools保留Tools的全部alias、path、description、input_schema、nullable owner_task_id及binding，静态和动态记录使用同一结构。
+agent.req/res/sync只反映实际已激活实例，包含address、workspace、status、完整tools、sandboxes、sandbox、model及error，不为未激活定义成员生成占位项。后端通过Agent地址解析完整Entity并读取组件，VM生命周期标识只供内部使用。tools保留Tools的全部alias、path、description、input_schema、nullable owner_task_id及binding，静态和动态记录使用同一结构。
 
 回合、任务、历史、会话日志、MCL记录与生成流均不塞入Agent状态对象。agent.turn提供指定实例的当前turn，空闲为null。agent.task查询与主动同步都是指定实例的完整活跃任务集合和各任务完整保留输出窗口；包含未return及已return未finish任务，不使用分块、输出追加补丁或removed列表。
 
@@ -88,3 +88,5 @@ ServerMessage的Serialize与Deserialize共同校验成功/失败分支；成功�
 扫描来源已移除的运行Workspace继续展示其已知定义及真实状态，只允许停止。启动或重启必须在本次全量重载缓存中找到目标定义。sync的ClientSender每帧依据既定条件取得，查询不改变接收范围。
 
 外部字段统一使用Agent Address。MCL审计payload及Agent日志context_json只投影业务关联，VM生命周期标识在后端保留。网络投影在编码前移除内部VM标识。
+
+Agent的sandboxes每次从该Entity的Sandboxes组件遍历，包含alias及path；sandbox来自SelectedSandbox。model由AgentInferenceConfig关联当前ModelRoutes，包含id、model、provider、api_type、context_window_tokens及可空thinking/reasoning_effort；配置或路由缺失为null。agent.req和每帧sync使用同一实时投影，模型端点和凭据保留在后端。

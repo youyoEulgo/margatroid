@@ -104,7 +104,7 @@ projection::workspaces(world: &World) -> Vec<WorkspaceInfoDto>
     行为：合并已发布定义与运行组件；来源移除项使用Workspace.definition，WorkspaceFailure投影为error。
 
 projection::agents(world: &World) -> Vec<AgentStateDto>
-    行为：读取激活Agent、完整Tools和故障投影，仅输出Agent Address及业务字段。
+    行为：每次调用从Agent Entity读取Tools并遍历Sandboxes，读取SelectedSandbox；以AgentInferenceConfig的model关联ModelRoutes，投影模型ID、名称、provider、api_type、上下文窗口和思考选项，读取故障。缺失沙箱返回空数组，未选择返回null，配置或路由缺失时model为null。
 
 projection::turn(world: &World, entity: Entity) -> Option<AgentTurnStateDto>
     行为：读取Agent地址与当前turn。

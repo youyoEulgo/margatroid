@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 compose = { path = "../../crates/margatroid/compose" }
 app_runtime_plugin = { path = "../../crates/mecs/app_runtime_plugin" }
+axum_plugin = { path = "../../crates/margatroid/axum_plugin" }
 tool_plugin = { path = "../../crates/margatroid/tool/plugin" }
 tokio = { workspace = true }
 

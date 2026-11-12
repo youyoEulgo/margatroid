@@ -1022,7 +1022,7 @@ const conversationRows = computed<ConversationRow[]>(() => {
                 <span>Sandbox</span>
                 <span>{{ sandboxOptions.options.length }}</span>
               </div>
-              <div v-if="sandboxOptions.available" class="tool-resource-list">
+              <div class="tool-resource-list">
                 <div
                   v-for="choice in sandboxChoices"
                   :key="choice.value || 'none'"
@@ -1054,9 +1054,6 @@ const conversationRows = computed<ConversationRow[]>(() => {
                   </button>
                 </div>
               </div>
-              <p v-if="!sandboxOptions.available" class="tool-resource-empty">
-                Sandbox runtime selection is unavailable here. Use the Driver MCL controls.
-              </p>
             </section>
 
             <section class="tool-resource-group">

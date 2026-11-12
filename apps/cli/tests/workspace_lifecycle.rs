@@ -57,7 +57,7 @@ async fn exercise_member_failure(shutdown_during_startup: bool) {
             assert!(child.try_wait().unwrap().is_none());
         }
         socket.send(Message::Text(json!({"type":"workspace.start.result","id":start["id"],"success":true}).to_string().into())).await.unwrap();
-        socket.send(Message::Text(json!({"type":"agent.sync","agents":[{"address":"agent:cli-test/reviewer:latest","workspace":"workspace:local/runtime-address:latest","status":"failed","tools":[],"error":{"code":"StartFailed","message":"driver:local/reviewer:latest cannot inspect /missing/agent-drivers/local/reviewer/latest"}}]}).to_string().into())).await.unwrap();
+        socket.send(Message::Text(json!({"type":"agent.sync","agents":[{"address":"agent:cli-test/reviewer:latest","workspace":"workspace:local/runtime-address:latest","status":"failed","tools":[],"sandboxes":[],"sandbox":null,"model":null,"error":{"code":"StartFailed","message":"driver:local/reviewer:latest cannot inspect /missing/agent-drivers/local/reviewer/latest"}}]}).to_string().into())).await.unwrap();
         socket.send(Message::Text(json!({"type":"workspace.start.result","id":start["id"],"success":false,"error":{"code":"Stale","message":"late duplicate result"}}).to_string().into())).await.unwrap();
         if !shutdown_during_startup {
             socket.send(Message::Ping(vec![7, 8].into())).await.unwrap();

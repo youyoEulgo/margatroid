@@ -1004,7 +1004,27 @@ pub struct AgentStateDto {
 
     pub status: String,
     pub tools: Vec<AgentToolDto>,
+    pub sandboxes: Vec<AgentSandboxDto>,
+    pub sandbox: Option<String>,
+    pub model: Option<AgentModelDto>,
     pub error: Option<ProtocolErrorDto>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSandboxDto {
+    pub alias: String,
+    pub path: String,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentModelDto {
+    pub id: String,
+    pub model: String,
+    pub provider: String,
+    pub api_type: String,
+    pub context_window_tokens: u64,
+    pub thinking: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

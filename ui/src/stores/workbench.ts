@@ -4,8 +4,6 @@ import {
   parseServerMessage,
   isRecord,
   isAgentMessage,
-  isMclError,
-  errorMessage,
   type AgentHistory,
   type AgentMessage,
   type AgentState,
@@ -20,7 +18,7 @@ import {
   type WorkspaceReference,
   type UserImage,
   type WorkspaceSnapshot,
-  type AgentSnapshot,
+  type AgentInfo,
   type TaskSnapshot,
   type AgentTool,
   type AgentLogRecord,
@@ -31,6 +29,17 @@ import {
 import { randomId } from '@/lib/id';
 
 export type ConnectionStatus = 'offline' | 'connecting' | 'online';
+const COMMAND_RESULT: Partial<Record<ClientMessage['type'], ServerMessage['type']>> = {
+  'workspace.start': 'workspace.start.result',
+  'workspace.stop': 'workspace.stop.result',
+  'workspace.restart': 'workspace.restart.result',
+  'workspace.reload': 'workspace.reload.result',
+  'agent.start': 'agent.start.result',
+  'agent.stop': 'agent.stop.result',
+  'agent.restart': 'agent.restart.result',
+  'agent.turn.abort': 'agent.turn.abort.result',
+  'mcl.execute': 'mcl.execute.result',
+};
 export type MessageRole = 'system' | 'user' | 'assistant' | 'tool' | 'error' | 'record';
 export interface ToolResult {
   content: string;
@@ -84,10 +93,7 @@ interface PendingCommand {
   target?: Target;
   read?: boolean;
   turn?: string;
-}
-interface MclCommandFailure extends Error {
-  requestId?: string;
-  agentMessage?: unknown;
+  expectedType?: ServerMessage['type'];
 }
 interface AbortGuard extends Target {
   id: string;
@@ -399,7 +405,10 @@ export function buildSidebarModel(
         };
       });
       const reason =
-        agents.find((agent) => agent.reason)?.reason || instance?.member_failures?.[0]?.error || '';
+        agents.find((agent) => agent.reason)?.reason ||
+        instance?.error?.message ||
+        instance?.member_failures?.[0]?.error ||
+        '';
       const status: TreeStatus = reason
         ? 'error'
         : instance?.status === 'running' && agents.every((agent) => agent.status === 'running')
@@ -447,7 +456,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const connectionError = ref('');
   const registeredClient = ref<ClientInfo | null>(null);
   const workspaceSnapshots = ref<WorkspaceSnapshot[]>([]);
-  const activeAgentSnapshots = ref<AgentSnapshot[]>([]);
+  const activeAgentInfos = ref<AgentInfo[]>([]);
   const turnStates = ref(new Map<string, string | null>());
   const taskStates = ref(new Map<string, TaskSnapshot[]>());
   const toolDefinitions = ref(new Map<string, AgentTool[]>());
@@ -478,19 +487,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     { workspace: string; agent: string; content: string; images: UserImage[] }
   >();
   const resourceWritePending = ref('');
-  const savedSandboxSettings = ref(new Map<string, string[]>());
   const resourceWriteInFlight = computed(() => !!resourceWritePending.value);
   // Tools are advertised by the Agent state and are read-only in this panel.
   const toolOptions = computed(() => selectedAgentState.value?.tools ?? []);
   const sandboxOptions = computed(() => ({
     options: selectedAgentState.value?.sandboxes ?? [],
-    activated: [],
-    available: false,
-    configured: selectedAgentState.value
-      ? (savedSandboxSettings.value.get(
-          `${selectedAgentState.value.agent}`,
-        ) ?? null)
-      : null,
+    activated: selectedAgentState.value?.sandbox ? [selectedAgentState.value.sandbox] : [],
   }));
   let socket: WebSocket | null = null;
   let registrationId = '';
@@ -795,7 +797,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         JSON.stringify({
           type: 'connection.register',
           id: registrationId,
-          message: { client_type: 'webui' },
+          message: { client_type: 'webui', name: `webui-${randomId()}` },
         } satisfies ClientMessage),
       );
     };
@@ -907,6 +909,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         target,
         read,
         turn: request.type === 'agent.turn.abort' ? request.message.turn : undefined,
+        expectedType: COMMAND_RESULT[request.type],
       });
       try {
         socket!.send(JSON.stringify(request));
@@ -961,24 +964,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (resourceTargetSnapshot(currentTarget(false)) !== snapshot)
       throw new Error('Selected agent changed during resource settings update');
   }
-  async function readSandboxSettings(): Promise<void> {
-    const target = currentTarget()!;
-    const result = await executeFor(target, 'CONFIG GET');
-    if (!matchesTarget(target)) throw new Error('Agent instance changed before settings were read');
-    if (!isRecord(result) || !isRecord(result.Config))
-      throw new Error('CONFIG GET did not return settings');
-    const values = result.Config.sandbox;
-    if (Array.isArray(values) && values.every((v) => typeof v === 'string'))
-      savedSandboxSettings.value = new Map(savedSandboxSettings.value).set(
-        targetKey(target),
-        values,
-      );
-  }
   async function setSandbox(alias: string | null): Promise<void> {
-    if (!sandboxOptions.value.available)
-      throw new Error(
-        'Sandbox runtime selection is unavailable in this API; use Driver MCL controls',
-      );
     if (resourceWritePending.value) throw new Error('Wait for the current sandbox request');
     const target = currentTarget()!;
     const snapshot = resourceTargetSnapshot(target);
@@ -999,8 +985,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       queryState();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      // Saved and applied are separate steps: re-read both so the panel shows
-      // the actual persisted value and the actual running sandbox.
+      // Save and apply are separate steps; refresh the authoritative Agent
+      // snapshot so the panel shows what actually runs.
       queryState();
       throw new Error(
         saved ? `Sandbox saved but not activated: ${message}` : `Sandbox was not saved: ${message}`,
@@ -1242,6 +1228,19 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       ),
     );
   }
+  // The Agent list is the authoritative activation set: release state that
+  // belongs to instances that no longer exist.
+  function pruneAgentState() {
+    const live = new Set(activeAgentInfos.value.map((agent) => agent.address));
+    const retain = <T>(source: Map<string, T>) =>
+      new Map([...source].filter(([agent]) => live.has(agent)));
+    turnStates.value = retain(turnStates.value);
+    taskStates.value = retain(taskStates.value);
+    agentLogs.value = retain(agentLogs.value);
+    mclRecords.value = retain(mclRecords.value);
+    for (const [key, wake] of pendingWakes) if (!live.has(wake.agent)) pendingWakes.delete(key);
+    histories.value = histories.value.filter((history) => live.has(history.agent));
+  }
   function projectSnapshots() {
     definitions.value = workspaceSnapshots.value.map((w) => ({
       path: w.path,
@@ -1255,11 +1254,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         project_root: w.definition.project_root,
         definition_path: w.path,
         status: w.status as WorkspaceInfo['status'],
-        agents: activeAgentSnapshots.value
+        error: w.error,
+        agents: activeAgentInfos.value
           .filter((a) => a.workspace === w.address)
           .map((a) => a.address),
       }));
-    agentStates.value = activeAgentSnapshots.value.map((a) => ({
+    agentStates.value = activeAgentInfos.value.map((a) => ({
       workspace: runtimeWorkspaces.value.find((w) => w.id === a.workspace) ?? {
         id: a.workspace,
         name: resourceName(a.workspace),
@@ -1270,14 +1270,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       status: (a.status === 'ready' ? 'idle' : a.status) as AgentState['status'],
       turn: turnStates.value.get(`${a.address}`) ?? null,
       tools: a.tools.map((t) => t.alias),
-      sandbox: null,
-      sandboxes: [],
+      sandbox: a.sandbox,
+      sandboxes: a.sandboxes.map((sandbox) => sandbox.alias),
       queued_commands: 0,
       pending_command: null,
+      context_window_tokens: a.model?.context_window_tokens ?? null,
       error: a.error,
     }));
     toolDefinitions.value = new Map(
-      activeAgentSnapshots.value.map((a) => [`${a.address}`, a.tools]),
+      activeAgentInfos.value.map((a) => [`${a.address}`, a.tools]),
     );
     for (const state of agentStates.value) {
       const key = `${workspaceKey(state.workspace)}:${state.agent}`;
@@ -1407,6 +1408,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (event.error) addLog('ERROR', event.error.message, event.address);
   }
   function handleServerMessage(event: ServerMessage) {
+    if ('id' in event) {
+      const command = pending.get(event.id);
+      if (command?.expectedType && command.expectedType !== event.type) {
+        settle(
+          event.id,
+          null,
+          `Received ${event.type} for a waiting ${command.expectedType}`,
+        );
+        return;
+      }
+    }
     switch (event.type) {
       case 'connection.register.result':
         if (event.id !== registrationId) break;
@@ -1426,7 +1438,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         if (listQueries.get(event.id) !== 'workspace.req') break;
         listQueries.delete(event.id);
         if (!event.success) {
-          settle(event.id, null, event.error.message);
+          addLog('ERROR', event.error.message, 'ui.workspace');
           break;
         }
         workspaceSnapshots.value = event.workspaces;
@@ -1443,15 +1455,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         if (listQueries.get(event.id) !== 'agent.req') break;
         listQueries.delete(event.id);
         if (!event.success) {
-          settle(event.id, null, event.error.message);
+          addLog('ERROR', event.error.message, 'ui.agent');
           break;
         }
-        activeAgentSnapshots.value = event.agents;
+        activeAgentInfos.value = event.agents;
+        pruneAgentState();
         projectSnapshots();
         settle(event.id, event.agents);
         break;
       case 'agent.sync':
-        activeAgentSnapshots.value = event.agents;
+        activeAgentInfos.value = event.agents;
+        pruneAgentState();
         projectSnapshots();
         break;
       case 'workspace.start.result':
@@ -1679,7 +1693,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
   return {
     workspaceSnapshots,
-    activeAgentSnapshots,
+    activeAgentInfos,
     taskStates,
     toolDefinitions,
     agentLogs,
@@ -1688,7 +1702,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedMclEntries,
     selectedSessionLogs,
     loadOlderHistory,
-    readSandboxSettings,
     queryRecords,
     endpoint,
     driverContextPath,

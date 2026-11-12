@@ -325,6 +325,16 @@ async fn shutdown_case(name: &str, repeat: bool) {
         registered["type"], "connection.register.result",
         "{registered}"
     );
+    let startup = daemon.log();
+    assert!(startup.contains("started successfully"), "{startup}");
+    assert!(
+        startup.contains(&format!("Webui:  http://{address}/")),
+        "{startup}"
+    );
+    assert!(
+        startup.contains(&format!("WebSocket: ws://{address}/ws")),
+        "{startup}"
+    );
     let started = request(
         &mut socket,
         "workspace.start",
@@ -474,4 +484,43 @@ async fn sigterm_waits_for_returned_persistent_tasks_and_all_descendants() {
 #[tokio::test]
 async fn repeated_sigint_does_not_exit_before_child_cleanup() {
     shutdown_case("-INT", true).await;
+}
+
+#[test]
+fn bind_failure_reports_error_and_exits_without_success_banner() {
+    let home = tempfile::tempdir().unwrap();
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    fixture(home.path(), occupied.local_addr().unwrap());
+    let log_path = home.path().join("bind-failure.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_margatroid-daemon"))
+        .env("HOME", home.path())
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let mut daemon = Daemon {
+        child,
+        owned: vec![],
+        log: log_path,
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = daemon.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon stayed silent after bind failure: {}",
+            daemon.log()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(!status.success());
+    let output = daemon.log();
+    assert!(output.contains("margatroid-daemon: starting"), "{output}");
+    assert!(output.contains("axum"), "{output}");
+    assert!(!output.contains("started successfully"), "{output}");
+    assert!(!output.contains("Webui:"), "{output}");
 }

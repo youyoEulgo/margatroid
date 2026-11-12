@@ -1363,6 +1363,7 @@ dependencies = [
  "address",
  "agent_driver_core",
  "app_runtime_plugin",
+ "axum_plugin",
  "compose",
  "futures-util",
  "mlua",
