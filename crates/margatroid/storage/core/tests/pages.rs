@@ -168,3 +168,87 @@ fn ranges_validate_boundaries_and_empty_pages() {
     assert_eq!(page.next_before_sequence, None);
     assert_eq!(page.next_after_sequence, None);
 }
+
+#[test]
+fn record_change_watch_notifies_only_after_new_records_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = open_storage(
+        &dir.path().join("state.sqlite"),
+        &dir.path().join("setting.toml"),
+        "",
+    )
+    .unwrap();
+    let mut changes = subscribe_record_changes(&storage);
+    assert!(!changes.has_changed().unwrap());
+    let messages = append_message_history(
+        &storage,
+        &[json!({"type":"user","content":"committed"})],
+        None,
+    )
+    .unwrap();
+    assert!(changes.has_changed().unwrap());
+    assert_eq!(changes.borrow_and_update().message, 1);
+    append_message_history(&storage, &messages, None).unwrap();
+    read_message_page(&storage, query(None, None, 50)).unwrap();
+    read_record_watermarks(&storage).unwrap();
+    execute_storage(
+        &storage,
+        StorageOperation::AppendHistory { records: vec![] },
+    )
+    .unwrap();
+    assert!(!changes.has_changed().unwrap());
+    let failure = execute_storage(
+        &storage,
+        StorageOperation::AppendHistory {
+            records: vec![
+                HistoryRecord {
+                    source: Some("client:local/test".into()),
+                    turn: None,
+                    kind: "mcl".into(),
+                    content: "rolled-back".into(),
+                    payload: json!({}),
+                    created_at_ms: Some(0),
+                },
+                HistoryRecord {
+                    source: None,
+                    turn: None,
+                    kind: "invalid".into(),
+                    content: String::new(),
+                    payload: json!({}),
+                    created_at_ms: Some(0),
+                },
+            ],
+        },
+    );
+    assert!(failure.is_err());
+    assert!(!changes.has_changed().unwrap());
+    assert_eq!(read_record_watermarks(&storage).unwrap().mcl, 0);
+    append_mcl(&storage);
+    assert_eq!(changes.borrow_and_update().mcl, 2);
+    append_agent_log(
+        &storage,
+        AgentLogRecord {
+            created_at_ms: Some(0),
+            level: AgentLogLevel::Info,
+            source: AgentLogSource::Driver,
+            stage: "test".into(),
+            message: "new log".into(),
+            details_json: None,
+            context_json: None,
+            origin: None,
+            raw_error: None,
+            traceback: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(changes.borrow_and_update().agent_log, 1);
+    let reopened = open_storage(
+        &dir.path().join("state.sqlite"),
+        &dir.path().join("setting.toml"),
+        "",
+    )
+    .unwrap();
+    assert!(storage.same_database(&reopened));
+    append_mcl(&reopened);
+    assert_eq!(changes.borrow_and_update().mcl, 3);
+}

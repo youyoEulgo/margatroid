@@ -147,7 +147,17 @@ fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
         write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         connection.flush().unwrap();
     });
-    std::fs::write(root.path().join("models.toml"), format!("[[models]]\nid='openrouter/deepseek-v4.1-flash'\nmodel='offline-model'\nbase_url='http://{endpoint}/v1'\napi_key='local-test'\nprovider='openai'\napi_type='chat_completions'\ncontext_window='128k'\n")).unwrap();
+    let driver_model = agent_driver_core::read_driver(
+        &root
+            .path()
+            .join("agent-drivers/local/coder/latest/driver.toml"),
+        &Default::default(),
+    )
+    .unwrap()
+    .manifest
+    .inference
+    .model;
+    std::fs::write(root.path().join("models.toml"), format!("[[models]]\nid={driver_model:?}\nmodel='offline-model'\nbase_url='http://{endpoint}/v1'\napi_key='local-test'\nprovider='openai'\napi_type='chat_completions'\ncontext_window='128k'\n")).unwrap();
     let mut app = build_app(ApplicationOptions {
         data_root: root.path().to_owned(),
         runner_path: std::env::current_exe().unwrap(),

@@ -77,6 +77,7 @@ end
 
 local initialized, initialization_error = pcall(function()
     command("IMPORT TOOL tool:local/skill-register:latest AS skill_register")
+    command("IMPORT TOOL tool:local/mcp-register:latest AS mcp_register")
     command("IMPORT MESSAGE prompt:local/coder-soul:latest AS soul")
     command("IMPORT MESSAGE prompt:local/compact:latest AS compact")
     command("IMPORT TOOL tool:local/list-directory:latest AS list_dir")

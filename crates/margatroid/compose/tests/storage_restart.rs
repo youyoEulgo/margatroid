@@ -250,8 +250,18 @@ fn workspace_restarts_keep_block_files_persistent_context_and_history_without_te
         project.display(), root.path().display())).unwrap();
     std::fs::write(root.path().join("config.toml"),
         "[server]\nbind='127.0.0.1:0'\n[outbound]\nlogs=['type:unmatched']\nbackend_state=['type:unmatched']\n").unwrap();
+    let driver_model = agent_driver_core::read_driver(
+        &root
+            .path()
+            .join("agent-drivers/local/coder/latest/driver.toml"),
+        &Default::default(),
+    )
+    .unwrap()
+    .manifest
+    .inference
+    .model;
     std::fs::write(root.path().join("models.toml"),
-        "[[models]]\nid='openrouter/deepseek-v4.1-flash'\nmodel='unused'\nbase_url='http://127.0.0.1:1/v1'\napi_key='unused-local-test'\nprovider='openai'\napi_type='chat_completions'\ncontext_window='128k'\n").unwrap();
+        format!("[[models]]\nid={driver_model:?}\nmodel='unused'\nbase_url='http://127.0.0.1:1/v1'\napi_key='unused-local-test'\nprovider='openai'\napi_type='chat_completions'\ncontext_window='128k'\n")).unwrap();
     let mut app = build_app(ApplicationOptions {
         data_root: root.path().to_owned(),
         runner_path: std::env::current_exe().unwrap(),

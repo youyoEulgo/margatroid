@@ -65,6 +65,14 @@ fn vm(world: &mut World, owner: Entity, id: &str) {
 
 impl Harness {
     fn new() -> Self {
+        Self::with_counters(None)
+    }
+    fn with_counters(
+        counters: Option<(
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicUsize>,
+        )>,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
@@ -187,6 +195,18 @@ impl Harness {
             );
         });
         app.add_plugin(DtoPlugin::new());
+        if let Some((frames, events)) = counters {
+            app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
+                frames.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                events.fetch_add(
+                    world
+                        .event_reader::<dto_plugin::WebSocketMessageSend>()
+                        .into_iter()
+                        .count(),
+                    std::sync::atomic::Ordering::AcqRel,
+                );
+            });
+        }
         app.tick();
         let deadline = Instant::now() + Duration::from_secs(5);
         let server = loop {
@@ -1663,4 +1683,77 @@ fn driver_ui_change_advances_an_idle_event_driven_world_without_polling_queries(
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
+}
+
+#[test]
+fn record_sync_sleeps_when_idle_and_one_commit_does_not_start_a_frame_feedback_loop() {
+    use app_runtime_plugin::{AppRunExt, RuntimeHandle};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let frames = Arc::new(AtomicUsize::new(0));
+    let outbound = Arc::new(AtomicUsize::new(0));
+    let mut harness = Harness::with_counters(Some((frames.clone(), outbound.clone())));
+    let mut socket = harness.connect();
+    harness.register(&mut socket, "webui", "idle-record-test");
+    harness.collect(&mut socket, 5);
+    frames.store(0, Ordering::Release);
+    outbound.store(0, Ordering::Release);
+    let storage = harness
+        .app
+        .world()
+        .get_component::<AgentStorage>(harness.agent)
+        .unwrap()
+        .clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = stop.clone();
+    let runtime = harness
+        .app
+        .world()
+        .get_resource::<RuntimeHandle>()
+        .unwrap()
+        .clone();
+    let observed = frames.clone();
+    let worker = std::thread::spawn(move || {
+        struct Finish(Arc<AtomicBool>, RuntimeHandle);
+        impl Drop for Finish {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                self.1.wake();
+            }
+        }
+        let _finish = Finish(stopping, runtime);
+        std::thread::sleep(Duration::from_millis(150));
+        let idle = observed.load(Ordering::Acquire);
+        storage_core::append_message_history(
+            &storage,
+            &[json!({"type":"user","content":"one actual update"})],
+            None,
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let after = observed.load(Ordering::Acquire);
+        std::thread::sleep(Duration::from_millis(150));
+        let settled = observed.load(Ordering::Acquire);
+        (idle, after, settled)
+    });
+    harness.app.run_until(|| stop.load(Ordering::Acquire));
+    let (idle, after, settled) = worker.join().unwrap();
+    assert!(idle <= 3, "idle frame loop: {idle}");
+    assert!(
+        after > idle && after - idle <= 8,
+        "one update generated too many frames: {idle} -> {after}"
+    );
+    assert_eq!(after, settled, "record completion kept the loop running");
+    assert_eq!(outbound.load(Ordering::Acquire), 1);
+    let value = harness.next(&mut socket, |value| {
+        value["type"] == "agent.message.full.sync"
+    });
+    assert_eq!(value["message"]["content"], "one actual update");
+    let server = harness
+        .app
+        .world()
+        .get_resource::<AxumHandle>()
+        .unwrap()
+        .clone();
+    server.request_shutdown();
+    harness.wait(|_| server.is_stopped());
 }

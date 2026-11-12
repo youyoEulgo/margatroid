@@ -84,3 +84,11 @@ SQLite事务和TOML文件修改互相独立，不承诺跨文件事务；初始�
 read_message_page、read_mcl_page、read_agent_log_page及read_record_watermarks是纯core同步读取能力。范围使用排他before/after及limit，输出升序和双向游标，读取只针对所属表，不修改消息或消费日志。网络层在blocking worker调用，Storage不引用wire DTO，不新增StorageOperation或事件。页中消息由规范列重建完整AgentMessage，SQL残余payload不能冒充完整网络消息。新增sync按已提交sequence增量读取，消息/MCL与日志水位不能混用。
 
 范围参数必须能表示为SQLite整数，limit必须非零，双界必须after<before；非法范围返回InvalidRange。页数据、两个继续游标和剩余记录判断在同一读事务取得；游标只说明原查询范围内是否还有更早或更新记录，不跨越原边界。历史分页保持已落库消息的真实sequence，查询重复读取不消费数据。
+
+## 提交观察与范围查询
+
+提交观察及范围SQL修复已落实到源码。管理库共享状态增加record_changes，保存消息、MCL及日志三个真实已提交高水位，并以Tokio watch提供独立观察。新增记录确认COMMIT后通知，读操作、空批次、已有sequence复用、失败及回滚均保持通知值。该通知是进程内状态变化能力，不是Storage ECS事件，也不保存第二份记录正文。
+
+DTO为每个活动Agent存储建立一个长期异步监控，先订阅再取得初始基线，后续等待changed。watch通知可以合并，监控以实际sequence追齐记录。提交在读取期间发生时仍保留通知，未读完的同次变化继续分页；追齐后等待下次真实提交。SQL worker完成后只回到监控本身，不额外触发World调查。
+
+范围及游标查询按实际边界构造sequence主键谓词，无下界以0作为排他最小值，无上界以SQLite最大整数作为包含边界，实际存在的边界保持排他，保持现有排他界及升序输出。去除可空OR导致的全表SCAN，增量为空时通过主键边界直接结束。写事务通知不改变Schema、持久记录序号或查询副作用边界。

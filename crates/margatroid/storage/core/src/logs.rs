@@ -21,8 +21,22 @@ fn transaction<T>(
             "BEGIN DEFERRED"
         })
         .map_err(if write { write_err } else { read_err })?;
-    let outcome = operation(&connection);
-    finish_transaction(&connection, &storage.database.shared.retired, outcome)
+    let outcome = operation(&connection).and_then(|value| {
+        Ok((
+            value,
+            if write {
+                Some(pages::record_watermarks(&connection)?)
+            } else {
+                None
+            },
+        ))
+    });
+    let (value, committed) =
+        finish_transaction(&connection, &storage.database.shared.retired, outcome)?;
+    if let Some(committed) = committed {
+        publish_record_changes(&storage.database.shared, committed);
+    }
+    Ok(value)
 }
 
 fn validate(record: &AgentLogRecord) -> Result<(), StorageError> {

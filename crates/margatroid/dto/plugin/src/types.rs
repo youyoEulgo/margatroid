@@ -68,19 +68,29 @@ impl From<async_runtime_plugin::AsyncTaskError> for DtoAsyncError {
 pub(crate) struct SyncState {
     pub sent: BTreeMap<(u64, String), serde_json::Value>,
     pub errors: BTreeMap<Entity, ProtocolErrorDto>,
-    pub records: BTreeMap<Entity, Arc<Mutex<RecordPosition>>>,
+    pub records: BTreeMap<Entity, RecordWatchSlot>,
     pub ui: BTreeMap<Entity, UiWatchSlot>,
     pub ui_sent: BTreeMap<(ConnectionId, Entity), UiDeliveryKey>,
 }
 impl Resource for SyncState {}
-#[derive(Default)]
-pub(crate) struct RecordPosition {
+pub(crate) struct RecordWatchSlot {
+    pub storage: storage_core::AgentStorage,
     pub cancel: tokio_util::sync::CancellationToken,
-    pub initialized: bool,
-    pub running: bool,
-    pub message: u64,
-    pub mcl: u64,
-    pub log: u64,
+}
+impl Drop for RecordWatchSlot {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+pub(crate) struct RecordMonitorContext {
+    pub storage: storage_core::AgentStorage,
+    pub address: String,
+    pub events: app_runtime_plugin::RuntimeEventSender,
+    pub changes: storage_core::RecordChanges,
+    pub position: storage_core::RecordWatermarks,
+    pub cancel: tokio_util::sync::CancellationToken,
+    pub lifetime: axum_plugin::AxumLifetime,
+    pub guard: axum_plugin::AxumWorkGuard,
 }
 #[derive(Clone, Default)]
 pub(crate) struct ConnState {
@@ -167,12 +177,9 @@ pub(crate) struct UiWatchSlot {
     pub address: String,
     pub watch: agent_driver_core::DriverUiWatch,
     pub delivery: Arc<std::sync::RwLock<UiDelivery>>,
-    pub frame_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Drop for UiWatchSlot {
     fn drop(&mut self) {
-        self.frame_pending
-            .store(false, std::sync::atomic::Ordering::Release);
         self.watch.cancel();
     }
 }

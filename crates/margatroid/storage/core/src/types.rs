@@ -9,6 +9,7 @@ pub struct StorageDatabase {
 pub(crate) struct DatabaseState {
     pub(crate) connection: Mutex<Connection>,
     pub(crate) retired: AtomicBool,
+    pub(crate) record_changes: tokio::sync::watch::Sender<RecordWatermarks>,
     pub(crate) block_root: std::path::PathBuf,
     pub(crate) temporary:
         Mutex<std::collections::BTreeMap<(String, String), crate::blocks::MemoryBlock>>,
@@ -148,3 +149,5 @@ pub struct RecordWatermarks {
     pub mcl: u64,
     pub agent_log: u64,
 }
+
+pub type RecordChanges = tokio::sync::watch::Receiver<RecordWatermarks>;

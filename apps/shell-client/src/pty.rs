@@ -5,13 +5,49 @@ use tokio::io::unix::AsyncFd;
 use tokio::process::Command;
 
 type Master = Arc<AsyncFd<File>>;
+const INITIAL_ROWS: u16 = 24;
+const INITIAL_COLS: u16 = 80;
+
+fn dimensions(master: &Master) -> io::Result<(u16, u16)> {
+    use std::os::fd::AsRawFd;
+    let mut size = nix::pty::Winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe {
+        nix::libc::ioctl(
+            master.get_ref().as_raw_fd(),
+            nix::libc::TIOCGWINSZ,
+            &mut size,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if size.ws_row == 0 || size.ws_col == 0 {
+        return Err(failure("terminal size must be nonzero"));
+    }
+    Ok((size.ws_row, size.ws_col))
+}
+
+fn render(
+    master: &Master,
+    output: &mut crate::output::TerminalOutput,
+    bytes: &[u8],
+) -> io::Result<(String, bool)> {
+    let (rows, cols) = dimensions(master)?;
+    output.resize(rows, cols)?;
+    output.process(bytes)
+}
 
 #[allow(deprecated)]
 pub(crate) fn configure(command: &mut Command) -> io::Result<Master> {
     let terminal = nix::pty::openpty(
         Some(&nix::pty::Winsize {
-            ws_row: 24,
-            ws_col: 80,
+            ws_row: INITIAL_ROWS,
+            ws_col: INITIAL_COLS,
             ws_xpixel: 0,
             ws_ypixel: 0,
         }),
@@ -100,7 +136,7 @@ async fn stream(
         if count == 0 {
             return Ok(());
         }
-        let (text, replace) = output.process(&chunk[..count])?;
+        let (text, replace) = render(master, output, &chunk[..count])?;
         *pending = Some(json!({"type":"output", "text":text, "replace":replace}));
         frame(tx, pending.as_ref().expect("pending output frame").clone()).await?;
         *pending = None;
@@ -141,7 +177,8 @@ pub(crate) async fn terminal(input: &mut Input, tx: &Frames, maximum: usize) -> 
         frame(tx, json!({"type":"ready"})).await?;
         // Keep a frame until it has reached the queue: cancelling a blocked
         // send when child.wait completes must not lose its rendered bytes.
-        let mut output = crate::output::TerminalOutput::new(maximum);
+        let (rows, cols) = dimensions(&master)?;
+        let mut output = crate::output::TerminalOutput::new(maximum, rows, cols);
         let mut pending = None;
         let writer = async {
             loop {
@@ -184,7 +221,7 @@ pub(crate) async fn terminal(input: &mut Input, tx: &Frames, maximum: usize) -> 
                     break;
                 }
                 remaining -= count;
-                let (text, replace) = output.process(&chunk[..count])?;
+                let (text, replace) = render(&master, &mut output, &chunk[..count])?;
                 frame(tx, json!({"type":"output", "text":text, "replace":replace})).await?;
             }
             Ok::<_, io::Error>(Some(status))

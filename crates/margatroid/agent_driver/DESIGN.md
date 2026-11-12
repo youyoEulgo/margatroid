@@ -40,7 +40,7 @@ run_driver_ui_monitor(context: DriverUiMonitor) -> Future<Output = Result<(), Dr
         初始化立即读取一次；后续新增、修改、删除使用100ms安静窗口合并，再调用read_driver_ui；完整读取及新状态publish同在blocking worker内执行。
         Unstable保留待处理状态并重读；其他读取错误发布Failed并保持后续观察，路径恢复后重新发布Ready。
         读取或监控初始化错误进入有间隔的恢复尝试，取消后等待正在执行的blocking worker真实返回。
-        更新状态时只持短锁，锁外调用on_change；相同Ready内容或相同错误不重复通知。
+        更新状态时只持短锁，锁外调用on_change；初次稳定结果及后续内容或错误状态变化才通知，相同Ready内容或相同错误保持等待。
         取消后释放notify句柄并返回，完整监控Future退出才算清理结束。
 
 DriverUiWatch::state(&self) -> DriverUiState
@@ -50,7 +50,7 @@ DriverUiWatch::cancel(&self)
 DriverUiWatch::is_cancelled(&self) -> bool
     行为：读取取消状态，供DTO在异常终结后重新建立观察。
 DriverUiWatch::publish(&self, state: DriverUiState)
-    行为：发布稳定读取结果，锁外交付on_change，供DTO构造网络投影并唤醒帧循环。
+    行为：发布稳定读取结果，锁外交付on_change，供DTO构造网络投影；DTO仅在实际UI内容或错误状态变化时发送WebSocketMessageSend，由事件自然唤醒帧。core不直接调用World或RuntimeHandle。
 ```
 
 # types pub

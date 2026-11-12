@@ -2,9 +2,12 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import {
+  Bot,
+  Boxes,
   Command,
   Menu,
   MessageSquare,
+  PanelLeft,
   PanelRight,
   Settings2,
   UsersRound,
@@ -13,6 +16,7 @@ import {
 import SidebarTree from '@/components/SidebarTree.vue';
 import { useWorkbenchStore } from '@/stores/workbench';
 import { buildDriverDocument } from '@/lib/driverUi';
+import InfoPanel from './InfoPanel.vue';
 import { formatRecordTime } from '@/lib/time';
 
 const store = useWorkbenchStore();
@@ -38,6 +42,10 @@ const {
 } = storeToRefs(store);
 
 const sidebarOpen = ref(false);
+const sidebarCollapsed = ref(false);
+const viewMode = ref<'driver' | 'info'>(
+  typeof window !== 'undefined' && window.location.hash === '#info' ? 'info' : 'driver',
+);
 const activityOpen = ref(typeof window === 'undefined' ? true : window.innerWidth > 1180);
 const activityTab = ref<'activity' | 'mcl'>('activity');
 const logFilter = ref<'all' | 'errors'>('all');
@@ -101,6 +109,23 @@ watch(
   },
 );
 
+watch(viewMode, (mode) => {
+  const hash = mode === 'info' ? '#info' : '#driver';
+  if (window.location.hash !== hash) history.replaceState(null, '', hash);
+});
+
+function toggleSidebar() {
+  if (sidebarCollapsed.value) {
+    sidebarCollapsed.value = false;
+    return;
+  }
+  sidebarCollapsed.value = true;
+  sidebarOpen.value = false;
+}
+function openNavigation() {
+  sidebarCollapsed.value = false;
+  sidebarOpen.value = true;
+}
 function selectWorkspace(path: string) {
   store.selectWorkspace(path);
   sidebarOpen.value = false;
@@ -131,7 +156,9 @@ function saveSettings() {
 }
 function logLevelClass(level: string) {
   const value = level.toUpperCase();
-  return value === 'ERROR' || value === 'WARN' ? 'is-error' : '';
+  if (value === 'ERROR') return 'log-level--error';
+  if (value === 'WARN') return 'log-level--warn';
+  return 'log-level--info';
 }
 function closeOverlaysOnEscape(event: KeyboardEvent) {
   if (event.key !== 'Escape') return;
@@ -154,8 +181,15 @@ onBeforeUnmount(() => {
 <template>
   <div class="shell">
     <header class="shell-topbar">
-      <button class="icon-button shell-menu" title="Open navigation" @click="sidebarOpen = true">
+      <button class="icon-button shell-menu" title="Open navigation" @click="openNavigation">
         <Menu :size="18" />
+      </button>
+      <button
+        class="icon-button shell-sidebar-toggle"
+        :title="sidebarCollapsed ? 'Expand workspace rail' : 'Collapse workspace rail'"
+        @click="toggleSidebar"
+      >
+        <PanelLeft :size="17" />
       </button>
       <div class="shell-brand">
         <div class="brand-mark"><Command :size="16" :stroke-width="2.4" /></div>
@@ -163,6 +197,24 @@ onBeforeUnmount(() => {
           <strong>margatroid</strong>
           <span>{{ connectionLabel }}</span>
         </div>
+      </div>
+      <div class="shell-view-switch" role="tablist" aria-label="Center view">
+        <button
+          type="button"
+          :class="{ active: viewMode === 'driver' }"
+          :aria-selected="viewMode === 'driver'"
+          @click="viewMode = 'driver'"
+        >
+          <Bot :size="13" /> Driver
+        </button>
+        <button
+          type="button"
+          :class="{ active: viewMode === 'info' }"
+          :aria-selected="viewMode === 'info'"
+          @click="viewMode = 'info'"
+        >
+          <Boxes :size="13" /> Info
+        </button>
       </div>
       <div class="shell-heading">
         <strong>{{ channelLabel }}</strong>
@@ -186,10 +238,17 @@ onBeforeUnmount(() => {
 
     <div class="shell-body">
       <div v-if="sidebarOpen" class="mobile-scrim" @click="sidebarOpen = false"></div>
-      <aside :class="['workspace-sidebar', 'shell-sidebar', { 'workspace-sidebar--open': sidebarOpen }]">
+      <aside
+        v-if="!sidebarCollapsed"
+        :class="['workspace-sidebar', 'shell-sidebar', { 'workspace-sidebar--open': sidebarOpen }]"
+      >
         <div class="sidebar-heading shell-sidebar-heading">
           <span>Workspaces</span>
-          <button class="icon-button sidebar-close" title="Close navigation" @click="sidebarOpen = false">
+          <button
+            class="icon-button sidebar-close shell-sidebar-close"
+            title="Collapse workspace rail"
+            @click="toggleSidebar"
+          >
             <X :size="17" />
           </button>
         </div>
@@ -210,6 +269,10 @@ onBeforeUnmount(() => {
       </aside>
 
       <main class="shell-center">
+        <template v-if="viewMode === 'info'">
+          <InfoPanel />
+        </template>
+        <template v-else>
         <div v-if="connectionError" class="inline-error shell-error">
           <span>{{ connectionError }}</span>
           <button class="text-button" @click="openSettings">Configure</button>
@@ -237,6 +300,7 @@ onBeforeUnmount(() => {
             Retry
           </button>
         </div>
+        </template>
       </main>
 
       <aside v-if="activityOpen" class="activity-panel shell-activity">
@@ -269,10 +333,9 @@ onBeforeUnmount(() => {
         </div>
         <div v-if="activityTab === 'mcl'" class="activity-list">
           <div v-if="!selectedMclEntries.length" class="activity-empty">No MCL records for the selected agent</div>
-          <article v-for="record in selectedMclEntries" :key="record.key" class="log-row">
-            <span class="log-time">{{ formatRecordTime(record.timestamp, true) }}</span>
-            <span class="log-level">MCL</span>
-            <span class="log-message">{{ record.content || 'MCL command' }}</span>
+          <article v-for="record in selectedMclEntries" :key="record.key" class="mcl-entry">
+            <code>{{ record.content || 'MCL command' }}</code>
+            <small>{{ formatRecordTime(record.timestamp, true) }}</small>
           </article>
         </div>
         <div v-else class="activity-list">
@@ -286,10 +349,12 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <div v-if="!displayedLogs.length" class="activity-empty">No activity yet</div>
-          <article v-for="log in displayedLogs" :key="log.key" class="log-row">
-            <span class="log-time">{{ formatRecordTime(log.timestamp, true) }}</span>
+          <article v-for="log in displayedLogs" :key="log.key" class="log-entry">
             <span :class="['log-level', logLevelClass(log.level)]">{{ log.level }}</span>
-            <span class="log-message">{{ log.message }}</span>
+            <div class="log-copy">
+              <p>{{ log.message }}</p>
+              <small>{{ formatRecordTime(log.timestamp, true) }}</small>
+            </div>
           </article>
         </div>
       </aside>
