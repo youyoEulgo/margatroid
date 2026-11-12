@@ -17,7 +17,7 @@ import {
   parseServerMessage,
   type AgentHistory,
   type WorkspaceSnapshot,
-  type AgentSnapshot,
+  type AgentInfo,
   type TaskSnapshot,
 } from '../types/protocol';
 import { formatToolPayload, inlineToolPayload } from '../lib/format';
@@ -43,7 +43,7 @@ const ws: WorkspaceSnapshot = {
   address: workspace,
   error: null,
 };
-const agent: AgentSnapshot = {
+const agent: AgentInfo = {
   address,
   workspace,
 
@@ -58,6 +58,20 @@ const agent: AgentSnapshot = {
       binding: null,
     },
   ],
+  sandboxes: [
+    { alias: 'workspace_write', path: '/sandboxes/workspace-write/sandbox.toml' },
+    { alias: 'read_only', path: '/sandboxes/read-only/sandbox.toml' },
+  ],
+  sandbox: 'workspace_write',
+  model: {
+    id: 'default/model',
+    model: 'model-name',
+    provider: 'openai',
+    api_type: 'chat_completions',
+    context_window_tokens: 131072,
+    thinking: null,
+    reasoning_effort: null,
+  },
   error: null,
 };
 interface Wire {
@@ -65,7 +79,7 @@ interface Wire {
   id: string;
   message: Record<string, unknown>;
 }
-function setup(workspaces: WorkspaceSnapshot[] = [ws], agents: AgentSnapshot[] = [agent]) {
+function setup(workspaces: WorkspaceSnapshot[] = [ws], agents: AgentInfo[] = [agent]) {
   setActivePinia(createPinia());
   const store = useWorkbenchStore();
   const original = globalThis.WebSocket;
@@ -192,6 +206,12 @@ test('registration independently queries Workspace and active Agents without glo
       ['connection.register', 'workspace.req', 'agent.req'],
     );
     assert.equal(e.store.registeredClient?.address, 'client:webui/test:1');
+    const registration = e.sent[0]!;
+    assert.equal(registration.type, 'connection.register');
+    assert.match(
+      String((registration.message as { name?: string }).name),
+      /^webui-[0-9a-z-]+$/,
+    );
     assert.equal(e.store.selectedAgent, address);
     assert.deepEqual(e.store.toolOptions, ['read_file']);
     assert.equal(
@@ -199,6 +219,65 @@ test('registration independently queries Workspace and active Agents without glo
       'Read a file',
     );
     assert.ok(!e.sent.some((x) => x.type.includes('state')));
+  } finally {
+    e.cleanup();
+  }
+});
+test('a command only settles on its own result type', async () => {
+  const e = setup();
+  try {
+    const pending = e.store.executeMclCommand('CONFIG GET');
+    const command = e.sent.at(-1)!;
+    assert.equal(command.type, 'mcl.execute');
+    e.receive({ type: 'workspace.start.result', id: command.id, success: true });
+    await assert.rejects(
+      pending,
+      /Received workspace.start.result for a waiting mcl.execute.result/,
+    );
+  } finally {
+    e.cleanup();
+  }
+});
+test('a workspace failure is carried into the sidebar row', () => {
+  const e = setup();
+  try {
+    e.receive({
+      type: 'workspace.sync',
+      workspaces: [
+        {
+          ...ws,
+          status: 'failed',
+          error: { code: 'StartFailed', message: 'workspace failed to start' },
+        },
+      ],
+    });
+    const row = e.store.sidebarTree.workspaces[0]!;
+    assert.equal(row.status, 'error');
+    assert.equal(row.reason, 'workspace failed to start');
+  } finally {
+    e.cleanup();
+  }
+});
+test('removing an agent releases its task snapshot', () => {
+  const e = setup();
+  try {
+    e.receive({
+      type: 'agent.task.sync',
+      address,
+      tasks: [
+        {
+          task_id: 'task-1',
+          call_id: 'call-1',
+          alias: 'bash',
+          returned: true,
+          output: ['ready'],
+          error: null,
+        },
+      ],
+    });
+    assert.equal(e.store.taskStates.get(address)?.length, 1);
+    e.receive({ type: 'agent.sync', agents: [] });
+    assert.equal(e.store.taskStates.size, 0);
   } finally {
     e.cleanup();
   }
@@ -648,6 +727,12 @@ test('registration result is matched to the current connection request', () => {
       client: { address: 'client:wrong/x:1', client_type: 'webui' },
     });
     assert.equal(e.store.registeredClient?.address, 'client:webui/test:1');
+    const registration = e.sent[0]!;
+    assert.equal(registration.type, 'connection.register');
+    assert.match(
+      String((registration.message as { name?: string }).name),
+      /^webui-[0-9a-z-]+$/,
+    );
   } finally {
     e.cleanup();
   }
@@ -1219,23 +1304,30 @@ test('history token totals use persisted assistant usage and latest sequence', (
     e.receive(page(id, rows));
     assert.deepEqual(e.store.tokenUsage, { input: 70, output: 6, cached: 6 });
     assert.equal(e.store.contextTokens, 64);
-    assert.equal(e.store.contextWindowTokens, null);
+    assert.equal(e.store.contextWindowTokens, 131072);
   } finally {
     e.cleanup();
   }
 });
-test('unsupported sandbox runtime state is explicit and saved selection is read through MCL', async () => {
+test('sandbox choices and model come from the authoritative agent snapshot', async () => {
   const e = setup();
   try {
-    assert.equal(e.store.sandboxOptions.available, false);
-    await assert.rejects(e.store.setSandbox(null), /unavailable/);
-    const p = e.store.readSandboxSettings();
-    const request = e.sent.at(-1)!;
-    assert.equal(request.message.command, 'CONFIG GET');
-    e.reply(request.id, { kind: 'config', value: { sandbox: ['safe'] } });
-    await p;
-    assert.deepEqual(e.store.sandboxOptions.configured, ['safe']);
-    assert.deepEqual(e.store.sandboxOptions.activated, []);
+    assert.deepEqual(e.store.sandboxOptions.options, ['workspace_write', 'read_only']);
+    assert.deepEqual(e.store.sandboxOptions.activated, ['workspace_write']);
+    assert.equal(e.store.contextWindowTokens, 131072);
+
+    const applying = e.store.setSandbox('read_only');
+    const set = e.sent.at(-1)!;
+    assert.equal(set.message.command, 'CONFIG SET ? ?');
+    assert.deepEqual(set.message.arguments, ['sandbox', ['read_only']]);
+    e.reply(set.id);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const effect = e.sent.at(-1)!;
+    assert.equal(effect.message.command, 'EFFECT sandbox_use ?');
+    e.reply(effect.id);
+    await applying;
+    e.receive({ type: 'agent.sync', agents: [{ ...agent, sandbox: 'read_only' }] });
+    assert.deepEqual(e.store.sandboxOptions.activated, ['read_only']);
   } finally {
     e.cleanup();
   }

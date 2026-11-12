@@ -240,7 +240,7 @@ fn complete_workspace_agent_tool_and_mcl_business_data_are_preserved() {
     let workspace = json!({"type":"workspace.sync","workspaces":[{"path":"/project/workspace.yaml","definition":{"name":"demo","project_root":"/project","agents":[{"name":"coder","driver":"driver:local/coder","home_root":"/agent"}]},"status":"inactive","address":null,"error":null}]});
     let message: ServerMessage = serde_json::from_value(workspace.clone()).unwrap();
     assert_eq!(serde_json::to_value(message).unwrap(), workspace);
-    let agent = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder","workspace":"workspace:local/demo","status":"ready","tools":[{"alias":"read","path":"/tools/read","description":"Read","input_schema":{"type":"object"},"owner_task_id":null,"binding":{"opaque":true}}],"error":null}]});
+    let agent = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder","workspace":"workspace:local/demo","status":"ready","sandboxes":[],"sandbox":null,"model":null,"tools":[{"alias":"read","path":"/tools/read","description":"Read","input_schema":{"type":"object"},"owner_task_id":null,"binding":{"opaque":true}}],"error":null}]});
     let message: ServerMessage = serde_json::from_value(agent.clone()).unwrap();
     assert_eq!(serde_json::to_value(message).unwrap(), agent);
     let result = json!({"type":"mcl.execute.result","id":"r","success":true,"data":{"kind":"block_snapshots","value":{"timeline":{},"snapshots":[]}}});
@@ -362,4 +362,25 @@ fn public_targets_reject_internal_vm_identity_fields() {
         value[key] = json!("private-vm");
         assert!(serde_json::from_value::<ServerMessage>(value).is_err());
     }
+}
+
+#[test]
+fn agent_resources_and_public_model_fields_are_strict_and_nullable() {
+    let mut value = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder","workspace":"workspace:local/demo","status":"ready","tools":[],"sandboxes":[{"alias":"read_only","path":"/sandbox/read-only.toml"}],"sandbox":"read_only","model":{"id":"model-route","model":"model-name","provider":"openai","api_type":"responses","context_window_tokens":131072,"thinking":null,"reasoning_effort":"high"},"error":null}]});
+    let message: ServerMessage = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(message).unwrap(), value);
+    for field in ["sandboxes", "sandbox", "model"] {
+        let mut missing = value.clone();
+        missing["agents"][0].as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<ServerMessage>(missing).is_err());
+    }
+    for field in ["api_key", "base_url", "instance"] {
+        let mut internal = value.clone();
+        internal["agents"][0]["model"][field] = json!("private");
+        assert!(serde_json::from_value::<ServerMessage>(internal).is_err());
+    }
+    value["agents"][0]["sandbox"] = Value::Null;
+    value["agents"][0]["model"] = Value::Null;
+    value["agents"][0]["sandboxes"] = json!([]);
+    assert!(serde_json::from_value::<ServerMessage>(value).is_ok());
 }

@@ -9,6 +9,7 @@ export interface WorkspaceInfo extends WorkspaceRef {
   definition_path: string;
   status: WorkspaceStatus;
   agents: string[];
+  error?: ProtocolError | null;
   member_failures?: { agent: string; driver: string; error: string }[];
 }
 export interface AgentDefinition {
@@ -148,11 +149,27 @@ export interface AgentTool {
   owner_task_id: string | null;
   binding: unknown;
 }
-export interface AgentSnapshot {
+export interface AgentSandbox {
+  alias: string;
+  path: string;
+}
+export interface AgentModel {
+  id: string;
+  model: string;
+  provider: string;
+  api_type: string;
+  context_window_tokens: number;
+  thinking: string | null;
+  reasoning_effort: string | null;
+}
+export interface AgentInfo {
   address: string;
   workspace: string;
   status: 'starting' | 'ready' | 'working' | 'restarting' | 'stopping' | 'failed';
   tools: AgentTool[];
+  sandboxes: AgentSandbox[];
+  sandbox: string | null;
+  model: AgentModel | null;
   error: ProtocolError | null;
 }
 export interface AgentTarget {
@@ -250,8 +267,8 @@ export type ServerMessage =
       { success: true; workspaces: WorkspaceSnapshot[] } | Failure
     ))
   | { type: 'workspace.sync'; workspaces: WorkspaceSnapshot[] }
-  | ({ type: 'agent.res'; id: string } & ({ success: true; agents: AgentSnapshot[] } | Failure))
-  | { type: 'agent.sync'; agents: AgentSnapshot[] }
+  | ({ type: 'agent.res'; id: string } & ({ success: true; agents: AgentInfo[] } | Failure))
+  | { type: 'agent.sync'; agents: AgentInfo[] }
   | ({
       type:
         | 'workspace.start.result'
@@ -306,7 +323,6 @@ const optionalNullableString = (value: unknown): boolean =>
   value === undefined || nullableString(value);
 const integer = (value: unknown): boolean =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
-const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(string);
 const protocolError = (v: unknown): boolean => isRecord(v) && string(v.code) && string(v.message);
 const target = (v: Record<string, unknown>): boolean => string(v.address);
 const errorOrNull = (v: unknown): boolean => v === null || protocolError(v);
@@ -325,7 +341,7 @@ const workspaceSnapshot = (v: unknown): boolean =>
   ) &&
   nullableString(v.address) &&
   errorOrNull(v.error);
-const agentSnapshot = (v: unknown): boolean =>
+const agentInfo = (v: unknown): boolean =>
   isRecord(v) &&
   target(v) &&
   string(v.workspace) &&
@@ -341,7 +357,19 @@ const agentSnapshot = (v: unknown): boolean =>
       isRecord(t.input_schema) &&
       nullableString(t.owner_task_id) &&
       'binding' in t,
-  );
+  ) &&
+  Array.isArray(v.sandboxes) &&
+  v.sandboxes.every((s) => isRecord(s) && string(s.alias) && string(s.path)) &&
+  nullableString(v.sandbox) &&
+  (v.model === null ||
+    (isRecord(v.model) &&
+      string(v.model.id) &&
+      string(v.model.model) &&
+      string(v.model.provider) &&
+      string(v.model.api_type) &&
+      integer(v.model.context_window_tokens) &&
+      nullableString(v.model.thinking) &&
+      nullableString(v.model.reasoning_effort)));
 const tasks = (v: unknown): boolean =>
   Array.isArray(v) &&
   v.every(
@@ -505,10 +533,10 @@ export function parseServerMessage(raw: string): ServerMessage | null {
           reply &&
           (v.success === false
             ? v.agents === undefined
-            : Array.isArray(v.agents) && v.agents.every(agentSnapshot));
+            : Array.isArray(v.agents) && v.agents.every(agentInfo));
         break;
       case 'agent.sync':
-        valid = v.id === undefined && Array.isArray(v.agents) && v.agents.every(agentSnapshot);
+        valid = v.id === undefined && Array.isArray(v.agents) && v.agents.every(agentInfo);
         break;
       case 'workspace.start.result':
       case 'workspace.stop.result':

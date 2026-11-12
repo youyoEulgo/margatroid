@@ -51,3 +51,5 @@ MclCommand、StorageRequest、InitInference、InitToolTasks及Driver VM控制继
 验证全部定义重载、目标移除只允许停止、TEMP纯内存、规范消息列与真实序号、任务查询不消费脚本游标。断线、重连及换实例验证身份隔离，范围查询与新增记录验证游标稳定。完成源码集成后运行全仓回归、严格Clippy及前端测试，不以文档变更或局部通过声明整套API可用。
 
 外部请求和同步使用Agent Address。完整Entity及取消能力用于后端生命周期管理；响应投影只输出API规定的业务字段。审计payload与日志context_json中的内部VM标识在网络边界过滤。
+
+Agent查询及每帧sync当次遍历该Entity的Sandboxes，返回全部alias/path与SelectedSandbox.alias。模型投影从AgentInferenceConfig及ModelRoutes读取当次安全字段：id、模型名称、provider、api_type、context_window_tokens、thinking及reasoning_effort。两条路径共用projection::agents，资源或路由变化在下次查询及sync中体现。

@@ -164,8 +164,22 @@ AgentStateDto
     workspace: AddressDto
     status: String
     tools: Vec<AgentToolDto>
+    sandboxes: Vec<AgentSandboxDto>
+    sandbox: Option<String>
+    model: Option<AgentModelDto>
     error: Option<ProtocolErrorDto>
     行为：只投影实际已激活实例；停止完成后从集合移除，不为未激活定义成员生成占位项
+AgentSandboxDto
+    alias: String
+    path: String
+AgentModelDto
+    id: String
+    model: String
+    provider: String
+    api_type: String
+    context_window_tokens: u64
+    thinking: Option<String>
+    reasoning_effort: Option<String>
 AgentToolDto
     alias: String
     path: String
