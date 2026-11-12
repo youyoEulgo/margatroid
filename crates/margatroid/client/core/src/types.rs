@@ -3,6 +3,8 @@ use core_plugin::Entity;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredClient {
     pub client: Entity,
+    pub address: String,
+    pub client_type: String,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

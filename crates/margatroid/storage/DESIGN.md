@@ -10,7 +10,7 @@ System分别列出事件、闭包结果、提交闭包及oneshot回复，使用R
 # 板块格式
 
 ```text
-# lib        storage/core/src/lib.rs、blocks.rs、blocks/publication.rs、messages.rs、logs.rs；storage/plugin/src/lib.rs  文件、快照和数据库入口；Plugin安装
+# lib        storage/core/src/lib.rs、blocks.rs、blocks/publication.rs、messages.rs、pages.rs、logs.rs；storage/plugin/src/lib.rs  文件、快照和数据库入口；Plugin安装
 # components storage/core/src/components.rs                     AgentStorage
 # events     storage/core/src/events.rs                         存储请求
 # system     storage/plugin/src/system.rs                       请求和闭包结果路由
@@ -54,7 +54,19 @@ read_agent_logs(storage: &AgentStorage, after_sequence: Option<u64>, limit: usiz
         None从首条读取，Some仅取sequence严格大于给定值的记录
         按sequence升序至多返回limit条，limit为0返回空数组
         不合并历史、不派发事件；异步调用方使用spawn_blocking并等待真实join
-        仅提供core诊断读取能力，不自动向LLM暴露，不新增DTO或GUI接口
+        仅提供core诊断读取能力，不自动向LLM暴露；网络范围查询由独立分页函数提供，不改变本函数after升序语义
+
+read_message_page(storage: &AgentStorage, query: RecordRange) -> Result<RecordPage<StoredHistoryRecord>, StorageError>
+    行为：在管理连接同一读事务中仅查询agent_messages，按规范列重建完整消息及真实sequence，返回范围内记录及双游标，不合并MCL或日志。
+
+read_mcl_page(storage: &AgentStorage, query: RecordRange) -> Result<RecordPage<StoredHistoryRecord>, StorageError>
+    行为：同一只读快照仅查询mcl_records，保留真实source、turn、原指令及审计payload，不读取消息正文表替代审计。
+
+read_agent_log_page(storage: &AgentStorage, query: RecordRange) -> Result<RecordPage<StoredAgentLog>, StorageError>
+    行为：同一只读快照仅查询agent_logs，保留级别、来源、阶段、上下文及原始诊断，使用该表独立sequence，不消费日志。
+
+read_record_watermarks(storage: &AgentStorage) -> Result<RecordWatermarks, StorageError>
+    行为：在同一管理库读事务取得消息、MCL和Agent日志各表已提交最大sequence，空表为0；只返回事实，不创建记录、不增加本地序号。
 
 snapshot_block(storage: &AgentStorage, name: &str, instance: Option<&str>) -> Result<(), StorageError>
     行为：
@@ -140,6 +152,15 @@ restore_block(storage: &AgentStorage, name: &str, instance: Option<&str>, snapsh
         行为：清理未发布.pending；完整marker与映射一致则保留文件，未登记则回收其明确归属文件；损坏或归属冲突明确报错
     remove_database(path) / remove_owned_file(path) / marker_path(root, mapping)
         行为：对已由调用方核验归属的文件及-wal/-shm/-journal执行非递归清理，拒绝symlink及非普通文件
+
+私有，定义于storage_core::pages：
+    read(storage, operation)
+        行为：持管理连接锁，检查retired并开启DEFERRED读事务，执行读取闭包后通过finish_transaction提交或回滚，不外借Connection。
+    bounds(query: RecordRange) -> Result<(Option<i64>, Option<i64>, i64), StorageError>
+        行为：拒绝零limit、after>=before及超出SQLite整数范围的边界/limit，转换为SQL参数。
+    page<T>(db, table, query, decode) -> Result<RecordPage<T>, StorageError>
+        行为：在所属表按排他上下界有界选择sequence；无after降序选最新，有after升序选最早，再按sequence升序排列。
+            同事务检查本页最小/最大序号之外且原范围内是否有记录，存在才返回对应游标；逐条按真实ID解码，不使用offset或读取整表。
 
 私有，定义于storage_core::messages：
     split(message) -> MessageRow
@@ -383,6 +404,21 @@ HistoryRecord：只追加历史记录
     content: String--MCL原文独立保存；消息写入按payload的统一映射提取，读取对应存储content
     payload: serde_json::Value--对外完整重建消息带sequence，SQL payload仅保存剩余字段
     created_at_ms: Option<u64>--新记录缺省时取真实写入时间
+
+RecordRange：记录范围，公开纯值类型
+    before_sequence: Option<u64>--排他上界
+    after_sequence: Option<u64>--排他下界
+    limit: usize--非零；双界同时存在时after必须小于before
+    行为：无after时选上界之前最新limit条；有after时选下界之后最早limit条并受上界约束，结果始终sequence升序，不使用offset。
+RecordPage<T>：有界读取结果，公开纯值类型
+    records: Vec<T>
+    next_before_sequence: Option<u64>--当前范围内仍有更早记录时为本页最小sequence
+    next_after_sequence: Option<u64>--当前范围内仍有更新记录时为本页最大sequence
+    行为：记录与游标由同一读事务确定；无对应方向剩余记录为None，空页不是查询失败。
+RecordWatermarks：独立持久记录水位
+    message: u64
+    mcl: u64
+    agent_log: u64
 
 StorageValue：存储成功值，公开枚举
     Unit

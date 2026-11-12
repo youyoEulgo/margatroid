@@ -105,6 +105,7 @@ fn entity_accessors_keep_full_generation_and_domain_independent_members() {
     world.insert_component(
         workspace,
         Workspace {
+            definition: None,
             name: "w".into(),
             definition_path: "w.yaml".into(),
             project_root: "project".into(),
@@ -152,71 +153,66 @@ fn entity_accessors_keep_full_generation_and_domain_independent_members() {
     );
 }
 #[test]
-fn lifecycle_contracts_are_path_based_and_self_contained() {
+fn lifecycle_request_owns_original_oneshot() {
     let mut world = World::new();
     let workspace = world.spawn();
-    let path = PathBuf::from("new.yaml");
-    let start = StartWorkspace {
-        id: "start".into(),
-        path: path.clone(),
-    };
-    let restart = RestartWorkspace {
-        id: "restart".into(),
-        path,
-    };
-    let stop = StopWorkspace {
+    let (sender, mut receiver) = tokio::sync::oneshot::channel();
+    let request = StopWorkspace {
         id: "stop".into(),
         workspace,
+        reply: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
     };
-    world.emit_event(start.clone());
-    world.emit_event(restart.clone());
-    world.emit_event(stop.clone());
+    world.emit_event(request);
     world.advance_event_frame();
-    assert_eq!(
-        world
-            .event_reader::<StartWorkspace>()
-            .into_iter()
-            .next()
-            .unwrap(),
-        &start
-    );
-    assert_eq!(
-        world
-            .event_reader::<RestartWorkspace>()
-            .into_iter()
-            .next()
-            .unwrap(),
-        &restart
-    );
-    assert_eq!(
-        world
-            .event_reader::<StopWorkspace>()
-            .into_iter()
-            .next()
-            .unwrap(),
-        &stop
-    );
-    let output = WorkspaceOperationOutput {
-        workspace,
-        members: vec![],
-        member_errors: vec![MemberDiagnostic {
-            name: "coder".into(),
-            error: WorkspaceError::new(WorkspaceErrorKind::MemberFailed, "failed"),
-        }],
+    let event = world
+        .event_reader::<StopWorkspace>()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(event.workspace, workspace);
+    let sender = event.reply.lock().unwrap().take().unwrap();
+    sender
+        .send(Ok(WorkspaceOperationOutput {
+            workspace,
+            members: vec![],
+            member_errors: vec![],
+        }))
+        .unwrap();
+    assert_eq!(receiver.try_recv().unwrap().unwrap().workspace, workspace);
+}
+
+#[test]
+fn full_reload_publishes_all_definitions_atomically_and_snapshots_remain_immutable() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, value: &str| {
+        let path = dir.path().join(name).join("workspace.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!("name: {value}\nproject_root: project\nmembers: []\n"),
+        )
+        .unwrap();
+        path
     };
-    let result = StartWorkspaceResult {
-        id: "start".into(),
-        result: Ok(output.clone()),
-    };
-    world.emit_event(result.clone());
-    world.advance_event_frame();
-    assert_eq!(
-        world
-            .event_reader::<StartWorkspaceResult>()
-            .into_iter()
-            .next()
-            .unwrap(),
-        &result
-    );
-    assert_eq!(result.result.unwrap(), output);
+    let first = write("first", "old-first");
+    let second = write("second", "old-second");
+    let definitions = WorkspaceDefinitions::open(dir.path()).unwrap();
+    let old = definitions.reload().unwrap();
+    write("first", "new-first");
+    write("second", "new-second");
+    let current = definitions.reload().unwrap();
+    assert_eq!(current.get(&first).unwrap().name, "new-first");
+    assert_eq!(current.get(&second).unwrap().name, "new-second");
+    assert_eq!(old.get(&first).unwrap().name, "old-first");
+    assert_eq!(old.get(&second).unwrap().name, "old-second");
+    std::fs::write(&second, "broken: [").unwrap();
+    write("first", "unpublished");
+    assert!(definitions.reload().is_err());
+    assert_eq!(definitions.get(&first).unwrap().name, "new-first");
+    assert_eq!(definitions.get(&second).unwrap().name, "new-second");
+    assert_eq!(current.get(&first).unwrap().name, "new-first");
+    std::fs::remove_file(&second).unwrap();
+    let after = definitions.reload().unwrap();
+    assert!(after.get(&second).is_none());
+    assert_eq!(after.get(&first).unwrap().name, "unpublished");
 }

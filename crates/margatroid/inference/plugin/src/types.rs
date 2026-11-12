@@ -57,7 +57,7 @@ pub(crate) struct InferenceContext {
 pub(crate) struct StreamDelivery {
     pub id: String,
     pub agent: String,
-    pub instance: String,
+    pub turn: String,
     pub senders: Vec<ClientSender>,
 }
 
@@ -479,7 +479,9 @@ impl TryFrom<DomainRequest> for MessagesRequest {
                         blocks.push(json!({"type":"tool_use","id":call.id,"name":call.name,"input":call.arguments}));
                     }
                     if blocks.is_empty() {
-                        return Err(invalid("Messages cannot encode reasoning-only assistant history without fabricating signed thinking"));
+                        return Err(invalid(
+                            "Messages cannot encode reasoning-only assistant history without fabricating signed thinking",
+                        ));
                     }
                     merge_message(&mut messages, "assistant", blocks);
                 }
@@ -692,7 +694,9 @@ pub(crate) fn build_adapter(
         && format == ApiFormat::ChatCompletions)
         && (route.thinking.is_some() || route.reasoning_effort.is_some())
     {
-        return Err(invalid("thinking/reasoning_effort options are supported only for DeepSeek/OpenRouter chat_completions"));
+        return Err(invalid(
+            "thinking/reasoning_effort options are supported only for DeepSeek/OpenRouter chat_completions",
+        ));
     }
     let thinking = route
         .thinking
@@ -703,10 +707,18 @@ pub(crate) fn build_adapter(
         .transpose()?;
     let reasoning_effort = match (thinking, route.reasoning_effort) {
         (Some(ThinkingMode::Enabled), Some("high")) => Some("high".to_owned()),
-        (Some(ThinkingMode::Enabled), Some("max")) if vendor == Vendor::DeepSeek => Some("max".to_owned()),
-        (Some(ThinkingMode::Enabled), None) => return Err(invalid("enabled thinking requires reasoning_effort")),
+        (Some(ThinkingMode::Enabled), Some("max")) if vendor == Vendor::DeepSeek => {
+            Some("max".to_owned())
+        }
+        (Some(ThinkingMode::Enabled), None) => {
+            return Err(invalid("enabled thinking requires reasoning_effort"));
+        }
         (_, None) => None,
-        _ => return Err(invalid("reasoning_effort requires enabled thinking: DeepSeek supports high/max; OpenRouter supports high")),
+        _ => {
+            return Err(invalid(
+                "reasoning_effort requires enabled thinking: DeepSeek supports high/max; OpenRouter supports high",
+            ));
+        }
     };
     let transport = Transport {
         base_url: route.base_url.clone(),
@@ -1064,7 +1076,7 @@ pub(crate) fn normalize(request: &mut DomainRequest) -> Result<()> {
                 return Err(InferenceError::new(
                     InferenceErrorKind::InvalidMessages,
                     "tool result batch interrupted",
-                ))
+                ));
             }
             _ => {}
         }

@@ -74,6 +74,8 @@ const {
   sandboxOptions,
   resourceWriteInFlight,
   visibleMessages,
+  selectedMclEntries,
+  selectedSessionLogs,
   logs,
   lastFailures,
 } = storeToRefs(store);
@@ -94,7 +96,7 @@ function openImagePicker() {
 }
 const composerRoute = computed(
   () =>
-    `${endpoint.value}:${selectedWorkspace.value?.path}:${selectedAgent.value}:${selectedAgentState.value?.agent_instance}`,
+    `${endpoint.value}:${selectedWorkspace.value?.path}:${selectedAgent.value}`,
 );
 watch(
   composerRoute,
@@ -166,11 +168,19 @@ const logFilter = ref<'all' | 'errors'>('all');
 const endpointDraft = ref(endpoint.value);
 const contextPathDraft = ref(driverContextPath.value);
 const formError = ref('');
+const activityLogs = computed(() => [...logs.value, ...selectedSessionLogs.value]);
+watch(
+  [activityOpen, activityTab, selectedAgent],
+  () => {
+    if (activityOpen.value && selectedAgentReady.value)
+      store.queryRecords(activityTab.value === 'mcl' ? 'mcl' : 'log');
+  },
+);
 const displayedLogs = computed(() => {
   if (logFilter.value === 'errors') {
-    return logs.value.filter((entry) => entry.level === 'ERROR' || entry.level === 'WARN');
+    return activityLogs.value.filter((entry) => entry.level === 'ERROR' || entry.level === 'WARN');
   }
-  return logs.value;
+  return activityLogs.value;
 });
 
 const selectedAgentFailure = computed(() => {
@@ -540,7 +550,7 @@ function isMcLRecord(message: ConversationEntry) {
   return message.role === 'record' && message.kind === 'mcl';
 }
 
-const mclRecords = computed(() => visibleMessages.value.filter(isMcLRecord));
+const mclRecords = computed(() => selectedMclEntries.value);
 const conversationMessages = computed(() =>
   visibleMessages.value.filter((message) => !isMcLRecord(message)),
 );
@@ -565,14 +575,7 @@ function showsMeta(index: number): boolean {
 // thinking, text and tool calls each become sibling blocks, so the gap between
 // them never depends on which message they came from.
 type RowKind =
-  | 'images'
-  | 'thinking'
-  | 'content'
-  | 'error'
-  | 'tool'
-  | 'toolResult'
-  | 'recordData'
-  | 'meta';
+  'images' | 'thinking' | 'content' | 'error' | 'tool' | 'toolResult' | 'recordData' | 'meta';
 interface ConversationRow {
   key: string;
   role: ConversationEntry['role'];
@@ -744,7 +747,10 @@ const conversationRows = computed<ConversationRow[]>(() => {
                     loading="lazy"
                   />
                 </div>
-                <details v-else-if="row.kind === 'thinking'" class="message-disclosure message-thinking">
+                <details
+                  v-else-if="row.kind === 'thinking'"
+                  class="message-disclosure message-thinking"
+                >
                   <summary>Thinking</summary>
                   <p>{{ row.message.thinking }}</p>
                 </details>
@@ -804,17 +810,11 @@ const conversationRows = computed<ConversationRow[]>(() => {
                     <Wrench :size="14" />
                     <span>{{ toolCallLabel(row.tool) }}</span>
                   </summary>
-                  <pre class="message-pre">{{
-                    formatToolPayload(row.tool.arguments ?? {})
-                  }}</pre>
+                  <pre class="message-pre">{{ formatToolPayload(row.tool.arguments ?? {}) }}</pre>
                   <template v-if="toolResult(row.message, row.tool.id)">
-                    <pre
-                      v-if="toolResult(row.message, row.tool.id)?.content"
-                      class="message-pre"
-                      >{{
-                        formatToolPayload(toolResult(row.message, row.tool.id)?.content)
-                      }}</pre
-                    >
+                    <pre v-if="toolResult(row.message, row.tool.id)?.content" class="message-pre">{{
+                      formatToolPayload(toolResult(row.message, row.tool.id)?.content)
+                    }}</pre>
                     <div
                       v-if="toolResult(row.message, row.tool.id)?.images?.length"
                       class="image-row history-image-row"
@@ -1022,7 +1022,7 @@ const conversationRows = computed<ConversationRow[]>(() => {
                 <span>Sandbox</span>
                 <span>{{ sandboxOptions.options.length }}</span>
               </div>
-              <div class="tool-resource-list">
+              <div v-if="sandboxOptions.available" class="tool-resource-list">
                 <div
                   v-for="choice in sandboxChoices"
                   :key="choice.value || 'none'"
@@ -1054,6 +1054,9 @@ const conversationRows = computed<ConversationRow[]>(() => {
                   </button>
                 </div>
               </div>
+              <p v-if="!sandboxOptions.available" class="tool-resource-empty">
+                Sandbox runtime selection is unavailable here. Use the Driver MCL controls.
+              </p>
             </section>
 
             <section class="tool-resource-group">
@@ -1133,7 +1136,7 @@ const conversationRows = computed<ConversationRow[]>(() => {
         aria-label="Filter activity"
       >
         <button type="button" :class="{ active: logFilter === 'all' }" @click="logFilter = 'all'">
-          All <span>{{ logs.length }}</span>
+          All <span>{{ activityLogs.length }}</span>
         </button>
         <button
           type="button"
@@ -1142,7 +1145,7 @@ const conversationRows = computed<ConversationRow[]>(() => {
         >
           Errors
           <span>{{
-            logs.filter((log) => log.level === 'ERROR' || log.level === 'WARN').length
+            activityLogs.filter((log) => log.level === 'ERROR' || log.level === 'WARN').length
           }}</span>
         </button>
       </div>

@@ -24,7 +24,7 @@ ConfigPlugin::open在启动阶段读取，build只发布已校验值。filter若
 
 allow缺省localhost，支持all或IP/CIDR数组；回环bind不能搭配放行非回环的策略。带Origin的请求要求Host同源。目标支持broadcast、type和name，两组均非空且各自不重复。入口策略不等于客户端身份认证。
 
-模型路由归Inference，Workspace路径与展示缓存归Workspace，Agent setting.toml归Storage。Config不复制这些定义或充当万能配置表。各plugin在边界转换OutboundTarget，不让config_core引用DTO契约。整体重载不在此定义独立流程。
+模型路由归Inference，Workspace路径及统一定义/启动缓存归Workspace，Agent setting.toml归Storage。Config不复制这些定义或充当万能配置表。各plugin在边界转换OutboundTarget，不让config_core引用DTO契约。整体重载不在此定义独立流程。
 
 `[tools]` 接受三个容量字符串：`total_task_memory_limit` 默认 8 GiB，`task_memory_limit` 默认 2 GiB，`task_output_buffer_window` 默认 128 MiB。整个段或任意字段均可省略，compose 只从工具领域的 `ToolExecutionLimits::default()` 补齐默认值。单位后缀大小写不敏感，按 1024 进制解释：`K/M/G/T`，可选 `B` 或 `iB`（例如 `2G`、`128MiB`）；也可使用不带后缀的正数字节数。序列化使用可无损表达的最大单位。只接受正整数容量字符串，零、负数、小数、未知单位、整数类型及溢出均拒绝。旧的 `[tools.limits]`、`memory`、`cache` 和字节命名字段严格拒绝。
 

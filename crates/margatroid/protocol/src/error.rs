@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProtocolErrorDto {
-    pub kind: String,
+    pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 impl ProtocolErrorDto {
     pub fn new(kind: impl Into<String>, message: impl Into<String>) -> Self {
@@ -14,8 +17,9 @@ impl ProtocolErrorDto {
         }
         message.truncate(end);
         Self {
-            kind: kind.into(),
+            code: kind.into(),
             message,
+            details: None,
         }
     }
 }
@@ -28,7 +32,7 @@ impl ProtocolError {
 }
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.0.kind, self.0.message)
+        write!(f, "{}: {}", self.0.code, self.0.message)
     }
 }
 impl std::error::Error for ProtocolError {}

@@ -1,3 +1,5 @@
+mod pages;
+pub use pages::{read_agent_log_page, read_mcl_page, read_message_page, read_record_watermarks};
 mod blocks;
 mod logs;
 mod messages;

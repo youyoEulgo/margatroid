@@ -72,6 +72,10 @@ ToolTasks：该Agent的工具任务句柄集合，公开组件
     list(&self) -> Vec<(String, ToolTaskHandle)>
         行为：
             return entries中的活任务句柄克隆
+    snapshot(&self) -> Vec<ToolTaskSnapshot>
+        行为：短锁克隆当前集合成员，逐句柄调用非破坏性snapshot并跳过已真实清理项，按task_id稳定排序。
+            每项包含完整保留窗口；不调用read、不推进cursor、不清除replaced、不发送reply、不触发取消或finish。
+            集合成员和单任务分别取锁，不持集合锁等待长IO，不宣称所有任务在同一个全局时刻冻结。
     read(&self, id: &str) -> Result<TaskReadResult, ToolError>
         行为：
             从集合取得仍存活任务后，同一短锁读取output[cursor..]并将相邻字符串无分隔符拼成一项，非字符串原样保留顺序；
@@ -506,6 +510,8 @@ ToolTaskHandle：可克隆的任务共享句柄，公开类型
     is_cleanup_complete(&self) -> bool
         行为：
             仅内部清理等待者查询清理是否完成，不提供对外completed状态或完成缓存。
+    snapshot(&self, task_id: &str) -> Option<ToolTaskSnapshot>
+        行为：在任务shared短锁中原子读取call_id、alias、returned、output及error，cleanup_complete则None；不改变状态和脚本读游标。
     impl Clone
         行为：
             共享同一任务状态、输入与取消能力，不复制任务。
@@ -524,6 +530,14 @@ ToolTaskData：任务查询数据
     alias: String--正常及强制return使用相同工具入口
     returned: bool--LLM结果是否已交付；finish不是可存储的任务状态
     reply: Option<oneshot::Sender<Result<ToolExecuteResponse, ToolError>>>--仅ToolTaskData持有
+    error: Option<ToolError>
+
+ToolTaskSnapshot：活跃任务的非破坏性只读快照，公开纯值类型
+    task_id: String
+    call_id: String
+    alias: String
+    returned: bool
+    output: Vec<serde_json::Value>--当前保留的完整结构化输出窗口，不是cursor之后的增量
     error: Option<ToolError>
 
 TaskReadResult：增量查询结果

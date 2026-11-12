@@ -5,7 +5,7 @@ mod types;
 
 pub use components::Client;
 pub use error::{ClientError, ClientSendError};
-pub use events::{ClientDisconnected, ClientRegistrationResult, RegisterClient};
+pub use events::{ClientDisconnected, ClientRegistrationReply, RegisterClient};
 pub use types::{ClientFrame, ClientSender, ConnectionId, RegisteredClient};
 
 use core_plugin::{Entity, World};

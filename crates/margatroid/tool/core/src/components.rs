@@ -1,5 +1,5 @@
 use crate::types::lock;
-use crate::{TaskReadResult, ToolError, ToolErrorKind, ToolTaskHandle};
+use crate::{TaskReadResult, ToolError, ToolErrorKind, ToolTaskHandle, ToolTaskSnapshot};
 use core_plugin::Component;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -55,6 +55,13 @@ impl ToolTasks {
         lock(&self.entries)
             .iter()
             .map(|(id, handle)| (id.clone(), handle.clone()))
+            .collect()
+    }
+
+    pub fn snapshot(&self) -> Vec<ToolTaskSnapshot> {
+        self.list()
+            .into_iter()
+            .filter_map(|(id, handle)| handle.snapshot(&id))
             .collect()
     }
 

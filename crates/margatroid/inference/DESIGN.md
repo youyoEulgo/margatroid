@@ -164,7 +164,7 @@ supervise_inference(context: InferenceContext) -> Future<Output = ()>
         已确认的provider或流错误立即通过原reply交付一次；
         后台继续等待worker真实join，不提前释放ActiveInference。
         用户中止且清理成功返回冻结内容的Completed结果；
-        清理预算耗尽及时返回CleanupFailed，原监督继续真实清理。
+        清理预算耗尽及时返回CleanupFailed并发送完整error同步，原监督继续真实清理；若先前已交付错误则不再次回复oneshot，只对同generation发送CleanupFailed完整纠错同步。
         全部真实清理结束发送绑定Agent、VM实例和request_id的私有完成事件；
         确认监督任务已结束后才唤醒当前Driver，未结束则下一帧复查，过期事件丢弃，不自动finish_turn。
         不写历史、不执行工具、不重试推理。
@@ -186,16 +186,31 @@ receive_stream(context: StreamContext, receiver: mpsc::Receiver<ProviderFragment
         不等待上游退出才冻结。
         正常和中止的Completed结果都从同一累积器生成，worker退出结果不得补写正文。
 
-push_stream(context: StreamDelivery, fragment: AcceptedDelta) -> Future<Output = ()>
+push_stream(delivery: &mut StreamDelivery, sequence: u64, reasoning: bool, content: String)
     行为：
-        向本次发送器快照有界发送正文或reasoning；
-        剔除关闭及慢连接；
-        发送失败不改变推理结果。
+        向本次发送器快照有界发送agent.message.chunk.sync，delta仅包含新增content或reasoning；
+        address和turn取StreamDelivery固定身份，generation取本次生成关联，sequence为同一生成共用分片序列，不作为历史序号；
+        剔除关闭及慢连接；发送失败不改变推理结果，不在此写历史或伪造history_sequence。
+
+finish_inference(context: &mut InferenceContext, result: Result<InferenceResponse, InferenceError>)
+    行为：关闭接受门，认领唯一reply时先调用push_full投影本次完整结果，再通过原oneshot发送result；不写历史或确认持久化。
+
+push_full(delivery: &mut StreamDelivery, result: Result<&InferenceResponse, &InferenceError>)
+    行为：
+        生成agent.message.full.sync，携带address、turn、generation及history_sequence=null，不输出消息sequence。
+        成功转换为完整内部assistant：reasoning/content、tool_calls、usage、stop_reason及request_id；工具name映射tool_name、arguments JSON值编码成字符串，空可选字段省略。
+        失败转换内部error消息并保留request_id，full.error含code/message；不制造assistant正文或持久序号，不带replay/data。
+        只投影通用响应，不另建厂商内部消息或调用协议crate。
+
+push_frame(delivery: &mut StreamDelivery, frame: serde_json::Value)
+    行为：序列化JSON，通过本次ClientSender快照try_send，剔除关闭及满队列，不等待网络，不改变后端结果。
 
 build_request(input: DomainRequest, route: ModelRoute) -> Result<ProviderHttpRequest, InferenceError>
     行为：
-        按ApiFormat转换具体请求，再按Vendor添加选项、鉴权和端点；
-        不猜测格式或厂商。
+        按route明确的Vendor及ApiFormat构造支持的ApiAdapter；
+        调用adapter.encode(input)经TryFrom得到具体ApiRequest，再调用adapter.process_request完成该组合HTTP编码；
+        不从URL或模型名猜测，不使用通用JSON请求壳修补或未知组合回退；
+        输入DomainRequest保持厂商无关，不向消息、结果或历史添加格式状态。
 ```
 
 # types
@@ -207,7 +222,12 @@ build_request(input: DomainRequest, route: ModelRoute) -> Result<ProviderHttpReq
 InferenceContext：请求执行材料--原请求及reply、已编码http_request、deadline、HTTP客户端、取消能力和推流投影
 ProviderContext：上游材料--HTTP请求、格式解码器、取消能力及读取预算
 StreamContext：接收材料--Arc<Mutex<StreamGate>>、取消能力及StreamDelivery
-StreamDelivery：前端出口--Vec<client_core::ClientSender>固定快照、请求ID、对外地址和不透明实例标识；只发送ClientFrame，不持有WebSocket或访问DTO连接表。
+StreamDelivery：前端出口，私有类型
+    id: String--生成关联，wire中为generation，不是前端请求id
+    agent: String--wire中为address
+    instance: String
+    turn: String
+    senders: Vec<client_core::ClientSender>--固定快照，只发送ClientFrame，不持有WebSocket或访问DTO连接表
 InferenceLaunchOutput：已将监督任务交给共享句柄的启动事实
 InferenceLaunchError：InferenceError及原回复、共享句柄关联，实现From<AsyncTaskError>
 
@@ -228,8 +248,8 @@ ProviderFragment：格式归一后的分片，私有枚举
 
 AcceptedDelta：已接受的显示分片--sequence及Content或Reasoning
 AcceptedResponse：接收器结果--累积消息和已接受协议终态
-ResponseAccumulator：唯一响应累积器--正文、思考、工具调用、usage及停止原因
-FormatDecoder：SSE解析状态--跨字节缓冲、协议索引及完整结束校验，不另存最终正文
+ResponseAccumulator：唯一响应累积器--正文、思考、工具调用、usage及停止原因；不含replay、api_format或原生厂商内容块
+FormatDecoder：SSE解析状态--跨字节缓冲、协议索引及完整结束校验，不另存最终正文，不把签名或加密重放材料转为领域分片
 
 ApiFormat：格式，私有枚举
     ChatCompletions | Messages | Responses
@@ -239,19 +259,23 @@ ApiRequest：具体格式请求，私有枚举
     ChatCompletions(ChatCompletionsRequest)
     Messages(MessagesRequest)
     Responses(ResponsesRequest)
-ChatCompletionsRequest / MessagesRequest / ResponsesRequest：具体格式请求
-    impl TryFrom<DomainRequest>或TryFrom<EncodeInput>
+ChatCompletionsRequest / MessagesRequest / ResponsesRequest：插件自有具体格式结构体，不是共享领域类型或通用JSON壳
+    impl TryFrom<DomainRequest> for ChatCompletionsRequest
+    impl TryFrom<EncodeInput> for ChatCompletionsRequest
+    impl TryFrom<DomainRequest> for MessagesRequest
+    impl TryFrom<DomainRequest> for ResponsesRequest
+        type Error = InferenceError
         行为：
             转换消息、工具及参数；
             在HTTP前校验目标格式与厂商能力，不经过通用JSON中间请求；
             Chat按EncodeInput能力映射reasoning_content，Messages/Responses仅编码其支持的独立字段，不把历史思考混入正文或构造签名块；
             只有reasoning且无正文/工具的历史若目标无法表达则明确失败，有正文或工具时保持它们原样转换。
-EncodeInput：插件内格式编码材料--DomainRequest及本次只读能力，不进入领域core。
+EncodeInput：插件内格式编码材料--DomainRequest及本次只读ChatReasoning能力，不进入领域core或存储。
 OpenAi<T> / Anthropic<T> / DeepSeek<T> / OpenRouter<T>：具体厂商handler
     T：具体ChatCompletionsRequest、MessagesRequest或ResponsesRequest，不是ApiRequest枚举变体。
-    process(request: T) -> Result<ProviderHttpRequest, InferenceError>
+    process(&self, request: T) -> Result<ProviderHttpRequest, InferenceError>
         行为：
-            只有支持矩阵中的具体组合实现process；
+            仅OpenAi<ChatCompletionsRequest>、OpenAi<ResponsesRequest>、Anthropic<MessagesRequest>、DeepSeek<ChatCompletionsRequest>、DeepSeek<MessagesRequest>、DeepSeek<ResponsesRequest>、OpenRouter<ChatCompletionsRequest>实现process；
             以有类型字段处理厂商选项、鉴权和端点，附上同一组合选择的响应解码器。
 ApiAdapter：显式组合分派，私有枚举
     OpenAiChat(OpenAi<ChatCompletionsRequest>)
@@ -261,9 +285,11 @@ ApiAdapter：显式组合分派，私有枚举
     DeepSeekMessages(DeepSeek<MessagesRequest>)
     DeepSeekResponses(DeepSeek<ResponsesRequest>)
     OpenRouterChat(OpenRouter<ChatCompletionsRequest>)
-    行为：
-        只接受已登记的vendor与format组合，转换具体请求并调用对应process。
-        不以通用VendorAdapter在JSON对象上修补差异。
+    encode(&self, request: DomainRequest) -> Result<ApiRequest, InferenceError>
+        行为：按已选具体组合调用.try_into()，必要时在插件内构造EncodeInput；不修改原始领域消息或持久历史。
+    process_request(&self, request: ApiRequest) -> Result<ProviderHttpRequest, InferenceError>
+        行为：配对ApiAdapter与具体ApiRequest，调用对应泛型handler.process；格式不匹配明确失败。
+    约束：不以通用VendorAdapter在JSON对象上修补差异，不用ApiRequest枚举变体充当泛型T。
 ProviderHttpRequest：HTTP请求--method、url、headers、body及格式响应解码器
     行为：
         响应沿请求所选组合逆向归一，不再单独按配置猜解码器。
@@ -313,12 +339,13 @@ ModelRoute：配置路由
     thinking: Option<String>
     reasoning_effort: Option<String>
 
-DomainRequest：拥有所有权的协议输入
+DomainRequest：拥有所有权的纯领域输入，不承载厂商或API协议状态
     messages: Vec<InferenceMessage>
     tools: Vec<InferenceToolDefinition>
     config: InferenceParameters--编码前model替换为上游模型名
+    约束：不含provider、api_type、URL、密钥、HTTP材料、Entity、turn、执行句柄或channel；不并建第二份共享请求。
 
-InferenceMessage：推理自身的消息契约，公开枚举
+InferenceMessage：推理自身的厂商无关消息契约，公开枚举；不含replay、api_format、签名块或加密重放载荷
     System { content: String }
     User { content: String, images: Vec<InferenceImage> }--JSON字段名为data，无images别名
     Assistant { reasoning: Option<String>, content: Option<String>, tool_calls: Vec<InferenceToolCall> }
@@ -329,8 +356,8 @@ InferenceToolCall：模型调用--id、name、arguments
 InferenceImage：图片--media_type、标准base64 data
 InferenceUsage：用量--input_tokens、output_tokens、可选cache_hit_tokens
 
-InferenceResponse：成功响应
-    reasoning: Option<String>
+InferenceResponse：厂商无关成功响应，不保存请求格式或厂商原生内容块
+    reasoning: Option<String>--可读思考唯一副本，不随签名/回放再次保存
     content: Option<String>
     tool_calls: Vec<InferenceToolCall>
     usage: Option<InferenceUsage>

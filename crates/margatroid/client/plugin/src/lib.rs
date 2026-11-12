@@ -2,8 +2,8 @@ mod handler;
 mod system;
 
 pub use client_core::{
-    Client, ClientDisconnected, ClientError, ClientFrame, ClientRegistrationResult,
-    ClientSendError, ClientSender, ConnectionId, RegisterClient, RegisteredClient, WorldClientExt,
+    Client, ClientDisconnected, ClientError, ClientFrame, ClientRegistrationReply, ClientSendError,
+    ClientSender, ConnectionId, RegisterClient, RegisteredClient, WorldClientExt,
 };
 
 use app_runtime_plugin::RuntimePlugin;

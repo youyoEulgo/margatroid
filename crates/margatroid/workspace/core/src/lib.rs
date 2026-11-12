@@ -3,7 +3,7 @@ pub mod error;
 pub mod events;
 pub mod types;
 
-pub use components::{Workspace, WorkspaceExecutor};
+pub use components::{Workspace, WorkspaceExecutor, WorkspaceFailure};
 pub use error::{WorkspaceError, WorkspaceErrorKind};
 pub use events::*;
 pub use types::*;
@@ -20,9 +20,67 @@ use std::{
 #[derive(Clone, Debug, Default)]
 pub struct WorkspaceDefinitions {
     pub entries: Arc<RwLock<BTreeMap<PathBuf, WorkspaceDefinition>>>,
+    source: Option<PathBuf>,
+    reload_lock: Arc<std::sync::Mutex<()>>,
+}
+#[derive(Clone, Debug)]
+pub struct WorkspaceDefinitionSnapshot {
+    pub entries: Arc<BTreeMap<PathBuf, WorkspaceDefinition>>,
+}
+impl WorkspaceDefinitionSnapshot {
+    pub fn get(&self, path: &Path) -> Option<&WorkspaceDefinition> {
+        self.entries.get(path)
+    }
+    pub fn list(&self) -> Vec<(PathBuf, WorkspaceDefinition)> {
+        self.entries
+            .iter()
+            .map(|(p, d)| (p.clone(), d.clone()))
+            .collect()
+    }
 }
 impl Resource for WorkspaceDefinitions {}
 impl WorkspaceDefinitions {
+    pub fn open(source: impl Into<PathBuf>) -> Result<Self, WorkspaceError> {
+        let source = source.into();
+        let source = if source.is_absolute() {
+            source
+        } else {
+            std::env::current_dir()
+                .map_err(invalid_definition)?
+                .join(source)
+        };
+        reject_definition_symlinks(&source)?;
+        let source = std::fs::canonicalize(source).map_err(invalid_definition)?;
+        let definitions = Self {
+            source: Some(source),
+            ..Self::default()
+        };
+        definitions.reload()?;
+        Ok(definitions)
+    }
+    pub fn source(&self) -> Option<&Path> {
+        self.source.as_deref()
+    }
+    pub fn reload(&self) -> Result<WorkspaceDefinitionSnapshot, WorkspaceError> {
+        let _reload = self
+            .reload_lock
+            .lock()
+            .map_err(|_| invalid_definition("definition reload lock poisoned"))?;
+        let source = self
+            .source
+            .as_deref()
+            .ok_or_else(|| invalid_definition("workspace definition source is not configured"))?;
+        let entries = load_workspace_definitions(source)?;
+        let snapshot = WorkspaceDefinitionSnapshot {
+            entries: Arc::new(entries),
+        };
+        *self
+            .entries
+            .write()
+            .map_err(|_| invalid_definition("definition cache lock poisoned"))? =
+            (*snapshot.entries).clone();
+        Ok(snapshot)
+    }
     pub fn get(&self, path: &Path) -> Option<WorkspaceDefinition> {
         self.entries
             .read()
@@ -38,6 +96,84 @@ impl WorkspaceDefinitions {
             .map(|(path, definition)| (path.clone(), definition.clone()))
             .collect()
     }
+}
+pub fn reject_definition_symlinks(path: &Path) -> Result<(), WorkspaceError> {
+    let mut current = PathBuf::new();
+    for part in path.components() {
+        current.push(part.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_definition(
+                    "symbolic links are not allowed in workspace paths",
+                ))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(invalid_definition(error)),
+        }
+    }
+    Ok(())
+}
+pub fn load_workspace_definitions(
+    source: &Path,
+) -> Result<BTreeMap<PathBuf, WorkspaceDefinition>, WorkspaceError> {
+    reject_definition_symlinks(source)?;
+    let metadata = std::fs::metadata(source).map_err(invalid_definition)?;
+    let paths = if metadata.is_file() {
+        vec![source.to_path_buf()]
+    } else if metadata.is_dir() {
+        let mut paths = Vec::new();
+        let mut entries = std::fs::read_dir(source)
+            .map_err(invalid_definition)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(invalid_definition)?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let kind = entry.file_type().map_err(invalid_definition)?;
+            if kind.is_symlink() {
+                return Err(invalid_definition(
+                    "workspace root contains a symbolic link",
+                ));
+            }
+            if kind.is_dir() {
+                let path = entry.path().join("workspace.yaml");
+                if path.exists() {
+                    reject_definition_symlinks(&path)?;
+                    paths.push(path);
+                }
+            }
+        }
+        paths
+    } else {
+        return Err(invalid_definition(
+            "workspace root must be a directory or YAML file",
+        ));
+    };
+    if paths.len() > 4096 {
+        return Err(invalid_definition(
+            "workspace definition count exceeds 4096",
+        ));
+    }
+    let mut entries = BTreeMap::new();
+    for path in paths {
+        let definition = load_workspace_definition(&path)?;
+        let valid = |name: &str| {
+            !name.trim().is_empty()
+                && name.len() <= 128
+                && !matches!(name, "." | "..")
+                && !name
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+        };
+        if !valid(&definition.name) || definition.members.iter().any(|m| !valid(&m.name)) {
+            return Err(invalid_definition("invalid workspace or member name"));
+        }
+        entries.insert(path, definition);
+    }
+    Ok(entries)
 }
 pub trait WorldWorkspaceExt {
     fn workspace_definitions(&self) -> Result<&WorkspaceDefinitions, WorkspaceError>;

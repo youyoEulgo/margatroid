@@ -1,7 +1,12 @@
-use crate::{
-    checked_path, invalid, reject_symlinks, types::*, validate_definition_names, validate_name,
-    WorkspaceInstalled,
-};
+fn reply(
+    sender: &workspace_core::WorkspaceOperationReply,
+    result: Result<workspace_core::WorkspaceOperationOutput, workspace_core::WorkspaceError>,
+) {
+    if let Some(sender) = sender.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = sender.send(result);
+    }
+}
+use crate::{checked_path, invalid, reject_symlinks, types::*, validate_name, WorkspaceInstalled};
 use address::Address;
 use agent_core::{Agent, AgentStartParameters, AgentState, StartAgent, StopAgent};
 use app_runtime_plugin::WorldEventExt;
@@ -32,10 +37,17 @@ fn valid_id(id: &str) -> Result<(), WorkspaceError> {
         Ok(())
     }
 }
-fn context(world: &World, id: String, path: PathBuf, workspace: Entity) -> WorkspaceFlowContext {
+fn context(
+    world: &World,
+    id: String,
+    path: PathBuf,
+    workspace: Entity,
+    reply: WorkspaceOperationReply,
+) -> WorkspaceFlowContext {
     let installed = world.get_resource::<WorkspaceInstalled>().unwrap();
     WorkspaceFlowContext {
         id,
+        reply,
         workspace,
         path,
         events: world.event_sender(),
@@ -50,7 +62,7 @@ fn fail(
     restore_running: bool,
 ) -> FlowError {
     FlowError {
-        id: context.id.clone(),
+        reply: context.reply.clone(),
         workspace: Some(context.workspace),
         error,
         cleanup_completed,
@@ -121,15 +133,19 @@ pub(crate) fn handle_start_workspace(world: &mut World, request: StartWorkspace)
                 project_root: PathBuf::new(),
                 state: WorkspaceState::Starting,
                 agents: BTreeSet::new(),
+                definition: None,
             },
         );
-        Ok(context(world, request.id.clone(), path, workspace))
+        Ok(context(
+            world,
+            request.id.clone(),
+            path,
+            workspace,
+            request.reply.clone(),
+        ))
     })();
     match result {
-        Err(error) => world.send_event(StartWorkspaceResult {
-            id: request.id,
-            result: Err(error),
-        }),
+        Err(error) => reply(&request.reply, Err(error)),
         Ok(context) => {
             let schedule = world
                 .get_resource::<WorkspaceInstalled>()
@@ -166,13 +182,16 @@ pub(crate) fn handle_stop_workspace(world: &mut World, request: StopWorkspace) {
             .get_component_mut::<Workspace>(request.workspace)
             .unwrap()
             .state = WorkspaceState::Stopping;
-        Ok(context(world, request.id.clone(), path, request.workspace))
+        Ok(context(
+            world,
+            request.id.clone(),
+            path,
+            request.workspace,
+            request.reply.clone(),
+        ))
     })();
     match result {
-        Err(error) => world.send_event(StopWorkspaceResult {
-            id: request.id,
-            result: Err(error),
-        }),
+        Err(error) => reply(&request.reply, Err(error)),
         Ok(context) => {
             let schedule = world
                 .get_resource::<WorkspaceInstalled>()
@@ -236,13 +255,16 @@ pub(crate) fn handle_restart_workspace(world: &mut World, request: RestartWorksp
             .get_component_mut::<Workspace>(workspace)
             .unwrap()
             .state = WorkspaceState::Restarting;
-        Ok(context(world, request.id.clone(), path, workspace))
+        Ok(context(
+            world,
+            request.id.clone(),
+            path,
+            workspace,
+            request.reply.clone(),
+        ))
     })();
     match result {
-        Err(error) => world.send_event(RestartWorkspaceResult {
-            id: request.id,
-            result: Err(error),
-        }),
+        Err(error) => reply(&request.reply, Err(error)),
         Ok(context) => {
             let schedule = world
                 .get_resource::<WorkspaceInstalled>()
@@ -274,6 +296,7 @@ fn finish_running(
     let component = world.get_component_mut::<Workspace>(workspace).unwrap();
     component.agents = all;
     component.state = WorkspaceState::Running;
+    world.remove_component::<WorkspaceFailure>(workspace);
     Ok(())
 }
 fn failure_result(world: &mut World, failure: &FlowError, state: WorkspaceState) {
@@ -282,6 +305,7 @@ fn failure_result(world: &mut World, failure: &FlowError, state: WorkspaceState)
             .get_component::<Workspace>(workspace)
             .is_some_and(|w| w.state == state)
         {
+            world.insert_component(workspace, WorkspaceFailure(failure.error.clone()));
             if failure.cleanup_completed {
                 world.despawn(workspace);
             } else if failure.restore_running {
@@ -304,17 +328,11 @@ pub(crate) fn handle_start_result(world: &mut World, result: Result<StartOutput,
                         member_errors: output.member_errors,
                     }
                 });
-            world.send_event(StartWorkspaceResult {
-                id: output.id,
-                result,
-            });
+            reply(&output.reply, result);
         }
         Err(failure) => {
             failure_result(world, &failure, WorkspaceState::Starting);
-            world.send_event(StartWorkspaceResult {
-                id: failure.id,
-                result: Err(failure.error),
-            });
+            reply(&failure.reply, Err(failure.error));
         }
     }
 }
@@ -337,17 +355,11 @@ pub(crate) fn handle_stop_result(world: &mut World, result: Result<StopOutput, S
                     "stop result does not match its live workspace host",
                 ))
             };
-            world.send_event(StopWorkspaceResult {
-                id: output.id,
-                result,
-            });
+            reply(&output.reply, result);
         }
         Err(failure) => {
             failure_result(world, &failure, WorkspaceState::Stopping);
-            world.send_event(StopWorkspaceResult {
-                id: failure.id,
-                result: Err(failure.error),
-            });
+            reply(&failure.reply, Err(failure.error));
         }
     }
 }
@@ -365,17 +377,11 @@ pub(crate) fn handle_restart_result(
                         member_errors: output.member_errors,
                     }
                 });
-            world.send_event(RestartWorkspaceResult {
-                id: output.id,
-                result,
-            });
+            reply(&output.reply, result);
         }
         Err(failure) => {
             failure_result(world, &failure, WorkspaceState::Restarting);
-            world.send_event(RestartWorkspaceResult {
-                id: failure.id,
-                result: Err(failure.error),
-            });
+            reply(&failure.reply, Err(failure.error));
         }
     }
 }
@@ -396,10 +402,8 @@ async fn with_world<T: Send + 'static>(
 }
 fn prepare_definition(
     path: &Path,
+    definition: WorkspaceDefinition,
 ) -> Result<(WorkspaceDefinition, Vec<AgentStartParameters>), WorkspaceError> {
-    reject_symlinks(path)?;
-    let definition = load_workspace_definition(path)?;
-    validate_definition_names(&definition)?;
     let base = path
         .parent()
         .ok_or_else(|| invalid("definition has no workspace home"))?;
@@ -433,16 +437,19 @@ async fn fresh_definition(
     context: &WorkspaceFlowContext,
 ) -> Result<(WorkspaceDefinition, Vec<AgentStartParameters>), WorkspaceError> {
     let path = context.path.clone();
-    let parsed = tokio::task::spawn_blocking(move || prepare_definition(&path))
-        .await
-        .map_err(|e| error(WorkspaceErrorKind::InvalidDefinition, e))??;
-    context
-        .definitions
-        .entries
-        .write()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .insert(context.path.clone(), parsed.0.clone());
-    Ok(parsed)
+    let definitions = context.definitions.clone();
+    tokio::task::spawn_blocking(move || {
+        let snapshot = definitions.reload()?;
+        let definition = snapshot.get(&path).cloned().ok_or_else(|| {
+            error(
+                WorkspaceErrorKind::Missing,
+                "workspace is absent from reloaded definitions",
+            )
+        })?;
+        prepare_definition(&path, definition)
+    })
+    .await
+    .map_err(|e| error(WorkspaceErrorKind::InvalidDefinition, e))?
 }
 async fn mount_executor(
     context: &WorkspaceFlowContext,
@@ -475,6 +482,7 @@ async fn mount_executor(
             ));
         }
         let component = world.get_component_mut::<Workspace>(workspace).unwrap();
+        component.definition = Some(definition.clone());
         component.name = definition.name;
         component.project_root = definition.project_root;
         component.agents.clear();
@@ -500,6 +508,7 @@ async fn start_members(
 ) -> (Vec<Entity>, Vec<MemberDiagnostic>) {
     let mut successful = Vec::new();
     let mut failures = Vec::new();
+    let mut replies = Vec::new();
     for (member, parameters) in definition.members.into_iter().zip(parameters) {
         let (sender, receiver) = oneshot::channel();
         context.events.send_event(StartAgent {
@@ -509,7 +518,16 @@ async fn start_members(
             parameters,
             reply: Arc::new(Mutex::new(Some(sender))),
         });
-        let result = match receiver.await {
+        replies.push((member, receiver));
+    }
+    let outcomes = futures_util::future::join_all(
+        replies
+            .into_iter()
+            .map(|(member, receiver)| async move { (member, receiver.await) }),
+    )
+    .await;
+    for (member, received) in outcomes {
+        let result = match received {
             Ok(Ok(agent)) => {
                 let workspace = context.workspace;
                 let name = member.name.clone();
@@ -629,7 +647,7 @@ async fn start_flow(context: WorkspaceFlowContext) -> Result<StartOutput, StartE
         .map_err(|e| fail(&context, e, false, false))?;
     let (members, member_errors) = start_members(&context, definition, parameters).await;
     Ok(StartOutput {
-        id: context.id,
+        reply: context.reply,
         workspace: context.workspace,
         members,
         member_errors,
@@ -640,7 +658,7 @@ async fn stop_flow(context: WorkspaceFlowContext) -> Result<StopOutput, StopErro
         .await
         .map_err(|e| fail(&context, e, false, false))?;
     Ok(StopOutput {
-        id: context.id,
+        reply: context.reply,
         workspace: context.workspace,
         members,
         member_errors: Vec::new(),
@@ -658,7 +676,7 @@ async fn restart_flow(context: WorkspaceFlowContext) -> Result<RestartOutput, Re
         .map_err(|e| fail(&context, e, false, false))?;
     let (members, member_errors) = start_members(&context, definition, parameters).await;
     Ok(RestartOutput {
-        id: context.id,
+        reply: context.reply,
         workspace: context.workspace,
         members,
         member_errors,

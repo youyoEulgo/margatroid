@@ -206,6 +206,7 @@ impl Fixture {
         app.world_mut().insert_component(
             workspace,
             workspace_core::Workspace {
+                definition: None,
                 name: "demo".into(),
                 definition_path: root.path().join("workspace.yaml"),
                 project_root: root.path().to_owned(),
@@ -364,14 +365,13 @@ fn all_seven_provider_api_combinations_use_explicit_auth_endpoints_and_strict_st
         assert!(
             frames
                 .iter()
-                .any(|frame| frame["type"] == "agent.message.delta" && frame["content"] == "ok")
+                .any(|frame| frame["type"] == "agent.message.chunk.sync"
+                    && frame["delta"]["content"] == "ok")
         );
-        assert_eq!(frames.last().unwrap()["type"], "agent.message.finished");
-        assert!(
-            frames.iter().all(
-                |frame| frame["id"] == "request" && frame["agent_instance"] == "driver-fixture"
-            )
-        );
+        assert_eq!(frames.last().unwrap()["type"], "agent.message.full.sync");
+        assert!(frames.iter().all(|frame| frame["generation"] == "request"
+            && frame.get("instance").is_none()
+            && frame.get("agent_instance").is_none()));
         let (path, headers, body) = server
             .received
             .recv_timeout(Duration::from_secs(1))
@@ -669,7 +669,7 @@ fn next_ws(
 }
 
 #[test]
-fn dto_advertised_vm_instance_matches_real_inference_delta_and_finished_frames() {
+fn address_only_state_and_streams_preserve_target_through_vm_restart() {
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -707,7 +707,7 @@ fn dto_advertised_vm_instance_matches_real_inference_delta_and_finished_frames()
         .unwrap();
     runtime.block_on(socket.send(Message::Text(json!({"type":"connection.register","id":"register","message":{"client_type":"webui","name":"browser"}}).to_string().into()))).unwrap();
     next_ws(&mut fixture, &runtime, &mut socket, |frame| {
-        frame["type"] == "connection.registered"
+        frame["type"] == "connection.register.result" && frame["success"] == true
     });
     let mut expected_instance = "driver-fixture";
     for (request_id, instance) in [
@@ -718,49 +718,46 @@ fn dto_advertised_vm_instance_matches_real_inference_delta_and_finished_frames()
             install_vm(fixture.app.world_mut(), fixture.agent, instance);
             expected_instance = instance;
         }
-        let state = next_ws(&mut fixture, &runtime, &mut socket, |frame| {
-            frame["type"] == "state.sync"
-                && frame["state"]["agents"].as_array().is_some_and(|agents| {
-                    agents.iter().any(|agent| {
-                        agent["agent"] == "agent:test/agent:latest"
-                            && agent["agent_instance"] == instance
-                    })
-                })
-        });
-        let advertised = state["state"]["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|agent| agent["agent"] == "agent:test/agent:latest")
-            .unwrap()["agent_instance"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert_ne!(advertised, format!("{:?}", fixture.agent));
+        if request_id == "first-stream" {
+            let state = next_ws(&mut fixture, &runtime, &mut socket, |frame| {
+                frame["type"] == "agent.sync"
+            });
+            assert!(
+                state["agents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|agent| agent.get("instance").is_none())
+            );
+        }
         let (request, reply) = fixture.request(request_id);
         fixture.app.world().emit_event(request);
         fixture.app.tick();
         let response = fixture.response(reply).unwrap();
         assert_eq!(response.content.as_deref(), Some("answer"));
         let reasoning = next_ws(&mut fixture, &runtime, &mut socket, |frame| {
-            frame["id"] == request_id && frame["type"] == "agent.message.reasoning_delta"
+            frame["generation"] == request_id
+                && frame["type"] == "agent.message.chunk.sync"
+                && frame["delta"]["reasoning"].is_string()
         });
         let content = next_ws(&mut fixture, &runtime, &mut socket, |frame| {
-            frame["id"] == request_id && frame["type"] == "agent.message.delta"
+            frame["generation"] == request_id
+                && frame["type"] == "agent.message.chunk.sync"
+                && frame["delta"]["content"].is_string()
         });
         let finished = next_ws(&mut fixture, &runtime, &mut socket, |frame| {
-            frame["id"] == request_id && frame["type"] == "agent.message.finished"
+            frame["generation"] == request_id && frame["type"] == "agent.message.full.sync"
         });
         for frame in [&reasoning, &content, &finished] {
-            assert_eq!(frame["agent_instance"], advertised);
-            assert_eq!(frame["agent"], "agent:test/agent:latest");
+            assert!(frame.get("instance").is_none());
+            assert_eq!(frame["address"], "agent:test/agent:latest");
             serde_json::from_value::<margatroid_protocol::ServerMessage>(frame.clone()).unwrap();
         }
-        assert_eq!(reasoning["content"], "thinking");
+        assert_eq!(reasoning["delta"]["reasoning"], "thinking");
         assert_eq!(reasoning["sequence"], 1);
-        assert_eq!(content["content"], "answer");
+        assert_eq!(content["delta"]["content"], "answer");
         assert_eq!(content["sequence"], 2);
-        assert!(content.get("delta").is_none());
+        assert!(content["delta"].is_object());
         assert!(finished.get("sequence").is_none());
         assert_eq!(finished["error"], Value::Null);
         fixture.idle();

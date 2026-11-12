@@ -6,13 +6,8 @@ use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
 use async_runtime_plugin::AsyncRuntimeHandle;
 use closure_plugin::WorldClosureExt;
 use core_plugin::{App, Plugin, Resource};
-use std::{
-    collections::BTreeMap,
-    path::{Component, Path, PathBuf},
-};
-use workspace_core::{
-    load_workspace_definition, WorkspaceDefinitions, WorkspaceError, WorkspaceErrorKind as K,
-};
+use std::path::{Component, Path, PathBuf};
+use workspace_core::{WorkspaceDefinitions, WorkspaceError, WorkspaceErrorKind as K};
 
 pub struct WorkspacePlugin {
     pub schedule: String,
@@ -39,63 +34,24 @@ impl WorkspacePlugin {
         self
     }
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, WorkspaceError> {
-        let root = root.into();
-        let root = if root.is_absolute() {
-            root
-        } else {
-            std::env::current_dir().map_err(invalid)?.join(root)
-        };
-        reject_symlinks(&root)?;
-        let root = std::fs::canonicalize(root).map_err(invalid)?;
-        let metadata = std::fs::metadata(&root).map_err(invalid)?;
-        let (directory, file, paths) = if metadata.is_file() {
+        let definitions = WorkspaceDefinitions::open(root)?;
+        let source = definitions
+            .source()
+            .expect("open records definition source")
+            .to_path_buf();
+        let (directory, file) = if source.is_file() {
             (
-                root.parent()
+                source
+                    .parent()
                     .ok_or_else(|| invalid("definition has no parent"))?
                     .to_path_buf(),
-                Some(root.clone()),
-                vec![root],
+                Some(source),
             )
-        } else if metadata.is_dir() {
-            let mut paths = Vec::new();
-            let mut entries = std::fs::read_dir(&root)
-                .map_err(invalid)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(invalid)?;
-            entries.sort_by_key(|entry| entry.file_name());
-            for entry in entries {
-                if entry.file_name().to_string_lossy().starts_with('.') {
-                    continue;
-                }
-                let kind = entry.file_type().map_err(invalid)?;
-                if kind.is_symlink() {
-                    return Err(invalid("workspace root contains a symbolic link"));
-                }
-                if kind.is_dir() {
-                    let path = entry.path().join("workspace.yaml");
-                    if path.exists() {
-                        reject_symlinks(&path)?;
-                        paths.push(path);
-                    }
-                }
-            }
-            (root, None, paths)
         } else {
-            return Err(invalid("workspace root must be a directory or YAML file"));
+            (source, None)
         };
-        if paths.len() > 4096 {
-            return Err(invalid("workspace definition count exceeds 4096"));
-        }
-        let mut entries = BTreeMap::new();
-        for path in paths {
-            let definition = load_workspace_definition(&path)?;
-            validate_definition_names(&definition)?;
-            entries.insert(path, definition);
-        }
         Ok(Self {
-            definitions: WorkspaceDefinitions {
-                entries: std::sync::Arc::new(std::sync::RwLock::new(entries)),
-            },
+            definitions,
             root: Some(directory),
             file,
             ..Self::default()
@@ -147,15 +103,6 @@ pub(crate) fn validate_name(name: &str) -> Result<(), WorkspaceError> {
             .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
     {
         return Err(invalid("invalid workspace or member name"));
-    }
-    Ok(())
-}
-pub(crate) fn validate_definition_names(
-    definition: &workspace_core::WorkspaceDefinition,
-) -> Result<(), WorkspaceError> {
-    validate_name(&definition.name)?;
-    for member in &definition.members {
-        validate_name(&member.name)?;
     }
     Ok(())
 }

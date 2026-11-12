@@ -9,6 +9,7 @@ pub struct Workspace {
     pub project_root: PathBuf,
     pub state: WorkspaceState,
     pub agents: BTreeSet<Entity>,
+    pub definition: Option<crate::WorkspaceDefinition>,
 }
 impl Component for Workspace {}
 #[derive(Debug)]
@@ -22,3 +23,7 @@ impl Drop for WorkspaceExecutor {
         self.entry.close_admission();
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceFailure(pub crate::WorkspaceError);
+impl Component for WorkspaceFailure {}

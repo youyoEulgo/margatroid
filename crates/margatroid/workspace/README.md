@@ -4,13 +4,15 @@ workspace_core定义Workspace组件、状态、事件、定义和专属线程能
 
 ## 配置与运行实例
 
-Margatroid启动时传入配置根目录，调用WorkspacePlugin::open读取并校验全部工作区定义，再安装插件。文件读取在安装前同步完成，失败直接返回启动入口；build只安装已加载的WorkspaceDefinitions Resource和System，不隐藏文件IO。
+Margatroid启动时传入配置根目录，调用WorkspacePlugin::open读取并校验全部工作区定义，再安装插件。文件读取在安装前同步调用WorkspaceDefinitions::open完成，失败直接返回启动入口；build只安装已加载的WorkspaceDefinitions Resource和System，不隐藏文件IO。
 
-WorkspaceDefinitions保存定义文件路径和展示用解析缓存，启动Margatroid时加载一次。前端列表和详情同步读取缓存，不为展示查询发送领域事件或扫描磁盘。
+WorkspaceDefinitions是展示和启动共同使用的定义缓存，不再限定为展示目录。所有定义加载只有一条全量重载流程：读取配置根下全部定义、完整校验、原子更新缓存。不提供针对某个Workspace单独读取并启动的旁路。
 
-StartWorkspace与RestartWorkspace使用相同字段：id、path。每次启动或重启都重新读取path指向的文件并解析；解析成功后更新展示缓存，同时将本次解析值直接用于生命周期流程。不得从缓存启动，读取失败不得用旧缓存兜底；原展示缓存可以保留。
+显式reload只执行上述流程。Workspace和Agent的启动、重启固定先执行同一全量reload，成功后再从缓存读取目标Workspace及成员参数启动；失败即结束操作，不能继续从旧缓存启动。
 
-重启先读取、校验新定义，再关闭旧实例并用本次定义启动。定义解析由异步闭包完成，Handler克隆缓存的Arc句柄给闭包，解析成功后短写锁更新；锁不跨await，不借用World。运行Workspace仅保存定义文件路径作为运行关联，不保存另一份定义缓存；Address及执行器独立挂载。
+reload返回同一次发布的不可变缓存快照，后续启动以该快照为数据源，避免并发重载使“刚重载”和“启动使用”的内容分离。Workspace批量启动成员复用这一份快照，不对每个成员重复扫描。单独启动或重启Agent则先完成一次全量reload，从新快照选择所属Workspace与成员，再调用既有Agent生命周期能力。
+
+重启在重载及目标解析成功后才关闭旧实例，之后从本次缓存快照启动。启动底层步骤不再重复重载或回源单个文件。运行实例仍以Entity/Address定位，定义缓存不代替实例身份；更新缓存不会自动热改已有实例。Driver程序读取继续由AgentDriver领域完成，不把Lua程序混入Workspace定义缓存。
 
 ## 生命周期
 
@@ -18,7 +20,7 @@ StartWorkspace与RestartWorkspace使用相同字段：id、path。每次启动�
 
 同一Schedule依次挂载停止、重启、启动System，直接使用mecs添加顺序。System只收集事件并路由，闭包直接返回Result，不增加结果包装事件。
 
-启动创建Workspace实体及专属线程，再按本次文件解析结果逐成员发送带oneshot回复端的StartAgent；成员文件固定为定义所在目录agents/<成员名>/state.sqlite与setting.toml，不回退到其他设置文件名；闭包等待Agent完整启动回复后继续。成员失败不抹除成功成员；线程建立且成员请求收口后进入Running，并返回成员诊断。
+启动创建Workspace实体及专属线程，再按本次文件解析结果为各成员分别创建并发送带独立oneshot回复端的StartAgent；成员文件固定为定义所在目录agents/<成员名>/state.sqlite与setting.toml，不回退到其他设置文件名；闭包先发出全部成员事件，再并发等待每个Agent完整启动回复。成员失败不抹除成功成员；线程建立且成员请求收口后进入Running，并返回成员诊断。
 
 关闭等待已受理成员创建收口，停止全部Agent并等待活动及MCL清理，最后退出并join专属线程。全部完成后销毁Workspace；清理未确认时保留宿主并报告失败。重启复用关闭和启动流程，全程Restarting，旧线程退出后才创建新线程。
 
@@ -27,3 +29,12 @@ StartWorkspace与RestartWorkspace使用相同字段：id、path。每次启动�
 WorkspaceExecutor持有提交入口和关闭能力。Send工厂在专属线程中创建可非Send的Future，用于Driver等本地任务；线程不持有ECS World。
 
 关闭提交入口不终止已有任务，Driver仍能完成退出。需要额外提交的清理工作使用明确的内部能力，不重新开放普通入口。生命周期闭包运行在mecs全局异步设施，不运行在待关闭的Workspace线程上；join不阻塞ECS线程。
+
+
+新API设计将统一缓存定义与自身运行状态由DTO合成Workspace对象，不再提供definitions wire子域。WorkspaceDefinitions::reload是全部重载入口，既供workspace.reload调用，也供Workspace/Agent启动重启前调用。全量加载及Workspace生命周期已共用同一core入口，不改变System或公开事件字段。扫描移除但仍运行的实例保留展示，只允许停止；启动或重启要求本次全量重载后的缓存包含目标定义。停止完成后，该来源已移除的项退出列表。
+
+全量reload使用共享串行锁覆盖读取、校验和发布；返回的WorkspaceDefinitionSnapshot持有不可变Arc，后续重载不会改变已取得的启动材料。未配置来源的默认资源reload明确报错，不把旧entries伪装成刚读到的新数据。配置来源保留目录或单文件两种既有装配形式；单文件形式的全量集合就是该配置文件，不新增按请求目标单独读取的旁路。
+
+生命周期请求携带WorkspaceOperationReply，领域操作收口后直接回复原oneshot。Workspace自身持有本次启动使用的完整definition，用于运行快照和扫描来源移除后的展示。req只读取已发布目录与实例定义，来源已移除的运行实例只受理停止；启动和重启以全量reload后缓存中的存在性为条件。领域失败通过WorkspaceFailure投影，成功收口清除对应故障。
+
+一个StartAgent只启动一个Agent。Workspace持有成员启动的并发编排，先发送全部单成员事件，再join_all收齐全部结果；Agent领域只处理自己的单次生命周期操作。

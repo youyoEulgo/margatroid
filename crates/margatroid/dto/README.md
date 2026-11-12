@@ -1,29 +1,53 @@
-# DtoPlugin
+# DTO
 
-DtoPlugin适配WebSocket协议与领域事件。它依赖protocol、address、各领域core、mecs及Margatroid axum_plugin基础设施，不依赖其他业务plugin，不单独提供dto_core。
+本文与DESIGN描述确认后的新API接入设计。DTO、领域回复、Protocol、CLI及前端已按该链路接通，运行产物需使用相应构建版本。
 
-## 入站
+## 请求与响应
 
-DtoPlugin自行注册原生/ws Router并拥有全部连接（包括未注册连接）、读写Future及有界出站队列；握手handler直接检查IngressPolicy，读循环按protocol解析信封。无效帧直接响应或关闭，只有已解析DtoRequest进入World，不使用mecs通用网络事件。除连接注册外，先从真实连接取得Client Entity，拒绝未注册连接和同一Client重复的在途请求ID。运行目标通过address解析为完整Entity，再检查组件、Workspace归属和实例。未运行的Workspace直接从启动时加载的内存配置选择，不创建占位Entity。
+普通请求由Axum Handler创建一次性oneshot。serve_connection预处理协议对象，将路由字符串和owned对象装入DtoRequest。dto_route_system按字符串选择具体边界类型，调用try_from及into_event，将原发送端交给领域请求。
 
-列出Workspace同步读取内存配置并回复，不发送领域事件或提交异步任务；启动或重启携带path，Workspace重新读文件后更新展示缓存；整体重载不在此定义。异步请求生成独立operation_id，记录原网络ID、Client Entity、连接及目标实例，再转换成领域请求。不同连接可以使用相同网络ID；内部事件不传播外部实体地址。
+网络任务持有原接收端。领域结果只承载纯领域值；网络任务收到后编码result/res并写回socket。RegisteredClient包含实际地址与client_type，Workspace生命周期结果只供确认成功，Agent返回Entity只用于内部关联，MCL返回自己的MclValue。响应编码不需要进入World。
 
-## 回执与同步
+DTO校验失败、同步查询完成或owned读取worker结束时，同样使用原发送端。具体边界类型持有Prepared及原reply，reject映射为对应领域错误并完成回复。
 
-领域结果按operation_id关联，复检原目标、Client实例和连接后，只向原连接发送回执并释放关联。断连删除网络关联，不撤销已受理领域操作；迟到结果不绑定新连接或同地址新实体。
+每请求的接收Future进入本连接等待集合，socket读循环继续接收。socket写循环同时消费已完成的一次性结果和主动推送队列。oneshot不被转发为第二个oneshot或完成事件。网络连接的在途id由Ticket登记并在等待结束时释放，重复id不会覆盖原项。
 
-状态同步只读取领域组件和已加载的内存配置，通过Address取得对外地址。缓存保存最近投影，不建立第二份领域状态。消息不包含凭据、源码、数据库句柄或内部Entity表示。
+## 控制与同步
 
-## 职责边界
+agent.turn.abort由网络Handler直接构造AbortTurnControl，abort_control_system在PRE_UPDATE完成连接、地址、实例、回合的校验及中止裁决，通过原oneshot返回。普通请求保持一帧DTO受理、一帧领域受理；业务IO及实际生命周期收口时间按操作本身计算。
 
-Protocol只定义网络类型、序列化和格式校验；依赖领域类型的转换、寻址和错误映射均在DtoPlugin。Handler负责具体边界处理，System只收集事件并路由。
+dto_sync_system每帧从实际Client组件按既定条件筛选并去重ClientSender。req/res和sync均是纯查询；command/result承担业务副作用。查询不建立接收关系，也不改变同步对象或发送条件。
 
-DtoPlugin不执行MCL、模型推理、资源加载、数据库操作、目录扫描或生命周期清理。历史读取通过领域能力异步完成。请求受理、持久提交和运行成功分别表达，不把其中一个当作另一个的证明。
+Workspace、Agent、Turn和Task读取当前投影并发送变化；Task取完整保留窗口，保留脚本cursor和replaced状态。消息、Agent日志与MCL按各表真实sequence识别新增条目；sync内部的读取位置仅服务观察进度，不修改持久记录。每帧接收者由当次筛选决定，查询页与sync读取位置独立。
 
-入站消息总上限32MiB，请求ID非空且最多512个UTF-8字节。有可用ID的非法请求返回request.failed；无法关联的非法消息关闭连接，格式错误使用1007，超大消息使用1009。错误不回显凭据、图片或请求正文。
+Worker在有界批次中读取记录，codec重建完整消息后直接编码并发送。读完且完成发送的部分才推进观察位置，失败保留实际进度。目标实例的取消能力由System逐帧核对后维护，退出实例的owned worker会停止继续投递。
 
-回合中止保留两帧业务处理：DTO原生读循环解析后发送DtoRequest，UPDATE领域转换并发送私有AbortTurnControl，下一帧PRE_UPDATE控制Handler核对身份、回合同步清turn，再取消当前推理句柄，调用ToolTasks::abort_unreturned原子强制回复并终止未return任务；已return后台任务保留。控制System固定PRE_UPDATE，MCL/Inference/Tool仅允许UPDATE或POST_UPDATE；不能证明顺序的自定义schedule拒绝安装，不新增metadata或修改mecs。Axum不持有业务句柄，不新增直接取消通道。控制回执仅表示受理，不代表流读取任务已经退出。
+## 生命周期与定义
 
-MCL以原oneshot返回，DTO等待闭包将其转换为网络mcl.command_result，不要求MCL另发结果观察事件。展示缓存不能作为启动配置或运行实例身份来源。
+Workspace启动和重启进入所属领域后执行同一全量reload，再从本次不可变缓存快照启动。Workspace.definition保留该实例实际使用的完整定义。扫描来源移除后，列表继续展示该运行实例及其定义，只允许停止；停止完成后退出列表。
 
-升级前取得AxumLifetime退出登记，完整连接Future退出后才释放；读写监听共享停止信号。发送器Full/Closed立即取消对应连接，断开恰好一次通知ClientDisconnected。日志订阅、等待oneshot和历史快照使用普通异步闭包，统一走普通异步闭包结果收口；排队前不捕获事件发送器，dispatch时取得AsyncContext，避免队列循环持有。
+显式workspace.reload只调用统一全量重载。查询只读取缓存。读取或校验失败终结本次操作，旧缓存保持原值但不能冒充本次成功重载。
+
+Workspace请求携带原WorkspaceOperationReply，领域处理在状态提交或清理收口后直接回复。领域内用于真实执行收口的Result<StartOutput/StopOutput/RestartOutput, ...>仍由所属System处理，它们是业务提交步骤，不是网络响应绕回DTO。
+
+## 领域边界
+
+Client的注册请求新增原oneshot回复能力，成功结果提供实际地址及类别。Workspace的Start/Stop/Restart请求新增原oneshot回复能力，生命周期结果由原回复返回。DTO原先的一次性结果收集路由由上述直接回复取代。
+
+MclCommand、StorageRequest、InitInference、InitToolTasks及Driver VM控制继续保持领域类型和原reply约定。Inference按已确定的统一消息结构发送chunk与生成结束full；Driver显式写历史后，新增消息full携带真实持久sequence。
+
+## Agent单成员启动
+
+一个StartAgent只对应一个Agent，携带单成员的名称、启动参数及原reply。Workspace全量重载一次，从本次缓存快照取得各成员参数，分别创建StartAgent及独立oneshot；先发出全部事件，再并发等待所有回复。一个成员失败仍收齐其他成员结果。
+
+单独Agent启动或重启的网络Handler持有安装时注入的WorkspaceDefinitions能力，在worker中执行统一全量reload，再把本次不可变缓存快照放入预处理对象。DTO按字符串转换具体类型后，结合World中的目标Workspace及成员名，从该快照取得单成员参数并发送原领域事件。网络Handler只调用owned core能力，World寻址和DTO转换仍发生在DTO帧。
+
+该流程沿用StartAgent的单成员parameters与reply，不引入Agent批量启动类型。Agent地址在DTO边界解析为完整Entity，领域通过该Entity查询组件并校验当前状态。
+
+## 验证范围
+
+42种消息逐一验证。req保持业务状态与发送筛选条件，result在无变化和失败时都完成本次等待。中止直接进入控制System，原oneshot只被完成一次。
+
+验证全部定义重载、目标移除只允许停止、TEMP纯内存、规范消息列与真实序号、任务查询不消费脚本游标。断线、重连及换实例验证身份隔离，范围查询与新增记录验证游标稳定。完成源码集成后运行全仓回归、严格Clippy及前端测试，不以文档变更或局部通过声明整套API可用。
+
+外部请求和同步使用Agent Address。完整Entity及取消能力用于后端生命周期管理；响应投影只输出API规定的业务字段。审计payload与日志context_json中的内部VM标识在网络边界过滤。

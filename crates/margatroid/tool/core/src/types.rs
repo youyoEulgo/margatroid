@@ -45,6 +45,16 @@ pub struct TaskReadResult {
     pub error: Option<ToolError>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolTaskSnapshot {
+    pub task_id: String,
+    pub call_id: String,
+    pub alias: String,
+    pub returned: bool,
+    pub output: Vec<Value>,
+    pub error: Option<ToolError>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolExecutionLimits {
@@ -298,6 +308,21 @@ impl ToolTaskHandle {
         state.replaced = true;
         append_cache(&mut state, value, self.inner.cache_bytes);
         Ok(())
+    }
+
+    pub fn snapshot(&self, task_id: &str) -> Option<ToolTaskSnapshot> {
+        let state = lock(&self.inner.shared);
+        if state.cleanup_complete {
+            return None;
+        }
+        Some(ToolTaskSnapshot {
+            task_id: task_id.to_owned(),
+            call_id: state.call_id.clone(),
+            alias: state.alias.clone(),
+            returned: state.returned,
+            output: state.output.clone(),
+            error: state.error.clone(),
+        })
     }
 
     pub fn read(&self) -> Result<TaskReadResult, ToolError> {

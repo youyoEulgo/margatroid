@@ -1,8 +1,8 @@
 use super::*;
 use serde_json::json;
 
-fn definition(name: &str, root: &Path) -> WorkspaceConfigDto {
-    serde_json::from_value(json!({"path":format!("/configured/{name}/workspace.yaml"),"cache":{"name":name,"project_root":root,"agents":[]}})).unwrap()
+fn definition(name: &str, root: &Path) -> WorkspaceInfoDto {
+    serde_json::from_value(json!({"path":format!("/configured/{name}/workspace.yaml"),"definition":{"name":name,"project_root":root,"agents":[]},"status":"inactive","address":null,"error":null})).unwrap()
 }
 #[test]
 fn definitions_select_exact_name_or_canonical_current_project_root() {
@@ -35,7 +35,11 @@ fn chooser_cancel_and_invalid_numbers_never_guess() {
     ];
     let candidates = entries.iter().collect::<Vec<_>>();
     assert_eq!(
-        parse_choice("2", &candidates).unwrap().unwrap().cache.name,
+        parse_choice("2", &candidates)
+            .unwrap()
+            .unwrap()
+            .definition
+            .name,
         "two"
     );
     for cancel in ["", "q", "Q"] {
@@ -46,25 +50,22 @@ fn chooser_cancel_and_invalid_numbers_never_guess() {
     }
 }
 #[test]
-fn startup_receipt_uses_backend_runtime_address_and_keeps_partial_success() {
+fn startup_receipt_confirms_operation_without_inventing_runtime_state() {
     let mut session = CliSession {
         workspace_path: Some("/configured/test/workspace.yaml".into()),
         ..CliSession::default()
     };
-    let message=json!({"type":"workspace.started","id":"start","workspace":{"id":"workspace:local/runtime:latest","name":"display","project_root":"/project","definition_path":"/configured/test/workspace.yaml","status":"running","agents":[],"member_failures":[{"agent":"reviewer","driver":"driver:local/review","error":"failed member"}]}}).to_string();
+    let message = json!({"type":"workspace.start.result","id":"start","success":true}).to_string();
     handle_workspace_start_reply(&message, "other", &mut session).unwrap();
-    assert!(session.workspace_address.is_none());
+    assert!(!session.workspace_started);
     handle_workspace_start_reply(&message, "start", &mut session).unwrap();
-    assert_eq!(
-        session.workspace_address.as_deref(),
-        Some("workspace:local/runtime:latest")
-    );
-    let late=json!({"type":"workspace.start_failed","id":"start","error":{"kind":"Late","message":"late duplicate"}}).to_string();
+    assert!(session.workspace_started);
+    let late=json!({"type":"workspace.start.result","id":"start","success":false,"error":{"code":"Late","message":"duplicate"}}).to_string();
     handle_workspace_start_reply(&late, "start", &mut session).unwrap();
 }
 #[test]
 fn matching_failure_before_start_is_terminal_and_unrelated_ids_are_ignored() {
-    let message=json!({"type":"request.failed","id":"start","error":{"kind":"InvalidRequest","message":"bad path"}}).to_string();
+    let message=json!({"type":"workspace.start.result","id":"start","success":false,"error":{"code":"InvalidRequest","message":"bad path"}}).to_string();
     let mut session = CliSession::default();
     handle_workspace_start_reply(&message, "other", &mut session).unwrap();
     assert!(
@@ -73,20 +74,20 @@ fn matching_failure_before_start_is_terminal_and_unrelated_ids_are_ignored() {
             .to_string()
             .contains("bad path")
     );
-    assert!(session.workspace_address.is_none());
+    assert!(!session.workspace_started);
 }
 #[test]
 fn registration_and_stop_receipts_require_the_expected_id() {
-    let registration=json!({"type":"connection.register_failed","id":"registration","error":{"kind":"Denied","message":"denied"}}).to_string();
+    let registration=json!({"type":"connection.register.result","id":"registration","success":false,"error":{"code":"Denied","message":"denied"}}).to_string();
     assert!(registration_reply(&registration, "other").is_none());
     assert!(matches!(
         registration_reply(&registration, "registration"),
         Some(Err(CliError::Remote(_)))
     ));
-    let stop=json!({"type":"workspace.stopped","id":"stop","workspace":{"id":"workspace:local/runtime:latest","name":"runtime","project_root":"/project"}}).to_string();
+    let stop = json!({"type":"workspace.stop.result","id":"stop","success":true}).to_string();
     assert!(stop_reply(&stop, "other").is_none());
     assert!(matches!(stop_reply(&stop, "stop"), Some(Ok(()))));
-    let failure=json!({"type":"request.failed","id":"stop","error":{"kind":"CleanupFailed","message":"not stopped"}}).to_string();
+    let failure=json!({"type":"workspace.stop.result","id":"stop","success":false,"error":{"code":"CleanupFailed","message":"not stopped"}}).to_string();
     assert!(matches!(
         stop_reply(&failure, "stop"),
         Some(Err(CliError::Remote(_)))

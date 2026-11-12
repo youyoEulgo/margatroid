@@ -102,7 +102,7 @@ fn delivery() -> StreamDelivery {
     StreamDelivery {
         id: "request".into(),
         agent: "agent:test/agent:latest".into(),
-        instance: "instance".into(),
+        turn: "turn".into(),
         senders: vec![],
     }
 }
@@ -163,6 +163,8 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
     let (reply, mut received) = oneshot::channel();
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
+    let (mut delivery, mut frames) = captured_delivery();
+    delivery.turn = "turn".into();
     let context = InferenceContext {
         request,
         reply: Some(reply),
@@ -170,7 +172,7 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
         deadline: tokio::time::Instant::now() + Duration::from_secs(180),
         client: reqwest::Client::new(),
         gate: gate.clone(),
-        delivery: delivery(),
+        delivery,
         cleanup_notification: None,
         cleanup_gate: Some((entered.clone(), release.clone())),
     };
@@ -214,6 +216,22 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
     assert!(response.tool_calls.is_empty());
 
     assert_eq!(response.usage, None);
+    let mut sent = Vec::new();
+    while let Ok(frame) = frames.try_recv() {
+        sent.push(frame_json(frame));
+    }
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0]["type"], "agent.message.chunk.sync");
+    assert_eq!(sent[0]["delta"], json!({"content":"accepted"}));
+    assert_eq!(sent[1]["type"], "agent.message.full.sync");
+    assert_eq!(sent[1]["message"]["content"], "accepted");
+    assert_eq!(sent[1]["message"]["stop_reason"], "completed");
+    assert!(sent[1]["history_sequence"].is_null());
+    assert!(sent[1]["message"].get("sequence").is_none());
+    assert!(sent[1]["error"].is_null());
+    assert!(!sent
+        .iter()
+        .any(|v| v.to_string().contains("must-not-appear")));
     drop(sender);
     server.await.unwrap();
 }
@@ -228,6 +246,7 @@ async fn provider_error_replies_before_stalled_cleanup_and_retains_active_handle
     let (reply, received) = oneshot::channel();
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
+    let (delivery, mut frames) = captured_delivery();
     let task = tokio::spawn(supervise_inference(InferenceContext {
         request: input,
         reply: Some(reply),
@@ -235,7 +254,7 @@ async fn provider_error_replies_before_stalled_cleanup_and_retains_active_handle
         deadline: tokio::time::Instant::now() + Duration::from_secs(180),
         client: reqwest::Client::new(),
         gate: gate.clone(),
-        delivery: delivery(),
+        delivery,
         cleanup_notification: None,
         cleanup_gate: Some((entered.clone(), release.clone())),
     }));
@@ -257,6 +276,21 @@ async fn provider_error_replies_before_stalled_cleanup_and_retains_active_handle
         .unwrap()
         .unwrap_err();
     assert_eq!(failed.kind, Kind::ResponseInvalid);
+    let full = frame_json(frames.recv().await.unwrap());
+    assert_eq!(full["type"], "agent.message.full.sync");
+    assert_eq!(full["error"]["code"], "ResponseInvalid");
+    assert_eq!(full["message"]["type"], "error");
+    assert_eq!(full["message"]["request_id"], "request");
+    assert!(full["history_sequence"].is_null());
+    let correction = tokio::time::timeout(Duration::from_secs(4), frames.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let correction = frame_json(correction);
+    assert_eq!(correction["type"], "agent.message.full.sync");
+    assert_eq!(correction["generation"], full["generation"]);
+    assert_eq!(correction["error"]["code"], "CleanupFailed");
+    assert!(correction["history_sequence"].is_null());
     assert!(gate.lock().unwrap().closed);
     assert!(
         !handle.is_finished(),
@@ -1038,14 +1072,20 @@ fn status_error(body: &[u8], headers: &[(&str, &str)]) -> InferenceError {
 fn status_error_json_allowlists_fields_even_when_message_contains_request_id() {
     let failed = status_error(br#"{"error":{"type":"service_unavailable_error","code":"overloaded","request_id":"nested-id","message":"Service is too busy (request_id: embedded-id)","api_key":"unknown-secret","url":"https://private.invalid"},"request_id":"root-id","unknown":"ignored"}"#, &[("x-request-id", "header-id")]);
     assert_eq!(failed.kind, Kind::ResponseStatus);
-    assert_eq!(failed.message, "HTTP 503 Service Unavailable; type=service_unavailable_error; code=overloaded; request_id=nested-id; message=Service is too busy (request_id: embedded-id)");
+    assert_eq!(
+        failed.message,
+        "HTTP 503 Service Unavailable; type=service_unavailable_error; code=overloaded; request_id=nested-id; message=Service is too busy (request_id: embedded-id)"
+    );
 }
 
 #[test]
 fn status_error_captured_yakumo_503_preserves_busy_detail_and_embedded_request_id() {
     let captured = br#"{"error":{"message":"Service is too busy. We advise users to temporarily switch to alternative LLM API service providers. (request_id: 57b431fb-e5fd-43b9-94ce-785f607bcfd7)","type":"service_unavailable_error","param":null,"code":"service_unavailable_error"}}"#;
     let failed = status_error(captured, &[]);
-    assert_eq!(failed.message, "HTTP 503 Service Unavailable; type=service_unavailable_error; code=service_unavailable_error; request_id=57b431fb-e5fd-43b9-94ce-785f607bcfd7; message=Service is too busy. We advise users to temporarily switch to alternative LLM API service providers. (request_id: 57b431fb-e5fd-43b9-94ce-785f607bcfd7)");
+    assert_eq!(
+        failed.message,
+        "HTTP 503 Service Unavailable; type=service_unavailable_error; code=service_unavailable_error; request_id=57b431fb-e5fd-43b9-94ce-785f607bcfd7; message=Service is too busy. We advise users to temporarily switch to alternative LLM API service providers. (request_id: 57b431fb-e5fd-43b9-94ce-785f607bcfd7)"
+    );
     println!("{}", failed);
 }
 
@@ -1055,7 +1095,14 @@ fn status_error_supports_string_anthropic_and_request_id_fallbacks() {
         status_error(br#"{"error":"busy","request_id":"root-id"}"#, &[]).message,
         "HTTP 503 Service Unavailable; request_id=root-id; message=busy"
     );
-    assert_eq!(status_error(br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#, &[("x-request-id", "anthropic-id")]).message, "HTTP 503 Service Unavailable; type=overloaded_error; request_id=anthropic-id; message=Overloaded");
+    assert_eq!(
+        status_error(
+            br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            &[("x-request-id", "anthropic-id")]
+        )
+        .message,
+        "HTTP 503 Service Unavailable; type=overloaded_error; request_id=anthropic-id; message=Overloaded"
+    );
     assert!(status_error(b"", &[("request-id", "fallback-id")])
         .message
         .contains("request_id=fallback-id"));
@@ -1182,7 +1229,10 @@ async fn status_error_real_json_redacts_the_actual_outbound_key() {
     )
     .await
     .unwrap_err();
-    assert_eq!(failed.message, "HTTP 503 Service Unavailable; type=service_unavailable_error; code=busy; request_id=real-header-id; message=Service is too busy; echoed [REDACTED]");
+    assert_eq!(
+        failed.message,
+        "HTTP 503 Service Unavailable; type=service_unavailable_error; code=busy; request_id=real-header-id; message=Service is too busy; echoed [REDACTED]"
+    );
     let _ = release.send(());
     server.await.unwrap();
 }
@@ -1534,4 +1584,105 @@ async fn dropping_last_polled_waiter_does_not_strand_another_shared_waiter() {
         "supervisor completion must wake the surviving waiter"
     );
     first.await.unwrap();
+}
+
+fn captured_delivery() -> (StreamDelivery, mpsc::Receiver<ClientFrame>) {
+    let (sender, receiver) = mpsc::channel(16);
+    let mut delivery = delivery();
+    delivery
+        .senders
+        .push(client_core::ClientSender::new(sender));
+    (delivery, receiver)
+}
+
+fn frame_json(frame: ClientFrame) -> Value {
+    let ClientFrame::Text(text) = frame else {
+        panic!("expected text frame")
+    };
+    serde_json::from_str(&text).unwrap()
+}
+
+#[tokio::test]
+async fn chunk_frames_share_one_generation_sequence_and_use_new_identity_fields() {
+    let (mut delivery, mut frames) = captured_delivery();
+    let (sender, receiver) = mpsc::channel(4);
+    sender
+        .send(ProviderFragment::Reasoning("thought".into()))
+        .await
+        .unwrap();
+    sender
+        .send(ProviderFragment::Content("answer".into()))
+        .await
+        .unwrap();
+    sender
+        .send(ProviderFragment::Finished(InferenceStopReason::Completed))
+        .await
+        .unwrap();
+    drop(sender);
+    let gate = Arc::new(Mutex::new(StreamGate::default()));
+    receive_stream(
+        gate.clone(),
+        CancellationToken::new(),
+        &mut delivery,
+        receiver,
+    )
+    .await
+    .unwrap();
+    for (sequence, delta) in [
+        (1, json!({"reasoning":"thought"})),
+        (2, json!({"content":"answer"})),
+    ] {
+        let frame = frame_json(frames.recv().await.unwrap());
+        assert_eq!(
+            frame,
+            json!({"type":"agent.message.chunk.sync","address":"agent:test/agent:latest","turn":"turn","generation":"request","sequence":sequence,"delta":delta})
+        );
+    }
+    assert!(frames.try_recv().is_err());
+    assert_eq!(gate.lock().unwrap().sequence, 2);
+}
+
+#[tokio::test]
+async fn full_success_contains_complete_internal_assistant_without_persisted_sequence() {
+    let (mut delivery, mut frames) = captured_delivery();
+    let response = InferenceResponse {
+        reasoning: Some("thought".into()),
+        content: Some("answer".into()),
+        tool_calls: vec![inference_core::InferenceToolCall {
+            id: "call".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"a"}),
+        }],
+        usage: Some(inference_core::InferenceUsage {
+            input_tokens: 7,
+            output_tokens: 3,
+            cache_hit_tokens: Some(2),
+        }),
+        stop_reason: InferenceStopReason::ToolCalls,
+    };
+    push_full(&mut delivery, Ok(&response));
+    let full = frame_json(frames.recv().await.unwrap());
+    assert_eq!(full["type"], "agent.message.full.sync");
+    assert_eq!(full["address"], "agent:test/agent:latest");
+    assert!(full.get("instance").is_none());
+    assert_eq!(full["turn"], "turn");
+    assert_eq!(full["generation"], "request");
+    assert!(full["history_sequence"].is_null());
+    assert!(full["error"].is_null());
+    assert_eq!(
+        full["message"],
+        json!({"type":"assistant","request_id":"request","reasoning":"thought","content":"answer","tool_calls":[{"id":"call","tool_name":"read_file","arguments":"{\"path\":\"a\"}"}],"usage":{"input_tokens":7,"output_tokens":3,"cache_hit_tokens":2},"stop_reason":"tool_calls"})
+    );
+    for old in ["id", "agent", "agent_instance"] {
+        assert!(full.get(old).is_none());
+    }
+    for absent in ["sequence", "replay", "data"] {
+        assert!(full["message"].get(absent).is_none());
+    }
+    push_full(&mut delivery, Ok(&InferenceResponse::empty_completed()));
+    let empty = frame_json(frames.recv().await.unwrap());
+    assert_eq!(
+        empty["message"],
+        json!({"type":"assistant","request_id":"request","tool_calls":[],"stop_reason":"completed"})
+    );
 }

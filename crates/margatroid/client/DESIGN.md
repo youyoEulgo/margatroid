@@ -40,7 +40,7 @@ WorldClientExt：客户端查询扩展，公开trait
 公开，定义于client_plugin：
 ```text
 ClientPlugin：客户端身份插件
-    schedule: String--私有，默认RuntimePlugin::UPDATE
+    schedule: String
     new() -> Self
     with_schedule(self, schedule: impl Into<String>) -> Self
     impl Default for ClientPlugin
@@ -61,10 +61,10 @@ ClientPluginInstalled：安装标记，Resource
 公开：
 ```text
 Client：已注册客户端，组件
-    connection_id: ConnectionId--传输中立的连接身份
-    client_type: String--客户端自报类型
-    name: String--客户端名称
-    sender: ClientSender--注册时注入的出站能力
+    connection_id: ConnectionId
+    client_type: String
+    name: String
+    sender: ClientSender
     impl Component + Clone + Debug
 ```
 
@@ -74,18 +74,16 @@ Client：已注册客户端，组件
 
 公开，定义于client_core：
 ```text
-RegisterClient：身份注册请求，事件
-    id: String--内部注册请求ID，DTO负责关联网络ID
+ClientRegistrationReply
+    Arc<Mutex<Option<oneshot::Sender<Result<RegisteredClient, ClientError>>>>>
+
+RegisterClient
+    id: String
     connection_id: ConnectionId
     client_type: String
     name: Option<String>
-    sender: ClientSender--DTO为真实连接创建，客户端不能提交或替换
-    impl Event + Clone + Debug
-
-ClientRegistrationResult：注册结果，事件
-    id: String
-    connection_id: ConnectionId
-    result: Result<RegisteredClient, ClientError>
+    sender: ClientSender
+    reply: ClientRegistrationReply
     impl Event + Clone + Debug
 
 ClientDisconnected：连接结束，专用领域事件
@@ -104,7 +102,8 @@ client_registration_system(world: &mut World)
     处理事件：RegisterClient
     接收闭包结果：None
     提交闭包：None
-    产出事件：ClientRegistrationResult
+    产出事件：None
+    oneshot回复：Result<RegisteredClient, ClientError>
     行为：收集事件，逐条调用handle_client_registration。
 
 client_disconnect_system(world: &mut World)
@@ -122,7 +121,7 @@ client_disconnect_system(world: &mut World)
 crate公开：
 ```text
 handle_client_registration(world: &mut World, request: &RegisterClient)
-    行为：调用register_client，按原id与connection_id发送ClientRegistrationResult。
+    行为：认领request.reply，调用register_client，通过原oneshot回复结果；回复端关闭时核验本次创建的Client并清理。
 
 handle_client_disconnect(world: &mut World, event: &ClientDisconnected)
     行为：销毁connection_id匹配的Client Entity及Address；重复通知无操作，不撤销已受理业务操作。
@@ -136,7 +135,7 @@ register_client(world: &mut World, request: &RegisterClient) -> Result<Registere
         拒绝已注册连接和重复名称；名称缺省为连接ID文本。
         构造Address：client:<client_type>/<name>:<connection_id>，检查地址未占用。
         创建Entity，挂载Client（含sender克隆）和Address；复检sender，关闭则销毁本次Entity并失败。
-        不修改传输元数据；读端结束时DTO关闭接收端，注册与断连竞态通过sender关闭检查和ClientDisconnected收敛。
+        成功载荷保存本次实际Address文本和确认client_type；连接断开通过sender关闭及ClientDisconnected收口。
 
 valid_client_type(value: &str) -> bool
     行为：非空，只含小写ASCII字母、数字、下划线或短横线。
@@ -158,13 +157,13 @@ ConnectionId：传输中立连接标识，newtype(u64)
     行为：DTO在进程生命周期内分配不复用的ID；没有WebSocket或Axum类型。
 
 ClientFrame：应用出站帧，枚举
-    Text(String)--已经序列化的文本，包括JSON文本；不含框架消息类型
-    Binary(Vec<u8>)--owned二进制数据
-    Close { code: u16, reason: String }--通用关闭码及owned原因文本，由传输实现校验并映射关闭握手
+    Text(String)
+    Binary(Vec<u8>)
+    Close { code: u16, reason: String }
     impl Clone + Debug
 
 ClientSender：出站能力，结构体
-    sender: tokio::sync::mpsc::Sender<ClientFrame>--私有，有界队列发送端
+    sender: tokio::sync::mpsc::Sender<ClientFrame>
     new(sender: tokio::sync::mpsc::Sender<ClientFrame>) -> Self
     try_send(&self, frame: ClientFrame) -> Result<(), ClientSendError>
         行为：仅尝试入队；Full或Closed立即返回，不创建异步任务，不宣称已送达对端。
@@ -173,7 +172,9 @@ ClientSender：出站能力，结构体
     impl Clone + Debug
 
 RegisteredClient：注册成功载荷
-    client: Entity--已挂载Client与Address的完整句柄
+    client: Entity
+    address: String
+    client_type: String
     impl Clone + Debug + PartialEq + Eq
 ```
 

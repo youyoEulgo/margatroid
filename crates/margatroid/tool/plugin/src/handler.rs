@@ -2214,6 +2214,7 @@ mod world_sender_tests {
         app.world_mut().insert_component(
             agent,
             Workspace {
+                definition: None,
                 name: "test".into(),
                 definition_path: root.path().join("workspace.yaml"),
                 project_root: root.path().to_owned(),

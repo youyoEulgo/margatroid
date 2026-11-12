@@ -3,11 +3,15 @@ use async_runtime_plugin::AsyncTaskError;
 use closure_plugin::WorldClosureSender;
 use core_plugin::Entity;
 use std::path::PathBuf;
-use workspace_core::{MemberDiagnostic, WorkspaceDefinitions, WorkspaceError, WorkspaceErrorKind};
+use workspace_core::{
+    MemberDiagnostic, WorkspaceDefinitions, WorkspaceError, WorkspaceErrorKind,
+    WorkspaceOperationReply,
+};
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceFlowContext {
     pub id: String,
+    pub reply: WorkspaceOperationReply,
     pub workspace: Entity,
     pub events: RuntimeEventSender,
     pub path: PathBuf,
@@ -16,28 +20,28 @@ pub(crate) struct WorkspaceFlowContext {
 }
 #[derive(Clone)]
 pub(crate) struct StartOutput {
-    pub id: String,
+    pub reply: WorkspaceOperationReply,
     pub workspace: Entity,
     pub members: Vec<Entity>,
     pub member_errors: Vec<MemberDiagnostic>,
 }
 #[derive(Clone)]
 pub(crate) struct StopOutput {
-    pub id: String,
+    pub reply: WorkspaceOperationReply,
     pub workspace: Entity,
     pub members: Vec<Entity>,
     pub member_errors: Vec<MemberDiagnostic>,
 }
 #[derive(Clone)]
 pub(crate) struct RestartOutput {
-    pub id: String,
+    pub reply: WorkspaceOperationReply,
     pub workspace: Entity,
     pub members: Vec<Entity>,
     pub member_errors: Vec<MemberDiagnostic>,
 }
 #[derive(Clone)]
 pub(crate) struct FlowError {
-    pub id: String,
+    pub reply: WorkspaceOperationReply,
     pub workspace: Option<Entity>,
     pub error: WorkspaceError,
     pub cleanup_completed: bool,
@@ -49,7 +53,7 @@ pub(crate) type RestartError = FlowError;
 impl From<AsyncTaskError> for FlowError {
     fn from(error: AsyncTaskError) -> Self {
         Self {
-            id: String::new(),
+            reply: std::sync::Arc::new(std::sync::Mutex::new(None)),
             workspace: None,
             error: WorkspaceError::new(WorkspaceErrorKind::CleanupFailed, error),
             cleanup_completed: false,

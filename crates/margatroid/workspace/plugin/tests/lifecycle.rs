@@ -48,6 +48,7 @@ fn legacy_agents_map_starts_with_original_state_paths_and_ignores_hidden_backups
     assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
     app.world().emit_event(StartWorkspace {
         id: "hidden".into(),
+        reply: request_reply("hidden"),
         path: root.path().join(".trash/workspace.yaml"),
     });
     assert_eq!(
@@ -76,6 +77,7 @@ fn legacy_file_is_read_fresh_and_mutually_exclusive_forms_never_start_from_cache
     std::fs::write(&path, invalid).unwrap();
     app.world().emit_event(StartWorkspace {
         id: "changed".into(),
+        reply: request_reply("changed"),
         path: path.clone(),
     });
     assert_eq!(
@@ -171,21 +173,6 @@ fn fake_agents(world: &mut World) {
             let _ = reply.send(Ok(request.agent));
         }
     }
-    let mut results = Vec::new();
-    for event in world.event_reader::<StartWorkspaceResult>() {
-        results.push((event.id.clone(), event.result.clone()));
-    }
-    for event in world.event_reader::<StopWorkspaceResult>() {
-        results.push((event.id.clone(), event.result.clone()));
-    }
-    for event in world.event_reader::<RestartWorkspaceResult>() {
-        results.push((event.id.clone(), event.result.clone()));
-    }
-    world
-        .get_resource_mut::<FakeAgents>()
-        .unwrap()
-        .results
-        .extend(results);
 }
 fn app(plugin: WorkspacePlugin) -> App {
     let mut app = App::new();
@@ -202,14 +189,8 @@ fn wait(app: &mut App, id: &str) -> Result<WorkspaceOperationOutput, WorkspaceEr
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         app.tick();
-        if let Some(result) = app
-            .world()
-            .get_resource::<FakeAgents>()
-            .unwrap()
-            .results
-            .get(id)
-        {
-            return result.clone();
+        if let Some(result) = poll_reply(id) {
+            return result;
         }
         assert!(Instant::now() < deadline, "workspace result {id} timed out");
         std::thread::yield_now();
@@ -238,6 +219,7 @@ fn write(path: &Path, name: &str, members: &[&str], project: &str) {
 fn start(app: &mut App, path: &Path, id: &str) -> WorkspaceOperationOutput {
     app.world().emit_event(StartWorkspace {
         id: id.into(),
+        reply: request_reply(id),
         path: path.into(),
     });
     wait(app, id).unwrap()
@@ -245,6 +227,7 @@ fn start(app: &mut App, path: &Path, id: &str) -> WorkspaceOperationOutput {
 fn stop(app: &mut App, workspace: core_plugin::Entity, id: &str) -> WorkspaceOperationOutput {
     app.world().emit_event(StopWorkspace {
         id: id.into(),
+        reply: request_reply(id),
         workspace,
     });
     wait(app, id).unwrap()
@@ -343,6 +326,7 @@ fn unreadable_fresh_definition_never_starts_from_display_cache() {
     std::fs::write(&path, "broken: [").unwrap();
     app.world().emit_event(StartWorkspace {
         id: "broken".into(),
+        reply: request_reply("broken"),
         path: path.clone(),
     });
     assert_eq!(
@@ -388,6 +372,7 @@ fn restart_refuses_unfinished_tasks_on_every_member_without_cancelling_them() {
     tasks.register("unfinished".into(), task.clone()).unwrap();
     app.world().emit_event(RestartWorkspace {
         id: "busy".into(),
+        reply: request_reply("busy"),
         path: path.clone(),
     });
     app.tick();
@@ -420,6 +405,7 @@ fn restart_refuses_unfinished_tasks_on_every_member_without_cancelling_them() {
         .clone();
     app.world().emit_event(RestartWorkspace {
         id: "restart".into(),
+        reply: request_reply("restart"),
         path: path.clone(),
     });
     let restarted = wait(&mut app, "restart").unwrap();
@@ -452,6 +438,7 @@ fn restart_invalid_file_preserves_old_members_thread_admission_and_display_cache
     std::fs::write(&path, "invalid: [").unwrap();
     app.world().emit_event(RestartWorkspace {
         id: "restart".into(),
+        reply: request_reply("restart"),
         path: path.clone(),
     });
     assert_eq!(
@@ -495,6 +482,7 @@ fn stop_failure_or_lost_reply_preserves_workspace_and_unjoined_executor() {
         state.close_stop_reply = lost_reply;
         app.world().emit_event(StopWorkspace {
             id: "stop".into(),
+            reply: request_reply("stop"),
             workspace: output.workspace,
         });
         assert_eq!(
@@ -541,6 +529,7 @@ fn stop_waits_for_real_workspace_thread_join_before_destroying_host() {
         .unwrap();
     app.world().emit_event(StopWorkspace {
         id: "stop".into(),
+        reply: request_reply("stop"),
         workspace: output.workspace,
     });
     for _ in 0..20 {
@@ -569,14 +558,17 @@ fn stop_restart_start_order_and_non_running_rejections_are_synchronous() {
     let output = start(&mut app, &path, "start");
     app.world().emit_event(StopWorkspace {
         id: "stop".into(),
+        reply: request_reply("stop"),
         workspace: output.workspace,
     });
     app.world().emit_event(RestartWorkspace {
         id: "restart".into(),
+        reply: request_reply("restart"),
         path: path.clone(),
     });
     app.world().emit_event(StartWorkspace {
         id: "duplicate".into(),
+        reply: request_reply("duplicate"),
         path: path.clone(),
     });
     app.tick();
@@ -607,6 +599,7 @@ fn unconfirmed_starting_member_reports_busy_and_retains_host_instead_of_fake_cle
         .state = AgentState::Starting;
     app.world().emit_event(StopWorkspace {
         id: "stop".into(),
+        reply: request_reply("stop"),
         workspace: output.workspace,
     });
     assert_eq!(
@@ -632,6 +625,7 @@ fn open_validates_all_definitions_before_build_and_start_rejects_external_paths(
     write(&outside, "outside", &[], "p");
     app.world().emit_event(StartWorkspace {
         id: "outside".into(),
+        reply: request_reply("outside"),
         path: outside,
     });
     assert_eq!(
@@ -654,6 +648,7 @@ fn symlinked_state_path_is_refused_without_replacing_external_data() {
     std::os::unix::fs::symlink(&external, &state).unwrap();
     app.world().emit_event(StartWorkspace {
         id: "unsafe".into(),
+        reply: request_reply("unsafe"),
         path,
     });
     assert_eq!(
@@ -667,4 +662,108 @@ fn symlinked_state_path_is_refused_without_replacing_external_data() {
         .unwrap()
         .starts
         .is_empty());
+}
+
+#[test]
+fn workspace_start_reloads_all_sources_and_rejects_unrelated_invalid_definition() {
+    let root = tempfile::tempdir().unwrap();
+    let selected = file(root.path(), "selected");
+    let other = file(root.path(), "other");
+    write(&selected, "old-selected", &[], "project");
+    write(&other, "old-other", &[], "project");
+    let mut app = app(WorkspacePlugin::open(root.path()).unwrap());
+    write(&selected, "fresh-selected", &[], "project");
+    write(&other, "fresh-other", &[], "project");
+    let output = start(&mut app, &selected, "full-reload");
+    assert_eq!(
+        app.world()
+            .workspace_definitions()
+            .unwrap()
+            .get(&other)
+            .unwrap()
+            .name,
+        "fresh-other"
+    );
+    stop(&mut app, output.workspace, "stop");
+    std::fs::write(&other, "broken: [").unwrap();
+    app.world().emit_event(StartWorkspace {
+        id: "invalid-other".into(),
+        reply: request_reply("invalid-other"),
+        path: selected.clone(),
+    });
+    assert_eq!(
+        wait(&mut app, "invalid-other").unwrap_err().kind,
+        WorkspaceErrorKind::InvalidDefinition
+    );
+    assert!(app.world().query_with::<Workspace>().result().is_empty());
+    assert_eq!(
+        app.world()
+            .workspace_definitions()
+            .unwrap()
+            .get(&other)
+            .unwrap()
+            .name,
+        "fresh-other"
+    );
+}
+
+type OperationResult = Result<WorkspaceOperationOutput, WorkspaceError>;
+thread_local! {static REPLIES:std::cell::RefCell<BTreeMap<String,tokio::sync::oneshot::Receiver<OperationResult>>>=Default::default();}
+fn request_reply(id: &str) -> WorkspaceOperationReply {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    REPLIES.with(|rows| rows.borrow_mut().insert(id.to_owned(), receiver));
+    std::sync::Arc::new(std::sync::Mutex::new(Some(sender)))
+}
+fn poll_reply(id: &str) -> Option<OperationResult> {
+    REPLIES.with(|rows| {
+        rows.borrow_mut()
+            .get_mut(id)
+            .and_then(|receiver| receiver.try_recv().ok())
+    })
+}
+
+#[test]
+fn removed_definition_remains_on_running_component_and_only_stop_succeeds() {
+    let root = tempfile::tempdir().unwrap();
+    let path = file(root.path(), "removed");
+    write(&path, "retained", &[], "project");
+    let mut app = app(WorkspacePlugin::open(root.path()).unwrap());
+    let running = start(&mut app, &path, "start-retained");
+    let definitions = app.world().workspace_definitions().unwrap().clone();
+    assert_eq!(
+        app.world()
+            .get_component::<Workspace>(running.workspace)
+            .unwrap()
+            .definition
+            .as_ref()
+            .unwrap()
+            .name,
+        "retained"
+    );
+    assert_eq!(path.canonicalize().unwrap(), path);
+    std::fs::remove_file(&path).unwrap();
+    definitions.reload().unwrap();
+    assert!(definitions.get(&path).is_none());
+    app.world().emit_event(RestartWorkspace {
+        id: "missing-restart".into(),
+        path: path.clone(),
+        reply: request_reply("missing-restart"),
+    });
+    assert!(wait(&mut app, "missing-restart").is_err());
+    assert_eq!(
+        *app.world().workspace_state(running.workspace).unwrap(),
+        WorkspaceState::Running
+    );
+    assert_eq!(
+        app.world()
+            .get_component::<Workspace>(running.workspace)
+            .unwrap()
+            .definition
+            .as_ref()
+            .unwrap()
+            .name,
+        "retained"
+    );
+    stop(&mut app, running.workspace, "stop-retained");
+    assert!(!app.world().is_alive(running.workspace));
 }
