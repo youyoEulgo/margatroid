@@ -3,7 +3,7 @@ mod error;
 mod events;
 mod types;
 
-pub use components::Agent;
+pub use components::{Agent, AgentDriverSource};
 pub use error::{AgentError, AgentErrorKind};
 pub use events::{AgentException, AgentOperationReply, RestartAgent, StartAgent, StopAgent};
 pub use types::{AgentStartParameters, AgentState};

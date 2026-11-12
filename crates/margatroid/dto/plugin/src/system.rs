@@ -55,4 +55,6 @@ pub(crate) fn dto_sync_system(world: &mut World) {
         tracing::warn!(reason=%error.0,"DTO synchronization failed");
     }
     handler::publish_state(world);
+    crate::ui::reconcile_ui_watches(world);
+    crate::ui::publish_ui(world);
 }

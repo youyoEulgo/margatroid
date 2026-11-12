@@ -1,12 +1,6 @@
 import { createApp } from 'vue';
 import { createPinia } from 'pinia';
+import ShellApp from '@/shell/ShellApp.vue';
+import '@/assets/main.css';
 
-import App from './App.vue';
-import 'katex/dist/katex.min.css';
-import './assets/main.css';
-
-const app = createApp(App);
-
-app.use(createPinia());
-
-app.mount('#app');
+createApp(ShellApp).use(createPinia()).mount('#app');

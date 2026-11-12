@@ -1488,3 +1488,179 @@ fn original_oneshot_reaches_websocket_without_another_world_frame() {
         json!({"type":"workspace.start.result","id":"direct-reply","success":true})
     );
 }
+
+#[test]
+fn driver_ui_query_and_sync_follow_actual_source_and_recover_from_resource_errors() {
+    let mut harness = Harness::new();
+    let mut socket = harness.connect();
+    harness.register(&mut socket, "webui", "driver-ui");
+    let source = harness.root.path().join("loaded-driver");
+    std::fs::create_dir_all(source.join("ui")).unwrap();
+    std::fs::write(source.join("ui/index.html"), "first").unwrap();
+    harness.app.world_mut().insert_component(
+        harness.agent,
+        agent_core::AgentDriverSource {
+            address: "driver:local/loaded:latest".into(),
+            manifest_path: source.join("driver.toml"),
+        },
+    );
+    let initial = harness.next(&mut socket, |v| {
+        v["type"] == "agent.ui.sync" && v["ui"]["entry"] == "index.html"
+    });
+    assert_eq!(initial["ui"]["files"][0]["data"], "Zmlyc3Q=");
+    assert_eq!(initial["address"], "agent:demo/coder:latest");
+    harness.request(&mut socket, "agent.ui.req", "ui-read", harness.target());
+    let response = harness.next(&mut socket, |v| v["id"] == "ui-read");
+    assert_eq!(response["ui"], initial["ui"]);
+    assert_eq!(response["success"], true);
+    assert!(
+        harness
+            .collect(&mut socket, 5)
+            .iter()
+            .all(|v| v["type"] != "agent.ui.sync")
+    );
+    std::fs::create_dir_all(source.join("ui/assets")).unwrap();
+    std::fs::write(source.join("ui/assets/app.js"), "export const value=1").unwrap();
+    let added = harness.next(&mut socket, |v| {
+        v["type"] == "agent.ui.sync"
+            && v["ui"]["files"]
+                .as_array()
+                .is_some_and(|files| files.len() == 2)
+    });
+    assert_ne!(added["ui"]["revision"], initial["ui"]["revision"]);
+    let entry = source.join("ui/index.html");
+    assert!(entry.starts_with(harness.root.path()));
+    std::fs::remove_file(&entry).unwrap();
+    let failure = harness.next(&mut socket, |v| {
+        v["type"] == "agent.ui.sync" && v["error"]["code"] == "DriverUiEntryMissing"
+    });
+    assert!(failure["ui"].is_null());
+    harness.request(&mut socket, "agent.ui.req", "ui-failure", harness.target());
+    let failure = harness.next(&mut socket, |v| v["id"] == "ui-failure");
+    assert_eq!(failure["success"], false);
+    assert!(failure.get("ui").is_none());
+    std::fs::write(&entry, "first").unwrap();
+    let recovered = harness.next(&mut socket, |v| {
+        v["type"] == "agent.ui.sync" && v["ui"]["revision"] == added["ui"]["revision"]
+    });
+    assert!(recovered["error"].is_null());
+    let replacement = harness.root.path().join("replacement-driver");
+    std::fs::create_dir_all(replacement.join("ui")).unwrap();
+    std::fs::write(replacement.join("ui/index.html"), "second").unwrap();
+    harness
+        .app
+        .world_mut()
+        .get_component_mut::<agent_core::AgentDriverSource>(harness.agent)
+        .unwrap()
+        .manifest_path = replacement.join("driver.toml");
+    harness.next(&mut socket, |v| {
+        v["type"] == "agent.ui.sync" && v["ui"]["files"][0]["data"] == "c2Vjb25k"
+    });
+    std::fs::write(&entry, "old source").unwrap();
+    assert!(
+        harness
+            .collect(&mut socket, 10)
+            .iter()
+            .all(|v| v["type"] != "agent.ui.sync")
+    );
+    let ui = replacement.join("ui");
+    assert!(ui.starts_with(harness.root.path()));
+    std::fs::remove_dir_all(ui).unwrap();
+    harness.next(&mut socket, |v| {
+        v["type"] == "agent.ui.sync" && v["ui"].is_null() && v["error"].is_null()
+    });
+    harness.request(&mut socket, "agent.ui.req", "ui-absent", harness.target());
+    let absent = harness.next(&mut socket, |v| v["id"] == "ui-absent");
+    assert_eq!(absent["success"], true);
+    assert!(absent["ui"].is_null());
+    let server = harness
+        .app
+        .world()
+        .get_resource::<AxumHandle>()
+        .unwrap()
+        .clone();
+    server.request_shutdown();
+    harness.wait(|_| server.is_stopped());
+    assert!(server.result().unwrap().is_ok());
+}
+
+#[test]
+fn driver_ui_change_advances_an_idle_event_driven_world_without_polling_queries() {
+    use app_runtime_plugin::{AppRunExt, RuntimeHandle};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut harness = Harness::new();
+    harness
+        .app
+        .world_mut()
+        .remove_component::<AgentStorage>(harness.agent);
+    let mut socket = harness.connect();
+    harness.register(&mut socket, "webui", "ui-event-loop");
+    let source = harness.root.path().join("event-driver");
+    std::fs::create_dir_all(source.join("ui")).unwrap();
+    let entry = source.join("ui/index.html");
+    std::fs::write(&entry, "before").unwrap();
+    harness.app.world_mut().insert_component(
+        harness.agent,
+        agent_core::AgentDriverSource {
+            address: "driver:local/event:latest".into(),
+            manifest_path: source.join("driver.toml"),
+        },
+    );
+    harness.next(&mut socket, |v| {
+        v["type"] == "agent.ui.sync" && v["ui"].is_object()
+    });
+    let stopping = Arc::new(AtomicBool::new(false));
+    let stopped = stopping.clone();
+    let handle = harness
+        .app
+        .world()
+        .get_resource::<RuntimeHandle>()
+        .unwrap()
+        .clone();
+    let runtime = harness.runtime;
+    let worker = std::thread::spawn(move || {
+        struct Stop(Arc<AtomicBool>, RuntimeHandle);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                self.1.wake();
+            }
+        }
+        let _stop = Stop(stopped, handle);
+        runtime.block_on(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            std::fs::write(entry, "after").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                        continue;
+                    };
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if value["type"] == "agent.ui.sync"
+                        && value["ui"]["files"][0]["data"] == "YWZ0ZXI="
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("file update did not advance event-driven synchronization");
+            socket.close(None).await.unwrap();
+        });
+    });
+    harness.app.run_until(|| stopping.load(Ordering::Acquire));
+    worker.join().unwrap();
+    let server = harness
+        .app
+        .world()
+        .get_resource::<AxumHandle>()
+        .unwrap()
+        .clone();
+    server.request_shutdown();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !server.is_stopped() {
+        harness.app.tick();
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+}

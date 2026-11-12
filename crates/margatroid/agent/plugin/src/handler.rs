@@ -538,7 +538,16 @@ fn reject_symlinks(path: &Path) -> Result<(), AgentError> {
     }
     Ok(())
 }
-async fn prepare(context: &FlowContext) -> Result<(AgentDriverInput, AgentStorage), AgentError> {
+async fn prepare(
+    context: &FlowContext,
+) -> Result<
+    (
+        AgentDriverInput,
+        AgentStorage,
+        agent_core::AgentDriverSource,
+    ),
+    AgentError,
+> {
     let parameters = context.parameters.clone().ok_or_else(|| {
         error(
             AgentErrorKind::InvalidRequest,
@@ -559,7 +568,14 @@ async fn prepare(context: &FlowContext) -> Result<(AgentDriverInput, AgentStorag
             &driver.default_settings,
         )
         .map_err(|e| error(AgentErrorKind::StartFailed, e))?;
-        Ok((driver, storage))
+        Ok((
+            driver,
+            storage,
+            agent_core::AgentDriverSource {
+                address: parameters.driver,
+                manifest_path: path,
+            },
+        ))
     })
     .await
     .map_err(|e| error(AgentErrorKind::StartFailed, e))?
@@ -577,6 +593,7 @@ async fn install_runtime(
     context: &FlowContext,
     driver: &AgentDriverInput,
     storage: AgentStorage,
+    source: agent_core::AgentDriverSource,
 ) -> Result<LuaEnvironment, AgentError> {
     let agent = context.agent;
     let workspace = context.workspace;
@@ -684,6 +701,7 @@ async fn install_runtime(
             }
         }
         world.insert_component(agent, storage);
+        world.insert_component(agent, source);
         world.insert_component(
             agent,
             MclQueue {
@@ -721,8 +739,8 @@ async fn install_runtime(
     Ok(environment)
 }
 async fn start_steps(context: &FlowContext) -> Result<(), StartFailure> {
-    let (driver, storage) = prepare(context).await?;
-    let environment = install_runtime(context, &driver, storage).await?;
+    let (driver, storage, source) = prepare(context).await?;
+    let environment = install_runtime(context, &driver, storage, source).await?;
     let (tool_sender, tool_receiver) = oneshot::channel();
     let (inference_sender, inference_receiver) = oneshot::channel();
     let agent = context.agent;
@@ -1002,6 +1020,7 @@ async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), Age
                 "MCL commands have not fully drained",
             ));
         }
+        world.remove_component::<agent_core::AgentDriverSource>(agent);
         Ok(())
     })
     .await

@@ -19,6 +19,7 @@ import {
   type UserImage,
   type WorkspaceSnapshot,
   type AgentInfo,
+  type AgentUiBundle,
   type TaskSnapshot,
   type AgentTool,
   type AgentLogRecord,
@@ -455,6 +456,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const stateReady = ref(false);
   const connectionError = ref('');
   const registeredClient = ref<ClientInfo | null>(null);
+  const agentUiBundle = ref<AgentUiBundle | null>(null);
+  const agentUiError = ref('');
+  const agentUiAddress = ref('');
+  const agentUiLoading = ref(false);
+  const uiQueries = new Map<string, string>();
   const workspaceSnapshots = ref<WorkspaceSnapshot[]>([]);
   const activeAgentInfos = ref<AgentInfo[]>([]);
   const turnStates = ref(new Map<string, string | null>());
@@ -735,17 +741,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   function loadOlderHistory() {
     const target = currentTarget(false);
     if (!target) return;
-    const sequence = selectedHistory.value?.messages.reduce<number | null>(
-      (oldest, row) => (oldest === null ? row.sequence : Math.min(oldest, row.sequence)),
+    if ([...historyQueries.values()].some((query) => query.agent === target.agent)) return;
+    const cursor = historyCursors.value.get(targetKey(target));
+    if (cursor?.before === null) return;
+    const oldest = selectedHistory.value?.messages.reduce<number | null>(
+      (value, row) => (value === null ? row.sequence : Math.min(value, row.sequence)),
       null,
     );
-    if (
-      sequence != null &&
-      ![...historyQueries.values()].some(
-        (q) => q.agent === target.agent,
-      )
-    )
-      queryHistoryFor(target, { before_sequence: sequence });
+    if (oldest != null) queryHistoryFor(target, { before_sequence: oldest });
   }
   function rejectPending(message: string) {
     for (const command of pending.values()) {
@@ -818,6 +821,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       connectionStatus.value = 'offline';
       streams.value = new Map();
       pendingWakes.clear();
+      uiQueries.clear();
       resourcesReset();
       rejectPending('Backend WebSocket disconnected');
       if (shouldReconnect)
@@ -854,6 +858,32 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     selectedAgent.value = accepted;
     autoSelectSingle = accepted !== null;
     queryHistory();
+    requestAgentUi(accepted);
+  }
+  function requestAgentUi(address: string | null = selectedAgent.value): void {
+    if (!address || !connected()) return;
+    const changed = agentUiAddress.value !== address;
+    agentUiAddress.value = address;
+    agentUiLoading.value = true;
+    if (changed) {
+      agentUiBundle.value = null;
+      agentUiError.value = '';
+    }
+    const id = randomId();
+    uiQueries.set(id, address);
+    socket!.send(
+      JSON.stringify({
+        type: 'agent.ui.req',
+        id,
+        message: { address },
+      } satisfies ClientMessage),
+    );
+  }
+  function refreshAgentUi(): void {
+    if (!agentUiAddress.value) return;
+    const address = agentUiAddress.value;
+    agentUiError.value = '';
+    requestAgentUi(address);
   }
   function expandWorkspace(path: string) {
     expandedWorkspaceKeys.value = new Set(expandedWorkspaceKeys.value).add(path);
@@ -1288,6 +1318,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     reconcileAbortGuards();
     reconcileSelection();
     reconcileStreams();
+    const selected = selectedAgent.value;
+    if (selected && selected !== agentUiAddress.value) requestAgentUi(selected);
+    else if (!selected && agentUiAddress.value) {
+      agentUiLoading.value = false;
+      agentUiAddress.value = '';
+      agentUiBundle.value = null;
+      agentUiError.value = '';
+    }
   }
   function mergeHistory(target: Target, records: HistoryMessage[]) {
     const previous = histories.value.find(
@@ -1534,6 +1572,30 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         );
         break;
       }
+      case 'agent.ui.res': {
+        const requested = uiQueries.get(event.id);
+        uiQueries.delete(event.id);
+        if (!requested || requested !== event.address) break;
+        if (event.address !== agentUiAddress.value) break;
+        agentUiLoading.value = false;
+        if (!event.success) {
+          agentUiError.value = event.error.message;
+          break;
+        }
+        agentUiBundle.value = event.ui;
+        agentUiError.value = '';
+        break;
+      }
+      case 'agent.ui.sync':
+        if (event.address !== agentUiAddress.value) break;
+        agentUiLoading.value = false;
+        if (event.error) {
+          agentUiError.value = event.error.message;
+          break;
+        }
+        agentUiError.value = '';
+        agentUiBundle.value = event.ui;
+        break;
       case 'agent.history.res': {
         const query = queryTarget(event.id, event.address);
         if (!query) break;
@@ -1709,6 +1771,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     registeredClient,
     stateReady,
     connectionError,
+    agentUiBundle,
+    agentUiError,
+    agentUiAddress,
+    agentUiLoading,
+    refreshAgentUi,
     definitions,
     runtimeWorkspaces,
     workspaces,

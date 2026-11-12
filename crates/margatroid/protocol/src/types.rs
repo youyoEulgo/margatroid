@@ -33,6 +33,8 @@ pub enum ClientMessage {
     WorkspaceReload { id: String, message: EmptyDto },
     #[serde(rename = "agent.req")]
     AgentReq { id: String, message: EmptyDto },
+    #[serde(rename = "agent.ui.req")]
+    AgentUiReq { id: String, message: AgentTargetDto },
     #[serde(rename = "agent.start")]
     AgentStart { id: String, message: AgentStartDto },
     #[serde(rename = "agent.stop")]
@@ -76,6 +78,7 @@ impl ClientMessage {
             Self::WorkspaceRestart { id, .. } => id,
             Self::WorkspaceReload { id, .. } => id,
             Self::AgentReq { id, .. } => id,
+            Self::AgentUiReq { id, .. } => id,
             Self::AgentStart { id, .. } => id,
             Self::AgentStop { id, .. } => id,
             Self::AgentRestart { id, .. } => id,
@@ -149,6 +152,18 @@ pub enum ServerMessage {
     },
     AgentSync {
         agents: Vec<AgentStateDto>,
+    },
+    AgentUiRes {
+        id: String,
+        success: bool,
+        address: AddressDto,
+        ui: Option<AgentUiBundleDto>,
+        error: Option<ProtocolErrorDto>,
+    },
+    AgentUiSync {
+        address: AddressDto,
+        ui: Option<AgentUiBundleDto>,
+        error: Option<ProtocolErrorDto>,
     },
     AgentTurnRes {
         id: String,
@@ -326,6 +341,22 @@ enum ServerWire {
     },
     #[serde(rename = "agent.sync")]
     AgentSync { agents: Vec<AgentStateDto> },
+    #[serde(rename = "agent.ui.res")]
+    AgentUiRes {
+        id: String,
+        success: bool,
+        address: AddressDto,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ui: Option<AgentUiBundleDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ProtocolErrorDto>,
+    },
+    #[serde(rename = "agent.ui.sync")]
+    AgentUiSync {
+        address: AddressDto,
+        ui: Option<AgentUiBundleDto>,
+        error: Option<ProtocolErrorDto>,
+    },
     #[serde(rename = "agent.turn.res")]
     AgentTurnRes {
         id: String,
@@ -510,6 +541,22 @@ impl From<ServerMessage> for ServerWire {
                 error,
             },
             ServerMessage::AgentSync { agents } => Self::AgentSync { agents },
+            ServerMessage::AgentUiRes {
+                id,
+                success,
+                address,
+                ui,
+                error,
+            } => Self::AgentUiRes {
+                id,
+                success,
+                address,
+                ui,
+                error,
+            },
+            ServerMessage::AgentUiSync { address, ui, error } => {
+                Self::AgentUiSync { address, ui, error }
+            }
             ServerMessage::AgentTurnRes {
                 id,
                 success,
@@ -711,6 +758,22 @@ impl From<ServerWire> for ServerMessage {
                 error,
             },
             ServerWire::AgentSync { agents } => Self::AgentSync { agents },
+            ServerWire::AgentUiRes {
+                id,
+                success,
+                address,
+                ui,
+                error,
+            } => Self::AgentUiRes {
+                id,
+                success,
+                address,
+                ui,
+                error,
+            },
+            ServerWire::AgentUiSync { address, ui, error } => {
+                Self::AgentUiSync { address, ui, error }
+            }
             ServerWire::AgentTurnRes {
                 id,
                 success,
@@ -869,6 +932,13 @@ impl Serialize for ServerMessage {
                     .or_insert(Value::Null);
             }
         }
+        if value["type"] == "agent.ui.res" && value["success"] == true {
+            value
+                .as_object_mut()
+                .unwrap()
+                .entry("ui")
+                .or_insert(Value::Null);
+        }
         crate::validate_server_value(&value).map_err(serde::ser::Error::custom)?;
         value.serialize(serializer)
     }
@@ -897,6 +967,8 @@ impl ServerMessage {
             Self::AgentRestartResult { id, .. } => Some(id),
             Self::AgentRes { id, .. } => Some(id),
             Self::AgentSync { .. } => None,
+            Self::AgentUiRes { id, .. } => Some(id),
+            Self::AgentUiSync { .. } => None,
             Self::AgentTurnRes { id, .. } => Some(id),
             Self::AgentTurnSync { .. } => None,
             Self::AgentTurnAbortResult { id, .. } => Some(id),
@@ -1210,4 +1282,19 @@ pub enum MclExecuteDataDto {
     Import { value: MclImportResultDto },
     Inference { value: MclInferenceResultDto },
     BlockSnapshots { value: Value },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentUiBundleDto {
+    pub revision: String,
+    pub entry: String,
+    pub files: Vec<AgentUiFileDto>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentUiFileDto {
+    pub path: String,
+    pub media_type: String,
+    pub data: String,
 }

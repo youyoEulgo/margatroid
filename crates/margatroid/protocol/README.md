@@ -2,15 +2,15 @@
 
 Protocol定义纯JSON信封、请求、回执、分类状态、记录页与消息同步，只依赖标准库及serde等通用库，不依赖领域core、plugin、address或World。领域寻址、执行、请求关联和投递由DTO及各领域负责。
 
-[DESIGN.md](DESIGN.md)定义42种wire消息及纯协议校验。本文与设计已采用Agent Address对外寻址；源码和运行产物的接入状态按实际实现与验证记录确认。
+[DESIGN.md](DESIGN.md)定义45种wire消息及纯协议校验。本文与设计已采用Agent Address对外寻址；源码和运行产物的接入状态按实际实现与验证记录确认。
 
-接口定义见项目上级目录的[WebSocket API](../../../../WS_API.md)，接入链路见[API ENTRY](../../../../API_ENTRY.md)。内部消息使用厂商无关结构、data媒体字段及真实sequence；历史通过规范SQL列重建完整消息。Agent设置文件使用setting.toml。
+接口定义见项目上级目录的[WebSocket API](../../../../doc/api/WS_API.md)，接入链路见[API ENTRY](../../../../doc/api/API_ENTRY.md)。内部消息使用厂商无关结构、data媒体字段及真实sequence；历史通过规范SQL列重建完整消息。Agent设置文件使用setting.toml。
 
 ## 网络消息
 
 WebSocket入口为`/ws`，业务使用JSON文本。入站信封为`{type,id,message}`，id只关联本连接中的在途请求；出站type之外的数据直接放在顶层，不再统一包入message。地址与定义路径都是纯网络值，不传内部Entity、World、进程句柄、数据库连接或执行能力。
 
-目录共有42种wire type：17种client→server请求与25种server→client消息，全部在ClientMessage及ServerMessage中逐项对应。
+目录共有45种wire type：18种client→server请求与27种server→client消息，全部在ClientMessage及ServerMessage中逐项对应。
 
 ```text
 connection.register / connection.register.result
@@ -90,3 +90,5 @@ ServerMessage的Serialize与Deserialize共同校验成功/失败分支；成功�
 外部字段统一使用Agent Address。MCL审计payload及Agent日志context_json只投影业务关联，VM生命周期标识在后端保留。网络投影在编码前移除内部VM标识。
 
 Agent的sandboxes每次从该Entity的Sandboxes组件遍历，包含alias及path；sandbox来自SelectedSandbox。model由AgentInferenceConfig关联当前ModelRoutes，包含id、model、provider、api_type、context_window_tokens及可空thinking/reasoning_effort；配置或路由缺失为null。agent.req和每帧sync使用同一实时投影，模型端点和凭据保留在后端。
+
+Driver UI通过agent.ui.req/res/sync交付完整资源集合。查询以Agent Address定位实际Driver来源并沿原oneshot返回；同步独立监控ui目录变化。每个文件包含相对path、media_type和标准base64 data，内容revision使用SHA-256，完整集合和资源为空、读取失败均有明确分支。三种消息已实现，共享资料的Schema、AsyncAPI及实际后端校验同步45种消息。

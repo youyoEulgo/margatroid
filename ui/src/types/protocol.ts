@@ -175,6 +175,16 @@ export interface AgentInfo {
 export interface AgentTarget {
   address: string;
 }
+export interface AgentUiFile {
+  path: string;
+  media_type: string;
+  data: string;
+}
+export interface AgentUiBundle {
+  revision: string;
+  entry: string;
+  files: AgentUiFile[];
+}
 export interface TurnState extends AgentTarget {
   turn: string | null;
 }
@@ -246,6 +256,7 @@ export type ClientMessage =
       id: string;
       message: AgentTarget & { command: string; arguments: unknown[] };
     }
+  | { type: 'agent.ui.req'; id: string; message: AgentTarget }
   | { type: 'agent.turn.abort'; id: string; message: AgentTarget & { turn: string } };
 type Failure = { success: false; error: ProtocolError };
 type Receipt = { id: string } & ({ success: true } | Failure);
@@ -291,6 +302,14 @@ export type ServerMessage =
   | ({ type: 'agent.log.sync'; records: AgentLogRecord[] } & AgentTarget)
   | ({ type: 'agent.mcl.sync'; records: AgentMclRecord[] } & AgentTarget)
   | ({ type: 'mcl.execute.result'; id: string } & ({ success: true; data?: MclData } | Failure))
+  | ({ type: 'agent.ui.res'; id: string } & AgentTarget &
+      ({ success: true; ui: AgentUiBundle | null } | Failure))
+  | {
+      type: 'agent.ui.sync';
+      address: string;
+      ui: AgentUiBundle | null;
+      error: ProtocolError | null;
+    }
   | ({
       type: 'agent.message.chunk.sync';
       turn: string;
@@ -341,6 +360,28 @@ const workspaceSnapshot = (v: unknown): boolean =>
   ) &&
   nullableString(v.address) &&
   errorOrNull(v.error);
+const uiPath = (v: unknown): boolean =>
+  string(v) &&
+  v.length > 0 &&
+  !v.includes('\\') &&
+  !v.startsWith('/') &&
+  v.split('/').every((part) => part !== '' && part !== '.' && part !== '..');
+const agentUiBundle = (v: unknown): boolean =>
+  isRecord(v) &&
+  string(v.revision) &&
+  /^sha256:[0-9a-f]{64}$/.test(v.revision) &&
+  v.entry === 'index.html' &&
+  Array.isArray(v.files) &&
+  v.files.length > 0 &&
+  v.files.every(
+    (file) =>
+      isRecord(file) &&
+      uiPath(file.path) &&
+      string(file.media_type) &&
+      string(file.data) &&
+      /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(file.data),
+  ) &&
+  v.files.some((file) => isRecord(file) && file.path === 'index.html');
 const agentInfo = (v: unknown): boolean =>
   isRecord(v) &&
   target(v) &&
@@ -547,6 +588,19 @@ export function parseServerMessage(raw: string): ServerMessage | null {
       case 'agent.restart.result':
       case 'agent.turn.abort.result':
         valid = reply;
+        break;
+      case 'agent.ui.res':
+        valid =
+          reply &&
+          target(v) &&
+          (v.success === false ? v.ui === undefined : v.ui === null || agentUiBundle(v.ui));
+        break;
+      case 'agent.ui.sync':
+        valid =
+          v.id === undefined &&
+          target(v) &&
+          (v.ui === null || agentUiBundle(v.ui)) &&
+          errorOrNull(v.error);
         break;
       case 'agent.turn.res':
         valid =

@@ -1,0 +1,15 @@
+/* Driver UI runs inside the platform iframe: hide platform chrome. */
+.app-shell.driver-mode {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.driver-mode .workspace-sidebar,
+.driver-mode .mobile-scrim,
+.driver-mode .conversation-header,
+.driver-mode .activity-panel {
+  display: none;
+}
+
+.driver-mode .conversation-pane {
+  height: 100%;
+}

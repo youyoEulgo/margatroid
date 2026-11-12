@@ -86,6 +86,11 @@ Agent：Agent领域组件，公开结构体
     turn: Option<String>
     impl Component for Agent
 
+AgentDriverSource
+    address: String
+    manifest_path: PathBuf
+    impl Component
+
 ```
 
 # events
@@ -233,6 +238,7 @@ handle_restart_result(world: &mut World, result: Result<RestartOutput, RestartEr
 start_flow(context: FlowContext) -> Future<Output = Result<StartOutput, StartError>>
     行为：
         调用address::resolve_file及agent_driver_core::read_driver取得本次Driver材料，准备成员目录中的state.sqlite与setting.toml；仅接受这两个固定文件名，不读取旧名。
+        完成Driver读取后，经既有World闭包把本次实际Driver地址和清单规范路径写入AgentDriverSource；重启使用本次实际材料替换该组件。
         运行组件初始化阶段先发送InitToolTasks和InitInference，各携带agent及独立oneshot发送端，不先等待其中一个再发另一个。
         使用tokio::join!等待两个接收端，与原有资源初始化一起完成；
         收齐全部结果后处理错误，不提前丢弃另一项。
@@ -248,6 +254,7 @@ stop_flow(context: FlowContext) -> Future<Output = Result<StopOutput, StopError>
         沿现有流程停止任务；
         任务监督移除所属Tools记录；其他任务按Agent关闭的既有停止流程清理，不按工具owner关系级联。
         等待任务、子进程及MCL真实收口，并等待本次已提交的日志写入完成后再释放存储句柄
+        经既有World闭包移除AgentDriverSource，使DTO在下一帧取消所属UI监控；清理前仍运行的旧Driver保留原来源
         返回清理结果，不销毁协调Entity。
 
 restart_flow(context: FlowContext) -> Future<Output = Result<RestartOutput, RestartError>>

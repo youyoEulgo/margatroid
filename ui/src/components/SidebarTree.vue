@@ -1,8 +1,37 @@
 <script setup lang="ts">
-import { Bot, ChevronRight, FolderKanban, Pause, Play, RotateCw } from 'lucide-vue-next';
+import { ref, watch } from 'vue';
+import {
+  Bot,
+  ChevronRight,
+  FolderKanban,
+  LoaderCircle,
+  Pause,
+  Play,
+  RotateCw,
+} from 'lucide-vue-next';
 import type { SidebarModel, SidebarWorkspace } from '@/stores/workbench';
 
-defineProps<{ model: SidebarModel; pending: boolean; offline: boolean }>();
+const props = defineProps<{ model: SidebarModel; pending: boolean; offline: boolean }>();
+const busyKey = ref('');
+watch(
+  () => props.pending,
+  (pending) => {
+    if (!pending) busyKey.value = '';
+  },
+);
+function begin(key: string, action: () => void) {
+  busyKey.value = key;
+  action();
+  queueMicrotask(() => {
+    if (!props.pending) busyKey.value = '';
+  });
+}
+function isBusy(workspace: SidebarWorkspace): boolean {
+  return (
+    busyKey.value === workspace.key ||
+    ['starting', 'restarting', 'stopping'].includes(workspace.lifecycle)
+  );
+}
 const emit = defineEmits<{
   selectWorkspace: [path: string];
   toggleWorkspace: [path: string];
@@ -12,8 +41,15 @@ const emit = defineEmits<{
   stopWorkspace: [address: string];
 }>();
 
+function startWorkspace(workspace: SidebarWorkspace) {
+  begin(workspace.key, () => emit('startWorkspace', workspace.path));
+}
+function restartWorkspace(workspace: SidebarWorkspace) {
+  begin(workspace.key, () => emit('restartWorkspace', workspace.path));
+}
 function stopWorkspace(workspace: SidebarWorkspace) {
-  if (workspace.address) emit('stopWorkspace', workspace.address);
+  if (workspace.address)
+    begin(workspace.key, () => emit('stopWorkspace', workspace.address!));
 }
 </script>
 
@@ -47,13 +83,21 @@ function stopWorkspace(workspace: SidebarWorkspace) {
             <span class="tree-name">{{ workspace.name }}</span>
           </button>
           <div class="tree-actions">
-            <template v-if="workspace.lifecycle === 'running'">
+            <span
+              v-if="isBusy(workspace)"
+              class="tree-action tree-action--spinner"
+              :title="`${workspace.name} is ${workspace.lifecycle}`"
+              aria-label="Workspace operation in progress"
+            >
+              <LoaderCircle class="spin" :size="14" />
+            </span>
+            <template v-else-if="workspace.lifecycle === 'running'">
               <button
                 class="tree-action"
                 type="button"
                 title="Restart workspace"
                 :disabled="pending || offline"
-                @click.stop="emit('restartWorkspace', workspace.path)"
+                @click.stop="restartWorkspace(workspace)"
               >
                 <RotateCw :size="14" />
               </button>
@@ -73,7 +117,7 @@ function stopWorkspace(workspace: SidebarWorkspace) {
               type="button"
               title="Start workspace"
               :disabled="pending || offline"
-              @click.stop="emit('startWorkspace', workspace.path)"
+              @click.stop="startWorkspace(workspace)"
             >
               <Play :size="14" />
             </button>

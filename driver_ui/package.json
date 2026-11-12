@@ -1,0 +1,9 @@
+{
+  "name": "margatroid-driver-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "type-check": "vue-tsc --noEmit -p tsconfig.json"
+  }
+}

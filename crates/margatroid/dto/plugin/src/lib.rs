@@ -2,6 +2,7 @@ mod handler;
 mod projection;
 mod system;
 mod types;
+mod ui;
 
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
 use async_runtime_plugin::{AsyncContext, AsyncRuntimeHandle, WorldAsyncExt};

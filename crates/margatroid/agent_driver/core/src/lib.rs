@@ -1,5 +1,10 @@
 mod error;
 pub mod types;
+mod ui;
+pub use ui::{
+    DriverUiBundle, DriverUiError, DriverUiFile, DriverUiMonitor, DriverUiReadLimits,
+    DriverUiState, DriverUiWatch, open_driver_ui_watch, read_driver_ui, run_driver_ui_monitor,
+};
 
 pub use error::AgentDriverError;
 pub use types::{

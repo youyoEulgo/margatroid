@@ -69,6 +69,8 @@ pub(crate) struct SyncState {
     pub sent: BTreeMap<(u64, String), serde_json::Value>,
     pub errors: BTreeMap<Entity, ProtocolErrorDto>,
     pub records: BTreeMap<Entity, Arc<Mutex<RecordPosition>>>,
+    pub ui: BTreeMap<Entity, UiWatchSlot>,
+    pub ui_sent: BTreeMap<(ConnectionId, Entity), UiDeliveryKey>,
 }
 impl Resource for SyncState {}
 #[derive(Default)]
@@ -146,4 +148,37 @@ impl ConnState {
     pub fn remove(&self, id: ConnectionId) -> bool {
         self.entries.lock().unwrap().remove(&id).is_some()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum UiDeliveryKey {
+    Initializing,
+    Missing,
+    Ready(String),
+    Failed { code: String, message: String },
+}
+#[derive(Clone)]
+pub(crate) struct UiDelivery {
+    pub key: UiDeliveryKey,
+    pub frame: Arc<str>,
+}
+pub(crate) struct UiWatchSlot {
+    pub manifest_path: std::path::PathBuf,
+    pub address: String,
+    pub watch: agent_driver_core::DriverUiWatch,
+    pub delivery: Arc<std::sync::RwLock<UiDelivery>>,
+    pub frame_pending: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for UiWatchSlot {
+    fn drop(&mut self) {
+        self.frame_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.watch.cancel();
+    }
+}
+pub(crate) struct UiMonitorContext {
+    pub monitor: agent_driver_core::DriverUiMonitor,
+    pub watch: agent_driver_core::DriverUiWatch,
+    pub lifetime: axum_plugin::AxumLifetime,
+    pub guard: axum_plugin::AxumWorkGuard,
 }

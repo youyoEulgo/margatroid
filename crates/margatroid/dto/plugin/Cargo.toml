@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 address = { path = "../../address" }
 agent_core = { path = "../../agent/core" }
+agent_driver_core = { path = "../../agent_driver/core" }
+base64 = "0.22"
 client_core = { path = "../../client/core" }
 config_core = { path = "../../config/core" }
 workspace_core = { path = "../../workspace/core" }
@@ -30,8 +32,9 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 
+closure_plugin = { path = "../../../mecs/closure_plugin" }
+
 [dev-dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
-closure_plugin = { path = "../../../mecs/closure_plugin" }
 tempfile = "3"
 tokio-tungstenite = "0.29"

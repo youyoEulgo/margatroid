@@ -31,9 +31,13 @@ valid_request_id(id: &str) -> bool
 
 validate_server_value(value: &serde_json::Value) -> Result<(), ProtocolError>
     行为：检查严格wire type、回执成功/失败互斥、查询载荷、分页游标presence、nullable字段、记录顺序及完整消息序号关联。
+        agent.ui.res成功必须出现可空ui，失败省略ui并提供error；agent.ui.sync始终出现ui及error，error非空时ui为null。
 
 validate_value / validate_internal_message_fields / require_fields
     行为：检查递归预算、媒体、已删除旧消息字段、真实正sequence及必有字段；不推断领域权限或实例受理。
+
+validate_ui_bundle(value: &AgentUiBundleDto) -> Result<(), ProtocolError>
+    行为：校验sha256内容摘要格式、entry=index.html、files路径唯一且升序、相对路径段、媒体类型及标准base64；预算按实际网络信封UTF-8计算。
 
 logical_name / validate_path / validate_target / validate_address / validate_image
     行为：检查纯网络值形状、目标kind、路径及标准媒体编码，不依赖领域core。
@@ -55,6 +59,7 @@ ClientMessage：入站枚举，每个variant均为type、id和message信封
     WorkspaceRestart { id: String, message: WorkspacePathDto }
     WorkspaceReload { id: String, message: EmptyDto }
     AgentReq { id: String, message: EmptyDto }
+    AgentUiReq { id: String, message: AgentTargetDto }
     AgentStart { id: String, message: AgentStartDto }
     AgentStop { id: String, message: AgentTargetDto }
     AgentRestart { id: String, message: AgentTargetDto }
@@ -76,6 +81,8 @@ ServerMessage：出站枚举，type之外的字段位于顶层，不包message
     WorkspaceReloadResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
     AgentRes { id: String, success: bool, agents: Option<Vec<AgentStateDto>>, error: Option<ProtocolErrorDto> }
     AgentSync { agents: Vec<AgentStateDto> }
+    AgentUiRes { id: String, success: bool, address: AddressDto, ui: Option<AgentUiBundleDto>, error: Option<ProtocolErrorDto> }
+    AgentUiSync { address: AddressDto, ui: Option<AgentUiBundleDto>, error: Option<ProtocolErrorDto> }
     AgentStartResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
     AgentStopResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
     AgentRestartResult { id: String, success: bool, error: Option<ProtocolErrorDto> }
@@ -169,6 +176,14 @@ AgentStateDto
     model: Option<AgentModelDto>
     error: Option<ProtocolErrorDto>
     行为：只投影实际已激活实例；停止完成后从集合移除，不为未激活定义成员生成占位项
+AgentUiBundleDto
+    revision: String
+    entry: String
+    files: Vec<AgentUiFileDto>
+AgentUiFileDto
+    path: String
+    media_type: String
+    data: String
 AgentSandboxDto
     alias: String
     path: String

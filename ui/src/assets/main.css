@@ -2167,3 +2167,240 @@ textarea:focus-visible {
 .mcl-audit-entry { padding: 12px; border-bottom: 1px solid var(--mg-border); overflow-wrap: anywhere; font-size: 12px; }
 .mcl-audit-entry summary { cursor: pointer; }
 .mcl-audit-entry pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* ============================================================
+   Platform shell — top bar, workspace rail, Driver iframe, activity
+   ============================================================ */
+
+.shell {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  background: var(--mg-bg-base);
+}
+
+.shell-topbar {
+  display: flex;
+  z-index: 16;
+  min-height: 56px;
+  flex: none;
+  align-items: center;
+  gap: 12px;
+  padding: 0 18px 0 14px;
+  border-bottom: 1px solid var(--mg-border-l1);
+  background: var(--mg-bg-sidebar);
+}
+
+.shell-brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 190px;
+}
+
+.shell-heading {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.shell-heading strong {
+  overflow: hidden;
+  color: var(--mg-text-primary);
+  font-size: 14px;
+  font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell-heading span {
+  overflow: hidden;
+  color: var(--mg-text-tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.shell-body {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+}
+
+.shell-sidebar {
+  width: var(--mg-sidebar-width);
+  flex: none;
+  padding-top: 6px;
+}
+
+.shell-sidebar-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.shell-center {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  background: var(--mg-bg-base);
+}
+
+.shell-driver-frame-wrap {
+  position: relative;
+  min-height: 0;
+  flex: 1;
+}
+
+.shell-driver-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: var(--mg-bg-base);
+}
+
+.shell-driver-banner {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  left: 16px;
+  padding: 8px 12px;
+  border: 1px solid var(--mg-border);
+  border-radius: 8px;
+  background: var(--mg-bg-elevated);
+  color: var(--mg-error);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.shell-empty {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 32px;
+  color: var(--mg-text-secondary);
+  text-align: center;
+}
+
+.shell-empty strong {
+  color: var(--mg-text-primary);
+  font-size: 15px;
+  font-weight: 550;
+}
+
+.shell-empty span {
+  max-width: 520px;
+  color: var(--mg-text-tertiary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.shell-empty-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.shell-error {
+  margin: 10px 16px 0;
+  max-width: none;
+}
+
+.shell-activity {
+  width: var(--mg-panel-width);
+  flex: none;
+}
+
+.shell-menu {
+  display: none;
+}
+
+@media (max-width: 1180px) {
+  .shell-activity {
+    width: min(360px, 92vw);
+  }
+}
+
+@media (max-width: 760px) {
+  .shell-topbar {
+    padding: 0 10px;
+  }
+
+  .shell-brand {
+    min-width: 0;
+  }
+
+  .shell-heading {
+    display: none;
+  }
+
+  .shell-sidebar {
+    width: min(286px, 88vw);
+  }
+
+  .shell-menu {
+    display: inline-flex;
+  }
+
+  .shell-activity {
+    width: min(360px, 92vw);
+  }
+}
+
+.shell .brand-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  line-height: 1.15;
+}
+
+.shell .brand-copy strong {
+  color: var(--mg-text-primary);
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+.shell .brand-copy span {
+  color: var(--mg-text-tertiary);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.tree-action--spinner {
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: transparent;
+  color: var(--mg-text-tertiary);
+  cursor: default;
+}
+
+.spin {
+  animation: mg-spin 900ms linear infinite;
+}
+
+@keyframes mg-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
