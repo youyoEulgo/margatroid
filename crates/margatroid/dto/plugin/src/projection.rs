@@ -81,11 +81,11 @@ pub(crate) fn agents(world: &World) -> Vec<AgentStateDto> {
             let agent = world.get_component::<Agent>(entity)?;
             Some(AgentStateDto {
                 address: address(world, entity)?,
-                workspace: address(world, agent.workspace)?,
+                workspace: address(world, agent.workspace())?,
 
-                status: match agent.state {
+                status: match agent.state() {
                     AgentState::Idle => "ready".into(),
-                    _ => format!("{:?}", agent.state).to_lowercase(),
+                    _ => format!("{:?}", agent.state()).to_lowercase(),
                 },
                 tools: world
                     .get_component::<Tools>(entity)
@@ -134,10 +134,9 @@ pub(crate) fn agents(world: &World) -> Vec<AgentStateDto> {
                             reasoning_effort: route.reasoning_effort.clone(),
                         })
                     }),
-                error: world
-                    .get_resource::<crate::types::SyncState>()
-                    .and_then(|state| state.errors.get(&entity))
-                    .cloned(),
+                error: agent.fault().map(|error| {
+                    ProtocolErrorDto::new(format!("{:?}", error.kind), error.message.clone())
+                }),
             })
         })
         .collect::<Vec<_>>();
@@ -148,7 +147,7 @@ pub(crate) fn agents(world: &World) -> Vec<AgentStateDto> {
 pub(crate) fn turn(world: &World, entity: Entity) -> Option<AgentTurnStateDto> {
     Some(AgentTurnStateDto {
         address: address(world, entity)?,
-        turn: world.get_component::<Agent>(entity)?.turn.clone(),
+        turn: world.get_component::<Agent>(entity)?.turn().clone(),
     })
 }
 

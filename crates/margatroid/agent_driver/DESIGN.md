@@ -40,8 +40,8 @@ run_driver_ui_monitor(context: DriverUiMonitor) -> Future<Output = Result<(), Dr
         初始化立即读取一次；后续新增、修改、删除使用100ms安静窗口合并，再调用read_driver_ui；完整读取及新状态publish同在blocking worker内执行。
         Unstable保留待处理状态并重读；其他读取错误发布Failed并保持后续观察，路径恢复后重新发布Ready。
         读取或监控初始化错误进入有间隔的恢复尝试，取消后等待正在执行的blocking worker真实返回。
-        更新状态时在短锁内同时递增内部版本，释放锁后调用on_change；初次稳定结果及后续内容或错误状态变化才通知，相同Ready内容或相同错误保持等待。
-        on_change经注入的UI SyncContext直接选择当前Clients投递StateKey，编码资源在对应来源的稳定缓存中只生成一次；队列不保存多份旧集合。
+        更新core状态时只持短锁，释放锁后调用on_change；初次稳定结果及后续内容或错误状态变化才通知，相同Ready内容或相同错误保持等待。
+        on_change由DTO在实际来源安装时绑定，更新DTO版本化UiDelivery后经SyncContext直接选择当前Clients投递StateKey，编码资源在对应来源的稳定缓存中只生成一次；队列不保存多份旧集合。
         当前source失效后旧读取不得发布到新Agent来源；退出等待真实读取及notify收口。
         取消后释放notify句柄并返回，完整监控Future退出才算清理结束。
 
@@ -52,7 +52,7 @@ DriverUiWatch::cancel(&self)
 DriverUiWatch::is_cancelled(&self) -> bool
     行为：读取取消状态，供DTO在异常终结后重新建立观察。
 DriverUiWatch::publish(&self, state: DriverUiState)
-    行为：发布稳定读取结果，锁外交付on_change，供注入的DriverUiSyncBinding构造网络投影并通过同一Clients共享槽位直接投递，不发ECS事件、不调用World或RuntimeHandle。
+    行为：发布稳定读取结果，锁外交付on_change，供DTO安装的typed回调构造网络投影并通过同一Clients共享槽位直接投递，不发ECS事件、不调用World或RuntimeHandle。
 ```
 
 # types pub
@@ -104,22 +104,13 @@ DriverUiWatch
     is_cancelled(&self) -> bool
     publish(&self, state: DriverUiState)
 DriverUiShared
-    state: RwLock<(u64, DriverUiState)>--状态及内部单调版本同锁提交
+    state: RwLock<DriverUiState>
     cancel: CancellationToken
     on_change: Arc<dyn Fn(DriverUiState) + Send + Sync>
 DriverUiMonitor
     manifest_path: PathBuf
     limits: DriverUiReadLimits
     watch: DriverUiWatch
-
-DriverUiSyncBinding
-    bind: Arc<dyn Fn(Entity, String, PathBuf) -> DriverUiSyncContext + Send + Sync>
-    行为：先建立独立UI观察视图及回调，再把on_change传入open_driver_ui_watch；encode由DTO提供，内容revision继续只作为摘要身份。
-DriverUiSyncContext
-    state: Arc<RwLock<(u64, DriverUiState)>>--观察的派生只读视图，无World
-    on_change: Arc<dyn Fn(DriverUiState) + Send + Sync>
-    sync: SyncContext<DriverUiState>
-    行为：on_change持有视图并提交稳定变化，source.prepare只捕获视图Weak；视图本身不持有sync或watch，避免回环。
 
 AgentDriverReadLimits：读取预算
     manifest_bytes: usize

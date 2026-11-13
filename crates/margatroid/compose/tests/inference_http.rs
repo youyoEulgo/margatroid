@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use address::Address;
-use agent_core::{Agent, AgentState};
+use agent_core::AgentState;
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
 use closure_plugin::{AppClosureExt, ClosurePlugin};
@@ -148,7 +148,7 @@ struct Fixture {
     app: App,
     agent: Entity,
     root: tempfile::TempDir,
-    frames: tokio::sync::mpsc::Receiver<client_core::ClientFrame>,
+    frames: client_core::ClientReceiver,
 }
 
 impl Fixture {
@@ -187,16 +187,25 @@ impl Fixture {
             );
             app.add_plugin(dto_plugin::DtoPlugin::new());
         }
-        let (frames_sender, frames) = tokio::sync::mpsc::channel(256);
+        let (frames_sender, frames) = client_core::ClientSender::channel(256);
         if !dto {
+            let clients = client_core::Clients::default();
+            let id = client_core::ConnectionId::new(1);
+            clients.adopt(id, frames_sender).unwrap();
             let client = app.world_mut().spawn();
+            let identity = std::sync::Arc::new(client_core::ClientIdentity {
+                client,
+                address: "client:webui/inference-fixture:1".into(),
+                client_type: "webui".into(),
+                name: "inference-fixture".into(),
+            });
+            clients.commit_registration(id, identity.clone()).unwrap();
+            app.world_mut().insert_resource(clients);
             app.world_mut().insert_component(
                 client,
                 client_core::Client {
-                    connection_id: client_core::ConnectionId::new(1),
-                    client_type: "webui".into(),
-                    name: "inference-fixture".into(),
-                    sender: client_core::ClientSender::new(frames_sender),
+                    connection_id: id,
+                    identity,
                 },
             );
         }
@@ -205,24 +214,31 @@ impl Fixture {
             .insert_component(workspace, Address::new("workspace:local/demo").unwrap());
         app.world_mut().insert_component(
             workspace,
-            workspace_core::Workspace {
-                definition: None,
-                name: "demo".into(),
-                definition_path: root.path().join("workspace.yaml"),
-                project_root: root.path().to_owned(),
-                state: workspace_core::WorkspaceState::Running,
-                agents: std::collections::BTreeSet::new(),
-            },
+            workspace_core::Workspace::new(
+                "demo".into(),
+                root.path().join("workspace.yaml"),
+                root.path().to_owned(),
+                workspace_core::WorkspaceState::Running,
+                std::collections::BTreeSet::new(),
+                None,
+                crate::test_workspace_context(),
+            ),
         );
         let agent = app.world_mut().spawn();
+        let agent_updates = app
+            .world()
+            .get_resource::<agent_core::AgentUpdateContext>()
+            .cloned()
+            .unwrap_or_else(test_agent_context);
         app.world_mut().insert_component(
             agent,
-            Agent {
-                name: "test".into(),
+            agent_core::Agent::new(
+                "test".into(),
                 workspace,
-                state: AgentState::Working,
-                turn: Some("turn".into()),
-            },
+                AgentState::Working,
+                Some("turn".into()),
+                agent_updates.clone(),
+            ),
         );
         app.world_mut()
             .insert_component(agent, Address::new("agent:test/agent").unwrap());
@@ -325,7 +341,7 @@ impl Fixture {
         .unwrap();
         std::fs::write(directory.join("input.schema.json"), "{\"type\":\"object\"}").unwrap();
         std::fs::write(directory.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() end").unwrap();
-        let mut tools = Tools::default();
+        let mut tools = Tools::new(crate::test_probe());
         tools
             .insert("visible".into(), common::tool(directory.join("tool.toml")))
             .unwrap();
@@ -1003,4 +1019,16 @@ fn new_response_reasoning_remains_generic_across_storage_and_api_switches() {
             assert_eq!(serde_json::to_string(&original).unwrap(), serialized);
         }
     }
+}
+
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+}
+
+fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
+    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
+}
+
+fn test_probe<T>() -> client_core::UpdateProbe<T> {
+    client_core::UpdateProbe::new(|_| {})
 }

@@ -1,5 +1,6 @@
 use crate::{types::*, AgentInstalled};
 use address::{resolve_file, Address, ParsedAddress};
+use agent_core::WorldAgentExt;
 use agent_core::*;
 use agent_driver_core::{read_driver, AgentDriverInput, AgentDriverReadLimits};
 use app_runtime_plugin::WorldEventExt;
@@ -8,7 +9,7 @@ use closure_plugin::WorldClosureExt;
 use core_plugin::{Entity, World};
 use futures_util::{future::join_all, FutureExt};
 use inference_core::{
-    ActiveInference, AgentInferenceConfig, InferenceHandle, InferenceParameters, InitInference,
+    ActiveInference, InferenceHandle, InferenceParameters, InitInference,
     ModelRoutes,
 };
 use lua_runtime_core::*;
@@ -158,7 +159,7 @@ fn context(
     FlowContext {
         id,
         agent,
-        workspace: world.get_component::<Agent>(agent).unwrap().workspace,
+        workspace: world.get_component::<Agent>(agent).unwrap().workspace(),
         state,
         parameters,
         reply,
@@ -176,7 +177,7 @@ fn check_agent(
     let component = world
         .get_component::<Agent>(agent)
         .ok_or_else(|| error(AgentErrorKind::AgentMissing, "Agent entity is missing"))?;
-    if component.workspace != workspace || component.state != state {
+    if component.workspace() != workspace || component.state() != state {
         return Err(error(
             AgentErrorKind::StateRejected,
             "Agent lifecycle state or Workspace does not match",
@@ -221,7 +222,7 @@ pub(crate) fn handle_start_agent(world: &mut World, request: StartAgent) {
             .into_iter()
             .any(|entity| {
                 world.get_component::<Agent>(entity).is_some_and(|agent| {
-                    agent.workspace == request.workspace && agent.name == request.name
+                    agent.workspace() == request.workspace && agent.name() == &request.name
                 })
             })
         {
@@ -247,12 +248,13 @@ pub(crate) fn handle_start_agent(world: &mut World, request: StartAgent) {
         world.insert_component(agent, address);
         world.insert_component(
             agent,
-            Agent {
-                name: request.name.clone(),
-                workspace: request.workspace,
-                state: AgentState::Starting,
-                turn: None,
-            },
+            agent_core::Agent::new(
+                request.name.clone(),
+                request.workspace,
+                AgentState::Starting,
+                None,
+                world.get_resource::<AgentInstalled>().unwrap().sync.clone(),
+            ),
         );
         if let Err(error) = world.workspace_insert_agent(request.workspace, agent) {
             world.despawn(agent);
@@ -261,6 +263,9 @@ pub(crate) fn handle_start_agent(world: &mut World, request: StartAgent) {
                 error.to_string(),
             ));
         }
+        let publication = world.get_component::<Agent>(agent).unwrap().updates();
+        let waits = publication.notify(world, agent, agent_core::AgentUpdateKind::Changed);
+        assert!(waits.is_empty());
         Ok(context(
             world,
             request.id.clone(),
@@ -296,15 +301,13 @@ pub(crate) fn handle_stop_agent(world: &mut World, request: StopAgent) {
         let component = world
             .get_component::<Agent>(request.agent)
             .ok_or_else(|| error(AgentErrorKind::AgentMissing, "Agent is missing"))?;
-        if !matches!(component.state, AgentState::Idle | AgentState::Working) {
+        if !matches!(component.state(), AgentState::Idle | AgentState::Working) {
             return Err(error(
                 AgentErrorKind::StateRejected,
                 "Agent is not Idle or Working",
             ));
         }
-        let component = world.get_component_mut::<Agent>(request.agent).unwrap();
-        component.state = AgentState::Stopping;
-        component.turn = None;
+        world.agent_transition(request.agent, AgentState::Stopping, None)?;
         cancel_runtime(world, request.agent);
         Ok(context(
             world,
@@ -340,7 +343,7 @@ pub(crate) fn handle_restart_agent(world: &mut World, request: RestartAgent) {
             .into_iter()
             .filter(|entity| {
                 world.get_component::<Agent>(*entity).is_some_and(|agent| {
-                    agent.workspace == request.workspace && agent.name == request.name
+                    agent.workspace() == request.workspace && agent.name() == &request.name
                 })
             })
             .collect();
@@ -369,7 +372,7 @@ pub(crate) fn handle_restart_agent(world: &mut World, request: RestartAgent) {
             ));
         }
         if !matches!(
-            world.get_component::<Agent>(agent).unwrap().state,
+            world.get_component::<Agent>(agent).unwrap().state(),
             AgentState::Idle | AgentState::Working
         ) {
             return Err(error(
@@ -377,9 +380,7 @@ pub(crate) fn handle_restart_agent(world: &mut World, request: RestartAgent) {
                 "Agent is not Idle or Working",
             ));
         }
-        let component = world.get_component_mut::<Agent>(agent).unwrap();
-        component.state = AgentState::Restarting;
-        component.turn = None;
+        world.agent_transition(agent, AgentState::Restarting, None)?;
         cancel_runtime(world, agent);
         Ok(context(
             world,
@@ -403,19 +404,24 @@ pub(crate) fn handle_restart_agent(world: &mut World, request: RestartAgent) {
     }
 }
 pub(crate) fn handle_agent_exception(world: &mut World, event: AgentException) {
-    if let Some(agent) = world.get_component_mut::<Agent>(event.agent) {
-        agent.state = AgentState::Stopping;
-        agent.turn = None;
+    if let Some(agent) = world.get_component::<Agent>(event.agent) {
+        let context = agent.updates();
+        let _ = agent_core::update_agent(
+            world,
+            event.agent,
+            &context,
+            agent_core::AgentChange::Fault(event.error.clone()),
+        );
         cancel_runtime(world, event.agent);
         tracing::error!(request=%event.id,agent=?event.agent,error=%event.error,"Agent exception closed new admission; cleanup is not confirmed");
     }
 }
 fn despawn_clean(world: &mut World, agent: Entity) {
     if let Some(component) = world.get_component::<Agent>(agent) {
-        let workspace = component.workspace;
+        let workspace = component.workspace();
         let _ = world.workspace_remove_agent(workspace, agent);
     }
-    world.despawn(agent);
+    agent_core::remove_agent(world, agent);
 }
 fn finish_result(world: &mut World, agent: Entity, state: AgentState) -> Result<(), AgentError> {
     let component = world.get_component_mut::<Agent>(agent).ok_or_else(|| {
@@ -424,15 +430,13 @@ fn finish_result(world: &mut World, agent: Entity, state: AgentState) -> Result<
             "Agent result has lost its host",
         )
     })?;
-    if component.state != state {
+    if component.state() != state {
         return Err(error(
             AgentErrorKind::StateRejected,
             "stale Agent lifecycle result",
         ));
     }
-    component.state = AgentState::Idle;
-    component.turn = None;
-    Ok(())
+    world.agent_transition(agent, AgentState::Idle, None)
 }
 fn failed_result(world: &mut World, failure: FlowError, state: AgentState) {
     tracing::error!(request=%failure.id,error=%failure.error,cleanup_completed=failure.cleanup_completed,"Agent lifecycle failed");
@@ -440,7 +444,7 @@ fn failed_result(world: &mut World, failure: FlowError, state: AgentState) {
         if let Some(agent) = failure.agent {
             if world
                 .get_component::<Agent>(agent)
-                .is_some_and(|component| component.state == state)
+                .is_some_and(|component| component.state() == state)
             {
                 despawn_clean(world, agent);
             }
@@ -466,7 +470,7 @@ pub(crate) fn handle_stop_result(world: &mut World, result: Result<StopOutput, S
         Ok(output) => {
             let result = if world
                 .get_component::<Agent>(output.agent)
-                .is_some_and(|component| component.state == AgentState::Stopping)
+                .is_some_and(|component| component.state() == AgentState::Stopping)
             {
                 despawn_clean(world, output.agent);
                 Ok(output.agent)
@@ -600,7 +604,7 @@ async fn install_runtime(
     let state = context.state;
     let manifest = driver.manifest.clone();
     let parameters = context.parameters.clone().unwrap();
-    let (environment, finished) = with_world(context, move |world| {
+    let (environment, finished, observers) = with_world(context, move |world| {
         check_agent(world, agent, workspace, state)?;
         if world.get_component::<DriverLuaVm>(agent).is_some() {
             return Err(error(
@@ -666,7 +670,7 @@ async fn install_runtime(
             top_p: manifest.inference.top_p,
             stop: manifest.inference.stop,
         };
-        let name = world.get_component::<Agent>(agent).unwrap().name.clone();
+        let name = world.get_component::<Agent>(agent).unwrap().name().clone();
         let info = LuaValue::Object(BTreeMap::from([
             ("name".into(), LuaValue::String(name)),
             ("entity".into(), entity_value(agent)),
@@ -711,23 +715,65 @@ async fn install_runtime(
         );
         world.insert_component(
             agent,
-            AgentInferenceConfig {
-                parameters: inference,
-            },
+            inference_core::AgentInferenceConfig::new(
+                inference,
+                world
+                    .get_resource::<inference_core::ModelSyncBinding>()
+                    .expect("model sync required")
+                    .for_owner(agent),
+            ),
         );
-        world.insert_component(agent, Tools::default());
+        world.insert_component(
+            agent,
+            Tools::new(
+                world
+                    .get_resource::<tool_resource_core::ToolResourceSyncBinding>()
+                    .expect("tool resource sync required")
+                    .for_owner(agent),
+            ),
+        );
         world.insert_component(agent, Prompts::default());
-        world.insert_component(agent, Sandboxes::default());
-        world.insert_component(agent, SelectedSandbox::default());
+        world.insert_component(
+            agent,
+            Sandboxes::new(
+                world
+                    .get_resource::<sandbox_resource_core::SandboxSyncBinding>()
+                    .expect("sandbox sync required")
+                    .for_owner(agent),
+            ),
+        );
+        world.insert_component(
+            agent,
+            SelectedSandbox::new(
+                None,
+                world
+                    .get_resource::<sandbox_resource_core::SandboxSelectionSyncBinding>()
+                    .expect("sandbox selection sync required")
+                    .for_owner(agent),
+            ),
+        );
+        if let Some(tasks) = world.get_component::<ToolTasks>(agent) {
+            if !tasks.list().is_empty() {
+                return Err(error(
+                    AgentErrorKind::CleanupFailed,
+                    "previous tool tasks remain",
+                ));
+            }
+            tasks.close_sync();
+        }
+        world.remove_component::<ToolTasks>(agent);
+        let observers = agent_core::notify_agent_runtime(world, agent, false)?;
         Ok((
             LuaEnvironment {
                 globals: BTreeMap::from([("agent_info".into(), LuaBinding::Value(info))]),
                 modules: BTreeMap::new(),
             },
             finished,
+            observers,
         ))
     })
     .await?;
+    wait_observers(observers).await?;
     if let Some(finished) = finished {
         finished.wait_finished().await.map_err(|e| {
             error(
@@ -981,7 +1027,7 @@ async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), Age
         .map_err(|failure| error(AgentErrorKind::CleanupFailed, failure))?
         .map_err(|failure| error(AgentErrorKind::CleanupFailed, failure))?;
     }
-    with_world(context, move |world| {
+    let observers = with_world(context, move |world| {
         check_agent(world, agent, workspace, state)?;
         if world.get_component::<DriverLuaVm>(agent).is_some() {
             return Err(error(
@@ -1021,9 +1067,10 @@ async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), Age
             ));
         }
         world.remove_component::<agent_core::AgentDriverSource>(agent);
-        Ok(())
+        agent_core::notify_agent_runtime(world, agent, true)
     })
-    .await
+    .await?;
+    wait_observers(observers).await
 }
 async fn startup(context: &FlowContext) -> Result<(), FlowError> {
     match start_steps(context).await {
@@ -1118,4 +1165,20 @@ async fn guarded_restart(context: FlowContext) -> Result<RestartOutput, RestartE
                 false,
             ))
         })
+}
+
+async fn wait_observers(
+    observers: Vec<agent_core::AgentObservationWait>,
+) -> Result<(), AgentError> {
+    let errors = futures_util::future::join_all(observers)
+        .await
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(error(AgentErrorKind::CleanupFailed, errors.join("; ")))
+    }
 }

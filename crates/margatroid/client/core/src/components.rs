@@ -1,12 +1,15 @@
-use crate::{ClientSender, ConnectionId};
+use crate::{ClientIdentity, ConnectionId};
 use core_plugin::Component;
-
+use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct Client {
     pub connection_id: ConnectionId,
-    pub client_type: String,
-    pub name: String,
-    pub sender: ClientSender,
+    pub identity: Arc<ClientIdentity>,
 }
-
+impl std::ops::Deref for Client {
+    type Target = ClientIdentity;
+    fn deref(&self) -> &Self::Target {
+        &self.identity
+    }
+}
 impl Component for Client {}

@@ -14,6 +14,7 @@ name = "agent_core"
 version = "0.1.0"
 dependencies = [
  "core_plugin",
+ "serde_json",
  "tokio",
 ]
 
@@ -40,6 +41,7 @@ dependencies = [
  "agent_driver_core",
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "client_core",
  "closure_plugin",
  "core_plugin",
  "futures-util",
@@ -393,6 +395,7 @@ version = "0.1.0"
 dependencies = [
  "core_plugin",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -633,6 +636,7 @@ dependencies = [
  "lua_runtime_core",
  "margatroid_protocol",
  "mcl_core",
+ "notify",
  "rusqlite",
  "sandbox_resource_core",
  "serde_json",
@@ -1126,6 +1130,7 @@ dependencies = [
 name = "inference_core"
 version = "0.1.0"
 dependencies = [
+ "client_core",
  "core_plugin",
  "serde",
  "serde_json",
@@ -1493,9 +1498,11 @@ dependencies = [
 name = "mcp-client"
 version = "0.1.0"
 dependencies = [
+ "address",
  "agent_core",
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "client_core",
  "closure_plugin",
  "core_plugin",
  "futures-util",
@@ -2229,6 +2236,7 @@ dependencies = [
 name = "sandbox_resource_core"
 version = "0.1.0"
 dependencies = [
+ "client_core",
  "core_plugin",
  "serde_json",
  "tokio",
@@ -2241,6 +2249,7 @@ version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "client_core",
  "closure_plugin",
  "core_plugin",
  "sandbox_resource_core",
@@ -2799,6 +2808,7 @@ name = "tool_core"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "client_core",
  "core_plugin",
  "serde",
  "serde_json",
@@ -2810,10 +2820,12 @@ dependencies = [
 name = "tool_plugin"
 version = "0.1.0"
 dependencies = [
+ "address",
  "agent_core",
  "app_runtime_plugin",
  "async_runtime_plugin",
  "base64",
+ "client_core",
  "closure_plugin",
  "core_plugin",
  "futures-util",
@@ -2837,6 +2849,7 @@ dependencies = [
 name = "tool_resource_core"
 version = "0.1.0"
 dependencies = [
+ "client_core",
  "core_plugin",
  "jsonschema",
  "serde",
@@ -2852,6 +2865,7 @@ version = "0.1.0"
 dependencies = [
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "client_core",
  "closure_plugin",
  "core_plugin",
  "serde_json",
@@ -3480,9 +3494,11 @@ dependencies = [
  "agent_core",
  "app_runtime_plugin",
  "async_runtime_plugin",
+ "client_core",
  "closure_plugin",
  "core_plugin",
  "futures-util",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "tokio",

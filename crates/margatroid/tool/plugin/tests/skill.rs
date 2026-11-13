@@ -4,7 +4,7 @@ mod storage_fixture;
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use agent_core::{Agent, AgentState};
+    use agent_core::AgentState;
     use app_runtime_plugin::RuntimePlugin;
     use async_runtime_plugin::AsyncRuntimePlugin;
     use closure_plugin::{AppClosureExt, ClosurePlugin};
@@ -22,7 +22,7 @@ mod linux {
     };
     use tool_plugin::ToolPlugin;
     use tool_resource_core::{read_tool, ToolEntry, Tools};
-    use workspace_core::{Workspace, WorkspaceState};
+    use workspace_core::WorkspaceState;
 
     type Reply = oneshot::Receiver<Result<ToolExecuteResponse, ToolError>>;
     const BUDGET: Duration = Duration::from_secs(30);
@@ -60,7 +60,7 @@ mod linux {
                 }
             }
             let imported = read_tool(&resource.join("tool.toml")).unwrap();
-            let mut tools = Tools::default();
+            let mut tools = Tools::new(crate::test_probe());
             tools
                 .insert(
                     "skill_register".into(),
@@ -78,29 +78,34 @@ mod linux {
                 .add_plugin(AsyncRuntimePlugin)
                 .add_plugin(ClosurePlugin)
                 .add_closure_system(RuntimePlugin::UPDATE)
-                .add_plugin(ToolPlugin::new().with_runner_path(env!("CARGO_BIN_EXE_tool_runner")));
+                .add_plugin(
+                    ToolPlugin::new(crate::test_binding())
+                        .with_runner_path(env!("CARGO_BIN_EXE_tool_runner")),
+                );
             let workspace = app.world_mut().spawn();
             app.world_mut().insert_component(
                 workspace,
-                Workspace {
-                    definition: None,
-                    name: "skill-integration".into(),
-                    definition_path: root.path().join("workspace.yaml"),
-                    project_root: root.path().to_owned(),
-                    state: WorkspaceState::Running,
-                    agents: BTreeSet::new(),
-                },
+                workspace_core::Workspace::new(
+                    "skill-integration".into(),
+                    root.path().join("workspace.yaml"),
+                    root.path().to_owned(),
+                    WorkspaceState::Running,
+                    BTreeSet::new(),
+                    None,
+                    crate::test_workspace_context(),
+                ),
             );
             let agent = app.world_mut().spawn();
             super::storage_fixture::mount(app.world_mut(), agent, root.path());
             app.world_mut().insert_component(
                 agent,
-                Agent {
-                    name: "skill-integration".into(),
+                agent_core::Agent::new(
+                    "skill-integration".into(),
                     workspace,
-                    state: AgentState::Working,
-                    turn: Some("integration-turn".into()),
-                },
+                    AgentState::Working,
+                    Some("integration-turn".into()),
+                    crate::test_agent_context(),
+                ),
             );
             app.world_mut().insert_component(agent, tools);
             let (sender, mut reply) = oneshot::channel();
@@ -517,4 +522,28 @@ mod linux {
             "host_integration: real skill registration, static binding, fresh reads, binary metadata, validation and cleanup passed"
         );
     }
+}
+
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
+}
+
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+}
+
+fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
+    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
+}
+
+fn test_probe<T>() -> client_core::UpdateProbe<T> {
+    client_core::UpdateProbe::new(|_| {})
 }

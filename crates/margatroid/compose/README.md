@@ -1,6 +1,6 @@
 # Compose
 
-本轮同步目标设计尚未实现，源码基线为e24862b。异步监控、统一写入口和共享Client槽位按本领域DESIGN及[DTO设计说明](../dto/README.md)实施；以下保留的业务语义不代表新同步路径已部署。
+本轮共享Client槽位、统一写入口与异步监控已实现，尚未提交。具体函数和边界见本领域DESIGN及[DTO说明](../dto/README.md)；运行进程需使用新构建。
 Compose是应用装配库，处于plugin之上，可以依赖多个plugin及core。daemon使用build_app创建应用；领域plugin不得反向依赖Compose。
 
 Config、Workspace和Inference各自读取并校验所属配置；Compose只提供路径、转换装配参数并安装插件。Workspace启动时的文件重读归workspace_plugin，Driver文件读取归Agent启动闭包，数据库和设置操作归Storage。
@@ -13,4 +13,4 @@ mcl和wait由lua_runtime_plugin自行构造，分别使用mcl_core事件契约�
 
 shutdown_app(&mut App)在请求Axum停止后继续推进World，按原领域流程关闭Workspace/Agent，等待Axum普通请求及升级工作退出后返回；清理失败返回诊断，调用方必须保留App监督，不能将错误返回解释为全部已清理。
 
-装配时先创建唯一Clients，再取得DTO提供的具体typed SyncBindings，分别注入领域插件。异步监控和统一写入口都克隆同一槽位；删除dto_sync_system及同步中转事件，不新增sync总线或另一套执行器。Workspace磁盘监控归应用，UI/记录监控归实际Agent来源，关停先取消并等待真实join，再释放运行设施。
+装配时先创建唯一Clients，再取得DTO提供的具体typed绑定工厂，分别注入领域插件。异步监控和统一写入口都克隆同一槽位；删除dto_sync_system及同步中转事件，不新增sync总线或另一套执行器。Workspace磁盘监控归应用，UI/记录监控归实际Agent来源，关停先取消并等待真实join，再释放运行设施。

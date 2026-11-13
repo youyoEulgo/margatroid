@@ -1,5 +1,5 @@
 use core_plugin::World;
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+use std::collections::BTreeSet;
 use workspace_core::*;
 
 fn definition(name: &str) -> WorkspaceDefinition {
@@ -15,27 +15,28 @@ fn definition(name: &str) -> WorkspaceDefinition {
 }
 #[test]
 fn cloned_cache_shares_arc_and_exposes_cross_thread_updates_as_owned_snapshots() {
-    let definitions = WorkspaceDefinitions::default();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workspace.yaml");
+    std::fs::write(&path, "name: initial\nproject_root: project\nmembers: []\n").unwrap();
+    let definitions = WorkspaceDefinitions::open(&path).unwrap();
     let copy = definitions.clone();
-    assert!(Arc::ptr_eq(&definitions.entries, &copy.entries));
-    let path = PathBuf::from("workspace.yaml");
-    let other = path.clone();
+    assert!(definitions.same_instance(&copy));
+    let updated_path = path.clone();
     std::thread::spawn(move || {
-        copy.entries
-            .write()
-            .unwrap()
-            .insert(other, definition("initial"));
+        std::fs::write(
+            updated_path,
+            "name: updated\nproject_root: project\nmembers: []\n",
+        )
+        .unwrap();
+        copy.reload().unwrap();
     })
     .join()
     .unwrap();
+    std::fs::write(&path, "name: initial\nproject_root: project\nmembers: []\n").unwrap();
+    definitions.reload().unwrap();
     let snapshot = definitions.get(&path).unwrap();
-    definitions
-        .entries
-        .write()
-        .unwrap()
-        .get_mut(&path)
-        .unwrap()
-        .name = "updated".into();
+    std::fs::write(&path, "name: updated\nproject_root: project\nmembers: []\n").unwrap();
+    definitions.reload().unwrap();
     assert_eq!(snapshot.name, "initial");
     assert_eq!(definitions.get(&path).unwrap().name, "updated");
     assert_eq!(definitions.list().len(), 1);
@@ -50,12 +51,8 @@ fn cloned_cache_shares_arc_and_exposes_cross_thread_updates_as_owned_snapshots()
 fn fresh_load_reads_current_file_and_never_uses_or_mutates_display_cache() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("workspace.yaml");
-    let cache = WorkspaceDefinitions::default();
-    cache
-        .entries
-        .write()
-        .unwrap()
-        .insert(path.clone(), definition("cached"));
+    std::fs::write(&path, "name: cached\nproject_root: project\nmembers: []\n").unwrap();
+    let cache = WorkspaceDefinitions::open(&path).unwrap();
     std::fs::write(&path,"name: first\nproject_root: project\nmembers:\n  - name: coder\n    driver: drivers/coder\n    home_root: home/coder\n").unwrap();
     let loaded = load_workspace_definition(&path).unwrap();
     assert_eq!(loaded.name, "first");
@@ -104,14 +101,15 @@ fn entity_accessors_keep_full_generation_and_domain_independent_members() {
     let workspace = world.spawn();
     world.insert_component(
         workspace,
-        Workspace {
-            definition: None,
-            name: "w".into(),
-            definition_path: "w.yaml".into(),
-            project_root: "project".into(),
-            state: WorkspaceState::Starting,
-            agents: BTreeSet::new(),
-        },
+        workspace_core::Workspace::new(
+            "w".into(),
+            "w.yaml".into(),
+            "project".into(),
+            WorkspaceState::Starting,
+            BTreeSet::new(),
+            None,
+            crate::test_workspace_context(),
+        ),
     );
     let first = world.spawn();
     let stale = world.spawn();
@@ -136,10 +134,7 @@ fn entity_accessors_keep_full_generation_and_domain_independent_members() {
         WorkspaceState::Restarting,
         WorkspaceState::Stopping,
     ] {
-        world
-            .get_component_mut::<Workspace>(workspace)
-            .unwrap()
-            .state = state;
+        update_workspace(&mut world, workspace, WorkspaceChange::State(state)).unwrap();
         assert_eq!(*world.workspace_state(workspace).unwrap(), state);
     }
     world.workspace_remove_agent(workspace, stale).unwrap();
@@ -215,4 +210,8 @@ fn full_reload_publishes_all_definitions_atomically_and_snapshots_remain_immutab
     let after = definitions.reload().unwrap();
     assert!(after.get(&second).is_none());
     assert_eq!(after.get(&first).unwrap().name, "unpublished");
+}
+
+fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
+    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
 }

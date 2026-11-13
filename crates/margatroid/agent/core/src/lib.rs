@@ -1,7 +1,12 @@
 mod components;
 mod error;
 mod events;
+mod sync;
 mod types;
+pub use sync::{
+    notify_agent_runtime, remove_agent, update_agent, AgentChange, AgentObservationWait,
+    AgentUpdateContext, AgentUpdateKind,
+};
 
 pub use components::{Agent, AgentDriverSource};
 pub use error::{AgentError, AgentErrorKind};
@@ -14,6 +19,12 @@ use std::sync::OnceLock;
 
 pub trait WorldAgentExt {
     fn agent_state(&self, agent: Entity) -> Result<&AgentState, AgentError>;
+    fn agent_transition(
+        &mut self,
+        agent: Entity,
+        state: AgentState,
+        turn: Option<String>,
+    ) -> Result<(), AgentError>;
     fn agent_start_turn(&mut self, agent: Entity) -> Result<String, AgentError>;
     fn agent_finish_turn(&mut self, agent: Entity, turn: &str) -> Result<(), AgentError>;
     fn agent_abort_turn(&mut self, agent: Entity, turn: &str) -> Result<(), AgentError>;
@@ -26,6 +37,24 @@ impl WorldAgentExt for World {
             .ok_or_else(|| AgentError::new(AgentErrorKind::AgentMissing, "agent does not exist"))
     }
 
+    fn agent_transition(
+        &mut self,
+        owner: Entity,
+        state: AgentState,
+        turn: Option<String>,
+    ) -> Result<(), AgentError> {
+        let context = self
+            .get_component::<Agent>(owner)
+            .ok_or_else(|| AgentError::new(AgentErrorKind::AgentMissing, "Agent missing"))?
+            .updates
+            .clone();
+        update_agent(
+            self,
+            owner,
+            &context,
+            AgentChange::Transition { state, turn },
+        )
+    }
     fn agent_start_turn(&mut self, entity: Entity) -> Result<String, AgentError> {
         let agent = self
             .get_component_mut::<Agent>(entity)
@@ -49,8 +78,16 @@ impl WorldAgentExt for World {
             )
         });
         let turn = format!("turn:{prefix}:{}", NEXT.fetch_add(1, Ordering::Relaxed));
-        agent.turn = Some(turn.clone());
-        agent.state = AgentState::Working;
+        let context = agent.updates.clone();
+        update_agent(
+            self,
+            entity,
+            &context,
+            AgentChange::Transition {
+                state: AgentState::Working,
+                turn: Some(turn.clone()),
+            },
+        )?;
         Ok(turn)
     }
 
@@ -67,8 +104,16 @@ impl WorldAgentExt for World {
                 "turn does not match the working agent",
             ));
         }
-        agent.turn = None;
-        agent.state = AgentState::Idle;
+        let context = agent.updates.clone();
+        update_agent(
+            self,
+            entity,
+            &context,
+            AgentChange::Transition {
+                state: AgentState::Idle,
+                turn: None,
+            },
+        )?;
         Ok(())
     }
 
@@ -85,7 +130,18 @@ impl WorldAgentExt for World {
                 "turn does not match the working agent",
             ));
         }
-        agent.turn = None;
+        let context = agent.updates.clone();
+        update_agent(
+            self,
+            entity,
+            &context,
+            AgentChange::Transition {
+                state: AgentState::Working,
+                turn: None,
+            },
+        )?;
         Ok(())
     }
 }
+
+pub use sync::{AgentPublicUpdate, PublicModelInfo, PublicToolInfo};

@@ -58,7 +58,7 @@ fn entry(path: &str, owner: Option<&str>) -> ToolEntry {
 
 #[test]
 fn records_reject_conflicts_and_borrow_without_io() {
-    let mut entries = Tools::new();
+    let mut entries = Tools::new(crate::test_probe());
     let alpha = entry("/missing/alpha", None);
     let beta = entry("/missing/beta", Some("task-a"));
     entries.insert("z".into(), alpha.clone()).unwrap();
@@ -106,7 +106,7 @@ fn records_reject_conflicts_and_borrow_without_io() {
 
 #[test]
 fn batches_validate_every_record_before_atomic_publication() {
-    let mut entries = Tools::new();
+    let mut entries = Tools::new(crate::test_probe());
     entries
         .insert("existing".into(), entry("/missing/existing", None))
         .unwrap();
@@ -302,4 +302,8 @@ fn required_files_cannot_follow_symlinks_outside_entry_directory() {
         fs::remove_file(&candidate).unwrap();
         valid_tool(&fixture);
     }
+}
+
+fn test_probe<T>() -> client_core::UpdateProbe<T> {
+    client_core::UpdateProbe::new(|_| {})
 }

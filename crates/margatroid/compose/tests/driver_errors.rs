@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::sync::oneshot;
 use workspace_core::{
-    Workspace, WorkspaceExecutionClose, WorkspaceState, spawn_workspace_executor,
+    WorkspaceExecutionClose, WorkspaceState, spawn_workspace_executor,
 };
 
 const CODER: &str = include_str!("../../../../resources/agent-drivers/local/coder/latest/base.lua");
@@ -70,14 +70,15 @@ impl Fixture {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            Workspace {
-                definition: None,
-                name: "driver-errors".into(),
-                definition_path: root.path().join("workspace.yaml"),
-                project_root: root.path().to_owned(),
-                state: WorkspaceState::Running,
-                agents: Default::default(),
-            },
+            workspace_core::Workspace::new(
+                "driver-errors".into(),
+                root.path().join("workspace.yaml"),
+                root.path().to_owned(),
+                WorkspaceState::Running,
+                Default::default(),
+                None,
+                crate::test_workspace_context(),
+            ),
         );
         let executor = spawn_workspace_executor().unwrap();
         let close = executor.close.clone();
@@ -561,4 +562,8 @@ margatroid.driver:wait()
             fixture.close(Some(instance)).await;
         }
     }
+}
+
+fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
+    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
 }

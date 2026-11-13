@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+client_core = { path = "../../client/core" }
+address = { path = "../../address" }
 tool_core = { path = "../core" }
 lua_runtime_core = { path = "../../lua_runtime/core" }
 storage_core = { path = "../../storage/core" }

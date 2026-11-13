@@ -102,7 +102,15 @@ pub(crate) fn handle_import_result(world: &mut World, result: Result<ImportOutpu
     } else {
         validated.map(|path| {
             if !world.contains_component::<Sandboxes>(context.owner) {
-                world.insert_component(context.owner, Sandboxes::default());
+                world.insert_component(
+                    context.owner,
+                    Sandboxes::new(
+                        world
+                            .get_resource::<sandbox_resource_core::SandboxSyncBinding>()
+                            .expect("resource sync binding required")
+                            .for_owner(context.owner),
+                    ),
+                );
             }
             world
                 .get_component_mut::<Sandboxes>(context.owner)

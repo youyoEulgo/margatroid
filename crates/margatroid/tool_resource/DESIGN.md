@@ -11,14 +11,6 @@ method(args) -> xxx
 ```
 
 # 板块定义
-ToolResourceUpdateContext
-    owner: Entity
-    source_epoch: u64
-    on_change: Arc<dyn Fn(Vec<ToolEntry>) + Send + Sync>--compose绑定AgentUpdateContext及同一Clients槽位
-ToolResourceChange
-    Insert { alias: String, entry: ToolEntry }
-    InsertBatch(Vec<(String, ToolEntry)>) | RemoveOwner(String)
-
 ```text
 # lib        tool_resource/core/src/lib.rs；tool_resource/plugin/src/lib.rs  路径扩展及文件读取；Plugin安装
 # components tool_resource/core/src/components.rs                         Tools统一入口集合
@@ -61,9 +53,6 @@ ToolResourcePlugin：工具路径登记插件
 
 公开，定义于tool_resource_core：
 ```text
-update_tools(tools: &mut Tools, context: &ToolResourceUpdateContext, change: ToolResourceChange) -> Result<(), ToolResourceError>
-    行为：校验owner及来源租约后统一完成Insert/InsertBatch/RemoveOwner；失败不改集合，成功且内容变化时从当前Tools生成完整公共纯值，调用注入的on_change更新Agent公共视图并直接投递agent.sync。普通导入、MCP动态注册、owner清理及实例替换都不得旁路；回调不发送ECS同步事件。
-
 read_tool(path: &Path) -> Result<ToolInput, ToolResourceError>
     行为：
         完整读取tool.toml、input.schema.json、main.lua，不额外限制文件字节数
@@ -80,20 +69,20 @@ read_tool(path: &Path) -> Result<ToolInput, ToolResourceError>
 ```text
 Tools：Agent唯一工具集合，公开组件
     entries: BTreeMap<String, ToolEntry>--私有alias记录
-    updates: ToolResourceUpdateContext--构造必需，绑定当前Agent来源及公共信息发布
-    new(updates: ToolResourceUpdateContext) -> Self
+    updates: UpdateProbe<Vec<(String, ToolEntry)>>--构造必需，绑定当前Agent来源及公共信息发布
+    new(updates: UpdateProbe<Vec<(String, ToolEntry)>>) -> Self
     get(&self, alias: &str) -> Option<&ToolEntry>
         行为：
             return entries.get(alias)
     insert(&mut self, alias: String, entry: ToolEntry) -> Result<(), ToolResourceError>
         行为：
-            调用update_tools(Insert)，不直接修改entries。
+            调用同一insert_batch入口，成功后publish_current。
     insert_batch(&mut self, entries: Vec<(String, ToolEntry)>) -> Result<(), ToolResourceError>
         行为：
-            调用update_tools(InsertBatch)，批次校验、提交及公共视图发布同属一次入口调用。
+            同一入口校验整批schema/path/alias后原子提交；非空成功批次调用publish_current，失败不修改集合。
     remove_owner(&mut self, owner_task_id: &str)
         行为：
-            调用update_tools(RemoveOwner)，只删所属记录，不等待或取消已受理任务。
+            删除所属记录；只有集合实际缩小时publish_current，不等待或取消已受理任务。
     iter(&self) -> impl Iterator<Item = (&String, &ToolEntry)>
         行为：
             return entries.iter()
@@ -199,6 +188,11 @@ ToolInput：本次工具材料
     input_schema: serde_json::Value
     program: String
     origin: PathBuf
+ToolResourceSyncBinding = ProbeFactory<Vec<(String, ToolEntry)>>
+    行为：compose/DTO注入按owner创建的typed回调，转换为AgentPublicUpdate::Tools；回调仅捕获当前来源scope。
+Tools::publish_current(&self)
+    行为：从同一entries克隆完整公开记录后调用updates.publish，交付Agent公共视图，不发事件或借用World。
+
 ```
 
 # error

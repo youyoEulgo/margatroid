@@ -1,4 +1,4 @@
-Margatroid领域目标设计；本轮同步架构尚未实现，实施状态及契约变化见README。
+Margatroid领域实现契约；共享Client槽位与直接同步投递已实现，运行进程需使用相应构建。
 
 # 伪代码格式
 
@@ -18,7 +18,7 @@ Margatroid领域目标设计；本轮同步架构尚未实现，实施状态及�
 # events     client/core/src/events.rs                        注册和断连领域事件
 # system     client/plugin/src/system.rs                      事件路由
 # handler    client/plugin/src/handler.rs                     身份注册与销毁
-# types pub  client/core/src/types.rs                         共享发送槽位、连接及同步发布能力
+# types pub  client/core/src/types.rs、shared.rs、output.rs、probe.rs、probe_factory.rs  共享槽位与同步能力
 # error      client/core/src/error.rs                         注册、发送与编码错误
 ```
 
@@ -37,13 +37,15 @@ WorldClientExt
 
 Clients：Client领域Resource及网络/异步任务共用能力
     inner: Arc<ClientSlots>
-    new() -> Self
+    default() -> Self
+    same_instance(&self, other: &Self) -> bool
     allocate(&self) -> Result<(ConnectionId, ClientReceiver, CancellationToken), ClientError>
         行为：分配不复用ConnectionId、每连接唯一有界出站队列、取消能力及请求登记集合，插入尚未注册槽位。
-    sender(&self, connection: ConnectionId) -> Option<ClientSender>
-        行为：按真实传输连接取当前发送能力。
-    claim(&self, connection: ConnectionId, id: &str) -> Result<RequestTicket, ClientError>
+    claim(&self, connection: ConnectionId, id: &str) -> Option<Arc<RequestTicket>>
         行为：登记连接内唯一在途id，ticket释放时移除；不维护第二张网络连接表。
+    get(&self, connection: ConnectionId) -> Option<ClientSender>
+    adopt(&self, connection: ConnectionId, sender: ClientSender) -> Result<(), ClientError>
+        行为：显式接入已有传输能力，拒绝重复ConnectionId；生产WebSocket使用allocate。
     registered(&self, connection: ConnectionId) -> Option<Arc<ClientIdentity>>
         行为：读取唯一身份记录，未注册或已移除返回None。
     select(&self, targets: &[ClientSelector]) -> Vec<(ConnectionId, ClientSender)>
@@ -55,52 +57,53 @@ Clients：Client领域Resource及网络/异步任务共用能力
     initialize(&self, connection: ConnectionId)
         行为：注册成功后为符合条件的现存状态源投递StateKey，读取当前值；不重放chunk/日志/MCL/历史事件。
     register_source(&self, key: SyncKey, targets: Arc<[ClientSelector]>, prepare: StatePrepare) -> SyncSource
-        行为：登记可独立异步读取的状态源，分配本次来源epoch；替换同key旧来源时先失效旧source。
+        行为：登记owned状态读取源并分配epoch，替换同key旧来源先使其失效；立即向当前符合条件的连接排入一次该StateKey。
     publish_state(&self, source: &SyncSource, revision: u64)
         行为：检查来源存活及版本，缓存轻量来源信息；遍历当前select结果直接调用sender.try_send_state。
-    register_stream(&self, key: SyncKey, targets: Arc<[ClientSelector]>) -> SyncStreamSource
-        行为：建立有序增量的来源租约，不放入初始状态索引，也不要求伪造snapshot回调。
-    send_ordered(&self, source: &SyncStreamSource, frame: Arc<ClientFrame>)
-        行为：检查active及accepting，遍历当前select结果，附带后端来源租约直接投递具体有序帧，不缓存为初始状态。
+    send_ordered(&self, targets: &[ClientSelector], frame: Arc<ClientFrame>)
+        行为：遍历当前select结果直接投递有序具体帧，不登记初始状态。
+    send_scoped(&self, targets: &[ClientSelector], frame: Arc<ClientFrame>, active: Arc<AtomicBool>)
+        行为：来源仍存活才选择当前接收者，发送项携带同一来源有效标记；writer取帧时复检，来源失效则丢弃旧帧。
     retire_source(&self, source: &SyncSource)
         行为：失效来源、移除其初始化入口及旧pending状态；不借助ECS事件或运行帧。
     impl Resource + Clone
         行为：World、DTO State、同步入口及异步监控克隆同一个Arc。
 
-SyncContext<T>：领域更新入口必需的状态同步上下文
+SyncContext<T>：状态同步能力
     clients: Clients
     source: SyncSource
-    snapshot: Arc<dyn Fn() -> SnapshotFuture<T> + Send + Sync>
-    encode: Arc<dyn Fn(T) -> Result<Arc<ClientFrame>, ClientPrepareError> + Send + Sync>
+    marker: PhantomData<fn() -> T>
+    new(clients: Clients, key: SyncKey, targets: Arc<[ClientSelector]>, snapshot: impl Fn() -> Result<(u64, T), ClientPrepareError> + Send + Sync + 'static, encode: impl Fn(T) -> Result<Arc<ClientFrame>, ClientPrepareError> + Send + Sync + 'static) -> Self
+        行为：将owned读取及编码封装为StatePrepare，执行时spawn_blocking并真实await；只捕获Weak领域数据，不把World带进异步端。
     publish(&self, revision: u64)
-        行为：实际可见状态发生变化后直接调用Clients.publish_state；snapshot/encode封装为该source的StatePrepare，不访问World。
+        行为：实际更新后调用Clients.publish_state，不固定发送器列表。
     close(&self)
-        行为：失效该来源，阻止已取消或旧实例的迟到更新。
+        行为：Clients.retire_source失效当前来源并移出初始化索引。
+    source(&self) -> &SyncSource
     impl Clone
-        行为：持有共享槽位及owned读取能力，不固定接收者列表。
+UpdateProbe<T>
+    callback: Arc<dyn Fn(T) + Send + Sync>
+    new(callback: impl Fn(T) + Send + Sync + 'static) -> Self
+    publish(&self, value: T)
+        行为：所属领域唯一写入口在实际变化后提交typed派生纯值；回调由装配层绑定公共视图及Clients，不允许缺少回调。
+ProbeFactory<T>
+    callback: Arc<dyn Fn(Entity) -> UpdateProbe<T> + Send + Sync>
+    new(callback: impl Fn(Entity) -> UpdateProbe<T> + Send + Sync + 'static) -> Self
+    for_owner(&self, owner: Entity) -> UpdateProbe<T>
+    impl Clone + Resource（T: Send + Sync + 'static）
 
-StreamContext<T>：具体增量消息的同步上下文
-    clients: Clients
-    source: SyncStreamSource
-    encode: Arc<dyn Fn(T) -> Result<Arc<ClientFrame>, ClientPrepareError> + Send + Sync>
-    send(&self, update: T) -> Result<(), ClientPrepareError>
-        行为：把真实chunk或持久记录投影编码一次后直接调用Clients.send_ordered；保持来源内顺序，不合并、不回World。
-    finish(&self)
-        行为：仅关闭accepting，不抹除已入队的完整终态。
-    retire(&self)
-        行为：来源实际结束/替换时失效active，取消迟到旧更新。
 ```
 
 公开，定义于client_plugin：
 ```text
 ClientPlugin
     schedule: String
-    clients: Clients
-    new(clients: Clients) -> Self
+    new() -> Self
+    impl Default
     with_schedule(self, schedule: impl Into<String>) -> Self
     impl Plugin
         build(self, app: &mut App)
-            行为：检查运行计划和唯一共享槽位，插入同一Clients Resource及安装标记，安装注册及断连System；不创建服务器或同步分发任务。
+            行为：检查运行计划和安装标记；复用已插入Clients，无槽位时安装唯一默认槽位，安装注册及断连System；不创建服务器或同步分发任务。
 ```
 
 私有，定义于client_plugin：
@@ -207,74 +210,73 @@ ClientSelector
     Broadcast | Type(String) | Name(String)
     impl Clone + Debug + Eq
 ClientSlots
-    registry: RwLock<ClientRegistry>
-    sources: Mutex<BTreeMap<SyncKey, SyncSource>>--仅当前状态源，读取回调只捕获Weak领域数据，防止Arc环
-ClientRegistry
+    registry: RwLock<Registry>
+    sources: Mutex<BTreeMap<SyncKey, SyncSource>>
+Registry
     entries: BTreeMap<ConnectionId, ClientSlot>
-    names: BTreeMap<String, ConnectionId>--与entries在同一写锁提交
+    names: BTreeMap<String, ConnectionId>
 ClientSlot
     sender: ClientSender
     identity: Option<Arc<ClientIdentity>>
-    cancel: CancellationToken
     active: Arc<Mutex<BTreeSet<String>>>
+    行为：cancel从sender内部取得，不另建第二个取消状态。
 RequestTicket
     id: String
     connection: ConnectionId
     active: Arc<Mutex<BTreeSet<String>>>
     impl Drop：释放在途id
-
 SyncKey
-    topic: String--具体sync接口名
-    object: String--集合或Agent Address等业务对象键
-SyncSource
-    key: SyncKey
-    epoch: u64--后端来源租约，非网络字段；集合来源归应用，per-Agent来源归实际实例
-    active: Arc<AtomicBool>
-    revision: Arc<AtomicU64>
-    targets: Arc<[ClientSelector]>
-    prepare: StatePrepare--owned状态读取及编码，无World借用
-SyncStreamSource
+    topic: String
+    object: String
+SyncSource(Arc<StateSource>)
+StateSource
     key: SyncKey
     epoch: u64
-    active: Arc<AtomicBool>--来源/实例生命周期，替换或停止时失效
-    accepting: Arc<AtomicBool>--当前生产链是否仍接受新更新
+    active: AtomicBool
+    revision: AtomicU64
     targets: Arc<[ClientSelector]>
-    行为：正常生成结束只关闭accepting，已入队帧仍交付；来源替换或Agent停止使active失效，writer丢弃旧来源迟到帧。
+    prepare: StatePrepare
+    行为：key/epoch/active控制来源归属；revision仅在推进时发布，prepare只持Weak状态读取。
 StatePrepare = Arc<dyn Fn() -> PrepareFuture + Send + Sync>
 PrepareFuture = Pin<Box<dyn Future<Output = Result<PreparedState, ClientPrepareError>> + Send>>
-SnapshotFuture<T> = Pin<Box<dyn Future<Output = Result<(u64, T), ClientPrepareError>> + Send>>
 PreparedState
-    key: SyncKey
-    epoch: u64
     revision: u64
     frame: Arc<ClientFrame>
-    行为：版本取实际读取快照时刻，不把较旧通知版本当作实际内容版本。
-
+    行为：source由ClientReceiver.preparing保存，版本取实际读取快照时刻。
 ClientFrame
     Text(String) | Binary(Vec<u8>) | Close { code: u16, reason: String }
-ClientOutputItem
-    Ordered { source: Option<SyncStreamSource>, frame: Arc<ClientFrame> }
-    StateKey(SyncKey)
+OutputItem（私有）
+    Ordered { frame: Arc<ClientFrame>, active: Option<Arc<AtomicBool>> }
+    State(SyncKey)
 ClientOutput
-    sender: mpsc::Sender<ClientOutputItem>
     pending: Mutex<BTreeMap<SyncKey, SyncSource>>
     cancel: CancellationToken
 ClientSender
+    sender: mpsc::Sender<OutputItem>
     output: Arc<ClientOutput>
+    channel(capacity: usize) -> (ClientSender, ClientReceiver)
     try_send(&self, frame: ClientFrame) -> Result<(), ClientSendError>
-    try_send_ordered(&self, source: SyncStreamSource, frame: Arc<ClientFrame>) -> Result<(), ClientSendError>
-        行为：直接入队具体帧，保持顺序；Full/Closed明确返回并取消慢连接，不静默丢chunk或记录。
+    try_send_shared(&self, frame: Arc<ClientFrame>) -> Result<(), ClientSendError>
+    try_send_scoped(&self, frame: Arc<ClientFrame>, active: Arc<AtomicBool>) -> Result<(), ClientSendError>
+        行为：仅有界入队；Full/Closed立即取消连接，不能静默丢单个有序帧后继续。
     try_send_state(&self, source: SyncSource) -> Result<(), ClientSendError>
-        行为：只为同连接同key的首个pending状态排入StateKey，后续修改只更新该pending来源/版本，不排入多份大快照。
+        行为：pending无key时排一个State项，已有key时只替换最新有效来源；无大快照副本或中转任务。
+    cancel(&self)
+    cancel_token(&self) -> CancellationToken
     is_closed(&self) -> bool
     impl Clone + Debug
 ClientReceiver
-    receiver: mpsc::Receiver<ClientOutputItem>
-    output: Arc<ClientOutput>
-    recv(&mut self) -> Future<Output = Option<ClientOutputItem>>
-    take_state(&self, key: &SyncKey) -> Option<SyncSource>
-        行为：取走最新pending来源，释放锁后prepare；更新期间可再排一个新StateKey。
-    行为：每连接仅此一个有界队列，pending是本队列内部状态合并表，不是额外sync通道或后台分发器。
+    receiver: mpsc::Receiver<OutputItem>
+    output: Arc<ClientOutput>--不拥有sender，最后发送能力释放后可检测真实队列结束
+    preparing: Option<(SyncSource, PrepareFuture)>
+    sent: BTreeMap<SyncKey, (u64, u64)>
+    recv(&mut self) -> Future<Output = Option<ClientFrame>>
+        行为：Ordered复检可选active，State取pending最新来源并在preparing保存Future；prepare完成后复检来源和已发送epoch/revision，旧内容跳过。
+        取消本次recv Future不丢preparing，下一次继续原读取，不新建同次worker。
+    try_recv(&mut self) -> Result<ClientFrame, mpsc::error::TryRecvError>
+    close(&mut self) -> Future<Output = ()>
+        行为：取消连接、关闭队列及清pending，等待已有preparing真实结束；不丢Future冒充worker结束。
+    impl Drop：请求取消，正常网络退出先await close。
 
 RegisteredClient
     client: Entity
@@ -308,7 +310,7 @@ compose创建唯一Clients
 ├── DTO State / Axum handler
 ├── 异步文件与记录监控
 └── 同步领域统一更新入口
-    └── SyncContext / StreamContext
+    └── SyncContext / scoped有序发送
         └── 同一个Arc<ClientSlots>
             ├── 未注册及已注册ClientSlot
             │   ├── 同一ClientIdentity Arc（与Client组件共享）

@@ -54,7 +54,7 @@ fn fake_domains(world: &mut World) {
         state.tool_frames.push(frame);
         let fail = state.fail_tool;
         if !world.contains_component::<ToolTasks>(request.agent) {
-            world.insert_component(request.agent, ToolTasks::default());
+            world.insert_component(request.agent, test_tasks());
         }
         if let Some(sender) = request.reply.lock().unwrap().take() {
             let _ = sender.send(if fail {
@@ -258,15 +258,32 @@ impl Fixture {
             "mode='new default'\n",
         );
         let mut app = App::new();
+        app.world_mut()
+            .insert_resource(tool_resource_core::ToolResourceSyncBinding::new(|_| {
+                client_core::UpdateProbe::new(|_| {})
+            }));
+        app.world_mut()
+            .insert_resource(sandbox_resource_core::SandboxSyncBinding::new(|_| {
+                client_core::UpdateProbe::new(|_| {})
+            }));
+        app.world_mut()
+            .insert_resource(sandbox_resource_core::SandboxSelectionSyncBinding::new(
+                |_| client_core::UpdateProbe::new(|_| {}),
+            ));
+        app.world_mut()
+            .insert_resource(inference_core::ModelSyncBinding::new(|_| {
+                client_core::UpdateProbe::new(|_| {})
+            }));
+
         app.add_plugin(RuntimePlugin::default())
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE)
             .add_plugin(AsyncRuntimePlugin)
-            .add_plugin(AgentPlugin::new().with_resource_roots(root.path()))
+            .add_plugin(AgentPlugin::new(test_agent_context()).with_resource_roots(root.path()))
             .add_system(RuntimePlugin::UPDATE, fake_domains);
         app.world_mut().insert_resource(FakeDomains::default());
-        app.world_mut().insert_resource(ModelRoutes {
-            entries: BTreeMap::from([(
+        app.world_mut()
+            .insert_resource(inference_core::ModelRoutes::new(BTreeMap::from([(
                 "test-model".into(),
                 ModelRoute {
                     model: "provider-model".into(),
@@ -278,21 +295,21 @@ impl Fixture {
                     thinking: Some("enabled".into()),
                     reasoning_effort: Some("medium".into()),
                 },
-            )]),
-        });
+            )])));
         let directory = root.path().join("workspaces/demo");
         std::fs::create_dir_all(&directory).unwrap();
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            Workspace {
-                definition: None,
-                name: "Demo".into(),
-                definition_path: directory.join("workspace.yaml"),
-                project_root: root.path().join("project"),
-                state: WorkspaceState::Running,
-                agents: BTreeSet::new(),
-            },
+            workspace_core::Workspace::new(
+                "Demo".into(),
+                directory.join("workspace.yaml"),
+                root.path().join("project"),
+                WorkspaceState::Running,
+                BTreeSet::new(),
+                None,
+                crate::test_workspace_context(),
+            ),
         );
         app.world_mut()
             .insert_component(workspace, spawn_workspace_executor().unwrap());
@@ -567,7 +584,13 @@ fn stop_vm_error_retains_stopping_host_and_runtime_components() {
 fn restart_with_unfinished_tools_rejects_without_cancellation_or_vm_stop() {
     let mut fixture = Fixture::new();
     let agent = fixture.start();
-    let (task, _input) = new_tool_task();
+    let (task, _input) = new_tool_task(
+        fixture
+            .app
+            .world()
+            .get_component::<ToolTasks>(agent)
+            .unwrap(),
+    );
     fixture
         .app
         .world()
@@ -650,7 +673,13 @@ fn restart_uses_new_driver_same_entity_and_preserves_database_settings_without_f
         },
     )
     .unwrap();
-    let (completed, _input) = new_tool_task();
+    let (completed, _input) = new_tool_task(
+        fixture
+            .app
+            .world()
+            .get_component::<ToolTasks>(agent)
+            .unwrap(),
+    );
     fixture
         .app
         .world()
@@ -759,7 +788,13 @@ fn stop_closes_admission_then_waits_for_vm_inference_tools_and_mcl_drain() {
         .get_component_mut::<ActiveInference>(agent)
         .unwrap()
         .current = Some(inference_handle);
-    let (tool, _input) = new_tool_task();
+    let (tool, _input) = new_tool_task(
+        fixture
+            .app
+            .world()
+            .get_component::<ToolTasks>(agent)
+            .unwrap(),
+    );
     let finished = tool.clone();
     let cleanup_tasks = fixture
         .app
@@ -892,12 +927,12 @@ fn managed_database_paths_and_workspace_whitelist_are_checked_before_spawning() 
         .parent()
         .unwrap()
         .join("state.sqlite");
-    fixture
-        .app
-        .world_mut()
-        .get_component_mut::<Workspace>(fixture.workspace)
-        .unwrap()
-        .state = WorkspaceState::Stopping;
+    workspace_core::update_workspace(
+        fixture.app.world_mut(),
+        fixture.workspace,
+        workspace_core::WorkspaceChange::State(WorkspaceState::Stopping),
+    )
+    .unwrap();
     let mut reply = fixture.request_start("stopping");
     assert_eq!(
         wait(&mut fixture.app, &mut reply).unwrap_err().kind,
@@ -969,7 +1004,9 @@ fn exception_closes_admission_and_retains_host_without_faking_cleanup() {
         .is_empty());
 }
 
-fn new_tool_task() -> (
+fn new_tool_task(
+    tasks: &ToolTasks,
+) -> (
     ToolTaskHandle,
     tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
 ) {
@@ -979,6 +1016,32 @@ fn new_tool_task() -> (
         "call".into(),
         "tool".into(),
         reply,
+        tasks.update_context(),
     )
     .unwrap()
+}
+
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
+}
+fn test_tasks() -> tool_core::ToolTasks {
+    let mut app = core_plugin::App::new();
+    let owner = app.world_mut().spawn();
+    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
+}
+
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+}
+
+fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
+    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
 }

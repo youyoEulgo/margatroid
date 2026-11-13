@@ -13,4 +13,15 @@ pub fn mount(world: &mut core_plugin::World, agent: core_plugin::Entity, root: &
     )
     .unwrap();
     world.insert_component(agent, storage);
+    if world.get_component::<address::Address>(agent).is_none() {
+        world.insert_component(
+            agent,
+            address::Address::new(&format!(
+                "agent:fixture/task-{}-{}",
+                agent.index(),
+                agent.generation()
+            ))
+            .unwrap(),
+        );
+    }
 }

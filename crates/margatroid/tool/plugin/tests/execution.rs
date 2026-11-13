@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agent_core::{Agent, AgentState};
+use agent_core::AgentState;
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
 use closure_plugin::{AppClosureExt, ClosurePlugin};
@@ -23,7 +23,7 @@ use tool_core::{
 };
 use tool_plugin::ToolPlugin;
 use tool_resource_core::{read_tool, ToolEntry, Tools};
-use workspace_core::{Workspace, WorkspaceState};
+use workspace_core::WorkspaceState;
 
 fn imported_entry(path: &std::path::Path) -> ToolEntry {
     let tool = read_tool(path).unwrap();
@@ -63,32 +63,34 @@ impl Fixture {
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE)
             .add_plugin(
-                ToolPlugin::new()
+                ToolPlugin::new(crate::test_binding())
                     .with_runner_path(runner)
                     .with_limits(limits),
             );
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            Workspace {
-                definition: None,
-                name: "test".into(),
-                definition_path: root.path().join("workspace.yaml"),
-                project_root: root.path().to_owned(),
-                state: WorkspaceState::Running,
-                agents: BTreeSet::new(),
-            },
+            workspace_core::Workspace::new(
+                "test".into(),
+                root.path().join("workspace.yaml"),
+                root.path().to_owned(),
+                WorkspaceState::Running,
+                BTreeSet::new(),
+                None,
+                crate::test_workspace_context(),
+            ),
         );
         let agent = app.world_mut().spawn();
         storage_fixture::mount(app.world_mut(), agent, root.path());
         app.world_mut().insert_component(
             agent,
-            Agent {
-                name: "test".into(),
+            agent_core::Agent::new(
+                "test".into(),
                 workspace,
-                state: AgentState::Working,
-                turn: Some("test-turn".into()),
-            },
+                AgentState::Working,
+                Some("test-turn".into()),
+                crate::test_agent_context(),
+            ),
         );
         let (sender, mut reply) = oneshot::channel();
         app.world().emit_event(InitToolTasks {
@@ -139,7 +141,7 @@ impl Fixture {
         if !self.app.world().contains_component::<Tools>(self.agent) {
             self.app
                 .world_mut()
-                .insert_component(self.agent, Tools::default());
+                .insert_component(self.agent, Tools::new(crate::test_probe()));
         }
         self.app
             .world_mut()
@@ -426,13 +428,13 @@ fn return_keeps_vm_alive_across_turn_changes_and_supports_json_cache_replacement
         .get("background-task")
         .unwrap()
         .is_cleanup_complete());
-    let agent = fixture
-        .app
-        .world_mut()
-        .get_component_mut::<Agent>(fixture.agent)
-        .unwrap();
-    agent.turn = Some("unrelated-new-turn".into());
-    agent.state = AgentState::Idle;
+    agent_core::WorldAgentExt::agent_transition(
+        fixture.app.world_mut(),
+        fixture.agent,
+        AgentState::Idle,
+        Some("unrelated-new-turn".into()),
+    )
+    .unwrap();
     let value = json!({"nested":[1,true,null,{"text":"hello"}]});
     fixture
         .tasks()
@@ -616,12 +618,13 @@ fn init_preserves_existing_tasks_and_closed_agent_rejects_new_calls() {
     fixture.app.tick();
     assert!(reply.try_recv().unwrap().is_ok());
     assert_eq!(fixture.tasks().list().len(), 1);
-    fixture
-        .app
-        .world_mut()
-        .get_component_mut::<Agent>(fixture.agent)
-        .unwrap()
-        .state = AgentState::Stopping;
+    agent_core::WorldAgentExt::agent_transition(
+        fixture.app.world_mut(),
+        fixture.agent,
+        AgentState::Stopping,
+        Some("test-turn".into()),
+    )
+    .unwrap();
     let reply = fixture.execute("new", "background", json!({}));
     let rejected = fixture.response(reply).unwrap();
     assert!(rejected.failed);
@@ -874,7 +877,7 @@ fn selected_sandbox_is_read_fresh_and_invalid_policy_never_starts_tool() {
     fixture.tool("safe", "function execute(args,context) margatroid.task:append_output('must-not-run'); margatroid.task:return_result('unsafe'); margatroid.task:finish(margatroid.context.task_id) end");
     let policy = fixture.root.path().join("policy.json");
     std::fs::write(&policy, "[]").unwrap();
-    let mut sandboxes = sandbox_resource_core::Sandboxes::default();
+    let mut sandboxes = sandbox_resource_core::Sandboxes::new(crate::test_probe());
     sandboxes.insert("selected".into(), policy);
     fixture
         .app
@@ -882,9 +885,7 @@ fn selected_sandbox_is_read_fresh_and_invalid_policy_never_starts_tool() {
         .insert_component(fixture.agent, sandboxes);
     fixture.app.world_mut().insert_component(
         fixture.agent,
-        sandbox_resource_core::SelectedSandbox {
-            alias: Some("selected".into()),
-        },
+        sandbox_resource_core::SelectedSandbox::new(Some("selected".into()), crate::test_probe()),
     );
     let reply = fixture.execute("safe", "safe", json!({}));
     assert_eq!(fixture.response(reply).unwrap_err().kind, Kind::ReadFailed);
@@ -1426,12 +1427,13 @@ fn accepted_batch_abort_returns_long_call_immediately_and_preserves_returned_bac
         .parse()
         .unwrap();
     assert_eq!(fixture.tasks().list().len(), 2);
-    fixture
-        .app
-        .world_mut()
-        .get_component_mut::<Agent>(fixture.agent)
-        .unwrap()
-        .turn = None;
+    agent_core::WorldAgentExt::agent_transition(
+        fixture.app.world_mut(),
+        fixture.agent,
+        AgentState::Working,
+        None,
+    )
+    .unwrap();
     let started = Instant::now();
     assert_eq!(fixture.tasks().abort_unreturned(), 1);
     let response = fixture
@@ -1798,4 +1800,28 @@ end
     let reply = f.execute("contract", "contract", json!({"value":"original"}));
     assert_eq!(f.response(reply).unwrap().content, "contract verified");
     f.removed("contract");
+}
+
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
+}
+
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+}
+
+fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
+    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
+}
+
+fn test_probe<T>() -> client_core::UpdateProbe<T> {
+    client_core::UpdateProbe::new(|_| {})
 }

@@ -11,18 +11,15 @@ use std::path::PathBuf;
 pub struct AgentPlugin {
     pub schedule: String,
     driver_root: PathBuf,
+    sync: agent_core::AgentUpdateContext,
 }
-impl Default for AgentPlugin {
-    fn default() -> Self {
+impl AgentPlugin {
+    pub fn new(sync: agent_core::AgentUpdateContext) -> Self {
         Self {
+            sync,
             schedule: RuntimePlugin::UPDATE.into(),
             driver_root: PathBuf::from("resources/agent-drivers"),
         }
-    }
-}
-impl AgentPlugin {
-    pub fn new() -> Self {
-        Self::default()
     }
     pub fn with_schedule(mut self, schedule: impl Into<String>) -> Self {
         self.schedule = schedule.into();
@@ -37,6 +34,7 @@ impl AgentPlugin {
 pub(crate) struct AgentInstalled {
     pub schedule: String,
     pub driver_root: PathBuf,
+    pub sync: agent_core::AgentUpdateContext,
 }
 impl Resource for AgentInstalled {}
 impl Plugin for AgentPlugin {
@@ -53,6 +51,7 @@ impl Plugin for AgentPlugin {
         );
         let _ = app.world().closure_sender(&self.schedule);
         app.world_mut().insert_resource(AgentInstalled {
+            sync: self.sync,
             schedule: self.schedule.clone(),
             driver_root: self.driver_root,
         });

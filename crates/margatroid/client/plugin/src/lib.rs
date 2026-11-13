@@ -2,8 +2,9 @@ mod handler;
 mod system;
 
 pub use client_core::{
-    Client, ClientDisconnected, ClientError, ClientFrame, ClientRegistrationReply, ClientSendError,
-    ClientSender, ConnectionId, RegisterClient, RegisteredClient, WorldClientExt,
+    Client, ClientDisconnected, ClientError, ClientFrame, ClientIdentity, ClientReceiver,
+    ClientRegistrationReply, ClientSelector, ClientSendError, ClientSender, Clients, ConnectionId,
+    RegisterClient, RegisteredClient, WorldClientExt,
 };
 
 use app_runtime_plugin::RuntimePlugin;
@@ -47,6 +48,9 @@ impl Plugin for ClientPlugin {
             "ClientPlugin schedule does not exist: {}",
             self.schedule
         );
+        if !app.world().contains_resource::<Clients>() {
+            app.world_mut().insert_resource(Clients::default());
+        }
         app.world_mut().insert_resource(ClientPluginInstalled);
         app.add_system(&self.schedule, system::client_registration_system)
             .add_system(&self.schedule, system::client_disconnect_system);

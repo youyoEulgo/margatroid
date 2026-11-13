@@ -103,7 +103,8 @@ fn delivery() -> StreamDelivery {
         id: "request".into(),
         agent: "agent:test/agent:latest".into(),
         turn: "turn".into(),
-        senders: vec![],
+        clients: client_core::Clients::default(),
+        source_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     }
 }
 
@@ -300,12 +301,13 @@ async fn provider_error_replies_before_stalled_cleanup_and_retains_active_handle
     let entity = world.spawn();
     world.insert_component(
         entity,
-        Agent {
-            name: "test".into(),
-            workspace: entity,
-            state: AgentState::Working,
-            turn: Some("turn".into()),
-        },
+        agent_core::Agent::new(
+            "test".into(),
+            entity,
+            AgentState::Working,
+            Some("turn".into()),
+            test_agent_context(),
+        ),
     );
     world.insert_component(
         entity,
@@ -1586,12 +1588,25 @@ async fn dropping_last_polled_waiter_does_not_strand_another_shared_waiter() {
     first.await.unwrap();
 }
 
-fn captured_delivery() -> (StreamDelivery, mpsc::Receiver<ClientFrame>) {
-    let (sender, receiver) = mpsc::channel(16);
-    let mut delivery = delivery();
+fn captured_delivery() -> (StreamDelivery, client_core::ClientReceiver) {
+    let (sender, receiver) = client_core::ClientSender::channel(16);
+    let delivery = delivery();
+    let id = client_core::ConnectionId::new(1);
+    delivery.clients.adopt(id, sender).unwrap();
+    let mut app = core_plugin::App::new();
+    let client = app.world_mut().spawn();
     delivery
-        .senders
-        .push(client_core::ClientSender::new(sender));
+        .clients
+        .commit_registration(
+            id,
+            Arc::new(client_core::ClientIdentity {
+                client,
+                address: "client:webui/capture:1".into(),
+                client_type: "webui".into(),
+                name: "capture".into(),
+            }),
+        )
+        .unwrap();
     (delivery, receiver)
 }
 
@@ -1685,4 +1700,8 @@ async fn full_success_contains_complete_internal_assistant_without_persisted_seq
         empty["message"],
         json!({"type":"assistant","request_id":"request","tool_calls":[],"stop_reason":"completed"})
     );
+}
+
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
 }

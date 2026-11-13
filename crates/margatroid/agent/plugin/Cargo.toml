@@ -26,6 +26,7 @@ serde_json = "1"
 tracing = "0.1"
 
 [dev-dependencies]
+client_core = { path = "../../client/core" }
 tempfile = "3"
 toml = "0.8"
 tokio-util = "0.7"

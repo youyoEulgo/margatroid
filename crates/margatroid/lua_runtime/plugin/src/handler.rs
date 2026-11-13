@@ -534,7 +534,7 @@ impl DriverLogger {
             let turn = if current_instance(world, &instance) {
                 world
                     .get_component::<agent_core::Agent>(instance.owner)
-                    .and_then(|agent| agent.turn.clone())
+                    .and_then(|agent| agent.turn().clone())
             } else {
                 None
             };

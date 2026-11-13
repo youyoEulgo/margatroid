@@ -28,21 +28,3 @@ pub enum ClientFrame {
     Binary(Vec<u8>),
     Close { code: u16, reason: String },
 }
-#[derive(Clone, Debug)]
-pub struct ClientSender {
-    sender: tokio::sync::mpsc::Sender<ClientFrame>,
-}
-impl ClientSender {
-    pub fn new(sender: tokio::sync::mpsc::Sender<ClientFrame>) -> Self {
-        Self { sender }
-    }
-    pub fn try_send(&self, frame: ClientFrame) -> Result<(), crate::ClientSendError> {
-        self.sender.try_send(frame).map_err(|error| match error {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => crate::ClientSendError::Full,
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => crate::ClientSendError::Closed,
-        })
-    }
-    pub fn is_closed(&self) -> bool {
-        self.sender.is_closed()
-    }
-}

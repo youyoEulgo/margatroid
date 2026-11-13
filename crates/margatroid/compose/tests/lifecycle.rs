@@ -223,7 +223,7 @@ fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
         .first()
         .unwrap();
     assert_eq!(
-        app.world().get_component::<Agent>(agent).unwrap().state,
+        app.world().get_component::<Agent>(agent).unwrap().state(),
         AgentState::Idle
     );
     command(
@@ -245,7 +245,7 @@ fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
         if records.iter().any(|r| {
             r.record.payload.get("content").and_then(|v| v.as_str())
                 == Some("Finished through the new stack.")
-        }) && app.world().get_component::<Agent>(agent).unwrap().state == AgentState::Idle
+        }) && app.world().get_component::<Agent>(agent).unwrap().state() == AgentState::Idle
         {
             assert!(
                 records

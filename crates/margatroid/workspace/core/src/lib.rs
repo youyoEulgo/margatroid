@@ -1,7 +1,9 @@
 pub mod components;
 pub mod error;
 pub mod events;
+mod sync;
 pub mod types;
+pub use sync::{remove_workspace, update_workspace, WorkspaceChange, WorkspaceUpdateContext};
 
 pub use components::{Workspace, WorkspaceExecutor, WorkspaceFailure};
 pub use error::{WorkspaceError, WorkspaceErrorKind};
@@ -14,12 +16,13 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct WorkspaceDefinitions {
-    pub entries: Arc<RwLock<BTreeMap<PathBuf, WorkspaceDefinition>>>,
+    entries: Arc<RwLock<BTreeMap<PathBuf, WorkspaceDefinition>>>,
+    observer: Arc<OnceLock<DefinitionObserver>>,
     source: Option<PathBuf>,
     reload_lock: Arc<std::sync::Mutex<()>>,
 }
@@ -39,7 +42,23 @@ impl WorkspaceDefinitionSnapshot {
     }
 }
 impl Resource for WorkspaceDefinitions {}
+type DefinitionObserver =
+    Arc<dyn Fn(Result<WorkspaceDefinitionSnapshot, WorkspaceError>) + Send + Sync>;
+impl std::fmt::Debug for WorkspaceDefinitions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkspaceDefinitions")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
 impl WorkspaceDefinitions {
+    pub fn observe(&self, observer: DefinitionObserver) {
+        assert!(
+            self.observer.set(observer).is_ok(),
+            "Workspace definitions observer already installed"
+        );
+    }
+
     pub fn open(source: impl Into<PathBuf>) -> Result<Self, WorkspaceError> {
         let source = source.into();
         let source = if source.is_absolute() {
@@ -58,6 +77,9 @@ impl WorkspaceDefinitions {
         definitions.reload()?;
         Ok(definitions)
     }
+    pub fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.entries, &other.entries)
+    }
     pub fn source(&self) -> Option<&Path> {
         self.source.as_deref()
     }
@@ -70,7 +92,15 @@ impl WorkspaceDefinitions {
             .source
             .as_deref()
             .ok_or_else(|| invalid_definition("workspace definition source is not configured"))?;
-        let entries = load_workspace_definitions(source)?;
+        let entries = match load_workspace_definitions(source) {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(observer) = self.observer.get() {
+                    observer(Err(error.clone()));
+                }
+                return Err(error);
+            }
+        };
         let snapshot = WorkspaceDefinitionSnapshot {
             entries: Arc::new(entries),
         };
@@ -79,6 +109,9 @@ impl WorkspaceDefinitions {
             .write()
             .map_err(|_| invalid_definition("definition cache lock poisoned"))? =
             (*snapshot.entries).clone();
+        if let Some(observer) = self.observer.get() {
+            observer(Ok(snapshot.clone()));
+        }
         Ok(snapshot)
     }
     pub fn get(&self, path: &Path) -> Option<WorkspaceDefinition> {
@@ -231,22 +264,14 @@ impl WorldWorkspaceExt for World {
                 "member entity is not alive",
             ));
         }
-        self.get_component_mut::<Workspace>(workspace)
-            .ok_or_else(missing)?
-            .agents
-            .insert(agent);
-        Ok(())
+        update_workspace(self, workspace, WorkspaceChange::AddMember(agent))
     }
     fn workspace_remove_agent(
         &mut self,
         workspace: Entity,
         agent: Entity,
     ) -> Result<(), WorkspaceError> {
-        self.get_component_mut::<Workspace>(workspace)
-            .ok_or_else(missing)?
-            .agents
-            .remove(&agent);
-        Ok(())
+        update_workspace(self, workspace, WorkspaceChange::RemoveMember(agent))
     }
 }
 

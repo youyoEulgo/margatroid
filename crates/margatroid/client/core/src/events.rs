@@ -1,5 +1,5 @@
+use crate::ConnectionId;
 use crate::{ClientError, RegisteredClient};
-use crate::{ClientSender, ConnectionId};
 use core_plugin::Event;
 
 pub type ClientRegistrationReply = std::sync::Arc<
@@ -12,7 +12,6 @@ pub struct RegisterClient {
     pub connection_id: ConnectionId,
     pub client_type: String,
     pub name: Option<String>,
-    pub sender: ClientSender,
     pub reply: ClientRegistrationReply,
 }
 impl Event for RegisterClient {}

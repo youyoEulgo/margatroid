@@ -28,7 +28,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 use tool_core::{ToolExecutionLimits, ToolTaskHandle, ToolTasks};
 use workspace_core::{
-    StartWorkspace, Workspace, WorkspaceDefinitions, WorkspaceOperationOutput, WorkspaceState,
+    StartWorkspace, WorkspaceDefinitions, WorkspaceOperationOutput, WorkspaceState,
 };
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -108,28 +108,54 @@ impl Harness {
         app.world_mut()
             .insert_resource(WorkspaceDefinitions::open(&definitions_root).unwrap());
         let workspace = app.world_mut().spawn();
+        let workspace_binding = dto_plugin::workspace_sync_binding(
+            app.world()
+                .get_resource::<client_core::Clients>()
+                .unwrap()
+                .clone(),
+            app.world()
+                .get_resource::<MargatroidConfig>()
+                .unwrap()
+                .backend_state(),
+        );
+        app.world_mut()
+            .insert_resource(workspace_binding.updates.clone());
+        app.world_mut().insert_resource(workspace_binding.clone());
         app.world_mut().insert_component(
             workspace,
-            Workspace {
-                definition: None,
-                name: "demo".into(),
-                definition_path: definitions_root.join("demo/workspace.yaml"),
-                project_root: root.path().into(),
-                state: WorkspaceState::Running,
-                agents: BTreeSet::new(),
-            },
+            workspace_core::Workspace::new(
+                "demo".into(),
+                definitions_root.join("demo/workspace.yaml"),
+                root.path().into(),
+                WorkspaceState::Running,
+                BTreeSet::new(),
+                None,
+                workspace_binding.updates.clone(),
+            ),
         );
         app.world_mut()
             .insert_component(workspace, Address::new("workspace:local/demo").unwrap());
         let agent = app.world_mut().spawn();
+        let agent_updates = dto_plugin::agent_sync_context(
+            app.world()
+                .get_resource::<client_core::Clients>()
+                .unwrap()
+                .clone(),
+            app.world()
+                .get_resource::<MargatroidConfig>()
+                .unwrap()
+                .backend_state(),
+        );
+        app.world_mut().insert_resource(agent_updates.clone());
         app.world_mut().insert_component(
             agent,
-            Agent {
-                name: "coder".into(),
+            agent_core::Agent::new(
+                "coder".into(),
                 workspace,
-                state: AgentState::Idle,
-                turn: None,
-            },
+                AgentState::Idle,
+                None,
+                agent_updates.clone(),
+            ),
         );
         app.world_mut()
             .insert_component(agent, Address::new("agent:demo/coder").unwrap());
@@ -145,13 +171,31 @@ impl Harness {
         app.world_mut().insert_component(agent, MclQueue::default());
         app.world_mut()
             .insert_component(agent, ActiveInference::default());
-        app.world_mut().insert_component(agent, ToolTasks::new());
-        vm(app.world_mut(), agent, "driver-first");
-        app.world_mut()
-            .get_component_mut::<Workspace>(workspace)
+        let task_binding = dto_plugin::task_sync_binding(
+            app.world()
+                .get_resource::<client_core::Clients>()
+                .unwrap()
+                .clone(),
+            app.world()
+                .get_resource::<MargatroidConfig>()
+                .unwrap()
+                .backend_state(),
+        );
+        let task_address = app
+            .world()
+            .get_component::<Address>(agent)
             .unwrap()
-            .agents
-            .insert(agent);
+            .as_str()
+            .to_owned();
+        app.world_mut()
+            .insert_component(agent, ToolTasks::new(agent, task_address, task_binding));
+        vm(app.world_mut(), agent, "driver-first");
+        workspace_core::update_workspace(
+            app.world_mut(),
+            workspace,
+            workspace_core::WorkspaceChange::AddMember(agent),
+        )
+        .unwrap();
         let starts = Arc::new(Mutex::new(Vec::new()));
         let recorded = starts.clone();
         app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
@@ -196,15 +240,9 @@ impl Harness {
         });
         app.add_plugin(DtoPlugin::new());
         if let Some((frames, events)) = counters {
-            app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
+            app.add_system(RuntimePlugin::UPDATE, move |_world: &mut World| {
                 frames.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                events.fetch_add(
-                    world
-                        .event_reader::<dto_plugin::WebSocketMessageSend>()
-                        .into_iter()
-                        .count(),
-                    std::sync::atomic::Ordering::AcqRel,
-                );
+                let _ = &events;
             });
         }
         app.tick();
@@ -655,9 +693,8 @@ fn persisted_history_is_independent_from_classified_state_and_preserves_real_seq
     harness
         .app
         .world_mut()
-        .get_component_mut::<Agent>(harness.agent)
-        .unwrap()
-        .state = AgentState::Working;
+        .agent_transition(harness.agent, AgentState::Working, None)
+        .unwrap();
     let state = harness.next(&mut socket, |value| {
         value["type"] == "agent.sync" && value["agents"][0]["status"] == "working"
     });
@@ -694,9 +731,8 @@ fn classified_sync_deduplicates_targets_and_never_leaks_to_other_clients() {
     harness
         .app
         .world_mut()
-        .get_component_mut::<Agent>(harness.agent)
-        .unwrap()
-        .turn = Some("changed".into());
+        .agent_transition(harness.agent, AgentState::Idle, Some("changed".into()))
+        .unwrap();
     let turn = harness.next(&mut browser, |value| {
         value["type"] == "agent.turn.sync" && value["turn"] == "changed"
     });
@@ -741,6 +777,12 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
         "background-call".into(),
         "bash".into(),
         reply,
+        harness
+            .app
+            .world()
+            .get_component::<ToolTasks>(harness.agent)
+            .unwrap()
+            .update_context(),
     )
     .unwrap();
     task.return_result(Ok(tool_core::ToolExecuteResponse {
@@ -761,6 +803,12 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
         "pending-call".into(),
         "bash".into(),
         reply,
+        harness
+            .app
+            .world()
+            .get_component::<ToolTasks>(harness.agent)
+            .unwrap()
+            .update_context(),
     )
     .unwrap();
     let tasks = harness
@@ -835,15 +883,14 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
         .world()
         .get_component::<Agent>(harness.agent)
         .unwrap()
-        .turn
+        .turn()
         .clone();
     assert!(next_turn.is_none());
     harness
         .app
         .world_mut()
-        .get_component_mut::<Agent>(harness.agent)
-        .unwrap()
-        .state = AgentState::Idle;
+        .agent_transition(harness.agent, AgentState::Idle, None)
+        .unwrap();
     let turn = harness
         .app
         .world_mut()
@@ -867,7 +914,7 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
             .world()
             .get_component::<Agent>(harness.agent)
             .unwrap()
-            .turn
+            .turn()
             .is_some()
     );
 }
@@ -1000,15 +1047,16 @@ fn original_mcl_reply_keeps_request_identity_and_invalid_input_never_echoes_secr
         .unwrap();
     harness.app.world_mut().insert_component(
         harness.agent,
-        inference_core::AgentInferenceConfig {
-            parameters: inference_core::InferenceParameters {
+        inference_core::AgentInferenceConfig::new(
+            inference_core::InferenceParameters {
                 model: "test".into(),
                 temperature: None,
                 max_output_tokens: None,
                 top_p: None,
                 stop: vec![],
             },
-        },
+            crate::test_probe(),
+        ),
     );
     harness.command(
         &mut socket,
@@ -1071,7 +1119,14 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
     use sandbox_resource_core::{Sandboxes, SelectedSandbox};
     use tool_resource_core::{ToolEntry, Tools};
     let mut harness = Harness::new();
-    let mut tools = Tools::default();
+    let mut tools = Tools::new(
+        harness
+            .app
+            .world()
+            .get_resource::<tool_resource_core::ToolResourceSyncBinding>()
+            .unwrap()
+            .for_owner(harness.agent),
+    );
     tools
         .insert(
             "bash".into(),
@@ -1096,7 +1151,14 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
             },
         )
         .unwrap();
-    let mut sandboxes = Sandboxes::default();
+    let mut sandboxes = Sandboxes::new(
+        harness
+            .app
+            .world()
+            .get_resource::<sandbox_resource_core::SandboxSyncBinding>()
+            .unwrap()
+            .for_owner(harness.agent),
+    );
     sandboxes.insert(
         "read_only".into(),
         harness.root.path().join("private/read-only/policy.json"),
@@ -1109,29 +1171,40 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
         .app
         .world_mut()
         .insert_component(harness.agent, sandboxes);
+    let selection_probe = harness
+        .app
+        .world()
+        .get_resource::<sandbox_resource_core::SandboxSelectionSyncBinding>()
+        .unwrap()
+        .for_owner(harness.agent);
+    let model_probe = harness
+        .app
+        .world()
+        .get_resource::<inference_core::ModelSyncBinding>()
+        .unwrap()
+        .for_owner(harness.agent);
     harness.app.world_mut().insert_component(
         harness.agent,
-        SelectedSandbox {
-            alias: Some("read_only".into()),
-        },
+        sandbox_resource_core::SelectedSandbox::new(Some("read_only".into()), selection_probe),
     );
     harness.app.world_mut().insert_component(
         harness.agent,
-        inference_core::AgentInferenceConfig {
-            parameters: inference_core::InferenceParameters {
+        inference_core::AgentInferenceConfig::new(
+            inference_core::InferenceParameters {
                 model: "display-route".into(),
                 temperature: None,
                 max_output_tokens: None,
                 top_p: None,
                 stop: vec![],
             },
-        },
+            model_probe,
+        ),
     );
     harness
         .app
         .world_mut()
-        .insert_resource(inference_core::ModelRoutes {
-            entries: std::collections::BTreeMap::from([(
+        .insert_resource(inference_core::ModelRoutes::new(
+            std::collections::BTreeMap::from([(
                 "display-route".into(),
                 inference_core::ModelRoute {
                     model: "display-model".into(),
@@ -1144,7 +1217,10 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
                     reasoning_effort: Some("high".into()),
                 },
             )]),
-        });
+        ));
+    let waits =
+        agent_core::notify_agent_runtime(harness.app.world_mut(), harness.agent, false).unwrap();
+    assert!(waits.is_empty());
     let mut socket = harness.connect();
     harness.register(&mut socket, "webui", "resource-panel");
     harness.request(&mut socket, "agent.req", "resources", json!({}));
@@ -1206,16 +1282,24 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
         .world_mut()
         .get_component_mut::<SelectedSandbox>(harness.agent)
         .unwrap()
-        .alias = None;
-    harness
+        .set(None);
+    let config = harness
+        .app
+        .world()
+        .get_component::<inference_core::AgentInferenceConfig>(harness.agent)
+        .unwrap()
+        .clone();
+    let routes = harness
         .app
         .world_mut()
         .get_resource_mut::<inference_core::ModelRoutes>()
-        .unwrap()
-        .entries
+        .unwrap();
+    let mut entries = routes.entries().clone();
+    entries
         .get_mut("display-route")
         .unwrap()
         .context_window_tokens = 16384;
+    routes.replace(entries, &[config]);
     let sync = harness.next(&mut socket, |value| {
         value["type"] == "agent.sync"
             && value["agents"][0]["model"]["context_window_tokens"] == 16384
@@ -1237,6 +1321,9 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
         .app
         .world_mut()
         .remove_component::<inference_core::AgentInferenceConfig>(harness.agent);
+    let waits =
+        agent_core::notify_agent_runtime(harness.app.world_mut(), harness.agent, false).unwrap();
+    assert!(waits.is_empty());
     let cleared = harness.next(&mut socket, |value| {
         value["type"] == "agent.sync" && value["agents"][0]["sandboxes"] == json!([])
     });
@@ -1370,6 +1457,12 @@ fn task_queries_and_complete_sync_do_not_consume_script_output_or_replaced_marke
         "task-call".into(),
         "bash".into(),
         reply,
+        harness
+            .app
+            .world()
+            .get_component::<ToolTasks>(harness.agent)
+            .unwrap()
+            .update_context(),
     )
     .unwrap();
     task.replace(json!("first")).unwrap();
@@ -1524,6 +1617,9 @@ fn driver_ui_query_and_sync_follow_actual_source_and_recover_from_resource_error
             manifest_path: source.join("driver.toml"),
         },
     );
+    let waits =
+        agent_core::notify_agent_runtime(harness.app.world_mut(), harness.agent, false).unwrap();
+    assert!(waits.is_empty());
     let initial = harness.next(&mut socket, |v| {
         v["type"] == "agent.ui.sync" && v["ui"]["entry"] == "index.html"
     });
@@ -1573,6 +1669,13 @@ fn driver_ui_query_and_sync_follow_actual_source_and_recover_from_resource_error
         .get_component_mut::<agent_core::AgentDriverSource>(harness.agent)
         .unwrap()
         .manifest_path = replacement.join("driver.toml");
+    let waits =
+        agent_core::notify_agent_runtime(harness.app.world_mut(), harness.agent, false).unwrap();
+    harness.runtime.block_on(async {
+        for wait in waits {
+            wait.await.unwrap();
+        }
+    });
     harness.next(&mut socket, |v| {
         v["type"] == "agent.ui.sync" && v["ui"]["files"][0]["data"] == "c2Vjb25k"
     });
@@ -1626,6 +1729,13 @@ fn driver_ui_change_advances_an_idle_event_driven_world_without_polling_queries(
             manifest_path: source.join("driver.toml"),
         },
     );
+    let waits =
+        agent_core::notify_agent_runtime(harness.app.world_mut(), harness.agent, false).unwrap();
+    harness.runtime.block_on(async {
+        for wait in waits {
+            wait.await.unwrap();
+        }
+    });
     harness.next(&mut socket, |v| {
         v["type"] == "agent.ui.sync" && v["ui"].is_object()
     });
@@ -1738,16 +1848,333 @@ fn record_sync_sleeps_when_idle_and_one_commit_does_not_start_a_frame_feedback_l
     harness.app.run_until(|| stop.load(Ordering::Acquire));
     let (idle, after, settled) = worker.join().unwrap();
     assert!(idle <= 3, "idle frame loop: {idle}");
-    assert!(
-        after > idle && after - idle <= 8,
-        "one update generated too many frames: {idle} -> {after}"
+    assert_eq!(
+        after, idle,
+        "record update unexpectedly advanced World frames"
     );
     assert_eq!(after, settled, "record completion kept the loop running");
-    assert_eq!(outbound.load(Ordering::Acquire), 1);
+    assert_eq!(outbound.load(Ordering::Acquire), 0);
     let value = harness.next(&mut socket, |value| {
         value["type"] == "agent.message.full.sync"
     });
     assert_eq!(value["message"]["content"], "one actual update");
+    let server = harness
+        .app
+        .world()
+        .get_resource::<AxumHandle>()
+        .unwrap()
+        .clone();
+    server.request_shutdown();
+    harness.wait(|_| server.is_stopped());
+}
+
+#[test]
+fn task_output_return_and_cleanup_reach_websocket_without_any_world_update_frames() {
+    use app_runtime_plugin::{AppRunExt, RuntimeHandle};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let frames = Arc::new(AtomicUsize::new(0));
+    let events = Arc::new(AtomicUsize::new(0));
+    let mut harness = Harness::with_counters(Some((frames.clone(), events.clone())));
+    let mut socket = harness.connect();
+    harness.register(&mut socket, "webui", "task-direct");
+    harness.collect(&mut socket, 5);
+    frames.store(0, Ordering::Release);
+    events.store(0, Ordering::Release);
+    let tasks = harness
+        .app
+        .world()
+        .get_component::<ToolTasks>(harness.agent)
+        .unwrap()
+        .clone();
+    let (reply, _response) = oneshot::channel();
+    let (task, _input) = ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        "direct-call".into(),
+        "bash".into(),
+        reply,
+        tasks.update_context(),
+    )
+    .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = stop.clone();
+    let runtime = harness
+        .app
+        .world()
+        .get_resource::<RuntimeHandle>()
+        .unwrap()
+        .clone();
+    let counter = frames.clone();
+    let worker = std::thread::spawn(move || {
+        struct Finish(Arc<AtomicBool>, RuntimeHandle);
+        impl Drop for Finish {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                self.1.wake();
+            }
+        }
+        let _finish = Finish(stopping, runtime);
+        std::thread::sleep(Duration::from_millis(150));
+        let before = counter.load(Ordering::Acquire);
+        tasks.register("direct".into(), task.clone()).unwrap();
+        task.write(json!("output without frames")).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        task.return_result(Ok(tool_core::parse_tool_result(&json!("done")).unwrap()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(tasks.complete_cleanup("direct", &task, None));
+        std::thread::sleep(Duration::from_millis(150));
+        (before, counter.load(Ordering::Acquire))
+    });
+    harness.app.run_until(|| stop.load(Ordering::Acquire));
+    let (before, after) = worker.join().unwrap();
+    assert_eq!(before, after, "Task updates drove World frames");
+    assert_eq!(
+        events.load(Ordering::Acquire),
+        0,
+        "Task updates emitted sync events"
+    );
+    let values = harness.collect(&mut socket, 5);
+    assert!(values.iter().any(|v| v["type"] == "agent.task.sync"
+        && v["tasks"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row["output"] == json!(["output without frames"]))
+        })));
+    assert!(values.iter().any(|v| {
+        v["type"] == "agent.task.sync"
+            && v["tasks"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["returned"] == true))
+    }));
+    assert!(
+        values
+            .iter()
+            .any(|v| v["type"] == "agent.task.sync" && v["tasks"] == json!([]))
+    );
+    let server = harness
+        .app
+        .world()
+        .get_resource::<AxumHandle>()
+        .unwrap()
+        .clone();
+    server.request_shutdown();
+    harness.wait(|_| server.is_stopped());
+}
+
+fn test_probe<T>() -> client_core::UpdateProbe<T> {
+    client_core::UpdateProbe::new(|_| {})
+}
+
+#[test]
+fn workspace_definition_disk_changes_reach_websocket_without_world_frames() {
+    use app_runtime_plugin::{AppRunExt, RuntimeHandle};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let frames = Arc::new(AtomicUsize::new(0));
+    let events = Arc::new(AtomicUsize::new(0));
+    let mut harness = Harness::with_counters(Some((frames.clone(), events)));
+    let mut socket = harness.connect();
+    harness.register(&mut socket, "webui", "definition-monitor");
+    harness.collect(&mut socket, 10);
+    let directory = harness.root.path().join("workspaces/added");
+    let definition = directory.join("workspace.yaml");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = stop.clone();
+    let runtime = harness
+        .app
+        .world()
+        .get_resource::<RuntimeHandle>()
+        .unwrap()
+        .clone();
+    let counted = frames.clone();
+    let io_runtime = harness.runtime;
+    let worker = std::thread::spawn(move || {
+        struct Stop(Arc<AtomicBool>, RuntimeHandle);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                self.1.wake();
+            }
+        }
+        let _stop = Stop(stopping, runtime);
+        io_runtime.block_on(async move {
+            async fn wait(socket: &mut Socket, predicate: impl Fn(&Value) -> bool) {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let Some(Ok(Message::Text(text))) = socket.next().await else {
+                            continue;
+                        };
+                        let value: Value = serde_json::from_str(&text).unwrap();
+                        if predicate(&value) {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let before = counted.load(Ordering::Acquire);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(&definition, "name: added\nproject_root: .\nmembers: []\n").unwrap();
+            wait(&mut socket, |v| {
+                v["type"] == "workspace.sync"
+                    && v["workspaces"]
+                        .as_array()
+                        .is_some_and(|rows| rows.iter().any(|r| r["definition"]["name"] == "added"))
+            })
+            .await;
+            std::fs::write(&definition, "name: [invalid\n").unwrap();
+            wait(&mut socket, |v| {
+                v["type"] == "workspace.sync"
+                    && v["workspaces"].as_array().is_some_and(|rows| {
+                        rows.iter()
+                            .any(|r| r["definition"]["name"] == "added" && r["error"].is_object())
+                    })
+            })
+            .await;
+            std::fs::write(
+                &definition,
+                "name: recovered\nproject_root: .\nmembers: []\n",
+            )
+            .unwrap();
+            wait(&mut socket, |v| {
+                v["type"] == "workspace.sync"
+                    && v["workspaces"].as_array().is_some_and(|rows| {
+                        rows.iter()
+                            .any(|r| r["definition"]["name"] == "recovered" && r["error"].is_null())
+                    })
+            })
+            .await;
+            assert!(definition.starts_with(directory.parent().unwrap()));
+            std::fs::remove_file(&definition).unwrap();
+            wait(&mut socket, |v| {
+                v["type"] == "workspace.sync"
+                    && v["workspaces"].as_array().is_some_and(|rows| {
+                        rows.iter().all(|r| r["definition"]["name"] != "recovered")
+                    })
+            })
+            .await;
+            assert_eq!(
+                before,
+                counted.load(Ordering::Acquire),
+                "disk updates advanced World frames"
+            );
+        });
+    });
+    harness.app.run_until(|| stop.load(Ordering::Acquire));
+    worker.join().unwrap();
+    let server = harness
+        .app
+        .world()
+        .get_resource::<AxumHandle>()
+        .unwrap()
+        .clone();
+    server.request_shutdown();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !server.is_stopped() {
+        harness.app.tick();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn turn_and_resource_mutations_publish_without_another_world_tick() {
+    use sandbox_resource_core::{Sandboxes, SelectedSandbox};
+    use tool_resource_core::{ToolEntry, Tools};
+    let mut harness = Harness::new();
+    let mut socket = harness.connect();
+    harness.register(&mut socket, "webui", "sync-probes");
+    harness.collect(&mut socket, 5);
+    let tools = Tools::new(
+        harness
+            .app
+            .world()
+            .get_resource::<tool_resource_core::ToolResourceSyncBinding>()
+            .unwrap()
+            .for_owner(harness.agent),
+    );
+    harness
+        .app
+        .world_mut()
+        .insert_component(harness.agent, tools);
+    let sandboxes = Sandboxes::new(
+        harness
+            .app
+            .world()
+            .get_resource::<sandbox_resource_core::SandboxSyncBinding>()
+            .unwrap()
+            .for_owner(harness.agent),
+    );
+    harness
+        .app
+        .world_mut()
+        .insert_component(harness.agent, sandboxes);
+    let selected = SelectedSandbox::new(
+        None,
+        harness
+            .app
+            .world()
+            .get_resource::<sandbox_resource_core::SandboxSelectionSyncBinding>()
+            .unwrap()
+            .for_owner(harness.agent),
+    );
+    harness
+        .app
+        .world_mut()
+        .insert_component(harness.agent, selected);
+    let turn = harness
+        .app
+        .world_mut()
+        .agent_start_turn(harness.agent)
+        .unwrap();
+    let path = harness.root.path().join("probe/tool.toml");
+    harness
+        .app
+        .world_mut()
+        .get_component_mut::<Tools>(harness.agent)
+        .unwrap()
+        .insert(
+            "live_tool".into(),
+            ToolEntry {
+                path,
+                description: "probe".into(),
+                input_schema: json!({"type":"object"}),
+                owner_task_id: None,
+                binding: None,
+            },
+        )
+        .unwrap();
+    let path = harness.root.path().join("probe/policy.json");
+    harness
+        .app
+        .world_mut()
+        .get_component_mut::<Sandboxes>(harness.agent)
+        .unwrap()
+        .insert("probe".into(), path);
+    sandbox_resource_core::WorldSandboxResourceExt::sandbox_select(
+        harness.app.world_mut(),
+        harness.agent,
+        Some("probe".into()),
+    )
+    .unwrap();
+    harness.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut saw_turn = false;
+            let mut saw_agent = false;
+            while !saw_turn || !saw_agent {
+                let Some(Ok(Message::Text(text))) = socket.next().await else {
+                    continue;
+                };
+                let value: Value = serde_json::from_str(&text).unwrap();
+                saw_turn |= value["type"] == "agent.turn.sync" && value["turn"] == turn;
+                saw_agent |= value["type"] == "agent.sync"
+                    && value["agents"][0]["tools"][0]["alias"] == "live_tool"
+                    && value["agents"][0]["sandbox"] == "probe";
+            }
+        })
+        .await
+        .unwrap();
+    });
     let server = harness
         .app
         .world()

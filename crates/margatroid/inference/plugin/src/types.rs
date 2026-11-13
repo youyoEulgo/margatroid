@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 use app_runtime_plugin::RuntimeEventSender;
-use client_core::ClientSender;
+use client_core::Clients;
 use core_plugin::{Entity, Event, Resource};
 use inference_core::{
     DomainRequest, InferenceError, InferenceErrorKind, InferenceImage, InferenceMessage,
@@ -58,7 +58,8 @@ pub(crate) struct StreamDelivery {
     pub id: String,
     pub agent: String,
     pub turn: String,
-    pub senders: Vec<ClientSender>,
+    pub clients: Clients,
+    pub source_alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Default)]

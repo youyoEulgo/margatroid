@@ -61,13 +61,13 @@ fn validate_source(world: &World, request: &MclCommand) -> Result<(), MclError> 
     let agent = world
         .get_component::<Agent>(request.target)
         .ok_or_else(|| error(MclErrorKind::TargetMissing, "MCL target Agent is missing"))?;
-    if agent.state == AgentState::Stopping {
+    if agent.state() == AgentState::Stopping {
         return Err(error(
             MclErrorKind::Closed,
             "Agent is not accepting commands",
         ));
     }
-    if matches!(agent.state, AgentState::Starting | AgentState::Restarting)
+    if matches!(agent.state(), AgentState::Starting | AgentState::Restarting)
         && (request.source != request.target || request.source_instance.is_none())
     {
         return Err(error(
@@ -176,7 +176,7 @@ pub(crate) fn handle_queue(world: &mut World, target: Entity) {
             .map(|vm| vm.instance.start_id.clone()),
         turn: world
             .get_component::<Agent>(target)
-            .and_then(|agent| agent.turn.clone()),
+            .and_then(|agent| agent.turn().clone()),
         prompts: world
             .get_component::<Prompts>(target)
             .map(|prompts| {
@@ -846,9 +846,15 @@ async fn execute_effect(
                 if ready
                     && (request.source != request.target
                         || request.source_instance.as_deref() != Some(instance.start_id.as_str())
-                        || world.get_component::<Agent>(request.target).unwrap().state
+                        || world
+                            .get_component::<Agent>(request.target)
+                            .unwrap()
+                            .state()
                             != AgentState::Starting
-                            && world.get_component::<Agent>(request.target).unwrap().state
+                            && world
+                                .get_component::<Agent>(request.target)
+                                .unwrap()
+                                .state()
                                 != AgentState::Restarting)
                 {
                     return Err(error(
@@ -974,8 +980,8 @@ async fn finish_turn(context: &CommandContext) -> Result<MclValue, MclError> {
     in_world(&context.world, move |world| {
         check_action(world, &request, &cancel)?;
         let agent = world.get_component::<Agent>(request.target).unwrap();
-        if agent.state != AgentState::Working
-            || agent.turn.as_ref().is_some_and(|turn| Some(turn) != expected_turn.as_ref())
+        if agent.state() != AgentState::Working
+            || agent.turn().as_ref().is_some_and(|turn| Some(turn) != expected_turn.as_ref())
         {
             return Err(error(MclErrorKind::EffectFailed, "turn changed before finish_turn"));
         }
@@ -1009,7 +1015,9 @@ async fn execute_inference(
     let receiver = in_world(&context.world, move |world| {
         check_action(world, &request, &cancel)?;
         let agent = world.get_component::<Agent>(request.target).unwrap();
-        if agent.state != AgentState::Working || agent.turn.is_none() || agent.turn != expected_turn
+        if agent.state() != AgentState::Working
+            || agent.turn().is_none()
+            || agent.turn() != &expected_turn
         {
             return Ok(None);
         }
@@ -1027,7 +1035,7 @@ async fn execute_inference(
         world.send_event(InferenceRequest {
             id: request.id,
             agent: request.target,
-            turn: agent.turn.clone().unwrap(),
+            turn: agent.turn().clone().unwrap(),
             messages: typed,
             config,
             cancel,
@@ -1094,9 +1102,9 @@ async fn execute_tools(
     let pending = in_world(&context.world, move |world| {
         check_action(world, &request, &cancel)?;
         let agent = world.get_component::<Agent>(request.target).unwrap();
-        let active_turn = agent.state == AgentState::Working
-            && agent.turn.is_some()
-            && agent.turn == expected_turn;
+        let active_turn = agent.state() == AgentState::Working
+            && agent.turn().is_some()
+            && agent.turn() == &expected_turn;
         let mut pending = Vec::new();
         for (index, (call, failed)) in calls.into_iter().enumerate() {
             if let Some(failed) = failed {

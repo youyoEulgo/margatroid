@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 core_plugin = { path = "../../../mecs/core_plugin" }
 tokio = { workspace = true }
+tokio-util = { workspace = true }

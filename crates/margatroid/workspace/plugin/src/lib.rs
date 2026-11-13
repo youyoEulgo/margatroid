@@ -78,6 +78,11 @@ impl Plugin for WorkspacePlugin {
                 && app.world().contains_resource::<AsyncRuntimeHandle>(),
             "WorkspacePlugin requires schedule, RuntimePlugin and AsyncRuntimePlugin"
         );
+        assert!(
+            app.world()
+                .contains_resource::<workspace_core::WorkspaceUpdateContext>(),
+            "WorkspaceUpdateContext required"
+        );
         let _ = app.world().closure_sender(&self.schedule);
         app.world_mut().insert_resource(self.definitions.clone());
         app.world_mut().insert_resource(WorkspaceInstalled {

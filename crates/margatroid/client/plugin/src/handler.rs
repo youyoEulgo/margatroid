@@ -1,7 +1,8 @@
 use crate::{Client, ClientError, RegisteredClient, WorldClientExt};
 use address::{Address, WorldAddressExt};
-use client_core::{ClientDisconnected, RegisterClient};
+use client_core::{ClientDisconnected, ClientIdentity, Clients, RegisterClient};
 use core_plugin::World;
+use std::sync::Arc;
 
 pub(crate) fn handle_client_registration(world: &mut World, request: &RegisterClient) {
     let Some(sender) = request
@@ -16,6 +17,12 @@ pub(crate) fn handle_client_registration(world: &mut World, request: &RegisterCl
         return;
     }
     let result = register_client(world, request);
+    if result.is_ok() {
+        world
+            .get_resource::<Clients>()
+            .unwrap()
+            .initialize(request.connection_id);
+    }
     if let Err(error) = &result {
         tracing::warn!(
             request_id = %request.id,
@@ -29,6 +36,10 @@ pub(crate) fn handle_client_registration(world: &mut World, request: &RegisterCl
             .client_by_connection(request.connection_id)
             .is_some_and(|(entity, _)| entity == registered.client)
         {
+            world
+                .get_resource::<Clients>()
+                .unwrap()
+                .remove(request.connection_id);
             world.despawn(registered.client);
         }
     }
@@ -44,7 +55,14 @@ fn register_client(
     if !valid_client_type(&request.client_type) {
         return Err(ClientError::InvalidClientType);
     }
-    if request.sender.is_closed() {
+    let clients = world
+        .get_resource::<Clients>()
+        .expect("Clients resource missing")
+        .clone();
+    if clients
+        .get(request.connection_id)
+        .is_none_or(|sender| sender.is_closed())
+    {
         return Err(ClientError::ConnectionMissing);
     }
     if world.client_by_connection(request.connection_id).is_some() {
@@ -76,18 +94,24 @@ fn register_client(
         return Err(ClientError::DuplicateName);
     }
     let entity = world.spawn();
-    let client = Client {
-        connection_id: request.connection_id,
+    let public_address = address.as_str().to_owned();
+    let identity = Arc::new(ClientIdentity {
+        client: entity,
+        address: public_address.clone(),
         client_type: request.client_type.clone(),
         name: name.into(),
-        sender: request.sender.clone(),
-    };
-    world.insert_component(entity, client);
-    let public_address = address.as_str().to_owned();
+    });
+    world.insert_component(
+        entity,
+        Client {
+            connection_id: request.connection_id,
+            identity: identity.clone(),
+        },
+    );
     world.insert_component(entity, address);
-    if request.sender.is_closed() {
+    if let Err(error) = clients.commit_registration(request.connection_id, identity) {
         world.despawn(entity);
-        return Err(ClientError::ConnectionMissing);
+        return Err(error);
     }
     Ok(RegisteredClient {
         client: entity,
@@ -98,6 +122,10 @@ fn register_client(
 
 pub(crate) fn handle_client_disconnect(world: &mut World, event: &ClientDisconnected) {
     let connection_id = event.connection_id;
+    world
+        .get_resource::<Clients>()
+        .unwrap()
+        .remove(connection_id);
     let entities = world
         .query_with::<Client>()
         .result()

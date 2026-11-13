@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+client_core = { path = "../client/core" }
 core_plugin = { path = "../../mecs/core_plugin" }
 app_runtime_plugin = { path = "../../mecs/app_runtime_plugin" }
 async_runtime_plugin = { path = "../../mecs/async_runtime_plugin" }
@@ -31,7 +32,6 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 address = { path = "../address" }
-client_core = { path = "../client/core" }
 inference_core = { path = "../inference/core" }
 tool_core = { path = "../tool/core" }
 tool_resource_core = { path = "../tool_resource/core" }

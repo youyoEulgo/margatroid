@@ -1,19 +1,26 @@
 mod components;
 mod error;
 mod events;
+mod output;
+mod shared;
 mod types;
 
 pub use components::Client;
 pub use error::{ClientError, ClientSendError};
 pub use events::{ClientDisconnected, ClientRegistrationReply, RegisterClient};
-pub use types::{ClientFrame, ClientSender, ConnectionId, RegisteredClient};
+pub use output::{
+    ClientPrepareError, ClientReceiver, ClientSender, PrepareFuture, PreparedState, StatePrepare,
+    SyncContext, SyncKey, SyncSource,
+};
+pub use shared::{ClientIdentity, ClientSelector, Clients, RequestTicket};
+pub use types::{ClientFrame, ConnectionId, RegisteredClient};
 
 use core_plugin::{Entity, World};
-use std::collections::HashSet;
 
 pub trait WorldClientExt {
     fn client_by_connection(&self, connection: ConnectionId) -> Option<(Entity, &Client)>;
     fn client_webui_senders(&self) -> Vec<ClientSender>;
+    fn clients(&self) -> Clients;
 }
 
 impl WorldClientExt for World {
@@ -27,18 +34,22 @@ impl WorldClientExt for World {
             })
     }
 
+    fn clients(&self) -> Clients {
+        self.get_resource::<Clients>()
+            .expect("Clients resource missing")
+            .clone()
+    }
     fn client_webui_senders(&self) -> Vec<ClientSender> {
-        let mut ids = HashSet::new();
-        self.query_with::<Client>()
-            .result()
+        self.clients()
+            .select(&[ClientSelector::Type("webui".into())])
             .into_iter()
-            .filter_map(|entity| {
-                let client = self.get_component::<Client>(entity)?;
-                if client.client_type != "webui" || !ids.insert(client.connection_id) {
-                    return None;
-                }
-                (!client.sender.is_closed()).then(|| client.sender.clone())
-            })
+            .map(|(_, sender)| sender)
             .collect()
     }
 }
+
+mod probe;
+pub use probe::UpdateProbe;
+
+mod probe_factory;
+pub use probe_factory::ProbeFactory;
