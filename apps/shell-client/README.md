@@ -34,3 +34,5 @@ Linux以24行×80列初始化PTY并启动 `bash --noprofile --norc -i`，TERM �
 当前依赖边界：list-directory、glob、grep、write-file改用通用files、text和data能力，不再携带shell.lua或本bin。Bash和Bash Exec继续使用本程序承担实际shell、PTY及终端行为。文件工具不再打包本bin，Shell协议和终端行为保持原有语义。
 
 终端尺寸同步只跟随PTY的实际值，不引入新的网络resize接口。已运行shell-client进程继续执行原版本；修复在新构建的helper进程中生效。浏览器面板宽高仍由前端独立处理。
+
+VT100单元格滚屏预算为当前终端行数的两倍：24行保留48行，40行保留80行，缩小时立即丢弃多余的最旧单元格行并收缩队列。纯文本history及任务输出窗口预算保持独立；已转成文本的历史仍保留。为避免重建解析器丢失部分CSI/UTF-8、主/备用屏和光标，使用vendor/vt100中带许可证的0.16.2窄补丁，仅增加动态滚屏容量设置。

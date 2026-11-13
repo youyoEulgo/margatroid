@@ -1,0 +1,35 @@
+Margatroid — Third-Party Notices
+
+vt100 0.16.2
+------------
+
+This repository includes a locally modified copy of the vt100 crate in
+vendor/vt100, based on the published vt100 0.16.2 release.
+
+Upstream project: https://github.com/doy/vt100-rust
+Published crate: https://crates.io/crates/vt100/0.16.2
+Copyright (c) 2016 Jesse Luehrs
+License: MIT
+
+The upstream copyright notice and full MIT license text are preserved in
+vendor/vt100/LICENSE. The project's root LICENSE does not replace third-party
+copyright notices or license terms.
+
+Local modifications:
+
+- Add Screen::set_scrollback_len and the corresponding grid operation to adjust
+  retained normal-screen scrollback without rebuilding the terminal parser.
+- Remove excess oldest rows, clamp the scrollback view offset, and shrink the
+  scrollback queue when its capacity is reduced.
+- Preserve terminal screens, cursor state, modes, and incomplete escape/UTF-8
+  parsing state. The alternate screen retains its upstream zero-scrollback
+  behavior.
+- Retain runtime dependencies in the local Cargo manifest; omit upstream
+  development dependencies and unpublished test fixtures.
+
+Further patch details: vendor/vt100/LOCAL_PATCH.md
+
+When redistributing this component or substantial portions of it, retain its
+copyright notice and the full license text in vendor/vt100/LICENSE. This NOTICE
+summarizes the component's provenance and modifications; it does not replace
+that license.

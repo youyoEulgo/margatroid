@@ -11,9 +11,7 @@ fn main() {
     if std::env::args().nth(1).is_some_and(|arg| {
         matches!(
             arg.as_str(),
-            "--margatroid-tool-supervisor"
-                | "--margatroid-tool-worker"
-                | "--margatroid-tool-memory-entry"
+            "--margatroid-tool-supervisor" | "--margatroid-tool-worker"
         )
     }) {
         let runtime = tokio::runtime::Builder::new_current_thread()

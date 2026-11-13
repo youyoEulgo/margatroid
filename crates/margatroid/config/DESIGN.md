@@ -71,12 +71,11 @@ read_config(path: &Path) -> Result<MargatroidConfig, ConfigError>
 公开：
 ```text
 FileToolConfig：可持久化工具预算覆盖，serde严格拒绝未知字段
-    total_task_memory_limit: Option<usize>--同一daemon所有Agent工具任务合计内存
-    task_memory_limit: Option<usize>--单工具任务内存
+    lua_vm_memory_limit: Option<usize>--单工具Lua VM分配器上限
     task_output_buffer_window: Option<usize>--每任务宿主输出窗口，自动滚出旧内容
-    三字段配置使用容量字符串，内部保存换算后字节数；缺省None
+    两字段配置使用容量字符串，内部保存换算后字节数；缺省None
     validate(&self) -> Result<(), ConfigError>
-        行为：三个字段拒绝显式零值并报告tools字段路径，不依赖工具领域也不复制默认值；单任务大于总额合法，实际取较小值；任务内存组包含worker工具VM、Rust数据及所有子孙进程，排除宿主Driver VM和supervisor；输出窗口不限制返回结果容量且不计入任务内存组；工具timeout保持原义。
+        行为：两字段拒绝显式零值并报告tools字段路径，不依赖工具领域也不复制默认值；Lua限额只作用于工具VM分配器，不限制Rust及外部进程；输出窗口不限制返回结果容量；工具timeout保持原义。
 
 capacity::parse(text: &str) -> Result<usize, String>
     行为：

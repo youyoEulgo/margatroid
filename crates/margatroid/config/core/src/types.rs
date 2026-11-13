@@ -251,12 +251,7 @@ pub struct FileToolConfig {
         deserialize_with = "capacity::deserialize_option",
         serialize_with = "capacity::serialize_option"
     )]
-    pub total_task_memory_limit: Option<usize>,
-    #[serde(
-        deserialize_with = "capacity::deserialize_option",
-        serialize_with = "capacity::serialize_option"
-    )]
-    pub task_memory_limit: Option<usize>,
+    pub lua_vm_memory_limit: Option<usize>,
     #[serde(
         deserialize_with = "capacity::deserialize_option",
         serialize_with = "capacity::serialize_option"
@@ -267,11 +262,7 @@ pub struct FileToolConfig {
 impl FileToolConfig {
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
         for (field, value) in [
-            (
-                "tools.total_task_memory_limit",
-                self.total_task_memory_limit,
-            ),
-            ("tools.task_memory_limit", self.task_memory_limit),
+            ("tools.lua_vm_memory_limit", self.lua_vm_memory_limit),
             (
                 "tools.task_output_buffer_window",
                 self.task_output_buffer_window,

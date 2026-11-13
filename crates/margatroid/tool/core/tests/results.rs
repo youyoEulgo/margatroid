@@ -125,13 +125,18 @@ fn host_accepts_large_images_and_aggregate_image_payloads() {
 }
 
 #[test]
-fn execution_limits_have_total_and_task_memory_and_buffer_budgets_and_round_trip() {
+fn execution_limits_have_lua_memory_and_buffer_budgets_and_round_trip() {
     let defaults = ToolExecutionLimits::default();
     defaults.validate().unwrap();
     let value = serde_json::to_value(&defaults).unwrap();
-    assert_eq!(value.as_object().unwrap().len(), 3);
-    assert_eq!(value["total_memory_bytes"], defaults.total_memory_bytes);
-    assert_eq!(value["memory_bytes"], defaults.memory_bytes);
+    assert_eq!(value.as_object().unwrap().len(), 2);
+    assert_eq!(value["lua_vm_memory_bytes"], defaults.lua_vm_memory_bytes);
+    assert!(
+        serde_json::from_value::<ToolExecutionLimits>(
+            serde_json::json!({"memory_bytes": 1024, "cache_bytes":1024})
+        )
+        .is_err()
+    );
     assert_eq!(value["cache_bytes"], defaults.cache_bytes);
     assert_eq!(
         serde_json::from_value::<ToolExecutionLimits>(value).unwrap(),
@@ -139,11 +144,7 @@ fn execution_limits_have_total_and_task_memory_and_buffer_budgets_and_round_trip
     );
     for invalid in [
         ToolExecutionLimits {
-            total_memory_bytes: 0,
-            ..defaults.clone()
-        },
-        ToolExecutionLimits {
-            memory_bytes: 0,
+            lua_vm_memory_bytes: 0,
             ..defaults.clone()
         },
         ToolExecutionLimits {

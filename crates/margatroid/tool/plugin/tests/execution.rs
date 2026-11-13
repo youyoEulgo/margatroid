@@ -691,7 +691,7 @@ fn small_task_cache_rolls_over_without_rejecting_the_result() {
 #[test]
 fn lua_vm_allocation_still_obeys_the_memory_budget() {
     let mut fixture = Fixture::with_limits(ToolExecutionLimits {
-        memory_bytes: 2 * 1024 * 1024,
+        lua_vm_memory_bytes: 2 * 1024 * 1024,
         ..Default::default()
     });
     fixture.tool("memory", "function execute() local values={} for i=1,10000 do values[i]=string.rep(tostring(i),4096) end margatroid.task:return_result('unexpected') end");

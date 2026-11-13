@@ -1,5 +1,3 @@
-pub(crate) mod memory;
-use memory::MemoryBoundary;
 mod diagnostics;
 use diagnostics::*;
 use lua_runtime_core::host::{self, data, process};
@@ -196,11 +194,6 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         runner_path: config.runner_path,
         limits: config.limits,
         configuration: None,
-        memory_pool: world
-            .get_resource::<crate::ToolRuntime>()
-            .expect("Tool runtime missing")
-            .1
-            .clone(),
         handle: handle.clone(),
         tasks,
         input,
@@ -607,11 +600,6 @@ fn filtered_environment(command: &mut tokio::process::Command) {
                 "LUA_CPATH",
                 "BASH_ENV",
                 "ENV",
-                "MARGATROID_RUNNER_CGROUP",
-                "MARGATROID_RUNNER_SCOPE",
-                "MARGATROID_RUNNER_GLOBAL_CGROUP",
-                "MARGATROID_RUNNER_GLOBAL_SLICE",
-                "MARGATROID_RUNNER_TOTAL_MEMORY_BYTES",
             ]
             .contains(&upper.as_str())
         {
@@ -791,36 +779,9 @@ async fn run_runner(
             Ok(())
         });
     }
-    let boundary = Some(
-        MemoryBoundary::create(
-            &context.memory_pool,
-            request.limits.memory_bytes,
-            request.limits.total_memory_bytes,
-        )
-        .await?,
-    );
-    boundary
-        .as_ref()
-        .expect("memory boundary required")
-        .export(&mut command);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => {
-            if let Some(boundary) = boundary {
-                while boundary.cleanup().await.is_err() {
-                    record_cleanup_failure(
-                        context,
-                        "failed runner start cleanup pending; supervision retained",
-                    );
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            }
-            return Err(error(
-                Kind::RunnerStartFailed,
-                "tool runner could not start",
-            ));
-        }
-    };
+    let mut child = command
+        .spawn()
+        .map_err(|_| error(Kind::RunnerStartFailed, "tool runner could not start"))?;
     let pid = child.id().expect("spawned runner has a process id");
     let mut stdin = child.stdin.take().expect("runner stdin piped");
     let mut stdout = BufReader::new(child.stdout.take().expect("runner stdout piped"));
@@ -938,12 +899,6 @@ async fn run_runner(
                         "runner cleanup remains unproven; supervision retained",
                     );
                     signal_runner(pid);
-                    if let Some(boundary) = &boundary {
-                        if boundary.cleanup().await.is_ok() {
-                            proven = true;
-                            break;
-                        }
-                    }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             }
@@ -955,19 +910,13 @@ async fn run_runner(
         signal_runner(pid);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // Reap both pipe tasks and the boundary before propagating any pipe error.
+    // Reap both pipe tasks before propagating any pipe error.
     let writer_result = writer
         .await
         .map_err(|_| error(Kind::RunnerProtocolFailed, "runner input task failed"));
     let diagnostic_result = diagnostics
         .await
         .map_err(|_| error(Kind::RunnerProtocolFailed, "runner diagnostic task failed"));
-    if let Some(boundary) = &boundary {
-        while boundary.cleanup().await.is_err() {
-            record_cleanup_failure(context, "cgroup cleanup incomplete; supervision retained");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
     writer_result??;
     diagnostic_result??;
     if !proven {
@@ -1118,38 +1067,18 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
         let _ = write_json(&mut tokio::io::stdout(), &frame).await;
         return 0;
     }
-    let boundary = match MemoryBoundary::inherited() {
-        Ok(Some(boundary)) => boundary
-            .validate(
-                request.limits.memory_bytes,
-                request.limits.total_memory_bytes,
-            )
-            .map(|()| boundary),
-        Ok(None) => {
-            MemoryBoundary::create(
-                &Arc::default(),
-                request.limits.memory_bytes,
-                request.limits.total_memory_bytes,
-            )
-            .await
-        }
-        Err(failure) => Err(failure),
-    };
-    let boundary = match boundary {
-        Ok(boundary) => boundary,
-        Err(failure) => {
-            let frame = RunnerWire {
-                protocol_version: 1,
-                frame: RunnerFrame::Stopped {
-                    result: Err(failure),
-                    cleanup_proven: true,
-                },
-            };
-            let _ = write_json(&mut tokio::io::stdout(), &frame).await;
-            return 3;
-        }
-    };
-    let mut command = boundary.command(request.limits.memory_bytes, &executable, sandbox);
+    let mut command = tokio::process::Command::new(
+        sandbox.map_or(executable.as_os_str(), |(backend, _)| backend.as_os_str()),
+    );
+    if let Some((_, policy)) = sandbox {
+        command
+            .arg("run")
+            .arg("-p")
+            .arg(policy)
+            .arg("--")
+            .arg(&executable);
+    }
+    command.arg("--margatroid-tool-worker");
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1157,7 +1086,7 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
         .kill_on_drop(true);
     let mut output = tokio::io::stdout();
     let mut configuration: Option<ToolConfiguration> = None;
-    let mut result = match command.spawn() {
+    let result = match command.spawn() {
         Err(_) => Err(error(
             Kind::RunnerStartFailed,
             "restricted worker could not start",
@@ -1209,10 +1138,6 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
                 }
             };
             drop(worker_input);
-            let oom = boundary.oom_killed().await;
-            while boundary.kill().await.is_err() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
             while !cleanup_descendants().await {
                 let frame = RunnerWire {
                     protocol_version: 1,
@@ -1225,20 +1150,7 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
             }
             let _ = worker.wait().await;
             let _ = tokio::io::copy(&mut worker_output, &mut tokio::io::sink()).await;
-            if oom || boundary.oom_killed().await {
-                Err(error(
-                    Kind::ExecutionFailed,
-                    "task aggregate memory limit exceeded",
-                ))
-            } else if configuration.is_none()
-                && result
-                    .as_ref()
-                    .is_err_and(|failure| failure.kind == Kind::ExecutionFailed)
-            {
-                Err(error(Kind::SandboxUnavailable, "memory-enforced worker could not configure; ensure a delegated cgroup v2 memory controller or systemd user scope is available"))
-            } else {
-                result
-            }
+            result
         }
     };
     while !cleanup_descendants().await {
@@ -1250,18 +1162,6 @@ async fn supervisor_main(args: Vec<std::ffi::OsString>) -> i32 {
             },
         };
         let _ = write_json(&mut output, &frame).await;
-    }
-    while let Err(failure) = boundary.cleanup().await {
-        result = Err(failure.clone());
-        let frame = RunnerWire {
-            protocol_version: 1,
-            frame: RunnerFrame::Stopped {
-                result: Err(failure),
-                cleanup_proven: false,
-            },
-        };
-        let _ = write_json(&mut output, &frame).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let frame = RunnerWire {
         protocol_version: 1,
@@ -1284,13 +1184,6 @@ async fn supervisor_main(_: Vec<std::ffi::OsString>) -> i32 {
 
 pub async fn runner_main() -> i32 {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
-    #[cfg(target_os = "linux")]
-    if args
-        .first()
-        .is_some_and(|arg| arg == "--margatroid-tool-memory-entry")
-    {
-        return memory::enter_scope(&args[1..]);
-    }
     if args != [std::ffi::OsString::from("--margatroid-tool-worker")] {
         return supervisor_main(args).await;
     }
@@ -1405,7 +1298,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
         LuaOptions::default(),
     )
     .map_err(lua_failure)?;
-    lua.set_memory_limit(request.limits.memory_bytes)
+    lua.set_memory_limit(request.limits.lua_vm_memory_bytes)
         .map_err(lua_failure)?;
     let deadline = Arc::new(Mutex::new(None::<Instant>));
     let hook_deadline = deadline.clone();
@@ -1983,7 +1876,6 @@ mod world_sender_tests {
             project_root: PathBuf::from("/project"),
             runner_path: PathBuf::from("/runner"),
             limits: ToolExecutionLimits::default(),
-            memory_pool: Arc::default(),
             configuration: Some(ToolConfiguration { timeout_ms: 0 }),
             handle,
             tasks,

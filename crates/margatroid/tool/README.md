@@ -43,9 +43,9 @@ margatroid.task:finish(context.task_id)
 
 ## 宿主预算配置
 
-`config.toml`的`[tools]`直接提供三个容量字符串：`total_task_memory_limit`默认`"8G"`，限制当前daemon全部Agent的工具任务合计内存；`task_memory_limit`默认`"2G"`，限制单个worker、工具Lua VM及全部派生进程；`task_output_buffer_window`默认`"128M"`，是每任务在宿主侧的输出滚动窗口，不限制一次task_return结果。宿主中的Driver Lua VM和可信supervisor不计入工具内存额度。省略字段使用默认值，显式值须大于零，单任务上限可以高于总上限，实际仍同时受两级限制。修改配置后重启daemon生效，无需重新编译；当前没有热更新。示例见[配置说明](../config/README.md)。
+`config.toml`的`[tools]`提供两个容量字符串：`lua_vm_memory_limit`默认`"2G"`，只限制每个工具Lua VM分配器，覆盖加载、configure与execute；`task_output_buffer_window`默认`"128M"`，限制每任务在宿主侧保留的输出窗口，不限制一次task_return结果。Rust数据、helper、外部程序及其子孙进程不计入Lua限额。全局进程额度字段total_task_memory_limit已删除，旧字段严格报错，不静默忽略。省略字段使用工具领域默认值，显式值须大于零。修改配置后重启daemon生效，当前没有热更新。示例见[配置说明](../config/README.md)。
 
-宿主不设置脚本、参数、输入输出、诊断、消息队列、指令计数、解析深度或图片数量/大小配额。图片配额由工具作者决定，宿主仍校验有效的图片编码和结果格式。任务总内存由Linux cgroup v2强制执行，配置指定的委派根优先，否则使用systemd用户scope。任务启动前核对父、子两级memory.max和swap设置；全局父组不启用整组OOM终止，任务子组启用。总额度不足时内核可能终止一个或多个任务，不能假定只影响正在申请内存的任务。所有Agent的活跃工具任务共享一个父组，每任务单独清理子组，最后一个任务完成清理后释放父组。缺少支持时明确失败。宿主和负责回收的可信supervisor留在组外。容量单位K/M/G/T大小写不敏感，按1024进制解释。解析库本身的格式与实现限制仍适用，循环Lua table仍不能编码。
+宿主不设置脚本、参数、输入输出、诊断、消息队列、指令计数、解析深度或图片数量/大小配额。图片配额由工具作者决定，宿主仍校验有效编码和结果格式。外部进程没有Margatroid设置的内存硬限制，不再依赖Linux cgroup v2、委派根或systemd用户scope。超时、取消、沙箱及可信supervisor的真实后代回收保持。容量单位K/M/G/T大小写不敏感，按1024进制解释；循环Lua table仍不能编码。
 
 缓存超限自动滚出最旧内容，并调整cursor。超长字符串保留能放入窗口的UTF-8尾部，无法放入的结构化值整项滚出，不因窗口满返回失败。滚出不改变replaced标记；只有task_replace保留原替换语义。工具自行声明的timeout_ms及文件、结果策略不受本配置代替。
 
