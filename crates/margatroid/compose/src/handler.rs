@@ -173,10 +173,9 @@ fn resolve_tool_limits(
     config.validate()?;
     let defaults = tool_core::ToolExecutionLimits::default();
     let limits = tool_core::ToolExecutionLimits {
-        total_memory_bytes: config
-            .total_task_memory_limit
-            .unwrap_or(defaults.total_memory_bytes),
-        memory_bytes: config.task_memory_limit.unwrap_or(defaults.memory_bytes),
+        lua_vm_memory_bytes: config
+            .lua_vm_memory_limit
+            .unwrap_or(defaults.lua_vm_memory_bytes),
         cache_bytes: config
             .task_output_buffer_window
             .unwrap_or(defaults.cache_bytes),
@@ -208,21 +207,11 @@ mod tool_limit_tests {
         for (config, expected) in [
             (
                 config_core::FileToolConfig {
-                    total_task_memory_limit: Some(17),
+                    lua_vm_memory_limit: Some(19),
                     ..Default::default()
                 },
                 tool_core::ToolExecutionLimits {
-                    total_memory_bytes: 17,
-                    ..defaults
-                },
-            ),
-            (
-                config_core::FileToolConfig {
-                    task_memory_limit: Some(19),
-                    ..Default::default()
-                },
-                tool_core::ToolExecutionLimits {
-                    memory_bytes: 19,
+                    lua_vm_memory_bytes: 19,
                     ..defaults
                 },
             ),
@@ -244,23 +233,18 @@ mod tool_limit_tests {
     #[test]
     fn file_budget_overrides_reach_effective_tool_limits() {
         let root = tempfile::tempdir().unwrap();
-        let source = "[server]\nbind = '127.0.0.1:0'\n[outbound]\nlogs = ['broadcast']\nbackend_state = ['broadcast']\n[tools]\ntotal_task_memory_limit = '100B'\ntask_memory_limit = '106B'\ntask_output_buffer_window = '108B'\n";
+        let source = "[server]\nbind = '127.0.0.1:0'\n[outbound]\nlogs = ['broadcast']\nbackend_state = ['broadcast']\n[tools]\nlua_vm_memory_limit = '106B'\ntask_output_buffer_window = '108B'\n";
         let path = root.path().join("config.toml");
         std::fs::write(&path, source).unwrap();
         let config = config_plugin::ConfigPlugin::open(path).unwrap();
         let effective = resolve_tool_limits(config.config().tools()).unwrap();
-        assert_eq!(effective.total_memory_bytes, 100);
-        assert_eq!(effective.memory_bytes, 106);
+        assert_eq!(effective.lua_vm_memory_bytes, 106);
         assert_eq!(effective.cache_bytes, 108);
     }
 
     #[test]
     fn zero_budget_is_configuration_error_before_app_installation() {
-        for field in [
-            "total_task_memory_limit",
-            "task_memory_limit",
-            "task_output_buffer_window",
-        ] {
+        for field in ["lua_vm_memory_limit", "task_output_buffer_window"] {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("config.toml");
             std::fs::write(&path, format!("[server]\nbind = '127.0.0.1:0'\n[outbound]\nlogs = ['broadcast']\nbackend_state = ['broadcast']\n[tools]\n{field} = '0'\n")).unwrap();
@@ -280,17 +264,10 @@ mod tool_limit_tests {
         for (config, field) in [
             (
                 config_core::FileToolConfig {
-                    total_task_memory_limit: Some(0),
+                    lua_vm_memory_limit: Some(0),
                     ..Default::default()
                 },
-                "tools.total_task_memory_limit",
-            ),
-            (
-                config_core::FileToolConfig {
-                    task_memory_limit: Some(0),
-                    ..Default::default()
-                },
-                "tools.task_memory_limit",
+                "tools.lua_vm_memory_limit",
             ),
             (
                 config_core::FileToolConfig {

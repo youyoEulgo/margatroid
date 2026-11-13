@@ -58,16 +58,14 @@ pub struct ToolTaskSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolExecutionLimits {
-    pub total_memory_bytes: usize,
-    pub memory_bytes: usize,
+    pub lua_vm_memory_bytes: usize,
     pub cache_bytes: usize,
 }
 
 impl Default for ToolExecutionLimits {
     fn default() -> Self {
         Self {
-            total_memory_bytes: 8 * 1024 * 1024 * 1024,
-            memory_bytes: 2 * 1024 * 1024 * 1024,
+            lua_vm_memory_bytes: 2 * 1024 * 1024 * 1024,
             cache_bytes: 128 * 1024 * 1024,
         }
     }
@@ -75,7 +73,7 @@ impl Default for ToolExecutionLimits {
 
 impl ToolExecutionLimits {
     pub fn validate(&self) -> Result<(), ToolError> {
-        if self.total_memory_bytes == 0 || self.memory_bytes == 0 || self.cache_bytes == 0 {
+        if self.lua_vm_memory_bytes == 0 || self.cache_bytes == 0 {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidRequest,
                 "invalid tool execution limits",

@@ -90,10 +90,13 @@ TerminalOutput
     resized: bool
 
     new(limit: usize, rows: u16, cols: u16) -> Self
-        行为：以实际行列数初始化VT100解析器；滚动观察队列延迟分配，容量支持u16最大行数的一次多行滚动。
+        行为：以实际行列数初始化VT100解析器；滚动观察队列容量为usize::from(rows)*2，延迟按实际滚动分配单元格。
 
     resize(&mut self, rows: u16, cols: u16) -> io::Result<()>
-        行为：校验非零尺寸，尺寸变化时调整parser.screen并记录resized。
+        行为：校验非零尺寸，尺寸变化时调整parser.screen及set_scrollback_len(usize::from(rows)*2)，立即裁掉超额滚屏，保留同一parser状态并记录resized。
+
+    vt100::Screen::set_scrollback_len(rows: usize)
+        行为：本地vt100补丁仅调整主屏grid滚屏容量，裁掉最旧超额行、夹紧观察位置并收缩队列；备用屏保持上游零滚屏，不重建parser、屏幕、光标或未完成转义状态。
 
     process(bytes) -> Result<(text, replace)>
         行为：

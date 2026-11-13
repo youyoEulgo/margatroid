@@ -25,7 +25,6 @@ pub(crate) struct ToolExecutionContext {
     pub project_root: PathBuf,
     pub runner_path: PathBuf,
     pub limits: ToolExecutionLimits,
-    pub memory_pool: Arc<crate::handler::memory::MemoryPool>,
     pub configuration: Option<ToolConfiguration>,
     pub handle: ToolTaskHandle,
     pub tasks: ToolTasks,

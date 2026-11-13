@@ -295,11 +295,7 @@ fn reopening_observes_disk_changes_while_existing_plugin_keeps_snapshot() {
     assert_eq!(latest.config().server_bind().port(), 4000);
 }
 
-const TOOL_FIELDS: [&str; 3] = [
-    "total_task_memory_limit",
-    "task_memory_limit",
-    "task_output_buffer_window",
-];
+const TOOL_FIELDS: [&str; 2] = ["lua_vm_memory_limit", "task_output_buffer_window"];
 
 #[test]
 fn omitted_tool_configuration_preserves_unspecified_limits() {
@@ -316,28 +312,27 @@ fn omitted_tool_configuration_preserves_unspecified_limits() {
             .unwrap();
         let tools = plugin.config().tools();
         assert_eq!(
-            tools.total_task_memory_limit,
+            tools.lua_vm_memory_limit,
             (field == TOOL_FIELDS[0]).then_some(321)
         );
         assert_eq!(
-            tools.task_memory_limit,
-            (field == TOOL_FIELDS[1]).then_some(321)
-        );
-        assert_eq!(
             tools.task_output_buffer_window,
-            (field == TOOL_FIELDS[2]).then_some(321)
+            (field == TOOL_FIELDS[1]).then_some(321)
         );
     }
 }
 
 #[test]
-fn custom_tool_configuration_parses_all_three_capacities() {
-    let plugin = File::new(format!("{BASE}[tools]\ntotal_task_memory_limit = '8G'\ntask_memory_limit = '2GiB'\ntask_output_buffer_window = '128M'\n")).open().unwrap();
+fn custom_tool_configuration_parses_lua_memory_and_output_capacities() {
+    let plugin = File::new(format!(
+        "{BASE}[tools]\nlua_vm_memory_limit = '2GiB'\ntask_output_buffer_window = '128M'\n"
+    ))
+    .open()
+    .unwrap();
     assert_eq!(
         plugin.config().tools(),
         &config_core::FileToolConfig {
-            total_task_memory_limit: Some(8 * 1024usize.pow(3)),
-            task_memory_limit: Some(2 * 1024usize.pow(3)),
+            lua_vm_memory_limit: Some(2 * 1024usize.pow(3)),
             task_output_buffer_window: Some(128 * 1024usize.pow(2)),
         }
     );
@@ -391,8 +386,7 @@ fn every_tool_capacity_accepts_all_binary_units() {
                 .unwrap();
             let tools = plugin.config().tools();
             let actual = match field {
-                "total_task_memory_limit" => tools.total_task_memory_limit,
-                "task_memory_limit" => tools.task_memory_limit,
+                "lua_vm_memory_limit" => tools.lua_vm_memory_limit,
                 _ => tools.task_output_buffer_window,
             };
             assert_eq!(actual, Some(1024usize.pow(exponent)), "{field} {unit}");
@@ -410,8 +404,7 @@ fn tool_configuration_serializes_readable_capacities_and_round_trips() {
         (1024usize.pow(4), "1T"),
     ] {
         let tools = config_core::FileToolConfig {
-            total_task_memory_limit: Some(bytes),
-            task_memory_limit: Some(bytes),
+            lua_vm_memory_limit: Some(bytes),
             task_output_buffer_window: Some(bytes),
         };
         let source = toml::to_string(&tools).unwrap();
@@ -448,6 +441,8 @@ fn old_tool_sections_and_fields_are_unknown() {
         "limits",
         "memory",
         "cache",
+        "task_memory_limit",
+        "total_task_memory_limit",
         "total_memory_bytes",
         "memory_bytes",
         "cache_bytes",

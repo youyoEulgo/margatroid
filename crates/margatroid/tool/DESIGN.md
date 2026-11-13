@@ -209,22 +209,23 @@ supervise_tool(context: ToolExecutionContext) -> Future<Output = ()>
         清理失败及时交付CleanupFailed；
         保持未finish并保留本次runner管理能力继续清理，不标记已finish。
 
-run_runner(context: RunnerContext) -> Future<Output = Result<(), ToolError>>
+run_runner(context: &mut ToolExecutionContext, request: RunnerRequest, policy: Option<Value>) -> Future<Output = Result<(), ToolError>>
     行为：
-        启动可信supervisor，留在任务内存组外负责协议与真实清理
-        从当前ToolPlugin共享的MemoryPool取得全局内存父组，所有Agent工具任务共用
-        全局父组设置total_task_memory_limit、禁用swap并保持memory.oom.group=0，不按全局整组终止
-        启动worker前在该父组内建立任务子组，设置task_memory_limit、memory.swap.max=0及memory.oom.group=1
-        指定委派根时worker在exec前入组；否则使用同一systemd slice下的任务scope
-        启动入口核对父子两级实际内核限制后exec；宿主与supervisor均不进入工具内存组
-        每任务独立清理子组，最后一个活跃任务完成清理后释放全局父组；空闲后可按需重建
-        运行时销毁导致等待被丢弃时，最终组所有者同步回收本实例的父组和子组记录，不启动后台清理
-        全局OOM可能选择一个或多个任务，不能假定只终止正在申请内存的任务
-        无法建立或核实硬限制时返回明确错误，不降级成仅Lua限制
-        并行投递stdin、读取stdout/stderr和等待退出；
-        取消或超时终止执行并等待清理；
-        处理双向协议帧；
+        直接启动可信supervisor，传递执行材料及可选沙箱后端与策略。
+        不建立内存cgroup、systemd scope或全局MemoryPool，不设置外部进程内存额度。
+        并行投递stdin、读取stdout/stderr和等待退出，处理双向协议帧。
+        取消或超时向supervisor发送终止请求，继续等待真实后代回收证明、supervisor退出和两端管道收口。
+        清理失败保持监督，不以丢弃Future或收到Return冒充清理成功。
         Return不是进程终态，真实退出清理后返回。
+
+supervisor_main(args: Vec<OsString>) -> Future<Output = i32>
+    行为：
+        Linux入口安装child subreaper，解析可选sandbox参数，校验私有请求协议和Lua限额。
+        直接构造worker或sandbox run -p policy -- worker命令，不调用内存入组入口。
+        传递Configured与原host/worker协议，等待终结结果、取消或退出信号。
+        扫描、终止并回收全部后代，包括setsid和双重fork后代，等待worker及输出管道结束。
+        只有真实清理完成才发送Stopped(cleanup_proven=true)，无内核OOM内存组状态映射。
+        非Linux入口保持既有不可用行为，本次不新增跨平台进程回收实现。
 
 run_tool_worker(request: RunnerRequest) -> Result<(), ToolError>
     行为：
@@ -557,15 +558,14 @@ ToolImage：工具图片，公开类型
     data: String--标准base64
 
 ToolExecutionLimits：宿主资源配置
-    total_memory_bytes: usize--同daemon全部Agent工具任务合计内存上限
-    memory_bytes: usize--单个非宿主任务进程树合计内存上限
+    lua_vm_memory_bytes: usize--单工具Lua VM分配器上限，不限制Rust或外部进程
     cache_bytes: usize--每任务输出缓冲滚动窗口，不限制task_return结果
     validate(&self) -> Result<(), ToolError>
         行为：
-            要求三项均大于零，由compose将config.toml的tools三项容量覆盖默认值后注入
+            要求两项均大于零，由compose将tools.lua_vm_memory_limit和tools.task_output_buffer_window覆盖工具默认值后注入
             宿主不设置输入输出、图片、深度、指令数和队列数量配额
-            内核按整个任务cgroup合计内存；Lua局部内存上限保留为同值快速防护
-            宿主缓存和可信supervisor留在内存组外，不计入任务memory
+            通过Lua::set_memory_limit限制同一个工具Lua状态，覆盖顶层加载、configure及execute
+            helper、Rust缓冲和外部进程不受本配置限额；输出窗口按cache_bytes独立滚动
 
 ToolConfiguration：Lua配置函数返回的本次时间预算
     timeout_ms: u64

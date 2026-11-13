@@ -42,7 +42,7 @@ prepare(options: &ApplicationOptions) -> Result<ApplicationParts, ComposeError>
     行为：调用ConfigPlugin::open、WorkspacePlugin::open和InferencePlugin::open，准备资源根及runner路径；将config自有tools经resolve_tool_limits补齐并校验预算，失败映射config领域及config.toml路径，先于App创建和插件安装；任一失败返回，不自动启动工作区。
 
 resolve_tool_limits(config: &FileToolConfig) -> Result<ToolExecutionLimits, ConfigError>
-    行为：将total_task_memory_limit、task_memory_limit、task_output_buffer_window直接映射到total_memory_bytes、memory_bytes、cache_bytes；缺省值只取工具领域默认8GiB、2GiB、128MiB，三项均拒绝显式零值并报告tools字段路径；允许单任务内存大于总额，执行时受较小值限制；总额覆盖同一daemon所有Agent工具任务，任务内存组含工具worker VM及所有子孙进程并排除宿主Driver VM与supervisor，输出窗口按任务滚动保存且不计入任务内存组或限制返回结果容量。
+    行为：将lua_vm_memory_limit和task_output_buffer_window直接映射到lua_vm_memory_bytes和cache_bytes；缺省值只取工具领域默认2GiB及128MiB，两项拒绝显式零值并报告tools字段路径；lua_vm_memory_bytes只限制工具Lua VM分配器，cache_bytes独立约束任务输出窗口，不限制Rust或外部进程，不限制返回结果容量。
 
 install(app: &mut App, parts: ApplicationParts) -> Result<(), ComposeError>
     行为：先安装既有mecs Runtime、AsyncRuntime、Closure和日志设施，再安装Margatroid axum_plugin及各业务插件。

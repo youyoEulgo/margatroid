@@ -9,7 +9,7 @@ pub(crate) struct TerminalOutput {
 impl TerminalOutput {
     pub(crate) fn new(limit: usize, rows: u16, cols: u16) -> Self {
         Self {
-            parser: vt100::Parser::new(rows, cols, usize::from(u16::MAX) + 1),
+            parser: vt100::Parser::new(rows, cols, usize::from(rows) * 2),
             history: String::new(),
             previous: (String::new(), false),
             limit,
@@ -27,6 +27,9 @@ impl TerminalOutput {
         if self.parser.screen().size() != (rows, cols) {
             self.parser.screen_mut().set_scrollback(0);
             self.parser.screen_mut().set_size(rows, cols);
+            self.parser
+                .screen_mut()
+                .set_scrollback_len(usize::from(rows) * 2);
             self.resized = true;
         }
         Ok(())
@@ -286,5 +289,50 @@ mod tests {
             );
         }
         assert!(terminal.resize(0, 120).is_err());
+    }
+    #[test]
+    fn scrollback_is_twice_current_height_and_resize_preserves_pending_parser_state() {
+        let mut terminal = TerminalOutput::new(1024 * 1024, 24, 80);
+        terminal.process("row\r\n".repeat(1000).as_bytes()).unwrap();
+        terminal.parser.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(terminal.parser.screen().scrollback(), 48);
+        terminal.parser.screen_mut().set_scrollback(0);
+        terminal.process(b"\x1b[").unwrap();
+        terminal.resize(40, 120).unwrap();
+        let (text, replace) = terminal.process(b"2J\x1b[Hnormal\x1b[?1049hALT").unwrap();
+        assert!(replace);
+        assert_eq!(text, "ALT");
+        terminal.resize(10, 30).unwrap();
+        let (text, replace) = terminal.process(b"\x1b[?1049l").unwrap();
+        assert!(replace);
+        assert!(text.ends_with("normal"));
+        terminal
+            .process("next\r\n".repeat(1000).as_bytes())
+            .unwrap();
+        terminal.parser.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(terminal.parser.screen().scrollback(), 20);
+        terminal.parser.screen_mut().set_scrollback(0);
+        terminal.resize(40, 120).unwrap();
+        terminal
+            .process("wide\r\n".repeat(1000).as_bytes())
+            .unwrap();
+        terminal.parser.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(terminal.parser.screen().scrollback(), 80);
+    }
+
+    #[test]
+    fn shrinking_scrollback_keeps_fragmented_utf8_and_text_history() {
+        let mut terminal = TerminalOutput::new(1024 * 1024, 40, 120);
+        let first = terminal
+            .process("old\r\n".repeat(500).as_bytes())
+            .unwrap()
+            .0;
+        let bytes = "你".as_bytes();
+        terminal.process(&bytes[..1]).unwrap();
+        terminal.resize(10, 30).unwrap();
+        let (text, replace) = terminal.process(&bytes[1..]).unwrap();
+        assert!(replace);
+        assert!(text.contains('你'));
+        assert!(text.starts_with(&first[..100]));
     }
 }
