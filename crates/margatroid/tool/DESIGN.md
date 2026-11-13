@@ -60,12 +60,12 @@ ToolPlugin：工具执行插件
 公开：
 ```text
 ToolTasks：该Agent的工具任务句柄集合，公开组件
-    entries: Arc<Mutex<BTreeMap<String, ToolTaskHandle>>>--私有，宿主与任务共享的句柄集合
+    shared: Arc<TaskSetShared>--唯一集合及版本，内部可变字段私有
+    updates: TaskUpdateContext--必需，同一Agent的所有任务写能力从此衍生
+    new(owner: Entity, address: String, binding: TaskSyncBinding) -> Self
+        行为：先创建TaskSetShared，再由binding.bind传入Weak生成必需TaskUpdateContext；不允许缺少同步绑定的生产构造。
     register(&self, id: String, handle: ToolTaskHandle) -> Result<(), ToolError>
-        行为：
-            require id未登记
-            entries[id] = handle
-            空缓存，cursor=0，returned=false，唯一reply
+        行为：调用update_tasks(updates, TaskChange::Register)，不直接写集合。
     cancel(&self, id: &str) -> Result<(), ToolError>
         行为：
             向对应句柄请求取消，不直接中断监督任务或删除句柄。
@@ -73,9 +73,9 @@ ToolTasks：该Agent的工具任务句柄集合，公开组件
         行为：
             return entries中的活任务句柄克隆
     snapshot(&self) -> Vec<ToolTaskSnapshot>
-        行为：短锁克隆当前集合成员，逐句柄调用非破坏性snapshot并跳过已真实清理项，按task_id稳定排序。
+        行为：在TaskSetShared更新门内取得当前完整活跃集合，按task_id稳定排序；快照版本与该次读取一致。
             每项包含完整保留窗口；不调用read、不推进cursor、不清除replaced、不发送reply、不触发取消或finish。
-            集合成员和单任务分别取锁，不持集合锁等待长IO，不宣称所有任务在同一个全局时刻冻结。
+            所有同步可见更新受同一Agent的更新门串行化；释放锁后才编码和投递，不持锁等待IO。
     read(&self, id: &str) -> Result<TaskReadResult, ToolError>
         行为：
             从集合取得仍存活任务后，同一短锁读取output[cursor..]并将相邻字符串无分隔符拼成一项，非字符串原样保留顺序；
@@ -89,15 +89,15 @@ ToolTasks：该Agent的工具任务句柄集合，公开组件
         行为：
             request cancel(id)
             await Lua、进程及后代、管道、临时资源真实清理
-            success: entries.remove(id); release cache; return Ok(())
+            success: 调用update_tasks(TaskChange::CompleteCleanup)移除并释放缓存，随后返回Ok(())
             failure: return error; retain supervision
     abort_unreturned(&self) -> 工具中止交接结果
         行为：
             for handle in entries:
                 atomic if !handle.returned:
                     reply 原call_id/alias的中止结果
-                    handle.returned = true
-                    handle.cancel()
+                    通过update_tasks(TaskChange::AbortReturn)原子更新returned
+                    请求该句柄取消
                     同步触发，不等待清理
     impl Clone for ToolTasks
         行为：
@@ -177,13 +177,23 @@ handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
         模型参数不能覆盖宿主context标记
         固定本次工具、策略路径和目录参数，准备owned执行材料，不跨await借用World。
         受理后ToolTask独立持有执行材料；之后Tools记录被删除不影响该任务。
-        创建共享ToolTaskHandle，一份登记ToolTasks，克隆一份及共享集合句柄交给工作任务；
+        从ToolTasks.updates衍生同一来源的ToolTaskHandle，经统一Register入口登记，再把该能力克隆交给工作任务；
         通过send_async_closure提交launch_tool，失败通过原reply回复错误；
         不缓存执行器Handle。
 ```
 
 私有：
 ```text
+update_tasks(context: &TaskUpdateContext, change: TaskChange) -> Result<TaskChangeResult, ToolError>
+    行为：
+        升级context.state，核对完整Agent来源及租约；该入口是Task同步可见信息的唯一写入口。
+        取得同一TaskSetShared.update_gate，再取得集合和必要任务锁；校验Register/AppendOutput/ReplaceOutput/Return/AbortReturn/SetError/CompleteCleanup各自合法性。
+        Return与AbortReturn在原唯一reply锁内裁决，重复Return失败不重复发布；CompleteCleanup只接受真实监督收口证明，清缓存并移除集合项。
+        修改实际目标并在同一更新门内递增revision；失败或可见值未变不递增、不发布。
+        释放全部领域锁后调用context.sync.publish(revision)，直接遍历共享Client槽位投递状态通知；不发事件、不借用World、不等待网络。
+        完整任务窗口只在选中连接实际准备该StateKey时读取，连续Append不逐次复制整份窗口；同步不推进cursor或清除replaced。
+        脚本read更新cursor/replaced、输入投递及仅取消token不属于wire快照变化，不制造task.sync。
+
 launch_tool(context: ToolExecutionContext) -> Future<Output = Result<ToolLaunchOutput, ToolLaunchError>>
     行为：
         在普通异步闭包内部创建本领域监督任务，立即把真实JoinHandle交给已登记的ToolTaskHandle，再返回启动结果。该闭包结果只证明启动交接，不表示工具完成；
@@ -197,13 +207,13 @@ supervise_tool(context: ToolExecutionContext) -> Future<Output = ()>
         检查本任务取消状态后启动run_runner，动态入口不读取注册schema作回退。配置及execute收到相同可信owner_task_id/binding/resource_dir，不接受arguments覆盖。
         接收runner的Return时通过共享句柄的原子return裁决交付结果，不结束runner；
         中止、错误与正常Return共用唯一回复端，不能在context另持独立可回复状态；
-        持续处理缓存写入、覆盖及任务输入。
+        缓存写入、覆盖、正常/强制Return、错误及清理移除均调用update_tasks；任务输入与脚本read只保留各自原语义。
         自然退出/finish/到期/中止:
             World闭包: Tools.remove_owner(task_id)
             删除所属工具记录不检查调用状态，不等待或取消其他ToolTask
             未return则交付对应失败结果
             await VM、runner、后代、管道、临时文件真实清理
-            ToolTasks移除本任务; release cache
+            调用统一CompleteCleanup入口移除本任务并释放缓存，直接通知完整task.sync集合变化
         已回复调用不得重复回复；
         后台异常记录于对应任务error，未回复调用按实际错误完成。
         清理失败及时交付CleanupFailed；
@@ -508,6 +518,9 @@ ToolContext：worker私有上下文
 ```text
 ToolTaskHandle：可克隆的任务共享句柄，公开类型
     inner: Arc<ToolTaskShared>
+    updates: TaskUpdateContext--来源于同一ToolTasks，内部指向TaskSetShared的Weak，避免集合→句柄→集合强引用环
+    write / replace / try_return / set_error / complete_cleanup
+        行为：只构造对应TaskChange交给update_tasks；取消/超时/worker故障/中止与正常执行不能旁路。
     is_cleanup_complete(&self) -> bool
         行为：
             仅内部清理等待者查询清理是否完成，不提供对外completed状态或完成缓存。
@@ -517,10 +530,37 @@ ToolTaskHandle：可克隆的任务共享句柄，公开类型
         行为：
             共享同一任务状态、输入与取消能力，不复制任务。
 
+TaskSetShared
+    entries: Mutex<BTreeMap<String, ToolTaskHandle>>
+    update_gate: Mutex<()>
+    revision: AtomicU64
+TaskUpdateContext
+    state: Weak<TaskSetShared>
+    owner: Entity--完整Agent归属
+    source_epoch: u64
+    sync: SyncContext<AgentTaskSnapshot>
+TaskChange
+    Register { id: String, handle: ToolTaskHandle }
+    AppendOutput { id: String, value: Value }
+    ReplaceOutput { id: String, value: Value }
+    Return { id: String, result: Result<ToolExecuteResponse, ToolError> }
+    AbortReturn { id: String }
+    SetError { id: String, error: ToolError }
+    CompleteCleanup { id: String, proof: TaskCleanupProof }
+TaskChangeResult
+    Unit | Returned(bool)
+TaskCleanupProof：内部真实监督完成凭证，脚本不能构造
+AgentTaskSnapshot
+    address: String
+    tasks: Vec<ToolTaskSnapshot>
+TaskSyncBinding
+    bind: Arc<dyn Fn(Entity, String, Weak<TaskSetShared>) -> TaskUpdateContext + Send + Sync>
+    行为：由compose注入DTO编码函数及Clients槽位；实际TaskSetShared创建时补齐Weak快照读取能力。
+
 ToolTaskShared：任务持有数据
     cancel: CancellationToken--存活任务取消能力；回合中止只触发原子裁决仍未return的任务，不取消已return后台任务
     task: Mutex<Option<JoinHandle<()>>>--监督任务句柄，取消时不直接abort
-    shared: Mutex<ToolTaskData>--returned状态与唯一reply在同一锁内裁决
+    shared: Mutex<ToolTaskData>--私有；只允许update_tasks修改同步可见字段，returned与唯一reply同锁裁决
     input: mpsc::Sender<serde_json::Value>
 
 ToolTaskData：任务查询数据
@@ -601,7 +641,8 @@ Agent Entity
 ├── Agent（agent_core）
 ├── Tools（tool_resource_core）
 ├── ToolTasks（tool_core）
-│   └── BTreeMap<task_id, ToolTaskHandle>
+│   ├── TaskUpdateContext → 同一Clients Arc槽位
+│   └── TaskSetShared → BTreeMap<task_id, ToolTaskHandle>
 │       ├── 输出缓存、cursor、return状态与唯一结果回复端
 │       └── Lua输入通道
 └── Sandboxes与SelectedSandbox（sandbox_resource_core）

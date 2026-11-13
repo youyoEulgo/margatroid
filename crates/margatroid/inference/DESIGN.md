@@ -35,6 +35,8 @@ ModelRoutes：模型配置，公开Resource
     get(&self, id: &str) -> Option<&ModelRoute>
         行为：
             借用模型路由，不输出凭据。
+    replace(&mut self, routes: BTreeMap<String, ModelRoute>, contexts: &[ModelUpdateContext]) -> Result<(), InferenceError>
+        行为：内部路由替换的唯一入口，完整校验后替换，对受影响Agent提交安全模型投影；不增加网络reload接口，不把端点或密钥交给回调。
     impl Resource for ModelRoutes
 ```
 
@@ -53,7 +55,7 @@ InferencePlugin：单次推理执行插件
                 检查运行设施，拒绝重复安装；
                 schedule仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule；
                 安装ModelRoutes及共享reqwest HTTP客户端，挂载init_inference_system和inference_system。不通过临时握手取得Tokio Handle，不在Resource保存执行器Handle；
-                推理启动进入普通异步闭包。
+                推理启动进入普通异步闭包；模型选择/安全路由公共信息的实际变动通过注入的Agent公共信息入口提交agent.sync，查询路由和构造HTTP本身不发布。
 ```
 
 # components
@@ -62,6 +64,14 @@ InferencePlugin：单次推理执行插件
 
 ```text
 -- 公开
+AgentInferenceConfig
+    parameters: InferenceParameters--私有，不借出可变引用
+    updates: ModelUpdateContext--构造必需，绑定当前Agent公共视图及共享槽位
+    new(parameters: InferenceParameters, updates: ModelUpdateContext) -> Self
+    parameters(&self) -> &InferenceParameters
+    set(&mut self, parameters: InferenceParameters, routes: &ModelRoutes) -> Result<(), InferenceError>
+        行为：只调用update_model_configuration。
+
 ActiveInference：该Agent的当前推理句柄，公开组件
     current: Option<InferenceHandle>--初始化为None，不放入ToolTasks
     impl Component for ActiveInference
@@ -138,7 +148,7 @@ handle_inference(world: &mut World, request: InferenceRequest)
         直接遍历当前Agent的Tools，以每条记录的alias、description及input_schema构造本次工具定义。
         在受理阶段校验消息及参数，构造DomainRequest并调用build_request完成HTTP编码。
         向闭包交付已编码请求；工具定义和工具名称集合不进入闭包，后续调用按当前Tools查找及校验参数。
-        从client_core取得本次已注册webui的ClientSender快照，固定对外身份；
+        克隆已注入的InferenceSyncBinding和同一Clients共享槽位，固定Agent/turn/generation身份；每次发送重新筛选当前webui接收者，不固定起始发送器快照；
         同步登记尚未启动的共享InferenceHandle，防止异步提交窗口受理重叠请求；
         通过send_async_closure提交launch_inference。
         launch_inference在闭包内部创建监督任务并把JoinHandle交给同一共享句柄，不依赖全局执行器。ClientFrame::Text只携带已编码分片，不导入Axum消息、DTO插件或服务器框架发送器。
@@ -186,9 +196,12 @@ receive_stream(context: StreamContext, receiver: mpsc::Receiver<ProviderFragment
         不等待上游退出才冻结。
         正常和中止的Completed结果都从同一累积器生成，worker退出结果不得补写正文。
 
+update_model_configuration(config: &mut AgentInferenceConfig, parameters: InferenceParameters, routes: &ModelRoutes, context: &ModelUpdateContext) -> Result<(), InferenceError>
+    行为：校验模型选择后更新实际配置，提取安全模型公共值；仅公共值变化时调用context.on_change，经Agent统一入口直投agent.sync。失败和仅查询不发布，不以每帧投影发现变化。
+
 push_stream(delivery: &mut StreamDelivery, sequence: u64, reasoning: bool, content: String)
     行为：
-        向本次发送器快照有界发送agent.message.chunk.sync，delta仅包含新增content或reasoning；
+        通过本次StreamContext按当次共享槽位选择接收者并有界发送agent.message.chunk.sync，delta仅包含新增content或reasoning；
         address和turn取StreamDelivery固定身份，generation取本次生成关联，sequence为同一生成共用分片序列，不作为历史序号；
         剔除关闭及慢连接；发送失败不改变推理结果，不在此写历史或伪造history_sequence。
 
@@ -203,7 +216,7 @@ push_full(delivery: &mut StreamDelivery, result: Result<&InferenceResponse, &Inf
         只投影通用响应，不另建厂商内部消息或调用协议crate。
 
 push_frame(delivery: &mut StreamDelivery, frame: serde_json::Value)
-    行为：序列化JSON，通过本次ClientSender快照try_send，剔除关闭及满队列，不等待网络，不改变后端结果。
+    行为：通过StreamContext编码一次具体有序帧，直接遍历共享Client槽位选择当次webui并投递；Full/Closed取消对应慢连接，不丢弃单个chunk后继续冒充完整流，不等待网络或改变领域推理结果。
 
 build_request(input: DomainRequest, route: ModelRoute) -> Result<ProviderHttpRequest, InferenceError>
     行为：
@@ -222,12 +235,31 @@ build_request(input: DomainRequest, route: ModelRoute) -> Result<ProviderHttpReq
 InferenceContext：请求执行材料--原请求及reply、已编码http_request、deadline、HTTP客户端、取消能力和推流投影
 ProviderContext：上游材料--HTTP请求、格式解码器、取消能力及读取预算
 StreamContext：接收材料--Arc<Mutex<StreamGate>>、取消能力及StreamDelivery
+ModelUpdateContext
+    owner: Entity
+    source_epoch: u64
+    on_change: Arc<dyn Fn(Option<PublicModelInfo>) + Send + Sync>
+PublicModelInfo
+    id: String
+    model: String
+    provider: String
+    api_type: String
+    context_window_tokens: u64
+    thinking: Option<String>
+    reasoning_effort: Option<String>
+
+InferenceSyncBinding
+    bind: Arc<dyn Fn(Entity, String, String, String) -> StreamContext<InferenceStreamUpdate> + Send + Sync>
+InferenceStreamUpdate
+    Chunk { address: String, turn: String, generation: String, sequence: u64, reasoning: bool, content: String }
+    Full { address: String, turn: String, generation: String, result: Result<InferenceResponse, InferenceError> }
+    行为：按已有安全wire投影；generation及chunk顺序不变，不保留厂商专属载荷，不做初始状态重放。
 StreamDelivery：前端出口，私有类型
     id: String--生成关联，wire中为generation，不是前端请求id
     agent: String--wire中为address
     instance: String
     turn: String
-    senders: Vec<client_core::ClientSender>--固定快照，只发送ClientFrame，不持有WebSocket或访问DTO连接表
+    sync: StreamContext<InferenceStreamUpdate>--共享Client槽位及DTO注入的具体编码；不持有WebSocket或起始发送器快照
 InferenceLaunchOutput：已将监督任务交给共享句柄的启动事实
 InferenceLaunchError：InferenceError及原回复、共享句柄关联，实现From<AsyncTaskError>
 

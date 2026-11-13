@@ -1,21 +1,17 @@
 # Client
 
-client_core定义Client组件、注册结果、错误和World查询扩展，只依赖mecs及通用基础库。client_plugin依赖client_core、address和mecs，负责注册与断开处理。其他领域使用client_core，不依赖client_plugin；client_core不依赖address或其他领域core。
+本轮为目标设计，尚未实现。当前源码基线为e24862b；新结构及字段以[DESIGN.md](DESIGN.md)为准。
 
-## 注册与断开
+Client改为同一个`Arc<ClientSlots>`共享槽位：World Resource、DTO提供给Axum的State、异步监控和同步领域统一更新入口都持有这一个Arc。槽位保存未注册连接、已确认的注册身份、发送器、取消能力及在途请求集合，替代当前DTO ConnState与Client身份分别保存的两套可变登记。
 
-Client保存自有ConnectionId、类型、名称和ClientSender出站能力，不保存实际socket或资源地址，也不实现LibraryComponent。client_plugin注册时创建Entity，分别挂载Client与Address；地址为client:<client_type>/<name>:<connection_id>。名称缺省为连接ID文本，类型与名称是自报标签，不是认证凭据。
+Client组件保留完整Entity/Address寻址职责，但只引用同一份不可变ClientIdentity。注册和断连通过统一入口提交：注册在同一共享写锁复检连接、名称和身份，失败回滚本次Entity；断连先从共享槽位移除并取消，再通过原ClientDisconnected清理World身份。注册事件、请求原oneshot和连接生命周期事件继续存在，均不承担sync中转。
 
-System收集RegisterClient和ClientDisconnected专用领域事件并交给Handler。注册Handler校验发送能力、名称及地址占用，挂载Client和Address并复检队列是否关闭；成功通过请求携带的原oneshot回复RegisteredClient，其中包含完整Entity、实际地址和client_type。失败清理本次实体，不修改网络元数据。实际连接由DTO拥有，断开时关闭队列并发送ClientDisconnected，ClientPlugin销毁身份，不取消已提交推理。
+同步生产者每次发送都遍历当前槽位，按Type、Name或Broadcast筛选，不长期固定sender列表。注册表锁仅用于取得接收者快照，释放后才能编码和投递。身份标签保持原自报含义，不增加认证承诺。
 
-client_core提供ConnectionId、ClientFrame和有界ClientSender；Frame只有Text、Binary及Close，不依赖Axum或服务器插件。DTO把帧映射到实际socket，inference等领域只使用发送器快照，ClientPlugin无需服务器设施。
+所有sync直接进入每连接原有的有界出站队列，不建立sync总线、额外分发任务或ECS同步事件。Axum保留每连接唯一writer，领域线程不直接操作socket。
 
-## 查询与对外身份
+当前状态使用StateKey：队列内部pending表合并同对象尚未发送的更新，writer读取该来源的最新owned快照；连续输出不把多份完整大窗口挤进队列。日志、MCL、持久消息和推理chunk使用具体有序帧，不按状态覆盖。Full/Closed明确取消慢连接，不悄悄丢掉某条增量后继续发送。
 
-WorldClientExt按连接ID查询Client，或取得已注册webui发送器快照。发送器按连接ID去重并排除已关闭连接；后续注册不扩展已有快照。
+注册成功时初始化符合条件的当前状态源；持久记录及流片段不自动重放，历史查询仍显式进行。来源epoch和单调revision仅在后端用于丢弃旧实例和迟到快照，不新增wire字段。来源prepare只捕获Weak领域数据，关闭来源时释放索引，避免Client槽位、领域上下文及读取回调形成强引用环。
 
-网络入口通过真实连接取得Client Entity，内部传递完整Entity。DTO受理阶段校验真实连接，Client注册完成时将Address文本及client_type放入纯领域结果，网络Handler收到原oneshot结果即可编码回复。未注册连接直接拒绝，不提供unregistered字符串回退，不保留client_source或返回资源地址的registered_client辅助函数。
-
-Client不涉及磁盘资源或资源路径集合。core与plugin各自的测试放在其tests目录，不保留无内容的模块文件。
-
-注册原oneshot由网络Handler创建，Client领域直接交付纯注册结果。
+验收覆盖：相同Arc身份、注册与断连竞争、重复名称、失败回滚、后加入连接、当前目标筛选、旧实例迟到更新、状态合并与初始快照竞争、有序帧顺序、慢连接退出、真实快照worker收口。目标设计保留全部9种sync名称和45种协议消息。

@@ -1,10 +1,11 @@
 # Workspace
 
-workspace_core定义Workspace组件、状态、事件、定义和专属线程能力，只依赖mecs及通用库。workspace_plugin依赖workspace_core、address和所需领域core，负责运行生命周期，不依赖其他plugin。
+本轮同步目标设计尚未实现，源码基线为e24862b。异步监控、统一写入口和共享Client槽位按本领域DESIGN及[DTO设计说明](../dto/README.md)实施；以下保留的业务语义不代表新同步路径已部署。
+workspace_core定义Workspace组件、状态、事件、定义和专属线程能力，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。workspace_plugin依赖workspace_core、address和所需领域core，负责运行生命周期，不依赖其他plugin。
 
 ## 配置与运行实例
 
-Margatroid启动时传入配置根目录，调用WorkspacePlugin::open读取并校验全部工作区定义，再安装插件。文件读取在安装前同步调用WorkspaceDefinitions::open完成，失败直接返回启动入口；build只安装已加载的WorkspaceDefinitions Resource和System，不隐藏文件IO。
+Margatroid启动时传入配置根目录，调用WorkspacePlugin::open读取并校验全部工作区定义，再安装插件。文件读取在安装前同步调用WorkspaceDefinitions::open完成，失败直接返回启动入口；build安装已加载的WorkspaceDefinitions和共享运行目录，应用启动后在既有异步设施建立定义磁盘监控；文件IO不进入同步System。
 
 WorkspaceDefinitions是展示和启动共同使用的定义缓存，不再限定为展示目录。所有定义加载只有一条全量重载流程：读取配置根下全部定义、完整校验、原子更新缓存。不提供针对某个Workspace单独读取并启动的旁路。
 
@@ -38,3 +39,5 @@ WorkspaceExecutor持有提交入口和关闭能力。Send工厂在专属线程�
 生命周期请求携带WorkspaceOperationReply，领域操作收口后直接回复原oneshot。Workspace自身持有本次启动使用的完整definition，用于运行快照和扫描来源移除后的展示。req只读取已发布目录与实例定义，来源已移除的运行实例只受理停止；启动和重启以全量reload后缓存中的存在性为条件。领域失败通过WorkspaceFailure投影，成功收口清除对应故障。
 
 一个StartAgent只启动一个Agent。Workspace持有成员启动的并发编排，先发送全部单成员事件，再join_all收齐全部结果；Agent领域只处理自己的单次生命周期操作。
+
+定义监控和显式reload共用全量校验入口，变化后通过update_workspace提交新缓存及workspace.sync；运行状态、成员和故障也从同一入口更新。来源变化不自动改写运行实例定义或执行生命周期动作。监控覆盖父目录上的创建、删除及原子替换，100ms合并写入，失败保留最后有效集合，取消等待真实worker结束。

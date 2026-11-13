@@ -1,6 +1,7 @@
 # Sandbox Resource
 
-sandbox_resource_core定义沙箱路径集合、文件读取方法、导入事件和错误，只依赖mecs及通用库。sandbox_resource_plugin负责异步校验和路径登记，不依赖其他领域plugin，也不让core依赖address或其他领域core。
+本轮同步目标设计尚未实现，源码基线为e24862b。异步监控、统一写入口和共享Client槽位按本领域DESIGN及[DTO设计说明](../dto/README.md)实施；以下保留的业务语义不代表新同步路径已部署。
+sandbox_resource_core定义沙箱路径集合、文件读取方法、导入事件和错误，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。sandbox_resource_plugin负责异步校验和路径登记，不依赖其他领域plugin，也不让core依赖address或其他领域core。
 
 ## 导入与路径
 
@@ -19,3 +20,5 @@ sandbox_use只选择alias，不缓存policy正文。每次Sandbox活动创建时
 本领域不启动runner、不停止活动，不将选中策略放进Agent组件；真实清理由各执行plugin负责。集合只保存BTreeMap<String, PathBuf>，不使用ResourceID、LibraryComponent或通用ResourceSet；加载后的临时值不再携带资源身份。路径用于打开文件，不代替沙箱与文件访问检查。
 
 异步校验直接返回Result<ImportOutput, ImportError>，System只路由，Handler负责发布及oneshot回复。所有结果保留原owner Entity，迟到结果不写入复用index的新实体。文件读取失败报告alias、实际路径和底层原因，不回显文件正文。
+
+Sandboxes与SelectedSandbox的同步可见变动统一经update_sandboxes及必需SandboxUpdateContext。导入/替换、删除和选择提交成功后同步维护Agent公共沙箱视图并直投agent.sync；路径查询及策略读取不触发同步。

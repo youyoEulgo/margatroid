@@ -35,7 +35,7 @@ mcl.execute / mcl.execute.result
 
 command必须回复原id的result，成功表示操作收口，不只受理。状态sync能够交付的内容不在result重复：Workspace/Agent生命周期、回合中止和Workspace重载成功只返回success=true；失败返回success=false及error。连接注册成功另返回实际client身份；MCL成功非Unit值另返回data，Unit省略data。状态没有变化也必须回复result，但不强行重复发送sync。result与sync没有固定先后顺序。
 
-req/res与sync是无业务副作用的纯查询；command/result承载有副作用的操作。req只服务本次读取，sync每帧筛选符合条件的ClientSender后发送。req/res显式读取数据；查询成功必须提供相应对象或集合，无数据时返回合法空数组。失败省略成功对象、集合及分页游标，不能用空数组伪装查询失败。sync不携带请求id，不结束操作或查询等待，不反过来充当回执。无法解析或识别的信封、未知type及缺失id的错误投递规则不在目录中私造新type，作为公共边界保留。
+req/res与sync是无业务副作用的纯查询；command/result承载有副作用的操作。req只服务本次读取，目标投递在实际变化时从共享Client槽位筛选接收者，不依赖运行帧；本轮仅更改设计，wire字段不变。req/res显式读取数据；查询成功必须提供相应对象或集合，无数据时返回合法空数组。失败省略成功对象、集合及分页游标，不能用空数组伪装查询失败。sync不携带请求id，不结束操作或查询等待，不反过来充当回执。无法解析或识别的信封、未知type及缺失id的错误投递规则不在目录中私造新type，作为公共边界保留。
 
 旧的state领域及BackendStateDto整体退出；不保留state.query/state.sync、workspace.definitions作用域、旧started/start_failed、history.result、mcl.command及独立delta/reasoning_delta/finished别名，不把它们包装成另一种全后端大包。
 
@@ -61,7 +61,7 @@ mcl.execute.result的data按kind/value表达业务结果：messages、config、i
 
 ## 校验
 
-协议校验JSON、type、信封和字段形状、字节预算、角色内容及可选真实序号的合法范围；目标地址所属实例、调用身份、当前回合、命令受理及权限由DTO和领域验证。目标格式不得为了覆盖源码现状增加兼容字段。
+本轮只调整同步投递目标设计，45种消息字段及编码仍对应已提交基线。协议校验JSON、type、信封和字段形状、字节预算、角色内容及可选真实序号的合法范围；目标地址所属实例、调用身份、当前回合、命令受理及权限由DTO和领域验证。目标格式不得为了覆盖源码现状增加兼容字段。
 
 现有独立预算仍为网络应用消息32MiB、id非空且最多512个UTF-8字节、网络错误message最多512个UTF-8字节；递归消息和媒体校验沿现有协议预算，媒体支持PNG/JPEG/GIF/WebP，每条最多8张、每张解码5MiB、合计20MiB。字段是字符限制还是字节限制必须按实际验证区分，不把JSON Schema字符数当字节预算。
 
@@ -85,10 +85,10 @@ Workspace与Agent启动/重启的定义来源统一为“全量重载 → 发布
 
 ServerMessage的Serialize与Deserialize共同校验成功/失败分支；成功分页两个游标始终输出、空值为null，失败省略游标和成功数据。ClientMessage::id返回&str，ServerMessage::id返回Option<&str>，sync始终为None。纯协议类型不会创建领域事件。
 
-扫描来源已移除的运行Workspace继续展示其已知定义及真实状态，只允许停止。启动或重启必须在本次全量重载缓存中找到目标定义。sync的ClientSender每帧依据既定条件取得，查询不改变接收范围。
+扫描来源已移除的运行Workspace继续展示其已知定义及真实状态，只允许停止。启动或重启必须在本次全量重载缓存中找到目标定义。目标sync每次发送从共享槽位按既定条件取得ClientSender，查询不改变接收范围。
 
 外部字段统一使用Agent Address。MCL审计payload及Agent日志context_json只投影业务关联，VM生命周期标识在后端保留。网络投影在编码前移除内部VM标识。
 
-Agent的sandboxes每次从该Entity的Sandboxes组件遍历，包含alias及path；sandbox来自SelectedSandbox。model由AgentInferenceConfig关联当前ModelRoutes，包含id、model、provider、api_type、context_window_tokens及可空thinking/reasoning_effort；配置或路由缺失为null。agent.req和每帧sync使用同一实时投影，模型端点和凭据保留在后端。
+Agent的sandboxes每次从该Entity的Sandboxes组件遍历，包含alias及path；sandbox来自SelectedSandbox。model由AgentInferenceConfig关联当前ModelRoutes，包含id、model、provider、api_type、context_window_tokens及可空thinking/reasoning_effort；配置或路由缺失为null。目标agent.req读取公共视图，sync由统一更新入口推进同一视图并投递，模型端点和凭据保留在后端。
 
 Driver UI通过agent.ui.req/res/sync交付完整资源集合。查询以Agent Address定位实际Driver来源并沿原oneshot返回；同步独立监控ui目录变化。每个文件包含相对path、media_type和标准base64 data，内容revision使用SHA-256，完整集合和资源为空、读取失败均有明确分支。三种消息已实现，共享资料的Schema、AsyncAPI及实际后端校验同步45种消息。

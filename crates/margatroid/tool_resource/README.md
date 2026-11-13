@@ -1,6 +1,7 @@
 # Tool Resource
 
-tool_resource_core定义工具记录集合、文件读取方法、导入事件和错误，只依赖mecs及通用库。tool_resource_plugin负责异步校验和记录登记，不依赖其他领域plugin，也不让core依赖address或其他领域core。
+本轮同步目标设计尚未实现，源码基线为e24862b。异步监控、统一写入口和共享Client槽位按本领域DESIGN及[DTO设计说明](../dto/README.md)实施；以下保留的业务语义不代表新同步路径已部署。
+tool_resource_core定义工具记录集合、文件读取方法、导入事件和错误，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。tool_resource_plugin负责异步校验和记录登记，不依赖其他领域plugin，也不让core依赖address或其他领域core。
 
 ## 导入与路径
 
@@ -25,3 +26,5 @@ read_tool在导入校验时从入口路径读取tool.toml、input.schema.json和
 IMPORT校验资源后只向Agent.Tools增加一条记录，保存description、input_schema及path；每次推理直接遍历这些记录构造schema，工具调用按名称查询并使用记录中的schema，程序按path读取。普通导入和动态注入使用同一结构，没有第二份工具集合或选择清单。
 
 动态注入由tool_plugin通过现有宿主帧和World闭包调用Tools.insert_batch；入口路径由宿主固定，owner_task_id由注入参数显式配置，省略时为静态记录，binding作为工具自己的不透明数据传入执行context。Tools.insert与insert_batch校验alias、绝对路径、非空描述和schema；整批出现无效定义或alias冲突则原子失败；指定所有者任务清理时移除属于它的入口，不级联清理调用任务；静态入口随Agent.Tools存在。ToolResource不增加注入System或事件，进程通信和任务清理仍属Tool领域。
+
+工具集合构造必须绑定ToolResourceUpdateContext，普通导入、动态注册整批提交、owner移除及实例清理统一经update_tools。完整校验成功且集合变化后同步维护Agent公共Tools视图并直接发布agent.sync；失败和只读查询不发布，不能留下直接可变entries旁路。

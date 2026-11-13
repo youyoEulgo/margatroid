@@ -1,8 +1,9 @@
 # Agent
 
-agent_core定义Agent自身组件、生命周期状态、事件和错误，只依赖mecs及通用库。agent_plugin依赖agent_core、address和所需领域core，负责跨领域生命周期编排，不依赖其他plugin。
+本轮同步目标设计尚未实现，源码基线为e24862b。异步监控、统一写入口和共享Client槽位按本领域DESIGN及[DTO设计说明](../dto/README.md)实施；以下保留的业务语义不代表新同步路径已部署。
+agent_core定义Agent自身组件、生命周期状态、事件和错误，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。agent_plugin依赖agent_core、address和所需领域core，负责跨领域生命周期编排，不依赖其他plugin。
 
-本文同步本轮实现契约，不表示运行中的daemon已更新。Tools是当前Agent唯一工具记录集合，保存alias、path、description、input_schema及私有执行归属owner_task_id和binding；后两者仅经执行context提供，不进入模型schema或公开wire。动态定义仅归当前Agent完整Entity及Driver实例所有，随所属任务清理或实例结束释放；数据库和settings继续承担原有持久化业务。MCP协议由工具侧处理。
+本文其余业务契约沿用已提交基线，新同步路径以本轮目标设计为准。Tools是当前Agent唯一工具记录集合，保存alias、path、description、input_schema及私有执行归属owner_task_id和binding；后两者仅经执行context提供，不进入模型schema或公开wire。动态定义仅归当前Agent完整Entity及Driver实例所有，随所属任务清理或实例结束释放；数据库和settings继续承担原有持久化业务。MCP协议由工具侧处理。
 
 ## 同步受理
 
@@ -36,8 +37,10 @@ InitToolTasks由tool_plugin挂载空ToolTasks，InitInference由inference_plugin
 
 ## 数据归属
 
-Agent只保存名称、Workspace Entity、生命周期状态和当前turn。Address独立挂载，仅供边界寻址。Driver运行组件、MCL队列、数据库、历史和各资源集合由各领域core定义，作为并列组件挂到Agent Entity。
+Agent的同步可见状态改为共享只读视图，状态、turn、故障及公共信息只经update_agent修改；业务资源事实仍由原领域持有，公共Tools/沙箱/模型值由相应成功写入口同步维护。Address独立挂载，仅供边界寻址。Driver运行组件、MCL队列、数据库、历史和各资源集合由各领域core定义，作为并列组件挂到Agent Entity。
 
 中止控制事件被受理后，调用方plugin同步调用agent_abort_turn检查并清除turn，随后取消ActiveInference.current句柄，并由ToolTasks::abort_unreturned原子强制交付未return任务的原调用中止结果、请求终止清理；已return未finish后台任务保留；专属控制事件直接进入PRE_UPDATE完成本帧裁决；agent_core不额外提供中止结果事件或中止闭包。Agent保持Working，直到正常收尾后回Idle。turn已空或不匹配的重复中止直接拒绝，不保存上轮中止关联。Agent不修改Workspace配置文件。新API入口与Workspace生命周期共用全量重载能力，取得同一次发布缓存中的成员参数后调用Agent；底层Agent不另行扫描或按名称单独读取Workspace文件。
 
-AgentDriverSource及Driver UI观察已实现。来源组件由Agent既有启动/停止闭包维护，StartAgent、StopAgent、RestartAgent、AgentException及领域System数量、调度和路由签名保持原样。
+基线已包含AgentDriverSource和UI观察。本轮将监控创建/取消移到实际来源和存储的安装/替换/停止流程，不再让DTO活动帧扫描发现它们。生命周期与中止的原有受理顺序保留。
+
+StartTurn、FinishTurn和AbortTurn同属唯一Agent更新入口，turn变化和完整Agent列表变化直接投递共享槽位。错误、资源导入、动态工具移除、沙箱选择及模型公共信息提交也必须更新同一派生视图。来源替换先失效旧租约并等待UI/记录监控真实结束，不能使旧实例迟到更新复活。
