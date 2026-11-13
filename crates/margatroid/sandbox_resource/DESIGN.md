@@ -13,6 +13,13 @@ Margatroid领域使用原生Axum装配及普通异步闭包。网络服务属于
 
 # 板块格式
 
+SandboxUpdateContext
+    owner: Entity
+    source_epoch: u64
+    on_change: Arc<dyn Fn(Vec<(String, PathBuf)>, Option<String>) + Send + Sync>
+SandboxChange
+    Insert { alias: String, path: PathBuf } | Remove(String) | Select(Option<String>)
+
 ```text
 # lib        sandbox_resource/core/src/lib.rs；sandbox_resource/plugin/src/lib.rs  路径扩展及文件读取；Plugin安装
 # components sandbox_resource/core/src/components.rs                         Sandboxes与SelectedSandbox
@@ -34,7 +41,7 @@ WorldSandboxResourceExt：沙箱路径扩展，公开trait
     sandbox_path(&self, owner: Entity, alias: &str) -> Result<&Path, SandboxResourceError>
         行为：从Sandboxes借用路径，不读取文件。
     sandbox_select(&mut self, owner: Entity, alias: Option<String>) -> Result<(), SandboxResourceError>
-        行为：校验alias存在，更新SelectedSandbox，不读取策略。
+        行为：调用update_sandboxes(Select)，校验alias存在并同步当前选择，不读取策略。
     impl WorldSandboxResourceExt for World
 ```
 
@@ -52,6 +59,9 @@ SandboxResourcePlugin：沙箱路径登记插件
 
 公开，定义于sandbox_resource_core：
 ```text
+update_sandboxes(sandboxes: &mut Sandboxes, selected: &mut SelectedSandbox, context: &SandboxUpdateContext, change: SandboxChange) -> Result<Option<PathBuf>, SandboxResourceError>
+    行为：校验来源及操作，统一处理Insert/Remove/Select；只有接受且公共值变化时，提交完整alias/path和选择的派生纯值给on_change，由Agent统一入口更新并直接发布agent.sync。不在读取路径或策略时发布，不跨领域修改业务事实。
+
 read_sandbox(path: &Path, limits: &SandboxReadLimits) -> Result<SandboxInput, SandboxResourceError>
     行为：有界读取policy.json；校验策略是非空UTF-8及合法JSON对象；具体后端schema由执行方校验。返回本次材料，不保存正文缓存。
 ```
@@ -63,19 +73,21 @@ read_sandbox(path: &Path, limits: &SandboxReadLimits) -> Result<SandboxInput, Sa
 公开：
 ```text
 Sandboxes：沙箱路径集合，公开组件
-    entries: BTreeMap<String, PathBuf>--私有，alias到policy.json规范路径
+    entries: BTreeMap<String, PathBuf>--私有alias到规范路径
+    updates: SandboxUpdateContext--构造必需，不允许缺少同步上下文
+    new(updates: SandboxUpdateContext) -> Self
     get(&self, alias: &str) -> Option<&Path>
         行为：借用路径。
     insert(&mut self, alias: String, path: PathBuf) -> Option<PathBuf>
-        行为：替换单个alias路径并返回原路径，不修改其他条目。
+        行为：调用update_sandboxes(Insert)，返回原路径。
     remove(&mut self, alias: &str) -> Option<PathBuf>
-        行为：移除路径登记。
+        行为：调用update_sandboxes(Remove)。
     iter(&self) -> impl Iterator<Item = (&String, &PathBuf)>
         行为：按alias顺序遍历。
     impl Component for Sandboxes
 
 SelectedSandbox：当前选择，公开组件
-    alias: Option<String>
+    alias: Option<String>--私有，只由统一更新入口写入
     impl Component for SelectedSandbox
 ```
 

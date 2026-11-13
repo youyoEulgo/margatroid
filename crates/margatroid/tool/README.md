@@ -1,6 +1,7 @@
 # Tool
 
-tool_core定义ToolTasks、工具请求、结果和错误，只依赖mecs及通用库。tool_plugin组合Agent、工具资源及沙箱core，不依赖其他plugin。Agent同一轮发送InitToolTasks和InitInference，等待两者回复后继续启动；InitToolTasks只挂载空集合，不执行工具。
+本轮同步目标设计尚未实现，源码基线为e24862b。异步监控、统一写入口和共享Client槽位按本领域DESIGN及[DTO设计说明](../dto/README.md)实施；以下保留的业务语义不代表新同步路径已部署。
+tool_core定义ToolTasks、工具请求、结果和错误，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。tool_plugin组合Agent、工具资源及沙箱core，不依赖其他plugin。Agent同一轮发送InitToolTasks和InitInference，等待两者回复后继续启动；InitToolTasks只挂载空集合，不执行工具。
 
 ## 分组宿主接口
 
@@ -146,3 +147,5 @@ process_open使用原始stdin/stdout/stderr管道，不经过PTY；write/read保
 
 
 agent.task使用ToolTasks::snapshot与ToolTaskHandle::snapshot返回ToolTaskSnapshot纯值，不复用具有消费语义的read。每项包含task_id、call_id、alias、returned、完整保留output窗口及error；已清理项不返回，无完成缓存。读取不推进cursor、不清除replaced、不触发取消或finish，不借出内部句柄。查询和主动同步均为完整任务集合，非分块；并发任务逐项取一致状态，不宣称整个集合是同时冻结的全局事务。read/finish语义保持原样，System及事件不改。
+
+本轮Task统一写入口为update_tasks(context, change)，上下文强制包含当前Agent来源及共享Client槽位的typed同步能力。register、append/replace、正常或强制Return、错误及CompleteCleanup全部从此衍生；原底层可变字段私有，Lua、worker协议、异常和取消收口都不能旁路。脚本read的cursor/replaced、输入发送及只取消token不改变wire快照，不产生额外sync。高频输出只更新单连接队列的pending状态，实际快照读取保留输出窗口语义。

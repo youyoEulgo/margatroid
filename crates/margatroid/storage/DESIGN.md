@@ -72,6 +72,18 @@ read_record_watermarks(storage: &AgentStorage) -> Result<RecordWatermarks, Stora
 subscribe_record_changes(storage: &AgentStorage) -> RecordChanges
     行为：取得共享管理库record_changes的独立watch接收端，当前值为已提交的三个真实高水位；只登记进程内观察者，不修改业务数据或发ECS事件。
 
+open_record_watch(storage: AgentStorage, owner: Entity, address: String, sync: StreamContext<StorageRecordUpdate>) -> (RecordWatch, RecordMonitorContext)
+    行为：先订阅record_changes并在创建时捕获已提交基线，绑定本次实际存储及来源租约；不重放基线之前的历史，不建立Client订阅。
+
+run_record_monitor(mut context: RecordMonitorContext) -> Future<Output = Result<(), StorageError>>
+    行为：
+        无提交变化时等待changed、取消或实例退出，不按活动帧发调查，不发ECS同步事件。
+        观察真实高水位后在至多一个blocking读取中按类别及真实sequence分页，保持主键范围SEARCH，追齐同次高水位。
+        非空页形成StorageRecordUpdate，经context.sync直接筛选当前Clients并投递对应有序帧；空页不发送。
+        成功交付本次记录后推进观察位置；读取期间的新提交仍保留watch通知，追齐后重新等待。
+        错误保留进度并有限退避，相同错误不反复通知World；取消后等待真实blocking worker返回再完成join。
+        不监控SQLite主文件/WAL字节变化来代替COMMIT事实，不把库读取自身触发的Access当作业务更新。
+
 snapshot_block(storage: &AgentStorage, name: &str, instance: Option<&str>) -> Result<(), StorageError>
     行为：
         storage_core公开同步函数，阻塞执行到结果确认，不派发事件；异步调用者负责blocking worker及真实join
@@ -440,6 +452,27 @@ RecordPage<T>：有界读取结果，公开纯值类型
     next_before_sequence: Option<u64>--当前范围内仍有更早记录时为本页最小sequence
     next_after_sequence: Option<u64>--当前范围内仍有更新记录时为本页最大sequence
     行为：记录与游标由同一读事务确定；无对应方向剩余记录为None，空页不是查询失败。
+StorageRecordUpdate
+    address: String
+    records: StorageRecordBatch
+StorageRecordBatch
+    Messages(Vec<StoredHistoryRecord>) | Mcl(Vec<StoredHistoryRecord>) | Logs(Vec<StoredAgentLog>)
+RecordWatch
+    cancel: CancellationToken
+    source: SyncStreamSource
+    completion: 真实监控退出等待能力
+RecordMonitorContext
+    storage: AgentStorage
+    owner: Entity
+    address: String
+    changes: RecordChanges
+    position: RecordWatermarks
+    cancel: CancellationToken
+    sync: StreamContext<StorageRecordUpdate>
+StorageSyncBinding
+    bind: Arc<dyn Fn(Entity, String) -> StreamContext<StorageRecordUpdate> + Send + Sync>
+    行为：DTO在compose时注入具体安全投影及同一Clients槽位；Agent初始化取得真实Storage后调用open_record_watch，在已有异步启动流中驱动监控。
+
 RecordChanges = tokio::sync::watch::Receiver<RecordWatermarks>
 RecordWatermarks：独立持久记录水位
     message: u64

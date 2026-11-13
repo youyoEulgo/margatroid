@@ -32,7 +32,7 @@ method(args) -> xxx
 ```text
 -- 公开，定义于agent_core
 WorldAgentExt：Agent访问扩展，公开trait
-    agent_state(&self, agent: Entity) -> Result<&AgentState, AgentError>
+    agent_state(&self, agent: Entity) -> Result<AgentState, AgentError>
         行为：
             读取Agent状态，目标不存在返回错误。
     agent_start_turn(&mut self, agent: Entity) -> Result<String, AgentError>
@@ -53,7 +53,7 @@ WorldAgentExt：Agent访问扩展，公开trait
             不在agent_core跨域取消任务，调用方随后通过各领域core执行推理取消和ToolTasks未return任务的原子强制return及清理。
     impl WorldAgentExt for World
         行为：
-            只访问Agent自身组件，不操作其他领域。
+            只访问Agent自身共享信息；start_turn/finish_turn/abort_turn经同一AgentUpdateContext调用update_agent，不能直接修改字段或旁路同步。
 ```
 
 ```text
@@ -82,8 +82,7 @@ AgentPlugin：生命周期插件，公开类型
 Agent：Agent领域组件，公开结构体
     name: String
     workspace: Entity
-    state: AgentState
-    turn: Option<String>
+    shared: Arc<AgentShared>--state、turn、故障和公共信息只读，写入必须经过update_agent
     impl Component for Agent
 
 AgentDriverSource
@@ -181,54 +180,63 @@ agent_exception_system(world: &mut World)
 
 ```text
 -- crate公开
+update_agent(context: &AgentUpdateContext, change: AgentChange) -> Result<AgentChangeResult, AgentError>
+    行为：
+        取得AgentDirectory更新门，验证完整Entity和来源epoch，在同一门内更新实际AgentShared及公共目录revision。
+        Register/Transition/StartTurn/FinishTurn/AbortTurn/Fault/Tools/Sandboxes/Model/Remove均从此入口提交，Agent公共字段不提供外部可变借用。
+        StartTurn仅Idle可受理，在同一临界区生成turn并转Working；FinishTurn核对当前调用链收口，清turn并转Idle；AbortTurn核对turn后先清turn并保持Working。
+        各状态白名单、原reply和跨域取消顺序保持；拒绝或值未变不发布。
+        释放领域锁后直接发布agent.sync；turn实际变化时再调用该Agent的turn SyncContext，均使用同一Clients槽位。
+        Remove只在实际清理收口后移出目录并发布完整Agent列表，同时关闭该实例的per-Agent状态来源，迟到任务不复活旧对象。
+
 handle_start_agent(world: &mut World, request: StartAgent)
     行为：
         校验Workspace和成员创建请求；
-        同步创建Agent Entity并挂Agent等基础组件，置Starting，再提交start_flow；
+        同步创建Agent Entity并经update_agent(Register)登记Starting公共视图，再提交start_flow；
         拒绝时发送启动错误。
 
 handle_stop_agent(world: &mut World, request: StopAgent)
     行为：
-        按白名单同步转Stopping；
+        通过update_agent按白名单同步转Stopping并直接发布agent.sync；
         关闭新请求受理，再提交stop_flow；
         拒绝时发送关闭错误。
 
 handle_restart_agent(world: &mut World, request: RestartAgent)
     行为：
         在request.workspace内按name定位成员Entity，先检查ToolTasks，存在尚未finish的活任务条目直接拒绝；
-        通过白名单后同步转Restarting，关闭新请求受理；
+        通过update_agent按白名单转Restarting，关闭新请求受理并同步公共状态；
         使用request.parameters提交restart_flow；
         失败通过原reply回复。
 
 handle_agent_exception(world: &mut World, event: AgentException)
     行为：
-        核对Entity，关闭新受理并报告event.error，不发送额外异常结果事件。
+        核对Entity，通过update_agent写入故障及关闭新受理，直接发布agent.sync；不发送DTO同步事件。
 
 handle_start_result(world: &mut World, result: Result<StartOutput, StartError>)
     行为：
         核对Entity及对应生命周期状态；
         忽略失效结果。
-        启动成功：转Idle，通过原StartAgent.reply回复Entity。
+        启动成功：经update_agent转Idle，通过原StartAgent.reply回复Entity。
         失败：
-            有完整清理证明则销毁Entity，否则保留宿主及当前生命周期状态。
+            有完整清理证明则经update_agent(Remove)移出公共目录再销毁Entity，否则保留宿主及当前生命周期状态。
             通过原reply回复错误。
 
 handle_stop_result(world: &mut World, result: Result<StopOutput, StopError>)
     行为：
         核对Entity及对应生命周期状态；
         忽略失效结果。
-        关闭成功：销毁Entity，通过原StopAgent.reply回复原Entity。
+        关闭成功：经update_agent(Remove)移出公共目录，再销毁Entity，通过原StopAgent.reply回复原Entity。
         失败：
-            有完整清理证明则销毁Entity，否则保留宿主及当前生命周期状态。
+            有完整清理证明则经update_agent(Remove)移出公共目录再销毁Entity，否则保留宿主及当前生命周期状态。
             通过原reply回复错误。
 
 handle_restart_result(world: &mut World, result: Result<RestartOutput, RestartError>)
     行为：
         核对Entity及对应生命周期状态；
         忽略失效结果。
-        重启成功：转Idle，通过原RestartAgent.reply回复Entity。
+        重启成功：经update_agent转Idle，通过原RestartAgent.reply回复Entity。
         失败：
-            有完整清理证明则销毁Entity，否则保留宿主及当前生命周期状态。
+            有完整清理证明则经update_agent(Remove)移出公共目录再销毁Entity，否则保留宿主及当前生命周期状态。
             通过原reply回复错误。
 
 ```
@@ -238,11 +246,15 @@ handle_restart_result(world: &mut World, result: Result<RestartOutput, RestartEr
 start_flow(context: FlowContext) -> Future<Output = Result<StartOutput, StartError>>
     行为：
         调用address::resolve_file及agent_driver_core::read_driver取得本次Driver材料，准备成员目录中的state.sqlite与setting.toml；仅接受这两个固定文件名，不读取旧名。
-        完成Driver读取后，经既有World闭包把本次实际Driver地址和清单规范路径写入AgentDriverSource；重启使用本次实际材料替换该组件。
+        完成Driver读取后，通过实际来源安装入口绑定新的UI观察上下文，使用Driver实际清单路径启动文件监控；不等下一帧扫描组件。
+        AgentStorage初始化后，使用注入的StorageSyncBinding启动该实际存储的持续提交监控。
+        上述监控由start_flow已有异步运行上下文启动，持有各自取消及真实join能力，登记到本次来源租约；不新增执行器或每帧调查。
+        通过原有生命周期World闭包安装AgentDriverSource及租约；来源替换先使旧source失效并取消、等待旧监控，再发布新来源。
         运行组件初始化阶段先发送InitToolTasks和InitInference，各携带agent及独立oneshot发送端，不先等待其中一个再发另一个。
         使用tokio::join!等待两个接收端，与原有资源初始化一起完成；
         收齐全部结果后处理错误，不提前丢弃另一项。
-        新实例使用空Tools，接收普通导入和动态注入。全部初始化成功后准备agent_info并发送StartDriverLuaVm，等待原reply；
+        新实例先从AgentUpdateContext构造Tools、沙箱和模型的typed on_change回调，再创建对应资源及AgentInferenceConfig，不允许默认缺失同步上下文。
+        所有导入/动态注册/移除经Tool资源统一写入口更新Agent公共Tools视图；沙箱及模型公共投影也由各自成功更新入口提交。全部初始化成功后准备agent_info并发送StartDriverLuaVm，等待原reply；
         agent_info作为共享margatroid.context的只读材料，driver:mcl和driver:wait由Lua Runtime构造
         Driver及工具宿主克隆已初始化的AgentStorage作为日志能力，不增加启动事件字段
         失败清理本次已创建内容并返回，成功返回；
@@ -254,7 +266,7 @@ stop_flow(context: FlowContext) -> Future<Output = Result<StopOutput, StopError>
         沿现有流程停止任务；
         任务监督移除所属Tools记录；其他任务按Agent关闭的既有停止流程清理，不按工具owner关系级联。
         等待任务、子进程及MCL真实收口，并等待本次已提交的日志写入完成后再释放存储句柄
-        经既有World闭包移除AgentDriverSource，使DTO在下一帧取消所属UI监控；清理前仍运行的旧Driver保留原来源
+        在释放实际来源前取消UI及持久记录监控并等待真实读取worker和监控Future退出；通过生命周期入口移除AgentDriverSource并失效旧source，清理前仍运行的Driver保留原来源
         返回清理结果，不销毁协调Entity。
 
 restart_flow(context: FlowContext) -> Future<Output = Result<RestartOutput, RestartError>>
@@ -274,6 +286,11 @@ FlowContext：闭包上下文
     agent: Entity
     events: RuntimeEventSender
     parameters: Option<AgentStartParameters>--启动与重启为Some，关闭为None
+    sync: AgentUpdateContext
+    task_sync: TaskSyncBinding
+    ui_sync: DriverUiSyncBinding
+    storage_sync: StorageSyncBinding--各自所属core的能力，来源prepare/encode由compose注入
+    observations: 本次来源的UI与记录监控取消/等待能力
     reply: Option<oneshot::Sender<Result<Entity, AgentError>>>--原请求回复端
 
 StartOutput / StopOutput / RestartOutput：对应闭包的成功载荷
@@ -294,6 +311,68 @@ StartError / StopError / RestartError：对应闭包的失败载荷
 
 ```text
 -- 公开
+AgentDirectory：Resource，可克隆共享信息
+    inner: Arc<AgentDirectoryShared>
+AgentDirectoryShared
+    update_gate: Mutex<()>
+    entries: RwLock<BTreeMap<Entity, Arc<AgentShared>>>
+    revision: AtomicU64
+AgentShared
+    data: RwLock<AgentPublicState>--字段私有，不借出可变引用
+AgentPublicState
+    address: String
+    name: String
+    workspace: String
+    state: AgentState
+    turn: Option<String>
+    error: Option<AgentError>
+    tools: Vec<AgentToolInfo>
+    sandboxes: Vec<AgentSandboxInfo>
+    sandbox: Option<String>
+    model: Option<AgentModelInfo>
+    行为：Tools/沙箱/模型是用于对外观察的派生纯值，由对应资源写入口同步更新，不能独立编辑为第二份业务事实；模型不含凭据。
+AgentToolInfo
+    alias: String
+    path: String
+    description: String
+    input_schema: serde_json::Value
+    owner_task_id: Option<String>
+    binding: Option<serde_json::Value>
+AgentSandboxInfo
+    alias: String
+    path: String
+AgentModelInfo
+    id: String
+    model: String
+    provider: String
+    api_type: String
+    context_window_tokens: u64
+    thinking: Option<String>
+    reasoning_effort: Option<String>
+    行为：Agent自有公共纯值，不包含endpoint/凭据、不持有其他领域组件或World。
+AgentSyncSnapshot
+    agents: Vec<AgentPublicState>
+AgentTurnSnapshot
+    address: String
+    turn: Option<String>
+AgentUpdateContext
+    directory: AgentDirectory
+    owner: Entity
+    source_epoch: u64
+    agents: SyncContext<AgentSyncSnapshot>--所有Agent克隆同一个应用级集合来源
+    turn: SyncContext<AgentTurnSnapshot>
+AgentChangeResult
+    Unit | Turn(String)--StartTurn在同一写入中返回实际新turn，不另行读取来猜测结果
+AgentChange
+    Register(AgentPublicState) | Transition(AgentState) | StartTurn
+    FinishTurn(String) | AbortTurn(String) | Fault(AgentError)
+    Tools(Vec<AgentToolInfo>) | Sandboxes { values: Vec<AgentSandboxInfo>, selected: Option<String> }
+    Model(Option<AgentModelInfo>) | Remove
+AgentSyncBinding
+    directory: AgentDirectory
+    bind: Arc<dyn Fn(Entity, String) -> AgentUpdateContext + Send + Sync>
+    行为：工厂共享Clients和集合来源，per-Agent turn使用当前实际来源租约；快照读取仅捕获Weak共享数据，避免来源索引强引用回环。
+
 AgentStartParameters：启动参数，公开类型
     driver: String--Driver文件定位字符串
     project_root: PathBuf
@@ -332,7 +411,7 @@ AgentErrorKind：错误类别，公开枚举
 World
 └── Agent Entity
     ├── Address（address）
-    ├── Agent（agent_core）
+    ├── Agent → AgentShared（所有变更经AgentUpdateContext）
     ├── ToolTasks（tool_core，InitToolTasks挂载）
     ├── ActiveInference（inference_core，InitInference挂载）
     ├── Driver运行组件（Lua领域core）

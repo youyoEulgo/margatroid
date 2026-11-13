@@ -26,11 +26,29 @@ System分别列出处理事件、接收闭包结果、提交闭包与产出事�
 
 公开，定义于workspace_core：
 ```text
+update_workspace(context: &WorkspaceUpdateContext, change: WorkspaceChange) -> Result<WorkspaceChangeResult, WorkspaceError>
+    行为：
+        在WorkspaceDirectory更新门内校验来源及操作，提交Definitions/Register/State/Members/Failure/Remove变化并递增revision。
+        定义变动只更新候选定义，不改运行实例的definition、成员、状态，不自动启动、停止或重启。
+        状态或成员变动由各自真实生命周期入口调用本方法；原World扩展方法也只通过此入口修改。
+        同步列表同路径优先展示当前有效候选定义；源文件删除后用运行实例保留的启动定义补位，仍允许停止。
+        展示新候选定义不改运行实例执行材料；运行故障优先于定义读取故障，恢复只清对应定义故障，不覆盖真实生命周期错误。
+        失败且无新可观察状态不发布；真实错误变化属于更新；释放锁后sync.publish，直接选择当前Clients并投递。
+
+run_workspace_definition_monitor(context: WorkspaceWatchContext) -> Future<Output = Result<(), WorkspaceError>>
+    行为：
+        先挂notify观察后校验初始缓存，初始化及后续创建/修改/删除/rename按100ms安静窗口合并；忽略Access及无关文件。
+        每次有效通知在至多一个blocking worker内调用同一全量load/reload，完整校验后调用update_workspace发布；不产生ECS同步事件。
+        读取前后来源变动则继续稳定读取；重复内容不推进revision或发送，正在读取期间的新变化保留为待处理。
+        非法定义保留最后有效缓存，通过既有Workspace.error形状呈现可定位的旧条目故障；没有可用身份的新非法文件只记录诊断，不伪造列表项或新wire字段。
+        错误恢复清除错误并发布；取消后等待真实读取及notify退出，应用关停等待本监控收口。
+
 WorkspaceDefinitions：定义目录与启动数据Resource
     entries: Arc<RwLock<BTreeMap<PathBuf, WorkspaceDefinition>>>
     source: Option<PathBuf>
     reload_lock: Arc<Mutex<()>>
-    open(source: impl Into<PathBuf>) -> Result<Self, WorkspaceError>
+    updates: WorkspaceUpdateContext--定义缓存和运行投影的唯一发布入口
+    open(source: impl Into<PathBuf>, binding: WorkspaceSyncBinding) -> Result<Self, WorkspaceError>
         行为：规范来源并拒绝symlink，记录source后调用同一reload完成首轮全量加载。
     source(&self) -> Option<&Path>
         行为：借用已配置来源，供安装校验路径边界，不触发IO。
@@ -40,8 +58,10 @@ WorkspaceDefinitions：定义目录与启动数据Resource
         行为：短读锁克隆全部已发布定义列表，不隐式执行IO。
     reload(&self) -> Result<WorkspaceDefinitionSnapshot, WorkspaceError>
         行为：同步持有reload_lock调用load_workspace_definitions，读取source的全部Workspace定义并完整校验；异步调用方用blocking worker等待真实join。
-            成功后在短写锁内整体发布entries，并返回同一次发布的不可变缓存快照；失败保留旧缓存但返回错误，启动不得继续使用旧值。
+            成功后调用update_workspace(Definitions)原子发布entries并通知workspace.sync，返回同一次发布的不可变快照；失败经同一入口记录可观察错误并返回失败，启动不得继续使用旧值。
             不提供按某个Workspace单独重载的入口；显式reload与启动/重启共享本方法，不改运行Entity或重启成员。
+    start_watch(&self, context: WorkspaceWatchContext) -> WorkspaceDefinitionWatch
+        行为：应用启动后为已配置来源启动一次notify监控，覆盖每个workspace.yaml及可检测新增/删除/原子替换的父目录；不是每帧创建。
     impl Clone for WorkspaceDefinitions
         行为：共享同一Arc，不复制缓存仓库。
     impl Resource for WorkspaceDefinitions
@@ -59,9 +79,9 @@ WorldWorkspaceExt：工作区访问扩展，公开trait
     workspace_agents(&self, workspace: Entity) -> Result<Vec<Entity>, WorkspaceError>
         行为：读取完整成员Entity列表。
     workspace_insert_agent(&mut self, workspace: Entity, agent: Entity) -> Result<(), WorkspaceError>
-        行为：将Entity加入成员集合，不读取Agent领域组件。
+        行为：调用update_workspace(Members)加入成员，不读取Agent领域组件。
     workspace_remove_agent(&mut self, workspace: Entity, agent: Entity) -> Result<(), WorkspaceError>
-        行为：移除成员Entity。
+        行为：调用update_workspace(Members)移除成员Entity。
     impl WorldWorkspaceExt for World
 ```
 
@@ -70,11 +90,13 @@ WorldWorkspaceExt：工作区访问扩展，公开trait
 WorkspacePlugin：工作区编排插件，公开类型
     schedule: String
     definitions: WorkspaceDefinitions
-    open(root: impl Into<PathBuf>) -> Result<Self, WorkspaceError>
+    sync: WorkspaceSyncBinding
+    open(root: impl Into<PathBuf>, sync: WorkspaceSyncBinding) -> Result<Self, WorkspaceError>
         行为：同步读取并校验root内全部Workspace定义；失败返回错误，成功构造插件，不创建运行Entity。
     impl Plugin for WorkspacePlugin
         build(self, app: &mut App)
-            行为：检查运行设施并拒绝重复安装；将definitions作为Resource插入World；在同一Schedule依次安装stop_workspace_system、restart_workspace_system、start_workspace_system。
+            行为：检查运行设施及必需WorkspaceSyncBinding，插入definitions及共享WorkspaceDirectory，安装既有三个生命周期System。
+                初始化完成后通过现有异步设施启动一次定义文件监控，归属应用生命周期；不增加同步System或按帧调查。
 ```
 
 # components
@@ -87,10 +109,10 @@ Workspace：工作区运行实例，公开组件
     name: String
     definition_path: PathBuf
     project_root: PathBuf
-    state: WorkspaceState
-    agents: BTreeSet<Entity>
+    shared: Arc<WorkspaceRuntimeState>--状态、成员及故障通过统一入口修改
     definition: Option<WorkspaceDefinition>
     impl Component for Workspace
+    行为：身份及本次启动定义保持实例自有，异步投影从共享运行信息读取，不借用World。
 
 WorkspaceFailure(WorkspaceError)
     impl Component
@@ -245,6 +267,51 @@ MemberDiagnostic：成员诊断
 
 公开：
 ```text
+
+WorkspaceDirectory：共享Resource
+    inner: Arc<WorkspaceDirectoryShared>
+WorkspaceDirectoryShared
+    update_gate: Mutex<()>
+    definitions: Arc<RwLock<BTreeMap<PathBuf, WorkspaceDefinition>>>--与WorkspaceDefinitions.entries为同一缓存
+    running: RwLock<BTreeMap<Entity, Arc<WorkspaceRuntimeState>>>
+    revision: AtomicU64
+    definition_errors: RwLock<BTreeMap<PathBuf, WorkspaceError>>
+WorkspaceRuntimeState
+    data: RwLock<WorkspaceRuntimeSnapshot>--私有，统一入口更新
+WorkspaceRuntimeSnapshot
+    name: String
+    definition_path: PathBuf
+    project_root: PathBuf
+    state: WorkspaceState
+    agents: BTreeSet<Entity>
+    error: Option<WorkspaceError>
+    definition: WorkspaceDefinition--该实例实际启动定义
+    行为：访问器只提供只读值，编码无需World。
+WorkspaceUpdateContext
+    directory: Weak<WorkspaceDirectoryShared>
+    sync: SyncContext<WorkspaceSyncSnapshot>
+WorkspaceSyncSnapshot
+    definitions: Vec<(PathBuf, WorkspaceDefinition)>
+    running: Vec<WorkspaceRuntimeSnapshot>
+    definition_errors: BTreeMap<PathBuf, WorkspaceError>
+WorkspaceChange
+    Definitions(WorkspaceDefinitionSnapshot) | DefinitionError { path: PathBuf, error: WorkspaceError }
+    Register(WorkspaceRuntimeSnapshot) | State { workspace: Entity, state: WorkspaceState }
+    Members { workspace: Entity, agents: BTreeSet<Entity> } | Failure { workspace: Entity, error: WorkspaceError }
+    Remove(Entity)
+WorkspaceChangeResult
+    Unit | Definitions(WorkspaceDefinitionSnapshot)
+WorkspaceSyncBinding
+    directory: WorkspaceDirectory
+    updates: WorkspaceUpdateContext
+WorkspaceDefinitionWatch
+    cancel: CancellationToken
+    completion: 真实监控JoinHandle
+WorkspaceWatchContext
+    source: PathBuf
+    definitions: WorkspaceDefinitions
+    updates: WorkspaceUpdateContext
+    cancel: CancellationToken
 
 WorkspaceState：生命周期状态，公开枚举
     Starting

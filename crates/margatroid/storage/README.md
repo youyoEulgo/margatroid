@@ -1,5 +1,6 @@
 # Storage
 
+本轮同步目标设计尚未实现，源码基线为e24862b。异步监控、统一写入口和共享Client槽位按本领域DESIGN及[DTO设计说明](../dto/README.md)实施；以下保留的业务语义不代表新同步路径已部署。
 storage_core定义AgentStorage、Block、历史、Agent日志和设置操作及其文件实现，只依赖mecs、SQLite、TOML等通用库，不依赖其他领域core。storage_plugin取得组件句柄并调度blocking worker，通过原请求oneshot回复，不提供额外结果事件。Agent日志另由storage_core公开函数直接读写，不进入StorageOperation或StorageRequest。
 
 当前管理库schema版本为5，Block文件schema版本为2。旧version 3 JSON Block、旧三表或其他不匹配结构明确返回SchemaMismatch，不迁移、不兼容、不生成额外备份。测试仅操作临时目录，不操作用户数据库。
@@ -87,8 +88,10 @@ read_message_page、read_mcl_page、read_agent_log_page及read_record_watermarks
 
 ## 提交观察与范围查询
 
-提交观察及范围SQL修复已落实到源码。管理库共享状态增加record_changes，保存消息、MCL及日志三个真实已提交高水位，并以Tokio watch提供独立观察。新增记录确认COMMIT后通知，读操作、空批次、已有sequence复用、失败及回滚均保持通知值。该通知是进程内状态变化能力，不是Storage ECS事件，也不保存第二份记录正文。
+COMMIT观察及索引范围SQL在基线已有实现；本轮目标把监控归属移至实际Agent存储，把出口改为共享Client槽位直投。管理库共享状态增加record_changes，保存消息、MCL及日志三个真实已提交高水位，并以Tokio watch提供独立观察。新增记录确认COMMIT后通知，读操作、空批次、已有sequence复用、失败及回滚均保持通知值。该通知是进程内状态变化能力，不是Storage ECS事件，也不保存第二份记录正文。
 
-DTO为每个活动Agent存储建立一个长期异步监控，先订阅再取得初始基线，后续等待changed。watch通知可以合并，监控以实际sequence追齐记录。提交在读取期间发生时仍保留通知，未读完的同次变化继续分页；追齐后等待下次真实提交。SQL worker完成后只回到监控本身，不额外触发World调查。
+Agent实际存储初始化时通过StorageSyncBinding建立一个长期异步监控，先订阅再取得初始基线，后续等待changed。watch通知可以合并，监控以实际sequence追齐记录。提交在读取期间发生时仍保留通知，未读完的同次变化继续分页；追齐后等待下次真实提交。SQL worker完成后只回到监控本身，不额外触发World调查。
 
 范围及游标查询按实际边界构造sequence主键谓词，无下界以0作为排他最小值，无上界以SQLite最大整数作为包含边界，实际存在的边界保持排他，保持现有排他界及升序输出。去除可空OR导致的全表SCAN，增量为空时通过主键边界直接结束。写事务通知不改变Schema、持久记录序号或查询副作用边界。
+
+run_record_monitor不再产出WebSocketMessageSend；它把非空实际记录经注入的StreamContext编码为有序帧，直接按当前注册者发送。消息/MCL/日志使用各自真实sequence，不作状态覆盖或注册重放；数据库字节/WAL变化不能代替确认COMMIT通知。监控随存储生命周期关闭，取消等待真实SQL worker。

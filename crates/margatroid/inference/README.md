@@ -1,8 +1,9 @@
 # Inference
 
-inference_core定义推理请求、消息、结果、模型配置Resource及错误，只依赖mecs与通用库。inference_plugin组合Agent、Client、Tools记录，执行模型请求；不依赖其他plugin。MCL负责消息转换、批次工具调用和显式历史，Inference不维护上下文、不执行工具、不写历史。
+本轮同步目标设计尚未实现，源码基线为e24862b。异步监控、统一写入口和共享Client槽位按本领域DESIGN及[DTO设计说明](../dto/README.md)实施；以下保留的业务语义不代表新同步路径已部署。
+inference_core定义推理请求、消息、结果、模型配置Resource及错误，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。inference_plugin组合Agent、Client、Tools记录，执行模型请求；不依赖其他plugin。MCL负责消息转换、批次工具调用和显式历史，Inference不维护上下文、不执行工具、不写历史。
 
-本文同步本轮实现契约，不表示运行中的daemon已更新。InferenceRequest不再携带tools参数，每次推理直接遍历Agent的Tools，以每条记录的alias、description、input_schema构造模型工具定义；Tools为空时工具定义为空。发出异步闭包前完成HTTP请求编码；闭包不持工具定义或名称集合，不负责工具鉴权。执行侧按请求名称查询当前Tools并校验该记录的schema，缺失或参数无效返回对应调用的工具错误。
+本文其余业务契约沿用已提交基线，新同步路径以本轮目标设计为准。InferenceRequest不再携带tools参数，每次推理直接遍历Agent的Tools，以每条记录的alias、description、input_schema构造模型工具定义；Tools为空时工具定义为空。发出异步闭包前完成HTTP请求编码；闭包不持工具定义或名称集合，不负责工具鉴权。执行侧按请求名称查询当前Tools并校验该记录的schema，缺失或参数无效返回对应调用的工具错误。
 
 Margatroid领域使用原生Axum装配及普通异步闭包。网络服务归本应用基础设施，mecs提供通用运行、异步事件和闭包能力。
 
@@ -107,7 +108,7 @@ HTTP/SSE读取任务只向一个有界ProviderFragment通道写入，不直接�
 
 接收循环位于本次推理监督闭包，使用Tokio biased select!优先等待取消，每轮只读一个分片。追加前在StreamGate短锁内再次检查关闭状态；通过裁决才更新唯一ResponseAccumulator并分配sequence。只有已接受的正文或思考分片才能发送前端。
 
-网络发送不持接受门锁，不因慢客户端阻塞接收循环。发送队列和缓冲有界；超过发送预算的连接停止接收本次流，不丢弃后端累积内容，也不把连接错误改成模型错误。发送器使用本次开始时已注册webui快照，后续连接不补入；无前端连接仍能完成推理。
+网络发送不持接受门锁，不因慢客户端阻塞接收循环。发送队列和缓冲有界；超过发送预算的连接停止接收本次流，不丢弃后端累积内容，也不把连接错误改成模型错误。发送能力持有共享Clients，每次接受片段后筛选当次webui连接，不固定起始sender快照；无前端仍能完成推理。中途连接可以收到后续sequence，但不重放已过去的分片，最终full及显式历史提供完整结果。
 
 正常结束时验证对应格式的真实终态；通道关闭本身不表示协议成功。Chat检查finish_reason和DONE，Messages检查message_stop及内容块闭合，Responses检查其真实终态。工具调用校验完整ID、alias和JSON参数，不能执行半截调用。
 
