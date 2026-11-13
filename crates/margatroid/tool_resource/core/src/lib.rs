@@ -190,3 +190,5 @@ impl jsonschema::Retrieve for NoExternalSchema {
         Err("external schema references are not allowed".into())
     }
 }
+
+pub type ToolResourceSyncBinding = client_core::ProbeFactory<Vec<(String, ToolEntry)>>;

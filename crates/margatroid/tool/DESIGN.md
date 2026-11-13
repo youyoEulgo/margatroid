@@ -64,8 +64,11 @@ ToolTasks：该Agent的工具任务句柄集合，公开组件
     updates: TaskUpdateContext--必需，同一Agent的所有任务写能力从此衍生
     new(owner: Entity, address: String, binding: TaskSyncBinding) -> Self
         行为：先创建TaskSetShared，再由binding.bind传入Weak生成必需TaskUpdateContext；不允许缺少同步绑定的生产构造。
+    update_context(&self) -> TaskUpdateContext
+    close_sync(&self)
+        行为：实际来源结束时失效source并移出初始化索引。
     register(&self, id: String, handle: ToolTaskHandle) -> Result<(), ToolError>
-        行为：调用update_tasks(updates, TaskChange::Register)，不直接写集合。
+        行为：调用update_task执行本次登记，不直接写集合。
     cancel(&self, id: &str) -> Result<(), ToolError>
         行为：
             向对应句柄请求取消，不直接中断监督任务或删除句柄。
@@ -89,14 +92,14 @@ ToolTasks：该Agent的工具任务句柄集合，公开组件
         行为：
             request cancel(id)
             await Lua、进程及后代、管道、临时资源真实清理
-            success: 调用update_tasks(TaskChange::CompleteCleanup)移除并释放缓存，随后返回Ok(())
+            success: 调用update_task执行真实CompleteCleanup移除并释放缓存，随后返回Ok(())
             failure: return error; retain supervision
     abort_unreturned(&self) -> 工具中止交接结果
         行为：
             for handle in entries:
                 atomic if !handle.returned:
                     reply 原call_id/alias的中止结果
-                    通过update_tasks(TaskChange::AbortReturn)原子更新returned
+                    通过update_task执行原子AbortReturn原子更新returned
                     请求该句柄取消
                     同步触发，不等待清理
     impl Clone for ToolTasks
@@ -184,15 +187,9 @@ handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
 
 私有：
 ```text
-update_tasks(context: &TaskUpdateContext, change: TaskChange) -> Result<TaskChangeResult, ToolError>
-    行为：
-        升级context.state，核对完整Agent来源及租约；该入口是Task同步可见信息的唯一写入口。
-        取得同一TaskSetShared.update_gate，再取得集合和必要任务锁；校验Register/AppendOutput/ReplaceOutput/Return/AbortReturn/SetError/CompleteCleanup各自合法性。
-        Return与AbortReturn在原唯一reply锁内裁决，重复Return失败不重复发布；CompleteCleanup只接受真实监督收口证明，清缓存并移除集合项。
-        修改实际目标并在同一更新门内递增revision；失败或可见值未变不递增、不发布。
-        释放全部领域锁后调用context.sync.publish(revision)，直接遍历共享Client槽位投递状态通知；不发事件、不借用World、不等待网络。
-        完整任务窗口只在选中连接实际准备该StateKey时读取，连续Append不逐次复制整份窗口；同步不推进cursor或清除replaced。
-        脚本read更新cursor/replaced、输入投递及仅取消token不属于wire快照变化，不制造task.sync。
+update_task<R>(context: &TaskUpdateContext, change: impl FnOnce() -> Result<(R, bool), ToolError>) -> Result<R, ToolError>
+    行为：取得必需context.gate，在同一更新门执行具体修改，失败不发布；返回的changed仅在同步可见状态实际改变时为true。同门内递增revision，释放门后publish到共享Client槽位。
+    生产唯一写能力由ToolTaskHandle/ToolTasks方法构造具体闭包，内部可变字段保持私有；网络准备只持Weak集合，读取完整快照时取得同一更新门。
 
 launch_tool(context: ToolExecutionContext) -> Future<Output = Result<ToolLaunchOutput, ToolLaunchError>>
     行为：
@@ -207,7 +204,7 @@ supervise_tool(context: ToolExecutionContext) -> Future<Output = ()>
         检查本任务取消状态后启动run_runner，动态入口不读取注册schema作回退。配置及execute收到相同可信owner_task_id/binding/resource_dir，不接受arguments覆盖。
         接收runner的Return时通过共享句柄的原子return裁决交付结果，不结束runner；
         中止、错误与正常Return共用唯一回复端，不能在context另持独立可回复状态；
-        缓存写入、覆盖、正常/强制Return、错误及清理移除均调用update_tasks；任务输入与脚本read只保留各自原语义。
+        缓存写入、覆盖、正常/强制Return、错误及清理移除均调用update_task；任务输入与脚本read只保留各自原语义。
         自然退出/finish/到期/中止:
             World闭包: Tools.remove_owner(task_id)
             删除所属工具记录不检查调用状态，不等待或取消其他ToolTask
@@ -518,9 +515,9 @@ ToolContext：worker私有上下文
 ```text
 ToolTaskHandle：可克隆的任务共享句柄，公开类型
     inner: Arc<ToolTaskShared>
-    updates: TaskUpdateContext--来源于同一ToolTasks，内部指向TaskSetShared的Weak，避免集合→句柄→集合强引用环
+    updates: TaskUpdateContext--来源于同一ToolTasks，source.prepare只捕获集合Weak，避免强引用环
     write / replace / try_return / set_error / complete_cleanup
-        行为：只构造对应TaskChange交给update_tasks；取消/超时/worker故障/中止与正常执行不能旁路。
+        行为：只构造具体修改闭包交给update_task；取消/超时/worker故障/中止与正常执行不能旁路。
     is_cleanup_complete(&self) -> bool
         行为：
             仅内部清理等待者查询清理是否完成，不提供对外completed状态或完成缓存。
@@ -532,35 +529,34 @@ ToolTaskHandle：可克隆的任务共享句柄，公开类型
 
 TaskSetShared
     entries: Mutex<BTreeMap<String, ToolTaskHandle>>
-    update_gate: Mutex<()>
-    revision: AtomicU64
+    gate: Arc<Mutex<()>>
+    revision: Arc<AtomicU64>
+    retire: Mutex<Option<Box<dyn Fn() + Send + Sync>>>
+    impl Drop：实际集合释放时关闭同步来源，回调不强引用集合。
 TaskUpdateContext
-    state: Weak<TaskSetShared>
-    owner: Entity--完整Agent归属
-    source_epoch: u64
+    owner: Entity
+    gate: Arc<Mutex<()>>
+    revision: Arc<AtomicU64>
     sync: SyncContext<AgentTaskSnapshot>
-TaskChange
-    Register { id: String, handle: ToolTaskHandle }
-    AppendOutput { id: String, value: Value }
-    ReplaceOutput { id: String, value: Value }
-    Return { id: String, result: Result<ToolExecuteResponse, ToolError> }
-    AbortReturn { id: String }
-    SetError { id: String, error: ToolError }
-    CompleteCleanup { id: String, proof: TaskCleanupProof }
-TaskChangeResult
-    Unit | Returned(bool)
-TaskCleanupProof：内部真实监督完成凭证，脚本不能构造
+    same_owner(&self, other: &Self) -> bool
+    commit(&self) -> u64
+    publish(&self, revision: u64)
+    close(&self)
+TaskSyncBinding
+    clients: Clients
+    targets: Arc<[ClientSelector]>
+    encode: Arc<dyn Fn(AgentTaskSnapshot) -> Result<Arc<ClientFrame>, ClientPrepareError> + Send + Sync>
+    new(clients, targets, encode) -> Self
+    bind(&self, owner: Entity, address: String, state: Weak<TaskSetShared>) -> TaskUpdateContext
+        行为：初始化source，快照读取升级Weak并取gate，返回真实revision及非破坏性完整任务窗口。
 AgentTaskSnapshot
     address: String
     tasks: Vec<ToolTaskSnapshot>
-TaskSyncBinding
-    bind: Arc<dyn Fn(Entity, String, Weak<TaskSetShared>) -> TaskUpdateContext + Send + Sync>
-    行为：由compose注入DTO编码函数及Clients槽位；实际TaskSetShared创建时补齐Weak快照读取能力。
 
 ToolTaskShared：任务持有数据
     cancel: CancellationToken--存活任务取消能力；回合中止只触发原子裁决仍未return的任务，不取消已return后台任务
     task: Mutex<Option<JoinHandle<()>>>--监督任务句柄，取消时不直接abort
-    shared: Mutex<ToolTaskData>--私有；只允许update_tasks修改同步可见字段，returned与唯一reply同锁裁决
+    shared: Mutex<ToolTaskData>--私有；只允许update_task修改同步可见字段，returned与唯一reply同锁裁决
     input: mpsc::Sender<serde_json::Value>
 
 ToolTaskData：任务查询数据

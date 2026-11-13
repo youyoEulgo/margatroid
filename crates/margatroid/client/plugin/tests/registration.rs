@@ -22,11 +22,17 @@ impl Harness {
             senders: BTreeMap::new(),
         }
     }
-    fn connect(&mut self) -> (tokio::sync::mpsc::Receiver<ClientFrame>, ConnectionId) {
+    fn connect(&mut self) -> (client_core::ClientReceiver, ConnectionId) {
         self.next += 1;
         let id = ConnectionId::new(self.next);
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        self.senders.insert(id, ClientSender::new(tx));
+        let (sender, rx) = ClientSender::channel(8);
+        self.app
+            .world()
+            .get_resource::<client_core::Clients>()
+            .unwrap()
+            .adopt(id, sender.clone())
+            .unwrap();
+        self.senders.insert(id, sender);
         (rx, id)
     }
     fn register(
@@ -42,18 +48,13 @@ impl Harness {
             connection_id: connection,
             client_type: kind.into(),
             name: name.map(str::to_owned),
-            sender: self.senders[&connection].clone(),
             reply: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
         });
         self.app.tick();
         self.app.tick();
         receiver.try_recv().unwrap()
     }
-    fn disconnect(
-        &mut self,
-        receiver: tokio::sync::mpsc::Receiver<ClientFrame>,
-        connection: ConnectionId,
-    ) {
+    fn disconnect(&mut self, receiver: client_core::ClientReceiver, connection: ConnectionId) {
         drop(receiver);
         self.app.world().send_event(ClientDisconnected {
             connection_id: connection,
@@ -188,13 +189,14 @@ fn closed_receiver_rejects_registration_and_sender_reports_capacity() {
         sender.try_send(ClientFrame::Binary(vec![])),
         Err(client_plugin::ClientSendError::Full)
     );
-    assert!(receiver.try_recv().is_ok());
-    sender
-        .try_send(ClientFrame::Close {
+    assert!(receiver.try_recv().is_err());
+    assert_eq!(
+        sender.try_send(ClientFrame::Close {
             code: 1000,
-            reason: String::new(),
-        })
-        .unwrap();
+            reason: String::new()
+        }),
+        Err(client_plugin::ClientSendError::Closed)
+    );
     drop(receiver);
     assert!(sender.is_closed());
     assert_eq!(

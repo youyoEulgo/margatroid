@@ -1,9 +1,9 @@
 # Inference
 
-本轮同步目标设计尚未实现，源码基线为e24862b。异步监控、统一写入口和共享Client槽位按本领域DESIGN及[DTO设计说明](../dto/README.md)实施；以下保留的业务语义不代表新同步路径已部署。
+本轮共享Client槽位、统一写入口与异步监控已实现，尚未提交。具体函数和边界见本领域DESIGN及[DTO说明](../dto/README.md)；运行进程需使用新构建。
 inference_core定义推理请求、消息、结果、模型配置Resource及错误，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。inference_plugin组合Agent、Client、Tools记录，执行模型请求；不依赖其他plugin。MCL负责消息转换、批次工具调用和显式历史，Inference不维护上下文、不执行工具、不写历史。
 
-本文其余业务契约沿用已提交基线，新同步路径以本轮目标设计为准。InferenceRequest不再携带tools参数，每次推理直接遍历Agent的Tools，以每条记录的alias、description、input_schema构造模型工具定义；Tools为空时工具定义为空。发出异步闭包前完成HTTP请求编码；闭包不持工具定义或名称集合，不负责工具鉴权。执行侧按请求名称查询当前Tools并校验该记录的schema，缺失或参数无效返回对应调用的工具错误。
+本文其余业务契约沿用已提交基线，新同步路径以当前实际实现为准。InferenceRequest不再携带tools参数，每次推理直接遍历Agent的Tools，以每条记录的alias、description、input_schema构造模型工具定义；Tools为空时工具定义为空。发出异步闭包前完成HTTP请求编码；闭包不持工具定义或名称集合，不负责工具鉴权。执行侧按请求名称查询当前Tools并校验该记录的schema，缺失或参数无效返回对应调用的工具错误。
 
 Margatroid领域使用原生Axum装配及普通异步闭包。网络服务归本应用基础设施，mecs提供通用运行、异步事件和闭包能力。
 

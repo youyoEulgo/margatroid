@@ -49,6 +49,23 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
         inference,
         workspace,
     } = parts;
+    let clients = client_core::Clients::default();
+    let workspace_sync =
+        dto_plugin::workspace_sync_binding(clients.clone(), config.config().backend_state());
+    app.world_mut()
+        .insert_resource(workspace_sync.updates.clone());
+    app.world_mut().insert_resource(workspace_sync);
+    let agent_sync =
+        dto_plugin::agent_sync_context(clients.clone(), config.config().backend_state());
+    app.world_mut().insert_resource(agent_sync.clone());
+    app.world_mut()
+        .insert_resource(dto_plugin::model_sync_binding(agent_sync.clone()));
+    let (tools, sandboxes, selection) = dto_plugin::resource_sync_bindings(agent_sync.clone());
+    app.world_mut().insert_resource(tools);
+    app.world_mut().insert_resource(sandboxes);
+    app.world_mut().insert_resource(selection);
+    let task_sync = dto_plugin::task_sync_binding(clients.clone(), config.config().backend_state());
+    app.world_mut().insert_resource(clients);
     let bind = config.config().server_bind();
     let level = match config.config().log_level() {
         ConfigLogLevel::Off => LogLevel::Off,
@@ -81,14 +98,16 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
         .add_plugin(sandbox_resource_plugin::SandboxResourcePlugin::new())
         .add_plugin(inference)
         .add_plugin(
-            tool_plugin::ToolPlugin::new()
+            tool_plugin::ToolPlugin::new(task_sync)
                 .with_runner_path(options.runner_path)
                 .with_limits(tool_limits),
         )
         .add_plugin(storage_plugin::StoragePlugin::new())
         .add_plugin(lua_runtime_plugin::LuaRuntimePlugin::new())
         .add_plugin(mcl_plugin::MclPlugin::new().with_import_config(imports))
-        .add_plugin(agent_plugin::AgentPlugin::new().with_resource_roots(options.data_root))
+        .add_plugin(
+            agent_plugin::AgentPlugin::new(agent_sync).with_resource_roots(options.data_root),
+        )
         .add_plugin(workspace)
         .add_plugin(dto_plugin::DtoPlugin::new())
         .add_plugin(ui_plugin::UiPlugin::default());

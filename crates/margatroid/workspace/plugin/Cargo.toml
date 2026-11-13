@@ -16,6 +16,8 @@ tokio = { version = "1", features = ["rt", "sync", "time"] }
 futures-util = "0.3"
 
 [dev-dependencies]
+serde_json = { workspace = true }
+client_core = { path = "../../client/core" }
 closure_plugin = { path = "../../../mecs/closure_plugin" }
 tempfile = "3"
 serde_yaml = "0.9"

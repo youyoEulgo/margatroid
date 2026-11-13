@@ -104,12 +104,7 @@ fn invalid_legacy_reload_does_not_fall_back_to_shared_display_cache() {
     let path = directory.path().join("workspace.yaml");
     fs::write(&path, LEGACY).unwrap();
     let good = load_workspace_definition(&path).unwrap();
-    let cache = WorkspaceDefinitions::default();
-    cache
-        .entries
-        .write()
-        .unwrap()
-        .insert(path.clone(), good.clone());
+    let cache = WorkspaceDefinitions::open(&path).unwrap();
     let broken="name: changed\nproject_root: /project\nagents: {coder: {driver: https://outside/driver.toml}}\n";
     fs::write(&path, broken).unwrap();
     assert_eq!(

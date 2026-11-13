@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agent_core::{Agent, AgentState};
+use agent_core::AgentState;
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
 use closure_plugin::{AppClosureExt, ClosurePlugin};
@@ -23,7 +23,7 @@ use tool_core::{
 };
 use tool_plugin::ToolPlugin;
 use tool_resource_core::{read_tool, ToolEntry, Tools};
-use workspace_core::{Workspace, WorkspaceState};
+use workspace_core::WorkspaceState;
 
 fn imported_entry(path: &std::path::Path) -> ToolEntry {
     let tool = read_tool(path).unwrap();
@@ -56,32 +56,34 @@ impl Fixture {
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE)
             .add_plugin(
-                ToolPlugin::new()
+                ToolPlugin::new(crate::test_binding())
                     .with_runner_path(env!("CARGO_BIN_EXE_tool_runner"))
                     .with_limits(limits),
             );
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            Workspace {
-                definition: None,
-                name: "test".into(),
-                definition_path: root.path().join("workspace.yaml"),
-                project_root: root.path().to_owned(),
-                state: WorkspaceState::Running,
-                agents: BTreeSet::new(),
-            },
+            workspace_core::Workspace::new(
+                "test".into(),
+                root.path().join("workspace.yaml"),
+                root.path().to_owned(),
+                WorkspaceState::Running,
+                BTreeSet::new(),
+                None,
+                crate::test_workspace_context(),
+            ),
         );
         let agent = app.world_mut().spawn();
         storage_fixture::mount(app.world_mut(), agent, root.path());
         app.world_mut().insert_component(
             agent,
-            Agent {
-                name: "test".into(),
+            agent_core::Agent::new(
+                "test".into(),
                 workspace,
-                state: AgentState::Working,
-                turn: Some("test-turn".into()),
-            },
+                AgentState::Working,
+                Some("test-turn".into()),
+                crate::test_agent_context(),
+            ),
         );
         let (sender, mut reply) = oneshot::channel();
         app.world().emit_event(InitToolTasks {
@@ -124,7 +126,7 @@ impl Fixture {
         if !self.app.world().contains_component::<Tools>(self.agent) {
             self.app
                 .world_mut()
-                .insert_component(self.agent, Tools::default());
+                .insert_component(self.agent, Tools::new(crate::test_probe()));
         }
         self.app
             .world_mut()
@@ -233,7 +235,7 @@ impl Fixture {
         if !self.app.world().contains_component::<Tools>(self.agent) {
             self.app
                 .world_mut()
-                .insert_component(self.agent, Tools::default());
+                .insert_component(self.agent, Tools::new(crate::test_probe()));
         }
         self.app
             .world_mut()
@@ -275,21 +277,19 @@ impl Fixture {
     }
 
     fn sandbox(&mut self, name: &str) {
-        use sandbox_resource_core::{Sandboxes, SelectedSandbox};
+        use sandbox_resource_core::Sandboxes;
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../../resources/sandboxes/local")
             .join(name)
             .join("latest/policy.json")
             .canonicalize()
             .unwrap();
-        let mut entries = Sandboxes::default();
+        let mut entries = Sandboxes::new(crate::test_probe());
         entries.insert(name.into(), path);
         self.app.world_mut().insert_component(self.agent, entries);
         self.app.world_mut().insert_component(
             self.agent,
-            SelectedSandbox {
-                alias: Some(name.into()),
-            },
+            sandbox_resource_core::SelectedSandbox::new(Some(name.into()), crate::test_probe()),
         );
     }
 }
@@ -1178,4 +1178,28 @@ fn bundled_search_host_failures_keep_tracebacks_in_storage_and_brief_call_errors
         assert_eq!(context["call_id"], "call-search-failure");
         assert_eq!(context["alias"], alias);
     }
+}
+
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
+}
+
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+}
+
+fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
+    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
+}
+
+fn test_probe<T>() -> client_core::UpdateProbe<T> {
+    client_core::UpdateProbe::new(|_| {})
 }

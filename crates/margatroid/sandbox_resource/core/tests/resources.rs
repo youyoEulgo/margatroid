@@ -49,7 +49,7 @@ impl Drop for Fixture {
 
 #[test]
 fn path_collections_replace_only_the_named_alias_and_borrow_without_io() {
-    let mut entries = Sandboxes::new();
+    let mut entries = Sandboxes::new(crate::test_probe());
     let alpha = PathBuf::from("/missing/alpha");
     let beta = PathBuf::from("/missing/beta");
     assert_eq!(entries.insert("z".into(), alpha.clone()), None);
@@ -66,6 +66,7 @@ fn path_collections_replace_only_the_named_alias_and_borrow_without_io() {
     let mut world = World::new();
     let owner = world.spawn();
     world.insert_component(owner, entries);
+    world.insert_component(owner, SelectedSandbox::new(None, test_probe()));
     assert_eq!(world.sandbox_path(owner, "z").unwrap(), beta.as_path());
     assert_eq!(
         world.sandbox_path(owner, "missing").unwrap_err().kind,
@@ -173,9 +174,10 @@ fn validates_nonempty_object_utf8_and_exact_byte_budget() {
 fn selecting_checks_registered_alias_but_does_not_open_policy() {
     let mut world = World::new();
     let owner = world.spawn();
-    let mut entries = Sandboxes::default();
+    let mut entries = Sandboxes::new(crate::test_probe());
     entries.insert("safe".into(), PathBuf::from("/missing/policy.json"));
     world.insert_component(owner, entries);
+    world.insert_component(owner, SelectedSandbox::new(None, test_probe()));
     world.sandbox_select(owner, Some("safe".into())).unwrap();
     assert_eq!(
         world
@@ -215,4 +217,8 @@ fn selecting_checks_registered_alias_but_does_not_open_policy() {
     assert!(world
         .get_component::<SelectedSandbox>(replacement)
         .is_none());
+}
+
+fn test_probe<T>() -> client_core::UpdateProbe<T> {
+    client_core::UpdateProbe::new(|_| {})
 }

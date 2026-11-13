@@ -1,6 +1,6 @@
 use address::Address;
 use agent_core::{
-    Agent, AgentError, AgentErrorKind, AgentStartParameters, AgentState, StartAgent, StopAgent,
+    AgentError, AgentErrorKind, AgentStartParameters, AgentState, StartAgent, StopAgent,
 };
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
@@ -137,14 +137,15 @@ fn fake_agents(world: &mut World) {
             let entity = world.spawn();
             world.insert_component(
                 entity,
-                Agent {
-                    name: request.name,
-                    workspace: request.workspace,
-                    state: AgentState::Idle,
-                    turn: None,
-                },
+                agent_core::Agent::new(
+                    request.name,
+                    request.workspace,
+                    AgentState::Idle,
+                    None,
+                    crate::test_agent_context(),
+                ),
             );
-            world.insert_component(entity, ToolTasks::default());
+            world.insert_component(entity, test_tasks());
             let _ = reply.send(Ok(entity));
         }
     }
@@ -176,6 +177,8 @@ fn fake_agents(world: &mut World) {
 }
 fn app(plugin: WorkspacePlugin) -> App {
     let mut app = App::new();
+    app.world_mut()
+        .insert_resource(workspace_core::WorkspaceUpdateContext::new(|_, _| {}));
     app.add_plugin(RuntimePlugin::default())
         .add_plugin(ClosurePlugin)
         .add_closure_system(RuntimePlugin::UPDATE)
@@ -363,6 +366,10 @@ fn restart_refuses_unfinished_tasks_on_every_member_without_cancelling_them() {
         "call".into(),
         "tool".into(),
         reply,
+        app.world()
+            .get_component::<ToolTasks>(output.members[1])
+            .unwrap()
+            .update_context(),
     )
     .unwrap();
     let tasks = app
@@ -593,10 +600,13 @@ fn unconfirmed_starting_member_reports_busy_and_retains_host_instead_of_fake_cle
     write(&path, "demo", &["good"], "project");
     let mut app = app(WorkspacePlugin::open(root.path()).unwrap());
     let output = start(&mut app, &path, "start");
-    app.world_mut()
-        .get_component_mut::<Agent>(output.members[0])
-        .unwrap()
-        .state = AgentState::Starting;
+    agent_core::WorldAgentExt::agent_transition(
+        app.world_mut(),
+        output.members[0],
+        AgentState::Starting,
+        None,
+    )
+    .unwrap();
     app.world().emit_event(StopWorkspace {
         id: "stop".into(),
         reply: request_reply("stop"),
@@ -766,4 +776,25 @@ fn removed_definition_remains_on_running_component_and_only_stop_succeeds() {
     );
     stop(&mut app, running.workspace, "stop-retained");
     assert!(!app.world().is_alive(running.workspace));
+}
+
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
+}
+fn test_tasks() -> tool_core::ToolTasks {
+    let mut app = core_plugin::App::new();
+    let owner = app.world_mut().spawn();
+    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
+}
+
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
 }

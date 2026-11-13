@@ -1,6 +1,6 @@
 # Workspace
 
-本轮同步目标设计尚未实现，源码基线为e24862b。异步监控、统一写入口和共享Client槽位按本领域DESIGN及[DTO设计说明](../dto/README.md)实施；以下保留的业务语义不代表新同步路径已部署。
+本轮共享Client槽位、统一写入口与异步监控已实现，尚未提交。具体函数和边界见本领域DESIGN及[DTO说明](../dto/README.md)；运行进程需使用新构建。
 workspace_core定义Workspace组件、状态、事件、定义和专属线程能力，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。workspace_plugin依赖workspace_core、address和所需领域core，负责运行生命周期，不依赖其他plugin。
 
 ## 配置与运行实例

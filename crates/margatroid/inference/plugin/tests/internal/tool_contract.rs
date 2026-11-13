@@ -19,19 +19,18 @@ fn fixture(url: String, format: &str) -> (App, Entity) {
         .add_closure_system(RuntimePlugin::UPDATE)
         .add_plugin(crate::InferencePlugin {
             schedule: RuntimePlugin::UPDATE.into(),
-            routes: ModelRoutes {
-                entries: BTreeMap::from([("route".into(), selected)]),
-            },
+            routes: inference_core::ModelRoutes::new(BTreeMap::from([("route".into(), selected)])),
         });
     let agent = app.world_mut().spawn();
     app.world_mut().insert_component(
         agent,
-        Agent {
-            name: "test".into(),
-            workspace: agent,
-            state: AgentState::Working,
-            turn: Some("turn".into()),
-        },
+        agent_core::Agent::new(
+            "test".into(),
+            agent,
+            AgentState::Working,
+            Some("turn".into()),
+            test_agent_context(),
+        ),
     );
     app.world_mut()
         .insert_component(agent, Address::new("agent:test/agent").unwrap());
@@ -167,7 +166,7 @@ async fn real_http_uses_all_current_entries_at_acceptance_and_refreshes_each_req
     for format in ["chat_completions", "messages", "responses"] {
         let (url, chunks, server, captured) = http_server_with_request().await;
         let (mut app, agent) = fixture(url, format);
-        let mut tools = Tools::new();
+        let mut tools = Tools::new(test_probe());
         tools
             .insert("baseline".into(), entry("baseline", None))
             .unwrap();
@@ -190,13 +189,10 @@ async fn real_http_uses_all_current_entries_at_acceptance_and_refreshes_each_req
         server.await.unwrap();
 
         let (url, chunks, server, captured) = http_server_with_request().await;
-        app.world_mut()
-            .get_resource_mut::<ModelRoutes>()
-            .unwrap()
-            .entries
-            .get_mut("route")
-            .unwrap()
-            .base_url = url;
+        let routes = app.world_mut().get_resource_mut::<ModelRoutes>().unwrap();
+        let mut entries = routes.entries().clone();
+        entries.get_mut("route").unwrap().base_url = url;
+        routes.replace(entries, &[]);
         let tools = app.world_mut().get_component_mut::<Tools>(agent).unwrap();
         tools.remove_owner("mcp-owner");
         tools
@@ -219,7 +215,7 @@ async fn real_http_preserves_large_catalogs_and_long_descriptions_in_every_forma
     for format in ["chat_completions", "messages", "responses"] {
         let (url, chunks, server, captured) = http_server_with_request().await;
         let (mut app, agent) = fixture(url, format);
-        let mut tools = Tools::new();
+        let mut tools = Tools::new(test_probe());
         for index in 0..1024 {
             let alias = format!("catalog_{index:04}");
             let mut item = entry(&alias, Some("large-catalog-owner"));
@@ -257,4 +253,12 @@ async fn real_http_preserves_large_catalogs_and_long_descriptions_in_every_forma
         }
         server.await.unwrap();
     }
+}
+
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+}
+
+fn test_probe<T>() -> client_core::UpdateProbe<T> {
+    client_core::UpdateProbe::new(|_| {})
 }

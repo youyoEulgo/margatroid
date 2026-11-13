@@ -13,13 +13,6 @@ Margatroid领域使用原生Axum装配及普通异步闭包。网络服务属于
 
 # 板块格式
 
-SandboxUpdateContext
-    owner: Entity
-    source_epoch: u64
-    on_change: Arc<dyn Fn(Vec<(String, PathBuf)>, Option<String>) + Send + Sync>
-SandboxChange
-    Insert { alias: String, path: PathBuf } | Remove(String) | Select(Option<String>)
-
 ```text
 # lib        sandbox_resource/core/src/lib.rs；sandbox_resource/plugin/src/lib.rs  路径扩展及文件读取；Plugin安装
 # components sandbox_resource/core/src/components.rs                         Sandboxes与SelectedSandbox
@@ -41,29 +34,26 @@ WorldSandboxResourceExt：沙箱路径扩展，公开trait
     sandbox_path(&self, owner: Entity, alias: &str) -> Result<&Path, SandboxResourceError>
         行为：从Sandboxes借用路径，不读取文件。
     sandbox_select(&mut self, owner: Entity, alias: Option<String>) -> Result<(), SandboxResourceError>
-        行为：调用update_sandboxes(Select)，校验alias存在并同步当前选择，不读取策略。
+        行为：校验目标和alias已登记，调用已装配SelectedSandbox::set，不读取策略或产生ECS同步事件。
     impl WorldSandboxResourceExt for World
 ```
 
 公开，定义于sandbox_resource_plugin：
 ```text
-SandboxResourcePlugin：沙箱路径登记插件
+SandboxResourcePlugin
     schedule: String
     limits: SandboxReadLimits
-    impl Plugin for SandboxResourcePlugin
+    impl Plugin
         build(self, app: &mut App)
-            行为：检查异步设施，拒绝重复安装；安装sandbox_resource_system。
+            行为：检查运行设施并拒绝重复安装，安装sandbox_resource_system；成功导入实际创建集合时必须取得SandboxSyncBinding。
 ```
 
 ## 函数
 
 公开，定义于sandbox_resource_core：
 ```text
-update_sandboxes(sandboxes: &mut Sandboxes, selected: &mut SelectedSandbox, context: &SandboxUpdateContext, change: SandboxChange) -> Result<Option<PathBuf>, SandboxResourceError>
-    行为：校验来源及操作，统一处理Insert/Remove/Select；只有接受且公共值变化时，提交完整alias/path和选择的派生纯值给on_change，由Agent统一入口更新并直接发布agent.sync。不在读取路径或策略时发布，不跨领域修改业务事实。
-
 read_sandbox(path: &Path, limits: &SandboxReadLimits) -> Result<SandboxInput, SandboxResourceError>
-    行为：有界读取policy.json；校验策略是非空UTF-8及合法JSON对象；具体后端schema由执行方校验。返回本次材料，不保存正文缓存。
+    行为：有界读取policy.json并校验UTF-8及非空JSON对象；不缓存正文，执行后端校验具体策略。
 ```
 
 # components
@@ -74,21 +64,29 @@ read_sandbox(path: &Path, limits: &SandboxReadLimits) -> Result<SandboxInput, Sa
 ```text
 Sandboxes：沙箱路径集合，公开组件
     entries: BTreeMap<String, PathBuf>--私有alias到规范路径
-    updates: SandboxUpdateContext--构造必需，不允许缺少同步上下文
-    new(updates: SandboxUpdateContext) -> Self
+    updates: UpdateProbe<Vec<(String, PathBuf)>>--构造必需，不允许缺少同步上下文
+    new(updates: UpdateProbe<Vec<(String, PathBuf)>>) -> Self
     get(&self, alias: &str) -> Option<&Path>
         行为：借用路径。
     insert(&mut self, alias: String, path: PathBuf) -> Option<PathBuf>
-        行为：调用update_sandboxes(Insert)，返回原路径。
+        行为：同一insert入口替换路径，只有值变化时publish_current，返回原路径。
     remove(&mut self, alias: &str) -> Option<PathBuf>
-        行为：调用update_sandboxes(Remove)。
+        行为：同一remove入口删实际登记，存在时publish_current。
     iter(&self) -> impl Iterator<Item = (&String, &PathBuf)>
         行为：按alias顺序遍历。
     impl Component for Sandboxes
 
-SelectedSandbox：当前选择，公开组件
-    alias: Option<String>--私有，只由统一更新入口写入
-    impl Component for SelectedSandbox
+SelectedSandbox：当前选择，Component + Clone + Debug
+    data: SelectedSandboxData--不实现DerefMut
+    updates: UpdateProbe<Option<String>>
+    new(alias: Option<String>, updates: UpdateProbe<Option<String>>) -> Self
+    set(&mut self, alias: Option<String>)
+        行为：实际改变alias后publish；重复值不发布。
+    publish_current(&self)
+SelectedSandboxData
+    alias: Option<String>
+    行为：仅只读Deref访问，无法直接赋值旁路同步。
+
 ```
 
 # events
@@ -163,6 +161,12 @@ SandboxInput：本次沙箱策略
 
 SandboxReadLimits：读取预算
     policy_bytes: usize
+SandboxSyncBinding = ProbeFactory<Vec<(String, PathBuf)>>
+SandboxSelectionSyncBinding = ProbeFactory<Option<String>>
+    行为：按owner创建的typed入口上下文，转换为Agent公共沙箱列表或当前选择，保持实际来源scope。
+Sandboxes::publish_current(&self)
+    行为：克隆同一entries的完整alias/path后调用updates.publish，不读取策略、不发ECS事件。
+
 ```
 
 # error

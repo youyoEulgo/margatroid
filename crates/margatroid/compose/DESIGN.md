@@ -1,4 +1,4 @@
-本文为共享Client槽位及同步入口/监控的目标装配设计；本轮尚未实现，状态见README。
+本文为共享Client槽位及统一同步入口/监控的实际装配设计；运行进程需使用相应构建。
 
 # 伪代码格式
 
@@ -39,15 +39,16 @@ build_app(options: ApplicationOptions) -> Result<App, ComposeError>
 私有：
 ```text
 prepare(options: &ApplicationOptions) -> Result<ApplicationParts, ComposeError>
-    行为：先读取ConfigPlugin，创建唯一Clients并调用create_sync_bindings，再把Workspace绑定交给WorkspacePlugin::open，调用InferencePlugin::open，准备资源根及runner路径；将config自有tools经resolve_tool_limits补齐并校验预算，失败映射config领域及config.toml路径，先于App创建和插件安装；任一失败返回，不自动启动工作区。
+    行为：读取ConfigPlugin、WorkspacePlugin::open和InferencePlugin::open，准备资源根及runner路径；将config自有tools经resolve_tool_limits补齐并校验预算，失败映射config领域及config.toml路径，先于App创建和插件安装；任一失败返回，不自动启动工作区。
 
 resolve_tool_limits(config: &FileToolConfig) -> Result<ToolExecutionLimits, ConfigError>
     行为：将lua_vm_memory_limit和task_output_buffer_window直接映射到lua_vm_memory_bytes和cache_bytes；缺省值只取工具领域默认2GiB及128MiB，两项拒绝显式零值并报告tools字段路径；lua_vm_memory_bytes只限制工具Lua VM分配器，cache_bytes独立约束任务输出窗口，不限制Rust或外部进程，不限制返回结果容量。
 
 install(app: &mut App, parts: ApplicationParts) -> Result<(), ComposeError>
     行为：先安装既有mecs Runtime、AsyncRuntime、Closure和日志设施，再安装Margatroid axum_plugin及各业务插件。
-        复用prepare已创建的唯一Clients Arc槽位和dto_plugin::create_sync_bindings返回的typed绑定，不在install再次创建。
-        把同一Clients注入ClientPlugin及DtoPlugin，把各自core定义的Workspace/Agent/Task/UI/Storage/Inference同步绑定分别注入对应插件及生命周期上下文。
+        install先创建唯一Clients，调用dto_plugin::workspace_sync_binding、agent_sync_context、resource_sync_bindings、model_sync_binding、task_sync_binding，显式构造各typed能力。
+        将Clients、WorkspaceSyncBinding及其updates、AgentUpdateContext、ToolResourceSyncBinding、SandboxSyncBinding、SandboxSelectionSyncBinding和ModelSyncBinding作为Resource插入同一World。
+        ClientPlugin和DtoPlugin复用同一Clients Resource；AgentPlugin::new接收必需AgentUpdateContext，ToolPlugin::new接收必需TaskSyncBinding，资源插件及实际Agent初始化从Resource取得必需probe工厂。
         领域plugin只调用自身或其他领域core入口，不依赖DTO plugin；DTO函数返回的绑定由compose组装，wire编码函数通过owned回调注入。
         将已校验Lua预算通过ToolPlugin::with_limits注入工具插件，runner路径通过with_runner_path传入。
         不注册统一通用HTTP/WebSocket事件路由；bind参数交AxumPlugin，ingress由config_core拥有并由DTO handler直接校验。
@@ -86,8 +87,6 @@ ApplicationOptions：应用装配参数
 私有：
 ```text
 ApplicationParts：安装前材料--已构造插件、Axum监听参数、ingress配置及日志过滤
-    clients: Clients
-    sync_bindings: SyncBindings
     tool_limits: ToolExecutionLimits--已补齐默认值并校验的工具预算
 ```
 

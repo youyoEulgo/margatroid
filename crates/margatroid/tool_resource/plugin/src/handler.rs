@@ -104,7 +104,15 @@ pub(crate) fn handle_import_result(world: &mut World, result: Result<ImportOutpu
     } else {
         validated.and_then(|entry| {
             if !world.contains_component::<Tools>(context.owner) {
-                world.insert_component(context.owner, Tools::default());
+                world.insert_component(
+                    context.owner,
+                    Tools::new(
+                        world
+                            .get_resource::<tool_resource_core::ToolResourceSyncBinding>()
+                            .expect("resource sync binding required")
+                            .for_owner(context.owner),
+                    ),
+                );
             }
             world
                 .get_component_mut::<Tools>(context.owner)

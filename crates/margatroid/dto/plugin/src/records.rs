@@ -1,71 +1,108 @@
 use crate::{handler, projection, types::*};
 use agent_core::Agent;
-use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
+use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::WorldAsyncExt;
 use core_plugin::World;
 use margatroid_protocol::{ServerMessage, encode_server_message};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 use storage_core::{AgentStorage, RecordRange, RecordWatermarks};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) fn reconcile_record_watches(world: &mut World) {
-    let lifetime = world.get_resource::<DtoState>().unwrap().lifetime.clone();
-    let desired = if lifetime.is_cancelled() {
-        BTreeMap::new()
+pub(crate) fn refresh_record_watch(
+    world: &mut World,
+    entity: core_plugin::Entity,
+) -> Vec<agent_core::AgentObservationWait> {
+    let state = world.get_resource::<DtoState>().unwrap().clone();
+    let desired = if state.lifetime.is_cancelled() || world.get_component::<Agent>(entity).is_none()
+    {
+        None
     } else {
         world
-            .query_with::<Agent>()
-            .result()
-            .into_iter()
-            .filter_map(|entity| {
-                Some((
-                    entity,
-                    (
-                        world.get_component::<AgentStorage>(entity)?.clone(),
-                        projection::address(world, entity)?,
-                    ),
-                ))
-            })
-            .collect::<BTreeMap<_, _>>()
+            .get_component::<AgentStorage>(entity)
+            .cloned()
+            .zip(projection::address(world, entity))
     };
-    world
-        .get_resource_mut::<SyncState>()
+    let same = world
+        .get_resource::<SyncObservations>()
         .unwrap()
         .records
-        .retain(|entity, slot| {
+        .get(&entity)
+        .is_some_and(|slot| {
             desired
-                .get(entity)
+                .as_ref()
                 .is_some_and(|(storage, _)| storage.same_database(&slot.storage))
         });
-    for (entity, (storage, address)) in desired {
-        if world
-            .get_resource::<SyncState>()
-            .unwrap()
-            .records
-            .contains_key(&entity)
-        {
-            continue;
-        }
-        let cancel = CancellationToken::new();
-        let mut changes = storage_core::subscribe_record_changes(&storage);
-        let position = *changes.borrow_and_update();
-        let context = RecordMonitorContext {
-            changes,
-            position,
-            storage: storage.clone(),
-            address,
-            events: world.event_sender(),
-            cancel: cancel.clone(),
-            lifetime: lifetime.clone(),
-            guard: lifetime.track(),
-        };
-        world
-            .get_resource_mut::<SyncState>()
-            .unwrap()
-            .records
-            .insert(entity, RecordWatchSlot { storage, cancel });
-        world.send_async_closure(RuntimePlugin::UPDATE, move || run_record_watch(context));
+    if same {
+        return vec![];
+    }
+    let mut waits = vec![];
+    if let Some(slot) = world
+        .get_resource_mut::<SyncObservations>()
+        .unwrap()
+        .records
+        .remove(&entity)
+    {
+        waits.push(slot.completion.clone().wait());
+        drop(slot);
+    }
+    let Some((storage, address)) = desired else {
+        return waits;
+    };
+    let cancel = CancellationToken::new();
+    let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let completion = std::sync::Arc::new(crate::monitor::MonitorCompletion::default());
+    let mut changes = storage_core::subscribe_record_changes(&storage);
+    let position = *changes.borrow_and_update();
+    let context = RecordMonitorContext {
+        changes,
+        position,
+        storage: storage.clone(),
+        address,
+        clients: state.clients.clone(),
+        targets: crate::sync_selectors(
+            world
+                .get_resource::<config_core::MargatroidConfig>()
+                .unwrap()
+                .backend_state(),
+        ),
+        active: active.clone(),
+        cancel: cancel.clone(),
+        lifetime: state.lifetime.clone(),
+        guard: state.lifetime.track(),
+        completion: crate::monitor::MonitorCompletionGuard(completion.clone()),
+    };
+    world
+        .get_resource_mut::<SyncObservations>()
+        .unwrap()
+        .records
+        .insert(
+            entity,
+            RecordWatchSlot {
+                storage,
+                cancel,
+                active,
+                completion,
+            },
+        );
+    world.send_async_closure(RuntimePlugin::UPDATE, move || run_record_watch(context));
+    waits
+}
+pub(crate) fn stop_record_watch(
+    world: &mut World,
+    entity: core_plugin::Entity,
+) -> Vec<agent_core::AgentObservationWait> {
+    if let Some(slot) = world
+        .get_resource_mut::<SyncObservations>()
+        .unwrap()
+        .records
+        .remove(&entity)
+    {
+        let wait = slot.completion.clone().wait();
+        drop(slot);
+        vec![wait]
+    } else {
+        vec![]
     }
 }
 struct RecordBatch {
@@ -102,7 +139,10 @@ fn read_batch(
         },
     })
 }
-fn encode_batch(address: &str, batch: &RecordBatch) -> Result<Vec<Value>, DtoAsyncError> {
+fn encode_batch(
+    address: &str,
+    batch: &RecordBatch,
+) -> Result<Vec<std::sync::Arc<client_core::ClientFrame>>, DtoAsyncError> {
     let mut frames = vec![];
     for row in &batch.messages {
         frames.push(json!({"type":"agent.message.full.sync","address":address,"turn":row.record.turn,"generation":row.record.payload.get("request_id").and_then(Value::as_str),"history_sequence":row.sequence,"message":row.record.payload,"error":null}));
@@ -113,15 +153,20 @@ fn encode_batch(address: &str, batch: &RecordBatch) -> Result<Vec<Value>, DtoAsy
     if !batch.logs.is_empty() {
         frames.push(json!({"type":"agent.log.sync","address":address,"records":batch.logs.iter().cloned().map(handler::log_record).collect::<Vec<_>>()}));
     }
-    for frame in &frames {
-        let value: ServerMessage =
-            serde_json::from_value(frame.clone()).map_err(|e| DtoAsyncError(e.to_string()))?;
-        encode_server_message(&value).map_err(|e| DtoAsyncError(e.to_string()))?;
-    }
-    Ok(frames)
+    frames
+        .into_iter()
+        .map(|frame| {
+            let value: ServerMessage =
+                serde_json::from_value(frame).map_err(|e| DtoAsyncError(e.to_string()))?;
+            encode_server_message(&value)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|e| DtoAsyncError(e.to_string()))
+        })
+        .collect()
 }
 async fn run_record_watch(mut context: RecordMonitorContext) -> Result<(), DtoAsyncError> {
     let _guard = context.guard;
+    let _completion = context.completion;
     let mut position = context.position;
     loop {
         tokio::select! {
@@ -169,11 +214,10 @@ async fn run_record_watch(mut context: RecordMonitorContext) -> Result<(), DtoAs
             if context.cancel.is_cancelled() || context.lifetime.is_cancelled() {
                 return Ok(());
             }
-            for message in frames {
-                context.events.send_event(WebSocketMessageSend {
-                    target: config_core::OutboundTarget::Broadcast,
-                    message,
-                });
+            for frame in frames {
+                context
+                    .clients
+                    .send_scoped(&context.targets, frame, context.active.clone());
             }
             position.message = batch
                 .messages

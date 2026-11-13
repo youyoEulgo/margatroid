@@ -1,9 +1,9 @@
 # Agent
 
-本轮同步目标设计尚未实现，源码基线为e24862b。异步监控、统一写入口和共享Client槽位按本领域DESIGN及[DTO设计说明](../dto/README.md)实施；以下保留的业务语义不代表新同步路径已部署。
+本轮共享Client槽位、统一写入口与异步监控已实现，尚未提交。具体函数和边界见本领域DESIGN及[DTO说明](../dto/README.md)；运行进程需使用新构建。
 agent_core定义Agent自身组件、生命周期状态、事件和错误，目标通过client_core共享发送能力连接网络，仍不依赖DTO或服务器plugin。agent_plugin依赖agent_core、address和所需领域core，负责跨领域生命周期编排，不依赖其他plugin。
 
-本文其余业务契约沿用已提交基线，新同步路径以本轮目标设计为准。Tools是当前Agent唯一工具记录集合，保存alias、path、description、input_schema及私有执行归属owner_task_id和binding；后两者仅经执行context提供，不进入模型schema或公开wire。动态定义仅归当前Agent完整Entity及Driver实例所有，随所属任务清理或实例结束释放；数据库和settings继续承担原有持久化业务。MCP协议由工具侧处理。
+本文其余业务契约沿用已提交基线，新同步路径以当前实际实现为准。Tools是当前Agent唯一工具记录集合，保存alias、path、description、input_schema及私有执行归属owner_task_id和binding；后两者仅经执行context提供，不进入模型schema或公开wire。动态定义仅归当前Agent完整Entity及Driver实例所有，随所属任务清理或实例结束释放；数据库和settings继续承担原有持久化业务。MCP协议由工具侧处理。
 
 ## 同步受理
 

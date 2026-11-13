@@ -68,7 +68,13 @@ fn domain_cores_are_independent_and_plugins_only_depend_on_cores() {
                     if !target.starts_with(root) {
                         continue;
                     }
-                    assert_ne!(layer, "core", "{domain}/core depends on domain {name}");
+                    if layer == "core" {
+                        assert!(
+                            name == "client_core" && target == root.join("client/core"),
+                            "{domain}/core has an unapproved domain dependency: {name}"
+                        );
+                        continue;
+                    }
                     assert!(
                         target.ends_with("core")
                             || target.ends_with("address")

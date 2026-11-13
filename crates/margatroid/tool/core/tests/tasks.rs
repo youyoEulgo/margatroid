@@ -12,13 +12,20 @@ fn with_limits(
     limits: &ToolExecutionLimits,
 ) -> (ToolTaskHandle, tokio::sync::mpsc::UnboundedReceiver<Value>) {
     let (reply, _) = oneshot::channel();
-    ToolTaskHandle::new(limits, "call".into(), "tool".into(), reply).unwrap()
+    ToolTaskHandle::new(
+        limits,
+        "call".into(),
+        "tool".into(),
+        reply,
+        test_tasks().update_context(),
+    )
+    .unwrap()
 }
 
 #[test]
 fn cloned_collections_and_handles_share_outputs_and_cursor() {
-    let tasks = ToolTasks::new();
-    let (task, _input) = handle();
+    let tasks = test_tasks();
+    let (task, _input) = handle_for(&tasks);
     tasks.register("task".into(), task.clone()).unwrap();
     let worker = tasks.clone();
     std::thread::spawn(move || {
@@ -39,12 +46,12 @@ fn cloned_collections_and_handles_share_outputs_and_cursor() {
 
 #[test]
 fn duplicate_ids_do_not_replace_existing_tasks_and_agents_are_isolated() {
-    let tasks = ToolTasks::new();
-    let other_agent = ToolTasks::new();
-    let (first, _) = handle();
+    let tasks = test_tasks();
+    let other_agent = test_tasks();
+    let (first, _) = handle_for(&tasks);
     first.write(json!("original")).unwrap();
     tasks.register("same".into(), first.clone()).unwrap();
-    let (second, _) = handle();
+    let (second, _) = handle_for(&other_agent);
     assert_eq!(
         tasks
             .register("same".into(), second.clone())
@@ -174,8 +181,8 @@ fn overlong_cache_text_retains_a_valid_utf8_tail_and_can_be_replaced() {
 
 #[test]
 fn concurrent_reads_deliver_every_value_once_across_shared_cursor() {
-    let tasks = ToolTasks::new();
-    let (task, _) = handle();
+    let tasks = test_tasks();
+    let (task, _) = handle_for(&tasks);
     tasks.register("task".into(), task.clone()).unwrap();
     for number in 0..100 {
         task.write(json!(number)).unwrap();
@@ -231,13 +238,14 @@ fn response() -> tool_core::ToolExecuteResponse {
 
 #[tokio::test]
 async fn return_delivers_original_association_and_keeps_background_task_alive() {
-    let tasks = ToolTasks::new();
+    let tasks = test_tasks();
     let (reply, result) = oneshot::channel();
     let (task, mut input) = ToolTaskHandle::new(
         &ToolExecutionLimits::default(),
         "original-call".into(),
         "original-alias".into(),
         reply,
+        tasks.update_context(),
     )
     .unwrap();
     tasks.register("task".into(), task.clone()).unwrap();
@@ -261,13 +269,14 @@ async fn return_delivers_original_association_and_keeps_background_task_alive() 
 #[test]
 fn abort_and_return_race_delivers_exactly_one_reply_and_cancels_only_abort_winner() {
     for _ in 0..128 {
-        let tasks = ToolTasks::new();
+        let tasks = test_tasks();
         let (reply, mut result) = oneshot::channel();
         let (task, _input) = ToolTaskHandle::new(
             &ToolExecutionLimits::default(),
             "call".into(),
             "alias".into(),
             reply,
+            tasks.update_context(),
         )
         .unwrap();
         tasks.register("task".into(), task.clone()).unwrap();
@@ -302,17 +311,18 @@ fn abort_and_return_race_delivers_exactly_one_reply_and_cancels_only_abort_winne
 
 #[tokio::test]
 async fn abort_is_immediate_and_does_not_touch_returned_tasks() {
-    let tasks = ToolTasks::new();
+    let tasks = test_tasks();
     let (pending_reply, pending_result) = oneshot::channel();
     let (pending, _) = ToolTaskHandle::new(
         &ToolExecutionLimits::default(),
         "pending-call".into(),
         "pending-tool".into(),
         pending_reply,
+        tasks.update_context(),
     )
     .unwrap();
     tasks.register("pending".into(), pending.clone()).unwrap();
-    let (returned, mut input) = handle();
+    let (returned, mut input) = handle_for(&tasks);
     tasks.register("returned".into(), returned.clone()).unwrap();
     returned.return_result(Ok(response())).unwrap();
     returned.write(json!("retained")).unwrap();
@@ -334,8 +344,8 @@ async fn abort_is_immediate_and_does_not_touch_returned_tasks() {
 
 #[tokio::test]
 async fn finish_waits_for_real_cleanup_then_removes_task_and_cache_for_all_waiters() {
-    let tasks = ToolTasks::new();
-    let (task, _input) = handle();
+    let tasks = test_tasks();
+    let (task, _input) = handle_for(&tasks);
     tasks.register("task".into(), task.clone()).unwrap();
     let (cancel_seen, cancelled) = oneshot::channel();
     let (release, cleanup) = oneshot::channel();
@@ -396,8 +406,8 @@ async fn finish_waits_for_real_cleanup_then_removes_task_and_cache_for_all_waite
 
 #[tokio::test]
 async fn aborting_finish_waiter_retains_supervision_until_cleanup() {
-    let tasks = ToolTasks::new();
-    let (task, _) = handle();
+    let tasks = test_tasks();
+    let (task, _) = handle_for(&tasks);
     tasks.register("task".into(), task.clone()).unwrap();
     let (cancel_seen, cancelled) = oneshot::channel();
     let (release, cleanup) = oneshot::channel();
@@ -427,8 +437,8 @@ async fn aborting_finish_waiter_retains_supervision_until_cleanup() {
 
 #[tokio::test]
 async fn finish_before_attachment_does_not_lose_notifications() {
-    let tasks = ToolTasks::new();
-    let (task, _) = handle();
+    let tasks = test_tasks();
+    let (task, _) = handle_for(&tasks);
     tasks.register("task".into(), task.clone()).unwrap();
     let waiter_task = task.clone();
     let waiter = tokio::spawn(async move { waiter_task.finish().await });
@@ -447,8 +457,8 @@ async fn finish_before_attachment_does_not_lose_notifications() {
 
 #[tokio::test]
 async fn cleanup_failure_preserves_entry_cache_and_management_until_recovery() {
-    let tasks = ToolTasks::new();
-    let (task, _) = handle();
+    let tasks = test_tasks();
+    let (task, _) = handle_for(&tasks);
     tasks.register("task".into(), task.clone()).unwrap();
     task.write(json!("retained")).unwrap();
     let error = ToolError::new(ToolErrorKind::CleanupFailed, "child remains alive");
@@ -511,11 +521,11 @@ async fn supervisor_cannot_join_itself() {
 
 #[test]
 fn late_supervisor_cleanup_cannot_remove_replacement_with_same_id() {
-    let tasks = ToolTasks::new();
-    let (old, _) = handle();
+    let tasks = test_tasks();
+    let (old, _) = handle_for(&tasks);
     tasks.register("task".into(), old.clone()).unwrap();
     assert!(tasks.complete_cleanup("task", &old, None));
-    let (replacement, _) = handle();
+    let (replacement, _) = handle_for(&tasks);
     replacement.write(json!("replacement")).unwrap();
     tasks.register("task".into(), replacement.clone()).unwrap();
     assert!(!tasks.complete_cleanup("task", &old, None));
@@ -555,8 +565,8 @@ fn reads_join_unread_text_without_changing_structured_output_or_cursor() {
 
 #[test]
 fn snapshots_preserve_script_cursor_replaced_and_skip_cleanup() {
-    let tasks = ToolTasks::new();
-    let (task, _input) = handle();
+    let tasks = test_tasks();
+    let (task, _input) = handle_for(&tasks);
     tasks.register("z".into(), task.clone()).unwrap();
     task.write(json!("first")).unwrap();
     task.read().unwrap();
@@ -579,4 +589,33 @@ fn snapshots_preserve_script_cursor_replaced_and_skip_cleanup() {
     tasks.complete_cleanup("z", &task, None);
     assert!(tasks.snapshot().is_empty());
     assert!(task.snapshot("z").is_none());
+}
+
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
+}
+fn test_tasks() -> tool_core::ToolTasks {
+    let mut app = core_plugin::App::new();
+    let owner = app.world_mut().spawn();
+    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
+}
+
+fn handle_for(tasks: &ToolTasks) -> (ToolTaskHandle, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+    let (reply, _) = oneshot::channel();
+    ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        "call".into(),
+        "tool".into(),
+        reply,
+        tasks.update_context(),
+    )
+    .unwrap()
 }

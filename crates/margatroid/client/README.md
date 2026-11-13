@@ -1,12 +1,12 @@
 # Client
 
-本轮为目标设计，尚未实现。当前源码基线为e24862b；新结构及字段以[DESIGN.md](DESIGN.md)为准。
+共享槽位与直接同步已实现，当前工作树尚未提交；具体字段、方法和生命周期见[DESIGN.md](DESIGN.md)。
 
 Client改为同一个`Arc<ClientSlots>`共享槽位：World Resource、DTO提供给Axum的State、异步监控和同步领域统一更新入口都持有这一个Arc。槽位保存未注册连接、已确认的注册身份、发送器、取消能力及在途请求集合，替代当前DTO ConnState与Client身份分别保存的两套可变登记。
 
 Client组件保留完整Entity/Address寻址职责，但只引用同一份不可变ClientIdentity。注册和断连通过统一入口提交：注册在同一共享写锁复检连接、名称和身份，失败回滚本次Entity；断连先从共享槽位移除并取消，再通过原ClientDisconnected清理World身份。注册事件、请求原oneshot和连接生命周期事件继续存在，均不承担sync中转。
 
-同步生产者每次发送都遍历当前槽位，按Type、Name或Broadcast筛选，不长期固定sender列表。注册表锁仅用于取得接收者快照，释放后才能编码和投递。身份标签保持原自报含义，不增加认证承诺。
+同步生产者每次发布都遍历当前槽位，按Type、Name或Broadcast筛选，不长期固定sender列表。注册表锁仅用于取得接收者快照，释放后才能编码和投递。身份标签保持原自报含义，不增加认证承诺。
 
 所有sync直接进入每连接原有的有界出站队列，不建立sync总线、额外分发任务或ECS同步事件。Axum保留每连接唯一writer，领域线程不直接操作socket。
 

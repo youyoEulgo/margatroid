@@ -1,3 +1,4 @@
+use workspace_core::{remove_workspace, update_workspace, WorkspaceChange};
 fn reply(
     sender: &workspace_core::WorkspaceOperationReply,
     result: Result<workspace_core::WorkspaceOperationOutput, workspace_core::WorkspaceError>,
@@ -78,7 +79,7 @@ fn members(world: &World, workspace: Entity) -> Result<BTreeSet<Entity>, Workspa
     for entity in world.query_with::<Agent>().result() {
         if world
             .get_component::<Agent>(entity)
-            .is_some_and(|agent| agent.workspace == workspace)
+            .is_some_and(|agent| agent.workspace() == workspace)
         {
             members.insert(entity);
         }
@@ -127,15 +128,24 @@ pub(crate) fn handle_start_workspace(world: &mut World, request: StartWorkspace)
         world.insert_component(workspace, address);
         world.insert_component(
             workspace,
-            Workspace {
-                name: key.into(),
-                definition_path: path.clone(),
-                project_root: PathBuf::new(),
-                state: WorkspaceState::Starting,
-                agents: BTreeSet::new(),
-                definition: None,
-            },
+            workspace_core::Workspace::new(
+                key.into(),
+                path.clone(),
+                PathBuf::new(),
+                WorkspaceState::Starting,
+                BTreeSet::new(),
+                None,
+                world
+                    .get_resource::<workspace_core::WorkspaceUpdateContext>()
+                    .expect("workspace sync context missing")
+                    .clone(),
+            ),
         );
+        world
+            .get_component::<Workspace>(workspace)
+            .unwrap()
+            .updates()
+            .notify(world, workspace);
         Ok(context(
             world,
             request.id.clone(),
@@ -178,10 +188,11 @@ pub(crate) fn handle_stop_workspace(world: &mut World, request: StopWorkspace) {
                 )
             })?;
         executor.entry.close_admission();
-        world
-            .get_component_mut::<Workspace>(request.workspace)
-            .unwrap()
-            .state = WorkspaceState::Stopping;
+        update_workspace(
+            world,
+            request.workspace,
+            WorkspaceChange::State(WorkspaceState::Stopping),
+        )?;
         Ok(context(
             world,
             request.id.clone(),
@@ -251,10 +262,11 @@ pub(crate) fn handle_restart_workspace(world: &mut World, request: RestartWorksp
                 ));
             }
         }
-        world
-            .get_component_mut::<Workspace>(workspace)
-            .unwrap()
-            .state = WorkspaceState::Restarting;
+        update_workspace(
+            world,
+            workspace,
+            WorkspaceChange::State(WorkspaceState::Restarting),
+        )?;
         Ok(context(
             world,
             request.id.clone(),
@@ -293,10 +305,14 @@ fn finish_running(
         ));
     }
     let all = members(world, workspace)?;
-    let component = world.get_component_mut::<Workspace>(workspace).unwrap();
-    component.agents = all;
-    component.state = WorkspaceState::Running;
+    update_workspace(world, workspace, WorkspaceChange::Members(all))?;
     world.remove_component::<WorkspaceFailure>(workspace);
+    update_workspace(world, workspace, WorkspaceChange::Failure(None))?;
+    update_workspace(
+        world,
+        workspace,
+        WorkspaceChange::State(WorkspaceState::Running),
+    )?;
     Ok(())
 }
 fn failure_result(world: &mut World, failure: &FlowError, state: WorkspaceState) {
@@ -306,13 +322,19 @@ fn failure_result(world: &mut World, failure: &FlowError, state: WorkspaceState)
             .is_some_and(|w| w.state == state)
         {
             world.insert_component(workspace, WorkspaceFailure(failure.error.clone()));
+            let _ = update_workspace(
+                world,
+                workspace,
+                WorkspaceChange::Failure(Some(failure.error.clone())),
+            );
             if failure.cleanup_completed {
-                world.despawn(workspace);
+                remove_workspace(world, workspace);
             } else if failure.restore_running {
-                world
-                    .get_component_mut::<Workspace>(workspace)
-                    .unwrap()
-                    .state = WorkspaceState::Running;
+                let _ = update_workspace(
+                    world,
+                    workspace,
+                    WorkspaceChange::State(WorkspaceState::Running),
+                );
             }
         }
     }
@@ -343,7 +365,7 @@ pub(crate) fn handle_stop_result(world: &mut World, result: Result<StopOutput, S
                 .get_component::<Workspace>(output.workspace)
                 .is_some_and(|w| w.state == WorkspaceState::Stopping)
             {
-                world.despawn(output.workspace);
+                remove_workspace(world, output.workspace);
                 Ok(WorkspaceOperationOutput {
                     workspace: output.workspace,
                     members: output.members,
@@ -481,11 +503,8 @@ async fn mount_executor(
                 "existing workspace thread has not joined",
             ));
         }
-        let component = world.get_component_mut::<Workspace>(workspace).unwrap();
-        component.definition = Some(definition.clone());
-        component.name = definition.name;
-        component.project_root = definition.project_root;
-        component.agents.clear();
+        update_workspace(world, workspace, WorkspaceChange::Definition(definition))?;
+        update_workspace(world, workspace, WorkspaceChange::Members(BTreeSet::new()))?;
         world.insert_component(workspace, executor);
         Ok(())
     })
@@ -534,7 +553,7 @@ async fn start_members(
                 with_world(context, move |world| {
                     if !world
                         .get_component::<Agent>(agent)
-                        .is_some_and(|a| a.workspace == workspace && a.name == name)
+                        .is_some_and(|a| a.workspace() == workspace && a.name() == &name)
                     {
                         return Err(error(
                             WorkspaceErrorKind::MemberFailed,
@@ -585,7 +604,7 @@ async fn stop_members_and_join(
                     "workspace contains a missing or unconfirmed member",
                 )
             })?;
-            if !matches!(agent.state, AgentState::Idle | AgentState::Working) {
+            if !matches!(agent.state(), AgentState::Idle | AgentState::Working) {
                 return Err(error(
                     WorkspaceErrorKind::Busy,
                     "member creation or lifecycle cleanup has not confirmed completion",

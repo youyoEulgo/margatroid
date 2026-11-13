@@ -140,14 +140,19 @@ struct ToolTaskShared {
 #[derive(Clone, Debug)]
 pub struct ToolTaskHandle {
     inner: Arc<ToolTaskShared>,
+    updates: crate::TaskUpdateContext,
 }
 
 impl ToolTaskHandle {
+    pub(crate) fn update_context(&self) -> &crate::TaskUpdateContext {
+        &self.updates
+    }
     pub fn new(
         limits: &ToolExecutionLimits,
         call_id: String,
         alias: String,
         reply: oneshot::Sender<Result<ToolExecuteResponse, ToolError>>,
+        updates: crate::TaskUpdateContext,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), ToolError> {
         if let Err(error) = limits.validate() {
             let _ = reply.send(Err(error.clone()));
@@ -156,6 +161,7 @@ impl ToolTaskHandle {
         let (input, receiver) = mpsc::unbounded_channel();
         Ok((
             Self {
+                updates,
                 inner: Arc::new(ToolTaskShared {
                     cancel: CancellationToken::new(),
                     task: Mutex::new(None),
@@ -259,27 +265,32 @@ impl ToolTaskHandle {
         &self,
         result: Result<ToolExecuteResponse, ToolError>,
     ) -> Result<(), ToolError> {
-        let mut state = lock(&self.inner.shared);
-        ensure_open(&state)?;
-        if state.returned {
-            return Err(ToolError::new(
-                ToolErrorKind::AlreadyReturned,
-                "tool call already returned",
-            ));
-        }
-        deliver_reply(&mut state, result);
-        Ok(())
+        crate::sync::update_task(&self.updates, || {
+            let mut state = lock(&self.inner.shared);
+            ensure_open(&state)?;
+            if state.returned {
+                return Err(ToolError::new(
+                    ToolErrorKind::AlreadyReturned,
+                    "tool call already returned",
+                ));
+            }
+            deliver_reply(&mut state, result);
+            Ok(((), true))
+        })
     }
 
     pub(crate) fn abort_unreturned(&self) -> bool {
-        let mut state = lock(&self.inner.shared);
-        if state.cleanup_complete || state.returned {
-            return false;
-        }
-        let response = ToolExecuteResponse::aborted(state.call_id.clone(), state.alias.clone());
-        deliver_reply(&mut state, Ok(response));
-        self.inner.cancel.cancel();
-        true
+        crate::sync::update_task(&self.updates, || {
+            let mut state = lock(&self.inner.shared);
+            if state.cleanup_complete || state.returned {
+                return Ok((false, false));
+            }
+            let response = ToolExecuteResponse::aborted(state.call_id.clone(), state.alias.clone());
+            deliver_reply(&mut state, Ok(response));
+            self.inner.cancel.cancel();
+            Ok((true, true))
+        })
+        .unwrap_or(false)
     }
 
     pub fn has_returned(&self) -> bool {
@@ -291,21 +302,25 @@ impl ToolTaskHandle {
     }
 
     pub fn write(&self, value: Value) -> Result<(), ToolError> {
-        let mut state = lock(&self.inner.shared);
-        ensure_open(&state)?;
-        append_cache(&mut state, value, self.inner.cache_bytes);
-        Ok(())
+        crate::sync::update_task(&self.updates, || {
+            let mut state = lock(&self.inner.shared);
+            ensure_open(&state)?;
+            append_cache(&mut state, value, self.inner.cache_bytes);
+            Ok(((), true))
+        })
     }
 
     pub fn replace(&self, value: Value) -> Result<(), ToolError> {
-        let mut state = lock(&self.inner.shared);
-        ensure_open(&state)?;
-        state.output.clear();
-        state.bytes = 0;
-        state.cursor = 0;
-        state.replaced = true;
-        append_cache(&mut state, value, self.inner.cache_bytes);
-        Ok(())
+        crate::sync::update_task(&self.updates, || {
+            let mut state = lock(&self.inner.shared);
+            ensure_open(&state)?;
+            state.output.clear();
+            state.bytes = 0;
+            state.cursor = 0;
+            state.replaced = true;
+            append_cache(&mut state, value, self.inner.cache_bytes);
+            Ok(((), true))
+        })
     }
 
     pub fn snapshot(&self, task_id: &str) -> Option<ToolTaskSnapshot> {
@@ -353,11 +368,16 @@ impl ToolTaskHandle {
     }
 
     pub fn set_error(&self, error: ToolError) {
-        lock(&self.inner.shared).error = Some(error);
+        let _ = crate::sync::update_task(&self.updates, || {
+            let mut state = lock(&self.inner.shared);
+            let changed = state.error.as_ref() != Some(&error);
+            state.error = Some(error);
+            Ok(((), changed))
+        });
         self.inner.changed.notify_waiters();
     }
 
-    pub(crate) fn complete_cleanup(&self, error: Option<ToolError>) {
+    pub(crate) fn complete_cleanup_raw(&self, error: Option<ToolError>) {
         let mut state = lock(&self.inner.shared);
         if state.cleanup_complete {
             return;

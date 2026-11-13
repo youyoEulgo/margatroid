@@ -57,14 +57,15 @@ impl Fixture {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            workspace_core::Workspace {
-                definition: None,
-                name: "test".into(),
-                definition_path: directory.path().join("workspace.yaml"),
-                project_root: directory.path().to_owned(),
-                agents: Default::default(),
-                state: workspace_core::WorkspaceState::Running,
-            },
+            workspace_core::Workspace::new(
+                "test".into(),
+                directory.path().join("workspace.yaml"),
+                directory.path().to_owned(),
+                workspace_core::WorkspaceState::Running,
+                Default::default(),
+                None,
+                crate::test_workspace_context(),
+            ),
         );
         let executor = spawn_workspace_executor().unwrap();
         let close = executor.close.clone();
@@ -686,12 +687,13 @@ async fn shared_host_logs_use_current_turn_and_do_not_log_caught_faults_or_cance
     let mut fixture = Fixture::new(LuaRuntimeConfig::default());
     fixture.app.world_mut().insert_component(
         fixture.owner,
-        agent_core::Agent {
-            name: "trusted-agent".into(),
-            workspace: fixture.workspace,
-            state: agent_core::AgentState::Working,
-            turn: Some("first-turn".into()),
-        },
+        agent_core::Agent::new(
+            "trusted-agent".into(),
+            fixture.workspace,
+            agent_core::AgentState::Working,
+            Some("first-turn".into()),
+            crate::test_agent_context(),
+        ),
     );
     let instance = fixture
         .start(
@@ -715,12 +717,13 @@ async fn shared_host_logs_use_current_turn_and_do_not_log_caught_faults_or_cance
         )
         .await
         .unwrap();
-    fixture
-        .app
-        .world_mut()
-        .get_component_mut::<agent_core::Agent>(fixture.owner)
-        .unwrap()
-        .turn = Some("second-turn".into());
+    agent_core::WorldAgentExt::agent_transition(
+        fixture.app.world_mut(),
+        fixture.owner,
+        agent_core::AgentState::Working,
+        Some("second-turn".into()),
+    )
+    .unwrap();
     fixture.app.world().driver_wake(&instance).unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
     while !fixture
@@ -980,4 +983,12 @@ async fn driver_host_denies_tools_and_tasks_and_keeps_context_and_namespaces_rea
         .unwrap();
     fixture.stop(instance).await.unwrap();
     fixture.close().await;
+}
+
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+}
+
+fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
+    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
 }

@@ -3,16 +3,16 @@ use agent_core::{Agent, AgentDriverSource};
 use agent_driver_core::{
     DriverUiBundle, DriverUiError, DriverUiState, open_driver_ui_watch, run_driver_ui_monitor,
 };
-use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
+use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::WorldAsyncExt;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use client_core::ClientFrame;
 use core_plugin::World;
 use futures_util::FutureExt;
 use margatroid_protocol::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     any::Any,
-    collections::BTreeMap,
     panic::AssertUnwindSafe,
     sync::{Arc, RwLock},
 };
@@ -134,7 +134,7 @@ pub(crate) fn query_agent_ui(world: &World, object: Box<dyn Any + Send>) {
             .get_component::<AgentDriverSource>(entity)
             .ok_or_else(|| ui_error(DriverUiError::Initializing))?;
         let slot = world
-            .get_resource::<SyncState>()
+            .get_resource::<SyncObservations>()
             .and_then(|state| state.ui.get(&entity))
             .filter(|slot| slot.manifest_path == source.manifest_path)
             .ok_or_else(|| ui_error(DriverUiError::Initializing))?;
@@ -146,115 +146,138 @@ pub(crate) fn query_agent_ui(world: &World, object: Box<dyn Any + Send>) {
     })();
     handler::deliver(&request.reply, result);
 }
-pub(crate) fn reconcile_ui_watches(world: &mut World) {
-    let state = world
-        .get_resource::<DtoState>()
-        .expect("DTO installed")
-        .clone();
-    if state.lifetime.is_cancelled() {
-        let sync = world.get_resource_mut::<SyncState>().unwrap();
-        sync.ui.clear();
-        sync.ui_sent.clear();
-        return;
-    }
-    let desired = world
-        .query_with::<AgentDriverSource>()
-        .result()
-        .into_iter()
-        .filter_map(|entity| {
-            world.get_component::<Agent>(entity)?;
-            let source = world.get_component::<AgentDriverSource>(entity)?;
-            Some((
-                entity,
-                (
-                    source.manifest_path.clone(),
-                    projection::address(world, entity)?,
-                ),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
+pub(crate) fn refresh_ui_watch(
+    world: &mut World,
+    entity: core_plugin::Entity,
+) -> Vec<agent_core::AgentObservationWait> {
+    let state = world.get_resource::<DtoState>().unwrap().clone();
+    let desired = if state.lifetime.is_cancelled() || world.get_component::<Agent>(entity).is_none()
     {
-        let sync = world.get_resource_mut::<SyncState>().unwrap();
-        let stale = sync
-            .ui
-            .iter()
-            .filter_map(|(entity, slot)| {
-                let current = desired.get(entity);
-                if current.is_none_or(|(path, address)| {
-                    path != &slot.manifest_path || address != &slot.address
-                }) {
-                    Some(*entity)
-                } else {
-                    None
-                }
+        None
+    } else {
+        world
+            .get_component::<AgentDriverSource>(entity)
+            .and_then(|source| {
+                projection::address(world, entity)
+                    .map(|address| (source.manifest_path.clone(), address))
             })
-            .collect::<Vec<_>>();
-        for entity in stale {
-            sync.ui.remove(&entity);
-            sync.ui_sent.retain(|(_, current), _| *current != entity);
-        }
+    };
+    let same = world
+        .get_resource::<SyncObservations>()
+        .unwrap()
+        .ui
+        .get(&entity)
+        .is_some_and(|slot| {
+            desired.as_ref().is_some_and(|(path, address)| {
+                *path == slot.manifest_path && *address == slot.address
+            })
+        });
+    if same {
+        return vec![];
     }
-    for (entity, (manifest_path, address)) in desired {
-        if world
-            .get_resource::<SyncState>()
+    let waits = stop_ui_watch(world, entity);
+    let Some((manifest_path, address)) = desired else {
+        return waits;
+    };
+    let delivery = Arc::new(RwLock::new(build_ui_delivery(
+        &address,
+        DriverUiState::Initializing,
+    )));
+    let output = delivery.clone();
+    let revision = Arc::new(AtomicU64::new(0));
+    let version = revision.clone();
+    let weak = Arc::downgrade(&delivery);
+    let targets = crate::sync_selectors(
+        world
+            .get_resource::<config_core::MargatroidConfig>()
             .unwrap()
-            .ui
-            .contains_key(&entity)
-        {
-            continue;
-        }
-        let delivery = Arc::new(RwLock::new(build_ui_delivery(
-            &address,
-            DriverUiState::Initializing,
-        )));
-        let output = delivery.clone();
-        let target = address.clone();
-        let events = world.event_sender();
-        let lifetime = state.lifetime.clone();
-        let (watch, monitor) = open_driver_ui_watch(
-            manifest_path.clone(),
-            Arc::new(move |value| {
-                if lifetime.is_cancelled() {
+            .backend_state(),
+    );
+    let sync = client_core::SyncContext::new(
+        state.clients.clone(),
+        client_core::SyncKey {
+            topic: "agent.ui.sync".into(),
+            object: address.clone(),
+        },
+        targets,
+        move || {
+            let delivery = weak
+                .upgrade()
+                .ok_or(client_core::ClientPrepareError::SourceClosed)?;
+            let value = delivery.read().unwrap_or_else(|e| e.into_inner());
+            Ok((version.load(Ordering::Acquire), value.clone()))
+        },
+        |delivery: UiDelivery| Ok(Arc::new(ClientFrame::Text(delivery.frame.to_string()))),
+    );
+    let publish = sync.clone();
+    let target = address.clone();
+    let lifetime = state.lifetime.clone();
+    let (watch, monitor) = open_driver_ui_watch(
+        manifest_path.clone(),
+        Arc::new(move |value| {
+            if lifetime.is_cancelled() {
+                return;
+            }
+            let value = build_ui_delivery(&target, value);
+            let version = {
+                let mut previous = output.write().unwrap_or_else(|e| e.into_inner());
+                if previous.key == value.key {
                     return;
                 }
-                let value = build_ui_delivery(&target, value);
-                {
-                    let mut previous = output.write().unwrap_or_else(|e| e.into_inner());
-                    if previous.key == value.key {
-                        return;
-                    }
-                    *previous = value.clone();
-                }
-                if let Ok(message) = serde_json::from_str(value.frame.as_ref())
-                    && !lifetime.is_cancelled()
-                {
-                    events.send_event(WebSocketMessageSend {
-                        target: config_core::OutboundTarget::Broadcast,
-                        message,
-                    });
-                }
-            }),
-        );
-        let context = UiMonitorContext {
-            monitor,
-            watch: watch.clone(),
-            lifetime: state.lifetime.clone(),
-            guard: state.lifetime.track(),
-        };
-        world.get_resource_mut::<SyncState>().unwrap().ui.insert(
+                *previous = value;
+                revision.fetch_add(1, Ordering::AcqRel) + 1
+            };
+            if !lifetime.is_cancelled() {
+                publish.publish(version);
+            }
+        }),
+    );
+    let completion = Arc::new(crate::monitor::MonitorCompletion::default());
+    let context = UiMonitorContext {
+        completion: crate::monitor::MonitorCompletionGuard(completion.clone()),
+        monitor,
+        watch: watch.clone(),
+        lifetime: state.lifetime.clone(),
+        guard: state.lifetime.track(),
+    };
+    world
+        .get_resource_mut::<SyncObservations>()
+        .unwrap()
+        .ui
+        .insert(
             entity,
             UiWatchSlot {
+                completion,
                 manifest_path,
                 address,
                 watch,
-                delivery,
+                sync,
             },
         );
-        world.send_async_closure(RuntimePlugin::UPDATE, move || run_ui_watch(context));
+    world.send_async_closure(RuntimePlugin::UPDATE, move || run_ui_watch(context));
+    waits
+}
+
+pub(crate) fn stop_ui_watch(
+    world: &mut World,
+    entity: core_plugin::Entity,
+) -> Vec<agent_core::AgentObservationWait> {
+    if let Some(slot) = world
+        .get_resource_mut::<SyncObservations>()
+        .unwrap()
+        .ui
+        .remove(&entity)
+    {
+        let wait = slot.completion.clone().wait();
+        drop(slot);
+        vec![wait]
+    } else {
+        vec![]
     }
 }
 async fn run_ui_watch(context: UiMonitorContext) -> Result<(), DtoAsyncError> {
     let _guard = context.guard;
+    let _completion = context.completion;
     let monitor = AssertUnwindSafe(run_driver_ui_monitor(context.monitor)).catch_unwind();
     tokio::pin!(monitor);
     let result = tokio::select! {
@@ -269,64 +292,4 @@ async fn run_ui_watch(context: UiMonitorContext) -> Result<(), DtoAsyncError> {
         return Err(DtoAsyncError(error.to_string()));
     }
     Ok(())
-}
-pub(crate) fn publish_ui(world: &mut World) {
-    let targets = world
-        .get_resource::<config_core::MargatroidConfig>()
-        .map(|config| config.backend_state().to_vec())
-        .unwrap_or_default();
-    let senders = handler::recipients(world, &targets);
-    let deliveries = world
-        .get_resource::<SyncState>()
-        .unwrap()
-        .ui
-        .iter()
-        .map(|(entity, slot)| {
-            (
-                *entity,
-                slot.delivery
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let live = senders
-        .iter()
-        .map(|(connection, _)| *connection)
-        .collect::<std::collections::BTreeSet<_>>();
-    world
-        .get_resource_mut::<SyncState>()
-        .unwrap()
-        .ui_sent
-        .retain(|(connection, _), _| live.contains(connection));
-    for (connection, sender) in senders {
-        for (entity, delivery) in &deliveries {
-            if world
-                .get_resource::<SyncState>()
-                .unwrap()
-                .ui_sent
-                .get(&(connection, *entity))
-                == Some(&delivery.key)
-            {
-                continue;
-            }
-            if sender
-                .try_send(ClientFrame::Text(delivery.frame.to_string()))
-                .is_ok()
-            {
-                world
-                    .get_resource_mut::<SyncState>()
-                    .unwrap()
-                    .ui_sent
-                    .insert((connection, *entity), delivery.key.clone());
-            } else {
-                world
-                    .get_resource::<ConnState>()
-                    .unwrap()
-                    .cancel(connection);
-                break;
-            }
-        }
-    }
 }

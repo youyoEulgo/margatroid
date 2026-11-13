@@ -34,6 +34,11 @@ impl InferencePlugin {
 
 impl Plugin for InferencePlugin {
     fn build(self, app: &mut App) {
+        if !app.world().contains_resource::<client_core::Clients>() {
+            app.world_mut()
+                .insert_resource(client_core::Clients::default());
+        }
+
         assert!(
             app.world().contains_resource::<RuntimeHandle>(),
             "RuntimePlugin required by InferencePlugin"

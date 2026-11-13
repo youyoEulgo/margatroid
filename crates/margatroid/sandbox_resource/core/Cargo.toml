@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+client_core = { path = "../../client/core" }
 core_plugin = { path = "../../../mecs/core_plugin" }
 tokio = { version = "1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }

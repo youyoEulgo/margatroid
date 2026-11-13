@@ -26,77 +26,53 @@ System分别列出处理事件、接收闭包结果、提交闭包与产出事�
 
 公开，定义于workspace_core：
 ```text
-update_workspace(context: &WorkspaceUpdateContext, change: WorkspaceChange) -> Result<WorkspaceChangeResult, WorkspaceError>
-    行为：
-        在WorkspaceDirectory更新门内校验来源及操作，提交Definitions/Register/State/Members/Failure/Remove变化并递增revision。
-        定义变动只更新候选定义，不改运行实例的definition、成员、状态，不自动启动、停止或重启。
-        状态或成员变动由各自真实生命周期入口调用本方法；原World扩展方法也只通过此入口修改。
-        同步列表同路径优先展示当前有效候选定义；源文件删除后用运行实例保留的启动定义补位，仍允许停止。
-        展示新候选定义不改运行实例执行材料；运行故障优先于定义读取故障，恢复只清对应定义故障，不覆盖真实生命周期错误。
-        失败且无新可观察状态不发布；真实错误变化属于更新；释放锁后sync.publish，直接选择当前Clients并投递。
-
-run_workspace_definition_monitor(context: WorkspaceWatchContext) -> Future<Output = Result<(), WorkspaceError>>
-    行为：
-        先挂notify观察后校验初始缓存，初始化及后续创建/修改/删除/rename按100ms安静窗口合并；忽略Access及无关文件。
-        每次有效通知在至多一个blocking worker内调用同一全量load/reload，完整校验后调用update_workspace发布；不产生ECS同步事件。
-        读取前后来源变动则继续稳定读取；重复内容不推进revision或发送，正在读取期间的新变化保留为待处理。
-        非法定义保留最后有效缓存，通过既有Workspace.error形状呈现可定位的旧条目故障；没有可用身份的新非法文件只记录诊断，不伪造列表项或新wire字段。
-        错误恢复清除错误并发布；取消后等待真实读取及notify退出，应用关停等待本监控收口。
-
-WorkspaceDefinitions：定义目录与启动数据Resource
-    entries: Arc<RwLock<BTreeMap<PathBuf, WorkspaceDefinition>>>
+WorkspaceDefinitions：Resource + Clone
+    entries: Arc<RwLock<BTreeMap<PathBuf, WorkspaceDefinition>>>--私有，不借出可变缓存
     source: Option<PathBuf>
     reload_lock: Arc<Mutex<()>>
-    updates: WorkspaceUpdateContext--定义缓存和运行投影的唯一发布入口
-    open(source: impl Into<PathBuf>, binding: WorkspaceSyncBinding) -> Result<Self, WorkspaceError>
-        行为：规范来源并拒绝symlink，记录source后调用同一reload完成首轮全量加载。
+    observer: Arc<OnceLock<DefinitionObserver>>
+    open(source: impl Into<PathBuf>) -> Result<Self, WorkspaceError>
+        行为：验证来源并首轮全量reload，失败不安装；不自动运行Workspace。
     source(&self) -> Option<&Path>
-        行为：借用已配置来源，供安装校验路径边界，不触发IO。
+    same_instance(&self, other: &Self) -> bool
     get(&self, path: &Path) -> Option<WorkspaceDefinition>
-        行为：从已发布缓存克隆定义；启动必须先reload成功并使用其返回快照。
     list(&self) -> Vec<(PathBuf, WorkspaceDefinition)>
-        行为：短读锁克隆全部已发布定义列表，不隐式执行IO。
+        行为：只读取已发布缓存，不隐式IO或建立监控。
+    observe(&self, observer: DefinitionObserver)
+        行为：运行前仅装配一次typed观察，磁盘异步监控由DTO提供。
     reload(&self) -> Result<WorkspaceDefinitionSnapshot, WorkspaceError>
-        行为：同步持有reload_lock调用load_workspace_definitions，读取source的全部Workspace定义并完整校验；异步调用方用blocking worker等待真实join。
-            成功后调用update_workspace(Definitions)原子发布entries并通知workspace.sync，返回同一次发布的不可变快照；失败经同一入口记录可观察错误并返回失败，启动不得继续使用旧值。
-            不提供按某个Workspace单独重载的入口；显式reload与启动/重启共享本方法，不改运行Entity或重启成员。
-    start_watch(&self, context: WorkspaceWatchContext) -> WorkspaceDefinitionWatch
-        行为：应用启动后为已配置来源启动一次notify监控，覆盖每个workspace.yaml及可检测新增/删除/原子替换的父目录；不是每帧创建。
-    impl Clone for WorkspaceDefinitions
-        行为：共享同一Arc，不复制缓存仓库。
-    impl Resource for WorkspaceDefinitions
-
-load_workspace_definitions(source: &Path) -> Result<BTreeMap<PathBuf, WorkspaceDefinition>, WorkspaceError>
-    行为：拒绝symlink，扫描配置根下非隐藏子目录的workspace.yaml；单文件配置来源包含该文件全部定义，排序后完整解析并验证名称；任一失败不发布。
-reject_definition_symlinks(path: &Path) -> Result<(), WorkspaceError>
-    行为：逐路径分量拒绝symlink及metadata错误，允许尚未存在的目标由后续打开步骤报告。
-
-WorldWorkspaceExt：工作区访问扩展，公开trait
+        行为：reload_lock覆盖读取、完整校验和发布；成功整体替换entries并调用observer(Ok(snapshot))，失败保留旧缓存并observer(Err(error))。
+        显式reload、启动/重启和磁盘监控共用此入口；返回不可变快照，运行实例仍保留自己启动使用的definition。
+WorkspaceDefinitionSnapshot
+    entries: Arc<BTreeMap<PathBuf, WorkspaceDefinition>>
+    get(&self, path: &Path) -> Option<&WorkspaceDefinition>
+    list(&self) -> Vec<(PathBuf, WorkspaceDefinition)>
+WorldWorkspaceExt
     workspace_definitions(&self) -> Result<&WorkspaceDefinitions, WorkspaceError>
-        行为：同步取得定义缓存能力，不执行文件IO。
     workspace_state(&self, workspace: Entity) -> Result<&WorkspaceState, WorkspaceError>
-        行为：读取目标Workspace状态。
     workspace_agents(&self, workspace: Entity) -> Result<Vec<Entity>, WorkspaceError>
-        行为：读取完整成员Entity列表。
     workspace_insert_agent(&mut self, workspace: Entity, agent: Entity) -> Result<(), WorkspaceError>
-        行为：调用update_workspace(Members)加入成员，不读取Agent领域组件。
     workspace_remove_agent(&mut self, workspace: Entity, agent: Entity) -> Result<(), WorkspaceError>
-        行为：调用update_workspace(Members)移除成员Entity。
-    impl WorldWorkspaceExt for World
+        行为：成员写入只调用update_workspace的AddMember/RemoveMember，原完整Entity校验保持。
+load_workspace_definitions(source: &Path) -> Result<BTreeMap<PathBuf, WorkspaceDefinition>, WorkspaceError>
+reject_definition_symlinks(path: &Path) -> Result<(), WorkspaceError>
+    行为：沿原路径规则加载全部workspace.yaml，拒绝不允许的symlink及不合法定义，任一错误不发布部分结果。
 ```
 
 公开，定义于workspace_plugin：
 ```text
-WorkspacePlugin：工作区编排插件，公开类型
+WorkspacePlugin
     schedule: String
     definitions: WorkspaceDefinitions
-    sync: WorkspaceSyncBinding
-    open(root: impl Into<PathBuf>, sync: WorkspaceSyncBinding) -> Result<Self, WorkspaceError>
-        行为：同步读取并校验root内全部Workspace定义；失败返回错误，成功构造插件，不创建运行Entity。
-    impl Plugin for WorkspacePlugin
+    root: Option<PathBuf>
+    file: Option<PathBuf>
+    new() -> Self
+    open(root: impl Into<PathBuf>) -> Result<Self, WorkspaceError>
+    with_schedule(self, schedule: impl Into<String>) -> Self
+    impl Default + Plugin
         build(self, app: &mut App)
-            行为：检查运行设施及必需WorkspaceSyncBinding，插入definitions及共享WorkspaceDirectory，安装既有三个生命周期System。
-                初始化完成后通过现有异步设施启动一次定义文件监控，归属应用生命周期；不增加同步System或按帧调查。
+            行为：检查运行设施及必需WorkspaceUpdateContext，安装唯一definitions Resource和既有Stop/Restart/Start三个System。
+            定义监控由DTO在其安装阶段启动一次，不隐藏在World帧轮询中。
 ```
 
 # components
@@ -105,22 +81,28 @@ WorkspacePlugin：工作区编排插件，公开类型
 
 公开：
 ```text
-Workspace：工作区运行实例，公开组件
+Workspace：Component + Clone + Debug
+    data: WorkspaceData--私有，不实现DerefMut
+    updates: WorkspaceUpdateContext
+    new(name, definition_path, project_root, state, agents, definition, updates) -> Self
+    updates(&self) -> WorkspaceUpdateContext
+    impl Deref<Target = WorkspaceData>：只读字段访问
+WorkspaceData
     name: String
     definition_path: PathBuf
     project_root: PathBuf
-    shared: Arc<WorkspaceRuntimeState>--状态、成员及故障通过统一入口修改
+    state: WorkspaceState
+    agents: BTreeSet<Entity>
     definition: Option<WorkspaceDefinition>
-    impl Component for Workspace
-    行为：身份及本次启动定义保持实例自有，异步投影从共享运行信息读取，不借用World。
-
+    error: Option<WorkspaceError>
 WorkspaceFailure(WorkspaceError)
     impl Component
-
-WorkspaceExecutor：工作区专属线程控制，公开组件
+    行为：原运行诊断组件保留，实际故障投影由统一入口同步维护。
+WorkspaceExecutor
     entry: WorkspaceExecutionEntry
     close: WorkspaceExecutionClose
-    impl Component for WorkspaceExecutor
+    impl Component
+    impl Drop：关闭外部新提交受理，不冒充真实线程退出。
 ```
 
 # events
@@ -190,6 +172,11 @@ start_workspace_system(world: &mut World)
 
 crate公开：
 ```text
+update_workspace(world: &mut World, owner: Entity, change: WorkspaceChange) -> Result<(), WorkspaceError>
+    行为：唯一修改Workspace私有data的入口，统一处理状态、成员、故障、实际启动定义；变化后释放可变借用再context.notify，DTO探针提交owned运行快照并直投Clients。
+remove_workspace(world: &mut World, owner: Entity)
+    行为：真实停止收口后销毁Entity，再通知完整目录更新；不以提前移除代替回收。
+
 handle_start_workspace(world: &mut World, request: StartWorkspace)
     行为：保留原reply，校验request.path及重复启动，创建Starting实体并提交启动闭包；全量reload后目标必须存在，本次定义用于初始化Workspace.definition。
 
@@ -268,50 +255,15 @@ MemberDiagnostic：成员诊断
 公开：
 ```text
 
-WorkspaceDirectory：共享Resource
-    inner: Arc<WorkspaceDirectoryShared>
-WorkspaceDirectoryShared
-    update_gate: Mutex<()>
-    definitions: Arc<RwLock<BTreeMap<PathBuf, WorkspaceDefinition>>>--与WorkspaceDefinitions.entries为同一缓存
-    running: RwLock<BTreeMap<Entity, Arc<WorkspaceRuntimeState>>>
-    revision: AtomicU64
-    definition_errors: RwLock<BTreeMap<PathBuf, WorkspaceError>>
-WorkspaceRuntimeState
-    data: RwLock<WorkspaceRuntimeSnapshot>--私有，统一入口更新
-WorkspaceRuntimeSnapshot
-    name: String
-    definition_path: PathBuf
-    project_root: PathBuf
-    state: WorkspaceState
-    agents: BTreeSet<Entity>
-    error: Option<WorkspaceError>
-    definition: WorkspaceDefinition--该实例实际启动定义
-    行为：访问器只提供只读值，编码无需World。
-WorkspaceUpdateContext
-    directory: Weak<WorkspaceDirectoryShared>
-    sync: SyncContext<WorkspaceSyncSnapshot>
-WorkspaceSyncSnapshot
-    definitions: Vec<(PathBuf, WorkspaceDefinition)>
-    running: Vec<WorkspaceRuntimeSnapshot>
-    definition_errors: BTreeMap<PathBuf, WorkspaceError>
+WorkspaceUpdateContext(Arc<dyn Fn(&mut World, Entity) + Send + Sync>)
+    new(publish: impl Fn(&mut World, Entity) + Send + Sync + 'static) -> Self
+    notify(&self, world: &mut World, owner: Entity)
+    impl Clone + Resource
 WorkspaceChange
-    Definitions(WorkspaceDefinitionSnapshot) | DefinitionError { path: PathBuf, error: WorkspaceError }
-    Register(WorkspaceRuntimeSnapshot) | State { workspace: Entity, state: WorkspaceState }
-    Members { workspace: Entity, agents: BTreeSet<Entity> } | Failure { workspace: Entity, error: WorkspaceError }
-    Remove(Entity)
-WorkspaceChangeResult
-    Unit | Definitions(WorkspaceDefinitionSnapshot)
-WorkspaceSyncBinding
-    directory: WorkspaceDirectory
-    updates: WorkspaceUpdateContext
-WorkspaceDefinitionWatch
-    cancel: CancellationToken
-    completion: 真实监控JoinHandle
-WorkspaceWatchContext
-    source: PathBuf
-    definitions: WorkspaceDefinitions
-    updates: WorkspaceUpdateContext
-    cancel: CancellationToken
+    State(WorkspaceState) | AddMember(Entity) | Members(BTreeSet<Entity>)
+    RemoveMember(Entity) | Failure(Option<WorkspaceError>) | Definition(WorkspaceDefinition)
+DefinitionObserver = Arc<dyn Fn(Result<WorkspaceDefinitionSnapshot, WorkspaceError>) + Send + Sync>
+    行为：全量reload成功或错误经此通知owned共享视图；pre-install读取尚未观察时不发网络消息。
 
 WorkspaceState：生命周期状态，公开枚举
     Starting

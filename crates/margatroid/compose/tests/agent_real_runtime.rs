@@ -4,7 +4,7 @@ use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
 use closure_plugin::{AppClosureExt, ClosurePlugin};
 use core_plugin::{App, Entity, World};
-use inference_core::{ActiveInference, InitInference, ModelRoute, ModelRoutes};
+use inference_core::{ActiveInference, InitInference, ModelRoute};
 use lua_runtime_core::{DriverLuaVm, LuaRuntimeConfig};
 use lua_runtime_plugin::LuaRuntimePlugin;
 use mcl_core::{MclCommand, MclInstruction, MclQueue};
@@ -24,7 +24,7 @@ use storage_plugin::StoragePlugin;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tool_core::{InitToolTasks, ToolTasks};
-use workspace_core::{Workspace, WorkspaceExecutor, WorkspaceState, spawn_workspace_executor};
+use workspace_core::{WorkspaceExecutor, WorkspaceState, spawn_workspace_executor};
 
 const PROGRAM: &str = r#"
 margatroid.driver:mcl("CREATE BLOCK conversation (messages)")
@@ -61,7 +61,7 @@ fn initialize_domains(world: &mut World) {
         .collect();
     for request in tools {
         if !world.contains_component::<ToolTasks>(request.agent) {
-            world.insert_component(request.agent, ToolTasks::default());
+            world.insert_component(request.agent, test_tasks());
         }
         if let Some(reply) = request.reply.lock().unwrap().take() {
             let _ = reply.send(Ok(()));
@@ -89,6 +89,23 @@ struct Fixture {
 impl Fixture {
     fn open(root: &Path) -> Self {
         let mut app = App::new();
+        app.world_mut()
+            .insert_resource(tool_resource_core::ToolResourceSyncBinding::new(|_| {
+                client_core::UpdateProbe::new(|_| {})
+            }));
+        app.world_mut()
+            .insert_resource(sandbox_resource_core::SandboxSyncBinding::new(|_| {
+                client_core::UpdateProbe::new(|_| {})
+            }));
+        app.world_mut()
+            .insert_resource(sandbox_resource_core::SandboxSelectionSyncBinding::new(
+                |_| client_core::UpdateProbe::new(|_| {}),
+            ));
+        app.world_mut()
+            .insert_resource(inference_core::ModelSyncBinding::new(|_| {
+                client_core::UpdateProbe::new(|_| {})
+            }));
+
         app.add_plugin(RuntimePlugin::default())
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE)
@@ -103,10 +120,10 @@ impl Fixture {
                     .unwrap(),
             )
             .add_plugin(MclPlugin::new())
-            .add_plugin(AgentPlugin::new().with_resource_roots(root))
+            .add_plugin(AgentPlugin::new(test_agent_context()).with_resource_roots(root))
             .add_system(RuntimePlugin::UPDATE, initialize_domains);
-        app.world_mut().insert_resource(ModelRoutes {
-            entries: BTreeMap::from([(
+        app.world_mut()
+            .insert_resource(inference_core::ModelRoutes::new(BTreeMap::from([(
                 "test-model".into(),
                 ModelRoute {
                     model: "test".into(),
@@ -118,20 +135,20 @@ impl Fixture {
                     thinking: None,
                     reasoning_effort: None,
                 },
-            )]),
-        });
+            )])));
         let workspace = app.world_mut().spawn();
         let directory = root.join("workspaces/demo");
         app.world_mut().insert_component(
             workspace,
-            Workspace {
-                definition: None,
-                name: "demo".into(),
-                definition_path: directory.join("workspace.yaml"),
-                project_root: root.join("project"),
-                state: WorkspaceState::Running,
-                agents: BTreeSet::new(),
-            },
+            workspace_core::Workspace::new(
+                "demo".into(),
+                directory.join("workspace.yaml"),
+                root.join("project"),
+                WorkspaceState::Running,
+                BTreeSet::new(),
+                None,
+                crate::test_workspace_context(),
+            ),
         );
         app.world_mut()
             .insert_component(workspace, spawn_workspace_executor().unwrap());
@@ -298,7 +315,7 @@ fn real_agent_restart_allows_current_driver_initialization_but_refuses_external_
     advance_until(&mut fixture.app, |world| {
         world
             .get_component::<Agent>(agent)
-            .is_some_and(|agent| agent.state == AgentState::Restarting)
+            .is_some_and(|agent| agent.state() == AgentState::Restarting)
             && world
                 .get_component::<DriverLuaVm>(agent)
                 .is_some_and(|vm| vm.instance != old)
@@ -348,7 +365,7 @@ fn real_agent_restart_allows_current_driver_initialization_but_refuses_external_
             .world()
             .get_component::<Agent>(agent)
             .unwrap()
-            .state,
+            .state(),
         AgentState::Idle
     );
     let new = fixture
@@ -427,4 +444,29 @@ fn vm_instances_and_temp_namespaces_are_fresh_across_process_restarts() {
     }
     assert_ne!(ids[0], ids[1]);
     assert!(ids.iter().all(|id| id.starts_with("driver-")));
+}
+
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
+}
+fn test_tasks() -> tool_core::ToolTasks {
+    let mut app = core_plugin::App::new();
+    let owner = app.world_mut().spawn();
+    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
+}
+
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+}
+
+fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
+    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
 }

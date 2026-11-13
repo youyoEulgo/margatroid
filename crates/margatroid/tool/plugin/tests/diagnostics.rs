@@ -3,7 +3,7 @@
 #[path = "support/storage.rs"]
 mod storage_fixture;
 
-use agent_core::{Agent, AgentState};
+use agent_core::AgentState;
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
 use closure_plugin::{AppClosureExt, ClosurePlugin};
@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 use tool_core::{InitToolTasks, ToolError, ToolExecuteRequest, ToolExecuteResponse, ToolTasks};
 use tool_plugin::ToolPlugin;
 use tool_resource_core::{read_tool, ToolEntry, Tools};
-use workspace_core::{Workspace, WorkspaceState};
+use workspace_core::WorkspaceState;
 
 struct Fixture {
     app: App,
@@ -34,31 +34,37 @@ impl Fixture {
             .add_plugin(AsyncRuntimePlugin)
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE)
-            .add_plugin(ToolPlugin::new().with_runner_path(env!("CARGO_BIN_EXE_tool_runner")));
+            .add_plugin(
+                ToolPlugin::new(crate::test_binding())
+                    .with_runner_path(env!("CARGO_BIN_EXE_tool_runner")),
+            );
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
-            Workspace {
-                definition: None,
-                name: "diagnostics".into(),
-                definition_path: root.path().join("workspace.yaml"),
-                project_root: root.path().to_owned(),
-                state: WorkspaceState::Running,
-                agents: Default::default(),
-            },
+            workspace_core::Workspace::new(
+                "diagnostics".into(),
+                root.path().join("workspace.yaml"),
+                root.path().to_owned(),
+                WorkspaceState::Running,
+                Default::default(),
+                None,
+                crate::test_workspace_context(),
+            ),
         );
         let agent = app.world_mut().spawn();
         app.world_mut().insert_component(
             agent,
-            Agent {
-                name: "diagnostic-agent".into(),
+            agent_core::Agent::new(
+                "diagnostic-agent".into(),
                 workspace,
-                state: AgentState::Working,
-                turn: Some("diagnostic-turn".into()),
-            },
+                AgentState::Working,
+                Some("diagnostic-turn".into()),
+                crate::test_agent_context(),
+            ),
         );
         storage_fixture::mount(app.world_mut(), agent, root.path());
-        app.world_mut().insert_component(agent, Tools::default());
+        app.world_mut()
+            .insert_component(agent, Tools::new(crate::test_probe()));
         let (sender, mut receiver) = oneshot::channel();
         app.world().emit_event(InitToolTasks {
             agent,
@@ -320,4 +326,28 @@ fn missing_agent_storage_rejects_tool_before_registering_a_task() {
         .unwrap()
         .list()
         .is_empty());
+}
+
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
+}
+
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+}
+
+fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
+    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
+}
+
+fn test_probe<T>() -> client_core::UpdateProbe<T> {
+    client_core::UpdateProbe::new(|_| {})
 }

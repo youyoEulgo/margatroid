@@ -108,7 +108,7 @@ pub(crate) fn load_model_routes(path: &Path) -> Result<ModelRoutes, InferenceErr
             return Err(error(Kind::InvalidModelRoute, "duplicate model route id"));
         }
     }
-    Ok(ModelRoutes { entries })
+    Ok(inference_core::ModelRoutes::new(entries))
 }
 
 fn parse_context_window(value: Option<&str>) -> Result<u64, InferenceError> {
@@ -169,9 +169,9 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
         let _ = reply.send(Err(error(Kind::AgentMissing, "Agent entity missing")));
         return;
     };
-    if agent.state != AgentState::Working
+    if agent.state() != AgentState::Working
         || request.turn.is_empty()
-        || agent.turn.as_deref() != Some(request.turn.as_str())
+        || agent.turn().as_deref() != Some(request.turn.as_str())
     {
         let _ = reply.send(Ok(InferenceResponse::empty_completed()));
         return;
@@ -224,7 +224,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
                 )
             })?;
         let agent_instance = vm.instance.clone();
-        let senders = world.client_webui_senders();
+        let clients = world.clients();
         let runtime = world
             .get_resource::<HttpRuntime>()
             .expect("inference HTTP runtime missing");
@@ -232,18 +232,23 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             http_request,
             agent_address,
             agent_instance,
-            senders,
+            clients,
+            world
+                .get_component::<Agent>(request.agent)
+                .unwrap()
+                .source_lease(),
             runtime.client.clone(),
             runtime.schedule.clone(),
         ))
     })();
-    let (http_request, agent_address, agent_instance, senders, client, schedule) = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            let _ = reply.send(Err(error));
-            return;
-        }
-    };
+    let (http_request, agent_address, agent_instance, clients, source_alive, client, schedule) =
+        match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
     let gate = Arc::new(Mutex::new(StreamGate::default()));
     let frozen = gate.clone();
     let stop_stream: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -267,7 +272,8 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             id: request_id.clone(),
             agent: agent_address,
             turn: turn.clone(),
-            senders,
+            clients,
+            source_alive,
         },
         request,
         reply: Some(reply),
@@ -827,9 +833,11 @@ fn push_full(delivery: &mut StreamDelivery, result: Result<&InferenceResponse, &
 
 fn push_frame(delivery: &mut StreamDelivery, frame: serde_json::Value) {
     if let Ok(encoded) = serde_json::to_string(&frame) {
-        delivery.senders.retain(|sender| {
-            !sender.is_closed() && sender.try_send(ClientFrame::Text(encoded.clone())).is_ok()
-        });
+        delivery.clients.send_scoped(
+            &[client_core::ClientSelector::Type("webui".into())],
+            Arc::new(ClientFrame::Text(encoded)),
+            delivery.source_alive.clone(),
+        );
     }
 }
 

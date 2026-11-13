@@ -54,7 +54,14 @@ impl WorldSandboxResourceExt for World {
         if let Some(alias) = alias.as_deref() {
             self.sandbox_path(owner, alias)?;
         }
-        self.insert_component(owner, SelectedSandbox { alias });
+        self.get_component_mut::<SelectedSandbox>(owner)
+            .ok_or_else(|| {
+                SandboxResourceError::new(
+                    SandboxResourceErrorKind::OwnerMissing,
+                    "sandbox selection context missing",
+                )
+            })?
+            .set(alias);
         Ok(())
     }
 }
@@ -157,3 +164,6 @@ pub fn read_sandbox(
     }
     Ok(SandboxInput { policy, origin })
 }
+
+pub type SandboxSyncBinding = client_core::ProbeFactory<Vec<(String, std::path::PathBuf)>>;
+pub type SandboxSelectionSyncBinding = client_core::ProbeFactory<Option<String>>;

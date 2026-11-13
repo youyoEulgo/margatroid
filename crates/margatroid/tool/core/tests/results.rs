@@ -157,9 +157,15 @@ fn execution_limits_have_lua_memory_and_buffer_budgets_and_round_trip() {
             ToolErrorKind::InvalidRequest
         );
         assert_eq!(
-            ToolTaskHandle::new(&invalid, "call".into(), "tool".into(), oneshot::channel().0)
-                .unwrap_err()
-                .kind,
+            ToolTaskHandle::new(
+                &invalid,
+                "call".into(),
+                "tool".into(),
+                oneshot::channel().0,
+                test_tasks().update_context()
+            )
+            .unwrap_err()
+            .kind,
             ToolErrorKind::InvalidRequest
         );
     }
@@ -220,4 +226,21 @@ fn errors_are_bounded_and_serializable_without_other_domains() {
         serde_json::from_value::<ToolError>(serde_json::to_value(&error).unwrap()).unwrap(),
         error
     );
+}
+
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
+}
+fn test_tasks() -> tool_core::ToolTasks {
+    let mut app = core_plugin::App::new();
+    let owner = app.world_mut().spawn();
+    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
 }

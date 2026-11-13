@@ -2694,6 +2694,20 @@ textarea:focus-visible {
   white-space: pre-wrap;
 }
 
+
+/* Terminal cells are about twice as tall as they are wide. Keeping this
+   ratio makes task TUI box-drawing rows line up like the source terminal. */
+.info-task pre {
+  /* Render every captured PTY row. The screen height is in the output itself:
+     hard-coding 24 clipped current 40-row terminals and forced inner scrolling. */
+  height: auto;
+  max-height: none;
+  line-height: 2ch;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: pre;
+}
+
 .info-task {
   border: 1px solid var(--mg-border-l1);
   border-radius: 8px;

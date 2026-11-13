@@ -99,29 +99,31 @@ impl Fixture {
         app.world_mut().insert_component(owner, storage);
         app.world_mut().insert_component(
             owner,
-            Agent {
-                name: "test".into(),
+            agent_core::Agent::new(
+                "test".into(),
                 workspace,
-                state: AgentState::Idle,
-                turn: None,
-            },
+                AgentState::Idle,
+                None,
+                crate::test_agent_context(),
+            ),
         );
         app.world_mut().insert_component(owner, MclQueue::default());
         app.world_mut().insert_component(
             owner,
-            AgentInferenceConfig {
-                parameters: InferenceParameters {
+            inference_core::AgentInferenceConfig::new(
+                InferenceParameters {
                     model: "test/model".into(),
                     temperature: Some(0.1),
                     max_output_tokens: None,
                     top_p: None,
                     stop: vec![],
                 },
-            },
+                crate::test_probe(),
+            ),
         );
         app.world_mut()
             .insert_component(owner, ActiveInference::default());
-        app.world_mut().insert_component(owner, ToolTasks::new());
+        app.world_mut().insert_component(owner, test_tasks());
         let inference = Arc::new(Mutex::new(Vec::new()));
         let recorded = inference.clone();
         let auto_inference = Arc::new(AtomicBool::new(true));
@@ -193,6 +195,10 @@ impl Fixture {
                                 request.call_id.clone(),
                                 request.alias.clone(),
                                 sender,
+                                world
+                                    .get_component::<ToolTasks>(request.agent)
+                                    .unwrap()
+                                    .update_context(),
                             )
                             .unwrap();
                             world
@@ -217,6 +223,10 @@ impl Fixture {
                     request.call_id.clone(),
                     request.alias.clone(),
                     sender,
+                    world
+                        .get_component::<ToolTasks>(request.agent)
+                        .unwrap()
+                        .update_context(),
                 )
                 .unwrap();
                 handle
@@ -270,7 +280,7 @@ impl Fixture {
                     .unwrap()
                     .push(format!("tool:{}", request.alias));
                 if !world.contains_component::<Tools>(request.owner) {
-                    world.insert_component(request.owner, Tools::new());
+                    world.insert_component(request.owner, Tools::new(crate::test_probe()));
                 }
                 world
                     .get_component_mut::<Tools>(request.owner)
@@ -292,7 +302,16 @@ impl Fixture {
                     .unwrap()
                     .push(format!("sandbox:{}", request.alias));
                 if !world.contains_component::<Sandboxes>(request.owner) {
-                    world.insert_component(request.owner, Sandboxes::new());
+                    world.insert_component(request.owner, Sandboxes::new(crate::test_probe()));
+                    if world
+                        .get_component::<sandbox_resource_core::SelectedSandbox>(request.owner)
+                        .is_none()
+                    {
+                        world.insert_component(
+                            request.owner,
+                            sandbox_resource_core::SelectedSandbox::new(None, crate::test_probe()),
+                        );
+                    }
                 }
                 world
                     .get_component_mut::<Sandboxes>(request.owner)
@@ -394,7 +413,7 @@ impl Fixture {
         if !self.app.world().contains_component::<Tools>(self.owner) {
             self.app
                 .world_mut()
-                .insert_component(self.owner, Tools::new());
+                .insert_component(self.owner, Tools::new(crate::test_probe()));
         }
         let directory = self.root.path().join("fixture-tool").join(alias);
         fs::create_dir_all(&directory).unwrap();
@@ -835,7 +854,7 @@ async fn inference_converts_legacy_message_shapes_and_preserves_unknown_stop_rea
             .world()
             .get_component::<Agent>(fixture.owner)
             .unwrap()
-            .state,
+            .state(),
         AgentState::Idle
     );
 }
@@ -951,7 +970,7 @@ async fn tool_results_preserve_order_and_return_without_waiting_for_tool_vm_end(
         .world()
         .get_component::<Agent>(fixture.owner)
         .unwrap()
-        .turn
+        .turn()
         .clone()
         .unwrap();
     let calls = json!([{"type": "assistant", "content": null, "tool_calls": [{"id": "first", "tool_name": "bash", "arguments": "{\"n\":1}"}, {"id": "hidden", "tool_name": "private", "arguments": "{}"}, {"id": "last", "tool_name": "bash", "arguments": "{\"n\":2}"}]}]);
@@ -1040,7 +1059,7 @@ async fn batch_collects_forced_abort_and_returned_background_replies_without_los
         .world()
         .get_component::<Agent>(fixture.owner)
         .unwrap()
-        .turn
+        .turn()
         .clone()
         .unwrap();
     fixture
@@ -1065,7 +1084,7 @@ async fn batch_collects_forced_abort_and_returned_background_replies_without_los
             .world()
             .get_component::<Agent>(fixture.owner)
             .unwrap()
-            .state,
+            .state(),
         AgentState::Idle
     );
     assert!(!pending.is_cleanup_complete());
@@ -1096,16 +1115,17 @@ async fn fifo_waits_for_domain_reply_while_other_agents_keep_progressing() {
         .world()
         .get_component::<Agent>(fixture.owner)
         .unwrap()
-        .workspace;
+        .workspace();
     let other = fixture.app.world_mut().spawn();
     fixture.app.world_mut().insert_component(
         other,
-        Agent {
-            name: "other".into(),
+        agent_core::Agent::new(
+            "other".into(),
             workspace,
-            state: AgentState::Idle,
-            turn: None,
-        },
+            AgentState::Idle,
+            None,
+            crate::test_agent_context(),
+        ),
     );
     let shared_storage = fixture
         .app
@@ -1199,9 +1219,8 @@ async fn ready_requires_current_self_vm_and_wake_uses_current_slot() {
     fixture
         .app
         .world_mut()
-        .get_component_mut::<Agent>(fixture.owner)
-        .unwrap()
-        .state = AgentState::Starting;
+        .agent_transition(fixture.owner, AgentState::Starting, None)
+        .unwrap();
     assert_eq!(
         fixture.command("EFFECT ready", vec![]).await.error_kind(),
         MclErrorKind::SourceInvalid
@@ -1231,9 +1250,8 @@ async fn ready_requires_current_self_vm_and_wake_uses_current_slot() {
     fixture
         .app
         .world_mut()
-        .get_component_mut::<Agent>(fixture.owner)
-        .unwrap()
-        .state = AgentState::Idle;
+        .agent_transition(fixture.owner, AgentState::Idle, None)
+        .unwrap();
     fixture.command("EFFECT wake", vec![]).await.unwrap();
     let slot = fixture
         .app
@@ -1254,7 +1272,7 @@ async fn finish_turn_reports_running_inference_and_keeps_abort_control() {
         .world()
         .get_component::<Agent>(fixture.owner)
         .unwrap()
-        .turn
+        .turn()
         .clone()
         .unwrap();
     let (release, waiting) = oneshot::channel();
@@ -1287,7 +1305,7 @@ async fn finish_turn_reports_running_inference_and_keeps_abort_control() {
             .world()
             .get_component::<Agent>(fixture.owner)
             .unwrap()
-            .state,
+            .state(),
         AgentState::Working
     );
     fixture
@@ -1317,7 +1335,7 @@ async fn finish_turn_reports_running_inference_and_keeps_abort_control() {
             .world()
             .get_component::<Agent>(fixture.owner)
             .unwrap()
-            .state,
+            .state(),
         AgentState::Idle
     );
     assert!(
@@ -1503,7 +1521,7 @@ async fn inference_error_and_finish_turn_return_values_before_cleanup_completes(
                 .world()
                 .get_component::<Agent>(fixture.owner)
                 .unwrap()
-                .state,
+                .state(),
             AgentState::Working
         );
         let mut finish = fixture.enqueue("EFFECT finish_turn", vec![]);
@@ -1517,7 +1535,7 @@ async fn inference_error_and_finish_turn_return_values_before_cleanup_completes(
                 .world()
                 .get_component::<Agent>(fixture.owner)
                 .unwrap()
-                .state,
+                .state(),
             AgentState::Working
         );
         let active = fixture
@@ -1542,8 +1560,8 @@ async fn inference_error_and_finish_turn_return_values_before_cleanup_completes(
             .world()
             .get_component::<Agent>(fixture.owner)
             .unwrap();
-        assert_eq!(agent.state, AgentState::Idle);
-        assert!(agent.turn.is_none());
+        assert_eq!(agent.state(), AgentState::Idle);
+        assert!(agent.turn().is_none());
         assert!(
             fixture
                 .app
@@ -1573,9 +1591,12 @@ async fn inference_error_does_not_finish_a_replacement_turn() {
     fixture
         .app
         .world_mut()
-        .get_component_mut::<Agent>(fixture.owner)
-        .unwrap()
-        .turn = Some("replacement".into());
+        .agent_transition(
+            fixture.owner,
+            AgentState::Working,
+            Some("replacement".into()),
+        )
+        .unwrap();
     request
         .reply
         .lock()
@@ -1599,8 +1620,8 @@ async fn inference_error_does_not_finish_a_replacement_turn() {
         .world()
         .get_component::<Agent>(fixture.owner)
         .unwrap();
-    assert_eq!(agent.state, AgentState::Working);
-    assert_eq!(agent.turn.as_deref(), Some("replacement"));
+    assert_eq!(agent.state(), AgentState::Working);
+    assert_eq!(agent.turn().as_deref(), Some("replacement"));
 }
 
 #[tokio::test]
@@ -1617,17 +1638,18 @@ async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_
             .world()
             .get_component::<Agent>(fixture.owner)
             .unwrap()
-            .workspace;
+            .workspace();
         fixture.app.world_mut().insert_component(
             workspace,
-            workspace_core::Workspace {
-                definition: None,
-                name: "bundled-driver".into(),
-                definition_path: fixture.root.path().join("workspace.yaml"),
-                project_root: fixture.root.path().to_owned(),
-                state: workspace_core::WorkspaceState::Running,
-                agents: Default::default(),
-            },
+            workspace_core::Workspace::new(
+                "bundled-driver".into(),
+                fixture.root.path().join("workspace.yaml"),
+                fixture.root.path().to_owned(),
+                workspace_core::WorkspaceState::Running,
+                Default::default(),
+                None,
+                crate::test_workspace_context(),
+            ),
         );
         let executor = workspace_core::spawn_workspace_executor().unwrap();
         let close = executor.close.clone();
@@ -1687,9 +1709,8 @@ async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_
         fixture
             .app
             .world_mut()
-            .get_component_mut::<Agent>(fixture.owner)
-            .unwrap()
-            .state = AgentState::Starting;
+            .agent_transition(fixture.owner, AgentState::Starting, None)
+            .unwrap();
         let environment = LuaEnvironment {
             globals: std::collections::BTreeMap::from([("agent_info".into(), LuaBinding::Value(LuaValue::from_json(json!({
                 "entity": {"index": fixture.owner.index(), "generation": fixture.owner.generation()},
@@ -1713,9 +1734,8 @@ async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_
         fixture
             .app
             .world_mut()
-            .get_component_mut::<Agent>(fixture.owner)
-            .unwrap()
-            .state = AgentState::Idle;
+            .agent_transition(fixture.owner, AgentState::Idle, None)
+            .unwrap();
         for (index, kind) in [
             Some(InferenceErrorKind::RequestFailed),
             Some(InferenceErrorKind::ResponseStatus),
@@ -1809,8 +1829,8 @@ async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_
                 .world()
                 .get_component::<Agent>(fixture.owner)
                 .unwrap();
-            assert_eq!(agent.state, AgentState::Working);
-            assert_eq!(agent.turn.as_deref(), Some(request.turn.as_str()));
+            assert_eq!(agent.state(), AgentState::Working);
+            assert_eq!(agent.turn().as_deref(), Some(request.turn.as_str()));
             let active = fixture
                 .app
                 .world()
@@ -1834,8 +1854,8 @@ async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_
                     .world()
                     .get_component::<Agent>(fixture.owner)
                     .unwrap();
-                if agent.state == AgentState::Idle {
-                    assert!(agent.turn.is_none());
+                if agent.state() == AgentState::Idle {
+                    assert!(agent.turn().is_none());
                     break;
                 }
                 assert!(
@@ -2017,7 +2037,7 @@ async fn all_tool_errors_return_failed_results_and_leave_turn_completion_to_driv
                 .world()
                 .get_component::<Agent>(fixture.owner)
                 .unwrap()
-                .state,
+                .state(),
             AgentState::Idle
         );
         fixture.command("EFFECT start_turn", vec![]).await.unwrap();
@@ -2082,7 +2102,7 @@ async fn tool_cleanup_failures_return_failed_messages_and_preserve_the_turn() {
                 .world()
                 .get_component::<Agent>(fixture.owner)
                 .unwrap()
-                .state,
+                .state(),
             AgentState::Working
         );
         assert!(
@@ -2176,7 +2196,7 @@ async fn mixed_tool_batch_keeps_all_calls_after_backend_and_association_failures
             .world()
             .get_component::<Agent>(fixture.owner)
             .unwrap()
-            .state,
+            .state(),
         AgentState::Working
     );
     fixture.command("EFFECT finish_turn", vec![]).await.unwrap();
@@ -2255,7 +2275,7 @@ async fn audit_persistence_failure_returns_error_and_discloses_executed_side_eff
             .world()
             .get_component::<Agent>(fixture.owner)
             .unwrap()
-            .state,
+            .state(),
         AgentState::Working
     );
     fixture
@@ -2762,4 +2782,33 @@ async fn recorded_message_sequence_survives_context_snapshot_and_restore() {
             .unwrap(),
     );
     assert_eq!(current, again);
+}
+
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
+}
+fn test_tasks() -> tool_core::ToolTasks {
+    let mut app = core_plugin::App::new();
+    let owner = app.world_mut().spawn();
+    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
+}
+
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+}
+
+fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
+    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
+}
+
+fn test_probe<T>() -> client_core::UpdateProbe<T> {
+    client_core::UpdateProbe::new(|_| {})
 }

@@ -3,8 +3,7 @@ use address::WorldAddressExt;
 use agent_core::{Agent, AgentStartParameters, WorldAgentExt};
 use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::WorldAsyncExt;
-use client_core::{Client, ClientDisconnected, ClientFrame, ConnectionId, WorldClientExt};
-use config_core::{MargatroidConfig, OutboundTarget};
+use client_core::{ClientDisconnected, ClientFrame, ConnectionId, WorldClientExt};
 use core_plugin::{Entity, World};
 use futures_util::{
     FutureExt,
@@ -14,7 +13,6 @@ use margatroid_protocol::*;
 use serde_json::{Value, json};
 use std::{
     any::Any,
-    collections::BTreeMap,
     future::Future,
     path::PathBuf,
     pin::Pin,
@@ -93,7 +91,12 @@ fn reject<T, R, E: BoundaryError>(request: Prepared<T, R, E>, failure: ProtocolE
 pub(crate) fn client(world: &World, connection: ConnectionId) -> Result<Entity, ProtocolErrorDto> {
     world
         .client_by_connection(connection)
-        .filter(|(_, c)| !c.sender.is_closed())
+        .filter(|_| {
+            world
+                .get_resource::<Clients>()
+                .and_then(|clients| clients.get(connection))
+                .is_some_and(|sender| !sender.is_closed())
+        })
         .map(|(e, _)| e)
         .ok_or_else(|| error("Unregistered", "register this connection first"))
 }
@@ -320,8 +323,8 @@ converter!(
         client_core::RegisteredClient,
         client_core::ClientError,
     >| {
-        let sender = world
-            .get_resource::<ConnState>()
+        world
+            .get_resource::<Clients>()
             .and_then(|c| c.get(r.ticket.connection))
             .ok_or_else(|| error("ConnectionMissing", "connection closed"))?;
         Ok(client_core::RegisterClient {
@@ -329,7 +332,6 @@ converter!(
             connection_id: r.ticket.connection,
             client_type: r.input.client_type.clone(),
             name: r.input.name.clone(),
-            sender,
             reply: r.reply.clone(),
         })
     }
@@ -482,12 +484,12 @@ converter!(
         client(world, r.ticket.connection)?;
         let entity = agent(world, &r.input.target.address)?;
         let a = world.get_component::<Agent>(entity).unwrap();
-        let address = projection::address(world, a.workspace)
+        let address = projection::address(world, a.workspace())
             .ok_or_else(|| error("WorkspaceMissing", "Workspace address missing"))?;
         let input = AgentInput {
             start: AgentStartDto {
                 workspace: address,
-                name: a.name.clone(),
+                name: a.name().clone(),
             },
             snapshot: r.input.snapshot.clone(),
         };
@@ -671,25 +673,6 @@ pub(crate) fn handle_abort_control(world: &mut World, event: AbortTurnControl) {
     })();
     deliver(&r.reply, result);
 }
-pub(crate) fn handle_disconnect(world: &mut World, connection: ConnectionId) {
-    world
-        .get_resource_mut::<SyncState>()
-        .unwrap()
-        .sent
-        .retain(|(id, _), _| *id != connection.get());
-}
-pub(crate) fn handle_agent_exception(world: &mut World, event: agent_core::AgentException) {
-    if world.is_alive(event.agent) {
-        world
-            .get_resource_mut::<SyncState>()
-            .unwrap()
-            .errors
-            .insert(
-                event.agent,
-                error(&format!("{:?}", event.error.kind), &event.error.message),
-            );
-    }
-}
 
 fn page_fields<T>(
     address: String,
@@ -713,7 +696,7 @@ async fn prepare_request(
     } else {
         format!("{route}.result")
     };
-    let ticket = state.connections.claim(connection, &id).ok_or_else(|| {
+    let ticket = state.clients.claim(connection, &id).ok_or_else(|| {
         frame(
             &response,
             &id,
@@ -881,139 +864,6 @@ async fn prepare_request(
         }
     }
 }
-fn enqueue(
-    world: &World,
-    connection: ConnectionId,
-    sender: &client_core::ClientSender,
-    value: Value,
-) -> bool {
-    let Ok(message) = serde_json::from_value::<ServerMessage>(value) else {
-        return false;
-    };
-    let Ok(text) = encode_server_message(&message) else {
-        return false;
-    };
-    if sender.try_send(ClientFrame::Text(text)).is_ok() {
-        true
-    } else {
-        if let Some(c) = world.get_resource::<ConnState>() {
-            c.cancel(connection);
-        }
-        false
-    }
-}
-pub(crate) fn recipients(
-    world: &World,
-    targets: &[OutboundTarget],
-) -> Vec<(ConnectionId, client_core::ClientSender)> {
-    let mut rows = BTreeMap::new();
-    for entity in world.query_with::<Client>().result() {
-        let Some(c) = world.get_component::<Client>(entity) else {
-            continue;
-        };
-        let matches = targets.iter().any(|target| match target {
-            OutboundTarget::Broadcast => true,
-            OutboundTarget::Type(kind) => &c.client_type == kind,
-            OutboundTarget::Name(name) => &c.name == name,
-        });
-        if matches && !c.sender.is_closed() {
-            rows.insert(c.connection_id, c.sender.clone());
-        }
-    }
-    rows.into_iter().collect()
-}
-pub(crate) fn handle_outbound(world: &mut World, event: WebSocketMessageSend) {
-    if event.message["type"] == "agent.ui.sync" {
-        crate::ui::publish_ui(world);
-        return;
-    }
-    let sync_targets = world
-        .get_resource::<MargatroidConfig>()
-        .map(|config| config.backend_state().to_vec())
-        .unwrap_or_default();
-    let allowed = recipients(world, &sync_targets)
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect::<std::collections::BTreeSet<_>>();
-    let Ok(message) = serde_json::from_value::<ServerMessage>(event.message) else {
-        return;
-    };
-    let Ok(text) = encode_server_message(&message) else {
-        return;
-    };
-    for (connection, sender) in recipients(world, &[event.target]) {
-        if !allowed.contains(&connection) {
-            continue;
-        }
-        if sender.try_send(ClientFrame::Text(text.clone())).is_err() {
-            world
-                .get_resource::<ConnState>()
-                .unwrap()
-                .cancel(connection);
-        }
-    }
-}
-pub(crate) fn publish_state(world: &mut World) {
-    let targets = world
-        .get_resource::<MargatroidConfig>()
-        .map(|c| c.backend_state().to_vec())
-        .unwrap_or_default();
-    let senders = recipients(world, &targets);
-    let workspaces = projection::workspaces(world);
-    let mut agents = projection::agents(world);
-    for row in &mut agents {
-        if let Ok(entity) = agent(world, &row.address) {
-            row.error = world
-                .get_resource::<SyncState>()
-                .unwrap()
-                .errors
-                .get(&entity)
-                .cloned();
-        }
-    }
-    let mut messages = vec![
-        (
-            "workspace".to_owned(),
-            json!({"type":"workspace.sync","workspaces":workspaces}),
-        ),
-        (
-            "agent".to_owned(),
-            json!({"type":"agent.sync","agents":agents}),
-        ),
-    ];
-    let entities = world.query_with::<Agent>().result();
-    for entity in &entities {
-        if let Some(v) = projection::turn(world, *entity) {
-            messages.push((
-                format!("turn:{}", v.address),
-                json!({"type":"agent.turn.sync","address":v.address,"turn":v.turn}),
-            ));
-        }
-        if let Some(v) = projection::tasks(world, *entity) {
-            messages.push((
-                format!("task:{}", v.address),
-                json!({"type":"agent.task.sync","address":v.address,"tasks":v.tasks}),
-            ));
-        }
-    }
-    for (connection, sender) in &senders {
-        for (key, value) in &messages {
-            let same = world
-                .get_resource::<SyncState>()
-                .unwrap()
-                .sent
-                .get(&(connection.get(), key.clone()))
-                == Some(value);
-            if !same && enqueue(world, *connection, sender, value.clone()) {
-                world
-                    .get_resource_mut::<SyncState>()
-                    .unwrap()
-                    .sent
-                    .insert((connection.get(), key.clone()), value.clone());
-            }
-        }
-    }
-}
 pub(crate) async fn ws_handler(
     axum::extract::State(state): axum::extract::State<DtoState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -1040,7 +890,7 @@ pub(crate) async fn ws_handler(
     if state.events.get().is_none() || state.lifetime.is_cancelled() {
         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    let Some((connection, outbound, cancel)) = state.connections.allocate() else {
+    let Some((connection, outbound, cancel)) = state.clients.allocate() else {
         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let guard = state.lifetime.track();
@@ -1063,9 +913,8 @@ struct ConnectionReservation {
 }
 impl Drop for ConnectionReservation {
     fn drop(&mut self) {
-        if self.state.connections.remove(self.connection)
-            && let Some(events) = self.state.events.get()
-        {
+        self.state.clients.remove(self.connection);
+        if let Some(events) = self.state.events.get() {
             events.send_event(ClientDisconnected {
                 connection_id: self.connection,
             });
@@ -1148,7 +997,7 @@ async fn serve_connection(
     state: DtoState,
     connection: ConnectionId,
     socket: axum::extract::ws::WebSocket,
-    mut pushes: tokio::sync::mpsc::Receiver<ClientFrame>,
+    mut pushes: client_core::ClientReceiver,
     cancel: CancellationToken,
 ) {
     use axum::extract::ws::{CloseFrame, Message};
@@ -1217,7 +1066,8 @@ async fn serve_connection(
             }
         }
     }
-    pushes.close();
+    state.clients.remove(connection);
+    pushes.close().await;
     let _ = tokio::time::timeout(
         Duration::from_millis(250),
         writer.send(Message::Close(None)),

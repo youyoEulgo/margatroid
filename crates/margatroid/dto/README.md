@@ -1,6 +1,6 @@
 # DTO
 
-本轮同步架构是目标设计，尚未实现。已实现源码先提交为e24862b；共享API资料对应当前45种网络消息，不把下面的新投递路径当作已部署行为。字段、函数及职责见[DESIGN.md](DESIGN.md)。
+本轮同步架构已实现，设计检查点为8e0ed9d，当前源码改动尚未提交。网络仍为45种消息，字段未变；运行进程需使用新构建。字段、函数和职责见[DESIGN.md](DESIGN.md)。
 
 ## 统一入口与共享槽位
 
@@ -32,7 +32,7 @@ chunk和记录不采用状态覆盖。新连接获得当前状态源的初始化
 
 注册成功把ClientIdentity原子发布到唯一槽位，World组件引用同一身份。断连先移除槽位，再做World清理；异步线程使用当前身份，不需要World借用。选出sender后连接恰好断开属于正常竞争，Closed不能恢复已结束连接。
 
-各领域在自己的更新门内提交状态及单调revision，释放领域锁再通知ClientSender。来源epoch区分Agent重启或资源替换，完整Entity及epoch只作内部归属。准备快照时读取实际版本，旧来源或旧版本不覆盖新状态。读回调只捕获Weak共享数据，避免上下文和发布索引形成Arc环。
+Task在共享更新门提交状态及revision；Agent/Workspace在World同步入口提交实际修改，DTO公共视图在短锁内更新owned值及版本，释放领域锁再通知ClientSender。来源epoch区分Agent重启或资源替换，完整Entity及epoch只作内部归属。准备快照时读取实际版本，旧来源或旧版本不覆盖新状态。读回调只捕获Weak共享数据，避免上下文和发布索引形成Arc环。
 
 按既定配置筛选：状态与持久记录使用backend_state，推理出口保持webui类别语义；匹配按ConnectionId去重。慢连接队列满或关闭时取消连接，有序增量不静默丢帧。编码/32MiB预算失败明确诊断并关闭受影响同步连接；普通查询沿原res错误返回，不能无条件重试制造忙循环。
 
@@ -46,7 +46,11 @@ DTO移除dto_sync_system以及WebSocketMessageSend、ConnState、SyncState的旧
 
 本轮不改45种wire字段，不加入VM身份，不引入HTTP Driver资源接口。具体领域类型只依赖自身core及client_core能力；DTO提供具体编码函数，compose注入typed绑定，业务plugin之间不互相依赖。
 
-## 设计验收
+## 后续独立API调整
+
+本轮共享槽位及同步入口完成后，再处理agent.message.chunk.sync累计快照提议：上游片段先进入后端唯一累积器，再把当前已到达的完整内容投递前端；生成结束仍发送full.sync用于最终校正。该项需要单独确定字段和前端替换渲染语义，当前阶段保留原增量delta，不把设计提议写成已经实现。
+
+## 验证
 
 - 没有活动帧时，磁盘变化、Task输出、Return/错误/移除及turn变化仍可到达WS。
 - 无实际更新时没有ECS同步事件、帧唤醒、SQL调查或自循环。
@@ -55,3 +59,5 @@ DTO移除dto_sync_system以及WebSocketMessageSend、ConnState、SyncState的旧
 - 大输出只有每连接每key一个待发送状态，不堆积多份完整窗口；具体增量按序、不覆盖。
 - 查询不消费脚本输出游标、不隐式订阅，UI修改不重启Lua VM，定义修改不热改运行实例。
 - 取消等待真实文件/SQL/快照worker退出；连接与来源退出后无Arc环、悬挂sender或重复清理。
+
+本轮680项Rust测试及严格workspace Clippy通过。真实WS回归覆盖无World帧的Task输出/Return/移除、Turn/资源更新、COMMIT记录、UI变化及Workspace磁盘新增/错误/恢复/删除。隔离release的四批持久Bash输出均在未查询前收到结束标记；大窗口仍以完整快照发送，高频输出的总编码/流量并未因此消除，不把队列合并等同于节流。

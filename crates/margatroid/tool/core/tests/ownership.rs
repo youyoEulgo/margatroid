@@ -16,6 +16,7 @@ fn task(
         format!("call-{id}"),
         format!("alias-{id}"),
         reply,
+        tasks.update_context(),
     )
     .unwrap();
     tasks.register(id.into(), handle.clone()).unwrap();
@@ -24,7 +25,7 @@ fn task(
 
 #[tokio::test]
 async fn cleaning_up_one_task_leaves_other_pending_and_returned_tasks_independent() {
-    let tasks = ToolTasks::new();
+    let tasks = test_tasks();
     let (owner, _) = task(&tasks, "owner");
     let (pending, mut result) = task(&tasks, "pending");
     let (returned, completed) = task(&tasks, "returned");
@@ -47,7 +48,7 @@ async fn cleaning_up_one_task_leaves_other_pending_and_returned_tasks_independen
 #[test]
 fn abort_and_return_share_one_atomic_reply() {
     for _ in 0..64 {
-        let tasks = ToolTasks::new();
+        let tasks = test_tasks();
         let (handle, mut receiver) = task(&tasks, "pending");
         let barrier = Arc::new(Barrier::new(2));
         let race = barrier.clone();
@@ -74,4 +75,21 @@ fn abort_and_return_share_one_atomic_reply() {
         assert!(handle.has_returned());
         assert_eq!(tasks.abort_unreturned(), 0);
     }
+}
+
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
+}
+fn test_tasks() -> tool_core::ToolTasks {
+    let mut app = core_plugin::App::new();
+    let owner = app.world_mut().spawn();
+    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
 }

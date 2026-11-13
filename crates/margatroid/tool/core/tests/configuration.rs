@@ -1,5 +1,5 @@
 use std::time::Duration;
-use tool_core::{ToolConfiguration, ToolExecutionLimits, ToolTaskHandle, ToolTasks};
+use tool_core::{ToolConfiguration, ToolExecutionLimits, ToolTaskHandle};
 
 #[test]
 fn configuration_has_one_lifetime_and_zero_means_unlimited() {
@@ -48,6 +48,7 @@ async fn task_lifetime_is_configured_once_and_does_not_complete_before_cleanup()
         "call".into(),
         "tool".into(),
         tokio::sync::oneshot::channel().0,
+        test_tasks().update_context(),
     )
     .unwrap();
     assert!(
@@ -63,7 +64,7 @@ async fn task_lifetime_is_configured_once_and_does_not_complete_before_cleanup()
     task.cancel();
     assert!(task.cancel_token().is_cancelled());
     assert!(!task.is_cleanup_complete());
-    ToolTasks::new().complete_cleanup("task", &task, None);
+    test_tasks().complete_cleanup("task", &task, None);
     assert!(task.is_cleanup_complete());
 }
 
@@ -74,6 +75,7 @@ async fn unlimited_task_has_no_lifetime_timer_and_can_finish() {
         "call".into(),
         "tool".into(),
         tokio::sync::oneshot::channel().0,
+        test_tasks().update_context(),
     )
     .unwrap();
     task.configure_lifetime(0).unwrap();
@@ -87,9 +89,26 @@ async fn unlimited_task_has_no_lifetime_timer_and_can_finish() {
     task.attach_task(tokio::spawn(async move {
         supervised.cancel_token().cancelled().await;
         tokio::task::yield_now().await;
-        ToolTasks::new().complete_cleanup("task", &supervised, None);
+        test_tasks().complete_cleanup("task", &supervised, None);
     }))
     .unwrap();
     task.finish().await.unwrap();
     assert!(task.is_cleanup_complete());
+}
+
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
+}
+fn test_tasks() -> tool_core::ToolTasks {
+    let mut app = core_plugin::App::new();
+    let owner = app.world_mut().spawn();
+    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
 }

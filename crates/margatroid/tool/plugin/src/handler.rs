@@ -56,7 +56,23 @@ pub(crate) fn handle_init_tool_tasks(world: &mut World, request: InitToolTasks) 
             Err(error(Kind::AgentMissing, "Agent entity missing"))
         } else {
             if !world.contains_component::<ToolTasks>(request.agent) {
-                world.insert_component(request.agent, ToolTasks::new());
+                let address = world
+                    .get_component::<address::Address>(request.agent)
+                    .map(|value| value.as_str().to_owned())
+                    .ok_or_else(|| error(Kind::AgentMissing, "Agent address missing"));
+                let Ok(address) = address else {
+                    let _ = reply.send(Err(address.unwrap_err()));
+                    return;
+                };
+                let binding = world
+                    .get_resource::<ToolPlugin>()
+                    .expect("ToolPlugin missing")
+                    .sync
+                    .clone();
+                world.insert_component(
+                    request.agent,
+                    ToolTasks::new(request.agent, address, binding),
+                );
             }
             Ok(())
         };
@@ -76,9 +92,9 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         .get_component::<Agent>(request.agent)
         .is_some_and(|agent| {
             world.is_alive(request.agent)
-                && agent.state == AgentState::Working
+                && agent.state() == AgentState::Working
                 && !request.turn.is_empty()
-                && agent.turn.as_deref() == Some(request.turn.as_str())
+                && agent.turn().as_deref() == Some(request.turn.as_str())
         });
     if !accepted {
         let _ = reply.send(Ok(tool_core::ToolExecuteResponse::aborted(
@@ -126,7 +142,7 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
             })
             .transpose()?;
         let project_root = world
-            .get_component::<Workspace>(agent.workspace)
+            .get_component::<Workspace>(agent.workspace())
             .ok_or_else(|| error(Kind::InvalidRequest, "Agent workspace is missing"))?
             .project_root
             .clone();
@@ -143,7 +159,7 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
                 )
             })?
             .clone();
-        let agent_name = agent.name.clone();
+        let agent_name = agent.name().clone();
         validate_arguments(&tool_entry.input_schema, &request.arguments)?;
         Ok((
             config,
@@ -168,6 +184,7 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         request.call_id.clone(),
         request.alias.clone(),
         reply,
+        tasks.update_context(),
     ) else {
         // Handle construction delivers its validation failure to the original reply.
         return;
@@ -1806,6 +1823,40 @@ fn parse_configuration(lua: &Lua, value: LuaValue) -> Result<ToolConfiguration, 
 }
 
 #[cfg(test)]
+fn test_binding() -> tool_core::TaskSyncBinding {
+    tool_core::TaskSyncBinding::new(
+        client_core::Clients::default(),
+        std::sync::Arc::from([]),
+        |snapshot| {
+            serde_json::to_string(&snapshot)
+                .map(|text| std::sync::Arc::new(client_core::ClientFrame::Text(text)))
+                .map_err(|_| client_core::ClientPrepareError::EncodeFailed)
+        },
+    )
+}
+#[cfg(test)]
+fn test_tasks() -> tool_core::ToolTasks {
+    let mut app = core_plugin::App::new();
+    let owner = app.world_mut().spawn();
+    tool_core::ToolTasks::new(owner, "agent:test/unit:latest".into(), test_binding())
+}
+
+#[cfg(test)]
+fn test_agent_context() -> agent_core::AgentUpdateContext {
+    agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+}
+
+#[cfg(test)]
+fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
+    workspace_core::WorkspaceUpdateContext::new(|_, _| {})
+}
+
+#[cfg(test)]
+fn test_probe<T>() -> client_core::UpdateProbe<T> {
+    client_core::UpdateProbe::new(|_| {})
+}
+
+#[cfg(test)]
 mod world_sender_tests {
     use super::*;
     use app_runtime_plugin::RuntimePlugin;
@@ -1828,18 +1879,20 @@ mod world_sender_tests {
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE);
         let agent = app.world_mut().spawn();
-        let tasks = ToolTasks::new();
+        let tasks = test_tasks();
         let (reply, _) = oneshot::channel();
         let (handle, input) = ToolTaskHandle::new(
             &ToolExecutionLimits::default(),
             "call".into(),
             "source".into(),
             reply,
+            tasks.update_context(),
         )
         .unwrap();
         tasks.register("caller".into(), handle.clone()).unwrap();
         app.world_mut().insert_component(agent, tasks.clone());
-        app.world_mut().insert_component(agent, Tools::new());
+        app.world_mut()
+            .insert_component(agent, Tools::new(test_probe()));
         let sender = Arc::new(app.world().closure_sender(RuntimePlugin::UPDATE));
         let storage_root = tempfile::tempdir().unwrap();
         let storage = storage_core::open_storage(
@@ -1940,6 +1993,7 @@ mod world_sender_tests {
             "owner-call".into(),
             "owner-alias".into(),
             reply,
+            context.tasks.update_context(),
         )
         .unwrap();
         context
@@ -1972,6 +2026,7 @@ mod world_sender_tests {
             "accepted-call".into(),
             "owned".into(),
             reply,
+            context.tasks.update_context(),
         )
         .unwrap();
         context
@@ -2034,9 +2089,14 @@ mod world_sender_tests {
             );
         }
         let (reply, _) = oneshot::channel();
-        let (cancelled_owner, _) =
-            ToolTaskHandle::new(&context.limits, "cancelled".into(), "owner".into(), reply)
-                .unwrap();
+        let (cancelled_owner, _) = ToolTaskHandle::new(
+            &context.limits,
+            "cancelled".into(),
+            "owner".into(),
+            reply,
+            context.tasks.update_context(),
+        )
+        .unwrap();
         context
             .tasks
             .register("cancelled".into(), cancelled_owner.clone())
@@ -2084,7 +2144,7 @@ mod world_sender_tests {
             .add_plugin(AsyncRuntimePlugin)
             .add_plugin(ClosurePlugin)
             .add_closure_system(RuntimePlugin::UPDATE)
-            .add_plugin(ToolPlugin::new());
+            .add_plugin(ToolPlugin::new(test_binding()));
         let root = tempfile::tempdir().unwrap();
         let agent = app.world_mut().spawn();
         let storage = storage_core::open_storage(
@@ -2096,25 +2156,27 @@ mod world_sender_tests {
         app.world_mut().insert_component(agent, storage);
         app.world_mut().insert_component(
             agent,
-            Agent {
-                name: "test".into(),
-                workspace: agent,
-                state: AgentState::Working,
-                turn: Some("turn".into()),
-            },
+            agent_core::Agent::new(
+                "test".into(),
+                agent,
+                AgentState::Working,
+                Some("turn".into()),
+                test_agent_context(),
+            ),
         );
         app.world_mut().insert_component(
             agent,
-            Workspace {
-                definition: None,
-                name: "test".into(),
-                definition_path: root.path().join("workspace.yaml"),
-                project_root: root.path().to_owned(),
-                state: WorkspaceState::Running,
-                agents: Default::default(),
-            },
+            workspace_core::Workspace::new(
+                "test".into(),
+                root.path().join("workspace.yaml"),
+                root.path().to_owned(),
+                WorkspaceState::Running,
+                Default::default(),
+                None,
+                test_workspace_context(),
+            ),
         );
-        let mut tools = Tools::new();
+        let mut tools = Tools::new(test_probe());
         tools
             .insert(
                 "test".into(),
@@ -2128,7 +2190,7 @@ mod world_sender_tests {
             )
             .unwrap();
         app.world_mut().insert_component(agent, tools);
-        let tasks = ToolTasks::new();
+        let tasks = test_tasks();
         app.world_mut().insert_component(agent, tasks.clone());
         let sender = Arc::downgrade(&app.world().get_resource::<crate::ToolRuntime>().unwrap().0);
         let (reply, mut receiver) = oneshot::channel();
