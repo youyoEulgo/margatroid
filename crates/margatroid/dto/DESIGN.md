@@ -107,7 +107,7 @@ run_record_watch(context: RecordMonitorContext) -> Future<Output = Result<(), Dt
     行为：等待实际COMMIT的watch高水位，只对新增sequence执行有界索引查询；encode_batch生成具体有序帧，Clients.send_scoped直接选择当前接收者，追齐后等待，不产出ECS同步事件。
 read_batch(storage: &AgentStorage, position: RecordWatermarks, high: RecordWatermarks) -> Result<RecordBatch, StorageError>
 encode_batch(address: &str, batch: &RecordBatch) -> Result<Vec<Arc<ClientFrame>>, DtoAsyncError>
-    行为：每类最多50条，当前高水位限定排他范围；消息full保留真实持久序号，MCL和日志过滤内部VM信息，完整编码/预算失败明确重试诊断而不重复旧记录。
+    行为：每类最多50条，当前高水位限定排他范围；有request_id的assistant由推理通道完成，记录监控跳过其网络投影但照常推进游标；非生成消息full保留真实持久序号、generation=null，MCL和日志过滤内部VM信息，完整编码/预算失败明确重试诊断而不重复旧记录。
 install_workspace_monitor(world: &mut World)
     行为：安装前已有定义和运行状态先发布，绑定同一WorkspaceDefinitions.observe回调；实际配置来源存在时建立一次watch_definitions，归属AxumLifetime。
 watch_definitions(source: PathBuf, definitions: WorkspaceDefinitions, lifetime: AxumLifetime) -> Future<Output = Result<(), String>>

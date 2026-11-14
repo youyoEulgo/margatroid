@@ -145,7 +145,19 @@ fn encode_batch(
 ) -> Result<Vec<std::sync::Arc<client_core::ClientFrame>>, DtoAsyncError> {
     let mut frames = vec![];
     for row in &batch.messages {
-        frames.push(json!({"type":"agent.message.full.sync","address":address,"turn":row.record.turn,"generation":row.record.payload.get("request_id").and_then(Value::as_str),"history_sequence":row.sequence,"message":row.record.payload,"error":null}));
+        // Generated assistant messages already finish on the inference channel.
+        // Persistence is available through history queries, not another full frame.
+        if row.record.payload.get("type").and_then(Value::as_str) == Some("assistant")
+            && row
+                .record
+                .payload
+                .get("request_id")
+                .and_then(Value::as_str)
+                .is_some()
+        {
+            continue;
+        }
+        frames.push(json!({"type":"agent.message.full.sync","address":address,"turn":row.record.turn,"generation":null,"history_sequence":row.sequence,"message":row.record.payload,"error":null}));
     }
     if !batch.mcl.is_empty() {
         frames.push(json!({"type":"agent.mcl.sync","address":address,"records":batch.mcl.iter().cloned().map(handler::mcl_record).collect::<Vec<_>>()}));

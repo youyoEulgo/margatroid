@@ -11,7 +11,6 @@ import {
   type ClientMessage,
   type HistoryMessage,
   type ServerMessage,
-  type StreamDelta,
   type ToolCall,
   type WorkspaceConfig,
   type WorkspaceInfo,
@@ -1167,18 +1166,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         abortGuards.value.delete(id);
     }
   }
-  function handleDelta(event: StreamDelta, reasoning: boolean) {
-    const state = agentStates.value.find(
-      (candidate) =>
-        candidate.agent === event.agent,
-    );
+  function handleChunk(event: Extract<ServerMessage, { type: 'agent.message.chunk.sync' }>) {
+    const state = agentStates.value.find((candidate) => candidate.agent === event.address);
     if (!state) return;
-    const key = `${event.agent}:${event.id}`;
+    const key = `${event.address}:${event.generation}`;
     if (completedStreams.has(key) || abortedStreams.has(key)) return;
     const guard = [...abortGuards.value.values()].find(
       (candidate) =>
         candidate.workspace === workspaceKey(state.workspace) &&
-        candidate.agent === event.agent,
+        candidate.agent === event.address,
     );
     if (guard) {
       guard.streamKeys.add(key);
@@ -1191,9 +1187,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       ? { ...old }
       : {
           key,
-          id: event.id,
+          id: event.generation,
           workspaceKey: workspaceKey(state.workspace),
-          agent: event.agent,
+          agent: event.address,
           role: 'assistant',
           thinking: '',
           content: '',
@@ -1212,8 +1208,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           completed: false,
           frozen: false,
         };
-    if (reasoning) message.thinking += event.content;
-    else message.content += event.content;
+    // Chunk snapshots carry the complete text so far; replace, never append.
+    message.thinking = event.reasoning;
+    message.content = event.content;
     message.lastSequence = event.sequence;
     streams.value = new Map(streams.value).set(key, message);
   }
@@ -1410,38 +1407,33 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (event.generation) {
       const key = `${event.address}:${event.generation}`;
       remember(completedStreams, key);
-      if (event.history_sequence !== null) {
-        streams.value.delete(key);
-        streams.value = new Map(streams.value);
-      } else {
-        const row = decodeMessage(event.message)[0];
-        if (row) {
-          const old = streams.value.get(key);
-          streams.value = new Map(streams.value).set(key, {
-            key,
-            id: event.generation,
-            workspaceKey: target.workspace,
-            agent: target.agent,
-            role: row.role,
-            thinking: row.thinking,
-            content: row.content,
-            toolCalls: row.toolCalls,
-            failed: row.failed || !!event.error,
-            images: row.images,
-            timestamp: old?.timestamp ?? 0,
-            kind: 'stream',
-            payload: event.message,
-            source: null,
-            messageType: event.message.type,
-            sequence: null,
-            toolCallId: row.toolCallId,
-            toolName: row.toolName,
+      const row = decodeMessage(event.message)[0];
+      if (row) {
+        const old = streams.value.get(key);
+        streams.value = new Map(streams.value).set(key, {
+          key,
+          id: event.generation,
+          workspaceKey: target.workspace,
+          agent: target.agent,
+          role: row.role,
+          thinking: row.thinking,
+          content: row.content,
+          toolCalls: row.toolCalls,
+          failed: row.failed || !!event.error,
+          images: row.images,
+          timestamp: old?.timestamp ?? Date.now(),
+          kind: 'stream',
+          payload: event.message,
+          source: null,
+          messageType: event.message.type,
+          sequence: null,
+          toolCallId: row.toolCallId,
+          toolName: row.toolName,
 
-            lastSequence: old?.lastSequence ?? -1,
-            completed: true,
-            frozen: old?.frozen ?? false,
-          });
-        }
+          lastSequence: old?.lastSequence ?? -1,
+          completed: true,
+          frozen: old?.frozen ?? false,
+        });
       }
     }
     if (event.error) addLog('ERROR', event.error.message, event.address);
@@ -1632,49 +1624,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           mergeAudits({ agent: event.address }, event.records);
         break;
       case 'agent.message.chunk.sync':
-        if (
-          (streams.value.get(`${event.address}:${event.generation}`)
-            ?.lastSequence ?? -1) >= event.sequence
-        )
-          break;
-        if (event.delta.reasoning !== undefined)
-          handleDelta(
-            {
-              id: event.generation,
-              agent: event.address,
-
-              sequence: event.sequence,
-              content: event.delta.reasoning,
-            },
-            true,
-          );
-        if (event.delta.content !== undefined) {
-          // A single chunk may contain both fields; append content within the same accepted sequence.
-          const key = `${event.address}:${event.generation}`;
-          if (event.delta.reasoning !== undefined) {
-            const stream = streams.value.get(key);
-            if (
-              stream &&
-              stream.lastSequence === event.sequence &&
-              !stream.frozen &&
-              !stream.completed
-            )
-              streams.value = new Map(streams.value).set(key, {
-                ...stream,
-                content: stream.content + event.delta.content,
-              });
-          } else
-            handleDelta(
-              {
-                id: event.generation,
-                agent: event.address,
-
-                sequence: event.sequence,
-                content: event.delta.content,
-              },
-              false,
-            );
-        }
+        handleChunk(event);
         break;
       case 'agent.message.full.sync':
         handleFull(event);

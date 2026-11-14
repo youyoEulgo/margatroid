@@ -124,7 +124,7 @@ DTO原生WebSocket读循环解析协议后投递自有DtoRequest，UPDATE转换�
 
 文本冻结与任务清理分开。已确认的provider或流错误立即经oneshot交给MCL转换为error消息，不等待后台join；正常取消在清理预算内按completed普通结束，超预算及时返回CleanupFailed。原监督任务始终保留并等待真实join，ActiveInference不提前释放，下一次重叠推理返回可见错误。清理完成后发送绑定原Agent、VM实例和request_id的内部通知，确认任务真正结束才唤醒Driver重试finish_turn；迟到通知不能唤醒替换实例。不因错误已交付就假称推理退出，超时、根关闭和reply丢失保留各自分类。
 
-结果经oneshot交回MCL，再由Driver显式history_append；累积器不直接写历史。生成分片使用agent.message.chunk.sync，字段为address、turn、generation、sequence和delta；delta含新增content或reasoning，两种内容共用同一次生成的sequence。
+结果经oneshot交回MCL，再由Driver显式history_append；累积器不直接写历史。生成分片使用agent.message.chunk.sync，字段为address、turn、generation、sequence、content和reasoning；后两者均为截至本sequence的完整累计文本。
 
 生成终态使用agent.message.full.sync，带完整内部消息、同一generation、history_sequence=null及nullable error。成功消息包含完整正文、思考、工具调用、用量和停止原因；tool_calls使用tool_name及JSON文本arguments，与MCL内部AgentMessage一致。失败消息为type=error、message及request_id，外层error使用code/message。Inference不确认落库，因此message不带持久sequence、不填history_sequence，不另发旧finished消息。
 
@@ -139,3 +139,17 @@ full不替代oneshot或真实退出证明。流/协议错误及时交付后仍�
 工具目录不按条目数或单条描述长度截断，统一受HTTP请求总字节预算约束。真实HTTP回归覆盖1024个工具、每条16KiB描述，在三种模型格式中逐条核对完整名称、描述及schema。
 
 推理受理阶段完成Tools到schema的遍历、输入校验和模型HTTP请求编码，闭包仅持已编码请求及网络、流和清理材料。未知工具名只要响应结构合法就保留，不在推理结果层按工具清单拒绝；当前Tools存在性和schema校验由工具调用受理负责。内部取消信号和错误类别保留，正常中止向调用方返回completed，不影响真实清理要求。
+
+## chunk.sync累计文本改版（已实现，尚未提交）
+
+本节对应当前工作树的接口改版，后端源码已改用累计文本；旧49c7711产物仍发送delta，前端源码按本轮范围未改。
+
+上游ProviderFragment先经接受门写入唯一ResponseAccumulator，实际正文/思考变化后，在同一临界区取得sequence、完整content及完整reasoning的owned快照，锁外发送。前端不再维护字符串累积器，每条chunk替换同generation的正文和思考；生成结束的full.sync保持原结构，负责最终校正、工具调用、usage、结束原因及错误。工具参数和usage仍正常进入后端累积器，但不单独触发文本快照。
+
+新wire删除delta，使用顶层必填content和reasoning字符串，空值为""。这是不兼容改版，不接受旧增量字段作为别名。sequence只在正文或思考实际变化时递增，中途加入可从第一条收到的累计快照直接显示当前文本，不承诺无后续变化时自动补发旧快照或断线重放。
+
+累计快照包含全部已接受文本，只改变前端出口，不改变厂商解码、消息存储和后端唯一累积器。每次克隆/编码的成本随累计文本增长，原有32MiB信封预算和慢连接规则保持，超出时不静默截断或改回增量。取消门关闭后不再接受新片段，full仍从同一冻结累积器生成。
+
+验证要求：思考与正文交错时每次含两侧累计值；拆分UTF-8不产生损坏字符；工具参数/usage不误发文本快照；丢失某个chunk后的更高sequence可直接恢复文本；重复/迟到chunk不回滚，full后chunk不能重开生成；正常、取消、错误及零文本结束沿原full；预算失败不影响后端最终结果。
+
+同一generation的full只由推理消费链路交付一次；后续历史持久化不重发该assistant，持久序号通过history查询取得。已交付生成错误后的清理超时只记诊断，继续保留真实监督，不发送第二条终态full。

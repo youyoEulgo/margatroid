@@ -461,7 +461,7 @@ async fn supervise_inference(mut context: InferenceContext) {
                 if context.reply.is_some() {
                     finish_inference(&mut context, Err(failure.clone()));
                 } else {
-                    push_full(&mut context.delivery, Err(&failure));
+                    tracing::warn!(reason=%failure,"inference cleanup exceeded budget after terminal response");
                 }
                 let _ = worker.await;
                 return Err(failure);
@@ -522,7 +522,7 @@ async fn receive_stream(
         let Some(fragment) = fragment else {
             return Ok(());
         };
-        let delta = {
+        let snapshot = {
             let mut gate = gate.lock().unwrap_or_else(|error| error.into_inner());
             if gate.closed || cancel.is_cancelled() {
                 gate.close();
@@ -530,13 +530,17 @@ async fn receive_stream(
                 return Err(error(Kind::Cancelled, "inference stream frozen"));
             }
             let delta = gate.accumulator.accept(fragment)?;
-            delta.map(|(reasoning, content)| {
+            delta.filter(|(_, text)| !text.is_empty()).map(|_| {
                 gate.sequence += 1;
-                (gate.sequence, reasoning, content)
+                StreamTextSnapshot {
+                    sequence: gate.sequence,
+                    content: gate.accumulator.content.clone(),
+                    reasoning: gate.accumulator.reasoning.clone(),
+                }
             })
         };
-        if let Some((sequence, reasoning, content)) = delta {
-            push_stream(delivery, sequence, reasoning, content);
+        if let Some(snapshot) = snapshot {
+            push_stream(delivery, snapshot);
         }
     }
 }
@@ -799,13 +803,13 @@ fn format_provider_status_error(
     error(Kind::ResponseStatus, output)
 }
 
-fn push_stream(delivery: &mut StreamDelivery, sequence: u64, reasoning: bool, content: String) {
-    let delta = if reasoning {
-        json!({"reasoning":content})
-    } else {
-        json!({"content":content})
-    };
-    let frame = json!({"type":"agent.message.chunk.sync","address":delivery.agent,"turn":delivery.turn,"generation":delivery.id,"sequence":sequence,"delta":delta});
+struct StreamTextSnapshot {
+    sequence: u64,
+    content: String,
+    reasoning: String,
+}
+fn push_stream(delivery: &mut StreamDelivery, snapshot: StreamTextSnapshot) {
+    let frame = json!({"type":"agent.message.chunk.sync","address":delivery.agent,"turn":delivery.turn,"generation":delivery.id,"sequence":snapshot.sequence,"content":snapshot.content,"reasoning":snapshot.reasoning});
     push_frame(delivery, frame);
 }
 
@@ -831,8 +835,23 @@ fn push_full(delivery: &mut StreamDelivery, result: Result<&InferenceResponse, &
     push_frame(delivery, frame);
 }
 
+const MAX_STREAM_FRAME_BYTES: usize = 32 * 1024 * 1024;
 fn push_frame(delivery: &mut StreamDelivery, frame: serde_json::Value) {
     if let Ok(encoded) = serde_json::to_string(&frame) {
+        if encoded.len() > MAX_STREAM_FRAME_BYTES {
+            if delivery
+                .source_alive
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                for (_, sender) in delivery
+                    .clients
+                    .select(&[client_core::ClientSelector::Type("webui".into())])
+                {
+                    sender.cancel();
+                }
+            }
+            return;
+        }
         delivery.clients.send_scoped(
             &[client_core::ClientSelector::Type("webui".into())],
             Arc::new(ClientFrame::Text(encoded)),

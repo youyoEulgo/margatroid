@@ -48,7 +48,7 @@ DTO移除dto_sync_system以及WebSocketMessageSend、ConnState、SyncState的旧
 
 ## 后续独立API调整
 
-本轮共享槽位及同步入口完成后，再处理agent.message.chunk.sync累计快照提议：上游片段先进入后端唯一累积器，再把当前已到达的完整内容投递前端；生成结束仍发送full.sync用于最终校正。该项需要单独确定字段和前端替换渲染语义，当前阶段保留原增量delta，不把设计提议写成已经实现。
+共享槽位及同步入口已完成，本轮已实现agent.message.chunk.sync累计快照：上游片段先提交后端唯一累积器，再发送该时刻完整文本。目标删除delta，保留address/turn/generation/sequence，使用顶层必填content、reasoning字符串，空侧为""。前端按更高sequence整体替换，不再累加；full.sync保留原结构用于最后对比、校正和完成标记。推理、协议类型、机器Schema及可执行样例已对齐；旧49c7711构建及未修改的前端/参考客户端仍采用旧增量格式，客户端需另行适配。
 
 ## 验证
 

@@ -55,7 +55,7 @@ agent.history只读取agent_messages，不混入MCL或日志。agent.mcl读取mc
 
 三类记录查询均使用排他before_sequence/after_sequence及正limit。双界要求after<before；无下界时取上界前最近一页，有下界时取区间内最早一页，返回总按sequence升序。成功响应带next_before_sequence和next_after_sequence，无对应下一页时为null；失败省略游标。日志与MCL的sync只发送新提交条目，不发全表，也不因其他状态变化重复发送旧记录；没有新增记录不发送空sync。历史与记录查询不消费数据或改变工具脚本游标。
 
-agent.message.chunk.sync使用address/turn/generation关联一次生成，delta只含新增content或reasoning；正文和思考共用该生成的分片sequence。agent.message.full.sync携带完整AgentMessage、nullable generation和history_sequence及error。它表达生成结束及完整内容，不恢复独立finished type。history_sequence为空不证明已落库；非空必须与message.sequence一致。消息同样可表达未经过chunk的用户输入、工具结果或错误，但不能把非生成消息冒充另一生成的完成。
+agent.message.chunk.sync使用address/turn/generation关联一次生成，顶层content和reasoning为必填累计字符串；正文和思考共用该生成的快照sequence。agent.message.full.sync携带完整AgentMessage、nullable generation和history_sequence及error。它表达生成结束及完整内容，不恢复独立finished type。history_sequence为空不证明已落库；非空必须与message.sequence一致。消息同样可表达未经过chunk的用户输入、工具结果或错误，但不能把非生成消息冒充另一生成的完成。
 
 mcl.execute.result的data按kind/value表达业务结果：messages、config、import、inference及block_snapshots。最后一项来自现有MCL的BlockSnapshots成功值，补齐上级早期草稿遗漏，不修改MCL语言。内部MCL Error映射success=false及error，不能继续用外层Ok包Error当网络成功。已执行但审计或交付失败时，必要提交事实可写error.details，不声称副作用从未发生，不自动重发。
 
@@ -92,3 +92,13 @@ ServerMessage的Serialize与Deserialize共同校验成功/失败分支；成功�
 Agent的sandboxes每次从该Entity的Sandboxes组件遍历，包含alias及path；sandbox来自SelectedSandbox。model由AgentInferenceConfig关联当前ModelRoutes，包含id、model、provider、api_type、context_window_tokens及可空thinking/reasoning_effort；配置或路由缺失为null。agent.req读取公共视图，sync由统一更新入口推进同一视图并投递，模型端点和凭据保留在后端。
 
 Driver UI通过agent.ui.req/res/sync交付完整资源集合。查询以Agent Address定位实际Driver来源并沿原oneshot返回；同步独立监控ui目录变化。每个文件包含相对path、media_type和标准base64 data，内容revision使用SHA-256，完整集合和资源为空、读取失败均有明确分支。三种消息已实现，共享资料的Schema、AsyncAPI及实际后端校验同步45种消息。
+
+## chunk.sync累计快照契约（已实现，尚未提交）
+
+当前工作树已实现本节契约；旧49c7711产物仍为增量格式。新agent.message.chunk.sync保留address、turn、generation、sequence，删除delta，新增顶层必填字符串content、reasoning；两者是截至该sequence的完整已接受文本，空侧为""。至少一侧非空，不用null、缺省字段或旧名兼容表达累计文本。消息类型总数仍为45，full.sync字段和持久序号语义不变。
+
+sequence是同generation文本快照顺序，前端直接替换而非拼接，跳号无需补片；同generation的重复或较小sequence忽略。full使该generation进入完成态，迟到chunk不能重开；full的正文、思考和元数据具有最终权威，失败时仍按原full.error/message表示，不把部分chunk当成功结果。
+
+Rust类型、机器Schema和可执行样例已同步，AsyncAPI引用新Schema。前端及参考客户端源码本轮未改，仍需另行适配；其独立测试不代表已支持累计协议。
+
+生成full是一次性终态，不是落库状态的两阶段推送：推理完成发送一次history_sequence=null；保存同一assistant后不再补发带持久序号的full。持久记录通过history查询关联。记录同步只负责非生成消息，generation=null，不能用普通MCL请求id推断生成关联。

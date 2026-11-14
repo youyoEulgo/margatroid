@@ -159,7 +159,7 @@ fn all_twenty_seven_server_types_round_trip_and_distinguish_sync_ids() {
         json!({"type":"agent.turn.sync","address":"agent:demo/coder","turn":null}),
         json!({"type":"agent.task.res","id":"request-1","success":true,"address":"agent:demo/coder","tasks":[]}),
         json!({"type":"agent.task.sync","address":"agent:demo/coder","tasks":[]}),
-        json!({"type":"agent.message.chunk.sync","address":"agent:demo/coder","turn":"turn-1","generation":"gen-1","sequence":1,"delta":{"reasoning":"think"}}),
+        json!({"type":"agent.message.chunk.sync","address":"agent:demo/coder","turn":"turn-1","generation":"gen-1","sequence":1,"content":"","reasoning":"think"}),
         json!({"type":"agent.message.full.sync","address":"agent:demo/coder","turn":null,"generation":null,"history_sequence":null,"message":{"type":"user","content":"hello","data":[]},"error":null}),
     ]);
     for kind in ["agent.history.res", "agent.log.res", "agent.mcl.res"] {
@@ -442,4 +442,23 @@ fn driver_ui_messages_enforce_complete_resource_and_nullable_contracts() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn cumulative_chunk_requires_complete_text_pair_and_rejects_delta() {
+    let base = json!({"type":"agent.message.chunk.sync","address":"agent:demo/coder","turn":"turn-1","generation":"gen-1","sequence":1,"content":"你好","reasoning":"思考"});
+    let message: ServerMessage = serde_json::from_value(base.clone()).unwrap();
+    assert!(encode_server_message(&message).is_ok());
+    for field in ["content", "reasoning"] {
+        let mut value = base.clone();
+        value.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<ServerMessage>(value).is_err());
+    }
+    let mut old = base.clone();
+    old["delta"] = json!({"content":"x"});
+    assert!(serde_json::from_value::<ServerMessage>(old).is_err());
+    let mut empty = base;
+    empty["content"] = json!("");
+    empty["reasoning"] = json!("");
+    assert!(serde_json::from_value::<ServerMessage>(empty).is_err());
 }

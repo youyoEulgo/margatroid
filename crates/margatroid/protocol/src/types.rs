@@ -240,7 +240,8 @@ pub enum ServerMessage {
         turn: String,
         generation: String,
         sequence: u64,
-        delta: MessageDeltaDto,
+        content: String,
+        reasoning: String,
     },
     AgentMessageFullSync {
         address: AddressDto,
@@ -460,7 +461,8 @@ enum ServerWire {
         turn: String,
         generation: String,
         sequence: u64,
-        delta: MessageDeltaDto,
+        content: String,
+        reasoning: String,
     },
     #[serde(rename = "agent.message.full.sync")]
     AgentMessageFullSync {
@@ -659,14 +661,16 @@ impl From<ServerMessage> for ServerWire {
                 turn,
                 generation,
                 sequence,
-                delta,
+                content,
+                reasoning,
             } => Self::AgentMessageChunkSync {
                 address,
 
                 turn,
                 generation,
                 sequence,
-                delta,
+                content,
+                reasoning,
             },
             ServerMessage::AgentMessageFullSync {
                 address,
@@ -874,14 +878,16 @@ impl From<ServerWire> for ServerMessage {
                 turn,
                 generation,
                 sequence,
-                delta,
+                content,
+                reasoning,
             } => Self::AgentMessageChunkSync {
                 address,
 
                 turn,
                 generation,
                 sequence,
-                delta,
+                content,
+                reasoning,
             },
             ServerWire::AgentMessageFullSync {
                 address,
@@ -1186,14 +1192,6 @@ pub struct AgentMclRecordDto {
     pub turn: Option<String>,
     pub content: String,
     pub payload: Value,
-}
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MessageDeltaDto {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

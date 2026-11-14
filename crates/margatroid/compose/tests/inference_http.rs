@@ -379,10 +379,9 @@ fn all_seven_provider_api_combinations_use_explicit_auth_endpoints_and_strict_st
             frames.push(serde_json::from_str::<Value>(&text).unwrap());
         }
         assert!(
-            frames
-                .iter()
-                .any(|frame| frame["type"] == "agent.message.chunk.sync"
-                    && frame["delta"]["content"] == "ok")
+            frames.iter().any(
+                |frame| frame["type"] == "agent.message.chunk.sync" && frame["content"] == "ok"
+            )
         );
         assert_eq!(frames.last().unwrap()["type"], "agent.message.full.sync");
         assert!(frames.iter().all(|frame| frame["generation"] == "request"
@@ -695,6 +694,19 @@ fn address_only_state_and_streams_preserve_target_through_vm_restart() {
     );
     let server = HttpServer::new(trace);
     let mut fixture = Fixture::with_dto(&server.url);
+    let storage = storage_core::open_storage(
+        &fixture.root.path().join("history.sqlite"),
+        &fixture.root.path().join("settings.toml"),
+        "",
+    )
+    .unwrap();
+    fixture
+        .app
+        .world_mut()
+        .insert_component(fixture.agent, storage.clone());
+    let waits =
+        agent_core::notify_agent_runtime(fixture.app.world_mut(), fixture.agent, false).unwrap();
+    assert!(waits.is_empty());
     let deadline = Instant::now() + Duration::from_secs(5);
     let address = loop {
         fixture.app.tick();
@@ -754,12 +766,12 @@ fn address_only_state_and_streams_preserve_target_through_vm_restart() {
         let reasoning = next_ws(&mut fixture, &runtime, &mut socket, |frame| {
             frame["generation"] == request_id
                 && frame["type"] == "agent.message.chunk.sync"
-                && frame["delta"]["reasoning"].is_string()
+                && frame["reasoning"] == "thinking"
         });
         let content = next_ws(&mut fixture, &runtime, &mut socket, |frame| {
             frame["generation"] == request_id
                 && frame["type"] == "agent.message.chunk.sync"
-                && frame["delta"]["content"].is_string()
+                && frame["content"] == "answer"
         });
         let finished = next_ws(&mut fixture, &runtime, &mut socket, |frame| {
             frame["generation"] == request_id && frame["type"] == "agent.message.full.sync"
@@ -769,13 +781,63 @@ fn address_only_state_and_streams_preserve_target_through_vm_restart() {
             assert_eq!(frame["address"], "agent:test/agent:latest");
             serde_json::from_value::<margatroid_protocol::ServerMessage>(frame.clone()).unwrap();
         }
-        assert_eq!(reasoning["delta"]["reasoning"], "thinking");
+        assert_eq!(reasoning["reasoning"], "thinking");
         assert_eq!(reasoning["sequence"], 1);
-        assert_eq!(content["delta"]["content"], "answer");
+        assert_eq!(content["content"], "answer");
         assert_eq!(content["sequence"], 2);
-        assert!(content["delta"].is_object());
+        assert!(content.get("delta").is_none());
+        assert_eq!(content["reasoning"], "thinking");
         assert!(finished.get("sequence").is_none());
         assert_eq!(finished["error"], Value::Null);
+        storage_core::execute_storage(
+            &storage,
+            storage_core::StorageOperation::AppendHistory {
+                records: vec![
+                    storage_core::HistoryRecord {
+                        source: None,
+                        turn: Some("turn".into()),
+                        kind: "message".into(),
+                        content: "answer".into(),
+                        payload: finished["message"].clone(),
+                        created_at_ms: None,
+                    },
+                    storage_core::HistoryRecord {
+                        source: None,
+                        turn: Some("turn".into()),
+                        kind: "message".into(),
+                        content: format!("persisted-{request_id}"),
+                        payload: json!({"type":"user","content":format!("persisted-{request_id}")}),
+                        created_at_ms: None,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        // The following user record is a same-batch synchronization barrier.
+        // A duplicate assistant full would precede it and must fail this test.
+        next_ws(&mut fixture, &runtime, &mut socket, |frame| {
+            assert!(
+                !(frame["type"] == "agent.message.full.sync" && frame["generation"] == request_id),
+                "persisting a generated assistant emitted a second full: {frame}"
+            );
+            frame["type"] == "agent.message.full.sync"
+                && frame["message"]["content"] == format!("persisted-{request_id}")
+        });
+        let rows = storage_core::read_message_page(
+            &storage,
+            storage_core::RecordRange {
+                after_sequence: None,
+                before_sequence: None,
+                limit: 50,
+            },
+        )
+        .unwrap();
+        assert!(
+            rows.records
+                .iter()
+                .any(|row| row.record.payload["request_id"] == request_id
+                    && row.record.payload["sequence"].as_u64() == Some(row.sequence))
+        );
         fixture.idle();
     }
     runtime.block_on(socket.close(None)).unwrap();

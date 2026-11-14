@@ -1166,6 +1166,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tool_resource_core",
+ "tracing",
  "workspace_core",
 ]
 

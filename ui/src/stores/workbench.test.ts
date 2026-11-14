@@ -165,7 +165,7 @@ function full(
     error: null,
   };
 }
-function chunk(sequence = 1, delta: Record<string, string> = { content: 'part' }) {
+function chunk(sequence = 1, content = 'part', reasoning = '') {
   return {
     type: 'agent.message.chunk.sync',
     address,
@@ -173,7 +173,8 @@ function chunk(sequence = 1, delta: Record<string, string> = { content: 'part' }
     turn: 'turn-1',
     generation: 'generation-1',
     sequence,
-    delta,
+    content,
+    reasoning,
   };
 }
 function historyRecord(sequence: number, content: string) {
@@ -550,12 +551,13 @@ test('Workspace stop uses definition path and result does not optimistically del
 test('chunk accepts shared sequence once for both reasoning and content', () => {
   const e = setup();
   try {
-    e.receive(chunk(1, { reasoning: 'think', content: 'answer' }));
-    e.receive(chunk(1, { reasoning: 'think', content: 'answer' }));
+    e.receive(chunk(1, 'answer', 'think'));
+    e.receive(chunk(1, 'answer', 'think'));
     assert.equal(e.store.visibleMessages[0]?.thinking, 'think');
     assert.equal(e.store.visibleMessages[0]?.content, 'answer');
-    e.receive(chunk(2, { content: ' more' }));
+    e.receive(chunk(3, 'answer more', 'think more'));
     assert.equal(e.store.visibleMessages[0]?.content, 'answer more');
+    assert.equal(e.store.visibleMessages[0]?.thinking, 'think more');
   } finally {
     e.cleanup();
   }
@@ -569,9 +571,46 @@ test('full replaces the matching generation and deduplicates persisted messages'
     assert.equal(e.store.visibleMessages.length, 1);
     assert.equal(e.store.visibleMessages[0]?.content, 'complete');
     assert.equal(e.store.visibleMessages[0]?.sequence, 42);
-    e.receive(chunk(3, { content: 'late' }));
+    e.receive(chunk(3, 'late'));
     assert.equal(e.store.visibleMessages.length, 1);
     assert.equal(e.store.visibleMessages[0]?.content, 'complete');
+  } finally {
+    e.cleanup();
+  }
+});
+test('persisted full after a streaming full keeps the message visible', () => {
+  const e = setup();
+  try {
+    e.receive(chunk());
+    e.receive(full(null));
+    assert.equal(e.store.visibleMessages.length, 1);
+    e.receive(full(42));
+    assert.equal(e.store.visibleMessages.length, 1);
+    assert.equal(e.store.visibleMessages[0]?.content, 'complete');
+    assert.equal(e.store.visibleMessages[0]?.sequence, 42);
+  } finally {
+    e.cleanup();
+  }
+});
+test('reasoning-only completion keeps the assistant message visible', () => {
+  const e = setup();
+  try {
+    e.receive(chunk(1, '', 'thought'));
+    e.receive({
+      ...full(42, 'generation-1', ''),
+      message: {
+        type: 'assistant',
+        sequence: 42,
+        request_id: 'generation-1',
+        content: '',
+        reasoning: 'thought',
+        tool_calls: [],
+        stop_reason: 'completed',
+      },
+    });
+    assert.equal(e.store.visibleMessages.length, 1);
+    assert.equal(e.store.visibleMessages[0]?.role, 'assistant');
+    assert.equal(e.store.visibleMessages[0]?.thinking, 'thought');
   } finally {
     e.cleanup();
   }
@@ -712,7 +751,7 @@ test('abort uses original target instance and turn and cannot accept unrelated r
     assert.deepEqual(wire.message, { address, turn: 'turn-1' });
     e.receive({ type: 'agent.turn.abort.result', id: wire.id, success: true });
     await p;
-    e.receive(chunk(2, { content: 'late' }));
+    e.receive(chunk(2, 'late'));
     assert.equal(e.store.visibleMessages[0]?.content, 'part');
     e.receive({ type: 'agent.turn.sync', address, turn: null });
     assert.equal(e.store.canAbortTurn, false);
@@ -1313,10 +1352,10 @@ test('abort failure stays frozen until current matching turn sync releases it', 
       error: { code: 'Rejected', message: 'abort rejected' },
     });
     await assert.rejects(p, /abort rejected/);
-    e.receive(chunk(2, { content: 'blocked' }));
+    e.receive(chunk(2, 'blocked'));
     assert.equal(e.store.visibleMessages[0]?.content, 'part');
     e.receive({ type: 'agent.turn.sync', address, turn: 'turn-1' });
-    e.receive(chunk(3, { content: ' resumed' }));
+    e.receive(chunk(3, 'part resumed'));
     assert.equal(e.store.visibleMessages[0]?.content, 'part resumed');
   } finally {
     e.cleanup();

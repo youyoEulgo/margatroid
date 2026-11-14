@@ -179,7 +179,7 @@ supervise_inference(context: InferenceContext) -> Future<Output = ()>
         已确认的provider或流错误立即通过原reply交付一次；
         后台继续等待worker真实join，不提前释放ActiveInference。
         用户中止且清理成功返回冻结内容的Completed结果；
-        清理预算耗尽及时返回CleanupFailed并发送完整error同步，原监督继续真实清理；若先前已交付错误则不再次回复oneshot，只对同generation发送CleanupFailed完整纠错同步。
+        清理预算耗尽及时返回CleanupFailed并发送完整error同步，原监督继续真实清理；若先前已交付终态则只记录CleanupFailed诊断并继续真实清理，不再次回复oneshot或发送第二条full。
         全部真实清理结束发送绑定Agent、VM实例和request_id的私有完成事件；
         确认监督任务已结束后才唤醒当前Driver，未结束则下一帧复查，过期事件丢弃，不自动finish_turn。
         不写历史、不执行工具、不重试推理。
@@ -194,18 +194,22 @@ receive_stream(context: StreamContext, receiver: mpsc::Receiver<ProviderFragment
     行为：
         每轮使用biased select!优先检查取消，再等待一个分片，不批量排空。
         取得分片后在接受门短锁内复检关闭状态；
-        允许才更新累积器并分配sequence。
-        仅将已接受分片送往前端；
+        允许才先调用唯一accumulator.accept(fragment)提交分片；正文或思考实际变化时推进sequence。
+        在同一接受门锁内从已提交的accumulator克隆content及reasoning完整累计文本，与sequence组成StreamTextSnapshot；尚未有内容的字段使用空字符串。
+        释放接受门锁后才调用push_stream，前端出口不再接收原始delta；工具参数/usage/终态等不改变文本的片段继续正常累积，但不单独生成文本快照。
+        同一生成的chunk按sequence保序投递，不跨generation合并；不为每次更新创建第二个累积器。
         网络发送不持锁、不阻塞接收循环。
         中止立即关闭接受门和receiver，丢弃未接受分片；
         不等待上游退出才冻结。
         正常和中止的Completed结果都从同一累积器生成，worker退出结果不得补写正文。
 
-push_stream(delivery: &mut StreamDelivery, sequence: u64, reasoning: bool, content: String)
+push_stream(delivery: &mut StreamDelivery, snapshot: StreamTextSnapshot)
     行为：
-        通过本次StreamDelivery.clients按当次共享槽位选择接收者并有界发送agent.message.chunk.sync，delta仅包含新增content或reasoning；
-        address和turn取StreamDelivery固定身份，generation取本次生成关联，sequence为同一生成共用分片序列，不作为历史序号；
-        剔除关闭及慢连接；发送失败不改变推理结果，不在此写历史或伪造history_sequence。
+        按当前Clients槽位有界发送agent.message.chunk.sync，顶层content与reasoning均为必填字符串，表示同次接受门裁决之后的累计完整文本。
+        不发送delta，不按reasoning布尔值选择某一侧单独追加；任一侧变化时两侧都随快照交付。
+        address/turn/generation保持原身份，sequence为同一生成的文本快照序号，不是历史序号，也不是上游SSE数量。
+        发送发生在累积器提交之后且接受门锁外，慢连接不阻塞累积器；超预算/Full/Closed按既有规则关闭受影响连接，不截断累计文本或回退为增量。
+        生成结束仍经push_full发送原完整消息及终态，chunk不携带半成品tool_calls、usage、stop_reason或持久序号。
 
 finish_inference(context: &mut InferenceContext, result: Result<InferenceResponse, InferenceError>)
     行为：关闭接受门，认领唯一reply时先调用push_full投影本次完整结果，再通过原oneshot发送result；不写历史或确认持久化。
@@ -257,6 +261,11 @@ StreamDelivery：前端出口，私有类型
 InferenceLaunchOutput：已将监督任务交给共享句柄的启动事实
 InferenceLaunchError：InferenceError及原回复、共享句柄关联，实现From<AsyncTaskError>
 
+StreamTextSnapshot
+    sequence: u64
+    content: String
+    reasoning: String
+    行为：只在后端唯一累积器接受正文/思考后生成的一次owned投影，不是新的长期内容源；空累计字段为""。
 StreamGate：本次流接受门
     closed: bool
     accumulator: ResponseAccumulator

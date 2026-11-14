@@ -23,6 +23,7 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
 toml = "0.8"
 
 [dev-dependencies]

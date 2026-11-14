@@ -511,16 +511,16 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
         {
             return Err(invalid("invalid generation chunk"));
         }
-        let delta = value
-            .get("delta")
-            .and_then(Value::as_object)
-            .ok_or_else(|| invalid("missing delta"))?;
-        if delta.is_empty()
-            || delta
-                .iter()
-                .any(|(k, v)| !matches!(k.as_str(), "content" | "reasoning") || !v.is_string())
-        {
-            return Err(invalid("invalid delta"));
+        let content = value
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("missing cumulative content"))?;
+        let reasoning = value
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("missing cumulative reasoning"))?;
+        if content.is_empty() && reasoning.is_empty() {
+            return Err(invalid("empty cumulative text snapshot"));
         }
     }
     if kind == "agent.message.full.sync" {

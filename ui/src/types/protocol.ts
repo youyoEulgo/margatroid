@@ -115,12 +115,6 @@ export interface LogRecord {
   fields: { name: string; value: string }[];
   spans?: string[];
 }
-export interface StreamDelta {
-  id: string;
-  agent: string;
-  sequence: number;
-  content: string;
-}
 export interface MclError {
   type: 'error';
   message: string;
@@ -316,7 +310,8 @@ export type ServerMessage =
       turn: string;
       generation: string;
       sequence: number;
-      delta: { content?: string; reasoning?: string };
+      content: string;
+      reasoning: string;
     } & AgentTarget)
   | ({
       type: 'agent.message.full.sync';
@@ -652,10 +647,8 @@ export function parseServerMessage(raw: string): ServerMessage | null {
           string(v.turn) &&
           string(v.generation) &&
           integer(v.sequence) &&
-          isRecord(v.delta) &&
-          (string(v.delta.content) || string(v.delta.reasoning)) &&
-          (v.delta.content === undefined || string(v.delta.content)) &&
-          (v.delta.reasoning === undefined || string(v.delta.reasoning));
+          string(v.content) &&
+          string(v.reasoning);
         break;
       case 'agent.message.full.sync':
         valid =

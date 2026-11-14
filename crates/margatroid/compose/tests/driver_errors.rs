@@ -12,9 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
-use workspace_core::{
-    WorkspaceExecutionClose, WorkspaceState, spawn_workspace_executor,
-};
+use workspace_core::{WorkspaceExecutionClose, WorkspaceState, spawn_workspace_executor};
 
 const CODER: &str = include_str!("../../../../resources/agent-drivers/local/coder/latest/base.lua");
 const REVIEWER: &str =

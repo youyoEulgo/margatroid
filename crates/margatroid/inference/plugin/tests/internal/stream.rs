@@ -223,7 +223,8 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
     }
     assert_eq!(sent.len(), 2);
     assert_eq!(sent[0]["type"], "agent.message.chunk.sync");
-    assert_eq!(sent[0]["delta"], json!({"content":"accepted"}));
+    assert_eq!(sent[0]["content"], "accepted");
+    assert_eq!(sent[0]["reasoning"], "");
     assert_eq!(sent[1]["type"], "agent.message.full.sync");
     assert_eq!(sent[1]["message"]["content"], "accepted");
     assert_eq!(sent[1]["message"]["stop_reason"], "completed");
@@ -283,15 +284,12 @@ async fn provider_error_replies_before_stalled_cleanup_and_retains_active_handle
     assert_eq!(full["message"]["type"], "error");
     assert_eq!(full["message"]["request_id"], "request");
     assert!(full["history_sequence"].is_null());
-    let correction = tokio::time::timeout(Duration::from_secs(4), frames.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let correction = frame_json(correction);
-    assert_eq!(correction["type"], "agent.message.full.sync");
-    assert_eq!(correction["generation"], full["generation"]);
-    assert_eq!(correction["error"]["code"], "CleanupFailed");
-    assert!(correction["history_sequence"].is_null());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(4), frames.recv())
+            .await
+            .is_err(),
+        "cleanup must not emit a second generation terminal frame"
+    );
     assert!(gate.lock().unwrap().closed);
     assert!(
         !handle.is_finished(),
@@ -1643,14 +1641,11 @@ async fn chunk_frames_share_one_generation_sequence_and_use_new_identity_fields(
     )
     .await
     .unwrap();
-    for (sequence, delta) in [
-        (1, json!({"reasoning":"thought"})),
-        (2, json!({"content":"answer"})),
-    ] {
+    for (sequence, content, reasoning) in [(1, "", "thought"), (2, "answer", "thought")] {
         let frame = frame_json(frames.recv().await.unwrap());
         assert_eq!(
             frame,
-            json!({"type":"agent.message.chunk.sync","address":"agent:test/agent:latest","turn":"turn","generation":"request","sequence":sequence,"delta":delta})
+            json!({"type":"agent.message.chunk.sync","address":"agent:test/agent:latest","turn":"turn","generation":"request","sequence":sequence,"content":content,"reasoning":reasoning})
         );
     }
     assert!(frames.try_recv().is_err());
@@ -1704,4 +1699,70 @@ async fn full_success_contains_complete_internal_assistant_without_persisted_seq
 
 fn test_agent_context() -> agent_core::AgentUpdateContext {
     agent_core::AgentUpdateContext::new(|_, _, _| Vec::new(), |_, _| {})
+}
+
+#[tokio::test]
+async fn cumulative_chunks_preserve_both_texts_across_interleaved_and_empty_fragments() {
+    let (mut delivery, mut frames) = captured_delivery();
+    let (sender, receiver) = mpsc::channel(12);
+    for fragment in [
+        ProviderFragment::Content("你".into()),
+        ProviderFragment::Reasoning("想".into()),
+        ProviderFragment::Content("".into()),
+        ProviderFragment::Content("好".into()),
+        ProviderFragment::Reasoning("好了".into()),
+        ProviderFragment::Finished(InferenceStopReason::Completed),
+    ] {
+        sender.send(fragment).await.unwrap();
+    }
+    drop(sender);
+    let gate = Arc::new(Mutex::new(StreamGate::default()));
+    receive_stream(
+        gate.clone(),
+        CancellationToken::new(),
+        &mut delivery,
+        receiver,
+    )
+    .await
+    .unwrap();
+    for (index, (content, reasoning)) in
+        [("你", ""), ("你", "想"), ("你好", "想"), ("你好", "想好了")]
+            .into_iter()
+            .enumerate()
+    {
+        let frame = frame_json(frames.recv().await.unwrap());
+        assert_eq!(frame["sequence"], index + 1);
+        assert_eq!(frame["content"], content);
+        assert_eq!(frame["reasoning"], reasoning);
+        assert!(frame.get("delta").is_none());
+    }
+    assert!(frames.try_recv().is_err());
+    let gate = gate.lock().unwrap();
+    assert_eq!(gate.sequence, 4);
+    assert_eq!(gate.accumulator.content, "你好");
+    assert_eq!(gate.accumulator.reasoning, "想好了");
+}
+
+#[test]
+fn cumulative_wire_budget_cancels_delivery_without_changing_accumulated_result() {
+    let (mut delivery, mut frames) = captured_delivery();
+    let content = "\n".repeat(MAX_STREAM_FRAME_BYTES / 2 + 1);
+    let mut gate = StreamGate::default();
+    gate.accumulator
+        .accept(ProviderFragment::Content(content.clone()))
+        .unwrap();
+    push_stream(
+        &mut delivery,
+        StreamTextSnapshot {
+            sequence: 1,
+            content: gate.accumulator.content.clone(),
+            reasoning: String::new(),
+        },
+    );
+    assert!(frames.try_recv().is_err());
+    assert!(delivery
+        .clients
+        .select(&[client_core::ClientSelector::Type("webui".into())])
+        .is_empty());
+    assert_eq!(gate.accumulator.content, content);
 }

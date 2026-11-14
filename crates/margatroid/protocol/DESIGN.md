@@ -96,7 +96,7 @@ ServerMessage：出站枚举，type之外的字段位于顶层，不包message
     AgentLogSync { address: AddressDto, records: Vec<AgentLogRecordDto> }
     AgentMclRes { id: String, success: bool, address: AddressDto, records: Option<Vec<AgentMclRecordDto>>, next_before_sequence: Option<u64>, next_after_sequence: Option<u64>, error: Option<ProtocolErrorDto> }
     AgentMclSync { address: AddressDto, records: Vec<AgentMclRecordDto> }
-    AgentMessageChunkSync { address: AddressDto, turn: String, generation: String, sequence: u64, delta: MessageDeltaDto }
+    AgentMessageChunkSync { address: AddressDto, turn: String, generation: String, sequence: u64, content: String, reasoning: String }
     AgentMessageFullSync { address: AddressDto, turn: Option<String>, generation: Option<String>, history_sequence: Option<u64>, message: AgentMessageDto, error: Option<ProtocolErrorDto> }
     MclExecuteResult { id: String, success: bool, data: Option<MclExecuteDataDto>, error: Option<ProtocolErrorDto> }
 
@@ -271,10 +271,11 @@ AgentMclRecordDto
     content: String
     payload: serde_json::Value
     行为：投影MCL审计业务字段，移除source_instance及其他内部VM标识。
-MessageDeltaDto
-    content: Option<String>
-    reasoning: Option<String>
-    行为：只表示新增片段，不能替代完整AgentMessage，不使用分片序号冒充历史序号
+AgentMessageChunkSync累计文本约束
+    content、reasoning必须同时存在且为字符串；未收到对应内容时为""，不省略、不使用null。
+    每条表示同一generation截至sequence的完整已接受文本，至少一侧非空；未知delta字段严格拒绝，不提供旧格式别名。
+    sequence用于丢弃同generation迟到或重复快照，跳号不需要补拼前缀；不冒充持久消息sequence。
+    chunk不承载工具参数增量、usage或stop_reason，完整生成结果仍由原AgentMessageFullSync交付。
 MclExecuteDataDto：按kind标记的公开枚举，各variant用value承载业务值
     Messages { value: Vec<AgentMessageDto> }
     Config { value: serde_json::Value }
