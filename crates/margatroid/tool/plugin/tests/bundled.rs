@@ -28,6 +28,7 @@ use workspace_core::WorkspaceState;
 fn imported_entry(path: &std::path::Path) -> ToolEntry {
     let tool = read_tool(path).unwrap();
     ToolEntry {
+        owner_agent: None,
         path: tool.origin,
         description: tool.description,
         input_schema: tool.input_schema,
@@ -61,6 +62,10 @@ impl Fixture {
                     .with_limits(limits),
             );
         let workspace = app.world_mut().spawn();
+        app.world_mut().insert_component(
+            workspace,
+            address::Address::new("workspace:test/unit").unwrap(),
+        );
         app.world_mut().insert_component(
             workspace,
             workspace_core::Workspace::new(

@@ -41,6 +41,10 @@ impl Fixture {
         let workspace = app.world_mut().spawn();
         app.world_mut().insert_component(
             workspace,
+            address::Address::new("workspace:test/unit").unwrap(),
+        );
+        app.world_mut().insert_component(
+            workspace,
             workspace_core::Workspace::new(
                 "diagnostics".into(),
                 root.path().join("workspace.yaml"),
@@ -97,6 +101,7 @@ impl Fixture {
             .insert(
                 alias.into(),
                 ToolEntry {
+                    owner_agent: None,
                     path: imported.origin,
                     description: imported.description,
                     input_schema: imported.input_schema,

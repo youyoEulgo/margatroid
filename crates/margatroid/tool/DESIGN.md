@@ -20,7 +20,7 @@ method(args) -> xxx
 # system    tool/plugin/src/system.rs                    工具请求路由
 # handler   tool/plugin/src/handler.rs                   同步受理与独立runner监督
 # types     tool/plugin/src/types.rs                     执行上下文及runner协议
-# types pub tool/core/src/types.rs                       工具调用、结果及预算
+# types pub tool/core/src/types.rs、lifetime.rs            工具调用、结果及生命周期
 # error     tool/core/src/error.rs                       ToolError
 ```
 
@@ -206,8 +206,8 @@ supervise_tool(context: ToolExecutionContext) -> Future<Output = ()>
         中止、错误与正常Return共用唯一回复端，不能在context另持独立可回复状态；
         缓存写入、覆盖、正常/强制Return、错误及清理移除均调用update_task；任务输入与脚本read只保留各自原语义。
         自然退出/finish/到期/中止:
-            World闭包: Tools.remove_owner(task_id)
-            删除所属工具记录不检查调用状态，不等待或取消其他ToolTask
+            TaskScope.close取出并调用精确撤销句柄；各动作排入World按alias及RegistrationId注销
+            注销不等待或取消其他已受理ToolTask；cleanup_owner等待同一World发送器上的后续屏障，确认之前撤销操作已处理
             未return则交付对应失败结果
             await VM、runner、后代、管道、临时文件真实清理
             调用统一CompleteCleanup入口移除本任务并释放缓存，直接通知完整task.sync集合变化
@@ -362,14 +362,26 @@ margatroid.driver:wait() -> HostFuture
     行为：
         仅Driver身份可用，等待原DriverWakeSlot；工具中调用明确失败
 
-margatroid.tools:register(definitions: Vec<InjectedToolDefinition>) -> Future<Output = ()>
-    行为：
-        仅工具execute阶段可用，Driver中明确失败；操作Tools记录，不操作运行任务
-        宿主固定程序path为当前资源，每项owner_task_id由调用方显式配置
-        World闭包核对当前任务仍存在且未取消，再校验整批定义和alias冲突
-        省略owner为静态工具；指定owner要求同Agent对应任务存活且未进入清理
-        整批登记，任一错误则全批不写入；不覆盖已有记录
-        指定owner结束仅移除其工具记录，不等待或取消已经受理的ToolTask
+margatroid.tools:register(registration: RegisterToolsRequest) -> Future<Output = ()>
+    行为：仅工具execute可用。注册批次指定目标Agent，每项lifetime独立指定任务；缺省Agent为当前Agent，缺省lifetime不绑定发起任务。
+        inject_tools在World闭包校验实际发起任务身份和同Workspace当前目标，原子登记完整批次；程序路径固定为当前工具资源，不接受参数指定任意程序。
+        绑定任务关闭时只撤销该批次对应注册，不取消已受理调用，不增加同步事件或监听任务。
+margatroid.workspace:agents() -> Future<Output = Vec<Value>>
+    行为：工具execute异步请求WorkspaceAgents，宿主核对实际调用任务后实时查询同Workspace成员address/name/state，不缓存启动时成员列表。
+inject_tools(context: &ToolExecutionContext, registration: RegisterToolsRequest) -> Future<Output = Result<(), ToolError>>
+    行为：逐项解析lifetime为实际TaskHandle，以其TaskScope.bind创建撤销句柄；动作捕获Weak World发送能力、完整目标Entity、alias及RegistrationId。
+        Tools.insert_registered_batch先完整校验并核对绑定可用性，再同时提交定义和凭证并发布一次；任一失败释放已建立凭证，目标无部分工具。
+cleanup_owner(context: &ToolExecutionContext) -> Future<Output = Result<(), ToolError>>
+    行为：handle.cancel关闭注册作用域并请求执行取消；在同一World队列提交屏障并等待，不扫描Tools。
+resolve_agent(world: &World, source: Entity, address: Option<&str>) -> Result<Entity, ToolError>
+    行为：规范化公开Address，定位完整当前Entity，核对其Agent和source同Workspace且未Stopping；无address使用source。
+ensure_invocation(world: &World, agent: Entity, task_id: &str, expected: &ToolTaskHandle) -> Result<(), ToolError>
+    行为：核对任务表实际句柄same_task且未取消/未清理，防止旧worker借同名新任务执行操作。
+task_target(world: &World, source: Entity, target: &TaskReference) -> Result<ToolTaskHandle, ToolError>
+workspace_agents(context: &ToolExecutionContext) -> Future<Output = Result<Value, ToolError>>
+    行为：通过既有World闭包获取当前成员；不发事件、不创建独立监控。
+task_reference(lua: &Lua, value: LuaValue) -> mlua::Result<TaskReference>
+    行为：字符串为当前Agent任务id；对象严格读取TaskReference并规范化公开Agent地址。
 
 margatroid.task:append_output(value: LuaValue) -> Future<Output = ()>
     行为：
@@ -381,9 +393,9 @@ margatroid.task:replace_output(value: LuaValue) -> Future<Output = ()>
         仅工具execute阶段可用，替换当前输出缓冲，cursor=0且replaced=true
         替换与读取共用短锁，不改变任务存活状态
 
-margatroid.task:read_output(task_id: String) -> Future<Output = TaskReadResult>
+margatroid.task:read_output(target: TaskReference | String) -> Future<Output = TaskReadResult>
     行为：
-        仅工具execute阶段可用，读取同Agent任务增量缓冲并推进cursor
+        仅工具execute阶段可用，按结构化目标读取同Workspace实际任务的增量缓冲并推进cursor
         不返回completed字段，已经finish的目标返回TaskMissing
 
 margatroid.task:return_result(value: LuaValue) -> Future<Output = ()>
@@ -391,13 +403,13 @@ margatroid.task:return_result(value: LuaValue) -> Future<Output = ()>
         仅工具execute阶段可用，原子交付原调用一次结果，不结束VM或关闭输入
         与中止共用原reply裁决，重复回复报错，成功交付后异常仍只记录日志
 
-margatroid.task:finish(task_id: String) -> Future<Output = ()>
+margatroid.task:finish(target: TaskReference | String) -> Future<Output = ()>
     行为：
         仅工具execute阶段可用，只操作同Agent任务；Driver中调用明确失败
         自身以控制退出结束Lua，由监督者真实清理；不等待自己的JoinHandle
         其他任务在真实清理并移除后才返回成功，已finish目标返回TaskMissing
 
-margatroid.task:send(task_id: String, value: LuaValue) -> Future<Output = ()>
+margatroid.task:send(target: TaskReference | String, value: LuaValue) -> Future<Output = ()>
     行为：
         仅工具execute阶段可用，向同Agent任务输入通道投递结构化值
         成功仅表示已入队，不表示目标已经处理
@@ -435,6 +447,8 @@ ToolLaunchOutput：监督任务已交给ToolTaskHandle的启动事实，不是�
 ToolLaunchError：ToolError及原请求回复/共享句柄关联，实现From<AsyncTaskError>
 
 ToolExecutionContext：单次执行材料
+    agent_address: String
+    workspace: Value--实际受理时读取的固定Workspace身份
     request: ToolExecuteRequest
     reply：唯一回复端由ToolTaskShared持有，context仅通过同一共享句柄交付
     tool_entry: ToolEntry--按当前alias找到的工具记录，包含schema、path及必要任务标记
@@ -461,10 +475,11 @@ RunnerFrame：worker到supervisor的有序协议帧，私有枚举
     Return(serde_json::Value)
     Write(serde_json::Value)
     Replace(serde_json::Value)
-    Read { request_id: String, task_id: String }
-    Send { request_id: String, task_id: String, value: serde_json::Value }
-    Finish { request_id: String, task_id: String }
-    Inject { request_id: String, definitions: Vec<InjectedToolDefinition> }--通用工具定义登记请求，不含MCP协议
+    Read { request_id: String, target: TaskReference }
+    Send { request_id: String, target: TaskReference, value: serde_json::Value }
+    Finish { request_id: String, target: TaskReference }
+    WorkspaceAgents { request_id: String }
+    Inject { request_id: String, registration: RegisterToolsRequest }--通用工具定义登记请求，不含MCP协议
     Log { request_id: String, record: AgentLogRecord }--主动日志，宿主固定可信关联并在写入完成后确认
     LuaDiagnostic { request_id: String, record: AgentLogRecord }--含原始错误、来源和traceback，只在宿主日志路径消费并确认
     InputConsumed--Lua取走输入后允许转发下一条；宿主响应读取不等待输入邮箱腾位。
@@ -491,6 +506,9 @@ TextMatch：正则匹配位置
 
 ToolContext：worker私有上下文
     agent_name: String
+    agent_address: String
+    workspace: Value--固定address/name/project_root，受理时从真实Workspace取得
+    owner_agent: Option<String>--绑定任务实际Agent公开地址
     turn: String
     source_origin: String--内部Lua程序来源，public_value不暴露该键
     task_id: String
@@ -503,7 +521,7 @@ ToolContext：worker私有上下文
     temp_dir: PathBuf
     public_value(&self, arguments: &serde_json::Value) -> Result<serde_json::Value, Error>
         行为：
-            生成只读公共上下文，kind=tool、agent_info.name为真实名称，arguments来自本次调用
+            生成只读公共上下文，kind=tool、agent_info.name/address为真实身份，arguments来自本次调用
             隐藏内部agent_name与source_origin平铺键，保留调用参数与真实路径材料
 ```
 
@@ -554,6 +572,7 @@ AgentTaskSnapshot
     tasks: Vec<ToolTaskSnapshot>
 
 ToolTaskShared：任务持有数据
+    registrations: TaskScope
     cancel: CancellationToken--存活任务取消能力；回合中止只触发原子裁决仍未return的任务，不取消已return后台任务
     task: Mutex<Option<JoinHandle<()>>>--监督任务句柄，取消时不直接abort
     shared: Mutex<ToolTaskData>--私有；只允许update_task修改同步可见字段，returned与唯一reply同锁裁决
@@ -610,6 +629,31 @@ ToolConfiguration：Lua配置函数返回的本次时间预算
         拒绝未知字段、负数及不可表示时间，不使用后端默认值。
         ToolTask保存配置确认时确定的deadline；到期取消，等待真实清理后完成。
         不另设宿主、shell或清理限时；仅configure确认后安装执行能力并调用execute。
+TaskScope(Arc<ScopeInner>)：Clone + Default + Debug
+    bind(&self, revoke: impl FnOnce() + Send + 'static) -> Result<TaskBinding, ToolError>
+        行为：同一短锁检查closed及登记动作；不存在轮询或常驻等待任务。
+    close(&self)
+        行为：锁内一次关闭并take登记集合，锁外调用撤销动作。
+    availability(&self) -> Box<dyn Fn() -> bool + Send + Sync>
+        行为：只捕获Weak作用域，查询时检查实际任务仍存在且未关闭；不负责清理。
+    is_closed(&self) -> bool
+ScopeInner
+    state: Mutex<ScopeState>
+    impl Drop：实际任务共享对象释放的兜底路径调用剩余撤销动作。
+ScopeState
+    closed: bool
+    registrations: BTreeMap<u64, Box<dyn FnOnce() + Send>>
+TaskBinding
+    scope: Weak<ScopeInner>
+    id: u64
+    impl Drop：从任务作用域移除本项，不持有任务或World强引用。
+ToolTaskHandle
+    registration_scope(&self) -> TaskScope
+    close_registrations(&self)
+    same_task(&self, other: &Self) -> bool
+    行为：cancel/complete_cleanup关闭作用域，Return不关闭；物理清理与撤销登记分开收口。
+
+
 ```
 
 # error
@@ -628,6 +672,7 @@ ToolErrorKind：错误类别，公开枚举
     ReadFailed | Closed | SubmitFailed | SandboxUnavailable | RunnerStartFailed
     RunnerProtocolFailed | ExecutionFailed | OutputTooLarge | Timeout | Cancelled
     TaskPanicked | CleanupFailed | AlreadyReturned | MissingReturn | InputClosed | InputFull | LogFailed
+
 ```
 
 # 持有关系
@@ -640,7 +685,8 @@ Agent Entity
 │   ├── TaskUpdateContext → 同一Clients Arc槽位
 │   └── TaskSetShared → BTreeMap<task_id, ToolTaskHandle>
 │       ├── 输出缓存、cursor、return状态与唯一结果回复端
-│       └── Lua输入通道
+│       ├── Lua输入通道
+│       └── TaskScope → 精确注册撤销动作（Weak World）
 └── Sandboxes与SelectedSandbox（sandbox_resource_core）
 
 mecs全局异步设施

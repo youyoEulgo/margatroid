@@ -210,6 +210,7 @@ impl Fixture {
             );
         }
         let workspace = app.world_mut().spawn();
+        app.world_mut().insert_component(workspace,address::Address::new("workspace:test/unit").unwrap());
         app.world_mut()
             .insert_component(workspace, Address::new("workspace:local/demo").unwrap());
         app.world_mut().insert_component(
@@ -506,7 +507,7 @@ fn every_inference_uses_all_current_tool_entries() {
         .world_mut()
         .get_component_mut::<Tools>(fixture.agent)
         .unwrap()
-        .remove_owner("dynamic-owner");
+        .remove("second");
     fixture.run(request, reply).unwrap();
     let (_, _, body) = server
         .received

@@ -12,12 +12,14 @@ use tool_core::{
     ToolConfiguration, ToolError, ToolExecuteRequest, ToolExecutionLimits, ToolTaskHandle,
     ToolTasks,
 };
-use tool_resource_core::{InjectedToolDefinition, ToolEntry};
+use tool_resource_core::{RegisterToolsRequest, TaskReference, ToolEntry};
 
 pub(crate) struct ToolExecutionContext {
     pub request: ToolExecuteRequest,
     pub storage: storage_core::AgentStorage,
     pub agent_name: String,
+    pub agent_address: String,
+    pub workspace: Value,
     pub diagnostic_received: bool,
     pub tool_entry: ToolEntry,
     pub world: std::sync::Weak<WorldClosureSender>,
@@ -43,6 +45,10 @@ pub(crate) struct RunnerRequest {
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ToolContext {
     pub agent_name: String,
+    pub agent_address: String,
+    pub workspace: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_agent: Option<String>,
     pub turn: String,
     pub source_origin: String,
     pub task_id: String,
@@ -67,7 +73,7 @@ impl ToolContext {
             context.insert("kind".into(), Value::String("tool".into()));
             context.insert(
                 "agent_info".into(),
-                serde_json::json!({"name": self.agent_name}),
+                serde_json::json!({"name": self.agent_name,"address":self.agent_address}),
             );
         }
         Ok(value)
@@ -108,20 +114,23 @@ pub(crate) enum RunnerFrame {
     },
     Read {
         request_id: String,
-        task_id: String,
+        target: TaskReference,
     },
     Send {
         request_id: String,
-        task_id: String,
+        target: TaskReference,
         value: Value,
     },
     Finish {
         request_id: String,
-        task_id: String,
+        target: TaskReference,
     },
     Inject {
         request_id: String,
-        definitions: Vec<InjectedToolDefinition>,
+        registration: RegisterToolsRequest,
+    },
+    WorkspaceAgents {
+        request_id: String,
     },
     InputConsumed,
     Done {

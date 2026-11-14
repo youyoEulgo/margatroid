@@ -65,7 +65,7 @@ mod linux {
             tools
                 .insert(
                     "mcp_register".into(),
-                    ToolEntry {
+                    ToolEntry { owner_agent:None,
                         path: imported.origin,
                         description: imported.description,
                         input_schema: imported.input_schema,
@@ -81,6 +81,7 @@ mod linux {
                 .add_closure_system(RuntimePlugin::UPDATE)
                 .add_plugin(ToolPlugin::new(crate::test_binding()).with_runner_path(std::env::current_exe().unwrap()));
             let workspace = app.world_mut().spawn();
+            app.world_mut().insert_component(workspace,address::Address::new("workspace:test/mcp").unwrap());
             app.world_mut().insert_component(
                 workspace,
                 workspace_core::Workspace::new("mcp-integration".into(), root.path().join("workspace.yaml"), root.path().to_owned(), WorkspaceState::Running, BTreeSet::new(), None, crate::test_workspace_context()),

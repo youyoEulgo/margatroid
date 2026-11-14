@@ -48,6 +48,7 @@ impl Drop for Fixture {
 
 fn entry(path: &str, owner: Option<&str>) -> ToolEntry {
     ToolEntry {
+        owner_agent: None,
         path: PathBuf::from(path),
         description: "sample".into(),
         input_schema: serde_json::json!({"type":"object"}),
@@ -75,7 +76,7 @@ fn records_reject_conflicts_and_borrow_without_io() {
             .collect::<Vec<_>>(),
         ["a", "z"]
     );
-    entries.remove_owner("task-a");
+    entries.remove("a");
     assert!(entries.get("a").is_none());
     let mut world = World::new();
     let owner = world.spawn();
@@ -110,7 +111,10 @@ fn batches_validate_every_record_before_atomic_publication() {
     entries
         .insert("existing".into(), entry("/missing/existing", None))
         .unwrap();
-    let original = entries.clone();
+    let original = entries
+        .iter()
+        .map(|(a, e)| (a.clone(), e.clone()))
+        .collect::<Vec<_>>();
     for aliases in [["new", "existing"], ["new", "new"]] {
         assert_eq!(
             entries
@@ -124,7 +128,13 @@ fn batches_validate_every_record_before_atomic_publication() {
                 .kind,
             Kind::AliasConflict
         );
-        assert_eq!(entries, original);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(a, e)| (a.clone(), e.clone()))
+                .collect::<Vec<_>>(),
+            original
+        );
     }
     let mut invalid = Vec::new();
     let mut item = entry("relative", None);
@@ -153,7 +163,13 @@ fn batches_validate_every_record_before_atomic_publication() {
                 .kind,
             kind
         );
-        assert_eq!(entries, original);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(a, e)| (a.clone(), e.clone()))
+                .collect::<Vec<_>>(),
+            original
+        );
     }
     entries
         .insert_batch(vec![
@@ -161,7 +177,7 @@ fn batches_validate_every_record_before_atomic_publication() {
             ("other".into(), entry("/missing/tool", Some("task-b"))),
         ])
         .unwrap();
-    entries.remove_owner("task-a");
+    entries.remove("dynamic");
     assert!(entries.get("dynamic").is_none());
     assert!(entries.get("other").is_some());
     assert!(entries.get("existing").is_some());
@@ -306,4 +322,55 @@ fn required_files_cannot_follow_symlinks_outside_entry_directory() {
 
 fn test_probe<T>() -> client_core::UpdateProbe<T> {
     client_core::UpdateProbe::new(|_| {})
+}
+
+#[test]
+fn revocation_targets_exact_registration_and_releases_binding_guards() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct Guard(Arc<AtomicUsize>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut tools = Tools::new(test_probe());
+    let old = workspace_registration_id();
+    tools
+        .insert_registered_batch(
+            vec![("alias".into(), entry("/tool/old", Some("owner")))],
+            vec![(
+                "alias".into(),
+                old,
+                Box::new(Guard(dropped.clone())),
+                Box::new(|| true),
+            )],
+        )
+        .unwrap();
+    tools.remove("alias");
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    let current = workspace_registration_id();
+    tools
+        .insert_registered_batch(
+            vec![("alias".into(), entry("/tool/current", Some("owner")))],
+            vec![(
+                "alias".into(),
+                current,
+                Box::new(Guard(dropped.clone())),
+                Box::new(|| true),
+            )],
+        )
+        .unwrap();
+    tools.revoke("alias", old);
+    assert!(tools.get("alias").is_some());
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    tools.revoke("alias", current);
+    assert!(tools.get("alias").is_none());
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+}
+fn workspace_registration_id() -> tool_resource_core::RegistrationId {
+    tool_resource_core::RegistrationId::fresh()
 }

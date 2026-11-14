@@ -186,7 +186,7 @@ local function register_skill(arguments, context)
     local files = inventory(root)
     local paths = {}
     for _, file in ipairs(files) do paths[#paths + 1] = file.path end
-    margatroid.tools:register({ {
+    margatroid.tools:register({tools={ {
         alias = meta.name,
         description = meta.description,
         input_schema = {
@@ -198,8 +198,8 @@ local function register_skill(arguments, context)
             additionalProperties = false,
         },
         binding = { kind = "skill", skill_md = skill_md, files = files },
-    } })
-    -- Static aliases survive this short task's finish without owner_task_id.
+    } }})
+    -- Static aliases survive this short task's finish without a task lifetime.
     return margatroid.data:encode("json", { alias = meta.name, skill_md = skill_md, files = files })
 end
 

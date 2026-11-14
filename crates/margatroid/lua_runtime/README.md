@@ -33,7 +33,7 @@ mcl调用的参数校验、reply丢失和非VM取消错误作为MclValue::Error�
 数组与对象分别转换，嵌套空数组保留数组身份；拒绝无法表示的混合键和稀疏数组。require只解析注入模块。标准库选择及内存、源码、指令检查预算由LuaRuntimeConfig指定；Full和Safe均不表示进程沙箱。
 
 
-根对象仅提供context、log和wait_any，以及files、data、text、process、driver、tools、task只读子对象。arguments放进context，null放进data，不公开version。Driver使用driver:mcl、driver:wait，tools:register与task的方法在Driver中明确返回执行身份错误，不创建伪工具任务；工具中的driver方法同样拒绝。公共方法保留各执行环境真实的沙箱、资源所有权及阶段策略，统一定义不表示两者拥有相同系统权限。公共进程方法必须绑定当前VM或ToolTask的清理能力，缺少能力时明确拒绝，不能借统一对象脱离对应VM或ToolTask的退出回收职责；Lua内存配置只限制VM分配器，不限制外部进程。
+根对象仅提供context、log和wait_any，以及files、data、text、process、driver、tools、task、workspace只读子对象。arguments放进context，null放进data，不公开version。Driver使用driver:mcl、driver:wait，tools:register与task的方法在Driver中明确返回执行身份错误，不创建伪工具任务；工具中的driver方法同样拒绝。公共方法保留各执行环境真实的沙箱、资源所有权及阶段策略，统一定义不表示两者拥有相同系统权限。公共进程方法必须绑定当前VM或ToolTask的清理能力，缺少能力时明确拒绝，不能借统一对象脱离对应VM或ToolTask的退出回收职责；Lua内存配置只限制VM分配器，不限制外部进程。
 
 主动margatroid:log(level,message,details)及自动故障写入AgentStorage的agent_logs。Driver插件在启动handler克隆当前Agent存储句柄到执行上下文，不给StartDriverLuaVm增加事件字段。脚本编译/加载及主入口未处理错误由宿主捕获一次；记录原始错误、traceback、程序来源、阶段和当前实例后，再沿既有退出流程报告简洁错误。日志不追加会话、不触发推理、不另发退出事件，取消及正常结束不作为脚本故障。Storage core方法通过spawn_blocking和真实join完成写入，停止及退出通知之前等待已提交的诊断处理完成。
 
@@ -41,3 +41,5 @@ Driver自己在回合边界pcall处理掉的错误不会再次被入口自动捕
 
 
 文件类工具不再启动shell-client。files:info合并属性和实际路径查询，files:list提供直接子项及相同元数据，显式create_directory负责父目录创建。files:matches提供真实glob路径匹配，text:search提供通用正则位置，目录递归、忽略规则与结果展示仍属于Lua工具。文件读写保留原始字节和各自执行边界，不改变Driver与Tool的生命周期或任务内存归属。Bash和终端仍通过process:start使用shell-client。完整方法签名和行为见Tool设计的Lua宿主对象板块。
+
+本轮已实现：Lua工具注册使用{agent?, tools}，每项lifetime={agent?, task_id}独立指定任务生命周期；后端任务持有精确撤销句柄，关闭拒绝新绑定并主动注销，Return不关闭，不终止已受理工具调用。跨Agent操作限当前Workspace，环境提供workspace固定信息与实时agents查询。具体Rust接口已对齐设计，不新增System或同步事件。

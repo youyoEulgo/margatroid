@@ -64,7 +64,7 @@ end
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
     send(&mut input,json!({"protocol_version":1,"program":program,"arguments":{},
-        "context":{"agent_name":"fixture","turn":"turn","source_origin":"fixture.lua","task_id":"memory","call_id":"call","alias":"memory","resource_dir":root.path(),"project_root":root.path(),"temp_dir":root.path()},
+        "context":{"agent_address":"agent:test/fixture","workspace":{"address":"workspace:test/unit","name":"test","project_root":"/tmp"},"owner_agent":null,"agent_name":"fixture","turn":"turn","source_origin":"fixture.lua","task_id":"memory","call_id":"call","alias":"memory","resource_dir":root.path(),"project_root":root.path(),"temp_dir":root.path()},
         "limits":ToolExecutionLimits{lua_vm_memory_bytes:2*1024*1024,..Default::default()}})).await;
     let configured = receive(&mut output).await;
     assert_eq!(configured["frame"]["type"], "configured", "{configured}");

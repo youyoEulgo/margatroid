@@ -178,6 +178,7 @@ fn dynamic_admission_checks_schema_without_rechecking_recorded_owner() {
             .insert(
                 "dynamic".into(),
                 ToolEntry {
+                    owner_agent: None,
                     path: root.path().join("tool.toml"),
                     description: "dynamic tool".into(),
                     input_schema: json!({"type":"object","required":["value"]}),

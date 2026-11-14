@@ -53,7 +53,7 @@ fn fixture(url: String, format: &str) -> (App, Entity) {
 }
 
 fn entry(alias: &str, owner: Option<&str>) -> ToolEntry {
-    ToolEntry {
+    ToolEntry { owner_agent:None,
         // No tool files exist here. HTTP definitions must come only from entries.
         path: std::env::temp_dir()
             .join("inference-entry-without-files")
@@ -194,7 +194,7 @@ async fn real_http_uses_all_current_entries_at_acceptance_and_refreshes_each_req
         entries.get_mut("route").unwrap().base_url = url;
         routes.replace(entries, &[]);
         let tools = app.world_mut().get_component_mut::<Tools>(agent).unwrap();
-        tools.remove_owner("mcp-owner");
+        tools.remove("dynamic");
         tools
             .insert("later".into(), entry("later", Some("next-owner")))
             .unwrap();

@@ -2,7 +2,9 @@
 
 独立领域 core，只依赖 `core_plugin` 和通用库；不依赖 address、其他领域 core 或 plugin。
 
-`Tools` 以私有 `BTreeMap<String, ToolEntry>` 保存 alias 到完整工具记录，提供 Default、new、get、insert、insert_batch、remove_owner、iter。ToolEntry公开path、description、input_schema、owner_task_id和binding；InjectedToolDefinition公开alias、description、input_schema和binding，供宿主填入路径和任务归属。insert拒绝重复alias；insert_batch预先校验全部alias、路径、描述及schema，失败不修改集合；remove_owner仅移除指定任务拥有的条目。`WorldToolResourceExt::tool_entry` 借用完整记录，`tool_path` 借用同一记录的path，校验完整 Entity 和 alias，不访问文件系统。各领域只检查自身 alias；跨类别冲突由调用入口协调。
+`Tools`使用私有entries和registrations保存公开定义与唯一生命周期凭证，不可Clone。new要求同步UpdateProbe，get/iter过滤已关闭作用域，insert/insert_batch/insert_registered_batch共用整批校验和提交入口；remove按alias删除，revoke按alias及RegistrationId精确撤销，不再按owner扫描。目标集合销毁或主动删除时，guard释放并解除任务侧登记。TaskScope由tool_core持有，跨领域只用类型擦除的guard和Weak可用性回调，不建立tool_resource_core到tool_core的依赖。
+
+ToolEntry增加可信owner_agent，与owner_task_id共同描述生命周期任务；二者只由宿主实际解析lifetime得到。Lua RegisterToolsRequest使用agent和tools，InjectedToolDefinition使用alias、description、input_schema、可选lifetime及binding；旧owner_task_id输入明确拒绝。WorldToolResourceExt保持按完整Entity/alias只读借用，不访问文件系统。
 
 `read_tool(path)` 是不额外限制文件字节数的同步读取函数，供使用方在 blocking worker 调用。该函数用于导入校验，返回描述及schema后由Tools保存；已返回的临时材料不受之后文件变化影响。读取入口 TOML、同目录 `input.schema.json` 与 `main.lua`，要求 `schema_version = 1`、非空 description、合法 JSON 对象 schema 和 UTF-8 Lua 文本。允许内部 schema 引用，禁止外部引用；返回校验后的工具定义及程序文本，不执行 Lua。执行方按记录path只读取main.lua，不重读清单或schema；文件metadata变化不会隐式改写Tools记录。
 

@@ -19,3 +19,5 @@ worker 在独立进程中运行 Lua。全局 instruction hook 覆盖异步 corou
 supervisor 扫描并回收包括 setsid 后代在内的进程，完成后才发送真实清理证明。宿主同时等待 supervisor、管道和临时目录清理，才完成finish并从ToolTasks移除、释放缓存，不保存finished条目或完成缓存。TaskReadResult仅含replaced/output/error；finish后read/send/finish均返回TaskMissing，这是领域错误，不是未知宿主函数。需在finish前读完输出；is_cleanup_complete仅供内部清理等待者使用，不对外暴露completed。取消只请求退出，不 abort 监督任务。清理失败记录 CleanupFailed、完成尚未回复的调用，并保留监督能力继续清理，不先标记finished再异步清理；中止时原LLM回复仍及时交付。外部进程启动不再创建内存组或systemd scope，ToolRuntime不持有全局内存池；可信supervisor仍通过subreaper与后代扫描完成回收。本 crate 使用共享process:start原始管道、wait_any和分组任务API；package.config在执行环境初始化，os.execute/io.popen明确报错并提示process:start。shell、PTY和VT100由资源Lua及独立shell-client bin提供，宿主全局和margatroid入口不安装shell/terminal_open，不解码shell IPC。
 
 测试位于 tests，使用真实 runner 进程和资源文件，覆盖 Return 后交互、Finish、自身控制退出、跨任务访问、turn受理、唯一reply裁决、程序按次读取、Tools缓存schema、预算、图片、超时、setsid 后代清理和后端失败关闭。
+
+动态注册使用{agent?,tools}，工具项lifetime={agent?,task_id}绑定实际任务作用域。任务持有Weak World精确撤销动作，工具集合持有解绑凭证；取消/结束关闭作用域，Return不关闭，不扫描或取消其他已受理调用。context注入真实Workspace信息和agent_info.address，workspace:agents实时查询成员，跨Agent任务操作均在既有World闭包核对当前调用身份及同Workspace目标。

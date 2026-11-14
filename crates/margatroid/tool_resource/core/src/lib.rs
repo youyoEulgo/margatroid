@@ -9,10 +9,12 @@ use std::path::{Path, PathBuf};
 
 use core_plugin::{Entity, World};
 
-pub use components::Tools;
+pub use components::{RegistrationId, Tools};
 pub use error::{ToolResourceError, ToolResourceErrorKind};
 pub use events::{ImportTool, ImportToolReply};
-pub use types::{InjectedToolDefinition, ToolEntry, ToolInput};
+pub use types::{
+    InjectedToolDefinition, RegisterToolsRequest, TaskReference, ToolEntry, ToolInput,
+};
 
 use ToolResourceErrorKind as Kind;
 

@@ -139,9 +139,9 @@ LLM可见的工具失败保留原调用ID、工具名、failed标记、错误类
 
 普通导入与动态注入都向Agent.Tools增加包含描述、schema、path的记录；推理每次遍历Tools，工具调用按名称查询。Tool执行侧从记录取得schema，按path读取程序。宿主提供通用文件、文本、数据与进程能力，MCP连接与协议由工具资源及同目录client bin负责；bin并发推进输入写入、stdout/stderr读取和带ID响应路由。
 
-tool_inject由宿主固定当前资源路径，owner_task_id由注入参数显式选择，省略为静态工具，整批登记，任一定义无效或alias冲突整批失败，不增加System或专用事件。调用入口的owner_task_id、binding通过context传给同一脚本，模型参数不能改写它们；不额外增加工具清单或可见性步骤。
+tools:register使用{agent?,tools}批次，宿主固定当前资源路径，每项lifetime={agent?,task_id}选择实际任务，省略为静态工具，整批登记，任一定义无效或alias冲突整批失败，不增加System或专用事件。调用入口的owner_task_id、binding通过context传给同一脚本，模型参数不能改写它们；不额外增加工具清单或可见性步骤。
 
-MCP注册任务A连接成功、注入入口后return但不finish；使用入口的任务B从私有context取得owner_task_id和binding，运行同一Lua脚本，把带request ID的调用发送给A，得到结果后return并finish。A连续转发带ID的请求并路由乱序响应。A清理时只移除Tools中属于它的记录，不等待或取消已受理的B；B按自身超时、取消与工具内部通信结果处理。B先结束时，A的迟到回复遇TaskMissing仅清除该请求关联。
+MCP注册任务A连接成功、注入入口后return但不finish；使用入口的任务B从私有context取得owner_task_id和binding，运行同一Lua脚本，把带request ID的调用发送给A，得到结果后return并finish。A连续转发带ID的请求并路由乱序响应。A关闭作用域时主动撤销它持有的精确注册，不等待或取消已受理的B；B按自身超时、取消与工具内部通信结果处理。B先结束时，A的迟到回复遇TaskMissing仅清除该请求关联。
 
 process_open使用原始stdin/stdout/stderr管道，不经过PTY；write/read保持字节，工具自己处理消息边界、UTF-8分片和多条消息。输入写入、stdout与stderr读取需并行推进，避免双向背压互相阻塞。子进程和后代受ToolTask唯一存活预算、取消及finish清理约束。
 
@@ -149,3 +149,44 @@ process_open使用原始stdin/stdout/stderr管道，不经过PTY；write/read保
 agent.task使用ToolTasks::snapshot与ToolTaskHandle::snapshot返回ToolTaskSnapshot纯值，不复用具有消费语义的read。每项包含task_id、call_id、alias、returned、完整保留output窗口及error；已清理项不返回，无完成缓存。读取不推进cursor、不清除replaced、不触发取消或finish，不借出内部句柄。查询和主动同步均为完整任务集合，非分块；并发任务逐项取一致状态，不宣称整个集合是同时冻结的全局事务。read/finish语义保持原样，System及事件不改。
 
 本轮Task统一写入口为update_task(context, change)，上下文强制包含当前Agent来源及共享Client槽位的typed同步能力。register、append/replace、正常或强制Return、错误及CompleteCleanup全部从此衍生；原底层可变字段私有，Lua、worker协议、异常和取消收口都不能旁路。脚本read的cursor/replaced、输入发送及只取消token不改变wire快照，不产生额外sync。高频输出只更新单连接队列的pending状态，实际快照读取保留输出窗口语义。
+
+本轮已实现：Lua工具注册使用{agent?, tools}，每项lifetime={agent?, task_id}独立指定任务生命周期；后端任务持有精确撤销句柄，关闭拒绝新绑定并主动注销，Return不关闭，不终止已受理工具调用。跨Agent操作限当前Workspace，环境提供workspace固定信息与实时agents查询。具体Rust接口已对齐设计，不新增System或同步事件。
+
+
+## 跨Agent注册及任务归属
+
+```lua
+local workspace = margatroid.context.workspace
+local members = margatroid.workspace:agents()
+
+margatroid.tools:register({
+    agent = "agent:demo/B",
+    tools = {{
+        alias = "lookup",
+        description = "查询服务",
+        input_schema = {type = "object"},
+        lifetime = {agent = "agent:demo/C", task_id = "service-task"},
+        binding = {operation = "lookup"},
+    }},
+})
+```
+
+agent省略时目标是当前Agent，lifetime省略时不依赖注册发起任务。Agent A可以给B登记，生命周期绑定C的任务；A结束不隐式删掉该项，C关闭后B不再接受新调用，已受理调用独立收口。任务return_result后仍可提供服务，不关闭作用域。Tools提前移除或目标Agent退出会释放解绑凭证，旧任务的迟到撤销不能删除同alias新注册。
+
+所有跨Agent目标均以公开Address解析并限定在当前Workspace。内部保存完整Entity和实际TaskScope，不能靠重用任务id让旧worker或注册附着到新任务。注册失败整批无工具，原Lua数组式register和owner_task_id输入不作为兼容别名。
+
+工具context.workspace含address/name/project_root；context.agent_info含name/address。workspace:agents()实时返回同Workspace成员的address/name/state。固定环境不是成员缓存，查询无需建立订阅。
+
+调用绑定工具时context.owner_agent和owner_task_id是可信生命周期目标，binding原样保存。跨Agent任务操作支持结构化目标：
+
+```lua
+local owner = {
+    agent = margatroid.context.owner_agent,
+    task_id = margatroid.context.owner_task_id,
+}
+margatroid.task:send(owner, {request = "lookup"})
+local output = margatroid.task:read_output(owner)
+-- margatroid.task:finish(owner) 会请求并等待目标任务真实收口。
+```
+
+read_output/send/finish仍可用字符串选择当前Agent任务；结构化引用支持同Workspace其他Agent。自身finish保留worker本地退出路径，不能等待自己。

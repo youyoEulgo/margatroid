@@ -55,7 +55,7 @@ async fn runner(
     let output = BufReader::new(child.stdout.take().unwrap());
     send(&mut input, json!({
         "protocol_version": 1, "program": program, "arguments": arguments,
-        "context": {"agent_name":"protocol-fixture","turn":"test-turn","source_origin":"protocol-fixture.lua","task_id":"configure-test", "call_id":"call", "alias":"tool", "owner_task_id":null,"binding":null,"resource_dir":root.path(),"project_root":root.path(), "temp_dir":root.path()},
+        "context": {"agent_address":"agent:test/fixture","workspace":{"address":"workspace:test/unit","name":"test","project_root":"/tmp"},"owner_agent":null,"agent_name":"protocol-fixture","turn":"test-turn","source_origin":"protocol-fixture.lua","task_id":"configure-test", "call_id":"call", "alias":"tool", "owner_task_id":null,"binding":null,"resource_dir":root.path(),"project_root":root.path(), "temp_dir":root.path()},
         "limits": ToolExecutionLimits::default()
     })).await;
     (root, child, input, output)
@@ -91,7 +91,7 @@ async fn invalid_or_missing_configuration_never_executes() {
         "function configure() margatroid.files:create_directory('unsafe', false) end",
         "function configure() margatroid.files:matches('unsafe', '*') end",
         "function configure() margatroid.text:search('x', 'x') end",
-        "function configure() margatroid.tools:register({}) end",
+        "function configure() margatroid.tools:register({tools={}}) end",
         "function configure() margatroid.driver:wait() end",
         "while true do pcall(function() while true do end end) end",
         "function configure() coroutine.resume(coroutine.create(function() while true do end end)) end",

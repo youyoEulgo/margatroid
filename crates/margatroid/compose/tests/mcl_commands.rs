@@ -80,6 +80,7 @@ impl Fixture {
             .add_plugin(StoragePlugin::new())
             .add_plugin(MclPlugin::new().with_import_config(roots));
         let workspace = app.world_mut().spawn();
+        app.world_mut().insert_component(workspace,address::Address::new("workspace:test/unit").unwrap());
         let owner = app.world_mut().spawn();
         let client = app.world_mut().spawn();
         app.world_mut().insert_component(

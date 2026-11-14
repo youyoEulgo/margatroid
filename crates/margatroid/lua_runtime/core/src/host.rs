@@ -97,9 +97,10 @@ enum NamespaceKind {
     Driver,
     Tools,
     Task,
+    Workspace,
 }
 impl NamespaceKind {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Files,
         Self::Data,
         Self::Text,
@@ -107,6 +108,7 @@ impl NamespaceKind {
         Self::Driver,
         Self::Tools,
         Self::Task,
+        Self::Workspace,
     ];
     fn name(self) -> &'static str {
         match self {
@@ -117,12 +119,13 @@ impl NamespaceKind {
             Self::Driver => "driver",
             Self::Tools => "tools",
             Self::Task => "task",
+            Self::Workspace => "workspace",
         }
     }
     fn allowed(self, owner: HostKind) -> bool {
         match self {
             Self::Driver => owner == HostKind::Driver,
-            Self::Tools | Self::Task => owner == HostKind::Tool,
+            Self::Tools | Self::Task | Self::Workspace => owner == HostKind::Tool,
             _ => true,
         }
     }
@@ -134,6 +137,7 @@ struct HostNamespace {
 }
 const ROOT_METHODS: &[&str] = &["log", "wait_any"];
 const NAMESPACE_METHODS: &[(NamespaceKind, &str, &str, bool)] = &[
+    (NamespaceKind::Workspace, "agents", "workspace_agents", true),
     (NamespaceKind::Files, "read", "files_read", true),
     (NamespaceKind::Files, "write", "files_write", true),
     (NamespaceKind::Files, "list", "files_list", true),

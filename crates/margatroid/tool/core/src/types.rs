@@ -127,6 +127,7 @@ struct ToolTaskData {
 
 #[derive(Debug)]
 struct ToolTaskShared {
+    registrations: crate::TaskScope,
     cancel: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
     task_attached: AtomicBool,
@@ -163,6 +164,7 @@ impl ToolTaskHandle {
             Self {
                 updates,
                 inner: Arc::new(ToolTaskShared {
+                    registrations: crate::TaskScope::default(),
                     cancel: CancellationToken::new(),
                     task: Mutex::new(None),
                     task_attached: AtomicBool::new(false),
@@ -243,7 +245,14 @@ impl ToolTaskHandle {
         self.inner.cancel.clone()
     }
 
+    pub fn registration_scope(&self) -> crate::TaskScope {
+        self.inner.registrations.clone()
+    }
+    pub fn close_registrations(&self) {
+        self.inner.registrations.close();
+    }
     pub fn cancel(&self) {
+        self.close_registrations();
         self.inner.cancel.cancel();
     }
 
@@ -287,7 +296,7 @@ impl ToolTaskHandle {
             }
             let response = ToolExecuteResponse::aborted(state.call_id.clone(), state.alias.clone());
             deliver_reply(&mut state, Ok(response));
-            self.inner.cancel.cancel();
+            self.cancel();
             Ok((true, true))
         })
         .unwrap_or(false)
@@ -297,7 +306,7 @@ impl ToolTaskHandle {
         lock(&self.inner.shared).returned
     }
 
-    pub(crate) fn same_task(&self, other: &Self) -> bool {
+    pub fn same_task(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
@@ -378,6 +387,7 @@ impl ToolTaskHandle {
     }
 
     pub(crate) fn complete_cleanup_raw(&self, error: Option<ToolError>) {
+        self.close_registrations();
         let mut state = lock(&self.inner.shared);
         if state.cleanup_complete {
             return;

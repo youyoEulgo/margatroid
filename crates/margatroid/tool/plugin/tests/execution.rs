@@ -28,6 +28,7 @@ use workspace_core::WorkspaceState;
 fn imported_entry(path: &std::path::Path) -> ToolEntry {
     let tool = read_tool(path).unwrap();
     ToolEntry {
+        owner_agent: None,
         path: tool.origin,
         description: tool.description,
         input_schema: tool.input_schema,
@@ -68,6 +69,10 @@ impl Fixture {
                     .with_limits(limits),
             );
         let workspace = app.world_mut().spawn();
+        app.world_mut().insert_component(
+            workspace,
+            address::Address::new("workspace:test/unit").unwrap(),
+        );
         app.world_mut().insert_component(
             workspace,
             workspace_core::Workspace::new(
@@ -1472,10 +1477,10 @@ function configure(args, context)
 end
 function execute(args, context)
     if margatroid.context.owner_task_id == nil then
-        margatroid.tools:register({
-            {owner_task_id=margatroid.context.task_id, alias='dynamic_text', description='text operation', input_schema={type='object',required={'text'},properties={text={type='string'}}},binding={operation='dynamic_text'}},
-            {owner_task_id=margatroid.context.task_id, alias='dynamic_number', description='number operation', input_schema={type='object',required={'number'},properties={number={type='integer'}}},binding={operation='dynamic_number'}}
-        })
+        margatroid.tools:register({tools={
+            {lifetime={task_id=margatroid.context.task_id}, alias='dynamic_text', description='text operation', input_schema={type='object',required={'text'},properties={text={type='string'}}},binding={operation='dynamic_text'}},
+            {lifetime={task_id=margatroid.context.task_id}, alias='dynamic_number', description='number operation', input_schema={type='object',required={'number'},properties={number={type='integer'}}},binding={operation='dynamic_number'}}
+        }})
         margatroid.task:return_result(margatroid.context.task_id)
         local pending={}
         while true do
@@ -1571,7 +1576,7 @@ fn dynamic_aliases_use_distinct_recorded_schemas_and_reverse_concurrent_response
 fn owner_finish_removes_aliases_without_cancelling_pending_or_returned_tasks() {
     let mut f = Fixture::new();
     f.tool("factory", DYNAMIC_PROGRAM);
-    f.tool("other_factory", "function execute(args,context) margatroid.tools:register({{owner_task_id=margatroid.context.task_id,alias='other_dynamic',description='other',input_schema={type='object'}}}); margatroid.task:return_result('ready'); margatroid.task:receive() end");
+    f.tool("other_factory", "function execute(args,context) margatroid.tools:register({tools={{lifetime={task_id=margatroid.context.task_id},alias='other_dynamic',description='other',input_schema={type='object'}}}}); margatroid.task:return_result('ready'); margatroid.task:receive() end");
     let other = f.execute("other-owner", "other_factory", json!({}));
     f.response(other).unwrap();
     let owner = f.execute("owner", "factory", json!({}));
@@ -1627,10 +1632,10 @@ fn explicit_noncaller_owner_and_static_aliases_have_independent_lifetimes() {
                 margatroid.task:return_result('static survived')
                 margatroid.task:finish(margatroid.context.task_id)
             elseif margatroid.context.arguments.owner ~= nil then
-                margatroid.tools:register({
-                    {alias='bound_alias',description='bound',input_schema={type='object'},owner_task_id=margatroid.context.arguments.owner},
+                margatroid.tools:register({tools={
+                    {alias='bound_alias',description='bound',input_schema={type='object'},lifetime={task_id=margatroid.context.arguments.owner}},
                     {alias='static_alias',description='static',input_schema={type='object'},binding={static=true}}
-                })
+                }})
                 margatroid.task:return_result('injected')
                 margatroid.task:finish(margatroid.context.task_id)
             else
@@ -1682,10 +1687,10 @@ fn invalid_explicit_owner_rejects_static_and_bound_entries_as_one_batch() {
     f.tool(
         "factory",
         r#"function execute(args,context)
-            local ok,err=pcall(function() margatroid.tools:register({
+            local ok,err=pcall(function() margatroid.tools:register({tools={
                 {alias='static_alias',description='static',input_schema={type='object'}},
-                {alias='bound_alias',description='bound',input_schema={type='object'},owner_task_id=margatroid.context.arguments.owner}
-            }) end)
+                {alias='bound_alias',description='bound',input_schema={type='object'},lifetime={task_id=margatroid.context.arguments.owner}}
+            }}) end)
             margatroid.task:return_result({accepted=ok,error=tostring(err)})
             margatroid.task:finish(margatroid.context.task_id)
         end"#,
@@ -1713,10 +1718,10 @@ fn injection_alias_conflict_rejects_the_whole_batch() {
     f.tool(
         "factory",
         r#"function execute(args,context)
-        local ok,err=pcall(function() margatroid.tools:register({
+        local ok,err=pcall(function() margatroid.tools:register({tools={
             {alias='fresh_alias',description='fresh',input_schema={type='object'}},
             {alias='factory',description='conflict',input_schema={type='object'}}
-        }) end)
+        }}) end)
         margatroid.task:return_result({accepted=ok,error=tostring(err)})
         margatroid.task:receive()
     end"#,
@@ -1733,7 +1738,7 @@ fn injection_alias_conflict_rejects_the_whole_batch() {
 #[test]
 fn cancellation_between_injection_dispatch_and_world_commit_leaves_no_aliases() {
     let mut f = Fixture::new();
-    f.tool("factory", "function execute(args,context) margatroid.task:append_output('inject-dispatching'); margatroid.tools:register({{owner_task_id=margatroid.context.task_id,alias='cancelled_alias',description='cancelled',input_schema={type='object'}}}); margatroid.task:return_result('unexpected'); margatroid.task:receive() end");
+    f.tool("factory", "function execute(args,context) margatroid.task:append_output('inject-dispatching'); margatroid.tools:register({tools={{lifetime={task_id=margatroid.context.task_id},alias='cancelled_alias',description='cancelled',input_schema={type='object'}}}}); margatroid.task:return_result('unexpected'); margatroid.task:receive() end");
     let reply = f.execute("cancelled-owner", "factory", json!({}));
     // Observe the worker without ticking World, leaving its injection uncommitted.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1824,4 +1829,187 @@ fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
 
 fn test_probe<T>() -> client_core::UpdateProbe<T> {
     client_core::UpdateProbe::new(|_| {})
+}
+
+fn sibling_agent(
+    f: &mut Fixture,
+    name: &str,
+    workspace: core_plugin::Entity,
+) -> core_plugin::Entity {
+    let agent = f.app.world_mut().spawn();
+    storage_fixture::mount(f.app.world_mut(), agent, f.root.path());
+    f.app.world_mut().insert_component(
+        agent,
+        agent_core::Agent::new(
+            name.into(),
+            workspace,
+            AgentState::Working,
+            Some("test-turn".into()),
+            crate::test_agent_context(),
+        ),
+    );
+    let address = f
+        .app
+        .world()
+        .get_component::<address::Address>(agent)
+        .unwrap()
+        .as_str()
+        .to_owned();
+    f.app
+        .world_mut()
+        .insert_component(agent, ToolTasks::new(agent, address, crate::test_binding()));
+    f.app
+        .world_mut()
+        .insert_component(agent, Tools::new(crate::test_probe()));
+    agent
+}
+#[test]
+fn cross_agent_registration_uses_third_agent_lifetime_and_preserves_accepted_calls() {
+    let mut f = Fixture::new();
+    let source = f.agent;
+    let workspace = f
+        .app
+        .world()
+        .get_component::<agent_core::Agent>(source)
+        .unwrap()
+        .workspace();
+    let target = sibling_agent(&mut f, "target", workspace);
+    let owner_agent = sibling_agent(&mut f, "owner", workspace);
+    let address = |f: &Fixture, agent| {
+        f.app
+            .world()
+            .get_component::<address::Address>(agent)
+            .unwrap()
+            .as_str()
+            .to_owned()
+    };
+    let target_address = address(&f, target);
+    let owner_address = address(&f, owner_agent);
+    f.agent = owner_agent;
+    f.tool("owner",r#"function configure() return {timeout_ms=0} end
+ function execute() margatroid.task:append_output('owner-ready');margatroid.task:return_result('ready');while true do local request=margatroid.task:receive();margatroid.task:send(request.reply_to,{answer='cross-agent'}) end end"#);
+    let reply = f.execute("lifetime", "owner", json!({}));
+    assert_eq!(f.response(reply).unwrap().content, "ready");
+    let owner = f.tasks().get("lifetime").unwrap();
+    f.agent = source;
+    f.tool("factory",r#"function configure() return {timeout_ms=0} end
+ function execute()
+  local ctx=margatroid.context
+  assert(ctx.workspace.address=='workspace:test/unit:latest' and ctx.workspace.name=='test',margatroid.data:encode('json',ctx.workspace))
+  if ctx.binding then
+   local output=margatroid.task:read_output({agent=ctx.owner_agent,task_id=ctx.owner_task_id})
+   assert(output.output[1]=='owner-ready')
+   margatroid.task:send({agent=ctx.owner_agent,task_id=ctx.owner_task_id},{reply_to={agent=ctx.agent_info.address,task_id=ctx.task_id}})
+   local result=margatroid.task:receive();margatroid.task:return_result(result.answer);margatroid.task:receive()
+  else
+   local agents=margatroid.workspace:agents();assert(#agents==3,margatroid.data:encode("json",agents))
+   margatroid.tools:register({agent=ctx.arguments.target,tools={{alias='remote',description='remote',input_schema={type='object'},lifetime={agent=ctx.arguments.owner,task_id='lifetime'},binding={remote=true}}}})
+   margatroid.task:return_result('registered')
+  end
+ end"#);
+    let reply = f.execute(
+        "factory",
+        "factory",
+        json!({"target":target_address,"owner":owner_address}),
+    );
+    assert_eq!(f.response(reply).unwrap().content, "registered");
+    f.removed("factory");
+    assert!(f
+        .app
+        .world()
+        .get_component::<Tools>(source)
+        .unwrap()
+        .get("remote")
+        .is_none());
+    assert!(f
+        .app
+        .world()
+        .get_component::<Tools>(target)
+        .unwrap()
+        .get("remote")
+        .is_some());
+    f.agent = target;
+    let reply = f.execute("accepted", "remote", json!({}));
+    assert_eq!(f.response(reply).unwrap().content, "cross-agent");
+    let accepted = f.tasks().get("accepted").unwrap();
+    owner.cancel();
+    assert!(
+        f.app
+            .world()
+            .get_component::<Tools>(target)
+            .unwrap()
+            .get("remote")
+            .is_none(),
+        "closed lifetime must reject new calls before World revocation runs"
+    );
+    assert!(!accepted.cancel_token().is_cancelled());
+    f.drive(async move { owner.finish().await }).unwrap();
+    assert!(f
+        .app
+        .world()
+        .get_component::<Tools>(target)
+        .unwrap()
+        .get("remote")
+        .is_none());
+    assert!(!accepted.cancel_token().is_cancelled());
+    f.drive(async move { accepted.finish().await }).unwrap();
+    f.removed("accepted");
+    f.agent = owner_agent;
+    f.removed("lifetime");
+}
+#[test]
+fn workspace_members_are_live_and_cross_workspace_registration_is_rejected() {
+    let mut f = Fixture::new();
+    let source = f.agent;
+    let workspace = f
+        .app
+        .world()
+        .get_component::<agent_core::Agent>(source)
+        .unwrap()
+        .workspace();
+    f.tool(
+        "query",
+        r#"function execute() margatroid.task:return_result(margatroid.workspace:agents()) end"#,
+    );
+    let reply = f.execute("first", "query", json!({}));
+    assert_eq!(
+        serde_json::from_str::<Value>(&f.response(reply).unwrap().content)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    f.removed("first");
+    let sibling = sibling_agent(&mut f, "new-member", workspace);
+    let reply = f.execute("second", "query", json!({}));
+    let result: Value = serde_json::from_str(&f.response(reply).unwrap().content).unwrap();
+    assert_eq!(result.as_array().unwrap().len(), 2);
+    assert!(result
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["name"] == "new-member"));
+    f.removed("second");
+    let other_workspace = f.app.world_mut().spawn();
+    let outside = sibling_agent(&mut f, "outside", other_workspace);
+    let address = f
+        .app
+        .world()
+        .get_component::<address::Address>(outside)
+        .unwrap()
+        .as_str()
+        .to_owned();
+    f.tool("factory",r#"function execute() margatroid.tools:register({agent=margatroid.context.arguments.target,tools={{alias='forbidden',description='forbidden',input_schema={type='object'}}}});margatroid.task:return_result('unexpected') end"#);
+    let reply = f.execute("cross-workspace", "factory", json!({"target":address}));
+    assert!(f.response(reply).is_err());
+    f.removed("cross-workspace");
+    assert!(f
+        .app
+        .world()
+        .get_component::<Tools>(outside)
+        .unwrap()
+        .get("forbidden")
+        .is_none());
+    let _ = (source, sibling);
 }

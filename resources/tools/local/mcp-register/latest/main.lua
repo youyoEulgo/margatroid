@@ -85,7 +85,7 @@ local function call_remote(arguments, context)
     if type(context.binding) ~= "table" or type(context.binding.remote_tool) ~= "string" then
         error("missing remote_tool binding")
     end
-    margatroid.task:send(context.owner_task_id, {
+    margatroid.task:send({agent=context.owner_agent,task_id=context.owner_task_id}, {
         operation = "call", id = context.task_id, reply_to = context.task_id,
         tool = context.binding.remote_tool, arguments = arguments,
     })
@@ -215,12 +215,12 @@ local function register_server(arguments, context, state)
             end
             definitions[#definitions + 1] = {
                 alias = alias, description = description,
-                input_schema = tool.inputSchema, owner_task_id = context.task_id,
+                input_schema = tool.inputSchema, lifetime = {task_id=context.task_id},
                 binding = { remote_tool = tool.name },
             }
         end
         -- The host validates and commits the entire batch to its existing Tools.
-        margatroid.tools:register(definitions)
+        margatroid.tools:register({tools=definitions})
         registered = true
         -- Encode explicitly so an empty aliases list remains [] in the result.
         margatroid.task:return_result('{"task_id":' .. margatroid.data:encode("json", context.task_id) .. ',"aliases":'

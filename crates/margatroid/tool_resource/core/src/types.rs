@@ -6,19 +6,31 @@ pub struct ToolEntry {
     pub description: String,
     pub input_schema: serde_json::Value,
     pub owner_task_id: Option<String>,
+    pub owner_agent: Option<String>,
     pub binding: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskReference {
+    pub agent: Option<String>,
+    pub task_id: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterToolsRequest {
+    pub agent: Option<String>,
+    pub tools: Vec<InjectedToolDefinition>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InjectedToolDefinition {
     pub alias: String,
     pub description: String,
     pub input_schema: serde_json::Value,
-    #[serde(default)]
-    pub owner_task_id: Option<String>,
+    pub lifetime: Option<TaskReference>,
     pub binding: Option<serde_json::Value>,
 }
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolInput {
     pub description: String,

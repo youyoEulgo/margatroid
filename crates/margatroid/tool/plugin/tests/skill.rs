@@ -65,6 +65,7 @@ mod linux {
                 .insert(
                     "skill_register".into(),
                     ToolEntry {
+                        owner_agent: None,
                         path: imported.origin,
                         description: imported.description,
                         input_schema: imported.input_schema,
@@ -83,6 +84,10 @@ mod linux {
                         .with_runner_path(env!("CARGO_BIN_EXE_tool_runner")),
                 );
             let workspace = app.world_mut().spawn();
+            app.world_mut().insert_component(
+                workspace,
+                address::Address::new("workspace:test/unit").unwrap(),
+            );
             app.world_mut().insert_component(
                 workspace,
                 workspace_core::Workspace::new(
@@ -130,12 +135,14 @@ mod linux {
                 .unwrap()
                 .clone()
         }
-        fn tools(&self) -> Tools {
+        fn tools(&self) -> std::collections::BTreeMap<String, ToolEntry> {
             self.app
                 .world()
                 .get_component::<Tools>(self.agent)
                 .unwrap()
-                .clone()
+                .iter()
+                .map(|(alias, entry)| (alias.clone(), entry.clone()))
+                .collect()
         }
         fn execute(&mut self, id: &str, alias: &str, arguments: Value) -> Reply {
             let (sender, reply) = oneshot::channel();
@@ -385,7 +392,7 @@ mod linux {
         assert!(!registration.contains(&script));
         assert!(f.tasks().get("register").is_err());
         let definitions = f.tools();
-        assert_eq!(definitions.iter().count(), 2);
+        assert_eq!(definitions.len(), 2);
         let entry = definitions.get(ALIAS).unwrap();
         assert_eq!(entry.path, f.resource.join("tool.toml"));
         assert_eq!(entry.owner_task_id, None);

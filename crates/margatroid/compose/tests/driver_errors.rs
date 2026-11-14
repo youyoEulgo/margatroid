@@ -66,6 +66,7 @@ impl Fixture {
         .unwrap();
         app.world_mut().insert_component(owner, storage);
         let workspace = app.world_mut().spawn();
+        app.world_mut().insert_component(workspace,address::Address::new("workspace:test/unit").unwrap());
         app.world_mut().insert_component(
             workspace,
             workspace_core::Workspace::new(

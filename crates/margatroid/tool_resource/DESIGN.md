@@ -68,7 +68,8 @@ read_tool(path: &Path) -> Result<ToolInput, ToolResourceError>
 公开：
 ```text
 Tools：Agent唯一工具集合，公开组件
-    entries: BTreeMap<String, ToolEntry>--私有alias记录
+    entries: BTreeMap<String, ToolEntry>
+    registrations: BTreeMap<String, BoundRegistration>--私有alias记录
     updates: UpdateProbe<Vec<(String, ToolEntry)>>--构造必需，绑定当前Agent来源及公共信息发布
     new(updates: UpdateProbe<Vec<(String, ToolEntry)>>) -> Self
     get(&self, alias: &str) -> Option<&ToolEntry>
@@ -80,9 +81,12 @@ Tools：Agent唯一工具集合，公开组件
     insert_batch(&mut self, entries: Vec<(String, ToolEntry)>) -> Result<(), ToolResourceError>
         行为：
             同一入口校验整批schema/path/alias后原子提交；非空成功批次调用publish_current，失败不修改集合。
-    remove_owner(&mut self, owner_task_id: &str)
-        行为：
-            删除所属记录；只有集合实际缩小时publish_current，不等待或取消已受理任务。
+    insert_registered_batch(&mut self, entries: Vec<(String, ToolEntry)>, registrations: Vec<RegistrationBinding>) -> Result<(), ToolResourceError>
+        行为：insert_batch复用此入口；整批校验alias/path/description/schema及绑定可用性，再同时提交entries与凭证并发布完整公共列表一次。
+    remove(&mut self, alias: &str) -> Option<ToolEntry>
+        行为：删除指定项并释放凭证，实际变化才发布，不扫描任务owner。
+    revoke(&mut self, alias: &str, id: RegistrationId)
+        行为：仅匹配当前实际注册id才删除，迟到撤销不能删除同alias新注册。
     iter(&self) -> impl Iterator<Item = (&String, &ToolEntry)>
         行为：
             return entries.iter()
@@ -137,7 +141,7 @@ handle_import(world: &mut World, request: ImportTool)
 handle_import_result(world: &mut World, result: Result<ImportOutput, ImportError>)
     行为：
         require owner有效且未cancel
-        success: Tools.insert(alias, ToolEntry{description, input_schema, path, owner_task_id=None, binding=None})
+        success: Tools.insert(alias, ToolEntry{description, input_schema, path, owner_task_id=None, owner_agent=None, binding=None})
         reply 登记结果
 ```
 
@@ -171,17 +175,18 @@ ToolEntry：工具记录
     path: PathBuf--工具执行资源入口；MCP注入的记录都指向mcp_register
     description: String
     input_schema: serde_json::Value
-    owner_task_id: Option<String>--None为静态工具；Some(id)随指定任务存活，任务结束删除记录
+    owner_task_id: Option<String>--生命周期任务id，来自已解析实际任务
+    owner_agent: Option<String>--生命周期Agent的规范公开地址
     binding: Option<serde_json::Value>--工具自己的不透明路由数据，例如远端工具名
 
 InjectedToolDefinition：注入项
     alias: String
     description: String
     input_schema: serde_json::Value
-    owner_task_id: Option<String>--注入时显式选择；省略为None，不默认绑定注入者
+    lifetime: Option<TaskReference>--省略不绑定发起者，指定实际任务作用域
     binding: Option<serde_json::Value>
     行为：
-        宿主填path为当前工具资源，owner_task_id按注入参数登记
+        宿主填path为当前工具资源，owner_task_id/owner_agent由lifetime实际解析得到
 
 ToolInput：本次工具材料
     description: String
@@ -192,6 +197,22 @@ ToolResourceSyncBinding = ProbeFactory<Vec<(String, ToolEntry)>>
     行为：compose/DTO注入按owner创建的typed回调，转换为AgentPublicUpdate::Tools；回调仅捕获当前来源scope。
 Tools::publish_current(&self)
     行为：从同一entries克隆完整公开记录后调用updates.publish，交付Agent公共视图，不发事件或借用World。
+
+RegisterToolsRequest：Serialize + Deserialize，deny_unknown_fields
+    agent: Option<String>
+    tools: Vec<InjectedToolDefinition>
+TaskReference：Serialize + Deserialize，deny_unknown_fields
+    agent: Option<String>
+    task_id: String
+RegistrationId(u64)：Copy + PartialEq
+    fresh() -> Self--进程内单调唯一
+RegistrationBinding = (String, RegistrationId, Box<dyn Send + Sync>, Box<dyn Fn() -> bool + Send + Sync>)
+BoundRegistration
+    id: RegistrationId
+    _guard: Box<dyn Send + Sync>
+    available: Box<dyn Fn() -> bool + Send + Sync>
+    行为：Tools销毁/移除释放guard解除任务登记；get/iter检查available拒绝已关闭作用域，物理删除由任务主动撤销。
+
 
 ```
 
@@ -210,6 +231,7 @@ ToolResourceError：工具资源错误
 ToolResourceErrorKind：错误类别，公开枚举
     OwnerMissing | InvalidAlias | AliasMissing | AliasConflict | InvalidPath | FileMissing
     InvalidUtf8 | InvalidDefinition | ReadFailed | Cancelled | WorkerFailed
+
 ```
 
 # 持有关系

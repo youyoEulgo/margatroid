@@ -134,3 +134,6 @@ impl Write for BoundedCounter {
 
 mod sync;
 pub use sync::{AgentTaskSnapshot, TaskSyncBinding, TaskUpdateContext};
+
+mod lifetime;
+pub use lifetime::{TaskBinding, TaskScope};

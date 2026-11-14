@@ -73,7 +73,7 @@ pub(crate) fn handle_import_result(world: &mut World, result: Result<ImportOutpu
     let (context, validated) = match result {
         Ok(output) => (
             output.context,
-            Ok(ToolEntry {
+            Ok(ToolEntry { owner_agent:None,
                 path: output.path,
                 description: output.description,
                 input_schema: output.input_schema,

@@ -108,6 +108,7 @@ impl Harness {
         app.world_mut()
             .insert_resource(WorkspaceDefinitions::open(&definitions_root).unwrap());
         let workspace = app.world_mut().spawn();
+        app.world_mut().insert_component(workspace,address::Address::new("workspace:test/unit").unwrap());
         let workspace_binding = dto_plugin::workspace_sync_binding(
             app.world()
                 .get_resource::<client_core::Clients>()
@@ -1130,7 +1131,7 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
     tools
         .insert(
             "bash".into(),
-            ToolEntry {
+            ToolEntry { owner_agent:None,
                 path: harness.root.path().join("private/bash/tool.toml"),
                 description: "bash".into(),
                 input_schema: json!({"type":"object"}),
@@ -1142,7 +1143,7 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
     tools
         .insert(
             "read_file".into(),
-            ToolEntry {
+            ToolEntry { owner_agent:None,
                 path: harness.root.path().join("private/read-file/tool.toml"),
                 description: "read file".into(),
                 input_schema: json!({"type":"object"}),
@@ -2135,7 +2136,7 @@ fn turn_and_resource_mutations_publish_without_another_world_tick() {
         .unwrap()
         .insert(
             "live_tool".into(),
-            ToolEntry {
+            ToolEntry { owner_agent:None,
                 path,
                 description: "probe".into(),
                 input_schema: json!({"type":"object"}),

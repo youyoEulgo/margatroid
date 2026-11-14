@@ -361,6 +361,19 @@ LuaRuntimeConfig：执行预算
     max_memory_bytes: usize
     instruction_check_interval: u32
     startup_timeout: Option<Duration>
+NamespaceKind::Workspace
+    name: "workspace"
+    agents()--异步，只在执行能力安装后提供，工具端经RunnerFrame::WorkspaceAgents请求实时成员
+margatroid.context.workspace
+    address: String
+    name: String
+    project_root: PathBuf
+    行为：运行环境注入所属Workspace固定身份；不注入会过期的成员快照，不暴露Entity或VM实例。
+工具task.read_output/send/finish
+    目标：TaskReference { agent: Option<String>, task_id: String }
+    行为：字符串仍作为当前Agent任务id的便捷输入；结构化目标支持同Workspace其他Agent，后端每次校验实际实例。
+
+
 ```
 
 # error
@@ -379,6 +392,7 @@ LuaRuntimeErrorKind：错误类别，公开枚举
     SourceTooLarge | EnvironmentFailed | CompileFailed | ExecutionFailed
     StartupTimeout | Cancelled | CleanupFailed | StopAlreadyWaiting
     EndNotificationLost | AlreadyWaiting | Closed
+
 ```
 
 # 持有关系
