@@ -145,6 +145,29 @@ pub struct InferenceParameters {
     #[serde(default)]
     pub stop: Vec<String>,
 }
+impl InferenceParameters {
+    pub fn validate(&self) -> Result<(), crate::InferenceError> {
+        if self.model.trim().is_empty()
+            || self.model.len() > 1024
+            || self.model.chars().any(char::is_control)
+            || self
+                .temperature
+                .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
+            || self
+                .top_p
+                .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            || self.max_output_tokens == Some(0)
+            || self.stop.len() > 128
+            || self.stop.iter().any(|value| value.len() > 4096)
+        {
+            return Err(crate::InferenceError::new(
+                crate::InferenceErrorKind::InvalidRequest,
+                "invalid inference parameters",
+            ));
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ModelRoute {
     pub model: String,

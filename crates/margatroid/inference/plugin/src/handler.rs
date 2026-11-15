@@ -17,7 +17,6 @@ use inference_core::{
     InferenceRequest, InferenceResponse, InferenceStopReason, InferenceToolDefinition,
     InitInference, ModelRoute, ModelRoutes,
 };
-use lua_runtime_core::DriverLuaVm;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -169,7 +168,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
         let _ = reply.send(Err(error(Kind::AgentMissing, "Agent entity missing")));
         return;
     };
-    if agent.state() != AgentState::Working
+    if agent.state() != AgentState::Running
         || request.turn.is_empty()
         || agent.turn().as_deref() != Some(request.turn.as_str())
     {
@@ -214,16 +213,10 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
             .ok_or_else(|| error(Kind::InvalidRequest, "Agent address missing"))?
             .as_str()
             .to_owned();
-        let vm = world
-            .get_component::<DriverLuaVm>(request.agent)
-            .filter(|vm| vm.instance.owner == request.agent && !vm.instance.start_id.is_empty())
-            .ok_or_else(|| {
-                error(
-                    Kind::AgentMissing,
-                    "Driver VM instance is missing or does not match Agent",
-                )
-            })?;
-        let agent_instance = vm.instance.clone();
+        let agent_instance = world
+            .get_component::<Agent>(request.agent)
+            .unwrap()
+            .source_lease();
         let clients = world.clients();
         let runtime = world
             .get_resource::<HttpRuntime>()
@@ -264,7 +257,7 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
     let cleanup = InferenceCleanupFinished {
         agent,
         request_id: request_id.clone(),
-        instance: agent_instance.clone(),
+        source: agent_instance.clone(),
     };
     let context = InferenceContext {
         cleanup_notification: None,

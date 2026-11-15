@@ -32,6 +32,7 @@ fn copy_tree(source: &Path, target: &Path) {
 }
 
 async fn send(socket: &mut Socket, kind: &str, id: &str, message: Value) {
+    eprintln!("POST_STOP send {kind} {id}");
     socket
         .send(Message::Text(
             json!({"type":kind,"id":id,"message":message})
@@ -45,9 +46,15 @@ async fn send(socket: &mut Socket, kind: &str, id: &str, message: Value) {
 async fn next(socket: &mut Socket, matches: impl Fn(&Value) -> bool) -> Value {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if let Some(Ok(Message::Text(text))) = socket.next().await {
+            let frame = socket
+                .next()
+                .await
+                .expect("WebSocket closed while waiting")
+                .expect("WebSocket read failed");
+            if let Message::Text(text) = frame {
                 let value: Value = serde_json::from_str(&text).unwrap();
                 if matches(&value) {
+                    eprintln!("POST_STOP recv {} {}", value["type"], value["id"]);
                     return value;
                 }
             }
@@ -103,16 +110,15 @@ fn original_websocket_can_query_inactive_workspaces_and_no_agents_after_last_sto
         "[server]\nbind='127.0.0.1:0'\n[outbound]\nlogs=['type:unmatched']\nbackend_state=['type:webui']\n").unwrap();
     // The route is configuration only. No user messages or inference effects
     // are submitted, and this test does not need a provider or external network.
-    let driver_model = agent_driver_core::read_driver(
+    let driver_settings = agent_driver_core::read_initial_settings(
         &root
             .path()
-            .join("agent-drivers/local/coder/latest/driver.toml"),
-        &Default::default(),
+            .join("agent-drivers/local/coder/latest/setting.toml"),
+        agent_driver_core::AgentDriverReadLimits::default().settings_bytes,
     )
-    .unwrap()
-    .manifest
-    .inference
-    .model;
+    .unwrap();
+    let settings: toml::Value = toml::from_str(&driver_settings).unwrap();
+    let driver_model = settings["inference"]["model"].as_str().unwrap();
     std::fs::write(root.path().join("models.toml"),
         format!("[[models]]\nid={driver_model:?}\nmodel='unused'\nbase_url='http://127.0.0.1:1/v1'\napi_key='unused-local-test'\nprovider='openai'\napi_type='chat_completions'\ncontext_window='128k'\n")).unwrap();
     let mut daemon = Daemon(
@@ -129,7 +135,9 @@ fn original_websocket_can_query_inactive_workspaces_and_no_agents_after_last_sto
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     let address = loop {
-        if let Ok(address) = std::fs::read_to_string(root.path().join("server-address")) {
+        if let Ok(address) = std::fs::read_to_string(root.path().join("server-address"))
+            && let Ok(address) = address.parse::<std::net::SocketAddr>()
+        {
             break address;
         }
         assert!(

@@ -7,6 +7,16 @@ pub type AddressDto = String;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum ClientMessage {
+    #[serde(rename = "log.req")]
+    LogReq {
+        id: String,
+        message: RuntimeLogQueryDto,
+    },
+    #[serde(rename = "log.append")]
+    LogAppend {
+        id: String,
+        message: ClientLogReportDto,
+    },
     #[serde(rename = "connection.register")]
     ConnectionRegister {
         id: String,
@@ -71,6 +81,7 @@ pub enum ClientMessage {
 impl ClientMessage {
     pub fn id(&self) -> &str {
         match self {
+            Self::LogReq { id, .. } | Self::LogAppend { id, .. } => id,
             Self::ConnectionRegister { id, .. } => id,
             Self::WorkspaceReq { id, .. } => id,
             Self::WorkspaceStart { id, .. } => id,
@@ -94,6 +105,25 @@ impl ClientMessage {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum ServerMessage {
+    LogRes {
+        id: String,
+        success: bool,
+        records: Option<Vec<RuntimeLogRecordDto>>,
+        next_before_sequence: Option<u64>,
+        next_after_sequence: Option<u64>,
+        error: Option<ProtocolErrorDto>,
+    },
+    LogSync {
+        records: Vec<RuntimeLogRecordDto>,
+    },
+    LogAppendResult {
+        id: String,
+        success: bool,
+        sequence: Option<u64>,
+        report_id: Option<String>,
+        error: Option<ProtocolErrorDto>,
+    },
+
     ConnectionRegisterResult {
         id: String,
         success: bool,
@@ -262,6 +292,33 @@ pub enum ServerMessage {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 enum ServerWire {
+    #[serde(rename = "log.res")]
+    LogRes {
+        id: String,
+        success: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        records: Option<Vec<RuntimeLogRecordDto>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_before_sequence: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_after_sequence: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ProtocolErrorDto>,
+    },
+    #[serde(rename = "log.sync")]
+    LogSync { records: Vec<RuntimeLogRecordDto> },
+    #[serde(rename = "log.append.result")]
+    LogAppendResult {
+        id: String,
+        success: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ProtocolErrorDto>,
+    },
+
     #[serde(rename = "connection.register.result")]
     ConnectionRegisterResult {
         id: String,
@@ -487,6 +544,35 @@ enum ServerWire {
 impl From<ServerMessage> for ServerWire {
     fn from(value: ServerMessage) -> Self {
         match value {
+            ServerMessage::LogRes {
+                id,
+                success,
+                records,
+                next_before_sequence,
+                next_after_sequence,
+                error,
+            } => Self::LogRes {
+                id,
+                success,
+                records,
+                next_before_sequence,
+                next_after_sequence,
+                error,
+            },
+            ServerMessage::LogSync { records } => Self::LogSync { records },
+            ServerMessage::LogAppendResult {
+                id,
+                success,
+                sequence,
+                report_id,
+                error,
+            } => Self::LogAppendResult {
+                id,
+                success,
+                sequence,
+                report_id,
+                error,
+            },
             ServerMessage::ConnectionRegisterResult {
                 id,
                 success,
@@ -706,6 +792,35 @@ impl From<ServerMessage> for ServerWire {
 impl From<ServerWire> for ServerMessage {
     fn from(value: ServerWire) -> Self {
         match value {
+            ServerWire::LogRes {
+                id,
+                success,
+                records,
+                next_before_sequence,
+                next_after_sequence,
+                error,
+            } => Self::LogRes {
+                id,
+                success,
+                records,
+                next_before_sequence,
+                next_after_sequence,
+                error,
+            },
+            ServerWire::LogSync { records } => Self::LogSync { records },
+            ServerWire::LogAppendResult {
+                id,
+                success,
+                sequence,
+                report_id,
+                error,
+            } => Self::LogAppendResult {
+                id,
+                success,
+                sequence,
+                report_id,
+                error,
+            },
             ServerWire::ConnectionRegisterResult {
                 id,
                 success,
@@ -927,7 +1042,7 @@ impl Serialize for ServerMessage {
         if value.get("success") == Some(&Value::Bool(true))
             && matches!(
                 value["type"].as_str(),
-                Some("agent.history.res" | "agent.log.res" | "agent.mcl.res")
+                Some("log.res" | "agent.history.res" | "agent.log.res" | "agent.mcl.res")
             )
         {
             for key in ["next_before_sequence", "next_after_sequence"] {
@@ -961,6 +1076,8 @@ impl<'de> Deserialize<'de> for ServerMessage {
 impl ServerMessage {
     pub fn id(&self) -> Option<&str> {
         match self {
+            Self::LogRes { id, .. } | Self::LogAppendResult { id, .. } => Some(id),
+            Self::LogSync { .. } => None,
             Self::ConnectionRegisterResult { id, .. } => Some(id),
             Self::WorkspaceRes { id, .. } => Some(id),
             Self::WorkspaceSync { .. } => None,
@@ -1295,4 +1412,50 @@ pub struct AgentUiFileDto {
     pub path: String,
     pub media_type: String,
     pub data: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLogQueryDto {
+    #[serde(default)]
+    pub after_sequence: Option<u64>,
+    #[serde(default)]
+    pub before_sequence: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientLogReportDto {
+    pub report_id: String,
+    pub created_at_ms: u64,
+    pub level: String,
+    pub target: String,
+    pub agent: Option<AddressDto>,
+    pub message: String,
+    pub details_json: Option<Value>,
+    pub context_json: Option<Value>,
+    pub origin: Option<String>,
+    pub raw_error: Option<String>,
+    pub traceback: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLogRecordDto {
+    pub received_at_ms: u64,
+    pub report_id: Option<String>,
+    pub reporter: String,
+    pub target: String,
+    pub agent: Option<AddressDto>,
+    pub sequence: u64,
+    pub created_at_ms: u64,
+    pub level: String,
+    pub source: String,
+    pub stage: String,
+    pub message: String,
+    pub details_json: Option<Value>,
+    pub context_json: Option<Value>,
+    pub origin: Option<String>,
+    pub raw_error: Option<String>,
+    pub traceback: Option<String>,
 }

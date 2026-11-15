@@ -1,4 +1,3 @@
-use address::Address;
 use agent_core::*;
 use agent_plugin::AgentPlugin;
 use app_runtime_plugin::RuntimePlugin;
@@ -174,42 +173,7 @@ fn release_inference(app: &mut App) {
         }
     }
 }
-fn release_ready(app: &mut App) {
-    let requests = std::mem::take(
-        &mut app
-            .world_mut()
-            .get_resource_mut::<FakeDomains>()
-            .unwrap()
-            .held_ready,
-    );
-    for request in requests {
-        let instance = app
-            .world()
-            .get_component::<DriverLuaVm>(request.owner)
-            .unwrap()
-            .instance
-            .clone();
-        if let Some(sender) = request.reply.lock().unwrap().take() {
-            let _ = sender.send(Ok(instance));
-        }
-    }
-}
-fn release_stop(app: &mut App) {
-    let requests = std::mem::take(
-        &mut app
-            .world_mut()
-            .get_resource_mut::<FakeDomains>()
-            .unwrap()
-            .held_stop,
-    );
-    for request in requests {
-        app.world_mut()
-            .remove_component::<DriverLuaVm>(request.instance.owner);
-        if let Some(sender) = request.reply.lock().unwrap().take() {
-            let _ = sender.send(Ok(()));
-        }
-    }
-}
+
 fn advance_until(app: &mut App, condition: impl Fn(&World) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !condition(app.world()) {
@@ -315,7 +279,10 @@ impl Fixture {
             .insert_component(workspace, spawn_workspace_executor().unwrap());
         let home = directory.join("agents/coder");
         let parameters = AgentStartParameters {
-            driver: "driver:local/first".into(),
+            initial_settings_path: root
+                .path()
+                .join("agent-drivers/local/first/latest/setting.toml"),
+            ui_path: root.path().join("agent-drivers/local/first/latest/ui"),
             project_root: root.path().join("project"),
             home_root: root.path().join("home"),
             database_path: home.join("state.sqlite"),
@@ -331,6 +298,7 @@ impl Fixture {
     fn request_start(&self, id: &str) -> oneshot::Receiver<Result<Entity, AgentError>> {
         let (sender, receiver) = oneshot::channel();
         self.app.world().emit_event(StartAgent {
+            owner: self.workspace,
             id: id.into(),
             workspace: self.workspace,
             name: "coder".into(),
@@ -390,99 +358,50 @@ impl Drop for Fixture {
     }
 }
 #[test]
-fn startup_parallel_init_same_frame_vm_ready_and_safe_agent_info() {
+fn startup_mounts_resources_in_parallel_without_creating_or_configuring_a_vm() {
     let mut fixture = Fixture::new();
-    fixture
-        .app
-        .world_mut()
-        .get_resource_mut::<FakeDomains>()
-        .unwrap()
-        .hold_ready = true;
-    let mut reply = fixture.request_start("start");
-    advance_until(&mut fixture.app, |world| {
-        !world
-            .get_resource::<FakeDomains>()
-            .unwrap()
-            .held_ready
-            .is_empty()
-    });
-    let agent = fixture.app.world().query_with::<Agent>().result()[0];
-    assert_eq!(
-        *fixture.app.world().agent_state(agent).unwrap(),
-        AgentState::Starting
-    );
-    assert!(reply.try_recv().is_err());
+    let agent = fixture.start();
     let source = fixture
         .app
         .world()
-        .get_component::<agent_core::AgentDriverSource>(agent)
+        .get_component::<AgentResources>(agent)
         .unwrap();
-    assert_eq!(source.address, fixture.parameters.driver);
-    assert!(source.manifest_path.starts_with(fixture.root.path()));
     assert_eq!(
-        source.manifest_path.canonicalize().unwrap(),
-        source.manifest_path
+        source.parameters.settings_path,
+        fixture.parameters.settings_path
     );
-    assert_eq!(source.manifest_path.file_name().unwrap(), "driver.toml");
-    let state = fixture.app.world().get_resource::<FakeDomains>().unwrap();
-    assert_eq!(state.tool_frames, state.inference_frames);
-    let request = &state.vm_starts[0];
-    let LuaBinding::Value(LuaValue::Object(info)) = &request.environment.globals["agent_info"]
-    else {
-        panic!()
-    };
-    assert_eq!(
-        info["entity"],
-        LuaValue::Object(BTreeMap::from([
-            ("index".into(), LuaValue::Integer(agent.index() as i64)),
-            (
-                "generation".into(),
-                LuaValue::Integer(agent.generation() as i64)
-            )
-        ]))
-    );
-    let LuaValue::Object(model) = &info["model"] else {
-        panic!()
-    };
-    assert_eq!(model["context_window_tokens"], LuaValue::Integer(8192));
-    let encoded = format!("{:?}", request.environment);
-    assert!(!encoded.contains("NEVER_EXPOSE"));
-    assert!(!encoded.contains("secret.endpoint"));
-    assert!(!request.environment.globals.contains_key("mcl"));
-    assert!(!request.environment.globals.contains_key("wait"));
+    assert!(fixture
+        .app
+        .world()
+        .contains_component::<AgentStorage>(agent));
+    assert!(fixture
+        .app
+        .world()
+        .contains_component::<AgentSession>(agent));
+    assert!(fixture
+        .app
+        .world()
+        .contains_component::<AgentWaitSlot>(agent));
+    assert!(!fixture.app.world().contains_component::<DriverLuaVm>(agent));
+    assert!(!fixture
+        .app
+        .world()
+        .contains_component::<AgentInferenceConfig>(agent));
+    let domains = fixture.app.world().get_resource::<FakeDomains>().unwrap();
+    assert_eq!(domains.tool_frames, domains.inference_frames);
+    assert!(domains.vm_starts.is_empty());
     assert_eq!(
         fixture
             .app
             .world()
-            .get_component::<MclQueue>(agent)
+            .get_component::<AgentOwner>(agent)
             .unwrap()
-            .allowed_imports,
-        vec!["tool:local/bash:latest", "prompt:local/system:latest"]
-    );
-    release_ready(&mut fixture.app);
-    assert_eq!(wait(&mut fixture.app, &mut reply).unwrap(), agent);
-    assert_eq!(
-        *fixture.app.world().agent_state(agent).unwrap(),
-        AgentState::Idle
-    );
-    assert_eq!(
-        fixture
-            .app
-            .world()
-            .get_component::<Address>(agent)
-            .unwrap()
-            .as_str(),
-        "agent:demo/coder:latest"
+            .0,
+        fixture.workspace
     );
     let mut stop = fixture.request_stop(agent, "stop");
     assert_eq!(wait(&mut fixture.app, &mut stop).unwrap(), agent);
     assert!(!fixture.app.world().is_alive(agent));
-    assert!(fixture
-        .app
-        .world()
-        .workspace_agents(fixture.workspace)
-        .unwrap()
-        .is_empty());
 }
 #[test]
 fn one_initialization_failure_still_waits_for_other_reply_before_cleanup() {
@@ -527,58 +446,81 @@ fn one_initialization_failure_still_waits_for_other_reply_before_cleanup() {
         .is_empty());
 }
 #[test]
-fn lost_vm_start_reply_retains_host_as_cleanup_is_not_proven() {
+fn lost_domain_initialization_reply_retains_unconfirmed_agent_host() {
     let mut fixture = Fixture::new();
     fixture
         .app
         .world_mut()
         .get_resource_mut::<FakeDomains>()
         .unwrap()
-        .lose_ready = true;
+        .hold_inference = true;
     let mut reply = fixture.request_start("start");
+    advance_until(&mut fixture.app, |world| {
+        !world
+            .get_resource::<FakeDomains>()
+            .unwrap()
+            .held_inference
+            .is_empty()
+    });
+    let requests = std::mem::take(
+        &mut fixture
+            .app
+            .world_mut()
+            .get_resource_mut::<FakeDomains>()
+            .unwrap()
+            .held_inference,
+    );
+    for request in requests {
+        request.reply.lock().unwrap().take();
+    }
     assert_eq!(
         wait(&mut fixture.app, &mut reply).unwrap_err().kind,
         AgentErrorKind::ReplyClosed
     );
     let agent = fixture.app.world().query_with::<Agent>().result()[0];
     assert_eq!(
-        *fixture.app.world().agent_state(agent).unwrap(),
-        AgentState::Starting
-    );
-    assert!(
-        !fixture
+        fixture
             .app
             .world()
-            .get_component::<MclQueue>(agent)
+            .get_component::<Agent>(agent)
             .unwrap()
-            .accepting
+            .state(),
+        AgentState::Error
     );
 }
 #[test]
-fn stop_vm_error_retains_stopping_host_and_runtime_components() {
+fn stopping_agent_does_not_cancel_or_stop_an_independent_workspace_vm() {
     let mut fixture = Fixture::new();
     let agent = fixture.start();
-    fixture
-        .app
-        .world_mut()
-        .get_resource_mut::<FakeDomains>()
-        .unwrap()
-        .fail_stop = true;
+    let execution = fixture.app.world_mut().spawn();
+    let cancel = CancellationToken::new();
+    fixture.app.world_mut().insert_component(
+        execution,
+        DriverLuaVm {
+            instance: DriverLuaVmInstance {
+                owner: execution,
+                start_id: "independent".into(),
+            },
+            wake: DriverWakeSlot::shared(),
+            ready: Arc::new(Mutex::new(None)),
+            ended: None,
+            cancel: cancel.clone(),
+        },
+    );
     let mut reply = fixture.request_stop(agent, "stop");
-    assert_eq!(
-        wait(&mut fixture.app, &mut reply).unwrap_err().kind,
-        AgentErrorKind::CleanupFailed
-    );
-    assert!(fixture.app.world().is_alive(agent));
-    assert_eq!(
-        *fixture.app.world().agent_state(agent).unwrap(),
-        AgentState::Stopping
-    );
-    assert!(fixture.app.world().contains_component::<DriverLuaVm>(agent));
+    wait(&mut fixture.app, &mut reply).unwrap();
+    assert!(!cancel.is_cancelled());
     assert!(fixture
         .app
         .world()
-        .contains_component::<AgentStorage>(agent));
+        .contains_component::<DriverLuaVm>(execution));
+    assert!(fixture
+        .app
+        .world()
+        .get_resource::<FakeDomains>()
+        .unwrap()
+        .vm_stops
+        .is_empty());
 }
 #[test]
 fn restart_with_unfinished_tools_rejects_without_cancellation_or_vm_stop() {
@@ -598,13 +540,6 @@ fn restart_with_unfinished_tools_rejects_without_cancellation_or_vm_stop() {
         .unwrap()
         .register("unfinished".into(), task.clone())
         .unwrap();
-    let vm_cancel = fixture
-        .app
-        .world()
-        .get_component::<DriverLuaVm>(agent)
-        .unwrap()
-        .cancel
-        .clone();
     let mut reply = fixture.request_restart("restart", fixture.parameters.clone());
     fixture.app.tick();
     assert_eq!(
@@ -612,10 +547,9 @@ fn restart_with_unfinished_tools_rejects_without_cancellation_or_vm_stop() {
         AgentErrorKind::UnfinishedTasks
     );
     assert!(!task.cancel_token().is_cancelled());
-    assert!(!vm_cancel.is_cancelled());
     assert_eq!(
         *fixture.app.world().agent_state(agent).unwrap(),
-        AgentState::Idle
+        AgentState::Starting
     );
     assert!(
         fixture
@@ -696,26 +630,40 @@ fn restart_uses_new_driver_same_entity_and_preserves_database_settings_without_f
     let old = fixture
         .app
         .world()
-        .get_component::<DriverLuaVm>(agent)
+        .get_component::<AgentSession>(agent)
         .unwrap()
-        .instance
+        .0
         .clone();
     let mut parameters = fixture.parameters.clone();
-    parameters.driver = "driver:local/second".into();
+    parameters.initial_settings_path = fixture
+        .root
+        .path()
+        .join("agent-drivers/local/second/latest/setting.toml");
+    parameters.ui_path = fixture
+        .root
+        .path()
+        .join("agent-drivers/local/second/latest/ui");
     let mut reply = fixture.request_restart("restart", parameters);
     assert_eq!(wait(&mut fixture.app, &mut reply).unwrap(), agent);
     assert_ne!(
         fixture
             .app
             .world()
-            .get_component::<DriverLuaVm>(agent)
+            .get_component::<AgentSession>(agent)
             .unwrap()
-            .instance,
+            .0,
         old
     );
+    assert!(fixture
+        .app
+        .world()
+        .get_resource::<FakeDomains>()
+        .unwrap()
+        .vm_starts
+        .is_empty());
     assert_eq!(
         *fixture.app.world().agent_state(agent).unwrap(),
-        AgentState::Idle
+        AgentState::Starting
     );
     assert!(fixture
         .app
@@ -724,17 +672,6 @@ fn restart_uses_new_driver_same_entity_and_preserves_database_settings_without_f
         .unwrap()
         .get("completed")
         .is_err());
-    assert_eq!(
-        fixture
-            .app
-            .world()
-            .get_resource::<FakeDomains>()
-            .unwrap()
-            .vm_starts[1]
-            .program
-            .source,
-        "return 'second'"
-    );
     let settings = std::fs::read_to_string(&fixture.parameters.settings_path).unwrap();
     assert!(settings.contains("original"));
     assert!(settings.contains("42"));
@@ -846,14 +783,6 @@ fn stop_closes_admission_then_waits_for_vm_inference_tools_and_mcl_drain() {
     assert!(cancel.is_cancelled());
     assert!(tool.cancel_token().is_cancelled());
     assert!(gate.load(Ordering::SeqCst) > 0);
-    advance_until(&mut fixture.app, |world| {
-        !world
-            .get_resource::<FakeDomains>()
-            .unwrap()
-            .held_stop
-            .is_empty()
-    });
-    release_stop(&mut fixture.app);
     inference_release.send(()).unwrap();
     tool_release.send(()).unwrap();
     for _ in 0..20 {
@@ -873,12 +802,14 @@ fn stop_closes_admission_then_waits_for_vm_inference_tools_and_mcl_drain() {
 fn same_frame_stop_precedes_restart_and_duplicate_stop_is_rejected() {
     let mut fixture = Fixture::new();
     let agent = fixture.start();
-    fixture
+    let drain = fixture
         .app
-        .world_mut()
-        .get_resource_mut::<FakeDomains>()
+        .world()
+        .get_component::<MclQueue>(agent)
         .unwrap()
-        .hold_stop = true;
+        .drain
+        .clone();
+    drain.started();
     let mut stop = fixture.request_stop(agent, "stop");
     let mut restart = fixture.request_restart("restart", fixture.parameters.clone());
     fixture.app.tick();
@@ -896,14 +827,7 @@ fn same_frame_stop_precedes_restart_and_duplicate_stop_is_rejected() {
         duplicate.try_recv().unwrap().unwrap_err().kind,
         AgentErrorKind::StateRejected
     );
-    advance_until(&mut fixture.app, |world| {
-        !world
-            .get_resource::<FakeDomains>()
-            .unwrap()
-            .held_stop
-            .is_empty()
-    });
-    release_stop(&mut fixture.app);
+    drain.completed(None);
     wait(&mut fixture.app, &mut stop).unwrap();
 }
 #[test]
@@ -940,12 +864,12 @@ fn managed_database_paths_and_workspace_whitelist_are_checked_before_spawning() 
     );
 }
 #[test]
-fn missing_driver_is_read_fresh_and_confirmed_pre_vm_failure_removes_host() {
+fn missing_initial_config_fails_without_creating_a_vm_and_confirmed_cleanup_removes_host() {
     let mut fixture = Fixture::new();
     let path = fixture
         .root
         .path()
-        .join("agent-drivers/local/first/latest/base.lua");
+        .join("agent-drivers/local/first/latest/setting.toml");
     std::fs::remove_file(path).unwrap();
     let mut reply = fixture.request_start("missing");
     assert_eq!(
@@ -977,7 +901,7 @@ fn exception_closes_admission_and_retains_host_without_faking_cleanup() {
     fixture.app.tick();
     assert_eq!(
         *fixture.app.world().agent_state(agent).unwrap(),
-        AgentState::Stopping
+        AgentState::Error
     );
     assert!(
         !fixture
@@ -990,10 +914,12 @@ fn exception_closes_admission_and_retains_host_without_faking_cleanup() {
     assert!(fixture
         .app
         .world()
-        .get_component::<DriverLuaVm>(agent)
+        .get_component::<AgentWaitSlot>(agent)
         .unwrap()
-        .cancel
-        .is_cancelled());
+        .0
+        .lock()
+        .unwrap()
+        .is_closed());
     assert!(fixture.app.world().is_alive(agent));
     assert!(fixture
         .app
@@ -1044,4 +970,44 @@ fn test_agent_context() -> agent_core::AgentUpdateContext {
 
 fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
     workspace_core::WorkspaceUpdateContext::new(|_, _| {})
+}
+
+#[test]
+fn stopping_during_starting_waits_for_the_real_initialization_reply() {
+    let mut fixture = Fixture::new();
+    fixture
+        .app
+        .world_mut()
+        .get_resource_mut::<FakeDomains>()
+        .unwrap()
+        .hold_inference = true;
+    let mut start = fixture.request_start("start");
+    advance_until(&mut fixture.app, |world| {
+        !world
+            .get_resource::<FakeDomains>()
+            .unwrap()
+            .held_inference
+            .is_empty()
+    });
+    let agent = fixture.app.world().query_with::<Agent>().result()[0];
+    let mut stop = fixture.request_stop(agent, "stop-starting");
+    for _ in 0..10 {
+        fixture.app.tick();
+        std::thread::yield_now();
+    }
+    assert!(stop.try_recv().is_err());
+    assert!(fixture.app.world().is_alive(agent));
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get_component::<Agent>(agent)
+            .unwrap()
+            .state(),
+        AgentState::Stopping
+    );
+    release_inference(&mut fixture.app);
+    assert!(wait(&mut fixture.app, &mut start).is_err());
+    assert_eq!(wait(&mut fixture.app, &mut stop).unwrap(), agent);
+    assert!(!fixture.app.world().is_alive(agent));
 }

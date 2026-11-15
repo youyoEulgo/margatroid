@@ -30,7 +30,7 @@ async fn matching(
 #[test]
 fn read_complete_resources_has_stable_content_identity_and_strict_budget() {
     let root = tempfile::tempdir().unwrap();
-    let manifest = root.path().join("driver.toml");
+    let manifest = root.path().join("ui");
     assert!(
         read_driver_ui(&manifest, DriverUiReadLimits::default())
             .unwrap()
@@ -83,26 +83,20 @@ fn read_complete_resources_has_stable_content_identity_and_strict_budget() {
 }
 #[cfg(unix)]
 #[test]
-fn ui_files_and_root_cannot_escape_the_driver_directory() {
+fn ui_files_and_symlink_root_cannot_escape_the_selected_directory() {
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     write(root.path(), "ui/index.html", "safe");
     write(outside.path(), "secret", "private");
     std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("ui/leak")).unwrap();
     assert_eq!(
-        read_driver_ui(
-            &root.path().join("driver.toml"),
-            DriverUiReadLimits::default()
-        ),
+        read_driver_ui(&root.path().join("ui"), DriverUiReadLimits::default()),
         Err(DriverUiError::PathInvalid)
     );
     let link_root = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(outside.path(), link_root.path().join("ui")).unwrap();
     assert_eq!(
-        read_driver_ui(
-            &link_root.path().join("driver.toml"),
-            DriverUiReadLimits::default()
-        ),
+        read_driver_ui(&link_root.path().join("ui"), DriverUiReadLimits::default()),
         Err(DriverUiError::PathInvalid)
     );
 }
@@ -113,7 +107,7 @@ async fn monitor_observes_creation_edits_deletion_errors_and_recovery_without_qu
     fs::create_dir(&directory).unwrap();
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let (watch, monitor) = open_driver_ui_watch(
-        directory.join("driver.toml"),
+        directory.join("ui"),
         Arc::new(move |state| {
             sender.send(state).unwrap();
         }),
@@ -187,7 +181,7 @@ async fn cancel_waits_for_the_real_publication_worker_to_return() {
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
     let blocked = gate.clone();
     let (watch, monitor) = open_driver_ui_watch(
-        root.path().join("driver.toml"),
+        root.path().join("ui"),
         Arc::new(move |_| {
             observed.notify_one();
             let (lock, condition) = &*blocked;

@@ -129,6 +129,11 @@ pub(crate) enum RunnerFrame {
         request_id: String,
         registration: RegisterToolsRequest,
     },
+    Host {
+        request_id: String,
+        method: String,
+        arguments: Value,
+    },
     WorkspaceAgents {
         request_id: String,
     },

@@ -159,7 +159,7 @@ async fn configuration_uses_arguments_and_execution_waits_for_host_acknowledgeme
         end
         assert(type(margatroid) == 'userdata')
         assert(margatroid.version == nil and margatroid.arguments == nil and margatroid.null == nil)
-        for _, namespace in ipairs({'files','data','text','process','driver','tools','task'}) do
+        for _, namespace in ipairs({'files','data','text','process','mcl','agent','workspace','tools','task'}) do
             assert(type(margatroid[namespace]) == 'userdata')
         end
         assert(context == nil and args == nil and json == nil and base64 == nil and await_any == nil)

@@ -168,10 +168,16 @@ TracingRecord：tracing记录，公开结构体--TracingStream向外提供的结
     target: String--target，公开
     message: String--消息，公开
     fields: Vec<TracingField>--字段，公开
+    file: Option<String>--真实tracing调用文件
+    line: Option<u32>
+    module: Option<String>
     spans: Vec<String>--Span栈，公开
 
 TracingStream：诊断流，公开结构体--有界广播进程内tracing日志；subscribe接收全部通过Layer过滤的记录，订阅者可自行按target筛选
-    sender: broadcast::Sender<TracingRecord>--发送端；私有
+    sender: broadcast::Sender<TracingRecord>--尽力广播，私有
+    sinks: Arc<Mutex<BTreeMap<u64, DurableSink>>>--同步持久观察者，私有
+    subscribe_persistent(&self, sink: impl Fn(&TracingRecord) + Send + Sync + 'static) -> TracingSinkGuard
+        行为：登记唯一id的持久回调，返回精确解绑凭证；不经有界广播缓存，不丢弃记录。
     new(capacity: usize) -> Self
         构造诊断流：crate公开关联函数，capacity指定广播通道容量
         行为：使用capacity创建广播通道并持有发送端
@@ -187,6 +193,11 @@ TracingStream：诊断流，公开结构体--有界广播进程内tracing日志�
     impl Resource for TracingStream
         Resource：公开trait实现
 
+TracingSinkGuard：公开Resource
+    sinks: Weak<Mutex<BTreeMap<u64, DurableSink>>>
+    id: u64
+    impl Drop：仅移除本id的回调，不保留App或World，不取消其他观察者。
+DurableSink（私有别名） = Arc<dyn Fn(&TracingRecord) + Send + Sync>
 TracingSubscription：诊断流订阅，公开结构体--持有一个独立广播接收端及其累计丢弃数
     receiver: broadcast::Receiver<TracingRecord>--接收端；私有
     dropped: u64--已丢弃数；私有
@@ -249,12 +260,14 @@ crate公开：
 ```text
 TracingStreamLayer：诊断流Layer，crate公开结构体
     sender: broadcast::Sender<TracingRecord>--发送端
+    sinks: Arc<Mutex<BTreeMap<u64, DurableSink>>>--与TracingStream共享的持久观察入口
     impl<S> Layer<S> for TracingStreamLayer
         Layer：crate公开泛型trait实现
         约束：S: Subscriber + for<'lookup> LookupSpan<'lookup>
         on_event(&self, event: &tracing::Event<'_>, context: Context<'_, S>)
             处理tracing事件：event提供日志数据，context提供Span上下文
-            行为：构造TracingRecord并尝试广播，无接收者时直接丢弃，慢接收者由广播通道报告Lagged且不阻塞日志调用
+            行为：构造包含调用文件/行号/模块的TracingRecord，短锁克隆持久观察者列表后释放锁，逐个同步调用持久入口；随后才发送原尽力广播。
+                持久观察不经过可丢弃缓存；广播无接收者或Lagged不影响已提交诊断。同步持久回调可阻塞日志调用，但不持sinks锁执行。
 
 JsonLayer<Writer>：JSON Layer，crate公开结构体--将TracingRecord编码为单行JSON
     writer: Writer--Writer
@@ -345,7 +358,7 @@ record_from_event<S>(event: &tracing::Event<'_>, context: Context<'_, S>) -> Tra
     用户显式配置的File Layer与TracingStream Layer也可按过滤规则处理EventLog
     非阻塞文件Writer的WorkerGuard由进程全局持有到进程结束
     显式filter完全覆盖level生成的指令，不叠加默认级别，不自动读取RUST_LOG
-    TracingStream有界且不反向阻塞tracing调用；新订阅无历史重放，无接收者直接丢弃，慢订阅者报告Lagged
+    TracingStream广播部分仍有界且不反向阻塞，新订阅无历史重放、慢订阅报告Lagged；持久观察者是独立同步路径，必须先完成真实写入，不受广播丢弃影响
     诊断流不持久化、不保证可靠送达；文件输出需显式配置
     应用守护进程的stderr加容量256诊断流是应用配置，不是框架默认配置
 ```

@@ -1,4 +1,4 @@
-use agent_core::{Agent, AgentStartParameters, AgentState, RestartAgent, StartAgent, StopAgent};
+use agent_core::{AgentStartParameters, RestartAgent, StartAgent, StopAgent};
 use agent_plugin::AgentPlugin;
 use app_runtime_plugin::RuntimePlugin;
 use async_runtime_plugin::AsyncRuntimePlugin;
@@ -137,7 +137,10 @@ impl Fixture {
                 },
             )])));
         let workspace = app.world_mut().spawn();
-        app.world_mut().insert_component(workspace,address::Address::new("workspace:test/unit").unwrap());
+        app.world_mut().insert_component(
+            workspace,
+            address::Address::new("workspace:test/unit").unwrap(),
+        );
         let directory = root.join("workspaces/demo");
         app.world_mut().insert_component(
             workspace,
@@ -157,7 +160,8 @@ impl Fixture {
             app,
             workspace,
             parameters: AgentStartParameters {
-                driver: "driver:local/test:latest".into(),
+                initial_settings_path: root.join("agent-drivers/local/test/latest/setting.toml"),
+                ui_path: root.join("agent-drivers/local/test/latest/ui"),
                 project_root: root.join("project"),
                 home_root: root.join("home"),
                 database_path: directory.join("agents/coder/state.sqlite"),
@@ -168,6 +172,7 @@ impl Fixture {
     fn start(&mut self) -> Entity {
         let (sender, mut receiver) = oneshot::channel();
         self.app.world().emit_event(StartAgent {
+            owner: self.workspace,
             id: "start".into(),
             workspace: self.workspace,
             name: "coder".into(),
@@ -234,14 +239,7 @@ fn wait<T>(app: &mut App, receiver: &mut oneshot::Receiver<T>) -> T {
         std::thread::yield_now();
     }
 }
-fn advance_until(app: &mut App, condition: impl Fn(&World) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !condition(app.world()) {
-        app.tick();
-        assert!(Instant::now() < deadline, "VM transition timed out");
-        std::thread::yield_now();
-    }
-}
+
 fn mcl(
     app: &App,
     source: Entity,
@@ -271,18 +269,24 @@ fn mcl(
     receiver
 }
 #[test]
-fn real_agent_restart_allows_current_driver_initialization_but_refuses_external_and_stale_sources()
-{
+fn real_agent_restart_replaces_only_its_session_and_preserves_persistent_blocks() {
     let root = tempfile::tempdir().unwrap();
     seed(root.path());
     let mut fixture = Fixture::open(root.path());
     let agent = fixture.start();
+    assert!(
+        fixture
+            .app
+            .world()
+            .get_component::<DriverLuaVm>(agent)
+            .is_none()
+    );
     let old = fixture
         .app
         .world()
-        .get_component::<DriverLuaVm>(agent)
+        .get_component::<agent_core::AgentSession>(agent)
         .unwrap()
-        .instance
+        .0
         .clone();
     let storage = fixture
         .app
@@ -290,118 +294,105 @@ fn real_agent_restart_allows_current_driver_initialization_but_refuses_external_
         .get_component::<AgentStorage>(agent)
         .unwrap()
         .clone();
-    execute_storage(
-        &storage,
-        StorageOperation::ReplaceMessages {
-            sources: vec![MessageSource::Literal(vec![
-                serde_json::json!({"type":"user","content":"persistent"}),
-            ])],
-            target: MessageSelector {
-                block: "conversation".into(),
-                field: "messages".into(),
-                instance: None,
-                selection: MessageSelection::All,
+    for (name, instance) in [("conversation", None), ("private", Some(old.clone()))] {
+        execute_storage(
+            &storage,
+            StorageOperation::CreateBlock {
+                name: name.into(),
+                fields: vec!["messages".into()],
+                instance: instance.clone(),
             },
-        },
-    )
-    .unwrap();
-    let (sender, mut restarted) = oneshot::channel();
+        )
+        .unwrap();
+        execute_storage(
+            &storage,
+            StorageOperation::ReplaceMessages {
+                sources: vec![MessageSource::Literal(vec![
+                    serde_json::json!({"type":"user","content":"preserved"}),
+                ])],
+                target: MessageSelector {
+                    block: name.into(),
+                    field: "messages".into(),
+                    instance,
+                    selection: MessageSelection::All,
+                },
+            },
+        )
+        .unwrap();
+    }
+    let (tx, mut rx) = oneshot::channel();
     fixture.app.world().emit_event(RestartAgent {
         id: "restart".into(),
         workspace: fixture.workspace,
         name: "coder".into(),
         parameters: fixture.parameters.clone(),
-        reply: Arc::new(Mutex::new(Some(sender))),
+        reply: Arc::new(Mutex::new(Some(tx))),
     });
-    advance_until(&mut fixture.app, |world| {
-        world
-            .get_component::<Agent>(agent)
-            .is_some_and(|agent| agent.state() == AgentState::Restarting)
-            && world
-                .get_component::<DriverLuaVm>(agent)
-                .is_some_and(|vm| vm.instance != old)
-    });
-    let external = fixture.app.world_mut().spawn();
-    fixture.app.world_mut().insert_component(
-        external,
-        address::Address::new("client:local/external:latest").unwrap(),
-    );
-    let mut external_reply = mcl(
-        &fixture.app,
-        external,
-        agent,
-        None,
-        "external-during-restart",
-    );
-    let mut stale_reply = mcl(
-        &fixture.app,
-        agent,
-        agent,
-        Some(old.start_id.clone()),
-        "old-driver-during-restart",
-    );
-    let mut unbound_reply = mcl(
-        &fixture.app,
-        agent,
-        agent,
-        None,
-        "unbound-self-during-restart",
-    );
-    for reply in [&mut external_reply, &mut stale_reply, &mut unbound_reply] {
-        let mcl_core::MclValue::Error(message) = wait(&mut fixture.app, reply).unwrap() else {
-            panic!("error message")
-        };
-        assert_eq!(message["type"], "error");
-        assert!(
-            message["message"]
-                .as_str()
-                .unwrap()
-                .starts_with("SourceInvalid:")
-        );
-    }
-    assert_eq!(wait(&mut fixture.app, &mut restarted).unwrap(), agent);
-    assert_eq!(
-        fixture
-            .app
-            .world()
-            .get_component::<Agent>(agent)
-            .unwrap()
-            .state(),
-        AgentState::Idle
-    );
-    let new = fixture
+    assert_eq!(wait(&mut fixture.app, &mut rx).unwrap(), agent);
+    let current = fixture
         .app
         .world()
-        .get_component::<DriverLuaVm>(agent)
+        .get_component::<agent_core::AgentSession>(agent)
         .unwrap()
-        .instance
+        .0
         .clone();
-    assert_ne!(old.start_id, new.start_id);
+    assert_ne!(old, current);
     assert_eq!(
         execute_storage(
-            fixture
-                .app
-                .world()
-                .get_component::<AgentStorage>(agent)
-                .unwrap(),
+            &storage,
             StorageOperation::ReadMessages {
                 selectors: vec![MessageSelector {
                     block: "conversation".into(),
                     field: "messages".into(),
-                    instance: Some(new.start_id),
+                    instance: Some(current.clone()),
                     selection: MessageSelection::All
                 }]
             }
         )
         .unwrap(),
         StorageValue::Messages(vec![
-            serde_json::json!({"type":"user","content":"persistent"})
+            serde_json::json!({"type":"user","content":"preserved"})
         ])
     );
+    assert!(
+        execute_storage(
+            &storage,
+            StorageOperation::ReadMessages {
+                selectors: vec![MessageSelector {
+                    block: "private".into(),
+                    field: "messages".into(),
+                    instance: Some(current),
+                    selection: MessageSelection::All
+                }]
+            }
+        )
+        .is_err()
+    );
+    let external = fixture.app.world_mut().spawn();
+    fixture.app.world_mut().insert_component(
+        external,
+        address::Address::new("client:local/test").unwrap(),
+    );
+    let mut query = mcl(&fixture.app, external, agent, None, "config-query");
+    assert!(matches!(
+        wait(&mut fixture.app, &mut query).unwrap(),
+        mcl_core::MclValue::Config(_)
+    ));
+    let mut stale = mcl(
+        &fixture.app,
+        agent,
+        agent,
+        Some("old-execution".into()),
+        "stale",
+    );
+    assert!(matches!(
+        wait(&mut fixture.app, &mut stale).unwrap(),
+        mcl_core::MclValue::Error(_)
+    ));
     fixture.stop(agent);
 }
 #[test]
-fn vm_instances_and_temp_namespaces_are_fresh_across_process_restarts() {
+fn agent_sessions_and_temp_namespaces_are_fresh_across_process_restarts() {
     const ROOT: &str = "MARGATROID_REAL_VM_PROBE_ROOT";
     const OUTPUT: &str = "MARGATROID_REAL_VM_PROBE_OUTPUT";
     if let Some(root) = std::env::var_os(ROOT) {
@@ -410,10 +401,9 @@ fn vm_instances_and_temp_namespaces_are_fresh_across_process_restarts() {
         let id = fixture
             .app
             .world()
-            .get_component::<DriverLuaVm>(agent)
+            .get_component::<agent_core::AgentSession>(agent)
             .unwrap()
-            .instance
-            .start_id
+            .0
             .clone();
         std::fs::write(std::env::var_os(OUTPUT).unwrap(), id).unwrap();
         fixture.stop(agent);
@@ -427,7 +417,7 @@ fn vm_instances_and_temp_namespaces_are_fresh_across_process_restarts() {
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "vm_instances_and_temp_namespaces_are_fresh_across_process_restarts",
+                "agent_sessions_and_temp_namespaces_are_fresh_across_process_restarts",
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -444,7 +434,7 @@ fn vm_instances_and_temp_namespaces_are_fresh_across_process_restarts() {
         ids.push(std::fs::read_to_string(output_path).unwrap());
     }
     assert_ne!(ids[0], ids[1]);
-    assert!(ids.iter().all(|id| id.starts_with("driver-")));
+    assert!(ids.iter().all(|id| id.starts_with("agent-session:")));
 }
 
 fn test_binding() -> tool_core::TaskSyncBinding {

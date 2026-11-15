@@ -11,7 +11,7 @@ System列出处理事件、闭包结果、产出事件及回复；实施状态�
 ```text
 # lib      dto/plugin/src/lib.rs
 # system   dto/plugin/src/system.rs
-# handler  dto/plugin/src/handler.rs、projection.rs、ui.rs、records.rs、probes.rs、workspaces.rs、monitor.rs
+# handler  dto/plugin/src/handler.rs、projection.rs、ui.rs、records.rs、probes.rs、workspaces.rs、monitor.rs、runtime_logs.rs
 # types    dto/plugin/src/types.rs
 ```
 
@@ -25,7 +25,7 @@ DtoPlugin：无字段，Default
     new() -> Self
     impl Plugin
         build(self, app: &mut App)
-            行为：检查Runtime/AsyncRuntime/Axum及MargatroidConfig，复用World唯一Clients；存在的typed绑定必须与该槽位一致。
+            行为：检查必需RuntimeLogStore、Runtime/AsyncRuntime/Axum及MargatroidConfig，复用World唯一Clients；存在的typed绑定必须与该槽位一致。
                 取得或创建应用级WorkspaceSyncBinding及AgentUpdateContext，安装资源probe工厂，初始化DtoState及只持监控归属的SyncObservations。
                 为安装前已有Agent初始化实际来源观察，在应用启动建立一次Workspace定义磁盘监控。
                 注册GET /ws；只安装PRE_UPDATE的abort_control_system和UPDATE的dto_route_system，不安装同步System。
@@ -38,6 +38,8 @@ model_sync_binding(context: AgentUpdateContext) -> ModelSyncBinding
     行为：按owner衍生实际来源scope，映射安全Tools/沙箱/模型纯值；旧scope失效后回调不生效，不跨plugin依赖。
 workspace_sync_binding(clients: Clients, targets: &[OutboundTarget]) -> WorkspaceSyncBinding
     行为：创建应用级WorkspaceViews，定义成功/错误观察和生命周期探针共同更新同一owned列表。
+runtime_log_probe(clients: Clients, targets: &[OutboundTarget]) -> RuntimeLogProbe
+    行为：捕获同一Clients及logs目标选择器，实际提交后编码LogSync完整记录并直接send_ordered；不调用World或发ECS同步事件。
 sync_selectors(targets: &[OutboundTarget]) -> Arc<[ClientSelector]>
     行为：明确转换Broadcast/Type/Name，不从任意wire消息猜投递范围。
 
@@ -73,8 +75,14 @@ crate公开：
 ws_handler(State(state): State<DtoState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Future<Output = Response>
     行为：评估入口策略和退出状态，通过state.clients.allocate取得真实连接、唯一ClientReceiver及取消能力；升级任务持有AxumWorkGuard。
 
+runtime_logs::handle(world: &mut World, route: &str, object: Box<dyn Any + Send>)
+    行为：复用原DtoRequest；log.req校验实际Client并blocking读取RuntimeLogStore页；log.append固定真实Client Address、source=Host/stage=client，保留原报告及可信reporting_client上下文，blocking提交并等待join后沿原reply回复。
+runtime_logs::report_response(state, connection, request: Value, response: &Value, diagnostic: Option<String>) -> Future<Output = ()>
+    行为：仅实际失败响应生成报告；保留网络简化前的领域Debug诊断、原请求和响应、Client/请求id、原始错误及边界调用栈，await数据库提交；失败不能伪报已保存。
+runtime_logs::report_ui(store: &RuntimeLogStore, address: &str, origin: &Path, state: &DriverUiState)
+    行为：UI监控首次Initializing及真实状态变化在发布前持久记录；Initializing为Warn，Ready为Info，Failed为Error并保留原始读取错误/调用栈；资源只记录revision及文件元数据，不复制UI二进制正文进诊断。
 handle_dto_request(world: &mut World, request: DtoRequest)
-    行为：取出具体owned对象，按route转换领域请求或只读查询；原reply继续沿领域执行链回复。
+    行为：取出具体owned对象，按route转换领域请求或只读查询；原reply继续沿领域执行链回复。agent.restart在全量定义重载验证Workspace仍存在后沿用目标Agent保存的创建参数，不用定义中的程序目录覆盖配置/UI引用。
 
 handle_abort_control(world: &mut World, event: AbortTurnControl)
     行为：认领原请求，校验真实Client、Agent及turn，调用WorldAgentExt的统一turn入口及相关领域取消能力；原oneshot回复。
@@ -82,6 +90,7 @@ handle_abort_control(world: &mut World, event: AbortTurnControl)
 projection::address(world: &World, entity: Entity) -> Option<String>
 projection::workspaces(world: &World) -> Vec<WorkspaceInfoDto>
 projection::agents(world: &World) -> Vec<AgentStateDto>
+    行为：逐字投影starting/running/error/stopping，不将资源挂载或无turn误报ready；turn通过独立投影发布。
 projection::turn(world: &World, entity: Entity) -> Option<AgentTurnStateDto>
 projection::tasks(world: &World, entity: Entity) -> Option<AgentTaskStateDto>
     行为：仅服务req的非破坏性只读查询，从所属领域共享状态取得完整快照；不创建观察、不推进脚本cursor、不触发sync或IO调查。
@@ -148,7 +157,7 @@ records(world: &World, route: &str, object: Box<dyn Any + Send>)
 reload(world: &World, object: Box<dyn Any + Send>)
     行为：校验Client，克隆WorkspaceDefinitions，执行同一全量reload并回复；成功发布也经Workspace统一入口同步。
 query_agent_ui(world: &World, object: Box<dyn Any + Send>)
-    行为：核对当前Agent及实际Driver来源，读取该来源已有观察状态；未就绪返回AgentUiNotReady，不创建监控。
+    行为：核对当前Agent及实际AgentResources.parameters.ui_path来源，读取该来源已有观察状态；未就绪返回AgentUiNotReady，不创建监控。
 
 project_agent_ui(value: Option<Arc<DriverUiBundle>>) -> Result<Option<AgentUiBundleDto>, ProtocolErrorDto>
     行为：保持原字节、排序相对路径、媒体类型、entry及内容revision，data使用标准base64。
@@ -162,7 +171,12 @@ target(world: &World, address: &str) -> Result<Entity, ProtocolErrorDto>
 agent(world: &World, address: &str) -> Result<Entity, ProtocolErrorDto>
     行为：使用实际连接身份与Address定位完整Entity；Agent启动参数仍取同次全量reload快照。
 deliver<R, E>(reply: &PreparedReply<R, E>, result: Result<R, E>)
-reject<T, R, E: BoundaryError>(request: Prepared<T, R, E>, failure: ProtocolErrorDto)
+reject<T, R, E: BoundaryError>(request: ReplyOutput：私有一次性网络回复及诊断材料
+    value: Value
+    request: Value
+    diagnostic: Option<String>--领域错误转换为安全wire错误前取得原始Debug报告
+ReplyFuture = Pin<Box<dyn Future<Output = ReplyOutput> + Send>>
+Prepared<T, R, E>, failure: ProtocolErrorDto)
     行为：只认领原oneshot发送端一次。
 encode_response(value: Value) -> Option<String>
 invalid_reply(text: &str) -> Option<Value>
@@ -237,7 +251,7 @@ SyncObservations：Resource
     行为：只持监控归属和查询能力，不保存每连接全量投影或每帧发送位置。
 UiWatchSlot
     completion: Arc<MonitorCompletion>
-    manifest_path: PathBuf
+    ui_path: PathBuf
     address: String
     watch: DriverUiWatch
     sync: SyncContext<UiDelivery>
@@ -318,7 +332,7 @@ compose
 │   ├── Workspace定义磁盘监控及运行信息统一入口
 │   ├── Agent/Turn/Tools/Sandbox/Model公共信息统一入口
 │   ├── Task创建、输出、Return、错误、移除统一入口
-│   ├── Driver UI磁盘监控
+│   ├── 创建时传入的UI目录磁盘监控
 │   ├── 成功提交驱动的持久记录监控
 │   └── 推理chunk/full执行链
 └── 所有发送源直接遍历Clients并投递ClientSender

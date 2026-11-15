@@ -29,6 +29,19 @@ pub fn parse_client_message(text: &str) -> Result<ClientMessage, ProtocolError> 
     if !raw.get("message").is_some_and(Value::is_object) {
         return Err(invalid("message must be an explicit object"));
     }
+    if raw["type"] == "log.append" {
+        require_fields(
+            &raw["message"],
+            &[
+                "agent",
+                "details_json",
+                "context_json",
+                "origin",
+                "raw_error",
+                "traceback",
+            ],
+        )?;
+    }
     let message: ClientMessage = serde_json::from_value(raw)
         .map_err(|_| invalid("invalid protocol message shape or unknown field"))?;
     if !valid_request_id(message.id()) {
@@ -37,6 +50,35 @@ pub fn parse_client_message(text: &str) -> Result<ClientMessage, ProtocolError> 
         ));
     }
     match &message {
+        ClientMessage::LogReq { message, .. } => {
+            if message.before_sequence.is_some_and(|v| v > i64::MAX as u64)
+                || message.after_sequence.is_some_and(|v| v > i64::MAX as u64)
+                || message.limit == Some(0)
+                || matches!((message.after_sequence,message.before_sequence),(Some(a),Some(b))if a>=b)
+            {
+                return Err(invalid("invalid log range"));
+            }
+        }
+        ClientMessage::LogAppend { message, .. } => {
+            if !valid_request_id(&message.report_id)
+                || message.created_at_ms > i64::MAX as u64
+                || !matches!(message.level.as_str(), "debug" | "info" | "warn" | "error")
+                || message.target.trim().is_empty()
+            {
+                return Err(invalid("invalid diagnostic report"));
+            }
+            if let Some(agent) = &message.agent {
+                validate_target(agent)?;
+            }
+            for details in [&message.details_json, &message.context_json]
+                .into_iter()
+                .flatten()
+            {
+                if !details.is_object() {
+                    return Err(invalid("diagnostic context must be an object"));
+                }
+            }
+        }
         ClientMessage::ConnectionRegister { message, .. } => {
             if message.client_type.is_empty()
                 || message.client_type.len() > 128
@@ -274,7 +316,8 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
         .ok_or_else(|| invalid("missing response type"))?;
     let sync = matches!(
         kind,
-        "workspace.sync"
+        "log.sync"
+            | "workspace.sync"
             | "agent.sync"
             | "agent.ui.sync"
             | "agent.turn.sync"
@@ -287,7 +330,9 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
     let known = sync
         || matches!(
             kind,
-            "connection.register.result"
+            "log.res"
+                | "log.append.result"
+                | "connection.register.result"
                 | "workspace.res"
                 | "workspace.start.result"
                 | "workspace.stop.result"
@@ -330,6 +375,8 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
             return Err(invalid("success and error are mutually exclusive"));
         }
         let payload = match kind {
+            "log.res" => Some("records"),
+            "log.append.result" => Some("sequence"),
             "connection.register.result" => Some("client"),
             "workspace.res" => Some("workspaces"),
             "agent.res" => Some("agents"),
@@ -350,7 +397,7 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
         }
         if matches!(
             kind,
-            "agent.history.res" | "agent.log.res" | "agent.mcl.res"
+            "log.res" | "agent.history.res" | "agent.log.res" | "agent.mcl.res"
         ) {
             for key in ["next_before_sequence", "next_after_sequence"] {
                 if success {
@@ -368,6 +415,21 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                     return Err(invalid("failed page cannot contain cursors"));
                 }
             }
+        }
+    }
+    if kind == "log.append.result" {
+        if value["success"] == true {
+            if !value["sequence"]
+                .as_u64()
+                .is_some_and(|id| id > 0 && id <= i64::MAX as u64)
+                || !value["report_id"].as_str().is_some_and(valid_request_id)
+            {
+                return Err(invalid("invalid persisted diagnostic acknowledgement"));
+            }
+        } else if value.get("report_id").is_some() {
+            return Err(invalid(
+                "failed diagnostic acknowledgement contains report identity",
+            ));
         }
     }
     if kind == "agent.ui.sync" {
@@ -425,14 +487,7 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                     }
                     if !matches!(
                         item["status"].as_str(),
-                        Some(
-                            "inactive"
-                                | "starting"
-                                | "running"
-                                | "restarting"
-                                | "stopping"
-                                | "failed"
-                        )
+                        Some("inactive" | "starting" | "running" | "stopping" | "error")
                     ) {
                         return Err(invalid("invalid workspace status"));
                     }
@@ -450,9 +505,7 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                     )?;
                     if !matches!(
                         item["status"].as_str(),
-                        Some(
-                            "starting" | "ready" | "working" | "restarting" | "stopping" | "failed"
-                        )
+                        Some("starting" | "running" | "error" | "stopping")
                     ) {
                         return Err(invalid("invalid active agent status"));
                     }
@@ -542,7 +595,10 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                 .filter(|v| *v > previous && *v <= i64::MAX as u64)
                 .ok_or_else(|| invalid("records must have ascending positive sequences"))?;
             previous = sequence;
-            if matches!(kind, "agent.log.res" | "agent.log.sync") {
+            if matches!(
+                kind,
+                "log.res" | "log.sync" | "agent.log.res" | "agent.log.sync"
+            ) {
                 require_fields(
                     record,
                     &[
@@ -561,6 +617,17 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                     return Err(invalid("invalid agent log source or level"));
                 }
             }
+            if matches!(kind, "log.res" | "log.sync") {
+                require_fields(
+                    record,
+                    &["received_at_ms", "report_id", "reporter", "target", "agent"],
+                )?;
+                if record["reporter"].as_str().is_none_or(str::is_empty)
+                    || record["target"].as_str().is_none_or(str::is_empty)
+                {
+                    return Err(invalid("runtime report identity missing"));
+                }
+            }
             if kind == "agent.history.res"
                 && (record.get("kind").and_then(Value::as_str) != Some("message")
                     || record
@@ -572,13 +639,15 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
                 return Err(invalid("history sequence or kind mismatch"));
             }
         }
-        if matches!(kind, "agent.log.sync" | "agent.mcl.sync") && records.is_empty() {
+        if matches!(kind, "log.sync" | "agent.log.sync" | "agent.mcl.sync") && records.is_empty() {
             return Err(invalid("record sync requires new entries"));
         }
     }
     let mut nodes = 0;
     validate_value(value, 0, &mut nodes, false)?;
-    validate_internal_message_fields(value)?;
+    if !kind.starts_with("log.") && !kind.starts_with("agent.log.") {
+        validate_internal_message_fields(value)?;
+    }
     Ok(())
 }
 fn validate_internal_message_fields(value: &Value) -> Result<(), ProtocolError> {

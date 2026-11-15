@@ -33,7 +33,6 @@ impl AgentPlugin {
 #[derive(Clone)]
 pub(crate) struct AgentInstalled {
     pub schedule: String,
-    pub driver_root: PathBuf,
     pub sync: agent_core::AgentUpdateContext,
 }
 impl Resource for AgentInstalled {}
@@ -50,10 +49,11 @@ impl Plugin for AgentPlugin {
             "AgentPlugin requires schedule, RuntimePlugin and AsyncRuntimePlugin"
         );
         let _ = app.world().closure_sender(&self.schedule);
+        app.world_mut()
+            .insert_resource(agent_core::AgentResourceRoot(self.driver_root));
         app.world_mut().insert_resource(AgentInstalled {
             sync: self.sync,
             schedule: self.schedule.clone(),
-            driver_root: self.driver_root,
         });
         app.add_system(&self.schedule, system::stop_agent_system)
             .add_system(&self.schedule, system::restart_agent_system)

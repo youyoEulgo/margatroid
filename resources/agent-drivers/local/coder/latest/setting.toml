@@ -3,3 +3,7 @@ sandbox = ["workspace_write"]
 [compaction]
 threshold = 0.8
 keep_messages = 16
+
+[inference]
+model = "deepseek-v4.1-flash"
+temperature = 0.2

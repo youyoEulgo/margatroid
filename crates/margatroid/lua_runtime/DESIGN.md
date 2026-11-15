@@ -128,8 +128,8 @@ crate公开：
 handle_start_driver_lua_vm(world: &mut World, request: StartDriverLuaVm)
     行为：
         认领reply，检查owner、workspace及预算，拒绝已有VM
-        克隆当前AgentStorage供日志写入，固定Agent与本次Driver实例关联
-        安装新实例和通知组件，克隆本次wake的Arc及实例关联
+        owner为实际执行实体，WorkspaceExecutor仍是执行线程入口；AgentStorage仅为可选日志能力，不要求已有Agent。
+        安装新实例和通知组件，复用ToolTaskHandle创建LuaExecutionTask；配置有TaskSyncBinding时为Workspace内部任务派生execution_only，不投Agent专属网络同步。
         从workspace_core取得提交入口，提交run_driver工厂及start_vm闭包
         提交失败撤销本次安装并回复错误，不修改启动事件字段
 
@@ -151,12 +151,6 @@ handle_driver_lua_vm_exited(world: &mut World, event: DriverLuaVmExited)
 
 私有：
 ```text
-create_mcl_host(instance: DriverLuaVmInstance, events: RuntimeEventSender, cancel: CancellationToken) -> Arc<dyn LuaHostFunction>
-    行为：构造本plugin的MclHost，只引用mcl_core的请求和结果契约，不调用mcl_plugin。
-
-create_wait_host(slot: Arc<Mutex<DriverWakeSlot>>) -> Arc<dyn LuaHostFunction>
-    行为：构造WaitHost，捕获本次共享槽位；调用时直接await DriverWakeSlot::wait(slot)，不查询World或发送等待事件。
-
 start_vm(context: StartContext) -> Future<Output = Result<StartOutput, StartError>>
     行为：等待ready；失败或超时请求cancel，发送StopDriverLuaVm并等待oneshot，返回错误及退出事实。
 
@@ -164,18 +158,15 @@ stop_vm(context: StopContext) -> Future<Output = Result<StopOutput, StopError>>
     行为：等待原ended；VM退出且Lua释放后返回成功，通道丢失返回EndNotificationLost。
 
 run_driver(context: RunContext) -> LocalFuture
-    行为：
-        在Workspace线程创建Lua、设置预算，按共享宿主定义安装margatroid对象
-        context.kind固定driver，agent_info放入只读context，不再注入独立agent_info、mcl、wait全局
-        公共能力复用同一绑定实现；margatroid.driver绑定本plugin构造的MclHost与WaitHost
-        margatroid.tools与margatroid.task保留拒绝入口，不持有ToolTask能力，不伪造工具任务
-        在宿主边界捕获脚本编译、加载及Driver主入口的Lua异常，保留原始错误、来源、行号和traceback
-        异常通过append_agent_log写入当前Agent独立日志表；等待记录完成后沿原失败及退出流程处理
-        同一异常只在入口边界记录一次；主动取消与正常退出不记录为Lua脚本故障
-        日志写入失败使用现有诊断通道，不覆盖原错误，不递归log
-        对外LuaRuntimeError只提供分类与简洁说明，原始诊断不自动进入会话
-        释放Lua及其执行资源后完成ended并发送既有DriverLuaVmExited
-        未ready即退出则通过剩余ready发送端回复启动失败；关闭wake，不关闭Workspace线程
+    行为：沿原Workspace线程和监督运行execute_lua，捕获诊断；有AgentStorage时按原append_agent_log落库，无目标存储时通过运行日志记录。
+        执行完成后等待process registry真实cleanup，再关闭实际任务scope，经World complete_cleanup移除任务；不改变或销毁任何Agent。
+        进程真实清理后通过LuaServices.execution_finished交付本次执行诊断，等待绑定Agent日志提交及故障交接，再完成ended及DriverLuaVmExited；尚未交接启动则短任务正常结束确认成功、失败确认原错误。
+execute_lua(context, environment, logger, processes) -> Future<Output = Result<(), LuaRuntimeError>>
+    行为：调用共享create_environment，安装取消hook后复用configuration_globals/load_program；configure返回ToolConfiguration，纯阶段能力未启用。
+        enable_execution加载同一标准库并恢复保存全局，Margatroid.enable安装相同公共方法；读取execute并异步调用，配置超时同时约束CPU及等待。
+        source身份为执行Entity/实例，目标由方法显式指定；context包含workspace/name/resource_dir/task_id，不预造agent_info。
+        公共服务回调通过LuaServices，文件/data/text/process沿既有共享安装器；全程不按HostKind裁剪API。
+
 ```
 
 # types
@@ -184,23 +175,12 @@ run_driver(context: RunContext) -> LocalFuture
 
 私有：
 ```text
-MclHost：MCL事件发送适配，私有类型
-    instance: DriverLuaVmInstance
-    events: RuntimeEventSender
-    cancel: CancellationToken
-    impl LuaHostFunction for MclHost
-        call(&self, arguments: Vec<LuaValue>, cancel: CancellationToken) -> HostFuture
-            行为：将Lua参数转换为MclInstruction；绑定source为instance.owner及本次start_id，发送MclCommand并等待reply；MclValue序列化为Lua值，参数校验、reply丢失及fallback MclError统一返回MclValue::Error({type:error,message,request_id})；单次MCL取消不退出VM，只有VM取消保留Err；不执行或解析指令推断返回形状。
-
-WaitHost：等待适配，私有类型
-    slot: Arc<Mutex<DriverWakeSlot>>
-    impl LuaHostFunction for WaitHost
-        call(&self, arguments: Vec<LuaValue>, cancel: CancellationToken) -> HostFuture
-            行为：校验无参数，等待共享槽位或取消；完成及取消时清除本次waiting标记，锁不跨await。
-
 StartContext：启动等待上下文--instance、ready接收端、cancel、RuntimeEventSender、原reply
 StopContext：停止等待上下文--instance、ended接收端、原reply
-RunContext：执行上下文--instance、program、environment、wake、ready发送端存储、ended发送端、cancel、RuntimeEventSender、AgentStorage日志能力及宿主固定关联
+DriverLogger：私有诊断上下文--可选storage、LuaServices、真实LuaExecutionIdentity、World发送能力、origin及待捕获诊断
+    append：已有storage沿原blocking提交；无storage的主动log通过execution_log提交已绑定Agent；无Agent或未处理故障通过RunContext.runtime_logs提交完整应用报告，不能只打印控制台；故障另由execution_finished逐绑定完成Agent报告。
+RunContext.runtime_logs: Option<RuntimeLogStore>--Compose中必需安装；独立运行夹具可使用AgentStorage
+RunContext：执行上下文--instance、program、environment、wake、ready发送端存储、ended发送端、cancel、RuntimeEventSender、可选AgentStorage、workspace、LuaServices及宿主固定关联
 StartOutput：启动成功载荷--instance、原reply
 StartError：启动失败载荷--instance、原reply、LuaRuntimeError、cleanup_completed
 StopOutput：停止成功载荷--instance、原reply
@@ -213,6 +193,32 @@ StopError：停止失败载荷--instance、原reply、LuaRuntimeError
 
 公开：
 ```text
+
+LuaExecutionIdentity
+    source: Entity--实际Lua执行实体，独立于任意目标Agent
+    workspace: Entity
+    address: String
+    instance: String
+    cancel: CancellationToken
+LuaServices：Resource + Clone
+    invoke: Arc<dyn Fn(LuaExecutionIdentity, String, Value) -> LuaServiceFuture + Send + Sync>
+    行为：公共宿主服务边界，由应用宿主绑定既有World/event能力；工具worker经已有双向管道转发，同源执行环境不按Driver/Tool裁剪方法。
+create_environment(definition: HostDefinition, memory_limit: usize) -> mlua::Result<(Lua, AnyUserData)>
+    行为：统一TABLE/STRING/MATH/UTF8标准库、Lua allocator预算、readonly Margatroid安装及configure阶段隐藏项。
+configuration_globals(lua: &Lua) -> mlua::Result<Vec<(&'static str, Value)>>
+    行为：保存并隐藏pcall/xpcall/load/setmetatable/dofile/loadfile/warn，Driver与工具同源加载配置阶段。
+enable_execution(lua: &Lua, saved: Vec<(&'static str, Value)>) -> mlua::Result<()>
+    行为：两种启动方式共同加载IO/OS/COROUTINE、恢复保存全局并提供package.config。
+load_program(lua: &Lua, source: &str, origin: &Path) -> mlua::Result<()>
+    行为：同一来源命名规则加载程序一次，供configure/execute两阶段使用。
+LuaAgentMonitor：Component（不持VM所有权）
+    unlink: Option<Box<dyn FnOnce() + Send + Sync>>
+    new(unlink) -> Self
+    impl Drop：取出并调用精确解绑动作，Agent旧会话不再接收执行故障；不等待、不取消源VM。
+AgentWaitSlot(Arc<Mutex<DriverWakeSlot>>)：Component + Default + Debug，不可Clone
+    impl Drop：关闭槽位，即使等待者还持Arc也能结束等待。
+    行为：wait(agent)登记一次唤醒，wake取出发送；取消/关闭解除并结束等待，保留未消费唤醒避免注册竞态。
+
 DriverLuaVmInstance：VM实例
     owner: Entity
     start_id: String
@@ -220,10 +226,6 @@ DriverLuaVmInstance：VM实例
 LuaProgram：本次程序
     source: String
     origin: PathBuf
-    libraries: LuaStandardLibraries
-
-LuaStandardLibraries：标准库选择，公开枚举
-    Minimal | Safe | Full
 
 LuaEnvironment：注入环境
     globals: BTreeMap<String, LuaBinding>
@@ -247,15 +249,16 @@ Margatroid：共享Lua userdata
     data: 数据转换子对象--encode、decode及null标记
     text: 文本搜索子对象--search
     process: 子进程子对象--start
-    driver: Driver协调子对象--mcl、wait
+    mcl: execute--明确Agent目标
+    agent: create--无需Agent MCL队列
+    workspace: agents--实时成员
+    wait(agent_address: String)--根对象异步方法
     tools: 工具定义子对象--register
     task: 运行任务子对象--return_result、finish、append_output、replace_output、read_output、send、receive
 
 HostNamespace：只读子对象
-    namespace: Files | Data | Text | Process | Driver | Tools | Task
-    identity: Driver | Tool--宿主固定
-    phase: Configure | Execute
-    methods: 已裁剪的能力回调，不向Lua暴露可修改回调表
+    namespace: Files | Data | Text | Process | Tools | Task | Workspace | Mcl | Agent
+    callbacks: Arc<Mutex<Option<BTreeMap<String, Function>>>>--execute阶段冻结，不暴露可写表
 
 HostDefinition：两种执行环境共用的宿主定义
     kind: HostKind
@@ -268,10 +271,11 @@ HostKind：执行身份
 LuaHostContext字段约定：JSON对象保存真实执行元数据
     kind: Driver | Tool
     arguments: LuaValue--工具调用参数，Driver为data.null
-    agent_info: LuaValue--当前Agent真实信息
+    agent_info: Option<LuaValue>--按需工具的调用方Agent信息；自动执行尚未创建Agent时缺省
     project_root: Option<PathBuf>--只在当前环境确实提供时存在
     driver_instance: Option<String>
-    task_id, call_id, alias: Option<String>--仅工具提供，不虚构Driver任务
+    task_id: String--实际执行任务id
+    call_id, alias: Option<String>--有模型调用时提供
     owner_task_id: Option<String>
     binding: Option<LuaValue>
     resource_dir, temp_dir: Option<PathBuf>
@@ -296,17 +300,17 @@ Margatroid::install(lua: &Lua, definition: HostDefinition) -> Result<AnyUserData
     行为：
         两种运行时复用同一userdata、字段getter和值转换，不在plugin间互相调用
         强制context.kind匹配宿主身份，context及其arguments返回独立副本
-        files、data、text、process、driver、tools、task均为不可替换子对象，未enable时方法均明确拒绝
+        files、data、text、process、mcl、agent、workspace、tools、task均为不可替换子对象，未enable时方法均明确拒绝
         data.null保留空值身份，根对象不再提供version、arguments或null字段
         不保留旧全局mcl、wait、agent_info、顶层文件编解码方法或tool命名空间作为兼容入口
 
 Margatroid::enable(object: &AnyUserData, callbacks: Table) -> Result<(), LuaError>
     行为：
-        只选取公共方法及当前身份的专用能力，冻结为不向Lua公开的私有回调集合
-        公共方法按files、data、text、process绑定，log与wait_any保留在根对象
-        Driver协调能力只绑定driver；工具定义与任务能力分别绑定tools和task
+        选取统一公共方法，冻结为不向Lua公开的私有回调集合
+        公共方法按files、data、text、process绑定，log、wait和wait_any保留在根对象
+        mcl/agent/workspace与tools/task对所有Lua执行者同等开放，缺失实际目标或任务能力明确失败
         tools只登记定义，task只控制运行任务，不能因owner字段或命名重叠隐式联动
-        拒绝重复enable；错误身份的命名空间不持有真实回调
+        拒绝重复enable；HostKind只用于来源元数据，不决定能力集合
         每次调用均核对固定身份，不从Lua可写字段推断权限
         无能力或错误身份时返回明确宿主调用错误，不返回nil索引错误
         异步方法先克隆执行句柄并释放userdata借用，再await
@@ -322,24 +326,21 @@ margatroid:log(level: String, message: String, details: Option<LuaValue>) -> Fut
         脚本不能指定或覆盖可信关联；不追加历史、不触发推理、不结束回合
         失败返回写入错误，不递归log；工具configure阶段不开放该IO方法
 
-margatroid.driver:mcl(arguments: Vec<LuaValue>) -> HostFuture
-    行为：
-        require identity == Driver
-        使用现有MclHost参数及错误契约；source绑定真实Agent地址和本次Driver实例
-        Tool中调用明确返回执行身份错误，不发送MCL事件
-
-margatroid.driver:wait() -> HostFuture
-    行为：
-        require identity == Driver
-        复用当前DriverWakeSlot等待及取消语义；Tool中调用明确失败
-        Driver主入口捕获与日志不改变既有wake/ready/ended契约
-
+margatroid.mcl:execute(target: String, instruction: String, arguments: Option<Vec<Value>>) -> Future<Value>
+    行为：公共服务固定真实source身份，以明确目标提交原MclCommand，原oneshot/审计/取消保留；nil参数等价省略，目标仅Starting/Running可用。
+        成功始终返回结果对象，Unit返回空JSON对象{}，在Lua中保留object标记；MCL执行失败返回Error对象，可由Lua检查后继续。
+margatroid.agent:stop(target: String) -> Future<Value>
+    行为：同工具bin公共注入服务，不走MCL，提交原StopAgent并外部监督，不拥有或终止创建者VM。
+margatroid.agent:create({owner: String, name: String, config_path: String, ui_path: String}) -> Future<Value>
+    行为：无需既有MCL队列，公共服务发送StartAgent并等待资源安装返回，Agent归属与Lua执行生命周期独立；config_path只初始化持久配置，ui_path只保存引用并直接监控，均不从执行程序路径推导。
+margatroid:wait(agent_address: String) -> Future<()>
+    行为：公共服务在目标AgentWaitSlot上登记一次等待，复用DriverWakeSlot防丢失唤醒及取消guard；初次等待交接自动执行启动，Agent.ready不拥有VM。
 HostNamespace::callback(name: &str) -> Result<Function, LuaError>
     行为：
         根据命名空间和固定执行身份查找冻结的回调，具体共享方法签名见Tool设计
-        driver仅允许Driver身份，tools及task仅允许Tool身份且已确认execute阶段
+        所有公共namespace共享可用方法，执行阶段确认后按宿主能力调用
         文件、数据、文本、进程和日志沿真实执行环境的权限和阶段启用
-        错误身份明确失败，不创建工具任务、不伪造回复端、不扩大宿主权限
+        缺失能力或错误namespace明确失败，TaskHandle和取消归属由宿主真实注入
 
 HostFuture：公开类型别名
     Pin<Box<dyn Future<Output = Result<LuaValue, LuaRuntimeError>> + Send>>
@@ -411,11 +412,11 @@ Workspace专属线程
     ├── Lua与LocalFuture
     ├── Margatroid共享宿主对象
     │   ├── 公共能力、日志与只读context
-    │   ├── driver -> MclHost及WaitHost
-    │   └── tools/task -> 无能力的拒绝入口
+    │   ├── mcl/agent/workspace/wait -> LuaServices
+    │   └── tools/task -> 实际LuaExecutionTask与原工具任务能力
     ├── AgentStorage克隆句柄 -> agent_logs
-    ├── MclHost（只发送既有mcl_core::MclCommand）
-    ├── WaitHost（捕获与组件相同的wake Arc）
+    ├── LuaServices（复用原MCL/Agent事件与oneshot）
+    ├── AgentWaitSlot（一次等待，不拥有VM）
     └── ended发送端
 
 mecs全局异步设施

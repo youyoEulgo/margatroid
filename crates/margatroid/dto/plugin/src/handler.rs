@@ -24,11 +24,16 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use workspace_core::{Workspace, WorkspaceDefinitionSnapshot, WorkspaceDefinitions};
 
-type ReplyFuture = Pin<Box<dyn Future<Output = Value> + Send>>;
+struct ReplyOutput {
+    value: Value,
+    request: Value,
+    diagnostic: Option<String>,
+}
+type ReplyFuture = Pin<Box<dyn Future<Output = ReplyOutput> + Send>>;
 fn error(code: &str, message: &str) -> ProtocolErrorDto {
     ProtocolErrorDto::new(code, message)
 }
-trait BoundaryError: Sized + Send + 'static {
+trait BoundaryError: Sized + Send + std::fmt::Debug + 'static {
     fn boundary(value: ProtocolErrorDto) -> Self;
     fn external(self) -> ProtocolErrorDto;
 }
@@ -134,6 +139,7 @@ fn request<T: Send + 'static, R: Send + 'static, E: BoundaryError>(
     input: T,
     response: &str,
     project: impl FnOnce(R) -> Result<Value, ProtocolErrorDto> + Send + 'static,
+    original: Value,
 ) -> (DtoRequest, ReplyFuture) {
     let address = (&input as &dyn Any)
         .downcast_ref::<AgentRecordsQueryDto>()
@@ -155,11 +161,21 @@ fn request<T: Send + 'static, R: Send + 'static, E: BoundaryError>(
     };
     let response = response.to_owned();
     let future = async move {
+        let mut diagnostic = None;
         let result = match receiver.await {
             Ok(Ok(v)) => project(v),
-            Ok(Err(e)) => Err(e.external()),
-            Err(_) => Err(error("ReplyClosed", "operation response was lost")),
+            Ok(Err(e)) => {
+                diagnostic = Some(format!("{e:?}"));
+                Err(e.external())
+            }
+            Err(e) => {
+                diagnostic = Some(format!("{e:?}"));
+                Err(error("ReplyClosed", "operation response was lost"))
+            }
         };
+        if diagnostic.is_none() {
+            diagnostic = result.as_ref().err().map(|error| format!("{error:?}"));
+        }
         let mut value = frame(&response, &ticket.id, result);
         if matches!(
             response.as_str(),
@@ -172,7 +188,11 @@ fn request<T: Send + 'static, R: Send + 'static, E: BoundaryError>(
         {
             value["address"] = json!(address);
         }
-        value
+        ReplyOutput {
+            value,
+            request: original,
+            diagnostic,
+        }
     }
     .boxed();
     (dto, future)
@@ -185,10 +205,12 @@ fn mcl_result(value: mcl_core::MclValue) -> Result<Value, ProtocolErrorDto> {
     let (kind, value) = match value {
         MclValue::Unit => return minimal(()),
         MclValue::Error(v) => {
-            return Err(error(
+            let mut failure = error(
                 "MclFailed",
                 v["message"].as_str().unwrap_or("MCL execution failed"),
-            ));
+            );
+            failure.details = Some(v);
+            return Err(failure);
         }
         MclValue::Array(MessageArray::Message(v)) => ("messages", json!(v)),
         MclValue::Config(v) => ("config", json!(v)),
@@ -230,7 +252,6 @@ pub(crate) fn mcl_record(v: storage_core::StoredHistoryRecord) -> Value {
 pub(crate) fn log_record(v: storage_core::StoredAgentLog) -> Value {
     let mut row = serde_json::to_value(v.record).unwrap();
     row["sequence"] = json!(v.sequence);
-    clean_internal(&mut row["context_json"]);
     row
 }
 pub(crate) fn handle_dto_request(world: &mut World, request: DtoRequest) {
@@ -243,6 +264,7 @@ pub(crate) fn handle_dto_request(world: &mut World, request: DtoRequest) {
         return;
     };
     match request.route.as_str() {
+        "log.req" | "log.append" => crate::runtime_logs::handle(world, &request.route, object),
         "connection.register" => dispatch::<RegisterClientDto>(world, object),
         "workspace.start" => dispatch::<StartWorkspaceDto>(world, object),
         "workspace.stop" => dispatch::<StopWorkspaceDto>(world, object),
@@ -439,11 +461,20 @@ fn parameters(
         base.join(&member.home_root)
     };
     let directory = base.join("agents").join(&member.name);
+    let resource_root = world
+        .get_resource::<agent_core::AgentResourceRoot>()
+        .ok_or_else(|| error("ResourceRootMissing", "Agent initial resource root missing"))?;
+    let program = address::resolve_file(&resource_root.0, &member.driver)
+        .map_err(|failure| error("ResourceMissing", &failure.to_string()))?;
+    let source = program
+        .parent()
+        .ok_or_else(|| error("InvalidPath", "initial resource directory missing"))?;
     Ok((
         entity,
         member.name.clone(),
         AgentStartParameters {
-            driver: member.driver.clone(),
+            initial_settings_path: source.join("setting.toml"),
+            ui_path: source.join("ui"),
             project_root: definition.project_root.clone(),
             home_root: home,
             database_path: directory.join("state.sqlite"),
@@ -461,6 +492,7 @@ converter!(
         client(world, r.ticket.connection)?;
         let (workspace, name, parameters) = parameters(world, &r.input)?;
         Ok(agent_core::StartAgent {
+            owner: workspace,
             id: request_id(&r.ticket),
             workspace,
             name,
@@ -484,16 +516,20 @@ converter!(
         client(world, r.ticket.connection)?;
         let entity = agent(world, &r.input.target.address)?;
         let a = world.get_component::<Agent>(entity).unwrap();
-        let address = projection::address(world, a.workspace())
-            .ok_or_else(|| error("WorkspaceMissing", "Workspace address missing"))?;
-        let input = AgentInput {
-            start: AgentStartDto {
-                workspace: address,
-                name: a.name().clone(),
-            },
-            snapshot: r.input.snapshot.clone(),
-        };
-        let (workspace, name, parameters) = parameters(world, &input)?;
+        let workspace = a.workspace();
+        let name = a.name().clone();
+        let definition = world
+            .get_component::<Workspace>(workspace)
+            .ok_or_else(|| error("WorkspaceMissing", "Workspace missing"))?;
+        r.input
+            .snapshot
+            .get(&definition.definition_path)
+            .ok_or_else(|| error("DefinitionMissing", "Workspace definition is absent"))?;
+        let parameters = world
+            .get_component::<agent_core::AgentResources>(entity)
+            .ok_or_else(|| error("ResourcesMissing", "Agent creation parameters are missing"))?
+            .parameters
+            .clone();
         Ok(agent_core::RestartAgent {
             id: request_id(&r.ticket),
             workspace,
@@ -686,10 +722,8 @@ async fn prepare_request(
     connection: ConnectionId,
     message: ClientMessage,
 ) -> Result<(Option<DtoRequest>, Option<AbortTurnControl>, ReplyFuture), Value> {
-    let route = serde_json::to_value(&message).unwrap()["type"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let original = serde_json::to_value(&message).unwrap();
+    let route = original["type"].as_str().unwrap().to_owned();
     let id = message.id().to_owned();
     let response = if route.ends_with(".req") {
         format!("{}res", &route[..route.len() - 3])
@@ -705,12 +739,32 @@ async fn prepare_request(
     })?;
     macro_rules! build {
         ($input:expr,$out:ty,$err:ty,$project:expr) => {{
-            let (event, waiter) =
-                request::<_, $out, $err>(ticket, &route, $input, &response, $project);
+            let (event, waiter) = request::<_, $out, $err>(
+                ticket,
+                &route,
+                $input,
+                &response,
+                $project,
+                original.clone(),
+            );
             Ok((Some(event), None, waiter))
         }};
     }
     match message {
+        ClientMessage::LogReq { message, .. } => build!(
+            message,
+            storage_core::RecordPage<storage_core::StoredRuntimeLog>,
+            storage_core::StorageError,
+            crate::runtime_logs::page
+        ),
+        ClientMessage::LogAppend { message, .. } => build!(
+            message,
+            storage_core::StoredRuntimeLog,
+            storage_core::StorageError,
+            |row: storage_core::StoredRuntimeLog| Ok(
+                json!({"sequence":row.sequence,"report_id":row.input.report_id})
+            )
+        ),
         ClientMessage::ConnectionRegister { message, .. } => build!(
             message,
             client_core::RegisteredClient,
@@ -820,11 +874,17 @@ async fn prepare_request(
                 let result = receiver
                     .await
                     .unwrap_or_else(|_| Err(error("ReplyClosed", "control response lost")));
-                frame(
+                let diagnostic = result.as_ref().err().map(|error| format!("{error:?}"));
+                let value = frame(
                     "agent.turn.abort.result",
                     &ticket.id,
                     result.map(|()| json!({})),
-                )
+                );
+                ReplyOutput {
+                    value,
+                    request: original,
+                    diagnostic,
+                }
             }
             .boxed();
             Ok((
@@ -954,7 +1014,9 @@ fn invalid_reply(text: &str) -> Option<Value> {
     }
     if !matches!(
         kind,
-        "connection.register"
+        "log.req"
+            | "log.append"
+            | "connection.register"
             | "workspace.req"
             | "workspace.start"
             | "workspace.stop"
@@ -1013,8 +1075,9 @@ async fn serve_connection(
             _=state.lifetime.cancelled()=>break,
             _=cancel.cancelled()=>break,
             response=pending.next(),if !pending.is_empty()=>{
-                let Some(value)=response else{continue;};
-                match encode_response(value).ok_or(()) {
+                let Some(report)=response else{continue;};
+                crate::runtime_logs::report_response(&state,connection,report.request,&report.value,report.diagnostic).await;
+                match encode_response(report.value).ok_or(()) {
                     Ok(text)=>Some(Message::Text(text.into())),Err(_)=>Some(Message::Close(Some(CloseFrame{code:1007,reason:"invalid response".into()}))),
                 }
             },
@@ -1027,23 +1090,26 @@ async fn serve_connection(
                 match incoming {
                     Some(Ok(Message::Text(text)))=>if pending.len() >= 128 {Some(Message::Close(Some(CloseFrame{code:1008,reason:"too many pending requests".into()})))} else {match parse_client_message(&text) {
                         Ok(message)=>{
+                            let original=serde_json::to_value(&message).unwrap();
                             let state=state.clone();
                             pending.push(async move {
                                 match prepare_request(&state,connection,message).await {
                                     Ok((request,abort,future))=>{
+                                        drop(original);
                                         let events=state.events.get().unwrap();
                                         if let Some(v)=request{events.send_event(v);}
                                         if let Some(v)=abort{events.send_event(v);}
                                         future.await
                                     },
-                                    Err(response)=>response,
+                                    Err(value)=>ReplyOutput{value,request:original,diagnostic:None},
                                 }
                             }.boxed());
                             None
                         },
-                        Err(_)=>{
-                            if let Some(value)=invalid_reply(&text){pending.push(async move{value}.boxed());None}
-                            else{Some(Message::Close(Some(CloseFrame{code:if text.len()>MAX_MESSAGE_BYTES{1009}else{1007},reason:"invalid protocol request".into()})))}
+                        Err(error)=>{
+                            let request=serde_json::from_str(&text).unwrap_or_else(|_|json!({"raw_frame":text.to_string()}));
+                            if let Some(value)=invalid_reply(&text){let diagnostic=Some(format!("{error:?}"));pending.push(async move{ReplyOutput{value,request,diagnostic}}.boxed());None}
+                            else{let failure=json!({"success":false,"error":{"code":error.0.code,"message":error.0.message}});crate::runtime_logs::report_response(&state,connection,request,&failure,Some(format!("{error:?}"))).await;Some(Message::Close(Some(CloseFrame{code:if text.len()>MAX_MESSAGE_BYTES{1009}else{1007},reason:"invalid protocol request".into()})))}
                         },
                     }},
                     Some(Ok(Message::Ping(v)))=>Some(Message::Pong(v)),
@@ -1095,5 +1161,14 @@ mod tests {
         assert!(value["payload"].get("source_instance").is_none());
         assert_eq!(value["payload"]["arguments"], arguments);
         assert_eq!(value["sequence"], 7);
+    }
+    #[test]
+    fn mcl_error_summary_keeps_the_complete_original_report_in_details() {
+        let message = format!("{} END-OF-COMPLETE-REPORT", "完整错误".repeat(300));
+        let original = serde_json::json!({"type":"error","message":message,"request_id":"mcl-original-request"});
+        let error = mcl_result(mcl_core::MclValue::Error(original.clone())).unwrap_err();
+        assert!(error.message.len() <= 512);
+        assert_eq!(error.details, Some(original));
+        assert!(format!("{error:?}").contains("END-OF-COMPLETE-REPORT"));
     }
 }

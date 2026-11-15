@@ -105,12 +105,12 @@ impl DriverUiWatch {
     }
 }
 pub struct DriverUiMonitor {
-    manifest_path: PathBuf,
+    ui_path: PathBuf,
     limits: DriverUiReadLimits,
     watch: DriverUiWatch,
 }
 pub fn open_driver_ui_watch(
-    manifest_path: PathBuf,
+    ui_path: PathBuf,
     on_change: Arc<dyn Fn(DriverUiState) + Send + Sync>,
 ) -> (DriverUiWatch, DriverUiMonitor) {
     let watch = DriverUiWatch {
@@ -121,7 +121,7 @@ pub fn open_driver_ui_watch(
         }),
     };
     let monitor = DriverUiMonitor {
-        manifest_path,
+        ui_path,
         limits: DriverUiReadLimits::default(),
         watch: watch.clone(),
     };
@@ -225,21 +225,18 @@ fn scan(
     Ok(())
 }
 fn read_once(
-    manifest_path: &Path,
+    ui_path: &Path,
     limits: DriverUiReadLimits,
 ) -> Result<Option<DriverUiBundle>, DriverUiError> {
-    let directory = manifest_path.parent().ok_or(DriverUiError::PathInvalid)?;
-    let driver = match directory.canonicalize() {
+    if fs::symlink_metadata(ui_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(DriverUiError::PathInvalid);
+    }
+    let root = match ui_path.canonicalize() {
         Ok(value) => value,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(read_error(error)),
     };
-    let root = match driver.join("ui").canonicalize() {
-        Ok(value) => value,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(read_error(error)),
-    };
-    if root == driver || !root.starts_with(&driver) || !root.is_dir() {
+    if !root.is_dir() {
         return Err(DriverUiError::PathInvalid);
     }
     let mut files = Vec::new();
@@ -274,11 +271,11 @@ fn read_once(
     }))
 }
 pub fn read_driver_ui(
-    manifest_path: &Path,
+    ui_path: &Path,
     limits: DriverUiReadLimits,
 ) -> Result<Option<Arc<DriverUiBundle>>, DriverUiError> {
-    let first = read_once(manifest_path, limits)?;
-    let second = read_once(manifest_path, limits)?;
+    let first = read_once(ui_path, limits)?;
+    let second = read_once(ui_path, limits)?;
     if first != second {
         return Err(DriverUiError::Unstable);
     }
@@ -288,7 +285,7 @@ async fn refresh(
     context: &DriverUiMonitor,
     monitor_error: Option<DriverUiError>,
 ) -> Result<bool, DriverUiError> {
-    let path = context.manifest_path.clone();
+    let path = context.ui_path.clone();
     let limits = context.limits;
     let watch = context.watch.clone();
     tokio::task::spawn_blocking(move || {
@@ -314,13 +311,10 @@ async fn refresh(
     .await
     .map_err(|error| DriverUiError::ReadFailed(error.to_string()))?
 }
-fn attach(
-    manifest: PathBuf,
-    sender: mpsc::Sender<()>,
-) -> Result<RecommendedWatcher, DriverUiError> {
-    let directory = manifest.parent().ok_or(DriverUiError::PathInvalid)?;
-    let ui = directory.join("ui");
-    let parent = directory.parent().unwrap_or(directory).to_owned();
+fn attach(ui_path: PathBuf, sender: mpsc::Sender<()>) -> Result<RecommendedWatcher, DriverUiError> {
+    let directory = ui_path.parent().ok_or(DriverUiError::PathInvalid)?;
+    let parent = directory.canonicalize().map_err(read_error)?;
+    let ui = parent.join(ui_path.file_name().ok_or(DriverUiError::PathInvalid)?);
     let mut watcher = RecommendedWatcher::new(
         move |event: notify::Result<notify::Event>| {
             let relevant = match event {
@@ -356,7 +350,7 @@ pub async fn run_driver_ui_monitor(context: DriverUiMonitor) -> Result<(), Drive
         }
         let mut monitor_error = None;
         if watcher.is_none() {
-            let path = context.manifest_path.clone();
+            let path = context.ui_path.clone();
             let signal = sender.clone();
             match tokio::task::spawn_blocking(move || attach(path, signal)).await {
                 Ok(Ok(value)) => watcher = Some(value),
@@ -385,7 +379,7 @@ pub async fn run_driver_ui_monitor(context: DriverUiMonitor) -> Result<(), Drive
                     _=tokio::time::sleep(SETTLE)=>break,
                 }
             }
-            let parent = context.manifest_path.parent().and_then(Path::parent);
+            let parent = context.ui_path.parent();
             if parent.is_some_and(|path| !path.exists()) {
                 watcher = None;
             }

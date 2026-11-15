@@ -21,22 +21,25 @@
 公开：
 ```text
 read_driver(manifest_path: &Path, limits: &AgentDriverReadLimits) -> Result<AgentDriverInput, AgentDriverError>
-    行为：有界读取driver.toml、同目录base.lua和setting.toml；校验清单、UTF-8和默认TOML；返回本次材料，不缓存内容。
+    行为：只对给定Lua入口进行有界读取和UTF-8校验，返回program/origin；不推导、不读取同目录配置或UI。
 
-read_driver_ui(manifest_path: &Path, limits: DriverUiReadLimits) -> Result<Option<Arc<DriverUiBundle>>, DriverUiError>
+read_initial_settings(path: &Path, limit: usize) -> Result<String, AgentDriverError>
+    行为：有界读取明确传入的配置文件并校验TOML，保留原始文本；文件缺失、类型错误、非法UTF-8或TOML明确失败，不从程序目录推导，不使用旧名回退。
+
+read_driver_ui(ui_path: &Path, limits: DriverUiReadLimits) -> Result<Option<Arc<DriverUiBundle>>, DriverUiError>
     行为：
-        从实际清单父目录定位ui；目录缺失返回None，存在时要求index.html。
-        在blocking worker内递归读取普通文件，以规范化相对路径排序；ui根规范路径必须位于实际Driver目录内，所有最终文件路径限制在该ui根内。
+        直接读取ui_path指定目录；目录缺失返回None，存在时要求index.html。
+        在blocking worker内递归读取普通文件，以规范化相对路径排序；UI目录根不接受符号链接，所有最终文件路径限制在所指定的UI根内；UI目录可独立于程序或配置目录。
         读取前后复核文件集合及内容；变化时返回Unstable，由监控继续合并重读。
         raw_bytes为原始数据及路径和媒体类型的累计读取预算，上限32MiB，超出返回TooLarge；媒体类型由路径确定，未知类型使用application/octet-stream。
         对规范排序的路径、媒体类型和原始字节计算SHA-256，返回完整owned集合。
 
-open_driver_ui_watch(manifest_path: PathBuf, on_change: Arc<dyn Fn(DriverUiState) + Send + Sync>) -> (DriverUiWatch, DriverUiMonitor)
-    行为：Agent实际Driver来源安装时构造独立取消能力及Initializing状态；注入的UI同步上下文绑定该次来源，DriverUiMonitor在已有Agent异步启动流中运行，不由查询或活动帧扫描启动。
+open_driver_ui_watch(ui_path: PathBuf, on_change: Arc<dyn Fn(DriverUiState) + Send + Sync>) -> (DriverUiWatch, DriverUiMonitor)
+    行为：Agent创建参数中的UI来源安装时构造独立取消能力及Initializing状态；注入的UI同步上下文绑定该次来源，DriverUiMonitor在已有Agent异步启动流中运行，不由查询或活动帧扫描启动。
 
 run_driver_ui_monitor(context: DriverUiMonitor) -> Future<Output = Result<(), DriverUiError>>
     行为：
-        在blocking worker初始化notify监控，观察ui及可识别其创建、删除和替换的Driver祖先目录；过滤本Driver ui之外的变化。
+        在blocking worker初始化notify监控，观察传入UI目录及其父目录以识别创建、删除和替换；过滤该UI目录之外的变化，各Agent独立持有watch。
         初始化立即读取一次；后续新增、修改、删除使用100ms安静窗口合并，再调用read_driver_ui；完整读取及新状态publish同在blocking worker内执行。
         Unstable保留待处理状态并重读；其他读取错误发布Failed并保持后续观察，路径恢复后重新发布Ready。
         读取或监控初始化错误进入有间隔的恢复尝试，取消后等待正在执行的blocking worker真实返回。
@@ -61,23 +64,13 @@ DriverUiWatch::publish(&self, state: DriverUiState)
 
 公开：
 ```text
-AgentDriverManifest：Driver清单
-    schema_version: u32
-    dependencies: Vec<String>--尚未加载的文件定位输入
-    inference: DriverInferenceConfig
 
-DriverInferenceConfig：模型声明
-    model: String
-    temperature: Option<f32>
-    max_output_tokens: Option<u32>
-    top_p: Option<f32>
-    stop: Vec<String>
+Agent初始化资源材料
+    行为：Lua入口、初始化配置文件与UI目录独立。配置按明确地址初始化至Agent持久位置；UI始终直接读创建时传入的目录，既有Agent本地UI副本不参与查找或回退。
 
 AgentDriverInput：本次启动材料
-    manifest: AgentDriverManifest
     program: String
     origin: PathBuf
-    default_settings: String
 
 DriverUiReadLimits
     raw_bytes: usize
@@ -108,12 +101,11 @@ DriverUiShared
     cancel: CancellationToken
     on_change: Arc<dyn Fn(DriverUiState) + Send + Sync>
 DriverUiMonitor
-    manifest_path: PathBuf
+    ui_path: PathBuf
     limits: DriverUiReadLimits
     watch: DriverUiWatch
 
 AgentDriverReadLimits：读取预算
-    manifest_bytes: usize
     program_bytes: usize
     settings_bytes: usize
 ```
@@ -137,15 +129,13 @@ DriverUiError
 # 持有关系
 
 ```text
-Agent启动闭包
-├── 请求携带的Driver定位字符串
+Workspace程序准备闭包
+├── 定义携带的Lua程序定位字符串
 ├── address::resolve_file返回的临时PathBuf
 └── agent_driver_core::read_driver返回的AgentDriverInput
-    ├── manifest
-    ├── program与origin
-    └── default_settings
+    └── program与origin
 
-DTO按Agent持有的实际Driver清单路径建立UI观察
+DTO直接监控AgentResources.parameters.ui_path
 ├── DriverUiWatch
 │   └── Arc<DriverUiShared>
 │       ├── 稳定完整资源集合或错误

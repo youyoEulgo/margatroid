@@ -6,17 +6,21 @@ fn all_bundled_drivers_and_declared_resource_files_are_readable_with_the_new_con
         let manifest = root
             .join("agent-drivers/local")
             .join(name)
-            .join("latest/driver.toml");
+            .join("latest/base.lua");
         let driver = agent_driver_core::read_driver(&manifest, &Default::default()).unwrap();
         mlua::Lua::new()
             .load(&driver.program)
             .into_function()
             .unwrap();
-        for locator in driver.manifest.dependencies {
-            let parsed = address::ParsedAddress::parse(&locator).unwrap();
+        for locator in driver.program.lines().filter_map(|line| {
+            line.split("\"IMPORT ")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().nth(1))
+        }) {
+            let parsed = address::ParsedAddress::parse(locator).unwrap();
             match parsed.kind.as_str() {
                 "tool" => {
-                    let path = address::resolve_file(&root.join("tools"), &locator).unwrap();
+                    let path = address::resolve_file(&root.join("tools"), locator).unwrap();
                     let tool = tool_resource_core::read_tool(&path).unwrap();
                     mlua::Lua::new()
                         .load(&tool.program)
@@ -24,11 +28,11 @@ fn all_bundled_drivers_and_declared_resource_files_are_readable_with_the_new_con
                         .unwrap();
                 }
                 "prompt" => {
-                    let path = address::resolve_file(&root.join("prompts"), &locator).unwrap();
+                    let path = address::resolve_file(&root.join("prompts"), locator).unwrap();
                     prompt_resource_core::read_prompt(&path, &Default::default()).unwrap();
                 }
                 "sandbox" => {
-                    let path = address::resolve_file(&root.join("sandboxes"), &locator).unwrap();
+                    let path = address::resolve_file(&root.join("sandboxes"), locator).unwrap();
                     sandbox_resource_core::read_sandbox(&path, &Default::default()).unwrap();
                 }
                 other => panic!("unexpected dependency kind: {other}"),

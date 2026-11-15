@@ -8,10 +8,10 @@ pub use sync::{
     AgentUpdateContext, AgentUpdateKind,
 };
 
-pub use components::{Agent, AgentDriverSource};
+pub use components::{Agent, AgentResources};
 pub use error::{AgentError, AgentErrorKind};
 pub use events::{AgentException, AgentOperationReply, RestartAgent, StartAgent, StopAgent};
-pub use types::{AgentStartParameters, AgentState};
+pub use types::{AgentResourceRoot, AgentStartParameters, AgentState};
 
 use core_plugin::{Entity, World};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +25,7 @@ pub trait WorldAgentExt {
         state: AgentState,
         turn: Option<String>,
     ) -> Result<(), AgentError>;
+    fn agent_ready(&mut self, agent: Entity) -> Result<(), AgentError>;
     fn agent_start_turn(&mut self, agent: Entity) -> Result<String, AgentError>;
     fn agent_finish_turn(&mut self, agent: Entity, turn: &str) -> Result<(), AgentError>;
     fn agent_abort_turn(&mut self, agent: Entity, turn: &str) -> Result<(), AgentError>;
@@ -55,14 +56,28 @@ impl WorldAgentExt for World {
             AgentChange::Transition { state, turn },
         )
     }
+    fn agent_ready(&mut self, entity: Entity) -> Result<(), AgentError> {
+        let agent = self
+            .get_component::<Agent>(entity)
+            .ok_or_else(|| AgentError::new(AgentErrorKind::AgentMissing, "Agent missing"))?;
+        if !matches!(agent.state, AgentState::Starting | AgentState::Running)
+            || agent.turn.is_some()
+        {
+            return Err(AgentError::new(
+                AgentErrorKind::StateRejected,
+                "Agent cannot become ready in current state",
+            ));
+        }
+        self.agent_transition(entity, AgentState::Running, None)
+    }
     fn agent_start_turn(&mut self, entity: Entity) -> Result<String, AgentError> {
         let agent = self
             .get_component_mut::<Agent>(entity)
             .ok_or_else(|| AgentError::new(AgentErrorKind::AgentMissing, "agent does not exist"))?;
-        if agent.state != AgentState::Idle || agent.turn.is_some() {
+        if agent.state != AgentState::Running || agent.turn.is_some() {
             return Err(AgentError::new(
                 AgentErrorKind::StateRejected,
-                "only an idle agent can start a turn",
+                "a running Agent without an active turn is required",
             ));
         }
         static PREFIX: OnceLock<String> = OnceLock::new();
@@ -84,7 +99,7 @@ impl WorldAgentExt for World {
             entity,
             &context,
             AgentChange::Transition {
-                state: AgentState::Working,
+                state: AgentState::Running,
                 turn: Some(turn.clone()),
             },
         )?;
@@ -96,12 +111,12 @@ impl WorldAgentExt for World {
             .get_component_mut::<Agent>(entity)
             .ok_or_else(|| AgentError::new(AgentErrorKind::AgentMissing, "agent does not exist"))?;
         if turn.is_empty()
-            || agent.state != AgentState::Working
+            || agent.state != AgentState::Running
             || agent.turn.as_deref().is_some_and(|current| current != turn)
         {
             return Err(AgentError::new(
                 AgentErrorKind::StateRejected,
-                "turn does not match the working agent",
+                "turn does not match the running Agent",
             ));
         }
         let context = agent.updates.clone();
@@ -110,7 +125,7 @@ impl WorldAgentExt for World {
             entity,
             &context,
             AgentChange::Transition {
-                state: AgentState::Idle,
+                state: AgentState::Running,
                 turn: None,
             },
         )?;
@@ -122,12 +137,12 @@ impl WorldAgentExt for World {
             .get_component_mut::<Agent>(entity)
             .ok_or_else(|| AgentError::new(AgentErrorKind::AgentMissing, "agent does not exist"))?;
         if turn.is_empty()
-            || agent.state != AgentState::Working
+            || agent.state != AgentState::Running
             || agent.turn.as_deref() != Some(turn)
         {
             return Err(AgentError::new(
                 AgentErrorKind::StateRejected,
-                "turn does not match the working agent",
+                "turn does not match the running Agent",
             ));
         }
         let context = agent.updates.clone();
@@ -136,7 +151,7 @@ impl WorldAgentExt for World {
             entity,
             &context,
             AgentChange::Transition {
-                state: AgentState::Working,
+                state: AgentState::Running,
                 turn: None,
             },
         )?;
@@ -145,3 +160,7 @@ impl WorldAgentExt for World {
 }
 
 pub use sync::{AgentPublicUpdate, PublicModelInfo, PublicToolInfo};
+
+pub use components::AgentOwner;
+
+pub use components::AgentSession;

@@ -107,7 +107,7 @@ mod linux {
                 agent_core::Agent::new(
                     "skill-integration".into(),
                     workspace,
-                    AgentState::Working,
+                    AgentState::Running,
                     Some("integration-turn".into()),
                     crate::test_agent_context(),
                 ),

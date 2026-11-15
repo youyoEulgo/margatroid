@@ -1,23 +1,17 @@
 use crate::{types::*, AgentInstalled};
-use address::{resolve_file, Address, ParsedAddress};
+use address::Address;
 use agent_core::WorldAgentExt;
 use agent_core::*;
-use agent_driver_core::{read_driver, AgentDriverInput, AgentDriverReadLimits};
 use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::WorldAsyncExt;
 use closure_plugin::WorldClosureExt;
 use core_plugin::{Entity, World};
 use futures_util::{future::join_all, FutureExt};
-use inference_core::{
-    ActiveInference, InferenceHandle, InferenceParameters, InitInference,
-    ModelRoutes,
-};
-use lua_runtime_core::*;
+use inference_core::{ActiveInference, InferenceHandle, InitInference};
 use mcl_core::{MclDrain, MclQueue};
 use prompt_resource_core::Prompts;
 use sandbox_resource_core::{Sandboxes, SelectedSandbox};
 use std::{
-    collections::BTreeMap,
     panic::AssertUnwindSafe,
     path::{Component, Path},
     sync::{Arc, Mutex},
@@ -67,6 +61,7 @@ fn validate_request(id: &str, name: &str) -> Result<(), AgentError> {
 fn validate_parameters(
     world: &World,
     workspace: Entity,
+    owner: Entity,
     name: &str,
     parameters: &AgentStartParameters,
 ) -> Result<String, AgentError> {
@@ -75,7 +70,7 @@ fn validate_parameters(
         .ok_or_else(|| error(AgentErrorKind::InvalidRequest, "Workspace is missing"))?;
     if !matches!(
         component.state,
-        WorkspaceState::Starting | WorkspaceState::Running | WorkspaceState::Restarting
+        WorkspaceState::Starting | WorkspaceState::Running
     ) {
         return Err(error(
             AgentErrorKind::StateRejected,
@@ -111,6 +106,34 @@ fn validate_parameters(
                 "Workspace home has no valid name",
             )
         })?;
+    let home = if owner == workspace {
+        home.to_path_buf()
+    } else {
+        let parent = world.get_component::<Agent>(owner).ok_or_else(|| {
+            error(
+                AgentErrorKind::InvalidRequest,
+                "owner is neither Workspace nor Agent",
+            )
+        })?;
+        if parent.workspace() != workspace
+            || matches!(parent.state(), AgentState::Stopping | AgentState::Error)
+        {
+            return Err(error(
+                AgentErrorKind::StateRejected,
+                "parent Agent is closing",
+            ));
+        }
+        world
+            .get_component::<agent_core::AgentResources>(owner)
+            .and_then(|source| source.parameters.settings_path.parent())
+            .ok_or_else(|| {
+                error(
+                    AgentErrorKind::InvalidRequest,
+                    "parent Agent resources missing",
+                )
+            })?
+            .to_path_buf()
+    };
     let directory = home.join("agents").join(name);
     if parameters.database_path != directory.join("state.sqlite")
         || parameters.settings_path != directory.join("setting.toml")
@@ -123,6 +146,8 @@ fn validate_parameters(
     for path in [
         &parameters.database_path,
         &parameters.settings_path,
+        &parameters.initial_settings_path,
+        &parameters.ui_path,
         &parameters.project_root,
         &parameters.home_root,
     ] {
@@ -137,15 +162,21 @@ fn validate_parameters(
             ));
         }
     }
-    let locator = ParsedAddress::parse(&parameters.driver)
-        .map_err(|e| error(AgentErrorKind::InvalidRequest, e))?;
-    if locator.kind != "driver" {
-        return Err(error(
-            AgentErrorKind::InvalidRequest,
-            "expected a driver file locator",
-        ));
+    if owner == workspace {
+        Ok(scope.to_owned())
+    } else {
+        use sha2::Digest;
+        let address = world.get_component::<Address>(owner).ok_or_else(|| {
+            error(
+                AgentErrorKind::InvalidRequest,
+                "parent Agent address missing",
+            )
+        })?;
+        Ok(format!(
+            "child-{:x}",
+            sha2::Sha256::digest(address.as_str().as_bytes())
+        ))
     }
-    Ok(scope.to_string())
 }
 fn context(
     world: &World,
@@ -157,6 +188,11 @@ fn context(
 ) -> FlowContext {
     let installed = world.get_resource::<AgentInstalled>().unwrap();
     FlowContext {
+        startup: world
+            .get_component::<StartupBarrier>(agent)
+            .expect("Agent startup barrier missing")
+            .0
+            .clone(),
         id,
         agent,
         workspace: world.get_component::<Agent>(agent).unwrap().workspace(),
@@ -165,7 +201,6 @@ fn context(
         reply,
         events: world.event_sender(),
         world: world.closure_sender(&installed.schedule),
-        driver_root: installed.driver_root.clone(),
     }
 }
 fn check_agent(
@@ -186,6 +221,9 @@ fn check_agent(
     Ok(())
 }
 fn cancel_runtime(world: &mut World, agent: Entity) {
+    if let Some(slot) = world.get_component::<lua_runtime_core::AgentWaitSlot>(agent) {
+        slot.0.lock().unwrap_or_else(|e| e.into_inner()).close();
+    }
     if let Some(queue) = world.get_component_mut::<MclQueue>(agent) {
         queue.accepting = false;
         queue.cancel.cancel();
@@ -200,13 +238,6 @@ fn cancel_runtime(world: &mut World, agent: Entity) {
             handle.cancel();
         }
     }
-    if let Some(vm) = world.get_component::<DriverLuaVm>(agent) {
-        vm.cancel.cancel();
-        vm.wake
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .close();
-    }
 }
 pub(crate) fn handle_start_agent(world: &mut World, request: StartAgent) {
     let Some(reply) = claim(&request.reply) else {
@@ -214,15 +245,24 @@ pub(crate) fn handle_start_agent(world: &mut World, request: StartAgent) {
     };
     let prepared = (|| {
         validate_request(&request.id, &request.name)?;
-        let scope =
-            validate_parameters(world, request.workspace, &request.name, &request.parameters)?;
+        let scope = validate_parameters(
+            world,
+            request.workspace,
+            request.owner,
+            &request.name,
+            &request.parameters,
+        )?;
         if world
             .query_with::<Agent>()
             .result()
             .into_iter()
             .any(|entity| {
                 world.get_component::<Agent>(entity).is_some_and(|agent| {
-                    agent.workspace() == request.workspace && agent.name() == &request.name
+                    agent.workspace() == request.workspace
+                        && agent.name() == &request.name
+                        && world
+                            .get_component::<agent_core::AgentOwner>(entity)
+                            .is_some_and(|owner| owner.0 == request.owner)
                 })
             })
         {
@@ -245,7 +285,18 @@ pub(crate) fn handle_start_agent(world: &mut World, request: StartAgent) {
             ));
         }
         let agent = world.spawn();
+        world.insert_component(
+            agent,
+            StartupBarrier(Arc::new(StartupCompletion::default())),
+        );
         world.insert_component(agent, address);
+        world.insert_component(agent, agent_core::AgentOwner(request.owner));
+        world.insert_component(
+            agent,
+            AgentResources {
+                parameters: request.parameters.clone(),
+            },
+        );
         world.insert_component(
             agent,
             agent_core::Agent::new(
@@ -301,10 +352,10 @@ pub(crate) fn handle_stop_agent(world: &mut World, request: StopAgent) {
         let component = world
             .get_component::<Agent>(request.agent)
             .ok_or_else(|| error(AgentErrorKind::AgentMissing, "Agent is missing"))?;
-        if !matches!(component.state(), AgentState::Idle | AgentState::Working) {
+        if component.state() == AgentState::Stopping {
             return Err(error(
                 AgentErrorKind::StateRejected,
-                "Agent is not Idle or Working",
+                "Agent is already stopping",
             ));
         }
         world.agent_transition(request.agent, AgentState::Stopping, None)?;
@@ -336,7 +387,13 @@ pub(crate) fn handle_restart_agent(world: &mut World, request: RestartAgent) {
     };
     let prepared = (|| {
         validate_request(&request.id, &request.name)?;
-        validate_parameters(world, request.workspace, &request.name, &request.parameters)?;
+        validate_parameters(
+            world,
+            request.workspace,
+            request.workspace,
+            &request.name,
+            &request.parameters,
+        )?;
         let matches: Vec<_> = world
             .query_with::<Agent>()
             .result()
@@ -373,20 +430,24 @@ pub(crate) fn handle_restart_agent(world: &mut World, request: RestartAgent) {
         }
         if !matches!(
             world.get_component::<Agent>(agent).unwrap().state(),
-            AgentState::Idle | AgentState::Working
+            AgentState::Running | AgentState::Starting | AgentState::Error
         ) {
             return Err(error(
                 AgentErrorKind::StateRejected,
                 "Agent is not Idle or Working",
             ));
         }
-        world.agent_transition(agent, AgentState::Restarting, None)?;
+        world.insert_component(
+            agent,
+            StartupBarrier(Arc::new(StartupCompletion::default())),
+        );
+        world.agent_transition(agent, AgentState::Stopping, None)?;
         cancel_runtime(world, agent);
         Ok(context(
             world,
             request.id.clone(),
             agent,
-            AgentState::Restarting,
+            AgentState::Stopping,
             Some(request.parameters.clone()),
             reply.clone(),
         ))
@@ -405,6 +466,9 @@ pub(crate) fn handle_restart_agent(world: &mut World, request: RestartAgent) {
 }
 pub(crate) fn handle_agent_exception(world: &mut World, event: AgentException) {
     if let Some(agent) = world.get_component::<Agent>(event.agent) {
+        if !matches!(agent.state(), AgentState::Starting | AgentState::Running) {
+            return;
+        }
         let context = agent.updates();
         let _ = agent_core::update_agent(
             world,
@@ -436,17 +500,27 @@ fn finish_result(world: &mut World, agent: Entity, state: AgentState) -> Result<
             "stale Agent lifecycle result",
         ));
     }
-    world.agent_transition(agent, AgentState::Idle, None)
+    Ok(())
 }
 fn failed_result(world: &mut World, failure: FlowError, state: AgentState) {
     tracing::error!(request=%failure.id,error=%failure.error,cleanup_completed=failure.cleanup_completed,"Agent lifecycle failed");
-    if failure.cleanup_completed {
-        if let Some(agent) = failure.agent {
-            if world
-                .get_component::<Agent>(agent)
-                .is_some_and(|component| component.state() == state)
-            {
+    if let Some(agent) = failure.agent {
+        let expected = failure.state.unwrap_or(state);
+        if world
+            .get_component::<Agent>(agent)
+            .is_some_and(|component| component.state() == expected)
+        {
+            if failure.cleanup_completed {
                 despawn_clean(world, agent);
+            } else {
+                let context = world.get_component::<Agent>(agent).unwrap().updates();
+                let _ = agent_core::update_agent(
+                    world,
+                    agent,
+                    &context,
+                    agent_core::AgentChange::Fault(failure.error.clone()),
+                );
+                cancel_runtime(world, agent);
             }
         }
     }
@@ -493,11 +567,11 @@ pub(crate) fn handle_restart_result(
     match result {
         Ok(output) => {
             let result =
-                finish_result(world, output.agent, AgentState::Restarting).map(|()| output.agent);
+                finish_result(world, output.agent, AgentState::Starting).map(|()| output.agent);
             tracing::debug!(request=%output.id,"Agent restart finished");
             deliver(&output.reply, result);
         }
-        Err(error) => failed_result(world, error, AgentState::Restarting),
+        Err(error) => failed_result(world, error, AgentState::Starting),
     }
 }
 async fn with_world<T: Send + 'static>(
@@ -522,6 +596,7 @@ fn failed(context: &FlowContext, error: AgentError, cleanup_completed: bool) -> 
         reply: Some(context.reply.clone()),
         error,
         cleanup_completed,
+        state: Some(context.state),
     }
 }
 fn reject_symlinks(path: &Path) -> Result<(), AgentError> {
@@ -544,74 +619,46 @@ fn reject_symlinks(path: &Path) -> Result<(), AgentError> {
 }
 async fn prepare(
     context: &FlowContext,
-) -> Result<
-    (
-        AgentDriverInput,
-        AgentStorage,
-        agent_core::AgentDriverSource,
-    ),
-    AgentError,
-> {
+) -> Result<(AgentStorage, agent_core::AgentResources), AgentError> {
     let parameters = context.parameters.clone().ok_or_else(|| {
         error(
             AgentErrorKind::InvalidRequest,
             "Agent startup parameters are missing",
         )
     })?;
-    let root = context.driver_root.clone();
     tokio::task::spawn_blocking(move || {
-        let path = resolve_file(&root, &parameters.driver)
-            .map_err(|e| error(AgentErrorKind::StartFailed, e))?;
-        let driver = read_driver(&path, &AgentDriverReadLimits::default())
-            .map_err(|e| error(AgentErrorKind::StartFailed, e))?;
+        let default_settings = if parameters.settings_path.exists() {
+            String::new()
+        } else {
+            agent_driver_core::read_initial_settings(
+                &parameters.initial_settings_path,
+                agent_driver_core::AgentDriverReadLimits::default().settings_bytes,
+            )
+            .map_err(|error| self::error(AgentErrorKind::StartFailed, error))?
+        };
         reject_symlinks(&parameters.database_path)?;
         reject_symlinks(&parameters.settings_path)?;
         let storage = open_storage(
             &parameters.database_path,
             &parameters.settings_path,
-            &driver.default_settings,
+            &default_settings,
         )
         .map_err(|e| error(AgentErrorKind::StartFailed, e))?;
-        Ok((
-            driver,
-            storage,
-            agent_core::AgentDriverSource {
-                address: parameters.driver,
-                manifest_path: path,
-            },
-        ))
+        Ok((storage, agent_core::AgentResources { parameters }))
     })
     .await
     .map_err(|e| error(AgentErrorKind::StartFailed, e))?
 }
-fn entity_value(entity: Entity) -> LuaValue {
-    LuaValue::Object(BTreeMap::from([
-        ("index".into(), LuaValue::Integer(i64::from(entity.index()))),
-        (
-            "generation".into(),
-            LuaValue::Integer(i64::from(entity.generation())),
-        ),
-    ]))
-}
 async fn install_runtime(
     context: &FlowContext,
-    driver: &AgentDriverInput,
     storage: AgentStorage,
-    source: agent_core::AgentDriverSource,
-) -> Result<LuaEnvironment, AgentError> {
+    source: agent_core::AgentResources,
+) -> Result<(), AgentError> {
     let agent = context.agent;
     let workspace = context.workspace;
     let state = context.state;
-    let manifest = driver.manifest.clone();
-    let parameters = context.parameters.clone().unwrap();
-    let (environment, finished, observers) = with_world(context, move |world| {
+    let (finished, observers) = with_world(context, move |world| {
         check_agent(world, agent, workspace, state)?;
-        if world.get_component::<DriverLuaVm>(agent).is_some() {
-            return Err(error(
-                AgentErrorKind::CleanupFailed,
-                "old Driver VM still exists",
-            ));
-        }
         if world
             .get_component::<ActiveInference>(agent)
             .and_then(|active| active.current.as_ref())
@@ -622,77 +669,6 @@ async fn install_runtime(
                 "cannot replace an active inference handle",
             ));
         }
-        let route = world
-            .get_resource::<ModelRoutes>()
-            .and_then(|routes| routes.get(&manifest.inference.model))
-            .ok_or_else(|| {
-                error(
-                    AgentErrorKind::StartFailed,
-                    "Driver model has no configured ModelRoute",
-                )
-            })?;
-        let tokens = i64::try_from(route.context_window_tokens).map_err(|_| {
-            error(
-                AgentErrorKind::StartFailed,
-                "model context window exceeds Lua integer range",
-            )
-        })?;
-        let model = LuaValue::Object(BTreeMap::from([
-            (
-                "id".into(),
-                LuaValue::String(manifest.inference.model.clone()),
-            ),
-            ("model".into(), LuaValue::String(route.model.clone())),
-            ("provider".into(), LuaValue::String(route.provider.clone())),
-            ("api_type".into(), LuaValue::String(route.api_type.clone())),
-            ("context_window_tokens".into(), LuaValue::Integer(tokens)),
-            (
-                "thinking".into(),
-                route
-                    .thinking
-                    .clone()
-                    .map(LuaValue::String)
-                    .unwrap_or(LuaValue::Nil),
-            ),
-            (
-                "reasoning_effort".into(),
-                route
-                    .reasoning_effort
-                    .clone()
-                    .map(LuaValue::String)
-                    .unwrap_or(LuaValue::Nil),
-            ),
-        ]));
-        let inference = InferenceParameters {
-            model: manifest.inference.model,
-            temperature: manifest.inference.temperature,
-            max_output_tokens: manifest.inference.max_output_tokens,
-            top_p: manifest.inference.top_p,
-            stop: manifest.inference.stop,
-        };
-        let name = world.get_component::<Agent>(agent).unwrap().name().clone();
-        let info = LuaValue::Object(BTreeMap::from([
-            ("name".into(), LuaValue::String(name)),
-            ("entity".into(), entity_value(agent)),
-            ("workspace".into(), entity_value(workspace)),
-            (
-                "project_root".into(),
-                LuaValue::String(parameters.project_root.to_string_lossy().into_owned()),
-            ),
-            (
-                "home_root".into(),
-                LuaValue::String(parameters.home_root.to_string_lossy().into_owned()),
-            ),
-            ("model".into(), model),
-            (
-                "inference".into(),
-                LuaValue::from_json(
-                    serde_json::to_value(&inference)
-                        .map_err(|e| error(AgentErrorKind::StartFailed, e))?,
-                )
-                .map_err(|e| error(AgentErrorKind::StartFailed, e))?,
-            ),
-        ]));
         let finished = world
             .get_component_mut::<ActiveInference>(agent)
             .and_then(|active| active.current.take());
@@ -705,24 +681,11 @@ async fn install_runtime(
             }
         }
         world.insert_component(agent, storage);
+        world.remove_component::<lua_runtime_core::LuaAgentMonitor>(agent);
+        world.insert_component(agent, agent_core::AgentSession::new());
+        world.insert_component(agent, lua_runtime_core::AgentWaitSlot::default());
         world.insert_component(agent, source);
-        world.insert_component(
-            agent,
-            MclQueue {
-                allowed_imports: manifest.dependencies,
-                ..MclQueue::default()
-            },
-        );
-        world.insert_component(
-            agent,
-            inference_core::AgentInferenceConfig::new(
-                inference,
-                world
-                    .get_resource::<inference_core::ModelSyncBinding>()
-                    .expect("model sync required")
-                    .for_owner(agent),
-            ),
-        );
+        world.insert_component(agent, MclQueue::default());
         world.insert_component(
             agent,
             Tools::new(
@@ -763,14 +726,7 @@ async fn install_runtime(
         }
         world.remove_component::<ToolTasks>(agent);
         let observers = agent_core::notify_agent_runtime(world, agent, false)?;
-        Ok((
-            LuaEnvironment {
-                globals: BTreeMap::from([("agent_info".into(), LuaBinding::Value(info))]),
-                modules: BTreeMap::new(),
-            },
-            finished,
-            observers,
-        ))
+        Ok((finished, observers))
     })
     .await?;
     wait_observers(observers).await?;
@@ -782,11 +738,11 @@ async fn install_runtime(
             )
         })?;
     }
-    Ok(environment)
+    Ok(())
 }
 async fn start_steps(context: &FlowContext) -> Result<(), StartFailure> {
-    let (driver, storage, source) = prepare(context).await?;
-    let environment = install_runtime(context, &driver, storage, source).await?;
+    let (storage, source) = prepare(context).await?;
+    install_runtime(context, storage, source).await?;
     let (tool_sender, tool_receiver) = oneshot::channel();
     let (inference_sender, inference_receiver) = oneshot::channel();
     let agent = context.agent;
@@ -858,81 +814,47 @@ async fn start_steps(context: &FlowContext) -> Result<(), StartFailure> {
         Ok(())
     })
     .await?;
-    let (sender, receiver) = oneshot::channel();
-    context.events.send_event(StartDriverLuaVm {
-        owner: context.agent,
-        workspace: context.workspace,
-        program: LuaProgram {
-            source: driver.program,
-            origin: driver.origin,
-            libraries: LuaStandardLibraries::Minimal,
-        },
-        environment,
-        reply: Arc::new(Mutex::new(Some(sender))),
-    });
-    let instance = match receiver.await {
-        Ok(Ok(instance)) => instance,
-        Ok(Err(e)) => {
-            let uncertain = e.kind == LuaRuntimeErrorKind::CleanupFailed;
-            return Err(StartFailure {
-                error: error(AgentErrorKind::StartFailed, e),
-                uncertain,
-            });
-        }
-        Err(e) => {
-            return Err(StartFailure {
-                error: error(
-                    AgentErrorKind::ReplyClosed,
-                    format!("VM start reply closed: {e}"),
-                ),
-                uncertain: true,
-            });
-        }
-    };
-    with_world(context, move |world| {
-        check_agent(world, agent, workspace, state)?;
-        if instance.owner != agent
-            || !world
-                .get_component::<DriverLuaVm>(agent)
-                .is_some_and(|vm| vm.instance == instance)
-        {
-            return Err(error(
-                AgentErrorKind::CleanupFailed,
-                "Driver startup result does not match the current VM instance",
-            ));
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|error| StartFailure {
-        error,
-        uncertain: true,
-    })?;
+
     Ok(())
 }
 struct StopSnapshot {
-    instance: Option<DriverLuaVmInstance>,
     storage: Option<AgentStorage>,
+    session: Option<String>,
     inference: Option<InferenceHandle>,
     tasks: Vec<ToolTaskHandle>,
     drain: Option<MclDrain>,
 }
-async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), AgentError> {
+async fn stop_runtime(context: &FlowContext, _require_vm: bool) -> Result<(), AgentError> {
     let agent = context.agent;
     let workspace = context.workspace;
     let state = context.state;
+    let children = with_world(context, move |world| {
+        Ok(world
+            .query_with::<agent_core::AgentOwner>()
+            .result()
+            .into_iter()
+            .filter(|entity| {
+                world
+                    .get_component::<agent_core::AgentOwner>(*entity)
+                    .is_some_and(|owner| owner.0 == agent)
+                    && world.get_component::<Agent>(*entity).is_some()
+            })
+            .collect::<Vec<_>>())
+    })
+    .await?;
+    for child in children {
+        let (tx, rx) = oneshot::channel();
+        context.events.send_event(StopAgent {
+            id: format!("{}:child:{}", context.id, child.index()),
+            agent: child,
+            reply: Arc::new(Mutex::new(Some(tx))),
+        });
+        rx.await
+            .map_err(|e| error(AgentErrorKind::ReplyClosed, e))??;
+    }
     let snapshot = with_world(context, move |world| {
         check_agent(world, agent, workspace, state)?;
         cancel_runtime(world, agent);
-        let instance = world
-            .get_component::<DriverLuaVm>(agent)
-            .map(|vm| vm.instance.clone());
-        if require_vm && instance.is_none() {
-            return Err(error(
-                AgentErrorKind::CleanupFailed,
-                "Driver VM is missing without a confirmed stop result",
-            ));
-        }
         let inference = world
             .get_component_mut::<ActiveInference>(agent)
             .and_then(|active| active.current.take());
@@ -943,10 +865,11 @@ async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), Age
         let drain = world
             .get_component::<MclQueue>(agent)
             .map(|queue| queue.drain.clone());
-        let storage = world.get_component::<AgentStorage>(agent).cloned();
         Ok(StopSnapshot {
-            instance,
-            storage,
+            storage: world.get_component::<AgentStorage>(agent).cloned(),
+            session: world
+                .get_component::<agent_core::AgentSession>(agent)
+                .map(|session| session.0.clone()),
             inference,
             tasks,
             drain,
@@ -954,32 +877,12 @@ async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), Age
     })
     .await?;
     let StopSnapshot {
-        instance,
         storage,
+        session,
         inference,
         tasks,
         drain,
     } = snapshot;
-    let cleanup_instance = instance.as_ref().map(|instance| instance.start_id.clone());
-    let vm = async {
-        if let Some(instance) = instance {
-            let (sender, receiver) = oneshot::channel();
-            context.events.send_event(StopDriverLuaVm {
-                instance,
-                reply: Arc::new(Mutex::new(Some(sender))),
-            });
-            receiver
-                .await
-                .map_err(|e| {
-                    error(
-                        AgentErrorKind::ReplyClosed,
-                        format!("VM stop reply closed without cleanup proof: {e}"),
-                    )
-                })?
-                .map_err(|e| error(AgentErrorKind::CleanupFailed, e))?;
-        }
-        Ok::<(), AgentError>(())
-    };
     let inference = async move {
         if let Some(handle) = inference {
             handle.wait_finished().await.map_err(|e| {
@@ -1009,9 +912,9 @@ async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), Age
         }
         Ok::<(), AgentError>(())
     };
-    let (vm, inference, tasks, drain) = tokio::join!(vm, inference, tasks, drain);
+    let (inference, tasks, drain) = tokio::join!(inference, tasks, drain);
     let mut failures = Vec::new();
-    for result in [vm, inference, drain].into_iter().chain(tasks) {
+    for result in [inference, drain].into_iter().chain(tasks) {
         if let Err(error) = result {
             failures.push(error.to_string());
         }
@@ -1019,22 +922,17 @@ async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), Age
     if !failures.is_empty() {
         return Err(error(AgentErrorKind::CleanupFailed, failures.join("; ")));
     }
-    if let (Some(storage), Some(instance)) = (storage, cleanup_instance) {
+    if let (Some(storage), Some(instance)) = (storage, session) {
         tokio::task::spawn_blocking(move || {
             execute_storage(&storage, StorageOperation::DropTemporaryBlocks { instance })
         })
         .await
-        .map_err(|failure| error(AgentErrorKind::CleanupFailed, failure))?
-        .map_err(|failure| error(AgentErrorKind::CleanupFailed, failure))?;
+        .map_err(|e| error(AgentErrorKind::CleanupFailed, e))?
+        .map_err(|e| error(AgentErrorKind::CleanupFailed, e))?;
     }
     let observers = with_world(context, move |world| {
         check_agent(world, agent, workspace, state)?;
-        if world.get_component::<DriverLuaVm>(agent).is_some() {
-            return Err(error(
-                AgentErrorKind::CleanupFailed,
-                "Driver stop was acknowledged while its component remains",
-            ));
-        }
+        world.remove_component::<lua_runtime_core::LuaAgentMonitor>(agent);
         if let Some(active) = world.get_component_mut::<ActiveInference>(agent) {
             if active
                 .current
@@ -1066,7 +964,7 @@ async fn stop_runtime(context: &FlowContext, require_vm: bool) -> Result<(), Age
                 "MCL commands have not fully drained",
             ));
         }
-        world.remove_component::<agent_core::AgentDriverSource>(agent);
+        world.remove_component::<agent_core::AgentResources>(agent);
         agent_core::notify_agent_runtime(world, agent, true)
     })
     .await?;
@@ -1098,6 +996,7 @@ async fn start_flow(context: FlowContext) -> Result<StartOutput, StartError> {
     })
 }
 async fn stop_flow(context: FlowContext) -> Result<StopOutput, StopError> {
+    context.startup.wait().await;
     stop_runtime(&context, true)
         .await
         .map_err(|e| failed(&context, e, false))?;
@@ -1107,10 +1006,19 @@ async fn stop_flow(context: FlowContext) -> Result<StopOutput, StopError> {
         reply: context.reply,
     })
 }
-async fn restart_flow(context: FlowContext) -> Result<RestartOutput, RestartError> {
+async fn restart_flow(mut context: FlowContext) -> Result<RestartOutput, RestartError> {
     stop_runtime(&context, true)
         .await
         .map_err(|e| failed(&context, e, false))?;
+    let agent = context.agent;
+    let workspace = context.workspace;
+    with_world(&context, move |world| {
+        check_agent(world, agent, workspace, AgentState::Stopping)?;
+        world.agent_transition(agent, AgentState::Starting, None)
+    })
+    .await
+    .map_err(|e| failed(&context, e, false))?;
+    context.state = AgentState::Starting;
     startup(&context).await?;
     Ok(RestartOutput {
         id: context.id,
@@ -1120,7 +1028,7 @@ async fn restart_flow(context: FlowContext) -> Result<RestartOutput, RestartErro
 }
 async fn guarded_start(context: FlowContext) -> Result<StartOutput, StartError> {
     let retained = context.clone();
-    AssertUnwindSafe(start_flow(context))
+    let result = AssertUnwindSafe(start_flow(context))
         .catch_unwind()
         .await
         .unwrap_or_else(|_| {
@@ -1132,7 +1040,9 @@ async fn guarded_start(context: FlowContext) -> Result<StartOutput, StartError> 
                 ),
                 false,
             ))
-        })
+        });
+    retained.startup.finish();
+    result
 }
 async fn guarded_stop(context: FlowContext) -> Result<StopOutput, StopError> {
     let retained = context.clone();
@@ -1152,7 +1062,7 @@ async fn guarded_stop(context: FlowContext) -> Result<StopOutput, StopError> {
 }
 async fn guarded_restart(context: FlowContext) -> Result<RestartOutput, RestartError> {
     let retained = context.clone();
-    AssertUnwindSafe(restart_flow(context))
+    let result = AssertUnwindSafe(restart_flow(context))
         .catch_unwind()
         .await
         .unwrap_or_else(|_| {
@@ -1164,7 +1074,9 @@ async fn guarded_restart(context: FlowContext) -> Result<RestartOutput, RestartE
                 ),
                 false,
             ))
-        })
+        });
+    retained.startup.finish();
+    result
 }
 
 async fn wait_observers(

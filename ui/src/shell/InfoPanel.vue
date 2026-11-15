@@ -48,7 +48,9 @@ function historyPreview(message: HistoryMessage): string {
   const payload = payloadOf(message);
   if (Array.isArray(payload.tool_calls) && payload.tool_calls.length) {
     const names = payload.tool_calls
-      .map((call) => (isRecord(call) && typeof call.tool_name === 'string' ? call.tool_name : 'tool'))
+      .map((call) =>
+        isRecord(call) && typeof call.tool_name === 'string' ? call.tool_name : 'tool',
+      )
       .join(', ');
     return `tool calls: ${names}`;
   }
@@ -148,29 +150,50 @@ onMounted(async () => {
       </section>
 
       <p v-if="agent?.error" class="info-error info-agent-error">
-        {{ agent.error.code }}: {{ agent.error.message }}
+        Agent error · {{ agent.error.code }}
       </p>
 
       <section class="info-grid">
-        <div><span>Workspace</span><code>{{ selectedWorkspace?.name ?? agent?.workspace.id ?? '—' }}</code></div>
-        <div><span>Turn</span><code>{{ agent?.turn ?? 'idle' }}</code></div>
-        <div><span>Sandbox</span><code>{{ sandboxActive ?? 'none' }}</code></div>
-        <div><span>Context</span><code>{{ model ? `${model.context_window_tokens.toLocaleString()} tokens` : '—' }}</code></div>
+        <div>
+          <span>Workspace</span
+          ><code>{{ selectedWorkspace?.name ?? agent?.workspace.id ?? '—' }}</code>
+        </div>
+        <div>
+          <span>Turn</span><code>{{ agent?.turn ?? 'idle' }}</code>
+        </div>
+        <div>
+          <span>Sandbox</span><code>{{ sandboxActive ?? 'none' }}</code>
+        </div>
+        <div>
+          <span>Context</span
+          ><code>{{ model ? `${model.context_window_tokens.toLocaleString()} tokens` : '—' }}</code>
+        </div>
       </section>
 
       <section class="info-section">
         <h3><Cpu :size="14" /> Model</h3>
         <div v-if="model" class="info-model">
-          <div><span>Model</span><code>{{ model.model }}</code></div>
-          <div><span>Route</span><code>{{ model.id }}</code></div>
-          <div><span>Provider / API</span><code>{{ model.provider }} · {{ model.api_type }}</code></div>
-          <div><span>Thinking / effort</span><code>{{ model.thinking ?? '—' }} · {{ model.reasoning_effort ?? '—' }}</code></div>
+          <div>
+            <span>Model</span><code>{{ model.model }}</code>
+          </div>
+          <div>
+            <span>Route</span><code>{{ model.id }}</code>
+          </div>
+          <div>
+            <span>Provider / API</span><code>{{ model.provider }} · {{ model.api_type }}</code>
+          </div>
+          <div>
+            <span>Thinking / effort</span
+            ><code>{{ model.thinking ?? '—' }} · {{ model.reasoning_effort ?? '—' }}</code>
+          </div>
         </div>
         <p v-else class="info-empty">Model information is not available.</p>
       </section>
 
       <section class="info-section">
-        <h3><ShieldCheck :size="14" /> Sandboxes <span>{{ sandboxOptions.options.length }}</span></h3>
+        <h3>
+          <ShieldCheck :size="14" /> Sandboxes <span>{{ sandboxOptions.options.length }}</span>
+        </h3>
         <div v-if="sandboxOptions.options.length" class="info-list">
           <div v-for="alias in sandboxOptions.options" :key="alias" class="info-row">
             <ShieldCheck :size="13" />
@@ -182,7 +205,9 @@ onMounted(async () => {
       </section>
 
       <section class="info-section">
-        <h3><Wrench :size="14" /> Tools <span>{{ tools.length }}</span></h3>
+        <h3>
+          <Wrench :size="14" /> Tools <span>{{ tools.length }}</span>
+        </h3>
         <div v-if="tools.length" class="info-list">
           <details v-for="tool in tools" :key="tool.alias" class="info-tool">
             <summary>
@@ -200,7 +225,9 @@ onMounted(async () => {
       </section>
 
       <section class="info-section">
-        <h3><Boxes :size="14" /> Tasks <span>{{ tasks.length }}</span></h3>
+        <h3>
+          <Boxes :size="14" /> Tasks <span>{{ tasks.length }}</span>
+        </h3>
         <div v-if="tasks.length" class="info-list">
           <details v-for="task in tasks" :key="task.task_id" class="info-task">
             <summary>
@@ -209,7 +236,7 @@ onMounted(async () => {
               <small>{{ task.task_id }}</small>
             </summary>
             <p class="info-path">call: {{ task.call_id }}</p>
-            <p v-if="task.error" class="info-error">{{ task.error.code }}: {{ task.error.message }}</p>
+            <p v-if="task.error" class="info-error">Task error · {{ task.error.code }}</p>
             <pre v-if="task.output.length">{{ outputText(task.output) }}</pre>
           </details>
         </div>
@@ -227,13 +254,11 @@ onMounted(async () => {
           aria-label="Agent history"
           @scroll="onHistoryScroll"
         >
-          <details
-            v-for="message in history"
-            :key="message.sequence"
-            class="info-history-entry"
-          >
+          <details v-for="message in history" :key="message.sequence" class="info-history-entry">
             <summary class="info-history-row">
-              <span class="info-history-time">{{ formatRecordTime(message.created_at_ms, true) }}</span>
+              <span class="info-history-time">{{
+                formatRecordTime(message.created_at_ms, true)
+              }}</span>
               <span class="info-badge">{{ messageType(message) }}</span>
               <span class="info-history-seq">#{{ message.sequence }}</span>
               <span class="info-history-text">{{ historyPreview(message) }}</span>

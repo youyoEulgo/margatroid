@@ -39,6 +39,13 @@ impl TaskSyncBinding {
             encode: Arc::new(encode),
         }
     }
+    pub fn execution_only(&self) -> Self {
+        Self {
+            clients: self.clients.clone(),
+            targets: Arc::from([]),
+            encode: self.encode.clone(),
+        }
+    }
     pub(crate) fn bind(
         &self,
         owner: Entity,
@@ -125,3 +132,5 @@ pub(crate) fn update_task<R>(
     }
     Ok(result)
 }
+
+impl core_plugin::Resource for TaskSyncBinding {}

@@ -170,7 +170,7 @@ handle_init_tool_tasks(world: &mut World, request: InitToolTasks)
 
 handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
     行为：
-        认领reply，核对Agent完整Entity、Working及当前非空turn与request.turn匹配；
+        认领reply，核对Agent完整Entity、Running及当前非空turn与request.turn匹配；
         无turn或不匹配直接返回保留call_id/alias的中止工具结果，不注册任务、不启动闭包或进程。
         entry = Tools.get(request.alias) or return 对应工具错误
         使用entry.input_schema校验arguments
@@ -353,15 +353,16 @@ margatroid.process:start(program: String, arguments: Vec<String>) -> Future<Outp
         子进程归当前VM或ToolTask，随所属执行环境的取消、超时及真实清理回收
         只有Bash或终端工具显式启动shell-client，文件类工具不依赖该bin
 
-margatroid.driver:mcl(target, instruction, arguments?) -> HostFuture
-    行为：
-        仅Driver身份可用，工具中调用明确返回身份错误
-        沿用原MCL参数、身份绑定及结果契约，不建立工具任务
-
-margatroid.driver:wait() -> HostFuture
-    行为：
-        仅Driver身份可用，等待原DriverWakeSlot；工具中调用明确失败
-
+margatroid.mcl:execute(target: String, instruction: String, arguments: Option<Vec<Value>>) -> Future<Value>
+    行为：工具worker通过RunnerFrame::Host转发公共服务，宿主绑定实际ToolTaskHandle.execution_id及取消能力；与自动Lua使用同一LuaServices，原MCL队列/审计/oneshot保留。
+        mcl_value把MclValue::Unit显式投影为空JSON对象{}，其他成功值保持原结构，MCL Error保持{Error=...}；不以nil/null表示无数据成功。
+margatroid.agent:stop(target: String) -> Future<Value>
+    行为：共享Lua服务验证同Workspace目标，提交原StopAgent，并通过既有异步World闭包监督原reply；返回{}表示已提交清理，不表示实体已销毁。调用者可能正是目标自有工具，因此不在调用栈中等待自身退出。
+margatroid:wait(target: String) -> Future<()>
+    行为：在明确Agent上等待一次唤醒，与自动Lua相同，不把等待目标作为VM所有者。
+margatroid.agent:create({owner: String, name: String, config_path: String, ui_path: String}) -> Future<Value>
+    行为：发送原StartAgent，owner指向Workspace或父Agent，资源挂载完成返回实际信息，创建者执行独立。
+        config_path是明确的初始化TOML文件地址，仅首次初始化持久配置；ui_path是明确目录引用，每个Agent直接监控，不复制。拒绝旧resource_dir创建参数和未知字段。
 margatroid.tools:register(registration: RegisterToolsRequest) -> Future<Output = ()>
     行为：仅工具execute可用。注册批次指定目标Agent，每项lifetime独立指定任务；缺省Agent为当前Agent，缺省lifetime不绑定发起任务。
         inject_tools在World闭包校验实际发起任务身份和同Workspace当前目标，原子登记完整批次；程序路径固定为当前工具资源，不接受参数指定任意程序。
@@ -385,38 +386,38 @@ task_reference(lua: &Lua, value: LuaValue) -> mlua::Result<TaskReference>
 
 margatroid.task:append_output(value: LuaValue) -> Future<Output = ()>
     行为：
-        仅工具execute阶段可用，向当前任务缓冲追加值
+        仅execute阶段可用，向当前任务缓冲追加值
         窗口超限滚出旧项并调整cursor；超长字符串保留UTF-8尾部，放不下的结构项整项滚出
 
 margatroid.task:replace_output(value: LuaValue) -> Future<Output = ()>
     行为：
-        仅工具execute阶段可用，替换当前输出缓冲，cursor=0且replaced=true
+        仅execute阶段可用，替换当前输出缓冲，cursor=0且replaced=true
         替换与读取共用短锁，不改变任务存活状态
 
 margatroid.task:read_output(target: TaskReference | String) -> Future<Output = TaskReadResult>
     行为：
-        仅工具execute阶段可用，按结构化目标读取同Workspace实际任务的增量缓冲并推进cursor
+        仅execute阶段可用，按结构化目标读取同Workspace实际任务的增量缓冲并推进cursor
         不返回completed字段，已经finish的目标返回TaskMissing
 
 margatroid.task:return_result(value: LuaValue) -> Future<Output = ()>
     行为：
-        仅工具execute阶段可用，原子交付原调用一次结果，不结束VM或关闭输入
+        仅execute阶段可用，原子交付原调用一次结果，不结束VM或关闭输入
         与中止共用原reply裁决，重复回复报错，成功交付后异常仍只记录日志
 
 margatroid.task:finish(target: TaskReference | String) -> Future<Output = ()>
     行为：
-        仅工具execute阶段可用，只操作同Agent任务；Driver中调用明确失败
+        仅execute阶段可用；结构化引用支持同Workspace任务，省略Agent时选择当前执行任务集合
         自身以控制退出结束Lua，由监督者真实清理；不等待自己的JoinHandle
         其他任务在真实清理并移除后才返回成功，已finish目标返回TaskMissing
 
 margatroid.task:send(target: TaskReference | String, value: LuaValue) -> Future<Output = ()>
     行为：
-        仅工具execute阶段可用，向同Agent任务输入通道投递结构化值
+        仅execute阶段可用，通过真实TaskReference定位同Workspace任务并向其输入通道投递结构化值；省略Agent使用当前执行任务集合
         成功仅表示已入队，不表示目标已经处理
 
 margatroid.task:receive() -> Future<Output = LuaValue>
     行为：
-        仅工具execute阶段可用，等待当前任务的一条输入，不持缓存锁
+        仅execute阶段可用，等待当前任务的一条输入，不持缓存锁
         消息协议由Lua工具解释，等待服从当前任务取消及timeout
 
 ProcessSession：原始子进程userdata
@@ -443,86 +444,37 @@ ProcessSession：原始子进程userdata
 
 私有：
 ```text
-ToolLaunchOutput：监督任务已交给ToolTaskHandle的启动事实，不是工具执行结果
-ToolLaunchError：ToolError及原请求回复/共享句柄关联，实现From<AsyncTaskError>
 
-ToolExecutionContext：单次执行材料
-    agent_address: String
-    workspace: Value--实际受理时读取的固定Workspace身份
-    request: ToolExecuteRequest
-    reply：唯一回复端由ToolTaskShared持有，context仅通过同一共享句柄交付
-    tool_entry: ToolEntry--按当前alias找到的工具记录，包含schema、path及必要任务标记
-    sandbox_path: Option<PathBuf>
-    project_root: PathBuf
-    runner_path: PathBuf
-    limits: ToolExecutionLimits
-    handle: ToolTaskHandle--与集合条目指向同一任务
-    tasks: ToolTasks--共享集合句柄，处理task_read/task_send/task_finish不借用World
-    storage: AgentStorage--当前Agent的owned日志写入能力，不传入worker
-    agent_name: String--宿主固定真实名称及调用关联
-    diagnostic_received: bool--仅本次调用，用于避免同一worker故障重复记录
+RunnerFrame::Host { request_id: String, method: String, arguments: Value }
+    行为：工具bin复用公共Lua宿主服务协议，宿主自动绑定实际任务身份，不接受脚本伪造source。
+LuaExecutionTask（tool_core公开组件）
+    workspace: Entity
+    handle: ToolTaskHandle
+    tasks: ToolTasks
+    input: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Value>>>
+    resource_dir: PathBuf--自动任务的真实Lua入口路径
+    行为：复用原任务scope/输入/输出/Return能力，不持Agent生命周期；Workspace内部任务使用TaskSyncBinding.execution_only，不投Agent专属消息。
+LuaServices安装（tool/plugin/src/services.rs）
+    install(app: &mut App)
+    install_on(app: &mut App, schedule: &str)
+        行为：应用内唯一服务表，Weak World发送能力避免环；自动执行和tool bin转发使用同一invoke。
+    ExecutionBindings：Resource，Arc<Mutex<HashMap<执行实例, BTreeMap<登记id, MonitoredAgent>>>>
+    MonitoredAgent：实际Entity、AgentSession、owned AgentStorage
+    bound_context(world, agent) -> Value
+        行为：在真实调用时从World取得Agent/Workspace Address、当前turn和实际AgentSession；与可信执行instance/source_address组合保留完整日志关联，不缓存启动时的回合。
+    bind_agent(world, instance, entity)
+        行为：Agent创建资源挂载后、返回信息前登记实际会话；安装LuaAgentMonitor解绑凭证，重启/停止资源时移除；无需帧扫描或轮询任务。
+    finish_execution(sender, identity, diagnostic)
+        行为：实际执行退出清理后精确取走本实例登记；正常/受控取消只退休登记，异常逐目标await日志blocking提交，再复检当前Entity/Session并发送原AgentException。
+        持久日志提交驱动现有record probe直接投Clients；日志写入失败也不能遗漏其他Agent的error报告，聚合诊断错误。
+    invoke(sender, identity, method, arguments) -> LuaServiceFuture
+        行为：所有实际World读取/修改处validate_execution核对source Address、实际VM或唯一task-instance及取消状态。
+        execution_log将自动执行的主动日志投递给实际绑定Agent存储，沿原提交探针发布；无Agent的完整报告由Lua宿主提交RuntimeLogStore，不只写控制台。
+        agent_stop提交原StopAgent并在调用栈外监督原reply；
+        agent_create通过原StartAgent/oneshot挂载独立Agent并调用bind_agent；mcl_execute通过原MclCommand/oneshot；wait使用AgentWaitSlot；其他工具、成员、任务服务复用原入口。
+    acknowledge_execution(world: &World, identity: &LuaExecutionIdentity)
+        行为：自动Lua首次wait或Return交接启动；短任务正常执行结束也可成功，Agent.ready不控制VM寿命。
 
-RunnerContext：进程执行材料--本次读取的程序、校验后的参数、策略及执行预算
-
-RunnerRequest：stdin协议
-    protocol_version: u32
-    program: String
-    arguments: serde_json::Value
-    context: ToolContext
-    limits: ToolExecutionLimits
-
-RunnerFrame：worker到supervisor的有序协议帧，私有枚举
-    Return(serde_json::Value)
-    Write(serde_json::Value)
-    Replace(serde_json::Value)
-    Read { request_id: String, target: TaskReference }
-    Send { request_id: String, target: TaskReference, value: serde_json::Value }
-    Finish { request_id: String, target: TaskReference }
-    WorkspaceAgents { request_id: String }
-    Inject { request_id: String, registration: RegisterToolsRequest }--通用工具定义登记请求，不含MCP协议
-    Log { request_id: String, record: AgentLogRecord }--主动日志，宿主固定可信关联并在写入完成后确认
-    LuaDiagnostic { request_id: String, record: AgentLogRecord }--含原始错误、来源和traceback，只在宿主日志路径消费并确认
-    InputConsumed--Lua取走输入后允许转发下一条；宿主响应读取不等待输入邮箱腾位。
-
-HostFrame：supervisor到worker的协议帧，私有枚举
-    Input(serde_json::Value)
-    Response { request_id: String, result: Result<serde_json::Value, ToolError> }
-
-
-FileInfo：文件信息
-    path: LuaString--本次查询项的绝对路径，保留系统路径原始字节
-    resolved_path: Option<LuaString>--解析符号链接后的目标路径，不做有损转码
-    kind: file | directory | symlink | other--本次查询项自身种类
-    size: u64--本次查询项大小，单位为字节
-    modified_at_ns: Option<i64>--Unix纳秒修改时间，保留文件系统排序精度；不可取得时None
-
-DirectoryEntry：目录直接子项
-    name: LuaString
-    FileInfo的全部字段
-
-TextMatch：正则匹配位置
-    start: usize--零基字节偏移，包含
-    end: usize--字节偏移，不包含
-
-ToolContext：worker私有上下文
-    agent_name: String
-    agent_address: String
-    workspace: Value--固定address/name/project_root，受理时从真实Workspace取得
-    owner_agent: Option<String>--绑定任务实际Agent公开地址
-    turn: String
-    source_origin: String--内部Lua程序来源，public_value不暴露该键
-    task_id: String
-    call_id: String
-    alias: String--本次被调用的入口alias，不一定是原注册入口
-    owner_task_id: Option<String>--从Tools记录传入，值由注入时显式配置；调用参数不能覆盖
-    binding: Option<serde_json::Value>--脚本自定义不透明数据，宿主保存并原样注入
-    resource_dir: PathBuf--当前工具资源目录，供定位同目录bin；不从arguments派生
-    project_root: PathBuf
-    temp_dir: PathBuf
-    public_value(&self, arguments: &serde_json::Value) -> Result<serde_json::Value, Error>
-        行为：
-            生成只读公共上下文，kind=tool、agent_info.name/address为真实身份，arguments来自本次调用
-            隐藏内部agent_name与source_origin平铺键，保留调用参数与真实路径材料
 ```
 
 # types pub
@@ -532,6 +484,7 @@ ToolContext：worker私有上下文
 公开：
 ```text
 ToolTaskHandle：可克隆的任务共享句柄，公开类型
+    execution_id(&self) -> &str--每个实际任务唯一，MCL来源不使用可重用业务id
     inner: Arc<ToolTaskShared>
     updates: TaskUpdateContext--来源于同一ToolTasks，source.prepare只捕获集合Weak，避免强引用环
     write / replace / try_return / set_error / complete_cleanup

@@ -54,9 +54,13 @@ fn command(
     text: &str,
     arguments: Vec<serde_json::Value>,
 ) -> MclValue {
+    let execution = app
+        .world()
+        .query_with::<lua_runtime_core::WorkspaceLuaTask>()
+        .result()[0];
     let instance = app
         .world()
-        .get_component::<DriverLuaVm>(agent)
+        .get_component::<DriverLuaVm>(execution)
         .unwrap()
         .instance
         .start_id
@@ -64,10 +68,10 @@ fn command(
     let (tx, mut rx) = oneshot::channel();
     app.world().emit_event(MclCommand {
         id: format!("test:{text}"),
-        source: agent,
+        source: execution,
         source_address: app
             .world()
-            .get_component::<address::Address>(agent)
+            .get_component::<address::Address>(execution)
             .unwrap()
             .as_str()
             .to_owned(),
@@ -147,16 +151,15 @@ fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
         write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         connection.flush().unwrap();
     });
-    let driver_model = agent_driver_core::read_driver(
+    let driver_settings = agent_driver_core::read_initial_settings(
         &root
             .path()
-            .join("agent-drivers/local/coder/latest/driver.toml"),
-        &Default::default(),
+            .join("agent-drivers/local/coder/latest/setting.toml"),
+        agent_driver_core::AgentDriverReadLimits::default().settings_bytes,
     )
-    .unwrap()
-    .manifest
-    .inference
-    .model;
+    .unwrap();
+    let settings: toml::Value = toml::from_str(&driver_settings).unwrap();
+    let driver_model = settings["inference"]["model"].as_str().unwrap();
     std::fs::write(root.path().join("models.toml"), format!("[[models]]\nid={driver_model:?}\nmodel='offline-model'\nbase_url='http://{endpoint}/v1'\napi_key='local-test'\nprovider='openai'\napi_type='chat_completions'\ncontext_window='128k'\n")).unwrap();
     let mut app = build_app(ApplicationOptions {
         data_root: root.path().to_owned(),
@@ -224,7 +227,7 @@ fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
         .unwrap();
     assert_eq!(
         app.world().get_component::<Agent>(agent).unwrap().state(),
-        AgentState::Idle
+        AgentState::Running
     );
     command(
         &mut app,
@@ -245,7 +248,7 @@ fn bundled_driver_runs_real_mcl_storage_and_http_then_stops_its_workspace() {
         if records.iter().any(|r| {
             r.record.payload.get("content").and_then(|v| v.as_str())
                 == Some("Finished through the new stack.")
-        }) && app.world().get_component::<Agent>(agent).unwrap().state() == AgentState::Idle
+        }) && app.world().get_component::<Agent>(agent).unwrap().state() == AgentState::Running
         {
             assert!(
                 records

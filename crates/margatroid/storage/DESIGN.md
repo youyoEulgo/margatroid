@@ -10,7 +10,7 @@ System分别列出事件、闭包结果、提交闭包及oneshot回复，使用R
 # 板块格式
 
 ```text
-# lib        storage/core/src/lib.rs、blocks.rs、blocks/publication.rs、messages.rs、pages.rs、logs.rs；storage/plugin/src/lib.rs  文件、快照和数据库入口；Plugin安装
+# lib        storage/core/src/lib.rs、blocks.rs、blocks/publication.rs、messages.rs、pages.rs、logs.rs、runtime_logs.rs；storage/plugin/src/lib.rs  文件、快照和数据库入口；Plugin安装
 # components storage/core/src/components.rs                     AgentStorage
 # events     storage/core/src/events.rs                         存储请求
 # system     storage/plugin/src/system.rs                       请求和闭包结果路由
@@ -26,6 +26,15 @@ System分别列出事件、闭包结果、提交闭包及oneshot回复，使用R
 
 公开，定义于storage_core：
 ```text
+open_runtime_logs(path: &Path, probe: RuntimeLogProbe) -> Result<RuntimeLogStore, StorageError>
+    行为：打开独立应用日志库，事务验证唯一runtime_logs表及user_version=1；空库才初始化，不迁移或覆盖已有Agent库或不匹配库；返回必需提交探针绑定的共享句柄。
+RuntimeLogStore::append(&self, input: RuntimeLogInput) -> Result<StoredRuntimeLog, StorageError>
+    行为：先取得writes提交串行门，再持连接锁BEGIN IMMEDIATE；复用logs::validate校验完整AgentLogRecord及报告身份。
+        已有report_id只读取原记录并返回，不插入、不新分配sequence、不触发probe；新记录保留观察时间并填服务器接收时间，完整报告JSON作为payload入库。
+        COMMIT确认后释放连接锁，仍持提交串行门按数据库顺序调用RuntimeLogProbe，最后返回真实记录；探针可重入只读查询，不持数据库锁访问网络。
+RuntimeLogStore::read(&self, range: RecordRange) -> Result<RecordPage<StoredRuntimeLog>, StorageError>
+    行为：只读事务复用pages::page，按真实sequence读取完整payload和SQL身份列，保留排他范围及双游标，拒绝损坏记录，不生成时间或报告内容兜底。
+
 open_storage(database_path: &Path, settings_path: &Path, default_settings: &str) -> Result<AgentStorage, StorageError>
     行为：打开Agent管理库及Block工作文件及快照管理器，验证管理库和已登记Block文件的目标schema与映射；settings不存在时以不覆盖方式写入默认模板，存在则读取并校验；返回共享句柄，不缓存消息正文；用已有持久记录的真实最大sequence初始化record_changes通知值。
 
@@ -378,6 +387,23 @@ AgentLogLevel：日志级别，公开枚举
 AgentLogSource：可信运行身份，公开枚举
     Driver | Tool | Host--数据库分别保存driver、tool、host
 
+RuntimeLogInput：完整应用报告
+    report_id: Option<String>--客户端稳定重试标识；内部事件可无id
+    reporter: String--后端或服务器绑定的实际Client Address
+    target: String--日志目标模块/接口
+    agent: Option<String>--可选Agent关联，无Agent时仍可持久化
+    record: AgentLogRecord--保留级别、来源、阶段、观察时间、message、details_json、context_json、origin、raw_error、traceback
+StoredRuntimeLog
+    sequence: u64
+    received_at_ms: u64
+    input: RuntimeLogInput
+RuntimeLogProbe(Arc<dyn Fn(StoredRuntimeLog) + Send + Sync>)
+    new(publish) -> Self
+RuntimeLogStore(Arc<Shared>)：Resource + Clone
+Shared（runtime_logs.rs私有）
+    connection: Mutex<Connection>
+    writes: Mutex<()>--提交及探针发布顺序门，读取不需要此门
+    probe: RuntimeLogProbe
 AgentLogRecord：独立Agent日志写入值，公开类型
     created_at_ms: Option<u64>--宿主时间；None由写事务填入真实写入时间
     level: AgentLogLevel

@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+agent_driver_core = { path = "../../agent_driver/core" }
+serde_json = "1"
+lua_runtime_core = { path = "../../lua_runtime/core" }
 workspace_core = { path = "../core" }
 agent_core = { path = "../../agent/core" }
 tool_core = { path = "../../tool/core" }

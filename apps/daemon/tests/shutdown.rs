@@ -13,6 +13,11 @@ use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const LIMIT: Duration = Duration::from_secs(20);
+fn daemon_binary() -> PathBuf {
+    std::env::var_os("MARGATROID_SHUTDOWN_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_margatroid-daemon")))
+}
 
 // Include start time so failure cleanup can never signal an unrelated reused PID.
 #[derive(Clone, Debug)]
@@ -139,11 +144,6 @@ fn fixture(home: &Path, address: std::net::SocketAddr) -> PathBuf {
     );
     write(
         &root,
-        "agent-drivers/local/shutdown/latest/driver.toml",
-        "schema_version=1\ndependencies=['tool:local/shutdown:latest']\n[inference]\nmodel='offline'\n",
-    );
-    write(
-        &root,
         "agent-drivers/local/shutdown/latest/setting.toml",
         "",
     );
@@ -151,13 +151,17 @@ fn fixture(home: &Path, address: std::net::SocketAddr) -> PathBuf {
         &root,
         "agent-drivers/local/shutdown/latest/base.lua",
         r#"
+function configure()return {timeout_ms=0}end
+function execute(_,context)
+local agent=margatroid.agent:create({owner=context.workspace.address,name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
 local function command(text)
-    local result = margatroid.driver:mcl(margatroid.context.agent_info.entity, text)
-    assert(not result.Error, 'shutdown fixture MCL failed')
+    local result = margatroid.mcl:execute(agent.address, text)
+    assert(type(result)~='table' or not result.Error, 'shutdown fixture MCL failed')
 end
 command('IMPORT TOOL tool:local/shutdown:latest AS shutdown')
 command('EFFECT ready')
-while true do margatroid.driver:wait() end
+while true do margatroid:wait(agent.address) end
+end
 "#,
     );
     write(
@@ -282,7 +286,7 @@ async fn shutdown_case(name: &str, repeat: bool) {
     let log_path = home.path().join("daemon.log");
     let log = std::fs::File::create(&log_path).unwrap();
     drop(reservation);
-    let child = Command::new(env!("CARGO_BIN_EXE_margatroid-daemon"))
+    let child = Command::new(daemon_binary())
         .env("HOME", home.path())
         .stdin(Stdio::null())
         // A file cannot fill a pipe and stall the production event loop.
@@ -357,7 +361,7 @@ async fn shutdown_case(name: &str, repeat: bool) {
         agent,
         "tools",
         "EFFECT tool_call ?",
-        json!([[{"type":"assistant","tool_calls":calls}]]),
+        json!([calls]),
     )
     .await;
     assert_eq!(returned["kind"], "messages", "{returned}");
@@ -493,7 +497,7 @@ fn bind_failure_reports_error_and_exits_without_success_banner() {
     fixture(home.path(), occupied.local_addr().unwrap());
     let log_path = home.path().join("bind-failure.log");
     let log = std::fs::File::create(&log_path).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_margatroid-daemon"))
+    let child = Command::new(daemon_binary())
         .env("HOME", home.path())
         .stdin(Stdio::null())
         .stdout(log.try_clone().unwrap())
@@ -523,4 +527,169 @@ fn bind_failure_reports_error_and_exits_without_success_banner() {
     assert!(output.contains("axum"), "{output}");
     assert!(!output.contains("started successfully"), "{output}");
     assert!(!output.contains("Webui:"), "{output}");
+}
+
+async fn non_running_shutdown_case(starting: bool, name: &str) {
+    let home = tempfile::tempdir().unwrap();
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    let definition = fixture(home.path(), address);
+    let program = if starting {
+        r#"
+function configure()return {timeout_ms=0}end
+function execute(_,context)
+ local agent=margatroid.agent:create({owner=context.workspace.address,name=context.name,config_path=context.resource_dir..'/setting.toml',ui_path=context.resource_dir..'/ui'})
+ local child=margatroid.process:start('/bin/sleep',{'600'})
+ margatroid.files:write('initializing','ready')
+ margatroid.task:receive()
+end
+"#
+    } else {
+        include_str!("../../../resources/agent-drivers/local/coder/latest/base.lua")
+    };
+    write(
+        &home.path().join(".margatroid"),
+        "agent-drivers/local/shutdown/latest/base.lua",
+        program,
+    );
+    let log_path = home.path().join("non-running-shutdown.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    drop(reservation);
+    let child = Command::new(daemon_binary())
+        .env("HOME", home.path())
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let mut daemon = Daemon {
+        child,
+        owned: vec![],
+        log: log_path,
+    };
+    let deadline = Instant::now() + LIMIT;
+    let mut socket = loop {
+        if let Ok((socket, _)) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/ws")).await
+        {
+            break socket;
+        }
+        assert!(
+            daemon.child.try_wait().unwrap().is_none(),
+            "{}",
+            daemon.log()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "daemon never listened: {}",
+            daemon.log()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    request(
+        &mut socket,
+        "connection.register",
+        "register",
+        json!({"client_type":"cli","name":"non-running-shutdown"}),
+    )
+    .await;
+    if starting {
+        socket
+            .send(Message::Text(
+                json!({"type":"workspace.start","id":"start","message":{"path":definition}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let deadline = Instant::now() + LIMIT;
+        while !home.path().join("project/initializing").is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "Lua never reached initialization: {}",
+                daemon.log()
+            );
+            assert!(daemon.child.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    } else {
+        let response = request(
+            &mut socket,
+            "workspace.start",
+            "start",
+            json!({"path":definition}),
+        )
+        .await;
+        assert_eq!(response["success"], false, "{response}");
+        assert!(
+            response.to_string().contains("EFFECT model_set ?"),
+            "{response}"
+        );
+    }
+    let state = request(&mut socket, "workspace.req", "state", json!({})).await;
+    assert_eq!(
+        state["workspaces"][0]["status"],
+        if starting { "starting" } else { "error" },
+        "{state}"
+    );
+    daemon.owned = descendants(daemon.child.id());
+    if starting {
+        assert!(
+            daemon
+                .owned
+                .iter()
+                .any(|process| process.command.contains("/bin/sleep")),
+            "{:?}",
+            daemon.owned
+        );
+    }
+    // No workspace.stop request: the signal must find and clean this state itself.
+    let began = Instant::now();
+    signal(daemon.child.id(), name);
+    let deadline = Instant::now() + LIMIT;
+    let status = loop {
+        if let Some(status) = daemon.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "shutdown hung in {}: {}",
+            if starting { "starting" } else { "error" },
+            daemon.log()
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    };
+    assert!(status.success(), "{status}: {}", daemon.log());
+    assert!(
+        daemon.owned.iter().all(|process| !alive(process)),
+        "daemon left descendants alive: {:?}",
+        daemon.owned
+    );
+    assert!(
+        daemon.log().contains("shutdown complete"),
+        "{}",
+        daemon.log()
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "shutdown waited for startup timeout: {}",
+        daemon.log()
+    );
+}
+
+#[tokio::test]
+async fn sigint_cleans_failed_startup_without_prior_workspace_stop() {
+    non_running_shutdown_case(false, "-INT").await;
+}
+#[tokio::test]
+async fn sigterm_cleans_failed_startup_without_prior_workspace_stop() {
+    non_running_shutdown_case(false, "-TERM").await;
+}
+#[tokio::test]
+async fn sigint_cancels_starting_lua_and_reaps_its_process_before_exit() {
+    non_running_shutdown_case(true, "-INT").await;
+}
+#[tokio::test]
+async fn sigterm_cancels_starting_lua_and_reaps_its_process_before_exit() {
+    non_running_shutdown_case(true, "-TERM").await;
 }

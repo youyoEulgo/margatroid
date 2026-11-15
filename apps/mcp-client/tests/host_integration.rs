@@ -90,7 +90,7 @@ mod linux {
             super::storage_fixture::mount(app.world_mut(), agent, root.path());
             app.world_mut().insert_component(
                 agent,
-                agent_core::Agent::new("mcp-integration".into(), workspace, AgentState::Working, Some("integration-turn".into()), crate::test_agent_context()),
+                agent_core::Agent::new("mcp-integration".into(), workspace, AgentState::Running, Some("integration-turn".into()), crate::test_agent_context()),
             );
             app.world_mut().insert_component(agent, tools);
             let (sender, mut reply) = oneshot::channel();

@@ -30,7 +30,9 @@ valid_request_id(id: &str) -> bool
     行为：检查非空白、无控制字符及512字节上限。
 
 validate_server_value(value: &serde_json::Value) -> Result<(), ProtocolError>
-    行为：检查严格wire type、回执成功/失败互斥、查询载荷、分页游标presence、nullable字段、记录顺序及完整消息序号关联。
+    行为：检查50种严格wire type、回执成功/失败互斥、查询载荷、分页游标presence、nullable字段、记录顺序及完整消息序号关联。
+        log.append拒绝伪造来源和缺失的必需nullable报告字段；log.append.result成功必须有正sequence及report_id，失败不能带提交身份；log.sync必须包含新增记录。
+        诊断details/context按日志报告处理，不按内部AgentMessage递归解释原错误快照。
         agent.ui.res成功必须出现可空ui，失败省略ui并提供error；agent.ui.sync始终出现ui及error，error非空时ui为null。
 
 validate_value / validate_internal_message_fields / require_fields
@@ -51,7 +53,9 @@ logical_name / validate_path / validate_target / validate_address / validate_ima
 ```text
 AddressDto = String
 
-ClientMessage：入站枚举，每个variant均为type、id和message信封
+ClientMessage：20种入站枚举，每个variant均为type、id和message信封
+    LogReq { id: String, message: RuntimeLogQueryDto }
+    LogAppend { id: String, message: ClientLogReportDto }
     ConnectionRegister { id: String, message: RegisterConnectionDto }
     WorkspaceReq { id: String, message: EmptyDto }
     WorkspaceStart { id: String, message: WorkspacePathDto }
@@ -71,7 +75,10 @@ ClientMessage：入站枚举，每个variant均为type、id和message信封
     AgentMclReq { id: String, message: AgentRecordsQueryDto }
     MclExecute { id: String, message: MclExecuteDto }
 
-ServerMessage：出站枚举，type之外的字段位于顶层，不包message
+ServerMessage：30种出站枚举，type之外的字段位于顶层，不包message
+    LogRes { id, success, records: Option<Vec<RuntimeLogRecordDto>>, next_before_sequence, next_after_sequence, error }
+    LogSync { records: Vec<RuntimeLogRecordDto> }
+    LogAppendResult { id, success, sequence: Option<u64>, report_id: Option<String>, error }
     ConnectionRegisterResult { id: String, success: bool, client: Option<ClientInfoDto>, error: Option<ProtocolErrorDto> }
     WorkspaceRes { id: String, success: bool, workspaces: Option<Vec<WorkspaceInfoDto>>, error: Option<ProtocolErrorDto> }
     WorkspaceSync { workspaces: Vec<WorkspaceInfoDto> }
@@ -167,6 +174,7 @@ WorkspaceAgentDefinitionDto
     home_root: String
     行为：仅配置成员定义，不附带成员active、运行地址、status或member_failures
 AgentStateDto
+    行为：status严格为starting/running/error/stopping，turn通过独立消息提供，不保留旧ready/working/restarting/failed枚举。
     address: AddressDto
     workspace: AddressDto
     status: String
@@ -250,6 +258,30 @@ HistoryMessageDto
     content: String
     payload: AgentMessageDto
     created_at_ms: u64
+RuntimeLogQueryDto
+    after_sequence: Option<u64>
+    before_sequence: Option<u64>
+    limit: Option<usize>
+ClientLogReportDto
+    report_id: String
+    created_at_ms: u64
+    level: String
+    target: String
+    agent: Option<AddressDto>
+    message: String
+    details_json: Option<Value>
+    context_json: Option<Value>
+    origin: Option<String>
+    raw_error: Option<String>
+    traceback: Option<String>
+RuntimeLogRecordDto
+    sequence: u64
+    received_at_ms: u64
+    report_id: Option<String>
+    reporter: String
+    target: String
+    agent: Option<AddressDto>
+    其余字段与AgentLogRecordDto完整报告字段一致，不丢弃上下文或原始错误。
 AgentLogRecordDto
     sequence: u64
     created_at_ms: u64

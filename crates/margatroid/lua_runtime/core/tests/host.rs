@@ -30,7 +30,7 @@ async fn configure_is_metadata_only_and_identity_fields_are_readonly_copies() {
         assert(margatroid.context.null == margatroid.data.null)
         assert(margatroid.context.arguments.null == margatroid.data.null)
         assert(margatroid.context.arguments.nested.value==42)
-        for _,field in ipairs({'context','files','data','text','process','driver','tools','task'}) do
+        for _,field in ipairs({'context','files','data','text','process','mcl','agent','workspace','tools','task'}) do
             assert(not pcall(function() margatroid[field]={} end))
         end
         assert(not pcall(function() margatroid() end))
@@ -45,7 +45,7 @@ async fn configure_is_metadata_only_and_identity_fields_are_readonly_copies() {
             local ok, value = pcall(function() return margatroid[old] end)
             assert(not ok or value == nil, old)
         end
-        for _, name in ipairs({'files','data','text','process','driver','tools','task'}) do
+        for _, name in ipairs({'files','data','text','process','mcl','agent','workspace','tools','task'}) do
             assert(type(margatroid[name]) == 'userdata')
             assert(margatroid[name] == margatroid[name])
             assert(not pcall(function() margatroid[name].extra = true end))
@@ -77,7 +77,7 @@ async fn enable_freezes_callbacks_and_retains_only_current_identity() {
         host::data::install(&lua, &callbacks, std::path::PathBuf::new()).unwrap();
         callbacks
             .set(
-                "driver_mcl",
+                "mcl_execute",
                 lua.create_async_function(|_, (): ()| async { Ok("driver") })
                     .unwrap(),
             )
@@ -109,7 +109,7 @@ async fn enable_freezes_callbacks_and_retains_only_current_identity() {
             .unwrap();
         callbacks
             .set(
-                "driver_mcl",
+                "mcl_execute",
                 lua.create_async_function(|_, (): ()| async { Ok("tampered") })
                     .unwrap(),
             )
@@ -121,13 +121,8 @@ async fn enable_freezes_callbacks_and_retains_only_current_identity() {
             assert(margatroid.data:encode('json', margatroid.context.arguments.object)=='{}')
             assert(margatroid.data:encode('json', margatroid.context.arguments.array)=='[]')
             margatroid:log('info','hello')
-            if margatroid.context.kind=='driver' then
-                assert(margatroid.driver:mcl()=='driver')
-                assert(not pcall(function() margatroid.task:read_output() end))
-            else
-                assert(margatroid.task:read_output()=='tool')
-                assert(not pcall(function() margatroid.driver:mcl() end))
-            end
+            assert(margatroid.mcl:execute()=='driver')
+            assert(margatroid.task:read_output()=='tool')
         "#,
         )
         .exec_async()
@@ -154,7 +149,9 @@ async fn every_group_dispatches_plain_callbacks_and_rejects_wrong_capabilities()
         ("data", &["encode", "decode"]),
         ("text", &["search"]),
         ("process", &["start"]),
-        ("driver", &["mcl", "wait"]),
+        ("mcl", &["execute"]),
+        ("agent", &["create"]),
+        ("workspace", &["agents"]),
         ("tools", &["register"]),
         (
             "task",
@@ -169,13 +166,13 @@ async fn every_group_dispatches_plain_callbacks_and_rejects_wrong_capabilities()
             ],
         ),
     ];
-    assert_eq!(groups.len(), 7);
+    assert_eq!(groups.len(), 9);
     assert_eq!(
         groups
             .iter()
             .map(|(_, methods)| methods.len())
             .sum::<usize>(),
-        20
+        21
     );
     for kind in [HostKind::Driver, HostKind::Tool] {
         let (lua, object) = host(kind);
@@ -198,11 +195,7 @@ async fn every_group_dispatches_plain_callbacks_and_rejects_wrong_capabilities()
             }
         }
         for &(group, names) in groups {
-            let allowed = match group {
-                "driver" => kind == HostKind::Driver,
-                "tools" | "task" => kind == HostKind::Tool,
-                _ => true,
-            };
+            let allowed = true;
             for &name in names {
                 let error = lua
                     .load(format!("margatroid.{group}:{name}('literal', 42)"))
@@ -227,11 +220,7 @@ async fn every_group_dispatches_plain_callbacks_and_rejects_wrong_capabilities()
         Margatroid::enable(&object, callbacks.clone()).unwrap();
         callbacks.clear().unwrap();
         for &(group, names) in groups {
-            let allowed = match group {
-                "driver" => kind == HostKind::Driver,
-                "tools" | "task" => kind == HostKind::Tool,
-                _ => true,
-            };
+            let allowed = true;
             for &name in names {
                 let result = lua
                     .load(format!("return margatroid.{group}:{name}('literal', 42)"))

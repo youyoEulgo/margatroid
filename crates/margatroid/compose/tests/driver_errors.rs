@@ -1,6 +1,6 @@
 use app_runtime_plugin::{RuntimePlugin, WorldEventExt};
 use async_runtime_plugin::AsyncRuntimePlugin;
-use closure_plugin::{AppClosureExt, ClosurePlugin};
+use closure_plugin::{AppClosureExt, ClosurePlugin, WorldClosureExt};
 use core_plugin::{App, World};
 use lua_runtime_core::*;
 use lua_runtime_plugin::LuaRuntimePlugin;
@@ -66,7 +66,10 @@ impl Fixture {
         .unwrap();
         app.world_mut().insert_component(owner, storage);
         let workspace = app.world_mut().spawn();
-        app.world_mut().insert_component(workspace,address::Address::new("workspace:test/unit").unwrap());
+        app.world_mut().insert_component(
+            workspace,
+            address::Address::new("workspace:test/unit").unwrap(),
+        );
         app.world_mut().insert_component(
             workspace,
             workspace_core::Workspace::new(
@@ -82,6 +85,16 @@ impl Fixture {
         let executor = spawn_workspace_executor().unwrap();
         let close = executor.close.clone();
         app.world_mut().insert_component(workspace, executor);
+        let events = app.world().event_sender();
+        let closures = app.world().closure_sender(RuntimePlugin::UPDATE);
+        app.world_mut().insert_resource(LuaServices::new(move|identity,method,args|{let events=events.clone();let closures=closures.clone();Box::pin(async move{
+            match method.as_str(){
+                "agent_create"=>Ok(json!({"address":"agent:local/driver-errors:latest"})),
+                "wait"=>{let(tx,rx)=oneshot::channel();closures.send(move|world|{let _=tx.send(world.get_component::<DriverLuaVm>(owner).unwrap().wake.clone());});let slot=rx.await.unwrap();tokio::select!{_=identity.cancel.cancelled()=>Err(LuaRuntimeError::new(LuaRuntimeErrorKind::Cancelled,"cancelled")),result=DriverWakeSlot::wait(slot)=>{result?;Ok(serde_json::Value::Null)}}},
+                "mcl_execute"=>{let(tx,rx)=oneshot::channel();events.send_event(MclCommand{id:"fixture-mcl".into(),source:identity.source,source_address:identity.address,source_instance:Some(identity.instance),target:owner,instruction:mcl_core::MclInstruction{text:args["instruction"].as_str().unwrap().into(),arguments:serde_json::from_value(args["arguments"].clone()).unwrap()},cancel:identity.cancel,reply:Arc::new(Mutex::new(Some(tx)))});Ok(match rx.await.unwrap().unwrap(){MclValue::Unit=>json!({}),value=>serde_json::to_value(value).unwrap()})},
+                _=>Err(LuaRuntimeError::new(LuaRuntimeErrorKind::InvalidRequest,"unknown service")),
+            }
+        })}));
         let commands = Arc::new(Mutex::new(Commands::default()));
         let state = commands.clone();
         app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
@@ -105,6 +118,7 @@ impl Fixture {
                     } else {
                         MclValue::Config(toml::from_str("sandbox='read_only'\n[compaction]\nthreshold=0.8\nkeep_messages=2\n").unwrap())
                     }
+                } else if text=="EFFECT model_set ?"{MclValue::Config(toml::from_str("context_window_tokens=4096").unwrap())
                 } else if text == "GET session.conversation" {
                     MclValue::Array(MessageArray::Message(state.conversation.clone()))
                 } else if text == "EFFECT block_snapshot ?" {
@@ -176,10 +190,17 @@ impl Fixture {
     }
     async fn start(&mut self, source: &str) -> Result<DriverLuaVmInstance, LuaRuntimeError> {
         let (sender, mut reply) = oneshot::channel();
+        let source = if source.contains("function configure(") {
+            source.to_owned()
+        } else {
+            format!(
+                "function configure()return {{timeout_ms=0}}end\nfunction execute()\n{source}\nend"
+            )
+        };
         self.app.world().send_event(StartDriverLuaVm {
             owner:self.owner, workspace:self.workspace,
-            program:LuaProgram {source:source.into(), origin:"shipped-driver.lua".into(), libraries:LuaStandardLibraries::Minimal},
-            environment:LuaEnvironment {globals:BTreeMap::from([("agent_info".into(), LuaBinding::Value(LuaValue::from_json(json!({"entity":{"index":self.owner.index(),"generation":self.owner.generation()}, "model":{"context_window_tokens":4096}})).unwrap()))]), modules:BTreeMap::new()},
+            program:LuaProgram {source, origin:"shipped-driver.lua".into(), },
+            environment:LuaEnvironment {globals:BTreeMap::from([("execution_context".into(), LuaBinding::Value(LuaValue::from_json(json!({"workspace":{"address":"workspace:test/unit:latest"},"name":"test","resource_dir":"/tmp"})).unwrap()))]), modules:BTreeMap::new()},
             reply:Arc::new(Mutex::new(Some(sender))),
         });
         self.drive(|| reply.try_recv().ok()).await
@@ -229,7 +250,7 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn shipped_drivers_recover_each_command_stage_and_continue_in_same_vm() {
+async fn shipped_drivers_stop_at_each_mcl_failure_and_host_logs_once() {
     for source in [CODER, REVIEWER] {
         for stage in [
             "GET entry.pending[0]",
@@ -247,118 +268,75 @@ async fn shipped_drivers_recover_each_command_stage_and_continue_in_same_vm() {
             fixture.settle().await;
             fixture.commands.lock().unwrap().fail = Some(stage.into());
             fixture.wake(&instance);
-            let state = fixture.commands.clone();
+            let exits = fixture.exits.clone();
             fixture
-                .drive(|| state.lock().unwrap().fail.is_none().then_some(()))
+                .drive(|| (!exits.lock().unwrap().is_empty()).then_some(()))
                 .await;
-            fixture.settle().await;
-            let (before, histories, finishes) = {
-                let state = fixture.commands.lock().unwrap();
-                assert!(
-                    fixture.exits.lock().unwrap().is_empty(),
-                    "VM exited at {stage}"
-                );
-                if stage != "EFFECT history_append ?" {
-                    assert!(
-                        state
-                            .history
-                            .iter()
-                            .any(|message| message["type"] == "error"),
-                        "missing visible error at {stage}"
-                    );
-                }
-                if stage == "EFFECT finish_turn" {
-                    assert!(state.working);
-                }
-                (
-                    state.finished,
-                    state
-                        .calls
-                        .iter()
-                        .filter(|call| *call == "EFFECT history_append ?")
-                        .count(),
-                    state
-                        .calls
-                        .iter()
-                        .filter(|call| *call == "EFFECT finish_turn")
-                        .count(),
-                )
-            };
-            fixture.settle().await;
-            {
-                let state = fixture.commands.lock().unwrap();
-                assert_eq!(
-                    histories,
-                    state
-                        .calls
-                        .iter()
-                        .filter(|call| *call == "EFFECT history_append ?")
-                        .count()
-                );
-                assert_eq!(
-                    finishes,
-                    state
-                        .calls
-                        .iter()
-                        .filter(|call| *call == "EFFECT finish_turn")
-                        .count()
-                );
-            }
-            fixture.wake(&instance);
-            let state = fixture.commands.clone();
-            fixture
-                .drive(|| {
-                    let state = state.lock().unwrap();
-                    (state.finished > before && state.pending.is_empty() && !state.working)
-                        .then_some(())
-                })
-                .await;
+            assert!(fixture.exits.lock().unwrap()[0].result.is_err());
+            assert!(fixture.commands.lock().unwrap().fail.is_none());
+            assert!(
+                !fixture
+                    .commands
+                    .lock()
+                    .unwrap()
+                    .history
+                    .iter()
+                    .any(|item| item["type"] == "error")
+            );
+            let count = fixture.commands.lock().unwrap().calls.len();
             fixture.settle().await;
             assert_eq!(
+                fixture.commands.lock().unwrap().calls.len(),
+                count,
+                "script continued after {stage}"
+            );
+            let logs = storage_core::read_agent_logs(
                 fixture
                     .app
                     .world()
-                    .get_component::<DriverLuaVm>(fixture.owner)
+                    .get_component::<storage_core::AgentStorage>(fixture.owner)
+                    .unwrap(),
+                None,
+                100,
+            )
+            .unwrap();
+            assert_eq!(logs.len(), 1);
+            assert!(
+                logs[0]
+                    .record
+                    .raw_error
+                    .as_deref()
                     .unwrap()
-                    .instance,
-                instance
+                    .contains(&format!("injected {stage}"))
             );
-            assert!(fixture.exits.lock().unwrap().is_empty());
             fixture.close(Some(instance)).await;
         }
     }
 }
 
 #[tokio::test]
-async fn unknown_runtime_errors_become_history_errors_and_next_message_recovers() {
+async fn lua_programming_errors_are_logged_by_host_and_exit_without_script_recovery() {
     for source in [CODER, REVIEWER] {
         let mut fixture = Fixture::new();
         let instance = fixture.start(source).await.unwrap();
         fixture.settle().await;
         fixture.commands.lock().unwrap().malformed_config = true;
         fixture.wake(&instance);
-        let state = fixture.commands.clone();
+        let exits = fixture.exits.clone();
         fixture
-            .drive(|| {
-                state
-                    .lock()
-                    .unwrap()
-                    .history
-                    .iter()
-                    .any(|message| message["type"] == "error")
-                    .then_some(())
-            })
+            .drive(|| (!exits.lock().unwrap().is_empty()).then_some(()))
             .await;
-        fixture.settle().await;
-        {
-            let state = fixture.commands.lock().unwrap();
-            let error = state
+        assert!(fixture.exits.lock().unwrap()[0].result.is_err());
+        assert!(
+            !fixture
+                .commands
+                .lock()
+                .unwrap()
                 .history
                 .iter()
-                .find(|message| message["type"] == "error")
-                .unwrap();
-            assert_eq!(error["message"], "Driver execution failed; see Agent logs");
-        }
+                .any(|message| message["type"] == "error"),
+            "Lua programming error was converted into conversation data"
+        );
         let logs = storage_core::read_agent_logs(
             fixture
                 .app
@@ -371,37 +349,44 @@ async fn unknown_runtime_errors_become_history_errors_and_next_message_recovers(
         .unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].record.source, storage_core::AgentLogSource::Driver);
-        let details = logs[0].record.details_json.as_ref().unwrap();
-        assert_eq!(details["stage"], "turn");
         assert!(
-            details["raw_error"]
-                .as_str()
+            logs[0]
+                .record
+                .raw_error
+                .as_deref()
                 .unwrap()
-                .contains("shipped-driver.lua")
+                .contains("config")
         );
-        let before = fixture.commands.lock().unwrap().finished;
-        fixture.wake(&instance);
-        let state = fixture.commands.clone();
-        fixture
-            .drive(|| {
-                let state = state.lock().unwrap();
-                (state.finished > before && state.pending.is_empty() && !state.working)
-                    .then_some(())
-            })
-            .await;
-        assert!(fixture.exits.lock().unwrap().is_empty());
+        assert!(
+            logs[0]
+                .record
+                .traceback
+                .as_deref()
+                .is_some_and(|trace| trace.contains("shipped-driver.lua"))
+        );
+        let before = fixture.commands.lock().unwrap().calls.len();
+        fixture.settle().await;
+        assert_eq!(fixture.commands.lock().unwrap().calls.len(), before);
         fixture.close(Some(instance)).await;
     }
 }
 
 #[tokio::test]
-async fn initialization_failure_is_an_error_and_never_signals_ready() {
+async fn initialization_mcl_error_exits_through_host_without_ready() {
     for source in [CODER, REVIEWER] {
         let mut fixture = Fixture::new();
         fixture.commands.lock().unwrap().fail = Some("CONFIG GET".into());
-        let error = fixture.start(source).await.unwrap_err();
-        assert!(error.to_string().contains("injected CONFIG GET"));
-        assert!(!error.to_string().contains("stack traceback"));
+        let failure = fixture.start(source).await.unwrap_err();
+        assert!(failure.to_string().contains("injected CONFIG GET"));
+        assert!(
+            !fixture
+                .commands
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .any(|call| call == "EFFECT ready")
+        );
         let logs = storage_core::read_agent_logs(
             fixture
                 .app
@@ -421,70 +406,7 @@ async fn initialization_failure_is_an_error_and_never_signals_ready() {
                 .unwrap()
                 .contains("injected CONFIG GET")
         );
-        assert!(
-            !fixture
-                .commands
-                .lock()
-                .unwrap()
-                .calls
-                .iter()
-                .any(|call| call == "EFFECT ready")
-        );
-        assert!(
-            fixture
-                .app
-                .world()
-                .get_component::<DriverLuaVm>(fixture.owner)
-                .is_none()
-        );
         fixture.close(None).await;
-    }
-}
-
-#[tokio::test]
-async fn recovery_command_failures_are_bounded_and_cleanup_retries_on_next_wake() {
-    for source in [CODER, REVIEWER] {
-        for recovery_stage in ["EFFECT history_append ?", "EFFECT finish_turn"] {
-            let mut fixture = Fixture::new();
-            let instance = fixture.start(source).await.unwrap();
-            fixture.settle().await;
-            {
-                let mut state = fixture.commands.lock().unwrap();
-                state.fail = Some("CONFIG GET".into());
-                state.recovery_after_failure = Some(recovery_stage.into());
-            }
-            fixture.wake(&instance);
-            let state = fixture.commands.clone();
-            fixture
-                .drive(|| {
-                    let state = state.lock().unwrap();
-                    (state.fail.is_none() && state.recovery_fail.is_none()).then_some(())
-                })
-                .await;
-            fixture.settle().await;
-            let calls = fixture.commands.lock().unwrap().calls.len();
-            let before = fixture.commands.lock().unwrap().finished;
-            fixture.settle().await;
-            assert_eq!(
-                fixture.commands.lock().unwrap().calls.len(),
-                calls,
-                "recovery busy-looped"
-            );
-            if recovery_stage == "EFFECT finish_turn" {
-                assert!(fixture.commands.lock().unwrap().working);
-            }
-            fixture.wake(&instance);
-            let state = fixture.commands.clone();
-            fixture
-                .drive(|| {
-                    let state = state.lock().unwrap();
-                    (state.finished > before && state.pending.is_empty() && !state.working)
-                        .then_some(())
-                })
-                .await;
-            assert!(fixture.exits.lock().unwrap().is_empty());
-            fixture.close(Some(instance)).await;
-        }
     }
 }
 
@@ -506,20 +428,41 @@ async fn compaction_snapshots_before_replacement_and_preserves_context_on_snapsh
                     state.fail = Some("EFFECT block_snapshot ?".into());
                 }
             }
-            let prefix = source
-                .split("local initialized, initialization_error")
-                .next()
-                .unwrap();
+            let prefix = source.split("\n    initialize()\n").next().unwrap();
             let program = format!(
                 r#"{prefix}
-local ok = pcall(maybe_compact_context, {{usage = {{input_tokens = {tokens}, output_tokens = 0}}}})
-local marker = {{type = "user", content = ok and "probe-ok" or "probe-failed"}}
+active_model = {{context_window_tokens=4096}}
+maybe_compact_context({{usage = {{input_tokens = {tokens}, output_tokens = 0}}}})
+local marker = {{type = "user", content = "probe-ok"}}
 command("EFFECT history_append ?", {{{{marker}}}})
+active_model = {{context_window_tokens=4096}}
 command("EFFECT ready")
-margatroid.driver:wait()
+margatroid:wait(agent.address)
+end
 "#
             );
-            let instance = fixture.start(&program).await.unwrap();
+            let started = fixture.start(&program).await;
+            if fail_snapshot {
+                assert!(
+                    started
+                        .unwrap_err()
+                        .to_string()
+                        .contains("injected EFFECT block_snapshot")
+                );
+                {
+                    let state = fixture.commands.lock().unwrap();
+                    assert_eq!(state.conversation, original);
+                    assert!(
+                        !state
+                            .calls
+                            .iter()
+                            .any(|call| call == "INJECT ? TO session.conversation")
+                    );
+                }
+                fixture.close(None).await;
+                continue;
+            }
+            let instance = started.unwrap();
             {
                 let state = fixture.commands.lock().unwrap();
                 let expected = if fail_snapshot {

@@ -265,7 +265,6 @@ async fn events_share_single_oneshot_reply_and_ended_has_one_receiver() {
         program: LuaProgram {
             source: "return".into(),
             origin: "driver.lua".into(),
-            libraries: LuaStandardLibraries::Minimal,
         },
         environment: LuaEnvironment::default(),
         reply: Arc::new(Mutex::new(Some(sender))),

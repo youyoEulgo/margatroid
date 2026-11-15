@@ -128,7 +128,7 @@ inference_system(world: &mut World)
     行为：
         所在schedule严格晚于中止System所在schedule；
         InferenceRequest -> handle_inference；
-        闭包启动结果只收口启动交接，InferenceCleanupFinished仍核对真实完成后才唤醒Driver。
+        闭包启动结果只收口启动交接，InferenceCleanupFinished核对Agent来源租约及真实完成后才唤醒AgentWaitSlot。
 ```
 
 # handler
@@ -145,7 +145,7 @@ handle_init_inference(world: &mut World, request: InitInference)
 
 handle_inference(world: &mut World, request: InferenceRequest)
     行为：
-        认领reply，检查完整Agent Entity及Working；
+        认领reply，检查完整Agent Entity及Running和非空匹配turn；
         先检查当前turn，再检查ActiveInference及重叠推理。
         在System实际受理时检查Agent当前turn；
         已被中止清空或与request.turn不匹配，直接返回空assistant的Completed响应（正文、reasoning、tool_calls及usage均空），不创建HTTP或监督任务。
@@ -180,8 +180,8 @@ supervise_inference(context: InferenceContext) -> Future<Output = ()>
         后台继续等待worker真实join，不提前释放ActiveInference。
         用户中止且清理成功返回冻结内容的Completed结果；
         清理预算耗尽及时返回CleanupFailed并发送完整error同步，原监督继续真实清理；若先前已交付终态则只记录CleanupFailed诊断并继续真实清理，不再次回复oneshot或发送第二条full。
-        全部真实清理结束发送绑定Agent、VM实例和request_id的私有完成事件；
-        确认监督任务已结束后才唤醒当前Driver，未结束则下一帧复查，过期事件丢弃，不自动finish_turn。
+        全部真实清理结束发送绑定Agent、实际来源有效租约和request_id的私有完成事件；
+        确认监督任务已结束后才唤醒目标AgentWaitSlot，未结束则下一帧复查，过期事件丢弃，不自动finish_turn。
         不写历史、不执行工具、不重试推理。
 
 read_provider(context: ProviderContext, sender: mpsc::Sender<ProviderFragment>) -> Future<Output = Result<(), InferenceError>>

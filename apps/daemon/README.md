@@ -40,3 +40,7 @@ WebSocket: ws://127.0.0.1:3939/ws
 ```
 
 绑定失败时结束正常帧循环，执行既有清理并以非零状态返回实际错误。成功标识只在真实监听之后打印一次。
+
+应用退出覆盖所有Workspace状态：Starting/Running/Error均提交原StopWorkspace；Stopping等待已有监督及其原reply，不重复关闭。Starting中的Lua立即收到取消，仍等待初始化和进程真实退出。回归直接在启动失败后发送SIGINT/SIGTERM，不预先调用workspace.stop，并验证未完成初始化的Lua子进程在daemon退出前已回收。
+
+数据根新增runtime.sqlite保存应用级完整报告，不迁移Agent数据库。启动、监听、关闭请求、关闭完成及最终失败均持久化；daemon保留Store克隆到App释放后，使最后的退出报告也真正提交。终端启动/退出提示是这些记录的镜像，日志库不可写时显式报告失败，不伪报已保存。

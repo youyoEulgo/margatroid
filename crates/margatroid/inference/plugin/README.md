@@ -13,7 +13,7 @@
 
 context_window 接受 k/m/b/t 后缀，默认 1m。未知字段、重复路由、不兼容选项、非法 URL 或鉴权字段直接失败。凭据不写日志或前端错误，HTTP 错误不暴露完整请求、鉴权头或敏感 URL。
 
-InitInference 在存活 Agent 上同步初始化 ActiveInference，不覆盖已有句柄。请求受理验证完整 Entity、Working、当前 turn 和并发推理句柄，当前turn为空或与请求turn不匹配时返回空assistant的Completed，不创建HTTP或监督任务。模型路由、从当前Tools全量构造的模型工具定义、已注册 webui 发送器、Address 和 DriverLuaVm.instance.start_id 均取本次快照，不跨 await 借用 World。受理时要求 Driver VM 的 owner 匹配完整 Agent Entity 且 start_id 非空；缺失或不匹配返回 AgentMissing。start_id仅用于后端生命周期校验。当前句柄真实结束后可被下一次受理替换。
+InitInference 在存活 Agent 上同步初始化 ActiveInference，不覆盖已有句柄。请求受理验证完整 Entity、Running、当前 turn 和并发推理句柄，当前turn为空或与请求turn不匹配时返回空assistant的Completed，不创建HTTP或监督任务。模型路由、当前Tools全量模型定义、共享Clients、Address和Agent来源租约均取本次快照，不跨await借用World；无需Agent持有DriverLuaVm，完成后以来源租约核对，唤醒AgentWaitSlot，不改变Agent状态。当前句柄真实结束后可被下一次受理替换。
 
 InferenceRequest没有tools参数。每次推理遍历当前Agent.Tools，以alias、description、input_schema构造本次模型定义，不重读文件，不由settings或Driver筛选；Tools为空则无工具。导入后的文件metadata变化不会隐式更新记录。输入使用 inference_core 的独立消息类型，校验角色、工具调用配对、参数、图片以及请求总预算。
 

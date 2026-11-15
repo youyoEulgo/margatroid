@@ -15,7 +15,7 @@ use async_runtime_plugin::WorldAsyncExt;
 use closure_plugin::WorldClosureSender;
 use core_plugin::World;
 use futures_util::FutureExt;
-use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value as LuaValue, VmState};
+use mlua::{HookTriggers, Lua, LuaSerdeExt, Value as LuaValue, VmState};
 use sandbox_resource_core::{read_sandbox, SandboxReadLimits, Sandboxes, SelectedSandbox};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -92,7 +92,7 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         .get_component::<Agent>(request.agent)
         .is_some_and(|agent| {
             world.is_alive(request.agent)
-                && agent.state() == AgentState::Working
+                && agent.state() == AgentState::Running
                 && !request.turn.is_empty()
                 && agent.turn().as_deref() == Some(request.turn.as_str())
         });
@@ -434,6 +434,37 @@ async fn supervise_tool(mut context: ToolExecutionContext) {
         complete_reply(&mut context, Err(failure));
         return;
     }
+    let source = context.request.agent;
+    let instance = context.handle.execution_id().to_owned();
+    let cancel = context.handle.cancel_token();
+    if let Ok((services, identity)) = in_world(&context.world, move |world| {
+        let services = world
+            .get_resource::<lua_runtime_core::LuaServices>()
+            .cloned()
+            .ok_or_else(|| error(Kind::InvalidRequest, "Lua services unavailable"))?;
+        let identity = lua_runtime_core::LuaExecutionIdentity {
+            source,
+            workspace: workspace_of(world, source)?,
+            address: world
+                .get_component::<address::Address>(source)
+                .unwrap()
+                .as_str()
+                .into(),
+            instance,
+            cancel,
+        };
+        Ok((services, identity))
+    })
+    .await
+    {
+        let diagnostic=outcome.as_ref().err().filter(|failure|failure.kind!=Kind::Cancelled).map(|failure|serde_json::json!({"message":failure.to_string(),"raw_error":failure.to_string(),"origin":context.tool_entry.path})).unwrap_or(Value::Null);
+        if let Err(failure) = services
+            .call(identity, "execution_finished".into(), diagnostic)
+            .await
+        {
+            tracing::error!(%failure,"tool Agent monitor completion failed");
+        }
+    }
     if cleanup_confirmed {
         context
             .tasks
@@ -464,8 +495,12 @@ fn resource_dir(path: &Path) -> Result<&Path, ToolError> {
 
 fn read_program(path: &Path) -> Result<String, ToolError> {
     use std::io::Read;
-    let mut file = std::fs::File::open(resource_dir(path)?.join("main.lua"))
-        .map_err(|failure| error(Kind::ReadFailed, failure.to_string()))?;
+    let mut file = std::fs::File::open(if path.extension().is_some_and(|ext| ext == "lua") {
+        path.to_path_buf()
+    } else {
+        resource_dir(path)?.join("main.lua")
+    })
+    .map_err(|failure| error(Kind::ReadFailed, failure.to_string()))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|failure| error(Kind::ReadFailed, failure.to_string()))?;
@@ -489,15 +524,19 @@ async fn in_world<T: Send + 'static>(
         .map_err(|_| error(Kind::CleanupFailed, "tool World action reply lost"))?
 }
 
-fn workspace_of(
+pub(crate) fn workspace_of(
     world: &World,
-    agent: core_plugin::Entity,
+    source: core_plugin::Entity,
 ) -> Result<core_plugin::Entity, ToolError> {
+    if let Some(agent) = world.get_component::<Agent>(source) {
+        return Ok(agent.workspace());
+    }
     world
-        .get_component::<Agent>(agent)
-        .map(|value| value.workspace())
-        .ok_or_else(|| error(Kind::AgentMissing, "Agent is missing"))
+        .get_component::<tool_core::LuaExecutionTask>(source)
+        .map(|task| task.workspace)
+        .ok_or_else(|| error(Kind::AgentMissing, "execution Workspace missing"))
 }
+
 fn resolve_agent(
     world: &World,
     source: core_plugin::Entity,
@@ -524,7 +563,9 @@ fn resolve_agent(
     let agent = world
         .get_component::<Agent>(target)
         .ok_or_else(|| error(Kind::AgentMissing, "target is not an Agent"))?;
-    if agent.workspace() != source_workspace || agent.state() == AgentState::Stopping {
+    if agent.workspace() != source_workspace
+        || matches!(agent.state(), AgentState::Stopping | AgentState::Error)
+    {
         return Err(error(
             Kind::InvalidRequest,
             "target Agent is not available in this Workspace",
@@ -550,18 +591,50 @@ fn ensure_invocation(
     }
     Ok(())
 }
+pub(crate) fn resolve_task_entity(
+    world: &World,
+    source: core_plugin::Entity,
+    address: Option<&str>,
+) -> Result<core_plugin::Entity, ToolError> {
+    if address.is_none()
+        && world
+            .get_component::<tool_core::LuaExecutionTask>(source)
+            .is_some()
+    {
+        return Ok(source);
+    }
+    if let Some(address) = address {
+        let address = address::Address::new(address)
+            .map_err(|e| error(Kind::InvalidRequest, e.to_string()))?;
+        if let Some(entity) = world
+            .query_with::<tool_core::LuaExecutionTask>()
+            .result()
+            .into_iter()
+            .find(|entity| world.get_component::<address::Address>(*entity) == Some(&address))
+        {
+            if workspace_of(world, entity)? != workspace_of(world, source)? {
+                return Err(error(
+                    Kind::InvalidRequest,
+                    "execution task outside Workspace",
+                ));
+            }
+            return Ok(entity);
+        }
+    }
+    resolve_agent(world, source, address)
+}
 fn task_target(
     world: &World,
     source: core_plugin::Entity,
     target: &TaskReference,
 ) -> Result<ToolTaskHandle, ToolError> {
-    let agent = resolve_agent(world, source, target.agent.as_deref())?;
+    let agent = resolve_task_entity(world, source, target.agent.as_deref())?;
     world
         .get_component::<ToolTasks>(agent)
         .ok_or_else(|| error(Kind::TaskMissing, "target tasks missing"))?
         .get(&target.task_id)
 }
-async fn inject_tools(
+pub(crate) async fn inject_tools(
     context: &ToolExecutionContext,
     registration: RegisterToolsRequest,
 ) -> Result<(), ToolError> {
@@ -571,12 +644,26 @@ async fn inject_tools(
             "tool configuration not confirmed",
         ));
     }
-    let source = context.request.agent;
-    let task_id = context.request.id.clone();
-    let invocation = context.handle.clone();
-    let path = context.tool_entry.path.clone();
-    let weak = context.world.clone();
-    in_world(&context.world, move |world| {
+    register_from_execution(
+        context.world.clone(),
+        context.request.agent,
+        context.request.id.clone(),
+        context.handle.clone(),
+        context.tool_entry.path.clone(),
+        registration,
+    )
+    .await
+}
+pub(crate) async fn register_from_execution(
+    weak: std::sync::Weak<WorldClosureSender>,
+    source: core_plugin::Entity,
+    task_id: String,
+    invocation: ToolTaskHandle,
+    path: PathBuf,
+    registration: RegisterToolsRequest,
+) -> Result<(), ToolError> {
+    let dispatch = weak.clone();
+    in_world(&dispatch, move |world| {
         ensure_invocation(world, source, &task_id, &invocation)?;
         let target = resolve_agent(world, source, registration.agent.as_deref())?;
         let mut entries = Vec::new();
@@ -585,7 +672,7 @@ async fn inject_tools(
             let mut owner_task_id = None;
             let mut owner_agent = None;
             if let Some(owner) = definition.lifetime {
-                let agent = resolve_agent(world, source, owner.agent.as_deref())?;
+                let agent = resolve_task_entity(world, source, owner.agent.as_deref())?;
                 let handle = task_target(world, source, &owner)?;
                 if handle.cancel_token().is_cancelled() || handle.is_cleanup_complete() {
                     return Err(error(Kind::InvalidRequest, "lifetime task is closed"));
@@ -637,6 +724,7 @@ async fn inject_tools(
     })
     .await
 }
+
 async fn cleanup_owner(context: &ToolExecutionContext) -> Result<(), ToolError> {
     context.handle.cancel();
     // All revocation closures are submitted before this barrier on the same sender.
@@ -861,6 +949,47 @@ async fn host_frame(
             let result = inject_tools(context, registration)
                 .await
                 .map(|()| Value::Null);
+            (request_id, result)
+        }
+        RunnerFrame::Host {
+            request_id,
+            method,
+            arguments,
+        } => {
+            let source = context.request.agent;
+            let id = context.request.id.clone();
+            let expected = context.handle.clone();
+            let prepared = in_world(&context.world, move |world| {
+                ensure_invocation(world, source, &id, &expected)?;
+                let workspace = workspace_of(world, source)?;
+                let address = world
+                    .get_component::<address::Address>(source)
+                    .unwrap()
+                    .as_str()
+                    .to_owned();
+                let services = world
+                    .get_resource::<lua_runtime_core::LuaServices>()
+                    .ok_or_else(|| error(Kind::InvalidRequest, "Lua services unavailable"))?
+                    .clone();
+                Ok((
+                    services,
+                    lua_runtime_core::LuaExecutionIdentity {
+                        source,
+                        workspace,
+                        address,
+                        instance: expected.execution_id().to_owned(),
+                        cancel: expected.cancel_token(),
+                    },
+                ))
+            })
+            .await;
+            let result = match prepared {
+                Ok((services, identity)) => services
+                    .call(identity, method, arguments)
+                    .await
+                    .map_err(|failure| error(Kind::ExecutionFailed, failure.to_string())),
+                Err(failure) => Err(failure),
+            };
             (request_id, result)
         }
         RunnerFrame::WorkspaceAgents { request_id } => {
@@ -1449,13 +1578,18 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
 ) -> Result<(), ToolError> {
     request.limits.validate()?;
     let mut input = input;
-    let lua = Lua::new_with(
-        StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
-        LuaOptions::default(),
+    let (lua, host) = lua_runtime_core::create_environment(
+        host::HostDefinition {
+            kind: host::HostKind::Tool,
+            context: request
+                .context
+                .public_value(&request.arguments)
+                .map_err(|_| error(Kind::InvalidRequest, "invalid tool context"))?,
+            arguments: request.arguments.clone(),
+        },
+        request.limits.lua_vm_memory_bytes,
     )
     .map_err(lua_failure)?;
-    lua.set_memory_limit(request.limits.lua_vm_memory_bytes)
-        .map_err(lua_failure)?;
     let deadline = Arc::new(Mutex::new(None::<Instant>));
     let hook_deadline = deadline.clone();
     lua.set_global_hook(
@@ -1478,22 +1612,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     let globals = lua.globals();
     // Configuration runs with only the metadata API; execution capabilities are
     // installed after the host accepts the configuration.
-    let mut execution_globals = Vec::new();
-    for name in [
-        "pcall",
-        "xpcall",
-        "load",
-        "setmetatable",
-        "dofile",
-        "loadfile",
-        "warn",
-    ] {
-        execution_globals.push((name, globals.get::<LuaValue>(name).map_err(lua_failure)?));
-        globals.set(name, LuaValue::Nil).map_err(lua_failure)?;
-    }
-    for name in ["io", "os", "print"] {
-        globals.set(name, LuaValue::Nil).map_err(lua_failure)?;
-    }
+    let execution_globals = lua_runtime_core::configuration_globals(&lua).map_err(lua_failure)?;
     let arguments = data::to_lua(&lua, request.arguments.clone()).map_err(lua_failure)?;
     let context = data::to_lua(
         &lua,
@@ -1503,26 +1622,15 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
             .map_err(|failure| error(Kind::InvalidArguments, failure.to_string()))?,
     )
     .map_err(lua_failure)?;
-    let host = host::Margatroid::install(
-        &lua,
-        host::HostDefinition {
-            kind: host::HostKind::Tool,
-            context: request
-                .context
-                .public_value(&request.arguments)
-                .map_err(|_| error(Kind::InvalidRequest, "invalid tool context"))?,
-            arguments: request.arguments.clone(),
-        },
-    )
-    .map_err(lua_failure)?;
     // Registering async userdata methods may load the coroutine library in mlua.
     globals
         .set("coroutine", LuaValue::Nil)
         .map_err(lua_failure)?;
-    let loaded = lua
-        .load(&request.program)
-        .set_name(format!("@{}", request.context.source_origin))
-        .exec();
+    let loaded = lua_runtime_core::load_program(
+        &lua,
+        &request.program,
+        Path::new(&request.context.source_origin),
+    );
     if let Err(failure) = loaded {
         return Err(report_startup_failure(
             &request,
@@ -1599,19 +1707,7 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
     *deadline
         .lock()
         .unwrap_or_else(|failure| failure.into_inner()) = execution_deadline;
-    lua.load_std_libs(StdLib::IO | StdLib::OS | StdLib::COROUTINE)
-        .map_err(lua_failure)?;
-    for (name, value) in execution_globals {
-        globals.set(name, value).map_err(lua_failure)?;
-    }
-    let package = lua.create_table().map_err(lua_failure)?;
-    package
-        .set(
-            "config",
-            format!("{}\n;\n?\n!\n-\n", std::path::MAIN_SEPARATOR),
-        )
-        .map_err(lua_failure)?;
-    globals.set("package", package).map_err(lua_failure)?;
+    lua_runtime_core::enable_execution(&lua, execution_globals).map_err(lua_failure)?;
     let (sender, receiver) = mpsc::unbounded_channel();
     let finish = CancellationToken::new();
     let bridge = Arc::new(WorkerBridge {
@@ -1722,6 +1818,53 @@ async fn run_tool_worker<R: AsyncBufRead + Unpin + Send + 'static>(
             .map_err(lua_failure)?,
         )
         .map_err(lua_failure)?;
+    for method in ["agent_create", "wait"] {
+        let bridge = bridge.clone();
+        callbacks
+            .set(
+                method,
+                lua.create_async_function(move |lua, value: LuaValue| {
+                    let bridge = bridge.clone();
+                    async move {
+                        let arguments = host::data::from_lua(&lua, value)?;
+                        let result = bridge
+                            .call(|request_id| RunnerFrame::Host {
+                                request_id,
+                                method: method.into(),
+                                arguments,
+                            })
+                            .await
+                            .map_err(mlua::Error::external)?;
+                        host::data::to_lua(&lua, result)
+                    }
+                })
+                .map_err(lua_failure)?,
+            )
+            .map_err(lua_failure)?;
+    }
+    let service_bridge = bridge.clone();
+    let stop_bridge = bridge.clone();
+    callbacks
+        .set(
+            "agent_stop",
+            lua.create_async_function(move |lua, target: String| {
+                let bridge = stop_bridge.clone();
+                async move {
+                    let value = bridge
+                        .call(|request_id| RunnerFrame::Host {
+                            request_id,
+                            method: "agent_stop".into(),
+                            arguments: serde_json::json!(target),
+                        })
+                        .await
+                        .map_err(mlua::Error::external)?;
+                    data::to_lua(&lua, value)
+                }
+            })
+            .map_err(lua_failure)?,
+        )
+        .map_err(lua_failure)?;
+    callbacks.set("mcl_execute",lua.create_async_function(move|lua,(target,instruction,arguments):(String,String,Option<LuaValue>)|{let bridge=service_bridge.clone();async move{let arguments=arguments.map(|value|lua.from_value::<Value>(value)).transpose()?.unwrap_or_else(||serde_json::json!([]));let value=bridge.call(|request_id|RunnerFrame::Host{request_id,method:"mcl_execute".into(),arguments:serde_json::json!({"target":target,"instruction":instruction,"arguments":arguments})}).await.map_err(mlua::Error::external)?;data::to_lua(&lua,value)}}).map_err(lua_failure)?).map_err(lua_failure)?;
     let workspace_bridge = bridge.clone();
     callbacks
         .set(
@@ -2083,7 +2226,7 @@ mod world_sender_tests {
             Agent::new(
                 "test".into(),
                 workspace,
-                AgentState::Working,
+                AgentState::Running,
                 Some("turn".into()),
                 test_agent_context(),
             ),
@@ -2366,7 +2509,7 @@ mod world_sender_tests {
             agent_core::Agent::new(
                 "test".into(),
                 workspace,
-                AgentState::Working,
+                AgentState::Running,
                 Some("turn".into()),
                 test_agent_context(),
             ),

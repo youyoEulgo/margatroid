@@ -10,7 +10,6 @@ use inference_core::{
     InferenceRequest, InferenceResponse, InferenceStopReason, InferenceToolCall, InferenceUsage,
     ModelRoute,
 };
-use lua_runtime_core::DriverLuaVmInstance;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize};
@@ -36,7 +35,7 @@ impl Resource for HttpRuntime {}
 pub(crate) struct InferenceCleanupFinished {
     pub agent: Entity,
     pub request_id: String,
-    pub instance: DriverLuaVmInstance,
+    pub source: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Event for InferenceCleanupFinished {}
 

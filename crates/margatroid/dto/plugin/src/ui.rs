@@ -1,5 +1,5 @@
 use crate::{handler, projection, types::*};
-use agent_core::{Agent, AgentDriverSource};
+use agent_core::{Agent, AgentResources};
 use agent_driver_core::{
     DriverUiBundle, DriverUiError, DriverUiState, open_driver_ui_watch, run_driver_ui_monitor,
 };
@@ -131,12 +131,12 @@ pub(crate) fn query_agent_ui(world: &World, object: Box<dyn Any + Send>) {
         let entity = handler::agent(world, &request.input.address)
             .map_err(|_| ProtocolErrorDto::new("AgentMissing", "Agent is not active"))?;
         let source = world
-            .get_component::<AgentDriverSource>(entity)
+            .get_component::<AgentResources>(entity)
             .ok_or_else(|| ui_error(DriverUiError::Initializing))?;
         let slot = world
             .get_resource::<SyncObservations>()
             .and_then(|state| state.ui.get(&entity))
-            .filter(|slot| slot.manifest_path == source.manifest_path)
+            .filter(|slot| slot.ui_path == source.parameters.ui_path)
             .ok_or_else(|| ui_error(DriverUiError::Initializing))?;
         match slot.watch.state() {
             DriverUiState::Initializing => Err(ui_error(DriverUiError::Initializing)),
@@ -156,10 +156,10 @@ pub(crate) fn refresh_ui_watch(
         None
     } else {
         world
-            .get_component::<AgentDriverSource>(entity)
+            .get_component::<AgentResources>(entity)
             .and_then(|source| {
                 projection::address(world, entity)
-                    .map(|address| (source.manifest_path.clone(), address))
+                    .map(|address| (source.parameters.ui_path.clone(), address))
             })
     };
     let same = world
@@ -168,17 +168,23 @@ pub(crate) fn refresh_ui_watch(
         .ui
         .get(&entity)
         .is_some_and(|slot| {
-            desired.as_ref().is_some_and(|(path, address)| {
-                *path == slot.manifest_path && *address == slot.address
-            })
+            desired
+                .as_ref()
+                .is_some_and(|(path, address)| *path == slot.ui_path && *address == slot.address)
         });
     if same {
         return vec![];
     }
     let waits = stop_ui_watch(world, entity);
-    let Some((manifest_path, address)) = desired else {
+    let Some((ui_path, address)) = desired else {
         return waits;
     };
+    crate::runtime_logs::report_ui(
+        &state.logs,
+        &address,
+        &ui_path,
+        &DriverUiState::Initializing,
+    );
     let delivery = Arc::new(RwLock::new(build_ui_delivery(
         &address,
         DriverUiState::Initializing,
@@ -212,12 +218,15 @@ pub(crate) fn refresh_ui_watch(
     let publish = sync.clone();
     let target = address.clone();
     let lifetime = state.lifetime.clone();
+    let log_store = state.logs.clone();
+    let log_origin = ui_path.clone();
     let (watch, monitor) = open_driver_ui_watch(
-        manifest_path.clone(),
+        ui_path.clone(),
         Arc::new(move |value| {
             if lifetime.is_cancelled() {
                 return;
             }
+            let diagnostic = value.clone();
             let value = build_ui_delivery(&target, value);
             let version = {
                 let mut previous = output.write().unwrap_or_else(|e| e.into_inner());
@@ -228,6 +237,7 @@ pub(crate) fn refresh_ui_watch(
                 revision.fetch_add(1, Ordering::AcqRel) + 1
             };
             if !lifetime.is_cancelled() {
+                crate::runtime_logs::report_ui(&log_store, &target, &log_origin, &diagnostic);
                 publish.publish(version);
             }
         }),
@@ -248,7 +258,7 @@ pub(crate) fn refresh_ui_watch(
             entity,
             UiWatchSlot {
                 completion,
-                manifest_path,
+                ui_path,
                 address,
                 watch,
                 sync,

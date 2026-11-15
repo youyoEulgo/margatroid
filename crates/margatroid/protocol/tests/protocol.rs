@@ -11,9 +11,24 @@ fn error() -> Value {
     json!({"code":"Rejected","message":"safe failure"})
 }
 
+fn client_report() -> Value {
+    json!({"report_id":"browser-report-1","created_at_ms":1,"level":"error","target":"ui.decode","agent":null,"message":"invalid frame","details_json":{"raw_frame":"{broken"},"context_json":null,"origin":"workbench.ts:812","raw_error":"SyntaxError: invalid frame","traceback":"Error: invalid frame\n at decode"})
+}
+fn runtime_report() -> Value {
+    let mut report = client_report();
+    report["sequence"] = json!(1);
+    report["received_at_ms"] = json!(2);
+    report["reporter"] = json!("client:webui/browser:1");
+    report["source"] = json!("host");
+    report["stage"] = json!("client");
+    report
+}
+
 #[test]
-fn all_eighteen_client_types_round_trip_and_keep_request_ids() {
+fn all_twenty_client_types_round_trip_and_keep_request_ids() {
     let cases = vec![
+        ("log.req", json!({})),
+        ("log.append", client_report()),
         (
             "connection.register",
             json!({"client_type":"webui","name":"browser"}),
@@ -48,7 +63,7 @@ fn all_eighteen_client_types_round_trip_and_keep_request_ids() {
             json!({"address":"agent:demo/coder:latest","command":"CONFIG GET"}),
         ),
     ];
-    assert_eq!(cases.len(), 18);
+    assert_eq!(cases.len(), 20);
     for (kind, payload) in cases {
         let request = parse(kind, payload).unwrap();
         assert_eq!(request.id(), "request-1");
@@ -132,7 +147,7 @@ fn record_queries_use_exclusive_bounds_and_positive_limits() {
 }
 
 #[test]
-fn all_twenty_seven_server_types_round_trip_and_distinguish_sync_ids() {
+fn all_thirty_server_types_round_trip_and_distinguish_sync_ids() {
     let mut cases = Vec::new();
     for kind in [
         "workspace.start.result",
@@ -167,7 +182,10 @@ fn all_twenty_seven_server_types_round_trip_and_distinguish_sync_ids() {
     }
     cases.push(json!({"type":"agent.log.sync","address":"agent:demo/coder","records":[{"sequence":1,"created_at_ms":0,"level":"info","source":"driver","stage":"execute","message":"ready","details_json":null,"context_json":null,"origin":null,"raw_error":null,"traceback":null}]}));
     cases.push(json!({"type":"agent.mcl.sync","address":"agent:demo/coder","records":[{"sequence":2,"created_at_ms":0,"source":"client:webui/browser:1","turn":null,"content":"CONFIG GET","payload":{"text":"CONFIG GET"}}]}));
-    assert_eq!(cases.len(), 27);
+    cases.push(json!({"type":"log.res","id":"request-1","success":true,"records":[runtime_report()],"next_before_sequence":null,"next_after_sequence":null}));
+    cases.push(json!({"type":"log.sync","records":[runtime_report()]}));
+    cases.push(json!({"type":"log.append.result","id":"request-1","success":true,"sequence":1,"report_id":"browser-report-1"}));
+    assert_eq!(cases.len(), 30);
     for raw in cases {
         let message: ServerMessage =
             serde_json::from_value(raw.clone()).unwrap_or_else(|e| panic!("{}: {e}", raw["type"]));
@@ -243,7 +261,7 @@ fn complete_workspace_agent_tool_and_mcl_business_data_are_preserved() {
     let workspace = json!({"type":"workspace.sync","workspaces":[{"path":"/project/workspace.yaml","definition":{"name":"demo","project_root":"/project","agents":[{"name":"coder","driver":"driver:local/coder","home_root":"/agent"}]},"status":"inactive","address":null,"error":null}]});
     let message: ServerMessage = serde_json::from_value(workspace.clone()).unwrap();
     assert_eq!(serde_json::to_value(message).unwrap(), workspace);
-    let agent = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder","workspace":"workspace:local/demo","status":"ready","sandboxes":[],"sandbox":null,"model":null,"tools":[{"alias":"read","path":"/tools/read","description":"Read","input_schema":{"type":"object"},"owner_task_id":null,"binding":{"opaque":true}}],"error":null}]});
+    let agent = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder","workspace":"workspace:local/demo","status":"running","sandboxes":[],"sandbox":null,"model":null,"tools":[{"alias":"read","path":"/tools/read","description":"Read","input_schema":{"type":"object"},"owner_task_id":null,"binding":{"opaque":true}}],"error":null}]});
     let message: ServerMessage = serde_json::from_value(agent.clone()).unwrap();
     assert_eq!(serde_json::to_value(message).unwrap(), agent);
     let result = json!({"type":"mcl.execute.result","id":"r","success":true,"data":{"kind":"block_snapshots","value":{"timeline":{},"snapshots":[]}}});
@@ -369,7 +387,7 @@ fn public_targets_reject_internal_vm_identity_fields() {
 
 #[test]
 fn agent_resources_and_public_model_fields_are_strict_and_nullable() {
-    let mut value = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder","workspace":"workspace:local/demo","status":"ready","tools":[],"sandboxes":[{"alias":"read_only","path":"/sandbox/read-only.toml"}],"sandbox":"read_only","model":{"id":"model-route","model":"model-name","provider":"openai","api_type":"responses","context_window_tokens":131072,"thinking":null,"reasoning_effort":"high"},"error":null}]});
+    let mut value = json!({"type":"agent.sync","agents":[{"address":"agent:demo/coder","workspace":"workspace:local/demo","status":"running","tools":[],"sandboxes":[{"alias":"read_only","path":"/sandbox/read-only.toml"}],"sandbox":"read_only","model":{"id":"model-route","model":"model-name","provider":"openai","api_type":"responses","context_window_tokens":131072,"thinking":null,"reasoning_effort":"high"},"error":null}]});
     let message: ServerMessage = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(serde_json::to_value(message).unwrap(), value);
     for field in ["sandboxes", "sandbox", "model"] {
@@ -461,4 +479,26 @@ fn cumulative_chunk_requires_complete_text_pair_and_rejects_delta() {
     empty["content"] = json!("");
     empty["reasoning"] = json!("");
     assert!(serde_json::from_value::<ServerMessage>(empty).is_err());
+}
+
+#[test]
+fn runtime_diagnostics_require_complete_nullable_fields_and_valid_commit_acknowledgements() {
+    let mut report = client_report();
+    report.as_object_mut().unwrap().remove("traceback");
+    assert!(parse("log.append", report).is_err());
+    let mut report = client_report();
+    report["source"] = json!("driver");
+    assert!(
+        parse("log.append", report).is_err(),
+        "a client must not claim a trusted backend source"
+    );
+    assert!(
+        serde_json::from_value::<ServerMessage>(
+            json!({"type":"log.append.result","id":"request-1","success":true,"sequence":1})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ServerMessage>(json!({"type":"log.sync","records":[]})).is_err()
+    );
 }

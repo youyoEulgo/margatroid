@@ -1,5 +1,10 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, Weak,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use core_plugin::Resource;
@@ -25,25 +30,65 @@ pub struct TracingRecord {
     pub message: String,
     pub fields: Vec<TracingField>,
     pub spans: Vec<String>,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub module: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct TracingStream {
     sender: broadcast::Sender<TracingRecord>,
+    sinks: Arc<Mutex<BTreeMap<u64, DurableSink>>>,
+}
+type DurableSink = Arc<dyn Fn(&TracingRecord) + Send + Sync>;
+pub struct TracingSinkGuard {
+    sinks: Weak<Mutex<BTreeMap<u64, DurableSink>>>,
+    id: u64,
+}
+impl Resource for TracingSinkGuard {}
+impl Drop for TracingSinkGuard {
+    fn drop(&mut self) {
+        if let Some(sinks) = self.sinks.upgrade() {
+            sinks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.id);
+        }
+    }
 }
 
 impl TracingStream {
     pub(crate) fn new(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
-        Self { sender }
+        Self {
+            sender,
+            sinks: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
     pub(crate) fn layer(&self) -> TracingStreamLayer {
         TracingStreamLayer {
             sender: self.sender.clone(),
+            sinks: self.sinks.clone(),
         }
     }
 
+    /// Durable observers run before the best-effort broadcast, without a routing queue.
+    pub fn subscribe_persistent(
+        &self,
+        sink: impl Fn(&TracingRecord) + Send + Sync + 'static,
+    ) -> TracingSinkGuard {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        self.sinks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, Arc::new(sink));
+        TracingSinkGuard {
+            sinks: Arc::downgrade(&self.sinks),
+            id,
+        }
+    }
     pub fn subscribe(&self) -> TracingSubscription {
         TracingSubscription {
             receiver: self.sender.subscribe(),
@@ -100,6 +145,7 @@ impl std::error::Error for TracingStreamError {}
 
 pub(crate) struct TracingStreamLayer {
     sender: broadcast::Sender<TracingRecord>,
+    sinks: Arc<Mutex<BTreeMap<u64, DurableSink>>>,
 }
 
 impl<S> Layer<S> for TracingStreamLayer
@@ -108,6 +154,16 @@ where
 {
     fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
         let record = record_from_event(event, context);
+        let sinks = self
+            .sinks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for sink in sinks {
+            sink(&record);
+        }
         let _ = self.sender.send(record);
     }
 }
@@ -172,6 +228,9 @@ where
         message,
         fields: visitor.fields,
         spans,
+        file: metadata.file().map(str::to_owned),
+        line: metadata.line(),
+        module: metadata.module_path().map(str::to_owned),
     }
 }
 
@@ -231,5 +290,44 @@ mod tests {
         ));
         assert_eq!(subscription.dropped_count(), 1);
         assert_eq!(subscription.recv().await.unwrap().message, "second");
+    }
+    #[tokio::test]
+    async fn persistent_observer_receives_every_record_before_broadcast_can_lag_and_unlinks_on_drop(
+    ) {
+        let stream = TracingStream::new(1);
+        let mut subscription = stream.subscribe();
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let records = saved.clone();
+        let guard =
+            stream.subscribe_persistent(move |record| records.lock().unwrap().push(record.clone()));
+        let subscriber = tracing_subscriber::registry().with(stream.layer());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(request_id = "one", "first durable");
+            tracing::warn!(request_id = "two", "second durable");
+        });
+        assert_eq!(
+            saved
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|record| record.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first durable", "second durable"]
+        );
+        assert!(saved
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|record| record.file.is_some()
+                && record.line.is_some()
+                && record.module.is_some()));
+        assert!(matches!(
+            subscription.recv().await,
+            Err(TracingStreamError::Lagged(1))
+        ));
+        drop(guard);
+        let subscriber = tracing_subscriber::registry().with(stream.layer());
+        tracing::subscriber::with_default(subscriber, || tracing::info!("after unlink"));
+        assert_eq!(saved.lock().unwrap().len(), 2);
     }
 }

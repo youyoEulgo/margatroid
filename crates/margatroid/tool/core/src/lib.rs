@@ -137,3 +137,6 @@ pub use sync::{AgentTaskSnapshot, TaskSyncBinding, TaskUpdateContext};
 
 mod lifetime;
 pub use lifetime::{TaskBinding, TaskScope};
+
+mod execution;
+pub use execution::LuaExecutionTask;

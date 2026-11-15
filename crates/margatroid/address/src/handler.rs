@@ -7,7 +7,7 @@ use crate::{AddressError, ParsedAddress};
 pub fn resolve_file(root: &Path, address: &str) -> Result<PathBuf, AddressError> {
     let address = ParsedAddress::parse(address)?;
     let entry = match address.kind.as_str() {
-        "driver" => "driver.toml",
+        "driver" => "base.lua",
         "tool" => "tool.toml",
         "prompt" => "prompt.toml",
         "sandbox" => "policy.json",

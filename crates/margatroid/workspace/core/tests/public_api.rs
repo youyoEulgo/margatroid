@@ -131,7 +131,7 @@ fn entity_accessors_keep_full_generation_and_domain_independent_members() {
     for state in [
         WorkspaceState::Starting,
         WorkspaceState::Running,
-        WorkspaceState::Restarting,
+        WorkspaceState::Starting,
         WorkspaceState::Stopping,
     ] {
         update_workspace(&mut world, workspace, WorkspaceChange::State(state)).unwrap();

@@ -19,7 +19,7 @@ use tokio::{
 pub enum WorkspaceState {
     Starting,
     Running,
-    Restarting,
+    Error,
     Stopping,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -37,26 +37,28 @@ main()
 run() -> Result<(), Error>
     行为：
         从HOME定位.margatroid，构造ApplicationOptions
-        app = compose::build_app(options)
+        app = compose::build_app(options)；克隆必需RuntimeLogStore，启动目录、实际监听成功、关闭请求及关闭完成先作为完整报告提交，再镜像终端输出
         创建信号监听运行时，安装listen_for_shutdown
         app.run_until(stopping.load)
         await compose::shutdown_app(&mut app)，持续推进ECS及真实清理
-        清理未确认: 报错并继续监督
-        清理完成: 结束信号监听，释放App，返回退出码
+        清理未确认: persist_failure保留原错误及回溯，终端报错并继续监督
+        清理完成: 结束信号监听，释放App；仍持Store克隆，最后完成报告也实际提交；Axum最终错误同样持久记录再返回退出码
 
-listen_for_shutdown(stopping: Arc<AtomicBool>, handle: RuntimeHandle) -> Result<JoinHandle<()>, IoError>
+listen_for_shutdown(stopping: Arc<AtomicBool>, handle: RuntimeHandle, logs: RuntimeLogStore) -> Result<JoinHandle<()>, IoError>
     行为：
         Unix监听SIGINT、SIGTERM；非Unix监听Ctrl+C
         每次收到信号调用request_shutdown；监听保留至清理完成
 
-request_shutdown(stopping: &AtomicBool, handle: &RuntimeHandle)
+request_shutdown(stopping: &AtomicBool, handle: &RuntimeHandle, logs: &RuntimeLogStore)
     行为：
         首次信号: stopping = true; handle.wake()
         重复信号: 输出清理仍在进行，继续等待清理
 
-data_root() -> Result<PathBuf, Error>
-    行为：
-        取得HOME下.margatroid，不把项目目录用作状态目录。
+persist_notice(store: &RuntimeLogStore, stage: &str, message: &str, details: Value)
+    行为：track_caller取得真实文件/行号，提交Info级生命周期报告及进程上下文；必需探针由Store提交入口触发，不用tracing级别过滤隐藏退出记录。
+persist_failure(store: &RuntimeLogStore, stage: &str, error: &(impl Debug + Display))
+    行为：提交Error级完整Debug/Display诊断、来源及force_capture的Rust回溯，提交失败显式报告，不冒充安全退出。
+
 ```
 
 # 持有关系

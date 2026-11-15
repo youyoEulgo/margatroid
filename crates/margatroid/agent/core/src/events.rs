@@ -7,6 +7,7 @@ pub type AgentOperationReply = Arc<Mutex<Option<oneshot::Sender<Result<Entity, A
 
 #[derive(Clone, Debug)]
 pub struct StartAgent {
+    pub owner: Entity,
     pub id: String,
     pub workspace: Entity,
     pub name: String,

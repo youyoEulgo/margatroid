@@ -11,7 +11,7 @@ use inference_core::{
     ActiveInference, AgentInferenceConfig, InferenceMessage, InferenceRequest, InferenceResponse,
     InferenceToolCall,
 };
-use lua_runtime_core::{DriverLuaVm, WorldLuaRuntimeExt};
+use lua_runtime_core::DriverLuaVm;
 use mcl_core::*;
 use prompt_resource_core::{ImportPrompt, PromptReadLimits, PromptRole, Prompts, read_prompt};
 use sandbox_resource_core::{ImportSandbox, Sandboxes, WorldSandboxResourceExt};
@@ -61,21 +61,28 @@ fn validate_source(world: &World, request: &MclCommand) -> Result<(), MclError> 
     let agent = world
         .get_component::<Agent>(request.target)
         .ok_or_else(|| error(MclErrorKind::TargetMissing, "MCL target Agent is missing"))?;
-    if agent.state() == AgentState::Stopping {
+    if !matches!(agent.state(), AgentState::Starting | AgentState::Running) {
         return Err(error(
             MclErrorKind::Closed,
             "Agent is not accepting commands",
         ));
     }
-    if matches!(agent.state(), AgentState::Starting | AgentState::Restarting)
-        && (request.source != request.target || request.source_instance.is_none())
-    {
-        return Err(error(
-            MclErrorKind::SourceInvalid,
-            "only the current self Driver may initialize this Agent",
-        ));
-    }
     if let Some(instance) = &request.source_instance {
+        if instance.starts_with("task-instance:") {
+            let tasks = world
+                .get_component::<tool_core::ToolTasks>(request.source)
+                .ok_or_else(|| error(MclErrorKind::SourceInvalid, "source tasks missing"))?;
+            let handle = tasks
+                .list()
+                .into_iter()
+                .map(|(_, handle)| handle)
+                .find(|handle| handle.execution_id() == instance)
+                .ok_or_else(|| error(MclErrorKind::SourceInvalid, "source execution is stale"))?;
+            if handle.cancel_token().is_cancelled() || handle.is_cleanup_complete() {
+                return Err(error(MclErrorKind::SourceInvalid, "source task closed"));
+            }
+            return Ok(());
+        }
         let vm = world
             .get_component::<DriverLuaVm>(request.source)
             .ok_or_else(|| error(MclErrorKind::SourceInvalid, "Driver source VM is missing"))?;
@@ -164,16 +171,16 @@ pub(crate) fn handle_queue(world: &mut World, target: Entity) {
     let queue = world.get_component_mut::<MclQueue>(target).unwrap();
     queue.pending = Some(request.id.clone());
     let cancel = queue.cancel.child_token();
-    let allowed_imports = queue.allowed_imports.clone();
+    let instance = world
+        .get_component::<agent_core::AgentSession>(target)
+        .map(|session| session.0.clone());
     let context = CommandContext {
         request,
         operation,
         cancel,
         events: world.event_sender(),
         world: world.closure_sender(&schedule),
-        instance: world
-            .get_component::<DriverLuaVm>(target)
-            .map(|vm| vm.instance.start_id.clone()),
+        instance,
         turn: world
             .get_component::<Agent>(target)
             .and_then(|agent| agent.turn().clone()),
@@ -187,7 +194,6 @@ pub(crate) fn handle_queue(world: &mut World, target: Entity) {
             })
             .unwrap_or_default(),
         imports: world.get_resource::<MclImportConfig>().unwrap().clone(),
-        allowed_imports,
     };
     world.send_async_closure(&schedule, move || execute_command(context));
 }
@@ -197,7 +203,9 @@ pub(crate) fn handle_command_result(
     result: Result<CommandOutput, CommandError>,
 ) {
     match result {
-        Ok(output) => settle_head(world, &output.request, Ok(output.value)),
+        Ok(output) => {
+            settle_head(world, &output.request, Ok(output.value));
+        }
         Err(failed) => match failed.request {
             Some(request) => settle_head(world, &request, Err(failed.error)),
             None => {
@@ -505,6 +513,10 @@ async fn effect_messages(
 ) -> Result<Vec<Value>, MclError> {
     match parameter {
         EffectParameter::Expression(expression) => read_expression(context, expression).await,
+        EffectParameter::ToolCalls(_) => Err(error(
+            MclErrorKind::InvalidMessage,
+            "tool_calls is not a message expression",
+        )),
         EffectParameter::Manual(index) => manual_messages(context, index),
     }
 }
@@ -529,6 +541,40 @@ async fn tool_effect_messages(
                     "message parameter must be a complete message array",
                 )
             }),
+        EffectParameter::ToolCalls(expression) => {
+            let sources = prepare_sources(context, expression).await?;
+            let messages = match storage(
+                context,
+                StorageOperation::ReadMessageSources { sources },
+                context.cancel.clone(),
+            )
+            .await?
+            {
+                StorageValue::Messages(messages) => messages,
+                _ => {
+                    return Err(error(
+                        MclErrorKind::StorageFailed,
+                        "storage returned no messages",
+                    ));
+                }
+            };
+            let [message] = messages.as_slice() else {
+                return Err(error(
+                    MclErrorKind::InvalidMessage,
+                    "tool_calls projection requires one message",
+                ));
+            };
+            message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| {
+                    error(
+                        MclErrorKind::InvalidMessage,
+                        "selected message tool_calls missing",
+                    )
+                })
+        }
         EffectParameter::Expression(expression) => {
             let sources = prepare_sources(context, expression).await?;
             match storage(
@@ -660,13 +706,7 @@ async fn execute_import(
         ImportKind::Tool => "tool",
         ImportKind::Sandbox => "sandbox",
     };
-    if parsed.kind != expected
-        || !context
-            .allowed_imports
-            .iter()
-            .filter_map(|value| ParsedAddress::parse(value).ok())
-            .any(|value| value == parsed)
-    {
+    if parsed.kind != expected {
         return Err(error(
             MclErrorKind::ImportDenied,
             "resource kind or Driver dependency does not permit import",
@@ -761,6 +801,48 @@ async fn execute_effect(
 ) -> Result<MclValue, MclError> {
     let mut arguments = arguments.into_iter();
     match name {
+        "model_set" => {
+            let parameter = arguments.next().unwrap();
+            let EffectParameter::Manual(index) = parameter else {
+                return Err(error(
+                    MclErrorKind::ArgumentMismatch,
+                    "model_set requires ?",
+                ));
+            };
+            let parameters: inference_core::InferenceParameters =
+                serde_json::from_value(context.request.instruction.arguments[index].clone())
+                    .map_err(|e| error(MclErrorKind::InvalidMessage, e.to_string()))?;
+            parameters
+                .validate()
+                .map_err(|e| error(MclErrorKind::InvalidMessage, e.to_string()))?;
+            let request = context.request.clone();
+            let cancel = context.cancel.clone();
+            in_world(&context.world, move |world| {
+                check_action(world, &request, &cancel)?;
+                let routes = world
+                    .get_resource::<inference_core::ModelRoutes>()
+                    .ok_or_else(|| error(MclErrorKind::EffectFailed, "ModelRoutes missing"))?
+                    .clone();
+                let route=routes.get(&parameters.model).ok_or_else(||error(MclErrorKind::EffectFailed,"model route missing"))?.clone();
+                let info=json!({"id":parameters.model,"model":route.model,"provider":route.provider,"api_type":route.api_type,"context_window_tokens":route.context_window_tokens});
+                if let Some(config) =
+                    world.get_component_mut::<inference_core::AgentInferenceConfig>(request.target)
+                {
+                    config.set(parameters, &routes);
+                } else {
+                    let binding = world
+                        .get_resource::<inference_core::ModelSyncBinding>()
+                        .ok_or_else(|| error(MclErrorKind::EffectFailed, "model binding missing"))?
+                        .for_owner(request.target);
+                    let config = inference_core::AgentInferenceConfig::new(parameters, binding);
+                    config.publish_current(&routes);
+                    world.insert_component(request.target, config);
+                }
+                let value=toml::Value::try_from(info).map_err(|e|error(MclErrorKind::EffectFailed,e.to_string()))?;
+                Ok(MclValue::Config(value.as_table().unwrap().clone()))
+            })
+            .await
+        }
         "inference" => {
             let messages = effect_messages(context, arguments.next().unwrap()).await?;
             execute_inference(context, messages).await
@@ -839,35 +921,22 @@ async fn execute_effect(
             let cancel = context.cancel.clone();
             in_world(&context.world, move |world| {
                 check_action(world, &request, &cancel)?;
-                let vm = world
-                    .get_component::<DriverLuaVm>(request.target)
-                    .ok_or_else(|| error(MclErrorKind::SourceInvalid, "target VM is missing"))?;
-                let instance = vm.instance.clone();
-                if ready
-                    && (request.source != request.target
-                        || request.source_instance.as_deref() != Some(instance.start_id.as_str())
-                        || world
-                            .get_component::<Agent>(request.target)
-                            .unwrap()
-                            .state()
-                            != AgentState::Starting
-                            && world
-                                .get_component::<Agent>(request.target)
-                                .unwrap()
-                                .state()
-                                != AgentState::Restarting)
-                {
-                    return Err(error(
-                        MclErrorKind::SourceInvalid,
-                        "ready is only allowed for the starting Driver on itself",
-                    ));
-                }
                 if ready {
-                    world.driver_ready(&instance)
+                    world.agent_ready(request.target).map_err(|error| {
+                        self::error(MclErrorKind::EffectFailed, error.to_string())
+                    })?;
                 } else {
-                    world.driver_wake(&instance)
+                    let slot = world
+                        .get_component::<lua_runtime_core::AgentWaitSlot>(request.target)
+                        .ok_or_else(|| {
+                            error(MclErrorKind::TargetMissing, "Agent wait slot missing")
+                        })?;
+                    slot.0
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .wake()
+                        .map_err(|e| error(MclErrorKind::EffectFailed, e.to_string()))?;
                 }
-                .map_err(|failed| error(MclErrorKind::EffectFailed, failed.to_string()))?;
                 Ok(MclValue::Unit)
             })
             .await
@@ -976,29 +1045,36 @@ async fn execute_block_effect(
 async fn finish_turn(context: &CommandContext) -> Result<MclValue, MclError> {
     let request = context.request.clone();
     let cancel = context.cancel.clone();
-    let expected_turn = context.turn.clone();
+    let handle = in_world(&context.world, move |world| {
+        check_action(world, &request, &cancel)?;
+        Ok(world
+            .get_component::<ActiveInference>(request.target)
+            .and_then(|active| active.current.clone()))
+    })
+    .await?;
+    if let Some(handle) = handle {
+        handle
+            .wait_finished()
+            .await
+            .map_err(|failure| error(MclErrorKind::CleanupFailed, failure.to_string()))?;
+    }
+    let request = context.request.clone();
+    let cancel = context.cancel.clone();
+    let expected = context.turn.clone();
     in_world(&context.world, move |world| {
         check_action(world, &request, &cancel)?;
-        let agent = world.get_component::<Agent>(request.target).unwrap();
-        if agent.state() != AgentState::Working
-            || agent.turn().as_ref().is_some_and(|turn| Some(turn) != expected_turn.as_ref())
-        {
-            return Err(error(MclErrorKind::EffectFailed, "turn changed before finish_turn"));
-        }
-        if world.get_component::<ActiveInference>(request.target)
-            .and_then(|active| active.current.as_ref())
-            .is_some_and(|handle| !handle.is_finished())
-        {
-            return Err(error(MclErrorKind::EffectFailed,
-                "inference task is still running; finish_turn may be retried after cleanup completes"));
-        }
+        world
+            .agent_finish_turn(
+                request.target,
+                expected.as_deref().unwrap_or(request.id.as_str()),
+            )
+            .map_err(|failure| error(MclErrorKind::EffectFailed, failure.to_string()))?;
         if let Some(active) = world.get_component_mut::<ActiveInference>(request.target) {
             active.current.take();
         }
-        world.agent_finish_turn(request.target, expected_turn.as_deref().unwrap_or(request.id.as_str()))
-            .map_err(|failed| error(MclErrorKind::EffectFailed, failed.to_string()))?;
         Ok(MclValue::Unit)
-    }).await
+    })
+    .await
 }
 
 async fn execute_inference(
@@ -1014,13 +1090,6 @@ async fn execute_inference(
     let expected_turn = context.turn.clone();
     let receiver = in_world(&context.world, move |world| {
         check_action(world, &request, &cancel)?;
-        let agent = world.get_component::<Agent>(request.target).unwrap();
-        if agent.state() != AgentState::Working
-            || agent.turn().is_none()
-            || agent.turn() != &expected_turn
-        {
-            return Ok(None);
-        }
         let config = world
             .get_component::<AgentInferenceConfig>(request.target)
             .ok_or_else(|| {
@@ -1035,25 +1104,19 @@ async fn execute_inference(
         world.send_event(InferenceRequest {
             id: request.id,
             agent: request.target,
-            turn: agent.turn().clone().unwrap(),
+            turn: expected_turn.unwrap_or_default(),
             messages: typed,
             config,
             cancel,
             reply: Arc::new(Mutex::new(Some(sender))),
         });
-        Ok(Some(receiver))
+        Ok(receiver)
     })
     .await?;
-    let response = match receiver {
-        None => InferenceResponse::empty_completed(),
-        Some(receiver) => match receiver
-            .await
-            .map_err(|_| error(MclErrorKind::CleanupFailed, "inference reply was lost"))?
-        {
-            Ok(response) => response,
-            Err(failed) => return Err(error(MclErrorKind::EffectFailed, failed.to_string())),
-        },
-    };
+    let response = receiver
+        .await
+        .map_err(|_| error(MclErrorKind::CleanupFailed, "inference reply was lost"))?
+        .map_err(|failed| error(MclErrorKind::EffectFailed, failed.to_string()))?;
     inference_result(response, &context.request.id)
 }
 
@@ -1077,19 +1140,7 @@ async fn execute_tools(
     context: &CommandContext,
     messages: Vec<Value>,
 ) -> Result<MclValue, MclError> {
-    let [message] = messages.as_slice() else {
-        return Err(error(
-            MclErrorKind::InvalidMessage,
-            "tool_call expects exactly one Assistant message",
-        ));
-    };
-    if message.get("type").and_then(Value::as_str) != Some("assistant") {
-        return Err(error(
-            MclErrorKind::InvalidMessage,
-            "tool_call expects an Assistant message",
-        ));
-    }
-    let calls = executable_calls(message)?;
+    let calls = executable_calls(&Value::Array(messages))?;
     let request = context.request.clone();
     let cancel = context.cancel.clone();
     let expected_turn = context.turn.clone();
@@ -1101,35 +1152,17 @@ async fn execute_tools(
     );
     let pending = in_world(&context.world, move |world| {
         check_action(world, &request, &cancel)?;
-        let agent = world.get_component::<Agent>(request.target).unwrap();
-        let active_turn = agent.state() == AgentState::Working
-            && agent.turn().is_some()
-            && agent.turn() == &expected_turn;
         let mut pending = Vec::new();
         for (index, (call, failed)) in calls.into_iter().enumerate() {
             if let Some(failed) = failed {
                 pending.push((call, None, Some(failed)));
                 continue;
             }
-            if !active_turn {
-                pending.push((call, None, Some("Tool call aborted.".to_owned())));
-                continue;
-            }
-            if world
-                .get_component::<Tools>(request.target)
-                .and_then(|entries| entries.get(&call.name))
-                .is_none()
-            {
-                pending.push((call, None, Some("tool is not imported".to_owned())));
-                continue;
-            }
             let (sender, receiver) = oneshot::channel();
             world.send_event(ToolExecuteRequest {
                 id: format!("tool:{task_prefix}:{index}"),
                 agent: request.target,
-                turn: expected_turn
-                    .clone()
-                    .expect("active tool call requires a turn"),
+                turn: expected_turn.clone().unwrap_or_default(),
                 alias: call.name.clone(),
                 call_id: call.id.clone(),
                 arguments: call.arguments.clone(),
@@ -1181,16 +1214,12 @@ fn tool_message(
 // Validate the entire batch's identities before dispatching any side effects.
 // Once a call is identifiable, malformed arguments belong to its failed tool reply.
 fn executable_calls(message: &Value) -> Result<Vec<(InferenceToolCall, Option<String>)>, MclError> {
-    let calls = match message.get("tool_calls") {
-        None | Some(Value::Null) => return Ok(Vec::new()),
-        Some(Value::Array(calls)) => calls,
-        _ => {
-            return Err(error(
-                MclErrorKind::InvalidMessage,
-                "Assistant tool_calls must be an array",
-            ));
-        }
-    };
+    let calls = message.as_array().ok_or_else(|| {
+        error(
+            MclErrorKind::InvalidMessage,
+            "tool_call requires an array of calls",
+        )
+    })?;
     let mut unique = BTreeSet::new();
     let mut parsed = Vec::new();
     for call in calls {

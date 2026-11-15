@@ -127,6 +127,7 @@ struct ToolTaskData {
 
 #[derive(Debug)]
 struct ToolTaskShared {
+    execution_id: String,
     registrations: crate::TaskScope,
     cancel: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -159,11 +160,18 @@ impl ToolTaskHandle {
             let _ = reply.send(Err(error.clone()));
             return Err(error);
         }
+        static NEXT_EXECUTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let execution_id = format!(
+            "task-instance:{}:{}",
+            std::process::id(),
+            NEXT_EXECUTION.fetch_add(1, Ordering::Relaxed)
+        );
         let (input, receiver) = mpsc::unbounded_channel();
         Ok((
             Self {
                 updates,
                 inner: Arc::new(ToolTaskShared {
+                    execution_id,
                     registrations: crate::TaskScope::default(),
                     cancel: CancellationToken::new(),
                     task: Mutex::new(None),
@@ -245,6 +253,9 @@ impl ToolTaskHandle {
         self.inner.cancel.clone()
     }
 
+    pub fn execution_id(&self) -> &str {
+        &self.inner.execution_id
+    }
     pub fn registration_scope(&self) -> crate::TaskScope {
         self.inner.registrations.clone()
     }

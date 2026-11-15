@@ -98,8 +98,8 @@ pub fn update_agent(
         AgentChange::Transition { state, turn } => {
             let changed = agent.state != state
                 || agent.turn != turn
-                || (state == AgentState::Idle && agent.fault.is_some());
-            if state == AgentState::Idle {
+                || (state == AgentState::Running && agent.fault.is_some());
+            if state == AgentState::Running {
                 agent.fault = None;
             }
             agent.state = state;
@@ -108,10 +108,10 @@ pub fn update_agent(
         }
         AgentChange::Fault(error) => {
             let changed = agent.fault.as_ref() != Some(&error)
-                || agent.state != AgentState::Stopping
+                || agent.state != AgentState::Error
                 || agent.turn.is_some();
             agent.fault = Some(error);
-            agent.state = AgentState::Stopping;
+            agent.state = AgentState::Error;
             agent.turn = None;
             changed
         }

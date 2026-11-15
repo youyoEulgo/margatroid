@@ -5,7 +5,6 @@ import {
   Bot,
   Boxes,
   Command,
-  Menu,
   MessageSquare,
   PanelLeft,
   PanelRight,
@@ -34,9 +33,10 @@ const {
   workspaceOperationPending,
   workspaceNotice,
   agentUiBundle,
-  agentUiError,
   agentUiLoading,
   logs,
+  applicationLogs,
+  applicationLogHistoryLoaded,
   selectedSessionLogs,
   selectedMclEntries,
 } = storeToRefs(store);
@@ -62,22 +62,44 @@ const connectionLabel = computed(() => {
   if (connectionStatus.value === 'connecting') return 'Connecting';
   return 'Offline';
 });
-const activityLogs = computed(() => [...logs.value, ...selectedSessionLogs.value]);
+const applicationActivity = computed(() =>
+  applicationLogs.value.map((row) => ({
+    key: `app:${row.sequence}`,
+    timestamp: row.created_at_ms,
+    level: row.level.toUpperCase(),
+    target: row.target,
+    message: row.message,
+    fields: [
+      { name: 'target', value: row.target },
+      ...(row.agent ? [{ name: 'agent', value: row.agent }] : []),
+      ...(row.origin ? [{ name: 'origin', value: row.origin }] : []),
+      ...(row.raw_error ? [{ name: 'raw_error', value: row.raw_error }] : []),
+      ...(row.traceback ? [{ name: 'traceback', value: row.traceback }] : []),
+      ...(row.details_json ? [{ name: 'details', value: JSON.stringify(row.details_json) }] : []),
+      ...(row.context_json ? [{ name: 'context', value: JSON.stringify(row.context_json) }] : []),
+    ],
+  })),
+);
+const activityLogs = computed(() =>
+  [...logs.value, ...selectedSessionLogs.value, ...applicationActivity.value].sort(
+    (left, right) => left.timestamp - right.timestamp,
+  ),
+);
 const displayedLogs = computed(() =>
   logFilter.value === 'errors'
     ? activityLogs.value.filter((entry) => entry.level === 'ERROR' || entry.level === 'WARN')
     : activityLogs.value,
 );
 const channelLabel = computed(() => {
-  if (selectedAgent.value) return selectedAgent.value.split('/').pop()?.split(':')[0] ?? selectedAgent.value;
+  if (selectedAgent.value)
+    return selectedAgent.value.split('/').pop()?.split(':')[0] ?? selectedAgent.value;
   if (selectedWorkspace.value) return selectedWorkspace.value.name;
   return 'No agent selected';
 });
 const uiState = computed(() => {
   if (!selectedAgent.value) return 'Choose an agent to load its Driver UI.';
-  if (agentUiError.value) return agentUiError.value;
   if (agentUiLoading.value) return 'Loading Driver UI…';
-  if (!agentUiBundle.value) return 'This Driver does not provide a UI.';
+  if (!agentUiBundle.value) return 'No Driver UI.';
   return '';
 });
 
@@ -94,20 +116,19 @@ function renderDriver() {
       contextPath: driverContextPath.value,
     });
     iframeKey.value = `${selectedAgent.value}:${agentUiBundle.value.revision}`;
-  } catch (error) {
-    driverDocumentError.value = error instanceof Error ? error.message : String(error);
+  } catch {
+    driverDocumentError.value = 'Driver UI failed to load';
     driverDocument.value = '';
   }
 }
-watch([agentUiBundle, selectedAgent, endpoint, driverContextPath], renderDriver, { immediate: true });
+watch([agentUiBundle, selectedAgent, endpoint, driverContextPath], renderDriver, {
+  immediate: true,
+});
 
-watch(
-  [activityOpen, activityTab, selectedAgent],
-  () => {
-    if (activityOpen.value && selectedAgentReady.value)
-      store.queryRecords(activityTab.value === 'mcl' ? 'mcl' : 'log');
-  },
-);
+watch([activityOpen, activityTab, selectedAgent], () => {
+  if (activityOpen.value && selectedAgentReady.value && activityTab.value === 'mcl')
+    store.queryRecords('mcl');
+});
 
 watch(viewMode, (mode) => {
   const hash = mode === 'info' ? '#info' : '#driver';
@@ -115,16 +136,13 @@ watch(viewMode, (mode) => {
 });
 
 function toggleSidebar() {
-  if (sidebarCollapsed.value) {
-    sidebarCollapsed.value = false;
+  if (window.innerWidth <= 760) {
+    sidebarOpen.value = !sidebarOpen.value;
+    if (sidebarOpen.value) sidebarCollapsed.value = false;
     return;
   }
-  sidebarCollapsed.value = true;
-  sidebarOpen.value = false;
-}
-function openNavigation() {
-  sidebarCollapsed.value = false;
-  sidebarOpen.value = true;
+  sidebarCollapsed.value = !sidebarCollapsed.value;
+  if (sidebarCollapsed.value) sidebarOpen.value = false;
 }
 function selectWorkspace(path: string) {
   store.selectWorkspace(path);
@@ -181,12 +199,9 @@ onBeforeUnmount(() => {
 <template>
   <div class="shell">
     <header class="shell-topbar">
-      <button class="icon-button shell-menu" title="Open navigation" @click="openNavigation">
-        <Menu :size="18" />
-      </button>
       <button
         class="icon-button shell-sidebar-toggle"
-        :title="sidebarCollapsed ? 'Expand workspace rail' : 'Collapse workspace rail'"
+        title="Toggle navigation"
         @click="toggleSidebar"
       >
         <PanelLeft :size="17" />
@@ -244,13 +259,6 @@ onBeforeUnmount(() => {
       >
         <div class="sidebar-heading shell-sidebar-heading">
           <span>Workspaces</span>
-          <button
-            class="icon-button sidebar-close shell-sidebar-close"
-            title="Collapse workspace rail"
-            @click="toggleSidebar"
-          >
-            <X :size="17" />
-          </button>
         </div>
         <nav class="sidebar-scroll" aria-label="Workspaces">
           <SidebarTree
@@ -265,7 +273,9 @@ onBeforeUnmount(() => {
             @stop-workspace="stopWorkspace"
           />
         </nav>
-        <div v-if="workspaceNotice" class="sidebar-footnote" role="status">{{ workspaceNotice }}</div>
+        <div v-if="workspaceNotice" class="sidebar-footnote" role="status">
+          {{ workspaceNotice }}
+        </div>
       </aside>
 
       <main class="shell-center">
@@ -273,33 +283,27 @@ onBeforeUnmount(() => {
           <InfoPanel />
         </template>
         <template v-else>
-        <div v-if="connectionError" class="inline-error shell-error">
-          <span>{{ connectionError }}</span>
-          <button class="text-button" @click="openSettings">Configure</button>
-        </div>
-        <div v-if="driverDocument" class="shell-driver-frame-wrap">
-          <iframe
-            :key="iframeKey"
-            class="shell-driver-frame"
-            :srcdoc="driverDocument"
-            sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
-            title="Driver interface"
-          ></iframe>
-          <div v-if="agentUiError" class="shell-driver-banner" role="status">
-            {{ agentUiError }} — showing last loaded interface.
+          <div v-if="connectionError" class="inline-error shell-error">
+            <span>{{ connectionError }}</span>
+            <button class="text-button" @click="openSettings">Configure</button>
           </div>
-        </div>
-        <div v-else class="shell-empty">
-          <div class="empty-icon"><MessageSquare :size="22" /></div>
-          <strong>{{ channelLabel }}</strong>
-          <span>{{ driverDocumentError || uiState }}</span>
-          <span v-if="!selectedAgent && !workspaces.length" class="shell-empty-hint">
-            <UsersRound :size="14" /> Start a workspace from the sidebar.
-          </span>
-          <button v-if="agentUiError && selectedAgent" class="secondary-button" @click="store.refreshAgentUi()">
-            Retry
-          </button>
-        </div>
+          <div v-if="driverDocument" class="shell-driver-frame-wrap">
+            <iframe
+              :key="iframeKey"
+              class="shell-driver-frame"
+              :srcdoc="driverDocument"
+              sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
+              title="Driver interface"
+            ></iframe>
+          </div>
+          <div v-else class="shell-empty">
+            <div class="empty-icon"><MessageSquare :size="22" /></div>
+            <strong>{{ channelLabel }}</strong>
+            <span>{{ driverDocumentError || uiState }}</span>
+            <span v-if="!selectedAgent && !workspaces.length" class="shell-empty-hint">
+              <UsersRound :size="14" /> Start a workspace from the sidebar.
+            </span>
+          </div>
         </template>
       </main>
 
@@ -332,7 +336,9 @@ onBeforeUnmount(() => {
           </button>
         </div>
         <div v-if="activityTab === 'mcl'" class="activity-list">
-          <div v-if="!selectedMclEntries.length" class="activity-empty">No MCL records for the selected agent</div>
+          <div v-if="!selectedMclEntries.length" class="activity-empty">
+            No MCL records for the selected agent
+          </div>
           <article v-for="record in selectedMclEntries" :key="record.key" class="mcl-entry">
             <code>{{ record.content || 'MCL command' }}</code>
             <small>{{ formatRecordTime(record.timestamp, true) }}</small>
@@ -340,12 +346,30 @@ onBeforeUnmount(() => {
         </div>
         <div v-else class="activity-list">
           <div class="activity-filter" role="group" aria-label="Filter activity">
-            <button type="button" :class="{ active: logFilter === 'all' }" @click="logFilter = 'all'">
+            <button
+              type="button"
+              :class="{ active: logFilter === 'all' }"
+              @click="logFilter = 'all'"
+            >
               All <span>{{ activityLogs.length }}</span>
             </button>
-            <button type="button" :class="{ active: logFilter === 'errors' }" @click="logFilter = 'errors'">
+            <button
+              type="button"
+              :class="{ active: logFilter === 'errors' }"
+              @click="logFilter = 'errors'"
+            >
               Errors
-              <span>{{ activityLogs.filter((log) => log.level === 'ERROR' || log.level === 'WARN').length }}</span>
+              <span>{{
+                activityLogs.filter((log) => log.level === 'ERROR' || log.level === 'WARN').length
+              }}</span>
+            </button>
+            <button
+              v-if="!applicationLogHistoryLoaded"
+              type="button"
+              class="activity-history"
+              @click="store.loadLogHistory()"
+            >
+              Load history
             </button>
           </div>
           <div v-if="!displayedLogs.length" class="activity-empty">No activity yet</div>
@@ -353,7 +377,10 @@ onBeforeUnmount(() => {
             <span :class="['log-level', logLevelClass(log.level)]">{{ log.level }}</span>
             <div class="log-copy">
               <p>{{ log.message }}</p>
-              <small>{{ formatRecordTime(log.timestamp, true) }}</small>
+              <small>{{ log.target }} · {{ formatRecordTime(log.timestamp, true) }}</small>
+              <code v-for="field in log.fields" :key="field.name"
+                >{{ field.name }}={{ field.value }}</code
+              >
             </div>
           </article>
         </div>
@@ -361,7 +388,12 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-if="settingsOpen" class="dialog-backdrop" @click.self="settingsOpen = false">
-      <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="shell-settings-title">
+      <section
+        class="dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="shell-settings-title"
+      >
         <div class="dialog-header">
           <div>
             <span class="eyebrow">Daemon</span>

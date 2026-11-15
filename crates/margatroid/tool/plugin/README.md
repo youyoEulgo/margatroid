@@ -6,7 +6,7 @@
 
 `ToolPlugin::new()`、Default 使用 update schedule 和当前程序同目录的 tool_runner，支持 with_schedule、with_runner_path、with_limits；schedule仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule。安装前需要 RuntimePlugin 和 AsyncRuntimePlugin；配置校验预算并拒绝重复安装。独立二进制 tool_runner 由本 crate 提供，runner_main 是其公共启动入口。
 
-InitToolTasks 仅在存活 Agent 上初始化空 ToolTasks，已有集合保留。执行请求在System受理时核对完整Agent Entity、Working及当前非空turn与request.turn匹配；无turn或不匹配直接返回保留call_id/alias的failed中止结果，不创建任务。工具入口、选中沙箱入口及 Workspace project_root 均固定为 owned 数据后提交监督任务，不跨 await 借用 World。
+InitToolTasks 仅在存活 Agent 上初始化空 ToolTasks，已有集合保留。执行请求在System受理时核对完整Agent Entity、Running及当前非空turn与request.turn匹配；无turn或不匹配直接返回保留call_id/alias的failed中止结果，不创建任务。工具入口、选中沙箱入口及 Workspace project_root 均固定为 owned 数据后提交监督任务，不跨 await 借用 World。
 
 每次执行按alias查询当前Tools，取得记录中的schema、path及私有owner_task_id/binding，在blocking worker按path只读取Lua程序及选中策略；按Tools记录schema校验参数，文件metadata变化不隐式更新记录。owner_task_id/binding仅放执行context，不作为模型参数。worker先加载脚本并调用必需的configure(arguments, context)，通过Configured帧往返确认唯一timeout_ms存活配置（0不限时）后才开放执行能力并调用execute；总执行时间从配置确认开始，不给准备及配置阶段设置默认wallclock限时。配置阶段仍受Lua内存上限与取消约束，只允许纯计算，脚本只加载一次。ToolExecutionLimits只提供每个工具Lua VM分配器上限及每任务输出缓冲窗口，ToolTask持有Lua配置确定的唯一存活deadline，不另设RPC或清理限时。任务持有独立取消 token，ToolTasks 与监督任务克隆同一个共享句柄。正常Return和中止强制Return共享同一锁内的returned状态及唯一reply所有权，只交付一次。回合中止先清turn，再由ToolTasks::abort_unreturned同步裁决未return任务、强制回复并请求终止；已return未finish任务保持运行。
 

@@ -50,7 +50,7 @@ impl Drop for Fixture {
 fn all_four_global_layouts_resolve_to_real_absolute_entries() {
     let fixture = Fixture::new();
     for (kind, directory, entry) in [
-        ("driver", "agent-drivers", "driver.toml"),
+        ("driver", "agent-drivers", "base.lua"),
         ("tool", "tools", "tool.toml"),
         ("prompt", "prompts", "prompt.toml"),
         ("sandbox", "sandboxes", "policy.json"),

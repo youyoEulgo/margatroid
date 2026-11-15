@@ -63,7 +63,7 @@ stopWorkspace(address: string): Promise<void>
     行为：发送workspace.stop，等待权威状态，不乐观删除实例。
 
 abortTurn(): Promise<void>
-    行为：立即冻结当前address/generation的流，发送agent.turn.abort；后端先清turn，再取消推理、强制return并清理未return工具，已return后台任务保留。受理ack不表示清理完成；保持Working直到权威sync确认Idle，不以长任务自然结束作为中止响应条件。
+    行为：立即冻结当前address/generation的流，发送agent.turn.abort；后端先清turn，再取消推理、强制return并清理未return工具，已return后台任务保留。受理ack不表示清理完成；Agent始终running，以权威turn sync确认当前turn已撤销及后续回合关联，不以长任务自然结束作为中止响应条件。
 
 sendUserMessage(): Promise<void>
     行为：固定当前目标；按INJECT及EFFECT wake契约发送，回执失败保留草稿，切换目标隔离迟到结果。

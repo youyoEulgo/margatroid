@@ -17,12 +17,11 @@ use crate::{handler, ToolPlugin};
 #[test]
 fn admission_rechecks_current_turn_and_never_registers_rejected_requests() {
     for (state, current, requested) in [
-        (AgentState::Working, None, "turn"),
-        (AgentState::Working, Some(""), ""),
-        (AgentState::Working, Some("new-turn"), "old-turn"),
-        (AgentState::Idle, Some("turn"), "turn"),
+        (AgentState::Running, None, "turn"),
+        (AgentState::Running, Some(""), ""),
+        (AgentState::Running, Some("new-turn"), "old-turn"),
+        (AgentState::Error, Some("turn"), "turn"),
         (AgentState::Starting, Some("turn"), "turn"),
-        (AgentState::Restarting, Some("turn"), "turn"),
         (AgentState::Stopping, Some("turn"), "turn"),
     ] {
         let mut world = World::new();
@@ -141,7 +140,7 @@ fn dynamic_admission_checks_schema_without_rechecking_recorded_owner() {
             agent_core::Agent::new(
                 "agent".into(),
                 agent,
-                AgentState::Working,
+                AgentState::Running,
                 Some("turn".into()),
                 test_agent_context(),
             ),

@@ -17,13 +17,13 @@ reload返回同一次发布的不可变缓存快照，后续启动以该快照�
 
 ## 生命周期
 
-状态为Starting、Running、Restarting、Stopping。关闭和重启仅在Running时受理，同步修改状态并关闭新任务与成员创建受理；其他状态拒绝新操作。Workspace重启还检查全部成员的工具任务，存在未完成任务直接拒绝，不自动取消它们。
+状态为Starting、Running、Error、Stopping，不存在Restarting。关闭受理后立即Stopping，真实清理结束才移除Entity；重启先关闭旧Lua、Agent和线程，随后Starting读取新定义并启动。新启动失败保留Error和诊断，不把旧实例伪装恢复为Running。重启仍保留未完成工具任务的前置受理检查，拒绝时不执行重启。
 
 同一Schedule依次挂载停止、重启、启动System，直接使用mecs添加顺序。System只收集事件并路由，闭包直接返回Result，不增加结果包装事件。
 
 启动创建Workspace实体及专属线程，再按本次文件解析结果为各成员分别创建并发送带独立oneshot回复端的StartAgent；成员文件固定为定义所在目录agents/<成员名>/state.sqlite与setting.toml，不回退到其他设置文件名；闭包先发出全部成员事件，再并发等待每个Agent完整启动回复。成员失败不抹除成功成员；线程建立且成员请求收口后进入Running，并返回成员诊断。
 
-关闭等待已受理成员创建收口，停止全部Agent并等待活动及MCL清理，最后退出并join专属线程。全部完成后销毁Workspace；清理未确认时保留宿主并报告失败。重启复用关闭和启动流程，全程Restarting，旧线程退出后才创建新线程。
+关闭等待已受理成员创建收口，停止全部Agent并等待活动及MCL清理，最后退出并join专属线程。全部完成后销毁Workspace；清理未确认时保留宿主并报告失败。重启复用关闭和启动流程，Stopping真实完成后再Starting，旧线程退出后才创建新线程。
 
 ## 线程管理
 
@@ -41,3 +41,10 @@ WorkspaceExecutor持有提交入口和关闭能力。Send工厂在专属线程�
 一个StartAgent只启动一个Agent。Workspace持有成员启动的并发编排，先发送全部单成员事件，再join_all收齐全部结果；Agent领域只处理自己的单次生命周期操作。
 
 定义监控和显式reload共用全量校验入口，变化后通过update_workspace提交新缓存及workspace.sync；运行状态、成员和故障也从同一入口更新。来源变化不自动改写运行实例定义或执行生命周期动作。监控覆盖父目录上的创建、删除及原子替换，100ms合并写入，失败保留最后有效集合，取消等待真实worker结束。
+
+
+当前工作树已实现统一Lua：复用既有资源挂载、Storage、MCL队列、任务监督、进程回收及同步入口。Workspace先启动独立Lua任务；Agent创建由公共Lua注入能力提交StartAgent，Agent不再启动/持有/终止Lua VM。执行者与目标分开，Agent归属Workspace或父Agent，配置按明确初值文件初始化持久化，UI按创建时传入目录直接监控，模型通过EFFECT model_set配置。公共mcl.execute指定目标，wait(agent)登记本次唤醒句柄；关闭Agent使用margatroid.agent:stop(address)注入方法提交原StopAgent并外部监督，不经过MCL。EFFECT tool_call只接收调用数组。Driver专用manifest依赖裁剪取消；工具发现元数据保持。初始化/委托/子代理应用未实现；前端源码不在本轮修改范围内。
+
+四态契约：Agent/Workspace公开starting、running、error、stopping；Agent挂载完成不是ready，MCL允许starting/running，推理和工具仅running且有效turn。Lua创建的Agent在返回信息前绑定实际执行实例与AgentSession监控；执行异常真实收口后写Agent日志，原提交探针直投Clients，再通过AgentException发布error，正常结束和取消不误报故障，旧会话解绑。关闭使用Lua agent.stop注入，不提供MCL agent_stop。
+
+Agent创建注入接口为owner/name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。

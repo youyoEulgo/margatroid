@@ -74,6 +74,13 @@ impl Harness {
         )>,
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
+        let initial_root = root.path().join("agent-drivers");
+        for name in ["new", "refreshed"] {
+            let source = initial_root.join("local").join(name).join("latest");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("base.lua"), "").unwrap();
+        }
+
         let mut app = App::new();
         app.add_plugin(RuntimePlugin::default())
             .add_plugin(ClosurePlugin)
@@ -107,8 +114,13 @@ impl Harness {
         )).unwrap();
         app.world_mut()
             .insert_resource(WorkspaceDefinitions::open(&definitions_root).unwrap());
+        app.world_mut()
+            .insert_resource(agent_core::AgentResourceRoot(initial_root));
         let workspace = app.world_mut().spawn();
-        app.world_mut().insert_component(workspace,address::Address::new("workspace:test/unit").unwrap());
+        app.world_mut().insert_component(
+            workspace,
+            address::Address::new("workspace:test/unit").unwrap(),
+        );
         let workspace_binding = dto_plugin::workspace_sync_binding(
             app.world()
                 .get_resource::<client_core::Clients>()
@@ -153,7 +165,7 @@ impl Harness {
             agent_core::Agent::new(
                 "coder".into(),
                 workspace,
-                AgentState::Idle,
+                AgentState::Running,
                 None,
                 agent_updates.clone(),
             ),
@@ -168,6 +180,19 @@ impl Harness {
                 "enabled = true\n",
             )
             .unwrap(),
+        );
+        app.world_mut().insert_component(
+            agent,
+            agent_core::AgentResources {
+                parameters: agent_core::AgentStartParameters {
+                    initial_settings_path: root.path().join("initial.toml"),
+                    ui_path: root.path().join("absent-ui"),
+                    project_root: root.path().into(),
+                    home_root: root.path().into(),
+                    database_path: root.path().join("state.sqlite"),
+                    settings_path: root.path().join("setting.toml"),
+                },
+            },
         );
         app.world_mut().insert_component(agent, MclQueue::default());
         app.world_mut()
@@ -239,6 +264,13 @@ impl Harness {
                     .cloned(),
             );
         });
+        app.world_mut().insert_resource(
+            storage_core::open_runtime_logs(
+                &root.path().join("runtime.sqlite"),
+                storage_core::RuntimeLogProbe::new(|_| {}),
+            )
+            .unwrap(),
+        );
         app.add_plugin(DtoPlugin::new());
         if let Some((frames, events)) = counters {
             app.add_system(RuntimePlugin::UPDATE, move |_world: &mut World| {
@@ -524,7 +556,27 @@ fn agent_start_and_restart_reload_members_and_only_confirm_operation_results() {
             .settings_path
             .ends_with("workspaces/demo/agents/coder/setting.toml")
     );
-    assert_eq!(request.parameters.driver, "driver:local/new:latest");
+    assert_eq!(
+        request.parameters.initial_settings_path,
+        harness
+            .root
+            .path()
+            .join("agent-drivers/local/new/latest/setting.toml")
+    );
+    assert_eq!(
+        request.parameters.ui_path,
+        harness
+            .root
+            .path()
+            .join("agent-drivers/local/new/latest/ui")
+    );
+    let creation = request.parameters.clone();
+    harness.app.world_mut().insert_component(
+        harness.agent,
+        agent_core::AgentResources {
+            parameters: creation.clone(),
+        },
+    );
     request
         .reply
         .lock()
@@ -545,7 +597,7 @@ fn agent_start_and_restart_reload_members_and_only_confirm_operation_results() {
     harness.request(&mut socket, "agent.restart", "restart", harness.target());
     harness.wait(|harness| !harness.restarts.lock().unwrap().is_empty());
     let request = harness.restarts.lock().unwrap()[0].clone();
-    assert_eq!(request.parameters.driver, "driver:local/refreshed:latest");
+    assert_eq!(request.parameters, creation);
     vm(harness.app.world_mut(), harness.agent, "driver-restarted");
     request
         .reply
@@ -694,10 +746,10 @@ fn persisted_history_is_independent_from_classified_state_and_preserves_real_seq
     harness
         .app
         .world_mut()
-        .agent_transition(harness.agent, AgentState::Working, None)
+        .agent_transition(harness.agent, AgentState::Starting, None)
         .unwrap();
     let state = harness.next(&mut socket, |value| {
-        value["type"] == "agent.sync" && value["agents"][0]["status"] == "working"
+        value["type"] == "agent.sync" && value["agents"][0]["status"] == "starting"
     });
     assert!(state.get("histories").is_none());
     connection.execute("DROP TABLE agent_messages", []).unwrap();
@@ -732,7 +784,7 @@ fn classified_sync_deduplicates_targets_and_never_leaks_to_other_clients() {
     harness
         .app
         .world_mut()
-        .agent_transition(harness.agent, AgentState::Idle, Some("changed".into()))
+        .agent_transition(harness.agent, AgentState::Running, Some("changed".into()))
         .unwrap();
     let turn = harness.next(&mut browser, |value| {
         value["type"] == "agent.turn.sync" && value["turn"] == "changed"
@@ -890,7 +942,7 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
     harness
         .app
         .world_mut()
-        .agent_transition(harness.agent, AgentState::Idle, None)
+        .agent_transition(harness.agent, AgentState::Running, None)
         .unwrap();
     let turn = harness
         .app
@@ -1131,7 +1183,8 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
     tools
         .insert(
             "bash".into(),
-            ToolEntry { owner_agent:None,
+            ToolEntry {
+                owner_agent: None,
                 path: harness.root.path().join("private/bash/tool.toml"),
                 description: "bash".into(),
                 input_schema: json!({"type":"object"}),
@@ -1143,7 +1196,8 @@ fn agent_projection_reads_current_tools_sandboxes_and_public_model_fields() {
     tools
         .insert(
             "read_file".into(),
-            ToolEntry { owner_agent:None,
+            ToolEntry {
+                owner_agent: None,
                 path: harness.root.path().join("private/read-file/tool.toml"),
                 description: "read file".into(),
                 input_schema: json!({"type":"object"}),
@@ -1613,14 +1667,24 @@ fn driver_ui_query_and_sync_follow_actual_source_and_recover_from_resource_error
     std::fs::write(source.join("ui/index.html"), "first").unwrap();
     harness.app.world_mut().insert_component(
         harness.agent,
-        agent_core::AgentDriverSource {
-            address: "driver:local/loaded:latest".into(),
-            manifest_path: source.join("driver.toml"),
+        agent_core::AgentResources {
+            parameters: agent_core::AgentStartParameters {
+                initial_settings_path: source.join("setting.toml"),
+                ui_path: source.join("ui"),
+                settings_path: source.join("setting.toml"),
+                database_path: source.join("state.sqlite"),
+                project_root: source.clone(),
+                home_root: source.clone(),
+            },
         },
     );
     let waits =
         agent_core::notify_agent_runtime(harness.app.world_mut(), harness.agent, false).unwrap();
-    assert!(waits.is_empty());
+    harness.runtime.block_on(async {
+        for wait in waits {
+            wait.await.unwrap();
+        }
+    });
     let initial = harness.next(&mut socket, |v| {
         v["type"] == "agent.ui.sync" && v["ui"]["entry"] == "index.html"
     });
@@ -1667,9 +1731,10 @@ fn driver_ui_query_and_sync_follow_actual_source_and_recover_from_resource_error
     harness
         .app
         .world_mut()
-        .get_component_mut::<agent_core::AgentDriverSource>(harness.agent)
+        .get_component_mut::<agent_core::AgentResources>(harness.agent)
         .unwrap()
-        .manifest_path = replacement.join("driver.toml");
+        .parameters
+        .ui_path = replacement.join("ui");
     let waits =
         agent_core::notify_agent_runtime(harness.app.world_mut(), harness.agent, false).unwrap();
     harness.runtime.block_on(async {
@@ -1725,9 +1790,15 @@ fn driver_ui_change_advances_an_idle_event_driven_world_without_polling_queries(
     std::fs::write(&entry, "before").unwrap();
     harness.app.world_mut().insert_component(
         harness.agent,
-        agent_core::AgentDriverSource {
-            address: "driver:local/event:latest".into(),
-            manifest_path: source.join("driver.toml"),
+        agent_core::AgentResources {
+            parameters: agent_core::AgentStartParameters {
+                initial_settings_path: source.join("setting.toml"),
+                ui_path: source.join("ui"),
+                settings_path: source.join("setting.toml"),
+                database_path: source.join("state.sqlite"),
+                project_root: source.clone(),
+                home_root: source.clone(),
+            },
         },
     );
     let waits =
@@ -2136,7 +2207,8 @@ fn turn_and_resource_mutations_publish_without_another_world_tick() {
         .unwrap()
         .insert(
             "live_tool".into(),
-            ToolEntry { owner_agent:None,
+            ToolEntry {
+                owner_agent: None,
                 path,
                 description: "probe".into(),
                 input_schema: json!({"type":"object"}),

@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 
 #[derive(Clone)]
 pub(crate) struct DtoState {
+    pub logs: storage_core::RuntimeLogStore,
     pub ingress: config_core::IngressPolicy,
     pub events: Arc<std::sync::OnceLock<async_runtime_plugin::AsyncContext>>,
     pub clients: Clients,
@@ -91,7 +92,7 @@ pub(crate) struct UiDelivery {
 }
 pub(crate) struct UiWatchSlot {
     pub completion: Arc<crate::monitor::MonitorCompletion>,
-    pub manifest_path: std::path::PathBuf,
+    pub ui_path: std::path::PathBuf,
     pub address: String,
     pub watch: agent_driver_core::DriverUiWatch,
     pub sync: client_core::SyncContext<UiDelivery>,

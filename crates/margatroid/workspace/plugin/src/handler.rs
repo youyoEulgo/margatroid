@@ -9,7 +9,7 @@ fn reply(
 }
 use crate::{checked_path, invalid, reject_symlinks, types::*, validate_name, WorkspaceInstalled};
 use address::Address;
-use agent_core::{Agent, AgentStartParameters, AgentState, StartAgent, StopAgent};
+use agent_core::{Agent, AgentState, StopAgent};
 use app_runtime_plugin::WorldEventExt;
 use async_runtime_plugin::WorldAsyncExt;
 use closure_plugin::WorldClosureExt;
@@ -47,12 +47,19 @@ fn context(
 ) -> WorkspaceFlowContext {
     let installed = world.get_resource::<WorkspaceInstalled>().unwrap();
     WorkspaceFlowContext {
+        state: world.get_component::<Workspace>(workspace).unwrap().state,
+        startup: world
+            .get_component::<StartupBarrier>(workspace)
+            .expect("Workspace startup barrier missing")
+            .0
+            .clone(),
         id,
         reply,
         workspace,
         path,
         events: world.event_sender(),
         definitions: installed.definitions.clone(),
+        program_root: installed.program_root.clone(),
         world: world.closure_sender(&installed.schedule),
     }
 }
@@ -60,14 +67,13 @@ fn fail(
     context: &WorkspaceFlowContext,
     error: WorkspaceError,
     cleanup_completed: bool,
-    restore_running: bool,
 ) -> FlowError {
     FlowError {
         reply: context.reply.clone(),
         workspace: Some(context.workspace),
         error,
         cleanup_completed,
-        restore_running,
+        state: Some(context.state),
     }
 }
 fn members(world: &World, workspace: Entity) -> Result<BTreeSet<Entity>, WorkspaceError> {
@@ -125,6 +131,10 @@ pub(crate) fn handle_start_workspace(world: &mut World, request: StartWorkspace)
             ));
         }
         let workspace = world.spawn();
+        world.insert_component(
+            workspace,
+            StartupBarrier(Arc::new(StartupCompletion::default())),
+        );
         world.insert_component(workspace, address);
         world.insert_component(
             workspace,
@@ -172,22 +182,32 @@ pub(crate) fn handle_stop_workspace(world: &mut World, request: StopWorkspace) {
         let component = world
             .get_component::<Workspace>(request.workspace)
             .ok_or_else(|| error(WorkspaceErrorKind::Missing, "workspace is missing"))?;
-        if component.state != WorkspaceState::Running {
+        if component.state == WorkspaceState::Stopping {
             return Err(error(
                 WorkspaceErrorKind::StateRejected,
-                "workspace is not Running",
+                "workspace is already stopping",
             ));
         }
         let path = component.definition_path.clone();
-        let executor = world
-            .get_component::<WorkspaceExecutor>(request.workspace)
-            .ok_or_else(|| {
-                error(
-                    WorkspaceErrorKind::CleanupFailed,
-                    "workspace execution host is missing",
-                )
-            })?;
-        executor.entry.close_admission();
+        if let Some(executor) = world.get_component::<WorkspaceExecutor>(request.workspace) {
+            executor.entry.close_admission();
+        }
+        // A Starting Workspace may still await a Lua startup handoff. Request
+        // cancellation now, then let stop_flow await its actual startup barrier.
+        for entity in world
+            .query_with::<lua_runtime_core::WorkspaceLuaTask>()
+            .result()
+        {
+            let task = world
+                .get_component::<lua_runtime_core::WorkspaceLuaTask>(entity)
+                .unwrap();
+            if task.workspace != request.workspace {
+                continue;
+            }
+            if let Some(vm) = world.get_component::<lua_runtime_core::DriverLuaVm>(entity) {
+                vm.cancel.cancel();
+            }
+        }
         update_workspace(
             world,
             request.workspace,
@@ -245,7 +265,10 @@ pub(crate) fn handle_restart_workspace(world: &mut World, request: RestartWorksp
                 ));
             }
         };
-        if world.get_component::<Workspace>(workspace).unwrap().state != WorkspaceState::Running {
+        if !matches!(
+            world.get_component::<Workspace>(workspace).unwrap().state,
+            WorkspaceState::Running | WorkspaceState::Error
+        ) {
             return Err(error(
                 WorkspaceErrorKind::StateRejected,
                 "workspace is not Running",
@@ -262,10 +285,14 @@ pub(crate) fn handle_restart_workspace(world: &mut World, request: RestartWorksp
                 ));
             }
         }
+        world.insert_component(
+            workspace,
+            StartupBarrier(Arc::new(StartupCompletion::default())),
+        );
         update_workspace(
             world,
             workspace,
-            WorkspaceChange::State(WorkspaceState::Restarting),
+            WorkspaceChange::State(WorkspaceState::Stopping),
         )?;
         Ok(context(
             world,
@@ -319,7 +346,7 @@ fn failure_result(world: &mut World, failure: &FlowError, state: WorkspaceState)
     if let Some(workspace) = failure.workspace {
         if world
             .get_component::<Workspace>(workspace)
-            .is_some_and(|w| w.state == state)
+            .is_some_and(|w| w.state == failure.state.unwrap_or(state))
         {
             world.insert_component(workspace, WorkspaceFailure(failure.error.clone()));
             let _ = update_workspace(
@@ -329,11 +356,11 @@ fn failure_result(world: &mut World, failure: &FlowError, state: WorkspaceState)
             );
             if failure.cleanup_completed {
                 remove_workspace(world, workspace);
-            } else if failure.restore_running {
+            } else {
                 let _ = update_workspace(
                     world,
                     workspace,
-                    WorkspaceChange::State(WorkspaceState::Running),
+                    WorkspaceChange::State(WorkspaceState::Error),
                 );
             }
         }
@@ -342,12 +369,52 @@ fn failure_result(world: &mut World, failure: &FlowError, state: WorkspaceState)
 pub(crate) fn handle_start_result(world: &mut World, result: Result<StartOutput, StartError>) {
     match result {
         Ok(output) => {
+            if world
+                .get_component::<Workspace>(output.workspace)
+                .is_none_or(|workspace| workspace.state != WorkspaceState::Starting)
+            {
+                reply(
+                    &output.reply,
+                    Err(error(
+                        WorkspaceErrorKind::StateRejected,
+                        "startup superseded by cleanup",
+                    )),
+                );
+                return;
+            }
+            if !output.member_errors.is_empty() {
+                if let Ok(all) = members(world, output.workspace) {
+                    let _ =
+                        update_workspace(world, output.workspace, WorkspaceChange::Members(all));
+                }
+                let failure = error(
+                    WorkspaceErrorKind::MemberFailed,
+                    output
+                        .member_errors
+                        .iter()
+                        .map(|item| format!("{}: {}", item.name, item.error))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                );
+                let _ = update_workspace(
+                    world,
+                    output.workspace,
+                    WorkspaceChange::Failure(Some(failure.clone())),
+                );
+                let _ = update_workspace(
+                    world,
+                    output.workspace,
+                    WorkspaceChange::State(WorkspaceState::Error),
+                );
+                reply(&output.reply, Err(failure));
+                return;
+            }
             let result =
                 finish_running(world, output.workspace, WorkspaceState::Starting).map(|()| {
                     WorkspaceOperationOutput {
                         workspace: output.workspace,
                         members: output.members,
-                        member_errors: output.member_errors,
+                        member_errors: output.member_errors.clone(),
                     }
                 });
             reply(&output.reply, result);
@@ -391,18 +458,58 @@ pub(crate) fn handle_restart_result(
 ) {
     match result {
         Ok(output) => {
+            if world
+                .get_component::<Workspace>(output.workspace)
+                .is_none_or(|workspace| workspace.state != WorkspaceState::Starting)
+            {
+                reply(
+                    &output.reply,
+                    Err(error(
+                        WorkspaceErrorKind::StateRejected,
+                        "startup superseded by cleanup",
+                    )),
+                );
+                return;
+            }
+            if !output.member_errors.is_empty() {
+                if let Ok(all) = members(world, output.workspace) {
+                    let _ =
+                        update_workspace(world, output.workspace, WorkspaceChange::Members(all));
+                }
+                let failure = error(
+                    WorkspaceErrorKind::MemberFailed,
+                    output
+                        .member_errors
+                        .iter()
+                        .map(|item| format!("{}: {}", item.name, item.error))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                );
+                let _ = update_workspace(
+                    world,
+                    output.workspace,
+                    WorkspaceChange::Failure(Some(failure.clone())),
+                );
+                let _ = update_workspace(
+                    world,
+                    output.workspace,
+                    WorkspaceChange::State(WorkspaceState::Error),
+                );
+                reply(&output.reply, Err(failure));
+                return;
+            }
             let result =
-                finish_running(world, output.workspace, WorkspaceState::Restarting).map(|()| {
+                finish_running(world, output.workspace, WorkspaceState::Starting).map(|()| {
                     WorkspaceOperationOutput {
                         workspace: output.workspace,
                         members: output.members,
-                        member_errors: output.member_errors,
+                        member_errors: output.member_errors.clone(),
                     }
                 });
             reply(&output.reply, result);
         }
         Err(failure) => {
-            failure_result(world, &failure, WorkspaceState::Restarting);
+            failure_result(world, &failure, WorkspaceState::Starting);
             reply(&failure.reply, Err(failure.error));
         }
     }
@@ -425,11 +532,10 @@ async fn with_world<T: Send + 'static>(
 fn prepare_definition(
     path: &Path,
     definition: WorkspaceDefinition,
-) -> Result<(WorkspaceDefinition, Vec<AgentStartParameters>), WorkspaceError> {
+) -> Result<WorkspaceDefinition, WorkspaceError> {
     let base = path
         .parent()
         .ok_or_else(|| invalid("definition has no workspace home"))?;
-    let mut parameters = Vec::new();
     for member in &definition.members {
         let directory = base.join("agents").join(&member.name);
         reject_symlinks(&directory)?;
@@ -445,19 +551,12 @@ fn prepare_definition(
                 ));
             }
         }
-        parameters.push(AgentStartParameters {
-            driver: member.driver.clone(),
-            project_root: definition.project_root.clone(),
-            home_root: member.home_root.clone(),
-            database_path,
-            settings_path,
-        });
     }
-    Ok((definition, parameters))
+    Ok(definition)
 }
 async fn fresh_definition(
     context: &WorkspaceFlowContext,
-) -> Result<(WorkspaceDefinition, Vec<AgentStartParameters>), WorkspaceError> {
+) -> Result<WorkspaceDefinition, WorkspaceError> {
     let path = context.path.clone();
     let definitions = context.definitions.clone();
     tokio::task::spawn_blocking(move || {
@@ -523,63 +622,83 @@ async fn mount_executor(
 async fn start_members(
     context: &WorkspaceFlowContext,
     definition: WorkspaceDefinition,
-    parameters: Vec<AgentStartParameters>,
 ) -> (Vec<Entity>, Vec<MemberDiagnostic>) {
-    let mut successful = Vec::new();
     let mut failures = Vec::new();
     let mut replies = Vec::new();
-    for (member, parameters) in definition.members.into_iter().zip(parameters) {
+    for member in definition.members.into_iter() {
+        let workspace = context.workspace;
+        let name = member.name.clone();
+        let driver = member.driver.clone();
         let (sender, receiver) = oneshot::channel();
-        context.events.send_event(StartAgent {
-            id: format!("{}:start:{}", context.id, member.name),
-            workspace: context.workspace,
-            name: member.name.clone(),
-            parameters,
-            reply: Arc::new(Mutex::new(Some(sender))),
-        });
-        replies.push((member, receiver));
-    }
-    let outcomes = futures_util::future::join_all(
-        replies
-            .into_iter()
-            .map(|(member, receiver)| async move { (member, receiver.await) }),
-    )
-    .await;
-    for (member, received) in outcomes {
-        let result = match received {
-            Ok(Ok(agent)) => {
-                let workspace = context.workspace;
-                let name = member.name.clone();
-                with_world(context, move |world| {
-                    if !world
-                        .get_component::<Agent>(agent)
-                        .is_some_and(|a| a.workspace() == workspace && a.name() == &name)
-                    {
-                        return Err(error(
-                            WorkspaceErrorKind::MemberFailed,
-                            "StartAgent replied with an unrelated or missing member entity",
-                        ));
-                    }
-                    world.workspace_insert_agent(workspace, agent)?;
-                    Ok(agent)
-                })
-                .await
+        let root = context.program_root.clone();
+        let driver = driver.clone();
+        let source = tokio::task::spawn_blocking(move || {
+            let path = address::resolve_file(&root, &driver).map_err(invalid)?;
+            agent_driver_core::read_driver(&path, &Default::default()).map_err(invalid)
+        })
+        .await
+        .map_err(invalid)
+        .and_then(|value| value);
+        let source = match source {
+            Ok(value) => value,
+            Err(error) => {
+                failures.push(MemberDiagnostic {
+                    name: member.name,
+                    error,
+                });
+                continue;
             }
-            Ok(Err(error)) => Err(WorkspaceError::new(WorkspaceErrorKind::MemberFailed, error)),
-            Err(error) => Err(WorkspaceError::new(
-                WorkspaceErrorKind::CleanupFailed,
-                format!("member start reply closed without cleanup proof: {error}"),
-            )),
         };
-        match result {
-            Ok(agent) => successful.push(agent),
+        let prepared=with_world(context,move|world|{
+            let component=world.get_component::<Workspace>(workspace).ok_or_else(||error(WorkspaceErrorKind::Missing,"Workspace missing"))?;
+            let path=source.origin;let program=source.program;
+            let workspace_address=world.get_component::<Address>(workspace).unwrap().as_str().to_owned();
+            let execution_address=Address::new(&format!("execution:{}/{}:latest",workspace.index(),name)).map_err(invalid)?;
+            let environment=lua_runtime_core::LuaEnvironment{globals:std::collections::BTreeMap::from([("execution_context".into(),lua_runtime_core::LuaBinding::Value(lua_runtime_core::LuaValue::from_json(serde_json::json!({"workspace":{"address":workspace_address,"name":component.name,"project_root":component.project_root},"name":name,"resource_dir":path.parent().unwrap()})).map_err(invalid)?))]),modules:Default::default()};
+            let owner=world.spawn();world.insert_component(owner,execution_address);world.insert_component(owner,lua_runtime_core::WorkspaceLuaTask{workspace,name});
+            world.send_event(lua_runtime_core::StartDriverLuaVm{owner,workspace,program:lua_runtime_core::LuaProgram{source:program,origin:path,},environment,reply:Arc::new(Mutex::new(Some(sender)))});Ok(owner)
+        }).await;
+        match prepared {
+            Ok(owner) => replies.push((member, owner, receiver)),
             Err(error) => failures.push(MemberDiagnostic {
                 name: member.name,
                 error,
             }),
         }
     }
-    (successful, failures)
+    let outcomes = futures_util::future::join_all(
+        replies
+            .into_iter()
+            .map(|(member, owner, receiver)| async move { (member, owner, receiver.await) }),
+    )
+    .await;
+    for (member, owner, received) in outcomes {
+        match received {
+            Ok(Ok(instance)) if instance.owner == owner => {}
+            other => failures.push(MemberDiagnostic {
+                name: member.name,
+                error: error(
+                    WorkspaceErrorKind::MemberFailed,
+                    format!("Lua task start failed: {other:?}"),
+                ),
+            }),
+        }
+    }
+    let workspace = context.workspace;
+    let agents = with_world(context, move |world| {
+        Ok(members(world, workspace)?.into_iter().collect())
+    })
+    .await;
+    match agents {
+        Ok(agents) => (agents, failures),
+        Err(error) => {
+            failures.push(MemberDiagnostic {
+                name: "Workspace".into(),
+                error,
+            });
+            (Vec::new(), failures)
+        }
+    }
 }
 async fn stop_members_and_join(
     context: &WorkspaceFlowContext,
@@ -596,7 +715,14 @@ async fn stop_members_and_join(
                 "workspace state changed before stop",
             ));
         }
-        let members = members(world, workspace)?;
+        let members = members(world, workspace)?
+            .into_iter()
+            .filter(|entity| {
+                world
+                    .get_component::<agent_core::AgentOwner>(*entity)
+                    .is_none_or(|owner| owner.0 == workspace)
+            })
+            .collect::<BTreeSet<_>>();
         for member in &members {
             let agent = world.get_component::<Agent>(*member).ok_or_else(|| {
                 error(
@@ -604,28 +730,61 @@ async fn stop_members_and_join(
                     "workspace contains a missing or unconfirmed member",
                 )
             })?;
-            if !matches!(agent.state(), AgentState::Idle | AgentState::Working) {
+            if agent.state() == AgentState::Stopping {
                 return Err(error(
                     WorkspaceErrorKind::Busy,
                     "member creation or lifecycle cleanup has not confirmed completion",
                 ));
             }
         }
-        let executor = world
+        let close = world
             .get_component::<WorkspaceExecutor>(workspace)
-            .ok_or_else(|| {
-                error(
-                    WorkspaceErrorKind::CleanupFailed,
-                    "workspace executor is missing",
-                )
-            })?;
-        executor.entry.close_admission();
-        Ok((
-            members.into_iter().collect::<Vec<_>>(),
-            executor.close.clone(),
-        ))
+            .map(|executor| {
+                executor.entry.close_admission();
+                executor.close.clone()
+            });
+        Ok((members.into_iter().collect::<Vec<_>>(), close))
     })
     .await?;
+    let executions = with_world(context, move |world| {
+        Ok(world
+            .query_with::<lua_runtime_core::WorkspaceLuaTask>()
+            .result()
+            .into_iter()
+            .filter_map(|entity| {
+                let task = world.get_component::<lua_runtime_core::WorkspaceLuaTask>(entity)?;
+                if task.workspace != workspace {
+                    return None;
+                }
+                Some((
+                    entity,
+                    world
+                        .get_component::<lua_runtime_core::DriverLuaVm>(entity)
+                        .map(|vm| vm.instance.clone()),
+                ))
+            })
+            .collect::<Vec<_>>())
+    })
+    .await?;
+    for (entity, instance) in executions {
+        if let Some(instance) = instance {
+            let (tx, rx) = oneshot::channel();
+            context
+                .events
+                .send_event(lua_runtime_core::StopDriverLuaVm {
+                    instance,
+                    reply: Arc::new(Mutex::new(Some(tx))),
+                });
+            rx.await
+                .map_err(|e| error(WorkspaceErrorKind::CleanupFailed, e))?
+                .map_err(|e| error(WorkspaceErrorKind::CleanupFailed, e))?;
+        }
+        with_world(context, move |world| {
+            world.despawn(entity);
+            Ok(())
+        })
+        .await?;
+    }
     let mut failures = Vec::new();
     for member in &members {
         let (sender, receiver) = oneshot::channel();
@@ -654,17 +813,23 @@ async fn stop_members_and_join(
             failures.join("; "),
         ));
     }
-    close.close_and_join().await?;
+    with_world(context, move |world| {
+        update_workspace(world, workspace, WorkspaceChange::Members(BTreeSet::new()))
+    })
+    .await?;
+    if let Some(close) = close {
+        close.close_and_join().await?;
+    }
     Ok(members)
 }
 async fn start_flow(context: WorkspaceFlowContext) -> Result<StartOutput, StartError> {
-    let (definition, parameters) = fresh_definition(&context)
+    let definition = fresh_definition(&context)
         .await
-        .map_err(|e| fail(&context, e, true, false))?;
+        .map_err(|e| fail(&context, e, true))?;
     mount_executor(&context, &definition, WorkspaceState::Starting)
         .await
-        .map_err(|e| fail(&context, e, false, false))?;
-    let (members, member_errors) = start_members(&context, definition, parameters).await;
+        .map_err(|e| fail(&context, e, false))?;
+    let (members, member_errors) = start_members(&context, definition).await;
     Ok(StartOutput {
         reply: context.reply,
         workspace: context.workspace,
@@ -673,9 +838,10 @@ async fn start_flow(context: WorkspaceFlowContext) -> Result<StartOutput, StartE
     })
 }
 async fn stop_flow(context: WorkspaceFlowContext) -> Result<StopOutput, StopError> {
+    context.startup.wait().await;
     let members = stop_members_and_join(&context, WorkspaceState::Stopping)
         .await
-        .map_err(|e| fail(&context, e, false, false))?;
+        .map_err(|e| fail(&context, e, false))?;
     Ok(StopOutput {
         reply: context.reply,
         workspace: context.workspace,
@@ -683,17 +849,28 @@ async fn stop_flow(context: WorkspaceFlowContext) -> Result<StopOutput, StopErro
         member_errors: Vec::new(),
     })
 }
-async fn restart_flow(context: WorkspaceFlowContext) -> Result<RestartOutput, RestartError> {
-    let (definition, parameters) = fresh_definition(&context)
+async fn restart_flow(mut context: WorkspaceFlowContext) -> Result<RestartOutput, RestartError> {
+    stop_members_and_join(&context, WorkspaceState::Stopping)
         .await
-        .map_err(|e| fail(&context, e, false, true))?;
-    stop_members_and_join(&context, WorkspaceState::Restarting)
+        .map_err(|e| fail(&context, e, false))?;
+    let workspace = context.workspace;
+    with_world(&context, move |world| {
+        update_workspace(
+            world,
+            workspace,
+            WorkspaceChange::State(WorkspaceState::Starting),
+        )
+    })
+    .await
+    .map_err(|e| fail(&context, e, false))?;
+    context.state = WorkspaceState::Starting;
+    let definition = fresh_definition(&context)
         .await
-        .map_err(|e| fail(&context, e, false, false))?;
-    mount_executor(&context, &definition, WorkspaceState::Restarting)
+        .map_err(|e| fail(&context, e, false))?;
+    mount_executor(&context, &definition, WorkspaceState::Starting)
         .await
-        .map_err(|e| fail(&context, e, false, false))?;
-    let (members, member_errors) = start_members(&context, definition, parameters).await;
+        .map_err(|e| fail(&context, e, false))?;
+    let (members, member_errors) = start_members(&context, definition).await;
     Ok(RestartOutput {
         reply: context.reply,
         workspace: context.workspace,
@@ -703,7 +880,7 @@ async fn restart_flow(context: WorkspaceFlowContext) -> Result<RestartOutput, Re
 }
 async fn guarded_start(context: WorkspaceFlowContext) -> Result<StartOutput, StartError> {
     let retained = context.clone();
-    AssertUnwindSafe(start_flow(context))
+    let result = AssertUnwindSafe(start_flow(context))
         .catch_unwind()
         .await
         .unwrap_or_else(|_| {
@@ -714,9 +891,10 @@ async fn guarded_start(context: WorkspaceFlowContext) -> Result<StartOutput, Sta
                     "workspace start flow panicked; cleanup is not confirmed",
                 ),
                 false,
-                false,
             ))
-        })
+        });
+    retained.startup.finish();
+    result
 }
 async fn guarded_stop(context: WorkspaceFlowContext) -> Result<StopOutput, StopError> {
     let retained = context.clone();
@@ -731,13 +909,12 @@ async fn guarded_stop(context: WorkspaceFlowContext) -> Result<StopOutput, StopE
                     "workspace stop flow panicked; cleanup is not confirmed",
                 ),
                 false,
-                false,
             ))
         })
 }
 async fn guarded_restart(context: WorkspaceFlowContext) -> Result<RestartOutput, RestartError> {
     let retained = context.clone();
-    AssertUnwindSafe(restart_flow(context))
+    let result = AssertUnwindSafe(restart_flow(context))
         .catch_unwind()
         .await
         .unwrap_or_else(|_| {
@@ -748,7 +925,8 @@ async fn guarded_restart(context: WorkspaceFlowContext) -> Result<RestartOutput,
                     "workspace restart flow panicked; cleanup is not confirmed",
                 ),
                 false,
-                false,
             ))
-        })
+        });
+    retained.startup.finish();
+    result
 }

@@ -4,7 +4,7 @@ export interface WorkspaceRef {
   project_root: string;
 }
 export type WorkspaceReference = WorkspaceRef | string;
-export type WorkspaceStatus = 'starting' | 'running' | 'restarting' | 'stopping';
+export type WorkspaceStatus = 'starting' | 'running' | 'error' | 'stopping';
 export interface WorkspaceInfo extends WorkspaceRef {
   definition_path: string;
   status: WorkspaceStatus;
@@ -75,7 +75,7 @@ export type AgentMessage = { sequence?: number } & (
 export interface AgentState {
   workspace: WorkspaceRef;
   agent: string;
-  status: 'starting' | 'idle' | 'working' | 'restarting' | 'stopping';
+  status: 'starting' | 'running' | 'error' | 'stopping';
   turn: string | null;
   sandbox: string | null;
   tools: string[];
@@ -132,7 +132,7 @@ export type AbortResult = { Ok: null } | { Err: ProtocolError };
 export interface WorkspaceSnapshot {
   path: string;
   definition: WorkspaceDefinition;
-  status: 'inactive' | WorkspaceStatus | 'failed';
+  status: 'inactive' | WorkspaceStatus;
   address: string | null;
   error: ProtocolError | null;
 }
@@ -160,7 +160,7 @@ export interface AgentModel {
 export interface AgentInfo {
   address: string;
   workspace: string;
-  status: 'starting' | 'ready' | 'working' | 'restarting' | 'stopping' | 'failed';
+  status: 'starting' | 'running' | 'error' | 'stopping';
   tools: AgentTool[];
   sandboxes: AgentSandbox[];
   sandbox: string | null;
@@ -197,6 +197,37 @@ export interface AgentLogRecord {
   level: string;
   source: string;
   stage: string;
+  message: string;
+  details_json: unknown;
+  context_json: unknown;
+  origin: string | null;
+  raw_error: string | null;
+  traceback: string | null;
+}
+export interface AppLogRecord {
+  sequence: number;
+  report_id: string | null;
+  created_at_ms: number;
+  received_at_ms: number;
+  level: string;
+  target: string;
+  agent: string | null;
+  message: string;
+  details_json: unknown;
+  context_json: unknown;
+  origin: string | null;
+  raw_error: string | null;
+  traceback: string | null;
+  reporter: string;
+  source: string;
+  stage: string;
+}
+export interface AppLogReport {
+  report_id: string;
+  created_at_ms: number;
+  level: string;
+  target: string;
+  agent: string | null;
   message: string;
   details_json: unknown;
   context_json: unknown;
@@ -252,7 +283,9 @@ export type ClientMessage =
       message: AgentTarget & { command: string; arguments: unknown[] };
     }
   | { type: 'agent.ui.req'; id: string; message: AgentTarget }
-  | { type: 'agent.turn.abort'; id: string; message: AgentTarget & { turn: string } };
+  | { type: 'agent.turn.abort'; id: string; message: AgentTarget & { turn: string } }
+  | { type: 'log.req'; id: string; message: RangeQuery }
+  | { type: 'log.append'; id: string; message: AppLogReport };
 type Failure = { success: false; error: ProtocolError };
 type Receipt = { id: string } & ({ success: true } | Failure);
 type Page<T> = { id: string } & AgentTarget &
@@ -305,6 +338,19 @@ export type ServerMessage =
       ui: AgentUiBundle | null;
       error: ProtocolError | null;
     }
+  | ({ type: 'log.res'; id: string } & (
+      | {
+          success: true;
+          records: AppLogRecord[];
+          next_before_sequence: number | null;
+          next_after_sequence: number | null;
+        }
+      | Failure
+    ))
+  | ({ type: 'log.append.result'; id: string } & (
+      { success: true; sequence: number; report_id: string } | Failure
+    ))
+  | { type: 'log.sync'; records: AppLogRecord[] }
   | ({
       type: 'agent.message.chunk.sync';
       turn: string;
@@ -351,9 +397,7 @@ const workspaceSnapshot = (v: unknown): boolean =>
   isRecord(v) &&
   string(v.path) &&
   definition(v.definition) &&
-  ['inactive', 'starting', 'running', 'restarting', 'stopping', 'failed'].includes(
-    String(v.status),
-  ) &&
+  ['inactive', 'starting', 'running', 'error', 'stopping'].includes(String(v.status)) &&
   nullableString(v.address) &&
   errorOrNull(v.error);
 const uiPath = (v: unknown): boolean =>
@@ -378,11 +422,29 @@ const agentUiBundle = (v: unknown): boolean =>
       /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(file.data),
   ) &&
   v.files.some((file) => isRecord(file) && file.path === 'index.html');
+const appLogRecord = (v: unknown): boolean =>
+  isRecord(v) &&
+  integer(v.sequence) &&
+  nullableString(v.report_id) &&
+  integer(v.created_at_ms) &&
+  integer(v.received_at_ms) &&
+  string(v.level) &&
+  string(v.target) &&
+  nullableString(v.agent) &&
+  string(v.message) &&
+  (v.details_json === null || isRecord(v.details_json)) &&
+  (v.context_json === null || isRecord(v.context_json)) &&
+  nullableString(v.origin) &&
+  nullableString(v.raw_error) &&
+  nullableString(v.traceback) &&
+  string(v.reporter) &&
+  string(v.source) &&
+  string(v.stage);
 const agentInfo = (v: unknown): boolean =>
   isRecord(v) &&
   target(v) &&
   string(v.workspace) &&
-  ['starting', 'ready', 'working', 'restarting', 'stopping', 'failed'].includes(String(v.status)) &&
+  ['starting', 'running', 'error', 'stopping'].includes(String(v.status)) &&
   errorOrNull(v.error) &&
   Array.isArray(v.tools) &&
   v.tools.every(
@@ -660,6 +722,26 @@ export function parseServerMessage(raw: string): ServerMessage | null {
           isAgentMessage(v.message) &&
           (v.history_sequence === null || v.message.sequence === v.history_sequence) &&
           errorOrNull(v.error);
+        break;
+      case 'log.res':
+        valid =
+          reply &&
+          (v.success === false
+            ? v.records === undefined
+            : Array.isArray(v.records) &&
+              v.records.every(appLogRecord) &&
+              (v.next_before_sequence === null || integer(v.next_before_sequence)) &&
+              (v.next_after_sequence === null || integer(v.next_after_sequence)));
+        break;
+      case 'log.append.result':
+        valid =
+          reply &&
+          (v.success === false
+            ? v.sequence === undefined
+            : integer(v.sequence) && string(v.report_id));
+        break;
+      case 'log.sync':
+        valid = v.id === undefined && Array.isArray(v.records) && v.records.every(appLogRecord);
         break;
     }
     return valid ? (v as unknown as ServerMessage) : null;

@@ -12,7 +12,7 @@ pub use events::{
 };
 pub use types::{
     DriverLuaVmInstance, DriverWakeSlot, HostFuture, LuaBinding, LuaEnvironment, LuaHostFunction,
-    LuaProgram, LuaRuntimeConfig, LuaStandardLibraries, LuaValue,
+    LuaProgram, LuaRuntimeConfig, LuaValue,
 };
 
 use core_plugin::World;
@@ -66,3 +66,15 @@ fn checked_vm<'a>(
     }
     Ok(vm)
 }
+
+mod environment;
+pub use environment::{configuration_globals, create_environment, enable_execution, load_program};
+
+mod services;
+pub use services::{LuaExecutionIdentity, LuaServiceFuture, LuaServices};
+
+pub use components::AgentWaitSlot;
+
+pub use components::WorkspaceLuaTask;
+
+pub use components::LuaAgentMonitor;

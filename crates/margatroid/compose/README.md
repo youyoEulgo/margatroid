@@ -14,3 +14,7 @@ mcl和wait由lua_runtime_plugin自行构造，分别使用mcl_core事件契约�
 shutdown_app(&mut App)在请求Axum停止后继续推进World，按原领域流程关闭Workspace/Agent，等待Axum普通请求及升级工作退出后返回；清理失败返回诊断，调用方必须保留App监督，不能将错误返回解释为全部已清理。
 
 装配时先创建唯一Clients，再取得DTO提供的具体typed绑定工厂，分别注入领域插件。异步监控和统一写入口都克隆同一槽位；删除dto_sync_system及同步中转事件，不新增sync总线或另一套执行器。Workspace磁盘监控归应用，UI/记录监控归实际Agent来源，关停先取消并等待真实join，再释放运行设施。
+
+Compose必需安装应用级RuntimeLogStore和同一Clients的runtime_log_probe。TracingStream同步持久观察者先提交数据库，再走原尽力广播，不通过可丢弃队列保存报告。数据根存在时，配置/模型等prepare失败也保留完整启动诊断。日志写入失败显式报告，不以Activity内存或控制台替代已持久化证明。
+
+Agent创建注入接口为owner/name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。

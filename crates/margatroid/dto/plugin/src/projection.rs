@@ -1,5 +1,5 @@
 use address::Address;
-use agent_core::{Agent, AgentState};
+use agent_core::Agent;
 use core_plugin::{Entity, World};
 use margatroid_protocol::*;
 use std::collections::BTreeMap;
@@ -83,10 +83,7 @@ pub(crate) fn agents(world: &World) -> Vec<AgentStateDto> {
                 address: address(world, entity)?,
                 workspace: address(world, agent.workspace())?,
 
-                status: match agent.state() {
-                    AgentState::Idle => "ready".into(),
-                    _ => format!("{:?}", agent.state()).to_lowercase(),
-                },
+                status: format!("{:?}", agent.state()).to_lowercase(),
                 tools: world
                     .get_component::<Tools>(entity)
                     .map(|tools| {

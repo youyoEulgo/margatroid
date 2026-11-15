@@ -12,6 +12,7 @@ use workspace_core::{WorkspaceDefinitions, WorkspaceError, WorkspaceErrorKind as
 pub struct WorkspacePlugin {
     pub schedule: String,
     definitions: WorkspaceDefinitions,
+    program_root: PathBuf,
     root: Option<PathBuf>,
     file: Option<PathBuf>,
 }
@@ -20,6 +21,7 @@ impl Default for WorkspacePlugin {
         Self {
             schedule: RuntimePlugin::UPDATE.into(),
             definitions: WorkspaceDefinitions::default(),
+            program_root: PathBuf::from("agent-drivers"),
             root: None,
             file: None,
         }
@@ -28,6 +30,10 @@ impl Default for WorkspacePlugin {
 impl WorkspacePlugin {
     pub fn new() -> Self {
         Self::default()
+    }
+    pub fn with_program_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.program_root = root.into();
+        self
     }
     pub fn with_schedule(mut self, schedule: impl Into<String>) -> Self {
         self.schedule = schedule.into();
@@ -50,7 +56,12 @@ impl WorkspacePlugin {
         } else {
             (source, None)
         };
+        let program_root = directory
+            .parent()
+            .unwrap_or(&directory)
+            .join("agent-drivers");
         Ok(Self {
+            program_root,
             definitions,
             root: Some(directory),
             file,
@@ -62,6 +73,7 @@ impl WorkspacePlugin {
 pub(crate) struct WorkspaceInstalled {
     pub schedule: String,
     pub definitions: WorkspaceDefinitions,
+    pub program_root: PathBuf,
     pub root: Option<PathBuf>,
     pub file: Option<PathBuf>,
 }
@@ -88,6 +100,7 @@ impl Plugin for WorkspacePlugin {
         app.world_mut().insert_resource(WorkspaceInstalled {
             schedule: self.schedule.clone(),
             definitions: self.definitions,
+            program_root: self.program_root,
             root: self.root,
             file: self.file,
         });

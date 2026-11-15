@@ -18,7 +18,6 @@ pub(crate) struct CommandContext {
     pub turn: Option<String>,
     pub prompts: BTreeMap<String, PathBuf>,
     pub imports: MclImportConfig,
-    pub allowed_imports: Vec<String>,
 }
 
 #[derive(Clone, Debug)]

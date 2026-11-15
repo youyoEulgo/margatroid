@@ -27,10 +27,7 @@ function begin(key: string, action: () => void) {
   });
 }
 function isBusy(workspace: SidebarWorkspace): boolean {
-  return (
-    busyKey.value === workspace.key ||
-    ['starting', 'restarting', 'stopping'].includes(workspace.lifecycle)
-  );
+  return busyKey.value === workspace.key || ['starting', 'stopping'].includes(workspace.lifecycle);
 }
 const emit = defineEmits<{
   selectWorkspace: [path: string];
@@ -48,8 +45,7 @@ function restartWorkspace(workspace: SidebarWorkspace) {
   begin(workspace.key, () => emit('restartWorkspace', workspace.path));
 }
 function stopWorkspace(workspace: SidebarWorkspace) {
-  if (workspace.address)
-    begin(workspace.key, () => emit('stopWorkspace', workspace.address!));
+  if (workspace.address) begin(workspace.key, () => emit('stopWorkspace', workspace.address!));
 }
 </script>
 
@@ -76,7 +72,7 @@ function stopWorkspace(workspace: SidebarWorkspace) {
           <button
             class="tree-main"
             type="button"
-            :title="`${workspace.path} · ${workspace.lifecycle}${workspace.reason ? `: ${workspace.reason}` : ''}`"
+            :title="`${workspace.path} · ${workspace.lifecycle}${workspace.reason ? ' · error (see Activity logs)' : ''}`"
             @click="emit('toggleWorkspace', workspace.path)"
           >
             <FolderKanban class="tree-icon" :size="15" />
@@ -112,7 +108,17 @@ function stopWorkspace(workspace: SidebarWorkspace) {
               </button>
             </template>
             <button
-              v-else-if="workspace.lifecycle === 'stopped'"
+              v-else-if="workspace.lifecycle === 'error' && workspace.address"
+              class="tree-action"
+              type="button"
+              title="Stop workspace"
+              :disabled="pending || offline"
+              @click.stop="stopWorkspace(workspace)"
+            >
+              <Pause :size="14" />
+            </button>
+            <button
+              v-else-if="workspace.lifecycle === 'stopped' || workspace.lifecycle === 'inactive'"
               class="tree-action"
               type="button"
               title="Start workspace"
@@ -135,7 +141,11 @@ function stopWorkspace(workspace: SidebarWorkspace) {
               class="tree-main tree-main--agent"
               type="button"
               :disabled="!agent.id"
-              :title="agent.reason || agent.id || `${agent.name}: workspace is not running`"
+              :title="
+                agent.reason
+                  ? 'Agent error — see Activity logs'
+                  : agent.id || `${agent.name}: workspace is not running`
+              "
               @click="agent.id && emit('selectAgent', agent.id, workspace.path)"
             >
               <span

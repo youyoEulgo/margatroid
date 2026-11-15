@@ -27,7 +27,7 @@ fn fixture(url: String, format: &str) -> (App, Entity) {
         agent_core::Agent::new(
             "test".into(),
             agent,
-            AgentState::Working,
+            AgentState::Running,
             Some("turn".into()),
             test_agent_context(),
         ),
@@ -53,7 +53,8 @@ fn fixture(url: String, format: &str) -> (App, Entity) {
 }
 
 fn entry(alias: &str, owner: Option<&str>) -> ToolEntry {
-    ToolEntry { owner_agent:None,
+    ToolEntry {
+        owner_agent: None,
         // No tool files exist here. HTTP definitions must come only from entries.
         path: std::env::temp_dir()
             .join("inference-entry-without-files")

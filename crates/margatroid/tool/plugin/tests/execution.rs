@@ -92,7 +92,7 @@ impl Fixture {
             agent_core::Agent::new(
                 "test".into(),
                 workspace,
-                AgentState::Working,
+                AgentState::Running,
                 Some("test-turn".into()),
                 crate::test_agent_context(),
             ),
@@ -436,7 +436,7 @@ fn return_keeps_vm_alive_across_turn_changes_and_supports_json_cache_replacement
     agent_core::WorldAgentExt::agent_transition(
         fixture.app.world_mut(),
         fixture.agent,
-        AgentState::Idle,
+        AgentState::Running,
         Some("unrelated-new-turn".into()),
     )
     .unwrap();
@@ -1435,7 +1435,7 @@ fn accepted_batch_abort_returns_long_call_immediately_and_preserves_returned_bac
     agent_core::WorldAgentExt::agent_transition(
         fixture.app.world_mut(),
         fixture.agent,
-        AgentState::Working,
+        AgentState::Running,
         None,
     )
     .unwrap();
@@ -1843,7 +1843,7 @@ fn sibling_agent(
         agent_core::Agent::new(
             name.into(),
             workspace,
-            AgentState::Working,
+            AgentState::Running,
             Some("test-turn".into()),
             crate::test_agent_context(),
         ),

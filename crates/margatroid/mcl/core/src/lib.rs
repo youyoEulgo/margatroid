@@ -239,8 +239,8 @@ pub fn parse_instruction(input: &MclInstruction) -> Result<MclOperation, MclErro
         "EFFECT" => {
             let (name, mut rest) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
             let arity = match name {
-                "inference" | "tool_call" | "sandbox_use" | "history_append" | "block_snapshot"
-                | "block_snapshots" => 1,
+                "model_set" | "inference" | "tool_call" | "sandbox_use" | "history_append"
+                | "block_snapshot" | "block_snapshots" => 1,
                 "block_restore" => 2,
                 "start_turn" | "finish_turn" | "ready" | "wake" => 0,
                 _ => return Err(invalid("unknown effect")),
@@ -256,7 +256,16 @@ pub fn parse_instruction(input: &MclInstruction) -> Result<MclOperation, MclErro
                     let (inner, tail) = tail
                         .split_once(')')
                         .ok_or_else(|| invalid("unclosed effect parameter"))?;
-                    arguments.push(EffectParameter::Expression(expression(inner)?));
+                    if let Some(selector) = inner.trim().strip_suffix(".tool_calls") {
+                        if name != "tool_call" {
+                            return Err(invalid(
+                                "tool_calls projection is only valid for tool_call",
+                            ));
+                        }
+                        arguments.push(EffectParameter::ToolCalls(expression(selector)?));
+                    } else {
+                        arguments.push(EffectParameter::Expression(expression(inner)?));
+                    }
                     rest = tail.trim();
                 } else {
                     return Err(invalid("effect parameter must be expression or ?"));
@@ -282,7 +291,10 @@ pub fn parse_instruction(input: &MclInstruction) -> Result<MclOperation, MclErro
     if input.arguments.len() != count {
         return Err(MclError::new(
             MclErrorKind::ArgumentMismatch,
-            "question mark argument count mismatch",
+            format!(
+                "question mark argument count mismatch (expected {count}, received {})",
+                input.arguments.len()
+            ),
         ));
     }
     Ok(operation)

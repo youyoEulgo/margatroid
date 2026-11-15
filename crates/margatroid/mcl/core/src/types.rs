@@ -73,6 +73,7 @@ pub enum MessageParameter {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EffectParameter {
+    ToolCalls(MessageExpression),
     Expression(MessageExpression),
     Manual(usize),
 }

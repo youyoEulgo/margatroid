@@ -20,15 +20,6 @@ pub struct DriverLuaVmInstance {
 pub struct LuaProgram {
     pub source: String,
     pub origin: PathBuf,
-    pub libraries: LuaStandardLibraries,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LuaStandardLibraries {
-    #[default]
-    Minimal,
-    Safe,
-    Full,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -17,7 +17,7 @@ Margatroid领域使用原生Axum装配及普通异步闭包。网络服务属于
 
 ```text
 # lib     src/lib.rs      应用装配入口
-# handler src/handler.rs  插件构造与安装
+# handler src/handler.rs、diagnostics.rs  插件构造、持久诊断与安装
 # types   src/types.rs    应用路径及装配参数
 # error   src/error.rs    装配错误
 ```
@@ -29,7 +29,14 @@ Margatroid领域使用原生Axum装配及普通异步闭包。网络服务属于
 公开：
 ```text
 build_app(options: ApplicationOptions) -> Result<App, ComposeError>
-    行为：构造插件、读取启动配置、安装基础设施和业务插件，返回未进入运行循环的App。
+    行为：构造插件、读取启动配置、安装基础设施和业务插件，返回未进入运行循环的App；prepare失败由diagnostics::startup_failure保留原ComposeError及调用栈至现有数据根runtime.sqlite。
+shutdown_application(app: &mut App) -> Future<Output = Result<(), ComposeError>>
+    行为：先server.request_shutdown关闭外部新受理，保持World.tick及异步执行器推进。
+        pending按完整Workspace Entity保存本次StopWorkspace原oneshot及定义路径；非Stopping的所有状态均可提交关闭，包括Starting/Running/Error，不按Running白名单漏掉失败宿主。
+        对已Stopping的Workspace不重复提交，不干扰已有原reply；持续推进其既有停止监督，直至真实清理后的Entity移除。
+        原stop回复错误或丢失返回ComposeError，daemon保持监督并重新进入；Workspace失败保留Error可继续清理，不以丢弃Future或drop App伪造退出。
+        只有Workspace集合与pending均空、AxumHandle.is_stopped时完成，返回Axum最终结果；其余等待1ms让出执行，不强退、不提前销毁执行线程。
+
 ```
 
 # handler
@@ -41,12 +48,20 @@ build_app(options: ApplicationOptions) -> Result<App, ComposeError>
 prepare(options: &ApplicationOptions) -> Result<ApplicationParts, ComposeError>
     行为：读取ConfigPlugin、WorkspacePlugin::open和InferencePlugin::open，准备资源根及runner路径；将config自有tools经resolve_tool_limits补齐并校验预算，失败映射config领域及config.toml路径，先于App创建和插件安装；任一失败返回，不自动启动工作区。
 
+diagnostics::install(app: &mut App, store: RuntimeLogStore)
+    行为：订阅TracingStream.subscribe_persistent，直接同步append完整报告，包含原级别、字段、spans、调用文件/行号/模块、进程关联、错误及Error级Rust回溯；DB提交后由必需探针发布网络，不经ECS或可丢弃日志广播。
+        Store和TracingSinkGuard归App持有，Drop精确解绑；日志写失败只报告原失败，不递归写日志形成循环。
+diagnostics::startup_failure(options: &ApplicationOptions, error: &ComposeError)
+    行为：数据根已存在时打开runtime.sqlite并保存启动阶段原始错误、domain/path、调用栈；尚无Client使用无目标提交探针，不修改Agent库；根不存在或诊断库不可写只能报告持久化失败，不伪造成功。
+
 resolve_tool_limits(config: &FileToolConfig) -> Result<ToolExecutionLimits, ConfigError>
     行为：将lua_vm_memory_limit和task_output_buffer_window直接映射到lua_vm_memory_bytes和cache_bytes；缺省值只取工具领域默认2GiB及128MiB，两项拒绝显式零值并报告tools字段路径；lua_vm_memory_bytes只限制工具Lua VM分配器，cache_bytes独立约束任务输出窗口，不限制Rust或外部进程，不限制返回结果容量。
 
 install(app: &mut App, parts: ApplicationParts) -> Result<(), ComposeError>
     行为：先安装既有mecs Runtime、AsyncRuntime、Closure和日志设施，再安装Margatroid axum_plugin及各业务插件。
         install先创建唯一Clients，调用dto_plugin::workspace_sync_binding、agent_sync_context、resource_sync_bindings、model_sync_binding、task_sync_binding，显式构造各typed能力。
+        在日志设施安装前以dto_plugin::runtime_log_probe及logs目标创建必需RuntimeLogStore，打开数据根runtime.sqlite；初始化失败拒绝启动，不静默降级内存日志。
+        安装LogPlugin后、其他领域前调用diagnostics::install，登记TracingStream持久观察者并将Store与精确解绑Guard插入World；原广播不作为持久投递路径。
         将Clients、WorkspaceSyncBinding及其updates、AgentUpdateContext、ToolResourceSyncBinding、SandboxSyncBinding、SandboxSelectionSyncBinding和ModelSyncBinding作为Resource插入同一World。
         ClientPlugin和DtoPlugin复用同一Clients Resource；AgentPlugin::new接收必需AgentUpdateContext，ToolPlugin::new接收必需TaskSyncBinding，资源插件及实际Agent初始化从Resource取得必需probe工厂。
         领域plugin只调用自身或其他领域core入口，不依赖DTO plugin；DTO函数返回的绑定由compose组装，wire编码函数通过owned回调注入。
@@ -61,7 +76,7 @@ install(app: &mut App, parts: ApplicationParts) -> Result<(), ComposeError>
         同帧中止先清turn，再取消已受理推理及尚未return工具；之后到达业务System的旧turn事件必须拒绝，不能先执行再回查。
         各生命周期按Stop、Restart、Start顺序挂载；启动后创建Workspace定义监控，Agent实际来源/存储安装时启动UI和记录监控，替换/停止时取消并等待真实join。
         不安装dto_sync_system，不创建WebSocketMessageSend或sync中转通道，不用活动帧轮询获得更新；业务命令、生命周期及中止控制的原事件链保持。
-        9种sync的wire名称和字段保持，状态源初始化及更新使用每连接原有队列，有序记录和chunk不作状态覆盖。
+        既有9种sync字段保持，应用持久日志新增第10种log.sync，状态源初始化及更新使用每连接原有队列，有序记录和chunk不作状态覆盖。
 
 shutdown_app(app: &mut App) -> Future<Output = Result<(), ComposeError>>
     行为：

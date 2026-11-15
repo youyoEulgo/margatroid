@@ -85,7 +85,7 @@ impl Fixture {
             agent_core::Agent::new(
                 "test".into(),
                 workspace,
-                AgentState::Working,
+                AgentState::Running,
                 Some("test-turn".into()),
                 crate::test_agent_context(),
             ),

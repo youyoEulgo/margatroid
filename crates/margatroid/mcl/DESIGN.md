@@ -82,9 +82,9 @@ MclQueue：目标Entity的命令队列，公开组件
 -- 公开
 MclCommand：命令请求，公开事件
     id: String
-    source: Entity--由网络或Driver宿主绑定的真实来源
+    source: Entity--由网络或共享Lua宿主绑定的真实来源
     source_address: String--调用入口必需显式提供自身真实地址；校验与source一致，MCL审计source不记录Entity编号；history_append消息无source
-    source_instance: Option<String>--Driver来源为本次start_id，客户端为None；不引用Lua core类型
+    source_instance: Option<String>--自动Lua来源为执行start_id，工具来源为唯一task-instance，客户端为None；不引用Lua core类型
     target: Entity
     instruction: MclInstruction
     cancel: CancellationToken
@@ -118,7 +118,7 @@ mcl_command_system(world: &mut World)
 -- crate公开
 handle_command(world: &mut World, request: MclCommand)
     行为：
-        核对来源和目标完整Entity、Driver来源实例、入队门及重复id；
+        核对来源和目标完整Entity、实际Lua执行实例、入队门及重复id；目标统一仅Starting/Running可接受，Error/Stopping拒绝，不按具体指令增加状态或turn受理条件。
         入目标FIFO；
         拒绝通过reply返回错误。
 
@@ -155,14 +155,14 @@ read_expression(context: &CommandContext, expression: MessageExpression) -> Futu
 
 prepare_sources(context: &CommandContext, expression: MessageExpression) -> Future<Output = Result<Vec<storage_core::MessageSource>, MclError>>
     行为：
-        Selector转换为存储选择器，携带当前目标VM实例；
+        Selector转换为存储选择器，携带目标AgentSession；
         PromptAlias按已导入路径在blocking worker读取，按资源角色构造Literal来源；
         保留来源书写顺序，不在此改写目标Block。
 
 execute_operation(context: &CommandContext) -> Future<Output = Result<MclValue, MclError>>
     行为：
         执行前检查命令及执行取消标记，按MclOperation分派；
-        Create转换CreateBlock，TEMP绑定当前VM；Get调用read_expression并返回Array.Message；
+        Create转换CreateBlock，TEMP绑定目标AgentSession；Get调用read_expression并返回Array.Message；
         Inject将手工数组、空数组或表达式转换为消息来源，交存储ReplaceMessages完成替换，等待结果返回Unit；
         Config转换ReadConfig、SetConfig或DeleteConfig，仅访问当前Agent设置，读取返回Config，修改确认后返回Unit；
         Import及Effect分别调用execute_import和execute_effect，不在本函数回复原请求或写命令审计。
@@ -170,12 +170,18 @@ execute_operation(context: &CommandContext) -> Future<Output = Result<MclValue, 
 execute_effect(context: &CommandContext, name: &str, arguments: Vec<EffectParameter>) -> Future<Output = Result<MclValue, MclError>>
     行为：
         按effect参数约束求值，通过对应领域core能力执行或发送带oneshot的具体领域请求；
-        保留请求与回合关联。inference使用消息及推理参数，工具调用使用调用消息；
+        保留请求与回合关联。inference使用消息及推理参数，工具调用使用完整调用数组；
         工具定义与查找来自目标Agent的Tools。中止由队列外的控制流程受理，各System复检turn。
         按name分派领域调用并将参数求值为该领域输入，等待结果后返回MclValue或MclError；
         同步存储能力在blocking worker执行并等待真实join；不在此函数发送原请求reply或写入统一命令审计；
+        ready转交Agent core的agent_ready；start_turn/finish_turn同样调用Agent领域方法，不在MCL重复判断状态或turn策略。
+        不提供agent_stop effect，关闭由Lua agent.stop注入或StopAgent领域请求处理。
+        model_set校验InferenceParameters及真实ModelRoutes后使用AgentInferenceConfig统一入口安装/更新，返回安全模型元数据Config；不读取Driver manifest。
         history_append取得目标owned AgentStorage，复检命令及取消，在worker调用append_message_history并返回Array.Message。
 
+finish_turn(context: &CommandContext) -> Future<Output = Result<MclValue, MclError>>
+    行为：仅经通用check_action复检来源、MCL状态门及取消；克隆当前InferenceHandle并在World外等待wait_finished真实退出。随后调用Agent core的agent_finish_turn，由Agent领域验证Running/turn关联并清turn；成功才移除已完成句柄，MCL不重复实现回合受理规则。
+        不因正常后台收口返回要求Lua重试的错误，不等待已Return后台工具；实际清理失败才返回CleanupFailed。
 block_effect_argument(context: &CommandContext, parameter: &EffectParameter) -> Result<&serde_json::Value, MclError>
     行为：取得Manual指定的原始JSON参数，缺失或非Manual返回ArgumentMismatch，不作为消息数组解释。
 
@@ -183,12 +189,18 @@ execute_block_effect(context: &CommandContext, name: &str, parameters: Vec<Effec
     行为：
         按既有标识符规则校验Block名，恢复参数校验为SQLite范围内正整数；不接收物理路径
         通过World闭包check_action复检命令、来源及取消，克隆目标AgentStorage，不跨await借用World
-        owned句柄及当前VM命名空间交给blocking worker，提交前复检取消，执行对应存储能力并await真实join
+        owned句柄及目标AgentSession命名空间交给blocking worker，提交前复检取消，执行对应存储能力并await真实join
         将存储结果转换为Unit或BlockSnapshots，错误沿storage_error转换，worker失败为CleanupFailed
         不在本函数写审计或发送原请求reply，不自动重试
 
-execute_tools(context: CommandContext, messages: Vec<Value>) -> Future<Output = Result<MclValue, MclError>>
+execute_inference(context: &CommandContext, messages: Vec<Value>) -> Future<Output = Result<MclValue, MclError>>
+    行为：转换消息与读取实际推理配置，经通用check_action后提交InferenceRequest；turn只携带上下文快照，缺省为空字符串。
+        无turn也正常提交，不在MCL构造empty_completed或短路返回；Inference plugin实际受理时统一判断Running/有效turn及关联，并以原oneshot返回结果。
+
+execute_tools(context: &CommandContext, messages: Vec<Value>) -> Future<Output = Result<MclValue, MclError>>
     行为：
+        不判断Agent是否Running、有无turn或工具alias存在性；按通用MCL门通过后，合法调用全部发给ToolExecuteRequest，携带执行上下文快照turn，缺省为空字符串。
+        Tool plugin统一验证当前Running、有效turn、alias/Schema及实际任务受理，MCL只收齐并转换领域结果。
         验证调用身份后，一次性发出多个ToolExecuteRequest，各自携带Agent、原turn、call_id及独立oneshot；
         工具System按请求名称查当前Tools，存在则调用，不存在则返回对应工具错误。所有请求先发出，再用join_all收齐并按输入顺序返回。
         中止前未被工具System受理的请求直接回中止结果；
@@ -215,6 +227,7 @@ CommandError：失败载荷--原请求关联、MclError
 ## 类型
 
 ```text
+
 -- 公开
 MclInstruction：输入指令
     text: String
@@ -259,6 +272,7 @@ MessageParameter：消息参数，公开枚举
     Empty
 
 EffectParameter：效果参数，公开枚举
+    ToolCalls(MessageExpression)--只允许tool_call的字段投影，原Storage选择单消息后取得tool_calls
     Expression(MessageExpression)
     Manual(usize)
 
@@ -304,8 +318,8 @@ Agent Entity
 ├── 数据库及设置路径（所属领域）
 └── 各资源alias到路径的集合（所属领域core）
 
-Lua Runtime中的MclHost
-├── 真实source与VM实例关联
+共享LuaServices的mcl_execute服务
+├── 真实source与实际Lua执行实例关联
 └── MclCommand.reply接收端
 
 mecs全局异步设施

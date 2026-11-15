@@ -3,3 +3,8 @@ sandbox = ["read_only"]
 [compaction]
 threshold = 0.8
 keep_messages = 16
+
+[inference]
+model = "openrouter/deepseek-v4.1-flash"
+temperature = 0.1
+top_p = 0.9

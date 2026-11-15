@@ -48,7 +48,7 @@ const agent: AgentInfo = {
   address,
   workspace,
 
-  status: 'ready',
+  status: 'running',
   tools: [
     {
       alias: 'read_file',
@@ -210,16 +210,10 @@ test('registration independently queries Workspace and active Agents without glo
     assert.equal(e.store.registeredClient?.address, 'client:webui/test:1');
     const registration = e.sent[0]!;
     assert.equal(registration.type, 'connection.register');
-    assert.match(
-      String((registration.message as { name?: string }).name),
-      /^webui-[0-9a-z-]+$/,
-    );
+    assert.match(String((registration.message as { name?: string }).name), /^webui-[0-9a-z-]+$/);
     assert.equal(e.store.selectedAgent, address);
     assert.deepEqual(e.store.toolOptions, ['read_file']);
-    assert.equal(
-      e.store.toolDefinitions.get(`${address}`)?.[0]?.description,
-      'Read a file',
-    );
+    assert.equal(e.store.toolDefinitions.get(`${address}`)?.[0]?.description, 'Read a file');
     assert.ok(!e.sent.some((x) => x.type.includes('state')));
   } finally {
     e.cleanup();
@@ -267,16 +261,59 @@ test('older history follows the paging cursor and stops at the oldest page', () 
     const older = e.sent.filter((wire) => wire.type === 'agent.history.req').at(-1)!;
     assert.equal(older.message.before_sequence, 10);
     e.store.loadOlderHistory();
-    assert.equal(
-      e.sent.filter((wire) => wire.type === 'agent.history.req').length,
-      2,
-    );
+    assert.equal(e.sent.filter((wire) => wire.type === 'agent.history.req').length, 2);
     e.receive({ ...page(older.id, [historyRecord(1, 'old')]), next_before_sequence: null });
     e.store.loadOlderHistory();
-    assert.equal(
-      e.sent.filter((wire) => wire.type === 'agent.history.req').length,
-      2,
-    );
+    assert.equal(e.sent.filter((wire) => wire.type === 'agent.history.req').length, 2);
+  } finally {
+    e.cleanup();
+  }
+});
+test('lifecycle status and turn stay independent', () => {
+  const e = setup();
+  try {
+    e.receive({ type: 'agent.turn.sync', address, turn: null });
+    assert.equal(e.store.selectedAgentState?.status, 'running');
+    assert.equal(e.store.selectedAgentIdle, true);
+    assert.equal(e.store.selectedAgentWorking, false);
+    e.receive({ type: 'agent.turn.sync', address, turn: 'turn-1' });
+    assert.equal(e.store.selectedAgentIdle, false);
+    assert.equal(e.store.selectedAgentWorking, true);
+    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'error' }] });
+    assert.equal(e.store.selectedAgentState?.status, 'error');
+    assert.equal(e.store.selectedAgentReady, false);
+    assert.equal(e.store.selectedAgentWorking, false);
+  } finally {
+    e.cleanup();
+  }
+});
+test('application log sync merges records without requiring an agent', () => {
+  const e = setup();
+  try {
+    const record = {
+      sequence: 7,
+      report_id: 'report-7',
+      created_at_ms: 100,
+      received_at_ms: 101,
+      level: 'error',
+      target: 'ui.decode',
+      agent: null,
+      message: 'Unsupported backend message',
+      details_json: { frame_type: 'future.unknown' },
+      context_json: { agent: null, workspace: null },
+      origin: 'workbench.ts:1',
+      raw_error: 'Unsupported backend message',
+      traceback: 'Error: unsupported backend message',
+      reporter: 'client:webui/browser:1',
+      source: 'host',
+      stage: 'client',
+    };
+    e.receive({ type: 'log.sync', records: [record] });
+    assert.equal(e.store.applicationLogs.length, 1);
+    assert.equal(e.store.applicationLogs[0]?.report_id, 'report-7');
+    e.receive({ type: 'log.sync', records: [{ ...record, message: 'updated' }] });
+    assert.equal(e.store.applicationLogs.length, 1);
+    assert.equal(e.store.applicationLogs[0]?.message, 'updated');
   } finally {
     e.cleanup();
   }
@@ -291,7 +328,13 @@ test('agent.ui request, response and sync keep the last loaded Driver UI', () =>
     const ui = {
       revision,
       entry: 'index.html',
-      files: [{ path: 'index.html', media_type: 'text/html; charset=utf-8', data: 'PGgxPkRyaXZlcjwvaDE+' }],
+      files: [
+        {
+          path: 'index.html',
+          media_type: 'text/html; charset=utf-8',
+          data: 'PGgxPkRyaXZlcjwvaDE+',
+        },
+      ],
     };
     e.receive({
       type: 'agent.ui.res',
@@ -307,7 +350,8 @@ test('agent.ui request, response and sync keep the last loaded Driver UI', () =>
       ui: null,
       error: { code: 'DriverUiReadFailed', message: 'read failed' },
     });
-    assert.equal(e.store.agentUiError, 'read failed');
+    assert.equal(e.store.agentUiError, 'Driver UI failed to load');
+    assert.ok(e.store.logs.some((log) => log.message.includes('read failed')));
     assert.equal(e.store.agentUiBundle?.revision, revision);
     const next = { ...ui, revision: `sha256:${'b'.repeat(64)}` };
     e.receive({ type: 'agent.ui.sync', address, ui: next, error: null });
@@ -340,7 +384,7 @@ test('a workspace failure is carried into the sidebar row', () => {
       workspaces: [
         {
           ...ws,
-          status: 'failed',
+          status: 'error',
           error: { code: 'StartFailed', message: 'workspace failed to start' },
         },
       ],
@@ -438,7 +482,7 @@ test('Agent sync replaces full active collection and keeps full tool properties'
 test('turn state is independent of Agent state and uses Agent Address', () => {
   const e = setup();
   try {
-    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'working' }] });
+    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'running' }] });
     assert.equal(e.store.canAbortTurn, false);
     e.receive({ type: 'agent.turn.sync', address, turn: 'turn-1' });
     assert.equal(e.store.canAbortTurn, true);
@@ -516,6 +560,27 @@ test('command results for a removed Agent cannot complete as success', async () 
     e.receive({ type: 'agent.sync', agents: [] });
     e.reply(id, { kind: 'messages', value: [] });
     await assert.rejects(p, /instance changed/);
+  } finally {
+    e.cleanup();
+  }
+});
+test('workspace errors expose only a summary while Activity keeps the detail', async () => {
+  const e = setup([{ ...ws, address: null, status: 'inactive' }], []);
+  try {
+    const pending = e.store.startWorkspace(path);
+    const request = e.sent.at(-1)!;
+    e.receive({
+      type: 'workspace.start.result',
+      id: request.id,
+      success: false,
+      error: {
+        code: 'MemberFailed',
+        message: 'coder: MemberFailed: Lua task start failed: Ok(Err(LuaRuntimeError { ... }))',
+      },
+    });
+    await assert.rejects(pending, /MemberFailed/);
+    assert.equal(e.store.workspaceNotice, 'Workspace operation failed — see Activity logs');
+    assert.ok(e.store.logs.some((log) => log.message.includes('Lua task start failed')));
   } finally {
     e.cleanup();
   }
@@ -742,7 +807,7 @@ test('Agent logs and MCL records are separate incremental sets and range request
 test('abort uses original target instance and turn and cannot accept unrelated receipts', async () => {
   const e = setup();
   try {
-    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'working' }] });
+    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'running' }] });
     e.receive({ type: 'agent.turn.sync', address, turn: 'turn-1' });
     e.receive(chunk());
     const p = e.store.abortTurn();
@@ -861,10 +926,7 @@ test('registration result is matched to the current connection request', () => {
     assert.equal(e.store.registeredClient?.address, 'client:webui/test:1');
     const registration = e.sent[0]!;
     assert.equal(registration.type, 'connection.register');
-    assert.match(
-      String((registration.message as { name?: string }).name),
-      /^webui-[0-9a-z-]+$/,
-    );
+    assert.match(String((registration.message as { name?: string }).name), /^webui-[0-9a-z-]+$/);
   } finally {
     e.cleanup();
   }
@@ -936,7 +998,7 @@ const state = {
       workspace: { id: workspace, name: 'Demo', project_root: '/project' },
       agent: address,
 
-      status: 'idle' as const,
+      status: 'running' as const,
       turn: null,
       sandbox: null,
       tools: ['read_file'],
@@ -1340,7 +1402,7 @@ test('multi-MiB media sends await receipts and diagnostics do not contain media 
 test('abort failure stays frozen until current matching turn sync releases it', async () => {
   const e = setup();
   try {
-    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'working' }] });
+    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'running' }] });
     e.receive({ type: 'agent.turn.sync', address, turn: 'turn-1' });
     e.receive(chunk());
     const p = e.store.abortTurn();
@@ -1364,11 +1426,11 @@ test('abort failure stays frozen until current matching turn sync releases it', 
 test('late abort receipt completes original Promise without mutating new VM turn', async () => {
   const e = setup();
   try {
-    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'working' }] });
+    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'running' }] });
     e.receive({ type: 'agent.turn.sync', address, turn: 'turn-1' });
     const p = e.store.abortTurn();
     const abort = e.sent.at(-1)!;
-    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'working' }] });
+    e.receive({ type: 'agent.sync', agents: [{ ...agent, status: 'running' }] });
     e.receive({ type: 'agent.turn.sync', address, turn: 'turn-new' });
     e.receive({ type: 'agent.turn.abort.result', id: abort.id, success: true });
     await p;

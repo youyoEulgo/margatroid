@@ -43,7 +43,7 @@ fn page_sql(table: &str, order: &str, upper_op: &str) -> String {
     format!("SELECT sequence FROM {table} WHERE sequence>?1 AND sequence{upper_op}?2 ORDER BY sequence {order} LIMIT ?3")
 }
 
-fn page<T>(
+pub(crate) fn page<T>(
     db: &Connection,
     table: &str,
     query: RecordRange,

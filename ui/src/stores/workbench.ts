@@ -18,6 +18,8 @@ import {
   type UserImage,
   type WorkspaceSnapshot,
   type AgentInfo,
+  type AppLogRecord,
+  type AppLogReport,
   type AgentUiBundle,
   type TaskSnapshot,
   type AgentTool,
@@ -39,6 +41,7 @@ const COMMAND_RESULT: Partial<Record<ClientMessage['type'], ServerMessage['type'
   'agent.restart': 'agent.restart.result',
   'agent.turn.abort': 'agent.turn.abort.result',
   'mcl.execute': 'mcl.execute.result',
+  'log.append': 'log.append.result',
 };
 export type MessageRole = 'system' | 'user' | 'assistant' | 'tool' | 'error' | 'record';
 export interface ToolResult {
@@ -76,7 +79,6 @@ export interface RuntimeLog {
   fields: { name: string; value: string }[];
 }
 interface StreamEntry extends ConversationEntry {
-
   lastSequence: number;
   completed: boolean;
   frozen: boolean;
@@ -84,7 +86,6 @@ interface StreamEntry extends ConversationEntry {
 interface Target {
   workspace: string;
   agent: string;
-
 }
 interface PendingCommand {
   resolve: (value: unknown) => void;
@@ -390,16 +391,12 @@ export function buildSidebarModel(
           memberFailure ||
           state?.error?.message ||
           (instance && member.id ? failures.get(`${instance.id}:${member.id}`)?.message : '') ||
-          '';
+          (state?.status === 'error' ? 'Agent error' : '');
         return {
           ...member,
           key: member.id ?? member.name,
           reason,
-          status: reason
-            ? 'error'
-            : state && ['idle', 'working'].includes(state.status)
-              ? 'running'
-              : 'stopped',
+          status: reason ? 'error' : state?.status === 'running' ? 'running' : 'stopped',
           active:
             definition.path === selectedKey && member.id !== null && member.id === selectedAgent,
         };
@@ -408,7 +405,7 @@ export function buildSidebarModel(
         agents.find((agent) => agent.reason)?.reason ||
         instance?.error?.message ||
         instance?.member_failures?.[0]?.error ||
-        '';
+        (instance?.status === 'error' ? 'Workspace error' : '');
       const status: TreeStatus = reason
         ? 'error'
         : instance?.status === 'running' && agents.every((agent) => agent.status === 'running')
@@ -470,6 +467,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const historyCursors = ref(new Map<string, { before: number | null; after: number | null }>());
   const recordQueries = new Map<string, Target>();
   const historyQueries = new Map<string, Target>();
+  const appLogQueries = new Set<string>();
   const definitions = ref<WorkspaceConfig[]>([]);
   const runtimeWorkspaces = ref<WorkspaceInfo[]>([]);
   const agentStates = ref<AgentState[]>([]);
@@ -481,6 +479,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const workspaceNotice = ref('');
   const logs = ref<RuntimeLog[]>([]);
   const lastFailures = ref(new Map<string, { message: string }>());
+  const applicationLogs = ref<AppLogRecord[]>([]);
+  const applicationLogHistoryLoaded = ref(false);
   const streams = ref(new Map<string, StreamEntry>());
   const abortGuards = ref(new Map<string, AbortGuard>());
   const pending = new Map<string, PendingCommand>();
@@ -548,14 +548,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const selectedAgentName = computed(() =>
     selectedAgent.value ? resourceName(selectedAgent.value) : 'Choose an agent',
   );
-  const selectedAgentReady = computed(
-    () =>
-      ['idle', 'working'].includes(selectedAgentState.value?.status ?? ''),
-  );
+  const selectedAgentReady = computed(() => selectedAgentState.value?.status === 'running');
   const selectedAgentIdle = computed(
-    () => selectedAgentReady.value && selectedAgentState.value?.status === 'idle',
+    () => selectedAgentReady.value && !selectedAgentState.value?.turn,
   );
-  const selectedAgentWorking = computed(() => selectedAgentState.value?.status === 'working');
+  const selectedAgentWorking = computed(
+    () => selectedAgentReady.value && !!selectedAgentState.value?.turn,
+  );
   const selectedAbortGuard = computed(() =>
     [...abortGuards.value.values()].find(
       (guard) =>
@@ -563,13 +562,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         guard.agent === selectedAgent.value,
     ),
   );
-  const abortPending = computed(
-    () =>
-      selectedAgentWorking.value && (!selectedAgentState.value?.turn || !!selectedAbortGuard.value),
-  );
-  const canAbortTurn = computed(
-    () => selectedAgentWorking.value && !!selectedAgentState.value?.turn && !abortPending.value,
-  );
+  const abortPending = computed(() => selectedAgentWorking.value && !!selectedAbortGuard.value);
+  const canAbortTurn = computed(() => selectedAgentWorking.value && !abortPending.value);
   const sidebarTree = computed(() =>
     buildSidebarModel(
       definitions.value,
@@ -686,9 +680,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     return `${target.agent}`;
   }
   function matchesTarget(target: Pick<Target, 'agent'>): boolean {
-    return agentStates.value.some(
-      (s) => s.agent === target.agent,
-    );
+    return agentStates.value.some((s) => s.agent === target.agent);
   }
   function queryAgentDetails(target: Target) {
     if (!connected()) return;
@@ -708,7 +700,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (!connected() || !matchesTarget(target)) return;
     const id = randomId();
     recordQueries.set(id, target);
-    historyQueries.set(id,target);
+    historyQueries.set(id, target);
     socket!.send(
       JSON.stringify({
         type: 'agent.history.req',
@@ -781,7 +773,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       try {
         endpoint.value = normalizeEndpoint(rawEndpoint);
       } catch (error) {
-        connectionError.value = error instanceof Error ? error.message : String(error);
+        const detail = error instanceof Error ? error.message : String(error);
+        addLog('ERROR', detail, 'ui.connect');
+        connectionError.value = 'Invalid WebSocket endpoint';
         return false;
       }
     }
@@ -1014,6 +1008,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       queryState();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      addLog('ERROR', message, 'ui.sandbox');
       // Save and apply are separate steps; refresh the authoritative Agent
       // snapshot so the panel shows what actually runs.
       queryState();
@@ -1086,9 +1081,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       addLog('INFO', 'Daemon acknowledged message and wake', 'ui.send');
       return result;
     } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
       addLog(
         'ERROR',
-        `Message send failed while awaiting ${stage === 'injecting' ? 'injection' : 'wake'} acknowledgement; see composer error`,
+        `Message send failed while awaiting ${stage === 'injecting' ? 'injection' : 'wake'} acknowledgement: ${detail}`,
         'ui.send',
       );
       throw error;
@@ -1139,6 +1135,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     ).catch((error) => {
       const current = abortGuards.value.get(id);
       if (current) current.failed = true;
+      addLog('ERROR', error instanceof Error ? error.message : String(error), 'ui.abort');
       queryState();
       throw error;
     });
@@ -1147,10 +1144,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     for (const [id, guard] of abortGuards.value) {
       const state = agentStates.value.find(
         (candidate) =>
-          workspaceKey(candidate.workspace) === guard.workspace &&
-          candidate.agent === guard.agent,
+          workspaceKey(candidate.workspace) === guard.workspace && candidate.agent === guard.agent,
       );
-      const sameTurn = state?.status === 'working' && state.turn === guard.turn;
+      const sameTurn = state?.turn === guard.turn;
       if (guard.failed && sameTurn) {
         for (const key of guard.streamKeys) {
           abortedStreams.delete(key);
@@ -1158,12 +1154,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           if (stream) streams.value.set(key, { ...stream, frozen: false });
         }
         abortGuards.value.delete(id);
-      } else if (
-        !state ||
-        state.status !== 'working' ||
-        (state.turn !== null && state.turn !== guard.turn)
-      )
-        abortGuards.value.delete(id);
+      } else if (!state || state.turn !== guard.turn) abortGuards.value.delete(id);
     }
   }
   function handleChunk(event: Extract<ServerMessage, { type: 'agent.message.chunk.sync' }>) {
@@ -1173,8 +1164,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (completedStreams.has(key) || abortedStreams.has(key)) return;
     const guard = [...abortGuards.value.values()].find(
       (candidate) =>
-        candidate.workspace === workspaceKey(state.workspace) &&
-        candidate.agent === event.address,
+        candidate.workspace === workspaceKey(state.workspace) && candidate.agent === event.address,
     );
     if (guard) {
       guard.streamKeys.add(key);
@@ -1249,8 +1239,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         ([, stream]) =>
           agentStates.value.some(
             (state) =>
-              state.agent === stream.agent &&
-              workspaceKey(state.workspace) === stream.workspaceKey,
+              state.agent === stream.agent && workspaceKey(state.workspace) === stream.workspaceKey,
           ) && !assistantIds.has(`${stream.workspaceKey}:${stream.agent}:${stream.id}`),
       ),
     );
@@ -1294,7 +1283,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       },
       agent: a.address,
 
-      status: (a.status === 'ready' ? 'idle' : a.status) as AgentState['status'],
+      status: a.status,
       turn: turnStates.value.get(`${a.address}`) ?? null,
       tools: a.tools.map((t) => t.alias),
       sandbox: a.sandbox,
@@ -1305,13 +1294,16 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       context_window_tokens: a.model?.context_window_tokens ?? null,
       error: a.error,
     }));
-    toolDefinitions.value = new Map(
-      activeAgentInfos.value.map((a) => [`${a.address}`, a.tools]),
-    );
+    toolDefinitions.value = new Map(activeAgentInfos.value.map((a) => [`${a.address}`, a.tools]));
     for (const state of agentStates.value) {
       const key = `${workspaceKey(state.workspace)}:${state.agent}`;
-      if (state.error) lastFailures.value.set(key, { message: state.error.message });
-      else if (['idle', 'working'].includes(state.status)) lastFailures.value.delete(key);
+      if (state.error) {
+        const previous = lastFailures.value.get(key);
+        lastFailures.value.set(key, { message: state.error.message });
+        if (previous?.message !== state.error.message)
+          addLog('ERROR', `${state.error.code}: ${state.error.message}`, 'ui.agent');
+      } else if (['starting', 'running', 'stopping'].includes(state.status))
+        lastFailures.value.delete(key);
     }
     reconcileAbortGuards();
     reconcileSelection();
@@ -1353,11 +1345,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     const query = recordQueries.get(id);
     recordQueries.delete(id);
     historyQueries.delete(id);
-    if (
-      !query ||
-      !matchesTarget(query) ||
-      (address !== undefined && query.agent !== address)
-    )
+    if (!query || !matchesTarget(query) || (address !== undefined && query.agent !== address))
       return null;
     return query;
   }
@@ -1377,14 +1365,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
   }
   function handleFull(event: Extract<ServerMessage, { type: 'agent.message.full.sync' }>) {
-    const state = agentStates.value.find(
-      (a) => a.agent === event.address,
-    );
+    const state = agentStates.value.find((a) => a.agent === event.address);
     if (!state) return;
     const target = {
       workspace: workspaceKey(state.workspace),
       agent: event.address,
-
     };
     if (event.history_sequence !== null) {
       const message = event.message;
@@ -1442,11 +1427,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if ('id' in event) {
       const command = pending.get(event.id);
       if (command?.expectedType && command.expectedType !== event.type) {
-        settle(
-          event.id,
-          null,
-          `Received ${event.type} for a waiting ${command.expectedType}`,
-        );
+        settle(event.id, null, `Received ${event.type} for a waiting ${command.expectedType}`);
         return;
       }
     }
@@ -1454,7 +1435,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       case 'connection.register.result':
         if (event.id !== registrationId) break;
         if (!event.success) {
-          connectionError.value = event.error.message;
+          addLog('ERROR', event.error.message, 'ui.connect');
+          connectionError.value = 'Connection registration failed';
           shouldReconnect = false;
           socket?.close();
           break;
@@ -1537,19 +1519,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       case 'agent.task.res': {
         if (!queryTarget(event.id, event.address)) break;
         if (event.success)
-          taskStates.value = new Map(taskStates.value).set(
-            `${event.address}`,
-            event.tasks,
-          );
+          taskStates.value = new Map(taskStates.value).set(`${event.address}`, event.tasks);
         else addLog('ERROR', event.error.message);
         break;
       }
       case 'agent.task.sync':
         if (matchesTarget({ agent: event.address }))
-          taskStates.value = new Map(taskStates.value).set(
-            `${event.address}`,
-            event.tasks,
-          );
+          taskStates.value = new Map(taskStates.value).set(`${event.address}`, event.tasks);
         break;
       case 'mcl.execute.result': {
         const command = pending.get(event.id);
@@ -1565,6 +1541,17 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         );
         break;
       }
+      case 'log.res': {
+        if (!appLogQueries.delete(event.id)) break;
+        if (event.success) {
+          mergeApplicationLogs(event.records);
+          applicationLogHistoryLoaded.value = true;
+        } else addLog('ERROR', event.error.message, 'ui.log');
+        break;
+      }
+      case 'log.sync':
+        mergeApplicationLogs(event.records);
+        break;
       case 'agent.ui.res': {
         const requested = uiQueries.get(event.id);
         uiQueries.delete(event.id);
@@ -1572,7 +1559,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         if (event.address !== agentUiAddress.value) break;
         agentUiLoading.value = false;
         if (!event.success) {
-          agentUiError.value = event.error.message;
+          addLog('ERROR', event.error.message, 'ui.agent-ui');
+          agentUiError.value = 'Driver UI failed to load';
           break;
         }
         agentUiBundle.value = event.ui;
@@ -1583,7 +1571,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         if (event.address !== agentUiAddress.value) break;
         agentUiLoading.value = false;
         if (event.error) {
-          agentUiError.value = event.error.message;
+          addLog('ERROR', event.error.message, 'ui.agent-ui');
+          agentUiError.value = 'Driver UI failed to load';
           break;
         }
         agentUiError.value = '';
@@ -1631,6 +1620,30 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         break;
     }
   }
+  function mergeApplicationLogs(records: AppLogRecord[]) {
+    const rows = new Map(applicationLogs.value.map((row) => [row.sequence, row]));
+    for (const row of records) rows.set(row.sequence, row);
+    applicationLogs.value = [...rows.values()].sort((a, b) => a.sequence - b.sequence);
+  }
+  function queryApplicationLogs(range: RangeQuery = {}) {
+    if (!connected()) return;
+    const id = randomId();
+    appLogQueries.add(id);
+    socket!.send(
+      JSON.stringify({
+        type: 'log.req',
+        id,
+        message: { limit: 100, ...range },
+      } satisfies ClientMessage),
+    );
+  }
+  function appendApplicationLog(report: AppLogReport): Promise<unknown> {
+    return request({ type: 'log.append', id: randomId(), message: report });
+  }
+  function loadLogHistory() {
+    queryApplicationLogs();
+    queryRecords('log');
+  }
   function mergeLogs(target: Pick<Target, 'agent'>, records: AgentLogRecord[]) {
     const key = targetKey(target);
     const rows = new Map((agentLogs.value.get(key) ?? []).map((r) => [r.sequence, r]));
@@ -1657,7 +1670,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     try {
       return await request(message);
     } catch (error) {
-      workspaceNotice.value = error instanceof Error ? error.message : String(error);
+      const detail = error instanceof Error ? error.message : String(error);
+      addLog('ERROR', detail, 'ui.workspace');
+      workspaceNotice.value = 'Workspace operation failed — see Activity logs';
       throw error;
     } finally {
       workspaceOperationPending.value = false;
@@ -1675,10 +1690,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (
       !path ||
       !runtimeWorkspaces.value.some(
-        (workspace) => workspace.definition_path === path && workspace.status === 'running',
+        (workspace) =>
+          workspace.definition_path === path && ['running', 'error'].includes(workspace.status),
       )
     )
-      throw new Error('Choose a Running workspace');
+      throw new Error('Choose a running or failed workspace');
     await workspaceRequest({
       type: 'workspace.restart',
       id: randomId(),
@@ -1690,10 +1706,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (
       !address ||
       !runtimeWorkspaces.value.some(
-        (workspace) => workspace.id === address && workspace.status === 'running',
+        (workspace) => workspace.id === address && ['running', 'error'].includes(workspace.status),
       )
     )
-      throw new Error('Choose a Running workspace');
+      throw new Error('Choose a running or failed workspace');
     await workspaceRequest({
       type: 'workspace.stop',
       id: randomId(),
@@ -1713,6 +1729,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     mclRecords,
     historyCursors,
     selectedMclEntries,
+    applicationLogs,
+    applicationLogHistoryLoaded,
+    queryApplicationLogs,
+    loadLogHistory,
+    appendApplicationLog,
     selectedSessionLogs,
     selectedHistory,
     selectedHistoryEntries,

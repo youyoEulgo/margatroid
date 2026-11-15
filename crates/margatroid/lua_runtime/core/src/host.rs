@@ -94,21 +94,23 @@ enum NamespaceKind {
     Data,
     Text,
     Process,
-    Driver,
     Tools,
     Task,
     Workspace,
+    Mcl,
+    Agent,
 }
 impl NamespaceKind {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Files,
         Self::Data,
         Self::Text,
         Self::Process,
-        Self::Driver,
         Self::Tools,
         Self::Task,
         Self::Workspace,
+        Self::Mcl,
+        Self::Agent,
     ];
     fn name(self) -> &'static str {
         match self {
@@ -116,27 +118,23 @@ impl NamespaceKind {
             Self::Data => "data",
             Self::Text => "text",
             Self::Process => "process",
-            Self::Driver => "driver",
             Self::Tools => "tools",
             Self::Task => "task",
             Self::Workspace => "workspace",
-        }
-    }
-    fn allowed(self, owner: HostKind) -> bool {
-        match self {
-            Self::Driver => owner == HostKind::Driver,
-            Self::Tools | Self::Task | Self::Workspace => owner == HostKind::Tool,
-            _ => true,
+            Self::Mcl => "mcl",
+            Self::Agent => "agent",
         }
     }
 }
 struct HostNamespace {
     kind: NamespaceKind,
-    owner: HostKind,
     callbacks: Callbacks,
 }
-const ROOT_METHODS: &[&str] = &["log", "wait_any"];
+const ROOT_METHODS: &[&str] = &["log", "wait_any", "wait"];
 const NAMESPACE_METHODS: &[(NamespaceKind, &str, &str, bool)] = &[
+    (NamespaceKind::Mcl, "execute", "mcl_execute", true),
+    (NamespaceKind::Agent, "create", "agent_create", true),
+    (NamespaceKind::Agent, "stop", "agent_stop", true),
     (NamespaceKind::Workspace, "agents", "workspace_agents", true),
     (NamespaceKind::Files, "read", "files_read", true),
     (NamespaceKind::Files, "write", "files_write", true),
@@ -153,8 +151,6 @@ const NAMESPACE_METHODS: &[(NamespaceKind, &str, &str, bool)] = &[
     (NamespaceKind::Data, "decode", "data_decode", false),
     (NamespaceKind::Text, "search", "text_search", false),
     (NamespaceKind::Process, "start", "process_start", true),
-    (NamespaceKind::Driver, "mcl", "driver_mcl", true),
-    (NamespaceKind::Driver, "wait", "driver_wait", true),
     (NamespaceKind::Tools, "register", "tools_register", true),
     (
         NamespaceKind::Task,
@@ -203,7 +199,7 @@ fn callback(callbacks: &Callbacks, name: &str) -> mlua::Result<Function> {
 }
 impl HostNamespace {
     fn callback(&self, kind: NamespaceKind, key: &str) -> mlua::Result<Function> {
-        if self.kind != kind || !kind.allowed(self.owner) {
+        if self.kind != kind {
             return Err(invalid_context());
         }
         callback(&self.callbacks, key)
@@ -225,7 +221,6 @@ impl Margatroid {
             .map(|kind| {
                 lua.create_userdata(HostNamespace {
                     kind,
-                    owner: definition.kind,
                     callbacks: callbacks.clone(),
                 })
             })
@@ -251,10 +246,8 @@ impl Margatroid {
                 frozen.insert(key.to_owned(), function);
             }
         }
-        for &(kind, _, key, _) in NAMESPACE_METHODS {
-            if kind.allowed(host.definition.kind)
-                && let Some(function) = supplied.get::<Option<Function>>(key)?
-            {
+        for &(_, _, key, _) in NAMESPACE_METHODS {
+            if let Some(function) = supplied.get::<Option<Function>>(key)? {
                 frozen.insert(key.to_owned(), function);
             }
         }

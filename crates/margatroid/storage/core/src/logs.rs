@@ -39,7 +39,7 @@ fn transaction<T>(
     Ok(value)
 }
 
-fn validate(record: &AgentLogRecord) -> Result<(), StorageError> {
+pub(crate) fn validate(record: &AgentLogRecord) -> Result<(), StorageError> {
     if record
         .created_at_ms
         .is_some_and(|time| time > i64::MAX as u64)

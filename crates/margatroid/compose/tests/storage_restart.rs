@@ -49,9 +49,13 @@ fn wait_workspace(app: &mut App, id: &str, _restart: bool) -> WorkspaceOperation
 }
 
 fn command(app: &mut App, agent: Entity, text: &str, arguments: Vec<Value>) -> MclValue {
+    let execution = app
+        .world()
+        .query_with::<lua_runtime_core::WorkspaceLuaTask>()
+        .result()[0];
     let instance = app
         .world()
-        .get_component::<DriverLuaVm>(agent)
+        .get_component::<DriverLuaVm>(execution)
         .unwrap()
         .instance
         .start_id
@@ -59,10 +63,10 @@ fn command(app: &mut App, agent: Entity, text: &str, arguments: Vec<Value>) -> M
     let (sender, mut receiver) = oneshot::channel();
     app.world().emit_event(MclCommand {
         id: format!("block-files:{text}"),
-        source: agent,
+        source: execution,
         source_address: app
             .world()
-            .get_component::<address::Address>(agent)
+            .get_component::<address::Address>(execution)
             .unwrap()
             .as_str()
             .to_owned(),
@@ -250,16 +254,15 @@ fn workspace_restarts_keep_block_files_persistent_context_and_history_without_te
         project.display(), root.path().display())).unwrap();
     std::fs::write(root.path().join("config.toml"),
         "[server]\nbind='127.0.0.1:0'\n[outbound]\nlogs=['type:unmatched']\nbackend_state=['type:unmatched']\n").unwrap();
-    let driver_model = agent_driver_core::read_driver(
+    let driver_settings = agent_driver_core::read_initial_settings(
         &root
             .path()
-            .join("agent-drivers/local/coder/latest/driver.toml"),
-        &Default::default(),
+            .join("agent-drivers/local/coder/latest/setting.toml"),
+        agent_driver_core::AgentDriverReadLimits::default().settings_bytes,
     )
-    .unwrap()
-    .manifest
-    .inference
-    .model;
+    .unwrap();
+    let settings: toml::Value = toml::from_str(&driver_settings).unwrap();
+    let driver_model = settings["inference"]["model"].as_str().unwrap();
     std::fs::write(root.path().join("models.toml"),
         format!("[[models]]\nid={driver_model:?}\nmodel='unused'\nbase_url='http://127.0.0.1:1/v1'\napi_key='unused-local-test'\nprovider='openai'\napi_type='chat_completions'\ncontext_window='128k'\n")).unwrap();
     let mut app = build_app(ApplicationOptions {
@@ -297,10 +300,9 @@ fn workspace_restarts_keep_block_files_persistent_context_and_history_without_te
         let agent = output.members[0];
         let instance = app
             .world()
-            .get_component::<DriverLuaVm>(agent)
+            .get_component::<agent_core::AgentSession>(agent)
             .unwrap()
-            .instance
-            .start_id
+            .0
             .clone();
         assert!(instances.insert(instance.clone()));
         assert_eq!(

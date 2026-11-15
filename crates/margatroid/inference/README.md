@@ -28,7 +28,7 @@ ActiveInference归inference_core，单独保存当前InferenceHandle。受理推
 
 ## 输入与工具
 
-InferenceRequest携带完整Agent Entity、turn、消息和oneshot。Handler认领唯一回复端，检查Working及当前turn，准备本次请求。System实际受理时当前turn为空或与request.turn不匹配，直接返回空assistant的Completed响应（正文、reasoning、tool_calls、usage均空），不启动HTTP或监督任务。插件仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule。
+InferenceRequest携带完整Agent Entity、turn、消息和oneshot。Handler认领唯一回复端，检查Running及当前非空turn，准备本次请求。System实际受理时当前turn为空或与request.turn不匹配，直接返回空assistant的Completed响应（正文、reasoning、tool_calls、usage均空），不启动HTTP或监督任务。插件仅允许UPDATE或POST_UPDATE，拒绝PRE_UPDATE及无法证明顺序的自定义schedule。
 
 推理消息由本领域独立定义，MCL在plugin层转换并展开Inject；core不引用消息、工具或Agent core。System保留原角色，中止回复作为普通完成消息处理，工具调用与结果必须正确配对。
 
@@ -142,7 +142,7 @@ full不替代oneshot或真实退出证明。流/协议错误及时交付后仍�
 
 ## chunk.sync累计文本改版（已实现，尚未提交）
 
-本节对应当前工作树的接口改版，后端源码已改用累计文本；旧49c7711产物仍发送delta，前端源码按本轮范围未改。
+本节对应当前工作树的接口改版，后端源码已改用累计文本；旧49c7711产物仍发送delta，前端与参考客户端源码未改，不以本轮后端验收表示客户端已对接。
 
 上游ProviderFragment先经接受门写入唯一ResponseAccumulator，实际正文/思考变化后，在同一临界区取得sequence、完整content及完整reasoning的owned快照，锁外发送。前端不再维护字符串累积器，每条chunk替换同generation的正文和思考；生成结束的full.sync保持原结构，负责最终校正、工具调用、usage、结束原因及错误。工具参数和usage仍正常进入后端累积器，但不单独触发文本快照。
 

@@ -1,4 +1,5 @@
 use super::*;
+use lua_runtime_core::DriverLuaVm;
 #[path = "tool_contract.rs"]
 mod tool_contract;
 use inference_core::InferenceParameters;
@@ -302,7 +303,7 @@ async fn provider_error_replies_before_stalled_cleanup_and_retains_active_handle
         agent_core::Agent::new(
             "test".into(),
             entity,
-            AgentState::Working,
+            AgentState::Running,
             Some("turn".into()),
             test_agent_context(),
         ),
@@ -414,6 +415,8 @@ async fn real_cleanup_wakes_matching_driver_only_after_supervisor_finishes() {
         start_id: "current-instance".into(),
     };
     let wake = DriverWakeSlot::shared();
+    app.world_mut()
+        .insert_component(agent, lua_runtime_core::AgentWaitSlot(wake.clone()));
     app.world_mut().insert_component(
         agent,
         DriverLuaVm {
@@ -427,7 +430,7 @@ async fn real_cleanup_wakes_matching_driver_only_after_supervisor_finishes() {
     let cleanup = InferenceCleanupFinished {
         agent,
         request_id: "request".into(),
-        instance,
+        source: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     let (url, sender, server) = http_server().await;
     let mut input = request();
@@ -529,7 +532,7 @@ async fn real_cleanup_wakes_matching_driver_only_after_supervisor_finishes() {
     let mut stale_request = cleanup.clone();
     stale_request.request_id = "old-request".into();
     let mut stale_instance = cleanup.clone();
-    stale_instance.instance.start_id = "old-instance".into();
+    stale_instance.source = Arc::new(std::sync::atomic::AtomicBool::new(false));
     app.world().send_event(stale_request);
     app.world().send_event(stale_instance);
     app.tick();
@@ -560,6 +563,8 @@ async fn cleanup_event_retries_next_frame_until_actual_handle_finishes() {
         start_id: "current-instance".into(),
     };
     let wake = DriverWakeSlot::shared();
+    app.world_mut()
+        .insert_component(agent, lua_runtime_core::AgentWaitSlot(wake.clone()));
     app.world_mut().insert_component(
         agent,
         DriverLuaVm {
@@ -592,7 +597,7 @@ async fn cleanup_event_retries_next_frame_until_actual_handle_finishes() {
     app.world().send_event(InferenceCleanupFinished {
         agent,
         request_id: "request".into(),
-        instance,
+        source: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     });
     let mut waiting = Box::pin(DriverWakeSlot::wait(wake));
     assert!(waiting.as_mut().now_or_never().is_none());

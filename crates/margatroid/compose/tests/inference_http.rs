@@ -185,6 +185,13 @@ impl Fixture {
                 )
                 .unwrap(),
             );
+            app.world_mut().insert_resource(
+                storage_core::open_runtime_logs(
+                    &root.path().join("runtime.sqlite"),
+                    storage_core::RuntimeLogProbe::new(|_| {}),
+                )
+                .unwrap(),
+            );
             app.add_plugin(dto_plugin::DtoPlugin::new());
         }
         let (frames_sender, frames) = client_core::ClientSender::channel(256);
@@ -210,7 +217,10 @@ impl Fixture {
             );
         }
         let workspace = app.world_mut().spawn();
-        app.world_mut().insert_component(workspace,address::Address::new("workspace:test/unit").unwrap());
+        app.world_mut().insert_component(
+            workspace,
+            address::Address::new("workspace:test/unit").unwrap(),
+        );
         app.world_mut()
             .insert_component(workspace, Address::new("workspace:local/demo").unwrap());
         app.world_mut().insert_component(
@@ -236,7 +246,7 @@ impl Fixture {
             agent_core::Agent::new(
                 "test".into(),
                 workspace,
-                AgentState::Working,
+                AgentState::Running,
                 Some("turn".into()),
                 agent_updates.clone(),
             ),
@@ -845,46 +855,35 @@ fn address_only_state_and_streams_preserve_target_through_vm_restart() {
 }
 
 #[test]
-fn missing_or_mismatched_driver_vm_is_rejected_before_http_submission() {
-    let mut fixture = Fixture::new("http://127.0.0.1:1/v1", "openai", "chat_completions");
-    fixture
-        .app
-        .world_mut()
-        .remove_component::<lua_runtime_core::DriverLuaVm>(fixture.agent);
-    let (request, reply) = fixture.request("missing-vm");
-    assert_eq!(
-        fixture.run(request, reply).unwrap_err().kind,
-        Kind::AgentMissing
-    );
-    install_vm(fixture.app.world_mut(), fixture.agent, "");
-    let (request, reply) = fixture.request("empty-instance");
-    assert_eq!(
-        fixture.run(request, reply).unwrap_err().kind,
-        Kind::AgentMissing
-    );
-    install_vm(fixture.app.world_mut(), fixture.agent, "different-owner");
-    let other = fixture.app.world_mut().spawn();
-    fixture
-        .app
-        .world_mut()
-        .get_component_mut::<lua_runtime_core::DriverLuaVm>(fixture.agent)
-        .unwrap()
-        .instance
-        .owner = other;
-    let (request, reply) = fixture.request("wrong-owner");
-    assert_eq!(
-        fixture.run(request, reply).unwrap_err().kind,
-        Kind::AgentMissing
-    );
-    assert!(
+fn inference_uses_agent_lifetime_without_requiring_or_interpreting_a_driver_vm() {
+    let server = HttpServer::new(format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"index":0,"delta":{"content":"independent"},"finish_reason":"stop"}]})
+    ));
+    let mut fixture = Fixture::new(&server.url, "openai", "chat_completions");
+    for variant in ["no-vm", "unrelated-vm"] {
         fixture
             .app
-            .world()
-            .get_component::<ActiveInference>(fixture.agent)
-            .unwrap()
-            .current
-            .is_none()
-    );
+            .world_mut()
+            .remove_component::<lua_runtime_core::DriverLuaVm>(fixture.agent);
+        if variant == "unrelated-vm" {
+            install_vm(fixture.app.world_mut(), fixture.agent, "not-the-owner");
+            let other = fixture.app.world_mut().spawn();
+            fixture
+                .app
+                .world_mut()
+                .get_component_mut::<lua_runtime_core::DriverLuaVm>(fixture.agent)
+                .unwrap()
+                .instance
+                .owner = other;
+        }
+        let (request, reply) = fixture.request(variant);
+        assert_eq!(
+            fixture.run(request, reply).unwrap().content.as_deref(),
+            Some("independent")
+        );
+        fixture.idle();
+    }
 }
 
 fn historical_reasoning_fixture() -> Vec<InferenceMessage> {

@@ -2,6 +2,7 @@ mod handler;
 #[cfg(test)]
 #[path = "../tests/internal/lifecycle.rs"]
 mod lifecycle_tests;
+mod services;
 mod system;
 mod types;
 
@@ -92,8 +93,10 @@ impl Plugin for ToolPlugin {
         } else {
             app.world_mut().insert_resource(self.sync.clients.clone());
         }
+        app.world_mut().insert_resource(self.sync.clone());
         let sender = Arc::new(app.world().closure_sender(&self.schedule));
         app.world_mut().insert_resource(ToolRuntime(sender));
+        services::install_on(app, &self.schedule);
         self.limits.validate().expect("ToolPlugin limits invalid");
         let schedule = self.schedule.clone();
         app.world_mut().insert_resource(self);
@@ -101,3 +104,5 @@ impl Plugin for ToolPlugin {
         app.add_system(&schedule, system::tool_execute_system);
     }
 }
+
+pub use services::install as install_lua_services;

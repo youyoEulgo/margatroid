@@ -62,14 +62,36 @@ impl Agent {
 impl Component for Agent {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentDriverSource {
-    pub address: String,
-    pub manifest_path: std::path::PathBuf,
+pub struct AgentResources {
+    pub parameters: crate::AgentStartParameters,
 }
-impl Component for AgentDriverSource {}
+impl Component for AgentResources {}
 
 impl Drop for Agent {
     fn drop(&mut self) {
         self.close_source();
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+pub struct AgentOwner(pub core_plugin::Entity);
+impl Component for AgentOwner {}
+
+#[derive(Clone, Debug)]
+pub struct AgentSession(pub String);
+impl AgentSession {
+    pub fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(format!(
+            "agent-session:{}:{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+}
+impl Default for AgentSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Component for AgentSession {}

@@ -64,6 +64,9 @@ reject_definition_symlinks(path: &Path) -> Result<(), WorkspaceError>
 WorkspacePlugin
     schedule: String
     definitions: WorkspaceDefinitions
+    program_root: PathBuf--Workspace定义程序的明确资源根
+    state: WorkspaceState--本次异步阶段
+    startup: Arc<StartupCompletion>--在途启动真实完成屏障
     root: Option<PathBuf>
     file: Option<PathBuf>
     new() -> Self
@@ -176,44 +179,49 @@ update_workspace(world: &mut World, owner: Entity, change: WorkspaceChange) -> R
     行为：唯一修改Workspace私有data的入口，统一处理状态、成员、故障、实际启动定义；变化后释放可变借用再context.notify，DTO探针提交owned运行快照并直投Clients。
 remove_workspace(world: &mut World, owner: Entity)
     行为：真实停止收口后销毁Entity，再通知完整目录更新；不以提前移除代替回收。
+WorkspaceState：Starting | Running | Error | Stopping，无Restarting；定义存在但无运行Entity时网络目录可投影inactive。
 
 handle_start_workspace(world: &mut World, request: StartWorkspace)
     行为：保留原reply，校验request.path及重复启动，创建Starting实体并提交启动闭包；全量reload后目标必须存在，本次定义用于初始化Workspace.definition。
 
 handle_stop_workspace(world: &mut World, request: StopWorkspace)
-    行为：仅Running时同步转Stopping；关闭新任务及成员创建受理，提交关闭闭包；否则拒绝。
+    行为：Starting/Running/Error均同步转Stopping；关闭新任务及成员创建受理，并立即取消本Workspace实际Lua执行，使未完成启动交接能收口。
+        stop_flow仍等待StartupBarrier真实完成，再按原路径停止Lua、Agent和线程；已Stopping拒绝重复提交，由原监督者等待收口。
 
 handle_restart_workspace(world: &mut World, request: RestartWorkspace)
-    行为：按request.path定位运行Entity；仅Running且所有成员均无未完成工具任务时同步转Restarting并提交重启闭包；存在未完成任务则拒绝，不先关闭成员；否则拒绝。
+    行为：按request.path定位运行Entity；仅Running/Error且所有成员均无未完成工具任务时同步转Stopping并提交重启闭包；存在未完成任务则拒绝，不先关闭成员；否则拒绝。
 
 handle_start_result(world: &mut World, result: Result<StartOutput, StartError>)
 handle_stop_result(world: &mut World, result: Result<StopOutput, StopError>)
 handle_restart_result(world: &mut World, result: Result<RestartOutput, RestartError>)
-    行为：核对完整Entity和对应状态；启动或重启成功转Running，关闭成功销毁Entity；失败清理完整时销毁，否则保留宿主；mount_executor将本次定义保存到Workspace.definition；失败时保存WorkspaceFailure，成功时清除故障，通过原oneshot回复领域结果。
+    行为：核对完整Entity和对应状态；启动或重启成功转Running，关闭成功销毁Entity；失败清理完整时销毁，否则保留宿主并转Error；mount_executor将本次定义保存到Workspace.definition；失败时保存WorkspaceFailure；成员Lua启动失败先发布Error并通过原reply返回聚合MemberFailed，不发布Running；全成功才清除旧故障并Running。
 
 ```
 
 私有：
 ```text
 start_flow(context: WorkspaceFlowContext) -> Future<Output = Result<StartOutput, StartError>>
-    行为：调用fresh_definition取得本次全量重载缓存中的定义及成员参数；失败不启动。mount_executor后start_members，不再单独读取目标文件。
+    行为：调用fresh_definition取得本次全量重载缓存中的定义；失败不启动。mount_executor后start_members，不再单独读取目标文件。
 
-fresh_definition(context: &WorkspaceFlowContext) -> Future<Output = Result<(WorkspaceDefinition, Vec<AgentStartParameters>), WorkspaceError>>
+fresh_definition(context: &WorkspaceFlowContext) -> Future<Output = Result<WorkspaceDefinition, WorkspaceError>>
     行为：owned definitions及path交blocking worker，调用reload并从返回缓存快照get目标定义；缺失明确失败，再调用prepare_definition。
 
-prepare_definition(path: &Path, definition: WorkspaceDefinition) -> Result<(WorkspaceDefinition, Vec<AgentStartParameters>), WorkspaceError>
+prepare_definition(path: &Path, definition: WorkspaceDefinition) -> Result<WorkspaceDefinition, WorkspaceError>
     行为：仅使用已从缓存取得的定义，核验成员目录和固定state.sqlite/setting.toml路径，构造原AgentStartParameters；不读取Workspace定义文件。
 
-mount_executor(context, definition, state) / start_members(context, definition, parameters)
+mount_executor(context, definition, state) / start_members(context, definition)
     行为：将本次定义保存到Workspace.definition，创建并挂载专属执行线程。
-        为每个成员分别创建独立oneshot及StartAgent，逐条发送全部事件后使用join_all并发等待所有reply。
-        一个StartAgent只携带一个成员及其参数，结果按原成员顺序收齐；任一成员失败仍等待其他成员收口。
+        为每个定义创建独立执行Entity和WorkspaceLuaTask，发送StartDriverLuaVm并保留原oneshot，join_all等待全部启动交接。
+        一个StartDriverLuaVm只携带一个程序及其注入环境，结果按原成员顺序收齐；任一Lua任务失败仍等待其他启动交接收口。
 
 stop_flow(context: WorkspaceFlowContext) -> Future<Output = Result<StopOutput, StopError>>
-    行为：等待已受理成员创建收口；逐成员发送StopAgent并等待reply，确认真实清理；通知执行线程退出并在线程外join；不销毁协调Entity。
+    行为：等待已受理创建收口，先关闭新提交并逐个停止WorkspaceLuaTask对应实际执行，等待StopDriverLuaVm原oneshot及ended；移除独立执行Entity。
+        再对直接归属Workspace的Agent发送StopAgent并等待reply，子Agent由父Agent递归清理；最后执行线程退出并在线程外join，不销毁协调Entity。
 
 restart_flow(context: WorkspaceFlowContext) -> Future<Output = Result<RestartOutput, RestartError>>
-    行为：先fresh_definition全量重载并取本次缓存定义/参数，失败不关闭旧实例；成功后stop_members_and_join，mount_executor并start_members，全程Restarting；目标从新缓存移除时通过原reply失败，原实例保持。
+    行为：先在Stopping下stop_members_and_join，旧Agent、Lua和线程真实退出，清空成员目录；转Starting后fresh_definition全量重载，mount_executor并start_members。
+        新启动失败如实记录Error，不复活旧实例或还原Running；保留协调Entity，运行资源已全部换新；不存在Restarting。
+
 
 ```
 
@@ -229,6 +237,9 @@ WorkspaceFlowContext：生命周期闭包材料
     events: RuntimeEventSender
     path: PathBuf
     definitions: WorkspaceDefinitions
+    program_root: PathBuf--Workspace定义程序的明确资源根
+    state: WorkspaceState--本次异步阶段
+    startup: Arc<StartupCompletion>--在途启动真实完成屏障
     reply: WorkspaceOperationReply
     world: WorldClosureSender
 
@@ -242,9 +253,16 @@ StartError / StopError / RestartError = FlowError
     workspace: Option<Entity>
     error: WorkspaceError
     cleanup_completed: bool
-    restore_running: bool
+    state: Option<WorkspaceState>--只允许当前匹配阶段处理失败，停止不能被旧启动结果覆盖
     reply: WorkspaceOperationReply
 
+StartupCompletion：私有共享启动完成证明
+    done: AtomicBool
+    changed: tokio::sync::Notify
+    finish(&self)：真实启动/重启Future完成后发布并通知
+    wait(&self)：先注册后检查done，停止先等待所有启动工作真实收口
+StartupBarrier(Arc<StartupCompletion>)：Component
+    行为：初始创建和重启受理安装，guarded_start/guarded_restart完成后finish；stop_flow先wait，避免晚到程序创建落在关闭快照之后。
 MemberDiagnostic：成员诊断
 ```
 
@@ -255,56 +273,16 @@ MemberDiagnostic：成员诊断
 公开：
 ```text
 
-WorkspaceUpdateContext(Arc<dyn Fn(&mut World, Entity) + Send + Sync>)
-    new(publish: impl Fn(&mut World, Entity) + Send + Sync + 'static) -> Self
-    notify(&self, world: &mut World, owner: Entity)
-    impl Clone + Resource
-WorkspaceChange
-    State(WorkspaceState) | AddMember(Entity) | Members(BTreeSet<Entity>)
-    RemoveMember(Entity) | Failure(Option<WorkspaceError>) | Definition(WorkspaceDefinition)
-DefinitionObserver = Arc<dyn Fn(Result<WorkspaceDefinitionSnapshot, WorkspaceError>) + Send + Sync>
-    行为：全量reload成功或错误经此通知owned共享视图；pre-install读取尚未观察时不发网络消息。
-
-WorkspaceState：生命周期状态，公开枚举
-    Starting
-    Running
-    Restarting
-    Stopping
-
-WorkspaceDefinitionSnapshot：全量重载成功后的不可变缓存快照，公开纯值类型
-    entries: Arc<BTreeMap<PathBuf, WorkspaceDefinition>>
-    get(&self, path: &Path) -> Option<&WorkspaceDefinition>
-        行为：按规范路径借用本次已发布定义，不回源文件，不借用可变目录锁。
-    list(&self) -> Vec<(PathBuf, WorkspaceDefinition)>
-        行为：按路径顺序克隆本次快照全部条目。
-
-WorkspaceDefinition：持久定义，公开类型
-    name: String
-    project_root: PathBuf
-    members: Vec<WorkspaceMemberDefinition>
-
-WorkspaceMemberDefinition：成员定义，公开类型
-    name: String
-    driver: String
-    home_root: PathBuf
-
-WorkspaceOperationOutput
+WorkspaceLuaTask（lua_runtime_core组件）
     workspace: Entity
-    members: Vec<Entity>
-    member_errors: Vec<MemberDiagnostic>
+    name: String
+    行为：管理Workspace定义自动启动的Lua执行实体；与Workspace所属Agent列表分开。停止先关闭新增创建受理，取消所属执行并真实等待，再排空所属Agent及执行线程。
+WorkspaceMemberDefinition
+    name: String
+    driver: String--公开程序locator，解析到base.lua，不要求manifest
+    home_root: PathBuf
+    行为：不预创建Agent；Workspace准备读取沿read_driver原预算及blocking worker，注入workspace/name/resource_dir，公共Lua创建方法按需发送StartAgent。
 
-WorkspaceExecutionEntry：线程任务提交能力，公开可克隆类型
-    submit(&self, task: impl FnOnce() -> LocalFuture + Send + 'static) -> Result<(), WorkspaceError>
-        行为：检查受理门并入队，在专属线程创建和运行可非Send的Future。
-    close_admission(&self)
-        行为：同步关闭普通任务提交，不停止已有任务。
-
-WorkspaceExecutionClose：线程关闭能力，公开类型
-    close_and_join(&self) -> Future<Output = Result<(), WorkspaceError>>
-        行为：通知线程退出并异步等待join；失败返回真实线程错误。
-
-spawn_workspace_executor() -> Result<WorkspaceExecutor, WorkspaceError>
-    行为：创建专属线程和本地异步执行环境，返回控制组件。
 ```
 
 # error

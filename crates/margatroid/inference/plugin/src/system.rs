@@ -1,7 +1,6 @@
 use app_runtime_plugin::WorldEventExt;
 use core_plugin::World;
 use inference_core::{ActiveInference, InferenceRequest, InitInference};
-use lua_runtime_core::{DriverLuaVm, WorldLuaRuntimeExt};
 
 use crate::types::{InferenceCleanupFinished, InferenceLaunchError, InferenceLaunchOutput};
 
@@ -44,11 +43,7 @@ pub(crate) fn inference_system(world: &mut World) {
 }
 
 pub(crate) fn handle_cleanup_finished(world: &mut World, cleanup: InferenceCleanupFinished) {
-    if cleanup.instance.owner != cleanup.agent
-        || !world
-            .get_component::<DriverLuaVm>(cleanup.agent)
-            .is_some_and(|vm| vm.instance == cleanup.instance)
-    {
+    if !cleanup.source.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
     let Some(handle) = world
@@ -64,5 +59,7 @@ pub(crate) fn handle_cleanup_finished(world: &mut World, cleanup: InferenceClean
         world.send_event_after(cleanup, 1);
         return;
     }
-    let _ = world.driver_wake(&cleanup.instance);
+    if let Some(slot) = world.get_component::<lua_runtime_core::AgentWaitSlot>(cleanup.agent) {
+        let _ = slot.0.lock().unwrap_or_else(|e| e.into_inner()).wake();
+    }
 }

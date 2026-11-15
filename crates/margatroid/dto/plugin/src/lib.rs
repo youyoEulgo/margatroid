@@ -1,3 +1,5 @@
+mod runtime_logs;
+pub use runtime_logs::runtime_log_probe;
 mod handler;
 mod probes;
 mod workspaces;
@@ -53,6 +55,11 @@ impl Plugin for DtoPlugin {
         let agent_context = probes::get_or_create_agent_context(app.world_mut());
         probes::install_resource_bindings(app.world_mut(), agent_context);
         let state = DtoState {
+            logs: app
+                .world()
+                .get_resource::<storage_core::RuntimeLogStore>()
+                .expect("persistent diagnostic store is required")
+                .clone(),
             ingress: app
                 .world()
                 .get_resource::<MargatroidConfig>()

@@ -21,7 +21,7 @@ margatroid
 └── task：return_result、finish、append_output、replace_output、read_output、send、receive
 ```
 
-上下文只有一个入口margatroid.context；arguments收进其中，version不再向脚本公开，null归data。公共方法按操作对象分组；Driver协调、工具定义与执行任务分别使用driver、tools、task。子对象只读，错误身份调用明确失败，不持有另一方实际回调。configure只读元数据，执行确认前不开放IO或其他方法，不保留旧名称别名。
+上下文只有一个入口margatroid.context；arguments收进其中，version不再向脚本公开，null归data。公共方法按操作对象分组，mcl、agent、workspace、tools、task在自动执行和工具调用中同等开放。子对象只读，缺少实际目标或执行能力明确失败。configure只读元数据，执行确认前不开放IO或其他方法，不保留旧名称别名。
 
 files:read返回完整原始字节，write仅写指定路径，不创建父目录。create_directory(path,recursive)显式负责目录创建。info合并原属性查询和规范路径解析，返回path、resolved_path、kind、size及modified_at_ns；path是查询项的绝对路径，kind描述其自身，resolved_path才是链接目标，失效链接可为空。list只列直接子项，返回name及同样信息，不递归或隐式过滤。所有操作服从当前执行环境权限；路径解析不代替沙箱，查询再读取也不承诺无竞态。
 
@@ -190,3 +190,10 @@ local output = margatroid.task:read_output(owner)
 ```
 
 read_output/send/finish仍可用字符串选择当前Agent任务；结构化引用支持同Workspace其他Agent。自身finish保留worker本地退出路径，不能等待自己。
+
+
+当前工作树已实现统一Lua：复用既有资源挂载、Storage、MCL队列、任务监督、进程回收及同步入口。Workspace先启动独立Lua任务；Agent创建由公共Lua注入能力提交StartAgent，Agent不再启动/持有/终止Lua VM。执行者与目标分开，Agent归属Workspace或父Agent，配置按明确初值文件初始化持久化，UI按创建时传入目录直接监控，模型通过EFFECT model_set配置。公共mcl.execute指定目标，wait(agent)登记本次唤醒句柄；关闭Agent使用margatroid.agent:stop(address)注入方法提交原StopAgent并外部监督，不经过MCL。EFFECT tool_call只接收调用数组。Driver专用manifest依赖裁剪取消；工具发现元数据保持。初始化/委托/子代理应用未实现；前端源码不在本轮修改范围内。
+
+四态契约：Agent/Workspace公开starting、running、error、stopping；Agent挂载完成不是ready，MCL允许starting/running，推理和工具仅running且有效turn。Lua创建的Agent在返回信息前绑定实际执行实例与AgentSession监控；执行异常真实收口后写Agent日志，原提交探针直投Clients，再通过AgentException发布error，正常结束和取消不误报故障，旧会话解绑。关闭使用Lua agent.stop注入，不提供MCL agent_stop。
+
+Agent创建注入接口为owner/name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。

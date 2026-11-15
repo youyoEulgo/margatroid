@@ -9,7 +9,7 @@ fn agent(world: &mut World) -> core_plugin::Entity {
         agent_core::Agent::new(
             "coder".into(),
             workspace,
-            AgentState::Idle,
+            AgentState::Running,
             None,
             crate::test_agent_context(),
         ),
@@ -22,7 +22,11 @@ fn turn_admission_changes_state_synchronously_and_never_overwrites() {
     let mut world = World::new();
     let entity = agent(&mut world);
     let turn = world.agent_start_turn(entity).unwrap();
-    assert_eq!(*world.agent_state(entity).unwrap(), AgentState::Working);
+    assert!(
+        world.agent_ready(entity).is_err(),
+        "ready must not clear an active turn"
+    );
+    assert_eq!(*world.agent_state(entity).unwrap(), AgentState::Running);
     assert_eq!(
         world.agent_start_turn(entity).unwrap_err().kind,
         AgentErrorKind::StateRejected
@@ -37,8 +41,8 @@ fn turn_admission_changes_state_synchronously_and_never_overwrites() {
     );
     assert!(world.agent_finish_turn(entity, "stale").is_err());
     world.agent_finish_turn(entity, &turn).unwrap();
-    assert_eq!(*world.agent_state(entity).unwrap(), AgentState::Idle);
-    assert!(world.agent_finish_turn(entity, &turn).is_err());
+    assert_eq!(*world.agent_state(entity).unwrap(), AgentState::Running);
+    world.agent_finish_turn(entity, &turn).unwrap();
 }
 
 #[test]
@@ -47,7 +51,7 @@ fn abort_clears_turn_but_keeps_working_until_driver_finishes() {
     let entity = agent(&mut world);
     let turn = world.agent_start_turn(entity).unwrap();
     world.agent_abort_turn(entity, &turn).unwrap();
-    assert_eq!(*world.agent_state(entity).unwrap(), AgentState::Working);
+    assert_eq!(*world.agent_state(entity).unwrap(), AgentState::Running);
     assert!(world
         .get_component::<Agent>(entity)
         .unwrap()
@@ -55,7 +59,7 @@ fn abort_clears_turn_but_keeps_working_until_driver_finishes() {
         .is_none());
     assert!(world.agent_abort_turn(entity, &turn).is_err());
     world.agent_finish_turn(entity, &turn).unwrap();
-    assert_eq!(*world.agent_state(entity).unwrap(), AgentState::Idle);
+    assert_eq!(*world.agent_state(entity).unwrap(), AgentState::Running);
 }
 
 #[test]
@@ -64,7 +68,7 @@ fn lifecycle_states_reject_turn_operations_and_old_entities_do_not_resolve() {
     let entity = agent(&mut world);
     for state in [
         AgentState::Starting,
-        AgentState::Restarting,
+        AgentState::Error,
         AgentState::Stopping,
     ] {
         world.agent_transition(entity, state, None).unwrap();

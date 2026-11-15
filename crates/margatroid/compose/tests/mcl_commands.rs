@@ -55,6 +55,8 @@ struct Fixture {
     next: usize,
     inference: Arc<Mutex<Vec<InferenceRequest>>>,
     auto_inference: Arc<AtomicBool>,
+    inference_submissions: Arc<Mutex<Vec<InferenceRequest>>>,
+    tool_submissions: Arc<Mutex<Vec<ToolExecuteRequest>>>,
     tools: Arc<Mutex<Vec<ToolExecuteRequest>>>,
     tool_error: Arc<Mutex<Option<tool_core::ToolError>>>,
     tool_modes: Arc<Mutex<std::collections::BTreeMap<String, u8>>>,
@@ -80,7 +82,10 @@ impl Fixture {
             .add_plugin(StoragePlugin::new())
             .add_plugin(MclPlugin::new().with_import_config(roots));
         let workspace = app.world_mut().spawn();
-        app.world_mut().insert_component(workspace,address::Address::new("workspace:test/unit").unwrap());
+        app.world_mut().insert_component(
+            workspace,
+            address::Address::new("workspace:test/unit").unwrap(),
+        );
         let owner = app.world_mut().spawn();
         let client = app.world_mut().spawn();
         app.world_mut().insert_component(
@@ -103,12 +108,16 @@ impl Fixture {
             agent_core::Agent::new(
                 "test".into(),
                 workspace,
-                AgentState::Idle,
+                AgentState::Running,
                 None,
                 crate::test_agent_context(),
             ),
         );
         app.world_mut().insert_component(owner, MclQueue::default());
+        app.world_mut()
+            .insert_component(owner, agent_core::AgentSession::new());
+        app.world_mut()
+            .insert_component(owner, lua_runtime_core::AgentWaitSlot::default());
         app.world_mut().insert_component(
             owner,
             inference_core::AgentInferenceConfig::new(
@@ -127,6 +136,8 @@ impl Fixture {
         app.world_mut().insert_component(owner, test_tasks());
         let inference = Arc::new(Mutex::new(Vec::new()));
         let recorded = inference.clone();
+        let inference_submissions = Arc::new(Mutex::new(Vec::new()));
+        let submitted = inference_submissions.clone();
         let auto_inference = Arc::new(AtomicBool::new(true));
         let automatic = auto_inference.clone();
         app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
@@ -136,6 +147,20 @@ impl Fixture {
                 .cloned()
                 .collect::<Vec<_>>();
             for request in requests {
+                submitted.lock().unwrap().push(request.clone());
+                if world
+                    .get_component::<Agent>(request.agent)
+                    .is_none_or(|agent| {
+                        agent.state() != AgentState::Running
+                            || request.turn.is_empty()
+                            || agent.turn().as_deref() != Some(request.turn.as_str())
+                    })
+                {
+                    if let Some(sender) = request.reply.lock().unwrap().take() {
+                        let _ = sender.send(Ok(InferenceResponse::empty_completed()));
+                    }
+                    continue;
+                }
                 recorded.lock().unwrap().push(request.clone());
                 if automatic.load(Ordering::Acquire)
                     && let Some(sender) = request.reply.lock().unwrap().take()
@@ -150,6 +175,8 @@ impl Fixture {
         let tool_modes = Arc::new(Mutex::new(std::collections::BTreeMap::<String, u8>::new()));
         let configured_modes = tool_modes.clone();
         let recorded = tools.clone();
+        let tool_submissions = Arc::new(Mutex::new(Vec::new()));
+        let submitted = tool_submissions.clone();
         app.add_system(RuntimePlugin::UPDATE, move |world: &mut World| {
             let requests = world
                 .event_reader::<ToolExecuteRequest>()
@@ -157,6 +184,39 @@ impl Fixture {
                 .cloned()
                 .collect::<Vec<_>>();
             for request in requests {
+                submitted.lock().unwrap().push(request.clone());
+                if world
+                    .get_component::<Agent>(request.agent)
+                    .is_none_or(|agent| {
+                        agent.state() != AgentState::Running
+                            || request.turn.is_empty()
+                            || agent.turn().as_deref() != Some(request.turn.as_str())
+                    })
+                {
+                    if let Some(sender) = request.reply.lock().unwrap().take() {
+                        let _ = sender.send(Ok(ToolExecuteResponse::aborted(
+                            request.call_id.clone(),
+                            request.alias.clone(),
+                        )));
+                    }
+                    continue;
+                }
+                if world
+                    .get_component::<Tools>(request.agent)
+                    .and_then(|tools| tools.get(&request.alias))
+                    .is_none()
+                {
+                    if let Some(sender) = request.reply.lock().unwrap().take() {
+                        let _ = sender.send(Ok(ToolExecuteResponse {
+                            call_id: request.call_id.clone(),
+                            alias: request.alias.clone(),
+                            content: "tool is not imported".into(),
+                            images: Vec::new(),
+                            failed: true,
+                        }));
+                    }
+                    continue;
+                }
                 recorded.lock().unwrap().push(request.clone());
                 if let Some(mode) = configured_modes
                     .lock()
@@ -331,6 +391,8 @@ impl Fixture {
             next: 0,
             inference,
             auto_inference,
+            inference_submissions,
+            tool_submissions,
             tools,
             tool_error,
             tool_modes,
@@ -363,6 +425,26 @@ impl Fixture {
         text: &str,
         arguments: Vec<Value>,
     ) -> oneshot::Receiver<Result<MclValue, MclError>> {
+        let arguments = if text == "EFFECT tool_call ?" {
+            arguments
+                .into_iter()
+                .map(|value| {
+                    // Fixtures construct assistant results; the caller explicitly unwraps calls before dispatch.
+                    if let Some(messages) = value.as_array()
+                        && let [message] = messages.as_slice()
+                        && message["type"] == "assistant"
+                    {
+                        return message
+                            .get("tool_calls")
+                            .cloned()
+                            .unwrap_or_else(|| json!([]));
+                    }
+                    value
+                })
+                .collect()
+        } else {
+            arguments
+        };
         let (sender, receiver) = oneshot::channel();
         self.app.world().send_event(MclCommand {
             id,
@@ -392,6 +474,12 @@ impl Fixture {
     }
 
     fn vm(&mut self, id: &str) -> oneshot::Receiver<Result<(), LuaRuntimeError>> {
+        self.app
+            .world_mut()
+            .insert_component(self.owner, agent_core::AgentSession(id.to_owned()));
+        let slot = lua_runtime_core::AgentWaitSlot::default();
+        let wake = slot.0.clone();
+        self.app.world_mut().insert_component(self.owner, slot);
         let (sender, ready) = oneshot::channel();
         let (_sender, ended) = oneshot::channel();
         self.app.world_mut().insert_component(
@@ -401,7 +489,7 @@ impl Fixture {
                     owner: self.owner,
                     start_id: id.into(),
                 },
-                wake: DriverWakeSlot::shared(),
+                wake,
                 ready: Arc::new(Mutex::new(Some(sender))),
                 ended: Some(ended),
                 cancel: CancellationToken::new(),
@@ -712,16 +800,6 @@ async fn imports_validate_dependencies_kind_and_cross_category_aliases_and_rerea
     fs::create_dir_all(&sandbox).unwrap();
     fs::write(sandbox.join("policy.json"), "{}").unwrap();
     fixture
-        .app
-        .world_mut()
-        .get_component_mut::<MclQueue>(fixture.owner)
-        .unwrap()
-        .allowed_imports = vec![
-        "prompt:local/soul".into(),
-        "tool:local/bash:latest".into(),
-        "sandbox:local/policy".into(),
-    ];
-    fixture
         .command("IMPORT MESSAGE prompt:local/soul:latest AS soul", vec![])
         .await
         .unwrap();
@@ -856,7 +934,7 @@ async fn inference_converts_legacy_message_shapes_and_preserves_unknown_stop_rea
             .get_component::<Agent>(fixture.owner)
             .unwrap()
             .state(),
-        AgentState::Idle
+        AgentState::Running
     );
 }
 
@@ -939,7 +1017,7 @@ async fn real_http_unknown_tool_is_preserved_then_fails_current_tool_admission()
 }
 
 #[tokio::test]
-async fn no_turn_returns_normal_completed_results_without_submitting_domains() {
+async fn no_turn_is_dispatched_to_domains_and_rejected_by_their_admission() {
     let mut fixture = Fixture::new();
     let result = fixture
         .command("EFFECT inference ?", vec![json!([user("question")])])
@@ -948,6 +1026,7 @@ async fn no_turn_returns_normal_completed_results_without_submitting_domains() {
     assert!(
         matches!(result, MclValue::Inference { stop_reason, .. } if stop_reason == "completed")
     );
+    assert_eq!(fixture.inference_submissions.lock().unwrap().len(), 1);
     let calls = json!([{"type": "assistant", "content": null, "tool_calls": [{"id": "call", "tool_name": "bash", "arguments": "{}"}]}]);
     let result = messages(
         fixture
@@ -959,6 +1038,7 @@ async fn no_turn_returns_normal_completed_results_without_submitting_domains() {
     assert_eq!(result[0]["tool_call_id"], "call");
     assert!(fixture.inference.lock().unwrap().is_empty());
     assert!(fixture.tools.lock().unwrap().is_empty());
+    assert_eq!(fixture.tool_submissions.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1086,7 +1166,7 @@ async fn batch_collects_forced_abort_and_returned_background_replies_without_los
             .get_component::<Agent>(fixture.owner)
             .unwrap()
             .state(),
-        AgentState::Idle
+        AgentState::Running
     );
     assert!(!pending.is_cleanup_complete());
     assert!(tasks.get(&requests[1].id).is_ok());
@@ -1123,7 +1203,7 @@ async fn fifo_waits_for_domain_reply_while_other_agents_keep_progressing() {
         agent_core::Agent::new(
             "other".into(),
             workspace,
-            AgentState::Idle,
+            AgentState::Running,
             None,
             crate::test_agent_context(),
         ),
@@ -1214,58 +1294,42 @@ async fn closing_queue_cancels_domain_and_waits_for_reply_before_drain() {
 }
 
 #[tokio::test]
-async fn ready_requires_current_self_vm_and_wake_uses_current_slot() {
+async fn ready_targets_agent_and_wake_consumes_the_agent_wait_slot_without_a_vm() {
     let mut fixture = Fixture::new();
-    let ready = fixture.vm("current");
     fixture
         .app
         .world_mut()
         .agent_transition(fixture.owner, AgentState::Starting, None)
         .unwrap();
+    fixture.command("EFFECT ready", vec![]).await.unwrap();
     assert_eq!(
-        fixture.command("EFFECT ready", vec![]).await.error_kind(),
-        MclErrorKind::SourceInvalid
+        fixture
+            .app
+            .world()
+            .get_component::<Agent>(fixture.owner)
+            .unwrap()
+            .state(),
+        AgentState::Running
     );
-    let mut stale = fixture.enqueue_as(
-        "stale".into(),
-        fixture.owner,
-        Some("old".into()),
-        fixture.owner,
-        "EFFECT ready",
-        vec![],
+    assert!(
+        fixture
+            .app
+            .world()
+            .get_component::<DriverLuaVm>(fixture.owner)
+            .is_none()
     );
-    assert_eq!(
-        drive(&mut fixture.app, &mut stale).await.error_kind(),
-        MclErrorKind::SourceInvalid
-    );
-    let mut valid = fixture.enqueue_as(
-        "ready".into(),
-        fixture.owner,
-        Some("current".into()),
-        fixture.owner,
-        "EFFECT ready",
-        vec![],
-    );
-    drive(&mut fixture.app, &mut valid).await.unwrap();
-    ready.await.unwrap().unwrap();
-    fixture
-        .app
-        .world_mut()
-        .agent_transition(fixture.owner, AgentState::Idle, None)
-        .unwrap();
     fixture.command("EFFECT wake", vec![]).await.unwrap();
     let slot = fixture
         .app
         .world()
-        .get_component::<DriverLuaVm>(fixture.owner)
+        .get_component::<AgentWaitSlot>(fixture.owner)
         .unwrap()
-        .wake
+        .0
         .clone();
     DriverWakeSlot::wait(slot).await.unwrap();
 }
-
 #[tokio::test]
-async fn finish_turn_reports_running_inference_and_keeps_abort_control() {
+async fn finish_turn_waits_for_real_inference_cleanup_and_keeps_abort_control() {
     let mut fixture = Fixture::new();
     fixture.command("EFFECT start_turn", vec![]).await.unwrap();
     let turn = fixture
@@ -1296,9 +1360,13 @@ async fn finish_turn_reports_running_inference_and_keeps_abort_control() {
         }),
     ));
     let mut reply = fixture.enqueue("EFFECT finish_turn", vec![]);
-    assert_eq!(
-        drive(&mut fixture.app, &mut reply).await.error_kind(),
-        MclErrorKind::EffectFailed
+    for _ in 0..10 {
+        fixture.app.tick();
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        reply.try_recv().is_err(),
+        "finish_turn returned before real cleanup"
     );
     assert_eq!(
         fixture
@@ -1307,7 +1375,7 @@ async fn finish_turn_reports_running_inference_and_keeps_abort_control() {
             .get_component::<Agent>(fixture.owner)
             .unwrap()
             .state(),
-        AgentState::Working
+        AgentState::Running
     );
     fixture
         .app
@@ -1327,7 +1395,7 @@ async fn finish_turn_reports_running_inference_and_keeps_abort_control() {
     release.send(()).unwrap();
     tokio::task::yield_now().await;
     assert_eq!(
-        fixture.command("EFFECT finish_turn", vec![]).await.unwrap(),
+        drive(&mut fixture.app, &mut reply).await.unwrap(),
         MclValue::Unit
     );
     assert_eq!(
@@ -1337,7 +1405,7 @@ async fn finish_turn_reports_running_inference_and_keeps_abort_control() {
             .get_component::<Agent>(fixture.owner)
             .unwrap()
             .state(),
-        AgentState::Idle
+        AgentState::Running
     );
     assert!(
         fixture
@@ -1468,7 +1536,7 @@ async fn reusing_a_completed_request_id_creates_distinct_background_task_address
 }
 
 #[tokio::test]
-async fn inference_error_and_finish_turn_return_values_before_cleanup_completes() {
+async fn inference_error_is_a_value_and_finish_turn_waits_for_cleanup() {
     for kind in [
         InferenceErrorKind::RequestFailed,
         InferenceErrorKind::ResponseStatus,
@@ -1523,12 +1591,16 @@ async fn inference_error_and_finish_turn_return_values_before_cleanup_completes(
                 .get_component::<Agent>(fixture.owner)
                 .unwrap()
                 .state(),
-            AgentState::Working
+            AgentState::Running
         );
         let mut finish = fixture.enqueue("EFFECT finish_turn", vec![]);
-        assert_eq!(
-            drive(&mut fixture.app, &mut finish).await.error_kind(),
-            MclErrorKind::EffectFailed
+        for _ in 0..10 {
+            fixture.app.tick();
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            finish.try_recv().is_err(),
+            "finish_turn completed before cleanup"
         );
         assert_eq!(
             fixture
@@ -1537,7 +1609,7 @@ async fn inference_error_and_finish_turn_return_values_before_cleanup_completes(
                 .get_component::<Agent>(fixture.owner)
                 .unwrap()
                 .state(),
-            AgentState::Working
+            AgentState::Running
         );
         let active = fixture
             .app
@@ -1553,7 +1625,7 @@ async fn inference_error_and_finish_turn_return_values_before_cleanup_completes(
         release.send(()).unwrap();
         tokio::task::yield_now().await;
         assert_eq!(
-            fixture.command("EFFECT finish_turn", vec![]).await.unwrap(),
+            drive(&mut fixture.app, &mut finish).await.unwrap(),
             MclValue::Unit
         );
         let agent = fixture
@@ -1561,7 +1633,7 @@ async fn inference_error_and_finish_turn_return_values_before_cleanup_completes(
             .world()
             .get_component::<Agent>(fixture.owner)
             .unwrap();
-        assert_eq!(agent.state(), AgentState::Idle);
+        assert_eq!(agent.state(), AgentState::Running);
         assert!(agent.turn().is_none());
         assert!(
             fixture
@@ -1594,7 +1666,7 @@ async fn inference_error_does_not_finish_a_replacement_turn() {
         .world_mut()
         .agent_transition(
             fixture.owner,
-            AgentState::Working,
+            AgentState::Running,
             Some("replacement".into()),
         )
         .unwrap();
@@ -1621,132 +1693,177 @@ async fn inference_error_does_not_finish_a_replacement_turn() {
         .world()
         .get_component::<Agent>(fixture.owner)
         .unwrap();
-    assert_eq!(agent.state(), AgentState::Working);
+    assert_eq!(agent.state(), AgentState::Running);
     assert_eq!(agent.turn().as_deref(), Some("replacement"));
 }
 
 #[tokio::test]
-async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_message() {
+async fn bundled_drivers_log_inference_mcl_errors_and_exit_without_faking_turn_cleanup() {
     for source in [
         include_str!("../../../../resources/agent-drivers/local/coder/latest/base.lua"),
         include_str!("../../../../resources/agent-drivers/local/reviewer/latest/base.lua"),
     ] {
-        let mut fixture = Fixture::new();
-        fixture.auto_inference.store(false, Ordering::Release);
-        fixture.app.add_plugin(LuaRuntimePlugin::new());
-        let workspace = fixture
-            .app
-            .world()
-            .get_component::<Agent>(fixture.owner)
-            .unwrap()
-            .workspace();
-        fixture.app.world_mut().insert_component(
-            workspace,
-            workspace_core::Workspace::new(
-                "bundled-driver".into(),
-                fixture.root.path().join("workspace.yaml"),
-                fixture.root.path().to_owned(),
-                workspace_core::WorkspaceState::Running,
-                Default::default(),
-                None,
-                crate::test_workspace_context(),
-            ),
-        );
-        let executor = workspace_core::spawn_workspace_executor().unwrap();
-        let close = executor.close.clone();
-        fixture
-            .app
-            .world_mut()
-            .insert_component(workspace, executor);
-        // Use the bundled Driver unchanged; fake only resource imports and inference.
-        let mut allowed = Vec::new();
-        for line in source
-            .lines()
-            .map(str::trim_start)
-            .filter(|line| line.starts_with("command(\"IMPORT "))
-        {
-            let address = line.split_whitespace().nth(2).unwrap();
-            allowed.push(address.to_owned());
-            let (kind, rest) = address.split_once(':').unwrap();
-            let (name, version) = rest.rsplit_once(':').unwrap();
-            let root = match kind {
-                "prompt" => "prompts",
-                "tool" => "tools",
-                "sandbox" => "sandboxes",
-                _ => unreachable!(),
-            };
-            let directory = fixture.root.path().join(root).join(name).join(version);
-            fs::create_dir_all(&directory).unwrap();
-            match kind {
-                "prompt" => {
-                    fs::write(directory.join("prompt.toml"), "role='system'\n").unwrap();
-                    fs::write(directory.join("content.md"), "test instructions").unwrap();
-                }
-                "tool" => {
-                    fs::write(
-                        directory.join("tool.toml"),
-                        "schema_version=1\ndescription='test tool'\n",
-                    )
-                    .unwrap();
-                    fs::write(directory.join("input.schema.json"), "{}").unwrap();
-                    fs::write(directory.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() margatroid.task:return_result('test') end").unwrap();
-                }
-                "sandbox" => fs::write(directory.join("policy.json"), "{}").unwrap(),
-                _ => unreachable!(),
-            }
-        }
-        fixture
-            .app
-            .world_mut()
-            .get_component_mut::<MclQueue>(fixture.owner)
-            .unwrap()
-            .allowed_imports = allowed;
-        for key in ["sandbox"] {
+        for kind in [
+            InferenceErrorKind::RequestFailed,
+            InferenceErrorKind::ResponseStatus,
+            InferenceErrorKind::Timeout,
+            InferenceErrorKind::CleanupFailed,
+        ] {
+            let mut fixture = Fixture::new();
+            fixture.auto_inference.store(false, Ordering::Release);
+            fixture.app.add_plugin(LuaRuntimePlugin::new());
+            let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal = exited.clone();
+            fixture.app.add_system(
+                RuntimePlugin::UPDATE,
+                move |world: &mut core_plugin::World| {
+                    if world
+                        .event_reader::<lua_runtime_core::DriverLuaVmExited>()
+                        .into_iter()
+                        .next()
+                        .is_some()
+                    {
+                        signal.store(true, Ordering::Release);
+                    }
+                },
+            );
+
+            tool_plugin::install_lua_services(&mut fixture.app);
             fixture
-                .command("CONFIG SET ? ?", vec![json!(key), json!([])])
+                .app
+                .world_mut()
+                .insert_resource(inference_core::ModelRoutes::new(
+                    std::collections::BTreeMap::from([(
+                        "test/model".into(),
+                        ModelRoute {
+                            model: "test".into(),
+                            provider: "test".into(),
+                            api_type: "chat_completions".into(),
+                            base_url: "http://unused".into(),
+                            api_key: String::new(),
+                            context_window_tokens: 4096,
+                            thinking: None,
+                            reasoning_effort: None,
+                        },
+                    )]),
+                ));
+            fixture
+                .command(
+                    "CONFIG SET ? ?",
+                    vec![json!("inference"), json!({"model":"test/model"})],
+                )
                 .await
                 .unwrap();
-        }
-        fixture
-            .app
-            .world_mut()
-            .agent_transition(fixture.owner, AgentState::Starting, None)
-            .unwrap();
-        let environment = LuaEnvironment {
+            let workspace = fixture
+                .app
+                .world()
+                .get_component::<Agent>(fixture.owner)
+                .unwrap()
+                .workspace();
+            fixture.app.world_mut().insert_component(
+                workspace,
+                workspace_core::Workspace::new(
+                    "bundled-driver".into(),
+                    fixture.root.path().join("workspace.yaml"),
+                    fixture.root.path().to_owned(),
+                    workspace_core::WorkspaceState::Running,
+                    Default::default(),
+                    None,
+                    crate::test_workspace_context(),
+                ),
+            );
+            let executor = workspace_core::spawn_workspace_executor().unwrap();
+            let close = executor.close.clone();
+            fixture
+                .app
+                .world_mut()
+                .insert_component(workspace, executor);
+            // Use the bundled Driver unchanged; fake only resource imports and inference.
+            for line in source
+                .lines()
+                .map(str::trim_start)
+                .filter(|line| line.contains("\"IMPORT "))
+            {
+                let address = line
+                    .split("\"IMPORT ")
+                    .nth(1)
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let (kind, rest) = address.split_once(':').unwrap();
+                let (name, version) = rest.rsplit_once(':').unwrap();
+                let root = match kind {
+                    "prompt" => "prompts",
+                    "tool" => "tools",
+                    "sandbox" => "sandboxes",
+                    _ => unreachable!(),
+                };
+                let directory = fixture.root.path().join(root).join(name).join(version);
+                fs::create_dir_all(&directory).unwrap();
+                match kind {
+                    "prompt" => {
+                        fs::write(directory.join("prompt.toml"), "role='system'\n").unwrap();
+                        fs::write(directory.join("content.md"), "test instructions").unwrap();
+                    }
+                    "tool" => {
+                        fs::write(
+                            directory.join("tool.toml"),
+                            "schema_version=1\ndescription='test tool'\n",
+                        )
+                        .unwrap();
+                        fs::write(directory.join("input.schema.json"), "{}").unwrap();
+                        fs::write(directory.join("main.lua"), "function configure(arguments, context) return {timeout_ms=30000} end\nfunction execute() margatroid.task:return_result('test') end").unwrap();
+                    }
+                    "sandbox" => fs::write(directory.join("policy.json"), "{}").unwrap(),
+                    _ => unreachable!(),
+                }
+            }
+            for key in ["sandbox"] {
+                fixture
+                    .command("CONFIG SET ? ?", vec![json!(key), json!([])])
+                    .await
+                    .unwrap();
+            }
+            fixture
+                .app
+                .world_mut()
+                .agent_transition(fixture.owner, AgentState::Starting, None)
+                .unwrap();
+            let environment = LuaEnvironment {
             globals: std::collections::BTreeMap::from([("agent_info".into(), LuaBinding::Value(LuaValue::from_json(json!({
                 "entity": {"index": fixture.owner.index(), "generation": fixture.owner.generation()},
                 "model": {"context_window_tokens": 4096}
             })).unwrap()))]),
             modules: Default::default(),
         };
-        let (sender, mut started) = oneshot::channel();
-        fixture.app.world().send_event(StartDriverLuaVm {
+            let (sender, mut started) = oneshot::channel();
+            fixture.app.world().send_event(StartDriverLuaVm {
             owner: fixture.owner,
             workspace,
             program: LuaProgram {
-                source: source.into(),
+                source: source.replace("local agent = margatroid.agent:create({\n        owner = context.workspace.address,\n        name = context.name,\n        config_path = context.resource_dir .. \"/setting.toml\",\n        ui_path = context.resource_dir .. \"/ui\",\n    })", "local agent = {address='agent:local/test:latest'}"),
                 origin: "bundled-driver".into(),
-                libraries: LuaStandardLibraries::Minimal,
+
             },
             environment,
             reply: Arc::new(Mutex::new(Some(sender))),
         });
-        let instance = drive(&mut fixture.app, &mut started).await.unwrap();
-        fixture
-            .app
-            .world_mut()
-            .agent_transition(fixture.owner, AgentState::Idle, None)
-            .unwrap();
-        for (index, kind) in [
-            Some(InferenceErrorKind::RequestFailed),
-            Some(InferenceErrorKind::ResponseStatus),
-            Some(InferenceErrorKind::Timeout),
-            Some(InferenceErrorKind::CleanupFailed),
-            None,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+            let instance = drive(&mut fixture.app, &mut started).await.unwrap();
+            fixture
+                .app
+                .world_mut()
+                .agent_transition(fixture.owner, AgentState::Running, None)
+                .unwrap();
+            let waiting = fixture
+                .app
+                .world()
+                .get_component::<AgentWaitSlot>(fixture.owner)
+                .unwrap()
+                .0
+                .clone();
+            tick_until(&mut fixture.app, || waiting.lock().unwrap().is_waiting()).await;
+            let index = 0;
             fixture
                 .command(
                     "INJECT ? TO entry.pending[-1]",
@@ -1779,59 +1896,60 @@ async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_
                     waiting.await.unwrap();
                 }),
             ));
-            let failure = kind.map(|kind| InferenceError::new(kind, "safe inference failure"));
             request
                 .reply
                 .lock()
                 .unwrap()
                 .take()
                 .unwrap()
-                .send(match &failure {
-                    Some(failure) => Err(failure.clone()),
-                    None => Ok(response()),
-                })
+                .send(Err(InferenceError::new(kind, "safe inference failure")))
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 fixture.app.tick();
-                let persisted = fixture.history().iter().any(|record| {
-                    record.kind == "message"
-                        && match &failure {
-                            Some(failure) => {
-                                record.payload["type"] == "error"
-                                    && record.payload["message"]
-                                        == format!("EffectFailed: {failure}")
-                                    && record.payload["request_id"] == request.id
-                                    && record.payload["sequence"].as_u64().is_some()
-                            }
-                            None => {
-                                record.payload["type"] == "assistant"
-                                    && record.payload["request_id"] == request.id
-                                    && record.payload["content"] == "response"
-                            }
-                        }
-                });
-                if persisted {
+                if exited.load(Ordering::Acquire) {
                     break;
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "Driver did not persist inference result {kind:?} and settle its turn"
+                    "Driver did not exit for {kind:?}"
                 );
                 tokio::task::yield_now().await;
             }
-            // Give the Driver time to execute its real finish_turn command.
-            for _ in 0..30 {
-                fixture.app.tick();
-                tokio::task::yield_now().await;
-            }
-            let agent = fixture
-                .app
-                .world()
-                .get_component::<Agent>(fixture.owner)
-                .unwrap();
-            assert_eq!(agent.state(), AgentState::Working);
-            assert_eq!(agent.turn().as_deref(), Some(request.turn.as_str()));
+            assert_eq!(
+                fixture
+                    .app
+                    .world()
+                    .get_component::<Agent>(fixture.owner)
+                    .unwrap()
+                    .state(),
+                AgentState::Running
+            );
+            assert!(
+                !fixture
+                    .history()
+                    .iter()
+                    .any(|record| record.kind == "message" && record.payload["type"] == "error")
+            );
+            let logs = storage_core::read_agent_logs(
+                fixture
+                    .app
+                    .world()
+                    .get_component::<storage_core::AgentStorage>(fixture.owner)
+                    .unwrap(),
+                None,
+                100,
+            )
+            .unwrap();
+            assert_eq!(logs.len(), 1);
+            assert!(
+                logs[0]
+                    .record
+                    .raw_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("safe inference failure")
+            );
             let active = fixture
                 .app
                 .world()
@@ -1839,65 +1957,21 @@ async fn bundled_drivers_persist_inference_errors_and_keep_the_same_vm_for_next_
                 .unwrap()
                 .current
                 .as_ref()
-                .unwrap();
-            assert_eq!(active.request_id, request.id);
+                .unwrap()
+                .clone();
             assert!(!active.is_finished());
-            active.cancel();
-            assert!(cancel.is_cancelled());
+            assert!(!cancel.is_cancelled());
             release.send(()).unwrap();
-            tokio::task::yield_now().await;
-            fixture.command("EFFECT wake", vec![]).await.unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                fixture.app.tick();
-                let agent = fixture
-                    .app
-                    .world()
-                    .get_component::<Agent>(fixture.owner)
-                    .unwrap();
-                if agent.state() == AgentState::Idle {
-                    assert!(agent.turn().is_none());
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "Driver did not finish {kind:?} after inference task exited"
-                );
-                tokio::task::yield_now().await;
-            }
-            assert!(
-                fixture
-                    .app
-                    .world()
-                    .get_component::<ActiveInference>(fixture.owner)
-                    .unwrap()
-                    .current
-                    .is_none()
-            );
-            assert_eq!(
-                fixture
-                    .history()
-                    .iter()
-                    .filter(|record| record.kind == "message"
-                        && record.payload["request_id"] == request.id)
-                    .count(),
-                1
-            );
-            let vm = fixture
-                .app
-                .world()
-                .get_component::<DriverLuaVm>(fixture.owner)
-                .unwrap();
-            assert_eq!(vm.instance, instance);
-            assert!(!vm.cancel.is_cancelled());
+            active.wait_finished().await.unwrap();
+            fixture.command("EFFECT finish_turn", vec![]).await.unwrap();
+            let (sender, mut stopped) = oneshot::channel();
+            fixture.app.world().send_event(StopDriverLuaVm {
+                instance,
+                reply: Arc::new(Mutex::new(Some(sender))),
+            });
+            drive(&mut fixture.app, &mut stopped).await.unwrap();
+            close.close_and_join().await.unwrap();
         }
-        let (sender, mut stopped) = oneshot::channel();
-        fixture.app.world().send_event(StopDriverLuaVm {
-            instance,
-            reply: Arc::new(Mutex::new(Some(sender))),
-        });
-        drive(&mut fixture.app, &mut stopped).await.unwrap();
-        close.close_and_join().await.unwrap();
     }
 }
 
@@ -2039,7 +2113,7 @@ async fn all_tool_errors_return_failed_results_and_leave_turn_completion_to_driv
                 .get_component::<Agent>(fixture.owner)
                 .unwrap()
                 .state(),
-            AgentState::Idle
+            AgentState::Running
         );
         fixture.command("EFFECT start_turn", vec![]).await.unwrap();
         assert!(matches!(
@@ -2104,7 +2178,7 @@ async fn tool_cleanup_failures_return_failed_messages_and_preserve_the_turn() {
                 .get_component::<Agent>(fixture.owner)
                 .unwrap()
                 .state(),
-            AgentState::Working
+            AgentState::Running
         );
         assert!(
             fixture
@@ -2198,7 +2272,7 @@ async fn mixed_tool_batch_keeps_all_calls_after_backend_and_association_failures
             .get_component::<Agent>(fixture.owner)
             .unwrap()
             .state(),
-        AgentState::Working
+        AgentState::Running
     );
     fixture.command("EFFECT finish_turn", vec![]).await.unwrap();
     fixture.command("EFFECT start_turn", vec![]).await.unwrap();
@@ -2277,7 +2351,7 @@ async fn audit_persistence_failure_returns_error_and_discloses_executed_side_eff
             .get_component::<Agent>(fixture.owner)
             .unwrap()
             .state(),
-        AgentState::Working
+        AgentState::Running
     );
     fixture
         .app
@@ -2812,4 +2886,63 @@ fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
 
 fn test_probe<T>() -> client_core::UpdateProbe<T> {
     client_core::UpdateProbe::new(|_| {})
+}
+
+#[tokio::test]
+async fn tool_call_projects_calls_from_a_message_and_rejects_the_old_assistant_envelope() {
+    let mut fixture = Fixture::new();
+    fixture.add_tool("bash");
+    fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    fixture
+        .command("CREATE BLOCK projection (messages)", vec![])
+        .await
+        .unwrap();
+    let assistant = json!({"type":"assistant","tool_calls":[{"id":"projected","tool_name":"bash","arguments":"{}"}]});
+    fixture
+        .command(
+            "INJECT ? TO projection.messages",
+            vec![json!([assistant.clone()])],
+        )
+        .await
+        .unwrap();
+    let result = messages(
+        fixture
+            .command(
+                "EFFECT tool_call (projection.messages[-1].tool_calls)",
+                vec![],
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0]["tool_call_id"], "projected");
+    let (tx, mut rx) = oneshot::channel();
+    fixture.app.world().emit_event(MclCommand {
+        id: "old-envelope".into(),
+        source: fixture.client,
+        source_address: fixture
+            .app
+            .world()
+            .get_component::<address::Address>(fixture.client)
+            .unwrap()
+            .as_str()
+            .into(),
+        source_instance: None,
+        target: fixture.owner,
+        instruction: MclInstruction {
+            text: "EFFECT tool_call ?".into(),
+            arguments: vec![json!([assistant])],
+        },
+        cancel: CancellationToken::new(),
+        reply: Arc::new(Mutex::new(Some(tx))),
+    });
+    assert!(matches!(
+        drive(&mut fixture.app, &mut rx).await.unwrap(),
+        MclValue::Error(_)
+    ));
+    assert_eq!(
+        fixture.tools.lock().unwrap().len(),
+        1,
+        "old envelope dispatched another call"
+    );
 }

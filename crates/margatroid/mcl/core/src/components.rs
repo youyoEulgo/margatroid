@@ -7,7 +7,6 @@ pub struct MclQueue {
     pub commands: VecDeque<MclCommand>,
     pub pending: Option<String>,
     pub accepting: bool,
-    pub allowed_imports: Vec<String>,
     pub drain: MclDrain,
     pub cancel: CancellationToken,
 }
@@ -17,7 +16,6 @@ impl Default for MclQueue {
             commands: VecDeque::new(),
             pending: None,
             accepting: true,
-            allowed_imports: Vec::new(),
             drain: MclDrain::default(),
             cancel: CancellationToken::new(),
         }
