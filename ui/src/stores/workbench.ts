@@ -447,6 +447,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const driverContextPath = ref('entry.pending[-1]');
   const connectionStatus = ref<ConnectionStatus>('offline');
   const stateReady = ref(false);
+  const agentStateReady = ref(false);
   const connectionError = ref('');
   const registeredClient = ref<ClientInfo | null>(null);
   const agentUiBundle = ref<AgentUiBundle | null>(null);
@@ -765,6 +766,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
     registeredClient.value = null;
     stateReady.value = false;
+    agentStateReady.value = false;
     resourcesReset();
     recordQueries.clear();
     historyQueries.clear();
@@ -817,6 +819,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       socket = null;
       registeredClient.value = null;
       stateReady.value = false;
+      agentStateReady.value = false;
       connectionStatus.value = 'offline';
       streams.value = new Map();
       pendingWakes.clear();
@@ -927,6 +930,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (
       !workspace ||
       workspace.status !== 'running' ||
+      !agentStateReady.value ||
       !selectedAgent.value ||
       !state ||
       !selectedAgentReady.value
@@ -1464,6 +1468,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         registeredClient.value = event.client;
         connectionStatus.value = 'online';
         connectionError.value = '';
+        agentStateReady.value = false;
         reconnectAttempt = 0;
         queryState();
         break;
@@ -1492,12 +1497,19 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           break;
         }
         activeAgentInfos.value = event.agents;
+        agentStateReady.value = true;
+        const selectedBeforeProjection = selectedAgent.value;
         pruneAgentState();
         projectSnapshots();
+        // reconcileSelection already queries when it auto-selects the only
+        // member. Only fetch details here when a previous selection survived.
+        if (selectedBeforeProjection && selectedAgent.value === selectedBeforeProjection)
+          queryHistory();
         settle(event.id, event.agents);
         break;
       case 'agent.sync':
         activeAgentInfos.value = event.agents;
+        agentStateReady.value = true;
         pruneAgentState();
         projectSnapshots();
         break;
@@ -1731,6 +1743,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     connectionStatus,
     registeredClient,
     stateReady,
+    agentStateReady,
     connectionError,
     agentUiBundle,
     agentUiError,
