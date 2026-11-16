@@ -50,13 +50,6 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
         workspace,
     } = parts;
     let clients = client_core::Clients::default();
-    let log_path = options.data_root.join("runtime.sqlite");
-    let runtime_logs = storage_core::open_runtime_logs(
-        &log_path,
-        dto_plugin::runtime_log_probe(clients.clone(), config.config().logs()),
-    )
-    .map_err(|error| ComposeError::new("logs", &log_path, error.to_string()))?;
-
     let workspace_sync =
         dto_plugin::workspace_sync_binding(clients.clone(), config.config().backend_state());
     app.world_mut()
@@ -97,7 +90,6 @@ pub(crate) fn install(app: &mut App, parts: ApplicationParts) -> Result<(), Comp
         .add_closure_system(RuntimePlugin::PRE_UPDATE)
         .add_closure_system(RuntimePlugin::UPDATE)
         .add_plugin(log);
-    crate::diagnostics::install(app, runtime_logs);
     app.add_plugin(AxumPlugin::bind(bind))
         .add_plugin(config)
         .add_plugin(client_plugin::ClientPlugin::new())

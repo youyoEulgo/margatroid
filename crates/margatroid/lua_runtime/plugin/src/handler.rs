@@ -179,9 +179,6 @@ pub(crate) fn handle_start_driver_lua_vm(world: &mut World, request: StartDriver
     );
     let events = world.event_sender();
     let run = RunContext {
-        runtime_logs: world
-            .get_resource::<storage_core::RuntimeLogStore>()
-            .cloned(),
         workspace: request.workspace,
         services: world
             .get_resource::<lua_runtime_core::LuaServices>()
@@ -457,7 +454,6 @@ async fn stop_vm(context: StopContext) -> Result<StopOutput, StopError> {
 async fn run_driver(mut context: RunContext) {
     let logger = DriverLogger {
         storage: context.storage.clone(),
-        runtime_logs: context.runtime_logs.clone(),
         services: context.services.clone(),
         identity: lua_runtime_core::LuaExecutionIdentity {
             source: context.instance.owner,
@@ -607,7 +603,6 @@ async fn run_driver(mut context: RunContext) {
 #[derive(Clone)]
 struct DriverLogger {
     storage: Option<AgentStorage>,
-    runtime_logs: Option<storage_core::RuntimeLogStore>,
     services: Option<lua_runtime_core::LuaServices>,
     identity: lua_runtime_core::LuaExecutionIdentity,
     closures: WorldClosureSender,
@@ -677,25 +672,37 @@ impl DriverLogger {
                     return Ok(());
                 }
             }
-            if let Some(store) = self.runtime_logs.clone() {
-                let report = storage_core::RuntimeLogInput {
-                    report_id: None,
-                    reporter: self.source_address.clone(),
-                    target: "lua".into(),
-                    agent: None,
-                    record,
-                };
-                tokio::task::spawn_blocking(move || store.append(report))
-                    .await
-                    .map_err(|error| {
-                        failure(LuaRuntimeErrorKind::ExecutionFailed, error.to_string())
-                    })?
-                    .map_err(|error| {
-                        failure(LuaRuntimeErrorKind::ExecutionFailed, error.to_string())
-                    })?;
-                return Ok(());
+            let mut text = record.message;
+            if let Some(raw) = record
+                .raw_error
+                .as_deref()
+                .filter(|raw| !raw.is_empty() && *raw != text)
+            {
+                text.push(char::from(10));
+                text.push_str(raw);
             }
-            tracing::event!(tracing::Level::INFO,source=%self.source_address,message=%record.message,"Lua execution log");
+            if let Some(traceback) = record
+                .traceback
+                .as_deref()
+                .filter(|traceback| !traceback.is_empty() && !text.contains(*traceback))
+            {
+                text.push(char::from(10));
+                text.push_str(traceback);
+            }
+            match record.level {
+                AgentLogLevel::Debug => {
+                    tracing::debug!(source=%self.source_address,origin=%self.origin,stage,"{text}")
+                }
+                AgentLogLevel::Info => {
+                    tracing::info!(source=%self.source_address,origin=%self.origin,stage,"{text}")
+                }
+                AgentLogLevel::Warn => {
+                    tracing::warn!(source=%self.source_address,origin=%self.origin,stage,"{text}")
+                }
+                AgentLogLevel::Error => {
+                    tracing::error!(source=%self.source_address,origin=%self.origin,stage,"{text}")
+                }
+            }
             return Ok(());
         };
         tokio::task::spawn_blocking(move || append_agent_log(&storage, record))

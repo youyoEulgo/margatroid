@@ -1,6 +1,6 @@
 # DTO
 
-本轮同步架构已实现，设计检查点为8e0ed9d，当前源码改动尚未提交。网络已扩展为50种消息，新增持久诊断接口；运行进程需使用新构建。字段、函数和职责见[DESIGN.md](DESIGN.md)。
+本轮同步架构已实现，设计检查点为8e0ed9d，当前源码改动尚未提交。网络恢复45种既有消息，运行级日志直接输出tracing；运行进程需使用新构建。字段、函数和职责见[DESIGN.md](DESIGN.md)。
 
 ## 统一入口与共享槽位
 
@@ -44,7 +44,7 @@ UI监控在实际Driver来源安装时建立，记录监控在真实AgentStorage
 
 DTO移除dto_sync_system以及WebSocketMessageSend、ConnState、SyncState的旧投递/轮询结构；普通dto_route_system与abort_control_system保持。业务注册、生命周期、MCL及原oneshot链不改成同步消息；AgentException仍由Agent领域处理，并通过其统一更新入口发布故障。
 
-既有45种wire保持字段契约，新增5种应用诊断消息，不加入VM身份，不引入HTTP Driver资源接口。具体领域类型只依赖自身core及client_core能力；DTO提供具体编码函数，compose注入typed绑定，业务plugin之间不互相依赖。
+保持45种既有wire字段契约，不加入VM身份，不引入HTTP Driver资源接口。具体领域类型只依赖自身core及client_core能力；DTO提供具体编码函数，compose注入typed绑定，业务plugin之间不互相依赖。
 
 ## 后续独立API调整
 
@@ -62,4 +62,4 @@ DTO移除dto_sync_system以及WebSocketMessageSend、ConnState、SyncState的旧
 
 本轮680项Rust测试及严格workspace Clippy通过。真实WS回归覆盖无World帧的Task输出/Return/移除、Turn/资源更新、COMMIT记录、UI变化及Workspace磁盘新增/错误/恢复/删除。隔离release的四批持久Bash输出均在未查询前收到结束标记；大窗口仍以完整快照发送，高频输出的总编码/流量并未因此消除，不把队列合并等同于节流。
 
-DTO安装要求RuntimeLogStore。新增log.req/log.res、log.append/log.append.result、log.sync，网络共50种类型；只复用原DtoRequest，不新增System或同步事件。完整报告保留实际Client、原请求/响应、网络简化前的领域错误和边界栈；UI监控实际变化也先落库再发布。应用日志提交探针按logs目标直接筛选当前Clients，Agent日志仍按原存储提交监控。
+未绑定Agent的日志直接通过既有tracing输出，遵守配置的日志级别和过滤器；不创建独立运行日志数据库、不强制保存运行级报告。绑定Agent的日志沿原AgentStorage及提交探针处理。

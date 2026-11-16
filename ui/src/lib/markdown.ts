@@ -13,6 +13,13 @@ const inlineDisplayMath =
   /^(?:\$\$[ \t]*\n?([\s\S]+?)\n?[ \t]*\$\$|\\\[[ \t]*\n?([\s\S]+?)\n?[ \t]*\\\])/;
 const inlineMath = /^(?:\\\((.+?)\\\)|\$(?!\$|\s)((?:\\.|[^\\$\n])+?)(?<!\s)\$(?!\$))/;
 
+// Marked's inlineText consumes runs like "$x$" before a custom inline
+// tokenizer is consulted. Tell the lexer where the next math delimiter is.
+const mathStart = (source: string): number | undefined => {
+  const index = source.search(/\$|\\\(|\\\[/);
+  return index < 0 ? undefined : index;
+};
+
 function renderMath(token: MathToken): string {
   const formula = katex.renderToString(token.text, {
     displayMode: token.displayMode,
@@ -54,6 +61,7 @@ markdown.use({
     {
       name: 'inlineDisplayMath',
       level: 'inline',
+      start: mathStart,
       tokenizer(source) {
         const match = inlineDisplayMath.exec(source);
         if (!match) return;
@@ -72,6 +80,7 @@ markdown.use({
     {
       name: 'inlineMath',
       level: 'inline',
+      start: mathStart,
       tokenizer(source) {
         const match = inlineMath.exec(source);
         if (!match) return;

@@ -8,8 +8,7 @@ name = "margatroid-daemon"
 path = "src/main.rs"
 
 [dependencies]
-storage_core = { path = "../../crates/margatroid/storage/core" }
-serde_json = { workspace = true }
+tracing = "0.1"
 compose = { path = "../../crates/margatroid/compose" }
 app_runtime_plugin = { path = "../../crates/mecs/app_runtime_plugin" }
 axum_plugin = { path = "../../crates/margatroid/axum_plugin" }

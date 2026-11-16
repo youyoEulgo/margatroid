@@ -264,13 +264,6 @@ impl Harness {
                     .cloned(),
             );
         });
-        app.world_mut().insert_resource(
-            storage_core::open_runtime_logs(
-                &root.path().join("runtime.sqlite"),
-                storage_core::RuntimeLogProbe::new(|_| {}),
-            )
-            .unwrap(),
-        );
         app.add_plugin(DtoPlugin::new());
         if let Some((frames, events)) = counters {
             app.add_system(RuntimePlugin::UPDATE, move |_world: &mut World| {

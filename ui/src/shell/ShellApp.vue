@@ -34,10 +34,8 @@ const {
   workspaceNotice,
   agentUiBundle,
   agentUiLoading,
-  logs,
   applicationLogs,
   applicationLogHistoryLoaded,
-  selectedSessionLogs,
   selectedMclEntries,
 } = storeToRefs(store);
 
@@ -63,27 +61,29 @@ const connectionLabel = computed(() => {
   return 'Offline';
 });
 const applicationActivity = computed(() =>
-  applicationLogs.value.map((row) => ({
-    key: `app:${row.sequence}`,
-    timestamp: row.created_at_ms,
-    level: row.level.toUpperCase(),
-    target: row.target,
-    message: row.message,
-    fields: [
-      { name: 'target', value: row.target },
-      ...(row.agent ? [{ name: 'agent', value: row.agent }] : []),
-      ...(row.origin ? [{ name: 'origin', value: row.origin }] : []),
-      ...(row.raw_error ? [{ name: 'raw_error', value: row.raw_error }] : []),
-      ...(row.traceback ? [{ name: 'traceback', value: row.traceback }] : []),
-      ...(row.details_json ? [{ name: 'details', value: JSON.stringify(row.details_json) }] : []),
-      ...(row.context_json ? [{ name: 'context', value: JSON.stringify(row.context_json) }] : []),
-    ],
-  })),
+  applicationLogs.value
+    // UI resource lifecycle is internal backend monitoring noise. Keep it in
+    // the application log store, but do not surface it in Activity.
+    .filter((row) => row.stage !== 'ui')
+    .map((row) => ({
+      key: `app:${row.sequence}`,
+      timestamp: row.created_at_ms,
+      level: row.level.toUpperCase(),
+      target: row.target,
+      message: row.message,
+      fields: [
+        { name: 'target', value: row.target },
+        ...(row.agent ? [{ name: 'agent', value: row.agent }] : []),
+        ...(row.origin ? [{ name: 'origin', value: row.origin }] : []),
+        ...(row.raw_error ? [{ name: 'raw_error', value: row.raw_error }] : []),
+        ...(row.traceback ? [{ name: 'traceback', value: row.traceback }] : []),
+        ...(row.details_json ? [{ name: 'details', value: JSON.stringify(row.details_json) }] : []),
+        ...(row.context_json ? [{ name: 'context', value: JSON.stringify(row.context_json) }] : []),
+      ],
+    })),
 );
 const activityLogs = computed(() =>
-  [...logs.value, ...selectedSessionLogs.value, ...applicationActivity.value].sort(
-    (left, right) => left.timestamp - right.timestamp,
-  ),
+  [...applicationActivity.value].sort((left, right) => left.timestamp - right.timestamp),
 );
 const displayedLogs = computed(() =>
   logFilter.value === 'errors'

@@ -707,6 +707,23 @@ test('non-generation full appends without overwriting a different streaming mess
     e.cleanup();
   }
 });
+test('an older live assistant stays above a later persisted user message', () => {
+  const e = setup();
+  try {
+    e.receive(chunk());
+    e.receive(full(null));
+    e.receive({
+      ...full(40, null),
+      message: { type: 'user', sequence: 40, content: 'next question' },
+    });
+    assert.deepEqual(
+      e.store.visibleMessages.map((message) => message.role),
+      ['assistant', 'user'],
+    );
+  } finally {
+    e.cleanup();
+  }
+});
 test('history uses oldest persistent sequence as an exclusive cursor despite live arrivals', () => {
   const e = setup();
   try {

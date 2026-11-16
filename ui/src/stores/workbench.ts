@@ -481,6 +481,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const lastFailures = ref(new Map<string, { message: string }>());
   const applicationLogs = ref<AppLogRecord[]>([]);
   const applicationLogHistoryLoaded = ref(false);
+  let messageClock = 0;
+  function currentMessageTime(): number {
+    messageClock = Math.max(Date.now(), messageClock + 1);
+    return messageClock;
+  }
   const streams = ref(new Map<string, StreamEntry>());
   const abortGuards = ref(new Map<string, AbortGuard>());
   const pending = new Map<string, PendingCommand>();
@@ -601,7 +606,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         entry.agent === selectedAgent.value &&
         !historyMessageIds.value.has(entry.id),
     );
-    return [...history, ...live];
+    // A completed assistant can still be live while a later user message has
+    // already arrived through its persisted full. Concatenating history before
+    // live rows would put that newer user message above the older assistant.
+    return [...history, ...live].sort((left, right) => {
+      if (left.sequence !== null && right.sequence !== null) return left.sequence - right.sequence;
+      return left.timestamp - right.timestamp;
+    });
   });
   const selectedMclEntries = computed(() => {
     const target = currentTarget(false);
@@ -855,6 +866,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
   function requestAgentUi(address: string | null = selectedAgent.value): void {
     if (!address || !connected()) return;
+    const state = agentStates.value.find((candidate) => candidate.agent === address);
+    if (!state || state.status !== 'running') return;
+    const workspace = runtimeWorkspaces.value.find(
+      (candidate) => candidate.id === workspaceKey(state.workspace),
+    );
+    if (!workspace || workspace.status !== 'running') return;
     const changed = agentUiAddress.value !== address;
     agentUiAddress.value = address;
     agentUiLoading.value = true;
@@ -912,7 +929,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   function currentTarget(required = true): Target | null {
     const workspace = selectedRuntimeWorkspace.value;
     const state = selectedAgentState.value;
-    if (!workspace || !selectedAgent.value || !state || !selectedAgentReady.value) {
+    if (
+      !workspace ||
+      workspace.status !== 'running' ||
+      !selectedAgent.value ||
+      !state ||
+      !selectedAgentReady.value
+    ) {
       if (required) throw new Error('Select a running agent explicitly');
       return null;
     }
@@ -1185,7 +1208,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           content: '',
           toolCalls: [],
           failed: false,
-          timestamp: Date.now(),
+          timestamp: currentMessageTime(),
           kind: 'stream',
           payload: null,
           source: null,
@@ -1385,7 +1408,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
                 ? message.message
                 : '',
           payload: message,
-          created_at_ms: Date.now(),
+          created_at_ms: currentMessageTime(),
         },
       ]);
     }
@@ -1406,7 +1429,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           toolCalls: row.toolCalls,
           failed: row.failed || !!event.error,
           images: row.images,
-          timestamp: old?.timestamp ?? Date.now(),
+          timestamp: old?.timestamp ?? currentMessageTime(),
           kind: 'stream',
           payload: event.message,
           source: null,
@@ -1642,7 +1665,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
   function loadLogHistory() {
     queryApplicationLogs();
-    queryRecords('log');
   }
   function mergeLogs(target: Pick<Target, 'agent'>, records: AgentLogRecord[]) {
     const key = targetKey(target);

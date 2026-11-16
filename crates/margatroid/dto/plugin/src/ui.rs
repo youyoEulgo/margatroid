@@ -179,12 +179,6 @@ pub(crate) fn refresh_ui_watch(
     let Some((ui_path, address)) = desired else {
         return waits;
     };
-    crate::runtime_logs::report_ui(
-        &state.logs,
-        &address,
-        &ui_path,
-        &DriverUiState::Initializing,
-    );
     let delivery = Arc::new(RwLock::new(build_ui_delivery(
         &address,
         DriverUiState::Initializing,
@@ -218,15 +212,15 @@ pub(crate) fn refresh_ui_watch(
     let publish = sync.clone();
     let target = address.clone();
     let lifetime = state.lifetime.clone();
-    let log_store = state.logs.clone();
-    let log_origin = ui_path.clone();
     let (watch, monitor) = open_driver_ui_watch(
         ui_path.clone(),
         Arc::new(move |value| {
             if lifetime.is_cancelled() {
                 return;
             }
-            let diagnostic = value.clone();
+            if let DriverUiState::Failed(error) = &value {
+                tracing::warn!(agent=%target,error=%error,"Agent UI source is unavailable");
+            }
             let value = build_ui_delivery(&target, value);
             let version = {
                 let mut previous = output.write().unwrap_or_else(|e| e.into_inner());
@@ -237,7 +231,6 @@ pub(crate) fn refresh_ui_watch(
                 revision.fetch_add(1, Ordering::AcqRel) + 1
             };
             if !lifetime.is_cancelled() {
-                crate::runtime_logs::report_ui(&log_store, &target, &log_origin, &diagnostic);
                 publish.publish(version);
             }
         }),

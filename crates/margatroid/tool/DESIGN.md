@@ -469,7 +469,7 @@ LuaServices安装（tool/plugin/src/services.rs）
         持久日志提交驱动现有record probe直接投Clients；日志写入失败也不能遗漏其他Agent的error报告，聚合诊断错误。
     invoke(sender, identity, method, arguments) -> LuaServiceFuture
         行为：所有实际World读取/修改处validate_execution核对source Address、实际VM或唯一task-instance及取消状态。
-        execution_log将自动执行的主动日志投递给实际绑定Agent存储，沿原提交探针发布；无Agent的完整报告由Lua宿主提交RuntimeLogStore，不只写控制台。
+        execution_log将自动执行的主动日志投递给实际绑定Agent存储，沿原提交探针发布；无Agent的诊断由Lua宿主直接按原级别输出tracing，受既有日志级别及过滤配置控制。
         agent_stop提交原StopAgent并在调用栈外监督原reply；
         agent_create通过原StartAgent/oneshot挂载独立Agent并调用bind_agent；mcl_execute通过原MclCommand/oneshot；wait使用AgentWaitSlot；其他工具、成员、任务服务复用原入口。
     acknowledge_execution(world: &World, identity: &LuaExecutionIdentity)

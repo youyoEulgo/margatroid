@@ -27,9 +27,38 @@ use workspace_core::{Workspace, WorkspaceDefinitionSnapshot, WorkspaceDefinition
 struct ReplyOutput {
     value: Value,
     request: Value,
-    diagnostic: Option<String>,
 }
 type ReplyFuture = Pin<Box<dyn Future<Output = ReplyOutput> + Send>>;
+fn trace_response(connection: ConnectionId, request: &Value, response: &Value) {
+    if response["success"] != false {
+        return;
+    }
+    let failure = &response["error"];
+    let message = failure["details"]["message"]
+        .as_str()
+        .or_else(|| failure["message"].as_str())
+        .unwrap_or("request failed");
+    let route = request["type"].as_str().unwrap_or("protocol");
+    let id = response["id"].as_str().unwrap_or("");
+    let code = failure["code"].as_str().unwrap_or("Unknown");
+    if code == "AgentUiNotReady" {
+        tracing::warn!(
+            connection = connection.get(),
+            request_id = id,
+            route,
+            code,
+            "{message}"
+        );
+    } else {
+        tracing::error!(
+            connection = connection.get(),
+            request_id = id,
+            route,
+            code,
+            "{message}"
+        );
+    }
+}
 fn error(code: &str, message: &str) -> ProtocolErrorDto {
     ProtocolErrorDto::new(code, message)
 }
@@ -161,21 +190,11 @@ fn request<T: Send + 'static, R: Send + 'static, E: BoundaryError>(
     };
     let response = response.to_owned();
     let future = async move {
-        let mut diagnostic = None;
         let result = match receiver.await {
             Ok(Ok(v)) => project(v),
-            Ok(Err(e)) => {
-                diagnostic = Some(format!("{e:?}"));
-                Err(e.external())
-            }
-            Err(e) => {
-                diagnostic = Some(format!("{e:?}"));
-                Err(error("ReplyClosed", "operation response was lost"))
-            }
+            Ok(Err(e)) => Err(e.external()),
+            Err(_) => Err(error("ReplyClosed", "operation response was lost")),
         };
-        if diagnostic.is_none() {
-            diagnostic = result.as_ref().err().map(|error| format!("{error:?}"));
-        }
         let mut value = frame(&response, &ticket.id, result);
         if matches!(
             response.as_str(),
@@ -191,7 +210,6 @@ fn request<T: Send + 'static, R: Send + 'static, E: BoundaryError>(
         ReplyOutput {
             value,
             request: original,
-            diagnostic,
         }
     }
     .boxed();
@@ -264,7 +282,6 @@ pub(crate) fn handle_dto_request(world: &mut World, request: DtoRequest) {
         return;
     };
     match request.route.as_str() {
-        "log.req" | "log.append" => crate::runtime_logs::handle(world, &request.route, object),
         "connection.register" => dispatch::<RegisterClientDto>(world, object),
         "workspace.start" => dispatch::<StartWorkspaceDto>(world, object),
         "workspace.stop" => dispatch::<StopWorkspaceDto>(world, object),
@@ -751,20 +768,6 @@ async fn prepare_request(
         }};
     }
     match message {
-        ClientMessage::LogReq { message, .. } => build!(
-            message,
-            storage_core::RecordPage<storage_core::StoredRuntimeLog>,
-            storage_core::StorageError,
-            crate::runtime_logs::page
-        ),
-        ClientMessage::LogAppend { message, .. } => build!(
-            message,
-            storage_core::StoredRuntimeLog,
-            storage_core::StorageError,
-            |row: storage_core::StoredRuntimeLog| Ok(
-                json!({"sequence":row.sequence,"report_id":row.input.report_id})
-            )
-        ),
         ClientMessage::ConnectionRegister { message, .. } => build!(
             message,
             client_core::RegisteredClient,
@@ -874,7 +877,6 @@ async fn prepare_request(
                 let result = receiver
                     .await
                     .unwrap_or_else(|_| Err(error("ReplyClosed", "control response lost")));
-                let diagnostic = result.as_ref().err().map(|error| format!("{error:?}"));
                 let value = frame(
                     "agent.turn.abort.result",
                     &ticket.id,
@@ -883,7 +885,6 @@ async fn prepare_request(
                 ReplyOutput {
                     value,
                     request: original,
-                    diagnostic,
                 }
             }
             .boxed();
@@ -1076,7 +1077,7 @@ async fn serve_connection(
             _=cancel.cancelled()=>break,
             response=pending.next(),if !pending.is_empty()=>{
                 let Some(report)=response else{continue;};
-                crate::runtime_logs::report_response(&state,connection,report.request,&report.value,report.diagnostic).await;
+                trace_response(connection,&report.request,&report.value);
                 match encode_response(report.value).ok_or(()) {
                     Ok(text)=>Some(Message::Text(text.into())),Err(_)=>Some(Message::Close(Some(CloseFrame{code:1007,reason:"invalid response".into()}))),
                 }
@@ -1101,15 +1102,15 @@ async fn serve_connection(
                                         if let Some(v)=abort{events.send_event(v);}
                                         future.await
                                     },
-                                    Err(value)=>ReplyOutput{value,request:original,diagnostic:None},
+                                    Err(value)=>ReplyOutput{value,request:original},
                                 }
                             }.boxed());
                             None
                         },
                         Err(error)=>{
                             let request=serde_json::from_str(&text).unwrap_or_else(|_|json!({"raw_frame":text.to_string()}));
-                            if let Some(value)=invalid_reply(&text){let diagnostic=Some(format!("{error:?}"));pending.push(async move{ReplyOutput{value,request,diagnostic}}.boxed());None}
-                            else{let failure=json!({"success":false,"error":{"code":error.0.code,"message":error.0.message}});crate::runtime_logs::report_response(&state,connection,request,&failure,Some(format!("{error:?}"))).await;Some(Message::Close(Some(CloseFrame{code:if text.len()>MAX_MESSAGE_BYTES{1009}else{1007},reason:"invalid protocol request".into()})))}
+                            if let Some(value)=invalid_reply(&text){pending.push(async move{ReplyOutput{value,request}}.boxed());None}
+                            else{let failure=json!({"success":false,"error":{"code":error.0.code,"message":error.0.message}});trace_response(connection,&request,&failure);Some(Message::Close(Some(CloseFrame{code:if text.len()>MAX_MESSAGE_BYTES{1009}else{1007},reason:"invalid protocol request".into()})))}
                         },
                     }},
                     Some(Ok(Message::Ping(v)))=>Some(Message::Pong(v)),

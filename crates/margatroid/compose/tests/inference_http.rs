@@ -185,13 +185,6 @@ impl Fixture {
                 )
                 .unwrap(),
             );
-            app.world_mut().insert_resource(
-                storage_core::open_runtime_logs(
-                    &root.path().join("runtime.sqlite"),
-                    storage_core::RuntimeLogProbe::new(|_| {}),
-                )
-                .unwrap(),
-            );
             app.add_plugin(dto_plugin::DtoPlugin::new());
         }
         let (frames_sender, frames) = client_core::ClientSender::channel(256);

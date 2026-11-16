@@ -1426,12 +1426,12 @@ dependencies = [
  "prompt_resource_core",
  "sandbox_resource_core",
  "serde_json",
- "storage_core",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
  "tool_plugin",
  "tool_resource_core",
+ "tracing",
 ]
 
 [[package]]

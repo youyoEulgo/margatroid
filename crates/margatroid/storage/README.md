@@ -96,4 +96,4 @@ Agent实际存储初始化时通过Agent实际资源安装回调建立一个长�
 
 run_record_watch不产出WebSocketMessageSend；它把非空实际记录编码为有序帧并调用Clients.send_scoped，直接按当前注册者发送。消息/MCL/日志使用各自真实sequence，不作状态覆盖或注册重放；数据库字节/WAL变化不能代替确认COMMIT通知。监控随存储生命周期关闭，取消等待真实SQL worker。
 
-应用级日志使用RuntimeLogStore与数据根runtime.sqlite，独立schema版本1；Agent现有日志表及库不迁移。append完整报告先事务提交，再释放连接锁并按提交顺序调用必需RuntimeLogProbe。report_id重试返回原记录而不重复插入或发布。读取复用排他RecordRange与同一快照分页，原始错误/调用栈/上下文不裁剪。
+未绑定Agent的日志直接通过既有tracing输出，遵守配置的日志级别和过滤器；不创建独立运行日志数据库、不强制保存运行级报告。绑定Agent的日志沿原AgentStorage及提交探针处理。

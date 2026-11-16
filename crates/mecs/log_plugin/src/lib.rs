@@ -9,6 +9,5 @@ pub use event::{EventLog, WorldEventLogExt, EVENT_LOG_TARGET};
 pub use options::{ConsoleTarget, FileLogOptions, LogFormat, LogLevel, LogRotation};
 pub use plugin::LogPlugin;
 pub use stream::{
-    TracingField, TracingRecord, TracingSinkGuard, TracingStream, TracingStreamError,
-    TracingSubscription,
+    TracingField, TracingRecord, TracingStream, TracingStreamError, TracingSubscription,
 };

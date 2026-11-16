@@ -179,7 +179,6 @@ StartContext：启动等待上下文--instance、ready接收端、cancel、Runti
 StopContext：停止等待上下文--instance、ended接收端、原reply
 DriverLogger：私有诊断上下文--可选storage、LuaServices、真实LuaExecutionIdentity、World发送能力、origin及待捕获诊断
     append：已有storage沿原blocking提交；无storage的主动log通过execution_log提交已绑定Agent；无Agent或未处理故障通过RunContext.runtime_logs提交完整应用报告，不能只打印控制台；故障另由execution_finished逐绑定完成Agent报告。
-RunContext.runtime_logs: Option<RuntimeLogStore>--Compose中必需安装；独立运行夹具可使用AgentStorage
 RunContext：执行上下文--instance、program、environment、wake、ready发送端存储、ended发送端、cancel、RuntimeEventSender、可选AgentStorage、workspace、LuaServices及宿主固定关联
 StartOutput：启动成功载荷--instance、原reply
 StartError：启动失败载荷--instance、原reply、LuaRuntimeError、cleanup_completed

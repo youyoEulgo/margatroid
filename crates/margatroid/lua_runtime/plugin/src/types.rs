@@ -14,7 +14,6 @@ impl Resource for InstalledRuntime {}
 
 pub(crate) struct RunContext {
     pub storage: Option<storage_core::AgentStorage>,
-    pub runtime_logs: Option<storage_core::RuntimeLogStore>,
     pub workspace: core_plugin::Entity,
     pub services: Option<LuaServices>,
     pub closures: closure_plugin::WorldClosureSender,
