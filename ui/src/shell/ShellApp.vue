@@ -34,8 +34,8 @@ const {
   workspaceNotice,
   agentUiBundle,
   agentUiLoading,
-  applicationLogs,
-  applicationLogHistoryLoaded,
+  agentLogHistoryLoaded,
+  selectedSessionLogs,
   selectedMclEntries,
 } = storeToRefs(store);
 
@@ -60,31 +60,7 @@ const connectionLabel = computed(() => {
   if (connectionStatus.value === 'connecting') return 'Connecting';
   return 'Offline';
 });
-const applicationActivity = computed(() =>
-  applicationLogs.value
-    // UI resource lifecycle is internal backend monitoring noise. Keep it in
-    // the application log store, but do not surface it in Activity.
-    .filter((row) => row.stage !== 'ui')
-    .map((row) => ({
-      key: `app:${row.sequence}`,
-      timestamp: row.created_at_ms,
-      level: row.level.toUpperCase(),
-      target: row.target,
-      message: row.message,
-      fields: [
-        { name: 'target', value: row.target },
-        ...(row.agent ? [{ name: 'agent', value: row.agent }] : []),
-        ...(row.origin ? [{ name: 'origin', value: row.origin }] : []),
-        ...(row.raw_error ? [{ name: 'raw_error', value: row.raw_error }] : []),
-        ...(row.traceback ? [{ name: 'traceback', value: row.traceback }] : []),
-        ...(row.details_json ? [{ name: 'details', value: JSON.stringify(row.details_json) }] : []),
-        ...(row.context_json ? [{ name: 'context', value: JSON.stringify(row.context_json) }] : []),
-      ],
-    })),
-);
-const activityLogs = computed(() =>
-  [...applicationActivity.value].sort((left, right) => left.timestamp - right.timestamp),
-);
+const activityLogs = computed(() => selectedSessionLogs.value);
 const displayedLogs = computed(() =>
   logFilter.value === 'errors'
     ? activityLogs.value.filter((entry) => entry.level === 'ERROR' || entry.level === 'WARN')
@@ -364,7 +340,7 @@ onBeforeUnmount(() => {
               }}</span>
             </button>
             <button
-              v-if="!applicationLogHistoryLoaded"
+              v-if="!agentLogHistoryLoaded"
               type="button"
               class="activity-history"
               @click="store.loadLogHistory()"

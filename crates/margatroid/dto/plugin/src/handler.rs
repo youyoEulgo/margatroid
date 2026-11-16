@@ -927,6 +927,260 @@ async fn prepare_request(
         }
     }
 }
+pub(crate) async fn workspace_file_handler(
+    axum::extract::State(state): axum::extract::State<DtoState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    method: axum::http::Method,
+    path: Result<axum::extract::Path<(String, String)>, axum::extract::rejection::PathRejection>,
+) -> axum::response::Response {
+    use axum::{http::StatusCode as Status, response::IntoResponse};
+    let run = async {
+        let header = |name| {
+            headers
+                .get(name)
+                .map(|value| {
+                    value
+                        .to_str()
+                        .map(str::to_owned)
+                        .map_err(|_| Status::FORBIDDEN)
+                })
+                .transpose()
+        };
+        state
+            .ingress
+            .evaluate(&config_core::IngressRequest {
+                peer,
+                origin: header("origin")?,
+                host: header("host")?,
+            })
+            .map_err(|_| Status::FORBIDDEN)?;
+        if state.events.get().is_none() || state.lifetime.is_cancelled() {
+            return Err(Status::SERVICE_UNAVAILABLE);
+        }
+        let raw = uri.path().as_bytes();
+        let mut offset = 0;
+        while offset < raw.len() {
+            if raw[offset] == b'%' {
+                if raw
+                    .get(offset + 1)
+                    .is_none_or(|byte| !byte.is_ascii_hexdigit())
+                    || raw
+                        .get(offset + 2)
+                        .is_none_or(|byte| !byte.is_ascii_hexdigit())
+                {
+                    return Err(Status::BAD_REQUEST);
+                }
+                offset += 3;
+            } else {
+                offset += 1;
+            }
+        }
+        let axum::extract::Path((workspace, path)) = path.map_err(|_| Status::BAD_REQUEST)?;
+        let address = address::ParsedAddress::parse(&workspace).map_err(|_| Status::BAD_REQUEST)?;
+        if address.kind != "workspace" || address.to_string() != workspace {
+            return Err(Status::BAD_REQUEST);
+        }
+        validate_workspace_file_path(&path)?;
+        let (tx, rx) = oneshot::channel();
+        state.world.send(move |world| {
+            let result = world
+                .entity_by_address(&workspace)
+                .ok()
+                .and_then(|entity| world.get_component::<Workspace>(entity))
+                .ok_or(Status::NOT_FOUND)
+                .and_then(|workspace| {
+                    if workspace.state == workspace_core::WorkspaceState::Stopping {
+                        Err(Status::CONFLICT)
+                    } else {
+                        Ok(workspace.project_root.clone())
+                    }
+                });
+            let _ = tx.send(result);
+        });
+        let root = tokio::select! {
+            biased;
+            _=state.lifetime.cancelled()=>return Err(Status::SERVICE_UNAVAILABLE),
+            root=rx=>root.map_err(|_|Status::SERVICE_UNAVAILABLE)??,
+        };
+        if state.lifetime.is_cancelled() {
+            return Err(Status::SERVICE_UNAVAILABLE);
+        }
+        let head_only = method == axum::http::Method::HEAD;
+        // The worker owns the service guard even if the HTTP requester disconnects.
+        let guard = state.lifetime.track();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            read_workspace_file(root, path, head_only)
+        })
+        .await
+        .map_err(|_| Status::INTERNAL_SERVER_ERROR)?
+    };
+    match run.await {
+        Ok(response) => response,
+        Err(status) => status.into_response(),
+    }
+}
+
+fn validate_workspace_file_path(path: &str) -> Result<(), axum::http::StatusCode> {
+    use axum::http::StatusCode as Status;
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains(['\\', '\0'])
+        || path.as_bytes().get(1) == Some(&b':')
+    {
+        return Err(Status::BAD_REQUEST);
+    }
+    for part in path.split('/') {
+        if part == ".." {
+            return Err(Status::FORBIDDEN);
+        }
+        if part.is_empty() || part == "." {
+            return Err(Status::BAD_REQUEST);
+        }
+    }
+    Ok(())
+}
+
+fn workspace_file_status(error: std::io::Error) -> axum::http::StatusCode {
+    use axum::http::StatusCode as Status;
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => Status::NOT_FOUND,
+        std::io::ErrorKind::PermissionDenied => Status::FORBIDDEN,
+        _ => {
+            #[cfg(unix)]
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                return Status::FORBIDDEN;
+            }
+            Status::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_workspace_file(
+    root: &std::path::Path,
+    path: &str,
+) -> Result<std::fs::File, axum::http::StatusCode> {
+    use axum::http::StatusCode as Status;
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::OpenOptionsExt,
+    };
+    let mut parent = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(root)
+        .map_err(workspace_file_status)?;
+    let parts = path.split('/').collect::<Vec<_>>();
+    for (index, part) in parts.iter().enumerate() {
+        let name = std::ffi::CString::new(*part).map_err(|_| Status::BAD_REQUEST)?;
+        let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // Inspect relative to the already open parent; never follow a symbolic link.
+        let result = unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                info.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err(workspace_file_status(std::io::Error::last_os_error()));
+        }
+        // fstatat initialized the entire stat value on success.
+        let mode = unsafe { info.assume_init() }.st_mode & libc::S_IFMT;
+        if mode == libc::S_IFLNK {
+            return Err(Status::FORBIDDEN);
+        }
+        let last = index + 1 == parts.len();
+        if (last && mode != libc::S_IFREG) || (!last && mode != libc::S_IFDIR) {
+            return Err(Status::NOT_FOUND);
+        }
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if last { 0 } else { libc::O_DIRECTORY };
+        // Each new descriptor is anchored to its parent and no-follow closes the stat/open race.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(workspace_file_status(std::io::Error::last_os_error()));
+        }
+        // A successful openat transfers this fresh descriptor to File exactly once.
+        parent = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    if !parent.metadata().map_err(workspace_file_status)?.is_file() {
+        return Err(Status::NOT_FOUND);
+    }
+    Ok(parent)
+}
+
+fn read_workspace_file(
+    root: PathBuf,
+    path: String,
+    head_only: bool,
+) -> Result<axum::response::Response, axum::http::StatusCode> {
+    use axum::{
+        body::Body,
+        http::{StatusCode as Status, header},
+    };
+    validate_workspace_file_path(&path)?;
+    #[cfg(not(unix))]
+    {
+        let _ = (root, path, head_only);
+        Err(Status::NOT_IMPLEMENTED)
+    }
+    #[cfg(unix)]
+    {
+        let file = open_workspace_file(&root, &path)?;
+        let length = file.metadata().map_err(workspace_file_status)?.len();
+        let media_type = match std::path::Path::new(&path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("png") => "image/png",
+            Some("jpg" | "jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("avif") => "image/avif",
+            Some("svg") => "image/svg+xml",
+            Some("ico") => "image/x-icon",
+            Some("bmp") => "image/bmp",
+            Some("html" | "htm") => "text/html; charset=utf-8",
+            Some("css") => "text/css; charset=utf-8",
+            Some("js" | "mjs") => "text/javascript; charset=utf-8",
+            Some("json") => "application/json",
+            Some("txt" | "md" | "log" | "csv" | "lua" | "toml" | "yaml" | "yml" | "rs") => {
+                "text/plain; charset=utf-8"
+            }
+            Some("pdf") => "application/pdf",
+            Some("woff") => "font/woff",
+            Some("woff2") => "font/woff2",
+            Some("mp4") => "video/mp4",
+            Some("mp3") => "audio/mpeg",
+            _ => "application/octet-stream",
+        };
+        let body = if head_only {
+            Body::empty()
+        } else {
+            let reader = tokio::io::AsyncReadExt::take(tokio::fs::File::from_std(file), length);
+            Body::from_stream(tokio_util::io::ReaderStream::new(reader))
+        };
+        axum::response::Response::builder()
+            .status(Status::OK)
+            .header(header::CONTENT_TYPE, media_type)
+            .header(header::CONTENT_LENGTH, length)
+            .header(header::CACHE_CONTROL, "no-store")
+            .header("x-content-type-options", "nosniff")
+            .body(body)
+            .map_err(|_| Status::INTERNAL_SERVER_ERROR)
+    }
+}
+
 pub(crate) async fn ws_handler(
     axum::extract::State(state): axum::extract::State<DtoState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,

@@ -93,8 +93,8 @@ const {
   resourceWriteInFlight,
   visibleMessages,
   selectedMclEntries,
-  applicationLogs,
-  applicationLogHistoryLoaded,
+  selectedSessionLogs,
+  agentLogHistoryLoaded,
   lastFailures,
 } = storeToRefs(store);
 const canAbortTurn = computed(() => store.canAbortTurn);
@@ -187,45 +187,7 @@ const logFilter = ref<"all" | "errors">("all");
 const endpointDraft = ref(endpoint.value);
 const contextPathDraft = ref(driverContextPath.value);
 const formError = ref("");
-const applicationActivity = computed(() =>
-  applicationLogs.value
-    // UI resource lifecycle is internal backend monitoring noise. Keep it in
-    // the application log store, but do not surface it in Activity.
-    .filter((row) => row.stage !== "ui")
-    .map((row) => ({
-      key: `app:${row.sequence}`,
-      timestamp: row.created_at_ms,
-      level: row.level.toUpperCase(),
-      target: row.target,
-      message: row.message,
-      fields: [
-        { name: "target", value: row.target },
-        ...(row.agent ? [{ name: "agent", value: row.agent }] : []),
-        ...(row.origin ? [{ name: "origin", value: row.origin }] : []),
-        ...(row.raw_error ? [{ name: "raw_error", value: row.raw_error }] : []),
-        ...(row.traceback ? [{ name: "traceback", value: row.traceback }] : []),
-        ...(row.details_json
-          ? [{ name: "details", value: JSON.stringify(row.details_json) }]
-          : []),
-        ...(row.context_json
-          ? [{ name: "context", value: JSON.stringify(row.context_json) }]
-          : []),
-      ],
-    })),
-);
-const activityLogs = computed(() =>
-  [...applicationActivity.value].sort(
-    (left, right) => left.timestamp - right.timestamp,
-  ),
-);
-watch([activityOpen, activityTab, selectedAgent], () => {
-  if (
-    activityOpen.value &&
-    selectedAgentReady.value &&
-    activityTab.value === "mcl"
-  )
-    store.queryRecords("mcl");
-});
+const activityLogs = computed(() => selectedSessionLogs.value);
 const displayedLogs = computed(() => {
   if (logFilter.value === "errors") {
     return activityLogs.value.filter(
@@ -703,6 +665,12 @@ function toolCallLabel(tool: {
   return `${tool.tool_name}\u00a0\u00a0·\u00a0\u00a0${inlineToolPayload(tool.arguments ?? {})}`;
 }
 
+function markdownContext(message: ConversationEntry) {
+  return {
+    workspace: message.workspaceKey,
+    endpoint: endpoint.value,
+  };
+}
 function isMcLRecord(message: ConversationEntry) {
   return message.role === "record" && message.kind === "mcl";
 }
@@ -974,7 +942,12 @@ const conversationRows = computed<ConversationRow[]>(() => {
                 <div
                   v-else-if="row.kind === 'content'"
                   class="message-content"
-                  v-html="renderMarkdown(row.message.content)"
+                  v-html="
+                    renderMarkdown(
+                      row.message.content,
+                      markdownContext(row.message),
+                    )
+                  "
                 ></div>
                 <details
                   v-else-if="row.kind === 'recordData'"
@@ -1455,7 +1428,7 @@ const conversationRows = computed<ConversationRow[]>(() => {
           }}</span>
         </button>
         <button
-          v-if="!applicationLogHistoryLoaded"
+          v-if="!agentLogHistoryLoaded"
           type="button"
           class="activity-history"
           @click="store.loadLogHistory()"

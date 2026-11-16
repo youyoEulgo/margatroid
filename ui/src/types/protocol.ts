@@ -126,6 +126,7 @@ export type MclValue =
   | { Config: Record<string, unknown> }
   | { Inference: { message: AgentMessage; stop_reason: string } }
   | { Import: { kind: 'Message' | 'Tool' | 'Sandbox'; alias: string } }
+  | { Turn: string }
   | { Error: MclError };
 export type MclCommandResult = { Ok: MclValue };
 export type AbortResult = { Ok: null } | { Err: ProtocolError };
@@ -204,37 +205,6 @@ export interface AgentLogRecord {
   raw_error: string | null;
   traceback: string | null;
 }
-export interface AppLogRecord {
-  sequence: number;
-  report_id: string | null;
-  created_at_ms: number;
-  received_at_ms: number;
-  level: string;
-  target: string;
-  agent: string | null;
-  message: string;
-  details_json: unknown;
-  context_json: unknown;
-  origin: string | null;
-  raw_error: string | null;
-  traceback: string | null;
-  reporter: string;
-  source: string;
-  stage: string;
-}
-export interface AppLogReport {
-  report_id: string;
-  created_at_ms: number;
-  level: string;
-  target: string;
-  agent: string | null;
-  message: string;
-  details_json: unknown;
-  context_json: unknown;
-  origin: string | null;
-  raw_error: string | null;
-  traceback: string | null;
-}
 export interface AgentMclRecord {
   sequence: number;
   created_at_ms: number;
@@ -253,7 +223,8 @@ export type MclData =
   | { kind: 'config'; value: Record<string, unknown> }
   | { kind: 'import'; value: { kind: string; alias: string } }
   | { kind: 'inference'; value: { message: AgentMessage; stop_reason: string } }
-  | { kind: 'block_snapshots'; value: unknown };
+  | { kind: 'block_snapshots'; value: unknown }
+  | { kind: 'turn'; value: string };
 export type ClientMessage =
   | { type: 'connection.register'; id: string; message: { client_type: string; name?: string } }
   | {
@@ -283,9 +254,7 @@ export type ClientMessage =
       message: AgentTarget & { command: string; arguments: unknown[] };
     }
   | { type: 'agent.ui.req'; id: string; message: AgentTarget }
-  | { type: 'agent.turn.abort'; id: string; message: AgentTarget & { turn: string } }
-  | { type: 'log.req'; id: string; message: RangeQuery }
-  | { type: 'log.append'; id: string; message: AppLogReport };
+  | { type: 'agent.turn.abort'; id: string; message: AgentTarget & { turn: string } };
 type Failure = { success: false; error: ProtocolError };
 type Receipt = { id: string } & ({ success: true } | Failure);
 type Page<T> = { id: string } & AgentTarget &
@@ -338,22 +307,9 @@ export type ServerMessage =
       ui: AgentUiBundle | null;
       error: ProtocolError | null;
     }
-  | ({ type: 'log.res'; id: string } & (
-      | {
-          success: true;
-          records: AppLogRecord[];
-          next_before_sequence: number | null;
-          next_after_sequence: number | null;
-        }
-      | Failure
-    ))
-  | ({ type: 'log.append.result'; id: string } & (
-      { success: true; sequence: number; report_id: string } | Failure
-    ))
-  | { type: 'log.sync'; records: AppLogRecord[] }
   | ({
       type: 'agent.message.chunk.sync';
-      turn: string;
+      turn: string | null;
       generation: string;
       sequence: number;
       content: string;
@@ -422,24 +378,6 @@ const agentUiBundle = (v: unknown): boolean =>
       /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(file.data),
   ) &&
   v.files.some((file) => isRecord(file) && file.path === 'index.html');
-const appLogRecord = (v: unknown): boolean =>
-  isRecord(v) &&
-  integer(v.sequence) &&
-  nullableString(v.report_id) &&
-  integer(v.created_at_ms) &&
-  integer(v.received_at_ms) &&
-  string(v.level) &&
-  string(v.target) &&
-  nullableString(v.agent) &&
-  string(v.message) &&
-  (v.details_json === null || isRecord(v.details_json)) &&
-  (v.context_json === null || isRecord(v.context_json)) &&
-  nullableString(v.origin) &&
-  nullableString(v.raw_error) &&
-  nullableString(v.traceback) &&
-  string(v.reporter) &&
-  string(v.source) &&
-  string(v.stage);
 const agentInfo = (v: unknown): boolean =>
   isRecord(v) &&
   target(v) &&
@@ -524,6 +462,8 @@ const mclData = (v: unknown): boolean => {
       return isRecord(v.value) && isAgentMessage(v.value.message) && string(v.value.stop_reason);
     case 'block_snapshots':
       return isRecord(v.value);
+    case 'turn':
+      return string(v.value);
     default:
       return false;
   }
@@ -706,7 +646,7 @@ export function parseServerMessage(raw: string): ServerMessage | null {
         valid =
           v.id === undefined &&
           target(v) &&
-          string(v.turn) &&
+          nullableString(v.turn) &&
           string(v.generation) &&
           integer(v.sequence) &&
           string(v.content) &&
@@ -722,26 +662,6 @@ export function parseServerMessage(raw: string): ServerMessage | null {
           isAgentMessage(v.message) &&
           (v.history_sequence === null || v.message.sequence === v.history_sequence) &&
           errorOrNull(v.error);
-        break;
-      case 'log.res':
-        valid =
-          reply &&
-          (v.success === false
-            ? v.records === undefined
-            : Array.isArray(v.records) &&
-              v.records.every(appLogRecord) &&
-              (v.next_before_sequence === null || integer(v.next_before_sequence)) &&
-              (v.next_after_sequence === null || integer(v.next_after_sequence)));
-        break;
-      case 'log.append.result':
-        valid =
-          reply &&
-          (v.success === false
-            ? v.sequence === undefined
-            : integer(v.sequence) && string(v.report_id));
-        break;
-      case 'log.sync':
-        valid = v.id === undefined && Array.isArray(v.records) && v.records.every(appLogRecord);
         break;
     }
     return valid ? (v as unknown as ServerMessage) : null;

@@ -28,7 +28,8 @@ DtoPlugin：无字段，Default
             行为：检查Runtime/AsyncRuntime/Axum及MargatroidConfig，复用World唯一Clients；存在的typed绑定必须与该槽位一致。
                 取得或创建应用级WorkspaceSyncBinding及AgentUpdateContext，安装资源probe工厂，初始化DtoState及只持监控归属的SyncObservations。
                 为安装前已有Agent初始化实际来源观察，在应用启动建立一次Workspace定义磁盘监控。
-                注册GET /ws；只安装PRE_UPDATE的abort_control_system和UPDATE的dto_route_system，不安装同步System。
+                注册GET /ws及GET/HEAD /{workspace}/{*path}；文件handler复用既有ingress、AxumLifetime及WorldClosureSender，不新增业务System或公共事件。
+                只安装PRE_UPDATE的abort_control_system和UPDATE的dto_route_system，不安装同步System。
 task_sync_binding(clients: Clients, targets: &[OutboundTarget]) -> TaskSyncBinding
     行为：构造Task完整快照的DTO编码函数和同一共享槽位，注入ToolPlugin。
 agent_sync_context(clients: Clients, targets: &[OutboundTarget]) -> AgentUpdateContext
@@ -70,6 +71,27 @@ abort_control_system(world: &mut World)
 
 crate公开：
 ```text
+workspace_file_handler(State(state): State<DtoState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, uri: OriginalUri, method: Method, path: Result<Path<(String, String)>, PathRejection>) -> Future<Output = Response>
+    行为：GET/HEAD只读访问，不需要Agent、turn、MCL或预先注册WebSocket；使用现有ingress策略检查peer、Host和可选Origin，不将缺失Origin当成自动授权。
+        workspace为encodeURIComponent(完整Workspace Address)对应的单个URL段，解码一次后验证kind=workspace；不接受展示名称、定义文件路径、主机绝对路径或其他kind作为别名。
+        通过state.world提交一次原World闭包，按完整Address取得实际Workspace，读取其project_root及生命周期；不存在404、Stopping409，Starting/Running/Error允许读取；不从重载定义的project_root代替仍在运行实例的实际工作目录。
+        取得owned根路径后在持有AxumWorkGuard的受监督blocking读取中调用read_workspace_file；只允许工作目录内的普通文件，不产生写入、任务、历史或MCL审计；文件响应由同一Axum普通HTTP生命周期监督，不借出World或数据库。
+        成功返回200、准确Content-Type、Content-Length、Cache-Control: no-store、X-Content-Type-Options: nosniff；GET原始字节流，HEAD相同响应头且无正文；不base64包装，不重定向到文件系统路径，不返回目录列表。
+        路径/编码不合法400，越界/符号链接或权限拒绝403，Workspace/文件不存在或不是普通文件404，关闭中的Workspace409，服务停止503，其他读取失败500；非Unix目标在尚无安全锚定打开实现时返回501，不降级为不安全路径读取；错误正文为空，不泄露主机路径。
+        初版不提供写入、目录浏览、自动文件监控、条件缓存或分段读取协议；收到Range仍按普通GET返回200全文件，不宣称206支持。
+read_workspace_file(root: PathBuf, path: String, head_only: bool) -> Result<Response, StatusCode>
+    行为：handler先核对原始URI编码，Path extractor只解码一次，本函数接收已解码路径，不再次百分号解码；拒绝非法编码、NUL、反斜杠、绝对路径、盘符及解码后.或..目录段；编码后的分隔符不能绕过分段校验。
+        以实际project_root为锚点打开目录，逐段验证和打开，拒绝根之下的符号链接及特殊文件，最终文件始终位于该根内；检查与打开之间的路径替换也不能绕过边界，不以单次starts_with字符串检查代替文件归属验证。
+        project_root自身按实际配置解析，文件读取不拼接数据根或Agent目录，不回退Driver UI或平台静态资源。
+        Unix打开成功后取得该句柄长度，GET用tokio File及ReaderStream流式读取并take该长度，HEAD不构建文件Body；类型按扩展名静态映射，未知application/octet-stream。
+
+validate_workspace_file_path(path: &str) -> Result<(), StatusCode>
+    行为：空路径、绝对路径、反斜杠、NUL、盘符、空段及.段400，..段403；仅校验已经解码一次的相对路径，不再次解码。
+open_workspace_file(root: &Path, path: &str) -> Result<File, StatusCode>--Unix
+    行为：打开根目录句柄，按路径段以fstatat(AT_SYMLINK_NOFOLLOW)核对类型，再以openat(O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK)逐级打开，目录段额外要求O_DIRECTORY；拒绝符号链接及特殊文件，不读FIFO或设备；最终再次确认普通文件。
+workspace_file_status(error: io::Error) -> StatusCode
+    行为：不存在/非目录404，权限拒绝及ELOOP403，其余IO失败500；不把主机路径写进HTTP正文。
+
 ws_handler(State(state): State<DtoState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Future<Output = Response>
     行为：评估入口策略和退出状态，通过state.clients.allocate取得真实连接、唯一ClientReceiver及取消能力；升级任务持有AxumWorkGuard。
 
@@ -163,12 +185,7 @@ target(world: &World, address: &str) -> Result<Entity, ProtocolErrorDto>
 agent(world: &World, address: &str) -> Result<Entity, ProtocolErrorDto>
     行为：使用实际连接身份与Address定位完整Entity；Agent启动参数仍取同次全量reload快照。
 deliver<R, E>(reply: &PreparedReply<R, E>, result: Result<R, E>)
-reject<T, R, E: BoundaryError>(request: ReplyOutput：私有一次性网络回复及诊断材料
-    value: Value
-    request: Value
-    diagnostic: Option<String>--领域错误转换为安全wire错误前取得原始Debug报告
-ReplyFuture = Pin<Box<dyn Future<Output = ReplyOutput> + Send>>
-Prepared<T, R, E>, failure: ProtocolErrorDto)
+reject<T, R, E: BoundaryError>(request: Prepared<T, R, E>, failure: ProtocolErrorDto)
     行为：只认领原oneshot发送端一次。
 encode_response(value: Value) -> Option<String>
 invalid_reply(text: &str) -> Option<Value>
@@ -197,12 +214,17 @@ WorkspaceSyncBinding
 私有：
 ```text
 DtoState
+    world: WorldClosureSender--文件请求沿既有UPDATE闭包通道一次取得实际Workspace根，不缓存第二份目录
     ingress: IngressPolicy
     events: Arc<OnceLock<AsyncContext>>--只用于业务请求和连接生命周期
     clients: Clients
     lifetime: AxumLifetime
     definitions: WorkspaceDefinitions
     impl Resource + Clone
+ReplyOutput
+    value: Value
+    request: Value
+ReplyFuture = Pin<Box<dyn Future<Output = ReplyOutput> + Send>>
 Ticket = RequestTicket
 PreparedReply<R, E> = Arc<Mutex<Option<oneshot::Sender<Result<R, E>>>>>
 Prepared<T, R, E = ProtocolErrorDto>

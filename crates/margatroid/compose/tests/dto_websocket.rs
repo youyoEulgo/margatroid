@@ -73,6 +73,15 @@ impl Harness {
             Arc<std::sync::atomic::AtomicUsize>,
         )>,
     ) -> Self {
+        Self::with_counters_and_ingress(counters, config_core::IngressPolicy::Localhost)
+    }
+    fn with_counters_and_ingress(
+        counters: Option<(
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicUsize>,
+        )>,
+        policy: config_core::IngressPolicy,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let initial_root = root.path().join("agent-drivers");
         for name in ["new", "refreshed"] {
@@ -104,6 +113,8 @@ impl Harness {
                     OutboundTarget::Name("browser".into()),
                 ],
             )
+            .unwrap()
+            .with_ingress(policy)
             .unwrap(),
         );
         let definitions_root = root.path().join("workspaces");
@@ -265,6 +276,7 @@ impl Harness {
             );
         });
         app.add_plugin(DtoPlugin::new());
+        app.add_plugin(ui_plugin::UiPlugin::new());
         if let Some((frames, events)) = counters {
             app.add_system(RuntimePlugin::UPDATE, move |_world: &mut World| {
                 frames.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -2332,4 +2344,353 @@ fn aborting_user_turn_preserves_free_inference_and_free_pending_tool() {
         .unwrap()
         .current
         .take();
+}
+
+struct FileHttpResponse {
+    status: u16,
+    headers: std::collections::BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+impl Harness {
+    fn file_http(&mut self, method: &str, target: &str, headers: &str) -> FileHttpResponse {
+        let server = self.server;
+        let request = format!(
+            "{method} {target} HTTP/1.1\r\nHost: {server}\r\nConnection: close\r\n{headers}\r\n"
+        );
+        let task = self.runtime.spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut socket = tokio::net::TcpStream::connect(server).await.unwrap();
+            socket.write_all(request.as_bytes()).await.unwrap();
+            let mut bytes = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            bytes
+        });
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while !task.is_finished() {
+            self.app.tick();
+            assert!(
+                Instant::now() < deadline,
+                "HTTP file request did not complete"
+            );
+            self.runtime.block_on(async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            });
+        }
+        let bytes = self.runtime.block_on(task).unwrap();
+        let end = bytes
+            .windows(4)
+            .position(|value| value == b"\r\n\r\n")
+            .unwrap();
+        let text = std::str::from_utf8(&bytes[..end]).unwrap();
+        let mut lines = text.split("\r\n");
+        let status = lines
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let headers = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(key, value)| (key.to_ascii_lowercase(), value.trim().to_owned()))
+            .collect();
+        FileHttpResponse {
+            status,
+            headers,
+            body: bytes[end + 4..].to_vec(),
+        }
+    }
+}
+const FILE_ROOT: &str = "/workspace%3Alocal%2Fdemo%3Alatest";
+#[cfg(unix)]
+#[test]
+fn workspace_file_get_head_and_updates_use_actual_working_directory_without_agent_or_registration()
+{
+    let mut h = Harness::new();
+    h.app.world_mut().remove_component::<Agent>(h.agent);
+    let image = b"\x89PNG\r\n\x1a\nactual-project-image";
+    std::fs::write(h.root.path().join("mikuji.png"), image).unwrap();
+    std::fs::create_dir_all(h.root.path().join("docs")).unwrap();
+    std::fs::write(h.root.path().join("docs/中文 图.png"), b"unicode-image").unwrap();
+    let response = h.file_http("GET", &format!("{FILE_ROOT}/mikuji.png"), "");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, image);
+    assert_eq!(response.headers["content-type"], "image/png");
+    assert_eq!(response.headers["content-length"], image.len().to_string());
+    assert_eq!(response.headers["cache-control"], "no-store");
+    assert_eq!(response.headers["x-content-type-options"], "nosniff");
+    let head = h.file_http("HEAD", &format!("{FILE_ROOT}/mikuji.png"), "");
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty());
+    assert_eq!(head.headers["content-length"], image.len().to_string());
+    let ranged = h.file_http(
+        "GET",
+        &format!("{FILE_ROOT}/mikuji.png?v=2"),
+        "Range: bytes=0-1\r\n",
+    );
+    assert_eq!(ranged.status, 200);
+    assert_eq!(ranged.body, image);
+    let unicode = h.file_http(
+        "GET",
+        &format!("{FILE_ROOT}/docs/%E4%B8%AD%E6%96%87%20%E5%9B%BE.png"),
+        "",
+    );
+    assert_eq!(unicode.status, 200);
+    assert_eq!(unicode.body, b"unicode-image");
+    let wrong = h.root.path().join("new-definition-root");
+    std::fs::create_dir(&wrong).unwrap();
+    std::fs::write(wrong.join("mikuji.png"), b"wrong-definition").unwrap();
+    std::fs::write(
+        h.definition(),
+        format!(
+            "name: demo\nproject_root: {}\nmembers: []\n",
+            wrong.display()
+        ),
+    )
+    .unwrap();
+    h.app
+        .world()
+        .get_resource::<WorkspaceDefinitions>()
+        .unwrap()
+        .reload()
+        .unwrap();
+    std::fs::write(h.root.path().join("mikuji.png"), b"changed-actual-root").unwrap();
+    assert_eq!(
+        h.file_http("GET", &format!("{FILE_ROOT}/mikuji.png"), "")
+            .body,
+        b"changed-actual-root"
+    );
+    assert!(h.app.world().query_with::<Client>().result().is_empty());
+    assert!(
+        h.app
+            .world()
+            .get_component::<MclQueue>(h.agent)
+            .unwrap()
+            .commands
+            .is_empty()
+    );
+}
+#[cfg(unix)]
+#[test]
+fn workspace_file_paths_are_decoded_once_and_cannot_escape_or_follow_symlinks() {
+    let mut h = Harness::new();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret"), b"outside-secret").unwrap();
+    std::fs::write(h.root.path().join("inside"), b"inside").unwrap();
+    std::fs::create_dir(h.root.path().join("folder")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret"), h.root.path().join("link")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), h.root.path().join("linkdir")).unwrap();
+    std::os::unix::fs::symlink(
+        h.root.path().join("inside"),
+        h.root.path().join("inside-link"),
+    )
+    .unwrap();
+    for (path, status) in [
+        ("../secret", 403),
+        ("%2e%2e/secret", 403),
+        ("folder/%2E%2E/inside", 403),
+        ("%2Fetc/passwd", 400),
+        ("a%5Cb", 400),
+        ("%00", 400),
+        ("bad%zz", 400),
+        ("bad%", 400),
+        ("%FF", 400),
+        ("./inside", 400),
+        ("folder//inside", 400),
+        ("C%3A/foo", 400),
+        ("link", 403),
+        ("linkdir/secret", 403),
+        ("inside-link", 403),
+        ("folder", 404),
+        ("absent", 404),
+        ("inside/no-child", 404),
+    ] {
+        let response = h.file_http("GET", &format!("{FILE_ROOT}/{path}"), "");
+        assert_eq!(response.status, status, "{path}");
+        assert!(
+            response.body.is_empty(),
+            "{path}: errors must not expose paths"
+        );
+    }
+    std::fs::create_dir(h.root.path().join("%2e%2e")).unwrap();
+    std::fs::write(
+        h.root.path().join("%2e%2e/inside"),
+        b"literal-percent-directory",
+    )
+    .unwrap();
+    let literal = h.file_http("GET", &format!("{FILE_ROOT}/%252e%252e/inside"), "");
+    assert_eq!(literal.status, 200);
+    assert_eq!(literal.body, b"literal-percent-directory");
+    let fifo = h.root.path().join("pipe");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc_mkfifo_for_test(c.as_ptr()) }, 0);
+    assert_eq!(
+        h.file_http("GET", &format!("{FILE_ROOT}/pipe"), "").status,
+        404
+    );
+}
+#[cfg(unix)]
+unsafe fn libc_mkfifo_for_test(path: *const std::ffi::c_char) -> std::ffi::c_int {
+    unsafe extern "C" {
+        fn mkfifo(path: *const std::ffi::c_char, mode: u32) -> std::ffi::c_int;
+    }
+    unsafe { mkfifo(path, 0o600) }
+}
+#[cfg(unix)]
+#[test]
+fn workspace_file_identity_lifecycle_and_ingress_are_checked_per_request() {
+    let mut h = Harness::new();
+    std::fs::write(h.root.path().join("sample.txt"), b"sample").unwrap();
+    assert_eq!(h.file_http("GET", "/demo/sample.txt", "").status, 400);
+    assert_eq!(
+        h.file_http("GET", "/workspace%3Alocal%2Fdemo/sample.txt", "")
+            .status,
+        400
+    );
+    assert_eq!(
+        h.file_http("GET", "/agent%3Ademo%2Fcoder%3Alatest/sample.txt", "")
+            .status,
+        400
+    );
+    assert_eq!(
+        h.file_http("GET", "/workspace%3Alocal%2Fabsent%3Alatest/sample.txt", "")
+            .status,
+        404
+    );
+    assert_eq!(
+        h.file_http(
+            "GET",
+            &format!("{FILE_ROOT}/sample.txt"),
+            "Origin: http://example.invalid\r\n"
+        )
+        .status,
+        403
+    );
+    assert_eq!(
+        h.file_http(
+            "GET",
+            &format!("{FILE_ROOT}/sample.txt"),
+            "Origin: null\r\n"
+        )
+        .status,
+        403
+    );
+    for state in [
+        WorkspaceState::Starting,
+        WorkspaceState::Running,
+        WorkspaceState::Error,
+    ] {
+        workspace_core::update_workspace(
+            h.app.world_mut(),
+            h.workspace,
+            workspace_core::WorkspaceChange::State(state),
+        )
+        .unwrap();
+        assert_eq!(
+            h.file_http("GET", &format!("{FILE_ROOT}/sample.txt"), "")
+                .status,
+            200
+        );
+    }
+    workspace_core::update_workspace(
+        h.app.world_mut(),
+        h.workspace,
+        workspace_core::WorkspaceChange::State(WorkspaceState::Stopping),
+    )
+    .unwrap();
+    assert_eq!(
+        h.file_http("GET", &format!("{FILE_ROOT}/sample.txt"), "")
+            .status,
+        409
+    );
+    h.app
+        .world_mut()
+        .remove_component::<workspace_core::Workspace>(h.workspace);
+    assert_eq!(
+        h.file_http("GET", &format!("{FILE_ROOT}/sample.txt"), "")
+            .status,
+        404
+    );
+    let mut denied =
+        Harness::with_counters_and_ingress(None, config_core::IngressPolicy::Addresses(vec![]));
+    assert_eq!(
+        denied
+            .file_http("GET", &format!("{FILE_ROOT}/sample.txt"), "")
+            .status,
+        403
+    );
+}
+#[test]
+fn platform_assets_and_websocket_keep_priority_over_workspace_file_route() {
+    let mut h = Harness::new();
+    let page = h.file_http("GET", "/", "");
+    assert_eq!(page.status, 200);
+    let html = String::from_utf8(page.body).unwrap();
+    let script = html
+        .split("src=\"")
+        .skip(1)
+        .map(|tail| tail.split('"').next().unwrap())
+        .find(|path| path.starts_with("/assets/") && path.ends_with(".js"))
+        .unwrap();
+    let asset = h.file_http("GET", script, "");
+    assert_eq!(asset.status, 200);
+    assert!(asset.headers["content-type"].contains("javascript"));
+    let mut socket = h.connect();
+    h.register(&mut socket, "webui", "file-route-priority");
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_files_use_complete_addresses_when_display_names_are_equal() {
+    let mut h = Harness::new();
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(h.root.path().join("same.png"), b"first-workspace").unwrap();
+    std::fs::write(second.path().join("same.png"), b"second-workspace").unwrap();
+    let entity = h.app.world_mut().spawn();
+    h.app
+        .world_mut()
+        .insert_component(entity, Address::new("workspace:other/demo:latest").unwrap());
+    let updates = h
+        .app
+        .world()
+        .get_component::<workspace_core::Workspace>(h.workspace)
+        .unwrap()
+        .updates();
+    h.app.world_mut().insert_component(
+        entity,
+        workspace_core::Workspace::new(
+            "demo".into(),
+            second.path().join("workspace.yaml"),
+            second.path().into(),
+            WorkspaceState::Running,
+            BTreeSet::new(),
+            None,
+            updates,
+        ),
+    );
+    assert_eq!(
+        h.file_http("GET", &format!("{FILE_ROOT}/same.png"), "")
+            .body,
+        b"first-workspace"
+    );
+    assert_eq!(
+        h.file_http("GET", "/workspace%3Aother%2Fdemo%3Alatest/same.png", "")
+            .body,
+        b"second-workspace"
+    );
+    let origin = format!("Origin: http://{}\r\n", h.server);
+    assert_eq!(
+        h.file_http("GET", &format!("{FILE_ROOT}/same.png"), &origin)
+            .status,
+        200
+    );
+    assert_eq!(
+        h.file_http("POST", &format!("{FILE_ROOT}/same.png"), "")
+            .status,
+        405
+    );
 }

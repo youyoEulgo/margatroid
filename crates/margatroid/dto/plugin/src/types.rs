@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 
 #[derive(Clone)]
 pub(crate) struct DtoState {
+    pub world: closure_plugin::WorldClosureSender,
     pub ingress: config_core::IngressPolicy,
     pub events: Arc<std::sync::OnceLock<async_runtime_plugin::AsyncContext>>,
     pub clients: Clients,

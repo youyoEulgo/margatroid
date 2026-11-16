@@ -65,3 +65,7 @@ DTO移除dto_sync_system以及WebSocketMessageSend、ConnState、SyncState的旧
 未绑定Agent的日志直接通过既有tracing输出，遵守配置的日志级别和过滤器；不创建独立运行日志数据库、不强制保存运行级报告。绑定Agent的日志沿原AgentStorage及提交探针处理。
 
 显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Error/Stopping拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。
+
+Workspace文件读取已实现：GET/HEAD /{workspace}/{*path}由本插件提供，workspace为单段编码的完整Workspace Address；通过原World闭包取得实际运行Workspace的project_root，再只读返回根内普通文件。遵守现有ingress和HTTP生命周期，不新增事件、System、注册表、数据库或磁盘目录。
+
+文件读取在Unix使用目录句柄及逐段no-follow打开，拒绝符号链接、目录和特殊文件；GET按已打开文件长度流式返回，HEAD只返对应头，未知类型为application/octet-stream。非Unix目标返回501，不使用不安全路径检查降级。现有45种WS消息不变，不需Agent、turn或WebSocket注册。

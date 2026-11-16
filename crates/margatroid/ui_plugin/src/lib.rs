@@ -1,6 +1,6 @@
 use app_runtime_plugin::RuntimePlugin;
 use axum::body::Body;
-use axum::extract::Path;
+use axum::extract::OriginalUri;
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
@@ -32,7 +32,8 @@ impl UiPlugin {
     pub fn router() -> Router {
         Router::new()
             .route("/", get(index_handler))
-            .route("/{*path}", get(asset_handler))
+            .route("/assets/{*path}", get(asset_handler))
+            .fallback(asset_handler)
     }
 }
 
@@ -60,8 +61,8 @@ async fn index_handler() -> Result<Response<Body>, StatusCode> {
     asset_response("index.html")
 }
 
-async fn asset_handler(Path(path): Path<String>) -> Result<Response<Body>, StatusCode> {
-    asset_response(&path)
+async fn asset_handler(OriginalUri(uri): OriginalUri) -> Result<Response<Body>, StatusCode> {
+    asset_response(uri.path().trim_start_matches('/'))
 }
 
 fn asset_response(path: &str) -> Result<Response<Body>, StatusCode> {

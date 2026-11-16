@@ -31,7 +31,7 @@ log_plugin = { path = "../../../mecs/log_plugin" }
 tracing = "0.1"
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["io"] }
 
 closure_plugin = { path = "../../../mecs/closure_plugin" }
 
@@ -39,3 +39,6 @@ closure_plugin = { path = "../../../mecs/closure_plugin" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 tempfile = "3"
 tokio-tungstenite = "0.29"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

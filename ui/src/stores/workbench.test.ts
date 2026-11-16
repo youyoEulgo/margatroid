@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { createPinia, setActivePinia } from 'pinia';
 import { createRenderer, h, markRaw, nextTick } from 'vue';
 import SidebarTree from '../components/SidebarTree.vue';
+import { workspaceFileUrl } from '../lib/workspaceUrl';
 import {
   buildSidebarModel,
   contextInjection,
@@ -200,6 +201,29 @@ function page(id: string, records: unknown[]) {
   };
 }
 
+test('Workspace Markdown resources map to the encoded HTTP file route', () => {
+  const context = {
+    workspace: 'workspace:local/demo:latest',
+    endpoint: 'ws://127.0.0.1:3939/ws',
+  };
+  assert.equal(
+    workspaceFileUrl('./mikuji.png', context),
+    'http://127.0.0.1:3939/workspace%3Alocal%2Fdemo%3Alatest/mikuji.png',
+  );
+  assert.equal(
+    workspaceFileUrl('../mikuji.png', { ...context, baseDir: 'docs' }),
+    'http://127.0.0.1:3939/workspace%3Alocal%2Fdemo%3Alatest/mikuji.png',
+  );
+  assert.equal(
+    workspaceFileUrl('a b/%E4%B8%AD.png', context),
+    'http://127.0.0.1:3939/workspace%3Alocal%2Fdemo%3Alatest/a%20b/%25E4%25B8%25AD.png',
+  );
+  assert.equal(workspaceFileUrl('https://example.test/a.png', context), undefined);
+  assert.equal(workspaceFileUrl('data:image/png;base64,AA==', context), undefined);
+  assert.equal(workspaceFileUrl('/absolute.png', context), undefined);
+  assert.equal(workspaceFileUrl('../../escape.png', context), undefined);
+  assert.equal(workspaceFileUrl('./mikuji.png', { workspace: context.workspace }), undefined);
+});
 test('registration independently queries Workspace and active Agents without global state', () => {
   const e = setup();
   try {
@@ -283,37 +307,6 @@ test('lifecycle status and turn stay independent', () => {
     assert.equal(e.store.selectedAgentState?.status, 'error');
     assert.equal(e.store.selectedAgentReady, false);
     assert.equal(e.store.selectedAgentWorking, false);
-  } finally {
-    e.cleanup();
-  }
-});
-test('application log sync merges records without requiring an agent', () => {
-  const e = setup();
-  try {
-    const record = {
-      sequence: 7,
-      report_id: 'report-7',
-      created_at_ms: 100,
-      received_at_ms: 101,
-      level: 'error',
-      target: 'ui.decode',
-      agent: null,
-      message: 'Unsupported backend message',
-      details_json: { frame_type: 'future.unknown' },
-      context_json: { agent: null, workspace: null },
-      origin: 'workbench.ts:1',
-      raw_error: 'Unsupported backend message',
-      traceback: 'Error: unsupported backend message',
-      reporter: 'client:webui/browser:1',
-      source: 'host',
-      stage: 'client',
-    };
-    e.receive({ type: 'log.sync', records: [record] });
-    assert.equal(e.store.applicationLogs.length, 1);
-    assert.equal(e.store.applicationLogs[0]?.report_id, 'report-7');
-    e.receive({ type: 'log.sync', records: [{ ...record, message: 'updated' }] });
-    assert.equal(e.store.applicationLogs.length, 1);
-    assert.equal(e.store.applicationLogs[0]?.message, 'updated');
   } finally {
     e.cleanup();
   }

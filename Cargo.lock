@@ -633,6 +633,7 @@ dependencies = [
  "core_plugin",
  "futures-util",
  "inference_core",
+ "libc",
  "log_plugin",
  "lua_runtime_core",
  "margatroid_protocol",

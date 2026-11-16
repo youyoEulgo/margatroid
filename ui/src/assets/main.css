@@ -983,6 +983,14 @@ textarea:focus-visible {
   border-radius: 8px;
 }
 
+.message-content img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 10px 0;
+  border-radius: 8px;
+}
+
 .message-content .math-inline {
   display: inline;
   overflow-wrap: normal;

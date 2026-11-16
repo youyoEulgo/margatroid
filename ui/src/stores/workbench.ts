@@ -18,8 +18,6 @@ import {
   type UserImage,
   type WorkspaceSnapshot,
   type AgentInfo,
-  type AppLogRecord,
-  type AppLogReport,
   type AgentUiBundle,
   type TaskSnapshot,
   type AgentTool,
@@ -41,7 +39,6 @@ const COMMAND_RESULT: Partial<Record<ClientMessage['type'], ServerMessage['type'
   'agent.restart': 'agent.restart.result',
   'agent.turn.abort': 'agent.turn.abort.result',
   'mcl.execute': 'mcl.execute.result',
-  'log.append': 'log.append.result',
 };
 export type MessageRole = 'system' | 'user' | 'assistant' | 'tool' | 'error' | 'record';
 export interface ToolResult {
@@ -467,7 +464,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const historyCursors = ref(new Map<string, { before: number | null; after: number | null }>());
   const recordQueries = new Map<string, Target>();
   const historyQueries = new Map<string, Target>();
-  const appLogQueries = new Set<string>();
   const definitions = ref<WorkspaceConfig[]>([]);
   const runtimeWorkspaces = ref<WorkspaceInfo[]>([]);
   const agentStates = ref<AgentState[]>([]);
@@ -479,8 +475,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const workspaceNotice = ref('');
   const logs = ref<RuntimeLog[]>([]);
   const lastFailures = ref(new Map<string, { message: string }>());
-  const applicationLogs = ref<AppLogRecord[]>([]);
-  const applicationLogHistoryLoaded = ref(false);
+  const agentLogHistoryLoaded = ref(false);
   let messageClock = 0;
   function currentMessageTime(): number {
     messageClock = Math.max(Date.now(), messageClock + 1);
@@ -1385,6 +1380,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         return { Inference: data.value };
       case 'block_snapshots':
         return { BlockSnapshots: data.value };
+      case 'turn':
+        return { Turn: data.value };
     }
   }
   function handleFull(event: Extract<ServerMessage, { type: 'agent.message.full.sync' }>) {
@@ -1564,17 +1561,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         );
         break;
       }
-      case 'log.res': {
-        if (!appLogQueries.delete(event.id)) break;
-        if (event.success) {
-          mergeApplicationLogs(event.records);
-          applicationLogHistoryLoaded.value = true;
-        } else addLog('ERROR', event.error.message, 'ui.log');
-        break;
-      }
-      case 'log.sync':
-        mergeApplicationLogs(event.records);
-        break;
       case 'agent.ui.res': {
         const requested = uiQueries.get(event.id);
         uiQueries.delete(event.id);
@@ -1623,8 +1609,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           addLog('ERROR', event.error.message);
           break;
         }
-        if (event.type === 'agent.log.res') mergeLogs(query, event.records);
-        else mergeAudits(query, event.records);
+        if (event.type === 'agent.log.res') {
+          mergeLogs(query, event.records);
+          agentLogHistoryLoaded.value = true;
+        } else mergeAudits(query, event.records);
         break;
       }
       case 'agent.log.sync':
@@ -1643,28 +1631,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         break;
     }
   }
-  function mergeApplicationLogs(records: AppLogRecord[]) {
-    const rows = new Map(applicationLogs.value.map((row) => [row.sequence, row]));
-    for (const row of records) rows.set(row.sequence, row);
-    applicationLogs.value = [...rows.values()].sort((a, b) => a.sequence - b.sequence);
-  }
-  function queryApplicationLogs(range: RangeQuery = {}) {
-    if (!connected()) return;
-    const id = randomId();
-    appLogQueries.add(id);
-    socket!.send(
-      JSON.stringify({
-        type: 'log.req',
-        id,
-        message: { limit: 100, ...range },
-      } satisfies ClientMessage),
-    );
-  }
-  function appendApplicationLog(report: AppLogReport): Promise<unknown> {
-    return request({ type: 'log.append', id: randomId(), message: report });
-  }
   function loadLogHistory() {
-    queryApplicationLogs();
+    queryRecords('log');
   }
   function mergeLogs(target: Pick<Target, 'agent'>, records: AgentLogRecord[]) {
     const key = targetKey(target);
@@ -1751,11 +1719,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     mclRecords,
     historyCursors,
     selectedMclEntries,
-    applicationLogs,
-    applicationLogHistoryLoaded,
-    queryApplicationLogs,
+    agentLogHistoryLoaded,
     loadLogHistory,
-    appendApplicationLog,
     selectedSessionLogs,
     selectedHistory,
     selectedHistoryEntries,

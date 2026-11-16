@@ -19,3 +19,5 @@ Idle允许发送用户消息，Working允许中止；Starting、Restarting、Sto
 显示只接受当前实例的递增分片。点击中止立即冻结当前请求，拒绝迟到delta并等待sync；受理回执不等于清理完成，不提前显示Idle。后端仍走两帧控制路径：先清turn，再取消当前推理，原子强制return并终止未return工具；已return后台任务保留。只有通道出口已接受的分片进入后端累积器及前端流。
 
 sync以持久历史校正显示，可能与点击时内容略有差异。中止以普通completed结束，渲染已有正文及思考，不染红、不加标签、不填取消文案。finished是显示终态，不代替历史或任务清理证明。
+
+Workspace文件后端路由与平台静态资源优先级已实现；前端相对资源解析仍待接入：普通Markdown的./路径以消息所属Workspace工作目录解析，已知Markdown文件以该文件父目录解析，生成指向实际daemon origin和完整Workspace Address编码段的HTTP URL。平台/assets路由必须优先，不改变全页base，不通过read_image或临时turn渲染普通项目图片。

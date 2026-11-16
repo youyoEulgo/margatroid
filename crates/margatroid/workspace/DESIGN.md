@@ -93,7 +93,7 @@ Workspace：Component + Clone + Debug
 WorkspaceData
     name: String
     definition_path: PathBuf
-    project_root: PathBuf
+    project_root: PathBuf--运行实例实际工作目录；HTTP文件访问只以此目录为根，不根据同名展示条目或新定义缓存替换
     state: WorkspaceState
     agents: BTreeSet<Entity>
     definition: Option<WorkspaceDefinition>

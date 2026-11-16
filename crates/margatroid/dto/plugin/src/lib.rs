@@ -13,6 +13,7 @@ mod ui;
 use app_runtime_plugin::{RuntimeHandle, RuntimePlugin};
 use async_runtime_plugin::{AsyncContext, AsyncRuntimeHandle, WorldAsyncExt};
 use axum_plugin::{AppAxumExt, AxumHandle};
+use closure_plugin::WorldClosureExt;
 use config_core::MargatroidConfig;
 use core_plugin::{App, Plugin};
 use types::*;
@@ -53,6 +54,7 @@ impl Plugin for DtoPlugin {
         let agent_context = probes::get_or_create_agent_context(app.world_mut());
         probes::install_resource_bindings(app.world_mut(), agent_context);
         let state = DtoState {
+            world: app.world().closure_sender(RuntimePlugin::UPDATE),
             ingress: app
                 .world()
                 .get_resource::<MargatroidConfig>()
@@ -85,6 +87,10 @@ impl Plugin for DtoPlugin {
         app.add_axum_routes(
             axum::Router::new()
                 .route("/ws", axum::routing::get(handler::ws_handler))
+                .route(
+                    "/{workspace}/{*path}",
+                    axum::routing::get(handler::workspace_file_handler),
+                )
                 .with_state(state),
         )
         .add_system(RuntimePlugin::PRE_UPDATE, system::abort_control_system)
