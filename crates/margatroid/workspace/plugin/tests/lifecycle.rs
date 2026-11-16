@@ -471,6 +471,7 @@ fn restart_refuses_unfinished_tasks_on_every_member_without_cancelling_them() {
             .get_component::<ToolTasks>(output.members[1])
             .unwrap()
             .update_context(),
+        None,
     )
     .unwrap();
     let tasks = app

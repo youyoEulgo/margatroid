@@ -96,7 +96,7 @@ InitInference：推理句柄组件初始化请求，公开事件
 InferenceRequest：推理请求，公开事件
     id: String
     agent: Entity
-    turn: String
+    turn: Option<String>
     messages: Vec<InferenceMessage>
     config: InferenceParameters
     cancel: CancellationToken
@@ -145,15 +145,15 @@ handle_init_inference(world: &mut World, request: InitInference)
 
 handle_inference(world: &mut World, request: InferenceRequest)
     行为：
-        认领reply，检查完整Agent Entity及Running和非空匹配turn；
-        先检查当前turn，再检查ActiveInference及重叠推理。
-        在System实际受理时检查Agent当前turn；
-        已被中止清空或与request.turn不匹配，直接返回空assistant的Completed响应（正文、reasoning、tool_calls及usage均空），不创建HTTP或监督任务。
+        认领reply，检查完整Agent Entity、当前AgentSession/来源租约、请求取消能力及所需运行组件；Error/Stopping拒绝普通请求。
+        turn=None时为自由调用：Starting/Running可受理，不要求Agent已有turn，当前恰有turn也不隐式绑定。
+        turn=Some(id)时要求非空、Agent为Running且当前有效turn与id一致；失效或不匹配沿原中止响应收口，不创建HTTP或监督任务。
+        两种调用均执行ActiveInference检查，保留同Agent单个活跃推理限制，不用无turn绕过推理互斥。
         从ModelRoutes选定路由；
         直接遍历当前Agent的Tools，以每条记录的alias、description及input_schema构造本次工具定义。
         在受理阶段校验消息及参数，构造DomainRequest并调用build_request完成HTTP编码。
         向闭包交付已编码请求；工具定义和工具名称集合不进入闭包，后续调用按当前Tools查找及校验参数。
-        从World的唯一Clients资源克隆同一共享槽位及当前Agent来源有效租约，固定Agent/turn/generation身份；每次发送重新筛选当前webui接收者，不固定起始发送器快照；
+        从World的唯一Clients资源克隆同一共享槽位及当前Agent来源有效租约，固定Agent/AgentSession、显式可选turn及generation身份；每次发送重新筛选当前webui接收者，不固定起始发送器快照；
         同步登记尚未启动的共享InferenceHandle，防止异步提交窗口受理重叠请求；
         通过send_async_closure提交launch_inference。
         launch_inference在闭包内部创建监督任务并把JoinHandle交给同一共享句柄，不依赖全局执行器。ClientFrame::Text只携带已编码分片，不导入Axum消息、DTO插件或服务器框架发送器。
@@ -238,7 +238,7 @@ build_request(input: DomainRequest, route: ModelRoute) -> Result<ProviderHttpReq
 
 ```text
 -- 私有
-InferenceContext：请求执行材料--原请求及reply、已编码http_request、deadline、HTTP客户端、取消能力和推流投影
+InferenceContext：请求执行材料--原请求及reply、已编码http_request、deadline、HTTP客户端、取消能力和推流投影；原样保留Option<String>回合，不将None改成当前turn
 ProviderContext：上游材料--HTTP请求、格式解码器、取消能力及读取预算
 StreamContext：接收材料--Arc<Mutex<StreamGate>>、取消能力及StreamDelivery
 ModelSyncBinding = ProbeFactory<Option<PublicModelInfo>>
@@ -255,7 +255,7 @@ StreamDelivery：前端出口，私有类型
     id: String--生成关联，wire中为generation，不是前端请求id
     agent: String--wire中为address
     instance: String
-    turn: String
+    turn: Option<String>
     clients: Clients
     source_alive: Arc<AtomicBool>--实际Agent来源租约；正常生成结束不关闭它，停止/替换后writer丢弃旧来源帧
 InferenceLaunchOutput：已将监督任务交给共享句柄的启动事实
@@ -339,7 +339,7 @@ ProviderHttpRequest：HTTP请求--method、url、headers、body及格式响应�
 -- 公开
 InferenceHandle：本次推理句柄，公开类型
     request_id: String
-    turn: String
+    turn: Option<String>
     cancel: CancellationToken
     stop_stream: Arc<dyn Fn() + Send + Sync>--本次StreamGate关闭函数，由inference_plugin构造
     task: Arc<InferenceTaskState>--共享启动状态、Mutex<Option<JoinHandle<()>>>及完成通知
@@ -356,6 +356,7 @@ InferenceHandle：本次推理句柄，公开类型
     cancel(&self)
         行为：
             同步调用stop_stream冻结接受门，再触发cancel，不直接abort监督任务。
+            回合中止仅对handle.turn==Some(被中止turn)调用；自由推理不受其他回合的start/finish/abort影响。Agent关闭及调用者取消仍取消并等待真实收口。
 
 InferenceParameters：单次模型参数
     model: String--路由选择键

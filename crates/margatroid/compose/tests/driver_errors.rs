@@ -151,7 +151,7 @@ impl Fixture {
                     MclValue::Inference {message:json!({"type":"assistant", "content":"done", "stop_reason":"completed"}), stop_reason:"completed".into()}
                 } else if text == "EFFECT start_turn" {
                     state.working = true;
-                    MclValue::Unit
+                    MclValue::Turn("driver-error-turn".into())
                 } else if text == "EFFECT finish_turn" {
                     state.working = false;
                     state.finished += 1;
@@ -259,7 +259,7 @@ async fn shipped_drivers_stop_at_each_mcl_failure_and_host_logs_once() {
             "INJECT ? TO session.conversation[-1]",
             "EFFECT start_turn",
             "CONFIG GET",
-            "EFFECT inference (msg.instructions, session.conversation)",
+            "EFFECT inference (msg.instructions, session.conversation) ?",
             "INJECT ? TO entry.pending[-1]",
             "EFFECT finish_turn",
         ] {

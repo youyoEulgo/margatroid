@@ -80,6 +80,7 @@ pub enum EffectParameter {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum MclValue {
     Unit,
+    Turn(String),
     Array(MessageArray),
     Config(toml::Table),
     BlockSnapshots(Value),

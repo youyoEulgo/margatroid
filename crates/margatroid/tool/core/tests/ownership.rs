@@ -17,6 +17,7 @@ fn task(
         format!("alias-{id}"),
         reply,
         tasks.update_context(),
+        Some("test-turn".into()),
     )
     .unwrap();
     tasks.register(id.into(), handle.clone()).unwrap();
@@ -58,7 +59,7 @@ fn abort_and_return_share_one_atomic_reply() {
             returning.return_result(Ok(tool_core::parse_tool_result(&json!("result")).unwrap()))
         });
         barrier.wait();
-        let cancelled = tasks.abort_unreturned();
+        let cancelled = tasks.abort_unreturned("test-turn");
         let returned = worker.join().unwrap();
         let response = receiver.try_recv().unwrap().unwrap();
         assert_eq!(response.call_id, "call-pending");
@@ -73,7 +74,7 @@ fn abort_and_return_share_one_atomic_reply() {
             assert!(!handle.cancel_token().is_cancelled());
         }
         assert!(handle.has_returned());
-        assert_eq!(tasks.abort_unreturned(), 0);
+        assert_eq!(tasks.abort_unreturned("test-turn"), 0);
     }
 }
 

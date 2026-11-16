@@ -170,17 +170,17 @@ execute_operation(context: &CommandContext) -> Future<Output = Result<MclValue, 
 execute_effect(context: &CommandContext, name: &str, arguments: Vec<EffectParameter>) -> Future<Output = Result<MclValue, MclError>>
     行为：
         按effect参数约束求值，通过对应领域core能力执行或发送带oneshot的具体领域请求；
-        保留请求与回合关联。inference使用消息及推理参数，工具调用使用完整调用数组；
+        保留请求显式提供的可选回合关联。inference使用消息及推理参数，工具调用使用完整调用数组；省略turn保持None，不抓取目标当前turn自动绑定。
         工具定义与查找来自目标Agent的Tools。中止由队列外的控制流程受理，各System复检turn。
         按name分派领域调用并将参数求值为该领域输入，等待结果后返回MclValue或MclError；
         同步存储能力在blocking worker执行并等待真实join；不在此函数发送原请求reply或写入统一命令审计；
-        ready转交Agent core的agent_ready；start_turn/finish_turn同样调用Agent领域方法，不在MCL重复判断状态或turn策略。
+        ready转交Agent core的agent_ready；start_turn调用agent_start_turn并返回MclValue::Turn(String)，其值是实际当前turn；finish_turn同样调用Agent领域方法，不在MCL重复判断状态或turn策略。
         不提供agent_stop effect，关闭由Lua agent.stop注入或StopAgent领域请求处理。
         model_set校验InferenceParameters及真实ModelRoutes后使用AgentInferenceConfig统一入口安装/更新，返回安全模型元数据Config；不读取Driver manifest。
         history_append取得目标owned AgentStorage，复检命令及取消，在worker调用append_message_history并返回Array.Message。
 
 finish_turn(context: &CommandContext) -> Future<Output = Result<MclValue, MclError>>
-    行为：仅经通用check_action复检来源、MCL状态门及取消；克隆当前InferenceHandle并在World外等待wait_finished真实退出。随后调用Agent core的agent_finish_turn，由Agent领域验证Running/turn关联并清turn；成功才移除已完成句柄，MCL不重复实现回合受理规则。
+    行为：仅经通用check_action复检来源、MCL状态门及取消；只克隆与待结束turn明确关联的InferenceHandle并在World外等待wait_finished真实退出；自由推理句柄不属于该回合收尾范围。随后调用Agent core的agent_finish_turn，由Agent领域验证Running/turn关联并清turn；成功只移除已等待的同request_id、同turn且真实结束的句柄，不能移除并发出现的另一请求；MCL不重复实现回合受理规则。
         不因正常后台收口返回要求Lua重试的错误，不等待已Return后台工具；实际清理失败才返回CleanupFailed。
 block_effect_argument(context: &CommandContext, parameter: &EffectParameter) -> Result<&serde_json::Value, MclError>
     行为：取得Manual指定的原始JSON参数，缺失或非Manual返回ArgumentMismatch，不作为消息数组解释。
@@ -193,18 +193,21 @@ execute_block_effect(context: &CommandContext, name: &str, parameters: Vec<Effec
         将存储结果转换为Unit或BlockSnapshots，错误沿storage_error转换，worker失败为CleanupFailed
         不在本函数写审计或发送原请求reply，不自动重试
 
-execute_inference(context: &CommandContext, messages: Vec<Value>) -> Future<Output = Result<MclValue, MclError>>
-    行为：转换消息与读取实际推理配置，经通用check_action后提交InferenceRequest；turn只携带上下文快照，缺省为空字符串。
-        无turn也正常提交，不在MCL构造empty_completed或短路返回；Inference plugin实际受理时统一判断Running/有效turn及关联，并以原oneshot返回结果。
+explicit_turn(context: &CommandContext, parameter: Option<EffectParameter>) -> Result<Option<String>, MclError>
+    行为：省略返回None；明确参数只接受Manual指定的非空字符串，读取对应原始JSON值，不从Agent状态或执行上下文补齐。parse_instruction先验证第二参数类型、长度与控制字符。
 
-execute_tools(context: &CommandContext, messages: Vec<Value>) -> Future<Output = Result<MclValue, MclError>>
+execute_inference(context: &CommandContext, messages: Vec<Value>, turn: Option<String>) -> Future<Output = Result<MclValue, MclError>>
+    行为：转换消息与读取实际推理配置，经通用check_action后提交InferenceRequest；turn只来自本次effect明确提供的可选参数，不来自Agent当前状态快照；省略为None，空字符串或非字符串明确报参数错误。
+        无turn也正常提交，不在MCL构造empty_completed或短路返回；Inference plugin决定生命周期、会话、权限及并发受理，Some(turn)额外要求当前有效且匹配，None为自由调用，并以原oneshot返回结果。
+
+execute_tools(context: &CommandContext, messages: Vec<Value>, turn: Option<String>) -> Future<Output = Result<MclValue, MclError>>
     行为：
-        不判断Agent是否Running、有无turn或工具alias存在性；按通用MCL门通过后，合法调用全部发给ToolExecuteRequest，携带执行上下文快照turn，缺省为空字符串。
-        Tool plugin统一验证当前Running、有效turn、alias/Schema及实际任务受理，MCL只收齐并转换领域结果。
+        不判断Agent是否Running、有无turn或工具alias存在性；按通用MCL门通过后，合法调用全部发给ToolExecuteRequest；显式可选turn原样透传，省略为None，不继承当前Agent或调用工具的turn。
+        Tool plugin统一验证Starting/Running、实际会话、权限、alias/Schema及任务受理；Some(turn)额外要求Running且当前turn匹配，None不要求目标有turn，MCL只收齐并转换领域结果。
         验证调用身份后，一次性发出多个ToolExecuteRequest，各自携带Agent、原turn、call_id及独立oneshot；
         工具System按请求名称查当前Tools，存在则调用，不存在则返回对应工具错误。所有请求先发出，再用join_all收齐并按输入顺序返回。
-        中止前未被工具System受理的请求直接回中止结果；
-        已经受理且未return的任务由ToolTasks强制return并清理，使本闭包立即获得各调用的中止结果，不再等工具自然return。中止获胜后迟到Return无法再次交付，正常return先获胜的结果保留且后台任务不被杀。
+        中止前未被工具System受理且显式携带该turn的请求直接回中止结果；None自由调用不属于该回合。
+        已经受理、明确绑定该turn且未return的任务由ToolTasks强制return并清理，使本闭包立即获得各调用的中止结果，不再等工具自然return。中止获胜后迟到Return无法再次交付，正常return先获胜的结果保留且后台任务不被杀。
         同一Lua资源不同alias仍各自创建独立任务，MCL不按path或owner将它们串行化；
         A/B之间的请求路由及通信失败处理属于Lua工具内部协议；Tools记录删除不取消已进入ToolTasks的调用。
         可识别工具调用错误始终返回对应failed工具消息；
@@ -278,6 +281,7 @@ EffectParameter：效果参数，公开枚举
 
 MclValue：命令返回值，公开枚举
     Unit
+    Turn(String)--start_turn返回的实际当前回合，Lua投影为{Turn=turn}，wire为data.kind=turn/value字符串
     Error(serde_json::Value)--type=error、message及request_id；唯一回复出口将非工具错误转换为此值
     Array { Message: Vec<serde_json::Value> }
     Config(toml::Table)

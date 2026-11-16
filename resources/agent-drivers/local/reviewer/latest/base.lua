@@ -10,6 +10,7 @@ function execute(arguments, context)
         ui_path = context.resource_dir .. "/ui",
     })
     local active_model
+    local turn
     local pending_tool_results = 0
 
     local function command(text, arguments)
@@ -29,7 +30,7 @@ function execute(arguments, context)
     end
 
     local function enqueue_inference()
-        local message = command("EFFECT inference (msg.instructions, session.conversation)").Inference.message
+        local message = command("EFFECT inference (msg.instructions, session.conversation) ?", {turn}).Inference.message
         command("INJECT ? TO entry.pending[-1]", {{message}})
     end
 
@@ -132,7 +133,7 @@ function execute(arguments, context)
             inject_context(message)
         elseif message.type == "user" then
             command("INJECT ? TO session.conversation[-1]", {{message}})
-            command("EFFECT start_turn")
+            turn = command("EFFECT start_turn").Turn
             enqueue_inference()
         elseif message.type == "assistant" then
             if (message.content and message.content ~= "")
@@ -144,7 +145,7 @@ function execute(arguments, context)
                 maybe_compact_context(message)
                 command("EFFECT finish_turn")
             else
-                local results = command("EFFECT tool_call (session.conversation[-1].tool_calls)").Array.Message
+                local results = command("EFFECT tool_call (session.conversation[-1].tool_calls) ?", {turn}).Array.Message
                 pending_tool_results = #results
                 command("INJECT ? TO entry.pending[-1]", {results})
                 maybe_compact_context(message)

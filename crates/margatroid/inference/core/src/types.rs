@@ -33,7 +33,7 @@ enum InferenceTaskStatus {
 #[derive(Clone)]
 pub struct InferenceHandle {
     pub request_id: String,
-    pub turn: String,
+    pub turn: Option<String>,
     pub cancel: CancellationToken,
     pub stop_stream: Arc<dyn Fn() + Send + Sync>,
     pub task: Arc<InferenceTaskState>,

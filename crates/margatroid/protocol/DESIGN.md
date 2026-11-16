@@ -24,7 +24,7 @@ parse_client_message(text: &str) -> Result<ClientMessage, ProtocolError>
     行为：反序列化JSON，校验type、请求id、message对象、字段形状和字节预算；拒绝未知type及已删除旧字段，不负责领域受理。
 
 encode_server_message(message: &ServerMessage) -> Result<String, ProtocolError>
-    行为：按具体variant序列化顶层字段；校验成功/失败互斥、必需结果及消息预算；sync不生成请求id。
+    行为：按具体variant序列化顶层字段；校验成功/失败互斥、必需结果及消息预算；sync不生成请求id。MCL返回Turn时data.kind=turn且value为非空字符串；不新增消息type。推理chunk的turn必有且可空，None自由调用为null，full保留同一可选关联。
 
 valid_request_id(id: &str) -> bool
     行为：检查非空白、无控制字符及512字节上限。
@@ -97,7 +97,7 @@ ServerMessage：27种出站枚举，type之外的字段位于顶层，不包mess
     AgentLogSync { address: AddressDto, records: Vec<AgentLogRecordDto> }
     AgentMclRes { id: String, success: bool, address: AddressDto, records: Option<Vec<AgentMclRecordDto>>, next_before_sequence: Option<u64>, next_after_sequence: Option<u64>, error: Option<ProtocolErrorDto> }
     AgentMclSync { address: AddressDto, records: Vec<AgentMclRecordDto> }
-    AgentMessageChunkSync { address: AddressDto, turn: String, generation: String, sequence: u64, content: String, reasoning: String }
+    AgentMessageChunkSync { address: AddressDto, turn: Option<String>, generation: String, sequence: u64, content: String, reasoning: String }
     AgentMessageFullSync { address: AddressDto, turn: Option<String>, generation: Option<String>, history_sequence: Option<u64>, message: AgentMessageDto, error: Option<ProtocolErrorDto> }
     MclExecuteResult { id: String, success: bool, data: Option<MclExecuteDataDto>, error: Option<ProtocolErrorDto> }
 

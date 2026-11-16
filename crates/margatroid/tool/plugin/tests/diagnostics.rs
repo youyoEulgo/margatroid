@@ -114,7 +114,7 @@ impl Fixture {
         self.app.world().emit_event(ToolExecuteRequest {
             id: alias.into(),
             agent: self.agent,
-            turn: "diagnostic-turn".into(),
+            turn: Some("diagnostic-turn".into()),
             alias: alias.into(),
             call_id: format!("call-{alias}"),
             arguments: json!({}),

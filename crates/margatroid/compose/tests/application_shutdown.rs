@@ -137,7 +137,7 @@ async fn shutdown_phase(phase: WorkspaceState) {
         let complete = cleaned.clone();
         let handle = inference_core::InferenceHandle {
             request_id: "held-cleanup".into(),
-            turn: "held-turn".into(),
+            turn: Some("held-turn".into()),
             cancel,
             stop_stream: Arc::new(|| {}),
             task: Arc::new(inference_core::InferenceTaskState::default()),

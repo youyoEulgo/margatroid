@@ -164,6 +164,7 @@ fn next() -> u64 {
 fn mcl_value(value: mcl_core::MclValue) -> Value {
     match value {
         mcl_core::MclValue::Unit => json!({}),
+        mcl_core::MclValue::Turn(turn) => json!({"Turn":turn}),
         mcl_core::MclValue::Config(value) => json!({"Config":value}),
         mcl_core::MclValue::Array(value) => json!({"Array":value}),
         mcl_core::MclValue::Inference {

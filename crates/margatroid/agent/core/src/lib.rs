@@ -74,11 +74,14 @@ impl WorldAgentExt for World {
         let agent = self
             .get_component_mut::<Agent>(entity)
             .ok_or_else(|| AgentError::new(AgentErrorKind::AgentMissing, "agent does not exist"))?;
-        if agent.state != AgentState::Running || agent.turn.is_some() {
+        if agent.state != AgentState::Running {
             return Err(AgentError::new(
                 AgentErrorKind::StateRejected,
-                "a running Agent without an active turn is required",
+                "a running Agent is required",
             ));
+        }
+        if let Some(turn) = &agent.turn {
+            return Ok(turn.clone());
         }
         static PREFIX: OnceLock<String> = OnceLock::new();
         static NEXT: AtomicU64 = AtomicU64::new(1);

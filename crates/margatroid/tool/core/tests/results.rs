@@ -162,7 +162,8 @@ fn execution_limits_have_lua_memory_and_buffer_budgets_and_round_trip() {
                 "call".into(),
                 "tool".into(),
                 oneshot::channel().0,
-                test_tasks().update_context()
+                test_tasks().update_context(),
+                None,
             )
             .unwrap_err()
             .kind,
@@ -197,7 +198,7 @@ async fn events_share_single_claimable_oneshot_with_turn_identity() {
     let request = ToolExecuteRequest {
         id: "task".into(),
         agent,
-        turn: "turn".into(),
+        turn: Some("turn".into()),
         alias: "tool".into(),
         call_id: "model-call".into(),
         arguments: json!({"value": 1}),

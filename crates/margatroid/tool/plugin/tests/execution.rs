@@ -166,7 +166,7 @@ impl Fixture {
         self.app.world().emit_event(ToolExecuteRequest {
             id: id.into(),
             agent: self.agent,
-            turn: "test-turn".into(),
+            turn: Some("test-turn".into()),
             alias: alias.into(),
             call_id: format!("call-{id}"),
             arguments,
@@ -1406,7 +1406,7 @@ fn accepted_batch_abort_returns_long_call_immediately_and_preserves_returned_bac
         fixture.app.world().emit_event(ToolExecuteRequest {
             id: id.into(),
             agent: fixture.agent,
-            turn: "test-turn".into(),
+            turn: Some("test-turn".into()),
             alias: alias.into(),
             call_id: format!("original-{id}"),
             arguments: json!({}),
@@ -1440,7 +1440,7 @@ fn accepted_batch_abort_returns_long_call_immediately_and_preserves_returned_bac
     )
     .unwrap();
     let started = Instant::now();
-    assert_eq!(fixture.tasks().abort_unreturned(), 1);
+    assert_eq!(fixture.tasks().abort_unreturned("test-turn"), 1);
     let response = fixture
         .response_with_timeout(long_reply, Duration::from_secs(1))
         .unwrap();
@@ -1449,7 +1449,7 @@ fn accepted_batch_abort_returns_long_call_immediately_and_preserves_returned_bac
     assert_eq!(response.call_id, "original-unreturned-abort");
     assert_eq!(response.alias, "long-abort");
     assert_eq!(response.content, "Tool call aborted.");
-    assert_eq!(fixture.tasks().abort_unreturned(), 0);
+    assert_eq!(fixture.tasks().abort_unreturned("test-turn"), 0);
     fixture.removed("unreturned-abort");
     assert_eq!(
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
@@ -2012,4 +2012,45 @@ fn workspace_members_are_live_and_cross_workspace_registration_is_rejected() {
         .get("forbidden")
         .is_none());
     let _ = (source, sibling);
+}
+
+#[test]
+fn free_tools_initialize_without_turn_and_do_not_inherit_an_active_turn() {
+    use agent_core::WorldAgentExt;
+    for (state, current) in [
+        (AgentState::Starting, None),
+        (AgentState::Running, None),
+        (AgentState::Running, Some("unrelated-turn".to_owned())),
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.tool("free-init",r#"function execute(args,context) assert(context.turn==nil);margatroid.task:return_result('free-initialized') end"#);
+        fixture
+            .app
+            .world_mut()
+            .agent_transition(fixture.agent, state, current.clone())
+            .unwrap();
+        let (tx, rx) = oneshot::channel();
+        fixture.app.world().emit_event(ToolExecuteRequest {
+            id: "free-init".into(),
+            agent: fixture.agent,
+            turn: None,
+            alias: "free-init".into(),
+            call_id: "free-init-call".into(),
+            arguments: json!({}),
+            reply: Arc::new(Mutex::new(Some(tx))),
+        });
+        let result = fixture.response(rx).unwrap();
+        assert!(!result.failed, "{result:?}");
+        assert_eq!(result.content, "free-initialized");
+        assert_eq!(
+            fixture
+                .app
+                .world()
+                .get_component::<agent_core::Agent>(fixture.agent)
+                .unwrap()
+                .turn(),
+            &current
+        );
+        fixture.removed("free-init");
+    }
 }

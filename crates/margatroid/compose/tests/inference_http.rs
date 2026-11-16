@@ -274,7 +274,7 @@ impl Fixture {
             InferenceRequest {
                 id: id.into(),
                 agent: self.agent,
-                turn: "turn".into(),
+                turn: Some("turn".into()),
                 messages: vec![InferenceMessage::User {
                     content: "hello".into(),
                     images: vec![],
@@ -580,7 +580,7 @@ fn tool_result_images_keep_each_formats_native_or_deferred_layout() {
 fn invalid_turn_and_stale_entity_never_find_a_replacement_by_address() {
     let mut fixture = Fixture::new("http://127.0.0.1:1/v1", "openai", "chat_completions");
     let (mut request, reply) = fixture.request("wrong-turn");
-    request.turn = "old".into();
+    request.turn = Some("old".into());
     assert_eq!(
         fixture.run(request, reply).unwrap().stop_reason,
         InferenceStopReason::Completed
@@ -1086,4 +1086,79 @@ fn test_workspace_context() -> workspace_core::WorkspaceUpdateContext {
 
 fn test_probe<T>() -> client_core::UpdateProbe<T> {
     client_core::UpdateProbe::new(|_| {})
+}
+
+#[test]
+fn free_inference_executes_without_a_turn_in_starting_and_running_and_never_inherits_one() {
+    use agent_core::WorldAgentExt;
+    for (state, current) in [
+        (AgentState::Starting, None),
+        (AgentState::Running, None),
+        (AgentState::Running, Some("unrelated-turn".to_owned())),
+    ] {
+        let server = HttpServer::new(trace("chat_completions"));
+        let mut fixture = Fixture::new(&server.url, "openai", "chat_completions");
+        fixture
+            .app
+            .world_mut()
+            .agent_transition(fixture.agent, state, current.clone())
+            .unwrap();
+        let (mut request, reply) = fixture.request("free-inference");
+        request.turn = None;
+        let result = fixture.run(request, reply).unwrap();
+        assert!(result.content.is_some());
+        fixture.idle();
+        assert!(server.received.recv_timeout(Duration::from_secs(1)).is_ok());
+        let handle = fixture
+            .app
+            .world()
+            .get_component::<ActiveInference>(fixture.agent)
+            .unwrap()
+            .current
+            .as_ref()
+            .unwrap();
+        assert_eq!(handle.turn, None);
+        assert_eq!(
+            fixture
+                .app
+                .world()
+                .get_component::<agent_core::Agent>(fixture.agent)
+                .unwrap()
+                .turn(),
+            &current
+        );
+    }
+}
+#[test]
+fn free_inference_still_rejects_error_stopping_and_precancelled_requests() {
+    use agent_core::WorldAgentExt;
+    for (state, cancelled) in [
+        (AgentState::Error, false),
+        (AgentState::Stopping, false),
+        (AgentState::Starting, true),
+    ] {
+        let server = HttpServer::new(trace("chat_completions"));
+        let mut fixture = Fixture::new(&server.url, "openai", "chat_completions");
+        fixture
+            .app
+            .world_mut()
+            .agent_transition(fixture.agent, state, None)
+            .unwrap();
+        let (mut request, reply) = fixture.request("rejected-free");
+        request.turn = None;
+        if cancelled {
+            request.cancel.cancel();
+        }
+        fixture.run(request, reply).unwrap();
+        assert!(server.received.try_recv().is_err());
+        assert!(
+            fixture
+                .app
+                .world()
+                .get_component::<ActiveInference>(fixture.agent)
+                .unwrap()
+                .current
+                .is_none()
+        );
+    }
 }

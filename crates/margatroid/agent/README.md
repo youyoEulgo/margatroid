@@ -9,7 +9,7 @@ agent_core定义Agent自身组件、生命周期状态、事件和错误，目�
 
 状态只包含Starting、Running、Error、Stopping，turn独立。Handler在一次同步调用中检查状态白名单并切换状态，随后提交异步闭包。
 
-Starting从实体创建覆盖资源挂载和应用初始化，资源挂载完成仍为Starting；MCL在Starting/Running可用，只有ready进入Running。Running无turn允许start_turn，有turn允许推理及工具请求；开始/中止/结束只改变turn。Error拒绝普通MCL，仅接受查询及清理，Stopping表示实际关闭监督。Starting/Running/Error可停止，重复Stopping拒绝。重启保留已有未完成工具任务的受理检查，通过检查后真实先停止旧运行再Starting，不存在Restarting。
+Starting从实体创建覆盖资源挂载和应用初始化，资源挂载完成仍为Starting；MCL在Starting/Running可用，只有ready进入Running。Running下start_turn无则创建、有则返回当前标识；推理及工具显式携带turn才检查关联，省略允许自由调用；开始/中止/结束只改变turn。Error拒绝普通MCL，仅接受查询及清理，Stopping表示实际关闭监督。Starting/Running/Error可停止，重复Stopping拒绝。重启保留已有未完成工具任务的受理检查，通过检查后真实先停止旧运行再Starting，不存在Restarting。
 
 stop_agent_system、restart_agent_system、start_agent_system依次挂载于同一Schedule，直接使用mecs按添加顺序同步执行的机制。同帧关闭优先于重启；先受理者同步修改状态，后者按白名单拒绝。不增加统一生命周期事件、排序队列或手写优先级分发器。优先级不取消前一帧已受理的操作。
 
@@ -48,8 +48,10 @@ StartTurn、FinishTurn和AbortTurn同属唯一Agent更新入口，turn变化和�
 
 当前工作树已实现统一Lua：复用既有资源挂载、Storage、MCL队列、任务监督、进程回收及同步入口。Workspace先启动独立Lua任务；Agent创建由公共Lua注入能力提交StartAgent，Agent不再启动/持有/终止Lua VM。执行者与目标分开，Agent归属Workspace或父Agent，配置按明确初值文件初始化持久化，UI按创建时传入目录直接监控，模型通过EFFECT model_set配置。公共mcl.execute指定目标，wait(agent)登记本次唤醒句柄；关闭Agent使用margatroid.agent:stop(address)注入方法提交原StopAgent并外部监督，不经过MCL。EFFECT tool_call只接收调用数组。Driver专用manifest依赖裁剪取消；工具发现元数据保持。初始化/委托/子代理应用未实现；前端源码不在本轮修改范围内。
 
-四态契约：Agent/Workspace公开starting、running、error、stopping；Agent挂载完成不是ready，MCL允许starting/running，推理和工具仅running且有效turn。Lua创建的Agent在返回信息前绑定实际执行实例与AgentSession监控；执行异常真实收口后写Agent日志，原提交探针直投Clients，再通过AgentException发布error，正常结束和取消不误报故障，旧会话解绑。关闭使用Lua agent.stop注入，不提供MCL agent_stop。
+四态契约：Agent/Workspace公开starting、running、error、stopping；Agent挂载完成不是ready，MCL允许starting/running，推理和工具显式携带turn时要求running且匹配，省略时为Starting/Running自由调用。Lua创建的Agent在返回信息前绑定实际执行实例与AgentSession监控；执行异常真实收口后写Agent日志，原提交探针直投Clients，再通过AgentException发布error，正常结束和取消不误报故障，旧会话解绑。关闭使用Lua agent.stop注入，不提供MCL agent_stop。
 
 agent_ready作为Agent领域统一入口验证状态和turn，MCL只转交；回合开始/结束/中止也由Agent core方法验证。MCL不按具体指令维护第二套受理条件。
 
 Agent创建注入接口为owner/name/config_path/ui_path，拒绝旧resource_dir创建参数。配置仅首次从config_path初始化至Agent持久setting.toml，后续重启保留已修改配置；ui_path始终直接引用与监控，不创建Agent本地UI，不复制、覆盖、删除已有UI副本，也不把旧副本作为回退来源。Lua程序加载只读取程序文件，不推导或读取同目录配置。
+
+显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Error/Stopping拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。

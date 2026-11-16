@@ -61,7 +61,7 @@ abort_control_system(world: &mut World)
     接收闭包结果：None
     产出事件：None
     回复：Result<(), ProtocolErrorDto>
-    行为：调用handle_abort_control，经Agent统一入口同步清turn，再执行推理冻结及工具中止裁决；各领域入口直接发布实际变化。
+    行为：调用handle_abort_control，经Agent统一入口同步清turn，再仅对显式绑定该turn的推理执行冻结、对该turn的工具执行中止裁决；自由调用不参与回合中止；各领域入口直接发布实际变化。
 ```
 
 # handler
@@ -174,6 +174,7 @@ encode_response(value: Value) -> Option<String>
 invalid_reply(text: &str) -> Option<Value>
 frame(kind: &str, id: &str, result: Result<Value, ProtocolErrorDto>) -> Value
 mcl_result(value: MclValue) -> Result<Value, ProtocolErrorDto>
+    行为：Turn(id)投影为data={kind:"turn",value:id}，保留原请求id；Unit仍无data，不能把turn结果丢弃或投影为Unit。
 history_record(value: StoredHistoryRecord) -> Value
 mcl_record(value: StoredHistoryRecord) -> Value
 log_record(value: StoredAgentLog) -> Value

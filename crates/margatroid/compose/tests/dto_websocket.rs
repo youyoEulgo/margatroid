@@ -829,6 +829,7 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
             .get_component::<ToolTasks>(harness.agent)
             .unwrap()
             .update_context(),
+        Some(turn.clone()),
     )
     .unwrap();
     task.return_result(Ok(tool_core::ToolExecuteResponse {
@@ -855,6 +856,7 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
             .get_component::<ToolTasks>(harness.agent)
             .unwrap()
             .update_context(),
+        Some(turn.clone()),
     )
     .unwrap();
     let tasks = harness
@@ -882,7 +884,7 @@ fn abort_control_runs_next_frame_freezes_inference_and_only_cancels_unreturned_t
         .current = Some({
         let inference = InferenceHandle {
             request_id: "inference".into(),
-            turn: turn.clone(),
+            turn: Some(turn.clone()),
             cancel: cancel.clone(),
             stop_stream: Arc::new(move || {
                 assert!(!observed.is_cancelled());
@@ -1511,6 +1513,7 @@ fn task_queries_and_complete_sync_do_not_consume_script_output_or_replaced_marke
             .get_component::<ToolTasks>(harness.agent)
             .unwrap()
             .update_context(),
+        None,
     )
     .unwrap();
     task.replace(json!("first")).unwrap();
@@ -1958,6 +1961,7 @@ fn task_output_return_and_cleanup_reach_websocket_without_any_world_update_frame
         "bash".into(),
         reply,
         tasks.update_context(),
+        None,
     )
     .unwrap();
     let stop = Arc::new(AtomicBool::new(false));
@@ -2249,4 +2253,83 @@ fn turn_and_resource_mutations_publish_without_another_world_tick() {
         .clone();
     server.request_shutdown();
     harness.wait(|_| server.is_stopped());
+}
+
+#[test]
+fn aborting_user_turn_preserves_free_inference_and_free_pending_tool() {
+    let mut harness = Harness::new();
+    let mut socket = harness.connect();
+    harness.register(&mut socket, "webui", "free-abort");
+    let turn = harness
+        .app
+        .world_mut()
+        .agent_start_turn(harness.agent)
+        .unwrap();
+    let (tx, rx) = oneshot::channel();
+    let handle = InferenceHandle {
+        request_id: "free-http".into(),
+        turn: None,
+        cancel: CancellationToken::new(),
+        stop_stream: Arc::new(|| panic!("free stream must not be frozen by turn abort")),
+        task: Default::default(),
+    };
+    handle
+        .attach_task(harness.runtime.spawn(async move {
+            rx.await.unwrap();
+        }))
+        .unwrap();
+    harness
+        .app
+        .world_mut()
+        .get_component_mut::<ActiveInference>(harness.agent)
+        .unwrap()
+        .current = Some(handle.clone());
+    let tasks = harness
+        .app
+        .world()
+        .get_component::<ToolTasks>(harness.agent)
+        .unwrap()
+        .clone();
+    let (reply, mut result) = oneshot::channel();
+    let (tool, _) = ToolTaskHandle::new(
+        &ToolExecutionLimits::default(),
+        "free-call".into(),
+        "free-tool".into(),
+        reply,
+        tasks.update_context(),
+        None,
+    )
+    .unwrap();
+    tasks.register("free-task".into(), tool.clone()).unwrap();
+    harness.request(
+        &mut socket,
+        "agent.turn.abort",
+        "abort-free",
+        json!({"address":"agent:demo/coder","turn":turn}),
+    );
+    let reply = harness.next(&mut socket, |value| value["id"] == "abort-free");
+    assert_eq!(reply["success"], true);
+    assert!(!handle.cancel.is_cancelled());
+    assert!(!tool.cancel_token().is_cancelled());
+    assert!(!tool.has_returned());
+    assert!(result.try_recv().is_err());
+    tool.return_result(Ok(tool_core::ToolExecuteResponse {
+        call_id: "free-call".into(),
+        alias: "free-tool".into(),
+        content: "done".into(),
+        images: vec![],
+        failed: false,
+    }))
+    .unwrap();
+    assert!(!result.try_recv().unwrap().unwrap().failed);
+    tasks.complete_cleanup("free-task", &tool, None);
+    tx.send(()).unwrap();
+    harness.runtime.block_on(handle.wait_finished()).unwrap();
+    harness
+        .app
+        .world_mut()
+        .get_component_mut::<ActiveInference>(harness.agent)
+        .unwrap()
+        .current
+        .take();
 }

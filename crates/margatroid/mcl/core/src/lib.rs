@@ -271,8 +271,29 @@ pub fn parse_instruction(input: &MclInstruction) -> Result<MclOperation, MclErro
                     return Err(invalid("effect parameter must be expression or ?"));
                 }
             }
-            if arguments.len() != arity {
+            let optional_turn = matches!(name, "inference" | "tool_call");
+            if arguments.len() != arity && !(optional_turn && arguments.len() == arity + 1) {
                 return Err(invalid("effect parameter count mismatch"));
+            }
+            if optional_turn && arguments.len() == 2 {
+                let EffectParameter::Manual(index) = arguments[1] else {
+                    return Err(invalid("turn must be passed explicitly with ?"));
+                };
+                if input
+                    .arguments
+                    .get(index)
+                    .and_then(|value| value.as_str())
+                    .is_none_or(|turn| {
+                        turn.trim().is_empty()
+                            || turn.len() > 512
+                            || turn.chars().any(char::is_control)
+                    })
+                {
+                    return Err(MclError::new(
+                        MclErrorKind::ArgumentMismatch,
+                        "turn must be a nonempty string",
+                    ));
+                }
             }
             if matches!(name, "block_snapshot" | "block_snapshots" | "block_restore")
                 && arguments

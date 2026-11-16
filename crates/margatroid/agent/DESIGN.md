@@ -41,8 +41,8 @@ WorldAgentExt：Agent访问扩展，公开trait
         行为：Agent领域检查Starting或Running且无turn，再经统一入口转Running；拒绝Error/Stopping及已有turn，MCL只调用此方法。
     agent_start_turn(&mut self, agent: Entity) -> Result<String, AgentError>
         行为：
-            仅Running且turn为空允许；
-            同步生成turn，Agent始终Running。
+            仅Running允许；已有有效turn时直接返回同一标识，不生成或替换回合，不重复发布变化。
+            turn为空时同步生成并发布新turn，返回其标识；Agent始终Running。
     agent_finish_turn(&mut self, agent: Entity, turn: &str) -> Result<(), AgentError>
         行为：
             只验证Running、传入turn非空且与当前有效turn一致；当前turn已空时允许原调用链幂等结束。
@@ -390,7 +390,7 @@ AgentStartParameters：启动参数，公开类型
 
 AgentState：生命周期状态，公开枚举
     Starting--创建/挂载/初始化；允许MCL，不允许新推理或工具执行
-    Running--ready完成；普通MCL可用，推理/工具额外要求有效turn
+    Running--ready完成；普通MCL可用；推理/工具仅在请求明确携带turn时检查有效关联，自由调用不要求当前turn
     Error--明确异常；只允许查询诊断及关闭清理，不接受普通MCL
     Stopping--真实停止监督正在执行，清理完成才移除Entity
     行为：不存在Idle、Working或Restarting；turn为独立Option<String>，回合开始、中止和结束不修改Running。

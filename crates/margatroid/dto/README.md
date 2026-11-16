@@ -63,3 +63,5 @@ DTO移除dto_sync_system以及WebSocketMessageSend、ConnState、SyncState的旧
 本轮680项Rust测试及严格workspace Clippy通过。真实WS回归覆盖无World帧的Task输出/Return/移除、Turn/资源更新、COMMIT记录、UI变化及Workspace磁盘新增/错误/恢复/删除。隔离release的四批持久Bash输出均在未查询前收到结束标记；大窗口仍以完整快照发送，高频输出的总编码/流量并未因此消除，不把队列合并等同于节流。
 
 未绑定Agent的日志直接通过既有tracing输出，遵守配置的日志级别和过滤器；不创建独立运行日志数据库、不强制保存运行级报告。绑定Agent的日志沿原AgentStorage及提交探针处理。
+
+显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Error/Stopping拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。

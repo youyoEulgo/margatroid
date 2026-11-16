@@ -92,9 +92,12 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         .get_component::<Agent>(request.agent)
         .is_some_and(|agent| {
             world.is_alive(request.agent)
-                && agent.state() == AgentState::Running
-                && !request.turn.is_empty()
-                && agent.turn().as_deref() == Some(request.turn.as_str())
+                && matches!(agent.state(), AgentState::Starting | AgentState::Running)
+                && request.turn.as_ref().is_none_or(|turn| {
+                    !turn.is_empty()
+                        && agent.state() == AgentState::Running
+                        && agent.turn().as_ref() == Some(turn)
+                })
         });
     if !accepted {
         let _ = reply.send(Ok(tool_core::ToolExecuteResponse::aborted(
@@ -207,6 +210,7 @@ pub(crate) fn handle_tool_execute(world: &mut World, request: ToolExecuteRequest
         request.alias.clone(),
         reply,
         tasks.update_context(),
+        request.turn.clone(),
     ) else {
         // Handle construction delivers its validation failure to the original reply.
         return;
@@ -2243,6 +2247,7 @@ mod world_sender_tests {
             "source".into(),
             reply,
             tasks.update_context(),
+            None,
         )
         .unwrap();
         tasks.register("caller".into(), handle.clone()).unwrap();
@@ -2269,7 +2274,7 @@ mod world_sender_tests {
             request: ToolExecuteRequest {
                 id: "caller".into(),
                 agent,
-                turn: "turn".into(),
+                turn: Some("turn".into()),
                 alias: "source".into(),
                 call_id: "call".into(),
                 arguments: serde_json::json!({}),
@@ -2356,6 +2361,7 @@ mod world_sender_tests {
             "owner-alias".into(),
             reply,
             context.tasks.update_context(),
+            None,
         )
         .unwrap();
         context
@@ -2389,6 +2395,7 @@ mod world_sender_tests {
             "owned".into(),
             reply,
             context.tasks.update_context(),
+            None,
         )
         .unwrap();
         context
@@ -2448,6 +2455,7 @@ mod world_sender_tests {
             "owner".into(),
             reply,
             context.tasks.update_context(),
+            None,
         )
         .unwrap();
         context
@@ -2550,7 +2558,7 @@ mod world_sender_tests {
             ToolExecuteRequest {
                 id: "queued".into(),
                 agent,
-                turn: "turn".into(),
+                turn: Some("turn".into()),
                 alias: "test".into(),
                 call_id: "call".into(),
                 arguments: serde_json::json!({}),
@@ -2575,7 +2583,7 @@ mod world_sender_tests {
             workspace: serde_json::json!({"address":"workspace:test/unit","name":"test","project_root":"/project"}),
             owner_agent: None,
             agent_name: "test".into(),
-            turn: "turn".into(),
+            turn: Some("turn".into()),
             source_origin: "/resource/main.lua".into(),
             task_id: "task".into(),
             call_id: "call".into(),

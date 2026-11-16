@@ -151,7 +151,7 @@ impl Fixture {
         self.app.world().emit_event(ToolExecuteRequest {
             id: id.into(),
             agent: self.agent,
-            turn: "test-turn".into(),
+            turn: Some("test-turn".into()),
             alias: alias.into(),
             call_id: format!("call-{id}"),
             arguments,

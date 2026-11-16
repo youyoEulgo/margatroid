@@ -128,6 +128,7 @@ struct ToolTaskData {
 #[derive(Debug)]
 struct ToolTaskShared {
     execution_id: String,
+    turn: Option<String>,
     registrations: crate::TaskScope,
     cancel: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -146,6 +147,9 @@ pub struct ToolTaskHandle {
 }
 
 impl ToolTaskHandle {
+    pub fn turn(&self) -> Option<&str> {
+        self.inner.turn.as_deref()
+    }
     pub(crate) fn update_context(&self) -> &crate::TaskUpdateContext {
         &self.updates
     }
@@ -155,6 +159,7 @@ impl ToolTaskHandle {
         alias: String,
         reply: oneshot::Sender<Result<ToolExecuteResponse, ToolError>>,
         updates: crate::TaskUpdateContext,
+        turn: Option<String>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), ToolError> {
         if let Err(error) = limits.validate() {
             let _ = reply.send(Err(error.clone()));
@@ -172,6 +177,7 @@ impl ToolTaskHandle {
                 updates,
                 inner: Arc::new(ToolTaskShared {
                     execution_id,
+                    turn,
                     registrations: crate::TaskScope::default(),
                     cancel: CancellationToken::new(),
                     task: Mutex::new(None),

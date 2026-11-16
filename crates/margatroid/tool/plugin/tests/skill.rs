@@ -149,7 +149,7 @@ mod linux {
             self.app.world().emit_event(ToolExecuteRequest {
                 id: id.into(),
                 agent: self.agent,
-                turn: "integration-turn".into(),
+                turn: Some("integration-turn".into()),
                 alias: alias.into(),
                 call_id: format!("call-{id}"),
                 arguments,

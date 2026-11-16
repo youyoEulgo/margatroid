@@ -124,6 +124,7 @@ pub(crate) fn handle_start_driver_lua_vm(world: &mut World, request: StartDriver
             request.program.origin.to_string_lossy().into_owned(),
             tx,
             tasks.update_context(),
+            None,
         ) {
             Ok(value) => value,
             Err(error) => {

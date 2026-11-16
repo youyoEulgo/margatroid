@@ -711,7 +711,7 @@ fn stop_closes_admission_then_waits_for_vm_inference_tools_and_mcl_drain() {
     });
     let inference_handle = InferenceHandle {
         request_id: "inference".into(),
-        turn: "turn".into(),
+        turn: Some("turn".into()),
         cancel: cancel.clone(),
         stop_stream: Arc::new(move || {
             gate_copy.fetch_add(1, Ordering::SeqCst);
@@ -943,6 +943,7 @@ fn new_tool_task(
         "tool".into(),
         reply,
         tasks.update_context(),
+        None,
     )
     .unwrap()
 }

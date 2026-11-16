@@ -486,15 +486,23 @@ pub(crate) fn validate_server_value(value: &Value) -> Result<(), ProtocolError> 
     if kind == "agent.message.full.sync" {
         require_fields(value, &["turn", "generation", "history_sequence", "error"])?;
     }
+    if kind == "mcl.execute.result"
+        && value["success"] == true
+        && value["data"]["kind"] == "turn"
+        && !value["data"]["value"]
+            .as_str()
+            .is_some_and(valid_request_id)
+    {
+        return Err(invalid("invalid returned turn"));
+    }
     if kind == "agent.message.chunk.sync" {
         if !value
             .get("generation")
             .and_then(Value::as_str)
             .is_some_and(valid_request_id)
-            || !value
+            || value
                 .get("turn")
-                .and_then(Value::as_str)
-                .is_some_and(valid_request_id)
+                .is_none_or(|turn| !turn.is_null() && !turn.as_str().is_some_and(valid_request_id))
             || !value
                 .get("sequence")
                 .and_then(Value::as_u64)

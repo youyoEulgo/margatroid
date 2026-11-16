@@ -49,6 +49,7 @@ async fn task_lifetime_is_configured_once_and_does_not_complete_before_cleanup()
         "tool".into(),
         tokio::sync::oneshot::channel().0,
         test_tasks().update_context(),
+        None,
     )
     .unwrap();
     assert!(
@@ -76,6 +77,7 @@ async fn unlimited_task_has_no_lifetime_timer_and_can_finish() {
         "tool".into(),
         tokio::sync::oneshot::channel().0,
         test_tasks().update_context(),
+        None,
     )
     .unwrap();
     task.configure_lifetime(0).unwrap();

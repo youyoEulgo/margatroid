@@ -27,10 +27,7 @@ fn turn_admission_changes_state_synchronously_and_never_overwrites() {
         "ready must not clear an active turn"
     );
     assert_eq!(*world.agent_state(entity).unwrap(), AgentState::Running);
-    assert_eq!(
-        world.agent_start_turn(entity).unwrap_err().kind,
-        AgentErrorKind::StateRejected
-    );
+    assert_eq!(world.agent_start_turn(entity).unwrap(), turn);
     assert_eq!(
         world
             .get_component::<Agent>(entity)

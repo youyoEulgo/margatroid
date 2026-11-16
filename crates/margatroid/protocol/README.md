@@ -102,3 +102,5 @@ sequence是同generation文本快照顺序，前端直接替换而非拼接，�
 Rust类型、机器Schema和可执行样例已同步，AsyncAPI引用新Schema。前端及参考客户端源码未改；本轮只验证后端契约，不表示前端已对接新增能力。
 
 生成full是一次性终态，不是落库状态的两阶段推送：推理完成发送一次history_sequence=null；保存同一assistant后不再补发带持久序号的full。持久记录通过history查询关联。记录同步只负责非生成消息，generation=null，不能用普通MCL请求id推断生成关联。
+
+显式可选turn契约：start_turn取得并返回当前turn，已有回合返回同一标识；推理和工具显式携带turn时严格校验，省略为None自由调用，不自动继承当前turn。自由调用仍受实际会话、权限、生命周期、取消及原有并发限制；Starting允许初始化所需自由调用，Error/Stopping拒绝。回合中止/收尾只作用于明确绑定该turn的请求，Agent关闭仍监督全部调用。详见本域DESIGN。运行中的旧进程仍需使用新构建。

@@ -18,6 +18,7 @@ fn with_limits(
         "tool".into(),
         reply,
         test_tasks().update_context(),
+        Some("test-turn".into()),
     )
     .unwrap()
 }
@@ -246,6 +247,7 @@ async fn return_delivers_original_association_and_keeps_background_task_alive() 
         "original-alias".into(),
         reply,
         tasks.update_context(),
+        Some("test-turn".into()),
     )
     .unwrap();
     tasks.register("task".into(), task.clone()).unwrap();
@@ -257,7 +259,7 @@ async fn return_delivers_original_association_and_keeps_background_task_alive() 
         task.return_result(Ok(response())).unwrap_err().kind,
         ToolErrorKind::AlreadyReturned
     );
-    assert_eq!(tasks.abort_unreturned(), 0);
+    assert_eq!(tasks.abort_unreturned("test-turn"), 0);
     assert!(!task.cancel_token().is_cancelled());
     task.write(json!("background")).unwrap();
     tasks.send("task", json!("input")).unwrap();
@@ -277,6 +279,7 @@ fn abort_and_return_race_delivers_exactly_one_reply_and_cancels_only_abort_winne
             "alias".into(),
             reply,
             tasks.update_context(),
+            Some("test-turn".into()),
         )
         .unwrap();
         tasks.register("task".into(), task.clone()).unwrap();
@@ -288,13 +291,13 @@ fn abort_and_return_race_delivers_exactly_one_reply_and_cancels_only_abort_winne
             worker.return_result(Ok(response()))
         });
         gate.wait();
-        let aborted = tasks.abort_unreturned();
+        let aborted = tasks.abort_unreturned("test-turn");
         let normal = normal.join().unwrap();
         let delivered = result.try_recv().unwrap().unwrap();
         assert_eq!(delivered.call_id, "call");
         assert_eq!(delivered.alias, "alias");
         assert!(task.has_returned());
-        assert_eq!(tasks.abort_unreturned(), 0);
+        assert_eq!(tasks.abort_unreturned("test-turn"), 0);
         if aborted == 1 {
             assert_eq!(normal.unwrap_err().kind, ToolErrorKind::AlreadyReturned);
             assert_eq!(delivered.content, "Tool call aborted.");
@@ -319,6 +322,7 @@ async fn abort_is_immediate_and_does_not_touch_returned_tasks() {
         "pending-tool".into(),
         pending_reply,
         tasks.update_context(),
+        Some("test-turn".into()),
     )
     .unwrap();
     tasks.register("pending".into(), pending.clone()).unwrap();
@@ -326,7 +330,7 @@ async fn abort_is_immediate_and_does_not_touch_returned_tasks() {
     tasks.register("returned".into(), returned.clone()).unwrap();
     returned.return_result(Ok(response())).unwrap();
     returned.write(json!("retained")).unwrap();
-    assert_eq!(tasks.abort_unreturned(), 1);
+    assert_eq!(tasks.abort_unreturned("test-turn"), 1);
     let result = pending_result.await.unwrap().unwrap();
     assert_eq!(
         (result.call_id.as_str(), result.alias.as_str()),
@@ -616,6 +620,42 @@ fn handle_for(tasks: &ToolTasks) -> (ToolTaskHandle, tokio::sync::mpsc::Unbounde
         "tool".into(),
         reply,
         tasks.update_context(),
+        Some("test-turn".into()),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn turn_abort_preserves_free_calls_and_other_turns() {
+    let tasks = test_tasks();
+    let mut pending = Vec::new();
+    for (id, turn) in [
+        ("bound", Some("one".to_owned())),
+        ("other", Some("two".to_owned())),
+        ("free", None),
+    ] {
+        let (tx, rx) = oneshot::channel();
+        let (handle, _) = ToolTaskHandle::new(
+            &ToolExecutionLimits::default(),
+            id.into(),
+            "echo".into(),
+            tx,
+            tasks.update_context(),
+            turn,
+        )
+        .unwrap();
+        tasks.register(id.into(), handle.clone()).unwrap();
+        pending.push((id, handle, rx));
+    }
+    assert_eq!(tasks.abort_unreturned("one"), 1);
+    let (_, bound, result) = pending.remove(0);
+    assert!(result.await.unwrap().unwrap().failed);
+    assert!(bound.cancel_token().is_cancelled());
+    for (_, handle, mut result) in pending {
+        assert!(!handle.cancel_token().is_cancelled());
+        assert!(!handle.has_returned());
+        assert!(result.try_recv().is_err());
+        handle.return_result(Ok(response())).unwrap();
+        assert!(!result.await.unwrap().unwrap().failed);
+    }
 }

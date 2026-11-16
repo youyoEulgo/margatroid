@@ -49,7 +49,8 @@ pub(crate) struct ToolContext {
     pub workspace: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_agent: Option<String>,
-    pub turn: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn: Option<String>,
     pub source_origin: String,
     pub task_id: String,
     pub call_id: String,

@@ -237,7 +237,7 @@ pub enum ServerMessage {
     AgentMessageChunkSync {
         address: AddressDto,
 
-        turn: String,
+        turn: Option<String>,
         generation: String,
         sequence: u64,
         content: String,
@@ -458,7 +458,7 @@ enum ServerWire {
     AgentMessageChunkSync {
         address: AddressDto,
 
-        turn: String,
+        turn: Option<String>,
         generation: String,
         sequence: u64,
         content: String,
@@ -1275,6 +1275,7 @@ impl AgentMessageDto {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MclExecuteDataDto {
+    Turn { value: String },
     Messages { value: Vec<AgentMessageDto> },
     Config { value: Value },
     Import { value: MclImportResultDto },

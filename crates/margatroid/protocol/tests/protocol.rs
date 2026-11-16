@@ -464,3 +464,28 @@ fn cumulative_chunk_requires_complete_text_pair_and_rejects_delta() {
     empty["reasoning"] = json!("");
     assert!(serde_json::from_value::<ServerMessage>(empty).is_err());
 }
+
+#[test]
+fn returned_turn_and_free_generation_chunk_preserve_explicit_optional_association() {
+    let response = ServerMessage::MclExecuteResult {
+        id: "turn-request".into(),
+        success: true,
+        data: Some(MclExecuteDataDto::Turn {
+            value: "turn:one".into(),
+        }),
+        error: None,
+    };
+    let value: Value = serde_json::from_str(&encode_server_message(&response).unwrap()).unwrap();
+    assert_eq!(value["data"], json!({"kind":"turn","value":"turn:one"}));
+    let raw = json!({"type":"agent.message.chunk.sync","address":"agent:demo/coder:latest","turn":null,"generation":"free-request","sequence":1,"content":"summary","reasoning":""});
+    let parsed: ServerMessage = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&encode_server_message(&parsed).unwrap()).unwrap(),
+        raw
+    );
+    let mut missing = raw.clone();
+    missing.as_object_mut().unwrap().remove("turn");
+    assert!(serde_json::from_value::<ServerMessage>(missing).is_err());
+    let invalid = json!({"type":"mcl.execute.result","id":"turn-request","success":true,"data":{"kind":"turn","value":""}});
+    assert!(serde_json::from_value::<ServerMessage>(invalid).is_err());
+}

@@ -151,9 +151,12 @@ impl Fixture {
                 if world
                     .get_component::<Agent>(request.agent)
                     .is_none_or(|agent| {
-                        agent.state() != AgentState::Running
-                            || request.turn.is_empty()
-                            || agent.turn().as_deref() != Some(request.turn.as_str())
+                        !matches!(agent.state(), AgentState::Starting | AgentState::Running)
+                            || request.turn.as_ref().is_some_and(|turn| {
+                                turn.is_empty()
+                                    || agent.state() != AgentState::Running
+                                    || agent.turn().as_ref() != Some(turn)
+                            })
                     })
                 {
                     if let Some(sender) = request.reply.lock().unwrap().take() {
@@ -188,9 +191,12 @@ impl Fixture {
                 if world
                     .get_component::<Agent>(request.agent)
                     .is_none_or(|agent| {
-                        agent.state() != AgentState::Running
-                            || request.turn.is_empty()
-                            || agent.turn().as_deref() != Some(request.turn.as_str())
+                        !matches!(agent.state(), AgentState::Starting | AgentState::Running)
+                            || request.turn.as_ref().is_some_and(|turn| {
+                                turn.is_empty()
+                                    || agent.state() != AgentState::Running
+                                    || agent.turn().as_ref() != Some(turn)
+                            })
                     })
                 {
                     if let Some(sender) = request.reply.lock().unwrap().take() {
@@ -260,6 +266,7 @@ impl Fixture {
                                     .get_component::<ToolTasks>(request.agent)
                                     .unwrap()
                                     .update_context(),
+                                request.turn.clone(),
                             )
                             .unwrap();
                             world
@@ -288,6 +295,7 @@ impl Fixture {
                         .get_component::<ToolTasks>(request.agent)
                         .unwrap()
                         .update_context(),
+                    request.turn.clone(),
                 )
                 .unwrap();
                 handle
@@ -425,7 +433,7 @@ impl Fixture {
         text: &str,
         arguments: Vec<Value>,
     ) -> oneshot::Receiver<Result<MclValue, MclError>> {
-        let arguments = if text == "EFFECT tool_call ?" {
+        let arguments = if text.starts_with("EFFECT tool_call ?") {
             arguments
                 .into_iter()
                 .map(|value| {
@@ -1017,8 +1025,9 @@ async fn real_http_unknown_tool_is_preserved_then_fails_current_tool_admission()
 }
 
 #[tokio::test]
-async fn no_turn_is_dispatched_to_domains_and_rejected_by_their_admission() {
+async fn no_turn_is_dispatched_as_free_call_without_implicit_binding() {
     let mut fixture = Fixture::new();
+    fixture.add_tool("bash");
     let result = fixture
         .command("EFFECT inference ?", vec![json!([user("question")])])
         .await
@@ -1034,10 +1043,12 @@ async fn no_turn_is_dispatched_to_domains_and_rejected_by_their_admission() {
             .await
             .unwrap(),
     );
-    assert_eq!(result[0]["content"], "Tool call aborted.");
+    assert_eq!(result[0]["failed"], false);
     assert_eq!(result[0]["tool_call_id"], "call");
-    assert!(fixture.inference.lock().unwrap().is_empty());
-    assert!(fixture.tools.lock().unwrap().is_empty());
+    assert_eq!(fixture.inference.lock().unwrap().len(), 1);
+    assert!(fixture.inference.lock().unwrap()[0].turn.is_none());
+    assert_eq!(fixture.tools.lock().unwrap().len(), 1);
+    assert!(fixture.tools.lock().unwrap()[0].turn.is_none());
     assert_eq!(fixture.tool_submissions.lock().unwrap().len(), 1);
 }
 
@@ -1057,7 +1068,7 @@ async fn tool_results_preserve_order_and_return_without_waiting_for_tool_vm_end(
     let calls = json!([{"type": "assistant", "content": null, "tool_calls": [{"id": "first", "tool_name": "bash", "arguments": "{\"n\":1}"}, {"id": "hidden", "tool_name": "private", "arguments": "{}"}, {"id": "last", "tool_name": "bash", "arguments": "{\"n\":2}"}]}]);
     let results = messages(
         fixture
-            .command("EFFECT tool_call ?", vec![calls])
+            .command("EFFECT tool_call ? ?", vec![calls, json!(expected_turn)])
             .await
             .unwrap(),
     );
@@ -1076,7 +1087,7 @@ async fn tool_results_preserve_order_and_return_without_waiting_for_tool_vm_end(
             .lock()
             .unwrap()
             .iter()
-            .all(|request| request.turn == expected_turn)
+            .all(|request| request.turn.as_ref() == Some(&expected_turn))
     );
     let tasks = fixture
         .app
@@ -1108,18 +1119,23 @@ async fn batch_collects_forced_abort_and_returned_background_replies_without_los
     // This exercises MCL event transport and real task reply gates; tool execution is a fixture.
     let mut fixture = Fixture::new();
     fixture.add_tool("bash");
-    fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    let MclValue::Turn(turn) = fixture.command("EFFECT start_turn", vec![]).await.unwrap() else {
+        panic!("turn result");
+    };
     fixture
         .tool_modes
         .lock()
         .unwrap()
         .insert("pending".into(), 5);
     let mut receiver = fixture.enqueue(
-        "EFFECT tool_call ?",
-        vec![json!([{"type":"assistant","tool_calls":[
-            {"id":"pending","tool_name":"bash","arguments":"{}"},
-            {"id":"background","tool_name":"bash","arguments":"{\"background\":true}"}
-        ]}])],
+        "EFFECT tool_call ? ?",
+        vec![
+            json!([{"type":"assistant","tool_calls":[
+                {"id":"pending","tool_name":"bash","arguments":"{}"},
+                {"id":"background","tool_name":"bash","arguments":"{\"background\":true}"}
+            ]}]),
+            json!(turn),
+        ],
     );
     let recorded = fixture.tools.clone();
     tick_until(&mut fixture.app, || recorded.lock().unwrap().len() == 2).await;
@@ -1148,7 +1164,7 @@ async fn batch_collects_forced_abort_and_returned_background_replies_without_los
         .world_mut()
         .agent_abort_turn(fixture.owner, &turn)
         .unwrap();
-    assert_eq!(tasks.abort_unreturned(), 1);
+    assert_eq!(tasks.abort_unreturned(&turn), 1);
     let results = messages(drive(&mut fixture.app, &mut receiver).await.unwrap());
     assert_eq!(results.len(), 2);
     assert_eq!(results[0]["tool_call_id"], "pending");
@@ -1350,7 +1366,7 @@ async fn finish_turn_waits_for_real_inference_cleanup_and_keeps_abort_control() 
         .current = Some(attached_inference(
         InferenceHandle {
             request_id: "active".into(),
-            turn: turn.clone(),
+            turn: Some(turn.clone()),
             cancel: cancel.clone(),
             stop_stream: Arc::new(|| {}),
             task: Arc::new(InferenceTaskState::default()),
@@ -1545,8 +1561,14 @@ async fn inference_error_is_a_value_and_finish_turn_waits_for_cleanup() {
     ] {
         let mut fixture = Fixture::new();
         fixture.auto_inference.store(false, Ordering::Release);
-        fixture.command("EFFECT start_turn", vec![]).await.unwrap();
-        let mut reply = fixture.enqueue("EFFECT inference ?", vec![json!([user("hello")])]);
+        let MclValue::Turn(turn) = fixture.command("EFFECT start_turn", vec![]).await.unwrap()
+        else {
+            panic!("turn result");
+        };
+        let mut reply = fixture.enqueue(
+            "EFFECT inference ? ?",
+            vec![json!([user("hello")]), json!(turn)],
+        );
         let requests = fixture.inference.clone();
         tick_until(&mut fixture.app, || !requests.lock().unwrap().is_empty()).await;
         let request = requests.lock().unwrap()[0].clone();
@@ -1651,15 +1673,20 @@ async fn inference_error_is_a_value_and_finish_turn_waits_for_cleanup() {
 async fn inference_error_does_not_finish_a_replacement_turn() {
     let mut fixture = Fixture::new();
     fixture.auto_inference.store(false, Ordering::Release);
-    fixture.command("EFFECT start_turn", vec![]).await.unwrap();
-    let mut reply = fixture.enqueue("EFFECT inference ?", vec![json!([user("hello")])]);
+    let MclValue::Turn(turn) = fixture.command("EFFECT start_turn", vec![]).await.unwrap() else {
+        panic!("turn result");
+    };
+    let mut reply = fixture.enqueue(
+        "EFFECT inference ? ?",
+        vec![json!([user("hello")]), json!(turn)],
+    );
     let requests = fixture.inference.clone();
     tick_until(&mut fixture.app, || !requests.lock().unwrap().is_empty()).await;
     let request = requests.lock().unwrap()[0].clone();
     fixture
         .app
         .world_mut()
-        .agent_abort_turn(fixture.owner, &request.turn)
+        .agent_abort_turn(fixture.owner, request.turn.as_deref().unwrap())
         .unwrap();
     fixture
         .app
@@ -2945,4 +2972,118 @@ async fn tool_call_projects_calls_from_a_message_and_rejects_the_old_assistant_e
         1,
         "old envelope dispatched another call"
     );
+}
+
+#[tokio::test]
+async fn start_turn_returns_current_id_and_free_calls_do_not_inherit_it() {
+    let mut fixture = Fixture::new();
+    fixture.add_tool("bash");
+    let first = fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    let second = fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    assert_eq!(first, second);
+    let MclValue::Turn(turn) = first else {
+        panic!("start_turn must return an id");
+    };
+    fixture
+        .command("EFFECT inference ?", vec![json!([user("free")])])
+        .await
+        .unwrap();
+    let calls = json!([{"id":"free-tool","tool_name":"bash","arguments":"{}"}]);
+    fixture
+        .command("EFFECT tool_call ?", vec![calls])
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .inference
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .turn
+            .is_none()
+    );
+    assert!(fixture.tools.lock().unwrap().last().unwrap().turn.is_none());
+    let StorageValue::History(records) = execute_storage(
+        fixture
+            .app
+            .world()
+            .get_component::<AgentStorage>(fixture.owner)
+            .unwrap(),
+        StorageOperation::ReadHistory,
+    )
+    .unwrap() else {
+        panic!("audit");
+    };
+    for record in records.iter().filter(|record| {
+        matches!(
+            record.content.as_str(),
+            "EFFECT inference ?" | "EFFECT tool_call ?"
+        )
+    }) {
+        assert!(record.turn.is_none());
+    }
+    fixture
+        .command(
+            "EFFECT inference ? ?",
+            vec![json!([user("bound")]), json!(turn)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .inference
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .turn
+            .as_deref(),
+        Some(turn.as_str())
+    );
+}
+#[tokio::test]
+async fn finishing_a_turn_does_not_wait_for_or_remove_unbound_inference() {
+    let mut fixture = Fixture::new();
+    fixture.command("EFFECT start_turn", vec![]).await.unwrap();
+    let (tx, rx) = oneshot::channel();
+    let cancel = CancellationToken::new();
+    let handle = attached_inference(
+        InferenceHandle {
+            request_id: "free-running".into(),
+            turn: None,
+            cancel: cancel.clone(),
+            stop_stream: Arc::new(|| {}),
+            task: Arc::new(InferenceTaskState::default()),
+        },
+        tokio::spawn(async move {
+            rx.await.unwrap();
+        }),
+    );
+    fixture
+        .app
+        .world_mut()
+        .get_component_mut::<ActiveInference>(fixture.owner)
+        .unwrap()
+        .current = Some(handle.clone());
+    assert_eq!(
+        fixture.command("EFFECT finish_turn", vec![]).await.unwrap(),
+        MclValue::Unit
+    );
+    assert!(!cancel.is_cancelled());
+    assert!(!handle.is_finished());
+    assert_eq!(
+        fixture
+            .app
+            .world()
+            .get_component::<ActiveInference>(fixture.owner)
+            .unwrap()
+            .current
+            .as_ref()
+            .unwrap()
+            .request_id,
+        "free-running"
+    );
+    tx.send(()).unwrap();
+    handle.wait_finished().await.unwrap();
 }

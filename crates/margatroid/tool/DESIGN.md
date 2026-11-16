@@ -94,9 +94,9 @@ ToolTasks：该Agent的工具任务句柄集合，公开组件
             await Lua、进程及后代、管道、临时资源真实清理
             success: 调用update_task执行真实CompleteCleanup移除并释放缓存，随后返回Ok(())
             failure: return error; retain supervision
-    abort_unreturned(&self) -> 工具中止交接结果
+    abort_unreturned(&self, turn: &str) -> 工具中止交接结果
         行为：
-            for handle in entries:
+            for handle in entries where handle.turn == Some(turn):
                 atomic if !handle.returned:
                     reply 原call_id/alias的中止结果
                     通过update_task执行原子AbortReturn原子更新returned
@@ -122,7 +122,7 @@ InitToolTasks：工具任务组件初始化请求，公开事件
 ToolExecuteRequest：单次工具请求，公开事件
     id: String
     agent: Entity
-    turn: String--发出请求时的回合标识，System受理必须与Agent当前turn匹配
+    turn: Option<String>--调用方显式选择；None自由调用，Some在System受理时要求当前有效turn严格匹配
     alias: String--工具路径集合的键
     call_id: String--模型调用关联
     arguments: serde_json::Value
@@ -153,7 +153,7 @@ tool_execute_system(world: &mut World)
     oneshot回复：Result<ToolExecuteResponse, ToolError>
     行为：
         在中止schedule之后执行；
-        ToolExecuteRequest -> handle_tool_execute，逐请求复检当前turn，不使用发出时状态代替受理检查。
+        ToolExecuteRequest -> handle_tool_execute，逐请求仅对Some(turn)复检当前turn；None不检查回合，但照常检查会话、生命周期及任务受理，不使用发出时状态代替受理检查。
 ```
 
 # handler
@@ -170,8 +170,9 @@ handle_init_tool_tasks(world: &mut World, request: InitToolTasks)
 
 handle_tool_execute(world: &mut World, request: ToolExecuteRequest)
     行为：
-        认领reply，核对Agent完整Entity、Running及当前非空turn与request.turn匹配；
-        无turn或不匹配直接返回保留call_id/alias的中止工具结果，不注册任务、不启动闭包或进程。
+        认领reply，核对Agent完整Entity、实际AgentSession、调用身份与权限、取消状态及任务受理组件；Error/Stopping拒绝。
+        turn=None为自由调用，Starting/Running可受理；省略不自动继承当前Agent或调用者turn，初始化工具无需伪造回合。
+        turn=Some(id)必须非空且Agent为Running、当前有效turn与id匹配；失效或不匹配返回保留call_id/alias的中止工具结果，不注册任务、不启动闭包或进程。
         entry = Tools.get(request.alias) or return 对应工具错误
         使用entry.input_schema校验arguments
         按entry.path执行；
@@ -484,6 +485,8 @@ LuaServices安装（tool/plugin/src/services.rs）
 公开：
 ```text
 ToolTaskHandle：可克隆的任务共享句柄，公开类型
+    turn(&self) -> Option<&str>--读取任务不可变回合关联；None不归属于任何用户回合
+    new(limits: &ToolExecutionLimits, call_id: String, alias: String, reply: oneshot::Sender<Result<ToolExecuteResponse, ToolError>>, updates: TaskUpdateContext, turn: Option<String>) -> Result<(Self, mpsc::UnboundedReceiver<Value>), ToolError>
     execution_id(&self) -> &str--每个实际任务唯一，MCL来源不使用可重用业务id
     inner: Arc<ToolTaskShared>
     updates: TaskUpdateContext--来源于同一ToolTasks，source.prepare只捕获集合Weak，避免强引用环
@@ -525,6 +528,8 @@ AgentTaskSnapshot
     tasks: Vec<ToolTaskSnapshot>
 
 ToolTaskShared：任务持有数据
+    execution_id: String
+    turn: Option<String>--构造时固定的显式回合关联
     registrations: TaskScope
     cancel: CancellationToken--存活任务取消能力；回合中止只触发原子裁决仍未return的任务，不取消已return后台任务
     task: Mutex<Option<JoinHandle<()>>>--监督任务句柄，取消时不直接abort

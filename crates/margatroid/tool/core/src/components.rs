@@ -105,10 +105,10 @@ impl ToolTasks {
     }
 
     /// Synchronously deliver aborted replies and request cancellation only for pending calls.
-    pub fn abort_unreturned(&self) -> usize {
+    pub fn abort_unreturned(&self, turn: &str) -> usize {
         self.list()
             .into_iter()
-            .filter(|(_, handle)| handle.abort_unreturned())
+            .filter(|(_, handle)| handle.turn() == Some(turn) && handle.abort_unreturned())
             .count()
     }
 

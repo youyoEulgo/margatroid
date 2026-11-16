@@ -222,6 +222,7 @@ fn mcl_result(value: mcl_core::MclValue) -> Result<Value, ProtocolErrorDto> {
     use mcl_core::{MclValue, MessageArray};
     let (kind, value) = match value {
         MclValue::Unit => return minimal(()),
+        MclValue::Turn(value) => return Ok(json!({"data":{"kind":"turn","value":value}})),
         MclValue::Error(v) => {
             let mut failure = error(
                 "MclFailed",
@@ -716,11 +717,12 @@ pub(crate) fn handle_abort_control(world: &mut World, event: AbortTurnControl) {
         if let Some(active) = world
             .get_component::<inference_core::ActiveInference>(entity)
             .and_then(|a| a.current.as_ref())
+            .filter(|handle| handle.turn.as_deref() == Some(r.input.turn.as_str()))
         {
             active.cancel();
         }
         if let Some(tasks) = world.get_component::<tool_core::ToolTasks>(entity) {
-            tasks.abort_unreturned();
+            tasks.abort_unreturned(&r.input.turn);
         }
         Ok(())
     })();

@@ -260,9 +260,10 @@ async fn execute_command(context: CommandContext) -> Result<CommandOutput, Comma
             () = request.cancel.cancelled() => { context.cancel.cancel(); operation.await },
             result = &mut operation => result,
         };
+        let audit_turn=match &context.operation{MclOperation::Effect{name,arguments}if matches!(name.as_str(),"inference"|"tool_call")=>explicit_turn(&context,arguments.get(1).cloned())?,_=>context.turn.clone()};
         let audit = storage(&context, StorageOperation::AppendHistory { records: vec![storage_core::HistoryRecord {
             source: Some(request.source_address.clone()),
-            turn: context.turn.clone(), kind: "mcl".into(), content: request.instruction.text.clone(),
+            turn: audit_turn, kind: "mcl".into(), content: request.instruction.text.clone(),
             payload: json!({"id": request.id, "source_instance": request.source_instance, "text": request.instruction.text, "arguments": request.instruction.arguments, "succeeded": result.is_ok(), "error": result.as_ref().err()}), created_at_ms: None,
         }] }, CancellationToken::new()).await;
         match audit {
@@ -845,11 +846,13 @@ async fn execute_effect(
         }
         "inference" => {
             let messages = effect_messages(context, arguments.next().unwrap()).await?;
-            execute_inference(context, messages).await
+            let turn = explicit_turn(context, arguments.next())?;
+            execute_inference(context, messages, turn).await
         }
         "tool_call" => {
             let messages = tool_effect_messages(context, arguments.next().unwrap()).await?;
-            execute_tools(context, messages).await
+            let turn = explicit_turn(context, arguments.next())?;
+            execute_tools(context, messages, turn).await
         }
         "block_snapshot" | "block_snapshots" | "block_restore" => {
             execute_block_effect(context, name, arguments.collect()).await
@@ -909,8 +912,8 @@ async fn execute_effect(
                 check_action(world, &request, &cancel)?;
                 world
                     .agent_start_turn(request.target)
-                    .map_err(|failed| error(MclErrorKind::EffectFailed, failed.to_string()))?;
-                Ok(MclValue::Unit)
+                    .map(MclValue::Turn)
+                    .map_err(|failed| error(MclErrorKind::EffectFailed, failed.to_string()))
             })
             .await
         }
@@ -1045,13 +1048,16 @@ async fn execute_block_effect(
 async fn finish_turn(context: &CommandContext) -> Result<MclValue, MclError> {
     let request = context.request.clone();
     let cancel = context.cancel.clone();
+    let expected = context.turn.clone();
     let handle = in_world(&context.world, move |world| {
         check_action(world, &request, &cancel)?;
         Ok(world
             .get_component::<ActiveInference>(request.target)
-            .and_then(|active| active.current.clone()))
+            .and_then(|active| active.current.clone())
+            .filter(|handle| expected.is_some() && handle.turn == expected))
     })
     .await?;
+    let completed_request = handle.as_ref().map(|handle| handle.request_id.clone());
     if let Some(handle) = handle {
         handle
             .wait_finished()
@@ -1069,7 +1075,16 @@ async fn finish_turn(context: &CommandContext) -> Result<MclValue, MclError> {
                 expected.as_deref().unwrap_or(request.id.as_str()),
             )
             .map_err(|failure| error(MclErrorKind::EffectFailed, failure.to_string()))?;
-        if let Some(active) = world.get_component_mut::<ActiveInference>(request.target) {
+        if let Some(active) = world
+            .get_component_mut::<ActiveInference>(request.target)
+            .filter(|active| {
+                active.current.as_ref().is_some_and(|handle| {
+                    completed_request.as_deref() == Some(handle.request_id.as_str())
+                        && handle.turn == expected
+                        && handle.is_finished()
+                })
+            })
+        {
             active.current.take();
         }
         Ok(MclValue::Unit)
@@ -1077,9 +1092,39 @@ async fn finish_turn(context: &CommandContext) -> Result<MclValue, MclError> {
     .await
 }
 
+fn explicit_turn(
+    context: &CommandContext,
+    parameter: Option<EffectParameter>,
+) -> Result<Option<String>, MclError> {
+    let Some(parameter) = parameter else {
+        return Ok(None);
+    };
+    let EffectParameter::Manual(index) = parameter else {
+        return Err(error(
+            MclErrorKind::ArgumentMismatch,
+            "turn must be passed explicitly with ?",
+        ));
+    };
+    context
+        .request
+        .instruction
+        .arguments
+        .get(index)
+        .and_then(Value::as_str)
+        .filter(|turn| !turn.trim().is_empty())
+        .map(|turn| Some(turn.to_owned()))
+        .ok_or_else(|| {
+            error(
+                MclErrorKind::ArgumentMismatch,
+                "turn must be a nonempty string",
+            )
+        })
+}
+
 async fn execute_inference(
     context: &CommandContext,
     messages: Vec<Value>,
+    turn: Option<String>,
 ) -> Result<MclValue, MclError> {
     let mut typed = Vec::new();
     for message in messages {
@@ -1087,7 +1132,7 @@ async fn execute_inference(
     }
     let request = context.request.clone();
     let cancel = context.cancel.clone();
-    let expected_turn = context.turn.clone();
+    let expected_turn = turn;
     let receiver = in_world(&context.world, move |world| {
         check_action(world, &request, &cancel)?;
         let config = world
@@ -1104,7 +1149,7 @@ async fn execute_inference(
         world.send_event(InferenceRequest {
             id: request.id,
             agent: request.target,
-            turn: expected_turn.unwrap_or_default(),
+            turn: expected_turn,
             messages: typed,
             config,
             cancel,
@@ -1139,11 +1184,12 @@ fn inference_result(response: InferenceResponse, request_id: &str) -> Result<Mcl
 async fn execute_tools(
     context: &CommandContext,
     messages: Vec<Value>,
+    turn: Option<String>,
 ) -> Result<MclValue, MclError> {
     let calls = executable_calls(&Value::Array(messages))?;
     let request = context.request.clone();
     let cancel = context.cancel.clone();
-    let expected_turn = context.turn.clone();
+    let expected_turn = turn;
     static NEXT_TOOL_BATCH: AtomicU64 = AtomicU64::new(1);
     let task_prefix = format!(
         "{}:{}",
@@ -1162,7 +1208,7 @@ async fn execute_tools(
             world.send_event(ToolExecuteRequest {
                 id: format!("tool:{task_prefix}:{index}"),
                 agent: request.target,
-                turn: expected_turn.clone().unwrap_or_default(),
+                turn: expected_turn.clone(),
                 alias: call.name.clone(),
                 call_id: call.id.clone(),
                 arguments: call.arguments.clone(),

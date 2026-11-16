@@ -56,7 +56,7 @@ fn command(
     drive(app, &mut rx).unwrap()
 }
 #[test]
-fn starting_and_running_mcl_reach_real_domains_which_reject_absent_turns() {
+fn starting_and_running_mcl_reach_real_domains_which_reject_explicit_stale_turns() {
     let root = tempfile::tempdir().unwrap();
     write(
         root.path(),
@@ -156,19 +156,25 @@ end
             &mut app,
             client,
             agent,
-            "EFFECT inference ?",
-            vec![json!([{"type":"user","content":"no turn"}])],
+            "EFFECT inference ? ?",
+            vec![
+                json!([{"type":"user","content":"stale turn"}]),
+                json!("stale-turn"),
+            ],
         );
         assert!(
             matches!(result,MclValue::Inference{message,stop_reason}if stop_reason=="completed"&&message["content"].is_null()&&message["tool_calls"]==json!([])),
-            "domain must not submit HTTP without a turn"
+            "domain must not submit HTTP for a stale explicit turn"
         );
         let result = command(
             &mut app,
             client,
             agent,
-            "EFFECT tool_call ?",
-            vec![json!([{"id":"no-turn","tool_name":"unimported","arguments":"{}"}])],
+            "EFFECT tool_call ? ?",
+            vec![
+                json!([{"id":"stale-turn","tool_name":"unimported","arguments":"{}"}]),
+                json!("stale-turn"),
+            ],
         );
         assert!(
             matches!(result,MclValue::Array(mcl_core::MessageArray::Message(rows))if rows.len()==1&&rows[0]["failed"]==true&&rows[0]["content"]=="Tool call aborted.")

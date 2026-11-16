@@ -115,3 +115,46 @@ fn snapshot_effects_use_scalar_markers_and_exact_arity() {
     );
     assert_eq!(serde_json::from_value::<MclValue>(encoded).unwrap(), value);
 }
+
+#[test]
+fn inference_and_tools_accept_only_explicit_nonempty_optional_turns() {
+    for effect in ["inference", "tool_call"] {
+        assert!(parse(&format!("EFFECT {effect} ?"), vec![json!([])]).is_ok());
+        assert!(parse(
+            &format!("EFFECT {effect} ? ?"),
+            vec![json!([]), json!("turn:one")]
+        )
+        .is_ok());
+        for invalid in [
+            json!(null),
+            json!(""),
+            json!("  "),
+            json!(12),
+            json!([]),
+            json!({}),
+            json!("line\nturn"),
+        ] {
+            assert!(parse(&format!("EFFECT {effect} ? ?"), vec![json!([]), invalid]).is_err());
+        }
+        assert!(parse(
+            &format!("EFFECT {effect} ? (session.messages)"),
+            vec![json!([])]
+        )
+        .is_err());
+        assert!(parse(
+            &format!("EFFECT {effect} ? ? ?"),
+            vec![json!([]), json!("one"), json!("two")]
+        )
+        .is_err());
+    }
+    assert!(parse(
+        "EFFECT inference (session.messages) ?",
+        vec![json!("turn:one")]
+    )
+    .is_ok());
+    assert!(parse(
+        "EFFECT tool_call (session.messages[-1].tool_calls) ?",
+        vec![json!("turn:one")]
+    )
+    .is_ok());
+}

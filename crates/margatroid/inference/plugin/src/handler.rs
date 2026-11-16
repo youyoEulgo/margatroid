@@ -168,9 +168,13 @@ pub(crate) fn handle_inference(world: &mut World, request: InferenceRequest) {
         let _ = reply.send(Err(error(Kind::AgentMissing, "Agent entity missing")));
         return;
     };
-    if agent.state() != AgentState::Running
-        || request.turn.is_empty()
-        || agent.turn().as_deref() != Some(request.turn.as_str())
+    if !matches!(agent.state(), AgentState::Starting | AgentState::Running)
+        || request.cancel.is_cancelled()
+        || request.turn.as_ref().is_some_and(|turn| {
+            turn.is_empty()
+                || agent.state() != AgentState::Running
+                || agent.turn().as_ref() != Some(turn)
+        })
     {
         let _ = reply.send(Ok(InferenceResponse::empty_completed()));
         return;

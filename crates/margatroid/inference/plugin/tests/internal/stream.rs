@@ -82,7 +82,7 @@ fn request() -> InferenceRequest {
     InferenceRequest {
         id: "request".into(),
         agent: world.spawn(),
-        turn: "turn".into(),
+        turn: Some("turn".into()),
         messages: vec![inference_core::InferenceMessage::User {
             content: "hello".into(),
             images: vec![],
@@ -103,7 +103,7 @@ fn delivery() -> StreamDelivery {
     StreamDelivery {
         id: "request".into(),
         agent: "agent:test/agent:latest".into(),
-        turn: "turn".into(),
+        turn: Some("turn".into()),
         clients: client_core::Clients::default(),
         source_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     }
@@ -166,7 +166,7 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let (mut delivery, mut frames) = captured_delivery();
-    delivery.turn = "turn".into();
+    delivery.turn = Some("turn".into());
     let context = InferenceContext {
         request,
         reply: Some(reply),
@@ -182,7 +182,7 @@ async fn handle_cancel_freezes_synchronously_but_reply_waits_for_real_worker_joi
     let frozen = gate.clone();
     let handle = InferenceHandle {
         request_id: "request".into(),
-        turn: "turn".into(),
+        turn: Some("turn".into()),
         cancel,
         stop_stream: Arc::new(move || frozen.lock().unwrap().close()),
         task: Arc::new(inference_core::InferenceTaskState::default()),
@@ -263,7 +263,7 @@ async fn provider_error_replies_before_stalled_cleanup_and_retains_active_handle
     }));
     let handle = InferenceHandle {
         request_id: "request".into(),
-        turn: "turn".into(),
+        turn: Some("turn".into()),
         cancel,
         stop_stream: Arc::new(move || frozen.lock().unwrap().close()),
         task: Arc::new(inference_core::InferenceTaskState::default()),
@@ -362,7 +362,7 @@ async fn cancellation_cleanup_budget_replies_error_and_keeps_real_join_active() 
     }));
     let handle = InferenceHandle {
         request_id: "request".into(),
-        turn: "turn".into(),
+        turn: Some("turn".into()),
         cancel,
         stop_stream: Arc::new(move || frozen.lock().unwrap().close()),
         task: Arc::new(inference_core::InferenceTaskState::default()),
@@ -459,7 +459,7 @@ async fn real_cleanup_wakes_matching_driver_only_after_supervisor_finishes() {
             current: Some(attach_handle(
                 InferenceHandle {
                     request_id: "request".into(),
-                    turn: "turn".into(),
+                    turn: Some("turn".into()),
                     cancel,
                     stop_stream: Arc::new(|| {}),
                     task: Arc::new(inference_core::InferenceTaskState::default()),
@@ -585,7 +585,7 @@ async fn cleanup_event_retries_next_frame_until_actual_handle_finishes() {
             current: Some(attach_handle(
                 InferenceHandle {
                     request_id: "request".into(),
-                    turn: "turn".into(),
+                    turn: Some("turn".into()),
                     cancel: CancellationToken::new(),
                     stop_stream: Arc::new(|| {}),
                     task: Arc::new(inference_core::InferenceTaskState::default()),
@@ -1377,7 +1377,7 @@ fn attach_handle(handle: InferenceHandle, task: tokio::task::JoinHandle<()>) -> 
 fn pending_handle() -> InferenceHandle {
     InferenceHandle {
         request_id: "request".into(),
-        turn: "turn".into(),
+        turn: Some("turn".into()),
         cancel: CancellationToken::new(),
         stop_stream: Arc::new(|| {}),
         task: Arc::new(inference_core::InferenceTaskState::default()),

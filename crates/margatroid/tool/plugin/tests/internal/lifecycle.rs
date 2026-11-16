@@ -44,7 +44,7 @@ fn admission_rechecks_current_turn_and_never_registers_rejected_requests() {
             ToolExecuteRequest {
                 id: "task".into(),
                 agent: entity,
-                turn: requested.into(),
+                turn: Some(requested.into()),
                 call_id: "original-call".into(),
                 alias: "original-alias".into(),
                 arguments: json!({}),
@@ -70,7 +70,7 @@ fn missing_agent_returns_an_aborted_correlated_result() {
         ToolExecuteRequest {
             id: "task".into(),
             agent: entity,
-            turn: "turn".into(),
+            turn: Some("turn".into()),
             call_id: "call".into(),
             alias: "tool".into(),
             arguments: json!({}),
@@ -166,6 +166,7 @@ fn dynamic_admission_checks_schema_without_rechecking_recorded_owner() {
                 "factory".into(),
                 reply,
                 tasks.update_context(),
+                None,
             )
             .unwrap();
             owner.cancel();
@@ -193,7 +194,7 @@ fn dynamic_admission_checks_schema_without_rechecking_recorded_owner() {
             ToolExecuteRequest {
                 id: "dependent".into(),
                 agent,
-                turn: "turn".into(),
+                turn: Some("turn".into()),
                 alias: "dynamic".into(),
                 call_id: "call".into(),
                 arguments,
